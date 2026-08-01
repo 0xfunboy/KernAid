@@ -28,6 +28,10 @@ test-observe:
 test-provider-contracts:
     pnpm --filter @kernaid/agent-gateway test
 
+test-vault:
+    @echo "Runs destructive storage commands only against an internally-created disposable loop image."
+    sudo ./tools/test-vault/luks-roundtrip.sh
+
 run-desk:
     pnpm run run:desk
 

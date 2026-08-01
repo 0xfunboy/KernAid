@@ -1,0 +1,17 @@
+name: vault
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ["tools/test-vault/**", ".github/workflows/vault.yml"]
+permissions: {contents: read}
+jobs:
+  luks2-roundtrip:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install disposable-image tooling
+        run: sudo apt-get update && sudo apt-get install -y cryptsetup gdisk
+      - name: Prove encrypted persistence on a disposable image
+        run: sudo ./tools/test-vault/luks-roundtrip.sh
