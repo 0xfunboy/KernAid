@@ -444,6 +444,15 @@ impl<S: JournalSecretStore> SecureJournal<S> {
     /// that matches an earlier chain prefix, the anchor is advanced to recover
     /// from a crash between the database commit and secure-store update.
     pub fn verify(&mut self) -> Result<(), JournalError> {
+        self.head().map(|_| ())
+    }
+
+    /// Return the authenticated journal head without materializing plaintext.
+    ///
+    /// This performs the same complete verification and safe DB-ahead-anchor
+    /// recovery as [`Self::verify`]. The returned anchor is therefore suitable
+    /// for binding a signed report to the exact audit-journal state.
+    pub fn head(&mut self) -> Result<JournalAnchor, JournalError> {
         if !self.healthy {
             return Err(JournalError::Poisoned);
         }
@@ -471,7 +480,11 @@ impl<S: JournalSecretStore> SecureJournal<S> {
             }
         }
         transaction.commit()?;
-        Ok(())
+        Ok(JournalAnchor {
+            journal_id: self.journal_id,
+            sequence: scan.head.sequence,
+            entry_hash: scan.head.entry_hash,
+        })
     }
 
     /// Return a bounded plaintext snapshot after verification under one SQLite
@@ -1352,13 +1365,18 @@ mod tests {
     fn plaintext_snapshot_has_a_record_count_limit() {
         let path = database_path("read-count-limit");
         let store = MemorySecretStore::default();
-        let mut journal = SecureJournal::open(&path, store).expect("open journal");
+        let mut journal = SecureJournal::open(&path, store.clone()).expect("open journal");
         bulk_append_valid_empty_events(&mut journal, MAX_RETURNED_ENTRIES + 1);
 
         assert!(matches!(
             journal.entries(),
             Err(JournalError::ReadLimitExceeded)
         ));
+        let head = journal
+            .head()
+            .expect("head does not materialize plaintext records");
+        assert_eq!(head.sequence, MAX_RETURNED_ENTRIES + 1);
+        assert_eq!(head, store.anchor());
         journal.verify().expect("large journal remains verifiable");
         remove_database(&path);
     }
