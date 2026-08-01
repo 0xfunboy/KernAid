@@ -1,12 +1,27 @@
 #!/bin/sh
 set -eu
 base_url=http://127.0.0.1:4173
-index="$(curl --fail --silent --show-error "$base_url/")"
+
+fail() {
+    echo "KERNAID_RESCUE_NOT_READY: $*" >/dev/ttyS0
+    exit 1
+}
+
+index=
+attempt=1
+while [ "$attempt" -le 30 ]; do
+    if index="$(curl --fail --silent --show-error --max-time 2 "$base_url/" 2>/dev/null)"; then
+        break
+    fi
+    sleep 1
+    attempt=$((attempt + 1))
+done
+test -n "$index" || fail "local UI server did not answer"
+
 script_path="$(printf '%s' "$index" | sed -n 's/.*src="\.\/\([^"?]*\)".*/\1/p' | head -n 1)"
-test -n "$script_path"
-case "$script_path" in assets/*.js) ;; *) exit 1 ;; esac
-curl --fail --silent --show-error "$base_url/$script_path" >/dev/null
-inventory="$(curl --fail --silent --show-error "$base_url/api/inventory")"
-printf '%s' "$inventory" | grep -q '"collector": "system.hostname"'
-printf '%s' "$inventory" | grep -q '"collector": "linux.block.inventory"'
+case "$script_path" in assets/*.js) ;; *) fail "JavaScript bundle path is missing" ;; esac
+curl --fail --silent --show-error --max-time 10 "$base_url/$script_path" >/dev/null || fail "JavaScript bundle is unavailable"
+inventory="$(curl --fail --silent --show-error --max-time 60 "$base_url/api/inventory")" || fail "inventory endpoint failed"
+printf '%s' "$inventory" | grep -q '"collector": "system.hostname"' || fail "hostname evidence is missing"
+printf '%s' "$inventory" | grep -q '"collector": "linux.block.inventory"' || fail "storage evidence is missing"
 echo KERNAID_RESCUE_READY >/dev/ttyS0

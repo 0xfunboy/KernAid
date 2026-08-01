@@ -7,6 +7,8 @@ Requires=kernaid-ui.service
 Type=oneshot
 ExecStart=/bin/sh /usr/lib/kernaid/ready-check
 RemainAfterExit=yes
+StandardOutput=journal+console
+StandardError=journal+console
 
 [Install]
 WantedBy=multi-user.target

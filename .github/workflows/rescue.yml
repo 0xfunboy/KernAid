@@ -30,14 +30,20 @@ jobs:
         run: KERNAID_SMOKE_LOG=rescue-smoke-bios.log ./tools/build-rescue/qemu-smoke.sh bios
       - name: QEMU UEFI smoke test
         run: KERNAID_SMOKE_LOG=rescue-smoke-uefi.log ./tools/build-rescue/qemu-smoke.sh uefi
-      - name: Publish checksums and image
+      - name: Publish smoke diagnostics
         if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: KernAid-Rescue-smoke-logs
+          path: rescue-smoke-*.log
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Publish checksums and image
         uses: actions/upload-artifact@v4
         with:
           name: KernAid-Rescue-amd64
           path: |
             KernAid-Rescue-amd64.iso
             KernAid-Rescue-amd64.iso.sha256
-            rescue-smoke-*.log
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 14
