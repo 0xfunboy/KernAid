@@ -3,7 +3,7 @@ set -euo pipefail
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 firmware="${1:-bios}"
 iso="${2:-$repo_dir/KernAid-Rescue-amd64.iso}"
-for command in qemu-system-x86_64 sha256sum mkfs.ext4 truncate; do
+for command in qemu-system-x86_64 sha256sum mkfs.ext4 tee truncate; do
   command -v "$command" >/dev/null || { echo "Missing required command: $command" >&2; exit 2; }
 done
 if [[ "$firmware" != "bios" && "$firmware" != "uefi" ]]; then
@@ -11,6 +11,7 @@ if [[ "$firmware" != "bios" && "$firmware" != "uefi" ]]; then
   exit 2
 fi
 test -f "$iso" || { echo "ISO not found: $iso" >&2; exit 2; }
+iso_hash_before="$(sha256sum "$iso" | awk '{print $1}')"
 log="${KERNAID_SMOKE_LOG:-$(mktemp)}"
 temporary_log=0
 if [[ -z "${KERNAID_SMOKE_LOG:-}" ]]; then temporary_log=1; fi
@@ -54,6 +55,14 @@ for _attempt in $(seq 1 240); do
       echo "Rescue Observe boot modified the disposable target image" >&2
       exit 1
     fi
+    iso_hash_after="$(sha256sum "$iso" | awk '{print $1}')"
+    if [[ "$iso_hash_after" != "$iso_hash_before" ]]; then
+      echo "Rescue ISO changed during the QEMU smoke test" >&2
+      exit 1
+    fi
+    printf '%s\n' \
+      "KERNAID_QEMU_ATTESTATION_V1 firmware=$firmware iso_sha256=$iso_hash_after target_before_sha256=$target_hash_before target_after_sha256=$target_hash_after ready=true" \
+      | tee -a "$log"
     echo "PASS: KernAid Rescue booted with $firmware firmware and made zero target-image writes"
     exit 0
   fi

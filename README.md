@@ -25,7 +25,7 @@ CI produces engineering-preview desktop installers for Windows, Linux, Intel mac
 - **Windows, Linux or macOS that does boot:** download that operating system's desktop artifact, install it, and launch KernAid like a normal application. It collects only the fixed, read-only inventory commands exposed by the native shell.
 - **Do not use on customer data as a repair tool yet:** the current workflow diagnoses and stages an R0 no-write plan. It deliberately cannot execute real repairs.
 
-The Rescue artifact is rebuilt and boot-tested without a target disk in QEMU using both legacy BIOS and UEFI firmware. Secure Boot and physical-machine compatibility remain release gates, not claimed capabilities.
+The Rescue artifact is rebuilt and boot-tested in QEMU using both legacy BIOS and UEFI firmware. Each test attaches a disposable target disk, proves the live UI ready, and verifies that the complete target image is byte-identical before and after boot. Secure Boot and physical-machine compatibility remain release gates, not claimed capabilities.
 
 ## Trust boundaries
 

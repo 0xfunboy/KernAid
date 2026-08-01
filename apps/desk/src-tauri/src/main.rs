@@ -488,8 +488,8 @@ fn diagnose_linux_p0(evidence: Vec<NativeDiagnosticEvidence>) -> Result<serde_js
             dpkg_audit: input("linux.dpkg.audit")?,
         })
         .map_err(|_| "Una evidenza Linux è malformata o incompleta.".to_owned())?;
-        return serde_json::to_value(proposal_from_report(&report))
-            .map_err(|_| "La diagnosi Linux non è serializzabile.".to_owned());
+        serde_json::to_value(proposal_from_report(&report))
+            .map_err(|_| "La diagnosi Linux non è serializzabile.".to_owned())
     }
 
     #[cfg(not(target_os = "linux"))]

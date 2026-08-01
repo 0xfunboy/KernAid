@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kernaid.dev/schemas/trusted-rescue-images.v1.json",
+  "title": "KernAid trusted Rescue images catalog",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "catalogRevision", "images"],
+  "properties": {
+    "schema": {
+      "const": "dev.kernaid.trusted-rescue-images.v1"
+    },
+    "catalogRevision": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "images": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/image"
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "attestation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["passed", "workflowRunId", "workflowRunUrl", "logSha256"],
+      "properties": {
+        "passed": {"const": true},
+        "workflowRunId": {"type": "integer", "minimum": 1},
+        "workflowRunUrl": {
+          "type": "string",
+          "pattern": "^https://github\\.com/0xfunboy/KernAid/actions/runs/[0-9]+(?:/.*)?$"
+        },
+        "logSha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifactName",
+        "artifactVersion",
+        "sha256",
+        "bytes",
+        "qemuAttestations"
+      ],
+      "properties": {
+        "artifactName": {
+          "type": "string",
+          "pattern": "^KernAid-Rescue-[A-Za-z0-9._-]+\\.iso$"
+        },
+        "artifactVersion": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9.+_-]{0,63}$"
+        },
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "bytes": {"type": "integer", "minimum": 1},
+        "qemuAttestations": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["bios", "uefi"],
+          "properties": {
+            "bios": {"$ref": "#/$defs/attestation"},
+            "uefi": {"$ref": "#/$defs/attestation"}
+          }
+        }
+      }
+    }
+  }
+}

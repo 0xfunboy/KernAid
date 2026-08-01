@@ -1,0 +1,47 @@
+name: make-device
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "tools/make-device/**"
+      - ".github/workflows/make-device.yml"
+  pull_request:
+    paths:
+      - "tools/make-device/**"
+      - ".github/workflows/make-device.yml"
+
+permissions: {contents: read}
+
+jobs:
+  unit-and-disposable-loop:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install safety-test tooling
+        run: sudo apt-get update && sudo apt-get install -y shellcheck util-linux
+      - name: Validate Python and shell syntax
+        run: |
+          python3 -m py_compile \
+            tools/make-device/make-device.py \
+            tools/make-device/catalog-entry.py \
+            tools/make-device/tests/test_make_device.py
+          bash -n tools/make-device/tests/loop-smoke.sh
+          shellcheck tools/make-device/tests/loop-smoke.sh
+      - name: Run at least 40 isolated unit tests
+        run: |
+          unit_count="$(python3 - <<'PY'
+          import unittest
+
+          suite = unittest.defaultTestLoader.discover("tools/make-device/tests")
+          print(suite.countTestCases())
+          PY
+          )"
+          test "$unit_count" -ge 40
+          echo "Running $unit_count make-device unit tests"
+          PYTHONDONTWRITEBYTECODE=1 \
+            python3 -m unittest discover -s tools/make-device/tests -v
+      - name: Flash and verify a disposable loop device
+        run: sudo tools/make-device/tests/loop-smoke.sh

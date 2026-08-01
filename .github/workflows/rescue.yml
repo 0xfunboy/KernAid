@@ -3,7 +3,19 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
-    paths: ["rescue/**", "tools/build-rescue/**", "apps/desk/**", "pnpm-lock.yaml", ".github/workflows/rescue.yml"]
+    paths:
+      - "rescue/**"
+      - "tools/build-rescue/**"
+      - "tools/make-device/catalog-entry.py"
+      - "apps/desk/**"
+      - "packs/linux/**"
+      - "crates/rescue-secrets/**"
+      - "crates/storage/**"
+      - "crates/device-identity/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "pnpm-lock.yaml"
+      - ".github/workflows/rescue.yml"
 permissions: {contents: read}
 jobs:
   build-and-smoke-test:
@@ -30,6 +42,25 @@ jobs:
         run: KERNAID_SMOKE_LOG=rescue-smoke-bios.log ./tools/build-rescue/qemu-smoke.sh bios
       - name: QEMU UEFI smoke test
         run: KERNAID_SMOKE_LOG=rescue-smoke-uefi.log ./tools/build-rescue/qemu-smoke.sh uefi
+      - name: Derive catalog entry from the tested ISO and attested QEMU logs
+        env:
+          KERNAID_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          KERNAID_ARTIFACT_VERSION: ci-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          iso_sha256="$(sha256sum KernAid-Rescue-amd64.iso | awk '{print $1}')"
+          /usr/bin/python3 -I ./tools/make-device/catalog-entry.py \
+            --iso "$PWD/KernAid-Rescue-amd64.iso" \
+            --sha256 "$iso_sha256" \
+            --artifact-version "$KERNAID_ARTIFACT_VERSION" \
+            --bios-run-id "$GITHUB_RUN_ID" \
+            --bios-run-url "$KERNAID_RUN_URL" \
+            --bios-log "$PWD/rescue-smoke-bios.log" \
+            --uefi-run-id "$GITHUB_RUN_ID" \
+            --uefi-run-url "$KERNAID_RUN_URL" \
+            --uefi-log "$PWD/rescue-smoke-uefi.log" \
+            > KernAid-Rescue-amd64.catalog-entry.json
+          /usr/bin/python3 -m json.tool \
+            KernAid-Rescue-amd64.catalog-entry.json >/dev/null
       - name: Publish smoke diagnostics
         if: always()
         uses: actions/upload-artifact@v4
@@ -45,5 +76,6 @@ jobs:
           path: |
             KernAid-Rescue-amd64.iso
             KernAid-Rescue-amd64.iso.sha256
+            KernAid-Rescue-amd64.catalog-entry.json
           if-no-files-found: error
           retention-days: 14
