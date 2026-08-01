@@ -5,7 +5,7 @@ Requires=kernaid-ui.service
 
 [Service]
 Type=oneshot
-ExecStart=/bin/sh -c 'curl --fail --silent --show-error http://127.0.0.1:4173/ >/dev/null && echo KERNAID_RESCUE_READY >/dev/ttyS0'
+ExecStart=/bin/sh /usr/lib/kernaid/ready-check
 RemainAfterExit=yes
 
 [Install]

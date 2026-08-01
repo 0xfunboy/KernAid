@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+base_url=http://127.0.0.1:4173
+index="$(curl --fail --silent --show-error "$base_url/")"
+script_path="$(printf '%s' "$index" | sed -n 's/.*src="\.\/\([^"?]*\)".*/\1/p' | head -n 1)"
+test -n "$script_path"
+case "$script_path" in assets/*.js) ;; *) exit 1 ;; esac
+curl --fail --silent --show-error "$base_url/$script_path" >/dev/null
+echo KERNAID_RESCUE_READY >/dev/ttyS0
