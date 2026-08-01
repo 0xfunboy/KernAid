@@ -12,6 +12,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install disposable-image tooling
-        run: sudo apt-get update && sudo apt-get install -y cryptsetup gdisk
+        run: sudo apt-get update && sudo apt-get install -y cryptsetup gdisk shellcheck
+      - name: Validate the vault test shell
+        run: bash -n ./tools/test-vault/luks-roundtrip.sh && shellcheck ./tools/test-vault/luks-roundtrip.sh
       - name: Prove encrypted persistence on a disposable image
         run: sudo ./tools/test-vault/luks-roundtrip.sh
