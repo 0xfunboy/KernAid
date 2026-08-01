@@ -10,5 +10,6 @@
     "test": "pnpm -r test",
     "run:desk": "pnpm --filter @kernaid/desk tauri dev"
   },
-  "devDependencies": { "@eslint/js": "^9.25.0", "eslint": "^9.25.0", "prettier": "^3.5.3", "typescript": "^5.8.3", "typescript-eslint": "^8.31.0" }
+  "devDependencies": { "@eslint/js": "^9.25.0", "eslint": "^9.25.0", "prettier": "^3.5.3", "typescript": "^5.8.3", "typescript-eslint": "^8.31.0" },
+  "pnpm": { "overrides": { "@types/node": "^24.10.0" } }
 }
