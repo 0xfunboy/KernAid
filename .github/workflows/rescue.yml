@@ -1,0 +1,33 @@
+name: rescue
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ["rescue/**", "tools/build-rescue/**", "apps/desk/**", "pnpm-lock.yaml", ".github/workflows/rescue.yml"]
+permissions: {contents: read}
+jobs:
+  build-and-smoke-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: {version: 9.15.9}
+      - uses: actions/setup-node@v4
+        with: {node-version: 24.18.0, cache: pnpm}
+      - run: pnpm install --frozen-lockfile
+      - name: Install image and VM tooling
+        run: sudo apt-get update && sudo apt-get install -y live-build qemu-system-x86 ovmf
+      - name: Build hybrid BIOS and UEFI ISO
+        run: sudo env PATH="$PATH" ./tools/build-rescue/build.sh
+      - name: QEMU BIOS smoke test
+        run: ./tools/build-rescue/qemu-smoke.sh
+      - name: Publish checksums and image
+        uses: actions/upload-artifact@v4
+        with:
+          name: KernAid-Rescue-amd64
+          path: |
+            KernAid-Rescue-amd64.iso
+            KernAid-Rescue-amd64.iso.sha256
+          if-no-files-found: error
+          retention-days: 14

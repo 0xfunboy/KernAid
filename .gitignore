@@ -1,7 +1,14 @@
 /target/
 **/node_modules/
-/dist/
+**/dist/
 *.log
+KernAid-Rescue-*.iso
+KernAid-Rescue-*.iso.sha256
+rescue/live-build/.build/
+rescue/live-build/binary/
+rescue/live-build/cache/
+rescue/live-build/chroot/
+rescue/live-build/.build
 .env
 .env.*
 !.env.example

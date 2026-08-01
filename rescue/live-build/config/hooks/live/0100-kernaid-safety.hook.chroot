@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+systemctl enable kernaid-ready.service
+mkdir -p /etc/polkit-1/rules.d
+cat > /etc/polkit-1/rules.d/49-kernaid-observe.rules <<'RULE'
+polkit.addRule(function(action, subject) {
+  if (subject.user == "kernaid" && action.id.indexOf("org.freedesktop.udisks2.filesystem-mount") == 0) {
+    return polkit.Result.NO;
+  }
+});
+RULE
