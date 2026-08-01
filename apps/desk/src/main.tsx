@@ -21,6 +21,7 @@ function App() {
   const [nativeEvidence, setNativeEvidence] = useState<NativeObservation[]>([]);
   const [inventoryReady, setInventoryReady] = useState(!hasLocalCollector());
   const [sessionId, setSessionId] = useState<string>();
+  const [targetFingerprint, setTargetFingerprint] = useState<string>();
 
   useEffect(() => {
     if (!hasLocalCollector()) return;
@@ -31,7 +32,8 @@ function App() {
   }, []);
 
   async function fingerprint(items: NativeObservation[]): Promise<string> {
-    const canonical = items.map(item => `${item.collector}\0${item.output}`).join("\0");
+    const identity = items.filter(item => /hostname|block\.inventory|\.disks$|\.system$/.test(item.collector));
+    const canonical = identity.map(item => `${item.collector}\0${item.output}`).join("\0");
     const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(canonical));
     return `sha256:${Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, "0")).join("")}`;
   }
@@ -42,6 +44,7 @@ function App() {
     try {
       setWorkflow("Observe"); setStatus("Raccolta evidenze in sola lettura…");
       const targetFingerprint = nativeEvidence.length ? await fingerprint(nativeEvidence) : `sha256:${"0".repeat(64)}`;
+      setTargetFingerprint(targetFingerprint);
       const session = await driver.startSession({ mode: isNative() ? "resident" : "rescue", targetFingerprint });
       setSessionId(session.id);
       const observed: Evidence[] = [];
@@ -70,9 +73,13 @@ function App() {
   }
 
   async function verify() {
-    if (!plan || !sessionId || busy) return;
+    if (!plan || !sessionId || !targetFingerprint || busy) return;
     setBusy(true); setWorkflow("Verify"); setStatus("Verifica del piano e delle evidenze…");
     try {
+      if (hasLocalCollector()) {
+        const current = await collectLocalInventory();
+        if (await fingerprint(current) !== targetFingerprint) throw new Error("Il target è cambiato: piano annullato, ripetere la diagnosi.");
+      }
       for await (const event of driver.executePlan(plan.planId)) setStatus(event.message);
       setReport(await driver.exportReport(sessionId, "json"));
     } catch (error) { setStatus(error instanceof Error ? error.message : "Verifica non riuscita"); }
