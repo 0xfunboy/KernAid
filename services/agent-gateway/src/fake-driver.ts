@@ -1,11 +1,22 @@
 import type {
   ArtifactRef,
+  AuditRecord,
+  AuditRecordType,
+  AuditSink,
+  AuditSinkStatus,
   EvidenceRequest,
   ReportFormat,
   SessionDriver,
   SessionEvent,
   SessionInfo,
   StartSession,
+} from "@kernaid/session-driver";
+import {
+  UNAVAILABLE_AUDIT_STATUS,
+  auditStatusesEqual,
+  parseArtifactRef,
+  parseAuditRecord,
+  parseAuditSinkStatus,
 } from "@kernaid/session-driver";
 import {
   parseApproval,
@@ -22,6 +33,7 @@ import {
   type ValidatedPlan,
 } from "@kernaid/schemas";
 import { OfflineRulesProvider, type Provider } from "./fake-provider.js";
+import { InMemoryAuditSink } from "./audit-sink.js";
 import { redactForProvider } from "./redaction.js";
 
 const FINGERPRINT = /^sha256:[a-f0-9]{64}$/;
@@ -29,6 +41,9 @@ const MAX_SESSIONS = 128;
 const MAX_EVIDENCE_PER_SESSION = 128;
 const MAX_EVIDENCE_BYTES = 64 * 1024;
 const MAX_PROMPT_LENGTH = 8 * 1024;
+const MAX_PROPOSALS_PER_SESSION = 128;
+const MAX_APPROVALS_PER_SESSION = 128;
+const MAX_EVENTS_PER_SESSION = 1_024;
 
 type DriverState =
   "observe" | "diagnose" | "plan" | "verify" | "complete" | "failed";
@@ -55,6 +70,9 @@ const fixtureExecutor: ActionExecutor = {
 interface SessionRecord {
   input: StartSession;
   state: DriverState;
+  auditStatus: AuditSinkStatus;
+  auditSequence: number;
+  auditFailed: boolean;
   evidence: Evidence[];
   proposals: DiagnosisProposal[];
   decisions: Approval[];
@@ -76,6 +94,7 @@ export class LocalSessionDriver implements SessionDriver {
   constructor(
     private readonly provider: Provider = new OfflineRulesProvider(),
     private readonly executor: ActionExecutor = fixtureExecutor,
+    private readonly auditSink: AuditSink = new InMemoryAuditSink(),
   ) {}
 
   async startSession(input: StartSession): Promise<SessionInfo> {
@@ -86,15 +105,27 @@ export class LocalSessionDriver implements SessionDriver {
     if (input.mode !== "resident" && input.mode !== "rescue")
       throw new Error("invalid session mode");
     const id = `S-${crypto.randomUUID()}`;
-    this.sessions.set(id, {
+    const session: SessionRecord = {
       input: Object.freeze(structuredClone(input)),
       state: "observe",
+      auditStatus: this.sinkStatus(),
+      auditSequence: 0,
+      auditFailed: false,
       evidence: [],
       proposals: [],
       decisions: [],
       events: [],
+    };
+    await this.appendAudit(session, id, "session.started", {
+      mode: input.mode,
+      targetFingerprint: input.targetFingerprint,
     });
-    return { id, state: "observe" };
+    this.sessions.set(id, session);
+    return {
+      id,
+      state: "observe",
+      auditStatus: structuredClone(session.auditStatus),
+    };
   }
 
   async *sendUserPrompt(
@@ -102,12 +133,14 @@ export class LocalSessionDriver implements SessionDriver {
     prompt: string,
   ): AsyncIterable<SessionEvent> {
     const session = this.session(sessionId);
+    this.ensureAuditHealthy(session);
     if (session.state !== "observe" && session.state !== "diagnose")
       throw new Error("session is not accepting diagnosis prompts");
     if (!prompt.trim() || prompt.length > MAX_PROMPT_LENGTH)
       throw new Error("objective is required and must be bounded");
     if (session.evidence.length === 0) throw new Error("evidence is required");
-    session.state = "diagnose";
+    if (session.proposals.length >= MAX_PROPOSALS_PER_SESSION)
+      throw new Error("diagnosis limit reached");
     yield {
       type: "status",
       message: "Analisi deterministica delle evidenze locali",
@@ -116,11 +149,25 @@ export class LocalSessionDriver implements SessionDriver {
       evidence: structuredClone(evidence),
       content: this.content.get(evidence.id) ?? "",
     }));
-    const proposal = parseDiagnosisProposal(
+    const providerProposal = parseDiagnosisProposal(
       await this.provider.diagnose(redactForProvider(prompt), records),
     );
+    const proposal = parseDiagnosisProposal({
+      ...providerProposal,
+      diagnosis: redactForProvider(providerProposal.diagnosis),
+      requestedEvidence: providerProposal.requestedEvidence.map((item) =>
+        redactForProvider(item),
+      ),
+    });
     this.assertEvidenceBinding(session, proposal.evidenceIds);
+    await this.appendAudit(session, sessionId, "diagnosis", {
+      diagnosisSha256: await sha256(proposal.diagnosis),
+      confidence: proposal.confidence,
+      evidenceIds: proposal.evidenceIds,
+      requestedEvidenceCount: proposal.requestedEvidence.length,
+    });
     session.proposals.push(proposal);
+    session.state = "diagnose";
     yield {
       type: "proposal",
       message: proposal.diagnosis,
@@ -133,6 +180,7 @@ export class LocalSessionDriver implements SessionDriver {
     request: EvidenceRequest,
   ): Promise<Evidence[]> {
     const session = this.session(sessionId);
+    this.ensureAuditHealthy(session);
     if (session.state !== "observe" && session.state !== "diagnose")
       throw new Error("session is not accepting evidence");
     if (session.evidence.length >= MAX_EVIDENCE_PER_SESSION)
@@ -150,16 +198,29 @@ export class LocalSessionDriver implements SessionDriver {
     const item = parseEvidence({
       schemaVersion: "1.0",
       id: `E-${++this.evidenceSequence}`,
-      collector: request.collector,
-      target: request.target,
+      collector: redactForProvider(request.collector),
+      target: redactForProvider(request.target),
       capturedAt: new Date().toISOString(),
       contentType: request.contentType ?? "text/plain",
       sha256: hash,
       sensitivity: "system",
       trust: "observed-untrusted",
-      summary: request.summary ?? "Inventario raccolto in sola lettura",
+      summary: redactForProvider(
+        request.summary ?? "Inventario raccolto in sola lettura",
+      ),
       blobRef: `sha256:${hash}`,
     });
+    await this.appendAudit(
+      session,
+      sessionId,
+      "evidence",
+      {
+        evidenceId: item.id,
+        sha256: item.sha256,
+        sensitivity: item.sensitivity,
+      },
+      item.capturedAt,
+    );
     session.evidence.push(item);
     this.content.set(item.id, redactForProvider(observedContent));
     return [structuredClone(item)];
@@ -170,6 +231,7 @@ export class LocalSessionDriver implements SessionDriver {
     proposalValue: DiagnosisProposal,
   ): Promise<ValidatedPlan> {
     const session = this.session(sessionId);
+    this.ensureAuditHealthy(session);
     if (session.state !== "diagnose")
       throw new Error("session is not ready to stage a plan");
     const proposal = parseDiagnosisProposal(proposalValue);
@@ -194,6 +256,13 @@ export class LocalSessionDriver implements SessionDriver {
         },
       ],
     });
+    await this.appendAudit(session, sessionId, "plan", {
+      planId: plan.planId,
+      targetFingerprint: plan.targetFingerprint,
+      risk: plan.risk,
+      evidenceIds: plan.evidenceIds,
+      actions: plan.steps.map((step) => step.action),
+    });
     this.plans.set(plan.planId, { sessionId, plan, executed: false });
     session.state = "plan";
     return structuredClone(plan);
@@ -202,6 +271,7 @@ export class LocalSessionDriver implements SessionDriver {
   async approvePlan(planId: string, approvalValue: Approval): Promise<void> {
     const record = this.plan(planId);
     const session = this.session(record.sessionId);
+    this.ensureAuditHealthy(session);
     if (record.executed || session.state !== "plan")
       throw new Error("plan is not awaiting approval");
     const approval = parseApproval(approvalValue);
@@ -217,7 +287,25 @@ export class LocalSessionDriver implements SessionDriver {
       )
     )
       throw new Error("approval id was already used");
-    session.decisions.push(approval);
+    if (session.decisions.length >= MAX_APPROVALS_PER_SESSION)
+      throw new Error("approval limit reached");
+    const storedApproval = parseApproval({
+      ...approval,
+      approvedBy: redactForProvider(approval.approvedBy),
+      ...(approval.typedConfirmation === undefined
+        ? {}
+        : {
+            typedConfirmation: redactForProvider(approval.typedConfirmation),
+          }),
+    });
+    await this.appendAudit(session, record.sessionId, "approval", {
+      approvalId: storedApproval.approvalId,
+      planId: storedApproval.planId,
+      targetFingerprint: storedApproval.targetFingerprint,
+      approvedAt: storedApproval.approvedAt,
+      approvedBySha256: await sha256(storedApproval.approvedBy),
+    });
+    session.decisions.push(storedApproval);
   }
 
   async *executePlan(
@@ -225,8 +313,11 @@ export class LocalSessionDriver implements SessionDriver {
   ): AsyncGenerator<ExecutionEvent, void, unknown> {
     const record = this.plan(planId);
     const session = this.session(record.sessionId);
+    this.ensureAuditHealthy(session);
     if (record.executed || session.state !== "plan")
       throw new Error("plan was already executed or is out of state");
+    if (session.events.length + 2 > MAX_EVENTS_PER_SESSION)
+      throw new Error("execution event limit reached");
     const plan = parseValidatedPlan(record.plan);
     this.assertEvidenceBinding(session, plan.evidenceIds);
     if (
@@ -238,14 +329,15 @@ export class LocalSessionDriver implements SessionDriver {
       throw new Error("only the typed R0 observation action is enabled");
     }
     record.executed = true;
-    session.state = "verify";
     const started = this.event(
       planId,
       session.events.length + 1,
       "started",
       "Verifica del piano R0 avviata",
     );
+    await this.appendExecutionAudit(session, record.sessionId, started);
     session.events.push(started);
+    session.state = "verify";
     yield structuredClone(started);
     try {
       await this.executor.execute({
@@ -262,6 +354,7 @@ export class LocalSessionDriver implements SessionDriver {
         "failed",
         "Il broker locale ha rifiutato il piano; nessuna modifica è stata eseguita",
       );
+      await this.appendExecutionAudit(session, record.sessionId, failed);
       session.events.push(failed);
       session.state = "failed";
       yield structuredClone(failed);
@@ -273,6 +366,7 @@ export class LocalSessionDriver implements SessionDriver {
       "succeeded",
       "Evidenze presenti e piano R0 verificato; nessuna modifica eseguita",
     );
+    await this.appendExecutionAudit(session, record.sessionId, succeeded);
     session.events.push(succeeded);
     session.state = "complete";
     yield structuredClone(succeeded);
@@ -289,6 +383,7 @@ export class LocalSessionDriver implements SessionDriver {
     if (format !== "json" && format !== "markdown")
       throw new Error("unsupported report format");
     const session = this.session(sessionId);
+    this.ensureAuditHealthy(session);
     const verification = session.events.some(
       (event) => event.status === "failed",
     )
@@ -308,25 +403,49 @@ export class LocalSessionDriver implements SessionDriver {
       unresolvedRisks: [
         "Nessuna riparazione è stata eseguita",
         "Confermare la diagnosi con controlli mirati",
+        ...(session.auditStatus.state === "unavailable"
+          ? [
+              "Audit sicuro non disponibile: questo report non è firmato e non è persistente",
+            ]
+          : []),
       ],
     });
     const body =
       format === "json"
         ? JSON.stringify(report, null, 2)
         : this.markdown(report);
-    const mediaType = format === "json" ? "application/json" : "text/markdown";
-    const digest = await crypto.subtle.digest(
-      "SHA-256",
-      new TextEncoder().encode(body),
-    );
-    const sha256 = Array.from(new Uint8Array(digest), (byte) =>
-      byte.toString(16).padStart(2, "0"),
-    ).join("");
-    return {
-      mediaType,
-      uri: `data:${mediaType};charset=utf-8,${encodeURIComponent(body)}`,
-      sha256,
-    };
+    const payloadMediaType =
+      format === "json" ? "application/json" : "text/markdown";
+    const reportSha256 = await sha256(body);
+    await this.appendAudit(session, sessionId, "report", {
+      format,
+      payloadMediaType,
+      payloadSha256: reportSha256,
+      verification,
+    });
+
+    try {
+      const artifact = parseArtifactRef(
+        await this.auditSink.sealReport({
+          schemaVersion: "1.0",
+          sessionId,
+          format,
+          payloadMediaType,
+          body,
+          payloadSha256: reportSha256,
+        }),
+      );
+      if (
+        artifact.payloadMediaType !== payloadMediaType ||
+        artifact.payloadSha256 !== reportSha256 ||
+        !auditStatusesEqual(artifact.auditStatus, session.auditStatus)
+      )
+        throw new Error("invalid sealed artifact");
+      return artifact;
+    } catch {
+      this.failAudit(session);
+      throw auditBoundaryError();
+    }
   }
 
   private event(
@@ -348,6 +467,68 @@ export class LocalSessionDriver implements SessionDriver {
 
   private markdown(report: SessionReport): string {
     return `# KernAid report\n\nSession: ${report.sessionId}\n\n## Diagnosis\n\n${report.inferences.map((item) => item.diagnosis).join("\n\n")}\n\n## Evidence\n\n${report.facts.map((item) => `- ${item.id}: ${item.collector} — ${item.summary} (SHA-256 ${item.sha256})`).join("\n")}\n\n## Decisions\n\n${report.decisions.map((item) => `- ${item.approvalId}: ${item.approvedBy} at ${item.approvedAt}`).join("\n") || "- No mutating action was approved"}\n\n## Verification\n\n${report.verification}\n\n## Unresolved risks\n\n${report.unresolvedRisks.map((item) => `- ${item}`).join("\n")}\n`;
+  }
+
+  private async appendExecutionAudit(
+    session: SessionRecord,
+    sessionId: string,
+    event: ExecutionEvent,
+  ): Promise<void> {
+    await this.appendAudit(
+      session,
+      sessionId,
+      "execution",
+      {
+        planId: event.planId,
+        eventSequence: event.sequence,
+        status: event.status,
+        action: event.action,
+      },
+      event.capturedAt,
+    );
+  }
+
+  private async appendAudit(
+    session: SessionRecord,
+    sessionId: string,
+    type: AuditRecordType,
+    payload: AuditRecord["payload"],
+    capturedAt = new Date().toISOString(),
+  ): Promise<void> {
+    this.ensureAuditHealthy(session);
+    const sequence = session.auditSequence + 1;
+    try {
+      const record = parseAuditRecord({
+        schemaVersion: "1.0",
+        type,
+        sessionId,
+        sequence,
+        capturedAt,
+        payload,
+      });
+      await this.auditSink.append(record);
+      session.auditSequence = sequence;
+    } catch {
+      this.failAudit(session);
+      throw auditBoundaryError();
+    }
+  }
+
+  private ensureAuditHealthy(session: SessionRecord): void {
+    if (session.auditFailed) throw auditBoundaryError();
+  }
+
+  private failAudit(session: SessionRecord): void {
+    session.auditFailed = true;
+    session.state = "failed";
+  }
+
+  private sinkStatus(): AuditSinkStatus {
+    try {
+      return parseAuditSinkStatus(this.auditSink.status);
+    } catch {
+      return structuredClone(UNAVAILABLE_AUDIT_STATUS);
+    }
   }
 
   private assertEvidenceBinding(
@@ -396,4 +577,18 @@ function arraysEqual(
     left.length === right.length &&
     left.every((value, index) => value === right[index])
   );
+}
+
+async function sha256(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(value),
+  );
+  return Array.from(new Uint8Array(digest), (byte) =>
+    byte.toString(16).padStart(2, "0"),
+  ).join("");
+}
+
+function auditBoundaryError(): Error {
+  return new Error("Audit persistence failed; session is closed");
 }
