@@ -7,6 +7,10 @@ fail() {
     exit 1
 }
 
+if command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+    fail "live user unexpectedly has passwordless root"
+fi
+
 index=
 attempt=1
 while [ "$attempt" -le 30 ]; do
@@ -24,4 +28,8 @@ curl --fail --silent --show-error --max-time 10 "$base_url/$script_path" >/dev/n
 inventory="$(curl --fail --silent --show-error --max-time 60 "$base_url/api/inventory")" || fail "inventory endpoint failed"
 printf '%s' "$inventory" | grep -q '"collector": "system.hostname"' || fail "hostname evidence is missing"
 printf '%s' "$inventory" | grep -q '"collector": "linux.block.inventory"' || fail "storage evidence is missing"
+fingerprint="$(printf '%s' "$inventory" | python3 -c 'import hashlib,json,sys; items=json.load(sys.stdin); selected=[item for item in items if "hostname" in item["collector"] or "block.inventory" in item["collector"] or item["collector"].endswith(".disks") or item["collector"].endswith(".system")]; canonical="\0".join(item["collector"] + "\0" + item["output"] for item in selected); print("sha256:" + hashlib.sha256(canonical.encode()).hexdigest())')" || fail "target fingerprint failed"
+request="$(python3 -c 'import json,sys; print(json.dumps({"sessionId":"S-qemu-readiness","targetFingerprint":sys.argv[1],"sequence":1,"action":"system.observe.noop"}))' "$fingerprint")"
+authorization="$(curl --fail --silent --show-error --max-time 60 -H 'Origin: http://127.0.0.1:4173' -H 'Content-Type: application/json' --data "$request" "$base_url/api/authorize-observe")" || fail "R0 authorization endpoint failed"
+printf '%s' "$authorization" | grep -q '"status":"observed"' || fail "R0 authorization was not accepted"
 echo KERNAID_RESCUE_READY >/dev/ttyS0

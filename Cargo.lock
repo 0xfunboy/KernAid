@@ -1719,7 +1719,10 @@ dependencies = [
 name = "kernaid-desk-shell"
 version = "0.1.0"
 dependencies = [
+ "kernaid-broker",
+ "kernaid-protocol",
  "serde",
+ "sha2",
  "tauri",
  "tauri-build",
 ]

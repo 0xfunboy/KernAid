@@ -20,6 +20,7 @@ check:
 test:
     cargo test --workspace
     pnpm test
+    python3 -m unittest discover -s tests/rescue -p 'test_*.py'
     just test-observe
 
 test-observe:
@@ -38,8 +39,14 @@ run-desk:
 build-rescue:
     ./tools/build-rescue/build.sh
 
-qemu-bios qemu-uefi qemu-secureboot:
-    @echo "QEMU image tests are a Phase 0 release gate; build a rescue image first."
+qemu-bios:
+    ./tools/build-rescue/qemu-smoke.sh bios
+
+qemu-uefi:
+    ./tools/build-rescue/qemu-smoke.sh uefi
+
+qemu-secureboot:
+    @echo "Secure Boot is an open release gate; no shipping signed boot chain exists yet."
     @exit 2
 
 verify-release:

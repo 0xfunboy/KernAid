@@ -8,5 +8,8 @@ tauri-build = { version = "2.2", features = [] }
 [dependencies]
 tauri = { version = "2.5", features = [] }
 serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+kernaid-broker = { path = "../../../crates/broker" }
+kernaid-protocol = { path = "../../../crates/protocol" }
 [lints]
 workspace=true

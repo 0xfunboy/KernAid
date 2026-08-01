@@ -3,7 +3,13 @@ import { createRoot } from "react-dom/client";
 import { LocalSessionDriver } from "@kernaid/agent-gateway";
 import type { ArtifactRef } from "@kernaid/session-driver";
 import type { DiagnosisProposal, Evidence, ValidatedPlan } from "@kernaid/schemas";
-import { collectLocalInventory, hasLocalCollector, isNative, type NativeObservation } from "./native";
+import {
+  authorizeObserve,
+  collectLocalInventory,
+  hasLocalCollector,
+  isNative,
+  type NativeObservation,
+} from "./native";
 import "./style.css";
 
 type Workflow = "Observe" | "Diagnose" | "Plan" | "Verify";
@@ -77,8 +83,14 @@ function App() {
     setBusy(true); setWorkflow("Verify"); setStatus("Verifica del piano e delle evidenze…");
     try {
       if (hasLocalCollector()) {
-        const current = await collectLocalInventory();
-        if (await fingerprint(current) !== targetFingerprint) throw new Error("Il target è cambiato: piano annullato, ripetere la diagnosi.");
+        const step = plan.steps[0];
+        if (!step || step.action !== "system.observe.noop") throw new Error("Il piano contiene un'azione non consentita.");
+        await authorizeObserve({
+          sessionId,
+          targetFingerprint,
+          sequence: 1,
+          action: "system.observe.noop",
+        });
       }
       for await (const event of driver.executePlan(plan.planId)) setStatus(event.message);
       setReport(await driver.exportReport(sessionId, "json"));

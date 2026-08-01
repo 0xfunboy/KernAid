@@ -35,7 +35,7 @@ lb config \
   --archive-areas "main contrib non-free-firmware" \
   --debian-installer none \
   --apt-recommends false \
-  --bootappend-live "boot=live components username=kernaid hostname=kernaid-rescue console=tty0 console=ttyS0,115200n8"
+  --bootappend-live "boot=live components noroot username=kernaid hostname=kernaid-rescue console=tty0 console=ttyS0,115200n8"
 lb build
 
 iso="$(find . -maxdepth 1 -name 'live-image-amd64*.hybrid.iso' -o -name 'live-image-amd64*.iso' | head -n 1)"
