@@ -1,5 +1,26 @@
 {
   "schema": "dev.kernaid.trusted-rescue-images.v1",
-  "catalogRevision": 0,
-  "images": []
+  "catalogRevision": 1,
+  "images": [
+    {
+      "artifactName": "KernAid-Rescue-amd64.iso",
+      "artifactVersion": "ci-30698824356-1",
+      "sha256": "11a0ade7e05a01a06cf72770403f8f9197a40608d5975635dd360cea4d307801",
+      "bytes": 1316339712,
+      "qemuAttestations": {
+        "bios": {
+          "passed": true,
+          "workflowRunId": 30698824356,
+          "workflowRunUrl": "https://github.com/0xfunboy/KernAid/actions/runs/30698824356",
+          "logSha256": "0a4a1bc488b35c742720172c9134319627303c20ada23344e34fc11f09f8754e"
+        },
+        "uefi": {
+          "passed": true,
+          "workflowRunId": 30698824356,
+          "workflowRunUrl": "https://github.com/0xfunboy/KernAid/actions/runs/30698824356",
+          "logSha256": "6beee30bae93b1ea45b4aae91f44b46a29b0f36be5672386b3d9a1a41cd3ad6c"
+        }
+      }
+    }
+  ]
 }

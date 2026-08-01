@@ -397,13 +397,23 @@ class InventoryTests(unittest.TestCase):
 
 
 class PrimitiveTests(unittest.TestCase):
-    def test_checked_in_catalog_is_valid_and_intentionally_empty(self) -> None:
+    def test_checked_in_catalog_contains_the_attested_rescue_image(self) -> None:
         catalog_path = MODULE_PATH.parent / make_device.TRUST_CATALOG_FILENAME
         catalog = make_device.parse_trust_catalog(
             catalog_path.read_text(encoding="utf-8")
         )
-        self.assertEqual(catalog.revision, 0)
-        self.assertEqual(catalog.images, ())
+        self.assertEqual(catalog.revision, 1)
+        self.assertEqual(len(catalog.images), 1)
+        trusted = catalog.images[0]
+        self.assertEqual(trusted.artifact_name, "KernAid-Rescue-amd64.iso")
+        self.assertEqual(trusted.artifact_version, "ci-30698824356-1")
+        self.assertEqual(
+            trusted.sha256,
+            "11a0ade7e05a01a06cf72770403f8f9197a40608d5975635dd360cea4d307801",
+        )
+        self.assertEqual(trusted.size, 1_316_339_712)
+        self.assertEqual(trusted.bios.workflow_run_id, 30_698_824_356)
+        self.assertEqual(trusted.uefi.workflow_run_id, 30_698_824_356)
         schema = json.loads(
             (MODULE_PATH.parent / "trusted-rescue-images.schema.json").read_text(
                 encoding="utf-8"

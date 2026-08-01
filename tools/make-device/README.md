@@ -6,9 +6,12 @@ sovrascritto.** La coda non viene cancellata.
 
 ## Stato del trust catalog
 
-Il catalogo ufficiale `trusted-rescue-images.v1.json` è intenzionalmente vuoto.
-Finché CI non vi inserisce una ISO con hash e attestazioni valide, il tool
-rifiuta fail-closed ogni supporto fisico. Non basta fornire un SHA-256 arbitrario
+Il catalogo ufficiale `trusted-rescue-images.v1.json` autorizza la ISO
+`ci-30698824356-1`, SHA-256
+`11a0ade7e05a01a06cf72770403f8f9197a40608d5975635dd360cea4d307801`,
+costruita e avviata con successo in QEMU BIOS e UEFI nel run GitHub Actions
+`30698824356`, con prova byte-per-byte di zero scritture sul target. Ogni altra
+immagine viene rifiutata fail-closed; non basta fornire un SHA-256 arbitrario
 dalla riga di comando.
 
 Ogni voce lega esattamente:
@@ -27,7 +30,7 @@ recente (`lsblk`, `losetup`, `wipefs`), `udevadm` da systemd-udev e GNU `dd`.
 L'interprete è fissato a `/usr/bin/python3 -I`; non usare una copia del tool da
 una checkout scrivibile dall'utente.
 
-Dopo avere popolato e revisionato il catalogo ufficiale:
+Installare la copia revisionata del tool e del catalogo ufficiale:
 
 ```text
 sudo install -d -o root -g root -m 0755 /usr/local/libexec/kernaid/make-device
