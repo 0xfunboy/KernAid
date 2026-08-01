@@ -7,5 +7,6 @@ build="build.rs"
 tauri-build = { version = "2.2", features = [] }
 [dependencies]
 tauri = { version = "2.5", features = [] }
+serde = { version = "1", features = ["derive"] }
 [lints]
 workspace=true

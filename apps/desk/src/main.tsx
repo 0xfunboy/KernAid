@@ -1,7 +1,8 @@
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { FakeSessionDriver } from "@kernaid/agent-gateway";
 import type { DiagnosisProposal, Evidence, ValidatedPlan } from "@kernaid/schemas";
+import { collectLocalInventory, isNative, type NativeObservation } from "./native";
 import "./style.css";
 
 type Workflow = "Observe" | "Diagnose" | "Plan" | "Verify";
@@ -16,6 +17,14 @@ function App() {
   const [proposal, setProposal] = useState<DiagnosisProposal>();
   const [plan, setPlan] = useState<ValidatedPlan>();
   const [report, setReport] = useState<string>();
+  const [nativeEvidence, setNativeEvidence] = useState<NativeObservation[]>([]);
+
+  useEffect(() => {
+    if (!isNative()) return;
+    collectLocalInventory()
+      .then(items => setNativeEvidence(items))
+      .catch(error => setStatus(`Inventario locale non disponibile: ${String(error)}`));
+  }, []);
 
   async function diagnose() {
     if (!objective.trim() || busy) return;
@@ -39,13 +48,13 @@ function App() {
 
   return <main>
     <header><strong>KernAid</strong><span>Rescue preview · Fake provider · Vault locked</span></header>
-    <aside><p className="label">TARGET MACHINE</p><h2>Linux fixture</h2>{["Hardware", "Storage", "Boot", "Network"].map((item, index) => <button key={item}>{item} · {index < evidence.length ? "observed" : "pending"}</button>)}</aside>
+    <aside><p className="label">TARGET MACHINE</p><h2>{isNative() ? "Local machine" : "Linux fixture"}</h2>{["Hardware", "Storage", "Boot", "Network"].map((item, index) => <button key={item}>{item} · {index < nativeEvidence.length || index < evidence.length ? "observed" : "pending"}</button>)}{nativeEvidence.map(item => <details key={item.collector}><summary>{item.collector}</summary><pre>{item.output || "Nessun output"}</pre></details>)}</aside>
     <section><div className="steps">{(["Observe", "Diagnose", "Plan", "Repair", "Verify"] as const).map(step => <span className={step === workflow ? "active" : ""} key={step}>{step}</span>)}</div>
       <article><small>{evidence.length ? `${evidence[0].id} · observed-untrusted` : "SESSION NOT STARTED"}</small><h1>{proposal?.diagnosis ?? "Evidence before action."}</h1><p>{status}</p>{proposal && <p>Confidenza: {Math.round(proposal.confidence * 100)}% · Evidenze: {proposal.evidenceIds.join(", ")}</p>}</article>
       <textarea aria-label="Problem description" value={objective} onChange={event => setObjective(event.target.value)} placeholder="Descrivi il problema del computer…" />
       <button className="primary" disabled={!objective.trim() || busy} onClick={diagnose}>{busy ? "Analisi…" : "Diagnostica"}</button>{report && <p className="report">Report pronto: <code>{report}</code></p>}</section>
     <aside className="right"><p className="label">STAGED PLAN</p><h2>{plan ? plan.diagnosis : "Nessuna modifica prevista"}</h2><p>Rischio {plan?.risk ?? "R0"} · {plan?.steps.length ?? 0} azioni</p><hr />{plan?.steps.map(step => <div className="plan" key={step.action}><b>{step.action}</b><small>Validazione: {step.validation}</small></div>)}<p>Le riparazioni reali richiedono backup, risorse esplicite e approvazione locale.</p></aside>
-    <footer>{evidence.length} evidenze · Terminale disabilitato · Audit locale</footer>
+    <footer>{evidence.length + nativeEvidence.length} evidenze · Terminale disabilitato · Audit locale</footer>
   </main>;
 }
 
