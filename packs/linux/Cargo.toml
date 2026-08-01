@@ -4,6 +4,8 @@ version.workspace=true
 edition.workspace=true
 [lints]
 workspace=true
+[dependencies]
+sha2 = "0.10"
 [[bin]]
 name="kernaid-linux-inventory"
 path="src/main.rs"
