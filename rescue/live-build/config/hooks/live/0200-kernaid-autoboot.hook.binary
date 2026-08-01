@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+
+# Debian Live defaults to an infinite boot-menu wait. The workshop image must
+# boot unattended while still leaving a five-second window for diagnostics.
+if [ -f binary/isolinux/isolinux.cfg ]; then
+    sed -i '/^prompt /d; /^timeout /d' binary/isolinux/isolinux.cfg
+    printf '\nprompt 0\ntimeout 50\n' >> binary/isolinux/isolinux.cfg
+fi
+
+for config in binary/boot/grub/grub.cfg binary/EFI/BOOT/grub.cfg; do
+    if [ -f "$config" ]; then
+        sed -i 's/^set timeout=.*/set timeout=5/' "$config"
+        grep -q '^set timeout=' "$config" || printf '\nset timeout=5\n' >> "$config"
+    fi
+done

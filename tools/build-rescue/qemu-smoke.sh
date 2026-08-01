@@ -8,11 +8,13 @@ if [[ "$firmware" != "bios" && "$firmware" != "uefi" ]]; then
   exit 2
 fi
 test -f "$iso" || { echo "ISO not found: $iso" >&2; exit 2; }
-log="$(mktemp)"
+log="${KERNAID_SMOKE_LOG:-$(mktemp)}"
+temporary_log=0
+if [[ -z "${KERNAID_SMOKE_LOG:-}" ]]; then temporary_log=1; fi
 qemu_pid=""
 cleanup() {
   if [[ -n "$qemu_pid" ]]; then kill "$qemu_pid" 2>/dev/null || true; fi
-  rm -f "$log"
+  if [[ "$temporary_log" == "1" ]]; then rm -f "$log"; fi
 }
 trap cleanup EXIT
 
