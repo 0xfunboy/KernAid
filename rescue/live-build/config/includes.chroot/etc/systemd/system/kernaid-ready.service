@@ -1,0 +1,11 @@
+[Unit]
+Description=KernAid Rescue readiness marker
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'echo KERNAID_RESCUE_READY >/dev/ttyS0'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
