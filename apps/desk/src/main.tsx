@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { FakeSessionDriver } from "@kernaid/agent-gateway";
+import type { ArtifactRef } from "@kernaid/session-driver";
 import type { DiagnosisProposal, Evidence, ValidatedPlan } from "@kernaid/schemas";
 import { collectLocalInventory, isNative, type NativeObservation } from "./native";
 import "./style.css";
@@ -16,7 +17,7 @@ function App() {
   const [evidence, setEvidence] = useState<Evidence[]>([]);
   const [proposal, setProposal] = useState<DiagnosisProposal>();
   const [plan, setPlan] = useState<ValidatedPlan>();
-  const [report, setReport] = useState<string>();
+  const [report, setReport] = useState<ArtifactRef>();
   const [nativeEvidence, setNativeEvidence] = useState<NativeObservation[]>([]);
 
   useEffect(() => {
@@ -52,7 +53,7 @@ function App() {
       const staged = await driver.stagePlan(session.id, diagnosis);
       setPlan(staged); setWorkflow("Plan");
       const artifact = await driver.exportReport(session.id, "json");
-      setReport(artifact.uri); setStatus("Diagnosi completata. Nessuna modifica eseguita.");
+      setReport(artifact); setStatus("Diagnosi completata. Nessuna modifica eseguita.");
     } catch (error) { setStatus(error instanceof Error ? error.message : "Errore inatteso"); }
     finally { setBusy(false); }
   }
@@ -63,7 +64,7 @@ function App() {
     <section><div className="steps">{(["Observe", "Diagnose", "Plan", "Repair", "Verify"] as const).map(step => <span className={step === workflow ? "active" : ""} key={step}>{step}</span>)}</div>
       <article><small>{evidence.length ? `${evidence[0].id} · observed-untrusted` : "SESSION NOT STARTED"}</small><h1>{proposal?.diagnosis ?? "Evidence before action."}</h1><p>{status}</p>{proposal && <p>Confidenza: {Math.round(proposal.confidence * 100)}% · Evidenze: {proposal.evidenceIds.join(", ")}</p>}</article>
       <textarea aria-label="Problem description" value={objective} onChange={event => setObjective(event.target.value)} placeholder="Descrivi il problema del computer…" />
-      <button className="primary" disabled={!objective.trim() || busy} onClick={diagnose}>{busy ? "Analisi…" : "Diagnostica"}</button>{report && <p className="report">Report pronto: <code>{report}</code></p>}</section>
+      <button className="primary" disabled={!objective.trim() || busy} onClick={diagnose}>{busy ? "Analisi…" : "Diagnostica"}</button>{report && <p className="report"><a href={report.uri} download="KernAid-report.json">Scarica report JSON</a> · SHA-256 <code>{report.sha256.slice(0, 12)}…</code></p>}</section>
     <aside className="right"><p className="label">STAGED PLAN</p><h2>{plan ? plan.diagnosis : "Nessuna modifica prevista"}</h2><p>Rischio {plan?.risk ?? "R0"} · {plan?.steps.length ?? 0} azioni</p><hr />{plan?.steps.map(step => <div className="plan" key={step.action}><b>{step.action}</b><small>Validazione: {step.validation}</small></div>)}<p>Le riparazioni reali richiedono backup, risorse esplicite e approvazione locale.</p></aside>
     <footer>{evidence.length + nativeEvidence.length} evidenze · Terminale disabilitato · Audit locale</footer>
   </main>;
