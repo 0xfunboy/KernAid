@@ -1,7 +1,13 @@
 import type { Approval, DiagnosisProposal, Evidence, ExecutionEvent, ValidatedPlan } from "@kernaid/schemas";
 export interface StartSession { targetFingerprint:string; mode:"rescue"|"resident" }
 export interface SessionInfo { id:string; state:"observe" }
-export interface EvidenceRequest { collector:string; target:string }
+export interface EvidenceRequest {
+ collector:string;
+ target:string;
+ summary?:string;
+ observedContent?:string;
+ contentType?:string;
+}
 export interface ArtifactRef { mediaType:string; uri:string; sha256:string }
 export type ReportFormat = "json"|"markdown";
 export type SessionEvent = { type:"status"|"proposal"|"error"; message:string; proposal?:DiagnosisProposal };
