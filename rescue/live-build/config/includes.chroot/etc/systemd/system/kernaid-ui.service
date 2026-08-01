@@ -1,0 +1,18 @@
+[Unit]
+Description=KernAid local user interface server
+After=network.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+WorkingDirectory=/opt/kernaid/desk
+ExecStart=/usr/bin/python3 -m http.server 4173 --bind 127.0.0.1
+Restart=on-failure
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/run
+
+[Install]
+WantedBy=multi-user.target

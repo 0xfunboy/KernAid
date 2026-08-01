@@ -1,10 +1,11 @@
 [Unit]
 Description=KernAid Rescue readiness marker
-After=multi-user.target
+After=multi-user.target kernaid-ui.service
+Requires=kernaid-ui.service
 
 [Service]
 Type=oneshot
-ExecStart=/bin/sh -c 'echo KERNAID_RESCUE_READY >/dev/ttyS0'
+ExecStart=/bin/sh -c 'curl --fail --silent --show-error http://127.0.0.1:4173/ >/dev/null && echo KERNAID_RESCUE_READY >/dev/ttyS0'
 RemainAfterExit=yes
 
 [Install]

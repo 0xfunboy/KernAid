@@ -11,6 +11,7 @@ lightdm
 network-manager
 network-manager-gnome
 chromium
+python3-minimal
 sudo
 ca-certificates
 curl

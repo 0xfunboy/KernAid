@@ -1,6 +1,7 @@
 #!/bin/sh
 set -eu
 systemctl enable kernaid-ready.service
+systemctl enable kernaid-ui.service
 mkdir -p /etc/polkit-1/rules.d
 cat > /etc/polkit-1/rules.d/49-kernaid-observe.rules <<'RULE'
 polkit.addRule(function(action, subject) {
