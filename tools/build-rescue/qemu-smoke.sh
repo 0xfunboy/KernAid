@@ -9,7 +9,12 @@ if [[ "$firmware" != "bios" && "$firmware" != "uefi" ]]; then
 fi
 test -f "$iso" || { echo "ISO not found: $iso" >&2; exit 2; }
 log="$(mktemp)"
-trap 'rm -f "$log"' EXIT
+qemu_pid=""
+cleanup() {
+  if [[ -n "$qemu_pid" ]]; then kill "$qemu_pid" 2>/dev/null || true; fi
+  rm -f "$log"
+}
+trap cleanup EXIT
 
 qemu_args=(-machine accel=tcg -m 2048 -smp 2 -cdrom "$iso" -boot d -display none -serial stdio -no-reboot)
 if [[ "$firmware" == "uefi" ]]; then
@@ -24,10 +29,28 @@ if [[ "$firmware" == "uefi" ]]; then
   qemu_args+=(-drive "if=pflash,format=raw,readonly=on,file=$ovmf_code")
 fi
 
-set +e
-timeout 240 qemu-system-x86_64 "${qemu_args[@]}" >"$log" 2>&1
-status=$?
-set -e
-if [[ "$status" -ne 0 && "$status" -ne 124 ]]; then cat "$log"; exit "$status"; fi
-grep -q "KERNAID_RESCUE_READY" "$log" || { tail -n 200 "$log"; echo "Rescue readiness marker not observed" >&2; exit 1; }
-echo "PASS: KernAid Rescue booted with $firmware firmware in QEMU without an attached target disk"
+qemu-system-x86_64 "${qemu_args[@]}" >"$log" 2>&1 &
+qemu_pid=$!
+for _attempt in $(seq 1 240); do
+  if grep -q "KERNAID_RESCUE_READY" "$log"; then
+    kill "$qemu_pid" 2>/dev/null || true
+    wait "$qemu_pid" 2>/dev/null || true
+    qemu_pid=""
+    echo "PASS: KernAid Rescue booted with $firmware firmware in QEMU without an attached target disk"
+    exit 0
+  fi
+  if ! kill -0 "$qemu_pid" 2>/dev/null; then
+    set +e
+    wait "$qemu_pid"
+    status=$?
+    set -e
+    qemu_pid=""
+    cat "$log"
+    echo "QEMU exited before the Rescue readiness marker (status $status)" >&2
+    exit 1
+  fi
+  sleep 1
+done
+tail -n 200 "$log"
+echo "Rescue readiness marker not observed within 240 seconds" >&2
+exit 1
