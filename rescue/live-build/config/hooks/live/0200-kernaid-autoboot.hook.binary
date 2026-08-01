@@ -1,5 +1,7 @@
 #!/bin/sh
 set -eu
+build_dir="$(CDPATH= cd -- "$(dirname "$0")/../../.." && pwd)"
+cd "$build_dir"
 
 # Debian Live defaults to an infinite boot-menu wait. The workshop image must
 # boot unattended while still leaving a five-second window for diagnostics.
@@ -14,3 +16,6 @@ for config in binary/boot/grub/grub.cfg binary/EFI/BOOT/grub.cfg; do
         grep -q '^set timeout=' "$config" || printf '\nset timeout=5\n' >> "$config"
     fi
 done
+
+grep -q '^timeout 50$' binary/isolinux/isolinux.cfg
+echo "KernAid unattended boot timeout installed"

@@ -41,4 +41,5 @@ lb build
 iso="$(find . -maxdepth 1 -name 'live-image-amd64*.hybrid.iso' -o -name 'live-image-amd64*.iso' | head -n 1)"
 test -n "$iso"
 mv "$iso" "$repo_dir/KernAid-Rescue-amd64.iso"
-sha256sum "$repo_dir/KernAid-Rescue-amd64.iso" > "$repo_dir/KernAid-Rescue-amd64.iso.sha256"
+cd "$repo_dir"
+sha256sum KernAid-Rescue-amd64.iso > KernAid-Rescue-amd64.iso.sha256
