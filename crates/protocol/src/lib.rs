@@ -31,6 +31,7 @@ pub struct ValidatedPlan {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BrokerRequest {
     pub session_id: String,
+    pub plan_id: String,
     pub approval_id: Option<String>,
     pub target_fingerprint: String,
     pub sequence: u64,

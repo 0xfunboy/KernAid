@@ -1,1 +1,37 @@
-{"$schema":"https://json-schema.org/draft/2020-12/schema","$id":"https://schemas.kernaid.dev/v1/execution-event.json","title":"ExecutionEvent","type":"object","additionalProperties":false,"required":["schemaVersion","planId","sequence","status","action","message","capturedAt"],"properties":{"schemaVersion":{"const":"1.0"},"planId":{"type":"string"},"sequence":{"type":"integer","minimum":1},"status":{"enum":["started","succeeded","failed","rolled-back"]},"action":{"type":"string"},"message":{"type":"string"},"capturedAt":{"type":"string","format":"date-time"}}}
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.kernaid.dev/v1/execution-event.json",
+  "title": "ExecutionEvent",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "planId",
+    "sequence",
+    "status",
+    "action",
+    "message",
+    "capturedAt"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "1.0" },
+    "planId": {
+      "type": "string",
+      "pattern": "^P-[A-Za-z0-9-]+$",
+      "maxLength": 128
+    },
+    "sequence": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "status": { "enum": ["started", "succeeded", "failed", "rolled-back"] },
+    "action": {
+      "type": "string",
+      "pattern": "^[a-z0-9.-]+$",
+      "maxLength": 256
+    },
+    "message": { "type": "string", "maxLength": 8192 },
+    "capturedAt": { "type": "string", "format": "date-time" }
+  }
+}

@@ -9,6 +9,7 @@ export interface NativeObservation {
 
 export interface ObserveAuthorization {
   sessionId: string;
+  planId: string;
   targetFingerprint: string;
   sequence: number;
   action: "system.observe.noop";

@@ -3,6 +3,9 @@ set -euo pipefail
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 firmware="${1:-bios}"
 iso="${2:-$repo_dir/KernAid-Rescue-amd64.iso}"
+for command in qemu-system-x86_64 sha256sum mkfs.ext4 truncate; do
+  command -v "$command" >/dev/null || { echo "Missing required command: $command" >&2; exit 2; }
+done
 if [[ "$firmware" != "bios" && "$firmware" != "uefi" ]]; then
   echo "Usage: $0 [bios|uefi] [iso]" >&2
   exit 2
@@ -12,13 +15,17 @@ log="${KERNAID_SMOKE_LOG:-$(mktemp)}"
 temporary_log=0
 if [[ -z "${KERNAID_SMOKE_LOG:-}" ]]; then temporary_log=1; fi
 target_image="$(mktemp)"
-truncate -s 64M "$target_image"
+target_seed_dir="$(mktemp -d)"
+printf '%s\n' KERNAID_OBSERVE_TARGET_SENTINEL > "$target_seed_dir/README.txt"
+truncate -s 128M "$target_image"
+mkfs.ext4 -q -F -L KERNAID_TARGET -d "$target_seed_dir" "$target_image"
 target_hash_before="$(sha256sum "$target_image" | awk '{print $1}')"
 qemu_pid=""
 cleanup() {
   if [[ -n "$qemu_pid" ]]; then kill "$qemu_pid" 2>/dev/null || true; fi
   if [[ "$temporary_log" == "1" ]]; then rm -f "$log"; fi
   rm -f "$target_image"
+  rm -rf "$target_seed_dir"
 }
 trap cleanup EXIT
 

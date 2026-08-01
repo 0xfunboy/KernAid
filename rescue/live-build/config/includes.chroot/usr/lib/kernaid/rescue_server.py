@@ -10,22 +10,23 @@ import threading
 MAX_OUTPUT_BYTES = 64 * 1024
 WEB_ROOT = "/opt/kernaid/desk"
 COMMANDS = (
-    ("system.hostname", ("hostname",)),
+    ("system.hostname", ("/usr/bin/hostname",)),
     (
         "linux.block.inventory",
         (
-            "lsblk",
+            "/usr/bin/lsblk",
             "--json",
             "--bytes",
             "--output",
-            "NAME,TYPE,SIZE,RO,TRAN,FSTYPE,MOUNTPOINTS,MODEL",
+            "NAME,KNAME,MAJ:MIN,TYPE,SIZE,RO,TRAN,FSTYPE,MOUNTPOINTS,MODEL,SERIAL,WWN,UUID,PARTUUID,PTUUID",
         ),
     ),
-    ("linux.network.links", ("ip", "-json", "link")),
-    ("linux.failed.units", ("systemctl", "--failed", "--no-pager", "--plain")),
+    ("linux.network.links", ("/usr/sbin/ip", "-json", "link")),
+    ("linux.failed.units", ("/usr/bin/systemctl", "--failed", "--no-pager", "--plain")),
 )
 MAX_REQUEST_BYTES = 8 * 1024
 MAX_BROKER_SESSIONS = 1_024
+MAX_SERVER_THREADS = 8
 ALLOWED_HOSTS = {"127.0.0.1:4173", "localhost:4173"}
 ALLOWED_ORIGINS = {"http://127.0.0.1:4173", "http://localhost:4173"}
 
@@ -40,17 +41,21 @@ class ObserveBroker:
         self.last_sequence = 0
 
     def authorize(self, request: dict[str, object]) -> None:
-        if set(request) != {"sessionId", "targetFingerprint", "sequence", "action"}:
+        if set(request) != {"sessionId", "planId", "targetFingerprint", "sequence", "action"}:
             raise BrokerError("Richiesta al broker non valida.")
         if request["action"] != "system.observe.noop":
             raise BrokerError("Azione non consentita dal broker locale.")
         session_id = request["sessionId"]
+        plan_id = request["planId"]
         fingerprint = request["targetFingerprint"]
         sequence = request["sequence"]
         if (
             not isinstance(session_id, str)
             or not session_id.strip()
             or len(session_id) > 128
+            or not isinstance(plan_id, str)
+            or not plan_id.strip()
+            or len(plan_id) > 128
             or not isinstance(fingerprint, str)
             or not valid_fingerprint(fingerprint)
             or not isinstance(sequence, int)
@@ -66,24 +71,47 @@ class ObserveBroker:
 
 BROKERS: dict[str, ObserveBroker] = {}
 BROKER_LOCK = threading.Lock()
+INVENTORY_LOCK = threading.Lock()
 
 
 def observe(collector: str, command: tuple[str, ...]) -> dict[str, object]:
     try:
-        result = subprocess.run(
+        process = subprocess.Popen(
             command,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            check=False,
-            timeout=15,
         )
-        output = result.stdout[:MAX_OUTPUT_BYTES].decode("utf-8", errors="replace")
+        retained = bytearray()
+
+        def drain_output() -> None:
+            if process.stdout is None:
+                return
+            while chunk := process.stdout.read(8 * 1024):
+                remaining = MAX_OUTPUT_BYTES - len(retained)
+                if remaining > 0:
+                    retained.extend(chunk[:remaining])
+
+        reader = threading.Thread(target=drain_output, daemon=True)
+        reader.start()
+        timed_out = False
+        try:
+            process.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            process.kill()
+            process.wait(timeout=2)
+        reader.join(timeout=2)
+        if process.stdout is not None:
+            process.stdout.close()
+        output = bytes(retained).decode("utf-8", errors="replace")
+        if timed_out:
+            output = f"{output}\ncollector unavailable: command timed out".lstrip()
         return {
             "collector": collector,
             "trust": "observed-untrusted",
             "output": output,
-            "success": result.returncode == 0,
+            "success": not timed_out and process.returncode == 0,
         }
     except (OSError, subprocess.TimeoutExpired) as error:
         return {
@@ -95,7 +123,8 @@ def observe(collector: str, command: tuple[str, ...]) -> dict[str, object]:
 
 
 def inventory() -> list[dict[str, object]]:
-    return [observe(name, command) for name, command in COMMANDS]
+    with INVENTORY_LOCK:
+        return [observe(name, command) for name, command in COMMANDS]
 
 
 def is_identity_observation(collector: str) -> bool:
@@ -104,6 +133,7 @@ def is_identity_observation(collector: str) -> bool:
         or "block.inventory" in collector
         or collector.endswith(".disks")
         or collector.endswith(".system")
+        or collector.endswith(".storage.identity")
     )
 
 
@@ -145,9 +175,21 @@ class RescueHandler(SimpleHTTPRequestHandler):
     def local_authority(self) -> bool:
         return self.headers.get("Host") in ALLOWED_HOSTS
 
+    def same_site_request(self) -> bool:
+        origin = self.headers.get("Origin")
+        fetch_site = self.headers.get("Sec-Fetch-Site")
+        return (origin is None or origin in ALLOWED_ORIGINS) and fetch_site in {
+            None,
+            "none",
+            "same-origin",
+        }
+
     def do_GET(self) -> None:
         if not self.local_authority():
             self.send_error(421)
+            return
+        if not self.same_site_request():
+            self.send_error(403)
             return
         if self.path == "/api/inventory":
             body = json.dumps(inventory()).encode()
@@ -207,5 +249,30 @@ class RescueHandler(SimpleHTTPRequestHandler):
         return
 
 
+class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+    request_queue_size = MAX_SERVER_THREADS
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        self.slots = threading.BoundedSemaphore(MAX_SERVER_THREADS)
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request: object, client_address: object) -> None:
+        if not self.slots.acquire(blocking=False):
+            request.close()  # type: ignore[attr-defined]
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self.slots.release()
+            raise
+
+    def process_request_thread(self, request: object, client_address: object) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.slots.release()
+
+
 if __name__ == "__main__":
-    ThreadingHTTPServer(("127.0.0.1", 4173), RescueHandler).serve_forever()
+    BoundedThreadingHTTPServer(("127.0.0.1", 4173), RescueHandler).serve_forever()

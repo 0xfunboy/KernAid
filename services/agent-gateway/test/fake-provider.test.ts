@@ -1,2 +1,227 @@
-import assert from "node:assert/strict"; import test from "node:test"; import {LocalSessionDriver} from "../src/fake-driver.js";
-test("normalizes provider output, stages only R0, and exports a verified report",async()=>{const d=new LocalSessionDriver();const fingerprint=`sha256:${"1".repeat(64)}`;const s=await d.startSession({targetFingerprint:fingerprint,mode:"resident"});await d.requestEvidence(s.id,{collector:"linux.systemd.failed",target:"local-machine",observedContent:"demo.service loaded failed failed Demo"});let proposal;for await(const e of d.sendUserPrompt(s.id,"Why does boot fail?")) if(e.proposal)proposal=e.proposal;assert.ok(proposal);assert.match(proposal.diagnosis,/failed/);const plan=await d.stagePlan(s.id,proposal);assert.equal(plan.targetFingerprint,fingerprint);assert.equal(plan.risk,"R0");assert.equal(plan.steps[0]?.action,"system.observe.noop");for await(const event of d.executePlan(plan.planId))assert.equal(event.status,"succeeded");const report=await d.exportReport(s.id,"json");assert.equal(report.mediaType,"application/json");assert.match(report.sha256,/^[a-f0-9]{64}$/);assert.match(decodeURIComponent(report.uri),/"verification": "passed"/);});
+import assert from "node:assert/strict";
+import test from "node:test";
+import type { DiagnosisProposal } from "@kernaid/schemas";
+import { LocalSessionDriver, type ActionExecutor } from "../src/fake-driver.js";
+import type { ObservedEvidence, Provider } from "../src/fake-provider.js";
+import { redactForProvider } from "../src/redaction.js";
+
+const fingerprint = `sha256:${"1".repeat(64)}`;
+
+async function stagedDriver(): Promise<{
+  driver: LocalSessionDriver;
+  sessionId: string;
+  proposal: DiagnosisProposal;
+  planId: string;
+}> {
+  const driver = new LocalSessionDriver();
+  const session = await driver.startSession({
+    targetFingerprint: fingerprint,
+    mode: "resident",
+  });
+  await driver.requestEvidence(session.id, {
+    collector: "linux.systemd.failed",
+    target: "local-machine",
+    observedContent: "demo.service loaded failed failed Demo",
+  });
+  let proposal: DiagnosisProposal | undefined;
+  for await (const event of driver.sendUserPrompt(
+    session.id,
+    "Why does boot fail?",
+  )) {
+    if (event.proposal) proposal = event.proposal;
+  }
+  assert.ok(proposal);
+  const plan = await driver.stagePlan(session.id, proposal);
+  return { driver, sessionId: session.id, proposal, planId: plan.planId };
+}
+
+test("normalizes provider output, stages only R0, and exports a verified report", async () => {
+  const { driver, sessionId, planId } = await stagedDriver();
+  const events = [];
+  for await (const event of driver.executePlan(planId)) events.push(event);
+  assert.deepEqual(
+    events.map((event) => [event.sequence, event.status]),
+    [
+      [1, "started"],
+      [2, "succeeded"],
+    ],
+  );
+  const report = await driver.exportReport(sessionId, "json");
+  assert.equal(report.mediaType, "application/json");
+  assert.match(report.sha256, /^[a-f0-9]{64}$/);
+  assert.match(decodeURIComponent(report.uri), /"verification": "passed"/);
+});
+
+test("rejects replay and keeps a pre-execution report fail-closed", async () => {
+  const { driver, sessionId, planId } = await stagedDriver();
+  const before = await driver.exportReport(sessionId, "json");
+  assert.match(decodeURIComponent(before.uri), /"verification": "not-run"/);
+  for await (const _event of driver.executePlan(planId)) {
+    // Consume the transaction.
+  }
+  await assert.rejects(async () => {
+    for await (const _event of driver.executePlan(planId)) {
+      // A replay must never yield an event.
+    }
+  }, /already executed/);
+});
+
+test("serializes concurrent execution and fails closed when the boundary rejects", async () => {
+  let calls = 0;
+  const rejectingExecutor: ActionExecutor = {
+    async execute(): Promise<void> {
+      calls += 1;
+      throw new Error("stale target detail must not enter the report");
+    },
+  };
+  const driver = new LocalSessionDriver(undefined, rejectingExecutor);
+  const session = await driver.startSession({
+    targetFingerprint: fingerprint,
+    mode: "resident",
+  });
+  await driver.requestEvidence(session.id, {
+    collector: "test",
+    target: "fixture",
+  });
+  let proposal: DiagnosisProposal | undefined;
+  for await (const event of driver.sendUserPrompt(session.id, "diagnose"))
+    if (event.proposal) proposal = event.proposal;
+  assert.ok(proposal);
+  const plan = await driver.stagePlan(session.id, proposal);
+  const first = driver.executePlan(plan.planId);
+  const second = driver.executePlan(plan.planId);
+  const [firstEvent, secondResult] = await Promise.all([
+    first.next(),
+    second.next().then(
+      () => "unexpected success",
+      (error: unknown) => String(error),
+    ),
+  ]);
+  assert.equal(firstEvent.value?.status, "started");
+  assert.match(secondResult, /already executed/);
+  const failed = await first.next();
+  assert.equal(failed.value?.status, "failed");
+  assert.equal(calls, 1);
+  const report = await driver.exportReport(session.id, "json");
+  const decoded = decodeURIComponent(report.uri);
+  assert.match(decoded, /"verification": "failed"/);
+  assert.doesNotMatch(decoded, /stale target detail/);
+});
+
+test("rejects provider output with unknown fields or foreign evidence", async () => {
+  class MaliciousProvider implements Provider {
+    constructor(private readonly foreignEvidence: boolean) {}
+    async diagnose(
+      _objective: string,
+      evidence: readonly ObservedEvidence[],
+    ): Promise<DiagnosisProposal> {
+      return {
+        schemaVersion: "1.0",
+        diagnosis: "Injected proposal",
+        confidence: 1,
+        evidenceIds: [
+          this.foreignEvidence
+            ? "E-foreign"
+            : (evidence[0]?.evidence.id ?? "E-missing"),
+        ],
+        requestedEvidence: [],
+        ...(!this.foreignEvidence ? ({ command: "shell.exec" } as object) : {}),
+      };
+    }
+  }
+
+  for (const foreignEvidence of [false, true]) {
+    const driver = new LocalSessionDriver(
+      new MaliciousProvider(foreignEvidence),
+    );
+    const session = await driver.startSession({
+      targetFingerprint: fingerprint,
+      mode: "resident",
+    });
+    await driver.requestEvidence(session.id, {
+      collector: "test",
+      target: "fixture",
+    });
+    await assert.rejects(
+      async () => {
+        for await (const _event of driver.sendUserPrompt(
+          session.id,
+          "diagnose",
+        )) {
+          // Consume until validation rejects the proposal.
+        }
+      },
+      foreignEvidence ? /outside this session/ : /unknown field/,
+    );
+  }
+});
+
+test("redacts provider credentials from prompts and evidence", async () => {
+  class InspectingProvider implements Provider {
+    async diagnose(
+      objective: string,
+      evidence: readonly ObservedEvidence[],
+    ): Promise<DiagnosisProposal> {
+      assert.doesNotMatch(objective, /sk-test-supersecret/);
+      assert.doesNotMatch(
+        evidence[0]?.content ?? "",
+        /Bearer secret-token-value/,
+      );
+      assert.match(objective, /\[REDACTED\]/);
+      assert.match(evidence[0]?.content ?? "", /\[REDACTED\]/);
+      return {
+        schemaVersion: "1.0",
+        diagnosis: "No secret disclosed",
+        confidence: 0.7,
+        evidenceIds: evidence.map((item) => item.evidence.id),
+        requestedEvidence: [],
+      };
+    }
+  }
+  const driver = new LocalSessionDriver(new InspectingProvider());
+  const session = await driver.startSession({
+    targetFingerprint: fingerprint,
+    mode: "resident",
+  });
+  await driver.requestEvidence(session.id, {
+    collector: "test",
+    target: "fixture",
+    observedContent: "Authorization: Bearer secret-token-value",
+  });
+  for await (const _event of driver.sendUserPrompt(
+    session.id,
+    "key sk-test-supersecret",
+  )) {
+    // Provider assertions execute while consuming the stream.
+  }
+});
+
+test("records only approvals bound to the staged plan and target", async () => {
+  const { driver, planId } = await stagedDriver();
+  await assert.rejects(
+    driver.approvePlan(planId, {
+      schemaVersion: "1.0",
+      approvalId: "A-wrong",
+      planId,
+      targetFingerprint: `sha256:${"2".repeat(64)}`,
+      approvedAt: new Date().toISOString(),
+      approvedBy: "local-technician",
+    }),
+    /does not match/,
+  );
+  await driver.approvePlan(planId, {
+    schemaVersion: "1.0",
+    approvalId: "A-local",
+    planId,
+    targetFingerprint: fingerprint,
+    approvedAt: new Date().toISOString(),
+    approvedBy: "local-technician",
+  });
+});
+
+test("standalone redaction covers common provider secret shapes", () => {
+  const input =
+    "OPENAI_API_KEY=abc123 sk-ant-abcdefghijk AIza012345678901234567890 Bearer abc.def.ghi";
+  const output = redactForProvider(input);
+  assert.doesNotMatch(output, /abc123|sk-ant-|AIza|abc\.def\.ghi/);
+});

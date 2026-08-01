@@ -1,1 +1,59 @@
-{"$schema":"https://json-schema.org/draft/2020-12/schema","$id":"https://schemas.kernaid.dev/v1/session-report.json","title":"SessionReport","type":"object","additionalProperties":false,"required":["schemaVersion","sessionId","targetFingerprint","facts","inferences","decisions","events","verification","unresolvedRisks"],"properties":{"schemaVersion":{"const":"1.0"},"sessionId":{"type":"string"},"targetFingerprint":{"type":"string"},"facts":{"type":"array"},"inferences":{"type":"array"},"decisions":{"type":"array"},"events":{"type":"array"},"verification":{"enum":["not-run","passed","failed"]},"unresolvedRisks":{"type":"array","items":{"type":"string"}}}}
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.kernaid.dev/v1/session-report.json",
+  "title": "SessionReport",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "sessionId",
+    "targetFingerprint",
+    "facts",
+    "inferences",
+    "decisions",
+    "events",
+    "verification",
+    "unresolvedRisks"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "1.0" },
+    "sessionId": {
+      "type": "string",
+      "pattern": "^S-[A-Za-z0-9-]+$",
+      "maxLength": 128
+    },
+    "targetFingerprint": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "facts": {
+      "type": "array",
+      "maxItems": 128,
+      "items": { "$ref": "https://schemas.kernaid.dev/v1/evidence.json" }
+    },
+    "inferences": {
+      "type": "array",
+      "maxItems": 128,
+      "items": {
+        "$ref": "https://schemas.kernaid.dev/v1/diagnosis-proposal.json"
+      }
+    },
+    "decisions": {
+      "type": "array",
+      "maxItems": 128,
+      "items": { "$ref": "https://schemas.kernaid.dev/v1/approval.json" }
+    },
+    "events": {
+      "type": "array",
+      "maxItems": 1024,
+      "items": { "$ref": "https://schemas.kernaid.dev/v1/execution-event.json" }
+    },
+    "verification": { "enum": ["not-run", "passed", "failed"] },
+    "unresolvedRisks": {
+      "type": "array",
+      "maxItems": 128,
+      "items": { "type": "string", "maxLength": 8192 },
+      "uniqueItems": true
+    }
+  }
+}

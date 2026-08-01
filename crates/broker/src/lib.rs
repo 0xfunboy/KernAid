@@ -26,6 +26,8 @@ impl ObserveBroker {
         }
         if request.session_id.trim().is_empty()
             || request.session_id.len() > 128
+            || request.plan_id.trim().is_empty()
+            || request.plan_id.len() > 128
             || !valid_fingerprint(&request.target_fingerprint)
         {
             return Err(BrokerError::InvalidRequest);
@@ -59,6 +61,7 @@ mod tests {
     fn request(sequence: u64) -> BrokerRequest {
         BrokerRequest {
             session_id: "S-test".into(),
+            plan_id: "P-test".into(),
             approval_id: None,
             target_fingerprint: FINGERPRINT.into(),
             sequence,

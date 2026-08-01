@@ -1,1 +1,35 @@
-{"$schema":"https://json-schema.org/draft/2020-12/schema","$id":"https://schemas.kernaid.dev/v1/approval.json","title":"Approval","type":"object","additionalProperties":false,"required":["schemaVersion","approvalId","planId","targetFingerprint","approvedAt","approvedBy"],"properties":{"schemaVersion":{"const":"1.0"},"approvalId":{"type":"string"},"planId":{"type":"string"},"targetFingerprint":{"type":"string"},"approvedAt":{"type":"string","format":"date-time"},"approvedBy":{"type":"string"},"typedConfirmation":{"type":"string"}}}
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.kernaid.dev/v1/approval.json",
+  "title": "Approval",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "approvalId",
+    "planId",
+    "targetFingerprint",
+    "approvedAt",
+    "approvedBy"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "1.0" },
+    "approvalId": {
+      "type": "string",
+      "pattern": "^A-[A-Za-z0-9-]+$",
+      "maxLength": 128
+    },
+    "planId": {
+      "type": "string",
+      "pattern": "^P-[A-Za-z0-9-]+$",
+      "maxLength": 128
+    },
+    "targetFingerprint": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "approvedAt": { "type": "string", "format": "date-time" },
+    "approvedBy": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "typedConfirmation": { "type": "string", "minLength": 1, "maxLength": 256 }
+  }
+}

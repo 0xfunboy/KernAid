@@ -6,13 +6,17 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
-    process::Command,
+    io::Read,
+    process::{Command, Stdio},
     sync::{Mutex, MutexGuard},
+    thread,
+    time::{Duration, Instant},
 };
 use tauri::State;
 
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_BROKER_SESSIONS: usize = 1_024;
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -27,6 +31,7 @@ struct Observation {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ObserveRequest {
     session_id: String,
+    plan_id: String,
     target_fingerprint: String,
     sequence: u64,
     action: String,
@@ -39,67 +44,171 @@ fn bounded_utf8(bytes: &[u8]) -> String {
     String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_OUTPUT_BYTES)]).into_owned()
 }
 
+fn read_bounded(mut reader: impl Read + Send + 'static) -> thread::JoinHandle<Vec<u8>> {
+    thread::spawn(move || {
+        let mut retained = Vec::with_capacity(MAX_OUTPUT_BYTES);
+        let mut buffer = [0_u8; 8 * 1024];
+        loop {
+            let read = match reader.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => read,
+            };
+            let remaining = MAX_OUTPUT_BYTES.saturating_sub(retained.len());
+            retained.extend_from_slice(&buffer[..read.min(remaining)]);
+        }
+        retained
+    })
+}
+
+fn joined_output(handle: Option<thread::JoinHandle<Vec<u8>>>) -> Vec<u8> {
+    match handle {
+        Some(handle) => handle.join().unwrap_or_default(),
+        None => Vec::new(),
+    }
+}
+
 fn fixed_command(collector: &'static str, program: &str, args: &[&str]) -> Observation {
-    match Command::new(program).args(args).output() {
-        Ok(result) => Observation {
-            collector,
-            trust: "observed-untrusted",
-            output: bounded_utf8(&result.stdout),
-            success: result.status.success(),
-        },
-        Err(error) => Observation {
-            collector,
-            trust: "observed-untrusted",
-            output: format!("collector unavailable: {error}"),
-            success: false,
-        },
+    fixed_command_with_timeout(collector, program, args, COMMAND_TIMEOUT)
+}
+
+fn fixed_command_with_timeout(
+    collector: &'static str,
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> Observation {
+    let mut child = match Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            return Observation {
+                collector,
+                trust: "observed-untrusted",
+                output: format!("collector unavailable: {error}"),
+                success: false,
+            };
+        }
+    };
+    let stdout = child.stdout.take().map(read_bounded);
+    let stderr = child.stderr.take().map(read_bounded);
+    let deadline = Instant::now() + timeout;
+    let (success, timed_out) = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break (status.success(), false),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break (false, true);
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Observation {
+                    collector,
+                    trust: "observed-untrusted",
+                    output: format!("collector unavailable: {error}"),
+                    success: false,
+                };
+            }
+        }
+    };
+    let mut output = joined_output(stdout);
+    let error_output = joined_output(stderr);
+    if !error_output.is_empty() && output.len() < MAX_OUTPUT_BYTES {
+        if !output.is_empty() {
+            output.push(b'\n');
+        }
+        let remaining = MAX_OUTPUT_BYTES.saturating_sub(output.len());
+        output.extend_from_slice(&error_output[..error_output.len().min(remaining)]);
+    }
+    if timed_out {
+        let suffix = b"\ncollector unavailable: command timed out";
+        let remaining = MAX_OUTPUT_BYTES.saturating_sub(output.len());
+        output.extend_from_slice(&suffix[..suffix.len().min(remaining)]);
+    }
+    Observation {
+        collector,
+        trust: "observed-untrusted",
+        output: bounded_utf8(&output),
+        success,
     }
 }
 
 #[tauri::command]
 fn collect_local_inventory() -> Vec<Observation> {
-    let mut observations = vec![fixed_command("system.hostname", "hostname", &[])];
+    let mut observations: Vec<Observation> = Vec::new();
     #[cfg(target_os = "linux")]
     {
+        observations.push(fixed_command("system.hostname", "/usr/bin/hostname", &[]));
         observations.push(fixed_command(
             "linux.block.inventory",
-            "lsblk",
+            "/usr/bin/lsblk",
             &[
                 "--json",
                 "--bytes",
                 "--output",
-                "NAME,TYPE,SIZE,RO,TRAN,FSTYPE,MOUNTPOINTS,MODEL",
+                "NAME,KNAME,MAJ:MIN,TYPE,SIZE,RO,TRAN,FSTYPE,MOUNTPOINTS,MODEL,SERIAL,WWN,UUID,PARTUUID,PTUUID",
             ],
         ));
         observations.push(fixed_command(
             "linux.network.links",
-            "ip",
+            "/usr/sbin/ip",
             &["-json", "link"],
         ));
         observations.push(fixed_command(
             "linux.failed.units",
-            "systemctl",
+            "/usr/bin/systemctl",
             &["--failed", "--no-pager", "--plain"],
         ));
     }
     #[cfg(target_os = "windows")]
     {
-        observations.push(fixed_command("windows.system", "cmd", &["/C", "ver"]));
-        observations.push(fixed_command("windows.network", "ipconfig", &["/all"]));
-        observations.push(fixed_command("windows.disks", "powershell", &["-NoProfile", "-NonInteractive", "-Command", "Get-Disk | Select-Object Number,FriendlyName,BusType,HealthStatus,OperationalStatus,Size,IsReadOnly | ConvertTo-Json -Compress"]));
+        observations.push(fixed_command(
+            "system.hostname",
+            r"C:\Windows\System32\hostname.exe",
+            &[],
+        ));
+        observations.push(fixed_command(
+            "windows.network",
+            r"C:\Windows\System32\ipconfig.exe",
+            &["/all"],
+        ));
+        observations.push(fixed_command("windows.disks", r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe", &["-NoProfile", "-NonInteractive", "-Command", "Get-Disk | Select-Object Number,FriendlyName,BusType,HealthStatus,OperationalStatus,Size,IsReadOnly,UniqueId,SerialNumber,Guid,PartitionStyle | ConvertTo-Json -Compress"]));
+        observations.push(fixed_command(
+            "windows.system",
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            &[
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "[Environment]::OSVersion.VersionString",
+            ],
+        ));
     }
     #[cfg(target_os = "macos")]
     {
-        observations.push(fixed_command("macos.system", "sw_vers", &[]));
+        observations.push(fixed_command("system.hostname", "/bin/hostname", &[]));
+        observations.push(fixed_command("macos.system", "/usr/bin/sw_vers", &[]));
         observations.push(fixed_command(
             "macos.disks",
-            "diskutil",
+            "/usr/sbin/diskutil",
             &["list", "-plist"],
         ));
         observations.push(fixed_command(
             "macos.network",
-            "networksetup",
+            "/usr/sbin/networksetup",
             &["-listallhardwareports"],
+        ));
+        observations.push(fixed_command(
+            "macos.storage.identity",
+            "/usr/sbin/ioreg",
+            &["-r", "-c", "IOBlockStorageDevice", "-l"],
         ));
     }
     observations
@@ -110,6 +219,7 @@ fn is_identity_observation(collector: &str) -> bool {
         || collector.contains("block.inventory")
         || collector.ends_with(".disks")
         || collector.ends_with(".system")
+        || collector.ends_with(".storage.identity")
 }
 
 fn inventory_fingerprint(observations: &[Observation]) -> String {
@@ -177,6 +287,7 @@ fn authorize_observe_for_fingerprint(
     broker
         .execute(&BrokerRequest {
             session_id: request.session_id,
+            plan_id: request.plan_id,
             approval_id: None,
             target_fingerprint: request.target_fingerprint,
             sequence: request.sequence,
@@ -203,6 +314,19 @@ mod tests {
     fn output_is_bounded() {
         let input = vec![b'x'; MAX_OUTPUT_BYTES + 100];
         assert_eq!(bounded_utf8(&input).len(), MAX_OUTPUT_BYTES);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn collector_timeout_kills_a_stuck_process() {
+        let observation = fixed_command_with_timeout(
+            "test.timeout",
+            "/usr/bin/sleep",
+            &["1"],
+            Duration::from_millis(20),
+        );
+        assert!(!observation.success);
+        assert!(observation.output.contains("timed out"));
     }
 
     #[test]
@@ -253,6 +377,7 @@ mod tests {
         let after = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
         let request = |sequence| ObserveRequest {
             session_id: "S-changing".into(),
+            plan_id: "P-changing".into(),
             target_fingerprint: before.into(),
             sequence,
             action: "system.observe.noop".into(),

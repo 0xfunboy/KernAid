@@ -15,7 +15,14 @@ import "./style.css";
 type Workflow = "Observe" | "Diagnose" | "Plan" | "Verify";
 
 function App() {
-  const driver = useMemo(() => new LocalSessionDriver(), []);
+  const driver = useMemo(
+    () =>
+      new LocalSessionDriver(
+        undefined,
+        hasLocalCollector() ? { execute: authorizeObserve } : undefined,
+      ),
+    [],
+  );
   const [objective, setObjective] = useState("");
   const [workflow, setWorkflow] = useState<Workflow>("Observe");
   const [status, setStatus] = useState("Pronto per una diagnosi sicura.");
@@ -38,7 +45,7 @@ function App() {
   }, []);
 
   async function fingerprint(items: NativeObservation[]): Promise<string> {
-    const identity = items.filter(item => /hostname|block\.inventory|\.disks$|\.system$/.test(item.collector));
+    const identity = items.filter(item => /hostname|block\.inventory|\.disks$|\.system$|\.storage\.identity$/.test(item.collector));
     const canonical = identity.map(item => `${item.collector}\0${item.output}`).join("\0");
     const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(canonical));
     return `sha256:${Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, "0")).join("")}`;
@@ -82,16 +89,6 @@ function App() {
     if (!plan || !sessionId || !targetFingerprint || busy) return;
     setBusy(true); setWorkflow("Verify"); setStatus("Verifica del piano e delle evidenze…");
     try {
-      if (hasLocalCollector()) {
-        const step = plan.steps[0];
-        if (!step || step.action !== "system.observe.noop") throw new Error("Il piano contiene un'azione non consentita.");
-        await authorizeObserve({
-          sessionId,
-          targetFingerprint,
-          sequence: 1,
-          action: "system.observe.noop",
-        });
-      }
       for await (const event of driver.executePlan(plan.planId)) setStatus(event.message);
       setReport(await driver.exportReport(sessionId, "json"));
     } catch (error) { setStatus(error instanceof Error ? error.message : "Verifica non riuscita"); }
