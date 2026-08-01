@@ -102,6 +102,14 @@ pub struct NativeJournalSecretStore {
     state: NativeState,
 }
 
+/// Strict presence state for the journal key and anchor pair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeJournalState {
+    Empty,
+    Complete,
+    Partial,
+}
+
 impl NativeJournalSecretStore {
     pub fn open(namespace: SecretNamespace) -> Result<Self, NativeSecretError> {
         Ok(Self {
@@ -111,6 +119,38 @@ impl NativeJournalSecretStore {
 
     pub fn open_named(namespace: &str) -> Result<Self, NativeSecretError> {
         Self::open(SecretNamespace::parse(namespace)?)
+    }
+
+    /// Inspect both strictly decoded journal credentials without collapsing
+    /// native backend errors into the generic storage trait error.
+    pub fn inspect_state(&mut self) -> Result<NativeJournalState, NativeSecretError> {
+        let key = self.load_key_native()?;
+        let anchor = self.load_anchor_native()?;
+        Ok(match (key.is_some(), anchor.is_some()) {
+            (false, false) => NativeJournalState::Empty,
+            (true, true) => NativeJournalState::Complete,
+            _ => NativeJournalState::Partial,
+        })
+    }
+
+    fn load_key_native(&mut self) -> Result<Option<JournalKey>, NativeSecretError> {
+        let Some(encoded) = self.state.load(SecretKind::JournalKey)? else {
+            return Ok(None);
+        };
+        let decoded = decode_secret(SecretKind::JournalKey, &encoded)?;
+        let mut key = Zeroizing::new([0_u8; JOURNAL_KEY_BYTES]);
+        key.copy_from_slice(&decoded);
+        Ok(Some(JournalKey::from_zeroizing(key)))
+    }
+
+    fn load_anchor_native(&mut self) -> Result<Option<JournalAnchor>, NativeSecretError> {
+        let Some(encoded) = self.state.load(SecretKind::JournalAnchor)? else {
+            return Ok(None);
+        };
+        let decoded = decode_secret(SecretKind::JournalAnchor, &encoded)?;
+        JournalAnchor::from_bytes(&decoded)
+            .map(Some)
+            .map_err(|_| NativeSecretError::InvalidStoredValue)
     }
 
     #[cfg(test)]
@@ -123,17 +163,7 @@ impl NativeJournalSecretStore {
 
 impl JournalSecretStore for NativeJournalSecretStore {
     fn load_key(&mut self) -> Result<Option<JournalKey>, SecretStoreError> {
-        let Some(encoded) = self
-            .state
-            .load(SecretKind::JournalKey)
-            .map_err(to_journal_error)?
-        else {
-            return Ok(None);
-        };
-        let decoded = decode_secret(SecretKind::JournalKey, &encoded).map_err(to_journal_error)?;
-        let mut key = Zeroizing::new([0_u8; JOURNAL_KEY_BYTES]);
-        key.copy_from_slice(&decoded);
-        Ok(Some(JournalKey::from_zeroizing(key)))
+        self.load_key_native().map_err(to_journal_error)
     }
 
     fn store_key(&mut self, key: &JournalKey) -> Result<(), SecretStoreError> {
@@ -143,18 +173,7 @@ impl JournalSecretStore for NativeJournalSecretStore {
     }
 
     fn load_anchor(&mut self) -> Result<Option<JournalAnchor>, SecretStoreError> {
-        let Some(encoded) = self
-            .state
-            .load(SecretKind::JournalAnchor)
-            .map_err(to_journal_error)?
-        else {
-            return Ok(None);
-        };
-        let decoded =
-            decode_secret(SecretKind::JournalAnchor, &encoded).map_err(to_journal_error)?;
-        JournalAnchor::from_bytes(&decoded)
-            .map(Some)
-            .map_err(|_| to_journal_error(NativeSecretError::InvalidStoredValue))
+        self.load_anchor_native().map_err(to_journal_error)
     }
 
     fn store_anchor(&mut self, anchor: &JournalAnchor) -> Result<(), SecretStoreError> {
@@ -626,6 +645,46 @@ mod tests {
             .expect("load journal key")
             .expect("journal key exists");
         assert_eq!(loaded.expose_secret(), &[0xA5; JOURNAL_KEY_BYTES]);
+    }
+
+    #[test]
+    fn journal_state_probe_distinguishes_empty_partial_complete_and_invalid() {
+        let backend = MemoryBackend::default();
+        let observer = backend.clone();
+        let namespace = namespace();
+        let mut store =
+            NativeJournalSecretStore::with_backend(namespace.clone(), Box::new(backend));
+        assert_eq!(
+            store.inspect_state().expect("empty probe"),
+            NativeJournalState::Empty
+        );
+
+        let key = JournalKey::from_zeroizing(Zeroizing::new([0x44; JOURNAL_KEY_BYTES]));
+        store.store_key(&key).expect("store key");
+        assert_eq!(
+            store.inspect_state().expect("partial probe"),
+            NativeJournalState::Partial
+        );
+
+        let anchor = JournalAnchor {
+            journal_id: [3; 16],
+            sequence: 0,
+            entry_hash: [0; 32],
+        };
+        store.store_anchor(&anchor).expect("store anchor");
+        assert_eq!(
+            store.inspect_state().expect("complete probe"),
+            NativeJournalState::Complete
+        );
+
+        observer.replace(
+            CredentialName::new(&namespace, SecretKind::JournalAnchor),
+            b"malformed".to_vec(),
+        );
+        assert!(matches!(
+            store.inspect_state(),
+            Err(NativeSecretError::InvalidStoredValue)
+        ));
     }
 
     #[test]
