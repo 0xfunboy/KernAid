@@ -6,4 +6,7 @@ script_path="$(printf '%s' "$index" | sed -n 's/.*src="\.\/\([^"?]*\)".*/\1/p' |
 test -n "$script_path"
 case "$script_path" in assets/*.js) ;; *) exit 1 ;; esac
 curl --fail --silent --show-error "$base_url/$script_path" >/dev/null
+inventory="$(curl --fail --silent --show-error "$base_url/api/inventory")"
+printf '%s' "$inventory" | grep -q '"collector": "system.hostname"'
+printf '%s' "$inventory" | grep -q '"collector": "linux.block.inventory"'
 echo KERNAID_RESCUE_READY >/dev/ttyS0
