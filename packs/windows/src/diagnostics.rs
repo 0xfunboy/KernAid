@@ -453,10 +453,18 @@ pub enum SfcState {
     CouldNotVerify,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SfcExecutionState {
+    Completed,
+    NotRunUnqualified,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SfcSnapshot {
     pub mode: String,
+    pub execution_state: SfcExecutionState,
     pub state: SfcState,
     pub exit_code: i32,
 }
@@ -467,8 +475,17 @@ pub fn parse_sfc(input: EvidenceInput<'_>) -> Result<SfcSnapshot, DiagnosticErro
     if snapshot.mode != "verify-only" {
         return Err(error(source, DiagnosticErrorKind::InconsistentSnapshot));
     }
-    if snapshot.state == SfcState::Clean && snapshot.exit_code != 0 {
-        return Err(error(source, DiagnosticErrorKind::InconsistentSnapshot));
+    match snapshot.execution_state {
+        SfcExecutionState::Completed => {
+            if snapshot.state == SfcState::Clean && snapshot.exit_code != 0 {
+                return Err(error(source, DiagnosticErrorKind::InconsistentSnapshot));
+            }
+        }
+        SfcExecutionState::NotRunUnqualified => {
+            if snapshot.state != SfcState::CouldNotVerify || snapshot.exit_code != -1 {
+                return Err(error(source, DiagnosticErrorKind::InconsistentSnapshot));
+            }
+        }
     }
     Ok(snapshot)
 }
@@ -1194,22 +1211,35 @@ pub fn diagnose_windows_p0(
         ));
     }
 
-    match sfc.state {
-        SfcState::Clean => {}
-        SfcState::Violations => findings.push(finding(
+    match (sfc.execution_state, sfc.state) {
+        (SfcExecutionState::NotRunUnqualified, SfcState::CouldNotVerify) => findings.push(finding(
+            "windows.sfc.not-run-unqualified",
+            Severity::Medium,
+            &[inputs.sfc_json.id],
+            "SFC was not run because this runtime has no qualified locale-independent result adapter.",
+            "windows.sfc.qualified-verification",
+        )),
+        (SfcExecutionState::Completed, SfcState::Clean) => {}
+        (SfcExecutionState::Completed, SfcState::Violations) => findings.push(finding(
             "windows.sfc.integrity-violations",
             Severity::High,
             &[inputs.sfc_json.id],
             "Read-only system-file verification reports integrity violations.",
             "windows.sfc.verification-details",
         )),
-        SfcState::CouldNotVerify => findings.push(finding(
+        (SfcExecutionState::Completed, SfcState::CouldNotVerify) => findings.push(finding(
             "windows.sfc.inconclusive",
             Severity::Medium,
             &[inputs.sfc_json.id],
             "Read-only system-file verification could not complete.",
             "windows.sfc.verification-details",
         )),
+        (SfcExecutionState::NotRunUnqualified, _) => {
+            return Err(error(
+                EvidenceSource::SfcVerify,
+                DiagnosticErrorKind::InconsistentSnapshot,
+            ));
+        }
     }
 
     if update.pending_reboot

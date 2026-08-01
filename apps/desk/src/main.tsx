@@ -10,16 +10,35 @@ import type {
 import {
   authorizeObserve,
   collectLocalInventory,
+  collectWindowsP0Inventory,
   getSecureRuntimeStatus,
   hasLocalCollector,
   initializeDeviceIdentity,
+  isNativeIdentityCollector,
   isNative,
+  isRescueRuntime,
   NativeAuditSink,
   PlatformOfflineRulesProvider,
+  fingerprintNativeTarget,
+  scanRescueInstalledTargets,
   secureAuditReady,
+  selectRescueInstalledTarget,
   type NativeObservation,
+  type RescueTargetCandidate,
+  type RescueTargetBinding,
+  type RescueTargetScan,
+  type RescueTargetSelection,
   type SecureRuntimeStatus,
 } from "./native";
+import {
+  formatBytes,
+  observationStatus,
+  rescueCandidatePresentation,
+  rescueTargetBinding,
+  sameRescueSelection,
+  targetFamilyLabel,
+  type InventoryCategory,
+} from "./rescue-ui";
 import "./style.css";
 
 type Workflow = "Observe" | "Diagnose" | "Plan" | "Verify";
@@ -41,6 +60,16 @@ function App() {
   const [inventoryError, setInventoryError] = useState<string>();
   const [sessionId, setSessionId] = useState<string>();
   const [targetFingerprint, setTargetFingerprint] = useState<string>();
+  const [sessionDriver, setSessionDriver] = useState<LocalSessionDriver>();
+  const [sessionRescueTarget, setSessionRescueTarget] =
+    useState<RescueTargetSelection>();
+  const [rescueTargetScan, setRescueTargetScan] = useState<RescueTargetScan>();
+  const [selectedRescueTarget, setSelectedRescueTarget] =
+    useState<RescueTargetSelection>();
+  const [rescueTargetReady, setRescueTargetReady] =
+    useState(!isRescueRuntime());
+  const [rescueTargetBusy, setRescueTargetBusy] = useState(false);
+  const [rescueTargetError, setRescueTargetError] = useState<string>();
 
   useEffect(() => {
     let cancelled = false;
@@ -81,6 +110,36 @@ function App() {
   }, []);
 
   useEffect(() => {
+    if (!isRescueRuntime()) return;
+    let cancelled = false;
+    scanRescueInstalledTargets()
+      .then((scan) => {
+        if (cancelled) return;
+        setRescueTargetScan(scan);
+        setSelectedRescueTarget(undefined);
+        setRescueTargetError(undefined);
+        if (scan.candidates.length === 0)
+          setStatus(
+            "Nessun candidato installato selezionabile: storage montato, cifrato o complesso richiede una procedura dedicata.",
+          );
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        const message = `Scansione target non disponibile: ${String(error)}`;
+        setRescueTargetScan(undefined);
+        setSelectedRescueTarget(undefined);
+        setRescueTargetError(message);
+        setStatus(message);
+      })
+      .finally(() => {
+        if (!cancelled) setRescueTargetReady(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
     if (!hasLocalCollector()) return;
     collectLocalInventory()
       .then((items) => {
@@ -96,36 +155,78 @@ function App() {
       .finally(() => setInventoryReady(true));
   }, []);
 
-  async function fingerprint(items: NativeObservation[]): Promise<string> {
-    const identity = items.filter((item) =>
-      /hostname|block\.inventory|\.disks$|\.system$|\.storage\.identity$/.test(
-        item.collector,
-      ),
-    );
-    const canonical = identity
-      .map((item) => `${item.collector}\0${item.output}`)
-      .join("\0");
-    const digest = await crypto.subtle.digest(
-      "SHA-256",
-      new TextEncoder().encode(canonical),
-    );
-    return `sha256:${Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
-  }
-
-  async function diagnose() {
-    if (!objective.trim() || busy || !driver) return;
-    const activeDriver = driver;
-    setBusy(true);
+  function invalidateSession() {
+    setEvidence([]);
     setProposal(undefined);
     setPlan(undefined);
     setReport(undefined);
+    setSessionId(undefined);
+    setTargetFingerprint(undefined);
+    setSessionDriver(undefined);
+    setSessionRescueTarget(undefined);
+    setWorkflow("Observe");
+  }
+
+  async function diagnose() {
+    if (
+      !objective.trim() ||
+      busy ||
+      !driver ||
+      (isRescueRuntime() &&
+        (rescueTargetScan === undefined || selectedRescueTarget === undefined))
+    )
+      return;
+    let activeDriver = driver;
+    setBusy(true);
+    invalidateSession();
     try {
       setWorkflow("Observe");
       setStatus("Raccolta evidenze in sola lettura…");
+      let activeRescueSelection = selectedRescueTarget;
+      if (isRescueRuntime()) {
+        if (
+          rescueTargetScan === undefined ||
+          activeRescueSelection === undefined
+        )
+          throw new Error("Selezionare prima un candidato target Rescue.");
+        activeRescueSelection = await selectRescueInstalledTarget(
+          rescueTargetScan.scanFingerprint,
+          activeRescueSelection.target,
+        );
+        setSelectedRescueTarget(activeRescueSelection);
+      }
       let currentNativeEvidence: NativeObservation[] = [];
       if (hasLocalCollector()) {
         try {
-          currentNativeEvidence = await collectLocalInventory();
+          const currentIdentity = await collectLocalInventory();
+          const windowsIdentity = currentIdentity.filter(
+            (item) => item.collector === "windows.storage.identity",
+          );
+          if (isNative() && windowsIdentity.length > 0) {
+            if (
+              windowsIdentity.length !== 1 ||
+              windowsIdentity.some((item) => !item.success || item.truncated)
+            )
+              throw new Error(
+                "Identità Windows rapida non disponibile: diagnosi bloccata.",
+              );
+            setStatus(
+              "Raccolta Windows P0 in parallelo (budget software 150 s; SFC non eseguito perché non ancora qualificato)…",
+            );
+            currentNativeEvidence = await collectWindowsP0Inventory();
+            const diagnosticIdentity = currentNativeEvidence.filter(
+              (item) => item.collector === "windows.storage.identity",
+            );
+            if (
+              diagnosticIdentity.length !== 1 ||
+              !diagnosticIdentity[0]?.success ||
+              diagnosticIdentity[0].truncated ||
+              diagnosticIdentity[0].output !== windowsIdentity[0]?.output
+            )
+              throw new Error(
+                "Il target Windows è cambiato durante la raccolta: diagnosi annullata.",
+              );
+          } else currentNativeEvidence = currentIdentity;
         } catch (error) {
           const message = `Inventario locale non disponibile: ${String(error)}`;
           setNativeEvidence([]);
@@ -142,9 +243,7 @@ function App() {
         setInventoryError(undefined);
       }
       const identityEvidence = currentNativeEvidence.filter((item) =>
-        /hostname|block\.inventory|\.disks$|\.system$|\.storage\.identity$/.test(
-          item.collector,
-        ),
+        isNativeIdentityCollector(item.collector),
       );
       if (
         hasLocalCollector() &&
@@ -154,14 +253,26 @@ function App() {
         throw new Error(
           "Identità del target incompleta: la sessione è stata bloccata senza formulare diagnosi.",
         );
+      let rescueBinding: RescueTargetBinding | undefined;
+      if (activeRescueSelection !== undefined) {
+        activeRescueSelection = await selectRescueInstalledTarget(
+          activeRescueSelection.scanFingerprint,
+          activeRescueSelection.target,
+        );
+        setSelectedRescueTarget(activeRescueSelection);
+        rescueBinding = rescueTargetBinding(activeRescueSelection);
+        activeDriver = createDriver(undefined, rescueBinding);
+      }
       const targetFingerprint = currentNativeEvidence.length
-        ? await fingerprint(currentNativeEvidence)
+        ? await fingerprintNativeTarget(currentNativeEvidence, rescueBinding)
         : `sha256:${"0".repeat(64)}`;
       setTargetFingerprint(targetFingerprint);
       const session = await activeDriver.startSession({
         mode: isNative() ? "resident" : "rescue",
         targetFingerprint,
       });
+      setSessionDriver(activeDriver);
+      setSessionRescueTarget(activeRescueSelection);
       setSessionId(session.id);
       const observed: Evidence[] = [];
       if (currentNativeEvidence.length) {
@@ -171,10 +282,23 @@ function App() {
               collector: item.collector,
               target: isNative() ? "local-machine" : "rescue-runtime",
               summary: item.success
-                ? "Comando di inventario completato"
+                ? item.collector === "windows.sfc.verify-only"
+                  ? "Evidenza P0 esplicita: SFC non eseguito"
+                  : "Comando di inventario completato"
                 : "Comando di inventario non disponibile",
               observedContent: item.output,
               contentType: "text/plain",
+            })),
+          );
+        if (activeRescueSelection !== undefined)
+          observed.push(
+            ...(await activeDriver.requestEvidence(session.id, {
+              collector: "rescue.installed-target.selection",
+              target: "selected-installed-target-candidate",
+              summary:
+                "Candidato target rivalidato; soli metadati, nessun mount o contenuto ispezionato",
+              observedContent: JSON.stringify(activeRescueSelection),
+              contentType: "application/json",
             })),
           );
       } else if (!hasLocalCollector()) {
@@ -209,6 +333,8 @@ function App() {
       setReport(artifact);
       setStatus("Diagnosi completata. Nessuna modifica eseguita.");
     } catch (error) {
+      if (isRescueRuntime()) setSelectedRescueTarget(undefined);
+      invalidateSession();
       await refreshSecureRuntimeAfterFailure();
       setStatus(error instanceof Error ? error.message : "Errore inatteso");
     } finally {
@@ -216,9 +342,76 @@ function App() {
     }
   }
 
+  async function refreshRescueTargets() {
+    if (!isRescueRuntime() || rescueTargetBusy || busy) return;
+    setRescueTargetBusy(true);
+    setRescueTargetReady(false);
+    setSelectedRescueTarget(undefined);
+    invalidateSession();
+    setStatus("Nuova scansione metadata-only dei target…");
+    try {
+      const scan = await scanRescueInstalledTargets();
+      setRescueTargetScan(scan);
+      setRescueTargetError(undefined);
+      setStatus(
+        scan.candidates.length
+          ? "Seleziona il candidato del sistema da osservare."
+          : "Nessun candidato installato selezionabile in modo sicuro.",
+      );
+    } catch (error) {
+      const message = `Scansione target non disponibile: ${String(error)}`;
+      setRescueTargetScan(undefined);
+      setRescueTargetError(message);
+      setStatus(message);
+    } finally {
+      setRescueTargetReady(true);
+      setRescueTargetBusy(false);
+    }
+  }
+
+  async function chooseRescueTarget(candidate: RescueTargetCandidate) {
+    if (
+      !isRescueRuntime() ||
+      rescueTargetScan === undefined ||
+      rescueTargetBusy ||
+      busy
+    )
+      return;
+    setRescueTargetBusy(true);
+    setSelectedRescueTarget(undefined);
+    invalidateSession();
+    setStatus("Rivalidazione del candidato target…");
+    try {
+      const selected = await selectRescueInstalledTarget(
+        rescueTargetScan.scanFingerprint,
+        candidate,
+      );
+      setSelectedRescueTarget(selected);
+      setRescueTargetError(undefined);
+      setStatus(
+        "Target selezionato in modalità metadata-only. Il contenuto del filesystem non è ancora stato ispezionato.",
+      );
+    } catch (error) {
+      const message = `Target non più valido: ${String(error)}`;
+      setRescueTargetError(message);
+      setStatus(message);
+    } finally {
+      setRescueTargetBusy(false);
+    }
+  }
+
   async function verify() {
-    if (!plan || !sessionId || !targetFingerprint || busy || !driver) return;
-    const activeDriver = driver;
+    if (
+      !plan ||
+      !sessionId ||
+      !targetFingerprint ||
+      busy ||
+      !sessionDriver ||
+      (isRescueRuntime() &&
+        !sameRescueSelection(sessionRescueTarget, selectedRescueTarget))
+    )
+      return;
+    const activeDriver = sessionDriver;
     setBusy(true);
     setWorkflow("Verify");
     setStatus("Verifica del piano e delle evidenze…");
@@ -227,6 +420,10 @@ function App() {
         setStatus(event.message);
       setReport(await activeDriver.exportReport(sessionId, "json"));
     } catch (error) {
+      if (isRescueRuntime()) {
+        setSelectedRescueTarget(undefined);
+        invalidateSession();
+      }
       await refreshSecureRuntimeAfterFailure();
       setStatus(
         error instanceof Error ? error.message : "Verifica non riuscita",
@@ -265,11 +462,11 @@ function App() {
       setRuntimeStatus(next);
       if (!secureAuditReady(next)) {
         setDriver(undefined);
-        setReport(undefined);
+        invalidateSession();
       }
     } catch {
       setDriver(undefined);
-      setReport(undefined);
+      invalidateSession();
       setRuntimeStatus(undefined);
     }
   }
@@ -297,6 +494,15 @@ function App() {
             : runtimeStatus === undefined
               ? "Sicurezza non disponibile"
               : "Attivazione sicurezza richiesta";
+  const rescueSessionCurrent =
+    !isRescueRuntime() ||
+    sameRescueSelection(sessionRescueTarget, selectedRescueTarget);
+  const categories: InventoryCategory[] = [
+    "Hardware",
+    "Storage",
+    "Boot",
+    "Network",
+  ];
 
   return (
     <main>
@@ -307,25 +513,90 @@ function App() {
         </span>
       </header>
       <aside>
-        <p className="label">TARGET MACHINE</p>
+        <p className="label">
+          {isRescueRuntime() ? "TARGET INSTALLATO" : "TARGET MACHINE"}
+        </p>
         <h2>
           {isNative()
             ? "Local machine"
             : hasLocalCollector()
-              ? "Ambiente Rescue · target non selezionato"
+              ? selectedRescueTarget
+                ? `Candidato ${targetFamilyLabel(selectedRescueTarget.target.osFamilyHint)} · metadata-only`
+                : "Target non selezionato"
               : "Linux fixture"}
         </h2>
-        {["Hardware", "Storage", "Boot", "Network"].map((item, index) => (
+        {isRescueRuntime() && (
+          <div className="target-picker">
+            <p>
+              Solo metadati storage. Nessun filesystem viene montato e nessuna
+              installazione è confermata.
+            </p>
+            <button
+              disabled={rescueTargetBusy || busy}
+              onClick={refreshRescueTargets}
+            >
+              {rescueTargetBusy ? "Scansione…" : "Ripeti scansione target"}
+            </button>
+            {rescueTargetScan?.candidates.map((candidate, index) => {
+              const presentation = rescueCandidatePresentation(
+                rescueTargetScan,
+                candidate,
+                index,
+              );
+              return (
+                <button
+                  className={
+                    selectedRescueTarget?.target.targetId === candidate.targetId
+                      ? "selected-target"
+                      : ""
+                  }
+                  disabled={rescueTargetBusy || busy}
+                  key={candidate.targetId}
+                  onClick={() => chooseRescueTarget(candidate)}
+                >
+                  <b>{presentation.title}</b>
+                  <small>{presentation.detail}</small>
+                </button>
+              );
+            })}
+            {rescueTargetScan?.disks
+              .filter((disk) => !disk.selectionEligible)
+              .map((disk) => (
+                <small key={disk.id}>
+                  Escluso {disk.ref} · {formatBytes(disk.sizeBytes)} ·{" "}
+                  {disk.exclusionReasons.join(", ")}
+                </small>
+              ))}
+            {rescueTargetReady && rescueTargetScan?.candidates.length === 0 && (
+              <small>Nessun candidato selezionabile.</small>
+            )}
+            {rescueTargetError && <small>{rescueTargetError}</small>}
+          </div>
+        )}
+        {isRescueRuntime() && (
+          <div className="target-scope">
+            <button>
+              Storage metadata · {selectedRescueTarget ? "observed" : "pending"}
+            </button>
+            <button>OS content · not inspected</button>
+            <button>Boot content · not inspected</button>
+            <button>Target network · not inspected</button>
+            <p className="label">AMBIENTE RESCUE</p>
+            <h2>Runtime live · non è il target</h2>
+          </div>
+        )}
+        {categories.map((item) => (
           <button key={item}>
-            {item} ·{" "}
-            {index < nativeEvidence.length || index < evidence.length
-              ? "observed"
-              : "pending"}
+            {isRescueRuntime() ? `Rescue ${item}` : item} ·{" "}
+            {observationStatus(item, nativeEvidence)}
           </button>
         ))}
         {nativeEvidence.map((item) => (
           <details key={item.collector}>
-            <summary>{item.collector}</summary>
+            <summary>
+              {isRescueRuntime() ? "Rescue · " : ""}
+              {item.collector} · {item.success ? "observed" : "unavailable"}
+            </summary>
             <pre>{item.output || "Nessun output"}</pre>
           </details>
         ))}
@@ -393,23 +664,27 @@ function App() {
             !objective.trim() ||
             busy ||
             !inventoryReady ||
+            !rescueTargetReady ||
+            (isRescueRuntime() && selectedRescueTarget === undefined) ||
             !runtimeReady ||
             !driver ||
             securityBlocked
           }
           onClick={diagnose}
         >
-          {!inventoryReady || !runtimeReady
+          {!inventoryReady || !runtimeReady || !rescueTargetReady
             ? "Avvio sicuro…"
             : busy
               ? "Analisi…"
-              : inventoryError
-                ? "Riprova inventario"
-                : "Diagnostica"}
+              : isRescueRuntime() && selectedRescueTarget === undefined
+                ? "Seleziona un target"
+                : inventoryError
+                  ? "Riprova inventario"
+                  : "Diagnostica"}
         </button>
-        {plan && workflow !== "Verify" && (
+        {plan && workflow !== "Verify" && rescueSessionCurrent && (
           <button
-            disabled={busy || !driver || securityBlocked}
+            disabled={busy || !sessionDriver || securityBlocked}
             onClick={verify}
           >
             Verifica piano R0
@@ -458,10 +733,17 @@ function App() {
   );
 }
 
-function createDriver(auditSink?: AuditSink): LocalSessionDriver {
+function createDriver(
+  auditSink?: AuditSink,
+  rescueTarget?: RescueTargetBinding,
+): LocalSessionDriver {
   return new LocalSessionDriver(
     new PlatformOfflineRulesProvider(),
-    hasLocalCollector() ? { execute: authorizeObserve } : undefined,
+    hasLocalCollector()
+      ? {
+          execute: (request) => authorizeObserve(request, rescueTarget),
+        }
+      : undefined,
     auditSink,
   );
 }

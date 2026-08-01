@@ -21,8 +21,14 @@ CI produces engineering-preview desktop installers for Windows, Linux, Intel mac
 
 ## Use in the workshop
 
-- **PC that does not boot:** download the `KernAid-Rescue-amd64` artifact, verify the included SHA-256 file, write the ISO to a USB drive, disable Secure Boot for this engineering preview, and boot the PC from USB. KernAid opens automatically in the live desktop.
-- **Windows, Linux or macOS that does boot:** download that operating system's desktop artifact, install it, and launch KernAid like a normal application. It collects only the fixed, read-only inventory commands exposed by the native shell.
+- **PC that does not boot:** download the attested `KernAid-Rescue-amd64` image,
+  verify it, and use the catalog-enforcing Linux writer in
+  `tools/make-device` to create the USB. Boot the PC from USB, select the
+  installed-system candidate in the left rail, and keep Secure Boot disabled
+  for this engineering preview. The target is re-scanned before every session;
+  this milestone selects storage metadata only and does not yet inspect the
+  installed filesystem.
+- **Windows, Linux or macOS that does boot:** download that operating system's desktop artifact, install it, and launch KernAid like a normal application. Windows startup collects only a fast, derived target identity; the eleven-document P0 collection starts once when **Diagnostica** is selected. Its fixed commands do not request repairs, although native Windows tools such as DISM may still update their own operating-system logs.
 - **Do not use on customer data as a repair tool yet:** the current workflow diagnoses and stages an R0 no-write plan. It deliberately cannot execute real repairs.
 
 The Rescue artifact is rebuilt and boot-tested in QEMU using both legacy BIOS and UEFI firmware. Each test attaches a disposable target disk, proves the live UI ready, and verifies that the complete target image is byte-identical before and after boot. Secure Boot and physical-machine compatibility remain release gates, not claimed capabilities.
@@ -36,6 +42,6 @@ See the [operator guide](docs/operator-guide.md), [architecture](docs/architectu
 ## Current limitations
 
 - Deterministic offline rules only; API and Codex bridges are placeholders.
-- Native host inventory is read-only and intentionally limited; diagnosis still uses the normalized fixture flow.
+- Native host inventory is intentionally limited and has no mutation or repair handler. Windows SFC is explicitly reported as `not-run-unqualified` until a locale-independent result adapter and physical qualification exist; KernAid does not infer an SFC result from localized console text.
 - Encrypted persistence, Secure Boot, physical-machine validation and actual repair actions remain release gates.
 - Desktop artifacts are unsigned engineering previews.

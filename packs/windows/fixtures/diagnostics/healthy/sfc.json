@@ -1,5 +1,6 @@
 {
   "mode": "verify-only",
+  "executionState": "completed",
   "state": "clean",
   "exitCode": 0
 }

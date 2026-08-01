@@ -6,7 +6,8 @@ provider-neutral diagnosis proposal. The crate has no host filesystem or
 process API: it cannot run PowerShell, DISM, SFC, `bcdedit`, or any mutation.
 
 An upstream native collector must produce the projections below from fixed,
-read-only APIs or commands. It must not expose a general command field. All
+observation/check-only APIs or commands. It must not expose a general command
+field or a repair mode; native Windows tools may still update their own logs. All
 eleven documents are mandatory and each body is limited to 1 MiB. Collector
 identifiers are fixed. Evidence IDs are assigned by the session (for example,
 `E-1` or `E-WIN-EVENT-LOG`), must match `E-[A-Za-z0-9-]+`, are limited to 128
@@ -18,7 +19,7 @@ assigned to their source:
 | `windows.event-log.window` | `E-WIN-EVENT-LOG` | 168-hour System/Application projection with native `recordId`, without messages |
 | `windows.reliability.records` | `E-WIN-RELIABILITY` | 168-hour Reliability projection with native log/record identity and nullable product name |
 | `windows.component-store.check-health` | `E-WIN-COMPONENT-STORE` | read-only component-store check state |
-| `windows.sfc.verify-only` | `E-WIN-SFC-VERIFY` | `/verifyonly` state, never a repair mode |
+| `windows.sfc.verify-only` | `E-WIN-SFC-VERIFY` | explicit execution state: a qualified `/verifyonly` result or `not-run-unqualified`, never a repair mode |
 | `windows.update.state` | `E-WIN-UPDATE` | reboot signals, scan state, and 168-hour failed-update IDs/HRESULTs |
 | `windows.services.state` | `E-WIN-SERVICES` | complete service start/state/exit-code projection, including Boot/System and pending enum values |
 | `windows.network.state` | `E-WIN-NETWORK` | complete adapters, routes, and DNS bindings; zero adapters is valid evidence |

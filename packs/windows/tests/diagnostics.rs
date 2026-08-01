@@ -239,12 +239,55 @@ fn mutation_capable_mode_labels_are_not_part_of_phase_zero() {
     .expect_err("restore mode must not enter the read-only corpus");
     assert_eq!(error.kind, DiagnosticErrorKind::InconsistentSnapshot);
 
-    let sfc = br#"{"mode":"scan-and-repair","state":"clean","exitCode":0}"#;
+    let sfc =
+        br#"{"mode":"scan-and-repair","executionState":"completed","state":"clean","exitCode":0}"#;
     let error = parse_sfc(EvidenceInput {
         id: SFC_EVIDENCE_ID,
         body: sfc,
     })
     .expect_err("repair mode must not enter the read-only corpus");
+    assert_eq!(error.kind, DiagnosticErrorKind::InconsistentSnapshot);
+}
+
+#[test]
+fn sfc_not_run_is_explicit_and_inconsistent_combinations_fail_closed() {
+    let not_run = br#"{
+      "mode":"verify-only",
+      "executionState":"not-run-unqualified",
+      "state":"could-not-verify",
+      "exitCode":-1
+    }"#;
+    let snapshot = parse_sfc(EvidenceInput {
+        id: SFC_EVIDENCE_ID,
+        body: not_run,
+    })
+    .expect("typed not-run projection must parse");
+    assert_eq!(
+        snapshot.state,
+        kernaid_windows_pack::diagnostics::SfcState::CouldNotVerify
+    );
+
+    let mut inputs = healthy_inputs();
+    inputs.sfc_json.body = not_run;
+    let report = diagnose_windows_p0(inputs).expect("not-run SFC must not block the other corpus");
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|finding| finding.rule_id == "windows.sfc.not-run-unqualified")
+    );
+
+    let inconsistent = br#"{
+      "mode":"verify-only",
+      "executionState":"not-run-unqualified",
+      "state":"clean",
+      "exitCode":0
+    }"#;
+    let error = parse_sfc(EvidenceInput {
+        id: SFC_EVIDENCE_ID,
+        body: inconsistent,
+    })
+    .expect_err("not-run evidence cannot claim a clean result");
     assert_eq!(error.kind, DiagnosticErrorKind::InconsistentSnapshot);
 }
 

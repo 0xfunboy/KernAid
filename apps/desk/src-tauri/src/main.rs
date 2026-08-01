@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod secure_runtime;
+mod windows_resident;
 
 use kernaid_broker::{BrokerError, ObserveBroker};
 use kernaid_protocol::BrokerRequest;
@@ -14,21 +15,27 @@ use sha2::{Digest, Sha256};
 use std::fs::File;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(unix)]
+use std::process::Child;
 use std::{
     collections::HashMap,
-    io::Read,
-    process::{Child, Command, Stdio},
+    io::{self, Read},
+    process::{ChildStderr, ChildStdout, Command, ExitStatus, Stdio},
     sync::{
         Mutex, MutexGuard,
         mpsc::{self, Receiver},
     },
-    thread,
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 use tauri::{Manager, State};
 
-const MAX_OUTPUT_BYTES: usize = 64 * 1024;
+#[cfg(any(unix, test))]
+const DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024;
+#[cfg(any(target_os = "windows", test))]
+const QUALIFIED_WINDOWS_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_BROKER_SESSIONS: usize = 1_024;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 #[cfg(unix)]
@@ -72,10 +79,15 @@ struct BoundedRead {
     failed: bool,
 }
 
-fn read_bounded(mut reader: impl Read + Send + 'static) -> Receiver<BoundedRead> {
+struct BoundedReader {
+    receiver: Receiver<BoundedRead>,
+    handle: JoinHandle<()>,
+}
+
+fn read_bounded(mut reader: impl Read + Send + 'static, maximum_bytes: usize) -> BoundedReader {
     let (sender, receiver) = mpsc::channel();
-    thread::spawn(move || {
-        let mut retained = Vec::with_capacity(MAX_OUTPUT_BYTES);
+    let handle = thread::spawn(move || {
+        let mut retained = Vec::with_capacity(maximum_bytes);
         let mut buffer = [0_u8; 8 * 1024];
         let mut truncated = false;
         let mut failed = false;
@@ -88,7 +100,7 @@ fn read_bounded(mut reader: impl Read + Send + 'static) -> Receiver<BoundedRead>
                 }
                 Ok(read) => read,
             };
-            let remaining = MAX_OUTPUT_BYTES.saturating_sub(retained.len());
+            let remaining = maximum_bytes.saturating_sub(retained.len());
             retained.extend_from_slice(&buffer[..read.min(remaining)]);
             truncated |= read > remaining;
         }
@@ -98,12 +110,13 @@ fn read_bounded(mut reader: impl Read + Send + 'static) -> Receiver<BoundedRead>
             failed,
         });
     });
-    receiver
+    BoundedReader { receiver, handle }
 }
 
-fn received_output(receiver: Option<Receiver<BoundedRead>>) -> BoundedRead {
-    match receiver {
-        Some(receiver) => receiver
+fn received_output(reader: Option<&BoundedReader>) -> BoundedRead {
+    match reader {
+        Some(reader) => reader
+            .receiver
             .recv_timeout(PIPE_DRAIN_TIMEOUT)
             .unwrap_or(BoundedRead {
                 failed: true,
@@ -116,36 +129,131 @@ fn received_output(receiver: Option<Receiver<BoundedRead>>) -> BoundedRead {
     }
 }
 
-fn terminate_child(child: &mut Child) {
-    #[cfg(unix)]
-    {
-        let process_group = rustix::process::Pid::from_child(child);
+fn finish_reader(reader: Option<BoundedReader>) {
+    if let Some(reader) = reader {
+        let _ = reader.handle.join();
+    }
+}
+
+trait ManagedChild {
+    fn take_stdout(&mut self) -> Option<ChildStdout>;
+    fn take_stderr(&mut self) -> Option<ChildStderr>;
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>>;
+    fn terminate_tree(&mut self);
+}
+
+#[cfg(unix)]
+impl ManagedChild for Child {
+    fn take_stdout(&mut self) -> Option<ChildStdout> {
+        self.stdout.take()
+    }
+
+    fn take_stderr(&mut self) -> Option<ChildStderr> {
+        self.stderr.take()
+    }
+
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        Child::try_wait(self)
+    }
+
+    fn terminate_tree(&mut self) {
+        let process_group = rustix::process::Pid::from_child(self);
         let _ = rustix::process::kill_process_group(process_group, rustix::process::Signal::TERM);
         let deadline = Instant::now() + TERMINATION_GRACE;
         while Instant::now() < deadline {
-            if matches!(child.try_wait(), Ok(Some(_))) {
+            if matches!(Child::try_wait(self), Ok(Some(_))) {
                 break;
             }
             thread::sleep(Duration::from_millis(10));
         }
         let _ = rustix::process::kill_process_group(process_group, rustix::process::Signal::KILL);
+        let _ = self.wait();
     }
-    #[cfg(not(unix))]
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
+#[cfg(target_os = "windows")]
+struct WindowsJobChild(Box<dyn process_wrap::std::ChildWrapper>);
+
+#[cfg(target_os = "windows")]
+impl ManagedChild for WindowsJobChild {
+    fn take_stdout(&mut self) -> Option<ChildStdout> {
+        self.0.stdout().take()
+    }
+
+    fn take_stderr(&mut self) -> Option<ChildStderr> {
+        self.0.stderr().take()
+    }
+
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.0.try_wait()
+    }
+
+    fn terminate_tree(&mut self) {
+        // JobObject::start_kill terminates every process in the job; kill then
+        // waits for the job to drain so inherited stdout/stderr handles close.
+        let _ = self.0.kill();
+    }
+}
+
+#[cfg(unix)]
+fn spawn_managed(mut command: Command) -> io::Result<Box<dyn ManagedChild>> {
+    command.spawn().map(|child| Box::new(child) as _)
+}
+
+#[cfg(target_os = "windows")]
+fn spawn_managed(command: Command) -> io::Result<Box<dyn ManagedChild>> {
+    use process_wrap::std::{CommandWrap, JobObject};
+
+    let mut wrapped = CommandWrap::from(command);
+    wrapped.wrap(JobObject);
+    wrapped
+        .spawn()
+        .map(|child| Box::new(WindowsJobChild(child)) as _)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn fixed_command(collector: &'static str, program: &str, args: &[&str]) -> Observation {
     fixed_command_with_policy(collector, program, args, COMMAND_TIMEOUT, None)
 }
 
-fn fixed_command_with_policy(
-    collector: &'static str,
+struct FixedCommandOutput {
+    stdout: String,
+    stderr: String,
+    exit_code: i32,
+}
+
+#[derive(Clone, Copy)]
+enum FixedCommandFailure {
+    Unavailable,
+    TimedOut,
+    Truncated,
+    ReadFailed,
+    InvalidUtf8,
+}
+
+impl FixedCommandFailure {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    const fn message(self) -> &'static str {
+        match self {
+            Self::Unavailable => "collector unavailable: command failed",
+            Self::TimedOut => "collector unavailable: command timed out",
+            Self::Truncated => "collector unavailable: output exceeded the safety limit",
+            Self::ReadFailed => "collector unavailable: output could not be read safely",
+            Self::InvalidUtf8 => "collector unavailable: output is not valid UTF-8",
+        }
+    }
+
+    const fn truncated(self) -> bool {
+        matches!(self, Self::Truncated)
+    }
+}
+
+fn run_fixed_command(
     program: &str,
     args: &[&str],
     timeout: Duration,
-    empty_exit_one_output: Option<&'static str>,
-) -> Observation {
+    maximum_output_bytes: usize,
+) -> Result<FixedCommandOutput, FixedCommandFailure> {
     let mut command = Command::new(program);
     command.args(args).env_clear();
     #[cfg(unix)]
@@ -155,91 +263,106 @@ fn fixed_command_with_policy(
         .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
         .process_group(0);
     #[cfg(windows)]
+    {
+        command.current_dir(r"C:\Windows\System32");
+        for (name, value) in windows_resident::WINDOWS_ENVIRONMENT {
+            command.env(name, value);
+        }
+    }
     command
-        .env("SystemRoot", r"C:\Windows")
-        .env("WINDIR", r"C:\Windows");
-    let mut child = match command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(error) => {
-            return Observation {
-                collector,
-                trust: "observed-untrusted",
-                output: format!("collector unavailable: {error}"),
-                success: false,
-                truncated: false,
-            };
-        }
-    };
-    let stdout = child.stdout.take().map(read_bounded);
-    let stderr = child.stderr.take().map(read_bounded);
+        .stderr(Stdio::piped());
+    let mut child = spawn_managed(command).map_err(|_| FixedCommandFailure::Unavailable)?;
+    let stdout = child
+        .take_stdout()
+        .map(|reader| read_bounded(reader, maximum_output_bytes));
+    let stderr = child
+        .take_stderr()
+        .map(|reader| read_bounded(reader, maximum_output_bytes));
     let deadline = Instant::now() + timeout;
-    let (exit_status, timed_out) = loop {
+    let (exit_status, timed_out, wait_failed) = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break (Some(status), false),
+            Ok(Some(status)) => break (Some(status), false, false),
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
             Ok(None) => {
-                terminate_child(&mut child);
-                break (None, true);
+                child.terminate_tree();
+                break (None, true, false);
             }
-            Err(error) => {
-                terminate_child(&mut child);
-                return Observation {
-                    collector,
-                    trust: "observed-untrusted",
-                    output: format!("collector unavailable: {error}"),
-                    success: false,
-                    truncated: false,
-                };
+            Err(_) => {
+                child.terminate_tree();
+                break (None, false, true);
             }
         }
     };
-    let output = received_output(stdout);
-    let error_output = received_output(stderr);
-    let truncated = output.truncated || error_output.truncated;
-    let read_failed = output.failed || error_output.failed;
-    if read_failed {
-        terminate_child(&mut child);
+    let output = received_output(stdout.as_ref());
+    let error_output = received_output(stderr.as_ref());
+    if output.failed || error_output.failed {
+        child.terminate_tree();
     }
-    let empty_no_match = !timed_out
-        && exit_status
-            .as_ref()
-            .and_then(std::process::ExitStatus::code)
-            == Some(1)
-        && output.bytes.is_empty()
-        && error_output.bytes.is_empty()
-        && empty_exit_one_output.is_some();
-    let utf8_output = String::from_utf8(output.bytes).ok();
-    let command_succeeded = exit_status.as_ref().is_some_and(|status| status.success());
-    let success = (command_succeeded || empty_no_match)
-        && !truncated
-        && !read_failed
-        && utf8_output.is_some();
-    let safe_output = if empty_no_match {
-        empty_exit_one_output.unwrap_or_default().to_owned()
-    } else if success {
-        utf8_output.unwrap_or_default()
-    } else if timed_out {
-        "collector unavailable: command timed out".to_owned()
-    } else if truncated {
-        "collector unavailable: output exceeded the safety limit".to_owned()
-    } else if read_failed {
-        "collector unavailable: output could not be read safely".to_owned()
-    } else if utf8_output.is_none() {
-        "collector unavailable: output is not valid UTF-8".to_owned()
-    } else {
-        "collector unavailable: command failed".to_owned()
-    };
-    Observation {
-        collector,
-        trust: "observed-untrusted",
-        output: safe_output,
-        success,
-        truncated,
+    finish_reader(stdout);
+    finish_reader(stderr);
+    if wait_failed {
+        return Err(FixedCommandFailure::Unavailable);
+    }
+    if output.failed || error_output.failed {
+        return Err(FixedCommandFailure::ReadFailed);
+    }
+    if output.truncated || error_output.truncated {
+        return Err(FixedCommandFailure::Truncated);
+    }
+    if timed_out {
+        return Err(FixedCommandFailure::TimedOut);
+    }
+    let stdout = String::from_utf8(output.bytes).map_err(|_| FixedCommandFailure::InvalidUtf8)?;
+    let stderr =
+        String::from_utf8(error_output.bytes).map_err(|_| FixedCommandFailure::InvalidUtf8)?;
+    let exit_code = exit_status
+        .and_then(|status| status.code())
+        .ok_or(FixedCommandFailure::Unavailable)?;
+    Ok(FixedCommandOutput {
+        stdout,
+        stderr,
+        exit_code,
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn fixed_command_with_policy(
+    collector: &'static str,
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+    empty_exit_one_output: Option<&'static str>,
+) -> Observation {
+    match run_fixed_command(program, args, timeout, DEFAULT_MAX_OUTPUT_BYTES) {
+        Ok(output) => {
+            let empty_no_match = output.exit_code == 1
+                && output.stdout.is_empty()
+                && output.stderr.is_empty()
+                && empty_exit_one_output.is_some();
+            let success = output.exit_code == 0 || empty_no_match;
+            Observation {
+                collector,
+                trust: "observed-untrusted",
+                output: if empty_no_match {
+                    empty_exit_one_output.unwrap_or_default().to_owned()
+                } else if success {
+                    output.stdout
+                } else {
+                    "collector unavailable: command failed".to_owned()
+                },
+                success,
+                truncated: false,
+            }
+        }
+        Err(error) => Observation {
+            collector,
+            trust: "observed-untrusted",
+            output: error.message().to_owned(),
+            success: false,
+            truncated: error.truncated(),
+        },
     }
 }
 
@@ -276,7 +399,7 @@ fn collect_linux_fstab() -> Observation {
             };
         }
     };
-    if metadata.len() > MAX_OUTPUT_BYTES as u64 {
+    if metadata.len() > DEFAULT_MAX_OUTPUT_BYTES as u64 {
         return Observation {
             collector: "linux.fstab",
             trust: "observed-untrusted",
@@ -285,7 +408,9 @@ fn collect_linux_fstab() -> Observation {
             truncated: true,
         };
     }
-    let bounded = received_output(Some(read_bounded(file)));
+    let reader = read_bounded(file, DEFAULT_MAX_OUTPUT_BYTES);
+    let bounded = received_output(Some(&reader));
+    finish_reader(Some(reader));
     if bounded.truncated || bounded.failed {
         return Observation {
             collector: "linux.fstab",
@@ -300,7 +425,7 @@ fn collect_linux_fstab() -> Observation {
         };
     }
     match kernaid_linux_pack::diagnostics::normalize_fstab_for_diagnostics(&bounded.bytes) {
-        Ok(output) if output.len() <= MAX_OUTPUT_BYTES => Observation {
+        Ok(output) if output.len() <= DEFAULT_MAX_OUTPUT_BYTES => Observation {
             collector: "linux.fstab",
             trust: "observed-untrusted",
             output,
@@ -324,8 +449,248 @@ fn collect_linux_fstab() -> Observation {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn failed_windows_observation(collector: &'static str, truncated: bool) -> Observation {
+    Observation {
+        collector,
+        trust: "observed-untrusted",
+        output: "collector unavailable: Windows P0 evidence failed closed".to_owned(),
+        success: false,
+        truncated,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn validated_windows_output(collector: &'static str, output: String) -> Observation {
+    if windows_resident::validate_projection(collector, &output).is_ok() {
+        Observation {
+            collector,
+            trust: "observed-untrusted",
+            output,
+            success: true,
+            truncated: false,
+        }
+    } else {
+        failed_windows_observation(collector, false)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn collect_windows_powershell(collector: &'static str, script: &'static str) -> Observation {
+    let args = [
+        windows_resident::POWERSHELL_PREFIX_ARGS[0],
+        windows_resident::POWERSHELL_PREFIX_ARGS[1],
+        windows_resident::POWERSHELL_PREFIX_ARGS[2],
+        windows_resident::POWERSHELL_PREFIX_ARGS[3],
+        script,
+    ];
+    match run_fixed_command(
+        windows_resident::POWERSHELL,
+        &args,
+        windows_resident::POWERSHELL_TIMEOUT,
+        QUALIFIED_WINDOWS_MAX_OUTPUT_BYTES,
+    ) {
+        Ok(output) if output.exit_code == 0 && output.stderr.trim().is_empty() => {
+            validated_windows_output(collector, output.stdout)
+        }
+        Ok(_) => failed_windows_observation(collector, false),
+        Err(error) => failed_windows_observation(collector, error.truncated()),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn collect_windows_native(
+    collector: &'static str,
+    program: &'static str,
+    args: &[&str],
+    timeout: Duration,
+    normalize: fn(&str, &str, i32) -> Result<String, ()>,
+) -> Observation {
+    match run_fixed_command(program, args, timeout, QUALIFIED_WINDOWS_MAX_OUTPUT_BYTES) {
+        Ok(output) => match normalize(&output.stdout, &output.stderr, output.exit_code) {
+            Ok(normalized) => validated_windows_output(collector, normalized),
+            Err(()) => failed_windows_observation(collector, false),
+        },
+        Err(error) => failed_windows_observation(collector, error.truncated()),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn boot_native_output(
+    result: &Result<FixedCommandOutput, FixedCommandFailure>,
+) -> windows_resident::NativeOutput<'_> {
+    match result {
+        Ok(output) => windows_resident::NativeOutput {
+            stdout: &output.stdout,
+            exit_code: output.exit_code,
+        },
+        Err(_) => windows_resident::NativeOutput {
+            stdout: "",
+            exit_code: -1,
+        },
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn collect_windows_boot() -> Observation {
+    let (firmware, manager, loaders, default_loader) = thread::scope(|scope| {
+        let firmware = scope.spawn(|| {
+            run_fixed_command(
+                windows_resident::REG,
+                &windows_resident::FIRMWARE_REG_ARGS,
+                windows_resident::BOOT_TIMEOUT,
+                QUALIFIED_WINDOWS_MAX_OUTPUT_BYTES,
+            )
+        });
+        let manager = scope.spawn(|| {
+            run_fixed_command(
+                windows_resident::BCDEDIT,
+                &windows_resident::BOOT_MANAGER_ARGS,
+                windows_resident::BOOT_TIMEOUT,
+                QUALIFIED_WINDOWS_MAX_OUTPUT_BYTES,
+            )
+        });
+        let loaders = scope.spawn(|| {
+            run_fixed_command(
+                windows_resident::BCDEDIT,
+                &windows_resident::OS_LOADER_ARGS,
+                windows_resident::BOOT_TIMEOUT,
+                QUALIFIED_WINDOWS_MAX_OUTPUT_BYTES,
+            )
+        });
+        let default_loader = scope.spawn(|| {
+            run_fixed_command(
+                windows_resident::BCDEDIT,
+                &windows_resident::DEFAULT_LOADER_ARGS,
+                windows_resident::BOOT_TIMEOUT,
+                QUALIFIED_WINDOWS_MAX_OUTPUT_BYTES,
+            )
+        });
+        (
+            firmware
+                .join()
+                .unwrap_or(Err(FixedCommandFailure::Unavailable)),
+            manager
+                .join()
+                .unwrap_or(Err(FixedCommandFailure::Unavailable)),
+            loaders
+                .join()
+                .unwrap_or(Err(FixedCommandFailure::Unavailable)),
+            default_loader
+                .join()
+                .unwrap_or(Err(FixedCommandFailure::Unavailable)),
+        )
+    });
+    // Native stderr is deliberately not interpreted: localized warning/error
+    // text is neither evidence of success nor a schema. Exit status and the
+    // fixed ASCII identifiers alone drive the typed projection.
+    match windows_resident::normalize_boot(
+        boot_native_output(&firmware),
+        boot_native_output(&manager),
+        boot_native_output(&loaders),
+        boot_native_output(&default_loader),
+    ) {
+        Ok(normalized) => validated_windows_output("windows.boot.state", normalized),
+        Err(()) => failed_windows_observation("windows.boot.state", false),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_identity_from_volumes(volumes: &Observation) -> Observation {
+    if !volumes.success || volumes.truncated {
+        return failed_windows_observation("windows.storage.identity", volumes.truncated);
+    }
+    match windows_resident::derive_storage_identity(&volumes.output) {
+        Ok(output) => Observation {
+            collector: "windows.storage.identity",
+            trust: "observed-untrusted",
+            output,
+            success: true,
+            truncated: false,
+        },
+        Err(()) => failed_windows_observation("windows.storage.identity", false),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn collect_windows_identity() -> Observation {
+    let volumes =
+        collect_windows_powershell("windows.volumes.state", windows_resident::VOLUMES_SCRIPT);
+    windows_identity_from_volumes(&volumes)
+}
+
+#[cfg(target_os = "windows")]
+fn collect_windows_spec(spec: windows_resident::CollectorSpec) -> Observation {
+    match spec.kind {
+        windows_resident::CollectorKind::PowerShell(script) => {
+            collect_windows_powershell(spec.collector, script)
+        }
+        windows_resident::CollectorKind::Dism => collect_windows_native(
+            spec.collector,
+            windows_resident::DISM,
+            &windows_resident::DISM_ARGS,
+            windows_resident::DISM_TIMEOUT,
+            windows_resident::normalize_dism,
+        ),
+        windows_resident::CollectorKind::SfcNotRunUnqualified => {
+            match windows_resident::sfc_not_run_projection() {
+                Ok(output) => validated_windows_output(spec.collector, output),
+                Err(()) => failed_windows_observation(spec.collector, false),
+            }
+        }
+        windows_resident::CollectorKind::Boot => collect_windows_boot(),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn collect_windows_p0_observations() -> Vec<Observation> {
+    thread::scope(|scope| {
+        let handles = windows_resident::COLLECTORS
+            .map(|spec| scope.spawn(move || collect_windows_spec(spec)));
+        let mut observations = Vec::with_capacity(windows_resident::COLLECTORS.len() + 1);
+        for (spec, handle) in windows_resident::COLLECTORS.into_iter().zip(handles) {
+            observations.push(
+                handle
+                    .join()
+                    .unwrap_or_else(|_| failed_windows_observation(spec.collector, false)),
+            );
+        }
+        let identity = observations
+            .iter()
+            .find(|observation| observation.collector == "windows.volumes.state")
+            .map(windows_identity_from_volumes)
+            .unwrap_or_else(|| failed_windows_observation("windows.storage.identity", false));
+        observations.push(identity);
+        observations
+    })
+}
+
 #[tauri::command]
-fn collect_local_inventory() -> Vec<Observation> {
+async fn collect_windows_p0_inventory() -> Result<Vec<Observation>, String> {
+    #[cfg(target_os = "windows")]
+    {
+        tauri::async_runtime::spawn_blocking(|| {
+            let started = Instant::now();
+            let observations = collect_windows_p0_observations();
+            if started.elapsed() > windows_resident::P0_WALL_CLOCK_BUDGET {
+                return Err(
+                    "La raccolta Windows ha superato il budget P0 di 150 secondi; nessuna diagnosi è stata formulata."
+                        .to_owned(),
+                );
+            }
+            Ok(observations)
+        })
+        .await
+        .map_err(|_| "La raccolta Windows non è stata completata.".to_owned())?
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err("Il corpus Windows è disponibile solo su sistemi Windows.".to_owned())
+    }
+}
+
+fn collect_local_inventory_sync() -> Vec<Observation> {
     let mut observations: Vec<Observation> = Vec::new();
     #[cfg(target_os = "linux")]
     {
@@ -388,27 +753,7 @@ fn collect_local_inventory() -> Vec<Observation> {
     }
     #[cfg(target_os = "windows")]
     {
-        observations.push(fixed_command(
-            "system.hostname",
-            r"C:\Windows\System32\hostname.exe",
-            &[],
-        ));
-        observations.push(fixed_command(
-            "windows.network",
-            r"C:\Windows\System32\ipconfig.exe",
-            &["/all"],
-        ));
-        observations.push(fixed_command("windows.disks", r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe", &["-NoProfile", "-NonInteractive", "-Command", "Get-Disk | Select-Object Number,FriendlyName,BusType,HealthStatus,OperationalStatus,Size,IsReadOnly,UniqueId,SerialNumber,Guid,PartitionStyle | ConvertTo-Json -Compress"]));
-        observations.push(fixed_command(
-            "windows.system",
-            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
-            &[
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "[Environment]::OSVersion.VersionString",
-            ],
-        ));
+        observations.push(collect_windows_identity());
     }
     #[cfg(target_os = "macos")]
     {
@@ -431,6 +776,13 @@ fn collect_local_inventory() -> Vec<Observation> {
         ));
     }
     observations
+}
+
+#[tauri::command]
+async fn collect_local_inventory() -> Result<Vec<Observation>, String> {
+    tauri::async_runtime::spawn_blocking(collect_local_inventory_sync)
+        .await
+        .map_err(|_| "L’inventario locale non è stato completato.".to_owned())
 }
 
 #[tauri::command]
@@ -501,6 +853,76 @@ fn diagnose_linux_p0(evidence: Vec<NativeDiagnosticEvidence>) -> Result<serde_js
     }
 }
 
+fn diagnose_windows_documents(
+    evidence: Vec<NativeDiagnosticEvidence>,
+) -> Result<serde_json::Value, String> {
+    use kernaid_windows_pack::diagnostics::{
+        EvidenceInput, MAX_INPUT_BYTES, WindowsP0Inputs,
+        diagnose_windows_p0 as evaluate_windows_p0, proposal_from_report,
+    };
+    use std::collections::BTreeMap;
+
+    if evidence.len() != windows_resident::COLLECTORS.len() {
+        return Err("Il corpus Windows richiede tutte le evidenze P0.".to_owned());
+    }
+    let mut documents = BTreeMap::new();
+    for document in evidence {
+        if !windows_resident::COLLECTORS
+            .iter()
+            .any(|spec| spec.collector == document.collector)
+            || document.content.len() > MAX_INPUT_BYTES
+            || documents
+                .insert(document.collector.clone(), document)
+                .is_some()
+        {
+            return Err("Le evidenze Windows non sono valide.".to_owned());
+        }
+    }
+    let input = |collector: &str| -> Result<EvidenceInput<'_>, String> {
+        let document = documents
+            .get(collector)
+            .ok_or_else(|| "Le evidenze Windows sono incomplete.".to_owned())?;
+        Ok(EvidenceInput {
+            id: &document.id,
+            body: document.content.as_bytes(),
+        })
+    };
+    let report = evaluate_windows_p0(WindowsP0Inputs {
+        event_log_json: input("windows.event-log.window")?,
+        reliability_json: input("windows.reliability.records")?,
+        component_store_json: input("windows.component-store.check-health")?,
+        sfc_json: input("windows.sfc.verify-only")?,
+        update_json: input("windows.update.state")?,
+        services_json: input("windows.services.state")?,
+        network_json: input("windows.network.state")?,
+        drivers_json: input("windows.drivers.state")?,
+        bitlocker_json: input("windows.bitlocker.state")?,
+        boot_json: input("windows.boot.state")?,
+        volumes_json: input("windows.volumes.state")?,
+    })
+    .map_err(|_| "Una evidenza Windows è malformata o incompleta.".to_owned())?;
+    serde_json::to_value(proposal_from_report(&report))
+        .map_err(|_| "La diagnosi Windows non è serializzabile.".to_owned())
+}
+
+#[tauri::command]
+fn diagnose_windows_p0(
+    evidence: Vec<NativeDiagnosticEvidence>,
+) -> Result<serde_json::Value, String> {
+    #[cfg(target_os = "windows")]
+    {
+        diagnose_windows_documents(evidence)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        for document in evidence {
+            drop((document.id, document.collector, document.content));
+        }
+        Err("Il corpus Windows è disponibile solo su sistemi Windows.".to_owned())
+    }
+}
+
 fn is_identity_observation(collector: &str) -> bool {
     collector.contains("hostname")
         || collector.contains("block.inventory")
@@ -548,11 +970,15 @@ fn broker_error(error: BrokerError) -> String {
 }
 
 #[tauri::command]
-fn authorize_observe(
+async fn authorize_observe(
     state: State<'_, ObserveBrokers>,
     request: ObserveRequest,
 ) -> Result<&'static str, String> {
-    let current_fingerprint = inventory_fingerprint(&collect_local_inventory());
+    let current_fingerprint = tauri::async_runtime::spawn_blocking(|| {
+        inventory_fingerprint(&collect_local_inventory_sync())
+    })
+    .await
+    .map_err(|_| "L’identità corrente del target non è disponibile.".to_owned())?;
     let mut brokers = locked_brokers(&state)?;
     authorize_observe_for_fingerprint(&mut brokers, current_fingerprint, request)
 }
@@ -594,7 +1020,9 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             collect_local_inventory,
+            collect_windows_p0_inventory,
             diagnose_linux_p0,
+            diagnose_windows_p0,
             authorize_observe,
             secure_runtime_status,
             initialize_device_identity,
@@ -608,12 +1036,85 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn windows_fixture_evidence() -> Vec<NativeDiagnosticEvidence> {
+        let documents = [
+            (
+                "windows.event-log.window",
+                include_str!(
+                    "../../../../packs/windows/fixtures/diagnostics/healthy/event-log.json"
+                ),
+            ),
+            (
+                "windows.reliability.records",
+                include_str!(
+                    "../../../../packs/windows/fixtures/diagnostics/healthy/reliability.json"
+                ),
+            ),
+            (
+                "windows.component-store.check-health",
+                include_str!(
+                    "../../../../packs/windows/fixtures/diagnostics/healthy/component-store.json"
+                ),
+            ),
+            (
+                "windows.sfc.verify-only",
+                include_str!("../../../../packs/windows/fixtures/diagnostics/healthy/sfc.json"),
+            ),
+            (
+                "windows.update.state",
+                include_str!("../../../../packs/windows/fixtures/diagnostics/healthy/update.json"),
+            ),
+            (
+                "windows.services.state",
+                include_str!(
+                    "../../../../packs/windows/fixtures/diagnostics/healthy/services.json"
+                ),
+            ),
+            (
+                "windows.network.state",
+                include_str!("../../../../packs/windows/fixtures/diagnostics/healthy/network.json"),
+            ),
+            (
+                "windows.drivers.state",
+                include_str!("../../../../packs/windows/fixtures/diagnostics/healthy/drivers.json"),
+            ),
+            (
+                "windows.bitlocker.state",
+                include_str!(
+                    "../../../../packs/windows/fixtures/diagnostics/healthy/bitlocker.json"
+                ),
+            ),
+            (
+                "windows.boot.state",
+                include_str!("../../../../packs/windows/fixtures/diagnostics/healthy/boot.json"),
+            ),
+            (
+                "windows.volumes.state",
+                include_str!("../../../../packs/windows/fixtures/diagnostics/healthy/volumes.json"),
+            ),
+        ];
+        documents
+            .into_iter()
+            .enumerate()
+            .map(|(index, (collector, content))| NativeDiagnosticEvidence {
+                id: format!("E-{}", index + 1),
+                collector: collector.to_owned(),
+                content: content.to_owned(),
+            })
+            .collect()
+    }
+
     #[test]
-    fn output_is_bounded() {
-        let input = vec![b'x'; MAX_OUTPUT_BYTES + 100];
-        let bounded = received_output(Some(read_bounded(std::io::Cursor::new(input))));
-        assert_eq!(bounded.bytes.len(), MAX_OUTPUT_BYTES);
-        assert!(bounded.truncated);
+    fn output_limits_are_parameterized_at_both_security_boundaries() {
+        for maximum in [DEFAULT_MAX_OUTPUT_BYTES, QUALIFIED_WINDOWS_MAX_OUTPUT_BYTES] {
+            let input = vec![b'x'; maximum + 1];
+            let reader = read_bounded(std::io::Cursor::new(input), maximum);
+            let bounded = received_output(Some(&reader));
+            finish_reader(Some(reader));
+            assert_eq!(bounded.bytes.len(), maximum);
+            assert!(bounded.truncated);
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -727,5 +1228,35 @@ mod tests {
             authorize_observe_for_fingerprint(&mut brokers, after.into(), request(2)),
             Err("Il target è cambiato: piano annullato, ripetere la diagnosi.".into())
         );
+    }
+
+    #[test]
+    fn resident_windows_diagnosis_preserves_dynamic_evidence_ids() {
+        let proposal = diagnose_windows_documents(windows_fixture_evidence())
+            .expect("complete Windows evidence must diagnose");
+        let ids = proposal["evidenceIds"]
+            .as_array()
+            .expect("proposal evidence IDs");
+        assert_eq!(ids.len(), 11);
+        assert_eq!(ids[0], "E-1");
+        assert_eq!(ids[10], "E-11");
+        assert!(
+            !proposal["diagnosis"]
+                .as_str()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .contains("healthy")
+        );
+    }
+
+    #[test]
+    fn resident_windows_diagnosis_rejects_partial_or_duplicate_collectors() {
+        let mut partial = windows_fixture_evidence();
+        partial.pop();
+        assert!(diagnose_windows_documents(partial).is_err());
+
+        let mut duplicate = windows_fixture_evidence();
+        duplicate[10].collector = duplicate[9].collector.clone();
+        assert!(diagnose_windows_documents(duplicate).is_err());
     }
 }

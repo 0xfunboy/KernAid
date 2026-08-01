@@ -56,13 +56,9 @@ test("rejects replay and keeps a pre-execution report fail-closed", async () => 
   const { driver, sessionId, planId } = await stagedDriver();
   const before = await driver.exportReport(sessionId, "json");
   assert.match(decodeURIComponent(before.uri), /"verification": "not-run"/);
-  for await (const _event of driver.executePlan(planId)) {
-    // Consume the transaction.
-  }
+  await drain(driver.executePlan(planId));
   await assert.rejects(async () => {
-    for await (const _event of driver.executePlan(planId)) {
-      // A replay must never yield an event.
-    }
+    await drain(driver.executePlan(planId));
   }, /already executed/);
 });
 
@@ -151,12 +147,7 @@ test("rejects provider output with unknown fields or foreign evidence", async ()
     });
     await assert.rejects(
       async () => {
-        for await (const _event of driver.sendUserPrompt(
-          session.id,
-          "diagnose",
-        )) {
-          // Consume until validation rejects the proposal.
-        }
+        await drain(driver.sendUserPrompt(session.id, "diagnose"));
       },
       foreignEvidence ? /outside this session/ : /unknown field/,
     );
@@ -202,12 +193,7 @@ test("redacts provider credentials from prompts and evidence", async () => {
     target: "fixture",
     observedContent: "Authorization: Bearer secret-token-value",
   });
-  for await (const _event of driver.sendUserPrompt(
-    session.id,
-    "key sk-test-supersecret",
-  )) {
-    // Provider assertions execute while consuming the stream.
-  }
+  await drain(driver.sendUserPrompt(session.id, "key sk-test-supersecret"));
 });
 
 test("records only approvals bound to the staged plan and target", async () => {
@@ -239,3 +225,45 @@ test("standalone redaction covers common provider secret shapes", () => {
   const output = redactForProvider(input);
   assert.doesNotMatch(output, /abc123|sk-ant-|AIza|abc\.def\.ghi/);
 });
+
+test("admits the qualified Windows evidence bound without widening other collectors", async () => {
+  const driver = new LocalSessionDriver();
+  const session = await driver.startSession({
+    targetFingerprint: fingerprint,
+    mode: "resident",
+  });
+  const largerThanLegacyBound = "x".repeat(64 * 1024 + 1);
+  await driver.requestEvidence(session.id, {
+    collector: "windows.event-log.window",
+    target: "local-machine",
+    observedContent: largerThanLegacyBound,
+  });
+  await assert.rejects(
+    driver.requestEvidence(session.id, {
+      collector: "linux.systemd.failed",
+      target: "local-machine",
+      observedContent: largerThanLegacyBound,
+    }),
+    /safe limit/u,
+  );
+  await assert.rejects(
+    driver.requestEvidence(session.id, {
+      collector: "windows.storage.identity",
+      target: "local-machine",
+      observedContent: largerThanLegacyBound,
+    }),
+    /safe limit/u,
+  );
+  await assert.rejects(
+    driver.requestEvidence(session.id, {
+      collector: "windows.event-log.window",
+      target: "local-machine",
+      observedContent: "x".repeat(1024 * 1024 + 1),
+    }),
+    /safe limit/u,
+  );
+});
+
+async function drain(iterable: AsyncIterable<unknown>): Promise<void> {
+  for await (const value of iterable) void value;
+}

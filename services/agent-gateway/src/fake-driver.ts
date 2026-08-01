@@ -40,10 +40,31 @@ const FINGERPRINT = /^sha256:[a-f0-9]{64}$/;
 const MAX_SESSIONS = 128;
 const MAX_EVIDENCE_PER_SESSION = 128;
 const MAX_EVIDENCE_BYTES = 64 * 1024;
+const MAX_QUALIFIED_WINDOWS_EVIDENCE_BYTES = 1024 * 1024;
 const MAX_PROMPT_LENGTH = 8 * 1024;
 const MAX_PROPOSALS_PER_SESSION = 128;
 const MAX_APPROVALS_PER_SESSION = 128;
 const MAX_EVENTS_PER_SESSION = 1_024;
+
+const QUALIFIED_LARGE_WINDOWS_COLLECTORS = new Set([
+  "windows.event-log.window",
+  "windows.reliability.records",
+  "windows.component-store.check-health",
+  "windows.sfc.verify-only",
+  "windows.update.state",
+  "windows.services.state",
+  "windows.network.state",
+  "windows.drivers.state",
+  "windows.bitlocker.state",
+  "windows.boot.state",
+  "windows.volumes.state",
+]);
+
+function evidenceByteLimit(collector: string): number {
+  return QUALIFIED_LARGE_WINDOWS_COLLECTORS.has(collector)
+    ? MAX_QUALIFIED_WINDOWS_EVIDENCE_BYTES
+    : MAX_EVIDENCE_BYTES;
+}
 
 type DriverState =
   "observe" | "diagnose" | "plan" | "verify" | "complete" | "failed";
@@ -218,7 +239,7 @@ export class LocalSessionDriver implements SessionDriver {
         throw new Error("collector and target are required");
       const observedContent = request.observedContent ?? "fixture inventory";
       const bytes = new TextEncoder().encode(observedContent);
-      if (bytes.byteLength > MAX_EVIDENCE_BYTES)
+      if (bytes.byteLength > evidenceByteLimit(request.collector))
         throw new Error("evidence content exceeds the safe limit");
       const digest = await crypto.subtle.digest("SHA-256", bytes);
       const hash = Array.from(new Uint8Array(digest), (byte) =>
@@ -428,6 +449,7 @@ export class LocalSessionDriver implements SessionDriver {
   }
 
   async *rollback(_planId: string): AsyncIterable<ExecutionEvent> {
+    yield* [];
     throw new Error("R0 plans do not mutate and require no rollback");
   }
 

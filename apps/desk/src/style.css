@@ -46,6 +46,55 @@ aside button {
   border: 1px solid #29312d;
   border-radius: 6px;
 }
+.target-picker {
+  margin: 14px 0 20px;
+  padding: 12px;
+  border: 1px solid #29312d;
+  border-radius: 8px;
+  background: #101513;
+}
+.target-picker p {
+  margin: 0 0 10px;
+  color: #9aaba2;
+  font-size: 12px;
+  line-height: 1.45;
+}
+.target-picker button {
+  font-size: 12px;
+}
+.target-picker button b,
+.target-picker button small {
+  display: block;
+}
+.target-picker button small {
+  margin-top: 5px;
+  color: #8fb0a0;
+  letter-spacing: 0;
+  line-height: 1.35;
+}
+.target-picker button:disabled {
+  opacity: 0.5;
+}
+.target-picker .selected-target {
+  color: #0d1110;
+  border-color: #c7ff3d;
+  background: #c7ff3d;
+  font-weight: 700;
+}
+.target-picker .selected-target small {
+  color: #26351d;
+}
+.target-picker small {
+  display: block;
+  margin-top: 8px;
+  line-height: 1.4;
+}
+.target-scope {
+  margin-bottom: 18px;
+}
+.target-scope .label {
+  margin-top: 22px;
+}
 .label,
 small {
   color: #50d8e8;

@@ -464,13 +464,20 @@ async function resolveSecret(
     !secret ||
     secret.length > 16 * 1024 ||
     secret !== secret.trim() ||
-    /[\u0000-\u001f\u007f]/u.test(secret)
+    hasAsciiControl(secret)
   )
     throw new ProviderError(
       "credential_unavailable",
       "Provider credential is unavailable",
     );
   return secret;
+}
+
+function hasAsciiControl(value: string): boolean {
+  return Array.from(value).some((character) => {
+    const codePoint = character.codePointAt(0);
+    return codePoint !== undefined && (codePoint <= 0x1f || codePoint === 0x7f);
+  });
 }
 
 class RequestAborted extends Error {}

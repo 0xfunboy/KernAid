@@ -16,9 +16,13 @@ kernaid-device-identity = { path = "../../../crates/device-identity" }
 kernaid-native-secrets = { path = "../../../crates/native-secrets" }
 kernaid-protocol = { path = "../../../crates/protocol" }
 kernaid-storage = { path = "../../../crates/storage" }
+kernaid-windows-pack = { path = "../../../packs/windows" }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1.1.4", features = ["fs", "process"] }
+
+[target.'cfg(windows)'.dependencies]
+process-wrap = { version = "9.1.0", default-features = false, features = ["std", "job-object"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 kernaid-linux-pack = { path = "../../../packs/linux" }
