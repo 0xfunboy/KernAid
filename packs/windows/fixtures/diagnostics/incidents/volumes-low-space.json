@@ -1,0 +1,12 @@
+{
+  "snapshotComplete": true,
+  "volumes": [
+    {
+      "driveLetter": "C:",
+      "fileSystem": "NTFS",
+      "capacityBytes": 255550554112,
+      "freeBytes": 1073741824,
+      "systemVolume": true
+    }
+  ]
+}

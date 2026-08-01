@@ -1,0 +1,8 @@
+{
+  "schemaVersion": "1.0",
+  "queryComplete": true,
+  "windowHours": 24,
+  "kernelPanics": 1,
+  "watchdogReboots": 0,
+  "repeatedAppCrashes": 0
+}

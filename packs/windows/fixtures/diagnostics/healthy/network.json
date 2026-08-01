@@ -1,0 +1,25 @@
+{
+  "snapshotComplete": true,
+  "adapters": [
+    { "interfaceIndex": 1, "status": "Up", "hardwareInterface": false },
+    { "interfaceIndex": 7, "status": "Up", "hardwareInterface": true },
+    { "interfaceIndex": 12, "status": "Down", "hardwareInterface": true }
+  ],
+  "routes": [
+    {
+      "destinationPrefix": "0.0.0.0/0",
+      "interfaceIndex": 7,
+      "nextHop": "192.0.2.1",
+      "routeMetric": 25
+    },
+    {
+      "destinationPrefix": "192.0.2.0/24",
+      "interfaceIndex": 7,
+      "nextHop": "0.0.0.0",
+      "routeMetric": 281
+    }
+  ],
+  "dnsServers": [
+    { "interfaceIndex": 7, "addresses": ["192.0.2.53", "2001:db8::53"] }
+  ]
+}

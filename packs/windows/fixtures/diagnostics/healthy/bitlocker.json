@@ -1,0 +1,21 @@
+{
+  "queryState": "complete",
+  "volumes": [
+    {
+      "mountPoint": "C:",
+      "volumeType": "OperatingSystem",
+      "protectionStatus": "On",
+      "lockStatus": "Unlocked",
+      "conversionStatus": "fully-encrypted",
+      "encryptionPercentage": 100
+    },
+    {
+      "mountPoint": "D:",
+      "volumeType": "FixedData",
+      "protectionStatus": "On",
+      "lockStatus": "Unlocked",
+      "conversionStatus": "fully-encrypted",
+      "encryptionPercentage": 100
+    }
+  ]
+}

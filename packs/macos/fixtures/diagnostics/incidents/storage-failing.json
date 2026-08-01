@@ -1,0 +1,11 @@
+{
+  "schemaVersion": "1.0",
+  "queryComplete": true,
+  "devices": [
+    {
+      "internal": true,
+      "solidState": true,
+      "smartStatus": "failing"
+    }
+  ]
+}

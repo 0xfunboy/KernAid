@@ -2189,6 +2189,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "kernaid-macos-pack"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "kernaid-native-secrets"
 version = "0.1.0"
 dependencies = [
@@ -2239,6 +2247,14 @@ dependencies = [
  "rusqlite",
  "sha2",
  "zeroize",
+]
+
+[[package]]
+name = "kernaid-windows-pack"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

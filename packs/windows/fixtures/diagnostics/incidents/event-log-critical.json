@@ -1,0 +1,14 @@
+{
+  "lookbackHours": 168,
+  "queryComplete": true,
+  "records": [
+    {
+      "logName": "System",
+      "recordId": 148117,
+      "providerName": "Microsoft-Windows-Kernel-Power",
+      "eventId": 41,
+      "level": "Critical",
+      "timestampUtc": "2026-07-31T04:12:11Z"
+    }
+  ]
+}

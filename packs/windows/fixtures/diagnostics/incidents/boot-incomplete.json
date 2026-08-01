@@ -1,0 +1,7 @@
+{
+  "queryState": "complete",
+  "firmwareType": "Uefi",
+  "windowsBootManagerPresent": true,
+  "osLoaderCount": 1,
+  "defaultLoaderPresent": false
+}

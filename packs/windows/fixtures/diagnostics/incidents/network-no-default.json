@@ -1,0 +1,17 @@
+{
+  "snapshotComplete": true,
+  "adapters": [
+    { "interfaceIndex": 7, "status": "Up", "hardwareInterface": true }
+  ],
+  "routes": [
+    {
+      "destinationPrefix": "192.0.2.0/24",
+      "interfaceIndex": 7,
+      "nextHop": "0.0.0.0",
+      "routeMetric": 281
+    }
+  ],
+  "dnsServers": [
+    { "interfaceIndex": 7, "addresses": [] }
+  ]
+}

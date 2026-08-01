@@ -1,0 +1,29 @@
+{
+  "changeLookbackHours": 168,
+  "snapshotComplete": true,
+  "drivers": [
+    {
+      "deviceId": "PCI\\VEN_8086&DEV_15F3&SUBSYS_00008086",
+      "status": "Ok",
+      "problemCode": 0,
+      "signed": true,
+      "driverVersion": "2.1.4.3",
+      "driverDateUtc": "2025-11-12T00:00:00Z"
+    },
+    {
+      "deviceId": "ACPI\\PNP0C0A\\0",
+      "status": "Ok",
+      "problemCode": 0,
+      "signed": true,
+      "driverVersion": "10.0.26100.1",
+      "driverDateUtc": "2024-06-21T00:00:00Z"
+    }
+  ],
+  "recentChanges": [
+    {
+      "kind": "update",
+      "identifier": "KB5062553",
+      "installedAtUtc": "2026-07-29T08:30:00Z"
+    }
+  ]
+}

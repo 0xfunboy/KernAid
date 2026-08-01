@@ -1,0 +1,21 @@
+{
+  "changeLookbackHours": 168,
+  "snapshotComplete": true,
+  "drivers": [
+    {
+      "deviceId": "PCI\\VEN_10DE&DEV_2684&SUBSYS_00000000",
+      "status": "Error",
+      "problemCode": 43,
+      "signed": false,
+      "driverVersion": "32.0.15.6094",
+      "driverDateUtc": "2026-07-28T00:00:00Z"
+    }
+  ],
+  "recentChanges": [
+    {
+      "kind": "driver",
+      "identifier": "oem42.inf",
+      "installedAtUtc": "2026-07-30T18:04:00Z"
+    }
+  ]
+}

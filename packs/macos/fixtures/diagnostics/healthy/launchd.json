@@ -1,0 +1,20 @@
+{
+  "schemaVersion": "1.0",
+  "queryComplete": true,
+  "services": [
+    {
+      "scope": "system",
+      "state": "running",
+      "lastExitStatus": 0,
+      "consecutiveFailures": 0,
+      "appleSigned": true
+    },
+    {
+      "scope": "user",
+      "state": "waiting",
+      "lastExitStatus": 0,
+      "consecutiveFailures": 0,
+      "appleSigned": false
+    }
+  ]
+}

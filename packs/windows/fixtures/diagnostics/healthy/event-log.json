@@ -1,0 +1,22 @@
+{
+  "lookbackHours": 168,
+  "queryComplete": true,
+  "records": [
+    {
+      "logName": "System",
+      "recordId": 148021,
+      "providerName": "Microsoft-Windows-Kernel-General",
+      "eventId": 12,
+      "level": "Information",
+      "timestampUtc": "2026-07-31T08:15:22Z"
+    },
+    {
+      "logName": "System",
+      "recordId": 148034,
+      "providerName": "Microsoft-Windows-DNS-Client",
+      "eventId": 1014,
+      "level": "Warning",
+      "timestampUtc": "2026-07-31T09:10:01Z"
+    }
+  ]
+}

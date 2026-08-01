@@ -1,0 +1,6 @@
+{
+  "checkMode": "check-health-read-only",
+  "state": "repairable",
+  "exitCode": 0,
+  "rebootRequired": false
+}

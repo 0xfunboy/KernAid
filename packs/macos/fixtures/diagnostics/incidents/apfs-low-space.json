@@ -1,0 +1,11 @@
+{
+  "schemaVersion": "1.0",
+  "queryComplete": true,
+  "containerCount": 1,
+  "rootDataVolume": {
+    "capacityBytes": 494384795648,
+    "freeBytes": 1073741824,
+    "purgeableBytes": 268435456,
+    "fileVault": "on"
+  }
+}

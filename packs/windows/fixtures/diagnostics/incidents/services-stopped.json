@@ -1,0 +1,17 @@
+{
+  "snapshotComplete": true,
+  "services": [
+    {
+      "name": "EventLog",
+      "startMode": "automatic",
+      "state": "running",
+      "win32ExitCode": 0
+    },
+    {
+      "name": "Dhcp",
+      "startMode": "automatic",
+      "state": "stopped",
+      "win32ExitCode": 1067
+    }
+  ]
+}

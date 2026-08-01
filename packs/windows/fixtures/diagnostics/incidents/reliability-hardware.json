@@ -1,0 +1,14 @@
+{
+  "lookbackHours": 168,
+  "queryState": "complete",
+  "records": [
+    {
+      "logFile": "System",
+      "recordNumber": 9124,
+      "sourceName": "Windows",
+      "productName": "Hardware error",
+      "recordType": "HardwareFailure",
+      "timestampUtc": "2026-07-31T04:12:12Z"
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "lookbackHours": 168,
+  "queryState": "complete",
+  "records": [
+    {
+      "logFile": "System",
+      "recordNumber": 9031,
+      "sourceName": "Microsoft-Windows-WindowsUpdateClient",
+      "productName": null,
+      "recordType": "Informational",
+      "timestampUtc": "2026-07-30T13:05:00Z"
+    }
+  ]
+}

@@ -4,7 +4,7 @@ members = [
   "crates/core", "crates/broker", "crates/evidence", "crates/policy",
   "crates/protocol", "crates/storage", "crates/redaction", "crates/device-identity",
   "crates/native-secrets", "crates/rescue-secrets",
-  "packs/linux", "apps/desk/src-tauri"
+  "packs/linux", "packs/macos", "packs/windows", "apps/desk/src-tauri"
 ]
 
 [workspace.package]

@@ -1,0 +1,15 @@
+{
+  "historyLookbackHours": 168,
+  "scanState": "complete",
+  "pendingReboot": true,
+  "cbsRebootPending": true,
+  "windowsUpdateRebootPending": false,
+  "pendingFileRenameOperations": true,
+  "lastSuccessfulScanUtc": "2026-07-31T07:00:00Z",
+  "failedUpdates": [
+    {
+      "updateId": "2f99de23-9999-42f0-8e40-1ce5fbd5d70a",
+      "hresult": "0x800F0922"
+    }
+  ]
+}

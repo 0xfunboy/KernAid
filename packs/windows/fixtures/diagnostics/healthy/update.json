@@ -1,0 +1,10 @@
+{
+  "historyLookbackHours": 168,
+  "scanState": "complete",
+  "pendingReboot": false,
+  "cbsRebootPending": false,
+  "windowsUpdateRebootPending": false,
+  "pendingFileRenameOperations": false,
+  "lastSuccessfulScanUtc": "2026-07-31T07:00:00Z",
+  "failedUpdates": []
+}
