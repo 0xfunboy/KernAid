@@ -16,10 +16,16 @@ jobs:
       - uses: actions/setup-node@v4
         with: {node-version: 24.18.0, cache: pnpm}
       - run: pnpm install --frozen-lockfile
-      - name: Install image and VM tooling
-        run: sudo apt-get update && sudo apt-get install -y live-build qemu-system-x86 ovmf
+      - run: pnpm --filter @kernaid/desk build
+      - name: Install VM tooling
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 ovmf
       - name: Build hybrid BIOS and UEFI ISO
-        run: sudo env PATH="$PATH" ./tools/build-rescue/build.sh
+        run: |
+          docker run --rm --privileged \
+            -e KERNAID_DESK_PREBUILT=1 \
+            -v "$PWD:/workspace" -w /workspace \
+            debian:trixie-slim \
+            sh -c 'apt-get update && apt-get install -y live-build ca-certificates && ./tools/build-rescue/build.sh'
       - name: QEMU BIOS smoke test
         run: ./tools/build-rescue/qemu-smoke.sh
       - name: Publish checksums and image

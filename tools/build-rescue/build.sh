@@ -4,7 +4,7 @@ set -euo pipefail
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 build_dir="$repo_dir/rescue/live-build"
 
-for command in lb pnpm; do
+for command in lb; do
   command -v "$command" >/dev/null || { echo "Missing required command: $command" >&2; exit 2; }
 done
 
@@ -14,7 +14,11 @@ if [[ "$(id -u)" -ne 0 ]]; then
 fi
 
 cd "$repo_dir"
-pnpm --filter @kernaid/desk build
+if [[ "${KERNAID_DESK_PREBUILT:-0}" != "1" ]]; then
+  command -v pnpm >/dev/null || { echo "Missing required command: pnpm" >&2; exit 2; }
+  pnpm --filter @kernaid/desk build
+fi
+test -f apps/desk/dist/index.html || { echo "Desk production bundle is missing" >&2; exit 2; }
 
 install -d "$build_dir/config/includes.chroot/opt/kernaid/desk"
 rm -rf "$build_dir/config/includes.chroot/opt/kernaid/desk/assets"
@@ -29,7 +33,6 @@ lb config \
   --architectures amd64 \
   --binary-images iso-hybrid \
   --archive-areas "main contrib non-free-firmware" \
-  --security false \
   --debian-installer none \
   --apt-recommends false \
   --bootappend-live "boot=live components username=kernaid hostname=kernaid-rescue console=tty0 console=ttyS0,115200n8"
