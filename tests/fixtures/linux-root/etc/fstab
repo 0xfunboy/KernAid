@@ -1,0 +1,2 @@
+# Disposable fixture only
+UUID=fixture-root / ext4 defaults,ro 0 1

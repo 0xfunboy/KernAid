@@ -1,0 +1,9 @@
+[package]
+name="kernaid-linux-pack"
+version.workspace=true
+edition.workspace=true
+[lints]
+workspace=true
+[[bin]]
+name="kernaid-linux-inventory"
+path="src/main.rs"

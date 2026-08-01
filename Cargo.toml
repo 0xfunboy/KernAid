@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/core", "crates/broker", "crates/evidence", "crates/policy",
+  "crates/protocol", "crates/storage", "crates/redaction", "crates/device-identity",
+  "packs/linux", "apps/desk/src-tauri"
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license-file = "LICENSE"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+panic = "deny"

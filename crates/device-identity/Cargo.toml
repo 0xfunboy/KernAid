@@ -1,0 +1,6 @@
+[package]
+name="kernaid-device-identity"
+version.workspace=true
+edition.workspace=true
+[lints]
+workspace=true

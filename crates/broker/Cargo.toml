@@ -1,0 +1,8 @@
+[package]
+name = "kernaid-broker"
+version.workspace = true
+edition.workspace = true
+[dependencies]
+kernaid-protocol = { path = "../protocol" }
+[lints]
+workspace = true

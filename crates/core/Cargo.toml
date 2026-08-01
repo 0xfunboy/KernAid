@@ -1,0 +1,9 @@
+[package]
+name = "kernaid-core"
+version.workspace = true
+edition.workspace = true
+[dependencies]
+kernaid-policy = { path = "../policy" }
+kernaid-protocol = { path = "../protocol" }
+[lints]
+workspace = true
