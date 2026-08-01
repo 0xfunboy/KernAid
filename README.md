@@ -6,7 +6,7 @@ The current vertical slice is deliberately safe: start a session, collect a norm
 
 ## Quick start
 
-Requirements: Rust stable (pinned by `rust-toolchain.toml`), Node 22, pnpm 9, and `just`.
+Requirements: Rust stable (pinned by `rust-toolchain.toml`), Node 24.18.0, pnpm 9, and `just`.
 
 ```bash
 just bootstrap

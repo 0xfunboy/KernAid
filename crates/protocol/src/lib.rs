@@ -1,7 +1,13 @@
 #![forbid(unsafe_code)]
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Risk { R0, R1, R2, R3, R4 }
+pub enum Risk {
+    R0,
+    R1,
+    R2,
+    R3,
+    R4,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActionStep {
