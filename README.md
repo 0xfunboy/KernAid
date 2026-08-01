@@ -31,7 +31,7 @@ The Rescue artifact is rebuilt and boot-tested without a target disk in QEMU usi
 
 The React UI talks only to a `SessionDriver`. Providers return diagnosis proposals and cannot reach the broker. Core validates plans and policy. The broker accepts an allowlisted typed envelope; in Phase 0 its only action is `system.observe.noop`.
 
-See [architecture](docs/architecture/phase-0.md), [security policy](SECURITY.md), and the masterplan copied into `docs/`.
+See the [operator guide](docs/operator-guide.md), [architecture](docs/architecture/phase-0.md), [security policy](SECURITY.md), and the complete [masterplan](docs/MASTERPLAN.md).
 
 ## Current limitations
 
