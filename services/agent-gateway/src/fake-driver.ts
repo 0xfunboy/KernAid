@@ -48,6 +48,9 @@ const MAX_EVENTS_PER_SESSION = 1_024;
 type DriverState =
   "observe" | "diagnose" | "plan" | "verify" | "complete" | "failed";
 
+type OperationOutcome<Result> =
+  { ok: true; value: Result } | { ok: false; error: unknown };
+
 export interface ObserveExecutionIntent {
   sessionId: string;
   planId: string;
@@ -73,6 +76,7 @@ interface SessionRecord {
   auditStatus: AuditSinkStatus;
   auditSequence: number;
   auditFailed: boolean;
+  operationTail: Promise<void>;
   evidence: Evidence[];
   proposals: DiagnosisProposal[];
   decisions: Approval[];
@@ -111,6 +115,7 @@ export class LocalSessionDriver implements SessionDriver {
       auditStatus: this.sinkStatus(),
       auditSequence: 0,
       auditFailed: false,
+      operationTail: Promise.resolve(),
       evidence: [],
       proposals: [],
       decisions: [],
@@ -133,46 +138,69 @@ export class LocalSessionDriver implements SessionDriver {
     prompt: string,
   ): AsyncIterable<SessionEvent> {
     const session = this.session(sessionId);
-    this.ensureAuditHealthy(session);
-    if (session.state !== "observe" && session.state !== "diagnose")
-      throw new Error("session is not accepting diagnosis prompts");
-    if (!prompt.trim() || prompt.length > MAX_PROMPT_LENGTH)
-      throw new Error("objective is required and must be bounded");
-    if (session.evidence.length === 0) throw new Error("evidence is required");
-    if (session.proposals.length >= MAX_PROPOSALS_PER_SESSION)
-      throw new Error("diagnosis limit reached");
-    yield {
-      type: "status",
-      message: "Analisi deterministica delle evidenze locali",
-    };
-    const records = session.evidence.map((evidence) => ({
-      evidence: structuredClone(evidence),
-      content: this.content.get(evidence.id) ?? "",
-    }));
-    const providerProposal = parseDiagnosisProposal(
-      await this.provider.diagnose(redactForProvider(prompt), records),
+    let resolveStatus = (_event: SessionEvent): void => {};
+    let rejectStatus = (_error: unknown): void => {};
+    const statusReady = new Promise<SessionEvent>((resolve, reject) => {
+      resolveStatus = resolve;
+      rejectStatus = reject;
+    });
+    const operation = this.withSessionOperation(
+      session,
+      async (): Promise<SessionEvent> => {
+        this.ensureAuditHealthy(session);
+        if (session.state !== "observe" && session.state !== "diagnose")
+          throw new Error("session is not accepting diagnosis prompts");
+        if (!prompt.trim() || prompt.length > MAX_PROMPT_LENGTH)
+          throw new Error("objective is required and must be bounded");
+        if (session.evidence.length === 0)
+          throw new Error("evidence is required");
+        if (session.proposals.length >= MAX_PROPOSALS_PER_SESSION)
+          throw new Error("diagnosis limit reached");
+        resolveStatus({
+          type: "status",
+          message: "Analisi deterministica delle evidenze locali",
+        });
+        const records = session.evidence.map((evidence) => ({
+          evidence: structuredClone(evidence),
+          content: this.content.get(evidence.id) ?? "",
+        }));
+        const providerProposal = parseDiagnosisProposal(
+          await this.provider.diagnose(redactForProvider(prompt), records),
+        );
+        const proposal = parseDiagnosisProposal({
+          ...providerProposal,
+          diagnosis: redactForProvider(providerProposal.diagnosis),
+          requestedEvidence: providerProposal.requestedEvidence.map((item) =>
+            redactForProvider(item),
+          ),
+        });
+        this.assertEvidenceBinding(session, proposal.evidenceIds);
+        await this.appendAudit(session, sessionId, "diagnosis", {
+          diagnosisSha256: await sha256(proposal.diagnosis),
+          confidence: proposal.confidence,
+          evidenceIds: proposal.evidenceIds,
+          requestedEvidenceCount: proposal.requestedEvidence.length,
+        });
+        session.proposals.push(proposal);
+        session.state = "diagnose";
+        return {
+          type: "proposal",
+          message: proposal.diagnosis,
+          proposal: structuredClone(proposal),
+        };
+      },
+    ).then<OperationOutcome<SessionEvent>, OperationOutcome<SessionEvent>>(
+      (event) => ({ ok: true, value: event }),
+      (error: unknown) => {
+        rejectStatus(error);
+        return { ok: false, error };
+      },
     );
-    const proposal = parseDiagnosisProposal({
-      ...providerProposal,
-      diagnosis: redactForProvider(providerProposal.diagnosis),
-      requestedEvidence: providerProposal.requestedEvidence.map((item) =>
-        redactForProvider(item),
-      ),
-    });
-    this.assertEvidenceBinding(session, proposal.evidenceIds);
-    await this.appendAudit(session, sessionId, "diagnosis", {
-      diagnosisSha256: await sha256(proposal.diagnosis),
-      confidence: proposal.confidence,
-      evidenceIds: proposal.evidenceIds,
-      requestedEvidenceCount: proposal.requestedEvidence.length,
-    });
-    session.proposals.push(proposal);
-    session.state = "diagnose";
-    yield {
-      type: "proposal",
-      message: proposal.diagnosis,
-      proposal: structuredClone(proposal),
-    };
+
+    yield await statusReady;
+    const outcome = await operation;
+    if (!outcome.ok) throw outcome.error;
+    yield outcome.value;
   }
 
   async requestEvidence(
@@ -180,50 +208,52 @@ export class LocalSessionDriver implements SessionDriver {
     request: EvidenceRequest,
   ): Promise<Evidence[]> {
     const session = this.session(sessionId);
-    this.ensureAuditHealthy(session);
-    if (session.state !== "observe" && session.state !== "diagnose")
-      throw new Error("session is not accepting evidence");
-    if (session.evidence.length >= MAX_EVIDENCE_PER_SESSION)
-      throw new Error("evidence limit reached");
-    if (!request.collector.trim() || !request.target.trim())
-      throw new Error("collector and target are required");
-    const observedContent = request.observedContent ?? "fixture inventory";
-    const bytes = new TextEncoder().encode(observedContent);
-    if (bytes.byteLength > MAX_EVIDENCE_BYTES)
-      throw new Error("evidence content exceeds the safe limit");
-    const digest = await crypto.subtle.digest("SHA-256", bytes);
-    const hash = Array.from(new Uint8Array(digest), (byte) =>
-      byte.toString(16).padStart(2, "0"),
-    ).join("");
-    const item = parseEvidence({
-      schemaVersion: "1.0",
-      id: `E-${++this.evidenceSequence}`,
-      collector: redactForProvider(request.collector),
-      target: redactForProvider(request.target),
-      capturedAt: new Date().toISOString(),
-      contentType: request.contentType ?? "text/plain",
-      sha256: hash,
-      sensitivity: "system",
-      trust: "observed-untrusted",
-      summary: redactForProvider(
-        request.summary ?? "Inventario raccolto in sola lettura",
-      ),
-      blobRef: `sha256:${hash}`,
+    return this.withSessionOperation(session, async () => {
+      this.ensureAuditHealthy(session);
+      if (session.state !== "observe" && session.state !== "diagnose")
+        throw new Error("session is not accepting evidence");
+      if (session.evidence.length >= MAX_EVIDENCE_PER_SESSION)
+        throw new Error("evidence limit reached");
+      if (!request.collector.trim() || !request.target.trim())
+        throw new Error("collector and target are required");
+      const observedContent = request.observedContent ?? "fixture inventory";
+      const bytes = new TextEncoder().encode(observedContent);
+      if (bytes.byteLength > MAX_EVIDENCE_BYTES)
+        throw new Error("evidence content exceeds the safe limit");
+      const digest = await crypto.subtle.digest("SHA-256", bytes);
+      const hash = Array.from(new Uint8Array(digest), (byte) =>
+        byte.toString(16).padStart(2, "0"),
+      ).join("");
+      const item = parseEvidence({
+        schemaVersion: "1.0",
+        id: `E-${++this.evidenceSequence}`,
+        collector: redactForProvider(request.collector),
+        target: redactForProvider(request.target),
+        capturedAt: new Date().toISOString(),
+        contentType: request.contentType ?? "text/plain",
+        sha256: hash,
+        sensitivity: "system",
+        trust: "observed-untrusted",
+        summary: redactForProvider(
+          request.summary ?? "Inventario raccolto in sola lettura",
+        ),
+        blobRef: `sha256:${hash}`,
+      });
+      await this.appendAudit(
+        session,
+        sessionId,
+        "evidence",
+        {
+          evidenceId: item.id,
+          sha256: item.sha256,
+          sensitivity: item.sensitivity,
+        },
+        item.capturedAt,
+      );
+      session.evidence.push(item);
+      this.content.set(item.id, redactForProvider(observedContent));
+      return [structuredClone(item)];
     });
-    await this.appendAudit(
-      session,
-      sessionId,
-      "evidence",
-      {
-        evidenceId: item.id,
-        sha256: item.sha256,
-        sensitivity: item.sensitivity,
-      },
-      item.capturedAt,
-    );
-    session.evidence.push(item);
-    this.content.set(item.id, redactForProvider(observedContent));
-    return [structuredClone(item)];
   }
 
   async stagePlan(
@@ -231,81 +261,85 @@ export class LocalSessionDriver implements SessionDriver {
     proposalValue: DiagnosisProposal,
   ): Promise<ValidatedPlan> {
     const session = this.session(sessionId);
-    this.ensureAuditHealthy(session);
-    if (session.state !== "diagnose")
-      throw new Error("session is not ready to stage a plan");
-    const proposal = parseDiagnosisProposal(proposalValue);
-    if (!session.proposals.some((issued) => sameProposal(issued, proposal)))
-      throw new Error("proposal was not issued for this session");
-    this.assertEvidenceBinding(session, proposal.evidenceIds);
-    const plan = parseValidatedPlan({
-      schemaVersion: "1.0",
-      planId: `P-${crypto.randomUUID()}`,
-      targetFingerprint: session.input.targetFingerprint,
-      diagnosis: proposal.diagnosis,
-      evidenceIds: proposal.evidenceIds,
-      risk: "R0",
-      steps: [
-        {
-          action: "system.observe.noop",
-          args: {},
-          preconditions: ["target.still_matches"],
-          backup: "not-required",
-          validation: "evidence.exists",
-          rollback: null,
-        },
-      ],
+    return this.withSessionOperation(session, async () => {
+      this.ensureAuditHealthy(session);
+      if (session.state !== "diagnose")
+        throw new Error("session is not ready to stage a plan");
+      const proposal = parseDiagnosisProposal(proposalValue);
+      if (!session.proposals.some((issued) => sameProposal(issued, proposal)))
+        throw new Error("proposal was not issued for this session");
+      this.assertEvidenceBinding(session, proposal.evidenceIds);
+      const plan = parseValidatedPlan({
+        schemaVersion: "1.0",
+        planId: `P-${crypto.randomUUID()}`,
+        targetFingerprint: session.input.targetFingerprint,
+        diagnosis: proposal.diagnosis,
+        evidenceIds: proposal.evidenceIds,
+        risk: "R0",
+        steps: [
+          {
+            action: "system.observe.noop",
+            args: {},
+            preconditions: ["target.still_matches"],
+            backup: "not-required",
+            validation: "evidence.exists",
+            rollback: null,
+          },
+        ],
+      });
+      await this.appendAudit(session, sessionId, "plan", {
+        planId: plan.planId,
+        targetFingerprint: plan.targetFingerprint,
+        risk: plan.risk,
+        evidenceIds: plan.evidenceIds,
+        actions: plan.steps.map((step) => step.action),
+      });
+      this.plans.set(plan.planId, { sessionId, plan, executed: false });
+      session.state = "plan";
+      return structuredClone(plan);
     });
-    await this.appendAudit(session, sessionId, "plan", {
-      planId: plan.planId,
-      targetFingerprint: plan.targetFingerprint,
-      risk: plan.risk,
-      evidenceIds: plan.evidenceIds,
-      actions: plan.steps.map((step) => step.action),
-    });
-    this.plans.set(plan.planId, { sessionId, plan, executed: false });
-    session.state = "plan";
-    return structuredClone(plan);
   }
 
   async approvePlan(planId: string, approvalValue: Approval): Promise<void> {
     const record = this.plan(planId);
     const session = this.session(record.sessionId);
-    this.ensureAuditHealthy(session);
-    if (record.executed || session.state !== "plan")
-      throw new Error("plan is not awaiting approval");
-    const approval = parseApproval(approvalValue);
-    if (
-      approval.planId !== planId ||
-      approval.targetFingerprint !== record.plan.targetFingerprint
-    ) {
-      throw new Error("approval does not match the staged plan");
-    }
-    if (
-      session.decisions.some(
-        (decision) => decision.approvalId === approval.approvalId,
+    await this.withSessionOperation(session, async () => {
+      this.ensureAuditHealthy(session);
+      if (record.executed || session.state !== "plan")
+        throw new Error("plan is not awaiting approval");
+      const approval = parseApproval(approvalValue);
+      if (
+        approval.planId !== planId ||
+        approval.targetFingerprint !== record.plan.targetFingerprint
+      ) {
+        throw new Error("approval does not match the staged plan");
+      }
+      if (
+        session.decisions.some(
+          (decision) => decision.approvalId === approval.approvalId,
+        )
       )
-    )
-      throw new Error("approval id was already used");
-    if (session.decisions.length >= MAX_APPROVALS_PER_SESSION)
-      throw new Error("approval limit reached");
-    const storedApproval = parseApproval({
-      ...approval,
-      approvedBy: redactForProvider(approval.approvedBy),
-      ...(approval.typedConfirmation === undefined
-        ? {}
-        : {
-            typedConfirmation: redactForProvider(approval.typedConfirmation),
-          }),
+        throw new Error("approval id was already used");
+      if (session.decisions.length >= MAX_APPROVALS_PER_SESSION)
+        throw new Error("approval limit reached");
+      const storedApproval = parseApproval({
+        ...approval,
+        approvedBy: redactForProvider(approval.approvedBy),
+        ...(approval.typedConfirmation === undefined
+          ? {}
+          : {
+              typedConfirmation: redactForProvider(approval.typedConfirmation),
+            }),
+      });
+      await this.appendAudit(session, record.sessionId, "approval", {
+        approvalId: storedApproval.approvalId,
+        planId: storedApproval.planId,
+        targetFingerprint: storedApproval.targetFingerprint,
+        approvedAt: storedApproval.approvedAt,
+        approvedBySha256: await sha256(storedApproval.approvedBy),
+      });
+      session.decisions.push(storedApproval);
     });
-    await this.appendAudit(session, record.sessionId, "approval", {
-      approvalId: storedApproval.approvalId,
-      planId: storedApproval.planId,
-      targetFingerprint: storedApproval.targetFingerprint,
-      approvedAt: storedApproval.approvedAt,
-      approvedBySha256: await sha256(storedApproval.approvedBy),
-    });
-    session.decisions.push(storedApproval);
   }
 
   async *executePlan(
@@ -313,63 +347,84 @@ export class LocalSessionDriver implements SessionDriver {
   ): AsyncGenerator<ExecutionEvent, void, unknown> {
     const record = this.plan(planId);
     const session = this.session(record.sessionId);
-    this.ensureAuditHealthy(session);
-    if (record.executed || session.state !== "plan")
-      throw new Error("plan was already executed or is out of state");
-    if (session.events.length + 2 > MAX_EVENTS_PER_SESSION)
-      throw new Error("execution event limit reached");
-    const plan = parseValidatedPlan(record.plan);
-    this.assertEvidenceBinding(session, plan.evidenceIds);
-    if (
-      plan.risk !== "R0" ||
-      plan.steps.length !== 1 ||
-      plan.steps[0]?.action !== "system.observe.noop" ||
-      Object.keys(plan.steps[0].args).length !== 0
-    ) {
-      throw new Error("only the typed R0 observation action is enabled");
-    }
-    record.executed = true;
-    const started = this.event(
-      planId,
-      session.events.length + 1,
-      "started",
-      "Verifica del piano R0 avviata",
+    let resolveStarted = (_event: ExecutionEvent): void => {};
+    let rejectStarted = (_error: unknown): void => {};
+    const startedReady = new Promise<ExecutionEvent>((resolve, reject) => {
+      resolveStarted = resolve;
+      rejectStarted = reject;
+    });
+    const operation = this.withSessionOperation(
+      session,
+      async (): Promise<ExecutionEvent> => {
+        this.ensureAuditHealthy(session);
+        if (record.executed || session.state !== "plan")
+          throw new Error("plan was already executed or is out of state");
+        if (session.events.length + 2 > MAX_EVENTS_PER_SESSION)
+          throw new Error("execution event limit reached");
+        const plan = parseValidatedPlan(record.plan);
+        this.assertEvidenceBinding(session, plan.evidenceIds);
+        if (
+          plan.risk !== "R0" ||
+          plan.steps.length !== 1 ||
+          plan.steps[0]?.action !== "system.observe.noop" ||
+          Object.keys(plan.steps[0].args).length !== 0
+        ) {
+          throw new Error("only the typed R0 observation action is enabled");
+        }
+        record.executed = true;
+        const started = this.event(
+          planId,
+          session.events.length + 1,
+          "started",
+          "Verifica del piano R0 avviata",
+        );
+        await this.appendExecutionAudit(session, record.sessionId, started);
+        session.events.push(started);
+        session.state = "verify";
+        resolveStarted(structuredClone(started));
+        try {
+          await this.executor.execute({
+            sessionId: record.sessionId,
+            planId,
+            targetFingerprint: plan.targetFingerprint,
+            sequence: 1,
+            action: "system.observe.noop",
+          });
+        } catch {
+          const failed = this.event(
+            planId,
+            session.events.length + 1,
+            "failed",
+            "Il broker locale ha rifiutato il piano; nessuna modifica è stata eseguita",
+          );
+          await this.appendExecutionAudit(session, record.sessionId, failed);
+          session.events.push(failed);
+          session.state = "failed";
+          return structuredClone(failed);
+        }
+        const succeeded = this.event(
+          planId,
+          session.events.length + 1,
+          "succeeded",
+          "Evidenze presenti e piano R0 verificato; nessuna modifica eseguita",
+        );
+        await this.appendExecutionAudit(session, record.sessionId, succeeded);
+        session.events.push(succeeded);
+        session.state = "complete";
+        return structuredClone(succeeded);
+      },
+    ).then<OperationOutcome<ExecutionEvent>, OperationOutcome<ExecutionEvent>>(
+      (event) => ({ ok: true, value: event }),
+      (error: unknown) => {
+        rejectStarted(error);
+        return { ok: false, error };
+      },
     );
-    await this.appendExecutionAudit(session, record.sessionId, started);
-    session.events.push(started);
-    session.state = "verify";
-    yield structuredClone(started);
-    try {
-      await this.executor.execute({
-        sessionId: record.sessionId,
-        planId,
-        targetFingerprint: plan.targetFingerprint,
-        sequence: 1,
-        action: "system.observe.noop",
-      });
-    } catch {
-      const failed = this.event(
-        planId,
-        session.events.length + 1,
-        "failed",
-        "Il broker locale ha rifiutato il piano; nessuna modifica è stata eseguita",
-      );
-      await this.appendExecutionAudit(session, record.sessionId, failed);
-      session.events.push(failed);
-      session.state = "failed";
-      yield structuredClone(failed);
-      return;
-    }
-    const succeeded = this.event(
-      planId,
-      session.events.length + 1,
-      "succeeded",
-      "Evidenze presenti e piano R0 verificato; nessuna modifica eseguita",
-    );
-    await this.appendExecutionAudit(session, record.sessionId, succeeded);
-    session.events.push(succeeded);
-    session.state = "complete";
-    yield structuredClone(succeeded);
+
+    yield await startedReady;
+    const outcome = await operation;
+    if (!outcome.ok) throw outcome.error;
+    yield outcome.value;
   }
 
   async *rollback(_planId: string): AsyncIterable<ExecutionEvent> {
@@ -383,69 +438,101 @@ export class LocalSessionDriver implements SessionDriver {
     if (format !== "json" && format !== "markdown")
       throw new Error("unsupported report format");
     const session = this.session(sessionId);
-    this.ensureAuditHealthy(session);
-    const verification = session.events.some(
-      (event) => event.status === "failed",
-    )
-      ? "failed"
-      : session.events.at(-1)?.status === "succeeded"
-        ? "passed"
-        : "not-run";
-    const report = parseSessionReport({
-      schemaVersion: "1.0",
-      sessionId,
-      targetFingerprint: session.input.targetFingerprint,
-      facts: session.evidence,
-      inferences: session.proposals,
-      decisions: session.decisions,
-      events: session.events,
-      verification,
-      unresolvedRisks: [
-        "Nessuna riparazione è stata eseguita",
-        "Confermare la diagnosi con controlli mirati",
-        ...(session.auditStatus.state === "unavailable"
-          ? [
-              "Audit sicuro non disponibile: questo report non è firmato e non è persistente",
-            ]
-          : []),
-      ],
-    });
-    const body =
-      format === "json"
-        ? JSON.stringify(report, null, 2)
-        : this.markdown(report);
-    const payloadMediaType =
-      format === "json" ? "application/json" : "text/markdown";
-    const reportSha256 = await sha256(body);
-    await this.appendAudit(session, sessionId, "report", {
-      format,
-      payloadMediaType,
-      payloadSha256: reportSha256,
-      verification,
-    });
-
-    try {
-      const artifact = parseArtifactRef(
-        await this.auditSink.sealReport({
-          schemaVersion: "1.0",
-          sessionId,
-          format,
-          payloadMediaType,
-          body,
-          payloadSha256: reportSha256,
-        }),
-      );
-      if (
-        artifact.payloadMediaType !== payloadMediaType ||
-        artifact.payloadSha256 !== reportSha256 ||
-        !auditStatusesEqual(artifact.auditStatus, session.auditStatus)
+    return this.withSessionOperation(session, async () => {
+      this.ensureAuditHealthy(session);
+      const verification = session.events.some(
+        (event) => event.status === "failed",
       )
-        throw new Error("invalid sealed artifact");
-      return artifact;
-    } catch {
-      this.failAudit(session);
-      throw auditBoundaryError();
+        ? "failed"
+        : session.events.at(-1)?.status === "succeeded"
+          ? "passed"
+          : "not-run";
+      const report = parseSessionReport({
+        schemaVersion: "1.0",
+        sessionId,
+        targetFingerprint: session.input.targetFingerprint,
+        facts: session.evidence,
+        inferences: session.proposals,
+        decisions: session.decisions,
+        events: session.events,
+        verification,
+        unresolvedRisks: [
+          "Nessuna riparazione è stata eseguita",
+          "Confermare la diagnosi con controlli mirati",
+          ...(session.auditStatus.state === "unavailable"
+            ? [
+                "Audit sicuro non disponibile: questo report non è firmato e non è persistente",
+              ]
+            : []),
+        ],
+      });
+      const body =
+        format === "json"
+          ? JSON.stringify(report, null, 2)
+          : this.markdown(report);
+      const payloadMediaType =
+        format === "json" ? "application/json" : "text/markdown";
+      const reportSha256 = await sha256(body);
+      await this.appendAudit(session, sessionId, "report", {
+        format,
+        payloadMediaType,
+        payloadSha256: reportSha256,
+        verification,
+      });
+
+      try {
+        const artifact = parseArtifactRef(
+          await this.auditSink.sealReport({
+            schemaVersion: "1.0",
+            sessionId,
+            format,
+            payloadMediaType,
+            body,
+            payloadSha256: reportSha256,
+          }),
+        );
+        if (
+          artifact.payloadMediaType !== payloadMediaType ||
+          artifact.payloadSha256 !== reportSha256 ||
+          !auditStatusesEqual(artifact.auditStatus, session.auditStatus)
+        )
+          throw new Error("invalid sealed artifact");
+        this.ensureAuditHealthy(session);
+        return artifact;
+      } catch {
+        this.failAudit(session);
+        throw auditBoundaryError();
+      }
+    });
+  }
+
+  private async withSessionOperation<Result>(
+    session: SessionRecord,
+    operation: () => Promise<Result>,
+  ): Promise<Result> {
+    const releaseOperation = await this.acquireSessionOperation(session);
+    try {
+      return await operation();
+    } finally {
+      releaseOperation();
     }
+  }
+
+  private async acquireSessionOperation(
+    session: SessionRecord,
+  ): Promise<() => void> {
+    const previousOperation = session.operationTail;
+    let releaseOperation = (): void => {};
+    session.operationTail = new Promise<void>((resolve) => {
+      releaseOperation = resolve;
+    });
+    await previousOperation;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      releaseOperation();
+    };
   }
 
   private event(

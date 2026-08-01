@@ -254,6 +254,65 @@ test("report sealing is fail-closed after its audit record was accepted", async 
   );
 });
 
+test("serializes a report behind a delayed failing audit operation", async () => {
+  const sink = new DelayedFailingAuditSink();
+  const driver = new LocalSessionDriver(undefined, undefined, sink);
+  const session = await driver.startSession({
+    targetFingerprint: fingerprint,
+    mode: "resident",
+  });
+
+  const evidence = driver.requestEvidence(session.id, {
+    collector: "delayed.collector",
+    target: "fixture",
+  });
+  const evidenceFailure = assertAuditFailure(evidence, sink.secretMarker);
+  await sink.blockedAppendStarted;
+
+  const report = driver.exportReport(session.id, "json");
+  const reportFailure = assertAuditFailure(report, sink.secretMarker);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  assert.equal(sink.appendCalls, 2);
+  assert.equal(sink.sealCalls, 0);
+
+  sink.failBlockedAppend();
+  await evidenceFailure;
+  await reportFailure;
+  assert.equal(sink.appendCalls, 2);
+  assert.equal(sink.sealCalls, 0);
+});
+
+test("keeps concurrent mutation behind delayed report sealing", async () => {
+  const sink = new DelayedSealAuditSink();
+  const driver = new LocalSessionDriver(undefined, undefined, sink);
+  const session = await driver.startSession({
+    targetFingerprint: fingerprint,
+    mode: "resident",
+  });
+
+  const report = driver.exportReport(session.id, "json");
+  await sink.sealStarted;
+  const evidence = driver.requestEvidence(session.id, {
+    collector: "concurrent.collector",
+    target: "fixture",
+  });
+  const evidenceFailure = assertAuditFailure(evidence, sink.secretMarker);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  assert.equal(sink.appendCalls, 2);
+  sink.releaseSeal();
+  const artifact = await report;
+  assert.equal(artifact.payloadMediaType, "application/json");
+  await evidenceFailure;
+  await assertAuditFailure(
+    driver.exportReport(session.id, "json"),
+    sink.secretMarker,
+  );
+  assert.equal(sink.appendCalls, 3);
+  assert.equal(sink.sealCalls, 1);
+});
+
 test("audit contracts reject oversized records and ambiguous signed artifacts", () => {
   assert.throws(
     () =>
@@ -337,6 +396,104 @@ class FailingAuditSink implements AuditSink {
 
   records(sessionId: string): readonly AuditRecord[] {
     return this.#delegate.records(sessionId);
+  }
+}
+
+class DelayedFailingAuditSink implements AuditSink {
+  readonly status: AuditSinkStatus;
+  readonly secretMarker = `sink-secret-${randomUUID()}`;
+  readonly blockedAppendStarted: Promise<void>;
+
+  readonly #delegate = new InMemoryAuditSink();
+  readonly #blockedAppend: Promise<void>;
+  #markBlockedAppendStarted = (): void => {};
+  #releaseBlockedAppend = (): void => {};
+  #appendCalls = 0;
+  #sealCalls = 0;
+
+  constructor() {
+    this.status = this.#delegate.status;
+    this.blockedAppendStarted = new Promise<void>((resolve) => {
+      this.#markBlockedAppendStarted = resolve;
+    });
+    this.#blockedAppend = new Promise<void>((resolve) => {
+      this.#releaseBlockedAppend = resolve;
+    });
+  }
+
+  get appendCalls(): number {
+    return this.#appendCalls;
+  }
+
+  get sealCalls(): number {
+    return this.#sealCalls;
+  }
+
+  async append(record: AuditRecord): Promise<void> {
+    this.#appendCalls += 1;
+    if (this.#appendCalls === 2) {
+      this.#markBlockedAppendStarted();
+      await this.#blockedAppend;
+      throw new Error(this.secretMarker);
+    }
+    await this.#delegate.append(record);
+  }
+
+  async sealReport(request: AuditSealRequest): Promise<ArtifactRef> {
+    this.#sealCalls += 1;
+    return this.#delegate.sealReport(request);
+  }
+
+  failBlockedAppend(): void {
+    this.#releaseBlockedAppend();
+  }
+}
+
+class DelayedSealAuditSink implements AuditSink {
+  readonly status: AuditSinkStatus;
+  readonly secretMarker = `sink-secret-${randomUUID()}`;
+  readonly sealStarted: Promise<void>;
+
+  readonly #delegate = new InMemoryAuditSink();
+  readonly #sealRelease: Promise<void>;
+  #markSealStarted = (): void => {};
+  #releaseSeal = (): void => {};
+  #appendCalls = 0;
+  #sealCalls = 0;
+
+  constructor() {
+    this.status = this.#delegate.status;
+    this.sealStarted = new Promise<void>((resolve) => {
+      this.#markSealStarted = resolve;
+    });
+    this.#sealRelease = new Promise<void>((resolve) => {
+      this.#releaseSeal = resolve;
+    });
+  }
+
+  get appendCalls(): number {
+    return this.#appendCalls;
+  }
+
+  get sealCalls(): number {
+    return this.#sealCalls;
+  }
+
+  async append(record: AuditRecord): Promise<void> {
+    this.#appendCalls += 1;
+    if (this.#appendCalls === 3) throw new Error(this.secretMarker);
+    await this.#delegate.append(record);
+  }
+
+  async sealReport(request: AuditSealRequest): Promise<ArtifactRef> {
+    this.#sealCalls += 1;
+    this.#markSealStarted();
+    await this.#sealRelease;
+    return this.#delegate.sealReport(request);
+  }
+
+  releaseSeal(): void {
+    this.#releaseSeal();
   }
 }
 
