@@ -2,5 +2,8 @@
 name="kernaid-storage"
 version.workspace=true
 edition.workspace=true
+[dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+sha2 = "0.10"
 [lints]
 workspace=true
