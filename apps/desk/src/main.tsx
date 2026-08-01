@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { FakeSessionDriver } from "@kernaid/agent-gateway";
+import { LocalSessionDriver } from "@kernaid/agent-gateway";
 import type { ArtifactRef } from "@kernaid/session-driver";
 import type { DiagnosisProposal, Evidence, ValidatedPlan } from "@kernaid/schemas";
 import { collectLocalInventory, isNative, type NativeObservation } from "./native";
@@ -9,7 +9,7 @@ import "./style.css";
 type Workflow = "Observe" | "Diagnose" | "Plan" | "Verify";
 
 function App() {
-  const driver = useMemo(() => new FakeSessionDriver(), []);
+  const driver = useMemo(() => new LocalSessionDriver(), []);
   const [objective, setObjective] = useState("");
   const [workflow, setWorkflow] = useState<Workflow>("Observe");
   const [status, setStatus] = useState("Pronto per una diagnosi sicura.");

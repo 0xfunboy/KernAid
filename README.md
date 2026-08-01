@@ -2,7 +2,7 @@
 
 KernAid is an evidence-first machine diagnosis and repair platform. This repository implements the Phase 0 feasibility spike from `KERNAID_PRODUCT_AND_REPO_MASTERPLAN.md`.
 
-The current vertical slice is deliberately safe: start a session, collect a normalized read-only Linux snapshot, ask a deterministic fake provider for a diagnosis, validate an R0 plan through Core, and export an auditable JSON/Markdown report. No target mutation is implemented.
+The current vertical slice is deliberately safe: start a session, collect a normalized read-only host snapshot, run deterministic offline diagnostic rules, validate an R0 plan through Core, and export a downloadable, hashed JSON report. No target mutation is implemented.
 
 ## Quick start
 
@@ -35,7 +35,7 @@ See [architecture](docs/architecture/phase-0.md), [security policy](SECURITY.md)
 
 ## Current limitations
 
-- Fake deterministic provider only; API and Codex bridges are placeholders.
+- Deterministic offline rules only; API and Codex bridges are placeholders.
 - Native host inventory is read-only and intentionally limited; diagnosis still uses the normalized fixture flow.
 - Encrypted persistence, Secure Boot, physical-machine validation and actual repair actions remain release gates.
 - Desktop artifacts are unsigned engineering previews.

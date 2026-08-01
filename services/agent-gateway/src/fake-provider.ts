@@ -1,7 +1,7 @@
 import type { DiagnosisProposal, Evidence } from "@kernaid/schemas";
 export interface ObservedEvidence { evidence:Evidence; content:string }
 export interface Provider { diagnose(objective:string,evidence:readonly ObservedEvidence[]):Promise<DiagnosisProposal> }
-export class FakeProvider implements Provider {
+export class OfflineRulesProvider implements Provider {
  async diagnose(objective:string,evidence:readonly ObservedEvidence[]):Promise<DiagnosisProposal>{
   if (!objective.trim()) throw new Error("objective is required");
   if (evidence.length===0) throw new Error("evidence is required");
