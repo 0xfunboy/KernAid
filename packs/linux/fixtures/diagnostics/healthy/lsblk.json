@@ -1,0 +1,19 @@
+{
+  "blockdevices": [
+    {
+      "name": "vda",
+      "type": "disk",
+      "ro": false,
+      "mountpoints": [null],
+      "children": [
+        {
+          "name": "vda1",
+          "type": "part",
+          "uuid": "11111111-2222-3333-4444-555555555555",
+          "ro": false,
+          "mountpoints": ["/"]
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+SystemState=running
+
+Id=systemd-journald.service
+LoadState=loaded
+ActiveState=active
+SubState=running

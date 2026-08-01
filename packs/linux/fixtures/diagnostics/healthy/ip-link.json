@@ -1,0 +1,4 @@
+[
+  {"ifindex": 1, "ifname": "lo", "flags": ["LOOPBACK", "UP"], "operstate": "UNKNOWN", "link_type": "loopback"},
+  {"ifindex": 2, "ifname": "eth0", "flags": ["BROADCAST", "UP", "LOWER_UP"], "operstate": "UP", "link_type": "ether"}
+]

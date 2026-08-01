@@ -39,3 +39,40 @@ symlink rejection, stale targets, concurrent locks, backup tampering,
 mode/uid/gid preservation, malformed grammar, and backups placed inside the
 target. Temporary files are created exclusively and removed only when their
 device/inode identity still matches the file created by this transaction.
+
+## P0 read-only diagnostics
+
+`diagnostics` is independent from the fixture repair transaction. It accepts
+only caller-supplied byte slices and cannot execute commands, open host files,
+or mutate state. The `linux-p0.1` corpus requires eight separately identified
+evidence documents:
+
+- `lsblk --json` data with `name`, `type`, `uuid`, `ro`, `mountpoint(s)`, and
+  optional nested `children`;
+- plain `systemctl --failed --no-legend --plain` rows;
+- `systemctl show`-style `key=value` unit/manager state, with blank lines
+  between records;
+- `fstab` contents compared only with UUIDs from the bound `lsblk` evidence;
+- C-locale, byte-valued `df` rows (`Filesystem ... Used Available Use% Mounted
+  on`);
+- `ip -json link` data;
+- `ip -json route` data; and
+- `dpkg --audit` output, where empty output is healthy and non-empty output is
+  treated only as an interrupted/incomplete-state signal.
+
+These strings document the upstream collector contract; this crate does not
+run them. Inputs are byte-, line-, string-, and record-bounded. Evidence IDs
+are validated and must be unique. A malformed or partial source fails the
+whole evaluation instead of producing a misleading healthy report.
+
+Findings contain a schema version, stable rule ID/version, severity, exact
+evidence bindings, a fixed summary, and a fixed next-collector identifier.
+Untrusted descriptions, comments, package text, interface aliases, and unknown
+JSON fields are never copied into a finding. Record order is canonicalized so
+equivalent evidence produces byte-equivalent report data.
+
+`fixtures/diagnostics` contains a fully synthetic, secret-free healthy set and
+incident/adversarial fixtures for duplicate UUIDs, read-only root storage,
+failed/degraded systemd, missing `fstab` UUIDs, exhausted filesystems, down
+links, absent/misdirected routes, interrupted `dpkg`, malformed JSON, control
+characters, and prompt-injection strings.

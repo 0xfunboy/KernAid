@@ -1,0 +1,6 @@
+SystemState=degraded
+
+Id=example.service
+LoadState=loaded
+ActiveState=failed
+SubState=failed

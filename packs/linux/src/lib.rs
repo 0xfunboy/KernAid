@@ -2,6 +2,8 @@
 //! Linux repair-pack primitives. Mutations in this crate are restricted to
 //! explicitly marked disposable fixtures until the production broker exists.
 
+pub mod diagnostics;
+
 use rustix::{
     fd::OwnedFd,
     fs::{

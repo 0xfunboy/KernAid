@@ -1,0 +1,6 @@
+{
+  "blockdevices": [
+    {"name": "vda1", "type": "part", "uuid": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "ro": false, "mountpoints": ["/"]},
+    {"name": "vdb1", "type": "part", "uuid": "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE", "ro": false, "mountpoints": ["/mnt/clone"]}
+  ]
+}
