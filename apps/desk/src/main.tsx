@@ -3,7 +3,7 @@ import { createRoot } from "react-dom/client";
 import { LocalSessionDriver } from "@kernaid/agent-gateway";
 import type { ArtifactRef } from "@kernaid/session-driver";
 import type { DiagnosisProposal, Evidence, ValidatedPlan } from "@kernaid/schemas";
-import { collectLocalInventory, isNative, type NativeObservation } from "./native";
+import { collectLocalInventory, hasLocalCollector, isNative, type NativeObservation } from "./native";
 import "./style.css";
 
 type Workflow = "Observe" | "Diagnose" | "Plan" | "Verify";
@@ -21,7 +21,7 @@ function App() {
   const [nativeEvidence, setNativeEvidence] = useState<NativeObservation[]>([]);
 
   useEffect(() => {
-    if (!isNative()) return;
+    if (!hasLocalCollector()) return;
     collectLocalInventory()
       .then(items => setNativeEvidence(items))
       .catch(error => setStatus(`Inventario locale non disponibile: ${String(error)}`));
@@ -59,8 +59,8 @@ function App() {
   }
 
   return <main>
-    <header><strong>KernAid</strong><span>{isNative() ? "Resident" : "Rescue preview"} · Offline rules · Vault locked</span></header>
-    <aside><p className="label">TARGET MACHINE</p><h2>{isNative() ? "Local machine" : "Linux fixture"}</h2>{["Hardware", "Storage", "Boot", "Network"].map((item, index) => <button key={item}>{item} · {index < nativeEvidence.length || index < evidence.length ? "observed" : "pending"}</button>)}{nativeEvidence.map(item => <details key={item.collector}><summary>{item.collector}</summary><pre>{item.output || "Nessun output"}</pre></details>)}</aside>
+    <header><strong>KernAid</strong><span>{isNative() ? "Resident" : "Rescue"} · Offline rules · Vault locked</span></header>
+    <aside><p className="label">TARGET MACHINE</p><h2>{hasLocalCollector() ? "Local machine" : "Linux fixture"}</h2>{["Hardware", "Storage", "Boot", "Network"].map((item, index) => <button key={item}>{item} · {index < nativeEvidence.length || index < evidence.length ? "observed" : "pending"}</button>)}{nativeEvidence.map(item => <details key={item.collector}><summary>{item.collector}</summary><pre>{item.output || "Nessun output"}</pre></details>)}</aside>
     <section><div className="steps">{(["Observe", "Diagnose", "Plan", "Repair", "Verify"] as const).map(step => <span className={step === workflow ? "active" : ""} key={step}>{step}</span>)}</div>
       <article><small>{evidence.length ? `${evidence[0].id} · observed-untrusted` : "SESSION NOT STARTED"}</small><h1>{proposal?.diagnosis ?? "Evidence before action."}</h1><p>{status}</p>{proposal && <p>Confidenza: {Math.round(proposal.confidence * 100)}% · Evidenze: {proposal.evidenceIds.join(", ")}</p>}</article>
       <textarea aria-label="Problem description" value={objective} onChange={event => setObjective(event.target.value)} placeholder="Descrivi il problema del computer…" />
