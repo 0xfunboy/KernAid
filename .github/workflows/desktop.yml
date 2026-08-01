@@ -1,0 +1,55 @@
+name: desktop
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ["apps/desk/**", "crates/**", "packages/**", "services/**", "Cargo.lock", "pnpm-lock.yaml", ".github/workflows/desktop.yml"]
+permissions: {contents: read}
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ubuntu-24.04
+            name: linux-x86_64
+            args: ""
+            targets: ""
+          - platform: windows-latest
+            name: windows-x86_64
+            args: ""
+            targets: ""
+          - platform: macos-latest
+            name: macos-aarch64
+            args: --target aarch64-apple-darwin
+            targets: aarch64-apple-darwin
+          - platform: macos-latest
+            name: macos-x86_64
+            args: --target x86_64-apple-darwin
+            targets: x86_64-apple-darwin
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: {version: 9.15.9}
+      - uses: actions/setup-node@v4
+        with: {node-version: 24.18.0, cache: pnpm}
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          targets: ${{ matrix.targets }}
+      - name: Install Linux prerequisites
+        if: matrix.platform == 'ubuntu-24.04'
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+      - run: pnpm install --frozen-lockfile
+      - name: Generate platform icons
+        run: pnpm --filter @kernaid/desk tauri icon icon.svg
+      - uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_SIGNING_IDENTITY: ${{ startsWith(matrix.name, 'macos-') && '-' || '' }}
+        with:
+          projectPath: apps/desk
+          args: ${{ matrix.args }}
+          uploadWorkflowArtifacts: true
+          workflowArtifactNamePattern: kernaid-desk-[platform]-[arch]-[bundle]

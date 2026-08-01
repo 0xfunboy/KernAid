@@ -17,6 +17,8 @@ just run-desk
 
 `just test-observe` copies a disposable fixture, runs the collector, then byte-compares the fixture tree. It never accepts a physical block-device path.
 
+CI produces engineering-preview desktop bundles for Windows, Linux, Intel macOS and Apple-silicon macOS, plus a separate amd64 Rescue ISO. Download them from the successful GitHub Actions run artifacts. Production distribution still requires Windows code signing and Apple signing/notarization.
+
 ## Trust boundaries
 
 The React UI talks only to a `SessionDriver`. Providers return diagnosis proposals and cannot reach the broker. Core validates plans and policy. The broker accepts an allowlisted typed envelope; in Phase 0 its only action is `system.observe.noop`.
