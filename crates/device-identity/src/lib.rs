@@ -3,7 +3,7 @@
 //! is intended to live only inside the OS keychain or the Rescue LUKS2 vault.
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -54,7 +54,10 @@ pub struct SignedReportEnvelope {
 pub enum IdentityError {
     InvalidSeedLength,
     InvalidPublicKey,
+    InvalidDeviceId,
+    MissingTrustAnchor,
     UnexpectedPublicKey,
+    UnexpectedDeviceId,
     InvalidSignature,
     InvalidEnvelopeField(&'static str),
     InvalidBase64Url(&'static str),
@@ -113,6 +116,9 @@ impl DeviceIdentity {
     ) -> Result<SignedReportEnvelope, IdentityError> {
         validate_payload(payload)?;
         validate_media_type(payload_media_type)?;
+        if journal_sequence == 0 {
+            return Err(IdentityError::InvalidEnvelopeField("journalSequence"));
+        }
 
         let public_key = self.public_key();
         let device_id = self.device_id();
@@ -164,7 +170,7 @@ impl SignedReport {
             .map_err(|_| IdentityError::InvalidPublicKey)?;
         let signature = Signature::from_bytes(&self.signature);
         public_key
-            .verify(&report_signature_message(&self.payload), &signature)
+            .verify_strict(&report_signature_message(&self.payload), &signature)
             .map_err(|_| IdentityError::InvalidSignature)
     }
 }
@@ -185,6 +191,9 @@ impl SignedReportEnvelope {
             &self.algorithm,
             SIGNED_REPORT_ENVELOPE_ALGORITHM,
         )?;
+        if self.journal_sequence == 0 {
+            return Err(IdentityError::InvalidEnvelopeField("journalSequence"));
+        }
         validate_media_type(&self.payload_media_type)?;
 
         let embedded_public_key =
@@ -223,13 +232,79 @@ impl SignedReportEnvelope {
             public_key: &embedded_public_key,
         };
         public_key
-            .verify(
+            .verify_strict(
                 &envelope_signature_message(&content),
                 &Signature::from_bytes(&signature),
             )
             .map_err(|_| IdentityError::InvalidSignature)?;
         Ok(payload)
     }
+
+    /// Verify using one or both explicit trust anchors.
+    ///
+    /// When only a device ID is supplied, the embedded public key is accepted
+    /// only after its derived device ID matches the caller-pinned value. The
+    /// embedded key is therefore never sufficient on its own. When both
+    /// anchors are supplied, they must identify the same key.
+    pub fn verify_with_trust_anchors(
+        &self,
+        expected_device_id: Option<&str>,
+        expected_public_key: Option<&[u8; PUBLIC_KEY_BYTES]>,
+    ) -> Result<Vec<u8>, IdentityError> {
+        if expected_device_id.is_none() && expected_public_key.is_none() {
+            return Err(IdentityError::MissingTrustAnchor);
+        }
+        if let Some(device_id) = expected_device_id {
+            validate_device_id(device_id)?;
+        }
+
+        match expected_public_key {
+            Some(public_key) => {
+                if expected_device_id
+                    .is_some_and(|device_id| device_id_for_public_key(public_key) != device_id)
+                {
+                    return Err(IdentityError::UnexpectedDeviceId);
+                }
+                self.verify(public_key)
+            }
+            None => self
+                .verify_for_device_id(expected_device_id.ok_or(IdentityError::MissingTrustAnchor)?),
+        }
+    }
+
+    /// Verify against a caller-pinned KernAid device ID.
+    ///
+    /// This authenticates the embedded public key by its 96-bit device
+    /// fingerprint before using that key for signature verification.
+    pub fn verify_for_device_id(&self, expected_device_id: &str) -> Result<Vec<u8>, IdentityError> {
+        validate_device_id(expected_device_id)?;
+        let embedded_public_key =
+            decode_fixed_base64url::<PUBLIC_KEY_BYTES>(&self.public_key, "publicKey")?;
+        if device_id_for_public_key(&embedded_public_key) != expected_device_id {
+            return Err(IdentityError::UnexpectedDeviceId);
+        }
+        self.verify(&embedded_public_key)
+    }
+}
+
+/// Decode a canonical unpadded base64url Ed25519 public key.
+pub fn decode_public_key_base64url(encoded: &str) -> Result<[u8; 32], IdentityError> {
+    decode_fixed_base64url::<PUBLIC_KEY_BYTES>(encoded, "publicKey")
+}
+
+/// Validate the canonical `KA-` device fingerprint form.
+pub fn validate_device_id(device_id: &str) -> Result<(), IdentityError> {
+    let Some(hex) = device_id.strip_prefix("KA-") else {
+        return Err(IdentityError::InvalidDeviceId);
+    };
+    if hex.len() != 24
+        || !hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(IdentityError::InvalidDeviceId);
+    }
+    Ok(())
 }
 
 struct EnvelopeContent<'a> {
@@ -375,7 +450,7 @@ fn encode_base64url(value: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(value)
 }
 
-fn device_id_for_public_key(public_key: &[u8; PUBLIC_KEY_BYTES]) -> String {
+pub fn device_id_for_public_key(public_key: &[u8; PUBLIC_KEY_BYTES]) -> String {
     let digest = Sha256::digest(public_key);
     let short = digest[..12]
         .iter()
@@ -485,12 +560,16 @@ mod tests {
         let public_key = VerifyingKey::from_bytes(&identity.public_key()).expect("public key");
         let signature = Signature::from_bytes(&report.signature);
 
-        assert!(public_key.verify(&report.payload, &signature).is_err());
+        assert!(
+            public_key
+                .verify_strict(&report.payload, &signature)
+                .is_err()
+        );
 
         let other_domain_message = signature_message(b"KERNAID-OTHER-OBJECT-V1\0", &report.payload);
         assert!(
             public_key
-                .verify(&other_domain_message, &signature)
+                .verify_strict(&other_domain_message, &signature)
                 .is_err()
         );
 
@@ -562,6 +641,97 @@ mod tests {
         assert_eq!(
             attacker_envelope.verify(&trusted.public_key()),
             Err(IdentityError::UnexpectedPublicKey)
+        );
+    }
+
+    #[test]
+    fn device_id_is_a_valid_explicit_trust_anchor() {
+        let identity = DeviceIdentity::generate();
+        let envelope = signed_envelope(&identity);
+
+        assert_eq!(
+            envelope
+                .verify_for_device_id(&identity.device_id())
+                .expect("verify using pinned device ID"),
+            br#"{"schemaVersion":"1.0","verification":"passed"}"#
+        );
+    }
+
+    #[test]
+    fn device_id_anchor_rejects_key_substitution() {
+        let trusted = DeviceIdentity::generate();
+        let attacker = DeviceIdentity::generate();
+        let envelope = signed_envelope(&attacker);
+
+        assert_eq!(
+            envelope.verify_for_device_id(&trusted.device_id()),
+            Err(IdentityError::UnexpectedDeviceId)
+        );
+    }
+
+    #[test]
+    fn verification_requires_and_reconciles_trust_anchors() {
+        let identity = DeviceIdentity::generate();
+        let other = DeviceIdentity::generate();
+        let envelope = signed_envelope(&identity);
+
+        assert_eq!(
+            envelope.verify_with_trust_anchors(None, None),
+            Err(IdentityError::MissingTrustAnchor)
+        );
+        assert_eq!(
+            envelope
+                .verify_with_trust_anchors(Some(&other.device_id()), Some(&identity.public_key()),),
+            Err(IdentityError::UnexpectedDeviceId)
+        );
+    }
+
+    #[test]
+    fn device_id_and_public_key_parsers_require_canonical_values() {
+        let identity = DeviceIdentity::generate();
+        let envelope = signed_envelope(&identity);
+
+        assert_eq!(
+            decode_public_key_base64url(&envelope.public_key).expect("decode public key"),
+            identity.public_key()
+        );
+        assert_eq!(
+            decode_public_key_base64url(&format!("{}=", envelope.public_key)),
+            Err(IdentityError::InvalidBase64Url("publicKey"))
+        );
+        for invalid in [
+            "",
+            "KA-1234",
+            "ka-0123456789abcdef01234567",
+            "KA-0123456789ABCDEF01234567",
+            "KA-0123456789abcdef0123456g",
+        ] {
+            assert_eq!(
+                validate_device_id(invalid),
+                Err(IdentityError::InvalidDeviceId),
+                "accepted invalid device ID: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn report_envelopes_require_a_real_journal_entry() {
+        let identity = DeviceIdentity::generate();
+        assert_eq!(
+            identity.sign_report_envelope(
+                br#"{"schemaVersion":"1.0"}"#,
+                "application/json",
+                0,
+                &[0x42; HASH_BYTES],
+            ),
+            Err(IdentityError::InvalidEnvelopeField("journalSequence"))
+        );
+
+        let mut envelope = signed_envelope(&identity);
+        envelope.journal_sequence = 0;
+        assert_eq!(
+            envelope.verify(&identity.public_key()),
+            Err(IdentityError::InvalidEnvelopeField("journalSequence"))
         );
     }
 
