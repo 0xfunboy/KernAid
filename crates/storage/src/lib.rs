@@ -27,7 +27,11 @@ use zeroize::Zeroizing;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-const SCHEMA_VERSION: i64 = 2;
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
+
+const LEGACY_SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const JOURNAL_ID_BYTES: usize = 16;
 const NONCE_BYTES: usize = 24;
 const HASH_BYTES: usize = 32;
@@ -35,7 +39,14 @@ const AEAD_TAG_BYTES: usize = 16;
 const ZERO_HASH: [u8; HASH_BYTES] = [0; HASH_BYTES];
 const AAD_DOMAIN: &[u8] = b"KERNAID-SECURE-JOURNAL-AAD-V2\0";
 const HASH_DOMAIN: &[u8] = b"KERNAID-SECURE-JOURNAL-ENTRY-V2\0";
+const INITIALIZATION_AAD_DOMAIN: &[u8] = b"KERNAID-SECURE-JOURNAL-INIT-AAD-V3\0";
+const INITIALIZATION_PLAINTEXT: &[u8] = b"KERNAID-SECURE-JOURNAL-KEY-CHECK-V3\0";
+const INITIALIZATION_PENDING: i64 = 0;
+const INITIALIZATION_READY: i64 = 1;
 const ANCHOR_MAGIC: &[u8; 8] = b"KNAUDV2\0";
+
+#[cfg(windows)]
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 
 /// Size of the XChaCha20-Poly1305 key held by a [`JournalSecretStore`].
 pub const JOURNAL_KEY_BYTES: usize = 32;
@@ -210,6 +221,10 @@ pub enum JournalError {
     SequenceOverflow,
     EncryptionFailed,
     ReadLimitExceeded,
+    UnexpectedHead {
+        expected: JournalAnchor,
+        actual: JournalAnchor,
+    },
     Poisoned,
 }
 
@@ -237,6 +252,9 @@ impl fmt::Display for JournalError {
             Self::EncryptionFailed => formatter.write_str("journal event encryption failed"),
             Self::ReadLimitExceeded => {
                 formatter.write_str("decrypted journal read exceeds the memory limit")
+            }
+            Self::UnexpectedHead { .. } => {
+                formatter.write_str("journal head changed before the append")
             }
             Self::Poisoned => {
                 formatter.write_str("journal must be reopened after a partial append")
@@ -267,29 +285,45 @@ impl From<SecretStoreError> for JournalError {
 }
 
 /// Encrypted journal coupled to a mandatory native secure store.
+///
+/// One product-level interprocess lock must cover this value's complete
+/// lifetime. SQLite and a separate native secret store cannot jointly provide
+/// an atomic cross-process commit for the post-database anchor update.
 pub struct SecureJournal<S: JournalSecretStore> {
     connection: Connection,
     secret_store: S,
     cipher: XChaCha20Poly1305,
     journal_id: [u8; JOURNAL_ID_BYTES],
     path: PathBuf,
+    trusted_head: JournalAnchor,
+    verified_ciphertext_bytes: u64,
     healthy: bool,
 }
 
 impl<S: JournalSecretStore> SecureJournal<S> {
     /// Open an existing verified journal or initialize a new one.
     ///
-    /// An existing database without both secure items always fails closed.
+    /// A version-3 database left in its explicit pending state can recover the
+    /// narrowly defined crash windows between the durable database creation,
+    /// key write, anchor write and final ready marker. A ready database and all
+    /// legacy databases still require both secure items and fail closed if
+    /// either is absent.
+    ///
+    /// The caller must hold its product-level interprocess instance lock for
+    /// the complete call. SQLite serializes each database phase, but it cannot
+    /// atomically serialize two separate native-credential writes with the
+    /// database initialization transaction.
     pub fn open(path: &Path, mut secret_store: S) -> Result<Self, JournalError> {
-        let existed = inspect_database_path(path)?;
-
-        if !existed {
-            let key_exists = secret_store.load_key()?.is_some();
-            let anchor_exists = secret_store.load_anchor()?.is_some();
-            if key_exists || anchor_exists {
+        let path_state = inspect_database_path(path)?;
+        if path_state != DatabasePathState::Existing {
+            let key = secret_store.load_key()?;
+            let anchor = secret_store.load_anchor()?;
+            if key.is_some() || anchor.is_some() {
                 return Err(JournalError::SecretStateConflict);
             }
-            create_database_file(path)?;
+            if path_state == DatabasePathState::Missing {
+                create_database_file(path)?;
+            }
         }
 
         let connection = Connection::open_with_flags(
@@ -301,12 +335,33 @@ impl<S: JournalSecretStore> SecureJournal<S> {
         configure_connection(&connection)?;
         harden_database_files(path)?;
 
-        if existed {
-            validate_schema(&connection)?;
-            let journal_id = load_journal_id(&connection)?;
-            let key = secret_store.load_key()?.ok_or(JournalError::MissingKey)?;
+        if path_state != DatabasePathState::Existing || database_is_pristine(&connection)? {
+            let key = secret_store.load_key()?;
+            let anchor = secret_store.load_anchor()?;
+            if key.is_some() || anchor.is_some() {
+                return Err(JournalError::SecretStateConflict);
+            }
+            return initialize_new_journal(connection, secret_store, path);
+        }
+
+        let schema = validate_schema(&connection)?;
+        let journal_id = load_journal_id(&connection)?;
+
+        if schema == SchemaKind::Recoverable {
+            let initialization = load_initialization_record(&connection)?;
+            if initialization.state == INITIALIZATION_PENDING {
+                return recover_pending_initialization(connection, secret_store, path, journal_id);
+            }
+            if initialization.state != INITIALIZATION_READY {
+                return Err(JournalError::UnsupportedFormat);
+            }
+
+            let key = secret_store.load_key()?;
+            let anchor = secret_store.load_anchor()?;
+            let key = key.ok_or(JournalError::MissingKey)?;
+            verify_initialization_key(&key, &journal_id, &initialization)?;
             let cipher = cipher_from_key(&key)?;
-            if secret_store.load_anchor()?.is_none() {
+            if anchor.is_none() {
                 return Err(JournalError::MissingAnchor);
             }
             let mut journal = Self {
@@ -315,61 +370,82 @@ impl<S: JournalSecretStore> SecureJournal<S> {
                 cipher,
                 journal_id,
                 path: path.to_path_buf(),
+                trusted_head: initial_anchor(journal_id),
+                verified_ciphertext_bytes: 0,
                 healthy: true,
             };
             journal.verify()?;
-            Ok(journal)
-        } else {
-            let mut journal_id = [0_u8; JOURNAL_ID_BYTES];
-            OsRng.fill_bytes(&mut journal_id);
-            initialize_schema(&connection, &journal_id)?;
-            harden_database_files(path)?;
-
-            let key = JournalKey::generate();
-            let cipher = cipher_from_key(&key)?;
-            let anchor = JournalAnchor {
-                journal_id,
-                sequence: 0,
-                entry_hash: ZERO_HASH,
-            };
-            secret_store.store_key(&key)?;
-            secret_store.store_anchor(&anchor)?;
-
-            Ok(Self {
-                connection,
-                secret_store,
-                cipher,
-                journal_id,
-                path: path.to_path_buf(),
-                healthy: true,
-            })
+            return Ok(journal);
         }
+
+        let key = secret_store.load_key()?;
+        let anchor = secret_store.load_anchor()?;
+        let key = key.ok_or(JournalError::MissingKey)?;
+        let cipher = cipher_from_key(&key)?;
+        if anchor.is_none() {
+            return Err(JournalError::MissingAnchor);
+        }
+        let mut journal = Self {
+            connection,
+            secret_store,
+            cipher,
+            journal_id,
+            path: path.to_path_buf(),
+            trusted_head: initial_anchor(journal_id),
+            verified_ciphertext_bytes: 0,
+            healthy: true,
+        };
+        journal.verify()?;
+        Ok(journal)
     }
 
     /// Append one event and advance the secure anchor after the SQLite commit.
     pub fn append(&mut self, event: &[u8]) -> Result<JournalEntry, JournalError> {
+        let expected = self.head()?;
+        self.append_expected(expected, event)
+    }
+
+    /// Append only if the fully verified journal head still equals `expected`.
+    ///
+    /// The comparison and append happen under one SQLite immediate transaction,
+    /// so callers can safely bind an approval or report to an exact prior head.
+    /// A mismatch returns [`JournalError::UnexpectedHead`] without writing a
+    /// record or advancing the secure anchor.
+    pub fn append_expected(
+        &mut self,
+        expected: JournalAnchor,
+        event: &[u8],
+    ) -> Result<JournalEntry, JournalError> {
         if !self.healthy {
             return Err(JournalError::Poisoned);
         }
         if event.len() > MAX_EVENT_BYTES {
             return Err(JournalError::EventTooLarge);
         }
+        self.ensure_hardened()?;
+        if expected != self.trusted_head {
+            return Err(JournalError::UnexpectedHead {
+                expected,
+                actual: self.trusted_head,
+            });
+        }
 
-        let anchor = load_required_anchor(&mut self.secret_store)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let scan = scan_chain(
-            &transaction,
-            &self.cipher,
-            &self.journal_id,
-            anchor.sequence,
-            false,
-        )?;
-        validate_anchor(&anchor, &scan, &self.journal_id)?;
+        let anchor = load_required_anchor(&mut self.secret_store)?;
+        if anchor.journal_id != self.journal_id {
+            return Err(JournalError::RollbackDetected);
+        }
+        if anchor != expected {
+            return Err(JournalError::UnexpectedHead {
+                expected,
+                actual: anchor,
+            });
+        }
+        validate_expected_head(&transaction, &self.cipher, &self.journal_id, expected)?;
 
-        let sequence = scan
-            .head
+        let sequence = expected
             .sequence
             .checked_add(1)
             .ok_or(JournalError::SequenceOverflow)?;
@@ -379,7 +455,7 @@ impl<S: JournalSecretStore> SecureJournal<S> {
 
         let mut nonce = [0_u8; NONCE_BYTES];
         OsRng.fill_bytes(&mut nonce);
-        let aad = associated_data(&self.journal_id, sequence, &scan.head.entry_hash);
+        let aad = associated_data(&self.journal_id, sequence, &expected.entry_hash);
         let nonce_ref: &XNonce = nonce
             .as_slice()
             .try_into()
@@ -394,10 +470,17 @@ impl<S: JournalSecretStore> SecureJournal<S> {
                 },
             )
             .map_err(|_| JournalError::EncryptionFailed)?;
+        let new_ciphertext_bytes = self
+            .verified_ciphertext_bytes
+            .checked_add(ciphertext.len() as u64)
+            .ok_or(JournalError::JournalTooLarge)?;
+        if new_ciphertext_bytes > MAX_JOURNAL_CIPHERTEXT_BYTES {
+            return Err(JournalError::JournalTooLarge);
+        }
         let entry_hash = hash_entry(
             &self.journal_id,
             sequence,
-            &scan.head.entry_hash,
+            &expected.entry_hash,
             &nonce,
             &ciphertext,
         );
@@ -410,11 +493,14 @@ impl<S: JournalSecretStore> SecureJournal<S> {
                 sequence,
                 nonce.as_slice(),
                 ciphertext,
-                scan.head.entry_hash.as_slice(),
+                expected.entry_hash.as_slice(),
                 entry_hash.as_slice()
             ],
         )?;
-        transaction.commit()?;
+        if let Err(error) = transaction.commit() {
+            self.healthy = false;
+            return Err(error.into());
+        }
 
         if let Err(error) = harden_database_files(&self.path) {
             self.healthy = false;
@@ -429,11 +515,13 @@ impl<S: JournalSecretStore> SecureJournal<S> {
             self.healthy = false;
             return Err(error.into());
         }
+        self.trusted_head = new_anchor;
+        self.verified_ciphertext_bytes = new_ciphertext_bytes;
 
         Ok(JournalEntry {
             sequence,
             event: event.to_vec(),
-            previous_hash: scan.head.entry_hash,
+            previous_hash: expected.entry_hash,
             entry_hash,
         })
     }
@@ -456,16 +544,17 @@ impl<S: JournalSecretStore> SecureJournal<S> {
         if !self.healthy {
             return Err(JournalError::Poisoned);
         }
-        let anchor = load_required_anchor(&mut self.secret_store)?;
+        self.ensure_hardened()?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let anchor = load_required_anchor(&mut self.secret_store)?;
         let scan = scan_chain(
             &transaction,
             &self.cipher,
             &self.journal_id,
             anchor.sequence,
-            false,
+            ScanMode::None,
         )?;
         let anchor_lags = validate_anchor(&anchor, &scan, &self.journal_id)?;
         if anchor_lags {
@@ -480,11 +569,57 @@ impl<S: JournalSecretStore> SecureJournal<S> {
             }
         }
         transaction.commit()?;
-        Ok(JournalAnchor {
+        let verified_head = JournalAnchor {
             journal_id: self.journal_id,
             sequence: scan.head.sequence,
             entry_hash: scan.head.entry_hash,
-        })
+        };
+        self.trusted_head = verified_head;
+        self.verified_ciphertext_bytes = scan.ciphertext_bytes;
+        Ok(verified_head)
+    }
+
+    /// Return only the first authenticated entry after verifying the complete
+    /// chain and secure anchor under one SQLite immediate transaction.
+    ///
+    /// Later plaintext records are decrypted for authentication and then
+    /// discarded immediately; they are never accumulated in memory.
+    pub fn first_entry(&mut self) -> Result<Option<JournalEntry>, JournalError> {
+        if !self.healthy {
+            return Err(JournalError::Poisoned);
+        }
+        self.ensure_hardened()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let anchor = load_required_anchor(&mut self.secret_store)?;
+        let mut scan = scan_chain(
+            &transaction,
+            &self.cipher,
+            &self.journal_id,
+            anchor.sequence,
+            ScanMode::First,
+        )?;
+        let anchor_lags = validate_anchor(&anchor, &scan, &self.journal_id)?;
+        if anchor_lags {
+            let recovered = JournalAnchor {
+                journal_id: self.journal_id,
+                sequence: scan.head.sequence,
+                entry_hash: scan.head.entry_hash,
+            };
+            if let Err(error) = self.secret_store.store_anchor(&recovered) {
+                self.healthy = false;
+                return Err(error.into());
+            }
+        }
+        transaction.commit()?;
+        self.trusted_head = JournalAnchor {
+            journal_id: self.journal_id,
+            sequence: scan.head.sequence,
+            entry_hash: scan.head.entry_hash,
+        };
+        self.verified_ciphertext_bytes = scan.ciphertext_bytes;
+        Ok(scan.entries.pop())
     }
 
     /// Return a bounded plaintext snapshot after verification under one SQLite
@@ -494,36 +629,24 @@ impl<S: JournalSecretStore> SecureJournal<S> {
         if !self.healthy {
             return Err(JournalError::Poisoned);
         }
-        let anchor = load_required_anchor(&mut self.secret_store)?;
+        self.ensure_hardened()?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let verified = scan_chain(
+        let anchor = load_required_anchor(&mut self.secret_store)?;
+        let scan = scan_chain(
             &transaction,
             &self.cipher,
             &self.journal_id,
             anchor.sequence,
-            false,
+            ScanMode::AllBounded,
         )?;
-        let anchor_lags = validate_anchor(&anchor, &verified, &self.journal_id)?;
-        if verified.head.sequence > MAX_RETURNED_ENTRIES
-            || verified.plaintext_bytes > MAX_RETURNED_PLAINTEXT_BYTES
-        {
-            return Err(JournalError::ReadLimitExceeded);
-        }
-
-        let materialized = scan_chain(
-            &transaction,
-            &self.cipher,
-            &self.journal_id,
-            anchor.sequence,
-            true,
-        )?;
+        let anchor_lags = validate_anchor(&anchor, &scan, &self.journal_id)?;
         if anchor_lags {
             let recovered = JournalAnchor {
                 journal_id: self.journal_id,
-                sequence: verified.head.sequence,
-                entry_hash: verified.head.entry_hash,
+                sequence: scan.head.sequence,
+                entry_hash: scan.head.entry_hash,
             };
             if let Err(error) = self.secret_store.store_anchor(&recovered) {
                 self.healthy = false;
@@ -531,8 +654,300 @@ impl<S: JournalSecretStore> SecureJournal<S> {
             }
         }
         transaction.commit()?;
-        Ok(materialized.entries)
+        self.trusted_head = JournalAnchor {
+            journal_id: self.journal_id,
+            sequence: scan.head.sequence,
+            entry_hash: scan.head.entry_hash,
+        };
+        self.verified_ciphertext_bytes = scan.ciphertext_bytes;
+        Ok(scan.entries)
     }
+
+    fn ensure_hardened(&mut self) -> Result<(), JournalError> {
+        if let Err(error) = harden_database_files(&self.path) {
+            self.healthy = false;
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SchemaKind {
+    Legacy,
+    Recoverable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DatabasePathState {
+    Missing,
+    Empty,
+    Existing,
+}
+
+struct InitializationRecord {
+    state: i64,
+    nonce: [u8; NONCE_BYTES],
+    ciphertext: Vec<u8>,
+}
+
+fn initialize_new_journal<S: JournalSecretStore>(
+    mut connection: Connection,
+    mut secret_store: S,
+    path: &Path,
+) -> Result<SecureJournal<S>, JournalError> {
+    if !database_is_pristine(&connection)? {
+        return Err(JournalError::UnsupportedFormat);
+    }
+
+    let mut journal_id = [0_u8; JOURNAL_ID_BYTES];
+    OsRng.fill_bytes(&mut journal_id);
+    let key = JournalKey::generate();
+    let cipher = cipher_from_key(&key)?;
+    let initialization = create_initialization_record(&key, &journal_id)?;
+    initialize_schema(&connection, &journal_id, &initialization)?;
+    harden_database_files(path)?;
+    maybe_crash_initialization_test("database");
+
+    secret_store.store_key(&key)?;
+    maybe_crash_initialization_test("key");
+    secret_store.store_anchor(&initial_anchor(journal_id))?;
+    maybe_crash_initialization_test("anchor");
+    finalize_pending_initialization(&mut connection, &journal_id)?;
+    harden_database_files(path)?;
+    maybe_crash_initialization_test("ready");
+
+    Ok(SecureJournal {
+        connection,
+        secret_store,
+        cipher,
+        journal_id,
+        path: path.to_path_buf(),
+        trusted_head: initial_anchor(journal_id),
+        verified_ciphertext_bytes: 0,
+        healthy: true,
+    })
+}
+
+#[cfg(test)]
+fn maybe_crash_initialization_test(boundary: &str) {
+    if std::env::var("KERNAID_STORAGE_TEST_CRASH_BOUNDARY").as_deref() == Ok(boundary) {
+        std::process::exit(86);
+    }
+}
+
+#[cfg(not(test))]
+fn maybe_crash_initialization_test(_boundary: &str) {}
+
+fn recover_pending_initialization<S: JournalSecretStore>(
+    mut connection: Connection,
+    mut secret_store: S,
+    path: &Path,
+    journal_id: [u8; JOURNAL_ID_BYTES],
+) -> Result<SecureJournal<S>, JournalError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if validate_schema(&transaction)? != SchemaKind::Recoverable
+        || load_journal_id(&transaction)? != journal_id
+    {
+        return Err(JournalError::UnsupportedFormat);
+    }
+    let initialization = load_initialization_record(&transaction)?;
+    if initialization.state == INITIALIZATION_PENDING {
+        if journal_has_entries(&transaction)? {
+            return Err(JournalError::SecretStateConflict);
+        }
+        let key = secret_store.load_key()?;
+        let anchor = secret_store.load_anchor()?;
+        match (key, anchor) {
+            (None, None) => {
+                let key = JournalKey::generate();
+                let replacement = create_initialization_record(&key, &journal_id)?;
+                let changed = transaction.execute(
+                    "UPDATE secure_journal_initialization
+                     SET nonce = ?1, ciphertext = ?2
+                     WHERE singleton = 1 AND state = 0
+                       AND NOT EXISTS(SELECT 1 FROM secure_journal_entries)",
+                    params![replacement.nonce.as_slice(), replacement.ciphertext],
+                )?;
+                if changed != 1 {
+                    return Err(JournalError::SecretStateConflict);
+                }
+                transaction.commit()?;
+                secret_store.store_key(&key)?;
+                secret_store.store_anchor(&initial_anchor(journal_id))?;
+            }
+            (Some(key), None) => {
+                verify_initialization_key(&key, &journal_id, &initialization)?;
+                transaction.commit()?;
+                secret_store.store_anchor(&initial_anchor(journal_id))?;
+            }
+            (Some(key), Some(anchor)) => {
+                verify_initialization_key(&key, &journal_id, &initialization)?;
+                if anchor != initial_anchor(journal_id) {
+                    return Err(JournalError::RollbackDetected);
+                }
+                transaction.commit()?;
+            }
+            (None, Some(_)) => return Err(JournalError::SecretStateConflict),
+        }
+    } else if initialization.state == INITIALIZATION_READY {
+        transaction.commit()?;
+    } else {
+        return Err(JournalError::UnsupportedFormat);
+    }
+
+    finalize_pending_initialization(&mut connection, &journal_id)?;
+    let initialization = load_initialization_record(&connection)?;
+    let key = secret_store.load_key()?.ok_or(JournalError::MissingKey)?;
+    verify_initialization_key(&key, &journal_id, &initialization)?;
+    if secret_store.load_anchor()?.is_none() {
+        return Err(JournalError::MissingAnchor);
+    }
+    let cipher = cipher_from_key(&key)?;
+    harden_database_files(path)?;
+    let mut journal = SecureJournal {
+        connection,
+        secret_store,
+        cipher,
+        journal_id,
+        path: path.to_path_buf(),
+        trusted_head: initial_anchor(journal_id),
+        verified_ciphertext_bytes: 0,
+        healthy: true,
+    };
+    journal.verify()?;
+    Ok(journal)
+}
+
+fn finalize_pending_initialization(
+    connection: &mut Connection,
+    journal_id: &[u8; JOURNAL_ID_BYTES],
+) -> Result<(), JournalError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if validate_schema(&transaction)? != SchemaKind::Recoverable
+        || load_journal_id(&transaction)? != *journal_id
+        || journal_has_entries(&transaction)?
+    {
+        return Err(JournalError::SecretStateConflict);
+    }
+    let initialization = load_initialization_record(&transaction)?;
+    if initialization.state == INITIALIZATION_READY {
+        transaction.commit()?;
+        return Ok(());
+    }
+    if initialization.state != INITIALIZATION_PENDING {
+        return Err(JournalError::UnsupportedFormat);
+    }
+    let changed = transaction.execute(
+        "UPDATE secure_journal_initialization
+         SET state = 1
+         WHERE singleton = 1 AND state = 0
+           AND NOT EXISTS(SELECT 1 FROM secure_journal_entries)",
+        [],
+    )?;
+    if changed != 1 {
+        return Err(JournalError::SecretStateConflict);
+    }
+    transaction.execute_batch(
+        "CREATE TRIGGER secure_journal_initialization_no_update
+           BEFORE UPDATE ON secure_journal_initialization
+           BEGIN SELECT RAISE(ABORT, 'immutable secure journal initialization'); END;",
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn initial_anchor(journal_id: [u8; JOURNAL_ID_BYTES]) -> JournalAnchor {
+    JournalAnchor {
+        journal_id,
+        sequence: 0,
+        entry_hash: ZERO_HASH,
+    }
+}
+
+fn database_is_pristine(connection: &Connection) -> Result<bool, JournalError> {
+    let object_count: i64 = connection.query_row(
+        "SELECT count(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
+        [],
+        |row| row.get(0),
+    )?;
+    let user_version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    Ok(object_count == 0 && user_version == 0)
+}
+
+fn journal_has_entries(connection: &Connection) -> Result<bool, JournalError> {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM secure_journal_entries LIMIT 1)",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|exists| exists != 0)
+        .map_err(Into::into)
+}
+
+fn initialization_associated_data(journal_id: &[u8; JOURNAL_ID_BYTES]) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(INITIALIZATION_AAD_DOMAIN.len() + JOURNAL_ID_BYTES);
+    aad.extend_from_slice(INITIALIZATION_AAD_DOMAIN);
+    aad.extend_from_slice(journal_id);
+    aad
+}
+
+fn create_initialization_record(
+    key: &JournalKey,
+    journal_id: &[u8; JOURNAL_ID_BYTES],
+) -> Result<InitializationRecord, JournalError> {
+    let cipher = cipher_from_key(key)?;
+    let mut nonce = [0_u8; NONCE_BYTES];
+    OsRng.fill_bytes(&mut nonce);
+    let nonce_ref: &XNonce = nonce
+        .as_slice()
+        .try_into()
+        .map_err(|_| JournalError::EncryptionFailed)?;
+    let aad = initialization_associated_data(journal_id);
+    let ciphertext = cipher
+        .encrypt(
+            nonce_ref,
+            Payload {
+                msg: INITIALIZATION_PLAINTEXT,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| JournalError::EncryptionFailed)?;
+    Ok(InitializationRecord {
+        state: INITIALIZATION_PENDING,
+        nonce,
+        ciphertext,
+    })
+}
+
+fn verify_initialization_key(
+    key: &JournalKey,
+    journal_id: &[u8; JOURNAL_ID_BYTES],
+    initialization: &InitializationRecord,
+) -> Result<(), JournalError> {
+    let cipher = cipher_from_key(key)?;
+    let nonce_ref: &XNonce = initialization
+        .nonce
+        .as_slice()
+        .try_into()
+        .map_err(|_| JournalError::UnsupportedFormat)?;
+    let aad = initialization_associated_data(journal_id);
+    let plaintext = Zeroizing::new(
+        cipher
+            .decrypt(
+                nonce_ref,
+                Payload {
+                    msg: &initialization.ciphertext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| JournalError::AuthenticationFailed)?,
+    );
+    if plaintext.as_slice() != INITIALIZATION_PLAINTEXT {
+        return Err(JournalError::AuthenticationFailed);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -544,8 +959,15 @@ struct ChainHead {
 struct ChainScan {
     head: ChainHead,
     anchor_prefix_hash: Option<[u8; HASH_BYTES]>,
-    plaintext_bytes: u64,
+    ciphertext_bytes: u64,
     entries: Vec<JournalEntry>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScanMode {
+    None,
+    First,
+    AllBounded,
 }
 
 fn scan_chain(
@@ -553,7 +975,7 @@ fn scan_chain(
     cipher: &XChaCha20Poly1305,
     journal_id: &[u8; JOURNAL_ID_BYTES],
     anchor_sequence: u64,
-    materialize: bool,
+    mode: ScanMode,
 ) -> Result<ChainScan, JournalError> {
     let mut statement = connection.prepare(
         "SELECT sequence, \
@@ -645,7 +1067,12 @@ fn scan_chain(
         if sequence == anchor_sequence {
             anchor_prefix_hash = Some(entry_hash);
         }
-        if materialize {
+        if mode == ScanMode::AllBounded
+            && (sequence > MAX_RETURNED_ENTRIES || plaintext_bytes > MAX_RETURNED_PLAINTEXT_BYTES)
+        {
+            return Err(JournalError::ReadLimitExceeded);
+        }
+        if mode == ScanMode::AllBounded || (mode == ScanMode::First && sequence == 1) {
             entries.push(JournalEntry {
                 sequence,
                 event: plaintext.to_vec(),
@@ -666,9 +1093,155 @@ fn scan_chain(
             entry_hash: expected_previous,
         },
         anchor_prefix_hash,
-        plaintext_bytes,
+        ciphertext_bytes,
         entries,
     })
+}
+
+fn validate_expected_head(
+    connection: &Connection,
+    cipher: &XChaCha20Poly1305,
+    journal_id: &[u8; JOURNAL_ID_BYTES],
+    expected: JournalAnchor,
+) -> Result<(), JournalError> {
+    if &expected.journal_id != journal_id || load_journal_id(connection)? != *journal_id {
+        return Err(JournalError::RollbackDetected);
+    }
+
+    let (count_raw, minimum_raw, maximum_raw): (i64, Option<i64>, Option<i64>) = connection
+        .query_row(
+            "SELECT count(*), min(sequence), max(sequence)
+             FROM secure_journal_entries",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+    let count = u64::try_from(count_raw).map_err(|_| JournalError::CorruptChain)?;
+    if count > MAX_JOURNAL_ENTRIES {
+        return Err(JournalError::JournalTooLarge);
+    }
+
+    let actual = match (minimum_raw, maximum_raw) {
+        (None, None) if count == 0 => initial_anchor(*journal_id),
+        (Some(minimum_raw), Some(maximum_raw)) => {
+            let minimum = u64::try_from(minimum_raw).map_err(|_| JournalError::CorruptChain)?;
+            let maximum = u64::try_from(maximum_raw).map_err(|_| JournalError::CorruptChain)?;
+            if minimum != 1 || maximum != count || maximum > MAX_JOURNAL_ENTRIES {
+                return Err(JournalError::CorruptChain);
+            }
+            let (hash_length, entry_hash): (i64, Vec<u8>) = connection.query_row(
+                "SELECT length(entry_hash), entry_hash
+                 FROM secure_journal_entries WHERE sequence = ?1",
+                [maximum_raw],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            if hash_length != HASH_BYTES as i64 {
+                return Err(JournalError::CorruptChain);
+            }
+            JournalAnchor {
+                journal_id: *journal_id,
+                sequence: maximum,
+                entry_hash: entry_hash
+                    .try_into()
+                    .map_err(|_| JournalError::CorruptChain)?,
+            }
+        }
+        _ => return Err(JournalError::CorruptChain),
+    };
+
+    if actual != expected {
+        if actual.sequence <= expected.sequence {
+            return Err(JournalError::RollbackDetected);
+        }
+        return Err(JournalError::UnexpectedHead { expected, actual });
+    }
+    if expected.sequence == 0 {
+        if expected.entry_hash != ZERO_HASH {
+            return Err(JournalError::RollbackDetected);
+        }
+        return Ok(());
+    }
+
+    type TailRow = (i64, Vec<u8>, i64, Vec<u8>, i64, Vec<u8>, i64, Vec<u8>);
+    let (
+        nonce_length,
+        nonce,
+        ciphertext_length,
+        ciphertext,
+        previous_hash_length,
+        previous_hash,
+        entry_hash_length,
+        entry_hash,
+    ): TailRow = connection.query_row(
+        "SELECT length(nonce), nonce,
+                length(ciphertext), ciphertext,
+                length(previous_hash), previous_hash,
+                length(entry_hash), entry_hash
+         FROM secure_journal_entries WHERE sequence = ?1",
+        [i64::try_from(expected.sequence).map_err(|_| JournalError::CorruptChain)?],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+            ))
+        },
+    )?;
+    let max_ciphertext = MAX_EVENT_BYTES
+        .checked_add(AEAD_TAG_BYTES)
+        .ok_or(JournalError::JournalTooLarge)?;
+    if nonce_length != NONCE_BYTES as i64
+        || ciphertext_length < AEAD_TAG_BYTES as i64
+        || ciphertext_length > max_ciphertext as i64
+        || previous_hash_length != HASH_BYTES as i64
+        || entry_hash_length != HASH_BYTES as i64
+    {
+        return Err(JournalError::CorruptChain);
+    }
+    let nonce: [u8; NONCE_BYTES] = nonce.try_into().map_err(|_| JournalError::CorruptChain)?;
+    let previous_hash: [u8; HASH_BYTES] = previous_hash
+        .try_into()
+        .map_err(|_| JournalError::CorruptChain)?;
+    let entry_hash: [u8; HASH_BYTES] = entry_hash
+        .try_into()
+        .map_err(|_| JournalError::CorruptChain)?;
+    if entry_hash != expected.entry_hash
+        || entry_hash
+            != hash_entry(
+                journal_id,
+                expected.sequence,
+                &previous_hash,
+                &nonce,
+                &ciphertext,
+            )
+    {
+        return Err(JournalError::CorruptChain);
+    }
+
+    let nonce_ref: &XNonce = nonce
+        .as_slice()
+        .try_into()
+        .map_err(|_| JournalError::CorruptChain)?;
+    let aad = associated_data(journal_id, expected.sequence, &previous_hash);
+    let plaintext = Zeroizing::new(
+        cipher
+            .decrypt(
+                nonce_ref,
+                Payload {
+                    msg: &ciphertext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| JournalError::AuthenticationFailed)?,
+    );
+    if plaintext.len() > MAX_EVENT_BYTES {
+        return Err(JournalError::CorruptChain);
+    }
+    Ok(())
 }
 
 fn validate_anchor(
@@ -738,33 +1311,25 @@ fn hash_entry(
     hasher.finalize().into()
 }
 
-fn inspect_database_path(path: &Path) -> Result<bool, JournalError> {
+fn inspect_database_path(path: &Path) -> Result<DatabasePathState, JournalError> {
     if path.as_os_str().is_empty() || path == Path::new(":memory:") {
         return Err(JournalError::InvalidPath);
     }
-    let parent = path
-        .parent()
-        .filter(|value| !value.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let parent_metadata = fs::symlink_metadata(parent).map_err(database_io_error)?;
-    if parent_metadata.file_type().is_symlink() {
-        return Err(JournalError::SymlinkRejected);
-    }
-    if !parent_metadata.is_dir() {
-        return Err(JournalError::InvalidPath);
-    }
+    validate_parent_directory(path)?;
 
-    let existed = match fs::symlink_metadata(path) {
+    let state = match fs::symlink_metadata(path) {
         Ok(metadata) => {
-            if metadata.file_type().is_symlink() {
-                return Err(JournalError::SymlinkRejected);
-            }
+            reject_link_like(&metadata)?;
             if !metadata.is_file() {
                 return Err(JournalError::InvalidPath);
             }
-            true
+            if metadata.len() == 0 {
+                DatabasePathState::Empty
+            } else {
+                DatabasePathState::Existing
+            }
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => DatabasePathState::Missing,
         Err(error) => return Err(database_io_error(error)),
     };
 
@@ -772,10 +1337,8 @@ fn inspect_database_path(path: &Path) -> Result<bool, JournalError> {
         let sidecar = database_sidecar(path, suffix);
         match fs::symlink_metadata(sidecar) {
             Ok(metadata) => {
-                if metadata.file_type().is_symlink() {
-                    return Err(JournalError::SymlinkRejected);
-                }
-                if !metadata.is_file() || !existed {
+                reject_link_like(&metadata)?;
+                if !metadata.is_file() || state != DatabasePathState::Existing {
                     return Err(JournalError::InvalidPath);
                 }
             }
@@ -783,7 +1346,31 @@ fn inspect_database_path(path: &Path) -> Result<bool, JournalError> {
             Err(error) => return Err(database_io_error(error)),
         }
     }
-    Ok(existed)
+    Ok(state)
+}
+
+fn validate_parent_directory(path: &Path) -> Result<(), JournalError> {
+    let parent = path
+        .parent()
+        .filter(|value| !value.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let parent_metadata = fs::symlink_metadata(parent).map_err(database_io_error)?;
+    reject_link_like(&parent_metadata)?;
+    if !parent_metadata.is_dir() {
+        return Err(JournalError::InvalidPath);
+    }
+    Ok(())
+}
+
+fn reject_link_like(metadata: &fs::Metadata) -> Result<(), JournalError> {
+    if metadata.file_type().is_symlink() {
+        return Err(JournalError::SymlinkRejected);
+    }
+    #[cfg(windows)]
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(JournalError::SymlinkRejected);
+    }
+    Ok(())
 }
 
 fn create_database_file(path: &Path) -> Result<(), JournalError> {
@@ -811,12 +1398,13 @@ fn configure_connection(connection: &Connection) -> Result<(), JournalError> {
 fn initialize_schema(
     connection: &Connection,
     journal_id: &[u8; JOURNAL_ID_BYTES],
+    initialization: &InitializationRecord,
 ) -> Result<(), JournalError> {
     connection.execute_batch(
         "BEGIN IMMEDIATE;
          CREATE TABLE secure_journal_metadata (
            singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton = 1),
-           schema_version INTEGER NOT NULL CHECK(schema_version = 2),
+           schema_version INTEGER NOT NULL CHECK(schema_version = 3),
            journal_id BLOB NOT NULL CHECK(length(journal_id) = 16)
          );
          CREATE TABLE secure_journal_entries (
@@ -825,12 +1413,23 @@ fn initialize_schema(
            ciphertext BLOB NOT NULL CHECK(length(ciphertext) >= 16),
            previous_hash BLOB NOT NULL CHECK(length(previous_hash) = 32),
            entry_hash BLOB NOT NULL CHECK(length(entry_hash) = 32)
+         );
+         CREATE TABLE secure_journal_initialization (
+           singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton = 1),
+           state INTEGER NOT NULL CHECK(state IN (0, 1)),
+           nonce BLOB NOT NULL CHECK(length(nonce) = 24),
+           ciphertext BLOB NOT NULL CHECK(length(ciphertext) = 52)
          );",
     )?;
     connection.execute(
         "INSERT INTO secure_journal_metadata(singleton, schema_version, journal_id)\
          VALUES (1, ?1, ?2)",
         params![SCHEMA_VERSION, journal_id.as_slice()],
+    )?;
+    connection.execute(
+        "INSERT INTO secure_journal_initialization(singleton, state, nonce, ciphertext)
+         VALUES (1, 0, ?1, ?2)",
+        params![initialization.nonce.as_slice(), initialization.ciphertext],
     )?;
     connection.execute_batch(
         "CREATE TRIGGER secure_journal_entries_no_update
@@ -848,13 +1447,19 @@ fn initialize_schema(
          CREATE TRIGGER secure_journal_metadata_no_insert
            BEFORE INSERT ON secure_journal_metadata
            BEGIN SELECT RAISE(ABORT, 'immutable secure journal metadata'); END;
-         PRAGMA user_version=2;
+         CREATE TRIGGER secure_journal_initialization_no_delete
+           BEFORE DELETE ON secure_journal_initialization
+           BEGIN SELECT RAISE(ABORT, 'immutable secure journal initialization'); END;
+         CREATE TRIGGER secure_journal_initialization_no_insert
+           BEFORE INSERT ON secure_journal_initialization
+           BEGIN SELECT RAISE(ABORT, 'immutable secure journal initialization'); END;
+         PRAGMA user_version=3;
          COMMIT;",
     )?;
     Ok(())
 }
 
-fn validate_schema(connection: &Connection) -> Result<(), JournalError> {
+fn validate_schema(connection: &Connection) -> Result<SchemaKind, JournalError> {
     let required_tables: i64 = connection.query_row(
         "SELECT count(*) FROM sqlite_master
          WHERE type = 'table'
@@ -863,7 +1468,7 @@ fn validate_schema(connection: &Connection) -> Result<(), JournalError> {
         |row| row.get(0),
     )?;
     let user_version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if required_tables != 2 || user_version != SCHEMA_VERSION {
+    if required_tables != 2 || !matches!(user_version, LEGACY_SCHEMA_VERSION | SCHEMA_VERSION) {
         return Err(JournalError::UnsupportedFormat);
     }
     let metadata_rows: i64 =
@@ -875,10 +1480,87 @@ fn validate_schema(connection: &Connection) -> Result<(), JournalError> {
         [],
         |row| row.get(0),
     )?;
-    if metadata_rows != 1 || schema_version != SCHEMA_VERSION {
+    if metadata_rows != 1 || schema_version != user_version {
         return Err(JournalError::UnsupportedFormat);
     }
-    Ok(())
+    if schema_version == LEGACY_SCHEMA_VERSION {
+        return Ok(SchemaKind::Legacy);
+    }
+    if schema_version != SCHEMA_VERSION {
+        return Err(JournalError::UnsupportedFormat);
+    }
+    let initialization_tables: i64 = connection.query_row(
+        "SELECT count(*) FROM sqlite_master
+         WHERE type = 'table' AND name = 'secure_journal_initialization'",
+        [],
+        |row| row.get(0),
+    )?;
+    if initialization_tables != 1 {
+        return Err(JournalError::UnsupportedFormat);
+    }
+    Ok(SchemaKind::Recoverable)
+}
+
+fn load_initialization_record(
+    connection: &Connection,
+) -> Result<InitializationRecord, JournalError> {
+    let rows: i64 = connection.query_row(
+        "SELECT count(*) FROM secure_journal_initialization",
+        [],
+        |row| row.get(0),
+    )?;
+    if rows != 1 {
+        return Err(JournalError::UnsupportedFormat);
+    }
+    let (state, nonce_length, nonce, ciphertext_length, ciphertext): (
+        i64,
+        i64,
+        Vec<u8>,
+        i64,
+        Vec<u8>,
+    ) = connection.query_row(
+        "SELECT state, length(nonce), nonce, length(ciphertext), ciphertext
+         FROM secure_journal_initialization WHERE singleton = 1",
+        [],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        },
+    )?;
+    let expected_ciphertext_length = INITIALIZATION_PLAINTEXT
+        .len()
+        .checked_add(AEAD_TAG_BYTES)
+        .ok_or(JournalError::UnsupportedFormat)?;
+    if !matches!(state, INITIALIZATION_PENDING | INITIALIZATION_READY)
+        || nonce_length != NONCE_BYTES as i64
+        || ciphertext_length != expected_ciphertext_length as i64
+    {
+        return Err(JournalError::UnsupportedFormat);
+    }
+    let update_guards: i64 = connection.query_row(
+        "SELECT count(*) FROM sqlite_master
+         WHERE type = 'trigger'
+           AND name = 'secure_journal_initialization_no_update'",
+        [],
+        |row| row.get(0),
+    )?;
+    if (state == INITIALIZATION_PENDING && update_guards != 0)
+        || (state == INITIALIZATION_READY && update_guards != 1)
+    {
+        return Err(JournalError::UnsupportedFormat);
+    }
+    Ok(InitializationRecord {
+        state,
+        nonce: nonce
+            .try_into()
+            .map_err(|_| JournalError::UnsupportedFormat)?,
+        ciphertext,
+    })
 }
 
 fn load_journal_id(connection: &Connection) -> Result<[u8; JOURNAL_ID_BYTES], JournalError> {
@@ -897,16 +1579,15 @@ fn load_journal_id(connection: &Connection) -> Result<[u8; JOURNAL_ID_BYTES], Jo
 }
 
 fn harden_database_files(path: &Path) -> Result<(), JournalError> {
-    for candidate in [
-        path.to_path_buf(),
-        database_sidecar(path, "-wal"),
-        database_sidecar(path, "-shm"),
+    validate_parent_directory(path)?;
+    for (candidate, required) in [
+        (path.to_path_buf(), true),
+        (database_sidecar(path, "-wal"), false),
+        (database_sidecar(path, "-shm"), false),
     ] {
         match fs::symlink_metadata(&candidate) {
             Ok(metadata) => {
-                if metadata.file_type().is_symlink() {
-                    return Err(JournalError::SymlinkRejected);
-                }
+                reject_link_like(&metadata)?;
                 if !metadata.is_file() {
                     return Err(JournalError::InvalidPath);
                 }
@@ -914,7 +1595,7 @@ fn harden_database_files(path: &Path) -> Result<(), JournalError> {
                 fs::set_permissions(&candidate, fs::Permissions::from_mode(0o600))
                     .map_err(database_io_error)?;
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound && !required => {}
             Err(error) => return Err(database_io_error(error)),
         }
     }
@@ -935,7 +1616,9 @@ fn database_io_error(error: io::Error) -> JournalError {
 mod tests {
     use super::*;
     use std::{
-        env, process,
+        env,
+        io::Write,
+        process::{self, Command},
         sync::{
             Arc, Mutex,
             atomic::{AtomicU64, Ordering},
@@ -948,6 +1631,7 @@ mod tests {
     struct MemorySecrets {
         key: Option<[u8; JOURNAL_KEY_BYTES]>,
         anchor: Option<JournalAnchor>,
+        fail_next_key_write: bool,
         fail_next_anchor_write: bool,
     }
 
@@ -967,6 +1651,12 @@ mod tests {
             self.0.lock().expect("lock secrets").anchor = None;
         }
 
+        fn clear_all(&self) {
+            let mut secrets = self.0.lock().expect("lock secrets");
+            secrets.key = None;
+            secrets.anchor = None;
+        }
+
         fn anchor(&self) -> JournalAnchor {
             self.0
                 .lock()
@@ -982,6 +1672,10 @@ mod tests {
         fn fail_next_anchor_write(&self) {
             self.0.lock().expect("lock secrets").fail_next_anchor_write = true;
         }
+
+        fn fail_next_key_write(&self) {
+            self.0.lock().expect("lock secrets").fail_next_key_write = true;
+        }
     }
 
     impl JournalSecretStore for MemorySecretStore {
@@ -995,10 +1689,15 @@ mod tests {
         }
 
         fn store_key(&mut self, key: &JournalKey) -> Result<(), SecretStoreError> {
-            self.0
+            let mut secrets = self
+                .0
                 .lock()
-                .map_err(|_| SecretStoreError::new("memory store lock failed"))?
-                .key = Some(*key.expose_secret());
+                .map_err(|_| SecretStoreError::new("memory store lock failed"))?;
+            if secrets.fail_next_key_write {
+                secrets.fail_next_key_write = false;
+                return Err(SecretStoreError::new("injected key failure"));
+            }
+            secrets.key = Some(*key.expose_secret());
             Ok(())
         }
 
@@ -1024,6 +1723,79 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct ProcessSecretStore {
+        directory: PathBuf,
+    }
+
+    impl ProcessSecretStore {
+        fn new(directory: PathBuf) -> Self {
+            Self { directory }
+        }
+
+        fn key_path(&self) -> PathBuf {
+            self.directory.join("journal.key")
+        }
+
+        fn anchor_path(&self) -> PathBuf {
+            self.directory.join("journal.anchor")
+        }
+
+        fn load_file(path: &Path) -> Result<Option<Vec<u8>>, SecretStoreError> {
+            match fs::read(path) {
+                Ok(value) => Ok(Some(value)),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+                Err(_) => Err(SecretStoreError::new("process secret read failed")),
+            }
+        }
+
+        fn store_file(&self, path: &Path, value: &[u8]) -> Result<(), SecretStoreError> {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .map_err(|_| SecretStoreError::new("process secret create failed"))?;
+            file.write_all(value)
+                .map_err(|_| SecretStoreError::new("process secret write failed"))?;
+            file.sync_all()
+                .map_err(|_| SecretStoreError::new("process secret sync failed"))?;
+            #[cfg(unix)]
+            fs::File::open(&self.directory)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|_| SecretStoreError::new("process secret directory sync failed"))?;
+            Ok(())
+        }
+    }
+
+    impl JournalSecretStore for ProcessSecretStore {
+        fn load_key(&mut self) -> Result<Option<JournalKey>, SecretStoreError> {
+            let Some(value) = Self::load_file(&self.key_path())? else {
+                return Ok(None);
+            };
+            let key: [u8; JOURNAL_KEY_BYTES] = value
+                .try_into()
+                .map_err(|_| SecretStoreError::new("invalid process journal key"))?;
+            Ok(Some(JournalKey::from_zeroizing(Zeroizing::new(key))))
+        }
+
+        fn store_key(&mut self, key: &JournalKey) -> Result<(), SecretStoreError> {
+            self.store_file(&self.key_path(), key.expose_secret())
+        }
+
+        fn load_anchor(&mut self) -> Result<Option<JournalAnchor>, SecretStoreError> {
+            let Some(value) = Self::load_file(&self.anchor_path())? else {
+                return Ok(None);
+            };
+            JournalAnchor::from_bytes(&value)
+                .map(Some)
+                .map_err(|_| SecretStoreError::new("invalid process journal anchor"))
+        }
+
+        fn store_anchor(&mut self, anchor: &JournalAnchor) -> Result<(), SecretStoreError> {
+            self.store_file(&self.anchor_path(), &anchor.to_bytes())
+        }
+    }
+
     fn database_path(name: &str) -> PathBuf {
         env::temp_dir().join(format!(
             "kernaid-secure-journal-{name}-{}-{}.sqlite3",
@@ -1040,6 +1812,61 @@ mod tests {
         ] {
             let _ = fs::remove_file(candidate);
         }
+    }
+
+    fn initialization_state(path: &Path) -> (i64, i64) {
+        let connection = Connection::open(path).expect("open initialization database");
+        let state = connection
+            .query_row(
+                "SELECT state FROM secure_journal_initialization WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read initialization state");
+        let guard = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type = 'trigger'
+                   AND name = 'secure_journal_initialization_no_update'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read initialization guard");
+        (state, guard)
+    }
+
+    fn create_pending_database(
+        path: &Path,
+        store: &MemorySecretStore,
+        persist_key: bool,
+        persist_anchor: bool,
+    ) -> ([u8; JOURNAL_ID_BYTES], [u8; JOURNAL_KEY_BYTES]) {
+        create_database_file(path).expect("create pending database");
+        let connection = Connection::open(path).expect("open pending database");
+        configure_connection(&connection).expect("configure pending database");
+        let mut journal_id = [0_u8; JOURNAL_ID_BYTES];
+        OsRng.fill_bytes(&mut journal_id);
+        let key = JournalKey::generate();
+        let key_bytes = *key.expose_secret();
+        let initialization =
+            create_initialization_record(&key, &journal_id).expect("create key check");
+        initialize_schema(&connection, &journal_id, &initialization)
+            .expect("initialize pending schema");
+        if persist_key {
+            store.clone().store_key(&key).expect("persist pending key");
+        }
+        if persist_anchor {
+            assert!(
+                persist_key,
+                "an anchor without its key is not a valid phase"
+            );
+            store
+                .clone()
+                .store_anchor(&initial_anchor(journal_id))
+                .expect("persist pending anchor");
+        }
+        drop(connection);
+        (journal_id, key_bytes)
     }
 
     fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
@@ -1173,6 +2000,268 @@ mod tests {
         assert_eq!(entries[0].event, b"started");
         assert_eq!(entries[1].event, b"succeeded");
         remove_database(&path);
+    }
+
+    #[test]
+    fn first_entry_verifies_every_record_without_materializing_the_tail() {
+        let path = database_path("first-entry");
+        let store = MemorySecretStore::default();
+        let mut journal = SecureJournal::open(&path, store.clone()).expect("open journal");
+        assert_eq!(journal.first_entry().expect("empty first entry"), None);
+        journal.append(b"first").expect("append first");
+        journal.append(b"second").expect("append second");
+        journal.append(b"third").expect("append third");
+        let first = journal
+            .first_entry()
+            .expect("verify first entry")
+            .expect("stored first entry");
+        assert_eq!(first.sequence, 1);
+        assert_eq!(first.event, b"first");
+
+        rewrite_ciphertext_and_public_hash(&path, 3);
+        assert!(matches!(
+            journal.first_entry(),
+            Err(JournalError::AuthenticationFailed)
+        ));
+        remove_database(&path);
+    }
+
+    #[test]
+    fn append_expected_rejects_a_stale_head_without_writing() {
+        let path = database_path("expected-head");
+        let store = MemorySecretStore::default();
+        let mut first_writer =
+            SecureJournal::open(&path, store.clone()).expect("open first writer");
+        let mut second_writer =
+            SecureJournal::open(&path, store.clone()).expect("open second writer");
+        let expected = first_writer.head().expect("initial head");
+        let appended = first_writer
+            .append_expected(expected, b"first writer")
+            .expect("append at expected head");
+        assert_eq!(appended.sequence, 1);
+
+        let error = second_writer
+            .append_expected(expected, b"stale writer")
+            .expect_err("stale append must fail");
+        assert!(matches!(error, JournalError::UnexpectedHead { .. }));
+        if let JournalError::UnexpectedHead {
+            expected: rejected,
+            actual,
+        } = error
+        {
+            assert_eq!(rejected, expected);
+            assert_eq!(actual.sequence, 1);
+            assert_eq!(actual.entry_hash, appended.entry_hash);
+        }
+        assert_eq!(first_writer.entries().expect("read journal").len(), 1);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn append_expected_validates_the_current_tail_before_writing() {
+        let path = database_path("expected-tail-tamper");
+        let store = MemorySecretStore::default();
+        let mut journal = SecureJournal::open(&path, store.clone()).expect("open journal");
+        let first = journal.append(b"first").expect("append first");
+        let expected = store.anchor();
+        assert_eq!(expected.entry_hash, first.entry_hash);
+
+        rewrite_ciphertext_and_public_hash(&path, 1);
+        assert!(matches!(
+            journal.append_expected(expected, b"must not append"),
+            Err(JournalError::RollbackDetected)
+        ));
+        assert_eq!(store.anchor(), expected);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn append_expected_rejects_a_historical_gap_even_when_the_tail_matches() {
+        let path = database_path("expected-gap");
+        let store = MemorySecretStore::default();
+        let mut journal = SecureJournal::open(&path, store.clone()).expect("open journal");
+        journal.append(b"first").expect("append first");
+        journal.append(b"second").expect("append second");
+        let expected = store.anchor();
+
+        let connection = Connection::open(&path).expect("open raw gap database");
+        connection
+            .execute_batch(
+                "DROP TRIGGER secure_journal_entries_no_delete;
+                 DELETE FROM secure_journal_entries WHERE sequence = 1;",
+            )
+            .expect("inject historical gap");
+        drop(connection);
+
+        assert!(matches!(
+            journal.append_expected(expected, b"must not append"),
+            Err(JournalError::CorruptChain)
+        ));
+        assert_eq!(store.anchor(), expected);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn pending_database_only_and_key_only_states_recover() {
+        let database_only_path = database_path("pending-database-only");
+        let database_only_store = MemorySecretStore::default();
+        database_only_store.fail_next_key_write();
+        assert!(matches!(
+            SecureJournal::open(&database_only_path, database_only_store.clone()),
+            Err(JournalError::SecretStore(_))
+        ));
+        assert_eq!(initialization_state(&database_only_path), (0, 0));
+        let recovered = SecureJournal::open(&database_only_path, database_only_store)
+            .expect("recover database-only state");
+        assert_eq!(initialization_state(&database_only_path), (1, 1));
+        drop(recovered);
+        remove_database(&database_only_path);
+
+        let key_only_path = database_path("pending-key-only");
+        let key_only_store = MemorySecretStore::default();
+        key_only_store.fail_next_anchor_write();
+        assert!(matches!(
+            SecureJournal::open(&key_only_path, key_only_store.clone()),
+            Err(JournalError::SecretStore(_))
+        ));
+        assert_eq!(initialization_state(&key_only_path), (0, 0));
+        let recovered =
+            SecureJournal::open(&key_only_path, key_only_store).expect("recover key-only state");
+        assert_eq!(initialization_state(&key_only_path), (1, 1));
+        drop(recovered);
+        remove_database(&key_only_path);
+    }
+
+    #[test]
+    fn pending_anchor_state_recovers_and_mismatched_key_fails_closed() {
+        let anchor_path = database_path("pending-anchor");
+        let anchor_store = MemorySecretStore::default();
+        create_pending_database(&anchor_path, &anchor_store, true, true);
+        assert_eq!(initialization_state(&anchor_path), (0, 0));
+        let recovered = SecureJournal::open(&anchor_path, anchor_store)
+            .expect("recover anchor-before-ready state");
+        assert_eq!(initialization_state(&anchor_path), (1, 1));
+        drop(recovered);
+        remove_database(&anchor_path);
+
+        let mismatch_path = database_path("pending-key-mismatch");
+        let mismatch_store = MemorySecretStore::default();
+        create_pending_database(&mismatch_path, &mismatch_store, true, false);
+        mismatch_store.replace_key([0x6d; JOURNAL_KEY_BYTES]);
+        assert!(matches!(
+            SecureJournal::open(&mismatch_path, mismatch_store.clone()),
+            Err(JournalError::AuthenticationFailed)
+        ));
+        assert!(
+            mismatch_store
+                .0
+                .lock()
+                .expect("lock secrets")
+                .anchor
+                .is_none()
+        );
+        assert_eq!(initialization_state(&mismatch_path), (0, 0));
+        remove_database(&mismatch_path);
+    }
+
+    #[test]
+    fn ready_or_nonempty_databases_never_reinitialize_without_secrets() {
+        let ready_path = database_path("ready-missing-all");
+        let ready_store = MemorySecretStore::default();
+        drop(SecureJournal::open(&ready_path, ready_store.clone()).expect("initialize ready"));
+        ready_store.clear_all();
+        assert!(matches!(
+            SecureJournal::open(&ready_path, ready_store),
+            Err(JournalError::MissingKey)
+        ));
+        assert_eq!(initialization_state(&ready_path), (1, 1));
+        remove_database(&ready_path);
+
+        let nonempty_path = database_path("pending-nonempty");
+        let nonempty_store = MemorySecretStore::default();
+        create_pending_database(&nonempty_path, &nonempty_store, false, false);
+        let connection = Connection::open(&nonempty_path).expect("open pending raw database");
+        connection
+            .execute(
+                "INSERT INTO secure_journal_entries(
+                   sequence, nonce, ciphertext, previous_hash, entry_hash
+                 ) VALUES (1, ?1, ?2, ?3, ?4)",
+                params![
+                    [1_u8; NONCE_BYTES].as_slice(),
+                    [2_u8; AEAD_TAG_BYTES].as_slice(),
+                    ZERO_HASH.as_slice(),
+                    [3_u8; HASH_BYTES].as_slice()
+                ],
+            )
+            .expect("inject ambiguous pending entry");
+        drop(connection);
+        assert!(matches!(
+            SecureJournal::open(&nonempty_path, nonempty_store),
+            Err(JournalError::SecretStateConflict)
+        ));
+        remove_database(&nonempty_path);
+    }
+
+    #[test]
+    fn zero_length_database_file_is_a_recoverable_new_state() {
+        let path = database_path("zero-length");
+        fs::write(&path, []).expect("create empty database file");
+        let journal = SecureJournal::open(&path, MemorySecretStore::default())
+            .expect("initialize zero-length database");
+        assert_eq!(initialization_state(&path), (1, 1));
+        drop(journal);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn initialization_recovers_after_real_process_crashes_at_every_boundary() {
+        for boundary in ["database", "key", "anchor", "ready"] {
+            let directory = env::temp_dir().join(format!(
+                "kernaid-storage-crash-{boundary}-{}-{}",
+                process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&directory).expect("create crash directory");
+            let status = Command::new(env::current_exe().expect("current test executable"))
+                .args([
+                    "--exact",
+                    "tests::initialization_crash_child",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("KERNAID_STORAGE_TEST_CRASH_DIRECTORY", &directory)
+                .env("KERNAID_STORAGE_TEST_CRASH_BOUNDARY", boundary)
+                .status()
+                .expect("run crash child");
+            assert_eq!(status.code(), Some(86), "child did not crash at {boundary}");
+
+            let path = directory.join("journal.sqlite3");
+            let store = ProcessSecretStore::new(directory.clone());
+            let mut recovered =
+                SecureJournal::open(&path, store).expect("recover after crash boundary");
+            assert_eq!(recovered.head().expect("recovered head").sequence, 0);
+            assert_eq!(initialization_state(&path), (1, 1));
+            drop(recovered);
+
+            remove_database(&path);
+            let _ = fs::remove_file(directory.join("journal.key"));
+            let _ = fs::remove_file(directory.join("journal.anchor"));
+            fs::remove_dir(directory).expect("remove crash directory");
+        }
+    }
+
+    #[test]
+    #[ignore = "spawned by initialization_recovers_after_real_process_crashes_at_every_boundary"]
+    fn initialization_crash_child() {
+        let directory = PathBuf::from(
+            env::var_os("KERNAID_STORAGE_TEST_CRASH_DIRECTORY")
+                .expect("crash test directory environment"),
+        );
+        let path = directory.join("journal.sqlite3");
+        let store = ProcessSecretStore::new(directory);
+        let result = SecureJournal::open(&path, store);
+        assert!(result.is_err(), "crash hook did not terminate child");
     }
 
     #[test]
@@ -1372,6 +2461,12 @@ mod tests {
             journal.entries(),
             Err(JournalError::ReadLimitExceeded)
         ));
+        let first = journal
+            .first_entry()
+            .expect("first entry remains available")
+            .expect("large journal is nonempty");
+        assert_eq!(first.sequence, 1);
+        assert!(first.event.is_empty());
         let head = journal
             .head()
             .expect("head does not materialize plaintext records");
