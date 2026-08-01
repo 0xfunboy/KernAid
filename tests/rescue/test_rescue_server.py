@@ -2,7 +2,8 @@
 """Unit tests for the Rescue R0 authorization boundary."""
 
 from importlib.util import module_from_spec, spec_from_file_location
-from http.client import HTTPConnection
+from http.client import HTTPConnection, RemoteDisconnected
+import hashlib
 import json
 from pathlib import Path
 import socket
@@ -16,6 +17,11 @@ SERVER = (
     Path(__file__).parents[2]
     / "rescue/live-build/config/includes.chroot/usr/lib/kernaid/rescue_server.py"
 )
+READY_CHECK = (
+    Path(__file__).parents[2]
+    / "rescue/live-build/config/includes.chroot/usr/lib/kernaid/ready-check"
+)
+QEMU_SMOKE = Path(__file__).parents[2] / "tools/build-rescue/qemu-smoke.sh"
 SPEC = spec_from_file_location("kernaid_rescue_server", SERVER)
 if SPEC is None or SPEC.loader is None:
     raise RuntimeError("cannot load Rescue server")
@@ -23,6 +29,229 @@ rescue_server = module_from_spec(SPEC)
 SPEC.loader.exec_module(rescue_server)
 
 FINGERPRINT = "sha256:" + "1" * 64
+SCAN_FINGERPRINT = "scan:" + "2" * 64
+TARGET_ID = "target:" + "3" * 64
+RESCUE_TARGET = {
+    "scanFingerprint": SCAN_FINGERPRINT,
+    "targetId": TARGET_ID,
+}
+
+
+def block_device(
+    name: str,
+    kind: str,
+    *,
+    major_minor: str | None = None,
+    size: int = 1024,
+    read_only: bool = False,
+    removable: bool = False,
+    transport: str | None = None,
+    filesystem: str | None = None,
+    mountpoints: list[str | None] | None = None,
+    uuid: str | None = None,
+    partuuid: str | None = None,
+    ptuuid: str | None = None,
+    pttype: str | None = None,
+    parttype: str | None = None,
+    serial: str | None = None,
+    wwn: str | None = None,
+    children: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    if major_minor is None:
+        derived_minor = int.from_bytes(hashlib.sha256(name.encode()).digest()[:4], "big")
+        major_minor = f"240:{derived_minor}"
+    device: dict[str, object] = {
+        "name": name,
+        "maj:min": major_minor,
+        "type": kind,
+        "size": size,
+        "ro": read_only,
+        "rm": removable,
+        "tran": transport,
+        "fstype": filesystem,
+        "fsver": None,
+        "mountpoints": [] if mountpoints is None else mountpoints,
+        "uuid": uuid,
+        "partuuid": partuuid,
+        "ptuuid": ptuuid,
+        "pttype": pttype,
+        "parttype": parttype,
+        "serial": serial,
+        "wwn": wwn,
+    }
+    if children is not None:
+        device["children"] = children
+    return device
+
+
+def target_scan_fixture() -> str:
+    linux_root_type = "4f68bce3-e8cd-4db1-96e7-fbcaf984b709"
+    apple_apfs_type = "7c3457ef-0000-11aa-aa11-00306543ecac"
+    return json.dumps(
+        {
+            "blockdevices": [
+                block_device(
+                    "sda",
+                    "disk",
+                    size=8_000_000_000,
+                    removable=True,
+                    transport="usb",
+                    filesystem="iso9660",
+                    mountpoints=["/run/live/medium"],
+                    serial="RESCUE-DEVICE-SECRET",
+                    pttype="dos",
+                ),
+                block_device(
+                    "nvme0n1",
+                    "disk",
+                    size=1_000_000_000_000,
+                    transport="nvme",
+                    serial="CUSTOMER-SERIAL-SECRET",
+                    wwn="CUSTOMER-WWN-SECRET",
+                    ptuuid="CUSTOMER-PTUUID-SECRET",
+                    pttype="gpt",
+                    children=[
+                        block_device(
+                            "nvme0n1p1",
+                            "part",
+                            filesystem="vfat",
+                            uuid="CUSTOMER-EFI-UUID-SECRET",
+                        ),
+                        block_device(
+                            "nvme0n1p2",
+                            "part",
+                            filesystem="ntfs",
+                            uuid="CUSTOMER-NTFS-UUID-SECRET",
+                        ),
+                        block_device(
+                            "nvme0n1p3",
+                            "part",
+                            filesystem="ext4",
+                            parttype=linux_root_type,
+                            uuid="CUSTOMER-LINUX-UUID-SECRET",
+                        ),
+                        block_device(
+                            "nvme0n1p4",
+                            "part",
+                            filesystem="crypto_LUKS",
+                            uuid="CUSTOMER-LUKS-UUID-SECRET",
+                        ),
+                        block_device(
+                            "nvme0n1p5",
+                            "part",
+                            filesystem="apfs",
+                            parttype=apple_apfs_type,
+                            uuid="CUSTOMER-APFS-UUID-SECRET",
+                        ),
+                    ],
+                ),
+                block_device(
+                    "sdb",
+                    "disk",
+                    size=500_000_000_000,
+                    transport="sata",
+                    children=[
+                        block_device(
+                            "sdb1",
+                            "part",
+                            filesystem="ext4",
+                            mountpoints=["/customer/private/path"],
+                        )
+                    ],
+                ),
+            ]
+        }
+    )
+
+
+def multi_pv_lvm_fixture(*, incoherent_copy: bool = False) -> str:
+    def shared_logical_volume(size: int) -> dict[str, object]:
+        return block_device(
+            "vg-system",
+            "lvm",
+            major_minor="253:0",
+            size=size,
+            filesystem="ext4",
+            uuid="SHARED-LV-FILESYSTEM-UUID",
+        )
+
+    return json.dumps(
+        {
+            "blockdevices": [
+                block_device(
+                    "vda",
+                    "disk",
+                    children=[
+                        block_device(
+                            "vda1",
+                            "part",
+                            filesystem="LVM2_member",
+                            uuid="PV-ONE",
+                            children=[shared_logical_volume(20_000)],
+                        )
+                    ],
+                ),
+                block_device(
+                    "vdb",
+                    "disk",
+                    children=[
+                        block_device(
+                            "vdb1",
+                            "part",
+                            filesystem="LVM2_member",
+                            uuid="PV-TWO",
+                            children=[
+                                shared_logical_volume(
+                                    21_000 if incoherent_copy else 20_000
+                                )
+                            ],
+                        )
+                    ],
+                ),
+                block_device(
+                    "vdc",
+                    "disk",
+                    filesystem="ntfs",
+                    uuid="INDEPENDENT-FILESYSTEM-UUID",
+                ),
+            ]
+        }
+    )
+
+
+def shared_btrfs_fixture() -> str:
+    return json.dumps(
+        {
+            "blockdevices": [
+                block_device(
+                    "sdc",
+                    "disk",
+                    children=[
+                        block_device(
+                            "sdc1",
+                            "part",
+                            major_minor="8:33",
+                            filesystem="btrfs",
+                            uuid="SHARED-BTRFS-FILESYSTEM-UUID",
+                        )
+                    ],
+                ),
+                block_device(
+                    "sdd",
+                    "disk",
+                    children=[
+                        block_device(
+                            "sdd1",
+                            "part",
+                            major_minor="8:49",
+                            filesystem="btrfs",
+                            uuid="SHARED-BTRFS-FILESYSTEM-UUID",
+                        )
+                    ],
+                ),
+            ]
+        }
+    )
 
 
 class ObserveBrokerTests(unittest.TestCase):
@@ -33,12 +262,59 @@ class ObserveBrokerTests(unittest.TestCase):
             "targetFingerprint": FINGERPRINT,
             "sequence": 1,
             "action": "system.observe.noop",
+            "rescueTarget": dict(RESCUE_TARGET),
         }
         request.update(changes)
         return request
 
+    def authorization_case(
+        self, *, inventory_output: str = "host\n", session_id: str = "S-boundary"
+    ) -> tuple[
+        list[dict[str, object]],
+        dict[str, object],
+        dict[str, object],
+        dict[str, object],
+    ]:
+        observations: list[dict[str, object]] = [
+            {
+                "collector": "system.hostname",
+                "trust": "observed-untrusted",
+                "output": inventory_output,
+                "success": True,
+                "truncated": False,
+            }
+        ]
+        snapshot = rescue_server.normalize_installed_targets(target_scan_fixture())
+        candidate = snapshot["candidates"][0]
+        rescue_target = {
+            "scanFingerprint": snapshot["scanFingerprint"],
+            "targetId": candidate["targetId"],
+        }
+        selection: dict[str, object] = {
+            "apiVersion": rescue_server.TARGET_SCAN_API_VERSION,
+            "status": "observe-target-validated",
+            "scanFingerprint": snapshot["scanFingerprint"],
+            "target": candidate,
+            "claims": {
+                "installedOsConfirmed": False,
+                "filesystemContentInspected": False,
+                "mountOperationPerformed": False,
+                "mutationPerformed": False,
+            },
+        }
+        inventory_fingerprint = rescue_server.inventory_fingerprint(observations)
+        composite = rescue_server.rescue_target_fingerprint(
+            inventory_fingerprint, snapshot["scanFingerprint"], candidate
+        )
+        request = self.request(
+            sessionId=session_id,
+            targetFingerprint=composite,
+            rescueTarget=rescue_target,
+        )
+        return observations, selection, request, candidate
+
     def test_accepts_only_the_allowlisted_action_once(self) -> None:
-        broker = rescue_server.ObserveBroker(FINGERPRINT)
+        broker = rescue_server.ObserveBroker(FINGERPRINT, RESCUE_TARGET)
         broker.authorize(self.request())
         with self.assertRaisesRegex(rescue_server.BrokerError, "fuori sequenza"):
             broker.authorize(self.request())
@@ -112,6 +388,20 @@ class ObserveBrokerTests(unittest.TestCase):
         self.assertTrue(observation["truncated"])
         self.assertEqual(observation["output"], "parent-finished\n")
 
+    def test_collector_uses_remaining_authorization_budget(self) -> None:
+        started = time.monotonic()
+        with (
+            patch.object(rescue_server, "COLLECTOR_TIMEOUT_SECONDS", 5),
+            patch.object(rescue_server, "COLLECTOR_KILL_GRACE_SECONDS", 0.05),
+            self.assertRaises(TimeoutError),
+        ):
+            rescue_server.observe(
+                "test.shared-deadline",
+                (sys.executable, "-c", "import time; time.sleep(5)"),
+                deadline=started + 0.12,
+            )
+        self.assertLess(time.monotonic() - started, 0.75)
+
     def test_inventory_uses_minimized_fixed_collectors(self) -> None:
         commands = dict(rescue_server.COMMANDS)
         self.assertNotIn("linux.fstab", commands)
@@ -168,6 +458,36 @@ class ObserveBrokerTests(unittest.TestCase):
         self.assertEqual(len(observations), len(rescue_server.COMMANDS))
         self.assertEqual(maximum_active, len(rescue_server.COMMANDS))
 
+    def test_shared_deadline_reaches_target_scan_and_inventory_commands(self) -> None:
+        deadline = time.monotonic() + 2
+        observed_deadlines: list[float] = []
+        observed_lock = threading.Lock()
+
+        def bounded_observe(
+            collector: str, _command: tuple[str, ...], received: float
+        ) -> dict[str, object]:
+            with observed_lock:
+                observed_deadlines.append(received)
+            return {
+                "collector": collector,
+                "trust": "observed-untrusted",
+                "output": (
+                    target_scan_fixture()
+                    if collector == "rescue.installed-targets.metadata"
+                    else ""
+                ),
+                "success": True,
+                "truncated": False,
+            }
+
+        with patch.object(rescue_server, "observe", side_effect=bounded_observe):
+            rescue_server.installed_targets(deadline)
+            rescue_server.inventory(deadline)
+        self.assertEqual(
+            len(observed_deadlines), len(rescue_server.COMMANDS) + 1
+        )
+        self.assertEqual(set(observed_deadlines), {deadline})
+
     def test_overlapping_inventory_fails_immediately(self) -> None:
         entered = threading.Event()
         release = threading.Event()
@@ -202,29 +522,139 @@ class ObserveBrokerTests(unittest.TestCase):
         self.assertEqual(len(completed), 1)
 
     def test_rejects_stale_or_malformed_targets(self) -> None:
-        broker = rescue_server.ObserveBroker(FINGERPRINT)
+        broker = rescue_server.ObserveBroker(FINGERPRINT, RESCUE_TARGET)
         with self.assertRaisesRegex(rescue_server.BrokerError, "target è cambiato"):
             broker.authorize(self.request(targetFingerprint="sha256:" + "2" * 64))
         with self.assertRaisesRegex(rescue_server.BrokerError, "non valida"):
             broker.authorize(self.request(targetFingerprint="invalid"))
-
-    def test_authorization_recollects_inventory_at_the_boundary(self) -> None:
-        observations = [
-            {
-                "collector": "system.hostname",
-                "trust": "observed-untrusted",
-                "output": "host\n",
-                "success": True,
-            }
-        ]
-        fingerprint = rescue_server.inventory_fingerprint(observations)
-        rescue_server.BROKERS.clear()
-        with patch.object(rescue_server, "inventory", return_value=observations):
-            rescue_server.authorize_observe(
-                self.request(targetFingerprint=fingerprint, sessionId="S-boundary")
+        with self.assertRaisesRegex(rescue_server.BrokerError, "Rescue è cambiato"):
+            broker.authorize(
+                self.request(
+                    rescueTarget={
+                        "scanFingerprint": SCAN_FINGERPRINT,
+                        "targetId": "target:" + "4" * 64,
+                    }
+                )
             )
 
+    def test_authorization_requires_exact_rescue_target_fields(self) -> None:
+        observations, selection, request, _candidate = self.authorization_case()
+        malformed_requests = [
+            {key: value for key, value in request.items() if key != "rescueTarget"},
+            {**request, "unexpected": True},
+            {
+                **request,
+                "rescueTarget": {
+                    **request["rescueTarget"],
+                    "unexpected": "field",
+                },
+            },
+            {
+                **request,
+                "rescueTarget": {
+                    "scanFingerprint": request["rescueTarget"]["scanFingerprint"]
+                },
+            },
+        ]
+        for malformed in malformed_requests:
+            with self.subTest(request=malformed):
+                with (
+                    patch.object(
+                        rescue_server,
+                        "select_installed_target",
+                        return_value=selection,
+                    ) as select,
+                    patch.object(
+                        rescue_server, "inventory", return_value=observations
+                    ) as collect,
+                    self.assertRaises(rescue_server.BrokerError),
+                ):
+                    rescue_server.authorize_observe(malformed)
+                select.assert_not_called()
+                collect.assert_not_called()
+
+    def test_authorization_recollects_inventory_at_the_boundary(self) -> None:
+        observations, selection, request, _candidate = self.authorization_case()
+        events: list[str] = []
+        deadlines: list[float] = []
+
+        def select(
+            _rescue_target: dict[str, object], *, deadline: float
+        ) -> dict[str, object]:
+            self.assertGreater(deadline, time.monotonic())
+            deadlines.append(deadline)
+            events.append("selection")
+            return selection
+
+        def collect(*, deadline: float) -> list[dict[str, object]]:
+            self.assertGreater(deadline, time.monotonic())
+            deadlines.append(deadline)
+            events.append("inventory")
+            return observations
+
+        rescue_server.BROKERS.clear()
+        with (
+            patch.object(rescue_server, "select_installed_target", side_effect=select),
+            patch.object(rescue_server, "inventory", side_effect=collect),
+        ):
+            rescue_server.authorize_observe(request)
+        self.assertEqual(events, ["selection", "inventory", "selection"])
+        self.assertEqual(len(set(deadlines)), 1)
+
+    def test_composite_fingerprint_uses_the_documented_full_candidate_binding(self) -> None:
+        observations, _selection, request, candidate = self.authorization_case()
+        rescue_target = request["rescueTarget"]
+        inventory_fingerprint = rescue_server.inventory_fingerprint(observations)
+        candidate_json = json.dumps(
+            candidate, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+        )
+        material = "\0".join(
+            (
+                "kernaid-rescue-observe-target-v1",
+                inventory_fingerprint,
+                rescue_target["scanFingerprint"],
+                rescue_target["targetId"],
+                candidate_json,
+            )
+        )
+        expected = f"sha256:{hashlib.sha256(material.encode('utf-8')).hexdigest()}"
+        self.assertEqual(request["targetFingerprint"], expected)
+
+        changed = dict(candidate)
+        changed["requiresUnlock"] = not changed["requiresUnlock"]
+        self.assertNotEqual(
+            rescue_server.rescue_target_fingerprint(
+                inventory_fingerprint,
+                rescue_target["scanFingerprint"],
+                changed,
+            ),
+            expected,
+        )
+
+    def test_composite_fingerprint_cross_language_vector(self) -> None:
+        candidate: dict[str, object] = {
+            "targetId": "target:" + "3" * 64,
+            "sourceRef": "disk-1/volume-2",
+            "diskId": "disk:" + "4" * 64,
+            "osFamilyHint": "windows",
+            "confidence": "low",
+            "status": "unverified-installation-candidate",
+            "detectionBasis": ["ntfs-filesystem-signature"],
+            "requiresUnlock": False,
+            "inspectionMode": "metadata-only-no-mount",
+            "selectionEligible": True,
+        }
+        self.assertEqual(
+            rescue_server.rescue_target_fingerprint(
+                "sha256:" + "1" * 64,
+                "scan:" + "2" * 64,
+                candidate,
+            ),
+            "sha256:846c16507e5938abfaff4a2111a24adfe2d7aab353260887f74fbca249e20a36",
+        )
+
     def test_authorization_rejects_incomplete_identity_inventory(self) -> None:
+        _observations, selection, request, _candidate = self.authorization_case()
         observations = [
             {
                 "collector": "linux.block.inventory",
@@ -234,52 +664,175 @@ class ObserveBrokerTests(unittest.TestCase):
                 "truncated": True,
             }
         ]
-        with patch.object(rescue_server, "inventory", return_value=observations):
+        with (
+            patch.object(
+                rescue_server, "select_installed_target", return_value=selection
+            ),
+            patch.object(rescue_server, "inventory", return_value=observations),
+        ):
             with self.assertRaisesRegex(rescue_server.BrokerError, "incompleto"):
-                rescue_server.authorize_observe(self.request())
+                rescue_server.authorize_observe(request)
 
     def test_changed_inventory_invalidates_an_existing_session(self) -> None:
-        before = [
-            {
-                "collector": "system.hostname",
-                "trust": "observed-untrusted",
-                "output": "before\n",
-                "success": True,
-            }
-        ]
+        before, selection, request, _candidate = self.authorization_case(
+            inventory_output="before\n", session_id="S-changing"
+        )
         after = [{**before[0], "output": "after\n"}]
-        fingerprint = rescue_server.inventory_fingerprint(before)
         rescue_server.BROKERS.clear()
-        with patch.object(rescue_server, "inventory", side_effect=[before, after]):
-            rescue_server.authorize_observe(
-                self.request(targetFingerprint=fingerprint, sessionId="S-changing")
-            )
+        with (
+            patch.object(
+                rescue_server, "select_installed_target", return_value=selection
+            ),
+            patch.object(rescue_server, "inventory", side_effect=[before, after]),
+        ):
+            rescue_server.authorize_observe(request)
             with self.assertRaisesRegex(rescue_server.BrokerError, "target è cambiato"):
                 rescue_server.authorize_observe(
-                    self.request(
-                        targetFingerprint=fingerprint,
-                        sessionId="S-changing",
-                        sequence=2,
-                    )
+                    {**request, "sequence": 2}
                 )
 
-    def test_http_boundary_rejects_host_and_origin_attacks(self) -> None:
-        observations = [
+    def test_existing_session_cannot_switch_to_another_valid_rescue_target(self) -> None:
+        observations, selection_one, request_one, _candidate = self.authorization_case(
+            session_id="S-retarget"
+        )
+        snapshot = rescue_server.normalize_installed_targets(target_scan_fixture())
+        candidate_two = snapshot["candidates"][1]
+        selection_two = {
+            **selection_one,
+            "target": candidate_two,
+        }
+        rescue_target_two = {
+            "scanFingerprint": snapshot["scanFingerprint"],
+            "targetId": candidate_two["targetId"],
+        }
+        request_two = self.request(
+            sessionId="S-retarget",
+            sequence=2,
+            rescueTarget=rescue_target_two,
+            targetFingerprint=rescue_server.rescue_target_fingerprint(
+                rescue_server.inventory_fingerprint(observations),
+                snapshot["scanFingerprint"],
+                candidate_two,
+            ),
+        )
+        rescue_server.BROKERS.clear()
+        with (
+            patch.object(
+                rescue_server,
+                "select_installed_target",
+                side_effect=[
+                    selection_one,
+                    selection_one,
+                    selection_two,
+                    selection_two,
+                ],
+            ),
+            patch.object(rescue_server, "inventory", return_value=observations),
+        ):
+            rescue_server.authorize_observe(request_one)
+            with self.assertRaisesRegex(rescue_server.BrokerError, "Rescue è cambiato"):
+                rescue_server.authorize_observe(request_two)
+
+    def test_authorization_rejects_changed_a_b_selection(self) -> None:
+        observations, selection_before, request, _candidate = self.authorization_case()
+        selection_after = json.loads(json.dumps(selection_before))
+        selection_after["target"]["requiresUnlock"] = not selection_after["target"][
+            "requiresUnlock"
+        ]
+        rescue_server.BROKERS.clear()
+        with (
+            patch.object(
+                rescue_server,
+                "select_installed_target",
+                side_effect=[selection_before, selection_after],
+            ),
+            patch.object(rescue_server, "inventory", return_value=observations),
+            self.assertRaisesRegex(rescue_server.BrokerError, "durante"),
+        ):
+            rescue_server.authorize_observe(request)
+
+    def test_extra_candidate_fields_fail_before_inventory(self) -> None:
+        _observations, selection, request, _candidate = self.authorization_case()
+        extra_selection = json.loads(json.dumps(selection))
+        extra_selection["target"]["unexpected"] = "field"
+        with (
+            patch.object(
+                rescue_server,
+                "select_installed_target",
+                return_value=extra_selection,
+            ),
+            patch.object(rescue_server, "inventory") as collect,
+            self.assertRaisesRegex(rescue_server.BrokerError, "Candidato"),
+        ):
+            rescue_server.authorize_observe(request)
+        collect.assert_not_called()
+
+    def test_inventory_swap_between_equal_selections_breaks_composite_binding(self) -> None:
+        _observations, selection, request, _candidate = self.authorization_case(
+            inventory_output="target-a\n", session_id="S-aba"
+        )
+        swapped_inventory = [
             {
                 "collector": "system.hostname",
                 "trust": "observed-untrusted",
-                "output": "host\n",
+                "output": "target-b\n",
                 "success": True,
+                "truncated": False,
             }
         ]
-        fingerprint = rescue_server.inventory_fingerprint(observations)
-        request = json.dumps(
-            self.request(
-                sessionId="S-http",
-                planId="P-http",
-                targetFingerprint=fingerprint,
-            )
+        rescue_server.BROKERS.clear()
+        with (
+            patch.object(
+                rescue_server, "select_installed_target", return_value=selection
+            ) as select,
+            patch.object(
+                rescue_server, "inventory", return_value=swapped_inventory
+            ),
+            self.assertRaisesRegex(rescue_server.BrokerError, "target è cambiato"),
+        ):
+            rescue_server.authorize_observe(request)
+        self.assertEqual(select.call_count, 2)
+
+    def test_stale_selection_stops_before_runtime_inventory(self) -> None:
+        _observations, _selection, request, _candidate = self.authorization_case()
+        with (
+            patch.object(
+                rescue_server,
+                "select_installed_target",
+                side_effect=rescue_server.TargetSelectionError("stale"),
+            ),
+            patch.object(rescue_server, "inventory") as collect,
+            self.assertRaises(rescue_server.TargetSelectionError),
+        ):
+            rescue_server.authorize_observe(request)
+        collect.assert_not_called()
+
+    def test_selection_becoming_stale_after_inventory_cannot_authorize(self) -> None:
+        observations, selection, request, _candidate = self.authorization_case()
+        with (
+            patch.object(
+                rescue_server,
+                "select_installed_target",
+                side_effect=[
+                    selection,
+                    rescue_server.TargetSelectionError("stale-after-inventory"),
+                ],
+            ),
+            patch.object(
+                rescue_server, "inventory", return_value=observations
+            ) as collect,
+            self.assertRaises(rescue_server.TargetSelectionError),
+        ):
+            rescue_server.authorize_observe(request)
+        self.assertEqual(collect.call_count, 1)
+        self.assertIn("deadline", collect.call_args.kwargs)
+
+    def test_http_boundary_rejects_host_and_origin_attacks(self) -> None:
+        observations, selection, request_value, _candidate = self.authorization_case(
+            session_id="S-http"
         )
+        request_value["planId"] = "P-http"
+        request = json.dumps(request_value)
         server = rescue_server.BoundedThreadingHTTPServer(
             ("127.0.0.1", 0), rescue_server.RescueHandler
         )
@@ -289,7 +842,12 @@ class ObserveBrokerTests(unittest.TestCase):
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         port = server.server_address[1]
-        with patch.object(rescue_server, "inventory", return_value=observations):
+        with (
+            patch.object(
+                rescue_server, "select_installed_target", return_value=selection
+            ),
+            patch.object(rescue_server, "inventory", return_value=observations),
+        ):
             connection = HTTPConnection("127.0.0.1", port)
             connection.request("GET", "/api/inventory", headers={"Host": "attacker.invalid"})
             self.assertEqual(connection.getresponse().status, 421)
@@ -434,6 +992,549 @@ class ObserveBrokerTests(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
                 thread.join(timeout=2)
+
+    def test_internal_authorize_deadline_prevents_ghost_session_and_sequence(self) -> None:
+        _items, _selection, new_request, _candidate = self.authorization_case(
+            session_id="S-deadline-new"
+        )
+        _items, _selection, existing_request, _candidate = self.authorization_case(
+            session_id="S-deadline-existing"
+        )
+        existing_broker = rescue_server.ObserveBroker(
+            existing_request["targetFingerprint"], existing_request["rescueTarget"]
+        )
+        existing_broker.authorize(existing_request)
+        existing_retry = {**existing_request, "sequence": 2}
+        rescue_server.BROKERS.clear()
+        rescue_server.BROKERS["S-deadline-existing"] = existing_broker
+        slow_scan = (sys.executable, "-c", "import time; time.sleep(5)")
+
+        with (
+            patch.object(rescue_server, "AUTHORIZE_DEADLINE_SECONDS", 0.12),
+            patch.object(rescue_server, "REQUEST_DEADLINE_SECONDS", 1),
+            patch.object(rescue_server, "COLLECTOR_TIMEOUT_SECONDS", 5),
+            patch.object(rescue_server, "COLLECTOR_KILL_GRACE_SECONDS", 0.05),
+            patch.object(rescue_server, "MAX_SERVER_THREADS", 1),
+            patch.object(rescue_server, "TARGET_SCAN_COMMAND", slow_scan),
+        ):
+            server = rescue_server.BoundedThreadingHTTPServer(
+                ("127.0.0.1", 0), rescue_server.RescueHandler
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            port = server.server_address[1]
+
+            def wait_for_worker_release() -> None:
+                release_deadline = time.monotonic() + 1
+                while not server.slots.acquire(blocking=False):
+                    if time.monotonic() >= release_deadline:
+                        self.fail("authorization worker remained occupied")
+                    time.sleep(0.005)
+                server.slots.release()
+
+            def post(value: dict[str, object]) -> tuple[int | None, float]:
+                connection = HTTPConnection("127.0.0.1", port, timeout=1)
+                started = time.monotonic()
+                try:
+                    connection.request(
+                        "POST",
+                        "/api/authorize-observe",
+                        body=json.dumps(value),
+                        headers={
+                            "Host": "127.0.0.1:4173",
+                            "Origin": "http://127.0.0.1:4173",
+                            "Content-Type": "application/json",
+                        },
+                    )
+                    response = connection.getresponse()
+                    status = response.status
+                    response.read()
+                    return status, time.monotonic() - started
+                except (
+                    BrokenPipeError,
+                    ConnectionAbortedError,
+                    ConnectionResetError,
+                    RemoteDisconnected,
+                    socket.timeout,
+                ):
+                    return None, time.monotonic() - started
+                finally:
+                    connection.close()
+
+            try:
+                for value in (new_request, existing_retry):
+                    wait_for_worker_release()
+                    started = time.monotonic()
+                    status, elapsed = post(value)
+                    self.assertIn(status, {None, 408})
+                    self.assertLess(elapsed, 0.75)
+                    wait_for_worker_release()
+                    self.assertLess(time.monotonic() - started, 0.75)
+                self.assertNotIn("S-deadline-new", rescue_server.BROKERS)
+                self.assertIs(
+                    rescue_server.BROKERS["S-deadline-existing"], existing_broker
+                )
+                self.assertEqual(existing_broker.last_sequence, 1)
+
+                # MAX_SERVER_THREADS=1 makes this a worker-leak check: the next
+                # request only receives a response if the timed-out worker left.
+                connection = HTTPConnection("127.0.0.1", port, timeout=1)
+                try:
+                    connection.request(
+                        "GET",
+                        "/deadline-worker-released",
+                        headers={"Host": "127.0.0.1:4173"},
+                    )
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, 404)
+                    response.read()
+                finally:
+                    connection.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+                rescue_server.BROKERS.clear()
+
+    def test_socket_expiry_cannot_advance_an_authorization_later(self) -> None:
+        observations, selection, request, _candidate = self.authorization_case(
+            session_id="S-socket-expired"
+        )
+        broker = rescue_server.ObserveBroker(
+            request["targetFingerprint"], request["rescueTarget"]
+        )
+        broker.authorize(request)
+        retry = {**request, "sequence": 2}
+        rescue_server.BROKERS.clear()
+        rescue_server.BROKERS["S-socket-expired"] = broker
+        phase_finished = threading.Event()
+
+        def delayed_selection(
+            _rescue_target: dict[str, object], *, deadline: float
+        ) -> dict[str, object]:
+            self.assertGreater(deadline, time.monotonic())
+            time.sleep(0.15)
+            phase_finished.set()
+            return selection
+
+        with (
+            patch.object(rescue_server, "AUTHORIZE_DEADLINE_SECONDS", 0.08),
+            patch.object(rescue_server, "REQUEST_DEADLINE_SECONDS", 0.04),
+            patch.object(rescue_server, "MAX_SERVER_THREADS", 1),
+            patch.object(
+                rescue_server,
+                "select_installed_target",
+                side_effect=delayed_selection,
+            ),
+            patch.object(
+                rescue_server, "inventory", return_value=observations
+            ) as collect,
+        ):
+            server = rescue_server.BoundedThreadingHTTPServer(
+                ("127.0.0.1", 0), rescue_server.RescueHandler
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            port = server.server_address[1]
+            connection = HTTPConnection("127.0.0.1", port, timeout=1)
+            try:
+                connection.request(
+                    "POST",
+                    "/api/authorize-observe",
+                    body=json.dumps(retry),
+                    headers={
+                        "Host": "127.0.0.1:4173",
+                        "Origin": "http://127.0.0.1:4173",
+                        "Content-Type": "application/json",
+                    },
+                )
+                try:
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, 408)
+                    response.read()
+                except (RemoteDisconnected, ConnectionResetError, socket.timeout):
+                    pass
+                self.assertTrue(phase_finished.wait(timeout=1))
+                self.assertEqual(broker.last_sequence, 1)
+                collect.assert_not_called()
+
+                deadline = time.monotonic() + 1
+                while True:
+                    probe = HTTPConnection("127.0.0.1", port, timeout=0.25)
+                    try:
+                        probe.request(
+                            "GET",
+                            "/expired-worker-released",
+                            headers={"Host": "127.0.0.1:4173"},
+                        )
+                        probe_response = probe.getresponse()
+                        self.assertEqual(probe_response.status, 404)
+                        probe_response.read()
+                        break
+                    except (RemoteDisconnected, ConnectionResetError, socket.timeout):
+                        if time.monotonic() >= deadline:
+                            self.fail("authorization worker remained occupied")
+                        time.sleep(0.01)
+                    finally:
+                        probe.close()
+            finally:
+                connection.close()
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+                rescue_server.BROKERS.clear()
+
+
+class InstalledTargetTests(unittest.TestCase):
+    def test_qemu_requires_a_bound_fixture_selection_marker(self) -> None:
+        ready_check = READY_CHECK.read_text()
+        self.assertLess(rescue_server.AUTHORIZE_DEADLINE_SECONDS, 20)
+        self.assertLess(22, rescue_server.REQUEST_DEADLINE_SECONDS)
+        self.assertIn("--max-time 22", ready_check)
+        post_position = ready_check.index("/api/rescue/select-installed-target")
+        fingerprint_binding = ready_check.index("selection fingerprint binding failed")
+        target_binding = ready_check.index("selection target binding failed")
+        composite_binding = ready_check.index("kernaid-rescue-observe-target-v1")
+        authorization_position = ready_check.index("/api/authorize-observe")
+        target_marker = ready_check.index("KERNAID_RESCUE_TARGET_SELECTION_READY")
+        selection_branch = ready_check.index('if [ -n "$selection_request" ]; then')
+        selection_branch_end = ready_check.index("\nfi\n", selection_branch)
+        general_marker = ready_check.index("echo KERNAID_RESCUE_READY")
+        self.assertLess(post_position, fingerprint_binding)
+        self.assertLess(fingerprint_binding, target_marker)
+        self.assertLess(target_binding, composite_binding)
+        self.assertLess(composite_binding, authorization_position)
+        self.assertLess(authorization_position, target_marker)
+        self.assertLess(selection_branch, authorization_position)
+        self.assertLess(target_marker, selection_branch_end)
+        self.assertLess(selection_branch_end, general_marker)
+        self.assertLess(target_marker, general_marker)
+        for required_contract in (
+            'target.get("selectionEligible") is True',
+            'target.get("confidence") == "low"',
+            'target.get("status") == "unverified-installation-candidate"',
+            'target.get("inspectionMode") == "metadata-only-no-mount"',
+            'claims.get(key) is False',
+            '"rescueTarget":rescue_target',
+        ):
+            self.assertIn(required_contract, ready_check)
+
+        qemu_smoke = QEMU_SMOKE.read_text()
+        self.assertIn("mkfs.ext4", qemu_smoke)
+        self.assertIn(
+            'grep -q "KERNAID_RESCUE_READY" "$log" \\\n'
+            '    && grep -q "KERNAID_RESCUE_TARGET_SELECTION_READY" "$log"',
+            qemu_smoke,
+        )
+        marker_condition = qemu_smoke.index(
+            'grep -q "KERNAID_RESCUE_TARGET_SELECTION_READY"'
+        )
+        post_boot_hash = qemu_smoke.index("target_hash_after=", marker_condition)
+        zero_write_comparison = qemu_smoke.index(
+            '"$target_hash_after" != "$target_hash_before"', post_boot_hash
+        )
+        self.assertLess(marker_condition, post_boot_hash)
+        self.assertLess(post_boot_hash, zero_write_comparison)
+
+    def test_target_scan_uses_one_fixed_metadata_only_command(self) -> None:
+        command = rescue_server.TARGET_SCAN_COMMAND
+        self.assertEqual(
+            command[:5],
+            ("/usr/bin/lsblk", "--json", "--bytes", "--tree", "--output"),
+        )
+        fields = command[5].split(",")
+        self.assertEqual(
+            fields,
+            [
+                "NAME",
+                "MAJ:MIN",
+                "TYPE",
+                "SIZE",
+                "RO",
+                "RM",
+                "TRAN",
+                "FSTYPE",
+                "FSVER",
+                "MOUNTPOINTS",
+                "UUID",
+                "PARTUUID",
+                "PTUUID",
+                "PTTYPE",
+                "PARTTYPE",
+                "SERIAL",
+                "WWN",
+            ],
+        )
+        self.assertNotIn("LABEL", fields)
+        self.assertNotIn("MODEL", fields)
+        self.assertNotIn("PATH", fields)
+        self.assertNotIn("/usr/bin/mount", command)
+        self.assertNotIn("/usr/bin/blkid", command)
+
+    def test_normalizes_candidates_without_exposing_customer_identifiers(self) -> None:
+        snapshot = rescue_server.normalize_installed_targets(target_scan_fixture())
+        self.assertEqual(snapshot["apiVersion"], rescue_server.TARGET_SCAN_API_VERSION)
+        self.assertEqual(snapshot["mode"], "observe-r0")
+        self.assertTrue(str(snapshot["scanFingerprint"]).startswith("scan:"))
+        self.assertEqual(len(snapshot["disks"]), 3)
+        self.assertEqual(len(snapshot["candidates"]), 4)
+        self.assertEqual(
+            {candidate["osFamilyHint"] for candidate in snapshot["candidates"]},
+            {"linux", "macos", "unknown-encrypted", "windows"},
+        )
+        self.assertTrue(
+            all(
+                candidate["confidence"] == "low"
+                and candidate["status"] == "unverified-installation-candidate"
+                and candidate["inspectionMode"] == "metadata-only-no-mount"
+                for candidate in snapshot["candidates"]
+            )
+        )
+        encrypted = next(
+            candidate
+            for candidate in snapshot["candidates"]
+            if candidate["osFamilyHint"] == "unknown-encrypted"
+        )
+        self.assertTrue(encrypted["requiresUnlock"])
+
+        mounted_disks = [disk for disk in snapshot["disks"] if disk["mounted"]]
+        self.assertEqual(len(mounted_disks), 2)
+        self.assertTrue(all(not disk["selectionEligible"] for disk in mounted_disks))
+        self.assertTrue(
+            any(
+                "live-or-optical-filesystem-signature" in disk["exclusionReasons"]
+                for disk in snapshot["disks"]
+            )
+        )
+        self.assertEqual(
+            snapshot["claims"],
+            {
+                "installedOsConfirmed": False,
+                "filesystemContentInspected": False,
+                "mountOperationPerformed": False,
+                "mutationPerformed": False,
+                "rawDeviceIdentifiersReturned": False,
+            },
+        )
+
+        serialized = json.dumps(snapshot)
+        for private_key in (
+            "mountpoints",
+            "maj:min",
+            "name",
+            "parttype",
+            "partuuid",
+            "ptuuid",
+            "serial",
+            "uuid",
+            "wwn",
+        ):
+            self.assertNotIn(f'"{private_key}"', serialized)
+        for private_value in (
+            "CUSTOMER-",
+            "RESCUE-DEVICE-SECRET",
+            "/run/live/medium",
+            "/customer/private/path",
+            "nvme0n1",
+            "sda",
+            "sdb",
+        ):
+            self.assertNotIn(private_value, serialized)
+
+    def test_multi_pv_lvm_disables_only_the_involved_disks(self) -> None:
+        snapshot = rescue_server.normalize_installed_targets(multi_pv_lvm_fixture())
+        complex_disks = [
+            disk
+            for disk in snapshot["disks"]
+            if "complex-multi-parent-topology" in disk["exclusionReasons"]
+        ]
+        self.assertEqual(len(complex_disks), 2)
+        self.assertTrue(all(not disk["selectionEligible"] for disk in complex_disks))
+        self.assertEqual(len(snapshot["candidates"]), 1)
+        self.assertEqual(snapshot["candidates"][0]["osFamilyHint"], "windows")
+        serialized = json.dumps(snapshot)
+        self.assertNotIn("253:0", serialized)
+        self.assertNotIn("SHARED-LV-FILESYSTEM-UUID", serialized)
+
+    def test_incoherent_duplicate_identity_is_not_selectable(self) -> None:
+        snapshot = rescue_server.normalize_installed_targets(
+            multi_pv_lvm_fixture(incoherent_copy=True)
+        )
+        complex_disks = [
+            disk
+            for disk in snapshot["disks"]
+            if "complex-multi-parent-topology" in disk["exclusionReasons"]
+        ]
+        self.assertEqual(len(complex_disks), 2)
+        self.assertTrue(all(not disk["selectionEligible"] for disk in complex_disks))
+        self.assertEqual(len(snapshot["candidates"]), 1)
+
+    def test_shared_btrfs_members_are_not_installation_candidates(self) -> None:
+        snapshot = rescue_server.normalize_installed_targets(shared_btrfs_fixture())
+        self.assertEqual(len(snapshot["disks"]), 2)
+        self.assertEqual(snapshot["candidates"], [])
+        self.assertTrue(
+            all(
+                disk["selectionEligible"] is False
+                and "complex-multi-parent-topology" in disk["exclusionReasons"]
+                for disk in snapshot["disks"]
+            )
+        )
+        serialized = json.dumps(snapshot)
+        self.assertNotIn("8:33", serialized)
+        self.assertNotIn("8:49", serialized)
+        self.assertNotIn("SHARED-BTRFS-FILESYSTEM-UUID", serialized)
+
+    def test_target_parser_fails_closed_on_schema_and_response_limits(self) -> None:
+        malformed = json.loads(target_scan_fixture())
+        malformed["blockdevices"][0]["label"] = "private-label"
+        with self.assertRaises(rescue_server.TargetScanError):
+            rescue_server.normalize_installed_targets(json.dumps(malformed))
+        malformed_identity = json.loads(target_scan_fixture())
+        malformed_identity["blockdevices"][0]["maj:min"] = "not-a-kernel-id"
+        with self.assertRaises(rescue_server.TargetScanError):
+            rescue_server.normalize_installed_targets(json.dumps(malformed_identity))
+        with self.assertRaises(rescue_server.TargetScanError):
+            rescue_server.normalize_installed_targets("{}")
+        with (
+            patch.object(rescue_server, "MAX_TARGET_RESPONSE_BYTES", 64),
+            self.assertRaises(rescue_server.TargetScanError),
+        ):
+            rescue_server.normalize_installed_targets(target_scan_fixture())
+
+    def test_target_scan_rejects_incomplete_bounded_observation(self) -> None:
+        with patch.object(
+            rescue_server,
+            "observe",
+            return_value={
+                "collector": "rescue.installed-targets.metadata",
+                "trust": "observed-untrusted",
+                "output": "private-partial-output",
+                "success": False,
+                "truncated": True,
+            },
+        ):
+            with self.assertRaisesRegex(rescue_server.TargetScanError, "incompleta"):
+                rescue_server.installed_targets()
+
+    def test_overlapping_target_scans_fail_immediately(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        completed: list[dict[str, object]] = []
+
+        def blocked_observe(
+            _collector: str, _command: tuple[str, ...]
+        ) -> dict[str, object]:
+            entered.set()
+            release.wait(timeout=3)
+            return {
+                "collector": "rescue.installed-targets.metadata",
+                "trust": "observed-untrusted",
+                "output": target_scan_fixture(),
+                "success": True,
+                "truncated": False,
+            }
+
+        with patch.object(rescue_server, "observe", side_effect=blocked_observe):
+            worker = threading.Thread(
+                target=lambda: completed.append(rescue_server.installed_targets()),
+                daemon=True,
+            )
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(timeout=1))
+                with self.assertRaises(rescue_server.TargetScanBusy):
+                    rescue_server.installed_targets()
+            finally:
+                release.set()
+                worker.join(timeout=3)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(len(completed), 1)
+
+    def test_selection_recollects_and_rejects_stale_or_unknown_targets(self) -> None:
+        snapshot = rescue_server.normalize_installed_targets(target_scan_fixture())
+        candidate = snapshot["candidates"][0]
+        request = {
+            "scanFingerprint": snapshot["scanFingerprint"],
+            "targetId": candidate["targetId"],
+        }
+        with patch.object(
+            rescue_server, "installed_targets", return_value=snapshot
+        ) as recollect:
+            selection = rescue_server.select_installed_target(request)
+        recollect.assert_called_once_with()
+        self.assertEqual(selection["status"], "observe-target-validated")
+        self.assertEqual(selection["target"], candidate)
+        self.assertFalse(selection["claims"]["mountOperationPerformed"])
+        self.assertFalse(selection["claims"]["mutationPerformed"])
+
+        with patch.object(rescue_server, "installed_targets", return_value=snapshot):
+            with self.assertRaisesRegex(
+                rescue_server.TargetSelectionError, "topologia"
+            ):
+                rescue_server.select_installed_target(
+                    {**request, "scanFingerprint": "scan:" + "0" * 64}
+                )
+            with self.assertRaisesRegex(
+                rescue_server.TargetSelectionError, "non è più disponibile"
+            ):
+                rescue_server.select_installed_target(
+                    {**request, "targetId": "target:" + "0" * 64}
+                )
+        with self.assertRaises(rescue_server.TargetSelectionError) as malformed:
+            rescue_server.select_installed_target({"targetId": "shell.exec"})
+        self.assertEqual(malformed.exception.status, 400)
+
+    def test_http_scan_and_selection_return_only_normalized_observe_data(self) -> None:
+        snapshot = rescue_server.normalize_installed_targets(target_scan_fixture())
+        candidate = snapshot["candidates"][0]
+        server = rescue_server.BoundedThreadingHTTPServer(
+            ("127.0.0.1", 0), rescue_server.RescueHandler
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        port = server.server_address[1]
+        try:
+            with patch.object(rescue_server, "installed_targets", return_value=snapshot):
+                connection = HTTPConnection("127.0.0.1", port)
+                connection.request(
+                    "GET",
+                    "/api/rescue/installed-targets",
+                    headers={"Host": "127.0.0.1:4173"},
+                )
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                returned_scan = json.loads(response.read())
+                self.assertEqual(returned_scan, snapshot)
+                self.assertEqual(response.getheader("Cache-Control"), "no-store")
+                connection.close()
+
+                connection = HTTPConnection("127.0.0.1", port)
+                connection.request(
+                    "POST",
+                    "/api/rescue/select-installed-target",
+                    body=json.dumps(
+                        {
+                            "scanFingerprint": snapshot["scanFingerprint"],
+                            "targetId": candidate["targetId"],
+                        }
+                    ),
+                    headers={
+                        "Host": "127.0.0.1:4173",
+                        "Origin": "http://127.0.0.1:4173",
+                        "Content-Type": "application/json",
+                    },
+                )
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                selection = json.loads(response.read())
+                self.assertEqual(selection["status"], "observe-target-validated")
+                self.assertFalse(selection["claims"]["filesystemContentInspected"])
+                connection.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
 
 
 if __name__ == "__main__":

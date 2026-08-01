@@ -22,6 +22,7 @@ truncate -s 128M "$target_image"
 mkfs.ext4 -q -F -L KERNAID_TARGET -d "$target_seed_dir" "$target_image"
 target_hash_before="$(sha256sum "$target_image" | awk '{print $1}')"
 qemu_pid=""
+# shellcheck disable=SC2329  # Invoked indirectly by the EXIT trap below.
 cleanup() {
   if [[ -n "$qemu_pid" ]]; then kill "$qemu_pid" 2>/dev/null || true; fi
   if [[ "$temporary_log" == "1" ]]; then rm -f "$log"; fi
@@ -46,7 +47,8 @@ fi
 qemu-system-x86_64 "${qemu_args[@]}" >"$log" 2>&1 &
 qemu_pid=$!
 for _attempt in $(seq 1 240); do
-  if grep -q "KERNAID_RESCUE_READY" "$log"; then
+  if grep -q "KERNAID_RESCUE_READY" "$log" \
+    && grep -q "KERNAID_RESCUE_TARGET_SELECTION_READY" "$log"; then
     kill "$qemu_pid" 2>/dev/null || true
     wait "$qemu_pid" 2>/dev/null || true
     qemu_pid=""
@@ -63,7 +65,7 @@ for _attempt in $(seq 1 240); do
     printf '%s\n' \
       "KERNAID_QEMU_ATTESTATION_V1 firmware=$firmware iso_sha256=$iso_hash_after target_before_sha256=$target_hash_before target_after_sha256=$target_hash_after ready=true" \
       | tee -a "$log"
-    echo "PASS: KernAid Rescue booted with $firmware firmware and made zero target-image writes"
+    echo "PASS: KernAid Rescue booted with $firmware firmware, validated the fixture target selection, and made zero target-image writes"
     exit 0
   fi
   if ! kill -0 "$qemu_pid" 2>/dev/null; then
@@ -73,11 +75,11 @@ for _attempt in $(seq 1 240); do
     set -e
     qemu_pid=""
     cat "$log"
-    echo "QEMU exited before the Rescue readiness marker (status $status)" >&2
+    echo "QEMU exited before both Rescue readiness markers (status $status)" >&2
     exit 1
   fi
   sleep 1
 done
 tail -n 200 "$log"
-echo "Rescue readiness marker not observed within 240 seconds" >&2
+echo "The required Rescue readiness markers were not both observed within 240 seconds" >&2
 exit 1
