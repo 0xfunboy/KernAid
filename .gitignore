@@ -1,6 +1,7 @@
 /target/
 **/node_modules/
 **/dist/
+apps/desk/src-tauri/gen/schemas/
 **/__pycache__/
 *.pyc
 *.log

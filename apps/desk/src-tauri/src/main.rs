@@ -1,7 +1,13 @@
 #![forbid(unsafe_code)]
 
+mod secure_runtime;
+
 use kernaid_broker::{BrokerError, ObserveBroker};
 use kernaid_protocol::BrokerRequest;
+use secure_runtime::{
+    SecureRuntime, append_audit_record, initialize_device_identity, seal_signed_report,
+    secure_runtime_status,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -12,7 +18,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use tauri::State;
+use tauri::{Manager, State};
 
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_BROKER_SESSIONS: usize = 1_024;
@@ -299,9 +305,19 @@ fn authorize_observe_for_fingerprint(
 fn main() {
     tauri::Builder::default()
         .manage(ObserveBrokers::default())
+        .setup(|app| {
+            let app_data_directory = app.path().app_data_dir()?;
+            let runtime = SecureRuntime::open(&app_data_directory)?;
+            app.manage(runtime);
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             collect_local_inventory,
-            authorize_observe
+            authorize_observe,
+            secure_runtime_status,
+            initialize_device_identity,
+            append_audit_record,
+            seal_signed_report
         ])
         .run(tauri::generate_context!())
         .expect("failed to run KernAid Desk");
