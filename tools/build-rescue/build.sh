@@ -29,6 +29,7 @@ lb config \
   --architectures amd64 \
   --binary-images iso-hybrid \
   --archive-areas "main contrib non-free-firmware" \
+  --security false \
   --debian-installer none \
   --apt-recommends false \
   --bootappend-live "boot=live components username=kernaid hostname=kernaid-rescue console=tty0 console=ttyS0,115200n8"
