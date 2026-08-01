@@ -160,7 +160,7 @@ export class NativeAuditSink implements AuditSink {
   }
 }
 
-function parseSecureRuntimeStatus(value: unknown): SecureRuntimeStatus {
+export function parseSecureRuntimeStatus(value: unknown): SecureRuntimeStatus {
   const item = exactRecord(
     value,
     ["schemaVersion", "audit", "signing", "persistentAuditStarted", "deviceId"],
@@ -189,7 +189,7 @@ function parseSecureRuntimeStatus(value: unknown): SecureRuntimeStatus {
   return structuredClone(item) as unknown as SecureRuntimeStatus;
 }
 
-async function parseNativeSignedArtifact(
+export async function parseNativeSignedArtifact(
   value: unknown,
   request: AuditSealRequest,
 ): Promise<NativeSignedArtifact> {

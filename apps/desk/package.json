@@ -1,1 +1,34 @@
-{"name":"@kernaid/desk","version":"0.1.0","private":true,"type":"module","scripts":{"dev":"vite","tauri":"tauri","build":"tsc && vite build","format":"prettier --check .","lint":"eslint src","check":"tsc --noEmit","test":"echo 'desk: no DOM tests yet'"},"dependencies":{"@kernaid/agent-gateway":"workspace:*","@kernaid/schemas":"workspace:*","@kernaid/session-driver":"workspace:*","@tauri-apps/api":"^2.8.0","react":"^19.1.0","react-dom":"^19.1.0"},"devDependencies":{"@tauri-apps/cli":"^2.5.0","@types/react":"^19.1.2","@types/react-dom":"^19.1.2","@vitejs/plugin-react":"^4.4.1","eslint":"^9.25.0","prettier":"^3.5.3","typescript":"^5.8.3","vite":"^6.3.4"}}
+{
+  "name": "@kernaid/desk",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "tauri": "tauri",
+    "build": "tsc && vite build",
+    "format": "prettier --check .",
+    "lint": "eslint src test",
+    "check": "tsc --noEmit",
+    "test": "tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@kernaid/agent-gateway": "workspace:*",
+    "@kernaid/schemas": "workspace:*",
+    "@kernaid/session-driver": "workspace:*",
+    "@tauri-apps/api": "^2.8.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.5.0",
+    "@types/react": "^19.1.2",
+    "@types/react-dom": "^19.1.2",
+    "@vitejs/plugin-react": "^4.4.1",
+    "eslint": "^9.25.0",
+    "prettier": "^3.5.3",
+    "tsx": "^4.20.6",
+    "typescript": "^5.8.3",
+    "vite": "^6.3.4"
+  }
+}
