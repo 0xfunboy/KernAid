@@ -28,7 +28,6 @@ lb config \
   --distribution trixie \
   --architectures amd64 \
   --binary-images iso-hybrid \
-  --bootloaders "grub-efi,grub-pc" \
   --archive-areas "main contrib non-free-firmware" \
   --debian-installer none \
   --apt-recommends false \

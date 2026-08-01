@@ -6,6 +6,7 @@ grub-pc-bin
 grub-efi-amd64-bin
 xfce4
 xfce4-terminal
+xorg
 lightdm
 network-manager
 network-manager-gnome
