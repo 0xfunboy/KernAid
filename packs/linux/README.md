@@ -44,15 +44,18 @@ device/inode identity still matches the file created by this transaction.
 
 `diagnostics` is independent from the fixture repair transaction. It accepts
 only caller-supplied byte slices and cannot execute commands, open host files,
-or mutate state. The `linux-p0.1` corpus requires eight separately identified
+or mutate state. The `linux-p0.2` corpus requires nine separately identified
 evidence documents:
 
 - `lsblk --json` data with `name`, `type`, `uuid`, `ro`, `mountpoint(s)`, and
   optional nested `children`;
+- `findmnt --json --list --options ro --output TARGET,FSTYPE` data used to
+  distinguish the VFS mount state from a block device's hardware RO flag;
 - plain `systemctl --failed --no-legend --plain` rows;
 - `systemctl show`-style `key=value` unit/manager state, with blank lines
   between records;
-- `fstab` contents compared only with UUIDs from the bound `lsblk` evidence;
+- a normalized `fstab` projection containing only UUID and `nofail` state,
+  compared with UUIDs from the bound `lsblk` evidence;
 - C-locale, byte-valued `df` rows (`Filesystem ... Used Available Use% Mounted
   on`);
 - `ip -json link` data;

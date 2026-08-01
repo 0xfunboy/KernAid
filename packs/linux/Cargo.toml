@@ -12,3 +12,6 @@ sha2 = "0.10"
 [[bin]]
 name="kernaid-linux-inventory"
 path="src/main.rs"
+[[bin]]
+name="kernaid-linux-diagnose"
+path="src/bin/diagnose.rs"

@@ -10,11 +10,18 @@ use secure_runtime::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+#[cfg(target_os = "linux")]
+use std::fs::File;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::{
     collections::HashMap,
     io::Read,
-    process::{Command, Stdio},
-    sync::{Mutex, MutexGuard},
+    process::{Child, Command, Stdio},
+    sync::{
+        Mutex, MutexGuard,
+        mpsc::{self, Receiver},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -23,6 +30,9 @@ use tauri::{Manager, State};
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_BROKER_SESSIONS: usize = 1_024;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
+const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(unix)]
+const TERMINATION_GRACE: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -31,6 +41,7 @@ struct Observation {
     trust: &'static str,
     output: String,
     success: bool,
+    truncated: bool,
 }
 
 #[derive(Deserialize)]
@@ -43,48 +54,111 @@ struct ObserveRequest {
     action: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeDiagnosticEvidence {
+    id: String,
+    collector: String,
+    content: String,
+}
+
 #[derive(Default)]
 struct ObserveBrokers(Mutex<HashMap<String, ObserveBroker>>);
 
-fn bounded_utf8(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_OUTPUT_BYTES)]).into_owned()
+#[derive(Default)]
+struct BoundedRead {
+    bytes: Vec<u8>,
+    truncated: bool,
+    failed: bool,
 }
 
-fn read_bounded(mut reader: impl Read + Send + 'static) -> thread::JoinHandle<Vec<u8>> {
+fn read_bounded(mut reader: impl Read + Send + 'static) -> Receiver<BoundedRead> {
+    let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
         let mut retained = Vec::with_capacity(MAX_OUTPUT_BYTES);
         let mut buffer = [0_u8; 8 * 1024];
+        let mut truncated = false;
+        let mut failed = false;
         loop {
             let read = match reader.read(&mut buffer) {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break,
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
                 Ok(read) => read,
             };
             let remaining = MAX_OUTPUT_BYTES.saturating_sub(retained.len());
             retained.extend_from_slice(&buffer[..read.min(remaining)]);
+            truncated |= read > remaining;
         }
-        retained
-    })
+        let _ = sender.send(BoundedRead {
+            bytes: retained,
+            truncated,
+            failed,
+        });
+    });
+    receiver
 }
 
-fn joined_output(handle: Option<thread::JoinHandle<Vec<u8>>>) -> Vec<u8> {
-    match handle {
-        Some(handle) => handle.join().unwrap_or_default(),
-        None => Vec::new(),
+fn received_output(receiver: Option<Receiver<BoundedRead>>) -> BoundedRead {
+    match receiver {
+        Some(receiver) => receiver
+            .recv_timeout(PIPE_DRAIN_TIMEOUT)
+            .unwrap_or(BoundedRead {
+                failed: true,
+                ..BoundedRead::default()
+            }),
+        None => BoundedRead {
+            failed: true,
+            ..BoundedRead::default()
+        },
     }
 }
 
-fn fixed_command(collector: &'static str, program: &str, args: &[&str]) -> Observation {
-    fixed_command_with_timeout(collector, program, args, COMMAND_TIMEOUT)
+fn terminate_child(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        let process_group = rustix::process::Pid::from_child(child);
+        let _ = rustix::process::kill_process_group(process_group, rustix::process::Signal::TERM);
+        let deadline = Instant::now() + TERMINATION_GRACE;
+        while Instant::now() < deadline {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let _ = rustix::process::kill_process_group(process_group, rustix::process::Signal::KILL);
+    }
+    #[cfg(not(unix))]
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
-fn fixed_command_with_timeout(
+fn fixed_command(collector: &'static str, program: &str, args: &[&str]) -> Observation {
+    fixed_command_with_policy(collector, program, args, COMMAND_TIMEOUT, None)
+}
+
+fn fixed_command_with_policy(
     collector: &'static str,
     program: &str,
     args: &[&str],
     timeout: Duration,
+    empty_exit_one_output: Option<&'static str>,
 ) -> Observation {
-    let mut child = match Command::new(program)
-        .args(args)
+    let mut command = Command::new(program);
+    command.args(args).env_clear();
+    #[cfg(unix)]
+    command
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+        .process_group(0);
+    #[cfg(windows)]
+    command
+        .env("SystemRoot", r"C:\Windows")
+        .env("WINDIR", r"C:\Windows");
+    let mut child = match command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -97,52 +171,156 @@ fn fixed_command_with_timeout(
                 trust: "observed-untrusted",
                 output: format!("collector unavailable: {error}"),
                 success: false,
+                truncated: false,
             };
         }
     };
     let stdout = child.stdout.take().map(read_bounded);
     let stderr = child.stderr.take().map(read_bounded);
     let deadline = Instant::now() + timeout;
-    let (success, timed_out) = loop {
+    let (exit_status, timed_out) = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break (status.success(), false),
+            Ok(Some(status)) => break (Some(status), false),
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
             Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break (false, true);
+                terminate_child(&mut child);
+                break (None, true);
             }
             Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                terminate_child(&mut child);
                 return Observation {
                     collector,
                     trust: "observed-untrusted",
                     output: format!("collector unavailable: {error}"),
                     success: false,
+                    truncated: false,
                 };
             }
         }
     };
-    let mut output = joined_output(stdout);
-    let error_output = joined_output(stderr);
-    if !error_output.is_empty() && output.len() < MAX_OUTPUT_BYTES {
-        if !output.is_empty() {
-            output.push(b'\n');
-        }
-        let remaining = MAX_OUTPUT_BYTES.saturating_sub(output.len());
-        output.extend_from_slice(&error_output[..error_output.len().min(remaining)]);
+    let output = received_output(stdout);
+    let error_output = received_output(stderr);
+    let truncated = output.truncated || error_output.truncated;
+    let read_failed = output.failed || error_output.failed;
+    if read_failed {
+        terminate_child(&mut child);
     }
-    if timed_out {
-        let suffix = b"\ncollector unavailable: command timed out";
-        let remaining = MAX_OUTPUT_BYTES.saturating_sub(output.len());
-        output.extend_from_slice(&suffix[..suffix.len().min(remaining)]);
-    }
+    let empty_no_match = !timed_out
+        && exit_status
+            .as_ref()
+            .and_then(std::process::ExitStatus::code)
+            == Some(1)
+        && output.bytes.is_empty()
+        && error_output.bytes.is_empty()
+        && empty_exit_one_output.is_some();
+    let utf8_output = String::from_utf8(output.bytes).ok();
+    let command_succeeded = exit_status.as_ref().is_some_and(|status| status.success());
+    let success = (command_succeeded || empty_no_match)
+        && !truncated
+        && !read_failed
+        && utf8_output.is_some();
+    let safe_output = if empty_no_match {
+        empty_exit_one_output.unwrap_or_default().to_owned()
+    } else if success {
+        utf8_output.unwrap_or_default()
+    } else if timed_out {
+        "collector unavailable: command timed out".to_owned()
+    } else if truncated {
+        "collector unavailable: output exceeded the safety limit".to_owned()
+    } else if read_failed {
+        "collector unavailable: output could not be read safely".to_owned()
+    } else if utf8_output.is_none() {
+        "collector unavailable: output is not valid UTF-8".to_owned()
+    } else {
+        "collector unavailable: command failed".to_owned()
+    };
     Observation {
         collector,
         trust: "observed-untrusted",
-        output: bounded_utf8(&output),
+        output: safe_output,
         success,
+        truncated,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn collect_linux_fstab() -> Observation {
+    let file = match rustix::fs::open(
+        "/etc/fstab",
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::NONBLOCK,
+        rustix::fs::Mode::empty(),
+    ) {
+        Ok(descriptor) => File::from(descriptor),
+        Err(_) => {
+            return Observation {
+                collector: "linux.fstab",
+                trust: "observed-untrusted",
+                output: "collector unavailable: fstab could not be opened safely".to_owned(),
+                success: false,
+                truncated: false,
+            };
+        }
+    };
+    let metadata = match file.metadata() {
+        Ok(metadata) if metadata.is_file() => metadata,
+        _ => {
+            return Observation {
+                collector: "linux.fstab",
+                trust: "observed-untrusted",
+                output: "collector unavailable: fstab is not a regular file".to_owned(),
+                success: false,
+                truncated: false,
+            };
+        }
+    };
+    if metadata.len() > MAX_OUTPUT_BYTES as u64 {
+        return Observation {
+            collector: "linux.fstab",
+            trust: "observed-untrusted",
+            output: "collector unavailable: output exceeded the safety limit".to_owned(),
+            success: false,
+            truncated: true,
+        };
+    }
+    let bounded = received_output(Some(read_bounded(file)));
+    if bounded.truncated || bounded.failed {
+        return Observation {
+            collector: "linux.fstab",
+            trust: "observed-untrusted",
+            output: if bounded.truncated {
+                "collector unavailable: output exceeded the safety limit".to_owned()
+            } else {
+                "collector unavailable: output could not be read safely".to_owned()
+            },
+            success: false,
+            truncated: bounded.truncated,
+        };
+    }
+    match kernaid_linux_pack::diagnostics::normalize_fstab_for_diagnostics(&bounded.bytes) {
+        Ok(output) if output.len() <= MAX_OUTPUT_BYTES => Observation {
+            collector: "linux.fstab",
+            trust: "observed-untrusted",
+            output,
+            success: true,
+            truncated: false,
+        },
+        Ok(_) => Observation {
+            collector: "linux.fstab",
+            trust: "observed-untrusted",
+            output: "collector unavailable: normalized output exceeded the safety limit".to_owned(),
+            success: false,
+            truncated: true,
+        },
+        Err(_) => Observation {
+            collector: "linux.fstab",
+            trust: "observed-untrusted",
+            output: "collector unavailable: fstab is malformed".to_owned(),
+            success: false,
+            truncated: false,
+        },
     }
 }
 
@@ -159,8 +337,22 @@ fn collect_local_inventory() -> Vec<Observation> {
                 "--json",
                 "--bytes",
                 "--output",
-                "NAME,KNAME,MAJ:MIN,TYPE,SIZE,RO,TRAN,FSTYPE,MOUNTPOINTS,MODEL,SERIAL,WWN,UUID,PARTUUID,PTUUID",
+                "NAME,TYPE,SIZE,RO,FSTYPE,MOUNTPOINTS,SERIAL,WWN,UUID,PARTUUID,PTUUID",
             ],
+        ));
+        observations.push(fixed_command_with_policy(
+            "linux.mounts.read-only",
+            "/usr/bin/findmnt",
+            &[
+                "--json",
+                "--list",
+                "--options",
+                "ro",
+                "--output",
+                "TARGET,FSTYPE",
+            ],
+            COMMAND_TIMEOUT,
+            Some("{\"filesystems\":[]}"),
         ));
         observations.push(fixed_command(
             "linux.network.links",
@@ -168,9 +360,30 @@ fn collect_local_inventory() -> Vec<Observation> {
             &["-json", "link"],
         ));
         observations.push(fixed_command(
-            "linux.failed.units",
+            "linux.systemd.failed",
             "/usr/bin/systemctl",
             &["--failed", "--no-pager", "--plain"],
+        ));
+        observations.push(fixed_command(
+            "linux.systemd.state",
+            "/usr/bin/systemctl",
+            &["show", "--property=SystemState", "--no-pager"],
+        ));
+        observations.push(collect_linux_fstab());
+        observations.push(fixed_command(
+            "linux.df",
+            "/usr/bin/df",
+            &["--block-size=1", "--portability"],
+        ));
+        observations.push(fixed_command(
+            "linux.network.routes",
+            "/usr/sbin/ip",
+            &["-json", "route"],
+        ));
+        observations.push(fixed_command(
+            "linux.dpkg.audit",
+            "/usr/bin/dpkg",
+            &["--audit"],
         ));
     }
     #[cfg(target_os = "windows")]
@@ -218,6 +431,74 @@ fn collect_local_inventory() -> Vec<Observation> {
         ));
     }
     observations
+}
+
+#[tauri::command]
+fn diagnose_linux_p0(evidence: Vec<NativeDiagnosticEvidence>) -> Result<serde_json::Value, String> {
+    #[cfg(target_os = "linux")]
+    {
+        use kernaid_linux_pack::diagnostics::{
+            EvidenceInput, LinuxP0Inputs, MAX_INPUT_BYTES, diagnose_linux_p0, proposal_from_report,
+        };
+        use std::collections::BTreeMap;
+
+        const REQUIRED: [&str; 9] = [
+            "linux.block.inventory",
+            "linux.mounts.read-only",
+            "linux.systemd.failed",
+            "linux.systemd.state",
+            "linux.fstab",
+            "linux.df",
+            "linux.network.links",
+            "linux.network.routes",
+            "linux.dpkg.audit",
+        ];
+        if evidence.len() != REQUIRED.len() {
+            return Err("Il corpus Linux richiede tutte le evidenze P0.".to_owned());
+        }
+        let mut documents = BTreeMap::new();
+        for document in evidence {
+            if !REQUIRED.contains(&document.collector.as_str())
+                || document.content.len() > MAX_INPUT_BYTES
+                || documents
+                    .insert(document.collector.clone(), document)
+                    .is_some()
+            {
+                return Err("Le evidenze Linux non sono valide.".to_owned());
+            }
+        }
+        let input = |collector: &str| -> Result<EvidenceInput<'_>, String> {
+            let document = documents
+                .get(collector)
+                .ok_or_else(|| "Le evidenze Linux sono incomplete.".to_owned())?;
+            Ok(EvidenceInput {
+                id: &document.id,
+                body: document.content.as_bytes(),
+            })
+        };
+        let report = diagnose_linux_p0(LinuxP0Inputs {
+            lsblk_json: input("linux.block.inventory")?,
+            read_only_mounts_json: input("linux.mounts.read-only")?,
+            systemctl_failed: input("linux.systemd.failed")?,
+            systemctl_unit_state: input("linux.systemd.state")?,
+            fstab: input("linux.fstab")?,
+            df: input("linux.df")?,
+            ip_link_json: input("linux.network.links")?,
+            ip_route_json: input("linux.network.routes")?,
+            dpkg_audit: input("linux.dpkg.audit")?,
+        })
+        .map_err(|_| "Una evidenza Linux è malformata o incompleta.".to_owned())?;
+        return serde_json::to_value(proposal_from_report(&report))
+            .map_err(|_| "La diagnosi Linux non è serializzabile.".to_owned());
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        for document in evidence {
+            drop((document.id, document.collector, document.content));
+        }
+        Err("Il corpus Linux è disponibile solo su sistemi Linux.".to_owned())
+    }
 }
 
 fn is_identity_observation(collector: &str) -> bool {
@@ -313,6 +594,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             collect_local_inventory,
+            diagnose_linux_p0,
             authorize_observe,
             secure_runtime_status,
             initialize_device_identity,
@@ -329,20 +611,54 @@ mod tests {
     #[test]
     fn output_is_bounded() {
         let input = vec![b'x'; MAX_OUTPUT_BYTES + 100];
-        assert_eq!(bounded_utf8(&input).len(), MAX_OUTPUT_BYTES);
+        let bounded = received_output(Some(read_bounded(std::io::Cursor::new(input))));
+        assert_eq!(bounded.bytes.len(), MAX_OUTPUT_BYTES);
+        assert!(bounded.truncated);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn findmnt_empty_result_is_a_valid_empty_document() {
+        let observation = fixed_command_with_policy(
+            "test.findmnt-empty",
+            "/usr/bin/findmnt",
+            &["--json", "--list", "--types", "kernaid-no-such-filesystem"],
+            COMMAND_TIMEOUT,
+            Some("{\"filesystems\":[]}"),
+        );
+        assert!(observation.success);
+        assert_eq!(observation.output, "{\"filesystems\":[]}");
+        assert!(!observation.truncated);
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn collector_timeout_kills_a_stuck_process() {
-        let observation = fixed_command_with_timeout(
+        let observation = fixed_command_with_policy(
             "test.timeout",
             "/usr/bin/sleep",
             &["1"],
             Duration::from_millis(20),
+            None,
         );
         assert!(!observation.success);
         assert!(observation.output.contains("timed out"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn collector_timeout_kills_descendants_holding_output_pipes() {
+        let started = Instant::now();
+        let observation = fixed_command_with_policy(
+            "test.descendant-timeout",
+            "/bin/sh",
+            &["-c", "sleep 30 & wait"],
+            Duration::from_millis(20),
+            None,
+        );
+        assert!(!observation.success);
+        assert!(observation.output.contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 
     #[test]
@@ -353,18 +669,21 @@ mod tests {
                 trust: "observed-untrusted",
                 output: "host\n".into(),
                 success: true,
+                truncated: false,
             },
             Observation {
                 collector: "linux.network.links",
                 trust: "observed-untrusted",
                 output: "changes are not identity".into(),
                 success: true,
+                truncated: false,
             },
             Observation {
                 collector: "linux.block.inventory",
                 trust: "observed-untrusted",
                 output: "disks\n".into(),
                 success: true,
+                truncated: false,
             },
         ];
         let expected = format!(
@@ -381,6 +700,7 @@ mod tests {
             trust: "observed-untrusted",
             output: "before\n".into(),
             success: true,
+            truncated: false,
         }];
         let before = inventory_fingerprint(&observations);
         observations[0].output = "after\n".into();

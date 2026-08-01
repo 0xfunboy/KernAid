@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
-    paths: ["apps/desk/**", "crates/**", "packages/**", "services/**", "Cargo.lock", "pnpm-lock.yaml", ".github/workflows/desktop.yml"]
+    paths: ["apps/desk/**", "crates/**", "packs/linux/**", "packages/**", "services/**", "Cargo.lock", "pnpm-lock.yaml", ".github/workflows/desktop.yml"]
 permissions: {contents: read}
 jobs:
   build:

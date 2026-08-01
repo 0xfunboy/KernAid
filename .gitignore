@@ -2,6 +2,7 @@
 **/node_modules/
 **/dist/
 apps/desk/src-tauri/gen/schemas/
+rescue/live-build/config/includes.chroot/opt/kernaid/desk/
 **/__pycache__/
 *.pyc
 *.log

@@ -10,6 +10,7 @@ xorg
 lightdm
 network-manager
 network-manager-gnome
+iproute2
 chromium
 python3-minimal
 ca-certificates

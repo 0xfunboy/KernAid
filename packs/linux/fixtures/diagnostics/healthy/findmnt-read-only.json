@@ -1,0 +1,8 @@
+{
+  "filesystems": [
+    {
+      "target": "/sys",
+      "fstype": "sysfs"
+    }
+  ]
+}

@@ -15,6 +15,7 @@ import {
   initializeDeviceIdentity,
   isNative,
   NativeAuditSink,
+  PlatformOfflineRulesProvider,
   secureAuditReady,
   type NativeObservation,
   type SecureRuntimeStatus,
@@ -37,6 +38,7 @@ function App() {
   const [report, setReport] = useState<ArtifactRef>();
   const [nativeEvidence, setNativeEvidence] = useState<NativeObservation[]>([]);
   const [inventoryReady, setInventoryReady] = useState(!hasLocalCollector());
+  const [inventoryError, setInventoryError] = useState<string>();
   const [sessionId, setSessionId] = useState<string>();
   const [targetFingerprint, setTargetFingerprint] = useState<string>();
 
@@ -81,10 +83,16 @@ function App() {
   useEffect(() => {
     if (!hasLocalCollector()) return;
     collectLocalInventory()
-      .then((items) => setNativeEvidence(items))
-      .catch((error) =>
-        setStatus(`Inventario locale non disponibile: ${String(error)}`),
-      )
+      .then((items) => {
+        setNativeEvidence(items);
+        setInventoryError(undefined);
+      })
+      .catch((error) => {
+        const message = `Inventario locale non disponibile: ${String(error)}`;
+        setNativeEvidence([]);
+        setInventoryError(message);
+        setStatus(message);
+      })
       .finally(() => setInventoryReady(true));
   }, []);
 
@@ -114,8 +122,40 @@ function App() {
     try {
       setWorkflow("Observe");
       setStatus("Raccolta evidenze in sola lettura…");
-      const targetFingerprint = nativeEvidence.length
-        ? await fingerprint(nativeEvidence)
+      let currentNativeEvidence: NativeObservation[] = [];
+      if (hasLocalCollector()) {
+        try {
+          currentNativeEvidence = await collectLocalInventory();
+        } catch (error) {
+          const message = `Inventario locale non disponibile: ${String(error)}`;
+          setNativeEvidence([]);
+          setInventoryError(message);
+          throw new Error(`${message} Diagnosi bloccata.`);
+        }
+      }
+      if (hasLocalCollector() && currentNativeEvidence.length === 0)
+        throw new Error(
+          "L’inventario locale non ha restituito evidenze: diagnosi bloccata.",
+        );
+      if (hasLocalCollector()) {
+        setNativeEvidence(currentNativeEvidence);
+        setInventoryError(undefined);
+      }
+      const identityEvidence = currentNativeEvidence.filter((item) =>
+        /hostname|block\.inventory|\.disks$|\.system$|\.storage\.identity$/.test(
+          item.collector,
+        ),
+      );
+      if (
+        hasLocalCollector() &&
+        (identityEvidence.length === 0 ||
+          identityEvidence.some((item) => !item.success || item.truncated))
+      )
+        throw new Error(
+          "Identità del target incompleta: la sessione è stata bloccata senza formulare diagnosi.",
+        );
+      const targetFingerprint = currentNativeEvidence.length
+        ? await fingerprint(currentNativeEvidence)
         : `sha256:${"0".repeat(64)}`;
       setTargetFingerprint(targetFingerprint);
       const session = await activeDriver.startSession({
@@ -124,12 +164,12 @@ function App() {
       });
       setSessionId(session.id);
       const observed: Evidence[] = [];
-      if (nativeEvidence.length) {
-        for (const item of nativeEvidence)
+      if (currentNativeEvidence.length) {
+        for (const item of currentNativeEvidence)
           observed.push(
             ...(await activeDriver.requestEvidence(session.id, {
               collector: item.collector,
-              target: "local-machine",
+              target: isNative() ? "local-machine" : "rescue-runtime",
               summary: item.success
                 ? "Comando di inventario completato"
                 : "Comando di inventario non disponibile",
@@ -137,12 +177,16 @@ function App() {
               contentType: "text/plain",
             })),
           );
-      } else {
+      } else if (!hasLocalCollector()) {
         observed.push(
           ...(await activeDriver.requestEvidence(session.id, {
             collector: "linux.fixture.inventory",
             target: "fixture:linux-root",
           })),
+        );
+      } else {
+        throw new Error(
+          "L’inventario locale è obbligatorio: diagnosi bloccata.",
         );
       }
       setEvidence(observed);
@@ -264,7 +308,13 @@ function App() {
       </header>
       <aside>
         <p className="label">TARGET MACHINE</p>
-        <h2>{hasLocalCollector() ? "Local machine" : "Linux fixture"}</h2>
+        <h2>
+          {isNative()
+            ? "Local machine"
+            : hasLocalCollector()
+              ? "Ambiente Rescue · target non selezionato"
+              : "Linux fixture"}
+        </h2>
         {["Hardware", "Storage", "Boot", "Network"].map((item, index) => (
           <button key={item}>
             {item} ·{" "}
@@ -353,7 +403,9 @@ function App() {
             ? "Avvio sicuro…"
             : busy
               ? "Analisi…"
-              : "Diagnostica"}
+              : inventoryError
+                ? "Riprova inventario"
+                : "Diagnostica"}
         </button>
         {plan && workflow !== "Verify" && (
           <button
@@ -408,7 +460,7 @@ function App() {
 
 function createDriver(auditSink?: AuditSink): LocalSessionDriver {
   return new LocalSessionDriver(
-    undefined,
+    new PlatformOfflineRulesProvider(),
     hasLocalCollector() ? { execute: authorizeObserve } : undefined,
     auditSink,
   );

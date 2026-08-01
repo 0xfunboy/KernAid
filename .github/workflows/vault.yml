@@ -3,17 +3,41 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
-    paths: ["tools/test-vault/**", ".github/workflows/vault.yml"]
+    paths:
+      - "tools/test-vault/**"
+      - "crates/rescue-secrets/**"
+      - "crates/storage/**"
+      - "crates/device-identity/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/vault.yml"
 permissions: {contents: read}
 jobs:
   luks2-roundtrip:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with: {components: rustfmt, clippy}
       - name: Install disposable-image tooling
-        run: sudo apt-get update && sudo apt-get install -y cryptsetup gdisk shellcheck
+        run: sudo apt-get update && sudo apt-get install -y cryptsetup e2fsprogs gdisk shellcheck
       - name: Validate the vault test shell
-        run: bash -n ./tools/test-vault/luks-roundtrip.sh && shellcheck ./tools/test-vault/luks-roundtrip.sh
+        run: |
+          bash -n ./tools/test-vault/luks-roundtrip.sh
+          shellcheck ./tools/test-vault/luks-roundtrip.sh
+          bash -n ./crates/rescue-secrets/tests/privileged-luks.sh
+          shellcheck ./crates/rescue-secrets/tests/privileged-luks.sh
+      - name: Test the Rescue secure-state crate
+        run: |
+          cargo fmt -p kernaid-rescue-secrets -- --check
+          cargo clippy --locked -p kernaid-rescue-secrets --all-targets --all-features -- -D warnings
+          cargo test --locked -p kernaid-rescue-secrets --all-features
       - name: Prove encrypted persistence on a disposable image
         run: sudo ./tools/test-vault/luks-roundtrip.sh
+      - name: Probe Rescue secure state on a disposable LUKS2 mount
+        run: |
+          cargo build --locked -p kernaid-rescue-secrets \
+            --features privileged-probe --bin kernaid-rescue-vault-probe
+          sudo ./crates/rescue-secrets/tests/privileged-luks.sh \
+            "$PWD/target/debug/kernaid-rescue-vault-probe"
