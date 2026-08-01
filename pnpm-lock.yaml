@@ -74,6 +74,10 @@ importers:
         version: 6.4.3(@types/node@24.13.3)(tsx@4.23.1)
 
   packages/provider-types:
+    dependencies:
+      '@kernaid/schemas':
+        specifier: workspace:*
+        version: link:../schemas
     devDependencies:
       eslint:
         specifier: ^9.25.0
@@ -155,6 +159,9 @@ importers:
 
   services/agent-gateway:
     dependencies:
+      '@kernaid/provider-types':
+        specifier: workspace:*
+        version: link:../../packages/provider-types
       '@kernaid/schemas':
         specifier: workspace:*
         version: link:../../packages/schemas

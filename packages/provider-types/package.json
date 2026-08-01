@@ -1,1 +1,21 @@
-{"name":"@kernaid/provider-types","version":"0.1.0","private":true,"type":"module","scripts":{"format":"prettier --check .","lint":"eslint src","check":"tsc --noEmit","test":"node --test"},"devDependencies":{"eslint":"^9.25.0","prettier":"^3.5.3","typescript":"^5.8.3"}}
+{
+  "name": "@kernaid/provider-types",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "scripts": {
+    "format": "prettier --check .",
+    "lint": "eslint src",
+    "check": "tsc --noEmit",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@kernaid/schemas": "workspace:*"
+  },
+  "devDependencies": {
+    "eslint": "^9.25.0",
+    "prettier": "^3.5.3",
+    "typescript": "^5.8.3"
+  }
+}

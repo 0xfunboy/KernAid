@@ -110,6 +110,13 @@ test("serializes concurrent execution and fails closed when the boundary rejects
 
 test("rejects provider output with unknown fields or foreign evidence", async () => {
   class MaliciousProvider implements Provider {
+    readonly capabilities = Object.freeze({
+      streaming: false,
+      structuredOutput: true,
+      toolRequests: false,
+      local: true,
+    });
+
     constructor(private readonly foreignEvidence: boolean) {}
     async diagnose(
       _objective: string,
@@ -158,6 +165,13 @@ test("rejects provider output with unknown fields or foreign evidence", async ()
 
 test("redacts provider credentials from prompts and evidence", async () => {
   class InspectingProvider implements Provider {
+    readonly capabilities = Object.freeze({
+      streaming: false,
+      structuredOutput: true,
+      toolRequests: false,
+      local: true,
+    });
+
     async diagnose(
       objective: string,
       evidence: readonly ObservedEvidence[],
