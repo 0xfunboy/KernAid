@@ -232,7 +232,8 @@ class MachineFormatParserTests(unittest.TestCase):
     def test_mountinfo_parser_keeps_exact_path_and_machine_fields(self) -> None:
         raw = (
             "44 31 253:7 / /run/kernaid-make-device-v2.ABCDEF "
-            "ro,nosuid,nodev,noexec,nosymfollow - ext4 /dev/mapper/x rw\n"
+            "ro,nosuid,nodev,noexec,nosymfollow - ext4 /dev/mapper/x "
+            "rw,errors=continue,errors=remount-ro\n"
         )
         with mock.patch.object(writer.v1, "_read_bounded", return_value=raw):
             rows = writer.parse_mountinfo_for_path(
@@ -241,6 +242,10 @@ class MachineFormatParserTests(unittest.TestCase):
         self.assertEqual(rows[0][0], "253:7")
         self.assertEqual(rows[0][1], "ext4")
         self.assertIn("nosymfollow", rows[0][2])
+        self.assertEqual(
+            rows[0][3],
+            ("rw", "errors=continue", "errors=remount-ro"),
+        )
 
     def test_luks_json_profile_is_exact_and_host_default_independent(self) -> None:
         document = self.luks_profile_document()
@@ -550,6 +555,139 @@ class ProcessAndLifecycleTests(unittest.TestCase):
             node_rdev=os.makedev(253, 7),
             dm_uuid="CRYPT-LUKS2-11111111111111111111111111111111-test",
         )
+
+    @staticmethod
+    def mountpoint_details():
+        return SimpleNamespace(
+            st_mode=stat.S_IFDIR | 0o700,
+            st_uid=0,
+            st_gid=0,
+        )
+
+    def test_mount_errors_policy_accepts_only_explicit_or_verified_default(self) -> None:
+        mapper = self.mapper_identity()
+        required = frozenset({"rw", "nosuid", "nodev", "noexec", "nosymfollow"})
+        explicit = [
+            (
+                mapper.major_minor,
+                "ext4",
+                required,
+                ("rw", "errors=remount-ro"),
+            )
+        ]
+        omitted = [(mapper.major_minor, "ext4", required, ("rw",))]
+        with (
+            mock.patch.object(writer, "parse_mountinfo_for_path", return_value=explicit),
+            mock.patch.object(
+                writer.os, "lstat", return_value=self.mountpoint_details()
+            ),
+            mock.patch.object(
+                writer, "_verify_ext4_default_errors_policy"
+            ) as verify_default,
+        ):
+            writer.verify_mount("/run/vault", 73, mapper, read_only=False)
+        verify_default.assert_not_called()
+
+        with (
+            mock.patch.object(writer, "parse_mountinfo_for_path", return_value=omitted),
+            mock.patch.object(
+                writer.os, "lstat", return_value=self.mountpoint_details()
+            ),
+            mock.patch.object(
+                writer, "_verify_ext4_default_errors_policy"
+            ) as verify_default,
+        ):
+            writer.verify_mount("/run/vault", 73, mapper, read_only=False)
+        verify_default.assert_called_once_with(73, mapper)
+
+        rejected = (
+            ("rw", "errors=continue"),
+            ("rw", "errors=panic"),
+            ("rw", "errors=unknown"),
+            ("rw", "errors=remount-ro", "errors=remount-ro"),
+            ("rw", "errors=continue", "errors=remount-ro"),
+        )
+        for super_options in rejected:
+            with (
+                self.subTest(super_options=super_options),
+                mock.patch.object(
+                    writer,
+                    "parse_mountinfo_for_path",
+                    return_value=[
+                        (mapper.major_minor, "ext4", required, super_options)
+                    ],
+                ),
+                mock.patch.object(
+                    writer, "_verify_ext4_default_errors_policy"
+                ) as verify_default,
+            ):
+                with self.assertRaisesRegex(writer.SafetyError, "hardened exact"):
+                    writer.verify_mount("/run/vault", 73, mapper, read_only=False)
+            verify_default.assert_not_called()
+
+    def test_omitted_mount_errors_policy_is_descriptor_and_superblock_bound(self) -> None:
+        mapper = self.mapper_identity()
+        details = SimpleNamespace(
+            st_mode=stat.S_IFBLK | 0o600,
+            st_dev=mapper.node_device,
+            st_ino=mapper.node_inode,
+            st_rdev=mapper.node_rdev,
+        )
+        superblock = bytearray(1024)
+        writer.struct.pack_into("<H", superblock, 0x38, 0xEF53)
+        writer.struct.pack_into("<H", superblock, 0x3C, 2)
+        with (
+            mock.patch.object(
+                writer, "_open_data_fd_from_block_lease", return_value=91
+            ) as open_data,
+            mock.patch.object(writer.os, "fstat", side_effect=(details, details)),
+            mock.patch.object(writer.os, "pread", return_value=bytes(superblock)),
+            mock.patch.object(writer, "_verify_block_identity_lease") as verify_lease,
+            mock.patch.object(writer.os, "close") as close,
+        ):
+            writer._verify_ext4_default_errors_policy(73, mapper)
+        open_data.assert_called_once_with(
+            73, mapper.node_path, mapper.major_minor, "vault mapper", writable=False
+        )
+        verify_lease.assert_called_once_with(
+            73,
+            mapper.node_path,
+            mapper.major_minor,
+            "vault mapper",
+            expected=writer._block_identity_tuple(details),
+        )
+        close.assert_called_once_with(91)
+
+        changed = SimpleNamespace(**vars(details))
+        changed.st_ino += 1
+        invalid_superblocks = []
+        for offset, value in ((0x38, 0), (0x3C, 1), (0x3C, 3)):
+            invalid = bytearray(superblock)
+            writer.struct.pack_into("<H", invalid, offset, value)
+            invalid_superblocks.append(bytes(invalid))
+        cases = (
+            (b"", (details, details)),
+            *((invalid, (details, details)) for invalid in invalid_superblocks),
+            (bytes(superblock), (details, changed)),
+        )
+        for contents, identities in cases:
+            with (
+                self.subTest(
+                    contents=hashlib.sha256(contents).hexdigest(),
+                    final_inode=identities[1].st_ino,
+                ),
+                mock.patch.object(
+                    writer, "_open_data_fd_from_block_lease", return_value=91
+                ),
+                mock.patch.object(writer.os, "fstat", side_effect=identities),
+                mock.patch.object(writer.os, "pread", return_value=contents),
+                mock.patch.object(writer, "_verify_block_identity_lease") as verify_lease,
+                mock.patch.object(writer.os, "close") as close,
+            ):
+                with self.assertRaisesRegex(writer.SafetyError, "default errors"):
+                    writer._verify_ext4_default_errors_policy(73, mapper)
+            verify_lease.assert_not_called()
+            close.assert_called_once_with(91)
 
     def test_bounded_runner_rejects_ambiguous_exit_and_output(self) -> None:
         false = "/usr/bin/false" if Path("/usr/bin/false").exists() else "/bin/false"
@@ -1470,9 +1608,10 @@ class ProcessAndLifecycleTests(unittest.TestCase):
             st_ino=99,
         )
         for operation in (
-            lambda: writer.create_vault_layout("/run/vault", mapper),
+            lambda: writer.create_vault_layout("/run/vault", 73, mapper),
             lambda: writer.verify_vault_layout(
                 "/run/vault",
+                73,
                 mapper,
                 writer.VaultEvidence("", "", "a" * 64, "b" * 64),
             ),

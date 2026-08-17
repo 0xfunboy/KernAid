@@ -2805,9 +2805,11 @@ def verify_filesystem(
     verify_mapper_lease(mapper_lease_fd, mapper, partition, luks_uuid)
 
 
-def parse_mountinfo_for_path(path: str) -> list[tuple[str, str, frozenset[str], frozenset[str]]]:
+def parse_mountinfo_for_path(
+    path: str,
+) -> list[tuple[str, str, frozenset[str], tuple[str, ...]]]:
     raw = v1._read_bounded("/proc/self/mountinfo", v1.MAX_PROC_OUTPUT)
-    matches: list[tuple[str, str, frozenset[str], frozenset[str]]] = []
+    matches: list[tuple[str, str, frozenset[str], tuple[str, ...]]] = []
     for line in raw.splitlines():
         fields = line.split()
         if len(fields) < 10 or "-" not in fields:
@@ -2821,25 +2823,77 @@ def parse_mountinfo_for_path(path: str) -> list[tuple[str, str, frozenset[str], 
         major_minor = fields[2]
         filesystem = fields[separator + 1]
         mount_options = frozenset(fields[5].split(","))
-        super_options = frozenset(fields[separator + 3].split(","))
+        # Keep super options ordered rather than deduplicating them: duplicate
+        # errors= policies are ambiguous and must fail closed.
+        super_options = tuple(fields[separator + 3].split(","))
         matches.append((major_minor, filesystem, mount_options, super_options))
     return matches
 
 
-def verify_mount(mountpoint: str, mapper: MapperIdentity, *, read_only: bool) -> None:
+def _verify_ext4_default_errors_policy(
+    mapper_lease_fd: int, mapper: MapperIdentity
+) -> None:
+    mapper_data_fd = _open_data_fd_from_block_lease(
+        mapper_lease_fd,
+        mapper.node_path,
+        mapper.major_minor,
+        "vault mapper",
+        writable=False,
+    )
+    try:
+        before = os.fstat(mapper_data_fd)
+        if (
+            not stat.S_ISBLK(before.st_mode)
+            or (before.st_dev, before.st_ino, before.st_rdev)
+            != (mapper.node_device, mapper.node_inode, mapper.node_rdev)
+        ):
+            raise SafetyError("vault mapper data descriptor identity changed")
+        superblock = os.pread(mapper_data_fd, 1024, 1024)
+        after = os.fstat(mapper_data_fd)
+        if (
+            len(superblock) != 1024
+            or _block_identity_tuple(after) != _block_identity_tuple(before)
+            or struct.unpack_from("<H", superblock, 0x38)[0] != 0xEF53
+            or struct.unpack_from("<H", superblock, 0x3C)[0] != 2
+        ):
+            raise SafetyError("vault ext4 default errors policy is not remount-ro")
+        _verify_block_identity_lease(
+            mapper_lease_fd,
+            mapper.node_path,
+            mapper.major_minor,
+            "vault mapper",
+            expected=_block_identity_tuple(before),
+        )
+    finally:
+        os.close(mapper_data_fd)
+
+
+def verify_mount(
+    mountpoint: str,
+    mapper_lease_fd: int,
+    mapper: MapperIdentity,
+    *,
+    read_only: bool,
+) -> None:
     matches = parse_mountinfo_for_path(mountpoint)
     if len(matches) != 1:
         raise SafetyError("vault mountpoint is missing or ambiguous")
     major_minor, filesystem, mount_options, super_options = matches[0]
     required = {"nosuid", "nodev", "noexec", "nosymfollow"}
     required.add("ro" if read_only else "rw")
+    errors_options = [
+        option for option in super_options if option.startswith("errors=")
+    ]
     if (
         major_minor != mapper.major_minor
         or filesystem != "ext4"
         or not required.issubset(mount_options)
-        or (not read_only and "errors=remount-ro" not in super_options)
+        or len(errors_options) > 1
+        or (errors_options and errors_options != ["errors=remount-ro"])
     ):
         raise SafetyError("vault mount does not match the hardened exact policy")
+    if not errors_options:
+        _verify_ext4_default_errors_policy(mapper_lease_fd, mapper)
     details = os.lstat(mountpoint)
     if not stat.S_ISDIR(details.st_mode) or details.st_uid != 0 or details.st_gid != 0:
         raise SafetyError("vault mountpoint ownership or type is unsafe")
@@ -2893,6 +2947,7 @@ def _base64url_encode(value: bytearray) -> bytearray:
 def _bind_mount_root_fd(
     root_fd: int,
     mountpoint: str,
+    mapper_lease_fd: int,
     mapper: MapperIdentity,
     *,
     read_only: bool,
@@ -2906,7 +2961,7 @@ def _bind_mount_root_fd(
         or observed_major_minor != mapper.major_minor
     ):
         raise WriteError("vault root FD is not bound to the exact mapper filesystem")
-    verify_mount(mountpoint, mapper, read_only=read_only)
+    verify_mount(mountpoint, mapper_lease_fd, mapper, read_only=read_only)
     final = os.fstat(root_fd)
     if (
         final.st_dev,
@@ -2925,8 +2980,10 @@ def _bind_mount_root_fd(
     return final
 
 
-def create_vault_layout(mountpoint: str, mapper: MapperIdentity) -> VaultEvidence:
-    verify_mount(mountpoint, mapper, read_only=False)
+def create_vault_layout(
+    mountpoint: str, mapper_lease_fd: int, mapper: MapperIdentity
+) -> VaultEvidence:
+    verify_mount(mountpoint, mapper_lease_fd, mapper, read_only=False)
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
@@ -2935,7 +2992,9 @@ def create_vault_layout(mountpoint: str, mapper: MapperIdentity) -> VaultEvidenc
     encoded = bytearray()
     envelope = bytearray()
     try:
-        _bind_mount_root_fd(root_fd, mountpoint, mapper, read_only=False)
+        _bind_mount_root_fd(
+            root_fd, mountpoint, mapper_lease_fd, mapper, read_only=False
+        )
         os.fchmod(root_fd, 0o700)
         root_details = os.fstat(root_fd)
         if (
@@ -3021,14 +3080,21 @@ def _verify_regular_at(
         os.close(fd)
 
 
-def verify_vault_layout(mountpoint: str, mapper: MapperIdentity, evidence: VaultEvidence) -> None:
-    verify_mount(mountpoint, mapper, read_only=True)
+def verify_vault_layout(
+    mountpoint: str,
+    mapper_lease_fd: int,
+    mapper: MapperIdentity,
+    evidence: VaultEvidence,
+) -> None:
+    verify_mount(mountpoint, mapper_lease_fd, mapper, read_only=True)
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     root_fd = os.open(mountpoint, flags)
     try:
-        root = _bind_mount_root_fd(root_fd, mountpoint, mapper, read_only=True)
+        root = _bind_mount_root_fd(
+            root_fd, mountpoint, mapper_lease_fd, mapper, read_only=True
+        )
         if (
             root.st_uid != 0
             or root.st_gid != 0
@@ -3119,7 +3185,7 @@ def _mount_mapper(
             timeout=30,
             pass_fds=(mapper_lease_fd,),
         )
-        verify_mount(mountpoint, mapper, read_only=read_only)
+        verify_mount(mountpoint, mapper_lease_fd, mapper, read_only=read_only)
         return mountpoint
     except BaseException:
         # Ownership was recorded before the mutating command, so the common
@@ -3536,7 +3602,7 @@ def provision_vault(
         mountpoint = _mount_mapper(
             mapper_lease_fd, mapper, lifecycle, read_only=False
         )
-        created = create_vault_layout(mountpoint, mapper)
+        created = create_vault_layout(mountpoint, mapper_lease_fd, mapper)
         evidence = VaultEvidence(
             luks_uuid,
             filesystem_uuid,
@@ -3580,7 +3646,7 @@ def provision_vault(
         mountpoint = _mount_mapper(
             mapper_lease_fd, mapper, lifecycle, read_only=True
         )
-        verify_vault_layout(mountpoint, mapper, evidence)
+        verify_vault_layout(mountpoint, mapper_lease_fd, mapper, evidence)
         _unmount(lifecycle)
         _close_mapper(lifecycle, partition, luks_uuid)
         mapper_lease_fd = -1
