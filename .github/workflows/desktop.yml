@@ -117,6 +117,93 @@ jobs:
           name: kernaid-provider-key-${{ matrix.name }}
           path: ${{ matrix.companion_upload }}
           if-no-files-found: error
+      - name: Preseed pinned Tauri AppImage tooling
+        if: matrix.platform == 'ubuntu-24.04'
+        shell: bash
+        env:
+          KERNAID_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          tools_dir="${XDG_CACHE_HOME:-$HOME/.cache}/tauri"
+          mkdir -p "$tools_dir"
+          if [[ -L "$tools_dir" || ! -d "$tools_dir" || ! -O "$tools_dir" ]]; then
+            echo "Tauri tools cache must be an owned, real directory" >&2
+            exit 1
+          fi
+          chmod 0700 "$tools_dir"
+          if [[ "$(stat -c '%u:%a' "$tools_dir")" != "$(id -u):700" ]]; then
+            echo "Tauri tools cache owner or mode is unsafe" >&2
+            exit 1
+          fi
+          temporary_files=()
+          cleanup() {
+            local temporary
+            for temporary in "${temporary_files[@]}"; do
+              if [[ -e "$temporary" ]]; then
+                rm -f -- "$temporary"
+              fi
+            done
+          }
+          trap cleanup EXIT
+
+          fetch_pinned_tool() {
+            local name="$1"
+            local url="$2"
+            local expected_sha256="$3"
+            local expected_size="$4"
+            local accept="$5"
+            local destination="$tools_dir/$name"
+            local temporary
+            if [[ -e "$destination" || -L "$destination" ]]; then
+              if [[ ! -f "$destination" || -L "$destination" ]]; then
+                echo "Refusing unsafe Tauri tool destination: $name" >&2
+                return 1
+              fi
+            fi
+            temporary="$(mktemp "$tools_dir/.${name}.XXXXXX")"
+            temporary_files+=("$temporary")
+
+            curl --proto '=https' --tlsv1.2 \
+              --fail --silent --show-error --location \
+              --connect-timeout 15 --max-time 60 --max-filesize "$expected_size" \
+              --retry 5 --retry-all-errors --retry-max-time 180 \
+              --header "Authorization: Bearer ${KERNAID_GITHUB_TOKEN}" \
+              --header "Accept: ${accept}" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              --output "$temporary" "$url"
+            if [[ "$(stat -c '%s' "$temporary")" != "$expected_size" ]]; then
+              echo "Unexpected byte size for pinned Tauri tool: $name" >&2
+              return 1
+            fi
+            printf '%s  %s\n' "$expected_sha256" "$temporary" \
+              | sha256sum --check --strict -
+            chmod 0755 "$temporary"
+            if [[ ! -O "$temporary" || "$(stat -c '%a' "$temporary")" != 755 ]]; then
+              echo "Unexpected owner or mode for pinned Tauri tool: $name" >&2
+              return 1
+            fi
+            mv -fT -- "$temporary" "$destination"
+          }
+
+          fetch_pinned_tool \
+            AppRun-x86_64 \
+            https://api.github.com/repos/tauri-apps/binary-releases/releases/assets/274691722 \
+            f30140a43a0a59e46db21bdefdf749b9e9f2c6946e92afabbacf98b8ae73fb4f \
+            31552 \
+            application/octet-stream
+          fetch_pinned_tool \
+            linuxdeploy-x86_64.AppImage \
+            https://api.github.com/repos/tauri-apps/binary-releases/releases/assets/182515537 \
+            e762bea85c8eb0d4b3508d46e5c1f037f717d0f9303ae3b4aafc8b04991fa1ef \
+            13264064 \
+            application/octet-stream
+          fetch_pinned_tool \
+            linuxdeploy-plugin-gtk.sh \
+            'https://api.github.com/repos/tauri-apps/linuxdeploy-plugin-gtk/contents/linuxdeploy-plugin-gtk.sh?ref=b5eb8d05b4c0ed40107fe2158c5d8527f94568ef' \
+            cb379f9b0733e9ad9f8bd78f8c2fa038aef2478523bb7d4c8e64ff6a1ea3501a \
+            11648 \
+            application/vnd.github.raw+json
       - uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
