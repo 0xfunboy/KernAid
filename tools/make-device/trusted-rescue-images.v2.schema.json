@@ -1,0 +1,177 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kernaid.dev/schemas/trusted-rescue-images.v2.json",
+  "title": "KernAid trusted Rescue images catalog v2",
+  "$comment": "Runtime cross-field invariants are enforced by catalog_v2.py: artifact name/version pairs and image digests are unique; each firmware's USB and vault claims bind the same workflow run, URL, and raw log; BIOS and UEFI use different logs; authorization also requires exact equality with the current validated DeviceLayout. These relationships are not expressible with portable JSON Schema Draft 2020-12 keywords.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "catalogRevision", "images"],
+  "properties": {
+    "schema": {
+      "const": "dev.kernaid.trusted-rescue-images.v2"
+    },
+    "catalogRevision": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "images": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/image"
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "usbBootAttestation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "passed",
+        "bootTransport",
+        "bootCount",
+        "targetZeroWritesVerified",
+        "workflowRunId",
+        "workflowRunUrl",
+        "logSha256"
+      ],
+      "properties": {
+        "passed": {"const": true},
+        "bootTransport": {"const": "usb-storage"},
+        "bootCount": {"const": 2},
+        "targetZeroWritesVerified": {"const": true},
+        "workflowRunId": {"type": "integer", "minimum": 1},
+        "workflowRunUrl": {
+          "type": "string",
+          "maxLength": 4096,
+          "pattern": "^https://github\\.com/0xfunboy/KernAid/actions/runs/[0-9]+(?:/.*)?$"
+        },
+        "logSha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "vaultAttestation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "passed",
+        "bootCount",
+        "luksVersion",
+        "luksLabel",
+        "filesystem",
+        "filesystemLabel",
+        "stableUuidsVerified",
+        "sentinelVerified",
+        "identityVerified",
+        "wrongKeyRejected",
+        "workflowRunId",
+        "workflowRunUrl",
+        "logSha256"
+      ],
+      "properties": {
+        "passed": {"const": true},
+        "bootCount": {"const": 2},
+        "luksVersion": {"const": 2},
+        "luksLabel": {"const": "KERNAID_VAULT"},
+        "filesystem": {"const": "ext4"},
+        "filesystemLabel": {"const": "KERNAID_VAULT"},
+        "stableUuidsVerified": {"const": true},
+        "sentinelVerified": {"const": true},
+        "identityVerified": {"const": true},
+        "wrongKeyRejected": {"const": true},
+        "workflowRunId": {"type": "integer", "minimum": 1},
+        "workflowRunUrl": {
+          "type": "string",
+          "maxLength": 4096,
+          "pattern": "^https://github\\.com/0xfunboy/KernAid/actions/runs/[0-9]+(?:/.*)?$"
+        },
+        "logSha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "vaultPartition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["number", "name", "mbrType", "startLba", "sectorCount"],
+      "properties": {
+        "number": {"const": 3},
+        "name": {"const": "KERNAID_VAULT"},
+        "mbrType": {"const": "0x83"},
+        "startLba": {"const": 33554432},
+        "sectorCount": {"const": 16777216}
+      }
+    },
+    "deviceLayout": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "manifestSha256",
+        "partitionTable",
+        "logicalSectorBytes",
+        "minimumMediaBytes",
+        "minimumAdvertisedMediaBytes",
+        "minimumAdvertisedMediaLabel",
+        "vaultPartition"
+      ],
+      "properties": {
+        "schema": {"const": "kernaid.rescue-device-layout.v1"},
+        "manifestSha256": {"$ref": "#/$defs/sha256"},
+        "partitionTable": {"const": "mbr"},
+        "logicalSectorBytes": {"const": 512},
+        "minimumMediaBytes": {"const": 25769803776},
+        "minimumAdvertisedMediaBytes": {"const": 32000000000},
+        "minimumAdvertisedMediaLabel": {"const": "32 GB"},
+        "vaultPartition": {"$ref": "#/$defs/vaultPartition"}
+      }
+    },
+    "image": {
+      "type": "object",
+      "description": "For each firmware, qemuUsbBootAttestations and qemuVaultAttestations must identify the same workflow run, URL, and raw log. BIOS and UEFI must identify different raw logs. catalog_v2.py enforces these semantic relationships and catalog-wide identity/digest uniqueness in addition to this portable schema.",
+      "additionalProperties": false,
+      "required": [
+        "artifactName",
+        "artifactVersion",
+        "sha256",
+        "bytes",
+        "deviceLayout",
+        "qemuUsbBootAttestations",
+        "qemuVaultAttestations"
+      ],
+      "properties": {
+        "artifactName": {
+          "type": "string",
+          "maxLength": 4096,
+          "pattern": "^KernAid-Rescue-[A-Za-z0-9._-]+\\.iso$"
+        },
+        "artifactVersion": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9.+_-]{0,63}$"
+        },
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "bytes": {"type": "integer", "minimum": 1},
+        "deviceLayout": {"$ref": "#/$defs/deviceLayout"},
+        "qemuUsbBootAttestations": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["bios", "uefi"],
+          "properties": {
+            "bios": {"$ref": "#/$defs/usbBootAttestation"},
+            "uefi": {"$ref": "#/$defs/usbBootAttestation"}
+          }
+        },
+        "qemuVaultAttestations": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["bios", "uefi"],
+          "properties": {
+            "bios": {"$ref": "#/$defs/vaultAttestation"},
+            "uefi": {"$ref": "#/$defs/vaultAttestation"}
+          }
+        }
+      }
+    }
+  }
+}

@@ -23,6 +23,29 @@ Ogni voce lega esattamente:
 Il catalogo è il trust anchor locale: programma, catalogo e tutta la loro
 directory devono essere posseduti da `root` e non scrivibili da gruppo/altri.
 
+Il writer installabile e il workflow di pubblicazione restano sulla versione
+v1. I file `trusted-rescue-images.v2.json`,
+`trusted-rescue-images.v2.schema.json`, `catalog_v2.py` e
+`catalog-entry-v2.py` definiscono invece un contratto di trust futuro,
+separato e inattivo: il catalogo v2 ha revisione zero e l'elenco immagini è
+vuoto. Non è un catalogo alternativo da installare e non autorizza alcuna ISO.
+
+Una futura promozione v2 richiederà, per la stessa ISO e lo stesso layout
+immutabile, entrambe queste famiglie di prove indipendenti per BIOS e UEFI:
+
+- due boot consecutivi della stessa immagine raw come `usb-storage`, con
+  prefisso ISO, partizione p3 e target invariati e marker distinti per boot 1
+  e boot 2;
+- un vault realmente provisionato come LUKS2/ext4 `KERNAID_VAULT`, con UUID,
+  sentinel e identità stabili nei due boot, rifiuto della chiave errata e
+  chiusura pulita verificata.
+
+Lo smoke USB attuale che verifica soltanto layout e boot non prova la
+persistenza del vault. La sua riga `KERNAID_QEMU_USB_ATTESTATION_V1` non può
+quindi essere usata da sola per generare una voce trusted v2; anche i log
+CD-ROM v1 vengono rifiutati. Finché mancano entrambe le famiglie di
+attestazioni, nessun artefatto può essere promosso nel catalogo v2.
+
 ## Installazione operatore
 
 Servono Linux FHS a 64 bit, `/usr/bin/python3` 3.10 o successivo, util-linux
