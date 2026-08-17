@@ -709,6 +709,104 @@ class QmpTests(unittest.TestCase):
             self.assertFalse(thread.is_alive())
             self.assertEqual(commands, ["qmp_capabilities", "system_powerdown"])
 
+    def test_qemu_harness_discovers_stdout_pty_from_merged_bounded_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            root.chmod(0o700)
+            master, slave = os.openpty()
+            pty_path = os.ttyname(slave)
+            output = root / "qemu-output"
+            output.write_bytes(
+                f"char device redirected to {pty_path} (label serial0)\n".encode(
+                    "ascii"
+                )
+            )
+            fake_qemu = self._fake_qemu(root)
+            harness = controller.QemuHarness(
+                os.fspath(fake_qemu), [os.fspath(output)], root / "qmp.sock", []
+            )
+            qmp = mock.Mock()
+            try:
+                with mock.patch.object(
+                    controller.QmpClient, "connect", return_value=qmp
+                ):
+                    console, observed_qmp = harness.start(time.monotonic() + 2)
+                self.assertIs(observed_qmp, qmp)
+                self.assertIsNotNone(console)
+                self.assertIn(
+                    b"diagnostic-on-stderr\nchar device redirected to ",
+                    harness.output_capture.snapshot(),
+                )
+            finally:
+                harness.cleanup()
+                os.close(slave)
+                os.close(master)
+
+    def test_qemu_harness_output_failures_are_closed_and_bounded(self) -> None:
+        secret = bytearray(os.urandom(32).hex().encode("ascii"))
+        try:
+            for name, output_bytes, expected in [
+                ("missing", b"ordinary diagnostic\n", ("serial", "pty-missing")),
+                (
+                    "malformed",
+                    b"char device redirected to /tmp/not-a-pty (label serial0)\n",
+                    ("serial", "pty-missing"),
+                ),
+                (
+                    "oversized",
+                    b"x" * (controller.QEMU_OUTPUT_LIMIT + 1),
+                    ("qemu-output", "oversized"),
+                ),
+                ("secret", bytes(secret), ("qemu-output", "secret-exposure")),
+            ]:
+                with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    root.chmod(0o700)
+                    output = root / "qemu-output"
+                    output.write_bytes(output_bytes)
+                    fake_qemu = self._fake_qemu(root)
+                    capture_secrets = [secret] if name == "secret" else []
+                    harness = controller.QemuHarness(
+                        os.fspath(fake_qemu),
+                        [os.fspath(output)],
+                        root / "qmp.sock",
+                        capture_secrets,
+                    )
+                    try:
+                        with self.assertRaises(controller.ClosedFailure) as failure:
+                            deadline_seconds = 2.0 if name in {"oversized", "secret"} else 0.25
+                            harness.start(time.monotonic() + deadline_seconds)
+                        self.assertEqual(
+                            (failure.exception.stage, failure.exception.code), expected
+                        )
+                    finally:
+                        harness.cleanup()
+        finally:
+            controller.wipe(secret)
+
+    @staticmethod
+    def _fake_qemu(root: Path) -> Path:
+        fake_qemu = root / "fake-qemu"
+        fake_qemu.write_text(
+            """#!/usr/bin/python3
+import os
+import sys
+import time
+
+os.write(2, b"diagnostic-on-stderr\\n")
+with open(sys.argv[1], "rb", buffering=0) as source:
+    while True:
+        chunk = source.read(4096)
+        if not chunk:
+            break
+        os.write(1, chunk)
+time.sleep(60)
+""",
+            encoding="ascii",
+        )
+        fake_qemu.chmod(0o700)
+        return fake_qemu
+
     def test_cleanup_kills_the_entire_owned_process_group_boundedly(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             harness = controller.QemuHarness(

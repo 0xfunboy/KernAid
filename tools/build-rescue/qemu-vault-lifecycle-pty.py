@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Bounded PTY/QMP controller for the Rescue vault lifecycle smoke.
 
-The controller deliberately never persists or reproduces QEMU serial/stderr.
+The controller deliberately never persists or reproduces QEMU serial/process output.
 Its only output is a closed, machine-validated attestation or failure line.
 Vault passphrases arrive on already-open file descriptors and are never added
 to a child argv, environment, firmware configuration, or diagnostic.
@@ -32,7 +32,7 @@ from typing import Callable, Sequence
 
 
 SERIAL_LIMIT = 2 * 1024 * 1024
-QEMU_STDERR_LIMIT = 128 * 1024
+QEMU_OUTPUT_LIMIT = 128 * 1024
 QMP_LIMIT = 128 * 1024
 SECRET_BYTES = 64
 LOGIN_SECRET_LIMIT = 128
@@ -1306,10 +1306,10 @@ class QemuHarness:
     ) -> None:
         self.qmp_path = qmp_path
         self.serial_capture = BoundedCapture(SERIAL_LIMIT, capture_secrets)
-        self.stderr_capture = BoundedCapture(QEMU_STDERR_LIMIT, capture_secrets)
+        self.output_capture = BoundedCapture(QEMU_OUTPUT_LIMIT, capture_secrets)
         self.process: subprocess.Popen[bytes] | None = None
         self._qmp_path_owned = False
-        self.stderr_drainer: StderrDrainer | None = None
+        self.output_drainer: StderrDrainer | None = None
         self.console: SerialConsole | None = None
         self.qmp: QmpClient | None = None
         self._owned_pgid_fd = owned_pgid_fd
@@ -1368,8 +1368,8 @@ class QemuHarness:
             self.process = subprocess.Popen(
                 self._command,
                 stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 close_fds=True,
                 start_new_session=True,
                 env=self._environment,
@@ -1381,32 +1381,34 @@ class QemuHarness:
             owned_pgid_fd = self._owned_pgid_fd
             self._owned_pgid_fd = None
             publish_owned_process_group(owned_pgid_fd, self.process)
-        assert self.process.stderr is not None
-        os.set_blocking(self.process.stderr.fileno(), False)
+        assert self.process.stdout is not None
+        os.set_blocking(self.process.stdout.fileno(), False)
         pty_path: str | None = None
         while time.monotonic() < deadline:
             self.check_health()
             try:
-                chunk = self.process.stderr.read(4096)
+                chunk = self.process.stdout.read(4096)
             except BlockingIOError:
                 chunk = None
             if chunk:
                 try:
-                    self.stderr_capture.append(chunk)
+                    self.output_capture.append(chunk)
                 except SecretExposureError as error:
-                    raise ClosedFailure("qemu-stderr", "secret-exposure") from error
+                    raise ClosedFailure("qemu-output", "secret-exposure") from error
                 except CaptureLimitError as error:
-                    raise ClosedFailure("qemu-stderr", "oversized") from error
-                match = self.PTY_RE.search(self.stderr_capture.snapshot())
+                    raise ClosedFailure("qemu-output", "oversized") from error
+                match = self.PTY_RE.search(self.output_capture.snapshot())
                 if match is not None:
                     pty_path = os.fsdecode(match.group(1))
                     break
             time.sleep(0.02)
         if pty_path is None:
             raise ClosedFailure("serial", "pty-missing")
-        os.set_blocking(self.process.stderr.fileno(), True)
-        self.stderr_drainer = StderrDrainer(self.process.stderr, self.stderr_capture)
-        self.stderr_drainer.start()
+        os.set_blocking(self.process.stdout.fileno(), True)
+        self.output_drainer = StderrDrainer(
+            self.process.stdout, self.output_capture, "qemu-output"
+        )
+        self.output_drainer.start()
         try:
             serial_fd = os.open(
                 pty_path,
@@ -1427,8 +1429,8 @@ class QemuHarness:
         return self.console, self.qmp
 
     def check_health(self) -> None:
-        if self.stderr_drainer is not None:
-            self.stderr_drainer.check()
+        if self.output_drainer is not None:
+            self.output_drainer.check()
         if self.process is not None and self.process.poll() is not None:
             raise ClosedFailure("qemu", "exited-early")
 
@@ -1436,15 +1438,15 @@ class QemuHarness:
         if self.process is None:
             raise ClosedFailure("qemu", "not-started")
         while self.process.poll() is None and time.monotonic() < deadline:
-            if self.stderr_drainer is not None:
-                self.stderr_drainer.check()
+            if self.output_drainer is not None:
+                self.output_drainer.check()
             time.sleep(0.05)
         if self.process.poll() is None:
             raise ClosedFailure("qemu", "shutdown-timeout")
         if self.process.returncode != 0:
             raise ClosedFailure("qemu", "shutdown-failed")
-        if self.stderr_drainer is not None:
-            self.stderr_drainer.join()
+        if self.output_drainer is not None:
+            self.output_drainer.join()
 
     def cleanup(self) -> None:
         cleanup_failed = False
@@ -1465,17 +1467,19 @@ class QemuHarness:
                 cleanup_owned_process_group(self.process)
             except BaseException:
                 cleanup_failed = True
-        if self.stderr_drainer is not None:
+        if self.output_drainer is not None:
             try:
-                self.stderr_drainer.join(PROCESS_CLEANUP_SECONDS)
+                self.output_drainer.join(PROCESS_CLEANUP_SECONDS)
             except BaseException:
                 cleanup_failed = True
-            self.stderr_drainer = None
-        if self.process is not None and self.process.stderr is not None:
-            try:
-                self.process.stderr.close()
-            except OSError:
-                cleanup_failed = True
+            self.output_drainer = None
+        if self.process is not None:
+            for stream in (self.process.stdout, self.process.stderr):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except OSError:
+                        cleanup_failed = True
         if self._qmp_path_owned and os.path.lexists(self.qmp_path):
             try:
                 os.unlink(self.qmp_path)
@@ -1490,7 +1494,7 @@ class QemuHarness:
                 cleanup_failed = True
             self._owned_pgid_fd = None
         self.serial_capture.wipe()
-        self.stderr_capture.wipe()
+        self.output_capture.wipe()
         if cleanup_failed:
             raise ClosedFailure("cleanup", "qemu-residue")
 
