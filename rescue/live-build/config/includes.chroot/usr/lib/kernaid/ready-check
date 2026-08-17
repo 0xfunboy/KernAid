@@ -34,8 +34,12 @@ test "$(systemctl show --property=ActiveState --value kernaid-rescue-vaultd.serv
     || fail "vault lifecycle daemon is not active"
 test "$(systemctl show --property=ActiveState --value kernaid-rescue-vaultd.socket)" = "active" \
     || fail "vault lifecycle socket is not active"
-test "$(systemctl show --property=SubState --value kernaid-rescue-vaultd.socket)" = "listening" \
-    || fail "vault lifecycle socket is not listening"
+vault_socket_substate="$(systemctl show --property=SubState --value kernaid-rescue-vaultd.socket)" \
+    || fail "vault lifecycle socket state is unavailable"
+case "$vault_socket_substate" in
+    listening|running) ;;
+    *) fail "vault lifecycle socket is not operational" ;;
+esac
 vault_group_id="$(getent group kernaid-vault | awk -F: 'NF == 4 && $1 == "kernaid-vault" { print $3 }')"
 test -n "$vault_group_id" || fail "vault lifecycle group is missing"
 test -S /run/kernaid-rescue-vault.sock || fail "vault lifecycle pathname is not a socket"

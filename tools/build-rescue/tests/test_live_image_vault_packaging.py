@@ -242,6 +242,9 @@ class VaultLivePolicyTests(unittest.TestCase):
             "--value kernaid-rescue-vaultd.socket)", ready
         )
         self.assertIn("--property=SubState", ready)
+        self.assertIn('case "$vault_socket_substate" in', ready)
+        self.assertIn("listening|running) ;;", ready)
+        self.assertNotIn('= "listening"', ready)
         self.assertIn("test -S /run/kernaid-rescue-vault.sock", ready)
         self.assertIn("0:${vault_group_id}:660:1", ready)
 
