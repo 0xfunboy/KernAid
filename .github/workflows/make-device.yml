@@ -33,7 +33,7 @@ jobs:
       - name: Install safety-test tooling
         run: |
           sudo apt-get update
-          sudo apt-get install -y cryptsetup-bin e2fsprogs shellcheck systemd-udev util-linux
+          sudo apt-get install -y cryptsetup-bin e2fsprogs shellcheck udev util-linux
       - name: Validate Python and shell syntax
         run: |
           python3 -m py_compile \
