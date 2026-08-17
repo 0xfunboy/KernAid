@@ -7,6 +7,8 @@ expected_schemas=(
   diagnosis-proposal.schema.json
   evidence.schema.json
   execution-event.schema.json
+  rescue-openai-request.schema.json
+  rescue-openai-response.schema.json
   rescue-vault-request.schema.json
   rescue-vault-response.schema.json
   session-report.schema.json
