@@ -19,7 +19,7 @@ certification.
 
 | Fixed collector               | Evidence ID                         | Read-only source used by KernAid Desk                                                                                          |
 | ----------------------------- | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| `macos.storage.inventory`     | caller-assigned, valid unique `E-*` | `system_profiler SPStorageDataType -json -detailLevel mini`, normalized to device class and SMART availability/state           |
+| `macos.storage.inventory`     | caller-assigned, valid unique `E-*` | `system_profiler SPStorageDataType -json -detailLevel full`, normalized to device class and SMART availability/state           |
 | `macos.apfs.capacity`         | caller-assigned, valid unique `E-*` | `diskutil apfs list -plist` and `diskutil info -plist /`, including typed FileVault fields when the plist exposes them         |
 | `macos.launchd.state`         | caller-assigned, valid unique `E-*` | bounded `/bin/launchctl list` for the current user domain; system scope is explicitly `not-run-unqualified`                    |
 | `macos.network.state`         | caller-assigned, valid unique `E-*` | bounded `scutil --nwi`, `route -n get default`, and `scutil --dns` projections                                                 |

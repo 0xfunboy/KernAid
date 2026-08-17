@@ -1750,7 +1750,17 @@ mod tests {
 
         let quick = collect_macos_identity_observations();
         assert_eq!(quick.len(), 2);
-        assert!(quick.iter().all(|item| item.success && !item.truncated));
+        let quick_failures = quick
+            .iter()
+            .filter(|item| !item.success || item.truncated)
+            .map(|item| {
+                format!(
+                    "{}:success={}:truncated={}",
+                    item.collector, item.success, item.truncated
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(quick_failures.is_empty(), "{quick_failures:?}");
         assert_eq!(
             quick
                 .iter()
@@ -1761,11 +1771,17 @@ mod tests {
 
         let observations = collect_macos_p0_observations();
         assert_eq!(observations.len(), macos_resident::COLLECTORS.len() + 2);
-        assert!(
-            observations
-                .iter()
-                .all(|item| item.success && !item.truncated)
-        );
+        let failed_collectors = observations
+            .iter()
+            .filter(|item| !item.success || item.truncated)
+            .map(|item| {
+                format!(
+                    "{}:success={}:truncated={}",
+                    item.collector, item.success, item.truncated
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(failed_collectors.is_empty(), "{failed_collectors:?}");
         let mut expected = macos_resident::COLLECTORS
             .into_iter()
             .collect::<BTreeSet<_>>();
