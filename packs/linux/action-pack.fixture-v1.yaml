@@ -1,0 +1,19 @@
+apiVersion: kernaid.dev/v1alpha1
+kind: ActionPack
+metadata:
+  name: linux-boot-fixture-lab
+  version: 0.1.0
+spec:
+  fixtureLabOnly: true
+  platforms: [linux-fixture-lab]
+  actions:
+    - id: linux.fstab.repair-entry.fixture-v1
+      fixtureLabOnly: true
+      risk: R2
+      reversible: true
+      requiresBackup: true
+      handler: kernaid-action-linux
+      inputSchema: schemas/linux.fstab.repair-entry.fixture-v1.json
+      preflight: linux.fstab.preflight
+      validate: linux.boot.validate-fstab
+      rollback: linux.fstab.restore

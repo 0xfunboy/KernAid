@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kernaid.dev/schemas/linux.fstab.repair-entry.fixture-v1.json",
+  "title": "KernAid fixture fstab repair input",
+  "type": "object",
+  "additionalProperties": false,
+  "x-kernaid-action-id": "linux.fstab.repair-entry.fixture-v1",
+  "x-kernaid-fixture-lab-only": true,
+  "required": [
+    "resourceId",
+    "expectedBeforeSha256",
+    "expectedAfterSha256"
+  ],
+  "properties": {
+    "resourceId": {
+      "const": "fixture:linux-fstab-v1"
+    },
+    "expectedBeforeSha256": {
+      "type": "string",
+      "minLength": 71,
+      "maxLength": 71,
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "expectedAfterSha256": {
+      "type": "string",
+      "minLength": 71,
+      "maxLength": 71,
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    }
+  }
+}

@@ -10,6 +10,15 @@ known missing-device `fstab` entry. It is **fixture-only**: the exact
 `.kernaid-disposable-fixture` marker is mandatory, and the code is not wired to
 Tauri, Rescue, the broker, or real disks.
 
+`action-pack.fixture-v1.yaml` and its JSON input schema pin the single
+`linux.fstab.repair-entry.fixture-v1` contract at compile time. That manifest
+is explicitly fixture-lab-only and non-production: it is not a claim that the
+handler is available through a public broker or UI. Its input can identify
+only `fixture:linux-fstab-v1` and distinct exact lowercase
+`expectedBeforeSha256`/`expectedAfterSha256` fingerprints of the previewed
+before/after bytes; paths, raw content, replacement text, commands, and other
+fields are rejected.
+
 The transaction:
 
 - parses the documented Linux `fstab` grammar (four required fields, two
