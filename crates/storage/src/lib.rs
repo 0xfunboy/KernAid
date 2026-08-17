@@ -58,6 +58,12 @@ const MAX_JOURNAL_CIPHERTEXT_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_RETURNED_PLAINTEXT_BYTES: u64 = 16 * 1024 * 1024;
 /// Maximum record count materialized by [`SecureJournal::entries`].
 pub const MAX_RETURNED_ENTRIES: u64 = 10_000;
+/// Largest aggregate plaintext budget accepted by streaming replay (8 GiB).
+///
+/// Replay retains only one bounded event at a time, but a caller must still
+/// choose an explicit aggregate work budget no larger than the journal's
+/// authenticated ciphertext ceiling.
+pub const MAX_REPLAY_PLAINTEXT_BYTES: u64 = MAX_JOURNAL_CIPHERTEXT_BYTES;
 
 /// Secret key material returned by a [`JournalSecretStore`].
 ///
@@ -201,6 +207,108 @@ pub struct JournalEntry {
     pub event: Vec<u8>,
     pub previous_hash: [u8; HASH_BYTES],
     pub entry_hash: [u8; HASH_BYTES],
+}
+
+/// Borrowed authenticated record supplied during streaming replay.
+///
+/// The event bytes are valid only for the callback invocation and are erased
+/// before the next record is visited. Callers that need to retain data must
+/// copy only the bounded state required by their fold.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct JournalEntryRef<'entry> {
+    pub sequence: u64,
+    pub event: &'entry [u8],
+    pub previous_hash: [u8; HASH_BYTES],
+    pub entry_hash: [u8; HASH_BYTES],
+}
+
+impl fmt::Debug for JournalEntryRef<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("JournalEntryRef")
+            .field("sequence", &self.sequence)
+            .field("event_len", &self.event.len())
+            .field("previous_hash", &self.previous_hash)
+            .field("entry_hash", &self.entry_hash)
+            .finish()
+    }
+}
+
+/// Caller-selected limits for one streaming replay.
+///
+/// A zero sequence limit accepts only an empty journal. The plaintext budget
+/// may also be zero, which still permits authenticated empty events. Invalid
+/// limits fail before the database is scanned or a callback is invoked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JournalReplayLimits {
+    max_sequence: u64,
+    max_plaintext_bytes: u64,
+}
+
+impl JournalReplayLimits {
+    /// Construct limits within the fixed journal protocol ceilings.
+    pub fn new(max_sequence: u64, max_plaintext_bytes: u64) -> Result<Self, JournalError> {
+        if max_sequence > MAX_JOURNAL_ENTRIES || max_plaintext_bytes > MAX_REPLAY_PLAINTEXT_BYTES {
+            return Err(JournalError::ReadLimitExceeded);
+        }
+        Ok(Self {
+            max_sequence,
+            max_plaintext_bytes,
+        })
+    }
+
+    #[must_use]
+    pub const fn max_sequence(self) -> u64 {
+        self.max_sequence
+    }
+
+    #[must_use]
+    pub const fn max_plaintext_bytes(self) -> u64 {
+        self.max_plaintext_bytes
+    }
+}
+
+/// Authenticated bounds and head produced by a successful streaming replay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JournalReplaySummary {
+    pub head: JournalAnchor,
+    pub entries: u64,
+    pub plaintext_bytes: u64,
+}
+
+/// Failure from either journal verification or the caller's replay callback.
+///
+/// `CallbackError` is owned by the caller. Implementations must not include
+/// plaintext event bytes in its `Debug`, `Display` or error source if the
+/// value can cross a logging or IPC boundary.
+#[derive(Debug)]
+pub enum JournalReplayError<CallbackError> {
+    Journal(JournalError),
+    Callback(CallbackError),
+}
+
+impl<CallbackError> From<JournalError> for JournalReplayError<CallbackError> {
+    fn from(error: JournalError) -> Self {
+        Self::Journal(error)
+    }
+}
+
+impl<CallbackError: fmt::Display> fmt::Display for JournalReplayError<CallbackError> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Journal(error) => write!(formatter, "journal replay failed: {error}"),
+            Self::Callback(error) => write!(formatter, "journal replay callback failed: {error}"),
+        }
+    }
+}
+
+impl<CallbackError: Error + 'static> Error for JournalReplayError<CallbackError> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Journal(error) => Some(error),
+            Self::Callback(error) => Some(error),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -555,6 +663,7 @@ impl<S: JournalSecretStore> SecureJournal<S> {
             &self.journal_id,
             anchor.sequence,
             ScanMode::None,
+            None,
         )?;
         let anchor_lags = validate_anchor(&anchor, &scan, &self.journal_id)?;
         if anchor_lags {
@@ -599,6 +708,7 @@ impl<S: JournalSecretStore> SecureJournal<S> {
             &self.journal_id,
             anchor.sequence,
             ScanMode::First,
+            None,
         )?;
         let anchor_lags = validate_anchor(&anchor, &scan, &self.journal_id)?;
         if anchor_lags {
@@ -640,6 +750,7 @@ impl<S: JournalSecretStore> SecureJournal<S> {
             &self.journal_id,
             anchor.sequence,
             ScanMode::AllBounded,
+            None,
         )?;
         let anchor_lags = validate_anchor(&anchor, &scan, &self.journal_id)?;
         if anchor_lags {
@@ -661,6 +772,108 @@ impl<S: JournalSecretStore> SecureJournal<S> {
         };
         self.verified_ciphertext_bytes = scan.ciphertext_bytes;
         Ok(scan.entries)
+    }
+
+    /// Stream every authenticated event in sequence order without applying
+    /// the snapshot limits used by [`Self::entries`].
+    ///
+    /// Replay is deliberately two-pass under one SQLite immediate
+    /// transaction. The first pass verifies the complete encrypted chain,
+    /// caller limits and secure anchor. Only then can the second pass invoke
+    /// `callback`, so a corrupt or truncated tail cannot expose an
+    /// unauthenticated prefix as a successful recovery. At most one plaintext
+    /// event is resident at a time.
+    ///
+    /// If the callback fails, no lagging secure anchor is advanced and this
+    /// journal's trusted head is unchanged. External side effects performed by
+    /// a callback cannot be rolled back; [`Self::fold`] is preferred when
+    /// recovery can be represented as an in-memory accumulator.
+    pub fn replay<CallbackError, Callback>(
+        &mut self,
+        limits: JournalReplayLimits,
+        mut callback: Callback,
+    ) -> Result<JournalReplaySummary, JournalReplayError<CallbackError>>
+    where
+        Callback: for<'entry> FnMut(JournalEntryRef<'entry>) -> Result<(), CallbackError>,
+    {
+        if !self.healthy {
+            return Err(JournalError::Poisoned.into());
+        }
+        if limits.max_sequence > MAX_JOURNAL_ENTRIES
+            || limits.max_plaintext_bytes > MAX_REPLAY_PLAINTEXT_BYTES
+        {
+            return Err(JournalError::ReadLimitExceeded.into());
+        }
+        self.ensure_hardened()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(JournalError::from)?;
+        let anchor = load_required_anchor(&mut self.secret_store)?;
+        let scan = scan_chain(
+            &transaction,
+            &self.cipher,
+            &self.journal_id,
+            anchor.sequence,
+            ScanMode::None,
+            Some(limits),
+        )?;
+        let anchor_lags = validate_anchor(&anchor, &scan, &self.journal_id)?;
+        if scan.head.sequence > limits.max_sequence
+            || scan.plaintext_bytes > limits.max_plaintext_bytes
+        {
+            return Err(JournalError::ReadLimitExceeded.into());
+        }
+
+        replay_verified_chain(
+            &transaction,
+            &self.cipher,
+            &self.journal_id,
+            scan.head,
+            scan.plaintext_bytes,
+            &mut callback,
+        )?;
+
+        let verified_head = JournalAnchor {
+            journal_id: self.journal_id,
+            sequence: scan.head.sequence,
+            entry_hash: scan.head.entry_hash,
+        };
+        if anchor_lags {
+            if let Err(error) = self.secret_store.store_anchor(&verified_head) {
+                self.healthy = false;
+                return Err(JournalError::from(error).into());
+            }
+        }
+        transaction.commit().map_err(JournalError::from)?;
+        self.trusted_head = verified_head;
+        self.verified_ciphertext_bytes = scan.ciphertext_bytes;
+        Ok(JournalReplaySummary {
+            head: verified_head,
+            entries: scan.head.sequence,
+            plaintext_bytes: scan.plaintext_bytes,
+        })
+    }
+
+    /// Fold a streaming authenticated replay into bounded caller state.
+    ///
+    /// The accumulator is returned only after the complete replay succeeds.
+    /// On callback failure it is dropped, while the journal anchor and cached
+    /// trusted head remain unchanged.
+    pub fn fold<Accumulator, CallbackError, Callback>(
+        &mut self,
+        limits: JournalReplayLimits,
+        mut accumulator: Accumulator,
+        mut callback: Callback,
+    ) -> Result<(Accumulator, JournalReplaySummary), JournalReplayError<CallbackError>>
+    where
+        Callback: for<'entry> FnMut(
+            &mut Accumulator,
+            JournalEntryRef<'entry>,
+        ) -> Result<(), CallbackError>,
+    {
+        let summary = self.replay(limits, |entry| callback(&mut accumulator, entry))?;
+        Ok((accumulator, summary))
     }
 
     fn ensure_hardened(&mut self) -> Result<(), JournalError> {
@@ -960,6 +1173,7 @@ struct ChainScan {
     head: ChainHead,
     anchor_prefix_hash: Option<[u8; HASH_BYTES]>,
     ciphertext_bytes: u64,
+    plaintext_bytes: u64,
     entries: Vec<JournalEntry>,
 }
 
@@ -976,6 +1190,7 @@ fn scan_chain(
     journal_id: &[u8; JOURNAL_ID_BYTES],
     anchor_sequence: u64,
     mode: ScanMode,
+    replay_limits: Option<JournalReplayLimits>,
 ) -> Result<ChainScan, JournalError> {
     let mut statement = connection.prepare(
         "SELECT sequence, \
@@ -997,6 +1212,9 @@ fn scan_chain(
         if expected_sequence > MAX_JOURNAL_ENTRIES {
             return Err(JournalError::JournalTooLarge);
         }
+        if replay_limits.is_some_and(|limits| expected_sequence > limits.max_sequence) {
+            return Err(JournalError::ReadLimitExceeded);
+        }
         let sequence_raw: i64 = row.get(0)?;
         let sequence = u64::try_from(sequence_raw).map_err(|_| JournalError::CorruptChain)?;
         let nonce_len: i64 = row.get(1)?;
@@ -1014,6 +1232,23 @@ fn scan_chain(
             || entry_hash_len != HASH_BYTES as i64
         {
             return Err(JournalError::CorruptChain);
+        }
+        let record_ciphertext_bytes =
+            u64::try_from(ciphertext_len).map_err(|_| JournalError::CorruptChain)?;
+        let record_plaintext_bytes = record_ciphertext_bytes
+            .checked_sub(AEAD_TAG_BYTES as u64)
+            .ok_or(JournalError::CorruptChain)?;
+        let next_ciphertext_bytes = ciphertext_bytes
+            .checked_add(record_ciphertext_bytes)
+            .ok_or(JournalError::JournalTooLarge)?;
+        let next_plaintext_bytes = plaintext_bytes
+            .checked_add(record_plaintext_bytes)
+            .ok_or(JournalError::JournalTooLarge)?;
+        if next_ciphertext_bytes > MAX_JOURNAL_CIPHERTEXT_BYTES {
+            return Err(JournalError::JournalTooLarge);
+        }
+        if replay_limits.is_some_and(|limits| next_plaintext_bytes > limits.max_plaintext_bytes) {
+            return Err(JournalError::ReadLimitExceeded);
         }
 
         let nonce: [u8; NONCE_BYTES] = row
@@ -1051,19 +1286,12 @@ fn scan_chain(
                 )
                 .map_err(|_| JournalError::AuthenticationFailed)?,
         );
-        if plaintext.len() > MAX_EVENT_BYTES {
+        if plaintext.len() > MAX_EVENT_BYTES || plaintext.len() as u64 != record_plaintext_bytes {
             return Err(JournalError::CorruptChain);
         }
 
-        ciphertext_bytes = ciphertext_bytes
-            .checked_add(ciphertext.len() as u64)
-            .ok_or(JournalError::JournalTooLarge)?;
-        plaintext_bytes = plaintext_bytes
-            .checked_add(plaintext.len() as u64)
-            .ok_or(JournalError::JournalTooLarge)?;
-        if ciphertext_bytes > MAX_JOURNAL_CIPHERTEXT_BYTES {
-            return Err(JournalError::JournalTooLarge);
-        }
+        ciphertext_bytes = next_ciphertext_bytes;
+        plaintext_bytes = next_plaintext_bytes;
         if sequence == anchor_sequence {
             anchor_prefix_hash = Some(entry_hash);
         }
@@ -1094,8 +1322,132 @@ fn scan_chain(
         },
         anchor_prefix_hash,
         ciphertext_bytes,
+        plaintext_bytes,
         entries,
     })
+}
+
+fn replay_verified_chain<CallbackError, Callback>(
+    connection: &Connection,
+    cipher: &XChaCha20Poly1305,
+    journal_id: &[u8; JOURNAL_ID_BYTES],
+    verified_head: ChainHead,
+    verified_plaintext_bytes: u64,
+    callback: &mut Callback,
+) -> Result<(), JournalReplayError<CallbackError>>
+where
+    Callback: for<'entry> FnMut(JournalEntryRef<'entry>) -> Result<(), CallbackError>,
+{
+    let mut statement = connection
+        .prepare(
+            "SELECT sequence, \
+                    length(nonce), nonce, \
+                    length(ciphertext), ciphertext, \
+                    length(previous_hash), previous_hash, \
+                    length(entry_hash), entry_hash \
+             FROM secure_journal_entries ORDER BY sequence",
+        )
+        .map_err(JournalError::from)?;
+    let mut rows = statement.query([]).map_err(JournalError::from)?;
+    let mut expected_sequence = 1_u64;
+    let mut expected_previous = ZERO_HASH;
+    let mut plaintext_bytes = 0_u64;
+
+    while let Some(row) = rows.next().map_err(JournalError::from)? {
+        if expected_sequence > MAX_JOURNAL_ENTRIES {
+            return Err(JournalError::JournalTooLarge.into());
+        }
+        let sequence_raw: i64 = row.get(0).map_err(JournalError::from)?;
+        let sequence = u64::try_from(sequence_raw).map_err(|_| JournalError::CorruptChain)?;
+        let nonce_len: i64 = row.get(1).map_err(JournalError::from)?;
+        let ciphertext_len: i64 = row.get(3).map_err(JournalError::from)?;
+        let previous_hash_len: i64 = row.get(5).map_err(JournalError::from)?;
+        let entry_hash_len: i64 = row.get(7).map_err(JournalError::from)?;
+        let max_ciphertext = MAX_EVENT_BYTES
+            .checked_add(AEAD_TAG_BYTES)
+            .ok_or(JournalError::JournalTooLarge)?;
+        if sequence != expected_sequence
+            || nonce_len != NONCE_BYTES as i64
+            || ciphertext_len < AEAD_TAG_BYTES as i64
+            || ciphertext_len > max_ciphertext as i64
+            || previous_hash_len != HASH_BYTES as i64
+            || entry_hash_len != HASH_BYTES as i64
+        {
+            return Err(JournalError::CorruptChain.into());
+        }
+
+        let nonce: [u8; NONCE_BYTES] = row
+            .get::<_, Vec<u8>>(2)
+            .map_err(JournalError::from)?
+            .try_into()
+            .map_err(|_| JournalError::CorruptChain)?;
+        let ciphertext: Vec<u8> = row.get(4).map_err(JournalError::from)?;
+        let previous_hash: [u8; HASH_BYTES] = row
+            .get::<_, Vec<u8>>(6)
+            .map_err(JournalError::from)?
+            .try_into()
+            .map_err(|_| JournalError::CorruptChain)?;
+        let entry_hash: [u8; HASH_BYTES] = row
+            .get::<_, Vec<u8>>(8)
+            .map_err(JournalError::from)?
+            .try_into()
+            .map_err(|_| JournalError::CorruptChain)?;
+        if previous_hash != expected_previous
+            || entry_hash != hash_entry(journal_id, sequence, &previous_hash, &nonce, &ciphertext)
+        {
+            return Err(JournalError::CorruptChain.into());
+        }
+
+        let nonce_ref: &XNonce = nonce
+            .as_slice()
+            .try_into()
+            .map_err(|_| JournalError::CorruptChain)?;
+        let aad = associated_data(journal_id, sequence, &previous_hash);
+        let plaintext = Zeroizing::new(
+            cipher
+                .decrypt(
+                    nonce_ref,
+                    Payload {
+                        msg: &ciphertext,
+                        aad: &aad,
+                    },
+                )
+                .map_err(|_| JournalError::AuthenticationFailed)?,
+        );
+        if plaintext.len() > MAX_EVENT_BYTES {
+            return Err(JournalError::CorruptChain.into());
+        }
+        plaintext_bytes = plaintext_bytes
+            .checked_add(plaintext.len() as u64)
+            .ok_or(JournalError::JournalTooLarge)?;
+        if plaintext_bytes > verified_plaintext_bytes {
+            return Err(JournalError::CorruptChain.into());
+        }
+
+        callback(JournalEntryRef {
+            sequence,
+            event: &plaintext,
+            previous_hash,
+            entry_hash,
+        })
+        .map_err(JournalReplayError::Callback)?;
+
+        expected_previous = entry_hash;
+        expected_sequence = expected_sequence
+            .checked_add(1)
+            .ok_or(JournalError::SequenceOverflow)?;
+    }
+
+    let observed_sequence = expected_sequence
+        .checked_sub(1)
+        .ok_or(JournalError::CorruptChain)?;
+    if observed_sequence != verified_head.sequence
+        || expected_previous != verified_head.entry_hash
+        || plaintext_bytes != verified_plaintext_bytes
+    {
+        return Err(JournalError::CorruptChain.into());
+    }
+    Ok(())
 }
 
 fn validate_expected_head(
@@ -1875,7 +2227,10 @@ mod tests {
             .any(|window| window == needle)
     }
 
-    fn bulk_append_valid_empty_events(journal: &mut SecureJournal<MemorySecretStore>, count: u64) {
+    fn bulk_append_valid_events<'event>(
+        journal: &mut SecureJournal<MemorySecretStore>,
+        events: impl IntoIterator<Item = &'event [u8]>,
+    ) {
         let mut head = ChainHead {
             sequence: 0,
             entry_hash: ZERO_HASH,
@@ -1884,7 +2239,8 @@ mod tests {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .expect("begin bulk append");
-        for sequence in 1..=count {
+        for event in events {
+            let sequence = head.sequence.checked_add(1).expect("test sequence bound");
             let mut nonce = [0_u8; NONCE_BYTES];
             nonce[..8].copy_from_slice(&sequence.to_be_bytes());
             let nonce_ref: &XNonce = nonce.as_slice().try_into().expect("fixed nonce size");
@@ -1894,11 +2250,11 @@ mod tests {
                 .encrypt(
                     nonce_ref,
                     Payload {
-                        msg: b"",
+                        msg: event,
                         aad: &aad,
                     },
                 )
-                .expect("encrypt empty event");
+                .expect("encrypt bulk event");
             let entry_hash = hash_entry(
                 &journal.journal_id,
                 sequence,
@@ -1934,6 +2290,10 @@ mod tests {
                 entry_hash: head.entry_hash,
             })
             .expect("anchor bulk append");
+    }
+
+    fn bulk_append_valid_empty_events(journal: &mut SecureJournal<MemorySecretStore>, count: u64) {
+        bulk_append_valid_events(journal, (0..count).map(|_| b"".as_slice()));
     }
 
     fn rewrite_ciphertext_and_public_hash(path: &Path, sequence: u64) {
@@ -2473,7 +2833,247 @@ mod tests {
         assert_eq!(head.sequence, MAX_RETURNED_ENTRIES + 1);
         assert_eq!(head, store.anchor());
         journal.verify().expect("large journal remains verifiable");
+
+        let replay_limits =
+            JournalReplayLimits::new(MAX_RETURNED_ENTRIES + 1, 0).expect("exact streaming limits");
+        let mut visited = 0_u64;
+        let summary = journal
+            .replay(replay_limits, |entry| {
+                visited = visited.checked_add(1).ok_or("visitor counter overflow")?;
+                if entry.sequence != visited || !entry.event.is_empty() {
+                    return Err("unexpected streamed entry");
+                }
+                Ok(())
+            })
+            .expect("stream beyond snapshot entry limit");
+        assert_eq!(visited, MAX_RETURNED_ENTRIES + 1);
+        assert_eq!(summary.entries, visited);
+        assert_eq!(summary.plaintext_bytes, 0);
+        assert_eq!(summary.head, store.anchor());
+
+        let rejected_limits =
+            JournalReplayLimits::new(MAX_RETURNED_ENTRIES, 0).expect("smaller streaming limits");
+        let mut called = false;
+        assert!(matches!(
+            journal.replay::<(), _>(rejected_limits, |_| {
+                called = true;
+                Ok(())
+            }),
+            Err(JournalReplayError::Journal(JournalError::ReadLimitExceeded))
+        ));
+        assert!(!called, "limit failure must precede every callback");
         remove_database(&path);
+    }
+
+    #[test]
+    fn replay_plaintext_limits_are_exact_and_protocol_bounded() {
+        assert!(JournalReplayLimits::new(MAX_JOURNAL_ENTRIES, MAX_REPLAY_PLAINTEXT_BYTES).is_ok());
+        assert!(matches!(
+            JournalReplayLimits::new(MAX_JOURNAL_ENTRIES + 1, 0),
+            Err(JournalError::ReadLimitExceeded)
+        ));
+        assert!(matches!(
+            JournalReplayLimits::new(0, MAX_REPLAY_PLAINTEXT_BYTES + 1),
+            Err(JournalError::ReadLimitExceeded)
+        ));
+
+        let path = database_path("replay-byte-limit");
+        let store = MemorySecretStore::default();
+        let mut journal = SecureJournal::open(&path, store).expect("open journal");
+        journal.append(b"abc").expect("append three bytes");
+        journal.append(b"defgh").expect("append five bytes");
+
+        let exact = JournalReplayLimits::new(2, 8).expect("exact replay byte limit");
+        let (events, summary) = journal
+            .fold(exact, Vec::new(), |events, entry| {
+                events.push(entry.event.to_vec());
+                Ok::<(), ()>(())
+            })
+            .expect("fold at exact byte boundary");
+        assert_eq!(events, vec![b"abc".to_vec(), b"defgh".to_vec()]);
+        assert_eq!(summary.entries, 2);
+        assert_eq!(summary.plaintext_bytes, 8);
+
+        let too_small = JournalReplayLimits::new(2, 7).expect("smaller byte limit");
+        let mut called = false;
+        assert!(matches!(
+            journal.replay::<(), _>(too_small, |_| {
+                called = true;
+                Ok(())
+            }),
+            Err(JournalReplayError::Journal(JournalError::ReadLimitExceeded))
+        ));
+        assert!(!called, "byte limit failure must precede every callback");
+        remove_database(&path);
+    }
+
+    #[test]
+    fn replay_entry_debug_redacts_plaintext() {
+        let event = b"sensitive-recovery-event";
+        let entry = JournalEntryRef {
+            sequence: 7,
+            event,
+            previous_hash: [0x11; HASH_BYTES],
+            entry_hash: [0x22; HASH_BYTES],
+        };
+        let rendered = format!("{entry:?}");
+        assert!(rendered.contains("sequence: 7"));
+        assert!(rendered.contains(&format!("event_len: {}", event.len())));
+        assert!(!rendered.contains("sensitive-recovery-event"));
+        assert!(!rendered.contains("event: ["));
+    }
+
+    #[test]
+    fn replay_streams_beyond_the_snapshot_plaintext_limit() {
+        let path = database_path("replay-beyond-snapshot-bytes");
+        let store = MemorySecretStore::default();
+        let mut journal = SecureJournal::open(&path, store).expect("open journal");
+        let maximum_event = vec![0x5a; MAX_EVENT_BYTES];
+        bulk_append_valid_events(
+            &mut journal,
+            (0..16)
+                .map(|_| maximum_event.as_slice())
+                .chain(std::iter::once(b"x".as_slice())),
+        );
+        assert!(matches!(
+            journal.entries(),
+            Err(JournalError::ReadLimitExceeded)
+        ));
+
+        let replay_bytes = MAX_RETURNED_PLAINTEXT_BYTES + 1;
+        let limits = JournalReplayLimits::new(17, replay_bytes).expect("streaming byte limits");
+        let (observed_bytes, summary) = journal
+            .fold(limits, 0_u64, |observed, entry| {
+                *observed = observed
+                    .checked_add(entry.event.len() as u64)
+                    .ok_or("fold byte overflow")?;
+                Ok::<(), &'static str>(())
+            })
+            .expect("stream beyond snapshot byte limit");
+        assert_eq!(observed_bytes, replay_bytes);
+        assert_eq!(summary.entries, 17);
+        assert_eq!(summary.plaintext_bytes, replay_bytes);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn replay_callback_failure_does_not_recover_a_lagging_anchor() {
+        let path = database_path("replay-callback-failure");
+        let store = MemorySecretStore::default();
+        let mut journal = SecureJournal::open(&path, store.clone()).expect("open journal");
+        journal.append(b"first").expect("append first");
+        let earlier_anchor = store.anchor();
+        let final_entry = journal.append(b"second").expect("append second");
+        store.replace_anchor(earlier_anchor);
+
+        let limits = JournalReplayLimits::new(2, 11).expect("replay limits");
+        let mut callbacks = 0_u64;
+        assert!(matches!(
+            journal.replay(limits, |_| {
+                callbacks += 1;
+                if callbacks == 2 {
+                    Err("injected callback failure")
+                } else {
+                    Ok(())
+                }
+            }),
+            Err(JournalReplayError::Callback("injected callback failure"))
+        ));
+        assert_eq!(callbacks, 2);
+        assert_eq!(store.anchor(), earlier_anchor);
+
+        let summary = journal
+            .replay::<(), _>(limits, |_| Ok(()))
+            .expect("retry successful replay");
+        assert_eq!(summary.head.sequence, 2);
+        assert_eq!(summary.head.entry_hash, final_entry.entry_hash);
+        assert_eq!(store.anchor(), summary.head);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn replay_verifies_tamper_before_invoking_callbacks() {
+        let path = database_path("replay-tamper");
+        let store = MemorySecretStore::default();
+        let mut journal = SecureJournal::open(&path, store).expect("open journal");
+        journal.append(b"first").expect("append first");
+        journal.append(b"second").expect("append second");
+        rewrite_ciphertext_and_public_hash(&path, 2);
+
+        let mut callbacks = 0_u64;
+        let sequence_limited = JournalReplayLimits::new(1, 5).expect("one-record limits");
+        assert!(matches!(
+            journal.replay::<(), _>(sequence_limited, |_| {
+                callbacks += 1;
+                Ok(())
+            }),
+            Err(JournalReplayError::Journal(JournalError::ReadLimitExceeded))
+        ));
+        assert_eq!(callbacks, 0);
+
+        let byte_limited = JournalReplayLimits::new(2, 5).expect("first-event byte boundary");
+        assert!(matches!(
+            journal.replay::<(), _>(byte_limited, |_| {
+                callbacks += 1;
+                Ok(())
+            }),
+            Err(JournalReplayError::Journal(JournalError::ReadLimitExceeded))
+        ));
+        assert_eq!(callbacks, 0);
+
+        let limits = JournalReplayLimits::new(2, 11).expect("complete replay limits");
+        assert!(matches!(
+            journal.replay::<(), _>(limits, |_| {
+                callbacks += 1;
+                Ok(())
+            }),
+            Err(JournalReplayError::Journal(
+                JournalError::AuthenticationFailed
+            ))
+        ));
+        assert_eq!(callbacks, 0);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn replay_rejects_truncation_and_sequence_gaps_before_callbacks() {
+        for (name, tamper) in [
+            (
+                "truncated",
+                "DROP TRIGGER secure_journal_entries_no_delete;
+                 DELETE FROM secure_journal_entries WHERE sequence = 3;",
+            ),
+            (
+                "sequence-gap",
+                "DROP TRIGGER secure_journal_entries_no_update;
+                 UPDATE secure_journal_entries SET sequence = 4 WHERE sequence = 2;",
+            ),
+        ] {
+            let path = database_path(name);
+            let store = MemorySecretStore::default();
+            let mut journal = SecureJournal::open(&path, store).expect("open journal");
+            journal.append(b"one").expect("append one");
+            journal.append(b"two").expect("append two");
+            journal.append(b"three").expect("append three");
+            Connection::open(&path)
+                .expect("open raw journal")
+                .execute_batch(tamper)
+                .expect("apply journal tamper");
+
+            let limits = JournalReplayLimits::new(4, 11).expect("replay limits");
+            let mut callbacks = 0_u64;
+            assert!(matches!(
+                journal.replay::<(), _>(limits, |_| {
+                    callbacks += 1;
+                    Ok(())
+                }),
+                Err(JournalReplayError::Journal(
+                    JournalError::RollbackDetected | JournalError::CorruptChain
+                ))
+            ));
+            assert_eq!(callbacks, 0);
+            remove_database(&path);
+        }
     }
 
     #[cfg(unix)]
