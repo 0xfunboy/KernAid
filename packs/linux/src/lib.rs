@@ -64,6 +64,7 @@ pub enum RepairError {
     RepairNotApplicable,
     AmbiguousTarget,
     ValidationFailed,
+    UnsupportedMetadata,
     MetadataPreservationFailed,
     PostInstallRolledBack {
         cause: Box<RepairError>,
@@ -84,7 +85,12 @@ impl From<std::io::Error> for RepairError {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FstabPreview {
+    /// Opaque execution precondition binding content, ownership, mode, and
+    /// the exact file observed during preview.
     pub target_fingerprint: String,
+    /// Content-only fingerprint suitable for receipts and user-visible
+    /// comparisons. It is not sufficient to authorize execution.
+    pub target_content_fingerprint: String,
     pub before: String,
     pub after: String,
     pub backup_required: bool,
@@ -96,6 +102,9 @@ pub struct FstabPreview {
 pub struct RepairReceipt {
     pub before_fingerprint: String,
     pub after_fingerprint: String,
+    /// Opaque rollback precondition for the exact installed file and its
+    /// supported metadata.
+    pub after_target_precondition: String,
     pub backup_path: PathBuf,
     pub backup_fingerprint: String,
     pub before_metadata: PreservedMetadata,
@@ -135,6 +144,23 @@ fn fingerprint(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
 }
 
+fn snapshot_precondition(snapshot: &Snapshot) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"KERNAID_FSTAB_SNAPSHOT_PRECONDITION_V1\0");
+    digest.update(
+        u64::try_from(snapshot.bytes.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    digest.update(&snapshot.bytes);
+    digest.update(snapshot.state.identity.device.to_be_bytes());
+    digest.update(snapshot.state.identity.inode.to_be_bytes());
+    digest.update(snapshot.state.metadata.mode.to_be_bytes());
+    digest.update(snapshot.state.metadata.uid.to_be_bytes());
+    digest.update(snapshot.state.metadata.gid.to_be_bytes());
+    format!("sha256:{:x}", digest.finalize())
+}
+
 fn rustix_error(error: rustix::io::Errno) -> RepairError {
     RepairError::Io(error.to_string())
 }
@@ -158,6 +184,20 @@ fn state_from_stat(stat: &Stat) -> Result<FileState, RepairError> {
 
 fn same_identity(left: &FileState, right: &FileState) -> bool {
     left.identity == right.identity
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn reject_unsupported_metadata(file: &File) -> Result<(), RepairError> {
+    let mut empty = [0_u8; 0];
+    match rfs::flistxattr(file, &mut empty) {
+        Ok(0) => Ok(()),
+        Ok(_) | Err(_) => Err(RepairError::UnsupportedMetadata),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+fn reject_unsupported_metadata(_file: &File) -> Result<(), RepairError> {
+    Err(RepairError::UnsupportedMetadata)
 }
 
 fn open_directory(path: &Path) -> Result<(PathBuf, OwnedFd), RepairError> {
@@ -211,7 +251,9 @@ fn open_named_regular(parent: &OwnedFd, name: &Path) -> Result<(File, FileState)
     if !same_identity(&state, &named) {
         return Err(RepairError::StaleTarget);
     }
-    Ok((File::from(fd), state))
+    let file = File::from(fd);
+    reject_unsupported_metadata(&file)?;
+    Ok((file, state))
 }
 
 fn read_bounded(file: &File) -> Result<Vec<u8>, RepairError> {
@@ -234,10 +276,16 @@ fn read_bounded(file: &File) -> Result<Vec<u8>, RepairError> {
 
 fn snapshot_named(parent: &OwnedFd, name: &Path) -> Result<Snapshot, RepairError> {
     let (file, state) = open_named_regular(parent, name)?;
-    Ok(Snapshot {
-        bytes: read_bounded(&file)?,
-        state,
-    })
+    let bytes = read_bounded(&file)?;
+    reject_unsupported_metadata(&file)?;
+    let final_state = state_from_stat(&rfs::fstat(&file).map_err(rustix_error)?)?;
+    let named_state = state_from_stat(
+        &rfs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW).map_err(rustix_error)?,
+    )?;
+    if final_state != state || named_state != state {
+        return Err(RepairError::StaleTarget);
+    }
+    Ok(Snapshot { bytes, state })
 }
 
 fn canonical_fixture(root: &Path) -> Result<Fixture, RepairError> {
@@ -777,8 +825,10 @@ pub fn preview_missing_fstab_device(
     let fixture = canonical_fixture(root)?;
     let before = snapshot_named(&fixture.etc, Path::new(FSTAB_NAME))?;
     let after = repaired(&before.bytes)?;
+    let target_content_fingerprint = fingerprint(&before.bytes);
     Ok(FstabPreview {
-        target_fingerprint: fingerprint(&before.bytes),
+        target_fingerprint: snapshot_precondition(&before),
+        target_content_fingerprint,
         before: String::from_utf8(before.bytes).map_err(|_| RepairError::ValidationFailed)?,
         after: String::from_utf8(after).map_err(|_| RepairError::ValidationFailed)?,
         backup_required: true,
@@ -790,14 +840,14 @@ pub fn preview_missing_fstab_device(
 pub fn execute_missing_fstab_device_repair(
     root: &Path,
     backup_dir: &Path,
-    expected_fingerprint: &str,
+    expected_precondition: &str,
     evidence_ids: &[String],
     approval_id: &str,
 ) -> Result<RepairReceipt, RepairError> {
     execute_with_post_install_validator(
         root,
         backup_dir,
-        expected_fingerprint,
+        expected_precondition,
         evidence_ids,
         approval_id,
         |_, _| Ok(()),
@@ -807,7 +857,7 @@ pub fn execute_missing_fstab_device_repair(
 fn execute_with_post_install_validator<F>(
     root: &Path,
     backup_dir: &Path,
-    expected_fingerprint: &str,
+    expected_precondition: &str,
     evidence_ids: &[String],
     approval_id: &str,
     post_install_validator: F,
@@ -826,13 +876,21 @@ where
     if canonical_backup.starts_with(&fixture.canonical_path) {
         return Err(RepairError::BackupInsideTarget);
     }
+    let observed = snapshot_named(&fixture.etc, Path::new(FSTAB_NAME))?;
+    if snapshot_precondition(&observed) != expected_precondition {
+        return Err(RepairError::StaleTarget);
+    }
     let _lock = FixtureLock::acquire(&fixture.etc)?;
     let before = snapshot_named(&fixture.etc, Path::new(FSTAB_NAME))?;
-    if fingerprint(&before.bytes) != expected_fingerprint {
+    if before.state != observed.state
+        || before.bytes != observed.bytes
+        || snapshot_precondition(&before) != expected_precondition
+    {
         return Err(RepairError::StaleTarget);
     }
     let after = repaired(&before.bytes)?;
-    let digest = expected_fingerprint
+    let before_fingerprint = fingerprint(&before.bytes);
+    let digest = before_fingerprint
         .strip_prefix("sha256:")
         .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
         .ok_or(RepairError::StaleTarget)?;
@@ -855,7 +913,7 @@ where
         &before.state.metadata,
     )?;
     let final_recheck = snapshot_named(&fixture.etc, Path::new(FSTAB_NAME))?;
-    if !same_identity(&final_recheck.state, &before.state) || final_recheck.bytes != before.bytes {
+    if final_recheck.state != before.state || final_recheck.bytes != before.bytes {
         return Err(RepairError::StaleTarget);
     }
 
@@ -916,8 +974,9 @@ where
     }
 
     Ok(RepairReceipt {
-        before_fingerprint: expected_fingerprint.to_owned(),
+        before_fingerprint,
         after_fingerprint: fingerprint(&installed.bytes),
+        after_target_precondition: snapshot_precondition(&installed),
         backup_path: backup.path,
         backup_fingerprint: backup.fingerprint,
         before_metadata: before.state.metadata,
@@ -965,9 +1024,24 @@ pub fn rollback_missing_fstab_device_repair(
         return Err(RepairError::ApprovalRequired);
     }
     let fixture = canonical_fixture(root)?;
-    let (_backup_parent, _backup_fd, backup) = open_verified_backup(&fixture, repair)?;
+    let observed = snapshot_named(&fixture.etc, Path::new(FSTAB_NAME))?;
+    if fingerprint(&observed.bytes) != repair.after_fingerprint
+        || snapshot_precondition(&observed) != repair.after_target_precondition
+        || observed.state.metadata != repair.before_metadata
+    {
+        return Err(RepairError::StaleTarget);
+    }
     let _lock = FixtureLock::acquire(&fixture.etc)?;
     let current = snapshot_named(&fixture.etc, Path::new(FSTAB_NAME))?;
+    if current.state != observed.state
+        || current.bytes != observed.bytes
+        || fingerprint(&current.bytes) != repair.after_fingerprint
+        || snapshot_precondition(&current) != repair.after_target_precondition
+        || current.state.metadata != repair.before_metadata
+    {
+        return Err(RepairError::StaleTarget);
+    }
+    let (_backup_parent, _backup_fd, backup) = open_verified_backup(&fixture, repair)?;
     let digest = repair
         .before_fingerprint
         .strip_prefix("sha256:")
@@ -981,8 +1055,7 @@ pub fn rollback_missing_fstab_device_repair(
         &repair.before_metadata,
     )?;
     let final_recheck = snapshot_named(&fixture.etc, Path::new(FSTAB_NAME))?;
-    if !same_identity(&final_recheck.state, &current.state) || final_recheck.bytes != current.bytes
-    {
+    if final_recheck.state != current.state || final_recheck.bytes != current.bytes {
         return Err(RepairError::StaleTarget);
     }
     rfs::renameat_with(
@@ -1081,6 +1154,21 @@ mod tests {
         b"# test\nUUID=missing-data /mnt/data ext4 defaults 0 2\n".to_vec()
     }
 
+    fn directory_names(path: &Path) -> Vec<String> {
+        let mut names = fs::read_dir(path)
+            .expect("read directory")
+            .map(|entry| {
+                entry
+                    .expect("read directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
     struct TestTree {
         root: PathBuf,
     }
@@ -1172,7 +1260,10 @@ mod tests {
         assert_ne!(receipt.before_fingerprint, receipt.after_fingerprint);
         let rollback = rollback_missing_fstab_device_repair(&tree.target(), &receipt, "A-rollback")
             .expect("rollback fixture repair");
-        assert_eq!(rollback.restored_fingerprint, preview.target_fingerprint);
+        assert_eq!(
+            rollback.restored_fingerprint,
+            preview.target_content_fingerprint
+        );
         assert!(!rollback.automatic);
         assert_eq!(
             fs::read(tree.fstab()).expect("read restored fstab"),
@@ -1204,7 +1295,10 @@ mod tests {
         assert_eq!(*cause, RepairError::ValidationFailed);
         assert!(rollback.automatic);
         assert!(rollback.validation_passed);
-        assert_eq!(rollback.restored_fingerprint, preview.target_fingerprint);
+        assert_eq!(
+            rollback.restored_fingerprint,
+            preview.target_content_fingerprint
+        );
         assert_eq!(
             fs::read(tree.fstab()).expect("read restored fstab"),
             broken_fstab()
@@ -1246,6 +1340,87 @@ mod tests {
                 .expect("read backup directory")
                 .count(),
             0
+        );
+        assert!(!tree.target().join("etc").join(LOCK_NAME).exists());
+    }
+
+    #[test]
+    fn metadata_change_since_preview_is_rejected_without_mutation() {
+        let tree = TestTree::new("fstab-stale-metadata");
+        let evidence = vec!["E-missing-uuid".to_owned()];
+        let preview = preview_missing_fstab_device(&tree.target(), &evidence)
+            .expect("preview fixture repair");
+        let before = fs::read(tree.fstab()).expect("read fstab before metadata edit");
+        fs::set_permissions(tree.fstab(), fs::Permissions::from_mode(0o600))
+            .expect("change target mode after preview");
+
+        assert_eq!(
+            execute_missing_fstab_device_repair(
+                &tree.target(),
+                &tree.backup(),
+                &preview.target_fingerprint,
+                &evidence,
+                "A-local",
+            ),
+            Err(RepairError::StaleTarget)
+        );
+        assert_eq!(
+            fs::read(tree.fstab()).expect("read unchanged fstab"),
+            before
+        );
+        assert_eq!(
+            fs::metadata(tree.fstab())
+                .expect("read externally changed mode")
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o600
+        );
+        assert!(directory_names(&tree.backup()).is_empty());
+        assert_eq!(
+            directory_names(&tree.target().join("etc")),
+            vec![FSTAB_NAME]
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn extended_metadata_is_rejected_without_mutation() {
+        let tree = TestTree::new("fstab-unsupported-metadata");
+        let evidence = vec!["E-missing-uuid".to_owned()];
+        let preview = preview_missing_fstab_device(&tree.target(), &evidence)
+            .expect("preview fixture repair");
+        let before = fs::read(tree.fstab()).expect("read fstab before xattr edit");
+        rfs::setxattr(
+            tree.fstab(),
+            "user.kernaid-test",
+            b"preserve-me",
+            rfs::XattrFlags::CREATE,
+        )
+        .expect("set unsupported target xattr");
+
+        assert_eq!(
+            execute_missing_fstab_device_repair(
+                &tree.target(),
+                &tree.backup(),
+                &preview.target_fingerprint,
+                &evidence,
+                "A-local",
+            ),
+            Err(RepairError::UnsupportedMetadata)
+        );
+        assert_eq!(
+            fs::read(tree.fstab()).expect("read unchanged fstab"),
+            before
+        );
+        let mut value = [0_u8; 32];
+        let length = rfs::getxattr(tree.fstab(), "user.kernaid-test", &mut value)
+            .expect("read retained target xattr");
+        assert_eq!(&value[..length], b"preserve-me");
+        assert!(directory_names(&tree.backup()).is_empty());
+        assert_eq!(
+            directory_names(&tree.target().join("etc")),
+            vec![FSTAB_NAME]
         );
     }
 
@@ -1368,6 +1543,166 @@ mod tests {
             fs::read(tree.fstab()).expect("read installed fstab"),
             installed
         );
+    }
+
+    #[test]
+    fn post_repair_byte_edit_is_rejected_before_explicit_rollback_mutation() {
+        let tree = TestTree::new("fstab-rollback-stale-bytes");
+        let evidence = vec!["E-1".to_owned()];
+        let preview = preview_missing_fstab_device(&tree.target(), &evidence)
+            .expect("preview fixture repair");
+        let receipt = execute_missing_fstab_device_repair(
+            &tree.target(),
+            &tree.backup(),
+            &preview.target_fingerprint,
+            &evidence,
+            "A-local",
+        )
+        .expect("execute repair");
+        let backup_before = fs::read(&receipt.backup_path).expect("read backup before rollback");
+        let names_before = directory_names(&tree.target().join("etc"));
+        let externally_changed = b"# changed after repair\nUUID=other / ext4 defaults 0 1\n";
+        fs::write(tree.fstab(), externally_changed).expect("edit repaired target externally");
+
+        assert_eq!(
+            rollback_missing_fstab_device_repair(&tree.target(), &receipt, "A-rollback"),
+            Err(RepairError::StaleTarget)
+        );
+        assert_eq!(
+            fs::read(tree.fstab()).expect("read retained external edit"),
+            externally_changed
+        );
+        assert_eq!(
+            fs::read(&receipt.backup_path).expect("read unchanged backup"),
+            backup_before
+        );
+        assert_eq!(directory_names(&tree.target().join("etc")), names_before);
+    }
+
+    #[test]
+    fn post_repair_same_content_replacement_is_rejected_without_mutation() {
+        let tree = TestTree::new("fstab-rollback-replaced-target");
+        let evidence = vec!["E-1".to_owned()];
+        let preview = preview_missing_fstab_device(&tree.target(), &evidence)
+            .expect("preview fixture repair");
+        let receipt = execute_missing_fstab_device_repair(
+            &tree.target(),
+            &tree.backup(),
+            &preview.target_fingerprint,
+            &evidence,
+            "A-local",
+        )
+        .expect("execute repair");
+        let installed = fs::read(tree.fstab()).expect("read installed target");
+        let installed_metadata = fs::metadata(tree.fstab()).expect("read installed metadata");
+        let installed_inode = installed_metadata.ino();
+        let replacement = tree.target().join("etc/fstab.external-replacement");
+        fs::write(&replacement, &installed).expect("write same-content replacement");
+        fs::set_permissions(
+            &replacement,
+            fs::Permissions::from_mode(installed_metadata.mode() & 0o7777),
+        )
+        .expect("copy installed mode to replacement");
+        fs::rename(&replacement, tree.fstab()).expect("replace installed target externally");
+        let replacement_inode = fs::metadata(tree.fstab())
+            .expect("read replacement metadata")
+            .ino();
+        assert_ne!(replacement_inode, installed_inode);
+        let names_before = directory_names(&tree.target().join("etc"));
+
+        assert_eq!(
+            rollback_missing_fstab_device_repair(&tree.target(), &receipt, "A-rollback"),
+            Err(RepairError::StaleTarget)
+        );
+        assert_eq!(
+            fs::read(tree.fstab()).expect("read retained replacement"),
+            installed
+        );
+        assert_eq!(
+            fs::metadata(tree.fstab())
+                .expect("read retained replacement identity")
+                .ino(),
+            replacement_inode
+        );
+        assert_eq!(directory_names(&tree.target().join("etc")), names_before);
+    }
+
+    #[test]
+    fn post_repair_metadata_edit_is_rejected_before_explicit_rollback_mutation() {
+        let tree = TestTree::new("fstab-rollback-stale-metadata");
+        let evidence = vec!["E-1".to_owned()];
+        let preview = preview_missing_fstab_device(&tree.target(), &evidence)
+            .expect("preview fixture repair");
+        let receipt = execute_missing_fstab_device_repair(
+            &tree.target(),
+            &tree.backup(),
+            &preview.target_fingerprint,
+            &evidence,
+            "A-local",
+        )
+        .expect("execute repair");
+        let installed = fs::read(tree.fstab()).expect("read installed target");
+        let names_before = directory_names(&tree.target().join("etc"));
+        fs::set_permissions(tree.fstab(), fs::Permissions::from_mode(0o600))
+            .expect("change installed target mode externally");
+
+        assert_eq!(
+            rollback_missing_fstab_device_repair(&tree.target(), &receipt, "A-rollback"),
+            Err(RepairError::StaleTarget)
+        );
+        assert_eq!(
+            fs::read(tree.fstab()).expect("read installed target"),
+            installed
+        );
+        assert_eq!(
+            fs::metadata(tree.fstab())
+                .expect("read retained external mode")
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o600
+        );
+        assert_eq!(directory_names(&tree.target().join("etc")), names_before);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn post_repair_xattr_is_rejected_before_explicit_rollback_mutation() {
+        let tree = TestTree::new("fstab-rollback-unsupported-metadata");
+        let evidence = vec!["E-1".to_owned()];
+        let preview = preview_missing_fstab_device(&tree.target(), &evidence)
+            .expect("preview fixture repair");
+        let receipt = execute_missing_fstab_device_repair(
+            &tree.target(),
+            &tree.backup(),
+            &preview.target_fingerprint,
+            &evidence,
+            "A-local",
+        )
+        .expect("execute repair");
+        let installed = fs::read(tree.fstab()).expect("read installed target");
+        let names_before = directory_names(&tree.target().join("etc"));
+        rfs::setxattr(
+            tree.fstab(),
+            "user.kernaid-test",
+            b"preserve-me",
+            rfs::XattrFlags::CREATE,
+        )
+        .expect("set installed target xattr externally");
+
+        assert_eq!(
+            rollback_missing_fstab_device_repair(&tree.target(), &receipt, "A-rollback"),
+            Err(RepairError::UnsupportedMetadata)
+        );
+        assert_eq!(
+            fs::read(tree.fstab()).expect("read installed target"),
+            installed
+        );
+        let mut value = [0_u8; 32];
+        let length = rfs::getxattr(tree.fstab(), "user.kernaid-test", &mut value)
+            .expect("read retained installed xattr");
+        assert_eq!(&value[..length], b"preserve-me");
+        assert_eq!(directory_names(&tree.target().join("etc")), names_before);
     }
 
     #[test]

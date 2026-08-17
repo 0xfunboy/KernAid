@@ -15,6 +15,12 @@ The transaction:
 - parses the documented Linux `fstab` grammar (four required fields, two
   optional numeric fields, comments, blank lines, and octal field escapes);
 - rejects malformed or ambiguous input before creating a backup;
+- binds execution to an opaque preview precondition covering the exact target
+  file, its bytes, mode, uid, and gid; a content-only fingerprint is exposed
+  separately for receipts and comparison;
+- fails closed before mutation when any extended attribute is present or
+  cannot be inspected. This includes unsupported POSIX ACL, SELinux label,
+  file-capability, and user-xattr metadata;
 - opens the fixture, `etc`, `fstab`, backup, lock, and temporary files relative
   to held directory descriptors with no-follow semantics;
 - holds a nonblocking advisory lock on a persistent, no-follow, mode-`0600`
@@ -32,13 +38,18 @@ The transaction:
 - automatically exchanges the original file back after every post-install
   failure and returns a structured rollback receipt; and
 - supports an explicit, structured, byte-verified rollback using the repair
-  receipt.
+  receipt; rollback first requires the current bytes to match the receipt's
+  post-repair fingerprint and an opaque precondition to match the exact
+  installed file plus its mode/uid/gid, so an external edit or same-content
+  replacement is never overwritten.
 
 Tests cover injected post-install validation failure with automatic rollback,
 symlink rejection, stale targets, concurrent locks, backup tampering,
-mode/uid/gid preservation, malformed grammar, and backups placed inside the
-target. Temporary files are created exclusively and removed only when their
-device/inode identity still matches the file created by this transaction.
+mode/uid/gid preservation, metadata-bound previews, unsupported xattrs,
+post-repair byte and mode changes, same-content target replacement, malformed
+grammar, and backups placed inside the target. Temporary files are created
+exclusively and removed only when their device/inode identity still matches
+the file created by this transaction.
 
 ## P0 read-only diagnostics
 
