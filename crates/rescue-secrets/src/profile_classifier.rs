@@ -61,6 +61,10 @@ const EXT4_FLEX_GROUP_LOG: u8 = 4;
 const EXT4_INODE_BYTES: u64 = 256;
 const EXT4_JOURNAL_BYTES: u64 = 128 * 1024 * 1024;
 const EXT4_JOURNAL_BLOCKS: u64 = EXT4_JOURNAL_BYTES / EXT4_BLOCK_BYTES;
+const JBD2_SUPERBLOCK_BYTES: usize = 1024;
+const JBD2_CHECKSUM_OFFSET: usize = 0xfc;
+const JBD2_FEATURE_INCOMPAT_64BIT_CSUM_V3: u32 = 0x0000_0012;
+const JBD2_CRC32C_CHECKSUM_TYPE: u8 = 4;
 const PROFILE_SHA256: [u8; 32] = [
     0xb4, 0x80, 0x13, 0x59, 0xbd, 0x4f, 0x31, 0xce, 0x67, 0xfb, 0xd3, 0xec, 0x15, 0xb6, 0xc8, 0x1c,
     0x44, 0xaa, 0x67, 0x59, 0xba, 0x43, 0xb2, 0xa4, 0xe0, 0x99, 0xa7, 0xdf, 0xcc, 0x25, 0xa3, 0x7c,
@@ -978,24 +982,10 @@ fn parse_ext4_profile(
         let journal_offset = extent_start
             .checked_mul(EXT4_BLOCK_BYTES)
             .ok_or(ProfileClassifierError::InvalidDescriptor)?;
-        let mut journal_superblock = [0_u8; 1024];
+        let mut journal_superblock = [0_u8; JBD2_SUPERBLOCK_BYTES];
         read_exact_at(file, &mut journal_superblock, journal_offset)?;
         revalidate()?;
-        if be_u32(&journal_superblock, 0x00) != Some(0xc03b_3998)
-            || be_u32(&journal_superblock, 0x04) != Some(4)
-            || be_u32(&journal_superblock, 0x08) != Some(0)
-            || be_u32(&journal_superblock, 0x0c) != Some(4096)
-            || be_u32(&journal_superblock, 0x10) != Some(EXT4_JOURNAL_BLOCKS as u32)
-            || be_u32(&journal_superblock, 0x14) != Some(1)
-            || be_u32(&journal_superblock, 0x18).is_none_or(|sequence| sequence == 0)
-            || be_u32(&journal_superblock, 0x1c) != Some(0)
-            || be_u32(&journal_superblock, 0x20) != Some(0)
-            || be_u32(&journal_superblock, 0x24) != Some(0)
-            || be_u32(&journal_superblock, 0x28) != Some(0)
-            || be_u32(&journal_superblock, 0x2c) != Some(0)
-            || journal_superblock[0x30..0x40] != filesystem_uuid
-            || be_u32(&journal_superblock, 0x40) != Some(1)
-        {
+        if !verify_jbd2_superblock(&journal_superblock, &filesystem_uuid) {
             return Ok(None);
         }
     }
@@ -1003,6 +993,65 @@ fn parse_ext4_profile(
         uuid: filesystem_uuid,
         journal_start_block: extent_start,
     }))
+}
+
+fn verify_jbd2_superblock(
+    superblock: &[u8; JBD2_SUPERBLOCK_BYTES],
+    filesystem_uuid: &[u8; 16],
+) -> bool {
+    let Some(sequence) = be_u32(superblock, 0x18) else {
+        return false;
+    };
+    let Some(incompat_features) = be_u32(superblock, 0x28) else {
+        return false;
+    };
+    let Some(head) = be_u32(superblock, 0x58) else {
+        return false;
+    };
+    let Some(stored_checksum) = be_u32(superblock, JBD2_CHECKSUM_OFFSET) else {
+        return false;
+    };
+
+    if be_u32(superblock, 0x00) != Some(0xc03b_3998)
+        || be_u32(superblock, 0x04) != Some(4)
+        || be_u32(superblock, 0x08) != Some(0)
+        || be_u32(superblock, 0x0c) != Some(EXT4_BLOCK_BYTES as u32)
+        || be_u32(superblock, 0x10) != Some(EXT4_JOURNAL_BLOCKS as u32)
+        || be_u32(superblock, 0x14) != Some(1)
+        || sequence == 0
+        || be_u32(superblock, 0x1c) != Some(0)
+        || be_u32(superblock, 0x20) != Some(0)
+        || be_u32(superblock, 0x24) != Some(0)
+        || be_u32(superblock, 0x2c) != Some(0)
+        || superblock[0x30..0x40] != *filesystem_uuid
+        || be_u32(superblock, 0x40) != Some(1)
+        || be_u32(superblock, 0x44) != Some(0)
+        || be_u32(superblock, 0x48) != Some(0)
+        || be_u32(superblock, 0x4c) != Some(0)
+        || superblock[0x51..0x54].iter().any(|byte| *byte != 0)
+        || be_u32(superblock, 0x54) != Some(0)
+        || superblock[0x5c..JBD2_CHECKSUM_OFFSET]
+            .iter()
+            .any(|byte| *byte != 0)
+        || superblock[0x100..].iter().any(|byte| *byte != 0)
+    {
+        return false;
+    }
+
+    match incompat_features {
+        0 => sequence == 1 && superblock[0x50] == 0 && head == 0 && stored_checksum == 0,
+        JBD2_FEATURE_INCOMPAT_64BIT_CSUM_V3 => {
+            if superblock[0x50] != JBD2_CRC32C_CHECKSUM_TYPE
+                || !(1..EXT4_JOURNAL_BLOCKS as u32).contains(&head)
+            {
+                return false;
+            }
+            let mut checksum_input = *superblock;
+            checksum_input[JBD2_CHECKSUM_OFFSET..JBD2_CHECKSUM_OFFSET + 4].fill(0);
+            stored_checksum == crc32c(!0, &checksum_input)
+        }
+        _ => false,
+    }
 }
 
 fn crc32c(mut checksum: u32, bytes: &[u8]) -> u32 {
@@ -1224,6 +1273,20 @@ mod tests {
         file
     }
 
+    fn set_jbd2_checksum_v3(file: &File) {
+        let journal_offset = 557_056 * EXT4_BLOCK_BYTES;
+        let mut journal = [0_u8; JBD2_SUPERBLOCK_BYTES];
+        read_exact_at(file, &mut journal, journal_offset).expect("read jbd2 fixture");
+        put_be32(&mut journal, 0x28, JBD2_FEATURE_INCOMPAT_64BIT_CSUM_V3);
+        journal[0x50] = JBD2_CRC32C_CHECKSUM_TYPE;
+        put_be32(&mut journal, 0x58, 9);
+        put_be32(&mut journal, JBD2_CHECKSUM_OFFSET, 0);
+        let checksum = crc32c(!0, &journal);
+        put_be32(&mut journal, JBD2_CHECKSUM_OFFSET, checksum);
+        file.write_all_at(&journal, journal_offset)
+            .expect("write checksum-v3 jbd2 fixture");
+    }
+
     #[test]
     fn embedded_profile_and_layout_bind_the_same_pinned_geometry_and_digest() {
         verify_embedded_profile().expect("canonical profile");
@@ -1389,12 +1452,56 @@ mod tests {
         );
         assert_eq!(evidence.journal_start_block(), 557_056);
 
+        set_jbd2_checksum_v3(&file);
+        assert!(
+            parse_ext4_profile(&file, &mut || Ok(()), Ext4CheckPhase::PreMount)
+                .expect("checksum-v3 journal read")
+                .is_some()
+        );
+
+        file.write_all_at(
+            &0x0000_0013_u32.to_be_bytes(),
+            557_056 * EXT4_BLOCK_BYTES + 0x28,
+        )
+        .expect("tamper jbd2 features");
+        let mut feature_tamper = [0_u8; JBD2_SUPERBLOCK_BYTES];
+        read_exact_at(&file, &mut feature_tamper, 557_056 * EXT4_BLOCK_BYTES)
+            .expect("read feature-tampered jbd2 fixture");
+        put_be32(&mut feature_tamper, JBD2_CHECKSUM_OFFSET, 0);
+        let feature_tamper_checksum = crc32c(!0, &feature_tamper);
+        put_be32(
+            &mut feature_tamper,
+            JBD2_CHECKSUM_OFFSET,
+            feature_tamper_checksum,
+        );
+        file.write_all_at(&feature_tamper, 557_056 * EXT4_BLOCK_BYTES)
+            .expect("write feature-tampered jbd2 fixture");
+        assert!(
+            parse_ext4_profile(&file, &mut || Ok(()), Ext4CheckPhase::PreMount)
+                .expect("feature-tampered journal read")
+                .is_none()
+        );
+
+        set_jbd2_checksum_v3(&file);
+        let mut checksum_tamper = [0_u8; JBD2_SUPERBLOCK_BYTES];
+        read_exact_at(&file, &mut checksum_tamper, 557_056 * EXT4_BLOCK_BYTES)
+            .expect("read checksum-v3 jbd2 fixture");
+        checksum_tamper[JBD2_CHECKSUM_OFFSET] ^= 1;
+        file.write_all_at(&checksum_tamper, 557_056 * EXT4_BLOCK_BYTES)
+            .expect("write checksum-tampered jbd2 fixture");
+        assert!(
+            parse_ext4_profile(&file, &mut || Ok(()), Ext4CheckPhase::PreMount)
+                .expect("checksum-tampered journal read")
+                .is_none()
+        );
+
         let short_journal = ext4_file((EXT4_JOURNAL_BLOCKS / 2) as u16);
         assert!(
             parse_ext4_profile(&short_journal, &mut || Ok(()), Ext4CheckPhase::PreMount,)
                 .expect("short journal read")
                 .is_none()
         );
+        set_jbd2_checksum_v3(&file);
         file.write_all_at(&[0], 557_056 * EXT4_BLOCK_BYTES)
             .expect("tamper jbd2 magic");
         assert!(
