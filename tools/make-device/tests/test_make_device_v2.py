@@ -734,6 +734,137 @@ class ProcessAndLifecycleTests(unittest.TestCase):
             with self.assertRaisesRegex(writer.SafetyError, "logical sector"):
                 writer._revalidate_target_fd(51, target, logical_sector_bytes=512)
 
+    def test_ci_loop_partscan_is_identity_bound_and_required(self) -> None:
+        target = SimpleNamespace(
+            kind="loop",
+            path="/dev/loop9",
+            kname="/dev/loop9",
+            major_minor="7:9",
+        )
+        details = SimpleNamespace(
+            st_mode=stat.S_IFBLK | 0o600,
+            st_rdev=os.makedev(7, 9),
+            st_dev=42,
+            st_ino=77,
+        )
+        expected_sysfs = "/sys/devices/virtual/block/loop9"
+
+        def resolve(path: str) -> str:
+            if path in ("/sys/dev/block/7:9", "/sys/class/block/loop9"):
+                return expected_sysfs
+            return path
+
+        with (
+            mock.patch.object(writer.os.path, "realpath", side_effect=resolve),
+            mock.patch.object(writer.os.path, "isdir", return_value=True),
+            mock.patch.object(writer.os, "stat", return_value=details),
+            mock.patch.object(writer, "_read_small_text", return_value="1") as read,
+        ):
+            self.assertEqual(
+                writer.verify_ci_loop_partition_scan(target), expected_sysfs
+            )
+        read.assert_called_once_with(
+            f"{expected_sysfs}/loop/partscan", "CI loop partition-scan flag"
+        )
+
+        with (
+            mock.patch.object(writer.os.path, "realpath", side_effect=resolve),
+            mock.patch.object(writer.os.path, "isdir", return_value=True),
+            mock.patch.object(writer.os, "stat", return_value=details),
+            mock.patch.object(writer, "_read_small_text", return_value="0"),
+        ):
+            with self.assertRaisesRegex(writer.SafetyError, "LO_FLAGS_PARTSCAN"):
+                writer.verify_ci_loop_partition_scan(target)
+
+    def test_loop_backing_probe_refuses_disabled_partscan_before_subprocess(self) -> None:
+        target = SimpleNamespace(path="/dev/loop9")
+        image = SimpleNamespace(device=1, inode=2)
+        with (
+            mock.patch.object(
+                writer,
+                "verify_ci_loop_partition_scan",
+                side_effect=writer.SafetyError("LO_FLAGS_PARTSCAN is disabled"),
+            ),
+            mock.patch.object(writer, "_fixed_binary") as fixed_binary,
+            mock.patch.object(writer, "run_command") as runner,
+        ):
+            with self.assertRaisesRegex(writer.SafetyError, "LO_FLAGS_PARTSCAN"):
+                writer.inspect_loop_backing(target, image)
+        fixed_binary.assert_not_called()
+        runner.assert_not_called()
+
+    def test_partition_rescan_never_weakens_the_physical_path(self) -> None:
+        target = SimpleNamespace(path="/dev/sdz", major_minor="8:240")
+        with (
+            mock.patch.object(writer, "_revalidate_target_fd") as revalidate,
+            mock.patch.object(writer, "verify_ci_loop_partition_scan") as partscan,
+            mock.patch.object(
+                writer.fcntl,
+                "ioctl",
+                side_effect=OSError(22, "Invalid argument"),
+            ) as ioctl,
+        ):
+            with self.assertRaisesRegex(writer.WriteError, "partition-table rescan"):
+                writer._rescan_partition_table(
+                    51, target, ci_mode=False, logical_sector_bytes=512
+                )
+        revalidate.assert_called_once_with(51, target, logical_sector_bytes=512)
+        partscan.assert_not_called()
+        ioctl.assert_called_once_with(51, writer.BLKRRPART)
+
+    def test_ci_rescan_requires_partscan_before_the_kernel_ioctl(self) -> None:
+        target = SimpleNamespace(path="/dev/loop9", major_minor="7:9")
+        events: list[str] = []
+        with (
+            mock.patch.object(
+                writer,
+                "_revalidate_target_fd",
+                side_effect=lambda *_args, **_kwargs: events.append("identity"),
+            ),
+            mock.patch.object(
+                writer,
+                "verify_ci_loop_partition_scan",
+                side_effect=lambda *_args, **_kwargs: events.append("partscan"),
+            ),
+            mock.patch.object(
+                writer.fcntl,
+                "ioctl",
+                side_effect=lambda *_args, **_kwargs: events.append("ioctl"),
+            ),
+        ):
+            writer._rescan_partition_table(
+                51, target, ci_mode=True, logical_sector_bytes=512
+            )
+        self.assertEqual(events, ["identity", "partscan", "ioctl", "identity"])
+
+        with (
+            mock.patch.object(writer, "_revalidate_target_fd"),
+            mock.patch.object(
+                writer,
+                "verify_ci_loop_partition_scan",
+                side_effect=writer.SafetyError("partscan disabled"),
+            ),
+            mock.patch.object(writer.fcntl, "ioctl") as ioctl,
+        ):
+            with self.assertRaisesRegex(writer.SafetyError, "partscan disabled"):
+                writer._rescan_partition_table(
+                    51, target, ci_mode=True, logical_sector_bytes=512
+                )
+        ioctl.assert_not_called()
+
+    def test_privileged_loop_fixture_enables_partscan_before_writer_start(self) -> None:
+        fixture = (
+            REPO_DIR / "tools/make-device/tests/loop-v2-smoke.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "losetup --find --show --nooverlap --partscan --sector-size 512",
+            fixture,
+        )
+        self.assertLess(
+            fixture.index("--nooverlap --partscan --sector-size 512"),
+            fixture.index('--device "$loop_device"'),
+        )
+
     def test_partition_signature_probe_fails_closed_on_any_recognized_type(self) -> None:
         empty = writer.CommandResult(0, b'{"signatures": []}\n', b"")
         conflict = writer.CommandResult(

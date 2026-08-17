@@ -277,7 +277,9 @@ install -o root -g root -m 0644 \
 
 truncate -s 32000000000 "$backing"
 chmod 0600 "$backing"
-loop_device="$(losetup --find --show "$backing")"
+loop_device="$(
+  losetup --find --show --nooverlap --partscan --sector-size 512 "$backing"
+)"
 [[ "$loop_device" =~ ^/dev/loop[0-9]+$ ]] || {
   echo "losetup returned an unexpected path" >&2
   exit 1
@@ -291,6 +293,10 @@ read -r major_minor device_size disk_sequence < <(
   exit 1
 }
 read -r backing_device backing_inode < <(stat --format='%d %i' "$backing")
+if [[ "$(<"/sys/dev/block/$major_minor/loop/partscan")" != "1" ]]; then
+  echo "Disposable loop does not expose the required LO_FLAGS_PARTSCAN flag" >&2
+  exit 1
+fi
 token="KERNAID_CI_DISPOSABLE_LOOP path=$loop_device majmin=$major_minor"
 token+=" size=$device_size diskseq=$disk_sequence"
 token+=" backing=$backing_device:$backing_inode"

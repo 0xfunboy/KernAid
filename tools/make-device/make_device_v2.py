@@ -1134,7 +1134,60 @@ def probe_usb_media(candidate) -> object:
     return parse_udev_properties(result.stdout, candidate)
 
 
+def verify_ci_loop_partition_scan(candidate) -> str:
+    """Require an identity-bound loop with ``LO_FLAGS_PARTSCAN`` enabled.
+
+    A disposable loop is attached before the finalized MBR is copied.  Linux
+    will reject ``BLKRRPART`` on a loop that was created without partscan, so
+    discovering that capability only after the raw write would unnecessarily
+    turn a safe CI refusal into partial media.  This check is intentionally
+    loop-only; physical USB media continue to use the ordinary mandatory
+    ``BLKRRPART`` path without any fallback.
+    """
+
+    if (
+        candidate.kind != "loop"
+        or not v1.LOOP_PATH_RE.fullmatch(candidate.path)
+        or os.path.basename(candidate.kname) != os.path.basename(candidate.path)
+        or not v1.MAJ_MIN_RE.fullmatch(candidate.major_minor)
+    ):
+        raise SafetyError("CI partition-scan capability requires one exact /dev/loopN")
+    loop_name = os.path.basename(candidate.path)
+    expected_sysfs = f"/sys/devices/virtual/block/{loop_name}"
+    major_minor_link = f"/sys/dev/block/{candidate.major_minor}"
+    class_link = f"/sys/class/block/{loop_name}"
+    resolved = os.path.realpath(major_minor_link)
+    if (
+        resolved != expected_sysfs
+        or os.path.realpath(class_link) != expected_sysfs
+        or not os.path.isdir(expected_sysfs)
+    ):
+        raise SafetyError("CI loop sysfs identity is not exact")
+
+    before = os.stat(candidate.path, follow_symlinks=False)
+    observed_major_minor = f"{os.major(before.st_rdev)}:{os.minor(before.st_rdev)}"
+    if not stat.S_ISBLK(before.st_mode) or observed_major_minor != candidate.major_minor:
+        raise SafetyError("CI loop path no longer matches its major:minor")
+    if _read_small_text(
+        f"{expected_sysfs}/loop/partscan", "CI loop partition-scan flag"
+    ) != "1":
+        raise SafetyError(
+            "CI loop was not created with the required LO_FLAGS_PARTSCAN capability"
+        )
+
+    after = os.stat(candidate.path, follow_symlinks=False)
+    if (
+        (after.st_dev, after.st_ino, after.st_mode, after.st_rdev)
+        != (before.st_dev, before.st_ino, before.st_mode, before.st_rdev)
+        or os.path.realpath(major_minor_link) != expected_sysfs
+        or os.path.realpath(class_link) != expected_sysfs
+    ):
+        raise SafetyError("CI loop identity changed during partition-scan validation")
+    return expected_sysfs
+
+
 def inspect_loop_backing(candidate, image) -> object:
+    verify_ci_loop_partition_scan(candidate)
     losetup = _fixed_binary(LOSETUP_PATHS, "losetup")
     result = run_command(
         [
@@ -1197,6 +1250,7 @@ def inspect_loop_backing(candidate, image) -> object:
         raise SafetyError("disposable loop backing-file identity or permissions changed")
     if (details.st_dev, details.st_ino) == (image.device, image.inode):
         raise SafetyError("ISO source and disposable loop backing are identical")
+    verify_ci_loop_partition_scan(candidate)
     return v1.LoopBacking(
         backing,
         details.st_dev,
@@ -1621,16 +1675,43 @@ def _parse_uevent(path: str) -> dict[str, str]:
     return values
 
 
-def discover_partition(target_fd: int, candidate, layout) -> tuple[int, PartitionIdentity]:
+def _rescan_partition_table(
+    target_fd: int,
+    candidate,
+    *,
+    ci_mode: bool,
+    logical_sector_bytes: int | None = None,
+) -> None:
+    _revalidate_target_fd(
+        target_fd, candidate, logical_sector_bytes=logical_sector_bytes
+    )
+    if ci_mode:
+        verify_ci_loop_partition_scan(candidate)
+    try:
+        fcntl.ioctl(target_fd, BLKRRPART)
+    except OSError as error:
+        raise WriteError(
+            f"kernel refused the exact partition-table rescan: {error}"
+        ) from error
+    _revalidate_target_fd(
+        target_fd, candidate, logical_sector_bytes=logical_sector_bytes
+    )
+
+
+def discover_partition(
+    target_fd: int, candidate, layout, *, ci_mode: bool = False
+) -> tuple[int, PartitionIdentity]:
     _revalidate_target_fd(
         target_fd,
         candidate,
         logical_sector_bytes=layout.logical_sector_bytes,
     )
-    try:
-        fcntl.ioctl(target_fd, BLKRRPART)
-    except OSError as error:
-        raise WriteError(f"kernel refused the exact partition-table rescan: {error}") from error
+    _rescan_partition_table(
+        target_fd,
+        candidate,
+        ci_mode=ci_mode,
+        logical_sector_bytes=layout.logical_sector_bytes,
+    )
     udevadm = _fixed_binary(UDEVADM_PATHS, "udevadm")
     run_command(
         [udevadm, "settle", "--timeout=20"],
@@ -3477,7 +3558,7 @@ def execute(args: argparse.Namespace, state: OperationState) -> Mapping[str, obj
         )
         verify_finalized_image_layout(target_fd, image, layout)
         partition_fd, partition = discover_partition(
-            target_fd, final_candidate, layout
+            target_fd, final_candidate, layout, ci_mode=ci_mode
         )
         evidence = provision_vault(
             target_fd,
