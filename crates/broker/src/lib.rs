@@ -1,6 +1,12 @@
 #![forbid(unsafe_code)]
 use kernaid_protocol::BrokerRequest;
 
+/// Dormant, Linux-only broker core for the explicitly marked disposable
+/// `fstab` fixture. It is not connected to IPC, Core, the desktop, or a
+/// production target.
+#[cfg(target_os = "linux")]
+pub mod fixture_repair;
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum BrokerError {
     InvalidRequest,

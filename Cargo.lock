@@ -2182,7 +2182,14 @@ dependencies = [
 name = "kernaid-broker"
 version = "0.1.0"
 dependencies = [
+ "kernaid-device-identity",
+ "kernaid-linux-pack",
  "kernaid-protocol",
+ "kernaid-storage",
+ "serde",
+ "serde_json",
+ "sha2",
+ "zeroize",
 ]
 
 [[package]]
