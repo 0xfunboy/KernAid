@@ -1,10 +1,20 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { RescueOfflineInspectionError } from "../src/native.js";
 import {
+  finishRescueInspection,
   formatBytes,
   observationStatus,
   rescueCandidatePresentation,
+  rescueInspectionErrorPresentation,
+  rescueInspectionFailureDisposition,
+  rescueInspectionNeedsRescan,
+  rescueInspectionPresentation,
+  rescueInspectionRequiresRestart,
+  rescueInspectionResponseCurrent,
+  sameRescueInspection,
   sameRescueSelection,
+  tryStartRescueInspection,
 } from "../src/rescue-ui.js";
 
 test("same-family Rescue candidates remain visibly distinguishable", () => {
@@ -58,6 +68,130 @@ test("a session selection cannot survive a Rescue retarget", () => {
   assert.equal(sameRescueSelection(first, first), true);
   assert.equal(sameRescueSelection(first, second), false);
   assert.equal(sameRescueSelection(first, undefined), false);
+});
+
+test("inspection presentation exposes only normalized read-only facts", () => {
+  const inspection = windowsInspectionFixture();
+  const view = rescueInspectionPresentation(inspection);
+  assert.equal(view.title, "Windows");
+  assert.match(view.detail, /NTFS/u);
+  assert.match(view.detail, /installazione confermata/u);
+  assert.ok(
+    view.facts.some((fact) => /Marker installazione: 6\/6/u.test(fact)),
+  );
+  assert.ok(view.facts.some((fact) => /dirty\/ibernazione/u.test(fact)));
+  assert.doesNotMatch(JSON.stringify(view), /scan:|target:|disk-1/u);
+});
+
+test("stale inspection responses cannot survive an epoch change or retarget", () => {
+  const scan = targetScanFixture();
+  const selection = {
+    apiVersion: scan.apiVersion,
+    status: "observe-target-validated" as const,
+    scanFingerprint: scan.scanFingerprint,
+    target: scan.candidates[0]!,
+    claims: selectionClaims(),
+  };
+  const inspection = windowsInspectionFixture();
+  assert.equal(sameRescueInspection(selection, inspection), true);
+  assert.equal(
+    rescueInspectionResponseCurrent(4, 4, selection, inspection),
+    true,
+  );
+  assert.equal(
+    rescueInspectionResponseCurrent(4, 5, selection, inspection),
+    false,
+  );
+  assert.equal(
+    rescueInspectionResponseCurrent(
+      4,
+      4,
+      { ...selection, target: scan.candidates[1]! },
+      inspection,
+    ),
+    false,
+  );
+});
+
+test("the inspection latch rejects a second synchronous privileged operation", () => {
+  const latch = { current: false };
+  assert.equal(tryStartRescueInspection(latch), true);
+  assert.equal(tryStartRescueInspection(latch), false);
+  finishRescueInspection(latch);
+  assert.equal(tryStartRescueInspection(latch), true);
+  finishRescueInspection(latch);
+});
+
+test("typed unsupported and cleanup failures have fixed local guidance", () => {
+  const encrypted = new RescueOfflineInspectionError(
+    "unsupported-encrypted-storage",
+    false,
+    errorClaims(),
+    422,
+  );
+  const encryptedView = rescueInspectionErrorPresentation(encrypted);
+  assert.equal(encryptedView.severity, "unsupported");
+  assert.match(encryptedView.title, /cifrato/u);
+  assert.match(encryptedView.action, /credenziali del proprietario/u);
+
+  for (const code of [
+    "unsupported-apple-filesystem",
+    "unsupported-complex-storage",
+  ] as const)
+    assert.equal(
+      rescueInspectionErrorPresentation(
+        new RescueOfflineInspectionError(code, false, errorClaims(), 422),
+      ).severity,
+      "unsupported",
+    );
+
+  const stale = new RescueOfflineInspectionError(
+    "target-identity-changed",
+    true,
+    errorClaims(),
+    409,
+  );
+  assert.equal(rescueInspectionNeedsRescan(stale), true);
+  assert.equal(
+    rescueInspectionNeedsRescan(
+      new RescueOfflineInspectionError(
+        "target-already-mounted",
+        true,
+        errorClaims(),
+        409,
+      ),
+    ),
+    true,
+  );
+
+  const cleanup = new RescueOfflineInspectionError(
+    "inspection-failed",
+    false,
+    errorClaims({
+      mountOperationAttempted: true,
+      mountOperationPerformed: true,
+    }),
+    503,
+  );
+  assert.equal(rescueInspectionRequiresRestart(cleanup), true);
+  assert.equal(rescueInspectionErrorPresentation(cleanup).severity, "blocked");
+  assert.match(rescueInspectionErrorPresentation(cleanup).action, /Riavvia/u);
+});
+
+test("a stale cleanup failure still requires a Rescue restart", () => {
+  const cleanup = new RescueOfflineInspectionError(
+    "inspection-failed",
+    false,
+    errorClaims({
+      mountOperationAttempted: true,
+      mountOperationPerformed: true,
+    }),
+    503,
+  );
+  assert.deepEqual(rescueInspectionFailureDisposition(7, 8, cleanup), {
+    current: false,
+    requiresRestart: true,
+  });
 });
 
 test("byte formatting is bounded and human-readable", () => {
@@ -124,7 +258,7 @@ function targetScanFixture() {
     mode: "observe-r0" as const,
     trust: "observed-untrusted" as const,
     scanFingerprint: `scan:${"c".repeat(64)}`,
-    identifierScope: "ephemeral-rescue-process" as const,
+    identifierScope: "ephemeral-rescue-boot" as const,
     disks,
     candidates: [
       candidate(1, firstDiskId, "d"),
@@ -144,5 +278,95 @@ function selectionClaims() {
     filesystemContentInspected: false as const,
     mountOperationPerformed: false as const,
     mutationPerformed: false as const,
+  };
+}
+
+function errorClaims(overrides: Record<string, boolean> = {}) {
+  return {
+    installedOsConfirmed: false,
+    filesystemContentInspected: false,
+    mountOperationAttempted: false,
+    mountOperationPerformed: false,
+    mountCleanupVerified: false,
+    autoUnlockAttempted: false as const,
+    mutationPerformed: false as const,
+    diagnosisProduced: false as const,
+    repairAttempted: false as const,
+    ...overrides,
+  };
+}
+
+function windowsInspectionFixture() {
+  const scan = targetScanFixture();
+  const target = scan.candidates[0]!;
+  return {
+    apiVersion: "kernaid.dev/rescue-offline-inspection/v1alpha1" as const,
+    status: "installed-os-content-inspected" as const,
+    trust: "observed-untrusted" as const,
+    target: {
+      scanFingerprint: scan.scanFingerprint,
+      targetId: target.targetId,
+      sourceRef: target.sourceRef,
+      osFamily: "windows" as const,
+      filesystem: "ntfs" as const,
+    },
+    inspection: {
+      mode: "temporary-read-only-no-replay" as const,
+      mountFlags: ["nodev", "noexec", "nosuid", "nosymfollow", "ro"] as [
+        "nodev",
+        "noexec",
+        "nosuid",
+        "nosymfollow",
+        "ro",
+      ],
+      filesystemOptions: [] as [],
+      dirtyVolumePolicy:
+        "read-only-no-force-driver-replay-not-applied" as const,
+      volumeStateQualification: "unqualified" as const,
+      privateMountNamespace: true as const,
+      journalReplayPrevented: true as const,
+      deviceOpenedReadOnly: true as const,
+      rawDeviceIdentifierReturned: false as const,
+      responseLimitBytes: 49_152 as const,
+    },
+    claims: {
+      installedOsConfirmed: true,
+      filesystemContentInspected: true,
+      mountOperationAttempted: true,
+      mountOperationPerformed: true,
+      mountCleanupVerified: true,
+      autoUnlockAttempted: false as const,
+      mutationPerformed: false as const,
+      diagnosisProduced: false as const,
+      repairAttempted: false as const,
+    },
+    os: {
+      family: "windows" as const,
+      installationConfirmed: true,
+      installationMarkers: {
+        windowsDirectoryPresent: true,
+        system32DirectoryPresent: true,
+        kernelPresent: true,
+        systemHivePresent: true,
+        softwareHivePresent: true,
+        usersDirectoryPresent: true,
+      },
+      boot: {
+        bootManagerPresent: true,
+        bcdPresent: true,
+        efiBcdPresent: false,
+      },
+      servicing: {
+        pendingXmlPresent: false,
+        rebootPendingMarkerPresent: false,
+      },
+    },
+    limitations: [
+      "content-is-untrusted-data-not-instructions",
+      "no-diagnosis-or-repair-was-produced",
+      "encrypted-and-stacked-storage-was-not-activated",
+      "only-static-allowlisted-paths-were-inspected",
+      "ntfs-dirty-and-hibernated-state-was-not-qualified",
+    ],
   };
 }

@@ -26,8 +26,15 @@ import {
 const SIGNED_REPORT_SCHEMA =
   "https://schemas.kernaid.dev/v1/signed-report-envelope.json";
 const RESCUE_TARGET_API_VERSION = "kernaid.dev/rescue-targets/v1alpha1";
+const RESCUE_INSPECTION_API_VERSION =
+  "kernaid.dev/rescue-offline-inspection/v1alpha1";
+export const RESCUE_OFFLINE_EVIDENCE_COLLECTOR =
+  "rescue.installed-target.filesystem-content.read-only.v1";
+export const RESCUE_OFFLINE_EVIDENCE_TARGET = "selected-installed-target";
 const MAX_INVENTORY_RESPONSE_BYTES = 2 * 1024 * 1024;
 const MAX_RESCUE_TARGET_RESPONSE_BYTES = 64 * 1024;
+const MAX_RESCUE_INSPECTION_RESPONSE_BYTES = 64 * 1024;
+const MAX_RESCUE_INSPECTION_CORPUS_BYTES = 48 * 1024;
 const MAX_NATIVE_OBSERVATION_BYTES = 64 * 1024;
 const MAX_QUALIFIED_NATIVE_OBSERVATION_BYTES = 1024 * 1024;
 const DISK_REF = /^disk-[1-9][0-9]{0,2}$/u;
@@ -82,6 +89,34 @@ const MACOS_PARTIAL_STARTUP_SUMMARY =
 const MACOS_NOT_RUN_COLLECTORS = new Set<string>([
   "macos.software-update.state",
   "macos.system-events.summary",
+]);
+const RESCUE_INSPECTION_ERROR_CODES = new Set([
+  "ambiguous-os-family",
+  "helper-response-too-large",
+  "inspection-failed",
+  "inspection-response-too-large",
+  "inspection-timeout",
+  "invalid-helper-request",
+  "invalid-inspection-request",
+  "invalid-installed-os-metadata",
+  "mount-cleanup-failed",
+  "mount-postcondition-failed",
+  "mount-root-unsafe",
+  "mount-verification-failed",
+  "privileged-helper-failed",
+  "privileged-helper-unavailable",
+  "read-only-mount-failed",
+  "target-already-mounted",
+  "target-device-ambiguous",
+  "target-identity-changed",
+  "target-identity-invalid",
+  "target-resolution-invalid",
+  "target-revalidation-failed",
+  "unsafe-target-content",
+  "unsupported-apple-filesystem",
+  "unsupported-complex-storage",
+  "unsupported-encrypted-storage",
+  "unsupported-filesystem",
 ]);
 
 export interface NativeObservation {
@@ -149,7 +184,7 @@ export interface RescueTargetScan {
   mode: "observe-r0";
   trust: "observed-untrusted";
   scanFingerprint: string;
-  identifierScope: "ephemeral-rescue-process";
+  identifierScope: "ephemeral-rescue-boot";
   disks: RescueTargetDisk[];
   candidates: RescueTargetCandidate[];
   claims: {
@@ -178,6 +213,161 @@ export interface RescueTargetSelection {
 export interface RescueTargetBinding {
   scanFingerprint: string;
   target: RescueTargetCandidate;
+}
+
+export interface RescueOfflineInspectionClaims {
+  installedOsConfirmed: boolean;
+  filesystemContentInspected: boolean;
+  mountOperationAttempted: boolean;
+  mountOperationPerformed: boolean;
+  mountCleanupVerified: boolean;
+  autoUnlockAttempted: false;
+  mutationPerformed: false;
+  diagnosisProduced: false;
+  repairAttempted: false;
+}
+
+export interface RescueLinuxOfflineCorpus {
+  family: "linux";
+  installationConfirmed: boolean;
+  release: {
+    id: string | null;
+    name: string | null;
+    prettyName: string | null;
+    versionId: string | null;
+    source: "etc-os-release" | "usr-lib-os-release" | "absent";
+  };
+  boot: {
+    directoryPresent: boolean;
+    kernelArtifactCount: number;
+    initramfsArtifactCount: number;
+    bootloaderDirectoryCount: number;
+    symlinkArtifactCount: number;
+  };
+  configuration: {
+    fstab: {
+      present: boolean;
+      entryCount: number;
+      rootEntryPresent: boolean;
+      efiEntryPresent: boolean;
+      swapEntryCount: number;
+      networkEntryCount: number;
+      malformedLineCount: number;
+    };
+    machineIdPresent: boolean;
+  };
+  packageDatabases: {
+    dpkgStatusPresent: boolean;
+    rpmDatabasePresent: boolean;
+    pacmanDatabasePresent: boolean;
+  };
+}
+
+export interface RescueWindowsOfflineCorpus {
+  family: "windows";
+  installationConfirmed: boolean;
+  installationMarkers: {
+    windowsDirectoryPresent: boolean;
+    system32DirectoryPresent: boolean;
+    kernelPresent: boolean;
+    systemHivePresent: boolean;
+    softwareHivePresent: boolean;
+    usersDirectoryPresent: boolean;
+  };
+  boot: {
+    bootManagerPresent: boolean;
+    bcdPresent: boolean;
+    efiBcdPresent: boolean;
+  };
+  servicing: {
+    pendingXmlPresent: boolean;
+    rebootPendingMarkerPresent: boolean;
+  };
+}
+
+export type RescueOfflineCorpus =
+  RescueLinuxOfflineCorpus | RescueWindowsOfflineCorpus;
+
+export interface RescueOfflineInspection {
+  apiVersion: typeof RESCUE_INSPECTION_API_VERSION;
+  status:
+    | "installed-os-content-inspected"
+    | "content-inspected-installation-unconfirmed";
+  trust: "observed-untrusted";
+  target: {
+    scanFingerprint: string;
+    targetId: string;
+    sourceRef: string;
+    osFamily: "linux" | "windows";
+    filesystem: "ext4" | "ntfs";
+  };
+  inspection: {
+    mode: "temporary-read-only-no-replay";
+    mountFlags: ["nodev", "noexec", "nosuid", "nosymfollow", "ro"];
+    filesystemOptions: [] | ["noload"];
+    dirtyVolumePolicy:
+      | "journal-replay-disabled"
+      | "read-only-no-force-driver-replay-not-applied";
+    volumeStateQualification: "not-applicable" | "unqualified";
+    privateMountNamespace: true;
+    journalReplayPrevented: true;
+    deviceOpenedReadOnly: true;
+    rawDeviceIdentifierReturned: false;
+    responseLimitBytes: 49152;
+  };
+  claims: RescueOfflineInspectionClaims;
+  os: RescueOfflineCorpus;
+  limitations: string[];
+}
+
+export type RescueOfflineInspectionErrorCode =
+  | "ambiguous-os-family"
+  | "helper-response-too-large"
+  | "inspection-failed"
+  | "inspection-response-too-large"
+  | "inspection-timeout"
+  | "invalid-helper-request"
+  | "invalid-inspection-request"
+  | "invalid-installed-os-metadata"
+  | "mount-cleanup-failed"
+  | "mount-postcondition-failed"
+  | "mount-root-unsafe"
+  | "mount-verification-failed"
+  | "privileged-helper-failed"
+  | "privileged-helper-unavailable"
+  | "read-only-mount-failed"
+  | "target-already-mounted"
+  | "target-device-ambiguous"
+  | "target-identity-changed"
+  | "target-identity-invalid"
+  | "target-resolution-invalid"
+  | "target-revalidation-failed"
+  | "unsafe-target-content"
+  | "unsupported-apple-filesystem"
+  | "unsupported-complex-storage"
+  | "unsupported-encrypted-storage"
+  | "unsupported-filesystem"
+  | "invalid-local-response";
+
+export class RescueOfflineInspectionError extends Error {
+  readonly code: RescueOfflineInspectionErrorCode;
+  readonly retryable: boolean;
+  readonly claims: RescueOfflineInspectionClaims;
+  readonly httpStatus: number;
+
+  constructor(
+    code: RescueOfflineInspectionErrorCode,
+    retryable: boolean,
+    claims: RescueOfflineInspectionClaims,
+    httpStatus: number,
+  ) {
+    super("L'ispezione offline non è stata completata in sicurezza.");
+    this.name = "RescueOfflineInspectionError";
+    this.code = code;
+    this.retryable = retryable;
+    this.claims = structuredClone(claims);
+    this.httpStatus = httpStatus;
+  }
 }
 
 export interface SecureRuntimeStatus {
@@ -315,6 +505,246 @@ export async function selectRescueInstalledTarget(
   return selection;
 }
 
+export async function inspectRescueInstalledTarget(
+  expectedSelection: RescueTargetSelection,
+): Promise<RescueOfflineInspection> {
+  if (!isRescueRuntime())
+    throw new Error("L'ispezione offline richiede KernAid Rescue.");
+  const selection = parseRescueTargetSelection(expectedSelection);
+  let response: Response;
+  try {
+    response = await fetch("/api/rescue/inspect-installed-target", {
+      method: "POST",
+      cache: "no-store",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        scanFingerprint: selection.scanFingerprint,
+        targetId: selection.target.targetId,
+      }),
+      signal: AbortSignal.timeout(22_000),
+    });
+  } catch (error) {
+    throw localRescueInspectionTransportError(error);
+  }
+  if (!isJsonHttpResponse(response))
+    throw new RescueOfflineInspectionError(
+      "invalid-local-response",
+      false,
+      emptyRescueOfflineInspectionClaims(),
+      response.status,
+    );
+  let payload: unknown;
+  try {
+    payload = await readBoundedJson(
+      response,
+      MAX_RESCUE_INSPECTION_RESPONSE_BYTES,
+    );
+  } catch (error) {
+    if (isAbortOrTimeoutError(error))
+      throw localRescueInspectionError("inspection-timeout", true, 408);
+    if (error instanceof TypeError)
+      throw localRescueInspectionError(
+        "privileged-helper-unavailable",
+        true,
+        503,
+      );
+    throw localRescueInspectionError(
+      "invalid-local-response",
+      false,
+      response.status,
+    );
+  }
+  if (response.status !== 200)
+    throw parseRescueOfflineInspectionError(payload, response.status);
+  try {
+    return parseRescueOfflineInspection(payload, selection);
+  } catch {
+    throw localRescueInspectionError(
+      "invalid-local-response",
+      false,
+      response.status,
+    );
+  }
+}
+
+export function parseRescueOfflineInspection(
+  value: unknown,
+  expectedSelection: RescueTargetSelection,
+): RescueOfflineInspection {
+  const selection = parseRescueTargetSelection(expectedSelection);
+  const item = exactRecord(value, [
+    "apiVersion",
+    "status",
+    "trust",
+    "target",
+    "inspection",
+    "claims",
+    "os",
+    "limitations",
+  ]);
+  if (
+    item.apiVersion !== RESCUE_INSPECTION_API_VERSION ||
+    !(
+      item.status === "installed-os-content-inspected" ||
+      item.status === "content-inspected-installation-unconfirmed"
+    ) ||
+    item.trust !== "observed-untrusted"
+  )
+    throw new Error("Risposta di ispezione Rescue non valida.");
+
+  const target = exactRecord(item.target, [
+    "scanFingerprint",
+    "targetId",
+    "sourceRef",
+    "osFamily",
+    "filesystem",
+  ]);
+  if (
+    target.scanFingerprint !== selection.scanFingerprint ||
+    target.targetId !== selection.target.targetId ||
+    target.sourceRef !== selection.target.sourceRef ||
+    !(target.osFamily === "linux" || target.osFamily === "windows") ||
+    target.osFamily !== selection.target.osFamilyHint ||
+    !(
+      (target.osFamily === "linux" && target.filesystem === "ext4") ||
+      (target.osFamily === "windows" && target.filesystem === "ntfs")
+    )
+  )
+    throw new Error(
+      "L'ispezione Rescue non corrisponde al target selezionato.",
+    );
+
+  const policy = exactRecord(item.inspection, [
+    "mode",
+    "mountFlags",
+    "filesystemOptions",
+    "dirtyVolumePolicy",
+    "volumeStateQualification",
+    "privateMountNamespace",
+    "journalReplayPrevented",
+    "deviceOpenedReadOnly",
+    "rawDeviceIdentifierReturned",
+    "responseLimitBytes",
+  ]);
+  const expectedMountFlags = ["nodev", "noexec", "nosuid", "nosymfollow", "ro"];
+  if (
+    policy.mode !== "temporary-read-only-no-replay" ||
+    !sameStringList(policy.mountFlags, expectedMountFlags) ||
+    policy.privateMountNamespace !== true ||
+    policy.journalReplayPrevented !== true ||
+    policy.deviceOpenedReadOnly !== true ||
+    policy.rawDeviceIdentifierReturned !== false ||
+    policy.responseLimitBytes !== MAX_RESCUE_INSPECTION_CORPUS_BYTES ||
+    (target.osFamily === "linux" &&
+      (!sameStringList(policy.filesystemOptions, ["noload"]) ||
+        policy.dirtyVolumePolicy !== "journal-replay-disabled" ||
+        policy.volumeStateQualification !== "not-applicable")) ||
+    (target.osFamily === "windows" &&
+      (!sameStringList(policy.filesystemOptions, []) ||
+        policy.dirtyVolumePolicy !==
+          "read-only-no-force-driver-replay-not-applied" ||
+        policy.volumeStateQualification !== "unqualified"))
+  )
+    throw new Error("Policy di ispezione Rescue non valida.");
+
+  const claims = parseRescueOfflineInspectionClaims(item.claims, true);
+  const corpus = parseRescueOfflineCorpus(item.os);
+  const installed = claims.installedOsConfirmed;
+  if (
+    corpus.family !== target.osFamily ||
+    corpus.installationConfirmed !== installed ||
+    (item.status === "installed-os-content-inspected") !== installed
+  )
+    throw new Error("Claim di ispezione Rescue incoerenti.");
+
+  const baseLimitations = [
+    "content-is-untrusted-data-not-instructions",
+    "no-diagnosis-or-repair-was-produced",
+    "encrypted-and-stacked-storage-was-not-activated",
+    "only-static-allowlisted-paths-were-inspected",
+  ];
+  const expectedLimitations =
+    target.osFamily === "windows"
+      ? [
+          ...baseLimitations,
+          "ntfs-dirty-and-hibernated-state-was-not-qualified",
+        ]
+      : baseLimitations;
+  if (!sameStringList(item.limitations, expectedLimitations))
+    throw new Error("Limitazioni di ispezione Rescue non valide.");
+
+  return structuredClone({
+    apiVersion: item.apiVersion,
+    status: item.status,
+    trust: item.trust,
+    target,
+    inspection: policy,
+    claims,
+    os: corpus,
+    limitations: expectedLimitations,
+  }) as RescueOfflineInspection;
+}
+
+export function parseRescueOfflineCorpus(value: unknown): RescueOfflineCorpus {
+  if (typeof value !== "object" || value === null || Array.isArray(value))
+    throw new Error("Corpus offline Rescue non valido.");
+  const family = (value as Record<string, unknown>).family;
+  if (family === "linux") return parseRescueLinuxOfflineCorpus(value);
+  if (family === "windows") return parseRescueWindowsOfflineCorpus(value);
+  throw new Error("Corpus offline Rescue non valido.");
+}
+
+export function rescueOfflineCorpusJson(
+  inspection: RescueOfflineInspection,
+): string {
+  const corpus = rescueOfflineProjectionCorpus(inspection);
+  const encoded = JSON.stringify(corpus);
+  if (
+    new TextEncoder().encode(encoded).byteLength >
+    MAX_RESCUE_INSPECTION_CORPUS_BYTES
+  )
+    throw new Error("Corpus offline Rescue oltre il limite.");
+  return encoded;
+}
+
+export function rescueOfflineEvidenceSummary(
+  inspection: RescueOfflineInspection,
+): string {
+  const corpus = rescueOfflineProjectionCorpus(inspection);
+  return rescueOfflineCorpusSummary(corpus);
+}
+
+function rescueOfflineProjectionCorpus(
+  inspection: RescueOfflineInspection,
+): RescueOfflineCorpus {
+  const claims = parseRescueOfflineInspectionClaims(inspection.claims, true);
+  const corpus = parseRescueOfflineCorpus(inspection.os);
+  if (
+    inspection.apiVersion !== RESCUE_INSPECTION_API_VERSION ||
+    inspection.trust !== "observed-untrusted" ||
+    !(
+      inspection.status === "installed-os-content-inspected" ||
+      inspection.status === "content-inspected-installation-unconfirmed"
+    ) ||
+    inspection.target.osFamily !== corpus.family ||
+    !(
+      (corpus.family === "linux" && inspection.target.filesystem === "ext4") ||
+      (corpus.family === "windows" && inspection.target.filesystem === "ntfs")
+    ) ||
+    claims.installedOsConfirmed !== corpus.installationConfirmed ||
+    (inspection.status === "installed-os-content-inspected") !==
+      corpus.installationConfirmed
+  )
+    throw new Error("Ispezione Rescue non valida per la diagnosi.");
+  return corpus;
+}
+
+function rescueOfflineCorpusSummary(corpus: RescueOfflineCorpus): string {
+  return corpus.installationConfirmed
+    ? `Corpus statico ${corpus.family} acquisito read-only con cleanup verificato`
+    : `Corpus statico ${corpus.family} acquisito read-only; installazione non confermata`;
+}
+
 export function parseNativeObservations(value: unknown): NativeObservation[] {
   if (!Array.isArray(value) || value.length === 0 || value.length > 32)
     throw new Error("Inventario nativo non valido.");
@@ -383,7 +813,7 @@ export function parseRescueTargetScan(value: unknown): RescueTargetScan {
     item.trust !== "observed-untrusted" ||
     typeof item.scanFingerprint !== "string" ||
     !/^scan:[a-f0-9]{64}$/u.test(item.scanFingerprint) ||
-    item.identifierScope !== "ephemeral-rescue-process" ||
+    item.identifierScope !== "ephemeral-rescue-boot" ||
     !Array.isArray(item.disks) ||
     item.disks.length > 128 ||
     !Array.isArray(item.candidates) ||
@@ -662,6 +1092,365 @@ function safeSize(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
+function parseRescueOfflineInspectionError(
+  value: unknown,
+  httpStatus: number,
+): RescueOfflineInspectionError {
+  const invalid = (): RescueOfflineInspectionError =>
+    new RescueOfflineInspectionError(
+      "invalid-local-response",
+      false,
+      emptyRescueOfflineInspectionClaims(),
+      httpStatus,
+    );
+  if (![400, 408, 409, 422, 429, 503].includes(httpStatus)) return invalid();
+  try {
+    const envelope = exactRecord(value, ["error"]);
+    const error = exactRecord(envelope.error, [
+      "code",
+      "message",
+      "retryable",
+      "claims",
+    ]);
+    if (
+      typeof error.code !== "string" ||
+      !RESCUE_INSPECTION_ERROR_CODES.has(error.code) ||
+      typeof error.message !== "string" ||
+      !boundedControlFreeText(error.message, 512) ||
+      typeof error.retryable !== "boolean" ||
+      !validRescueInspectionErrorContract(
+        error.code,
+        httpStatus,
+        error.retryable,
+      )
+    )
+      return invalid();
+    const claims = parseRescueOfflineInspectionClaims(error.claims, false);
+    return new RescueOfflineInspectionError(
+      error.code as RescueOfflineInspectionErrorCode,
+      error.retryable,
+      claims,
+      httpStatus,
+    );
+  } catch {
+    return invalid();
+  }
+}
+
+function validRescueInspectionErrorContract(
+  code: string,
+  httpStatus: number,
+  retryable: boolean,
+): boolean {
+  switch (code) {
+    case "inspection-timeout":
+      return httpStatus === 408 && retryable;
+    case "invalid-helper-request":
+    case "invalid-inspection-request":
+      return httpStatus === 400 && !retryable;
+    case "ambiguous-os-family":
+    case "invalid-installed-os-metadata":
+    case "read-only-mount-failed":
+    case "unsafe-target-content":
+    case "unsupported-apple-filesystem":
+    case "unsupported-complex-storage":
+    case "unsupported-encrypted-storage":
+    case "unsupported-filesystem":
+      return httpStatus === 422 && !retryable;
+    case "target-already-mounted":
+      return httpStatus === 409 && retryable;
+    case "target-identity-invalid":
+      return httpStatus === 409 && !retryable;
+    case "target-identity-changed":
+      return httpStatus === 409;
+    case "target-device-ambiguous":
+      return httpStatus === 409 || (httpStatus === 503 && retryable);
+    case "target-revalidation-failed":
+      return [408, 409, 429, 503].includes(httpStatus) && retryable;
+    case "mount-postcondition-failed":
+    case "privileged-helper-failed":
+    case "privileged-helper-unavailable":
+      return httpStatus === 503 && retryable;
+    case "helper-response-too-large":
+    case "inspection-response-too-large":
+    case "mount-cleanup-failed":
+    case "mount-root-unsafe":
+    case "mount-verification-failed":
+    case "target-resolution-invalid":
+      return httpStatus === 503 && !retryable;
+    case "inspection-failed":
+      return httpStatus === 503;
+    default:
+      return false;
+  }
+}
+
+function localRescueInspectionTransportError(
+  error: unknown,
+): RescueOfflineInspectionError {
+  return isAbortOrTimeoutError(error)
+    ? localRescueInspectionError("inspection-timeout", true, 408)
+    : localRescueInspectionError("privileged-helper-unavailable", true, 503);
+}
+
+function localRescueInspectionError(
+  code: RescueOfflineInspectionErrorCode,
+  retryable: boolean,
+  httpStatus: number,
+): RescueOfflineInspectionError {
+  return new RescueOfflineInspectionError(
+    code,
+    retryable,
+    emptyRescueOfflineInspectionClaims(),
+    httpStatus,
+  );
+}
+
+function isAbortOrTimeoutError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    (error.name === "AbortError" || error.name === "TimeoutError")
+  );
+}
+
+function emptyRescueOfflineInspectionClaims(): RescueOfflineInspectionClaims {
+  return {
+    installedOsConfirmed: false,
+    filesystemContentInspected: false,
+    mountOperationAttempted: false,
+    mountOperationPerformed: false,
+    mountCleanupVerified: false,
+    autoUnlockAttempted: false,
+    mutationPerformed: false,
+    diagnosisProduced: false,
+    repairAttempted: false,
+  };
+}
+
+function parseRescueOfflineInspectionClaims(
+  value: unknown,
+  completed: boolean,
+): RescueOfflineInspectionClaims {
+  const item = exactRecord(value, [
+    "installedOsConfirmed",
+    "filesystemContentInspected",
+    "mountOperationAttempted",
+    "mountOperationPerformed",
+    "mountCleanupVerified",
+    "autoUnlockAttempted",
+    "mutationPerformed",
+    "diagnosisProduced",
+    "repairAttempted",
+  ]);
+  if (
+    Object.values(item).some((claim) => typeof claim !== "boolean") ||
+    item.autoUnlockAttempted !== false ||
+    item.mutationPerformed !== false ||
+    item.diagnosisProduced !== false ||
+    item.repairAttempted !== false ||
+    (item.mountOperationPerformed === true &&
+      item.mountOperationAttempted !== true) ||
+    (item.filesystemContentInspected === true &&
+      item.mountOperationPerformed !== true) ||
+    (item.installedOsConfirmed === true &&
+      item.filesystemContentInspected !== true) ||
+    (completed &&
+      (item.filesystemContentInspected !== true ||
+        item.mountOperationAttempted !== true ||
+        item.mountOperationPerformed !== true ||
+        item.mountCleanupVerified !== true))
+  )
+    throw new Error("Claim di ispezione Rescue non validi.");
+  return item as unknown as RescueOfflineInspectionClaims;
+}
+
+function parseRescueLinuxOfflineCorpus(
+  value: unknown,
+): RescueLinuxOfflineCorpus {
+  const item = exactRecord(value, [
+    "family",
+    "installationConfirmed",
+    "release",
+    "boot",
+    "configuration",
+    "packageDatabases",
+  ]);
+  const release = exactRecord(item.release, [
+    "id",
+    "name",
+    "prettyName",
+    "versionId",
+    "source",
+  ]);
+  const boot = exactRecord(item.boot, [
+    "directoryPresent",
+    "kernelArtifactCount",
+    "initramfsArtifactCount",
+    "bootloaderDirectoryCount",
+    "symlinkArtifactCount",
+  ]);
+  const configuration = exactRecord(item.configuration, [
+    "fstab",
+    "machineIdPresent",
+  ]);
+  const fstab = exactRecord(configuration.fstab, [
+    "present",
+    "entryCount",
+    "rootEntryPresent",
+    "efiEntryPresent",
+    "swapEntryCount",
+    "networkEntryCount",
+    "malformedLineCount",
+  ]);
+  const packageDatabases = exactRecord(item.packageDatabases, [
+    "dpkgStatusPresent",
+    "rpmDatabasePresent",
+    "pacmanDatabasePresent",
+  ]);
+  const releaseValues = [
+    release.id,
+    release.name,
+    release.prettyName,
+    release.versionId,
+  ];
+  if (
+    item.family !== "linux" ||
+    typeof item.installationConfirmed !== "boolean" ||
+    releaseValues.some(
+      (entry) =>
+        entry !== null &&
+        (typeof entry !== "string" || !boundedControlFreeText(entry, 256)),
+    ) ||
+    !(
+      release.source === "etc-os-release" ||
+      release.source === "usr-lib-os-release" ||
+      release.source === "absent"
+    ) ||
+    (release.source === "absent" &&
+      releaseValues.some((entry) => entry !== null)) ||
+    (item.installationConfirmed === true && typeof release.id !== "string") ||
+    typeof boot.directoryPresent !== "boolean" ||
+    !boundedInteger(boot.kernelArtifactCount, 512) ||
+    !boundedInteger(boot.initramfsArtifactCount, 512) ||
+    !boundedInteger(boot.bootloaderDirectoryCount, 3) ||
+    !boundedInteger(boot.symlinkArtifactCount, 512) ||
+    (boot.directoryPresent === false &&
+      (boot.kernelArtifactCount !== 0 ||
+        boot.initramfsArtifactCount !== 0 ||
+        boot.bootloaderDirectoryCount !== 0 ||
+        boot.symlinkArtifactCount !== 0)) ||
+    typeof fstab.present !== "boolean" ||
+    !boundedInteger(fstab.entryCount, 65_536) ||
+    typeof fstab.rootEntryPresent !== "boolean" ||
+    typeof fstab.efiEntryPresent !== "boolean" ||
+    !boundedInteger(fstab.swapEntryCount, Number(fstab.entryCount)) ||
+    !boundedInteger(fstab.networkEntryCount, Number(fstab.entryCount)) ||
+    !boundedInteger(fstab.malformedLineCount, 65_536) ||
+    Number(fstab.entryCount) + Number(fstab.malformedLineCount) > 65_536 ||
+    (fstab.present === false &&
+      (fstab.entryCount !== 0 ||
+        fstab.rootEntryPresent !== false ||
+        fstab.efiEntryPresent !== false ||
+        fstab.swapEntryCount !== 0 ||
+        fstab.networkEntryCount !== 0 ||
+        fstab.malformedLineCount !== 0)) ||
+    typeof configuration.machineIdPresent !== "boolean" ||
+    Object.values(packageDatabases).some((entry) => typeof entry !== "boolean")
+  )
+    throw new Error("Corpus Linux offline non valido.");
+  return structuredClone({
+    family: item.family,
+    installationConfirmed: item.installationConfirmed,
+    release,
+    boot,
+    configuration: { fstab, machineIdPresent: configuration.machineIdPresent },
+    packageDatabases,
+  }) as RescueLinuxOfflineCorpus;
+}
+
+function parseRescueWindowsOfflineCorpus(
+  value: unknown,
+): RescueWindowsOfflineCorpus {
+  const item = exactRecord(value, [
+    "family",
+    "installationConfirmed",
+    "installationMarkers",
+    "boot",
+    "servicing",
+  ]);
+  const markers = exactRecord(item.installationMarkers, [
+    "windowsDirectoryPresent",
+    "system32DirectoryPresent",
+    "kernelPresent",
+    "systemHivePresent",
+    "softwareHivePresent",
+    "usersDirectoryPresent",
+  ]);
+  const boot = exactRecord(item.boot, [
+    "bootManagerPresent",
+    "bcdPresent",
+    "efiBcdPresent",
+  ]);
+  const servicing = exactRecord(item.servicing, [
+    "pendingXmlPresent",
+    "rebootPendingMarkerPresent",
+  ]);
+  const requiredMarkers = [
+    markers.windowsDirectoryPresent,
+    markers.system32DirectoryPresent,
+    markers.kernelPresent,
+    markers.systemHivePresent,
+    markers.softwareHivePresent,
+  ];
+  if (
+    item.family !== "windows" ||
+    typeof item.installationConfirmed !== "boolean" ||
+    Object.values(markers).some((entry) => typeof entry !== "boolean") ||
+    Object.values(boot).some((entry) => typeof entry !== "boolean") ||
+    Object.values(servicing).some((entry) => typeof entry !== "boolean") ||
+    item.installationConfirmed !==
+      requiredMarkers.every((entry) => entry === true)
+  )
+    throw new Error("Corpus Windows offline non valido.");
+  return structuredClone({
+    family: item.family,
+    installationConfirmed: item.installationConfirmed,
+    installationMarkers: markers,
+    boot,
+    servicing,
+  }) as RescueWindowsOfflineCorpus;
+}
+
+function boundedInteger(value: unknown, maximum: number): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isSafeInteger(value) &&
+    value >= 0 &&
+    value <= maximum
+  );
+}
+
+function boundedControlFreeText(value: string, maximumBytes: number): boolean {
+  return (
+    value.length > 0 &&
+    new TextEncoder().encode(value).byteLength <= maximumBytes &&
+    !Array.from(value).some((character) => {
+      const codePoint = character.codePointAt(0);
+      return (
+        codePoint !== undefined && (codePoint <= 0x1f || codePoint === 0x7f)
+      );
+    })
+  );
+}
+
+function sameStringList(value: unknown, expected: readonly string[]): boolean {
+  return (
+    Array.isArray(value) &&
+    value.length === expected.length &&
+    value.every((entry, index) => entry === expected[index])
+  );
+}
+
 export async function authorizeObserve(
   request: ObserveAuthorization,
   rescueTarget?: RescueTargetBinding,
@@ -888,6 +1677,18 @@ export class PlatformOfflineRulesProvider implements Provider {
     evidence: readonly ObservedEvidence[],
   ): Promise<DiagnosisProposal> {
     if (!objective.trim()) throw new Error("objective is required");
+    const rescueCorpusEvidence = evidence.filter(
+      (item) => item.evidence.collector === RESCUE_OFFLINE_EVIDENCE_COLLECTOR,
+    );
+    const rescueScopedEvidence = evidence.filter(
+      (item) =>
+        item.evidence.collector.startsWith("rescue.") ||
+        item.evidence.target === "rescue-runtime" ||
+        item.evidence.target === "selected-installed-target-candidate" ||
+        item.evidence.target === RESCUE_OFFLINE_EVIDENCE_TARGET,
+    );
+    if (rescueCorpusEvidence.length > 0 || rescueScopedEvidence.length > 0)
+      return diagnoseRescueOfflineCorpus(evidence, rescueCorpusEvidence);
     const linuxEvidence = evidence.filter((item) =>
       LINUX_P0_COLLECTORS.includes(
         item.evidence.collector as (typeof LINUX_P0_COLLECTORS)[number],
@@ -903,59 +1704,6 @@ export class PlatformOfflineRulesProvider implements Provider {
         item.evidence.collector as (typeof MACOS_P0_COLLECTORS)[number],
       ),
     );
-
-    // Rescue observations remain metadata-only until a dedicated read-only
-    // filesystem inspector is qualified. Never present appliance inventory or
-    // a low-confidence selection as a diagnosis of the customer's OS.
-    if (isRescueRuntime()) {
-      const selectionEvidence = evidence.filter(
-        (item) =>
-          item.evidence.collector === "rescue.installed-target.selection",
-      );
-      let selectedTarget: RescueTargetSelection | undefined;
-      let invalidSelection = selectionEvidence.length > 1;
-      if (selectionEvidence.length === 1) {
-        const item = selectionEvidence[0]!;
-        if (
-          item.evidence.target !== "selected-installed-target-candidate" ||
-          item.evidence.contentType !== "application/json" ||
-          new TextEncoder().encode(item.content).byteLength >
-            MAX_RESCUE_TARGET_RESPONSE_BYTES
-        )
-          invalidSelection = true;
-        else {
-          try {
-            selectedTarget = parseRescueTargetSelection(
-              JSON.parse(item.content) as unknown,
-            );
-          } catch {
-            invalidSelection = true;
-          }
-        }
-      }
-      if (invalidSelection)
-        return parseDiagnosisProposal({
-          schemaVersion: "1.0",
-          diagnosis:
-            "Evidenza di selezione del target Rescue non valida o ambigua. La sessione resta bloccata e nessuna conclusione sul sistema installato viene formulata.",
-          confidence: 0.1,
-          evidenceIds: selectionEvidence.map((item) => item.evidence.id),
-          requestedEvidence: ["rescue.installed-target.selection.v1"],
-        });
-      return parseDiagnosisProposal({
-        schemaVersion: "1.0",
-        diagnosis: selectedTarget
-          ? "Candidato target Rescue selezionato e rivalidato usando soli metadati storage. Il filesystem non è stato montato e il contenuto dell’OS installato non è stato analizzato: non è ancora possibile formulare una diagnosi del sistema del cliente."
-          : "Inventario dell’ambiente Rescue completato. Nessun target installato è stato selezionato, montato o analizzato: non è possibile formulare una diagnosi del sistema del cliente da queste sole evidenze.",
-        confidence: 0.2,
-        evidenceIds: evidence.map((item) => item.evidence.id),
-        requestedEvidence: [
-          selectedTarget
-            ? "rescue.installed-target.filesystem-content.read-only.v1"
-            : "rescue.installed-target.selection.v1",
-        ],
-      });
-    }
 
     if (windowsEvidence.length > 0) {
       const selected = WINDOWS_P0_COLLECTORS.map((collector) =>
@@ -1085,6 +1833,112 @@ export class PlatformOfflineRulesProvider implements Provider {
     });
     return parseDiagnosisProposal(response);
   }
+}
+
+function diagnoseRescueOfflineCorpus(
+  evidence: readonly ObservedEvidence[],
+  matching: readonly ObservedEvidence[],
+): DiagnosisProposal {
+  const invalid = (): DiagnosisProposal =>
+    parseDiagnosisProposal({
+      schemaVersion: "1.0",
+      diagnosis:
+        "Il corpus offline Rescue non è valido, è duplicato o contiene evidenze fuori scope. La diagnosi resta bloccata senza formulare conclusioni sul sistema installato.",
+      confidence: 0.1,
+      evidenceIds: evidence.map((item) => item.evidence.id),
+      requestedEvidence: [RESCUE_OFFLINE_EVIDENCE_COLLECTOR],
+    });
+  if (evidence.length !== 1 || matching.length !== 1) return invalid();
+  const selected = matching[0]!;
+  if (
+    selected.evidence.target !== RESCUE_OFFLINE_EVIDENCE_TARGET ||
+    selected.evidence.contentType !== "application/json" ||
+    selected.evidence.trust !== "observed-untrusted" ||
+    new TextEncoder().encode(selected.content).byteLength >
+      MAX_RESCUE_INSPECTION_CORPUS_BYTES
+  )
+    return invalid();
+  let corpus: RescueOfflineCorpus;
+  try {
+    corpus = parseRescueOfflineCorpus(JSON.parse(selected.content) as unknown);
+  } catch {
+    return invalid();
+  }
+  if (selected.evidence.summary !== rescueOfflineCorpusSummary(corpus))
+    return invalid();
+  const evidenceIds = [selected.evidence.id];
+  if (!corpus.installationConfirmed)
+    return parseDiagnosisProposal({
+      schemaVersion: "1.0",
+      diagnosis:
+        "Il contenuto statico del volume è stato ispezionato in sola lettura, ma i marker consentiti non confermano un'installazione completa. Non viene formulata una diagnosi del sistema.",
+      confidence: 0.2,
+      evidenceIds,
+      requestedEvidence: [
+        "rescue.installed-target.installation-confirmation.read-only.v1",
+      ],
+    });
+  if (corpus.family === "linux") {
+    if (corpus.configuration.fstab.malformedLineCount > 0)
+      return parseDiagnosisProposal({
+        schemaVersion: "1.0",
+        diagnosis:
+          "Il corpus Linux conferma l'installazione e segnala una o più righe fstab malformate. Verificare la configurazione di mount senza eseguire modifiche automatiche.",
+        confidence: 0.84,
+        evidenceIds,
+        requestedEvidence: ["rescue.linux.fstab.review.read-only.v1"],
+      });
+    if (corpus.boot.directoryPresent && corpus.boot.kernelArtifactCount === 0)
+      return parseDiagnosisProposal({
+        schemaVersion: "1.0",
+        diagnosis:
+          "L'installazione Linux è confermata, ma nel volume ispezionato non è stato osservato alcun artefatto kernel regolare. Il boot può dipendere da un altro volume: serve una verifica read-only della topologia di avvio.",
+        confidence: 0.68,
+        evidenceIds,
+        requestedEvidence: ["rescue.linux.boot-layout.read-only.v1"],
+      });
+    return parseDiagnosisProposal({
+      schemaVersion: "1.0",
+      diagnosis:
+        "Installazione Linux confermata dal corpus statico read-only. Nei marker consentiti non emerge un'anomalia deterministica; servono controlli mirati prima di proporre modifiche.",
+      confidence: 0.58,
+      evidenceIds,
+      requestedEvidence: ["rescue.linux.targeted-health.read-only.v1"],
+    });
+  }
+  if (
+    corpus.servicing.pendingXmlPresent ||
+    corpus.servicing.rebootPendingMarkerPresent
+  )
+    return parseDiagnosisProposal({
+      schemaVersion: "1.0",
+      diagnosis:
+        "Il corpus Windows conferma l'installazione e mostra marker statici di servicing o riavvio pendente. La causa deve essere verificata con strumenti Windows nativi prima di qualsiasi riparazione.",
+      confidence: 0.8,
+      evidenceIds,
+      requestedEvidence: ["windows.update.state"],
+    });
+  if (
+    !corpus.boot.bootManagerPresent &&
+    !corpus.boot.bcdPresent &&
+    !corpus.boot.efiBcdPresent
+  )
+    return parseDiagnosisProposal({
+      schemaVersion: "1.0",
+      diagnosis:
+        "L'installazione Windows è confermata, ma il volume ispezionato non contiene marker boot consentiti. Gli artefatti possono trovarsi nella partizione EFI separata: non viene dichiarato un guasto senza quella verifica.",
+      confidence: 0.46,
+      evidenceIds,
+      requestedEvidence: ["rescue.windows.efi-bcd.read-only.v1"],
+    });
+  return parseDiagnosisProposal({
+    schemaVersion: "1.0",
+    diagnosis:
+      "Installazione Windows confermata dal corpus statico read-only. Nei marker consentiti non emerge un'anomalia deterministica; servono controlli Windows mirati prima di proporre modifiche.",
+    confidence: 0.58,
+    evidenceIds,
+    requestedEvidence: ["windows.offline.native-follow-up.v1"],
+  });
 }
 
 function isSuccessfulWindowsEvidence(
@@ -1448,6 +2302,11 @@ async function readBoundedJson(
   } catch {
     throw new Error("Risposta locale JSON non valida.");
   }
+}
+
+function isJsonHttpResponse(response: Response): boolean {
+  const value = response.headers.get("Content-Type");
+  return value !== null && /^application\/json(?:\s*;|$)/iu.test(value);
 }
 
 function retryAfterMilliseconds(value: string | null): number {

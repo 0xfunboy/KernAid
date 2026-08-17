@@ -114,6 +114,37 @@ aside button {
 .target-picker .selected-target small {
   color: #26351d;
 }
+.target-picker .inspect-target {
+  border-color: #50d8e8;
+  background: #102024;
+}
+.inspection-result,
+.inspection-error {
+  display: grid;
+  gap: 6px;
+  margin-top: 10px;
+  padding: 12px;
+  border: 1px solid #50d8e8;
+  border-radius: 7px;
+  background: #102024;
+}
+.inspection-result > small,
+.inspection-error > small {
+  margin-top: 0;
+  color: #b9c8c0;
+  letter-spacing: 0;
+}
+.inspection-error.unsupported {
+  border-color: #d7b75f;
+  background: #211d12;
+}
+.inspection-error.retryable {
+  border-color: #50d8e8;
+}
+.inspection-error.blocked {
+  border-color: #ff7b72;
+  background: #241516;
+}
 .target-picker small {
   display: block;
   margin-top: 8px;

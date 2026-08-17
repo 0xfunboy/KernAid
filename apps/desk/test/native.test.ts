@@ -8,9 +8,12 @@ import {
   collectLocalInventory,
   fingerprintNativeTarget,
   fingerprintRescueTarget,
+  inspectRescueInstalledTarget,
   nativeObservationContentType,
   nativeObservationSummary,
   parseNativeObservations,
+  parseRescueOfflineCorpus,
+  parseRescueOfflineInspection,
   parseRescueTargetScan,
   parseRescueTargetSelection,
   parseNativeSignedArtifact,
@@ -18,6 +21,11 @@ import {
   parseSecureRuntimeStatus,
   scanRescueInstalledTargets,
   selectRescueInstalledTarget,
+  rescueOfflineCorpusJson,
+  rescueOfflineEvidenceSummary,
+  RESCUE_OFFLINE_EVIDENCE_COLLECTOR,
+  RESCUE_OFFLINE_EVIDENCE_TARGET,
+  RescueOfflineInspectionError,
 } from "../src/native.js";
 
 test("native inventory requires explicit bounded truncation state", () => {
@@ -191,8 +199,15 @@ test("Rescue inventory retries a bounded 429 response", async () => {
 test("Rescue target scan and selection are exact, bounded, and cross-bound", async () => {
   const scan = rescueTargetScanFixture();
   const parsed = parseRescueTargetScan(scan);
+  assert.equal(parsed.identifierScope, "ephemeral-rescue-boot");
   assert.equal(parsed.candidates[0]?.osFamilyHint, "windows");
   assert.equal(parsed.disks[0]?.volumes[0]?.filesystem, "ntfs");
+  assert.throws(() =>
+    parseRescueTargetScan({
+      ...scan,
+      identifierScope: "ephemeral-rescue-process",
+    }),
+  );
 
   for (const filesystem of ["crypto_luks", "lvm2_member", "linux_raid_member"])
     assert.equal(
@@ -258,6 +273,441 @@ test("Rescue target scan and selection are exact, bounded, and cross-bound", asy
       claims: { ...selection.claims, filesystemContentInspected: true },
     }),
   );
+});
+
+test("Rescue offline inspection parser is exact, cross-bound, and fail-closed", () => {
+  const windowsSelection = rescueTargetSelectionFixture();
+  const windows = rescueWindowsInspectionFixture();
+  const parsedWindows = parseRescueOfflineInspection(windows, windowsSelection);
+  assert.equal(parsedWindows.os.family, "windows");
+  assert.equal(parsedWindows.claims.mountCleanupVerified, true);
+
+  const linuxSelection = rescueLinuxTargetSelectionFixture();
+  const linux = rescueLinuxInspectionFixture();
+  const parsedLinux = parseRescueOfflineInspection(linux, linuxSelection);
+  assert.equal(parsedLinux.os.family, "linux");
+  assert.equal(parsedLinux.os.configuration.fstab.malformedLineCount, 1);
+
+  assert.throws(() =>
+    parseRescueOfflineInspection(
+      { ...windows, unexpected: true },
+      windowsSelection,
+    ),
+  );
+  assert.throws(() =>
+    parseRescueOfflineInspection(
+      {
+        ...windows,
+        target: { ...windows.target, targetId: `target:${"f".repeat(64)}` },
+      },
+      windowsSelection,
+    ),
+  );
+  assert.throws(() =>
+    parseRescueOfflineInspection(
+      {
+        ...windows,
+        claims: { ...windows.claims, mutationPerformed: true },
+      },
+      windowsSelection,
+    ),
+  );
+  assert.throws(() =>
+    parseRescueOfflineInspection(
+      {
+        ...windows,
+        claims: { ...windows.claims, mountCleanupVerified: false },
+      },
+      windowsSelection,
+    ),
+  );
+  assert.throws(() =>
+    parseRescueOfflineInspection(
+      { ...windows, status: "content-inspected-installation-unconfirmed" },
+      windowsSelection,
+    ),
+  );
+  assert.throws(() =>
+    parseRescueOfflineInspection(
+      {
+        ...windows,
+        limitations: [...windows.limitations, "future-unknown-limitation"],
+      },
+      windowsSelection,
+    ),
+  );
+  assert.throws(() =>
+    parseRescueOfflineInspection(
+      {
+        ...windows,
+        inspection: {
+          ...windows.inspection,
+          deviceOpenedReadOnly: false,
+        },
+      },
+      windowsSelection,
+    ),
+  );
+
+  const impossibleFstab = structuredClone(linux.os);
+  impossibleFstab.configuration.fstab.entryCount = 65_536;
+  impossibleFstab.configuration.fstab.malformedLineCount = 1;
+  assert.throws(() => parseRescueOfflineCorpus(impossibleFstab));
+  const impossibleBoot = structuredClone(linux.os);
+  impossibleBoot.boot.directoryPresent = false;
+  assert.throws(() => parseRescueOfflineCorpus(impossibleBoot));
+});
+
+test("Rescue evidence projection contains only the normalized offline corpus", () => {
+  const inspection = parseRescueOfflineInspection(
+    rescueWindowsInspectionFixture(),
+    rescueTargetSelectionFixture(),
+  );
+  const encoded = rescueOfflineCorpusJson(inspection);
+  const projected = JSON.parse(encoded) as Record<string, unknown>;
+  assert.deepEqual(Object.keys(projected).sort(), [
+    "boot",
+    "family",
+    "installationConfirmed",
+    "installationMarkers",
+    "servicing",
+  ]);
+  assert.doesNotMatch(
+    encoded,
+    /scanFingerprint|targetId|sourceRef|disk-1|mountFlags|claims|limitations/u,
+  );
+  assert.equal(
+    rescueOfflineEvidenceSummary(inspection),
+    "Corpus statico windows acquisito read-only con cleanup verificato",
+  );
+  assert.throws(() =>
+    rescueOfflineCorpusJson({
+      ...inspection,
+      claims: { ...inspection.claims, mountCleanupVerified: false },
+    }),
+  );
+});
+
+test("Rescue inspection HTTP contract is minimal and rejects malformed success", async () => {
+  const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const originalLocation = Object.getOwnPropertyDescriptor(
+    globalThis,
+    "location",
+  );
+  const originalFetch = Object.getOwnPropertyDescriptor(globalThis, "fetch");
+  const selection = parseRescueTargetSelection(rescueTargetSelectionFixture());
+  let input: unknown;
+  let init: RequestInit | undefined;
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: {},
+  });
+  Object.defineProperty(globalThis, "location", {
+    configurable: true,
+    value: { hostname: "127.0.0.1", port: "4173" },
+  });
+  Object.defineProperty(globalThis, "fetch", {
+    configurable: true,
+    value: async (nextInput: unknown, nextInit: RequestInit | undefined) => {
+      input = nextInput;
+      init = nextInit;
+      return Response.json(rescueWindowsInspectionFixture());
+    },
+  });
+  try {
+    const inspection = await inspectRescueInstalledTarget(selection);
+    assert.equal(inspection.os.family, "windows");
+    assert.equal(input, "/api/rescue/inspect-installed-target");
+    assert.equal(init?.method, "POST");
+    assert.deepEqual(JSON.parse(String(init?.body)), {
+      scanFingerprint: selection.scanFingerprint,
+      targetId: selection.target.targetId,
+    });
+
+    Object.defineProperty(globalThis, "fetch", {
+      configurable: true,
+      value: async () => Response.json({}, { status: 200 }),
+    });
+    await assert.rejects(
+      inspectRescueInstalledTarget(selection),
+      (error: unknown) => {
+        assert.ok(error instanceof RescueOfflineInspectionError);
+        assert.equal(error.code, "invalid-local-response");
+        assert.equal(error.retryable, false);
+        return true;
+      },
+    );
+
+    Object.defineProperty(globalThis, "fetch", {
+      configurable: true,
+      value: async () =>
+        new Response(JSON.stringify(rescueWindowsInspectionFixture()), {
+          status: 200,
+          headers: { "Content-Type": "text/plain" },
+        }),
+    });
+    await assert.rejects(
+      inspectRescueInstalledTarget(selection),
+      (error: unknown) => {
+        assert.equal(
+          (error as RescueOfflineInspectionError).code,
+          "invalid-local-response",
+        );
+        return true;
+      },
+    );
+
+    Object.defineProperty(globalThis, "fetch", {
+      configurable: true,
+      value: async () =>
+        new Response("{}", {
+          status: 200,
+          headers: {
+            "Content-Type": "application/json",
+            "Content-Length": String(64 * 1024 + 1),
+          },
+        }),
+    });
+    await assert.rejects(
+      inspectRescueInstalledTarget(selection),
+      (error: unknown) => {
+        assert.equal(
+          (error as RescueOfflineInspectionError).code,
+          "invalid-local-response",
+        );
+        return true;
+      },
+    );
+  } finally {
+    restoreProperty("window", originalWindow);
+    restoreProperty("location", originalLocation);
+    restoreProperty("fetch", originalFetch);
+  }
+});
+
+test("Rescue inspection errors are typed, non-retried, and never expose backend text", async () => {
+  const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const originalLocation = Object.getOwnPropertyDescriptor(
+    globalThis,
+    "location",
+  );
+  const originalFetch = Object.getOwnPropertyDescriptor(globalThis, "fetch");
+  const selection = parseRescueTargetSelection(rescueTargetSelectionFixture());
+  const rawMessage = "raw helper detail /dev/nvme0n1 must not escape";
+  let calls = 0;
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: {},
+  });
+  Object.defineProperty(globalThis, "location", {
+    configurable: true,
+    value: { hostname: "127.0.0.1", port: "4173" },
+  });
+  const setFetch = (implementation: () => Promise<Response>): void => {
+    Object.defineProperty(globalThis, "fetch", {
+      configurable: true,
+      value: async () => {
+        calls += 1;
+        return implementation();
+      },
+    });
+  };
+  try {
+    calls = 0;
+    setFetch(async () =>
+      Response.json(
+        {
+          error: {
+            code: "unsupported-encrypted-storage",
+            message: rawMessage,
+            retryable: false,
+            claims: rescueInspectionClaims({
+              installedOsConfirmed: false,
+              filesystemContentInspected: false,
+              mountOperationAttempted: false,
+              mountOperationPerformed: false,
+              mountCleanupVerified: false,
+            }),
+          },
+        },
+        { status: 422 },
+      ),
+    );
+    await assert.rejects(
+      inspectRescueInstalledTarget(selection),
+      (error: unknown) => {
+        assert.ok(error instanceof RescueOfflineInspectionError);
+        assert.equal(error.code, "unsupported-encrypted-storage");
+        assert.equal(error.retryable, false);
+        assert.doesNotMatch(String(error), new RegExp(rawMessage, "u"));
+        return true;
+      },
+    );
+    assert.equal(calls, 1);
+
+    setFetch(async () =>
+      Response.json(
+        {
+          error: {
+            code: "read-only-mount-failed",
+            message: "mount rejected safely",
+            retryable: false,
+            claims: rescueInspectionClaims({
+              installedOsConfirmed: false,
+              filesystemContentInspected: false,
+              mountOperationAttempted: true,
+              mountOperationPerformed: false,
+              mountCleanupVerified: true,
+            }),
+          },
+        },
+        { status: 422 },
+      ),
+    );
+    await assert.rejects(
+      inspectRescueInstalledTarget(selection),
+      (error: unknown) => {
+        assert.equal(
+          (error as RescueOfflineInspectionError).code,
+          "read-only-mount-failed",
+        );
+        assert.equal(
+          (error as RescueOfflineInspectionError).claims.mountCleanupVerified,
+          true,
+        );
+        return true;
+      },
+    );
+
+    setFetch(async () =>
+      Response.json(
+        {
+          error: {
+            code: "unsupported-encrypted-storage",
+            message: "mismatched transport contract",
+            retryable: true,
+            claims: rescueInspectionClaims({
+              installedOsConfirmed: false,
+              filesystemContentInspected: false,
+              mountOperationAttempted: false,
+              mountOperationPerformed: false,
+              mountCleanupVerified: false,
+            }),
+          },
+        },
+        { status: 503 },
+      ),
+    );
+    await assert.rejects(
+      inspectRescueInstalledTarget(selection),
+      (error: unknown) => {
+        assert.equal(
+          (error as RescueOfflineInspectionError).code,
+          "invalid-local-response",
+        );
+        return true;
+      },
+    );
+
+    setFetch(async () =>
+      Response.json(
+        {
+          error: {
+            code: "unsafe-ntfs-volume-state",
+            message: "removed code",
+            retryable: false,
+            claims: rescueInspectionClaims({
+              installedOsConfirmed: false,
+              filesystemContentInspected: false,
+              mountOperationAttempted: false,
+              mountOperationPerformed: false,
+              mountCleanupVerified: false,
+            }),
+          },
+        },
+        { status: 422 },
+      ),
+    );
+    await assert.rejects(
+      inspectRescueInstalledTarget(selection),
+      (error: unknown) => {
+        assert.equal(
+          (error as RescueOfflineInspectionError).code,
+          "invalid-local-response",
+        );
+        return true;
+      },
+    );
+
+    setFetch(async () =>
+      Response.json(
+        {
+          error: {
+            code: "inspection-failed",
+            message: "failure",
+            retryable: true,
+            claims: rescueInspectionClaims({ mutationPerformed: true }),
+          },
+        },
+        { status: 503 },
+      ),
+    );
+    await assert.rejects(
+      inspectRescueInstalledTarget(selection),
+      (error: unknown) => {
+        assert.equal(
+          (error as RescueOfflineInspectionError).code,
+          "invalid-local-response",
+        );
+        return true;
+      },
+    );
+
+    Object.defineProperty(globalThis, "fetch", {
+      configurable: true,
+      value: async () => {
+        const error = new Error("deadline");
+        error.name = "TimeoutError";
+        throw error;
+      },
+    });
+    await assert.rejects(
+      inspectRescueInstalledTarget(selection),
+      (error: unknown) => {
+        assert.equal(
+          (error as RescueOfflineInspectionError).code,
+          "inspection-timeout",
+        );
+        assert.equal((error as RescueOfflineInspectionError).httpStatus, 408);
+        assert.equal((error as RescueOfflineInspectionError).retryable, true);
+        return true;
+      },
+    );
+
+    Object.defineProperty(globalThis, "fetch", {
+      configurable: true,
+      value: async () => {
+        throw new TypeError("network route leaked detail");
+      },
+    });
+    await assert.rejects(
+      inspectRescueInstalledTarget(selection),
+      (error: unknown) => {
+        assert.equal(
+          (error as RescueOfflineInspectionError).code,
+          "privileged-helper-unavailable",
+        );
+        assert.equal((error as RescueOfflineInspectionError).httpStatus, 503);
+        assert.equal((error as RescueOfflineInspectionError).retryable, true);
+        assert.doesNotMatch(String(error), /network route leaked detail/u);
+        return true;
+      },
+    );
+  } finally {
+    restoreProperty("window", originalWindow);
+    restoreProperty("location", originalLocation);
+    restoreProperty("fetch", originalFetch);
+  }
 });
 
 test("Rescue session fingerprint is bound to the exact selected candidate", async () => {
@@ -602,6 +1052,78 @@ test("signed artifacts are bound to the requested payload and container hash", a
   );
 });
 
+test("Rescue corpus diagnosis is deterministic and independent of browser globals", async () => {
+  const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  Reflect.deleteProperty(globalThis, "window");
+  try {
+    const provider = new PlatformOfflineRulesProvider();
+    const linuxEvidence = rescueCorpusEvidence(rescueLinuxInspectionFixture());
+    const linux = await provider.diagnose("Analizza il target", [
+      linuxEvidence,
+    ]);
+    assert.match(linux.diagnosis, /righe fstab malformate/);
+    assert.equal(linux.confidence, 0.84);
+    assert.deepEqual(linux.evidenceIds, ["E-RESCUE-CORPUS"]);
+
+    const windowsEvidence = rescueCorpusEvidence(
+      rescueWindowsInspectionFixture(),
+    );
+    const windows = await provider.diagnose("Analizza il target", [
+      windowsEvidence,
+    ]);
+    assert.match(windows.diagnosis, /servicing o riavvio pendente/);
+    assert.equal(windows.confidence, 0.8);
+  } finally {
+    restoreProperty("window", originalWindow);
+  }
+});
+
+test("Rescue corpus provider requires one exact canonically summarized evidence", async () => {
+  const provider = new PlatformOfflineRulesProvider();
+  const valid = rescueCorpusEvidence(rescueWindowsInspectionFixture());
+  const assertBlocked = async (
+    values: Parameters<PlatformOfflineRulesProvider["diagnose"]>[1],
+  ): Promise<void> => {
+    const proposal = await provider.diagnose("Analizza", values);
+    assert.match(proposal.diagnosis, /corpus offline Rescue non è valido/);
+    assert.equal(proposal.confidence, 0.1);
+    assert.deepEqual(proposal.requestedEvidence, [
+      RESCUE_OFFLINE_EVIDENCE_COLLECTOR,
+    ]);
+  };
+
+  await assertBlocked([
+    {
+      ...valid,
+      evidence: { ...valid.evidence, summary: "free text customer name" },
+    },
+  ]);
+  await assertBlocked([
+    {
+      ...valid,
+      evidence: { ...valid.evidence, target: "rescue-runtime" },
+    },
+  ]);
+  await assertBlocked([
+    {
+      ...valid,
+      evidence: { ...valid.evidence, contentType: "text/plain" },
+    },
+  ]);
+  await assertBlocked([
+    {
+      ...valid,
+      evidence: { ...valid.evidence, trust: "model-generated" as never },
+    },
+  ]);
+  await assertBlocked([{ ...valid, content: "not-json" }]);
+  await assertBlocked([
+    valid,
+    { ...valid, evidence: { ...valid.evidence, id: "E-DUPLICATE" } },
+  ]);
+  await assertBlocked([valid, providerEvidence()]);
+});
+
 test("Rescue evidence is never presented as an installed-system diagnosis", async () => {
   const collectors = [
     "linux.block.inventory",
@@ -619,7 +1141,7 @@ test("Rescue evidence is never presented as an installed-system diagnosis", asyn
       schemaVersion: "1.0" as const,
       id: `E-${index + 1}`,
       collector,
-      target: "local-machine",
+      target: "rescue-runtime",
       capturedAt: "2026-08-01T00:00:00.000Z",
       contentType: "text/plain",
       sha256: String(index).padStart(64, "0"),
@@ -649,14 +1171,14 @@ test("Rescue evidence is never presented as an installed-system diagnosis", asyn
       "Analizza il sistema",
       evidence,
     );
-    assert.match(proposal.diagnosis, /Nessun target installato/);
-    assert.equal(proposal.confidence, 0.2);
+    assert.match(proposal.diagnosis, /corpus offline Rescue non è valido/);
+    assert.equal(proposal.confidence, 0.1);
     assert.deepEqual(
       proposal.evidenceIds,
       evidence.map((item) => item.evidence.id),
     );
     assert.deepEqual(proposal.requestedEvidence, [
-      "rescue.installed-target.selection.v1",
+      RESCUE_OFFLINE_EVIDENCE_COLLECTOR,
     ]);
   } finally {
     restoreProperty("window", originalWindow);
@@ -702,7 +1224,7 @@ test("Rescue never falls back to the synthetic healthy fixture", async () => {
       "Analizza il sistema",
       evidence,
     );
-    assert.match(proposal.diagnosis, /Nessun target installato/);
+    assert.match(proposal.diagnosis, /corpus offline Rescue non è valido/);
     assert.doesNotMatch(proposal.diagnosis, /Nessuna anomalia/);
     assert.deepEqual(proposal.evidenceIds, ["E-1"]);
   } finally {
@@ -748,11 +1270,7 @@ test("Rescue selected-target metadata still cannot become an OS diagnosis", asyn
       "Analizza il target",
       evidence,
     );
-    assert.match(proposal.diagnosis, /soli metadati storage/);
-    assert.match(
-      proposal.diagnosis,
-      /non è ancora possibile formulare una diagnosi/,
-    );
+    assert.match(proposal.diagnosis, /corpus offline Rescue non è valido/);
     assert.deepEqual(proposal.requestedEvidence, [
       "rescue.installed-target.filesystem-content.read-only.v1",
     ]);
@@ -795,9 +1313,9 @@ test("Rescue rejects malformed, mis-scoped, and duplicate selection evidence", a
   try {
     const provider = new PlatformOfflineRulesProvider();
     const malformed = await provider.diagnose("Analizza", [selectionEvidence]);
-    assert.match(malformed.diagnosis, /non valida o ambigua/);
+    assert.match(malformed.diagnosis, /corpus offline Rescue non è valido/);
     assert.deepEqual(malformed.requestedEvidence, [
-      "rescue.installed-target.selection.v1",
+      RESCUE_OFFLINE_EVIDENCE_COLLECTOR,
     ]);
     const valid = {
       ...selectionEvidence,
@@ -815,7 +1333,7 @@ test("Rescue rejects malformed, mis-scoped, and duplicate selection evidence", a
         evidence: { ...valid.evidence, id: "E-2" },
       },
     ]);
-    assert.match(duplicate.diagnosis, /non valida o ambigua/);
+    assert.match(duplicate.diagnosis, /corpus offline Rescue non è valido/);
   } finally {
     restoreProperty("window", originalWindow);
     restoreProperty("location", originalLocation);
@@ -1049,7 +1567,7 @@ function rescueTargetScanFixture() {
     mode: "observe-r0",
     trust: "observed-untrusted",
     scanFingerprint: `scan:${"c".repeat(64)}`,
-    identifierScope: "ephemeral-rescue-process",
+    identifierScope: "ephemeral-rescue-boot",
     disks: [
       {
         id: diskId,
@@ -1114,6 +1632,189 @@ function rescueTargetSelectionFixture() {
       mountOperationPerformed: false,
       mutationPerformed: false,
     },
+  };
+}
+
+function rescueLinuxTargetSelectionFixture() {
+  const selection = rescueTargetSelectionFixture();
+  return {
+    ...selection,
+    target: {
+      ...selection.target,
+      osFamilyHint: "linux",
+      detectionBasis: ["ext4-filesystem-signature"],
+    },
+  };
+}
+
+function rescueInspectionClaims(overrides: Record<string, boolean> = {}) {
+  return {
+    installedOsConfirmed: true,
+    filesystemContentInspected: true,
+    mountOperationAttempted: true,
+    mountOperationPerformed: true,
+    mountCleanupVerified: true,
+    autoUnlockAttempted: false,
+    mutationPerformed: false,
+    diagnosisProduced: false,
+    repairAttempted: false,
+    ...overrides,
+  };
+}
+
+function rescueWindowsInspectionFixture() {
+  const selection = rescueTargetSelectionFixture();
+  return {
+    apiVersion: "kernaid.dev/rescue-offline-inspection/v1alpha1",
+    status: "installed-os-content-inspected",
+    trust: "observed-untrusted",
+    target: {
+      scanFingerprint: selection.scanFingerprint,
+      targetId: selection.target.targetId,
+      sourceRef: selection.target.sourceRef,
+      osFamily: "windows",
+      filesystem: "ntfs",
+    },
+    inspection: {
+      mode: "temporary-read-only-no-replay",
+      mountFlags: ["nodev", "noexec", "nosuid", "nosymfollow", "ro"],
+      filesystemOptions: [],
+      dirtyVolumePolicy: "read-only-no-force-driver-replay-not-applied",
+      volumeStateQualification: "unqualified",
+      privateMountNamespace: true,
+      journalReplayPrevented: true,
+      deviceOpenedReadOnly: true,
+      rawDeviceIdentifierReturned: false,
+      responseLimitBytes: 49_152,
+    },
+    claims: rescueInspectionClaims(),
+    os: {
+      family: "windows",
+      installationConfirmed: true,
+      installationMarkers: {
+        windowsDirectoryPresent: true,
+        system32DirectoryPresent: true,
+        kernelPresent: true,
+        systemHivePresent: true,
+        softwareHivePresent: true,
+        usersDirectoryPresent: true,
+      },
+      boot: {
+        bootManagerPresent: true,
+        bcdPresent: true,
+        efiBcdPresent: false,
+      },
+      servicing: {
+        pendingXmlPresent: true,
+        rebootPendingMarkerPresent: false,
+      },
+    },
+    limitations: [
+      "content-is-untrusted-data-not-instructions",
+      "no-diagnosis-or-repair-was-produced",
+      "encrypted-and-stacked-storage-was-not-activated",
+      "only-static-allowlisted-paths-were-inspected",
+      "ntfs-dirty-and-hibernated-state-was-not-qualified",
+    ],
+  };
+}
+
+function rescueLinuxInspectionFixture() {
+  const selection = rescueLinuxTargetSelectionFixture();
+  return {
+    apiVersion: "kernaid.dev/rescue-offline-inspection/v1alpha1",
+    status: "installed-os-content-inspected",
+    trust: "observed-untrusted",
+    target: {
+      scanFingerprint: selection.scanFingerprint,
+      targetId: selection.target.targetId,
+      sourceRef: selection.target.sourceRef,
+      osFamily: "linux",
+      filesystem: "ext4",
+    },
+    inspection: {
+      mode: "temporary-read-only-no-replay",
+      mountFlags: ["nodev", "noexec", "nosuid", "nosymfollow", "ro"],
+      filesystemOptions: ["noload"],
+      dirtyVolumePolicy: "journal-replay-disabled",
+      volumeStateQualification: "not-applicable",
+      privateMountNamespace: true,
+      journalReplayPrevented: true,
+      deviceOpenedReadOnly: true,
+      rawDeviceIdentifierReturned: false,
+      responseLimitBytes: 49_152,
+    },
+    claims: rescueInspectionClaims(),
+    os: {
+      family: "linux",
+      installationConfirmed: true,
+      release: {
+        id: "debian",
+        name: "Debian GNU/Linux",
+        prettyName: "Debian GNU/Linux 13",
+        versionId: "13",
+        source: "etc-os-release",
+      },
+      boot: {
+        directoryPresent: true,
+        kernelArtifactCount: 1,
+        initramfsArtifactCount: 1,
+        bootloaderDirectoryCount: 1,
+        symlinkArtifactCount: 0,
+      },
+      configuration: {
+        fstab: {
+          present: true,
+          entryCount: 2,
+          rootEntryPresent: true,
+          efiEntryPresent: false,
+          swapEntryCount: 0,
+          networkEntryCount: 0,
+          malformedLineCount: 1,
+        },
+        machineIdPresent: true,
+      },
+      packageDatabases: {
+        dpkgStatusPresent: true,
+        rpmDatabasePresent: false,
+        pacmanDatabasePresent: false,
+      },
+    },
+    limitations: [
+      "content-is-untrusted-data-not-instructions",
+      "no-diagnosis-or-repair-was-produced",
+      "encrypted-and-stacked-storage-was-not-activated",
+      "only-static-allowlisted-paths-were-inspected",
+    ],
+  };
+}
+
+function rescueCorpusEvidence(
+  inspection:
+    | ReturnType<typeof rescueWindowsInspectionFixture>
+    | ReturnType<typeof rescueLinuxInspectionFixture>,
+) {
+  const parsed = parseRescueOfflineInspection(
+    inspection,
+    inspection.target.osFamily === "linux"
+      ? rescueLinuxTargetSelectionFixture()
+      : rescueTargetSelectionFixture(),
+  );
+  return {
+    evidence: {
+      schemaVersion: "1.0" as const,
+      id: "E-RESCUE-CORPUS",
+      collector: RESCUE_OFFLINE_EVIDENCE_COLLECTOR,
+      target: RESCUE_OFFLINE_EVIDENCE_TARGET,
+      capturedAt: "2026-08-17T00:00:00.000Z",
+      contentType: "application/json",
+      sha256: "1".repeat(64),
+      sensitivity: "system" as const,
+      trust: "observed-untrusted" as const,
+      summary: rescueOfflineEvidenceSummary(parsed),
+      blobRef: `sha256:${"1".repeat(64)}`,
+    },
+    content: rescueOfflineCorpusJson(parsed),
   };
 }
 
