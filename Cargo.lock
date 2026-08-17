@@ -2312,6 +2312,7 @@ dependencies = [
  "kernaid-protocol",
  "kernaid-report-schema",
  "kernaid-storage",
+ "nix",
  "rand_core 0.6.4",
  "rustix",
  "serde",

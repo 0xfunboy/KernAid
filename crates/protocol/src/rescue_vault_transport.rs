@@ -85,6 +85,7 @@ pub enum SeqpacketTransportError {
     InvalidTransport,
     ServerNotRoot,
     EmptyDatagram,
+    AmbiguousZeroByte,
     DatagramTooLarge,
     AncillaryTruncated,
     UnexpectedAncillary,
@@ -100,6 +101,7 @@ impl fmt::Display for SeqpacketTransportError {
             Self::InvalidTransport => "invalid Rescue vault seqpacket transport",
             Self::ServerNotRoot => "Rescue vault server peer is not root",
             Self::EmptyDatagram => "empty Rescue vault seqpacket",
+            Self::AmbiguousZeroByte => "ambiguous zero-byte Rescue vault receive",
             Self::DatagramTooLarge => "Rescue vault seqpacket exceeds its bound",
             Self::AncillaryTruncated => "truncated Rescue vault ancillary data",
             Self::UnexpectedAncillary => "unexpected Rescue vault ancillary data",
@@ -207,10 +209,6 @@ pub(crate) fn recv_seqpacket<Fd: AsFd>(
     if message.flags.contains(ReturnFlags::TRUNC) || message.bytes > MAX_DATAGRAM_BYTES {
         return Err(SeqpacketTransportError::DatagramTooLarge);
     }
-    if message.bytes == 0 {
-        return Err(SeqpacketTransportError::EmptyDatagram);
-    }
-
     let mut descriptors = Vec::new();
     let mut unexpected_ancillary = false;
     for ancillary in control.drain() {
@@ -221,6 +219,21 @@ pub(crate) fn recv_seqpacket<Fd: AsFd>(
         }
     }
     drop(control);
+
+    if message.bytes == 0 {
+        // Linux reports both an orderly SOCK_SEQPACKET peer shutdown and a
+        // real zero-length record as the same zero-byte recvmsg result. A
+        // zero-length record immediately followed by shutdown is therefore
+        // indistinguishable from EOF. Ancillary data proves this was a real
+        // record. Otherwise classify only what the kernel still exposes: a
+        // live peer is a definite framing violation, while hangup is an
+        // explicit ambiguity that callers may reconcile only after mutation.
+        return Err(if !descriptors.is_empty() || unexpected_ancillary {
+            SeqpacketTransportError::EmptyDatagram
+        } else {
+            classify_zero_length_receive(socket, deadline)
+        });
+    }
 
     if unexpected_ancillary {
         return Err(SeqpacketTransportError::UnexpectedAncillary);
@@ -242,6 +255,92 @@ pub(crate) fn recv_seqpacket<Fd: AsFd>(
         descriptors,
         socket_identity,
     })
+}
+
+fn classify_zero_length_receive(
+    socket: BorrowedFd<'_>,
+    deadline: Instant,
+) -> SeqpacketTransportError {
+    loop {
+        if ensure_deadline(deadline).is_err() {
+            // The caller has already consumed a zero-byte result. Never turn
+            // that consumed event into a retryable timeout merely
+            // because its nonblocking classification crossed the deadline.
+            // The peer state is now unresolved, so require the same fresh
+            // post-mutation reconciliation as zero-byte plus hangup.
+            return SeqpacketTransportError::AmbiguousZeroByte;
+        }
+        let mut byte = [0_u8; 1];
+        let mut io = [IoSliceMut::new(&mut byte)];
+        let mut control_space =
+            [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(2), ScmCredentials(1))];
+        let mut control = RecvAncillaryBuffer::new(&mut control_space);
+        let message = match recvmsg(
+            socket,
+            &mut io,
+            &mut control,
+            RecvFlags::CMSG_CLOEXEC | RecvFlags::TRUNC | RecvFlags::DONTWAIT | RecvFlags::PEEK,
+        ) {
+            Ok(message) => message,
+            Err(error) if error == rustix::io::Errno::INTR => continue,
+            Err(error) if error == rustix::io::Errno::AGAIN => {
+                return SeqpacketTransportError::EmptyDatagram;
+            }
+            Err(_) => return SeqpacketTransportError::IoFailed,
+        };
+
+        let mut ancillary_present = false;
+        for ancillary in control.drain() {
+            ancillary_present = true;
+            if let RecvAncillaryMessage::ScmRights(rights) = ancillary {
+                // MSG_PEEK duplicates SCM_RIGHTS descriptors into this
+                // process. Consume their owning iterator so every duplicate
+                // is closed while the original queued record remains intact.
+                for descriptor in rights {
+                    drop(descriptor);
+                }
+            }
+        }
+        drop(control);
+
+        if message.bytes > 0
+            || ancillary_present
+            || message
+                .flags
+                .intersects(ReturnFlags::TRUNC | ReturnFlags::CTRUNC)
+        {
+            return SeqpacketTransportError::EmptyDatagram;
+        }
+
+        let mut descriptor = [PollFd::from_borrowed_fd(
+            socket,
+            PollFlags::IN | PollFlags::RDHUP,
+        )];
+        let immediate = Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        loop {
+            if ensure_deadline(deadline).is_err() {
+                return SeqpacketTransportError::AmbiguousZeroByte;
+            }
+            match poll(&mut descriptor, Some(&immediate)) {
+                Ok(_) => {
+                    let events = descriptor[0].revents();
+                    if events.intersects(PollFlags::ERR | PollFlags::NVAL) {
+                        return SeqpacketTransportError::IoFailed;
+                    }
+                    return if events.intersects(PollFlags::HUP | PollFlags::RDHUP) {
+                        SeqpacketTransportError::AmbiguousZeroByte
+                    } else {
+                        SeqpacketTransportError::EmptyDatagram
+                    };
+                }
+                Err(error) if error == rustix::io::Errno::INTR => continue,
+                Err(_) => return SeqpacketTransportError::IoFailed,
+            }
+        }
+    }
 }
 
 /// Sends exactly one bounded AF_UNIX `SOCK_SEQPACKET` record.
@@ -908,6 +1007,7 @@ fn decode_client_response(
                 response.operation,
                 request,
             )?;
+            validate_success_state_version(response.state_version, request)?;
             let payload = decode_success_payload(response.payload, &received_descriptors, request)?;
             Ok(ClientResponse {
                 state_version: response.state_version,
@@ -956,6 +1056,24 @@ fn validate_response_correlation(
         return Err(ClientResponseDecodeError::InvalidCorrelation);
     }
     if state_version > MAX_SAFE_JSON_INTEGER {
+        return Err(ClientResponseDecodeError::InvalidStateVersion);
+    }
+    Ok(())
+}
+
+fn validate_success_state_version(
+    state_version: u64,
+    request: &ClientRequest,
+) -> Result<(), ClientResponseDecodeError> {
+    if matches!(
+        request.payload(),
+        ClientRequestPayload::VaultUnlock { .. } | ClientRequestPayload::VaultLock
+    ) && request
+        .expected_state_version()
+        .checked_add(2)
+        .filter(|version| *version <= MAX_SAFE_JSON_INTEGER)
+        != Some(state_version)
+    {
         return Err(ClientResponseDecodeError::InvalidStateVersion);
     }
     Ok(())
@@ -1248,8 +1366,17 @@ mod tests {
     }
 
     fn status_response(request_id: &str, operation: &str, payload: &str) -> Vec<u8> {
+        success_response(request_id, 8, operation, payload)
+    }
+
+    fn success_response(
+        request_id: &str,
+        state_version: u64,
+        operation: &str,
+        payload: &str,
+    ) -> Vec<u8> {
         format!(
-            "{{\"apiVersion\":\"{API_VERSION}\",\"requestId\":\"{request_id}\",\"stateVersion\":8,\"operation\":\"{operation}\",\"outcome\":\"ok\",\"payload\":{payload}}}"
+            "{{\"apiVersion\":\"{API_VERSION}\",\"requestId\":\"{request_id}\",\"stateVersion\":{state_version},\"operation\":\"{operation}\",\"outcome\":\"ok\",\"payload\":{payload}}}"
         )
         .into_bytes()
     }
@@ -1300,6 +1427,85 @@ mod tests {
         assert_eq!(
             send_seqpacket(sender.as_fd(), &oversized, &[], test_deadline()),
             Err(SeqpacketTransportError::DatagramTooLarge)
+        );
+    }
+
+    #[test]
+    fn transport_separates_live_empty_records_from_ambiguous_hangup() {
+        let (sender, receiver) = seqpacket_pair();
+        rustix::net::send(sender.as_fd(), b"", SendFlags::NOSIGNAL).expect("empty record");
+        assert_eq!(
+            recv_seqpacket(receiver.as_fd(), test_deadline()).err(),
+            Some(SeqpacketTransportError::EmptyDatagram)
+        );
+        drop(sender);
+        assert_eq!(
+            recv_seqpacket(receiver.as_fd(), test_deadline()).err(),
+            Some(SeqpacketTransportError::AmbiguousZeroByte)
+        );
+
+        let (sender, receiver) = seqpacket_pair();
+        drop(sender);
+        assert_eq!(
+            recv_seqpacket(receiver.as_fd(), test_deadline()).err(),
+            Some(SeqpacketTransportError::AmbiguousZeroByte)
+        );
+
+        let (sender, receiver) = seqpacket_pair();
+        rustix::net::send(sender.as_fd(), b"", SendFlags::NOSIGNAL).expect("empty record");
+        drop(sender);
+        assert_eq!(
+            recv_seqpacket(receiver.as_fd(), test_deadline()).err(),
+            Some(SeqpacketTransportError::AmbiguousZeroByte)
+        );
+
+        let (sender, receiver) = seqpacket_pair();
+        drop(sender);
+        let expired = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("expired instant");
+        assert_eq!(
+            classify_zero_length_receive(receiver.as_fd(), expired),
+            SeqpacketTransportError::AmbiguousZeroByte
+        );
+    }
+
+    #[test]
+    fn rejecting_an_empty_record_preserves_the_following_record_and_descriptor() {
+        let (sender, receiver) = seqpacket_pair();
+        let pipe = read_pipe();
+        let pipe_stat = rustix::fs::fstat(&pipe).expect("pipe identity");
+        rustix::net::send(sender.as_fd(), b"", SendFlags::NOSIGNAL).expect("empty record");
+        send_seqpacket(sender.as_fd(), b"next", &[pipe.as_fd()], test_deadline())
+            .expect("following record");
+        drop(sender);
+
+        assert_eq!(
+            recv_seqpacket(receiver.as_fd(), test_deadline()).err(),
+            Some(SeqpacketTransportError::EmptyDatagram)
+        );
+        assert_eq!(count_open_pipe_inode(pipe_stat.st_ino), 1);
+        let packet = recv_seqpacket(receiver.as_fd(), test_deadline()).expect("following record");
+        assert_eq!(packet.bytes(), b"next");
+        let (_, descriptors) = packet.into_parts();
+        assert_eq!(descriptors.len(), 1);
+        let received_stat = rustix::fs::fstat(&descriptors[0]).expect("received pipe identity");
+        assert_eq!(received_stat.st_ino, pipe_stat.st_ino);
+        assert!(
+            rustix::io::fcntl_getfd(&descriptors[0])
+                .expect("received pipe flags")
+                .contains(rustix::io::FdFlags::CLOEXEC)
+        );
+
+        let (sender, receiver) = seqpacket_pair();
+        send_seqpacket(sender.as_fd(), b"authoritative", &[], test_deadline())
+            .expect("valid record");
+        drop(sender);
+        assert_eq!(
+            recv_seqpacket(receiver.as_fd(), test_deadline())
+                .expect("queued response wins close")
+                .bytes(),
+            b"authoritative"
         );
     }
 
@@ -1524,6 +1730,95 @@ mod tests {
         assert_eq!(
             recv_seqpacket(daemon.as_fd(), Instant::now() + Duration::from_millis(20),).err(),
             Some(SeqpacketTransportError::TimedOut)
+        );
+    }
+
+    #[test]
+    fn authenticated_client_requires_exact_two_step_vault_mutation_versions() {
+        for (payload, operation, response_payload) in [
+            (
+                ClientRequestPayload::VaultUnlock {
+                    passphrase_size: 12,
+                },
+                "vault.unlock",
+                format!("{{\"vaultState\":\"unlocked\",\"deviceId\":\"{DEVICE_ID}\"}}"),
+            ),
+            (
+                ClientRequestPayload::VaultLock,
+                "vault.lock",
+                "{\"vaultState\":\"locked\"}".to_owned(),
+            ),
+        ] {
+            let request = request(payload);
+            for version in [7_u64, 8, 9, 10] {
+                let (client, daemon) = seqpacket_pair();
+                let connection = authenticated_test_server(client.as_fd());
+                let response = success_response(REQUEST_ID, version, operation, &response_payload);
+                send_seqpacket(daemon.as_fd(), &response, &[], test_deadline())
+                    .expect("daemon response");
+                let result = connection.receive_response(&request, test_deadline());
+                if version == 9 {
+                    assert!(result.is_ok(), "exact +2 response rejected");
+                } else {
+                    assert_eq!(
+                        result.err(),
+                        Some(ClientExchangeError::Response(
+                            ClientResponseDecodeError::InvalidStateVersion
+                        ))
+                    );
+                }
+            }
+        }
+
+        let status = request(ClientRequestPayload::VaultStatus);
+        let (client, daemon) = seqpacket_pair();
+        let connection = authenticated_test_server(client.as_fd());
+        let response = status_response(REQUEST_ID, "vault.status", "{\"vaultState\":\"locked\"}");
+        send_seqpacket(daemon.as_fd(), &response, &[], test_deadline()).expect("status response");
+        assert!(
+            connection
+                .receive_response(&status, test_deadline())
+                .is_ok()
+        );
+
+        let unlock = request(ClientRequestPayload::VaultUnlock {
+            passphrase_size: 12,
+        });
+        let (client, daemon) = seqpacket_pair();
+        let connection = authenticated_test_server(client.as_fd());
+        let response = format!(
+            "{{\"apiVersion\":\"{API_VERSION}\",\"requestId\":\"{REQUEST_ID}\",\"stateVersion\":7,\"operation\":\"vault.unlock\",\"outcome\":\"error\",\"error\":\"BAD_PASSPHRASE\"}}"
+        );
+        send_seqpacket(daemon.as_fd(), response.as_bytes(), &[], test_deadline())
+            .expect("error response");
+        assert!(
+            connection
+                .receive_response(&unlock, test_deadline())
+                .is_ok()
+        );
+
+        let exhausted = ClientRequest::new(
+            RequestId::parse(REQUEST_ID).expect("request ID"),
+            MAX_SAFE_JSON_INTEGER - 1,
+            ClientRequestPayload::VaultLock,
+        )
+        .expect("headroom-exhausted request");
+        let (client, daemon) = seqpacket_pair();
+        let connection = authenticated_test_server(client.as_fd());
+        let response = success_response(
+            REQUEST_ID,
+            MAX_SAFE_JSON_INTEGER,
+            "vault.lock",
+            "{\"vaultState\":\"locked\"}",
+        );
+        send_seqpacket(daemon.as_fd(), &response, &[], test_deadline()).expect("bounded response");
+        assert_eq!(
+            connection
+                .receive_response(&exhausted, test_deadline())
+                .err(),
+            Some(ClientExchangeError::Response(
+                ClientResponseDecodeError::InvalidStateVersion
+            ))
         );
     }
 

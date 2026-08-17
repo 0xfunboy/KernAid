@@ -1,0 +1,1620 @@
+//! Descriptor-bound daemon runtime, fault marker, cgroup, and worker process.
+
+use super::{RescueVaultDaemonError, internal_wire};
+use rustix::{
+    event::{PollFd, PollFlags, Timespec, poll},
+    fd::OwnedFd,
+    fs::{self as rfs, AtFlags, CWD, FileType, FlockOperation, Mode, OFlags, ResolveFlags},
+    net::{AddressFamily, SocketFlags, SocketType, socketpair},
+    process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal},
+};
+use std::{
+    ffi::{OsStr, OsString},
+    os::{
+        fd::{AsFd, BorrowedFd},
+        unix::ffi::{OsStrExt, OsStringExt},
+    },
+    path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
+};
+
+const RUNTIME_ROOT_NAME: &str = "kernaid-rescue-vault";
+const DAEMON_LOCK_NAME: &str = "kernaid-rescue-vaultd.lock";
+const FAULT_MARKER_NAME: &str = "lifecycle-active-v1";
+const FAULT_MARKER_BYTES: &[u8] = b"KERNAID_RESCUE_VAULT_LIFECYCLE_ARMED_V1\n";
+const SUPERVISOR_CGROUP_NAME: &[u8] = b"supervisor";
+const WORKER_CGROUP_NAME: &str = "worker";
+const CGROUP2_SUPER_MAGIC: u64 = 0x6367_7270;
+const PROC_SUPER_MAGIC: u64 = 0x0000_9fa0;
+const SECURE_DIRECTORY_MODE: u32 = 0o700;
+const SECURE_FILE_MODE: u32 = 0o600;
+const MAX_CGROUP_FILE_BYTES: usize = 4096;
+const MAX_CGROUP_COMPONENTS: usize = 64;
+const MAX_CGROUP_COMPONENT_BYTES: usize = 128;
+const MAX_CGROUP_PROCESSES: usize = 256;
+const WORKER_EXIT_GRACE: Duration = Duration::from_secs(2);
+const WORKER_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Runtime marker disposition at daemon startup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RuntimeDisposition {
+    Ready,
+    PersistentFault,
+}
+
+/// Holds the singleton lock and the systemd-owned runtime directory. Drop
+/// deliberately never disarms an active lifecycle marker.
+pub(super) struct DaemonRuntime {
+    _lock: OwnedFd,
+    root: OwnedFd,
+    marker_armed: bool,
+}
+
+impl DaemonRuntime {
+    pub(super) fn open() -> Result<(Self, RuntimeDisposition), RescueVaultDaemonError> {
+        if !rustix::process::geteuid().is_root() {
+            return Err(RescueVaultDaemonError::PrivilegeRequired);
+        }
+        let run = open_root_directory(Path::new("/run"), false)?;
+        let root = open_runtime_root(&run)?;
+        // The singleton lives inside the root-owned 0700 RuntimeDirectory.
+        // A public sticky /run/lock still permits UID-1000 precreation DoS.
+        let lock = acquire_daemon_lock(&root)?;
+        match marker_disposition(&root)? {
+            // Any named entry is persistent fault evidence. In particular, a
+            // short or malformed marker is a plausible crash after CREATE or
+            // write but before file/directory fsync. Startup must remain
+            // status-only and must never clear or "repair" that evidence.
+            RuntimeDisposition::PersistentFault => Ok((
+                Self {
+                    _lock: lock,
+                    root,
+                    marker_armed: true,
+                },
+                RuntimeDisposition::PersistentFault,
+            )),
+            RuntimeDisposition::Ready => Ok((
+                Self {
+                    _lock: lock,
+                    root,
+                    marker_armed: false,
+                },
+                RuntimeDisposition::Ready,
+            )),
+        }
+    }
+
+    /// Durably arm the lifecycle boundary immediately before the first
+    /// mutating worker command, or when worker isolation becomes ambiguous.
+    pub(super) fn arm_lifecycle(&mut self) -> Result<(), RescueVaultDaemonError> {
+        match rfs::statat(&self.root, FAULT_MARKER_NAME, AtFlags::SYMLINK_NOFOLLOW) {
+            Err(error) if error == rustix::io::Errno::NOENT => {
+                create_fault_marker(&self.root)?;
+            }
+            Ok(_) => {
+                verify_and_sync_fault_marker(&self.root)?;
+            }
+            Err(_) => return Err(RescueVaultDaemonError::RuntimeUnavailable),
+        }
+        self.marker_armed = true;
+        Ok(())
+    }
+
+    /// Disarm only after the caller has proved an exact locked/non-mutated
+    /// worker state, or a reaped worker and empty delegated cgroup.
+    pub(super) fn disarm_after_verified_locked(&mut self) -> Result<(), RescueVaultDaemonError> {
+        if !self.marker_armed {
+            return match rfs::statat(&self.root, FAULT_MARKER_NAME, AtFlags::SYMLINK_NOFOLLOW) {
+                Err(error) if error == rustix::io::Errno::NOENT => Ok(()),
+                _ => Err(RescueVaultDaemonError::PersistentFault),
+            };
+        }
+        remove_fault_marker_with_hook(&self.root, 0, 0, |_| Ok(()))?;
+        self.marker_armed = false;
+        Ok(())
+    }
+
+    /// Prove and durably checkpoint that no lifecycle marker exists. This is
+    /// used only when no mutating worker command has been dispatched and the
+    /// worker/cgroup have been cleanly reaped.
+    pub(super) fn sync_and_verify_disarmed(&mut self) -> Result<(), RescueVaultDaemonError> {
+        if self.marker_armed {
+            return Err(RescueVaultDaemonError::PersistentFault);
+        }
+        rfs::fsync(&self.root).map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+        match rfs::statat(&self.root, FAULT_MARKER_NAME, AtFlags::SYMLINK_NOFOLLOW) {
+            Err(error) if error == rustix::io::Errno::NOENT => Ok(()),
+            _ => Err(RescueVaultDaemonError::PersistentFault),
+        }
+    }
+}
+
+fn marker_disposition(root: &OwnedFd) -> Result<RuntimeDisposition, RescueVaultDaemonError> {
+    match rfs::statat(root, FAULT_MARKER_NAME, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(_) => Ok(RuntimeDisposition::PersistentFault),
+        Err(error) if error == rustix::io::Errno::NOENT => Ok(RuntimeDisposition::Ready),
+        Err(_) => Err(RescueVaultDaemonError::RuntimeUnavailable),
+    }
+}
+
+fn open_root_directory(path: &Path, exact_mode: bool) -> Result<OwnedFd, RescueVaultDaemonError> {
+    let descriptor = rfs::openat2(
+        CWD,
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+    )
+    .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+    validate_root_directory(&descriptor, exact_mode)?;
+    Ok(descriptor)
+}
+
+fn open_child_directory(
+    parent: &OwnedFd,
+    name: &OsStr,
+    exact_mode: bool,
+) -> Result<OwnedFd, RescueVaultDaemonError> {
+    let descriptor = rfs::openat2(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+        beneath_flags(),
+    )
+    .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+    validate_root_directory(&descriptor, exact_mode)?;
+    Ok(descriptor)
+}
+
+fn open_runtime_root(run: &OwnedFd) -> Result<OwnedFd, RescueVaultDaemonError> {
+    open_child_directory(run, OsStr::new(RUNTIME_ROOT_NAME), true)
+}
+
+fn acquire_daemon_lock(lock_root: &OwnedFd) -> Result<OwnedFd, RescueVaultDaemonError> {
+    let create = OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let (descriptor, created) = match rfs::openat2(
+        lock_root,
+        DAEMON_LOCK_NAME,
+        create,
+        Mode::RUSR | Mode::WUSR,
+        beneath_flags(),
+    ) {
+        Ok(descriptor) => (descriptor, true),
+        Err(error) if error == rustix::io::Errno::EXIST => (
+            open_child_file(
+                lock_root,
+                DAEMON_LOCK_NAME,
+                OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            )?,
+            false,
+        ),
+        Err(_) => return Err(RescueVaultDaemonError::RuntimeUnavailable),
+    };
+    if created {
+        rfs::fchmod(&descriptor, Mode::RUSR | Mode::WUSR)
+            .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+    }
+    validate_secure_file(&descriptor, lock_root)?;
+    rfs::flock(&descriptor, FlockOperation::NonBlockingLockExclusive).map_err(|error| {
+        if error == rustix::io::Errno::AGAIN || error == rustix::io::Errno::WOULDBLOCK {
+            RescueVaultDaemonError::AlreadyRunning
+        } else {
+            RescueVaultDaemonError::RuntimeUnavailable
+        }
+    })?;
+    Ok(descriptor)
+}
+
+fn create_fault_marker(root: &OwnedFd) -> Result<(), RescueVaultDaemonError> {
+    create_fault_marker_with_hook(root, 0, 0, |_| Ok(()))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MarkerMutationStep {
+    Created,
+    Written,
+    FileSynced,
+    Unlinked,
+    DirectorySynced,
+}
+
+fn create_fault_marker_with_hook(
+    root: &OwnedFd,
+    expected_uid: u32,
+    expected_gid: u32,
+    mut hook: impl FnMut(MarkerMutationStep) -> Result<(), RescueVaultDaemonError>,
+) -> Result<(), RescueVaultDaemonError> {
+    let marker = rfs::openat2(
+        root,
+        FAULT_MARKER_NAME,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+        beneath_flags(),
+    )
+    .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+    hook(MarkerMutationStep::Created)?;
+    rfs::fchmod(&marker, Mode::RUSR | Mode::WUSR)
+        .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+    write_one(&marker, FAULT_MARKER_BYTES)
+        .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+    hook(MarkerMutationStep::Written)?;
+    rfs::fsync(&marker).map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+    hook(MarkerMutationStep::FileSynced)?;
+    validate_secure_file_owned(&marker, root, expected_uid, expected_gid)?;
+    rfs::fsync(root).map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+    hook(MarkerMutationStep::DirectorySynced)
+}
+
+fn remove_fault_marker_with_hook(
+    root: &OwnedFd,
+    expected_uid: u32,
+    expected_gid: u32,
+    mut hook: impl FnMut(MarkerMutationStep) -> Result<(), RescueVaultDaemonError>,
+) -> Result<(), RescueVaultDaemonError> {
+    let marker = open_child_file(
+        root,
+        FAULT_MARKER_NAME,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+    )?;
+    validate_secure_file_owned(&marker, root, expected_uid, expected_gid)?;
+    let bytes = read_bounded(marker.as_fd(), FAULT_MARKER_BYTES.len() + 1)
+        .map_err(|_| RescueVaultDaemonError::ShutdownFailed)?;
+    if bytes.as_slice() != FAULT_MARKER_BYTES {
+        return Err(RescueVaultDaemonError::ShutdownFailed);
+    }
+    let opened = rfs::fstat(&marker).map_err(|_| RescueVaultDaemonError::ShutdownFailed)?;
+    let named = rfs::statat(root, FAULT_MARKER_NAME, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|_| RescueVaultDaemonError::ShutdownFailed)?;
+    if opened.st_dev != named.st_dev || opened.st_ino != named.st_ino {
+        return Err(RescueVaultDaemonError::ShutdownFailed);
+    }
+    rfs::unlinkat(root, FAULT_MARKER_NAME, AtFlags::empty())
+        .map_err(|_| RescueVaultDaemonError::ShutdownFailed)?;
+    hook(MarkerMutationStep::Unlinked)?;
+    rfs::fsync(root).map_err(|_| RescueVaultDaemonError::ShutdownFailed)?;
+    hook(MarkerMutationStep::DirectorySynced)
+}
+
+fn verify_and_sync_fault_marker(root: &OwnedFd) -> Result<(), RescueVaultDaemonError> {
+    let marker = open_child_file(
+        root,
+        FAULT_MARKER_NAME,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+    )?;
+    validate_secure_file(&marker, root)?;
+    let bytes = read_bounded(marker.as_fd(), FAULT_MARKER_BYTES.len() + 1)
+        .map_err(|_| RescueVaultDaemonError::PersistentFault)?;
+    let opened = rfs::fstat(&marker).map_err(|_| RescueVaultDaemonError::PersistentFault)?;
+    let named = rfs::statat(root, FAULT_MARKER_NAME, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|_| RescueVaultDaemonError::PersistentFault)?;
+    if bytes.as_slice() != FAULT_MARKER_BYTES
+        || opened.st_dev != named.st_dev
+        || opened.st_ino != named.st_ino
+    {
+        return Err(RescueVaultDaemonError::PersistentFault);
+    }
+    rfs::fsync(&marker).map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+    rfs::fsync(root).map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)
+}
+
+fn open_child_file(
+    parent: &OwnedFd,
+    name: &str,
+    flags: OFlags,
+) -> Result<OwnedFd, RescueVaultDaemonError> {
+    rfs::openat2(parent, name, flags, Mode::empty(), beneath_flags())
+        .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)
+}
+
+fn validate_root_directory(
+    descriptor: &OwnedFd,
+    exact_mode: bool,
+) -> Result<(), RescueVaultDaemonError> {
+    let stat = rfs::fstat(descriptor).map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+    let descriptor_flags = rustix::io::fcntl_getfd(descriptor)
+        .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+    if !FileType::from_raw_mode(stat.st_mode).is_dir()
+        || stat.st_uid != 0
+        || stat.st_gid != 0
+        || (exact_mode && stat.st_mode & 0o7777 != SECURE_DIRECTORY_MODE)
+        || (!exact_mode && stat.st_mode & 0o022 != 0)
+        || !descriptor_flags.contains(rustix::io::FdFlags::CLOEXEC)
+    {
+        return Err(RescueVaultDaemonError::RuntimeUnavailable);
+    }
+    Ok(())
+}
+
+fn validate_secure_file(
+    descriptor: &OwnedFd,
+    parent: &OwnedFd,
+) -> Result<(), RescueVaultDaemonError> {
+    validate_secure_file_owned(descriptor, parent, 0, 0)
+}
+
+fn validate_secure_file_owned(
+    descriptor: &OwnedFd,
+    parent: &OwnedFd,
+    expected_uid: u32,
+    expected_gid: u32,
+) -> Result<(), RescueVaultDaemonError> {
+    let stat = rfs::fstat(descriptor).map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+    let parent_stat = rfs::fstat(parent).map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+    let descriptor_flags = rustix::io::fcntl_getfd(descriptor)
+        .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+    if !FileType::from_raw_mode(stat.st_mode).is_file()
+        || stat.st_uid != expected_uid
+        || stat.st_gid != expected_gid
+        || stat.st_nlink != 1
+        || stat.st_mode & 0o7777 != SECURE_FILE_MODE
+        || stat.st_dev != parent_stat.st_dev
+        || !descriptor_flags.contains(rustix::io::FdFlags::CLOEXEC)
+    {
+        return Err(RescueVaultDaemonError::RuntimeUnavailable);
+    }
+    Ok(())
+}
+
+fn beneath_flags() -> ResolveFlags {
+    ResolveFlags::BENEATH
+        | ResolveFlags::NO_SYMLINKS
+        | ResolveFlags::NO_MAGICLINKS
+        | ResolveFlags::NO_XDEV
+}
+
+/// A path-free handle to the exact delegated sibling cgroup reserved for the
+/// worker.
+pub(super) struct WorkerCgroup {
+    parent: OwnedFd,
+    supervisor: OwnedFd,
+    worker: OwnedFd,
+    supervisor_device: u64,
+    supervisor_inode: u64,
+    worker_device: u64,
+    worker_inode: u64,
+    supervisor_pid: i32,
+}
+
+impl WorkerCgroup {
+    pub(super) fn prepare() -> Result<Self, RescueVaultDaemonError> {
+        let membership = read_self_cgroup()?;
+        let components = parse_delegated_membership(&membership)?;
+        let root = open_cgroup_root()?;
+        let delegated = open_component_path(&root, &components)?;
+        validate_cgroup_directory(&delegated, Some(&root))?;
+        let supervisor = open_cgroup_child(&delegated, OsStr::from_bytes(SUPERVISOR_CGROUP_NAME))?;
+        validate_cgroup_directory(&supervisor, Some(&delegated))?;
+        let self_pid = rustix::process::getpid().as_raw_pid();
+        ensure_cgroup_domain(&delegated)?;
+        ensure_cgroup_domain(&supervisor)?;
+        if !read_cgroup_procs(&delegated)?.is_empty()
+            || read_cgroup_procs(&supervisor)? != [self_pid]
+        {
+            return Err(RescueVaultDaemonError::CgroupUnavailable);
+        }
+
+        match rfs::mkdirat(
+            &delegated,
+            WORKER_CGROUP_NAME,
+            Mode::RUSR | Mode::WUSR | Mode::XUSR,
+        ) {
+            Ok(()) => {}
+            Err(error) if error == rustix::io::Errno::EXIST => {
+                return Err(RescueVaultDaemonError::CgroupUnavailable);
+            }
+            Err(_) => return Err(RescueVaultDaemonError::CgroupUnavailable),
+        }
+        let worker = open_cgroup_child(&delegated, OsStr::new(WORKER_CGROUP_NAME))?;
+        validate_cgroup_directory(&worker, Some(&delegated))?;
+        ensure_cgroup_domain(&worker)?;
+        ensure_cgroup_control_files(&worker)?;
+        if !worker_population_is_empty(
+            &read_cgroup_procs(&worker)?,
+            cgroup_pids_current(&worker)?,
+            cgroup_descendant_count(&worker)?,
+            cgroup_populated(&worker)?,
+        ) {
+            return Err(RescueVaultDaemonError::CgroupUnavailable);
+        }
+        let stat = rfs::fstat(&worker).map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+        let supervisor_stat =
+            rfs::fstat(&supervisor).map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+        Ok(Self {
+            parent: delegated,
+            supervisor,
+            worker,
+            supervisor_device: supervisor_stat.st_dev,
+            supervisor_inode: supervisor_stat.st_ino,
+            worker_device: stat.st_dev,
+            worker_inode: stat.st_ino,
+            supervisor_pid: self_pid,
+        })
+    }
+
+    pub(super) fn move_worker(&self, pid: Pid) -> Result<(), RescueVaultDaemonError> {
+        self.validate_named_worker()?;
+        self.validate_supervisor_topology(Some(pid.as_raw_pid()))?;
+        if !worker_population_is_empty(
+            &read_cgroup_procs(&self.worker)?,
+            cgroup_pids_current(&self.worker)?,
+            cgroup_descendant_count(&self.worker)?,
+            cgroup_populated(&self.worker)?,
+        ) {
+            return Err(RescueVaultDaemonError::CgroupUnavailable);
+        }
+        let procs = open_cgroup_file(&self.worker, "cgroup.procs", OFlags::WRONLY)?;
+        let pid_bytes = pid.as_raw_pid().to_string();
+        write_one(&procs, pid_bytes.as_bytes())
+            .map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+        self.verify_exact_worker(pid)
+    }
+
+    pub(super) fn verify_exact_worker(&self, pid: Pid) -> Result<(), RescueVaultDaemonError> {
+        self.validate_named_worker()?;
+        self.validate_supervisor_topology(None)?;
+        if !worker_population_is_exact(
+            &read_cgroup_procs(&self.worker)?,
+            cgroup_pids_current(&self.worker)?,
+            cgroup_descendant_count(&self.worker)?,
+            cgroup_populated(&self.worker)?,
+            pid.as_raw_pid(),
+        ) {
+            return Err(RescueVaultDaemonError::CgroupUnavailable);
+        }
+        Ok(())
+    }
+
+    pub(super) fn kill_all(&self) -> Result<(), RescueVaultDaemonError> {
+        self.validate_named_worker()?;
+        let kill = open_cgroup_file(&self.worker, "cgroup.kill", OFlags::WRONLY)?;
+        write_one(&kill, b"1").map_err(|_| RescueVaultDaemonError::CgroupUnavailable)
+    }
+
+    pub(super) fn wait_empty(&self, deadline: Instant) -> Result<(), RescueVaultDaemonError> {
+        loop {
+            self.validate_named_worker()?;
+            if worker_population_is_empty(
+                &read_cgroup_procs(&self.worker)?,
+                cgroup_pids_current(&self.worker)?,
+                cgroup_descendant_count(&self.worker)?,
+                cgroup_populated(&self.worker)?,
+            ) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(RescueVaultDaemonError::ShutdownFailed);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    pub(super) fn remove_empty(&self, deadline: Instant) -> Result<(), RescueVaultDaemonError> {
+        self.wait_empty(deadline)?;
+        self.validate_supervisor_topology(None)?;
+        self.validate_named_worker()?;
+        rfs::unlinkat(&self.parent, WORKER_CGROUP_NAME, AtFlags::REMOVEDIR)
+            .map_err(|_| RescueVaultDaemonError::ShutdownFailed)?;
+        match rfs::statat(&self.parent, WORKER_CGROUP_NAME, AtFlags::SYMLINK_NOFOLLOW) {
+            Err(error) if error == rustix::io::Errno::NOENT => Ok(()),
+            _ => Err(RescueVaultDaemonError::ShutdownFailed),
+        }
+    }
+
+    fn validate_named_worker(&self) -> Result<(), RescueVaultDaemonError> {
+        let retained =
+            rfs::fstat(&self.worker).map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+        let named = rfs::statat(&self.parent, WORKER_CGROUP_NAME, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+        if retained.st_dev != self.worker_device
+            || retained.st_ino != self.worker_inode
+            || named.st_dev != self.worker_device
+            || named.st_ino != self.worker_inode
+        {
+            return Err(RescueVaultDaemonError::CgroupUnavailable);
+        }
+        validate_cgroup_directory(&self.worker, Some(&self.parent))
+    }
+
+    fn validate_supervisor_topology(
+        &self,
+        pending_worker: Option<i32>,
+    ) -> Result<(), RescueVaultDaemonError> {
+        let retained =
+            rfs::fstat(&self.supervisor).map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+        let named = rfs::statat(
+            &self.parent,
+            OsStr::from_bytes(SUPERVISOR_CGROUP_NAME),
+            AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+        if retained.st_dev != self.supervisor_device
+            || retained.st_ino != self.supervisor_inode
+            || named.st_dev != self.supervisor_device
+            || named.st_ino != self.supervisor_inode
+            || !read_cgroup_procs(&self.parent)?.is_empty()
+        {
+            return Err(RescueVaultDaemonError::CgroupUnavailable);
+        }
+        let mut expected = vec![self.supervisor_pid];
+        if let Some(pid) = pending_worker {
+            expected.push(pid);
+            expected.sort_unstable();
+        }
+        if read_cgroup_procs(&self.supervisor)? != expected {
+            return Err(RescueVaultDaemonError::CgroupUnavailable);
+        }
+        ensure_cgroup_domain(&self.parent)?;
+        ensure_cgroup_domain(&self.supervisor)
+    }
+}
+
+fn worker_population_is_empty(
+    direct_processes: &[i32],
+    current_processes: u64,
+    descendants: u64,
+    populated: bool,
+) -> bool {
+    direct_processes.is_empty() && current_processes == 0 && descendants == 0 && !populated
+}
+
+fn worker_population_is_exact(
+    direct_processes: &[i32],
+    current_processes: u64,
+    descendants: u64,
+    populated: bool,
+    worker_pid: i32,
+) -> bool {
+    direct_processes == [worker_pid] && current_processes == 1 && descendants == 0 && populated
+}
+
+fn read_self_cgroup() -> Result<Vec<u8>, RescueVaultDaemonError> {
+    let proc = rfs::openat2(
+        CWD,
+        "/proc",
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+    )
+    .map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+    let filesystem = rfs::fstatfs(&proc).map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+    if u64::try_from(filesystem.f_type).ok() != Some(PROC_SUPER_MAGIC) {
+        return Err(RescueVaultDaemonError::CgroupUnavailable);
+    }
+    let relative = format!("{}/cgroup", rustix::process::getpid().as_raw_pid());
+    let cgroup = rfs::openat2(
+        &proc,
+        relative,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+        beneath_flags(),
+    )
+    .map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+    read_bounded(cgroup.as_fd(), MAX_CGROUP_FILE_BYTES)
+        .map_err(|_| RescueVaultDaemonError::CgroupUnavailable)
+}
+
+fn parse_delegated_membership(bytes: &[u8]) -> Result<Vec<OsString>, RescueVaultDaemonError> {
+    if bytes.is_empty() || bytes.len() > MAX_CGROUP_FILE_BYTES || !bytes.ends_with(b"\n") {
+        return Err(RescueVaultDaemonError::CgroupUnavailable);
+    }
+    let lines = bytes[..bytes.len() - 1].split(|byte| *byte == b'\n');
+    let mut only = None;
+    for line in lines {
+        if line.is_empty() || only.is_some() || !line.starts_with(b"0::/") {
+            return Err(RescueVaultDaemonError::CgroupUnavailable);
+        }
+        only = Some(&line[4..]);
+    }
+    let path = only.ok_or(RescueVaultDaemonError::CgroupUnavailable)?;
+    let raw = path.split(|byte| *byte == b'/').collect::<Vec<_>>();
+    if raw.len() < 2
+        || raw.len() > MAX_CGROUP_COMPONENTS
+        || raw.last().copied() != Some(SUPERVISOR_CGROUP_NAME)
+    {
+        return Err(RescueVaultDaemonError::CgroupUnavailable);
+    }
+    let mut components = Vec::with_capacity(raw.len() - 1);
+    for component in &raw[..raw.len() - 1] {
+        if component.is_empty()
+            || component.len() > MAX_CGROUP_COMPONENT_BYTES
+            || *component == b"."
+            || *component == b".."
+            || component.iter().any(|byte| *byte == 0 || *byte == b'/')
+        {
+            return Err(RescueVaultDaemonError::CgroupUnavailable);
+        }
+        components.push(OsString::from_vec(component.to_vec()));
+    }
+    Ok(components)
+}
+
+/// Worker-side half of the placement handshake. The parent verifies the exact
+/// PID set through its retained cgroup descriptor; the worker independently
+/// proves that its unified membership ends in the fixed sibling `worker`
+/// before it receives any command.
+pub(super) fn verify_current_worker_cgroup() -> Result<(), RescueVaultDaemonError> {
+    let bytes = read_self_cgroup()?;
+    parse_worker_membership(&bytes)
+}
+
+fn parse_worker_membership(bytes: &[u8]) -> Result<(), RescueVaultDaemonError> {
+    if bytes.is_empty() || bytes.len() > MAX_CGROUP_FILE_BYTES || !bytes.ends_with(b"\n") {
+        return Err(RescueVaultDaemonError::CgroupUnavailable);
+    }
+    let mut lines = bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty());
+    let line = lines
+        .next()
+        .ok_or(RescueVaultDaemonError::CgroupUnavailable)?;
+    if lines.next().is_some() || !line.starts_with(b"0::/") {
+        return Err(RescueVaultDaemonError::CgroupUnavailable);
+    }
+    let components: Vec<&[u8]> = line[4..].split(|byte| *byte == b'/').collect();
+    if components.is_empty()
+        || components.len() > MAX_CGROUP_COMPONENTS
+        || components.last().copied() != Some(WORKER_CGROUP_NAME.as_bytes())
+        || components.iter().any(|component| {
+            component.is_empty()
+                || component.len() > MAX_CGROUP_COMPONENT_BYTES
+                || *component == b"."
+                || *component == b".."
+                || component.contains(&0)
+        })
+    {
+        return Err(RescueVaultDaemonError::CgroupUnavailable);
+    }
+    Ok(())
+}
+
+fn open_cgroup_root() -> Result<OwnedFd, RescueVaultDaemonError> {
+    let descriptor = rfs::openat2(
+        CWD,
+        "/sys/fs/cgroup",
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+    )
+    .map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+    let filesystem =
+        rfs::fstatfs(&descriptor).map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+    if u64::try_from(filesystem.f_type).ok() != Some(CGROUP2_SUPER_MAGIC) {
+        return Err(RescueVaultDaemonError::CgroupUnavailable);
+    }
+    validate_cgroup_directory(&descriptor, None)?;
+    Ok(descriptor)
+}
+
+fn open_component_path(
+    root: &OwnedFd,
+    components: &[OsString],
+) -> Result<OwnedFd, RescueVaultDaemonError> {
+    let mut path = PathBuf::new();
+    for component in components {
+        path.push(component);
+    }
+    rfs::openat2(
+        root,
+        path,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+        beneath_flags(),
+    )
+    .map_err(|_| RescueVaultDaemonError::CgroupUnavailable)
+}
+
+fn open_cgroup_child(parent: &OwnedFd, name: &OsStr) -> Result<OwnedFd, RescueVaultDaemonError> {
+    rfs::openat2(
+        parent,
+        name,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+        beneath_flags(),
+    )
+    .map_err(|_| RescueVaultDaemonError::CgroupUnavailable)
+}
+
+fn validate_cgroup_directory(
+    descriptor: &OwnedFd,
+    parent: Option<&OwnedFd>,
+) -> Result<(), RescueVaultDaemonError> {
+    let stat = rfs::fstat(descriptor).map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+    let filesystem =
+        rfs::fstatfs(descriptor).map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+    let descriptor_flags = rustix::io::fcntl_getfd(descriptor)
+        .map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+    if !FileType::from_raw_mode(stat.st_mode).is_dir()
+        || stat.st_uid != 0
+        || stat.st_gid != 0
+        || u64::try_from(filesystem.f_type).ok() != Some(CGROUP2_SUPER_MAGIC)
+        || !descriptor_flags.contains(rustix::io::FdFlags::CLOEXEC)
+        || parent.is_some_and(|parent| {
+            rfs::fstat(parent)
+                .map(|parent| parent.st_dev != stat.st_dev)
+                .unwrap_or(true)
+        })
+    {
+        return Err(RescueVaultDaemonError::CgroupUnavailable);
+    }
+    Ok(())
+}
+
+fn ensure_cgroup_control_files(worker: &OwnedFd) -> Result<(), RescueVaultDaemonError> {
+    let _events = open_cgroup_file(worker, "cgroup.events", OFlags::RDONLY)?;
+    let _procs = open_cgroup_file(worker, "cgroup.procs", OFlags::RDONLY)?;
+    let _kill = open_cgroup_file(worker, "cgroup.kill", OFlags::WRONLY)?;
+    let _pids = open_cgroup_file(worker, "pids.current", OFlags::RDONLY)?;
+    let _stat = open_cgroup_file(worker, "cgroup.stat", OFlags::RDONLY)?;
+    Ok(())
+}
+
+fn ensure_cgroup_domain(directory: &OwnedFd) -> Result<(), RescueVaultDaemonError> {
+    let descriptor = open_cgroup_file(directory, "cgroup.type", OFlags::RDONLY)?;
+    let bytes = read_bounded(descriptor.as_fd(), 32)
+        .map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+    if bytes != b"domain\n" {
+        return Err(RescueVaultDaemonError::CgroupUnavailable);
+    }
+    Ok(())
+}
+
+fn open_cgroup_file(
+    directory: &OwnedFd,
+    name: &str,
+    access: OFlags,
+) -> Result<OwnedFd, RescueVaultDaemonError> {
+    let descriptor = rfs::openat2(
+        directory,
+        name,
+        access | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+        beneath_flags(),
+    )
+    .map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+    let stat = rfs::fstat(&descriptor).map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+    let parent = rfs::fstat(directory).map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+    if !FileType::from_raw_mode(stat.st_mode).is_file()
+        || stat.st_uid != 0
+        || stat.st_gid != 0
+        || stat.st_dev != parent.st_dev
+    {
+        return Err(RescueVaultDaemonError::CgroupUnavailable);
+    }
+    Ok(descriptor)
+}
+
+fn read_cgroup_procs(directory: &OwnedFd) -> Result<Vec<i32>, RescueVaultDaemonError> {
+    let descriptor = open_cgroup_file(directory, "cgroup.procs", OFlags::RDONLY)?;
+    let bytes = read_bounded(descriptor.as_fd(), MAX_CGROUP_FILE_BYTES)
+        .map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !bytes.ends_with(b"\n") {
+        return Err(RescueVaultDaemonError::CgroupUnavailable);
+    }
+    let mut pids = Vec::new();
+    for line in bytes[..bytes.len() - 1].split(|byte| *byte == b'\n') {
+        if line.is_empty()
+            || line.len() > 10
+            || !line.iter().all(u8::is_ascii_digit)
+            || (line.len() > 1 && line[0] == b'0')
+        {
+            return Err(RescueVaultDaemonError::CgroupUnavailable);
+        }
+        let value = std::str::from_utf8(line)
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok())
+            .filter(|value| *value > 0)
+            .ok_or(RescueVaultDaemonError::CgroupUnavailable)?;
+        if pids.contains(&value) || pids.len() >= MAX_CGROUP_PROCESSES {
+            return Err(RescueVaultDaemonError::CgroupUnavailable);
+        }
+        pids.push(value);
+    }
+    pids.sort_unstable();
+    Ok(pids)
+}
+
+fn cgroup_populated(directory: &OwnedFd) -> Result<bool, RescueVaultDaemonError> {
+    let descriptor = open_cgroup_file(directory, "cgroup.events", OFlags::RDONLY)?;
+    let bytes = read_bounded(descriptor.as_fd(), MAX_CGROUP_FILE_BYTES)
+        .map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+    let mut populated = None;
+    for line in bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        let mut fields = line.split(|byte| *byte == b' ');
+        let key = fields.next().unwrap_or_default();
+        let value = fields.next().unwrap_or_default();
+        if fields.next().is_some() || value.len() != 1 {
+            return Err(RescueVaultDaemonError::CgroupUnavailable);
+        }
+        if key == b"populated" {
+            if populated.is_some() || !matches!(value, b"0" | b"1") {
+                return Err(RescueVaultDaemonError::CgroupUnavailable);
+            }
+            populated = Some(value == b"1");
+        }
+    }
+    populated.ok_or(RescueVaultDaemonError::CgroupUnavailable)
+}
+
+fn cgroup_pids_current(directory: &OwnedFd) -> Result<u64, RescueVaultDaemonError> {
+    let descriptor = open_cgroup_file(directory, "pids.current", OFlags::RDONLY)?;
+    let bytes = read_bounded(descriptor.as_fd(), 32)
+        .map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+    parse_single_cgroup_number(&bytes)
+}
+
+fn cgroup_descendant_count(directory: &OwnedFd) -> Result<u64, RescueVaultDaemonError> {
+    let descriptor = open_cgroup_file(directory, "cgroup.stat", OFlags::RDONLY)?;
+    let bytes = read_bounded(descriptor.as_fd(), MAX_CGROUP_FILE_BYTES)
+        .map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+    if bytes.is_empty() || !bytes.ends_with(b"\n") {
+        return Err(RescueVaultDaemonError::CgroupUnavailable);
+    }
+    let mut descendants = None;
+    let mut keys: Vec<&[u8]> = Vec::new();
+    for line in bytes[..bytes.len() - 1].split(|byte| *byte == b'\n') {
+        let mut fields = line.split(|byte| *byte == b' ');
+        let key = fields.next().unwrap_or_default();
+        let value = fields.next().unwrap_or_default();
+        if key.is_empty()
+            || key.len() > 64
+            || !key
+                .iter()
+                .all(|byte| byte.is_ascii_lowercase() || *byte == b'_')
+            || fields.next().is_some()
+            || keys.contains(&key)
+        {
+            return Err(RescueVaultDaemonError::CgroupUnavailable);
+        }
+        keys.push(key);
+        let number = parse_decimal(value)?;
+        if key == b"nr_descendants" {
+            descendants = Some(number);
+        }
+    }
+    descendants.ok_or(RescueVaultDaemonError::CgroupUnavailable)
+}
+
+fn parse_single_cgroup_number(bytes: &[u8]) -> Result<u64, RescueVaultDaemonError> {
+    if bytes.is_empty() || !bytes.ends_with(b"\n") || bytes[..bytes.len() - 1].contains(&b'\n') {
+        return Err(RescueVaultDaemonError::CgroupUnavailable);
+    }
+    parse_decimal(&bytes[..bytes.len() - 1])
+}
+
+fn parse_decimal(bytes: &[u8]) -> Result<u64, RescueVaultDaemonError> {
+    if bytes.is_empty()
+        || bytes.len() > 20
+        || !bytes.iter().all(u8::is_ascii_digit)
+        || (bytes.len() > 1 && bytes[0] == b'0')
+    {
+        return Err(RescueVaultDaemonError::CgroupUnavailable);
+    }
+    std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or(RescueVaultDaemonError::CgroupUnavailable)
+}
+
+/// Long-lived child and its race-free kernel/cgroup ownership handles.
+pub(super) struct WorkerHandle {
+    channel: Mutex<WorkerChannel>,
+    child: Mutex<Option<Child>>,
+    pidfd: OwnedFd,
+    pid: Pid,
+    cgroup: WorkerCgroup,
+    terminal: AtomicBool,
+}
+
+pub(super) enum WorkerSpawnResult {
+    Ready(Arc<WorkerHandle>),
+    CancelledClean,
+}
+
+struct WorkerChannel {
+    socket: OwnedFd,
+    next_request_id: u64,
+}
+
+impl WorkerHandle {
+    pub(super) fn spawn(
+        cgroup: WorkerCgroup,
+        startup_deadline: Instant,
+        cancellation: &AtomicBool,
+    ) -> Result<WorkerSpawnResult, RescueVaultDaemonError> {
+        let (parent_socket, child_socket) = socketpair(
+            AddressFamily::UNIX,
+            SocketType::SEQPACKET,
+            SocketFlags::CLOEXEC,
+            None,
+        )
+        .map_err(|_| RescueVaultDaemonError::WorkerUnavailable)?;
+        let mut command = Command::new("/proc/self/exe");
+        command
+            .arg("--internal-worker")
+            .env_clear()
+            .current_dir("/")
+            .stdin(Stdio::from(child_socket))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = command
+            .spawn()
+            .map_err(|_| RescueVaultDaemonError::WorkerUnavailable)?;
+        let pid = Pid::from_child(&child);
+        let pidfd = match pidfd_open(pid, PidfdFlags::NONBLOCK) {
+            Ok(pidfd) => pidfd,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = bounded_child_reap(&mut child, cleanup_deadline(startup_deadline));
+                return Err(RescueVaultDaemonError::WorkerUnavailable);
+            }
+        };
+        let descriptor_flags = match rustix::io::fcntl_getfd(&pidfd) {
+            Ok(flags) => flags,
+            Err(_) => {
+                cleanup_spawn_failure(&mut child, &pidfd, &cgroup, startup_deadline);
+                return Err(RescueVaultDaemonError::WorkerUnavailable);
+            }
+        };
+        if !descriptor_flags.contains(rustix::io::FdFlags::CLOEXEC) {
+            cleanup_spawn_failure(&mut child, &pidfd, &cgroup, startup_deadline);
+            return Err(RescueVaultDaemonError::WorkerUnavailable);
+        }
+        if cgroup.move_worker(pid).is_err() {
+            cleanup_spawn_failure(&mut child, &pidfd, &cgroup, startup_deadline);
+            return Err(RescueVaultDaemonError::CgroupUnavailable);
+        }
+        if internal_wire::validate_control_socket(parent_socket.as_fd()).is_err() {
+            cleanup_spawn_failure(&mut child, &pidfd, &cgroup, startup_deadline);
+            return Err(RescueVaultDaemonError::WorkerUnavailable);
+        }
+        let bootstrap_deadline = Instant::now()
+            .checked_add(WORKER_BOOTSTRAP_TIMEOUT)
+            .unwrap_or(startup_deadline)
+            .min(startup_deadline);
+        if cancellation.load(Ordering::Acquire) {
+            return cancelled_spawn_result(&mut child, &pidfd, &cgroup, startup_deadline);
+        }
+        if internal_wire::send_command(
+            parent_socket.as_fd(),
+            internal_wire::WorkerCommand::bootstrap(1),
+            None,
+            bootstrap_deadline,
+        )
+        .is_err()
+        {
+            cleanup_spawn_failure(&mut child, &pidfd, &cgroup, startup_deadline);
+            return Err(RescueVaultDaemonError::WorkerUnavailable);
+        }
+        let bootstrap = loop {
+            if cancellation.load(Ordering::Acquire) {
+                return cancelled_spawn_result(&mut child, &pidfd, &cgroup, startup_deadline);
+            }
+            let slice = Instant::now()
+                .checked_add(Duration::from_millis(200))
+                .unwrap_or(bootstrap_deadline)
+                .min(bootstrap_deadline);
+            match internal_wire::receive_response(parent_socket.as_fd(), 1, slice) {
+                Ok(response) => break response,
+                Err(internal_wire::InternalWireError::TimedOut) if slice < bootstrap_deadline => {}
+                Err(_) => {
+                    cleanup_spawn_failure(&mut child, &pidfd, &cgroup, startup_deadline);
+                    return Err(RescueVaultDaemonError::WorkerUnavailable);
+                }
+            }
+        };
+        if bootstrap.code != internal_wire::WorkerResultCode::BootstrapReady
+            || bootstrap.device_id.is_some()
+            || cgroup.verify_exact_worker(pid).is_err()
+            || pidfd_ready(pidfd.as_fd()).unwrap_or(true)
+        {
+            cleanup_spawn_failure(&mut child, &pidfd, &cgroup, startup_deadline);
+            return Err(RescueVaultDaemonError::WorkerUnavailable);
+        }
+        if cancellation.load(Ordering::Acquire) {
+            return cancelled_spawn_result(&mut child, &pidfd, &cgroup, startup_deadline);
+        }
+        Ok(WorkerSpawnResult::Ready(Arc::new(Self {
+            channel: Mutex::new(WorkerChannel {
+                socket: parent_socket,
+                next_request_id: 2,
+            }),
+            child: Mutex::new(Some(child)),
+            pidfd,
+            pid,
+            cgroup,
+            terminal: AtomicBool::new(false),
+        })))
+    }
+
+    pub(super) fn transact(
+        &self,
+        kind: internal_wire::WorkerCommandKind,
+        passphrase_size: Option<u16>,
+        passphrase: Option<BorrowedFd<'_>>,
+        deadline: Instant,
+    ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
+        self.transact_cancellable(kind, passphrase_size, passphrase, deadline, None)
+    }
+
+    pub(super) fn transact_cancellable(
+        &self,
+        kind: internal_wire::WorkerCommandKind,
+        passphrase_size: Option<u16>,
+        passphrase: Option<BorrowedFd<'_>>,
+        deadline: Instant,
+        cancellation: Option<&AtomicBool>,
+    ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
+        if self.terminal.load(Ordering::Acquire) {
+            return Err(RescueVaultDaemonError::WorkerUnavailable);
+        }
+        let mut channel = self
+            .channel
+            .lock()
+            .map_err(|_| RescueVaultDaemonError::WorkerUnavailable)?;
+        if self.terminal.load(Ordering::Acquire) {
+            return Err(RescueVaultDaemonError::WorkerUnavailable);
+        }
+        self.cgroup.verify_exact_worker(self.pid)?;
+        if pidfd_ready(self.pidfd.as_fd())? {
+            return Err(RescueVaultDaemonError::WorkerUnavailable);
+        }
+        let request_id = channel.next_request_id;
+        channel.next_request_id = request_id
+            .checked_add(1)
+            .filter(|next| *next != 0)
+            .ok_or(RescueVaultDaemonError::WorkerUnavailable)?;
+        let command = match (kind, passphrase_size) {
+            (internal_wire::WorkerCommandKind::Bootstrap, _) => {
+                return Err(RescueVaultDaemonError::ProtocolFailure);
+            }
+            (internal_wire::WorkerCommandKind::Probe, None) => {
+                internal_wire::WorkerCommand::probe(request_id)
+            }
+            (internal_wire::WorkerCommandKind::Unlock, Some(size)) => {
+                internal_wire::WorkerCommand::unlock(request_id, size)
+            }
+            (internal_wire::WorkerCommandKind::Lock, None) => {
+                internal_wire::WorkerCommand::lock(request_id)
+            }
+            (internal_wire::WorkerCommandKind::AttestQuiescent, None) => {
+                internal_wire::WorkerCommand::attest_quiescent(request_id)
+            }
+            (internal_wire::WorkerCommandKind::Shutdown, None) => {
+                internal_wire::WorkerCommand::shutdown(request_id)
+            }
+            _ => return Err(RescueVaultDaemonError::ProtocolFailure),
+        };
+        internal_wire::send_command(channel.socket.as_fd(), command, passphrase, deadline)
+            .map_err(|_| RescueVaultDaemonError::WorkerUnavailable)?;
+        let response = loop {
+            if cancellation.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
+                return Err(RescueVaultDaemonError::WorkerUnavailable);
+            }
+            let now = Instant::now();
+            let slice = now
+                .checked_add(Duration::from_millis(200))
+                .unwrap_or(deadline)
+                .min(deadline);
+            match internal_wire::receive_response(channel.socket.as_fd(), request_id, slice) {
+                Ok(response) => break response,
+                Err(internal_wire::InternalWireError::TimedOut) if slice < deadline => continue,
+                Err(_) => return Err(RescueVaultDaemonError::WorkerUnavailable),
+            }
+        };
+        if !response_matches(kind, &response) {
+            return Err(RescueVaultDaemonError::ProtocolFailure);
+        }
+        self.cgroup.verify_exact_worker(self.pid)?;
+        if pidfd_ready(self.pidfd.as_fd())? {
+            return Err(RescueVaultDaemonError::WorkerUnavailable);
+        }
+        Ok(response)
+    }
+
+    pub(super) fn exited(&self) -> Result<bool, RescueVaultDaemonError> {
+        pidfd_ready(self.pidfd.as_fd())
+    }
+
+    pub(super) fn verify_healthy(&self) -> Result<(), RescueVaultDaemonError> {
+        if self.terminal.load(Ordering::Acquire) {
+            return Err(RescueVaultDaemonError::WorkerUnavailable);
+        }
+        self.cgroup.verify_exact_worker(self.pid)?;
+        if pidfd_ready(self.pidfd.as_fd())? {
+            return Err(RescueVaultDaemonError::WorkerUnavailable);
+        }
+        Ok(())
+    }
+
+    pub(super) fn fault_and_terminate(
+        &self,
+        absolute_deadline: Instant,
+    ) -> Result<(), RescueVaultDaemonError> {
+        self.terminal.store(true, Ordering::Release);
+        let cleanup = cleanup_deadline(absolute_deadline);
+        if self
+            .child
+            .lock()
+            .map_err(|_| RescueVaultDaemonError::ShutdownFailed)?
+            .is_none()
+        {
+            return self.cgroup.wait_empty(cleanup);
+        }
+        let kill_cgroup = self.cgroup.kill_all();
+        let kill_worker = pidfd_send_signal(&self.pidfd, Signal::KILL);
+        if kill_cgroup.is_err() && kill_worker.is_err() {
+            return Err(RescueVaultDaemonError::ShutdownFailed);
+        }
+        self.wait_reaped_and_empty(cleanup, false)
+    }
+
+    pub(super) fn cancel_clean(&self, deadline: Instant) -> Result<(), RescueVaultDaemonError> {
+        self.terminal.store(true, Ordering::Release);
+        let cleanup = cleanup_deadline(deadline);
+        let kill_cgroup = self.cgroup.kill_all();
+        let kill_worker = pidfd_send_signal(&self.pidfd, Signal::KILL);
+        if kill_cgroup.is_err() && kill_worker.is_err() {
+            return Err(RescueVaultDaemonError::ShutdownFailed);
+        }
+        self.wait_reaped_and_empty(cleanup, false)?;
+        self.cgroup.remove_empty(cleanup)
+    }
+
+    pub(super) fn shutdown_clean(&self, deadline: Instant) -> Result<(), RescueVaultDaemonError> {
+        let mut channel = self
+            .channel
+            .lock()
+            .map_err(|_| RescueVaultDaemonError::ShutdownFailed)?;
+        if self.terminal.load(Ordering::Acquire) {
+            return Err(RescueVaultDaemonError::ShutdownFailed);
+        }
+        self.cgroup.verify_exact_worker(self.pid)?;
+        if pidfd_ready(self.pidfd.as_fd())? {
+            return Err(RescueVaultDaemonError::ShutdownFailed);
+        }
+        let request_id = channel.next_request_id;
+        channel.next_request_id = request_id
+            .checked_add(1)
+            .filter(|next| *next != 0)
+            .ok_or(RescueVaultDaemonError::ShutdownFailed)?;
+        internal_wire::send_command(
+            channel.socket.as_fd(),
+            internal_wire::WorkerCommand::shutdown(request_id),
+            None,
+            deadline,
+        )
+        .map_err(|_| RescueVaultDaemonError::ShutdownFailed)?;
+        let response =
+            internal_wire::receive_response(channel.socket.as_fd(), request_id, deadline)
+                .map_err(|_| RescueVaultDaemonError::ShutdownFailed)?;
+        if response.code != internal_wire::WorkerResultCode::ShutdownSucceeded {
+            return Err(RescueVaultDaemonError::ShutdownFailed);
+        }
+        self.terminal.store(true, Ordering::Release);
+        drop(channel);
+        self.wait_reaped_and_empty(deadline, true)?;
+        self.cgroup.remove_empty(deadline)
+    }
+
+    fn wait_reaped_and_empty(
+        &self,
+        deadline: Instant,
+        require_success: bool,
+    ) -> Result<(), RescueVaultDaemonError> {
+        wait_pidfd(self.pidfd.as_fd(), deadline)?;
+        let mut child_guard = self
+            .child
+            .lock()
+            .map_err(|_| RescueVaultDaemonError::ShutdownFailed)?;
+        let Some(child) = child_guard.as_mut() else {
+            return self.cgroup.wait_empty(deadline);
+        };
+        let status = child
+            .try_wait()
+            .map_err(|_| RescueVaultDaemonError::ShutdownFailed)?
+            .ok_or(RescueVaultDaemonError::ShutdownFailed)?;
+        if require_success && !status.success() {
+            return Err(RescueVaultDaemonError::ShutdownFailed);
+        }
+        *child_guard = None;
+        self.cgroup.wait_empty(deadline)
+    }
+}
+
+fn cleanup_spawn_failure(
+    child: &mut Child,
+    pidfd: &OwnedFd,
+    cgroup: &WorkerCgroup,
+    absolute_deadline: Instant,
+) -> bool {
+    let _ = cgroup.kill_all();
+    let _ = pidfd_send_signal(pidfd, Signal::KILL);
+    let deadline = cleanup_deadline(absolute_deadline);
+    if bounded_child_reap(child, deadline).is_err() || cgroup.wait_empty(deadline).is_err() {
+        return false;
+    }
+    cgroup.remove_empty(deadline).is_ok()
+}
+
+fn cancelled_spawn_result(
+    child: &mut Child,
+    pidfd: &OwnedFd,
+    cgroup: &WorkerCgroup,
+    absolute_deadline: Instant,
+) -> Result<WorkerSpawnResult, RescueVaultDaemonError> {
+    if cleanup_spawn_failure(child, pidfd, cgroup, absolute_deadline) {
+        Ok(WorkerSpawnResult::CancelledClean)
+    } else {
+        Err(RescueVaultDaemonError::ShutdownFailed)
+    }
+}
+
+fn cleanup_deadline(absolute_deadline: Instant) -> Instant {
+    Instant::now()
+        .checked_add(WORKER_EXIT_GRACE)
+        .unwrap_or(absolute_deadline)
+        .min(absolute_deadline)
+}
+
+fn response_matches(
+    kind: internal_wire::WorkerCommandKind,
+    response: &internal_wire::WorkerResponse,
+) -> bool {
+    use internal_wire::{WorkerCommandKind as Command, WorkerResultCode as Result};
+    match kind {
+        Command::Bootstrap => response.code == Result::BootstrapReady,
+        Command::Probe => matches!(
+            response.code,
+            Result::ProbeAbsent
+                | Result::ProbeUnprovisioned
+                | Result::ProbeLocked
+                | Result::ProbeProfileMismatch
+                | Result::ProbeClassifierUnavailable
+                | Result::ProbeIoFailed
+                | Result::TimedOut
+                | Result::CleanupFailed
+        ),
+        Command::Unlock => matches!(
+            response.code,
+            Result::UnlockSucceeded
+                | Result::Absent
+                | Result::Unprovisioned
+                | Result::ProfileMismatch
+                | Result::BadPassphrase
+                | Result::MediaChanged
+                | Result::IoFailed
+                | Result::CleanupFailed
+                | Result::TimedOut
+                | Result::Busy
+        ),
+        Command::Lock => matches!(
+            response.code,
+            Result::LockSucceeded
+                | Result::IoFailed
+                | Result::CleanupFailed
+                | Result::TimedOut
+                | Result::Busy
+        ),
+        Command::AttestQuiescent => matches!(
+            response.code,
+            Result::AttestAbsent
+                | Result::AttestUnprovisioned
+                | Result::AttestLocked
+                | Result::AttestProfileMismatch
+                | Result::TimedOut
+                | Result::CleanupFailed
+                | Result::IoFailed
+        ),
+        Command::Shutdown => matches!(
+            response.code,
+            Result::ShutdownSucceeded | Result::CleanupFailed | Result::TimedOut
+        ),
+    }
+}
+
+fn pidfd_ready(pidfd: BorrowedFd<'_>) -> Result<bool, RescueVaultDaemonError> {
+    let mut descriptor = [PollFd::from_borrowed_fd(pidfd, PollFlags::IN)];
+    let zero = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    match poll(&mut descriptor, Some(&zero)) {
+        Ok(0) => Ok(false),
+        Ok(_) if descriptor[0].revents().contains(PollFlags::NVAL) => {
+            Err(RescueVaultDaemonError::WorkerUnavailable)
+        }
+        Ok(_) => Ok(descriptor[0]
+            .revents()
+            .intersects(PollFlags::IN | PollFlags::ERR | PollFlags::HUP)),
+        Err(error) if error == rustix::io::Errno::INTR => Ok(false),
+        Err(_) => Err(RescueVaultDaemonError::WorkerUnavailable),
+    }
+}
+
+fn wait_pidfd(pidfd: BorrowedFd<'_>, deadline: Instant) -> Result<(), RescueVaultDaemonError> {
+    loop {
+        if pidfd_ready(pidfd)? {
+            return Ok(());
+        }
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(RescueVaultDaemonError::ShutdownFailed)?;
+        let seconds = i64::try_from(remaining.as_secs()).unwrap_or(i64::MAX);
+        let timeout = Timespec {
+            tv_sec: seconds,
+            tv_nsec: if seconds == i64::MAX {
+                999_999_999
+            } else {
+                i64::from(remaining.subsec_nanos())
+            },
+        };
+        let mut descriptor = [PollFd::from_borrowed_fd(pidfd, PollFlags::IN)];
+        match poll(&mut descriptor, Some(&timeout)) {
+            Ok(0) => return Err(RescueVaultDaemonError::ShutdownFailed),
+            Ok(_) => {}
+            Err(error) if error == rustix::io::Errno::INTR => {}
+            Err(_) => return Err(RescueVaultDaemonError::ShutdownFailed),
+        }
+    }
+}
+
+fn bounded_child_reap(child: &mut Child, deadline: Instant) -> Result<(), RescueVaultDaemonError> {
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) | Err(_) => return Err(RescueVaultDaemonError::ShutdownFailed),
+        }
+    }
+}
+
+fn write_one(descriptor: &OwnedFd, bytes: &[u8]) -> Result<(), ()> {
+    match rustix::io::write(descriptor, bytes) {
+        Ok(written) if written == bytes.len() => Ok(()),
+        _ => Err(()),
+    }
+}
+
+fn read_bounded(descriptor: BorrowedFd<'_>, maximum: usize) -> Result<Vec<u8>, ()> {
+    let mut output = Vec::new();
+    let mut buffer = [0_u8; 512];
+    loop {
+        match rustix::io::read(descriptor, &mut buffer) {
+            Ok(0) => return Ok(output),
+            Ok(count) if output.len().saturating_add(count) <= maximum => {
+                output.extend_from_slice(&buffer[..count]);
+            }
+            Ok(_) | Err(_) => return Err(()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    fn temporary_root() -> (tempfile::TempDir, OwnedFd) {
+        let directory = tempfile::tempdir().expect("temporary runtime");
+        let root = rfs::open(
+            directory.path(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .expect("runtime descriptor");
+        (directory, root)
+    }
+
+    #[test]
+    fn delegated_path_parser_requires_exact_supervisor_sibling_shape() {
+        assert_eq!(
+            parse_delegated_membership(
+                b"0::/system.slice/kernaid-rescue-vaultd.service/supervisor\n"
+            )
+            .expect("valid path"),
+            vec![
+                OsString::from("system.slice"),
+                OsString::from("kernaid-rescue-vaultd.service")
+            ]
+        );
+        for invalid in [
+            &b"0::/supervisor\n"[..],
+            &b"0::/a/../supervisor\n"[..],
+            &b"0::/a/worker\n"[..],
+            &b"2:cpu:/a/supervisor\n"[..],
+            &b"0::/a/supervisor\n0::/b/supervisor\n"[..],
+            &b"0::/a//supervisor\n"[..],
+            &b"0::/a/supervisor"[..],
+        ] {
+            assert_eq!(
+                parse_delegated_membership(invalid).err(),
+                Some(RescueVaultDaemonError::CgroupUnavailable)
+            );
+        }
+    }
+
+    #[test]
+    fn worker_membership_and_population_reject_nested_or_residual_processes() {
+        assert_eq!(
+            parse_worker_membership(b"0::/system.slice/example.service/worker\n"),
+            Ok(())
+        );
+        for invalid in [
+            &b"0::/system.slice/example.service/worker/child\n"[..],
+            &b"0::/system.slice/example.service/supervisor\n"[..],
+            &b"0::/system.slice/../worker\n"[..],
+            &b"0::/system.slice/example.service/worker\n0::/other/worker\n"[..],
+            &b"2:cpu:/system.slice/example.service/worker\n"[..],
+        ] {
+            assert_eq!(
+                parse_worker_membership(invalid),
+                Err(RescueVaultDaemonError::CgroupUnavailable)
+            );
+        }
+
+        assert!(worker_population_is_exact(&[4242], 1, 0, true, 4242));
+        assert!(!worker_population_is_exact(&[4242], 2, 0, true, 4242));
+        assert!(!worker_population_is_exact(&[4242], 1, 1, true, 4242));
+        assert!(!worker_population_is_exact(&[4242], 1, 0, false, 4242));
+        assert!(!worker_population_is_exact(&[4242, 4243], 2, 0, true, 4242));
+
+        assert!(worker_population_is_empty(&[], 0, 0, false));
+        assert!(!worker_population_is_empty(&[], 1, 0, true));
+        assert!(!worker_population_is_empty(&[], 1, 1, true));
+        assert!(!worker_population_is_empty(&[4242], 1, 0, true));
+
+        assert_eq!(parse_single_cgroup_number(b"0\n"), Ok(0));
+        assert_eq!(parse_single_cgroup_number(b"1\n"), Ok(1));
+        for invalid in [
+            &b"01\n"[..],
+            &b"1\n2\n"[..],
+            &b"-1\n"[..],
+            &b"1"[..],
+            &b"\n"[..],
+        ] {
+            assert_eq!(
+                parse_single_cgroup_number(invalid),
+                Err(RescueVaultDaemonError::CgroupUnavailable)
+            );
+        }
+    }
+
+    #[test]
+    fn worker_response_semantics_are_operation_specific() {
+        let probe =
+            internal_wire::WorkerResponse::new(1, internal_wire::WorkerResultCode::ProbeLocked);
+        assert!(response_matches(
+            internal_wire::WorkerCommandKind::Probe,
+            &probe
+        ));
+        assert!(!response_matches(
+            internal_wire::WorkerCommandKind::Unlock,
+            &probe
+        ));
+        let unlock =
+            internal_wire::WorkerResponse::unlocked(2, "KA-0123456789abcdef01234567".to_owned());
+        assert!(response_matches(
+            internal_wire::WorkerCommandKind::Unlock,
+            &unlock
+        ));
+    }
+
+    #[test]
+    fn any_named_or_partial_marker_forces_persistent_fault() {
+        let (directory, root) = temporary_root();
+        assert_eq!(
+            marker_disposition(&root).expect("missing marker"),
+            RuntimeDisposition::Ready
+        );
+
+        std::fs::write(directory.path().join(FAULT_MARKER_NAME), b"short").expect("partial marker");
+        assert_eq!(
+            marker_disposition(&root).expect("partial marker"),
+            RuntimeDisposition::PersistentFault
+        );
+        std::fs::remove_file(directory.path().join(FAULT_MARKER_NAME)).expect("remove partial");
+        symlink("missing-target", directory.path().join(FAULT_MARKER_NAME))
+            .expect("marker symlink");
+        assert_eq!(
+            marker_disposition(&root).expect("named marker"),
+            RuntimeDisposition::PersistentFault
+        );
+    }
+
+    #[test]
+    fn marker_create_write_and_sync_faults_remain_restart_evidence() {
+        let uid = rustix::process::geteuid().as_raw();
+        let gid = rustix::process::getegid().as_raw();
+        for fault in [
+            MarkerMutationStep::Created,
+            MarkerMutationStep::Written,
+            MarkerMutationStep::FileSynced,
+            MarkerMutationStep::DirectorySynced,
+        ] {
+            let (_directory, root) = temporary_root();
+            let result = create_fault_marker_with_hook(&root, uid, gid, |step| {
+                if step == fault {
+                    Err(RescueVaultDaemonError::RuntimeUnavailable)
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(result.is_err(), "fault point {fault:?}");
+            assert_eq!(
+                marker_disposition(&root).expect("restart disposition"),
+                RuntimeDisposition::PersistentFault,
+                "fault point {fault:?} must never restart a worker"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_marker_unlink_or_directory_sync_is_immediately_rearmed() {
+        let uid = rustix::process::geteuid().as_raw();
+        let gid = rustix::process::getegid().as_raw();
+        for fault in [
+            MarkerMutationStep::Unlinked,
+            MarkerMutationStep::DirectorySynced,
+        ] {
+            let (_directory, root) = temporary_root();
+            create_fault_marker_with_hook(&root, uid, gid, |_| Ok(())).expect("initial marker");
+            let result = remove_fault_marker_with_hook(&root, uid, gid, |step| {
+                if step == fault {
+                    Err(RescueVaultDaemonError::ShutdownFailed)
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(result.is_err(), "fault point {fault:?}");
+            // A failed disarm is never accepted as clean. The same action
+            // mark_fault performs must recreate and durably sync the marker.
+            match marker_disposition(&root).expect("post-fault disposition") {
+                RuntimeDisposition::PersistentFault => {}
+                RuntimeDisposition::Ready => {
+                    create_fault_marker_with_hook(&root, uid, gid, |_| Ok(()))
+                        .expect("immediate re-arm");
+                }
+            }
+            assert_eq!(
+                marker_disposition(&root).expect("restart disposition"),
+                RuntimeDisposition::PersistentFault
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_deadline_only_consumes_remaining_absolute_budget() {
+        let now = Instant::now();
+        let expired = now
+            .checked_sub(Duration::from_secs(1))
+            .expect("expired deadline");
+        assert_eq!(cleanup_deadline(expired), expired);
+
+        let short = Instant::now()
+            .checked_add(Duration::from_millis(50))
+            .expect("short deadline");
+        assert_eq!(cleanup_deadline(short), short);
+
+        let long = Instant::now()
+            .checked_add(Duration::from_secs(30))
+            .expect("long deadline");
+        let bounded = cleanup_deadline(long);
+        assert!(bounded <= long);
+        assert!(bounded <= Instant::now() + WORKER_EXIT_GRACE);
+    }
+}

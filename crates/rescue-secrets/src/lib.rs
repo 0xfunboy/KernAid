@@ -140,6 +140,9 @@ mod profile_classifier;
 #[cfg(all(target_os = "linux", feature = "experimental-vault-manager"))]
 mod mount_manager;
 
+#[cfg(all(target_os = "linux", feature = "experimental-vault-manager"))]
+mod rescue_daemon;
+
 #[cfg(target_os = "linux")]
 pub use application_store::{
     ProviderCredentialStatus, RescueApplicationStoreError, RescueReportSummary,
@@ -161,6 +164,15 @@ pub use mount_manager::{
     MapperName, MountedRescueVault, RescueVaultMountManager, VaultMountManagerError,
     VaultUnlockRequest,
 };
+#[cfg(all(target_os = "linux", feature = "experimental-vault-manager"))]
+pub use rescue_daemon::{
+    RescueVaultCompanionError, RescueVaultDaemonError, run_rescue_vault_companion,
+    run_rescue_vault_daemon,
+};
+
+#[cfg(all(target_os = "linux", feature = "experimental-vault-manager"))]
+#[doc(hidden)]
+pub use rescue_daemon::run_internal_rescue_vault_worker;
 
 #[cfg(not(target_os = "linux"))]
 mod unsupported {

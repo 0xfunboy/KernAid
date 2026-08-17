@@ -8,9 +8,10 @@ LUKS2 mount manager—is deliberately disabled by default and is available only
 with `experimental-vault-manager`; its disposable integration probe
 additionally requires `privileged-probe`.
 
-It is not yet a production daemon or a bootable repair product. The feature
-gate remains in place because mount-namespace/path races and restart recovery
-still need a dedicated privileged service design.
+It is not yet a packaged production service or a bootable repair product. A
+Rust-only lifecycle daemon and terminal companion now exist behind
+`experimental-vault-manager`, but the systemd isolation, ISO integration and
+privileged QEMU lifecycle proof are deliberately a later tranche.
 
 ## Experimental manager API
 
@@ -268,22 +269,101 @@ window. This is intentionally not an in-guest unlock or vault-service claim.
 The probe, provisioning commands and tmpfs key files are never packaged in the
 Rescue ISO.
 
-## Service and UI integration
+## Experimental Rescue lifecycle daemon
 
-The intended integration is a small root-owned local daemon that holds
-`MountedRescueVault` for the complete session and exposes only bounded typed
-operations over a permission-checked Unix socket. The closed AF_UNIX
-`SOCK_SEQPACKET` message and descriptor contract now lives in
-`kernaid-protocol`; this crate supplies its read-only boot-media locator and
-closed application persistence store.
-The web/Python UI must never receive the LUKS passphrase, journal key, identity
-seed, raw mount path, or an arbitrary command primitive. The daemon, socket
-listener, systemd/ISO packaging, unlock/store handlers, and Rescue UI flow are
-not implemented yet.
+With `experimental-vault-manager`, `kernaid-rescue-vaultd` implements only the
+closed `vault.status`, `vault.unlock`, and `vault.lock` lifecycle. Every
+provider configure/status/logout/borrow/home-lease, Agent audit, and report
+persist/list/get request is answered `NOT_AUTHORIZED`, with no output
+descriptor and no worker dispatch. The public socket is the fixed top-level
+`/run/kernaid-rescue-vault.sock`; the daemon accepts only protocol-authenticated
+UID 1000 `kernaid` companion requests and never accepts a client path, mapper
+name, command, JSON secret, or configuration argument. `stateVersion` starts
+from a CSPRNG value in the exact JSON-safe range and is checked before every
+transition; status accepts only bootstrap zero or the exact current version.
+
+The supervisor remains responsive while a separate, long-lived internal
+worker owns the locator, mount manager, mounted vault and transient application
+store used to copy the public device ID. The worker is moved, before any probe,
+from the exact delegated cgroup-v2 `supervisor` subgroup to its fixed sibling
+`worker`. A bootstrap barrier makes the child prove its own `/worker`
+membership; the parent brackets commands with pidfd, `cgroup.procs`,
+`pids.current`, `nr_descendants`, and supervisor-topology checks. Internal
+messages have a fixed binary layout, closed result codes, bounded records,
+exact correlation and descriptor arity, and contain neither paths nor secret
+bytes. The LUKS mapper name is freshly randomized for each unlock attempt.
+
+`/run/kernaid-rescue-vault/lifecycle-active-v1` is a daemon-created crash
+marker beneath the systemd-owned runtime directory, not a generic state file.
+The supervisor creates, file-fsyncs and directory-fsyncs it immediately before
+the first mutating worker dispatch. It remains present while unlocked and
+through every ambiguous cleanup. It is removed and the directory fsynced only
+after the worker proves the exact boot partition is LUKS-locked and quiescent
+(no holders or mount), worker/cgroup identity remains exact, and cleanup is
+complete. Any named marker found at restart—including a partial or malformed
+one—means status-only
+`FaultedRebootRequired`; no worker is started. Marker, cgroup, pidfd, reap, or
+cleanup ambiguity is terminal and never causes an automatic retry. The
+singleton flock is inside the root-owned mode-0700 runtime directory rather
+than a pre-creatable `/run/lock` name.
+
+The supervisor performs startup locate/classify with the same quiescent
+`Locked` meaning used for marker removal. A client disappearing before the
+lifecycle begin or immediately before marker arm is observed on that exact
+accepted seqpacket socket and prevents dispatch. Disappearance observed after
+the durable arm but before dispatch becomes a terminal fault; after dispatch,
+the authoritative outcome may still complete and is reconciled. A correlated
+response that has already arrived remains authoritative; a terminal signal
+that wins a later receive poll closes that connection and uses the same
+unknown-outcome reconciliation as a genuine post-send transport failure.
+Fresh status connections poll transitional `Unlocking`/`Locking` evidence
+silently until a terminal state or the original aggregate deadline, and only
+the exact target with sufficient version advancement is success.
+Linux cannot distinguish an orderly `SOCK_SEQPACKET` shutdown from an empty
+record immediately followed by shutdown. That explicit zero-byte peer-state
+ambiguity—including a classification deadline reached after consuming the
+zero byte—is eligible for reconciliation only in the post-mutation context; a
+confirmed live empty record and every other malformed frame remain protocol
+failures.
+
+`kernaid-rescue-vaultctl` is the only shipping-shaped passphrase path. It has
+no path/configuration option, verifies the fixed UID/name binding, opens only
+`/dev/tty`, proves foreground job-control ownership, disables and reads back
+echo before printing `READY`, and intercepts INT, TERM, HUP, QUIT, TSTP, TTIN
+and TTOU. Input uses a preallocated zeroizing buffer, exact length/EOF/NUL and
+single-line validation, an anonymous pipe, and cleanup-dominant input flush
+plus verified echo restore. The secret is never placed in argv, environment,
+stdout, JSON or a log. The daemon revalidates the pipe as read-only CLOEXEC
+PIPEFS and copies it into a separate internal pipe only after stale/policy and
+pre-secret swap gates succeed.
+
+Daemon, worker and companion set `PR_SET_DUMPABLE=0` and prove the initial user
+namespace before sensitive work. The daemon additionally requires an empty
+`/proc/sys/kernel/core_pattern`, exact-zero `core_uses_pid`, and header-only
+`/proc/swaps`; swap is rechecked immediately before external secret read and
+again before worker consumption. Each daemon mutation handler, including its
+worker transaction, fault cleanup and correlated response send, shares one
+aggregate 600-second absolute budget; the final send is additionally capped at
+three seconds within the remaining aggregate budget. The companion
+mutation/reconciliation budget is 610 seconds, and the single stop budget is
+at most 110 seconds from the first caught signal; fault cleanup never starts a
+fresh grace interval beyond either absolute deadline.
+These are user-space checkpoint bounds: a kernel D-state block read, exec
+stall, or unkillable process group still requires the future systemd/cgroup
+fault policy and host reboot.
+
+This tranche does not install a unit, socket, sysctl, coredump policy, private
+mount namespace, runtime users/groups, or Rescue-image/UI wiring. Those
+deployment controls and a privileged QEMU test must prove the documented
+runtime-directory, socket ownership/mode, delegated cgroup topology,
+core/swap policy, UID-1000 privacy prefix, signal/stop behavior, real dm-crypt
+holder rejection and reboot-required recovery before this daemon is called a
+shipping service. The web/Python UI must never receive the LUKS passphrase,
+journal key, identity seed, raw mount path, or an arbitrary command primitive.
 
 ## Remaining production gates
 
-- run the daemon in a private mount namespace and adopt descriptor-based mount
+- package the Rust daemon in a private mount namespace and adopt descriptor-based mount
   attachment (`open_tree`/`move_mount` or an equivalent design);
 - define and test restart recovery for an interrupted process and mappings or
   mounts visible in other namespaces;

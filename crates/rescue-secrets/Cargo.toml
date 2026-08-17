@@ -20,7 +20,8 @@ sha2 = "0.10"
 zeroize = "1.8"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-rustix = { version = "1.1.4", features = ["fs", "mount", "process"] }
+nix = { version = "0.31.3", features = ["signal", "term"] }
+rustix = { version = "1.1.4", features = ["event", "fs", "mount", "net", "process", "termios"] }
 
 [dev-dependencies]
 tempfile = "3.27"
@@ -32,3 +33,13 @@ workspace = true
 name = "kernaid-rescue-vault-probe"
 path = "src/bin/kernaid-rescue-vault-probe.rs"
 required-features = ["privileged-probe"]
+
+[[bin]]
+name = "kernaid-rescue-vaultd"
+path = "src/bin/kernaid-rescue-vaultd.rs"
+required-features = ["experimental-vault-manager"]
+
+[[bin]]
+name = "kernaid-rescue-vaultctl"
+path = "src/bin/kernaid-rescue-vaultctl.rs"
+required-features = ["experimental-vault-manager"]

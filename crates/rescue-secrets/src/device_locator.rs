@@ -199,6 +199,33 @@ impl LocatedVaultPartition {
         }
     }
 
+    /// Classify the retained partition and, for the locked state, prove that
+    /// no kernel holder or mount survives for the exact p3 major:minor. This
+    /// is the only classification suitable for clearing the daemon lifecycle
+    /// marker after a failed unlock, lock, or shutdown attempt.
+    ///
+    /// The proof is bracketed by full descriptor identity checkpoints and by
+    /// two holder scans around a strict, bounded `/proc/self/mountinfo` scan.
+    /// Any residue, malformed kernel view, or observation failure is reported
+    /// as cleanup failure; it can never be represented as safely locked.
+    #[cfg(feature = "experimental-vault-manager")]
+    pub fn classify_quiescent_read_only(
+        &self,
+        timeout: Duration,
+    ) -> Result<LocatedVaultClassification, LocatedVaultClassificationError> {
+        let deadline = classification_deadline(timeout)?;
+        let remaining = remaining_classification_time(deadline)?;
+        let classification = self.classify_read_only(remaining)?;
+        if classification == LocatedVaultClassification::Locked {
+            self.validate_classification_identity(deadline)?;
+            verify_no_partition_holders(self.identity, deadline)?;
+            verify_partition_not_mounted(self.identity, deadline)?;
+            verify_no_partition_holders(self.identity, deadline)?;
+            self.validate_classification_identity(deadline)?;
+        }
+        Ok(classification)
+    }
+
     #[cfg(feature = "experimental-vault-manager")]
     fn validate_classification_identity(
         &self,
@@ -239,6 +266,115 @@ fn classification_deadline(timeout: Duration) -> Result<Instant, LocatedVaultCla
     Instant::now()
         .checked_add(timeout)
         .ok_or(LocatedVaultClassificationError::InvalidDeadline)
+}
+
+#[cfg(feature = "experimental-vault-manager")]
+fn remaining_classification_time(
+    deadline: Instant,
+) -> Result<Duration, LocatedVaultClassificationError> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or(LocatedVaultClassificationError::OperationTimedOut)
+}
+
+#[cfg(feature = "experimental-vault-manager")]
+fn verify_no_partition_holders(
+    identity: LocatedVaultIdentity,
+    deadline: Instant,
+) -> Result<(), LocatedVaultClassificationError> {
+    remaining_classification_time(deadline)?;
+    let link = PathBuf::from(format!(
+        "/sys/dev/block/{}:{}",
+        identity.partition_major, identity.partition_minor
+    ));
+    let device =
+        fs::canonicalize(&link).map_err(|_| LocatedVaultClassificationError::CleanupFailed)?;
+    let sys_devices = fs::canonicalize("/sys/devices")
+        .map_err(|_| LocatedVaultClassificationError::CleanupFailed)?;
+    if device == sys_devices
+        || !device.starts_with(&sys_devices)
+        || read_major_minor(&device.join("dev")).ok()
+            != Some((identity.partition_major, identity.partition_minor))
+    {
+        return Err(LocatedVaultClassificationError::CleanupFailed);
+    }
+    let entries = fs::read_dir(device.join("holders"))
+        .map_err(|_| LocatedVaultClassificationError::CleanupFailed)?;
+    let mut count = 0_usize;
+    for entry in entries {
+        remaining_classification_time(deadline)?;
+        entry.map_err(|_| LocatedVaultClassificationError::CleanupFailed)?;
+        count = count
+            .checked_add(1)
+            .ok_or(LocatedVaultClassificationError::CleanupFailed)?;
+        if count > MAX_SYSFS_CHILDREN {
+            return Err(LocatedVaultClassificationError::CleanupFailed);
+        }
+    }
+    if count == 0 {
+        Ok(())
+    } else {
+        Err(LocatedVaultClassificationError::CleanupFailed)
+    }
+}
+
+#[cfg(feature = "experimental-vault-manager")]
+fn verify_partition_not_mounted(
+    identity: LocatedVaultIdentity,
+    deadline: Instant,
+) -> Result<(), LocatedVaultClassificationError> {
+    remaining_classification_time(deadline)?;
+    let bytes = read_bounded(Path::new("/proc/self/mountinfo"), MAX_MOUNTINFO_BYTES)
+        .map_err(|_| LocatedVaultClassificationError::CleanupFailed)?;
+    if mountinfo_excludes_device(&bytes, (identity.partition_major, identity.partition_minor)) {
+        Ok(())
+    } else {
+        Err(LocatedVaultClassificationError::CleanupFailed)
+    }
+}
+
+#[cfg(feature = "experimental-vault-manager")]
+fn mountinfo_excludes_device(bytes: &[u8], expected: (u32, u32)) -> bool {
+    if bytes.is_empty() || !bytes.ends_with(b"\n") {
+        return false;
+    }
+    let mut count = 0_usize;
+    for line in bytes[..bytes.len() - 1].split(|byte| *byte == b'\n') {
+        if line.is_empty() || line.len() > MAX_MOUNTINFO_LINE_BYTES {
+            return false;
+        }
+        count = match count.checked_add(1) {
+            Some(count) if count <= MAX_MOUNTINFO_LINES => count,
+            _ => return false,
+        };
+        let fields: Vec<&[u8]> = line.split(|byte| *byte == b' ').collect();
+        if fields.iter().any(|field| field.is_empty()) {
+            return false;
+        }
+        let mut separators = fields
+            .iter()
+            .enumerate()
+            .filter(|(_, field)| **field == b"-");
+        let Some((separator, _)) = separators.next() else {
+            return false;
+        };
+        if separators.next().is_some() {
+            return false;
+        }
+        let post_separator_minimum = separator.checked_add(4);
+        if fields.len() < 10
+            || separator < 6
+            || post_separator_minimum != Some(fields.len())
+            || parse_major_minor(fields[2]).is_none()
+        {
+            return false;
+        }
+        if parse_major_minor(fields[2]) == Some(expected) {
+            return false;
+        }
+    }
+    count > 0
 }
 
 #[cfg(feature = "experimental-vault-manager")]
@@ -1832,6 +1968,35 @@ mod tests {
             Some(LocatedVaultClassificationError::InvalidDeadline)
         );
         assert!(classification_deadline(Duration::from_secs(1)).is_ok());
+    }
+
+    #[cfg(feature = "experimental-vault-manager")]
+    #[test]
+    fn quiescent_mountinfo_parser_rejects_target_residue_and_ambiguous_views() {
+        let unrelated = b"36 25 8:2 / /mnt rw,relatime - ext4 /dev/sda2 rw\n";
+        assert!(mountinfo_excludes_device(unrelated, (8, 3)));
+        let unrelated_with_optional =
+            b"36 25 8:2 / /mnt rw,relatime shared:1 master:2 - ext4 /dev/sda2 rw\n";
+        assert!(mountinfo_excludes_device(unrelated_with_optional, (8, 3)));
+        assert!(!mountinfo_excludes_device(
+            b"36 25 8:3 / /mnt rw,relatime - ext4 /dev/sda3 rw\n",
+            (8, 3)
+        ));
+        for malformed in [
+            &b""[..],
+            &b"36 25 8:2 / /mnt rw - ext4 /dev/sda2 rw"[..],
+            &b"36 25 bad / /mnt rw - ext4 /dev/sda2 rw\n"[..],
+            &b"36 25 8:2 / /mnt rw ext4 /dev/sda2 rw\n"[..],
+            &b"36 25 8:2 / /mnt rw - ext4 /dev/sda2\n"[..],
+            &b"36 25 8:2 / /mnt rw shared:1 - ext4 /dev/sda2\n"[..],
+            &b"36 25 8:2 / /mnt rw - ext4 /dev/sda2 -\n"[..],
+            &b"36 25 8:2 / /mnt rw - - /dev/sda2 rw\n"[..],
+            &b"36 25 8:2 / /mnt rw - ext4 /dev/sda2 rw trailing\n"[..],
+            &b"36 25 8:2 / /mnt  rw - ext4 /dev/sda2 rw\n"[..],
+            &b"\n"[..],
+        ] {
+            assert!(!mountinfo_excludes_device(malformed, (8, 3)));
+        }
     }
 
     #[test]

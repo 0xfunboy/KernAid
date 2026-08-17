@@ -30,6 +30,10 @@ Both state-version fields are bounded by `Number.MAX_SAFE_INTEGER`
 (`9_007_199_254_740_991`). A future daemon must seed a fresh epoch from a
 CSPRNG value of at most 52 bits and use checked increments. It increments once
 when entering `unlocking`/`locking` and again when completing the transition.
+The typed client decoder therefore accepts a successful `vault.unlock` or
+`vault.lock` response only when its `stateVersion` is exactly the request's
+`expectedStateVersion + 2`; status and error responses remain authoritative
+within the general safe-integer bound.
 The closed states are `absent`, `unprovisioned`, `locked`, `unlocking`,
 `unlocked`, `locking`, and `faulted-reboot-required`. Only `vault.status` is
 allowed while faulted; every other operation returns `REBOOT_REQUIRED`.
@@ -55,7 +59,15 @@ exchange methods are on connection capabilities: the client first
 authenticates the server as UID 0 with `SO_PEERCRED`, and the server first
 authenticates the allowlisted peer. Every authentication, send, and receive
 boundary revalidates socket type, connection state, kernel identity, and
-`CLOEXEC`.
+`CLOEXEC`. Linux reports both an orderly peer shutdown and a zero-length
+`SOCK_SEQPACKET` record as a zero-byte receive, including when an empty record
+is immediately followed by shutdown. A live empty record is rejected as a
+framing violation. A zero-byte receive accompanied by hangup, or whose peer
+state cannot be classified within the current receive deadline, is reported
+as a separate ambiguity: it is eligible for bounded fresh-status
+reconciliation only after a valid mutation request was sent, never for status
+or request decoding. A queued successor remains available to the next receive,
+and any descriptors duplicated while peeking are closed.
 
 Every receiving endpoint must keep ancillary-generating options not modelled
 by `rustix` 1.1 disabled: notably `SO_PASSPIDFD`, `SO_PASSSEC`, and socket
