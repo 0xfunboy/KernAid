@@ -26,6 +26,8 @@ mkfs.ext4 -q -F -L KERNAID_TARGET -d "$target_seed_dir" "$target_image"
 target_hash_before="$(sha256sum "$target_image" | awk '{print $1}')"
 qemu_pid=""
 # shellcheck disable=SC2329  # Invoked indirectly by the EXIT trap below.
+# This callback is reached indirectly through the EXIT trap below.
+# shellcheck disable=SC2317
 cleanup() {
   if [[ -n "$qemu_pid" ]]; then kill "$qemu_pid" 2>/dev/null || true; fi
   if [[ "$temporary_log" == "1" ]]; then rm -f "$log"; fi
