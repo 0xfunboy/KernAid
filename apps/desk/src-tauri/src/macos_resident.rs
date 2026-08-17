@@ -222,7 +222,7 @@ fn bounded_identity_value(value: &Value) -> Result<&str, ()> {
     Ok(value)
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 pub fn storage_shape_summary(raw: &str) -> String {
     fn kind(value: Option<&Value>) -> &'static str {
         match value {
@@ -353,7 +353,7 @@ pub fn storage_shape_summary(raw: &str) -> String {
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 pub fn launchd_shape_summary(raw: &str) -> String {
     let mut lines = raw.lines();
     let header = lines.next();
@@ -397,7 +397,7 @@ pub fn launchd_shape_summary(raw: &str) -> String {
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 pub fn snapshot_shape_summary(raw: &str) -> String {
     let mut lines = raw.lines();
     let header = lines.next();
