@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import errno
 import importlib.util
 import io
 import json
@@ -9,6 +10,7 @@ import os
 import re
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -912,7 +914,157 @@ class SanitizedOutputTests(unittest.TestCase):
         )
 
 
+class LoopDetachTests(unittest.TestCase):
+    @staticmethod
+    def loop_status(
+        backing: object,
+        *,
+        number: int = 7,
+        offset: int = 4096,
+        size_limit: int = 8192,
+        flags: int = 0,
+    ) -> bytes:
+        return controller.LOOP_INFO64.pack(
+            backing.st_dev,
+            backing.st_ino,
+            backing.st_rdev,
+            offset,
+            size_limit,
+            number,
+            0,
+            0,
+            flags,
+            b"",
+            b"",
+            b"",
+            0,
+            0,
+        )
+
+    def invoke_clear(
+        self,
+        encoded: bytes,
+        *,
+        clear_errors: list[int] | None = None,
+    ) -> list[tuple[int, int]]:
+        loop_fd = os.open("/dev/null", os.O_RDONLY)
+        backing_fd = os.open("/dev/null", os.O_RDONLY)
+        loop_status = SimpleNamespace(
+            st_mode=stat.S_IFBLK | 0o660,
+            st_rdev=os.makedev(7, 7),
+        )
+        backing_status = SimpleNamespace(
+            st_mode=stat.S_IFREG | 0o600,
+            st_dev=41,
+            st_ino=73,
+            st_rdev=0,
+            st_nlink=1,
+        )
+        calls: list[tuple[int, int]] = []
+        errors = list(clear_errors or [])
+
+        def fake_ioctl(descriptor: int, operation: int, *args: object) -> int:
+            calls.append((descriptor, operation))
+            if operation == controller.LOOP_GET_STATUS64:
+                buffer = args[0]
+                assert isinstance(buffer, bytearray)
+                buffer[:] = encoded
+                return 0
+            if operation == controller.LOOP_CLR_FD:
+                if errors:
+                    raise OSError(errors.pop(0), "injected")
+                return 0
+            raise AssertionError("unexpected ioctl")
+
+        with (
+            mock.patch.object(
+                controller.os,
+                "fstat",
+                side_effect=lambda descriptor: (
+                    loop_status if descriptor == loop_fd else backing_status
+                ),
+            ),
+            mock.patch.object(controller.fcntl, "fcntl", return_value=0),
+            mock.patch.object(controller.fcntl, "ioctl", side_effect=fake_ioctl),
+        ):
+            controller.clear_owned_loop_fd(
+                loop_fd,
+                backing_fd,
+                expected_number=7,
+                expected_offset=4096,
+                expected_size_limit=8192,
+                expected_read_only=False,
+            )
+        return calls
+
+    def test_same_descriptor_validates_full_mapping_then_clears(self) -> None:
+        backing = SimpleNamespace(st_dev=41, st_ino=73, st_rdev=0)
+        calls = self.invoke_clear(self.loop_status(backing))
+        self.assertEqual(
+            [operation for _, operation in calls],
+            [controller.LOOP_GET_STATUS64, controller.LOOP_CLR_FD],
+        )
+        self.assertEqual(calls[0][0], calls[1][0])
+
+        retried = self.invoke_clear(
+            self.loop_status(backing), clear_errors=[errno.EINTR, errno.EINTR]
+        )
+        self.assertEqual(
+            [operation for _, operation in retried],
+            [
+                controller.LOOP_GET_STATUS64,
+                controller.LOOP_CLR_FD,
+                controller.LOOP_CLR_FD,
+                controller.LOOP_CLR_FD,
+            ],
+        )
+        self.assertEqual(len({descriptor for descriptor, _ in retried}), 1)
+
+    def test_mismatched_identity_slice_or_flags_never_clears(self) -> None:
+        backing = SimpleNamespace(st_dev=41, st_ino=73, st_rdev=0)
+        mismatches = [
+            self.loop_status(SimpleNamespace(st_dev=42, st_ino=73, st_rdev=0)),
+            self.loop_status(backing, number=8),
+            self.loop_status(backing, offset=4097),
+            self.loop_status(backing, size_limit=8193),
+            self.loop_status(backing, flags=controller.LO_FLAGS_READ_ONLY),
+            self.loop_status(backing, flags=8),
+        ]
+        for encoded in mismatches:
+            with self.assertRaises(controller.ClosedFailure) as failure:
+                self.invoke_clear(encoded)
+            self.assertEqual(failure.exception.code, "mapping-mismatch")
+
+    def test_controller_invocation_has_an_outer_wall_clock_bound(self) -> None:
+        shell = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn(
+            "timeout --foreground --signal=TERM --kill-after=1s 3s \\\n"
+            '    python3 -I -B "$controller" --clear-owned-loop',
+            shell,
+        )
+        started = time.monotonic()
+        result = subprocess.run(
+            [
+                "timeout",
+                "--foreground",
+                "--signal=TERM",
+                "--kill-after=1s",
+                "0.1s",
+                sys.executable,
+                "-c",
+                "import time; time.sleep(60)",
+            ],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        )
+        self.assertEqual(result.returncode, 124)
+        self.assertLess(time.monotonic() - started, 2)
+
+
 class StaticContractTests(unittest.TestCase):
+
     def test_new_shell_is_syntactically_valid_and_scope_is_separate(self) -> None:
         subprocess.run(["bash", "-n", SCRIPT], check=True)
         shell = SCRIPT.read_text(encoding="utf-8")
@@ -928,6 +1080,9 @@ class StaticContractTests(unittest.TestCase):
         self.assertIn("0030-user-setup", shell)
         self.assertIn("squashfs-tools", shell)
         self.assertIn("--extract-live-credential", shell)
+        self.assertIn("--clear-owned-loop", shell)
+        self.assertIn('6<"$loop_device" 7<"$expected_backing"', shell)
+        self.assertNotIn("losetup -d --", shell)
         self.assertIn("--timeout 1200", shell)
         self.assertIn('kill -s "$signal_name" "$controller_pid"', shell)
         self.assertNotIn("-fw_cfg", shell)

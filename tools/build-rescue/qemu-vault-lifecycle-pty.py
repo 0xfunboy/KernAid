@@ -13,6 +13,7 @@ import argparse
 import ctypes
 import dataclasses
 import errno
+import fcntl
 import json
 import os
 import re
@@ -20,6 +21,7 @@ import selectors
 import signal
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import threading
@@ -42,6 +44,12 @@ PROCESS_CLEANUP_SECONDS = 5.0
 PROBE_OUTPUT_LIMIT = 256
 PROBE_STDERR_LIMIT = 256
 PROBE_TIMEOUT_SECONDS = 620.0
+
+LOOP_CLR_FD = 0x4C01
+LOOP_GET_STATUS64 = 0x4C05
+LO_FLAGS_READ_ONLY = 1
+LO_FLAGS_AUTOCLEAR = 4
+LOOP_INFO64 = struct.Struct("=QQQQQIIII64s64s32sQQ")
 
 READY_LINE = b"KERNAID_RESCUE_READY"
 LOGIN_OK_LINE = b"KERNAID_VAULT_LOGIN_V1 uid=1000 user=kernaid group=true"
@@ -72,6 +80,85 @@ class CaptureLimitError(Exception):
 
 class SecretExposureError(Exception):
     pass
+
+
+def clear_owned_loop_fd(
+    loop_fd: int,
+    backing_fd: int,
+    *,
+    expected_number: int,
+    expected_offset: int,
+    expected_size_limit: int,
+    expected_read_only: bool,
+) -> None:
+    """Validate and clear one loop mapping through the same pinned descriptor."""
+
+    if loop_fd == backing_fd or min(loop_fd, backing_fd) < 3:
+        raise ClosedFailure("loop-detach", "descriptor-invalid")
+    try:
+        loop_status = os.fstat(loop_fd)
+        backing_status = os.fstat(backing_fd)
+        if (
+            not stat.S_ISBLK(loop_status.st_mode)
+            or os.major(loop_status.st_rdev) != 7
+            or os.minor(loop_status.st_rdev) != expected_number
+            or not stat.S_ISREG(backing_status.st_mode)
+            or backing_status.st_nlink != 1
+        ):
+            raise ClosedFailure("loop-detach", "identity-invalid")
+
+        descriptor_flags = fcntl.fcntl(loop_fd, fcntl.F_GETFD)
+        fcntl.fcntl(loop_fd, fcntl.F_SETFD, descriptor_flags | fcntl.FD_CLOEXEC)
+        backing_flags = fcntl.fcntl(backing_fd, fcntl.F_GETFD)
+        fcntl.fcntl(backing_fd, fcntl.F_SETFD, backing_flags | fcntl.FD_CLOEXEC)
+
+        encoded = bytearray(LOOP_INFO64.size)
+        try:
+            fcntl.ioctl(loop_fd, LOOP_GET_STATUS64, encoded, True)
+        except OSError as error:
+            raise ClosedFailure("loop-detach", "status-failed") from error
+        fields = LOOP_INFO64.unpack(encoded)
+        (
+            backing_device,
+            backing_inode,
+            backing_rdevice,
+            offset,
+            size_limit,
+            loop_number,
+            encryption_type,
+            encryption_key_size,
+            loop_flags,
+            *_reserved,
+        ) = fields
+        allowed_flags = LO_FLAGS_READ_ONLY | LO_FLAGS_AUTOCLEAR
+        if (
+            backing_device != backing_status.st_dev
+            or backing_inode != backing_status.st_ino
+            or backing_rdevice != backing_status.st_rdev
+            or offset != expected_offset
+            or size_limit != expected_size_limit
+            or loop_number != expected_number
+            or encryption_type != 0
+            or encryption_key_size != 0
+            or loop_flags & ~allowed_flags != 0
+            or bool(loop_flags & LO_FLAGS_READ_ONLY) != expected_read_only
+        ):
+            raise ClosedFailure("loop-detach", "mapping-mismatch")
+
+        for attempt in range(8):
+            try:
+                fcntl.ioctl(loop_fd, LOOP_CLR_FD)
+                break
+            except OSError as error:
+                if error.errno == errno.EINTR and attempt != 7:
+                    continue
+                raise ClosedFailure("loop-detach", "clear-failed") from error
+    finally:
+        for descriptor in (loop_fd, backing_fd):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 
 class ControllerSignal(BaseException):
@@ -1720,6 +1807,30 @@ def parse_extraction_arguments(arguments: Sequence[str]) -> argparse.Namespace:
     return parsed
 
 
+def parse_loop_detach_arguments(arguments: Sequence[str]) -> argparse.Namespace:
+    parser = ClosedArgumentParser(add_help=False)
+    parser.add_argument("--clear-owned-loop", action="store_true", required=True)
+    parser.add_argument("--loop-fd", type=int, required=True)
+    parser.add_argument("--backing-fd", type=int, required=True)
+    parser.add_argument("--loop-number", type=int, required=True)
+    parser.add_argument("--offset", type=int, required=True)
+    parser.add_argument("--size-limit", type=int, required=True)
+    parser.add_argument("--read-only", choices=("0", "1"), required=True)
+    parsed = parser.parse_args(arguments)
+    if (
+        parsed.loop_fd == parsed.backing_fd
+        or min(parsed.loop_fd, parsed.backing_fd) < 3
+        or parsed.loop_number < 0
+        or parsed.loop_number > 1_048_575
+        or parsed.offset < 0
+        or parsed.offset > (1 << 63) - 1
+        or parsed.size_limit < 0
+        or parsed.size_limit > (1 << 63) - 1
+    ):
+        raise ClosedFailure("loop-detach", "arguments-invalid")
+    return parsed
+
+
 def boot_attestation(
     firmware: str, boot: int, initial_version: int, final_version: int, device_id: str
 ) -> str:
@@ -1779,6 +1890,33 @@ def restore_signal_guard(
 
 
 def main(arguments: Sequence[str]) -> int:
+    if arguments[:1] == ["--clear-owned-loop"]:
+        try:
+            loop_detach = parse_loop_detach_arguments(arguments)
+            clear_owned_loop_fd(
+                loop_detach.loop_fd,
+                loop_detach.backing_fd,
+                expected_number=loop_detach.loop_number,
+                expected_offset=loop_detach.offset,
+                expected_size_limit=loop_detach.size_limit,
+                expected_read_only=loop_detach.read_only == "1",
+            )
+            return 0
+        except ClosedFailure as error:
+            print(
+                f"{FAILURE_PREFIX} stage={error.stage} code={error.code}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return 1
+        except BaseException:
+            print(
+                f"{FAILURE_PREFIX} stage=loop-detach code=unexpected",
+                file=sys.stderr,
+                flush=True,
+            )
+            return 1
+
     if arguments[:1] == ["--extract-live-credential"]:
         try:
             extraction = parse_extraction_arguments(arguments)

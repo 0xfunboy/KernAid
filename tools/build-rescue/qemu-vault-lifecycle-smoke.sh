@@ -65,6 +65,39 @@ mapper_active() {
   [[ -n "$1" ]] && cryptsetup status "$1" >/dev/null 2>&1
 }
 
+detach_owned_loop_bounded() {
+  local loop_device="$1"
+  local expected_backing="$2"
+  local baseline="$3"
+  local expected_offset="$4"
+  local expected_size_limit="$5"
+  local expected_read_only="$6"
+  local deadline=$((SECONDS + 10))
+  local loop_number loops_now
+
+  [[ "$loop_device" =~ ^/dev/loop[0-9]+$ \
+    && -f "$expected_backing" && ! -L "$expected_backing" \
+    && "$expected_offset" =~ ^[0-9]+$ \
+    && "$expected_size_limit" =~ ^[0-9]+$ \
+    && "$expected_read_only" =~ ^[01]$ ]] || return 1
+  loop_number="${loop_device#/dev/loop}"
+  timeout --foreground --signal=TERM --kill-after=1s 3s \
+    python3 -I -B "$controller" --clear-owned-loop \
+    --loop-fd 6 --backing-fd 7 --loop-number "$loop_number" \
+    --offset "$expected_offset" --size-limit "$expected_size_limit" \
+    --read-only "$expected_read_only" \
+    6<"$loop_device" 7<"$expected_backing" >/dev/null 2>&1 || return 1
+
+  while ((SECONDS < deadline)); do
+    udevadm settle --timeout=1 >/dev/null 2>&1 || true
+    loops_now="$(losetup -j "$expected_backing" 2>/dev/null)" \
+      || return 1
+    [[ "$loops_now" == "$baseline" ]] && return 0
+    sleep 0.05 || return 1
+  done
+  return 1
+}
+
 owned_group_exists() {
   [[ "$owned_pgid" =~ ^[1-9][0-9]*$ ]] \
     && kill -0 -- "-$owned_pgid" >/dev/null 2>&1
@@ -264,7 +297,10 @@ cleanup() {
     cryptsetup close "$manager_mapper" >/dev/null 2>&1 || cleanup_failed=1
   fi
   if [[ "$vault_loop" =~ ^/dev/loop[0-9]+$ ]]; then
-    losetup -d -- "$vault_loop" >/dev/null 2>&1 || cleanup_failed=1
+    detach_owned_loop_bounded \
+      "$vault_loop" "$rescue_media" "$rescue_loops_before" \
+      "$p3_start_bytes" "$p3_bytes" 0 \
+      || cleanup_failed=1
     vault_loop=""
   fi
   if [[ "$iso_mounted" == 1 && -n "$iso_mount" ]]; then
@@ -272,7 +308,9 @@ cleanup() {
     iso_mounted=0
   fi
   if [[ "$iso_loop" =~ ^/dev/loop[0-9]+$ ]]; then
-    losetup -d -- "$iso_loop" >/dev/null 2>&1 || cleanup_failed=1
+    detach_owned_loop_bounded \
+      "$iso_loop" "$iso" "$iso_loops_before" 0 0 1 \
+      || cleanup_failed=1
     iso_loop=""
   fi
   if [[ -n "$key_dir" ]]; then
@@ -430,7 +468,7 @@ login_metadata="$(stat -c '%a:%u:%g:%h:%s' -- "$login_credential" 2>/dev/null)" 
 ((BASH_REMATCH[1] <= 128)) || fail credential metadata-invalid
 umount -- "$iso_mount" >/dev/null 2>&1 || fail credential iso-unmount-failed
 iso_mounted=0
-losetup -d -- "$iso_loop" >/dev/null 2>&1 \
+detach_owned_loop_bounded "$iso_loop" "$iso" "$iso_loops_before" 0 0 1 \
   || fail credential iso-loop-detach-failed
 iso_loop=""
 [[ "$(losetup -j "$iso" 2>/dev/null)" == "$iso_loops_before" ]] \
@@ -583,6 +621,9 @@ random_suffix="$(od -An -N8 -tx1 /dev/urandom | tr -d '[:space:]')" \
 provision_mapper="kernaid-provision-$random_suffix"
 manager_mapper="kernaid-vault-$random_suffix"
 
+rescue_loops_before="$(losetup -j "$rescue_media" 2>/dev/null)" \
+  || fail provisioning loop-inspect-failed
+[[ -z "$rescue_loops_before" ]] || fail provisioning loop-residue
 vault_loop="$(
   losetup --find --show --offset "$p3_start_bytes" \
     --sizelimit "$p3_bytes" -- "$rescue_media" 2>/dev/null
@@ -675,7 +716,9 @@ cryptsetup isLuks --type luks2 "$vault_loop" >/dev/null 2>&1 \
   && "$(blkid --probe --cache-file /dev/null --no-encoding --output value --match-tag LABEL "$vault_loop" 2>/dev/null)" == KERNAID_VAULT ]] \
   || fail provisioning luks-profile-invalid
 
-losetup -d -- "$vault_loop" >/dev/null 2>&1 \
+detach_owned_loop_bounded \
+  "$vault_loop" "$rescue_media" "$rescue_loops_before" \
+  "$p3_start_bytes" "$p3_bytes" 0 \
   || fail provisioning loop-detach-failed
 vault_loop=""
 udevadm settle >/dev/null 2>&1 || fail provisioning udev-failed
@@ -885,6 +928,9 @@ done
 # production host verifier. The verifier is allowed to write filesystem
 # shutdown metadata, so its post-verify digest is distinct from the guest
 # window digest and deliberately has no equality assertion.
+rescue_loops_before="$(losetup -j "$rescue_media" 2>/dev/null)" \
+  || fail postverify loop-inspect-failed
+[[ -z "$rescue_loops_before" ]] || fail postverify loop-residue
 vault_loop="$(
   losetup --find --show --offset "$p3_start_bytes" \
     --sizelimit "$p3_bytes" -- "$rescue_media" 2>/dev/null
@@ -945,7 +991,9 @@ if mapper_active "$manager_mapper" \
   || mountpoint -q "/run/kernaid/vault/$manager_mapper" >/dev/null 2>&1; then
   fail postverify residue
 fi
-losetup -d -- "$vault_loop" >/dev/null 2>&1 \
+detach_owned_loop_bounded \
+  "$vault_loop" "$rescue_media" "$rescue_loops_before" \
+  "$p3_start_bytes" "$p3_bytes" 0 \
   || fail postverify loop-detach-failed
 vault_loop=""
 udevadm settle >/dev/null 2>&1 || fail postverify udev-failed
