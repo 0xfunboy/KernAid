@@ -1,5 +1,6 @@
 live-boot
 live-config
+user-setup
 systemd-sysv
 linux-image-amd64
 grub-pc-bin

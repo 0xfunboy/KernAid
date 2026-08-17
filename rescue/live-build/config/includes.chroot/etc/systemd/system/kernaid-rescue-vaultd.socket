@@ -1,0 +1,26 @@
+[Unit]
+Description=KernAid Rescue vault lifecycle control socket
+Requires=systemd-sysusers.service
+After=systemd-sysusers.service
+ConditionKernelCommandLine=boot=live
+
+[Socket]
+ListenSequentialPacket=/run/kernaid-rescue-vault.sock
+Accept=no
+Backlog=8
+FlushPending=yes
+SocketMode=0660
+SocketUser=root
+SocketGroup=kernaid-vault
+RemoveOnStop=yes
+PassCredentials=no
+PassSecurity=no
+PassPacketInfo=no
+Timestamping=off
+
+# Debian trixie's systemd 257 predates the PassPIDFD directive. The kernel
+# SO_PASSPIDFD default must remain off; the daemon rejects unexpected ancillary
+# data, and the static image-policy test forbids adding that newer directive.
+
+[Install]
+WantedBy=sockets.target

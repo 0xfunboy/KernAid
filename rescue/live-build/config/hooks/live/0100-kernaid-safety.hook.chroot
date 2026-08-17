@@ -1,10 +1,77 @@
 #!/bin/sh
 set -eu
-chown root:root /usr/lib/kernaid/offline_inspector.py /usr/lib/kernaid/rescue_server.py
-chmod 0644 /usr/lib/kernaid/offline_inspector.py /usr/lib/kernaid/rescue_server.py
+chown root:root \
+    /etc/systemd/coredump.conf.d \
+    /etc/systemd/system \
+    /etc/sysctl.d \
+    /etc/sysusers.d \
+    /usr/lib/kernaid \
+    /usr/lib/tmpfiles.d
+chmod 0755 \
+    /etc/systemd/coredump.conf.d \
+    /etc/systemd/system \
+    /etc/sysctl.d \
+    /etc/sysusers.d \
+    /usr/lib/kernaid \
+    /usr/lib/tmpfiles.d
+chown root:root \
+    /usr/lib/kernaid/offline_inspector.py \
+    /usr/lib/kernaid/ready-check \
+    /usr/lib/kernaid/rescue_server.py
+chmod 0644 \
+    /usr/lib/kernaid/offline_inspector.py \
+    /usr/lib/kernaid/ready-check \
+    /usr/lib/kernaid/rescue_server.py
+chown root:root \
+    /usr/lib/kernaid/kernaid-rescue-vaultd \
+    /usr/bin/kernaid-rescue-vaultctl
+chmod 0755 \
+    /usr/lib/kernaid/kernaid-rescue-vaultd \
+    /usr/bin/kernaid-rescue-vaultctl
+chown root:root \
+    /etc/systemd/system/kernaid-offline-inspector-key.service \
+    /etc/systemd/system/kernaid-offline-inspector.socket \
+    /etc/systemd/system/kernaid-offline-inspector@.service \
+    /etc/systemd/system/kernaid-rescue-vaultd.service \
+    /etc/systemd/system/kernaid-rescue-vaultd.socket \
+    /etc/systemd/system/kernaid-ready.service \
+    /etc/systemd/system/kernaid-ui.service \
+    /etc/sysusers.d/kernaid.conf \
+    /etc/sysctl.d/99-kernaid-rescue-core.conf \
+    /etc/systemd/coredump.conf.d/99-kernaid-rescue.conf \
+    /usr/lib/tmpfiles.d/kernaid.conf
+chmod 0644 \
+    /etc/systemd/system/kernaid-offline-inspector-key.service \
+    /etc/systemd/system/kernaid-offline-inspector.socket \
+    /etc/systemd/system/kernaid-offline-inspector@.service \
+    /etc/systemd/system/kernaid-rescue-vaultd.service \
+    /etc/systemd/system/kernaid-rescue-vaultd.socket \
+    /etc/systemd/system/kernaid-ready.service \
+    /etc/systemd/system/kernaid-ui.service \
+    /etc/sysusers.d/kernaid.conf \
+    /etc/sysctl.d/99-kernaid-rescue-core.conf \
+    /etc/systemd/coredump.conf.d/99-kernaid-rescue.conf \
+    /usr/lib/tmpfiles.d/kernaid.conf
+
+# The live user must not receive subordinate-ID ranges. The companion and
+# daemon also verify the initial user namespace, while removing set-ID bits
+# from optional uidmap helpers keeps this image safe if dependencies change.
+for key in SUB_UID_COUNT SUB_GID_COUNT; do
+    sed -i "/^[[:space:]]*${key}[[:space:]]/d" /etc/login.defs
+    printf '%s\t0\n' "$key" >> /etc/login.defs
+done
+for helper in /usr/bin/newuidmap /usr/bin/newgidmap; do
+    if [ -e "$helper" ]; then
+        chmod u-s,g-s "$helper"
+    fi
+done
+
 systemctl enable kernaid-ready.service
 systemctl enable kernaid-ui.service
 systemctl enable kernaid-offline-inspector.socket
+systemctl enable kernaid-rescue-vaultd.socket
+systemctl enable kernaid-rescue-vaultd.service
+systemctl mask swap.target
 mkdir -p /etc/polkit-1/rules.d
 cat > /etc/polkit-1/rules.d/49-kernaid-observe.rules <<'RULE'
 polkit.addRule(function(action, subject) {

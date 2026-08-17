@@ -286,7 +286,10 @@ The supervisor remains responsive while a separate, long-lived internal
 worker owns the locator, mount manager, mounted vault and transient application
 store used to copy the public device ID. The worker is moved, before any probe,
 from the exact delegated cgroup-v2 `supervisor` subgroup to its fixed sibling
-`worker`. A bootstrap barrier makes the child prove its own `/worker`
+`worker`. The supervisor requires `pids` in the delegated root's controller
+set, enables it through the retained `cgroup.subtree_control` descriptor, and
+requires exact readback plus recursive sibling/leaf topology before creating
+or using `worker`. A bootstrap barrier makes the child prove its own `/worker`
 membership; the parent brackets commands with pidfd, `cgroup.procs`,
 `pids.current`, `nr_descendants`, and supervisor-topology checks. Internal
 messages have a fixed binary layout, closed result codes, bounded records,
@@ -348,28 +351,41 @@ three seconds within the remaining aggregate budget. The companion
 mutation/reconciliation budget is 610 seconds, and the single stop budget is
 at most 110 seconds from the first caught signal; fault cleanup never starts a
 fresh grace interval beyond either absolute deadline.
-These are user-space checkpoint bounds: a kernel D-state block read, exec
-stall, or unkillable process group still requires the future systemd/cgroup
-fault policy and host reboot.
+These are user-space checkpoint bounds. The packaged delegated cgroup provides
+recursive `cgroup.kill`, pidfd signalling and bounded population checks, but a
+kernel D-state block read or exec stall still cannot be reaped until the kernel
+returns. In that case the durable lifecycle marker remains and reboot is the
+only honest recovery.
 
-This tranche does not install a unit, socket, sysctl, coredump policy, private
-mount namespace, runtime users/groups, or Rescue-image/UI wiring. Those
-deployment controls and a privileged QEMU test must prove the documented
-runtime-directory, socket ownership/mode, delegated cgroup topology,
-core/swap policy, UID-1000 privacy prefix, signal/stop behavior, real dm-crypt
-holder rejection and reboot-required recovery before this daemon is called a
-shipping service. The web/Python UI must never receive the LUKS passphrase,
-journal key, identity seed, raw mount path, or an arbitrary command primitive.
+The Rescue live-build packaging installs the feature-gated daemon and
+companion, a root:`kernaid-vault` sequential-packet socket, a `Type=notify`
+service with a private mount namespace and delegated worker cgroup, the
+root-owned runtime/tmpfiles boundary, and fail-closed core/swap and UID-1000
+policy. The daemon sends `READY=1` only after runtime disposition, worker Probe,
+an immediate worker-health recheck, and coherent Supervisor construction on a
+marker-free startup. Any fresh cgroup, spawn, Probe, or health failure exits
+without READY. A marker found before startup may become ready only as a
+contained status-only `PersistentFault` service and never starts a worker.
+Static tests and target-systemd unit verification do not qualify the real
+deployment by themselves. A separate privileged QEMU lifecycle test must still
+prove socket ownership/mode, cgroup topology and capabilities, core/swap
+policy, UID-1000 privacy, signal/stop behavior, real dm-crypt holder rejection,
+mount-namespace isolation and reboot-required recovery before this integration
+is described as shipping-qualified. The web/Python UI never receives the LUKS
+passphrase, journal key, identity seed, raw mount path, or an arbitrary command
+primitive.
 
 ## Remaining production gates
 
-- package the Rust daemon in a private mount namespace and adopt descriptor-based mount
-  attachment (`open_tree`/`move_mount` or an equivalent design);
+- replace the current private-namespace pathname mount attachment with a
+  descriptor-based attachment (`open_tree`/`move_mount` or an equivalent
+  design);
 - define and test restart recovery for an interrupted process and mappings or
   mounts visible in other namespaces;
 - exercise crash windows, additional-holder races, and real hardware in the
   privileged test matrix;
-- package the service and tools into the Rescue ISO; and
+- run the packaged service and companion through the separate BIOS/UEFI,
+  two-boot privileged QEMU lifecycle matrix; and
 - add TPM/Fleet anchoring for rollback detection across full vault-image
   replay.
 

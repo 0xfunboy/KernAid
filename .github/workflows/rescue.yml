@@ -15,6 +15,7 @@ on:
       - "apps/desk/**"
       - "packs/linux/**"
       - "crates/rescue-secrets/**"
+      - "crates/protocol/**"
       - "crates/storage/**"
       - "crates/device-identity/**"
       - "Cargo.toml"
@@ -55,13 +56,44 @@ jobs:
           cargo fmt -p kernaid-rescue-secrets -- --check
           cargo build --locked --release -p kernaid-rescue-secrets \
             --features privileged-probe --bin kernaid-rescue-vault-probe
+      - name: Build the in-guest Rescue vault lifecycle binaries
+        run: |
+          cargo build --locked --release -p kernaid-rescue-secrets \
+            --features experimental-vault-manager \
+            --bin kernaid-rescue-vaultd \
+            --bin kernaid-rescue-vaultctl
+      - name: Verify the in-guest Rescue binary ABI
+        run: |
+          preflight_dir="$(sudo /usr/bin/mktemp -d /root/kernaid-rescue-shipping-preflight.XXXXXXXX)"
+          cleanup_preflight() {
+            sudo unlink -- "$preflight_dir/kernaid-rescue-vaultd" 2>/dev/null || true
+            sudo unlink -- "$preflight_dir/kernaid-rescue-vaultctl" 2>/dev/null || true
+            sudo rmdir -- "$preflight_dir" 2>/dev/null || true
+          }
+          trap cleanup_preflight EXIT
+          if [[ ! "$preflight_dir" =~ ^/root/kernaid-rescue-shipping-preflight\.[A-Za-z0-9]{8}$ ]]; then
+            exit 2
+          fi
+          test "$(sudo /usr/bin/stat -c '%u:%g:%a' "$preflight_dir")" = "0:0:700"
+          sudo install -o root -g root -m 0755 \
+            target/release/kernaid-rescue-vaultd \
+            "$preflight_dir/kernaid-rescue-vaultd"
+          sudo install -o root -g root -m 0755 \
+            target/release/kernaid-rescue-vaultctl \
+            "$preflight_dir/kernaid-rescue-vaultctl"
+          sudo /usr/bin/python3 -I tools/build-rescue/verify-shipping-binary.py \
+            "$preflight_dir/kernaid-rescue-vaultd"
+          sudo /usr/bin/python3 -I tools/build-rescue/verify-shipping-binary.py \
+            "$preflight_dir/kernaid-rescue-vaultctl"
       - name: Build hybrid BIOS and UEFI ISO
         run: |
           docker run --rm --privileged \
             -e KERNAID_DESK_PREBUILT=1 \
+            -e KERNAID_RESCUE_VAULTD_BINARY=/workspace/target/release/kernaid-rescue-vaultd \
+            -e KERNAID_RESCUE_VAULTCTL_BINARY=/workspace/target/release/kernaid-rescue-vaultctl \
             -v "$PWD:/workspace" -w /workspace \
             debian:trixie-slim \
-            sh -c 'apt-get update && apt-get install -y live-build ca-certificates python3 && ./tools/build-rescue/build.sh'
+            sh -c 'apt-get update && apt-get install -y binutils live-build ca-certificates python3 && ./tools/build-rescue/build.sh'
       - name: QEMU BIOS smoke test
         run: KERNAID_SMOKE_LOG=rescue-smoke-bios.log ./tools/build-rescue/qemu-smoke.sh bios
       - name: QEMU UEFI smoke test

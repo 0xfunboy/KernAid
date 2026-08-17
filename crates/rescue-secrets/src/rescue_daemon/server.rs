@@ -15,11 +15,18 @@ use rustix::{
     event::{PollFd, PollFlags, Timespec, poll},
     fd::{AsFd, BorrowedFd, OwnedFd},
     fs::{self as rfs, FileType, OFlags},
-    net::{AddressFamily, RecvFlags, SocketAddrUnix, SocketFlags, SocketType, accept_with, recv},
+    net::{
+        AddressFamily, RecvFlags, SendFlags, SocketAddrUnix, SocketFlags, SocketType, accept_with,
+        recv, sendto, socket_with,
+    },
     pipe::{PipeFlags, pipe_with},
 };
 use std::{
+    env,
+    ffi::OsStr,
     io,
+    os::unix::ffi::OsStrExt,
+    path::Path,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -35,8 +42,12 @@ const ACCEPT_POLL_SLICE: Duration = Duration::from_millis(200);
 const CLIENT_PIPE_TIMEOUT: Duration = Duration::from_secs(15);
 const WORKER_OPERATION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(110);
+const READINESS_NOTIFICATION_TIMEOUT: Duration = Duration::from_secs(3);
 const UNLOCK_RATE_LIMIT: Duration = Duration::from_secs(2);
 const CONTROL_SOCKET_PATH: &str = "/run/kernaid-rescue-vault.sock";
+const NOTIFY_SOCKET_ENV: &str = "NOTIFY_SOCKET";
+const READY_NOTIFICATION: &[u8] = b"READY=1";
+const MAX_NOTIFY_SOCKET_BYTES: usize = 108;
 const PASSWD_FILE_PATH: &str = "/etc/passwd";
 const GROUP_FILE_PATH: &str = "/etc/group";
 const LISTENER_GROUP_NAME: &[u8] = b"kernaid-vault";
@@ -162,6 +173,7 @@ impl WorkerBoundary for WorkerHandle {
 #[derive(Clone)]
 struct StopControl {
     requested: Arc<AtomicBool>,
+    first_requested_at: Arc<Mutex<Option<Instant>>>,
     deadline: Arc<Mutex<Option<Instant>>>,
 }
 
@@ -172,25 +184,94 @@ enum WorkerStartup {
     },
     Faulted {
         worker: Option<Arc<WorkerHandle>>,
+        untracked_worker_may_remain: bool,
     },
+    Unavailable(RescueVaultDaemonError),
     CancelledClean,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StartupReadiness {
+    Ready,
+    Stopping,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FaultContainment {
+    marker_durable: bool,
+    worker_quiesced: bool,
+}
+
+impl FaultContainment {
+    fn permits_status_service(self) -> bool {
+        self.marker_durable && self.worker_quiesced
+    }
+}
+
+enum SystemdNotifier {
+    Disabled,
+    Enabled(SocketAddrUnix),
+}
+
+impl SystemdNotifier {
+    fn from_environment() -> Result<Self, RescueVaultDaemonError> {
+        Self::from_value(env::var_os(NOTIFY_SOCKET_ENV).as_deref())
+    }
+
+    fn from_value(value: Option<&OsStr>) -> Result<Self, RescueVaultDaemonError> {
+        let Some(value) = value else {
+            return Ok(Self::Disabled);
+        };
+        let bytes = value.as_bytes();
+        if bytes.is_empty() || bytes.len() > MAX_NOTIFY_SOCKET_BYTES || bytes.contains(&0) {
+            return Err(RescueVaultDaemonError::InvalidConfiguration);
+        }
+        let address = match bytes[0] {
+            b'/' => SocketAddrUnix::new(Path::new(value)),
+            b'@' if bytes.len() > 1 => SocketAddrUnix::new_abstract_name(&bytes[1..]),
+            _ => return Err(RescueVaultDaemonError::InvalidConfiguration),
+        }
+        .map_err(|_| RescueVaultDaemonError::InvalidConfiguration)?;
+        Ok(Self::Enabled(address))
+    }
+
+    fn notify_ready_by(&self, deadline: Instant) -> Result<(), RescueVaultDaemonError> {
+        let Self::Enabled(address) = self else {
+            return Ok(());
+        };
+        send_readiness_notification(address, deadline)
+    }
 }
 
 impl StopControl {
     fn new() -> Self {
         Self {
             requested: Arc::new(AtomicBool::new(false)),
+            first_requested_at: Arc::new(Mutex::new(None)),
             deadline: Arc::new(Mutex::new(None)),
         }
     }
 
     fn request(&self) {
-        if let Ok(mut deadline) = self.deadline.lock() {
-            if deadline.is_none() {
-                *deadline = Some(Instant::now() + SHUTDOWN_TIMEOUT);
-            }
-            self.requested.store(true, Ordering::Release);
-        }
+        let requested_at = Instant::now();
+        self.request_at(requested_at);
+    }
+
+    fn request_at(&self, requested_at: Instant) {
+        let Ok(mut first_requested_at) = self.first_requested_at.lock() else {
+            return;
+        };
+        let first = first_requested_at.map_or(requested_at, |first| first.min(requested_at));
+        *first_requested_at = Some(first);
+        let Ok(mut deadline) = self.deadline.lock() else {
+            return;
+        };
+        let requested_deadline = first.checked_add(SHUTDOWN_TIMEOUT).unwrap_or(first);
+        *deadline = Some(deadline.map_or(requested_deadline, |current| {
+            current.min(requested_deadline)
+        }));
+        self.requested.store(true, Ordering::Release);
     }
 
     fn deadline_or(&self, fallback: Instant) -> Instant {
@@ -204,6 +285,7 @@ impl StopControl {
 
 pub(super) fn run(companion_uid: u32) -> Result<(), RescueVaultDaemonError> {
     enforce_process_privacy().map_err(|()| RescueVaultDaemonError::RuntimeUnavailable)?;
+    let notifier = SystemdNotifier::from_environment()?;
     let signal_set = block_termination_signals()?;
     let stop = StopControl::new();
     spawn_signal_waiter(signal_set, stop.clone());
@@ -214,14 +296,23 @@ pub(super) fn run(companion_uid: u32) -> Result<(), RescueVaultDaemonError> {
     let (runtime, disposition) = DaemonRuntime::open()?;
     let seed = state_version_seed()?;
 
-    let (worker, availability, startup_fault) = match disposition {
-        RuntimeDisposition::PersistentFault => (None, faulted_availability(), true),
+    let (worker, availability, startup_fault, untracked_worker_may_remain) = match disposition {
+        RuntimeDisposition::PersistentFault => (None, faulted_availability(), true, false),
         RuntimeDisposition::Ready => match start_worker(&stop) {
             WorkerStartup::Ready {
                 worker,
                 availability,
-            } => (Some(worker), availability, false),
-            WorkerStartup::Faulted { worker } => (worker, faulted_availability(), true),
+            } => (Some(worker), availability, false, false),
+            WorkerStartup::Faulted {
+                worker,
+                untracked_worker_may_remain,
+            } => (
+                worker,
+                faulted_availability(),
+                true,
+                untracked_worker_may_remain,
+            ),
+            WorkerStartup::Unavailable(error) => return Err(error),
             WorkerStartup::CancelledClean => return Ok(()),
         },
     };
@@ -244,8 +335,55 @@ pub(super) fn run(companion_uid: u32) -> Result<(), RescueVaultDaemonError> {
         stopping: Arc::clone(&stop.requested),
         stop_deadline: Arc::clone(&stop.deadline),
     });
-    if startup_fault && disposition == RuntimeDisposition::Ready {
-        supervisor.mark_fault();
+    let fault_containment = if startup_fault && disposition == RuntimeDisposition::Ready {
+        let mut containment = supervisor.mark_fault();
+        if untracked_worker_may_remain {
+            containment.worker_quiesced = false;
+        }
+        containment
+    } else {
+        FaultContainment {
+            marker_durable: true,
+            worker_quiesced: true,
+        }
+    };
+    let readiness = supervisor.startup_readiness(fault_containment, disposition);
+    let readiness_result = publish_readiness(&notifier, readiness, &stop);
+    match readiness {
+        StartupReadiness::Ready => match readiness_result {
+            Ok(true) => {}
+            Ok(false) => {
+                let deadline = stop.deadline_or(
+                    Instant::now()
+                        .checked_add(SHUTDOWN_TIMEOUT)
+                        .unwrap_or_else(Instant::now),
+                );
+                return supervisor.shutdown(deadline);
+            }
+            Err(readiness_error) => {
+                return shutdown_after_readiness_failure(&supervisor, &stop, readiness_error);
+            }
+        },
+        StartupReadiness::Stopping => {
+            let deadline = stop.deadline_or(
+                Instant::now()
+                    .checked_add(SHUTDOWN_TIMEOUT)
+                    .unwrap_or_else(Instant::now),
+            );
+            return supervisor.shutdown(deadline);
+        }
+        StartupReadiness::Failed => {
+            stop.request();
+            let deadline = stop.deadline_or(
+                Instant::now()
+                    .checked_add(SHUTDOWN_TIMEOUT)
+                    .unwrap_or_else(Instant::now),
+            );
+            return match supervisor.shutdown(deadline) {
+                Ok(()) => Err(RescueVaultDaemonError::RuntimeUnavailable),
+                Err(error) => Err(error),
+            };
+        }
     }
 
     let serve_result = serve_connections(listener, allowlist, Arc::clone(&supervisor), &stop);
@@ -267,21 +405,31 @@ fn start_worker(stop: &StopControl) -> WorkerStartup {
     }
     let cgroup = match WorkerCgroup::prepare() {
         Ok(cgroup) => cgroup,
-        Err(_) => return WorkerStartup::Faulted { worker: None },
+        Err(error) => return WorkerStartup::Unavailable(error),
     };
     if stop.requested.load(Ordering::Acquire) {
         let deadline = stop.deadline_or(Instant::now() + SHUTDOWN_TIMEOUT);
         return if cgroup.remove_empty(deadline).is_ok() {
             WorkerStartup::CancelledClean
         } else {
-            WorkerStartup::Faulted { worker: None }
+            WorkerStartup::Faulted {
+                worker: None,
+                untracked_worker_may_remain: false,
+            }
         };
     }
     let startup_deadline = Instant::now() + WORKER_OPERATION_TIMEOUT;
     let worker = match WorkerHandle::spawn(cgroup, startup_deadline, &stop.requested) {
         Ok(WorkerSpawnResult::Ready(worker)) => worker,
         Ok(WorkerSpawnResult::CancelledClean) => return WorkerStartup::CancelledClean,
-        Err(_) => return WorkerStartup::Faulted { worker: None },
+        Err(_) => {
+            return WorkerStartup::Faulted {
+                worker: None,
+                // WorkerHandle::spawn performs bounded cleanup, but its
+                // error does not prove that reap/cgroup cleanup completed.
+                untracked_worker_may_remain: true,
+            };
+        }
     };
     if stop.requested.load(Ordering::Acquire) {
         return cancel_startup_worker(worker, stop);
@@ -306,6 +454,7 @@ fn start_worker(stop: &StopControl) -> WorkerStartup {
                 let _ = worker.fault_and_terminate(startup_deadline);
                 WorkerStartup::Faulted {
                     worker: Some(worker),
+                    untracked_worker_may_remain: false,
                 }
             }
         },
@@ -313,6 +462,7 @@ fn start_worker(stop: &StopControl) -> WorkerStartup {
             let _ = worker.fault_and_terminate(startup_deadline);
             WorkerStartup::Faulted {
                 worker: Some(worker),
+                untracked_worker_may_remain: false,
             }
         }
     }
@@ -325,6 +475,7 @@ fn cancel_startup_worker(worker: Arc<WorkerHandle>, stop: &StopControl) -> Worke
     } else {
         WorkerStartup::Faulted {
             worker: Some(worker),
+            untracked_worker_may_remain: false,
         }
     }
 }
@@ -563,6 +714,145 @@ fn state_version_seed() -> Result<u64, RescueVaultDaemonError> {
         }
     }
     Err(RescueVaultDaemonError::RuntimeUnavailable)
+}
+
+fn publish_readiness(
+    notifier: &SystemdNotifier,
+    readiness: StartupReadiness,
+    stop: &StopControl,
+) -> Result<bool, RescueVaultDaemonError> {
+    if readiness != StartupReadiness::Ready {
+        return Ok(false);
+    }
+    let deadline = Instant::now()
+        .checked_add(READINESS_NOTIFICATION_TIMEOUT)
+        .ok_or(RescueVaultDaemonError::RuntimeUnavailable)?;
+    publish_readiness_by(notifier, readiness, stop, deadline)
+}
+
+fn publish_readiness_by(
+    notifier: &SystemdNotifier,
+    readiness: StartupReadiness,
+    stop: &StopControl,
+    deadline: Instant,
+) -> Result<bool, RescueVaultDaemonError> {
+    publish_readiness_with(readiness, stop, || notifier.notify_ready_by(deadline))
+}
+
+fn publish_readiness_with(
+    readiness: StartupReadiness,
+    stop: &StopControl,
+    publish: impl FnOnce() -> Result<(), RescueVaultDaemonError>,
+) -> Result<bool, RescueVaultDaemonError> {
+    if readiness != StartupReadiness::Ready {
+        return Ok(false);
+    }
+    let _linearization = stop
+        .deadline
+        .lock()
+        .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+    if stop.requested.load(Ordering::Acquire) {
+        return Ok(false);
+    }
+    publish()?;
+    Ok(true)
+}
+
+fn shutdown_after_readiness_failure(
+    supervisor: &Supervisor,
+    stop: &StopControl,
+    readiness_error: RescueVaultDaemonError,
+) -> Result<(), RescueVaultDaemonError> {
+    stop.request();
+    let deadline = stop.deadline_or(
+        Instant::now()
+            .checked_add(SHUTDOWN_TIMEOUT)
+            .unwrap_or_else(Instant::now),
+    );
+    match supervisor.shutdown(deadline) {
+        Ok(()) => Err(readiness_error),
+        Err(shutdown_error) => Err(shutdown_error),
+    }
+}
+
+fn send_readiness_notification(
+    address: &SocketAddrUnix,
+    deadline: Instant,
+) -> Result<(), RescueVaultDaemonError> {
+    ensure_before(deadline).map_err(|()| RescueVaultDaemonError::RuntimeUnavailable)?;
+    let socket = open_notification_socket()?;
+    loop {
+        ensure_before(deadline).map_err(|()| RescueVaultDaemonError::RuntimeUnavailable)?;
+        match sendto(
+            &socket,
+            READY_NOTIFICATION,
+            SendFlags::DONTWAIT | SendFlags::NOSIGNAL,
+            address,
+        ) {
+            Ok(sent) if sent == READY_NOTIFICATION.len() => return Ok(()),
+            Ok(_) => return Err(RescueVaultDaemonError::RuntimeUnavailable),
+            Err(error) if error == rustix::io::Errno::INTR => {}
+            Err(error) if error == rustix::io::Errno::AGAIN => {
+                wait_notification_writable(socket.as_fd(), deadline)?;
+            }
+            Err(_) => return Err(RescueVaultDaemonError::RuntimeUnavailable),
+        }
+    }
+}
+
+fn open_notification_socket() -> Result<OwnedFd, RescueVaultDaemonError> {
+    let socket = socket_with(
+        AddressFamily::UNIX,
+        SocketType::DGRAM,
+        SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+        None,
+    )
+    .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+    let descriptor_flags =
+        rustix::io::fcntl_getfd(&socket).map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+    let status_flags =
+        rfs::fcntl_getfl(&socket).map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+    if !descriptor_flags.contains(rustix::io::FdFlags::CLOEXEC)
+        || !status_flags.contains(OFlags::NONBLOCK)
+        || rustix::net::sockopt::socket_domain(&socket)
+            .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?
+            != AddressFamily::UNIX
+        || rustix::net::sockopt::socket_type(&socket)
+            .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?
+            != SocketType::DGRAM
+        || rustix::net::sockopt::socket_acceptconn(&socket)
+            .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?
+    {
+        return Err(RescueVaultDaemonError::RuntimeUnavailable);
+    }
+    Ok(socket)
+}
+
+fn wait_notification_writable(
+    socket: BorrowedFd<'_>,
+    deadline: Instant,
+) -> Result<(), RescueVaultDaemonError> {
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(RescueVaultDaemonError::RuntimeUnavailable)?;
+        let mut descriptor = [PollFd::from_borrowed_fd(socket, PollFlags::OUT)];
+        match poll(&mut descriptor, Some(&duration_to_timespec(remaining))) {
+            Ok(0) => return Err(RescueVaultDaemonError::RuntimeUnavailable),
+            Ok(_) => {
+                let events = descriptor[0].revents();
+                if events.intersects(PollFlags::ERR | PollFlags::HUP | PollFlags::NVAL) {
+                    return Err(RescueVaultDaemonError::RuntimeUnavailable);
+                }
+                if events.contains(PollFlags::OUT) {
+                    return Ok(());
+                }
+            }
+            Err(error) if error == rustix::io::Errno::INTR => {}
+            Err(_) => return Err(RescueVaultDaemonError::RuntimeUnavailable),
+        }
+    }
 }
 
 fn serve_connections(
@@ -1411,15 +1701,60 @@ impl Supervisor {
         Ok(apply_completion(&mut state, origin))
     }
 
-    fn mark_fault(&self) {
+    fn startup_readiness(
+        &self,
+        mut containment: FaultContainment,
+        disposition: RuntimeDisposition,
+    ) -> StartupReadiness {
+        if !self.faulted.load(Ordering::Acquire) {
+            let worker_is_healthy = self
+                .worker
+                .as_ref()
+                .is_some_and(|worker| worker.verify_healthy().is_ok());
+            if !worker_is_healthy {
+                containment = self.mark_fault();
+            }
+        }
+        let state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => return StartupReadiness::Failed,
+        };
+        let faulted = self.faulted.load(Ordering::Acquire);
+        let coherent = faulted == state.faulted
+            && state.transition_origin.is_none()
+            && !state.marker_persistence_failed
+            && if faulted {
+                disposition == RuntimeDisposition::PersistentFault
+                    && state.fault_marker_required
+                    && containment.permits_status_service()
+                    && matches!(
+                        state.availability,
+                        Availability::Available {
+                            state: VaultState::FaultedRebootRequired,
+                            device_id: None,
+                        }
+                    )
+            } else {
+                !state.fault_marker_required && self.worker.is_some()
+            };
+        if !coherent {
+            StartupReadiness::Failed
+        } else if self.stopping.load(Ordering::Acquire) {
+            StartupReadiness::Stopping
+        } else {
+            StartupReadiness::Ready
+        }
+    }
+
+    fn mark_fault(&self) -> FaultContainment {
         self.mark_fault_by(
             Instant::now()
                 .checked_add(SHUTDOWN_TIMEOUT)
                 .unwrap_or_else(Instant::now),
-        );
+        )
     }
 
-    fn mark_fault_by(&self, requested_deadline: Instant) {
+    fn mark_fault_by(&self, requested_deadline: Instant) -> FaultContainment {
         let deadline = self
             .stop_deadline
             .lock()
@@ -1445,9 +1780,10 @@ impl Supervisor {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             runtime.arm_lifecycle()
         };
-        if let Some(worker) = self.worker.as_ref() {
-            let _ = worker.fault_and_terminate(deadline);
-        }
+        let worker_quiesced = self
+            .worker
+            .as_ref()
+            .is_none_or(|worker| worker.fault_and_terminate(deadline).is_ok());
         let marker_result = if first_marker_attempt.is_ok() {
             first_marker_attempt
         } else {
@@ -1471,6 +1807,10 @@ impl Supervisor {
         state.marker_persistence_failed = marker_result.is_err();
         if state.marker_persistence_failed {
             self.stopping.store(true, Ordering::Release);
+        }
+        FaultContainment {
+            marker_durable: marker_result.is_ok(),
+            worker_quiesced,
         }
     }
 
@@ -1822,14 +2162,16 @@ mod tests {
     use rustix::{
         net::{
             AddressFamily, SendAncillaryBuffer, SendAncillaryMessage, SendFlags, SocketFlags,
-            SocketType, send, sendmsg, socketpair,
+            SocketType, bind, send, sendmsg, socket_with, socketpair,
         },
         pipe::{PipeFlags, pipe_with},
     };
     use std::{
         collections::VecDeque,
+        ffi::OsString,
         io::IoSlice,
         mem::MaybeUninit,
+        os::unix::ffi::OsStringExt,
         sync::{
             atomic::{AtomicU64, AtomicUsize},
             mpsc,
@@ -1961,6 +2303,7 @@ mod tests {
         fault_deadlines: Vec<Instant>,
         shutdowns: usize,
         fail_verify: bool,
+        fail_fault: bool,
         block_unlock: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
     }
 
@@ -2048,7 +2391,11 @@ mod tests {
             let mut state = self.state.lock().expect("fake worker");
             state.faults += 1;
             state.fault_deadlines.push(deadline);
-            Ok(())
+            if state.fail_fault {
+                Err(RescueVaultDaemonError::ShutdownFailed)
+            } else {
+                Ok(())
+            }
         }
 
         fn cancel_clean(&self, _deadline: Instant) -> Result<(), RescueVaultDaemonError> {
@@ -2416,6 +2763,328 @@ mod tests {
             marker_persistence_failed: false,
             clean_fault_shutdown: false,
         }
+    }
+
+    fn notification_receiver(address: &SocketAddrUnix) -> OwnedFd {
+        let receiver = socket_with(
+            AddressFamily::UNIX,
+            SocketType::DGRAM,
+            SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+            None,
+        )
+        .expect("notification receiver");
+        bind(&receiver, address).expect("bind notification receiver");
+        receiver
+    }
+
+    fn receive_notification(receiver: &OwnedFd) -> Result<Vec<u8>, rustix::io::Errno> {
+        let mut buffer = [0_u8; 64];
+        recv(receiver, &mut buffer, RecvFlags::DONTWAIT)
+            .map(|(received, _)| buffer[..received].to_vec())
+    }
+
+    fn assert_no_notification(receiver: &OwnedFd) {
+        assert!(matches!(
+            receive_notification(receiver),
+            Err(error) if error == rustix::io::Errno::AGAIN
+        ));
+    }
+
+    fn verified_fault_containment() -> FaultContainment {
+        FaultContainment {
+            marker_durable: true,
+            worker_quiesced: true,
+        }
+    }
+
+    #[test]
+    fn readiness_filesystem_seam_is_exact_and_never_premature() {
+        let directory = tempfile::tempdir().expect("temporary notify directory");
+        let path = directory.path().join("notify.sock");
+        let address = SocketAddrUnix::new(&path).expect("filesystem notification address");
+        let receiver = notification_receiver(&address);
+        let notifier = SystemdNotifier::from_value(Some(path.as_os_str())).expect("notifier");
+        let stop = StopControl::new();
+
+        assert_eq!(
+            publish_readiness_by(&notifier, StartupReadiness::Stopping, &stop, Instant::now(),),
+            Ok(false)
+        );
+        assert_eq!(
+            publish_readiness_by(&notifier, StartupReadiness::Failed, &stop, Instant::now(),),
+            Ok(false)
+        );
+        assert_no_notification(&receiver);
+
+        assert_eq!(
+            publish_readiness_by(
+                &notifier,
+                StartupReadiness::Ready,
+                &stop,
+                Instant::now() + Duration::from_secs(1),
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            receive_notification(&receiver).expect("readiness datagram"),
+            READY_NOTIFICATION
+        );
+        assert_no_notification(&receiver);
+    }
+
+    #[test]
+    fn readiness_abstract_socket_seam_sends_exact_datagram() {
+        static NEXT_ABSTRACT_SOCKET: AtomicU64 = AtomicU64::new(1);
+
+        let name = format!(
+            "kernaid-ready-{}-{}",
+            std::process::id(),
+            NEXT_ABSTRACT_SOCKET.fetch_add(1, Ordering::Relaxed)
+        )
+        .into_bytes();
+        let address = SocketAddrUnix::new_abstract_name(&name).expect("abstract address");
+        let receiver = notification_receiver(&address);
+        let mut activation = Vec::with_capacity(name.len() + 1);
+        activation.push(b'@');
+        activation.extend_from_slice(&name);
+        let activation = OsString::from_vec(activation);
+        let notifier =
+            SystemdNotifier::from_value(Some(activation.as_os_str())).expect("abstract notifier");
+        let stop = StopControl::new();
+
+        assert_eq!(
+            publish_readiness_by(
+                &notifier,
+                StartupReadiness::Ready,
+                &stop,
+                Instant::now() + Duration::from_secs(1),
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            receive_notification(&receiver).expect("abstract readiness datagram"),
+            READY_NOTIFICATION
+        );
+        assert_no_notification(&receiver);
+    }
+
+    #[test]
+    fn readiness_and_stop_are_linearized_without_moving_the_stop_deadline() {
+        let stop = StopControl::new();
+        let publisher_stop = stop.clone();
+        let (publish_entered_tx, publish_entered_rx) = mpsc::sync_channel(0);
+        let (publish_release_tx, publish_release_rx) = mpsc::sync_channel(0);
+        let publisher = thread::spawn(move || {
+            publish_readiness_with(StartupReadiness::Ready, &publisher_stop, || {
+                publish_entered_tx.send(()).expect("publish entered");
+                publish_release_rx.recv().expect("publish release");
+                Ok(())
+            })
+        });
+        publish_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("publisher holds readiness gate");
+
+        let requested_at = Instant::now();
+        let requester_stop = stop.clone();
+        let (request_entered_tx, request_entered_rx) = mpsc::sync_channel(0);
+        let (request_done_tx, request_done_rx) = mpsc::sync_channel(0);
+        let requester = thread::spawn(move || {
+            request_entered_tx.send(()).expect("request entered");
+            requester_stop.request_at(requested_at);
+            request_done_tx.send(()).expect("request completed");
+        });
+        request_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("stop request attempted");
+        assert_eq!(
+            request_done_rx.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout),
+            "stop-first publication ordering escaped the shared gate"
+        );
+        publish_release_tx.send(()).expect("release publication");
+        assert_eq!(publisher.join().expect("publisher thread"), Ok(true));
+        request_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("stop request completed after publication");
+        requester.join().expect("requester thread");
+        assert!(stop.requested.load(Ordering::Acquire));
+        assert_eq!(
+            *stop.deadline.lock().expect("stop deadline"),
+            requested_at.checked_add(SHUTDOWN_TIMEOUT),
+            "waiting behind READY must not move the first signal's budget"
+        );
+
+        let stop_first = StopControl::new();
+        stop_first.request();
+        let called = Arc::new(AtomicBool::new(false));
+        let called_by_publish = Arc::clone(&called);
+        assert_eq!(
+            publish_readiness_with(StartupReadiness::Ready, &stop_first, || {
+                called_by_publish.store(true, Ordering::Release);
+                Ok(())
+            }),
+            Ok(false)
+        );
+        assert!(!called.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn readiness_socket_and_activation_input_are_bounded_and_sanitized() {
+        let socket = open_notification_socket().expect("notification socket");
+        assert!(
+            rustix::io::fcntl_getfd(&socket)
+                .expect("descriptor flags")
+                .contains(rustix::io::FdFlags::CLOEXEC)
+        );
+        assert!(
+            rfs::fcntl_getfl(&socket)
+                .expect("status flags")
+                .contains(OFlags::NONBLOCK)
+        );
+        assert_eq!(
+            rustix::net::sockopt::socket_domain(&socket).expect("socket domain"),
+            AddressFamily::UNIX
+        );
+        assert_eq!(
+            rustix::net::sockopt::socket_type(&socket).expect("socket type"),
+            SocketType::DGRAM
+        );
+        assert!(!rustix::net::sockopt::socket_acceptconn(&socket).expect("accept state"));
+
+        for invalid in [
+            OsString::new(),
+            OsString::from("relative.sock"),
+            OsString::from("@"),
+            OsString::from_vec(vec![b'@', 0, b'x']),
+            OsString::from_vec(vec![b'@'; MAX_NOTIFY_SOCKET_BYTES + 1]),
+        ] {
+            let error = SystemdNotifier::from_value(Some(invalid.as_os_str()))
+                .err()
+                .expect("invalid activation input rejected");
+            assert_eq!(error, RescueVaultDaemonError::InvalidConfiguration);
+            assert_eq!(
+                error.to_string(),
+                "invalid Rescue vault daemon configuration"
+            );
+        }
+
+        let maximum_abstract = OsString::from_vec({
+            let mut value = vec![b'a'; MAX_NOTIFY_SOCKET_BYTES];
+            value[0] = b'@';
+            value
+        });
+        assert!(
+            SystemdNotifier::from_value(Some(maximum_abstract.as_os_str())).is_ok(),
+            "the largest representable abstract activation address must be accepted"
+        );
+    }
+
+    #[test]
+    fn readiness_deadline_and_send_failure_are_fail_closed_with_clean_shutdown() {
+        let directory = tempfile::tempdir().expect("temporary notify directory");
+        let path = directory.path().join("not-listening.sock");
+        let notifier = SystemdNotifier::from_value(Some(path.as_os_str())).expect("notifier");
+        let send_stop = StopControl::new();
+        assert_eq!(
+            publish_readiness_by(
+                &notifier,
+                StartupReadiness::Ready,
+                &send_stop,
+                Instant::now(),
+            ),
+            Err(RescueVaultDaemonError::RuntimeUnavailable)
+        );
+
+        let (supervisor, runtime, worker, _, _) =
+            fake_supervisor(service_state(9, VaultState::Locked), [], true);
+        runtime.lock().expect("runtime state").marker = true;
+        let stop = StopControl {
+            requested: Arc::clone(&supervisor.stopping),
+            first_requested_at: Arc::new(Mutex::new(None)),
+            deadline: Arc::clone(&supervisor.stop_deadline),
+        };
+        let readiness_error = publish_readiness_by(
+            &notifier,
+            StartupReadiness::Ready,
+            &stop,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .expect_err("missing receiver must reject readiness");
+        let started = Instant::now();
+        assert_eq!(
+            shutdown_after_readiness_failure(&supervisor, &stop, readiness_error),
+            Err(RescueVaultDaemonError::RuntimeUnavailable)
+        );
+        let finished = Instant::now();
+        assert!(stop.requested.load(Ordering::Acquire));
+        let deadline = stop
+            .deadline
+            .lock()
+            .expect("stop deadline")
+            .expect("bounded stop deadline");
+        assert!(deadline >= started && deadline <= finished + SHUTDOWN_TIMEOUT);
+        assert_eq!(worker.lock().expect("worker state").shutdowns, 1);
+        assert_eq!(runtime.lock().expect("runtime state").disarms, 1);
+        assert!(!runtime.lock().expect("runtime state").marker);
+    }
+
+    #[test]
+    fn readiness_rechecks_worker_and_allows_only_preexisting_fault_status() {
+        let (contained, _, contained_worker, _, _) =
+            fake_supervisor(service_state(20, VaultState::Locked), [], true);
+        contained_worker.lock().expect("worker state").fail_verify = true;
+        assert_eq!(
+            contained.startup_readiness(verified_fault_containment(), RuntimeDisposition::Ready,),
+            StartupReadiness::Failed,
+            "a fresh startup fault must never be published as healthy readiness"
+        );
+        let state = contained.state.lock().expect("service state");
+        assert!(state.faulted);
+        assert!(matches!(
+            state.availability,
+            Availability::Available {
+                state: VaultState::FaultedRebootRequired,
+                device_id: None,
+            }
+        ));
+        drop(state);
+        let worker = contained_worker.lock().expect("worker state");
+        assert_eq!(worker.verifies, 1);
+        assert_eq!(worker.faults, 1);
+        drop(worker);
+
+        let mut persistent_state = service_state(25, VaultState::FaultedRebootRequired);
+        persistent_state.faulted = true;
+        persistent_state.fault_marker_required = true;
+        let (persistent, _, persistent_worker, _, _) = fake_supervisor(persistent_state, [], true);
+        persistent.faulted.store(true, Ordering::Release);
+        assert_eq!(
+            persistent.startup_readiness(
+                verified_fault_containment(),
+                RuntimeDisposition::PersistentFault,
+            ),
+            StartupReadiness::Ready,
+            "only a marker observed before startup may become status-only ready"
+        );
+        assert_eq!(
+            persistent_worker.lock().expect("worker state").verifies,
+            0,
+            "persistent-fault readiness must not run a worker health check"
+        );
+
+        let (uncontained, _, uncontained_worker, _, _) =
+            fake_supervisor(service_state(30, VaultState::Locked), [], true);
+        {
+            let mut worker = uncontained_worker.lock().expect("worker state");
+            worker.fail_verify = true;
+            worker.fail_fault = true;
+        }
+        assert_eq!(
+            uncontained.startup_readiness(verified_fault_containment(), RuntimeDisposition::Ready,),
+            StartupReadiness::Failed
+        );
+        assert!(uncontained.state.lock().expect("service state").faulted);
     }
 
     #[test]

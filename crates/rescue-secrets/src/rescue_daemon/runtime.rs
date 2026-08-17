@@ -4,7 +4,9 @@ use super::{RescueVaultDaemonError, internal_wire};
 use rustix::{
     event::{PollFd, PollFlags, Timespec, poll},
     fd::OwnedFd,
-    fs::{self as rfs, AtFlags, CWD, FileType, FlockOperation, Mode, OFlags, ResolveFlags},
+    fs::{
+        self as rfs, AtFlags, CWD, FileType, FlockOperation, Mode, OFlags, ResolveFlags, SeekFrom,
+    },
     net::{AddressFamily, SocketFlags, SocketType, socketpair},
     process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal},
 };
@@ -29,6 +31,7 @@ const FAULT_MARKER_NAME: &str = "lifecycle-active-v1";
 const FAULT_MARKER_BYTES: &[u8] = b"KERNAID_RESCUE_VAULT_LIFECYCLE_ARMED_V1\n";
 const SUPERVISOR_CGROUP_NAME: &[u8] = b"supervisor";
 const WORKER_CGROUP_NAME: &str = "worker";
+const PIDS_CONTROLLER_NAME: &[u8] = b"pids";
 const CGROUP2_SUPER_MAGIC: u64 = 0x6367_7270;
 const PROC_SUPER_MAGIC: u64 = 0x0000_9fa0;
 const SECURE_DIRECTORY_MODE: u32 = 0o700;
@@ -398,6 +401,16 @@ impl WorkerCgroup {
         {
             return Err(RescueVaultDaemonError::CgroupUnavailable);
         }
+        // Delegate=pids makes the controller available to the service, but
+        // systemd does not enable it for children of the delegated root. Use
+        // the retained parent descriptor to enable and read back the exact
+        // controller before creating the sibling worker cgroup. Otherwise a
+        // superficially valid worker directory has no pids.current and the
+        // recursive population proof cannot be made.
+        enable_pids_controller(&delegated)?;
+        if !cgroup_tree_is_exact(&delegated, &supervisor, None)? {
+            return Err(RescueVaultDaemonError::CgroupUnavailable);
+        }
 
         match rfs::mkdirat(
             &delegated,
@@ -419,7 +432,8 @@ impl WorkerCgroup {
             cgroup_pids_current(&worker)?,
             cgroup_descendant_count(&worker)?,
             cgroup_populated(&worker)?,
-        ) {
+        ) || !cgroup_tree_is_exact(&delegated, &supervisor, Some(&worker))?
+        {
             return Err(RescueVaultDaemonError::CgroupUnavailable);
         }
         let stat = rfs::fstat(&worker).map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
@@ -538,6 +552,7 @@ impl WorkerCgroup {
             || named.st_dev != self.supervisor_device
             || named.st_ino != self.supervisor_inode
             || !read_cgroup_procs(&self.parent)?.is_empty()
+            || !cgroup_tree_is_exact(&self.parent, &self.supervisor, Some(&self.worker))?
         {
             return Err(RescueVaultDaemonError::CgroupUnavailable);
         }
@@ -571,6 +586,33 @@ fn worker_population_is_exact(
     worker_pid: i32,
 ) -> bool {
     direct_processes == [worker_pid] && current_processes == 1 && descendants == 0 && populated
+}
+
+fn cgroup_tree_is_exact(
+    parent: &OwnedFd,
+    supervisor: &OwnedFd,
+    worker: Option<&OwnedFd>,
+) -> Result<bool, RescueVaultDaemonError> {
+    let worker_descendants = worker.map(cgroup_descendant_count).transpose()?;
+    Ok(cgroup_tree_metrics_are_exact(
+        cgroup_descendant_count(parent)?,
+        cgroup_descendant_count(supervisor)?,
+        worker_descendants,
+        cgroup_pids_current(supervisor)?,
+    ))
+}
+
+fn cgroup_tree_metrics_are_exact(
+    parent_descendants: u64,
+    supervisor_descendants: u64,
+    worker_descendants: Option<u64>,
+    supervisor_tasks: u64,
+) -> bool {
+    let expected_descendants = if worker_descendants.is_some() { 2 } else { 1 };
+    parent_descendants == expected_descendants
+        && supervisor_descendants == 0
+        && worker_descendants.is_none_or(|count| count == 0)
+        && supervisor_tasks > 0
 }
 
 fn read_self_cgroup() -> Result<Vec<u8>, RescueVaultDaemonError> {
@@ -762,6 +804,64 @@ fn ensure_cgroup_domain(directory: &OwnedFd) -> Result<(), RescueVaultDaemonErro
         return Err(RescueVaultDaemonError::CgroupUnavailable);
     }
     Ok(())
+}
+
+fn enable_pids_controller(directory: &OwnedFd) -> Result<(), RescueVaultDaemonError> {
+    let available = open_cgroup_file(directory, "cgroup.controllers", OFlags::RDONLY)?;
+    let available = read_bounded(available.as_fd(), MAX_CGROUP_FILE_BYTES)
+        .map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+    let subtree = open_cgroup_file(directory, "cgroup.subtree_control", OFlags::RDWR)?;
+    let enabled = read_bounded(subtree.as_fd(), MAX_CGROUP_FILE_BYTES)
+        .map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+    if pids_controller_activation_required(&available, &enabled)? {
+        rfs::seek(&subtree, SeekFrom::Start(0))
+            .map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+        write_one(&subtree, b"+pids\n").map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+    }
+    rfs::seek(&subtree, SeekFrom::Start(0))
+        .map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+    let verified = read_bounded(subtree.as_fd(), MAX_CGROUP_FILE_BYTES)
+        .map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+    if !pids_controller_is_listed(&verified)? {
+        return Err(RescueVaultDaemonError::CgroupUnavailable);
+    }
+    Ok(())
+}
+
+fn pids_controller_activation_required(
+    available: &[u8],
+    enabled: &[u8],
+) -> Result<bool, RescueVaultDaemonError> {
+    if !pids_controller_is_listed(available)? {
+        return Err(RescueVaultDaemonError::CgroupUnavailable);
+    }
+    Ok(!pids_controller_is_listed(enabled)?)
+}
+
+fn pids_controller_is_listed(bytes: &[u8]) -> Result<bool, RescueVaultDaemonError> {
+    if bytes.len() > MAX_CGROUP_FILE_BYTES {
+        return Err(RescueVaultDaemonError::CgroupUnavailable);
+    }
+    if bytes.is_empty() {
+        return Ok(false);
+    }
+    if !bytes.ends_with(b"\n") || bytes[..bytes.len() - 1].contains(&b'\n') {
+        return Err(RescueVaultDaemonError::CgroupUnavailable);
+    }
+    let mut controllers: Vec<&[u8]> = Vec::new();
+    for controller in bytes[..bytes.len() - 1].split(|byte| *byte == b' ') {
+        if controller.is_empty()
+            || controller.len() > 64
+            || !controller
+                .iter()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
+            || controllers.contains(&controller)
+        {
+            return Err(RescueVaultDaemonError::CgroupUnavailable);
+        }
+        controllers.push(controller);
+    }
+    Ok(controllers.contains(&PIDS_CONTROLLER_NAME))
 }
 
 fn open_cgroup_file(
@@ -1445,6 +1545,63 @@ mod tests {
                 parse_delegated_membership(invalid).err(),
                 Some(RescueVaultDaemonError::CgroupUnavailable)
             );
+        }
+    }
+
+    #[test]
+    fn pids_controller_activation_is_exact_and_fail_closed() {
+        assert_eq!(
+            pids_controller_activation_required(b"cpu io memory pids\n", b""),
+            Ok(true)
+        );
+        assert_eq!(
+            pids_controller_activation_required(b"memory pids\n", b"pids\n"),
+            Ok(false)
+        );
+        assert_eq!(pids_controller_is_listed(b"pids\n"), Ok(true));
+        assert_eq!(pids_controller_is_listed(b"pid\n"), Ok(false));
+        assert_eq!(pids_controller_is_listed(b""), Ok(false));
+        assert_eq!(
+            pids_controller_activation_required(b"cpu memory\n", b""),
+            Err(RescueVaultDaemonError::CgroupUnavailable)
+        );
+
+        for invalid in [
+            &b"pids"[..],
+            &b"pids\nextra\n"[..],
+            &b" pids\n"[..],
+            &b"pids \n"[..],
+            &b"cpu  pids\n"[..],
+            &b"cpu\tpids\n"[..],
+            &b"pids pids\n"[..],
+            &b"PIDS\n"[..],
+            &b"pids\0\n"[..],
+        ] {
+            assert_eq!(
+                pids_controller_is_listed(invalid),
+                Err(RescueVaultDaemonError::CgroupUnavailable)
+            );
+        }
+    }
+
+    #[test]
+    fn recursive_cgroup_metrics_allow_only_supervisor_and_worker_siblings() {
+        assert!(cgroup_tree_metrics_are_exact(1, 0, None, 2));
+        assert!(cgroup_tree_metrics_are_exact(2, 0, Some(0), 2));
+        for (parent, supervisor, worker, supervisor_tasks) in [
+            (0, 0, None, 2),
+            (2, 0, None, 2),
+            (3, 0, Some(0), 2),
+            (2, 1, Some(0), 2),
+            (2, 0, Some(1), 2),
+            (2, 0, Some(0), 0),
+        ] {
+            assert!(!cgroup_tree_metrics_are_exact(
+                parent,
+                supervisor,
+                worker,
+                supervisor_tasks,
+            ));
         }
     }
 

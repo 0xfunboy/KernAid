@@ -13,6 +13,35 @@ fail() {
     exit 1
 }
 
+test "$(id -u kernaid 2>/dev/null)" = "1000" || fail "live user is not exact UID 1000"
+id -nG kernaid 2>/dev/null | tr ' ' '\n' | grep -Fxq kernaid-vault \
+    || fail "live user is not a kernaid-vault member"
+for subordinate_ids in /etc/subuid /etc/subgid; do
+    if [ -r "$subordinate_ids" ] && grep -q '^kernaid:' "$subordinate_ids"; then
+        fail "live user unexpectedly has subordinate IDs"
+    fi
+done
+for helper in /usr/bin/newuidmap /usr/bin/newgidmap; do
+    if [ -u "$helper" ] || [ -g "$helper" ]; then
+        fail "uidmap helper unexpectedly has a set-ID bit"
+    fi
+done
+test -r /proc/sys/kernel/core_pattern || fail "kernel core policy is unreadable"
+test -z "$(cat /proc/sys/kernel/core_pattern)" || fail "kernel core filename is enabled"
+test "$(cat /proc/sys/kernel/core_uses_pid)" = "0" || fail "kernel core PID suffix is enabled"
+test "$(wc -l < /proc/swaps)" -eq 1 || fail "swap is active"
+test "$(systemctl show --property=ActiveState --value kernaid-rescue-vaultd.service)" = "active" \
+    || fail "vault lifecycle daemon is not active"
+test "$(systemctl show --property=ActiveState --value kernaid-rescue-vaultd.socket)" = "active" \
+    || fail "vault lifecycle socket is not active"
+test "$(systemctl show --property=SubState --value kernaid-rescue-vaultd.socket)" = "listening" \
+    || fail "vault lifecycle socket is not listening"
+vault_group_id="$(getent group kernaid-vault | awk -F: 'NF == 4 && $1 == "kernaid-vault" { print $3 }')"
+test -n "$vault_group_id" || fail "vault lifecycle group is missing"
+test -S /run/kernaid-rescue-vault.sock || fail "vault lifecycle pathname is not a socket"
+test "$(stat -c '%u:%g:%a:%h' -- /run/kernaid-rescue-vault.sock)" = "0:${vault_group_id}:660:1" \
+    || fail "vault lifecycle socket ownership or mode is unsafe"
+
 if command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
     fail "live user unexpectedly has passwordless root"
 fi

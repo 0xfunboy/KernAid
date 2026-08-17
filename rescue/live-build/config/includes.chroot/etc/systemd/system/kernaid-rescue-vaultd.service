@@ -1,0 +1,56 @@
+[Unit]
+Description=KernAid Rescue vault lifecycle daemon
+Requires=kernaid-rescue-vaultd.socket live-config.service systemd-sysusers.service
+After=kernaid-rescue-vaultd.socket live-config.service systemd-sysusers.service systemd-sysctl.service systemd-tmpfiles-setup.service
+Before=kernaid-ready.service
+ConditionKernelCommandLine=boot=live
+ConditionPathIsDirectory=/run/live/medium
+
+[Service]
+Type=notify
+NotifyAccess=main
+Sockets=kernaid-rescue-vaultd.socket
+ExecStart=/usr/lib/kernaid/kernaid-rescue-vaultd
+Restart=no
+TimeoutStartSec=620s
+TimeoutStopSec=120s
+KillMode=mixed
+SendSIGKILL=yes
+StandardInput=socket
+StandardOutput=journal
+StandardError=journal
+User=root
+Group=root
+UMask=0077
+RuntimeDirectory=kernaid-rescue-vault
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+LimitCORE=0
+LimitNOFILE=128
+TasksMax=64
+NoNewPrivileges=yes
+PrivateMounts=yes
+PrivateNetwork=yes
+PrivateTmp=yes
+PrivateDevices=no
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectControlGroups=no
+ReadWritePaths=-/run/kernaid /run/lock -/run/cryptsetup
+CapabilityBoundingSet=CAP_SYS_ADMIN
+RestrictAddressFamilies=AF_UNIX
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+Delegate=pids
+DelegateSubgroup=supervisor
+
+[Install]
+WantedBy=multi-user.target

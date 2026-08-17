@@ -1,7 +1,7 @@
 [Unit]
 Description=KernAid Rescue readiness marker
-After=multi-user.target kernaid-ui.service
-Requires=kernaid-ui.service
+After=multi-user.target kernaid-ui.service kernaid-rescue-vaultd.service
+Requires=kernaid-ui.service kernaid-rescue-vaultd.service
 
 [Service]
 Type=oneshot
