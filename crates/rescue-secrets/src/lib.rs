@@ -131,6 +131,9 @@ mod bounded_process;
 #[cfg(target_os = "linux")]
 mod device_locator;
 
+#[cfg(target_os = "linux")]
+mod profile_classifier;
+
 #[cfg(all(target_os = "linux", feature = "experimental-vault-manager"))]
 mod mount_manager;
 

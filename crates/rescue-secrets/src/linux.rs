@@ -1127,23 +1127,9 @@ fn verify_luks2_mount(
         }
     }
     let entry = match_found.ok_or(RescueSecretError::VaultNotMounted)?;
-    if entry.mount_root != b"/"
-        || !entry.read_write
-        || !entry.no_suid
-        || !entry.no_dev
-        || !entry.no_exec
-        || !entry.no_sym_follow
-        || entry.mount_id != root_mount_id
-        || entry.major != rfs::major(root_state.device)
-        || entry.minor != rfs::minor(root_state.device)
-    {
-        return Err(RescueSecretError::VaultNotMounted);
-    }
+    verify_mount_entry_identity(&entry, root_state.device, root_mount_id)?;
     if entry.filesystem.as_slice() != b"ext4" {
         return Err(RescueSecretError::UnsupportedFilesystem);
-    }
-    if !entry.source.starts_with(b"/dev/") {
-        return Err(RescueSecretError::VaultNotMounted);
     }
 
     let dm_uuid_path = PathBuf::from(format!(
@@ -1202,6 +1188,26 @@ fn verify_luks2_mount(
         mapper_name,
         luks_uuid,
     })
+}
+
+fn verify_mount_entry_identity(
+    entry: &MountEntry,
+    root_device: u64,
+    root_mount_id: u64,
+) -> Result<(), RescueSecretError> {
+    if entry.mount_root != b"/"
+        || !entry.read_write
+        || !entry.no_suid
+        || !entry.no_dev
+        || !entry.no_exec
+        || !entry.no_sym_follow
+        || entry.mount_id != root_mount_id
+        || entry.major != rfs::major(root_device)
+        || entry.minor != rfs::minor(root_device)
+    {
+        return Err(RescueSecretError::VaultNotMounted);
+    }
+    Ok(())
 }
 
 #[cfg(feature = "experimental-vault-manager")]
@@ -1370,7 +1376,6 @@ struct MountEntry {
     no_sym_follow: bool,
     errors_policy: MountErrorsPolicy,
     filesystem: Vec<u8>,
-    source: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1396,7 +1401,12 @@ fn parse_mountinfo_line(line: &[u8]) -> Result<Option<MountEntry>, RescueSecretE
     };
     let mount_root = decode_mountinfo_field(fields[3])?;
     let mountpoint = decode_mountinfo_field(fields[4])?;
-    let source = decode_mountinfo_field(fields[separator + 2])?;
+    // The source string is presentation-only and may legitimately be the
+    // retained `/proc/<pid>/fd/<fd>` path supplied to mount(2). Decode it to
+    // keep the mountinfo grammar strict, but never use it as identity. The
+    // mount ID, root st_dev, device-mapper major:minor, dm UUID/name, sole
+    // backing device, and holder relationship are the authoritative binding.
+    let _source = decode_mountinfo_field(fields[separator + 2])?;
     let mount_options: Vec<_> = fields[5].split(|byte| *byte == b',').collect();
     let read_write = mount_options.contains(&b"rw".as_slice());
     let no_suid = mount_options.contains(&b"nosuid".as_slice());
@@ -1431,7 +1441,6 @@ fn parse_mountinfo_line(line: &[u8]) -> Result<Option<MountEntry>, RescueSecretE
         no_sym_follow,
         errors_policy,
         filesystem: fields[separator + 1].to_vec(),
-        source,
     }))
 }
 
@@ -1531,7 +1540,10 @@ mod tests {
     use kernaid_storage::JournalSecretStore;
     use std::{
         fs::{self, OpenOptions},
-        os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, symlink},
+        os::{
+            fd::AsRawFd,
+            unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, symlink},
+        },
     };
     use tempfile::TempDir;
 
@@ -1915,6 +1927,45 @@ mod tests {
         )
         .is_err());
         assert!(parse_mountinfo_line(b"x 29 253:17 / /vault rw - ext4 /dev/dm-0 rw").is_err());
+    }
+
+    #[test]
+    fn procfd_mount_source_is_non_authoritative_but_kernel_identity_is_exact() {
+        let descriptor = tempfile::tempfile().expect("create retained descriptor fixture");
+        let procfd_source = format!("/proc/{}/fd/{}", std::process::id(), descriptor.as_raw_fd());
+        assert!(Path::new(&procfd_source).exists());
+        let line = format!(
+            "41 29 253:17 / /vault rw,nosuid,nodev,noexec,nosymfollow - ext4 {procfd_source} rw,errors=remount-ro"
+        );
+        let entry = parse_mountinfo_line(line.as_bytes())
+            .expect("valid procfd-source mountinfo")
+            .expect("procfd-source entry");
+        let root_device = rfs::makedev(253, 17);
+        assert_eq!(verify_mount_entry_identity(&entry, root_device, 41), Ok(()));
+
+        let bind_or_subroot = parse_mountinfo_line(
+            b"41 29 253:17 /subtree /vault rw,nosuid,nodev,noexec,nosymfollow - ext4 /proc/1/fd/7 rw,errors=remount-ro",
+        )
+        .expect("syntactically valid subroot mountinfo")
+        .expect("subroot entry");
+        assert_eq!(
+            verify_mount_entry_identity(&bind_or_subroot, root_device, 41),
+            Err(RescueSecretError::VaultNotMounted)
+        );
+
+        let wrong_device = parse_mountinfo_line(
+            b"41 29 253:18 / /vault rw,nosuid,nodev,noexec,nosymfollow - ext4 /proc/1/fd/7 rw,errors=remount-ro",
+        )
+        .expect("syntactically valid wrong-device mountinfo")
+        .expect("wrong-device entry");
+        assert_eq!(
+            verify_mount_entry_identity(&wrong_device, root_device, 41),
+            Err(RescueSecretError::VaultNotMounted)
+        );
+        assert_eq!(
+            verify_mount_entry_identity(&entry, root_device, 42),
+            Err(RescueSecretError::VaultNotMounted)
+        );
     }
 
     #[test]

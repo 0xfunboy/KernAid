@@ -20,8 +20,9 @@ if [[ "$(id -u)" -ne 0 ]]; then
   exit 2
 fi
 
-for command in chmod cryptsetup dd findmnt id losetup mkdir mkfs.ext4 mktemp \
-  mount mountpoint od rm rmdir sync tr truncate tune2fs umount udevadm; do
+for command in blockdev chmod cryptsetup dd findmnt id losetup mkdir mkfs.ext4 \
+  mktemp mount mountpoint od rm rmdir sha256sum stat sync tr truncate tune2fs \
+  umount udevadm; do
   command -v "$command" >/dev/null || {
     echo "missing required disposable-probe tooling" >&2
     exit 2
@@ -49,6 +50,13 @@ provision_mount="$work_dir/provision"
 loop_device=""
 provision_open=false
 provision_mounted=false
+logical_sector_bytes=512
+vault_sector_count=16777216
+vault_bytes=8589934592
+luks_data_offset_bytes=16777216
+payload_bytes=8573157376
+payload_sector_count=16744448
+luks_header_span_bytes=32768
 
 cleanup() {
   local result="$1"
@@ -128,7 +136,18 @@ trap 'cleanup $?' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-truncate -s 512M "$image"
+if ((vault_sector_count * logical_sector_bytes != vault_bytes)) ||
+  ((vault_bytes - luks_data_offset_bytes != payload_bytes)) ||
+  ((payload_bytes / logical_sector_bytes != payload_sector_count)); then
+  echo "the disposable vault geometry constants are inconsistent" >&2
+  exit 1
+fi
+truncate -s "$vault_bytes" "$image"
+if [[ "$(stat -c %s "$image")" != "$vault_bytes" ]] ||
+  [[ "$(stat -c %b "$image")" != 0 ]]; then
+  echo "failed to create the exact sparse disposable p3 image" >&2
+  exit 1
+fi
 dd if=/dev/urandom of="$key_file" bs=64 count=1 status=none
 dd if=/dev/urandom of="$wrong_key_file" bs=64 count=1 status=none
 chmod 600 "$key_file"
@@ -136,6 +155,14 @@ chmod 600 "$wrong_key_file"
 loop_device="$(losetup --find --show "$image")"
 if [[ ! "$loop_device" =~ ^/dev/loop[0-9]+$ ]]; then
   echo "the disposable loop allocator returned an unexpected path" >&2
+  exit 1
+fi
+associated_loop="$(losetup --associated "$image" --noheadings --output NAME | tr -d '[:space:]')"
+if [[ "$associated_loop" != "$loop_device" ]] ||
+  [[ "$(blockdev --getss "$loop_device")" != "$logical_sector_bytes" ]] ||
+  [[ "$(blockdev --getsz "$loop_device")" != "$vault_sector_count" ]] ||
+  [[ "$(blockdev --getsize64 "$loop_device")" != "$vault_bytes" ]]; then
+  echo "the disposable loop does not bind the exact 8 GiB p3 geometry" >&2
   exit 1
 fi
 
@@ -152,6 +179,12 @@ cryptsetup open --type luks2 --batch-mode --tries 1 \
   --disable-external-tokens --key-file "$key_file" --keyfile-size 64 \
   "$loop_device" "$provision_mapper"
 provision_open=true
+if [[ "$(blockdev --getss "/dev/mapper/$provision_mapper")" != "$logical_sector_bytes" ]] ||
+  [[ "$(blockdev --getsz "/dev/mapper/$provision_mapper")" != "$payload_sector_count" ]] ||
+  [[ "$(blockdev --getsize64 "/dev/mapper/$provision_mapper")" != "$payload_bytes" ]]; then
+  echo "the disposable LUKS mapping does not expose the pinned payload geometry" >&2
+  exit 1
+fi
 mkfs.ext4 -q -F -t ext4 -b 4096 -I 256 -i 16384 -g 32768 -G 16 \
   -m 0 -o linux -e remount-ro -J size=128 \
   -E lazy_itable_init=0,lazy_journal_init=0 \
@@ -176,6 +209,15 @@ provision_mounted=false
 cryptsetup close "$provision_mapper"
 provision_open=false
 
+header_digest_before="$(
+  dd if="$loop_device" bs="$luks_header_span_bytes" count=1 status=none | sha256sum
+)"
+header_digest_before="${header_digest_before%% *}"
+if [[ ! "$header_digest_before" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "failed to fingerprint the disposable dual LUKS2 headers" >&2
+  exit 1
+fi
+
 # The block device is an explicit positional argument. The passphrase enters
 # only on stdin; neither value is inferred from an environment variable/glob.
 if "$probe_binary" --device "$loop_device" --mapper "$manager_mapper" \
@@ -188,14 +230,40 @@ if mountpoint -q "$manager_mount" || cryptsetup status "$manager_mapper" >/dev/n
   exit 1
 fi
 
-"$probe_binary" --device "$loop_device" --mapper "$manager_mapper" \
-  --mode initialize <"$key_file"
-"$probe_binary" --device "$loop_device" --mapper "$manager_mapper" \
-  --mode verify <"$key_file"
+initialize_attestation="$(
+  "$probe_binary" --device "$loop_device" --mapper "$manager_mapper" \
+    --mode initialize <"$key_file"
+)"
+if [[ ! "$initialize_attestation" =~ ^KERNAID_RESCUE_VAULT_PROBE_ATTESTATION_V1\ mode=initialize\ sentinel=kernaid-disposable-vault-persistence-v1\ identity_public_key=([0-9a-f]{64})\ clean_shutdown=true$ ]]; then
+  echo "the initial real-profile attestation was not canonical" >&2
+  exit 1
+fi
+identity_public_key="${BASH_REMATCH[1]}"
+printf '%s\n' "$initialize_attestation"
+
+verify_attestation="$(
+  "$probe_binary" --device "$loop_device" --mapper "$manager_mapper" \
+    --mode verify <"$key_file"
+)"
+if [[ ! "$verify_attestation" =~ ^KERNAID_RESCUE_VAULT_PROBE_ATTESTATION_V1\ mode=verify\ sentinel=kernaid-disposable-vault-persistence-v1\ identity_public_key=([0-9a-f]{64})\ clean_shutdown=true$ ]] ||
+  [[ "${BASH_REMATCH[1]:-}" != "$identity_public_key" ]]; then
+  echo "the reopened real-profile attestation was not canonical and stable" >&2
+  exit 1
+fi
+printf '%s\n' "$verify_attestation"
 
 if mountpoint -q "$manager_mount" || cryptsetup status "$manager_mapper" >/dev/null 2>&1; then
   echo "the Rescue manager left a mount or mapping active" >&2
   exit 1
 fi
 
-echo "PASS: Rescue manager accepted the pinned vault profile, rejected a wrong key, and persisted journal/identity across reopen"
+header_digest_after="$(
+  dd if="$loop_device" bs="$luks_header_span_bytes" count=1 status=none | sha256sum
+)"
+header_digest_after="${header_digest_after%% *}"
+if [[ "$header_digest_after" != "$header_digest_before" ]]; then
+  echo "the Rescue profile checks modified a disposable LUKS2 header" >&2
+  exit 1
+fi
+
+echo "PASS: exact sparse 8 GiB p3 profile was stable, wrong key was rejected, and journal/identity persisted across reopen"

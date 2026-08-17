@@ -41,11 +41,14 @@ cryptsetup/blkid child starts in a new process group. The manager drains
 captured output non-blockingly, rejects unexpected descendants even after the
 direct child exits, and uses bounded TERM/KILL cleanup on errors or timeouts.
 
-The selected vault device is different: every cryptsetup/blkid probe and
-activation receives `/proc/<daemon-pid>/fd/<retained-fd>`, which resolves the
-manager's already-validated descriptor. The direct `/dev/<node>` name remains
-only a repeated identity checkpoint and is never the child tool's device
-argument, so a udev rename or replacement cannot retarget the mutation.
+The selected vault device is different: its pre-unlock classifier reads only
+the manager's retained read-only descriptor and runs no external command.
+`cryptsetup open` is the first operation allowed to reopen that descriptor as
+a mutating capability, and it receives only
+`/proc/<daemon-pid>/fd/<retained-fd>`. Later cache-free `blkid` checks receive
+only retained mapper procfds. The direct `/dev/<node>` names remain repeated
+identity checkpoints and are never child-tool device arguments, so a udev
+rename or replacement cannot retarget an operation.
 
 An accepted vault must already contain this root-owned layout:
 
@@ -66,18 +69,32 @@ identity writes happen only through later, explicit application calls such as
 Before activation, the manager holds a CLOEXEC descriptor for the selected
 block device and repeatedly compares its inode, filesystem device and `rdev`
 with the direct pathname. It also retains the kernel sysfs disk sequence and
-capacity, requires no holders, rejects an existing mapper, and requires:
+capacity, requires no holders, rejects an existing mapper, and validates the
+embedded device-layout and vault-profile manifests. Exactly one of three
+closed results is possible:
 
-- a LUKS2 header recognized by cryptsetup;
-- agreement between cryptsetup and cache-free blkid UUID observations; and
-- the exact `KERNAID_VAULT` LUKS label.
+- every byte of the exact 8 GiB p3 is zero: `UNPROVISIONED`;
+- both independently checksummed 16 KiB LUKS2 metadata copies have the exact
+  label, RFC 4122 v4 UUID, matching sequence and logical JSON, and every
+  cipher/KDF/keyslot/offset/sector/profile field is pinned: `LOCKED`; or
+- any other non-zero layout or metadata state: `PROFILE_MISMATCH`.
 
-After `cryptsetup open`, it verifies the mapper's device numbers, exact name,
-LUKS2 DM UUID, one direct backing slave, cryptsetup status, and that this mapper
-is the backing device's only holder. The inner filesystem must be ext4 with the
-`KERNAID_VAULT` label. It is mounted with
+The raw classifier never invokes cryptsetup: `luksDump`/`luksUUID` can repair a
+redundant header when run as root even when the original descriptor was opened
+read-only. Avoiding those commands is therefore part of the zero-write trust
+boundary, not merely an implementation preference.
+
+After `cryptsetup open`, it retains a separate read-only mapper descriptor and
+verifies its device numbers, exact name, LUKS2 DM UUID, exact payload capacity,
+one direct backing slave, cryptsetup status, and that this mapper is the
+backing device's only holder. Before mount, the inner filesystem must match the
+complete ext4 profile, including superblock and group-descriptor checksums,
+feature/geometry policy, RFC 4122 v4 UUID, inode 8's initialized 128 MiB
+journal extent and the JBD2 superblock. It is mounted with
 `rw,nosuid,nodev,noexec,nosymfollow,relatime,errors=remount-ro` and then checked
-against `/proc/self/mountinfo` and sysfs again.
+again through the retained mapper descriptor, `/proc/self/mountinfo` and
+sysfs. Mutable ext4 fields are accepted after mount only where the profile
+explicitly permits them; immutable profile evidence must remain identical.
 
 Linux omits an `errors=` mountinfo token when the requested policy equals the
 ext4 superblock default. The manager therefore accepts either an explicit
@@ -122,12 +139,11 @@ while binding every pathname checkpoint to its major/minor, disk sequence and
 capacity. Cryptsetup and blkid receive only the retained daemon procfd; no IPC
 field exposes or selects the checkpoint name.
 
-This constructor is not a production unlock claim. Before a daemon may call
-the experimental manager, an FD-bound classifier must map an exact blank
-profile to `UNPROVISIONED`, the fully pinned LUKS2/ext4 vault-profile.v1 to
-`LOCKED`, and every profile delta to `PROFILE_MISMATCH`, with descriptor-bound
-rechecks before and after unlock and mount. Until that classifier exists, the
-feature gate prevents this API from becoming the shipping activation path.
+This constructor is not yet a production unlock claim. The manager now applies
+the non-bypassable descriptor-bound classifier and repeats immutable profile
+checks before and after unlock and mount, but the feature gate remains until a
+dedicated daemon owns the private mount namespace, restart recovery and IPC
+lifecycle.
 
 The locator never invokes cryptsetup, activates device mapper, mounts a
 filesystem, reads a LUKS header, repairs metadata, or writes any byte. It does
@@ -196,8 +212,6 @@ not implemented yet.
 
 ## Remaining production gates
 
-- implement the non-bypassable FD-bound blank/exact/profile-mismatch
-  classifier and its pre/post activation rechecks;
 - run the daemon in a private mount namespace and adopt descriptor-based mount
   attachment (`open_tree`/`move_mount` or an equivalent design);
 - replace the experimental manager's remaining sysfs disk-sequence checkpoint
