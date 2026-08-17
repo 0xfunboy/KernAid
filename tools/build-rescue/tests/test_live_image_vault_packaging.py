@@ -345,7 +345,7 @@ class VaultLivePolicyTests(unittest.TestCase):
         self.assertNotIn("$RUNNER_TEMP/kernaid-rescue-shipping-preflight", workflow)
         self.assertIn("sudo install -o root -g root -m 0755", workflow)
         self.assertEqual(workflow.count("verify-shipping-binary.py"), 2)
-        self.assertNotIn("lifecycle smoke", workflow.lower())
+        self.assertIn("qemu-vault-lifecycle-smoke.sh", workflow)
 
 
 if __name__ == "__main__":

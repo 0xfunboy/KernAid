@@ -15,11 +15,19 @@ on:
       - "apps/desk/**"
       - "packs/linux/**"
       - "crates/rescue-secrets/**"
+      - "crates/report-schema/**"
       - "crates/protocol/**"
       - "crates/storage/**"
       - "crates/device-identity/**"
+      - "services/agent-gateway/**"
+      - "packages/provider-types/**"
+      - "packages/schemas/**"
+      - "packages/session-driver/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "package.json"
+      - "pnpm-workspace.yaml"
       - "pnpm-lock.yaml"
       - ".github/workflows/rescue.yml"
 permissions: {contents: read}
@@ -47,15 +55,25 @@ jobs:
           python3 -m unittest discover -s tools/build-rescue/tests -p 'test_*.py' -v
           bash -n tools/build-rescue/build.sh \
             tools/build-rescue/qemu-smoke.sh \
-            tools/build-rescue/qemu-usb-smoke.sh
+            tools/build-rescue/qemu-usb-smoke.sh \
+            tools/build-rescue/qemu-vault-lifecycle-smoke.sh
           shellcheck tools/build-rescue/build.sh \
             tools/build-rescue/qemu-smoke.sh \
-            tools/build-rescue/qemu-usb-smoke.sh
+            tools/build-rescue/qemu-usb-smoke.sh \
+            tools/build-rescue/qemu-vault-lifecycle-smoke.sh
+          python3 -I -B -c 'from pathlib import Path; path = Path("tools/build-rescue/qemu-vault-lifecycle-pty.py"); compile(path.read_bytes(), str(path), "exec", dont_inherit=True)'
       - name: Build the host-only Rescue vault lifecycle probe
         run: |
           cargo fmt -p kernaid-rescue-secrets -- --check
           cargo build --locked --release -p kernaid-rescue-secrets \
             --features privileged-probe --bin kernaid-rescue-vault-probe
+      - name: Publish the host-only lifecycle probe input
+        uses: actions/upload-artifact@v4
+        with:
+          name: KernAid-Rescue-vault-lifecycle-probe-input
+          path: target/release/kernaid-rescue-vault-probe
+          if-no-files-found: error
+          retention-days: 1
       - name: Build the in-guest Rescue vault lifecycle binaries
         run: |
           cargo build --locked --release -p kernaid-rescue-secrets \
@@ -205,5 +223,391 @@ jobs:
             KernAid-Rescue-amd64.iso.sha256
             KernAid-Rescue-amd64.catalog-entry.json
             KernAid-Rescue-amd64.catalog-entry-v2.json
+          if-no-files-found: error
+          retention-days: 14
+
+  vault-lifecycle-bios:
+    needs: build-and-smoke-test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install isolated lifecycle VM tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            coreutils cryptsetup e2fsprogs gawk grep libcrypt1 mount ovmf procps \
+            python3 qemu-system-x86 squashfs-tools udev util-linux
+      - name: Download the tested Rescue image input
+        uses: actions/download-artifact@v4
+        with:
+          name: KernAid-Rescue-amd64
+          path: ${{ runner.temp }}/kernaid-vault-lifecycle-bios/image
+      - name: Download the host-only lifecycle probe input
+        uses: actions/download-artifact@v4
+        with:
+          name: KernAid-Rescue-vault-lifecycle-probe-input
+          path: ${{ runner.temp }}/kernaid-vault-lifecycle-bios/probe
+      - name: QEMU BIOS two-boot vault lifecycle test
+        timeout-minutes: 80
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          iso_dir="$RUNNER_TEMP/kernaid-vault-lifecycle-bios/image"
+          probe_dir="$RUNNER_TEMP/kernaid-vault-lifecycle-bios/probe"
+          iso="$iso_dir/KernAid-Rescue-amd64.iso"
+          checksum="$iso_dir/KernAid-Rescue-amd64.iso.sha256"
+          probe="$probe_dir/kernaid-rescue-vault-probe"
+          raw_output="$RUNNER_TEMP/kernaid-vault-lifecycle-bios.raw.log"
+          safe_output="$RUNNER_TEMP/kernaid-vault-lifecycle-bios.sanitized.log"
+
+          for input in "$iso" "$checksum" "$probe"; do
+            test -f "$input"
+            test ! -L "$input"
+            test "$(stat -c '%F:%h' -- "$input")" = "regular file:1"
+          done
+          chmod 0755 -- "$probe"
+          test "$(stat -c '%a' -- "$probe")" = 755
+          (
+            cd "$iso_dir"
+            sha256sum --check --strict KernAid-Rescue-amd64.iso.sha256
+          )
+          install -m 0600 /dev/null "$raw_output"
+
+          set +e
+          sudo -n -- "$GITHUB_WORKSPACE/tools/build-rescue/qemu-vault-lifecycle-smoke.sh" \
+            bios "$iso" "$probe" >"$raw_output" 2>&1
+          harness_status=$?
+          set -e
+
+          python3 -I -B - "$raw_output" "$safe_output" bios "$harness_status" <<'PY'
+          import os
+          import re
+          import sys
+          from pathlib import Path
+
+          raw_path = Path(sys.argv[1])
+          safe_path = Path(sys.argv[2])
+          firmware = sys.argv[3]
+          status = int(sys.argv[4])
+          expected_uefi_vars = "fresh-per-boot" if firmware == "uefi" else "not-applicable"
+          payload = raw_path.read_bytes()
+          if (
+              not payload
+              or len(payload) > 32768
+              or not payload.endswith(b"\n")
+              or b"\r" in payload
+              or b"\0" in payload
+          ):
+              raise SystemExit("lifecycle output framing was invalid")
+          try:
+              lines = payload[:-1].decode("ascii").split("\n")
+          except UnicodeDecodeError:
+              raise SystemExit("lifecycle output was not ASCII") from None
+
+          failure = re.compile(
+              r"KERNAID_QEMU_VAULT_LIFECYCLE_FAILURE_V1 "
+              r"stage=[a-z0-9-]+ code=[a-z0-9-]+"
+          )
+          boot = re.compile(
+              rf"KERNAID_QEMU_VAULT_LIFECYCLE_BOOT_V1 firmware={firmware} "
+              r"boot=([12]) initial_version=[0-9]+ final_version=[0-9]+ "
+              r"device_id=KA-[0-9a-f]{24} wrong_key_rejected=true "
+              r"rate_limit_waited=true daemon_stable=true worker_stable=true "
+              r"cgroup_stable=true caps_stable=true ambient_zero=true "
+              r"no_new_privs=true core_limits_zero=true swaps_empty=true "
+              r"cgroup_topology_exact=true shell_mount_absent=true "
+              r"residue_absent=true acpi_shutdown=true"
+          )
+          raw = re.compile(
+              rf"KERNAID_QEMU_VAULT_LIFECYCLE_RAW_V1 firmware={firmware} "
+              r"media_bytes=32000000000 iso_bytes=[0-9]+ "
+              r"prefix_before_sha256=[0-9a-f]{64} prefix_after_sha256=[0-9a-f]{64} "
+              r"observe_before_sha256=[0-9a-f]{64} observe_after_sha256=[0-9a-f]{64} "
+              r"swap_before_sha256=[0-9a-f]{64} swap_after_sha256=[0-9a-f]{64} "
+              r"p3_before_sha256=[0-9a-f]{64} p3_guest_after_sha256=[0-9a-f]{64} "
+              r"p3_post_verify_sha256=[0-9a-f]{64} prefix_immutable=true "
+              r"observe_immutable=true swap_immutable=true p3_expected_rw=true"
+          )
+          attestation = re.compile(
+              rf"KERNAID_QEMU_VAULT_LIFECYCLE_ATTESTATION_V1 firmware={firmware} "
+              r"boot_count=2 same_usb=true device_id=KA-[0-9a-f]{24} "
+              r"device_id_stable=true identity_public_key_stable=true "
+              r"guest_device_id_derived=true host_postverify=true clean_shutdown=true "
+              r"luks_profile_valid=true versions_exact_plus_two=true "
+              r"wrong_key_rejected=true rate_limit_waited=true "
+              r"locked_after_each_boot=true daemon_processes_stable=true "
+              r"cgroups_exact=true capabilities_exact=true ambient_zero=true "
+              r"no_new_privs=true core_limits_zero=true swaps_empty=true "
+              r"shell_mount_absent=true residue_absent=true qmp_acpi_shutdowns=2 "
+              rf"uefi_vars={expected_uefi_vars} ready=true"
+          )
+          patterns = (
+              ("failure", failure),
+              ("boot", boot),
+              ("raw", raw),
+              ("attestation", attestation),
+          )
+          kinds = []
+          boots = []
+          for line in lines:
+              if len(line) > 2048:
+                  raise SystemExit("lifecycle output line was too long")
+              for kind, pattern in patterns:
+                  match = pattern.fullmatch(line)
+                  if match is not None:
+                      kinds.append(kind)
+                      if kind == "boot":
+                          boots.append(match.group(1))
+                      break
+              else:
+                  raise SystemExit("lifecycle output was outside the allowlist")
+          if status == 0:
+              if kinds != ["boot", "boot", "raw", "attestation"] or boots != ["1", "2"]:
+                  raise SystemExit("successful lifecycle output was incomplete")
+          elif "failure" not in kinds or "raw" in kinds or "attestation" in kinds:
+              raise SystemExit("failed lifecycle output was not fail-closed")
+
+          temporary_path = safe_path.with_name(safe_path.name + ".tmp")
+          flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+          descriptor = os.open(temporary_path, flags, 0o600)
+          published = False
+          try:
+              with os.fdopen(descriptor, "wb") as stream:
+                  stream.write(payload)
+                  stream.flush()
+                  os.fsync(stream.fileno())
+              os.link(temporary_path, safe_path, follow_symlinks=False)
+              os.unlink(temporary_path)
+              final = os.stat(safe_path, follow_symlinks=False)
+              if (
+                  not safe_path.is_file()
+                  or final.st_nlink != 1
+                  or final.st_size != len(payload)
+                  or final.st_uid != os.geteuid()
+                  or final.st_mode & 0o7777 != 0o600
+              ):
+                  raise SystemExit("sanitized lifecycle evidence was not durable")
+              directory = os.open(
+                  safe_path.parent,
+                  os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+              )
+              try:
+                  os.fsync(directory)
+              finally:
+                  os.close(directory)
+              published = True
+          finally:
+              try:
+                  os.unlink(temporary_path)
+              except FileNotFoundError:
+                  pass
+              if not published:
+                  try:
+                      os.unlink(safe_path)
+                  except FileNotFoundError:
+                      pass
+          PY
+
+          exit "$harness_status"
+      - name: Publish sanitized BIOS lifecycle evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: KernAid-Rescue-vault-lifecycle-bios-evidence
+          path: ${{ runner.temp }}/kernaid-vault-lifecycle-bios.sanitized.log
+          if-no-files-found: error
+          retention-days: 14
+
+  vault-lifecycle-uefi:
+    needs: build-and-smoke-test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install isolated lifecycle VM tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            coreutils cryptsetup e2fsprogs gawk grep libcrypt1 mount ovmf procps \
+            python3 qemu-system-x86 squashfs-tools udev util-linux
+      - name: Download the tested Rescue image input
+        uses: actions/download-artifact@v4
+        with:
+          name: KernAid-Rescue-amd64
+          path: ${{ runner.temp }}/kernaid-vault-lifecycle-uefi/image
+      - name: Download the host-only lifecycle probe input
+        uses: actions/download-artifact@v4
+        with:
+          name: KernAid-Rescue-vault-lifecycle-probe-input
+          path: ${{ runner.temp }}/kernaid-vault-lifecycle-uefi/probe
+      - name: QEMU UEFI two-boot vault lifecycle test
+        timeout-minutes: 80
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          iso_dir="$RUNNER_TEMP/kernaid-vault-lifecycle-uefi/image"
+          probe_dir="$RUNNER_TEMP/kernaid-vault-lifecycle-uefi/probe"
+          iso="$iso_dir/KernAid-Rescue-amd64.iso"
+          checksum="$iso_dir/KernAid-Rescue-amd64.iso.sha256"
+          probe="$probe_dir/kernaid-rescue-vault-probe"
+          raw_output="$RUNNER_TEMP/kernaid-vault-lifecycle-uefi.raw.log"
+          safe_output="$RUNNER_TEMP/kernaid-vault-lifecycle-uefi.sanitized.log"
+
+          for input in "$iso" "$checksum" "$probe"; do
+            test -f "$input"
+            test ! -L "$input"
+            test "$(stat -c '%F:%h' -- "$input")" = "regular file:1"
+          done
+          chmod 0755 -- "$probe"
+          test "$(stat -c '%a' -- "$probe")" = 755
+          (
+            cd "$iso_dir"
+            sha256sum --check --strict KernAid-Rescue-amd64.iso.sha256
+          )
+          install -m 0600 /dev/null "$raw_output"
+
+          set +e
+          sudo -n -- "$GITHUB_WORKSPACE/tools/build-rescue/qemu-vault-lifecycle-smoke.sh" \
+            uefi "$iso" "$probe" >"$raw_output" 2>&1
+          harness_status=$?
+          set -e
+
+          python3 -I -B - "$raw_output" "$safe_output" uefi "$harness_status" <<'PY'
+          import os
+          import re
+          import sys
+          from pathlib import Path
+
+          raw_path = Path(sys.argv[1])
+          safe_path = Path(sys.argv[2])
+          firmware = sys.argv[3]
+          status = int(sys.argv[4])
+          expected_uefi_vars = "fresh-per-boot" if firmware == "uefi" else "not-applicable"
+          payload = raw_path.read_bytes()
+          if (
+              not payload
+              or len(payload) > 32768
+              or not payload.endswith(b"\n")
+              or b"\r" in payload
+              or b"\0" in payload
+          ):
+              raise SystemExit("lifecycle output framing was invalid")
+          try:
+              lines = payload[:-1].decode("ascii").split("\n")
+          except UnicodeDecodeError:
+              raise SystemExit("lifecycle output was not ASCII") from None
+
+          failure = re.compile(
+              r"KERNAID_QEMU_VAULT_LIFECYCLE_FAILURE_V1 "
+              r"stage=[a-z0-9-]+ code=[a-z0-9-]+"
+          )
+          boot = re.compile(
+              rf"KERNAID_QEMU_VAULT_LIFECYCLE_BOOT_V1 firmware={firmware} "
+              r"boot=([12]) initial_version=[0-9]+ final_version=[0-9]+ "
+              r"device_id=KA-[0-9a-f]{24} wrong_key_rejected=true "
+              r"rate_limit_waited=true daemon_stable=true worker_stable=true "
+              r"cgroup_stable=true caps_stable=true ambient_zero=true "
+              r"no_new_privs=true core_limits_zero=true swaps_empty=true "
+              r"cgroup_topology_exact=true shell_mount_absent=true "
+              r"residue_absent=true acpi_shutdown=true"
+          )
+          raw = re.compile(
+              rf"KERNAID_QEMU_VAULT_LIFECYCLE_RAW_V1 firmware={firmware} "
+              r"media_bytes=32000000000 iso_bytes=[0-9]+ "
+              r"prefix_before_sha256=[0-9a-f]{64} prefix_after_sha256=[0-9a-f]{64} "
+              r"observe_before_sha256=[0-9a-f]{64} observe_after_sha256=[0-9a-f]{64} "
+              r"swap_before_sha256=[0-9a-f]{64} swap_after_sha256=[0-9a-f]{64} "
+              r"p3_before_sha256=[0-9a-f]{64} p3_guest_after_sha256=[0-9a-f]{64} "
+              r"p3_post_verify_sha256=[0-9a-f]{64} prefix_immutable=true "
+              r"observe_immutable=true swap_immutable=true p3_expected_rw=true"
+          )
+          attestation = re.compile(
+              rf"KERNAID_QEMU_VAULT_LIFECYCLE_ATTESTATION_V1 firmware={firmware} "
+              r"boot_count=2 same_usb=true device_id=KA-[0-9a-f]{24} "
+              r"device_id_stable=true identity_public_key_stable=true "
+              r"guest_device_id_derived=true host_postverify=true clean_shutdown=true "
+              r"luks_profile_valid=true versions_exact_plus_two=true "
+              r"wrong_key_rejected=true rate_limit_waited=true "
+              r"locked_after_each_boot=true daemon_processes_stable=true "
+              r"cgroups_exact=true capabilities_exact=true ambient_zero=true "
+              r"no_new_privs=true core_limits_zero=true swaps_empty=true "
+              r"shell_mount_absent=true residue_absent=true qmp_acpi_shutdowns=2 "
+              rf"uefi_vars={expected_uefi_vars} ready=true"
+          )
+          patterns = (
+              ("failure", failure),
+              ("boot", boot),
+              ("raw", raw),
+              ("attestation", attestation),
+          )
+          kinds = []
+          boots = []
+          for line in lines:
+              if len(line) > 2048:
+                  raise SystemExit("lifecycle output line was too long")
+              for kind, pattern in patterns:
+                  match = pattern.fullmatch(line)
+                  if match is not None:
+                      kinds.append(kind)
+                      if kind == "boot":
+                          boots.append(match.group(1))
+                      break
+              else:
+                  raise SystemExit("lifecycle output was outside the allowlist")
+          if status == 0:
+              if kinds != ["boot", "boot", "raw", "attestation"] or boots != ["1", "2"]:
+                  raise SystemExit("successful lifecycle output was incomplete")
+          elif "failure" not in kinds or "raw" in kinds or "attestation" in kinds:
+              raise SystemExit("failed lifecycle output was not fail-closed")
+
+          temporary_path = safe_path.with_name(safe_path.name + ".tmp")
+          flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+          descriptor = os.open(temporary_path, flags, 0o600)
+          published = False
+          try:
+              with os.fdopen(descriptor, "wb") as stream:
+                  stream.write(payload)
+                  stream.flush()
+                  os.fsync(stream.fileno())
+              os.link(temporary_path, safe_path, follow_symlinks=False)
+              os.unlink(temporary_path)
+              final = os.stat(safe_path, follow_symlinks=False)
+              if (
+                  not safe_path.is_file()
+                  or final.st_nlink != 1
+                  or final.st_size != len(payload)
+                  or final.st_uid != os.geteuid()
+                  or final.st_mode & 0o7777 != 0o600
+              ):
+                  raise SystemExit("sanitized lifecycle evidence was not durable")
+              directory = os.open(
+                  safe_path.parent,
+                  os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+              )
+              try:
+                  os.fsync(directory)
+              finally:
+                  os.close(directory)
+              published = True
+          finally:
+              try:
+                  os.unlink(temporary_path)
+              except FileNotFoundError:
+                  pass
+              if not published:
+                  try:
+                      os.unlink(safe_path)
+                  except FileNotFoundError:
+                      pass
+          PY
+
+          exit "$harness_status"
+      - name: Publish sanitized UEFI lifecycle evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: KernAid-Rescue-vault-lifecycle-uefi-evidence
+          path: ${{ runner.temp }}/kernaid-vault-lifecycle-uefi.sanitized.log
           if-no-files-found: error
           retention-days: 14
