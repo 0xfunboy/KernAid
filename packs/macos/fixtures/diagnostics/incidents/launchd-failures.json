@@ -1,20 +1,13 @@
 {
   "schemaVersion": "1.0",
   "queryComplete": true,
+  "userQueryState": "complete",
+  "systemQueryState": "not-run-unqualified",
   "services": [
     {
-      "scope": "system",
-      "state": "failed",
-      "lastExitStatus": 78,
-      "consecutiveFailures": 6,
-      "appleSigned": true
-    },
-    {
       "scope": "user",
-      "state": "waiting",
-      "lastExitStatus": 0,
-      "consecutiveFailures": 0,
-      "appleSigned": false
+      "state": "failed",
+      "lastExitStatus": 78
     }
   ]
 }

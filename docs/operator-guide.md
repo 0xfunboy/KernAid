@@ -80,6 +80,20 @@ on supported physical hardware, non-English installations, administrator and
 non-administrator sessions, and timeout/process-tree behavior remain release
 qualification gates until recorded in the release evidence.
 
+On macOS, startup and the Verify gate collect a normalized system-version and
+storage identity. **Diagnostica** then runs the bounded read-only P0 collectors
+in parallel and rejects the session if storage identity changes. The current
+user's `launchd` table comes only from fixed `/bin/launchctl list`; system-domain
+services are explicitly `not-run-unqualified`. KernAid does not invoke
+`softwareupdate`, interpret its potentially stale preferences cache, or equate
+process-name log lines with incidents. Update availability and system-event
+counts therefore remain explicit limitation findings with no inferred zero.
+Startup qualifies only numeric `kern.safeboot`; KernAid does not invoke the
+human-readable `sfltool dumpbtm`, so login-item and background-item counts are
+also explicit `not-run-unqualified` limitations with `null` values.
+Physical Intel/Apple-silicon qualification and signing/notarization are still
+release gates.
+
 ## Safety rules
 
 - Never attach a customer disk to automated test scripts; tests accept fixtures and disposable images only.

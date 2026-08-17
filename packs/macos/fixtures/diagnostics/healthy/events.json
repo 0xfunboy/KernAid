@@ -1,8 +1,10 @@
 {
   "schemaVersion": "1.0",
   "queryComplete": true,
-  "windowHours": 24,
-  "kernelPanics": 0,
-  "watchdogReboots": 0,
-  "repeatedAppCrashes": 0
+  "executionState": "not-run-unqualified",
+  "queryState": "not-run-unqualified",
+  "windowHours": null,
+  "kernelPanics": null,
+  "watchdogReboots": null,
+  "repeatedAppCrashes": null
 }

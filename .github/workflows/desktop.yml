@@ -44,6 +44,11 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Generate platform icons
         run: pnpm --filter @kernaid/desk tauri icon icon.svg
+      - name: Probe native macOS P0 sources
+        if: matrix.name == 'macos-aarch64'
+        run: |
+          pnpm --filter @kernaid/desk build
+          cargo test --locked -p kernaid-desk-shell resident_macos_native_runtime_probe -- --nocapture
       - uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -28,7 +28,7 @@ CI produces engineering-preview desktop installers for Windows, Linux, Intel mac
   for this engineering preview. The target is re-scanned before every session;
   this milestone selects storage metadata only and does not yet inspect the
   installed filesystem.
-- **Windows, Linux or macOS that does boot:** download that operating system's desktop artifact, install it, and launch KernAid like a normal application. Windows startup collects only a fast, derived target identity; the eleven-document P0 collection starts once when **Diagnostica** is selected. Its fixed commands do not request repairs, although native Windows tools such as DISM may still update their own operating-system logs.
+- **Windows, Linux or macOS that does boot:** download that operating system's desktop artifact, install it, and launch KernAid like a normal application. Windows and macOS startup collect only a fast, derived target identity; the deeper P0 collection starts once when **Diagnostica** is selected. macOS queries only the current-user `launchd` table and safe-boot integer, and explicitly reports system `launchd`, software-update availability, system-event analysis, and login/background-item counts as unqualified instead of inventing results. The fixed commands do not request repairs, although native Windows tools such as DISM may still update their own operating-system logs.
 - **Do not use on customer data as a repair tool yet:** the current workflow diagnoses and stages an R0 no-write plan. It deliberately cannot execute real repairs.
 
 The Rescue artifact is rebuilt and boot-tested in QEMU using both legacy BIOS and UEFI firmware. Each test attaches a disposable target disk, proves the live UI ready, and verifies that the complete target image is byte-identical before and after boot. Secure Boot and physical-machine compatibility remain release gates, not claimed capabilities.
@@ -42,6 +42,6 @@ See the [operator guide](docs/operator-guide.md), [architecture](docs/architectu
 ## Current limitations
 
 - Deterministic offline rules only; API and Codex bridges are placeholders.
-- Native host inventory is intentionally limited and has no mutation or repair handler. Windows SFC is explicitly reported as `not-run-unqualified` until a locale-independent result adapter and physical qualification exist; KernAid does not infer an SFC result from localized console text.
+- Native host inventory is intentionally limited and has no mutation or repair handler. Windows SFC is explicitly reported as `not-run-unqualified` until a locale-independent result adapter and physical qualification exist. macOS likewise leaves system-domain `launchd`, update freshness, incident counts, and login/background-item counts explicitly unqualified until observation-only sources are physically qualified. KernAid does not turn absent, stale or ambiguous data into a clean result.
 - Encrypted persistence, Secure Boot, physical-machine validation and actual repair actions remain release gates.
 - Desktop artifacts are unsigned engineering previews.

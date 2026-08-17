@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+#[cfg(any(target_os = "macos", test))]
+mod macos_resident;
 mod secure_runtime;
 #[cfg(any(target_os = "windows", test))]
 mod windows_resident;
@@ -18,6 +20,8 @@ use std::fs::File;
 use std::os::unix::process::CommandExt;
 #[cfg(unix)]
 use std::process::Child;
+#[cfg(target_os = "macos")]
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
     collections::HashMap,
     io::{self, Read},
@@ -31,12 +35,14 @@ use std::{
 };
 use tauri::{Manager, State};
 
-#[cfg(any(unix, test))]
+#[cfg(any(target_os = "linux", test))]
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024;
 #[cfg(any(target_os = "windows", test))]
 const QUALIFIED_WINDOWS_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
+#[cfg(any(target_os = "macos", test))]
+const QUALIFIED_MACOS_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_BROKER_SESSIONS: usize = 1_024;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 #[cfg(unix)]
@@ -212,7 +218,7 @@ fn spawn_managed(command: Command) -> io::Result<Box<dyn ManagedChild>> {
         .map(|child| Box::new(WindowsJobChild(child)) as _)
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn fixed_command(collector: &'static str, program: &str, args: &[&str]) -> Observation {
     fixed_command_with_policy(collector, program, args, COMMAND_TIMEOUT, None)
 }
@@ -233,7 +239,7 @@ enum FixedCommandFailure {
 }
 
 impl FixedCommandFailure {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     const fn message(self) -> &'static str {
         match self {
             Self::Unavailable => "collector unavailable: command failed",
@@ -328,7 +334,7 @@ fn run_fixed_command(
     })
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn fixed_command_with_policy(
     collector: &'static str,
     program: &str,
@@ -691,6 +697,348 @@ async fn collect_windows_p0_inventory() -> Result<Vec<Observation>, String> {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn failed_macos_observation(collector: &'static str, truncated: bool) -> Observation {
+    Observation {
+        collector,
+        trust: "observed-untrusted",
+        output: "collector unavailable: macOS P0 evidence failed closed".to_owned(),
+        success: false,
+        truncated,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn validated_macos_output(collector: &'static str, output: String) -> Observation {
+    if output.len() <= QUALIFIED_MACOS_MAX_OUTPUT_BYTES
+        && macos_resident::validate_projection(collector, &output).is_ok()
+    {
+        Observation {
+            collector,
+            trust: "observed-untrusted",
+            output,
+            success: true,
+            truncated: false,
+        }
+    } else {
+        failed_macos_observation(collector, output.len() > QUALIFIED_MACOS_MAX_OUTPUT_BYTES)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn complete_macos_command(
+    result: Result<FixedCommandOutput, FixedCommandFailure>,
+) -> Result<FixedCommandOutput, bool> {
+    match result {
+        Ok(output) if output.exit_code == 0 && output.stderr.trim().is_empty() => Ok(output),
+        Ok(_) => Err(false),
+        Err(error) => Err(error.truncated()),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn collect_macos_system() -> Observation {
+    let output = complete_macos_command(run_fixed_command(
+        macos_resident::SW_VERS,
+        &macos_resident::SW_VERS_ARGS,
+        macos_resident::STANDARD_TIMEOUT,
+        QUALIFIED_MACOS_MAX_OUTPUT_BYTES,
+    ));
+    match output.and_then(|output| {
+        macos_resident::normalize_system_version(&output.stdout).map_err(|_| false)
+    }) {
+        Ok(output) => Observation {
+            collector: "macos.system",
+            trust: "observed-untrusted",
+            output,
+            success: true,
+            truncated: false,
+        },
+        Err(truncated) => failed_macos_observation("macos.system", truncated),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn collect_macos_storage() -> (Observation, Observation) {
+    let result = complete_macos_command(run_fixed_command(
+        macos_resident::SYSTEM_PROFILER,
+        &macos_resident::SYSTEM_PROFILER_ARGS,
+        macos_resident::STORAGE_TIMEOUT,
+        QUALIFIED_MACOS_MAX_OUTPUT_BYTES,
+    ));
+    match result {
+        Ok(output) => {
+            let storage = macos_resident::normalize_storage(&output.stdout)
+                .map(|output| validated_macos_output("macos.storage.inventory", output))
+                .unwrap_or_else(|_| failed_macos_observation("macos.storage.inventory", false));
+            let identity = macos_resident::derive_storage_identity(&output.stdout)
+                .map(|output| Observation {
+                    collector: "macos.storage.identity",
+                    trust: "observed-untrusted",
+                    output,
+                    success: true,
+                    truncated: false,
+                })
+                .unwrap_or_else(|_| failed_macos_observation("macos.storage.identity", false));
+            (storage, identity)
+        }
+        Err(truncated) => (
+            failed_macos_observation("macos.storage.inventory", truncated),
+            failed_macos_observation("macos.storage.identity", truncated),
+        ),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn collect_macos_apfs() -> Observation {
+    let (list, root) = thread::scope(|scope| {
+        let list = scope.spawn(|| {
+            run_fixed_command(
+                macos_resident::DISKUTIL,
+                &macos_resident::APFS_LIST_ARGS,
+                macos_resident::STANDARD_TIMEOUT,
+                QUALIFIED_MACOS_MAX_OUTPUT_BYTES,
+            )
+        });
+        let root = scope.spawn(|| {
+            run_fixed_command(
+                macos_resident::DISKUTIL,
+                &macos_resident::ROOT_INFO_ARGS,
+                macos_resident::STANDARD_TIMEOUT,
+                QUALIFIED_MACOS_MAX_OUTPUT_BYTES,
+            )
+        });
+        (
+            list.join().unwrap_or(Err(FixedCommandFailure::Unavailable)),
+            root.join().unwrap_or(Err(FixedCommandFailure::Unavailable)),
+        )
+    });
+    let normalized = complete_macos_command(list).and_then(|list| {
+        complete_macos_command(root).and_then(|root| {
+            macos_resident::normalize_apfs(list.stdout.as_bytes(), root.stdout.as_bytes())
+                .map_err(|_| false)
+        })
+    });
+    match normalized {
+        Ok(output) => validated_macos_output("macos.apfs.capacity", output),
+        Err(truncated) => failed_macos_observation("macos.apfs.capacity", truncated),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn collect_macos_launchd() -> Observation {
+    let normalized = complete_macos_command(run_fixed_command(
+        macos_resident::LAUNCHCTL,
+        &macos_resident::LAUNCHCTL_ARGS,
+        macos_resident::STANDARD_TIMEOUT,
+        QUALIFIED_MACOS_MAX_OUTPUT_BYTES,
+    ))
+    .and_then(|output| macos_resident::normalize_launchd_user(&output.stdout).map_err(|_| false));
+    match normalized {
+        Ok(output) => validated_macos_output("macos.launchd.state", output),
+        Err(truncated) => failed_macos_observation("macos.launchd.state", truncated),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn collect_macos_network() -> Observation {
+    let (nwi, route, dns) = thread::scope(|scope| {
+        let nwi = scope.spawn(|| {
+            run_fixed_command(
+                macos_resident::SCUTIL,
+                &macos_resident::NWI_ARGS,
+                macos_resident::STANDARD_TIMEOUT,
+                QUALIFIED_MACOS_MAX_OUTPUT_BYTES,
+            )
+        });
+        let route = scope.spawn(|| {
+            run_fixed_command(
+                macos_resident::ROUTE,
+                &macos_resident::ROUTE_ARGS,
+                macos_resident::STANDARD_TIMEOUT,
+                QUALIFIED_MACOS_MAX_OUTPUT_BYTES,
+            )
+        });
+        let dns = scope.spawn(|| {
+            run_fixed_command(
+                macos_resident::SCUTIL,
+                &macos_resident::DNS_ARGS,
+                macos_resident::STANDARD_TIMEOUT,
+                QUALIFIED_MACOS_MAX_OUTPUT_BYTES,
+            )
+        });
+        (
+            nwi.join().unwrap_or(Err(FixedCommandFailure::Unavailable)),
+            route
+                .join()
+                .unwrap_or(Err(FixedCommandFailure::Unavailable)),
+            dns.join().unwrap_or(Err(FixedCommandFailure::Unavailable)),
+        )
+    });
+    let normalized = complete_macos_command(nwi).and_then(|nwi| {
+        complete_macos_command(dns).and_then(|dns| match route {
+            Ok(route) if matches!(route.exit_code, 0 | 1) => {
+                macos_resident::normalize_network(&nwi.stdout, route.exit_code, &dns.stdout)
+                    .map_err(|_| false)
+            }
+            Ok(_) => Err(false),
+            Err(error) => Err(error.truncated()),
+        })
+    });
+    match normalized {
+        Ok(output) => validated_macos_output("macos.network.state", output),
+        Err(truncated) => failed_macos_observation("macos.network.state", truncated),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn collect_macos_updates() -> Observation {
+    match macos_resident::updates_unqualified_projection() {
+        Ok(output) => validated_macos_output("macos.software-update.state", output),
+        Err(()) => failed_macos_observation("macos.software-update.state", false),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn collect_macos_events() -> Observation {
+    match macos_resident::events_unqualified_projection() {
+        Ok(output) => validated_macos_output("macos.system-events.summary", output),
+        Err(()) => failed_macos_observation("macos.system-events.summary", false),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn collect_macos_startup() -> Observation {
+    let normalized = complete_macos_command(run_fixed_command(
+        macos_resident::SYSCTL,
+        &macos_resident::SAFE_BOOT_ARGS,
+        macos_resident::STANDARD_TIMEOUT,
+        QUALIFIED_MACOS_MAX_OUTPUT_BYTES,
+    ))
+    .and_then(|safe_boot| macos_resident::normalize_startup(&safe_boot.stdout).map_err(|_| false));
+    match normalized {
+        Ok(output) => validated_macos_output("macos.startup.state", output),
+        Err(truncated) => failed_macos_observation("macos.startup.state", truncated),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn collect_macos_snapshots() -> Observation {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|_| false);
+    let normalized = now.and_then(|now| {
+        complete_macos_command(run_fixed_command(
+            macos_resident::TMUTIL,
+            &macos_resident::SNAPSHOT_ARGS,
+            macos_resident::STANDARD_TIMEOUT,
+            QUALIFIED_MACOS_MAX_OUTPUT_BYTES,
+        ))
+        .and_then(|output| {
+            macos_resident::normalize_snapshots(&output.stdout, now).map_err(|_| false)
+        })
+    });
+    match normalized {
+        Ok(output) => validated_macos_output("macos.snapshots.inventory", output),
+        Err(truncated) => failed_macos_observation("macos.snapshots.inventory", truncated),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn collect_macos_identity_observations() -> Vec<Observation> {
+    let (system, (_, identity)) = thread::scope(|scope| {
+        let system = scope.spawn(collect_macos_system);
+        let storage = scope.spawn(collect_macos_storage);
+        (
+            system
+                .join()
+                .unwrap_or_else(|_| failed_macos_observation("macos.system", false)),
+            storage.join().unwrap_or_else(|_| {
+                (
+                    failed_macos_observation("macos.storage.inventory", false),
+                    failed_macos_observation("macos.storage.identity", false),
+                )
+            }),
+        )
+    });
+    vec![system, identity]
+}
+
+#[cfg(target_os = "macos")]
+fn collect_macos_p0_observations() -> Vec<Observation> {
+    thread::scope(|scope| {
+        let system = scope.spawn(collect_macos_system);
+        let storage = scope.spawn(collect_macos_storage);
+        let apfs = scope.spawn(collect_macos_apfs);
+        let launchd = scope.spawn(collect_macos_launchd);
+        let network = scope.spawn(collect_macos_network);
+        let updates = scope.spawn(collect_macos_updates);
+        let events = scope.spawn(collect_macos_events);
+        let startup = scope.spawn(collect_macos_startup);
+        let snapshots = scope.spawn(collect_macos_snapshots);
+        let system = system
+            .join()
+            .unwrap_or_else(|_| failed_macos_observation("macos.system", false));
+        let (storage, identity) = storage.join().unwrap_or_else(|_| {
+            (
+                failed_macos_observation("macos.storage.inventory", false),
+                failed_macos_observation("macos.storage.identity", false),
+            )
+        });
+        vec![
+            system,
+            storage,
+            apfs.join()
+                .unwrap_or_else(|_| failed_macos_observation("macos.apfs.capacity", false)),
+            launchd
+                .join()
+                .unwrap_or_else(|_| failed_macos_observation("macos.launchd.state", false)),
+            network
+                .join()
+                .unwrap_or_else(|_| failed_macos_observation("macos.network.state", false)),
+            updates
+                .join()
+                .unwrap_or_else(|_| failed_macos_observation("macos.software-update.state", false)),
+            events
+                .join()
+                .unwrap_or_else(|_| failed_macos_observation("macos.system-events.summary", false)),
+            startup
+                .join()
+                .unwrap_or_else(|_| failed_macos_observation("macos.startup.state", false)),
+            snapshots
+                .join()
+                .unwrap_or_else(|_| failed_macos_observation("macos.snapshots.inventory", false)),
+            identity,
+        ]
+    })
+}
+
+#[tauri::command]
+async fn collect_macos_p0_inventory() -> Result<Vec<Observation>, String> {
+    #[cfg(target_os = "macos")]
+    {
+        tauri::async_runtime::spawn_blocking(|| {
+            let started = Instant::now();
+            let observations = collect_macos_p0_observations();
+            if started.elapsed() > macos_resident::P0_WALL_CLOCK_BUDGET {
+                return Err(
+                    "La raccolta macOS ha superato il budget P0 di 90 secondi; nessuna diagnosi è stata formulata."
+                        .to_owned(),
+                );
+            }
+            Ok(observations)
+        })
+        .await
+        .map_err(|_| "La raccolta macOS non è stata completata.".to_owned())?
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("Il corpus macOS è disponibile solo su sistemi macOS.".to_owned())
+    }
+}
+
 fn collect_local_inventory_sync() -> Vec<Observation> {
     let mut observations: Vec<Observation> = Vec::new();
     #[cfg(target_os = "linux")]
@@ -758,23 +1106,7 @@ fn collect_local_inventory_sync() -> Vec<Observation> {
     }
     #[cfg(target_os = "macos")]
     {
-        observations.push(fixed_command("system.hostname", "/bin/hostname", &[]));
-        observations.push(fixed_command("macos.system", "/usr/bin/sw_vers", &[]));
-        observations.push(fixed_command(
-            "macos.disks",
-            "/usr/sbin/diskutil",
-            &["list", "-plist"],
-        ));
-        observations.push(fixed_command(
-            "macos.network",
-            "/usr/sbin/networksetup",
-            &["-listallhardwareports"],
-        ));
-        observations.push(fixed_command(
-            "macos.storage.identity",
-            "/usr/sbin/ioreg",
-            &["-r", "-c", "IOBlockStorageDevice", "-l"],
-        ));
+        observations.extend(collect_macos_identity_observations());
     }
     observations
 }
@@ -851,6 +1183,70 @@ fn diagnose_linux_p0(evidence: Vec<NativeDiagnosticEvidence>) -> Result<serde_js
             drop((document.id, document.collector, document.content));
         }
         Err("Il corpus Linux è disponibile solo su sistemi Linux.".to_owned())
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn diagnose_macos_documents(
+    evidence: Vec<NativeDiagnosticEvidence>,
+) -> Result<serde_json::Value, String> {
+    use kernaid_macos_pack::{
+        EvidenceInput, MAX_INPUT_BYTES, MacosP0Inputs, diagnose_macos_p0 as evaluate_macos_p0,
+        proposal_from_report,
+    };
+    use std::collections::BTreeMap;
+
+    if evidence.len() != macos_resident::COLLECTORS.len() {
+        return Err("Il corpus macOS richiede tutte le otto evidenze P0.".to_owned());
+    }
+    let mut documents = BTreeMap::new();
+    for document in evidence {
+        if !macos_resident::COLLECTORS.contains(&document.collector.as_str())
+            || document.content.len() > MAX_INPUT_BYTES
+            || documents
+                .insert(document.collector.clone(), document)
+                .is_some()
+        {
+            return Err("Le evidenze macOS non sono valide.".to_owned());
+        }
+    }
+    let input = |collector: &str| -> Result<EvidenceInput<'_>, String> {
+        let document = documents
+            .get(collector)
+            .ok_or_else(|| "Le evidenze macOS sono incomplete.".to_owned())?;
+        Ok(EvidenceInput {
+            id: &document.id,
+            body: document.content.as_bytes(),
+        })
+    };
+    let report = evaluate_macos_p0(MacosP0Inputs {
+        storage: input("macos.storage.inventory")?,
+        apfs: input("macos.apfs.capacity")?,
+        launchd: input("macos.launchd.state")?,
+        network: input("macos.network.state")?,
+        updates: input("macos.software-update.state")?,
+        events: input("macos.system-events.summary")?,
+        startup: input("macos.startup.state")?,
+        snapshots: input("macos.snapshots.inventory")?,
+    })
+    .map_err(|_| "Una evidenza macOS è malformata o incompleta.".to_owned())?;
+    serde_json::to_value(proposal_from_report(&report))
+        .map_err(|_| "La diagnosi macOS non è serializzabile.".to_owned())
+}
+
+#[tauri::command]
+fn diagnose_macos_p0(evidence: Vec<NativeDiagnosticEvidence>) -> Result<serde_json::Value, String> {
+    #[cfg(target_os = "macos")]
+    {
+        diagnose_macos_documents(evidence)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        for document in evidence {
+            drop((document.id, document.collector, document.content));
+        }
+        Err("Il corpus macOS è disponibile solo su sistemi macOS.".to_owned())
     }
 }
 
@@ -1022,8 +1418,10 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             collect_local_inventory,
+            collect_macos_p0_inventory,
             collect_windows_p0_inventory,
             diagnose_linux_p0,
+            diagnose_macos_p0,
             diagnose_windows_p0,
             authorize_observe,
             secure_runtime_status,
@@ -1038,6 +1436,52 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn macos_fixture_evidence() -> Vec<NativeDiagnosticEvidence> {
+        let documents = [
+            (
+                "macos.storage.inventory",
+                include_str!("../../../../packs/macos/fixtures/diagnostics/healthy/storage.json"),
+            ),
+            (
+                "macos.apfs.capacity",
+                include_str!("../../../../packs/macos/fixtures/diagnostics/healthy/apfs.json"),
+            ),
+            (
+                "macos.launchd.state",
+                include_str!("../../../../packs/macos/fixtures/diagnostics/healthy/launchd.json"),
+            ),
+            (
+                "macos.network.state",
+                include_str!("../../../../packs/macos/fixtures/diagnostics/healthy/network.json"),
+            ),
+            (
+                "macos.software-update.state",
+                include_str!("../../../../packs/macos/fixtures/diagnostics/healthy/updates.json"),
+            ),
+            (
+                "macos.system-events.summary",
+                include_str!("../../../../packs/macos/fixtures/diagnostics/healthy/events.json"),
+            ),
+            (
+                "macos.startup.state",
+                include_str!("../../../../packs/macos/fixtures/diagnostics/healthy/startup.json"),
+            ),
+            (
+                "macos.snapshots.inventory",
+                include_str!("../../../../packs/macos/fixtures/diagnostics/healthy/snapshots.json"),
+            ),
+        ];
+        documents
+            .into_iter()
+            .enumerate()
+            .map(|(index, (collector, content))| NativeDiagnosticEvidence {
+                id: format!("E-MACOS-{}", index + 1),
+                collector: collector.to_owned(),
+                content: content.to_owned(),
+            })
+            .collect()
+    }
 
     fn windows_fixture_evidence() -> Vec<NativeDiagnosticEvidence> {
         let documents = [
@@ -1109,7 +1553,11 @@ mod tests {
 
     #[test]
     fn output_limits_are_parameterized_at_both_security_boundaries() {
-        for maximum in [DEFAULT_MAX_OUTPUT_BYTES, QUALIFIED_WINDOWS_MAX_OUTPUT_BYTES] {
+        for maximum in [
+            DEFAULT_MAX_OUTPUT_BYTES,
+            QUALIFIED_WINDOWS_MAX_OUTPUT_BYTES,
+            QUALIFIED_MACOS_MAX_OUTPUT_BYTES,
+        ] {
             let input = vec![b'x'; maximum + 1];
             let reader = read_bounded(std::io::Cursor::new(input), maximum);
             let bounded = received_output(Some(&reader));
@@ -1260,5 +1708,101 @@ mod tests {
         let mut duplicate = windows_fixture_evidence();
         duplicate[10].collector = duplicate[9].collector.clone();
         assert!(diagnose_windows_documents(duplicate).is_err());
+    }
+
+    #[test]
+    fn resident_macos_diagnosis_preserves_dynamic_evidence_ids() {
+        let proposal = diagnose_macos_documents(macos_fixture_evidence())
+            .expect("complete macOS evidence must diagnose");
+        let ids = proposal["evidenceIds"]
+            .as_array()
+            .expect("proposal evidence IDs");
+        assert_eq!(ids.len(), 8);
+        assert_eq!(ids[0], "E-MACOS-1");
+        assert_eq!(ids[7], "E-MACOS-8");
+        assert!(
+            proposal["diagnosis"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not a health certification")
+        );
+    }
+
+    #[test]
+    fn resident_macos_diagnosis_rejects_partial_duplicate_and_unknown_collectors() {
+        let mut partial = macos_fixture_evidence();
+        partial.pop();
+        assert!(diagnose_macos_documents(partial).is_err());
+
+        let mut duplicate = macos_fixture_evidence();
+        duplicate[7].collector = duplicate[6].collector.clone();
+        assert!(diagnose_macos_documents(duplicate).is_err());
+
+        let mut unknown = macos_fixture_evidence();
+        unknown[0].collector = "macos.command.arbitrary".to_owned();
+        assert!(diagnose_macos_documents(unknown).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn resident_macos_native_runtime_probe() {
+        use std::collections::BTreeSet;
+
+        let quick = collect_macos_identity_observations();
+        assert_eq!(quick.len(), 2);
+        assert!(quick.iter().all(|item| item.success && !item.truncated));
+        assert_eq!(
+            quick
+                .iter()
+                .map(|item| item.collector)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["macos.storage.identity", "macos.system"])
+        );
+
+        let observations = collect_macos_p0_observations();
+        assert_eq!(observations.len(), macos_resident::COLLECTORS.len() + 2);
+        assert!(
+            observations
+                .iter()
+                .all(|item| item.success && !item.truncated)
+        );
+        let mut expected = macos_resident::COLLECTORS
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        expected.extend(["macos.storage.identity", "macos.system"]);
+        assert_eq!(
+            observations
+                .iter()
+                .map(|item| item.collector)
+                .collect::<BTreeSet<_>>(),
+            expected
+        );
+
+        let quick_identity = quick
+            .iter()
+            .find(|item| item.collector == "macos.storage.identity")
+            .expect("quick storage identity");
+        let diagnostic_identity = observations
+            .iter()
+            .find(|item| item.collector == "macos.storage.identity")
+            .expect("diagnostic storage identity");
+        assert_eq!(quick_identity.output, diagnostic_identity.output);
+
+        let evidence = macos_resident::COLLECTORS
+            .into_iter()
+            .enumerate()
+            .map(|(index, collector)| {
+                let observation = observations
+                    .iter()
+                    .find(|item| item.collector == collector)
+                    .expect("exact native P0 collector");
+                NativeDiagnosticEvidence {
+                    id: format!("E-MACOS-NATIVE-{}", index + 1),
+                    collector: collector.to_owned(),
+                    content: observation.output.clone(),
+                }
+            })
+            .collect();
+        assert!(diagnose_macos_documents(evidence).is_ok());
     }
 }

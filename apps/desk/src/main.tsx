@@ -10,11 +10,14 @@ import type {
 import {
   authorizeObserve,
   collectLocalInventory,
+  collectMacosP0Inventory,
   collectWindowsP0Inventory,
   getSecureRuntimeStatus,
   hasLocalCollector,
   initializeDeviceIdentity,
   isNativeIdentityCollector,
+  nativeObservationContentType,
+  nativeObservationSummary,
   isNative,
   isRescueRuntime,
   NativeAuditSink,
@@ -202,6 +205,9 @@ function App() {
           const windowsIdentity = currentIdentity.filter(
             (item) => item.collector === "windows.storage.identity",
           );
+          const macosIdentity = currentIdentity.filter(
+            (item) => item.collector === "macos.storage.identity",
+          );
           if (isNative() && windowsIdentity.length > 0) {
             if (
               windowsIdentity.length !== 1 ||
@@ -225,6 +231,30 @@ function App() {
             )
               throw new Error(
                 "Il target Windows è cambiato durante la raccolta: diagnosi annullata.",
+              );
+          } else if (isNative() && macosIdentity.length > 0) {
+            if (
+              macosIdentity.length !== 1 ||
+              macosIdentity.some((item) => !item.success || item.truncated)
+            )
+              throw new Error(
+                "Identità storage macOS rapida non disponibile: diagnosi bloccata.",
+              );
+            setStatus(
+              "Raccolta macOS P0 in parallelo (otto proiezioni native, sola lettura, budget 90 s)…",
+            );
+            currentNativeEvidence = await collectMacosP0Inventory();
+            const diagnosticIdentity = currentNativeEvidence.filter(
+              (item) => item.collector === "macos.storage.identity",
+            );
+            if (
+              diagnosticIdentity.length !== 1 ||
+              !diagnosticIdentity[0]?.success ||
+              diagnosticIdentity[0].truncated ||
+              diagnosticIdentity[0].output !== macosIdentity[0]?.output
+            )
+              throw new Error(
+                "Il target storage macOS è cambiato durante la raccolta: diagnosi annullata.",
               );
           } else currentNativeEvidence = currentIdentity;
         } catch (error) {
@@ -281,13 +311,9 @@ function App() {
             ...(await activeDriver.requestEvidence(session.id, {
               collector: item.collector,
               target: isNative() ? "local-machine" : "rescue-runtime",
-              summary: item.success
-                ? item.collector === "windows.sfc.verify-only"
-                  ? "Evidenza P0 esplicita: SFC non eseguito"
-                  : "Comando di inventario completato"
-                : "Comando di inventario non disponibile",
+              summary: nativeObservationSummary(item),
               observedContent: item.output,
-              contentType: "text/plain",
+              contentType: nativeObservationContentType(item),
             })),
           );
         if (activeRescueSelection !== undefined)

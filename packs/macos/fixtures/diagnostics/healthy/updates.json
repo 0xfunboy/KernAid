@@ -1,5 +1,7 @@
 {
   "schemaVersion": "1.0",
   "queryComplete": true,
+  "executionState": "not-run-unqualified",
+  "queryState": "unavailable-stale-cache",
   "pending": []
 }

@@ -1,0 +1,7 @@
+Network information
+
+IPv4 network interface information
+     en0 : flags      : 0x5 (IPv4,DNS)
+   REACH : flags 0x00000002 (Reachable)
+
+Network interfaces: en0 utun4

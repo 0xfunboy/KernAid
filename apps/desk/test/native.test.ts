@@ -7,6 +7,8 @@ import {
   collectLocalInventory,
   fingerprintNativeTarget,
   fingerprintRescueTarget,
+  nativeObservationContentType,
+  nativeObservationSummary,
   parseNativeObservations,
   parseRescueTargetScan,
   parseRescueTargetSelection,
@@ -70,6 +72,69 @@ test("native inventory requires explicit bounded truncation state", () => {
       },
     ])[0]?.output.length,
     64 * 1024 + 1,
+  );
+  assert.deepEqual(
+    parseNativeObservations([
+      {
+        ...valid,
+        collector: "macos.launchd.state",
+        output: "x".repeat(64 * 1024 + 1),
+      },
+    ])[0]?.output.length,
+    64 * 1024 + 1,
+  );
+  assert.throws(
+    () =>
+      parseNativeObservations([
+        {
+          ...valid,
+          collector: "macos.launchd.state",
+          output: "x".repeat(1024 * 1024 + 1),
+        },
+      ]),
+    /Inventario nativo non valido/,
+  );
+});
+
+test("failed macOS observations are never mislabeled as JSON", () => {
+  const observation = {
+    collector: "macos.system-events.summary",
+    trust: "observed-untrusted" as const,
+    output: "collector unavailable: macOS P0 evidence failed closed",
+    success: false,
+    truncated: false,
+  };
+  assert.equal(nativeObservationContentType(observation), "text/plain");
+  assert.equal(
+    nativeObservationSummary(observation),
+    "Comando di inventario non disponibile",
+  );
+  assert.equal(
+    nativeObservationContentType({
+      ...observation,
+      output: '{"schemaVersion":"1.0"}',
+      success: true,
+    }),
+    "application/json",
+  );
+  assert.equal(
+    nativeObservationSummary({
+      ...observation,
+      collector: "macos.system-events.summary",
+      output: '{"schemaVersion":"1.0","executionState":"not-run-unqualified"}',
+      success: true,
+    }),
+    "Scope P0 esplicitamente non eseguito perché non qualificato",
+  );
+  assert.equal(
+    nativeObservationSummary({
+      ...observation,
+      collector: "macos.startup.state",
+      output:
+        '{"schemaVersion":"1.0","safeModeQueryState":"complete","loginItemsQueryState":"not-run-unqualified"}',
+      success: true,
+    }),
+    "Safe mode verificato; login e background item non eseguiti perché non qualificati",
   );
 });
 
@@ -736,6 +801,132 @@ test("partial native Windows evidence fails closed instead of using generic rule
     assert.match(proposal.diagnosis, /Diagnosi Windows incompleta/);
     assert.equal(proposal.confidence, 0.1);
     assert.ok(proposal.requestedEvidence.includes("windows.event-log.window"));
+  } finally {
+    restoreProperty("window", originalWindow);
+  }
+});
+
+test("partial native macOS evidence fails closed instead of using generic rules", async () => {
+  const evidence = [
+    {
+      evidence: {
+        schemaVersion: "1.0" as const,
+        id: "E-MACOS-1",
+        collector: "macos.storage.inventory",
+        target: "local-machine",
+        capturedAt: "2026-08-01T00:00:00.000Z",
+        contentType: "application/json",
+        sha256: "1".repeat(64),
+        sensitivity: "system" as const,
+        trust: "observed-untrusted" as const,
+        summary: "Comando di inventario completato",
+        blobRef: `sha256:${"1".repeat(64)}`,
+      },
+      content: '{"schemaVersion":"1.0","queryComplete":true,"devices":[]}',
+    },
+  ];
+  const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: { __TAURI_INTERNALS__: {} },
+  });
+  try {
+    const proposal = await new PlatformOfflineRulesProvider().diagnose(
+      "Analizza il sistema",
+      evidence,
+    );
+    assert.match(proposal.diagnosis, /Diagnosi macOS incompleta/);
+    assert.equal(proposal.confidence, 0.1);
+    assert.ok(proposal.requestedEvidence.includes("macos.apfs.capacity"));
+  } finally {
+    restoreProperty("window", originalWindow);
+  }
+});
+
+test("macOS limited projections require their exact scope summary", async () => {
+  const evidence = {
+    evidence: {
+      schemaVersion: "1.0" as const,
+      id: "E-MACOS-UPDATES",
+      collector: "macos.software-update.state",
+      target: "local-machine",
+      capturedAt: "2026-08-01T00:00:00.000Z",
+      contentType: "application/json",
+      sha256: "1".repeat(64),
+      sensitivity: "system" as const,
+      trust: "observed-untrusted" as const,
+      summary: "Scope P0 esplicitamente non eseguito perché non qualificato",
+      blobRef: `sha256:${"1".repeat(64)}`,
+    },
+    content:
+      '{"schemaVersion":"1.0","queryComplete":true,"executionState":"not-run-unqualified","queryState":"unavailable-stale-cache","pending":[]}',
+  };
+  const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: { __TAURI_INTERNALS__: {} },
+  });
+  try {
+    const provider = new PlatformOfflineRulesProvider();
+    const explicit = await provider.diagnose("Analizza il sistema", [evidence]);
+    assert.ok(
+      !explicit.requestedEvidence.includes("macos.software-update.state"),
+    );
+    const mislabeled = await provider.diagnose("Analizza il sistema", [
+      {
+        ...evidence,
+        evidence: {
+          ...evidence.evidence,
+          summary: "Comando di inventario completato",
+        },
+      },
+    ]);
+    assert.ok(
+      mislabeled.requestedEvidence.includes("macos.software-update.state"),
+    );
+    const wrongMime = await provider.diagnose("Analizza il sistema", [
+      {
+        ...evidence,
+        evidence: {
+          ...evidence.evidence,
+          contentType: "text/plain" as const,
+        },
+      },
+    ]);
+    assert.ok(
+      wrongMime.requestedEvidence.includes("macos.software-update.state"),
+    );
+
+    const startup = {
+      ...evidence,
+      evidence: {
+        ...evidence.evidence,
+        id: "E-MACOS-STARTUP",
+        collector: "macos.startup.state",
+        summary:
+          "Safe mode verificato; login e background item non eseguiti perché non qualificati",
+      },
+      content:
+        '{"schemaVersion":"1.0","queryComplete":true,"safeModeQueryState":"complete","loginItemsQueryState":"not-run-unqualified","backgroundItemsQueryState":"not-run-unqualified","safeMode":false,"thirdPartyLoginItemsEnabled":null,"backgroundItemsBlocked":null}',
+    };
+    const partialStartup = await provider.diagnose("Analizza il sistema", [
+      startup,
+    ]);
+    assert.ok(
+      !partialStartup.requestedEvidence.includes("macos.startup.state"),
+    );
+    const mislabeledStartup = await provider.diagnose("Analizza il sistema", [
+      {
+        ...startup,
+        evidence: {
+          ...startup.evidence,
+          summary: "Comando di inventario completato",
+        },
+      },
+    ]);
+    assert.ok(
+      mislabeledStartup.requestedEvidence.includes("macos.startup.state"),
+    );
   } finally {
     restoreProperty("window", originalWindow);
   }

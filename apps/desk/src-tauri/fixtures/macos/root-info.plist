@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>DeviceIdentifier</key><string>disk3s1</string>
+  <key>APFSContainerReference</key><string>disk3</string>
+  <key>ContainerTotalSpace</key><integer>494384795648</integer>
+  <key>ContainerFreeSpace</key><integer>187904819200</integer>
+  <key>PurgeableSpace</key><integer>12884901888</integer>
+  <key>FileVault</key><true/>
+</dict>
+</plist>

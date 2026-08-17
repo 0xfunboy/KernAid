@@ -27,7 +27,7 @@ const RESCUE_TARGET_API_VERSION = "kernaid.dev/rescue-targets/v1alpha1";
 const MAX_INVENTORY_RESPONSE_BYTES = 2 * 1024 * 1024;
 const MAX_RESCUE_TARGET_RESPONSE_BYTES = 64 * 1024;
 const MAX_NATIVE_OBSERVATION_BYTES = 64 * 1024;
-const MAX_QUALIFIED_WINDOWS_OBSERVATION_BYTES = 1024 * 1024;
+const MAX_QUALIFIED_NATIVE_OBSERVATION_BYTES = 1024 * 1024;
 const DISK_REF = /^disk-[1-9][0-9]{0,2}$/u;
 const VOLUME_REF = /^disk-[1-9][0-9]{0,2}\/volume-[1-9][0-9]{0,2}$/u;
 const PUBLIC_TOKEN = /^[a-z0-9][a-z0-9-]{0,63}$/u;
@@ -56,11 +56,31 @@ const WINDOWS_P0_COLLECTORS = [
   "windows.boot.state",
   "windows.volumes.state",
 ] as const;
-const QUALIFIED_LARGE_WINDOWS_COLLECTORS = new Set<string>([
+const MACOS_P0_COLLECTORS = [
+  "macos.storage.inventory",
+  "macos.apfs.capacity",
+  "macos.launchd.state",
+  "macos.network.state",
+  "macos.software-update.state",
+  "macos.system-events.summary",
+  "macos.startup.state",
+  "macos.snapshots.inventory",
+] as const;
+const QUALIFIED_LARGE_NATIVE_COLLECTORS = new Set<string>([
   ...WINDOWS_P0_COLLECTORS,
   "windows.storage.identity",
+  ...MACOS_P0_COLLECTORS,
+  "macos.storage.identity",
 ]);
 const SFC_NOT_RUN_SUMMARY = "Evidenza P0 esplicita: SFC non eseguito";
+const MACOS_NOT_RUN_SUMMARY =
+  "Scope P0 esplicitamente non eseguito perché non qualificato";
+const MACOS_PARTIAL_STARTUP_SUMMARY =
+  "Safe mode verificato; login e background item non eseguiti perché non qualificati";
+const MACOS_NOT_RUN_COLLECTORS = new Set<string>([
+  "macos.software-update.state",
+  "macos.system-events.summary",
+]);
 
 export interface NativeObservation {
   collector: string;
@@ -219,6 +239,12 @@ export async function collectWindowsP0Inventory(): Promise<
   return parseNativeObservations(await invoke("collect_windows_p0_inventory"));
 }
 
+export async function collectMacosP0Inventory(): Promise<NativeObservation[]> {
+  if (!isNative())
+    throw new Error("La raccolta P0 macOS richiede KernAid Resident.");
+  return parseNativeObservations(await invoke("collect_macos_p0_inventory"));
+}
+
 export function isRescueRuntime(): boolean {
   return hasLocalCollector() && !isNative();
 }
@@ -291,8 +317,8 @@ export function parseNativeObservations(value: unknown): NativeObservation[] {
       item.trust !== "observed-untrusted" ||
       typeof item.output !== "string" ||
       new TextEncoder().encode(item.output).byteLength >
-        (QUALIFIED_LARGE_WINDOWS_COLLECTORS.has(item.collector)
-          ? MAX_QUALIFIED_WINDOWS_OBSERVATION_BYTES
+        (QUALIFIED_LARGE_NATIVE_COLLECTORS.has(item.collector)
+          ? MAX_QUALIFIED_NATIVE_OBSERVATION_BYTES
           : MAX_NATIVE_OBSERVATION_BYTES) ||
       typeof item.success !== "boolean" ||
       typeof item.truncated !== "boolean" ||
@@ -301,6 +327,27 @@ export function parseNativeObservations(value: unknown): NativeObservation[] {
       throw new Error("Inventario nativo non valido.");
     return item as unknown as NativeObservation;
   });
+}
+
+export function nativeObservationContentType(
+  observation: NativeObservation,
+): "application/json" | "text/plain" {
+  return observation.success && observation.collector.startsWith("macos.")
+    ? "application/json"
+    : "text/plain";
+}
+
+export function nativeObservationSummary(
+  observation: NativeObservation,
+): string {
+  if (!observation.success) return "Comando di inventario non disponibile";
+  if (observation.collector === "windows.sfc.verify-only")
+    return SFC_NOT_RUN_SUMMARY;
+  if (MACOS_NOT_RUN_COLLECTORS.has(observation.collector))
+    return MACOS_NOT_RUN_SUMMARY;
+  if (observation.collector === "macos.startup.state")
+    return MACOS_PARTIAL_STARTUP_SUMMARY;
+  return "Comando di inventario completato";
 }
 
 export function parseRescueTargetScan(value: unknown): RescueTargetScan {
@@ -739,6 +786,11 @@ export class PlatformOfflineRulesProvider implements Provider {
         item.evidence.collector as (typeof WINDOWS_P0_COLLECTORS)[number],
       ),
     );
+    const macosEvidence = evidence.filter((item) =>
+      MACOS_P0_COLLECTORS.includes(
+        item.evidence.collector as (typeof MACOS_P0_COLLECTORS)[number],
+      ),
+    );
 
     // Rescue observations remain metadata-only until a dedicated read-only
     // filesystem inspector is qualified. Never present appliance inventory or
@@ -835,6 +887,46 @@ export class PlatformOfflineRulesProvider implements Provider {
       );
     }
 
+    if (macosEvidence.length > 0) {
+      const selected = MACOS_P0_COLLECTORS.map((collector) =>
+        evidence.find((item) => item.evidence.collector === collector),
+      );
+      const complete =
+        selected.every((item) => item !== undefined) &&
+        MACOS_P0_COLLECTORS.every(
+          (collector) =>
+            evidence.filter((item) => item.evidence.collector === collector)
+              .length === 1,
+        );
+      const successful = selected.every((item) =>
+        isSuccessfulMacosEvidence(item),
+      );
+      if (!complete || !successful) {
+        const requestedEvidence = MACOS_P0_COLLECTORS.filter((collector) => {
+          const matches = evidence.filter(
+            (item) => item.evidence.collector === collector,
+          );
+          return matches.length !== 1 || !isSuccessfulMacosEvidence(matches[0]);
+        });
+        return parseDiagnosisProposal({
+          schemaVersion: "1.0",
+          diagnosis:
+            "Diagnosi macOS incompleta: una o più evidenze P0 richieste non sono disponibili o affidabili. Nessuna conclusione sullo stato del sistema viene formulata.",
+          confidence: 0.1,
+          evidenceIds: macosEvidence.map((item) => item.evidence.id),
+          requestedEvidence,
+        });
+      }
+      const documents = selected.map((item) => ({
+        id: item!.evidence.id,
+        collector: item!.evidence.collector,
+        content: item!.content,
+      }));
+      return parseDiagnosisProposal(
+        await invoke("diagnose_macos_p0", { evidence: documents }),
+      );
+    }
+
     if (linuxEvidence.length === 0)
       return this.#fallback.diagnose(objective, evidence);
 
@@ -892,6 +984,23 @@ function isSuccessfulWindowsEvidence(
     (item.evidence.collector === "windows.sfc.verify-only" &&
       item.evidence.summary === SFC_NOT_RUN_SUMMARY)
   );
+}
+
+function isSuccessfulMacosEvidence(
+  item: ObservedEvidence | undefined,
+): boolean {
+  if (item === undefined) return false;
+  if (
+    item.evidence.contentType !== "application/json" ||
+    item.evidence.trust !== "observed-untrusted" ||
+    item.evidence.target !== "local-machine"
+  )
+    return false;
+  if (MACOS_NOT_RUN_COLLECTORS.has(item.evidence.collector))
+    return item.evidence.summary === MACOS_NOT_RUN_SUMMARY;
+  if (item.evidence.collector === "macos.startup.state")
+    return item.evidence.summary === MACOS_PARTIAL_STARTUP_SUMMARY;
+  return item.evidence.summary === "Comando di inventario completato";
 }
 
 export async function fingerprintNativeTarget(

@@ -6,10 +6,10 @@
 //! observed data is untrusted. Findings contain only fixed text and fixed
 //! collector identifiers; observed strings are never copied into a finding.
 
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use std::{collections::BTreeSet, error::Error, fmt};
 
-pub const CORPUS_VERSION: &str = "macos-resident-p0.1";
+pub const CORPUS_VERSION: &str = "macos-resident-p0.2";
 pub const REPORT_SCHEMA_VERSION: &str = "1.0";
 pub const PROJECTION_SCHEMA_VERSION: &str = "1.0";
 pub const MAX_INPUT_BYTES: usize = 1024 * 1024;
@@ -194,11 +194,21 @@ pub enum FileVaultState {
     Unsupported,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CollectionState {
+    Complete,
+    NotRunUnqualified,
+    UnavailableStaleCache,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LaunchdProjection {
     pub schema_version: String,
     pub query_complete: bool,
+    pub user_query_state: CollectionState,
+    pub system_query_state: CollectionState,
     pub services: Vec<LaunchdService>,
 }
 
@@ -207,9 +217,8 @@ pub struct LaunchdProjection {
 pub struct LaunchdService {
     pub scope: LaunchdScope,
     pub state: LaunchdState,
-    pub last_exit_status: i32,
-    pub consecutive_failures: u32,
-    pub apple_signed: bool,
+    #[serde(deserialize_with = "required_option")]
+    pub last_exit_status: Option<i32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -224,8 +233,6 @@ pub enum LaunchdScope {
 pub enum LaunchdState {
     Running,
     Waiting,
-    Exited,
-    Throttled,
     Failed,
 }
 
@@ -244,6 +251,8 @@ pub struct NetworkProjection {
 pub struct UpdatesProjection {
     pub schema_version: String,
     pub query_complete: bool,
+    pub execution_state: CollectionState,
+    pub query_state: CollectionState,
     pub pending: Vec<PendingUpdate>,
 }
 
@@ -259,10 +268,16 @@ pub struct PendingUpdate {
 pub struct EventsProjection {
     pub schema_version: String,
     pub query_complete: bool,
-    pub window_hours: u16,
-    pub kernel_panics: u32,
-    pub watchdog_reboots: u32,
-    pub repeated_app_crashes: u32,
+    pub execution_state: CollectionState,
+    pub query_state: CollectionState,
+    #[serde(deserialize_with = "required_option")]
+    pub window_hours: Option<u16>,
+    #[serde(deserialize_with = "required_option")]
+    pub kernel_panics: Option<u32>,
+    #[serde(deserialize_with = "required_option")]
+    pub watchdog_reboots: Option<u32>,
+    #[serde(deserialize_with = "required_option")]
+    pub repeated_app_crashes: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -270,9 +285,14 @@ pub struct EventsProjection {
 pub struct StartupProjection {
     pub schema_version: String,
     pub query_complete: bool,
+    pub safe_mode_query_state: CollectionState,
+    pub login_items_query_state: CollectionState,
+    pub background_items_query_state: CollectionState,
     pub safe_mode: bool,
-    pub third_party_login_items_enabled: u16,
-    pub background_items_blocked: u16,
+    #[serde(deserialize_with = "required_option")]
+    pub third_party_login_items_enabled: Option<u16>,
+    #[serde(deserialize_with = "required_option")]
+    pub background_items_blocked: Option<u16>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -281,7 +301,16 @@ pub struct SnapshotsProjection {
     pub schema_version: String,
     pub query_complete: bool,
     pub local_snapshots: u32,
+    #[serde(deserialize_with = "required_option")]
     pub oldest_age_hours: Option<u32>,
+}
+
+fn required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
 }
 
 fn error(source: EvidenceSource, kind: DiagnosticErrorKind) -> DiagnosticError {
@@ -385,26 +414,32 @@ pub fn parse_launchd(input: EvidenceInput<'_>) -> Result<LaunchdProjection, Diag
         &projection.schema_version,
         projection.query_complete,
     )?;
-    if projection.services.is_empty() {
-        return Err(error(
-            EvidenceSource::Launchd,
-            DiagnosticErrorKind::InconsistentEvidence,
-        ));
-    }
     if projection.services.len() > MAX_RECORDS {
         return Err(error(
             EvidenceSource::Launchd,
             DiagnosticErrorKind::TooManyRecords,
         ));
     }
-    if projection
-        .services
-        .iter()
-        .any(|service| service.consecutive_failures > 1_000_000)
+    if projection.user_query_state != CollectionState::Complete
+        || projection.system_query_state != CollectionState::NotRunUnqualified
     {
         return Err(error(
             EvidenceSource::Launchd,
-            DiagnosticErrorKind::ValueOutOfRange,
+            DiagnosticErrorKind::InconsistentEvidence,
+        ));
+    }
+    let inconsistent = projection.services.iter().any(|service| {
+        service.scope != LaunchdScope::User
+            || matches!(service.state, LaunchdState::Running) && service.last_exit_status.is_some()
+            || matches!(service.state, LaunchdState::Waiting)
+                && service.last_exit_status.is_some_and(|status| status != 0)
+            || matches!(service.state, LaunchdState::Failed)
+                && service.last_exit_status.is_none_or(|status| status == 0)
+    });
+    if inconsistent {
+        return Err(error(
+            EvidenceSource::Launchd,
+            DiagnosticErrorKind::InconsistentEvidence,
         ));
     }
     Ok(projection)
@@ -445,6 +480,15 @@ pub fn parse_updates(input: EvidenceInput<'_>) -> Result<UpdatesProjection, Diag
             DiagnosticErrorKind::TooManyRecords,
         ));
     }
+    let explicitly_unqualified = projection.execution_state == CollectionState::NotRunUnqualified
+        && projection.query_state == CollectionState::UnavailableStaleCache
+        && projection.pending.is_empty();
+    if !explicitly_unqualified {
+        return Err(error(
+            EvidenceSource::Updates,
+            DiagnosticErrorKind::InconsistentEvidence,
+        ));
+    }
     Ok(projection)
 }
 
@@ -455,15 +499,19 @@ pub fn parse_events(input: EvidenceInput<'_>) -> Result<EventsProjection, Diagno
         &projection.schema_version,
         projection.query_complete,
     )?;
-    if projection.window_hours == 0
-        || projection.window_hours > 168
-        || projection.kernel_panics > 100_000
-        || projection.watchdog_reboots > 100_000
-        || projection.repeated_app_crashes > 1_000_000
-    {
+    let explicitly_unqualified = projection.execution_state == CollectionState::NotRunUnqualified
+        && projection.query_state == CollectionState::NotRunUnqualified;
+    let counts = (
+        projection.window_hours,
+        projection.kernel_panics,
+        projection.watchdog_reboots,
+        projection.repeated_app_crashes,
+    );
+    let values_valid = matches!(counts, (None, None, None, None)) && explicitly_unqualified;
+    if !values_valid {
         return Err(error(
             EvidenceSource::Events,
-            DiagnosticErrorKind::ValueOutOfRange,
+            DiagnosticErrorKind::InconsistentEvidence,
         ));
     }
     Ok(projection)
@@ -476,12 +524,15 @@ pub fn parse_startup(input: EvidenceInput<'_>) -> Result<StartupProjection, Diag
         &projection.schema_version,
         projection.query_complete,
     )?;
-    if projection.third_party_login_items_enabled as usize > MAX_RECORDS
-        || projection.background_items_blocked as usize > MAX_RECORDS
-    {
+    let explicitly_unqualified = projection.safe_mode_query_state == CollectionState::Complete
+        && projection.login_items_query_state == CollectionState::NotRunUnqualified
+        && projection.background_items_query_state == CollectionState::NotRunUnqualified
+        && projection.third_party_login_items_enabled.is_none()
+        && projection.background_items_blocked.is_none();
+    if !explicitly_unqualified {
         return Err(error(
             EvidenceSource::Startup,
-            DiagnosticErrorKind::TooManyRecords,
+            DiagnosticErrorKind::InconsistentEvidence,
         ));
     }
     Ok(projection)
@@ -566,8 +617,8 @@ pub fn diagnose_macos_p0(inputs: MacosP0Inputs<'_>) -> Result<DiagnosticReport, 
     let apfs = parse_apfs(inputs.apfs)?;
     let launchd = parse_launchd(inputs.launchd)?;
     let network = parse_network(inputs.network)?;
-    let updates = parse_updates(inputs.updates)?;
-    let events = parse_events(inputs.events)?;
+    parse_updates(inputs.updates)?;
+    parse_events(inputs.events)?;
     let startup = parse_startup(inputs.startup)?;
     let snapshots = parse_snapshots(inputs.snapshots)?;
     ensure_unique_evidence_ids(inputs)?;
@@ -617,28 +668,23 @@ pub fn diagnose_macos_p0(inputs: MacosP0Inputs<'_>) -> Result<DiagnosticReport, 
         ));
     }
 
+    findings.push(finding(
+        "macos.launchd.system-scope-not-qualified",
+        Severity::Medium,
+        &[inputs.launchd.id],
+        "System-domain launchd services were not queried because that collector is not qualified for P0.",
+        "macos.launchd.system-read-only-qualified",
+    ));
     if launchd
         .services
         .iter()
-        .any(|service| service.state == LaunchdState::Failed || service.consecutive_failures >= 3)
+        .any(|service| service.last_exit_status.is_some_and(|status| status != 0))
     {
         findings.push(finding(
-            "macos.launchd.repeated-failure",
-            Severity::High,
-            &[inputs.launchd.id],
-            "At least one launchd service is failed or repeatedly exiting.",
-            "macos.launchd.failure-detail",
-        ));
-    } else if launchd
-        .services
-        .iter()
-        .any(|service| service.state == LaunchdState::Throttled && service.last_exit_status != 0)
-    {
-        findings.push(finding(
-            "macos.launchd.throttled-after-error",
+            "macos.launchd.last-exit-nonzero",
             Severity::Medium,
             &[inputs.launchd.id],
-            "At least one launchd service is throttled after a nonzero exit.",
+            "At least one service in a queried launchd scope has a nonzero last exit status.",
             "macos.launchd.failure-detail",
         ));
     }
@@ -669,52 +715,29 @@ pub fn diagnose_macos_p0(inputs: MacosP0Inputs<'_>) -> Result<DiagnosticReport, 
         ));
     }
 
-    if updates.pending.iter().any(|update| update.security) {
-        findings.push(finding(
-            "macos.software-update.security-pending",
-            Severity::Medium,
-            &[inputs.updates.id],
-            "At least one pending software update is security-relevant.",
-            "macos.software-update.native-detail",
-        ));
-    }
-    if updates.pending.iter().any(|update| update.restart_required) {
-        findings.push(finding(
-            "macos.software-update.restart-pending",
-            Severity::Low,
-            &[inputs.updates.id],
-            "At least one pending software update requires a restart.",
-            "macos.software-update.native-detail",
-        ));
-    }
+    findings.push(finding(
+        "macos.software-update.query-not-qualified",
+        Severity::Medium,
+        &[inputs.updates.id],
+        "Software-update availability was not queried because the cached preference data is not a qualified freshness source.",
+        "macos.software-update.read-only-qualified",
+    ));
 
-    if events.kernel_panics > 0 {
-        findings.push(finding(
-            "macos.events.kernel-panic-observed",
-            Severity::Critical,
-            &[inputs.events.id],
-            "The bounded unified-event window contains a kernel panic signal.",
-            "macos.apple-diagnostics.handoff",
-        ));
-    }
-    if events.watchdog_reboots > 0 {
-        findings.push(finding(
-            "macos.events.watchdog-reboot-observed",
-            Severity::High,
-            &[inputs.events.id],
-            "The bounded unified-event window contains a watchdog reboot signal.",
-            "macos.events.shutdown-detail",
-        ));
-    }
-    if events.repeated_app_crashes >= 3 {
-        findings.push(finding(
-            "macos.events.repeated-app-crash",
-            Severity::Medium,
-            &[inputs.events.id],
-            "The bounded event window contains a repeated application-crash signal.",
-            "macos.events.crash-detail",
-        ));
-    }
+    findings.push(finding(
+        "macos.events.query-not-qualified",
+        Severity::Medium,
+        &[inputs.events.id],
+        "System incidents were not queried because process-name-only Unified Log counts are not qualified evidence.",
+        "macos.events.read-only-qualified",
+    ));
+
+    findings.push(finding(
+        "macos.startup.items-scope-not-qualified",
+        Severity::Medium,
+        &[inputs.startup.id],
+        "Login-item and background-item state was not queried because the available text source is not qualified evidence.",
+        "macos.startup.items-read-only-qualified",
+    ));
 
     if startup.safe_mode {
         findings.push(finding(
@@ -723,24 +746,6 @@ pub fn diagnose_macos_p0(inputs: MacosP0Inputs<'_>) -> Result<DiagnosticReport, 
             &[inputs.startup.id],
             "The current macOS session is running in safe mode.",
             "macos.startup.normal-boot-compare",
-        ));
-    }
-    if startup.background_items_blocked > 0 {
-        findings.push(finding(
-            "macos.startup.background-items-blocked",
-            Severity::Low,
-            &[inputs.startup.id],
-            "At least one configured background item is blocked.",
-            "macos.startup.login-item-detail",
-        ));
-    }
-    if startup.third_party_login_items_enabled >= 25 {
-        findings.push(finding(
-            "macos.startup.login-item-volume-high",
-            Severity::Low,
-            &[inputs.startup.id],
-            "The enabled third-party login-item count exceeds the P0 review threshold.",
-            "macos.startup.login-item-detail",
         ));
     }
 
@@ -764,7 +769,7 @@ pub fn diagnose_macos_p0(inputs: MacosP0Inputs<'_>) -> Result<DiagnosticReport, 
         .map(|value| (*value).to_owned())
         .collect(),
         findings,
-        scope_statement: "Complete means all eight bounded P0 projections were parsed; it is not a health certification.".to_owned(),
+        scope_statement: "Complete means all eight bounded P0 projection documents and their declared query states were parsed. System launchd, software-update, system-event, login-item, and background-item scopes remain explicitly unqualified; this is not a health certification.".to_owned(),
     })
 }
 
@@ -776,15 +781,27 @@ pub fn proposal_from_report(report: &DiagnosticReport) -> MacosDiagnosisProposal
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
+    let has_unqualified_scope = report
+        .findings
+        .iter()
+        .any(|finding| finding.rule_id.ends_with("not-qualified"));
     let (diagnosis, confidence) = if report.findings.is_empty() {
         (
             "No deterministic macOS P0 incident rule matched the complete evidence set; this is not a health certification.".to_owned(),
             0.55,
         )
+    } else if has_unqualified_scope {
+        (
+            format!(
+                "{} deterministic macOS P0 signal(s), including explicitly unqualified diagnostic scopes, require review; this is not a health certification.",
+                report.findings.len()
+            ),
+            0.65,
+        )
     } else {
         (
             format!(
-                "{} deterministic macOS P0 signal(s) require review.",
+                "{} deterministic macOS P0 signal(s) require review; this is not a health certification.",
                 report.findings.len()
             ),
             0.9,
@@ -860,14 +877,29 @@ mod tests {
     }
 
     #[test]
-    fn complete_no_match_report_is_not_a_health_claim() {
+    fn complete_projection_set_surfaces_every_unqualified_scope() {
         let report = diagnose_macos_p0(healthy_inputs()).expect("complete fixture parses");
         assert!(report.complete);
-        assert!(report.findings.is_empty());
+        assert_eq!(
+            report
+                .findings
+                .iter()
+                .map(|finding| finding.rule_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "macos.events.query-not-qualified",
+                "macos.launchd.system-scope-not-qualified",
+                "macos.software-update.query-not-qualified",
+                "macos.startup.items-scope-not-qualified",
+            ]
+        );
         assert_eq!(report.evidence_ids, REQUIRED_EVIDENCE_IDS);
+        assert!(report.scope_statement.contains("login-item"));
+        assert!(report.scope_statement.contains("background-item"));
         let proposal = proposal_from_report(&report);
         assert!(proposal.diagnosis.contains("not a health certification"));
-        assert!(proposal.requested_evidence.is_empty());
+        assert_eq!(proposal.confidence, 0.65);
+        assert_eq!(proposal.requested_evidence.len(), 4);
     }
 
     #[test]
@@ -940,6 +972,53 @@ mod tests {
     }
 
     #[test]
+    fn nullable_projection_fields_are_still_required() {
+        let launchd = br#"{"schemaVersion":"1.0","queryComplete":true,"userQueryState":"complete","systemQueryState":"not-run-unqualified","services":[{"scope":"user","state":"running"}]}"#;
+        assert_eq!(
+            parse_launchd(EvidenceInput {
+                id: LAUNCHD_EVIDENCE_ID,
+                body: launchd,
+            })
+            .expect_err("launchd null state must be explicit")
+            .kind,
+            DiagnosticErrorKind::MalformedInput
+        );
+
+        let events = br#"{"schemaVersion":"1.0","queryComplete":true,"executionState":"not-run-unqualified","queryState":"not-run-unqualified","windowHours":null,"kernelPanics":null,"watchdogReboots":null}"#;
+        assert_eq!(
+            parse_events(EvidenceInput {
+                id: EVENTS_EVIDENCE_ID,
+                body: events,
+            })
+            .expect_err("every unqualified event metric must be explicit")
+            .kind,
+            DiagnosticErrorKind::MalformedInput
+        );
+
+        let startup = br#"{"schemaVersion":"1.0","queryComplete":true,"safeModeQueryState":"complete","loginItemsQueryState":"not-run-unqualified","backgroundItemsQueryState":"not-run-unqualified","safeMode":false,"thirdPartyLoginItemsEnabled":null}"#;
+        assert_eq!(
+            parse_startup(EvidenceInput {
+                id: STARTUP_EVIDENCE_ID,
+                body: startup,
+            })
+            .expect_err("every unqualified startup metric must be explicit")
+            .kind,
+            DiagnosticErrorKind::MalformedInput
+        );
+
+        let snapshots = br#"{"schemaVersion":"1.0","queryComplete":true,"localSnapshots":0}"#;
+        assert_eq!(
+            parse_snapshots(EvidenceInput {
+                id: SNAPSHOTS_EVIDENCE_ID,
+                body: snapshots,
+            })
+            .expect_err("snapshot age null must be explicit")
+            .kind,
+            DiagnosticErrorKind::MalformedInput
+        );
+    }
+
+    #[test]
     fn oversized_input_is_rejected_before_json_parsing() {
         let oversized = vec![b' '; MAX_INPUT_BYTES + 1];
         assert_eq!(
@@ -968,10 +1047,6 @@ mod tests {
             id: SNAPSHOTS_EVIDENCE_ID,
             body: include_bytes!("../fixtures/diagnostics/incidents/snapshots-many.json"),
         };
-        inputs.events = EvidenceInput {
-            id: EVENTS_EVIDENCE_ID,
-            body: include_bytes!("../fixtures/diagnostics/incidents/events-panic.json"),
-        };
         let report = diagnose_macos_p0(inputs).expect("incident fixture parses");
         let rules = report
             .findings
@@ -983,7 +1058,10 @@ mod tests {
             vec![
                 "macos.apfs.root-low-space",
                 "macos.apfs.snapshot-pressure-correlation",
-                "macos.events.kernel-panic-observed",
+                "macos.events.query-not-qualified",
+                "macos.launchd.system-scope-not-qualified",
+                "macos.software-update.query-not-qualified",
+                "macos.startup.items-scope-not-qualified",
                 "macos.storage.smart-failing",
             ]
         );
@@ -1008,7 +1086,7 @@ mod tests {
     }
 
     #[test]
-    fn service_network_update_event_and_startup_corpus_is_deterministic() {
+    fn qualified_collectors_and_unqualified_scopes_are_deterministic() {
         let mut inputs = healthy_inputs();
         inputs.launchd = EvidenceInput {
             id: LAUNCHD_EVIDENCE_ID,
@@ -1017,14 +1095,6 @@ mod tests {
         inputs.network = EvidenceInput {
             id: NETWORK_EVIDENCE_ID,
             body: include_bytes!("../fixtures/diagnostics/incidents/network-route-missing.json"),
-        };
-        inputs.updates = EvidenceInput {
-            id: UPDATES_EVIDENCE_ID,
-            body: include_bytes!("../fixtures/diagnostics/incidents/updates-pending.json"),
-        };
-        inputs.events = EvidenceInput {
-            id: EVENTS_EVIDENCE_ID,
-            body: include_bytes!("../fixtures/diagnostics/incidents/events-instability.json"),
         };
         inputs.startup = EvidenceInput {
             id: STARTUP_EVIDENCE_ID,
@@ -1039,14 +1109,12 @@ mod tests {
         assert_eq!(
             rules,
             vec![
-                "macos.events.repeated-app-crash",
-                "macos.events.watchdog-reboot-observed",
-                "macos.launchd.repeated-failure",
+                "macos.events.query-not-qualified",
+                "macos.launchd.last-exit-nonzero",
+                "macos.launchd.system-scope-not-qualified",
                 "macos.network.default-route-missing",
-                "macos.software-update.restart-pending",
-                "macos.software-update.security-pending",
-                "macos.startup.background-items-blocked",
-                "macos.startup.login-item-volume-high",
+                "macos.software-update.query-not-qualified",
+                "macos.startup.items-scope-not-qualified",
                 "macos.startup.safe-mode-active",
             ]
         );
@@ -1102,8 +1170,8 @@ mod tests {
 
     #[test]
     fn equivalent_record_order_has_identical_report_bytes() {
-        let one = br#"{"schemaVersion":"1.0","queryComplete":true,"services":[{"scope":"user","state":"waiting","lastExitStatus":0,"consecutiveFailures":0,"appleSigned":false},{"scope":"system","state":"running","lastExitStatus":0,"consecutiveFailures":0,"appleSigned":true}]}"#;
-        let two = br#"{"schemaVersion":"1.0","queryComplete":true,"services":[{"scope":"system","state":"running","lastExitStatus":0,"consecutiveFailures":0,"appleSigned":true},{"scope":"user","state":"waiting","lastExitStatus":0,"consecutiveFailures":0,"appleSigned":false}]}"#;
+        let one = br#"{"schemaVersion":"1.0","queryComplete":true,"userQueryState":"complete","systemQueryState":"not-run-unqualified","services":[{"scope":"user","state":"waiting","lastExitStatus":0},{"scope":"user","state":"running","lastExitStatus":null}]}"#;
+        let two = br#"{"schemaVersion":"1.0","queryComplete":true,"userQueryState":"complete","systemQueryState":"not-run-unqualified","services":[{"scope":"user","state":"running","lastExitStatus":null},{"scope":"user","state":"waiting","lastExitStatus":0}]}"#;
         let mut left_inputs = healthy_inputs();
         left_inputs.launchd = EvidenceInput {
             id: LAUNCHD_EVIDENCE_ID,
@@ -1120,5 +1188,113 @@ mod tests {
             serde_json::to_vec(&left).expect("serialize left"),
             serde_json::to_vec(&right).expect("serialize right")
         );
+    }
+
+    #[test]
+    fn unqualified_sources_cannot_smuggle_interpreted_values() {
+        let updates = br#"{"schemaVersion":"1.0","queryComplete":true,"executionState":"not-run-unqualified","queryState":"unavailable-stale-cache","pending":[{"security":true,"restartRequired":true}]}"#;
+        assert_eq!(
+            parse_updates(EvidenceInput {
+                id: UPDATES_EVIDENCE_ID,
+                body: updates,
+            })
+            .expect_err("unqualified update query cannot carry pending claims")
+            .kind,
+            DiagnosticErrorKind::InconsistentEvidence
+        );
+
+        let events = br#"{"schemaVersion":"1.0","queryComplete":true,"executionState":"not-run-unqualified","queryState":"not-run-unqualified","windowHours":24,"kernelPanics":1,"watchdogReboots":0,"repeatedAppCrashes":0}"#;
+        assert_eq!(
+            parse_events(EvidenceInput {
+                id: EVENTS_EVIDENCE_ID,
+                body: events,
+            })
+            .expect_err("unqualified event query cannot carry incident counts")
+            .kind,
+            DiagnosticErrorKind::InconsistentEvidence
+        );
+
+        let launchd = br#"{"schemaVersion":"1.0","queryComplete":true,"userQueryState":"complete","systemQueryState":"not-run-unqualified","services":[{"scope":"system","state":"running","lastExitStatus":null}]}"#;
+        assert_eq!(
+            parse_launchd(EvidenceInput {
+                id: LAUNCHD_EVIDENCE_ID,
+                body: launchd,
+            })
+            .expect_err("unqualified launchd scope cannot carry services")
+            .kind,
+            DiagnosticErrorKind::InconsistentEvidence
+        );
+
+        let qualified_updates = br#"{"schemaVersion":"1.0","queryComplete":true,"executionState":"complete","queryState":"complete","pending":[]}"#;
+        assert_eq!(
+            parse_updates(EvidenceInput {
+                id: UPDATES_EVIDENCE_ID,
+                body: qualified_updates,
+            })
+            .expect_err("P0 has no qualified update source")
+            .kind,
+            DiagnosticErrorKind::InconsistentEvidence
+        );
+
+        let qualified_events = br#"{"schemaVersion":"1.0","queryComplete":true,"executionState":"complete","queryState":"complete","windowHours":24,"kernelPanics":0,"watchdogReboots":0,"repeatedAppCrashes":0}"#;
+        assert_eq!(
+            parse_events(EvidenceInput {
+                id: EVENTS_EVIDENCE_ID,
+                body: qualified_events,
+            })
+            .expect_err("P0 has no qualified incident source")
+            .kind,
+            DiagnosticErrorKind::InconsistentEvidence
+        );
+
+        let startup_counts = br#"{"schemaVersion":"1.0","queryComplete":true,"safeModeQueryState":"complete","loginItemsQueryState":"not-run-unqualified","backgroundItemsQueryState":"not-run-unqualified","safeMode":false,"thirdPartyLoginItemsEnabled":3,"backgroundItemsBlocked":0}"#;
+        assert_eq!(
+            parse_startup(EvidenceInput {
+                id: STARTUP_EVIDENCE_ID,
+                body: startup_counts,
+            })
+            .expect_err("unqualified startup item scopes cannot carry counts")
+            .kind,
+            DiagnosticErrorKind::InconsistentEvidence
+        );
+    }
+
+    #[test]
+    fn launchd_state_and_optional_exit_status_must_be_coherent() {
+        for (state, status) in [
+            ("running", "0"),
+            ("waiting", "78"),
+            ("failed", "null"),
+            ("failed", "0"),
+        ] {
+            let projection = format!(
+                r#"{{"schemaVersion":"1.0","queryComplete":true,"userQueryState":"complete","systemQueryState":"not-run-unqualified","services":[{{"scope":"user","state":"{state}","lastExitStatus":{status}}}]}}"#
+            );
+            assert_eq!(
+                parse_launchd(EvidenceInput {
+                    id: LAUNCHD_EVIDENCE_ID,
+                    body: projection.as_bytes(),
+                })
+                .expect_err("launchd state cannot invent or contradict exit status")
+                .kind,
+                DiagnosticErrorKind::InconsistentEvidence
+            );
+        }
+
+        for (state, status) in [
+            ("running", "null"),
+            ("waiting", "null"),
+            ("waiting", "0"),
+            ("failed", "-15"),
+        ] {
+            let projection = format!(
+                r#"{{"schemaVersion":"1.0","queryComplete":true,"userQueryState":"complete","systemQueryState":"not-run-unqualified","services":[{{"scope":"user","state":"{state}","lastExitStatus":{status}}}]}}"#
+            );
+            parse_launchd(EvidenceInput {
+                id: LAUNCHD_EVIDENCE_ID,
+                body: projection.as_bytes(),
+            })
+            .expect("documented launchctl state must be accepted");
+        }
     }
 }
