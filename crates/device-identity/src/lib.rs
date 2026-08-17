@@ -7,6 +7,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::fmt;
 use zeroize::Zeroizing;
 
 const SIGNED_REPORT_DOMAIN: &[u8] = b"KERNAID-SIGNED-REPORT-V1\0";
@@ -26,7 +27,7 @@ pub struct DeviceIdentity {
     signing_key: SigningKey,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SignedReport {
     pub payload: Vec<u8>,
     pub public_key: [u8; PUBLIC_KEY_BYTES],
@@ -34,7 +35,7 @@ pub struct SignedReport {
 }
 
 /// Portable JSON report bundle whose complete semantic content is signed.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SignedReportEnvelope {
     pub schema: String,
@@ -48,6 +49,29 @@ pub struct SignedReportEnvelope {
     pub payload: String,
     pub public_key: String,
     pub signature: String,
+}
+
+impl fmt::Debug for SignedReport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SignedReport")
+            .field("payload_len", &self.payload.len())
+            .field("public_key_len", &self.public_key.len())
+            .field("signature_len", &self.signature.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for SignedReportEnvelope {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SignedReportEnvelope")
+            .field("journal_sequence", &self.journal_sequence)
+            .field("payload_base64url_len", &self.payload.len())
+            .field("public_key_base64url_len", &self.public_key.len())
+            .field("signature_base64url_len", &self.signature.len())
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -503,6 +527,77 @@ mod tests {
         let mut tampered = envelope.clone();
         mutate(&mut tampered);
         assert!(tampered.verify(&identity.public_key()).is_err());
+    }
+
+    #[test]
+    fn signed_report_debug_redacts_payload_key_and_signature() {
+        let identity = DeviceIdentity::from_seed(&[0xa5; 32]).expect("fixed test identity");
+        let secret_payload = b"KERNAID_SIGNED_REPORT_DEBUG_SECRET";
+        let report = identity.sign_report(secret_payload);
+
+        let debug = format!("{report:?}");
+        assert_eq!(
+            debug,
+            format!(
+                "SignedReport {{ payload_len: {}, public_key_len: {}, signature_len: {}, .. }}",
+                report.payload.len(),
+                report.public_key.len(),
+                report.signature.len()
+            )
+        );
+        assert!(!debug.contains("KERNAID_SIGNED_REPORT_DEBUG_SECRET"));
+        assert!(!debug.contains(&format!("{:?}", report.payload)));
+        assert!(!debug.contains(&format!("{:?}", report.public_key)));
+        assert!(!debug.contains(&format!("{:?}", report.signature)));
+    }
+
+    #[test]
+    fn signed_envelope_debug_redacts_all_string_content() {
+        const SECRET: &str = "KERNAID_SIGNED_ENVELOPE_DEBUG_SECRET";
+
+        let mut envelope = signed_envelope(&DeviceIdentity::generate());
+        envelope.schema = format!("{SECRET}:schema");
+        envelope.kind = format!("{SECRET}:kind");
+        envelope.algorithm = format!("{SECRET}:algorithm");
+        envelope.device_id = format!("{SECRET}:device-id");
+        envelope.journal_sequence = 8_675_309;
+        envelope.journal_entry_hash = format!("{SECRET}:journal-entry-hash");
+        envelope.payload_media_type = format!("{SECRET}:media-type");
+        envelope.payload_sha256 = format!("{SECRET}:payload-hash");
+        envelope.payload = format!("{SECRET}:payload");
+        envelope.public_key = format!("{SECRET}:public-key");
+        envelope.signature = format!("{SECRET}:signature");
+
+        let debug = format!("{envelope:?}");
+        assert_eq!(
+            debug,
+            format!(
+                concat!(
+                    "SignedReportEnvelope {{ journal_sequence: {}, ",
+                    "payload_base64url_len: {}, public_key_base64url_len: {}, ",
+                    "signature_base64url_len: {}, .. }}"
+                ),
+                envelope.journal_sequence,
+                envelope.payload.len(),
+                envelope.public_key.len(),
+                envelope.signature.len()
+            )
+        );
+        assert!(!debug.contains(SECRET));
+        for sensitive in [
+            &envelope.schema,
+            &envelope.kind,
+            &envelope.algorithm,
+            &envelope.device_id,
+            &envelope.journal_entry_hash,
+            &envelope.payload_media_type,
+            &envelope.payload_sha256,
+            &envelope.payload,
+            &envelope.public_key,
+            &envelope.signature,
+        ] {
+            assert!(!debug.contains(sensitive));
+        }
     }
 
     #[test]
