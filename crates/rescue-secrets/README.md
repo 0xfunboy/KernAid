@@ -94,6 +94,27 @@ creates a device identity. The second unlocks the same volume and verifies the
 journal key/anchor, sentinel, and identity survived the reopen. The script also
 requires a wrong passphrase to fail without leaving a mount or mapping.
 
+The successful probe output is one machine-readable, non-secret line:
+
+```text
+KERNAID_RESCUE_VAULT_PROBE_ATTESTATION_V1 mode=<initialize|verify> sentinel=kernaid-disposable-vault-persistence-v1 identity_public_key=<64 lowercase hex> clean_shutdown=true
+```
+
+It is emitted only after `MountedRescueVault::shutdown` succeeds. The identity
+value is the public Ed25519 key in canonical lowercase hexadecimal, never its
+seed. Errors remain sanitized and never print the passphrase or stored secret
+bytes.
+
+The Rescue workflow also exercises this probe against p3 of a disposable
+32,000,000,000-byte raw USB image. Provisioning and initialize happen on the
+host before two consecutive BIOS or UEFI QEMU USB boots; verify happens on the
+host after both boots. CI binds the stable logical sentinel and identity,
+LUKS/filesystem UUIDs, wrong-key rejection and two clean managed lifecycles to
+the same log that proves raw prefix/p3/target invariance during the boot
+window. This is intentionally not an in-guest unlock or vault-service claim.
+The probe, provisioning commands and tmpfs key files are never packaged in the
+Rescue ISO.
+
 ## Service and UI integration
 
 The intended integration is a small root-owned local daemon that holds

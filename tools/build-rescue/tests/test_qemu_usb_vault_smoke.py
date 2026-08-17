@@ -1,0 +1,458 @@
+from __future__ import annotations
+
+import hashlib
+import importlib.util
+import os
+import shutil
+import stat
+import struct
+import subprocess
+import sys
+import tempfile
+import textwrap
+import unittest
+from pathlib import Path
+
+
+TOOLS_DIR = Path(__file__).resolve().parents[1]
+REPO_DIR = Path(__file__).resolve().parents[3]
+SCRIPT = TOOLS_DIR / "qemu-usb-smoke.sh"
+LAYOUT_MANIFEST = REPO_DIR / "rescue/image-layout/device-layout.v1.json"
+CATALOG_V2_PATH = REPO_DIR / "tools/make-device/catalog_v2.py"
+ENTRY_V2_PATH = REPO_DIR / "tools/make-device/catalog-entry-v2.py"
+
+
+def load_module(name: str, path: Path) -> object:
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+catalog_v2 = load_module("kernaid_mock_catalog_v2", CATALOG_V2_PATH)
+entry_v2 = load_module("kernaid_mock_entry_v2", ENTRY_V2_PATH)
+
+
+def partition_entry(
+    *, status: int, type_code: int, start_lba: int, sector_count: int
+) -> bytes:
+    return (
+        bytes((status,))
+        + b"\x00\x02\x00"
+        + bytes((type_code,))
+        + b"\xfe\xff\xff"
+        + struct.pack("<II", start_lba, sector_count)
+    )
+
+
+def write_finalized_fixture(path: Path) -> None:
+    image = bytearray(4 * 1024 * 1024)
+    image[446:462] = partition_entry(
+        status=0x80, type_code=0x00, start_lba=64, sector_count=8000
+    )
+    image[462:478] = partition_entry(
+        status=0x00, type_code=0xEF, start_lba=512, sector_count=256
+    )
+    image[478:494] = (
+        bytes.fromhex("00feffff83feffff")
+        + struct.pack("<II", 33_554_432, 16_777_216)
+    )
+    image[510:512] = b"\x55\xaa"
+    path.write_bytes(image)
+
+
+def executable(path: Path, source: str) -> None:
+    path.write_text(textwrap.dedent(source).lstrip(), encoding="utf-8")
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+
+
+class MockToolchain:
+    def __init__(self, directory: Path) -> None:
+        self.root = directory
+        self.bin = directory / "bin"
+        self.state = directory / "state"
+        self.bin.mkdir()
+        self.state.mkdir()
+        self._install()
+
+    def _tool(self, name: str, source: str) -> None:
+        executable(self.bin / name, source)
+
+    def _install(self) -> None:
+        self._tool(
+            "id",
+            """
+            #!/usr/bin/env bash
+            if [[ "${1:-}" == "-u" ]]; then printf '0\n'; else /usr/bin/id "$@"; fi
+            """,
+        )
+        self._tool(
+            "findmnt",
+            """
+            #!/usr/bin/env bash
+            printf 'tmpfs\n'
+            """,
+        )
+        self._tool(
+            "stat",
+            """
+            #!/usr/bin/env bash
+            if [[ "$*" == *"%a:%u:%g"* ]]; then
+              case "${@: -1}" in
+                */.kernaid-secure-state-v1) printf '700:0:0\n' ;;
+                *) printf '600:0:0\n' ;;
+              esac
+            else
+              /usr/bin/stat "$@"
+            fi
+            """,
+        )
+        self._tool(
+            "losetup",
+            """
+            #!/usr/bin/env bash
+            set -euo pipefail
+            state="$KERNAID_MOCK_STATE_DIR"
+            if [[ " $* " == *" --find "* && " $* " == *" --show "* ]]; then
+              printf '%s\n' "${@: -1}" >"$state/backing"
+              : >"$state/loop-attached"
+              printf '/dev/loop0\n'
+            elif [[ "${1:-}" == "--noheadings" ]]; then
+              case "$*" in
+                *BACK-FILE*) cat "$state/backing" ;;
+                *OFFSET*) printf '17179869184\n' ;;
+                *SIZELIMIT*) printf '8589934592\n' ;;
+                *) exit 2 ;;
+              esac
+            elif [[ "${1:-}" == "-d" ]]; then
+              rm -f "$state/loop-attached"
+            elif [[ "${1:-}" == "-j" ]]; then
+              if [[ -e "$state/loop-attached" ]]; then
+                printf '/dev/loop0: []: (%s)\n' "$2"
+              fi
+            else
+              exit 2
+            fi
+            """,
+        )
+        self._tool(
+            "udevadm",
+            """
+            #!/usr/bin/env bash
+            exit 0
+            """,
+        )
+        self._tool(
+            "cryptsetup",
+            """
+            #!/usr/bin/env bash
+            set -euo pipefail
+            state="$KERNAID_MOCK_STATE_DIR"
+            command="${1:-}"
+            case "$command" in
+              luksFormat|isLuks) exit 0 ;;
+              luksUUID)
+                printf '11111111-2222-4333-8444-555555555555\n'
+                ;;
+              open)
+                mapper="${@: -1}"
+                : >"$state/mapper.$mapper"
+                ;;
+              close)
+                if [[ "${KERNAID_MOCK_CLOSE_FAIL:-0}" == "1" \
+                  && "$2" == kernaid-vault-* ]]; then
+                  : >"$state/manager-close-failed"
+                  exit 1
+                fi
+                rm -f "$state/mapper.${2:?}"
+                ;;
+              status)
+                [[ -e "$state/mapper.${2:?}" ]]
+                ;;
+              *) exit 2 ;;
+            esac
+            """,
+        )
+        self._tool(
+            "blkid",
+            """
+            #!/usr/bin/env bash
+            set -euo pipefail
+            tag=""
+            previous=""
+            for argument in "$@"; do
+              if [[ "$previous" == "--match-tag" ]]; then tag="$argument"; fi
+              previous="$argument"
+            done
+            device="${@: -1}"
+            if [[ "$device" == /dev/loop0 ]]; then
+              case "$tag" in
+                TYPE) printf 'crypto_LUKS\n' ;;
+                VERSION) printf '2\n' ;;
+                LABEL) printf 'KERNAID_VAULT\n' ;;
+                *) exit 2 ;;
+              esac
+            else
+              case "$tag" in
+                TYPE) printf 'ext4\n' ;;
+                LABEL) printf 'KERNAID_VAULT\n' ;;
+                UUID) printf 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee\n' ;;
+                *) exit 2 ;;
+              esac
+            fi
+            """,
+        )
+        self._tool(
+            "mkfs.ext4",
+            """
+            #!/usr/bin/env bash
+            exit 0
+            """,
+        )
+        self._tool(
+            "mount",
+            """
+            #!/usr/bin/env bash
+            : >"$KERNAID_MOCK_STATE_DIR/provision-mounted"
+            """,
+        )
+        self._tool(
+            "umount",
+            """
+            #!/usr/bin/env bash
+            case "$1" in
+              */provision) rm -f "$KERNAID_MOCK_STATE_DIR/provision-mounted" ;;
+              /run/kernaid/vault/*) rm -f "$KERNAID_MOCK_STATE_DIR/manager-mounted" ;;
+              *) exit 2 ;;
+            esac
+            """,
+        )
+        self._tool(
+            "mountpoint",
+            """
+            #!/usr/bin/env bash
+            target="${@: -1}"
+            case "$target" in
+              */provision) [[ -e "$KERNAID_MOCK_STATE_DIR/provision-mounted" ]] ;;
+              /run/kernaid/vault/*) [[ -e "$KERNAID_MOCK_STATE_DIR/manager-mounted" ]] ;;
+              *) exit 1 ;;
+            esac
+            """,
+        )
+        self._tool(
+            "dd",
+            """
+            #!/usr/bin/env bash
+            set -euo pipefail
+            output=false
+            skip=0
+            for argument in "$@"; do
+              case "$argument" in
+                of=*) output=true ;;
+                skip=*) skip="${argument#skip=}" ;;
+              esac
+            done
+            if [[ "$output" == true || "$skip" == "0" ]]; then
+              /usr/bin/dd "$@"
+            else
+              printf 'mock-provisioned-p3-v1'
+            fi
+            """,
+        )
+        self._tool(
+            "qemu-system-x86_64",
+            """
+            #!/usr/bin/env bash
+            printf 'KERNAID_RESCUE_READY\n'
+            printf 'KERNAID_RESCUE_TARGET_SELECTION_READY\n'
+            /usr/bin/sleep 30
+            """,
+        )
+
+    def probe(self, path: Path) -> None:
+        executable(
+            path,
+            """
+            #!/usr/bin/env bash
+            set -euo pipefail
+            state="$KERNAID_MOCK_STATE_DIR"
+            mode=""
+            mapper=""
+            while [[ "$#" -gt 0 ]]; do
+              case "$1" in
+                --device) shift 2 ;;
+                --mapper) mapper="$2"; shift 2 ;;
+                --mode) mode="$2"; shift 2 ;;
+                *) exit 2 ;;
+              esac
+            done
+            # Consume the descriptor without retaining or printing its bytes.
+            /usr/bin/sha256sum >/dev/null
+            printf '%s\n' "$mode" >>"$state/probe-calls"
+            if [[ "$mode" == "verify" && ! -e "$state/wrong-key-seen" ]]; then
+              : >"$state/wrong-key-seen"
+              if [[ "${KERNAID_MOCK_PROBE_LEAK:-0}" == "1" ]]; then
+                : >"$state/mapper.$mapper"
+              fi
+              printf 'Rescue vault lifecycle probe failed\n' >&2
+              exit 2
+            fi
+            printf '%s\n' \
+              "KERNAID_RESCUE_VAULT_PROBE_ATTESTATION_V1 mode=$mode sentinel=kernaid-disposable-vault-persistence-v1 identity_public_key=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef clean_shutdown=true"
+            """,
+        )
+
+
+class QemuUsbVaultSmokeTests(unittest.TestCase):
+    def run_smoke(
+        self, *, leak_on_wrong_key: bool = False, cleanup_close_failure: bool = False
+    ) -> tuple[
+        subprocess.CompletedProcess[str],
+        Path,
+        Path,
+        Path,
+        tempfile.TemporaryDirectory[str],
+    ]:
+        temporary = tempfile.TemporaryDirectory()
+        directory = Path(temporary.name)
+        mocks = MockToolchain(directory)
+        iso = directory / "KernAid-Rescue-amd64.iso"
+        log = directory / "bios.log"
+        probe = directory / "kernaid-rescue-vault-probe"
+        write_finalized_fixture(iso)
+        mocks.probe(probe)
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "PATH": f"{mocks.bin}:{environment['PATH']}",
+                "KERNAID_MOCK_STATE_DIR": str(mocks.state),
+                "KERNAID_MOCK_PROBE_LEAK": "1" if leak_on_wrong_key else "0",
+                "KERNAID_MOCK_CLOSE_FAIL": "1" if cleanup_close_failure else "0",
+                "KERNAID_USB_SMOKE_LOG": str(log),
+            }
+        )
+        result = subprocess.run(
+            [str(SCRIPT), "bios", str(iso), str(probe)],
+            cwd=REPO_DIR,
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return result, iso, log, mocks.state, temporary
+
+    def test_mocked_lifecycle_emits_catalog_v2_compatible_evidence(self) -> None:
+        result, iso, log, state, temporary = self.run_smoke()
+        self.addCleanup(temporary.cleanup)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        contents = log.read_text(encoding="utf-8")
+        self.assertEqual(contents.count("KERNAID_QEMU_USB_ATTESTATION_V1 "), 1)
+        self.assertEqual(
+            contents.count("KERNAID_QEMU_USB_VAULT_ATTESTATION_V1 "), 1
+        )
+        self.assertEqual(
+            contents.count("KERNAID_QEMU_USB_VAULT_RAW_SCOPE_V1 "), 1
+        )
+        self.assertEqual(contents.count("KERNAID_QEMU_USB_BOOT_READY_V1 "), 2)
+        self.assertEqual(
+            contents.count("KERNAID_RESCUE_VAULT_WRONG_KEY_V1 "), 1
+        )
+        self.assertEqual(
+            contents.count("KERNAID_RESCUE_VAULT_PROBE_ATTESTATION_V1 "), 2
+        )
+        self.assertEqual(contents.count("mode=initialize sentinel="), 1)
+        self.assertEqual(contents.count("mode=verify sentinel="), 1)
+        self.assertIn("post_verify_mount_outside_raw_window=true", contents)
+        self.assertEqual(
+            (state / "probe-calls").read_text(encoding="utf-8").splitlines(),
+            ["initialize", "verify", "verify"],
+        )
+        self.assertFalse((state / "loop-attached").exists())
+        self.assertEqual(list(state.glob("mapper.*")), [])
+        self.assertFalse((state / "provision-mounted").exists())
+
+        layout = catalog_v2.load_device_layout(LAYOUT_MANIFEST)
+        iso_digest = hashlib.sha256(iso.read_bytes()).hexdigest()
+        log_digest = entry_v2.attested_log(
+            log,
+            firmware="bios",
+            iso_size=iso.stat().st_size,
+            iso_sha256=iso_digest,
+            layout=layout,
+        )
+        self.assertRegex(log_digest, r"^[0-9a-f]{64}$")
+
+        uefi_log = log.with_name("uefi.log")
+        uefi_log.write_text(
+            contents.replace("firmware=bios", "firmware=uefi").replace(
+                "uefi_vars=not-applicable", "uefi_vars=fresh-per-boot"
+            ),
+            encoding="utf-8",
+        )
+        generated = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-B",
+                str(ENTRY_V2_PATH),
+                "--iso",
+                str(iso),
+                "--sha256",
+                iso_digest,
+                "--layout-manifest",
+                str(LAYOUT_MANIFEST),
+                "--artifact-version",
+                "ci-4242-1",
+                "--bios-run-id",
+                "4242",
+                "--bios-run-url",
+                "https://github.com/0xfunboy/KernAid/actions/runs/4242",
+                "--bios-log",
+                str(log),
+                "--uefi-run-id",
+                "4242",
+                "--uefi-run-url",
+                "https://github.com/0xfunboy/KernAid/actions/runs/4242",
+                "--uefi-log",
+                str(uefi_log),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(generated.returncode, 0, generated.stderr)
+
+    def test_wrong_key_residue_fails_and_cleanup_closes_owned_resources(self) -> None:
+        result, _iso, _log, state, temporary = self.run_smoke(
+            leak_on_wrong_key=True
+        )
+        self.addCleanup(temporary.cleanup)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("left a disposable vault mount or mapper active", result.stderr)
+        self.assertFalse((state / "loop-attached").exists())
+        self.assertEqual(list(state.glob("mapper.*")), [])
+        self.assertFalse((state / "manager-mounted").exists())
+
+    def test_cleanup_failure_is_loud_and_preserves_the_disposable_medium(self) -> None:
+        result, _iso, _log, state, temporary = self.run_smoke(
+            leak_on_wrong_key=True, cleanup_close_failure=True
+        )
+        self.addCleanup(temporary.cleanup)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Failed to close the disposable managed mapper", result.stderr)
+        self.assertIn("Preserving disposable media after cleanup failure", result.stderr)
+        self.assertTrue((state / "manager-close-failed").exists())
+        self.assertFalse((state / "loop-attached").exists())
+
+        backing = Path((state / "backing").read_text(encoding="utf-8").strip())
+        preserved = backing.parent
+        self.assertRegex(str(preserved), r"^/tmp/kernaid-qemu-usb-vault\.[A-Za-z0-9]+$")
+        self.assertTrue(preserved.is_dir())
+        shutil.rmtree(preserved)
+
+
+if __name__ == "__main__":
+    unittest.main()
