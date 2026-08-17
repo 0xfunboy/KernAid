@@ -4,8 +4,8 @@ repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 firmware="${1:-bios}"
 iso="${2:-$repo_dir/KernAid-Rescue-amd64.iso}"
 readonly boot_timeout_seconds=600
-for command in cp debugfs mkfs.ext4 mkfs.ntfs ntfsfix python3 \
-  qemu-system-x86_64 sha256sum sync tee truncate; do
+for command in cp dd debugfs mcopy mmd mkfs.ext4 mkfs.ntfs mkfs.vfat ntfsfix \
+  python3 qemu-system-x86_64 sgdisk sha256sum sync tee truncate; do
   command -v "$command" >/dev/null || { echo "Missing required command: $command" >&2; exit 2; }
 done
 if [[ "$EUID" -eq 0 ]]; then
@@ -124,8 +124,11 @@ temporary_log=0
 if [[ -z "${KERNAID_SMOKE_LOG:-}" ]]; then temporary_log=1; fi
 target_image="$($mktemp_command)"
 windows_target_image="$($mktemp_command)"
+windows_esp_image="$($mktemp_command)"
+windows_gpt_target_image="$($mktemp_command)"
 altered_windows_target_image="$($mktemp_command)"
 target_seed_dir="$($mktemp_command -d)"
+windows_esp_seed_dir="$($mktemp_command -d)"
 windows_seed_mount="$($mktemp_command -d)"
 qemu_pid=""
 windows_fixture_mounted=0
@@ -215,8 +218,9 @@ cleanup() {
   rm -rf "$target_seed_dir"
   if [[ "$windows_fixture_cleanup_safe" == "1" ]] \
     && ! "$findmnt_command" -rn --mountpoint "$windows_seed_mount" >/dev/null; then
-    rm -f "$windows_target_image" "$altered_windows_target_image"
-    rm -rf "$windows_seed_mount"
+    rm -f "$windows_target_image" "$windows_esp_image" \
+      "$windows_gpt_target_image" "$altered_windows_target_image"
+    rm -rf "$windows_esp_seed_dir" "$windows_seed_mount"
   else
     echo "Preserving the still-mounted disposable Windows fixture for runner cleanup" >&2
     cleanup_failed=1
@@ -290,7 +294,6 @@ printf '%s\n' KERNAID_WINDOWS_BCD_FIXTURE > \
   "$windows_seed_mount/Boot/BCD"
 sync -f "$windows_seed_mount"
 unmount_disposable_windows_fixture
-windows_target_hash_before="$(sha256sum "$windows_target_image" | awk '{print $1}')"
 cp --reflink=auto --sparse=always \
   "$windows_target_image" "$altered_windows_target_image"
 # ntfsfix deliberately schedules this disposable clone for a Windows check.
@@ -299,9 +302,43 @@ cp --reflink=auto --sparse=always \
 ntfsfix "$altered_windows_target_image" >/dev/null
 altered_windows_target_hash_before="$(sha256sum "$altered_windows_target_image" | awk '{print $1}')"
 
+# Build a same-disk GPT Windows fixture without a host loop device.  The
+# filesystem images are populated separately, then copied at fixed sector
+# offsets into the disposable GPT image.
+truncate -s 64M "$windows_esp_image"
+mkfs.vfat -F 32 -n KERNAID_ESP "$windows_esp_image" >/dev/null
+printf '%s\n' KERNAID_WINDOWS_EFI_BOOT_MANAGER_FIXTURE > \
+  "$windows_esp_seed_dir/bootmgfw.efi"
+printf '%s\n' KERNAID_WINDOWS_EFI_BCD_FIXTURE > \
+  "$windows_esp_seed_dir/BCD"
+printf '%s\n' KERNAID_WINDOWS_EFI_FALLBACK_FIXTURE > \
+  "$windows_esp_seed_dir/BOOTX64.EFI"
+MTOOLSRC=/dev/null mmd -i "$windows_esp_image" ::/EFI
+MTOOLSRC=/dev/null mmd -i "$windows_esp_image" ::/EFI/Microsoft
+MTOOLSRC=/dev/null mmd -i "$windows_esp_image" ::/EFI/Microsoft/Boot
+MTOOLSRC=/dev/null mmd -i "$windows_esp_image" ::/EFI/BOOT
+MTOOLSRC=/dev/null mcopy -i "$windows_esp_image" "$windows_esp_seed_dir/bootmgfw.efi" \
+  ::/EFI/Microsoft/Boot/bootmgfw.efi
+MTOOLSRC=/dev/null mcopy -i "$windows_esp_image" "$windows_esp_seed_dir/BCD" \
+  ::/EFI/Microsoft/Boot/BCD
+MTOOLSRC=/dev/null mcopy -i "$windows_esp_image" "$windows_esp_seed_dir/BOOTX64.EFI" \
+  ::/EFI/BOOT/BOOTX64.EFI
+truncate -s 256M "$windows_gpt_target_image"
+sgdisk --zap-all "$windows_gpt_target_image" >/dev/null
+sgdisk \
+  --new=1:2048:133119 --typecode=1:ef00 --change-name=1:KERNAID_ESP \
+  --new=2:133120:395263 --typecode=2:0700 --change-name=2:KERNAID_WINDOWS \
+  "$windows_gpt_target_image" >/dev/null
+sgdisk --verify "$windows_gpt_target_image" >/dev/null
+dd if="$windows_esp_image" of="$windows_gpt_target_image" bs=512 \
+  seek=2048 count=131072 conv=notrunc status=none
+dd if="$windows_target_image" of="$windows_gpt_target_image" bs=512 \
+  seek=133120 count=262144 conv=notrunc status=none
+windows_gpt_target_hash_before="$(sha256sum "$windows_gpt_target_image" | awk '{print $1}')"
+
 qemu_args=(-machine accel=tcg -m 2048 -smp 2 -cdrom "$iso" \
   -drive "file=$target_image,if=virtio,format=raw,cache=none" \
-  -drive "file=$windows_target_image,if=virtio,format=raw,cache=none" \
+  -drive "file=$windows_gpt_target_image,if=virtio,format=raw,cache=none" \
   -drive "file=$altered_windows_target_image,if=virtio,format=raw,cache=none" \
   -fw_cfg "name=opt/kernaid-offline-inspection,string=v1" \
   -boot d -display none -serial stdio -no-reboot)
@@ -331,9 +368,9 @@ for ((_attempt = 1; _attempt <= boot_timeout_seconds; _attempt++)); do
       echo "Rescue Observe boot modified the disposable target image" >&2
       exit 1
     fi
-    windows_target_hash_after="$(sha256sum "$windows_target_image" | awk '{print $1}')"
-    if [[ "$windows_target_hash_after" != "$windows_target_hash_before" ]]; then
-      echo "Rescue offline inspection modified the disposable Windows target image" >&2
+    windows_gpt_target_hash_after="$(sha256sum "$windows_gpt_target_image" | awk '{print $1}')"
+    if [[ "$windows_gpt_target_hash_after" != "$windows_gpt_target_hash_before" ]]; then
+      echo "Rescue offline inspection modified the disposable GPT Windows target image" >&2
       exit 1
     fi
     altered_windows_target_hash_after="$(sha256sum "$altered_windows_target_image" | awk '{print $1}')"
@@ -350,9 +387,9 @@ for ((_attempt = 1; _attempt <= boot_timeout_seconds; _attempt++)); do
       "KERNAID_QEMU_ATTESTATION_V1 firmware=$firmware iso_sha256=$iso_hash_after target_before_sha256=$target_hash_before target_after_sha256=$target_hash_after ready=true" \
       | tee -a "$log"
     printf '%s\n' \
-      "KERNAID_QEMU_OFFLINE_INSPECTION_ATTESTATION_V1 firmware=$firmware linux_before_sha256=$target_hash_before linux_after_sha256=$target_hash_after windows_before_sha256=$windows_target_hash_before windows_after_sha256=$windows_target_hash_after windows_altered_before_sha256=$altered_windows_target_hash_before windows_altered_after_sha256=$altered_windows_target_hash_after ready=true" \
+      "KERNAID_QEMU_OFFLINE_INSPECTION_ATTESTATION_V1 firmware=$firmware linux_before_sha256=$target_hash_before linux_after_sha256=$target_hash_after windows_gpt_before_sha256=$windows_gpt_target_hash_before windows_gpt_after_sha256=$windows_gpt_target_hash_after windows_altered_before_sha256=$altered_windows_target_hash_before windows_altered_after_sha256=$altered_windows_target_hash_after ready=true" \
       | tee -a "$log"
-    echo "PASS: KernAid Rescue booted with $firmware firmware, inspected Linux ext4 plus two volume-state-unqualified Windows NTFS fixtures read-only, and made zero target-image writes"
+    echo "PASS: KernAid Rescue booted with $firmware firmware, inspected Linux ext4, a same-disk GPT Windows NTFS plus ESP fixture, and an altered NTFS fixture read-only with zero target-image writes"
     exit 0
   fi
   if ! kill -0 "$qemu_pid" 2>/dev/null; then

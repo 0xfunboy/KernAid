@@ -79,6 +79,14 @@ test("inspection presentation exposes only normalized read-only facts", () => {
   assert.ok(
     view.facts.some((fact) => /Marker installazione: 6\/6/u.test(fact)),
   );
+  assert.ok(
+    view.facts.some((fact) => /Marker boot volume Windows: 2\/2/u.test(fact)),
+  );
+  assert.ok(
+    view.facts.some((fact) =>
+      /ESP associata: 2\/3 marker osservati/u.test(fact),
+    ),
+  );
   assert.ok(view.facts.some((fact) => /dirty\/ibernazione/u.test(fact)));
   assert.doesNotMatch(JSON.stringify(view), /scan:|target:|disk-1/u);
 });
@@ -156,6 +164,17 @@ test("typed unsupported and cleanup failures have fixed local guidance", () => {
     rescueInspectionNeedsRescan(
       new RescueOfflineInspectionError(
         "target-already-mounted",
+        true,
+        errorClaims(),
+        409,
+      ),
+    ),
+    true,
+  );
+  assert.equal(
+    rescueInspectionNeedsRescan(
+      new RescueOfflineInspectionError(
+        "associated-efi-already-mounted",
         true,
         errorClaims(),
         409,
@@ -354,7 +373,12 @@ function windowsInspectionFixture() {
       boot: {
         bootManagerPresent: true,
         bcdPresent: true,
-        efiBcdPresent: false,
+        efiSystemPartition: {
+          state: "inspected" as const,
+          microsoftBootManagerPresent: true,
+          bcdPresent: true,
+          fallbackBootloaderPresent: false,
+        },
       },
       servicing: {
         pendingXmlPresent: false,

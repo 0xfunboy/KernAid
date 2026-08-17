@@ -17,7 +17,8 @@ const LINUX_FSTAB_DIAGNOSIS: &str = "Il corpus Linux conferma l'installazione e 
 const LINUX_KERNEL_DIAGNOSIS: &str = "L'installazione Linux è confermata, ma nel volume ispezionato non è stato osservato alcun artefatto kernel regolare. Il boot può dipendere da un altro volume: serve una verifica read-only della topologia di avvio.";
 const LINUX_GENERIC_DIAGNOSIS: &str = "Installazione Linux confermata dal corpus statico read-only. Nei marker consentiti non emerge un'anomalia deterministica; servono controlli mirati prima di proporre modifiche.";
 const WINDOWS_PENDING_DIAGNOSIS: &str = "Il corpus Windows conferma l'installazione e mostra marker statici di servicing o riavvio pendente. La causa deve essere verificata con strumenti Windows nativi prima di qualsiasi riparazione.";
-const WINDOWS_BOOT_DIAGNOSIS: &str = "L'installazione Windows è confermata, ma il volume ispezionato non contiene marker boot consentiti. Gli artefatti possono trovarsi nella partizione EFI separata: non viene dichiarato un guasto senza quella verifica.";
+const WINDOWS_MISSING_BOOT_CHAIN_DIAGNOSIS: &str = "L'installazione Windows è confermata e l'unica partizione EFI associata è stata ispezionata in sola lettura, ma non contiene BCD, Windows Boot Manager o loader fallback x86-64. La catena di avvio richiede una verifica mirata prima di qualsiasi riparazione.";
+const WINDOWS_UNQUALIFIED_BOOT_TOPOLOGY_DIAGNOSIS: &str = "L'installazione Windows è confermata, ma il volume ispezionato non contiene marker boot consentiti e la partizione EFI associata non è stata qualificata univocamente. Non viene dichiarato un guasto: serve una verifica read-only della topologia delle partizioni e del layout di avvio.";
 const WINDOWS_GENERIC_DIAGNOSIS: &str = "Installazione Windows confermata dal corpus statico read-only. Nei marker consentiti non emerge un'anomalia deterministica; servono controlli Windows mirati prima di proporre modifiche.";
 
 static PROVIDER_REDACTION_PATTERNS: LazyLock<Result<Vec<Regex>, regex::Error>> = LazyLock::new(
@@ -341,13 +342,25 @@ impl RescueCorpus {
             Self::Windows(corpus)
                 if !corpus.boot.boot_manager_present
                     && !corpus.boot.bcd_present
-                    && !corpus.boot.efi_bcd_present =>
+                    && corpus.boot.efi_system_partition.all_markers_absent() =>
             {
                 DiagnosisProposal::deterministic(
-                    WINDOWS_BOOT_DIAGNOSIS,
+                    WINDOWS_MISSING_BOOT_CHAIN_DIAGNOSIS,
+                    0.76,
+                    evidence_id,
+                    "rescue.windows.boot-chain.verify.read-only.v1",
+                )
+            }
+            Self::Windows(corpus)
+                if !corpus.boot.boot_manager_present
+                    && !corpus.boot.bcd_present
+                    && !corpus.boot.efi_system_partition.is_inspected() =>
+            {
+                DiagnosisProposal::deterministic(
+                    WINDOWS_UNQUALIFIED_BOOT_TOPOLOGY_DIAGNOSIS,
                     0.46,
                     evidence_id,
-                    "rescue.windows.efi-bcd.read-only.v1",
+                    "rescue.windows.boot-topology.review.read-only.v1",
                 )
             }
             Self::Windows(_) => DiagnosisProposal::deterministic(
@@ -483,7 +496,7 @@ impl WindowsCorpus {
             && self.installation_markers.kernel_present
             && self.installation_markers.system_hive_present
             && self.installation_markers.software_hive_present;
-        if self.installation_confirmed != expected {
+        if self.installation_confirmed != expected || !self.boot.validate() {
             return Err(CorpusError::Invalid);
         }
         Ok(())
@@ -507,7 +520,69 @@ struct WindowsInstallationMarkers {
 struct WindowsBoot {
     boot_manager_present: bool,
     bcd_present: bool,
-    efi_bcd_present: bool,
+    efi_system_partition: WindowsEfiSystemPartition,
+}
+
+impl WindowsBoot {
+    fn validate(&self) -> bool {
+        self.efi_system_partition.validate()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum WindowsEfiSystemPartitionState {
+    Inspected,
+    NotPresent,
+    Ambiguous,
+    Unsupported,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WindowsEfiSystemPartition {
+    state: WindowsEfiSystemPartitionState,
+    microsoft_boot_manager_present: RequiredNullableBool,
+    bcd_present: RequiredNullableBool,
+    fallback_bootloader_present: RequiredNullableBool,
+}
+
+impl WindowsEfiSystemPartition {
+    fn validate(&self) -> bool {
+        match self.state {
+            WindowsEfiSystemPartitionState::Inspected => [
+                &self.microsoft_boot_manager_present,
+                &self.bcd_present,
+                &self.fallback_bootloader_present,
+            ]
+            .iter()
+            .all(|value| matches!(value, RequiredNullableBool::Bool(_))),
+            WindowsEfiSystemPartitionState::NotPresent
+            | WindowsEfiSystemPartitionState::Ambiguous
+            | WindowsEfiSystemPartitionState::Unsupported => [
+                &self.microsoft_boot_manager_present,
+                &self.bcd_present,
+                &self.fallback_bootloader_present,
+            ]
+            .iter()
+            .all(|value| matches!(value, RequiredNullableBool::Null(()))),
+        }
+    }
+
+    fn is_inspected(&self) -> bool {
+        self.state == WindowsEfiSystemPartitionState::Inspected
+    }
+
+    fn all_markers_absent(&self) -> bool {
+        self.is_inspected()
+            && [
+                &self.microsoft_boot_manager_present,
+                &self.bcd_present,
+                &self.fallback_bootloader_present,
+            ]
+            .iter()
+            .all(|value| matches!(value, RequiredNullableBool::Bool(false)))
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -521,6 +596,13 @@ struct WindowsServicing {
 #[serde(untagged)]
 enum RequiredNullableText {
     Text(String),
+    Null(()),
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+enum RequiredNullableBool {
+    Bool(bool),
     Null(()),
 }
 

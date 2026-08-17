@@ -900,10 +900,10 @@ mod tests {
     }
 
     #[test]
-    fn all_eight_shared_branches_are_covered_offline() {
+    fn all_eight_diagnosis_branches_plus_status_are_covered_offline() {
         let corpus = manifest();
         assert_eq!(corpus.schema_version, 1);
-        assert_eq!(corpus.cases.len(), 8);
+        assert_eq!(corpus.cases.len(), 9);
         for fixture in corpus.cases {
             let request =
                 parse_request_frame(&read_shared(&fixture.request)).expect("provider request");

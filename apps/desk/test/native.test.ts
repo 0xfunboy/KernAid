@@ -282,6 +282,8 @@ test("Rescue offline inspection parser is exact, cross-bound, and fail-closed", 
   const parsedWindows = parseRescueOfflineInspection(windows, windowsSelection);
   assert.equal(parsedWindows.os.family, "windows");
   assert.equal(parsedWindows.claims.mountCleanupVerified, true);
+  if (parsedWindows.os.family === "windows")
+    assert.equal(parsedWindows.os.boot.efiSystemPartition.state, "inspected");
 
   const linuxSelection = rescueLinuxTargetSelectionFixture();
   const linux = rescueLinuxInspectionFixture();
@@ -357,6 +359,77 @@ test("Rescue offline inspection parser is exact, cross-bound, and fail-closed", 
   const impossibleBoot = structuredClone(linux.os);
   impossibleBoot.boot.directoryPresent = false;
   assert.throws(() => parseRescueOfflineCorpus(impossibleBoot));
+
+  const nonInspectedEfiWithFacts = {
+    ...windows.os,
+    boot: {
+      ...windows.os.boot,
+      efiSystemPartition: {
+        state: "not-present",
+        microsoftBootManagerPresent: false,
+        bcdPresent: false,
+        fallbackBootloaderPresent: false,
+      },
+    },
+  };
+  assert.throws(() => parseRescueOfflineCorpus(nonInspectedEfiWithFacts));
+  const inspectedEfiWithNulls = {
+    ...windows.os,
+    boot: {
+      ...windows.os.boot,
+      efiSystemPartition: {
+        state: "inspected",
+        microsoftBootManagerPresent: null,
+        bcdPresent: null,
+        fallbackBootloaderPresent: null,
+      },
+    },
+  };
+  assert.throws(() => parseRescueOfflineCorpus(inspectedEfiWithNulls));
+  assert.throws(() =>
+    parseRescueOfflineCorpus({
+      ...windows.os,
+      boot: {
+        ...windows.os.boot,
+        efiSystemPartition: {
+          state: ["not-present"],
+          microsoftBootManagerPresent: null,
+          bcdPresent: null,
+          fallbackBootloaderPresent: null,
+        },
+      },
+    }),
+  );
+
+  const missingEfi = {
+    ...windows,
+    os: {
+      ...windows.os,
+      boot: {
+        ...windows.os.boot,
+        efiSystemPartition: {
+          state: "not-present",
+          microsoftBootManagerPresent: null,
+          bcdPresent: null,
+          fallbackBootloaderPresent: null,
+        },
+      },
+    },
+    limitations: [
+      ...windows.limitations,
+      "associated-efi-system-partition-not-present",
+    ],
+  };
+  assert.equal(
+    parseRescueOfflineInspection(missingEfi, windowsSelection).os.family,
+    "windows",
+  );
+  assert.throws(() =>
+    parseRescueOfflineInspection(
+      { ...missingEfi, limitations: windows.limitations },
+      windowsSelection,
+    ),
+  );
 });
 
 test("Rescue evidence projection contains only the normalized offline corpus", () => {
@@ -571,6 +644,34 @@ test("Rescue inspection errors are typed, non-retried, and never expose backend 
         assert.equal(
           (error as RescueOfflineInspectionError).code,
           "read-only-mount-failed",
+        );
+        assert.equal(
+          (error as RescueOfflineInspectionError).claims.mountCleanupVerified,
+          true,
+        );
+        return true;
+      },
+    );
+
+    setFetch(async () =>
+      Response.json(
+        {
+          error: {
+            code: "associated-efi-read-only-mount-failed",
+            message: "ESP mount rejected safely",
+            retryable: false,
+            claims: rescueInspectionClaims(),
+          },
+        },
+        { status: 422 },
+      ),
+    );
+    await assert.rejects(
+      inspectRescueInstalledTarget(selection),
+      (error: unknown) => {
+        assert.equal(
+          (error as RescueOfflineInspectionError).code,
+          "associated-efi-read-only-mount-failed",
         );
         assert.equal(
           (error as RescueOfflineInspectionError).claims.mountCleanupVerified,
@@ -1129,7 +1230,7 @@ test("Rescue OpenAI golden requests preserve deterministic TypeScript parity", a
   const diagnoseCases = manifest.validCases.filter(
     ({ name }) => name !== "status",
   );
-  assert.equal(diagnoseCases.length, 7);
+  assert.equal(diagnoseCases.length, 8);
   const provider = new PlatformOfflineRulesProvider();
   for (const golden of diagnoseCases) {
     const request = JSON.parse(
@@ -1798,7 +1899,12 @@ function rescueWindowsInspectionFixture() {
       boot: {
         bootManagerPresent: true,
         bcdPresent: true,
-        efiBcdPresent: false,
+        efiSystemPartition: {
+          state: "inspected",
+          microsoftBootManagerPresent: true,
+          bcdPresent: true,
+          fallbackBootloaderPresent: false,
+        },
       },
       servicing: {
         pendingXmlPresent: true,

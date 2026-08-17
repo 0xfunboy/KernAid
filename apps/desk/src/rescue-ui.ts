@@ -146,12 +146,25 @@ export function rescueInspectionPresentation(
       ],
     };
   }
+  const efi = corpus.boot.efiSystemPartition;
+  const efiFact =
+    efi.state === "inspected"
+      ? `ESP associata: ${presentCount([
+          efi.microsoftBootManagerPresent,
+          efi.bcdPresent,
+          efi.fallbackBootloaderPresent,
+        ])}/3 marker osservati`
+      : `ESP associata: ${efi.state}`;
   return {
     title: "Windows",
     detail: `${inspection.target.filesystem.toUpperCase()} · ${corpus.installationConfirmed ? "installazione confermata" : "installazione non confermata"} · sola lettura`,
     facts: [
       `Marker installazione: ${presentCount(Object.values(corpus.installationMarkers))}/6 osservati`,
-      `Marker boot: ${presentCount(Object.values(corpus.boot))}/3 osservati`,
+      `Marker boot volume Windows: ${presentCount([
+        corpus.boot.bootManagerPresent,
+        corpus.boot.bcdPresent,
+      ])}/2 osservati`,
+      efiFact,
       `Servicing pendente: ${corpus.servicing.pendingXmlPresent || corpus.servicing.rebootPendingMarkerPresent ? "osservato" : "non osservato"}`,
       "Stato dirty/ibernazione NTFS non qualificato",
     ],
@@ -226,6 +239,7 @@ export function rescueInspectionErrorPresentation(
       return cleanupNotVerifiedPresentation();
     case "inspection-timeout":
     case "privileged-helper-unavailable":
+    case "associated-efi-already-mounted":
     case "target-already-mounted":
       return {
         title: "Ispezione temporaneamente non disponibile",
@@ -260,6 +274,7 @@ export function rescueInspectionNeedsRescan(
   error: RescueOfflineInspectionError,
 ): boolean {
   return new Set([
+    "associated-efi-already-mounted",
     "target-already-mounted",
     "target-device-ambiguous",
     "target-identity-changed",

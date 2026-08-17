@@ -44,14 +44,24 @@ The current Rescue image supports x86-64 PCs with legacy BIOS or UEFI. It is not
    the exact target again before it starts the session; a topology change
    cancels the selection.
 5. Read the result, confidence and evidence identifiers. This image currently
-   reports only what it has actually inspected. Target selection alone cannot
-   become an installed-OS diagnosis because no filesystem content has been
-   mounted or read yet.
+   reports only what it has actually inspected. Target selection alone remains
+   metadata-only and cannot become an installed-OS diagnosis. **Diagnostica**
+   may inspect a qualified direct leaf ext4 or NTFS target using a temporary
+   read-only mount. Disks with any mounted descendant are not selectable. For
+   an otherwise-selectable Windows target on GPT, KernAid inspects a separate
+   EFI System Partition only when exactly one unmounted direct-sibling FAT
+   partition has the standard ESP type; zero, multiple, or otherwise
+   unqualified siblings produce `not-present`, `ambiguous`, or `unsupported`
+   and make no boot-failure claim.
 6. Download the JSON report and retain its displayed SHA-256 prefix with the job
    record.
 7. Shut the live system down before removing the USB drive.
 
-KernAid currently stages an R0 observation plan and performs no repair mutation. The absence of a finding is not proof that the machine is healthy.
+The Windows EFI result contains only presence booleans for BCD, Windows Boot
+Manager, and the x86-64 fallback loader. It contains no discovered filenames,
+directory listings, bytes, device identifiers, or customer paths. KernAid
+currently stages an R0 observation plan and performs no repair mutation. The
+absence of a finding is not proof that the machine is healthy.
 
 ## Diagnose a running operating system
 

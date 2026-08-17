@@ -47,6 +47,12 @@
       "request": "valid/windows-generic.request.raw",
       "outcome": "response",
       "response": "windows-generic.response.json"
+    },
+    {
+      "name": "windows-unqualified-esp",
+      "request": "valid/windows-unqualified-esp.request.raw",
+      "outcome": "response",
+      "response": "windows-unqualified-esp.response.json"
     }
   ]
 }

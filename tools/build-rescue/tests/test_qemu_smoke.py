@@ -34,7 +34,17 @@ class MockToolchain:
         executable(self.bin / name, source)
 
     def _install(self) -> None:
-        for name in ("debugfs", "mkfs.ext4", "mkfs.ntfs", "ntfsfix"):
+        for name in (
+            "dd",
+            "debugfs",
+            "mcopy",
+            "mmd",
+            "mkfs.ext4",
+            "mkfs.ntfs",
+            "mkfs.vfat",
+            "ntfsfix",
+            "sgdisk",
+        ):
             self._tool(
                 name,
                 """
@@ -303,6 +313,18 @@ class QemuSmokeFixturePrivilegeTests(unittest.TestCase):
             self.assertFalse((mocks.state / "direct-ntfs-3g").exists())
             self.assertFalse((mocks.state / "direct-umount").exists())
             self.assertFalse((mocks.state / "direct-mktemp").exists())
+
+    def test_gpt_esp_fixture_uses_explicit_host_tools_and_no_user_mtools_config(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        workflow = RESCUE_WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("mkfs.vfat", source)
+        self.assertIn("sgdisk", source)
+        self.assertEqual(source.count("MTOOLSRC=/dev/null mmd"), 4)
+        self.assertEqual(source.count("MTOOLSRC=/dev/null mcopy"), 3)
+        self.assertIn("windows_gpt_target_hash_before", source)
+        self.assertIn("windows_gpt_target_hash_after", source)
+        for package in ("dosfstools", "gdisk", "mtools"):
+            self.assertIn(package, workflow)
 
     def test_fixture_mount_is_the_only_sudo_scope_and_qemu_is_unprivileged(
         self,

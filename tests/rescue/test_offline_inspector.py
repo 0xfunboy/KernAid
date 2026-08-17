@@ -83,6 +83,7 @@ def resolution(
     topology_kinds: list[str] | None = None,
     topology_filesystems: list[str] | None = None,
     unlock: bool = False,
+    associated_efi: dict[str, object] | None = None,
 ) -> dict[str, object]:
     return {
         "candidate": candidate(family, unlock=unlock),
@@ -96,6 +97,41 @@ def resolution(
         "topologyFilesystems": [filesystem]
         if topology_filesystems is None
         else topology_filesystems,
+        "associatedEfiSystemPartition": (
+            {"state": "not-present"}
+            if associated_efi is None
+            else associated_efi
+        ),
+    }
+
+
+def eligible_efi_resolution() -> dict[str, object]:
+    return {
+        "state": "eligible",
+        "deviceIdentity": {
+            "name": "sda1",
+            "maj:min": "8:1",
+            "type": "part",
+            "size": 1024,
+            "ro": False,
+            "rm": False,
+            "tran": None,
+            "fstype": "vfat",
+            "fsver": None,
+            "mountpoints": [],
+            "uuid": "TEST-ESP-UUID",
+            "partuuid": "TEST-ESP-PARTUUID",
+            "ptuuid": None,
+            "pttype": None,
+            "parttype": offline_inspector.EFI_SYSTEM_PARTITION_TYPE,
+            "serial": None,
+            "wwn": None,
+        },
+        "majorMinor": "8:1",
+        "filesystem": "vfat",
+        "kernelKind": "part",
+        "leaf": True,
+        "directOnDisk": True,
     }
 
 
@@ -216,6 +252,42 @@ class CorpusTests(unittest.TestCase):
         self.assertNotIn("Customer Name", encoded)
         self.assertNotIn("customer-secret", encoded)
 
+    def test_efi_corpus_uses_only_three_fixed_presence_markers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "EFI/Microsoft/Boot").mkdir(parents=True)
+            (root / "EFI/BOOT").mkdir(parents=True)
+            (root / "EFI/Microsoft/Boot/bootmgfw.efi").write_bytes(b"secret")
+            (root / "EFI/Microsoft/Boot/BCD").write_bytes(b"secret")
+            (root / "EFI/BOOT/BOOTX64.EFI").write_bytes(b"secret")
+            (root / "EFI/customer-private-name").write_bytes(b"secret")
+            root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                result = offline_inspector.collect_efi_system_partition(root_fd)
+            finally:
+                os.close(root_fd)
+        self.assertEqual(
+            result,
+            {
+                "microsoftBootManagerPresent": True,
+                "bcdPresent": True,
+                "fallbackBootloaderPresent": True,
+            },
+        )
+        self.assertNotIn("customer-private-name", json.dumps(result))
+        self.assertNotIn("secret", json.dumps(result))
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "EFI/Microsoft/Boot").mkdir(parents=True)
+            (root / "EFI/Microsoft/Boot/BCD").symlink_to("/etc/passwd")
+            root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                with self.assertRaises(offline_inspector.InspectionError):
+                    offline_inspector.collect_efi_system_partition(root_fd)
+            finally:
+                os.close(root_fd)
+
     def test_symlink_fifo_and_oversize_allowed_files_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -333,6 +405,102 @@ class QualificationTests(unittest.TestCase):
             resolution("ext4", family="windows"), "ambiguous-os-family"
         )
 
+    def test_efi_resolution_accepts_only_exact_internal_states(self) -> None:
+        self.assertEqual(
+            offline_inspector._qualify_efi_system_partition(
+                eligible_efi_resolution()
+            ),
+            ("eligible", "8:1", "vfat"),
+        )
+        for state in ("not-present", "ambiguous", "unsupported"):
+            self.assertEqual(
+                offline_inspector._qualify_efi_system_partition({"state": state}),
+                (state, None, None),
+            )
+        malformed = eligible_efi_resolution()
+        identity = malformed["deviceIdentity"]
+        if not isinstance(identity, dict):
+            raise RuntimeError("bad fake ESP identity")
+        identity["maj:min"] = "8:9"
+        with self.assertRaises(offline_inspector.InspectionError) as context:
+            offline_inspector._qualify_efi_system_partition(malformed)
+        self.assertEqual(context.exception.code, "target-resolution-invalid")
+
+    def test_efi_qualifier_accepts_the_real_normalized_identity_shape(self) -> None:
+        def raw_device(
+            name: str,
+            major_minor: str,
+            kind: str,
+            *,
+            filesystem: str | None = None,
+            partition_table: str | None = None,
+            partition_type: str | None = None,
+            children: list[dict[str, object]] | None = None,
+        ) -> dict[str, object]:
+            value: dict[str, object] = {
+                "name": name,
+                "maj:min": major_minor,
+                "type": kind,
+                "size": 1024,
+                "ro": False,
+                "rm": False,
+                "tran": None,
+                "fstype": filesystem,
+                "fsver": None,
+                "mountpoints": [],
+                "uuid": None,
+                "partuuid": None,
+                "ptuuid": None,
+                "pttype": partition_table,
+                "parttype": partition_type,
+                "serial": None,
+                "wwn": None,
+            }
+            if children is not None:
+                value["children"] = children
+            return value
+
+        raw = json.dumps(
+            {
+                "blockdevices": [
+                    raw_device(
+                        "sda",
+                        "8:0",
+                        "disk",
+                        partition_table="gpt",
+                        children=[
+                            raw_device(
+                                "sda1",
+                                "8:1",
+                                "part",
+                                filesystem="vfat",
+                                partition_type=offline_inspector.EFI_SYSTEM_PARTITION_TYPE,
+                            ),
+                            raw_device(
+                                "sda2",
+                                "8:2",
+                                "part",
+                                filesystem="ntfs",
+                            ),
+                        ],
+                    )
+                ]
+            }
+        )
+        snapshot, resolutions = (
+            rescue_server._normalize_installed_targets_with_resolutions(raw)
+        )
+        windows = next(
+            item
+            for item in snapshot["candidates"]
+            if item["osFamilyHint"] == "windows"
+        )
+        esp = resolutions[windows["targetId"]]["associatedEfiSystemPartition"]
+        self.assertEqual(
+            offline_inspector._qualify_efi_system_partition(esp),
+            ("eligible", "8:1", "vfat"),
+        )
+
 
 class EngineTests(unittest.TestCase):
     def run_engine(
@@ -340,19 +508,27 @@ class EngineTests(unittest.TestCase):
         targets: FakeTargets | None = None,
         *,
         umount_error: OSError | None = None,
+        umount_error_call: int = 1,
+        calls_out: list[tuple[object, ...]] | None = None,
     ) -> tuple[dict[str, object], list[tuple[object, ...]]]:
         fake_targets = FakeTargets() if targets is None else targets
         engine = offline_inspector.OfflineInspectionEngine(fake_targets)
-        calls: list[tuple[object, ...]] = []
-        descriptor = os.open("/dev/null", os.O_RDONLY)
+        calls: list[tuple[object, ...]] = [] if calls_out is None else calls_out
+        umount_count = 0
 
         def mount_call(*args: object) -> None:
             calls.append(("mount", *args))
 
         def umount_call(*args: object) -> None:
+            nonlocal umount_count
+            umount_count += 1
             calls.append(("umount", *args))
-            if umount_error is not None:
+            if umount_error is not None and umount_count == umount_error_call:
                 raise umount_error
+
+        def open_bound(major_minor: str, _deadline: float) -> tuple[int, int, int]:
+            major, minor = (int(part) for part in major_minor.split(":"))
+            return os.open("/dev/null", os.O_RDONLY), major, minor
 
         normalized_linux = {
             "family": "linux",
@@ -400,7 +576,7 @@ class EngineTests(unittest.TestCase):
                 "softwareHivePresent": True,
                 "usersDirectoryPresent": True,
             },
-            "boot": {"bootManagerPresent": True, "bcdPresent": True, "efiBcdPresent": False},
+            "boot": {"bootManagerPresent": True, "bcdPresent": True},
             "servicing": {
                 "pendingXmlPresent": True,
                 "rebootPendingMarkerPresent": False,
@@ -416,7 +592,7 @@ class EngineTests(unittest.TestCase):
             patch.object(
                 offline_inspector,
                 "_open_bound_block_device",
-                return_value=(descriptor, 8, 2),
+                side_effect=open_bound,
             ),
             patch.object(offline_inspector, "_assert_block_fd"),
             patch.object(offline_inspector, "_mount_call", side_effect=mount_call),
@@ -424,6 +600,15 @@ class EngineTests(unittest.TestCase):
             patch.object(offline_inspector, "collect_linux", return_value=normalized_linux),
             patch.object(
                 offline_inspector, "collect_windows", return_value=normalized_windows
+            ),
+            patch.object(
+                offline_inspector,
+                "collect_efi_system_partition",
+                return_value={
+                    "microsoftBootManagerPresent": True,
+                    "bcdPresent": True,
+                    "fallbackBootloaderPresent": False,
+                },
             ),
             patch.object(offline_inspector, "_umount_call", side_effect=umount_call),
             patch.object(offline_inspector, "_verify_unmounted"),
@@ -498,6 +683,121 @@ class EngineTests(unittest.TestCase):
             result["limitations"],
         )
         self.assertNotIn("ntfsinfo", INSPECTOR_PATH.read_text(encoding="utf-8"))
+
+    def test_unique_esp_is_mounted_serially_and_returns_only_typed_markers(self) -> None:
+        targets = FakeTargets(
+            resolution(
+                "ntfs",
+                family="windows",
+                associated_efi=eligible_efi_resolution(),
+            )
+        )
+        result, calls = self.run_engine(targets)
+        mounts = [call for call in calls if call[0] == "mount"]
+        unmounts = [call for call in calls if call[0] == "umount"]
+        self.assertEqual(len(mounts), 2)
+        self.assertEqual(len(unmounts), 2)
+        self.assertLess(calls.index(unmounts[0]), calls.index(mounts[1]))
+        esp_mount = mounts[1]
+        self.assertRegex(esp_mount[1].decode("ascii"), r"^/proc/self/fd/[0-9]+$")
+        self.assertEqual(esp_mount[3], b"vfat")
+        self.assertIsNone(esp_mount[5])
+        for required in (
+            offline_inspector.MS_RDONLY,
+            offline_inspector.MS_NOSUID,
+            offline_inspector.MS_NODEV,
+            offline_inspector.MS_NOEXEC,
+            offline_inspector.MS_NOSYMFOLLOW,
+        ):
+            self.assertEqual(esp_mount[4] & required, required)
+        self.assertEqual(
+            result["os"]["boot"]["efiSystemPartition"],
+            {
+                "state": "inspected",
+                "microsoftBootManagerPresent": True,
+                "bcdPresent": True,
+                "fallbackBootloaderPresent": False,
+            },
+        )
+        self.assertEqual(targets.resolve_count, 4)
+        serialized = json.dumps(result)
+        self.assertNotIn("majorMinor", serialized)
+        self.assertNotIn("/proc/self/fd", serialized)
+
+    def test_esp_cleanup_failure_dominates_and_never_uses_lazy_detach(self) -> None:
+        targets = FakeTargets(
+            resolution(
+                "ntfs",
+                family="windows",
+                associated_efi=eligible_efi_resolution(),
+            )
+        )
+        with self.assertRaises(offline_inspector.InspectionError) as context:
+            self.run_engine(
+                targets,
+                umount_error=OSError(errno := 16, os.strerror(errno)),
+                umount_error_call=2,
+            )
+        self.assertEqual(context.exception.code, "mount-cleanup-failed")
+        self.assertTrue(context.exception.fatal_cleanup)
+        self.assertFalse(context.exception.claims["mountCleanupVerified"])
+
+    def test_esp_resolution_change_before_mount_fails_closed(self) -> None:
+        targets = FakeTargets(
+            resolution(
+                "ntfs",
+                family="windows",
+                associated_efi=eligible_efi_resolution(),
+            )
+        )
+        original = targets.resolve_installed_target
+
+        def changed(request: dict[str, object], *, deadline: float):
+            selected, resolved = original(request, deadline=deadline)
+            if targets.resolve_count == 3:
+                esp = resolved["associatedEfiSystemPartition"]
+                if not isinstance(esp, dict):
+                    raise RuntimeError("bad fake ESP")
+                esp["majorMinor"] = "8:9"
+            return selected, resolved
+
+        targets.resolve_installed_target = changed  # type: ignore[method-assign]
+        calls: list[tuple[object, ...]] = []
+        with self.assertRaises(offline_inspector.InspectionError) as context:
+            self.run_engine(targets, calls_out=calls)
+        self.assertEqual(context.exception.code, "target-identity-changed")
+        self.assertEqual(len([call for call in calls if call[0] == "mount"]), 1)
+
+    def test_already_mounted_esp_preserves_verified_root_cleanup_claim(self) -> None:
+        targets = FakeTargets(
+            resolution(
+                "ntfs",
+                family="windows",
+                associated_efi=eligible_efi_resolution(),
+            )
+        )
+        selected, resolved = targets.resolve_installed_target(
+            REQUEST, deadline=time.monotonic() + 2
+        )
+        claims = offline_inspector._empty_claims()
+        claims["mountOperationPerformed"] = True
+        claims["mountCleanupVerified"] = True
+        with (
+            patch.object(
+                offline_inspector, "_target_already_mounted", return_value=True
+            ),
+            self.assertRaises(offline_inspector.InspectionError) as context,
+        ):
+            offline_inspector._inspect_associated_efi_system_partition(
+                targets,
+                REQUEST,
+                selected,
+                resolved,
+                claims,
+                time.monotonic() + 2,
+            )
+        self.assertEqual(context.exception.code, "associated-efi-already-mounted")
+        self.assertTrue(context.exception.claims["mountCleanupVerified"])
 
     def test_ntfs_mount_verification_rejects_force_superoption(self) -> None:
         entry = {
@@ -883,6 +1183,10 @@ class BoundaryTests(unittest.TestCase):
         self.assertIn("debugfs", smoke)
         self.assertIn("feature needs_recovery", smoke)
         self.assertIn("mkfs.ntfs", smoke)
+        self.assertIn("mkfs.vfat", smoke)
+        self.assertIn("sgdisk", smoke)
+        self.assertIn("MTOOLSRC=/dev/null mmd", smoke)
+        self.assertIn("MTOOLSRC=/dev/null mcopy", smoke)
         self.assertIn("ntfsfix", smoke)
         self.assertNotIn('"norecover"', ready)
         self.assertNotIn("ntfsinfo", ready)
@@ -891,12 +1195,18 @@ class BoundaryTests(unittest.TestCase):
         self.assertIn("volumeStateQualification", ready)
         self.assertIn("ntfs-dirty-and-hibernated-state-was-not-qualified", ready)
         self.assertIn("len(candidates) == 2", ready)
-        self.assertIn("Windows fixture targets are not distinct", ready)
+        self.assertIn("one GPT partition Windows fixture target is required", ready)
+        self.assertIn("one distinct whole-disk Windows fixture target", ready)
+        self.assertIn('efi.get("state") == "inspected"', ready)
+        self.assertIn("microsoftBootManagerPresent", ready)
+        self.assertIn("fallbackBootloaderPresent", ready)
+        self.assertIn("same-disk EFI system partition markers were not inspected", ready)
         self.assertNotIn("dirty_windows_", smoke)
-        self.assertIn("windows_target_hash_before=", smoke)
-        self.assertIn("windows_target_hash_after=", smoke)
+        self.assertIn("windows_gpt_target_hash_before=", smoke)
+        self.assertIn("windows_gpt_target_hash_after=", smoke)
         self.assertIn(
-            '"$windows_target_hash_after" != "$windows_target_hash_before"', smoke
+            '"$windows_gpt_target_hash_after" != "$windows_gpt_target_hash_before"',
+            smoke,
         )
         self.assertIn("altered_windows_target_hash_before=", smoke)
         self.assertIn("altered_windows_target_hash_after=", smoke)

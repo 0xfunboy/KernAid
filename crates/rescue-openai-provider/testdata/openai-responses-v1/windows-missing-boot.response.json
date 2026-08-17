@@ -15,7 +15,7 @@
           "type": "output_text",
           "annotations": [],
           "logprobs": [],
-          "text": "{\"requestId\":\"O-66666666-6666-6666-6666-666666666666\",\"operation\":\"provider.openai.diagnose\",\"proposal\":{\"schemaVersion\":\"1.0\",\"diagnosis\":\"L'installazione Windows è confermata, ma il volume ispezionato non contiene marker boot consentiti. Gli artefatti possono trovarsi nella partizione EFI separata: non viene dichiarato un guasto senza quella verifica.\",\"confidence\":0.46,\"evidenceIds\":[\"E-RESCUE-CORPUS\"],\"requestedEvidence\":[\"rescue.windows.efi-bcd.read-only.v1\"]}}"
+          "text": "{\"requestId\":\"O-66666666-6666-6666-6666-666666666666\",\"operation\":\"provider.openai.diagnose\",\"proposal\":{\"schemaVersion\":\"1.0\",\"diagnosis\":\"L'installazione Windows è confermata e l'unica partizione EFI associata è stata ispezionata in sola lettura, ma non contiene BCD, Windows Boot Manager o loader fallback x86-64. La catena di avvio richiede una verifica mirata prima di qualsiasi riparazione.\",\"confidence\":0.76,\"evidenceIds\":[\"E-RESCUE-CORPUS\"],\"requestedEvidence\":[\"rescue.windows.boot-chain.verify.read-only.v1\"]}}"
         }
       ]
     }

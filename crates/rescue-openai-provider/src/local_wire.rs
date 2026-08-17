@@ -570,7 +570,7 @@ mod tests {
     fn shared_valid_fixtures_match_every_deterministic_rescue_branch() {
         let manifest = golden_manifest();
         assert_eq!(manifest.schema_version, 1);
-        assert_eq!(manifest.valid_cases.len(), 8);
+        assert_eq!(manifest.valid_cases.len(), 9);
         for golden in manifest.valid_cases {
             let request_bytes = read_fixture(&golden.request);
             let response_bytes = read_fixture(&golden.response);

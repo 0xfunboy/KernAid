@@ -40,6 +40,11 @@
       "name": "windows-generic",
       "request": "valid/windows-generic.request.raw",
       "response": "valid/windows-generic.response.raw"
+    },
+    {
+      "name": "windows-unqualified-esp",
+      "request": "valid/windows-unqualified-esp.request.raw",
+      "response": "valid/windows-unqualified-esp.response.raw"
     }
   ],
   "invalidRequests": [

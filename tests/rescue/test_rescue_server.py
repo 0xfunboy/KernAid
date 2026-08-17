@@ -115,6 +115,7 @@ def target_scan_fixture() -> str:
                             "nvme0n1p1",
                             "part",
                             filesystem="vfat",
+                            parttype=rescue_server.EFI_SYSTEM_PARTITION_TYPE,
                             uuid="CUSTOMER-EFI-UUID-SECRET",
                         ),
                         block_device(
@@ -1354,6 +1355,113 @@ class InstalledTargetTests(unittest.TestCase):
             "sdb",
         ):
             self.assertNotIn(private_value, serialized)
+
+    def test_internal_resolution_binds_only_one_direct_gpt_esp_sibling(self) -> None:
+        snapshot, resolutions = rescue_server._normalize_installed_targets_with_resolutions(
+            target_scan_fixture()
+        )
+        windows = next(
+            candidate
+            for candidate in snapshot["candidates"]
+            if candidate["osFamilyHint"] == "windows"
+        )
+        resolved = resolutions[windows["targetId"]]
+        esp = resolved["associatedEfiSystemPartition"]
+        self.assertEqual(esp["state"], "eligible")
+        self.assertEqual(esp["filesystem"], "vfat")
+        self.assertEqual(esp["kernelKind"], "part")
+        self.assertTrue(esp["leaf"])
+        self.assertTrue(esp["directOnDisk"])
+        self.assertNotIn("associatedEfiSystemPartition", json.dumps(snapshot))
+
+        duplicate = json.loads(target_scan_fixture())
+        disk = duplicate["blockdevices"][1]
+        disk["children"].insert(
+            1,
+            block_device(
+                "nvme0n1p9",
+                "part",
+                filesystem="vfat",
+                parttype=rescue_server.EFI_SYSTEM_PARTITION_TYPE,
+            ),
+        )
+        duplicate_snapshot, duplicate_resolutions = (
+            rescue_server._normalize_installed_targets_with_resolutions(
+                json.dumps(duplicate)
+            )
+        )
+        duplicate_windows = next(
+            candidate
+            for candidate in duplicate_snapshot["candidates"]
+            if candidate["osFamilyHint"] == "windows"
+        )
+        self.assertEqual(
+            duplicate_resolutions[duplicate_windows["targetId"]][
+                "associatedEfiSystemPartition"
+            ],
+            {"state": "ambiguous"},
+        )
+
+        unsupported = json.loads(target_scan_fixture())
+        unsupported["blockdevices"][1]["children"][0]["fstype"] = "ext4"
+        unsupported_snapshot, unsupported_resolutions = (
+            rescue_server._normalize_installed_targets_with_resolutions(
+                json.dumps(unsupported)
+            )
+        )
+        unsupported_windows = next(
+            candidate
+            for candidate in unsupported_snapshot["candidates"]
+            if candidate["osFamilyHint"] == "windows"
+        )
+        self.assertEqual(
+            unsupported_resolutions[unsupported_windows["targetId"]][
+                "associatedEfiSystemPartition"
+            ],
+            {"state": "unsupported"},
+        )
+
+    def test_nested_candidate_does_not_abort_efi_sibling_resolution(self) -> None:
+        fixture = json.dumps(
+            {
+                "blockdevices": [
+                    block_device(
+                        "sda",
+                        "disk",
+                        pttype="gpt",
+                        children=[
+                            block_device(
+                                "sda1",
+                                "part",
+                                filesystem="vfat",
+                                parttype=rescue_server.EFI_SYSTEM_PARTITION_TYPE,
+                            ),
+                            block_device(
+                                "sda2",
+                                "part",
+                                filesystem="LVM2_member",
+                                children=[
+                                    block_device(
+                                        "vg-root",
+                                        "lvm",
+                                        filesystem="ext4",
+                                    )
+                                ],
+                            ),
+                        ],
+                    )
+                ]
+            }
+        )
+        snapshot, resolutions = rescue_server._normalize_installed_targets_with_resolutions(
+            fixture
+        )
+        self.assertEqual(len(snapshot["candidates"]), 1)
+        candidate = snapshot["candidates"][0]
+        self.assertEqual(
+            resolutions[candidate["targetId"]]["associatedEfiSystemPartition"],
+            {"state": "unsupported"},
+        )
 
     def test_multi_pv_lvm_disables_only_the_involved_disks(self) -> None:
         snapshot = rescue_server.normalize_installed_targets(multi_pv_lvm_fixture())

@@ -159,6 +159,8 @@ LINUX_ROOT_PARTITION_TYPES = {
     "4f68bce3-e8cd-4db1-96e7-fbcaf984b709",  # x86-64 root
     "44479540-f297-41b2-9af7-d131d5f0458a",  # x86 root
 }
+EFI_SYSTEM_PARTITION_TYPE = "c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
+EFI_SYSTEM_FILESYSTEMS = {"fat", "vfat"}
 APPLE_APFS_PARTITION_TYPE = "7c3457ef-0000-11aa-aa11-00306543ecac"
 OBSERVE_AUTHORIZATION_FIELDS = {
     "sessionId",
@@ -904,6 +906,49 @@ def _candidate_nodes(device: dict[str, object]) -> list[dict[str, object]]:
     return [device] if _candidate_classification(device) is not None else []
 
 
+def _associated_efi_system_partition(
+    disk: dict[str, object], candidate: dict[str, object]
+) -> dict[str, object]:
+    """Resolve one direct GPT ESP sibling without exposing it publicly."""
+    if disk["partition_table"] != "gpt" or candidate is disk:
+        return {"state": "not-present"}
+    children = disk["children"]
+    if not isinstance(children, list):
+        raise TargetScanError("Topologia ESP normalizzata non valida.")
+    if not any(child is candidate for child in children):
+        return {"state": "unsupported"}
+    matches = [
+        child
+        for child in children
+        if child is not candidate
+        and child["partition_type"] == EFI_SYSTEM_PARTITION_TYPE
+    ]
+    if not matches:
+        return {"state": "not-present"}
+    if len(matches) != 1:
+        return {"state": "ambiguous"}
+    selected = matches[0]
+    selected_children = selected["children"]
+    if not isinstance(selected_children, list):
+        raise TargetScanError("Topologia ESP normalizzata non valida.")
+    if (
+        selected["kind"] != "part"
+        or selected_children
+        or selected["filesystem"] not in EFI_SYSTEM_FILESYSTEMS
+        or selected["mounted"] is not False
+    ):
+        return {"state": "unsupported"}
+    return {
+        "state": "eligible",
+        "deviceIdentity": selected["identity"],
+        "majorMinor": selected["major_minor"],
+        "filesystem": selected["filesystem"],
+        "kernelKind": selected["kind"],
+        "leaf": True,
+        "directOnDisk": True,
+    }
+
+
 def _flatten_target_volumes(
     disk: dict[str, object], disk_ref: str
 ) -> tuple[list[dict[str, object]], dict[int, str]]:
@@ -1051,6 +1096,9 @@ def _normalize_installed_targets_with_resolutions(
                 "directOnDisk": candidate is disk or direct_child,
                 "topologyKinds": topology_kinds,
                 "topologyFilesystems": topology_filesystems,
+                "associatedEfiSystemPartition": _associated_efi_system_partition(
+                    disk, candidate
+                ),
             }
 
     snapshot: dict[str, object] = {

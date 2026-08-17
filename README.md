@@ -26,8 +26,11 @@ CI produces engineering-preview desktop installers for Windows, Linux, Intel mac
   `tools/make-device` to create the USB. Boot the PC from USB, select the
   installed-system candidate in the left rail, and keep Secure Boot disabled
   for this engineering preview. The target is re-scanned before every session;
-  this milestone selects storage metadata only and does not yet inspect the
-  installed filesystem.
+  target selection itself remains metadata-only. When **Diagnostica** starts,
+  the qualified helper can inspect a direct leaf ext4 or NTFS installation
+  read-only. For a Windows partition on GPT it also inspects exactly one
+  unmounted direct-sibling FAT EFI System Partition, when uniquely qualified,
+  and returns only fixed boot-marker booleans. No repair or unlock is attempted.
 - **Windows, Linux or macOS that does boot:** download that operating system's desktop artifact, install it, and launch KernAid like a normal application. Windows and macOS startup collect only a fast, derived target identity; the deeper P0 collection starts once when **Diagnostica** is selected. macOS queries only the current-user `launchd` table and safe-boot integer, and explicitly reports system `launchd`, software-update availability, system-event analysis, and login/background-item counts as unqualified instead of inventing results. The fixed commands do not request repairs, although native Windows tools such as DISM may still update their own operating-system logs.
 - **Optional Resident OpenAI reasoning:** configure the public
   `resident-default` profile from the hidden native TTY prompts of
@@ -42,7 +45,7 @@ CI produces engineering-preview desktop installers for Windows, Linux, Intel mac
   remain the startup/default provider and require no account or network.
 - **Do not use on customer data as a repair tool yet:** the current workflow diagnoses and stages an R0 no-write plan. It deliberately cannot execute real repairs.
 
-The Rescue artifact is rebuilt and boot-tested in QEMU using both legacy BIOS and UEFI firmware. Each test attaches a disposable target disk, proves the live UI ready, and verifies that the complete target image is byte-identical before and after boot. Secure Boot and physical-machine compatibility remain release gates, not claimed capabilities.
+The Rescue artifact is rebuilt and boot-tested in QEMU using both legacy BIOS and UEFI firmware. Each test attaches only disposable target images, including one same-disk GPT Windows fixture with NTFS and EFI partitions, proves the live UI ready, and verifies that each complete target image is byte-identical before and after boot. Secure Boot and physical-machine compatibility remain release gates, not claimed capabilities.
 
 ## Trust boundaries
 

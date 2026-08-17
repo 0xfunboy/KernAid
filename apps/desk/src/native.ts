@@ -91,6 +91,9 @@ const MACOS_NOT_RUN_COLLECTORS = new Set<string>([
   "macos.system-events.summary",
 ]);
 const RESCUE_INSPECTION_ERROR_CODES = new Set([
+  "associated-efi-already-mounted",
+  "associated-efi-inspection-failed",
+  "associated-efi-read-only-mount-failed",
   "ambiguous-os-family",
   "helper-response-too-large",
   "inspection-failed",
@@ -277,13 +280,27 @@ export interface RescueWindowsOfflineCorpus {
   boot: {
     bootManagerPresent: boolean;
     bcdPresent: boolean;
-    efiBcdPresent: boolean;
+    efiSystemPartition: RescueEfiSystemPartitionCorpus;
   };
   servicing: {
     pendingXmlPresent: boolean;
     rebootPendingMarkerPresent: boolean;
   };
 }
+
+export type RescueEfiSystemPartitionCorpus =
+  | {
+      state: "inspected";
+      microsoftBootManagerPresent: boolean;
+      bcdPresent: boolean;
+      fallbackBootloaderPresent: boolean;
+    }
+  | {
+      state: "not-present" | "ambiguous" | "unsupported";
+      microsoftBootManagerPresent: null;
+      bcdPresent: null;
+      fallbackBootloaderPresent: null;
+    };
 
 export type RescueOfflineCorpus =
   RescueLinuxOfflineCorpus | RescueWindowsOfflineCorpus;
@@ -321,6 +338,9 @@ export interface RescueOfflineInspection {
 }
 
 export type RescueOfflineInspectionErrorCode =
+  | "associated-efi-already-mounted"
+  | "associated-efi-inspection-failed"
+  | "associated-efi-read-only-mount-failed"
   | "ambiguous-os-family"
   | "helper-response-too-large"
   | "inspection-failed"
@@ -668,6 +688,12 @@ export function parseRescueOfflineInspection(
       ? [
           ...baseLimitations,
           "ntfs-dirty-and-hibernated-state-was-not-qualified",
+          ...(corpus.family === "windows" &&
+          corpus.boot.efiSystemPartition.state !== "inspected"
+            ? [
+                `associated-efi-system-partition-${corpus.boot.efiSystemPartition.state}`,
+              ]
+            : []),
         ]
       : baseLimitations;
   if (!sameStringList(item.limitations, expectedLimitations))
@@ -1149,6 +1175,7 @@ function validRescueInspectionErrorContract(
     case "invalid-inspection-request":
       return httpStatus === 400 && !retryable;
     case "ambiguous-os-family":
+    case "associated-efi-read-only-mount-failed":
     case "invalid-installed-os-metadata":
     case "read-only-mount-failed":
     case "unsafe-target-content":
@@ -1157,6 +1184,7 @@ function validRescueInspectionErrorContract(
     case "unsupported-encrypted-storage":
     case "unsupported-filesystem":
       return httpStatus === 422 && !retryable;
+    case "associated-efi-already-mounted":
     case "target-already-mounted":
       return httpStatus === 409 && retryable;
     case "target-identity-invalid":
@@ -1178,6 +1206,7 @@ function validRescueInspectionErrorContract(
     case "mount-verification-failed":
     case "target-resolution-invalid":
       return httpStatus === 503 && !retryable;
+    case "associated-efi-inspection-failed":
     case "inspection-failed":
       return httpStatus === 503;
     default:
@@ -1389,7 +1418,13 @@ function parseRescueWindowsOfflineCorpus(
   const boot = exactRecord(item.boot, [
     "bootManagerPresent",
     "bcdPresent",
-    "efiBcdPresent",
+    "efiSystemPartition",
+  ]);
+  const efiSystemPartition = exactRecord(boot.efiSystemPartition, [
+    "state",
+    "microsoftBootManagerPresent",
+    "bcdPresent",
+    "fallbackBootloaderPresent",
   ]);
   const servicing = exactRecord(item.servicing, [
     "pendingXmlPresent",
@@ -1406,7 +1441,23 @@ function parseRescueWindowsOfflineCorpus(
     item.family !== "windows" ||
     typeof item.installationConfirmed !== "boolean" ||
     Object.values(markers).some((entry) => typeof entry !== "boolean") ||
-    Object.values(boot).some((entry) => typeof entry !== "boolean") ||
+    typeof boot.bootManagerPresent !== "boolean" ||
+    typeof boot.bcdPresent !== "boolean" ||
+    typeof efiSystemPartition.state !== "string" ||
+    !["inspected", "not-present", "ambiguous", "unsupported"].includes(
+      efiSystemPartition.state,
+    ) ||
+    (efiSystemPartition.state === "inspected"
+      ? [
+          efiSystemPartition.microsoftBootManagerPresent,
+          efiSystemPartition.bcdPresent,
+          efiSystemPartition.fallbackBootloaderPresent,
+        ].some((entry) => typeof entry !== "boolean")
+      : [
+          efiSystemPartition.microsoftBootManagerPresent,
+          efiSystemPartition.bcdPresent,
+          efiSystemPartition.fallbackBootloaderPresent,
+        ].some((entry) => entry !== null)) ||
     Object.values(servicing).some((entry) => typeof entry !== "boolean") ||
     item.installationConfirmed !==
       requiredMarkers.every((entry) => entry === true)
@@ -1416,7 +1467,11 @@ function parseRescueWindowsOfflineCorpus(
     family: item.family,
     installationConfirmed: item.installationConfirmed,
     installationMarkers: markers,
-    boot,
+    boot: {
+      bootManagerPresent: boot.bootManagerPresent,
+      bcdPresent: boot.bcdPresent,
+      efiSystemPartition,
+    },
     servicing,
   }) as RescueWindowsOfflineCorpus;
 }
@@ -1918,18 +1973,32 @@ function diagnoseRescueOfflineCorpus(
       evidenceIds,
       requestedEvidence: ["windows.update.state"],
     });
+  const windowsRootBootMissing =
+    !corpus.boot.bootManagerPresent && !corpus.boot.bcdPresent;
+  const efi = corpus.boot.efiSystemPartition;
   if (
-    !corpus.boot.bootManagerPresent &&
-    !corpus.boot.bcdPresent &&
-    !corpus.boot.efiBcdPresent
+    windowsRootBootMissing &&
+    efi.state === "inspected" &&
+    !efi.microsoftBootManagerPresent &&
+    !efi.bcdPresent &&
+    !efi.fallbackBootloaderPresent
   )
     return parseDiagnosisProposal({
       schemaVersion: "1.0",
       diagnosis:
-        "L'installazione Windows è confermata, ma il volume ispezionato non contiene marker boot consentiti. Gli artefatti possono trovarsi nella partizione EFI separata: non viene dichiarato un guasto senza quella verifica.",
+        "L'installazione Windows è confermata e l'unica partizione EFI associata è stata ispezionata in sola lettura, ma non contiene BCD, Windows Boot Manager o loader fallback x86-64. La catena di avvio richiede una verifica mirata prima di qualsiasi riparazione.",
+      confidence: 0.76,
+      evidenceIds,
+      requestedEvidence: ["rescue.windows.boot-chain.verify.read-only.v1"],
+    });
+  if (windowsRootBootMissing && efi.state !== "inspected")
+    return parseDiagnosisProposal({
+      schemaVersion: "1.0",
+      diagnosis:
+        "L'installazione Windows è confermata, ma il volume ispezionato non contiene marker boot consentiti e la partizione EFI associata non è stata qualificata univocamente. Non viene dichiarato un guasto: serve una verifica read-only della topologia delle partizioni e del layout di avvio.",
       confidence: 0.46,
       evidenceIds,
-      requestedEvidence: ["rescue.windows.efi-bcd.read-only.v1"],
+      requestedEvidence: ["rescue.windows.boot-topology.review.read-only.v1"],
     });
   return parseDiagnosisProposal({
     schemaVersion: "1.0",

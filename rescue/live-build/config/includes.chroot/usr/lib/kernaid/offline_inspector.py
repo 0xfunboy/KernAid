@@ -61,6 +61,33 @@ SUPPORTED_FILESYSTEMS = {
         "read-only-no-force-driver-replay-not-applied",
     ),
 }
+EFI_SYSTEM_FILESYSTEMS = {"fat": "vfat", "vfat": "vfat"}
+EFI_SYSTEM_PARTITION_TYPE = "c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
+EFI_SYSTEM_PARTITION_STATES = {
+    "eligible",
+    "not-present",
+    "ambiguous",
+    "unsupported",
+}
+DEVICE_IDENTITY_FIELDS = {
+    "name",
+    "maj:min",
+    "type",
+    "size",
+    "ro",
+    "rm",
+    "tran",
+    "fstype",
+    "fsver",
+    "mountpoints",
+    "uuid",
+    "partuuid",
+    "ptuuid",
+    "pttype",
+    "parttype",
+    "serial",
+    "wwn",
+}
 STACKED_KINDS = {"crypt", "lvm", "md", "raid", "raid0", "raid1", "raid4", "raid5", "raid6", "raid10"}
 STACKED_FILESYSTEMS = {
     "apfs",
@@ -948,10 +975,6 @@ def collect_windows(root_fd: int, deadline: float) -> dict[str, object]:
                 root_fd, ("Boot", "BCD"), {"regular"}
             )
             == "regular",
-            "efiBcdPresent": _require_safe_kind(
-                root_fd, ("EFI", "Microsoft", "Boot", "BCD"), {"regular"}
-            )
-            == "regular",
         },
         "servicing": {
             "pendingXmlPresent": _require_safe_kind(
@@ -965,6 +988,26 @@ def collect_windows(root_fd: int, deadline: float) -> dict[str, object]:
             )
             == "regular",
         },
+    }
+
+
+def collect_efi_system_partition(root_fd: int) -> dict[str, bool]:
+    """Collect fixed x86-64 boot markers without returning names or bytes."""
+    return {
+        "microsoftBootManagerPresent": _require_safe_kind(
+            root_fd,
+            ("EFI", "Microsoft", "Boot", "bootmgfw.efi"),
+            {"regular"},
+        )
+        == "regular",
+        "bcdPresent": _require_safe_kind(
+            root_fd, ("EFI", "Microsoft", "Boot", "BCD"), {"regular"}
+        )
+        == "regular",
+        "fallbackBootloaderPresent": _require_safe_kind(
+            root_fd, ("EFI", "BOOT", "BOOTX64.EFI"), {"regular"}
+        )
+        == "regular",
     }
 
 
@@ -1037,8 +1080,315 @@ def _qualify_resolution(
     return mount_filesystem, replay_option, expected_family, recovery_policy
 
 
+def _qualify_efi_system_partition(
+    resolution: object,
+) -> tuple[str, str | None, str | None]:
+    if not isinstance(resolution, dict):
+        raise InspectionError(
+            "target-resolution-invalid",
+            "La risoluzione interna della partizione EFI non è valida.",
+            status=503,
+        )
+    state = resolution.get("state")
+    if state not in EFI_SYSTEM_PARTITION_STATES:
+        raise InspectionError(
+            "target-resolution-invalid",
+            "La risoluzione interna della partizione EFI non è valida.",
+            status=503,
+        )
+    if state != "eligible":
+        if set(resolution) != {"state"}:
+            raise InspectionError(
+                "target-resolution-invalid",
+                "La risoluzione interna della partizione EFI non è valida.",
+                status=503,
+            )
+        return str(state), None, None
+    if set(resolution) != {
+        "state",
+        "deviceIdentity",
+        "majorMinor",
+        "filesystem",
+        "kernelKind",
+        "leaf",
+        "directOnDisk",
+    }:
+        raise InspectionError(
+            "target-resolution-invalid",
+            "La risoluzione interna della partizione EFI non è valida.",
+            status=503,
+        )
+    major_minor = resolution.get("majorMinor")
+    filesystem = resolution.get("filesystem")
+    device_identity = resolution.get("deviceIdentity")
+    identity_text_fields = (
+        "name",
+        "type",
+        "tran",
+        "fstype",
+        "fsver",
+        "uuid",
+        "partuuid",
+        "ptuuid",
+        "pttype",
+        "parttype",
+        "serial",
+        "wwn",
+    )
+    if (
+        not isinstance(device_identity, dict)
+        or set(device_identity) != DEVICE_IDENTITY_FIELDS
+        or not isinstance(major_minor, str)
+        or device_identity.get("maj:min") != major_minor
+        or not isinstance(device_identity.get("name"), str)
+        or not device_identity.get("name")
+        or not isinstance(device_identity.get("type"), str)
+        or str(device_identity.get("type")).lower() != "part"
+        or any(
+            device_identity.get(field) is not None
+            and not isinstance(device_identity.get(field), str)
+            for field in identity_text_fields
+        )
+        or not isinstance(device_identity.get("size"), int)
+        or isinstance(device_identity.get("size"), bool)
+        or int(device_identity.get("size", -1)) < 0
+        or not isinstance(device_identity.get("ro"), bool)
+        or not isinstance(device_identity.get("rm"), bool)
+        or not isinstance(device_identity.get("mountpoints"), list)
+        or len(device_identity.get("mountpoints", [])) > 32
+        or any(
+            entry is not None and not isinstance(entry, str)
+            for entry in device_identity.get("mountpoints", [])
+        )
+        or any(device_identity.get("mountpoints", []))
+        or not isinstance(device_identity.get("fstype"), str)
+        or str(device_identity.get("fstype")).lower() != filesystem
+        or not isinstance(device_identity.get("parttype"), str)
+        or str(device_identity.get("parttype")).lower()
+        != EFI_SYSTEM_PARTITION_TYPE
+        or filesystem not in EFI_SYSTEM_FILESYSTEMS
+        or resolution.get("kernelKind") != "part"
+        or resolution.get("leaf") is not True
+        or resolution.get("directOnDisk") is not True
+    ):
+        raise InspectionError(
+            "target-resolution-invalid",
+            "La risoluzione interna della partizione EFI non è valida.",
+            status=503,
+        )
+    _major_minor_parts(major_minor)
+    return "eligible", major_minor, EFI_SYSTEM_FILESYSTEMS[str(filesystem)]
+
+
 def _canonical_resolution(value: object) -> str:
     return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+
+
+def _empty_efi_system_partition(state: str) -> dict[str, object]:
+    return {
+        "state": state,
+        "microsoftBootManagerPresent": None,
+        "bcdPresent": None,
+        "fallbackBootloaderPresent": None,
+    }
+
+
+def _assert_target_resolution_unchanged(
+    targets: object,
+    request: dict[str, object],
+    selection_before: dict[str, object],
+    resolution_before: dict[str, object],
+    deadline: float,
+    claims: dict[str, bool],
+) -> None:
+    selection_after, resolution_after = targets.resolve_installed_target(
+        request, deadline=deadline
+    )
+    if (
+        targets.canonical_target_selection(selection_before)
+        != targets.canonical_target_selection(selection_after)
+        or _canonical_resolution(resolution_before)
+        != _canonical_resolution(resolution_after)
+    ):
+        raise InspectionError(
+            "target-identity-changed",
+            "Il target è cambiato durante l'ispezione offline.",
+            status=409,
+            claims=claims,
+        )
+
+
+def _inspect_associated_efi_system_partition(
+    targets: object,
+    request: dict[str, object],
+    selection_before: dict[str, object],
+    resolution_before: dict[str, object],
+    claims: dict[str, bool],
+    deadline: float,
+) -> dict[str, object]:
+    try:
+        state, major_minor, mount_filesystem = _qualify_efi_system_partition(
+            resolution_before.get("associatedEfiSystemPartition")
+        )
+    except InspectionError as error:
+        error.claims = dict(claims)
+        raise
+    if state != "eligible":
+        return _empty_efi_system_partition(state)
+    if major_minor is None or mount_filesystem != "vfat":
+        raise InspectionError(
+            "target-resolution-invalid",
+            "La risoluzione interna della partizione EFI non è valida.",
+            status=503,
+            claims=claims,
+        )
+
+    _assert_target_resolution_unchanged(
+        targets,
+        request,
+        selection_before,
+        resolution_before,
+        deadline,
+        claims,
+    )
+    descriptor = -1
+    major = -1
+    minor = -1
+    mountpoint = ""
+    mounted = False
+    observed: dict[str, bool] | None = None
+    primary_error: BaseException | None = None
+    try:
+        _check_deadline(deadline)
+        if _target_already_mounted(major_minor):
+            raise InspectionError(
+                "associated-efi-already-mounted",
+                "La partizione EFI associata risulta già montata; l'ispezione è stata annullata.",
+                status=409,
+                retryable=True,
+                claims=claims,
+            )
+        descriptor, major, minor = _open_bound_block_device(major_minor, deadline)
+        _assert_block_fd(descriptor, major, minor)
+        mountpoint = tempfile.mkdtemp(prefix="efi-inspection-", dir=MOUNT_BASE)
+        os.chmod(mountpoint, 0o700)
+        claims["mountCleanupVerified"] = False
+        claims["mountOperationAttempted"] = True
+        try:
+            _mount_call(
+                f"/proc/self/fd/{descriptor}".encode("ascii"),
+                os.fsencode(mountpoint),
+                b"vfat",
+                MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_NOSYMFOLLOW,
+                None,
+            )
+        except OSError as error:
+            raise InspectionError(
+                "associated-efi-read-only-mount-failed",
+                "La partizione EFI associata non può essere montata con la policy read-only richiesta.",
+                claims=claims,
+            ) from error
+        mounted = True
+        claims["mountOperationPerformed"] = True
+        _verify_mounted(
+            mountpoint,
+            major_minor,
+            "vfat",
+            None,
+            descriptor,
+            major,
+            minor,
+        )
+        root_fd = os.open(
+            mountpoint,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+        try:
+            _assert_block_fd(descriptor, major, minor)
+            _check_deadline(deadline)
+            observed = collect_efi_system_partition(root_fd)
+            _check_deadline(deadline)
+            _assert_block_fd(descriptor, major, minor)
+            _verify_mounted(
+                mountpoint,
+                major_minor,
+                "vfat",
+                None,
+                descriptor,
+                major,
+                minor,
+            )
+        finally:
+            os.close(root_fd)
+    except BaseException as error:
+        primary_error = error
+    finally:
+        cleanup_error: BaseException | None = None
+        if mounted:
+            try:
+                _umount_call(os.fsencode(mountpoint), 0)
+                mounted = False
+            except BaseException as error:
+                cleanup_error = InspectionError(
+                    "mount-cleanup-failed",
+                    "Il mount temporaneo EFI non può essere rimosso in modo verificato.",
+                    status=503,
+                    claims=claims,
+                    fatal_cleanup=True,
+                )
+                cleanup_error.__cause__ = error
+        if descriptor >= 0:
+            try:
+                _assert_block_fd(descriptor, major, minor)
+                if not mounted:
+                    _verify_unmounted(mountpoint, major_minor)
+                    _assert_target_resolution_unchanged(
+                        targets,
+                        request,
+                        selection_before,
+                        resolution_before,
+                        deadline,
+                        claims,
+                    )
+                    claims["mountCleanupVerified"] = True
+            except BaseException as error:
+                cleanup_error = cleanup_error or error
+            finally:
+                os.close(descriptor)
+        if mountpoint:
+            try:
+                os.rmdir(mountpoint)
+            except OSError as error:
+                cleanup_error = cleanup_error or InspectionError(
+                    "mount-cleanup-failed",
+                    "La directory temporanea EFI non può essere rimossa.",
+                    status=503,
+                    claims=claims,
+                    fatal_cleanup=True,
+                )
+                if cleanup_error.__cause__ is None:
+                    cleanup_error.__cause__ = error
+        if cleanup_error is not None:
+            primary_error = cleanup_error
+    if primary_error is not None:
+        if isinstance(primary_error, InspectionError):
+            primary_error.claims = dict(claims)
+            raise primary_error
+        raise InspectionError(
+            "associated-efi-inspection-failed",
+            "L'ispezione della partizione EFI associata non è stata completata in sicurezza.",
+            status=503,
+            retryable=True,
+            claims=claims,
+        ) from primary_error
+    if observed is None or claims["mountCleanupVerified"] is not True:
+        raise InspectionError(
+            "associated-efi-inspection-failed",
+            "L'ispezione della partizione EFI associata non ha prodotto un risultato verificato.",
+            status=503,
+            claims=claims,
+        )
+    return {"state": "inspected", **observed}
 
 
 class OfflineInspectionEngine:
@@ -1169,23 +1519,14 @@ class OfflineInspectionEngine:
                     _assert_block_fd(descriptor, major, minor)
                     if not mounted:
                         _verify_unmounted(mountpoint, major_minor)
-                        selection_after, resolution_after = (
-                            self.targets.resolve_installed_target(
-                                request, deadline=deadline
-                            )
+                        _assert_target_resolution_unchanged(
+                            self.targets,
+                            request,
+                            selection_before,
+                            resolution_before,
+                            deadline,
+                            claims,
                         )
-                        if (
-                            self.targets.canonical_target_selection(selection_before)
-                            != self.targets.canonical_target_selection(selection_after)
-                            or _canonical_resolution(resolution_before)
-                            != _canonical_resolution(resolution_after)
-                        ):
-                            raise InspectionError(
-                                "target-identity-changed",
-                                "Il target è cambiato durante l'ispezione offline.",
-                                status=409,
-                                claims=claims,
-                            )
                         claims["mountCleanupVerified"] = True
                 except BaseException as error:
                     cleanup_error = cleanup_error or error
@@ -1224,6 +1565,26 @@ class OfflineInspectionEngine:
                 status=503,
                 claims=claims,
             )
+        efi_state: str | None = None
+        if expected_family == "windows":
+            efi = _inspect_associated_efi_system_partition(
+                self.targets,
+                request,
+                selection_before,
+                resolution_before,
+                claims,
+                deadline,
+            )
+            boot = collected.get("boot")
+            if not isinstance(boot, dict):
+                raise InspectionError(
+                    "inspection-failed",
+                    "L'ispezione Windows non ha prodotto un risultato valido.",
+                    status=503,
+                    claims=claims,
+                )
+            boot["efiSystemPartition"] = efi
+            efi_state = str(efi["state"])
         candidate = selection_before["target"]
         if not isinstance(candidate, dict):
             raise InspectionError(
@@ -1273,6 +1634,11 @@ class OfflineInspectionEngine:
                 *(
                     ["ntfs-dirty-and-hibernated-state-was-not-qualified"]
                     if mount_filesystem == "ntfs3"
+                    else []
+                ),
+                *(
+                    [f"associated-efi-system-partition-{efi_state}"]
+                    if efi_state in {"not-present", "ambiguous", "unsupported"}
                     else []
                 ),
             ],
