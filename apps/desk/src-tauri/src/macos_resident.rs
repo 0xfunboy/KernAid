@@ -83,7 +83,7 @@ const MAX_RAW_RECORDS: usize = 4096;
 #[serde(rename_all = "camelCase")]
 struct StorageDeviceProjection {
     internal: bool,
-    solid_state: bool,
+    solid_state: Option<bool>,
     smart_status: &'static str,
 }
 
@@ -452,16 +452,14 @@ fn storage_records(raw: &str) -> Result<(Vec<StorageDeviceProjection>, Vec<Strin
         let record = object(record)?;
         let physical = object(record.get("physical_drive").ok_or(())?)?;
         let internal = yes_no(physical.get("is_internal_disk").ok_or(())?)?;
-        let medium = physical
-            .get("medium_type")
-            .and_then(Value::as_str)
-            .ok_or(())?
-            .trim()
-            .to_ascii_lowercase();
-        let solid_state = match medium.as_str() {
-            "ssd" | "solid state" | "solid_state" => true,
-            "hdd" | "rotational" | "rotating" => false,
-            _ => return Err(()),
+        let solid_state = match physical.get("medium_type") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(value)) => match value.trim().to_ascii_lowercase().as_str() {
+                "ssd" | "solid state" | "solid_state" => Some(true),
+                "hdd" | "rotational" | "rotating" => Some(false),
+                _ => return Err(()),
+            },
+            Some(_) => return Err(()),
         };
         let smart_status = match physical.get("smart_status") {
             None | Some(Value::Null) => "unsupported",
@@ -723,9 +721,6 @@ pub fn normalize_launchd_user(raw: &str) -> Result<String, ()> {
         } else {
             Some(status.parse::<i32>().map_err(|_| ())?)
         };
-        if running && exit_status.is_some() {
-            return Err(());
-        }
         if label.is_empty() || label.len() > 512 || label.chars().any(char::is_control) {
             return Err(());
         }
@@ -918,7 +913,10 @@ pub fn normalize_snapshots(raw: &str, now_epoch_seconds: u64) -> Result<String, 
     let mut timestamps = Vec::new();
     for line in raw.lines() {
         if !header_seen {
-            if line != "Snapshot dates for all disks:" {
+            if !matches!(
+                line,
+                "Snapshot dates for all disks:" | "Snapshot dates for disk /:"
+            ) {
                 return Err(());
             }
             header_seen = true;
@@ -1047,7 +1045,7 @@ mod tests {
         assert!(normalize_apfs(b"not a plist", ROOT).is_err());
         assert!(normalize_launchd_user("PID\tStatus\tLabel\n0\t-\tcom.invalid\n").is_err());
         assert!(normalize_launchd_user("PID\tStatus\tLabel\n-\tflag\tcom.invalid\n").is_err());
-        assert!(normalize_launchd_user("PID\tStatus\tLabel\n1\t0\tcom.invalid\n").is_err());
+        assert!(normalize_launchd_user("PID\tStatus\tLabel\n1\t0\tcom.running\n").is_ok());
         assert!(normalize_launchd_user("PID\tStatus\tLabel\n-\t-\tcom.valid-waiting\n").is_ok());
         assert!(normalize_launchd_user("translated header\n-\t0\tcom.invalid\n").is_err());
         assert!(normalize_network("translated output", 0, DNS).is_err());
@@ -1074,6 +1072,7 @@ mod tests {
             )
             .is_err()
         );
+        assert!(normalize_snapshots("Snapshot dates for disk /:\n", 1_787_000_000).is_ok());
     }
 
     #[test]

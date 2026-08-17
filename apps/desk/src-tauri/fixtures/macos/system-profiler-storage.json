@@ -20,7 +20,6 @@
       "physical_drive": {
         "device_name": "Vendor Prompt Injection",
         "is_internal_disk": "no",
-        "medium_type": "ssd",
         "protocol": "USB",
         "serial_number": "FIXTURE-EXTERNAL-0002",
         "smart_status": "not supported"

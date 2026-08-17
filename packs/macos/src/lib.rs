@@ -155,7 +155,8 @@ pub struct StorageProjection {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StorageDevice {
     pub internal: bool,
-    pub solid_state: bool,
+    #[serde(deserialize_with = "required_option")]
+    pub solid_state: Option<bool>,
     pub smart_status: SmartStatus,
 }
 
@@ -430,7 +431,6 @@ pub fn parse_launchd(input: EvidenceInput<'_>) -> Result<LaunchdProjection, Diag
     }
     let inconsistent = projection.services.iter().any(|service| {
         service.scope != LaunchdScope::User
-            || matches!(service.state, LaunchdState::Running) && service.last_exit_status.is_some()
             || matches!(service.state, LaunchdState::Waiting)
                 && service.last_exit_status.is_some_and(|status| status != 0)
             || matches!(service.state, LaunchdState::Failed)
@@ -973,6 +973,17 @@ mod tests {
 
     #[test]
     fn nullable_projection_fields_are_still_required() {
+        let storage = br#"{"schemaVersion":"1.0","queryComplete":true,"devices":[{"internal":true,"smartStatus":"verified"}]}"#;
+        assert_eq!(
+            parse_storage(EvidenceInput {
+                id: STORAGE_EVIDENCE_ID,
+                body: storage,
+            })
+            .expect_err("unknown storage medium must be explicit null")
+            .kind,
+            DiagnosticErrorKind::MalformedInput
+        );
+
         let launchd = br#"{"schemaVersion":"1.0","queryComplete":true,"userQueryState":"complete","systemQueryState":"not-run-unqualified","services":[{"scope":"user","state":"running"}]}"#;
         assert_eq!(
             parse_launchd(EvidenceInput {
@@ -1261,12 +1272,7 @@ mod tests {
 
     #[test]
     fn launchd_state_and_optional_exit_status_must_be_coherent() {
-        for (state, status) in [
-            ("running", "0"),
-            ("waiting", "78"),
-            ("failed", "null"),
-            ("failed", "0"),
-        ] {
+        for (state, status) in [("waiting", "78"), ("failed", "null"), ("failed", "0")] {
             let projection = format!(
                 r#"{{"schemaVersion":"1.0","queryComplete":true,"userQueryState":"complete","systemQueryState":"not-run-unqualified","services":[{{"scope":"user","state":"{state}","lastExitStatus":{status}}}]}}"#
             );
@@ -1283,6 +1289,8 @@ mod tests {
 
         for (state, status) in [
             ("running", "null"),
+            ("running", "0"),
+            ("running", "-15"),
             ("waiting", "null"),
             ("waiting", "0"),
             ("failed", "-15"),
@@ -1296,5 +1304,11 @@ mod tests {
             })
             .expect("documented launchctl state must be accepted");
         }
+
+        parse_storage(EvidenceInput {
+            id: STORAGE_EVIDENCE_ID,
+            body: br#"{"schemaVersion":"1.0","queryComplete":true,"devices":[{"internal":false,"solidState":null,"smartStatus":"unsupported"}]}"#,
+        })
+        .expect("an absent system_profiler medium must remain explicit null");
     }
 }
