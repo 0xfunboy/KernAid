@@ -1,0 +1,31 @@
+[Unit]
+Description=KernAid boot-scoped offline target identifier key
+Before=kernaid-offline-inspector.socket
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I /usr/lib/kernaid/offline_inspector.py --initialize-target-key
+RemainAfterExit=yes
+User=root
+Group=root
+UMask=0077
+RuntimeDirectory=kernaid-offline-inspector
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+NoNewPrivileges=yes
+PrivateNetwork=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectClock=yes
+ProtectHostname=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native

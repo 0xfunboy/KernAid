@@ -8,6 +8,8 @@ import hmac
 import json
 import os
 import signal
+import socket
+import stat
 import subprocess
 import threading
 import time
@@ -60,7 +62,74 @@ TARGET_SCAN_API_VERSION = "kernaid.dev/rescue-targets/v1alpha1"
 RESCUE_TARGET_FINGERPRINT_DOMAIN = "kernaid-rescue-observe-target-v1"
 ALLOWED_HOSTS = {"127.0.0.1:4173", "localhost:4173"}
 ALLOWED_ORIGINS = {"http://127.0.0.1:4173", "http://localhost:4173"}
-TARGET_ID_KEY = os.urandom(32)
+TARGET_ID_KEY_FILE = "/run/kernaid-offline-inspector/target-id.key"
+
+
+def _load_target_id_key() -> bytes:
+    """Load the boot-scoped helper key, or use a process-local UI key."""
+    configured = os.environ.get("KERNAID_TARGET_ID_KEY_FILE")
+    if configured is None:
+        return os.urandom(32)
+    if configured != TARGET_ID_KEY_FILE:
+        raise RuntimeError("the target identifier key path is not allowed")
+    descriptor = os.open(
+        configured, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    )
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != 0
+            or before.st_gid != 0
+            or stat.S_IMODE(before.st_mode) != 0o600
+            or before.st_nlink != 1
+            or before.st_size != 32
+        ):
+            raise RuntimeError("the target identifier key is not a secure file")
+        key = os.read(descriptor, 33)
+        after = os.fstat(descriptor)
+        if (
+            len(key) != 32
+            or (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+            )
+            != (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+            )
+        ):
+            raise RuntimeError("the target identifier key changed while loading")
+        return key
+    finally:
+        os.close(descriptor)
+
+
+TARGET_ID_KEY = _load_target_id_key()
+TARGET_ID_SCOPE = (
+    "ephemeral-rescue-boot"
+    if os.environ.get("KERNAID_TARGET_ID_KEY_FILE") == TARGET_ID_KEY_FILE
+    else "ephemeral-rescue-process"
+)
+OFFLINE_HELPER_SOCKET = "/run/kernaid-offline-inspector.sock"
+OFFLINE_HELPER_ENABLED = os.environ.get("KERNAID_PRIVILEGED_INSPECTOR") == "1"
+OFFLINE_HELPER_TIMEOUT_SECONDS = 20
+MAX_OFFLINE_HELPER_RESPONSE_BYTES = 64 * 1024
+OFFLINE_INSPECTION_CLAIM_FIELDS = {
+    "installedOsConfirmed",
+    "filesystemContentInspected",
+    "mountOperationAttempted",
+    "mountOperationPerformed",
+    "mountCleanupVerified",
+    "autoUnlockAttempted",
+    "mutationPerformed",
+    "diagnosisProduced",
+    "repairAttempted",
+}
 
 TARGET_DEVICE_FIELDS = {
     "name",
@@ -151,6 +220,15 @@ class TargetSelectionError(Exception):
         self.status = status
 
 
+class PrivilegedHelperError(Exception):
+    """A typed failure returned by the fixed root inspection service."""
+
+    def __init__(self, error: dict[str, object], status: int) -> None:
+        super().__init__(str(error["message"]))
+        self.error = error
+        self.status = status
+
+
 def _remaining_seconds(deadline: float | None) -> float | None:
     """Return the remaining monotonic budget, or fail once it is exhausted."""
     if deadline is None:
@@ -168,6 +246,105 @@ def _bounded_timeout(per_command: float, deadline: float | None) -> float:
 
 def _check_deadline(deadline: float | None) -> None:
     _remaining_seconds(deadline)
+
+
+def _validate_helper_error(value: object) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != {
+        "code",
+        "message",
+        "retryable",
+        "claims",
+    }:
+        raise BrokerError("Risposta dell'ispettore privilegiato non valida.")
+    code = value.get("code")
+    message = value.get("message")
+    retryable = value.get("retryable")
+    claims = value.get("claims")
+    if (
+        not isinstance(code, str)
+        or not code
+        or len(code) > 64
+        or not code.isascii()
+        or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789-" for character in code)
+        or not isinstance(message, str)
+        or not message
+        or len(message.encode("utf-8")) > 512
+        or any(ord(character) < 32 or ord(character) == 127 for character in message)
+        or not isinstance(retryable, bool)
+        or not isinstance(claims, dict)
+        or set(claims) != OFFLINE_INSPECTION_CLAIM_FIELDS
+        or any(not isinstance(claims[field], bool) for field in claims)
+    ):
+        raise BrokerError("Risposta dell'ispettore privilegiato non valida.")
+    return value
+
+
+def _privileged_helper_call(
+    operation: str, request: dict[str, object] | None = None
+) -> object:
+    if operation not in {"inspect", "scan", "select"}:
+        raise BrokerError("Operazione dell'ispettore privilegiato non valida.")
+    frame: dict[str, object] = {"operation": operation}
+    if request is not None:
+        frame["request"] = request
+    encoded = json.dumps(
+        frame, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8") + b"\n"
+    if len(encoded) > MAX_REQUEST_BYTES:
+        raise BrokerError("Richiesta all'ispettore privilegiato oltre il limite.")
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(OFFLINE_HELPER_TIMEOUT_SECONDS)
+            connection.connect(OFFLINE_HELPER_SOCKET)
+            connection.sendall(encoded)
+            connection.shutdown(socket.SHUT_WR)
+            payload = bytearray()
+            while len(payload) <= MAX_OFFLINE_HELPER_RESPONSE_BYTES:
+                chunk = connection.recv(
+                    min(
+                        8 * 1024,
+                        MAX_OFFLINE_HELPER_RESPONSE_BYTES + 1 - len(payload),
+                    )
+                )
+                if not chunk:
+                    break
+                payload.extend(chunk)
+    except (OSError, TimeoutError) as error:
+        raise PrivilegedHelperError(
+            {
+                "code": "privileged-helper-unavailable",
+                "message": "L'ispettore privilegiato locale non è disponibile.",
+                "retryable": True,
+                "claims": {field: False for field in OFFLINE_INSPECTION_CLAIM_FIELDS},
+            },
+            503,
+        ) from error
+    if (
+        len(payload) > MAX_OFFLINE_HELPER_RESPONSE_BYTES
+        or payload.count(b"\n") != 1
+        or not payload.endswith(b"\n")
+    ):
+        raise BrokerError("Frame dell'ispettore privilegiato non valido.")
+    try:
+        response = json.loads(payload[:-1].decode("utf-8", errors="strict"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise BrokerError("JSON dell'ispettore privilegiato non valido.") from error
+    if not isinstance(response, dict) or not isinstance(response.get("ok"), bool):
+        raise BrokerError("Risposta dell'ispettore privilegiato non valida.")
+    if response["ok"] is True:
+        if set(response) != {"ok", "result"}:
+            raise BrokerError("Risposta dell'ispettore privilegiato non valida.")
+        return response["result"]
+    if set(response) != {"ok", "status", "error"}:
+        raise BrokerError("Risposta dell'ispettore privilegiato non valida.")
+    status = response.get("status")
+    if (
+        not isinstance(status, int)
+        or isinstance(status, bool)
+        or status not in {400, 408, 409, 422, 429, 503}
+    ):
+        raise BrokerError("Risposta dell'ispettore privilegiato non valida.")
+    raise PrivilegedHelperError(_validate_helper_error(response["error"]), status)
 
 
 class ObserveBroker:
@@ -758,7 +935,9 @@ def _flatten_target_volumes(
     return volumes, references
 
 
-def normalize_installed_targets(output: str) -> dict[str, object]:
+def _normalize_installed_targets_with_resolutions(
+    output: str,
+) -> tuple[dict[str, object], dict[str, dict[str, object]]]:
     try:
         decoded = json.loads(output)
     except (json.JSONDecodeError, UnicodeDecodeError) as error:
@@ -780,6 +959,7 @@ def normalize_installed_targets(output: str) -> dict[str, object]:
 
     public_disks: list[dict[str, object]] = []
     public_candidates: list[dict[str, object]] = []
+    resolutions: dict[str, dict[str, object]] = {}
     seen_target_ids: set[str] = set()
     for disk_index, disk in enumerate(disks, start=1):
         disk_ref = f"disk-{disk_index}"
@@ -828,27 +1008,57 @@ def normalize_installed_targets(output: str) -> dict[str, object]:
             if target_id in seen_target_ids:
                 continue
             seen_target_ids.add(target_id)
-            public_candidates.append(
+            public_candidate = {
+                "targetId": target_id,
+                "sourceRef": references[id(candidate)],
+                "diskId": disk_id,
+                "osFamilyHint": family,
+                "confidence": "low",
+                "status": "unverified-installation-candidate",
+                "detectionBasis": basis,
+                "requiresUnlock": requires_unlock,
+                "inspectionMode": "metadata-only-no-mount",
+                "selectionEligible": True,
+            }
+            public_candidates.append(public_candidate)
+            disk_children = disk["children"]
+            candidate_children = candidate["children"]
+            if not isinstance(disk_children, list) or not isinstance(
+                candidate_children, list
+            ):
+                raise TargetScanError("Topologia normalizzata non valida.")
+            direct_child = any(child is candidate for child in disk_children)
+            topology_kinds = sorted(
                 {
-                    "targetId": target_id,
-                    "sourceRef": references[id(candidate)],
-                    "diskId": disk_id,
-                    "osFamilyHint": family,
-                    "confidence": "low",
-                    "status": "unverified-installation-candidate",
-                    "detectionBasis": basis,
-                    "requiresUnlock": requires_unlock,
-                    "inspectionMode": "metadata-only-no-mount",
-                    "selectionEligible": True,
+                    str(node["kind"])
+                    for node in _walk_target_devices(disk)
                 }
             )
+            topology_filesystems = sorted(
+                {
+                    str(node["filesystem"])
+                    for node in _walk_target_devices(disk)
+                    if node["filesystem"]
+                }
+            )
+            resolutions[target_id] = {
+                "candidate": public_candidate,
+                "deviceIdentity": candidate["identity"],
+                "majorMinor": candidate["major_minor"],
+                "filesystem": candidate["filesystem"],
+                "kernelKind": candidate["kind"],
+                "leaf": not candidate_children,
+                "directOnDisk": candidate is disk or direct_child,
+                "topologyKinds": topology_kinds,
+                "topologyFilesystems": topology_filesystems,
+            }
 
     snapshot: dict[str, object] = {
         "apiVersion": TARGET_SCAN_API_VERSION,
         "mode": "observe-r0",
         "trust": "observed-untrusted",
         "scanFingerprint": scan_fingerprint,
-        "identifierScope": "ephemeral-rescue-process",
+        "identifierScope": TARGET_ID_SCOPE,
         "disks": public_disks,
         "candidates": public_candidates,
         "claims": {
@@ -868,32 +1078,106 @@ def normalize_installed_targets(output: str) -> dict[str, object]:
     encoded = json.dumps(snapshot, ensure_ascii=True, separators=(",", ":")).encode()
     if len(encoded) > MAX_TARGET_RESPONSE_BYTES:
         raise TargetScanError("Risposta della scansione dei target oltre il limite.")
+    return snapshot, resolutions
+
+
+def normalize_installed_targets(output: str) -> dict[str, object]:
+    snapshot, _resolutions = _normalize_installed_targets_with_resolutions(output)
     return snapshot
 
 
+def _target_scan_output(deadline: float | None = None) -> str:
+    if deadline is None:
+        observation = observe("rescue.installed-targets.metadata", TARGET_SCAN_COMMAND)
+    else:
+        observation = observe(
+            "rescue.installed-targets.metadata", TARGET_SCAN_COMMAND, deadline
+        )
+    _check_deadline(deadline)
+    if observation.get("success") is not True or observation.get("truncated") is True:
+        raise TargetScanError("Scansione dei target incompleta; riprovare.")
+    output = observation.get("output")
+    if not isinstance(output, str):
+        raise TargetScanError("Output della scansione dei target non valido.")
+    return output
+
+
 def installed_targets(deadline: float | None = None) -> dict[str, object]:
+    if OFFLINE_HELPER_ENABLED:
+        _check_deadline(deadline)
+        result = _privileged_helper_call("scan")
+        if not isinstance(result, dict):
+            raise TargetScanError("Risposta privilegiata dei target non valida.")
+        return result
     _check_deadline(deadline)
     if not TARGET_SCAN_LOCK.acquire(blocking=False):
         raise TargetScanBusy("Scansione dei target già in corso; riprovare.")
     try:
         _check_deadline(deadline)
-        if deadline is None:
-            observation = observe(
-                "rescue.installed-targets.metadata", TARGET_SCAN_COMMAND
-            )
-        else:
-            observation = observe(
-                "rescue.installed-targets.metadata", TARGET_SCAN_COMMAND, deadline
-            )
-        _check_deadline(deadline)
-        if observation.get("success") is not True or observation.get("truncated") is True:
-            raise TargetScanError("Scansione dei target incompleta; riprovare.")
-        output = observation.get("output")
-        if not isinstance(output, str):
-            raise TargetScanError("Output della scansione dei target non valido.")
-        return normalize_installed_targets(output)
+        return normalize_installed_targets(_target_scan_output(deadline))
     finally:
         TARGET_SCAN_LOCK.release()
+
+
+def resolve_installed_target(
+    request: dict[str, object], deadline: float | None = None
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Resolve an opaque selection to one internal identity in this process.
+
+    The internal resolution is for the privileged offline inspector only. It
+    must never be serialized by the HTTP bridge because it contains raw kernel
+    identity and storage metadata.
+    """
+    _check_deadline(deadline)
+    if set(request) != {"scanFingerprint", "targetId"}:
+        raise TargetSelectionError(
+            "Richiesta di selezione del target non valida.", status=400
+        )
+    requested_fingerprint = request["scanFingerprint"]
+    requested_target = request["targetId"]
+    if not _valid_ephemeral_id(
+        requested_fingerprint, "scan"
+    ) or not _valid_ephemeral_id(requested_target, "target"):
+        raise TargetSelectionError(
+            "Richiesta di selezione del target non valida.", status=400
+        )
+    if not TARGET_SCAN_LOCK.acquire(blocking=False):
+        raise TargetScanBusy("Scansione dei target già in corso; riprovare.")
+    try:
+        snapshot, resolutions = _normalize_installed_targets_with_resolutions(
+            _target_scan_output(deadline)
+        )
+    finally:
+        TARGET_SCAN_LOCK.release()
+    _check_deadline(deadline)
+    if snapshot["scanFingerprint"] != requested_fingerprint:
+        raise TargetSelectionError(
+            "La topologia dei dischi è cambiata; ripetere la selezione."
+        )
+    if not isinstance(requested_target, str):
+        raise TargetSelectionError(
+            "Richiesta di selezione del target non valida.", status=400
+        )
+    resolution = resolutions.get(requested_target)
+    if resolution is None:
+        raise TargetSelectionError(
+            "Il target non è più disponibile in modalità Observe; ripetere la selezione."
+        )
+    candidate = resolution.get("candidate")
+    canonical_target_candidate(candidate)
+    selection = {
+        "apiVersion": TARGET_SCAN_API_VERSION,
+        "status": "observe-target-validated",
+        "scanFingerprint": snapshot["scanFingerprint"],
+        "target": candidate,
+        "claims": {
+            "installedOsConfirmed": False,
+            "filesystemContentInspected": False,
+            "mountOperationPerformed": False,
+            "mutationPerformed": False,
+        },
+    }
+    return selection, resolution
 
 
 def _valid_ephemeral_id(value: object, prefix: str) -> bool:
@@ -908,6 +1192,14 @@ def _valid_ephemeral_id(value: object, prefix: str) -> bool:
 def select_installed_target(
     request: dict[str, object], deadline: float | None = None
 ) -> dict[str, object]:
+    if OFFLINE_HELPER_ENABLED:
+        _check_deadline(deadline)
+        result = _privileged_helper_call("select", request)
+        if not isinstance(result, dict):
+            raise TargetSelectionError(
+                "Risposta privilegiata di selezione non valida.", status=503
+            )
+        return result
     _check_deadline(deadline)
     if set(request) != {"scanFingerprint", "targetId"}:
         raise TargetSelectionError(
@@ -964,6 +1256,39 @@ def select_installed_target(
     }
     _check_deadline(deadline)
     return selection
+
+
+def inspect_installed_target(request: dict[str, object]) -> dict[str, object]:
+    if set(request) != {"scanFingerprint", "targetId"}:
+        raise PrivilegedHelperError(
+            {
+                "code": "invalid-inspection-request",
+                "message": "Richiesta di ispezione del target non valida.",
+                "retryable": False,
+                "claims": {
+                    field: False for field in OFFLINE_INSPECTION_CLAIM_FIELDS
+                },
+            },
+            400,
+        )
+    if not _valid_ephemeral_id(
+        request.get("scanFingerprint"), "scan"
+    ) or not _valid_ephemeral_id(request.get("targetId"), "target"):
+        raise PrivilegedHelperError(
+            {
+                "code": "invalid-inspection-request",
+                "message": "Richiesta di ispezione del target non valida.",
+                "retryable": False,
+                "claims": {
+                    field: False for field in OFFLINE_INSPECTION_CLAIM_FIELDS
+                },
+            },
+            400,
+        )
+    result = _privileged_helper_call("inspect", request)
+    if not isinstance(result, dict):
+        raise BrokerError("Risposta privilegiata di ispezione non valida.")
+    return result
 
 
 def is_identity_observation(collector: str) -> bool:
@@ -1281,6 +1606,14 @@ class RescueHandler(SimpleHTTPRequestHandler):
             except TargetScanError as error:
                 body = json.dumps({"error": str(error)}).encode()
                 status = 503
+            except PrivilegedHelperError as error:
+                body = json.dumps(
+                    {"error": error.error},
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+                status = error.status
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Cache-Control", "no-store")
@@ -1307,6 +1640,7 @@ class RescueHandler(SimpleHTTPRequestHandler):
             return
         if self.path not in {
             "/api/authorize-observe",
+            "/api/rescue/inspect-installed-target",
             "/api/rescue/select-installed-target",
         }:
             self.send_error(405)
@@ -1329,6 +1663,19 @@ class RescueHandler(SimpleHTTPRequestHandler):
                 return
             request = json.loads(encoded)
             if not isinstance(request, dict):
+                if self.path == "/api/rescue/inspect-installed-target":
+                    raise PrivilegedHelperError(
+                        {
+                            "code": "invalid-inspection-request",
+                            "message": "Richiesta di ispezione del target non valida.",
+                            "retryable": False,
+                            "claims": {
+                                field: False
+                                for field in OFFLINE_INSPECTION_CLAIM_FIELDS
+                            },
+                        },
+                        400,
+                    )
                 if self.path == "/api/rescue/select-installed-target":
                     raise TargetSelectionError(
                         "Richiesta di selezione del target non valida.", status=400
@@ -1337,6 +1684,13 @@ class RescueHandler(SimpleHTTPRequestHandler):
             if self.path == "/api/authorize-observe":
                 authorize_observe(request, deadline=authorization_deadline)
                 body = b'{"status":"observed"}'
+            elif self.path == "/api/rescue/inspect-installed-target":
+                body = json.dumps(
+                    inspect_installed_target(request),
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
             else:
                 body = json.dumps(
                     select_installed_target(request),
@@ -1353,6 +1707,14 @@ class RescueHandler(SimpleHTTPRequestHandler):
         except BrokerError as error:
             body = json.dumps({"error": str(error)}).encode()
             status = 409
+        except PrivilegedHelperError as error:
+            body = json.dumps(
+                {"error": error.error},
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+            status = error.status
         except TargetSelectionError as error:
             body = json.dumps({"error": str(error)}).encode()
             status = error.status

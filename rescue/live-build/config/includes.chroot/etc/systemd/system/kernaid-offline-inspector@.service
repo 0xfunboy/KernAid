@@ -1,0 +1,36 @@
+[Unit]
+Description=KernAid privileged read-only offline inspector connection
+Requires=kernaid-offline-inspector.socket kernaid-offline-inspector-key.service
+After=kernaid-offline-inspector.socket kernaid-offline-inspector-key.service
+CollectMode=inactive-or-failed
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -I /usr/lib/kernaid/offline_inspector.py
+Environment=KERNAID_TARGET_ID_KEY_FILE=/run/kernaid-offline-inspector/target-id.key
+RuntimeMaxSec=20
+Restart=no
+User=root
+Group=root
+UMask=0077
+NoNewPrivileges=yes
+PrivateMounts=yes
+PrivateNetwork=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectClock=yes
+ProtectHostname=yes
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH
+RestrictAddressFamilies=AF_UNIX
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+KillMode=control-group
+SendSIGKILL=yes
+TimeoutStopSec=2

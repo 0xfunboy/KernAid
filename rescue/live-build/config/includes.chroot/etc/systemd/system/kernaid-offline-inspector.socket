@@ -1,0 +1,17 @@
+[Unit]
+Description=KernAid privileged offline inspector socket
+Requires=kernaid-offline-inspector-key.service
+After=kernaid-offline-inspector-key.service
+
+[Socket]
+ListenStream=/run/kernaid-offline-inspector.sock
+Accept=yes
+MaxConnections=1
+SocketMode=0660
+SocketUser=root
+SocketGroup=kernaid-inspect
+Backlog=8
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

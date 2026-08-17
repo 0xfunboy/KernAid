@@ -1,7 +1,10 @@
 #!/bin/sh
 set -eu
+chown root:root /usr/lib/kernaid/offline_inspector.py /usr/lib/kernaid/rescue_server.py
+chmod 0644 /usr/lib/kernaid/offline_inspector.py /usr/lib/kernaid/rescue_server.py
 systemctl enable kernaid-ready.service
 systemctl enable kernaid-ui.service
+systemctl enable kernaid-offline-inspector.socket
 mkdir -p /etc/polkit-1/rules.d
 cat > /etc/polkit-1/rules.d/49-kernaid-observe.rules <<'RULE'
 polkit.addRule(function(action, subject) {
