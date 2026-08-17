@@ -349,6 +349,116 @@ class LiveLoginTests(unittest.TestCase):
         controller.wipe(scripted.credential)
         scripted.capture.wipe()
 
+    def test_login_marker_accepts_only_exact_optional_bracketed_paste_prefix(
+        self,
+    ) -> None:
+        for marker in (controller.LOGIN_OK_LINE, controller.LOGIN_FAIL_LINE):
+            for prefix in (b"", b"\x1b[?2004l\r"):
+                with self.subTest(marker=marker, prefix=prefix):
+                    transcript = b"command\r\n" + prefix + marker + b"\r\n"
+                    match = controller.LOGIN_RESULT_PATTERN.search(transcript)
+                    self.assertIsNotNone(match)
+                    assert match is not None
+                    self.assertEqual(match.group(1), marker)
+
+        malformed_prefixes = (
+            b"\x1b[?2004h\r",
+            b"\x1b[?2004l",
+            b"\x1b[?2004l\rX",
+            b"X\x1b[?2004l\r",
+            b"\x1b[31m",
+            b"\x1b[?2004l\r\x1b[?2004l\r",
+        )
+        for prefix in malformed_prefixes:
+            with self.subTest(malformed_prefix=prefix):
+                transcript = (
+                    b"command\r\n" + prefix + controller.LOGIN_OK_LINE + b"\r\n"
+                )
+                self.assertIsNone(controller.LOGIN_RESULT_PATTERN.search(transcript))
+
+    @unittest.skipUnless(Path("/bin/bash").is_file(), "interactive bash required")
+    def test_live_session_uses_real_interactive_bash_bracketed_paste_output(
+        self,
+    ) -> None:
+        credential = bytearray(synthetic_login_credential())
+        wrapper = r"""
+set -eu
+printf 'KERNAID_RESCUE_READY\n'
+IFS= read -r ignored
+printf 'kernaid-rescue login: '
+IFS= read -r ignored
+stty -echo
+printf 'Password: '
+IFS= read -r ignored
+stty echo
+printf '\n'
+id() {
+    case "${1-}" in
+        -u) printf '1000\n' ;;
+        -un) printf 'kernaid\n' ;;
+        -nG) printf 'kernaid kernaid-vault\n' ;;
+        *) command id "$@" ;;
+    esac
+}
+export -f id
+PS1='kernaid@kernaid-rescue:~$ '
+PROMPT_COMMAND=
+export PS1 PROMPT_COMMAND
+exec /bin/bash --noprofile --norc -i
+"""
+        child_pid, master = os.forkpty()
+        if child_pid == 0:
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "TERM": "xterm-256color",
+                    "LC_ALL": "C",
+                    "LANG": "C",
+                }
+            )
+            try:
+                os.execve(
+                    "/bin/bash",
+                    ["/bin/bash", "--noprofile", "--norc", "-c", wrapper],
+                    environment,
+                )
+            except BaseException:
+                os._exit(127)
+
+        os.set_blocking(master, False)
+        capture = controller.BoundedCapture(64 * 1024, [credential])
+        console = controller.SerialConsole(master, capture, lambda: None)
+        try:
+            cursor = controller.establish_live_session(
+                console, time.monotonic() + 10.0, credential
+            )
+            self.assertGreater(cursor, 0)
+            self.assertIn(
+                b"\x1b[?2004l\r" + controller.LOGIN_OK_LINE + b"\r\n",
+                capture.snapshot(),
+            )
+        finally:
+            console.close()
+            try:
+                os.kill(child_pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            wait_deadline = time.monotonic() + 2.0
+            while True:
+                waited, _ = os.waitpid(child_pid, os.WNOHANG)
+                if waited == child_pid:
+                    break
+                if time.monotonic() >= wait_deadline:
+                    try:
+                        os.kill(child_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    os.waitpid(child_pid, 0)
+                    break
+                time.sleep(0.01)
+            controller.wipe(credential)
+            capture.wipe()
+
 
 class ResponseParserTests(unittest.TestCase):
     def test_exact_status_wrong_unlock_success_and_lock(self) -> None:

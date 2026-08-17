@@ -54,6 +54,13 @@ LOOP_INFO64 = struct.Struct("=QQQQQIIII64s64s32sQQ")
 READY_LINE = b"KERNAID_RESCUE_READY"
 LOGIN_OK_LINE = b"KERNAID_VAULT_LOGIN_V1 uid=1000 user=kernaid group=true"
 LOGIN_FAIL_LINE = b"KERNAID_VAULT_LOGIN_V1 invalid=true"
+# Interactive Bash places this one bracketed-paste disable sequence between the
+# echoed proof command and its output. No other terminal control prefix is valid.
+LOGIN_RESULT_PATTERN = re.compile(
+    rb"(?:^|\r?\n)(?:\x1b\[\?2004l\r)?"
+    rb"(KERNAID_VAULT_LOGIN_V1 (?:uid=1000 user=kernaid group=true|invalid=true))"
+    rb"\r?\n"
+)
 CAP_SYS_ADMIN_ONLY = "0000000000200000"
 ZERO_CAPS = "0000000000000000"
 
@@ -1558,9 +1565,7 @@ def establish_live_session(
     ).encode("ascii")
     console.send(b"\n" + proof, deadline=_deadline(aggregate, 5.0))
     match = console.wait_regex(
-        re.compile(
-            rb"(?:^|\r?\n)(KERNAID_VAULT_LOGIN_V1 (?:uid=1000 user=kernaid group=true|invalid=true))\r?\n"
-        ),
+        LOGIN_RESULT_PATTERN,
         start=cursor,
         deadline=_deadline(aggregate, 15.0),
         stage="login",
