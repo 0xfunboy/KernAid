@@ -30,7 +30,11 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm --filter @kernaid/desk build
       - name: Install VM tooling
-        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 ovmf
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 ovmf shellcheck
+      - name: Validate Rescue image-layout tooling
+        run: |
+          python3 -m unittest discover -s tools/build-rescue/tests -p 'test_*.py' -v
+          shellcheck tools/build-rescue/build.sh tools/build-rescue/qemu-smoke.sh
       - name: Build hybrid BIOS and UEFI ISO
         run: |
           docker run --rm --privileged \

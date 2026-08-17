@@ -1,0 +1,16 @@
+{
+  "schema": "kernaid.rescue-device-layout.v1",
+  "layoutVersion": 1,
+  "partitionTable": "mbr",
+  "logicalSectorBytes": 512,
+  "minimumMediaBytes": 25769803776,
+  "minimumAdvertisedMediaBytes": 32000000000,
+  "minimumAdvertisedMediaLabel": "32 GB",
+  "vaultPartition": {
+    "number": 3,
+    "name": "KERNAID_VAULT",
+    "mbrType": "0x83",
+    "startLba": 33554432,
+    "sectorCount": 16777216
+  }
+}

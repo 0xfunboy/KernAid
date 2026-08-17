@@ -4,7 +4,7 @@ set -euo pipefail
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 build_dir="$repo_dir/rescue/live-build"
 
-for command in lb; do
+for command in lb python3; do
   command -v "$command" >/dev/null || { echo "Missing required command: $command" >&2; exit 2; }
 done
 
@@ -40,6 +40,9 @@ lb build
 
 iso="$(find . -maxdepth 1 -name 'live-image-amd64*.hybrid.iso' -o -name 'live-image-amd64*.iso' | head -n 1)"
 test -n "$iso"
+python3 -I "$repo_dir/tools/build-rescue/finalize-device-layout.py" finalize \
+  --manifest "$repo_dir/rescue/image-layout/device-layout.v1.json" \
+  --image "$iso"
 mv "$iso" "$repo_dir/KernAid-Rescue-amd64.iso"
 cd "$repo_dir"
 sha256sum KernAid-Rescue-amd64.iso > KernAid-Rescue-amd64.iso.sha256

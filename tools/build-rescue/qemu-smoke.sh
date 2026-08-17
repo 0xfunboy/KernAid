@@ -3,7 +3,7 @@ set -euo pipefail
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 firmware="${1:-bios}"
 iso="${2:-$repo_dir/KernAid-Rescue-amd64.iso}"
-for command in qemu-system-x86_64 sha256sum mkfs.ext4 tee truncate; do
+for command in python3 qemu-system-x86_64 sha256sum mkfs.ext4 tee truncate; do
   command -v "$command" >/dev/null || { echo "Missing required command: $command" >&2; exit 2; }
 done
 if [[ "$firmware" != "bios" && "$firmware" != "uefi" ]]; then
@@ -11,6 +11,9 @@ if [[ "$firmware" != "bios" && "$firmware" != "uefi" ]]; then
   exit 2
 fi
 test -f "$iso" || { echo "ISO not found: $iso" >&2; exit 2; }
+python3 -I "$repo_dir/tools/build-rescue/finalize-device-layout.py" verify \
+  --manifest "$repo_dir/rescue/image-layout/device-layout.v1.json" \
+  --image "$iso"
 iso_hash_before="$(sha256sum "$iso" | awk '{print $1}')"
 log="${KERNAID_SMOKE_LOG:-$(mktemp)}"
 temporary_log=0
