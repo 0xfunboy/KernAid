@@ -34,6 +34,7 @@ const WORKER_CGROUP_NAME: &str = "worker";
 const PIDS_CONTROLLER_NAME: &[u8] = b"pids";
 const CGROUP2_SUPER_MAGIC: u64 = 0x6367_7270;
 const PROC_SUPER_MAGIC: u64 = 0x0000_9fa0;
+const TMPFS_MAGIC: u64 = 0x0102_1994;
 const SECURE_DIRECTORY_MODE: u32 = 0o700;
 const SECURE_FILE_MODE: u32 = 0o600;
 const MAX_CGROUP_FILE_BYTES: usize = 4096;
@@ -158,25 +159,57 @@ fn open_root_directory(path: &Path, exact_mode: bool) -> Result<OwnedFd, RescueV
     Ok(descriptor)
 }
 
-fn open_child_directory(
-    parent: &OwnedFd,
-    name: &OsStr,
-    exact_mode: bool,
-) -> Result<OwnedFd, RescueVaultDaemonError> {
+fn open_runtime_root(run: &OwnedFd) -> Result<OwnedFd, RescueVaultDaemonError> {
+    // RuntimeDirectory is exposed as a dedicated bind mount inside systemd's
+    // service mount namespace. Cross exactly that known mount boundary from
+    // the already validated /run descriptor, then bind the opened descriptor
+    // back to its named entry and to /run's tmpfs. Every lookup below this
+    // directory restores beneath_flags(), including NO_XDEV.
     let descriptor = rfs::openat2(
-        parent,
-        name,
+        run,
+        RUNTIME_ROOT_NAME,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
-        beneath_flags(),
+        ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
     )
     .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
-    validate_root_directory(&descriptor, exact_mode)?;
+    validate_root_directory(&descriptor, true)?;
+
+    let opened = rfs::fstat(&descriptor).map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+    let named = rfs::statat(run, RUNTIME_ROOT_NAME, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+    let run_stat = rfs::fstat(run).map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+    let opened_fs =
+        rfs::fstatfs(&descriptor).map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+    let run_fs = rfs::fstatfs(run).map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+    if !runtime_root_mount_is_exact(
+        opened.st_dev,
+        opened.st_ino,
+        named.st_dev,
+        named.st_ino,
+        run_stat.st_dev,
+        u64::try_from(opened_fs.f_type).ok(),
+        u64::try_from(run_fs.f_type).ok(),
+    ) {
+        return Err(RescueVaultDaemonError::RuntimeUnavailable);
+    }
     Ok(descriptor)
 }
 
-fn open_runtime_root(run: &OwnedFd) -> Result<OwnedFd, RescueVaultDaemonError> {
-    open_child_directory(run, OsStr::new(RUNTIME_ROOT_NAME), true)
+fn runtime_root_mount_is_exact(
+    opened_device: u64,
+    opened_inode: u64,
+    named_device: u64,
+    named_inode: u64,
+    run_device: u64,
+    opened_filesystem: Option<u64>,
+    run_filesystem: Option<u64>,
+) -> bool {
+    opened_device == named_device
+        && opened_inode == named_inode
+        && opened_device == run_device
+        && opened_filesystem == Some(TMPFS_MAGIC)
+        && run_filesystem == Some(TMPFS_MAGIC)
 }
 
 fn acquire_daemon_lock(lock_root: &OwnedFd) -> Result<OwnedFd, RescueVaultDaemonError> {
@@ -1545,6 +1578,44 @@ mod tests {
                 parse_delegated_membership(invalid).err(),
                 Some(RescueVaultDaemonError::CgroupUnavailable)
             );
+        }
+    }
+
+    #[test]
+    fn runtime_root_mount_crossing_requires_named_same_tmpfs_identity() {
+        assert!(runtime_root_mount_is_exact(
+            11,
+            22,
+            11,
+            22,
+            11,
+            Some(TMPFS_MAGIC),
+            Some(TMPFS_MAGIC),
+        ));
+        for candidate in [
+            (12, 22, 11, 22, 11, Some(TMPFS_MAGIC), Some(TMPFS_MAGIC)),
+            (11, 23, 11, 22, 11, Some(TMPFS_MAGIC), Some(TMPFS_MAGIC)),
+            (11, 22, 11, 22, 12, Some(TMPFS_MAGIC), Some(TMPFS_MAGIC)),
+            (
+                11,
+                22,
+                11,
+                22,
+                11,
+                Some(PROC_SUPER_MAGIC),
+                Some(TMPFS_MAGIC),
+            ),
+            (11, 22, 11, 22, 11, Some(TMPFS_MAGIC), None),
+        ] {
+            assert!(!runtime_root_mount_is_exact(
+                candidate.0,
+                candidate.1,
+                candidate.2,
+                candidate.3,
+                candidate.4,
+                candidate.5,
+                candidate.6,
+            ));
         }
     }
 

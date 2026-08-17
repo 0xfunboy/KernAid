@@ -45,7 +45,6 @@ ReadWritePaths=-/run/kernaid /run/lock -/run/cryptsetup
 CapabilityBoundingSet=CAP_SYS_ADMIN
 RestrictAddressFamilies=AF_UNIX
 RestrictRealtime=yes
-RestrictSUIDSGID=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native

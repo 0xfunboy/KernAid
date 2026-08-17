@@ -173,7 +173,6 @@ class VaultSystemdPackagingTests(unittest.TestCase):
             "CapabilityBoundingSet": "CAP_SYS_ADMIN",
             "RestrictAddressFamilies": "AF_UNIX",
             "RestrictRealtime": "yes",
-            "RestrictSUIDSGID": "yes",
             "LockPersonality": "yes",
             "MemoryDenyWriteExecute": "yes",
             "SystemCallArchitectures": "native",
@@ -184,6 +183,11 @@ class VaultSystemdPackagingTests(unittest.TestCase):
         self.assertNotIn("DynamicUser", service)
         self.assertNotIn("ExecStartPost", service)
         self.assertNotIn("NonBlocking", service)
+        # systemd 257 implements RestrictSUIDSGID by denying every openat2(2)
+        # call. The daemon's descriptor-bound path validation requires openat2,
+        # so that directive must stay absent while the other sandbox gates stay
+        # exact above.
+        self.assertNotIn("RestrictSUIDSGID", service)
         self.assertEqual(sections["Install"], {"WantedBy": "multi-user.target"})
 
     def test_packaging_names_match_the_frozen_daemon_constants(self) -> None:

@@ -361,7 +361,16 @@ The Rescue live-build packaging installs the feature-gated daemon and
 companion, a root:`kernaid-vault` sequential-packet socket, a `Type=notify`
 service with a private mount namespace and delegated worker cgroup, the
 root-owned runtime/tmpfiles boundary, and fail-closed core/swap and UID-1000
-policy. The daemon sends `READY=1` only after runtime disposition, worker Probe,
+policy. The target systemd 257 unit intentionally omits `RestrictSUIDSGID`
+because that version implements it by denying all `openat2` calls; the daemon's
+descriptor-bound path validation requires `openat2`, while `NoNewPrivileges`,
+the `CAP_SYS_ADMIN`-only bounding set, strict filesystem protection and the
+remaining sandbox gates stay enabled. The one systemd `RuntimeDirectory`
+bind-mount crossing is opened relative to a validated `/run` descriptor and
+accepted only when descriptor, named entry and `/run` share the exact expected
+root-owned tmpfs identity; all child operations restore no-cross-mount
+resolution. The daemon sends `READY=1` only after runtime disposition, worker
+Probe,
 an immediate worker-health recheck, and coherent Supervisor construction on a
 marker-free startup. Any fresh cgroup, spawn, Probe, or health failure exits
 without READY. A marker found before startup may become ready only as a
