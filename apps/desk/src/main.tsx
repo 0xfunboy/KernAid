@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { LocalSessionDriver } from "@kernaid/agent-gateway";
 import type { ArtifactRef, AuditSink } from "@kernaid/session-driver";
@@ -12,6 +12,7 @@ import {
   collectLocalInventory,
   collectMacosP0Inventory,
   collectWindowsP0Inventory,
+  getResidentOpenAiStatus,
   getSecureRuntimeStatus,
   hasLocalCollector,
   initializeDeviceIdentity,
@@ -21,16 +22,19 @@ import {
   isNative,
   isRescueRuntime,
   NativeAuditSink,
+  NativeOpenAiProvider,
   PlatformOfflineRulesProvider,
   fingerprintNativeTarget,
   scanRescueInstalledTargets,
   secureAuditReady,
   selectRescueInstalledTarget,
+  logoutResidentOpenAi,
   type NativeObservation,
   type RescueTargetCandidate,
   type RescueTargetBinding,
   type RescueTargetScan,
   type RescueTargetSelection,
+  type ResidentOpenAiStatus,
   type SecureRuntimeStatus,
 } from "./native";
 import {
@@ -45,11 +49,16 @@ import {
 import "./style.css";
 
 type Workflow = "Observe" | "Diagnose" | "Plan" | "Verify";
+type ProviderMode = "offline" | "openai";
 
 function App() {
   const [driver, setDriver] = useState<LocalSessionDriver>();
   const [runtimeStatus, setRuntimeStatus] = useState<SecureRuntimeStatus>();
   const [runtimeReady, setRuntimeReady] = useState(false);
+  const [providerMode, setProviderMode] = useState<ProviderMode>("offline");
+  const [openAiStatus, setOpenAiStatus] = useState<ResidentOpenAiStatus>();
+  const [providerLogoutBusy, setProviderLogoutBusy] = useState(false);
+  const providerLogoutInFlight = useRef(false);
   const [objective, setObjective] = useState("");
   const [workflow, setWorkflow] = useState<Workflow>("Observe");
   const [status, setStatus] = useState("Pronto per una diagnosi sicura.");
@@ -107,6 +116,21 @@ function App() {
       }
     }
     void startRuntime();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isNative()) return;
+    let cancelled = false;
+    getResidentOpenAiStatus()
+      .then((next) => {
+        if (!cancelled) setOpenAiStatus(next);
+      })
+      .catch(() => {
+        if (!cancelled) setOpenAiStatus(undefined);
+      });
     return () => {
       cancelled = true;
     };
@@ -468,7 +492,7 @@ function App() {
       setRuntimeStatus(next);
       if (!secureAuditReady(next))
         throw new Error("Il portachiavi sicuro non è ancora disponibile.");
-      setDriver(createDriver(new NativeAuditSink()));
+      setDriver(createDriver(new NativeAuditSink(), undefined, providerMode));
       setStatus("Audit cifrato e firma del dispositivo attivi.");
     } catch (error) {
       setDriver(undefined);
@@ -477,6 +501,61 @@ function App() {
         error instanceof Error ? error.message : "Attivazione non riuscita",
       );
     } finally {
+      setBusy(false);
+    }
+  }
+
+  function chooseProvider(next: ProviderMode) {
+    if (
+      !isNative() ||
+      busy ||
+      sessionId !== undefined ||
+      driver === undefined ||
+      (next === "openai" && openAiStatus?.credential !== "configured")
+    )
+      return;
+    invalidateSession();
+    setProviderMode(next);
+    setDriver(createDriver(activeAuditSink(runtimeStatus), undefined, next));
+    setStatus(
+      next === "openai"
+        ? "OpenAI selezionato. Il corpus grezzo resta locale; vengono inviati obiettivo filtrato, proposta deterministica e soli ID/collector."
+        : "Diagnostica offline selezionata. Nessun dato lascia il computer.",
+    );
+  }
+
+  async function logoutOpenAi() {
+    if (
+      !isNative() ||
+      providerLogoutInFlight.current ||
+      (providerMode !== "openai" && (busy || sessionId !== undefined))
+    )
+      return;
+    providerLogoutInFlight.current = true;
+    setProviderLogoutBusy(true);
+    setBusy(true);
+    const hadDriver = driver !== undefined;
+    try {
+      const next = await logoutResidentOpenAi();
+      setOpenAiStatus(next);
+      setProviderMode("offline");
+      invalidateSession();
+      if (hadDriver)
+        setDriver(
+          createDriver(activeAuditSink(runtimeStatus), undefined, "offline"),
+        );
+      setStatus(
+        "Logout OpenAI completato e verificato. Provider offline attivo.",
+      );
+    } catch (error) {
+      setStatus(
+        error instanceof Error
+          ? error.message
+          : "Logout OpenAI non completato.",
+      );
+    } finally {
+      providerLogoutInFlight.current = false;
+      setProviderLogoutBusy(false);
       setBusy(false);
     }
   }
@@ -534,9 +613,55 @@ function App() {
     <main>
       <header>
         <strong>KernAid</strong>
-        <span>
-          {isNative() ? "Resident" : "Rescue"} · Offline rules · {securityLabel}
-        </span>
+        <div className="runtime-summary">
+          {isNative() && (
+            <div className="provider-switch" aria-label="Provider diagnostico">
+              <button
+                aria-pressed={providerMode === "offline"}
+                disabled={busy || sessionId !== undefined}
+                onClick={() => chooseProvider("offline")}
+              >
+                Offline
+              </button>
+              <button
+                aria-pressed={providerMode === "openai"}
+                disabled={
+                  busy ||
+                  sessionId !== undefined ||
+                  openAiStatus?.credential !== "configured"
+                }
+                onClick={() => chooseProvider("openai")}
+              >
+                OpenAI
+              </button>
+              {openAiStatus?.credential === "configured" && (
+                <button
+                  disabled={
+                    providerLogoutBusy ||
+                    (providerMode !== "openai" &&
+                      (busy || sessionId !== undefined))
+                  }
+                  onClick={logoutOpenAi}
+                >
+                  {providerLogoutBusy ? "Logout…" : "Logout"}
+                </button>
+              )}
+            </div>
+          )}
+          <span>
+            {isNative() ? "Resident" : "Rescue"} ·{" "}
+            {providerMode === "openai"
+              ? "OpenAI · gpt-5.6-sol"
+              : "Offline rules"}{" "}
+            · {securityLabel}
+          </span>
+          {isNative() && openAiStatus?.credential !== "configured" && (
+            <small>
+              OpenAI non configurato · chiudi Desk e avvia con{" "}
+              <code>configure</code> il companion nativo estratto
+            </small>
+          )}
+        </div>
       </header>
       <aside>
         <p className="label">
@@ -678,6 +803,15 @@ function App() {
             )}
           </div>
         )}
+        {providerMode === "openai" && (
+          <p className="provider-context-notice" role="note">
+            A OpenAI invieremo l’obiettivo dopo filtri conservativi per token,
+            email, IP e percorsi comuni, più la proposta diagnostica locale e
+            soli ID/collector. Il corpus grezzo resta sul PC. Il testo libero
+            può comunque contenere nomi o altri dati personali: non inserirli;
+            questa versione non offre ancora un’anteprima del contesto.
+          </p>
+        )}
         <textarea
           aria-label="Problem description"
           value={objective}
@@ -762,9 +896,12 @@ function App() {
 function createDriver(
   auditSink?: AuditSink,
   rescueTarget?: RescueTargetBinding,
+  providerMode: ProviderMode = "offline",
 ): LocalSessionDriver {
   return new LocalSessionDriver(
-    new PlatformOfflineRulesProvider(),
+    providerMode === "openai" && isNative()
+      ? new NativeOpenAiProvider()
+      : new PlatformOfflineRulesProvider(),
     hasLocalCollector()
       ? {
           execute: (request) => authorizeObserve(request, rescueTarget),
@@ -772,6 +909,14 @@ function createDriver(
       : undefined,
     auditSink,
   );
+}
+
+function activeAuditSink(
+  status: SecureRuntimeStatus | undefined,
+): AuditSink | undefined {
+  return status !== undefined && secureAuditReady(status)
+    ? new NativeAuditSink()
+    : undefined;
 }
 
 createRoot(document.getElementById("root")!).render(<App />);

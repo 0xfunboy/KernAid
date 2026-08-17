@@ -15,18 +15,26 @@ jobs:
             name: linux-x86_64
             args: ""
             targets: ""
+            companion: target/release/kernaid-provider-key
+            companion_upload: kernaid-provider-key-linux-x86_64.tar.gz
           - platform: windows-latest
             name: windows-x86_64
             args: ""
             targets: ""
+            companion: target/release/kernaid-provider-key.exe
+            companion_upload: target/release/kernaid-provider-key.exe
           - platform: macos-latest
             name: macos-aarch64
             args: --target aarch64-apple-darwin
             targets: aarch64-apple-darwin
+            companion: target/aarch64-apple-darwin/release/kernaid-provider-key
+            companion_upload: kernaid-provider-key-macos-aarch64.tar.gz
           - platform: macos-latest
             name: macos-x86_64
             args: --target x86_64-apple-darwin
             targets: x86_64-apple-darwin
+            companion: target/x86_64-apple-darwin/release/kernaid-provider-key
+            companion_upload: kernaid-provider-key-macos-x86_64.tar.gz
     runs-on: ${{ matrix.platform }}
     timeout-minutes: 60
     steps:
@@ -40,15 +48,75 @@ jobs:
           targets: ${{ matrix.targets }}
       - name: Install Linux prerequisites
         if: matrix.platform == 'ubuntu-24.04'
-        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libdbus-1-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
       - run: pnpm install --frozen-lockfile
       - name: Generate platform icons
         run: pnpm --filter @kernaid/desk tauri icon icon.svg
+      - name: Test Resident OpenAI and credential companion boundaries
+        if: matrix.name != 'macos-x86_64'
+        run: |
+          cargo test --locked -p kernaid-desk-shell resident_openai -- --nocapture
+          cargo test --locked -p kernaid-desk-shell --bin kernaid-provider-key -- --nocapture
       - name: Probe native macOS P0 sources
         if: matrix.name == 'macos-aarch64'
         run: |
           pnpm --filter @kernaid/desk build
           cargo test --locked -p kernaid-desk-shell resident_macos_native_runtime_probe -- --nocapture
+      - name: Build native provider credential companion
+        run: cargo build --locked --release -p kernaid-desk-shell --bin kernaid-provider-key ${{ matrix.args }}
+      - name: Package executable native provider credential companion
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          COMPANION_SOURCE: ${{ matrix.companion }}
+          COMPANION_ARCHIVE: ${{ matrix.companion_upload }}
+        run: |
+          python3 - <<'PY'
+          import gzip
+          import hashlib
+          import io
+          import os
+          import tarfile
+
+          source = os.environ["COMPANION_SOURCE"]
+          archive = os.environ["COMPANION_ARCHIVE"]
+          with open(source, "rb") as executable:
+              payload = executable.read()
+
+          info = tarfile.TarInfo("kernaid-provider-key")
+          info.size = len(payload)
+          info.mode = 0o700
+          info.mtime = 0
+          info.uid = 0
+          info.gid = 0
+          info.uname = "root"
+          info.gname = "root"
+          with open(archive, "wb") as destination:
+              with gzip.GzipFile(
+                  filename="", fileobj=destination, mode="wb", mtime=0
+              ) as compressed:
+                  with tarfile.open(
+                      fileobj=compressed, mode="w", format=tarfile.USTAR_FORMAT
+                  ) as bundle:
+                      bundle.addfile(info, fileobj=io.BytesIO(payload))
+
+          with tarfile.open(archive, "r:gz") as bundle:
+              members = bundle.getmembers()
+              assert len(members) == 1
+              member = members[0]
+              assert member.name == "kernaid-provider-key"
+              assert member.isfile()
+              assert member.mode == 0o700
+              extracted = bundle.extractfile(member)
+              assert extracted is not None
+              assert hashlib.sha256(extracted.read()).digest() == hashlib.sha256(payload).digest()
+          PY
+      - name: Upload native provider credential companion
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernaid-provider-key-${{ matrix.name }}
+          path: ${{ matrix.companion_upload }}
+          if-no-files-found: error
       - uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

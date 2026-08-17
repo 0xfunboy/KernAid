@@ -1,7 +1,12 @@
 import type { DiagnosisProposal } from "@kernaid/schemas";
 import type { ObservedEvidence, Provider } from "@kernaid/provider-types";
 
-export type { ObservedEvidence, Provider } from "@kernaid/provider-types";
+export { ProviderError } from "@kernaid/provider-types";
+export type {
+  ObservedEvidence,
+  Provider,
+  ProviderRequestOptions,
+} from "@kernaid/provider-types";
 
 export class OfflineRulesProvider implements Provider {
   readonly capabilities = Object.freeze({

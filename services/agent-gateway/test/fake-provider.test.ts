@@ -3,7 +3,10 @@ import test from "node:test";
 import type { DiagnosisProposal } from "@kernaid/schemas";
 import { LocalSessionDriver, type ActionExecutor } from "../src/fake-driver.js";
 import type { ObservedEvidence, Provider } from "../src/fake-provider.js";
-import { redactForProvider } from "../src/redaction.js";
+import {
+  redactForProvider,
+  redactSecretsForLocalEvidence,
+} from "../src/redaction.js";
 
 const fingerprint = `sha256:${"1".repeat(64)}`;
 
@@ -196,6 +199,52 @@ test("redacts provider credentials from prompts and evidence", async () => {
   await drain(driver.sendUserPrompt(session.id, "key sk-test-supersecret"));
 });
 
+test("hashes exactly the secret-redacted evidence retained at the local boundary", async () => {
+  const sensitive =
+    "service failed OPENAI_API_KEY=secret-value at /home/alice/report.txt";
+  const expectedContent = redactSecretsForLocalEvidence(sensitive);
+  class InspectingProvider implements Provider {
+    readonly capabilities = Object.freeze({
+      streaming: false,
+      structuredOutput: true,
+      toolRequests: false,
+      local: true,
+    });
+
+    async diagnose(
+      objective: string,
+      evidence: readonly ObservedEvidence[],
+    ): Promise<DiagnosisProposal> {
+      assert.equal(objective, "diagnose");
+      assert.equal(evidence[0]?.content, expectedContent);
+      assert.equal(
+        evidence[0]?.evidence.sha256,
+        await sha256Text(expectedContent),
+      );
+      assert.doesNotMatch(JSON.stringify(evidence), /secret-value/iu);
+      return {
+        schemaVersion: "1.0",
+        diagnosis: "No personal data disclosed",
+        confidence: 0.7,
+        evidenceIds: evidence.map((item) => item.evidence.id),
+        requestedEvidence: [],
+      };
+    }
+  }
+  const driver = new LocalSessionDriver(new InspectingProvider());
+  const session = await driver.startSession({
+    targetFingerprint: fingerprint,
+    mode: "resident",
+  });
+  const [evidence] = await driver.requestEvidence(session.id, {
+    collector: "linux.systemd.failed",
+    target: "local-machine",
+    observedContent: sensitive,
+  });
+  assert.equal(evidence?.sha256, await sha256Text(expectedContent));
+  await drain(driver.sendUserPrompt(session.id, "diagnose"));
+});
+
 test("records only approvals bound to the staged plan and target", async () => {
   const { driver, planId } = await stagedDriver();
   await assert.rejects(
@@ -224,6 +273,25 @@ test("standalone redaction covers common provider secret shapes", () => {
     "OPENAI_API_KEY=abc123 sk-ant-abcdefghijk AIza012345678901234567890 Bearer abc.def.ghi";
   const output = redactForProvider(input);
   assert.doesNotMatch(output, /abc123|sk-ant-|AIza|abc\.def\.ghi/);
+});
+
+test("standalone redaction conservatively removes provider-context PII", () => {
+  const input = [
+    "username=alice",
+    "alice@example.test",
+    "192.0.2.44",
+    "2001:db8::8",
+    "aa:bb:cc:dd:ee:ff",
+    "serial=SN-12345",
+    "/home/alice/report.txt",
+    String.raw`C:\Users\alice\report.txt`,
+    "https://example.test/private/history?q=customer",
+  ].join(" ");
+  const output = redactForProvider(input);
+  assert.doesNotMatch(
+    output,
+    /alice|example\.test|192\.0\.2\.44|2001:db8|aa:bb|SN-12345|report\.txt|customer/iu,
+  );
 });
 
 test("admits the qualified Windows evidence bound without widening other collectors", async () => {
@@ -266,4 +334,14 @@ test("admits the qualified Windows evidence bound without widening other collect
 
 async function drain(iterable: AsyncIterable<unknown>): Promise<void> {
   for await (const value of iterable) void value;
+}
+
+async function sha256Text(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(value),
+  );
+  return Array.from(new Uint8Array(digest), (byte) =>
+    byte.toString(16).padStart(2, "0"),
+  ).join("");
 }

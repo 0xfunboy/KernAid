@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { AuditSealRequest } from "@kernaid/session-driver";
 import {
+  NativeOpenAiProvider,
   PlatformOfflineRulesProvider,
   authorizeObserve,
   collectLocalInventory,
@@ -13,6 +14,7 @@ import {
   parseRescueTargetScan,
   parseRescueTargetSelection,
   parseNativeSignedArtifact,
+  parseResidentOpenAiStatus,
   parseSecureRuntimeStatus,
   scanRescueInstalledTargets,
   selectRescueInstalledTarget,
@@ -460,6 +462,94 @@ test("secure runtime status rejects ambiguous native responses", () => {
       persistentAuditStarted: false,
       unexpected: true,
     }),
+  );
+});
+
+test("Resident OpenAI status is presence-only and exact", () => {
+  assert.deepEqual(
+    parseResidentOpenAiStatus({
+      schemaVersion: "1.0",
+      provider: "openai",
+      profile: "resident-default",
+      model: "gpt-5.6-sol",
+      credential: "configured",
+    }),
+    {
+      schemaVersion: "1.0",
+      provider: "openai",
+      profile: "resident-default",
+      model: "gpt-5.6-sol",
+      credential: "configured",
+    },
+  );
+  assert.throws(() =>
+    parseResidentOpenAiStatus({
+      schemaVersion: "1.0",
+      provider: "openai",
+      profile: "resident-default",
+      model: "gpt-5.6-sol",
+      credential: "configured",
+      credentialValue: "must-never-cross-the-webview",
+    }),
+  );
+});
+
+test("Resident OpenAI provider sends no credential field across IPC", async () => {
+  const calls: Array<{ command: string; args?: Record<string, unknown> }> = [];
+  const invoke = async <T>(
+    command: string,
+    args?: Record<string, unknown>,
+  ): Promise<T> => {
+    calls.push({ command, args });
+    return {
+      schemaVersion: "1.0",
+      diagnosis: "Read-only follow-up required.",
+      confidence: 0.7,
+      evidenceIds: ["E-1"],
+      requestedEvidence: [],
+    } as T;
+  };
+  const provider = new NativeOpenAiProvider(invoke);
+  const proposal = await provider.diagnose("Diagnose", [providerEvidence()]);
+  assert.equal(proposal.diagnosis, "Read-only follow-up required.");
+  assert.equal(calls[0]?.command, "resident_openai_diagnose");
+  const serialized = JSON.stringify(calls[0]?.args);
+  assert.doesNotMatch(serialized, /api.?key|authorization|bearer/iu);
+  assert.match(serialized, /observed-untrusted/u);
+});
+
+test("Resident OpenAI cancellation and errors never expose backend detail", async () => {
+  const secret = "synthetic-secret-must-not-escape";
+  const commands: string[] = [];
+  const pendingInvoke = async <T>(command: string): Promise<T> => {
+    commands.push(command);
+    if (command === "resident_openai_cancel") return undefined as T;
+    return new Promise<T>(() => undefined);
+  };
+  const controller = new AbortController();
+  const cancelled = new NativeOpenAiProvider(pendingInvoke).diagnose(
+    "Diagnose",
+    [providerEvidence()],
+    { signal: controller.signal },
+  );
+  controller.abort();
+  await assert.rejects(cancelled, (error: unknown) => {
+    assert.equal((error as { code?: unknown }).code, "cancelled");
+    return true;
+  });
+  assert.ok(commands.includes("resident_openai_cancel"));
+
+  const rejectedInvoke = async <T>(): Promise<T> =>
+    Promise.reject({ code: "upstream", message: secret });
+  await assert.rejects(
+    new NativeOpenAiProvider(rejectedInvoke).diagnose("Diagnose", [
+      providerEvidence(),
+    ]),
+    (error: unknown) => {
+      assert.equal((error as { code?: unknown }).code, "upstream");
+      assert.doesNotMatch(String(error), new RegExp(secret, "u"));
+      return true;
+    },
   );
 });
 
@@ -931,6 +1021,25 @@ test("macOS limited projections require their exact scope summary", async () => 
     restoreProperty("window", originalWindow);
   }
 });
+
+function providerEvidence() {
+  return {
+    evidence: {
+      schemaVersion: "1.0" as const,
+      id: "E-1",
+      collector: "linux.systemd.failed",
+      target: "local-machine",
+      capturedAt: "2026-08-17T00:00:00.000Z",
+      contentType: "text/plain",
+      sha256: "a".repeat(64),
+      sensitivity: "system" as const,
+      trust: "observed-untrusted" as const,
+      summary: "One failed service was observed",
+      blobRef: `sha256:${"a".repeat(64)}`,
+    },
+    content: "demo.service failed",
+  };
+}
 
 function rescueTargetScanFixture() {
   const diskId = `disk:${"a".repeat(64)}`;

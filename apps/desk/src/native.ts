@@ -1,8 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
 import {
   OfflineRulesProvider,
+  ProviderError,
   type ObservedEvidence,
   type Provider,
+  type ProviderRequestOptions,
 } from "@kernaid/agent-gateway";
 import {
   parseDiagnosisProposal,
@@ -185,6 +187,19 @@ export interface SecureRuntimeStatus {
   persistentAuditStarted: boolean;
   deviceId?: string;
 }
+
+export interface ResidentOpenAiStatus {
+  schemaVersion: "1.0";
+  provider: "openai";
+  profile: "resident-default";
+  model: "gpt-5.6-sol";
+  credential: "absent" | "configured";
+}
+
+type NativeInvoke = <T>(
+  command: string,
+  args?: Record<string, unknown>,
+) => Promise<T>;
 
 interface NativeSignedArtifact {
   mediaType: typeof SIGNED_REPORT_MEDIA_TYPE;
@@ -705,6 +720,103 @@ export async function initializeDeviceIdentity(): Promise<SecureRuntimeStatus> {
   return parseSecureRuntimeStatus(await invoke("initialize_device_identity"));
 }
 
+export async function getResidentOpenAiStatus(
+  invokeCommand: NativeInvoke = invoke,
+): Promise<ResidentOpenAiStatus> {
+  if (invokeCommand === invoke && !isNative())
+    throw new Error("OpenAI Resident richiede KernAid Desk nativo.");
+  try {
+    return parseResidentOpenAiStatus(
+      await invokeCommand("resident_openai_status"),
+    );
+  } catch (error) {
+    throw nativeOpenAiError(error);
+  }
+}
+
+export async function logoutResidentOpenAi(
+  invokeCommand: NativeInvoke = invoke,
+): Promise<ResidentOpenAiStatus> {
+  if (invokeCommand === invoke && !isNative())
+    throw new Error("OpenAI Resident richiede KernAid Desk nativo.");
+  try {
+    return parseResidentOpenAiStatus(
+      await invokeCommand("resident_openai_logout"),
+    );
+  } catch (error) {
+    throw nativeOpenAiError(error);
+  }
+}
+
+export class NativeOpenAiProvider implements Provider {
+  readonly capabilities = Object.freeze({
+    streaming: false,
+    structuredOutput: true,
+    toolRequests: false,
+    local: false,
+  });
+
+  readonly #invoke: NativeInvoke;
+
+  constructor(invokeCommand: NativeInvoke = invoke) {
+    this.#invoke = invokeCommand;
+  }
+
+  async diagnose(
+    objective: string,
+    evidence: readonly ObservedEvidence[],
+    options: ProviderRequestOptions = {},
+  ): Promise<DiagnosisProposal> {
+    if (!objective.trim() || evidence.length === 0)
+      throw new ProviderError("invalid_request", "Provider input is invalid");
+    if (options.signal?.aborted)
+      throw new ProviderError("cancelled", "Provider request was cancelled");
+    const requestId = `O-${crypto.randomUUID()}`;
+    const request = {
+      requestId,
+      objective,
+      evidence: evidence.map(({ evidence: item, content }) => ({
+        id: item.id,
+        collector: item.collector,
+        target: item.target,
+        capturedAt: item.capturedAt,
+        contentType: item.contentType,
+        sha256: item.sha256,
+        sensitivity: item.sensitivity,
+        trust: item.trust,
+        summary: item.summary,
+        content,
+      })),
+    };
+    let rejectCancellation: ((reason: ProviderError) => void) | undefined;
+    const cancellation = new Promise<never>((_resolve, reject) => {
+      rejectCancellation = reject;
+    });
+    const onAbort = (): void => {
+      void this.#invoke("resident_openai_cancel", { requestId }).catch(
+        () => undefined,
+      );
+      rejectCancellation?.(
+        new ProviderError("cancelled", "Provider request was cancelled"),
+      );
+    };
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+    const operation = this.#invoke<unknown>("resident_openai_diagnose", {
+      request,
+    });
+    try {
+      return parseDiagnosisProposal(
+        await Promise.race([operation, cancellation]),
+      );
+    } catch (error) {
+      if (error instanceof ProviderError) throw error;
+      throw nativeOpenAiError(error);
+    } finally {
+      options.signal?.removeEventListener("abort", onAbort);
+    }
+  }
+}
+
 export function secureAuditReady(status: SecureRuntimeStatus): boolean {
   return status.audit === "secure" && status.signing === "ready";
 }
@@ -1070,6 +1182,78 @@ export function parseSecureRuntimeStatus(value: unknown): SecureRuntimeStatus {
   )
     throw new Error("Stato del runtime sicuro non valido.");
   return structuredClone(item) as unknown as SecureRuntimeStatus;
+}
+
+export function parseResidentOpenAiStatus(
+  value: unknown,
+): ResidentOpenAiStatus {
+  const item = exactRecord(value, [
+    "schemaVersion",
+    "provider",
+    "profile",
+    "model",
+    "credential",
+  ]);
+  if (
+    item.schemaVersion !== "1.0" ||
+    item.provider !== "openai" ||
+    item.profile !== "resident-default" ||
+    item.model !== "gpt-5.6-sol" ||
+    !(item.credential === "absent" || item.credential === "configured")
+  )
+    throw new Error("Stato OpenAI Resident non valido.");
+  return structuredClone(item) as unknown as ResidentOpenAiStatus;
+}
+
+function nativeOpenAiError(value: unknown): ProviderError {
+  const fallback = new ProviderError(
+    "transport",
+    "OpenAI Resident non è disponibile.",
+  );
+  if (typeof value !== "object" || value === null || Array.isArray(value))
+    return fallback;
+  const item = value as Record<string, unknown>;
+  if (Object.keys(item).some((key) => key !== "code" && key !== "message"))
+    return fallback;
+  const code = item.code;
+  switch (code) {
+    case "cancelled":
+      return new ProviderError("cancelled", "Richiesta OpenAI annullata.");
+    case "credential_unavailable":
+      return new ProviderError(
+        "credential_unavailable",
+        "Credenziale OpenAI non disponibile.",
+      );
+    case "invalid_request":
+      return new ProviderError(
+        "invalid_request",
+        "Richiesta OpenAI non valida.",
+      );
+    case "invalid_response":
+      return new ProviderError(
+        "invalid_response",
+        "Risposta OpenAI non valida.",
+      );
+    case "request_too_large":
+      return new ProviderError(
+        "request_too_large",
+        "Richiesta OpenAI troppo grande.",
+      );
+    case "response_too_large":
+      return new ProviderError(
+        "response_too_large",
+        "Risposta OpenAI troppo grande.",
+      );
+    case "timeout":
+      return new ProviderError("timeout", "Richiesta OpenAI scaduta.");
+    case "upstream":
+      return new ProviderError("upstream", "OpenAI ha rifiutato la richiesta.");
+    case "busy":
+    case "transport":
+      return fallback;
+    default:
+      return fallback;
+  }
 }
 
 export async function parseNativeSignedArtifact(

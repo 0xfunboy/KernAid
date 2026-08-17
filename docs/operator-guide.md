@@ -94,6 +94,77 @@ also explicit `not-run-unqualified` limitations with `null` values.
 Physical Intel/Apple-silicon qualification and signing/notarization are still
 release gates.
 
+### Optional OpenAI diagnosis in Resident mode
+
+OpenAI is opt-in and is not available in Rescue in this milestone. The
+credential companion is not included in the desktop installer and is not added
+to `PATH`. From the same successful Desktop workflow run, download and extract
+the outer GitHub artifact matching the installed Desk build:
+
+- `kernaid-provider-key-windows-x86_64` contains
+  `kernaid-provider-key.exe`;
+- `kernaid-provider-key-linux-x86_64` contains
+  `kernaid-provider-key-linux-x86_64.tar.gz`;
+- `kernaid-provider-key-macos-aarch64` contains
+  `kernaid-provider-key-macos-aarch64.tar.gz`;
+- `kernaid-provider-key-macos-x86_64` contains
+  `kernaid-provider-key-macos-x86_64.tar.gz`.
+
+On Linux or macOS, unpack the inner archive; it preserves the companion as an
+owner-only executable:
+
+```text
+Linux x86_64: tar -xzf kernaid-provider-key-linux-x86_64.tar.gz
+Apple silicon: tar -xzf kernaid-provider-key-macos-aarch64.tar.gz
+Intel macOS: tar -xzf kernaid-provider-key-macos-x86_64.tar.gz
+```
+
+Close KernAid Desk, open a native terminal in the extracted directory, and
+run the applicable command:
+
+```text
+Windows: .\kernaid-provider-key.exe configure
+Linux/macOS: ./kernaid-provider-key configure
+```
+
+Enter the API key twice at the hidden TTY prompts. The companion rejects keys
+from command-line arguments, redirected standard input, files and environment
+variables. It stores the key under the public `resident-default` profile in
+Windows Credential Manager, macOS Keychain or Linux Secret Service; no
+plaintext fallback exists. `kernaid-provider-key status` reports only
+`configured` or `absent`. Close Desk before running either companion command,
+because Desk and the companion share an exclusive provider-store lock. The
+companion accepts no data-directory override, and changing `HOME`, XDG or
+`APPDATA` cannot create a second lock for the same OS-user provider profile.
+
+Restart Desk and select **OpenAI** in the header. Selection is explicit:
+KernAid starts with **Offline** rules even when a key exists and never silently
+falls back or resubmits context to another provider. The backend sends one
+bounded HTTPS request to `https://api.openai.com/v1/responses` using the fixed
+`gpt-5.6-sol` profile, `store: false`, no tools, and a strict diagnosis-only
+JSON schema. Reasoning effort is fixed to `medium`, the combined reasoning and
+answer budget is 4,096 tokens, and the request fails closed after 60 seconds
+(with a 10-second connection bound). Before any network request, the native
+backend requires the exact complete OS-specific corpus, verifies each content
+hash, and parses it with the strict local diagnostic pack. Raw collector
+content, targets and summaries never enter provider context: OpenAI receives
+only the provider-neutral deterministic proposal, minimized evidence
+ID/collector metadata and the bounded objective after conservative
+pattern-based filtering for common secrets, emails, network addresses and
+paths. This filtering cannot guarantee removal of names or arbitrary personal
+text. Desk shows that limitation before diagnosis; technicians must keep names,
+document text and other customer identifiers out of the objective. This
+milestone does not yet provide a context-preview screen. Observations remain
+marked `observed-untrusted`; the response can only propose a diagnosis bound to
+existing evidence identifiers and cannot invoke a repair or the broker.
+
+Select **Logout** in the header to cancel any active provider request, remove
+the selected key idempotently, verify its absence, and return to Offline rules.
+If the keyring, network, timeout or provider response fails, the cloud request
+fails closed while Offline diagnostics remain selectable. Provider use sends
+diagnostic data to OpenAI under the technician's own account and terms; review
+customer authorization and applicable data-processing requirements first.
+
 ## Safety rules
 
 - Never attach a customer disk to automated test scripts; tests accept fixtures and disposable images only.

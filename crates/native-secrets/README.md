@@ -46,6 +46,18 @@ There is no raw public getter, serialization support, Tauri command, log value,
 or UI bridge in this crate. An application integration must keep setup and use
 inside a trusted native backend; a webview must never load a stored key.
 
+KernAid Desk uses the fixed public profile `resident-default`. Its
+`kernaid-provider-key configure` companion accepts the key only from two
+matching hidden native-TTY prompts while Desk is closed. The Resident HTTP
+adapter borrows the decoded value through `with_openai_api_key`, retains only a
+`Zeroizing` request-lifetime copy in managed application memory, and exposes no
+configure command to the webview. The webview receives presence-only status,
+diagnosis results, sanitized error categories, and idempotent logout.
+The companion accepts no application-data override. Its provider lock has one
+fixed identity per OS user and public provider profile, independent of
+`HOME`/XDG path aliases on Unix and resolved through the same platform data
+directory contract as Tauri on Windows.
+
 ## Required application boundary
 
 Open each store only after acquiring the application's inter-process

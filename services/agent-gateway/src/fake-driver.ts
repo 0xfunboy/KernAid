@@ -34,7 +34,10 @@ import {
 } from "@kernaid/schemas";
 import { OfflineRulesProvider, type Provider } from "./fake-provider.js";
 import { InMemoryAuditSink } from "./audit-sink.js";
-import { redactForProvider } from "./redaction.js";
+import {
+  redactForProvider,
+  redactSecretsForLocalEvidence,
+} from "./redaction.js";
 
 const FINGERPRINT = /^sha256:[a-f0-9]{64}$/;
 const MAX_SESSIONS = 128;
@@ -241,10 +244,8 @@ export class LocalSessionDriver implements SessionDriver {
       const bytes = new TextEncoder().encode(observedContent);
       if (bytes.byteLength > evidenceByteLimit(request.collector))
         throw new Error("evidence content exceeds the safe limit");
-      const digest = await crypto.subtle.digest("SHA-256", bytes);
-      const hash = Array.from(new Uint8Array(digest), (byte) =>
-        byte.toString(16).padStart(2, "0"),
-      ).join("");
+      const providerContent = redactSecretsForLocalEvidence(observedContent);
+      const hash = await sha256(providerContent);
       const item = parseEvidence({
         schemaVersion: "1.0",
         id: `E-${++this.evidenceSequence}`,
@@ -272,7 +273,7 @@ export class LocalSessionDriver implements SessionDriver {
         item.capturedAt,
       );
       session.evidence.push(item);
-      this.content.set(item.id, redactForProvider(observedContent));
+      this.content.set(item.id, providerContent);
       return [structuredClone(item)];
     });
   }

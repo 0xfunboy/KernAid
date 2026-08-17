@@ -2,12 +2,17 @@
 
 #[cfg(any(target_os = "macos", test))]
 mod macos_resident;
+mod resident_openai;
 mod secure_runtime;
 #[cfg(any(target_os = "windows", test))]
 mod windows_resident;
 
 use kernaid_broker::{BrokerError, ObserveBroker};
 use kernaid_protocol::BrokerRequest;
+use resident_openai::{
+    ResidentOpenAiRuntime, resident_openai_cancel, resident_openai_diagnose,
+    resident_openai_logout, resident_openai_status,
+};
 use secure_runtime::{
     SecureRuntime, append_audit_record, initialize_device_identity, seal_signed_report,
     secure_runtime_status,
@@ -1414,6 +1419,7 @@ fn main() {
             let app_data_directory = app.path().app_data_dir()?;
             let runtime = SecureRuntime::open(&app_data_directory)?;
             app.manage(runtime);
+            app.manage(ResidentOpenAiRuntime::open(&app_data_directory));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1427,7 +1433,11 @@ fn main() {
             secure_runtime_status,
             initialize_device_identity,
             append_audit_record,
-            seal_signed_report
+            seal_signed_report,
+            resident_openai_status,
+            resident_openai_diagnose,
+            resident_openai_cancel,
+            resident_openai_logout
         ])
         .run(tauri::generate_context!())
         .expect("failed to run KernAid Desk");
@@ -1772,81 +1782,9 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        let storage_shape = if !failed_collectors
-            .iter()
-            .any(|failure| failure.starts_with("macos.storage"))
-        {
-            "not-needed".to_owned()
-        } else {
-            match run_fixed_command(
-                macos_resident::SYSTEM_PROFILER,
-                &macos_resident::SYSTEM_PROFILER_ARGS,
-                macos_resident::STORAGE_TIMEOUT,
-                QUALIFIED_MACOS_MAX_OUTPUT_BYTES,
-            ) {
-                Ok(output) => format!(
-                    "exit={};stderrEmpty={};truncated=false;{}",
-                    output.exit_code,
-                    output.stderr.trim().is_empty(),
-                    macos_resident::storage_shape_summary(&output.stdout)
-                ),
-                Err(error) => format!(
-                    "commandFailed=true;truncated={}",
-                    matches!(error, FixedCommandFailure::Truncated)
-                ),
-            }
-        };
-        let launchd_shape = if !failed_collectors
-            .iter()
-            .any(|failure| failure.starts_with("macos.launchd.state"))
-        {
-            "not-needed".to_owned()
-        } else {
-            match run_fixed_command(
-                macos_resident::LAUNCHCTL,
-                &macos_resident::LAUNCHCTL_ARGS,
-                macos_resident::STANDARD_TIMEOUT,
-                QUALIFIED_MACOS_MAX_OUTPUT_BYTES,
-            ) {
-                Ok(output) => format!(
-                    "exit={};stderrEmpty={};{}",
-                    output.exit_code,
-                    output.stderr.trim().is_empty(),
-                    macos_resident::launchd_shape_summary(&output.stdout)
-                ),
-                Err(error) => format!(
-                    "commandFailed=true;truncated={}",
-                    matches!(error, FixedCommandFailure::Truncated)
-                ),
-            }
-        };
-        let snapshot_shape = if !failed_collectors
-            .iter()
-            .any(|failure| failure.starts_with("macos.snapshots.inventory"))
-        {
-            "not-needed".to_owned()
-        } else {
-            match run_fixed_command(
-                macos_resident::TMUTIL,
-                &macos_resident::SNAPSHOT_ARGS,
-                macos_resident::STANDARD_TIMEOUT,
-                QUALIFIED_MACOS_MAX_OUTPUT_BYTES,
-            ) {
-                Ok(output) => format!(
-                    "exit={};stderrEmpty={};{}",
-                    output.exit_code,
-                    output.stderr.trim().is_empty(),
-                    macos_resident::snapshot_shape_summary(&output.stdout)
-                ),
-                Err(error) => format!(
-                    "commandFailed=true;truncated={}",
-                    matches!(error, FixedCommandFailure::Truncated)
-                ),
-            }
-        };
         assert!(
             quick_failures.is_empty() && failed_collectors.is_empty(),
-            "quick={quick_failures:?};deep={failed_collectors:?};storageShape={storage_shape};launchdShape={launchd_shape};snapshotShape={snapshot_shape}"
+            "quick={quick_failures:?};deep={failed_collectors:?}"
         );
         assert_eq!(
             quick
