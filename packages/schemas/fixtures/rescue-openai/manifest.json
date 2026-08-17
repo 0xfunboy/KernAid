@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "validCases": [
+    {
+      "name": "status",
+      "request": "valid/status.request.raw",
+      "response": "valid/status.response.raw"
+    },
+    {
+      "name": "linux-malformed-fstab",
+      "request": "valid/linux-malformed-fstab.request.raw",
+      "response": "valid/linux-malformed-fstab.response.raw"
+    },
+    {
+      "name": "linux-missing-kernel",
+      "request": "valid/linux-missing-kernel.request.raw",
+      "response": "valid/linux-missing-kernel.response.raw"
+    },
+    {
+      "name": "linux-generic-canary",
+      "request": "valid/linux-generic-canary.request.raw",
+      "response": "valid/linux-generic-canary.response.raw"
+    },
+    {
+      "name": "linux-unconfirmed",
+      "request": "valid/linux-unconfirmed.request.raw",
+      "response": "valid/linux-unconfirmed.response.raw"
+    },
+    {
+      "name": "windows-pending",
+      "request": "valid/windows-pending.request.raw",
+      "response": "valid/windows-pending.response.raw"
+    },
+    {
+      "name": "windows-missing-boot",
+      "request": "valid/windows-missing-boot.request.raw",
+      "response": "valid/windows-missing-boot.response.raw"
+    },
+    {
+      "name": "windows-generic",
+      "request": "valid/windows-generic.request.raw",
+      "response": "valid/windows-generic.response.raw"
+    }
+  ],
+  "invalidRequests": [
+    "invalid/duplicate-envelope.request.raw",
+    "invalid/duplicate-evidence-field.request.raw",
+    "invalid/duplicate-corpus-field.request.raw",
+    "invalid/trailing-value.request.raw",
+    "invalid/trailing-corpus-value.request.raw",
+    "invalid/prohibited-fields.request.raw",
+    "invalid/unknown-corpus-field.request.raw"
+  ]
+}

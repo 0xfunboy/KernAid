@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import type { AuditSealRequest } from "@kernaid/session-driver";
 import {
@@ -1075,6 +1076,101 @@ test("Rescue corpus diagnosis is deterministic and independent of browser global
     assert.equal(windows.confidence, 0.8);
   } finally {
     restoreProperty("window", originalWindow);
+  }
+});
+
+test("Rescue OpenAI golden requests preserve deterministic TypeScript parity", async () => {
+  interface GoldenManifest {
+    schemaVersion: number;
+    validCases: Array<{
+      name: string;
+      request: string;
+      response: string;
+    }>;
+  }
+  interface GoldenDiagnoseRequest {
+    operation: "provider.openai.diagnose";
+    payload: {
+      objective: string;
+      evidence: Array<{
+        schemaVersion: "1.0";
+        id: string;
+        collector: string;
+        target: string;
+        contentType: string;
+        trust: "observed-untrusted";
+        summary: string;
+        content: string;
+      }>;
+    };
+  }
+  interface GoldenDiagnoseResponse {
+    operation: "provider.openai.diagnose";
+    ok: true;
+    payload: {
+      proposal: {
+        schemaVersion: "1.0";
+        diagnosis: string;
+        confidence: number;
+        evidenceIds: string[];
+        requestedEvidence: string[];
+      };
+    };
+  }
+
+  const root = new URL(
+    "../../../packages/schemas/fixtures/rescue-openai/",
+    import.meta.url,
+  );
+  const manifest = JSON.parse(
+    readFileSync(new URL("manifest.json", root), "utf8"),
+  ) as GoldenManifest;
+  assert.equal(manifest.schemaVersion, 1);
+  const diagnoseCases = manifest.validCases.filter(
+    ({ name }) => name !== "status",
+  );
+  assert.equal(diagnoseCases.length, 7);
+  const provider = new PlatformOfflineRulesProvider();
+  for (const golden of diagnoseCases) {
+    const request = JSON.parse(
+      readFileSync(new URL(golden.request, root), "utf8"),
+    ) as GoldenDiagnoseRequest;
+    const expected = JSON.parse(
+      readFileSync(new URL(golden.response, root), "utf8"),
+    ) as GoldenDiagnoseResponse;
+    assert.equal(request.operation, "provider.openai.diagnose", golden.name);
+    assert.equal(expected.operation, request.operation, golden.name);
+    assert.equal(expected.ok, true, golden.name);
+    assert.equal(request.payload.evidence.length, 1, golden.name);
+    const item = request.payload.evidence[0];
+    assert.ok(item);
+    const contentSha256 = await sha256(item.content);
+    const proposal = await provider.diagnose(request.payload.objective, [
+      {
+        evidence: {
+          schemaVersion: item.schemaVersion,
+          id: item.id,
+          collector: item.collector,
+          target: item.target,
+          capturedAt: "2026-08-17T00:00:00.000Z",
+          contentType: item.contentType,
+          sha256: contentSha256,
+          sensitivity: "system",
+          trust: item.trust,
+          summary: item.summary,
+          blobRef: `sha256:${contentSha256}`,
+        },
+        content: item.content,
+      },
+    ]);
+    assert.deepEqual(proposal, expected.payload.proposal, golden.name);
+    if (golden.name === "linux-generic-canary") {
+      assert.match(item.content, /RESCUE-CORPUS-CANARY-DO-NOT-PROJECT/u);
+      assert.doesNotMatch(
+        JSON.stringify(expected.payload.proposal),
+        /RESCUE-CORPUS-CANARY-DO-NOT-PROJECT/u,
+      );
+    }
   }
 });
 

@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.kernaid.dev/v1/rescue-openai-request.json",
+  "title": "RescueOpenAiRequest",
+  "$comment": "The raw one-line frame is capped at 98304 bytes. Rust additionally enforces UTF-8 byte limits for objective, summary, and corpus content and parses the nested corpus with duplicate and trailing-value rejection.",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["apiVersion", "requestId", "operation", "payload"],
+      "properties": {
+        "apiVersion": { "const": "kernaid.dev/rescue-openai/v1alpha1" },
+        "requestId": { "$ref": "#/$defs/requestId" },
+        "operation": { "const": "provider.status" },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "maxProperties": 0
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["apiVersion", "requestId", "operation", "payload"],
+      "properties": {
+        "apiVersion": { "const": "kernaid.dev/rescue-openai/v1alpha1" },
+        "requestId": { "$ref": "#/$defs/requestId" },
+        "operation": { "const": "provider.openai.diagnose" },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["objective", "evidence"],
+          "properties": {
+            "objective": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 8192
+            },
+            "evidence": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 1,
+              "items": { "$ref": "#/$defs/rescueEvidence" }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "requestId": {
+      "type": "string",
+      "pattern": "^O-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "rescueEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "id",
+        "collector",
+        "target",
+        "contentType",
+        "trust",
+        "summary",
+        "content"
+      ],
+      "properties": {
+        "schemaVersion": { "const": "1.0" },
+        "id": {
+          "type": "string",
+          "pattern": "^E-[A-Za-z0-9-]+$",
+          "maxLength": 128
+        },
+        "collector": {
+          "const": "rescue.installed-target.filesystem-content.read-only.v1"
+        },
+        "target": { "const": "selected-installed-target" },
+        "contentType": { "const": "application/json" },
+        "trust": { "const": "observed-untrusted" },
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "content": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 49152
+        }
+      }
+    }
+  }
+}

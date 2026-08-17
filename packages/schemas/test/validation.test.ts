@@ -15,6 +15,8 @@ const schemaFiles = [
   "diagnosis-proposal.schema.json",
   "evidence.schema.json",
   "execution-event.schema.json",
+  "rescue-openai-request.schema.json",
+  "rescue-openai-response.schema.json",
   "rescue-vault-request.schema.json",
   "rescue-vault-response.schema.json",
   "session-report.schema.json",
@@ -44,6 +46,104 @@ test("all published JSON schemas compile together", () => {
         `https://schemas.kernaid.dev/v1/${file.replace(".schema", "")}`,
       ),
     );
+});
+
+test("Rescue OpenAI golden frames agree with the closed published schemas", () => {
+  interface GoldenManifest {
+    schemaVersion: number;
+    validCases: Array<{ name: string; request: string; response: string }>;
+  }
+
+  const ajv = new Ajv2020({ allErrors: true, strict: true });
+  const requestSchema = JSON.parse(
+    readFileSync(
+      new URL("../rescue-openai-request.schema.json", import.meta.url),
+      "utf8",
+    ),
+  );
+  const responseSchema = JSON.parse(
+    readFileSync(
+      new URL("../rescue-openai-response.schema.json", import.meta.url),
+      "utf8",
+    ),
+  );
+  const validateRequest = ajv.compile(requestSchema);
+  const validateResponse = ajv.compile(responseSchema);
+  const root = new URL("../fixtures/rescue-openai/", import.meta.url);
+  const manifest = JSON.parse(
+    readFileSync(new URL("manifest.json", root), "utf8"),
+  ) as GoldenManifest;
+  assert.equal(manifest.schemaVersion, 1);
+  assert.equal(manifest.validCases.length, 8);
+  for (const golden of manifest.validCases) {
+    assert.equal(
+      validateRequest(
+        JSON.parse(readFileSync(new URL(golden.request, root), "utf8")),
+      ),
+      true,
+      `${golden.name} request`,
+    );
+    assert.equal(
+      validateResponse(
+        JSON.parse(readFileSync(new URL(golden.response, root), "utf8")),
+      ),
+      true,
+      `${golden.name} response`,
+    );
+  }
+
+  const diagnose = JSON.parse(
+    readFileSync(
+      new URL("valid/linux-malformed-fstab.request.raw", root),
+      "utf8",
+    ),
+  ) as Record<string, unknown> & {
+    payload: Record<string, unknown> & { evidence: unknown[] };
+  };
+  for (const field of [
+    "url",
+    "model",
+    "tools",
+    "messages",
+    "command",
+    "path",
+    "device",
+    "raw",
+    "generic",
+    "args",
+  ]) {
+    const injected = structuredClone(diagnose);
+    injected.payload[field] = "forbidden";
+    assert.equal(validateRequest(injected), false, field);
+  }
+  const duplicateEvidence = structuredClone(diagnose);
+  duplicateEvidence.payload.evidence.push(
+    structuredClone(duplicateEvidence.payload.evidence[0]),
+  );
+  assert.equal(validateRequest(duplicateEvidence), false);
+
+  const diagnoseResponse = JSON.parse(
+    readFileSync(
+      new URL("valid/linux-malformed-fstab.response.raw", root),
+      "utf8",
+    ),
+  ) as {
+    payload: { proposal: { evidenceIds: string[] } };
+  };
+  diagnoseResponse.payload.proposal.evidenceIds.push("E-FOREIGN");
+  assert.equal(validateResponse(diagnoseResponse), false);
+
+  const status = JSON.parse(
+    readFileSync(new URL("valid/status.response.raw", root), "utf8"),
+  ) as Record<string, unknown> & {
+    payload: Record<string, unknown>;
+  };
+  status.payload.vault = "locked";
+  assert.equal(validateResponse(status), false);
+  status.payload.credential = "unavailable";
+  assert.equal(validateResponse(status), true);
+  status.payload.message = "upstream text";
+  assert.equal(validateResponse(status), false);
 });
 
 test("Rescue vault schemas keep path and secret data out of IPC JSON", () => {

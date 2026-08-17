@@ -1,0 +1,12 @@
+[package]
+name = "kernaid-rescue-openai-provider"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+regex = "1.13"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+
+[lints]
+workspace = true

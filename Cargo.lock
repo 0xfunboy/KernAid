@@ -2304,6 +2304,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "kernaid-rescue-openai-provider"
+version = "0.1.0"
+dependencies = [
+ "regex",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "kernaid-rescue-secrets"
 version = "0.1.0"
 dependencies = [

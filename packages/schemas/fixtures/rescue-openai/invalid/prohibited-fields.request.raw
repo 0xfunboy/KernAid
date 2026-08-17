@@ -1,0 +1,1 @@
+{"apiVersion":"kernaid.dev/rescue-openai/v1alpha1","requestId":"O-88888888-8888-8888-8888-888888888888","operation":"provider.openai.diagnose","payload":{"objective":"Analizza il target","evidence":[],"url":"https://example.invalid","model":"arbitrary","tools":[],"messages":[],"command":"sh","path":"/dev/sda","device":"sda","raw":"payload","generic":{"args":["--force"]}}}

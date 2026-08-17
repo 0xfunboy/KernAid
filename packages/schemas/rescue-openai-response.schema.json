@@ -1,0 +1,154 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.kernaid.dev/v1/rescue-openai-response.json",
+  "title": "RescueOpenAiResponse",
+  "$comment": "The complete one-line response frame, including its terminal newline, is capped at 65536 bytes. Error responses carry only a closed code and never free-form upstream text.",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["apiVersion", "requestId", "operation", "ok", "payload"],
+      "properties": {
+        "apiVersion": { "const": "kernaid.dev/rescue-openai/v1alpha1" },
+        "requestId": { "$ref": "#/$defs/requestId" },
+        "operation": { "const": "provider.status" },
+        "ok": { "const": true },
+        "payload": { "$ref": "#/$defs/status" }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["apiVersion", "requestId", "operation", "ok", "payload"],
+      "properties": {
+        "apiVersion": { "const": "kernaid.dev/rescue-openai/v1alpha1" },
+        "requestId": { "$ref": "#/$defs/requestId" },
+        "operation": { "const": "provider.openai.diagnose" },
+        "ok": { "const": true },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["proposal"],
+          "properties": {
+            "proposal": { "$ref": "#/$defs/diagnosisProposal" }
+          }
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["apiVersion", "requestId", "operation", "ok", "error"],
+      "properties": {
+        "apiVersion": { "const": "kernaid.dev/rescue-openai/v1alpha1" },
+        "requestId": { "$ref": "#/$defs/requestId" },
+        "operation": {
+          "enum": ["provider.status", "provider.openai.diagnose"]
+        },
+        "ok": { "const": false },
+        "error": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["code"],
+          "properties": {
+            "code": {
+              "enum": [
+                "busy",
+                "credential_unavailable",
+                "invalid_request",
+                "invalid_response",
+                "request_too_large",
+                "response_too_large",
+                "timeout",
+                "transport",
+                "upstream"
+              ]
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "requestId": {
+      "type": "string",
+      "pattern": "^O-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "status": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "profile", "vault", "credential"],
+      "properties": {
+        "provider": { "const": "openai" },
+        "profile": { "const": "rescue-default" },
+        "vault": {
+          "enum": [
+            "absent",
+            "unprovisioned",
+            "locked",
+            "unlocking",
+            "unlocked",
+            "locking",
+            "faulted-reboot-required"
+          ]
+        },
+        "credential": {
+          "enum": ["unavailable", "absent", "configured"]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "vault": { "not": { "const": "unlocked" } } },
+            "required": ["vault"]
+          },
+          "then": {
+            "properties": { "credential": { "const": "unavailable" } },
+            "required": ["credential"]
+          }
+        }
+      ]
+    },
+    "diagnosisProposal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "diagnosis",
+        "confidence",
+        "evidenceIds",
+        "requestedEvidence"
+      ],
+      "properties": {
+        "schemaVersion": { "const": "1.0" },
+        "diagnosis": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16384
+        },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "evidenceIds": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^E-[A-Za-z0-9-]+$",
+            "maxLength": 128
+          }
+        },
+        "requestedEvidence": {
+          "type": "array",
+          "maxItems": 128,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        }
+      }
+    }
+  }
+}
