@@ -211,7 +211,7 @@ class VaultEvidence:
 @dataclass
 class VaultLifecycle:
     mapper: MapperIdentity | None = None
-    mapper_fd: int = -1
+    mapper_lease_fd: int = -1
     pending_mapper_name: str | None = None
     mountpoint: str | None = None
     mount_major_minor: str | None = None
@@ -817,6 +817,31 @@ def bind_preflight_tools() -> Mapping[str, ToolIdentity]:
     return resolved
 
 
+def _preflight_identity_lease_capability() -> None:
+    if not hasattr(os, "O_PATH") or not os.path.isdir("/proc/self/fd"):
+        raise SafetyError("Linux O_PATH/procfd identity leases are required")
+    lease_fd = -1
+    data_fd = -1
+    try:
+        with defer_managed_signals():
+            flags = os.O_PATH | os.O_CLOEXEC
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            lease_fd = os.open("/dev/null", flags)
+            expected = _block_identity_tuple(os.fstat(lease_fd))
+            data_fd = os.open(f"/proc/self/fd/{lease_fd}", os.O_RDONLY | os.O_CLOEXEC)
+            if (
+                not stat.S_ISCHR(expected[2])
+                or _block_identity_tuple(os.fstat(data_fd)) != expected
+            ):
+                raise SafetyError("O_PATH/procfd identity lease preflight diverged")
+    finally:
+        if data_fd >= 0:
+            os.close(data_fd)
+        if lease_fd >= 0:
+            os.close(lease_fd)
+
+
 def _require_tool_version(
     result: CommandResult, product: str, minimum: tuple[int, int, int]
 ) -> None:
@@ -924,6 +949,7 @@ def _preflight_mount_capability(tools: Mapping[str, ToolIdentity]) -> None:
 
 def preflight_writer_environment() -> Mapping[str, ToolIdentity]:
     verify_implemented_vault_profile()
+    _preflight_identity_lease_capability()
     tools = bind_preflight_tools()
 
     cryptsetup = tools["cryptsetup"].path
@@ -1538,6 +1564,218 @@ def _revalidate_target_fd(
         or path_details.st_dev != details.st_dev
     ):
         raise SafetyError("whole-device path no longer names the held descriptor")
+
+
+def _block_identity_tuple(details) -> tuple[int, int, int, int]:
+    return (details.st_dev, details.st_ino, details.st_mode, details.st_rdev)
+
+
+def _close_owned_descriptors(descriptors: Sequence[int], label: str) -> None:
+    owned = [descriptor for descriptor in descriptors if descriptor >= 0]
+    errors: list[str] = []
+    if len(owned) != len(set(owned)):
+        errors.append("descriptor ownership is duplicated")
+    unique_owned = list(dict.fromkeys(owned))
+    with defer_managed_signals():
+        for descriptor in unique_owned:
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                errors.append(f"fd {descriptor}: {error}")
+    if errors:
+        raise WriteError(f"{label} descriptor cleanup failed ({'; '.join(errors)})")
+
+
+def _verify_block_identity_lease(
+    lease_fd: int,
+    path: str,
+    major_minor: str,
+    label: str,
+    *,
+    expected: tuple[int, int, int, int] | None = None,
+) -> tuple[int, int, int, int]:
+    if lease_fd < 0 or not os.path.isabs(path) or not v1.MAJ_MIN_RE.fullmatch(major_minor):
+        raise SafetyError(f"{label} identity lease is incomplete")
+    held = os.fstat(lease_fd)
+    named = os.stat(path, follow_symlinks=False)
+    identity = _block_identity_tuple(held)
+    descriptor_flags = fcntl.fcntl(lease_fd, fcntl.F_GETFL)
+    if (
+        not hasattr(os, "O_PATH")
+        or descriptor_flags & os.O_PATH != os.O_PATH
+        or not stat.S_ISBLK(held.st_mode)
+        or identity != _block_identity_tuple(named)
+        or f"{os.major(held.st_rdev)}:{os.minor(held.st_rdev)}" != major_minor
+        or (expected is not None and identity != expected)
+        or os.path.realpath(f"/proc/self/fd/{lease_fd}") != path
+    ):
+        raise SafetyError(f"{label} identity lease/path changed")
+    return identity
+
+
+def _open_block_identity_lease_from_data_fd(
+    data_fd: int, path: str, major_minor: str, label: str
+) -> int:
+    if not hasattr(os, "O_PATH"):
+        raise SafetyError("Linux O_PATH identity leases are unavailable")
+    baseline = os.fstat(data_fd)
+    expected = _block_identity_tuple(baseline)
+    if (
+        not stat.S_ISBLK(baseline.st_mode)
+        or f"{os.major(baseline.st_rdev)}:{os.minor(baseline.st_rdev)}"
+        != major_minor
+    ):
+        raise SafetyError(f"{label} data descriptor identity is invalid")
+    flags = os.O_PATH | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    lease_fd = os.open(path, flags)
+    try:
+        _verify_block_identity_lease(
+            lease_fd, path, major_minor, label, expected=expected
+        )
+        return lease_fd
+    except BaseException:
+        os.close(lease_fd)
+        raise
+
+
+def _open_data_fd_from_block_lease(
+    lease_fd: int,
+    path: str,
+    major_minor: str,
+    label: str,
+    *,
+    writable: bool,
+) -> int:
+    """Open one short-lived data FD while preserving lease identity exactly."""
+
+    data_fd = -1
+    try:
+        with defer_managed_signals():
+            expected = _verify_block_identity_lease(
+                lease_fd, path, major_minor, label
+            )
+            # /proc/self/fd/N is a kernel-owned link to the already validated
+            # O_PATH lease.  O_NOFOLLOW would reject that intentional link.
+            flags = (os.O_RDWR if writable else os.O_RDONLY) | os.O_CLOEXEC
+            data_fd = os.open(f"/proc/self/fd/{lease_fd}", flags)
+            observed = os.fstat(data_fd)
+            observed_flags = fcntl.fcntl(data_fd, fcntl.F_GETFL)
+            expected_access = os.O_RDWR if writable else os.O_RDONLY
+            if (
+                _block_identity_tuple(observed) != expected
+                or observed_flags & getattr(os, "O_PATH", 0)
+                or observed_flags & os.O_ACCMODE != expected_access
+            ):
+                raise SafetyError(f"{label} data descriptor diverged from its lease")
+            _verify_block_identity_lease(
+                lease_fd, path, major_minor, label, expected=expected
+            )
+        return data_fd
+    except BaseException:
+        if data_fd >= 0:
+            os.close(data_fd)
+        raise
+
+
+def _verify_partition_leases(
+    target_lease_fd: int,
+    partition_lease_fd: int,
+    partition: PartitionIdentity,
+    candidate,
+    layout,
+) -> None:
+    target_data_fd = _open_data_fd_from_block_lease(
+        target_lease_fd,
+        candidate.path,
+        candidate.major_minor,
+        "whole-device",
+        writable=False,
+    )
+    try:
+        partition_data_fd = _open_data_fd_from_block_lease(
+            partition_lease_fd,
+            partition.path,
+            partition.major_minor,
+            "vault partition",
+            writable=False,
+        )
+        try:
+            verify_partition_fd(
+                partition_data_fd,
+                partition,
+                target_data_fd,
+                candidate,
+                layout,
+            )
+        finally:
+            os.close(partition_data_fd)
+    finally:
+        os.close(target_data_fd)
+
+
+def handoff_partition_to_identity_leases(
+    target_fd: int,
+    partition_fd: int,
+    partition: PartitionIdentity,
+    candidate,
+    layout,
+) -> tuple[int, int]:
+    """Consume exclusive/data descriptors and return non-claiming O_PATH leases."""
+
+    owned_target_fd = target_fd
+    owned_partition_fd = partition_fd
+    target_lease_fd = -1
+    partition_lease_fd = -1
+    try:
+        with defer_managed_signals():
+            verify_partition_fd(
+                owned_partition_fd,
+                partition,
+                owned_target_fd,
+                candidate,
+                layout,
+            )
+            target_lease_fd = _open_block_identity_lease_from_data_fd(
+                owned_target_fd,
+                candidate.path,
+                candidate.major_minor,
+                "whole-device",
+            )
+            partition_lease_fd = _open_block_identity_lease_from_data_fd(
+                owned_partition_fd,
+                partition.path,
+                partition.major_minor,
+                "vault partition",
+            )
+            closing_partition_fd = owned_partition_fd
+            owned_partition_fd = -1
+            os.close(closing_partition_fd)
+            closing_target_fd = owned_target_fd
+            owned_target_fd = -1
+            os.close(closing_target_fd)
+            _verify_partition_leases(
+                target_lease_fd,
+                partition_lease_fd,
+                partition,
+                candidate,
+                layout,
+            )
+        return target_lease_fd, partition_lease_fd
+    except BaseException:
+        cleanup_descriptors = (
+            owned_partition_fd,
+            owned_target_fd,
+            partition_lease_fd,
+            target_lease_fd,
+        )
+        owned_partition_fd = -1
+        owned_target_fd = -1
+        partition_lease_fd = -1
+        target_lease_fd = -1
+        _close_owned_descriptors(cleanup_descriptors, "block handoff")
+        raise
 
 
 def _reject_tail_signatures(target_fd: int, candidate, image) -> None:
@@ -2314,6 +2552,33 @@ def verify_mapper_fd(
         raise SafetyError("mapper backing device changed")
 
 
+def verify_mapper_lease(
+    mapper_lease_fd: int,
+    identity: MapperIdentity,
+    partition: PartitionIdentity,
+    luks_uuid: str,
+    *,
+    require_alias: bool = True,
+) -> None:
+    mapper_data_fd = _open_data_fd_from_block_lease(
+        mapper_lease_fd,
+        identity.node_path,
+        identity.major_minor,
+        "vault mapper",
+        writable=False,
+    )
+    try:
+        verify_mapper_fd(
+            mapper_data_fd,
+            identity,
+            partition,
+            luks_uuid,
+            require_alias=require_alias,
+        )
+    finally:
+        os.close(mapper_data_fd)
+
+
 def _capture_lifecycle_mapper(
     lifecycle: VaultLifecycle,
     name: str,
@@ -2322,21 +2587,37 @@ def _capture_lifecycle_mapper(
     *,
     require_alias: bool,
 ) -> MapperIdentity:
-    if lifecycle.mapper is not None or lifecycle.mapper_fd >= 0:
+    if lifecycle.mapper is not None or lifecycle.mapper_lease_fd >= 0:
         raise WriteError("vault lifecycle already owns a mapper")
     if lifecycle.pending_mapper_name != name:
         raise WriteError("vault mapper recovery name is not lifecycle-bound")
     previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, v1.MANAGED_SIGNALS)
+    mapper_data_fd = -1
+    mapper_lease_fd = -1
     try:
-        mapper_fd, mapper = capture_mapper(
+        mapper_data_fd, mapper = capture_mapper(
             name,
             partition,
             luks_uuid,
             require_alias=require_alias,
         )
-        lifecycle.mapper_fd = mapper_fd
+        mapper_lease_fd = _open_block_identity_lease_from_data_fd(
+            mapper_data_fd,
+            mapper.node_path,
+            mapper.major_minor,
+            "vault mapper",
+        )
+        closing_mapper_data_fd = mapper_data_fd
+        mapper_data_fd = -1
+        os.close(closing_mapper_data_fd)
+        lifecycle.mapper_lease_fd = mapper_lease_fd
+        mapper_lease_fd = -1
         lifecycle.mapper = mapper
     finally:
+        if mapper_data_fd >= 0:
+            os.close(mapper_data_fd)
+        if mapper_lease_fd >= 0:
+            os.close(mapper_lease_fd)
         signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
     return mapper
 
@@ -2344,7 +2625,7 @@ def _capture_lifecycle_mapper(
 def _register_pending_mapper(lifecycle: VaultLifecycle, name: str) -> None:
     if (
         lifecycle.mapper is not None
-        or lifecycle.mapper_fd >= 0
+        or lifecycle.mapper_lease_fd >= 0
         or lifecycle.pending_mapper_name is not None
     ):
         raise WriteError("vault lifecycle already owns a mapper transition")
@@ -2363,14 +2644,14 @@ def _clear_pending_mapper(lifecycle: VaultLifecycle) -> None:
         signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
 
-def _release_lifecycle_mapper_fd(lifecycle: VaultLifecycle) -> None:
-    if lifecycle.mapper_fd < 0:
+def _release_lifecycle_mapper_lease(lifecycle: VaultLifecycle) -> None:
+    if lifecycle.mapper_lease_fd < 0:
         return
     previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, v1.MANAGED_SIGNALS)
     try:
-        mapper_fd = lifecycle.mapper_fd
-        lifecycle.mapper_fd = -1
-        os.close(mapper_fd)
+        mapper_lease_fd = lifecycle.mapper_lease_fd
+        lifecycle.mapper_lease_fd = -1
+        os.close(mapper_lease_fd)
     finally:
         signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
@@ -2412,7 +2693,7 @@ def _acquire_existing_mapper_for_cleanup(
             )
             return True
         except BaseException as error:
-            if lifecycle.mapper is not None and lifecycle.mapper_fd >= 0:
+            if lifecycle.mapper is not None and lifecycle.mapper_lease_fd >= 0:
                 return True
             last_error = error
             time.sleep(0.05)
@@ -2489,8 +2770,15 @@ def verify_ext4_superblock(
         raise WriteError("ext4 binary superblock profile is not exact")
 
 
-def verify_filesystem(mapper_fd: int, expected_uuid: str) -> None:
-    fields = probe_blkid(mapper_fd, "blkid ext4 metadata probe")
+def verify_filesystem(
+    mapper_lease_fd: int,
+    mapper: MapperIdentity,
+    partition: PartitionIdentity,
+    luks_uuid: str,
+    expected_uuid: str,
+) -> None:
+    verify_mapper_lease(mapper_lease_fd, mapper, partition, luks_uuid)
+    fields = probe_blkid(mapper_lease_fd, "blkid ext4 metadata probe")
     if (
         fields.get("TYPE") != "ext4"
         or fields.get("LABEL") != VAULT_LABEL
@@ -2501,7 +2789,20 @@ def verify_filesystem(mapper_fd: int, expected_uuid: str) -> None:
         "FSBLOCKSIZE"
     ) not in (None, str(EXT4_BLOCK_BYTES)):
         raise WriteError("ext4 blkid block-size profile is not exact")
-    verify_ext4_superblock(mapper_fd, expected_uuid)
+    mapper_data_fd = _open_data_fd_from_block_lease(
+        mapper_lease_fd,
+        mapper.node_path,
+        mapper.major_minor,
+        "vault mapper",
+        writable=False,
+    )
+    try:
+        verify_ext4_superblock(
+            mapper_data_fd, expected_uuid, capacity_bytes=mapper.size
+        )
+    finally:
+        os.close(mapper_data_fd)
+    verify_mapper_lease(mapper_lease_fd, mapper, partition, luks_uuid)
 
 
 def parse_mountinfo_for_path(path: str) -> list[tuple[str, str, frozenset[str], frozenset[str]]]:
@@ -2764,7 +3065,7 @@ def verify_vault_layout(mountpoint: str, mapper: MapperIdentity, evidence: Vault
 
 
 def _mount_mapper(
-    mapper_fd: int,
+    mapper_lease_fd: int,
     mapper: MapperIdentity,
     lifecycle: VaultLifecycle,
     *,
@@ -2811,12 +3112,12 @@ def _mount_mapper(
                 "ext4",
                 "--options",
                 options,
-                f"/proc/self/fd/{mapper_fd}",
+                f"/proc/self/fd/{mapper_lease_fd}",
                 mountpoint,
             ],
             label="hardened ext4 vault mount",
             timeout=30,
-            pass_fds=(mapper_fd,),
+            pass_fds=(mapper_lease_fd,),
         )
         verify_mount(mountpoint, mapper, read_only=read_only)
         return mountpoint
@@ -2915,7 +3216,7 @@ def _close_mapper(
 ) -> None:
     mapper = lifecycle.mapper
     if mapper is None:
-        _release_lifecycle_mapper_fd(lifecycle)
+        _release_lifecycle_mapper_lease(lifecycle)
         pending_name = lifecycle.pending_mapper_name
         if pending_name is None:
             return
@@ -2936,7 +3237,7 @@ def _close_mapper(
             raise WriteError("vault mapper recovery did not acquire ownership")
     if lifecycle.mountpoint is not None:
         raise WriteError("refusing to close a mapper while its vault is mounted")
-    _release_lifecycle_mapper_fd(lifecycle)
+    _release_lifecycle_mapper_lease(lifecycle)
     alias_exists = os.path.lexists(mapper.alias_path)
     sysfs_matches = _sysfs_mapper_by_name(mapper.name)
     if not alias_exists and not sysfs_matches:
@@ -3026,7 +3327,7 @@ def _cleanup_lifecycle_with_signals_deferred(
 
 
 def _open_mapper(
-    partition_fd: int,
+    partition_lease_fd: int,
     partition: PartitionIdentity,
     luks_uuid: str,
     passphrase: bytearray,
@@ -3041,13 +3342,13 @@ def _open_mapper(
             cryptsetup,
             key_path,
             key_size,
-            f"/proc/self/fd/{partition_fd}",
+            f"/proc/self/fd/{partition_lease_fd}",
             name,
         ),
         passphrase,
         label="cryptsetup LUKS2 open",
         timeout=FORMAT_TIMEOUT_SECONDS,
-        pass_fds=(partition_fd,),
+        pass_fds=(partition_lease_fd,),
     )
     udevadm = _fixed_binary(UDEVADM_PATHS, "udevadm")
     run_command(
@@ -3062,11 +3363,11 @@ def _open_mapper(
         luks_uuid,
         require_alias=True,
     )
-    return lifecycle.mapper_fd, mapper
+    return lifecycle.mapper_lease_fd, mapper
 
 
 def _verify_wrong_key_rejected(
-    partition_fd: int,
+    partition_lease_fd: int,
     partition: PartitionIdentity,
     luks_uuid: str,
 ) -> None:
@@ -3084,14 +3385,14 @@ def _verify_wrong_key_rejected(
                     cryptsetup,
                     key_path,
                     key_size,
-                    f"/proc/self/fd/{partition_fd}",
+                    f"/proc/self/fd/{partition_lease_fd}",
                     name,
                 ),
                 wrong,
                 label="cryptsetup wrong-key rejection probe",
                 timeout=FORMAT_TIMEOUT_SECONDS,
                 allowed_returncodes=(0, 2),
-                pass_fds=(partition_fd,),
+                pass_fds=(partition_lease_fd,),
             )
         except BaseException as error:
             original_error = error
@@ -3118,15 +3419,21 @@ def _verify_wrong_key_rejected(
 
 
 def provision_vault(
-    target_fd: int,
+    target_lease_fd: int,
     candidate,
-    partition_fd: int,
+    partition_lease_fd: int,
     partition: PartitionIdentity,
     layout,
     passphrase: bytearray,
 ) -> VaultEvidence:
-    verify_partition_fd(partition_fd, partition, target_fd, candidate, layout)
-    reject_partition_signature(partition_fd)
+    _verify_partition_leases(
+        target_lease_fd,
+        partition_lease_fd,
+        partition,
+        candidate,
+        layout,
+    )
+    reject_partition_signature(partition_lease_fd)
     cryptsetup = _fixed_binary(CRYPTSETUP_PATHS, "cryptsetup")
     luks_uuid = str(uuid.uuid4())
     filesystem_uuid = str(uuid.uuid4())
@@ -3138,49 +3445,97 @@ def provision_vault(
             cryptsetup,
             key_path,
             key_size,
-            f"/proc/self/fd/{partition_fd}",
+            f"/proc/self/fd/{partition_lease_fd}",
             luks_uuid,
         ),
         passphrase,
         label="cryptsetup LUKS2 format",
         timeout=FORMAT_TIMEOUT_SECONDS,
-        pass_fds=(partition_fd,),
+        pass_fds=(partition_lease_fd,),
     )
-    os.fsync(partition_fd)
-    verify_partition_fd(partition_fd, partition, target_fd, candidate, layout)
-    verify_luks_metadata(partition_fd, luks_uuid)
-    _verify_wrong_key_rejected(partition_fd, partition, luks_uuid)
+    partition_data_fd = _open_data_fd_from_block_lease(
+        partition_lease_fd,
+        partition.path,
+        partition.major_minor,
+        "vault partition",
+        writable=True,
+    )
+    try:
+        os.fsync(partition_data_fd)
+    finally:
+        os.close(partition_data_fd)
+    _verify_partition_leases(
+        target_lease_fd,
+        partition_lease_fd,
+        partition,
+        candidate,
+        layout,
+    )
+    verify_luks_metadata(partition_lease_fd, luks_uuid)
+    _verify_partition_leases(
+        target_lease_fd,
+        partition_lease_fd,
+        partition,
+        candidate,
+        layout,
+    )
+    _verify_wrong_key_rejected(partition_lease_fd, partition, luks_uuid)
 
     lifecycle = VaultLifecycle()
-    mapper_fd = -1
+    mapper_lease_fd = -1
     evidence: VaultEvidence | None = None
     original_error: BaseException | None = None
     try:
         name = _random_mapper_name()
-        mapper_fd, mapper = _open_mapper(
-            partition_fd, partition, luks_uuid, passphrase, name, lifecycle
+        _verify_partition_leases(
+            target_lease_fd,
+            partition_lease_fd,
+            partition,
+            candidate,
+            layout,
         )
-        verify_mapper_fd(mapper_fd, mapper, partition, luks_uuid)
+        mapper_lease_fd, mapper = _open_mapper(
+            partition_lease_fd, partition, luks_uuid, passphrase, name, lifecycle
+        )
+        verify_mapper_lease(mapper_lease_fd, mapper, partition, luks_uuid)
         mkfs = _fixed_binary(MKFS_EXT4_PATHS, "mkfs.ext4")
         run_command(
             _mkfs_ext4_command(
-                mkfs, f"/proc/self/fd/{mapper_fd}", filesystem_uuid
+                mkfs, f"/proc/self/fd/{mapper_lease_fd}", filesystem_uuid
             ),
             label="mkfs.ext4 vault format",
             timeout=FORMAT_TIMEOUT_SECONDS,
-            pass_fds=(mapper_fd,),
+            pass_fds=(mapper_lease_fd,),
         )
+        verify_mapper_lease(mapper_lease_fd, mapper, partition, luks_uuid)
         tune2fs = _fixed_binary(TUNE2FS_PATHS, "tune2fs")
         run_command(
-            _tune2fs_command(tune2fs, f"/proc/self/fd/{mapper_fd}"),
+            _tune2fs_command(tune2fs, f"/proc/self/fd/{mapper_lease_fd}"),
             label="tune2fs pinned vault profile",
             timeout=FORMAT_TIMEOUT_SECONDS,
-            pass_fds=(mapper_fd,),
+            pass_fds=(mapper_lease_fd,),
         )
-        os.fsync(mapper_fd)
-        verify_mapper_fd(mapper_fd, mapper, partition, luks_uuid)
-        verify_filesystem(mapper_fd, filesystem_uuid)
-        mountpoint = _mount_mapper(mapper_fd, mapper, lifecycle, read_only=False)
+        mapper_data_fd = _open_data_fd_from_block_lease(
+            mapper_lease_fd,
+            mapper.node_path,
+            mapper.major_minor,
+            "vault mapper",
+            writable=True,
+        )
+        try:
+            os.fsync(mapper_data_fd)
+        finally:
+            os.close(mapper_data_fd)
+        verify_filesystem(
+            mapper_lease_fd,
+            mapper,
+            partition,
+            luks_uuid,
+            filesystem_uuid,
+        )
+        mountpoint = _mount_mapper(
+            mapper_lease_fd, mapper, lifecycle, read_only=False
+        )
         created = create_vault_layout(mountpoint, mapper)
         evidence = VaultEvidence(
             luks_uuid,
@@ -3190,24 +3545,45 @@ def provision_vault(
         )
         _unmount(lifecycle)
         _close_mapper(lifecycle, partition, luks_uuid)
-        mapper_fd = -1
+        mapper_lease_fd = -1
 
-        verify_partition_fd(partition_fd, partition, target_fd, candidate, layout)
-        verify_luks_metadata(partition_fd, luks_uuid)
-        mapper_fd, mapper = _open_mapper(
-            partition_fd,
+        _verify_partition_leases(
+            target_lease_fd,
+            partition_lease_fd,
+            partition,
+            candidate,
+            layout,
+        )
+        verify_luks_metadata(partition_lease_fd, luks_uuid)
+        _verify_partition_leases(
+            target_lease_fd,
+            partition_lease_fd,
+            partition,
+            candidate,
+            layout,
+        )
+        mapper_lease_fd, mapper = _open_mapper(
+            partition_lease_fd,
             partition,
             luks_uuid,
             passphrase,
             _random_mapper_name(),
             lifecycle,
         )
-        verify_filesystem(mapper_fd, filesystem_uuid)
-        mountpoint = _mount_mapper(mapper_fd, mapper, lifecycle, read_only=True)
+        verify_filesystem(
+            mapper_lease_fd,
+            mapper,
+            partition,
+            luks_uuid,
+            filesystem_uuid,
+        )
+        mountpoint = _mount_mapper(
+            mapper_lease_fd, mapper, lifecycle, read_only=True
+        )
         verify_vault_layout(mountpoint, mapper, evidence)
         _unmount(lifecycle)
         _close_mapper(lifecycle, partition, luks_uuid)
-        mapper_fd = -1
+        mapper_lease_fd = -1
     except BaseException as error:
         original_error = error
     finally:
@@ -3226,9 +3602,25 @@ def provision_vault(
         raise original_error
     if evidence is None:
         raise WriteError("vault provisioning produced no verified evidence")
-    verify_partition_fd(partition_fd, partition, target_fd, candidate, layout)
-    verify_luks_metadata(partition_fd, luks_uuid)
-    os.fsync(target_fd)
+    _verify_partition_leases(
+        target_lease_fd,
+        partition_lease_fd,
+        partition,
+        candidate,
+        layout,
+    )
+    verify_luks_metadata(partition_lease_fd, luks_uuid)
+    target_data_fd = _open_data_fd_from_block_lease(
+        target_lease_fd,
+        candidate.path,
+        candidate.major_minor,
+        "whole-device",
+        writable=True,
+    )
+    try:
+        os.fsync(target_data_fd)
+    finally:
+        os.close(target_data_fd)
     return evidence
 
 
@@ -3486,6 +3878,8 @@ def execute(args: argparse.Namespace, state: OperationState) -> Mapping[str, obj
     operator_fresh_media_attestation: bool | None = None
     target_fd = -1
     partition_fd = -1
+    target_lease_fd = -1
+    partition_lease_fd = -1
     try:
         verify_finalized_image_layout(source_fd, image, layout)
         try:
@@ -3560,18 +3954,49 @@ def execute(args: argparse.Namespace, state: OperationState) -> Mapping[str, obj
         partition_fd, partition = discover_partition(
             target_fd, final_candidate, layout, ci_mode=ci_mode
         )
-        evidence = provision_vault(
-            target_fd,
+        # The raw writer's O_EXCL whole-device claim and the partition data FD
+        # must not remain open while cryptsetup/mkfs acquire their own kernel
+        # claims.  Transfer ownership atomically to non-claiming O_PATH leases;
+        # the helper consumes both input descriptors on every outcome.
+        exclusive_target_fd = target_fd
+        discovered_partition_fd = partition_fd
+        target_fd = -1
+        partition_fd = -1
+        target_lease_fd, partition_lease_fd = handoff_partition_to_identity_leases(
+            exclusive_target_fd,
+            discovered_partition_fd,
+            partition,
             final_candidate,
-            partition_fd,
+            layout,
+        )
+        _checkpoint_candidate(
+            args.device,
+            final_candidate,
+            image,
+            ci_mode=ci_mode,
+            usb_proof=usb_proof,
+            loop_backing=loop_backing,
+            ci_token=args.ci_disposable_loop_token,
+        )
+        _verify_partition_leases(
+            target_lease_fd,
+            partition_lease_fd,
+            partition,
+            final_candidate,
+            layout,
+        )
+        evidence = provision_vault(
+            target_lease_fd,
+            final_candidate,
+            partition_lease_fd,
             partition,
             layout,
             passphrase,
         )
-        os.close(partition_fd)
-        partition_fd = -1
-        os.close(target_fd)
-        target_fd = -1
+        completed_leases = (partition_lease_fd, target_lease_fd)
+        partition_lease_fd = -1
+        target_lease_fd = -1
+        _close_owned_descriptors(completed_leases, "completed block lease")
         _checkpoint_candidate(
             args.device,
             final_candidate,
@@ -3596,11 +4021,19 @@ def execute(args: argparse.Namespace, state: OperationState) -> Mapping[str, obj
         )
     finally:
         _wipe_bytearray(passphrase)
-        if partition_fd >= 0:
-            os.close(partition_fd)
-        if target_fd >= 0:
-            os.close(target_fd)
-        os.close(source_fd)
+        remaining_descriptors = (
+            partition_fd,
+            target_fd,
+            partition_lease_fd,
+            target_lease_fd,
+            source_fd,
+        )
+        partition_fd = -1
+        target_fd = -1
+        partition_lease_fd = -1
+        target_lease_fd = -1
+        source_fd = -1
+        _close_owned_descriptors(remaining_descriptors, "writer")
 
 
 def main(argv: Sequence[str] | None = None) -> int:

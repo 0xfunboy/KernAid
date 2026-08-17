@@ -12,7 +12,7 @@ import sys
 import tempfile
 import base64
 import unittest
-from contextlib import redirect_stderr
+from contextlib import contextmanager, redirect_stderr
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest import mock
@@ -793,6 +793,130 @@ class ProcessAndLifecycleTests(unittest.TestCase):
         fixed_binary.assert_not_called()
         runner.assert_not_called()
 
+    def test_exclusive_partition_handoff_closes_data_fds_and_returns_only_leases(self) -> None:
+        partition = SimpleNamespace(path="/dev/loop9p3", major_minor="7:12")
+        target = SimpleNamespace(path="/dev/loop9", major_minor="7:9")
+        layout = SimpleNamespace(logical_sector_bytes=512)
+        closed: list[int] = []
+        with (
+            mock.patch.object(writer, "verify_partition_fd"),
+            mock.patch.object(
+                writer,
+                "_open_block_identity_lease_from_data_fd",
+                side_effect=(72, 73),
+            ) as open_lease,
+            mock.patch.object(writer, "_verify_partition_leases") as verify_leases,
+            mock.patch.object(writer.os, "close", side_effect=closed.append),
+        ):
+            result = writer.handoff_partition_to_identity_leases(
+                70, 71, partition, target, layout
+            )
+        self.assertEqual(result, (72, 73))
+        self.assertEqual(closed, [71, 70])
+        self.assertEqual(
+            [call.args[:3] for call in open_lease.call_args_list],
+            [(70, "/dev/loop9", "7:9"), (71, "/dev/loop9p3", "7:12")],
+        )
+        verify_leases.assert_called_once_with(
+            72, 73, partition, target, layout
+        )
+
+    def test_handoff_interrupt_after_transition_closes_each_lease_exactly_once(self) -> None:
+        partition = SimpleNamespace(path="/dev/loop9p3", major_minor="7:12")
+        target = SimpleNamespace(path="/dev/loop9", major_minor="7:9")
+        closed: list[int] = []
+
+        @contextmanager
+        def interrupt_on_exit():
+            yield
+            raise writer.OperationInterrupted(signal.SIGTERM)
+
+        with (
+            mock.patch.object(writer, "defer_managed_signals", interrupt_on_exit),
+            mock.patch.object(writer, "verify_partition_fd"),
+            mock.patch.object(
+                writer,
+                "_open_block_identity_lease_from_data_fd",
+                side_effect=(72, 73),
+            ),
+            mock.patch.object(writer, "_verify_partition_leases"),
+            mock.patch.object(writer.os, "close", side_effect=closed.append),
+        ):
+            with self.assertRaises(writer.OperationInterrupted):
+                writer.handoff_partition_to_identity_leases(
+                    70, 71, partition, target, SimpleNamespace()
+                )
+        self.assertEqual(closed, [71, 70, 73, 72])
+        self.assertEqual(len(closed), len(set(closed)))
+
+    def test_block_lease_rejects_path_or_hotplug_identity_change(self) -> None:
+        held = SimpleNamespace(
+            st_mode=stat.S_IFBLK | 0o600,
+            st_rdev=os.makedev(7, 9),
+            st_dev=42,
+            st_ino=77,
+        )
+        replaced = SimpleNamespace(
+            st_mode=stat.S_IFBLK | 0o600,
+            st_rdev=os.makedev(7, 10),
+            st_dev=42,
+            st_ino=78,
+        )
+        with (
+            mock.patch.object(writer.os, "fstat", return_value=held),
+            mock.patch.object(writer.os, "stat", return_value=replaced),
+            mock.patch.object(writer.fcntl, "fcntl", return_value=writer.os.O_PATH),
+            mock.patch.object(
+                writer.os.path, "realpath", return_value="/dev/loop9"
+            ),
+        ):
+            with self.assertRaisesRegex(writer.SafetyError, "lease/path changed"):
+                writer._verify_block_identity_lease(
+                    72, "/dev/loop9", "7:9", "whole-device"
+                )
+
+        with (
+            mock.patch.object(writer.os, "fstat", return_value=held),
+            mock.patch.object(writer.os, "stat", return_value=held),
+            mock.patch.object(writer.fcntl, "fcntl", return_value=os.O_RDONLY),
+            mock.patch.object(
+                writer.os.path, "realpath", return_value="/dev/loop9"
+            ),
+        ):
+            with self.assertRaisesRegex(writer.SafetyError, "lease/path changed"):
+                writer._verify_block_identity_lease(
+                    72, "/dev/loop9", "7:9", "whole-device"
+                )
+
+    def test_mapper_capture_releases_data_fd_before_publishing_lease(self) -> None:
+        mapper = self.mapper_identity()
+        lifecycle = writer.VaultLifecycle(pending_mapper_name=mapper.name)
+        closed: list[int] = []
+        with (
+            mock.patch.object(writer, "capture_mapper", return_value=(73, mapper)),
+            mock.patch.object(
+                writer,
+                "_open_block_identity_lease_from_data_fd",
+                return_value=74,
+            ) as open_lease,
+            mock.patch.object(writer.os, "close", side_effect=closed.append),
+        ):
+            self.assertEqual(
+                writer._capture_lifecycle_mapper(
+                    lifecycle,
+                    mapper.name,
+                    SimpleNamespace(),
+                    "1" * 36,
+                    require_alias=True,
+                ),
+                mapper,
+            )
+        open_lease.assert_called_once_with(
+            73, mapper.node_path, mapper.major_minor, "vault mapper"
+        )
+        self.assertEqual(closed, [73])
+        self.assertEqual(lifecycle.mapper_lease_fd, 74)
+
     def test_partition_rescan_never_weakens_the_physical_path(self) -> None:
         target = SimpleNamespace(path="/dev/sdz", major_minor="8:240")
         with (
@@ -904,7 +1028,7 @@ class ProcessAndLifecycleTests(unittest.TestCase):
     def test_unmount_reconciles_already_unmounted_owned_directory(self) -> None:
         lifecycle = writer.VaultLifecycle(
             mapper=self.mapper_identity(),
-            mapper_fd=73,
+            mapper_lease_fd=73,
             mountpoint="/run/kernaid-make-device-v2.fixture",
             mount_major_minor="253:7",
             mountpoint_device=51,
@@ -940,7 +1064,7 @@ class ProcessAndLifecycleTests(unittest.TestCase):
     def test_unmount_postcondition_clears_state_when_runner_raises(self) -> None:
         lifecycle = writer.VaultLifecycle(
             mapper=self.mapper_identity(),
-            mapper_fd=73,
+            mapper_lease_fd=73,
             mountpoint="/run/kernaid-make-device-v2.fixture",
             mount_major_minor="253:7",
             mountpoint_device=51,
@@ -998,9 +1122,9 @@ class ProcessAndLifecycleTests(unittest.TestCase):
         rmdir.assert_called_once_with(mountpoint)
         self.assertIsNone(lifecycle.mountpoint)
 
-    def test_mapper_fd_lifecycle_closes_each_descriptor_exactly_once(self) -> None:
+    def test_mapper_lease_lifecycle_closes_each_descriptor_exactly_once(self) -> None:
         mapper = self.mapper_identity()
-        lifecycle = writer.VaultLifecycle(mapper=mapper, mapper_fd=73)
+        lifecycle = writer.VaultLifecycle(mapper=mapper, mapper_lease_fd=73)
         partition = SimpleNamespace()
         closed: set[int] = set()
 
@@ -1023,12 +1147,12 @@ class ProcessAndLifecycleTests(unittest.TestCase):
         ):
             writer._close_mapper(lifecycle, partition, "1" * 36)
         self.assertEqual(closed, {73, 74})
-        self.assertEqual(lifecycle.mapper_fd, -1)
+        self.assertEqual(lifecycle.mapper_lease_fd, -1)
         self.assertIsNone(lifecycle.mapper)
 
     def test_mapper_close_reconciles_mapping_already_absent(self) -> None:
         lifecycle = writer.VaultLifecycle(
-            mapper=self.mapper_identity(), mapper_fd=73
+            mapper=self.mapper_identity(), mapper_lease_fd=73
         )
         with (
             mock.patch.object(writer.os, "close") as close_fd,
@@ -1039,7 +1163,7 @@ class ProcessAndLifecycleTests(unittest.TestCase):
             writer._close_mapper(lifecycle, SimpleNamespace(), "1" * 36)
         close_fd.assert_called_once_with(73)
         command.assert_not_called()
-        self.assertEqual(lifecycle.mapper_fd, -1)
+        self.assertEqual(lifecycle.mapper_lease_fd, -1)
         self.assertIsNone(lifecycle.mapper)
 
     def test_pending_mapper_survives_first_signal_and_second_is_deferred(self) -> None:
@@ -1094,6 +1218,11 @@ class ProcessAndLifecycleTests(unittest.TestCase):
                 side_effect=(["dm-7"], ["dm-7"], ["dm-7"], []),
             ),
             mock.patch.object(writer, "capture_mapper", side_effect=capture_with_second_signal),
+            mock.patch.object(
+                writer,
+                "_open_block_identity_lease_from_data_fd",
+                return_value=75,
+            ),
             mock.patch.object(writer, "_fixed_binary", side_effect=lambda _paths, name: f"/usr/bin/{name}"),
             mock.patch.object(writer, "run_command", side_effect=cleanup_command),
             mock.patch.object(writer.os, "close"),
@@ -1107,13 +1236,13 @@ class ProcessAndLifecycleTests(unittest.TestCase):
         self.assertIn("cryptsetup mapper close", commands)
         self.assertIsNone(lifecycle.mapper)
         self.assertIsNone(lifecycle.pending_mapper_name)
-        self.assertEqual(lifecycle.mapper_fd, -1)
+        self.assertEqual(lifecycle.mapper_lease_fd, -1)
 
     def test_deferred_cleanup_runs_mutators_with_managed_signals_unblocked(self) -> None:
         mapper = self.mapper_identity()
         lifecycle = writer.VaultLifecycle(
             mapper=mapper,
-            mapper_fd=73,
+            mapper_lease_fd=73,
             mountpoint="/run/kernaid-make-device-v2.fixture",
             mount_major_minor="253:7",
             mountpoint_device=51,
@@ -1156,7 +1285,7 @@ class ProcessAndLifecycleTests(unittest.TestCase):
             self.assertIsNotNone(call.args[2])
         self.assertIsNone(lifecycle.mountpoint)
         self.assertIsNone(lifecycle.mapper)
-        self.assertEqual(lifecycle.mapper_fd, -1)
+        self.assertEqual(lifecycle.mapper_lease_fd, -1)
 
     def test_wrong_key_claim_accepts_only_cryptsetup_status_two(self) -> None:
         partition = SimpleNamespace()
