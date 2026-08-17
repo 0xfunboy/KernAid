@@ -1,0 +1,35 @@
+{
+  "object": "response",
+  "status": "completed",
+  "error": null,
+  "incomplete_details": null,
+  "model": "gpt-5.6-sol",
+  "output": [
+    {
+      "id": "msg_linux_generic",
+      "type": "message",
+      "role": "assistant",
+      "status": "completed",
+      "content": [
+        {
+          "type": "output_text",
+          "annotations": [],
+          "logprobs": [],
+          "text": "{\"requestId\":\"O-33333333-3333-3333-3333-333333333333\",\"operation\":\"provider.openai.diagnose\",\"proposal\":{\"schemaVersion\":\"1.0\",\"diagnosis\":\"Installazione Linux confermata dal corpus statico read-only. Nei marker consentiti non emerge un'anomalia deterministica; servono controlli mirati prima di proporre modifiche.\",\"confidence\":0.58,\"evidenceIds\":[\"E-RESCUE-CORPUS\"],\"requestedEvidence\":[\"rescue.linux.targeted-health.read-only.v1\"]}}"
+        }
+      ]
+    }
+  ],
+  "usage": {
+    "input_tokens": 512,
+    "input_tokens_details": {
+      "cached_tokens": 0,
+      "cache_write_tokens": 0
+    },
+    "output_tokens": 128,
+    "output_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "total_tokens": 640
+  }
+}

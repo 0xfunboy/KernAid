@@ -1,0 +1,52 @@
+{
+  "schemaVersion": 1,
+  "cases": [
+    {
+      "name": "status",
+      "request": "valid/status.request.raw",
+      "outcome": "unsupported"
+    },
+    {
+      "name": "linux-malformed-fstab",
+      "request": "valid/linux-malformed-fstab.request.raw",
+      "outcome": "response",
+      "response": "linux-malformed-fstab.response.json"
+    },
+    {
+      "name": "linux-missing-kernel",
+      "request": "valid/linux-missing-kernel.request.raw",
+      "outcome": "response",
+      "response": "linux-missing-kernel.response.json"
+    },
+    {
+      "name": "linux-generic-canary",
+      "request": "valid/linux-generic-canary.request.raw",
+      "outcome": "response",
+      "response": "linux-generic-canary.response.json"
+    },
+    {
+      "name": "linux-unconfirmed",
+      "request": "valid/linux-unconfirmed.request.raw",
+      "outcome": "response",
+      "response": "linux-unconfirmed.response.json"
+    },
+    {
+      "name": "windows-pending",
+      "request": "valid/windows-pending.request.raw",
+      "outcome": "response",
+      "response": "windows-pending.response.json"
+    },
+    {
+      "name": "windows-missing-boot",
+      "request": "valid/windows-missing-boot.request.raw",
+      "outcome": "response",
+      "response": "windows-missing-boot.response.json"
+    },
+    {
+      "name": "windows-generic",
+      "request": "valid/windows-generic.request.raw",
+      "outcome": "response",
+      "response": "windows-generic.response.json"
+    }
+  ]
+}

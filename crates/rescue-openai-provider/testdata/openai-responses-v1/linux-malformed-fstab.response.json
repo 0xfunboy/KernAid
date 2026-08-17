@@ -1,0 +1,77 @@
+{
+  "id": "resp_linux_malformed_fstab",
+  "object": "response",
+  "created_at": 1786900000,
+  "status": "completed",
+  "completed_at": 1786900001,
+  "background": false,
+  "conversation": null,
+  "error": null,
+  "incomplete_details": null,
+  "input": [],
+  "instructions": "fixed-offline-fixture",
+  "max_output_tokens": 2048,
+  "max_tool_calls": null,
+  "metadata": {},
+  "model": "gpt-5.6-sol",
+  "moderation": null,
+  "output": [
+    {
+      "id": "msg_linux_malformed_fstab",
+      "type": "message",
+      "role": "assistant",
+      "status": "completed",
+      "phase": "final_answer",
+      "content": [
+        {
+          "type": "output_text",
+          "annotations": [],
+          "logprobs": [],
+          "text": "{\"requestId\":\"O-11111111-1111-1111-1111-111111111111\",\"operation\":\"provider.openai.diagnose\",\"proposal\":{\"schemaVersion\":\"1.0\",\"diagnosis\":\"Il corpus Linux conferma l'installazione e segnala una o più righe fstab malformate. Verificare la configurazione di mount senza eseguire modifiche automatiche.\",\"confidence\":0.84,\"evidenceIds\":[\"E-RESCUE-CORPUS\"],\"requestedEvidence\":[\"rescue.linux.fstab.review.read-only.v1\"]}}"
+        }
+      ]
+    }
+  ],
+  "output_text": null,
+  "parallel_tool_calls": false,
+  "previous_response_id": null,
+  "prompt": null,
+  "prompt_cache_key": null,
+  "prompt_cache_options": null,
+  "prompt_cache_retention": null,
+  "reasoning": {
+    "effort": "none",
+    "context": "current_turn",
+    "generate_summary": "auto",
+    "mode": "standard"
+  },
+  "safety_identifier": null,
+  "service_tier": "default",
+  "store": false,
+  "temperature": 1,
+  "text": {
+    "format": {
+      "type": "json_schema",
+      "name": "kernaid_rescue_diagnosis_v1",
+      "strict": true
+    }
+  },
+  "tool_choice": "none",
+  "tools": [],
+  "top_logprobs": 0,
+  "top_p": 1,
+  "truncation": "disabled",
+  "usage": {
+    "input_tokens": 512,
+    "input_tokens_details": {
+      "cached_tokens": 0,
+      "cache_write_tokens": 0
+    },
+    "output_tokens": 128,
+    "output_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "total_tokens": 640
+  },
+  "user": null
+}
