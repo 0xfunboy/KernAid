@@ -3,10 +3,112 @@ set -euo pipefail
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 firmware="${1:-bios}"
 iso="${2:-$repo_dir/KernAid-Rescue-amd64.iso}"
-for command in cp debugfs findmnt fusermount3 mkfs.ext4 mkfs.ntfs ntfs-3g \
-  ntfsfix python3 qemu-system-x86_64 sha256sum sync tee truncate; do
+for command in cp debugfs mkfs.ext4 mkfs.ntfs ntfsfix python3 \
+  qemu-system-x86_64 sha256sum sync tee truncate; do
   command -v "$command" >/dev/null || { echo "Missing required command: $command" >&2; exit 2; }
 done
+if [[ "$EUID" -eq 0 ]]; then
+  echo "qemu-smoke.sh must run as an unprivileged user; only disposable NTFS fixture setup uses sudo" >&2
+  exit 2
+fi
+ntfs_3g_command="/usr/bin/ntfs-3g"
+sudo_command="/usr/bin/sudo"
+umount_command="/usr/bin/umount"
+findmnt_command="/usr/bin/findmnt"
+stat_command="/usr/bin/stat"
+readlink_command="/usr/bin/readlink"
+mktemp_command="/usr/bin/mktemp"
+
+trusted_root_directory_chain() {
+  local directory="$1"
+  local file_type owner_uid owner_gid permissions
+  while true; do
+    if [[ ! -d "$directory" || -L "$directory" ]]; then
+      echo "Privileged fixture tool has an unsafe parent directory: $directory" >&2
+      return 1
+    fi
+    IFS=: read -r file_type owner_uid owner_gid permissions \
+      <<<"$(LC_ALL=C "$stat_command" -c '%F:%u:%g:%a' -- "$directory")"
+    if [[ "$file_type" != "directory" || "$owner_uid" != "0" \
+      || "$owner_gid" != "0" || -z "$permissions" \
+      || $((8#$permissions & 0022)) -ne 0 ]]; then
+      echo "Privileged fixture tool has an untrusted parent directory: $directory" >&2
+      return 1
+    fi
+    [[ "$directory" == "/" ]] && return 0
+    directory="${directory%/*}"
+    [[ -n "$directory" ]] || directory="/"
+  done
+}
+
+trusted_privileged_tool() {
+  local path="$1"
+  local current="$path"
+  local parent link_target
+  local hop=0
+  local file_type owner_uid owner_gid permissions
+  while [[ -L "$current" ]]; do
+    hop=$((hop + 1))
+    if [[ "$hop" -gt 8 ]]; then
+      echo "Privileged fixture tool symlink chain is too deep: $path" >&2
+      return 1
+    fi
+    parent="${current%/*}"
+    [[ -n "$parent" ]] || parent="/"
+    trusted_root_directory_chain "$parent" || return 1
+    IFS=: read -r file_type owner_uid owner_gid \
+      <<<"$(LC_ALL=C "$stat_command" -c '%F:%u:%g' -- "$current")"
+    if [[ "$file_type" != "symbolic link" || "$owner_uid" != "0" \
+      || "$owner_gid" != "0" ]]; then
+      echo "Privileged fixture tool has an untrusted symlink: $current" >&2
+      return 1
+    fi
+    link_target="$("$readlink_command" -- "$current")"
+    if [[ "$link_target" == /* ]]; then
+      current="$link_target"
+    else
+      case "/$link_target/" in
+        *"/../"*|*"/./"*)
+          echo "Privileged fixture tool has a non-canonical relative symlink: $current" >&2
+          return 1
+          ;;
+      esac
+      current="$parent/$link_target"
+    fi
+  done
+  case "$current" in
+    /usr/bin/*|/usr/sbin/*|/usr/lib/*) ;;
+    *)
+      echo "Privileged fixture tool resolved outside the system allowlist: $path" >&2
+      return 1
+      ;;
+  esac
+  parent="${current%/*}"
+  trusted_root_directory_chain "$parent" || return 1
+  if [[ ! -f "$current" || ! -x "$current" ]]; then
+    echo "Privileged fixture tool is not a regular executable: $path" >&2
+    return 1
+  fi
+  IFS=: read -r file_type owner_uid owner_gid permissions \
+    <<<"$(LC_ALL=C "$stat_command" -c '%F:%u:%g:%a' -- "$current")"
+  if [[ "$file_type" != "regular file" || "$owner_uid" != "0" \
+    || "$owner_gid" != "0" || -z "$permissions" \
+    || $((8#$permissions & 0022)) -ne 0 ]]; then
+    echo "Privileged fixture tool failed root ownership and mode validation: $path" >&2
+    return 1
+  fi
+}
+
+for inspection_tool in "$findmnt_command" "$stat_command" "$readlink_command" /usr/bin/id; do
+  [[ -x "$inspection_tool" ]] \
+    || { echo "Missing fixed system tool: $inspection_tool" >&2; exit 2; }
+done
+for privileged_tool in "$ntfs_3g_command" "$sudo_command" "$umount_command"; do
+  trusted_privileged_tool "$privileged_tool" || exit 2
+done
+mktemp_resolved="$($readlink_command -f -- "$mktemp_command")"
+[[ -n "$mktemp_resolved" ]] || { echo "Missing fixed system tool: $mktemp_command" >&2; exit 2; }
+trusted_privileged_tool "$mktemp_resolved" || exit 2
 if [[ "$firmware" != "bios" && "$firmware" != "uefi" ]]; then
   echo "Usage: $0 [bios|uefi] [iso]" >&2
   exit 2
@@ -16,29 +118,112 @@ python3 -I "$repo_dir/tools/build-rescue/finalize-device-layout.py" verify \
   --manifest "$repo_dir/rescue/image-layout/device-layout.v1.json" \
   --image "$iso"
 iso_hash_before="$(sha256sum "$iso" | awk '{print $1}')"
-log="${KERNAID_SMOKE_LOG:-$(mktemp)}"
+log="${KERNAID_SMOKE_LOG:-$($mktemp_command)}"
 temporary_log=0
 if [[ -z "${KERNAID_SMOKE_LOG:-}" ]]; then temporary_log=1; fi
-target_image="$(mktemp)"
-windows_target_image="$(mktemp)"
-altered_windows_target_image="$(mktemp)"
-target_seed_dir="$(mktemp -d)"
-windows_seed_mount="$(mktemp -d)"
+target_image="$($mktemp_command)"
+windows_target_image="$($mktemp_command)"
+altered_windows_target_image="$($mktemp_command)"
+target_seed_dir="$($mktemp_command -d)"
+windows_seed_mount="$($mktemp_command -d)"
 qemu_pid=""
 windows_fixture_mounted=0
+windows_fixture_cleanup_safe=1
+fixture_uid="$(/usr/bin/id -u)"
+fixture_gid="$(/usr/bin/id -g)"
+
+verify_disposable_windows_fixture_mount() {
+  local require_policy="${1:-yes}"
+  local mount_record mounted_source mounted_target mounted_fstype mounted_options
+  if [[ -z "${windows_fixture_identity:-}" \
+    || -z "${windows_mountpoint_identity:-}" \
+    || -L "$windows_target_image" || ! -f "$windows_target_image" \
+    || "$($stat_command -c '%d:%i:%s:%u:%g:%a:%h' -- "$windows_target_image")" \
+      != "$windows_fixture_identity" \
+    || -L "$windows_seed_mount" || ! -d "$windows_seed_mount" ]]; then
+    echo "Disposable Windows fixture path identity is no longer exact" >&2
+    return 1
+  fi
+  mount_record="$($findmnt_command -rn -o SOURCE,TARGET,FSTYPE,OPTIONS \
+    --mountpoint "$windows_seed_mount")" || return 1
+  IFS=' ' read -r mounted_source mounted_target mounted_fstype mounted_options \
+    <<<"$mount_record"
+  if [[ "$mounted_source" != "$windows_target_image" \
+    || "$mounted_target" != "$windows_seed_mount" \
+    || ( "$mounted_fstype" != "fuse" && "$mounted_fstype" != "fuseblk" ) ]]; then
+    echo "Disposable Windows fixture mount provenance was not exact" >&2
+    return 1
+  fi
+  if [[ "$require_policy" == "yes" ]]; then
+    mounted_options=",$mounted_options,"
+    for required_option in rw nodev nosuid noexec; do
+      if [[ "$mounted_options" != *",$required_option,"* ]]; then
+        echo "Disposable Windows fixture mount lost option: $required_option" >&2
+        return 1
+      fi
+    done
+  fi
+}
+
+verify_disposable_windows_fixture_unmounted() {
+  if [[ -L "$windows_target_image" || ! -f "$windows_target_image" \
+    || "$($stat_command -c '%d:%i:%s:%u:%g:%a:%h' -- "$windows_target_image")" \
+      != "$windows_fixture_identity" \
+    || -L "$windows_seed_mount" || ! -d "$windows_seed_mount" \
+    || "$($stat_command -c '%d:%i:%u:%g:%a' -- "$windows_seed_mount")" \
+      != "$windows_mountpoint_identity" ]]; then
+    echo "Disposable Windows fixture identity changed across the privileged mount" >&2
+    windows_fixture_cleanup_safe=0
+    return 1
+  fi
+}
+
+unmount_disposable_windows_fixture() {
+  local require_policy="${1:-yes}"
+  if ! "$findmnt_command" -rn --mountpoint "$windows_seed_mount" >/dev/null; then
+    windows_fixture_mounted=0
+    return 0
+  fi
+  verify_disposable_windows_fixture_mount "$require_policy" || return 1
+  "$sudo_command" -n -- "$umount_command" -- "$windows_seed_mount" || return 1
+  if "$findmnt_command" -rn --mountpoint "$windows_seed_mount" >/dev/null; then
+    echo "Disposable Windows fixture remained mounted" >&2
+    return 1
+  fi
+  windows_fixture_mounted=0
+  verify_disposable_windows_fixture_unmounted
+}
+
 # shellcheck disable=SC2329  # Invoked indirectly by the EXIT trap below.
 # This callback is reached indirectly through the EXIT trap below.
 # shellcheck disable=SC2317
 cleanup() {
+  local status="$1"
+  local cleanup_failed=0
+  trap - EXIT
   if [[ -n "$qemu_pid" ]]; then kill "$qemu_pid" 2>/dev/null || true; fi
-  if [[ "$windows_fixture_mounted" == "1" ]]; then
-    fusermount3 -u "$windows_seed_mount" 2>/dev/null || true
+  if [[ "$windows_fixture_mounted" == "1" ]] \
+    || "$findmnt_command" -rn --mountpoint "$windows_seed_mount" >/dev/null; then
+    if ! unmount_disposable_windows_fixture no; then
+      echo "Failed to unmount the disposable Windows fixture during cleanup" >&2
+      cleanup_failed=1
+    fi
   fi
   if [[ "$temporary_log" == "1" ]]; then rm -f "$log"; fi
-  rm -f "$target_image" "$windows_target_image" "$altered_windows_target_image"
-  rm -rf "$target_seed_dir" "$windows_seed_mount"
+  rm -f "$target_image"
+  rm -rf "$target_seed_dir"
+  if [[ "$windows_fixture_cleanup_safe" == "1" ]] \
+    && ! "$findmnt_command" -rn --mountpoint "$windows_seed_mount" >/dev/null; then
+    rm -f "$windows_target_image" "$altered_windows_target_image"
+    rm -rf "$windows_seed_mount"
+  else
+    echo "Preserving the still-mounted disposable Windows fixture for runner cleanup" >&2
+    cleanup_failed=1
+  fi
+  if [[ "$cleanup_failed" == "1" ]]; then exit 1; fi
+  exit "$status"
 }
-trap cleanup EXIT
+trap 'cleanup $?' EXIT
 mkdir -p "$target_seed_dir/etc" "$target_seed_dir/usr/lib" \
   "$target_seed_dir/boot/grub" "$target_seed_dir/var/lib/dpkg"
 cat >"$target_seed_dir/etc/os-release" <<'EOF'
@@ -63,9 +248,30 @@ debugfs -w -R 'feature needs_recovery' "$target_image" >/dev/null 2>&1
 target_hash_before="$(sha256sum "$target_image" | awk '{print $1}')"
 truncate -s 128M "$windows_target_image"
 mkfs.ntfs -q -F -L KERNAID_WINDOWS_TARGET "$windows_target_image"
-ntfs-3g "$windows_target_image" "$windows_seed_mount" \
-  -o rw,nodev,nosuid,noexec
+windows_fixture_identity="$("$stat_command" -c '%d:%i:%s:%u:%g:%a:%h' -- "$windows_target_image")"
+windows_mountpoint_identity="$("$stat_command" -c '%d:%i:%u:%g:%a' -- "$windows_seed_mount")"
+if [[ -L "$windows_target_image" || ! -f "$windows_target_image" \
+  || "$windows_fixture_identity" != *":$fixture_uid:$fixture_gid:600:1" ]]; then
+  echo "Disposable Windows fixture image ownership or mode is unsafe" >&2
+  exit 1
+fi
+if [[ -L "$windows_seed_mount" || ! -d "$windows_seed_mount" \
+  || "$windows_mountpoint_identity" != *":$fixture_uid:$fixture_gid:700" ]]; then
+  echo "Disposable Windows fixture mountpoint ownership or mode is unsafe" >&2
+  exit 1
+fi
+if "$findmnt_command" -rn --mountpoint "$windows_seed_mount" >/dev/null; then
+  echo "Disposable Windows fixture mountpoint was already in use" >&2
+  exit 1
+fi
+# GitHub-hosted runners forbid an unprivileged ntfs-3g FUSE mount.  Limit
+# elevation to mounting this freshly-created mode-0600 disposable image and
+# its normal unmount.  QEMU itself is rejected above when the script is root.
+"$sudo_command" -n -- "$ntfs_3g_command" \
+  "$windows_target_image" "$windows_seed_mount" \
+  -o "rw,nodev,nosuid,noexec,allow_other,uid=$fixture_uid,gid=$fixture_gid,umask=0077"
 windows_fixture_mounted=1
+verify_disposable_windows_fixture_mount yes
 mkdir -p "$windows_seed_mount/Windows/System32/config" \
   "$windows_seed_mount/Windows/WinSxS" "$windows_seed_mount/Users" \
   "$windows_seed_mount/Boot"
@@ -81,13 +287,8 @@ printf '%s\n' KERNAID_WINDOWS_BOOT_MANAGER_FIXTURE > \
   "$windows_seed_mount/bootmgr"
 printf '%s\n' KERNAID_WINDOWS_BCD_FIXTURE > \
   "$windows_seed_mount/Boot/BCD"
-sync "$windows_seed_mount"
-fusermount3 -u "$windows_seed_mount"
-if findmnt -rn --mountpoint "$windows_seed_mount" >/dev/null; then
-  echo "Disposable Windows fixture remained mounted" >&2
-  exit 1
-fi
-windows_fixture_mounted=0
+sync -f "$windows_seed_mount"
+unmount_disposable_windows_fixture
 windows_target_hash_before="$(sha256sum "$windows_target_image" | awk '{print $1}')"
 cp --reflink=auto --sparse=always \
   "$windows_target_image" "$altered_windows_target_image"
