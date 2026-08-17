@@ -12,9 +12,13 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+#[cfg(target_os = "windows")]
 pub const POWERSHELL: &str = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+#[cfg(target_os = "windows")]
 pub const DISM: &str = r"C:\Windows\System32\dism.exe";
+#[cfg(target_os = "windows")]
 pub const REG: &str = r"C:\Windows\System32\reg.exe";
+#[cfg(target_os = "windows")]
 pub const BCDEDIT: &str = r"C:\Windows\System32\bcdedit.exe";
 pub const WINDOWS_ENVIRONMENT: [(&str, &str); 4] = [
     ("SystemRoot", r"C:\Windows"),
@@ -26,9 +30,11 @@ pub const WINDOWS_ENVIRONMENT: [(&str, &str); 4] = [
     ("POWERSHELL_TELEMETRY_OPTOUT", "1"),
 ];
 
+#[cfg(target_os = "windows")]
 pub const POWERSHELL_PREFIX_ARGS: [&str; 4] =
     ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"];
 pub const DISM_ARGS: [&str; 4] = ["/Online", "/Cleanup-Image", "/CheckHealth", "/English"];
+#[cfg(target_os = "windows")]
 pub const FIRMWARE_REG_ARGS: [&str; 4] = [
     "QUERY",
     r"HKLM\SYSTEM\CurrentControlSet\Control",

@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod secure_runtime;
+#[cfg(any(target_os = "windows", test))]
 mod windows_resident;
 
 use kernaid_broker::{BrokerError, ObserveBroker};
@@ -853,6 +854,7 @@ fn diagnose_linux_p0(evidence: Vec<NativeDiagnosticEvidence>) -> Result<serde_js
     }
 }
 
+#[cfg(any(target_os = "windows", test))]
 fn diagnose_windows_documents(
     evidence: Vec<NativeDiagnosticEvidence>,
 ) -> Result<serde_json::Value, String> {
