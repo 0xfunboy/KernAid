@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import stat
 import subprocess
 import tempfile
@@ -12,6 +13,8 @@ from pathlib import Path
 TOOLS_DIR = Path(__file__).resolve().parents[1]
 REPO_DIR = Path(__file__).resolve().parents[3]
 SCRIPT = TOOLS_DIR / "qemu-smoke.sh"
+USB_SCRIPT = TOOLS_DIR / "qemu-usb-smoke.sh"
+RESCUE_WORKFLOW = REPO_DIR / ".github/workflows/rescue.yml"
 
 
 def executable(path: Path, source: str) -> None:
@@ -380,6 +383,47 @@ class QemuSmokeFixturePrivilegeTests(unittest.TestCase):
         self.assertIn("ntfs-3g", calls[0])
         self.assertTrue((state / "mount-source").exists())
         self.assertFalse((state / "qemu-euid").exists())
+
+
+class QemuTimeoutBudgetTests(unittest.TestCase):
+    @staticmethod
+    def readonly_integer(source: str, name: str) -> int:
+        match = re.search(
+            rf"^readonly {re.escape(name)}=([0-9]+)$", source, re.MULTILINE
+        )
+        if match is None:
+            raise AssertionError(f"missing exact readonly integer: {name}")
+        return int(match.group(1))
+
+    def test_tcg_boot_budgets_fit_inside_the_workflow_timeout(self) -> None:
+        classic = SCRIPT.read_text(encoding="utf-8")
+        usb = USB_SCRIPT.read_text(encoding="utf-8")
+        workflow = RESCUE_WORKFLOW.read_text(encoding="utf-8")
+
+        classic_timeout = self.readonly_integer(classic, "boot_timeout_seconds")
+        usb_timeout = self.readonly_integer(usb, "boot_timeout_seconds")
+        usb_boot_count = self.readonly_integer(usb, "boot_count")
+        workflow_timeout_match = re.search(
+            r"^\s*timeout-minutes:\s*([0-9]+)\s*$", workflow, re.MULTILINE
+        )
+        self.assertIsNotNone(workflow_timeout_match)
+        assert workflow_timeout_match is not None
+        workflow_timeout_seconds = int(workflow_timeout_match.group(1)) * 60
+        classic_invocations = workflow.count("./tools/build-rescue/qemu-smoke.sh ")
+        usb_invocations = workflow.count(
+            '"$PWD/tools/build-rescue/qemu-usb-smoke.sh" '
+        )
+
+        self.assertEqual(classic_timeout, 600)
+        self.assertEqual(usb_timeout, 600)
+        self.assertEqual(classic_invocations, 2)
+        self.assertEqual(usb_invocations, 2)
+        total_tcg_budget = (
+            classic_invocations * classic_timeout
+            + usb_invocations * usb_boot_count * usb_timeout
+        )
+        self.assertLess(total_tcg_budget, workflow_timeout_seconds)
+        self.assertGreaterEqual(workflow_timeout_seconds - total_tcg_budget, 30 * 60)
 
 
 if __name__ == "__main__":

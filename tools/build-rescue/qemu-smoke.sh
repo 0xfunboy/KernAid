@@ -3,6 +3,7 @@ set -euo pipefail
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 firmware="${1:-bios}"
 iso="${2:-$repo_dir/KernAid-Rescue-amd64.iso}"
+readonly boot_timeout_seconds=600
 for command in cp debugfs mkfs.ext4 mkfs.ntfs ntfsfix python3 \
   qemu-system-x86_64 sha256sum sync tee truncate; do
   command -v "$command" >/dev/null || { echo "Missing required command: $command" >&2; exit 2; }
@@ -318,7 +319,7 @@ fi
 
 qemu-system-x86_64 "${qemu_args[@]}" >"$log" 2>&1 &
 qemu_pid=$!
-for _attempt in $(seq 1 240); do
+for ((_attempt = 1; _attempt <= boot_timeout_seconds; _attempt++)); do
   if grep -q "KERNAID_RESCUE_READY" "$log" \
     && grep -q "KERNAID_RESCUE_TARGET_SELECTION_READY" "$log" \
     && grep -q "KERNAID_RESCUE_OFFLINE_INSPECTION_READY" "$log"; then
@@ -367,5 +368,5 @@ for _attempt in $(seq 1 240); do
   sleep 1
 done
 tail -n 200 "$log"
-echo "The required Rescue readiness markers were not both observed within 240 seconds" >&2
+echo "The required Rescue readiness markers were not both observed within $boot_timeout_seconds seconds" >&2
 exit 1

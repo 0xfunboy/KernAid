@@ -1189,8 +1189,22 @@ class InstalledTargetTests(unittest.TestCase):
     def test_qemu_requires_a_bound_fixture_selection_marker(self) -> None:
         ready_check = READY_CHECK.read_text()
         self.assertLess(rescue_server.AUTHORIZE_DEADLINE_SECONDS, 20)
+        self.assertEqual(rescue_server.OFFLINE_HELPER_TIMEOUT_SECONDS, 20)
+        self.assertLess(rescue_server.OFFLINE_HELPER_TIMEOUT_SECONDS, 22)
         self.assertLess(22, rescue_server.REQUEST_DEADLINE_SECONDS)
         self.assertIn("--max-time 22", ready_check)
+        selection_requests = [
+            line
+            for line in ready_check.splitlines()
+            if "/api/rescue/select-installed-target" in line
+        ]
+        self.assertEqual(len(selection_requests), 2)
+        self.assertTrue(
+            all("--max-time 22" in request for request in selection_requests)
+        )
+        self.assertTrue(
+            all("--max-time 5" not in request for request in selection_requests)
+        )
         post_position = ready_check.index("/api/rescue/select-installed-target")
         fingerprint_binding = ready_check.index("selection fingerprint binding failed")
         target_binding = ready_check.index("selection target binding failed")
