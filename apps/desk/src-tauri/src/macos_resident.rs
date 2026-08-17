@@ -268,8 +268,80 @@ pub fn storage_shape_summary(raw: &str) -> String {
     let physical = first
         .and_then(Value::as_object)
         .and_then(|record| record.get("physical_drive"));
+    let record_shapes = records
+        .and_then(Value::as_array)
+        .map(|records| {
+            records
+                .iter()
+                .take(16)
+                .map(|record| {
+                    let physical = record
+                        .as_object()
+                        .and_then(|record| record.get("physical_drive"));
+                    let internal = physical
+                        .and_then(Value::as_object)
+                        .and_then(|physical| physical.get("is_internal_disk"));
+                    let medium = physical
+                        .and_then(Value::as_object)
+                        .and_then(|physical| physical.get("medium_type"));
+                    let smart = physical
+                        .and_then(Value::as_object)
+                        .and_then(|physical| physical.get("smart_status"));
+                    let internal_class = match internal {
+                        Some(Value::Bool(_)) => "bool",
+                        Some(Value::String(value)) if value.eq_ignore_ascii_case("yes") => "yes",
+                        Some(Value::String(value)) if value.eq_ignore_ascii_case("no") => "no",
+                        Some(Value::String(_)) => "unknown-string",
+                        Some(_) => "wrong-type",
+                        None => "missing",
+                    };
+                    let medium_class = match medium {
+                        Some(Value::String(value))
+                            if matches!(
+                                value.trim().to_ascii_lowercase().as_str(),
+                                "ssd" | "solid state" | "solid_state"
+                            ) =>
+                        {
+                            "solid-state"
+                        }
+                        Some(Value::String(value))
+                            if matches!(
+                                value.trim().to_ascii_lowercase().as_str(),
+                                "hdd" | "rotational" | "rotating"
+                            ) =>
+                        {
+                            "rotational"
+                        }
+                        Some(Value::String(_)) => "unknown-string",
+                        Some(_) => "wrong-type",
+                        None => "missing",
+                    };
+                    let smart_class = match smart {
+                        None | Some(Value::Null) => "missing-or-null",
+                        Some(Value::String(value))
+                            if matches!(
+                                value.trim().to_ascii_lowercase().as_str(),
+                                "verified" | "failing" | "unsupported" | "not supported"
+                            ) =>
+                        {
+                            "known"
+                        }
+                        Some(Value::String(_)) => "unknown-string",
+                        Some(_) => "wrong-type",
+                    };
+                    format!(
+                        "record={};keys={:?};physical={};physicalKeys={:?};internal={internal_class};medium={medium_class};smart={smart_class}",
+                        kind(Some(record)),
+                        safe_keys(Some(record)),
+                        kind(physical),
+                        safe_keys(physical),
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     format!(
-        "root={};rootKeys={:?};records={};recordCount={};first={};firstKeys={:?};physical={};physicalKeys={:?}",
+        "root={};rootKeys={:?};records={};recordCount={};first={};firstKeys={:?};physical={};physicalKeys={:?};recordShapes={record_shapes:?}",
         kind(Some(&root)),
         safe_keys(Some(&root)),
         kind(records),
@@ -278,6 +350,80 @@ pub fn storage_shape_summary(raw: &str) -> String {
         safe_keys(first),
         kind(physical),
         safe_keys(physical),
+    )
+}
+
+#[cfg(test)]
+pub fn launchd_shape_summary(raw: &str) -> String {
+    let mut lines = raw.lines();
+    let header = lines.next();
+    let mut rows = 0_usize;
+    let mut field_counts = BTreeMap::<usize, usize>::new();
+    let mut pid_classes = BTreeMap::<&'static str, usize>::new();
+    let mut status_classes = BTreeMap::<&'static str, usize>::new();
+    let mut invalid_labels = 0_usize;
+    for line in lines {
+        rows += 1;
+        let fields = line.split('\t').collect::<Vec<_>>();
+        *field_counts.entry(fields.len()).or_default() += 1;
+        let pid_class = match fields.first() {
+            Some(&"-") => "dash",
+            Some(value) if value.parse::<u32>().is_ok_and(|value| value > 0) => "positive-u32",
+            Some(_) => "other",
+            None => "missing",
+        };
+        *pid_classes.entry(pid_class).or_default() += 1;
+        let status_class = match fields.get(1) {
+            Some(&"-") => "dash",
+            Some(value) if value.parse::<i32>().is_ok() => "i32",
+            Some(_) => "other",
+            None => "missing",
+        };
+        *status_classes.entry(status_class).or_default() += 1;
+        if fields.get(2).is_none_or(|label| {
+            label.is_empty() || label.len() > 512 || label.chars().any(char::is_control)
+        }) {
+            invalid_labels += 1;
+        }
+    }
+    format!(
+        "headerExact={};headerLength={};headerTabs={};rows={rows};fieldCounts={field_counts:?};pidClasses={pid_classes:?};statusClasses={status_classes:?};invalidLabels={invalid_labels}",
+        header == Some("PID\tStatus\tLabel"),
+        header.map_or(0, str::len),
+        header.map_or(0, |header| header
+            .bytes()
+            .filter(|byte| *byte == b'\t')
+            .count()),
+    )
+}
+
+#[cfg(test)]
+pub fn snapshot_shape_summary(raw: &str) -> String {
+    let mut lines = raw.lines();
+    let header = lines.next();
+    let mut rows = 0_usize;
+    let mut blanks = 0_usize;
+    let mut date_shapes = 0_usize;
+    let mut other_shapes = 0_usize;
+    for line in lines {
+        rows += 1;
+        if line.is_empty() {
+            blanks += 1;
+        } else if line.len() == 17
+            && line.as_bytes().get(4) == Some(&b'-')
+            && line.as_bytes().get(7) == Some(&b'-')
+            && line.as_bytes().get(10) == Some(&b'-')
+        {
+            date_shapes += 1;
+        } else {
+            other_shapes += 1;
+        }
+    }
+    format!(
+        "headerExact={};headerLength={};headerAscii={};rows={rows};blanks={blanks};dateShapes={date_shapes};otherShapes={other_shapes}",
+        header == Some("Snapshot dates for all disks:"),
+        header.map_or(0, str::len),
+        header.is_some_and(str::is_ascii),
     )
 }
 
