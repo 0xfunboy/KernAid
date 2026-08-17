@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import test from "node:test";
 import Ajv2020 from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
@@ -20,6 +20,13 @@ const schemaFiles = [
   "session-report.schema.json",
   "validated-plan.schema.json",
 ];
+
+test("published schema basenames match the expected release set", () => {
+  const publishedSchemaFiles = readdirSync(new URL("../", import.meta.url))
+    .filter((file) => file.endsWith(".schema.json"))
+    .sort();
+  assert.deepEqual(publishedSchemaFiles, schemaFiles);
+});
 
 test("all published JSON schemas compile together", () => {
   const ajv = new Ajv2020({ allErrors: true, strict: true });
