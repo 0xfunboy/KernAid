@@ -7,7 +7,11 @@
 use super::{RescueSecretError, RescueVaultSecrets, VaultMountAttestation};
 use crate::{
     bounded_process,
-    device_locator::{LocatedVaultIdentity, LocatedVaultPartition},
+    device_locator::{
+        DescriptorBlockGeometry, DescriptorBlockIdentity, DescriptorBlockIdentityError,
+        LocatedVaultIdentity, LocatedVaultPartition, descriptor_block_geometry,
+        descriptor_block_identity,
+    },
     linux,
     profile_classifier::{
         Ext4ProfileEvidence, LOGICAL_SECTOR_BYTES, MINIMUM_ADVERTISED_MEDIA_BYTES,
@@ -141,6 +145,7 @@ pub enum VaultMountManagerError {
     InvalidMapperName,
     Unprovisioned,
     ProfileMismatch,
+    ClassifierUnavailable,
     InvalidLuks2Header,
     WrongVaultLabel,
     MapperConflict,
@@ -169,6 +174,7 @@ impl std::fmt::Display for VaultMountManagerError {
             Self::InvalidMapperName => "the Rescue vault mapper name is invalid",
             Self::Unprovisioned => "the Rescue vault is not provisioned",
             Self::ProfileMismatch => "the Rescue vault profile does not match",
+            Self::ClassifierUnavailable => "the pinned Rescue vault classifier is unavailable",
             Self::InvalidLuks2Header => "the selected device is not the expected LUKS2 vault",
             Self::WrongVaultLabel => "the selected device is not labelled as a KernAid vault",
             Self::MapperConflict => "the selected Rescue mapper is already in use",
@@ -201,6 +207,7 @@ impl VaultMountManagerError {
             Self::InvalidMapperName => "invalid-mapper-name",
             Self::Unprovisioned => "unprovisioned",
             Self::ProfileMismatch => "profile-mismatch",
+            Self::ClassifierUnavailable => "classifier-unavailable",
             Self::InvalidLuks2Header => "invalid-luks2-header",
             Self::WrongVaultLabel => "wrong-vault-label",
             Self::MapperConflict => "mapper-conflict",
@@ -254,18 +261,28 @@ impl RescueVaultMountManager {
     ) -> Result<MountedRescueVault, VaultMountManagerError> {
         ensure_cloexec(&passphrase_fd)?;
         let resolved = ResolvedRequest::resolve(request)?;
-        let activation = Activation::start(SystemOps, self.lock, resolved, passphrase_fd)?;
+        let mut activation = Activation::start(SystemOps, self.lock, resolved, passphrase_fd)?;
 
-        let attestation = activation
-            .attestation
-            .as_ref()
-            .ok_or(VaultMountManagerError::MountVerificationFailed)?;
-        let secrets = RescueVaultSecrets::open(&activation.request.mount_root, attestation)
-            .map_err(map_secure_state_error)?;
-        Ok(MountedRescueVault {
-            secrets,
-            activation,
-        })
+        let secrets_result = match activation.attestation.as_ref() {
+            Some(attestation) => {
+                RescueVaultSecrets::open(&activation.request.mount_root, attestation)
+                    .map_err(map_secure_state_error)
+            }
+            None => Err(VaultMountManagerError::MountVerificationFailed),
+        };
+        match secrets_result {
+            Ok(secrets) => Ok(MountedRescueVault {
+                secrets,
+                activation,
+            }),
+            Err(primary) => {
+                if activation.cleanup().is_err() {
+                    Err(VaultMountManagerError::CleanupFailed)
+                } else {
+                    Err(primary)
+                }
+            }
+        }
     }
 }
 
@@ -338,6 +355,7 @@ struct BlockDevice {
     rdev: u64,
     disk_sequence: u64,
     capacity_sectors: u64,
+    logical_sector_bytes: u64,
     located_identity: Option<LocatedVaultIdentity>,
 }
 
@@ -394,11 +412,13 @@ impl BlockDevice {
         {
             return Err(VaultMountManagerError::InvalidBlockDevice);
         }
-        let (disk_sequence, capacity_sectors) =
-            block_device_kernel_identity(major_minor.0, major_minor.1)?;
-        if located_identity.is_some_and(|identity| {
-            disk_sequence != identity.disk_sequence || capacity_sectors != identity.sector_count
-        }) {
+        let observed_identity = source_descriptor_block_identity(&descriptor)?;
+        if located_identity
+            .is_some_and(|identity| !source_identity_matches_location(observed_identity, identity))
+        {
+            return Err(VaultMountManagerError::InvalidBlockDevice);
+        }
+        if observed_identity.logical_sector_bytes != LOGICAL_SECTOR_BYTES {
             return Err(VaultMountManagerError::InvalidBlockDevice);
         }
         let command_path = retained_descriptor_path(&descriptor)?;
@@ -409,8 +429,9 @@ impl BlockDevice {
             device: stat.st_dev,
             inode: stat.st_ino,
             rdev: stat.st_rdev,
-            disk_sequence,
-            capacity_sectors,
+            disk_sequence: observed_identity.disk_sequence,
+            capacity_sectors: observed_identity.sector_count,
+            logical_sector_bytes: observed_identity.logical_sector_bytes,
             located_identity,
         };
         result.revalidate()?;
@@ -418,14 +439,34 @@ impl BlockDevice {
     }
 
     fn revalidate(&self) -> Result<(), VaultMountManagerError> {
+        self.validate_endpoint_paths()?;
+        let observed = source_descriptor_block_identity(&self.descriptor)?;
+        self.validate_endpoint_paths()?;
+        if observed.disk_sequence != self.disk_sequence
+            || observed.sector_count != self.capacity_sectors
+            || observed.logical_sector_bytes != self.logical_sector_bytes
+            || observed.logical_sector_bytes != LOGICAL_SECTOR_BYTES
+            || self.located_identity.is_some_and(|identity| {
+                self.major_minor() != (identity.partition_major, identity.partition_minor)
+                    || !source_identity_matches_location(observed, identity)
+            })
+        {
+            return Err(VaultMountManagerError::InvalidBlockDevice);
+        }
+        Ok(())
+    }
+
+    fn validate_endpoint_paths(&self) -> Result<(), VaultMountManagerError> {
         let descriptor =
             rfs::fstat(&self.descriptor).map_err(|_| VaultMountManagerError::InvalidBlockDevice)?;
         let named = rfs::statat(CWD, &self.checkpoint_path, AtFlags::SYMLINK_NOFOLLOW)
             .map_err(|_| VaultMountManagerError::InvalidBlockDevice)?;
         let command = rfs::statat(CWD, &self.command_path, AtFlags::empty())
             .map_err(|_| VaultMountManagerError::InvalidBlockDevice)?;
-        let (major, minor) = self.major_minor();
-        let (observed_sequence, observed_capacity) = block_device_kernel_identity(major, minor)?;
+        let status = rfs::fcntl_getfl(&self.descriptor)
+            .map_err(|_| VaultMountManagerError::InvalidBlockDevice)?;
+        let descriptor_flags = rustix::io::fcntl_getfd(&self.descriptor)
+            .map_err(|_| VaultMountManagerError::InvalidBlockDevice)?;
         if !FileType::from_raw_mode(descriptor.st_mode).is_block_device()
             || !FileType::from_raw_mode(named.st_mode).is_block_device()
             || descriptor.st_dev != self.device
@@ -438,13 +479,9 @@ impl BlockDevice {
             || command.st_dev != self.device
             || command.st_ino != self.inode
             || command.st_rdev != self.rdev
-            || observed_sequence != self.disk_sequence
-            || observed_capacity != self.capacity_sectors
-            || self.located_identity.is_some_and(|identity| {
-                (major, minor) != (identity.partition_major, identity.partition_minor)
-                    || observed_sequence != identity.disk_sequence
-                    || observed_capacity != identity.sector_count
-            })
+            || status & OFlags::ACCMODE != OFlags::RDONLY
+            || !status.contains(OFlags::NONBLOCK)
+            || !descriptor_flags.contains(rustix::io::FdFlags::CLOEXEC)
         {
             return Err(VaultMountManagerError::InvalidBlockDevice);
         }
@@ -460,9 +497,11 @@ impl BlockDevice {
     }
 
     fn revalidate_profile_capability(&self) -> Result<(), ProfileClassifierError> {
-        self.revalidate()
+        self.validate_endpoint_paths()
             .map_err(|_| ProfileClassifierError::MediaChanged)?;
-        if self.capacity_sectors.checked_mul(512) != Some(VAULT_PARTITION_BYTES) {
+        if self.capacity_sectors.checked_mul(LOGICAL_SECTOR_BYTES) != Some(VAULT_PARTITION_BYTES)
+            || self.logical_sector_bytes != LOGICAL_SECTOR_BYTES
+        {
             return Err(ProfileClassifierError::MediaChanged);
         }
         Ok(())
@@ -496,6 +535,7 @@ struct MappingIdentity {
     backing_major: u32,
     backing_minor: u32,
     capacity_sectors: u64,
+    logical_sector_bytes: u64,
 }
 
 impl MappingIdentity {
@@ -506,6 +546,19 @@ impl MappingIdentity {
         header: HeaderIdentity,
     ) -> Result<(), VaultMountManagerError> {
         device.revalidate()?;
+        self.validate_endpoint_path()?;
+        let block_identity = mapping_descriptor_block_geometry(&self.descriptor)?;
+        self.validate_endpoint_path()?;
+        if block_identity.sector_count != self.capacity_sectors
+            || block_identity.logical_sector_bytes != self.logical_sector_bytes
+            || block_identity.logical_sector_bytes != LOGICAL_SECTOR_BYTES
+            || block_identity
+                .sector_count
+                .checked_mul(LOGICAL_SECTOR_BYTES)
+                != Some(VAULT_PAYLOAD_BYTES)
+        {
+            return Err(VaultMountManagerError::MappingVerificationFailed);
+        }
         let descriptor = rfs::fstat(&self.descriptor)
             .map_err(|_| VaultMountManagerError::MappingVerificationFailed)?;
         let command = rfs::statat(CWD, &self.command_path, AtFlags::empty())
@@ -536,19 +589,38 @@ impl MappingIdentity {
         {
             return Err(VaultMountManagerError::MappingVerificationFailed);
         }
-        let capacity = parse_u64(trim_line(&read_small_file(&sysfs.join("size"))?))
-            .ok_or(VaultMountManagerError::MappingVerificationFailed)?;
-        if capacity != self.capacity_sectors
-            || capacity.checked_mul(512) != Some(VAULT_PAYLOAD_BYTES)
-        {
-            return Err(VaultMountManagerError::MappingVerificationFailed);
-        }
         let backing = single_backing_device(&sysfs.join("slaves"))?;
         if backing != (self.backing_major, self.backing_minor) || backing != device.major_minor() {
             return Err(VaultMountManagerError::MappingVerificationFailed);
         }
         verify_unique_backing_holder(backing, (self.major, self.minor))?;
         device.revalidate()?;
+        Ok(())
+    }
+
+    fn validate_endpoint_path(&self) -> Result<(), VaultMountManagerError> {
+        let descriptor = rfs::fstat(&self.descriptor)
+            .map_err(|_| VaultMountManagerError::MappingVerificationFailed)?;
+        let command = rfs::statat(CWD, &self.command_path, AtFlags::empty())
+            .map_err(|_| VaultMountManagerError::MappingVerificationFailed)?;
+        let status = rfs::fcntl_getfl(&self.descriptor)
+            .map_err(|_| VaultMountManagerError::MappingVerificationFailed)?;
+        let descriptor_flags = rustix::io::fcntl_getfd(&self.descriptor)
+            .map_err(|_| VaultMountManagerError::MappingVerificationFailed)?;
+        if !FileType::from_raw_mode(descriptor.st_mode).is_block_device()
+            || descriptor.st_dev != self.device
+            || descriptor.st_ino != self.inode
+            || descriptor.st_rdev != self.rdev
+            || !FileType::from_raw_mode(command.st_mode).is_block_device()
+            || command.st_dev != self.device
+            || command.st_ino != self.inode
+            || command.st_rdev != self.rdev
+            || status & OFlags::ACCMODE != OFlags::RDONLY
+            || !status.contains(OFlags::NONBLOCK)
+            || !descriptor_flags.contains(rustix::io::FdFlags::CLOEXEC)
+        {
+            return Err(VaultMountManagerError::MappingVerificationFailed);
+        }
         Ok(())
     }
 }
@@ -563,6 +635,8 @@ struct Activation<R: VaultOps> {
     attestation: Option<VaultMountAttestation>,
     mapping_open: bool,
     mounted: bool,
+    mutator_invoked: bool,
+    cleanup_attempted: bool,
 }
 
 impl<R: VaultOps> Activation<R> {
@@ -589,16 +663,37 @@ impl<R: VaultOps> Activation<R> {
             attestation: None,
             mapping_open: false,
             mounted: false,
+            mutator_invoked: false,
+            cleanup_attempted: false,
         };
 
+        let result = activation.continue_start(passphrase);
+        match result {
+            Ok(()) => Ok(activation),
+            Err(primary) => {
+                if activation.mutator_invoked && activation.cleanup().is_err() {
+                    Err(VaultMountManagerError::CleanupFailed)
+                } else {
+                    Err(primary)
+                }
+            }
+        }
+    }
+
+    fn continue_start(&mut self, passphrase: impl AsFd) -> Result<(), VaultMountManagerError> {
+        // Finish every fallible read-only checkpoint before claiming that a
+        // mapper mutation may have occurred. A failed checkpoint must never
+        // confer ownership of a concurrently created mapper.
+        self.ops.pre_open_revalidate(&self.request.device)?;
         // The source descriptor was made CLOEXEC before any validation child
         // was spawned. Create the only duplicate at the last possible moment;
         // Command transfers it onto fd 0 and exec closes every other copy.
         let cryptsetup_passphrase = rustix::io::fcntl_dupfd_cloexec(&passphrase, 3)
             .map_err(|_| VaultMountManagerError::PassphraseUnavailable)?;
-        let open_result = activation.ops.open_luks2(
-            &activation.request.device,
-            &activation.request.mapper,
+        self.mutator_invoked = true;
+        let open_result = self.ops.open_luks2(
+            &self.request.device,
+            &self.request.mapper,
             cryptsetup_passphrase,
         );
         drop(passphrase);
@@ -607,84 +702,117 @@ impl<R: VaultOps> Activation<R> {
         // close a concurrently created mapping merely because it matches the
         // requested public identity.
         if open_result == Err(VaultMountManagerError::ToolUnavailable) {
+            self.mutator_invoked = false;
             return Err(VaultMountManagerError::ToolUnavailable);
+        }
+        // CleanupFailed means the mutating cryptsetup child or its process
+        // group is still unowned. Do not inspect, acquire, or close any mapper
+        // while that mutator may resume; the outer start wrapper records the
+        // terminal cleanup failure without issuing an ambiguous operation.
+        if open_result == Err(VaultMountManagerError::CleanupFailed) {
+            return Err(VaultMountManagerError::CleanupFailed);
         }
 
         // cryptsetup may return an error after the kernel accepted the mapping
         // (for example after interruption). Acquire the complete mapping
         // identity stepwise so Drop can close it only when it is still exact.
-        let mapping_result = activation.ops.inspect_mapping(
-            &activation.request.device,
-            &activation.request.mapper,
-            &activation.request.mapper_path,
-            activation.header,
+        let mapping_result = self.ops.inspect_mapping(
+            &self.request.device,
+            &self.request.mapper,
+            &self.request.mapper_path,
+            self.header,
         );
         match mapping_result {
             Ok(mapping) => {
-                activation.mapping = Some(mapping);
-                activation.mapping_open = true;
+                self.mapping = Some(mapping);
+                self.mapping_open = true;
             }
             Err(mapping_error) => {
-                if open_result.is_ok() {
+                if mapping_error == VaultMountManagerError::CleanupFailed {
+                    return Err(VaultMountManagerError::CleanupFailed);
+                }
+                if let Err(open_error) = open_result {
+                    if open_error == VaultMountManagerError::CleanupFailed {
+                        return Err(VaultMountManagerError::CleanupFailed);
+                    }
+                    if self
+                        .ops
+                        .verify_failed_open_absence(
+                            &self.request.device,
+                            &self.request.mapper,
+                            &self.request.mapper_path,
+                        )
+                        .is_ok()
+                    {
+                        return Err(dominant_open_inspection_error(open_error, mapping_error));
+                    }
+                    return Err(VaultMountManagerError::CleanupFailed);
+                } else {
                     // We know cryptsetup reported success, but we do not have
                     // enough identity to issue an ambiguous close.
-                    activation.mapping_open = true;
+                    self.mapping_open = true;
                 }
-                return Err(open_result.err().unwrap_or(mapping_error));
+                return Err(VaultMountManagerError::CleanupFailed);
             }
         }
         open_result?;
-        if activation
-            .ops
-            .classify_outer_profile(&activation.request.device)?
-            != activation.outer_profile
-        {
+        if self.ops.classify_outer_profile(&self.request.device)? != self.outer_profile {
             return Err(VaultMountManagerError::ProfileMismatch);
         }
-        let mapping = activation
+        let mapping = self
             .mapping
             .as_ref()
             .ok_or(VaultMountManagerError::MappingVerificationFailed)?;
-        let filesystem_profile = activation.ops.inspect_filesystem(
-            &activation.request.device,
-            &activation.request.mapper,
+        let filesystem_profile = self.ops.inspect_filesystem(
+            &self.request.device,
+            &self.request.mapper,
             mapping,
-            activation.header,
+            self.header,
         )?;
-        activation
-            .ops
-            .prepare_mount_root(&activation.request.mount_root)?;
-        activation.ops.mount_ext4(
-            &activation.request.device,
-            &activation.request.mapper,
+        self.ops.prepare_mount_root(&self.request.mount_root)?;
+        // This mapping checkpoint may itself time out. Run it before claiming
+        // mount ownership so failure cannot trigger an unmount of a mount that
+        // this activation never created.
+        self.ops.pre_mount_revalidate(
+            &self.request.device,
+            &self.request.mapper,
             mapping,
-            activation.header,
-            &activation.request.mount_root,
+            self.header,
         )?;
-        activation.mounted = true;
-        activation.ops.verify_mounted_filesystem(
-            &activation.request.device,
-            &activation.request.mapper,
+        // Treat the mount syscall as mutating until an explicit cleanup proves
+        // and removes the exact mount; an error cannot silently rely on Drop.
+        self.mounted = true;
+        self.ops.mount_ext4(
+            &self.request.device,
+            &self.request.mapper,
             mapping,
-            activation.header,
+            self.header,
+            &self.request.mount_root,
+        )?;
+        self.ops.verify_mounted_filesystem(
+            &self.request.device,
+            &self.request.mapper,
+            mapping,
+            self.header,
             filesystem_profile,
         )?;
-        if activation
-            .ops
-            .classify_outer_profile(&activation.request.device)?
-            != activation.outer_profile
-        {
+        if self.ops.classify_outer_profile(&self.request.device)? != self.outer_profile {
             return Err(VaultMountManagerError::ProfileMismatch);
         }
-        activation.attestation = Some(activation.ops.attest_mount(
-            &activation.request,
-            activation.header,
-            mapping,
-        )?);
-        Ok(activation)
+        self.attestation = Some(self.ops.attest_mount(&self.request, self.header, mapping)?);
+        Ok(())
     }
 
     fn cleanup(&mut self) -> Result<(), VaultMountManagerError> {
+        if self.cleanup_attempted {
+            return Err(VaultMountManagerError::CleanupFailed);
+        }
+        self.cleanup_attempted = true;
+        self.cleanup_inner()
+            .map_err(|_| VaultMountManagerError::CleanupFailed)
+    }
+
+    fn cleanup_inner(&mut self) -> Result<(), VaultMountManagerError> {
         if self.mounted {
             let mapping = self
                 .mapping
@@ -697,6 +825,8 @@ impl<R: VaultOps> Activation<R> {
                 self.attestation.as_ref(),
             )?;
             self.ops.unmount(&self.request.mount_root)?;
+            self.ops
+                .verify_unmounted(&self.request, self.header, mapping)?;
             self.mounted = false;
         }
         if self.mapping_open {
@@ -716,15 +846,39 @@ impl<R: VaultOps> Activation<R> {
             // any process still has that block device open.
             drop(self.mapping.take());
             self.ops.close_mapping(&self.request.mapper)?;
+            self.ops.verify_closed_mapping_absence(
+                &self.request.device,
+                &self.request.mapper,
+                &self.request.mapper_path,
+            )?;
             self.mapping_open = false;
         }
         Ok(())
     }
 }
 
+fn dominant_open_inspection_error(
+    open_error: VaultMountManagerError,
+    mapping_error: VaultMountManagerError,
+) -> VaultMountManagerError {
+    for dominant in [
+        VaultMountManagerError::CleanupFailed,
+        VaultMountManagerError::OperationTimedOut,
+        VaultMountManagerError::ToolUnavailable,
+    ] {
+        if open_error == dominant || mapping_error == dominant {
+            return dominant;
+        }
+    }
+    open_error
+}
+
 impl<R: VaultOps> Drop for Activation<R> {
     fn drop(&mut self) {
-        let _ = self.cleanup();
+        if !self.cleanup_attempted {
+            self.cleanup_attempted = true;
+            let _ = self.cleanup_inner();
+        }
     }
 }
 
@@ -739,6 +893,7 @@ trait VaultOps {
         &mut self,
         device: &BlockDevice,
     ) -> Result<OuterProfileEvidence, VaultMountManagerError>;
+    fn pre_open_revalidate(&mut self, device: &BlockDevice) -> Result<(), VaultMountManagerError>;
     fn open_luks2(
         &mut self,
         device: &BlockDevice,
@@ -752,6 +907,18 @@ trait VaultOps {
         mapper_path: &Path,
         header: HeaderIdentity,
     ) -> Result<MappingIdentity, VaultMountManagerError>;
+    fn verify_failed_open_absence(
+        &mut self,
+        device: &BlockDevice,
+        mapper: &MapperName,
+        mapper_path: &Path,
+    ) -> Result<(), VaultMountManagerError>;
+    fn verify_closed_mapping_absence(
+        &mut self,
+        device: &BlockDevice,
+        mapper: &MapperName,
+        mapper_path: &Path,
+    ) -> Result<(), VaultMountManagerError>;
     fn inspect_filesystem(
         &mut self,
         device: &BlockDevice,
@@ -760,6 +927,13 @@ trait VaultOps {
         header: HeaderIdentity,
     ) -> Result<Ext4ProfileEvidence, VaultMountManagerError>;
     fn prepare_mount_root(&mut self, root: &Path) -> Result<(), VaultMountManagerError>;
+    fn pre_mount_revalidate(
+        &mut self,
+        device: &BlockDevice,
+        mapper: &MapperName,
+        mapping: &MappingIdentity,
+        header: HeaderIdentity,
+    ) -> Result<(), VaultMountManagerError>;
     fn mount_ext4(
         &mut self,
         device: &BlockDevice,
@@ -790,6 +964,12 @@ trait VaultOps {
         attestation: Option<&VaultMountAttestation>,
     ) -> Result<(), VaultMountManagerError>;
     fn unmount(&mut self, root: &Path) -> Result<(), VaultMountManagerError>;
+    fn verify_unmounted(
+        &mut self,
+        request: &ResolvedRequest,
+        header: HeaderIdentity,
+        mapping: &MappingIdentity,
+    ) -> Result<(), VaultMountManagerError>;
     fn verify_cleanup_mapping(
         &mut self,
         device: &BlockDevice,
@@ -804,6 +984,21 @@ trait VaultOps {
 struct SystemOps;
 
 impl SystemOps {
+    fn verify_mapping_absence(
+        device: &BlockDevice,
+        mapper: &MapperName,
+        mapper_path: &Path,
+    ) -> Result<(), VaultMountManagerError> {
+        device
+            .revalidate()
+            .map_err(|_| VaultMountManagerError::CleanupFailed)?;
+        verify_mapper_absence_checkpoint(device, mapper, mapper_path)?;
+        device
+            .revalidate()
+            .map_err(|_| VaultMountManagerError::CleanupFailed)?;
+        verify_mapper_absence_checkpoint(device, mapper, mapper_path)
+    }
+
     fn run_capture(mut command: Command) -> Result<Vec<u8>, VaultMountManagerError> {
         command
             .env_clear()
@@ -813,7 +1008,7 @@ impl SystemOps {
             .stdout(Stdio::piped());
         let output = bounded_process::capture(&mut command, COMMAND_TIMEOUT, COMMAND_OUTPUT_LIMIT)
             .map_err(map_bounded_process_error)?;
-        if !output.status.success() || output.exceeded_limit {
+        if !output.status.success() {
             return Err(VaultMountManagerError::MappingVerificationFailed);
         }
         Ok(output.bytes)
@@ -859,9 +1054,9 @@ impl VaultOps for SystemOps {
         mapper: &MapperName,
         mapper_path: &Path,
     ) -> Result<(), VaultMountManagerError> {
-        if rfs::statat(CWD, mapper_path, AtFlags::SYMLINK_NOFOLLOW).is_ok() {
-            return Err(VaultMountManagerError::MapperConflict);
-        }
+        require_mapper_path_absent(
+            rfs::statat(CWD, mapper_path, AtFlags::SYMLINK_NOFOLLOW).map(|_| ()),
+        )?;
         if sysfs_mapper_name_exists(mapper)? {
             return Err(VaultMountManagerError::MapperConflict);
         }
@@ -872,15 +1067,21 @@ impl VaultOps for SystemOps {
         &mut self,
         device: &BlockDevice,
     ) -> Result<OuterProfileEvidence, VaultMountManagerError> {
+        device.revalidate()?;
         let classification = classify_partition(&device.descriptor, || {
             device.revalidate_profile_capability()
         })
         .map_err(map_profile_classifier_error)?;
+        device.revalidate()?;
         match classification {
             VaultPartitionProfile::Unprovisioned => Err(VaultMountManagerError::Unprovisioned),
             VaultPartitionProfile::Locked(evidence) => Ok(evidence),
             VaultPartitionProfile::ProfileMismatch => Err(VaultMountManagerError::ProfileMismatch),
         }
+    }
+
+    fn pre_open_revalidate(&mut self, device: &BlockDevice) -> Result<(), VaultMountManagerError> {
+        device.revalidate()
     }
 
     fn open_luks2(
@@ -889,7 +1090,6 @@ impl VaultOps for SystemOps {
         mapper: &MapperName,
         passphrase: OwnedFd,
     ) -> Result<(), VaultMountManagerError> {
-        device.revalidate()?;
         let mut command = cryptsetup_open_command(device.command_path(), mapper);
         command
             .env_clear()
@@ -948,9 +1148,15 @@ impl VaultOps for SystemOps {
         verify_cryptsetup_status(&status)?;
         device.revalidate()?;
         verify_unique_backing_holder(backing, (major, minor))?;
-        let capacity_sectors = parse_u64(trim_line(&read_small_file(&sysfs.join("size"))?))
-            .filter(|value| value.checked_mul(512) == Some(VAULT_PAYLOAD_BYTES))
-            .ok_or(VaultMountManagerError::MappingVerificationFailed)?;
+        let block_identity = mapping_descriptor_block_geometry(&descriptor)?;
+        if block_identity.logical_sector_bytes != LOGICAL_SECTOR_BYTES
+            || block_identity
+                .sector_count
+                .checked_mul(LOGICAL_SECTOR_BYTES)
+                != Some(VAULT_PAYLOAD_BYTES)
+        {
+            return Err(VaultMountManagerError::MappingVerificationFailed);
+        }
         let command_path = retained_descriptor_path(&descriptor)?;
         let mapping = MappingIdentity {
             command_path,
@@ -962,10 +1168,29 @@ impl VaultOps for SystemOps {
             minor,
             backing_major: backing.0,
             backing_minor: backing.1,
-            capacity_sectors,
+            capacity_sectors: block_identity.sector_count,
+            logical_sector_bytes: block_identity.logical_sector_bytes,
         };
         mapping.revalidate(device, mapper, header)?;
         Ok(mapping)
+    }
+
+    fn verify_failed_open_absence(
+        &mut self,
+        device: &BlockDevice,
+        mapper: &MapperName,
+        mapper_path: &Path,
+    ) -> Result<(), VaultMountManagerError> {
+        Self::verify_mapping_absence(device, mapper, mapper_path)
+    }
+
+    fn verify_closed_mapping_absence(
+        &mut self,
+        device: &BlockDevice,
+        mapper: &MapperName,
+        mapper_path: &Path,
+    ) -> Result<(), VaultMountManagerError> {
+        Self::verify_mapping_absence(device, mapper, mapper_path)
     }
 
     fn inspect_filesystem(
@@ -991,20 +1216,12 @@ impl VaultOps for SystemOps {
             .arg("--match-tag")
             .arg("LABEL")
             .arg(&mapping.command_path);
-        let output = Self::run_capture(blkid).map_err(|error| {
-            if error == VaultMountManagerError::ToolUnavailable {
-                error
-            } else {
-                VaultMountManagerError::UnsupportedFilesystem
-            }
-        })?;
+        let output = Self::run_capture(blkid).map_err(map_blkid_probe_error)?;
         let properties = parse_blkid_export(&output)?;
-        let evidence = qualify_ext4_mapper(&mapping.descriptor, || {
-            mapping
-                .revalidate(device, mapper, header)
-                .map_err(|_| ProfileClassifierError::MediaChanged)
-        })
-        .map_err(map_profile_classifier_error)?
+        let evidence = with_profile_revalidation(
+            |checkpoint| qualify_ext4_mapper(&mapping.descriptor, checkpoint),
+            || mapping.revalidate(device, mapper, header),
+        )?
         .ok_or(VaultMountManagerError::ProfileMismatch)?;
         if properties.kind.as_deref() != Some(b"ext4")
             || properties.label.as_deref() != Some(VAULT_LABEL)
@@ -1020,15 +1237,24 @@ impl VaultOps for SystemOps {
         prepare_runtime_mount_root(root)
     }
 
-    fn mount_ext4(
+    fn pre_mount_revalidate(
         &mut self,
         device: &BlockDevice,
         mapper: &MapperName,
         mapping: &MappingIdentity,
         header: HeaderIdentity,
+    ) -> Result<(), VaultMountManagerError> {
+        mapping.revalidate(device, mapper, header)
+    }
+
+    fn mount_ext4(
+        &mut self,
+        _device: &BlockDevice,
+        _mapper: &MapperName,
+        mapping: &MappingIdentity,
+        _header: HeaderIdentity,
         root: &Path,
     ) -> Result<(), VaultMountManagerError> {
-        mapping.revalidate(device, mapper, header)?;
         rustix::mount::mount(
             &mapping.command_path,
             root,
@@ -1052,12 +1278,10 @@ impl VaultOps for SystemOps {
         expected: Ext4ProfileEvidence,
     ) -> Result<(), VaultMountManagerError> {
         mapping.revalidate(device, mapper, header)?;
-        let exact = revalidate_mounted_ext4_mapper(&mapping.descriptor, expected, || {
-            mapping
-                .revalidate(device, mapper, header)
-                .map_err(|_| ProfileClassifierError::MediaChanged)
-        })
-        .map_err(map_profile_classifier_error)?;
+        let exact = with_profile_revalidation(
+            |checkpoint| revalidate_mounted_ext4_mapper(&mapping.descriptor, expected, checkpoint),
+            || mapping.revalidate(device, mapper, header),
+        )?;
         if !exact {
             return Err(VaultMountManagerError::ProfileMismatch);
         }
@@ -1070,23 +1294,21 @@ impl VaultOps for SystemOps {
         header: HeaderIdentity,
         mapping: &MappingIdentity,
     ) -> Result<VaultMountAttestation, VaultMountManagerError> {
-        mapping
-            .revalidate(&request.device, &request.mapper, header)
-            .map_err(|_| VaultMountManagerError::MountVerificationFailed)?;
-        let attestation = linux::mint_managed_mount_attestation(
-            &request.mount_root,
-            request.mapper.as_fixed_bytes(),
-            header.uuid,
-            mapping.major,
-            mapping.minor,
-            mapping.backing_major,
-            mapping.backing_minor,
+        with_mount_attestation_revalidation(
+            || mapping.revalidate(&request.device, &request.mapper, header),
+            || {
+                linux::mint_managed_mount_attestation(
+                    &request.mount_root,
+                    request.mapper.as_fixed_bytes(),
+                    header.uuid,
+                    mapping.major,
+                    mapping.minor,
+                    mapping.backing_major,
+                    mapping.backing_minor,
+                )
+                .map_err(|_| VaultMountManagerError::MountVerificationFailed)
+            },
         )
-        .map_err(|_| VaultMountManagerError::MountVerificationFailed)?;
-        mapping
-            .revalidate(&request.device, &request.mapper, header)
-            .map_err(|_| VaultMountManagerError::MountVerificationFailed)?;
-        Ok(attestation)
     }
 
     fn verify_cleanup_mount(
@@ -1122,6 +1344,24 @@ impl VaultOps for SystemOps {
 
     fn unmount(&mut self, root: &Path) -> Result<(), VaultMountManagerError> {
         rustix::mount::unmount(root, UnmountFlags::NOFOLLOW)
+            .map_err(|_| VaultMountManagerError::CleanupFailed)
+    }
+
+    fn verify_unmounted(
+        &mut self,
+        request: &ResolvedRequest,
+        header: HeaderIdentity,
+        mapping: &MappingIdentity,
+    ) -> Result<(), VaultMountManagerError> {
+        mapping
+            .revalidate(&request.device, &request.mapper, header)
+            .map_err(|_| VaultMountManagerError::CleanupFailed)?;
+        linux::verify_managed_mount_absent(&request.mount_root, mapping.major, mapping.minor)
+            .map_err(|_| VaultMountManagerError::CleanupFailed)?;
+        mapping
+            .revalidate(&request.device, &request.mapper, header)
+            .map_err(|_| VaultMountManagerError::CleanupFailed)?;
+        linux::verify_managed_mount_absent(&request.mount_root, mapping.major, mapping.minor)
             .map_err(|_| VaultMountManagerError::CleanupFailed)
     }
 
@@ -1338,48 +1578,44 @@ fn ensure_cloexec(descriptor: impl AsFd) -> Result<(), VaultMountManagerError> {
         .map_err(|_| VaultMountManagerError::PassphraseUnavailable)
 }
 
-fn block_device_kernel_identity(
-    major: u32,
-    minor: u32,
-) -> Result<(u64, u64), VaultMountManagerError> {
-    let sysfs = PathBuf::from(format!("/sys/dev/block/{major}:{minor}"));
-    let observed_device = read_small_block_file(&sysfs.join("dev"))?;
-    if parse_major_minor(trim_line(&observed_device)) != Some((major, minor)) {
-        return Err(VaultMountManagerError::InvalidBlockDevice);
-    }
-    let capacity = parse_u64(trim_line(&read_small_block_file(&sysfs.join("size"))?))
-        .filter(|value| *value > 0)
-        .ok_or(VaultMountManagerError::InvalidBlockDevice)?;
-
-    let sequence_path = if sysfs.join("diskseq").is_file() {
-        sysfs.join("diskseq")
-    } else {
-        // Partitions expose the containing disk's sequence in their canonical
-        // sysfs parent. BLKGETDISKSEQ is not available through safe rustix;
-        // this kernel-owned value is retained as a fail-closed experimental
-        // identity checkpoint until an ioctl-safe wrapper is adopted.
-        let canonical =
-            fs::canonicalize(&sysfs).map_err(|_| VaultMountManagerError::InvalidBlockDevice)?;
-        if !canonical.starts_with("/sys/devices") {
-            return Err(VaultMountManagerError::InvalidBlockDevice);
-        }
-        canonical
-            .parent()
-            .ok_or(VaultMountManagerError::InvalidBlockDevice)?
-            .join("diskseq")
-    };
-    let sequence = parse_u64(trim_line(&read_small_block_file(&sequence_path)?))
-        .filter(|value| *value > 0)
-        .ok_or(VaultMountManagerError::InvalidBlockDevice)?;
-    Ok((sequence, capacity))
+fn source_descriptor_block_identity(
+    descriptor: &(impl AsFd + AsRawFd),
+) -> Result<DescriptorBlockIdentity, VaultMountManagerError> {
+    descriptor_block_identity(descriptor).map_err(|error| {
+        map_descriptor_identity_error(error, VaultMountManagerError::InvalidBlockDevice)
+    })
 }
 
-fn read_small_block_file(path: &Path) -> Result<Vec<u8>, VaultMountManagerError> {
-    let bytes = fs::read(path).map_err(|_| VaultMountManagerError::InvalidBlockDevice)?;
-    if bytes.len() > 64 {
-        return Err(VaultMountManagerError::InvalidBlockDevice);
+fn source_identity_matches_location(
+    observed: DescriptorBlockIdentity,
+    expected: LocatedVaultIdentity,
+) -> bool {
+    observed.disk_sequence == expected.disk_sequence
+        && observed.sector_count == expected.sector_count
+        && observed.logical_sector_bytes == expected.logical_sector_bytes
+}
+
+fn mapping_descriptor_block_geometry(
+    descriptor: &(impl AsFd + AsRawFd),
+) -> Result<DescriptorBlockGeometry, VaultMountManagerError> {
+    descriptor_block_geometry(descriptor).map_err(|error| {
+        map_descriptor_identity_error(error, VaultMountManagerError::MappingVerificationFailed)
+    })
+}
+
+fn map_descriptor_identity_error(
+    error: DescriptorBlockIdentityError,
+    invalid: VaultMountManagerError,
+) -> VaultMountManagerError {
+    match error {
+        DescriptorBlockIdentityError::InvalidDescriptor
+        | DescriptorBlockIdentityError::IdentityUnavailable => invalid,
+        DescriptorBlockIdentityError::ToolUnavailable => VaultMountManagerError::ToolUnavailable,
+        DescriptorBlockIdentityError::OperationTimedOut => {
+            VaultMountManagerError::OperationTimedOut
+        }
+        DescriptorBlockIdentityError::CleanupFailed => VaultMountManagerError::CleanupFailed,
     }
-    Ok(bytes)
 }
 
 fn read_small_file(path: &Path) -> Result<Vec<u8>, VaultMountManagerError> {
@@ -1408,6 +1644,36 @@ fn sysfs_mapper_name_exists(mapper: &MapperName) -> Result<bool, VaultMountManag
         }
     }
     Ok(false)
+}
+
+fn require_mapper_path_absent(
+    result: Result<(), rustix::io::Errno>,
+) -> Result<(), VaultMountManagerError> {
+    match result {
+        Err(error) if error == rustix::io::Errno::NOENT => Ok(()),
+        Ok(()) | Err(_) => Err(VaultMountManagerError::MapperConflict),
+    }
+}
+
+fn verify_mapper_absence_checkpoint(
+    device: &BlockDevice,
+    mapper: &MapperName,
+    mapper_path: &Path,
+) -> Result<(), VaultMountManagerError> {
+    match rfs::statat(CWD, mapper_path, AtFlags::SYMLINK_NOFOLLOW) {
+        Err(error) if error == rustix::io::Errno::NOENT => {}
+        Ok(_) | Err(_) => return Err(VaultMountManagerError::CleanupFailed),
+    }
+    if sysfs_mapper_name_exists(mapper).map_err(|_| VaultMountManagerError::CleanupFailed)? {
+        return Err(VaultMountManagerError::CleanupFailed);
+    }
+    let (major, minor) = device.major_minor();
+    let mut holders = fs::read_dir(format!("/sys/dev/block/{major}:{minor}/holders"))
+        .map_err(|_| VaultMountManagerError::CleanupFailed)?;
+    match holders.next() {
+        None => Ok(()),
+        Some(_) => Err(VaultMountManagerError::CleanupFailed),
+    }
 }
 
 fn single_backing_device(directory: &Path) -> Result<(u32, u32), VaultMountManagerError> {
@@ -1522,19 +1788,6 @@ fn parse_u32(value: &[u8]) -> Option<u32> {
     Some(parsed)
 }
 
-fn parse_u64(value: &[u8]) -> Option<u64> {
-    if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
-        return None;
-    }
-    let mut parsed = 0_u64;
-    for byte in value {
-        parsed = parsed
-            .checked_mul(10)?
-            .checked_add(u64::from(byte - b'0'))?;
-    }
-    Some(parsed)
-}
-
 fn trim_line(value: &[u8]) -> &[u8] {
     let without_newline = value.strip_suffix(b"\n").unwrap_or(value);
     without_newline
@@ -1620,15 +1873,16 @@ fn map_bounded_process_error(
     error: bounded_process::BoundedProcessError,
 ) -> VaultMountManagerError {
     match error {
-        bounded_process::BoundedProcessError::Unavailable => {
+        bounded_process::BoundedProcessError::Unavailable
+        | bounded_process::BoundedProcessError::StartFailed => {
             VaultMountManagerError::ToolUnavailable
         }
         bounded_process::BoundedProcessError::TimedOut => VaultMountManagerError::OperationTimedOut,
         bounded_process::BoundedProcessError::CleanupFailed => {
             VaultMountManagerError::CleanupFailed
         }
-        bounded_process::BoundedProcessError::StartFailed
-        | bounded_process::BoundedProcessError::WaitFailed
+        bounded_process::BoundedProcessError::WaitFailed
+        | bounded_process::BoundedProcessError::OutputLimitExceeded
         | bounded_process::BoundedProcessError::UnexpectedDescendant => {
             VaultMountManagerError::MappingVerificationFailed
         }
@@ -1637,11 +1891,55 @@ fn map_bounded_process_error(
 
 fn map_profile_classifier_error(error: ProfileClassifierError) -> VaultMountManagerError {
     match error {
-        ProfileClassifierError::InvalidCanonicalProfile => VaultMountManagerError::ProfileMismatch,
+        ProfileClassifierError::InvalidCanonicalProfile => {
+            VaultMountManagerError::ClassifierUnavailable
+        }
         ProfileClassifierError::InvalidDescriptor | ProfileClassifierError::MediaChanged => {
             VaultMountManagerError::InvalidBlockDevice
         }
         ProfileClassifierError::OperationTimedOut => VaultMountManagerError::OperationTimedOut,
+    }
+}
+
+fn with_profile_revalidation<T>(
+    mut classify: impl FnMut(
+        &mut dyn FnMut() -> Result<(), ProfileClassifierError>,
+    ) -> Result<T, ProfileClassifierError>,
+    mut revalidate: impl FnMut() -> Result<(), VaultMountManagerError>,
+) -> Result<T, VaultMountManagerError> {
+    let mut manager_error = None;
+    let classified = {
+        let mut checkpoint = || match revalidate() {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                manager_error = Some(error);
+                Err(ProfileClassifierError::MediaChanged)
+            }
+        };
+        classify(&mut checkpoint)
+    };
+    if let Some(error) = manager_error {
+        return Err(error);
+    }
+    classified.map_err(map_profile_classifier_error)
+}
+
+fn with_mount_attestation_revalidation<T>(
+    mut revalidate: impl FnMut() -> Result<(), VaultMountManagerError>,
+    attest: impl FnOnce() -> Result<T, VaultMountManagerError>,
+) -> Result<T, VaultMountManagerError> {
+    revalidate()?;
+    let attestation = attest()?;
+    revalidate()?;
+    Ok(attestation)
+}
+
+fn map_blkid_probe_error(error: VaultMountManagerError) -> VaultMountManagerError {
+    match error {
+        VaultMountManagerError::ToolUnavailable
+        | VaultMountManagerError::OperationTimedOut
+        | VaultMountManagerError::CleanupFailed => error,
+        _ => VaultMountManagerError::UnsupportedFilesystem,
     }
 }
 
@@ -1662,6 +1960,7 @@ mod tests {
         Profile,
         Open,
         Mapping,
+        FailedOpenAbsent,
         Filesystem,
         Prepare,
         Mount,
@@ -1669,14 +1968,27 @@ mod tests {
         Attest,
         VerifyMount,
         Unmount,
+        VerifyUnmounted,
         VerifyMapping,
         Close,
+        ClosedAbsent,
     }
 
     #[derive(Default)]
     struct FakeState {
         steps: Vec<Step>,
         fail_at: Option<Step>,
+        cleanup_fail_at: Option<Step>,
+        mapping_absent: bool,
+        mapping_error: Option<VaultMountManagerError>,
+        absence_proof_fails: bool,
+        unmount_absence_proof_fails: bool,
+        close_absence_proof_fails: bool,
+        open_error: Option<VaultMountManagerError>,
+        pre_open_error: Option<VaultMountManagerError>,
+        pre_mount_error: Option<VaultMountManagerError>,
+        pre_open_calls: usize,
+        pre_mount_calls: usize,
     }
 
     #[derive(Clone)]
@@ -1686,7 +1998,7 @@ mod tests {
         fn step(&self, step: Step) -> Result<(), VaultMountManagerError> {
             let mut state = self.0.lock().expect("fake state lock");
             state.steps.push(step);
-            if state.fail_at == Some(step) {
+            if state.fail_at == Some(step) || state.cleanup_fail_at == Some(step) {
                 Err(VaultMountManagerError::MountVerificationFailed)
             } else {
                 Ok(())
@@ -1721,13 +2033,27 @@ mod tests {
             ))
         }
 
+        fn pre_open_revalidate(
+            &mut self,
+            _device: &BlockDevice,
+        ) -> Result<(), VaultMountManagerError> {
+            let mut state = self.0.lock().expect("fake state lock");
+            state.pre_open_calls += 1;
+            state.pre_open_error.map_or(Ok(()), Err)
+        }
+
         fn open_luks2(
             &mut self,
             _device: &BlockDevice,
             _mapper: &MapperName,
             _passphrase: OwnedFd,
         ) -> Result<(), VaultMountManagerError> {
-            self.step(Step::Open)
+            self.step(Step::Open)?;
+            self.0
+                .lock()
+                .expect("fake state lock")
+                .open_error
+                .map_or(Ok(()), Err)
         }
 
         fn inspect_mapping(
@@ -1738,6 +2064,12 @@ mod tests {
             _header: HeaderIdentity,
         ) -> Result<MappingIdentity, VaultMountManagerError> {
             self.step(Step::Mapping)?;
+            if let Some(error) = self.0.lock().expect("fake state lock").mapping_error {
+                return Err(error);
+            }
+            if self.0.lock().expect("fake state lock").mapping_absent {
+                return Err(VaultMountManagerError::MappingVerificationFailed);
+            }
             Ok(MappingIdentity {
                 descriptor: dummy_fd(),
                 command_path: PathBuf::from("/proc/1/fd/9"),
@@ -1749,7 +2081,41 @@ mod tests {
                 backing_major: 7,
                 backing_minor: 8,
                 capacity_sectors: VAULT_PAYLOAD_BYTES / 512,
+                logical_sector_bytes: LOGICAL_SECTOR_BYTES,
             })
+        }
+
+        fn verify_failed_open_absence(
+            &mut self,
+            _device: &BlockDevice,
+            _mapper: &MapperName,
+            _mapper_path: &Path,
+        ) -> Result<(), VaultMountManagerError> {
+            self.step(Step::FailedOpenAbsent)?;
+            if self.0.lock().expect("fake state lock").absence_proof_fails {
+                Err(VaultMountManagerError::CleanupFailed)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn verify_closed_mapping_absence(
+            &mut self,
+            _device: &BlockDevice,
+            _mapper: &MapperName,
+            _mapper_path: &Path,
+        ) -> Result<(), VaultMountManagerError> {
+            self.step(Step::ClosedAbsent)?;
+            if self
+                .0
+                .lock()
+                .expect("fake state lock")
+                .close_absence_proof_fails
+            {
+                Err(VaultMountManagerError::CleanupFailed)
+            } else {
+                Ok(())
+            }
         }
 
         fn inspect_filesystem(
@@ -1765,6 +2131,18 @@ mod tests {
 
         fn prepare_mount_root(&mut self, _root: &Path) -> Result<(), VaultMountManagerError> {
             self.step(Step::Prepare)
+        }
+
+        fn pre_mount_revalidate(
+            &mut self,
+            _device: &BlockDevice,
+            _mapper: &MapperName,
+            _mapping: &MappingIdentity,
+            _header: HeaderIdentity,
+        ) -> Result<(), VaultMountManagerError> {
+            let mut state = self.0.lock().expect("fake state lock");
+            state.pre_mount_calls += 1;
+            state.pre_mount_error.map_or(Ok(()), Err)
         }
 
         fn mount_ext4(
@@ -1824,6 +2202,25 @@ mod tests {
             self.step(Step::Unmount)
         }
 
+        fn verify_unmounted(
+            &mut self,
+            _request: &ResolvedRequest,
+            _header: HeaderIdentity,
+            _mapping: &MappingIdentity,
+        ) -> Result<(), VaultMountManagerError> {
+            self.step(Step::VerifyUnmounted)?;
+            if self
+                .0
+                .lock()
+                .expect("fake state lock")
+                .unmount_absence_proof_fails
+            {
+                Err(VaultMountManagerError::CleanupFailed)
+            } else {
+                Ok(())
+            }
+        }
+
         fn verify_cleanup_mapping(
             &mut self,
             _device: &BlockDevice,
@@ -1858,6 +2255,7 @@ mod tests {
                 rdev: rfs::makedev(7, 8),
                 disk_sequence: 12,
                 capacity_sectors: 524_288,
+                logical_sector_bytes: LOGICAL_SECTOR_BYTES,
                 located_identity: None,
             },
             mapper: MapperName::parse("kernaid-vault-0123456789abcdef").expect("mapper"),
@@ -1939,6 +2337,58 @@ mod tests {
             fs::read(&named).expect("read named replacement"),
             b"replacement"
         );
+        let retained_stat = rfs::fstat(&retained).expect("stat retained original");
+        let replacement_stat =
+            rfs::statat(CWD, &named, AtFlags::SYMLINK_NOFOLLOW).expect("stat named replacement");
+        assert_ne!(
+            (retained_stat.st_dev, retained_stat.st_ino),
+            (replacement_stat.st_dev, replacement_stat.st_ino),
+            "the pre/post named-path checkpoint detects the replacement"
+        );
+    }
+
+    #[test]
+    fn source_identity_rechecks_are_descriptor_only_and_exact() {
+        let expected = LocatedVaultIdentity {
+            parent_major: 8,
+            parent_minor: 16,
+            partition_major: 8,
+            partition_minor: 19,
+            disk_sequence: 77,
+            logical_sector_bytes: LOGICAL_SECTOR_BYTES,
+            media_sector_count: 62_500_000,
+            start_lba: VAULT_START_LBA,
+            sector_count: VAULT_SECTOR_COUNT,
+        };
+        let exact = DescriptorBlockIdentity {
+            disk_sequence: expected.disk_sequence,
+            sector_count: expected.sector_count,
+            logical_sector_bytes: expected.logical_sector_bytes,
+        };
+        assert!(source_identity_matches_location(exact, expected));
+        for mismatch in [
+            DescriptorBlockIdentity {
+                disk_sequence: 78,
+                ..exact
+            },
+            DescriptorBlockIdentity {
+                sector_count: exact.sector_count + 1,
+                ..exact
+            },
+            DescriptorBlockIdentity {
+                logical_sector_bytes: 4096,
+                ..exact
+            },
+        ] {
+            assert!(!source_identity_matches_location(mismatch, expected));
+        }
+
+        let source = include_str!("mount_manager.rs");
+        let sysfs_sequence_read = ["join(", "\"disk", "seq\"", ")"].concat();
+        let sysfs_capacity_read = ["join(", "\"si", "ze\"", ")"].concat();
+        assert!(!source.contains(&sysfs_sequence_read));
+        assert!(!source.contains(&sysfs_capacity_read));
+        assert!(!source.contains(&["block_device_kernel_", "identity"].concat()));
     }
 
     #[test]
@@ -1951,6 +2401,7 @@ mod tests {
             VaultMountManagerError::InvalidMapperName,
             VaultMountManagerError::Unprovisioned,
             VaultMountManagerError::ProfileMismatch,
+            VaultMountManagerError::ClassifierUnavailable,
             VaultMountManagerError::InvalidLuks2Header,
             VaultMountManagerError::WrongVaultLabel,
             VaultMountManagerError::MapperConflict,
@@ -1977,7 +2428,108 @@ mod tests {
     }
 
     #[test]
+    fn filesystem_probe_preserves_tool_timeout_and_cleanup_failures() {
+        assert_eq!(
+            map_bounded_process_error(bounded_process::BoundedProcessError::StartFailed),
+            VaultMountManagerError::ToolUnavailable,
+            "a spawn failure proves that the mutator never ran"
+        );
+        assert_eq!(
+            map_bounded_process_error(bounded_process::BoundedProcessError::WaitFailed),
+            VaultMountManagerError::MappingVerificationFailed,
+            "a wait failure can follow mutation and requires inspection"
+        );
+        for error in [
+            VaultMountManagerError::ToolUnavailable,
+            VaultMountManagerError::OperationTimedOut,
+            VaultMountManagerError::CleanupFailed,
+        ] {
+            assert_eq!(map_blkid_probe_error(error), error);
+        }
+        assert_eq!(
+            map_blkid_probe_error(VaultMountManagerError::MappingVerificationFailed),
+            VaultMountManagerError::UnsupportedFilesystem
+        );
+        assert_eq!(
+            map_profile_classifier_error(ProfileClassifierError::InvalidCanonicalProfile),
+            VaultMountManagerError::ClassifierUnavailable
+        );
+    }
+
+    #[test]
+    fn profile_callbacks_preserve_timeout_and_cleanup_failures() {
+        for expected in [
+            VaultMountManagerError::ToolUnavailable,
+            VaultMountManagerError::OperationTimedOut,
+            VaultMountManagerError::CleanupFailed,
+        ] {
+            let first_checkpoint = with_profile_revalidation(
+                |checkpoint| {
+                    checkpoint()?;
+                    Ok(())
+                },
+                || Err(expected),
+            );
+            assert_eq!(first_checkpoint, Err(expected));
+
+            let mut calls = 0_u8;
+            let later_checkpoint = with_profile_revalidation(
+                |checkpoint| {
+                    checkpoint()?;
+                    checkpoint()?;
+                    Ok(())
+                },
+                || {
+                    calls += 1;
+                    if calls == 1 { Ok(()) } else { Err(expected) }
+                },
+            );
+            assert_eq!(later_checkpoint, Err(expected));
+        }
+    }
+
+    #[test]
+    fn mount_attestation_preserves_pre_and_post_revalidation_failures() {
+        for expected in [
+            VaultMountManagerError::ToolUnavailable,
+            VaultMountManagerError::OperationTimedOut,
+            VaultMountManagerError::CleanupFailed,
+        ] {
+            assert_eq!(
+                with_mount_attestation_revalidation(|| Err(expected), || Ok(())),
+                Err(expected)
+            );
+
+            let mut calls = 0_u8;
+            assert_eq!(
+                with_mount_attestation_revalidation(
+                    || {
+                        calls += 1;
+                        if calls == 1 { Ok(()) } else { Err(expected) }
+                    },
+                    || Ok(())
+                ),
+                Err(expected)
+            );
+        }
+    }
+
+    #[test]
     fn parsers_reject_ambiguous_identity_data() {
+        assert_eq!(
+            require_mapper_path_absent(Err(rustix::io::Errno::NOENT)),
+            Ok(())
+        );
+        for observed in [
+            Ok(()),
+            Err(rustix::io::Errno::ACCESS),
+            Err(rustix::io::Errno::IO),
+        ] {
+            assert_eq!(
+                require_mapper_path_absent(observed),
+                Err(VaultMountManagerError::MapperConflict)
+            );
+        }
         assert_eq!(
             parse_uuid_line(b"a9950603-ffce-492a-b082-43fba5c492a1\n"),
             Some(*b"a9950603-ffce-492a-b082-43fba5c492a1")
@@ -2062,8 +2614,10 @@ mod tests {
                 Step::Attest,
                 Step::VerifyMount,
                 Step::Unmount,
+                Step::VerifyUnmounted,
                 Step::VerifyMapping,
                 Step::Close,
+                Step::ClosedAbsent,
             ]
         );
     }
@@ -2073,6 +2627,7 @@ mod tests {
         let state = Arc::new(Mutex::new(FakeState {
             steps: Vec::new(),
             fail_at: Some(Step::Open),
+            ..FakeState::default()
         }));
         assert_eq!(
             start_fake(Arc::clone(&state)).err(),
@@ -2088,8 +2643,191 @@ mod tests {
                 Step::Mapping,
                 Step::VerifyMapping,
                 Step::Close,
+                Step::ClosedAbsent,
             ]
         );
+    }
+
+    #[test]
+    fn wrong_pass_is_reported_only_after_exact_mapper_absence_proof() {
+        let proven_absent = Arc::new(Mutex::new(FakeState {
+            mapping_absent: true,
+            open_error: Some(VaultMountManagerError::UnlockFailed),
+            ..FakeState::default()
+        }));
+        assert_eq!(
+            start_fake(Arc::clone(&proven_absent)).err(),
+            Some(VaultMountManagerError::UnlockFailed)
+        );
+        assert_eq!(
+            proven_absent.lock().expect("state").steps,
+            vec![
+                Step::DeviceUnused,
+                Step::MapperAbsent,
+                Step::Profile,
+                Step::Open,
+                Step::Mapping,
+                Step::FailedOpenAbsent,
+            ]
+        );
+
+        let ambiguous = Arc::new(Mutex::new(FakeState {
+            mapping_absent: true,
+            absence_proof_fails: true,
+            open_error: Some(VaultMountManagerError::UnlockFailed),
+            ..FakeState::default()
+        }));
+        assert_eq!(
+            start_fake(Arc::clone(&ambiguous)).err(),
+            Some(VaultMountManagerError::CleanupFailed)
+        );
+        assert_eq!(
+            ambiguous.lock().expect("state").steps,
+            vec![
+                Step::DeviceUnused,
+                Step::MapperAbsent,
+                Step::Profile,
+                Step::Open,
+                Step::Mapping,
+                Step::FailedOpenAbsent,
+            ]
+        );
+    }
+
+    #[test]
+    fn mapping_inspection_operational_failures_dominate_wrong_pass() {
+        for mapping_error in [
+            VaultMountManagerError::ToolUnavailable,
+            VaultMountManagerError::OperationTimedOut,
+            VaultMountManagerError::CleanupFailed,
+        ] {
+            let state = Arc::new(Mutex::new(FakeState {
+                mapping_error: Some(mapping_error),
+                open_error: Some(VaultMountManagerError::UnlockFailed),
+                ..FakeState::default()
+            }));
+            assert_eq!(start_fake(Arc::clone(&state)).err(), Some(mapping_error));
+            let absence_checked = state
+                .lock()
+                .expect("state")
+                .steps
+                .contains(&Step::FailedOpenAbsent);
+            assert_eq!(
+                absence_checked,
+                mapping_error != VaultMountManagerError::CleanupFailed,
+                "a child cleanup ambiguity must dominate before further inspection"
+            );
+        }
+
+        for mapping_error in [
+            VaultMountManagerError::ToolUnavailable,
+            VaultMountManagerError::OperationTimedOut,
+        ] {
+            let state = Arc::new(Mutex::new(FakeState {
+                mapping_error: Some(mapping_error),
+                open_error: Some(VaultMountManagerError::CleanupFailed),
+                ..FakeState::default()
+            }));
+            assert_eq!(
+                start_fake(Arc::clone(&state)).err(),
+                Some(VaultMountManagerError::CleanupFailed)
+            );
+            assert_eq!(
+                state.lock().expect("state").steps,
+                vec![
+                    Step::DeviceUnused,
+                    Step::MapperAbsent,
+                    Step::Profile,
+                    Step::Open,
+                ],
+                "an unreaped cryptsetup child forbids mapper inspection or close"
+            );
+        }
+        assert_eq!(
+            dominant_open_inspection_error(
+                VaultMountManagerError::OperationTimedOut,
+                VaultMountManagerError::ToolUnavailable,
+            ),
+            VaultMountManagerError::OperationTimedOut
+        );
+    }
+
+    #[test]
+    fn pre_mutation_start_failure_never_inspects_or_closes_a_mapper() {
+        let state = Arc::new(Mutex::new(FakeState {
+            open_error: Some(VaultMountManagerError::ToolUnavailable),
+            ..FakeState::default()
+        }));
+        assert_eq!(
+            start_fake(Arc::clone(&state)).err(),
+            Some(VaultMountManagerError::ToolUnavailable)
+        );
+        assert_eq!(
+            state.lock().expect("state").steps,
+            vec![
+                Step::DeviceUnused,
+                Step::MapperAbsent,
+                Step::Profile,
+                Step::Open,
+            ],
+            "a child that never started cannot confer mapper ownership"
+        );
+    }
+
+    #[test]
+    fn pre_open_revalidation_failure_never_claims_mapper_ownership() {
+        for expected in [
+            VaultMountManagerError::InvalidBlockDevice,
+            VaultMountManagerError::OperationTimedOut,
+        ] {
+            let state = Arc::new(Mutex::new(FakeState {
+                pre_open_error: Some(expected),
+                ..FakeState::default()
+            }));
+            assert_eq!(start_fake(Arc::clone(&state)).err(), Some(expected));
+            let observed = state.lock().expect("state");
+            assert_eq!(observed.pre_open_calls, 1);
+            assert_eq!(observed.pre_mount_calls, 0);
+            assert_eq!(
+                observed.steps,
+                vec![Step::DeviceUnused, Step::MapperAbsent, Step::Profile],
+                "a read-only failure before spawn must not inspect or close a mapper"
+            );
+        }
+    }
+
+    #[test]
+    fn pre_mount_revalidation_failure_never_claims_mount_ownership() {
+        for expected in [
+            VaultMountManagerError::InvalidBlockDevice,
+            VaultMountManagerError::OperationTimedOut,
+        ] {
+            let state = Arc::new(Mutex::new(FakeState {
+                pre_mount_error: Some(expected),
+                ..FakeState::default()
+            }));
+            assert_eq!(start_fake(Arc::clone(&state)).err(), Some(expected));
+            let observed = state.lock().expect("state");
+            assert_eq!(observed.pre_open_calls, 1);
+            assert_eq!(observed.pre_mount_calls, 1);
+            assert_eq!(
+                observed.steps,
+                vec![
+                    Step::DeviceUnused,
+                    Step::MapperAbsent,
+                    Step::Profile,
+                    Step::Open,
+                    Step::Mapping,
+                    Step::Profile,
+                    Step::Filesystem,
+                    Step::Prepare,
+                    Step::VerifyMapping,
+                    Step::Close,
+                    Step::ClosedAbsent,
+                ],
+                "a read-only failure before mount must close only the owned mapper"
+            );
+        }
     }
 
     #[test]
@@ -2097,6 +2835,7 @@ mod tests {
         let state = Arc::new(Mutex::new(FakeState {
             steps: Vec::new(),
             fail_at: Some(Step::Filesystem),
+            ..FakeState::default()
         }));
         assert_eq!(
             start_fake(Arc::clone(&state)).err(),
@@ -2114,6 +2853,7 @@ mod tests {
                 Step::Filesystem,
                 Step::VerifyMapping,
                 Step::Close,
+                Step::ClosedAbsent,
             ]
         );
     }
@@ -2123,6 +2863,7 @@ mod tests {
         let state = Arc::new(Mutex::new(FakeState {
             steps: Vec::new(),
             fail_at: Some(Step::Attest),
+            ..FakeState::default()
         }));
         assert_eq!(
             start_fake(Arc::clone(&state)).err(),
@@ -2145,9 +2886,94 @@ mod tests {
                 Step::Attest,
                 Step::VerifyMount,
                 Step::Unmount,
+                Step::VerifyUnmounted,
                 Step::VerifyMapping,
                 Step::Close,
+                Step::ClosedAbsent,
             ]
+        );
+    }
+
+    #[test]
+    fn cleanup_failure_dominates_every_post_mutator_primary_error() {
+        let state = Arc::new(Mutex::new(FakeState {
+            fail_at: Some(Step::Attest),
+            cleanup_fail_at: Some(Step::Unmount),
+            ..FakeState::default()
+        }));
+        assert_eq!(
+            start_fake(Arc::clone(&state)).err(),
+            Some(VaultMountManagerError::CleanupFailed)
+        );
+        let steps = &state.lock().expect("state").steps;
+        assert!(steps.contains(&Step::Attest));
+        assert!(steps.contains(&Step::VerifyMount));
+        assert!(steps.contains(&Step::Unmount));
+        assert!(!steps.contains(&Step::Close));
+        assert_eq!(
+            steps.iter().filter(|step| **step == Step::Unmount).count(),
+            1,
+            "Drop must not silently retry cleanup after reporting its ambiguity"
+        );
+    }
+
+    #[test]
+    fn mount_mutator_error_runs_explicit_verified_cleanup() {
+        let state = Arc::new(Mutex::new(FakeState {
+            fail_at: Some(Step::Mount),
+            ..FakeState::default()
+        }));
+        assert_eq!(
+            start_fake(Arc::clone(&state)).err(),
+            Some(VaultMountManagerError::MountVerificationFailed)
+        );
+        let steps = &state.lock().expect("state").steps;
+        assert!(steps.contains(&Step::Mount));
+        assert!(steps.contains(&Step::VerifyMount));
+        assert!(steps.contains(&Step::Unmount));
+        assert!(steps.contains(&Step::VerifyUnmounted));
+        assert!(steps.contains(&Step::VerifyMapping));
+        assert!(steps.contains(&Step::Close));
+        assert!(steps.contains(&Step::ClosedAbsent));
+    }
+
+    #[test]
+    fn successful_unmount_requires_a_double_checked_absence_postcondition() {
+        let state = Arc::new(Mutex::new(FakeState {
+            unmount_absence_proof_fails: true,
+            ..FakeState::default()
+        }));
+        let mut activation = start_fake(Arc::clone(&state)).expect("activate");
+        assert_eq!(
+            activation.cleanup(),
+            Err(VaultMountManagerError::CleanupFailed)
+        );
+        drop(activation);
+        let steps = &state.lock().expect("state").steps;
+        assert!(steps.contains(&Step::Unmount));
+        assert!(steps.contains(&Step::VerifyUnmounted));
+        assert!(!steps.contains(&Step::Close));
+    }
+
+    #[test]
+    fn successful_close_requires_a_double_checked_absence_postcondition() {
+        let state = Arc::new(Mutex::new(FakeState {
+            close_absence_proof_fails: true,
+            ..FakeState::default()
+        }));
+        let mut activation = start_fake(Arc::clone(&state)).expect("activate");
+        assert_eq!(
+            activation.cleanup(),
+            Err(VaultMountManagerError::CleanupFailed)
+        );
+        drop(activation);
+        let steps = &state.lock().expect("state").steps;
+        assert!(steps.contains(&Step::Close));
+        assert!(steps.contains(&Step::ClosedAbsent));
+        assert_eq!(
+            steps.iter().filter(|step| **step == Step::Close).count(),
+            1,
+            "Drop must not retry an ambiguous close"
         );
     }
 
@@ -2156,16 +2982,18 @@ mod tests {
         let state = Arc::new(Mutex::new(FakeState {
             steps: Vec::new(),
             fail_at: Some(Step::Unmount),
+            ..FakeState::default()
         }));
         let mut activation = start_fake(Arc::clone(&state)).expect("activate");
         assert!(activation.cleanup().is_err());
-        // Prevent Drop from retrying so this assertion describes one cleanup attempt.
-        activation.mounted = false;
-        activation.mapping_open = false;
         drop(activation);
         let steps = &state.lock().expect("state").steps;
         assert!(steps.contains(&Step::Unmount));
         assert!(!steps.contains(&Step::Close));
+        assert_eq!(
+            steps.iter().filter(|step| **step == Step::Unmount).count(),
+            1
+        );
     }
 
     #[test]
@@ -2173,15 +3001,21 @@ mod tests {
         let state = Arc::new(Mutex::new(FakeState {
             steps: Vec::new(),
             fail_at: Some(Step::VerifyMount),
+            ..FakeState::default()
         }));
         let mut activation = start_fake(Arc::clone(&state)).expect("activate");
         assert!(activation.cleanup().is_err());
-        activation.mounted = false;
-        activation.mapping_open = false;
         drop(activation);
         let steps = &state.lock().expect("state").steps;
         assert!(steps.contains(&Step::VerifyMount));
         assert!(!steps.contains(&Step::Unmount));
         assert!(!steps.contains(&Step::Close));
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|step| **step == Step::VerifyMount)
+                .count(),
+            1
+        );
     }
 }

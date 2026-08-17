@@ -13,12 +13,14 @@ use std::{
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const TERMINATION_GRACE: Duration = Duration::from_millis(250);
 const KILL_GRACE: Duration = Duration::from_secs(1);
+const MAX_STDOUT_READS_PER_POLL: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BoundedProcessError {
     Unavailable,
     StartFailed,
     WaitFailed,
+    OutputLimitExceeded,
     TimedOut,
     UnexpectedDescendant,
     CleanupFailed,
@@ -27,7 +29,6 @@ pub(crate) enum BoundedProcessError {
 pub(crate) struct CapturedOutput {
     pub(crate) bytes: Vec<u8>,
     pub(crate) status: ExitStatus,
-    pub(crate) exceeded_limit: bool,
 }
 
 pub(crate) fn capture(
@@ -37,7 +38,7 @@ pub(crate) fn capture(
 ) -> Result<CapturedOutput, BoundedProcessError> {
     let capture_limit = maximum_bytes
         .checked_add(1)
-        .ok_or(BoundedProcessError::StartFailed)?;
+        .ok_or(BoundedProcessError::OutputLimitExceeded)?;
     let (mut child, process_group) = spawn_isolated(command)?;
     let Some(mut stdout) = child.stdout.take() else {
         return Err(cleanup_or(
@@ -70,7 +71,14 @@ pub(crate) fn capture(
     let mut stdout_closed = false;
     let mut buffer = [0_u8; 1024];
     loop {
-        loop {
+        for _ in 0..MAX_STDOUT_READS_PER_POLL {
+            if Instant::now() >= deadline {
+                return Err(cleanup_or(
+                    &mut child,
+                    process_group,
+                    BoundedProcessError::TimedOut,
+                ));
+            }
             match stdout.read(&mut buffer) {
                 Ok(0) => {
                     stdout_closed = true;
@@ -80,6 +88,13 @@ pub(crate) fn capture(
                     if captured.len() < capture_limit {
                         let remaining = capture_limit - captured.len();
                         captured.extend_from_slice(&buffer[..read.min(remaining)]);
+                    }
+                    if captured.len() == capture_limit {
+                        return Err(cleanup_or(
+                            &mut child,
+                            process_group,
+                            BoundedProcessError::OutputLimitExceeded,
+                        ));
                     }
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
@@ -115,7 +130,6 @@ pub(crate) fn capture(
                 ));
             }
             return Ok(CapturedOutput {
-                exceeded_limit: captured.len() > maximum_bytes,
                 bytes: captured,
                 status,
             });
@@ -199,7 +213,11 @@ fn cleanup_or(
     process_group: Pid,
     error: BoundedProcessError,
 ) -> BoundedProcessError {
-    if terminate_process_group(child, process_group) {
+    cleanup_outcome(terminate_process_group(child, process_group), error)
+}
+
+fn cleanup_outcome(cleaned: bool, error: BoundedProcessError) -> BoundedProcessError {
+    if cleaned {
         error
     } else {
         BoundedProcessError::CleanupFailed
@@ -209,18 +227,56 @@ fn cleanup_or(
 fn terminate_process_group(child: &mut Child, process_group: Pid) -> bool {
     let _ = rustix::process::kill_process_group(process_group, Signal::TERM);
     let term_deadline = Instant::now() + TERMINATION_GRACE;
-    while Instant::now() < term_deadline && process_group_exists(process_group) == Ok(true) {
-        let _ = child.try_wait();
-        thread::sleep(POLL_INTERVAL);
+    if poll_cleanup_until(child, process_group, term_deadline) {
+        return true;
     }
-    if process_group_exists(process_group) != Ok(false) {
-        let _ = rustix::process::kill_process_group(process_group, Signal::KILL);
-        let kill_deadline = Instant::now() + KILL_GRACE;
-        while Instant::now() < kill_deadline && process_group_exists(process_group) == Ok(true) {
-            let _ = child.try_wait();
-            thread::sleep(POLL_INTERVAL);
+
+    let _ = rustix::process::kill_process_group(process_group, Signal::KILL);
+    // A trusted fixed child should remain in its process group, but kill the
+    // direct child as well so a group change cannot make ownership ambiguous.
+    let _ = child.kill();
+    let kill_deadline = Instant::now() + KILL_GRACE;
+    poll_cleanup_until(child, process_group, kill_deadline)
+}
+
+fn poll_cleanup_until(child: &mut Child, process_group: Pid, deadline: Instant) -> bool {
+    loop {
+        let child_reaped = match child.try_wait() {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(_) => return false,
+        };
+        let group_absent = match process_group_exists(process_group) {
+            Ok(exists) => !exists,
+            Err(()) => return false,
+        };
+        if child_reaped && group_absent {
+            return true;
         }
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return false;
+        };
+        if remaining.is_zero() {
+            return false;
+        }
+        thread::sleep(POLL_INTERVAL.min(remaining));
     }
-    let _ = child.wait();
-    process_group_exists(process_group) == Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_ambiguity_is_terminal_and_never_uses_blocking_wait() {
+        assert_eq!(
+            cleanup_outcome(false, BoundedProcessError::TimedOut),
+            BoundedProcessError::CleanupFailed
+        );
+        let blocking_wait = ["child", ".wait()"].concat();
+        assert!(
+            !include_str!("bounded_process.rs").contains(&blocking_wait),
+            "cleanup must use only deadline-bounded try_wait polling"
+        );
+    }
 }

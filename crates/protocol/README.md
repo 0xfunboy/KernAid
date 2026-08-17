@@ -36,7 +36,35 @@ allowed while faulted; every other operation returns `REBOOT_REQUIRED`.
 
 The server derives the caller PID and UID with `SO_PEERCRED` on the connected
 seqpacket socket. `PeerAllowlist` maps two distinct non-root UIDs to
-`companion` and `agent`; neither identity is accepted from JSON.
+`companion` and `agent`; neither identity is accepted from JSON. A
+companion-only allowlist is available for deployments that do not yet run an
+Agent identity. Authentication returns a non-cloneable borrowed connection
+capability, not a copyable identity assertion. Requests and rejection contexts
+carry a private per-authentication token and kernel socket identity; responses
+can be sent only through the capability that received that record.
+
+The Linux transport helpers require a connected, non-listening AF_UNIX
+`SOCK_SEQPACKET` socket whose descriptor has `CLOEXEC`, plus a caller-supplied
+hard monotonic deadline. They use nonblocking `sendmsg`/`recvmsg` with bounded
+`poll`, reject truncated records, truncated ancillary data, recognized
+credentials control messages, and more than one passed descriptor, and receive
+descriptors with `CLOEXEC` set. Sends use `MSG_NOSIGNAL` and must complete one
+whole record. Received descriptors are owned and close on every rejection
+path. The raw record functions and decoders are crate-private. The only public
+exchange methods are on connection capabilities: the client first
+authenticates the server as UID 0 with `SO_PEERCRED`, and the server first
+authenticates the allowlisted peer. Every authentication, send, and receive
+boundary revalidates socket type, connection state, kernel identity, and
+`CLOEXEC`.
+
+Every receiving endpoint must keep ancillary-generating options not modelled
+by `rustix` 1.1 disabled: notably `SO_PASSPIDFD`, `SO_PASSSEC`, and socket
+timestamping. `rustix` filters unknown control-message kinds before this crate
+can observe them; a generated `SCM_PIDFD` would otherwise leave an unowned
+descriptor. The daemon inherits this policy from its root-owned listener, and
+the client creates its endpoint with these options disabled. The shipping
+systemd socket configuration must preserve this default-off precondition and
+its tests must reject any future opt-in.
 
 | Operation | Allowed caller | Request FD | Success FD |
 | --- | --- | --- | --- |
@@ -105,6 +133,7 @@ rejections retain a `RejectedRequestContext`, which makes the otherwise closed
 `NOT_AUTHORIZED`, `FD_REQUIRED`, and `FD_FORBIDDEN` responses reachable without
 reflecting untrusted correlation data.
 
-This crate currently provides the codec, authorization and FD contract only.
-It does not create a listening socket, daemon, vault mount, unlock flow, secret
+This crate currently provides the codec, authorization and FD contract plus
+strict Linux record transport and typed client request/response helpers. It
+does not create a listening socket, daemon, vault mount, unlock flow, secret
 store, provider process, or UI endpoint.

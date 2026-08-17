@@ -7,19 +7,23 @@
 //! device or path parameter.
 
 use crate::bounded_process;
-use rustix::fs::{self as rfs, FileType, Mode, OFlags};
+#[cfg(feature = "experimental-vault-manager")]
+use crate::profile_classifier::{
+    ProfileClassifierError, VaultPartitionProfile, classify_partition_with_timeout,
+};
+use rustix::fs::{self as rfs, AtFlags, CWD, FileType, Mode, OFlags};
 use std::{
     collections::BTreeMap,
     error::Error,
     ffi::{OsStr, OsString},
     fmt, fs, io,
     os::{
-        fd::{AsFd, BorrowedFd, OwnedFd},
+        fd::{AsFd, AsRawFd, BorrowedFd},
         unix::{ffi::OsStrExt, fs::FileExt},
     },
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const LIVE_MEDIUM_MOUNT: &[u8] = b"/run/live/medium";
@@ -27,6 +31,9 @@ const ISO9660: &[u8] = b"iso9660";
 const BLOCKDEV_PATH: &str = "/usr/sbin/blockdev";
 const BLOCKDEV_TIMEOUT: Duration = Duration::from_secs(2);
 const BLOCKDEV_OUTPUT_LIMIT: usize = 64;
+const KERNEL_SECTOR_BYTES: u64 = 512;
+#[cfg(feature = "experimental-vault-manager")]
+const MAX_CLASSIFICATION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const MAX_MOUNTINFO_BYTES: usize = 256 * 1024;
 const MAX_MOUNTINFO_LINES: usize = 4096;
 const MAX_MOUNTINFO_LINE_BYTES: usize = 4096;
@@ -68,6 +75,49 @@ pub struct LocatedVaultPartition {
     device_name: OsString,
 }
 
+/// Read-only classification of the exact retained vault partition.
+#[cfg(feature = "experimental-vault-manager")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocatedVaultClassification {
+    /// Every byte in the fixed partition capability is zero.
+    Unprovisioned,
+    /// Both redundant LUKS2 headers match the pinned outer profile.
+    Locked,
+}
+
+/// Closed failures from descriptor-bound read-only classification.
+#[cfg(feature = "experimental-vault-manager")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocatedVaultClassificationError {
+    InvalidDeadline,
+    ClassifierUnavailable,
+    MediaChanged,
+    ProfileMismatch,
+    BlockIdentityUnavailable,
+    ToolUnavailable,
+    OperationTimedOut,
+    CleanupFailed,
+}
+
+#[cfg(feature = "experimental-vault-manager")]
+impl fmt::Display for LocatedVaultClassificationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidDeadline => "the vault classification deadline is invalid",
+            Self::ClassifierUnavailable => "the pinned vault classifier is unavailable",
+            Self::MediaChanged => "the Rescue vault partition changed during classification",
+            Self::ProfileMismatch => "the Rescue vault partition profile does not match",
+            Self::BlockIdentityUnavailable => "the Rescue vault block identity is unavailable",
+            Self::ToolUnavailable => "required read-only block identity tool is unavailable",
+            Self::OperationTimedOut => "vault profile inspection timed out",
+            Self::CleanupFailed => "the read-only identity probe could not be cleaned up",
+        })
+    }
+}
+
+#[cfg(feature = "experimental-vault-manager")]
+impl Error for LocatedVaultClassificationError {}
+
 impl fmt::Debug for LocatedVaultPartition {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -89,6 +139,87 @@ impl LocatedVaultPartition {
         self.descriptor
     }
 
+    /// Classify this exact retained partition without opening, mounting or
+    /// writing it. The caller supplies a non-zero checkpoint deadline capped
+    /// at ten minutes; descriptor identity is revalidated throughout the
+    /// scan. Synchronous kernel block reads can return after that deadline if
+    /// the device stalls in uninterruptible I/O; timeout is reported as soon
+    /// as control returns to user space.
+    #[cfg(feature = "experimental-vault-manager")]
+    pub fn classify_read_only(
+        &self,
+        timeout: Duration,
+    ) -> Result<LocatedVaultClassification, LocatedVaultClassificationError> {
+        let deadline = classification_deadline(timeout)?;
+        self.validate_classification_identity(deadline)?;
+        let scan_timeout = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(LocatedVaultClassificationError::OperationTimedOut)?;
+        let mut checkpoint_failure = None;
+        let result = classify_partition_with_timeout(&self.descriptor, scan_timeout, || {
+            if Instant::now() >= deadline {
+                checkpoint_failure = Some(LocatedVaultClassificationError::OperationTimedOut);
+                return Err(ProfileClassifierError::OperationTimedOut);
+            }
+            if validate_block_descriptor(
+                &self.descriptor,
+                (self.identity.partition_major, self.identity.partition_minor),
+            )
+            .is_err()
+            {
+                checkpoint_failure = Some(LocatedVaultClassificationError::MediaChanged);
+                return Err(ProfileClassifierError::MediaChanged);
+            }
+            Ok(())
+        });
+        if let Some(error) = checkpoint_failure {
+            return Err(error);
+        }
+        if result != Err(ProfileClassifierError::OperationTimedOut) {
+            self.validate_classification_identity(deadline)?;
+        }
+        match result {
+            Ok(VaultPartitionProfile::Unprovisioned) => {
+                Ok(LocatedVaultClassification::Unprovisioned)
+            }
+            Ok(VaultPartitionProfile::Locked(_)) => Ok(LocatedVaultClassification::Locked),
+            Ok(VaultPartitionProfile::ProfileMismatch) => {
+                Err(LocatedVaultClassificationError::ProfileMismatch)
+            }
+            Err(ProfileClassifierError::InvalidCanonicalProfile) => {
+                Err(LocatedVaultClassificationError::ClassifierUnavailable)
+            }
+            Err(
+                ProfileClassifierError::InvalidDescriptor | ProfileClassifierError::MediaChanged,
+            ) => Err(LocatedVaultClassificationError::MediaChanged),
+            Err(ProfileClassifierError::OperationTimedOut) => {
+                Err(LocatedVaultClassificationError::OperationTimedOut)
+            }
+        }
+    }
+
+    #[cfg(feature = "experimental-vault-manager")]
+    fn validate_classification_identity(
+        &self,
+        deadline: Instant,
+    ) -> Result<(), LocatedVaultClassificationError> {
+        validate_block_descriptor(
+            &self.descriptor,
+            (self.identity.partition_major, self.identity.partition_minor),
+        )
+        .map_err(|_| LocatedVaultClassificationError::MediaChanged)?;
+        let observed = descriptor_block_identity_until(&self.descriptor, deadline)
+            .map_err(map_classification_identity_error)?;
+        if observed.disk_sequence != self.identity.disk_sequence
+            || observed.sector_count != self.identity.sector_count
+            || observed.logical_sector_bytes != self.identity.logical_sector_bytes
+        {
+            return Err(LocatedVaultClassificationError::MediaChanged);
+        }
+        Ok(())
+    }
+
     /// Transfers the sealed locator result to the experimental mount manager.
     ///
     /// The validated kernel device name remains crate-private: neither an IPC
@@ -97,6 +228,39 @@ impl LocatedVaultPartition {
     #[cfg(feature = "experimental-vault-manager")]
     pub(crate) fn into_manager_parts(self) -> (fs::File, LocatedVaultIdentity, OsString) {
         (self.descriptor, self.identity, self.device_name)
+    }
+}
+
+#[cfg(feature = "experimental-vault-manager")]
+fn classification_deadline(timeout: Duration) -> Result<Instant, LocatedVaultClassificationError> {
+    if timeout.is_zero() || timeout > MAX_CLASSIFICATION_TIMEOUT {
+        return Err(LocatedVaultClassificationError::InvalidDeadline);
+    }
+    Instant::now()
+        .checked_add(timeout)
+        .ok_or(LocatedVaultClassificationError::InvalidDeadline)
+}
+
+#[cfg(feature = "experimental-vault-manager")]
+fn map_classification_identity_error(
+    error: DescriptorBlockIdentityError,
+) -> LocatedVaultClassificationError {
+    match error {
+        DescriptorBlockIdentityError::InvalidDescriptor => {
+            LocatedVaultClassificationError::MediaChanged
+        }
+        DescriptorBlockIdentityError::IdentityUnavailable => {
+            LocatedVaultClassificationError::BlockIdentityUnavailable
+        }
+        DescriptorBlockIdentityError::ToolUnavailable => {
+            LocatedVaultClassificationError::ToolUnavailable
+        }
+        DescriptorBlockIdentityError::OperationTimedOut => {
+            LocatedVaultClassificationError::OperationTimedOut
+        }
+        DescriptorBlockIdentityError::CleanupFailed => {
+            LocatedVaultClassificationError::CleanupFailed
+        }
     }
 }
 
@@ -130,6 +294,8 @@ pub enum BootVaultLocatorError {
     BlockDeviceUnavailable,
     BlockIdentityUnavailable,
     ToolUnavailable,
+    OperationTimedOut,
+    CleanupFailed,
 }
 
 impl fmt::Display for BootVaultLocatorError {
@@ -146,7 +312,31 @@ impl fmt::Display for BootVaultLocatorError {
             Self::BlockDeviceUnavailable => "Rescue vault block device is unavailable",
             Self::BlockIdentityUnavailable => "Rescue vault block identity is unavailable",
             Self::ToolUnavailable => "required read-only block identity tool is unavailable",
+            Self::OperationTimedOut => "Rescue vault block identity inspection timed out",
+            Self::CleanupFailed => "Rescue vault block identity probe could not be cleaned up",
         })
+    }
+}
+
+impl BootVaultLocatorError {
+    /// Stable, redacted category for the privileged service boundary.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::BootMediumAbsent => "boot-medium-absent",
+            Self::AmbiguousBootMedium => "ambiguous-boot-medium",
+            Self::UnsupportedBootMedium => "unsupported-boot-medium",
+            Self::VaultPartitionAbsent => "vault-partition-absent",
+            Self::AmbiguousVaultPartition => "ambiguous-vault-partition",
+            Self::InvalidKernelIdentity => "invalid-kernel-identity",
+            Self::InvalidVaultGeometry => "invalid-vault-geometry",
+            Self::MediaChanged => "media-changed",
+            Self::BlockDeviceUnavailable => "block-device-unavailable",
+            Self::BlockIdentityUnavailable => "block-identity-unavailable",
+            Self::ToolUnavailable => "tool-unavailable",
+            Self::OperationTimedOut => "operation-timed-out",
+            Self::CleanupFailed => "cleanup-failed",
+        }
     }
 }
 
@@ -697,8 +887,9 @@ fn validate_open_descriptors(
 ) -> Result<(), BootVaultLocatorError> {
     validate_block_descriptor(parent, candidate.parent_major_minor)?;
     validate_block_descriptor(partition, candidate.partition_major_minor)?;
-    let parent_identity = descriptor_block_identity(parent)?;
-    let partition_identity = descriptor_block_identity(partition)?;
+    let parent_identity = descriptor_block_identity(parent).map_err(map_locator_identity_error)?;
+    let partition_identity =
+        descriptor_block_identity(partition).map_err(map_locator_identity_error)?;
     if parent_identity.disk_sequence != candidate.disk_sequence
         || partition_identity.disk_sequence != candidate.disk_sequence
         || parent_identity.logical_sector_bytes != candidate.logical_sector_bytes
@@ -712,60 +903,314 @@ fn validate_open_descriptors(
     Ok(())
 }
 
-#[derive(Clone, Copy)]
-struct DescriptorBlockIdentity {
-    disk_sequence: u64,
-    sector_count: u64,
-    logical_sector_bytes: u64,
+fn map_locator_identity_error(error: DescriptorBlockIdentityError) -> BootVaultLocatorError {
+    match error {
+        DescriptorBlockIdentityError::ToolUnavailable => BootVaultLocatorError::ToolUnavailable,
+        DescriptorBlockIdentityError::OperationTimedOut => BootVaultLocatorError::OperationTimedOut,
+        DescriptorBlockIdentityError::CleanupFailed => BootVaultLocatorError::CleanupFailed,
+        DescriptorBlockIdentityError::InvalidDescriptor
+        | DescriptorBlockIdentityError::IdentityUnavailable => {
+            BootVaultLocatorError::BlockIdentityUnavailable
+        }
+    }
 }
 
-fn descriptor_block_identity(
-    descriptor: &fs::File,
-) -> Result<DescriptorBlockIdentity, BootVaultLocatorError> {
-    Ok(DescriptorBlockIdentity {
-        disk_sequence: blockdev_u64(descriptor, "--getdiskseq")?,
-        sector_count: blockdev_u64(descriptor, "--getsz")?,
-        logical_sector_bytes: blockdev_u64(descriptor, "--getss")?,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DescriptorBlockIdentity {
+    pub(crate) disk_sequence: u64,
+    pub(crate) sector_count: u64,
+    pub(crate) logical_sector_bytes: u64,
+}
+
+#[cfg(feature = "experimental-vault-manager")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DescriptorBlockGeometry {
+    pub(crate) sector_count: u64,
+    pub(crate) logical_sector_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DescriptorBlockIdentityError {
+    InvalidDescriptor,
+    IdentityUnavailable,
+    ToolUnavailable,
+    OperationTimedOut,
+    CleanupFailed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DescriptorObject {
+    device: u64,
+    inode: u64,
+    rdev: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockdevQuery {
+    DiskSequence,
+    SizeBytes,
+    LogicalSectorBytes,
+}
+
+impl BlockdevQuery {
+    fn argument(self) -> &'static str {
+        match self {
+            Self::DiskSequence => "--getdiskseq",
+            Self::SizeBytes => "--getsize64",
+            Self::LogicalSectorBytes => "--getss",
+        }
+    }
+}
+
+pub(crate) fn descriptor_block_identity(
+    descriptor: &(impl AsFd + AsRawFd),
+) -> Result<DescriptorBlockIdentity, DescriptorBlockIdentityError> {
+    descriptor_block_identity_with_deadline(descriptor, aggregate_blockdev_deadline(None)?)
+}
+
+#[cfg(feature = "experimental-vault-manager")]
+fn descriptor_block_identity_until(
+    descriptor: &(impl AsFd + AsRawFd),
+    deadline: Instant,
+) -> Result<DescriptorBlockIdentity, DescriptorBlockIdentityError> {
+    descriptor_block_identity_with_deadline(
+        descriptor,
+        aggregate_blockdev_deadline(Some(deadline))?,
+    )
+}
+
+fn descriptor_block_identity_with_deadline(
+    descriptor: &(impl AsFd + AsRawFd),
+    deadline: Instant,
+) -> Result<DescriptorBlockIdentity, DescriptorBlockIdentityError> {
+    ensure_blockdev_deadline(deadline)?;
+    let procfd = descriptor_procfd_path(descriptor)?;
+    let before = validate_descriptor_procfd(descriptor, &procfd)?;
+    let identity = query_descriptor_block_identity_until(&procfd, deadline, blockdev_query)?;
+    let after = validate_descriptor_procfd(descriptor, &procfd)?;
+    ensure_blockdev_deadline(deadline)?;
+    if after != before {
+        return Err(DescriptorBlockIdentityError::InvalidDescriptor);
+    }
+    Ok(identity)
+}
+
+#[cfg(feature = "experimental-vault-manager")]
+pub(crate) fn descriptor_block_geometry(
+    descriptor: &(impl AsFd + AsRawFd),
+) -> Result<DescriptorBlockGeometry, DescriptorBlockIdentityError> {
+    let deadline = aggregate_blockdev_deadline(None)?;
+    let procfd = descriptor_procfd_path(descriptor)?;
+    let before = validate_descriptor_procfd(descriptor, &procfd)?;
+    let geometry = query_descriptor_block_geometry_until(&procfd, deadline, blockdev_query)?;
+    let after = validate_descriptor_procfd(descriptor, &procfd)?;
+    ensure_blockdev_deadline(deadline)?;
+    if after != before {
+        return Err(DescriptorBlockIdentityError::InvalidDescriptor);
+    }
+    Ok(geometry)
+}
+
+fn aggregate_blockdev_deadline(
+    outer_deadline: Option<Instant>,
+) -> Result<Instant, DescriptorBlockIdentityError> {
+    let local_deadline = Instant::now()
+        .checked_add(BLOCKDEV_TIMEOUT)
+        .ok_or(DescriptorBlockIdentityError::OperationTimedOut)?;
+    let deadline = outer_deadline.map_or(local_deadline, |outer| outer.min(local_deadline));
+    ensure_blockdev_deadline(deadline)?;
+    Ok(deadline)
+}
+
+fn remaining_blockdev_timeout(deadline: Instant) -> Result<Duration, DescriptorBlockIdentityError> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or(DescriptorBlockIdentityError::OperationTimedOut)
+}
+
+fn ensure_blockdev_deadline(deadline: Instant) -> Result<(), DescriptorBlockIdentityError> {
+    remaining_blockdev_timeout(deadline).map(|_| ())
+}
+
+fn query_descriptor_block_identity_until(
+    procfd: &Path,
+    deadline: Instant,
+    mut query: impl FnMut(&Path, BlockdevQuery, Duration) -> Result<u64, DescriptorBlockIdentityError>,
+) -> Result<DescriptorBlockIdentity, DescriptorBlockIdentityError> {
+    let identity = consistent_descriptor_block_identity(|operation| {
+        query(procfd, operation, remaining_blockdev_timeout(deadline)?)
+    })?;
+    ensure_blockdev_deadline(deadline)?;
+    Ok(identity)
+}
+
+#[cfg(feature = "experimental-vault-manager")]
+fn query_descriptor_block_geometry_until(
+    procfd: &Path,
+    deadline: Instant,
+    mut query: impl FnMut(&Path, BlockdevQuery, Duration) -> Result<u64, DescriptorBlockIdentityError>,
+) -> Result<DescriptorBlockGeometry, DescriptorBlockIdentityError> {
+    let geometry = consistent_descriptor_block_geometry(|operation| {
+        query(procfd, operation, remaining_blockdev_timeout(deadline)?)
+    })?;
+    ensure_blockdev_deadline(deadline)?;
+    Ok(geometry)
+}
+
+fn descriptor_procfd_path(
+    descriptor: &impl AsRawFd,
+) -> Result<PathBuf, DescriptorBlockIdentityError> {
+    let descriptor_number = descriptor.as_raw_fd();
+    if descriptor_number < 0 {
+        return Err(DescriptorBlockIdentityError::InvalidDescriptor);
+    }
+    Ok(PathBuf::from(format!(
+        "/proc/{}/fd/{descriptor_number}",
+        std::process::id()
+    )))
+}
+
+fn validate_descriptor_procfd(
+    descriptor: &(impl AsFd + AsRawFd),
+    procfd: &Path,
+) -> Result<DescriptorObject, DescriptorBlockIdentityError> {
+    let observed =
+        rfs::fstat(descriptor).map_err(|_| DescriptorBlockIdentityError::InvalidDescriptor)?;
+    let procfd_observed = rfs::statat(CWD, procfd, AtFlags::empty())
+        .map_err(|_| DescriptorBlockIdentityError::InvalidDescriptor)?;
+    let status = rfs::fcntl_getfl(descriptor)
+        .map_err(|_| DescriptorBlockIdentityError::InvalidDescriptor)?;
+    let descriptor_flags = rustix::io::fcntl_getfd(descriptor)
+        .map_err(|_| DescriptorBlockIdentityError::InvalidDescriptor)?;
+    if !FileType::from_raw_mode(observed.st_mode).is_block_device()
+        || !FileType::from_raw_mode(procfd_observed.st_mode).is_block_device()
+        || observed.st_dev != procfd_observed.st_dev
+        || observed.st_ino != procfd_observed.st_ino
+        || observed.st_rdev != procfd_observed.st_rdev
+        || status & OFlags::ACCMODE != OFlags::RDONLY
+        || !status.contains(OFlags::NONBLOCK)
+        || !descriptor_flags.contains(rustix::io::FdFlags::CLOEXEC)
+    {
+        return Err(DescriptorBlockIdentityError::InvalidDescriptor);
+    }
+    Ok(DescriptorObject {
+        device: observed.st_dev,
+        inode: observed.st_ino,
+        rdev: observed.st_rdev,
     })
 }
 
-/// util-linux performs BLKGETDISKSEQ/BLKGETSIZE/BLKSSZGET on fd 0 reached
-/// through a fixed procfd name. `Command` maps a CLOEXEC duplicate to fd 0;
-/// no mutable pathname or inherited ambient descriptor is handed to it.
-fn blockdev_u64(
-    descriptor: &fs::File,
-    operation: &'static str,
-) -> Result<u64, BootVaultLocatorError> {
-    let input: OwnedFd = rustix::io::fcntl_dupfd_cloexec(descriptor, 3)
-        .map_err(|_| BootVaultLocatorError::BlockIdentityUnavailable)?;
-    let mut command = Command::new(BLOCKDEV_PATH);
+fn consistent_descriptor_block_identity(
+    mut query: impl FnMut(BlockdevQuery) -> Result<u64, DescriptorBlockIdentityError>,
+) -> Result<DescriptorBlockIdentity, DescriptorBlockIdentityError> {
+    let disk_sequence_before = query(BlockdevQuery::DiskSequence)?;
+    let size_bytes_before = query(BlockdevQuery::SizeBytes)?;
+    let logical_sector_bytes_before = query(BlockdevQuery::LogicalSectorBytes)?;
+    let logical_sector_bytes_after = query(BlockdevQuery::LogicalSectorBytes)?;
+    let size_bytes_after = query(BlockdevQuery::SizeBytes)?;
+    let disk_sequence_after = query(BlockdevQuery::DiskSequence)?;
+    if disk_sequence_before == 0
+        || size_bytes_before == 0
+        || logical_sector_bytes_before == 0
+        || disk_sequence_after != disk_sequence_before
+        || size_bytes_after != size_bytes_before
+        || logical_sector_bytes_after != logical_sector_bytes_before
+        || size_bytes_before % KERNEL_SECTOR_BYTES != 0
+    {
+        return Err(DescriptorBlockIdentityError::IdentityUnavailable);
+    }
+    Ok(DescriptorBlockIdentity {
+        disk_sequence: disk_sequence_before,
+        sector_count: size_bytes_before / KERNEL_SECTOR_BYTES,
+        logical_sector_bytes: logical_sector_bytes_before,
+    })
+}
+
+#[cfg(feature = "experimental-vault-manager")]
+fn consistent_descriptor_block_geometry(
+    mut query: impl FnMut(BlockdevQuery) -> Result<u64, DescriptorBlockIdentityError>,
+) -> Result<DescriptorBlockGeometry, DescriptorBlockIdentityError> {
+    let size_bytes_before = query(BlockdevQuery::SizeBytes)?;
+    let logical_sector_bytes_before = query(BlockdevQuery::LogicalSectorBytes)?;
+    let logical_sector_bytes_after = query(BlockdevQuery::LogicalSectorBytes)?;
+    let size_bytes_after = query(BlockdevQuery::SizeBytes)?;
+    if size_bytes_before == 0
+        || logical_sector_bytes_before == 0
+        || size_bytes_after != size_bytes_before
+        || logical_sector_bytes_after != logical_sector_bytes_before
+        || size_bytes_before % KERNEL_SECTOR_BYTES != 0
+    {
+        return Err(DescriptorBlockIdentityError::IdentityUnavailable);
+    }
+    Ok(DescriptorBlockGeometry {
+        sector_count: size_bytes_before / KERNEL_SECTOR_BYTES,
+        logical_sector_bytes: logical_sector_bytes_before,
+    })
+}
+
+/// util-linux performs BLKGETDISKSEQ, BLKGETSIZE64 and BLKSSZGET only on the
+/// retained parent-process procfd. The executable, operation arguments,
+/// aggregate deadline and output bound are fixed in production; each child
+/// receives only the budget remaining from the one shared deadline.
+fn blockdev_query(
+    procfd: &Path,
+    query: BlockdevQuery,
+    timeout: Duration,
+) -> Result<u64, DescriptorBlockIdentityError> {
+    run_blockdev_query(Path::new(BLOCKDEV_PATH), procfd, query, timeout)
+}
+
+#[cfg(test)]
+fn test_blockdev_query(
+    program: &Path,
+    procfd: &Path,
+    query: BlockdevQuery,
+    timeout: Duration,
+) -> Result<u64, DescriptorBlockIdentityError> {
+    run_blockdev_query(program, procfd, query, timeout)
+}
+
+fn run_blockdev_query(
+    program: &Path,
+    procfd: &Path,
+    query: BlockdevQuery,
+    timeout: Duration,
+) -> Result<u64, DescriptorBlockIdentityError> {
+    let mut command = Command::new(program);
     command
-        .arg(operation)
-        .arg("/proc/self/fd/0")
+        .arg(query.argument())
+        .arg(procfd)
         .env_clear()
         .env("LC_ALL", "C")
-        .stdin(Stdio::from(input))
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let output = bounded_process::capture(&mut command, BLOCKDEV_TIMEOUT, BLOCKDEV_OUTPUT_LIMIT)
-        .map_err(|error| match error {
-            bounded_process::BoundedProcessError::Unavailable => {
-                BootVaultLocatorError::ToolUnavailable
+    let output = bounded_process::capture(&mut command, timeout, BLOCKDEV_OUTPUT_LIMIT).map_err(
+        |error| match error {
+            bounded_process::BoundedProcessError::Unavailable
+            | bounded_process::BoundedProcessError::StartFailed => {
+                DescriptorBlockIdentityError::ToolUnavailable
             }
-            bounded_process::BoundedProcessError::StartFailed
-            | bounded_process::BoundedProcessError::WaitFailed
-            | bounded_process::BoundedProcessError::TimedOut
-            | bounded_process::BoundedProcessError::UnexpectedDescendant
-            | bounded_process::BoundedProcessError::CleanupFailed => {
-                BootVaultLocatorError::BlockIdentityUnavailable
+            bounded_process::BoundedProcessError::TimedOut => {
+                DescriptorBlockIdentityError::OperationTimedOut
             }
-        })?;
-    if !output.status.success() || output.exceeded_limit {
-        return Err(BootVaultLocatorError::BlockIdentityUnavailable);
+            bounded_process::BoundedProcessError::CleanupFailed => {
+                DescriptorBlockIdentityError::CleanupFailed
+            }
+            bounded_process::BoundedProcessError::WaitFailed
+            | bounded_process::BoundedProcessError::OutputLimitExceeded
+            | bounded_process::BoundedProcessError::UnexpectedDescendant => {
+                DescriptorBlockIdentityError::IdentityUnavailable
+            }
+        },
+    )?;
+    if !output.status.success() {
+        return Err(DescriptorBlockIdentityError::IdentityUnavailable);
     }
     parse_u64(trim_line(&output.bytes))
         .filter(|value| *value > 0)
-        .ok_or(BootVaultLocatorError::BlockIdentityUnavailable)
+        .ok_or(DescriptorBlockIdentityError::IdentityUnavailable)
 }
 
 fn validate_mbr(parent: &fs::File) -> Result<(), BootVaultLocatorError> {
@@ -884,7 +1329,12 @@ fn read_exact_at(file: &fs::File, buffer: &mut [u8], offset: u64) -> io::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs::OpenOptions, os::unix::fs::symlink};
+    use std::{
+        collections::VecDeque,
+        fs::{File, OpenOptions},
+        os::unix::fs::{PermissionsExt, symlink},
+        time::Instant,
+    };
     use tempfile::TempDir;
 
     struct Fixture {
@@ -1124,6 +1574,264 @@ mod tests {
             Err(BootVaultLocatorError::InvalidVaultGeometry),
             "an overlapping p4 alias must not qualify as layout-v1"
         );
+    }
+
+    #[test]
+    fn descriptor_identity_rejects_inconsistent_diskseq_capacity_and_sector_size() {
+        fn observed(
+            values: [u64; 6],
+        ) -> Result<DescriptorBlockIdentity, DescriptorBlockIdentityError> {
+            let mut values = VecDeque::from(values);
+            consistent_descriptor_block_identity(|_| {
+                values
+                    .pop_front()
+                    .ok_or(DescriptorBlockIdentityError::IdentityUnavailable)
+            })
+        }
+
+        let size = VAULT_SECTOR_COUNT * KERNEL_SECTOR_BYTES;
+        assert_eq!(
+            observed([77, size, 512, 512, size, 77]),
+            Ok(DescriptorBlockIdentity {
+                disk_sequence: 77,
+                sector_count: VAULT_SECTOR_COUNT,
+                logical_sector_bytes: 512,
+            })
+        );
+        for inconsistent in [
+            [77, size, 512, 512, size, 78],
+            [77, size, 512, 512, size + 512, 77],
+            [77, size, 512, 4096, size, 77],
+        ] {
+            assert_eq!(
+                observed(inconsistent),
+                Err(DescriptorBlockIdentityError::IdentityUnavailable)
+            );
+        }
+
+        assert_eq!(
+            map_locator_identity_error(DescriptorBlockIdentityError::OperationTimedOut),
+            BootVaultLocatorError::OperationTimedOut
+        );
+        assert_eq!(
+            map_locator_identity_error(DescriptorBlockIdentityError::CleanupFailed),
+            BootVaultLocatorError::CleanupFailed
+        );
+        for error in [
+            BootVaultLocatorError::OperationTimedOut,
+            BootVaultLocatorError::CleanupFailed,
+        ] {
+            assert!(
+                error
+                    .code()
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'-')
+            );
+            assert!(!error.to_string().is_empty());
+        }
+    }
+
+    #[test]
+    #[ignore = "subprocess probe must run without parallel vault lock descriptors"]
+    fn fixed_blockdev_probe_uses_retained_procfd_after_named_path_swap() {
+        let fixture = tempfile::tempdir().expect("blockdev procfd fixture");
+        let named = fixture.path().join("selected-device");
+        let moved = fixture.path().join("original-device");
+        fs::write(&named, b"77\n").expect("write original identity");
+        let retained = File::open(&named).expect("retain original identity");
+        let procfd = descriptor_procfd_path(&retained).expect("retained procfd");
+        fs::rename(&named, &moved).expect("move original pathname");
+        fs::write(&named, b"99\n").expect("write pathname replacement");
+
+        let tool = fixture.path().join("mock-blockdev");
+        fs::write(
+            &tool,
+            b"#!/bin/sh\n[ \"$#\" -eq 2 ] || exit 90\n[ \"$1\" = --getdiskseq ] || exit 91\ncase \"$2\" in /proc/[0-9]*/fd/[0-9]*) ;; *) exit 92 ;; esac\nexec /usr/bin/cat \"$2\"\n",
+        )
+        .expect("write blockdev mock");
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o700))
+            .expect("make blockdev mock executable");
+
+        assert_eq!(
+            test_blockdev_query(
+                &tool,
+                &procfd,
+                BlockdevQuery::DiskSequence,
+                Duration::from_secs(1),
+            ),
+            Ok(77)
+        );
+        assert_eq!(fs::read(named).expect("read replacement"), b"99\n");
+    }
+
+    #[test]
+    #[ignore = "subprocess probe must run without parallel vault lock descriptors"]
+    fn fixed_blockdev_probe_ignores_sysfs_spoof_and_bounds_timeout_cleanup() {
+        let fixture = tempfile::tempdir().expect("blockdev command fixture");
+        let descriptor_path = fixture.path().join("retained");
+        fs::write(&descriptor_path, b"descriptor").expect("write retained fixture");
+        let retained = File::open(&descriptor_path).expect("open retained fixture");
+        let procfd = descriptor_procfd_path(&retained).expect("retained procfd");
+        let spoofed_sysfs = fixture.path().join("sys/dev/block/7:3");
+        fs::create_dir_all(&spoofed_sysfs).expect("create spoofed sysfs");
+        fs::write(spoofed_sysfs.join("diskseq"), b"999\n").expect("spoof diskseq");
+        fs::write(spoofed_sysfs.join("size"), b"1\n").expect("spoof size");
+
+        let fixed = fixture.path().join("fixed-blockdev");
+        fs::write(
+            &fixed,
+            b"#!/bin/sh\n[ \"$#\" -eq 2 ] || exit 90\ncase \"$2\" in /proc/[0-9]*/fd/[0-9]*) ;; *) exit 91 ;; esac\ncase \"$1\" in --getdiskseq) echo 77 ;; --getsize64) echo 8589934592 ;; --getss) echo 512 ;; *) exit 92 ;; esac\n",
+        )
+        .expect("write fixed blockdev mock");
+        fs::set_permissions(&fixed, fs::Permissions::from_mode(0o700))
+            .expect("make fixed blockdev mock executable");
+        let identity = consistent_descriptor_block_identity(|query| {
+            test_blockdev_query(&fixed, &procfd, query, Duration::from_secs(1))
+        })
+        .expect("descriptor-only identity");
+        assert_eq!(identity.disk_sequence, 77);
+        assert_eq!(identity.sector_count, VAULT_SECTOR_COUNT);
+        fs::remove_dir_all(fixture.path().join("sys")).expect("remove spoofed sysfs");
+        assert_eq!(
+            consistent_descriptor_block_identity(|query| {
+                test_blockdev_query(&fixed, &procfd, query, Duration::from_secs(1))
+            }),
+            Ok(identity),
+            "sysfs absence cannot alter the descriptor-only probe"
+        );
+
+        let oversized = fixture.path().join("oversized-blockdev");
+        fs::write(
+            &oversized,
+            b"#!/bin/sh\nprintf 11111111111111111111111111111111111111111111111111111111111111111\n",
+        )
+        .expect("write oversized mock");
+        fs::set_permissions(&oversized, fs::Permissions::from_mode(0o700))
+            .expect("make oversized mock executable");
+        assert_eq!(
+            test_blockdev_query(
+                &oversized,
+                &procfd,
+                BlockdevQuery::SizeBytes,
+                Duration::from_secs(1),
+            ),
+            Err(DescriptorBlockIdentityError::IdentityUnavailable)
+        );
+
+        let descendant_pid = fixture.path().join("descendant.pid");
+        let timeout_tool = fixture.path().join("timeout-blockdev");
+        fs::write(
+            &timeout_tool,
+            format!(
+                "#!/bin/sh\ntrap '' TERM\n/usr/bin/sleep 30 &\nprintf '%s' \"$!\" > '{}'\nprintf ready\nwait\n",
+                descendant_pid.display()
+            ),
+        )
+        .expect("write timeout mock");
+        fs::set_permissions(&timeout_tool, fs::Permissions::from_mode(0o700))
+            .expect("make timeout mock executable");
+        let started = Instant::now();
+        assert_eq!(
+            test_blockdev_query(
+                &timeout_tool,
+                &procfd,
+                BlockdevQuery::SizeBytes,
+                Duration::from_millis(100),
+            ),
+            Err(DescriptorBlockIdentityError::OperationTimedOut)
+        );
+        assert!(started.elapsed() < Duration::from_secs(3));
+        let descendant: i32 = fs::read_to_string(descendant_pid)
+            .expect("read descendant pid")
+            .parse()
+            .expect("numeric descendant pid");
+        let descendant = rustix::process::Pid::from_raw(descendant).expect("positive pid");
+        assert_eq!(
+            rustix::process::test_kill_process(descendant).err(),
+            Some(rustix::io::Errno::SRCH)
+        );
+    }
+
+    #[test]
+    #[ignore = "subprocess probe must run without parallel vault lock descriptors"]
+    fn repeated_blockdev_queries_share_one_aggregate_deadline() {
+        let fixture = tempfile::tempdir().expect("aggregate deadline fixture");
+        let descriptor_path = fixture.path().join("retained");
+        fs::write(&descriptor_path, b"descriptor").expect("write retained fixture");
+        let retained = File::open(&descriptor_path).expect("open retained fixture");
+        let procfd = descriptor_procfd_path(&retained).expect("retained procfd");
+        let calls = fixture.path().join("calls");
+        let tool = fixture.path().join("slow-blockdev");
+        fs::write(
+            &tool,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{}'\n/usr/bin/sleep 0.4\ncase \"$1\" in --getdiskseq) echo 77 ;; --getsize64) echo 8589934592 ;; --getss) echo 512 ;; *) exit 92 ;; esac\n",
+                calls.display()
+            ),
+        )
+        .expect("write slow blockdev mock");
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o700))
+            .expect("make slow blockdev mock executable");
+
+        let started = Instant::now();
+        let deadline = started
+            .checked_add(Duration::from_millis(750))
+            .expect("deadline");
+        assert_eq!(
+            query_descriptor_block_identity_until(&procfd, deadline, |path, query, timeout| {
+                test_blockdev_query(&tool, path, query, timeout)
+            },),
+            Err(DescriptorBlockIdentityError::OperationTimedOut)
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "six independent per-query budgets would exceed this aggregate bound"
+        );
+        assert_eq!(
+            fs::read_to_string(&calls)
+                .expect("read child calls")
+                .lines()
+                .count(),
+            2,
+            "the second child must receive only the first child's remaining budget"
+        );
+
+        #[cfg(feature = "experimental-vault-manager")]
+        {
+            fs::write(&calls, b"").expect("reset child calls");
+            let started = Instant::now();
+            let deadline = started
+                .checked_add(Duration::from_millis(750))
+                .expect("geometry deadline");
+            assert_eq!(
+                query_descriptor_block_geometry_until(&procfd, deadline, |path, query, timeout| {
+                    test_blockdev_query(&tool, path, query, timeout)
+                },),
+                Err(DescriptorBlockIdentityError::OperationTimedOut)
+            );
+            assert!(started.elapsed() < Duration::from_secs(2));
+            assert_eq!(
+                fs::read_to_string(&calls)
+                    .expect("read geometry child calls")
+                    .lines()
+                    .count(),
+                2
+            );
+        }
+    }
+
+    #[cfg(feature = "experimental-vault-manager")]
+    #[test]
+    fn classification_deadline_is_nonzero_and_capped() {
+        assert_eq!(
+            classification_deadline(Duration::ZERO).err(),
+            Some(LocatedVaultClassificationError::InvalidDeadline)
+        );
+        assert_eq!(
+            classification_deadline(MAX_CLASSIFICATION_TIMEOUT + Duration::from_nanos(1)).err(),
+            Some(LocatedVaultClassificationError::InvalidDeadline)
+        );
+        assert!(classification_deadline(Duration::from_secs(1)).is_ok());
     }
 
     #[test]

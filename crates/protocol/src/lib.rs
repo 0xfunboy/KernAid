@@ -3,6 +3,9 @@
 #[cfg(target_os = "linux")]
 pub mod rescue_vault;
 
+#[cfg(target_os = "linux")]
+pub mod rescue_vault_transport;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Risk {
     R0,

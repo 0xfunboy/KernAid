@@ -40,6 +40,8 @@ const ENVELOPE_PREFIX: &[u8] = b"kernaid-rescue-secret-v1:";
 const IDENTITY_SEED_BYTES: usize = 32;
 const MAX_ENVELOPE_BYTES: usize = 256;
 const MAX_MOUNTINFO_BYTES: u64 = 1024 * 1024;
+#[cfg(feature = "experimental-vault-manager")]
+const MAX_MOUNTINFO_LINES: usize = 4096;
 const MAX_DM_UUID_BYTES: u64 = 512;
 const MAX_DM_UUID_LENGTH: usize = 128;
 const DM_LUKS2_PREFIX: &[u8] = b"CRYPT-LUKS2-";
@@ -1550,6 +1552,86 @@ pub(crate) fn mint_managed_mount_attestation(
     })
 }
 
+/// Proves that neither the managed mountpoint nor the exact mapper device is
+/// present in this mount namespace after `umount(2)` returned success. The
+/// caller performs mapper-identity checkpoints around each invocation.
+#[cfg(feature = "experimental-vault-manager")]
+pub(crate) fn verify_managed_mount_absent(
+    root_path: &Path,
+    mapping_major: u32,
+    mapping_minor: u32,
+) -> Result<(), RescueSecretError> {
+    let root_path = normalize_absolute_root(root_path)?;
+    let root_fd = open_root(&root_path)?;
+    let descriptor_before =
+        rfs::fstat(&root_fd).map_err(|_| RescueSecretError::InvalidMountAttestation)?;
+    let named_before = rfs::statat(CWD, &root_path, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|_| RescueSecretError::InvalidMountAttestation)?;
+    if !FileType::from_raw_mode(descriptor_before.st_mode).is_dir()
+        || descriptor_before.st_dev != named_before.st_dev
+        || descriptor_before.st_ino != named_before.st_ino
+        || descriptor_before.st_dev == rfs::makedev(mapping_major, mapping_minor)
+    {
+        return Err(RescueSecretError::InvalidMountAttestation);
+    }
+
+    let mut mountinfo = Vec::new();
+    File::open("/proc/self/mountinfo")
+        .map_err(|_| RescueSecretError::InvalidMountAttestation)?
+        .take(MAX_MOUNTINFO_BYTES + 1)
+        .read_to_end(&mut mountinfo)
+        .map_err(|_| RescueSecretError::InvalidMountAttestation)?;
+    if mountinfo.len() as u64 > MAX_MOUNTINFO_BYTES {
+        return Err(RescueSecretError::InvalidMountAttestation);
+    }
+    verify_mountinfo_absence(
+        &mountinfo,
+        root_path.as_os_str().as_bytes(),
+        mapping_major,
+        mapping_minor,
+    )?;
+
+    let descriptor_after =
+        rfs::fstat(&root_fd).map_err(|_| RescueSecretError::InvalidMountAttestation)?;
+    let named_after = rfs::statat(CWD, &root_path, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|_| RescueSecretError::InvalidMountAttestation)?;
+    if descriptor_after.st_dev != descriptor_before.st_dev
+        || descriptor_after.st_ino != descriptor_before.st_ino
+        || named_after.st_dev != descriptor_before.st_dev
+        || named_after.st_ino != descriptor_before.st_ino
+    {
+        return Err(RescueSecretError::InvalidMountAttestation);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "experimental-vault-manager")]
+fn verify_mountinfo_absence(
+    mountinfo: &[u8],
+    root_path: &[u8],
+    mapping_major: u32,
+    mapping_minor: u32,
+) -> Result<(), RescueSecretError> {
+    let mut line_count = 0_usize;
+    for line in mountinfo
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        line_count = line_count
+            .checked_add(1)
+            .filter(|count| *count <= MAX_MOUNTINFO_LINES)
+            .ok_or(RescueSecretError::InvalidMountAttestation)?;
+        let entry =
+            parse_mountinfo_line(line)?.ok_or(RescueSecretError::InvalidMountAttestation)?;
+        if entry.mountpoint == root_path
+            || (entry.major == mapping_major && entry.minor == mapping_minor)
+        {
+            return Err(RescueSecretError::InvalidMountAttestation);
+        }
+    }
+    Ok(())
+}
+
 fn is_managed_mapper_name(name: &[u8; 30]) -> bool {
     name.starts_with(b"kernaid-vault-")
         && name[b"kernaid-vault-".len()..]
@@ -2768,6 +2850,23 @@ mod tests {
         )
         .is_err());
         assert!(parse_mountinfo_line(b"x 29 253:17 / /vault rw - ext4 /dev/dm-0 rw").is_err());
+    }
+
+    #[cfg(feature = "experimental-vault-manager")]
+    #[test]
+    fn unmount_postcondition_rejects_residual_mountpoint_or_mapper_device() {
+        let unrelated = b"40 29 8:1 / / rw - ext4 /dev/sda1 rw\n";
+        assert_eq!(
+            verify_mountinfo_absence(unrelated, b"/vault", 253, 17),
+            Ok(())
+        );
+
+        let residual_mountpoint = b"41 29 8:1 / /vault rw - ext4 /dev/sda1 rw\n";
+        assert!(verify_mountinfo_absence(residual_mountpoint, b"/vault", 253, 17).is_err());
+
+        let residual_mapper_elsewhere = b"42 29 253:17 / /elsewhere rw - ext4 /dev/dm-0 rw\n";
+        assert!(verify_mountinfo_absence(residual_mapper_elsewhere, b"/vault", 253, 17).is_err());
+        assert!(verify_mountinfo_absence(b"malformed\n", b"/vault", 253, 17).is_err());
     }
 
     #[test]

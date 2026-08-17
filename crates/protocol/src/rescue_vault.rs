@@ -5,11 +5,17 @@
 //! is always taken from `SO_PEERCRED`; a PID or UID in JSON would be attacker
 //! input and is therefore not part of the wire format.
 
+use crate::rescue_vault_transport::{
+    SeqpacketSocketIdentity, SeqpacketTransportError, ensure_deadline, recv_seqpacket,
+    send_seqpacket, validate_bound_seqpacket_socket, validate_seqpacket_socket,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use std::{
     fmt,
     os::fd::{BorrowedFd, OwnedFd},
+    sync::Arc,
+    time::Instant,
 };
 
 /// Exact version accepted on the Rescue vault socket.
@@ -45,11 +51,11 @@ pub const MAX_REPORTS_PER_RESPONSE: usize = 256;
 pub const SESSION_REPORT_MEDIA_TYPE: &str = "application/json";
 const PIPEFS_MAGIC: u64 = 0x5049_5045;
 
-/// The two unprivileged identities allowed to connect to the service.
+/// The unprivileged identities allowed to connect to the service.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PeerAllowlist {
     companion_uid: u32,
-    agent_uid: u32,
+    agent_uid: Option<u32>,
 }
 
 impl PeerAllowlist {
@@ -61,14 +67,26 @@ impl PeerAllowlist {
         }
         Ok(Self {
             companion_uid,
-            agent_uid,
+            agent_uid: Some(agent_uid),
+        })
+    }
+
+    /// Constructs the lifecycle-only allowlist used before an Agent service
+    /// exists. No UID can be authenticated as [`PeerRole::Agent`].
+    pub fn companion_only(companion_uid: u32) -> Result<Self, ProtocolViolation> {
+        if companion_uid == 0 {
+            return Err(ProtocolViolation::InvalidAllowlist);
+        }
+        Ok(Self {
+            companion_uid,
+            agent_uid: None,
         })
     }
 
     fn role_for(self, peer_uid: u32) -> Result<PeerRole, ProtocolViolation> {
         if peer_uid == self.companion_uid {
             Ok(PeerRole::Companion)
-        } else if peer_uid == self.agent_uid {
+        } else if self.agent_uid == Some(peer_uid) {
             Ok(PeerRole::Agent)
         } else {
             Err(ProtocolViolation::NotAuthorized)
@@ -83,27 +101,138 @@ pub enum PeerRole {
     Agent,
 }
 
-/// Peer identity minted only from `SO_PEERCRED` on a connected seqpacket
-/// socket. Its fields are private so request handlers cannot substitute an
-/// attacker-provided JSON PID or UID.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AuthenticatedPeer {
+/// An authenticated server-side connection to one allowlisted peer.
+///
+/// The socket borrow and kernel socket identity bind all received requests and
+/// emitted responses to this exact connection. The capability is deliberately
+/// neither `Clone` nor `Copy`.
+pub struct AuthenticatedPeer<'socket> {
+    socket: BorrowedFd<'socket>,
+    socket_identity: SeqpacketSocketIdentity,
+    connection_token: Arc<()>,
     pid: u32,
     uid: u32,
     role: PeerRole,
 }
 
-impl AuthenticatedPeer {
-    pub fn pid(self) -> u32 {
+impl fmt::Debug for AuthenticatedPeer<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthenticatedPeer")
+            .field("pid", &self.pid)
+            .field("uid", &self.uid)
+            .field("role", &self.role)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AuthenticatedPeer<'_> {
+    pub fn pid(&self) -> u32 {
         self.pid
     }
 
-    pub fn uid(self) -> u32 {
+    pub fn uid(&self) -> u32 {
         self.uid
     }
 
-    pub fn role(self) -> PeerRole {
+    pub fn role(&self) -> PeerRole {
         self.role
+    }
+
+    /// Receives, decodes, and authorizes one request from this exact peer.
+    pub fn receive_request(
+        &self,
+        deadline: Instant,
+    ) -> Result<ValidatedRequest, ServerReceiveError> {
+        ensure_deadline(deadline).map_err(ServerReceiveError::Transport)?;
+        validate_bound_seqpacket_socket(self.socket, self.socket_identity)
+            .map_err(ServerReceiveError::Transport)?;
+        let packet =
+            recv_seqpacket(self.socket, deadline).map_err(ServerReceiveError::Transport)?;
+        if packet.socket_identity() != self.socket_identity {
+            return Err(ServerReceiveError::Transport(
+                SeqpacketTransportError::InvalidTransport,
+            ));
+        }
+        let (datagram, descriptors) = packet.into_parts();
+        decode_request(
+            &datagram,
+            PeerIdentity {
+                pid: self.pid,
+                uid: self.uid,
+                role: self.role,
+                connection_identity: self.socket_identity,
+                connection_token: Arc::clone(&self.connection_token),
+            },
+            descriptors,
+        )
+        .map_err(ServerReceiveError::Decode)
+    }
+
+    /// Encodes and sends a success response on the connection that produced
+    /// `request`.
+    pub fn send_success(
+        &self,
+        request: &ValidatedRequest,
+        state_version: u64,
+        payload: &SuccessPayload,
+        output_descriptors: &[BorrowedFd<'_>],
+        deadline: Instant,
+    ) -> Result<(), ServerSendError> {
+        ensure_deadline(deadline).map_err(ServerSendError::Transport)?;
+        self.validate_response_binding(request.connection_identity, &request.connection_token)?;
+        let datagram = encode_success(request, state_version, payload, output_descriptors)
+            .map_err(ServerSendError::Protocol)?;
+        send_seqpacket(self.socket, &datagram, output_descriptors, deadline)
+            .map_err(ServerSendError::Transport)
+    }
+
+    /// Encodes and sends a closed-token error response on the connection that
+    /// produced `request`.
+    pub fn send_error(
+        &self,
+        request: &ValidatedRequest,
+        state_version: u64,
+        error: ErrorToken,
+        deadline: Instant,
+    ) -> Result<(), ServerSendError> {
+        ensure_deadline(deadline).map_err(ServerSendError::Transport)?;
+        self.validate_response_binding(request.connection_identity, &request.connection_token)?;
+        let datagram =
+            encode_error(request, state_version, error, &[]).map_err(ServerSendError::Protocol)?;
+        send_seqpacket(self.socket, &datagram, &[], deadline).map_err(ServerSendError::Transport)
+    }
+
+    /// Sends the sole correlated response allowed for an authenticated decode
+    /// rejection, on the same connection that produced it.
+    pub fn send_rejection(
+        &self,
+        rejected: &RejectedRequestContext,
+        state_version: u64,
+        deadline: Instant,
+    ) -> Result<(), ServerSendError> {
+        ensure_deadline(deadline).map_err(ServerSendError::Transport)?;
+        self.validate_response_binding(rejected.connection_identity, &rejected.connection_token)?;
+        let datagram =
+            encode_rejection(rejected, state_version).map_err(ServerSendError::Protocol)?;
+        send_seqpacket(self.socket, &datagram, &[], deadline).map_err(ServerSendError::Transport)
+    }
+
+    fn validate_response_binding(
+        &self,
+        connection_identity: SeqpacketSocketIdentity,
+        connection_token: &Arc<()>,
+    ) -> Result<(), ServerSendError> {
+        validate_bound_seqpacket_socket(self.socket, self.socket_identity)
+            .map_err(ServerSendError::Transport)?;
+        if connection_identity != self.socket_identity
+            || !Arc::ptr_eq(connection_token, &self.connection_token)
+        {
+            return Err(ServerSendError::Transport(
+                SeqpacketTransportError::InvalidTransport,
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -112,25 +241,29 @@ impl AuthenticatedPeer {
 pub fn authenticate_seqpacket_peer(
     socket: BorrowedFd<'_>,
     allowlist: PeerAllowlist,
-) -> Result<AuthenticatedPeer, ProtocolViolation> {
-    if rustix::net::sockopt::socket_domain(socket)
-        .map_err(|_| ProtocolViolation::InvalidTransport)?
-        != rustix::net::AddressFamily::UNIX
-        || rustix::net::sockopt::socket_type(socket)
-            .map_err(|_| ProtocolViolation::InvalidTransport)?
-            != rustix::net::SocketType::SEQPACKET
-    {
-        return Err(ProtocolViolation::InvalidTransport);
-    }
+) -> Result<AuthenticatedPeer<'_>, ProtocolViolation> {
+    let socket_identity =
+        validate_seqpacket_socket(socket).map_err(|_| ProtocolViolation::InvalidTransport)?;
     let credentials = rustix::net::sockopt::socket_peercred(socket)
         .map_err(|_| ProtocolViolation::InvalidTransport)?;
     let pid = credentials.pid.as_raw_nonzero().get() as u32;
     let uid = credentials.uid.as_raw();
     Ok(AuthenticatedPeer {
+        socket,
+        socket_identity,
+        connection_token: Arc::new(()),
         pid,
         uid,
         role: allowlist.role_for(uid)?,
     })
+}
+
+struct PeerIdentity {
+    pid: u32,
+    uid: u32,
+    role: PeerRole,
+    connection_identity: SeqpacketSocketIdentity,
+    connection_token: Arc<()>,
 }
 
 /// Closed request operation set. There is no command, path, or generic tool
@@ -184,6 +317,11 @@ impl Operation {
 pub struct RequestId(String);
 
 impl RequestId {
+    /// Reconstructs a request identifier with the exact wire grammar.
+    pub fn parse(value: &str) -> Result<Self, ProtocolViolation> {
+        parse_request_id(value)
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -349,6 +487,8 @@ pub struct ValidatedRequest {
     role: PeerRole,
     payload: RequestPayload,
     descriptors: Vec<OwnedFd>,
+    connection_identity: SeqpacketSocketIdentity,
+    connection_token: Arc<()>,
 }
 
 impl fmt::Debug for ValidatedRequest {
@@ -495,14 +635,65 @@ impl fmt::Display for RequestDecodeError {
 
 impl std::error::Error for RequestDecodeError {}
 
+/// Failure while receiving a request through an authenticated peer
+/// capability.
+#[derive(Debug)]
+pub enum ServerReceiveError {
+    Transport(SeqpacketTransportError),
+    Decode(RequestDecodeError),
+}
+
+impl fmt::Display for ServerReceiveError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Transport(error) => error.fmt(formatter),
+            Self::Decode(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for ServerReceiveError {}
+
+/// Failure while encoding or sending a response through an authenticated peer
+/// capability.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServerSendError {
+    Protocol(ProtocolViolation),
+    Transport(SeqpacketTransportError),
+}
+
+impl fmt::Display for ServerSendError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Protocol(error) => error.fmt(formatter),
+            Self::Transport(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for ServerSendError {}
+
 /// Correlation data retained for an authenticated protocol rejection. It has
 /// no payload, peer-supplied text or descriptor metadata.
-#[derive(Debug)]
 pub struct RejectedRequestContext {
     request_id: RequestId,
     operation: Operation,
     violation: ProtocolViolation,
     error: ErrorToken,
+    connection_identity: SeqpacketSocketIdentity,
+    connection_token: Arc<()>,
+}
+
+impl fmt::Debug for RejectedRequestContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RejectedRequestContext")
+            .field("request_id", &self.request_id)
+            .field("operation", &self.operation)
+            .field("violation", &self.violation)
+            .field("error", &self.error)
+            .finish()
+    }
 }
 
 impl RejectedRequestContext {
@@ -573,14 +764,14 @@ struct GetPayload {
     report_id: String,
 }
 
-/// Decodes and authorizes one complete request packet. `peer` can only be
-/// minted by [`authenticate_seqpacket_peer`] from `SO_PEERCRED`.
+/// Decodes and authorizes one complete request packet for an already-bound
+/// peer identity. The public entry point is [`AuthenticatedPeer::receive_request`].
 ///
 /// `received_descriptors` must be the exact set from this one seqpacket. The
 /// function consumes and closes them on every error.
-pub fn decode_request(
+fn decode_request(
     datagram: &[u8],
-    peer: AuthenticatedPeer,
+    peer: PeerIdentity,
     received_descriptors: Vec<OwnedFd>,
 ) -> Result<ValidatedRequest, RequestDecodeError> {
     if datagram.is_empty() {
@@ -608,6 +799,8 @@ pub fn decode_request(
             wire.operation,
             ProtocolViolation::NotAuthorized,
             ErrorToken::NotAuthorized,
+            peer.connection_identity,
+            Arc::clone(&peer.connection_token),
         ));
     }
 
@@ -621,6 +814,8 @@ pub fn decode_request(
             wire.operation,
             violation,
             error,
+            peer.connection_identity,
+            Arc::clone(&peer.connection_token),
         ));
     }
     Ok(ValidatedRequest {
@@ -632,6 +827,8 @@ pub fn decode_request(
         role: peer.role,
         payload,
         descriptors: received_descriptors,
+        connection_identity: peer.connection_identity,
+        connection_token: peer.connection_token,
     })
 }
 
@@ -640,12 +837,16 @@ fn rejected_request(
     operation: Operation,
     violation: ProtocolViolation,
     error: ErrorToken,
+    connection_identity: SeqpacketSocketIdentity,
+    connection_token: Arc<()>,
 ) -> RequestDecodeError {
     RequestDecodeError::Reject(RejectedRequestContext {
         request_id,
         operation,
         violation,
         error,
+        connection_identity,
+        connection_token,
     })
 }
 
@@ -932,7 +1133,7 @@ impl VaultStatusPayload {
         self.device_id.as_deref()
     }
 
-    fn is_exact(&self) -> bool {
+    pub(crate) fn is_exact(&self) -> bool {
         match (self.vault_state, self.device_id.as_deref()) {
             (VaultState::Unlocked, Some(device_id)) => {
                 kernaid_device_identity::validate_device_id(device_id).is_ok()
@@ -951,7 +1152,7 @@ impl VaultStatusPayload {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderStatusPayload {
     pub openai: ProviderState,
@@ -1060,7 +1261,7 @@ struct ReportResponse<'a> {
 
 /// Encodes one success packet only when its payload and ancillary descriptors
 /// exactly match the request operation.
-pub fn encode_success(
+fn encode_success(
     request: &ValidatedRequest,
     state_version: u64,
     payload: &SuccessPayload,
@@ -1140,7 +1341,7 @@ pub fn encode_success(
 }
 
 /// Encodes an error packet. Errors can never carry a descriptor or a message.
-pub fn encode_error(
+fn encode_error(
     request: &ValidatedRequest,
     state_version: u64,
     error: ErrorToken,
@@ -1170,7 +1371,7 @@ pub fn encode_error(
 /// Encodes the only response allowed for a decode-time rejection. Close-only
 /// failures intentionally have no such API because their correlation fields
 /// were not all trustworthy.
-pub fn encode_rejection(
+fn encode_rejection(
     rejected: &RejectedRequestContext,
     state_version: u64,
 ) -> Result<Vec<u8>, ProtocolViolation> {
@@ -1312,7 +1513,7 @@ fn validate_success(
     }
 }
 
-fn valid_report_list(reports: &[ReportSummary]) -> bool {
+pub(crate) fn valid_report_list(reports: &[ReportSummary]) -> bool {
     reports.len() <= MAX_REPORTS_PER_RESPONSE
         && reports.iter().enumerate().all(|(index, report)| {
             reports[..index]
@@ -1321,7 +1522,7 @@ fn valid_report_list(reports: &[ReportSummary]) -> bool {
         })
 }
 
-fn validate_borrowed_pipe(descriptor: BorrowedFd<'_>) -> Result<(), ProtocolViolation> {
+pub(crate) fn validate_borrowed_pipe(descriptor: BorrowedFd<'_>) -> Result<(), ProtocolViolation> {
     use rustix::fs::{self as rfs, FileType, OFlags};
 
     let stat = rfs::fstat(descriptor).map_err(|_| ProtocolViolation::InvalidDescriptor)?;
@@ -1342,7 +1543,9 @@ fn validate_borrowed_pipe(descriptor: BorrowedFd<'_>) -> Result<(), ProtocolViol
     Ok(())
 }
 
-fn validate_o_path_directory(descriptor: BorrowedFd<'_>) -> Result<(), ProtocolViolation> {
+pub(crate) fn validate_o_path_directory(
+    descriptor: BorrowedFd<'_>,
+) -> Result<(), ProtocolViolation> {
     use rustix::fs::{self as rfs, FileType, OFlags};
 
     let stat = rfs::fstat(descriptor).map_err(|_| ProtocolViolation::InvalidDescriptor)?;
@@ -1361,11 +1564,17 @@ fn validate_o_path_directory(descriptor: BorrowedFd<'_>) -> Result<(), ProtocolV
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rescue_vault_transport::{
+        ClientRequest, ClientRequestPayload, encode_client_request,
+    };
     use rustix::{
         fs::{CWD, Mode, OFlags},
         pipe::{PipeFlags, pipe_with},
     };
-    use std::os::fd::AsFd;
+    use std::{
+        os::fd::AsFd,
+        time::{Duration, Instant},
+    };
 
     const REQUEST_ID: &str = "R-12345678-1234-1234-1234-123456789abc";
     const DEVICE_ID: &str = "KA-0123456789abcdef01234567";
@@ -1374,17 +1583,22 @@ mod tests {
         PeerAllowlist::new(1000, 1001).expect("valid test allowlist")
     }
 
-    fn peer(uid: u32) -> AuthenticatedPeer {
-        AuthenticatedPeer {
+    fn peer(uid: u32) -> PeerIdentity {
+        PeerIdentity {
             pid: 4242,
             uid,
             role: allowlist().role_for(uid).expect("allowed test UID"),
+            connection_identity: SeqpacketSocketIdentity {
+                device: 7,
+                inode: 11,
+            },
+            connection_token: Arc::new(()),
         }
     }
 
     fn decode_request(
         datagram: &[u8],
-        peer: AuthenticatedPeer,
+        peer: PeerIdentity,
         descriptors: Vec<OwnedFd>,
     ) -> Result<ValidatedRequest, ProtocolViolation> {
         super::decode_request(datagram, peer, descriptors).map_err(|error| error.violation())
@@ -1452,6 +1666,10 @@ mod tests {
         assert_eq!(authenticated.pid(), pid);
         assert_eq!(authenticated.uid(), uid);
         assert_eq!(authenticated.role(), PeerRole::Companion);
+        let debug = format!("{authenticated:?}");
+        assert!(!debug.contains("socket"));
+        assert!(!debug.contains("identity"));
+        assert!(!debug.contains("token"));
 
         let (stream, _peer) = socketpair(
             AddressFamily::UNIX,
@@ -1468,6 +1686,238 @@ mod tests {
             .err(),
             Some(ProtocolViolation::InvalidTransport)
         );
+    }
+
+    #[test]
+    fn authenticated_peer_binds_records_and_responses_to_one_capability() {
+        use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
+
+        let (client_a, server_a) = socketpair(
+            AddressFamily::UNIX,
+            SocketType::SEQPACKET,
+            SocketFlags::CLOEXEC,
+            None,
+        )
+        .expect("first seqpacket pair");
+        let (client_b, server_b) = socketpair(
+            AddressFamily::UNIX,
+            SocketType::SEQPACKET,
+            SocketFlags::CLOEXEC,
+            None,
+        )
+        .expect("second seqpacket pair");
+        let uid = rustix::net::sockopt::socket_peercred(&server_a)
+            .expect("peer credentials")
+            .uid
+            .as_raw();
+        if uid == 0 {
+            return;
+        }
+        let other = if uid == 1 { 2 } else { 1 };
+        let allowlist = PeerAllowlist::new(uid, other).expect("allowlist");
+        let peer_a = authenticate_seqpacket_peer(server_a.as_fd(), allowlist)
+            .expect("authenticate first peer");
+        let peer_a_reauthenticated = authenticate_seqpacket_peer(server_a.as_fd(), allowlist)
+            .expect("reauthenticate first peer");
+        let peer_b = authenticate_seqpacket_peer(server_b.as_fd(), allowlist)
+            .expect("authenticate second peer");
+
+        let request_bytes = request("vault.status", "{}");
+        crate::rescue_vault_transport::send_seqpacket(
+            client_a.as_fd(),
+            &request_bytes,
+            &[],
+            Instant::now() + Duration::from_secs(2),
+        )
+        .expect("send first request");
+        let request_a = peer_a
+            .receive_request(Instant::now() + Duration::from_secs(2))
+            .expect("receive first request");
+        let response = SuccessPayload::VaultStatus(vault_status(VaultState::Locked));
+
+        assert_eq!(
+            peer_b
+                .send_success(
+                    &request_a,
+                    8,
+                    &response,
+                    &[],
+                    Instant::now() + Duration::from_secs(2),
+                )
+                .err(),
+            Some(ServerSendError::Transport(
+                SeqpacketTransportError::InvalidTransport
+            ))
+        );
+        assert_eq!(
+            peer_a_reauthenticated
+                .send_success(
+                    &request_a,
+                    8,
+                    &response,
+                    &[],
+                    Instant::now() + Duration::from_secs(2),
+                )
+                .err(),
+            Some(ServerSendError::Transport(
+                SeqpacketTransportError::InvalidTransport
+            ))
+        );
+
+        peer_a
+            .send_success(
+                &request_a,
+                8,
+                &response,
+                &[],
+                Instant::now() + Duration::from_secs(2),
+            )
+            .expect("send response on originating capability");
+        let response_a = crate::rescue_vault_transport::recv_seqpacket(
+            client_a.as_fd(),
+            Instant::now() + Duration::from_secs(2),
+        )
+        .expect("receive first response");
+        assert!(response_a.bytes().starts_with(b"{"));
+
+        crate::rescue_vault_transport::send_seqpacket(
+            client_b.as_fd(),
+            &request_bytes,
+            &[],
+            Instant::now() + Duration::from_secs(2),
+        )
+        .expect("send second request");
+        assert!(matches!(
+            peer_a.receive_request(Instant::now() + Duration::from_millis(20)),
+            Err(ServerReceiveError::Transport(
+                SeqpacketTransportError::TimedOut
+            ))
+        ));
+        assert!(
+            peer_b
+                .receive_request(Instant::now() + Duration::from_secs(2))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn authenticated_peer_revalidates_socket_cloexec_before_receive() {
+        use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
+
+        let (client, server) = socketpair(
+            AddressFamily::UNIX,
+            SocketType::SEQPACKET,
+            SocketFlags::CLOEXEC,
+            None,
+        )
+        .expect("seqpacket pair");
+        let uid = rustix::net::sockopt::socket_peercred(&server)
+            .expect("peer credentials")
+            .uid
+            .as_raw();
+        if uid == 0 {
+            return;
+        }
+        let other = if uid == 1 { 2 } else { 1 };
+        let peer = authenticate_seqpacket_peer(
+            server.as_fd(),
+            PeerAllowlist::new(uid, other).expect("allowlist"),
+        )
+        .expect("authenticate peer");
+        crate::rescue_vault_transport::send_seqpacket(
+            client.as_fd(),
+            &request("vault.status", "{}"),
+            &[],
+            Instant::now() + Duration::from_secs(2),
+        )
+        .expect("queue request");
+
+        rustix::io::fcntl_setfd(server.as_fd(), rustix::io::FdFlags::empty())
+            .expect("clear socket CLOEXEC");
+        let expired = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("expired instant");
+        assert!(matches!(
+            peer.receive_request(expired),
+            Err(ServerReceiveError::Transport(
+                SeqpacketTransportError::TimedOut
+            ))
+        ));
+        assert!(matches!(
+            peer.receive_request(Instant::now() + Duration::from_secs(2)),
+            Err(ServerReceiveError::Transport(
+                SeqpacketTransportError::InvalidTransport
+            ))
+        ));
+        rustix::io::fcntl_setfd(server.as_fd(), rustix::io::FdFlags::CLOEXEC)
+            .expect("restore socket CLOEXEC");
+        let request = peer
+            .receive_request(Instant::now() + Duration::from_secs(2))
+            .expect("receive after restoring CLOEXEC");
+        rustix::io::fcntl_setfd(server.as_fd(), rustix::io::FdFlags::empty())
+            .expect("clear socket CLOEXEC before response");
+        assert_eq!(
+            peer.send_error(&request, 8, ErrorToken::IoFailed, expired)
+                .err(),
+            Some(ServerSendError::Transport(
+                SeqpacketTransportError::TimedOut
+            ))
+        );
+        assert_eq!(
+            peer.send_error(
+                &request,
+                8,
+                ErrorToken::IoFailed,
+                Instant::now() + Duration::from_secs(2),
+            )
+            .err(),
+            Some(ServerSendError::Transport(
+                SeqpacketTransportError::InvalidTransport
+            ))
+        );
+    }
+
+    #[test]
+    fn companion_only_allowlist_never_mints_an_agent() {
+        let allowlist = PeerAllowlist::companion_only(1000).expect("companion-only allowlist");
+        assert_eq!(allowlist.role_for(1000), Ok(PeerRole::Companion));
+        assert_eq!(
+            allowlist.role_for(1001),
+            Err(ProtocolViolation::NotAuthorized)
+        );
+        assert_eq!(
+            PeerAllowlist::companion_only(0),
+            Err(ProtocolViolation::InvalidAllowlist)
+        );
+    }
+
+    #[test]
+    fn typed_client_requests_round_trip_through_the_server_decoder() {
+        let status = ClientRequest::new(
+            RequestId::parse(REQUEST_ID).expect("request ID"),
+            7,
+            ClientRequestPayload::VaultStatus,
+        )
+        .expect("status request");
+        let status_bytes = encode_client_request(&status, &[]).expect("encode status");
+        let decoded = decode_request(&status_bytes, peer(1000), Vec::new())
+            .expect("server decodes typed status");
+        assert_eq!(decoded.operation(), Operation::VaultStatus);
+
+        let unlock = ClientRequest::new(
+            RequestId::parse(REQUEST_ID).expect("request ID"),
+            7,
+            ClientRequestPayload::VaultUnlock {
+                passphrase_size: MIN_PASSPHRASE_BYTES,
+            },
+        )
+        .expect("unlock request");
+        let pipe = read_pipe();
+        let unlock_bytes = encode_client_request(&unlock, &[pipe.as_fd()]).expect("encode unlock");
+        let mut decoded = decode_request(&unlock_bytes, peer(1000), vec![pipe])
+            .expect("server decodes typed unlock");
+        assert_eq!(decoded.operation(), Operation::VaultUnlock);
+        assert!(decoded.take_descriptor().is_some());
     }
 
     #[test]
@@ -1590,6 +2040,9 @@ mod tests {
         assert_eq!(context.operation(), Operation::VaultUnlock);
         assert_eq!(context.violation(), ProtocolViolation::NotAuthorized);
         assert_eq!(context.error(), ErrorToken::NotAuthorized);
+        let debug = format!("{context:?}");
+        assert!(!debug.contains("identity"));
+        assert!(!debug.contains("token"));
         let response = encode_rejection(&context, 8).expect("correlated rejection");
         let response = String::from_utf8(response).expect("UTF-8 rejection");
         assert!(response.contains(REQUEST_ID));

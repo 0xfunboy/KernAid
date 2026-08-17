@@ -17,7 +17,9 @@ fn bounded_capture_kills_a_descendant_holding_stdout() {
     let mut command = Command::new("/bin/sh");
     command
         .arg("-c")
-        .arg("trap '' TERM; sleep 30 & printf '%s' \"$!\" >\"$1\"; printf ready")
+        .arg(
+            "trap '' TERM; sleep 30 & printf '%s' \"$!\" >\"$1\"; printf ready; while :; do sleep 30; done",
+        )
         .arg("kernaid-process-group-test")
         .arg(&pid_file)
         .stdin(Stdio::null())
@@ -51,7 +53,6 @@ fn bounded_capture_kills_a_descendant_holding_stdout() {
         .expect("bounded captured command");
     assert!(output.status.success());
     assert_eq!(output.bytes, b"bounded-output");
-    assert!(!output.exceeded_limit);
 
     // Compile and exercise the same no-capture path used for cryptsetup open
     // and close; no unit-test process with vault locks is alive in this test
@@ -61,5 +62,26 @@ fn bounded_capture_kills_a_descendant_holding_stdout() {
         wait(&mut success, Duration::from_secs(1))
             .expect("bounded no-capture command")
             .success()
+    );
+}
+
+#[test]
+fn bounded_capture_stops_a_continuous_stdout_producer() {
+    let mut command = Command::new("/bin/sh");
+    command
+        .arg("-c")
+        .arg("trap '' TERM; while :; do printf 0123456789abcdef; done")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .stdout(Stdio::piped());
+
+    let started = Instant::now();
+    assert_eq!(
+        capture(&mut command, Duration::from_millis(150), 4096).err(),
+        Some(BoundedProcessError::OutputLimitExceeded)
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "an always-readable pipe must not starve bounded cleanup"
     );
 }

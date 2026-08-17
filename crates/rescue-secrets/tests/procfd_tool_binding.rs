@@ -35,10 +35,6 @@ fn capture(command: &mut Command) -> Vec<u8> {
     let output = bounded_process::capture(command, COMMAND_TIMEOUT, COMMAND_OUTPUT_LIMIT)
         .expect("bounded external probe");
     assert!(output.status.success(), "external probe failed");
-    assert!(
-        !output.exceeded_limit,
-        "external probe output exceeded bound"
-    );
     output.bytes
 }
 

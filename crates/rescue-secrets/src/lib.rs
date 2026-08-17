@@ -150,6 +150,8 @@ pub use device_locator::{
     BootVaultLocation, BootVaultLocatorError, LocatedVaultIdentity, LocatedVaultPartition,
     locate_boot_vault,
 };
+#[cfg(all(target_os = "linux", feature = "experimental-vault-manager"))]
+pub use device_locator::{LocatedVaultClassification, LocatedVaultClassificationError};
 #[cfg(target_os = "linux")]
 pub use linux::RescueVaultSecrets;
 #[cfg(all(target_os = "linux", feature = "privileged-probe"))]

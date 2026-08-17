@@ -515,15 +515,27 @@ fn canonical_base64_32(value: &str) -> bool {
 
 pub(crate) fn classify_partition(
     descriptor: impl AsFd,
+    revalidate: impl FnMut() -> Result<(), ProfileClassifierError>,
+) -> Result<VaultPartitionProfile, ProfileClassifierError> {
+    classify_partition_with_timeout(descriptor, ZERO_SCAN_TIMEOUT, revalidate)
+}
+
+pub(crate) fn classify_partition_with_timeout(
+    descriptor: impl AsFd,
+    timeout: Duration,
     mut revalidate: impl FnMut() -> Result<(), ProfileClassifierError>,
 ) -> Result<VaultPartitionProfile, ProfileClassifierError> {
+    if timeout.is_zero() || timeout > ZERO_SCAN_TIMEOUT {
+        return Err(ProfileClassifierError::OperationTimedOut);
+    }
     verify_embedded_profile()?;
     revalidate()?;
     let before = descriptor_snapshot(&descriptor)?;
     if !FileType::from_raw_mode(before.mode).is_block_device() {
         return Err(ProfileClassifierError::InvalidDescriptor);
     }
-    let result = classify_raw_partition(&descriptor, VAULT_PARTITION_BYTES, &mut revalidate)?;
+    let result =
+        classify_raw_partition(&descriptor, VAULT_PARTITION_BYTES, timeout, &mut revalidate)?;
     revalidate()?;
     if descriptor_snapshot(&descriptor)? != before {
         return Err(ProfileClassifierError::MediaChanged);
@@ -534,10 +546,11 @@ pub(crate) fn classify_partition(
 fn classify_raw_partition(
     descriptor: impl AsFd,
     capacity: u64,
+    timeout: Duration,
     mut revalidate: impl FnMut() -> Result<(), ProfileClassifierError>,
 ) -> Result<VaultPartitionProfile, ProfileClassifierError> {
     let deadline = Instant::now()
-        .checked_add(ZERO_SCAN_TIMEOUT)
+        .checked_add(timeout)
         .ok_or(ProfileClassifierError::OperationTimedOut)?;
     let duplicate = rustix::io::fcntl_dupfd_cloexec(descriptor, 3)
         .map_err(|_| ProfileClassifierError::InvalidDescriptor)?;
@@ -1361,16 +1374,33 @@ mod tests {
         file.set_len(2 * ZERO_SCAN_CHUNK_BYTES as u64 + 17)
             .expect("size zero-scan fixture");
         let capacity = file.metadata().expect("stat zero-scan fixture").len();
-        let profile =
-            classify_raw_partition(&file, capacity, || Ok(())).expect("zero classification");
+        let profile = classify_raw_partition(&file, capacity, ZERO_SCAN_TIMEOUT, || Ok(()))
+            .expect("zero classification");
         assert!(matches!(profile, VaultPartitionProfile::Unprovisioned));
 
         file.seek(SeekFrom::Start(capacity - 1))
             .expect("seek zero-scan tail");
         file.write_all(&[1]).expect("tamper zero-scan tail");
-        let profile = classify_raw_partition(&file, capacity, || Ok(()))
+        let profile = classify_raw_partition(&file, capacity, ZERO_SCAN_TIMEOUT, || Ok(()))
             .expect("non-zero tail classification");
         assert!(matches!(profile, VaultPartitionProfile::ProfileMismatch));
+    }
+
+    #[test]
+    fn raw_classification_honors_the_caller_timeout() {
+        let file = tempfile().expect("create timeout fixture");
+        file.set_len(4096).expect("size timeout fixture");
+        assert_eq!(
+            classify_raw_partition(&file, 4096, Duration::from_millis(1), || {
+                std::thread::sleep(Duration::from_millis(2));
+                Ok(())
+            }),
+            Err(ProfileClassifierError::OperationTimedOut)
+        );
+        assert_eq!(
+            classify_partition_with_timeout(&file, Duration::ZERO, || Ok(())).err(),
+            Some(ProfileClassifierError::OperationTimedOut)
+        );
     }
 
     #[test]
@@ -1378,13 +1408,18 @@ mod tests {
         let mut file = tempfile().expect("create mismatch fixture");
         file.set_len(8192).expect("size mismatch fixture");
         file.write_all(&[1]).expect("write mismatch fixture");
-        let mismatch =
-            classify_raw_partition(&file, 8192, || Ok(())).expect("mismatch classification");
+        let mismatch = classify_raw_partition(&file, 8192, ZERO_SCAN_TIMEOUT, || Ok(()))
+            .expect("mismatch classification");
         assert!(matches!(mismatch, VaultPartitionProfile::ProfileMismatch));
 
         let (exact_file, _) = dual_luks_file();
-        let exact = classify_raw_partition(&exact_file, 2 * LUKS_HEADER_BYTES as u64, || Ok(()))
-            .expect("outer classification");
+        let exact = classify_raw_partition(
+            &exact_file,
+            2 * LUKS_HEADER_BYTES as u64,
+            ZERO_SCAN_TIMEOUT,
+            || Ok(()),
+        )
+        .expect("outer classification");
         assert!(matches!(exact, VaultPartitionProfile::Locked(_)));
     }
 
@@ -1409,8 +1444,9 @@ mod tests {
         let mut before = vec![0_u8; 2 * LUKS_HEADER_BYTES];
         read_exact_at(&file, &mut before, 0).expect("read corrupt headers before classification");
 
-        let classified = classify_raw_partition(&file, before.len() as u64, || Ok(()))
-            .expect("classify corrupt headers");
+        let classified =
+            classify_raw_partition(&file, before.len() as u64, ZERO_SCAN_TIMEOUT, || Ok(()))
+                .expect("classify corrupt headers");
         assert!(matches!(classified, VaultPartitionProfile::ProfileMismatch));
 
         let mut after = vec![0_u8; before.len()];

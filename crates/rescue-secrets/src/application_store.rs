@@ -1972,10 +1972,11 @@ mod tests {
         error: Option<ErrorToken>,
     ) -> ValidatedRequest {
         use kernaid_protocol::rescue_vault::{
-            API_VERSION, PeerAllowlist, authenticate_seqpacket_peer, decode_request,
+            API_VERSION, PeerAllowlist, authenticate_seqpacket_peer,
         };
-        use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
+        use rustix::net::{AddressFamily, SendFlags, SocketFlags, SocketType, socketpair};
         use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{Duration, Instant};
 
         static NEXT_REQUEST: AtomicU64 = AtomicU64::new(1);
 
@@ -2014,7 +2015,17 @@ mod tests {
             "payload": payload,
         }))
         .expect("serialize audit request");
-        decode_request(&datagram, peer, Vec::new()).expect("decode authenticated audit request")
+        assert_eq!(
+            rustix::net::send(
+                peer_socket.as_fd(),
+                &datagram,
+                SendFlags::NOSIGNAL | SendFlags::DONTWAIT,
+            )
+            .expect("send authenticated audit request"),
+            datagram.len()
+        );
+        peer.receive_request(Instant::now() + Duration::from_secs(2))
+            .expect("receive authenticated audit request")
     }
 
     fn application_journal_len(fixture: &Fixture) -> usize {

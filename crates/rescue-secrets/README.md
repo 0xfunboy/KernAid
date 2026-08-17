@@ -36,11 +36,22 @@ descriptor before spawning validation tools. Only immediately before
 `cryptsetup open` it makes one `F_DUPFD_CLOEXEC` duplicate and transfers that
 duplicate to stdin. The passphrase is never placed in argv, an environment
 variable, a Rust string, a log, or an error. Cryptsetup receives one
-non-interactive attempt and every child operation has a 30-second deadline, so
-a missing passphrase EOF cannot block the manager indefinitely. Every fixed
-cryptsetup/blkid child starts in a new process group. The manager drains
+non-interactive attempt. Cryptsetup and blkid children have a 30-second
+user-space deadline; the descriptor-bound blockdev identity queries instead
+share one aggregate two-second deadline per identity check. A missing
+passphrase EOF is therefore covered by the user-space child deadline while the
+child remains interruptible. Every fixed child starts in a new process group. The manager drains
 captured output non-blockingly, rejects unexpected descendants even after the
 direct child exits, and uses bounded TERM/KILL cleanup on errors or timeouts.
+
+These deadlines are checkpoints, not a hard wall-clock guarantee against a
+faulting block device. A synchronous kernel `pread` can remain in
+uninterruptible I/O past the requested classification deadline. A fixed child
+in kernel D-state can survive TERM/KILL, but cleanup uses only bounded
+`try_wait` polling and returns `cleanup-failed` after the kill grace instead of
+entering an unbounded reap. The integrating service must isolate this backend
+work in a separate process and treat either condition as a terminal
+reboot-required host fault rather than retry inside that process.
 
 The selected vault device is different: its pre-unlock classifier reads only
 the manager's retained read-only descriptor and runs no external command.
@@ -74,10 +85,11 @@ public only for the disposable `privileged-probe` feature.
 
 Before activation, the manager holds a CLOEXEC descriptor for the selected
 block device and repeatedly compares its inode, filesystem device and `rdev`
-with the direct pathname. It also retains the kernel sysfs disk sequence and
-capacity, requires no holders, rejects an existing mapper, and validates the
-embedded device-layout and vault-profile manifests. Exactly one of three
-closed results is possible:
+with the direct pathname. It also re-reads disk sequence, capacity and logical
+sector size through the retained descriptor under one aggregate blockdev
+deadline, requires no holders, rejects an existing mapper, and validates the
+embedded device-layout and vault-profile manifests. Exactly one of three closed
+results is possible:
 
 - every byte of the exact 8 GiB p3 is zero: `UNPROVISIONED`;
 - both independently checksummed 16 KiB LUKS2 metadata copies have the exact
@@ -112,9 +124,12 @@ or any other policy fail closed.
 These are strong checkpoint validations in the manager's current mount
 namespace, not an atomic proof against a concurrent privileged namespace/path
 actor. Cleanup rechecks the same claims and refuses force/lazy unmount or an
-unverified mapping close on ambiguity. A `cryptsetup open` error is followed
-by mapping inspection; if the exact mapping was nevertheless created, its
-identity is acquired and verified cleanup is attempted.
+unverified mapping close on ambiguity. A `cryptsetup open` error after a child
+actually ran is followed by mapping inspection; if the exact mapping was
+nevertheless created, its identity is acquired and verified cleanup is
+attempted. A spawn failure, or a child/process group that cannot be proven
+reaped, stops before any mapper inspection or close because ownership was not
+established.
 
 ## Read-only boot-medium locator
 
@@ -130,9 +145,10 @@ and p3 `/sys/dev/block` identities, direct parentage, uevent major/minor/type,
 partition number, disk sequence, 512-byte logical sectors, at least the
 qualified 32 GB media capacity, and the exact layout-v1 p3 start/length. It
 then opens the parent and p3 direct nodes read-only with NOFOLLOW, NONBLOCK and
-CLOEXEC. A fixed, bounded `/usr/sbin/blockdev` child receives a CLOEXEC
-duplicate as fd 0 and performs the actual BLKGETDISKSEQ and geometry ioctls on
-`/proc/self/fd/0`; no mutable device pathname is handed to the tool. The
+CLOEXEC. Fixed, bounded `/usr/sbin/blockdev` children perform the actual
+BLKGETDISKSEQ and geometry ioctls only through
+`/proc/<locator-pid>/fd/<retained-fd>`; no mutable device pathname is handed to
+the tool and all queries share one aggregate deadline. The
 retained parent descriptor must contain the complete finalized layout-v1 MBR:
 qualified ISO slots 1/2 before the vault, exact slot 3, and an all-zero reserved
 slot 4. The complete mountinfo/sysfs/FD/ioctl/MBR identity is checked twice
@@ -269,8 +285,6 @@ not implemented yet.
 
 - run the daemon in a private mount namespace and adopt descriptor-based mount
   attachment (`open_tree`/`move_mount` or an equivalent design);
-- replace the experimental manager's remaining sysfs disk-sequence checkpoint
-  with its descriptor-bound `BLKGETDISKSEQ` observation;
 - define and test restart recovery for an interrupted process and mappings or
   mounts visible in other namespaces;
 - exercise crash windows, additional-holder races, and real hardware in the
