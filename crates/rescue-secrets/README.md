@@ -31,7 +31,10 @@ descriptor before spawning validation tools. Only immediately before
 duplicate to stdin. The passphrase is never placed in argv, an environment
 variable, a Rust string, a log, or an error. Cryptsetup receives one
 non-interactive attempt and every child operation has a 30-second deadline, so
-a missing passphrase EOF cannot block the manager indefinitely.
+a missing passphrase EOF cannot block the manager indefinitely. Every fixed
+cryptsetup/blkid child starts in a new process group. The manager drains
+captured output non-blockingly, rejects unexpected descendants even after the
+direct child exits, and uses bounded TERM/KILL cleanup on errors or timeouts.
 
 An accepted vault must already contain this root-owned layout:
 
@@ -65,6 +68,13 @@ is the backing device's only holder. The inner filesystem must be ext4 with the
 `rw,nosuid,nodev,noexec,nosymfollow,relatime,errors=remount-ro` and then checked
 against `/proc/self/mountinfo` and sysfs again.
 
+Linux omits an `errors=` mountinfo token when the requested policy equals the
+ext4 superblock default. The manager therefore accepts either an explicit
+`errors=remount-ro` token or an omitted token plus an exact, descriptor-bound
+ext4 `s_errors=2` observation from the validated mapper. Explicit
+`errors=continue`, `errors=panic`, duplicate policies, a bad ext4 magic value,
+or any other policy fail closed.
+
 These are strong checkpoint validations in the manager's current mount
 namespace, not an atomic proof against a concurrent privileged namespace/path
 actor. Cleanup rechecks the same claims and refuses force/lazy unmount or an
@@ -80,7 +90,8 @@ arbitrary-command API. Provisioning is a separate administrative operation.
 
 `tests/privileged-luks.sh` is the only provisioning path in this crate. It is
 restricted to a newly allocated disposable loop image, creates the LUKS2/ext4
-filesystem and required marker/layout outside the Rust manager, and then runs:
+filesystem with the same pinned profile-v1 arguments as the USB smoke test and
+the required marker/layout outside the Rust manager, and then runs:
 
 ```text
 kernaid-rescue-vault-probe --device /dev/loopN \
@@ -102,8 +113,13 @@ KERNAID_RESCUE_VAULT_PROBE_ATTESTATION_V1 mode=<initialize|verify> sentinel=kern
 
 It is emitted only after `MountedRescueVault::shutdown` succeeds. The identity
 value is the public Ed25519 key in canonical lowercase hexadecimal, never its
-seed. Errors remain sanitized and never print the passphrase or stored secret
-bytes.
+seed. Failures emit exactly one closed diagnostic such as
+`KERNAID_RESCUE_VAULT_PROBE_FAILURE_V1 stage=unlock code=mount-verification-failed`.
+Stage/code values are fixed enum literals; paths, mapper identities, command
+output, OS messages, passphrases, and stored bytes are never copied. Once a
+mount exists, the probe always executes the verified shutdown path even when
+the journal or identity operation fails; a cleanup failure takes precedence
+over the operation failure.
 
 The Rescue workflow also exercises this probe against p3 of a disposable
 32,000,000,000-byte raw USB image. Provisioning and initialize happen on the

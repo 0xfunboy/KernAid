@@ -356,6 +356,18 @@ class MockToolchain:
             # Consume the descriptor without retaining or printing its bytes.
             /usr/bin/sha256sum >/dev/null
             printf '%s\n' "$mode" >>"$state/probe-calls"
+            if [[ "$mode" == "initialize" \
+              && "${KERNAID_MOCK_INITIALIZE_FAILURE:-none}" != "none" ]]; then
+              if [[ "$KERNAID_MOCK_INITIALIZE_FAILURE" == "typed" ]]; then
+                printf '%s\n' \
+                  'KERNAID_RESCUE_VAULT_PROBE_FAILURE_V1 stage=unlock code=mount-verification-failed' \
+                  >&2
+              else
+                printf '%s\n' \
+                  'unsafe raw diagnostic path=/private/vault key=do-not-copy' >&2
+              fi
+              exit 2
+            fi
             if [[ "$mode" == "verify" && ! -e "$state/wrong-key-seen" ]]; then
               : >"$state/wrong-key-seen"
               if [[ "${KERNAID_MOCK_PROBE_LEAK:-0}" == "1" ]]; then
@@ -418,6 +430,7 @@ class QemuUsbVaultSmokeTests(unittest.TestCase):
         leak_on_wrong_key: bool = False,
         cleanup_close_failure: bool = False,
         profile_failure: str = "",
+        initialize_failure: str = "none",
     ) -> tuple[
         subprocess.CompletedProcess[str],
         Path,
@@ -441,6 +454,7 @@ class QemuUsbVaultSmokeTests(unittest.TestCase):
                 "KERNAID_MOCK_PROBE_LEAK": "1" if leak_on_wrong_key else "0",
                 "KERNAID_MOCK_CLOSE_FAIL": "1" if cleanup_close_failure else "0",
                 "KERNAID_MOCK_PROFILE_FAILURE": profile_failure,
+                "KERNAID_MOCK_INITIALIZE_FAILURE": initialize_failure,
                 "KERNAID_USB_SMOKE_LOG": str(log),
             }
         )
@@ -602,6 +616,35 @@ class QemuUsbVaultSmokeTests(unittest.TestCase):
             "KERNAID_QEMU_USB_VAULT_ATTESTATION_V1 ",
             log.read_text(encoding="utf-8"),
         )
+
+    def test_typed_probe_failure_is_preserved_without_success_evidence(self) -> None:
+        result, _iso, log, _state, temporary = self.run_smoke(
+            initialize_failure="typed"
+        )
+        self.addCleanup(temporary.cleanup)
+        self.assertNotEqual(result.returncode, 0)
+        diagnostic = (
+            "KERNAID_RESCUE_VAULT_PROBE_FAILURE_V1 "
+            "stage=unlock code=mount-verification-failed"
+        )
+        self.assertIn(diagnostic, result.stderr)
+        self.assertEqual(log.read_text(encoding="utf-8").splitlines(), [diagnostic])
+
+    def test_untyped_probe_stderr_is_never_copied_to_diagnostics(self) -> None:
+        result, _iso, log, _state, temporary = self.run_smoke(
+            initialize_failure="unsafe"
+        )
+        self.addCleanup(temporary.cleanup)
+        self.assertNotEqual(result.returncode, 0)
+        combined = result.stdout + result.stderr + log.read_text(encoding="utf-8")
+        self.assertNotIn("/private/vault", combined)
+        self.assertNotIn("do-not-copy", combined)
+        diagnostic = (
+            "KERNAID_RESCUE_VAULT_PROBE_FAILURE_V1 "
+            "stage=wrapper code=invalid-diagnostic"
+        )
+        self.assertIn(diagnostic, result.stderr)
+        self.assertEqual(log.read_text(encoding="utf-8").splitlines(), [diagnostic])
 
 
 if __name__ == "__main__":

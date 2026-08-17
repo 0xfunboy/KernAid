@@ -21,7 +21,7 @@ if [[ "$(id -u)" -ne 0 ]]; then
 fi
 
 for command in chmod cryptsetup dd findmnt id losetup mkdir mkfs.ext4 mktemp \
-  mount mountpoint od rm rmdir sync tr truncate umount udevadm; do
+  mount mountpoint od rm rmdir sync tr truncate tune2fs umount udevadm; do
   command -v "$command" >/dev/null || {
     echo "missing required disposable-probe tooling" >&2
     exit 2
@@ -128,7 +128,7 @@ trap 'cleanup $?' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-truncate -s 256M "$image"
+truncate -s 512M "$image"
 dd if=/dev/urandom of="$key_file" bs=64 count=1 status=none
 dd if=/dev/urandom of="$wrong_key_file" bs=64 count=1 status=none
 chmod 600 "$key_file"
@@ -142,11 +142,23 @@ fi
 # Provisioning is intentionally confined to this disposable CI image. The
 # production Rust manager exposes no format, erase, repair, or raw-write API.
 cryptsetup luksFormat --type luks2 --batch-mode --label KERNAID_VAULT \
-  --key-file "$key_file" "$loop_device"
-cryptsetup open --type luks2 --batch-mode --key-file "$key_file" \
+  --cipher aes-xts-plain64 --key-size 512 --hash sha256 --sector-size 512 \
+  --pbkdf argon2id --pbkdf-force-iterations 4 --pbkdf-memory 65536 \
+  --pbkdf-parallel 1 --key-slot 0 --keyslot-cipher aes-xts-plain64 \
+  --keyslot-key-size 512 --luks2-metadata-size 16384 \
+  --luks2-keyslots-size 16744448 --use-urandom \
+  --key-file "$key_file" --keyfile-size 64 "$loop_device"
+cryptsetup open --type luks2 --batch-mode --tries 1 \
+  --disable-external-tokens --key-file "$key_file" --keyfile-size 64 \
   "$loop_device" "$provision_mapper"
 provision_open=true
-mkfs.ext4 -q -L KERNAID_VAULT "/dev/mapper/$provision_mapper"
+mkfs.ext4 -q -F -t ext4 -b 4096 -I 256 -i 16384 -g 32768 -G 16 \
+  -m 0 -o linux -e remount-ro -J size=128 \
+  -E lazy_itable_init=0,lazy_journal_init=0 \
+  -O none,has_journal,ext_attr,resize_inode,dir_index,filetype,extent,64bit,flex_bg,sparse_super,large_file,huge_file,dir_nlink,extra_isize,metadata_csum \
+  -L KERNAID_VAULT -M / "/dev/mapper/$provision_mapper"
+tune2fs -c 0 -i 0 -e remount-ro -m 0 -o '^acl,^user_xattr' -M / \
+  "/dev/mapper/$provision_mapper"
 mkdir "$provision_mount"
 chmod 700 "$provision_mount"
 mount -t ext4 "/dev/mapper/$provision_mapper" "$provision_mount"
@@ -186,4 +198,4 @@ if mountpoint -q "$manager_mount" || cryptsetup status "$manager_mapper" >/dev/n
   exit 1
 fi
 
-echo "PASS: Rescue manager rejected a wrong key and persisted journal/identity across reopen"
+echo "PASS: Rescue manager accepted the pinned vault profile, rejected a wrong key, and persisted journal/identity across reopen"

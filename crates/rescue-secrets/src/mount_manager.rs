@@ -5,7 +5,7 @@
 //! ownership against another privileged actor.
 
 use super::{RescueSecretError, RescueVaultSecrets, VaultMountAttestation};
-use crate::linux;
+use crate::{bounded_process, linux};
 use rustix::{
     fd::{AsFd, OwnedFd},
     fs::{
@@ -17,12 +17,10 @@ use std::{
     error::Error,
     ffi::OsStr,
     fs::{self, File},
-    io::{self, Read},
     os::unix::ffi::OsStrExt,
     path::{Component, Path, PathBuf},
-    process::{Child, Command, ExitStatus, Stdio},
-    thread,
-    time::{Duration, Instant},
+    process::{Command, Stdio},
+    time::Duration,
 };
 
 const MANAGER_LOCK_PATH: &str = "/run/lock/kernaid-rescue-vault-manager.lock";
@@ -36,7 +34,6 @@ const MAPPER_SUFFIX_BYTES: usize = 16;
 const MAPPER_NAME_BYTES: usize = MAPPER_PREFIX.len() + MAPPER_SUFFIX_BYTES;
 const COMMAND_OUTPUT_LIMIT: usize = 4096;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
-const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const SECURE_DIRECTORY_MODE: u32 = 0o700;
 const SECURE_FILE_MODE: u32 = 0o600;
 
@@ -149,6 +146,36 @@ impl std::fmt::Display for VaultMountManagerError {
             Self::ToolUnavailable => "a required Rescue vault tool is unavailable",
             Self::OperationTimedOut => "a bounded Rescue vault operation timed out",
         })
+    }
+}
+
+impl VaultMountManagerError {
+    /// Stable machine-readable category which is safe to emit in local probe
+    /// diagnostics. Values are closed literals and never contain a path,
+    /// command output, OS error, mapper name, or passphrase material.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::UnsupportedPlatform => "unsupported-platform",
+            Self::PrivilegeRequired => "privilege-required",
+            Self::ManagerLocked => "manager-locked",
+            Self::InvalidBlockDevice => "invalid-block-device",
+            Self::InvalidMapperName => "invalid-mapper-name",
+            Self::InvalidLuks2Header => "invalid-luks2-header",
+            Self::WrongVaultLabel => "wrong-vault-label",
+            Self::MapperConflict => "mapper-conflict",
+            Self::PassphraseUnavailable => "passphrase-unavailable",
+            Self::UnlockFailed => "unlock-failed",
+            Self::MappingVerificationFailed => "mapping-verification-failed",
+            Self::UnsupportedFilesystem => "unsupported-filesystem",
+            Self::UnsafeMountRoot => "unsafe-mount-root",
+            Self::MountFailed => "mount-failed",
+            Self::MountVerificationFailed => "mount-verification-failed",
+            Self::SecureStateUnavailable => "secure-state-unavailable",
+            Self::CleanupFailed => "cleanup-failed",
+            Self::ToolUnavailable => "tool-unavailable",
+            Self::OperationTimedOut => "operation-timed-out",
+        }
     }
 }
 
@@ -533,31 +560,12 @@ impl SystemOps {
             .stdin(Stdio::null())
             .stderr(Stdio::null())
             .stdout(Stdio::piped());
-        let mut child = command
-            .spawn()
-            .map_err(|error| map_command_start_error(&error))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or(VaultMountManagerError::MappingVerificationFailed)?;
-        let reader = thread::spawn(move || read_bounded_child_output(stdout));
-        let deadline = Instant::now() + COMMAND_TIMEOUT;
-        let wait_result = wait_bounded_until(&mut child, deadline);
-        while !reader.is_finished() {
-            if Instant::now() >= deadline {
-                return Err(VaultMountManagerError::OperationTimedOut);
-            }
-            thread::sleep(COMMAND_POLL_INTERVAL);
-        }
-        let output_result = reader
-            .join()
-            .map_err(|_| VaultMountManagerError::MappingVerificationFailed)?;
-        let status = wait_result?;
-        let output = output_result?;
-        if !status.success() || output.len() > COMMAND_OUTPUT_LIMIT {
+        let output = bounded_process::capture(&mut command, COMMAND_TIMEOUT, COMMAND_OUTPUT_LIMIT)
+            .map_err(map_bounded_process_error)?;
+        if !output.status.success() || output.exceeded_limit {
             return Err(VaultMountManagerError::MappingVerificationFailed);
         }
-        Ok(output)
+        Ok(output.bytes)
     }
 
     fn run_quiet(mut command: Command) -> Result<(), VaultMountManagerError> {
@@ -567,10 +575,8 @@ impl SystemOps {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let mut child = command
-            .spawn()
-            .map_err(|error| map_command_start_error(&error))?;
-        let status = wait_bounded(&mut child)?;
+        let status = bounded_process::wait(&mut command, COMMAND_TIMEOUT)
+            .map_err(map_bounded_process_error)?;
         if !status.success() {
             return Err(VaultMountManagerError::CleanupFailed);
         }
@@ -680,10 +686,8 @@ impl VaultOps for SystemOps {
             .stdin(Stdio::from(File::from(passphrase)))
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let mut child = command
-            .spawn()
-            .map_err(|error| map_command_start_error(&error))?;
-        let status = wait_bounded(&mut child)?;
+        let status = bounded_process::wait(&mut command, COMMAND_TIMEOUT)
+            .map_err(map_bounded_process_error)?;
         if !status.success() {
             return Err(VaultMountManagerError::UnlockFailed);
         }
@@ -1067,51 +1071,6 @@ fn ensure_cloexec(descriptor: impl AsFd) -> Result<(), VaultMountManagerError> {
         .map_err(|_| VaultMountManagerError::PassphraseUnavailable)
 }
 
-fn wait_bounded(child: &mut Child) -> Result<ExitStatus, VaultMountManagerError> {
-    wait_bounded_until(child, Instant::now() + COMMAND_TIMEOUT)
-}
-
-fn wait_bounded_until(
-    child: &mut Child,
-    deadline: Instant,
-) -> Result<ExitStatus, VaultMountManagerError> {
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Ok(status),
-            Ok(None) => {}
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(VaultMountManagerError::MappingVerificationFailed);
-            }
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(VaultMountManagerError::OperationTimedOut);
-        }
-        thread::sleep(COMMAND_POLL_INTERVAL);
-    }
-}
-
-fn read_bounded_child_output(mut output: impl Read) -> Result<Vec<u8>, VaultMountManagerError> {
-    let mut captured = Vec::with_capacity(COMMAND_OUTPUT_LIMIT + 1);
-    let mut buffer = [0_u8; 1024];
-    loop {
-        let read = output
-            .read(&mut buffer)
-            .map_err(|_| VaultMountManagerError::MappingVerificationFailed)?;
-        if read == 0 {
-            break;
-        }
-        if captured.len() <= COMMAND_OUTPUT_LIMIT {
-            let remaining = COMMAND_OUTPUT_LIMIT + 1 - captured.len();
-            captured.extend_from_slice(&buffer[..read.min(remaining)]);
-        }
-    }
-    Ok(captured)
-}
-
 fn block_device_kernel_identity(
     major: u32,
     minor: u32,
@@ -1397,11 +1356,22 @@ fn trim_horizontal(mut value: &[u8]) -> &[u8] {
     value
 }
 
-fn map_command_start_error(error: &io::Error) -> VaultMountManagerError {
-    if error.kind() == io::ErrorKind::NotFound || error.kind() == io::ErrorKind::PermissionDenied {
-        VaultMountManagerError::ToolUnavailable
-    } else {
-        VaultMountManagerError::MappingVerificationFailed
+fn map_bounded_process_error(
+    error: bounded_process::BoundedProcessError,
+) -> VaultMountManagerError {
+    match error {
+        bounded_process::BoundedProcessError::Unavailable => {
+            VaultMountManagerError::ToolUnavailable
+        }
+        bounded_process::BoundedProcessError::TimedOut => VaultMountManagerError::OperationTimedOut,
+        bounded_process::BoundedProcessError::CleanupFailed => {
+            VaultMountManagerError::CleanupFailed
+        }
+        bounded_process::BoundedProcessError::StartFailed
+        | bounded_process::BoundedProcessError::WaitFailed
+        | bounded_process::BoundedProcessError::UnexpectedDescendant => {
+            VaultMountManagerError::MappingVerificationFailed
+        }
     }
 }
 
@@ -1644,6 +1614,39 @@ mod tests {
             assert_eq!(
                 validate_device_path(Path::new(invalid)).err(),
                 Some(VaultMountManagerError::InvalidBlockDevice)
+            );
+        }
+    }
+
+    #[test]
+    fn manager_error_codes_are_closed_sanitized_literals() {
+        let errors = [
+            VaultMountManagerError::UnsupportedPlatform,
+            VaultMountManagerError::PrivilegeRequired,
+            VaultMountManagerError::ManagerLocked,
+            VaultMountManagerError::InvalidBlockDevice,
+            VaultMountManagerError::InvalidMapperName,
+            VaultMountManagerError::InvalidLuks2Header,
+            VaultMountManagerError::WrongVaultLabel,
+            VaultMountManagerError::MapperConflict,
+            VaultMountManagerError::PassphraseUnavailable,
+            VaultMountManagerError::UnlockFailed,
+            VaultMountManagerError::MappingVerificationFailed,
+            VaultMountManagerError::UnsupportedFilesystem,
+            VaultMountManagerError::UnsafeMountRoot,
+            VaultMountManagerError::MountFailed,
+            VaultMountManagerError::MountVerificationFailed,
+            VaultMountManagerError::SecureStateUnavailable,
+            VaultMountManagerError::CleanupFailed,
+            VaultMountManagerError::ToolUnavailable,
+            VaultMountManagerError::OperationTimedOut,
+        ];
+        for error in errors {
+            let code = error.code();
+            assert!(!code.is_empty());
+            assert!(
+                code.bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
             );
         }
     }

@@ -21,6 +21,7 @@ readonly p3_bytes=8589934592
 readonly boot_count=2
 readonly boot_timeout_seconds=240
 readonly probe_prefix=KERNAID_RESCUE_VAULT_PROBE_ATTESTATION_V1
+readonly probe_failure_prefix=KERNAID_RESCUE_VAULT_PROBE_FAILURE_V1
 readonly sentinel_value=kernaid-disposable-vault-persistence-v1
 
 for command in awk blkid cat chmod cp cryptsetup dd dirname findmnt grep id \
@@ -364,8 +365,14 @@ parse_probe_attestation() {
   local expected_mode="$1"
   local output_file="$2"
   local line
+  local output_bytes
   local -a lines
 
+  output_bytes="$(stat -c '%s' -- "$output_file")"
+  if [[ ! "$output_bytes" =~ ^[0-9]+$ ]] || ((output_bytes > 512)); then
+    echo "The vault probe emitted oversized lifecycle evidence" >&2
+    exit 1
+  fi
   mapfile -t lines <"$output_file"
   if [[ "${#lines[@]}" -ne 1 ]]; then
     echo "The vault probe emitted an unexpected number of lines" >&2
@@ -391,7 +398,23 @@ run_probe() {
   local error_file="$3"
   if ! "$probe_binary" --device "$vault_loop" --mapper "$manager_mapper" \
     --mode "$mode" <"$key_file" >"$output_file" 2>"$error_file"; then
-    tail -n 20 "$error_file" >&2
+    local diagnostic
+    local error_bytes
+    local -a error_lines
+    error_bytes="$(stat -c '%s' -- "$error_file")"
+    error_lines=()
+    if [[ "$error_bytes" =~ ^[0-9]+$ ]] && ((error_bytes <= 512)); then
+      mapfile -t error_lines <"$error_file"
+    fi
+    if [[ "${#error_lines[@]}" -eq 1 \
+      && "${error_lines[0]}" =~ ^${probe_failure_prefix}\ stage=[a-z0-9-]+\ code=[a-z0-9-]+$ ]]; then
+      diagnostic="${error_lines[0]}"
+    else
+      # Never copy arbitrary stderr into a workflow log: it could contain an
+      # OS path, command output, mapper identity, or passphrase material.
+      diagnostic="$probe_failure_prefix stage=wrapper code=invalid-diagnostic"
+    fi
+    printf '%s\n' "$diagnostic" | tee -a "$log" >&2
     echo "The Rescue vault probe failed in $mode mode" >&2
     exit 1
   fi

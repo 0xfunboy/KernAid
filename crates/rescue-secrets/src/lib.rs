@@ -126,6 +126,9 @@ impl Error for RescueSecretError {}
 mod linux;
 
 #[cfg(all(target_os = "linux", feature = "experimental-vault-manager"))]
+mod bounded_process;
+
+#[cfg(all(target_os = "linux", feature = "experimental-vault-manager"))]
 mod mount_manager;
 
 #[cfg(target_os = "linux")]

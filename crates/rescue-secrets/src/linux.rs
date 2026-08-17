@@ -17,10 +17,11 @@ use rustix::{
     },
 };
 use std::{
+    ffi::OsStr,
     fs::{self, File},
     io::{Read, Write},
     mem::MaybeUninit,
-    os::unix::ffi::OsStrExt,
+    os::unix::{ffi::OsStrExt, fs::FileExt},
     path::{Component, Path, PathBuf},
     sync::{Mutex, MutexGuard},
 };
@@ -41,6 +42,11 @@ const MAX_MOUNTINFO_BYTES: u64 = 1024 * 1024;
 const MAX_DM_UUID_BYTES: u64 = 512;
 const MAX_DM_UUID_LENGTH: usize = 128;
 const DM_LUKS2_PREFIX: &[u8] = b"CRYPT-LUKS2-";
+const EXT4_SUPERBLOCK_OFFSET: u64 = 1024;
+const EXT4_SUPERBLOCK_PREFIX_BYTES: usize = 64;
+const EXT4_MAGIC_OFFSET: usize = 56;
+const EXT4_ERRORS_OFFSET: usize = 60;
+const EXT4_ERRORS_REMOUNT_READ_ONLY: u16 = 2;
 const ORPHAN_SCAN_BUFFER_BYTES: usize = 8192;
 const DIRECTORY_MODE: u32 = 0o700;
 const FILE_MODE: u32 = 0o600;
@@ -1127,7 +1133,6 @@ fn verify_luks2_mount(
         || !entry.no_dev
         || !entry.no_exec
         || !entry.no_sym_follow
-        || !entry.errors_remount_read_only
         || entry.mount_id != root_mount_id
         || entry.major != rfs::major(root_state.device)
         || entry.minor != rfs::minor(root_state.device)
@@ -1177,6 +1182,13 @@ fn verify_luks2_mount(
         .map_err(|_| RescueSecretError::NotLuks2)?;
     if !is_managed_mapper_name(&mapper_name) {
         return Err(RescueSecretError::NotLuks2);
+    }
+    match entry.errors_policy {
+        MountErrorsPolicy::RemountReadOnly => {}
+        MountErrorsPolicy::Unspecified => {
+            verify_ext4_default_errors_policy(entry.major, entry.minor, &mapper_name)?;
+        }
+        MountErrorsPolicy::Other => return Err(RescueSecretError::VaultNotMounted),
     }
     let (backing_major, backing_minor) = observed_single_backing_device(entry.major, entry.minor)?;
     verify_unique_mapping_holder(backing_major, backing_minor, entry.major, entry.minor)?;
@@ -1239,6 +1251,51 @@ fn is_managed_mapper_name(name: &[u8; 30]) -> bool {
         && name[b"kernaid-vault-".len()..]
             .iter()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+}
+
+fn verify_ext4_default_errors_policy(
+    mapping_major: u32,
+    mapping_minor: u32,
+    mapper_name: &[u8; 30],
+) -> Result<(), RescueSecretError> {
+    let mapper_path = PathBuf::from("/dev/mapper").join(OsStr::from_bytes(mapper_name));
+    let descriptor = rfs::openat2(
+        CWD,
+        &mapper_path,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::NO_MAGICLINKS,
+    )
+    .map_err(|_| RescueSecretError::VaultNotMounted)?;
+    let expected_rdev = rfs::makedev(mapping_major, mapping_minor);
+    let before = rfs::fstat(&descriptor).map_err(|_| RescueSecretError::VaultNotMounted)?;
+    if !FileType::from_raw_mode(before.st_mode).is_block_device() || before.st_rdev != expected_rdev
+    {
+        return Err(RescueSecretError::VaultNotMounted);
+    }
+
+    let file = File::from(descriptor);
+    let mut superblock = [0_u8; EXT4_SUPERBLOCK_PREFIX_BYTES];
+    file.read_exact_at(&mut superblock, EXT4_SUPERBLOCK_OFFSET)
+        .map_err(|_| RescueSecretError::VaultNotMounted)?;
+    let after = rfs::fstat(&file).map_err(|_| RescueSecretError::VaultNotMounted)?;
+    if before.st_dev != after.st_dev
+        || before.st_ino != after.st_ino
+        || before.st_rdev != after.st_rdev
+        || !ext4_default_errors_remount_read_only(&superblock)
+    {
+        return Err(RescueSecretError::VaultNotMounted);
+    }
+    Ok(())
+}
+
+fn ext4_default_errors_remount_read_only(superblock: &[u8]) -> bool {
+    superblock.get(EXT4_MAGIC_OFFSET..EXT4_MAGIC_OFFSET + 2) == Some([0x53, 0xef].as_slice())
+        && superblock
+            .get(EXT4_ERRORS_OFFSET..EXT4_ERRORS_OFFSET + 2)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u16::from_le_bytes)
+            == Some(EXT4_ERRORS_REMOUNT_READ_ONLY)
 }
 
 fn observed_single_backing_device(
@@ -1311,9 +1368,16 @@ struct MountEntry {
     no_dev: bool,
     no_exec: bool,
     no_sym_follow: bool,
-    errors_remount_read_only: bool,
+    errors_policy: MountErrorsPolicy,
     filesystem: Vec<u8>,
     source: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MountErrorsPolicy {
+    Unspecified,
+    RemountReadOnly,
+    Other,
 }
 
 fn parse_mountinfo_line(line: &[u8]) -> Result<Option<MountEntry>, RescueSecretError> {
@@ -1340,7 +1404,20 @@ fn parse_mountinfo_line(line: &[u8]) -> Result<Option<MountEntry>, RescueSecretE
     let no_exec = mount_options.contains(&b"noexec".as_slice());
     let no_sym_follow = mount_options.contains(&b"nosymfollow".as_slice());
     let super_options: Vec<_> = fields[separator + 3].split(|byte| *byte == b',').collect();
-    let errors_remount_read_only = super_options.contains(&b"errors=remount-ro".as_slice());
+    let mut errors_policy = MountErrorsPolicy::Unspecified;
+    for option in super_options
+        .iter()
+        .filter(|option| option.starts_with(b"errors="))
+    {
+        if errors_policy != MountErrorsPolicy::Unspecified {
+            return Err(RescueSecretError::VaultNotMounted);
+        }
+        errors_policy = if *option == b"errors=remount-ro" {
+            MountErrorsPolicy::RemountReadOnly
+        } else {
+            MountErrorsPolicy::Other
+        };
+    }
     Ok(Some(MountEntry {
         mount_id,
         major,
@@ -1352,7 +1429,7 @@ fn parse_mountinfo_line(line: &[u8]) -> Result<Option<MountEntry>, RescueSecretE
         no_dev,
         no_exec,
         no_sym_follow,
-        errors_remount_read_only,
+        errors_policy,
         filesystem: fields[separator + 1].to_vec(),
         source,
     }))
@@ -1820,8 +1897,43 @@ mod tests {
         assert!(entry.no_dev);
         assert!(entry.no_exec);
         assert!(entry.no_sym_follow);
-        assert!(entry.errors_remount_read_only);
+        assert_eq!(entry.errors_policy, MountErrorsPolicy::RemountReadOnly);
+        let default_policy = parse_mountinfo_line(
+            b"41 29 253:17 / /vault rw,nosuid,nodev,noexec,nosymfollow - ext4 /dev/dm-0 rw",
+        )
+        .expect("valid default-policy mountinfo")
+        .expect("default-policy entry");
+        assert_eq!(default_policy.errors_policy, MountErrorsPolicy::Unspecified);
+        let unsafe_policy = parse_mountinfo_line(
+            b"41 29 253:17 / /vault rw,nosuid,nodev,noexec,nosymfollow - ext4 /dev/dm-0 rw,errors=continue",
+        )
+        .expect("syntactically valid unsafe-policy mountinfo")
+        .expect("unsafe-policy entry");
+        assert_eq!(unsafe_policy.errors_policy, MountErrorsPolicy::Other);
+        assert!(parse_mountinfo_line(
+            b"41 29 253:17 / /vault rw,nosuid,nodev,noexec,nosymfollow - ext4 /dev/dm-0 rw,errors=continue,errors=remount-ro",
+        )
+        .is_err());
         assert!(parse_mountinfo_line(b"x 29 253:17 / /vault rw - ext4 /dev/dm-0 rw").is_err());
+    }
+
+    #[test]
+    fn ext4_default_error_policy_parser_is_exact() {
+        let mut superblock = [0_u8; EXT4_SUPERBLOCK_PREFIX_BYTES];
+        superblock[EXT4_MAGIC_OFFSET..EXT4_MAGIC_OFFSET + 2].copy_from_slice(&[0x53, 0xef]);
+        superblock[EXT4_ERRORS_OFFSET..EXT4_ERRORS_OFFSET + 2]
+            .copy_from_slice(&EXT4_ERRORS_REMOUNT_READ_ONLY.to_le_bytes());
+        assert!(ext4_default_errors_remount_read_only(&superblock));
+
+        superblock[EXT4_ERRORS_OFFSET..EXT4_ERRORS_OFFSET + 2]
+            .copy_from_slice(&1_u16.to_le_bytes());
+        assert!(!ext4_default_errors_remount_read_only(&superblock));
+        superblock[EXT4_ERRORS_OFFSET..EXT4_ERRORS_OFFSET + 2]
+            .copy_from_slice(&3_u16.to_le_bytes());
+        assert!(!ext4_default_errors_remount_read_only(&superblock));
+        superblock[EXT4_MAGIC_OFFSET] = 0;
+        assert!(!ext4_default_errors_remount_read_only(&superblock));
+        assert!(!ext4_default_errors_remount_read_only(&superblock[..32]));
     }
 
     #[test]
