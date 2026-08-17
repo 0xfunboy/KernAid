@@ -1,7 +1,8 @@
 # KernAid Rescue secure state
 
-This crate implements fail-closed persistence for the KernAid Rescue journal
-and device identity. Its production constructor requires an opaque mount
+This crate implements fail-closed persistence for the KernAid Rescue journal,
+device identity, provider credential, typed Agent audit, and signed reports.
+Its production constructor requires an opaque mount
 attestation. The only component that can mint that attestation—the privileged
 LUKS2 mount manager—is deliberately disabled by default and is available only
 with `experimental-vault-manager`; its disposable integration probe
@@ -59,10 +60,15 @@ An accepted vault must already contain this root-owned layout:
 ```
 
 Unlock and `RescueVaultSecrets::open` validate that layout; they do not create,
-chmod, chown, repair, or delete anything inside the mounted filesystem. A
-leftover `.tmp-*` object fails closed and is not removed. Journal/database and
-identity writes happen only through later, explicit application calls such as
-`open_journal`, `append`, and `create_device_identity`.
+chmod, chown, or repair its externally provisioned objects. One exact secure
+`.tmp-<32 lowercase hex>` core-secret file left after file and directory fsync
+may be reconciled under the vault lock: a valid typed value is promoted with
+`RENAME_NOREPLACE` when its final is absent, or removed only when the final
+state makes that action unambiguous. Multiple, malformed, linked, cross-mount,
+wrong-owner/mode, invalid, or conflicting temporary objects remain untouched
+and fail closed. Journal and application writes happen only through later,
+explicit typed calls. Raw journal and identity-creation surfaces are compiled
+public only for the disposable `privileged-probe` feature.
 
 ## Kernel identity checks
 
@@ -149,6 +155,51 @@ The locator never invokes cryptsetup, activates device mapper, mounts a
 filesystem, reads a LUKS header, repairs metadata, or writes any byte. It does
 not prove that p3 is provisioned; that remains a later typed service step.
 
+## Closed application store
+
+`RescueVaultSecrets::open_application_store` is the production persistence
+surface. It is load-only for `DeviceIdentity`: an identity must already exist,
+and journal sequence one must be the sole canonical `vault.identity.bound`
+event containing the matching device ID and public-key SHA-256. Authenticated
+replay is side-effect-free; only after the complete chain is accepted may one
+tail intent be recovered. Unknown, non-canonical, duplicate, out-of-order, or
+raw caller-supplied journal events fail closed.
+
+The store exposes only these bounded operations:
+
+- presence-only OpenAI status, configure/replace, callback-scoped borrow, and
+  logout. Values are 1–512 visible ASCII bytes, callback allocations are
+  zeroized, and journal events contain only old/new SHA-256 values. The fixed
+  file is `provider-openai-api-key-v1`; replacement uses atomic
+  `RENAME_EXCHANGE`, retaining the old value as the transaction-bound stage
+  until the applied completion is durable;
+- typed Agent lifecycle audit accepted only as an authenticated
+  `kernaid_protocol::rescue_vault::ValidatedRequest`. Request IDs are kept in
+  an exact bounded `[u8; 16]` replay set, sequence is monotonic within a
+  lifecycle, and a fresh successful session-start explicitly begins a new
+  lifecycle while failed/rejected starts do not replace the active one; and
+- validation, expected-hash binding, identity signing, persistence, bounded
+  listing, and callback-scoped retrieval of strict `SessionReport` JSON. Raw
+  input is at most 1 MiB, reports are capped at 256, filenames are
+  `report-v1-RP-<uuid>.json`, and every envelope binds the report hash plus the
+  exact journal intent sequence/hash. Open performs full bounded verification;
+  list checks authenticated metadata and filesystem bijection; get re-verifies
+  the one requested envelope and schema.
+
+New application files are accessed relative to the retained state-directory
+descriptor with `openat2` beneath/no-symlink/no-magiclink/no-cross-mount
+resolution, owner/mode/nlink/mount checks, CSPRNG transaction stages, file and
+directory fsync, no-replace report installation, and final named readback.
+Application stages are `.kernaid-app-stage-v1-<32 lowercase hex>` and only the
+single journal-authenticated tail transaction can be reconciled.
+
+The SQLite journal implementation still opens its database through a pathname
+inside `SecureJournal`; the application store checks the retained directory
+and DB/WAL/SHM owner, mode, link, device, and mount identity before and after
+each journal operation. A concurrent root actor able to replace pathname state
+inside that narrow interval remains an explicit residual threat until a
+descriptor-bound SQLite VFS or private privileged daemon boundary replaces it.
+
 ## Provisioning and disposable probe
 
 The Rust production surface contains no format, erase, raw-write, LUKS repair,
@@ -167,15 +218,18 @@ kernaid-rescue-vault-probe --device /dev/loopN \
   --mapper kernaid-vault-<suffix> --mode verify
 ```
 
-The first mode initializes an encrypted journal, appends a fixed sentinel, and
-creates a device identity. The second unlocks the same volume and verifies the
-journal key/anchor, sentinel, and identity survived the reopen. The script also
-requires a wrong passphrase to fail without leaving a mount or mapping.
+The first mode proves the journal is empty, creates a device identity, and then
+opens the closed application store so sequence one becomes the canonical
+identity-binding event. The second unlocks the same volume and opens that store
+again, thereby authenticating the journal key/anchor and exact identity
+binding before reporting the same public key. No provider or report fixture is
+written. The script also requires a wrong passphrase to fail without leaving a
+mount or mapping.
 
 The successful probe output is one machine-readable, non-secret line:
 
 ```text
-KERNAID_RESCUE_VAULT_PROBE_ATTESTATION_V1 mode=<initialize|verify> sentinel=kernaid-disposable-vault-persistence-v1 identity_public_key=<64 lowercase hex> clean_shutdown=true
+KERNAID_RESCUE_VAULT_PROBE_ATTESTATION_V1 mode=<initialize|verify> journal_binding=device-identity-bound-v1 identity_public_key=<64 lowercase hex> clean_shutdown=true
 ```
 
 It is emitted only after `MountedRescueVault::shutdown` succeeds. The identity
@@ -191,7 +245,7 @@ over the operation failure.
 The Rescue workflow also exercises this probe against p3 of a disposable
 32,000,000,000-byte raw USB image. Provisioning and initialize happen on the
 host before two consecutive BIOS or UEFI QEMU USB boots; verify happens on the
-host after both boots. CI binds the stable logical sentinel and identity,
+host after both boots. CI binds the authenticated journal identity claim and identity,
 LUKS/filesystem UUIDs, wrong-key rejection and two clean managed lifecycles to
 the same log that proves raw prefix/p3/target invariance during the boot
 window. This is intentionally not an in-guest unlock or vault-service claim.
@@ -204,7 +258,8 @@ The intended integration is a small root-owned local daemon that holds
 `MountedRescueVault` for the complete session and exposes only bounded typed
 operations over a permission-checked Unix socket. The closed AF_UNIX
 `SOCK_SEQPACKET` message and descriptor contract now lives in
-`kernaid-protocol`; this crate supplies only its read-only boot-media locator.
+`kernaid-protocol`; this crate supplies its read-only boot-media locator and
+closed application persistence store.
 The web/Python UI must never receive the LUKS passphrase, journal key, identity
 seed, raw mount path, or an arbitrary command primitive. The daemon, socket
 listener, systemd/ISO packaging, unlock/store handlers, and Rescue UI flow are

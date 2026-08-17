@@ -377,7 +377,7 @@ class MockToolchain:
               exit 2
             fi
             printf '%s\n' \
-              "KERNAID_RESCUE_VAULT_PROBE_ATTESTATION_V1 mode=$mode sentinel=kernaid-disposable-vault-persistence-v1 identity_public_key=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef clean_shutdown=true"
+              "KERNAID_RESCUE_VAULT_PROBE_ATTESTATION_V1 mode=$mode journal_binding=device-identity-bound-v1 identity_public_key=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef clean_shutdown=true"
             """,
         )
 
@@ -491,8 +491,8 @@ class QemuUsbVaultSmokeTests(unittest.TestCase):
         self.assertEqual(
             contents.count("KERNAID_RESCUE_VAULT_PROBE_ATTESTATION_V1 "), 2
         )
-        self.assertEqual(contents.count("mode=initialize sentinel="), 1)
-        self.assertEqual(contents.count("mode=verify sentinel="), 1)
+        self.assertEqual(contents.count("mode=initialize journal_binding="), 1)
+        self.assertEqual(contents.count("mode=verify journal_binding="), 1)
         self.assertIn("post_verify_mount_outside_raw_window=true", contents)
         self.assertEqual(
             (state / "probe-calls").read_text(encoding="utf-8").splitlines(),

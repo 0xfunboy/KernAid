@@ -147,8 +147,8 @@ def synthetic_log(
         "vault_profile_sha256": catalog_v2.VAULT_PROFILE_SHA256,
         "filesystem_uuid_before": uuid("e" if firmware == "bios" else "f"),
         "filesystem_uuid_after": uuid("e" if firmware == "bios" else "f"),
-        "sentinel_before_sha256": sha("1"),
-        "sentinel_after_sha256": sha("1"),
+        "journal_binding_before_sha256": entry_v2.JOURNAL_IDENTITY_BINDING_SHA256,
+        "journal_binding_after_sha256": entry_v2.JOURNAL_IDENTITY_BINDING_SHA256,
         "identity_before_sha256": sha("2"),
         "identity_after_sha256": sha("2"),
         "vault_layout_verified": "true",
@@ -545,7 +545,10 @@ class CatalogV2Tests(unittest.TestCase):
             ({"luks_version": "1"}, "not LUKS2"),
             ({"filesystem": "btrfs"}, "wrong inner filesystem"),
             ({"luks_uuid_after": uuid("9")}, "LUKS UUID"),
-            ({"sentinel_after_sha256": sha("9")}, "vault sentinel changed"),
+            (
+                {"journal_binding_after_sha256": sha("9")},
+                "journal identity binding changed",
+            ),
             ({"identity_after_sha256": sha("9")}, "device identity changed"),
             ({"wrong_key_rejected": "false"}, "wrong_key_rejected"),
         )
@@ -569,6 +572,36 @@ class CatalogV2Tests(unittest.TestCase):
                         firmware="bios",
                         iso_size=iso.stat().st_size,
                         iso_sha256=digest,
+                        layout=layout,
+                    )
+
+    def test_vault_evidence_pins_the_exact_journal_identity_binding(self) -> None:
+        for digest in (
+            "f248a3890e9b96b45e1e371fa4dda54b944ada7cae48c96f66f4951bc6e6515e",
+            sha("9"),
+        ):
+            with self.subTest(digest=digest), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                iso, iso_digest, layout, bios_log, _uefi_log = self._fixture(directory)
+                bios_log.write_text(
+                    synthetic_log(
+                        "bios",
+                        iso_size=iso.stat().st_size,
+                        iso_sha256=iso_digest,
+                        layout_sha256=layout.manifest_sha256,
+                        vault_overrides={
+                            "journal_binding_before_sha256": digest,
+                            "journal_binding_after_sha256": digest,
+                        },
+                    ),
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(ValueError, "wrong journal identity binding"):
+                    entry_v2.attested_log(
+                        bios_log,
+                        firmware="bios",
+                        iso_size=iso.stat().st_size,
+                        iso_sha256=iso_digest,
                         layout=layout,
                     )
 
@@ -596,9 +629,11 @@ class CatalogV2Tests(unittest.TestCase):
 
         false_vault = copy.deepcopy(base)
         false_vault["images"][0]["qemuVaultAttestations"]["bios"][
-            "sentinelVerified"
+            "journalIdentityBindingVerified"
         ] = False
-        with self.assertRaisesRegex(catalog_v2.CatalogV2Error, "persistent sentinel"):
+        with self.assertRaisesRegex(
+            catalog_v2.CatalogV2Error, "journal identity binding"
+        ):
             catalog_v2.parse_trust_catalog_v2(json.dumps(false_vault))
 
     def test_authorization_rejects_a_stale_manifest_digest(self) -> None:
@@ -732,7 +767,8 @@ class CatalogV2Tests(unittest.TestCase):
             schema["$defs"]["usbBootAttestation"]["required"],
         )
         self.assertIn(
-            "sentinelVerified", schema["$defs"]["vaultAttestation"]["required"]
+            "journalIdentityBindingVerified",
+            schema["$defs"]["vaultAttestation"]["required"],
         )
         self.assertIn("cross-field", schema["$comment"])
         self.assertIn("same workflow", image["description"])

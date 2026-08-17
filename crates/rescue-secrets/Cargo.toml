@@ -10,6 +10,8 @@ privileged-probe = ["experimental-vault-manager"]
 [dependencies]
 base64 = "0.22"
 kernaid-device-identity = { path = "../device-identity" }
+kernaid-protocol = { path = "../protocol" }
+kernaid-report-schema = { path = "../report-schema" }
 kernaid-storage = { path = "../storage" }
 rand_core = { version = "0.6", features = ["getrandom"] }
 serde = { version = "1", features = ["derive"] }

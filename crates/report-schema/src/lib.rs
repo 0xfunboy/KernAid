@@ -5,16 +5,16 @@
 //! this crate adds transport framing, duplicate-key rejection and the one
 //! cross-field binding JSON Schema cannot express.
 
-use std::collections::BTreeSet;
+use std::borrow::Borrow;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
-use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
-use serde_json::{Map, Number, Value};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// Largest raw `SessionReport` JSON document the vault accepts.
 pub const MAX_SESSION_REPORT_BYTES: usize = 1024 * 1024;
-const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const MAX_SAFE_INTEGER_DECIMAL: &[u8] = b"9007199254740991";
 
 /// Sanitized failure returned for an untrusted report document.
@@ -39,11 +39,13 @@ impl Error for SessionReportValidationError {}
 
 /// A schema- and semantics-validated report that retains the exact input bytes.
 ///
-/// The bytes are deliberately never parsed and reserialized for signing.
+/// The bytes are deliberately never parsed and reserialized for signing. The
+/// binding copies owned here are scrubbed on drop; `raw` remains borrowed, so
+/// its owner remains responsible for scrubbing that input allocation.
 pub struct ValidatedSessionReport<'a> {
     raw: &'a [u8],
-    session_id: String,
-    target_fingerprint: String,
+    session_id: Zeroizing<String>,
+    target_fingerprint: Zeroizing<String>,
 }
 
 impl ValidatedSessionReport<'_> {
@@ -73,6 +75,15 @@ impl fmt::Debug for ValidatedSessionReport<'_> {
     }
 }
 
+impl Zeroize for ValidatedSessionReport<'_> {
+    fn zeroize(&mut self) {
+        self.session_id.zeroize();
+        self.target_fingerprint.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for ValidatedSessionReport<'_> {}
+
 /// Validate one raw JSON document without changing the bytes that will be
 /// signed. Duplicate object keys are rejected recursively before schema
 /// validation.
@@ -82,27 +93,176 @@ pub fn validate_session_report_json(
     if raw.len() > MAX_SESSION_REPORT_BYTES {
         return Err(SessionReportValidationError::InputTooLarge);
     }
-    if raw.contains(&0) || std::str::from_utf8(raw).is_err() {
+    let Ok(raw_text) = std::str::from_utf8(raw) else {
         return Err(SessionReportValidationError::InvalidReport);
-    }
-    if !exact_report_numbers_are_valid(raw) {
+    };
+    if raw.contains(&0) {
         return Err(SessionReportValidationError::InvalidReport);
     }
 
-    let mut deserializer = serde_json::Deserializer::from_slice(raw);
-    let unique = UniqueValue::deserialize(&mut deserializer)
-        .map_err(|_| SessionReportValidationError::InvalidReport)?;
-    deserializer
-        .end()
-        .map_err(|_| SessionReportValidationError::InvalidReport)?;
-
+    let sensitive = SensitiveJsonParser::parse_document(raw_text)
+        .ok_or(SessionReportValidationError::InvalidReport)?;
     let binding =
-        validate_session_report(&unique.0).ok_or(SessionReportValidationError::InvalidReport)?;
+        validate_session_report(&sensitive).ok_or(SessionReportValidationError::InvalidReport)?;
     Ok(ValidatedSessionReport {
         raw,
-        session_id: binding.session_id.to_owned(),
-        target_fingerprint: binding.target_fingerprint.to_owned(),
+        session_id: protected_copy(binding.session_id),
+        target_fingerprint: protected_copy(binding.target_fingerprint),
     })
+}
+
+fn protected_copy(value: &str) -> Zeroizing<String> {
+    // Wrap the allocation before customer bytes are copied into it so every
+    // return and unwind path scrubs the initialized buffer.
+    let mut protected = Zeroizing::new(String::with_capacity(value.len()));
+    protected.push_str(value);
+    protected
+}
+
+struct SensitiveString(Zeroizing<String>);
+
+impl SensitiveString {
+    fn new(value: Zeroizing<String>) -> Self {
+        Self(value)
+    }
+
+    fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl Borrow<str> for SensitiveString {
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl PartialEq for SensitiveString {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl Eq for SensitiveString {}
+
+impl PartialOrd for SensitiveString {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SensitiveString {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.as_str().cmp(other.as_str())
+    }
+}
+
+impl Zeroize for SensitiveString {
+    fn zeroize(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for SensitiveString {}
+
+impl fmt::Debug for SensitiveString {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SensitiveString")
+            .field("len", &self.0.len())
+            .finish_non_exhaustive()
+    }
+}
+
+type SensitiveObject = BTreeMap<SensitiveString, SensitiveValue>;
+
+enum SensitiveValue {
+    Null,
+    Bool(bool),
+    Number(SensitiveString),
+    String(SensitiveString),
+    Array(Zeroizing<Vec<Self>>),
+    Object(SensitiveObject),
+}
+
+impl SensitiveValue {
+    fn as_object(&self) -> Option<&SensitiveObject> {
+        match self {
+            Self::Object(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    fn as_array(&self) -> Option<&[Self]> {
+        match self {
+            Self::Array(value) => Some(value.as_slice()),
+            _ => None,
+        }
+    }
+
+    fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::String(value) => Some(value.as_str()),
+            _ => None,
+        }
+    }
+
+    fn as_number(&self) -> Option<&str> {
+        match self {
+            Self::Number(value) => Some(value.as_str()),
+            _ => None,
+        }
+    }
+
+    fn as_f64(&self) -> Option<f64> {
+        self.as_number()?.parse().ok()
+    }
+
+    #[cfg(test)]
+    fn as_bool(&self) -> Option<bool> {
+        match self {
+            Self::Bool(value) => Some(*value),
+            _ => None,
+        }
+    }
+}
+
+impl Zeroize for SensitiveValue {
+    fn zeroize(&mut self) {
+        match self {
+            Self::Null => {}
+            Self::Bool(value) => value.zeroize(),
+            Self::Number(value) => value.zeroize(),
+            Self::String(value) => value.zeroize(),
+            Self::Array(values) => values.zeroize(),
+            Self::Object(values) => drop(std::mem::take(values)),
+        }
+    }
+}
+
+impl Drop for SensitiveValue {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for SensitiveValue {}
+
+impl fmt::Debug for SensitiveValue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::Null => "null",
+            Self::Bool(_) => "bool",
+            Self::Number(_) => "number",
+            Self::String(_) => "string",
+            Self::Array(_) => "array",
+            Self::Object(_) => "object",
+        };
+        formatter
+            .debug_struct("SensitiveValue")
+            .field("kind", &kind)
+            .finish_non_exhaustive()
+    }
 }
 
 struct ReportBinding<'a> {
@@ -110,7 +270,7 @@ struct ReportBinding<'a> {
     target_fingerprint: &'a str,
 }
 
-fn validate_session_report(value: &Value) -> Option<ReportBinding<'_>> {
+fn validate_session_report(value: &SensitiveValue) -> Option<ReportBinding<'_>> {
     let report = exact_object(
         value,
         &[
@@ -170,7 +330,7 @@ fn validate_session_report(value: &Value) -> Option<ReportBinding<'_>> {
     })
 }
 
-fn validate_evidence(value: &Value) -> bool {
+fn validate_evidence(value: &SensitiveValue) -> bool {
     let Some(evidence) = exact_object(
         value,
         &[
@@ -207,10 +367,10 @@ fn validate_evidence(value: &Value) -> bool {
         && string(evidence, "trust") == Some("observed-untrusted")
         && bounded_string(evidence, "summary", 0, 8192)
         && string(evidence, "blobRef")
-            .is_some_and(|blob_ref| blob_ref == format!("sha256:{digest}"))
+            .is_some_and(|blob_ref| blob_ref.strip_prefix("sha256:") == Some(digest))
 }
 
-fn validate_diagnosis(value: &Value) -> bool {
+fn validate_diagnosis(value: &SensitiveValue) -> bool {
     let Some(diagnosis) = exact_object(
         value,
         &[
@@ -228,17 +388,21 @@ fn validate_diagnosis(value: &Value) -> bool {
         && bounded_string(diagnosis, "diagnosis", 1, 16_384)
         && diagnosis
             .get("confidence")
-            .and_then(Value::as_f64)
+            .and_then(SensitiveValue::as_f64)
             .is_some_and(|confidence| confidence.is_finite() && (0.0..=1.0).contains(&confidence))
         && unique_string_array(
-            diagnosis.get("evidenceIds").unwrap_or(&Value::Null),
+            diagnosis
+                .get("evidenceIds")
+                .unwrap_or(&SensitiveValue::Null),
             1,
             128,
             128,
             |item| prefixed_id(item, "E-", 128),
         )
         && unique_string_array(
-            diagnosis.get("requestedEvidence").unwrap_or(&Value::Null),
+            diagnosis
+                .get("requestedEvidence")
+                .unwrap_or(&SensitiveValue::Null),
             0,
             128,
             256,
@@ -246,7 +410,7 @@ fn validate_diagnosis(value: &Value) -> bool {
         )
 }
 
-fn validate_approval(value: &Value) -> bool {
+fn validate_approval(value: &SensitiveValue) -> bool {
     let Some(approval) = exact_object(
         value,
         &[
@@ -272,7 +436,7 @@ fn validate_approval(value: &Value) -> bool {
             .is_none_or(|_| bounded_string(approval, "typedConfirmation", 1, 256))
 }
 
-fn validate_execution_event(value: &Value) -> bool {
+fn validate_execution_event(value: &SensitiveValue) -> bool {
     let Some(event) = exact_object(
         value,
         &[
@@ -301,10 +465,10 @@ fn validate_execution_event(value: &Value) -> bool {
 }
 
 fn exact_object<'a>(
-    value: &'a Value,
+    value: &'a SensitiveValue,
     required: &[&str],
     optional: &[&str],
-) -> Option<&'a Map<String, Value>> {
+) -> Option<&'a SensitiveObject> {
     let object = value.as_object()?;
     if required.iter().any(|key| !object.contains_key(*key))
         || object
@@ -316,24 +480,28 @@ fn exact_object<'a>(
     Some(object)
 }
 
-fn string<'a>(object: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
+fn string<'a>(object: &'a SensitiveObject, key: &str) -> Option<&'a str> {
     object.get(key)?.as_str()
 }
 
-fn bounded_string(object: &Map<String, Value>, key: &str, minimum: usize, maximum: usize) -> bool {
+fn bounded_string(object: &SensitiveObject, key: &str, minimum: usize, maximum: usize) -> bool {
     string(object, key).is_some_and(|value| {
         let length = value.chars().count();
         (minimum..=maximum).contains(&length)
     })
 }
 
-fn array<'a>(object: &'a Map<String, Value>, key: &str, maximum: usize) -> Option<&'a Vec<Value>> {
+fn array<'a>(
+    object: &'a SensitiveObject,
+    key: &str,
+    maximum: usize,
+) -> Option<&'a [SensitiveValue]> {
     let values = object.get(key)?.as_array()?;
     (values.len() <= maximum).then_some(values)
 }
 
 fn unique_string_array<F>(
-    value: &Value,
+    value: &SensitiveValue,
     minimum_items: usize,
     maximum_items: usize,
     maximum_string_length: usize,
@@ -386,19 +554,10 @@ fn action_id(value: &str) -> bool {
         })
 }
 
-fn safe_positive_integer(value: &Value) -> bool {
-    let Some(number) = value.as_number() else {
-        return false;
-    };
-    if let Some(integer) = number.as_u64() {
-        return (1..=MAX_SAFE_INTEGER).contains(&integer);
-    }
-    number.as_f64().is_some_and(|number| {
-        number.is_finite()
-            && number.fract() == 0.0
-            && number >= 1.0
-            && number <= MAX_SAFE_INTEGER as f64
-    })
+fn safe_positive_integer(value: &SensitiveValue) -> bool {
+    value
+        .as_number()
+        .is_some_and(|number| exact_positive_safe_integer(number.as_bytes()))
 }
 
 fn valid_rfc3339(value: &str) -> bool {
@@ -539,7 +698,7 @@ impl ReportJsonContext {
 
 struct ExactDecimal {
     negative: bool,
-    coefficient: Vec<u8>,
+    coefficient: Zeroizing<Vec<u8>>,
     scale: i64,
 }
 
@@ -559,12 +718,15 @@ fn exact_decimal(token: &[u8]) -> Option<ExactDecimal> {
     {
         return None;
     }
-    let coefficient = integer
-        .iter()
-        .chain(fraction)
-        .copied()
-        .skip_while(|digit| *digit == b'0')
-        .collect();
+    let capacity = integer.len().checked_add(fraction.len())?;
+    let mut coefficient = Zeroizing::new(Vec::with_capacity(capacity));
+    coefficient.extend(
+        integer
+            .iter()
+            .chain(fraction)
+            .copied()
+            .skip_while(|digit| *digit == b'0'),
+    );
     Some(ExactDecimal {
         negative,
         coefficient,
@@ -624,7 +786,8 @@ fn exact_positive_safe_integer(token: &[u8]) -> bool {
         if length > MAX_SAFE_INTEGER_DECIMAL.len() {
             return false;
         }
-        let mut integer = decimal.coefficient;
+        let mut integer = Zeroizing::new(Vec::with_capacity(length));
+        integer.extend_from_slice(&decimal.coefficient);
         integer.resize(length, b'0');
         integer
     } else {
@@ -641,7 +804,9 @@ fn exact_positive_safe_integer(token: &[u8]) -> bool {
         {
             return false;
         }
-        decimal.coefficient[..integer_length].to_vec()
+        let mut integer = Zeroizing::new(Vec::with_capacity(integer_length));
+        integer.extend_from_slice(&decimal.coefficient[..integer_length]);
+        integer
     };
     integer.len() < MAX_SAFE_INTEGER_DECIMAL.len()
         || (integer.len() == MAX_SAFE_INTEGER_DECIMAL.len()
@@ -672,64 +837,75 @@ fn exact_confidence(token: &[u8]) -> bool {
         && decimal.coefficient[1..].iter().all(|digit| *digit == b'0')
 }
 
-fn exact_report_numbers_are_valid(raw: &[u8]) -> bool {
-    let mut scanner = ReportJsonScanner { raw, offset: 0 };
-    if scanner.parse_value(0, ReportJsonContext::Root).is_none() {
-        return false;
-    }
-    scanner.skip_whitespace();
-    scanner.offset == raw.len()
-}
-
-struct ReportJsonScanner<'a> {
-    raw: &'a [u8],
+/// Narrow JSON parser for the customer-data-bearing report. It never asks
+/// serde_json to decode a string, so escaped customer bytes cannot enter
+/// serde_json's ordinary scratch allocation. Every decoded string is
+/// written directly into an already-`Zeroizing` allocation.
+struct SensitiveJsonParser<'a> {
+    raw: &'a str,
     offset: usize,
 }
 
-impl<'a> ReportJsonScanner<'a> {
-    fn parse_value(&mut self, depth: usize, context: ReportJsonContext) -> Option<()> {
+impl<'a> SensitiveJsonParser<'a> {
+    fn parse_document(raw: &'a str) -> Option<SensitiveValue> {
+        let mut parser = Self { raw, offset: 0 };
+        let value = parser.parse_value(0, ReportJsonContext::Root)?;
+        parser.skip_whitespace();
+        (parser.offset == raw.len()).then_some(value)
+    }
+
+    fn parse_value(&mut self, depth: usize, context: ReportJsonContext) -> Option<SensitiveValue> {
         if depth > 64 {
             return None;
         }
         self.skip_whitespace();
-        match self.raw.get(self.offset)? {
+        match self.byte()? {
             b'{' => self.parse_object(depth + 1, context),
             b'[' => self.parse_array(depth + 1, context),
-            b'"' => self.parse_string_token().map(drop),
-            b'-' | b'0'..=b'9' => {
-                let token = self.parse_number_token()?;
-                match context {
-                    ReportJsonContext::Sequence if !exact_positive_safe_integer(token) => None,
-                    ReportJsonContext::Confidence if !exact_confidence(token) => None,
-                    _ => Some(()),
-                }
+            b'"' => self.parse_string().map(SensitiveValue::String),
+            b'-' | b'0'..=b'9' => self.parse_number(context),
+            b't' => {
+                self.consume_literal(b"true")?;
+                Some(SensitiveValue::Bool(true))
             }
-            b't' => self.consume_literal(b"true"),
-            b'f' => self.consume_literal(b"false"),
-            b'n' => self.consume_literal(b"null"),
+            b'f' => {
+                self.consume_literal(b"false")?;
+                Some(SensitiveValue::Bool(false))
+            }
+            b'n' => {
+                self.consume_literal(b"null")?;
+                Some(SensitiveValue::Null)
+            }
             _ => None,
         }
     }
 
-    fn parse_object(&mut self, depth: usize, context: ReportJsonContext) -> Option<()> {
-        self.offset += 1;
+    fn parse_object(&mut self, depth: usize, context: ReportJsonContext) -> Option<SensitiveValue> {
+        self.consume_byte(b'{')?;
         self.skip_whitespace();
-        if self.raw.get(self.offset) == Some(&b'}') {
+        let mut values = SensitiveObject::new();
+        if self.byte() == Some(b'}') {
             self.offset += 1;
-            return Some(());
+            return Some(SensitiveValue::Object(values));
         }
+
         loop {
             self.skip_whitespace();
-            let key_token = self.parse_string_token()?;
-            let key = serde_json::from_slice::<String>(key_token).ok()?;
+            let key = self.parse_string()?;
+            if values.contains_key(key.as_str()) {
+                return None;
+            }
             self.skip_whitespace();
             self.consume_byte(b':')?;
-            self.parse_value(depth, context.object_value(&key))?;
+            let value = self.parse_value(depth, context.object_value(key.as_str()))?;
+            if values.insert(key, value).is_some() {
+                return None;
+            }
             self.skip_whitespace();
-            match self.raw.get(self.offset)? {
+            match self.byte()? {
                 b'}' => {
                     self.offset += 1;
-                    return Some(());
+                    return Some(SensitiveValue::Object(values));
                 }
                 b',' => self.offset += 1,
                 _ => return None,
@@ -737,20 +913,22 @@ impl<'a> ReportJsonScanner<'a> {
         }
     }
 
-    fn parse_array(&mut self, depth: usize, context: ReportJsonContext) -> Option<()> {
-        self.offset += 1;
+    fn parse_array(&mut self, depth: usize, context: ReportJsonContext) -> Option<SensitiveValue> {
+        self.consume_byte(b'[')?;
         self.skip_whitespace();
-        if self.raw.get(self.offset) == Some(&b']') {
+        let mut values = Zeroizing::new(Vec::new());
+        if self.byte() == Some(b']') {
             self.offset += 1;
-            return Some(());
+            return Some(SensitiveValue::Array(values));
         }
+
         loop {
-            self.parse_value(depth, context.array_item())?;
+            values.push(self.parse_value(depth, context.array_item())?);
             self.skip_whitespace();
-            match self.raw.get(self.offset)? {
+            match self.byte()? {
                 b']' => {
                     self.offset += 1;
-                    return Some(());
+                    return Some(SensitiveValue::Array(values));
                 }
                 b',' => self.offset += 1,
                 _ => return None,
@@ -758,76 +936,161 @@ impl<'a> ReportJsonScanner<'a> {
         }
     }
 
-    fn parse_string_token(&mut self) -> Option<&'a [u8]> {
-        let start = self.offset;
+    fn parse_string(&mut self) -> Option<SensitiveString> {
+        let opening = self.offset;
         self.consume_byte(b'"')?;
-        loop {
-            let byte = *self.raw.get(self.offset)?;
-            match byte {
-                b'"' => {
-                    self.offset += 1;
-                    return self.raw.get(start..self.offset);
-                }
+        let closing = self.string_closing_quote(opening)?;
+        let raw_content_len = closing.checked_sub(self.offset)?;
+        let mut decoded = Zeroizing::new(String::with_capacity(raw_content_len));
+
+        while self.offset < closing {
+            match self.byte()? {
                 b'\\' => {
                     self.offset += 1;
-                    let escaped = *self.raw.get(self.offset)?;
+                    match self.byte()? {
+                        b'"' => decoded.push('"'),
+                        b'\\' => decoded.push('\\'),
+                        b'/' => decoded.push('/'),
+                        b'b' => decoded.push('\u{0008}'),
+                        b'f' => decoded.push('\u{000c}'),
+                        b'n' => decoded.push('\n'),
+                        b'r' => decoded.push('\r'),
+                        b't' => decoded.push('\t'),
+                        b'u' => {
+                            self.offset += 1;
+                            let first = self.parse_hex_quad()?;
+                            let codepoint = if (0xd800..=0xdbff).contains(&first) {
+                                self.consume_byte(b'\\')?;
+                                self.consume_byte(b'u')?;
+                                let second = self.parse_hex_quad()?;
+                                if !(0xdc00..=0xdfff).contains(&second) {
+                                    return None;
+                                }
+                                0x1_0000
+                                    + ((u32::from(first) - 0xd800) << 10)
+                                    + (u32::from(second) - 0xdc00)
+                            } else if (0xdc00..=0xdfff).contains(&first) {
+                                return None;
+                            } else {
+                                u32::from(first)
+                            };
+                            decoded.push(char::from_u32(codepoint)?);
+                            continue;
+                        }
+                        _ => return None,
+                    }
                     self.offset += 1;
+                }
+                0..=0x1f => return None,
+                _ => {
+                    let character = self.raw.get(self.offset..closing)?.chars().next()?;
+                    decoded.push(character);
+                    self.offset += character.len_utf8();
+                }
+            }
+        }
+        self.consume_byte(b'"')?;
+        Some(SensitiveString::new(decoded))
+    }
+
+    fn string_closing_quote(&self, opening: usize) -> Option<usize> {
+        let bytes = self.raw.as_bytes();
+        let mut cursor = opening.checked_add(1)?;
+        loop {
+            match *bytes.get(cursor)? {
+                b'"' => return Some(cursor),
+                b'\\' => {
+                    cursor = cursor.checked_add(1)?;
+                    let escaped = *bytes.get(cursor)?;
+                    cursor = cursor.checked_add(1)?;
                     if escaped == b'u' {
-                        let end = self.offset.checked_add(4)?;
-                        self.raw.get(self.offset..end)?;
-                        self.offset = end;
+                        let end = cursor.checked_add(4)?;
+                        bytes.get(cursor..end)?;
+                        cursor = end;
                     }
                 }
                 0..=0x1f => return None,
-                _ => self.offset += 1,
+                _ => cursor = cursor.checked_add(1)?,
             }
         }
+    }
+
+    fn parse_hex_quad(&mut self) -> Option<u16> {
+        let end = self.offset.checked_add(4)?;
+        let digits = self.raw.as_bytes().get(self.offset..end)?;
+        let mut value = 0_u16;
+        for digit in digits {
+            value = value.checked_mul(16)?.checked_add(match digit {
+                b'0'..=b'9' => u16::from(*digit - b'0'),
+                b'a'..=b'f' => u16::from(*digit - b'a' + 10),
+                b'A'..=b'F' => u16::from(*digit - b'A' + 10),
+                _ => return None,
+            })?;
+        }
+        self.offset = end;
+        Some(value)
+    }
+
+    fn parse_number(&mut self, context: ReportJsonContext) -> Option<SensitiveValue> {
+        let token = self.parse_number_token()?;
+        let text = std::str::from_utf8(token).ok()?;
+        if !text.parse::<f64>().ok().is_some_and(f64::is_finite) {
+            return None;
+        }
+        match context {
+            ReportJsonContext::Sequence if !exact_positive_safe_integer(token) => return None,
+            ReportJsonContext::Confidence if !exact_confidence(token) => return None,
+            _ => {}
+        }
+        Some(SensitiveValue::Number(SensitiveString::new(
+            protected_copy(text),
+        )))
     }
 
     fn parse_number_token(&mut self) -> Option<&'a [u8]> {
         let start = self.offset;
-        if self.raw.get(self.offset) == Some(&b'-') {
+        if self.byte() == Some(b'-') {
             self.offset += 1;
         }
-        match self.raw.get(self.offset)? {
+        match self.byte()? {
             b'0' => self.offset += 1,
             b'1'..=b'9' => {
                 self.offset += 1;
-                while self.raw.get(self.offset).is_some_and(u8::is_ascii_digit) {
+                while self.byte().is_some_and(|byte| byte.is_ascii_digit()) {
                     self.offset += 1;
                 }
             }
             _ => return None,
         }
-        if self.raw.get(self.offset) == Some(&b'.') {
+        if self.byte() == Some(b'.') {
             self.offset += 1;
             let fraction_start = self.offset;
-            while self.raw.get(self.offset).is_some_and(u8::is_ascii_digit) {
+            while self.byte().is_some_and(|byte| byte.is_ascii_digit()) {
                 self.offset += 1;
             }
             if self.offset == fraction_start {
                 return None;
             }
         }
-        if matches!(self.raw.get(self.offset), Some(b'e' | b'E')) {
+        if matches!(self.byte(), Some(b'e' | b'E')) {
             self.offset += 1;
-            if matches!(self.raw.get(self.offset), Some(b'+' | b'-')) {
+            if matches!(self.byte(), Some(b'+' | b'-')) {
                 self.offset += 1;
             }
             let exponent_start = self.offset;
-            while self.raw.get(self.offset).is_some_and(u8::is_ascii_digit) {
+            while self.byte().is_some_and(|byte| byte.is_ascii_digit()) {
                 self.offset += 1;
             }
             if self.offset == exponent_start {
                 return None;
             }
         }
-        self.raw.get(start..self.offset)
+        self.raw.as_bytes().get(start..self.offset)
     }
 
     fn consume_literal(&mut self, literal: &[u8]) -> Option<()> {
         let end = self.offset.checked_add(literal.len())?;
-        if self.raw.get(self.offset..end)? != literal {
+        if self.raw.as_bytes().get(self.offset..end)? != literal {
             return None;
         }
         self.offset = end;
@@ -835,106 +1098,21 @@ impl<'a> ReportJsonScanner<'a> {
     }
 
     fn consume_byte(&mut self, expected: u8) -> Option<()> {
-        if self.raw.get(self.offset) != Some(&expected) {
+        if self.byte() != Some(expected) {
             return None;
         }
         self.offset += 1;
         Some(())
     }
 
+    fn byte(&self) -> Option<u8> {
+        self.raw.as_bytes().get(self.offset).copied()
+    }
+
     fn skip_whitespace(&mut self) {
-        while matches!(
-            self.raw.get(self.offset),
-            Some(b' ' | b'\t' | b'\r' | b'\n')
-        ) {
+        while matches!(self.byte(), Some(b' ' | b'\t' | b'\r' | b'\n')) {
             self.offset += 1;
         }
-    }
-}
-
-struct UniqueValue(Value);
-
-impl<'de> Deserialize<'de> for UniqueValue {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_any(UniqueValueVisitor)
-    }
-}
-
-struct UniqueValueVisitor;
-
-impl<'de> Visitor<'de> for UniqueValueVisitor {
-    type Value = UniqueValue;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a JSON value with unique object keys")
-    }
-
-    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
-        Ok(UniqueValue(Value::Bool(value)))
-    }
-
-    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
-        Ok(UniqueValue(Value::Number(Number::from(value))))
-    }
-
-    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
-        Ok(UniqueValue(Value::Number(Number::from(value))))
-    }
-
-    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        Number::from_f64(value)
-            .map(Value::Number)
-            .map(UniqueValue)
-            .ok_or_else(|| E::custom("non-finite JSON number"))
-    }
-
-    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
-        Ok(UniqueValue(Value::String(value.to_owned())))
-    }
-
-    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
-        Ok(UniqueValue(Value::String(value)))
-    }
-
-    fn visit_none<E>(self) -> Result<Self::Value, E> {
-        Ok(UniqueValue(Value::Null))
-    }
-
-    fn visit_unit<E>(self) -> Result<Self::Value, E> {
-        Ok(UniqueValue(Value::Null))
-    }
-
-    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
-    where
-        A: SeqAccess<'de>,
-    {
-        let mut values = Vec::new();
-        while let Some(value) = sequence.next_element::<UniqueValue>()? {
-            values.push(value.0);
-        }
-        Ok(UniqueValue(Value::Array(values)))
-    }
-
-    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        let mut values = Map::new();
-        let mut keys = BTreeSet::new();
-        while let Some(key) = map.next_key::<String>()? {
-            if !keys.insert(key.clone()) {
-                return Err(de::Error::custom("duplicate JSON object key"));
-            }
-            let value = map.next_value::<UniqueValue>()?;
-            values.insert(key, value.0);
-        }
-        Ok(UniqueValue(Value::Object(values)))
     }
 }
 
@@ -970,12 +1148,25 @@ mod tests {
 
     #[test]
     fn exact_raw_bytes_are_retained_without_debugging_content() {
-        let report = validate_session_report_json(VALID).expect("valid report");
+        let mut report = validate_session_report_json(VALID).expect("valid report");
         assert_eq!(report.raw_json(), VALID);
         assert_eq!(report.session_id(), "S-test");
+        assert_eq!(
+            report.target_fingerprint(),
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
         assert!(format!("{report:?}").contains("raw_len"));
         assert!(!format!("{report:?}").contains("S-test"));
         assert!(!format!("{report:?}").contains("observed"));
+
+        report.zeroize();
+        assert!(report.session_id().is_empty());
+        assert!(report.target_fingerprint().is_empty());
+        assert_eq!(
+            report.raw_json(),
+            VALID,
+            "borrowed bytes remain caller-owned"
+        );
     }
 
     #[test]
@@ -988,7 +1179,8 @@ mod tests {
             validate_session_report_json(duplicate).expect_err("duplicate must fail"),
             SessionReportValidationError::InvalidReport
         );
-        let mut trailing = VALID.to_vec();
+        let mut trailing = Zeroizing::new(Vec::with_capacity(VALID.len() + 2));
+        trailing.extend_from_slice(VALID);
         trailing.extend_from_slice(b"{}");
         assert_eq!(
             validate_session_report_json(&trailing).expect_err("trailing JSON must fail"),
@@ -1010,28 +1202,191 @@ mod tests {
     }
 
     #[test]
+    fn decoded_strings_follow_json_escape_and_surrogate_semantics() {
+        let escaped = std::str::from_utf8(VALID)
+            .expect("fixture is UTF-8")
+            .replace("S-test", r"S-te\u0073t");
+        let report = validate_session_report_json(escaped.as_bytes()).expect("escaped id is valid");
+        assert_eq!(report.session_id(), "S-test");
+
+        for malformed in [
+            br#"{"value":"\ud800"}"#.as_slice(),
+            br#"{"value":"\udc00"}"#.as_slice(),
+            br#"{"value":"\ud800\u0041"}"#.as_slice(),
+            br#"{"value":"\q"}"#.as_slice(),
+        ] {
+            assert!(
+                SensitiveJsonParser::parse_document(
+                    std::str::from_utf8(malformed).expect("ASCII fixture")
+                )
+                .is_none()
+            );
+        }
+
+        let pair = SensitiveJsonParser::parse_document(r#"{"value":"\ud83d\ude80"}"#)
+            .expect("valid surrogate pair");
+        assert_eq!(
+            pair.as_object()
+                .and_then(|object| object.get("value"))
+                .and_then(SensitiveValue::as_str),
+            Some("🚀")
+        );
+    }
+
+    #[test]
+    fn partial_nested_errors_duplicates_unknown_fields_and_trailing_data_are_sanitized() {
+        const SECRET: &str = "MEMORY-HYGIENE-SECRET-71d3";
+        let partial_documents: &[&str] = &[
+            r#"{"outer":{"secret":"MEMORY-HYGIENE-SECRET-71d3","broken":["array-secret",]}}"#,
+            r#"{"outer":{"secret":"MEMORY-HYGIENE-SECRET-71d3","secr\u0065t":"duplicate"}}"#,
+            r#"{"outer":{"secret":"MEMORY-HYGIENE-SECRET-71d3","nested":{"later":"nested-secret","bad":]}}}"#,
+        ];
+        for raw in partial_documents {
+            assert!(SensitiveJsonParser::parse_document(raw).is_none());
+            let error = validate_session_report_json(raw.as_bytes())
+                .expect_err("partial customer tree must fail");
+            let diagnostic = format!("{error:?}: {error}");
+            assert!(!diagnostic.contains(SECRET));
+            assert!(!diagnostic.contains("array-secret"));
+            assert!(!diagnostic.contains("nested-secret"));
+        }
+
+        let valid = std::str::from_utf8(VALID).expect("fixture is UTF-8");
+        let closing = valid.rfind('}').expect("root closing brace");
+        let unknown_suffix = format!(r#", "unknownSecret":"{SECRET}""#);
+        let mut unknown = Zeroizing::new(String::with_capacity(valid.len() + unknown_suffix.len()));
+        unknown.push_str(&valid[..closing]);
+        unknown.push_str(&unknown_suffix);
+        unknown.push_str(&valid[closing..]);
+        let unknown_error = validate_session_report_json(unknown.as_bytes())
+            .expect_err("unknown final field must fail");
+        assert!(!format!("{unknown_error:?}: {unknown_error}").contains(SECRET));
+
+        let trailing_suffix = format!(r#" {{"trailing":"{SECRET}"}}"#);
+        let mut trailing =
+            Zeroizing::new(String::with_capacity(valid.len() + trailing_suffix.len()));
+        trailing.push_str(valid);
+        trailing.push_str(&trailing_suffix);
+        let trailing_error = validate_session_report_json(trailing.as_bytes())
+            .expect_err("trailing customer tree must fail");
+        assert!(!format!("{trailing_error:?}: {trailing_error}").contains(SECRET));
+    }
+
+    #[test]
+    fn sensitive_tree_debug_and_drop_contracts_are_redacted() {
+        fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
+
+        assert_zeroize_on_drop::<SensitiveString>();
+        assert_zeroize_on_drop::<SensitiveValue>();
+        assert_zeroize_on_drop::<ValidatedSessionReport<'static>>();
+
+        let mut parsed = SensitiveJsonParser::parse_document(
+            r#"{"secret":"TREE-SECRET-29a1","items":["ARRAY-SECRET",17]}"#,
+        )
+        .expect("sensitive tree");
+        let debug = format!("{parsed:?}");
+        assert!(!debug.contains("TREE-SECRET-29a1"));
+        assert!(!debug.contains("ARRAY-SECRET"));
+        let secret = parsed
+            .as_object()
+            .and_then(|object| object.get("secret"))
+            .expect("secret member");
+        assert!(!format!("{secret:?}").contains("TREE-SECRET-29a1"));
+
+        parsed.zeroize();
+        assert!(parsed.as_object().is_some_and(BTreeMap::is_empty));
+    }
+
+    #[test]
+    fn production_parser_has_no_plain_customer_string_or_vec_deserializer_path() {
+        let source = include_str!("lib.rs");
+        let production = source
+            .split_once("\n#[cfg(test)]\nmod tests")
+            .expect("test module boundary")
+            .0;
+        let serde_value = ["serde_json::", "Value"].concat();
+        let derived_tree = ["Unique", "Value"].concat();
+
+        for forbidden in [
+            serde_value.as_str(),
+            derived_tree.as_str(),
+            "serde_json::from_slice",
+            "serde_json::from_str",
+            ".to_owned()",
+            ".to_vec()",
+            "format!(",
+            "Option<String>",
+            "Vec<String>",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "plain customer allocation/deserializer path remains: {forbidden}"
+            );
+        }
+        assert_eq!(
+            production.matches("String::with_capacity").count(),
+            production
+                .matches("Zeroizing::new(String::with_capacity")
+                .count(),
+            "every owned string must be protected before its first write"
+        );
+        assert_eq!(
+            production.matches("Vec::").count(),
+            production.matches("Zeroizing::new(Vec::").count(),
+            "every vector allocation must be protected before its first write"
+        );
+        for line in production.lines().filter(|line| line.contains("Vec<")) {
+            assert!(
+                line.contains("Zeroizing<Vec<"),
+                "plain owned vector field remains: {line}"
+            );
+        }
+        for required in [
+            "impl Drop for SensitiveValue",
+            "Self::Object(values) => drop(std::mem::take(values))",
+            "if values.contains_key(key.as_str())",
+            "let mut decoded = Zeroizing::new(String::with_capacity",
+            "let mut values = Zeroizing::new(Vec::new())",
+            "session_id: protected_copy(binding.session_id)",
+            "target_fingerprint: protected_copy(binding.target_fingerprint)",
+        ] {
+            assert!(
+                production.contains(required),
+                "missing RAII guard: {required}"
+            );
+        }
+    }
+
+    #[test]
     fn rust_matches_the_shared_golden_corpus() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../packages/schemas/testdata/session-report");
         let manifest_bytes = fs::read(root.join("manifest.json")).expect("read golden manifest");
-        let manifest: Value =
-            serde_json::from_slice(&manifest_bytes).expect("parse golden manifest");
+        let manifest_text = std::str::from_utf8(&manifest_bytes).expect("UTF-8 golden manifest");
+        let manifest = SensitiveJsonParser::parse_document(manifest_text)
+            .expect("parse golden manifest without serde scratch");
+        let manifest = exact_object(&manifest, &["schemaVersion", "cases"], &[])
+            .expect("exact golden manifest");
         assert_eq!(
-            manifest.get("schemaVersion").and_then(Value::as_u64),
-            Some(1)
+            manifest
+                .get("schemaVersion")
+                .and_then(SensitiveValue::as_number),
+            Some("1")
         );
         let cases = manifest
             .get("cases")
-            .and_then(Value::as_array)
+            .and_then(SensitiveValue::as_array)
             .expect("golden cases");
-        assert!(!cases.is_empty());
+        assert_eq!(cases.len(), 115, "all shared corpus cases must run");
         for case in cases {
-            let name = case.get("name").and_then(Value::as_str).expect("case name");
+            let case =
+                exact_object(case, &["name", "valid", "file"], &[]).expect("exact golden case");
+            let name = string(case, "name").expect("case name");
             let expected = case
                 .get("valid")
-                .and_then(Value::as_bool)
+                .and_then(SensitiveValue::as_bool)
                 .expect("case result");
-            let file = case.get("file").and_then(Value::as_str).expect("case file");
+            let file = string(case, "file").expect("case file");
             let raw = fs::read(root.join(file)).expect("read golden case");
             assert_eq!(
                 validate_session_report_json(&raw).is_ok(),

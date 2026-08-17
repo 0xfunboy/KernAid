@@ -126,6 +126,9 @@ impl Error for RescueSecretError {}
 mod linux;
 
 #[cfg(target_os = "linux")]
+mod application_store;
+
+#[cfg(target_os = "linux")]
 mod bounded_process;
 
 #[cfg(target_os = "linux")]
@@ -138,12 +141,19 @@ mod profile_classifier;
 mod mount_manager;
 
 #[cfg(target_os = "linux")]
+pub use application_store::{
+    ProviderCredentialStatus, RescueApplicationStoreError, RescueReportSummary,
+    RescueVaultApplicationStore,
+};
+#[cfg(target_os = "linux")]
 pub use device_locator::{
     BootVaultLocation, BootVaultLocatorError, LocatedVaultIdentity, LocatedVaultPartition,
     locate_boot_vault,
 };
 #[cfg(target_os = "linux")]
-pub use linux::{RescueDeviceIdentityStore, RescueJournalSecretStore, RescueVaultSecrets};
+pub use linux::RescueVaultSecrets;
+#[cfg(all(target_os = "linux", feature = "privileged-probe"))]
+pub use linux::{RescueDeviceIdentityStore, RescueJournalSecretStore};
 #[cfg(all(target_os = "linux", feature = "experimental-vault-manager"))]
 pub use mount_manager::{
     MapperName, MountedRescueVault, RescueVaultMountManager, VaultMountManagerError,

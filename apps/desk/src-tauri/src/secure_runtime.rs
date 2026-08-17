@@ -549,7 +549,7 @@ pub fn seal_signed_report(
             return Err("La firma del report non è riuscita; riavviare KernAid.".to_owned());
         }
     };
-    let verified_payload = match envelope.verify(&expected_public_key) {
+    let verified_payload = match envelope.verify_zeroizing(&expected_public_key) {
         Ok(payload) => payload,
         Err(_) => {
             inner.audit = AuditRuntimeState::Blocked;
@@ -557,7 +557,7 @@ pub fn seal_signed_report(
             return Err("La firma del report non è verificabile; riavviare KernAid.".to_owned());
         }
     };
-    if verified_payload != payload {
+    if verified_payload.as_slice() != payload {
         return Err("La firma del report non è verificabile.".to_owned());
     }
     let container = serde_json::to_string(&envelope)

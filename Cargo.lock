@@ -2300,8 +2300,7 @@ version = "0.1.0"
 name = "kernaid-report-schema"
 version = "0.1.0"
 dependencies = [
- "serde",
- "serde_json",
+ "zeroize",
 ]
 
 [[package]]
@@ -2310,6 +2309,8 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "kernaid-device-identity",
+ "kernaid-protocol",
+ "kernaid-report-schema",
  "kernaid-storage",
  "rand_core 0.6.4",
  "rustix",

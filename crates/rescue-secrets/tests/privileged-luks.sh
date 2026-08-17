@@ -234,7 +234,7 @@ initialize_attestation="$(
   "$probe_binary" --device "$loop_device" --mapper "$manager_mapper" \
     --mode initialize <"$key_file"
 )"
-if [[ ! "$initialize_attestation" =~ ^KERNAID_RESCUE_VAULT_PROBE_ATTESTATION_V1\ mode=initialize\ sentinel=kernaid-disposable-vault-persistence-v1\ identity_public_key=([0-9a-f]{64})\ clean_shutdown=true$ ]]; then
+if [[ ! "$initialize_attestation" =~ ^KERNAID_RESCUE_VAULT_PROBE_ATTESTATION_V1\ mode=initialize\ journal_binding=device-identity-bound-v1\ identity_public_key=([0-9a-f]{64})\ clean_shutdown=true$ ]]; then
   echo "the initial real-profile attestation was not canonical" >&2
   exit 1
 fi
@@ -245,7 +245,7 @@ verify_attestation="$(
   "$probe_binary" --device "$loop_device" --mapper "$manager_mapper" \
     --mode verify <"$key_file"
 )"
-if [[ ! "$verify_attestation" =~ ^KERNAID_RESCUE_VAULT_PROBE_ATTESTATION_V1\ mode=verify\ sentinel=kernaid-disposable-vault-persistence-v1\ identity_public_key=([0-9a-f]{64})\ clean_shutdown=true$ ]] ||
+if [[ ! "$verify_attestation" =~ ^KERNAID_RESCUE_VAULT_PROBE_ATTESTATION_V1\ mode=verify\ journal_binding=device-identity-bound-v1\ identity_public_key=([0-9a-f]{64})\ clean_shutdown=true$ ]] ||
   [[ "${BASH_REMATCH[1]:-}" != "$identity_public_key" ]]; then
   echo "the reopened real-profile attestation was not canonical and stable" >&2
   exit 1

@@ -10,6 +10,7 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use zeroize::Zeroizing;
 
 const MAX_ENVELOPE_BYTES: u64 = 2 * 1024 * 1024;
 const HELP: &str = "\
@@ -137,7 +138,7 @@ where
     }))
 }
 
-fn read_bounded_regular_file(path: &Path) -> Result<Vec<u8>, CliError> {
+fn read_bounded_regular_file(path: &Path) -> Result<Zeroizing<Vec<u8>>, CliError> {
     let file = File::open(path).map_err(|_| CliError::Input)?;
     let metadata = file.metadata().map_err(|_| CliError::Input)?;
     if !metadata.is_file() {
@@ -147,10 +148,19 @@ fn read_bounded_regular_file(path: &Path) -> Result<Vec<u8>, CliError> {
         return Err(CliError::OversizedInput);
     }
 
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.take(MAX_ENVELOPE_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| CliError::Input)?;
+    let mut bytes = Zeroizing::new(vec![0_u8; (MAX_ENVELOPE_BYTES + 1) as usize]);
+    let mut reader = file.take(MAX_ENVELOPE_BYTES + 1);
+    let mut bytes_read = 0;
+    while bytes_read < bytes.len() {
+        let count = reader
+            .read(&mut bytes[bytes_read..])
+            .map_err(|_| CliError::Input)?;
+        if count == 0 {
+            break;
+        }
+        bytes_read += count;
+    }
+    bytes.truncate(bytes_read);
     if bytes.len() as u64 > MAX_ENVELOPE_BYTES {
         return Err(CliError::OversizedInput);
     }
@@ -379,11 +389,12 @@ mod tests {
     fn conflicting_explicit_anchors_are_rejected_before_input() {
         let first = DeviceIdentity::generate();
         let second = DeviceIdentity::generate();
+        let second_public_key = envelope(&second).public_key.clone();
         let result = invoke(vec![
             OsString::from("--device-id"),
             OsString::from(first.device_id()),
             OsString::from("--public-key"),
-            OsString::from(envelope(&second).public_key),
+            OsString::from(second_public_key),
             OsString::from("does-not-need-to-exist.json"),
         ]);
 

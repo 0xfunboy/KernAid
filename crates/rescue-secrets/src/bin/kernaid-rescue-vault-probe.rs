@@ -5,7 +5,7 @@ mod linux_probe {
     use kernaid_rescue_secrets::{MapperName, RescueVaultMountManager, VaultUnlockRequest};
     use std::{fmt::Write as _, io, os::fd::AsFd, path::PathBuf};
 
-    const SENTINEL_EVENT: &str = "kernaid-disposable-vault-persistence-v1";
+    const JOURNAL_BINDING: &str = "device-identity-bound-v1";
     const ATTESTATION_PREFIX: &str = "KERNAID_RESCUE_VAULT_PROBE_ATTESTATION_V1";
 
     enum Mode {
@@ -23,15 +23,15 @@ mod linux_probe {
         InitializeJournalOpen,
         InitializeJournalRead,
         InitializeJournalNotEmpty,
-        InitializeJournalAppend,
         InitializeIdentityLoad,
         InitializeIdentityPresent,
         InitializeIdentityCreate,
-        VerifyJournalOpen,
-        VerifyJournalRead,
-        VerifyJournalMismatch,
+        InitializeApplicationOpen,
+        InitializeApplicationMismatch,
         VerifyIdentityLoad,
         VerifyIdentityMissing,
+        VerifyApplicationOpen,
+        VerifyApplicationMismatch,
         EncodePublicKey,
         Shutdown(kernaid_rescue_secrets::VaultMountManagerError),
     }
@@ -47,15 +47,15 @@ mod linux_probe {
                 Self::InitializeJournalOpen => "initialize-journal-open",
                 Self::InitializeJournalRead => "initialize-journal-read",
                 Self::InitializeJournalNotEmpty => "initialize-journal-state",
-                Self::InitializeJournalAppend => "initialize-journal-append",
                 Self::InitializeIdentityLoad => "initialize-identity-load",
                 Self::InitializeIdentityPresent => "initialize-identity-state",
                 Self::InitializeIdentityCreate => "initialize-identity-create",
-                Self::VerifyJournalOpen => "verify-journal-open",
-                Self::VerifyJournalRead => "verify-journal-read",
-                Self::VerifyJournalMismatch => "verify-journal-state",
+                Self::InitializeApplicationOpen => "initialize-application-open",
+                Self::InitializeApplicationMismatch => "initialize-application-binding",
                 Self::VerifyIdentityLoad => "verify-identity-load",
                 Self::VerifyIdentityMissing => "verify-identity-state",
+                Self::VerifyApplicationOpen => "verify-application-open",
+                Self::VerifyApplicationMismatch => "verify-application-binding",
                 Self::EncodePublicKey => "encode-public-key",
                 Self::Shutdown(_) => "shutdown",
             }
@@ -71,16 +71,17 @@ mod linux_probe {
                 | Self::Shutdown(error) => error.code(),
                 Self::InitializeJournalOpen
                 | Self::InitializeJournalRead
-                | Self::InitializeJournalAppend
                 | Self::InitializeIdentityLoad
                 | Self::InitializeIdentityCreate
-                | Self::VerifyJournalOpen
-                | Self::VerifyJournalRead
-                | Self::VerifyIdentityLoad => "storage-operation-failed",
+                | Self::InitializeApplicationOpen
+                | Self::VerifyIdentityLoad
+                | Self::VerifyApplicationOpen => "storage-operation-failed",
                 Self::InitializeJournalNotEmpty | Self::InitializeIdentityPresent => {
                     "unexpected-existing-state"
                 }
-                Self::VerifyJournalMismatch => "sentinel-mismatch",
+                Self::InitializeApplicationMismatch | Self::VerifyApplicationMismatch => {
+                    "identity-binding-mismatch"
+                }
                 Self::VerifyIdentityMissing => "identity-missing",
                 Self::EncodePublicKey => "encoding-failed",
             }
@@ -156,9 +157,7 @@ mod linux_probe {
                 {
                     return Err(ProbeFailure::InitializeJournalNotEmpty);
                 }
-                journal
-                    .append(SENTINEL_EVENT.as_bytes())
-                    .map_err(|_| ProbeFailure::InitializeJournalAppend)?;
+                drop(journal);
                 let mut identities = mounted.secrets().device_identity_store();
                 if identities
                     .load_device_identity()
@@ -170,28 +169,32 @@ mod linux_probe {
                 let identity = identities
                     .create_device_identity()
                     .map_err(|_| ProbeFailure::InitializeIdentityCreate)?;
+                let application = mounted
+                    .secrets()
+                    .open_application_store()
+                    .map_err(|_| ProbeFailure::InitializeApplicationOpen)?;
+                if application.device_id() != identity.device_id() {
+                    return Err(ProbeFailure::InitializeApplicationMismatch);
+                }
                 Ok(ProbeAttestation {
                     mode: "initialize",
                     identity_public_key: encode_public_key(identity.public_key())?,
                 })
             }
             Mode::Verify => {
-                let mut journal = mounted
-                    .secrets()
-                    .open_journal()
-                    .map_err(|_| ProbeFailure::VerifyJournalOpen)?;
-                let entries = journal
-                    .entries()
-                    .map_err(|_| ProbeFailure::VerifyJournalRead)?;
-                if entries.len() != 1 || entries[0].event.as_slice() != SENTINEL_EVENT.as_bytes() {
-                    return Err(ProbeFailure::VerifyJournalMismatch);
-                }
                 let identity = mounted
                     .secrets()
                     .device_identity_store()
                     .load_device_identity()
                     .map_err(|_| ProbeFailure::VerifyIdentityLoad)?
                     .ok_or(ProbeFailure::VerifyIdentityMissing)?;
+                let application = mounted
+                    .secrets()
+                    .open_application_store()
+                    .map_err(|_| ProbeFailure::VerifyApplicationOpen)?;
+                if application.device_id() != identity.device_id() {
+                    return Err(ProbeFailure::VerifyApplicationMismatch);
+                }
                 Ok(ProbeAttestation {
                     mode: "verify",
                     identity_public_key: encode_public_key(identity.public_key())?,
@@ -214,8 +217,8 @@ mod linux_probe {
     pub(super) fn entrypoint() {
         match run() {
             Ok(attestation) => println!(
-                "{ATTESTATION_PREFIX} mode={} sentinel={} identity_public_key={} clean_shutdown=true",
-                attestation.mode, SENTINEL_EVENT, attestation.identity_public_key,
+                "{ATTESTATION_PREFIX} mode={} journal_binding={} identity_public_key={} clean_shutdown=true",
+                attestation.mode, JOURNAL_BINDING, attestation.identity_public_key,
             ),
             Err(failure) => {
                 eprintln!(
@@ -244,15 +247,15 @@ mod linux_probe {
                 ProbeFailure::InitializeJournalOpen,
                 ProbeFailure::InitializeJournalRead,
                 ProbeFailure::InitializeJournalNotEmpty,
-                ProbeFailure::InitializeJournalAppend,
                 ProbeFailure::InitializeIdentityLoad,
                 ProbeFailure::InitializeIdentityPresent,
                 ProbeFailure::InitializeIdentityCreate,
-                ProbeFailure::VerifyJournalOpen,
-                ProbeFailure::VerifyJournalRead,
-                ProbeFailure::VerifyJournalMismatch,
+                ProbeFailure::InitializeApplicationOpen,
+                ProbeFailure::InitializeApplicationMismatch,
                 ProbeFailure::VerifyIdentityLoad,
                 ProbeFailure::VerifyIdentityMissing,
+                ProbeFailure::VerifyApplicationOpen,
+                ProbeFailure::VerifyApplicationMismatch,
                 ProbeFailure::EncodePublicKey,
                 ProbeFailure::Shutdown(VaultMountManagerError::CleanupFailed),
             ];

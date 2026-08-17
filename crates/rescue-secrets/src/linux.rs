@@ -2,6 +2,7 @@ use super::{
     MountAttestationClaims, RescueSecretError, VAULT_MARKER_NAME, VAULT_MARKER_V1,
     VaultMountAttestation, VaultOwner,
 };
+use crate::application_store::{RescueApplicationStoreError, RescueVaultApplicationStore};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use kernaid_device_identity::DeviceIdentity;
 use kernaid_storage::{
@@ -29,12 +30,12 @@ use zeroize::Zeroizing;
 
 const STATE_DIRECTORY: &str = ".kernaid-secure-state-v1";
 const LOCK_NAME: &str = ".kernaid-rescue-secrets.lock";
-const JOURNAL_KEY_NAME: &str = "journal-key";
-const JOURNAL_ANCHOR_NAME: &str = "journal-anchor";
-const DEVICE_IDENTITY_NAME: &str = "device-identity";
-const JOURNAL_DATABASE_NAME: &str = "audit.sqlite3";
-const JOURNAL_WAL_NAME: &str = "audit.sqlite3-wal";
-const JOURNAL_SHM_NAME: &str = "audit.sqlite3-shm";
+pub(crate) const JOURNAL_KEY_NAME: &str = "journal-key";
+pub(crate) const JOURNAL_ANCHOR_NAME: &str = "journal-anchor";
+pub(crate) const DEVICE_IDENTITY_NAME: &str = "device-identity";
+pub(crate) const JOURNAL_DATABASE_NAME: &str = "audit.sqlite3";
+pub(crate) const JOURNAL_WAL_NAME: &str = "audit.sqlite3-wal";
+pub(crate) const JOURNAL_SHM_NAME: &str = "audit.sqlite3-shm";
 const ENVELOPE_PREFIX: &[u8] = b"kernaid-rescue-secret-v1:";
 const IDENTITY_SEED_BYTES: usize = 32;
 const MAX_ENVELOPE_BYTES: usize = 256;
@@ -48,6 +49,8 @@ const EXT4_MAGIC_OFFSET: usize = 56;
 const EXT4_ERRORS_OFFSET: usize = 60;
 const EXT4_ERRORS_REMOUNT_READ_ONLY: u16 = 2;
 const ORPHAN_SCAN_BUFFER_BYTES: usize = 8192;
+const MAX_STATE_DIRECTORY_ENTRIES: usize = 288;
+const MAX_STATE_DIRECTORY_NAME_BYTES: usize = 128;
 const DIRECTORY_MODE: u32 = 0o700;
 const FILE_MODE: u32 = 0o600;
 
@@ -55,7 +58,7 @@ const FILE_MODE: u32 = 0o600;
 /// Derived handles borrow this value and therefore cannot outlive the verified
 /// mapping/mount boundary that owns it.
 pub struct RescueVaultSecrets {
-    inner: VaultInner,
+    pub(crate) inner: VaultInner,
 }
 
 impl RescueVaultSecrets {
@@ -76,35 +79,60 @@ impl RescueVaultSecrets {
 
     /// Build a journal secret-store sharing this vault's exclusive lock.
     #[must_use]
+    #[cfg(feature = "privileged-probe")]
     pub fn journal_store(&self) -> RescueJournalSecretStore<'_> {
+        RescueJournalSecretStore { inner: &self.inner }
+    }
+
+    #[cfg(all(test, not(feature = "privileged-probe")))]
+    pub(crate) fn journal_store(&self) -> RescueJournalSecretStore<'_> {
         RescueJournalSecretStore { inner: &self.inner }
     }
 
     /// Build a device-identity store sharing this vault's exclusive lock.
     #[must_use]
+    #[cfg(feature = "privileged-probe")]
     pub fn device_identity_store(&self) -> RescueDeviceIdentityStore<'_> {
+        RescueDeviceIdentityStore { inner: &self.inner }
+    }
+
+    #[cfg(all(test, not(feature = "privileged-probe")))]
+    pub(crate) fn device_identity_store(&self) -> RescueDeviceIdentityStore<'_> {
         RescueDeviceIdentityStore { inner: &self.inner }
     }
 
     /// Explicitly open or initialize the encrypted audit journal. Unlike
     /// [`Self::open`], this is a state-mutating application operation and must
     /// only be called after the pre-provisioned vault boundary is accepted.
+    #[cfg(feature = "privileged-probe")]
     pub fn open_journal(
         &self,
     ) -> Result<SecureJournal<RescueJournalSecretStore<'_>>, JournalError> {
-        self.inner
-            .preflight_journal_layout()
-            .map_err(|_| JournalError::InvalidPath)?;
-        let path = self
-            .inner
-            .root_path
-            .join(STATE_DIRECTORY)
-            .join(JOURNAL_DATABASE_NAME);
-        SecureJournal::open(&path, self.journal_store())
+        self.inner.open_application_journal()
+    }
+
+    #[cfg(all(test, not(feature = "privileged-probe")))]
+    pub(crate) fn open_journal(
+        &self,
+    ) -> Result<SecureJournal<RescueJournalSecretStore<'_>>, JournalError> {
+        self.inner.open_application_journal()
+    }
+
+    /// Open the closed, descriptor-oriented Rescue application store.
+    ///
+    /// The device identity must already exist. This call never creates or
+    /// replaces it and does not expose a raw journal append or signing API.
+    pub fn open_application_store(
+        &self,
+    ) -> Result<RescueVaultApplicationStore<'_>, RescueApplicationStoreError> {
+        RescueVaultApplicationStore::open(&self.inner)
     }
 
     #[cfg(test)]
-    fn open_for_test(root: impl AsRef<Path>, owner: VaultOwner) -> Result<Self, RescueSecretError> {
+    pub(crate) fn open_for_test(
+        root: impl AsRef<Path>,
+        owner: VaultOwner,
+    ) -> Result<Self, RescueSecretError> {
         Self::open_with_policy(root.as_ref(), owner, MountPolicy::test_fixture())
     }
 
@@ -150,7 +178,12 @@ impl RescueVaultSecrets {
         {
             return Err(RescueSecretError::UnsafePath);
         }
-        reject_orphan_temporary_files(&state_fd, root_mount_id)?;
+        recover_or_reject_orphan_temporary_file(
+            &state_fd,
+            owner,
+            state_state.device,
+            root_mount_id,
+        )?;
 
         let inner = VaultInner {
             root_path,
@@ -164,6 +197,7 @@ impl RescueVaultSecrets {
             owner,
             mount_policy,
             operation_lock: Mutex::new(()),
+            application_lock: Mutex::new(()),
         };
         inner.ensure_integrity()?;
         Ok(Self { inner })
@@ -172,7 +206,7 @@ impl RescueVaultSecrets {
 
 /// LUKS-vault implementation of the encrypted journal's secret-store trait.
 pub struct RescueJournalSecretStore<'vault> {
-    inner: &'vault VaultInner,
+    pub(crate) inner: &'vault VaultInner,
 }
 
 impl JournalSecretStore for RescueJournalSecretStore<'_> {
@@ -235,7 +269,7 @@ impl RescueJournalSecretStore<'_> {
 /// Explicit Rescue device-identity persistence. Loading never creates, and
 /// creation never overwrites an existing or malformed identity.
 pub struct RescueDeviceIdentityStore<'vault> {
-    inner: &'vault VaultInner,
+    pub(crate) inner: &'vault VaultInner,
 }
 
 impl RescueDeviceIdentityStore<'_> {
@@ -249,6 +283,7 @@ impl RescueDeviceIdentityStore<'_> {
     }
 
     /// Persist a caller-created identity only if no identity file exists.
+    #[cfg(any(test, feature = "privileged-probe"))]
     pub fn store_new_device_identity(
         &mut self,
         identity: &DeviceIdentity,
@@ -270,6 +305,7 @@ impl RescueDeviceIdentityStore<'_> {
 
     /// Generate and persist an identity as an explicit first-run action.
     /// There is intentionally no load-or-create API.
+    #[cfg(any(test, feature = "privileged-probe"))]
     pub fn create_device_identity(&mut self) -> Result<DeviceIdentity, RescueSecretError> {
         if self.load_device_identity()?.is_some() {
             return Err(RescueSecretError::IdentityAlreadyExists);
@@ -280,7 +316,7 @@ impl RescueDeviceIdentityStore<'_> {
     }
 }
 
-struct VaultInner {
+pub(crate) struct VaultInner {
     root_path: PathBuf,
     root_fd: OwnedFd,
     root_state: FileState,
@@ -292,10 +328,11 @@ struct VaultInner {
     owner: VaultOwner,
     mount_policy: MountPolicy,
     operation_lock: Mutex<()>,
+    application_lock: Mutex<()>,
 }
 
 impl VaultInner {
-    fn preflight_journal_layout(&self) -> Result<(), RescueSecretError> {
+    pub(crate) fn preflight_journal_layout(&self) -> Result<(), RescueSecretError> {
         let _guard = self.operation_guard()?;
         self.ensure_integrity()?;
         let database = verify_optional_journal_file(self, JOURNAL_DATABASE_NAME)?;
@@ -307,13 +344,22 @@ impl VaultInner {
         Ok(())
     }
 
-    fn operation_guard(&self) -> Result<MutexGuard<'_, ()>, RescueSecretError> {
+    pub(crate) fn operation_guard(&self) -> Result<MutexGuard<'_, ()>, RescueSecretError> {
         self.operation_lock
             .lock()
             .map_err(|_| RescueSecretError::StorageUnavailable)
     }
 
-    fn ensure_integrity(&self) -> Result<(), RescueSecretError> {
+    pub(crate) fn application_guard(&self) -> Result<MutexGuard<'_, ()>, RescueSecretError> {
+        self.application_lock
+            .try_lock()
+            .map_err(|error| match error {
+                std::sync::TryLockError::WouldBlock => RescueSecretError::VaultLocked,
+                std::sync::TryLockError::Poisoned(_) => RescueSecretError::StorageUnavailable,
+            })
+    }
+
+    pub(crate) fn ensure_integrity(&self) -> Result<(), RescueSecretError> {
         let root_descriptor = directory_state(&self.root_fd, self.owner, DIRECTORY_MODE)?;
         if !root_descriptor.same_object(&self.root_state)
             || descriptor_mount_id(&self.root_fd)? != self.root_mount_id
@@ -363,6 +409,34 @@ impl VaultInner {
             return Err(RescueSecretError::StaleVault);
         }
         Ok(())
+    }
+
+    pub(crate) fn open_application_journal(
+        &self,
+    ) -> Result<SecureJournal<RescueJournalSecretStore<'_>>, JournalError> {
+        self.preflight_journal_layout()
+            .map_err(|_| JournalError::InvalidPath)?;
+        let path = self
+            .root_path
+            .join(STATE_DIRECTORY)
+            .join(JOURNAL_DATABASE_NAME);
+        SecureJournal::open(&path, RescueJournalSecretStore { inner: self })
+    }
+
+    pub(crate) fn state_directory_fd(&self) -> &OwnedFd {
+        &self.state_fd
+    }
+
+    pub(crate) const fn state_device(&self) -> u64 {
+        self.state_state.device
+    }
+
+    pub(crate) const fn root_mount_id(&self) -> u64 {
+        self.root_mount_id
+    }
+
+    pub(crate) const fn owner(&self) -> VaultOwner {
+        self.owner
     }
 
     fn load_secret(
@@ -440,6 +514,8 @@ enum WriteStage {
     Complete,
     #[cfg(test)]
     FailBeforeRename,
+    #[cfg(test)]
+    CrashAfterDirectorySync,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -734,8 +810,10 @@ fn verify_optional_journal_file(vault: &VaultInner, name: &str) -> Result<bool, 
     Ok(true)
 }
 
-fn reject_orphan_temporary_files(
+fn recover_or_reject_orphan_temporary_file(
     directory: &OwnedFd,
+    owner: VaultOwner,
+    expected_device: u64,
     expected_mount_id: u64,
 ) -> Result<(), RescueSecretError> {
     let scan_fd = open_child(
@@ -749,19 +827,232 @@ fn reject_orphan_temporary_files(
         return Err(RescueSecretError::UnsafePath);
     }
 
+    let mut orphan_name = None;
+    let mut entry_count = 0_usize;
     let mut buffer = [MaybeUninit::<u8>::uninit(); ORPHAN_SCAN_BUFFER_BYTES];
     let mut entries = RawDir::new(&scan_fd, &mut buffer);
     while let Some(entry) = entries.next() {
         let entry = entry.map_err(|_| RescueSecretError::StorageUnavailable)?;
         let name = entry.file_name().to_bytes();
-        if name == b"." || name == b".." || !name.starts_with(b".tmp-") {
+        if name == b"." || name == b".." {
             continue;
         }
-        // Unlock/open is layout-validation only. Recovery or deletion of a
-        // prior crash artifact requires a separate explicit maintenance flow.
-        return Err(RescueSecretError::UnsafePath);
+        entry_count = entry_count
+            .checked_add(1)
+            .ok_or(RescueSecretError::UnsafePath)?;
+        if entry_count > MAX_STATE_DIRECTORY_ENTRIES || name.len() > MAX_STATE_DIRECTORY_NAME_BYTES
+        {
+            return Err(RescueSecretError::UnsafePath);
+        }
+        if !name.starts_with(b".tmp-") {
+            continue;
+        }
+        if name.len() != 37
+            || !name[5..]
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+            || orphan_name.is_some()
+        {
+            return Err(RescueSecretError::UnsafePath);
+        }
+        orphan_name = Some(
+            std::str::from_utf8(name)
+                .map_err(|_| RescueSecretError::UnsafePath)?
+                .to_owned(),
+        );
+    }
+    let Some(orphan_name) = orphan_name else {
+        return Ok(());
+    };
+
+    let orphan = open_recovery_file(
+        directory,
+        &orphan_name,
+        owner,
+        expected_device,
+        expected_mount_id,
+    )?
+    .ok_or(RescueSecretError::UnsafePath)?;
+
+    let mut decoded_kind = None;
+    for kind in [
+        SecretKind::JournalKey,
+        SecretKind::JournalAnchor,
+        SecretKind::DeviceIdentity,
+    ] {
+        if decode_secret(kind, &orphan.envelope).is_ok() && decoded_kind.replace(kind).is_some() {
+            return Err(RescueSecretError::UnsafePath);
+        }
+    }
+    let kind = decoded_kind.ok_or(RescueSecretError::UnsafePath)?;
+    let orphan_value = decode_secret(kind, &orphan.envelope)?;
+    validate_recovery_secret_value(kind, &orphan_value)?;
+    let final_file = open_recovery_file(
+        directory,
+        kind.filename(),
+        owner,
+        expected_device,
+        expected_mount_id,
+    )?;
+    match final_file {
+        None => {
+            recheck_open_recovery_file(directory, &orphan_name, owner, &orphan)?;
+            if optional_named_state(directory, kind.filename(), owner)?.is_some() {
+                return Err(RescueSecretError::ConcurrentWrite);
+            }
+            rfs::renameat_with(
+                directory,
+                &orphan_name,
+                directory,
+                kind.filename(),
+                RenameFlags::NOREPLACE,
+            )
+            .map_err(|_| RescueSecretError::ConcurrentWrite)?;
+            recheck_open_recovery_file_same_object(directory, kind.filename(), owner, &orphan)?;
+            sync_directory(directory)?;
+            let persisted = open_recovery_file(
+                directory,
+                kind.filename(),
+                owner,
+                expected_device,
+                expected_mount_id,
+            )?
+            .ok_or(RescueSecretError::WriteVerificationFailed)?;
+            if !persisted.state.same_object(&orphan.state)
+                || persisted.envelope.as_slice() != orphan.envelope.as_slice()
+                || decode_secret(kind, &persisted.envelope)?.as_slice() != orphan_value.as_slice()
+            {
+                return Err(RescueSecretError::WriteVerificationFailed);
+            }
+        }
+        Some(final_file) => {
+            let final_value = decode_secret(kind, &final_file.envelope)
+                .map_err(|_| RescueSecretError::UnsafePath)?;
+            validate_recovery_secret_value(kind, &final_value)?;
+            if kind != SecretKind::JournalAnchor
+                && final_value.as_slice() != orphan_value.as_slice()
+            {
+                return Err(RescueSecretError::UnsafePath);
+            }
+            recheck_open_recovery_file(directory, kind.filename(), owner, &final_file)?;
+            recheck_open_recovery_file(directory, &orphan_name, owner, &orphan)?;
+            rfs::unlinkat(directory, &orphan_name, AtFlags::empty())
+                .map_err(|_| RescueSecretError::StorageUnavailable)?;
+            let unlinked = rfs::fstat(&orphan.descriptor)
+                .map_err(|_| RescueSecretError::StorageUnavailable)?;
+            if !orphan.state.same_object(&FileState::from_stat(&unlinked)) || unlinked.st_nlink != 0
+            {
+                return Err(RescueSecretError::ConcurrentWrite);
+            }
+            if optional_named_state(directory, &orphan_name, owner)?.is_some() {
+                return Err(RescueSecretError::ConcurrentWrite);
+            }
+            recheck_open_recovery_file(directory, kind.filename(), owner, &final_file)?;
+            sync_directory(directory)?;
+        }
     }
     Ok(())
+}
+
+struct OpenRecoveryFile {
+    descriptor: File,
+    state: FileState,
+    envelope: Zeroizing<Vec<u8>>,
+}
+
+fn open_recovery_file(
+    directory: &OwnedFd,
+    name: &str,
+    owner: VaultOwner,
+    expected_device: u64,
+    expected_mount_id: u64,
+) -> Result<Option<OpenRecoveryFile>, RescueSecretError> {
+    let descriptor = match open_child(
+        directory,
+        Path::new(name),
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(error) if error == rustix::io::Errno::NOENT => return Ok(None),
+        Err(_) => return Err(RescueSecretError::UnsafePath),
+    };
+    let before = regular_file_state(&descriptor, owner, FILE_MODE)?;
+    if before.device != expected_device || descriptor_mount_id(&descriptor)? != expected_mount_id {
+        return Err(RescueSecretError::UnsafePath);
+    }
+    let size = usize::try_from(before.size).map_err(|_| RescueSecretError::InvalidStoredValue)?;
+    if size > MAX_ENVELOPE_BYTES {
+        return Err(RescueSecretError::InvalidStoredValue);
+    }
+    let mut descriptor = File::from(descriptor);
+    let mut envelope = Zeroizing::new(Vec::with_capacity(size));
+    Read::by_ref(&mut descriptor)
+        .take((MAX_ENVELOPE_BYTES + 1) as u64)
+        .read_to_end(envelope.as_mut())
+        .map_err(|_| RescueSecretError::StorageUnavailable)?;
+    if envelope.len() != size || envelope.len() > MAX_ENVELOPE_BYTES {
+        return Err(RescueSecretError::StaleVault);
+    }
+    let opened = OpenRecoveryFile {
+        descriptor,
+        state: before,
+        envelope,
+    };
+    recheck_open_recovery_file(directory, name, owner, &opened)?;
+    Ok(Some(opened))
+}
+
+fn recheck_open_recovery_file(
+    directory: &OwnedFd,
+    name: &str,
+    owner: VaultOwner,
+    opened: &OpenRecoveryFile,
+) -> Result<(), RescueSecretError> {
+    let descriptor_stat =
+        rfs::fstat(&opened.descriptor).map_err(|_| RescueSecretError::StorageUnavailable)?;
+    validate_regular_stat(&descriptor_stat, owner, FILE_MODE)?;
+    let named_stat = rfs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|_| RescueSecretError::StaleVault)?;
+    validate_regular_stat(&named_stat, owner, FILE_MODE)?;
+    if FileState::from_stat(&descriptor_stat) != opened.state
+        || FileState::from_stat(&named_stat) != opened.state
+    {
+        return Err(RescueSecretError::StaleVault);
+    }
+    Ok(())
+}
+
+fn recheck_open_recovery_file_same_object(
+    directory: &OwnedFd,
+    name: &str,
+    owner: VaultOwner,
+    opened: &OpenRecoveryFile,
+) -> Result<(), RescueSecretError> {
+    let descriptor_stat =
+        rfs::fstat(&opened.descriptor).map_err(|_| RescueSecretError::StorageUnavailable)?;
+    validate_regular_stat(&descriptor_stat, owner, FILE_MODE)?;
+    let named_stat = rfs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|_| RescueSecretError::StaleVault)?;
+    validate_regular_stat(&named_stat, owner, FILE_MODE)?;
+    let descriptor_state = FileState::from_stat(&descriptor_stat);
+    let named_state = FileState::from_stat(&named_stat);
+    if !opened.state.same_object(&descriptor_state) || descriptor_state != named_state {
+        return Err(RescueSecretError::StaleVault);
+    }
+    Ok(())
+}
+
+fn validate_recovery_secret_value(kind: SecretKind, value: &[u8]) -> Result<(), RescueSecretError> {
+    match kind {
+        SecretKind::JournalKey => Ok(()),
+        SecretKind::JournalAnchor => JournalAnchor::from_bytes(value)
+            .map(|_| ())
+            .map_err(|_| RescueSecretError::UnsafePath),
+        SecretKind::DeviceIdentity => DeviceIdentity::from_seed(value)
+            .map(|_| ())
+            .map_err(|_| RescueSecretError::UnsafePath),
+    }
 }
 
 fn read_optional_named(
@@ -905,6 +1196,13 @@ fn atomic_store(
 
     #[cfg(test)]
     if stage == WriteStage::FailBeforeRename {
+        return Err(RescueSecretError::StorageUnavailable);
+    }
+    #[cfg(test)]
+    if stage == WriteStage::CrashAfterDirectorySync {
+        // Model abrupt process/power loss: unlike an ordinary error return,
+        // the temporary-file destructor would never have run.
+        guard.disarm();
         return Err(RescueSecretError::StorageUnavailable);
     }
     #[cfg(not(test))]
@@ -1611,6 +1909,71 @@ mod tests {
         }
     }
 
+    fn write_test_secret_file(path: &Path, kind: SecretKind, value: &[u8]) {
+        let encoded = encode_secret(kind, value).expect("encode test secret");
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(FILE_MODE)
+            .open(path)
+            .expect("create test secret file");
+        file.write_all(&encoded).expect("write test secret file");
+        file.sync_all().expect("sync test secret file");
+    }
+
+    #[test]
+    fn subprocess_crash_writer_helper() {
+        let Some(root) = std::env::var_os("KERNAID_TEST_CRASH_VAULT_ROOT") else {
+            return;
+        };
+        let ready =
+            PathBuf::from(std::env::var_os("KERNAID_TEST_CRASH_READY").expect("crash ready path"));
+        let kind = match std::env::var("KERNAID_TEST_CRASH_SECRET")
+            .expect("crash secret kind")
+            .as_str()
+        {
+            "journal-key" => SecretKind::JournalKey,
+            "journal-anchor" => SecretKind::JournalAnchor,
+            "device-identity" => SecretKind::DeviceIdentity,
+            _ => return,
+        };
+        let value = Zeroizing::new(match kind {
+            SecretKind::JournalKey => vec![71; JOURNAL_KEY_BYTES],
+            SecretKind::JournalAnchor => anchor(71).to_bytes().to_vec(),
+            SecretKind::DeviceIdentity => vec![72; IDENTITY_SEED_BYTES],
+        });
+        let envelope = encode_secret(kind, &value).expect("encode crash secret");
+        let vault = RescueVaultSecrets::open_for_test(PathBuf::from(root), VaultOwner::effective())
+            .expect("open crash child vault");
+        let (mut file, _state, mut guard) =
+            create_temporary_file(&vault.inner.state_fd, vault.inner.owner)
+                .expect("create crash temp");
+        file.write_all(&envelope).expect("write crash temp");
+        file.flush().expect("flush crash temp");
+        rfs::fchmod(&file, Mode::RUSR | Mode::WUSR).expect("set crash temp mode");
+        file.sync_all().expect("sync crash temp");
+        assert_eq!(
+            read_optional_named(&vault.inner.state_fd, guard.name(), vault.inner.owner)
+                .expect("read crash temp")
+                .expect("crash temp exists")
+                .as_slice(),
+            envelope.as_slice()
+        );
+        sync_directory(&vault.inner.state_fd).expect("sync crash temp directory");
+        guard.disarm();
+
+        let ready_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(FILE_MODE)
+            .open(ready)
+            .expect("create crash-ready marker");
+        ready_file.sync_all().expect("sync crash-ready marker");
+        loop {
+            std::thread::park_timeout(std::time::Duration::from_secs(60));
+        }
+    }
+
     #[test]
     fn journal_and_identity_roundtrip_across_reopen() {
         let fixture = Fixture::new();
@@ -1822,6 +2185,484 @@ mod tests {
                 .iter()
                 .any(|name| name.as_bytes().starts_with(b".tmp-"))
         );
+    }
+
+    #[test]
+    fn crash_orphans_for_each_core_secret_recover_deterministically() {
+        {
+            let fixture = Fixture::new();
+            {
+                let vault = fixture.open();
+                assert_eq!(
+                    vault.inner.store_secret_with_stage(
+                        SecretKind::JournalKey,
+                        key(31).expose_secret(),
+                        ReplaceMode::Replace,
+                        WriteStage::CrashAfterDirectorySync,
+                    ),
+                    Err(RescueSecretError::StorageUnavailable)
+                );
+            }
+            let vault = fixture.open();
+            assert_eq!(
+                vault
+                    .journal_store()
+                    .load_key()
+                    .expect("load recovered key")
+                    .expect("recovered key")
+                    .expose_secret(),
+                &[31; JOURNAL_KEY_BYTES]
+            );
+        }
+
+        {
+            let fixture = Fixture::new();
+            let expected = anchor(17);
+            {
+                let vault = fixture.open();
+                assert_eq!(
+                    vault.inner.store_secret_with_stage(
+                        SecretKind::JournalAnchor,
+                        &expected.to_bytes(),
+                        ReplaceMode::Replace,
+                        WriteStage::CrashAfterDirectorySync,
+                    ),
+                    Err(RescueSecretError::StorageUnavailable)
+                );
+            }
+            let vault = fixture.open();
+            assert_eq!(
+                vault
+                    .journal_store()
+                    .load_anchor()
+                    .expect("load recovered anchor"),
+                Some(expected)
+            );
+        }
+
+        {
+            let fixture = Fixture::new();
+            let identity = DeviceIdentity::generate();
+            let seed = identity.export_seed_for_encrypted_storage();
+            let expected_public_key = identity.public_key();
+            {
+                let vault = fixture.open();
+                assert_eq!(
+                    vault.inner.store_secret_with_stage(
+                        SecretKind::DeviceIdentity,
+                        seed.as_slice(),
+                        ReplaceMode::CreateOnly,
+                        WriteStage::CrashAfterDirectorySync,
+                    ),
+                    Err(RescueSecretError::StorageUnavailable)
+                );
+            }
+            let vault = fixture.open();
+            assert_eq!(
+                vault
+                    .device_identity_store()
+                    .load_device_identity()
+                    .expect("load recovered identity")
+                    .expect("recovered identity")
+                    .public_key(),
+                expected_public_key
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "SIGKILL fork must run without parallel vault descriptors"]
+    fn sigkill_after_temp_directory_fsync_recovers_each_core_secret() {
+        for kind in ["journal-key", "journal-anchor", "device-identity"] {
+            let fixture = Fixture::new();
+            let ready = fixture._temporary.path().join(format!("ready-{kind}"));
+            let mut child = std::process::Command::new(
+                std::env::current_exe().expect("resolve current test executable"),
+            )
+            .args([
+                "--exact",
+                "linux::tests::subprocess_crash_writer_helper",
+                "--nocapture",
+            ])
+            .env("KERNAID_TEST_CRASH_VAULT_ROOT", &fixture.root)
+            .env("KERNAID_TEST_CRASH_READY", &ready)
+            .env("KERNAID_TEST_CRASH_SECRET", kind)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn crash writer");
+            let mut ready_seen = false;
+            for _ in 0..500 {
+                if ready.exists() {
+                    ready_seen = true;
+                    break;
+                }
+                if child.try_wait().expect("poll crash writer").is_some() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(
+                ready_seen,
+                "crash writer reached durable boundary for {kind}"
+            );
+            child.kill().expect("SIGKILL crash writer");
+            let status = child.wait().expect("wait for killed crash writer");
+            assert!(!status.success());
+
+            let vault = fixture.open();
+            match kind {
+                "journal-key" => assert_eq!(
+                    vault
+                        .journal_store()
+                        .load_key()
+                        .expect("load SIGKILL-recovered key")
+                        .expect("SIGKILL-recovered key")
+                        .expose_secret(),
+                    &[71; JOURNAL_KEY_BYTES]
+                ),
+                "journal-anchor" => assert_eq!(
+                    vault
+                        .journal_store()
+                        .load_anchor()
+                        .expect("load SIGKILL-recovered anchor"),
+                    Some(anchor(71))
+                ),
+                "device-identity" => assert_eq!(
+                    vault
+                        .device_identity_store()
+                        .load_device_identity()
+                        .expect("load SIGKILL-recovered identity")
+                        .expect("SIGKILL-recovered identity")
+                        .public_key(),
+                    DeviceIdentity::from_seed(&[72; IDENTITY_SEED_BYTES])
+                        .expect("expected SIGKILL identity")
+                        .public_key()
+                ),
+                _ => unreachable!(),
+            }
+            assert!(
+                fs::read_dir(fixture.root.join(STATE_DIRECTORY))
+                    .expect("scan recovered state")
+                    .all(|entry| !entry
+                        .expect("state entry")
+                        .file_name()
+                        .as_bytes()
+                        .starts_with(b".tmp-"))
+            );
+        }
+    }
+
+    #[test]
+    fn crash_orphan_reconciliation_never_guesses_between_valid_values() {
+        let fixture = Fixture::new();
+        {
+            let vault = fixture.open();
+            vault
+                .journal_store()
+                .store_key(&key(41))
+                .expect("store final key");
+            assert_eq!(
+                vault.inner.store_secret_with_stage(
+                    SecretKind::JournalKey,
+                    key(42).expose_secret(),
+                    ReplaceMode::Replace,
+                    WriteStage::CrashAfterDirectorySync,
+                ),
+                Err(RescueSecretError::StorageUnavailable)
+            );
+        }
+        let orphan = fs::read_dir(fixture.root.join(STATE_DIRECTORY))
+            .expect("read state directory")
+            .map(|entry| entry.expect("directory entry").path())
+            .find(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.as_bytes().starts_with(b".tmp-"))
+            })
+            .expect("preserved crash orphan");
+        assert_eq!(
+            RescueVaultSecrets::open_for_test(&fixture.root, fixture.owner).err(),
+            Some(RescueSecretError::UnsafePath)
+        );
+        assert!(orphan.exists());
+    }
+
+    #[test]
+    fn newer_anchor_orphan_defers_to_valid_final_for_journal_replay() {
+        let fixture = Fixture::new();
+        {
+            let vault = fixture.open();
+            vault
+                .journal_store()
+                .store_anchor(&anchor(21))
+                .expect("store final anchor");
+            assert_eq!(
+                vault.inner.store_secret_with_stage(
+                    SecretKind::JournalAnchor,
+                    &anchor(22).to_bytes(),
+                    ReplaceMode::Replace,
+                    WriteStage::CrashAfterDirectorySync,
+                ),
+                Err(RescueSecretError::StorageUnavailable)
+            );
+        }
+        let vault = fixture.open();
+        assert_eq!(
+            vault
+                .journal_store()
+                .load_anchor()
+                .expect("load retained final anchor"),
+            Some(anchor(21))
+        );
+        assert!(
+            fs::read_dir(fixture.root.join(STATE_DIRECTORY))
+                .expect("read state directory")
+                .all(|entry| !entry
+                    .expect("directory entry")
+                    .file_name()
+                    .as_bytes()
+                    .starts_with(b".tmp-"))
+        );
+    }
+
+    #[test]
+    fn anchor_orphan_cleanup_composes_with_authenticated_database_ahead_recovery() {
+        let fixture = Fixture::new();
+        {
+            let vault = fixture.open();
+            vault
+                .device_identity_store()
+                .create_device_identity()
+                .expect("provision application identity");
+            vault
+                .open_application_store()
+                .expect("bootstrap identity binding");
+        }
+        let anchor_one = fs::read(fixture.state_path(JOURNAL_ANCHOR_NAME))
+            .expect("read sequence-one anchor envelope");
+        {
+            let vault = fixture.open();
+            vault
+                .open_journal()
+                .expect("open application journal")
+                .append(
+                    br#"{"type":"provider.openai.logout.intent","transactionId":"00000000000000000000000000000001","oldSha256":null}"#,
+                )
+                .expect("append canonical sequence-two intent");
+        }
+        let anchor_two = fs::read(fixture.state_path(JOURNAL_ANCHOR_NAME))
+            .expect("read sequence-two anchor envelope");
+        assert_ne!(anchor_one, anchor_two);
+        fs::write(fixture.state_path(JOURNAL_ANCHOR_NAME), &anchor_one)
+            .expect("restore prefix anchor");
+        fs::set_permissions(
+            fixture.state_path(JOURNAL_ANCHOR_NAME),
+            fs::Permissions::from_mode(FILE_MODE),
+        )
+        .expect("restore anchor mode");
+        let orphan_name = ".tmp-abcdefabcdefabcdefabcdefabcdefab";
+        let mut orphan = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(FILE_MODE)
+            .open(fixture.state_path(orphan_name))
+            .expect("create sequence-two anchor orphan");
+        orphan
+            .write_all(&anchor_two)
+            .expect("write sequence-two anchor orphan");
+        orphan.sync_all().expect("sync anchor orphan");
+        drop(orphan);
+
+        {
+            let vault = fixture.open();
+            assert!(!fixture.state_path(orphan_name).exists());
+            vault
+                .open_journal()
+                .expect("authenticate database-ahead prefix and advance anchor");
+        }
+        assert_eq!(
+            fs::read(fixture.state_path(JOURNAL_ANCHOR_NAME))
+                .expect("read recovered sequence-two anchor"),
+            anchor_two
+        );
+        let vault = fixture.open();
+        vault
+            .open_application_store()
+            .expect("recover authenticated tail intent after anchor advancement");
+    }
+
+    #[test]
+    fn multiple_valid_crash_orphans_are_preserved_and_rejected() {
+        let fixture = Fixture::new();
+        for (name, value) in [
+            (".tmp-00112233445566778899aabbccddeeff", key(51)),
+            (".tmp-ffeeddccbbaa99887766554433221100", key(52)),
+        ] {
+            let encoded = encode_secret(SecretKind::JournalKey, value.expose_secret())
+                .expect("encode orphan key");
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(FILE_MODE)
+                .open(fixture.state_path(name))
+                .expect("create valid orphan");
+            file.write_all(&encoded).expect("write valid orphan");
+            file.sync_all().expect("sync valid orphan");
+        }
+        assert_eq!(
+            RescueVaultSecrets::open_for_test(&fixture.root, fixture.owner).err(),
+            Some(RescueSecretError::UnsafePath)
+        );
+        assert!(
+            fixture
+                .state_path(".tmp-00112233445566778899aabbccddeeff")
+                .exists()
+        );
+        assert!(
+            fixture
+                .state_path(".tmp-ffeeddccbbaa99887766554433221100")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn retained_recovery_descriptors_detect_orphan_and_final_name_swaps() {
+        let fixture = Fixture::new();
+        let vault = fixture.open();
+        let orphan_name = ".tmp-1234567890abcdef1234567890abcdef";
+        let orphan_path = fixture.state_path(orphan_name);
+        let orphan_held = fixture.state_path("held-orphan-a");
+        let orphan_replacement = fixture.state_path("orphan-replacement-b");
+        write_test_secret_file(
+            &orphan_path,
+            SecretKind::JournalKey,
+            key(61).expose_secret(),
+        );
+        write_test_secret_file(
+            &orphan_replacement,
+            SecretKind::JournalKey,
+            key(62).expose_secret(),
+        );
+        let opened_orphan = open_recovery_file(
+            &vault.inner.state_fd,
+            orphan_name,
+            fixture.owner,
+            vault.inner.state_state.device,
+            vault.inner.root_mount_id,
+        )
+        .expect("open retained orphan")
+        .expect("retained orphan exists");
+        fs::rename(&orphan_path, &orphan_held).expect("move orphan A aside");
+        fs::rename(&orphan_replacement, &orphan_path).expect("install orphan B");
+        assert_eq!(
+            recheck_open_recovery_file(
+                &vault.inner.state_fd,
+                orphan_name,
+                fixture.owner,
+                &opened_orphan,
+            ),
+            Err(RescueSecretError::StaleVault)
+        );
+        fs::rename(&orphan_path, &orphan_replacement).expect("move orphan B aside");
+        fs::rename(&orphan_held, &orphan_path).expect("restore orphan A");
+        assert_eq!(
+            recheck_open_recovery_file(
+                &vault.inner.state_fd,
+                orphan_name,
+                fixture.owner,
+                &opened_orphan,
+            ),
+            Err(RescueSecretError::StaleVault),
+            "an A-to-B-to-A name replay must remain detectable through ctime",
+        );
+        assert_eq!(
+            decode_secret(SecretKind::JournalKey, &opened_orphan.envelope)
+                .expect("decode retained orphan")
+                .as_slice(),
+            key(61).expose_secret()
+        );
+
+        vault
+            .journal_store()
+            .store_key(&key(63))
+            .expect("store final key");
+        let final_path = fixture.state_path(JOURNAL_KEY_NAME);
+        let final_held = fixture.state_path("held-final-a");
+        let final_replacement = fixture.state_path("final-replacement-b");
+        write_test_secret_file(
+            &final_replacement,
+            SecretKind::JournalKey,
+            key(64).expose_secret(),
+        );
+        let opened_final = open_recovery_file(
+            &vault.inner.state_fd,
+            JOURNAL_KEY_NAME,
+            fixture.owner,
+            vault.inner.state_state.device,
+            vault.inner.root_mount_id,
+        )
+        .expect("open retained final")
+        .expect("retained final exists");
+        fs::rename(&final_path, &final_held).expect("move final A aside");
+        fs::rename(&final_replacement, &final_path).expect("install final B");
+        assert_eq!(
+            recheck_open_recovery_file(
+                &vault.inner.state_fd,
+                JOURNAL_KEY_NAME,
+                fixture.owner,
+                &opened_final,
+            ),
+            Err(RescueSecretError::StaleVault)
+        );
+        fs::rename(&final_path, &final_replacement).expect("move final B aside");
+        fs::rename(&final_held, &final_path).expect("restore final A");
+        assert_eq!(
+            recheck_open_recovery_file(
+                &vault.inner.state_fd,
+                JOURNAL_KEY_NAME,
+                fixture.owner,
+                &opened_final,
+            ),
+            Err(RescueSecretError::StaleVault),
+            "an A-to-B-to-A final replay must remain detectable through ctime",
+        );
+    }
+
+    #[test]
+    fn orphan_scan_has_explicit_entry_and_name_budgets() {
+        {
+            let fixture = Fixture::new();
+            for index in 0..=MAX_STATE_DIRECTORY_ENTRIES {
+                let file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(FILE_MODE)
+                    .open(fixture.state_path(&format!("bounded-entry-{index:03}")))
+                    .expect("create bounded directory entry");
+                file.sync_all().expect("sync bounded directory entry");
+            }
+            assert_eq!(
+                RescueVaultSecrets::open_for_test(&fixture.root, fixture.owner).err(),
+                Some(RescueSecretError::UnsafePath)
+            );
+        }
+
+        {
+            let fixture = Fixture::new();
+            let oversized_name = "x".repeat(MAX_STATE_DIRECTORY_NAME_BYTES + 1);
+            let file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(FILE_MODE)
+                .open(fixture.state_path(&oversized_name))
+                .expect("create oversized name");
+            file.sync_all().expect("sync oversized name");
+            assert_eq!(
+                RescueVaultSecrets::open_for_test(&fixture.root, fixture.owner).err(),
+                Some(RescueSecretError::UnsafePath)
+            );
+        }
     }
 
     #[test]

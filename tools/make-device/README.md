@@ -45,8 +45,8 @@ immutabile, entrambe queste famiglie di prove indipendenti per BIOS e UEFI:
   prefisso ISO, partizione p3 e target invariati e marker distinti per boot 1
   e boot 2;
 - un vault realmente provisionato come LUKS2/ext4 `KERNAID_VAULT`, con UUID,
-  sentinel e identità stabili nei due boot, rifiuto della chiave errata e
-  chiusura pulita verificata.
+  binding autenticato journal-identità e identità stabili nei due boot,
+  rifiuto della chiave errata e chiusura pulita verificata.
 
 La riga di solo layout/boot `KERNAID_QEMU_USB_ATTESTATION_V1` non può essere
 usata da sola per generare una voce trusted v2; anche i log CD-ROM v1 vengono
@@ -55,6 +55,12 @@ rifiutati. Lo smoke vault emette la distinta
 volte, tramite JSON LUKS2 e superblock ext4 binario, il profilo canonico
 `vault-profile.v1.json`. Una modifica a KDF, offset, cipher, geometria,
 feature, journal o policy ext4 interrompe lo smoke prima dell'attestazione.
+Il parser fissa inoltre `journal_binding_before_sha256` e
+`journal_binding_after_sha256` al digest SHA-256 canonico di
+`device-identity-bound-v1`
+(`4c535d9a1a37281ca7e25ba0f52ee44ebc893558326f74e4b36ac18a65c4d513`):
+un valore arbitrario soltanto stabile, incluso il vecchio sentinel, è
+rifiutato.
 Finché mancano entrambe le famiglie di attestazioni, nessun artefatto può
 essere promosso nel catalogo v2.
 

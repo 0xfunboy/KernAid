@@ -22,7 +22,7 @@ readonly boot_count=2
 readonly boot_timeout_seconds=600
 readonly probe_prefix=KERNAID_RESCUE_VAULT_PROBE_ATTESTATION_V1
 readonly probe_failure_prefix=KERNAID_RESCUE_VAULT_PROBE_FAILURE_V1
-readonly sentinel_value=kernaid-disposable-vault-persistence-v1
+readonly journal_binding_value=device-identity-bound-v1
 
 for command in awk blkid cat chmod cp cryptsetup dd dirname findmnt grep id \
   kill losetup mkdir mkfs.ext4 mktemp mount mountpoint od python3 \
@@ -379,12 +379,12 @@ parse_probe_attestation() {
     exit 1
   fi
   line="${lines[0]}"
-  if [[ ! "$line" =~ ^${probe_prefix}\ mode=(initialize|verify)\ sentinel=(${sentinel_value})\ identity_public_key=([0-9a-f]{64})\ clean_shutdown=true$ ]]; then
+  if [[ ! "$line" =~ ^${probe_prefix}\ mode=(initialize|verify)\ journal_binding=(${journal_binding_value})\ identity_public_key=([0-9a-f]{64})\ clean_shutdown=true$ ]]; then
     echo "The vault probe emitted malformed lifecycle evidence" >&2
     exit 1
   fi
   probe_mode="${BASH_REMATCH[1]}"
-  probe_sentinel="${BASH_REMATCH[2]}"
+  probe_journal_binding="${BASH_REMATCH[2]}"
   probe_identity_public_key="${BASH_REMATCH[3]}"
   if [[ "$probe_mode" != "$expected_mode" ]]; then
     echo "The vault probe attested the wrong lifecycle mode" >&2
@@ -612,9 +612,9 @@ assert_vault_resources_clean "Provisioning"
 initialize_output="$work_dir/probe-initialize.out"
 initialize_error="$work_dir/probe-initialize.err"
 run_probe initialize "$initialize_output" "$initialize_error"
-sentinel_before_sha256="$(sha256_text "$probe_sentinel")"
+journal_binding_before_sha256="$(sha256_text "$probe_journal_binding")"
 identity_before_sha256="$(sha256_text "$probe_identity_public_key")"
-require_sha256 "initial sentinel digest" "$sentinel_before_sha256"
+require_sha256 "initial journal identity binding digest" "$journal_binding_before_sha256"
 require_sha256 "initial identity digest" "$identity_before_sha256"
 
 inspect_vault_metadata "Post-initialize"
@@ -800,13 +800,13 @@ reject_wrong_key
 verify_output="$work_dir/probe-verify.out"
 verify_error="$work_dir/probe-verify.err"
 run_probe verify "$verify_output" "$verify_error"
-sentinel_after_sha256="$(sha256_text "$probe_sentinel")"
+journal_binding_after_sha256="$(sha256_text "$probe_journal_binding")"
 identity_after_sha256="$(sha256_text "$probe_identity_public_key")"
-require_sha256 "verified sentinel digest" "$sentinel_after_sha256"
+require_sha256 "verified journal identity binding digest" "$journal_binding_after_sha256"
 require_sha256 "verified identity digest" "$identity_after_sha256"
-if [[ "$sentinel_after_sha256" != "$sentinel_before_sha256" \
+if [[ "$journal_binding_after_sha256" != "$journal_binding_before_sha256" \
   || "$identity_after_sha256" != "$identity_before_sha256" ]]; then
-  echo "The persistent sentinel or DeviceIdentity changed across the two boots" >&2
+  echo "The journal identity binding or DeviceIdentity changed across the two boots" >&2
   exit 1
 fi
 if [[ "$clean_shutdowns" -ne 2 ]]; then
@@ -872,7 +872,7 @@ printf '%s\n' \
   "KERNAID_QEMU_USB_ATTESTATION_V1 firmware=$firmware transport=usb-storage boot_count=$boot_count ready_boots=$boot_count uefi_vars=$uefi_vars_attestation media_bytes=$media_bytes iso_bytes=$iso_bytes layout_manifest_sha256=$layout_manifest_sha256 iso_sha256=$iso_sha256 prefix_before_sha256=$prefix_before_sha256 prefix_after_sha256=$prefix_after_sha256 p3_start_bytes=$p3_start_bytes p3_bytes=$p3_bytes p3_before_sha256=$p3_before_sha256 p3_after_sha256=$p3_after_sha256 target_before_sha256=$target_before_sha256 target_after_sha256=$target_after_sha256 ready=true" \
   | tee -a "$log"
 printf '%s\n' \
-  "KERNAID_QEMU_USB_VAULT_ATTESTATION_V1 firmware=$firmware boot_count=$boot_count luks_version=2 luks_label=KERNAID_VAULT luks_uuid_before=$luks_uuid_before luks_uuid_after=$luks_uuid_after filesystem=ext4 filesystem_label=KERNAID_VAULT vault_profile_version=1 vault_profile_sha256=b4801359bd4f31ce67fbd3ec15b6c81c44aa6759ba43b2a4e099a7dfcc25a37c filesystem_uuid_before=$filesystem_uuid_before filesystem_uuid_after=$filesystem_uuid_after sentinel_before_sha256=$sentinel_before_sha256 sentinel_after_sha256=$sentinel_after_sha256 identity_before_sha256=$identity_before_sha256 identity_after_sha256=$identity_after_sha256 vault_layout_verified=true wrong_key_rejected=true clean_shutdowns=$clean_shutdowns" \
+  "KERNAID_QEMU_USB_VAULT_ATTESTATION_V1 firmware=$firmware boot_count=$boot_count luks_version=2 luks_label=KERNAID_VAULT luks_uuid_before=$luks_uuid_before luks_uuid_after=$luks_uuid_after filesystem=ext4 filesystem_label=KERNAID_VAULT vault_profile_version=1 vault_profile_sha256=b4801359bd4f31ce67fbd3ec15b6c81c44aa6759ba43b2a4e099a7dfcc25a37c filesystem_uuid_before=$filesystem_uuid_before filesystem_uuid_after=$filesystem_uuid_after journal_binding_before_sha256=$journal_binding_before_sha256 journal_binding_after_sha256=$journal_binding_after_sha256 identity_before_sha256=$identity_before_sha256 identity_after_sha256=$identity_after_sha256 vault_layout_verified=true wrong_key_rejected=true clean_shutdowns=$clean_shutdowns" \
   | tee -a "$log"
 printf '%s\n' \
   "KERNAID_RESCUE_VAULT_HOST_PROBE_V1 sha256=$probe_sha256 invocation_scope=host-only" \

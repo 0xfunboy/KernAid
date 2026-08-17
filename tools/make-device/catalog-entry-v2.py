@@ -3,8 +3,9 @@
 
 The layout-only `KERNAID_QEMU_USB_ATTESTATION_V1` line is necessary but not
 sufficient.  Each firmware log must also contain the independent vault line
-defined below, proving that a provisioned LUKS2/ext4 vault, its sentinel and
-its device identity survived two boots.  Legacy CD-ROM attestations and a USB
+defined below, proving that a provisioned LUKS2/ext4 vault, its authenticated
+journal-to-identity binding and its device identity survived two boots. Legacy
+CD-ROM attestations and a USB
 log without vault evidence fail closed.
 """
 
@@ -54,6 +55,9 @@ UUID_RE: Final = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z"
 )
 DECIMAL_RE: Final = re.compile(r"(?:0|[1-9][0-9]*)\Z")
+JOURNAL_IDENTITY_BINDING_SHA256: Final = (
+    "4c535d9a1a37281ca7e25ba0f52ee44ebc893558326f74e4b36ac18a65c4d513"
+)
 
 USB_ATTESTATION_FIELDS: Final = frozenset(
     (
@@ -91,8 +95,8 @@ VAULT_ATTESTATION_FIELDS: Final = frozenset(
         "vault_profile_sha256",
         "filesystem_uuid_before",
         "filesystem_uuid_after",
-        "sentinel_before_sha256",
-        "sentinel_after_sha256",
+        "journal_binding_before_sha256",
+        "journal_binding_after_sha256",
         "identity_before_sha256",
         "identity_after_sha256",
         "vault_layout_verified",
@@ -303,12 +307,14 @@ def _validate_vault_line(fields: dict[str, str], firmware: str, layout: object) 
         "filesystem_uuid_after",
         f"{firmware} filesystem",
     )
-    _stable_sha256(
+    binding_digest = _stable_sha256(
         fields,
-        "sentinel_before_sha256",
-        "sentinel_after_sha256",
-        f"{firmware} vault sentinel",
+        "journal_binding_before_sha256",
+        "journal_binding_after_sha256",
+        f"{firmware} journal identity binding",
     )
+    if not hmac.compare_digest(binding_digest, JOURNAL_IDENTITY_BINDING_SHA256):
+        raise ValueError(f"{firmware} has the wrong journal identity binding")
     _stable_sha256(
         fields,
         "identity_before_sha256",

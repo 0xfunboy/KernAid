@@ -182,7 +182,7 @@ class QemuVaultAttestation:
             "vaultProfileVersion": VAULT_PROFILE_VERSION,
             "vaultProfileSha256": VAULT_PROFILE_SHA256,
             "stableUuidsVerified": True,
-            "sentinelVerified": True,
+            "journalIdentityBindingVerified": True,
             "identityVerified": True,
             "wrongKeyRejected": True,
             "workflowRunId": self.workflow_run_id,
@@ -702,7 +702,7 @@ def _vault_attestation(
             "vaultProfileVersion",
             "vaultProfileSha256",
             "stableUuidsVerified",
-            "sentinelVerified",
+            "journalIdentityBindingVerified",
             "identityVerified",
             "wrongKeyRejected",
             "workflowRunId",
@@ -739,7 +739,7 @@ def _vault_attestation(
         raise CatalogV2Error(f"{location} did not verify the immutable vault profile")
     for field, description in (
         ("stableUuidsVerified", "stable LUKS and filesystem UUIDs"),
-        ("sentinelVerified", "the persistent sentinel"),
+        ("journalIdentityBindingVerified", "the authenticated journal identity binding"),
         ("identityVerified", "the persistent device identity"),
         ("wrongKeyRejected", "wrong-key rejection"),
     ):

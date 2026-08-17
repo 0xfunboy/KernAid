@@ -238,7 +238,7 @@ def vault(firmware, run_id, log_hash):
         "vaultProfileVersion": layout["vaultProfileVersion"],
         "vaultProfileSha256": layout["vaultProfileSha256"],
         "stableUuidsVerified": True,
-        "sentinelVerified": True,
+        "journalIdentityBindingVerified": True,
         "identityVerified": True,
         "wrongKeyRejected": True,
         "workflowRunId": run_id,
