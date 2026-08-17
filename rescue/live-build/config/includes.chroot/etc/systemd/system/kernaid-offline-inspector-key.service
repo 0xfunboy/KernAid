@@ -1,6 +1,10 @@
 [Unit]
 Description=KernAid boot-scoped offline target identifier key
-Before=kernaid-offline-inspector.socket
+DefaultDependencies=no
+Requires=sysinit.target
+After=sysinit.target
+Before=kernaid-offline-inspector.socket shutdown.target
+Conflicts=shutdown.target
 
 [Service]
 Type=oneshot

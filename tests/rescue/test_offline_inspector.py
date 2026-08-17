@@ -856,6 +856,19 @@ class BoundaryTests(unittest.TestCase):
         self.assertIn("chown root:root", hook)
         self.assertIn("chmod 0644", hook)
 
+    def test_key_service_runs_before_socket_without_basic_target_cycle(self) -> None:
+        key_service = HELPER_KEY_SERVICE.read_text(encoding="utf-8")
+        unit = key_service.split("[Service]", maxsplit=1)[0].splitlines()
+        self.assertIn("DefaultDependencies=no", unit)
+        self.assertNotIn("DefaultDependencies=yes", unit)
+        self.assertIn("Requires=sysinit.target", unit)
+        self.assertIn("After=sysinit.target", unit)
+        self.assertNotIn("After=basic.target", unit)
+        self.assertIn(
+            "Before=kernaid-offline-inspector.socket shutdown.target", unit
+        )
+        self.assertIn("Conflicts=shutdown.target", unit)
+
     def test_qemu_contract_requires_real_inspection_and_zero_write_hash(self) -> None:
         ready = READY_CHECK.read_text(encoding="utf-8")
         smoke = QEMU_SMOKE.read_text(encoding="utf-8")
