@@ -1760,15 +1760,6 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        assert!(quick_failures.is_empty(), "{quick_failures:?}");
-        assert_eq!(
-            quick
-                .iter()
-                .map(|item| item.collector)
-                .collect::<BTreeSet<_>>(),
-            BTreeSet::from(["macos.storage.identity", "macos.system"])
-        );
-
         let observations = collect_macos_p0_observations();
         assert_eq!(observations.len(), macos_resident::COLLECTORS.len() + 2);
         let failed_collectors = observations
@@ -1781,7 +1772,38 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        assert!(failed_collectors.is_empty(), "{failed_collectors:?}");
+        let storage_shape = if quick_failures.is_empty() {
+            "not-needed".to_owned()
+        } else {
+            match run_fixed_command(
+                macos_resident::SYSTEM_PROFILER,
+                &macos_resident::SYSTEM_PROFILER_ARGS,
+                macos_resident::STORAGE_TIMEOUT,
+                QUALIFIED_MACOS_MAX_OUTPUT_BYTES,
+            ) {
+                Ok(output) => format!(
+                    "exit={};stderrEmpty={};truncated=false;{}",
+                    output.exit_code,
+                    output.stderr.trim().is_empty(),
+                    macos_resident::storage_shape_summary(&output.stdout)
+                ),
+                Err(error) => format!(
+                    "commandFailed=true;truncated={}",
+                    matches!(error, FixedCommandFailure::Truncated)
+                ),
+            }
+        };
+        assert!(
+            quick_failures.is_empty() && failed_collectors.is_empty(),
+            "quick={quick_failures:?};deep={failed_collectors:?};storageShape={storage_shape}"
+        );
+        assert_eq!(
+            quick
+                .iter()
+                .map(|item| item.collector)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["macos.storage.identity", "macos.system"])
+        );
         let mut expected = macos_resident::COLLECTORS
             .into_iter()
             .collect::<BTreeSet<_>>();

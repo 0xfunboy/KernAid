@@ -222,6 +222,65 @@ fn bounded_identity_value(value: &Value) -> Result<&str, ()> {
     Ok(value)
 }
 
+#[cfg(test)]
+pub fn storage_shape_summary(raw: &str) -> String {
+    fn kind(value: Option<&Value>) -> &'static str {
+        match value {
+            None => "missing",
+            Some(Value::Null) => "null",
+            Some(Value::Bool(_)) => "bool",
+            Some(Value::Number(_)) => "number",
+            Some(Value::String(_)) => "string",
+            Some(Value::Array(_)) => "array",
+            Some(Value::Object(_)) => "object",
+        }
+    }
+
+    fn safe_keys(value: Option<&Value>) -> Vec<String> {
+        let Some(Value::Object(object)) = value else {
+            return Vec::new();
+        };
+        let mut keys = object
+            .keys()
+            .filter(|key| {
+                !key.is_empty()
+                    && key.len() <= 64
+                    && key
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            })
+            .take(64)
+            .cloned()
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys
+    }
+
+    let Ok(root) = serde_json::from_str::<Value>(raw) else {
+        return "root=invalid-json".to_owned();
+    };
+    let records = root
+        .as_object()
+        .and_then(|object| object.get("SPStorageDataType"));
+    let first = records
+        .and_then(Value::as_array)
+        .and_then(|records| records.first());
+    let physical = first
+        .and_then(Value::as_object)
+        .and_then(|record| record.get("physical_drive"));
+    format!(
+        "root={};rootKeys={:?};records={};recordCount={};first={};firstKeys={:?};physical={};physicalKeys={:?}",
+        kind(Some(&root)),
+        safe_keys(Some(&root)),
+        kind(records),
+        records.and_then(Value::as_array).map_or(0, Vec::len),
+        kind(first),
+        safe_keys(first),
+        kind(physical),
+        safe_keys(physical),
+    )
+}
+
 fn yes_no(value: &Value) -> Result<bool, ()> {
     match value {
         Value::Bool(value) => Ok(*value),
