@@ -2283,6 +2283,14 @@ dependencies = [
 [[package]]
 name = "kernaid-protocol"
 version = "0.1.0"
+dependencies = [
+ "kernaid-device-identity",
+ "kernaid-storage",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
 
 [[package]]
 name = "kernaid-redaction"

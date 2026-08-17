@@ -5,7 +5,11 @@
 //! ownership against another privileged actor.
 
 use super::{RescueSecretError, RescueVaultSecrets, VaultMountAttestation};
-use crate::{bounded_process, linux};
+use crate::{
+    bounded_process,
+    device_locator::{LocatedVaultIdentity, LocatedVaultPartition},
+    linux,
+};
 use rustix::{
     fd::{AsFd, OwnedFd},
     fs::{
@@ -17,6 +21,7 @@ use std::{
     error::Error,
     ffi::OsStr,
     fs::{self, File},
+    os::fd::AsRawFd,
     os::unix::ffi::OsStrExt,
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
@@ -75,24 +80,47 @@ impl std::fmt::Debug for MapperName {
     }
 }
 
-/// Explicit request to unlock one already-provisioned Rescue vault.
+/// Explicit request to unlock the already-provisioned vault located on the
+/// exact Rescue boot medium.
 ///
-/// The device must be a direct, resolved `/dev/<node>` path. Symlinks such as
-/// `/dev/disk/by-*` and existing device-mapper nodes are deliberately rejected.
-/// The mount root is not caller-controlled; it is derived beneath
-/// `/run/kernaid/vault` from the validated mapper name.
+/// The production-shaped constructor consumes a sealed
+/// [`LocatedVaultPartition`], so an IPC client cannot select a path or device.
+/// The mount root is likewise derived beneath `/run/kernaid/vault/` from the
+/// validated mapper name.
 pub struct VaultUnlockRequest {
-    device: PathBuf,
+    device: UnlockDevice,
     mapper: MapperName,
 }
 
+enum UnlockDevice {
+    Located(LocatedVaultPartition),
+    #[cfg(feature = "privileged-probe")]
+    DisposableProbe(PathBuf),
+}
+
 impl VaultUnlockRequest {
+    /// Bind unlock to the path-free capability returned by
+    /// [`crate::locate_boot_vault`].
+    #[must_use]
+    pub fn from_located(device: LocatedVaultPartition, mapper: MapperName) -> Self {
+        Self {
+            device: UnlockDevice::Located(device),
+            mapper,
+        }
+    }
+
+    /// Construct the path-based request used only by the disposable privileged
+    /// integration probe. Shipping manager builds do not expose this entrypoint.
+    #[cfg(feature = "privileged-probe")]
     pub fn new(
         device: impl AsRef<Path>,
         mapper: MapperName,
     ) -> Result<Self, VaultMountManagerError> {
         let device = validate_device_path(device.as_ref())?;
-        Ok(Self { device, mapper })
+        Ok(Self {
+            device: UnlockDevice::DisposableProbe(device),
+            mapper,
+        })
     }
 }
 
@@ -266,14 +294,19 @@ struct ResolvedRequest {
 
 impl ResolvedRequest {
     fn resolve(request: VaultUnlockRequest) -> Result<Self, VaultMountManagerError> {
-        let device = BlockDevice::open(request.device)?;
-        let mapper_path = PathBuf::from("/dev/mapper").join(request.mapper.as_os_str());
+        let VaultUnlockRequest { device, mapper } = request;
+        let device = match device {
+            UnlockDevice::Located(device) => BlockDevice::from_located(device)?,
+            #[cfg(feature = "privileged-probe")]
+            UnlockDevice::DisposableProbe(path) => BlockDevice::open(path)?,
+        };
+        let mapper_path = PathBuf::from("/dev/mapper").join(mapper.as_os_str());
         let mount_root = PathBuf::from(RUNTIME_ROOT)
             .join(VAULT_MOUNT_PARENT)
-            .join(request.mapper.as_os_str());
+            .join(mapper.as_os_str());
         Ok(Self {
             device,
-            mapper: request.mapper,
+            mapper,
             mapper_path,
             mount_root,
         })
@@ -281,16 +314,23 @@ impl ResolvedRequest {
 }
 
 struct BlockDevice {
-    path: PathBuf,
+    // Direct /dev node used only for repeated identity checkpoints. Tools and
+    // mutators never receive it.
+    checkpoint_path: PathBuf,
+    // Procfs handle to the retained descriptor in this daemon process. Child
+    // tools open this exact capability even if the /dev name is replaced.
+    command_path: PathBuf,
     descriptor: OwnedFd,
     device: u64,
     inode: u64,
     rdev: u64,
     disk_sequence: u64,
     capacity_sectors: u64,
+    located_identity: Option<LocatedVaultIdentity>,
 }
 
 impl BlockDevice {
+    #[cfg(feature = "privileged-probe")]
     fn open(path: PathBuf) -> Result<Self, VaultMountManagerError> {
         let descriptor = rfs::openat2(
             CWD,
@@ -300,21 +340,55 @@ impl BlockDevice {
             ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
         )
         .map_err(|_| VaultMountManagerError::InvalidBlockDevice)?;
+        Self::from_descriptor(path, descriptor, None)
+    }
+
+    fn from_located(device: LocatedVaultPartition) -> Result<Self, VaultMountManagerError> {
+        let (descriptor, identity, device_name) = device.into_manager_parts();
+        let path = validate_device_path(&PathBuf::from("/dev").join(device_name))?;
+        Self::from_descriptor(path, descriptor.into(), Some(identity))
+    }
+
+    fn from_descriptor(
+        path: PathBuf,
+        descriptor: OwnedFd,
+        located_identity: Option<LocatedVaultIdentity>,
+    ) -> Result<Self, VaultMountManagerError> {
         let stat =
             rfs::fstat(&descriptor).map_err(|_| VaultMountManagerError::InvalidBlockDevice)?;
-        if !FileType::from_raw_mode(stat.st_mode).is_block_device() {
+        let status = rfs::fcntl_getfl(&descriptor)
+            .map_err(|_| VaultMountManagerError::InvalidBlockDevice)?;
+        let descriptor_flags = rustix::io::fcntl_getfd(&descriptor)
+            .map_err(|_| VaultMountManagerError::InvalidBlockDevice)?;
+        let major_minor = (rfs::major(stat.st_rdev), rfs::minor(stat.st_rdev));
+        if !FileType::from_raw_mode(stat.st_mode).is_block_device()
+            || status & OFlags::ACCMODE != OFlags::RDONLY
+            || !status.contains(OFlags::NONBLOCK)
+            || !descriptor_flags.contains(rustix::io::FdFlags::CLOEXEC)
+            || located_identity.is_some_and(|identity| {
+                major_minor != (identity.partition_major, identity.partition_minor)
+            })
+        {
             return Err(VaultMountManagerError::InvalidBlockDevice);
         }
         let (disk_sequence, capacity_sectors) =
-            block_device_kernel_identity(rfs::major(stat.st_rdev), rfs::minor(stat.st_rdev))?;
+            block_device_kernel_identity(major_minor.0, major_minor.1)?;
+        if located_identity.is_some_and(|identity| {
+            disk_sequence != identity.disk_sequence || capacity_sectors != identity.sector_count
+        }) {
+            return Err(VaultMountManagerError::InvalidBlockDevice);
+        }
+        let command_path = retained_descriptor_path(&descriptor)?;
         let result = Self {
-            path,
+            checkpoint_path: path,
+            command_path,
             descriptor,
             device: stat.st_dev,
             inode: stat.st_ino,
             rdev: stat.st_rdev,
             disk_sequence,
             capacity_sectors,
+            located_identity,
         };
         result.revalidate()?;
         Ok(result)
@@ -323,7 +397,9 @@ impl BlockDevice {
     fn revalidate(&self) -> Result<(), VaultMountManagerError> {
         let descriptor =
             rfs::fstat(&self.descriptor).map_err(|_| VaultMountManagerError::InvalidBlockDevice)?;
-        let named = rfs::statat(CWD, &self.path, AtFlags::SYMLINK_NOFOLLOW)
+        let named = rfs::statat(CWD, &self.checkpoint_path, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|_| VaultMountManagerError::InvalidBlockDevice)?;
+        let command = rfs::statat(CWD, &self.command_path, AtFlags::empty())
             .map_err(|_| VaultMountManagerError::InvalidBlockDevice)?;
         let (major, minor) = self.major_minor();
         let (observed_sequence, observed_capacity) = block_device_kernel_identity(major, minor)?;
@@ -335,8 +411,17 @@ impl BlockDevice {
             || named.st_dev != self.device
             || named.st_ino != self.inode
             || named.st_rdev != self.rdev
+            || !FileType::from_raw_mode(command.st_mode).is_block_device()
+            || command.st_dev != self.device
+            || command.st_ino != self.inode
+            || command.st_rdev != self.rdev
             || observed_sequence != self.disk_sequence
             || observed_capacity != self.capacity_sectors
+            || self.located_identity.is_some_and(|identity| {
+                (major, minor) != (identity.partition_major, identity.partition_minor)
+                    || observed_sequence != identity.disk_sequence
+                    || observed_capacity != identity.sector_count
+            })
         {
             return Err(VaultMountManagerError::InvalidBlockDevice);
         }
@@ -346,6 +431,21 @@ impl BlockDevice {
     fn major_minor(&self) -> (u32, u32) {
         (rfs::major(self.rdev), rfs::minor(self.rdev))
     }
+
+    fn command_path(&self) -> &Path {
+        &self.command_path
+    }
+}
+
+fn retained_descriptor_path(descriptor: &impl AsRawFd) -> Result<PathBuf, VaultMountManagerError> {
+    let descriptor_number = descriptor.as_raw_fd();
+    if descriptor_number < 0 {
+        return Err(VaultMountManagerError::InvalidBlockDevice);
+    }
+    Ok(PathBuf::from(format!(
+        "/proc/{}/fd/{descriptor_number}",
+        std::process::id()
+    )))
 }
 
 #[derive(Clone, Copy)]
@@ -627,7 +727,7 @@ impl VaultOps for SystemOps {
             .arg("luksUUID")
             .arg("--type")
             .arg("luks2")
-            .arg(&device.path);
+            .arg(device.command_path());
         let uuid_output = Self::run_capture(uuid_command).map_err(|error| match error {
             VaultMountManagerError::ToolUnavailable => error,
             _ => VaultMountManagerError::InvalidLuks2Header,
@@ -651,7 +751,7 @@ impl VaultOps for SystemOps {
             .arg("UUID")
             .arg("--match-tag")
             .arg("LABEL")
-            .arg(&device.path);
+            .arg(device.command_path());
         let properties = parse_blkid_export(&Self::run_capture(blkid).map_err(|error| {
             if error == VaultMountManagerError::ToolUnavailable {
                 error
@@ -679,7 +779,7 @@ impl VaultOps for SystemOps {
         passphrase: OwnedFd,
     ) -> Result<(), VaultMountManagerError> {
         device.revalidate()?;
-        let mut command = cryptsetup_open_command(&device.path, mapper);
+        let mut command = cryptsetup_open_command(device.command_path(), mapper);
         command
             .env_clear()
             .env("LC_ALL", "C")
@@ -732,7 +832,9 @@ impl VaultOps for SystemOps {
         }
         verify_unique_backing_holder(backing, (major, minor))?;
         let status = Self::mapping_status(mapper)?;
-        verify_cryptsetup_status(&status, &device.path)?;
+        // The exact backing major:minor and sole DM slave were verified above;
+        // cryptsetup's informational device pathname is not an identity.
+        verify_cryptsetup_status(&status)?;
         device.revalidate()?;
         verify_unique_backing_holder(backing, (major, minor))?;
         Ok(MappingIdentity {
@@ -1316,12 +1418,8 @@ fn parse_blkid_export(value: &[u8]) -> Result<BlkidProperties, VaultMountManager
     Ok(properties)
 }
 
-fn verify_cryptsetup_status(
-    output: &[u8],
-    expected_device: &Path,
-) -> Result<(), VaultMountManagerError> {
+fn verify_cryptsetup_status(output: &[u8]) -> Result<(), VaultMountManagerError> {
     let mut observed_type = None;
-    let mut observed_device = None;
     for line in output.split(|byte| *byte == b'\n') {
         let line = trim_horizontal(line);
         let Some(separator) = line.iter().position(|byte| *byte == b':') else {
@@ -1331,16 +1429,13 @@ fn verify_cryptsetup_status(
         let value = trim_horizontal(&line[separator + 1..]);
         match key {
             b"type" if observed_type.is_none() => observed_type = Some(value),
-            b"device" if observed_device.is_none() => observed_device = Some(value),
-            b"type" | b"device" => {
+            b"type" => {
                 return Err(VaultMountManagerError::MappingVerificationFailed);
             }
             _ => {}
         }
     }
-    if observed_type != Some(b"LUKS2".as_slice())
-        || observed_device != Some(expected_device.as_os_str().as_bytes())
-    {
+    if observed_type != Some(b"LUKS2".as_slice()) {
         return Err(VaultMountManagerError::MappingVerificationFailed);
     }
     Ok(())
@@ -1555,13 +1650,15 @@ mod tests {
         .expect("open dummy descriptor");
         ResolvedRequest {
             device: BlockDevice {
-                path: PathBuf::from("/dev/loop8"),
+                checkpoint_path: PathBuf::from("/dev/loop8"),
+                command_path: PathBuf::from("/proc/1/fd/8"),
                 descriptor,
                 device: 1,
                 inode: 2,
                 rdev: rfs::makedev(7, 8),
                 disk_sequence: 12,
                 capacity_sectors: 524_288,
+                located_identity: None,
             },
             mapper: MapperName::parse("kernaid-vault-0123456789abcdef").expect("mapper"),
             mapper_path: PathBuf::from("/dev/mapper/kernaid-vault-0123456789abcdef"),
@@ -1587,6 +1684,10 @@ mod tests {
 
     #[test]
     fn mapper_and_device_grammars_are_closed() {
+        let located_constructor: fn(LocatedVaultPartition, MapperName) -> VaultUnlockRequest =
+            VaultUnlockRequest::from_located;
+        let _ = located_constructor;
+
         assert!(MapperName::parse("kernaid-vault-0123456789abcdef").is_ok());
         for invalid in [
             "kernaid-vault-0123456789abcde",
@@ -1616,6 +1717,28 @@ mod tests {
                 Some(VaultMountManagerError::InvalidBlockDevice)
             );
         }
+    }
+
+    #[test]
+    fn retained_procfd_is_stable_across_named_path_replacement() {
+        let directory = tempfile::tempdir().expect("temporary procfd fixture");
+        let named = directory.path().join("selected-device");
+        let moved = directory.path().join("original-device");
+        fs::write(&named, b"original").expect("write original fixture");
+        let retained = File::open(&named).expect("retain original descriptor");
+        let command_path = retained_descriptor_path(&retained).expect("retained procfd path");
+
+        fs::rename(&named, &moved).expect("move original fixture");
+        fs::write(&named, b"replacement").expect("write replacement fixture");
+
+        assert_eq!(
+            fs::read(&command_path).expect("read retained procfd"),
+            b"original"
+        );
+        assert_eq!(
+            fs::read(&named).expect("read named replacement"),
+            b"replacement"
+        );
     }
 
     #[test]
@@ -1678,24 +1801,22 @@ mod tests {
         );
         assert!(
             verify_cryptsetup_status(
-                b"/dev/mapper/x is active.\n  type:    LUKS2\n  device:  /dev/loop8\n",
-                Path::new("/dev/loop8")
+                b"/dev/mapper/x is active.\n  type:    LUKS2\n  device:  /dev/replaced\n"
             )
             .is_ok()
         );
         assert!(
             verify_cryptsetup_status(
-                b"/dev/mapper/x is active.\n  type: plain\n  device: /dev/loop8\n",
-                Path::new("/dev/loop8")
+                b"/dev/mapper/x is active.\n  type: plain\n  device: /dev/loop8\n"
             )
             .is_err()
         );
     }
 
     #[test]
-    fn unlock_command_has_only_fixed_typed_arguments_and_stdin_key_source() {
+    fn unlock_command_has_only_procfd_device_and_stdin_key_source() {
         let mapper = MapperName::parse("kernaid-vault-0123456789abcdef").expect("mapper");
-        let command = cryptsetup_open_command(Path::new("/dev/loop8"), &mapper);
+        let command = cryptsetup_open_command(Path::new("/proc/123/fd/8"), &mapper);
         assert_eq!(command.get_program(), OsStr::new(CRYPTSETUP_PATH));
         let arguments: Vec<_> = command.get_args().collect();
         assert_eq!(
@@ -1710,7 +1831,7 @@ mod tests {
                 OsStr::new("--disable-external-tokens"),
                 OsStr::new("--key-file"),
                 OsStr::new("-"),
-                OsStr::new("/dev/loop8"),
+                OsStr::new("/proc/123/fd/8"),
                 OsStr::new("kernaid-vault-0123456789abcdef"),
             ]
         );

@@ -131,6 +131,7 @@ pub(crate) fn capture(
     }
 }
 
+#[cfg_attr(not(feature = "experimental-vault-manager"), allow(dead_code))]
 pub(crate) fn wait(
     command: &mut Command,
     timeout: Duration,

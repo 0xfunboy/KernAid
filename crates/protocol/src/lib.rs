@@ -1,5 +1,8 @@
 #![forbid(unsafe_code)]
 
+#[cfg(target_os = "linux")]
+pub mod rescue_vault;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Risk {
     R0,

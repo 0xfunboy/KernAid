@@ -125,12 +125,20 @@ impl Error for RescueSecretError {}
 #[cfg(target_os = "linux")]
 mod linux;
 
-#[cfg(all(target_os = "linux", feature = "experimental-vault-manager"))]
+#[cfg(target_os = "linux")]
 mod bounded_process;
+
+#[cfg(target_os = "linux")]
+mod device_locator;
 
 #[cfg(all(target_os = "linux", feature = "experimental-vault-manager"))]
 mod mount_manager;
 
+#[cfg(target_os = "linux")]
+pub use device_locator::{
+    BootVaultLocation, BootVaultLocatorError, LocatedVaultIdentity, LocatedVaultPartition,
+    locate_boot_vault,
+};
 #[cfg(target_os = "linux")]
 pub use linux::{RescueDeviceIdentityStore, RescueJournalSecretStore, RescueVaultSecrets};
 #[cfg(all(target_os = "linux", feature = "experimental-vault-manager"))]

@@ -14,7 +14,12 @@ still need a dedicated privileged service design.
 ## Experimental manager API
 
 `RescueVaultMountManager::acquire` requires effective uid 0 and holds one
-non-blocking root-owned lifecycle lock. `VaultUnlockRequest::new` accepts only:
+non-blocking root-owned lifecycle lock. The integration-shaped
+`VaultUnlockRequest::from_located` consumes only the sealed, read-only
+`LocatedVaultPartition` returned for the exact boot medium; it does not accept
+a client-selected device or path. The path-taking `VaultUnlockRequest::new` is
+compiled only for the `privileged-probe` disposable integration binary and
+accepts only:
 
 - a direct, absolute, symlink-free `/dev/<node>` block-device path (never a
   `/dev/disk/by-*` alias or an existing device-mapper node); and
@@ -35,6 +40,12 @@ a missing passphrase EOF cannot block the manager indefinitely. Every fixed
 cryptsetup/blkid child starts in a new process group. The manager drains
 captured output non-blockingly, rejects unexpected descendants even after the
 direct child exits, and uses bounded TERM/KILL cleanup on errors or timeouts.
+
+The selected vault device is different: every cryptsetup/blkid probe and
+activation receives `/proc/<daemon-pid>/fd/<retained-fd>`, which resolves the
+manager's already-validated descriptor. The direct `/dev/<node>` name remains
+only a repeated identity checkpoint and is never the child tool's device
+argument, so a udev rename or replacement cannot retarget the mutation.
 
 An accepted vault must already contain this root-owned layout:
 
@@ -81,6 +92,46 @@ actor. Cleanup rechecks the same claims and refuses force/lazy unmount or an
 unverified mapping close on ambiguity. A `cryptsetup open` error is followed
 by mapping inspection; if the exact mapping was nevertheless created, its
 identity is acquired and verified cleanup is attempted.
+
+## Read-only boot-medium locator
+
+`locate_boot_vault()` is a separate, production-visible Observe primitive. It
+accepts no argument and never searches `/dev` or all disks. It starts at the
+single exact ISO9660 mount `/run/live/medium`, resolves that mount's kernel
+major:minor through sysfs, identifies its containing disk, and considers only
+that parent's direct partition number 3. Optical boot returns the distinct
+`OpticalBootAbsent` state and never falls back to another attached device.
+
+For USB boot, the locator requires an unambiguous USB sysfs ancestry, parent
+and p3 `/sys/dev/block` identities, direct parentage, uevent major/minor/type,
+partition number, disk sequence, 512-byte logical sectors, at least the
+qualified 32 GB media capacity, and the exact layout-v1 p3 start/length. It
+then opens the parent and p3 direct nodes read-only with NOFOLLOW, NONBLOCK and
+CLOEXEC. A fixed, bounded `/usr/sbin/blockdev` child receives a CLOEXEC
+duplicate as fd 0 and performs the actual BLKGETDISKSEQ and geometry ioctls on
+`/proc/self/fd/0`; no mutable device pathname is handed to the tool. The
+retained parent descriptor must contain the complete finalized layout-v1 MBR:
+qualified ISO slots 1/2 before the vault, exact slot 3, and an all-zero reserved
+slot 4. The complete mountinfo/sysfs/FD/ioctl/MBR identity is checked twice
+before a path-free `LocatedVaultPartition` is returned.
+
+That sealed capability can be moved directly into
+`VaultUnlockRequest::from_located`. Its validated kernel node name remains
+crate-private, and the experimental manager keeps the locator descriptor open
+while binding every pathname checkpoint to its major/minor, disk sequence and
+capacity. Cryptsetup and blkid receive only the retained daemon procfd; no IPC
+field exposes or selects the checkpoint name.
+
+This constructor is not a production unlock claim. Before a daemon may call
+the experimental manager, an FD-bound classifier must map an exact blank
+profile to `UNPROVISIONED`, the fully pinned LUKS2/ext4 vault-profile.v1 to
+`LOCKED`, and every profile delta to `PROFILE_MISMATCH`, with descriptor-bound
+rechecks before and after unlock and mount. Until that classifier exists, the
+feature gate prevents this API from becoming the shipping activation path.
+
+The locator never invokes cryptsetup, activates device mapper, mounts a
+filesystem, reads a LUKS header, repairs metadata, or writes any byte. It does
+not prove that p3 is provisioned; that remains a later typed service step.
 
 ## Provisioning and disposable probe
 
@@ -135,17 +186,22 @@ Rescue ISO.
 
 The intended integration is a small root-owned local daemon that holds
 `MountedRescueVault` for the complete session and exposes only bounded typed
-operations over a permission-checked Unix socket. The web/Python UI must never
-receive the LUKS passphrase, journal key, identity seed, raw mount path, or an
-arbitrary command primitive. That daemon, its socket protocol, systemd/ISO
-packaging, and the Rescue UI flow are not implemented by this crate yet.
+operations over a permission-checked Unix socket. The closed AF_UNIX
+`SOCK_SEQPACKET` message and descriptor contract now lives in
+`kernaid-protocol`; this crate supplies only its read-only boot-media locator.
+The web/Python UI must never receive the LUKS passphrase, journal key, identity
+seed, raw mount path, or an arbitrary command primitive. The daemon, socket
+listener, systemd/ISO packaging, unlock/store handlers, and Rescue UI flow are
+not implemented yet.
 
 ## Remaining production gates
 
+- implement the non-bypassable FD-bound blank/exact/profile-mismatch
+  classifier and its pre/post activation rechecks;
 - run the daemon in a private mount namespace and adopt descriptor-based mount
   attachment (`open_tree`/`move_mount` or an equivalent design);
-- replace the sysfs disk-sequence checkpoint with a safe `BLKGETDISKSEQ` ioctl
-  wrapper and eliminate pathname handoff to external tools where possible;
+- replace the experimental manager's remaining sysfs disk-sequence checkpoint
+  with its descriptor-bound `BLKGETDISKSEQ` observation;
 - define and test restart recovery for an interrupted process and mappings or
   mounts visible in other namespaces;
 - exercise crash windows, additional-holder races, and real hardware in the

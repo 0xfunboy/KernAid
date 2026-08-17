@@ -1,0 +1,401 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.kernaid.dev/v1/rescue-vault-response.json",
+  "title": "RescueVaultResponse",
+  "description": "Closed, path-free and secret-free response for one Rescue vault seqpacket request.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "apiVersion",
+    "requestId",
+    "stateVersion",
+    "operation",
+    "outcome"
+  ],
+  "properties": {
+    "apiVersion": { "const": "kernaid.dev/rescue-vault/v1alpha1" },
+    "requestId": {
+      "type": "string",
+      "pattern": "^R-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "stateVersion": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "operation": {
+      "enum": [
+        "vault.status",
+        "vault.unlock",
+        "vault.lock",
+        "provider.openai.configure",
+        "provider.status",
+        "provider.logout",
+        "provider.openai.borrow",
+        "provider.codex.home_lease",
+        "audit.append",
+        "report.persist",
+        "report.list",
+        "report.get"
+      ]
+    },
+    "outcome": { "enum": ["ok", "error"] },
+    "payload": { "type": "object" },
+    "error": { "$ref": "#/$defs/errorToken" }
+  },
+  "$defs": {
+    "emptyPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "maxProperties": 0
+    },
+    "errorToken": {
+      "enum": [
+        "ABSENT",
+        "UNPROVISIONED",
+        "LOCKED",
+        "BAD_PASSPHRASE",
+        "MEDIA_CHANGED",
+        "PROFILE_MISMATCH",
+        "STALE_STATE",
+        "FD_REQUIRED",
+        "FD_FORBIDDEN",
+        "NOT_AUTHORIZED",
+        "RATE_LIMITED",
+        "BUSY",
+        "PROVIDER_UNCONFIGURED",
+        "REPORT_TOO_LARGE",
+        "IO_FAILED",
+        "REBOOT_REQUIRED"
+      ]
+    },
+    "vaultStatus": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["vaultState"],
+          "properties": {
+            "vaultState": {
+              "enum": [
+                "absent",
+                "unprovisioned",
+                "locked",
+                "unlocking",
+                "locking",
+                "faulted-reboot-required"
+              ]
+            }
+          }
+        },
+        { "$ref": "#/$defs/unlockedVaultStatus" }
+      ]
+    },
+    "unlockedVaultStatus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["vaultState", "deviceId"],
+      "properties": {
+        "vaultState": { "const": "unlocked" },
+        "deviceId": { "$ref": "#/$defs/deviceId" }
+      }
+    },
+    "deviceId": {
+      "type": "string",
+      "pattern": "^KA-[0-9a-f]{24}$"
+    },
+    "providerStatus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["openai", "codex"],
+      "properties": {
+        "openai": { "enum": ["unconfigured", "configured"] },
+        "codex": { "enum": ["unconfigured", "configured"] }
+      }
+    },
+    "openaiOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "size"],
+      "properties": {
+        "type": { "const": "openai-api-key-pipe" },
+        "size": { "type": "integer", "minimum": 1, "maximum": 512 }
+      }
+    },
+    "codexOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "size"],
+      "properties": {
+        "type": { "const": "codex-home-o-path" },
+        "size": { "const": 0 }
+      }
+    },
+    "signedReportEnvelopeOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "size"],
+      "properties": {
+        "type": { "const": "signed-report-envelope-pipe" },
+        "size": {
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 1572864
+        }
+      }
+    },
+    "reportSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reportId", "envelopeSize", "envelopeSha256"],
+      "properties": {
+        "reportId": {
+          "type": "string",
+          "pattern": "^RP-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "envelopeSize": {
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 1572864
+        },
+        "envelopeSha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "outcome": { "const": "ok" } },
+        "required": ["outcome"]
+      },
+      "then": {
+        "properties": { "payload": {} },
+        "required": ["payload"],
+        "not": {
+          "properties": { "error": {} },
+          "required": ["error"]
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "outcome": { "const": "error" } },
+        "required": ["outcome"]
+      },
+      "then": {
+        "properties": { "error": { "$ref": "#/$defs/errorToken" } },
+        "required": ["error"],
+        "not": {
+          "properties": { "payload": {} },
+          "required": ["payload"]
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": { "const": "ok" },
+          "operation": { "const": "vault.status" }
+        },
+        "required": ["outcome", "operation"]
+      },
+      "then": { "properties": { "payload": { "$ref": "#/$defs/vaultStatus" } } }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": { "const": "ok" },
+          "operation": { "const": "vault.unlock" }
+        },
+        "required": ["outcome", "operation"]
+      },
+      "then": {
+        "properties": {
+          "payload": { "$ref": "#/$defs/unlockedVaultStatus" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": { "const": "ok" },
+          "operation": { "const": "vault.lock" }
+        },
+        "required": ["outcome", "operation"]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["vaultState"],
+            "properties": { "vaultState": { "const": "locked" } }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": { "const": "ok" },
+          "operation": { "const": "provider.openai.configure" }
+        },
+        "required": ["outcome", "operation"]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["openai", "codex"],
+            "properties": {
+              "openai": { "const": "configured" },
+              "codex": { "enum": ["unconfigured", "configured"] }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": { "const": "ok" },
+          "operation": { "enum": ["provider.status", "provider.logout"] }
+        },
+        "required": ["outcome", "operation"]
+      },
+      "then": {
+        "properties": { "payload": { "$ref": "#/$defs/providerStatus" } }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": { "const": "ok" },
+          "operation": { "const": "provider.openai.borrow" }
+        },
+        "required": ["outcome", "operation"]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["output"],
+            "properties": {
+              "output": { "$ref": "#/$defs/openaiOutput" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": { "const": "ok" },
+          "operation": { "const": "provider.codex.home_lease" }
+        },
+        "required": ["outcome", "operation"]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["output"],
+            "properties": {
+              "output": { "$ref": "#/$defs/codexOutput" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": { "const": "ok" },
+          "operation": { "const": "audit.append" }
+        },
+        "required": ["outcome", "operation"]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["sequence"],
+            "properties": {
+              "sequence": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 1000000
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": { "const": "ok" },
+          "operation": { "const": "report.persist" }
+        },
+        "required": ["outcome", "operation"]
+      },
+      "then": {
+        "properties": { "payload": { "$ref": "#/$defs/reportSummary" } }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": { "const": "ok" },
+          "operation": { "const": "report.list" }
+        },
+        "required": ["outcome", "operation"]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["reports"],
+            "properties": {
+              "reports": {
+                "type": "array",
+                "maxItems": 256,
+                "items": { "$ref": "#/$defs/reportSummary" }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": { "const": "ok" },
+          "operation": { "const": "report.get" }
+        },
+        "required": ["outcome", "operation"]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["report", "output"],
+            "properties": {
+              "report": { "$ref": "#/$defs/reportSummary" },
+              "output": { "$ref": "#/$defs/signedReportEnvelopeOutput" }
+            }
+          }
+        }
+      }
+    }
+  ]
+}
