@@ -34,7 +34,12 @@ jobs:
       - name: Validate Rescue image-layout tooling
         run: |
           python3 -m unittest discover -s tools/build-rescue/tests -p 'test_*.py' -v
-          shellcheck tools/build-rescue/build.sh tools/build-rescue/qemu-smoke.sh
+          bash -n tools/build-rescue/build.sh \
+            tools/build-rescue/qemu-smoke.sh \
+            tools/build-rescue/qemu-usb-smoke.sh
+          shellcheck tools/build-rescue/build.sh \
+            tools/build-rescue/qemu-smoke.sh \
+            tools/build-rescue/qemu-usb-smoke.sh
       - name: Build hybrid BIOS and UEFI ISO
         run: |
           docker run --rm --privileged \
@@ -46,6 +51,10 @@ jobs:
         run: KERNAID_SMOKE_LOG=rescue-smoke-bios.log ./tools/build-rescue/qemu-smoke.sh bios
       - name: QEMU UEFI smoke test
         run: KERNAID_SMOKE_LOG=rescue-smoke-uefi.log ./tools/build-rescue/qemu-smoke.sh uefi
+      - name: QEMU BIOS USB-style two-boot smoke test
+        run: KERNAID_USB_SMOKE_LOG=rescue-usb-smoke-bios.log ./tools/build-rescue/qemu-usb-smoke.sh bios
+      - name: QEMU UEFI USB-style two-boot smoke test
+        run: KERNAID_USB_SMOKE_LOG=rescue-usb-smoke-uefi.log ./tools/build-rescue/qemu-usb-smoke.sh uefi
       - name: Derive catalog entry from the tested ISO and attested QEMU logs
         env:
           KERNAID_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -70,7 +79,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: KernAid-Rescue-smoke-logs
-          path: rescue-smoke-*.log
+          path: |
+            rescue-smoke-*.log
+            rescue-usb-smoke-*.log
           if-no-files-found: warn
           retention-days: 14
       - name: Publish checksums and image
