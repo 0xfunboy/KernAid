@@ -1,0 +1,580 @@
+{
+  "schemaVersion": 1,
+  "cases": [
+    {
+      "name": "baseline",
+      "valid": true,
+      "file": "valid/baseline.raw"
+    },
+    {
+      "name": "minimum-confidence-and-empty-allowed-fields",
+      "valid": true,
+      "file": "valid/minimum-confidence-and-empty-allowed-fields.raw"
+    },
+    {
+      "name": "maximum-confidence",
+      "valid": true,
+      "file": "valid/maximum-confidence.raw"
+    },
+    {
+      "name": "surrounding-whitespace",
+      "valid": true,
+      "file": "valid/surrounding-whitespace.raw"
+    },
+    {
+      "name": "raw-size-at-limit",
+      "valid": true,
+      "file": "valid/raw-size-at-limit.raw"
+    },
+    {
+      "name": "session-id-128-code-points",
+      "valid": true,
+      "file": "valid/session-id-128-code-points.raw"
+    },
+    {
+      "name": "evidence-id-128-code-points",
+      "valid": true,
+      "file": "valid/evidence-id-128-code-points.raw"
+    },
+    {
+      "name": "unicode-approved-by-256-code-points",
+      "valid": true,
+      "file": "valid/unicode-approved-by-256-code-points.raw"
+    },
+    {
+      "name": "escaped-unicode-scalar-pair",
+      "valid": true,
+      "file": "valid/escaped-unicode-scalar-pair.raw"
+    },
+    {
+      "name": "unicode-typed-confirmation-256-code-points",
+      "valid": true,
+      "file": "valid/unicode-typed-confirmation-256-code-points.raw"
+    },
+    {
+      "name": "action-256-code-points",
+      "valid": true,
+      "file": "valid/action-256-code-points.raw"
+    },
+    {
+      "name": "unicode-message-8192-code-points",
+      "valid": true,
+      "file": "valid/unicode-message-8192-code-points.raw"
+    },
+    {
+      "name": "unicode-risk-8192-code-points",
+      "valid": true,
+      "file": "valid/unicode-risk-8192-code-points.raw"
+    },
+    {
+      "name": "unicode-summary-8192-code-points",
+      "valid": true,
+      "file": "valid/unicode-summary-8192-code-points.raw"
+    },
+    {
+      "name": "diagnosis-16384-code-points",
+      "valid": true,
+      "file": "valid/diagnosis-16384-code-points.raw"
+    },
+    {
+      "name": "safe-integer-maximum",
+      "valid": true,
+      "file": "valid/safe-integer-maximum.raw"
+    },
+    {
+      "name": "mathematical-integer-number",
+      "valid": true,
+      "file": "valid/mathematical-integer-number.raw"
+    },
+    {
+      "name": "safe-integer-exponent-maximum",
+      "valid": true,
+      "file": "valid/safe-integer-exponent-maximum.raw"
+    },
+    {
+      "name": "safe-integer-negative-exponent",
+      "valid": true,
+      "file": "valid/safe-integer-negative-exponent.raw"
+    },
+    {
+      "name": "confidence-one-exponent",
+      "valid": true,
+      "file": "valid/confidence-one-exponent.raw"
+    },
+    {
+      "name": "confidence-small-positive-exponent",
+      "valid": true,
+      "file": "valid/confidence-small-positive-exponent.raw"
+    },
+    {
+      "name": "confidence-negative-zero",
+      "valid": true,
+      "file": "valid/confidence-negative-zero.raw"
+    },
+    {
+      "name": "confidence-zero-large-exponent",
+      "valid": true,
+      "file": "valid/confidence-zero-large-exponent.raw"
+    },
+    {
+      "name": "confidence-small-large-negative-exponent",
+      "valid": true,
+      "file": "valid/confidence-small-large-negative-exponent.raw"
+    },
+    {
+      "name": "lowercase-rfc3339",
+      "valid": true,
+      "file": "valid/lowercase-rfc3339.raw"
+    },
+    {
+      "name": "rfc3339-year-zero",
+      "valid": true,
+      "file": "valid/rfc3339-year-zero.raw"
+    },
+    {
+      "name": "rfc3339-leap-second",
+      "valid": true,
+      "file": "valid/rfc3339-leap-second.raw"
+    },
+    {
+      "name": "rfc3339-leap-second-translated-by-offset",
+      "valid": true,
+      "file": "valid/rfc3339-leap-second-translated-by-offset.raw"
+    },
+    {
+      "name": "rfc3339-leap-second-translated-by-minute-offset",
+      "valid": true,
+      "file": "valid/rfc3339-leap-second-translated-by-minute-offset.raw"
+    },
+    {
+      "name": "rfc3339-rounded-fraction-at-leap-minute",
+      "valid": true,
+      "file": "valid/rfc3339-rounded-fraction-at-leap-minute.raw"
+    },
+    {
+      "name": "rfc3339-offset",
+      "valid": true,
+      "file": "valid/rfc3339-offset.raw"
+    },
+    {
+      "name": "facts-at-item-limit",
+      "valid": true,
+      "file": "valid/facts-at-item-limit.raw"
+    },
+    {
+      "name": "events-at-item-limit",
+      "valid": true,
+      "file": "valid/events-at-item-limit.raw"
+    },
+    {
+      "name": "unique-array-at-item-limit",
+      "valid": true,
+      "file": "valid/unique-array-at-item-limit.raw"
+    },
+    {
+      "name": "raw-size-over-limit",
+      "valid": false,
+      "file": "invalid/raw-size-over-limit.raw"
+    },
+    {
+      "name": "invalid-utf8",
+      "valid": false,
+      "file": "invalid/invalid-utf8.raw"
+    },
+    {
+      "name": "unpaired-unicode-surrogate",
+      "valid": false,
+      "file": "invalid/unpaired-unicode-surrogate.raw"
+    },
+    {
+      "name": "trailing-document",
+      "valid": false,
+      "file": "invalid/trailing-document.raw"
+    },
+    {
+      "name": "trailing-nul",
+      "valid": false,
+      "file": "invalid/trailing-nul.raw"
+    },
+    {
+      "name": "duplicate-top-level",
+      "valid": false,
+      "file": "invalid/duplicate-top-level.raw"
+    },
+    {
+      "name": "duplicate-evidence-escaped-key",
+      "valid": false,
+      "file": "invalid/duplicate-evidence-escaped-key.raw"
+    },
+    {
+      "name": "duplicate-inference",
+      "valid": false,
+      "file": "invalid/duplicate-inference.raw"
+    },
+    {
+      "name": "duplicate-approval",
+      "valid": false,
+      "file": "invalid/duplicate-approval.raw"
+    },
+    {
+      "name": "duplicate-event",
+      "valid": false,
+      "file": "invalid/duplicate-event.raw"
+    },
+    {
+      "name": "unknown-top-level-field",
+      "valid": false,
+      "file": "invalid/unknown-top-level-field.raw"
+    },
+    {
+      "name": "unknown-evidence-field",
+      "valid": false,
+      "file": "invalid/unknown-evidence-field.raw"
+    },
+    {
+      "name": "unknown-inference-field",
+      "valid": false,
+      "file": "invalid/unknown-inference-field.raw"
+    },
+    {
+      "name": "unknown-approval-field",
+      "valid": false,
+      "file": "invalid/unknown-approval-field.raw"
+    },
+    {
+      "name": "unknown-event-field",
+      "valid": false,
+      "file": "invalid/unknown-event-field.raw"
+    },
+    {
+      "name": "missing-evidence-field",
+      "valid": false,
+      "file": "invalid/missing-evidence-field.raw"
+    },
+    {
+      "name": "empty-evidence-collector",
+      "valid": false,
+      "file": "invalid/empty-evidence-collector.raw"
+    },
+    {
+      "name": "empty-diagnosis",
+      "valid": false,
+      "file": "invalid/empty-diagnosis.raw"
+    },
+    {
+      "name": "empty-diagnosis-evidence-ids",
+      "valid": false,
+      "file": "invalid/empty-diagnosis-evidence-ids.raw"
+    },
+    {
+      "name": "empty-approved-by",
+      "valid": false,
+      "file": "invalid/empty-approved-by.raw"
+    },
+    {
+      "name": "empty-typed-confirmation",
+      "valid": false,
+      "file": "invalid/empty-typed-confirmation.raw"
+    },
+    {
+      "name": "confidence-below-minimum",
+      "valid": false,
+      "file": "invalid/confidence-below-minimum.raw"
+    },
+    {
+      "name": "confidence-above-maximum",
+      "valid": false,
+      "file": "invalid/confidence-above-maximum.raw"
+    },
+    {
+      "name": "confidence-rounded-above-maximum",
+      "valid": false,
+      "file": "invalid/confidence-rounded-above-maximum.raw"
+    },
+    {
+      "name": "confidence-negative-underflow",
+      "valid": false,
+      "file": "invalid/confidence-negative-underflow.raw"
+    },
+    {
+      "name": "invalid-evidence-sensitivity",
+      "valid": false,
+      "file": "invalid/invalid-evidence-sensitivity.raw"
+    },
+    {
+      "name": "invalid-evidence-trust",
+      "valid": false,
+      "file": "invalid/invalid-evidence-trust.raw"
+    },
+    {
+      "name": "invalid-event-status",
+      "valid": false,
+      "file": "invalid/invalid-event-status.raw"
+    },
+    {
+      "name": "invalid-verification-state",
+      "valid": false,
+      "file": "invalid/invalid-verification-state.raw"
+    },
+    {
+      "name": "array-evidence-sensitivity",
+      "valid": false,
+      "file": "invalid/array-evidence-sensitivity.raw"
+    },
+    {
+      "name": "array-event-status",
+      "valid": false,
+      "file": "invalid/array-event-status.raw"
+    },
+    {
+      "name": "array-verification-state",
+      "valid": false,
+      "file": "invalid/array-verification-state.raw"
+    },
+    {
+      "name": "session-id-129-code-points",
+      "valid": false,
+      "file": "invalid/session-id-129-code-points.raw"
+    },
+    {
+      "name": "evidence-id-129-code-points",
+      "valid": false,
+      "file": "invalid/evidence-id-129-code-points.raw"
+    },
+    {
+      "name": "evidence-reference-id-129-code-points",
+      "valid": false,
+      "file": "invalid/evidence-reference-id-129-code-points.raw"
+    },
+    {
+      "name": "collector-257-code-points",
+      "valid": false,
+      "file": "invalid/collector-257-code-points.raw"
+    },
+    {
+      "name": "target-513-code-points",
+      "valid": false,
+      "file": "invalid/target-513-code-points.raw"
+    },
+    {
+      "name": "content-type-257-code-points",
+      "valid": false,
+      "file": "invalid/content-type-257-code-points.raw"
+    },
+    {
+      "name": "summary-8193-code-points",
+      "valid": false,
+      "file": "invalid/summary-8193-code-points.raw"
+    },
+    {
+      "name": "diagnosis-16385-code-points",
+      "valid": false,
+      "file": "invalid/diagnosis-16385-code-points.raw"
+    },
+    {
+      "name": "approval-id-129-code-points",
+      "valid": false,
+      "file": "invalid/approval-id-129-code-points.raw"
+    },
+    {
+      "name": "plan-id-129-code-points",
+      "valid": false,
+      "file": "invalid/plan-id-129-code-points.raw"
+    },
+    {
+      "name": "unicode-approved-by-257-code-points",
+      "valid": false,
+      "file": "invalid/unicode-approved-by-257-code-points.raw"
+    },
+    {
+      "name": "unicode-typed-confirmation-257-code-points",
+      "valid": false,
+      "file": "invalid/unicode-typed-confirmation-257-code-points.raw"
+    },
+    {
+      "name": "action-257-code-points",
+      "valid": false,
+      "file": "invalid/action-257-code-points.raw"
+    },
+    {
+      "name": "unicode-message-8193-code-points",
+      "valid": false,
+      "file": "invalid/unicode-message-8193-code-points.raw"
+    },
+    {
+      "name": "unicode-risk-8193-code-points",
+      "valid": false,
+      "file": "invalid/unicode-risk-8193-code-points.raw"
+    },
+    {
+      "name": "duplicate-evidence-ids",
+      "valid": false,
+      "file": "invalid/duplicate-evidence-ids.raw"
+    },
+    {
+      "name": "duplicate-requested-evidence",
+      "valid": false,
+      "file": "invalid/duplicate-requested-evidence.raw"
+    },
+    {
+      "name": "duplicate-unresolved-risks",
+      "valid": false,
+      "file": "invalid/duplicate-unresolved-risks.raw"
+    },
+    {
+      "name": "requested-evidence-over-item-limit",
+      "valid": false,
+      "file": "invalid/requested-evidence-over-item-limit.raw"
+    },
+    {
+      "name": "facts-over-item-limit",
+      "valid": false,
+      "file": "invalid/facts-over-item-limit.raw"
+    },
+    {
+      "name": "events-over-item-limit",
+      "valid": false,
+      "file": "invalid/events-over-item-limit.raw"
+    },
+    {
+      "name": "unsafe-integer",
+      "valid": false,
+      "file": "invalid/unsafe-integer.raw"
+    },
+    {
+      "name": "unsafe-integer-exponent",
+      "valid": false,
+      "file": "invalid/unsafe-integer-exponent.raw"
+    },
+    {
+      "name": "fractional-negative-exponent",
+      "valid": false,
+      "file": "invalid/fractional-negative-exponent.raw"
+    },
+    {
+      "name": "fractional-sequence",
+      "valid": false,
+      "file": "invalid/fractional-sequence.raw"
+    },
+    {
+      "name": "rounded-fractional-sequence-below-one",
+      "valid": false,
+      "file": "invalid/rounded-fractional-sequence-below-one.raw"
+    },
+    {
+      "name": "rounded-fractional-sequence-above-one",
+      "valid": false,
+      "file": "invalid/rounded-fractional-sequence-above-one.raw"
+    },
+    {
+      "name": "rounded-fractional-sequence-safe-maximum",
+      "valid": false,
+      "file": "invalid/rounded-fractional-sequence-safe-maximum.raw"
+    },
+    {
+      "name": "rounded-fractional-sequence-escaped-path",
+      "valid": false,
+      "file": "invalid/rounded-fractional-sequence-escaped-path.raw"
+    },
+    {
+      "name": "rounded-confidence-escaped-path",
+      "valid": false,
+      "file": "invalid/rounded-confidence-escaped-path.raw"
+    },
+    {
+      "name": "zero-sequence",
+      "valid": false,
+      "file": "invalid/zero-sequence.raw"
+    },
+    {
+      "name": "invalid-calendar-date",
+      "valid": false,
+      "file": "invalid/invalid-calendar-date.raw"
+    },
+    {
+      "name": "invalid-rfc3339-space-separator",
+      "valid": false,
+      "file": "invalid/invalid-rfc3339-space-separator.raw"
+    },
+    {
+      "name": "invalid-rfc3339-offset-without-colon",
+      "valid": false,
+      "file": "invalid/invalid-rfc3339-offset-without-colon.raw"
+    },
+    {
+      "name": "invalid-rfc3339-timezone",
+      "valid": false,
+      "file": "invalid/invalid-rfc3339-timezone.raw"
+    },
+    {
+      "name": "invalid-rfc3339-translated-hour-evidence",
+      "valid": false,
+      "file": "invalid/invalid-rfc3339-translated-hour-evidence.raw"
+    },
+    {
+      "name": "invalid-rfc3339-translated-minute-approval",
+      "valid": false,
+      "file": "invalid/invalid-rfc3339-translated-minute-approval.raw"
+    },
+    {
+      "name": "invalid-rfc3339-translated-hour-event",
+      "valid": false,
+      "file": "invalid/invalid-rfc3339-translated-hour-event.raw"
+    },
+    {
+      "name": "invalid-rfc3339-nonascii-seconds",
+      "valid": false,
+      "file": "invalid/invalid-rfc3339-nonascii-seconds.raw"
+    },
+    {
+      "name": "invalid-rfc3339-leap-second",
+      "valid": false,
+      "file": "invalid/invalid-rfc3339-leap-second.raw"
+    },
+    {
+      "name": "invalid-rfc3339-offset-leap-second",
+      "valid": false,
+      "file": "invalid/invalid-rfc3339-offset-leap-second.raw"
+    },
+    {
+      "name": "invalid-rfc3339-rounded-fraction-away-from-leap-minute",
+      "valid": false,
+      "file": "invalid/invalid-rfc3339-rounded-fraction-away-from-leap-minute.raw"
+    },
+    {
+      "name": "invalid-rfc3339-rounded-fraction-over-leap-second",
+      "valid": false,
+      "file": "invalid/invalid-rfc3339-rounded-fraction-over-leap-second.raw"
+    },
+    {
+      "name": "uppercase-evidence-hash",
+      "valid": false,
+      "file": "invalid/uppercase-evidence-hash.raw"
+    },
+    {
+      "name": "short-evidence-hash",
+      "valid": false,
+      "file": "invalid/short-evidence-hash.raw"
+    },
+    {
+      "name": "blob-reference-hash-mismatch",
+      "valid": false,
+      "file": "invalid/blob-reference-hash-mismatch.raw"
+    },
+    {
+      "name": "uppercase-target-fingerprint",
+      "valid": false,
+      "file": "invalid/uppercase-target-fingerprint.raw"
+    },
+    {
+      "name": "malformed-session-id",
+      "valid": false,
+      "file": "invalid/malformed-session-id.raw"
+    },
+    {
+      "name": "malformed-action-id",
+      "valid": false,
+      "file": "invalid/malformed-action-id.raw"
+    }
+  ]
+}

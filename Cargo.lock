@@ -2297,6 +2297,14 @@ name = "kernaid-redaction"
 version = "0.1.0"
 
 [[package]]
+name = "kernaid-report-schema"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "kernaid-rescue-secrets"
 version = "0.1.0"
 dependencies = [

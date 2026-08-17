@@ -308,6 +308,18 @@ test("plans and reports reject empty actions and malformed nested records", () =
   };
   assert.deepEqual(parseValidatedPlan(plan), plan);
   assert.throws(
+    () => parseValidatedPlan({ ...plan, risk: ["R0"] }),
+    SchemaValidationError,
+  );
+  assert.throws(
+    () =>
+      parseValidatedPlan({
+        ...plan,
+        steps: [{ ...plan.steps[0], backup: ["not-required"] }],
+      }),
+    SchemaValidationError,
+  );
+  assert.throws(
     () => parseValidatedPlan({ ...plan, steps: [] }),
     SchemaValidationError,
   );

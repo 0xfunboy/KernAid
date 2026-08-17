@@ -66,11 +66,15 @@ export interface SessionReport {
   unresolvedRisks: string[];
 }
 export {
+  MAX_SESSION_REPORT_BYTES,
   SchemaValidationError,
+  decodeSessionReportJson,
   parseApproval,
   parseDiagnosisProposal,
   parseEvidence,
   parseExecutionEvent,
   parseSessionReport,
+  parseSessionReportJson,
   parseValidatedPlan,
+  sessionReportSemanticBindingsAreValid,
 } from "./validation.js";
