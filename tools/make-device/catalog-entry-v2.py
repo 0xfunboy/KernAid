@@ -47,6 +47,7 @@ FINALIZER_SPEC.loader.exec_module(finalize_device_layout)
 MAX_LOG_BYTES: Final = 16 * 1024 * 1024
 USB_ATTESTATION_PREFIX: Final = "KERNAID_QEMU_USB_ATTESTATION_V1 "
 VAULT_ATTESTATION_PREFIX: Final = "KERNAID_QEMU_USB_VAULT_ATTESTATION_V1 "
+VAULT_PROFILE_CHECK_PREFIX: Final = "KERNAID_QEMU_USB_VAULT_PROFILE_CHECK_V1 "
 BOOT_READY_PREFIX: Final = "KERNAID_QEMU_USB_BOOT_READY_V1 "
 LEGACY_CDROM_ATTESTATION: Final = "KERNAID_QEMU_ATTESTATION_V1"
 UUID_RE: Final = re.compile(
@@ -86,6 +87,8 @@ VAULT_ATTESTATION_FIELDS: Final = frozenset(
         "luks_uuid_after",
         "filesystem",
         "filesystem_label",
+        "vault_profile_version",
+        "vault_profile_sha256",
         "filesystem_uuid_before",
         "filesystem_uuid_after",
         "sentinel_before_sha256",
@@ -98,6 +101,16 @@ VAULT_ATTESTATION_FIELDS: Final = frozenset(
     )
 )
 BOOT_READY_FIELDS: Final = frozenset(("firmware", "boot", "ready"))
+VAULT_PROFILE_CHECK_FIELDS: Final = frozenset(
+    (
+        "firmware",
+        "stage",
+        "kind",
+        "vault_profile_version",
+        "vault_profile_sha256",
+        "verified",
+    )
+)
 
 
 def _tokens(line: str, prefix: str, expected: frozenset[str], label: str) -> dict[str, str]:
@@ -258,7 +271,7 @@ def _validate_usb_line(
         raise ValueError(f"{firmware} UEFI variable policy is not isolated per boot")
 
 
-def _validate_vault_line(fields: dict[str, str], firmware: str) -> None:
+def _validate_vault_line(fields: dict[str, str], firmware: str, layout: object) -> None:
     if fields["firmware"] != firmware:
         raise ValueError(f"{firmware} vault attestation names another firmware")
     if _decimal(fields["boot_count"], f"{firmware} vault boot_count") != 2:
@@ -269,6 +282,18 @@ def _validate_vault_line(fields: dict[str, str], firmware: str) -> None:
         raise ValueError(f"{firmware} vault has the wrong LUKS label")
     if fields["filesystem"] != "ext4" or fields["filesystem_label"] != "KERNAID_VAULT":
         raise ValueError(f"{firmware} vault has the wrong inner filesystem")
+    if (
+        _decimal(fields["vault_profile_version"], f"{firmware} vault profile version")
+        != layout.vault_profile_version
+        or not hmac.compare_digest(
+            _sha256(
+                fields["vault_profile_sha256"],
+                f"{firmware} vault profile SHA-256",
+            ),
+            layout.vault_profile_sha256,
+        )
+    ):
+        raise ValueError(f"{firmware} vault evidence names another vault profile")
     _stable_uuid(
         fields, "luks_uuid_before", "luks_uuid_after", f"{firmware} LUKS"
     )
@@ -297,6 +322,57 @@ def _validate_vault_line(fields: dict[str, str], firmware: str) -> None:
         raise ValueError(f"{firmware} vault lifecycle did not close cleanly twice")
 
 
+def _validate_profile_checks(
+    lines: list[str], firmware: str, layout: object
+) -> None:
+    profile_lines = [
+        line for line in lines if line.startswith(VAULT_PROFILE_CHECK_PREFIX)
+    ]
+    if len(profile_lines) != 4:
+        raise ValueError(
+            f"{firmware} log must contain four exact vault profile checks"
+        )
+    observed: set[tuple[str, str]] = set()
+    for index, line in enumerate(profile_lines):
+        fields = _tokens(
+            line,
+            VAULT_PROFILE_CHECK_PREFIX,
+            VAULT_PROFILE_CHECK_FIELDS,
+            f"{firmware} vault profile check {index + 1}",
+        )
+        if (
+            fields["firmware"] != firmware
+            or fields["stage"] not in ("post-initialize", "post-boot-verify")
+            or fields["kind"] not in ("luks2", "ext4")
+            or fields["verified"] != "true"
+            or _decimal(
+                fields["vault_profile_version"],
+                f"{firmware} profile check version",
+            )
+            != layout.vault_profile_version
+            or not hmac.compare_digest(
+                _sha256(
+                    fields["vault_profile_sha256"],
+                    f"{firmware} profile check SHA-256",
+                ),
+                layout.vault_profile_sha256,
+            )
+        ):
+            raise ValueError(f"{firmware} vault profile check is not exact")
+        key = (fields["stage"], fields["kind"])
+        if key in observed:
+            raise ValueError(f"{firmware} vault profile check is duplicated")
+        observed.add(key)
+    expected = {
+        ("post-initialize", "luks2"),
+        ("post-initialize", "ext4"),
+        ("post-boot-verify", "luks2"),
+        ("post-boot-verify", "ext4"),
+    }
+    if observed != expected:
+        raise ValueError(f"{firmware} vault profile check matrix is incomplete")
+
+
 def attested_log(
     path: Path,
     *,
@@ -323,6 +399,7 @@ def attested_log(
             f"{firmware} log must contain exactly one independent vault attestation"
         )
     _validate_boot_markers(lines, firmware)
+    _validate_profile_checks(lines, firmware, layout)
     usb_fields = _tokens(
         usb_lines[0],
         USB_ATTESTATION_PREFIX,
@@ -342,7 +419,7 @@ def attested_log(
         iso_sha256=iso_sha256,
         layout=layout,
     )
-    _validate_vault_line(vault_fields, firmware)
+    _validate_vault_line(vault_fields, firmware, layout)
     return hashlib.sha256(raw).hexdigest()
 
 

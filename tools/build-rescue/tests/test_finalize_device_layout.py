@@ -15,6 +15,7 @@ TOOLS_DIR = Path(__file__).resolve().parents[1]
 REPO_DIR = Path(__file__).resolve().parents[3]
 MODULE_PATH = TOOLS_DIR / "finalize-device-layout.py"
 MANIFEST_PATH = REPO_DIR / "rescue/image-layout/device-layout.v1.json"
+PROFILE_PATH = REPO_DIR / "rescue/image-layout/vault-profile.v1.json"
 SPEC = importlib.util.spec_from_file_location("kernaid_device_layout", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
 device_layout = importlib.util.module_from_spec(SPEC)
@@ -81,6 +82,27 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(layout.minimum_media_bytes, 24 * 1024**3)
         self.assertEqual(layout.minimum_advertised_media_bytes, 32_000_000_000)
         self.assertEqual(layout.minimum_advertised_media_label, "32 GB")
+        self.assertEqual(layout.vault_profile_version, 1)
+        self.assertEqual(
+            layout.vault_profile_sha256,
+            device_layout.EXPECTED_VAULT_PROFILE_SHA256,
+        )
+
+    def test_layout_requires_the_exact_canonical_vault_profile_sibling(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            manifest = directory / "device-layout.v1.json"
+            profile = directory / device_layout.VAULT_PROFILE_FILENAME
+            manifest.write_bytes(MANIFEST_PATH.read_bytes())
+            profile.write_bytes(PROFILE_PATH.read_bytes())
+            device_layout.parse_layout_manifest(manifest)
+            document = json.loads(profile.read_text(encoding="utf-8"))
+            document["luks2"]["pbkdfMemoryKiB"] //= 2
+            profile.write_text(json.dumps(document), encoding="utf-8")
+            with self.assertRaisesRegex(
+                device_layout.LayoutError, "immutable profile-v1"
+            ):
+                device_layout.parse_layout_manifest(manifest)
 
     def _write_manifest(self, directory: Path, document: object) -> Path:
         path = directory / "layout.json"

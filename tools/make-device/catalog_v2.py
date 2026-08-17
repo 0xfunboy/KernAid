@@ -34,9 +34,15 @@ VAULT_START_LBA: Final = 33_554_432
 VAULT_SECTOR_COUNT: Final = 16_777_216
 BOOT_TRANSPORT: Final = "usb-storage"
 REQUIRED_BOOT_COUNT: Final = 2
+VAULT_PROFILE_VERSION: Final = 1
+VAULT_PROFILE_SHA256: Final = (
+    "b4801359bd4f31ce67fbd3ec15b6c81c44aa6759ba43b2a4e099a7dfcc25a37c"
+)
 
 MAX_CATALOG_BYTES: Final = 2 * 1024 * 1024
 MAX_MANIFEST_BYTES: Final = 64 * 1024
+MAX_PROFILE_BYTES: Final = 64 * 1024
+VAULT_PROFILE_FILENAME: Final = "vault-profile.v1.json"
 READ_CHUNK_BYTES: Final = 1024 * 1024
 SHA256_RE: Final = re.compile(r"[0-9a-f]{64}\Z")
 ARTIFACT_NAME_RE: Final = re.compile(
@@ -53,6 +59,44 @@ TRUSTED_RUN_URL_PREFIX: Final = (
 
 class CatalogV2Error(RuntimeError):
     """The v2 catalog or its immutable device-layout binding is invalid."""
+
+
+VAULT_PROFILE_DOCUMENT: Final = {
+    "schema": "kernaid.vault-profile.v1",
+    "luks2": {
+        "afHash": "sha256",
+        "afStripes": 4000,
+        "cipher": "aes-xts-plain64",
+        "dataOffsetBytes": 16777216,
+        "digestHash": "sha256",
+        "digestIterations": 1000,
+        "keyBits": 512,
+        "keyslot": 0,
+        "keyslotAreaBytes": 258048,
+        "keyslotAreaOffsetBytes": 32768,
+        "keyslotsBytes": 16744448,
+        "metadataBytes": 16384,
+        "pbkdf": "argon2id",
+        "pbkdfCpus": 1,
+        "pbkdfMemoryKiB": 65536,
+        "pbkdfTime": 4,
+        "sectorBytes": 512,
+    },
+    "ext4": {
+        "blockBytes": 4096,
+        "blocksPerGroup": 32768,
+        "bytesPerInode": 16384,
+        "defaultMountOptions": "none",
+        "errors": "remount-ro",
+        "featuresCompat": 60,
+        "featuresIncompat": 706,
+        "featuresRoCompat": 1131,
+        "flexGroupSize": 16,
+        "inodeBytes": 256,
+        "journalMiB": 128,
+        "reservedPercent": 0,
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -82,6 +126,8 @@ class DeviceLayout:
     minimum_media_bytes: int
     minimum_advertised_media_bytes: int
     minimum_advertised_media_label: str
+    vault_profile_version: int
+    vault_profile_sha256: str
     vault_partition: VaultPartition
 
     def as_document(self) -> dict[str, object]:
@@ -93,6 +139,8 @@ class DeviceLayout:
             "minimumMediaBytes": self.minimum_media_bytes,
             "minimumAdvertisedMediaBytes": self.minimum_advertised_media_bytes,
             "minimumAdvertisedMediaLabel": self.minimum_advertised_media_label,
+            "vaultProfileVersion": self.vault_profile_version,
+            "vaultProfileSha256": self.vault_profile_sha256,
             "vaultPartition": self.vault_partition.as_document(),
         }
 
@@ -131,6 +179,8 @@ class QemuVaultAttestation:
             "luksLabel": VAULT_PARTITION_NAME,
             "filesystem": "ext4",
             "filesystemLabel": VAULT_PARTITION_NAME,
+            "vaultProfileVersion": VAULT_PROFILE_VERSION,
+            "vaultProfileSha256": VAULT_PROFILE_SHA256,
             "stableUuidsVerified": True,
             "sentinelVerified": True,
             "identityVerified": True,
@@ -385,6 +435,22 @@ def _vault_partition(document: object, location: str) -> VaultPartition:
     return partition
 
 
+def load_vault_profile(path: Path) -> str:
+    raw = read_regular_file(path, MAX_PROFILE_BYTES, "vault profile manifest")
+    document = _parse_json_bytes(
+        raw, maximum=MAX_PROFILE_BYTES, location="vault profile manifest"
+    )
+    if document != VAULT_PROFILE_DOCUMENT:
+        raise CatalogV2Error("vault profile manifest changes immutable profile-v1")
+    canonical = json.dumps(
+        document, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("ascii")
+    digest = hashlib.sha256(canonical).hexdigest()
+    if digest != VAULT_PROFILE_SHA256:
+        raise CatalogV2Error("vault profile canonical SHA-256 is not immutable profile-v1")
+    return digest
+
+
 def load_device_layout(path: Path) -> DeviceLayout:
     raw = read_regular_file(path, MAX_MANIFEST_BYTES, "device layout manifest")
     document = _parse_json_bytes(
@@ -400,6 +466,8 @@ def load_device_layout(path: Path) -> DeviceLayout:
             "minimumMediaBytes",
             "minimumAdvertisedMediaBytes",
             "minimumAdvertisedMediaLabel",
+            "vaultProfileVersion",
+            "vaultProfileSha256",
             "vaultPartition",
         },
         "device layout manifest",
@@ -432,6 +500,15 @@ def load_device_layout(path: Path) -> DeviceLayout:
             value["minimumAdvertisedMediaLabel"],
             "device layout manifest.minimumAdvertisedMediaLabel",
         ),
+        vault_profile_version=_integer(
+            value["vaultProfileVersion"],
+            "device layout manifest.vaultProfileVersion",
+            minimum=1,
+        ),
+        vault_profile_sha256=_sha256(
+            value["vaultProfileSha256"],
+            "device layout manifest.vaultProfileSha256",
+        ),
         vault_partition=_vault_partition(
             value["vaultPartition"], "device layout manifest.vaultPartition"
         ),
@@ -450,6 +527,8 @@ def load_device_layout(path: Path) -> DeviceLayout:
             layout.minimum_advertised_media_label,
             MINIMUM_ADVERTISED_MEDIA_LABEL,
         ),
+        (layout.vault_profile_version, VAULT_PROFILE_VERSION),
+        (layout.vault_profile_sha256, VAULT_PROFILE_SHA256),
     )
     if any(actual != expected for actual, expected in immutable):
         raise CatalogV2Error("device layout manifest changes immutable layout-v1")
@@ -465,6 +544,12 @@ def load_device_layout(path: Path) -> DeviceLayout:
         raise CatalogV2Error(
             "device layout advertised capacity is below the layout minimum"
         )
+    profile_digest = load_vault_profile(path.with_name(VAULT_PROFILE_FILENAME))
+    if (
+        layout.vault_profile_version != VAULT_PROFILE_VERSION
+        or layout.vault_profile_sha256 != profile_digest
+    ):
+        raise CatalogV2Error("device layout does not bind the canonical vault profile")
     return layout
 
 
@@ -480,6 +565,8 @@ def _catalog_layout(document: object) -> DeviceLayout:
             "minimumMediaBytes",
             "minimumAdvertisedMediaBytes",
             "minimumAdvertisedMediaLabel",
+            "vaultProfileVersion",
+            "vaultProfileSha256",
             "vaultPartition",
         },
         location,
@@ -507,6 +594,15 @@ def _catalog_layout(document: object) -> DeviceLayout:
             value["minimumAdvertisedMediaLabel"],
             f"{location}.minimumAdvertisedMediaLabel",
         ),
+        vault_profile_version=_integer(
+            value["vaultProfileVersion"],
+            f"{location}.vaultProfileVersion",
+            minimum=1,
+        ),
+        vault_profile_sha256=_sha256(
+            value["vaultProfileSha256"],
+            f"{location}.vaultProfileSha256",
+        ),
         vault_partition=_vault_partition(
             value["vaultPartition"], f"{location}.vaultPartition"
         ),
@@ -524,6 +620,8 @@ def _catalog_layout(document: object) -> DeviceLayout:
             layout.minimum_advertised_media_label,
             MINIMUM_ADVERTISED_MEDIA_LABEL,
         ),
+        (layout.vault_profile_version, VAULT_PROFILE_VERSION),
+        (layout.vault_profile_sha256, VAULT_PROFILE_SHA256),
     )
     if any(actual != immutable for actual, immutable in expected):
         raise CatalogV2Error(
@@ -601,6 +699,8 @@ def _vault_attestation(
             "luksLabel",
             "filesystem",
             "filesystemLabel",
+            "vaultProfileVersion",
+            "vaultProfileSha256",
             "stableUuidsVerified",
             "sentinelVerified",
             "identityVerified",
@@ -623,6 +723,20 @@ def _vault_attestation(
         raise CatalogV2Error(f"{location} did not verify ext4")
     if value["filesystemLabel"] != VAULT_PARTITION_NAME:
         raise CatalogV2Error(f"{location} has the wrong filesystem label")
+    if (
+        _integer(
+            value["vaultProfileVersion"],
+            f"{location}.vaultProfileVersion",
+            minimum=1,
+        )
+        != VAULT_PROFILE_VERSION
+        or _sha256(
+            value["vaultProfileSha256"],
+            f"{location}.vaultProfileSha256",
+        )
+        != VAULT_PROFILE_SHA256
+    ):
+        raise CatalogV2Error(f"{location} did not verify the immutable vault profile")
     for field, description in (
         ("stableUuidsVerified", "stable LUKS and filesystem UUIDs"),
         ("sentinelVerified", "the persistent sentinel"),

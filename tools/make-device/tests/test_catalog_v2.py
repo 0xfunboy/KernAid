@@ -19,6 +19,7 @@ REPO_DIR = Path(__file__).resolve().parents[3]
 PARSER_PATH = TOOLS_DIR / "catalog_v2.py"
 GENERATOR_PATH = TOOLS_DIR / "catalog-entry-v2.py"
 MANIFEST_PATH = REPO_DIR / "rescue/image-layout/device-layout.v1.json"
+PROFILE_PATH = REPO_DIR / "rescue/image-layout/vault-profile.v1.json"
 CATALOG_PATH = TOOLS_DIR / "trusted-rescue-images.v2.json"
 SCHEMA_PATH = TOOLS_DIR / "trusted-rescue-images.v2.schema.json"
 
@@ -142,6 +143,8 @@ def synthetic_log(
         "luks_uuid_after": uuid(discriminator),
         "filesystem": "ext4",
         "filesystem_label": "KERNAID_VAULT",
+        "vault_profile_version": "1",
+        "vault_profile_sha256": catalog_v2.VAULT_PROFILE_SHA256,
         "filesystem_uuid_before": uuid("e" if firmware == "bios" else "f"),
         "filesystem_uuid_after": uuid("e" if firmware == "bios" else "f"),
         "sentinel_before_sha256": sha("1"),
@@ -167,6 +170,21 @@ def synthetic_log(
         )
     lines.append(render_fields(entry_v2.USB_ATTESTATION_PREFIX, usb))
     if include_vault:
+        for stage in ("post-initialize", "post-boot-verify"):
+            for kind in ("luks2", "ext4"):
+                lines.append(
+                    render_fields(
+                        entry_v2.VAULT_PROFILE_CHECK_PREFIX,
+                        {
+                            "firmware": firmware,
+                            "stage": stage,
+                            "kind": kind,
+                            "vault_profile_version": "1",
+                            "vault_profile_sha256": catalog_v2.VAULT_PROFILE_SHA256,
+                            "verified": "true",
+                        },
+                    )
+                )
         lines.append(render_fields(entry_v2.VAULT_ATTESTATION_PREFIX, vault))
     return "\n".join(lines) + "\n"
 
@@ -196,6 +214,10 @@ class CatalogV2Tests(unittest.TestCase):
         self.assertEqual(layout.logical_sector_bytes, 512)
         self.assertEqual(layout.minimum_media_bytes, 25_769_803_776)
         self.assertEqual(layout.minimum_advertised_media_bytes, 32_000_000_000)
+        self.assertEqual(layout.vault_profile_version, 1)
+        self.assertEqual(
+            layout.vault_profile_sha256, catalog_v2.VAULT_PROFILE_SHA256
+        )
         self.assertEqual(layout.vault_partition.number, 3)
         self.assertEqual(layout.vault_partition.start_lba, 33_554_432)
         self.assertEqual(layout.vault_partition.sector_count, 16_777_216)
@@ -209,6 +231,25 @@ class CatalogV2Tests(unittest.TestCase):
                 catalog_v2.CatalogV2Error, "immutable layout-v1"
             ):
                 catalog_v2.load_device_layout(path)
+
+    def test_canonical_vault_profile_document_and_digest_are_required(self) -> None:
+        self.assertEqual(
+            catalog_v2.load_vault_profile(PROFILE_PATH),
+            catalog_v2.VAULT_PROFILE_SHA256,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            layout = directory / "device-layout.v1.json"
+            profile = directory / catalog_v2.VAULT_PROFILE_FILENAME
+            layout.write_bytes(MANIFEST_PATH.read_bytes())
+            profile.write_bytes(PROFILE_PATH.read_bytes())
+            document = json.loads(profile.read_text(encoding="utf-8"))
+            document["luks2"]["dataOffsetBytes"] //= 2
+            profile.write_text(json.dumps(document), encoding="utf-8")
+            with self.assertRaisesRegex(
+                catalog_v2.CatalogV2Error, "immutable profile-v1"
+            ):
+                catalog_v2.load_device_layout(layout)
 
     def _fixture(
         self, directory: Path, *, slot3: str = "finalized"
@@ -478,6 +519,26 @@ class CatalogV2Tests(unittest.TestCase):
                 ),
                 r"^[0-9a-f]{64}$",
             )
+            lines = bios_log.read_text(encoding="utf-8").splitlines()
+            removed = False
+            incomplete: list[str] = []
+            for line in lines:
+                if (
+                    not removed
+                    and line.startswith(entry_v2.VAULT_PROFILE_CHECK_PREFIX)
+                ):
+                    removed = True
+                    continue
+                incomplete.append(line)
+            bios_log.write_text("\n".join(incomplete) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "four exact vault profile checks"):
+                entry_v2.attested_log(
+                    bios_log,
+                    firmware="bios",
+                    iso_size=iso.stat().st_size,
+                    iso_sha256=digest,
+                    layout=layout,
+                )
 
     def test_vault_evidence_requires_luks_ext4_and_stable_state(self) -> None:
         cases = (

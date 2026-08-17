@@ -9,6 +9,9 @@ on:
       - "tools/make-device/catalog-entry.py"
       - "tools/make-device/catalog-entry-v2.py"
       - "tools/make-device/catalog_v2.py"
+      - "tools/make-device/make-device.py"
+      - "tools/make-device/make_device_v2.py"
+      - "tools/make-device/trusted-rescue-images.v2.schema.json"
       - "apps/desk/**"
       - "packs/linux/**"
       - "crates/rescue-secrets/**"
@@ -104,7 +107,7 @@ jobs:
             > KernAid-Rescue-amd64.catalog-entry.json
           /usr/bin/python3 -m json.tool \
             KernAid-Rescue-amd64.catalog-entry.json >/dev/null
-      - name: Validate the inactive catalog-v2 evidence contract
+      - name: Derive and validate the inactive catalog-v2 evidence artifact
         env:
           KERNAID_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           KERNAID_ARTIFACT_VERSION: ci-${{ github.run_id }}-${{ github.run_attempt }}
@@ -121,9 +124,36 @@ jobs:
             --uefi-run-id "$GITHUB_RUN_ID" \
             --uefi-run-url "$KERNAID_RUN_URL" \
             --uefi-log "$PWD/rescue-usb-smoke-uefi.log" \
-            > /tmp/kernaid-catalog-entry-v2.preview.json
+            > KernAid-Rescue-amd64.catalog-entry-v2.json
           /usr/bin/python3 -m json.tool \
-            /tmp/kernaid-catalog-entry-v2.preview.json >/dev/null
+            KernAid-Rescue-amd64.catalog-entry-v2.json >/dev/null
+          /usr/bin/python3 -I -B - \
+            "$PWD/tools/make-device/catalog_v2.py" \
+            "$PWD/KernAid-Rescue-amd64.catalog-entry-v2.json" <<'PY'
+          import json
+          import sys
+          import types
+          from pathlib import Path
+
+          module_path = Path(sys.argv[1])
+          entry_path = Path(sys.argv[2])
+          module = types.ModuleType("kernaid_catalog_v2_artifact_gate")
+          module.__file__ = str(module_path)
+          sys.modules[module.__name__] = module
+          source = module_path.read_bytes()
+          exec(compile(source, str(module_path), "exec", dont_inherit=True), module.__dict__)
+          entry = json.loads(entry_path.read_text(encoding="utf-8"))
+          catalog = {
+              "schema": "dev.kernaid.trusted-rescue-images.v2",
+              "catalogRevision": 1,
+              "images": [entry],
+          }
+          parsed = module.parse_trust_catalog_v2(
+              json.dumps(catalog, sort_keys=True, separators=(",", ":"))
+          )
+          if len(parsed.images) != 1:
+              raise SystemExit("catalog-v2 artifact did not validate exactly once")
+          PY
       - name: Publish smoke diagnostics
         if: always()
         uses: actions/upload-artifact@v4
@@ -142,5 +172,6 @@ jobs:
             KernAid-Rescue-amd64.iso
             KernAid-Rescue-amd64.iso.sha256
             KernAid-Rescue-amd64.catalog-entry.json
+            KernAid-Rescue-amd64.catalog-entry-v2.json
           if-no-files-found: error
           retention-days: 14

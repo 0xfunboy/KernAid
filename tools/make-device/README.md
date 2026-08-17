@@ -23,12 +23,20 @@ Ogni voce lega esattamente:
 Il catalogo è il trust anchor locale: programma, catalogo e tutta la loro
 directory devono essere posseduti da `root` e non scrivibili da gruppo/altri.
 
-Il writer installabile e il workflow di pubblicazione restano sulla versione
-v1. I file `trusted-rescue-images.v2.json`,
+Il writer v1 resta l'unico percorso attivo per l'immagine pubblicata corrente.
+Il percorso separato `make-device-v2.py` è implementato e testabile, ma resta
+**inattivo in produzione**: `trusted-rescue-images.v2.json` ha revisione zero e
+l'elenco immagini è vuoto. Il launcher v2 non consulta mai il catalogo v1 e
+non effettua downgrade; con il trust anchor presente nel repository rifiuta
+ogni ISO prima di aprire il target in scrittura.
+
 `trusted-rescue-images.v2.schema.json`, `catalog_v2.py` e
-`catalog-entry-v2.py` definiscono invece un contratto di trust futuro,
-separato e inattivo: il catalogo v2 ha revisione zero e l'elenco immagini è
-vuoto. Non è un catalogo alternativo da installare e non autorizza alcuna ISO.
+`catalog-entry-v2.py` definiscono il relativo contratto di trust. Il writer v2
+potrà diventare operativo soltanto quando una release reale avrà entrambe le
+prove BIOS/UEFI descritte sotto e la relativa voce sarà revisionata e inserita
+esplicitamente nel catalogo. La fixture dello smoke loop privilegiato vive
+soltanto in una directory temporanea root-owned e non promuove il catalogo
+distribuito.
 
 Una futura promozione v2 richiederà, per la stessa ISO e lo stesso layout
 immutabile, entrambe queste famiglie di prove indipendenti per BIOS e UEFI:
@@ -40,11 +48,15 @@ immutabile, entrambe queste famiglie di prove indipendenti per BIOS e UEFI:
   sentinel e identità stabili nei due boot, rifiuto della chiave errata e
   chiusura pulita verificata.
 
-Lo smoke USB attuale che verifica soltanto layout e boot non prova la
-persistenza del vault. La sua riga `KERNAID_QEMU_USB_ATTESTATION_V1` non può
-quindi essere usata da sola per generare una voce trusted v2; anche i log
-CD-ROM v1 vengono rifiutati. Finché mancano entrambe le famiglie di
-attestazioni, nessun artefatto può essere promosso nel catalogo v2.
+La riga di solo layout/boot `KERNAID_QEMU_USB_ATTESTATION_V1` non può essere
+usata da sola per generare una voce trusted v2; anche i log CD-ROM v1 vengono
+rifiutati. Lo smoke vault emette la distinta
+`KERNAID_QEMU_USB_VAULT_ATTESTATION_V1` soltanto dopo avere verificato due
+volte, tramite JSON LUKS2 e superblock ext4 binario, il profilo canonico
+`vault-profile.v1.json`. Una modifica a KDF, offset, cipher, geometria,
+feature, journal o policy ext4 interrompe lo smoke prima dell'attestazione.
+Finché mancano entrambe le famiglie di attestazioni, nessun artefatto può
+essere promosso nel catalogo v2.
 
 ## Installazione operatore
 
@@ -117,6 +129,116 @@ e provati in modo sicuro. Il report contiene la prova udev verificata, incluso
 `ID_PATH`, ma dichiara esplicitamente di essere JSON locale **non firmato e non
 autenticato**: non è una ricevuta crittografica.
 
+Questa dichiarazione riguarda esclusivamente `make-device.py` v1. Il percorso
+v2 crea e verifica il vault, ma non può ancora autorizzare un'immagine di
+produzione perché il catalogo v2 distribuito è vuoto.
+
+## Writer USB v2 e vault cifrato (implementato, trust inattivo)
+
+Quando una futura voce catalog-v2 sarà realmente trusted, il launcher v2
+accetterà soltanto un supporto che espone almeno `32000000000` byte. Scrive e
+verifica il prefisso ISO esatto, richiede che lo slot MBR 3 coincida con il
+manifest installato e fa riesaminare la tabella al kernel. La p3 deve essere:
+
+- numero `3`, tipo MBR `0x83`;
+- start LBA `33554432` (16 GiB);
+- `16777216` settori da 512 byte (8 GiB);
+- label LUKS2 e filesystem ext4 `KERNAID_VAULT`.
+
+Path, major:minor, inode del nodo, parent sysfs, capacità, settore logico e
+disk sequence del disco intero vengono legati e ricontrollati a ogni handoff.
+Una geometria diversa, un nodo mutato, un mapper ambiguo o qualsiasi firma
+riconosciuta nella p3/coda che entrerebbe in conflitto viene rifiutata senza
+cancellazione o riparazione implicita.
+
+La passphrase fisica viene letta due volte esclusivamente da `/dev/tty` con
+echo disabilitato. Non esiste un argomento, variabile d'ambiente o file per
+fornirla. `cryptsetup` la riceve tramite pipe ereditata e `/proc/self/fd/N`;
+buffer e seed dell'identità vengono azzerati best-effort prima del rilascio.
+Il solo smoke CI può usare un FD di pipe ereditato, ma esclusivamente insieme
+al token che lega un `/dev/loopN` privato al backing inode. Con `CI` attivo un
+supporto fisico è irraggiungibile.
+
+La policy fisica v2 autorizza **soltanto supporti factory-new, mai usati per
+dati**. Dopo la conferma distruttiva legata a path/seriale/modello/capacità,
+l'operatore deve digitare una seconda frase esatta che attesta anche
+path/seriale/disk sequence e questa condizione. È un'attestazione umana, non
+una misura tecnica: il report conserva separatamente
+`operatorFreshMediaAttestation: true` e
+`technicalFreshnessVerified: false`. Il loop CI usa invece un valore test-only
+tipizzato e non finge un'attestazione umana. `luksFormat` e `mkfs.ext4` non
+sanitizzano ogni byte raw residuo: supporti già usati sono vietati e non esiste
+ancora un comando di wipe, recovery o reprovisioning autenticato.
+
+Il vault viene formattato LUKS2, aperto con un mapper generato localmente,
+formattato ext4 e montato con policy hardened. Vengono creati il marker Rescue,
+il lock, `/.kernaid-secure-state-v1/` e un seed Ed25519 iniziale nel formato
+letto da `kernaid-rescue-secrets`. Il writer smonta e chiude, rifiuta una chiave
+errata, riapre con quella corretta e verifica esattamente UUID LUKS/filesystem,
+label, marker e hash dell'envelope d'identità. Mapper e mount temporanei sono
+sempre sottoposti a cleanup verificato.
+
+Il profilo crittografico/filesystem non dipende dai default dell'host: cipher,
+key size, settore, Argon2id, aree metadata/keyslot e data offset LUKS2, oltre a
+geometria, feature mask, journal, reserved blocks e mount policy ext4, sono
+pinning immutabili. Il loro documento canonico e SHA-256 sono legati al
+manifest, al catalogo, alle attestazioni e al report. Prima di qualunque
+inventario esterno o apertura del target, il writer lega l'identità di tutti i
+binari root-owned, prova realmente lo stesso LUKS2 su un file anonimo e lo
+stesso ext4 su un file sparse temporaneo, quindi verifica i metadati
+machine-readable. Tool, versione o capability incompatibili causano un rifiuto
+prima del primo byte sul supporto.
+
+Dopo il primo tentativo di scrittura sul supporto, qualunque errore—including
+provisioning, verifica, cleanup, segnale o output del report—termina con exit
+code `4` e il messaggio `MEDIA PARTIAL / NON-BOOTABLE`. Il supporto non deve
+essere avviato o riutilizzato. Il writer rifiuta una firma riconosciuta in
+conflitto senza cancellarla: quindi un supporto v2 già provisionato, o un
+parziale che contiene già LUKS in p3, viene rifiutato. Questo non consente però
+di provare che un supporto senza firme riconosciute sia nuovo: un errore prima
+della creazione della firma p3 può lasciare uno stato tecnicamente
+indistinguibile da una coda blank/non riconosciuta. L'indicazione “non
+riutilizzare” è pertanto una policy operativa conservativa, non una
+classificazione autenticata del supporto. Retry, recovery e reprovisioning
+autenticati non sono implementati; richiederanno un futuro flusso separato che
+provi esattamente vault, passphrase, marker e identità KernAid. Non viene
+cancellata alcuna firma implicitamente e non viene mai tentato un fallback al
+writer/catalogo v1. Il report espone esplicitamente questi limiti.
+
+Il bundle v2 richiede inoltre `cryptsetup` ed `e2fsprogs`. Va installato in una
+directory root-owned non scrivibile da gruppo/altri insieme a una copia esatta
+del manifest:
+
+```text
+sudo install -d -o root -g root -m 0755 /usr/local/libexec/kernaid/make-device-v2
+sudo install -o root -g root -m 0755 \
+  tools/make-device/make-device-v2.py \
+  /usr/local/libexec/kernaid/make-device-v2/make-device-v2.py
+sudo install -o root -g root -m 0644 \
+  tools/make-device/make_device_v2.py \
+  tools/make-device/make-device.py \
+  tools/make-device/catalog_v2.py \
+  tools/make-device/trusted-rescue-images.v2.json \
+  /usr/local/libexec/kernaid/make-device-v2/
+sudo install -o root -g root -m 0644 \
+  rescue/image-layout/device-layout.v1.json \
+  /usr/local/libexec/kernaid/make-device-v2/device-layout.v1.json
+sudo install -o root -g root -m 0644 \
+  rescue/image-layout/vault-profile.v1.json \
+  /usr/local/libexec/kernaid/make-device-v2/vault-profile.v1.json
+```
+
+Il launcher verifica ownership e mode del bundle **prima** di importare il
+core. Oggi il comando seguente rifiuta correttamente con “catalog v2 inactive”;
+diventerà operativo soltanto dopo una promozione catalogata reale:
+
+```text
+sudo /usr/local/libexec/kernaid/make-device-v2/make-device-v2.py \
+  --iso /percorso/KernAid-Rescue-amd64.iso \
+  --sha256 HASH_UFFICIALE_DA_64_CARATTERI \
+  --device /dev/sdX
+```
+
 ## Popolare il catalogo dopo CI
 
 La pipeline Rescue calcola l'hash della stessa ISO avviata da QEMU e fa
@@ -165,5 +287,17 @@ crea e distrugge autonomamente il proprio loop:
 ```text
 sudo tools/make-device/tests/loop-smoke.sh
 ```
+
+Lo smoke v2 crea un backing **sparse** esattamente da 32.000.000.000 byte,
+installa un bundle/fixture catalog-v2 temporaneo root-owned, scrive l'immagine,
+provisiona e riapre LUKS2/ext4 e verifica che non restino mapper o mount:
+
+```text
+sudo tools/make-device/tests/loop-v2-smoke.sh
+```
+
+La fixture v2 è raggiungibile soltanto dal loop temporaneo e non costituisce
+evidenza di release. Il workflow `make-device` installa cryptsetup/e2fsprogs,
+esegue tutti i test unitari v1/v2 e poi entrambi gli smoke privilegiati.
 
 Non esiste un'opzione `--yes` per i dispositivi fisici.

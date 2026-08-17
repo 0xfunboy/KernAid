@@ -12,6 +12,8 @@ import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 
 TOOLS_DIR = Path(__file__).resolve().parents[1]
@@ -20,6 +22,7 @@ SCRIPT = TOOLS_DIR / "qemu-usb-smoke.sh"
 LAYOUT_MANIFEST = REPO_DIR / "rescue/image-layout/device-layout.v1.json"
 CATALOG_V2_PATH = REPO_DIR / "tools/make-device/catalog_v2.py"
 ENTRY_V2_PATH = REPO_DIR / "tools/make-device/catalog-entry-v2.py"
+PROFILE_VERIFIER_PATH = TOOLS_DIR / "verify-vault-profile.py"
 
 
 def load_module(name: str, path: Path) -> object:
@@ -33,6 +36,7 @@ def load_module(name: str, path: Path) -> object:
 
 catalog_v2 = load_module("kernaid_mock_catalog_v2", CATALOG_V2_PATH)
 entry_v2 = load_module("kernaid_mock_entry_v2", ENTRY_V2_PATH)
+profile_verifier = load_module("kernaid_mock_profile_verifier", PROFILE_VERIFIER_PATH)
 
 
 def partition_entry(
@@ -153,6 +157,9 @@ class MockToolchain:
             command="${1:-}"
             case "$command" in
               luksFormat|isLuks) exit 0 ;;
+              luksDump)
+                printf '{}\n'
+                ;;
               luksUUID)
                 printf '11111111-2222-4333-8444-555555555555\n'
                 ;;
@@ -209,6 +216,64 @@ class MockToolchain:
             """
             #!/usr/bin/env bash
             exit 0
+            """,
+        )
+        self._tool(
+            "tune2fs",
+            """
+            #!/usr/bin/env bash
+            exit 0
+            """,
+        )
+        self._tool(
+            "readlink",
+            """
+            #!/usr/bin/env bash
+            if [[ "${@: -1}" == /dev/mapper/* ]]; then
+              printf '/dev/dm-0\n'
+            else
+              /usr/bin/readlink "$@"
+            fi
+            """,
+        )
+        self._tool(
+            "python3",
+            """
+            #!/usr/bin/env bash
+            set -euo pipefail
+            if [[ " $* " == *"/verify-vault-profile.py "* ]]; then
+              kind=""
+              if [[ " $* " == *" luks-json "* ]]; then kind=luks-json; fi
+              if [[ " $* " == *" ext4 "* ]]; then kind=ext4; fi
+              [[ -n "$kind" ]]
+              if [[ "$kind" == luks-json ]]; then /usr/bin/cat >/dev/null; fi
+              if [[ "$kind" == ext4 ]]; then
+                device=""; mapper=""; backing=""
+                while [[ "$#" -gt 0 ]]; do
+                  case "$1" in
+                    --device) device="$2"; shift 2 ;;
+                    --mapper-name) mapper="$2"; shift 2 ;;
+                    --backing-device) backing="$2"; shift 2 ;;
+                    *) shift ;;
+                  esac
+                done
+                if [[ "$device" != /dev/dm-0 \
+                  || ! "$mapper" =~ ^kernaid-inspect-[0-9a-f]{16}$ \
+                  || "$backing" != /dev/loop0 ]]; then
+                  printf 'mock ext4 dm binding arguments rejected\n' >&2
+                  exit 3
+                fi
+              fi
+              printf '%s\n' "$kind" >>"$KERNAID_MOCK_STATE_DIR/profile-checks"
+              if [[ "${KERNAID_MOCK_PROFILE_FAILURE:-}" == "$kind" ]]; then
+                printf 'mock profile tamper rejected\n' >&2
+                exit 2
+              fi
+              printf '%s\n' \
+                "KERNAID_VAULT_PROFILE_CHECK_V1 kind=$kind sha256=b4801359bd4f31ce67fbd3ec15b6c81c44aa6759ba43b2a4e099a7dfcc25a37c verified=true"
+              exit 0
+            fi
+            exec /usr/bin/python3 "$@"
             """,
         )
         self._tool(
@@ -306,8 +371,53 @@ class MockToolchain:
 
 
 class QemuUsbVaultSmokeTests(unittest.TestCase):
+    def test_profile_helper_rejects_a_misbound_dm_slave(self) -> None:
+        scan = mock.MagicMock()
+        scan.__enter__.return_value = [SimpleNamespace(name="loop1")]
+        scan.__exit__.return_value = False
+
+        def resolve(path: str) -> str:
+            if path == "/sys/dev/block/253:7":
+                return "/sys/devices/virtual/block/dm-0"
+            if path.endswith("/slaves/loop1"):
+                return "/sys/devices/pci0000/block/loop1"
+            return path
+
+        def read(path: str) -> str:
+            if path.endswith("/dm/name"):
+                return "kernaid-inspect-0123456789abcdef"
+            if path.endswith("/dev"):
+                return "7:1"
+            raise AssertionError(path)
+
+        with (
+            mock.patch.object(
+                profile_verifier,
+                "_block_identity",
+                side_effect=(
+                    (1, 2, os.makedev(253, 7), stat.S_IFBLK | 0o600),
+                    (3, 4, os.makedev(7, 0), stat.S_IFBLK | 0o600),
+                ),
+            ),
+            mock.patch.object(profile_verifier.os.path, "realpath", side_effect=resolve),
+            mock.patch.object(profile_verifier, "_read_sysfs_text", side_effect=read),
+            mock.patch.object(profile_verifier.os, "scandir", return_value=scan),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "exact p3 loop"):
+                profile_verifier._dm_snapshot(
+                    8,
+                    "/dev/dm-0",
+                    "kernaid-inspect-0123456789abcdef",
+                    9,
+                    "/dev/loop0",
+                )
+
     def run_smoke(
-        self, *, leak_on_wrong_key: bool = False, cleanup_close_failure: bool = False
+        self,
+        *,
+        leak_on_wrong_key: bool = False,
+        cleanup_close_failure: bool = False,
+        profile_failure: str = "",
     ) -> tuple[
         subprocess.CompletedProcess[str],
         Path,
@@ -330,6 +440,7 @@ class QemuUsbVaultSmokeTests(unittest.TestCase):
                 "KERNAID_MOCK_STATE_DIR": str(mocks.state),
                 "KERNAID_MOCK_PROBE_LEAK": "1" if leak_on_wrong_key else "0",
                 "KERNAID_MOCK_CLOSE_FAIL": "1" if cleanup_close_failure else "0",
+                "KERNAID_MOCK_PROFILE_FAILURE": profile_failure,
                 "KERNAID_USB_SMOKE_LOG": str(log),
             }
         )
@@ -354,6 +465,9 @@ class QemuUsbVaultSmokeTests(unittest.TestCase):
             contents.count("KERNAID_QEMU_USB_VAULT_ATTESTATION_V1 "), 1
         )
         self.assertEqual(
+            contents.count("KERNAID_QEMU_USB_VAULT_PROFILE_CHECK_V1 "), 4
+        )
+        self.assertEqual(
             contents.count("KERNAID_QEMU_USB_VAULT_RAW_SCOPE_V1 "), 1
         )
         self.assertEqual(contents.count("KERNAID_QEMU_USB_BOOT_READY_V1 "), 2)
@@ -373,6 +487,10 @@ class QemuUsbVaultSmokeTests(unittest.TestCase):
         self.assertFalse((state / "loop-attached").exists())
         self.assertEqual(list(state.glob("mapper.*")), [])
         self.assertFalse((state / "provision-mounted").exists())
+        self.assertEqual(
+            (state / "profile-checks").read_text(encoding="utf-8").splitlines(),
+            ["luks-json", "ext4", "luks-json", "ext4"],
+        )
 
         layout = catalog_v2.load_device_layout(LAYOUT_MANIFEST)
         iso_digest = hashlib.sha256(iso.read_bytes()).hexdigest()
@@ -452,6 +570,38 @@ class QemuUsbVaultSmokeTests(unittest.TestCase):
         self.assertRegex(str(preserved), r"^/tmp/kernaid-qemu-usb-vault\.[A-Za-z0-9]+$")
         self.assertTrue(preserved.is_dir())
         shutil.rmtree(preserved)
+
+    def test_luks_profile_tamper_cannot_emit_vault_attestation(self) -> None:
+        result, _iso, log, _state, temporary = self.run_smoke(
+            profile_failure="luks-json"
+        )
+        self.addCleanup(temporary.cleanup)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("mock profile tamper rejected", result.stderr)
+        self.assertEqual(
+            (_state / "profile-checks").read_text(encoding="utf-8").splitlines(),
+            ["luks-json"],
+        )
+        self.assertNotIn(
+            "KERNAID_QEMU_USB_VAULT_ATTESTATION_V1 ",
+            log.read_text(encoding="utf-8"),
+        )
+
+    def test_ext4_profile_tamper_cannot_emit_vault_attestation(self) -> None:
+        result, _iso, log, _state, temporary = self.run_smoke(
+            profile_failure="ext4"
+        )
+        self.addCleanup(temporary.cleanup)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("mock profile tamper rejected", result.stderr)
+        self.assertEqual(
+            (_state / "profile-checks").read_text(encoding="utf-8").splitlines(),
+            ["luks-json", "ext4"],
+        )
+        self.assertNotIn(
+            "KERNAID_QEMU_USB_VAULT_ATTESTATION_V1 ",
+            log.read_text(encoding="utf-8"),
+        )
 
 
 if __name__ == "__main__":

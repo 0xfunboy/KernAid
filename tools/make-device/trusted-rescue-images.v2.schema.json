@@ -63,6 +63,8 @@
         "luksLabel",
         "filesystem",
         "filesystemLabel",
+        "vaultProfileVersion",
+        "vaultProfileSha256",
         "stableUuidsVerified",
         "sentinelVerified",
         "identityVerified",
@@ -78,6 +80,8 @@
         "luksLabel": {"const": "KERNAID_VAULT"},
         "filesystem": {"const": "ext4"},
         "filesystemLabel": {"const": "KERNAID_VAULT"},
+        "vaultProfileVersion": {"const": 1},
+        "vaultProfileSha256": {"const": "b4801359bd4f31ce67fbd3ec15b6c81c44aa6759ba43b2a4e099a7dfcc25a37c"},
         "stableUuidsVerified": {"const": true},
         "sentinelVerified": {"const": true},
         "identityVerified": {"const": true},
@@ -114,6 +118,8 @@
         "minimumMediaBytes",
         "minimumAdvertisedMediaBytes",
         "minimumAdvertisedMediaLabel",
+        "vaultProfileVersion",
+        "vaultProfileSha256",
         "vaultPartition"
       ],
       "properties": {
@@ -124,6 +130,8 @@
         "minimumMediaBytes": {"const": 25769803776},
         "minimumAdvertisedMediaBytes": {"const": 32000000000},
         "minimumAdvertisedMediaLabel": {"const": "32 GB"},
+        "vaultProfileVersion": {"const": 1},
+        "vaultProfileSha256": {"const": "b4801359bd4f31ce67fbd3ec15b6c81c44aa6759ba43b2a4e099a7dfcc25a37c"},
         "vaultPartition": {"$ref": "#/$defs/vaultPartition"}
       }
     },

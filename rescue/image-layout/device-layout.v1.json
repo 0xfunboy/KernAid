@@ -6,6 +6,8 @@
   "minimumMediaBytes": 25769803776,
   "minimumAdvertisedMediaBytes": 32000000000,
   "minimumAdvertisedMediaLabel": "32 GB",
+  "vaultProfileVersion": 1,
+  "vaultProfileSha256": "b4801359bd4f31ce67fbd3ec15b6c81c44aa6759ba43b2a4e099a7dfcc25a37c",
   "vaultPartition": {
     "number": 3,
     "name": "KERNAID_VAULT",

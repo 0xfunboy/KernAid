@@ -10,6 +10,7 @@ outside the byte-for-byte attested ISO prefix.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import stat
@@ -27,6 +28,7 @@ PARTITION_TABLE_OFFSET: Final = 446
 PARTITION_ENTRY_BYTES: Final = 16
 UINT32_LIMIT: Final = 1 << 32
 MAX_MANIFEST_BYTES: Final = 64 * 1024
+VAULT_PROFILE_FILENAME: Final = "vault-profile.v1.json"
 
 EXPECTED_SCHEMA: Final = "kernaid.rescue-device-layout.v1"
 EXPECTED_LAYOUT_VERSION: Final = 1
@@ -35,6 +37,10 @@ EXPECTED_SECTOR_BYTES: Final = 512
 EXPECTED_MINIMUM_MEDIA_BYTES: Final = 24 * 1024**3
 EXPECTED_ADVERTISED_MEDIA_BYTES: Final = 32_000_000_000
 EXPECTED_ADVERTISED_MEDIA_LABEL: Final = "32 GB"
+EXPECTED_VAULT_PROFILE_VERSION: Final = 1
+EXPECTED_VAULT_PROFILE_SHA256: Final = (
+    "b4801359bd4f31ce67fbd3ec15b6c81c44aa6759ba43b2a4e099a7dfcc25a37c"
+)
 EXPECTED_VAULT_NUMBER: Final = 3
 EXPECTED_VAULT_NAME: Final = "KERNAID_VAULT"
 EXPECTED_VAULT_TYPE: Final = 0x83
@@ -52,6 +58,8 @@ class DeviceLayout:
     minimum_media_bytes: int
     minimum_advertised_media_bytes: int
     minimum_advertised_media_label: str
+    vault_profile_version: int
+    vault_profile_sha256: str
     vault_number: int
     vault_name: str
     vault_type: int
@@ -105,20 +113,22 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def _read_manifest_document(path: Path) -> dict[str, Any]:
+def _read_manifest_document(
+    path: Path, *, label: str = "layout manifest"
+) -> dict[str, Any]:
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
         descriptor = os.open(path, flags)
     except OSError as error:
-        raise LayoutError(f"cannot open layout manifest: {error}") from error
+        raise LayoutError(f"cannot open {label}: {error}") from error
     try:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
-            raise LayoutError("layout manifest must be a regular file")
+            raise LayoutError(f"{label} must be a regular file")
         if metadata.st_size <= 0 or metadata.st_size > MAX_MANIFEST_BYTES:
-            raise LayoutError("layout manifest has an invalid size")
+            raise LayoutError(f"{label} has an invalid size")
         chunks: list[bytes] = []
         remaining = metadata.st_size + 1
         while remaining > 0:
@@ -129,7 +139,7 @@ def _read_manifest_document(path: Path) -> dict[str, Any]:
             remaining -= len(chunk)
         encoded = b"".join(chunks)
         if len(encoded) != metadata.st_size:
-            raise LayoutError("layout manifest changed while it was read")
+            raise LayoutError(f"{label} changed while it was read")
     finally:
         os.close(descriptor)
 
@@ -140,10 +150,19 @@ def _read_manifest_document(path: Path) -> dict[str, Any]:
     except (UnicodeDecodeError, json.JSONDecodeError, LayoutError) as error:
         if isinstance(error, LayoutError):
             raise
-        raise LayoutError(f"layout manifest is not strict UTF-8 JSON: {error}") from error
+        raise LayoutError(f"{label} is not strict UTF-8 JSON: {error}") from error
     if not isinstance(document, dict):
-        raise LayoutError("layout manifest root must be an object")
+        raise LayoutError(f"{label} root must be an object")
     return document
+
+
+def _verify_vault_profile(path: Path) -> None:
+    document = _read_manifest_document(path, label="vault profile manifest")
+    canonical = json.dumps(
+        document, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("ascii")
+    if hashlib.sha256(canonical).hexdigest() != EXPECTED_VAULT_PROFILE_SHA256:
+        raise LayoutError("vault profile manifest changes immutable profile-v1")
 
 
 def _require_exact_keys(
@@ -182,6 +201,8 @@ def parse_layout_manifest(path: Path) -> DeviceLayout:
             "minimumMediaBytes",
             "minimumAdvertisedMediaBytes",
             "minimumAdvertisedMediaLabel",
+            "vaultProfileVersion",
+            "vaultProfileSha256",
             "vaultPartition",
         },
         "manifest",
@@ -215,6 +236,12 @@ def parse_layout_manifest(path: Path) -> DeviceLayout:
     advertised_label = _require_string(
         document["minimumAdvertisedMediaLabel"],
         "manifest.minimumAdvertisedMediaLabel",
+    )
+    vault_profile_version = _require_int(
+        document["vaultProfileVersion"], "manifest.vaultProfileVersion"
+    )
+    vault_profile_sha256 = _require_string(
+        document["vaultProfileSha256"], "manifest.vaultProfileSha256"
     )
     vault_number = _require_int(
         vault_document["number"], "manifest.vaultPartition.number"
@@ -252,6 +279,8 @@ def parse_layout_manifest(path: Path) -> DeviceLayout:
         minimum_media_bytes=minimum_media_bytes,
         minimum_advertised_media_bytes=advertised_bytes,
         minimum_advertised_media_label=advertised_label,
+        vault_profile_version=vault_profile_version,
+        vault_profile_sha256=vault_profile_sha256,
         vault_number=vault_number,
         vault_name=vault_name,
         vault_type=vault_type,
@@ -278,6 +307,16 @@ def parse_layout_manifest(path: Path) -> DeviceLayout:
             EXPECTED_ADVERTISED_MEDIA_LABEL,
             "minimumAdvertisedMediaLabel",
         ),
+        (
+            vault_profile_version,
+            EXPECTED_VAULT_PROFILE_VERSION,
+            "vaultProfileVersion",
+        ),
+        (
+            vault_profile_sha256,
+            EXPECTED_VAULT_PROFILE_SHA256,
+            "vaultProfileSha256",
+        ),
         (vault_number, EXPECTED_VAULT_NUMBER, "vaultPartition.number"),
         (vault_name, EXPECTED_VAULT_NAME, "vaultPartition.name"),
         (vault_type, EXPECTED_VAULT_TYPE, "vaultPartition.mbrType"),
@@ -301,6 +340,7 @@ def parse_layout_manifest(path: Path) -> DeviceLayout:
         raise LayoutError("minimum media bytes must equal the end of the vault partition")
     if layout.minimum_advertised_media_bytes < layout.minimum_media_bytes:
         raise LayoutError("advertised media capacity cannot be below the layout minimum")
+    _verify_vault_profile(path.with_name(VAULT_PROFILE_FILENAME))
     return layout
 
 

@@ -6,10 +6,20 @@ on:
     branches: [main]
     paths:
       - "tools/make-device/**"
+      - "rescue/image-layout/device-layout.v1.json"
+      - "rescue/image-layout/vault-profile.v1.json"
+      - "tools/build-rescue/qemu-usb-smoke.sh"
+      - "tools/build-rescue/verify-vault-profile.py"
+      - "tools/build-rescue/tests/test_qemu_usb_vault_smoke.py"
       - ".github/workflows/make-device.yml"
   pull_request:
     paths:
       - "tools/make-device/**"
+      - "rescue/image-layout/device-layout.v1.json"
+      - "rescue/image-layout/vault-profile.v1.json"
+      - "tools/build-rescue/qemu-usb-smoke.sh"
+      - "tools/build-rescue/verify-vault-profile.py"
+      - "tools/build-rescue/tests/test_qemu_usb_vault_smoke.py"
       - ".github/workflows/make-device.yml"
 
 permissions: {contents: read}
@@ -17,20 +27,38 @@ permissions: {contents: read}
 jobs:
   unit-and-disposable-loop:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Install safety-test tooling
-        run: sudo apt-get update && sudo apt-get install -y shellcheck util-linux
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cryptsetup-bin e2fsprogs shellcheck systemd-udev util-linux
       - name: Validate Python and shell syntax
         run: |
           python3 -m py_compile \
             tools/make-device/make-device.py \
+            tools/make-device/make-device-v2.py \
+            tools/make-device/make_device_v2.py \
             tools/make-device/catalog-entry.py \
-            tools/make-device/tests/test_make_device.py
+            tools/make-device/catalog-entry-v2.py \
+            tools/make-device/catalog_v2.py \
+            tools/make-device/tests/test_make_device.py \
+            tools/make-device/tests/test_make_device_v2.py \
+            tools/make-device/tests/test_catalog_v2.py \
+            tools/build-rescue/verify-vault-profile.py \
+            tools/build-rescue/tests/test_qemu_usb_vault_smoke.py
           bash -n tools/make-device/tests/loop-smoke.sh
+          bash -n tools/make-device/tests/loop-v2-smoke.sh
+          bash -n tools/build-rescue/qemu-usb-smoke.sh
           shellcheck tools/make-device/tests/loop-smoke.sh
-      - name: Run at least 40 isolated unit tests
+          shellcheck tools/make-device/tests/loop-v2-smoke.sh
+          shellcheck tools/build-rescue/qemu-usb-smoke.sh
+      - name: Prove exact QEMU vault-profile evidence gating
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 PYTHONWARNINGS=error::ResourceWarning \
+            python3 -m unittest tools/build-rescue/tests/test_qemu_usb_vault_smoke.py -v
+      - name: Run at least 75 isolated unit tests
         run: |
           unit_count="$(python3 - <<'PY'
           import unittest
@@ -39,9 +67,11 @@ jobs:
           print(suite.countTestCases())
           PY
           )"
-          test "$unit_count" -ge 40
+          test "$unit_count" -ge 75
           echo "Running $unit_count make-device unit tests"
           PYTHONDONTWRITEBYTECODE=1 \
             python3 -m unittest discover -s tools/make-device/tests -v
       - name: Flash and verify a disposable loop device
         run: sudo tools/make-device/tests/loop-smoke.sh
+      - name: Write, provision, reopen, and verify a catalog-v2 sparse loop
+        run: sudo tools/make-device/tests/loop-v2-smoke.sh

@@ -8,6 +8,9 @@ firmware="${1:-bios}"
 iso="${2:-$repo_dir/KernAid-Rescue-amd64.iso}"
 probe_binary="${3:-$repo_dir/target/release/kernaid-rescue-vault-probe}"
 layout_manifest="$repo_dir/rescue/image-layout/device-layout.v1.json"
+vault_profile_manifest="$repo_dir/rescue/image-layout/vault-profile.v1.json"
+vault_profile_verifier="$repo_dir/tools/build-rescue/verify-vault-profile.py"
+readonly vault_profile_sha256=b4801359bd4f31ce67fbd3ec15b6c81c44aa6759ba43b2a4e099a7dfcc25a37c
 
 # These values are the immutable layout-v1 geometry validated by
 # finalize-device-layout.py. Provisioning is confined to the p3 slice of one
@@ -23,7 +26,7 @@ readonly sentinel_value=kernaid-disposable-vault-persistence-v1
 for command in awk blkid cat chmod cp cryptsetup dd dirname findmnt grep id \
   kill losetup mkdir mkfs.ext4 mktemp mount mountpoint od python3 \
   qemu-system-x86_64 readlink rm rmdir sha256sum sleep stat sync tail tee tr \
-  truncate udevadm umount; do
+  truncate tune2fs udevadm umount; do
   command -v "$command" >/dev/null || {
     echo "Missing required command: $command" >&2
     exit 2
@@ -45,6 +48,10 @@ fi
 [[ -f "$iso" ]] || { echo "ISO not found: $iso" >&2; exit 2; }
 [[ -f "$layout_manifest" ]] || {
   echo "Layout manifest not found: $layout_manifest" >&2
+  exit 2
+}
+[[ -f "$vault_profile_manifest" && -f "$vault_profile_verifier" ]] || {
+  echo "Vault profile manifest or exact verifier is missing" >&2
   exit 2
 }
 if [[ "$probe_binary" != /* ]]; then
@@ -180,6 +187,8 @@ vault_loop=""
 provision_open=false
 provision_mounted=false
 inspection_open=false
+profile_luks_checks=0
+profile_ext4_checks=0
 last_prefix_sha256=""
 last_p3_sha256=""
 last_target_sha256=""
@@ -416,8 +425,60 @@ blkid_value() {
     --output value --match-tag "$tag" "$device"
 }
 
+verify_luks_profile() {
+  local stage="$1"
+  local stage_token="$2"
+  local observed
+  observed="$(
+    cryptsetup luksDump --dump-json-metadata "$vault_loop" \
+      | python3 -I -B "$vault_profile_verifier" \
+          --profile "$vault_profile_manifest" luks-json
+  )"
+  if [[ "$observed" != "KERNAID_VAULT_PROFILE_CHECK_V1 kind=luks-json sha256=$vault_profile_sha256 verified=true" ]]; then
+    echo "$stage did not pass the exact machine-readable LUKS2 profile gate" >&2
+    exit 1
+  fi
+  ((profile_luks_checks += 1))
+  printf '%s\n' \
+    "KERNAID_QEMU_USB_VAULT_PROFILE_CHECK_V1 firmware=$firmware stage=$stage_token kind=luks2 vault_profile_version=1 vault_profile_sha256=$vault_profile_sha256 verified=true" \
+    >>"$log"
+}
+
+verify_ext4_profile() {
+  local stage="$1"
+  local stage_token="$2"
+  local filesystem_uuid="$3"
+  local mapper_node
+  local observed
+  mapper_node="$(readlink -f -- "/dev/mapper/$inspection_mapper")"
+  if [[ ! "$mapper_node" =~ ^/dev/dm-[0-9]+$ ]]; then
+    echo "$stage mapper did not resolve to one direct device-mapper node" >&2
+    exit 1
+  fi
+  observed="$(
+    python3 -I -B "$vault_profile_verifier" \
+      --profile "$vault_profile_manifest" ext4 \
+      --device "$mapper_node" --mapper-name "$inspection_mapper" \
+      --backing-device "$vault_loop" --uuid "$filesystem_uuid"
+  )"
+  if [[ "$observed" != "KERNAID_VAULT_PROFILE_CHECK_V1 kind=ext4 sha256=$vault_profile_sha256 verified=true" ]]; then
+    echo "$stage did not pass the exact binary ext4 profile gate" >&2
+    exit 1
+  fi
+  ((profile_ext4_checks += 1))
+  printf '%s\n' \
+    "KERNAID_QEMU_USB_VAULT_PROFILE_CHECK_V1 firmware=$firmware stage=$stage_token kind=ext4 vault_profile_version=1 vault_profile_sha256=$vault_profile_sha256 verified=true" \
+    >>"$log"
+}
+
 inspect_vault_metadata() {
   local stage="$1"
+  local stage_token
+  case "$stage" in
+    Post-initialize) stage_token=post-initialize ;;
+    Post-boot\ verify) stage_token=post-boot-verify ;;
+    *) echo "Unknown exact vault profile inspection stage" >&2; exit 1 ;;
+  esac
   cryptsetup isLuks --type luks2 "$vault_loop"
   observed_luks_uuid="$(cryptsetup luksUUID --type luks2 "$vault_loop")"
   observed_luks_type="$(blkid_value "$vault_loop" TYPE)"
@@ -430,8 +491,10 @@ inspect_vault_metadata() {
     echo "$stage did not observe the exact LUKS2 KERNAID_VAULT header" >&2
     exit 1
   fi
+  verify_luks_profile "$stage" "$stage_token"
 
-  cryptsetup open --type luks2 --readonly --batch-mode --key-file "$key_file" \
+  cryptsetup open --type luks2 --readonly --batch-mode --tries 1 \
+    --disable-external-tokens --key-file "$key_file" --keyfile-size 64 \
     "$vault_loop" "$inspection_mapper"
   inspection_open=true
   udevadm settle
@@ -444,6 +507,7 @@ inspect_vault_metadata() {
     echo "$stage did not observe the exact ext4 KERNAID_VAULT filesystem" >&2
     exit 1
   fi
+  verify_ext4_profile "$stage" "$stage_token" "$observed_filesystem_uuid"
   cryptsetup close "$inspection_mapper"
   inspection_open=false
   assert_vault_resources_clean "$stage metadata inspection"
@@ -481,13 +545,24 @@ mkfs.ext4 -q -F -L KERNAID_TARGET -d "$target_seed_dir" "$target_image"
 # Neither this code, the passphrase, nor the probe is packaged in the ISO.
 allocate_vault_loop
 cryptsetup luksFormat --type luks2 --batch-mode --label KERNAID_VAULT \
-  --key-file "$key_file" "$vault_loop"
-cryptsetup open --type luks2 --batch-mode --key-file "$key_file" \
+  --cipher aes-xts-plain64 --key-size 512 --hash sha256 --sector-size 512 \
+  --pbkdf argon2id --pbkdf-force-iterations 4 --pbkdf-memory 65536 \
+  --pbkdf-parallel 1 --key-slot 0 --keyslot-cipher aes-xts-plain64 \
+  --keyslot-key-size 512 --luks2-metadata-size 16384 \
+  --luks2-keyslots-size 16744448 --use-urandom \
+  --key-file "$key_file" --keyfile-size 64 "$vault_loop"
+cryptsetup open --type luks2 --batch-mode --tries 1 \
+  --disable-external-tokens --key-file "$key_file" --keyfile-size 64 \
   "$vault_loop" "$provision_mapper"
 provision_open=true
 udevadm settle
-mkfs.ext4 -q -F -L KERNAID_VAULT \
-  -E lazy_itable_init=0,lazy_journal_init=0 "/dev/mapper/$provision_mapper"
+mkfs.ext4 -q -F -t ext4 -b 4096 -I 256 -i 16384 -g 32768 -G 16 \
+  -m 0 -o linux -e remount-ro -J size=128 \
+  -E lazy_itable_init=0,lazy_journal_init=0 \
+  -O none,has_journal,ext_attr,resize_inode,dir_index,filetype,extent,64bit,flex_bg,sparse_super,large_file,huge_file,dir_nlink,extra_isize,metadata_csum \
+  -L KERNAID_VAULT -M / "/dev/mapper/$provision_mapper"
+tune2fs -c 0 -i 0 -e remount-ro -m 0 -o '^acl,^user_xattr' -M / \
+  "/dev/mapper/$provision_mapper"
 mount -t ext4 -o rw,nosuid,nodev,noexec,nosymfollow \
   "/dev/mapper/$provision_mapper" "$provision_mount"
 provision_mounted=true
@@ -757,6 +832,11 @@ if [[ "$layout_manifest_after_sha256" != "$layout_manifest_sha256" ]]; then
   exit 1
 fi
 assert_vault_resources_clean "Final verification"
+if [[ "$profile_luks_checks" != "$boot_count" \
+  || "$profile_ext4_checks" != "$boot_count" ]]; then
+  echo "Exact vault profile checks did not pass before and after the boot window" >&2
+  exit 1
+fi
 if [[ -n "$(losetup -j "$rescue_media")" ]]; then
   echo "Final verification left a loop attached to the disposable medium" >&2
   exit 1
@@ -769,7 +849,7 @@ printf '%s\n' \
   "KERNAID_QEMU_USB_ATTESTATION_V1 firmware=$firmware transport=usb-storage boot_count=$boot_count ready_boots=$boot_count uefi_vars=$uefi_vars_attestation media_bytes=$media_bytes iso_bytes=$iso_bytes layout_manifest_sha256=$layout_manifest_sha256 iso_sha256=$iso_sha256 prefix_before_sha256=$prefix_before_sha256 prefix_after_sha256=$prefix_after_sha256 p3_start_bytes=$p3_start_bytes p3_bytes=$p3_bytes p3_before_sha256=$p3_before_sha256 p3_after_sha256=$p3_after_sha256 target_before_sha256=$target_before_sha256 target_after_sha256=$target_after_sha256 ready=true" \
   | tee -a "$log"
 printf '%s\n' \
-  "KERNAID_QEMU_USB_VAULT_ATTESTATION_V1 firmware=$firmware boot_count=$boot_count luks_version=2 luks_label=KERNAID_VAULT luks_uuid_before=$luks_uuid_before luks_uuid_after=$luks_uuid_after filesystem=ext4 filesystem_label=KERNAID_VAULT filesystem_uuid_before=$filesystem_uuid_before filesystem_uuid_after=$filesystem_uuid_after sentinel_before_sha256=$sentinel_before_sha256 sentinel_after_sha256=$sentinel_after_sha256 identity_before_sha256=$identity_before_sha256 identity_after_sha256=$identity_after_sha256 vault_layout_verified=true wrong_key_rejected=true clean_shutdowns=$clean_shutdowns" \
+  "KERNAID_QEMU_USB_VAULT_ATTESTATION_V1 firmware=$firmware boot_count=$boot_count luks_version=2 luks_label=KERNAID_VAULT luks_uuid_before=$luks_uuid_before luks_uuid_after=$luks_uuid_after filesystem=ext4 filesystem_label=KERNAID_VAULT vault_profile_version=1 vault_profile_sha256=b4801359bd4f31ce67fbd3ec15b6c81c44aa6759ba43b2a4e099a7dfcc25a37c filesystem_uuid_before=$filesystem_uuid_before filesystem_uuid_after=$filesystem_uuid_after sentinel_before_sha256=$sentinel_before_sha256 sentinel_after_sha256=$sentinel_after_sha256 identity_before_sha256=$identity_before_sha256 identity_after_sha256=$identity_after_sha256 vault_layout_verified=true wrong_key_rejected=true clean_shutdowns=$clean_shutdowns" \
   | tee -a "$log"
 printf '%s\n' \
   "KERNAID_RESCUE_VAULT_HOST_PROBE_V1 sha256=$probe_sha256 invocation_scope=host-only" \
