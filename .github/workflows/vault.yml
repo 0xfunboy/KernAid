@@ -6,10 +6,17 @@ on:
     paths:
       - "tools/test-vault/**"
       - "crates/rescue-secrets/**"
+      - "crates/rescue-openai-executor/**"
+      - "crates/rescue-openai-provider/**"
+      - "crates/protocol/**"
       - "crates/storage/**"
       - "crates/device-identity/**"
+      - "packages/schemas/rescue-openai-request.schema.json"
+      - "packages/schemas/rescue-openai-response.schema.json"
+      - "packages/schemas/fixtures/rescue-openai/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "rust-toolchain.toml"
       - ".github/workflows/vault.yml"
 permissions: {contents: read}
 jobs:
@@ -31,8 +38,11 @@ jobs:
       - name: Test the Rescue secure-state crate
         run: |
           cargo fmt -p kernaid-rescue-secrets -- --check
+          cargo fmt -p kernaid-rescue-openai-executor -- --check
           cargo clippy --locked -p kernaid-rescue-secrets --all-targets --all-features -- -D warnings
+          cargo clippy --locked -p kernaid-rescue-openai-executor --all-targets -- -D warnings
           cargo test --locked -p kernaid-rescue-secrets --all-features
+          cargo test --locked -p kernaid-rescue-openai-executor
       - name: Prove encrypted persistence on a disposable image
         run: sudo ./tools/test-vault/luks-roundtrip.sh
       - name: Probe Rescue secure state on a disposable LUKS2 mount

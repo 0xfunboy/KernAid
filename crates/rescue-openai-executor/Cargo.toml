@@ -1,0 +1,18 @@
+[package]
+name = "kernaid-rescue-openai-executor"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+kernaid-protocol = { path = "../protocol" }
+kernaid-rescue-openai-provider = { path = "../rescue-openai-provider" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1.4", features = ["event", "fs", "net", "process"] }
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "kernaid-rescue-openai-executor"
+path = "src/main.rs"

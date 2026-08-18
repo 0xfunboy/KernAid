@@ -18,6 +18,12 @@ use std::{error::Error, ffi::OsString, fmt};
 
 pub(super) const COMPANION_UID: u32 = 1000;
 pub(super) const COMPANION_NAME: &[u8] = b"kernaid";
+pub(super) const OPENAI_AGENT_NAME: &[u8] = b"kernaid-openai";
+const OPENAI_AGENT_HOME: &[u8] = b"/nonexistent";
+const OPENAI_AGENT_SHELL: &[u8] = b"/usr/sbin/nologin";
+const OPENAI_AGENT_GROUP: &[u8] = b"kernaid-openai";
+const OPENAI_VAULT_GROUP: &[u8] = b"kernaid-vault";
+const PROVIDER_CLIENT_GROUP: &[u8] = b"kernaid-provider-client";
 
 const PROC_SUPER_MAGIC: u64 = 0x0000_9fa0;
 const MAX_PROC_POLICY_BYTES: usize = 4096;
@@ -376,6 +382,257 @@ pub(super) fn passwd_has_exact_companion(bytes: &[u8], expected_uid: u32) -> boo
         }
     }
     matching_name == 1 && matching_uid == 1
+}
+
+/// Resolves the dynamically allocated Rescue OpenAI Agent UID from one
+/// already validated `/etc/passwd` descriptor. The account name, no-home
+/// marker, nologin shell, unique non-root UID, and separation from the fixed
+/// companion identity are all closed requirements.
+pub(super) fn passwd_openai_agent_uid(bytes: &[u8], companion_uid: u32) -> Option<u32> {
+    let mut entries: Vec<(&[u8], u32)> = Vec::new();
+    let mut agent_uid = None;
+    for line in bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        if line.len() > 4096 || line.contains(&0) {
+            return None;
+        }
+        let fields: Vec<&[u8]> = line.split(|byte| *byte == b':').collect();
+        if fields.len() != 7
+            || fields[0].is_empty()
+            || fields[2].is_empty()
+            || fields[3].is_empty()
+            || !fields[2].iter().all(u8::is_ascii_digit)
+            || !fields[3].iter().all(u8::is_ascii_digit)
+            || (fields[2].len() > 1 && fields[2][0] == b'0')
+            || (fields[3].len() > 1 && fields[3][0] == b'0')
+        {
+            return None;
+        }
+        let uid = std::str::from_utf8(fields[2])
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())?;
+        let gid = std::str::from_utf8(fields[3])
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())?;
+        entries.push((fields[0], uid));
+        if fields[0] == OPENAI_AGENT_NAME {
+            if agent_uid.is_some()
+                || uid == 0
+                || uid == companion_uid
+                || gid != uid
+                || fields[5] != OPENAI_AGENT_HOME
+                || fields[6] != OPENAI_AGENT_SHELL
+            {
+                return None;
+            }
+            agent_uid = Some(uid);
+        }
+    }
+    let uid = agent_uid?;
+    if entries
+        .iter()
+        .filter(|(_, candidate)| *candidate == uid)
+        .count()
+        != 1
+    {
+        return None;
+    }
+    Some(uid)
+}
+
+/// Validates the two group capabilities around the OpenAI application plane.
+/// The Agent has exactly one supplemental membership (`kernaid-vault`) and is
+/// explicitly absent from the UI-facing provider-client group.
+pub(super) fn group_has_exact_openai_boundaries(bytes: &[u8], agent_uid: u32) -> bool {
+    struct Entry<'a> {
+        name: &'a [u8],
+        gid: u32,
+        members: Vec<&'a [u8]>,
+    }
+
+    if agent_uid == 0 {
+        return false;
+    }
+    let mut entries = Vec::new();
+    for line in bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        if line.len() > 4096 || line.contains(&0) {
+            return false;
+        }
+        let fields: Vec<&[u8]> = line.split(|byte| *byte == b':').collect();
+        if fields.len() != 4
+            || fields[0].is_empty()
+            || fields[2].is_empty()
+            || !fields[2].iter().all(u8::is_ascii_digit)
+            || (fields[2].len() > 1 && fields[2][0] == b'0')
+        {
+            return false;
+        }
+        let Some(gid) = std::str::from_utf8(fields[2])
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            return false;
+        };
+        let members = if fields[3].is_empty() {
+            Vec::new()
+        } else {
+            let members: Vec<&[u8]> = fields[3].split(|byte| *byte == b',').collect();
+            if members.iter().any(|member| member.is_empty()) {
+                return false;
+            }
+            for (index, member) in members.iter().enumerate() {
+                if members[..index].contains(member) {
+                    return false;
+                }
+            }
+            members
+        };
+        entries.push(Entry {
+            name: fields[0],
+            gid,
+            members,
+        });
+    }
+
+    let unique = |name: &[u8]| {
+        let mut matching = entries.iter().filter(|entry| entry.name == name);
+        let entry = matching.next()?;
+        matching.next().is_none().then_some(entry)
+    };
+    let Some(agent_group) = unique(OPENAI_AGENT_GROUP) else {
+        return false;
+    };
+    let Some(vault_group) = unique(OPENAI_VAULT_GROUP) else {
+        return false;
+    };
+    let Some(provider_group) = unique(PROVIDER_CLIENT_GROUP) else {
+        return false;
+    };
+    if agent_group.gid != agent_uid
+        || vault_group.gid == 0
+        || provider_group.gid == 0
+        || vault_group.gid == agent_uid
+        || provider_group.gid == agent_uid
+        || provider_group.gid == vault_group.gid
+        || !agent_group.members.is_empty()
+        || !provider_group.members.is_empty()
+        || entries
+            .iter()
+            .filter(|entry| entry.gid == agent_group.gid)
+            .count()
+            != 1
+        || entries
+            .iter()
+            .filter(|entry| entry.gid == vault_group.gid)
+            .count()
+            != 1
+        || entries
+            .iter()
+            .filter(|entry| entry.gid == provider_group.gid)
+            .count()
+            != 1
+        || vault_group
+            .members
+            .iter()
+            .filter(|member| **member == OPENAI_AGENT_NAME)
+            .count()
+            != 1
+        || vault_group.members.len() != 2
+        || !vault_group.members.contains(&COMPANION_NAME)
+        || provider_group.members.contains(&OPENAI_AGENT_NAME)
+        || entries.iter().any(|entry| {
+            entry.name != OPENAI_VAULT_GROUP && entry.members.contains(&OPENAI_AGENT_NAME)
+        })
+    {
+        return false;
+    }
+    true
+}
+
+#[cfg(test)]
+mod passwd_agent_tests {
+    use super::*;
+
+    const VALID: &[u8] = b"root:x:0:0:root:/root:/bin/bash\n\
+kernaid:x:1000:1000:KernAid:/home/kernaid:/bin/bash\n\
+kernaid-openai:x:994:994:KernAid Rescue OpenAI executor:/nonexistent:/usr/sbin/nologin\n";
+
+    #[test]
+    fn dynamic_openai_agent_uid_is_exact_and_collision_free() {
+        assert_eq!(passwd_openai_agent_uid(VALID, 1000), Some(994));
+        assert_eq!(passwd_openai_agent_uid(VALID, 994), None);
+
+        let duplicate_uid = [
+            VALID,
+            b"another:x:994:995:duplicate:/nonexistent:/usr/sbin/nologin\n",
+        ]
+        .concat();
+        assert_eq!(passwd_openai_agent_uid(&duplicate_uid, 1000), None);
+
+        let duplicate_name = [
+            VALID,
+            b"kernaid-openai:x:993:993:duplicate:/nonexistent:/usr/sbin/nologin\n",
+        ]
+        .concat();
+        assert_eq!(passwd_openai_agent_uid(&duplicate_name, 1000), None);
+    }
+
+    #[test]
+    fn openai_agent_home_shell_and_canonical_uid_are_closed() {
+        for invalid in [
+            b"kernaid:x:1000:1000:KernAid:/home/kernaid:/bin/bash\n\
+kernaid-openai:x:994:994:OpenAI:/home/openai:/usr/sbin/nologin\n"
+                .as_slice(),
+            b"kernaid:x:1000:1000:KernAid:/home/kernaid:/bin/bash\n\
+kernaid-openai:x:994:994:OpenAI:/nonexistent:/bin/bash\n"
+                .as_slice(),
+            b"kernaid:x:1000:1000:KernAid:/home/kernaid:/bin/bash\n\
+kernaid-openai:x:0994:994:OpenAI:/nonexistent:/usr/sbin/nologin\n"
+                .as_slice(),
+            b"kernaid:x:1000:1000:KernAid:/home/kernaid:/bin/bash\n\
+kernaid-openai:x:994:0:OpenAI:/nonexistent:/usr/sbin/nologin\n"
+                .as_slice(),
+            b"kernaid:x:1000:1000:KernAid:/home/kernaid:/bin/bash\n\
+kernaid-openai:x:994:993:OpenAI:/nonexistent:/usr/sbin/nologin\n"
+                .as_slice(),
+            b"kernaid:x:1000:1000:KernAid:/home/kernaid:/bin/bash\n\
+kernaid-openai:x:994:0994:OpenAI:/nonexistent:/usr/sbin/nologin\n"
+                .as_slice(),
+            b"kernaid:x:1000:1000:KernAid:/home/kernaid:/bin/bash\n\
+renamed:x:994:994:OpenAI:/nonexistent:/usr/sbin/nologin\n"
+                .as_slice(),
+        ] {
+            assert_eq!(passwd_openai_agent_uid(invalid, 1000), None);
+        }
+    }
+
+    #[test]
+    fn openai_agent_group_boundaries_are_exact() {
+        const GROUPS: &[u8] = b"root:x:0:\n\
+kernaid-vault:x:993:kernaid,kernaid-openai\n\
+kernaid-provider-client:x:992:\n\
+kernaid-openai:x:994:\n";
+        assert!(group_has_exact_openai_boundaries(GROUPS, 994));
+        for invalid in [
+            b"kernaid-vault:x:993:kernaid\nkernaid-provider-client:x:992:\nkernaid-openai:x:994:\n".as_slice(),
+            b"kernaid-vault:x:993:kernaid-openai\nkernaid-provider-client:x:992:\nkernaid-openai:x:994:\n".as_slice(),
+            b"kernaid-vault:x:993:kernaid-openai\nkernaid-provider-client:x:992:kernaid-openai\nkernaid-openai:x:994:\n".as_slice(),
+            b"kernaid-vault:x:993:kernaid-openai\nkernaid-provider-client:x:992:\nkernaid-openai:x:0:\n".as_slice(),
+            b"kernaid-vault:x:993:kernaid-openai\nkernaid-provider-client:x:992:\nkernaid-openai:x:995:\n".as_slice(),
+            b"kernaid-vault:x:993:kernaid-openai\nkernaid-provider-client:x:994:\nkernaid-openai:x:994:\n".as_slice(),
+            b"kernaid-vault:x:993:kernaid-openai\nkernaid-provider-client:x:992:some-user\nkernaid-openai:x:994:\n".as_slice(),
+            b"kernaid-vault:x:993:kernaid-openai\nkernaid-provider-client:x:992:\nkernaid-openai:x:994:some-user\n".as_slice(),
+            b"kernaid-vault:x:993:kernaid-openai\nkernaid-provider-client:x:992:\nkernaid-openai:x:994:\nextra:x:991:kernaid-openai\n".as_slice(),
+            b"kernaid-vault:x:993:kernaid,kernaid-openai,extra\nkernaid-provider-client:x:992:\nkernaid-openai:x:994:\n".as_slice(),
+        ] {
+            assert!(!group_has_exact_openai_boundaries(invalid, 994));
+        }
+    }
 }
 
 /// Sanitized daemon failure. No variant carries a pathname, OS error, peer

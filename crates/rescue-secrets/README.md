@@ -392,7 +392,13 @@ The Rescue live-build packaging installs the feature-gated daemon and
 companion, a root:`kernaid-vault` sequential-packet socket, a `Type=notify`
 service with a private mount namespace and delegated worker cgroup, the
 root-owned runtime/tmpfiles boundary, and fail-closed core/swap and UID-1000
-policy. The target systemd 257 unit intentionally omits `RestrictSUIDSGID`
+policy. It also creates the dynamic `kernaid-openai` nologin/no-home identity,
+adds only that identity to `kernaid-vault`, and resolves its collision-free UID
+from the descriptor-validated passwd file before constructing the daemon peer
+allowlist. The shipping OpenAI Agent is restricted to `vault.status` and
+`provider.status`; all mutation, key-borrow, Codex, audit and report operations
+remain unavailable at the server boundary without worker dispatch or an output
+descriptor. The target systemd 257 vault unit intentionally omits `RestrictSUIDSGID`
 because that version implements it by denying all `openat2` calls; the daemon's
 descriptor-bound path validation requires `openat2`, while `NoNewPrivileges`,
 the `CAP_SYS_ADMIN`-only bounding set, strict filesystem protection and the

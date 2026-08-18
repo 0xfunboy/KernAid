@@ -4,7 +4,7 @@ members = [
   "crates/core", "crates/broker", "crates/evidence", "crates/policy",
   "crates/protocol", "crates/storage", "crates/redaction", "crates/device-identity",
   "crates/native-secrets", "crates/rescue-secrets", "crates/report-schema",
-  "crates/rescue-openai-provider",
+  "crates/rescue-openai-provider", "crates/rescue-openai-executor",
   "packs/linux", "packs/macos", "packs/windows", "apps/desk/src-tauri"
 ]
 

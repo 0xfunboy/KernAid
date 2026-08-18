@@ -283,7 +283,7 @@ class VaultLivePolicyTests(unittest.TestCase):
         self.assertNotIn("uidmap", active_lines(PACKAGE_LIST))
         self.assertIn("user-setup", active_lines(PACKAGE_LIST))
 
-    def test_build_stages_only_release_daemon_and_companion_as_root_0755(self) -> None:
+    def test_build_stages_only_release_rescue_binaries_as_root_0755(self) -> None:
         build = BUILD_SCRIPT.read_text(encoding="utf-8")
         self.assertIn("KERNAID_RESCUE_VAULTD_BINARY", build)
         self.assertIn("KERNAID_RESCUE_VAULTCTL_BINARY", build)
@@ -293,11 +293,15 @@ class VaultLivePolicyTests(unittest.TestCase):
         self.assertIn(
             "config/includes.chroot/usr/bin/kernaid-rescue-vaultctl", build
         )
+        self.assertIn(
+            "config/includes.chroot/usr/lib/kernaid/kernaid-rescue-openai-executor",
+            build,
+        )
         self.assertIn("validate_amd64_elf", build)
         self.assertGreaterEqual(build.count("install -o root -g root -m 0755"), 2)
         self.assertIn("trap cleanup_staged_binaries EXIT", build)
         self.assertIn('rmdir -- "$vaultctl_destination_dir"', build)
-        self.assertEqual(build.count("verify-shipping-binary.py"), 2)
+        self.assertEqual(build.count("verify-shipping-binary.py"), 3)
         self.assertNotIn("cargo build", build)
 
     def test_shipping_binary_dependency_parser_is_closed_and_rejects_runpath(self) -> None:
@@ -323,17 +327,22 @@ class VaultLivePolicyTests(unittest.TestCase):
         self.assertIn("TOOL_TIMEOUT_SECONDS", verifier)
         self.assertNotIn("ldd", verifier)
 
-    def test_workflow_builds_and_supplies_both_shipping_binaries(self) -> None:
+    def test_workflow_builds_and_supplies_all_shipping_binaries(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
         self.assertIn('- "crates/protocol/**"', workflow)
         self.assertIn("--bin kernaid-rescue-vaultd", workflow)
         self.assertIn("--bin kernaid-rescue-vaultctl", workflow)
+        self.assertIn("--bin kernaid-rescue-openai-executor", workflow)
         self.assertIn(
             "KERNAID_RESCUE_VAULTD_BINARY=/workspace/target/release/kernaid-rescue-vaultd",
             workflow,
         )
         self.assertIn(
             "KERNAID_RESCUE_VAULTCTL_BINARY=/workspace/target/release/kernaid-rescue-vaultctl",
+            workflow,
+        )
+        self.assertIn(
+            "KERNAID_RESCUE_OPENAI_EXECUTOR_BINARY=/workspace/target/release/kernaid-rescue-openai-executor",
             workflow,
         )
         self.assertIn("apt-get install -y binutils live-build", workflow)
@@ -344,7 +353,7 @@ class VaultLivePolicyTests(unittest.TestCase):
         )
         self.assertNotIn("$RUNNER_TEMP/kernaid-rescue-shipping-preflight", workflow)
         self.assertIn("sudo install -o root -g root -m 0755", workflow)
-        self.assertEqual(workflow.count("verify-shipping-binary.py"), 2)
+        self.assertEqual(workflow.count("verify-shipping-binary.py"), 3)
         self.assertIn("qemu-vault-lifecycle-smoke.sh", workflow)
 
 

@@ -15,6 +15,8 @@ on:
       - "apps/desk/**"
       - "packs/linux/**"
       - "crates/rescue-secrets/**"
+      - "crates/rescue-openai-executor/**"
+      - "crates/rescue-openai-provider/**"
       - "crates/report-schema/**"
       - "crates/protocol/**"
       - "crates/storage/**"
@@ -38,6 +40,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88.0
+        with: {components: rustfmt, clippy}
       - uses: pnpm/action-setup@v4
         with: {version: 9.15.9}
       - uses: actions/setup-node@v4
@@ -76,16 +79,22 @@ jobs:
           retention-days: 1
       - name: Build the in-guest Rescue vault lifecycle binaries
         run: |
+          cargo fmt -p kernaid-rescue-openai-executor -- --check
+          cargo clippy --locked -p kernaid-rescue-openai-executor --all-targets -- -D warnings
+          cargo test --locked -p kernaid-rescue-openai-executor
           cargo build --locked --release -p kernaid-rescue-secrets \
             --features experimental-vault-manager \
             --bin kernaid-rescue-vaultd \
             --bin kernaid-rescue-vaultctl
+          cargo build --locked --release -p kernaid-rescue-openai-executor \
+            --bin kernaid-rescue-openai-executor
       - name: Verify the in-guest Rescue binary ABI
         run: |
           preflight_dir="$(sudo /usr/bin/mktemp -d /root/kernaid-rescue-shipping-preflight.XXXXXXXX)"
           cleanup_preflight() {
             sudo unlink -- "$preflight_dir/kernaid-rescue-vaultd" 2>/dev/null || true
             sudo unlink -- "$preflight_dir/kernaid-rescue-vaultctl" 2>/dev/null || true
+            sudo unlink -- "$preflight_dir/kernaid-rescue-openai-executor" 2>/dev/null || true
             sudo rmdir -- "$preflight_dir" 2>/dev/null || true
           }
           trap cleanup_preflight EXIT
@@ -99,16 +108,22 @@ jobs:
           sudo install -o root -g root -m 0755 \
             target/release/kernaid-rescue-vaultctl \
             "$preflight_dir/kernaid-rescue-vaultctl"
+          sudo install -o root -g root -m 0755 \
+            target/release/kernaid-rescue-openai-executor \
+            "$preflight_dir/kernaid-rescue-openai-executor"
           sudo /usr/bin/python3 -I tools/build-rescue/verify-shipping-binary.py \
             "$preflight_dir/kernaid-rescue-vaultd"
           sudo /usr/bin/python3 -I tools/build-rescue/verify-shipping-binary.py \
             "$preflight_dir/kernaid-rescue-vaultctl"
+          sudo /usr/bin/python3 -I tools/build-rescue/verify-shipping-binary.py \
+            "$preflight_dir/kernaid-rescue-openai-executor"
       - name: Build hybrid BIOS and UEFI ISO
         run: |
           docker run --rm --privileged \
             -e KERNAID_DESK_PREBUILT=1 \
             -e KERNAID_RESCUE_VAULTD_BINARY=/workspace/target/release/kernaid-rescue-vaultd \
             -e KERNAID_RESCUE_VAULTCTL_BINARY=/workspace/target/release/kernaid-rescue-vaultctl \
+            -e KERNAID_RESCUE_OPENAI_EXECUTOR_BINARY=/workspace/target/release/kernaid-rescue-openai-executor \
             -v "$PWD:/workspace" -w /workspace \
             debian:trixie-slim \
             sh -c 'apt-get update && apt-get install -y binutils live-build ca-certificates python3 && ./tools/build-rescue/build.sh'

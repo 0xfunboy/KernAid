@@ -1,5 +1,6 @@
 use super::{
-    RescueVaultDaemonError, enforce_process_privacy, internal_wire, passwd_has_exact_companion,
+    RescueVaultDaemonError, enforce_process_privacy, group_has_exact_openai_boundaries,
+    internal_wire, passwd_has_exact_companion, passwd_openai_agent_uid,
     runtime::{DaemonRuntime, RuntimeDisposition, WorkerCgroup, WorkerHandle, WorkerSpawnResult},
     validate_no_active_swap,
 };
@@ -290,9 +291,7 @@ pub(super) fn run(companion_uid: u32) -> Result<(), RescueVaultDaemonError> {
     let signal_set = block_termination_signals()?;
     let stop = StopControl::new();
     spawn_signal_waiter(signal_set, stop.clone());
-    validate_companion_identity(companion_uid)?;
-    let allowlist = PeerAllowlist::companion_only(companion_uid)
-        .map_err(|_| RescueVaultDaemonError::InvalidConfiguration)?;
+    let allowlist = validated_peer_allowlist(companion_uid)?;
     let listener = take_listener()?;
     let (runtime, disposition) = DaemonRuntime::open()?;
     let seed = state_version_seed()?;
@@ -580,7 +579,7 @@ fn validate_listener(
     Ok(())
 }
 
-fn validate_companion_identity(expected_uid: u32) -> Result<(), RescueVaultDaemonError> {
+fn validated_peer_allowlist(companion_uid: u32) -> Result<PeerAllowlist, RescueVaultDaemonError> {
     let descriptor = rfs::openat2(
         rfs::CWD,
         PASSWD_FILE_PATH,
@@ -592,13 +591,43 @@ fn validate_companion_identity(expected_uid: u32) -> Result<(), RescueVaultDaemo
     let stat = rfs::fstat(&descriptor).map_err(|_| RescueVaultDaemonError::InvalidConfiguration)?;
     if !FileType::from_raw_mode(stat.st_mode).is_file()
         || stat.st_uid != 0
+        || stat.st_gid != 0
         || stat.st_nlink != 1
         || stat.st_mode & 0o022 != 0
     {
         return Err(RescueVaultDaemonError::InvalidConfiguration);
     }
     let bytes = read_file_bounded(descriptor.as_fd(), GROUP_FILE_LIMIT)?;
-    if !passwd_has_exact_companion(&bytes, expected_uid) {
+    if !passwd_has_exact_companion(&bytes, companion_uid) {
+        return Err(RescueVaultDaemonError::InvalidConfiguration);
+    }
+    let agent_uid = passwd_openai_agent_uid(&bytes, companion_uid)
+        .ok_or(RescueVaultDaemonError::InvalidConfiguration)?;
+    validate_openai_agent_groups(agent_uid)?;
+    PeerAllowlist::new(companion_uid, agent_uid)
+        .map_err(|_| RescueVaultDaemonError::InvalidConfiguration)
+}
+
+fn validate_openai_agent_groups(agent_uid: u32) -> Result<(), RescueVaultDaemonError> {
+    let descriptor = rfs::openat2(
+        rfs::CWD,
+        GROUP_FILE_PATH,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        rfs::Mode::empty(),
+        rfs::ResolveFlags::NO_SYMLINKS | rfs::ResolveFlags::NO_MAGICLINKS,
+    )
+    .map_err(|_| RescueVaultDaemonError::InvalidConfiguration)?;
+    let stat = rfs::fstat(&descriptor).map_err(|_| RescueVaultDaemonError::InvalidConfiguration)?;
+    if !FileType::from_raw_mode(stat.st_mode).is_file()
+        || stat.st_uid != 0
+        || stat.st_gid != 0
+        || stat.st_nlink != 1
+        || stat.st_mode & 0o022 != 0
+    {
+        return Err(RescueVaultDaemonError::InvalidConfiguration);
+    }
+    let bytes = read_file_bounded(descriptor.as_fd(), GROUP_FILE_LIMIT)?;
+    if !group_has_exact_openai_boundaries(&bytes, agent_uid) {
         return Err(RescueVaultDaemonError::InvalidConfiguration);
     }
     Ok(())
@@ -616,6 +645,7 @@ fn lookup_listener_group() -> Result<u32, RescueVaultDaemonError> {
     let stat = rfs::fstat(&descriptor).map_err(|_| RescueVaultDaemonError::InvalidConfiguration)?;
     if !FileType::from_raw_mode(stat.st_mode).is_file()
         || stat.st_uid != 0
+        || stat.st_gid != 0
         || stat.st_nlink != 1
         || stat.st_mode & 0o022 != 0
     {
@@ -1115,7 +1145,7 @@ impl Supervisor {
         connection: ClientConnection<'_>,
     ) -> (u64, HandlerResult) {
         let operation = request.operation();
-        if !external_operation_is_enabled(operation) {
+        if !external_operation_is_enabled(operation, request.role()) {
             let version = self.snapshot().version;
             return (
                 version,
@@ -2442,16 +2472,27 @@ impl Supervisor {
     }
 }
 
-fn external_operation_is_enabled(operation: Operation) -> bool {
-    matches!(
-        operation,
-        Operation::VaultStatus
-            | Operation::VaultUnlock
-            | Operation::VaultLock
-            | Operation::ProviderOpenAiConfigure
-            | Operation::ProviderStatus
-            | Operation::ProviderLogout
-    )
+fn external_operation_is_enabled(
+    operation: Operation,
+    role: kernaid_protocol::rescue_vault::PeerRole,
+) -> bool {
+    match role {
+        kernaid_protocol::rescue_vault::PeerRole::Companion => matches!(
+            operation,
+            Operation::VaultStatus
+                | Operation::VaultUnlock
+                | Operation::VaultLock
+                | Operation::ProviderOpenAiConfigure
+                | Operation::ProviderStatus
+                | Operation::ProviderLogout
+        ),
+        kernaid_protocol::rescue_vault::PeerRole::Agent => {
+            matches!(
+                operation,
+                Operation::VaultStatus | Operation::ProviderStatus
+            )
+        }
+    }
 }
 
 fn status_version_is_accepted(expected: u64, current: u64) -> bool {
@@ -4134,17 +4175,24 @@ mod tests {
                 ),
                 (persist, Some(persist_writer)),
                 (
-                    validated_request("report.list", serde_json::json!({}), 60, None),
+                    validated_request_for_role(
+                        "report.list",
+                        serde_json::json!({}),
+                        60,
+                        None,
+                        PeerRole::Agent,
+                    ),
                     None,
                 ),
                 (
-                    validated_request(
+                    validated_request_for_role(
                         "report.get",
                         serde_json::json!({
                             "reportId": "RP-00000000-0000-0000-0000-000000000001"
                         }),
                         60,
                         None,
+                        PeerRole::Agent,
                     ),
                     None,
                 ),
@@ -4230,7 +4278,7 @@ mod tests {
     }
 
     #[test]
-    fn only_vault_and_openai_configuration_operations_are_enabled() {
+    fn shipping_peer_roles_have_a_closed_operation_surface() {
         let forbidden = [
             Operation::ProviderOpenAiBorrow,
             Operation::ProviderCodexHomeLease,
@@ -4250,7 +4298,11 @@ mod tests {
         ] {
             let state = service_state(700, vault);
             for operation in forbidden {
-                assert!(!external_operation_is_enabled(operation));
+                assert!(!external_operation_is_enabled(
+                    operation,
+                    PeerRole::Companion
+                ));
+                assert!(!external_operation_is_enabled(operation, PeerRole::Agent));
                 assert_eq!(state.version, 700);
             }
         }
@@ -4262,7 +4314,26 @@ mod tests {
             Operation::ProviderStatus,
             Operation::ProviderLogout,
         ] {
-            assert!(external_operation_is_enabled(operation));
+            assert!(external_operation_is_enabled(
+                operation,
+                PeerRole::Companion
+            ));
+        }
+        assert!(external_operation_is_enabled(
+            Operation::VaultStatus,
+            PeerRole::Agent
+        ));
+        assert!(external_operation_is_enabled(
+            Operation::ProviderStatus,
+            PeerRole::Agent
+        ));
+        for operation in [
+            Operation::VaultUnlock,
+            Operation::VaultLock,
+            Operation::ProviderOpenAiConfigure,
+            Operation::ProviderLogout,
+        ] {
+            assert!(!external_operation_is_enabled(operation, PeerRole::Agent));
         }
     }
 
@@ -4276,7 +4347,13 @@ mod tests {
             ))],
             true,
         );
-        let request = validated_request("provider.status", serde_json::json!({}), 60, None);
+        let request = validated_request_for_role(
+            "provider.status",
+            serde_json::json!({}),
+            60,
+            None,
+            PeerRole::Agent,
+        );
         let (version, result) = status.handle_request(request, Instant::now());
         assert_eq!(version, 60);
         assert_handler_provider_status(result, ProviderState::Configured);

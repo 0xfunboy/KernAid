@@ -16,9 +16,20 @@ fail() {
 test "$(id -u kernaid 2>/dev/null)" = "1000" || fail "live user is not exact UID 1000"
 id -nG kernaid 2>/dev/null | tr ' ' '\n' | grep -Fxq kernaid-vault \
     || fail "live user is not a kernaid-vault member"
+if id -nG kernaid 2>/dev/null | tr ' ' '\n' | grep -Fxq kernaid-provider-client; then
+    fail "live user unexpectedly has provider-client access"
+fi
+openai_identity="$(getent passwd kernaid-openai | awk -F: 'NF == 7 && $1 == "kernaid-openai" && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ && $3 == $4 && $3 != 0 && $3 != 1000 && $6 == "/nonexistent" && $7 == "/usr/sbin/nologin" { print $3 ":" $4 }')"
+test -n "$openai_identity" || fail "OpenAI Agent identity is missing or unsafe"
+id -nG kernaid-openai 2>/dev/null | tr ' ' '\n' | grep -Fxq kernaid-vault \
+    || fail "OpenAI Agent is not a kernaid-vault member"
+if id -nG kernaid-openai 2>/dev/null | tr ' ' '\n' | grep -Fxq kernaid-provider-client; then
+    fail "OpenAI Agent unexpectedly has provider-client access"
+fi
 for subordinate_ids in /etc/subuid /etc/subgid; do
-    if [ -r "$subordinate_ids" ] && grep -q '^kernaid:' "$subordinate_ids"; then
-        fail "live user unexpectedly has subordinate IDs"
+    if [ -r "$subordinate_ids" ] \
+        && grep -Eq '^(kernaid|kernaid-openai):' "$subordinate_ids"; then
+        fail "Rescue identities unexpectedly have subordinate IDs"
     fi
 done
 for helper in /usr/bin/newuidmap /usr/bin/newgidmap; do
@@ -45,6 +56,19 @@ test -n "$vault_group_id" || fail "vault lifecycle group is missing"
 test -S /run/kernaid-rescue-vault.sock || fail "vault lifecycle pathname is not a socket"
 test "$(stat -c '%u:%g:%a:%h' -- /run/kernaid-rescue-vault.sock)" = "0:${vault_group_id}:660:1" \
     || fail "vault lifecycle socket ownership or mode is unsafe"
+test "$(systemctl show --property=ActiveState --value kernaid-rescue-openai-executor.socket)" = "active" \
+    || fail "OpenAI executor socket is not active"
+provider_socket_substate="$(systemctl show --property=SubState --value kernaid-rescue-openai-executor.socket)" \
+    || fail "OpenAI executor socket state is unavailable"
+case "$provider_socket_substate" in
+    listening|running) ;;
+    *) fail "OpenAI executor socket is not operational" ;;
+esac
+provider_group_id="$(getent group kernaid-provider-client | awk -F: 'NF == 4 && $1 == "kernaid-provider-client" { print $3 }')"
+test -n "$provider_group_id" || fail "provider-client group is missing"
+test -S /run/kernaid-rescue-openai.sock || fail "OpenAI executor pathname is not a socket"
+test "$(stat -c '%u:%g:%a:%h' -- /run/kernaid-rescue-openai.sock)" = "0:${provider_group_id}:660:1" \
+    || fail "OpenAI executor socket ownership or mode is unsafe"
 
 if command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
     fail "live user unexpectedly has passwordless root"

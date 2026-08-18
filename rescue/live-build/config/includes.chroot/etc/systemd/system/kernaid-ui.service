@@ -1,12 +1,12 @@
 [Unit]
 Description=KernAid local user interface server
-After=network.target kernaid-offline-inspector.socket
-Requires=kernaid-offline-inspector.socket
+After=network.target kernaid-offline-inspector.socket kernaid-rescue-openai-executor.socket
+Requires=kernaid-offline-inspector.socket kernaid-rescue-openai-executor.socket
 
 [Service]
 Type=simple
 DynamicUser=yes
-SupplementaryGroups=kernaid-inspect
+SupplementaryGroups=kernaid-inspect kernaid-provider-client
 WorkingDirectory=/opt/kernaid/desk
 ExecStart=/usr/bin/python3 -I /usr/lib/kernaid/rescue_server.py
 Environment=KERNAID_PRIVILEGED_INSPECTOR=1

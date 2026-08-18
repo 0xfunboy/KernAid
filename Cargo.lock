@@ -2311,6 +2311,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "kernaid-rescue-openai-executor"
+version = "0.1.0"
+dependencies = [
+ "kernaid-protocol",
+ "kernaid-rescue-openai-provider",
+ "rustix",
+]
+
+[[package]]
 name = "kernaid-rescue-openai-provider"
 version = "0.1.0"
 dependencies = [
