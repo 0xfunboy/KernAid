@@ -1,0 +1,82 @@
+{
+  "schema": "kernaid.codex-cli-lock.v1",
+  "upstream": {
+    "repository": "https://github.com/openai/codex",
+    "tag": "rust-v0.147.0",
+    "commit": "be6e8eac029b183056b7e4402879f15d2c85f61b",
+    "version": "0.147.0",
+    "license": {
+      "spdxId": "Apache-2.0",
+      "name": "Apache License 2.0",
+      "url": "https://github.com/openai/codex/blob/rust-v0.147.0/LICENSE",
+      "gitBlobSha1": "4606e72e042564097e8780d66c1d4dcb611869bd"
+    }
+  },
+  "release": {
+    "url": "https://github.com/openai/codex/releases/tag/rust-v0.147.0",
+    "publishedAt": "2026-08-07T01:41:49Z"
+  },
+  "artifact": {
+    "platform": "x86_64-unknown-linux-musl",
+    "archive": {
+      "name": "codex-x86_64-unknown-linux-musl.tar.gz",
+      "url": "https://github.com/openai/codex/releases/download/rust-v0.147.0/codex-x86_64-unknown-linux-musl.tar.gz",
+      "mediaType": "application/gzip",
+      "sizeBytes": 98970270,
+      "sha256": "0246e2e773834e07f0fb5249ed6ebad12e4591e608f8c7bb97dd6a9690544c36",
+      "entry": {
+        "path": "codex-x86_64-unknown-linux-musl",
+        "type": "regular",
+        "mode": "0755",
+        "sizeBytes": 258278208
+      }
+    },
+    "binary": {
+      "name": "codex",
+      "sizeBytes": 258278208,
+      "sha256": "cb0a15567e9a60a5820d54b0f6ae86d504dc3805c1eab21a47f70e3eb7b73a40",
+      "installPath": "/usr/lib/kernaid/codex",
+      "ownerUid": 0,
+      "ownerGid": 0,
+      "mode": "0755",
+      "versionArgs": [
+        "--version"
+      ],
+      "versionOutput": "codex-cli 0.147.0\n",
+      "elf": {
+        "class": "ELF64",
+        "data": "little-endian",
+        "osAbi": "SYSV",
+        "type": "ET_DYN",
+        "machine": "EM_X86_64",
+        "programHeaderCount": 9,
+        "interpreter": null,
+        "staticPie": true,
+        "executableStack": false
+      }
+    },
+    "sigstore": {
+      "name": "codex-x86_64-unknown-linux-musl.sigstore",
+      "url": "https://github.com/openai/codex/releases/download/rust-v0.147.0/codex-x86_64-unknown-linux-musl.sigstore",
+      "sizeBytes": 8585,
+      "sha256": "8ea31ab792fe0cfc7ba55c9dfc1836edf166dabf2d564ed7391eed6c7d422b3d",
+      "signedBinarySha256": "cb0a15567e9a60a5820d54b0f6ae86d504dc3805c1eab21a47f70e3eb7b73a40",
+      "leafCertificateSha256": "0cd70c48dbbb777f1910538d62604b16be271028b8195325bb8eae58fcf255c8",
+      "certificateIdentity": "https://github.com/openai/codex/.github/workflows/rust-release.yml@refs/tags/rust-v0.147.0",
+      "certificateOidcIssuer": "https://token.actions.githubusercontent.com",
+      "rekorLogId": "c0d23d6ad406973f9559f3ba2d1ca01f84147d8ffc5b8445c224f98b9591801d",
+      "rekorLogIndex": 2363083279,
+      "rekorIntegratedTime": 1786064545,
+      "trustRoot": {
+        "sourceUrl": "https://tuf-repo-cdn.sigstore.dev/targets/6494e21ea73fa7ee769f85f57d5a3e6a08725eae1e38c755fc3517c9e6bc0b66.trusted_root.json",
+        "sourceSha256": "6494e21ea73fa7ee769f85f57d5a3e6a08725eae1e38c755fc3517c9e6bc0b66",
+        "rekorPublicKeyDerBase64": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE2G2Y+2tabdTV5BcGiBIx0a9fAFwrkBbmLSGtks4L3qX6yYY0zufBnhC8Ur/iy55GhWP/9A/bY2LhC30M9+RYtw==",
+        "rekorPublicKeySha256": "c0d23d6ad406973f9559f3ba2d1ca01f84147d8ffc5b8445c224f98b9591801d",
+        "fulcioIntermediateCertificateDerBase64": "MIICGjCCAaGgAwIBAgIUALnViVfnU0brJasmRkHrn/UnfaQwCgYIKoZIzj0EAwMwKjEVMBMGA1UEChMMc2lnc3RvcmUuZGV2MREwDwYDVQQDEwhzaWdzdG9yZTAeFw0yMjA0MTMyMDA2MTVaFw0zMTEwMDUxMzU2NThaMDcxFTATBgNVBAoTDHNpZ3N0b3JlLmRldjEeMBwGA1UEAxMVc2lnc3RvcmUtaW50ZXJtZWRpYXRlMHYwEAYHKoZIzj0CAQYFK4EEACIDYgAE8RVS/ysH+NOvuDZyPIZtilgUF9NlarYpAd9HP1vBBH1U5CV77LSS7s0ZiH4nE7Hv7ptS6LvvR/STk798LVgMzLlJ4HeIfF3tHSaexLcYpSASr1kS0N/RgBJz/9jWCiXno3sweTAOBgNVHQ8BAf8EBAMCAQYwEwYDVR0lBAwwCgYIKwYBBQUHAwMwEgYDVR0TAQH/BAgwBgEB/wIBADAdBgNVHQ4EFgQU39Ppz1YkEZb5qNjpKFWixi4YZD8wHwYDVR0jBBgwFoAUWMAeX5FFpWapesyQoZMi0CrFxfowCgYIKoZIzj0EAwMDZwAwZAIwPCsQK4DYiZYDPIaDi5HFKnfxXx6ASSVmERfsynYBiX2X6SJRnZU84/9DZdnFvvxmAjBOt6QpBlc4J/0DxvkTCqpclvziL6BCCPnjdlIB3Pu3BxsPmygUY7Ii2zbdCdliiow=",
+        "fulcioIntermediateCertificateSha256": "15d795348226b4649f750f5802592c393bee7cc53c3b86982175b7ad087efe47",
+        "fulcioRootCertificateDerBase64": "MIIB9zCCAXygAwIBAgIUALZNAPFdxHPwjeDloDwyYChAO/4wCgYIKoZIzj0EAwMwKjEVMBMGA1UEChMMc2lnc3RvcmUuZGV2MREwDwYDVQQDEwhzaWdzdG9yZTAeFw0yMTEwMDcxMzU2NTlaFw0zMTEwMDUxMzU2NThaMCoxFTATBgNVBAoTDHNpZ3N0b3JlLmRldjERMA8GA1UEAxMIc2lnc3RvcmUwdjAQBgcqhkjOPQIBBgUrgQQAIgNiAAT7XeFT4rb3PQGwS4IajtLk3/OlnpgangaBclYpsYBr5i+4ynB07ceb3LP0OIOZdxexX69c5iVuyJRQ+Hz05yi+UF3uBWAlHpiS5sh0+H2GHE7SXrk1EC5m1Tr19L9gg92jYzBhMA4GA1UdDwEB/wQEAwIBBjAPBgNVHRMBAf8EBTADAQH/MB0GA1UdDgQWBBRYwB5fkUWlZql6zJChkyLQKsXF+jAfBgNVHSMEGDAWgBRYwB5fkUWlZql6zJChkyLQKsXF+jAKBggqhkjOPQQDAwNpADBmAjEAj1nHeXZp+13NWBNa+EDsDP8G1WWg1tCMWP/WHPqpaVo0jhsweNFZgSs0eE7wYI4qAjEA2WB9ot98sIkoF3vZYdd3/VtWB5b9TNMea7Ix/stJ5TfcLLeABLE4BNJOsQ4vnBHJ",
+        "fulcioRootCertificateSha256": "3ba7b6cc4e95469d4d334b49cb257ad8537076fa84b0ca87ff4ecfe6a54680c1"
+      }
+    }
+  }
+}
