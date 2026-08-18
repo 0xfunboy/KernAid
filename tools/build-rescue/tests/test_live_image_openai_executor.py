@@ -335,11 +335,18 @@ class RescueOpenAiExecutorPackagingTests(unittest.TestCase):
             'u kernaid-openai-egress - "KernAid Rescue OpenAI TLS egress proxy" /nonexistent /usr/sbin/nologin',
             lines,
         )
-        self.assertIn("g kernaid-codex 1003 -", lines)
-        self.assertIn(
-            'u kernaid-codex 1003:1003 "KernAid Rescue Codex executor" /nonexistent /usr/sbin/nologin',
-            lines,
-        )
+        self.assertFalse(any("kernaid-codex" in line for line in lines))
+        for line in lines:
+            fields = line.split()
+            if fields[0] not in {"u", "u!"}:
+                continue
+            uid = fields[2].split(":", 1)[0]
+            if uid.isdecimal():
+                self.assertNotIn(
+                    int(uid),
+                    range(1000, 60000),
+                    "an early sysusers account suppresses live-config's UID-1000 user",
+                )
         self.assertIn("m kernaid-openai kernaid-vault", lines)
         self.assertFalse(any(line.startswith("u kernaid-openai ") and " - " not in line for line in lines))
         self.assertFalse(any(line.startswith("m kernaid-openai-egress ") for line in lines))
@@ -350,8 +357,6 @@ class RescueOpenAiExecutorPackagingTests(unittest.TestCase):
         ready = READY_CHECK.read_text(encoding="utf-8")
         self.assertIn("getent passwd kernaid-openai", ready)
         self.assertIn("getent passwd kernaid-openai-egress", ready)
-        self.assertIn("getent passwd kernaid-codex", ready)
-        self.assertIn("getent group | awk -F:", ready)
         self.assertIn("getent group kernaid-openai", ready)
         self.assertIn('$4 == ""', ready)
         self.assertIn('count == 1 && !bad', ready)
@@ -361,10 +366,8 @@ class RescueOpenAiExecutorPackagingTests(unittest.TestCase):
         self.assertIn('$7 == "/usr/sbin/nologin"', ready)
         self.assertIn("OpenAI Agent unexpectedly has provider-client access", ready)
         self.assertIn("live user unexpectedly has provider-client access", ready)
-        self.assertIn("$3 == 1003 && $4 == 1003", ready)
-        self.assertIn("$1 == \"kernaid-codex\" || $3 == 1003 || $4 == 1003", ready)
-        self.assertIn("$1 == \"kernaid-codex\" || $3 == 1003", ready)
-        self.assertIn('test "$(id -nG kernaid-codex 2>/dev/null)" = "kernaid-codex"', ready)
+        self.assertNotIn("getent passwd kernaid-codex", ready)
+        self.assertNotIn("id -nG kernaid-codex", ready)
         self.assertIn(
             "'^(kernaid|kernaid-codex|kernaid-openai|kernaid-openai-egress):'",
             ready,
