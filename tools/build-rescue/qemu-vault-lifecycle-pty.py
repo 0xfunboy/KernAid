@@ -739,6 +739,8 @@ class RuntimeSnapshot:
     stage: str
     service_pid: int
     worker_pid: int
+    worker_ppid: int
+    invocation_id: str
     service_caps: tuple[str, str, str, str]
     worker_caps: tuple[str, str, str, str]
     service_ambient: str
@@ -754,15 +756,16 @@ class RuntimeSnapshot:
 RUNTIME_RE = re.compile(
     rb"^KERNAID_VAULT_RUNTIME_V1 "
     rb"stage=([a-z0-9-]+) service_pid=([1-9][0-9]*) worker_pid=([1-9][0-9]*) "
+    rb"worker_ppid=([1-9][0-9]*) "
+    rb"invocation_id=([0-9a-f]{32}) "
     rb"service_caps=([0-9a-f]{16}):([0-9a-f]{16}):([0-9a-f]{16}):([0-9a-f]{16}) "
     rb"worker_caps=([0-9a-f]{16}):([0-9a-f]{16}):([0-9a-f]{16}):([0-9a-f]{16}) "
     rb"service_ambient=(0000000000000000) worker_ambient=(0000000000000000) "
     rb"service_nnp=(1) worker_nnp=(1) service_core=(0):(0) worker_core=(0):(0) "
-    rb"parent_procs=empty supervisor_procs=service worker_procs=worker "
-    rb"subtree_control=pids parent_descendants=(2) supervisor_descendants=(0) "
-    rb"worker_descendants=(0) worker_pids_current=(1) leaf_exact=true "
+    rb"systemd_control_group=unit service_cgroup=supervisor "
+    rb"worker_cgroup=worker identity_stable=true "
     rb"mapper_count=([0-9]+) shell_mount=(false|true) "
-    rb"swaps_empty=true service_active=true socket_listening=true cgroups_exact=true$"
+    rb"swaps_empty=true service_state=active-running socket_state=operational$"
 )
 
 # This second grammar is diagnostic-only. RUNTIME_RE above remains the sole
@@ -775,6 +778,8 @@ RUNTIME_EVIDENCE_SHAPE_RE = re.compile(
     rb"stage=(?P<stage>[a-z0-9-]{1,64}) "
     rb"service_pid=(?P<service_pid>[0-9]{1,20}) "
     rb"worker_pid=(?P<worker_pid>[0-9]{1,20}) "
+    rb"worker_ppid=(?P<worker_ppid>[a-z0-9-]{1,32}) "
+    rb"invocation_id=(?P<invocation_id>[a-z0-9-]{1,64}) "
     rb"service_caps=(?P<service_caps>[a-z0-9:]{1,131}) "
     rb"worker_caps=(?P<worker_caps>[a-z0-9:]{1,131}) "
     rb"service_ambient=(?P<service_ambient>[a-z0-9]{1,32}) "
@@ -783,22 +788,15 @@ RUNTIME_EVIDENCE_SHAPE_RE = re.compile(
     rb"worker_nnp=(?P<worker_nnp>[a-z0-9]{1,20}) "
     rb"service_core=(?P<service_core>[a-z0-9:]{1,65}) "
     rb"worker_core=(?P<worker_core>[a-z0-9:]{1,65}) "
-    rb"parent_procs=(?P<parent_procs>[a-z0-9-]{1,32}) "
-    rb"supervisor_procs=(?P<supervisor_procs>[a-z0-9-]{1,32}) "
-    rb"worker_procs=(?P<worker_procs>[a-z0-9-]{1,32}) "
-    rb"subtree_control=(?P<subtree_control>"
-    rb"[a-z0-9_]{0,64}(?: [a-z0-9_]{1,64}){0,15}) "
-    rb"parent_descendants=(?P<parent_descendants>[a-z0-9-]{1,32}) "
-    rb"supervisor_descendants=(?P<supervisor_descendants>[a-z0-9-]{1,32}) "
-    rb"worker_descendants=(?P<worker_descendants>[a-z0-9-]{1,32}) "
-    rb"worker_pids_current=(?P<worker_pids_current>[a-z0-9-]{1,32}) "
-    rb"leaf_exact=(?P<leaf_exact>[a-z0-9-]{1,32}) "
+    rb"systemd_control_group=(?P<systemd_control_group>[a-z0-9-]{1,32}) "
+    rb"service_cgroup=(?P<service_cgroup>[a-z0-9-]{1,32}) "
+    rb"worker_cgroup=(?P<worker_cgroup>[a-z0-9-]{1,32}) "
+    rb"identity_stable=(?P<identity_stable>[a-z0-9-]{1,32}) "
     rb"mapper_count=(?P<mapper_count>[a-z0-9-]{1,32}) "
     rb"shell_mount=(?P<shell_mount>[a-z0-9-]{1,32}) "
     rb"swaps_empty=(?P<swaps_empty>[a-z0-9-]{1,32}) "
-    rb"service_active=(?P<service_active>[a-z0-9-]{1,32}) "
-    rb"socket_listening=(?P<socket_listening>[a-z0-9-]{1,32}) "
-    rb"cgroups_exact=(?P<cgroups_exact>[a-z0-9-]{1,32})$"
+    rb"service_state=(?P<service_state>[a-z0-9-]{1,32}) "
+    rb"socket_state=(?P<socket_state>[a-z0-9-]{1,32})$"
 )
 RUNTIME_CAPABILITIES_SHAPE_RE = re.compile(
     rb"^[0-9a-f]{16}:[0-9a-f]{16}:[0-9a-f]{16}:[0-9a-f]{16}$"
@@ -810,6 +808,9 @@ RUNTIME_EVIDENCE_FAILURE_CODES = frozenset(
         "capabilities-invalid",
         "service-pid-invalid",
         "worker-pid-invalid",
+        "worker-ppid-invalid",
+        "worker-parent-invalid",
+        "invocation-id-invalid",
         "service-capabilities-invalid",
         "worker-capabilities-invalid",
         "service-ambient-invalid",
@@ -818,21 +819,15 @@ RUNTIME_EVIDENCE_FAILURE_CODES = frozenset(
         "worker-nnp-invalid",
         "service-core-invalid",
         "worker-core-invalid",
-        "parent-procs-invalid",
-        "supervisor-procs-invalid",
-        "worker-procs-invalid",
-        "subtree-control-invalid",
-        "parent-descendants-invalid",
-        "supervisor-descendants-invalid",
-        "worker-descendants-invalid",
-        "worker-pids-current-invalid",
-        "leaf-exact-invalid",
+        "systemd-control-group-invalid",
+        "service-cgroup-invalid",
+        "worker-cgroup-invalid",
+        "identity-stability-invalid",
         "mapper-count-invalid",
         "shell-mount-invalid",
         "swaps-invalid",
         "service-state-invalid",
         "socket-state-invalid",
-        "cgroups-invalid",
     }
 )
 assert all(
@@ -840,10 +835,15 @@ assert all(
     for code in RUNTIME_EVIDENCE_FAILURE_CODES
 )
 
-SOCKET_OPERATIONAL_CASE = (
-    'case "$socket_state" in '
-    'active:listening|active:running) listening=true;; '
-    'esac;'
+BOUNDED_CHILD_PID_FUNCTION = (
+    'child(){ v=$(/usr/bin/pgrep -P "$1" 2>/dev/null|'
+    '/usr/bin/head -n 2);case "$v" in \'\'|*[!0-9]*)printf 0;;'
+    '*)printf %s "$v";;esac;};'
+)
+RUNTIME_IDENTITY_STABILITY_COMMAND = (
+    'stable=false;[ "$svc2:$worker2:$wppid:$wppid2:$inv2" = '
+    '"$svc:$worker:$svc:$svc:$inv" ]&&[ "$control2:$scg2:$wcg2" = '
+    '"$control:$scg:$wcg" ]&&stable=true;'
 )
 
 
@@ -863,6 +863,14 @@ def _runtime_evidence_failure_code(line: bytes, expected_stage: str) -> str:
         (
             re.fullmatch(rb"[1-9][0-9]*", match["worker_pid"]) is not None,
             "worker-pid-invalid",
+        ),
+        (
+            re.fullmatch(rb"[1-9][0-9]*", match["worker_ppid"]) is not None,
+            "worker-ppid-invalid",
+        ),
+        (
+            re.fullmatch(rb"[0-9a-f]{32}", match["invocation_id"]) is not None,
+            "invocation-id-invalid",
         ),
         (
             RUNTIME_CAPABILITIES_SHAPE_RE.fullmatch(match["service_caps"])
@@ -886,27 +894,24 @@ def _runtime_evidence_failure_code(line: bytes, expected_stage: str) -> str:
         (match["worker_nnp"] == b"1", "worker-nnp-invalid"),
         (match["service_core"] == b"0:0", "service-core-invalid"),
         (match["worker_core"] == b"0:0", "worker-core-invalid"),
-        (match["parent_procs"] == b"empty", "parent-procs-invalid"),
-        (match["supervisor_procs"] == b"service", "supervisor-procs-invalid"),
-        (match["worker_procs"] == b"worker", "worker-procs-invalid"),
-        (match["subtree_control"] == b"pids", "subtree-control-invalid"),
-        (match["parent_descendants"] == b"2", "parent-descendants-invalid"),
         (
-            match["supervisor_descendants"] == b"0",
-            "supervisor-descendants-invalid",
+            match["systemd_control_group"] == b"unit",
+            "systemd-control-group-invalid",
         ),
-        (match["worker_descendants"] == b"0", "worker-descendants-invalid"),
-        (match["worker_pids_current"] == b"1", "worker-pids-current-invalid"),
-        (match["leaf_exact"] == b"true", "leaf-exact-invalid"),
+        (match["service_cgroup"] == b"supervisor", "service-cgroup-invalid"),
+        (match["worker_cgroup"] == b"worker", "worker-cgroup-invalid"),
+        (
+            match["identity_stable"] == b"true",
+            "identity-stability-invalid",
+        ),
         (
             re.fullmatch(rb"[0-9]+", match["mapper_count"]) is not None,
             "mapper-count-invalid",
         ),
         (match["shell_mount"] in {b"false", b"true"}, "shell-mount-invalid"),
         (match["swaps_empty"] == b"true", "swaps-invalid"),
-        (match["service_active"] == b"true", "service-state-invalid"),
-        (match["socket_listening"] == b"true", "socket-state-invalid"),
-        (match["cgroups_exact"] == b"true", "cgroups-invalid"),
+        (match["service_state"] == b"active-running", "service-state-invalid"),
+        (match["socket_state"] == b"operational", "socket-state-invalid"),
     )
     for valid, code in checks:
         if not valid:
@@ -923,8 +928,10 @@ def parse_runtime_snapshot(line: bytes, expected_stage: str) -> RuntimeSnapshot:
         )
     if match.group(1).decode("ascii") != expected_stage:
         raise ClosedFailure("runtime", "stage-invalid")
-    service_caps = tuple(item.decode("ascii") for item in match.groups()[3:7])
-    worker_caps = tuple(item.decode("ascii") for item in match.groups()[7:11])
+    if match.group(4) != match.group(2):
+        raise ClosedFailure("runtime", "worker-parent-invalid")
+    service_caps = tuple(item.decode("ascii") for item in match.groups()[5:9])
+    worker_caps = tuple(item.decode("ascii") for item in match.groups()[9:13])
     exact_caps = (ZERO_CAPS, CAP_SYS_ADMIN_ONLY, CAP_SYS_ADMIN_ONLY, CAP_SYS_ADMIN_ONLY)
     if service_caps != exact_caps or worker_caps != exact_caps:
         raise ClosedFailure("runtime", "capabilities-invalid")
@@ -932,16 +939,18 @@ def parse_runtime_snapshot(line: bytes, expected_stage: str) -> RuntimeSnapshot:
         stage=expected_stage,
         service_pid=int(match.group(2)),
         worker_pid=int(match.group(3)),
+        worker_ppid=int(match.group(4)),
+        invocation_id=match.group(5).decode("ascii"),
         service_caps=service_caps,
         worker_caps=worker_caps,
-        service_ambient=match.group(12).decode("ascii"),
-        worker_ambient=match.group(13).decode("ascii"),
-        service_no_new_privs=int(match.group(14)),
-        worker_no_new_privs=int(match.group(15)),
-        service_core=(int(match.group(16)), int(match.group(17))),
-        worker_core=(int(match.group(18)), int(match.group(19))),
-        mapper_count=int(match.group(24)),
-        shell_mount=match.group(25) == b"true",
+        service_ambient=match.group(14).decode("ascii"),
+        worker_ambient=match.group(15).decode("ascii"),
+        service_no_new_privs=int(match.group(16)),
+        worker_no_new_privs=int(match.group(17)),
+        service_core=(int(match.group(18)), int(match.group(19))),
+        worker_core=(int(match.group(20)), int(match.group(21))),
+        mapper_count=int(match.group(22)),
+        shell_mount=match.group(23) == b"true",
     )
 
 
@@ -990,6 +999,8 @@ def validate_runtime_sequence(snapshots: Sequence[RuntimeSnapshot]) -> None:
         if (
             snapshot.service_pid != baseline.service_pid
             or snapshot.worker_pid != baseline.worker_pid
+            or snapshot.worker_ppid != baseline.worker_ppid
+            or snapshot.invocation_id != baseline.invocation_id
             or snapshot.service_caps != baseline.service_caps
             or snapshot.worker_caps != baseline.worker_caps
             or snapshot.service_ambient != baseline.service_ambient
@@ -1744,38 +1755,46 @@ def establish_live_session(
 def _runtime_command(stage: str) -> bytes:
     if TOKEN_RE.fullmatch(stage) is None:
         raise ClosedFailure("runtime", "stage-invalid")
-    # Every dynamic field is constrained before it reaches the single marker.
-    # The shell namespace mount test is intentionally separate from the
+    # UID 1000 cannot traverse the daemon's root-only worker cgroup. This
+    # evidence therefore observes only systemd's public unit facts and exact
+    # /proc identities. The daemon separately re-attests its retained,
+    # descriptor-bound cgroup topology before and after every worker request.
+    # Every dynamic field is reduced to a closed proof token before it reaches
+    # the single marker. The shell mount test remains separate from the
     # daemon's private mount namespace.
     source = f"""
-stage='{stage}'; unit='kernaid-rescue-vaultd.service'; base='/sys/fs/cgroup/system.slice/kernaid-rescue-vaultd.service'; sup="$base/supervisor"; work="$base/worker";
-svc=$(systemctl show --property=MainPID --value "$unit" 2>/dev/null) || svc=0; case "$svc" in ''|*[!0-9]*) svc=0;; esac;
-wprocs=$(cat "$work/cgroup.procs" 2>/dev/null) || wprocs=invalid; case "$wprocs" in ''|*[!0-9]*) worker=0;; *) worker="$wprocs";; esac;
-caps() {{ awk 'BEGIN{{i=p=e=b=""}} $1=="CapInh:"{{i=$2}} $1=="CapPrm:"{{p=$2}} $1=="CapEff:"{{e=$2}} $1=="CapBnd:"{{b=$2}} END{{if(i!=""&&p!=""&&e!=""&&b!="")printf "%s:%s:%s:%s",i,p,e,b;else exit 1}}' "$1"; }};
-field() {{ awk -v key="$2" 'BEGIN{{v="";n=0}} $1==key{{v=$2;n++}} END{{if(n==1&&v!="")printf "%s",v;else exit 1}}' "$1"; }};
-core() {{ awk 'BEGIN{{v="";n=0}} $1=="Max"&&$2=="core"&&$3=="file"&&$4=="size"{{v=$5 ":" $6;n++}} END{{if(n==1)printf "%s",v;else exit 1}}' "$1"; }};
-metric() {{ awk -v key="$2" 'BEGIN{{v="";n=0}} $1==key{{v=$2;n++}} END{{if(n==1&&v~/^(0|[1-9][0-9]*)$/)printf "%s",v;else exit 1}}' "$1"; }};
+stage='{stage}'; unit='kernaid-rescue-vaultd.service'; socket='kernaid-rescue-vaultd.socket';
+{BOUNDED_CHILD_PID_FUNCTION}
+show() {{ /usr/bin/systemctl show --property="$1" --value "$2" 2>/dev/null; }};
+caps() {{ /usr/bin/awk 'BEGIN{{i=p=e=b=""}} $1=="CapInh:"{{i=$2}} $1=="CapPrm:"{{p=$2}} $1=="CapEff:"{{e=$2}} $1=="CapBnd:"{{b=$2}} END{{if(i!=""&&p!=""&&e!=""&&b!="")printf "%s:%s:%s:%s",i,p,e,b;else exit 1}}' "$1"; }};
+field() {{ /usr/bin/awk -v key="$2" 'BEGIN{{v="";n=0}} $1==key{{v=$2;n++}} END{{if(n==1&&v!="")printf "%s",v;else exit 1}}' "$1"; }};
+core() {{ /usr/bin/awk 'BEGIN{{v="";n=0}} $1=="Max"&&$2=="core"&&$3=="file"&&$4=="size"{{v=$5 ":" $6;n++}} END{{if(n==1)printf "%s",v;else exit 1}}' "$1"; }};
+svc=$(show MainPID "$unit") || svc=0; case "$svc" in ''|*[!0-9]*) svc=0;; esac; worker=$(child "$svc");
+inv=$(show InvocationID "$unit") || inv=invalid; case "$inv" in ''|*[!0-9a-f]*) inv=invalid;; esac; [ "${{#inv}}" = 32 ] || inv=invalid;
 scaps=$(caps "/proc/$svc/status" 2>/dev/null) || scaps=invalid;
 wcaps=$(caps "/proc/$worker/status" 2>/dev/null) || wcaps=invalid;
 samb=$(field "/proc/$svc/status" CapAmb: 2>/dev/null) || samb=invalid; wamb=$(field "/proc/$worker/status" CapAmb: 2>/dev/null) || wamb=invalid;
 snnp=$(field "/proc/$svc/status" NoNewPrivs: 2>/dev/null) || snnp=invalid; wnnp=$(field "/proc/$worker/status" NoNewPrivs: 2>/dev/null) || wnnp=invalid;
 score=$(core "/proc/$svc/limits" 2>/dev/null) || score=invalid; wcore=$(core "/proc/$worker/limits" 2>/dev/null) || wcore=invalid;
-scg=$(cat "/proc/$svc/cgroup" 2>/dev/null) || scg=invalid;
-wcg=$(cat "/proc/$worker/cgroup" 2>/dev/null) || wcg=invalid;
-pp=$(cat "$base/cgroup.procs" 2>/dev/null) || pp=invalid; sp=$(cat "$sup/cgroup.procs" 2>/dev/null) || sp=invalid;
-pproof=invalid; sproof=invalid; wproof=invalid; [ -z "$pp" ] && pproof=empty; [ "$sp" = "$svc" ] && sproof=service; [ "$wprocs" = "$worker" ] && [ "$worker" != 0 ] && wproof=worker;
-subtree=$(cat "$base/cgroup.subtree_control" 2>/dev/null) || subtree=invalid;
-pd=$(metric "$base/cgroup.stat" nr_descendants 2>/dev/null) || pd=invalid; sd=$(metric "$sup/cgroup.stat" nr_descendants 2>/dev/null) || sd=invalid; wd=$(metric "$work/cgroup.stat" nr_descendants 2>/dev/null) || wd=invalid;
-wcurrent=$(cat "$work/pids.current" 2>/dev/null) || wcurrent=invalid; leaf=false; [ "$sd:$wd" = 0:0 ] && leaf=true;
+wppid=$(field "/proc/$worker/status" PPid: 2>/dev/null) || wppid=invalid;
+scg=$(/usr/bin/cat "/proc/$svc/cgroup" 2>/dev/null) || scg=invalid; wcg=$(/usr/bin/cat "/proc/$worker/cgroup" 2>/dev/null) || wcg=invalid;
+control=$(show ControlGroup "$unit") || control=invalid;
+controlproof=invalid; scgproof=invalid; wcgproof=invalid;
+[ "$control" = "/system.slice/kernaid-rescue-vaultd.service" ] && controlproof=unit;
+[ "$scg" = "0::/system.slice/kernaid-rescue-vaultd.service/supervisor" ] && scgproof=supervisor;
+[ "$wcg" = "0::/system.slice/kernaid-rescue-vaultd.service/worker" ] && wcgproof=worker;
 mc=0; for n in /sys/block/dm-*/dm/name; do [ -r "$n" ] || continue; read -r v <"$n" || v=; case "$v" in kernaid-vault-*) mc=$((mc+1));; esac; done;
-sm=false; awk '$5=="/run/kernaid/vault"||index($5,"/run/kernaid/vault/")==1{{found=1}} END{{exit found?0:1}}' /proc/self/mountinfo && sm=true;
-swaps=false; [ "$(awk 'END{{print NR}}' /proc/swaps 2>/dev/null)" = 1 ] && swaps=true;
-active=false; listening=false; cgroups=false;
-[ "$(systemctl show --property=ActiveState --value "$unit" 2>/dev/null)" = active ] && active=true;
-socket_state="$(systemctl show -p ActiveState --value kernaid-rescue-vaultd.socket 2>/dev/null):$(systemctl show -p SubState --value kernaid-rescue-vaultd.socket 2>/dev/null)";
-{SOCKET_OPERATIONAL_CASE}
-[ "$scg" = "0::/system.slice/kernaid-rescue-vaultd.service/supervisor" ] && [ "$wcg" = "0::/system.slice/kernaid-rescue-vaultd.service/worker" ] && [ "$pproof:$sproof:$wproof:$subtree:$pd:$sd:$wd:$wcurrent:$leaf" = empty:service:worker:pids:2:0:0:1:true ] && cgroups=true;
-printf '%s\\n' "KERNAID_VAULT_RUNTIME_V1 stage=$stage service_pid=$svc worker_pid=$worker service_caps=$scaps worker_caps=$wcaps service_ambient=$samb worker_ambient=$wamb service_nnp=$snnp worker_nnp=$wnnp service_core=$score worker_core=$wcore parent_procs=$pproof supervisor_procs=$sproof worker_procs=$wproof subtree_control=$subtree parent_descendants=$pd supervisor_descendants=$sd worker_descendants=$wd worker_pids_current=$wcurrent leaf_exact=$leaf mapper_count=$mc shell_mount=$sm swaps_empty=$swaps service_active=$active socket_listening=$listening cgroups_exact=$cgroups"
+sm=false; /usr/bin/awk '$5=="/run/kernaid/vault"||index($5,"/run/kernaid/vault/")==1{{found=1}} END{{exit found?0:1}}' /proc/self/mountinfo && sm=true;
+swaps=false; [ "$(/usr/bin/awk 'END{{print NR}}' /proc/swaps 2>/dev/null)" = 1 ] && swaps=true;
+sraw="$(show ActiveState "$unit"):$(show SubState "$unit")"; sstate=invalid; [ "$sraw" = active:running ] && sstate=active-running;
+oraw="$(show ActiveState "$socket"):$(show SubState "$socket")"; ostate=invalid; case "$oraw" in active:listening|active:running) ostate=operational;; esac;
+svc2=$(show MainPID "$unit") || svc2=0; case "$svc2" in ''|*[!0-9]*) svc2=0;; esac; worker2=$(child "$svc2");
+inv2=$(show InvocationID "$unit") || inv2=invalid; case "$inv2" in ''|*[!0-9a-f]*) inv2=invalid;; esac; [ "${{#inv2}}" = 32 ] || inv2=invalid;
+wppid2=$(field "/proc/$worker2/status" PPid: 2>/dev/null) || wppid2=invalid;
+scg2=$(/usr/bin/cat "/proc/$svc2/cgroup" 2>/dev/null) || scg2=invalid; wcg2=$(/usr/bin/cat "/proc/$worker2/cgroup" 2>/dev/null) || wcg2=invalid;
+control2=$(show ControlGroup "$unit") || control2=invalid;
+{RUNTIME_IDENTITY_STABILITY_COMMAND}
+printf '%s\\n' "KERNAID_VAULT_RUNTIME_V1 stage=$stage service_pid=$svc worker_pid=$worker worker_ppid=$wppid invocation_id=$inv service_caps=$scaps worker_caps=$wcaps service_ambient=$samb worker_ambient=$wamb service_nnp=$snnp worker_nnp=$wnnp service_core=$score worker_core=$wcore systemd_control_group=$controlproof service_cgroup=$scgproof worker_cgroup=$wcgproof identity_stable=$stable mapper_count=$mc shell_mount=$sm swaps_empty=$swaps service_state=$sstate socket_state=$ostate"
 """
     return " ".join(line.strip() for line in source.splitlines() if line.strip()).encode(
         "ascii"
@@ -2004,6 +2023,13 @@ def parse_loop_detach_arguments(arguments: Sequence[str]) -> argparse.Namespace:
 def boot_attestation(
     firmware: str, boot: int, initial_version: int, final_version: int, device_id: str
 ) -> str:
+    # `cgroup_topology_exact` is a composed claim: boot readiness follows the
+    # root daemon's descriptor-bound topology setup; every successful lifecycle
+    # operation re-attests that topology internally before and after worker
+    # dispatch; and the four UID-1000 RuntimeSnapshots independently bind the
+    # stable systemd MainPID/direct child to their exact /proc memberships.
+    # It never claims that this controller traversed the root-only worker
+    # cgroup directory.
     if final_version != initial_version + 6:
         raise ClosedFailure("attestation", "version-invalid")
     line = (

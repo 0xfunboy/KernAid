@@ -94,16 +94,16 @@ def runtime_line(stage: str, mapper_count: int) -> bytes:
     cap = controller.CAP_SYS_ADMIN_ONLY
     return (
         f"KERNAID_VAULT_RUNTIME_V1 stage={stage} service_pid=101 worker_pid=102 "
+        "worker_ppid=101 "
+        "invocation_id=0123456789abcdef0123456789abcdef "
         f"service_caps={zero}:{cap}:{cap}:{cap} "
         f"worker_caps={zero}:{cap}:{cap}:{cap} "
         f"service_ambient={zero} worker_ambient={zero} "
         "service_nnp=1 worker_nnp=1 service_core=0:0 worker_core=0:0 "
-        "parent_procs=empty supervisor_procs=service worker_procs=worker "
-        "subtree_control=pids parent_descendants=2 supervisor_descendants=0 "
-        "worker_descendants=0 worker_pids_current=1 leaf_exact=true "
+        "systemd_control_group=unit service_cgroup=supervisor "
+        "worker_cgroup=worker identity_stable=true "
         f"mapper_count={mapper_count} shell_mount=false swaps_empty=true "
-        "service_active=true "
-        "socket_listening=true cgroups_exact=true"
+        "service_state=active-running socket_state=operational"
     ).encode("ascii")
 
 
@@ -526,7 +526,8 @@ exec /bin/bash --noprofile --norc -i
             )
 
             invalid_runtime = runtime_line("diagnostic", 0).replace(
-                b"subtree_control=pids", b"subtree_control=cpu pids"
+                b"systemd_control_group=unit",
+                b"systemd_control_group=invalid",
             )
             invalid_command = b"printf '%s\\n' '" + invalid_runtime + b"'\n"
             with mock.patch.object(
@@ -537,10 +538,11 @@ exec /bin/bash --noprofile --norc -i
                 )
             self.assertEqual(failure.exception.stage, "runtime")
             self.assertEqual(
-                failure.exception.code, "subtree-control-invalid"
+                failure.exception.code, "systemd-control-group-invalid"
             )
             self.assertEqual(
-                str(failure.exception), "runtime:subtree-control-invalid"
+                str(failure.exception),
+                "runtime:systemd-control-group-invalid",
             )
             invalid_match = controller.RUNTIME_RESULT_PATTERN.search(
                 capture.snapshot(), cursor
@@ -726,35 +728,236 @@ class ResponseParserTests(unittest.TestCase):
 
 
 class RuntimeEvidenceTests(unittest.TestCase):
-    def test_socket_operational_state_is_an_exact_closed_set(self) -> None:
-        for active_state, substate, expected in (
-            ("active", "listening", "true"),
-            ("active", "running", "true"),
-            ("active", "dead", "false"),
-            ("active", "failed", "false"),
-            ("inactive", "listening", "false"),
-            ("inactive", "running", "false"),
-            ("invalid", "invalid", "false"),
-        ):
-            with self.subTest(active_state=active_state, substate=substate):
-                script = (
-                    f"socket_state={f'{active_state}:{substate}'!r}; "
-                    "listening=false; "
-                    f"{controller.SOCKET_OPERATIONAL_CASE} "
-                    'printf "%s" "$listening"'
-                )
-                observed = subprocess.run(
-                    ["sh", "-c", script],
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                )
-                self.assertEqual(observed.stdout, expected)
+    @unittest.skipUnless(
+        Path("/usr/bin/pgrep").is_file() and Path("/usr/bin/head").is_file(),
+        "pgrep and head required",
+    )
+    def test_worker_pid_is_one_bounded_direct_child(
+        self,
+    ) -> None:
+        derivation = controller.BOUNDED_CHILD_PID_FUNCTION
+        self.assertIn('/usr/bin/pgrep -P "$1"', derivation)
+        self.assertIn("/usr/bin/head -n 2", derivation)
+        helper_source = """
+import subprocess
+import sys
+import time
 
-        runtime_command = controller._runtime_command("socket-state-test").decode(
-            "ascii"
+count = int(sys.argv[1])
+children = [subprocess.Popen(["/bin/sleep", "30"]) for _ in range(count)]
+print(" ".join(str(child.pid) for child in children), flush=True)
+time.sleep(30)
+"""
+        for child_count in (1, 2):
+            with self.subTest(child_count=child_count):
+                helper = subprocess.Popen(
+                    [sys.executable, "-c", helper_source, str(child_count)],
+                    stdout=subprocess.PIPE,
+                    text=True,
+                    start_new_session=True,
+                )
+                try:
+                    assert helper.stdout is not None
+                    children = helper.stdout.readline().strip().split()
+                    self.assertEqual(len(children), child_count)
+                    observed = subprocess.run(
+                        [
+                            "/bin/bash",
+                            "--noprofile",
+                            "--norc",
+                            "-c",
+                            f"{derivation} child {helper.pid}",
+                        ],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+                    expected = children[0] if child_count == 1 else "0"
+                    self.assertEqual(observed.stdout, expected)
+                finally:
+                    if helper.stdout is not None:
+                        helper.stdout.close()
+                    os.killpg(helper.pid, signal.SIGKILL)
+                    helper.wait(timeout=5)
+
+    @unittest.skipIf(os.geteuid() == 0, "real non-root EUID required")
+    def test_entire_runtime_command_uses_only_nonroot_systemd_and_proc_evidence(
+        self,
+    ) -> None:
+        self.assertEqual(os.getuid(), os.geteuid())
+        shipping = controller._runtime_command("nonroot-fixture").decode("ascii")
+        for forbidden in (
+            "/sys/fs/cgroup",
+            "cgroup.procs",
+            "cgroup.stat",
+            "pids.current",
+            "cgroup.subtree_control",
+            "base='/sys/fs/cgroup",
+            '"$base/',
+            '"$sup/',
+            '"$work/',
+        ):
+            self.assertNotIn(forbidden, shipping)
+        self.assertIn("/usr/bin/systemctl", shipping)
+        self.assertIn("/usr/bin/pgrep", shipping)
+        self.assertIn("/usr/bin/head -n 2", shipping)
+        self.assertIn('field "/proc/$worker/status" PPid:', shipping)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            proc = root / "proc"
+            system_block = root / "sys" / "block"
+            fakebin = root / "bin"
+            for path in (proc / "101", proc / "102", proc / "self", system_block, fakebin):
+                path.mkdir(parents=True, exist_ok=True)
+
+            zero = controller.ZERO_CAPS
+            cap = controller.CAP_SYS_ADMIN_ONLY
+
+            def write_process(pid: int, parent: int, membership: str) -> None:
+                (proc / str(pid) / "status").write_text(
+                    "\n".join(
+                        (
+                            f"PPid:\t{parent}",
+                            f"CapInh:\t{zero}",
+                            f"CapPrm:\t{cap}",
+                            f"CapEff:\t{cap}",
+                            f"CapBnd:\t{cap}",
+                            f"CapAmb:\t{zero}",
+                            "NoNewPrivs:\t1",
+                        )
+                    )
+                    + "\n",
+                    encoding="ascii",
+                )
+                (proc / str(pid) / "limits").write_text(
+                    "Max core file size        0                    0                    bytes\n",
+                    encoding="ascii",
+                )
+                (proc / str(pid) / "cgroup").write_text(
+                    membership + "\n", encoding="ascii"
+                )
+
+            write_process(
+                101,
+                1,
+                "0::/system.slice/kernaid-rescue-vaultd.service/supervisor",
+            )
+            write_process(
+                102,
+                101,
+                "0::/system.slice/kernaid-rescue-vaultd.service/worker",
+            )
+            (proc / "self" / "mountinfo").write_text("", encoding="ascii")
+            (proc / "swaps").write_text(
+                "Filename Type Size Used Priority\n", encoding="ascii"
+            )
+
+            systemctl = fakebin / "systemctl"
+            systemctl.write_text(
+                """#!/bin/sh
+case "$*" in
+  *MainPID*) printf '%s\n' 101 ;;
+  *InvocationID*) printf '%s\n' 0123456789abcdef0123456789abcdef ;;
+  *ControlGroup*) printf '%s\n' /system.slice/kernaid-rescue-vaultd.service ;;
+  *ActiveState*) printf '%s\n' active ;;
+  *SubState*kernaid-rescue-vaultd.socket*) printf '%s\n' listening ;;
+  *SubState*) printf '%s\n' running ;;
+  *) exit 1 ;;
+esac
+""",
+                encoding="ascii",
+            )
+            systemctl.chmod(0o700)
+            pgrep = fakebin / "pgrep"
+            pgrep.write_text(
+                """#!/bin/sh
+[ "$1:$2" = '-P:101' ] || exit 1
+printf '%s\n' 102
+""",
+                encoding="ascii",
+            )
+            pgrep.chmod(0o700)
+
+            fixture = shipping.replace("/usr/bin/systemctl", os.fspath(systemctl))
+            fixture = fixture.replace("/usr/bin/pgrep", os.fspath(pgrep))
+            fixture = fixture.replace("/proc", os.fspath(proc))
+            fixture = fixture.replace("/sys/block", os.fspath(system_block))
+            observed = subprocess.run(
+                ["/bin/bash", "--noprofile", "--norc", "-c", fixture],
+                check=True,
+                capture_output=True,
+                timeout=5,
+            )
+        expected = runtime_line("nonroot-fixture", 0)
+        self.assertEqual(observed.stdout, expected + b"\n")
+        snapshot = controller.parse_runtime_snapshot(expected, "nonroot-fixture")
+        self.assertEqual(snapshot.worker_ppid, snapshot.service_pid)
+
+    def test_service_and_socket_states_are_closed_exact_tokens(self) -> None:
+        runtime_command = controller._runtime_command("state-test").decode("ascii")
+        self.assertIn('[ "$sraw" = active:running ] && sstate=active-running', runtime_command)
+        self.assertIn(
+            'case "$oraw" in active:listening|active:running) ostate=operational',
+            runtime_command,
         )
-        self.assertIn(controller.SOCKET_OPERATIONAL_CASE, runtime_command)
+
+    def test_end_reread_comparison_rejects_each_identity_race(self) -> None:
+        stable = {
+            "svc": "101",
+            "worker": "102",
+            "wppid": "101",
+            "control": "/system.slice/kernaid-rescue-vaultd.service",
+            "scg": "0::/system.slice/kernaid-rescue-vaultd.service/supervisor",
+            "wcg": "0::/system.slice/kernaid-rescue-vaultd.service/worker",
+            "inv": "0123456789abcdef0123456789abcdef",
+            "svc2": "101",
+            "worker2": "102",
+            "wppid2": "101",
+            "control2": "/system.slice/kernaid-rescue-vaultd.service",
+            "scg2": "0::/system.slice/kernaid-rescue-vaultd.service/supervisor",
+            "wcg2": "0::/system.slice/kernaid-rescue-vaultd.service/worker",
+            "inv2": "0123456789abcdef0123456789abcdef",
+        }
+        for changed in (
+            "svc2",
+            "worker2",
+            "wppid",
+            "wppid2",
+            "control2",
+            "scg2",
+            "wcg2",
+            "inv2",
+        ):
+            values = dict(stable)
+            values[changed] = "changed"
+            assignments = ";".join(
+                f"{name}={value!r}" for name, value in values.items()
+            )
+            observed = subprocess.run(
+                [
+                    "/bin/bash",
+                    "--noprofile",
+                    "--norc",
+                    "-c",
+                    assignments
+                    + ";"
+                    + controller.RUNTIME_IDENTITY_STABILITY_COMMAND
+                    + "printf '%s' \"$stable\"",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            with self.subTest(changed=changed):
+                self.assertEqual(observed.stdout, "false")
+
+        runtime_command = controller._runtime_command("reread-test").decode("ascii")
+        self.assertIn(controller.RUNTIME_IDENTITY_STABILITY_COMMAND, runtime_command)
+        self.assertEqual(runtime_command.count('show MainPID "$unit"'), 2)
+        self.assertEqual(runtime_command.count('show ControlGroup "$unit"'), 2)
+        self.assertEqual(runtime_command.count('show InvocationID "$unit"'), 2)
 
     def test_runtime_sequence_requires_stable_processes_caps_and_mapper_cleanup(self) -> None:
         snapshots = [
@@ -771,6 +974,11 @@ class RuntimeEvidenceTests(unittest.TestCase):
         changed = list(snapshots)
         changed[3] = controller.dataclasses.replace(
             snapshots[3], service_pid=999
+        )
+        with self.assertRaises(controller.ClosedFailure):
+            controller.validate_runtime_sequence(changed)
+        changed[3] = controller.dataclasses.replace(
+            snapshots[3], invocation_id="f" * 32
         )
         with self.assertRaises(controller.ClosedFailure):
             controller.validate_runtime_sequence(changed)
@@ -821,6 +1029,17 @@ class RuntimeEvidenceTests(unittest.TestCase):
             (b"stage=initial", b"stage=other", "stage-invalid"),
             (b"service_pid=101", b"service_pid=0", "service-pid-invalid"),
             (b"worker_pid=102", b"worker_pid=0", "worker-pid-invalid"),
+            (b"worker_ppid=101", b"worker_ppid=0", "worker-ppid-invalid"),
+            (
+                b"worker_ppid=101",
+                b"worker_ppid=999",
+                "worker-parent-invalid",
+            ),
+            (
+                b"invocation_id=0123456789abcdef0123456789abcdef",
+                b"invocation_id=invalid",
+                "invocation-id-invalid",
+            ),
             (
                 b"service_caps=" + b":".join((zero, cap, cap, cap)),
                 b"service_caps=invalid",
@@ -854,49 +1073,24 @@ class RuntimeEvidenceTests(unittest.TestCase):
                 "worker-core-invalid",
             ),
             (
-                b"parent_procs=empty",
-                b"parent_procs=invalid",
-                "parent-procs-invalid",
+                b"systemd_control_group=unit",
+                b"systemd_control_group=invalid",
+                "systemd-control-group-invalid",
             ),
             (
-                b"supervisor_procs=service",
-                b"supervisor_procs=invalid",
-                "supervisor-procs-invalid",
+                b"service_cgroup=supervisor",
+                b"service_cgroup=invalid",
+                "service-cgroup-invalid",
             ),
             (
-                b"worker_procs=worker",
-                b"worker_procs=invalid",
-                "worker-procs-invalid",
+                b"worker_cgroup=worker",
+                b"worker_cgroup=invalid",
+                "worker-cgroup-invalid",
             ),
             (
-                b"subtree_control=pids",
-                b"subtree_control=cpu pids",
-                "subtree-control-invalid",
-            ),
-            (
-                b"parent_descendants=2",
-                b"parent_descendants=3",
-                "parent-descendants-invalid",
-            ),
-            (
-                b"supervisor_descendants=0",
-                b"supervisor_descendants=1",
-                "supervisor-descendants-invalid",
-            ),
-            (
-                b"worker_descendants=0",
-                b"worker_descendants=1",
-                "worker-descendants-invalid",
-            ),
-            (
-                b"worker_pids_current=1",
-                b"worker_pids_current=2",
-                "worker-pids-current-invalid",
-            ),
-            (
-                b"leaf_exact=true",
-                b"leaf_exact=false",
-                "leaf-exact-invalid",
+                b"identity_stable=true",
+                b"identity_stable=false",
+                "identity-stability-invalid",
             ),
             (
                 b"mapper_count=0",
@@ -914,19 +1108,14 @@ class RuntimeEvidenceTests(unittest.TestCase):
                 "swaps-invalid",
             ),
             (
-                b"service_active=true",
-                b"service_active=false",
+                b"service_state=active-running",
+                b"service_state=inactive",
                 "service-state-invalid",
             ),
             (
-                b"socket_listening=true",
-                b"socket_listening=false",
+                b"socket_state=operational",
+                b"socket_state=inactive",
                 "socket-state-invalid",
-            ),
-            (
-                b"cgroups_exact=true",
-                b"cgroups_exact=false",
-                "cgroups-invalid",
             ),
         ]
         observed_codes = set()
@@ -960,7 +1149,10 @@ class RuntimeEvidenceTests(unittest.TestCase):
                 b"worker_pid=102 service_pid=101",
             ),
             valid.replace(b"stage=initial", b"stage=initial\x1b[31m"),
-            valid.replace(b"parent_procs=empty", b"parent_procs=empty\nspoof"),
+            valid.replace(
+                b"systemd_control_group=unit",
+                b"systemd_control_group=unit\nspoof",
+            ),
             valid.replace(b"worker_pid=102", b"unknown=1 worker_pid=102"),
             b"\x1b[?2004l\r" + valid,
             valid + (b"x" * 1025),
@@ -1627,7 +1819,12 @@ class StaticContractTests(unittest.TestCase):
         self.assertIn("close_fds=True", python)
         self.assertIn("SERIAL_LIMIT = 2 * 1024 * 1024", python)
         self.assertIn("ACPI_SHUTDOWN_SECONDS = 180.0", python)
-        self.assertIn("parent_procs=empty", python)
+        self.assertIn("systemd_control_group=unit", python)
+        self.assertIn("service_cgroup=supervisor", python)
+        self.assertIn("worker_cgroup=worker", python)
+        self.assertIn("`cgroup_topology_exact` is a composed claim", python)
+        self.assertNotIn("parent_procs=empty", python)
+        self.assertNotIn("worker_pids_current=1", python)
         self.assertIn("swaps_empty=true", python)
         self.assertLess(
             len(controller._runtime_command("maximum-stage")),
