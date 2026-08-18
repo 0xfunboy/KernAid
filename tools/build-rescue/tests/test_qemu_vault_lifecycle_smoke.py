@@ -17,6 +17,7 @@ import tempfile
 import threading
 import time
 import unittest
+from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -313,73 +314,10 @@ class LiveLoginTests(unittest.TestCase):
                 raise controller.ClosedFailure("scripted", "missing")
             return match
 
-    def test_real_login_accepts_standalone_or_exact_prefixed_ready(self) -> None:
-        for ready in (
-            b"KERNAID_RESCUE_READY\r\n",
-            b"kernaid-rescue login: KERNAID_RESCUE_READY\r\n",
-        ):
-            with self.subTest(ready=ready):
-                credential = bytearray(synthetic_login_credential())
-                scripted = self.ScriptedConsole(ready, bytes(credential))
-                cursor = controller.establish_live_session(
-                    scripted, time.monotonic() + 60, credential
-                )
-                self.assertGreater(cursor, 0)
-                self.assertEqual(
-                    scripted.sent[:4],
-                    [b"\n", b"kernaid\n", bytes(credential), b"\n"],
-                )
-                controller.wipe(credential)
-                controller.wipe(scripted.credential)
-                scripted.capture.wipe()
-
-    def test_real_login_fails_if_password_is_echoed_in_prompt_window(self) -> None:
-        credential = bytearray(synthetic_login_credential())
-        scripted = self.ScriptedConsole(
-            b"KERNAID_RESCUE_READY\r\n",
-            bytes(credential),
-            echo_credential=True,
-        )
-        with self.assertRaises(controller.ClosedFailure) as failure:
-            controller.establish_live_session(
-                scripted, time.monotonic() + 60, credential
-            )
-        self.assertEqual(failure.exception.code, "credential-echoed")
-        controller.wipe(credential)
-        controller.wipe(scripted.credential)
-        scripted.capture.wipe()
-
-    def test_login_marker_accepts_only_exact_optional_bracketed_paste_prefix(
+    @contextlib.contextmanager
+    def real_interactive_bash_console(
         self,
-    ) -> None:
-        for marker in (controller.LOGIN_OK_LINE, controller.LOGIN_FAIL_LINE):
-            for prefix in (b"", b"\x1b[?2004l\r"):
-                with self.subTest(marker=marker, prefix=prefix):
-                    transcript = b"command\r\n" + prefix + marker + b"\r\n"
-                    match = controller.LOGIN_RESULT_PATTERN.search(transcript)
-                    self.assertIsNotNone(match)
-                    assert match is not None
-                    self.assertEqual(match.group(1), marker)
-
-        malformed_prefixes = (
-            b"\x1b[?2004h\r",
-            b"\x1b[?2004l",
-            b"\x1b[?2004l\rX",
-            b"X\x1b[?2004l\r",
-            b"\x1b[31m",
-            b"\x1b[?2004l\r\x1b[?2004l\r",
-        )
-        for prefix in malformed_prefixes:
-            with self.subTest(malformed_prefix=prefix):
-                transcript = (
-                    b"command\r\n" + prefix + controller.LOGIN_OK_LINE + b"\r\n"
-                )
-                self.assertIsNone(controller.LOGIN_RESULT_PATTERN.search(transcript))
-
-    @unittest.skipUnless(Path("/bin/bash").is_file(), "interactive bash required")
-    def test_live_session_uses_real_interactive_bash_bracketed_paste_output(
-        self,
-    ) -> None:
+    ) -> Iterator[tuple[object, object, bytearray]]:
         credential = bytearray(synthetic_login_credential())
         wrapper = r"""
 set -eu
@@ -429,14 +367,7 @@ exec /bin/bash --noprofile --norc -i
         capture = controller.BoundedCapture(64 * 1024, [credential])
         console = controller.SerialConsole(master, capture, lambda: None)
         try:
-            cursor = controller.establish_live_session(
-                console, time.monotonic() + 10.0, credential
-            )
-            self.assertGreater(cursor, 0)
-            self.assertIn(
-                b"\x1b[?2004l\r" + controller.LOGIN_OK_LINE + b"\r\n",
-                capture.snapshot(),
-            )
+            yield console, capture, credential
         finally:
             console.close()
             try:
@@ -458,6 +389,178 @@ exec /bin/bash --noprofile --norc -i
                 time.sleep(0.01)
             controller.wipe(credential)
             capture.wipe()
+
+    def test_real_login_accepts_standalone_or_exact_prefixed_ready(self) -> None:
+        for ready in (
+            b"KERNAID_RESCUE_READY\r\n",
+            b"kernaid-rescue login: KERNAID_RESCUE_READY\r\n",
+        ):
+            with self.subTest(ready=ready):
+                credential = bytearray(synthetic_login_credential())
+                scripted = self.ScriptedConsole(ready, bytes(credential))
+                cursor = controller.establish_live_session(
+                    scripted, time.monotonic() + 60, credential
+                )
+                self.assertGreater(cursor, 0)
+                self.assertEqual(
+                    scripted.sent[:4],
+                    [b"\n", b"kernaid\n", bytes(credential), b"\n"],
+                )
+                controller.wipe(credential)
+                controller.wipe(scripted.credential)
+                scripted.capture.wipe()
+
+    def test_real_login_fails_if_password_is_echoed_in_prompt_window(self) -> None:
+        credential = bytearray(synthetic_login_credential())
+        scripted = self.ScriptedConsole(
+            b"KERNAID_RESCUE_READY\r\n",
+            bytes(credential),
+            echo_credential=True,
+        )
+        with self.assertRaises(controller.ClosedFailure) as failure:
+            controller.establish_live_session(
+                scripted, time.monotonic() + 60, credential
+            )
+        self.assertEqual(failure.exception.code, "credential-echoed")
+        controller.wipe(credential)
+        controller.wipe(scripted.credential)
+        scripted.capture.wipe()
+
+    def test_trusted_shell_markers_accept_only_exact_optional_bracketed_paste_prefix(
+        self,
+    ) -> None:
+        runtime = runtime_line("initial", 0)
+        begin = b"KERNAID_VAULT_CTL_BEGIN_V1_marker-test"
+        end = b"KERNAID_VAULT_CTL_END_V1_marker-test"
+        cases = (
+            ("login", controller.LOGIN_RESULT_PATTERN, controller.LOGIN_OK_LINE),
+            (
+                "login-failure",
+                controller.LOGIN_RESULT_PATTERN,
+                controller.LOGIN_FAIL_LINE,
+            ),
+            ("runtime", controller.RUNTIME_RESULT_PATTERN, runtime),
+            (
+                "companion-begin",
+                controller._trusted_shell_line_pattern(begin),
+                begin,
+            ),
+        )
+        for name, pattern, marker in cases:
+            for prefix in (b"", controller.BRACKETED_PASTE_DISABLE_PREFIX):
+                with self.subTest(name=name, prefix=prefix):
+                    transcript = b"command\r\n" + prefix + marker + b"\r\n"
+                    self.assertIsNotNone(pattern.search(transcript))
+
+        malformed_prefixes = (
+            b"\x1b[?2004h\r",
+            b"\x1b[?2004l",
+            b"\x1b[?2004l\rX",
+            b"X\x1b[?2004l\r",
+            b"\x1b[31m",
+            b"\x1b[?2004l\r\x1b[?2004l\r",
+        )
+        for name, pattern, marker in cases:
+            for prefix in malformed_prefixes:
+                with self.subTest(name=name, malformed_prefix=prefix):
+                    transcript = b"command\r\n" + prefix + marker + b"\r\n"
+                    self.assertIsNone(pattern.search(transcript))
+
+        end_pattern = controller._return_code_line_pattern(end)
+        self.assertIsNotNone(
+            end_pattern.search(b"output\r\n" + end + b" rc=0\r\n")
+        )
+        self.assertIsNone(
+            end_pattern.search(
+                b"output\r\n"
+                + controller.BRACKETED_PASTE_DISABLE_PREFIX
+                + end
+                + b" rc=0\r\n"
+            )
+        )
+
+    @unittest.skipUnless(Path("/bin/bash").is_file(), "interactive bash required")
+    def test_live_session_uses_real_interactive_bash_bracketed_paste_output(
+        self,
+    ) -> None:
+        with self.real_interactive_bash_console() as (
+            console,
+            capture,
+            credential,
+        ):
+            cursor = controller.establish_live_session(
+                console, time.monotonic() + 10.0, credential
+            )
+            self.assertGreater(cursor, 0)
+            self.assertIn(
+                controller.BRACKETED_PASTE_DISABLE_PREFIX
+                + controller.LOGIN_OK_LINE
+                + b"\r\n",
+                capture.snapshot(),
+            )
+
+    @unittest.skipUnless(Path("/bin/bash").is_file(), "interactive bash required")
+    def test_real_interactive_bash_runtime_and_companion_markers(self) -> None:
+        with self.real_interactive_bash_console() as (
+            console,
+            capture,
+            credential,
+        ):
+            aggregate = time.monotonic() + 15.0
+            cursor = controller.establish_live_session(
+                console, aggregate, credential
+            )
+
+            runtime = runtime_line("initial", 0)
+            runtime_command = b"printf '%s\\n' '" + runtime + b"'\n"
+            with mock.patch.object(
+                controller, "_runtime_command", return_value=runtime_command
+            ):
+                snapshot, cursor = controller.collect_runtime(
+                    console, "initial", cursor, aggregate
+                )
+            self.assertEqual(snapshot.stage, "initial")
+            self.assertIn(
+                controller.BRACKETED_PASTE_DISABLE_PREFIX + runtime + b"\r\n",
+                capture.snapshot(),
+            )
+
+            setup = b"KERNAID_TEST_COMPANION_READY"
+            console.send(
+                b"function /usr/bin/kernaid-rescue-vaultctl { "
+                b"printf '%s\\n' 'stateVersion: 10' 'vaultState: locked'; "
+                b"}; printf '%s\\n' '"
+                + setup
+                + b"'\n",
+                deadline=aggregate,
+            )
+            setup_match = console.wait_regex(
+                controller._trusted_shell_line_pattern(setup),
+                start=cursor,
+                deadline=aggregate,
+                stage="test-companion-setup",
+            )
+            observed, _ = controller.run_companion(
+                console,
+                "status",
+                "real-bash-status",
+                setup_match.end(),
+                aggregate,
+            )
+            self.assertEqual(observed, response(10, "locked"))
+            self.assertEqual(observed.return_code, 0)
+            begin = b"KERNAID_VAULT_CTL_BEGIN_V1_real-bash-status"
+            end = b"KERNAID_VAULT_CTL_END_V1_real-bash-status"
+            transcript = capture.snapshot()
+            self.assertIn(
+                controller.BRACKETED_PASTE_DISABLE_PREFIX + begin + b"\r\n",
+                transcript,
+            )
+            self.assertIn(b"\r\n" + end + b" rc=0\r\n", transcript)
+            self.assertNotIn(
+                controller.BRACKETED_PASTE_DISABLE_PREFIX + end + b" rc=0\r\n",
+                transcript,
+            )
 
 
 class ResponseParserTests(unittest.TestCase):

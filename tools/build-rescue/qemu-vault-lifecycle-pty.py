@@ -54,12 +54,21 @@ LOOP_INFO64 = struct.Struct("=QQQQQIIII64s64s32sQQ")
 READY_LINE = b"KERNAID_RESCUE_READY"
 LOGIN_OK_LINE = b"KERNAID_VAULT_LOGIN_V1 uid=1000 user=kernaid group=true"
 LOGIN_FAIL_LINE = b"KERNAID_VAULT_LOGIN_V1 invalid=true"
-# Interactive Bash places this one bracketed-paste disable sequence between the
-# echoed proof command and its output. No other terminal control prefix is valid.
+# Interactive Bash places this one bracketed-paste disable sequence between an
+# echoed command and its first output line. Only trusted shell-emitted markers
+# opt in to this exact optional prefix at a line boundary.
+BRACKETED_PASTE_DISABLE_PREFIX = b"\x1b[?2004l\r"
+_TRUSTED_SHELL_MARKER_START = (
+    rb"(?:^|\r?\n)(?:" + re.escape(BRACKETED_PASTE_DISABLE_PREFIX) + rb")?"
+)
 LOGIN_RESULT_PATTERN = re.compile(
-    rb"(?:^|\r?\n)(?:\x1b\[\?2004l\r)?"
-    rb"(KERNAID_VAULT_LOGIN_V1 (?:uid=1000 user=kernaid group=true|invalid=true))"
-    rb"\r?\n"
+    _TRUSTED_SHELL_MARKER_START
+    + rb"(KERNAID_VAULT_LOGIN_V1 (?:uid=1000 user=kernaid group=true|invalid=true))"
+    + rb"\r?\n"
+)
+RUNTIME_RESULT_PATTERN = re.compile(
+    _TRUSTED_SHELL_MARKER_START
+    + rb"(KERNAID_VAULT_RUNTIME_V1 [^\r\n]{1,1024})\r?\n"
 )
 CAP_SYS_ADMIN_ONLY = "0000000000200000"
 ZERO_CAPS = "0000000000000000"
@@ -244,6 +253,16 @@ class BoundedCapture:
 
 def _line_pattern(line: bytes) -> re.Pattern[bytes]:
     return re.compile(rb"(?:^|\r?\n)" + re.escape(line) + rb"\r?\n")
+
+
+def _trusted_shell_line_pattern(line: bytes) -> re.Pattern[bytes]:
+    return re.compile(_TRUSTED_SHELL_MARKER_START + re.escape(line) + rb"\r?\n")
+
+
+def _return_code_line_pattern(line: bytes) -> re.Pattern[bytes]:
+    return re.compile(
+        rb"(?:^|\r?\n)" + re.escape(line) + rb" rc=([0-9]{1,3})\r?\n"
+    )
 
 
 def _normalize(block: bytes) -> list[bytes]:
@@ -1620,11 +1639,8 @@ def collect_runtime(
     console: SerialConsole, stage: str, cursor: int, aggregate: float
 ) -> tuple[RuntimeSnapshot, int]:
     console.send(_runtime_command(stage), deadline=_deadline(aggregate, 5.0))
-    pattern = re.compile(
-        rb"(?:^|\r?\n)(KERNAID_VAULT_RUNTIME_V1 [^\r\n]{1,1024})\r?\n"
-    )
     match = console.wait_regex(
-        pattern,
+        RUNTIME_RESULT_PATTERN,
         start=cursor,
         deadline=_deadline(aggregate, 15.0),
         stage="runtime",
@@ -1655,7 +1671,7 @@ def run_companion(
     )
     console.send(shell, deadline=_deadline(aggregate, 5.0))
     begin_match = console.wait_regex(
-        _line_pattern(begin),
+        _trusted_shell_line_pattern(begin),
         start=cursor,
         deadline=_deadline(aggregate, 10.0),
         stage="command-start",
@@ -1674,9 +1690,7 @@ def run_companion(
             raise ClosedFailure("response", "prompt-invalid")
         console.send(secret, deadline=_deadline(aggregate, 5.0))
         console.send(b"\n", deadline=_deadline(aggregate, 5.0))
-    end_pattern = re.compile(
-        rb"(?:^|\r?\n)" + re.escape(end) + rb" rc=([0-9]{1,3})\r?\n"
-    )
+    end_pattern = _return_code_line_pattern(end)
     end_match = console.wait_regex(
         end_pattern,
         start=begin_match.end(),
