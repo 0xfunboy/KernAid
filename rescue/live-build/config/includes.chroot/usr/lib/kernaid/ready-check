@@ -188,9 +188,11 @@ test -r /proc/sys/kernel/core_pattern || fail "kernel core policy is unreadable"
 test -z "$(cat /proc/sys/kernel/core_pattern)" || fail "kernel core filename is enabled"
 test "$(cat /proc/sys/kernel/core_uses_pid)" = "0" || fail "kernel core PID suffix is enabled"
 test -r /proc/sys/kernel/printk || fail "kernel console policy is unreadable"
-read -r printk_console printk_default printk_minimum printk_boot < /proc/sys/kernel/printk \
-    || fail "kernel console policy is unavailable"
-test "$printk_console:$printk_default:$printk_minimum:$printk_boot" = "5:4:1:7" \
+printk_policy="$(
+    /usr/bin/head -c 65 /proc/sys/kernel/printk || exit 1
+    printf '.'
+)" || fail "kernel console policy is unavailable"
+test "$printk_policy" = "$(printf '5\t4\t1\t7\n.')" \
     || fail "kernel console policy is unsafe"
 test "$(wc -l < /proc/swaps)" -eq 1 || fail "swap is active"
 test "$(systemctl show --property=ActiveState --value kernaid-rescue-vaultd.service)" = "active" \

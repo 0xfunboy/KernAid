@@ -280,9 +280,21 @@ class VaultLivePolicyTests(unittest.TestCase):
         self.assertIn("/proc/sys/kernel/core_pattern", ready)
         self.assertIn("/proc/sys/kernel/core_uses_pid", ready)
         self.assertIn("/proc/sys/kernel/printk", ready)
+        expected_printk_gate = (
+            'printk_policy="$(\n'
+            "    /usr/bin/head -c 65 /proc/sys/kernel/printk || exit 1\n"
+            "    printf '.'\n"
+            ')" || fail "kernel console policy is unavailable"\n'
+            'test "$printk_policy" = "$(printf \'5\\t4\\t1\\t7\\n.\')" \\\n'
+            '    || fail "kernel console policy is unsafe"'
+        )
         self.assertIn(
-            '"$printk_console:$printk_default:$printk_minimum:$printk_boot" = "5:4:1:7"',
+            expected_printk_gate,
             ready,
+        )
+        self.assertNotRegex(
+            ready,
+            r"(?m)^\s*read\b[^\n]*<\s*/proc/sys/kernel/printk(?:\s|$)",
         )
         self.assertIn("/proc/swaps", ready)
         self.assertIn(
