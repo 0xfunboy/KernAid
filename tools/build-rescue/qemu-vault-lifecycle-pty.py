@@ -83,6 +83,27 @@ ATTESTATION_PREFIX = "KERNAID_QEMU_VAULT_LIFECYCLE_BOOT_V1"
 TOKEN_RE = re.compile(r"^[a-z0-9-]+$")
 DEVICE_ID_RE = re.compile(r"^KA-[0-9a-f]{24}$")
 
+# Public protocol errors are safe to classify in the sanitized lifecycle
+# evidence. Keep this mapping explicit: an unknown or malformed server token
+# must retain the generic fail-closed result rather than becoming output.
+UNLOCK_REMOTE_FAILURE_CODES = {
+    "ABSENT": "absent",
+    "UNPROVISIONED": "unprovisioned",
+    "LOCKED": "locked",
+    "MEDIA_CHANGED": "media-changed",
+    "PROFILE_MISMATCH": "profile-mismatch",
+    "STALE_STATE": "stale-state",
+    "FD_REQUIRED": "fd-required",
+    "FD_FORBIDDEN": "fd-forbidden",
+    "NOT_AUTHORIZED": "not-authorized",
+    "RATE_LIMITED": "rate-limited",
+    "BUSY": "busy",
+    "PROVIDER_UNCONFIGURED": "provider-unconfigured",
+    "REPORT_TOO_LARGE": "report-too-large",
+    "IO_FAILED": "io-failed",
+    "REBOOT_REQUIRED": "reboot-required",
+}
+
 
 class ClosedFailure(Exception):
     """Failure carrying only closed diagnostic tokens."""
@@ -744,6 +765,16 @@ def parse_companion_response(
             and error == "BAD_PASSPHRASE"
         )
         if not (success or rejected):
+            remote_code = (
+                UNLOCK_REMOTE_FAILURE_CODES.get(error)
+                if return_code != 0
+                and state is None
+                and device_id is None
+                and error is not None
+                else None
+            )
+            if remote_code is not None:
+                raise ClosedFailure("response", f"unlock-remote-{remote_code}")
             raise ClosedFailure("response", "unlock-invalid")
     return CompanionResponse(version, state, device_id, error, return_code)
 

@@ -647,6 +647,25 @@ class ResponseParserTests(unittest.TestCase):
                     block, command="unlock", return_code=1
                 )
 
+    def test_unlock_parser_classifies_only_closed_public_remote_errors(self) -> None:
+        with self.assertRaises(controller.ClosedFailure) as classified:
+            controller.parse_companion_response(
+                b"READY\nVault passphrase: \nstateVersion: 24\nerror: IO_FAILED\n",
+                command="unlock",
+                return_code=1,
+            )
+        self.assertEqual(classified.exception.stage, "response")
+        self.assertEqual(classified.exception.code, "unlock-remote-io-failed")
+
+        with self.assertRaises(controller.ClosedFailure) as unknown:
+            controller.parse_companion_response(
+                b"READY\nVault passphrase: \nstateVersion: 24\nerror: FUTURE_ERROR\n",
+                command="unlock",
+                return_code=1,
+            )
+        self.assertEqual(unknown.exception.stage, "response")
+        self.assertEqual(unknown.exception.code, "unlock-invalid")
+
     def test_provider_companion_parser_is_exact_and_boot_prior_is_correlated(self) -> None:
         configured = controller.ProviderCompanionResponse(
             16, "configured", "unconfigured", None, 0
@@ -901,6 +920,25 @@ class ResponseParserTests(unittest.TestCase):
             )
         self.assertEqual(observed.exception.stage, stage)
         self.assertEqual(observed.exception.code, "response-version-invalid")
+
+        remote = ScriptedConsole(
+            transcript.replace(
+                b"error: BAD_PASSPHRASE", b"error: MEDIA_CHANGED"
+            )
+        )
+        with self.assertRaises(controller.ClosedFailure) as observed:
+            controller.run_companion(
+                remote,
+                "unlock",
+                stage,
+                0,
+                time.monotonic() + 10,
+                secret,
+            )
+        self.assertEqual(observed.exception.stage, stage)
+        self.assertEqual(
+            observed.exception.code, "response-unlock-remote-media-changed"
+        )
 
         missing_ready = transcript.replace(b"READY\r\n", b"NOT_READY\r\n")
         blocked = ScriptedConsole(missing_ready)
