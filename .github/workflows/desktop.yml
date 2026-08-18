@@ -54,6 +54,7 @@ jobs:
         run: pnpm --filter @kernaid/desk tauri icon icon.svg
       - name: Test Resident OpenAI and credential companion boundaries
         if: matrix.name != 'macos-x86_64'
+        shell: bash
         run: |
           cargo test --locked -p kernaid-desk-shell resident_openai -- --nocapture
           cargo test --locked -p kernaid-desk-shell --bin kernaid-provider-key -- --nocapture

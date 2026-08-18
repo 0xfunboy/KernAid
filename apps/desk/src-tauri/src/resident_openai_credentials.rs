@@ -307,7 +307,7 @@ fn open_instance_lock(path: &Path) -> Result<File, ResidentOpenAiCredentialError
 fn lock_file(file: File) -> Result<File, ResidentOpenAiCredentialError> {
     match file.try_lock_exclusive() {
         Ok(()) => Ok(file),
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+        Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
             Err(ResidentOpenAiCredentialError::InstanceAlreadyRunning)
         }
         Err(_) => Err(ResidentOpenAiCredentialError::InvalidApplicationDirectory),
