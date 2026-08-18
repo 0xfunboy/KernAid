@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import os
+import re
 import shutil
 import stat
 import struct
@@ -10,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -70,6 +72,17 @@ def write_finalized_fixture(path: Path) -> None:
 def executable(path: Path, source: str) -> None:
     path.write_text(textwrap.dedent(source).lstrip(), encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
+
+
+def shell_function(source: str, name: str) -> str:
+    match = re.search(
+        rf"^{re.escape(name)}\(\) \{{\n(?P<body>.*?)^\}}$",
+        source,
+        re.MULTILINE | re.DOTALL,
+    )
+    if match is None:
+        raise AssertionError(f"shell function is missing: {name}")
+    return match.group("body")
 
 
 class MockToolchain:
@@ -328,11 +341,29 @@ class MockToolchain:
         )
         self._tool(
             "qemu-system-x86_64",
-            """
+            r"""
             #!/usr/bin/env bash
+            printf '%s\n' "$$" >"$KERNAID_MOCK_STATE_DIR/qemu-pid"
+            if [[ "${KERNAID_MOCK_QEMU_IGNORE_TERM:-0}" == "1" ]]; then
+              exec /usr/bin/python3 -c '
+import os
+import signal
+import time
+
+state = os.environ["KERNAID_MOCK_STATE_DIR"]
+
+def observe_term(_signal, _frame):
+    open(os.path.join(state, "qemu-term-observed"), "ab").close()
+
+signal.signal(signal.SIGTERM, observe_term)
+print("KERNAID_RESCUE_READY", flush=True)
+print("KERNAID_RESCUE_TARGET_SELECTION_READY", flush=True)
+time.sleep(30)
+'
+            fi
             printf 'KERNAID_RESCUE_READY\n'
             printf 'KERNAID_RESCUE_TARGET_SELECTION_READY\n'
-            /usr/bin/sleep 30
+            exec /usr/bin/sleep 30
             """,
         )
 
@@ -383,6 +414,62 @@ class MockToolchain:
 
 
 class QemuUsbVaultSmokeTests(unittest.TestCase):
+    def test_qemu_cleanup_is_identity_bound_and_fully_bounded(self) -> None:
+        shell = SCRIPT.read_text(encoding="utf-8")
+
+        for name, expected in (
+            ("qemu_term_grace_seconds", 5),
+            ("qemu_kill_grace_seconds", 5),
+        ):
+            match = re.search(
+                rf"^readonly {name}=([0-9]+)$", shell, re.MULTILINE
+            )
+            self.assertIsNotNone(match)
+            assert match is not None
+            self.assertEqual(int(match.group(1)), expected)
+
+        identity = shell_function(shell, "read_qemu_process_state_and_identity")
+        capture = shell_function(
+            shell, "capture_qemu_process_identity_bounded"
+        )
+        abort_unidentified = shell_function(
+            shell, "abort_unidentified_qemu_bounded"
+        )
+        signal_bound = shell_function(shell, "signal_qemu_identity_bound")
+        status = shell_function(shell, "qemu_process_status")
+        reap = shell_function(shell, "reap_stopped_qemu")
+        terminate = shell_function(shell, "terminate_qemu_bounded")
+        cleanup = shell_function(shell, "cleanup")
+        stop = shell_function(shell, "stop_qemu")
+        boot = shell_function(shell, "run_boot")
+
+        self.assertIn('"/proc/$pid/stat"', identity)
+        self.assertIn('process_fields[19]', identity)
+        self.assertIn("capture_qemu_process_identity_bounded", boot)
+        self.assertIn("coproc QEMU_PROCESS", boot)
+        self.assertIn("abort_unidentified_qemu_bounded", boot)
+        self.assertIn("close_qemu_start_gate", abort_unidentified)
+        self.assertIn("qemu_identity_capture_seconds", capture)
+        self.assertIn('identity-mismatch', status)
+        self.assertIn('[[ "$process_status" != "live" ]]', terminate)
+        self.assertIn("signal_qemu_identity_bound TERM", terminate)
+        self.assertIn("signal_qemu_identity_bound KILL", terminate)
+        self.assertIn("os.pidfd_open", signal_bound)
+        self.assertIn("signal.pidfd_send_signal", signal_bound)
+        self.assertNotIn('kill -TERM "$qemu_pid"', shell)
+        self.assertNotIn('kill -KILL "$qemu_pid"', shell)
+        self.assertIn("qemu_term_grace_seconds", terminate)
+        self.assertIn("qemu_kill_grace_seconds", terminate)
+        self.assertEqual(shell.count('wait "$qemu_pid"'), 2)
+        self.assertEqual(reap.count('wait "$qemu_pid"'), 1)
+        self.assertNotIn('kill "$qemu_pid"', shell)
+        self.assertIn("terminate_qemu_bounded", stop)
+        self.assertIn("terminate_qemu_bounded", cleanup)
+        self.assertIn("recover_qemu_start_gate_tracking", cleanup)
+        self.assertIn("termination was not confirmed", cleanup)
+        self.assertIn("qemu_cleanup_safe", cleanup)
+        self.assertIn("qemu_process_status", boot)
+
     def test_profile_helper_rejects_a_misbound_dm_slave(self) -> None:
         scan = mock.MagicMock()
         scan.__enter__.return_value = [SimpleNamespace(name="loop1")]
@@ -431,6 +518,7 @@ class QemuUsbVaultSmokeTests(unittest.TestCase):
         cleanup_close_failure: bool = False,
         profile_failure: str = "",
         initialize_failure: str = "none",
+        qemu_ignore_term: bool = False,
     ) -> tuple[
         subprocess.CompletedProcess[str],
         Path,
@@ -455,6 +543,9 @@ class QemuUsbVaultSmokeTests(unittest.TestCase):
                 "KERNAID_MOCK_CLOSE_FAIL": "1" if cleanup_close_failure else "0",
                 "KERNAID_MOCK_PROFILE_FAILURE": profile_failure,
                 "KERNAID_MOCK_INITIALIZE_FAILURE": initialize_failure,
+                "KERNAID_MOCK_QEMU_IGNORE_TERM": (
+                    "1" if qemu_ignore_term else "0"
+                ),
                 "KERNAID_USB_SMOKE_LOG": str(log),
             }
         )
@@ -468,6 +559,20 @@ class QemuUsbVaultSmokeTests(unittest.TestCase):
             timeout=30,
         )
         return result, iso, log, mocks.state, temporary
+
+    def test_term_ignoring_qemu_is_pidfd_killed_and_reaped_boundedly(self) -> None:
+        started = time.monotonic()
+        result, _iso, _log, state, temporary = self.run_smoke(
+            qemu_ignore_term=True
+        )
+        elapsed = time.monotonic() - started
+        self.addCleanup(temporary.cleanup)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertLess(elapsed, 20)
+        self.assertTrue((state / "qemu-term-observed").exists())
+        qemu_pid = int((state / "qemu-pid").read_text(encoding="utf-8"))
+        self.assertFalse(Path(f"/proc/{qemu_pid}").exists())
 
     def test_mocked_lifecycle_emits_catalog_v2_compatible_evidence(self) -> None:
         result, iso, log, state, temporary = self.run_smoke()

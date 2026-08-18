@@ -34,11 +34,32 @@ def named_step(job: str, name: str) -> str:
     return match.group(0)
 
 
+def readonly_integer(source: str, name: str) -> int:
+    match = re.search(
+        rf"^readonly {re.escape(name)}=([0-9]+)$", source, re.MULTILINE
+    )
+    if match is None:
+        raise AssertionError(f"missing exact readonly integer: {name}")
+    return int(match.group(1))
+
+
+def timeout_minutes(source: str, indentation: int) -> int:
+    match = re.search(
+        rf"^{' ' * indentation}timeout-minutes: ([0-9]+)$",
+        source,
+        re.MULTILINE,
+    )
+    if match is None:
+        raise AssertionError("workflow timeout is missing")
+    return int(match.group(1))
+
+
 class RescueLifecycleWorkflowTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.workflow = WORKFLOW.read_text(encoding="utf-8")
         cls.legacy = job_block(cls.workflow, "build-and-smoke-test")
+        cls.lifecycle_harness = LIFECYCLE_HARNESS.read_text(encoding="utf-8")
 
     def test_trigger_covers_report_schema_and_every_desk_workspace_dependency(self) -> None:
         required_paths = {
@@ -99,23 +120,36 @@ class RescueLifecycleWorkflowTests(unittest.TestCase):
         self.assertEqual(catalog_v2.count("--uefi-log"), 1)
 
     def test_bios_and_uefi_are_explicit_isolated_downstream_jobs(self) -> None:
+        boot_count = readonly_integer(self.lifecycle_harness, "boot_count")
+        probe_wrapper_seconds = readonly_integer(
+            self.lifecycle_harness, "probe_wrapper_timeout_seconds"
+        )
+        qemu_wrapper_seconds = readonly_integer(
+            self.lifecycle_harness, "qemu_wrapper_timeout_seconds"
+        )
+        bounded_harness_seconds = (
+            2 * probe_wrapper_seconds + boot_count * qemu_wrapper_seconds
+        )
         for firmware in ("bios", "uefi"):
             with self.subTest(firmware=firmware):
                 job = job_block(self.workflow, f"vault-lifecycle-{firmware}")
                 self.assertIn("needs: build-and-smoke-test", job)
                 self.assertIn("runs-on: ubuntu-24.04", job)
-                self.assertRegex(
-                    job, re.compile(r"^    timeout-minutes: 90$", re.MULTILINE)
-                )
+                job_timeout_seconds = timeout_minutes(job, 4) * 60
                 self.assertNotIn("matrix:", job)
                 self.assertNotIn("strategy:", job)
 
                 run_step = named_step(
                     job, f"QEMU {firmware.upper()} two-boot vault lifecycle test"
                 )
-                self.assertRegex(
-                    run_step,
-                    re.compile(r"^        timeout-minutes: 80$", re.MULTILINE),
+                step_timeout_seconds = timeout_minutes(run_step, 8) * 60
+                self.assertGreaterEqual(
+                    step_timeout_seconds - bounded_harness_seconds,
+                    1060,
+                )
+                self.assertGreaterEqual(
+                    job_timeout_seconds - step_timeout_seconds,
+                    10 * 60,
                 )
                 self.assertEqual(
                     run_step.count("qemu-vault-lifecycle-smoke.sh"), 1

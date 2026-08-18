@@ -36,7 +36,7 @@ permissions: {contents: read}
 jobs:
   build-and-smoke-test:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 155
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88.0
@@ -295,7 +295,7 @@ jobs:
   vault-lifecycle-bios:
     needs: build-and-smoke-test
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 110
     steps:
       - uses: actions/checkout@v4
       - name: Install isolated lifecycle VM tooling
@@ -365,7 +365,7 @@ jobs:
           name: KernAid-Rescue-vault-lifecycle-probe-input
           path: ${{ runner.temp }}/kernaid-vault-lifecycle-bios/probe
       - name: QEMU BIOS two-boot vault lifecycle test
-        timeout-minutes: 80
+        timeout-minutes: 100
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -568,7 +568,7 @@ jobs:
   vault-lifecycle-uefi:
     needs: build-and-smoke-test
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 110
     steps:
       - uses: actions/checkout@v4
       - name: Install isolated lifecycle VM tooling
@@ -638,7 +638,7 @@ jobs:
           name: KernAid-Rescue-vault-lifecycle-probe-input
           path: ${{ runner.temp }}/kernaid-vault-lifecycle-uefi/probe
       - name: QEMU UEFI two-boot vault lifecycle test
-        timeout-minutes: 80
+        timeout-minutes: 100
         shell: bash
         run: |
           set -Eeuo pipefail

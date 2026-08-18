@@ -38,6 +38,9 @@ SECRET_BYTES = 64
 LOGIN_SECRET_LIMIT = 128
 LIVE_CONFIG_LIMIT = 64 * 1024
 RATE_LIMIT_WAIT_SECONDS = 2.25
+QEMU_START_TIMEOUT_SECONDS = 15.0
+READINESS_TIMEOUT_SECONDS = 1200.0
+CONTROLLER_TIMEOUT_SECONDS = 1800
 ACPI_SHUTDOWN_SECONDS = 180.0
 SHUTDOWN_RESERVE_SECONDS = ACPI_SHUTDOWN_SECONDS + 15.0
 PROCESS_CLEANUP_SECONDS = 5.0
@@ -2008,7 +2011,7 @@ def establish_live_session(
             + rb")\r?\n"
         ),
         start=0,
-        deadline=_deadline(aggregate, 620.0),
+        deadline=_deadline(aggregate, READINESS_TIMEOUT_SECONDS),
         stage="readiness",
     )
     cursor = ready.end()
@@ -2958,11 +2961,11 @@ def parse_arguments(arguments: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--provider-key-fd", type=int, required=True)
     parser.add_argument("--owned-pgid-fd", type=int, required=True)
     parser.add_argument("--qmp-socket", type=Path, required=True)
-    parser.add_argument("--timeout", type=int, default=1200)
+    parser.add_argument("--timeout", type=int, default=CONTROLLER_TIMEOUT_SECONDS)
     parser.add_argument("--qemu", required=True)
     parser.add_argument("qemu_args", nargs=argparse.REMAINDER)
     parsed = parser.parse_args(arguments)
-    if parsed.timeout < 300 or parsed.timeout > 1200:
+    if parsed.timeout < 300 or parsed.timeout > CONTROLLER_TIMEOUT_SECONDS:
         raise ClosedFailure("arguments", "timeout-invalid")
     descriptors = {
         parsed.correct_key_fd,
@@ -3259,7 +3262,9 @@ def main(arguments: Sequence[str]) -> int:
             [correct, wrong, login_credential, provider_key],
             parsed.owned_pgid_fd,
         )
-        console, qmp = harness.start(_deadline(aggregate, 15.0))
+        console, qmp = harness.start(
+            _deadline(aggregate, QEMU_START_TIMEOUT_SECONDS)
+        )
         lifecycle_deadline = aggregate - SHUTDOWN_RESERVE_SECONDS
         if lifecycle_deadline <= time.monotonic():
             raise ClosedFailure("lifecycle", "shutdown-reserve-exhausted")

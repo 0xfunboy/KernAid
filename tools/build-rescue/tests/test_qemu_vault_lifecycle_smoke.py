@@ -24,8 +24,14 @@ from unittest import mock
 
 
 TOOLS_DIR = Path(__file__).resolve().parents[1]
+REPO_DIR = Path(__file__).resolve().parents[3]
 CONTROLLER = TOOLS_DIR / "qemu-vault-lifecycle-pty.py"
 SCRIPT = TOOLS_DIR / "qemu-vault-lifecycle-smoke.sh"
+VAULT_SERVICE = (
+    REPO_DIR
+    / "rescue/live-build/config/includes.chroot/etc/systemd/system"
+    / "kernaid-rescue-vaultd.service"
+)
 
 
 def load_controller() -> object:
@@ -2202,6 +2208,82 @@ class LoopDetachTests(unittest.TestCase):
 
 class StaticContractTests(unittest.TestCase):
 
+    def test_readiness_controller_and_wrapper_deadlines_are_strictly_nested(
+        self,
+    ) -> None:
+        shell = SCRIPT.read_text(encoding="utf-8")
+        unit = VAULT_SERVICE.read_text(encoding="utf-8")
+
+        def readonly_integer(name: str) -> int:
+            match = re.search(
+                rf"^readonly {re.escape(name)}=([0-9]+)$",
+                shell,
+                re.MULTILINE,
+            )
+            if match is None:
+                raise AssertionError(f"missing exact readonly integer: {name}")
+            return int(match.group(1))
+
+        vault_match = re.search(
+            r"^TimeoutStartSec=([0-9]+)s$", unit, re.MULTILINE
+        )
+        self.assertIsNotNone(vault_match)
+        assert vault_match is not None
+        vault_start_seconds = int(vault_match.group(1))
+        probe_controller_seconds = readonly_integer(
+            "probe_controller_timeout_seconds"
+        )
+        probe_wrapper_seconds = readonly_integer("probe_wrapper_timeout_seconds")
+        qemu_controller_seconds = readonly_integer(
+            "qemu_controller_timeout_seconds"
+        )
+        qemu_wrapper_seconds = readonly_integer("qemu_wrapper_timeout_seconds")
+
+        self.assertEqual(vault_start_seconds, 620)
+        self.assertGreaterEqual(
+            controller.READINESS_TIMEOUT_SECONDS,
+            180 + vault_start_seconds + 370 + 30,
+        )
+        self.assertGreaterEqual(
+            qemu_controller_seconds,
+            controller.QEMU_START_TIMEOUT_SECONDS
+            + controller.READINESS_TIMEOUT_SECONDS
+            + 370
+            + controller.SHUTDOWN_RESERVE_SECONDS,
+        )
+        self.assertEqual(
+            qemu_controller_seconds, controller.CONTROLLER_TIMEOUT_SECONDS
+        )
+        self.assertGreaterEqual(qemu_wrapper_seconds, qemu_controller_seconds + 30)
+        self.assertEqual(
+            probe_controller_seconds, int(controller.PROBE_TIMEOUT_SECONDS)
+        )
+        self.assertGreaterEqual(probe_wrapper_seconds, probe_controller_seconds + 20)
+        self.assertIn(
+            '--timeout "$qemu_controller_timeout_seconds"', shell
+        )
+        self.assertIn(
+            '--timeout "$probe_controller_timeout_seconds"', shell
+        )
+        for anchor, deadline in (
+            (
+                'python3 -I -B "$controller" --run-bounded-probe',
+                'controller_deadline=$((SECONDS + probe_wrapper_timeout_seconds))',
+            ),
+            (
+                '--timeout "$qemu_controller_timeout_seconds" --qemu',
+                'controller_deadline=$((SECONDS + qemu_wrapper_timeout_seconds))',
+            ),
+        ):
+            spawn = shell.index(anchor)
+            pid_capture = shell.index("controller_pid=$!", spawn)
+            deadline_capture = shell.index(deadline, pid_capture)
+            publication_wait = shell.index(
+                "await_owned_group_publication", deadline_capture
+            )
+            self.assertLess(pid_capture, deadline_capture)
+            self.assertLess(deadline_capture, publication_wait)
+
     def test_provider_guest_proofs_are_closed_bounded_and_role_separated(self) -> None:
         normal = controller._socket_probe_source(
             "normal-release",
@@ -2335,7 +2417,7 @@ class StaticContractTests(unittest.TestCase):
         self.assertIn("--clear-owned-loop", shell)
         self.assertIn('6<"$loop_device" 7<"$expected_backing"', shell)
         self.assertNotIn("losetup -d --", shell)
-        self.assertIn("--timeout 1200", shell)
+        self.assertIn('--timeout "$qemu_controller_timeout_seconds"', shell)
         self.assertEqual(shell.count("    -nic none\n"), 1)
         self.assertIn("production_ui_provider_relay_path=true", shell)
         self.assertIn('kill -s "$signal_name" "$controller_pid"', shell)

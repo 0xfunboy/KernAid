@@ -16,6 +16,10 @@ readonly media_bytes=32000000000
 readonly p3_start_bytes=17179869184
 readonly p3_bytes=8589934592
 readonly boot_count=2
+readonly probe_controller_timeout_seconds=620
+readonly probe_wrapper_timeout_seconds=640
+readonly qemu_controller_timeout_seconds=1800
+readonly qemu_wrapper_timeout_seconds=1830
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 firmware="${1:-bios}"
@@ -553,9 +557,11 @@ run_host_probe() {
     --probe "$probe_binary" --device "$vault_loop" \
     --mapper "$manager_mapper" --mode "$mode" \
     --correct-key-fd 3 --wrong-key-fd 4 --owned-pgid-fd 6 \
-    --timeout 620 3<"$correct_key" 4<"$wrong_key" \
+    --timeout "$probe_controller_timeout_seconds" \
+    3<"$correct_key" 4<"$wrong_key" \
     6>"$probe_pgid_file" >"$probe_output" 2>"$probe_error" &
   controller_pid=$!
+  controller_deadline=$((SECONDS + probe_wrapper_timeout_seconds))
   if await_owned_group_publication; then
     publication_status=0
   else
@@ -567,7 +573,6 @@ run_host_probe() {
     fail "$stage" probe-pgid-invalid
   fi
 
-  controller_deadline=$((SECONDS + 640))
   controller_timed_out=0
   while kill -0 "$controller_pid" 2>/dev/null; do
     if ((SECONDS >= controller_deadline)); then
@@ -857,11 +862,12 @@ for ((boot = 1; boot <= boot_count; boot++)); do
     --correct-key-fd 3 --wrong-key-fd 4 \
     --login-credential-fd 5 --provider-key-fd 7 \
     --owned-pgid-fd 6 --qmp-socket "$qmp_socket" \
-    --timeout 1200 --qemu "$qemu_binary" -- \
+    --timeout "$qemu_controller_timeout_seconds" --qemu "$qemu_binary" -- \
     "${qemu_args[@]}" 3<"$correct_key" 4<"$wrong_key" \
     5<"$login_credential" 6>"$qemu_pgid_file" 7<"$provider_key" \
     >"$boot_output" 2>"$boot_error" &
   controller_pid=$!
+  controller_deadline=$((SECONDS + qemu_wrapper_timeout_seconds))
   if await_owned_group_publication; then
     publication_status=0
   else
@@ -872,7 +878,6 @@ for ((boot = 1; boot <= boot_count; boot++)); do
     clear_owned_group_tracking || true
     fail controller pgid-invalid
   fi
-  controller_deadline=$((SECONDS + 1230))
   controller_timed_out=0
   while kill -0 "$controller_pid" 2>/dev/null; do
     if ((SECONDS >= controller_deadline)); then

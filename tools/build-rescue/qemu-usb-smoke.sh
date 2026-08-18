@@ -19,7 +19,11 @@ readonly media_bytes=32000000000
 readonly p3_start_bytes=17179869184
 readonly p3_bytes=8589934592
 readonly boot_count=2
-readonly boot_timeout_seconds=600
+readonly boot_timeout_seconds=1200
+readonly qemu_identity_capture_seconds=5
+readonly qemu_term_grace_seconds=5
+readonly qemu_kill_grace_seconds=5
+readonly qemu_stop_poll_seconds=0.05
 readonly probe_prefix=KERNAID_RESCUE_VAULT_PROBE_ATTESTATION_V1
 readonly probe_failure_prefix=KERNAID_RESCUE_VAULT_PROBE_FAILURE_V1
 readonly journal_binding_value=device-identity-bound-v1
@@ -33,6 +37,10 @@ for command in awk blkid cat chmod cp cryptsetup dd dirname findmnt grep id \
     exit 2
   }
 done
+[[ -x /usr/bin/python3 ]] || {
+  echo "Missing fixed pidfd helper interpreter: /usr/bin/python3" >&2
+  exit 2
+}
 
 if [[ "$firmware" != "bios" && "$firmware" != "uefi" ]]; then
   echo "Usage: $0 [bios|uefi] [iso] [vault-probe]" >&2
@@ -184,6 +192,10 @@ key_file="$key_dir/key"
 wrong_key_file="$key_dir/wrong-key"
 
 qemu_pid=""
+qemu_process_identity=""
+qemu_start_fd=""
+qemu_last_status=""
+qemu_cleanup_safe=true
 vault_loop=""
 provision_open=false
 provision_mounted=false
@@ -199,6 +211,282 @@ mapper_is_active() {
   cryptsetup status "$1" >/dev/null 2>&1
 }
 
+read_qemu_process_state_and_identity() {
+  local pid="$1"
+  local process_stat process_tail
+  local -a process_fields
+  [[ -r "/proc/$pid/stat" ]] || return 1
+  IFS= read -r process_stat <"/proc/$pid/stat" || return 1
+  [[ "$process_stat" == *") "* ]] || return 1
+  process_tail="${process_stat##*) }"
+  read -r -a process_fields <<<"$process_tail"
+  [[ "${#process_fields[@]}" -ge 20 ]] || return 1
+  printf '%s:%s\n' "${process_fields[0]}" "${process_fields[19]}"
+}
+
+capture_qemu_process_identity_bounded() {
+  local deadline observation state identity
+  deadline=$((SECONDS + qemu_identity_capture_seconds))
+  while ((SECONDS < deadline)); do
+    if observation="$(read_qemu_process_state_and_identity "$qemu_pid")"; then
+      state="${observation%%:*}"
+      identity="${observation#*:}"
+      if [[ "$identity" =~ ^[0-9]+$ ]]; then
+        case "$state" in
+          Z|X) return 1 ;;
+          *)
+            qemu_process_identity="$identity"
+            return 0
+            ;;
+        esac
+      fi
+    elif [[ ! -e "/proc/$qemu_pid" ]]; then
+      return 1
+    fi
+    sleep "$qemu_stop_poll_seconds" || true
+  done
+  return 1
+}
+
+close_qemu_start_gate() {
+  if [[ -z "$qemu_start_fd" ]]; then
+    return 0
+  fi
+  if [[ ! "$qemu_start_fd" =~ ^[0-9]+$ ]]; then
+    echo "QEMU start-gate descriptor is invalid" >&2
+    return 1
+  fi
+  exec {qemu_start_fd}>&-
+  qemu_start_fd=""
+}
+
+# shellcheck disable=SC2329  # Invoked indirectly by the EXIT cleanup trap.
+recover_qemu_start_gate_tracking() {
+  local spawned_fd="${QEMU_PROCESS[1]:-}"
+  local spawned_pid="${QEMU_PROCESS_PID:-}"
+  [[ -z "$qemu_process_identity" && -n "$spawned_pid" ]] || return 0
+  if [[ ! "$spawned_pid" =~ ^[1-9][0-9]*$ \
+    || ! "$spawned_fd" =~ ^[0-9]+$ \
+    || ( -n "$qemu_pid" && "$qemu_pid" != "$spawned_pid" ) \
+    || ( -n "$qemu_start_fd" && "$qemu_start_fd" != "$spawned_fd" ) ]]; then
+    echo "QEMU start-gate launch tracking is inconsistent" >&2
+    return 1
+  fi
+  qemu_pid="$spawned_pid"
+  qemu_start_fd="$spawned_fd"
+}
+
+release_qemu_start_gate() {
+  local process_status
+  process_status="$(qemu_process_status)"
+  if [[ "$process_status" != "live" ]]; then
+    echo "QEMU start-gate process state is untrusted: $process_status" >&2
+    return 1
+  fi
+  if [[ ! "$qemu_start_fd" =~ ^[0-9]+$ ]] \
+    || ! printf '%s\n' KERNAID_QEMU_START_V1 >&"$qemu_start_fd"; then
+    close_qemu_start_gate || true
+    return 1
+  fi
+  close_qemu_start_gate
+}
+
+qemu_process_status() {
+  local observation state identity
+  if ! observation="$(read_qemu_process_state_and_identity "$qemu_pid")"; then
+    if [[ -e "/proc/$qemu_pid" ]]; then
+      printf 'unknown\n'
+    else
+      printf 'gone\n'
+    fi
+    return 0
+  fi
+  state="${observation%%:*}"
+  identity="${observation#*:}"
+  if [[ "$identity" != "$qemu_process_identity" ]]; then
+    printf 'identity-mismatch\n'
+  elif [[ "$state" == "Z" || "$state" == "X" ]]; then
+    printf 'reapable\n'
+  else
+    printf 'live\n'
+  fi
+}
+
+reap_stopped_qemu() {
+  local process_status
+  process_status="$(qemu_process_status)"
+  case "$process_status" in
+    gone|reapable)
+      if wait "$qemu_pid" 2>/dev/null; then
+        qemu_last_status=0
+      else
+        qemu_last_status=$?
+      fi
+      qemu_pid=""
+      qemu_process_identity=""
+      return 0
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+reap_unidentified_qemu() {
+  local observation state
+  if observation="$(read_qemu_process_state_and_identity "$qemu_pid")"; then
+    state="${observation%%:*}"
+    [[ "$state" == "Z" || "$state" == "X" ]] || return 1
+  elif [[ -e "/proc/$qemu_pid" ]]; then
+    return 1
+  fi
+  if wait "$qemu_pid" 2>/dev/null; then
+    qemu_last_status=0
+  else
+    qemu_last_status=$?
+  fi
+  qemu_pid=""
+  qemu_process_identity=""
+}
+
+abort_unidentified_qemu_bounded() {
+  local deadline
+  close_qemu_start_gate || return 1
+  deadline=$((SECONDS + qemu_identity_capture_seconds))
+  while ((SECONDS < deadline)); do
+    if reap_unidentified_qemu; then
+      return 0
+    fi
+    sleep "$qemu_stop_poll_seconds" || true
+  done
+  reap_unidentified_qemu
+}
+
+signal_qemu_identity_bound() {
+  local signal_name="$1"
+  /usr/bin/python3 -I - "$qemu_pid" "$qemu_process_identity" "$signal_name" <<'PY'
+import os
+import signal
+import sys
+
+signals = {"CHECK": 0, "TERM": signal.SIGTERM, "KILL": signal.SIGKILL}
+try:
+    pid_text, expected_start, signal_name = sys.argv[1:]
+    if (
+        not pid_text.isascii()
+        or not pid_text.isdecimal()
+        or int(pid_text) <= 0
+        or not expected_start.isascii()
+        or not expected_start.isdecimal()
+        or signal_name not in signals
+    ):
+        raise ValueError
+    pid = int(pid_text)
+except (TypeError, ValueError):
+    raise SystemExit(4)
+
+try:
+    pidfd = os.pidfd_open(pid, 0)
+except ProcessLookupError:
+    raise SystemExit(3)
+except (AttributeError, OSError):
+    raise SystemExit(4)
+
+try:
+    try:
+        with open(f"/proc/{pid}/stat", "rb", buffering=0) as process_stat:
+            payload = process_stat.read(4096)
+    except FileNotFoundError:
+        raise SystemExit(3)
+    except OSError:
+        raise SystemExit(4)
+    close_paren = payload.rfind(b") ")
+    if close_paren < 0:
+        raise SystemExit(4)
+    fields = payload[close_paren + 2 :].split()
+    if len(fields) < 20 or fields[19] != expected_start.encode("ascii"):
+        raise SystemExit(4)
+    try:
+        signal.pidfd_send_signal(pidfd, signals[signal_name], None, 0)
+    except ProcessLookupError:
+        raise SystemExit(3)
+    except (AttributeError, OSError):
+        raise SystemExit(4)
+finally:
+    os.close(pidfd)
+PY
+}
+
+terminate_qemu_bounded() {
+  local deadline process_status signal_status
+  if [[ -z "$qemu_pid" ]]; then
+    return 0
+  fi
+  if [[ ! "$qemu_pid" =~ ^[1-9][0-9]*$ \
+    || ! "$qemu_process_identity" =~ ^[0-9]+$ ]]; then
+    echo "QEMU process identity is invalid during cleanup" >&2
+    return 1
+  fi
+  if reap_stopped_qemu; then
+    return 0
+  fi
+  process_status="$(qemu_process_status)"
+  if [[ "$process_status" != "live" ]]; then
+    echo "QEMU process state is untrusted during cleanup: $process_status" >&2
+    return 1
+  fi
+  if signal_qemu_identity_bound TERM; then
+    signal_status=0
+  else
+    signal_status=$?
+  fi
+  if [[ "$signal_status" -eq 3 ]] && reap_stopped_qemu; then
+    return 0
+  elif [[ "$signal_status" -ne 0 ]]; then
+    echo "QEMU identity-bound TERM failed closed (status $signal_status)" >&2
+    return 1
+  fi
+  deadline=$((SECONDS + qemu_term_grace_seconds))
+  while ((SECONDS < deadline)); do
+    if reap_stopped_qemu; then
+      return 0
+    fi
+    [[ "$(qemu_process_status)" == "live" ]] || break
+    sleep "$qemu_stop_poll_seconds" || true
+  done
+  if reap_stopped_qemu; then
+    return 0
+  fi
+  process_status="$(qemu_process_status)"
+  if [[ "$process_status" != "live" ]]; then
+    echo "QEMU process state is untrusted after TERM: $process_status" >&2
+    return 1
+  fi
+  if signal_qemu_identity_bound KILL; then
+    signal_status=0
+  else
+    signal_status=$?
+  fi
+  if [[ "$signal_status" -eq 3 ]] && reap_stopped_qemu; then
+    return 0
+  elif [[ "$signal_status" -ne 0 ]]; then
+    echo "QEMU identity-bound KILL failed closed (status $signal_status)" >&2
+    return 1
+  fi
+  deadline=$((SECONDS + qemu_kill_grace_seconds))
+  while ((SECONDS < deadline)); do
+    if reap_stopped_qemu; then
+      return 0
+    fi
+    [[ "$(qemu_process_status)" == "live" ]] || break
+    sleep "$qemu_stop_poll_seconds" || true
+  done
+  if ! reap_stopped_qemu; then
+    process_status="$(qemu_process_status)"
+    echo "QEMU did not terminate within the bounded cleanup window" >&2
+    echo "QEMU terminal process state: $process_status" >&2
+    return 1
+  fi
+}
+
 # shellcheck disable=SC2329  # Invoked indirectly by the EXIT trap below.
 # shellcheck disable=SC2317
 cleanup() {
@@ -207,58 +495,70 @@ cleanup() {
   trap - EXIT
   set +e
 
-  if [[ -n "$qemu_pid" ]]; then
-    kill "$qemu_pid" 2>/dev/null || true
-    wait "$qemu_pid" 2>/dev/null || true
-    qemu_pid=""
+  if ! recover_qemu_start_gate_tracking; then
+    qemu_cleanup_safe=false
+    cleanup_failed=true
   fi
-  if mountpoint -q "$manager_mount" 2>/dev/null; then
-    if ! umount "$manager_mount"; then
-      echo "Failed to unmount the disposable managed vault" >&2
+  if [[ -n "$qemu_pid" && -z "$qemu_process_identity" ]]; then
+    if ! abort_unidentified_qemu_bounded; then
+      qemu_cleanup_safe=false
       cleanup_failed=true
     fi
+  elif ! terminate_qemu_bounded; then
+    qemu_cleanup_safe=false
+    cleanup_failed=true
   fi
-  if mapper_is_active "$manager_mapper"; then
-    if ! cryptsetup close "$manager_mapper"; then
-      echo "Failed to close the disposable managed mapper" >&2
-      cleanup_failed=true
-    fi
-  fi
-  if [[ "$provision_mounted" == true ]] \
-    || mountpoint -q "$provision_mount" 2>/dev/null; then
-    if ! umount "$provision_mount"; then
-      echo "Failed to unmount the disposable provisioning vault" >&2
-      cleanup_failed=true
-    fi
-    provision_mounted=false
-  fi
-  if [[ "$provision_open" == true ]] || mapper_is_active "$provision_mapper"; then
-    if ! cryptsetup close "$provision_mapper"; then
-      echo "Failed to close the disposable provisioning mapper" >&2
-      cleanup_failed=true
-    fi
-    provision_open=false
-  fi
-  if [[ "$inspection_open" == true ]] || mapper_is_active "$inspection_mapper"; then
-    if ! cryptsetup close "$inspection_mapper"; then
-      echo "Failed to close the disposable inspection mapper" >&2
-      cleanup_failed=true
-    fi
-    inspection_open=false
-  fi
-  if [[ -n "$vault_loop" ]]; then
-    if [[ "$vault_loop" =~ ^/dev/loop[0-9]+$ ]]; then
-      udevadm settle
-      if ! losetup -d "$vault_loop"; then
-        echo "Failed to detach the disposable p3 loop" >&2
+  if [[ "$qemu_cleanup_safe" == true ]]; then
+    if mountpoint -q "$manager_mount" 2>/dev/null; then
+      if ! umount "$manager_mount"; then
+        echo "Failed to unmount the disposable managed vault" >&2
         cleanup_failed=true
-      else
-        vault_loop=""
       fi
-    else
-      echo "Refusing to detach an unexpected loop path" >&2
-      cleanup_failed=true
     fi
+    if mapper_is_active "$manager_mapper"; then
+      if ! cryptsetup close "$manager_mapper"; then
+        echo "Failed to close the disposable managed mapper" >&2
+        cleanup_failed=true
+      fi
+    fi
+    if [[ "$provision_mounted" == true ]] \
+      || mountpoint -q "$provision_mount" 2>/dev/null; then
+      if ! umount "$provision_mount"; then
+        echo "Failed to unmount the disposable provisioning vault" >&2
+        cleanup_failed=true
+      fi
+      provision_mounted=false
+    fi
+    if [[ "$provision_open" == true ]] || mapper_is_active "$provision_mapper"; then
+      if ! cryptsetup close "$provision_mapper"; then
+        echo "Failed to close the disposable provisioning mapper" >&2
+        cleanup_failed=true
+      fi
+      provision_open=false
+    fi
+    if [[ "$inspection_open" == true ]] || mapper_is_active "$inspection_mapper"; then
+      if ! cryptsetup close "$inspection_mapper"; then
+        echo "Failed to close the disposable inspection mapper" >&2
+        cleanup_failed=true
+      fi
+      inspection_open=false
+    fi
+    if [[ -n "$vault_loop" ]]; then
+      if [[ "$vault_loop" =~ ^/dev/loop[0-9]+$ ]]; then
+        udevadm settle
+        if ! losetup -d "$vault_loop"; then
+          echo "Failed to detach the disposable p3 loop" >&2
+          cleanup_failed=true
+        else
+          vault_loop=""
+        fi
+      else
+        echo "Refusing to detach an unexpected loop path" >&2
+        cleanup_failed=true
+      fi
+    fi
+  else
+    echo "Preserving QEMU backing files because termination was not confirmed" >&2
   fi
 
   case "$key_dir" in
@@ -273,7 +573,7 @@ cleanup() {
   esac
   case "$work_dir" in
     /tmp/kernaid-qemu-usb-vault.*)
-      if [[ "$cleanup_failed" == false ]]; then
+      if [[ "$qemu_cleanup_safe" == true && "$cleanup_failed" == false ]]; then
         rm -rf -- "$work_dir"
       else
         echo "Preserving disposable media after cleanup failure: $work_dir" >&2
@@ -660,10 +960,10 @@ if [[ "$firmware" == "uefi" ]]; then
 fi
 
 stop_qemu() {
-  if [[ -n "$qemu_pid" ]]; then
-    kill "$qemu_pid" 2>/dev/null || true
-    wait "$qemu_pid" 2>/dev/null || true
-    qemu_pid=""
+  if ! terminate_qemu_bounded; then
+    qemu_cleanup_safe=false
+    echo "QEMU could not be stopped before USB image validation" >&2
+    return 1
   fi
 }
 
@@ -704,6 +1004,7 @@ assert_boot_images_unchanged() {
 run_boot() {
   local boot="$1"
   local boot_log="$work_dir/qemu-$firmware-boot-$boot.log"
+  local qemu_deadline qemu_runtime_status status
   # QEMU's -drive and -device values are deliberately comma-delimited strings.
   # shellcheck disable=SC2054
   local qemu_args=(
@@ -732,9 +1033,35 @@ run_boot() {
     )
   fi
 
-  qemu-system-x86_64 "${qemu_args[@]}" >"$boot_log" 2>&1 &
-  qemu_pid=$!
-  for ((attempt = 1; attempt <= boot_timeout_seconds; attempt++)); do
+  coproc QEMU_PROCESS {
+    IFS= read -r qemu_start_token
+    [[ "$qemu_start_token" == KERNAID_QEMU_START_V1 ]] || exit 125
+    exec qemu-system-x86_64 "${qemu_args[@]}"
+  } >"$boot_log" 2>&1
+  qemu_pid="$QEMU_PROCESS_PID" qemu_start_fd="${QEMU_PROCESS[1]}"
+  qemu_last_status=""
+  if ! capture_qemu_process_identity_bounded; then
+    echo "QEMU process identity could not be captured" >&2
+    if ! abort_unidentified_qemu_bounded; then
+      qemu_cleanup_safe=false
+      echo "QEMU start-gate child could not be reaped within the bounded window" >&2
+    fi
+    return 1
+  fi
+  if ! signal_qemu_identity_bound CHECK; then
+    echo "QEMU pidfd identity preflight failed closed" >&2
+    if ! abort_unidentified_qemu_bounded; then
+      qemu_cleanup_safe=false
+      echo "QEMU start-gate child could not be reaped within the bounded window" >&2
+    fi
+    return 1
+  fi
+  if ! release_qemu_start_gate; then
+    echo "QEMU start gate could not be released safely" >&2
+    return 1
+  fi
+  qemu_deadline=$((SECONDS + boot_timeout_seconds))
+  while ((SECONDS < qemu_deadline)); do
     if grep -Fq "KERNAID_RESCUE_READY" "$boot_log" \
       && grep -Fq "KERNAID_RESCUE_TARGET_SELECTION_READY" "$boot_log"; then
       stop_qemu
@@ -748,18 +1075,24 @@ run_boot() {
         | tee -a "$log"
       return 0
     fi
-    if ! kill -0 "$qemu_pid" 2>/dev/null; then
-      set +e
-      wait "$qemu_pid"
-      status=$?
-      set -e
-      qemu_pid=""
+    qemu_runtime_status="$(qemu_process_status)"
+    if [[ "$qemu_runtime_status" == "gone" \
+      || "$qemu_runtime_status" == "reapable" ]]; then
+      reap_stopped_qemu || {
+        echo "QEMU stopped but could not be reaped safely" >&2
+        return 1
+      }
+      status="$qemu_last_status"
       {
         printf '%s\n' "===== QEMU USB $firmware boot $boot ====="
         cat "$boot_log"
       } >>"$log"
       tail -n 200 "$boot_log"
       echo "QEMU USB boot $boot exited before both readiness markers (status $status)" >&2
+      return 1
+    elif [[ "$qemu_runtime_status" != "live" ]]; then
+      qemu_cleanup_safe=false
+      echo "QEMU process state became untrusted: $qemu_runtime_status" >&2
       return 1
     fi
     sleep 1

@@ -16,11 +16,250 @@ REPO_DIR = Path(__file__).resolve().parents[3]
 SCRIPT = TOOLS_DIR / "qemu-smoke.sh"
 USB_SCRIPT = TOOLS_DIR / "qemu-usb-smoke.sh"
 RESCUE_WORKFLOW = REPO_DIR / ".github/workflows/rescue.yml"
+VAULT_SERVICE = (
+    REPO_DIR
+    / "rescue/live-build/config/includes.chroot/etc/systemd/system"
+    / "kernaid-rescue-vaultd.service"
+)
+READY_CHECK = (
+    REPO_DIR
+    / "rescue/live-build/config/includes.chroot/usr/lib/kernaid/ready-check"
+)
 
 
 def executable(path: Path, source: str) -> None:
     path.write_text(textwrap.dedent(source).lstrip(), encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
+
+
+def shell_function(source: str, name: str) -> str:
+    match = re.search(
+        rf"^{re.escape(name)}\(\) \{{\n(?P<body>.*?)^\}}$",
+        source,
+        re.MULTILINE | re.DOTALL,
+    )
+    if match is None:
+        raise AssertionError(f"shell function is missing: {name}")
+    return match.group("body")
+
+
+class QemuProcessLifecycleTests(unittest.TestCase):
+    @staticmethod
+    def function_definition(source: str, name: str) -> str:
+        return f"{name}() {{\n{shell_function(source, name)}}}\n"
+
+    def test_capture_failure_closes_start_gate_and_reaps_for_both_harnesses(
+        self,
+    ) -> None:
+        for script in (SCRIPT, USB_SCRIPT):
+            with self.subTest(script=script.name):
+                source = script.read_text(encoding="utf-8")
+                definitions = "\n".join(
+                    self.function_definition(source, name)
+                    for name in (
+                        "capture_qemu_process_identity_bounded",
+                        "close_qemu_start_gate",
+                        "recover_qemu_start_gate_tracking",
+                        "reap_unidentified_qemu",
+                        "abort_unidentified_qemu_bounded",
+                    )
+                )
+                harness = f"""
+set -euo pipefail
+readonly qemu_identity_capture_seconds=1
+readonly qemu_stop_poll_seconds=0.01
+qemu_pid=""
+qemu_process_identity=""
+qemu_start_fd=""
+qemu_last_status=""
+{definitions}
+read_qemu_process_state_and_identity() {{ return 1; }}
+coproc QEMU_PROCESS {{ IFS= read -r ignored; exit 125; }}
+child_pid="$QEMU_PROCESS_PID"
+recover_qemu_start_gate_tracking
+[[ "$qemu_pid" == "$child_pid" ]]
+if capture_qemu_process_identity_bounded; then exit 91; fi
+abort_unidentified_qemu_bounded
+[[ -z "$qemu_pid" ]]
+[[ ! -e "/proc/$child_pid" ]]
+"""
+                result = subprocess.run(
+                    ["bash", "-c", harness],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_pidfd_signal_is_atomic_allowlisted_and_rejects_stale_identity(
+        self,
+    ) -> None:
+        for script in (SCRIPT, USB_SCRIPT):
+            with self.subTest(script=script.name):
+                source = script.read_text(encoding="utf-8")
+                signal_definition = self.function_definition(
+                    source, "signal_qemu_identity_bound"
+                )
+                signal_body = shell_function(source, "signal_qemu_identity_bound")
+                terminate_body = shell_function(source, "terminate_qemu_bounded")
+                self.assertIn("[[ -x /usr/bin/python3 ]]", source)
+                self.assertIn("/usr/bin/python3 -I -", signal_body)
+                self.assertLess(
+                    signal_body.index("os.pidfd_open"),
+                    signal_body.index('open(f"/proc/{pid}/stat"'),
+                )
+                self.assertLess(
+                    signal_body.index('open(f"/proc/{pid}/stat"'),
+                    signal_body.index("signal.pidfd_send_signal"),
+                )
+                self.assertEqual(
+                    terminate_body.count(
+                        '[[ "$signal_status" -eq 3 ]] && reap_stopped_qemu'
+                    ),
+                    2,
+                )
+                self.assertEqual(
+                    terminate_body.count('elif [[ "$signal_status" -ne 0 ]]'),
+                    2,
+                )
+
+                child = subprocess.Popen(["/usr/bin/sleep", "30"])
+                self.addCleanup(
+                    lambda process=child: (
+                        (process.kill(), process.wait())
+                        if process.poll() is None
+                        else process.wait()
+                    )
+                )
+                stat_fields = Path(f"/proc/{child.pid}/stat").read_text(
+                    encoding="ascii"
+                ).rsplit(") ", 1)[1].split()
+                identity = int(stat_fields[19])
+
+                for expected, signal_name in (
+                    (identity + 1, "TERM"),
+                    (identity, "USR1"),
+                ):
+                    harness = f"""
+set -euo pipefail
+qemu_pid={child.pid}
+qemu_process_identity={expected}
+{signal_definition}
+if signal_qemu_identity_bound {signal_name}; then
+  exit 91
+else
+  signal_status=$?
+fi
+[[ "$signal_status" -eq 4 ]]
+"""
+                    result = subprocess.run(
+                        ["bash", "-c", harness],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIsNone(child.poll())
+
+                harness = f"""
+set -euo pipefail
+qemu_pid={child.pid}
+qemu_process_identity={identity}
+{signal_definition}
+signal_qemu_identity_bound TERM
+"""
+                result = subprocess.run(
+                    ["bash", "-c", harness],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                child.wait(timeout=5)
+                self.assertFalse(Path(f"/proc/{child.pid}").exists())
+
+                harness = f"""
+set -euo pipefail
+qemu_pid={child.pid}
+qemu_process_identity={identity}
+{signal_definition}
+if signal_qemu_identity_bound TERM; then
+  exit 91
+else
+  signal_status=$?
+fi
+[[ "$signal_status" -eq 3 ]]
+"""
+                result = subprocess.run(
+                    ["bash", "-c", harness],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_pidfd_preflight_failure_never_releases_qemu_and_reaps_gate(
+        self,
+    ) -> None:
+        for script in (SCRIPT, USB_SCRIPT):
+            with self.subTest(script=script.name):
+                source = script.read_text(encoding="utf-8")
+                launch = source.index("coproc QEMU_PROCESS")
+                preflight = source.index(
+                    "if ! signal_qemu_identity_bound CHECK", launch
+                )
+                release = source.index("if ! release_qemu_start_gate", launch)
+                self.assertLess(preflight, release)
+                self.assertIn(
+                    "abort_unidentified_qemu_bounded",
+                    source[preflight:release],
+                )
+
+                definitions = "\n".join(
+                    self.function_definition(source, name)
+                    for name in (
+                        "read_qemu_process_state_and_identity",
+                        "close_qemu_start_gate",
+                        "reap_unidentified_qemu",
+                        "abort_unidentified_qemu_bounded",
+                    )
+                )
+                unavailable_signal = self.function_definition(
+                    source, "signal_qemu_identity_bound"
+                ).replace("/usr/bin/python3 -I -", "/usr/bin/false")
+                harness = f"""
+set -euo pipefail
+readonly qemu_identity_capture_seconds=1
+readonly qemu_stop_poll_seconds=0.01
+qemu_pid=""
+qemu_process_identity=""
+qemu_start_fd=""
+qemu_last_status=""
+{definitions}
+{unavailable_signal}
+coproc TEST_QEMU {{ IFS= read -r ignored; exit 125; }}
+qemu_pid="$TEST_QEMU_PID"
+qemu_start_fd="${{TEST_QEMU[1]}}"
+child_pid="$qemu_pid"
+observation="$(read_qemu_process_state_and_identity "$qemu_pid")"
+qemu_process_identity="${{observation#*:}}"
+if signal_qemu_identity_bound CHECK; then exit 91; fi
+abort_unidentified_qemu_bounded
+[[ -z "$qemu_pid" ]]
+[[ ! -e "/proc/$child_pid" ]]
+"""
+                result = subprocess.run(
+                    ["bash", "-c", harness],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
 
 
 class MockToolchain:
@@ -734,12 +973,65 @@ class QemuTimeoutBudgetTests(unittest.TestCase):
         classic = SCRIPT.read_text(encoding="utf-8")
         usb = USB_SCRIPT.read_text(encoding="utf-8")
         workflow = RESCUE_WORKFLOW.read_text(encoding="utf-8")
+        vault_service = VAULT_SERVICE.read_text(encoding="utf-8")
+        ready_check = READY_CHECK.read_text(encoding="utf-8")
 
         classic_timeout = self.readonly_integer(classic, "boot_timeout_seconds")
         usb_timeout = self.readonly_integer(usb, "boot_timeout_seconds")
         usb_boot_count = self.readonly_integer(usb, "boot_count")
+        classic_cleanup = self.readonly_integer(
+            classic, "qemu_term_grace_seconds"
+        ) + self.readonly_integer(classic, "qemu_kill_grace_seconds")
+        usb_cleanup = self.readonly_integer(
+            usb, "qemu_term_grace_seconds"
+        ) + self.readonly_integer(usb, "qemu_kill_grace_seconds")
+        classic_capture = self.readonly_integer(
+            classic, "qemu_identity_capture_seconds"
+        )
+        usb_capture = self.readonly_integer(
+            usb, "qemu_identity_capture_seconds"
+        )
+        vault_timeout_match = re.search(
+            r"^TimeoutStartSec=([0-9]+)s$", vault_service, re.MULTILINE
+        )
+        self.assertIsNotNone(vault_timeout_match)
+        assert vault_timeout_match is not None
+        vault_timeout = int(vault_timeout_match.group(1))
+
+        # These are the declared blocking portions of the longest, offline
+        # readiness branch. The remaining eight seconds of its 370-second
+        # allowance cover fixed local validation and marker publication.
+        self.assertIn('while [ "$attempt" -le 30 ]; do', ready_check)
+        self.assertEqual(
+            len(re.findall(r"--max-time 2(?:\s|$)", ready_check)), 1
+        )
+        self.assertEqual(ready_check.count("--max-time 10"), 1)
+        self.assertEqual(ready_check.count("--max-time 5 --retry 12"), 2)
+        self.assertEqual(ready_check.count("--retry-max-time 60"), 2)
+        self.assertEqual(ready_check.count("--max-time 22"), 6)
+        declared_ready_check_seconds = (
+            30 * (2 + 1) + 10 + 2 * (60 + 5) + 6 * 22
+        )
+        ready_check_allowance_seconds = 370
+        self.assertEqual(declared_ready_check_seconds, 362)
+        self.assertLessEqual(
+            declared_ready_check_seconds, ready_check_allowance_seconds
+        )
+
+        tcg_pre_service_seconds = 180
+        scheduling_and_poll_seconds = 30
+        minimum_boot_timeout = (
+            tcg_pre_service_seconds
+            + vault_timeout
+            + ready_check_allowance_seconds
+            + scheduling_and_poll_seconds
+        )
         workflow_timeout_match = re.search(
-            r"^\s*timeout-minutes:\s*([0-9]+)\s*$", workflow, re.MULTILINE
+            r"^  build-and-smoke-test:\n"
+            r"(?:(?!^  [a-z0-9-]+:\n).)*?"
+            r"^    timeout-minutes:\s*([0-9]+)\s*$",
+            workflow,
+            re.MULTILINE | re.DOTALL,
         )
         self.assertIsNotNone(workflow_timeout_match)
         assert workflow_timeout_match is not None
@@ -749,16 +1041,33 @@ class QemuTimeoutBudgetTests(unittest.TestCase):
             '"$PWD/tools/build-rescue/qemu-usb-smoke.sh" '
         )
 
-        self.assertEqual(classic_timeout, 600)
-        self.assertEqual(usb_timeout, 600)
+        self.assertEqual(vault_timeout, 620)
+        self.assertEqual(minimum_boot_timeout, 1200)
+        self.assertGreaterEqual(classic_timeout, minimum_boot_timeout)
+        self.assertGreaterEqual(usb_timeout, minimum_boot_timeout)
+        self.assertEqual(classic_cleanup, 10)
+        self.assertEqual(usb_cleanup, 10)
         self.assertEqual(classic_invocations, 2)
         self.assertEqual(usb_invocations, 2)
         total_tcg_budget = (
             classic_invocations * classic_timeout
             + usb_invocations * usb_boot_count * usb_timeout
         )
-        self.assertLess(total_tcg_budget, workflow_timeout_seconds)
-        self.assertGreaterEqual(workflow_timeout_seconds - total_tcg_budget, 30 * 60)
+        total_cleanup_budget = (
+            classic_invocations * classic_cleanup
+            + usb_invocations * usb_boot_count * usb_cleanup
+        )
+        total_capture_budget = (
+            classic_invocations * classic_capture
+            + usb_invocations * usb_boot_count * usb_capture
+        )
+        self.assertGreaterEqual(
+            workflow_timeout_seconds
+            - total_tcg_budget
+            - total_cleanup_budget
+            - total_capture_budget,
+            30 * 60,
+        )
 
 
 if __name__ == "__main__":
