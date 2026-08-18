@@ -1067,7 +1067,10 @@ fn validate_success_state_version(
 ) -> Result<(), ClientResponseDecodeError> {
     if matches!(
         request.payload(),
-        ClientRequestPayload::VaultUnlock { .. } | ClientRequestPayload::VaultLock
+        ClientRequestPayload::VaultUnlock { .. }
+            | ClientRequestPayload::VaultLock
+            | ClientRequestPayload::ProviderOpenAiConfigure { .. }
+            | ClientRequestPayload::ProviderLogout { .. }
     ) && request
         .expected_state_version()
         .checked_add(2)
@@ -1734,7 +1737,7 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_client_requires_exact_two_step_vault_mutation_versions() {
+    fn authenticated_client_requires_exact_two_step_mutation_versions() {
         for (payload, operation, response_payload) in [
             (
                 ClientRequestPayload::VaultUnlock {
@@ -1747,6 +1750,18 @@ mod tests {
                 ClientRequestPayload::VaultLock,
                 "vault.lock",
                 "{\"vaultState\":\"locked\"}".to_owned(),
+            ),
+            (
+                ClientRequestPayload::ProviderOpenAiConfigure { api_key_size: 12 },
+                "provider.openai.configure",
+                "{\"openai\":\"configured\",\"codex\":\"unconfigured\"}".to_owned(),
+            ),
+            (
+                ClientRequestPayload::ProviderLogout {
+                    provider: Provider::OpenAi,
+                },
+                "provider.logout",
+                "{\"openai\":\"unconfigured\",\"codex\":\"unconfigured\"}".to_owned(),
             ),
         ] {
             let request = request(payload);

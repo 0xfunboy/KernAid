@@ -4,7 +4,8 @@ use super::{
 };
 use kernaid_protocol::{
     rescue_vault::{
-        MAX_PASSPHRASE_BYTES, MIN_PASSPHRASE_BYTES, RequestId, SuccessPayload, VaultState,
+        MAX_OPENAI_KEY_BYTES, MAX_PASSPHRASE_BYTES, MIN_PASSPHRASE_BYTES, Provider, ProviderState,
+        RequestId, SuccessPayload, VaultState, validate_openai_api_key_bytes,
     },
     rescue_vault_transport::{
         ClientExchangeError, ClientRequest, ClientRequestPayload, ClientResponse,
@@ -51,6 +52,9 @@ enum Command {
     Status,
     Unlock,
     Lock,
+    ProviderStatus,
+    OpenAiConfigure,
+    OpenAiLogout,
 }
 
 pub(super) fn run<I>(arguments: I) -> Result<(), RescueVaultCompanionError>
@@ -79,6 +83,9 @@ where
         Some(value) if value == "status" => Command::Status,
         Some(value) if value == "unlock" => Command::Unlock,
         Some(value) if value == "lock" => Command::Lock,
+        Some(value) if value == "provider-status" => Command::ProviderStatus,
+        Some(value) if value == "openai-configure" => Command::OpenAiConfigure,
+        Some(value) if value == "openai-logout" => Command::OpenAiLogout,
         _ => return Err(RescueVaultCompanionError::InvalidCommand),
     };
     if arguments.next().is_some() {
@@ -188,7 +195,7 @@ fn execute(
         ClientResponseOutcome::Error(_) => return display_response(tty, &status),
         _ => return Err(RescueVaultCompanionError::ProtocolFailure),
     };
-    if let Some(error) = mutation_source_error(command, status_payload.vault_state()) {
+    if let Some(error) = command_source_error(command, status_payload.vault_state()) {
         display_response(tty, &status)?;
         return Err(RescueVaultCompanionError::Remote(error));
     }
@@ -214,7 +221,11 @@ fn execute(
                 &[read.as_fd()],
                 MUTATION_TIMEOUT,
                 Some(interrupted),
-                Some((tty, VaultState::Unlocked, state_version)),
+                Some(MutationReconciliation {
+                    tty,
+                    target: MutationTarget::Vault(VaultState::Unlocked),
+                    prior_version: state_version,
+                }),
             )?
         }
         Command::Lock => exchange(
@@ -223,28 +234,105 @@ fn execute(
             &[],
             MUTATION_TIMEOUT,
             Some(interrupted),
-            Some((tty, VaultState::Locked, state_version)),
+            Some(MutationReconciliation {
+                tty,
+                target: MutationTarget::Vault(VaultState::Locked),
+                prior_version: state_version,
+            }),
         )?,
+        Command::ProviderStatus => exchange(
+            ClientRequestPayload::ProviderStatus,
+            state_version,
+            &[],
+            STATUS_TIMEOUT,
+            Some(interrupted),
+            None,
+        )?,
+        Command::OpenAiConfigure => {
+            let secret = read_openai_api_key_from_tty(tty, interrupted)?;
+            let (read, write) = pipe_with(PipeFlags::CLOEXEC)
+                .map_err(|_| RescueVaultCompanionError::TransportUnavailable)?;
+            write_pipe_secret(write.as_fd(), &secret)
+                .map_err(|_| RescueVaultCompanionError::TransportUnavailable)?;
+            drop(write);
+            let size = u64::try_from(secret.len())
+                .map_err(|_| RescueVaultCompanionError::SecretInvalid)?;
+            drop(secret);
+            if interrupted.load(Ordering::Acquire) {
+                return Err(RescueVaultCompanionError::Interrupted);
+            }
+            exchange(
+                ClientRequestPayload::ProviderOpenAiConfigure { api_key_size: size },
+                state_version,
+                &[read.as_fd()],
+                MUTATION_TIMEOUT,
+                Some(interrupted),
+                Some(MutationReconciliation {
+                    tty,
+                    target: MutationTarget::OpenAi(ProviderState::Configured),
+                    prior_version: state_version,
+                }),
+            )?
+        }
+        Command::OpenAiLogout => {
+            confirm_openai_logout(tty, interrupted)?;
+            exchange(
+                ClientRequestPayload::ProviderLogout {
+                    provider: Provider::OpenAi,
+                },
+                state_version,
+                &[],
+                MUTATION_TIMEOUT,
+                Some(interrupted),
+                Some(MutationReconciliation {
+                    tty,
+                    target: MutationTarget::OpenAi(ProviderState::Unconfigured),
+                    prior_version: state_version,
+                }),
+            )?
+        }
         Command::Status => return Err(RescueVaultCompanionError::InvalidCommand),
     };
     display_response(tty, &response)
 }
 
-fn mutation_source_error(
+fn command_source_error(
     command: Command,
     state: VaultState,
 ) -> Option<kernaid_protocol::rescue_vault::ErrorToken> {
     use kernaid_protocol::rescue_vault::ErrorToken;
     match (command, state) {
-        (Command::Unlock, VaultState::Locked) | (Command::Lock, VaultState::Unlocked) => None,
+        (Command::Unlock, VaultState::Locked)
+        | (Command::Lock, VaultState::Unlocked)
+        | (
+            Command::ProviderStatus | Command::OpenAiConfigure | Command::OpenAiLogout,
+            VaultState::Unlocked,
+        ) => None,
         (_, VaultState::Absent) => Some(ErrorToken::Absent),
         (_, VaultState::Unprovisioned) => Some(ErrorToken::Unprovisioned),
         (Command::Lock, VaultState::Locked) => Some(ErrorToken::Locked),
         (Command::Unlock, VaultState::Unlocked)
         | (_, VaultState::Unlocking | VaultState::Locking) => Some(ErrorToken::Busy),
+        (
+            Command::ProviderStatus | Command::OpenAiConfigure | Command::OpenAiLogout,
+            VaultState::Locked,
+        ) => Some(ErrorToken::Locked),
         (_, VaultState::FaultedRebootRequired) => Some(ErrorToken::RebootRequired),
         (Command::Status, _) => Some(ErrorToken::NotAuthorized),
     }
+}
+
+#[derive(Clone, Copy)]
+struct MutationReconciliation<'tty> {
+    tty: BorrowedFd<'tty>,
+    target: MutationTarget,
+    prior_version: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MutationTarget {
+    Vault(VaultState),
+    OpenAi(ProviderState),
 }
 
 fn exchange(
@@ -253,7 +341,7 @@ fn exchange(
     descriptors: &[BorrowedFd<'_>],
     timeout: Duration,
     before_send: Option<&AtomicBool>,
-    reconciliation: Option<(BorrowedFd<'_>, VaultState, u64)>,
+    reconciliation: Option<MutationReconciliation<'_>>,
 ) -> Result<ClientResponse, RescueVaultCompanionError> {
     let aggregate_deadline = Instant::now()
         .checked_add(timeout)
@@ -288,9 +376,13 @@ fn exchange(
             reconciliation.is_some(),
             |slice| server.receive_response(&request, slice),
             |response| {
-                if let Some((_, target, prior_version)) = reconciliation
+                if let Some(reconciliation) = reconciliation
                     && matches!(response.outcome(), ClientResponseOutcome::Success(_))
-                    && !direct_mutation_success_is_exact(response, target, prior_version)
+                    && !direct_mutation_success_is_exact(
+                        response,
+                        reconciliation.target,
+                        reconciliation.prior_version,
+                    )
                 {
                     return Err(RescueVaultCompanionError::ProtocolFailure);
                 }
@@ -340,9 +432,13 @@ fn receive_correlated_or_reconcile<T>(
                 // connection and reconcile through fresh status requests;
                 // server begin/pre-arm liveness gates prevent late dispatch.
                 if interrupted.is_some_and(|flag| flag.load(Ordering::Acquire)) {
-                    return Ok(ReceiveDisposition::Reconcile(
-                        RescueVaultCompanionError::Interrupted,
-                    ));
+                    return if reconciliation_enabled {
+                        Ok(ReceiveDisposition::Reconcile(
+                            RescueVaultCompanionError::Interrupted,
+                        ))
+                    } else {
+                        Err(RescueVaultCompanionError::Interrupted)
+                    };
                 }
             }
             Err(error)
@@ -385,44 +481,195 @@ fn map_client_exchange_error(error: ClientExchangeError) -> RescueVaultCompanion
 }
 
 fn reconcile_unknown_mutation(
-    reconciliation: Option<(BorrowedFd<'_>, VaultState, u64)>,
+    reconciliation: Option<MutationReconciliation<'_>>,
     fallback: RescueVaultCompanionError,
     deadline: Instant,
 ) -> Result<ClientResponse, RescueVaultCompanionError> {
-    let Some((tty, target, prior_version)) = reconciliation else {
+    let Some(reconciliation) = reconciliation else {
         return Err(RescueVaultCompanionError::ProtocolFailure);
     };
-    let outcome = poll_reconciliation_until(
-        deadline,
-        |attempt| {
-            exchange(
-                ClientRequestPayload::VaultStatus,
-                0,
-                &[],
-                attempt,
-                None,
-                None,
-            )
-        },
-        |status| {
-            if reconciled_mutation_target_is_authoritative(status, target, prior_version) {
-                ReconciliationClass::Target
-            } else if response_is_transitional(status) {
-                ReconciliationClass::Transitional
-            } else {
-                ReconciliationClass::Terminal
+    let outcome = match reconciliation.target {
+        MutationTarget::Vault(target) => poll_reconciliation_until(
+            deadline,
+            |attempt| {
+                exchange(
+                    ClientRequestPayload::VaultStatus,
+                    0,
+                    &[],
+                    attempt,
+                    None,
+                    None,
+                )
+            },
+            |status| {
+                if reconciled_mutation_target_is_authoritative(
+                    status,
+                    MutationTarget::Vault(target),
+                    reconciliation.prior_version,
+                ) {
+                    ReconciliationClass::Target
+                } else if response_is_transitional(status) {
+                    ReconciliationClass::Transitional
+                } else {
+                    ReconciliationClass::Terminal
+                }
+            },
+            Instant::now,
+            thread::sleep,
+        )?,
+        MutationTarget::OpenAi(target) => {
+            let provider_outcome = poll_reconciliation_until(
+                deadline,
+                |attempt| {
+                    query_provider_reconciliation(attempt, target, reconciliation.prior_version)
+                },
+                |sample| sample.class,
+                Instant::now,
+                thread::sleep,
+            )?;
+            match provider_outcome {
+                ReconciliationPoll::Target(sample) => ReconciliationPoll::Target(sample.response),
+                ReconciliationPoll::Terminal(sample) => {
+                    ReconciliationPoll::Terminal(sample.response)
+                }
+                ReconciliationPoll::Expired(sample) => {
+                    ReconciliationPoll::Expired(sample.map(|sample| sample.response))
+                }
             }
-        },
-        Instant::now,
-        thread::sleep,
-    )?;
+        }
+    };
+    resolve_reconciliation_outcome(outcome, fallback, |status| {
+        display_response(reconciliation.tty, status)
+    })
+}
+
+fn resolve_reconciliation_outcome<T>(
+    outcome: ReconciliationPoll<T>,
+    fallback: RescueVaultCompanionError,
+    mut display: impl FnMut(&T) -> Result<(), RescueVaultCompanionError>,
+) -> Result<T, RescueVaultCompanionError> {
     match outcome {
-        ReconciliationPoll::Target(status) => return Ok(status),
-        ReconciliationPoll::Terminal(status) => display_response(tty, &status)?,
-        ReconciliationPoll::Expired(Some(status)) => display_response(tty, &status)?,
-        ReconciliationPoll::Expired(None) => {}
+        ReconciliationPoll::Target(status) => Ok(status),
+        ReconciliationPoll::Terminal(status) => {
+            display(&status)?;
+            Err(fallback)
+        }
+        ReconciliationPoll::Expired(Some(status)) => match display(&status) {
+            Ok(())
+            | Err(RescueVaultCompanionError::Remote(
+                kernaid_protocol::rescue_vault::ErrorToken::Busy
+                | kernaid_protocol::rescue_vault::ErrorToken::StaleState,
+            )) => Err(fallback),
+            Err(error) => Err(error),
+        },
+        ReconciliationPoll::Expired(None) => Err(fallback),
     }
-    Err(fallback)
+}
+
+struct ProviderReconciliationSample {
+    response: ClientResponse,
+    class: ReconciliationClass,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProviderVaultReconciliation {
+    QueryProvider,
+    Transitional,
+    Terminal,
+}
+
+fn query_provider_reconciliation(
+    attempt: Duration,
+    target: ProviderState,
+    prior_version: u64,
+) -> Result<ProviderReconciliationSample, RescueVaultCompanionError> {
+    let first = attempt / 2;
+    let second = attempt.saturating_sub(first);
+    if first.is_zero() || second.is_zero() {
+        return Err(RescueVaultCompanionError::TransportUnavailable);
+    }
+    let vault = exchange(ClientRequestPayload::VaultStatus, 0, &[], first, None, None)?;
+    let minimum = prior_version
+        .checked_add(2)
+        .ok_or(RescueVaultCompanionError::ProtocolFailure)?;
+    match classify_provider_vault_reconciliation(&vault, prior_version) {
+        ProviderVaultReconciliation::Transitional => {
+            return Ok(ProviderReconciliationSample {
+                response: vault,
+                class: ReconciliationClass::Transitional,
+            });
+        }
+        ProviderVaultReconciliation::Terminal => {
+            return Ok(ProviderReconciliationSample {
+                response: vault,
+                class: ReconciliationClass::Terminal,
+            });
+        }
+        ProviderVaultReconciliation::QueryProvider => {}
+    }
+    debug_assert!(vault.state_version() >= minimum);
+    let provider = exchange(
+        ClientRequestPayload::ProviderStatus,
+        vault.state_version(),
+        &[],
+        second,
+        None,
+        None,
+    )?;
+    let class = classify_provider_status_reconciliation(&provider, target, prior_version);
+    Ok(ProviderReconciliationSample {
+        response: provider,
+        class,
+    })
+}
+
+fn classify_provider_vault_reconciliation(
+    vault: &impl ReconciliationResponse,
+    prior_version: u64,
+) -> ProviderVaultReconciliation {
+    let Some(minimum) = prior_version.checked_add(2) else {
+        return ProviderVaultReconciliation::Terminal;
+    };
+    if vault.reconciliation_state_version() < minimum {
+        if vault.reconciliation_state_version() == prior_version.saturating_add(1)
+            && response_is_exact_vault_target(vault, VaultState::Unlocked)
+        {
+            ProviderVaultReconciliation::Transitional
+        } else {
+            ProviderVaultReconciliation::Terminal
+        }
+    } else if response_is_exact_vault_target(vault, VaultState::Unlocked) {
+        ProviderVaultReconciliation::QueryProvider
+    } else {
+        ProviderVaultReconciliation::Terminal
+    }
+}
+
+fn classify_provider_status_reconciliation(
+    provider: &impl ReconciliationResponse,
+    target: ProviderState,
+    prior_version: u64,
+) -> ReconciliationClass {
+    // Presence proves logout's desired absence, but it cannot distinguish a
+    // replacement key from the prior configured key. Unknown configure must
+    // therefore retain its original transport/interruption result.
+    match provider.reconciliation_outcome() {
+        ClientResponseOutcome::Success(SuccessPayload::ProviderStatus(status))
+            if target == ProviderState::Unconfigured
+                && status.openai == target
+                && reconciled_mutation_version_is_authoritative(
+                    provider.reconciliation_state_version(),
+                    prior_version,
+                ) =>
+        {
+            ReconciliationClass::Target
+        }
+        ClientResponseOutcome::Error(
+            kernaid_protocol::rescue_vault::ErrorToken::Busy
+            | kernaid_protocol::rescue_vault::ErrorToken::StaleState,
+        ) => ReconciliationClass::Transitional,
+        _ => ReconciliationClass::Terminal,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -472,20 +719,35 @@ fn poll_reconciliation_until<T>(
     }
 }
 
-fn response_is_transitional(response: &ClientResponse) -> bool {
+trait ReconciliationResponse {
+    fn reconciliation_state_version(&self) -> u64;
+    fn reconciliation_outcome(&self) -> &ClientResponseOutcome;
+}
+
+impl ReconciliationResponse for ClientResponse {
+    fn reconciliation_state_version(&self) -> u64 {
+        self.state_version()
+    }
+
+    fn reconciliation_outcome(&self) -> &ClientResponseOutcome {
+        self.outcome()
+    }
+}
+
+fn response_is_transitional(response: &impl ReconciliationResponse) -> bool {
     matches!(
-        response.outcome(),
+        response.reconciliation_outcome(),
         ClientResponseOutcome::Success(SuccessPayload::VaultStatus(status))
             if matches!(status.vault_state(), VaultState::Unlocking | VaultState::Locking)
     )
 }
 
 fn direct_mutation_success_is_exact(
-    response: &ClientResponse,
-    target: VaultState,
+    response: &impl ReconciliationResponse,
+    target: MutationTarget,
     prior_version: u64,
 ) -> bool {
-    direct_mutation_version_is_exact(response.state_version(), prior_version)
+    direct_mutation_version_is_exact(response.reconciliation_state_version(), prior_version)
         && response_is_exact_mutation_target(response, target)
 }
 
@@ -496,12 +758,14 @@ fn direct_mutation_version_is_exact(response_version: u64, prior_version: u64) -
 }
 
 fn reconciled_mutation_target_is_authoritative(
-    response: &ClientResponse,
-    target: VaultState,
+    response: &impl ReconciliationResponse,
+    target: MutationTarget,
     prior_version: u64,
 ) -> bool {
-    reconciled_mutation_version_is_authoritative(response.state_version(), prior_version)
-        && response_is_exact_mutation_target(response, target)
+    reconciled_mutation_version_is_authoritative(
+        response.reconciliation_state_version(),
+        prior_version,
+    ) && response_is_exact_mutation_target(response, target)
 }
 
 fn reconciled_mutation_version_is_authoritative(response_version: u64, prior_version: u64) -> bool {
@@ -510,8 +774,26 @@ fn reconciled_mutation_version_is_authoritative(response_version: u64, prior_ver
         .is_some_and(|minimum| response_version >= minimum)
 }
 
-fn response_is_exact_mutation_target(response: &ClientResponse, target: VaultState) -> bool {
-    let ClientResponseOutcome::Success(SuccessPayload::VaultStatus(status)) = response.outcome()
+fn response_is_exact_mutation_target(
+    response: &impl ReconciliationResponse,
+    target: MutationTarget,
+) -> bool {
+    match target {
+        MutationTarget::Vault(target) => response_is_exact_vault_target(response, target),
+        MutationTarget::OpenAi(target) => matches!(
+            response.reconciliation_outcome(),
+            ClientResponseOutcome::Success(SuccessPayload::ProviderStatus(status))
+                if status.openai == target
+        ),
+    }
+}
+
+fn response_is_exact_vault_target(
+    response: &impl ReconciliationResponse,
+    target: VaultState,
+) -> bool {
+    let ClientResponseOutcome::Success(SuccessPayload::VaultStatus(status)) =
+        response.reconciliation_outcome()
     else {
         return false;
     };
@@ -598,6 +880,18 @@ fn display_response(
             }
             Ok(())
         }
+        ClientResponseOutcome::Success(SuccessPayload::ProviderStatus(status)) => {
+            let openai = match status.openai {
+                ProviderState::Unconfigured => "unconfigured",
+                ProviderState::Configured => "configured",
+            };
+            let codex = match status.codex {
+                ProviderState::Unconfigured => "unconfigured",
+                ProviderState::Configured => "configured",
+            };
+            let line = format!("openai: {openai}\ncodex: {codex}\n");
+            write_tty(tty, line.as_bytes())
+        }
         _ => Err(RescueVaultCompanionError::ProtocolFailure),
     }
 }
@@ -613,6 +907,7 @@ fn write_tty_error(
         RescueVaultCompanionError::TtyUnavailable => "TTY_UNAVAILABLE",
         RescueVaultCompanionError::EchoControlFailed => "ECHO_CONTROL_FAILED",
         RescueVaultCompanionError::SecretInvalid => "SECRET_INVALID",
+        RescueVaultCompanionError::ConfirmationDeclined => "CONFIRMATION_DECLINED",
         RescueVaultCompanionError::TransportUnavailable => "TRANSPORT_UNAVAILABLE",
         RescueVaultCompanionError::ProtocolFailure => "PROTOCOL_FAILURE",
     };
@@ -744,35 +1039,102 @@ fn read_secret_after_privacy_with_foreground_check(
     interrupted: &AtomicBool,
     foreground_check: fn(BorrowedFd<'_>) -> Result<(), RescueVaultCompanionError>,
 ) -> Result<Zeroizing<Vec<u8>>, RescueVaultCompanionError> {
+    read_hidden_secret_after_privacy_with_foreground_check(
+        tty,
+        interrupted,
+        foreground_check,
+        HiddenSecretKind::VaultPassphrase,
+    )
+}
+
+fn read_openai_api_key_from_tty(
+    tty: BorrowedFd<'_>,
+    interrupted: &AtomicBool,
+) -> Result<Zeroizing<Vec<u8>>, RescueVaultCompanionError> {
+    validate_no_active_swap().map_err(|()| RescueVaultCompanionError::TransportUnavailable)?;
+    read_hidden_secret_after_privacy_with_foreground_check(
+        tty,
+        interrupted,
+        ensure_foreground_tty,
+        HiddenSecretKind::OpenAiApiKey,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum HiddenSecretKind {
+    VaultPassphrase,
+    OpenAiApiKey,
+}
+
+impl HiddenSecretKind {
+    const fn maximum(self) -> usize {
+        match self {
+            Self::VaultPassphrase => MAX_PASSPHRASE_BYTES as usize,
+            Self::OpenAiApiKey => MAX_OPENAI_KEY_BYTES as usize,
+        }
+    }
+
+    const fn prompt(self) -> &'static [u8] {
+        match self {
+            Self::VaultPassphrase => b"READY\nVault passphrase: ",
+            Self::OpenAiApiKey => b"READY\nOpenAI API key: ",
+        }
+    }
+
+    fn validate(self, value: &[u8]) -> bool {
+        match self {
+            Self::VaultPassphrase => {
+                (MIN_PASSPHRASE_BYTES as usize..=MAX_PASSPHRASE_BYTES as usize)
+                    .contains(&value.len())
+                    && !value.contains(&0)
+            }
+            Self::OpenAiApiKey => validate_openai_api_key_bytes(value).is_ok(),
+        }
+    }
+}
+
+fn read_hidden_secret_after_privacy_with_foreground_check(
+    tty: BorrowedFd<'_>,
+    interrupted: &AtomicBool,
+    foreground_check: fn(BorrowedFd<'_>) -> Result<(), RescueVaultCompanionError>,
+    kind: HiddenSecretKind,
+) -> Result<Zeroizing<Vec<u8>>, RescueVaultCompanionError> {
     // Allocate before echo is disabled so allocator failure cannot strand the
     // controlling terminal in the hidden state.
-    let value = preallocated_secret_buffer();
+    let value = Zeroizing::new(Vec::with_capacity(kind.maximum()));
     let mut guard = EchoGuard::hide_with_foreground_check(tty, foreground_check)?;
     let prompt_deadline = Instant::now() + Duration::from_secs(2);
-    if let Err(error) = write_tty_all(
-        tty,
-        b"READY\nVault passphrase: ",
-        prompt_deadline,
-        Some(interrupted),
-    ) {
+    if let Err(error) = write_tty_all(tty, kind.prompt(), prompt_deadline, Some(interrupted)) {
         return Err(guard.abort_after_hide(error));
     }
-    let result = read_secret_line(tty, interrupted, value);
+    let result = read_hidden_secret_line(tty, interrupted, value, kind);
     guard.cleanup_after_hide()?;
     write_tty(tty, b"\n")?;
     result
 }
 
+#[cfg(test)]
 fn preallocated_secret_buffer() -> Zeroizing<Vec<u8>> {
     Zeroizing::new(Vec::with_capacity(MAX_PASSPHRASE_BYTES as usize))
 }
 
+#[cfg(test)]
 fn read_secret_line(
     tty: BorrowedFd<'_>,
     interrupted: &AtomicBool,
-    mut value: Zeroizing<Vec<u8>>,
+    value: Zeroizing<Vec<u8>>,
 ) -> Result<Zeroizing<Vec<u8>>, RescueVaultCompanionError> {
-    if value.capacity() < MAX_PASSPHRASE_BYTES as usize || !value.is_empty() {
+    read_hidden_secret_line(tty, interrupted, value, HiddenSecretKind::VaultPassphrase)
+}
+
+fn read_hidden_secret_line(
+    tty: BorrowedFd<'_>,
+    interrupted: &AtomicBool,
+    mut value: Zeroizing<Vec<u8>>,
+    kind: HiddenSecretKind,
+) -> Result<Zeroizing<Vec<u8>>, RescueVaultCompanionError> {
+    let maximum = kind.maximum();
+    if value.capacity() < maximum || !value.is_empty() {
         return Err(RescueVaultCompanionError::SecretInvalid);
     }
     loop {
@@ -785,7 +1147,7 @@ fn read_secret_line(
             Ok(read) => {
                 let chunk = &buffer[..read];
                 if let Some(newline) = chunk.iter().position(|byte| *byte == b'\n') {
-                    if newline > (MAX_PASSPHRASE_BYTES as usize).saturating_sub(value.len()) {
+                    if newline > maximum.saturating_sub(value.len()) {
                         return Err(RescueVaultCompanionError::SecretInvalid);
                     }
                     value.extend_from_slice(&chunk[..newline]);
@@ -797,7 +1159,7 @@ fn read_secret_line(
                     }
                     break;
                 }
-                if chunk.len() > (MAX_PASSPHRASE_BYTES as usize).saturating_sub(value.len()) {
+                if chunk.len() > maximum.saturating_sub(value.len()) {
                     return Err(RescueVaultCompanionError::SecretInvalid);
                 }
                 value.extend_from_slice(chunk);
@@ -809,9 +1171,7 @@ fn read_secret_line(
             Err(_) => return Err(RescueVaultCompanionError::TtyUnavailable),
         }
     }
-    if !(MIN_PASSPHRASE_BYTES as usize..=MAX_PASSPHRASE_BYTES as usize).contains(&value.len())
-        || value.contains(&0)
-    {
+    if !kind.validate(&value) {
         return Err(RescueVaultCompanionError::SecretInvalid);
     }
     reject_buffered_tty_input(tty, interrupted)?;
@@ -834,6 +1194,88 @@ fn reject_buffered_tty_input(
             Err(_) => return Err(RescueVaultCompanionError::TtyUnavailable),
         }
     }
+}
+
+fn confirm_openai_logout(
+    tty: BorrowedFd<'_>,
+    interrupted: &AtomicBool,
+) -> Result<(), RescueVaultCompanionError> {
+    confirm_openai_logout_with_foreground_check(tty, interrupted, ensure_foreground_tty)
+}
+
+struct ConfirmationInputGuard<'tty> {
+    tty: BorrowedFd<'tty>,
+}
+
+impl Drop for ConfirmationInputGuard<'_> {
+    fn drop(&mut self) {
+        let _ = tcflush(self.tty, QueueSelector::IFlush);
+    }
+}
+
+fn confirm_openai_logout_with_foreground_check(
+    tty: BorrowedFd<'_>,
+    interrupted: &AtomicBool,
+    mut foreground_check: impl FnMut(BorrowedFd<'_>) -> Result<(), RescueVaultCompanionError>,
+) -> Result<(), RescueVaultCompanionError> {
+    let _flush_guard = ConfirmationInputGuard { tty };
+    foreground_check(tty)?;
+    tcflush(tty, QueueSelector::IFlush).map_err(|_| RescueVaultCompanionError::TtyUnavailable)?;
+    foreground_check(tty)?;
+    tcflush(tty, QueueSelector::IFlush).map_err(|_| RescueVaultCompanionError::TtyUnavailable)?;
+    write_tty_all(
+        tty,
+        b"READY\nType LOGOUT to confirm: ",
+        Instant::now() + Duration::from_secs(2),
+        Some(interrupted),
+    )?;
+    let mut value = [0_u8; 7];
+    let mut length = 0_usize;
+    loop {
+        if interrupted.load(Ordering::Acquire) {
+            return Err(RescueVaultCompanionError::Interrupted);
+        }
+        let mut buffer = [0_u8; 16];
+        match rustix::io::read(tty, &mut buffer) {
+            Ok(0) => return Err(RescueVaultCompanionError::ConfirmationDeclined),
+            Ok(read) => {
+                let chunk = &buffer[..read];
+                if let Some(newline) = chunk.iter().position(|byte| *byte == b'\n') {
+                    if newline > value.len().saturating_sub(length) || newline + 1 != chunk.len() {
+                        return Err(RescueVaultCompanionError::ConfirmationDeclined);
+                    }
+                    value[length..length + newline].copy_from_slice(&chunk[..newline]);
+                    length += newline;
+                    if length > 0 && value[length - 1] == b'\r' {
+                        length -= 1;
+                    }
+                    break;
+                }
+                if chunk.len() > value.len().saturating_sub(length) {
+                    return Err(RescueVaultCompanionError::ConfirmationDeclined);
+                }
+                value[length..length + chunk.len()].copy_from_slice(chunk);
+                length += chunk.len();
+            }
+            Err(error) if error == rustix::io::Errno::INTR => {}
+            Err(error) if error == rustix::io::Errno::AGAIN => wait_tty(tty, interrupted)?,
+            Err(_) => return Err(RescueVaultCompanionError::TtyUnavailable),
+        }
+    }
+    if let Err(error) = reject_buffered_tty_input(tty, interrupted) {
+        return Err(match error {
+            RescueVaultCompanionError::SecretInvalid => {
+                RescueVaultCompanionError::ConfirmationDeclined
+            }
+            other => other,
+        });
+    }
+    tcflush(tty, QueueSelector::IFlush).map_err(|_| RescueVaultCompanionError::TtyUnavailable)?;
+    write_tty(tty, b"\n")?;
+    if &value[..length] != b"LOGOUT" {
+        return Err(RescueVaultCompanionError::ConfirmationDeclined);
+    }
+    Ok(())
 }
 
 fn ensure_foreground_tty(tty: BorrowedFd<'_>) -> Result<(), RescueVaultCompanionError> {
@@ -998,7 +1440,8 @@ fn duration_to_timespec(duration: Duration) -> Timespec {
 mod tests {
     use super::*;
     use kernaid_protocol::{
-        rescue_vault::ProtocolViolation, rescue_vault_transport::ClientResponseDecodeError,
+        rescue_vault::{ErrorToken, ProtocolViolation, ProviderStatusPayload, VaultStatusPayload},
+        rescue_vault_transport::ClientResponseDecodeError,
     };
     use nix::pty::openpty;
     use rustix::net::{RecvFlags, SendFlags, recv, send, socketpair};
@@ -1030,6 +1473,54 @@ mod tests {
         })
     }
 
+    struct TestResponse {
+        state_version: u64,
+        outcome: ClientResponseOutcome,
+    }
+
+    impl ReconciliationResponse for TestResponse {
+        fn reconciliation_state_version(&self) -> u64 {
+            self.state_version
+        }
+
+        fn reconciliation_outcome(&self) -> &ClientResponseOutcome {
+            &self.outcome
+        }
+    }
+
+    fn test_vault_status(state_version: u64, state: VaultState) -> TestResponse {
+        let device = if state == VaultState::Unlocked {
+            Some("KA-0123456789abcdef01234567")
+        } else {
+            None
+        };
+        TestResponse {
+            state_version,
+            outcome: ClientResponseOutcome::Success(SuccessPayload::VaultStatus(
+                VaultStatusPayload::new(state, device).expect("test vault status"),
+            )),
+        }
+    }
+
+    fn test_provider_status(state_version: u64, state: ProviderState) -> TestResponse {
+        TestResponse {
+            state_version,
+            outcome: ClientResponseOutcome::Success(SuccessPayload::ProviderStatus(
+                ProviderStatusPayload {
+                    openai: state,
+                    codex: ProviderState::Unconfigured,
+                },
+            )),
+        }
+    }
+
+    fn test_provider_error(state_version: u64, error: ErrorToken) -> TestResponse {
+        TestResponse {
+            state_version,
+            outcome: ClientResponseOutcome::Error(error),
+        }
+    }
+
     #[test]
     fn command_surface_is_exact_and_path_free() {
         assert_eq!(
@@ -1040,7 +1531,25 @@ mod tests {
             parse_command([OsString::from("unlock")]),
             Ok(Command::Unlock)
         );
+        assert_eq!(
+            parse_command([OsString::from("provider-status")]),
+            Ok(Command::ProviderStatus)
+        );
+        assert_eq!(
+            parse_command([OsString::from("openai-configure")]),
+            Ok(Command::OpenAiConfigure)
+        );
+        assert_eq!(
+            parse_command([OsString::from("openai-logout")]),
+            Ok(Command::OpenAiLogout)
+        );
         assert!(parse_command([OsString::from("unlock"), OsString::from("/dev/sda")]).is_err());
+        for command in ["provider-status", "openai-configure", "openai-logout"] {
+            assert!(
+                parse_command([OsString::from(command), OsString::from("/tmp/injected")]).is_err(),
+                "{command} accepted a path-like extra argument"
+            );
+        }
         assert!(parse_command([OsString::from("--socket=/tmp/x")]).is_err());
     }
 
@@ -1078,6 +1587,204 @@ mod tests {
             rustix::io::read(&pty.master, &mut output).err(),
             Some(rustix::io::Errno::AGAIN),
             "an interrupt before the prompt must not emit READY"
+        );
+    }
+
+    #[test]
+    fn openai_key_tty_is_hidden_restored_bounded_and_visible_ascii_only() {
+        let pty = nonblocking_pty();
+        let master_copy = rustix::io::fcntl_dupfd_cloexec(&pty.master, 3).expect("master copy");
+        let before = tcgetattr(&pty.slave).expect("before");
+        let synthetic = b"VISIBLE_TEST_ONLY".to_vec();
+        rustix::io::write(&pty.master, b"PREQUEUED_SHOULD_FLUSH\n").expect("prequeued key input");
+        let writer =
+            delayed_master_write(master_copy, [synthetic.clone(), b"\n".to_vec()].concat());
+        let value = read_hidden_secret_after_privacy_with_foreground_check(
+            pty.slave.as_fd(),
+            &AtomicBool::new(false),
+            assume_foreground,
+            HiddenSecretKind::OpenAiApiKey,
+        )
+        .expect("hidden key input");
+        writer.join().expect("writer");
+        assert_eq!(value.len(), synthetic.len());
+        assert!(value.iter().all(u8::is_ascii_graphic));
+        drop(value);
+        assert_eq!(
+            before.local_modes,
+            tcgetattr(&pty.slave).expect("after").local_modes
+        );
+
+        let flags = rfs::fcntl_getfl(&pty.master).expect("master flags");
+        rfs::fcntl_setfl(&pty.master, flags | OFlags::NONBLOCK).expect("nonblocking master");
+        let mut output = Vec::new();
+        let mut buffer = [0_u8; 256];
+        let mut output_read_failed = false;
+        loop {
+            match rustix::io::read(&pty.master, &mut buffer) {
+                Ok(0) => break,
+                Ok(read) => output.extend_from_slice(&buffer[..read]),
+                Err(error) if error == rustix::io::Errno::AGAIN => break,
+                Err(error) if error == rustix::io::Errno::INTR => {}
+                Err(_) => {
+                    output_read_failed = true;
+                    break;
+                }
+            }
+        }
+        assert!(!output_read_failed, "master output read failed");
+        assert!(
+            output
+                .windows(b"OpenAI API key".len())
+                .any(|window| window == b"OpenAI API key")
+        );
+        assert!(
+            !output
+                .windows(synthetic.len())
+                .any(|window| window == synthetic)
+        );
+
+        let max_pty = nonblocking_pty();
+        let max_master =
+            rustix::io::fcntl_dupfd_cloexec(&max_pty.master, 3).expect("maximum master copy");
+        let max_writer = delayed_master_write(
+            max_master,
+            [vec![b'K'; MAX_OPENAI_KEY_BYTES as usize], b"\n".to_vec()].concat(),
+        );
+        let maximum = read_hidden_secret_line(
+            max_pty.slave.as_fd(),
+            &AtomicBool::new(false),
+            Zeroizing::new(Vec::with_capacity(MAX_OPENAI_KEY_BYTES as usize)),
+            HiddenSecretKind::OpenAiApiKey,
+        )
+        .expect("maximum key input");
+        max_writer.join().expect("maximum writer");
+        assert_eq!(maximum.len(), MAX_OPENAI_KEY_BYTES as usize);
+
+        let oversized_pty = nonblocking_pty();
+        let oversized_master = rustix::io::fcntl_dupfd_cloexec(&oversized_pty.master, 3)
+            .expect("oversized master copy");
+        let oversized_writer = delayed_master_write(
+            oversized_master,
+            [
+                vec![b'K'; MAX_OPENAI_KEY_BYTES as usize + 1],
+                b"\n".to_vec(),
+            ]
+            .concat(),
+        );
+        assert_eq!(
+            read_hidden_secret_line(
+                oversized_pty.slave.as_fd(),
+                &AtomicBool::new(false),
+                Zeroizing::new(Vec::with_capacity(MAX_OPENAI_KEY_BYTES as usize)),
+                HiddenSecretKind::OpenAiApiKey,
+            ),
+            Err(RescueVaultCompanionError::SecretInvalid)
+        );
+        oversized_writer.join().expect("oversized writer");
+
+        for invalid in [b"BAD KEY\n".as_slice(), b"TWO\nLINES\n".as_slice()] {
+            let pty = nonblocking_pty();
+            let writer = delayed_master_write(pty.master, invalid.to_vec());
+            assert_eq!(
+                read_hidden_secret_line(
+                    pty.slave.as_fd(),
+                    &AtomicBool::new(false),
+                    Zeroizing::new(Vec::with_capacity(MAX_OPENAI_KEY_BYTES as usize)),
+                    HiddenSecretKind::OpenAiApiKey,
+                ),
+                Err(RescueVaultCompanionError::SecretInvalid)
+            );
+            writer.join().expect("invalid writer");
+        }
+
+        let interrupted = openpty(None, None).expect("interrupt pty");
+        let before = tcgetattr(&interrupted.slave).expect("before interrupt");
+        assert_eq!(
+            read_hidden_secret_after_privacy_with_foreground_check(
+                interrupted.slave.as_fd(),
+                &AtomicBool::new(true),
+                assume_foreground,
+                HiddenSecretKind::OpenAiApiKey,
+            ),
+            Err(RescueVaultCompanionError::Interrupted)
+        );
+        assert_eq!(
+            before.local_modes,
+            tcgetattr(&interrupted.slave)
+                .expect("after interrupt")
+                .local_modes
+        );
+    }
+
+    #[test]
+    fn logout_confirmation_flushes_prequeue_is_exact_and_cleans_every_exit() {
+        let pty = nonblocking_pty();
+        rustix::io::write(&pty.master, b"LOGOUT\n").expect("prequeued confirmation");
+        let master_copy = rustix::io::fcntl_dupfd_cloexec(&pty.master, 3).expect("master copy");
+        let writer = delayed_master_write(master_copy, b"NO\n".to_vec());
+        let foreground_checks = Cell::new(0_usize);
+        assert_eq!(
+            confirm_openai_logout_with_foreground_check(
+                pty.slave.as_fd(),
+                &AtomicBool::new(false),
+                |_| {
+                    foreground_checks.set(foreground_checks.get() + 1);
+                    Ok(())
+                },
+            ),
+            Err(RescueVaultCompanionError::ConfirmationDeclined)
+        );
+        writer.join().expect("decline writer");
+        assert_eq!(foreground_checks.get(), 2);
+        let mut leftover = [0_u8; 1];
+        assert_eq!(
+            rustix::io::read(&pty.slave, &mut leftover).err(),
+            Some(rustix::io::Errno::AGAIN)
+        );
+
+        let accepted = nonblocking_pty();
+        let accepted_master =
+            rustix::io::fcntl_dupfd_cloexec(&accepted.master, 3).expect("accepted master copy");
+        let writer = delayed_master_write(accepted_master, b"LOGOUT\n".to_vec());
+        assert_eq!(
+            confirm_openai_logout_with_foreground_check(
+                accepted.slave.as_fd(),
+                &AtomicBool::new(false),
+                assume_foreground,
+            ),
+            Ok(())
+        );
+        writer.join().expect("accept writer");
+
+        let signalled = nonblocking_pty();
+        assert_eq!(
+            confirm_openai_logout_with_foreground_check(
+                signalled.slave.as_fd(),
+                &AtomicBool::new(true),
+                assume_foreground,
+            ),
+            Err(RescueVaultCompanionError::Interrupted)
+        );
+        assert_eq!(
+            rustix::io::read(&signalled.slave, &mut leftover).err(),
+            Some(rustix::io::Errno::AGAIN)
+        );
+
+        let rejected_foreground = nonblocking_pty();
+        rustix::io::write(&rejected_foreground.master, b"LOGOUT\n")
+            .expect("prequeue before foreground failure");
+        assert_eq!(
+            confirm_openai_logout_with_foreground_check(
+                rejected_foreground.slave.as_fd(),
+                &AtomicBool::new(false),
+                |_| Err(RescueVaultCompanionError::TtyUnavailable),
+            ),
+            Err(RescueVaultCompanionError::TtyUnavailable)
+        );
+        assert_eq!(
+            rustix::io::read(&rejected_foreground.slave, &mut leftover).err(),
+            Some(rustix::io::Errno::AGAIN)
         );
     }
 
@@ -1370,6 +2077,19 @@ mod tests {
         .expect("authoritative response");
         assert!(matches!(outcome, ReceiveDisposition::Response(42)));
 
+        assert!(matches!(
+            receive_correlated_or_reconcile(
+                Instant::now() + Duration::from_secs(1),
+                Some(&interrupted),
+                false,
+                |_| Err::<u8, _>(ClientExchangeError::Transport(
+                    SeqpacketTransportError::TimedOut,
+                )),
+                |_| Ok(()),
+            ),
+            Err(RescueVaultCompanionError::Interrupted)
+        ));
+
         let (daemon, companion) = socketpair(
             AddressFamily::UNIX,
             SocketType::SEQPACKET,
@@ -1512,6 +2232,90 @@ mod tests {
     }
 
     #[test]
+    fn provider_reconciliation_requires_authoritative_version_and_exact_target() {
+        let transitional_vault = test_vault_status(11, VaultState::Unlocked);
+        assert_eq!(
+            classify_provider_vault_reconciliation(&transitional_vault, 10),
+            ProviderVaultReconciliation::Transitional
+        );
+        let query_vault = test_vault_status(12, VaultState::Unlocked);
+        assert_eq!(
+            classify_provider_vault_reconciliation(&query_vault, 10),
+            ProviderVaultReconciliation::QueryProvider
+        );
+        let old_vault = test_vault_status(10, VaultState::Unlocked);
+        assert_eq!(
+            classify_provider_vault_reconciliation(&old_vault, 10),
+            ProviderVaultReconciliation::Terminal
+        );
+        let locked = test_vault_status(12, VaultState::Locked);
+        assert_eq!(
+            classify_provider_vault_reconciliation(&locked, 10),
+            ProviderVaultReconciliation::Terminal
+        );
+
+        let configured = test_provider_status(12, ProviderState::Configured);
+        assert_eq!(
+            classify_provider_status_reconciliation(&configured, ProviderState::Configured, 10),
+            ReconciliationClass::Terminal,
+            "presence cannot prove that a replacement key displaced the prior key"
+        );
+        assert!(direct_mutation_success_is_exact(
+            &test_provider_status(12, ProviderState::Configured),
+            MutationTarget::OpenAi(ProviderState::Configured),
+            10,
+        ));
+        let logout_target = test_provider_status(12, ProviderState::Unconfigured);
+        assert_eq!(
+            classify_provider_status_reconciliation(
+                &logout_target,
+                ProviderState::Unconfigured,
+                10,
+            ),
+            ReconciliationClass::Target
+        );
+        assert_eq!(
+            classify_provider_status_reconciliation(&configured, ProviderState::Unconfigured, 10,),
+            ReconciliationClass::Terminal
+        );
+        for error in [ErrorToken::Busy, ErrorToken::StaleState] {
+            let response = test_provider_error(11, error);
+            assert_eq!(
+                classify_provider_status_reconciliation(&response, ProviderState::Configured, 10,),
+                ReconciliationClass::Transitional
+            );
+        }
+
+        let fallback = RescueVaultCompanionError::TransportUnavailable;
+        assert_eq!(
+            resolve_reconciliation_outcome(
+                ReconciliationPoll::Terminal(1_u8),
+                fallback,
+                |_| Ok(()),
+            ),
+            Err(fallback),
+            "non-authoritative configure presence must preserve the transport result"
+        );
+        assert_eq!(
+            resolve_reconciliation_outcome(ReconciliationPoll::Terminal(1_u8), fallback, |_| Err(
+                RescueVaultCompanionError::Remote(ErrorToken::RebootRequired)
+            ),),
+            Err(RescueVaultCompanionError::Remote(
+                ErrorToken::RebootRequired
+            ))
+        );
+        assert_eq!(
+            resolve_reconciliation_outcome(
+                ReconciliationPoll::Expired(Some(1_u8)),
+                fallback,
+                |_| Err(RescueVaultCompanionError::Remote(ErrorToken::Busy)),
+            ),
+            Err(fallback),
+            "expired transitional evidence must preserve the original transport result"
+        );
+    }
+
+    #[test]
     fn reconciliation_deadline_returns_the_last_transitional_evidence() {
         let base = Instant::now();
         let elapsed = Cell::new(Duration::ZERO);
@@ -1612,8 +2416,8 @@ mod tests {
             ),
         ];
         for (state, unlock_error, lock_error) in cases {
-            let unlock = mutation_source_error(Command::Unlock, state);
-            let lock = mutation_source_error(Command::Lock, state);
+            let unlock = command_source_error(Command::Unlock, state);
+            let lock = command_source_error(Command::Lock, state);
             if state == VaultState::Locked {
                 assert_eq!(unlock, None);
             } else {

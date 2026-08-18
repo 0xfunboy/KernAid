@@ -2,9 +2,12 @@
 //!
 //! The wire is fixed-size binary data. It contains no pathname, secret,
 //! command string, diagnostic text, or JSON. The sole permitted descriptor is
-//! one anonymous passphrase pipe on an `Unlock` command.
+//! one anonymous secret pipe on an `Unlock` or `ProviderOpenAiConfigure`
+//! command.
 
-use kernaid_protocol::rescue_vault::{MAX_PASSPHRASE_BYTES, MIN_PASSPHRASE_BYTES};
+use kernaid_protocol::rescue_vault::{
+    MAX_OPENAI_KEY_BYTES, MAX_PASSPHRASE_BYTES, MIN_PASSPHRASE_BYTES,
+};
 use rustix::{
     event::{PollFd, PollFlags, Timespec, poll},
     net::{
@@ -34,6 +37,9 @@ pub(super) enum WorkerCommandKind {
     Probe,
     Unlock,
     Lock,
+    ProviderStatus,
+    ProviderOpenAiConfigure,
+    ProviderOpenAiLogout,
     AttestQuiescent,
     Shutdown,
 }
@@ -42,7 +48,7 @@ pub(super) enum WorkerCommandKind {
 pub(super) struct WorkerCommand {
     pub(super) request_id: u64,
     pub(super) kind: WorkerCommandKind,
-    pub(super) passphrase_size: u16,
+    pub(super) secret_size: u16,
 }
 
 impl WorkerCommand {
@@ -50,7 +56,7 @@ impl WorkerCommand {
         Self {
             request_id,
             kind: WorkerCommandKind::Bootstrap,
-            passphrase_size: 0,
+            secret_size: 0,
         }
     }
 
@@ -58,7 +64,7 @@ impl WorkerCommand {
         Self {
             request_id,
             kind: WorkerCommandKind::Probe,
-            passphrase_size: 0,
+            secret_size: 0,
         }
     }
 
@@ -66,7 +72,7 @@ impl WorkerCommand {
         Self {
             request_id,
             kind: WorkerCommandKind::Unlock,
-            passphrase_size,
+            secret_size: passphrase_size,
         }
     }
 
@@ -74,7 +80,31 @@ impl WorkerCommand {
         Self {
             request_id,
             kind: WorkerCommandKind::Lock,
-            passphrase_size: 0,
+            secret_size: 0,
+        }
+    }
+
+    pub(super) fn provider_status(request_id: u64) -> Self {
+        Self {
+            request_id,
+            kind: WorkerCommandKind::ProviderStatus,
+            secret_size: 0,
+        }
+    }
+
+    pub(super) fn provider_openai_configure(request_id: u64, api_key_size: u16) -> Self {
+        Self {
+            request_id,
+            kind: WorkerCommandKind::ProviderOpenAiConfigure,
+            secret_size: api_key_size,
+        }
+    }
+
+    pub(super) fn provider_openai_logout(request_id: u64) -> Self {
+        Self {
+            request_id,
+            kind: WorkerCommandKind::ProviderOpenAiLogout,
+            secret_size: 0,
         }
     }
 
@@ -82,7 +112,7 @@ impl WorkerCommand {
         Self {
             request_id,
             kind: WorkerCommandKind::Shutdown,
-            passphrase_size: 0,
+            secret_size: 0,
         }
     }
 
@@ -90,15 +120,19 @@ impl WorkerCommand {
         Self {
             request_id,
             kind: WorkerCommandKind::AttestQuiescent,
-            passphrase_size: 0,
+            secret_size: 0,
         }
     }
 
     fn encode(self) -> Result<[u8; COMMAND_BYTES], InternalWireError> {
         if self.request_id == 0
-            || (self.kind == WorkerCommandKind::Unlock
-                && !valid_passphrase_size(self.passphrase_size))
-            || (self.kind != WorkerCommandKind::Unlock && self.passphrase_size != 0)
+            || (self.kind == WorkerCommandKind::Unlock && !valid_passphrase_size(self.secret_size))
+            || (self.kind == WorkerCommandKind::ProviderOpenAiConfigure
+                && !valid_openai_key_size(self.secret_size))
+            || (!matches!(
+                self.kind,
+                WorkerCommandKind::Unlock | WorkerCommandKind::ProviderOpenAiConfigure
+            ) && self.secret_size != 0)
         {
             return Err(InternalWireError::InvalidFrame);
         }
@@ -111,9 +145,12 @@ impl WorkerCommand {
             WorkerCommandKind::Lock => 4,
             WorkerCommandKind::Shutdown => 5,
             WorkerCommandKind::AttestQuiescent => 6,
+            WorkerCommandKind::ProviderStatus => 7,
+            WorkerCommandKind::ProviderOpenAiConfigure => 8,
+            WorkerCommandKind::ProviderOpenAiLogout => 9,
         };
         bytes[16..24].copy_from_slice(&self.request_id.to_be_bytes());
-        bytes[24..26].copy_from_slice(&self.passphrase_size.to_be_bytes());
+        bytes[24..26].copy_from_slice(&self.secret_size.to_be_bytes());
         Ok(bytes)
     }
 
@@ -130,7 +167,7 @@ impl WorkerCommand {
                 .try_into()
                 .map_err(|_| InternalWireError::InvalidFrame)?,
         );
-        let passphrase_size = u16::from_be_bytes(
+        let secret_size = u16::from_be_bytes(
             bytes[24..26]
                 .try_into()
                 .map_err(|_| InternalWireError::InvalidFrame)?,
@@ -142,12 +179,15 @@ impl WorkerCommand {
             4 => WorkerCommandKind::Lock,
             5 => WorkerCommandKind::Shutdown,
             6 => WorkerCommandKind::AttestQuiescent,
+            7 => WorkerCommandKind::ProviderStatus,
+            8 => WorkerCommandKind::ProviderOpenAiConfigure,
+            9 => WorkerCommandKind::ProviderOpenAiLogout,
             _ => return Err(InternalWireError::InvalidFrame),
         };
         let command = Self {
             request_id,
             kind,
-            passphrase_size,
+            secret_size,
         };
         command.encode()?;
         Ok(command)
@@ -157,6 +197,10 @@ impl WorkerCommand {
 fn valid_passphrase_size(size: u16) -> bool {
     let size = u64::from(size);
     (MIN_PASSPHRASE_BYTES..=MAX_PASSPHRASE_BYTES).contains(&size)
+}
+
+fn valid_openai_key_size(size: u16) -> bool {
+    (1..=MAX_OPENAI_KEY_BYTES).contains(&u64::from(size))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -185,6 +229,12 @@ pub(super) enum WorkerResultCode {
     AttestUnprovisioned,
     AttestLocked,
     AttestProfileMismatch,
+    ProviderStatusUnconfigured,
+    ProviderStatusConfigured,
+    ProviderConfigureSucceeded,
+    ProviderLogoutSucceeded,
+    ProviderMutationAborted,
+    ProviderStateAmbiguous,
 }
 
 impl WorkerResultCode {
@@ -214,6 +264,12 @@ impl WorkerResultCode {
             Self::AttestUnprovisioned => 22,
             Self::AttestLocked => 23,
             Self::AttestProfileMismatch => 24,
+            Self::ProviderStatusUnconfigured => 25,
+            Self::ProviderStatusConfigured => 26,
+            Self::ProviderConfigureSucceeded => 27,
+            Self::ProviderLogoutSucceeded => 28,
+            Self::ProviderMutationAborted => 29,
+            Self::ProviderStateAmbiguous => 30,
         }
     }
 
@@ -243,6 +299,12 @@ impl WorkerResultCode {
             22 => Ok(Self::AttestUnprovisioned),
             23 => Ok(Self::AttestLocked),
             24 => Ok(Self::AttestProfileMismatch),
+            25 => Ok(Self::ProviderStatusUnconfigured),
+            26 => Ok(Self::ProviderStatusConfigured),
+            27 => Ok(Self::ProviderConfigureSucceeded),
+            28 => Ok(Self::ProviderLogoutSucceeded),
+            29 => Ok(Self::ProviderMutationAborted),
+            30 => Ok(Self::ProviderStateAmbiguous),
             _ => Err(InternalWireError::InvalidFrame),
         }
     }
@@ -367,17 +429,17 @@ impl std::error::Error for InternalWireError {}
 pub(super) fn send_command(
     socket: BorrowedFd<'_>,
     command: WorkerCommand,
-    passphrase: Option<BorrowedFd<'_>>,
+    secret: Option<BorrowedFd<'_>>,
     deadline: Instant,
 ) -> Result<(), InternalWireError> {
     let bytes = command.encode()?;
-    match (command.kind, passphrase) {
-        (WorkerCommandKind::Unlock, Some(descriptor)) => {
-            send_record(socket, &bytes, &[descriptor], deadline)
-        }
-        (WorkerCommandKind::Unlock, None) | (_, Some(_)) => {
-            Err(InternalWireError::InvalidDescriptors)
-        }
+    match (command.kind, secret) {
+        (
+            WorkerCommandKind::Unlock | WorkerCommandKind::ProviderOpenAiConfigure,
+            Some(descriptor),
+        ) => send_record(socket, &bytes, &[descriptor], deadline),
+        (WorkerCommandKind::Unlock | WorkerCommandKind::ProviderOpenAiConfigure, None)
+        | (_, Some(_)) => Err(InternalWireError::InvalidDescriptors),
         (_, None) => send_record(socket, &bytes, &[], deadline),
     }
 }
@@ -389,8 +451,12 @@ pub(super) fn receive_command(
     let (bytes, mut descriptors) = receive_record(socket, deadline)?;
     let command = WorkerCommand::decode(&bytes)?;
     match (command.kind, descriptors.len()) {
-        (WorkerCommandKind::Unlock, 1) => Ok((command, descriptors.pop())),
-        (WorkerCommandKind::Unlock, _) | (_, 1..) => Err(InternalWireError::InvalidDescriptors),
+        (WorkerCommandKind::Unlock | WorkerCommandKind::ProviderOpenAiConfigure, 1) => {
+            Ok((command, descriptors.pop()))
+        }
+        (WorkerCommandKind::Unlock | WorkerCommandKind::ProviderOpenAiConfigure, _) | (_, 1..) => {
+            Err(InternalWireError::InvalidDescriptors)
+        }
         (_, 0) => Ok((command, None)),
     }
 }
@@ -624,6 +690,18 @@ mod tests {
         assert_eq!(command, WorkerCommand::unlock(7, 12));
         assert!(descriptor.is_some());
 
+        let (key_read, _key_write) = pipe_with(PipeFlags::CLOEXEC).expect("key pipe");
+        send_command(
+            parent.as_fd(),
+            WorkerCommand::provider_openai_configure(8, 32),
+            Some(key_read.as_fd()),
+            deadline,
+        )
+        .expect("send provider configure");
+        let (command, descriptor) = receive_command(worker.as_fd(), deadline).expect("receive");
+        assert_eq!(command, WorkerCommand::provider_openai_configure(8, 32));
+        assert!(descriptor.is_some());
+
         let response = WorkerResponse::unlocked(7, "KA-0123456789abcdef01234567".to_owned());
         send_response(worker.as_fd(), &response, deadline).expect("send response");
         assert_eq!(
@@ -636,6 +714,14 @@ mod tests {
     fn canonical_frames_reject_wrong_arity_reserved_bytes_and_correlation() {
         assert_eq!(
             WorkerCommand::unlock(1, 11).encode(),
+            Err(InternalWireError::InvalidFrame)
+        );
+        assert_eq!(
+            WorkerCommand::provider_openai_configure(1, 0).encode(),
+            Err(InternalWireError::InvalidFrame)
+        );
+        assert_eq!(
+            WorkerCommand::provider_openai_configure(1, 513).encode(),
             Err(InternalWireError::InvalidFrame)
         );
         let mut frame = WorkerCommand::probe(1).encode().expect("frame");

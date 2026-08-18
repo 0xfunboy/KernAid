@@ -5,9 +5,9 @@ use super::{
 };
 use kernaid_protocol::rescue_vault::{
     ErrorToken, MAX_INITIAL_STATE_VERSION, MAX_SAFE_JSON_INTEGER, Operation, PeerAllowlist,
-    RequestDecodeError, RequestPayload, ServerReceiveError, SuccessPayload, ValidatedRequest,
-    VaultState, VaultStatusPayload, authenticate_seqpacket_peer, gate_operation_for_vault_state,
-    validate_passphrase_read,
+    Provider, ProviderState, ProviderStatusPayload, RequestDecodeError, RequestPayload,
+    ServerReceiveError, SuccessPayload, ValidatedRequest, VaultState, VaultStatusPayload,
+    authenticate_seqpacket_peer, gate_operation_for_vault_state, validate_passphrase_read,
 };
 use nix::sys::signal::{SigSet, Signal};
 use rand_core::{OsRng, RngCore};
@@ -67,6 +67,7 @@ struct ServiceState {
     version: u64,
     availability: Availability,
     transition_origin: Option<Availability>,
+    provider_operation_active: bool,
     last_unlock_attempt: Option<Instant>,
     faulted: bool,
     fault_marker_required: bool,
@@ -321,6 +322,7 @@ pub(super) fn run(companion_uid: u32) -> Result<(), RescueVaultDaemonError> {
             version: seed,
             availability,
             transition_origin: None,
+            provider_operation_active: false,
             last_unlock_attempt: None,
             faulted: startup_fault,
             fault_marker_required: startup_fault,
@@ -956,7 +958,10 @@ fn handle_connection(connection: OwnedFd, allowlist: PeerAllowlist, supervisor: 
     };
     let mutation = matches!(
         request.operation(),
-        Operation::VaultUnlock | Operation::VaultLock
+        Operation::VaultUnlock
+            | Operation::VaultLock
+            | Operation::ProviderOpenAiConfigure
+            | Operation::ProviderLogout
     );
     let started = Instant::now();
     let (version, result) = supervisor.handle_connected_request(
@@ -1121,6 +1126,11 @@ impl Supervisor {
             Operation::VaultStatus => self.handle_status(request),
             Operation::VaultUnlock => self.handle_unlock(request, started, &connection),
             Operation::VaultLock => self.handle_lock(request, started, &connection),
+            Operation::ProviderStatus => self.handle_provider_status(request, started, &connection),
+            Operation::ProviderOpenAiConfigure => {
+                self.handle_provider_configure(request, started, &connection)
+            }
+            Operation::ProviderLogout => self.handle_provider_logout(request, started, &connection),
             _ => unreachable!("external operation allowlist is closed"),
         }
     }
@@ -1161,6 +1171,330 @@ impl Supervisor {
                         )
                     }
                 }
+            }
+        }
+    }
+
+    fn handle_provider_status(
+        self: &Arc<Self>,
+        request: ValidatedRequest,
+        started: Instant,
+        connection: &ClientConnection<'_>,
+    ) -> (u64, HandlerResult) {
+        let operation_deadline = started
+            .checked_add(WORKER_OPERATION_TIMEOUT)
+            .unwrap_or(started);
+        if !matches!(request.payload(), RequestPayload::Empty) {
+            let version = self.snapshot().version;
+            return (version, HandlerResult::Error(request, ErrorToken::IoFailed));
+        }
+        if let Err((version, error)) =
+            self.begin_provider_operation(request.expected_state_version(), false, connection)
+        {
+            if error == ErrorToken::RebootRequired {
+                self.mark_fault_by(operation_deadline);
+                return (
+                    self.snapshot().version,
+                    HandlerResult::Error(request, ErrorToken::RebootRequired),
+                );
+            }
+            return (version, HandlerResult::Error(request, error));
+        }
+        match self.provider_dispatch_ready(false, connection) {
+            Ok(DispatchArm::Armed) => {}
+            Ok(DispatchArm::StoppedBeforeArm | DispatchArm::StoppedAfterArm) => {
+                return match self.release_provider_status() {
+                    Ok(version) => (version, HandlerResult::Error(request, ErrorToken::Busy)),
+                    Err(()) => {
+                        self.mark_fault_by(operation_deadline);
+                        (
+                            self.snapshot().version,
+                            HandlerResult::Error(request, ErrorToken::RebootRequired),
+                        )
+                    }
+                };
+            }
+            Ok(DispatchArm::ClientGoneBeforeArm | DispatchArm::ClientGoneAfterArm) => {
+                return match self.release_provider_status() {
+                    Ok(version) => (version, HandlerResult::Error(request, ErrorToken::IoFailed)),
+                    Err(()) => {
+                        self.mark_fault_by(operation_deadline);
+                        (
+                            self.snapshot().version,
+                            HandlerResult::Error(request, ErrorToken::RebootRequired),
+                        )
+                    }
+                };
+            }
+            Err(_) => {
+                self.mark_fault_by(operation_deadline);
+                return (
+                    self.snapshot().version,
+                    HandlerResult::Error(request, ErrorToken::RebootRequired),
+                );
+            }
+        }
+        let Some(worker) = self.worker.as_ref() else {
+            self.mark_fault_by(operation_deadline);
+            return (
+                self.snapshot().version,
+                HandlerResult::Error(request, ErrorToken::RebootRequired),
+            );
+        };
+        match worker.transact(
+            internal_wire::WorkerCommandKind::ProviderStatus,
+            None,
+            None,
+            operation_deadline,
+        ) {
+            Ok(response) => {
+                use internal_wire::WorkerResultCode as Result;
+                let openai = match response.code {
+                    Result::ProviderStatusUnconfigured => ProviderState::Unconfigured,
+                    Result::ProviderStatusConfigured => ProviderState::Configured,
+                    Result::ProviderStateAmbiguous => {
+                        self.mark_fault_by(operation_deadline);
+                        return (
+                            self.snapshot().version,
+                            HandlerResult::Error(request, ErrorToken::RebootRequired),
+                        );
+                    }
+                    _ => {
+                        self.mark_fault_by(operation_deadline);
+                        return (
+                            self.snapshot().version,
+                            HandlerResult::Error(request, ErrorToken::RebootRequired),
+                        );
+                    }
+                };
+                let version = match self.release_provider_status() {
+                    Ok(version) => version,
+                    Err(()) => {
+                        self.mark_fault_by(operation_deadline);
+                        return (
+                            self.snapshot().version,
+                            HandlerResult::Error(request, ErrorToken::RebootRequired),
+                        );
+                    }
+                };
+                (
+                    version,
+                    HandlerResult::Success(
+                        request,
+                        SuccessPayload::ProviderStatus(ProviderStatusPayload {
+                            openai,
+                            codex: ProviderState::Unconfigured,
+                        }),
+                    ),
+                )
+            }
+            Err(_) => {
+                self.mark_fault_by(operation_deadline);
+                (
+                    self.snapshot().version,
+                    HandlerResult::Error(request, ErrorToken::RebootRequired),
+                )
+            }
+        }
+    }
+
+    fn handle_provider_configure(
+        self: &Arc<Self>,
+        mut request: ValidatedRequest,
+        started: Instant,
+        connection: &ClientConnection<'_>,
+    ) -> (u64, HandlerResult) {
+        let operation_deadline = started
+            .checked_add(WORKER_OPERATION_TIMEOUT)
+            .unwrap_or(started);
+        let input_size = match request.payload() {
+            RequestPayload::ProviderOpenAiConfigure { input } => input.size,
+            _ => {
+                let version = self.snapshot().version;
+                return (version, HandlerResult::Error(request, ErrorToken::IoFailed));
+            }
+        };
+        if let Err((version, error)) =
+            self.begin_provider_operation(request.expected_state_version(), true, connection)
+        {
+            if error == ErrorToken::RebootRequired {
+                self.mark_fault_by(operation_deadline);
+                return (
+                    self.snapshot().version,
+                    HandlerResult::Error(request, ErrorToken::RebootRequired),
+                );
+            }
+            return (version, HandlerResult::Error(request, error));
+        }
+        let descriptor = match request.take_descriptor() {
+            Some(descriptor) => descriptor,
+            None => {
+                return self.finish_provider_mutation_without_dispatch(
+                    request,
+                    ErrorToken::FdRequired,
+                    operation_deadline,
+                );
+            }
+        };
+        match self.provider_dispatch_ready(true, connection) {
+            Ok(DispatchArm::Armed) => {}
+            Ok(DispatchArm::StoppedBeforeArm) => {
+                return self.finish_provider_mutation_without_dispatch(
+                    request,
+                    ErrorToken::Busy,
+                    operation_deadline,
+                );
+            }
+            Ok(DispatchArm::ClientGoneBeforeArm) => {
+                return self.finish_provider_mutation_without_dispatch(
+                    request,
+                    ErrorToken::IoFailed,
+                    operation_deadline,
+                );
+            }
+            Ok(DispatchArm::StoppedAfterArm | DispatchArm::ClientGoneAfterArm) => {
+                self.mark_fault_by(operation_deadline);
+                return (
+                    self.snapshot().version,
+                    HandlerResult::Error(request, ErrorToken::RebootRequired),
+                );
+            }
+            Err(_) => {
+                self.mark_fault_by(operation_deadline);
+                return (
+                    self.snapshot().version,
+                    HandlerResult::Error(request, ErrorToken::RebootRequired),
+                );
+            }
+        }
+        let Some(worker) = self.worker.as_ref() else {
+            self.mark_fault_by(operation_deadline);
+            return (
+                self.snapshot().version,
+                HandlerResult::Error(request, ErrorToken::RebootRequired),
+            );
+        };
+        let response = worker.transact(
+            internal_wire::WorkerCommandKind::ProviderOpenAiConfigure,
+            u16::try_from(input_size).ok(),
+            Some(descriptor.as_fd()),
+            operation_deadline,
+        );
+        drop(descriptor);
+        match response {
+            Ok(response) => self.finish_provider_mutation(
+                request,
+                response,
+                ProviderState::Configured,
+                internal_wire::WorkerResultCode::ProviderConfigureSucceeded,
+                operation_deadline,
+            ),
+            Err(_) => {
+                self.mark_fault_by(operation_deadline);
+                (
+                    self.snapshot().version,
+                    HandlerResult::Error(request, ErrorToken::RebootRequired),
+                )
+            }
+        }
+    }
+
+    fn handle_provider_logout(
+        self: &Arc<Self>,
+        request: ValidatedRequest,
+        started: Instant,
+        connection: &ClientConnection<'_>,
+    ) -> (u64, HandlerResult) {
+        let operation_deadline = started
+            .checked_add(WORKER_OPERATION_TIMEOUT)
+            .unwrap_or(started);
+        match request.payload() {
+            RequestPayload::ProviderLogout {
+                provider: Provider::OpenAi,
+            } => {}
+            RequestPayload::ProviderLogout {
+                provider: Provider::Codex,
+            } => {
+                let version = self.snapshot().version;
+                return (
+                    version,
+                    HandlerResult::Error(request, ErrorToken::NotAuthorized),
+                );
+            }
+            _ => {
+                let version = self.snapshot().version;
+                return (version, HandlerResult::Error(request, ErrorToken::IoFailed));
+            }
+        }
+        if let Err((version, error)) =
+            self.begin_provider_operation(request.expected_state_version(), true, connection)
+        {
+            if error == ErrorToken::RebootRequired {
+                self.mark_fault_by(operation_deadline);
+                return (
+                    self.snapshot().version,
+                    HandlerResult::Error(request, ErrorToken::RebootRequired),
+                );
+            }
+            return (version, HandlerResult::Error(request, error));
+        }
+        match self.provider_dispatch_ready(true, connection) {
+            Ok(DispatchArm::Armed) => {}
+            Ok(DispatchArm::StoppedBeforeArm) => {
+                return self.finish_provider_mutation_without_dispatch(
+                    request,
+                    ErrorToken::Busy,
+                    operation_deadline,
+                );
+            }
+            Ok(DispatchArm::ClientGoneBeforeArm) => {
+                return self.finish_provider_mutation_without_dispatch(
+                    request,
+                    ErrorToken::IoFailed,
+                    operation_deadline,
+                );
+            }
+            Ok(DispatchArm::StoppedAfterArm | DispatchArm::ClientGoneAfterArm) => {
+                self.mark_fault_by(operation_deadline);
+                return (
+                    self.snapshot().version,
+                    HandlerResult::Error(request, ErrorToken::RebootRequired),
+                );
+            }
+            Err(_) => {
+                self.mark_fault_by(operation_deadline);
+                return (
+                    self.snapshot().version,
+                    HandlerResult::Error(request, ErrorToken::RebootRequired),
+                );
+            }
+        }
+        let Some(worker) = self.worker.as_ref() else {
+            self.mark_fault_by(operation_deadline);
+            return (
+                self.snapshot().version,
+                HandlerResult::Error(request, ErrorToken::RebootRequired),
+            );
+        };
+        match worker.transact(
+            internal_wire::WorkerCommandKind::ProviderOpenAiLogout,
+            None,
+            None,
+            operation_deadline,
+        ) {
+            Ok(response) => self.finish_provider_mutation(
+                request,
+                response,
+                ProviderState::Unconfigured,
+                internal_wire::WorkerResultCode::ProviderLogoutSucceeded,
+                operation_deadline,
+            ),
+            Err(_) => {
+                self.mark_fault_by(operation_deadline);
+                (
+                    self.snapshot().version,
+                    HandlerResult::Error(request, ErrorToken::RebootRequired),
+                )
             }
         }
     }
@@ -1584,6 +1918,202 @@ impl Supervisor {
         begin_lock_state(&mut state, expected, self.stopping.load(Ordering::Acquire))
     }
 
+    fn begin_provider_operation(
+        &self,
+        expected: u64,
+        mutation: bool,
+        connection: &ClientConnection<'_>,
+    ) -> Result<u64, (u64, ErrorToken)> {
+        let _decision = self
+            .lifecycle
+            .lock()
+            .map_err(|_| (0, ErrorToken::RebootRequired))?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| (0, ErrorToken::RebootRequired))?;
+        if !connection.is_live() {
+            return Err((state.version, ErrorToken::IoFailed));
+        }
+        begin_provider_operation_state(
+            &mut state,
+            expected,
+            mutation,
+            self.stopping.load(Ordering::Acquire),
+        )
+    }
+
+    fn provider_dispatch_ready(
+        &self,
+        mutation: bool,
+        connection: &ClientConnection<'_>,
+    ) -> Result<DispatchArm, RescueVaultDaemonError> {
+        let _decision = self
+            .lifecycle
+            .lock()
+            .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+        if state.faulted
+            || !state.provider_operation_active
+            || mutation != state.transition_origin.is_some()
+            || !matches!(
+                state.availability,
+                Availability::Available {
+                    state: VaultState::Unlocked,
+                    device_id: Some(_),
+                }
+            )
+        {
+            return Err(RescueVaultDaemonError::PersistentFault);
+        }
+        if !connection.is_live() {
+            return Ok(DispatchArm::ClientGoneBeforeArm);
+        }
+        if self.stopping.load(Ordering::Acquire) {
+            return Ok(DispatchArm::StoppedBeforeArm);
+        }
+        self.privacy
+            .validate_no_active_swap()
+            .map_err(|()| RescueVaultDaemonError::RuntimeUnavailable)?;
+        if self.stopping.load(Ordering::Acquire) {
+            return Ok(DispatchArm::StoppedBeforeArm);
+        }
+        if !connection.is_live() {
+            return Ok(DispatchArm::ClientGoneBeforeArm);
+        }
+        if mutation {
+            self.runtime
+                .lock()
+                .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?
+                .arm_lifecycle()?;
+        }
+        if self.stopping.load(Ordering::Acquire) {
+            Ok(DispatchArm::StoppedAfterArm)
+        } else if !connection.is_live() {
+            Ok(DispatchArm::ClientGoneAfterArm)
+        } else {
+            Ok(DispatchArm::Armed)
+        }
+    }
+
+    fn release_provider_status(&self) -> Result<u64, ()> {
+        let _decision = self.lifecycle.lock().map_err(|_| ())?;
+        let mut state = self.state.lock().map_err(|_| ())?;
+        if state.faulted
+            || !state.provider_operation_active
+            || state.transition_origin.is_some()
+            || !matches!(
+                state.availability,
+                Availability::Available {
+                    state: VaultState::Unlocked,
+                    device_id: Some(_),
+                }
+            )
+        {
+            return Err(());
+        }
+        state.provider_operation_active = false;
+        Ok(state.version)
+    }
+
+    fn complete_provider_mutation(&self) -> Result<u64, ()> {
+        let _decision = self.lifecycle.lock().map_err(|_| ())?;
+        let mut state = self.state.lock().map_err(|_| ())?;
+        let origin = state.transition_origin.as_ref().ok_or(())?;
+        if state.faulted
+            || !state.provider_operation_active
+            || origin != &state.availability
+            || !matches!(
+                state.availability,
+                Availability::Available {
+                    state: VaultState::Unlocked,
+                    device_id: Some(_),
+                }
+            )
+            || state.version >= MAX_SAFE_JSON_INTEGER
+        {
+            return Err(());
+        }
+        state.version += 1;
+        state.transition_origin = None;
+        state.provider_operation_active = false;
+        Ok(state.version)
+    }
+
+    fn finish_provider_mutation_without_dispatch(
+        &self,
+        request: ValidatedRequest,
+        error: ErrorToken,
+        deadline: Instant,
+    ) -> (u64, HandlerResult) {
+        match self.complete_provider_mutation() {
+            Ok(version) => (version, HandlerResult::Error(request, error)),
+            Err(()) => {
+                self.mark_fault_by(deadline);
+                (
+                    self.snapshot().version,
+                    HandlerResult::Error(request, ErrorToken::RebootRequired),
+                )
+            }
+        }
+    }
+
+    fn finish_provider_mutation(
+        &self,
+        request: ValidatedRequest,
+        response: internal_wire::WorkerResponse,
+        desired: ProviderState,
+        expected_success: internal_wire::WorkerResultCode,
+        deadline: Instant,
+    ) -> (u64, HandlerResult) {
+        use internal_wire::WorkerResultCode as Result;
+        if response.code == expected_success {
+            return match self.complete_provider_mutation() {
+                Ok(version) => (
+                    version,
+                    HandlerResult::Success(
+                        request,
+                        SuccessPayload::ProviderStatus(ProviderStatusPayload {
+                            openai: desired,
+                            codex: ProviderState::Unconfigured,
+                        }),
+                    ),
+                ),
+                Err(()) => {
+                    self.mark_fault_by(deadline);
+                    (
+                        self.snapshot().version,
+                        HandlerResult::Error(request, ErrorToken::RebootRequired),
+                    )
+                }
+            };
+        }
+        match response.code {
+            Result::ProviderMutationAborted | Result::InvalidRequest => {
+                match self.complete_provider_mutation() {
+                    Ok(version) => (version, HandlerResult::Error(request, ErrorToken::IoFailed)),
+                    Err(()) => {
+                        self.mark_fault_by(deadline);
+                        (
+                            self.snapshot().version,
+                            HandlerResult::Error(request, ErrorToken::RebootRequired),
+                        )
+                    }
+                }
+            }
+            _ => {
+                self.mark_fault_by(deadline);
+                (
+                    self.snapshot().version,
+                    HandlerResult::Error(request, ErrorToken::RebootRequired),
+                )
+            }
+        }
+    }
+
     fn complete_transition(
         &self,
         expected: VaultState,
@@ -1722,6 +2252,7 @@ impl Supervisor {
         let faulted = self.faulted.load(Ordering::Acquire);
         let coherent = faulted == state.faulted
             && state.transition_origin.is_none()
+            && !state.provider_operation_active
             && !state.marker_persistence_failed
             && if faulted {
                 disposition == RuntimeDisposition::PersistentFault
@@ -1914,7 +2445,12 @@ impl Supervisor {
 fn external_operation_is_enabled(operation: Operation) -> bool {
     matches!(
         operation,
-        Operation::VaultStatus | Operation::VaultUnlock | Operation::VaultLock
+        Operation::VaultStatus
+            | Operation::VaultUnlock
+            | Operation::VaultLock
+            | Operation::ProviderOpenAiConfigure
+            | Operation::ProviderStatus
+            | Operation::ProviderLogout
     )
 }
 
@@ -1936,6 +2472,9 @@ fn begin_unlock_state(
     }
     if expected != state.version {
         return Err((state.version, ErrorToken::StaleState));
+    }
+    if state.provider_operation_active {
+        return Err((state.version, ErrorToken::Busy));
     }
     match &state.availability {
         Availability::Unavailable(error) => return Err((state.version, *error)),
@@ -1989,6 +2528,9 @@ fn begin_lock_state(
     if expected != state.version {
         return Err((state.version, ErrorToken::StaleState));
     }
+    if state.provider_operation_active {
+        return Err((state.version, ErrorToken::Busy));
+    }
     match &state.availability {
         Availability::Unavailable(error) => return Err((state.version, *error)),
         Availability::Available { state: vault, .. } => {
@@ -2021,8 +2563,53 @@ fn begin_lock_state(
     Ok(state.version)
 }
 
+fn begin_provider_operation_state(
+    state: &mut ServiceState,
+    expected: u64,
+    mutation: bool,
+    stopping: bool,
+) -> Result<u64, (u64, ErrorToken)> {
+    if state.faulted {
+        return Err((state.version, ErrorToken::RebootRequired));
+    }
+    if stopping {
+        return Err((state.version, ErrorToken::Busy));
+    }
+    if expected != state.version {
+        return Err((state.version, ErrorToken::StaleState));
+    }
+    if state.provider_operation_active || state.transition_origin.is_some() {
+        return Err((state.version, ErrorToken::Busy));
+    }
+    match &state.availability {
+        Availability::Unavailable(error) => return Err((state.version, *error)),
+        Availability::Available { state: vault, .. } => match vault {
+            VaultState::Unlocked => {}
+            VaultState::Absent => return Err((state.version, ErrorToken::Absent)),
+            VaultState::Unprovisioned => {
+                return Err((state.version, ErrorToken::Unprovisioned));
+            }
+            VaultState::Locked => return Err((state.version, ErrorToken::Locked)),
+            VaultState::Unlocking | VaultState::Locking => {
+                return Err((state.version, ErrorToken::Busy));
+            }
+            VaultState::FaultedRebootRequired => {
+                return Err((state.version, ErrorToken::RebootRequired));
+            }
+        },
+    }
+    if mutation {
+        ensure_transition_headroom(state.version, 2).map_err(|error| (state.version, error))?;
+        state.transition_origin = Some(state.availability.clone());
+        state.version += 1;
+    }
+    state.provider_operation_active = true;
+    Ok(state.version)
+}
+
 fn validate_completion(state: &ServiceState, expected: VaultState) -> Result<(), ()> {
     if state.faulted
+        || state.provider_operation_active
         || state.transition_origin.is_none()
         || !matches!(
             state.availability,
@@ -2041,6 +2628,7 @@ fn apply_completion(state: &mut ServiceState, availability: Availability) -> u64
     state.version += 1;
     state.availability = availability;
     state.transition_origin = None;
+    state.provider_operation_active = false;
     state.version
 }
 
@@ -2057,6 +2645,7 @@ fn transition_state_to_fault(state: &mut ServiceState, marker_required: bool) {
     }
     state.availability = faulted_availability();
     state.transition_origin = None;
+    state.provider_operation_active = false;
 }
 
 fn ensure_transition_headroom(version: u64, transitions: u64) -> Result<(), ErrorToken> {
@@ -2752,17 +3341,40 @@ mod tests {
         ));
     }
 
+    fn assert_handler_provider_status(result: HandlerResult, expected: ProviderState) {
+        assert!(matches!(
+            result,
+            HandlerResult::Success(
+                _request,
+                SuccessPayload::ProviderStatus(ProviderStatusPayload {
+                    openai,
+                    codex: ProviderState::Unconfigured,
+                }),
+            ) if openai == expected
+        ));
+    }
+
     fn service_state(version: u64, vault: VaultState) -> ServiceState {
         ServiceState {
             version,
             availability: available(vault, None),
             transition_origin: None,
+            provider_operation_active: false,
             last_unlock_attempt: None,
             faulted: false,
             fault_marker_required: false,
             marker_persistence_failed: false,
             clean_fault_shutdown: false,
         }
+    }
+
+    fn unlocked_service_state(version: u64) -> ServiceState {
+        let mut state = service_state(version, VaultState::Unlocked);
+        state.availability = available(
+            VaultState::Unlocked,
+            Some("KA-0123456789abcdef01234567".to_owned()),
+        );
+        state
     }
 
     fn notification_receiver(address: &SocketAddrUnix) -> OwnedFd {
@@ -3458,7 +4070,7 @@ mod tests {
     }
 
     #[test]
-    fn supervisor_rejects_all_non_lifecycle_requests_in_every_state_without_effects() {
+    fn supervisor_rejects_all_deferred_requests_in_every_state_without_effects() {
         for vault in [
             VaultState::Absent,
             VaultState::Unprovisioned,
@@ -3474,15 +4086,6 @@ mod tests {
                 initial.fault_marker_required = true;
             }
             let (supervisor, runtime, worker, _, _) = fake_supervisor(initial, [], true);
-            let (configure, configure_writer) = descriptor_request(
-                "provider.openai.configure",
-                serde_json::json!({
-                    "input": {"type": "openai-api-key-pipe", "size": 1}
-                }),
-                60,
-                PeerRole::Companion,
-                b"K",
-            );
             let (persist, persist_writer) = descriptor_request(
                 "report.persist",
                 serde_json::json!({
@@ -3495,20 +4098,6 @@ mod tests {
                 b"{}",
             );
             let requests = [
-                (configure, Some(configure_writer)),
-                (
-                    validated_request("provider.status", serde_json::json!({}), 60, None),
-                    None,
-                ),
-                (
-                    validated_request(
-                        "provider.logout",
-                        serde_json::json!({"provider": "openai"}),
-                        60,
-                        None,
-                    ),
-                    None,
-                ),
                 (
                     validated_request_for_role(
                         "provider.openai.borrow",
@@ -3641,11 +4230,8 @@ mod tests {
     }
 
     #[test]
-    fn only_three_external_operations_are_enabled_in_every_state() {
+    fn only_vault_and_openai_configuration_operations_are_enabled() {
         let forbidden = [
-            Operation::ProviderOpenAiConfigure,
-            Operation::ProviderStatus,
-            Operation::ProviderLogout,
             Operation::ProviderOpenAiBorrow,
             Operation::ProviderCodexHomeLease,
             Operation::AuditAppend,
@@ -3672,9 +4258,282 @@ mod tests {
             Operation::VaultStatus,
             Operation::VaultUnlock,
             Operation::VaultLock,
+            Operation::ProviderOpenAiConfigure,
+            Operation::ProviderStatus,
+            Operation::ProviderLogout,
         ] {
             assert!(external_operation_is_enabled(operation));
         }
+    }
+
+    #[test]
+    fn provider_status_configure_and_logout_use_real_requests_and_exact_versions() {
+        let (status, runtime, worker, privacy, _) = fake_supervisor(
+            unlocked_service_state(60),
+            [Ok(internal_wire::WorkerResponse::new(
+                1,
+                internal_wire::WorkerResultCode::ProviderStatusConfigured,
+            ))],
+            true,
+        );
+        let request = validated_request("provider.status", serde_json::json!({}), 60, None);
+        let (version, result) = status.handle_request(request, Instant::now());
+        assert_eq!(version, 60);
+        assert_handler_provider_status(result, ProviderState::Configured);
+        assert_eq!(privacy.checks.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            worker.lock().expect("worker trace").calls,
+            [internal_wire::WorkerCommandKind::ProviderStatus]
+        );
+        assert_eq!(runtime.lock().expect("runtime trace").arms, 0);
+
+        let (configure, runtime, worker, privacy, _) = fake_supervisor(
+            unlocked_service_state(70),
+            [Ok(internal_wire::WorkerResponse::new(
+                2,
+                internal_wire::WorkerResultCode::ProviderConfigureSucceeded,
+            ))],
+            true,
+        );
+        let (request, writer) = descriptor_request(
+            "provider.openai.configure",
+            serde_json::json!({
+                "input": {"type": "openai-api-key-pipe", "size": 1}
+            }),
+            70,
+            PeerRole::Companion,
+            b"K",
+        );
+        drop(writer);
+        let (version, result) = configure.handle_request(request, Instant::now());
+        assert_eq!(version, 72);
+        assert_handler_provider_status(result, ProviderState::Configured);
+        assert_eq!(privacy.checks.load(Ordering::Relaxed), 1);
+        let worker = worker.lock().expect("worker trace");
+        assert_eq!(
+            worker.calls,
+            [internal_wire::WorkerCommandKind::ProviderOpenAiConfigure]
+        );
+        assert_eq!(worker.passphrase_bytes, 1);
+        drop(worker);
+        let runtime = runtime.lock().expect("runtime trace");
+        assert_eq!(runtime.arms, 1);
+        assert!(runtime.marker);
+
+        let (logout, runtime, worker, privacy, _) = fake_supervisor(
+            unlocked_service_state(80),
+            [Ok(internal_wire::WorkerResponse::new(
+                3,
+                internal_wire::WorkerResultCode::ProviderLogoutSucceeded,
+            ))],
+            true,
+        );
+        let request = validated_request(
+            "provider.logout",
+            serde_json::json!({"provider": "openai"}),
+            80,
+            None,
+        );
+        let (version, result) = logout.handle_request(request, Instant::now());
+        assert_eq!(version, 82);
+        assert_handler_provider_status(result, ProviderState::Unconfigured);
+        assert_eq!(privacy.checks.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            worker.lock().expect("worker trace").calls,
+            [internal_wire::WorkerCommandKind::ProviderOpenAiLogout]
+        );
+        assert_eq!(runtime.lock().expect("runtime trace").arms, 1);
+    }
+
+    #[test]
+    fn provider_gates_reject_stale_locked_busy_dead_client_and_codex_without_dispatch() {
+        for (mut state, expected, error) in [
+            (unlocked_service_state(90), 89, ErrorToken::StaleState),
+            (
+                service_state(90, VaultState::Locked),
+                90,
+                ErrorToken::Locked,
+            ),
+        ] {
+            state.provider_operation_active = false;
+            let (supervisor, _, worker, privacy, _) = fake_supervisor(state, [], true);
+            let request =
+                validated_request("provider.status", serde_json::json!({}), expected, None);
+            let (version, result) = supervisor.handle_request(request, Instant::now());
+            assert_eq!(version, 90);
+            assert_handler_error(result, error);
+            assert!(worker.lock().expect("worker trace").calls.is_empty());
+            assert_eq!(privacy.checks.load(Ordering::Relaxed), 0);
+        }
+
+        let mut active = unlocked_service_state(100);
+        active.provider_operation_active = true;
+        let (supervisor, _, worker, _, _) = fake_supervisor(active, [], true);
+        let request = validated_request("provider.status", serde_json::json!({}), 100, None);
+        let (version, result) = supervisor.handle_request(request, Instant::now());
+        assert_eq!(version, 100);
+        assert_handler_error(result, ErrorToken::Busy);
+        assert!(worker.lock().expect("worker trace").calls.is_empty());
+
+        let (supervisor, _, worker, _, _) = fake_supervisor(unlocked_service_state(110), [], true);
+        let (request, client, server) = validated_request_with_connection_for_role(
+            "provider.status",
+            serde_json::json!({}),
+            110,
+            None,
+            PeerRole::Companion,
+        );
+        drop(client);
+        let (version, result) = supervisor.handle_connected_request(
+            request,
+            Instant::now(),
+            ClientConnection::Socket(server.as_fd()),
+        );
+        assert_eq!(version, 110);
+        assert_handler_error(result, ErrorToken::IoFailed);
+        assert!(worker.lock().expect("worker trace").calls.is_empty());
+
+        let (supervisor, _, worker, _, _) = fake_supervisor(unlocked_service_state(120), [], true);
+        let request = validated_request(
+            "provider.logout",
+            serde_json::json!({"provider": "codex"}),
+            120,
+            None,
+        );
+        let (version, result) = supervisor.handle_request(request, Instant::now());
+        assert_eq!(version, 120);
+        assert_handler_error(result, ErrorToken::NotAuthorized);
+        assert!(worker.lock().expect("worker trace").calls.is_empty());
+
+        let mut faulted = unlocked_service_state(125);
+        faulted.faulted = true;
+        faulted.fault_marker_required = true;
+        faulted.availability = faulted_availability();
+        let (supervisor, _, worker, _, _) = fake_supervisor(faulted, [], true);
+        supervisor.faulted.store(true, Ordering::Release);
+        let request = validated_request("provider.status", serde_json::json!({}), 125, None);
+        let (version, result) = supervisor.handle_request(request, Instant::now());
+        assert_eq!(version, 125);
+        assert_handler_error(result, ErrorToken::RebootRequired);
+        assert!(worker.lock().expect("worker trace").calls.is_empty());
+
+        let mut provider_mutation = unlocked_service_state(126);
+        assert_eq!(
+            begin_provider_operation_state(&mut provider_mutation, 126, true, false),
+            Ok(127)
+        );
+        assert_eq!(
+            begin_lock_state(&mut provider_mutation, 127, false),
+            Err((127, ErrorToken::Busy))
+        );
+        assert_eq!(
+            begin_provider_operation_state(&mut provider_mutation, 127, false, false),
+            Err((127, ErrorToken::Busy))
+        );
+
+        let mut vault_mutation = unlocked_service_state(128);
+        assert_eq!(begin_lock_state(&mut vault_mutation, 128, false), Ok(129));
+        assert_eq!(
+            begin_provider_operation_state(&mut vault_mutation, 129, false, false),
+            Err((129, ErrorToken::Busy))
+        );
+    }
+
+    #[test]
+    fn provider_aborted_is_consistent_but_ambiguous_or_privacy_failure_faults() {
+        let (aborted, _, worker, _, _) = fake_supervisor(
+            unlocked_service_state(130),
+            [Ok(internal_wire::WorkerResponse::new(
+                4,
+                internal_wire::WorkerResultCode::ProviderMutationAborted,
+            ))],
+            true,
+        );
+        let request = validated_request(
+            "provider.logout",
+            serde_json::json!({"provider": "openai"}),
+            130,
+            None,
+        );
+        let (version, result) = aborted.handle_request(request, Instant::now());
+        assert_eq!(version, 132);
+        assert_handler_error(result, ErrorToken::IoFailed);
+        assert!(!aborted.faulted.load(Ordering::Acquire));
+        assert_eq!(worker.lock().expect("worker trace").faults, 0);
+
+        let (ambiguous, _, worker, _, _) = fake_supervisor(
+            unlocked_service_state(140),
+            [Ok(internal_wire::WorkerResponse::new(
+                5,
+                internal_wire::WorkerResultCode::ProviderStateAmbiguous,
+            ))],
+            true,
+        );
+        let request = validated_request("provider.status", serde_json::json!({}), 140, None);
+        let (version, result) = ambiguous.handle_request(request, Instant::now());
+        assert_eq!(version, 141);
+        assert_handler_error(result, ErrorToken::RebootRequired);
+        assert!(ambiguous.faulted.load(Ordering::Acquire));
+        assert_eq!(worker.lock().expect("worker trace").faults, 1);
+
+        let (privacy_failed, _, worker, privacy, _) =
+            fake_supervisor(unlocked_service_state(150), [], false);
+        let request = validated_request("provider.status", serde_json::json!({}), 150, None);
+        let (version, result) = privacy_failed.handle_request(request, Instant::now());
+        assert_eq!(version, 151);
+        assert_handler_error(result, ErrorToken::RebootRequired);
+        assert_eq!(privacy.checks.load(Ordering::Relaxed), 1);
+        let worker = worker.lock().expect("worker trace");
+        assert!(worker.calls.is_empty());
+        assert_eq!(worker.faults, 1);
+    }
+
+    #[test]
+    fn provider_stop_before_arm_rolls_back_but_stop_after_marker_faults() {
+        let (before, runtime, worker, _, _) =
+            fake_supervisor(unlocked_service_state(160), [], true);
+        before.stopping.store(true, Ordering::Release);
+        let request = validated_request(
+            "provider.logout",
+            serde_json::json!({"provider": "openai"}),
+            160,
+            None,
+        );
+        let (version, result) = before.handle_request(request, Instant::now());
+        assert_eq!(version, 160);
+        assert_handler_error(result, ErrorToken::Busy);
+        assert_eq!(runtime.lock().expect("runtime trace").arms, 0);
+        assert!(worker.lock().expect("worker trace").calls.is_empty());
+
+        let (after, runtime, worker, _, trace) =
+            fake_supervisor(unlocked_service_state(170), [], true);
+        let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        *after.runtime.lock().expect("runtime boundary") = Box::new(StopDuringFirstArmRuntime {
+            state: Arc::clone(&runtime),
+            trace: Arc::clone(&trace),
+            entered: entered_tx,
+            release: Some(release_rx),
+        });
+        let request = validated_request(
+            "provider.logout",
+            serde_json::json!({"provider": "openai"}),
+            170,
+            None,
+        );
+        let running = Arc::clone(&after);
+        let handler = thread::spawn(move || running.handle_request(request, Instant::now()));
+        entered_rx.recv().expect("provider marker arm reached");
+        after.stopping.store(true, Ordering::Release);
+        release_tx.send(()).expect("release provider marker arm");
+        let (version, result) = handler.join().expect("provider handler");
+        assert_eq!(version, 172);
+        assert_handler_error(result, ErrorToken::RebootRequired);
+        assert!(after.faulted.load(Ordering::Acquire));
+        let worker = worker.lock().expect("worker trace");
+        assert!(worker.calls.is_empty());
+        assert_eq!(worker.faults, 1);
+        assert!(runtime.lock().expect("runtime trace").marker);
     }
 
     #[test]

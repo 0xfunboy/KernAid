@@ -271,20 +271,34 @@ Rescue ISO.
 
 ## Experimental Rescue lifecycle daemon
 
-With `experimental-vault-manager`, `kernaid-rescue-vaultd` implements only the
-closed `vault.status`, `vault.unlock`, and `vault.lock` lifecycle. Every
-provider configure/status/logout/borrow/home-lease, Agent audit, and report
-persist/list/get request is answered `NOT_AUTHORIZED`, with no output
-descriptor and no worker dispatch. The public socket is the fixed top-level
-`/run/kernaid-rescue-vault.sock`; the daemon accepts only protocol-authenticated
+With `experimental-vault-manager`, `kernaid-rescue-vaultd` implements the
+closed `vault.status`, `vault.unlock`, and `vault.lock` lifecycle plus the
+configuration-only `provider.status`, `provider.openai.configure`, and OpenAI
+form of `provider.logout`. `provider.openai.borrow`, Codex logout/home lease,
+all provider execution or network access, Agent audit, and report
+persist/list/get remain disabled and are answered `NOT_AUTHORIZED`, with no
+output descriptor and no worker dispatch. Provider status returns only the
+configured/unconfigured state; it never returns a credential. Provider
+operations require the vault to be unlocked and are serialized with each
+other and with vault lifecycle work. Status does not change `stateVersion`;
+configure and logout each reserve and complete a transition, so a correlated
+success is exactly the request version plus two. The public socket is the
+fixed top-level `/run/kernaid-rescue-vault.sock`; the daemon accepts only
+protocol-authenticated
 UID 1000 `kernaid` companion requests and never accepts a client path, mapper
 name, command, JSON secret, or configuration argument. `stateVersion` starts
 from a CSPRNG value in the exact JSON-safe range and is checked before every
-transition; status accepts only bootstrap zero or the exact current version.
+transition. `vault.status` accepts bootstrap zero or the exact current version;
+`provider.status` requires the exact current version.
 
 The supervisor remains responsive while a separate, long-lived internal
-worker owns the locator, mount manager, mounted vault and transient application
-store used to copy the public device ID. The worker is moved, before any probe,
+worker owns the locator, mount manager, mounted vault, application store, and
+all provider-key material. It reopens and validates the application store for
+each provider operation and reports only closed presence/mutation outcomes to
+the supervisor. Configure and logout reopen after mutation and distinguish the
+desired state, the exact prior key digest, and an unexpected third state; an
+unresolved or inconsistent observation faults the service rather than
+guessing. The worker is moved, before any probe,
 from the exact delegated cgroup-v2 `supervisor` subgroup to its fixed sibling
 `worker`. The supervisor requires `pids` in the delegated root's controller
 set, enables it through the retained `cgroup.subtree_control` descriptor, and
@@ -321,7 +335,15 @@ that wins a later receive poll closes that connection and uses the same
 unknown-outcome reconciliation as a genuine post-send transport failure.
 Fresh status connections poll transitional `Unlocking`/`Locking` evidence
 silently until a terminal state or the original aggregate deadline, and only
-the exact target with sufficient version advancement is success.
+the exact target with sufficient version advancement is success. Unknown
+configure/logout outcomes first obtain fresh unlocked vault status at least
+two versions beyond the prior state, then query exact provider status at that
+version. Logout's observed unconfigured state is authoritative. Configured
+presence cannot distinguish a replacement key from the prior key, so an
+unknown configure never reports reconciled success and preserves the original
+transport/interruption result after displaying fresh evidence.
+`BUSY`/`STALE_STATE` remain transitional until the original deadline, while
+any other fresh terminal response is preserved.
 Linux cannot distinguish an orderly `SOCK_SEQPACKET` shutdown from an empty
 record immediately followed by shutdown. That explicit zero-byte peer-state
 ambiguity—including a classification deadline reached after consuming the
@@ -329,23 +351,32 @@ zero byte—is eligible for reconciliation only in the post-mutation context; a
 confirmed live empty record and every other malformed frame remain protocol
 failures.
 
-`kernaid-rescue-vaultctl` is the only shipping-shaped passphrase path. It has
-no path/configuration option, verifies the fixed UID/name binding, opens only
-`/dev/tty`, proves foreground job-control ownership, disables and reads back
-echo before printing `READY`, and intercepts INT, TERM, HUP, QUIT, TSTP, TTIN
-and TTOU. Input uses a preallocated zeroizing buffer, exact length/EOF/NUL and
-single-line validation, an anonymous pipe, and cleanup-dominant input flush
-plus verified echo restore. The secret is never placed in argv, environment,
-stdout, JSON or a log. The daemon revalidates the pipe as read-only CLOEXEC
-PIPEFS and copies it into a separate internal pipe only after stale/policy and
-pre-secret swap gates succeed.
+`kernaid-rescue-vaultctl` exposes only the exact commands `status`, `unlock`,
+`lock`, `provider-status`, `openai-configure`, and `openai-logout`; it has no
+path/configuration option. It verifies the fixed UID/name binding, opens only
+`/dev/tty`, proves foreground job-control ownership, and intercepts INT, TERM,
+HUP, QUIT, TSTP, TTIN and TTOU. Passphrase and OpenAI-key input disable and
+read back echo before printing `READY`, use preallocated zeroizing buffers,
+enforce bounded single-line byte policies, and perform cleanup-dominant double
+input flush plus verified echo restore. OpenAI logout separately flushes
+prequeued input before its visible prompt and requires the exact confirmation
+`LOGOUT`. A secret is never placed in argv, environment, stdout, JSON, a Rust
+`String`, or a log. The authenticated protocol decoder validates each external
+secret pipe as read-only CLOEXEC PIPEFS before handler state gates. After the
+stale, policy, privacy, liveness, and pre-secret swap gates succeed, unlock
+reads and copies the passphrase into a separate bounded internal pipe, while
+configure transfers the same OpenAI-key descriptor to the worker without the
+supervisor reading it. The worker revalidates its received descriptor, repeats
+the no-swap gate, and only then performs the bounded read into zeroizing
+storage.
 
 Daemon, worker and companion set `PR_SET_DUMPABLE=0` and prove the initial user
 namespace before sensitive work. The daemon additionally requires an empty
 `/proc/sys/kernel/core_pattern`, exact-zero `core_uses_pid`, and header-only
 `/proc/swaps`; swap is rechecked immediately before external secret read and
-again before worker consumption. Each daemon mutation handler, including its
-worker transaction, fault cleanup and correlated response send, shares one
+again in the worker immediately before every provider store open or secret
+consumption. Each daemon mutation handler, including its worker transaction,
+fault cleanup and correlated response send, shares one
 aggregate 600-second absolute budget; the final send is additionally capped at
 three seconds within the remaining aggregate budget. The companion
 mutation/reconciliation budget is 610 seconds, and the single stop budget is
@@ -369,8 +400,9 @@ remaining sandbox gates stay enabled. The one systemd `RuntimeDirectory`
 bind-mount crossing is opened relative to a validated `/run` descriptor and
 accepted only when descriptor, named entry and `/run` share the exact expected
 root-owned tmpfs identity; all child operations restore no-cross-mount
-resolution. The daemon sends `READY=1` only after runtime disposition, worker
-Probe,
+resolution. This configuration lifecycle does not call OpenAI, borrow a key,
+launch a provider process, expose a UI route, or otherwise execute network
+work. The daemon sends `READY=1` only after runtime disposition, worker probe,
 an immediate worker-health recheck, and coherent Supervisor construction on a
 marker-free startup. Any fresh cgroup, spawn, Probe, or health failure exits
 without READY. A marker found before startup may become ready only as a

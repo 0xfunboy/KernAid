@@ -1,6 +1,8 @@
 //! Root Rescue vault daemon and terminal-only companion lifecycle.
 //!
-//! The daemon exposes only `vault.status`, `vault.unlock`, and `vault.lock`.
+//! The daemon exposes the vault lifecycle plus presence-only provider status,
+//! OpenAI credential configuration, and OpenAI logout. Provider borrowing and
+//! execution remain disabled.
 //! Potentially blocking block-device and filesystem work lives in one
 //! long-lived worker process which is moved into its delegated cgroup before
 //! it receives any work.
@@ -419,6 +421,7 @@ pub enum RescueVaultCompanionError {
     TtyUnavailable,
     EchoControlFailed,
     SecretInvalid,
+    ConfirmationDeclined,
     TransportUnavailable,
     ProtocolFailure,
     Interrupted,
@@ -431,7 +434,8 @@ impl fmt::Display for RescueVaultCompanionError {
             Self::InvalidCommand => "invalid Rescue vault companion command",
             Self::TtyUnavailable => "the controlling terminal is unavailable",
             Self::EchoControlFailed => "terminal echo could not be restored",
-            Self::SecretInvalid => "the vault passphrase input is invalid",
+            Self::SecretInvalid => "the hidden secret input is invalid",
+            Self::ConfirmationDeclined => "provider logout was not confirmed",
             Self::TransportUnavailable => "the Rescue vault service is unavailable",
             Self::ProtocolFailure => "the Rescue vault response is invalid",
             Self::Interrupted => "the Rescue vault companion was interrupted",

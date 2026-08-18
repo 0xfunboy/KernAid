@@ -4,25 +4,30 @@ use super::{
 };
 use crate::{
     BootVaultLocation, BootVaultLocatorError, LocatedVaultClassification,
-    LocatedVaultClassificationError, MapperName, MountedRescueVault, RescueVaultMountManager,
-    VaultMountManagerError, VaultUnlockRequest, locate_boot_vault,
+    LocatedVaultClassificationError, MapperName, MountedRescueVault, ProviderCredentialStatus,
+    RescueVaultMountManager, VaultMountManagerError, VaultUnlockRequest, locate_boot_vault,
 };
+use kernaid_protocol::rescue_vault::validate_openai_api_key_bytes;
 use nix::sys::signal::{SigSet, Signal as NixSignal};
 use rand_core::{OsRng, RngCore};
 use rustix::{
+    event::{PollFd, PollFlags, Timespec, poll},
     fd::{AsFd, BorrowedFd, OwnedFd},
     fs::{self as rfs, FileType, OFlags},
     process::{Signal, getppid, set_parent_process_death_signal},
 };
+use sha2::{Digest, Sha256};
 use std::{
     io,
     time::{Duration, Instant},
 };
+use zeroize::Zeroizing;
 
 const CONTROL_WAIT_SLICE: Duration = Duration::from_secs(30);
 const CONTROL_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(10);
 const CLASSIFICATION_TIMEOUT: Duration = Duration::from_secs(9 * 60);
+const PROVIDER_PIPE_TIMEOUT: Duration = Duration::from_secs(15);
 const PIPEFS_MAGIC: u64 = 0x5049_5045;
 
 enum WorkerVaultState {
@@ -156,7 +161,7 @@ fn handle_command(
                     false,
                 );
             }
-            if validate_internal_passphrase_pipe(passphrase.as_fd()).is_err() {
+            if validate_internal_secret_pipe(passphrase.as_fd()).is_err() {
                 return (
                     internal_wire::WorkerResponse::new(request_id, Result::InvalidRequest),
                     false,
@@ -168,7 +173,7 @@ fn handle_command(
                     false,
                 );
             }
-            match unlock(passphrase, command.passphrase_size) {
+            match unlock(passphrase, command.secret_size) {
                 Ok((mounted, device_id)) => {
                     *state = WorkerVaultState::Unlocked(Box::new(mounted));
                     (
@@ -195,6 +200,62 @@ fn handle_command(
                     Err(VaultMountManagerError::OperationTimedOut) => Result::TimedOut,
                     Err(_) => Result::IoFailed,
                 },
+            };
+            (internal_wire::WorkerResponse::new(request_id, code), false)
+        }
+        Command::ProviderStatus => {
+            if descriptor.is_some() {
+                return (
+                    internal_wire::WorkerResponse::new(request_id, Result::InvalidRequest),
+                    false,
+                );
+            }
+            let code = match state {
+                WorkerVaultState::Locked => Result::Busy,
+                WorkerVaultState::Unlocked(_) if validate_no_active_swap().is_err() => {
+                    Result::CleanupFailed
+                }
+                WorkerVaultState::Unlocked(mounted) => provider_status(mounted),
+            };
+            (internal_wire::WorkerResponse::new(request_id, code), false)
+        }
+        Command::ProviderOpenAiConfigure => {
+            let Some(api_key) = descriptor else {
+                return (
+                    internal_wire::WorkerResponse::new(request_id, Result::InvalidRequest),
+                    false,
+                );
+            };
+            if validate_internal_secret_pipe(api_key.as_fd()).is_err() {
+                return (
+                    internal_wire::WorkerResponse::new(request_id, Result::InvalidRequest),
+                    false,
+                );
+            }
+            let code = match state {
+                WorkerVaultState::Locked => Result::Busy,
+                WorkerVaultState::Unlocked(_) if validate_no_active_swap().is_err() => {
+                    Result::CleanupFailed
+                }
+                WorkerVaultState::Unlocked(mounted) => {
+                    configure_openai(mounted, api_key, command.secret_size)
+                }
+            };
+            (internal_wire::WorkerResponse::new(request_id, code), false)
+        }
+        Command::ProviderOpenAiLogout => {
+            if descriptor.is_some() {
+                return (
+                    internal_wire::WorkerResponse::new(request_id, Result::InvalidRequest),
+                    false,
+                );
+            }
+            let code = match state {
+                WorkerVaultState::Locked => Result::Busy,
+                WorkerVaultState::Unlocked(_) if validate_no_active_swap().is_err() => {
+                    Result::CleanupFailed
+                }
+                WorkerVaultState::Unlocked(mounted) => logout_openai(mounted),
             };
             (internal_wire::WorkerResponse::new(request_id, code), false)
         }
@@ -239,6 +300,186 @@ fn handle_command(
             };
             (internal_wire::WorkerResponse::new(request_id, code), true)
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProviderMutationDisposition {
+    Applied,
+    Aborted,
+    Ambiguous,
+}
+
+fn provider_status(mounted: &MountedRescueVault) -> internal_wire::WorkerResultCode {
+    use internal_wire::WorkerResultCode as Result;
+    let store = match mounted.secrets().open_application_store() {
+        Ok(store) => store,
+        Err(_) => return Result::ProviderStateAmbiguous,
+    };
+    match store.provider_status() {
+        Ok(ProviderCredentialStatus::Absent) => Result::ProviderStatusUnconfigured,
+        Ok(ProviderCredentialStatus::Configured) => Result::ProviderStatusConfigured,
+        Err(_) => Result::ProviderStateAmbiguous,
+    }
+}
+
+fn configure_openai(
+    mounted: &MountedRescueVault,
+    api_key_pipe: OwnedFd,
+    declared_size: u16,
+) -> internal_wire::WorkerResultCode {
+    use internal_wire::WorkerResultCode as Result;
+    let api_key = match read_exact_openai_api_key(
+        api_key_pipe,
+        declared_size,
+        Instant::now() + PROVIDER_PIPE_TIMEOUT,
+    ) {
+        Ok(value) => value,
+        Err(()) => return Result::InvalidRequest,
+    };
+    let desired: [u8; 32] = Sha256::digest(api_key.as_slice()).into();
+    let mut store = match mounted.secrets().open_application_store() {
+        Ok(store) => store,
+        Err(_) => return Result::ProviderStateAmbiguous,
+    };
+    let prior = match provider_digest(&store) {
+        Ok(observed) => observed,
+        Err(()) => return Result::ProviderStateAmbiguous,
+    };
+    let operation_succeeded = store.configure_openai_api_key(api_key).is_ok();
+    drop(store);
+    let observed = match reopen_provider_digest(mounted) {
+        Ok(observed) => observed,
+        Err(()) => return Result::ProviderStateAmbiguous,
+    };
+    match classify_provider_mutation(prior, Some(desired), observed, operation_succeeded) {
+        ProviderMutationDisposition::Applied => Result::ProviderConfigureSucceeded,
+        ProviderMutationDisposition::Aborted => Result::ProviderMutationAborted,
+        ProviderMutationDisposition::Ambiguous => Result::ProviderStateAmbiguous,
+    }
+}
+
+fn logout_openai(mounted: &MountedRescueVault) -> internal_wire::WorkerResultCode {
+    use internal_wire::WorkerResultCode as Result;
+    let mut store = match mounted.secrets().open_application_store() {
+        Ok(store) => store,
+        Err(_) => return Result::ProviderStateAmbiguous,
+    };
+    let prior = match provider_digest(&store) {
+        Ok(observed) => observed,
+        Err(()) => return Result::ProviderStateAmbiguous,
+    };
+    let operation_succeeded = store.logout_openai().is_ok();
+    drop(store);
+    let observed = match reopen_provider_digest(mounted) {
+        Ok(observed) => observed,
+        Err(()) => return Result::ProviderStateAmbiguous,
+    };
+    match classify_provider_mutation(prior, None, observed, operation_succeeded) {
+        ProviderMutationDisposition::Applied => Result::ProviderLogoutSucceeded,
+        ProviderMutationDisposition::Aborted => Result::ProviderMutationAborted,
+        ProviderMutationDisposition::Ambiguous => Result::ProviderStateAmbiguous,
+    }
+}
+
+fn reopen_provider_digest(mounted: &MountedRescueVault) -> Result<Option<[u8; 32]>, ()> {
+    let store = mounted.secrets().open_application_store().map_err(|_| ())?;
+    provider_digest(&store)
+}
+
+fn provider_digest(store: &crate::RescueVaultApplicationStore<'_>) -> Result<Option<[u8; 32]>, ()> {
+    store
+        .with_openai_api_key(|value| Sha256::digest(value).into())
+        .map_err(|_| ())
+}
+
+fn classify_provider_mutation(
+    prior: Option<[u8; 32]>,
+    desired: Option<[u8; 32]>,
+    observed: Option<[u8; 32]>,
+    operation_succeeded: bool,
+) -> ProviderMutationDisposition {
+    if observed == desired {
+        ProviderMutationDisposition::Applied
+    } else if !operation_succeeded && observed == prior {
+        ProviderMutationDisposition::Aborted
+    } else {
+        ProviderMutationDisposition::Ambiguous
+    }
+}
+
+fn read_exact_openai_api_key(
+    descriptor: OwnedFd,
+    declared_size: u16,
+    deadline: Instant,
+) -> Result<Zeroizing<Vec<u8>>, ()> {
+    let expected = usize::from(declared_size);
+    if expected == 0
+        || u64::from(declared_size) > kernaid_protocol::rescue_vault::MAX_OPENAI_KEY_BYTES
+    {
+        return Err(());
+    }
+    let status = rfs::fcntl_getfl(&descriptor).map_err(|_| ())?;
+    rfs::fcntl_setfl(&descriptor, status | OFlags::NONBLOCK).map_err(|_| ())?;
+    let mut value = Zeroizing::new(Vec::with_capacity(expected));
+    while value.len() < expected {
+        ensure_pipe_deadline(deadline)?;
+        let mut buffer = Zeroizing::new([0_u8; 256]);
+        let remaining = expected - value.len();
+        let chunk = remaining.min(buffer.len());
+        match rustix::io::read(&descriptor, &mut buffer[..chunk]) {
+            Ok(0) => return Err(()),
+            Ok(read) => value.extend_from_slice(&buffer[..read]),
+            Err(error) if error == rustix::io::Errno::INTR => {}
+            Err(error) if error == rustix::io::Errno::AGAIN => {
+                wait_provider_pipe(descriptor.as_fd(), deadline)?;
+            }
+            Err(_) => return Err(()),
+        }
+    }
+    loop {
+        ensure_pipe_deadline(deadline)?;
+        let mut extra = Zeroizing::new([0_u8; 1]);
+        match rustix::io::read(&descriptor, &mut extra[..]) {
+            Ok(0) => break,
+            Ok(_) => return Err(()),
+            Err(error) if error == rustix::io::Errno::INTR => {}
+            Err(error) if error == rustix::io::Errno::AGAIN => {
+                wait_provider_pipe(descriptor.as_fd(), deadline)?;
+            }
+            Err(_) => return Err(()),
+        }
+    }
+    validate_openai_api_key_bytes(&value).map_err(|_| ())?;
+    Ok(value)
+}
+
+fn ensure_pipe_deadline(deadline: Instant) -> Result<(), ()> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .map(|_| ())
+        .ok_or(())
+}
+
+fn wait_provider_pipe(descriptor: BorrowedFd<'_>, deadline: Instant) -> Result<(), ()> {
+    let remaining = deadline.checked_duration_since(Instant::now()).ok_or(())?;
+    let mut descriptors = [PollFd::from_borrowed_fd(descriptor, PollFlags::IN)];
+    let seconds = i64::try_from(remaining.as_secs()).unwrap_or(i64::MAX);
+    let timeout = Timespec {
+        tv_sec: seconds,
+        tv_nsec: if seconds == i64::MAX {
+            999_999_999
+        } else {
+            i64::from(remaining.subsec_nanos())
+        },
+    };
+    match poll(&mut descriptors, Some(&timeout)) {
+        Ok(0) => Err(()),
+        Ok(_) if descriptors[0].revents().contains(PollFlags::NVAL) => Err(()),
+        Ok(_) => Ok(()),
+        Err(error) if error == rustix::io::Errno::INTR => Ok(()),
+        Err(_) => Err(()),
     }
 }
 
@@ -435,7 +676,7 @@ fn map_manager_error(error: VaultMountManagerError) -> internal_wire::WorkerResu
     }
 }
 
-fn validate_internal_passphrase_pipe(descriptor: BorrowedFd<'_>) -> Result<(), ()> {
+fn validate_internal_secret_pipe(descriptor: BorrowedFd<'_>) -> Result<(), ()> {
     let stat = rfs::fstat(descriptor).map_err(|_| ())?;
     let filesystem = rfs::fstatfs(descriptor).map_err(|_| ())?;
     let filesystem_type = u64::try_from(filesystem.f_type).map_err(|_| ())?;
@@ -458,16 +699,13 @@ mod tests {
     use rustix::pipe::{PipeFlags, pipe_with};
 
     #[test]
-    fn internal_passphrase_descriptor_requires_read_only_pipefs_cloexec() {
+    fn internal_secret_descriptor_requires_read_only_pipefs_cloexec() {
         let (read, write) = pipe_with(PipeFlags::CLOEXEC).expect("pipe");
-        assert_eq!(validate_internal_passphrase_pipe(read.as_fd()), Ok(()));
-        assert_eq!(validate_internal_passphrase_pipe(write.as_fd()), Err(()));
+        assert_eq!(validate_internal_secret_pipe(read.as_fd()), Ok(()));
+        assert_eq!(validate_internal_secret_pipe(write.as_fd()), Err(()));
 
         let (plain_read, _plain_write) = pipe_with(PipeFlags::empty()).expect("plain pipe");
-        assert_eq!(
-            validate_internal_passphrase_pipe(plain_read.as_fd()),
-            Err(())
-        );
+        assert_eq!(validate_internal_secret_pipe(plain_read.as_fd()), Err(()));
     }
 
     #[test]
@@ -496,5 +734,77 @@ mod tests {
         let second = fresh_mapper_name().expect("second mapper");
         assert_ne!(first, second);
         assert!(format!("{first:?}").contains("validated"));
+    }
+
+    #[test]
+    fn provider_key_pipe_is_exact_eof_bounded_and_visible_ascii_only() {
+        fn pipe_bytes(bytes: &[u8], keep_writer: bool) -> (OwnedFd, Option<OwnedFd>) {
+            let (read, write) = pipe_with(PipeFlags::CLOEXEC).expect("pipe");
+            rustix::io::write(&write, bytes).expect("write synthetic bytes");
+            if keep_writer {
+                (read, Some(write))
+            } else {
+                drop(write);
+                (read, None)
+            }
+        }
+
+        let bytes = b"VISIBLE_TEST_ONLY";
+        let (valid, _) = pipe_bytes(bytes, false);
+        let value = read_exact_openai_api_key(
+            valid,
+            u16::try_from(bytes.len()).expect("bounded length"),
+            Instant::now() + Duration::from_secs(1),
+        )
+        .expect("valid key bytes");
+        assert_eq!(value.len(), bytes.len());
+        assert!(value.iter().all(u8::is_ascii_graphic));
+
+        let (short, _) = pipe_bytes(b"SHORT", false);
+        assert!(
+            read_exact_openai_api_key(short, 6, Instant::now() + Duration::from_millis(100))
+                .is_err()
+        );
+        let (extra, _) = pipe_bytes(b"EXTRA", false);
+        assert!(
+            read_exact_openai_api_key(extra, 4, Instant::now() + Duration::from_millis(100))
+                .is_err()
+        );
+        let (control, _) = pipe_bytes(b"BAD KEY", false);
+        assert!(
+            read_exact_openai_api_key(control, 7, Instant::now() + Duration::from_millis(100))
+                .is_err()
+        );
+        let (open, writer) = pipe_bytes(b"OPEN", true);
+        assert!(
+            read_exact_openai_api_key(open, 4, Instant::now() + Duration::from_millis(20)).is_err()
+        );
+        drop(writer);
+    }
+
+    #[test]
+    fn provider_mutation_reconciliation_distinguishes_desired_prior_and_third_state() {
+        let prior = Some([1_u8; 32]);
+        let desired = Some([2_u8; 32]);
+        assert_eq!(
+            classify_provider_mutation(prior, desired, desired, false),
+            ProviderMutationDisposition::Applied
+        );
+        assert_eq!(
+            classify_provider_mutation(prior, desired, prior, false),
+            ProviderMutationDisposition::Aborted
+        );
+        assert_eq!(
+            classify_provider_mutation(prior, desired, Some([3_u8; 32]), false),
+            ProviderMutationDisposition::Ambiguous
+        );
+        assert_eq!(
+            classify_provider_mutation(prior, desired, prior, true),
+            ProviderMutationDisposition::Ambiguous
+        );
+        assert_eq!(
+            classify_provider_mutation(prior, None, None, false),
+            ProviderMutationDisposition::Applied
+        );
     }
 }

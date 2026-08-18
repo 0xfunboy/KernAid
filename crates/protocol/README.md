@@ -29,9 +29,10 @@ JSON.
 Both state-version fields are bounded by `Number.MAX_SAFE_INTEGER`
 (`9_007_199_254_740_991`). A future daemon must seed a fresh epoch from a
 CSPRNG value of at most 52 bits and use checked increments. It increments once
-when entering `unlocking`/`locking` and again when completing the transition.
-The typed client decoder therefore accepts a successful `vault.unlock` or
-`vault.lock` response only when its `stateVersion` is exactly the request's
+when entering a vault or provider mutation and again when completing the
+transition. The typed client decoder therefore accepts a successful
+`vault.unlock`, `vault.lock`, `provider.openai.configure`, or `provider.logout`
+response only when its `stateVersion` is exactly the request's
 `expectedStateVersion + 2`; status and error responses remain authoritative
 within the general safe-integer bound.
 The closed states are `absent`, `unprovisioned`, `locked`, `unlocking`,
@@ -145,7 +146,11 @@ rejections retain a `RejectedRequestContext`, which makes the otherwise closed
 `NOT_AUTHORIZED`, `FD_REQUIRED`, and `FD_FORBIDDEN` responses reachable without
 reflecting untrusted correlation data.
 
-This crate currently provides the codec, authorization and FD contract plus
-strict Linux record transport and typed client request/response helpers. It
-does not create a listening socket, daemon, vault mount, unlock flow, secret
-store, provider process, or UI endpoint.
+This protocol crate provides the codec, authorization and FD contract plus
+strict Linux record transport and typed client request/response helpers; it
+does not itself create a listener, daemon, mount, store, provider process, or
+UI endpoint. The feature-gated implementation in `kernaid-rescue-secrets`
+currently enables only vault lifecycle and provider configuration lifecycle
+(`provider.status`, `provider.openai.configure`, and OpenAI
+`provider.logout`). Borrow/home lease, provider execution and network calls,
+Codex logout, audit/report operations, and UI routes remain disabled.

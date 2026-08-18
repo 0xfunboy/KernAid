@@ -1174,18 +1174,18 @@ impl WorkerHandle {
     pub(super) fn transact(
         &self,
         kind: internal_wire::WorkerCommandKind,
-        passphrase_size: Option<u16>,
-        passphrase: Option<BorrowedFd<'_>>,
+        secret_size: Option<u16>,
+        secret: Option<BorrowedFd<'_>>,
         deadline: Instant,
     ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
-        self.transact_cancellable(kind, passphrase_size, passphrase, deadline, None)
+        self.transact_cancellable(kind, secret_size, secret, deadline, None)
     }
 
     pub(super) fn transact_cancellable(
         &self,
         kind: internal_wire::WorkerCommandKind,
-        passphrase_size: Option<u16>,
-        passphrase: Option<BorrowedFd<'_>>,
+        secret_size: Option<u16>,
+        secret: Option<BorrowedFd<'_>>,
         deadline: Instant,
         cancellation: Option<&AtomicBool>,
     ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
@@ -1208,7 +1208,7 @@ impl WorkerHandle {
             .checked_add(1)
             .filter(|next| *next != 0)
             .ok_or(RescueVaultDaemonError::WorkerUnavailable)?;
-        let command = match (kind, passphrase_size) {
+        let command = match (kind, secret_size) {
             (internal_wire::WorkerCommandKind::Bootstrap, _) => {
                 return Err(RescueVaultDaemonError::ProtocolFailure);
             }
@@ -1221,6 +1221,15 @@ impl WorkerHandle {
             (internal_wire::WorkerCommandKind::Lock, None) => {
                 internal_wire::WorkerCommand::lock(request_id)
             }
+            (internal_wire::WorkerCommandKind::ProviderStatus, None) => {
+                internal_wire::WorkerCommand::provider_status(request_id)
+            }
+            (internal_wire::WorkerCommandKind::ProviderOpenAiConfigure, Some(size)) => {
+                internal_wire::WorkerCommand::provider_openai_configure(request_id, size)
+            }
+            (internal_wire::WorkerCommandKind::ProviderOpenAiLogout, None) => {
+                internal_wire::WorkerCommand::provider_openai_logout(request_id)
+            }
             (internal_wire::WorkerCommandKind::AttestQuiescent, None) => {
                 internal_wire::WorkerCommand::attest_quiescent(request_id)
             }
@@ -1229,7 +1238,7 @@ impl WorkerHandle {
             }
             _ => return Err(RescueVaultDaemonError::ProtocolFailure),
         };
-        internal_wire::send_command(channel.socket.as_fd(), command, passphrase, deadline)
+        internal_wire::send_command(channel.socket.as_fd(), command, secret, deadline)
             .map_err(|_| RescueVaultDaemonError::WorkerUnavailable)?;
         let response = loop {
             if cancellation.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
@@ -1439,6 +1448,28 @@ fn response_matches(
                 | Result::CleanupFailed
                 | Result::TimedOut
                 | Result::Busy
+        ),
+        Command::ProviderStatus => matches!(
+            response.code,
+            Result::ProviderStatusUnconfigured
+                | Result::ProviderStatusConfigured
+                | Result::ProviderStateAmbiguous
+                | Result::CleanupFailed
+        ),
+        Command::ProviderOpenAiConfigure => matches!(
+            response.code,
+            Result::ProviderConfigureSucceeded
+                | Result::ProviderMutationAborted
+                | Result::ProviderStateAmbiguous
+                | Result::InvalidRequest
+                | Result::CleanupFailed
+        ),
+        Command::ProviderOpenAiLogout => matches!(
+            response.code,
+            Result::ProviderLogoutSucceeded
+                | Result::ProviderMutationAborted
+                | Result::ProviderStateAmbiguous
+                | Result::CleanupFailed
         ),
         Command::AttestQuiescent => matches!(
             response.code,
