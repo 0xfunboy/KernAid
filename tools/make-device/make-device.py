@@ -1829,8 +1829,9 @@ def make_report(
         "vault": {
             "created": False,
             "reason": (
-                "Vault provisioning is intentionally deferred until partitioning, "
-                "key enrollment, crash recovery, and rollback are implemented safely."
+                "Vault provisioning is intentionally deferred by writer v1; writer "
+                "v2 is implemented but production-inactive until a reviewed catalog "
+                "v2 entry binds the required evidence."
             ),
         },
     }

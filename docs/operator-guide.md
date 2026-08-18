@@ -1,6 +1,8 @@
 # KernAid workshop operator guide
 
-This guide describes the current signed-off engineering workflow. KernAid must not be represented as supporting Secure Boot or unattended repair until those release gates are completed.
+This guide describes the intended engineering-preview workflow. KernAid must
+not be represented as supporting physical Rescue media, Secure Boot or
+unattended repair until those release gates are completed.
 
 ## Create the Rescue USB
 
@@ -20,14 +22,19 @@ This guide describes the current signed-off engineering workflow. KernAid must n
    physical confirmation, writes it, and verifies every ISO byte. **The selected
    USB is overwritten.** Rufus or balenaEtcher remain an engineering fallback
    on Windows/macOS, but they do not enforce the KernAid trust catalog.
-5. Boot the target PC from its one-time boot menu. For the engineering image,
-   disable Secure Boot if firmware refuses to start it. Do not change the
-   internal-disk boot order permanently.
-6. KernAid starts its local desktop and opens the interface automatically. The
+5. Attempt to boot the target PC from its one-time boot menu. The current boot
+   evidence is QEMU-only; physical USB and firmware compatibility are not yet
+   qualified. For the engineering image, disable Secure Boot if firmware
+   refuses to start it. Do not change the internal-disk boot order permanently.
+6. On a successful boot, KernAid starts its local desktop and opens the
+   interface automatically. The
    header must say `Rescue · Offline rules`; the target initially says
    `Ambiente Rescue · target non selezionato`.
 
-The current Rescue image supports x86-64 PCs with legacy BIOS or UEFI. It is not an Apple-silicon boot image. Intel Mac external boot remains a physical validation item.
+The current Rescue image targets amd64 legacy BIOS and UEFI. Its current boot
+evidence is QEMU-only; physical PCs, firmware and USB media are unqualified. It
+is not an Apple-silicon boot image, and Intel Mac external boot remains a
+physical validation item.
 
 ## Diagnose from Rescue
 
@@ -106,9 +113,15 @@ release gates.
 
 ### Optional OpenAI diagnosis in Resident mode
 
-OpenAI is opt-in and is not available in Rescue in this milestone. The
-credential companion is not included in the desktop installer and is not added
-to `PATH`. From the same successful Desktop workflow run, download and extract
+The supported workshop procedure in this section is Resident-only. Rescue
+contains feature-gated persistent-vault OpenAI plumbing and a loopback
+UI-server relay, but an exact revision is virtually qualified only after both
+privileged BIOS and UEFI lifecycle jobs pass. The active physical writer v1
+does not create that vault, and Chromium rendering, live provider TLS with a
+real account, and physical media are not qualified; do not present Rescue
+OpenAI as supported on customer media yet. The Resident credential companion
+is not included in the desktop installer and is not added to `PATH`. From the
+same successful Desktop workflow run, download and extract
 the outer GitHub artifact matching the installed Desk build:
 
 - `kernaid-provider-key-windows-x86_64` contains
@@ -185,7 +198,9 @@ customer authorization and applicable data-processing requirements first.
 
 ## Troubleshooting the Rescue environment
 
-- If the UI does not open, browse to `http://127.0.0.1:4173/` from Chromium inside the live desktop.
+- If the UI does not open, browse to `http://127.0.0.1:4173/` from Chromium
+  inside the live desktop. This is a troubleshooting step, not browser-renderer
+  qualification.
 - If the page opens but Rescue observations or the target selector do not
   appear, check `systemctl status kernaid-ui.service` from the live console.
 - If firmware does not list the USB, rewrite it in raw/DD mode and retry another port. Secure Boot support is not yet claimed.

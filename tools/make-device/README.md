@@ -14,6 +14,10 @@ costruita e avviata con successo in QEMU BIOS e UEFI nel run GitHub Actions
 immagine viene rifiutata fail-closed; non basta fornire un SHA-256 arbitrario
 dalla riga di comando.
 
+Questa evidenza v1 avvia l'immagine come CD-ROM virtuale QEMU: non prova il boot
+da USB né firmware o hardware fisici. Il writer v1 copia e verifica il prefisso
+ISO ma non provisiona la p3 persistente.
+
 Ogni voce lega esattamente:
 
 - nome e versione dell'artefatto;
@@ -61,8 +65,9 @@ Il parser fissa inoltre `journal_binding_before_sha256` e
 (`4c535d9a1a37281ca7e25ba0f52ee44ebc893558326f74e4b36ac18a65c4d513`):
 un valore arbitrario soltanto stabile, incluso il vecchio sentinel, è
 rifiutato.
-Finché mancano entrambe le famiglie di attestazioni, nessun artefatto può
-essere promosso nel catalogo v2.
+Nessun artefatto può essere promosso nel catalogo v2 finché entrambe le
+famiglie di attestazioni non sono legate alla stessa revisione in una voce di
+catalogo revisionata.
 
 ## Installazione operatore
 
@@ -129,11 +134,12 @@ parte oltre la fine della ISO causa un rifiuto, senza cancellazione implicita.
 Altri dati non riconosciuti nella coda possono rimanere recuperabili; il report
 lo dichiara. Questo non è uno strumento di sanitizzazione.
 
-Il report dichiara anche che il vault persistente **non viene creato** finché
-partizionamento, enrollment, crash recovery e rollback non saranno implementati
-e provati in modo sicuro. Il report contiene la prova udev verificata, incluso
-`ID_PATH`, ma dichiara esplicitamente di essere JSON locale **non firmato e non
-autenticato**: non è una ricevuta crittografica.
+Il report v1 dichiara anche che il vault persistente **non viene creato**: il
+writer v1 non provisiona intenzionalmente la p3. Il writer v2 e il relativo
+lifecycle esistono, ma il catalogo distribuito resta inattivo; recovery
+autenticata e rollback restano gate separati. Il report contiene la prova udev
+verificata, incluso `ID_PATH`, ma dichiara esplicitamente di essere JSON locale
+**non firmato e non autenticato**: non è una ricevuta crittografica.
 
 Questa dichiarazione riguarda esclusivamente `make-device.py` v1. Il percorso
 v2 crea e verifica il vault, ma non può ancora autorizzare un'immagine di

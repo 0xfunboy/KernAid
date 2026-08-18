@@ -8,7 +8,11 @@ Desk UI -> SessionDriver -> Agent Gateway -> Provider
 
 Provider output is an untrusted proposal. It cannot call the broker. Core links claims to evidence, validates action metadata, and admits only R0 in this phase. The fake broker recognizes only `system.observe.noop`, checks the target fingerprint, and rejects repeated or decreasing sequence numbers.
 
-The Linux collector accepts exactly one directory fixture. It reads metadata only, never follows a block-device selector, never elevates privileges, and emits normalized JSON tagged `observed-untrusted`.
+The Resident Linux fixture collector accepts exactly one directory and reads
+metadata only. Rescue has a separate one-shot, descriptor-bound inspector for
+qualified disposable block-image targets; it uses fixed read-only mount policy
+and emits a bounded normalized corpus tagged `observed-untrusted`. Neither
+collector grants provider output access to the broker.
 
 ## Implemented acceptance checks
 
@@ -20,4 +24,11 @@ The Linux collector accepts exactly one directory fixture. It reads metadata onl
 
 ## Open release gates
 
-The repository scaffold does not establish bootability, encrypted persistence, signed reports, Secure Boot compatibility, WebKit/GPU compatibility, or physical hardware support. Those require the next milestones and suitable build/test hosts.
+The repository now defines legacy-BIOS/UEFI QEMU boot gates, a feature-gated
+encrypted Rescue vault/provider lifecycle, and closed signed-report library
+primitives. An exact Rescue image is virtually qualified only when both
+privileged lifecycle jobs pass, and the shipping peer allowlist still exposes
+neither the Application audit/report role nor Codex. Secure Boot,
+browser-renderer/WebKit/GPU compatibility, live provider TLS with a real
+account, promotion of vault provisioning into the trusted physical writer, and
+physical hardware/media support remain open release gates.

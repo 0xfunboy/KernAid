@@ -9,7 +9,7 @@ the Rescue OpenAI provider:
   borrows one API-key pipe from the vault as the exact Agent, consumes its
   declared bytes and EOF into zeroizing owned storage, and performs one
   synchronous TLS exchange;
-- the production destination is only `api.openai.com:443`, with SNI and `Host`
+- the compiled shipping destination is only `api.openai.com:443`, with SNI and `Host`
   fixed to `api.openai.com`, `POST /v1/responses`, HTTP/1.1 ALPN, compiled WebPKI
   roots, no redirect, and no URL, model, tool, command, proxy, trust-root, or
   environment override;
@@ -31,3 +31,10 @@ socket remains open through the HTTPS exchange and local response. Handoff,
 HTTPS, and outer process deadlines are 20, 110, and 145 seconds respectively.
 The API key is not logged or deliberately duplicated, though rustls necessarily
 buffers protocol plaintext internally during the exchange.
+
+In Rescue, Desk's fixed same-origin loopback endpoint is served by the shipping
+Python UI server, which relays one bounded opaque frame to the executor's
+AF_UNIX socket. The privileged BIOS/UEFI lifecycle qualifies an exact image
+revision only when both jobs pass; its relay probe keeps egress inactive and
+therefore does not exercise Chromium rendering, live TLS, a real account or
+physical media.
