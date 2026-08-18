@@ -1122,7 +1122,8 @@ fn descriptor_block_identity_with_deadline(
     ensure_blockdev_deadline(deadline)?;
     let procfd = descriptor_procfd_path(descriptor)?;
     let before = validate_descriptor_procfd(descriptor, &procfd)?;
-    let identity = query_descriptor_block_identity_until(&procfd, deadline, blockdev_query)?;
+    let identity =
+        query_descriptor_block_identity_until(descriptor.as_fd(), deadline, blockdev_query)?;
     let after = validate_descriptor_procfd(descriptor, &procfd)?;
     ensure_blockdev_deadline(deadline)?;
     if after != before {
@@ -1138,7 +1139,8 @@ pub(crate) fn descriptor_block_geometry(
     let deadline = aggregate_blockdev_deadline(None)?;
     let procfd = descriptor_procfd_path(descriptor)?;
     let before = validate_descriptor_procfd(descriptor, &procfd)?;
-    let geometry = query_descriptor_block_geometry_until(&procfd, deadline, blockdev_query)?;
+    let geometry =
+        query_descriptor_block_geometry_until(descriptor.as_fd(), deadline, blockdev_query)?;
     let after = validate_descriptor_procfd(descriptor, &procfd)?;
     ensure_blockdev_deadline(deadline)?;
     if after != before {
@@ -1170,12 +1172,16 @@ fn ensure_blockdev_deadline(deadline: Instant) -> Result<(), DescriptorBlockIden
 }
 
 fn query_descriptor_block_identity_until(
-    procfd: &Path,
+    descriptor: BorrowedFd<'_>,
     deadline: Instant,
-    mut query: impl FnMut(&Path, BlockdevQuery, Duration) -> Result<u64, DescriptorBlockIdentityError>,
+    mut query: impl FnMut(
+        BorrowedFd<'_>,
+        BlockdevQuery,
+        Duration,
+    ) -> Result<u64, DescriptorBlockIdentityError>,
 ) -> Result<DescriptorBlockIdentity, DescriptorBlockIdentityError> {
     let identity = consistent_descriptor_block_identity(|operation| {
-        query(procfd, operation, remaining_blockdev_timeout(deadline)?)
+        query(descriptor, operation, remaining_blockdev_timeout(deadline)?)
     })?;
     ensure_blockdev_deadline(deadline)?;
     Ok(identity)
@@ -1183,12 +1189,16 @@ fn query_descriptor_block_identity_until(
 
 #[cfg(feature = "experimental-vault-manager")]
 fn query_descriptor_block_geometry_until(
-    procfd: &Path,
+    descriptor: BorrowedFd<'_>,
     deadline: Instant,
-    mut query: impl FnMut(&Path, BlockdevQuery, Duration) -> Result<u64, DescriptorBlockIdentityError>,
+    mut query: impl FnMut(
+        BorrowedFd<'_>,
+        BlockdevQuery,
+        Duration,
+    ) -> Result<u64, DescriptorBlockIdentityError>,
 ) -> Result<DescriptorBlockGeometry, DescriptorBlockIdentityError> {
     let geometry = consistent_descriptor_block_geometry(|operation| {
-        query(procfd, operation, remaining_blockdev_timeout(deadline)?)
+        query(descriptor, operation, remaining_blockdev_timeout(deadline)?)
     })?;
     ensure_blockdev_deadline(deadline)?;
     Ok(geometry)
@@ -1285,68 +1295,76 @@ fn consistent_descriptor_block_geometry(
     })
 }
 
-/// util-linux performs BLKGETDISKSEQ, BLKGETSIZE64 and BLKSSZGET only on the
-/// retained parent-process procfd. The executable, operation arguments,
+/// util-linux performs BLKGETDISKSEQ, BLKGETSIZE64 and BLKSSZGET only on one
+/// inherited duplicate addressed through the child's own procfd. The retained
+/// parent descriptor stays CLOEXEC. The executable, operation arguments,
 /// aggregate deadline and output bound are fixed in production; each child
 /// receives only the budget remaining from the one shared deadline.
 fn blockdev_query(
-    procfd: &Path,
+    descriptor: BorrowedFd<'_>,
     query: BlockdevQuery,
     timeout: Duration,
 ) -> Result<u64, DescriptorBlockIdentityError> {
-    run_blockdev_query(Path::new(BLOCKDEV_PATH), procfd, query, timeout)
+    run_blockdev_query(Path::new(BLOCKDEV_PATH), descriptor, query, timeout)
 }
 
 #[cfg(test)]
 fn test_blockdev_query(
     program: &Path,
-    procfd: &Path,
+    descriptor: BorrowedFd<'_>,
     query: BlockdevQuery,
     timeout: Duration,
 ) -> Result<u64, DescriptorBlockIdentityError> {
-    run_blockdev_query(program, procfd, query, timeout)
+    run_blockdev_query(program, descriptor, query, timeout)
 }
 
 fn run_blockdev_query(
     program: &Path,
-    procfd: &Path,
+    descriptor: BorrowedFd<'_>,
     query: BlockdevQuery,
     timeout: Duration,
 ) -> Result<u64, DescriptorBlockIdentityError> {
+    let child_stdin =
+        bounded_process::duplicate_child_stdin(descriptor).map_err(map_blockdev_process_error)?;
     let mut command = Command::new(program);
     command
         .arg(query.argument())
-        .arg(procfd)
+        .arg(bounded_process::CHILD_STDIN_PATH)
         .env_clear()
         .env("LC_ALL", "C")
-        .stdin(Stdio::null())
+        .stdin(child_stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let output = bounded_process::capture(&mut command, timeout, BLOCKDEV_OUTPUT_LIMIT).map_err(
-        |error| match error {
-            bounded_process::BoundedProcessError::Unavailable
-            | bounded_process::BoundedProcessError::StartFailed => {
-                DescriptorBlockIdentityError::ToolUnavailable
-            }
-            bounded_process::BoundedProcessError::TimedOut => {
-                DescriptorBlockIdentityError::OperationTimedOut
-            }
-            bounded_process::BoundedProcessError::CleanupFailed => {
-                DescriptorBlockIdentityError::CleanupFailed
-            }
-            bounded_process::BoundedProcessError::WaitFailed
-            | bounded_process::BoundedProcessError::OutputLimitExceeded
-            | bounded_process::BoundedProcessError::UnexpectedDescendant => {
-                DescriptorBlockIdentityError::IdentityUnavailable
-            }
-        },
-    )?;
+    let output = bounded_process::capture(&mut command, timeout, BLOCKDEV_OUTPUT_LIMIT)
+        .map_err(map_blockdev_process_error)?;
     if !output.status.success() {
         return Err(DescriptorBlockIdentityError::IdentityUnavailable);
     }
     parse_u64(trim_line(&output.bytes))
         .filter(|value| *value > 0)
         .ok_or(DescriptorBlockIdentityError::IdentityUnavailable)
+}
+
+fn map_blockdev_process_error(
+    error: bounded_process::BoundedProcessError,
+) -> DescriptorBlockIdentityError {
+    match error {
+        bounded_process::BoundedProcessError::Unavailable
+        | bounded_process::BoundedProcessError::StartFailed => {
+            DescriptorBlockIdentityError::ToolUnavailable
+        }
+        bounded_process::BoundedProcessError::TimedOut => {
+            DescriptorBlockIdentityError::OperationTimedOut
+        }
+        bounded_process::BoundedProcessError::CleanupFailed => {
+            DescriptorBlockIdentityError::CleanupFailed
+        }
+        bounded_process::BoundedProcessError::WaitFailed
+        | bounded_process::BoundedProcessError::OutputLimitExceeded
+        | bounded_process::BoundedProcessError::UnexpectedDescendant => {
+            DescriptorBlockIdentityError::IdentityUnavailable
+        }
+    }
 }
 
 fn validate_mbr(parent: &fs::File) -> Result<(), BootVaultLocatorError> {
@@ -1769,20 +1787,19 @@ mod tests {
 
     #[test]
     #[ignore = "subprocess probe must run without parallel vault lock descriptors"]
-    fn fixed_blockdev_probe_uses_retained_procfd_after_named_path_swap() {
+    fn fixed_blockdev_probe_uses_inherited_descriptor_after_named_path_swap() {
         let fixture = tempfile::tempdir().expect("blockdev procfd fixture");
         let named = fixture.path().join("selected-device");
         let moved = fixture.path().join("original-device");
         fs::write(&named, b"77\n").expect("write original identity");
         let retained = File::open(&named).expect("retain original identity");
-        let procfd = descriptor_procfd_path(&retained).expect("retained procfd");
         fs::rename(&named, &moved).expect("move original pathname");
         fs::write(&named, b"99\n").expect("write pathname replacement");
 
         let tool = fixture.path().join("mock-blockdev");
         fs::write(
             &tool,
-            b"#!/bin/sh\n[ \"$#\" -eq 2 ] || exit 90\n[ \"$1\" = --getdiskseq ] || exit 91\ncase \"$2\" in /proc/[0-9]*/fd/[0-9]*) ;; *) exit 92 ;; esac\nexec /usr/bin/cat \"$2\"\n",
+            b"#!/bin/sh\n[ \"$#\" -eq 2 ] || exit 90\n[ \"$1\" = --getdiskseq ] || exit 91\n[ \"$2\" = /proc/self/fd/0 ] || exit 92\nexec /usr/bin/cat \"$2\"\n",
         )
         .expect("write blockdev mock");
         fs::set_permissions(&tool, fs::Permissions::from_mode(0o700))
@@ -1791,7 +1808,7 @@ mod tests {
         assert_eq!(
             test_blockdev_query(
                 &tool,
-                &procfd,
+                retained.as_fd(),
                 BlockdevQuery::DiskSequence,
                 Duration::from_secs(1),
             ),
@@ -1807,7 +1824,6 @@ mod tests {
         let descriptor_path = fixture.path().join("retained");
         fs::write(&descriptor_path, b"descriptor").expect("write retained fixture");
         let retained = File::open(&descriptor_path).expect("open retained fixture");
-        let procfd = descriptor_procfd_path(&retained).expect("retained procfd");
         let spoofed_sysfs = fixture.path().join("sys/dev/block/7:3");
         fs::create_dir_all(&spoofed_sysfs).expect("create spoofed sysfs");
         fs::write(spoofed_sysfs.join("diskseq"), b"999\n").expect("spoof diskseq");
@@ -1816,13 +1832,13 @@ mod tests {
         let fixed = fixture.path().join("fixed-blockdev");
         fs::write(
             &fixed,
-            b"#!/bin/sh\n[ \"$#\" -eq 2 ] || exit 90\ncase \"$2\" in /proc/[0-9]*/fd/[0-9]*) ;; *) exit 91 ;; esac\ncase \"$1\" in --getdiskseq) echo 77 ;; --getsize64) echo 8589934592 ;; --getss) echo 512 ;; *) exit 92 ;; esac\n",
+            b"#!/bin/sh\n[ \"$#\" -eq 2 ] || exit 90\n[ \"$2\" = /proc/self/fd/0 ] || exit 91\ncase \"$1\" in --getdiskseq) echo 77 ;; --getsize64) echo 8589934592 ;; --getss) echo 512 ;; *) exit 92 ;; esac\n",
         )
         .expect("write fixed blockdev mock");
         fs::set_permissions(&fixed, fs::Permissions::from_mode(0o700))
             .expect("make fixed blockdev mock executable");
         let identity = consistent_descriptor_block_identity(|query| {
-            test_blockdev_query(&fixed, &procfd, query, Duration::from_secs(1))
+            test_blockdev_query(&fixed, retained.as_fd(), query, Duration::from_secs(1))
         })
         .expect("descriptor-only identity");
         assert_eq!(identity.disk_sequence, 77);
@@ -1830,7 +1846,7 @@ mod tests {
         fs::remove_dir_all(fixture.path().join("sys")).expect("remove spoofed sysfs");
         assert_eq!(
             consistent_descriptor_block_identity(|query| {
-                test_blockdev_query(&fixed, &procfd, query, Duration::from_secs(1))
+                test_blockdev_query(&fixed, retained.as_fd(), query, Duration::from_secs(1))
             }),
             Ok(identity),
             "sysfs absence cannot alter the descriptor-only probe"
@@ -1847,7 +1863,7 @@ mod tests {
         assert_eq!(
             test_blockdev_query(
                 &oversized,
-                &procfd,
+                retained.as_fd(),
                 BlockdevQuery::SizeBytes,
                 Duration::from_secs(1),
             ),
@@ -1870,7 +1886,7 @@ mod tests {
         assert_eq!(
             test_blockdev_query(
                 &timeout_tool,
-                &procfd,
+                retained.as_fd(),
                 BlockdevQuery::SizeBytes,
                 Duration::from_millis(100),
             ),
@@ -1895,7 +1911,6 @@ mod tests {
         let descriptor_path = fixture.path().join("retained");
         fs::write(&descriptor_path, b"descriptor").expect("write retained fixture");
         let retained = File::open(&descriptor_path).expect("open retained fixture");
-        let procfd = descriptor_procfd_path(&retained).expect("retained procfd");
         let calls = fixture.path().join("calls");
         let tool = fixture.path().join("slow-blockdev");
         fs::write(
@@ -1914,9 +1929,11 @@ mod tests {
             .checked_add(Duration::from_millis(750))
             .expect("deadline");
         assert_eq!(
-            query_descriptor_block_identity_until(&procfd, deadline, |path, query, timeout| {
-                test_blockdev_query(&tool, path, query, timeout)
-            },),
+            query_descriptor_block_identity_until(
+                retained.as_fd(),
+                deadline,
+                |fd, query, timeout| { test_blockdev_query(&tool, fd, query, timeout) },
+            ),
             Err(DescriptorBlockIdentityError::OperationTimedOut)
         );
         assert!(
@@ -1940,9 +1957,11 @@ mod tests {
                 .checked_add(Duration::from_millis(750))
                 .expect("geometry deadline");
             assert_eq!(
-                query_descriptor_block_geometry_until(&procfd, deadline, |path, query, timeout| {
-                    test_blockdev_query(&tool, path, query, timeout)
-                },),
+                query_descriptor_block_geometry_until(
+                    retained.as_fd(),
+                    deadline,
+                    |fd, query, timeout| { test_blockdev_query(&tool, fd, query, timeout) },
+                ),
                 Err(DescriptorBlockIdentityError::OperationTimedOut)
             );
             assert!(started.elapsed() < Duration::from_secs(2));

@@ -346,9 +346,9 @@ struct BlockDevice {
     // Direct /dev node used only for repeated identity checkpoints. Tools and
     // mutators never receive it.
     checkpoint_path: PathBuf,
-    // Procfs handle to the retained descriptor in this daemon process. Child
-    // tools open this exact capability even if the /dev name is replaced.
-    command_path: PathBuf,
+    // Parent-only procfs checkpoint for the retained descriptor. Child tools
+    // receive a scoped duplicate and address only their own procfs namespace.
+    checkpoint_procfd: PathBuf,
     descriptor: OwnedFd,
     device: u64,
     inode: u64,
@@ -421,10 +421,10 @@ impl BlockDevice {
         if observed_identity.logical_sector_bytes != LOGICAL_SECTOR_BYTES {
             return Err(VaultMountManagerError::InvalidBlockDevice);
         }
-        let command_path = retained_descriptor_path(&descriptor)?;
+        let checkpoint_procfd = retained_descriptor_path(&descriptor)?;
         let result = Self {
             checkpoint_path: path,
-            command_path,
+            checkpoint_procfd,
             descriptor,
             device: stat.st_dev,
             inode: stat.st_ino,
@@ -461,7 +461,7 @@ impl BlockDevice {
             rfs::fstat(&self.descriptor).map_err(|_| VaultMountManagerError::InvalidBlockDevice)?;
         let named = rfs::statat(CWD, &self.checkpoint_path, AtFlags::SYMLINK_NOFOLLOW)
             .map_err(|_| VaultMountManagerError::InvalidBlockDevice)?;
-        let command = rfs::statat(CWD, &self.command_path, AtFlags::empty())
+        let command = rfs::statat(CWD, &self.checkpoint_procfd, AtFlags::empty())
             .map_err(|_| VaultMountManagerError::InvalidBlockDevice)?;
         let status = rfs::fcntl_getfl(&self.descriptor)
             .map_err(|_| VaultMountManagerError::InvalidBlockDevice)?;
@@ -490,10 +490,6 @@ impl BlockDevice {
 
     fn major_minor(&self) -> (u32, u32) {
         (rfs::major(self.rdev), rfs::minor(self.rdev))
-    }
-
-    fn command_path(&self) -> &Path {
-        &self.command_path
     }
 
     fn revalidate_profile_capability(&self) -> Result<(), ProfileClassifierError> {
@@ -526,7 +522,7 @@ struct HeaderIdentity {
 
 struct MappingIdentity {
     descriptor: OwnedFd,
-    command_path: PathBuf,
+    checkpoint_procfd: PathBuf,
     device: u64,
     inode: u64,
     rdev: u64,
@@ -561,7 +557,7 @@ impl MappingIdentity {
         }
         let descriptor = rfs::fstat(&self.descriptor)
             .map_err(|_| VaultMountManagerError::MappingVerificationFailed)?;
-        let command = rfs::statat(CWD, &self.command_path, AtFlags::empty())
+        let command = rfs::statat(CWD, &self.checkpoint_procfd, AtFlags::empty())
             .map_err(|_| VaultMountManagerError::MappingVerificationFailed)?;
         let status = rfs::fcntl_getfl(&self.descriptor)
             .map_err(|_| VaultMountManagerError::MappingVerificationFailed)?;
@@ -601,7 +597,7 @@ impl MappingIdentity {
     fn validate_endpoint_path(&self) -> Result<(), VaultMountManagerError> {
         let descriptor = rfs::fstat(&self.descriptor)
             .map_err(|_| VaultMountManagerError::MappingVerificationFailed)?;
-        let command = rfs::statat(CWD, &self.command_path, AtFlags::empty())
+        let command = rfs::statat(CWD, &self.checkpoint_procfd, AtFlags::empty())
             .map_err(|_| VaultMountManagerError::MappingVerificationFailed)?;
         let status = rfs::fcntl_getfl(&self.descriptor)
             .map_err(|_| VaultMountManagerError::MappingVerificationFailed)?;
@@ -1014,6 +1010,24 @@ impl SystemOps {
         Ok(output.bytes)
     }
 
+    fn run_capture_with_stdin(
+        mut command: Command,
+        stdin: Stdio,
+    ) -> Result<Vec<u8>, VaultMountManagerError> {
+        command
+            .env_clear()
+            .env("LC_ALL", "C")
+            .stdin(stdin)
+            .stderr(Stdio::null())
+            .stdout(Stdio::piped());
+        let output = bounded_process::capture(&mut command, COMMAND_TIMEOUT, COMMAND_OUTPUT_LIMIT)
+            .map_err(map_bounded_process_error)?;
+        if !output.status.success() {
+            return Err(VaultMountManagerError::MappingVerificationFailed);
+        }
+        Ok(output.bytes)
+    }
+
     fn run_quiet(mut command: Command) -> Result<(), VaultMountManagerError> {
         command
             .env_clear()
@@ -1090,15 +1104,18 @@ impl VaultOps for SystemOps {
         mapper: &MapperName,
         passphrase: OwnedFd,
     ) -> Result<(), VaultMountManagerError> {
-        let mut command = cryptsetup_open_command(device.command_path(), mapper);
+        let inherited = bounded_process::InheritedChildDescriptor::duplicate(&device.descriptor)
+            .map_err(map_bounded_process_error)?;
+        let mut command = cryptsetup_open_command(inherited.path(), mapper);
         command
             .env_clear()
             .env("LC_ALL", "C")
             .stdin(Stdio::from(File::from(passphrase)))
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let status = bounded_process::wait(&mut command, COMMAND_TIMEOUT)
-            .map_err(map_bounded_process_error)?;
+        let status =
+            bounded_process::wait_with_descriptor(&mut command, COMMAND_TIMEOUT, inherited)
+                .map_err(map_bounded_process_error)?;
         if !status.success() {
             return Err(VaultMountManagerError::UnlockFailed);
         }
@@ -1157,9 +1174,9 @@ impl VaultOps for SystemOps {
         {
             return Err(VaultMountManagerError::MappingVerificationFailed);
         }
-        let command_path = retained_descriptor_path(&descriptor)?;
+        let checkpoint_procfd = retained_descriptor_path(&descriptor)?;
         let mapping = MappingIdentity {
-            command_path,
+            checkpoint_procfd,
             device: stat.st_dev,
             inode: stat.st_ino,
             rdev: stat.st_rdev,
@@ -1201,6 +1218,8 @@ impl VaultOps for SystemOps {
         header: HeaderIdentity,
     ) -> Result<Ext4ProfileEvidence, VaultMountManagerError> {
         mapping.revalidate(device, mapper, header)?;
+        let child_stdin = bounded_process::duplicate_child_stdin(&mapping.descriptor)
+            .map_err(map_bounded_process_error)?;
         let mut blkid = Command::new(BLKID_PATH);
         blkid
             .arg("--probe")
@@ -1215,8 +1234,9 @@ impl VaultOps for SystemOps {
             .arg("UUID")
             .arg("--match-tag")
             .arg("LABEL")
-            .arg(&mapping.command_path);
-        let output = Self::run_capture(blkid).map_err(map_blkid_probe_error)?;
+            .arg(bounded_process::CHILD_STDIN_PATH);
+        let output =
+            Self::run_capture_with_stdin(blkid, child_stdin).map_err(map_blkid_probe_error)?;
         let properties = parse_blkid_export(&output)?;
         let evidence = with_profile_revalidation(
             |checkpoint| qualify_ext4_mapper(&mapping.descriptor, checkpoint),
@@ -1256,7 +1276,7 @@ impl VaultOps for SystemOps {
         root: &Path,
     ) -> Result<(), VaultMountManagerError> {
         rustix::mount::mount(
-            &mapping.command_path,
+            &mapping.checkpoint_procfd,
             root,
             "ext4",
             MountFlags::NOSUID
@@ -2072,7 +2092,7 @@ mod tests {
             }
             Ok(MappingIdentity {
                 descriptor: dummy_fd(),
-                command_path: PathBuf::from("/proc/1/fd/9"),
+                checkpoint_procfd: PathBuf::from("/proc/1/fd/9"),
                 device: 3,
                 inode: 4,
                 rdev: rfs::makedev(253, 7),
@@ -2248,7 +2268,7 @@ mod tests {
         ResolvedRequest {
             device: BlockDevice {
                 checkpoint_path: PathBuf::from("/dev/loop8"),
-                command_path: PathBuf::from("/proc/1/fd/8"),
+                checkpoint_procfd: PathBuf::from("/proc/1/fd/8"),
                 descriptor,
                 device: 1,
                 inode: 2,
@@ -2324,13 +2344,13 @@ mod tests {
         let moved = directory.path().join("original-device");
         fs::write(&named, b"original").expect("write original fixture");
         let retained = File::open(&named).expect("retain original descriptor");
-        let command_path = retained_descriptor_path(&retained).expect("retained procfd path");
+        let checkpoint_procfd = retained_descriptor_path(&retained).expect("retained procfd path");
 
         fs::rename(&named, &moved).expect("move original fixture");
         fs::write(&named, b"replacement").expect("write replacement fixture");
 
         assert_eq!(
-            fs::read(&command_path).expect("read retained procfd"),
+            fs::read(&checkpoint_procfd).expect("read retained procfd"),
             b"original"
         );
         assert_eq!(
@@ -2568,9 +2588,9 @@ mod tests {
     }
 
     #[test]
-    fn unlock_command_has_only_procfd_device_and_stdin_key_source() {
+    fn unlock_command_has_only_child_procfd_device_and_stdin_key_source() {
         let mapper = MapperName::parse("kernaid-vault-0123456789abcdef").expect("mapper");
-        let command = cryptsetup_open_command(Path::new("/proc/123/fd/8"), &mapper);
+        let command = cryptsetup_open_command(Path::new("/proc/self/fd/8"), &mapper);
         assert_eq!(command.get_program(), OsStr::new(CRYPTSETUP_PATH));
         let arguments: Vec<_> = command.get_args().collect();
         assert_eq!(
@@ -2585,7 +2605,7 @@ mod tests {
                 OsStr::new("--disable-external-tokens"),
                 OsStr::new("--key-file"),
                 OsStr::new("-"),
-                OsStr::new("/proc/123/fd/8"),
+                OsStr::new("/proc/self/fd/8"),
                 OsStr::new("kernaid-vault-0123456789abcdef"),
             ]
         );

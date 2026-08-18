@@ -6,8 +6,8 @@ mod bounded_process;
 
 use std::{
     fs::{self, File, OpenOptions},
-    os::{fd::AsRawFd, unix::fs::PermissionsExt},
-    path::{Path, PathBuf},
+    os::unix::fs::PermissionsExt,
+    path::Path,
     process::{Command, Stdio},
     time::Duration,
 };
@@ -17,32 +17,23 @@ const BLKID_PATH: &str = "/usr/sbin/blkid";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const COMMAND_OUTPUT_LIMIT: usize = 4096;
 
-fn retained_descriptor_path(descriptor: &impl AsRawFd) -> PathBuf {
-    PathBuf::from(format!(
-        "/proc/{}/fd/{}",
-        std::process::id(),
-        descriptor.as_raw_fd()
-    ))
-}
-
-fn capture(command: &mut Command) -> Vec<u8> {
+fn capture_with_stdin(command: &mut Command, stdin: Stdio) -> Vec<u8> {
     command
         .env_clear()
         .env("LC_ALL", "C")
-        .stdin(Stdio::null())
+        .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     let output = bounded_process::capture(command, COMMAND_TIMEOUT, COMMAND_OUTPUT_LIMIT)
-        .expect("bounded external probe");
-    assert!(output.status.success(), "external probe failed");
+        .expect("bounded stdin probe");
+    assert!(output.status.success(), "external stdin probe failed");
     output.bytes
 }
 
 #[test]
-fn cryptsetup_and_blkid_probe_the_retained_procfd_after_path_swap() {
-    // This is an integration-test binary, not a unit test in the vault-store
-    // process. Its external children therefore cannot transiently inherit a
-    // parallel unit test's CLOEXEC lifecycle lock between fork and exec.
+fn cryptsetup_and_blkid_probe_an_inherited_child_procfd_after_path_swap() {
+    // Every descriptor-bearing child uses the same bounded spawn gate as the
+    // production worker, including its CLOEXEC handoff window.
     if !Path::new(CRYPTSETUP_PATH).is_file() || !Path::new(BLKID_PATH).is_file() {
         return;
     }
@@ -55,9 +46,6 @@ fn cryptsetup_and_blkid_probe_the_retained_procfd_after_path_swap() {
     fs::write(&key_path, b"disposable-test-passphrase").expect("write disposable test key");
     fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))
         .expect("secure disposable test key");
-    let key = File::open(&key_path).expect("retain test-key descriptor");
-    let key_procfd = retained_descriptor_path(&key);
-
     let image = OpenOptions::new()
         .read(true)
         .write(true)
@@ -67,8 +55,6 @@ fn cryptsetup_and_blkid_probe_the_retained_procfd_after_path_swap() {
     image
         .set_len(32 * 1024 * 1024)
         .expect("size disposable image");
-    let image_procfd = retained_descriptor_path(&image);
-
     let mut format = Command::new(CRYPTSETUP_PATH);
     format
         .arg("luksFormat")
@@ -82,8 +68,8 @@ fn cryptsetup_and_blkid_probe_the_retained_procfd_after_path_swap() {
         .arg("--pbkdf-force-iterations")
         .arg("1000")
         .arg("--key-file")
-        .arg(&key_procfd)
-        .arg(&image_procfd)
+        .arg(&key_path)
+        .arg(&named)
         .env_clear()
         .env("LC_ALL", "C")
         .stdin(Stdio::null())
@@ -93,8 +79,10 @@ fn cryptsetup_and_blkid_probe_the_retained_procfd_after_path_swap() {
         bounded_process::wait(&mut format, COMMAND_TIMEOUT).expect("bounded cryptsetup format");
     assert!(
         status.success(),
-        "cryptsetup could not format procfd fixture"
+        "cryptsetup could not format disposable fixture"
     );
+    drop(image);
+    let retained = File::open(&named).expect("retain formatted image descriptor");
 
     fs::rename(&named, &moved).expect("move formatted image");
     let blank = OpenOptions::new()
@@ -108,16 +96,26 @@ fn cryptsetup_and_blkid_probe_the_retained_procfd_after_path_swap() {
         .expect("size blank replacement");
     fs::rename(&replacement, &named).expect("replace selected path");
 
-    let mut uuid = Command::new(CRYPTSETUP_PATH);
-    uuid.arg("luksUUID")
+    let mut is_luks = Command::new(CRYPTSETUP_PATH);
+    let cryptsetup_descriptor = bounded_process::InheritedChildDescriptor::duplicate(&retained)
+        .expect("cryptsetup child descriptor");
+    is_luks
+        .arg("isLuks")
         .arg("--type")
         .arg("luks2")
-        .arg(&image_procfd);
-    let uuid = capture(&mut uuid);
-    let uuid = uuid.strip_suffix(b"\n").unwrap_or(&uuid);
-    assert_eq!(uuid.len(), 36, "invalid retained LUKS UUID");
+        .arg(cryptsetup_descriptor.path())
+        .env_clear()
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let status =
+        bounded_process::wait_with_descriptor(&mut is_luks, COMMAND_TIMEOUT, cryptsetup_descriptor)
+            .expect("bounded cryptsetup retained probe");
+    assert!(status.success(), "cryptsetup rejected retained descriptor");
 
     let mut blkid = Command::new(BLKID_PATH);
+    let blkid_stdin = bounded_process::duplicate_child_stdin(&retained).expect("blkid child stdin");
     blkid
         .arg("--probe")
         .arg("--cache-file")
@@ -133,8 +131,8 @@ fn cryptsetup_and_blkid_probe_the_retained_procfd_after_path_swap() {
         .arg("UUID")
         .arg("--match-tag")
         .arg("LABEL")
-        .arg(&image_procfd);
-    let properties = capture(&mut blkid);
+        .arg(bounded_process::CHILD_STDIN_PATH);
+    let properties = capture_with_stdin(&mut blkid, blkid_stdin);
     assert!(
         properties
             .split(|byte| *byte == b'\n')
@@ -151,8 +149,12 @@ fn cryptsetup_and_blkid_probe_the_retained_procfd_after_path_swap() {
             .any(|line| line == b"LABEL=KERNAID_VAULT")
     );
     assert!(properties.split(|byte| *byte == b'\n').any(|line| {
-        line.strip_prefix(b"UUID=")
-            .is_some_and(|value| value == uuid)
+        line.strip_prefix(b"UUID=").is_some_and(|value| {
+            value.len() == 36
+                && value.iter().all(|byte| {
+                    byte.is_ascii_digit() || (b'a'..=b'f').contains(byte) || *byte == b'-'
+                })
+        })
     }));
 
     let mut swapped = Command::new(CRYPTSETUP_PATH);

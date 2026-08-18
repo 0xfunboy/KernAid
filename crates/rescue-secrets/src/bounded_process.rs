@@ -1,11 +1,15 @@
 use rustix::{
+    fd::{AsFd, AsRawFd, OwnedFd},
     fs::{self as rfs, OFlags},
     process::{Pid, Signal},
 };
 use std::{
+    fs::File,
     io::{self, Read},
-    os::unix::process::CommandExt,
-    process::{Child, Command, ExitStatus},
+    os::{fd::RawFd, unix::process::CommandExt},
+    path::{Path, PathBuf},
+    process::{Child, Command, ExitStatus, Stdio},
+    sync::Mutex,
     thread,
     time::{Duration, Instant},
 };
@@ -14,6 +18,9 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const TERMINATION_GRACE: Duration = Duration::from_millis(250);
 const KILL_GRACE: Duration = Duration::from_secs(1);
 const MAX_STDOUT_READS_PER_POLL: usize = 64;
+const CHILD_DESCRIPTOR_MINIMUM: RawFd = 3;
+pub(crate) const CHILD_STDIN_PATH: &str = "/proc/self/fd/0";
+static SPAWN_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BoundedProcessError {
@@ -31,6 +38,57 @@ pub(crate) struct CapturedOutput {
     pub(crate) status: ExitStatus,
 }
 
+/// One descriptor capability made visible only to the next bounded child.
+///
+/// The parent-side duplicate remains CLOEXEC until `spawn_isolated` holds the
+/// bounded-spawn lock. It is then cleared immediately before `spawn` and
+/// closed in the parent immediately afterwards. The production worker is
+/// single-threaded, and all of its external tools use this bounded spawn path.
+/// The child addresses only its own inherited descriptor, so a non-dumpable
+/// parent is never reopened via `/proc/<parent>/fd`.
+pub(crate) struct InheritedChildDescriptor {
+    descriptor: OwnedFd,
+    path: PathBuf,
+}
+
+impl InheritedChildDescriptor {
+    pub(crate) fn duplicate(source: impl AsFd) -> Result<Self, BoundedProcessError> {
+        let descriptor = duplicate_cloexec(source)?;
+        let number = descriptor.as_raw_fd();
+        Ok(Self {
+            descriptor,
+            path: PathBuf::from(format!("/proc/self/fd/{number}")),
+        })
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+pub(crate) fn duplicate_child_stdin(source: impl AsFd) -> Result<Stdio, BoundedProcessError> {
+    duplicate_cloexec(source).map(|descriptor| Stdio::from(File::from(descriptor)))
+}
+
+fn duplicate_cloexec(source: impl AsFd) -> Result<OwnedFd, BoundedProcessError> {
+    let source = source.as_fd();
+    let source_flags =
+        rustix::io::fcntl_getfd(source).map_err(|_| BoundedProcessError::StartFailed)?;
+    if !source_flags.contains(rustix::io::FdFlags::CLOEXEC) {
+        return Err(BoundedProcessError::StartFailed);
+    }
+    let descriptor = rustix::io::fcntl_dupfd_cloexec(source, CHILD_DESCRIPTOR_MINIMUM)
+        .map_err(|_| BoundedProcessError::StartFailed)?;
+    let number = descriptor.as_raw_fd();
+    let duplicate_flags =
+        rustix::io::fcntl_getfd(&descriptor).map_err(|_| BoundedProcessError::StartFailed)?;
+    if number < CHILD_DESCRIPTOR_MINIMUM || !duplicate_flags.contains(rustix::io::FdFlags::CLOEXEC)
+    {
+        return Err(BoundedProcessError::StartFailed);
+    }
+    Ok(descriptor)
+}
+
 pub(crate) fn capture(
     command: &mut Command,
     timeout: Duration,
@@ -39,7 +97,7 @@ pub(crate) fn capture(
     let capture_limit = maximum_bytes
         .checked_add(1)
         .ok_or(BoundedProcessError::OutputLimitExceeded)?;
-    let (mut child, process_group) = spawn_isolated(command)?;
+    let (mut child, process_group) = spawn_isolated(command, None)?;
     let Some(mut stdout) = child.stdout.take() else {
         return Err(cleanup_or(
             &mut child,
@@ -150,7 +208,23 @@ pub(crate) fn wait(
     command: &mut Command,
     timeout: Duration,
 ) -> Result<ExitStatus, BoundedProcessError> {
-    let (mut child, process_group) = spawn_isolated(command)?;
+    wait_optional_descriptor(command, timeout, None)
+}
+
+pub(crate) fn wait_with_descriptor(
+    command: &mut Command,
+    timeout: Duration,
+    descriptor: InheritedChildDescriptor,
+) -> Result<ExitStatus, BoundedProcessError> {
+    wait_optional_descriptor(command, timeout, Some(descriptor))
+}
+
+fn wait_optional_descriptor(
+    command: &mut Command,
+    timeout: Duration,
+    descriptor: Option<InheritedChildDescriptor>,
+) -> Result<ExitStatus, BoundedProcessError> {
+    let (mut child, process_group) = spawn_isolated(command, descriptor)?;
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
@@ -184,7 +258,22 @@ pub(crate) fn wait(
     }
 }
 
-fn spawn_isolated(command: &mut Command) -> Result<(Child, Pid), BoundedProcessError> {
+fn spawn_isolated(
+    command: &mut Command,
+    descriptor: Option<InheritedChildDescriptor>,
+) -> Result<(Child, Pid), BoundedProcessError> {
+    let _spawn_guard = SPAWN_LOCK
+        .lock()
+        .map_err(|_| BoundedProcessError::StartFailed)?;
+    if let Some(inherited) = descriptor.as_ref() {
+        let flags = rustix::io::fcntl_getfd(&inherited.descriptor)
+            .map_err(|_| BoundedProcessError::StartFailed)?;
+        if !flags.contains(rustix::io::FdFlags::CLOEXEC) {
+            return Err(BoundedProcessError::StartFailed);
+        }
+        rustix::io::fcntl_setfd(&inherited.descriptor, flags - rustix::io::FdFlags::CLOEXEC)
+            .map_err(|_| BoundedProcessError::StartFailed)?;
+    }
     command.process_group(0);
     let child = command.spawn().map_err(|error| {
         if matches!(
@@ -195,7 +284,9 @@ fn spawn_isolated(command: &mut Command) -> Result<(Child, Pid), BoundedProcessE
         } else {
             BoundedProcessError::StartFailed
         }
-    })?;
+    });
+    drop(descriptor);
+    let child = child?;
     let process_group = Pid::from_child(&child);
     Ok((child, process_group))
 }
@@ -266,6 +357,8 @@ fn poll_cleanup_until(child: &mut Child, process_group: Pid, deadline: Instant) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustix::process::{DumpableBehavior, set_dumpable_behavior};
+    use std::{fs::File, os::unix::fs::MetadataExt, process::Stdio};
 
     #[test]
     fn cleanup_ambiguity_is_terminal_and_never_uses_blocking_wait() {
@@ -278,5 +371,109 @@ mod tests {
             !include_str!("bounded_process.rs").contains(&blocking_wait),
             "cleanup must use only deadline-bounded try_wait polling"
         );
+    }
+
+    #[test]
+    fn nondumpable_parent_passes_only_a_child_self_descriptor() {
+        const CHILD_FLAG: &str = "KERNAID_BOUNDED_DESCRIPTOR_CHILD";
+        const GRANDCHILD_FLAG: &str = "KERNAID_BOUNDED_DESCRIPTOR_GRANDCHILD";
+        const FIXED_BYTES: &[u8] = b"descriptor-capability-v1\n";
+        if let Some(path) = std::env::var_os(GRANDCHILD_FLAG) {
+            let path = PathBuf::from(path);
+            assert!(path.to_string_lossy().starts_with("/proc/self/fd/"));
+            let expected = std::fs::metadata(&path).expect("stat inherited descriptor");
+            let aliases = std::fs::read_dir("/proc/self/fd")
+                .expect("scan child descriptors")
+                .filter_map(Result::ok)
+                .filter_map(|entry| std::fs::metadata(entry.path()).ok())
+                .filter(|metadata| {
+                    metadata.dev() == expected.dev() && metadata.ino() == expected.ino()
+                })
+                .count();
+            assert_eq!(
+                aliases, 1,
+                "only the intended child descriptor is inherited"
+            );
+            let bytes = std::fs::read(path).expect("read inherited descriptor");
+            assert_eq!(bytes, FIXED_BYTES);
+            return;
+        }
+        if let Some(path) = std::env::var_os(CHILD_FLAG) {
+            set_dumpable_behavior(DumpableBehavior::NotDumpable).expect("set non-dumpable");
+            let source = File::open(path).expect("open descriptor fixture");
+            let source_flags = rustix::io::fcntl_getfd(&source).expect("source flags");
+            rustix::io::fcntl_setfd(&source, source_flags | rustix::io::FdFlags::CLOEXEC)
+                .expect("source CLOEXEC");
+            let inherited = InheritedChildDescriptor::duplicate(&source).expect("child duplicate");
+            assert!(
+                inherited
+                    .path()
+                    .to_string_lossy()
+                    .starts_with("/proc/self/fd/")
+            );
+            let mut command = Command::new(std::env::current_exe().expect("test executable"));
+            command
+                .arg("--exact")
+                .arg(
+                    "bounded_process::tests::nondumpable_parent_passes_only_a_child_self_descriptor",
+                )
+                .arg("--nocapture")
+                .env_clear()
+                .env(GRANDCHILD_FLAG, inherited.path())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let status = wait_with_descriptor(&mut command, Duration::from_secs(1), inherited)
+                .expect("wait for inherited descriptor child");
+            assert!(status.success());
+            assert!(
+                rustix::io::fcntl_getfd(&source)
+                    .expect("source flags after child")
+                    .contains(rustix::io::FdFlags::CLOEXEC)
+            );
+
+            let child_stdin = duplicate_child_stdin(&source).expect("child stdin duplicate");
+            let mut stdin_command = Command::new(std::env::current_exe().expect("test executable"));
+            stdin_command
+                .arg("--exact")
+                .arg(
+                    "bounded_process::tests::nondumpable_parent_passes_only_a_child_self_descriptor",
+                )
+                .arg("--nocapture")
+                .env_clear()
+                .env(GRANDCHILD_FLAG, CHILD_STDIN_PATH)
+                .stdin(child_stdin)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let status = wait(&mut stdin_command, Duration::from_secs(1))
+                .expect("wait for child stdin descriptor");
+            assert!(status.success());
+            return;
+        }
+
+        let non_cloexec = tempfile::tempfile().expect("non-CLOEXEC fixture");
+        let flags = rustix::io::fcntl_getfd(&non_cloexec).expect("non-CLOEXEC flags");
+        rustix::io::fcntl_setfd(&non_cloexec, flags - rustix::io::FdFlags::CLOEXEC)
+            .expect("clear source CLOEXEC");
+        assert_eq!(
+            InheritedChildDescriptor::duplicate(&non_cloexec).err(),
+            Some(BoundedProcessError::StartFailed),
+            "a source that could leak independently is rejected"
+        );
+        assert!(duplicate_child_stdin(&non_cloexec).is_err());
+
+        let fixture = tempfile::NamedTempFile::new().expect("descriptor fixture");
+        std::fs::write(fixture.path(), FIXED_BYTES).expect("write descriptor fixture");
+        let status = Command::new(std::env::current_exe().expect("test executable"))
+            .arg("--exact")
+            .arg("bounded_process::tests::nondumpable_parent_passes_only_a_child_self_descriptor")
+            .arg("--nocapture")
+            .env(CHILD_FLAG, fixture.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("spawn non-dumpable regression child");
+        assert!(status.success());
     }
 }
