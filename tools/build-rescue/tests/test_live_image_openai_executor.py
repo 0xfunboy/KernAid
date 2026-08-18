@@ -17,6 +17,10 @@ BUILD = REPO_DIR / "tools/build-rescue/build.sh"
 WORKFLOW = REPO_DIR / ".github/workflows/rescue.yml"
 VAULT_WORKFLOW = REPO_DIR / ".github/workflows/vault.yml"
 EXECUTOR_SOURCE = REPO_DIR / "crates/rescue-openai-executor/src/linux.rs"
+VAULT_WIRE_SOURCE = REPO_DIR / "crates/rescue-secrets/src/rescue_daemon/internal_wire.rs"
+VAULT_WORKER_SOURCE = REPO_DIR / "crates/rescue-secrets/src/rescue_daemon/worker.rs"
+VAULT_RUNTIME_SOURCE = REPO_DIR / "crates/rescue-secrets/src/rescue_daemon/runtime.rs"
+VAULT_SERVER_SOURCE = REPO_DIR / "crates/rescue-secrets/src/rescue_daemon/server.rs"
 READY_CHECK = LIVE_ROOT / "usr/lib/kernaid/ready-check"
 
 
@@ -233,6 +237,31 @@ class RescueOpenAiExecutorPackagingTests(unittest.TestCase):
             "UdpSocket",
         ):
             self.assertNotIn(forbidden, source)
+
+    def test_key_borrow_pipe_substrate_is_private_dormant_and_non_networked(self) -> None:
+        wire = VAULT_WIRE_SOURCE.read_text(encoding="utf-8")
+        worker = VAULT_WORKER_SOURCE.read_text(encoding="utf-8")
+        runtime = VAULT_RUNTIME_SOURCE.read_text(encoding="utf-8")
+        server = VAULT_SERVER_SOURCE.read_text(encoding="utf-8")
+        self.assertIn('b"KRVWC002"', wire)
+        self.assertIn('b"KRVWR002"', wire)
+        self.assertIn("ProviderOpenAiBorrow", wire)
+        self.assertIn("validate_internal_output_pipe", worker)
+        self.assertIn("with_openai_api_key", worker)
+        self.assertIn("pub(super) fn borrow_openai", runtime)
+        self.assertIn("ioctl_fionread", runtime)
+
+        allowlist_start = server.index("fn external_operation_is_enabled(")
+        allowlist_end = server.index("fn status_version_is_accepted(", allowlist_start)
+        self.assertNotIn("ProviderOpenAiBorrow", server[allowlist_start:allowlist_end])
+        dispatch_start = server.index("fn handle_connected_request(")
+        dispatch_end = server.index("fn handle_request(", dispatch_start)
+        self.assertNotIn("ProviderOpenAiBorrow", server[dispatch_start:dispatch_end])
+        self.assertIn("&[], send_deadline", server)
+
+        service = unit_sections(EXECUTOR_SERVICE)["Service"]
+        self.assertEqual(service["PrivateNetwork"], "yes")
+        self.assertEqual(service["RestrictAddressFamilies"], "AF_UNIX")
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ use rustix::{
         self as rfs, AtFlags, CWD, FileType, FlockOperation, Mode, OFlags, ResolveFlags, SeekFrom,
     },
     net::{AddressFamily, SocketFlags, SocketType, socketpair},
+    pipe::{PipeFlags, pipe_with},
     process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal},
 };
 use std::{
@@ -35,6 +36,7 @@ const PIDS_CONTROLLER_NAME: &[u8] = b"pids";
 const CGROUP2_SUPER_MAGIC: u64 = 0x6367_7270;
 const PROC_SUPER_MAGIC: u64 = 0x0000_9fa0;
 const TMPFS_MAGIC: u64 = 0x0102_1994;
+const PIPEFS_MAGIC: u64 = 0x5049_5045;
 const SECURE_DIRECTORY_MODE: u32 = 0o700;
 const SECURE_FILE_MODE: u32 = 0o600;
 const MAX_CGROUP_FILE_BYTES: usize = 4096;
@@ -43,6 +45,9 @@ const MAX_CGROUP_COMPONENT_BYTES: usize = 128;
 const MAX_CGROUP_PROCESSES: usize = 256;
 const WORKER_EXIT_GRACE: Duration = Duration::from_secs(2);
 const WORKER_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_PROVIDER_OUTPUT_BYTES: usize =
+    kernaid_protocol::rescue_vault::MAX_OPENAI_KEY_BYTES as usize;
+const _: () = assert!(MAX_PROVIDER_OUTPUT_BYTES <= rustix::pipe::PIPE_BUF);
 
 /// Runtime marker disposition at daemon startup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1149,6 +1154,7 @@ impl WorkerHandle {
         };
         if bootstrap.code != internal_wire::WorkerResultCode::BootstrapReady
             || bootstrap.device_id.is_some()
+            || bootstrap.output_size.is_some()
             || cgroup.verify_exact_worker(pid).is_err()
             || pidfd_ready(pidfd.as_fd()).unwrap_or(true)
         {
@@ -1175,20 +1181,58 @@ impl WorkerHandle {
         &self,
         kind: internal_wire::WorkerCommandKind,
         secret_size: Option<u16>,
-        secret: Option<BorrowedFd<'_>>,
+        descriptor: Option<OwnedFd>,
         deadline: Instant,
-    ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
-        self.transact_cancellable(kind, secret_size, secret, deadline, None)
+    ) -> Result<(internal_wire::WorkerResponse, Option<OwnedFd>), RescueVaultDaemonError> {
+        self.transact_cancellable(kind, secret_size, descriptor, deadline, None)
     }
 
     pub(super) fn transact_cancellable(
         &self,
         kind: internal_wire::WorkerCommandKind,
         secret_size: Option<u16>,
-        secret: Option<BorrowedFd<'_>>,
+        descriptor: Option<OwnedFd>,
         deadline: Instant,
         cancellation: Option<&AtomicBool>,
-    ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
+    ) -> Result<(internal_wire::WorkerResponse, Option<OwnedFd>), RescueVaultDaemonError> {
+        if kind == internal_wire::WorkerCommandKind::ProviderOpenAiBorrow {
+            return Err(RescueVaultDaemonError::ProtocolFailure);
+        }
+        self.transact_inner(kind, secret_size, descriptor, deadline, cancellation, None)
+    }
+
+    /// Dormant private substrate for the future Agent lease handler. The
+    /// shipping server does not call this method: public borrow remains
+    /// hard-denied before worker dispatch.
+    #[allow(dead_code)]
+    pub(super) fn borrow_openai(
+        &self,
+        deadline: Instant,
+    ) -> Result<(internal_wire::WorkerResponse, Option<OwnedFd>), RescueVaultDaemonError> {
+        let (read, write) = create_provider_output_pipe()?;
+        self.transact_inner(
+            internal_wire::WorkerCommandKind::ProviderOpenAiBorrow,
+            None,
+            Some(write),
+            deadline,
+            None,
+            Some(read),
+        )
+    }
+
+    fn transact_inner(
+        &self,
+        kind: internal_wire::WorkerCommandKind,
+        secret_size: Option<u16>,
+        descriptor: Option<OwnedFd>,
+        deadline: Instant,
+        cancellation: Option<&AtomicBool>,
+        provider_output: Option<OwnedFd>,
+    ) -> Result<(internal_wire::WorkerResponse, Option<OwnedFd>), RescueVaultDaemonError> {
+        let borrowing = kind == internal_wire::WorkerCommandKind::ProviderOpenAiBorrow;
+        if borrowing != provider_output.is_some() || (borrowing && cancellation.is_some()) {
+            return Err(RescueVaultDaemonError::ProtocolFailure);
+        }
         if self.terminal.load(Ordering::Acquire) {
             return Err(RescueVaultDaemonError::WorkerUnavailable);
         }
@@ -1208,38 +1252,60 @@ impl WorkerHandle {
             .checked_add(1)
             .filter(|next| *next != 0)
             .ok_or(RescueVaultDaemonError::WorkerUnavailable)?;
-        let command = match (kind, secret_size) {
-            (internal_wire::WorkerCommandKind::Bootstrap, _) => {
+        let (command, outgoing) = match (kind, secret_size, descriptor) {
+            (internal_wire::WorkerCommandKind::Bootstrap, _, _) => {
                 return Err(RescueVaultDaemonError::ProtocolFailure);
             }
-            (internal_wire::WorkerCommandKind::Probe, None) => {
-                internal_wire::WorkerCommand::probe(request_id)
+            (internal_wire::WorkerCommandKind::Probe, None, None) => {
+                (internal_wire::WorkerCommand::probe(request_id), None)
             }
-            (internal_wire::WorkerCommandKind::Unlock, Some(size)) => {
-                internal_wire::WorkerCommand::unlock(request_id, size)
+            (internal_wire::WorkerCommandKind::Unlock, Some(size), Some(descriptor)) => (
+                internal_wire::WorkerCommand::unlock(request_id, size),
+                Some(descriptor),
+            ),
+            (internal_wire::WorkerCommandKind::Lock, None, None) => {
+                (internal_wire::WorkerCommand::lock(request_id), None)
             }
-            (internal_wire::WorkerCommandKind::Lock, None) => {
-                internal_wire::WorkerCommand::lock(request_id)
-            }
-            (internal_wire::WorkerCommandKind::ProviderStatus, None) => {
-                internal_wire::WorkerCommand::provider_status(request_id)
-            }
-            (internal_wire::WorkerCommandKind::ProviderOpenAiConfigure, Some(size)) => {
-                internal_wire::WorkerCommand::provider_openai_configure(request_id, size)
-            }
-            (internal_wire::WorkerCommandKind::ProviderOpenAiLogout, None) => {
-                internal_wire::WorkerCommand::provider_openai_logout(request_id)
-            }
-            (internal_wire::WorkerCommandKind::AttestQuiescent, None) => {
-                internal_wire::WorkerCommand::attest_quiescent(request_id)
-            }
-            (internal_wire::WorkerCommandKind::Shutdown, None) => {
-                internal_wire::WorkerCommand::shutdown(request_id)
+            (internal_wire::WorkerCommandKind::ProviderStatus, None, None) => (
+                internal_wire::WorkerCommand::provider_status(request_id),
+                None,
+            ),
+            (
+                internal_wire::WorkerCommandKind::ProviderOpenAiConfigure,
+                Some(size),
+                Some(descriptor),
+            ) => (
+                internal_wire::WorkerCommand::provider_openai_configure(request_id, size),
+                Some(descriptor),
+            ),
+            (internal_wire::WorkerCommandKind::ProviderOpenAiLogout, None, None) => (
+                internal_wire::WorkerCommand::provider_openai_logout(request_id),
+                None,
+            ),
+            (internal_wire::WorkerCommandKind::ProviderOpenAiBorrow, None, Some(descriptor)) => (
+                internal_wire::WorkerCommand::provider_openai_borrow(request_id),
+                Some(descriptor),
+            ),
+            (internal_wire::WorkerCommandKind::AttestQuiescent, None, None) => (
+                internal_wire::WorkerCommand::attest_quiescent(request_id),
+                None,
+            ),
+            (internal_wire::WorkerCommandKind::Shutdown, None, None) => {
+                (internal_wire::WorkerCommand::shutdown(request_id), None)
             }
             _ => return Err(RescueVaultDaemonError::ProtocolFailure),
         };
-        internal_wire::send_command(channel.socket.as_fd(), command, secret, deadline)
-            .map_err(|_| RescueVaultDaemonError::WorkerUnavailable)?;
+        let sent = internal_wire::send_command(
+            channel.socket.as_fd(),
+            command,
+            outgoing.as_ref().map(AsFd::as_fd),
+            deadline,
+        );
+        // SCM_RIGHTS has taken its own reference after a successful sendmsg.
+        // Neither input secrets nor the supervisor's output writer remain
+        // open while the worker processes the command.
+        drop(outgoing);
+        sent.map_err(|_| RescueVaultDaemonError::WorkerUnavailable)?;
         let response = loop {
             if cancellation.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
                 return Err(RescueVaultDaemonError::WorkerUnavailable);
@@ -1262,7 +1328,11 @@ impl WorkerHandle {
         if pidfd_ready(self.pidfd.as_fd())? {
             return Err(RescueVaultDaemonError::WorkerUnavailable);
         }
-        Ok(response)
+        let output = match provider_output {
+            Some(output) => finalize_provider_output(output, &response, deadline)?,
+            None => None,
+        };
+        Ok((response, output))
     }
 
     pub(super) fn exited(&self) -> Result<bool, RescueVaultDaemonError> {
@@ -1410,6 +1480,115 @@ fn cleanup_deadline(absolute_deadline: Instant) -> Instant {
         .min(absolute_deadline)
 }
 
+fn create_provider_output_pipe() -> Result<(OwnedFd, OwnedFd), RescueVaultDaemonError> {
+    let (read, write) = pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK)
+        .map_err(|_| RescueVaultDaemonError::WorkerUnavailable)?;
+    validate_provider_output_endpoint(read.as_fd(), OFlags::RDONLY)?;
+    validate_provider_output_endpoint(write.as_fd(), OFlags::WRONLY)?;
+    let read_stat = rfs::fstat(&read).map_err(|_| RescueVaultDaemonError::WorkerUnavailable)?;
+    let write_stat = rfs::fstat(&write).map_err(|_| RescueVaultDaemonError::WorkerUnavailable)?;
+    if read_stat.st_dev != write_stat.st_dev || read_stat.st_ino != write_stat.st_ino {
+        return Err(RescueVaultDaemonError::WorkerUnavailable);
+    }
+    Ok((read, write))
+}
+
+fn validate_provider_output_endpoint(
+    descriptor: BorrowedFd<'_>,
+    access: OFlags,
+) -> Result<(), RescueVaultDaemonError> {
+    let stat = rfs::fstat(descriptor).map_err(|_| RescueVaultDaemonError::WorkerUnavailable)?;
+    let filesystem =
+        rfs::fstatfs(descriptor).map_err(|_| RescueVaultDaemonError::WorkerUnavailable)?;
+    let filesystem_type =
+        u64::try_from(filesystem.f_type).map_err(|_| RescueVaultDaemonError::WorkerUnavailable)?;
+    let status =
+        rfs::fcntl_getfl(descriptor).map_err(|_| RescueVaultDaemonError::WorkerUnavailable)?;
+    let descriptor_flags = rustix::io::fcntl_getfd(descriptor)
+        .map_err(|_| RescueVaultDaemonError::WorkerUnavailable)?;
+    let capacity = rustix::pipe::fcntl_getpipe_size(descriptor)
+        .map_err(|_| RescueVaultDaemonError::WorkerUnavailable)?;
+    if !FileType::from_raw_mode(stat.st_mode).is_fifo()
+        || filesystem_type != PIPEFS_MAGIC
+        || status != (access | OFlags::NONBLOCK)
+        || descriptor_flags != rustix::io::FdFlags::CLOEXEC
+        || stat.st_size != 0
+        || capacity < MAX_PROVIDER_OUTPUT_BYTES
+    {
+        return Err(RescueVaultDaemonError::WorkerUnavailable);
+    }
+    Ok(())
+}
+
+fn finalize_provider_output(
+    output: OwnedFd,
+    response: &internal_wire::WorkerResponse,
+    deadline: Instant,
+) -> Result<Option<OwnedFd>, RescueVaultDaemonError> {
+    validate_provider_output_endpoint(output.as_fd(), OFlags::RDONLY)?;
+    let expected = match (response.code, response.output_size) {
+        (internal_wire::WorkerResultCode::ProviderBorrowReady, Some(size))
+            if (1..=MAX_PROVIDER_OUTPUT_BYTES).contains(&usize::from(size)) =>
+        {
+            u64::from(size)
+        }
+        (internal_wire::WorkerResultCode::ProviderBorrowReady, _) | (_, Some(_)) => {
+            return Err(RescueVaultDaemonError::ProtocolFailure);
+        }
+        (_, None) => 0,
+    };
+    wait_provider_output_hup(output.as_fd(), deadline)?;
+    let available = rustix::io::ioctl_fionread(output.as_fd())
+        .map_err(|_| RescueVaultDaemonError::ProtocolFailure)?;
+    if available != expected {
+        return Err(RescueVaultDaemonError::ProtocolFailure);
+    }
+    if response.code == internal_wire::WorkerResultCode::ProviderBorrowReady {
+        Ok(Some(output))
+    } else {
+        Ok(None)
+    }
+}
+
+fn wait_provider_output_hup(
+    output: BorrowedFd<'_>,
+    deadline: Instant,
+) -> Result<(), RescueVaultDaemonError> {
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(RescueVaultDaemonError::ProtocolFailure)?;
+        let mut descriptors = [PollFd::from_borrowed_fd(output, PollFlags::HUP)];
+        match poll(&mut descriptors, Some(&duration_to_timespec(remaining))) {
+            Ok(0) => return Err(RescueVaultDaemonError::ProtocolFailure),
+            Ok(_) => {
+                let events = descriptors[0].revents();
+                if events.intersects(PollFlags::NVAL | PollFlags::ERR) {
+                    return Err(RescueVaultDaemonError::ProtocolFailure);
+                }
+                if events.contains(PollFlags::HUP) {
+                    return Ok(());
+                }
+            }
+            Err(error) if error == rustix::io::Errno::INTR => {}
+            Err(_) => return Err(RescueVaultDaemonError::ProtocolFailure),
+        }
+    }
+}
+
+fn duration_to_timespec(duration: Duration) -> Timespec {
+    let seconds = i64::try_from(duration.as_secs()).unwrap_or(i64::MAX);
+    Timespec {
+        tv_sec: seconds,
+        tv_nsec: if seconds == i64::MAX {
+            999_999_999
+        } else {
+            i64::from(duration.subsec_nanos())
+        },
+    }
+}
+
 fn response_matches(
     kind: internal_wire::WorkerCommandKind,
     response: &internal_wire::WorkerResponse,
@@ -1469,6 +1648,14 @@ fn response_matches(
             Result::ProviderLogoutSucceeded
                 | Result::ProviderMutationAborted
                 | Result::ProviderStateAmbiguous
+                | Result::CleanupFailed
+        ),
+        Command::ProviderOpenAiBorrow => matches!(
+            response.code,
+            Result::ProviderBorrowReady
+                | Result::ProviderBorrowUnconfigured
+                | Result::ProviderStateAmbiguous
+                | Result::IoFailed
                 | Result::CleanupFailed
         ),
         Command::AttestQuiescent => matches!(
@@ -1571,7 +1758,7 @@ fn read_bounded(descriptor: BorrowedFd<'_>, maximum: usize) -> Result<Vec<u8>, (
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::symlink;
+    use std::{ffi::OsString, os::fd::AsRawFd, os::unix::fs::symlink};
 
     fn temporary_root() -> (tempfile::TempDir, OwnedFd) {
         let directory = tempfile::tempdir().expect("temporary runtime");
@@ -1771,6 +1958,120 @@ mod tests {
             internal_wire::WorkerCommandKind::Unlock,
             &unlock
         ));
+
+        let ready = internal_wire::WorkerResponse::provider_borrow_ready(3, 32);
+        assert!(response_matches(
+            internal_wire::WorkerCommandKind::ProviderOpenAiBorrow,
+            &ready
+        ));
+        for divergent in [
+            internal_wire::WorkerResultCode::Busy,
+            internal_wire::WorkerResultCode::InvalidRequest,
+        ] {
+            assert!(!response_matches(
+                internal_wire::WorkerCommandKind::ProviderOpenAiBorrow,
+                &internal_wire::WorkerResponse::new(3, divergent)
+            ));
+        }
+    }
+
+    #[test]
+    fn provider_output_completion_requires_exact_hup_and_byte_count_without_reading() {
+        let (read, write) = create_provider_output_pipe().expect("provider output pipe");
+        let synthetic = [b'X'; 32];
+        assert_eq!(rustix::io::write(&write, &synthetic), Ok(32));
+        drop(write);
+        let ready = internal_wire::WorkerResponse::provider_borrow_ready(4, 32);
+        let read = finalize_provider_output(read, &ready, Instant::now() + Duration::from_secs(1))
+            .expect("valid ready completion")
+            .expect("ready descriptor");
+        assert_eq!(rustix::io::ioctl_fionread(read.as_fd()), Ok(32));
+
+        let (empty, empty_writer) = create_provider_output_pipe().expect("empty output pipe");
+        drop(empty_writer);
+        let unconfigured = internal_wire::WorkerResponse::new(
+            5,
+            internal_wire::WorkerResultCode::ProviderBorrowUnconfigured,
+        );
+        assert!(
+            finalize_provider_output(
+                empty,
+                &unconfigured,
+                Instant::now() + Duration::from_secs(1)
+            )
+            .expect("valid unconfigured completion")
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn provider_output_completion_rejects_open_writer_timeout_and_protocol_mismatch() {
+        let (open, open_writer) = create_provider_output_pipe().expect("open output pipe");
+        let unconfigured = internal_wire::WorkerResponse::new(
+            6,
+            internal_wire::WorkerResultCode::ProviderBorrowUnconfigured,
+        );
+        assert!(matches!(
+            finalize_provider_output(
+                open,
+                &unconfigured,
+                Instant::now() + Duration::from_millis(20)
+            ),
+            Err(RescueVaultDaemonError::ProtocolFailure)
+        ));
+        let zero = Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let mut descriptors = [PollFd::from_borrowed_fd(
+            open_writer.as_fd(),
+            PollFlags::OUT,
+        )];
+        assert_eq!(poll(&mut descriptors, Some(&zero)), Ok(1));
+        assert!(descriptors[0].revents().contains(PollFlags::ERR));
+        drop(open_writer);
+
+        let (mismatch, mismatch_writer) =
+            create_provider_output_pipe().expect("mismatch output pipe");
+        let target = descriptor_target(mismatch.as_fd());
+        let synthetic = [b'X'; 31];
+        assert_eq!(rustix::io::write(&mismatch_writer, &synthetic), Ok(31));
+        drop(mismatch_writer);
+        assert_eq!(descriptor_target_count(&target), 1);
+        let ready = internal_wire::WorkerResponse::provider_borrow_ready(7, 32);
+        assert!(matches!(
+            finalize_provider_output(mismatch, &ready, Instant::now() + Duration::from_secs(1)),
+            Err(RescueVaultDaemonError::ProtocolFailure)
+        ));
+        assert_eq!(descriptor_target_count(&target), 0);
+
+        let (unexpected, unexpected_writer) =
+            create_provider_output_pipe().expect("unexpected output pipe");
+        assert_eq!(rustix::io::write(&unexpected_writer, b"X"), Ok(1));
+        drop(unexpected_writer);
+        assert!(matches!(
+            finalize_provider_output(
+                unexpected,
+                &unconfigured,
+                Instant::now() + Duration::from_secs(1)
+            ),
+            Err(RescueVaultDaemonError::ProtocolFailure)
+        ));
+    }
+
+    fn descriptor_target(descriptor: BorrowedFd<'_>) -> OsString {
+        std::fs::read_link(format!("/proc/self/fd/{}", descriptor.as_raw_fd()))
+            .expect("descriptor target")
+            .into_os_string()
+    }
+
+    fn descriptor_target_count(target: &OsString) -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .expect("proc fd")
+            .filter_map(Result::ok)
+            .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+            .filter(|observed| observed.as_os_str() == target.as_os_str())
+            .count()
     }
 
     #[test]

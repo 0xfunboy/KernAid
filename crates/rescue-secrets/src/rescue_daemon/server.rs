@@ -130,9 +130,9 @@ trait WorkerBoundary: Send + Sync {
         &self,
         kind: internal_wire::WorkerCommandKind,
         passphrase_size: Option<u16>,
-        passphrase: Option<BorrowedFd<'_>>,
+        descriptor: Option<OwnedFd>,
         deadline: Instant,
-    ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError>;
+    ) -> Result<(internal_wire::WorkerResponse, Option<OwnedFd>), RescueVaultDaemonError>;
     fn verify_healthy(&self) -> Result<(), RescueVaultDaemonError>;
     fn exited(&self) -> Result<bool, RescueVaultDaemonError>;
     fn fault_and_terminate(&self, deadline: Instant) -> Result<(), RescueVaultDaemonError>;
@@ -145,10 +145,10 @@ impl WorkerBoundary for WorkerHandle {
         &self,
         kind: internal_wire::WorkerCommandKind,
         passphrase_size: Option<u16>,
-        passphrase: Option<BorrowedFd<'_>>,
+        descriptor: Option<OwnedFd>,
         deadline: Instant,
-    ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
-        WorkerHandle::transact(self, kind, passphrase_size, passphrase, deadline)
+    ) -> Result<(internal_wire::WorkerResponse, Option<OwnedFd>), RescueVaultDaemonError> {
+        WorkerHandle::transact(self, kind, passphrase_size, descriptor, deadline)
     }
 
     fn verify_healthy(&self) -> Result<(), RescueVaultDaemonError> {
@@ -446,7 +446,7 @@ fn start_worker(stop: &StopControl) -> WorkerStartup {
         return cancel_startup_worker(worker, stop);
     }
     match response {
-        Ok(response) => match probe_availability(response.code) {
+        Ok((response, None)) => match probe_availability(response.code) {
             Ok(availability) => WorkerStartup::Ready {
                 worker,
                 availability,
@@ -459,7 +459,7 @@ fn start_worker(stop: &StopControl) -> WorkerStartup {
                 }
             }
         },
-        Err(_) => {
+        Ok((_, Some(_))) | Err(_) => {
             let _ = worker.fault_and_terminate(startup_deadline);
             WorkerStartup::Faulted {
                 worker: Some(worker),
@@ -1277,7 +1277,7 @@ impl Supervisor {
             None,
             operation_deadline,
         ) {
-            Ok(response) => {
+            Ok((response, None)) => {
                 use internal_wire::WorkerResultCode as Result;
                 let openai = match response.code {
                     Result::ProviderStatusUnconfigured => ProviderState::Unconfigured,
@@ -1318,7 +1318,7 @@ impl Supervisor {
                     ),
                 )
             }
-            Err(_) => {
+            Ok((_, Some(_))) | Err(_) => {
                 self.mark_fault_by(operation_deadline);
                 (
                     self.snapshot().version,
@@ -1407,19 +1407,18 @@ impl Supervisor {
         let response = worker.transact(
             internal_wire::WorkerCommandKind::ProviderOpenAiConfigure,
             u16::try_from(input_size).ok(),
-            Some(descriptor.as_fd()),
+            Some(descriptor),
             operation_deadline,
         );
-        drop(descriptor);
         match response {
-            Ok(response) => self.finish_provider_mutation(
+            Ok((response, None)) => self.finish_provider_mutation(
                 request,
                 response,
                 ProviderState::Configured,
                 internal_wire::WorkerResultCode::ProviderConfigureSucceeded,
                 operation_deadline,
             ),
-            Err(_) => {
+            Ok((_, Some(_))) | Err(_) => {
                 self.mark_fault_by(operation_deadline);
                 (
                     self.snapshot().version,
@@ -1512,14 +1511,14 @@ impl Supervisor {
             None,
             operation_deadline,
         ) {
-            Ok(response) => self.finish_provider_mutation(
+            Ok((response, None)) => self.finish_provider_mutation(
                 request,
                 response,
                 ProviderState::Unconfigured,
                 internal_wire::WorkerResultCode::ProviderLogoutSucceeded,
                 operation_deadline,
             ),
-            Err(_) => {
+            Ok((_, Some(_))) | Err(_) => {
                 self.mark_fault_by(operation_deadline);
                 (
                     self.snapshot().version,
@@ -1648,13 +1647,12 @@ impl Supervisor {
         let response = worker.transact(
             internal_wire::WorkerCommandKind::Unlock,
             u16::try_from(input_size).ok(),
-            Some(internal_pipe.as_fd()),
+            Some(internal_pipe),
             operation_deadline,
         );
-        drop(internal_pipe);
         match response {
-            Ok(response) => self.finish_unlock(request, response, operation_deadline),
-            Err(_) => {
+            Ok((response, None)) => self.finish_unlock(request, response, operation_deadline),
+            Ok((_, Some(_))) | Err(_) => {
                 self.mark_fault_by(operation_deadline);
                 let version = self.snapshot().version;
                 (
@@ -1887,7 +1885,9 @@ impl Supervisor {
             operation_deadline,
         );
         match response {
-            Ok(response) if response.code == internal_wire::WorkerResultCode::LockSucceeded => {
+            Ok((response, None))
+                if response.code == internal_wire::WorkerResultCode::LockSucceeded =>
+            {
                 let version = match self.complete_after_locked_attestation(
                     VaultState::Locking,
                     available(VaultState::Locked, None),
@@ -2183,8 +2183,10 @@ impl Supervisor {
                 deadline,
             )
             .map_err(|_| ())?;
+        let (response, output) = response;
         if response.code != internal_wire::WorkerResultCode::AttestLocked
             || response.device_id.is_some()
+            || output.is_some()
         {
             return Err(());
         }
@@ -2947,9 +2949,10 @@ mod tests {
             &self,
             kind: internal_wire::WorkerCommandKind,
             _passphrase_size: Option<u16>,
-            passphrase: Option<BorrowedFd<'_>>,
+            passphrase: Option<OwnedFd>,
             _deadline: Instant,
-        ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
+        ) -> Result<(internal_wire::WorkerResponse, Option<OwnedFd>), RescueVaultDaemonError>
+        {
             let event = match kind {
                 internal_wire::WorkerCommandKind::Unlock => TraceEvent::WorkerUnlock,
                 internal_wire::WorkerCommandKind::Lock => TraceEvent::WorkerLock,
@@ -2961,7 +2964,7 @@ mod tests {
             if let Some(passphrase) = passphrase {
                 let mut buffer = Zeroizing::new([0_u8; 256]);
                 loop {
-                    match rustix::io::read(passphrase, &mut buffer[..]) {
+                    match rustix::io::read(&passphrase, &mut buffer[..]) {
                         Ok(0) => break,
                         Ok(read) => secret_bytes += read,
                         Err(error) if error == rustix::io::Errno::INTR => {}
@@ -2990,7 +2993,7 @@ mod tests {
                     .recv()
                     .map_err(|_| RescueVaultDaemonError::WorkerUnavailable)?;
             }
-            response
+            response.map(|response| (response, None))
         }
 
         fn verify_healthy(&self) -> Result<(), RescueVaultDaemonError> {
@@ -4335,6 +4338,36 @@ mod tests {
         ] {
             assert!(!external_operation_is_enabled(operation, PeerRole::Agent));
         }
+    }
+
+    #[test]
+    fn dormant_provider_borrow_worker_support_does_not_enable_external_dispatch() {
+        let (supervisor, runtime, worker, privacy, _) = fake_supervisor(
+            unlocked_service_state(710),
+            [Ok(internal_wire::WorkerResponse::provider_borrow_ready(
+                1, 32,
+            ))],
+            true,
+        );
+        let request = validated_request_for_role(
+            "provider.openai.borrow",
+            serde_json::json!({}),
+            710,
+            None,
+            PeerRole::Agent,
+        );
+        let (version, result) = supervisor.handle_request(request, Instant::now());
+        assert_eq!(version, 710);
+        assert_handler_error(result, ErrorToken::NotAuthorized);
+        assert_eq!(supervisor.snapshot().version, 710);
+        let worker = worker.lock().expect("worker trace");
+        assert!(worker.calls.is_empty());
+        assert_eq!(worker.responses.len(), 1);
+        drop(worker);
+        assert_eq!(privacy.checks.load(Ordering::Relaxed), 0);
+        let runtime = runtime.lock().expect("runtime trace");
+        assert_eq!((runtime.arms, runtime.disarms), (0, 0));
+        assert!(!runtime.marker);
     }
 
     #[test]

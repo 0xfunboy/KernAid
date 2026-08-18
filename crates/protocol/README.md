@@ -109,6 +109,15 @@ dedicated Agent process, and waits for pidfd-confirmed exit and lease release
 before locking. An initial daemon that cannot yet supply an OpenAI key may
 answer `provider.openai.borrow` with `PROVIDER_UNCONFIGURED` and no descriptor.
 
+The current feature-gated daemon still hard-denies that external operation. It
+now has only a dormant private worker-pipe primitive behind a dedicated
+non-cancellable helper: the supervisor creates the anonymous nonblocking pipe,
+immediately drops its transferred writer after `sendmsg`, and verifies writer
+HUP plus the declared `FIONREAD` byte count without reading credential bytes.
+Only the private `Ready` result can retain the read end; every other result
+closes it. This is not an Agent lease, response-FD path, provider execution, or
+network-support claim.
+
 Passphrase pipes are limited to 12–1024 non-NUL bytes, matching vault writer
 v2. After the exact-size read the handler must attempt one further read, prove
 EOF, and call `validate_passphrase_read`; short, extra, NUL-containing or

@@ -2,8 +2,9 @@
 //!
 //! The wire is fixed-size binary data. It contains no pathname, secret,
 //! command string, diagnostic text, or JSON. The sole permitted descriptor is
-//! one anonymous secret pipe on an `Unlock` or `ProviderOpenAiConfigure`
-//! command.
+//! one anonymous pipe on an `Unlock`, `ProviderOpenAiConfigure`, or dormant
+//! `ProviderOpenAiBorrow` command. Borrow carries only the worker's write end;
+//! the supervisor retains the read end and never reads credential bytes.
 
 use kernaid_protocol::rescue_vault::{
     MAX_OPENAI_KEY_BYTES, MAX_PASSPHRASE_BYTES, MIN_PASSPHRASE_BYTES,
@@ -23,8 +24,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-const COMMAND_MAGIC: &[u8; 8] = b"KRVWC001";
-const RESPONSE_MAGIC: &[u8; 8] = b"KRVWR001";
+const COMMAND_MAGIC: &[u8; 8] = b"KRVWC002";
+const RESPONSE_MAGIC: &[u8; 8] = b"KRVWR002";
 const COMMAND_BYTES: usize = 32;
 const RESPONSE_BYTES: usize = 64;
 const MAX_RECORD_BYTES: usize = RESPONSE_BYTES;
@@ -40,6 +41,7 @@ pub(super) enum WorkerCommandKind {
     ProviderStatus,
     ProviderOpenAiConfigure,
     ProviderOpenAiLogout,
+    ProviderOpenAiBorrow,
     AttestQuiescent,
     Shutdown,
 }
@@ -108,6 +110,14 @@ impl WorkerCommand {
         }
     }
 
+    pub(super) fn provider_openai_borrow(request_id: u64) -> Self {
+        Self {
+            request_id,
+            kind: WorkerCommandKind::ProviderOpenAiBorrow,
+            secret_size: 0,
+        }
+    }
+
     pub(super) fn shutdown(request_id: u64) -> Self {
         Self {
             request_id,
@@ -148,6 +158,7 @@ impl WorkerCommand {
             WorkerCommandKind::ProviderStatus => 7,
             WorkerCommandKind::ProviderOpenAiConfigure => 8,
             WorkerCommandKind::ProviderOpenAiLogout => 9,
+            WorkerCommandKind::ProviderOpenAiBorrow => 10,
         };
         bytes[16..24].copy_from_slice(&self.request_id.to_be_bytes());
         bytes[24..26].copy_from_slice(&self.secret_size.to_be_bytes());
@@ -182,6 +193,7 @@ impl WorkerCommand {
             7 => WorkerCommandKind::ProviderStatus,
             8 => WorkerCommandKind::ProviderOpenAiConfigure,
             9 => WorkerCommandKind::ProviderOpenAiLogout,
+            10 => WorkerCommandKind::ProviderOpenAiBorrow,
             _ => return Err(InternalWireError::InvalidFrame),
         };
         let command = Self {
@@ -235,6 +247,8 @@ pub(super) enum WorkerResultCode {
     ProviderLogoutSucceeded,
     ProviderMutationAborted,
     ProviderStateAmbiguous,
+    ProviderBorrowReady,
+    ProviderBorrowUnconfigured,
 }
 
 impl WorkerResultCode {
@@ -270,6 +284,8 @@ impl WorkerResultCode {
             Self::ProviderLogoutSucceeded => 28,
             Self::ProviderMutationAborted => 29,
             Self::ProviderStateAmbiguous => 30,
+            Self::ProviderBorrowReady => 31,
+            Self::ProviderBorrowUnconfigured => 32,
         }
     }
 
@@ -305,6 +321,8 @@ impl WorkerResultCode {
             28 => Ok(Self::ProviderLogoutSucceeded),
             29 => Ok(Self::ProviderMutationAborted),
             30 => Ok(Self::ProviderStateAmbiguous),
+            31 => Ok(Self::ProviderBorrowReady),
+            32 => Ok(Self::ProviderBorrowUnconfigured),
             _ => Err(InternalWireError::InvalidFrame),
         }
     }
@@ -315,6 +333,7 @@ pub(super) struct WorkerResponse {
     pub(super) request_id: u64,
     pub(super) code: WorkerResultCode,
     pub(super) device_id: Option<String>,
+    pub(super) output_size: Option<u16>,
 }
 
 impl WorkerResponse {
@@ -323,6 +342,7 @@ impl WorkerResponse {
             request_id,
             code,
             device_id: None,
+            output_size: None,
         }
     }
 
@@ -331,12 +351,26 @@ impl WorkerResponse {
             request_id,
             code: WorkerResultCode::UnlockSucceeded,
             device_id: Some(device_id),
+            output_size: None,
+        }
+    }
+
+    pub(super) fn provider_borrow_ready(request_id: u64, output_size: u16) -> Self {
+        Self {
+            request_id,
+            code: WorkerResultCode::ProviderBorrowReady,
+            device_id: None,
+            output_size: Some(output_size),
         }
     }
 
     fn encode(&self) -> Result<[u8; RESPONSE_BYTES], InternalWireError> {
         if self.request_id == 0
             || (self.code == WorkerResultCode::UnlockSucceeded) != self.device_id.is_some()
+            || (self.code == WorkerResultCode::ProviderBorrowReady) != self.output_size.is_some()
+            || self
+                .output_size
+                .is_some_and(|size| !valid_openai_key_size(size))
         {
             return Err(InternalWireError::InvalidFrame);
         }
@@ -348,20 +382,23 @@ impl WorkerResponse {
         bytes[..8].copy_from_slice(RESPONSE_MAGIC);
         bytes[8] = self.code.encode();
         bytes[9] = u8::try_from(device.len()).map_err(|_| InternalWireError::InvalidFrame)?;
+        bytes[10..12].copy_from_slice(&self.output_size.unwrap_or_default().to_be_bytes());
         bytes[12..20].copy_from_slice(&self.request_id.to_be_bytes());
         bytes[DEVICE_ID_OFFSET..DEVICE_ID_OFFSET + device.len()].copy_from_slice(device);
         Ok(bytes)
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, InternalWireError> {
-        if bytes.len() != RESPONSE_BYTES
-            || &bytes[..8] != RESPONSE_MAGIC
-            || bytes[10..12].iter().any(|byte| *byte != 0)
-        {
+        if bytes.len() != RESPONSE_BYTES || &bytes[..8] != RESPONSE_MAGIC {
             return Err(InternalWireError::InvalidFrame);
         }
         let code = WorkerResultCode::decode(bytes[8])?;
         let device_len = usize::from(bytes[9]);
+        let output_size = u16::from_be_bytes(
+            bytes[10..12]
+                .try_into()
+                .map_err(|_| InternalWireError::InvalidFrame)?,
+        );
         if device_len > MAX_DEVICE_ID_BYTES
             || bytes[DEVICE_ID_OFFSET + device_len..]
                 .iter()
@@ -391,6 +428,7 @@ impl WorkerResponse {
             request_id,
             code,
             device_id,
+            output_size: (output_size != 0).then_some(output_size),
         };
         response.encode()?;
         Ok(response)
@@ -429,16 +467,23 @@ impl std::error::Error for InternalWireError {}
 pub(super) fn send_command(
     socket: BorrowedFd<'_>,
     command: WorkerCommand,
-    secret: Option<BorrowedFd<'_>>,
+    descriptor: Option<BorrowedFd<'_>>,
     deadline: Instant,
 ) -> Result<(), InternalWireError> {
     let bytes = command.encode()?;
-    match (command.kind, secret) {
+    match (command.kind, descriptor) {
         (
-            WorkerCommandKind::Unlock | WorkerCommandKind::ProviderOpenAiConfigure,
+            WorkerCommandKind::Unlock
+            | WorkerCommandKind::ProviderOpenAiConfigure
+            | WorkerCommandKind::ProviderOpenAiBorrow,
             Some(descriptor),
         ) => send_record(socket, &bytes, &[descriptor], deadline),
-        (WorkerCommandKind::Unlock | WorkerCommandKind::ProviderOpenAiConfigure, None)
+        (
+            WorkerCommandKind::Unlock
+            | WorkerCommandKind::ProviderOpenAiConfigure
+            | WorkerCommandKind::ProviderOpenAiBorrow,
+            None,
+        )
         | (_, Some(_)) => Err(InternalWireError::InvalidDescriptors),
         (_, None) => send_record(socket, &bytes, &[], deadline),
     }
@@ -451,12 +496,19 @@ pub(super) fn receive_command(
     let (bytes, mut descriptors) = receive_record(socket, deadline)?;
     let command = WorkerCommand::decode(&bytes)?;
     match (command.kind, descriptors.len()) {
-        (WorkerCommandKind::Unlock | WorkerCommandKind::ProviderOpenAiConfigure, 1) => {
-            Ok((command, descriptors.pop()))
-        }
-        (WorkerCommandKind::Unlock | WorkerCommandKind::ProviderOpenAiConfigure, _) | (_, 1..) => {
-            Err(InternalWireError::InvalidDescriptors)
-        }
+        (
+            WorkerCommandKind::Unlock
+            | WorkerCommandKind::ProviderOpenAiConfigure
+            | WorkerCommandKind::ProviderOpenAiBorrow,
+            1,
+        ) => Ok((command, descriptors.pop())),
+        (
+            WorkerCommandKind::Unlock
+            | WorkerCommandKind::ProviderOpenAiConfigure
+            | WorkerCommandKind::ProviderOpenAiBorrow,
+            _,
+        )
+        | (_, 1..) => Err(InternalWireError::InvalidDescriptors),
         (_, 0) => Ok((command, None)),
     }
 }
@@ -702,10 +754,30 @@ mod tests {
         assert_eq!(command, WorkerCommand::provider_openai_configure(8, 32));
         assert!(descriptor.is_some());
 
+        let (_borrow_read, borrow_write) =
+            pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK).expect("borrow pipe");
+        send_command(
+            parent.as_fd(),
+            WorkerCommand::provider_openai_borrow(9),
+            Some(borrow_write.as_fd()),
+            deadline,
+        )
+        .expect("send provider borrow");
+        let (command, descriptor) = receive_command(worker.as_fd(), deadline).expect("receive");
+        assert_eq!(command, WorkerCommand::provider_openai_borrow(9));
+        assert!(descriptor.is_some());
+
         let response = WorkerResponse::unlocked(7, "KA-0123456789abcdef01234567".to_owned());
         send_response(worker.as_fd(), &response, deadline).expect("send response");
         assert_eq!(
             receive_response(parent.as_fd(), 7, deadline).expect("receive response"),
+            response
+        );
+
+        let response = WorkerResponse::provider_borrow_ready(9, 32);
+        send_response(worker.as_fd(), &response, deadline).expect("send borrow response");
+        assert_eq!(
+            receive_response(parent.as_fd(), 9, deadline).expect("receive borrow response"),
             response
         );
     }
@@ -724,15 +796,79 @@ mod tests {
             WorkerCommand::provider_openai_configure(1, 513).encode(),
             Err(InternalWireError::InvalidFrame)
         );
+        let borrow = WorkerCommand::provider_openai_borrow(1)
+            .encode()
+            .expect("borrow frame");
+        assert_eq!(borrow[8], 10);
+        assert_eq!(&borrow[24..26], &[0, 0]);
+        let mut noncanonical_borrow = borrow;
+        noncanonical_borrow[25] = 1;
+        assert_eq!(
+            WorkerCommand::decode(&noncanonical_borrow),
+            Err(InternalWireError::InvalidFrame)
+        );
+        assert_eq!(
+            WorkerResponse::new(1, WorkerResultCode::ProviderBorrowReady).encode(),
+            Err(InternalWireError::InvalidFrame)
+        );
+        assert_eq!(
+            WorkerResponse::provider_borrow_ready(1, 0).encode(),
+            Err(InternalWireError::InvalidFrame)
+        );
+        assert_eq!(
+            WorkerResponse::provider_borrow_ready(1, 513).encode(),
+            Err(InternalWireError::InvalidFrame)
+        );
+        let encoded_ready = WorkerResponse::provider_borrow_ready(1, 32)
+            .encode()
+            .expect("canonical ready response");
+        assert_eq!(encoded_ready[8], 31);
+        assert_eq!(encoded_ready[9], 0);
+        assert_eq!(&encoded_ready[10..12], &[0, 32]);
+        let encoded_unconfigured =
+            WorkerResponse::new(1, WorkerResultCode::ProviderBorrowUnconfigured)
+                .encode()
+                .expect("canonical unconfigured response");
+        assert_eq!(encoded_unconfigured[8], 32);
+        assert_eq!(&encoded_unconfigured[10..12], &[0, 0]);
         let mut frame = WorkerCommand::probe(1).encode().expect("frame");
         frame[15] = 1;
         assert_eq!(
             WorkerCommand::decode(&frame),
             Err(InternalWireError::InvalidFrame)
         );
+        let mut legacy_command = WorkerCommand::probe(1).encode().expect("legacy command");
+        legacy_command[..8].copy_from_slice(b"KRVWC001");
+        assert_eq!(
+            WorkerCommand::decode(&legacy_command),
+            Err(InternalWireError::InvalidFrame)
+        );
         let response = WorkerResponse::new(9, WorkerResultCode::ProbeLocked);
         let mut encoded = response.encode().expect("response");
         encoded[63] = 1;
+        assert_eq!(
+            WorkerResponse::decode(&encoded),
+            Err(InternalWireError::InvalidFrame)
+        );
+        let mut legacy_response = response.encode().expect("legacy response");
+        legacy_response[..8].copy_from_slice(b"KRVWR001");
+        assert_eq!(
+            WorkerResponse::decode(&legacy_response),
+            Err(InternalWireError::InvalidFrame)
+        );
+        let mut encoded = WorkerResponse::new(9, WorkerResultCode::ProbeLocked)
+            .encode()
+            .expect("response");
+        encoded[11] = 1;
+        assert_eq!(
+            WorkerResponse::decode(&encoded),
+            Err(InternalWireError::InvalidFrame)
+        );
+
+        let mut encoded = WorkerResponse::provider_borrow_ready(9, 32)
+            .encode()
+            .expect("borrow response");
+        encoded[11] = 0;
         assert_eq!(
             WorkerResponse::decode(&encoded),
             Err(InternalWireError::InvalidFrame)
@@ -744,6 +880,17 @@ mod tests {
         assert_eq!(
             receive_response(parent.as_fd(), 10, deadline),
             Err(InternalWireError::InvalidFrame)
+        );
+
+        let (parent, _worker) = pair();
+        assert_eq!(
+            send_command(
+                parent.as_fd(),
+                WorkerCommand::provider_openai_borrow(11),
+                None,
+                deadline
+            ),
+            Err(InternalWireError::InvalidDescriptors)
         );
     }
 

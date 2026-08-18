@@ -310,6 +310,21 @@ messages have a fixed binary layout, closed result codes, bounded records,
 exact correlation and descriptor arity, and contain neither paths nor secret
 bytes. The LUKS mapper name is freshly randomized for each unlock attempt.
 
+The internal wire's `002` revision also contains a dormant, crate-private
+OpenAI borrow substrate. It does not change the public operation allowlist or
+dispatch switch. Its dedicated non-cancellable supervisor helper creates one
+anonymous CLOEXEC/NONBLOCK PIPEFS pipe, retains only the read end, and transfers
+the write end to the worker. The worker requires a write-only pipe with at
+least 512 bytes of capacity, borrows the validated key only inside the store
+callback, performs one atomic-size write (retrying only interruption), and
+closes its writer before sending a fixed response containing only the byte
+count. The supervisor never reads the pipe: under the original transaction
+deadline it requires writer HUP and an exact `FIONREAD` count, returns the read
+descriptor only for the closed `Ready` result, and closes it for every other
+outcome. Generic and cancellable worker transactions reject borrow. The
+shipping Agent request still receives `NOT_AUTHORIZED`, with no worker dispatch
+and no output descriptor; networking remains absent.
+
 `/run/kernaid-rescue-vault/lifecycle-active-v1` is a daemon-created crash
 marker beneath the systemd-owned runtime directory, not a generic state file.
 The supervisor creates, file-fsyncs and directory-fsyncs it immediately before
@@ -366,9 +381,11 @@ secret pipe as read-only CLOEXEC PIPEFS before handler state gates. After the
 stale, policy, privacy, liveness, and pre-secret swap gates succeed, unlock
 reads and copies the passphrase into a separate bounded internal pipe, while
 configure transfers the same OpenAI-key descriptor to the worker without the
-supervisor reading it. The worker revalidates its received descriptor, repeats
-the no-swap gate, and only then performs the bounded read into zeroizing
-storage.
+supervisor reading it. Worker transaction APIs consume these descriptors, so
+the supervisor's sender reference closes immediately after `sendmsg` rather
+than remaining live until the response. The worker revalidates its received
+descriptor, repeats the no-swap gate, and only then performs the bounded read
+into zeroizing storage.
 
 Daemon, worker and companion set `PR_SET_DUMPABLE=0` and prove the initial user
 namespace before sensitive work. The daemon additionally requires an empty

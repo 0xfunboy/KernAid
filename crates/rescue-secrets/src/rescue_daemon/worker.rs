@@ -7,7 +7,7 @@ use crate::{
     LocatedVaultClassificationError, MapperName, MountedRescueVault, ProviderCredentialStatus,
     RescueVaultMountManager, VaultMountManagerError, VaultUnlockRequest, locate_boot_vault,
 };
-use kernaid_protocol::rescue_vault::validate_openai_api_key_bytes;
+use kernaid_protocol::rescue_vault::{MAX_OPENAI_KEY_BYTES, validate_openai_api_key_bytes};
 use nix::sys::signal::{SigSet, Signal as NixSignal};
 use rand_core::{OsRng, RngCore};
 use rustix::{
@@ -29,6 +29,8 @@ const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(10);
 const CLASSIFICATION_TIMEOUT: Duration = Duration::from_secs(9 * 60);
 const PROVIDER_PIPE_TIMEOUT: Duration = Duration::from_secs(15);
 const PIPEFS_MAGIC: u64 = 0x5049_5045;
+const MAX_PROVIDER_OUTPUT_BYTES: usize = MAX_OPENAI_KEY_BYTES as usize;
+const _: () = assert!(MAX_PROVIDER_OUTPUT_BYTES <= rustix::pipe::PIPE_BUF);
 
 enum WorkerVaultState {
     Locked,
@@ -243,6 +245,38 @@ fn handle_command(
             };
             (internal_wire::WorkerResponse::new(request_id, code), false)
         }
+        Command::ProviderOpenAiBorrow => {
+            let Some(output) = descriptor else {
+                return (
+                    internal_wire::WorkerResponse::new(request_id, Result::InvalidRequest),
+                    false,
+                );
+            };
+            if validate_internal_output_pipe(output.as_fd()).is_err() {
+                return (
+                    internal_wire::WorkerResponse::new(request_id, Result::InvalidRequest),
+                    false,
+                );
+            }
+            let borrowed = match state {
+                WorkerVaultState::Locked => Err(Result::Busy),
+                WorkerVaultState::Unlocked(_) if validate_no_active_swap().is_err() => {
+                    Err(Result::CleanupFailed)
+                }
+                WorkerVaultState::Unlocked(mounted) => borrow_openai(mounted, output),
+            };
+            let response = match borrowed {
+                Ok(Some(size)) => {
+                    internal_wire::WorkerResponse::provider_borrow_ready(request_id, size)
+                }
+                Ok(None) => internal_wire::WorkerResponse::new(
+                    request_id,
+                    Result::ProviderBorrowUnconfigured,
+                ),
+                Err(code) => internal_wire::WorkerResponse::new(request_id, code),
+            };
+            (response, false)
+        }
         Command::ProviderOpenAiLogout => {
             if descriptor.is_some() {
                 return (
@@ -320,6 +354,44 @@ fn provider_status(mounted: &MountedRescueVault) -> internal_wire::WorkerResultC
         Ok(ProviderCredentialStatus::Absent) => Result::ProviderStatusUnconfigured,
         Ok(ProviderCredentialStatus::Configured) => Result::ProviderStatusConfigured,
         Err(_) => Result::ProviderStateAmbiguous,
+    }
+}
+
+fn borrow_openai(
+    mounted: &MountedRescueVault,
+    output: OwnedFd,
+) -> Result<Option<u16>, internal_wire::WorkerResultCode> {
+    use internal_wire::WorkerResultCode as Result;
+    let store = mounted
+        .secrets()
+        .open_application_store()
+        .map_err(|_| Result::ProviderStateAmbiguous)?;
+    let borrowed = store
+        .with_openai_api_key(|value| write_openai_key_once(output.as_fd(), value))
+        .map_err(|_| Result::ProviderStateAmbiguous);
+    // The worker must close its only output writer before the control response
+    // is sent. The supervisor can then prove EOF/HUP without reading a byte.
+    drop(output);
+    match borrowed {
+        Ok(Some(Ok(size))) => Ok(Some(size)),
+        Ok(None) => Ok(None),
+        Ok(Some(Err(()))) => Err(Result::IoFailed),
+        Err(code) => Err(code),
+    }
+}
+
+fn write_openai_key_once(output: BorrowedFd<'_>, value: &[u8]) -> Result<u16, ()> {
+    validate_openai_api_key_bytes(value).map_err(|_| ())?;
+    let size = u16::try_from(value.len()).map_err(|_| ())?;
+    if value.len() > MAX_PROVIDER_OUTPUT_BYTES {
+        return Err(());
+    }
+    loop {
+        match rustix::io::write(output, value) {
+            Ok(written) if written == value.len() => return Ok(size),
+            Err(error) if error == rustix::io::Errno::INTR => {}
+            Ok(_) | Err(_) => return Err(()),
+        }
     }
 }
 
@@ -693,6 +765,25 @@ fn validate_internal_secret_pipe(descriptor: BorrowedFd<'_>) -> Result<(), ()> {
     Ok(())
 }
 
+fn validate_internal_output_pipe(descriptor: BorrowedFd<'_>) -> Result<(), ()> {
+    let stat = rfs::fstat(descriptor).map_err(|_| ())?;
+    let filesystem = rfs::fstatfs(descriptor).map_err(|_| ())?;
+    let filesystem_type = u64::try_from(filesystem.f_type).map_err(|_| ())?;
+    let status = rfs::fcntl_getfl(descriptor).map_err(|_| ())?;
+    let descriptor_flags = rustix::io::fcntl_getfd(descriptor).map_err(|_| ())?;
+    let capacity = rustix::pipe::fcntl_getpipe_size(descriptor).map_err(|_| ())?;
+    if !FileType::from_raw_mode(stat.st_mode).is_fifo()
+        || filesystem_type != PIPEFS_MAGIC
+        || status != (OFlags::WRONLY | OFlags::NONBLOCK)
+        || descriptor_flags != rustix::io::FdFlags::CLOEXEC
+        || stat.st_size != 0
+        || capacity < MAX_PROVIDER_OUTPUT_BYTES
+    {
+        return Err(());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -706,6 +797,91 @@ mod tests {
 
         let (plain_read, _plain_write) = pipe_with(PipeFlags::empty()).expect("plain pipe");
         assert_eq!(validate_internal_secret_pipe(plain_read.as_fd()), Err(()));
+    }
+
+    #[test]
+    fn internal_provider_output_requires_nonblocking_write_only_pipefs_cloexec() {
+        let (read, write) =
+            pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK).expect("output pipe");
+        assert_eq!(validate_internal_output_pipe(write.as_fd()), Ok(()));
+        assert_eq!(validate_internal_output_pipe(read.as_fd()), Err(()));
+
+        let (_blocking_read, blocking_write) =
+            pipe_with(PipeFlags::CLOEXEC).expect("blocking pipe");
+        assert_eq!(
+            validate_internal_output_pipe(blocking_write.as_fd()),
+            Err(())
+        );
+
+        let (_plain_read, plain_write) = pipe_with(PipeFlags::NONBLOCK).expect("non-cloexec pipe");
+        assert_eq!(validate_internal_output_pipe(plain_write.as_fd()), Err(()));
+
+        let directory = tempfile::tempdir().expect("endpoint matrix directory");
+        let fifo_path = directory.path().join("named-fifo");
+        rfs::mkfifoat(
+            rustix::fs::CWD,
+            &fifo_path,
+            rustix::fs::Mode::from_raw_mode(0o600),
+        )
+        .expect("named fifo");
+        let _fifo_reader = rfs::open(
+            &fifo_path,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            rustix::fs::Mode::empty(),
+        )
+        .expect("named fifo reader");
+        let fifo_writer = rfs::open(
+            &fifo_path,
+            OFlags::WRONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            rustix::fs::Mode::empty(),
+        )
+        .expect("named fifo writer");
+        assert_eq!(validate_internal_output_pipe(fifo_writer.as_fd()), Err(()));
+
+        let regular_path = directory.path().join("regular");
+        let regular = rfs::open(
+            &regular_path,
+            OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            rustix::fs::Mode::from_raw_mode(0o600),
+        )
+        .expect("regular file");
+        assert_eq!(validate_internal_output_pipe(regular.as_fd()), Err(()));
+
+        let (socket, _peer) = rustix::net::socketpair(
+            rustix::net::AddressFamily::UNIX,
+            rustix::net::SocketType::STREAM,
+            rustix::net::SocketFlags::CLOEXEC | rustix::net::SocketFlags::NONBLOCK,
+            None,
+        )
+        .expect("socket pair");
+        assert_eq!(validate_internal_output_pipe(socket.as_fd()), Err(()));
+    }
+
+    #[test]
+    fn provider_output_is_one_bounded_write_without_supervisor_readback() {
+        let (read, write) =
+            pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK).expect("output pipe");
+        assert!(write_openai_key_once(write.as_fd(), &[]).is_err());
+        assert!(write_openai_key_once(write.as_fd(), &[b' '; 1]).is_err());
+        let synthetic = [b'X'; 32];
+        assert_eq!(write_openai_key_once(write.as_fd(), &synthetic), Ok(32));
+        assert_eq!(rustix::io::ioctl_fionread(read.as_fd()), Ok(32));
+        drop(write);
+        let zero = Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let mut descriptors = [PollFd::from_borrowed_fd(read.as_fd(), PollFlags::HUP)];
+        assert_eq!(poll(&mut descriptors, Some(&zero)), Ok(1));
+        assert!(descriptors[0].revents().contains(PollFlags::HUP));
+        let mut observed = [0_u8; 32];
+        assert_eq!(rustix::io::read(read.as_fd(), &mut observed), Ok(32));
+        assert!(
+            observed == synthetic,
+            "synthetic provider output changed during the bounded write"
+        );
+        let mut eof = [0_u8; 1];
+        assert_eq!(rustix::io::read(read.as_fd(), &mut eof), Ok(0));
     }
 
     #[test]
