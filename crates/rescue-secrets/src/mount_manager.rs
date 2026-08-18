@@ -23,7 +23,8 @@ use crate::{
 use rustix::{
     fd::{AsFd, OwnedFd},
     fs::{
-        self as rfs, AtFlags, CWD, FileType, FlockOperation, Mode, OFlags, ResolveFlags, StatxFlags,
+        self as rfs, AtFlags, CWD, FileType, FlockOperation, Mode, OFlags, ResolveFlags, Stat,
+        StatxFlags,
     },
     mount::{MountFlags, UnmountFlags},
 };
@@ -40,6 +41,7 @@ use std::{
 
 const MANAGER_LOCK_PATH: &str = "/run/lock/kernaid-rescue-vault-manager.lock";
 const RUNTIME_ROOT: &str = "/run/kernaid";
+const RUNTIME_ROOT_NAME: &str = "kernaid";
 const VAULT_MOUNT_PARENT: &str = "vault";
 const CRYPTSETUP_PATH: &str = "/usr/sbin/cryptsetup";
 const BLKID_PATH: &str = "/usr/sbin/blkid";
@@ -51,6 +53,7 @@ const COMMAND_OUTPUT_LIMIT: usize = 4096;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const SECURE_DIRECTORY_MODE: u32 = 0o700;
 const SECURE_FILE_MODE: u32 = 0o600;
+const TMPFS_MAGIC: u64 = 0x0102_1994;
 
 /// A mapper name in KernAid's single accepted grammar:
 /// `kernaid-vault-` followed by exactly sixteen lowercase hexadecimal bytes.
@@ -1501,7 +1504,7 @@ fn prepare_runtime_mount_root(root: &Path) -> Result<(), VaultMountManagerError>
         return Err(VaultMountManagerError::UnsafeMountRoot);
     }
     let run = open_secure_directory(Path::new("/run"), false)?;
-    let runtime = open_or_create_child_directory(&run, OsStr::new("kernaid"))?;
+    let runtime = open_or_create_runtime_root(&run)?;
     let mount_parent = open_or_create_child_directory(&runtime, OsStr::new(VAULT_MOUNT_PARENT))?;
     let name = root
         .file_name()
@@ -1515,6 +1518,100 @@ fn prepare_runtime_mount_root(root: &Path) -> Result<(), VaultMountManagerError>
         return Err(VaultMountManagerError::UnsafeMountRoot);
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DirectoryIdentity {
+    device: u64,
+    inode: u64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+}
+
+impl DirectoryIdentity {
+    const fn from_stat(stat: &Stat) -> Self {
+        Self {
+            device: stat.st_dev,
+            inode: stat.st_ino,
+            mode: stat.st_mode,
+            uid: stat.st_uid,
+            gid: stat.st_gid,
+        }
+    }
+}
+
+fn open_or_create_runtime_root(run: &OwnedFd) -> Result<OwnedFd, VaultMountManagerError> {
+    // `ProtectSystem=strict` plus the service's exact `ReadWritePaths` entry
+    // exposes `/run/kernaid` as a self-bind mount. Cross only that literal
+    // boundary, then bind the retained descriptor back to the named endpoint
+    // and `/run`'s tmpfs before restoring NO_XDEV for every child lookup.
+    let run_before = DirectoryIdentity::from_stat(
+        &rfs::fstat(run).map_err(|_| VaultMountManagerError::UnsafeMountRoot)?,
+    );
+    let run_fs_before = rfs::fstatfs(run).map_err(|_| VaultMountManagerError::UnsafeMountRoot)?;
+    if u64::try_from(run_fs_before.f_type).ok() != Some(TMPFS_MAGIC) {
+        return Err(VaultMountManagerError::UnsafeMountRoot);
+    }
+    let created = match rfs::mkdirat(run, RUNTIME_ROOT_NAME, Mode::RUSR | Mode::WUSR | Mode::XUSR) {
+        Ok(()) => true,
+        Err(error) if error == rustix::io::Errno::EXIST => false,
+        Err(_) => return Err(VaultMountManagerError::UnsafeMountRoot),
+    };
+    let descriptor = rfs::openat2(
+        run,
+        RUNTIME_ROOT_NAME,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+    )
+    .map_err(|_| VaultMountManagerError::UnsafeMountRoot)?;
+    if created {
+        rfs::fchmod(&descriptor, Mode::RUSR | Mode::WUSR | Mode::XUSR)
+            .map_err(|_| VaultMountManagerError::UnsafeMountRoot)?;
+        rfs::fsync(&descriptor).map_err(|_| VaultMountManagerError::UnsafeMountRoot)?;
+        rfs::fsync(run).map_err(|_| VaultMountManagerError::UnsafeMountRoot)?;
+    }
+    validate_root_directory(&descriptor, true)?;
+
+    let opened = rfs::fstat(&descriptor).map_err(|_| VaultMountManagerError::UnsafeMountRoot)?;
+    let named = rfs::statat(run, RUNTIME_ROOT_NAME, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|_| VaultMountManagerError::UnsafeMountRoot)?;
+    let run_stat = DirectoryIdentity::from_stat(
+        &rfs::fstat(run).map_err(|_| VaultMountManagerError::UnsafeMountRoot)?,
+    );
+    let opened_fs =
+        rfs::fstatfs(&descriptor).map_err(|_| VaultMountManagerError::UnsafeMountRoot)?;
+    let run_fs = rfs::fstatfs(run).map_err(|_| VaultMountManagerError::UnsafeMountRoot)?;
+    if run_stat != run_before
+        || !runtime_root_mount_is_exact(
+            DirectoryIdentity::from_stat(&opened),
+            DirectoryIdentity::from_stat(&named),
+            run_stat.device,
+            u64::try_from(opened_fs.f_type).ok(),
+            u64::try_from(run_fs.f_type).ok(),
+        )
+    {
+        return Err(VaultMountManagerError::UnsafeMountRoot);
+    }
+    Ok(descriptor)
+}
+
+fn runtime_root_mount_is_exact(
+    opened: DirectoryIdentity,
+    named: DirectoryIdentity,
+    run_device: u64,
+    opened_filesystem: Option<u64>,
+    run_filesystem: Option<u64>,
+) -> bool {
+    opened == named
+        && FileType::from_raw_mode(opened.mode).is_dir()
+        && opened.uid == 0
+        && opened.gid == 0
+        && opened.mode & 0o7777 == SECURE_DIRECTORY_MODE
+        && opened.device == run_device
+        && opened_filesystem == Some(TMPFS_MAGIC)
+        && run_filesystem == Some(TMPFS_MAGIC)
 }
 
 fn open_secure_directory(path: &Path, exact_mode: bool) -> Result<OwnedFd, VaultMountManagerError> {
@@ -1971,7 +2068,11 @@ fn map_secure_state_error(_error: RescueSecretError) -> VaultMountManagerError {
 mod tests {
     use super::*;
     use crate::MountAttestationClaims;
-    use std::sync::{Arc, Mutex};
+    use std::{
+        os::unix::fs::{PermissionsExt, symlink},
+        process::Command,
+        sync::{Arc, Mutex},
+    };
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Step {
@@ -2365,6 +2466,247 @@ mod tests {
             (replacement_stat.st_dev, replacement_stat.st_ino),
             "the pre/post named-path checkpoint detects the replacement"
         );
+    }
+
+    #[test]
+    fn runtime_root_identity_accepts_only_the_exact_root_owned_tmpfs_object() {
+        assert_eq!(
+            Path::new(RUNTIME_ROOT).parent(),
+            Some(Path::new("/run")),
+            "the mount-boundary exception is rooted directly below /run"
+        );
+        assert_eq!(
+            Path::new(RUNTIME_ROOT).file_name(),
+            Some(OsStr::new(RUNTIME_ROOT_NAME)),
+            "the full path and descriptor-relative literal cannot drift"
+        );
+        let exact = DirectoryIdentity {
+            device: 11,
+            inode: 22,
+            mode: 0o040700,
+            uid: 0,
+            gid: 0,
+        };
+        assert!(runtime_root_mount_is_exact(
+            exact,
+            exact,
+            exact.device,
+            Some(TMPFS_MAGIC),
+            Some(TMPFS_MAGIC),
+        ));
+
+        let mismatches = [
+            (
+                DirectoryIdentity {
+                    device: 12,
+                    ..exact
+                },
+                exact,
+                exact.device,
+                Some(TMPFS_MAGIC),
+                Some(TMPFS_MAGIC),
+            ),
+            (
+                exact,
+                DirectoryIdentity { inode: 23, ..exact },
+                exact.device,
+                Some(TMPFS_MAGIC),
+                Some(TMPFS_MAGIC),
+            ),
+            (
+                DirectoryIdentity {
+                    mode: 0o100700,
+                    ..exact
+                },
+                DirectoryIdentity {
+                    mode: 0o100700,
+                    ..exact
+                },
+                exact.device,
+                Some(TMPFS_MAGIC),
+                Some(TMPFS_MAGIC),
+            ),
+            (
+                DirectoryIdentity { uid: 1, ..exact },
+                DirectoryIdentity { uid: 1, ..exact },
+                exact.device,
+                Some(TMPFS_MAGIC),
+                Some(TMPFS_MAGIC),
+            ),
+            (
+                DirectoryIdentity { gid: 1, ..exact },
+                DirectoryIdentity { gid: 1, ..exact },
+                exact.device,
+                Some(TMPFS_MAGIC),
+                Some(TMPFS_MAGIC),
+            ),
+            (
+                DirectoryIdentity {
+                    mode: 0o040750,
+                    ..exact
+                },
+                DirectoryIdentity {
+                    mode: 0o040750,
+                    ..exact
+                },
+                exact.device,
+                Some(TMPFS_MAGIC),
+                Some(TMPFS_MAGIC),
+            ),
+            (
+                exact,
+                exact,
+                exact.device + 1,
+                Some(TMPFS_MAGIC),
+                Some(TMPFS_MAGIC),
+            ),
+            (exact, exact, exact.device, Some(0xef53), Some(TMPFS_MAGIC)),
+            (exact, exact, exact.device, Some(TMPFS_MAGIC), Some(0xef53)),
+        ];
+        for (opened, named, run_device, opened_filesystem, run_filesystem) in mismatches {
+            assert!(!runtime_root_mount_is_exact(
+                opened,
+                named,
+                run_device,
+                opened_filesystem,
+                run_filesystem,
+            ));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires /usr/bin/unshare and unprivileged user and mount namespaces"]
+    fn runtime_root_accepts_direct_and_systemd_self_bind_but_no_other_mount() {
+        const CHILD_FLAG: &str = "KERNAID_RUNTIME_ROOT_SELF_BIND_CHILD";
+        const TEST_NAME: &str = "mount_manager::tests::runtime_root_accepts_direct_and_systemd_self_bind_but_no_other_mount";
+        if let Some(root) = std::env::var_os(CHILD_FLAG) {
+            let root = PathBuf::from(root);
+            let run_path = root.join("run");
+            fs::create_dir(&run_path).expect("create user-namespace run fixture");
+            fs::set_permissions(&run_path, fs::Permissions::from_mode(0o700))
+                .expect("set run fixture mode");
+            rustix::mount::mount(
+                "tmpfs",
+                &run_path,
+                "tmpfs",
+                MountFlags::NOSUID | MountFlags::NODEV | MountFlags::NOEXEC,
+                None::<&std::ffi::CStr>,
+            )
+            .expect("mount isolated tmpfs fixture");
+
+            let run = open_secure_directory(&run_path, false).expect("open isolated run tmpfs");
+            let direct = open_or_create_runtime_root(&run).expect("accept direct host layout");
+            assert_eq!(
+                descriptor_mount_id(&direct).expect("direct runtime mount id"),
+                descriptor_mount_id(&run).expect("run mount id"),
+                "the host-probe layout stays on /run's mount"
+            );
+            drop(direct);
+
+            let runtime_path = run_path.join(RUNTIME_ROOT_NAME);
+            rustix::mount::mount_bind(&runtime_path, &runtime_path)
+                .expect("create systemd-style self bind");
+            assert_eq!(
+                rfs::openat2(
+                    &run,
+                    RUNTIME_ROOT_NAME,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                    ResolveFlags::BENEATH
+                        | ResolveFlags::NO_SYMLINKS
+                        | ResolveFlags::NO_MAGICLINKS
+                        | ResolveFlags::NO_XDEV,
+                )
+                .err(),
+                Some(rustix::io::Errno::XDEV),
+                "the old lookup must reproduce EXDEV at the self-bind boundary"
+            );
+            let bound = open_or_create_runtime_root(&run).expect("accept exact systemd self bind");
+            assert_ne!(
+                descriptor_mount_id(&bound).expect("bound runtime mount id"),
+                descriptor_mount_id(&run).expect("run mount id after bind"),
+                "the accepted systemd layout crosses exactly one mount boundary"
+            );
+
+            let nested_path = runtime_path.join(VAULT_MOUNT_PARENT);
+            let nested = open_or_create_child_directory(&bound, OsStr::new(VAULT_MOUNT_PARENT))
+                .expect("create nested runtime directory");
+            drop(nested);
+            rustix::mount::mount(
+                "tmpfs",
+                &nested_path,
+                "tmpfs",
+                MountFlags::NOSUID | MountFlags::NODEV | MountFlags::NOEXEC,
+                None::<&std::ffi::CStr>,
+            )
+            .expect("mount nested foreign filesystem");
+            assert_eq!(
+                open_or_create_child_directory(&bound, OsStr::new(VAULT_MOUNT_PARENT)).err(),
+                Some(VaultMountManagerError::UnsafeMountRoot),
+                "NO_XDEV must be restored below the one accepted boundary"
+            );
+            rustix::mount::unmount(&nested_path, UnmountFlags::NOFOLLOW)
+                .expect("unmount nested fixture");
+            drop(bound);
+            rustix::mount::unmount(&runtime_path, UnmountFlags::NOFOLLOW)
+                .expect("unmount self-bind fixture");
+
+            rustix::mount::mount(
+                "tmpfs",
+                &runtime_path,
+                "tmpfs",
+                MountFlags::NOSUID | MountFlags::NODEV | MountFlags::NOEXEC,
+                None::<&std::ffi::CStr>,
+            )
+            .expect("mount foreign runtime filesystem");
+            assert_eq!(
+                open_or_create_runtime_root(&run).err(),
+                Some(VaultMountManagerError::UnsafeMountRoot),
+                "a different tmpfs device is not the allowed self bind"
+            );
+            rustix::mount::unmount(&runtime_path, UnmountFlags::NOFOLLOW)
+                .expect("unmount foreign runtime fixture");
+
+            fs::remove_dir(&nested_path).expect("remove nested fixture");
+            fs::remove_dir(&runtime_path).expect("remove runtime fixture");
+            let alternate = run_path.join("alternate");
+            fs::create_dir(&alternate).expect("create symlink target fixture");
+            fs::set_permissions(&alternate, fs::Permissions::from_mode(0o700))
+                .expect("set symlink target mode");
+            symlink(&alternate, &runtime_path).expect("create runtime symlink fixture");
+            assert_eq!(
+                open_or_create_runtime_root(&run).err(),
+                Some(VaultMountManagerError::UnsafeMountRoot),
+                "the one boundary exception must not follow a symlink"
+            );
+            fs::remove_file(&runtime_path).expect("remove runtime symlink fixture");
+            fs::create_dir(&runtime_path).expect("restore runtime directory");
+            fs::set_permissions(&runtime_path, fs::Permissions::from_mode(0o750))
+                .expect("set unsafe runtime mode");
+            assert_eq!(
+                open_or_create_runtime_root(&run).err(),
+                Some(VaultMountManagerError::UnsafeMountRoot),
+                "the runtime root mode remains exact"
+            );
+            return;
+        }
+
+        let fixture = tempfile::tempdir().expect("temporary runtime-root fixture");
+        let status = Command::new("/usr/bin/unshare")
+            .arg("--user")
+            .arg("--map-root-user")
+            .arg("--mount")
+            .arg("--propagation")
+            .arg("private")
+            .arg(std::env::current_exe().expect("current test executable"))
+            .arg("--ignored")
+            .arg("--exact")
+            .arg(TEST_NAME)
+            .arg("--nocapture")
+            .env(CHILD_FLAG, fixture.path())
+            .status()
+            .expect("spawn isolated runtime-root regression child");
+        assert!(status.success(), "runtime-root namespace regression failed");
     }
 
     #[test]
