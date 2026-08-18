@@ -5,7 +5,8 @@ use rustix::{
     event::{PollFd, PollFlags, Timespec, poll},
     fd::OwnedFd,
     fs::{
-        self as rfs, AtFlags, CWD, FileType, FlockOperation, Mode, OFlags, ResolveFlags, SeekFrom,
+        self as rfs, AtFlags, CWD, FileType, FlockOperation, Mode, OFlags, RawDir, ResolveFlags,
+        SeekFrom,
     },
     net::{AddressFamily, SocketFlags, SocketType, socketpair},
     pipe::{PipeFlags, pipe_with},
@@ -19,6 +20,7 @@ use rustix::{
 use std::{
     ffi::{OsStr, OsString},
     fs as stdfs,
+    mem::MaybeUninit,
     os::{
         fd::{AsFd, BorrowedFd},
         unix::ffi::{OsStrExt, OsStringExt},
@@ -49,6 +51,24 @@ const MAX_CGROUP_FILE_BYTES: usize = 4096;
 const MAX_CGROUP_COMPONENTS: usize = 64;
 const MAX_CGROUP_COMPONENT_BYTES: usize = 128;
 const MAX_CGROUP_PROCESSES: usize = 256;
+const MAX_PROC_MOUNTINFO_BYTES: usize = 256 * 1024;
+const PROVIDER_AGENT_CGROUP_NAME: &[u8] = b"agent";
+const PROVIDER_CONTROL_CGROUP_NAME: &[u8] = b".control";
+const SYSTEM_SLICE_CGROUP_NAME: &[u8] = b"system.slice";
+const OPENAI_EXECUTOR_UNIT_PREFIX: &[u8] = b"kernaid-rescue-openai-executor@";
+const LEASE_PROBE_UNIT_PREFIX: &[u8] = b"kernaid-provider-lease-probe@";
+const SERVICE_UNIT_SUFFIX: &[u8] = b".service";
+const PROVIDER_UNIT_ROOT_AGENT_CONTROLS: [(&str, u32); 3] = [
+    ("cgroup.procs", 0o644),
+    ("cgroup.subtree_control", 0o644),
+    ("cgroup.threads", 0o644),
+];
+const PROVIDER_SUBGROUP_AGENT_CONTROLS: [(&str, u32); 4] = [
+    ("cgroup.procs", 0o644),
+    ("cgroup.events", 0o444),
+    ("cgroup.kill", 0o200),
+    ("cgroup.stat", 0o444),
+];
 const WORKER_EXIT_GRACE: Duration = Duration::from_secs(2);
 const WORKER_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_PROVIDER_OUTPUT_BYTES: usize =
@@ -616,6 +636,934 @@ fn beneath_flags() -> ResolveFlags {
         | ResolveFlags::NO_XDEV
 }
 
+/// The process boundary attached to a credential lease. DirectPeer is kept
+/// for provider adapters whose execution model cannot create descendants;
+/// shipping OpenAI borrows require the complete delegated service tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ProcessScope {
+    DirectPeer,
+    CgroupTree,
+}
+
+/// Descriptor-bound process ownership retained for the entire provider lease.
+pub(super) struct ProviderProcessBoundary {
+    scope: ProcessScope,
+    tree: Option<ProviderCgroupTree>,
+}
+
+impl ProviderProcessBoundary {
+    pub(super) fn direct_peer() -> Self {
+        Self {
+            scope: ProcessScope::DirectPeer,
+            tree: None,
+        }
+    }
+
+    pub(super) fn capture(
+        scope: ProcessScope,
+        peer_pid: i32,
+        peer_uid: u32,
+        peer_gid: u32,
+    ) -> Result<Self, RescueVaultDaemonError> {
+        if peer_pid <= 1 || peer_uid == 0 || peer_gid == 0 {
+            return Err(RescueVaultDaemonError::CgroupUnavailable);
+        }
+        let tree = match scope {
+            ProcessScope::DirectPeer => return Ok(Self::direct_peer()),
+            ProcessScope::CgroupTree => {
+                Some(ProviderCgroupTree::capture(peer_pid, peer_uid, peer_gid)?)
+            }
+        };
+        Ok(Self { scope, tree })
+    }
+
+    pub(super) fn try_clone(&self) -> Result<Self, RescueVaultDaemonError> {
+        Ok(Self {
+            scope: self.scope,
+            tree: self
+                .tree
+                .as_ref()
+                .map(ProviderCgroupTree::try_clone)
+                .transpose()?,
+        })
+    }
+
+    pub(super) fn verify_initial_peer(&self, peer_pid: i32) -> Result<(), RescueVaultDaemonError> {
+        match &self.tree {
+            Some(tree) => tree.verify_initial_peer(peer_pid),
+            None => Ok(()),
+        }
+    }
+
+    pub(super) fn events(&self) -> Option<BorrowedFd<'_>> {
+        self.tree.as_ref().map(|tree| tree.events.as_fd())
+    }
+
+    pub(super) fn is_quiescent(
+        &self,
+        direct_peer_exited: bool,
+    ) -> Result<bool, RescueVaultDaemonError> {
+        match &self.tree {
+            Some(tree) => tree.is_quiescent(),
+            None => Ok(direct_peer_exited),
+        }
+    }
+
+    pub(super) fn kill_all(&self) -> Result<(), RescueVaultDaemonError> {
+        match &self.tree {
+            Some(tree) => tree.kill_all(),
+            None => Ok(()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn scope(&self) -> ProcessScope {
+        self.scope
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProviderUnitKind {
+    OpenAiExecutor,
+    LeaseProbe,
+}
+
+struct ProviderMembership {
+    unit: OsString,
+    kind: ProviderUnitKind,
+}
+
+struct ProviderCgroupTree {
+    parent: OwnedFd,
+    root: OwnedFd,
+    agent: OwnedFd,
+    events: OwnedFd,
+    kill: OwnedFd,
+    unit: OsString,
+    kind: ProviderUnitKind,
+    peer_uid: u32,
+    peer_gid: u32,
+    root_device: u64,
+    root_inode: u64,
+    agent_device: u64,
+    agent_inode: u64,
+    events_device: u64,
+    events_inode: u64,
+    kill_device: u64,
+    kill_inode: u64,
+}
+
+impl ProviderCgroupTree {
+    fn capture(
+        peer_pid: i32,
+        peer_uid: u32,
+        peer_gid: u32,
+    ) -> Result<Self, RescueVaultDaemonError> {
+        let proc = open_proc_root()?;
+        let membership_bytes =
+            read_proc_pid_file(&proc, peer_pid, "cgroup", MAX_CGROUP_FILE_BYTES)?;
+        let membership = parse_provider_membership(&membership_bytes)?;
+        let peer_mountinfo =
+            read_proc_pid_file(&proc, peer_pid, "mountinfo", MAX_PROC_MOUNTINFO_BYTES)?;
+        let self_mountinfo = read_proc_pid_file(
+            &proc,
+            rustix::process::getpid().as_raw_pid(),
+            "mountinfo",
+            MAX_PROC_MOUNTINFO_BYTES,
+        )?;
+
+        let cgroup_root = open_cgroup_root()?;
+        let root_stat =
+            rfs::fstat(&cgroup_root).map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+        if !mountinfo_has_exact_cgroup2_access(&peer_mountinfo, root_stat.st_dev, false)?
+            || !mountinfo_has_exact_cgroup2_access(&self_mountinfo, root_stat.st_dev, true)?
+        {
+            return Err(RescueVaultDaemonError::CgroupUnavailable);
+        }
+        let parent = open_cgroup_child(&cgroup_root, OsStr::from_bytes(SYSTEM_SLICE_CGROUP_NAME))?;
+        validate_cgroup_directory(&parent, Some(&cgroup_root))?;
+        let root = open_cgroup_child(&parent, &membership.unit)?;
+        validate_provider_delegated_directory(&root, &parent, peer_uid, peer_gid)?;
+        validate_provider_unit_root_control_files(&root, peer_uid, peer_gid)?;
+        let agent = open_cgroup_child(&root, OsStr::from_bytes(PROVIDER_AGENT_CGROUP_NAME))?;
+        validate_provider_delegated_directory(&agent, &root, peer_uid, peer_gid)?;
+        let events = open_cgroup_file(&root, "cgroup.events", OFlags::RDONLY)?;
+        let kill = open_cgroup_file(&root, "cgroup.kill", OFlags::WRONLY)?;
+        validate_provider_root_control_file(&events, &root, 0o444)?;
+        validate_provider_root_control_file(&kill, &root, 0o200)?;
+        validate_provider_subgroup_control_files(&agent, peer_uid, peer_gid)?;
+
+        let root_stat = rfs::fstat(&root).map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+        let agent_stat =
+            rfs::fstat(&agent).map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+        let events_stat =
+            rfs::fstat(&events).map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+        let kill_stat = rfs::fstat(&kill).map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+        let tree = Self {
+            parent,
+            root,
+            agent,
+            events,
+            kill,
+            unit: membership.unit,
+            kind: membership.kind,
+            peer_uid,
+            peer_gid,
+            root_device: root_stat.st_dev,
+            root_inode: root_stat.st_ino,
+            agent_device: agent_stat.st_dev,
+            agent_inode: agent_stat.st_ino,
+            events_device: events_stat.st_dev,
+            events_inode: events_stat.st_ino,
+            kill_device: kill_stat.st_dev,
+            kill_inode: kill_stat.st_ino,
+        };
+        tree.verify_initial_peer(peer_pid)?;
+        Ok(tree)
+    }
+
+    fn try_clone(&self) -> Result<Self, RescueVaultDaemonError> {
+        let duplicate = |descriptor: &OwnedFd| {
+            rustix::io::fcntl_dupfd_cloexec(descriptor, 3)
+                .map_err(|_| RescueVaultDaemonError::CgroupUnavailable)
+        };
+        // Open independent control-file descriptions. dup(2) would share the
+        // cgroup.events offset across concurrent monitor/revoker snapshots.
+        // If systemd has already collected the exact prevalidated unit, only
+        // dead retained descriptions remain; their qualified ENODEV behavior
+        // is first proven and they are safe to duplicate because no offset can
+        // advance.
+        let controls = (|| {
+            let events = open_cgroup_file(&self.root, "cgroup.events", OFlags::RDONLY)?;
+            let kill = open_cgroup_file(&self.root, "cgroup.kill", OFlags::WRONLY)?;
+            validate_retained_identity(&events, self.events_device, self.events_inode, false)?;
+            validate_retained_identity(&kill, self.kill_device, self.kill_inode, false)?;
+            Ok::<_, RescueVaultDaemonError>((events, kill))
+        })();
+        let (events, kill) = match controls {
+            Ok(controls) => controls,
+            Err(_) if self.verify_garbage_collected()? => {
+                (duplicate(&self.events)?, duplicate(&self.kill)?)
+            }
+            Err(_) => return Err(RescueVaultDaemonError::CgroupUnavailable),
+        };
+        Ok(Self {
+            parent: duplicate(&self.parent)?,
+            root: duplicate(&self.root)?,
+            agent: duplicate(&self.agent)?,
+            events,
+            kill,
+            unit: self.unit.clone(),
+            kind: self.kind,
+            peer_uid: self.peer_uid,
+            peer_gid: self.peer_gid,
+            root_device: self.root_device,
+            root_inode: self.root_inode,
+            agent_device: self.agent_device,
+            agent_inode: self.agent_inode,
+            events_device: self.events_device,
+            events_inode: self.events_inode,
+            kill_device: self.kill_device,
+            kill_inode: self.kill_inode,
+        })
+    }
+
+    fn verify_initial_peer(&self, peer_pid: i32) -> Result<(), RescueVaultDaemonError> {
+        self.validate_named_root()?;
+        self.validate_retained_descriptors()?;
+        let named_agent = rfs::statat(
+            &self.root,
+            OsStr::from_bytes(PROVIDER_AGENT_CGROUP_NAME),
+            AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+        if named_agent.st_dev != self.agent_device || named_agent.st_ino != self.agent_inode {
+            return Err(RescueVaultDaemonError::CgroupUnavailable);
+        }
+        let expected_children: &[&[u8]] = match self.kind {
+            ProviderUnitKind::OpenAiExecutor => &[PROVIDER_AGENT_CGROUP_NAME],
+            ProviderUnitKind::LeaseProbe => {
+                &[PROVIDER_CONTROL_CGROUP_NAME, PROVIDER_AGENT_CGROUP_NAME]
+            }
+        };
+        if !provider_child_directories_are_exact(self.kind, &cgroup_child_directories(&self.root)?)
+            || !read_provider_cgroup_procs(&self.root)?.is_empty()
+            || read_provider_cgroup_procs(&self.agent)? != [peer_pid]
+            || cgroup_descendant_count(&self.root)? != expected_children.len() as u64
+            || provider_cgroup_descendant_count(&self.agent)? != 0
+            || !cgroup_populated(&self.root)?
+            || !provider_cgroup_populated(&self.agent)?
+        {
+            return Err(RescueVaultDaemonError::CgroupUnavailable);
+        }
+        if self.kind == ProviderUnitKind::LeaseProbe {
+            let control =
+                open_cgroup_child(&self.root, OsStr::from_bytes(PROVIDER_CONTROL_CGROUP_NAME))?;
+            validate_provider_delegated_directory(
+                &control,
+                &self.root,
+                self.peer_uid,
+                self.peer_gid,
+            )?;
+            validate_provider_subgroup_control_files(&control, self.peer_uid, self.peer_gid)?;
+            if !provider_control_is_empty(
+                &read_provider_cgroup_procs(&control)?,
+                provider_cgroup_descendant_count(&control)?,
+                provider_cgroup_populated(&control)?,
+            ) {
+                return Err(RescueVaultDaemonError::CgroupUnavailable);
+            }
+        }
+        Ok(())
+    }
+
+    fn is_quiescent(&self) -> Result<bool, RescueVaultDaemonError> {
+        self.validate_retained_descriptors()?;
+        match self.named_root_state()? {
+            NamedCgroupState::Present => match read_cgroup_events_fd(self.events.as_fd()) {
+                Ok(false) => Ok(true),
+                Ok(true) => {
+                    if self.validate_populated_topology().is_ok() {
+                        return Ok(false);
+                    }
+                    // Population may drop and systemd may collect the unit
+                    // between the fresh populated=1 read and the topology
+                    // walk. Accept that race only through the same exact
+                    // named-path-absence plus retained ENODEV proof.
+                    if self.verify_garbage_collected()? {
+                        Ok(true)
+                    } else {
+                        Err(RescueVaultDaemonError::CgroupUnavailable)
+                    }
+                }
+                Err(error) if error == rustix::io::Errno::NODEV => self.verify_garbage_collected(),
+                Err(_) => Err(RescueVaultDaemonError::CgroupUnavailable),
+            },
+            NamedCgroupState::Absent => self.verify_garbage_collected(),
+        }
+    }
+
+    fn kill_all(&self) -> Result<(), RescueVaultDaemonError> {
+        self.validate_retained_descriptors()?;
+        match self.named_root_state()? {
+            NamedCgroupState::Absent => {
+                if self.verify_garbage_collected()? {
+                    Ok(())
+                } else {
+                    Err(RescueVaultDaemonError::CgroupUnavailable)
+                }
+            }
+            NamedCgroupState::Present => match rustix::io::write(&self.kill, b"1") {
+                Ok(1) => Ok(()),
+                Err(error) if error == rustix::io::Errno::NODEV => {
+                    if self.verify_garbage_collected()? {
+                        Ok(())
+                    } else {
+                        Err(RescueVaultDaemonError::CgroupUnavailable)
+                    }
+                }
+                _ => Err(RescueVaultDaemonError::CgroupUnavailable),
+            },
+        }
+    }
+
+    fn validate_named_root(&self) -> Result<(), RescueVaultDaemonError> {
+        match self.named_root_state()? {
+            NamedCgroupState::Present => Ok(()),
+            NamedCgroupState::Absent => Err(RescueVaultDaemonError::CgroupUnavailable),
+        }
+    }
+
+    fn named_root_state(&self) -> Result<NamedCgroupState, RescueVaultDaemonError> {
+        match rfs::statat(&self.parent, &self.unit, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(named)
+                if named.st_dev == self.root_device
+                    && named.st_ino == self.root_inode
+                    && FileType::from_raw_mode(named.st_mode).is_dir() =>
+            {
+                Ok(NamedCgroupState::Present)
+            }
+            Ok(_) => Err(RescueVaultDaemonError::CgroupUnavailable),
+            Err(error) if error == rustix::io::Errno::NOENT => Ok(NamedCgroupState::Absent),
+            Err(_) => Err(RescueVaultDaemonError::CgroupUnavailable),
+        }
+    }
+
+    fn validate_retained_descriptors(&self) -> Result<(), RescueVaultDaemonError> {
+        validate_retained_identity(&self.root, self.root_device, self.root_inode, true)?;
+        validate_retained_identity(&self.agent, self.agent_device, self.agent_inode, true)?;
+        validate_retained_identity(&self.events, self.events_device, self.events_inode, false)?;
+        validate_retained_identity(&self.kill, self.kill_device, self.kill_inode, false)
+    }
+
+    fn validate_populated_topology(&self) -> Result<(), RescueVaultDaemonError> {
+        self.validate_named_root()?;
+        if !read_provider_cgroup_procs(&self.root)?.is_empty()
+            || provider_cgroup_descendant_count(&self.agent)? != 0
+        {
+            return Err(RescueVaultDaemonError::CgroupUnavailable);
+        }
+        let expected_children: &[&[u8]] = match self.kind {
+            ProviderUnitKind::OpenAiExecutor => &[PROVIDER_AGENT_CGROUP_NAME],
+            ProviderUnitKind::LeaseProbe => {
+                &[PROVIDER_CONTROL_CGROUP_NAME, PROVIDER_AGENT_CGROUP_NAME]
+            }
+        };
+        if !provider_child_directories_are_exact(self.kind, &cgroup_child_directories(&self.root)?)
+            || cgroup_descendant_count(&self.root)? != expected_children.len() as u64
+        {
+            return Err(RescueVaultDaemonError::CgroupUnavailable);
+        }
+        if self.kind == ProviderUnitKind::LeaseProbe {
+            let control =
+                open_cgroup_child(&self.root, OsStr::from_bytes(PROVIDER_CONTROL_CGROUP_NAME))?;
+            validate_provider_delegated_directory(
+                &control,
+                &self.root,
+                self.peer_uid,
+                self.peer_gid,
+            )?;
+            validate_provider_subgroup_control_files(&control, self.peer_uid, self.peer_gid)?;
+            if !provider_control_is_empty(
+                &read_provider_cgroup_procs(&control)?,
+                provider_cgroup_descendant_count(&control)?,
+                provider_cgroup_populated(&control)?,
+            ) {
+                return Err(RescueVaultDaemonError::CgroupUnavailable);
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_garbage_collected(&self) -> Result<bool, RescueVaultDaemonError> {
+        if self.named_root_state()? != NamedCgroupState::Absent {
+            return Ok(false);
+        }
+        let events_nodev = match read_cgroup_events_fd(self.events.as_fd()) {
+            Err(error) if error == rustix::io::Errno::NODEV => true,
+            Ok(_) => false,
+            Err(_) => return Err(RescueVaultDaemonError::CgroupUnavailable),
+        };
+        let kill_nodev = match rustix::io::write(&self.kill, b"1") {
+            Err(error) if error == rustix::io::Errno::NODEV => true,
+            Ok(_) => false,
+            Err(_) => return Err(RescueVaultDaemonError::CgroupUnavailable),
+        };
+        let named_path_still_absent = self.named_root_state()? == NamedCgroupState::Absent;
+        Ok(garbage_collection_evidence_is_terminal(
+            named_path_still_absent,
+            events_nodev,
+            kill_nodev,
+        ))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NamedCgroupState {
+    Present,
+    Absent,
+}
+
+fn garbage_collection_evidence_is_terminal(
+    named_path_absent: bool,
+    retained_events_nodev: bool,
+    retained_kill_nodev: bool,
+) -> bool {
+    named_path_absent && retained_events_nodev && retained_kill_nodev
+}
+
+fn provider_child_directories_are_exact(kind: ProviderUnitKind, children: &[&[u8]]) -> bool {
+    match kind {
+        ProviderUnitKind::OpenAiExecutor => children == [PROVIDER_AGENT_CGROUP_NAME],
+        ProviderUnitKind::LeaseProbe => {
+            children == [PROVIDER_CONTROL_CGROUP_NAME, PROVIDER_AGENT_CGROUP_NAME]
+        }
+    }
+}
+
+fn provider_control_is_empty(processes: &[i32], descendants: u64, populated: bool) -> bool {
+    processes.is_empty() && descendants == 0 && !populated
+}
+
+fn validate_retained_identity(
+    descriptor: &OwnedFd,
+    expected_device: u64,
+    expected_inode: u64,
+    directory: bool,
+) -> Result<(), RescueVaultDaemonError> {
+    let stat = rfs::fstat(descriptor).map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+    let file_type = FileType::from_raw_mode(stat.st_mode);
+    let descriptor_flags = rustix::io::fcntl_getfd(descriptor)
+        .map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+    if stat.st_dev != expected_device
+        || stat.st_ino != expected_inode
+        || directory != file_type.is_dir()
+        || (!directory && !file_type.is_file())
+        || !descriptor_flags.contains(rustix::io::FdFlags::CLOEXEC)
+    {
+        return Err(RescueVaultDaemonError::CgroupUnavailable);
+    }
+    Ok(())
+}
+
+fn parse_provider_membership(bytes: &[u8]) -> Result<ProviderMembership, RescueVaultDaemonError> {
+    if bytes.is_empty()
+        || bytes.len() > MAX_CGROUP_FILE_BYTES
+        || !bytes.ends_with(b"\n")
+        || bytes[..bytes.len() - 1].contains(&b'\n')
+        || !bytes.starts_with(b"0::/system.slice/")
+    {
+        return Err(RescueVaultDaemonError::CgroupUnavailable);
+    }
+    let path = &bytes[b"0::/system.slice/".len()..bytes.len() - 1];
+    let Some(unit) = path.strip_suffix(b"/agent") else {
+        return Err(RescueVaultDaemonError::CgroupUnavailable);
+    };
+    if unit.is_empty() || unit.contains(&b'/') {
+        return Err(RescueVaultDaemonError::CgroupUnavailable);
+    }
+    let kind = if valid_instantiated_service(unit, OPENAI_EXECUTOR_UNIT_PREFIX) {
+        ProviderUnitKind::OpenAiExecutor
+    } else if valid_instantiated_service(unit, LEASE_PROBE_UNIT_PREFIX) {
+        ProviderUnitKind::LeaseProbe
+    } else {
+        return Err(RescueVaultDaemonError::CgroupUnavailable);
+    };
+    Ok(ProviderMembership {
+        unit: OsString::from_vec(unit.to_vec()),
+        kind,
+    })
+}
+
+fn valid_instantiated_service(unit: &[u8], prefix: &[u8]) -> bool {
+    let Some(instance_with_suffix) = unit.strip_prefix(prefix) else {
+        return false;
+    };
+    let Some(instance) = instance_with_suffix.strip_suffix(SERVICE_UNIT_SUFFIX) else {
+        return false;
+    };
+    if instance.is_empty() || instance.len() > MAX_CGROUP_COMPONENT_BYTES {
+        return false;
+    }
+    let mut index = 0;
+    while index < instance.len() {
+        let byte = instance[index];
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':') {
+            index += 1;
+            continue;
+        }
+        if byte == b'\\'
+            && instance.get(index + 1) == Some(&b'x')
+            && instance
+                .get(index + 2..index + 4)
+                .is_some_and(|hex| hex.iter().all(u8::is_ascii_hexdigit))
+        {
+            index += 4;
+            continue;
+        }
+        return false;
+    }
+    true
+}
+
+fn open_proc_root() -> Result<OwnedFd, RescueVaultDaemonError> {
+    let proc = rfs::openat2(
+        CWD,
+        "/proc",
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+    )
+    .map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+    let filesystem = rfs::fstatfs(&proc).map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+    if u64::try_from(filesystem.f_type).ok() != Some(PROC_SUPER_MAGIC) {
+        return Err(RescueVaultDaemonError::CgroupUnavailable);
+    }
+    Ok(proc)
+}
+
+fn read_proc_pid_file(
+    proc: &OwnedFd,
+    pid: i32,
+    name: &str,
+    maximum: usize,
+) -> Result<Vec<u8>, RescueVaultDaemonError> {
+    if pid <= 0 || !pid.to_string().bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(RescueVaultDaemonError::CgroupUnavailable);
+    }
+    let process = rfs::openat2(
+        proc,
+        pid.to_string(),
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+        beneath_flags(),
+    )
+    .map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+    let descriptor = rfs::openat2(
+        &process,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+        beneath_flags(),
+    )
+    .map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+    let stat = rfs::fstat(&descriptor).map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+    let filesystem =
+        rfs::fstatfs(&descriptor).map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+    if !FileType::from_raw_mode(stat.st_mode).is_file()
+        || u64::try_from(filesystem.f_type).ok() != Some(PROC_SUPER_MAGIC)
+    {
+        return Err(RescueVaultDaemonError::CgroupUnavailable);
+    }
+    read_bounded(descriptor.as_fd(), maximum).map_err(|_| RescueVaultDaemonError::CgroupUnavailable)
+}
+
+fn mountinfo_has_exact_cgroup2_access(
+    bytes: &[u8],
+    expected_device: u64,
+    writable: bool,
+) -> Result<bool, RescueVaultDaemonError> {
+    if bytes.is_empty() || bytes.len() > MAX_PROC_MOUNTINFO_BYTES || !bytes.ends_with(b"\n") {
+        return Err(RescueVaultDaemonError::CgroupUnavailable);
+    }
+    let mut found = false;
+    for line in bytes[..bytes.len() - 1].split(|byte| *byte == b'\n') {
+        if line.is_empty() || line.contains(&0) {
+            return Err(RescueVaultDaemonError::CgroupUnavailable);
+        }
+        let fields: Vec<&[u8]> = line.split(|byte| *byte == b' ').collect();
+        let Some(separator) = fields.iter().position(|field| *field == b"-") else {
+            return Err(RescueVaultDaemonError::CgroupUnavailable);
+        };
+        if separator < 6 || fields.len().saturating_sub(separator) < 4 {
+            return Err(RescueVaultDaemonError::CgroupUnavailable);
+        }
+        if fields[separator + 1] != b"cgroup2" {
+            continue;
+        }
+        if found
+            || fields[3] != b"/"
+            || fields[4] != b"/sys/fs/cgroup"
+            || fields[separator + 2] != b"cgroup2"
+            || fields[2].contains(&b'\\')
+            || fields[3].contains(&b'\\')
+            || fields[4].contains(&b'\\')
+        {
+            return Ok(false);
+        }
+        let (major, minor) = parse_mountinfo_device(fields[2])?;
+        if major != rfs::major(expected_device) || minor != rfs::minor(expected_device) {
+            return Ok(false);
+        }
+        let (has_ro, has_rw) = parse_mount_access_options(fields[5])?;
+        let (super_has_ro, super_has_rw) = parse_mount_access_options(fields[separator + 3])?;
+        if has_ro == has_rw || writable != has_rw {
+            return Ok(false);
+        }
+        if super_has_ro || !super_has_rw {
+            return Ok(false);
+        }
+        found = true;
+    }
+    Ok(found)
+}
+
+fn parse_mount_access_options(bytes: &[u8]) -> Result<(bool, bool), RescueVaultDaemonError> {
+    if bytes.is_empty() || bytes.len() > 4096 {
+        return Err(RescueVaultDaemonError::CgroupUnavailable);
+    }
+    let mut options: Vec<&[u8]> = Vec::new();
+    for option in bytes.split(|byte| *byte == b',') {
+        if option.is_empty()
+            || option.len() > 128
+            || option.iter().any(|byte| {
+                !byte.is_ascii_alphanumeric() && !matches!(byte, b'_' | b'-' | b'.' | b'=')
+            })
+            || options.contains(&option)
+        {
+            return Err(RescueVaultDaemonError::CgroupUnavailable);
+        }
+        options.push(option);
+    }
+    Ok((
+        options.contains(&b"ro".as_slice()),
+        options.contains(&b"rw".as_slice()),
+    ))
+}
+
+fn parse_mountinfo_device(bytes: &[u8]) -> Result<(u32, u32), RescueVaultDaemonError> {
+    let mut fields = bytes.split(|byte| *byte == b':');
+    let major = fields.next().unwrap_or_default();
+    let minor = fields.next().unwrap_or_default();
+    if fields.next().is_some() {
+        return Err(RescueVaultDaemonError::CgroupUnavailable);
+    }
+    let parse = |value: &[u8]| {
+        if value.is_empty()
+            || value.len() > 10
+            || !value.iter().all(u8::is_ascii_digit)
+            || (value.len() > 1 && value[0] == b'0')
+        {
+            return None;
+        }
+        std::str::from_utf8(value).ok()?.parse::<u32>().ok()
+    };
+    Ok((
+        parse(major).ok_or(RescueVaultDaemonError::CgroupUnavailable)?,
+        parse(minor).ok_or(RescueVaultDaemonError::CgroupUnavailable)?,
+    ))
+}
+
+fn validate_provider_delegated_directory(
+    descriptor: &OwnedFd,
+    parent: &OwnedFd,
+    peer_uid: u32,
+    peer_gid: u32,
+) -> Result<(), RescueVaultDaemonError> {
+    let stat = rfs::fstat(descriptor).map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+    let parent = rfs::fstat(parent).map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+    let filesystem =
+        rfs::fstatfs(descriptor).map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+    let descriptor_flags = rustix::io::fcntl_getfd(descriptor)
+        .map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+    if !provider_delegated_directory_metadata_is_exact(
+        FileType::from_raw_mode(stat.st_mode),
+        (stat.st_uid, stat.st_gid),
+        (peer_uid, peer_gid),
+        (stat.st_dev, parent.st_dev),
+        stat.st_mode,
+        u64::try_from(filesystem.f_type).ok(),
+        descriptor_flags.contains(rustix::io::FdFlags::CLOEXEC),
+    ) {
+        return Err(RescueVaultDaemonError::CgroupUnavailable);
+    }
+    Ok(())
+}
+
+fn provider_delegated_directory_metadata_is_exact(
+    file_type: FileType,
+    ownership: (u32, u32),
+    expected_ownership: (u32, u32),
+    device: (u64, u64),
+    mode: u32,
+    filesystem_type: Option<u64>,
+    cloexec: bool,
+) -> bool {
+    file_type.is_dir()
+        && ownership == expected_ownership
+        && ownership.0 != 0
+        && ownership.1 != 0
+        && device.0 == device.1
+        && mode & 0o7777 == 0o755
+        && filesystem_type == Some(CGROUP2_SUPER_MAGIC)
+        && cloexec
+}
+
+fn validate_provider_root_control_file(
+    descriptor: &OwnedFd,
+    root: &OwnedFd,
+    expected_mode: u32,
+) -> Result<(), RescueVaultDaemonError> {
+    let stat = rfs::fstat(descriptor).map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+    let root = rfs::fstat(root).map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+    if !provider_root_control_metadata_is_exact(
+        FileType::from_raw_mode(stat.st_mode),
+        stat.st_uid,
+        stat.st_gid,
+        stat.st_dev,
+        root.st_dev,
+        stat.st_mode,
+        expected_mode,
+    ) {
+        return Err(RescueVaultDaemonError::CgroupUnavailable);
+    }
+    Ok(())
+}
+
+fn provider_root_control_metadata_is_exact(
+    file_type: FileType,
+    uid: u32,
+    gid: u32,
+    device: u64,
+    parent_device: u64,
+    mode: u32,
+    expected_mode: u32,
+) -> bool {
+    file_type.is_file()
+        && uid == 0
+        && gid == 0
+        && device == parent_device
+        && mode & 0o7777 == expected_mode
+}
+
+fn provider_delegated_control_metadata_is_exact(
+    file_type: FileType,
+    ownership: (u32, u32),
+    expected_ownership: (u32, u32),
+    device: (u64, u64),
+    mode: u32,
+    expected_mode: u32,
+) -> bool {
+    file_type.is_file()
+        && ownership == expected_ownership
+        && ownership.0 != 0
+        && ownership.1 != 0
+        && device.0 == device.1
+        && mode & 0o7777 == expected_mode
+}
+
+fn validate_provider_unit_root_control_files(
+    root: &OwnedFd,
+    peer_uid: u32,
+    peer_gid: u32,
+) -> Result<(), RescueVaultDaemonError> {
+    // systemd v257's fatal unified cg_set_access() allowlist delegates these
+    // three writable unit-root controls while leaving events and kill root-owned.
+    for (name, expected_mode) in PROVIDER_UNIT_ROOT_AGENT_CONTROLS {
+        let stat = rfs::statat(root, name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+        let parent = rfs::fstat(root).map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+        if !provider_delegated_control_metadata_is_exact(
+            FileType::from_raw_mode(stat.st_mode),
+            (stat.st_uid, stat.st_gid),
+            (peer_uid, peer_gid),
+            (stat.st_dev, parent.st_dev),
+            stat.st_mode,
+            expected_mode,
+        ) {
+            return Err(RescueVaultDaemonError::CgroupUnavailable);
+        }
+    }
+    Ok(())
+}
+
+fn validate_provider_subgroup_control_files(
+    subgroup: &OwnedFd,
+    peer_uid: u32,
+    peer_gid: u32,
+) -> Result<(), RescueVaultDaemonError> {
+    // v257 recursively chowns the selected DelegateSubgroup, including the
+    // `.control` subgroup selected for ExecCondition. Inspect Agent-owned
+    // write-only controls as metadata only; vaultd mutates the root kill file.
+    for (name, expected_mode) in PROVIDER_SUBGROUP_AGENT_CONTROLS {
+        let stat = rfs::statat(subgroup, name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+        let parent = rfs::fstat(subgroup).map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+        if !provider_delegated_control_metadata_is_exact(
+            FileType::from_raw_mode(stat.st_mode),
+            (stat.st_uid, stat.st_gid),
+            (peer_uid, peer_gid),
+            (stat.st_dev, parent.st_dev),
+            stat.st_mode,
+            expected_mode,
+        ) {
+            return Err(RescueVaultDaemonError::CgroupUnavailable);
+        }
+    }
+    Ok(())
+}
+
+fn cgroup_child_directories(
+    directory: &OwnedFd,
+) -> Result<Vec<&'static [u8]>, RescueVaultDaemonError> {
+    let scan = rfs::openat2(
+        directory,
+        ".",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+        beneath_flags(),
+    )
+    .map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+    let mut buffer = [MaybeUninit::<u8>::uninit(); 8192];
+    let mut entries = RawDir::new(&scan, &mut buffer);
+    let mut children = Vec::new();
+    let mut count = 0_usize;
+    while let Some(entry) = entries.next() {
+        let entry = entry.map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+        let name = entry.file_name().to_bytes();
+        if matches!(name, b"." | b"..") {
+            continue;
+        }
+        count = count
+            .checked_add(1)
+            .ok_or(RescueVaultDaemonError::CgroupUnavailable)?;
+        if count > 256 || name.len() > MAX_CGROUP_COMPONENT_BYTES {
+            return Err(RescueVaultDaemonError::CgroupUnavailable);
+        }
+        let is_directory = if entry.file_type() == FileType::Unknown {
+            rfs::statat(
+                directory,
+                OsStr::from_bytes(name),
+                AtFlags::SYMLINK_NOFOLLOW,
+            )
+            .map(|stat| FileType::from_raw_mode(stat.st_mode).is_dir())
+            .map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?
+        } else {
+            entry.file_type().is_dir()
+        };
+        if !is_directory {
+            continue;
+        }
+        let known = match name {
+            PROVIDER_AGENT_CGROUP_NAME => PROVIDER_AGENT_CGROUP_NAME,
+            PROVIDER_CONTROL_CGROUP_NAME => PROVIDER_CONTROL_CGROUP_NAME,
+            _ => return Err(RescueVaultDaemonError::CgroupUnavailable),
+        };
+        if children.contains(&known) {
+            return Err(RescueVaultDaemonError::CgroupUnavailable);
+        }
+        children.push(known);
+    }
+    children.sort_unstable();
+    Ok(children)
+}
+
+fn read_cgroup_events_fd(descriptor: BorrowedFd<'_>) -> Result<bool, rustix::io::Errno> {
+    rfs::seek(descriptor, SeekFrom::Start(0))?;
+    let bytes = read_bounded_errno(descriptor, MAX_CGROUP_FILE_BYTES)?;
+    parse_cgroup_events_populated(&bytes).map_err(|_| rustix::io::Errno::INVAL)
+}
+
+fn read_bounded_errno(
+    descriptor: BorrowedFd<'_>,
+    maximum: usize,
+) -> Result<Vec<u8>, rustix::io::Errno> {
+    let mut output = Vec::new();
+    let mut buffer = [0_u8; 512];
+    loop {
+        match rustix::io::read(descriptor, &mut buffer) {
+            Ok(0) => return Ok(output),
+            Ok(count) if output.len().saturating_add(count) <= maximum => {
+                output.extend_from_slice(&buffer[..count]);
+            }
+            Ok(_) => return Err(rustix::io::Errno::FBIG),
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn parse_cgroup_events_populated(bytes: &[u8]) -> Result<bool, RescueVaultDaemonError> {
+    let mut populated = None;
+    if bytes.is_empty() || bytes.len() > MAX_CGROUP_FILE_BYTES || !bytes.ends_with(b"\n") {
+        return Err(RescueVaultDaemonError::CgroupUnavailable);
+    }
+    for line in bytes[..bytes.len() - 1].split(|byte| *byte == b'\n') {
+        let mut fields = line.split(|byte| *byte == b' ');
+        let key = fields.next().unwrap_or_default();
+        let value = fields.next().unwrap_or_default();
+        if key.is_empty() || fields.next().is_some() || value.len() != 1 {
+            return Err(RescueVaultDaemonError::CgroupUnavailable);
+        }
+        if key == b"populated" {
+            if populated.is_some() || !matches!(value, b"0" | b"1") {
+                return Err(RescueVaultDaemonError::CgroupUnavailable);
+            }
+            populated = Some(value == b"1");
+        }
+    }
+    populated.ok_or(RescueVaultDaemonError::CgroupUnavailable)
+}
+
 /// A path-free handle to the exact delegated sibling cgroup reserved for the
 /// worker.
 pub(super) struct WorkerCgroup {
@@ -1134,10 +2082,42 @@ fn open_cgroup_file(
     Ok(descriptor)
 }
 
+fn open_provider_cgroup_file(
+    directory: &OwnedFd,
+    name: &str,
+    access: OFlags,
+) -> Result<OwnedFd, RescueVaultDaemonError> {
+    let descriptor = rfs::openat2(
+        directory,
+        name,
+        access | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+        beneath_flags(),
+    )
+    .map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+    let stat = rfs::fstat(&descriptor).map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+    let parent = rfs::fstat(directory).map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+    if !FileType::from_raw_mode(stat.st_mode).is_file() || stat.st_dev != parent.st_dev {
+        return Err(RescueVaultDaemonError::CgroupUnavailable);
+    }
+    Ok(descriptor)
+}
+
 fn read_cgroup_procs(directory: &OwnedFd) -> Result<Vec<i32>, RescueVaultDaemonError> {
     let descriptor = open_cgroup_file(directory, "cgroup.procs", OFlags::RDONLY)?;
     let bytes = read_bounded(descriptor.as_fd(), MAX_CGROUP_FILE_BYTES)
         .map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+    parse_cgroup_procs(&bytes)
+}
+
+fn read_provider_cgroup_procs(directory: &OwnedFd) -> Result<Vec<i32>, RescueVaultDaemonError> {
+    let descriptor = open_provider_cgroup_file(directory, "cgroup.procs", OFlags::RDONLY)?;
+    let bytes = read_bounded(descriptor.as_fd(), MAX_CGROUP_FILE_BYTES)
+        .map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+    parse_cgroup_procs(&bytes)
+}
+
+fn parse_cgroup_procs(bytes: &[u8]) -> Result<Vec<i32>, RescueVaultDaemonError> {
     if bytes.is_empty() {
         return Ok(Vec::new());
     }
@@ -1171,25 +2151,14 @@ fn cgroup_populated(directory: &OwnedFd) -> Result<bool, RescueVaultDaemonError>
     let descriptor = open_cgroup_file(directory, "cgroup.events", OFlags::RDONLY)?;
     let bytes = read_bounded(descriptor.as_fd(), MAX_CGROUP_FILE_BYTES)
         .map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
-    let mut populated = None;
-    for line in bytes
-        .split(|byte| *byte == b'\n')
-        .filter(|line| !line.is_empty())
-    {
-        let mut fields = line.split(|byte| *byte == b' ');
-        let key = fields.next().unwrap_or_default();
-        let value = fields.next().unwrap_or_default();
-        if fields.next().is_some() || value.len() != 1 {
-            return Err(RescueVaultDaemonError::CgroupUnavailable);
-        }
-        if key == b"populated" {
-            if populated.is_some() || !matches!(value, b"0" | b"1") {
-                return Err(RescueVaultDaemonError::CgroupUnavailable);
-            }
-            populated = Some(value == b"1");
-        }
-    }
-    populated.ok_or(RescueVaultDaemonError::CgroupUnavailable)
+    parse_cgroup_events_populated(&bytes)
+}
+
+fn provider_cgroup_populated(directory: &OwnedFd) -> Result<bool, RescueVaultDaemonError> {
+    let descriptor = open_provider_cgroup_file(directory, "cgroup.events", OFlags::RDONLY)?;
+    let bytes = read_bounded(descriptor.as_fd(), MAX_CGROUP_FILE_BYTES)
+        .map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+    parse_cgroup_events_populated(&bytes)
 }
 
 fn cgroup_pids_current(directory: &OwnedFd) -> Result<u64, RescueVaultDaemonError> {
@@ -1203,6 +2172,17 @@ fn cgroup_descendant_count(directory: &OwnedFd) -> Result<u64, RescueVaultDaemon
     let descriptor = open_cgroup_file(directory, "cgroup.stat", OFlags::RDONLY)?;
     let bytes = read_bounded(descriptor.as_fd(), MAX_CGROUP_FILE_BYTES)
         .map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+    parse_cgroup_descendant_count(&bytes)
+}
+
+fn provider_cgroup_descendant_count(directory: &OwnedFd) -> Result<u64, RescueVaultDaemonError> {
+    let descriptor = open_provider_cgroup_file(directory, "cgroup.stat", OFlags::RDONLY)?;
+    let bytes = read_bounded(descriptor.as_fd(), MAX_CGROUP_FILE_BYTES)
+        .map_err(|_| RescueVaultDaemonError::CgroupUnavailable)?;
+    parse_cgroup_descendant_count(&bytes)
+}
+
+fn parse_cgroup_descendant_count(bytes: &[u8]) -> Result<u64, RescueVaultDaemonError> {
     if bytes.is_empty() || !bytes.ends_with(b"\n") {
         return Err(RescueVaultDaemonError::CgroupUnavailable);
     }
@@ -1978,6 +2958,300 @@ mod tests {
         )
         .expect("runtime descriptor");
         (directory, root)
+    }
+
+    #[test]
+    fn provider_membership_is_terminal_agent_in_one_exact_service_unit() {
+        let production = parse_provider_membership(
+            b"0::/system.slice/kernaid-rescue-openai-executor@4-123.service/agent\n",
+        )
+        .expect("production membership");
+        assert_eq!(production.kind, ProviderUnitKind::OpenAiExecutor);
+        assert_eq!(
+            production.unit,
+            OsString::from("kernaid-rescue-openai-executor@4-123.service")
+        );
+        let probe = parse_provider_membership(
+            b"0::/system.slice/kernaid-provider-lease-probe@1-foo\\x2dbar.service/agent\n",
+        )
+        .expect("probe membership");
+        assert_eq!(probe.kind, ProviderUnitKind::LeaseProbe);
+
+        for invalid in [
+            b"0::/system.slice/kernaid-rescue-openai-executor@4.service\n".as_slice(),
+            b"0::/system.slice/kernaid-rescue-openai-executor@4.service/agent/nested\n",
+            b"0::/system.slice/kernaid-rescue-openai-executor@.service/agent\n",
+            b"0::/user.slice/kernaid-rescue-openai-executor@4.service/agent\n",
+            b"0::/system.slice/unrelated@4.service/agent\n",
+            b"0::/system.slice/kernaid-rescue-openai-executor@4.service/agent\n0::/other\n",
+            b"1:name=/system.slice/kernaid-rescue-openai-executor@4.service/agent\n",
+        ] {
+            assert_eq!(
+                parse_provider_membership(invalid).err(),
+                Some(RescueVaultDaemonError::CgroupUnavailable)
+            );
+        }
+    }
+
+    #[test]
+    fn provider_mount_access_requires_one_same_device_cgroup2_mount() {
+        let device = rfs::makedev(0, 28);
+        let peer =
+            b"36 25 0:28 / /sys/fs/cgroup ro,nosuid,nodev,noexec,relatime - cgroup2 cgroup2 rw\n";
+        let daemon =
+            b"36 25 0:28 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime - cgroup2 cgroup2 rw\n";
+        assert_eq!(
+            mountinfo_has_exact_cgroup2_access(peer, device, false),
+            Ok(true)
+        );
+        assert_eq!(
+            mountinfo_has_exact_cgroup2_access(daemon, device, true),
+            Ok(true)
+        );
+        assert_eq!(
+            mountinfo_has_exact_cgroup2_access(peer, device, true),
+            Ok(false)
+        );
+        assert_eq!(
+            mountinfo_has_exact_cgroup2_access(daemon, device, false),
+            Ok(false)
+        );
+        for invalid in [
+            b"36 25 0:29 / /sys/fs/cgroup ro - cgroup2 cgroup2 rw\n".as_slice(),
+            b"36 25 0:28 / /other ro - cgroup2 cgroup2 rw\n",
+            b"36 25 0:28 / /sys/fs/cgroup ro,rw - cgroup2 cgroup2 rw\n",
+            b"36 25 0:28 / /sys/fs/cgroup ro - cgroup2 cgroup2 rw\n37 25 0:28 / /other ro - cgroup2 cgroup2 rw\n",
+        ] {
+            assert_eq!(
+                mountinfo_has_exact_cgroup2_access(invalid, device, false),
+                Ok(false)
+            );
+        }
+        assert_eq!(
+            mountinfo_has_exact_cgroup2_access(
+                b"36 25 0:28 / /sys/fs/cgroup ro,ro - cgroup2 cgroup2 rw\n",
+                device,
+                false,
+            ),
+            Err(RescueVaultDaemonError::CgroupUnavailable)
+        );
+    }
+
+    #[test]
+    fn provider_tree_terminal_states_are_closed_four_factor_evidence() {
+        assert_eq!(
+            parse_cgroup_events_populated(b"populated 0\nfrozen 0\n"),
+            Ok(false)
+        );
+        assert_eq!(parse_cgroup_events_populated(b"populated 1\n"), Ok(true));
+        for invalid in [
+            b"".as_slice(),
+            b"populated 0",
+            b"populated 2\n",
+            b"populated 0\npopulated 1\n",
+            b"other 0\n",
+        ] {
+            assert_eq!(
+                parse_cgroup_events_populated(invalid),
+                Err(RescueVaultDaemonError::CgroupUnavailable)
+            );
+        }
+
+        assert!(garbage_collection_evidence_is_terminal(true, true, true));
+        for incomplete in [
+            (false, true, true),
+            (true, false, true),
+            (true, true, false),
+            (false, false, false),
+        ] {
+            assert!(!garbage_collection_evidence_is_terminal(
+                incomplete.0,
+                incomplete.1,
+                incomplete.2
+            ));
+        }
+    }
+
+    #[test]
+    fn provider_unit_topology_and_root_kill_ownership_are_exact() {
+        assert!(provider_child_directories_are_exact(
+            ProviderUnitKind::OpenAiExecutor,
+            &[PROVIDER_AGENT_CGROUP_NAME]
+        ));
+        assert!(provider_child_directories_are_exact(
+            ProviderUnitKind::LeaseProbe,
+            &[PROVIDER_CONTROL_CGROUP_NAME, PROVIDER_AGENT_CGROUP_NAME]
+        ));
+        assert!(!provider_child_directories_are_exact(
+            ProviderUnitKind::OpenAiExecutor,
+            &[PROVIDER_CONTROL_CGROUP_NAME, PROVIDER_AGENT_CGROUP_NAME]
+        ));
+        assert!(!provider_child_directories_are_exact(
+            ProviderUnitKind::LeaseProbe,
+            &[PROVIDER_AGENT_CGROUP_NAME]
+        ));
+        assert!(provider_control_is_empty(&[], 0, false));
+        assert!(!provider_control_is_empty(&[41], 0, true));
+        assert!(!provider_control_is_empty(&[], 1, false));
+        assert_eq!(
+            PROVIDER_UNIT_ROOT_AGENT_CONTROLS,
+            [
+                ("cgroup.procs", 0o644),
+                ("cgroup.subtree_control", 0o644),
+                ("cgroup.threads", 0o644),
+            ]
+        );
+        assert_eq!(
+            PROVIDER_SUBGROUP_AGENT_CONTROLS,
+            [
+                ("cgroup.procs", 0o644),
+                ("cgroup.events", 0o444),
+                ("cgroup.kill", 0o200),
+                ("cgroup.stat", 0o444),
+            ]
+        );
+
+        let device = rfs::makedev(0, 28);
+        let peer = (1000, 1000);
+        assert!(provider_delegated_directory_metadata_is_exact(
+            FileType::from_raw_mode(0o040_755),
+            peer,
+            peer,
+            (device, device),
+            0o040_755,
+            Some(CGROUP2_SUPER_MAGIC),
+            true,
+        ));
+        for invalid_owner in [(0, 0), (0, 1000), (1000, 0), (1001, 1000)] {
+            assert!(!provider_delegated_directory_metadata_is_exact(
+                FileType::from_raw_mode(0o040_755),
+                invalid_owner,
+                peer,
+                (device, device),
+                0o040_755,
+                Some(CGROUP2_SUPER_MAGIC),
+                true,
+            ));
+        }
+        assert!(!provider_delegated_directory_metadata_is_exact(
+            FileType::from_raw_mode(0o040_755),
+            peer,
+            peer,
+            (device, device),
+            0o040_775,
+            Some(CGROUP2_SUPER_MAGIC),
+            true,
+        ));
+        for (file_type, devices, filesystem, cloexec) in [
+            (
+                FileType::RegularFile,
+                (device, device),
+                Some(CGROUP2_SUPER_MAGIC),
+                true,
+            ),
+            (
+                FileType::from_raw_mode(0o040_755),
+                (rfs::makedev(0, 29), device),
+                Some(CGROUP2_SUPER_MAGIC),
+                true,
+            ),
+            (
+                FileType::from_raw_mode(0o040_755),
+                (device, device),
+                Some(PROC_SUPER_MAGIC),
+                true,
+            ),
+            (
+                FileType::from_raw_mode(0o040_755),
+                (device, device),
+                Some(CGROUP2_SUPER_MAGIC),
+                false,
+            ),
+        ] {
+            assert!(!provider_delegated_directory_metadata_is_exact(
+                file_type, peer, peer, devices, 0o040_755, filesystem, cloexec,
+            ));
+        }
+
+        assert!(provider_delegated_control_metadata_is_exact(
+            FileType::RegularFile,
+            peer,
+            peer,
+            (device, device),
+            0o100_644,
+            0o644,
+        ));
+        for invalid_owner in [(0, 0), (0, 1000), (1000, 0), (1001, 1000)] {
+            assert!(!provider_delegated_control_metadata_is_exact(
+                FileType::RegularFile,
+                invalid_owner,
+                peer,
+                (device, device),
+                0o100_644,
+                0o644,
+            ));
+        }
+        assert!(!provider_delegated_control_metadata_is_exact(
+            FileType::RegularFile,
+            peer,
+            peer,
+            (device, device),
+            0o100_600,
+            0o644,
+        ));
+        assert!(!provider_delegated_control_metadata_is_exact(
+            FileType::RegularFile,
+            peer,
+            peer,
+            (rfs::makedev(0, 29), device),
+            0o100_644,
+            0o644,
+        ));
+
+        assert!(provider_root_control_metadata_is_exact(
+            FileType::RegularFile,
+            0,
+            0,
+            device,
+            device,
+            0o100_200,
+            0o200,
+        ));
+        assert!(provider_root_control_metadata_is_exact(
+            FileType::RegularFile,
+            0,
+            0,
+            device,
+            device,
+            0o100_444,
+            0o444,
+        ));
+        assert!(!provider_root_control_metadata_is_exact(
+            FileType::RegularFile,
+            0,
+            0,
+            device,
+            device,
+            0o100_400,
+            0o444,
+        ));
+        for invalid in [
+            (1000, 0, device, device, 0o100_200),
+            (0, 1000, device, device, 0o100_200),
+            (0, 0, rfs::makedev(0, 29), device, 0o100_200),
+            (0, 0, device, device, 0o100_000),
+            (0, 0, device, device, 0o100_220),
+        ] {
+            assert!(!provider_root_control_metadata_is_exact(
+                FileType::RegularFile,
+                invalid.0,
+                invalid.1,
+                invalid.2,
+                invalid.3,
+                invalid.4,
+                0o200,
+            ));
+        }
     }
 
     #[test]

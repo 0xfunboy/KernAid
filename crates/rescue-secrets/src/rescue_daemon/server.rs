@@ -2,7 +2,8 @@ use super::{
     RescueVaultDaemonError, enforce_process_privacy, group_has_exact_openai_boundaries,
     internal_wire, passwd_has_exact_companion, passwd_openai_agent_uid,
     runtime::{
-        self, DaemonRuntime, RuntimeDisposition, WorkerCgroup, WorkerHandle, WorkerSpawnResult,
+        self, DaemonRuntime, ProcessScope, ProviderProcessBoundary, RuntimeDisposition,
+        WorkerCgroup, WorkerHandle, WorkerSpawnResult,
     },
     validate_no_active_swap,
 };
@@ -115,6 +116,8 @@ struct ProviderLease {
     id: u64,
     socket: OwnedFd,
     pidfd: OwnedFd,
+    peer_pid: i32,
+    process: ProviderProcessBoundary,
     state: LeaseState,
     handoff_deadline: Instant,
     lease_deadline: Option<Instant>,
@@ -138,12 +141,15 @@ impl Default for LeaseRegistry {
 struct LeaseCandidate {
     socket: OwnedFd,
     pidfd: OwnedFd,
+    peer_pid: i32,
+    process: ProviderProcessBoundary,
 }
 
 struct LeaseSnapshot {
     id: u64,
     socket: OwnedFd,
     pidfd: OwnedFd,
+    process: ProviderProcessBoundary,
     deadline: Instant,
     output_obligation: Arc<LeaseOutputState>,
 }
@@ -182,7 +188,8 @@ impl Drop for LeaseOutputGuard {
     fn drop(&mut self) {
         // Close every supervisor-owned credential descriptor before publishing
         // finalization. Revocation may remove the lease only after observing
-        // this release-store in addition to peer HUP and pidfd exit.
+        // this release-store in addition to peer HUP, pidfd exit, and whole
+        // process-scope quiescence.
         drop(self.descriptor.take());
         self.state.finalized.store(true, Ordering::Release);
     }
@@ -1263,7 +1270,8 @@ fn handle_connection_by(
             };
             // Publish the output-finalized latch only after the supervisor's
             // credential read descriptor is closed. Revocation and lock wait
-            // for this latch in addition to Agent HUP and pidfd exit.
+            // for this latch in addition to Agent HUP, pidfd exit, and whole
+            // process-scope quiescence.
             drop(output);
             match sent {
                 Ok(DescriptorSend::Established) => {
@@ -1400,16 +1408,24 @@ impl ClientConnection<'_> {
         }
     }
 
-    fn lease_candidate(&self) -> Result<LeaseCandidate, RescueVaultDaemonError> {
-        let (socket, production_validation) = match self {
-            Self::Socket(socket) => (socket, true),
+    fn lease_candidate(
+        &self,
+        requested_scope: ProcessScope,
+    ) -> Result<LeaseCandidate, RescueVaultDaemonError> {
+        let (socket, production_validation, process_scope) = match self {
+            Self::Socket(socket) => (socket, true, requested_scope),
             #[cfg(test)]
-            Self::LeaseTestSocket(socket) => (socket, false),
+            Self::LeaseTestSocket(socket) => (socket, false, ProcessScope::DirectPeer),
             #[cfg(test)]
             Self::AssumedLive | Self::BlockingLive(_) => {
                 return Err(RescueVaultDaemonError::ProtocolFailure);
             }
         };
+        let credentials = getsockopt(socket, sockopt::PeerCredentials)
+            .map_err(|_| RescueVaultDaemonError::ProtocolFailure)?;
+        if credentials.pid() <= 1 || credentials.uid() == 0 || credentials.gid() == 0 {
+            return Err(RescueVaultDaemonError::ProtocolFailure);
+        }
         let pidfd = getsockopt(socket, sockopt::PeerPidfd)
             .map_err(|_| RescueVaultDaemonError::ProtocolFailure)?;
         let pidfd_flags =
@@ -1428,9 +1444,26 @@ impl ClientConnection<'_> {
         if source.st_dev != duplicate.st_dev || source.st_ino != duplicate.st_ino {
             return Err(RescueVaultDaemonError::ProtocolFailure);
         }
+        let process = ProviderProcessBoundary::capture(
+            process_scope,
+            credentials.pid(),
+            credentials.uid(),
+            credentials.gid(),
+        )
+        .map_err(|_| RescueVaultDaemonError::ProtocolFailure)?;
+        if getsockopt(&observer, sockopt::PeerCredentials)
+            .map(|observed| observed != credentials)
+            .unwrap_or(true)
+            || lease_pid_exited(pidfd.as_fd())?
+        {
+            return Err(RescueVaultDaemonError::ProtocolFailure);
+        }
+        process.verify_initial_peer(credentials.pid())?;
         Ok(LeaseCandidate {
             socket: observer,
             pidfd,
+            peer_pid: credentials.pid(),
+            process,
         })
     }
 }
@@ -1497,6 +1530,7 @@ fn snapshot_provider_lease(lease: &ProviderLease) -> Result<LeaseSnapshot, Rescu
         id: lease.id,
         socket,
         pidfd,
+        process: lease.process.try_clone()?,
         deadline: lease.lease_deadline.unwrap_or(lease.handoff_deadline),
         output_obligation: Arc::clone(&lease.output_obligation),
     })
@@ -1509,26 +1543,47 @@ fn wait_for_lease_evidence(
     let mut socket_closed = false;
     let mut process_exited = false;
     loop {
-        let now = Instant::now();
         let output_finalized = lease.output_obligation.finalized.load(Ordering::Acquire);
-        if socket_closed && process_exited && output_finalized {
+        let process_scope_quiescent = lease.process.is_quiescent(process_exited)?;
+        if lease_release_evidence_is_complete(
+            socket_closed,
+            process_exited,
+            output_finalized,
+            process_scope_quiescent,
+        ) {
             return Ok(LeaseWait::Released);
         }
+        let now = Instant::now();
         if now >= deadline {
             return Ok(LeaseWait::Deadline);
         }
         let remaining = deadline.saturating_duration_since(now);
         let slice = remaining.min(ACCEPT_POLL_SLICE);
-        let mut descriptors = [
+        let mut descriptors = vec![
             PollFd::from_borrowed_fd(lease.socket.as_fd(), PollFlags::HUP | PollFlags::RDHUP),
             PollFd::from_borrowed_fd(lease.pidfd.as_fd(), PollFlags::IN),
         ];
+        if !process_scope_quiescent && let Some(events) = lease.process.events() {
+            // cgroup.events reports population changes with POLLPRI. On
+            // systemd 257 a collected cgroup reports POLLERR, never POLLHUP;
+            // the error is accepted only through the qualified ENODEV proof.
+            descriptors.push(PollFd::from_borrowed_fd(
+                events,
+                PollFlags::PRI | PollFlags::ERR,
+            ));
+        }
         match poll(&mut descriptors, Some(&duration_to_timespec(slice))) {
             Ok(_) => {
                 let socket_events = descriptors[0].revents();
                 let process_events = descriptors[1].revents();
+                let process_scope_events = descriptors.get(2).map(PollFd::revents);
                 if socket_events.intersects(PollFlags::ERR | PollFlags::NVAL)
                     || process_events.intersects(PollFlags::ERR | PollFlags::NVAL)
+                {
+                    return Err(RescueVaultDaemonError::ProtocolFailure);
+                }
+                if process_scope_events
+                    .is_some_and(|events| events.intersects(PollFlags::HUP | PollFlags::NVAL))
                 {
                     return Err(RescueVaultDaemonError::ProtocolFailure);
                 }
@@ -1537,11 +1592,28 @@ fn wait_for_lease_evidence(
                 // evidence.
                 socket_closed |= socket_events.contains(PollFlags::HUP);
                 process_exited |= process_events.contains(PollFlags::IN);
+                if process_scope_events.is_some_and(|events| events.contains(PollFlags::ERR))
+                    && !lease.process.is_quiescent(process_exited)?
+                {
+                    // POLLERR is the qualified systemd-GC signal only when
+                    // the retained ENODEV and named-path proof agrees. Do not
+                    // spin on an unexplained permanently-ready error bit.
+                    return Err(RescueVaultDaemonError::ProtocolFailure);
+                }
             }
             Err(error) if error == rustix::io::Errno::INTR => {}
             Err(_) => return Err(RescueVaultDaemonError::ProtocolFailure),
         }
     }
+}
+
+fn lease_release_evidence_is_complete(
+    socket_closed: bool,
+    process_exited: bool,
+    output_finalized: bool,
+    process_scope_quiescent: bool,
+) -> bool {
+    socket_closed && process_exited && output_finalized && process_scope_quiescent
 }
 
 #[cfg(test)]
@@ -1796,7 +1868,7 @@ impl Supervisor {
             let version = self.snapshot().version;
             return (version, HandlerResult::Error(request, ErrorToken::IoFailed));
         }
-        let candidate = match connection.lease_candidate() {
+        let candidate = match connection.lease_candidate(provider_process_scope(request.role())) {
             Ok(candidate) => candidate,
             Err(_) => {
                 return (
@@ -2679,6 +2751,10 @@ impl Supervisor {
             || !socket_client_is_live(candidate.socket.as_fd())
             || lease_pid_exited(candidate.pidfd.as_fd())
                 .map_err(|_| (version, ErrorToken::RebootRequired))?
+            || candidate
+                .process
+                .verify_initial_peer(candidate.peer_pid)
+                .is_err()
         {
             return Err((version, ErrorToken::IoFailed));
         }
@@ -2697,6 +2773,10 @@ impl Supervisor {
             || !socket_client_is_live(candidate.socket.as_fd())
             || lease_pid_exited(candidate.pidfd.as_fd())
                 .map_err(|_| (version, ErrorToken::RebootRequired))?
+            || candidate
+                .process
+                .verify_initial_peer(candidate.peer_pid)
+                .is_err()
         {
             return Err((version, ErrorToken::IoFailed));
         }
@@ -2716,6 +2796,8 @@ impl Supervisor {
             id: lease_id,
             socket: candidate.socket,
             pidfd: candidate.pidfd,
+            peer_pid: candidate.peer_pid,
+            process: candidate.process,
             state: LeaseState::Pending,
             handoff_deadline,
             lease_deadline: None,
@@ -2825,9 +2907,13 @@ impl Supervisor {
             || !socket_client_is_live(lease.socket.as_fd())
             || pid_exited;
         if cancel_without_secret {
+            // Pending has never requested a credential descriptor. This is a
+            // definite-no-secret cancellation, not release of an issued
+            // process-scope lease.
             leases.active.take();
             return Ok(PotentialIssue::CancelledBeforeSecret);
         }
+        lease.process.verify_initial_peer(lease.peer_pid)?;
         let output_obligation = Arc::new(LeaseOutputState {
             finalized: AtomicBool::new(false),
         });
@@ -2860,6 +2946,8 @@ impl Supervisor {
         }
         match leases.active.as_ref() {
             Some(lease) if lease.id == lease_id && lease.state == LeaseState::Pending => {
+                // Pending is removable without process termination because no
+                // provider descriptor has been requested or transferred.
                 leases.active.take();
                 Ok(PendingCancel::CancelledHere(state.version))
             }
@@ -2953,6 +3041,8 @@ impl Supervisor {
         {
             return Err(RescueVaultDaemonError::PersistentFault);
         }
+        // The worker returned an authenticated Unconfigured response with no
+        // descriptor and the false-issued output obligation is finalized.
         leases.active.take();
         Ok(Some(state.version))
     }
@@ -3010,6 +3100,7 @@ impl Supervisor {
             drop(decision);
             return Ok(DescriptorSend::RevocationRequired(snapshot));
         }
+        lease.process.verify_initial_peer(lease.peer_pid)?;
         lease.lease_deadline = Some(
             Instant::now()
                 .checked_add(PROVIDER_LEASE_TIMEOUT)
@@ -3198,14 +3289,18 @@ impl Supervisor {
         &self,
         snapshot: LeaseSnapshot,
     ) -> Result<(), RescueVaultDaemonError> {
+        // Kill the complete delegated unit tree first. The pidfd signal stays
+        // as an independent defense for the authenticated peer itself.
+        let tree_kill_ok = snapshot.process.kill_all().is_ok();
         let already_exited = lease_pid_exited(snapshot.pidfd.as_fd())?;
         let signal_result = if already_exited {
             Ok(())
         } else {
             pidfd_send_signal(&snapshot.pidfd, ProcessSignal::KILL)
         };
-        // ESRCH is only provisionally acceptable here. The dual wait below
-        // must still prove pidfd POLLIN as well as full peer-socket HUP.
+        // ESRCH is only provisionally acceptable here. The wait below must
+        // still prove pidfd POLLIN, full peer-socket HUP, output finalization,
+        // and whole-tree quiescence.
         let signal_ok = signal_result.is_ok()
             || signal_result
                 .as_ref()
@@ -3237,7 +3332,7 @@ impl Supervisor {
             Some(_) => return Err(RescueVaultDaemonError::ShutdownFailed),
             None => {}
         }
-        if signal_ok {
+        if tree_kill_ok && signal_ok {
             Ok(())
         } else {
             Err(RescueVaultDaemonError::ShutdownFailed)
@@ -3818,6 +3913,18 @@ fn external_operation_is_enabled(
         kernaid_protocol::rescue_vault::PeerRole::Agent(
             AgentRole::Application | AgentRole::Codex,
         ) => false,
+    }
+}
+
+fn provider_process_scope(role: kernaid_protocol::rescue_vault::PeerRole) -> ProcessScope {
+    match role {
+        kernaid_protocol::rescue_vault::PeerRole::Agent(AgentRole::OpenAi) => {
+            ProcessScope::CgroupTree
+        }
+        kernaid_protocol::rescue_vault::PeerRole::Companion
+        | kernaid_protocol::rescue_vault::PeerRole::Agent(
+            AgentRole::Application | AgentRole::Codex,
+        ) => ProcessScope::DirectPeer,
     }
 }
 
@@ -4551,6 +4658,10 @@ mod tests {
         PostScmPreLocalDrop,
     }
 
+    fn direct_peer_boundary() -> ProviderProcessBoundary {
+        ProviderProcessBoundary::direct_peer()
+    }
+
     fn install_output_obligated_lease(
         supervisor: &Supervisor,
     ) -> (LeaseOutputGuard, OwnedFd, std::process::Child) {
@@ -4580,6 +4691,8 @@ mod tests {
             id: 1,
             socket: observer,
             pidfd,
+            peer_pid: pid.as_raw_pid(),
+            process: direct_peer_boundary(),
             state: LeaseState::PotentiallyIssued,
             handoff_deadline: Instant::now() + PROVIDER_BORROW_TIMEOUT,
             lease_deadline: None,
@@ -5904,6 +6017,17 @@ mod tests {
                     "disabled {role:?} role reached {operation:?}"
                 );
             }
+        }
+        assert_eq!(
+            provider_process_scope(PeerRole::Agent(AgentRole::OpenAi)),
+            ProcessScope::CgroupTree
+        );
+        for role in [
+            PeerRole::Companion,
+            PeerRole::Agent(AgentRole::Application),
+            PeerRole::Agent(AgentRole::Codex),
+        ] {
+            assert_eq!(provider_process_scope(role), ProcessScope::DirectPeer);
         }
     }
 
@@ -7326,8 +7450,9 @@ mod tests {
         .expect("pending lease socketpair");
         let pending_connection = ClientConnection::LeaseTestSocket(pending_server.as_fd());
         let pending_candidate = pending_connection
-            .lease_candidate()
+            .lease_candidate(ProcessScope::CgroupTree)
             .expect("pending lease candidate");
+        assert_eq!(pending_candidate.process.scope(), ProcessScope::DirectPeer);
         let (_, pending_id) = supervisor
             .begin_provider_borrow(
                 50,
@@ -7367,6 +7492,8 @@ mod tests {
             id: 1,
             socket,
             pidfd,
+            peer_pid: rustix::process::getpid().as_raw_pid(),
+            process: direct_peer_boundary(),
             state: LeaseState::Established,
             handoff_deadline: Instant::now() + PROVIDER_BORROW_TIMEOUT,
             lease_deadline: Some(Instant::now() + PROVIDER_LEASE_TIMEOUT),
@@ -7400,7 +7527,7 @@ mod tests {
                 .expect("lease registry")
                 .active
                 .is_some(),
-            "a Revoking lease is removed only by triple-factor revocation"
+            "a Revoking lease is removed only by four-factor revocation"
         );
     }
 
@@ -7427,6 +7554,7 @@ mod tests {
             id: 1,
             socket: observer,
             pidfd,
+            process: direct_peer_boundary(),
             deadline: first_deadline,
             output_obligation: Arc::new(LeaseOutputState {
                 finalized: AtomicBool::new(true),
@@ -7443,5 +7571,25 @@ mod tests {
             wait_for_lease_evidence(&snapshot, final_deadline),
             Ok(LeaseWait::Released)
         );
+    }
+
+    #[test]
+    fn lease_release_requires_socket_pid_output_and_whole_tree_quiescence() {
+        assert!(lease_release_evidence_is_complete(true, true, true, true));
+        for incomplete in [
+            (false, true, true, true),
+            (true, false, true, true),
+            (true, true, false, true),
+            // The authenticated peer may have exited while an inherited-key
+            // descendant still populates the delegated service tree.
+            (true, true, true, false),
+        ] {
+            assert!(!lease_release_evidence_is_complete(
+                incomplete.0,
+                incomplete.1,
+                incomplete.2,
+                incomplete.3
+            ));
+        }
     }
 }

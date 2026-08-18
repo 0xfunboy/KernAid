@@ -185,6 +185,8 @@ class RescueOpenAiExecutorPackagingTests(unittest.TestCase):
                 "LimitCORE": "0",
                 "LimitNOFILE": "16",
                 "TasksMax": "1",
+                "Delegate": "pids",
+                "DelegateSubgroup": "agent",
                 "KillMode": "control-group",
                 "SendSIGKILL": "yes",
                 "NoNewPrivileges": "yes",
@@ -476,6 +478,9 @@ class RescueOpenAiExecutorPackagingTests(unittest.TestCase):
         self.assertEqual(lease["Group"], "kernaid-openai")
         self.assertEqual(lease["SupplementaryGroups"], "kernaid-vault")
         self.assertEqual(lease["TasksMax"], "1")
+        self.assertEqual(lease["Delegate"], "pids")
+        self.assertEqual(lease["DelegateSubgroup"], "agent")
+        self.assertEqual(lease["ProtectControlGroups"], "yes")
         self.assertEqual(lease["PrivateNetwork"], "yes")
         self.assertEqual(lease["RestrictAddressFamilies"], "AF_UNIX")
         self.assertEqual(lease["CapabilityBoundingSet"], "")
@@ -495,6 +500,8 @@ class RescueOpenAiExecutorPackagingTests(unittest.TestCase):
         self.assertEqual(status["RestrictAddressFamilies"], "AF_UNIX")
         self.assertEqual(status["CapabilityBoundingSet"], "")
         self.assertEqual(status["AmbientCapabilities"], "")
+        self.assertNotIn("Delegate", status)
+        self.assertNotIn("DelegateSubgroup", status)
         self.assertEqual(
             status["InaccessiblePaths"],
             "/run/kernaid-rescue-openai-egress.sock /run/kernaid-rescue-vault.sock",
@@ -514,6 +521,8 @@ class RescueOpenAiExecutorPackagingTests(unittest.TestCase):
         self.assertEqual(kill["SupplementaryGroups"], "")
         self.assertEqual(kill["CapabilityBoundingSet"], "")
         self.assertEqual(kill["AmbientCapabilities"], "")
+        self.assertNotIn("Delegate", kill)
+        self.assertNotIn("DelegateSubgroup", kill)
         self.assertIn(
             "ConditionPathExists=/run/kernaid-rescue-vault/lifecycle-active-v1",
             section_lines(LEASE_KILL_SERVICE, "Unit"),
@@ -619,6 +628,23 @@ class RescueOpenAiExecutorPackagingTests(unittest.TestCase):
         production_server = server[: server.index("\n#[cfg(test)]\nmod tests")]
         self.assertNotIn("pidfd_open", production_server)
         self.assertIn("provider_lease", server)
+        for value in (
+            "ProcessScope::CgroupTree",
+            "ProviderProcessBoundary",
+            "PROVIDER_UNIT_ROOT_AGENT_CONTROLS",
+            "PROVIDER_SUBGROUP_AGENT_CONTROLS",
+            'validate_provider_root_control_file(&kill, &root, 0o200)',
+            'open_cgroup_file(&root, "cgroup.kill", OFlags::WRONLY)',
+            "PollFlags::PRI | PollFlags::ERR",
+            "garbage_collection_evidence_is_terminal",
+            "retained_events_nodev",
+            "retained_kill_nodev",
+            "lease_release_evidence_is_complete",
+        ):
+            self.assertIn(value, server + runtime)
+        self.assertNotIn(
+            "validate_cgroup_directory(&root, Some(&parent))", runtime
+        )
 
         service = unit_sections(EXECUTOR_SERVICE)["Service"]
         self.assertEqual(service["PrivateNetwork"], "yes")
