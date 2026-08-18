@@ -217,19 +217,137 @@ class VaultSystemdPackagingTests(unittest.TestCase):
         self.assertIn('const LISTENER_GROUP_NAME: &[u8] = b"kernaid-vault";', server)
         self.assertIn('const RUNTIME_ROOT_NAME: &str = "kernaid-rescue-vault";', runtime)
 
-    def test_global_readiness_waits_for_authenticated_daemon_ready(self) -> None:
+    def test_global_readiness_runs_after_failed_dependencies_to_report_not_ready(self) -> None:
         sections = unit_sections(READY_SERVICE)
         unit = sections["Unit"]
         self.assertEqual(
-            set(unit["Requires"].split()),
+            set(unit["Wants"].split()),
             {
                 "kernaid-ui.service",
                 "kernaid-rescue-openai-egress.socket",
                 "kernaid-rescue-vaultd.service",
             },
         )
-        self.assertIn("kernaid-rescue-openai-egress.socket", unit["After"].split())
-        self.assertIn("kernaid-rescue-vaultd.service", unit["After"].split())
+        self.assertNotIn("Requires", unit)
+        self.assertEqual(
+            set(unit["After"].split()),
+            {
+                "multi-user.target",
+                "kernaid-ui.service",
+                "kernaid-rescue-openai-egress.socket",
+                "kernaid-rescue-vaultd.service",
+            },
+        )
+        self.assertEqual(
+            sections["Service"]["ExecStart"],
+            "/bin/sh /usr/lib/kernaid/ready-check",
+        )
+        self.assertIn(
+            "printf '\\nKERNAID_RESCUE_NOT_READY: %s\\n' \"$*\" >/dev/ttyS0",
+            READY_CHECK.read_text(encoding="utf-8"),
+        )
+
+    def test_vault_startup_status_is_fixed_bounded_and_stage_ordered(self) -> None:
+        ready = READY_CHECK.read_text(encoding="utf-8")
+        server = DAEMON_SERVER.read_text(encoding="utf-8")
+        prefix = "KERNAID_RESCUE_VAULT_STARTUP_V1 stage="
+        stages = (
+            "identity",
+            "listener",
+            "runtime",
+            "rng",
+            "worker-cgroup",
+            "worker-bootstrap",
+            "worker-caps",
+            "worker-probe",
+            "caps-final",
+            "ready",
+        )
+
+        self.assertIn(
+            "/usr/bin/timeout --signal=TERM --kill-after=1s 5s \\\n"
+            "            /usr/bin/systemctl show --property=StatusText --value \\\n"
+            "            kernaid-rescue-vaultd.service 2>/dev/null \\\n"
+            "            | /usr/bin/head -c 65",
+            ready,
+        )
+        self.assertIn(
+            '"$(printf \'\\n.\')")\n'
+            '            fail "vault lifecycle daemon startup stage is unavailable"',
+            ready,
+        )
+        for stage in stages:
+            self.assertIn(
+                f'"$(printf \'{prefix}{stage}\\n.\')")',
+                ready,
+            )
+            self.assertIn(
+                f'fail "vault lifecycle daemon last reported startup stage {stage}"',
+                ready,
+            )
+            self.assertIn(
+                f'b"STATUS={prefix}{stage}"',
+                server,
+            )
+        self.assertIn(
+            'fail "vault lifecycle daemon startup stage is unavailable"',
+            ready,
+        )
+        self.assertNotRegex(
+            ready,
+            r'fail\s+"vault lifecycle daemon (?:startup|last reported)[^"\n]*\$',
+        )
+
+        run_start = server.index("pub(super) fn run(companion_uid:")
+        worker_start = server.index("\nfn start_worker(", run_start)
+        run_source = server[run_start:worker_start]
+        run_order = (
+            "enforce_process_privacy()",
+            "SystemdNotifier::from_environment()?",
+            "spawn_signal_waiter(signal_set, stop.clone())?",
+            "note_startup_stage(StartupStage::Identity)",
+            "validated_peer_allowlist(companion_uid)?",
+            "note_startup_stage(StartupStage::Listener)",
+            "take_listener()?",
+            "note_startup_stage(StartupStage::Runtime)",
+            "DaemonRuntime::open()?",
+            "note_startup_stage(StartupStage::Rng)",
+            "state_version_seed()?",
+            "start_worker(",
+            "startup_stage_can_advance(disposition, startup_fault)",
+            "note_startup_stage(StartupStage::CapsFinal)",
+            "let capabilities_ready =",
+            "note_startup_stage(StartupStage::Ready)",
+            "startup_readiness(",
+        )
+        positions = [run_source.index(fragment) for fragment in run_order]
+        self.assertEqual(positions, sorted(positions))
+
+        worker_end = server.index("\nfn cancel_startup_worker(", worker_start)
+        worker_source = server[worker_start:worker_end]
+        for stage, phase in (
+            ("WorkerCgroup", "WorkerCgroup::prepare()"),
+            ("WorkerBootstrap", "WorkerHandle::spawn("),
+            ("WorkerCaps", "runtime::narrow_supervisor_capabilities()"),
+            ("WorkerProbe", "worker.transact_cancellable("),
+        ):
+            self.assertLess(
+                worker_source.index(f"note_startup_stage(StartupStage::{stage})"),
+                worker_source.index(phase),
+            )
+        self.assertIn("notifier: &SystemdNotifier", worker_source)
+        self.assertIn(
+            "if startup_stage_can_advance {\n"
+            "        notifier.note_startup_stage(StartupStage::CapsFinal);\n"
+            "    }",
+            run_source,
+        )
+        self.assertIn(
+            "if startup_stage_can_advance {\n"
+            "        notifier.note_startup_stage(StartupStage::Ready);\n"
+            "    }",
+            run_source,
+        )
 
     def test_runtime_ownership_does_not_tmpfiles_manage_the_fault_marker(self) -> None:
         self.assertEqual(active_lines(TMPFILES), ["d /run/kernaid 0700 root root -"])

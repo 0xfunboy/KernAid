@@ -530,6 +530,10 @@ terminate_qemu_bounded() {
   fi
 }
 
+rescue_not_ready_observed() {
+  LC_ALL=C grep -aq '^KERNAID_RESCUE_NOT_READY:' "$log"
+}
+
 # shellcheck disable=SC2329  # Invoked indirectly by the EXIT trap below.
 # This callback is reached indirectly through the EXIT trap below.
 # shellcheck disable=SC2317
@@ -797,11 +801,23 @@ if ! release_qemu_start_gate; then
 fi
 qemu_deadline=$((SECONDS + boot_timeout_seconds))
 while ((SECONDS < qemu_deadline)); do
+  if rescue_not_ready_observed; then
+    if ! terminate_qemu_bounded; then
+      echo "QEMU could not be stopped after the not-ready marker" >&2
+      exit 1
+    fi
+    echo "Rescue guest reported a not-ready marker" >&2
+    exit 1
+  fi
   if grep -q "KERNAID_RESCUE_READY" "$log" \
     && grep -q "KERNAID_RESCUE_TARGET_SELECTION_READY" "$log" \
     && grep -q "KERNAID_RESCUE_OFFLINE_INSPECTION_READY" "$log"; then
     if ! terminate_qemu_bounded; then
       echo "QEMU could not be stopped before target-image validation" >&2
+      exit 1
+    fi
+    if rescue_not_ready_observed; then
+      echo "Rescue guest reported a not-ready marker" >&2
       exit 1
     fi
     target_hash_after="$(sha256sum "$target_image" | awk '{print $1}')"
@@ -841,6 +857,10 @@ while ((SECONDS < qemu_deadline)); do
       exit 1
     }
     status="$qemu_last_status"
+    if rescue_not_ready_observed; then
+      echo "Rescue guest reported a not-ready marker" >&2
+      exit 1
+    fi
     cat "$log"
     echo "QEMU exited before both Rescue readiness markers (status $status)" >&2
     exit 1
@@ -850,6 +870,14 @@ while ((SECONDS < qemu_deadline)); do
   fi
   sleep 1
 done
+if ! terminate_qemu_bounded; then
+  echo "QEMU could not be stopped after the readiness timeout" >&2
+  exit 1
+fi
+if rescue_not_ready_observed; then
+  echo "Rescue guest reported a not-ready marker" >&2
+  exit 1
+fi
 tail -n 200 "$log"
 echo "The required Rescue readiness markers were not both observed within $boot_timeout_seconds seconds" >&2
 exit 1

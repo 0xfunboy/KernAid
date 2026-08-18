@@ -16,6 +16,7 @@ import sys
 import tempfile
 import threading
 import time
+import tty
 import unittest
 from collections.abc import Iterator
 from pathlib import Path
@@ -416,6 +417,205 @@ exec /bin/bash --noprofile --norc -i
                 controller.wipe(credential)
                 controller.wipe(scripted.credential)
                 scripted.capture.wipe()
+
+    def test_real_pty_not_ready_precedes_ready_without_exposing_reason(self) -> None:
+        master, slave = os.openpty()
+        tty.setraw(slave)
+        credential = bytearray(synthetic_login_credential())
+        capture = controller.BoundedCapture(4096, [credential])
+        console = controller.SerialConsole(slave, capture, lambda: None)
+        private_reason = b"private-reason=must-not-escape"
+        try:
+            os.write(
+                master,
+                b"midline KERNAID_RESCUE_NOT_READY: decoy\r\n"
+                + controller.READY_LINE
+                + b"\r\n"
+                + controller.NOT_READY_LINE_PREFIX
+                + b" "
+                + private_reason
+                + b"\r\n",
+            )
+            with self.assertRaises(controller.ClosedFailure) as failure:
+                controller.establish_live_session(
+                    console, time.monotonic() + 2.0, credential
+                )
+            self.assertEqual(
+                (failure.exception.stage, failure.exception.code),
+                ("readiness", "not-ready"),
+            )
+            self.assertNotIn(
+                private_reason.decode("ascii"), str(failure.exception)
+            )
+            self.assertIsNone(
+                controller.NOT_READY_PREFIX_PATTERN.search(
+                    b"midline " + controller.NOT_READY_LINE_PREFIX
+                )
+            )
+        finally:
+            console.close()
+            os.close(master)
+            controller.wipe(credential)
+            capture.wipe()
+
+    def test_real_pty_ready_then_not_ready_aborts_a_completable_login(self) -> None:
+        import select
+
+        master, slave = os.openpty()
+        tty.setraw(slave)
+        credential = bytearray(synthetic_login_credential())
+        capture = controller.BoundedCapture(8192, [credential])
+        console = controller.SerialConsole(slave, capture, lambda: None)
+        private_reason = b"private-reason=must-not-escape"
+        responder_errors: list[str] = []
+
+        def read_line(timeout: float) -> bytes | None:
+            deadline = time.monotonic() + timeout
+            received = bytearray()
+            while time.monotonic() < deadline:
+                readable, _, _ = select.select(
+                    [master], [], [], max(0.0, deadline - time.monotonic())
+                )
+                if not readable:
+                    continue
+                chunk = os.read(master, 4096)
+                if not chunk:
+                    return None
+                received.extend(chunk)
+                if b"\n" in received:
+                    return bytes(received)
+            return None
+
+        def complete_login_if_controller_continues() -> None:
+            try:
+                os.write(master, controller.READY_LINE + b"\r\n")
+                if read_line(1.0) is None:
+                    responder_errors.append("ready-not-consumed")
+                    return
+                os.write(
+                    master,
+                    controller.NOT_READY_LINE_PREFIX
+                    + b" "
+                    + private_reason
+                    + b"\r\n",
+                )
+                os.write(master, b"kernaid-rescue login: ")
+                if read_line(0.25) is None:
+                    return
+                os.write(master, b"\r\nPassword: ")
+                if read_line(0.25) is None:
+                    return
+                os.write(master, b"\r\nkernaid@kernaid-rescue:~$ ")
+                if read_line(0.25) is None:
+                    return
+                os.write(
+                    master,
+                    b"\r\n" + controller.LOGIN_OK_LINE + b"\r\n",
+                )
+            except BaseException:
+                responder_errors.append("responder-failed")
+
+        responder = threading.Thread(target=complete_login_if_controller_continues)
+        responder.start()
+        try:
+            with self.assertRaises(controller.ClosedFailure) as failure:
+                controller.establish_live_session(
+                    console, time.monotonic() + 3.0, credential
+                )
+            self.assertEqual(
+                (failure.exception.stage, failure.exception.code),
+                ("readiness", "not-ready"),
+            )
+            self.assertNotIn(private_reason.decode("ascii"), str(failure.exception))
+        finally:
+            responder.join(2.0)
+            console.close()
+            os.close(master)
+            controller.wipe(credential)
+            capture.wipe()
+        self.assertFalse(responder.is_alive())
+        self.assertEqual(responder_errors, [])
+
+    def test_wait_regex_retains_overlap_and_prioritizes_queued_not_ready(self) -> None:
+        master, slave = os.openpty()
+        tty.setraw(slave)
+        capture = controller.BoundedCapture(4096, [])
+        console = controller.SerialConsole(slave, capture, lambda: None)
+        private_reason = b"private-reason=must-not-escape"
+        split = len(controller.NOT_READY_LINE_PREFIX) - 5
+        prefix_part = controller.NOT_READY_LINE_PREFIX[:split]
+        suffix_part = controller.NOT_READY_LINE_PREFIX[split:]
+        target = b"KERNAID_TEST_REQUESTED_MATCH_V1"
+        try:
+            os.write(master, b"x" * 128 + b"\r\n" + prefix_part)
+            partial = console.wait_regex(
+                re.compile(re.escape(prefix_part) + rb"$"),
+                start=0,
+                deadline=time.monotonic() + 1.0,
+                stage="partial",
+            )
+            self.assertGreater(partial.start(), controller.NOT_READY_SCAN_OVERLAP)
+            os.write(
+                master,
+                suffix_part
+                + b" "
+                + private_reason
+                + b"\r\n"
+                + target
+                + b"\r\n",
+            )
+            with self.assertRaises(controller.ClosedFailure) as failure:
+                console.wait_line(
+                    target,
+                    start=partial.end(),
+                    deadline=time.monotonic() + 1.0,
+                    stage="requested",
+                )
+            self.assertEqual(
+                (failure.exception.stage, failure.exception.code),
+                ("readiness", "not-ready"),
+            )
+            self.assertNotIn(private_reason.decode("ascii"), str(failure.exception))
+        finally:
+            console.close()
+            os.close(master)
+            capture.wipe()
+
+    def test_wait_regex_drains_queued_not_ready_before_a_captured_match(self) -> None:
+        import select
+
+        master, slave = os.openpty()
+        tty.setraw(slave)
+        private_reason = b"private-reason=must-not-escape"
+        capture = controller.BoundedCapture(4096, [])
+        capture.append(controller.READY_LINE + b"\r\n")
+        console = controller.SerialConsole(slave, capture, lambda: None)
+        try:
+            os.write(
+                master,
+                controller.NOT_READY_LINE_PREFIX
+                + b" "
+                + private_reason
+                + b"\r\n",
+            )
+            readable, _, _ = select.select([slave], [], [], 1.0)
+            self.assertEqual(readable, [slave])
+            with self.assertRaises(controller.ClosedFailure) as failure:
+                console.wait_regex(
+                    controller.READY_RESULT_PATTERN,
+                    start=0,
+                    deadline=time.monotonic() + 1.0,
+                    stage="requested",
+                )
+            self.assertEqual(
+                (failure.exception.stage, failure.exception.code),
+                ("readiness", "not-ready"),
+            )
+            self.assertNotIn(private_reason.decode("ascii"), str(failure.exception))
+        finally:
+            console.close()
+            os.close(master)
+            capture.wipe()
 
     def test_real_login_fails_if_password_is_echoed_in_prompt_window(self) -> None:
         credential = bytearray(synthetic_login_credential())

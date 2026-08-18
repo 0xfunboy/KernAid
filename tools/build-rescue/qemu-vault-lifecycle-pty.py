@@ -55,6 +55,7 @@ LO_FLAGS_AUTOCLEAR = 4
 LOOP_INFO64 = struct.Struct("=QQQQQIIII64s64s32sQQ")
 
 READY_LINE = b"KERNAID_RESCUE_READY"
+NOT_READY_LINE_PREFIX = b"KERNAID_RESCUE_NOT_READY:"
 LOGIN_OK_LINE = b"KERNAID_VAULT_LOGIN_V1 uid=1000 user=kernaid group=true"
 LOGIN_FAIL_LINE = b"KERNAID_VAULT_LOGIN_V1 invalid=true"
 # Interactive Bash places this one bracketed-paste disable sequence between an
@@ -63,6 +64,17 @@ LOGIN_FAIL_LINE = b"KERNAID_VAULT_LOGIN_V1 invalid=true"
 BRACKETED_PASTE_DISABLE_PREFIX = b"\x1b[?2004l\r"
 _TRUSTED_SHELL_MARKER_START = (
     rb"(?:^|\r?\n)(?:" + re.escape(BRACKETED_PASTE_DISABLE_PREFIX) + rb")?"
+)
+NOT_READY_PREFIX_PATTERN = re.compile(
+    rb"(?:^|\r?\n)" + re.escape(NOT_READY_LINE_PREFIX)
+)
+NOT_READY_SCAN_OVERLAP = len(NOT_READY_LINE_PREFIX) + 2
+READY_RESULT_PATTERN = re.compile(
+    rb"(?:^|\r?\n)(?:"
+    + re.escape(READY_LINE)
+    + rb"|kernaid-rescue login: "
+    + re.escape(READY_LINE)
+    + rb")\r?\n"
 )
 LOGIN_RESULT_PATTERN = re.compile(
     _TRUSTED_SHELL_MARKER_START
@@ -1717,6 +1729,7 @@ class SerialConsole:
         self._health = health
         self._selector = selectors.DefaultSelector()
         self._selector.register(fd, selectors.EVENT_READ)
+        self._not_ready_scan_start = 0
 
     def send(self, value: bytes | bytearray, *, deadline: float) -> None:
         offset = 0
@@ -1749,7 +1762,9 @@ class SerialConsole:
     ) -> re.Match[bytes]:
         while True:
             self._health()
+            self._drain_immediately_available()
             snapshot = self.capture.snapshot()
+            self._raise_if_not_ready(snapshot)
             match = pattern.search(snapshot, start)
             if match is not None:
                 return match
@@ -1758,10 +1773,16 @@ class SerialConsole:
             events = self._selector.select(min(0.1, max(0.0, deadline - time.monotonic())))
             if not events:
                 continue
+
+    def _drain_immediately_available(self) -> None:
+        while self._selector.select(0):
+            self._health()
             try:
                 chunk = os.read(self.fd, 4096)
-            except BlockingIOError:
+            except InterruptedError:
                 continue
+            except BlockingIOError:
+                return
             except OSError as error:
                 if error.errno == errno.EIO:
                     raise ClosedFailure("serial", "closed") from error
@@ -1774,6 +1795,11 @@ class SerialConsole:
                 raise ClosedFailure("serial", "secret-exposure") from error
             except CaptureLimitError as error:
                 raise ClosedFailure("serial", "oversized") from error
+
+    def _raise_if_not_ready(self, snapshot: bytes) -> None:
+        if NOT_READY_PREFIX_PATTERN.search(snapshot, self._not_ready_scan_start) is not None:
+            raise ClosedFailure("readiness", "not-ready")
+        self._not_ready_scan_start = max(0, len(snapshot) - NOT_READY_SCAN_OVERLAP)
 
     def wait_line(self, line: bytes, *, start: int, deadline: float, stage: str) -> int:
         return self.wait_regex(
@@ -2003,13 +2029,7 @@ def establish_live_session(
     console: SerialConsole, aggregate: float, login_credential: bytearray
 ) -> int:
     ready = console.wait_regex(
-        re.compile(
-            rb"(?:^|\r?\n)(?:"
-            + re.escape(READY_LINE)
-            + rb"|kernaid-rescue login: "
-            + re.escape(READY_LINE)
-            + rb")\r?\n"
-        ),
+        READY_RESULT_PATTERN,
         start=0,
         deadline=_deadline(aggregate, READINESS_TIMEOUT_SECONDS),
         stage="readiness",
@@ -2252,7 +2272,14 @@ def run_companion(
                     end_match.end(),
                     aggregate,
                 )
-            except (ClosedFailure, CaptureLimitError):
+            except ClosedFailure as diagnostic_error:
+                if (
+                    diagnostic_error.stage == "readiness"
+                    and diagnostic_error.code == "not-ready"
+                ):
+                    raise
+                reason = "diagnostic-unavailable"
+            except CaptureLimitError:
                 reason = "diagnostic-unavailable"
             raise ClosedFailure(
                 stage, f"response-{error.code}-{reason}"

@@ -344,7 +344,8 @@ class MockToolchain:
             r"""
             #!/usr/bin/env bash
             printf '%s\n' "$$" >"$KERNAID_MOCK_STATE_DIR/qemu-pid"
-            if [[ "${KERNAID_MOCK_QEMU_IGNORE_TERM:-0}" == "1" ]]; then
+            if [[ "${KERNAID_MOCK_QEMU_IGNORE_TERM:-0}" == "1" \
+              || "${KERNAID_MOCK_QEMU_NOT_READY:-0}" == "1" ]]; then
               exec /usr/bin/python3 -c '
 import os
 import signal
@@ -356,6 +357,8 @@ def observe_term(_signal, _frame):
     open(os.path.join(state, "qemu-term-observed"), "ab").close()
 
 signal.signal(signal.SIGTERM, observe_term)
+if os.environ.get("KERNAID_MOCK_QEMU_NOT_READY") == "1":
+    print("KERNAID_RESCUE_NOT_READY: private-reason=must-not-escape", flush=True)
 print("KERNAID_RESCUE_READY", flush=True)
 print("KERNAID_RESCUE_TARGET_SELECTION_READY", flush=True)
 time.sleep(30)
@@ -519,6 +522,7 @@ class QemuUsbVaultSmokeTests(unittest.TestCase):
         profile_failure: str = "",
         initialize_failure: str = "none",
         qemu_ignore_term: bool = False,
+        qemu_not_ready: bool = False,
     ) -> tuple[
         subprocess.CompletedProcess[str],
         Path,
@@ -545,6 +549,9 @@ class QemuUsbVaultSmokeTests(unittest.TestCase):
                 "KERNAID_MOCK_INITIALIZE_FAILURE": initialize_failure,
                 "KERNAID_MOCK_QEMU_IGNORE_TERM": (
                     "1" if qemu_ignore_term else "0"
+                ),
+                "KERNAID_MOCK_QEMU_NOT_READY": (
+                    "1" if qemu_not_ready else "0"
                 ),
                 "KERNAID_USB_SMOKE_LOG": str(log),
             }
@@ -573,6 +580,28 @@ class QemuUsbVaultSmokeTests(unittest.TestCase):
         self.assertTrue((state / "qemu-term-observed").exists())
         qemu_pid = int((state / "qemu-pid").read_text(encoding="utf-8"))
         self.assertFalse(Path(f"/proc/{qemu_pid}").exists())
+
+    def test_not_ready_precedes_ready_and_is_killed_reaped_without_reason_leak(
+        self,
+    ) -> None:
+        started = time.monotonic()
+        result, _iso, log, state, temporary = self.run_smoke(qemu_not_ready=True)
+        elapsed = time.monotonic() - started
+        self.addCleanup(temporary.cleanup)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertLess(elapsed, 20)
+        self.assertTrue((state / "qemu-term-observed").exists())
+        qemu_pid = int((state / "qemu-pid").read_text(encoding="utf-8"))
+        self.assertFalse(Path(f"/proc/{qemu_pid}").exists())
+        combined_output = result.stdout + result.stderr
+        self.assertIn("Rescue guest reported a not-ready marker", result.stderr)
+        self.assertNotIn("KERNAID_RESCUE_NOT_READY:", combined_output)
+        self.assertNotIn("private-reason=must-not-escape", combined_output)
+        self.assertNotIn("KERNAID_QEMU_USB_BOOT_READY_V1", combined_output)
+        self.assertNotIn(
+            "private-reason=must-not-escape", log.read_text(encoding="utf-8")
+        )
 
     def test_mocked_lifecycle_emits_catalog_v2_compatible_evidence(self) -> None:
         result, iso, log, state, temporary = self.run_smoke()

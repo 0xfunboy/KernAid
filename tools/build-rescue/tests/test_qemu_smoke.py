@@ -481,7 +481,8 @@ class MockToolchain:
                   ;;
               esac
             done
-            if [[ "${KERNAID_MOCK_QEMU_IGNORE_TERM:-0}" == "1" ]]; then
+            if [[ "${KERNAID_MOCK_QEMU_IGNORE_TERM:-0}" == "1" \
+              || "${KERNAID_MOCK_QEMU_NOT_READY:-0}" == "1" ]]; then
               exec /usr/bin/python3 -c '
 import os
 import signal
@@ -493,6 +494,8 @@ def observe_term(_signal, _frame):
     open(os.path.join(state, "qemu-term-observed"), "wb").close()
 
 signal.signal(signal.SIGTERM, observe_term)
+if os.environ.get("KERNAID_MOCK_QEMU_NOT_READY") == "1":
+    print("KERNAID_RESCUE_NOT_READY: private-reason=must-not-escape", flush=True)
 print("KERNAID_RESCUE_READY", flush=True)
 print("KERNAID_RESCUE_TARGET_SELECTION_READY", flush=True)
 print("KERNAID_RESCUE_OFFLINE_INSPECTION_READY", flush=True)
@@ -550,6 +553,7 @@ class QemuSmokeFixturePrivilegeTests(unittest.TestCase):
         ovmf_directory_mode: str = "755",
         ovmf_directory_symlink: bool = False,
         qemu_ignore_term: bool = False,
+        qemu_not_ready: bool = False,
     ) -> tuple[
         subprocess.CompletedProcess[str], Path, Path, tempfile.TemporaryDirectory[str]
     ]:
@@ -593,7 +597,12 @@ class QemuSmokeFixturePrivilegeTests(unittest.TestCase):
                 "KERNAID_MOCK_CHAIN_UID": str(ovmf_directory_uid),
                 "KERNAID_MOCK_CHAIN_GID": str(ovmf_directory_gid),
                 "KERNAID_MOCK_CHAIN_MODE": ovmf_directory_mode,
-                "KERNAID_MOCK_QEMU_IGNORE_TERM": "1" if qemu_ignore_term else "0",
+                "KERNAID_MOCK_QEMU_IGNORE_TERM": (
+                    "1" if qemu_ignore_term else "0"
+                ),
+                "KERNAID_MOCK_QEMU_NOT_READY": (
+                    "1" if qemu_not_ready else "0"
+                ),
                 "KERNAID_MOCK_OVMF_VARS_TEMPLATE": str(
                     mocks.ovmf
                     / (
@@ -837,6 +846,34 @@ class QemuSmokeFixturePrivilegeTests(unittest.TestCase):
         )
         self.assertFalse(vars_path.exists())
         self.assertIn("PASS: KernAid Rescue booted", result.stdout)
+
+    def test_not_ready_precedes_ready_and_is_killed_reaped_without_reason_leak(
+        self,
+    ) -> None:
+        started = time.monotonic()
+        result, log, state, temporary = self.run_smoke(
+            firmware="uefi", qemu_not_ready=True
+        )
+        elapsed = time.monotonic() - started
+        self.addCleanup(temporary.cleanup)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertLess(elapsed, 15)
+        self.assertTrue((state / "qemu-term-observed").exists())
+        qemu_pid = int((state / "qemu-pid").read_text(encoding="utf-8").strip())
+        self.assertFalse(Path(f"/proc/{qemu_pid}").exists())
+        combined_output = result.stdout + result.stderr
+        self.assertIn("Rescue guest reported a not-ready marker", result.stderr)
+        self.assertNotIn("KERNAID_RESCUE_NOT_READY:", combined_output)
+        self.assertNotIn("private-reason=must-not-escape", combined_output)
+        self.assertNotIn("KERNAID_QEMU_ATTESTATION_V1", combined_output)
+        self.assertIn(
+            "private-reason=must-not-escape", log.read_text(encoding="utf-8")
+        )
+        vars_path = Path(
+            (state / "qemu-ovmf-vars-path").read_text(encoding="utf-8").strip()
+        )
+        self.assertFalse(vars_path.exists())
 
     def test_uefi_accepts_only_the_matching_legacy_code_vars_pair(self) -> None:
         result, _log, state, temporary = self.run_smoke(

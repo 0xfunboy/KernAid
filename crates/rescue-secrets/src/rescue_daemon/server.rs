@@ -60,6 +60,7 @@ const UNLOCK_RATE_LIMIT: Duration = Duration::from_secs(2);
 const CONTROL_SOCKET_PATH: &str = "/run/kernaid-rescue-vault.sock";
 const NOTIFY_SOCKET_ENV: &str = "NOTIFY_SOCKET";
 const READY_NOTIFICATION: &[u8] = b"READY=1";
+const STARTUP_STATUS_PREFIX: &str = "STATUS=KERNAID_RESCUE_VAULT_STARTUP_V1 stage=";
 const UNLOCK_DIAGNOSTIC_PREFIX: &str = "STATUS=KERNAID_RESCUE_VAULT_UNLOCK_DIAGNOSTIC_V1";
 const MAX_UNLOCK_DIAGNOSTIC_BYTES: usize = 192;
 const MAX_NOTIFY_SOCKET_BYTES: usize = 108;
@@ -348,6 +349,39 @@ enum SystemdNotifier {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StartupStage {
+    Identity,
+    Listener,
+    Runtime,
+    Rng,
+    WorkerCgroup,
+    WorkerBootstrap,
+    WorkerCaps,
+    WorkerProbe,
+    CapsFinal,
+    Ready,
+}
+
+impl StartupStage {
+    fn payload(self) -> &'static [u8] {
+        match self {
+            Self::Identity => b"STATUS=KERNAID_RESCUE_VAULT_STARTUP_V1 stage=identity",
+            Self::Listener => b"STATUS=KERNAID_RESCUE_VAULT_STARTUP_V1 stage=listener",
+            Self::Runtime => b"STATUS=KERNAID_RESCUE_VAULT_STARTUP_V1 stage=runtime",
+            Self::Rng => b"STATUS=KERNAID_RESCUE_VAULT_STARTUP_V1 stage=rng",
+            Self::WorkerCgroup => b"STATUS=KERNAID_RESCUE_VAULT_STARTUP_V1 stage=worker-cgroup",
+            Self::WorkerBootstrap => {
+                b"STATUS=KERNAID_RESCUE_VAULT_STARTUP_V1 stage=worker-bootstrap"
+            }
+            Self::WorkerCaps => b"STATUS=KERNAID_RESCUE_VAULT_STARTUP_V1 stage=worker-caps",
+            Self::WorkerProbe => b"STATUS=KERNAID_RESCUE_VAULT_STARTUP_V1 stage=worker-probe",
+            Self::CapsFinal => b"STATUS=KERNAID_RESCUE_VAULT_STARTUP_V1 stage=caps-final",
+            Self::Ready => b"STATUS=KERNAID_RESCUE_VAULT_STARTUP_V1 stage=ready",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum UnlockDiagnosticReason {
     InProgress,
     NonIo,
@@ -496,6 +530,18 @@ impl SystemdNotifier {
         send_readiness_notification(address, deadline)
     }
 
+    fn note_startup_stage(&self, stage: StartupStage) {
+        let Self::Enabled(address) = self else {
+            return;
+        };
+        debug_assert!(
+            stage
+                .payload()
+                .starts_with(STARTUP_STATUS_PREFIX.as_bytes())
+        );
+        let _ = send_notification_once(address, stage.payload());
+    }
+
     fn notify_unlock_by(
         &self,
         reason: UnlockDiagnosticReason,
@@ -563,9 +609,13 @@ pub(super) fn run(companion_uid: u32) -> Result<(), RescueVaultDaemonError> {
     let signal_set = block_termination_signals()?;
     let stop = StopControl::new();
     spawn_signal_waiter(signal_set, stop.clone())?;
+    notifier.note_startup_stage(StartupStage::Identity);
     let allowlist = validated_peer_allowlist(companion_uid)?;
+    notifier.note_startup_stage(StartupStage::Listener);
     let listener = take_listener()?;
+    notifier.note_startup_stage(StartupStage::Runtime);
     let (mut daemon_runtime, disposition) = DaemonRuntime::open()?;
+    notifier.note_startup_stage(StartupStage::Rng);
     let seed = state_version_seed()?;
     let mut parent_capabilities_narrowed = false;
     let mut parent_capability_failure = false;
@@ -573,6 +623,7 @@ pub(super) fn run(companion_uid: u32) -> Result<(), RescueVaultDaemonError> {
     let (worker, availability, startup_fault, untracked_worker_may_remain) = match disposition {
         RuntimeDisposition::PersistentFault => (None, faulted_availability(), true, false),
         RuntimeDisposition::Ready => match start_worker(
+            &notifier,
             &stop,
             &mut parent_capabilities_narrowed,
             &mut parent_capability_failure,
@@ -594,6 +645,10 @@ pub(super) fn run(companion_uid: u32) -> Result<(), RescueVaultDaemonError> {
             WorkerStartup::CancelledClean => return Ok(()),
         },
     };
+    let startup_stage_can_advance = startup_stage_can_advance(disposition, startup_fault);
+    if startup_stage_can_advance {
+        notifier.note_startup_stage(StartupStage::CapsFinal);
+    }
     let capabilities_ready = !parent_capability_failure
         && (parent_capabilities_narrowed || runtime::narrow_supervisor_capabilities().is_ok())
         && runtime::verify_all_supervisor_threads_capabilities().is_ok()
@@ -645,6 +700,9 @@ pub(super) fn run(companion_uid: u32) -> Result<(), RescueVaultDaemonError> {
             worker_quiesced: true,
         }
     };
+    if startup_stage_can_advance {
+        notifier.note_startup_stage(StartupStage::Ready);
+    }
     let readiness = supervisor.startup_readiness(fault_containment, disposition);
     let readiness_result = publish_readiness(&notifier, readiness, &stop);
     match readiness {
@@ -697,7 +755,12 @@ pub(super) fn run(companion_uid: u32) -> Result<(), RescueVaultDaemonError> {
     }
 }
 
+fn startup_stage_can_advance(disposition: RuntimeDisposition, startup_fault: bool) -> bool {
+    disposition == RuntimeDisposition::PersistentFault || !startup_fault
+}
+
 fn start_worker(
+    notifier: &SystemdNotifier,
     stop: &StopControl,
     parent_capabilities_narrowed: &mut bool,
     parent_capability_failure: &mut bool,
@@ -705,6 +768,7 @@ fn start_worker(
     if stop.requested.load(Ordering::Acquire) {
         return WorkerStartup::CancelledClean;
     }
+    notifier.note_startup_stage(StartupStage::WorkerCgroup);
     let cgroup = match WorkerCgroup::prepare() {
         Ok(cgroup) => cgroup,
         Err(error) => return WorkerStartup::Unavailable(error),
@@ -720,6 +784,7 @@ fn start_worker(
             }
         };
     }
+    notifier.note_startup_stage(StartupStage::WorkerBootstrap);
     let bootstrap_deadline = Instant::now() + WORKER_STARTUP_TIMEOUT;
     let worker = match WorkerHandle::spawn(cgroup, bootstrap_deadline, &stop.requested) {
         Ok(WorkerSpawnResult::Ready(worker)) => worker,
@@ -733,6 +798,7 @@ fn start_worker(
             };
         }
     };
+    notifier.note_startup_stage(StartupStage::WorkerCaps);
     if runtime::narrow_supervisor_capabilities().is_err()
         || runtime::verify_all_supervisor_threads_capabilities().is_err()
     {
@@ -749,6 +815,7 @@ fn start_worker(
     let probe_deadline = Instant::now()
         .checked_add(WORKER_OPERATION_TIMEOUT)
         .unwrap_or_else(Instant::now);
+    notifier.note_startup_stage(StartupStage::WorkerProbe);
     let response = worker.transact_cancellable(
         internal_wire::WorkerCommandKind::Probe,
         None,
@@ -5495,6 +5562,118 @@ mod tests {
             READY_NOTIFICATION
         );
         assert_no_notification(&receiver);
+    }
+
+    #[test]
+    fn startup_stage_notifications_are_exact_and_non_dominant() {
+        let directory = tempfile::tempdir().expect("temporary notify directory");
+        let path = directory.path().join("startup-notify.sock");
+        let address = SocketAddrUnix::new(&path).expect("notification address");
+        let receiver = notification_receiver(&address);
+        let notifier = SystemdNotifier::from_value(Some(path.as_os_str())).expect("notifier");
+        let expected: &[(StartupStage, &[u8])] = &[
+            (
+                StartupStage::Identity,
+                b"STATUS=KERNAID_RESCUE_VAULT_STARTUP_V1 stage=identity",
+            ),
+            (
+                StartupStage::Listener,
+                b"STATUS=KERNAID_RESCUE_VAULT_STARTUP_V1 stage=listener",
+            ),
+            (
+                StartupStage::Runtime,
+                b"STATUS=KERNAID_RESCUE_VAULT_STARTUP_V1 stage=runtime",
+            ),
+            (
+                StartupStage::Rng,
+                b"STATUS=KERNAID_RESCUE_VAULT_STARTUP_V1 stage=rng",
+            ),
+            (
+                StartupStage::WorkerCgroup,
+                b"STATUS=KERNAID_RESCUE_VAULT_STARTUP_V1 stage=worker-cgroup",
+            ),
+            (
+                StartupStage::WorkerBootstrap,
+                b"STATUS=KERNAID_RESCUE_VAULT_STARTUP_V1 stage=worker-bootstrap",
+            ),
+            (
+                StartupStage::WorkerCaps,
+                b"STATUS=KERNAID_RESCUE_VAULT_STARTUP_V1 stage=worker-caps",
+            ),
+            (
+                StartupStage::WorkerProbe,
+                b"STATUS=KERNAID_RESCUE_VAULT_STARTUP_V1 stage=worker-probe",
+            ),
+            (
+                StartupStage::CapsFinal,
+                b"STATUS=KERNAID_RESCUE_VAULT_STARTUP_V1 stage=caps-final",
+            ),
+            (
+                StartupStage::Ready,
+                b"STATUS=KERNAID_RESCUE_VAULT_STARTUP_V1 stage=ready",
+            ),
+        ];
+        for (stage, payload) in expected {
+            assert!(payload.starts_with(STARTUP_STATUS_PREFIX.as_bytes()));
+            assert!(payload.len() < 65);
+            assert!(!payload.contains(&b'\n'));
+            notifier.note_startup_stage(*stage);
+            assert_eq!(
+                receive_notification(&receiver).expect("startup stage notification"),
+                *payload
+            );
+            assert_no_notification(&receiver);
+        }
+
+        let mut saturated = false;
+        for _ in 0..=1024 {
+            if send_notification_once(&address, b"saturate").is_err() {
+                saturated = true;
+                break;
+            }
+        }
+        assert!(saturated, "notification receiver queue did not saturate");
+        let started = Instant::now();
+        notifier.note_startup_stage(StartupStage::Ready);
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        let missing = directory.path().join("missing.sock");
+        let missing_notifier =
+            SystemdNotifier::from_value(Some(missing.as_os_str())).expect("missing notifier");
+        missing_notifier.note_startup_stage(StartupStage::Identity);
+        SystemdNotifier::Disabled.note_startup_stage(StartupStage::Identity);
+    }
+
+    #[test]
+    fn worker_startup_fault_keeps_the_last_reported_stage_sticky() {
+        let directory = tempfile::tempdir().expect("temporary notify directory");
+        let path = directory.path().join("sticky-startup-notify.sock");
+        let address = SocketAddrUnix::new(&path).expect("notification address");
+        let receiver = notification_receiver(&address);
+        let notifier = SystemdNotifier::from_value(Some(path.as_os_str())).expect("notifier");
+
+        for failed_stage in [
+            StartupStage::WorkerBootstrap,
+            StartupStage::WorkerProbe,
+            StartupStage::WorkerCaps,
+        ] {
+            notifier.note_startup_stage(failed_stage);
+            if startup_stage_can_advance(RuntimeDisposition::Ready, true) {
+                notifier.note_startup_stage(StartupStage::CapsFinal);
+                notifier.note_startup_stage(StartupStage::Ready);
+            }
+            assert_eq!(
+                receive_notification(&receiver).expect("last reported worker stage"),
+                failed_stage.payload()
+            );
+            assert_no_notification(&receiver);
+        }
+
+        assert!(startup_stage_can_advance(RuntimeDisposition::Ready, false));
+        assert!(startup_stage_can_advance(
+            RuntimeDisposition::PersistentFault,
+            true
+        ));
     }
 
     #[test]

@@ -967,6 +967,11 @@ stop_qemu() {
   fi
 }
 
+rescue_not_ready_observed() {
+  local boot_log="$1"
+  LC_ALL=C grep -aq '^KERNAID_RESCUE_NOT_READY:' "$boot_log"
+}
+
 assert_boot_images_unchanged() {
   local boot="$1"
   local prefix_after
@@ -1062,9 +1067,20 @@ run_boot() {
   fi
   qemu_deadline=$((SECONDS + boot_timeout_seconds))
   while ((SECONDS < qemu_deadline)); do
+    if rescue_not_ready_observed "$boot_log"; then
+      if ! stop_qemu; then
+        return 1
+      fi
+      echo "Rescue guest reported a not-ready marker" >&2
+      return 1
+    fi
     if grep -Fq "KERNAID_RESCUE_READY" "$boot_log" \
       && grep -Fq "KERNAID_RESCUE_TARGET_SELECTION_READY" "$boot_log"; then
       stop_qemu
+      if rescue_not_ready_observed "$boot_log"; then
+        echo "Rescue guest reported a not-ready marker" >&2
+        return 1
+      fi
       {
         printf '%s\n' "===== QEMU USB $firmware boot $boot ====="
         cat "$boot_log"
@@ -1083,6 +1099,10 @@ run_boot() {
         return 1
       }
       status="$qemu_last_status"
+      if rescue_not_ready_observed "$boot_log"; then
+        echo "Rescue guest reported a not-ready marker" >&2
+        return 1
+      fi
       {
         printf '%s\n' "===== QEMU USB $firmware boot $boot ====="
         cat "$boot_log"
@@ -1099,6 +1119,10 @@ run_boot() {
   done
 
   stop_qemu
+  if rescue_not_ready_observed "$boot_log"; then
+    echo "Rescue guest reported a not-ready marker" >&2
+    return 1
+  fi
   {
     printf '%s\n' "===== QEMU USB $firmware boot $boot ====="
     cat "$boot_log"

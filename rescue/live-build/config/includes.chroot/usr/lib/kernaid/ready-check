@@ -9,8 +9,56 @@ if [ -r "$offline_inspection_marker" ] \
 fi
 
 fail() {
-    echo "KERNAID_RESCUE_NOT_READY: $*" >/dev/ttyS0
+    printf '\nKERNAID_RESCUE_NOT_READY: %s\n' "$*" >/dev/ttyS0
     exit 1
+}
+
+fail_vaultd_startup() {
+    vaultd_startup_status="$(
+        /usr/bin/timeout --signal=TERM --kill-after=1s 5s \
+            /usr/bin/systemctl show --property=StatusText --value \
+            kernaid-rescue-vaultd.service 2>/dev/null \
+            | /usr/bin/head -c 65
+        printf '.'
+    )"
+    case "$vaultd_startup_status" in
+        "$(printf '\n.')")
+            fail "vault lifecycle daemon startup stage is unavailable"
+            ;;
+        "$(printf 'KERNAID_RESCUE_VAULT_STARTUP_V1 stage=identity\n.')")
+            fail "vault lifecycle daemon last reported startup stage identity"
+            ;;
+        "$(printf 'KERNAID_RESCUE_VAULT_STARTUP_V1 stage=listener\n.')")
+            fail "vault lifecycle daemon last reported startup stage listener"
+            ;;
+        "$(printf 'KERNAID_RESCUE_VAULT_STARTUP_V1 stage=runtime\n.')")
+            fail "vault lifecycle daemon last reported startup stage runtime"
+            ;;
+        "$(printf 'KERNAID_RESCUE_VAULT_STARTUP_V1 stage=rng\n.')")
+            fail "vault lifecycle daemon last reported startup stage rng"
+            ;;
+        "$(printf 'KERNAID_RESCUE_VAULT_STARTUP_V1 stage=worker-cgroup\n.')")
+            fail "vault lifecycle daemon last reported startup stage worker-cgroup"
+            ;;
+        "$(printf 'KERNAID_RESCUE_VAULT_STARTUP_V1 stage=worker-bootstrap\n.')")
+            fail "vault lifecycle daemon last reported startup stage worker-bootstrap"
+            ;;
+        "$(printf 'KERNAID_RESCUE_VAULT_STARTUP_V1 stage=worker-caps\n.')")
+            fail "vault lifecycle daemon last reported startup stage worker-caps"
+            ;;
+        "$(printf 'KERNAID_RESCUE_VAULT_STARTUP_V1 stage=worker-probe\n.')")
+            fail "vault lifecycle daemon last reported startup stage worker-probe"
+            ;;
+        "$(printf 'KERNAID_RESCUE_VAULT_STARTUP_V1 stage=caps-final\n.')")
+            fail "vault lifecycle daemon last reported startup stage caps-final"
+            ;;
+        "$(printf 'KERNAID_RESCUE_VAULT_STARTUP_V1 stage=ready\n.')")
+            fail "vault lifecycle daemon last reported startup stage ready"
+            ;;
+        *)
+            fail "vault lifecycle daemon startup stage is unavailable"
+            ;;
+    esac
 }
 
 provider_probe_raw=/sys/firmware/qemu_fw_cfg/by_name/opt/io.systemd.credentials/provider-lease-probe/raw
@@ -204,8 +252,11 @@ printk_policy="$(
 test "$printk_policy" = "$(printf '5\t4\t1\t7\n.')" \
     || fail "kernel console policy is unsafe"
 test "$(wc -l < /proc/swaps)" -eq 1 || fail "swap is active"
-test "$(systemctl show --property=ActiveState --value kernaid-rescue-vaultd.service)" = "active" \
-    || fail "vault lifecycle daemon is not active"
+vaultd_active_state="$(systemctl show --property=ActiveState --value kernaid-rescue-vaultd.service)" \
+    || fail "vault lifecycle daemon state is unavailable"
+if [ "$vaultd_active_state" != "active" ]; then
+    fail_vaultd_startup
+fi
 test "$(systemctl show --property=ActiveState --value kernaid-rescue-vaultd.socket)" = "active" \
     || fail "vault lifecycle socket is not active"
 vault_socket_substate="$(systemctl show --property=SubState --value kernaid-rescue-vaultd.socket)" \
