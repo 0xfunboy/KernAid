@@ -525,6 +525,36 @@ exec /bin/bash --noprofile --norc -i
                 capture.snapshot(),
             )
 
+            invalid_runtime = runtime_line("diagnostic", 0).replace(
+                b"subtree_control=pids", b"subtree_control=cpu pids"
+            )
+            invalid_command = b"printf '%s\\n' '" + invalid_runtime + b"'\n"
+            with mock.patch.object(
+                controller, "_runtime_command", return_value=invalid_command
+            ), self.assertRaises(controller.ClosedFailure) as failure:
+                controller.collect_runtime(
+                    console, "diagnostic", cursor, aggregate
+                )
+            self.assertEqual(failure.exception.stage, "runtime")
+            self.assertEqual(
+                failure.exception.code, "subtree-control-invalid"
+            )
+            self.assertEqual(
+                str(failure.exception), "runtime:subtree-control-invalid"
+            )
+            invalid_match = controller.RUNTIME_RESULT_PATTERN.search(
+                capture.snapshot(), cursor
+            )
+            self.assertIsNotNone(invalid_match)
+            assert invalid_match is not None
+            cursor = invalid_match.end()
+            self.assertIn(
+                controller.BRACKETED_PASTE_DISABLE_PREFIX
+                + invalid_runtime
+                + b"\r\n",
+                capture.snapshot(),
+            )
+
             setup = b"KERNAID_TEST_COMPANION_READY"
             console.send(
                 b"function /usr/bin/kernaid-rescue-vaultctl { "
@@ -745,12 +775,37 @@ class RuntimeEvidenceTests(unittest.TestCase):
         with self.assertRaises(controller.ClosedFailure):
             controller.validate_runtime_sequence(changed)
 
+    def test_runtime_classifier_never_relaxes_the_strict_acceptance_path(self) -> None:
+        valid = runtime_line("initial", 0)
+        with mock.patch.object(
+            controller,
+            "_runtime_evidence_failure_code",
+            side_effect=AssertionError("diagnostic classifier was reached"),
+        ):
+            snapshot = controller.parse_runtime_snapshot(valid, "initial")
+        self.assertEqual(snapshot.stage, "initial")
+
+        excess = valid.replace(
+            controller.CAP_SYS_ADMIN_ONLY.encode("ascii"),
+            b"0000000000600000",
+            1,
+        )
+        self.assertIsNotNone(controller.RUNTIME_RE.fullmatch(excess))
+        with mock.patch.object(
+            controller,
+            "_runtime_evidence_failure_code",
+            side_effect=AssertionError("diagnostic classifier was reached"),
+        ), self.assertRaises(controller.ClosedFailure) as failure:
+            controller.parse_runtime_snapshot(excess, "initial")
+        self.assertEqual(failure.exception.code, "capabilities-invalid")
+
     def test_runtime_parser_rejects_excess_capabilities_and_shell_mount(self) -> None:
         line = runtime_line("initial", 0).replace(
             controller.CAP_SYS_ADMIN_ONLY.encode("ascii"), b"0000000000600000", 1
         )
-        with self.assertRaises(controller.ClosedFailure):
+        with self.assertRaises(controller.ClosedFailure) as failure:
             controller.parse_runtime_snapshot(line, "initial")
+        self.assertEqual(failure.exception.code, "capabilities-invalid")
         mounted = runtime_line("initial", 0).replace(
             b"shell_mount=false", b"shell_mount=true"
         )
@@ -758,28 +813,166 @@ class RuntimeEvidenceTests(unittest.TestCase):
         with self.assertRaises(controller.ClosedFailure):
             controller.validate_runtime_sequence([snapshot] * 4)
 
-    def test_runtime_parser_rejects_each_topology_privacy_and_swap_claim(self) -> None:
+    def test_runtime_rejection_classifier_covers_every_emitted_field(self) -> None:
         valid = runtime_line("initial", 0)
+        zero = controller.ZERO_CAPS.encode("ascii")
+        cap = controller.CAP_SYS_ADMIN_ONLY.encode("ascii")
         mutations = [
-            (b"service_ambient=0000000000000000", b"service_ambient=0000000000000001"),
-            (b"worker_nnp=1", b"worker_nnp=0"),
-            (b"service_core=0:0", b"service_core=0:1"),
-            (b"parent_procs=empty", b"parent_procs=service"),
-            (b"supervisor_procs=service", b"supervisor_procs=empty"),
-            (b"worker_procs=worker", b"worker_procs=empty"),
-            (b"subtree_control=pids", b"subtree_control=cpu"),
-            (b"parent_descendants=2", b"parent_descendants=3"),
-            (b"worker_pids_current=1", b"worker_pids_current=2"),
-            (b"leaf_exact=true", b"leaf_exact=false"),
-            (b"swaps_empty=true", b"swaps_empty=false"),
+            (b"stage=initial", b"stage=other", "stage-invalid"),
+            (b"service_pid=101", b"service_pid=0", "service-pid-invalid"),
+            (b"worker_pid=102", b"worker_pid=0", "worker-pid-invalid"),
+            (
+                b"service_caps=" + b":".join((zero, cap, cap, cap)),
+                b"service_caps=invalid",
+                "service-capabilities-invalid",
+            ),
+            (
+                b"worker_caps=" + b":".join((zero, cap, cap, cap)),
+                b"worker_caps=invalid",
+                "worker-capabilities-invalid",
+            ),
+            (
+                b"service_ambient=" + zero,
+                b"service_ambient=0000000000000001",
+                "service-ambient-invalid",
+            ),
+            (
+                b"worker_ambient=" + zero,
+                b"worker_ambient=0000000000000001",
+                "worker-ambient-invalid",
+            ),
+            (b"service_nnp=1", b"service_nnp=0", "service-nnp-invalid"),
+            (b"worker_nnp=1", b"worker_nnp=0", "worker-nnp-invalid"),
+            (
+                b"service_core=0:0",
+                b"service_core=0:unlimited",
+                "service-core-invalid",
+            ),
+            (
+                b"worker_core=0:0",
+                b"worker_core=0:unlimited",
+                "worker-core-invalid",
+            ),
+            (
+                b"parent_procs=empty",
+                b"parent_procs=invalid",
+                "parent-procs-invalid",
+            ),
+            (
+                b"supervisor_procs=service",
+                b"supervisor_procs=invalid",
+                "supervisor-procs-invalid",
+            ),
+            (
+                b"worker_procs=worker",
+                b"worker_procs=invalid",
+                "worker-procs-invalid",
+            ),
+            (
+                b"subtree_control=pids",
+                b"subtree_control=cpu pids",
+                "subtree-control-invalid",
+            ),
+            (
+                b"parent_descendants=2",
+                b"parent_descendants=3",
+                "parent-descendants-invalid",
+            ),
+            (
+                b"supervisor_descendants=0",
+                b"supervisor_descendants=1",
+                "supervisor-descendants-invalid",
+            ),
+            (
+                b"worker_descendants=0",
+                b"worker_descendants=1",
+                "worker-descendants-invalid",
+            ),
+            (
+                b"worker_pids_current=1",
+                b"worker_pids_current=2",
+                "worker-pids-current-invalid",
+            ),
+            (
+                b"leaf_exact=true",
+                b"leaf_exact=false",
+                "leaf-exact-invalid",
+            ),
+            (
+                b"mapper_count=0",
+                b"mapper_count=invalid",
+                "mapper-count-invalid",
+            ),
+            (
+                b"shell_mount=false",
+                b"shell_mount=invalid",
+                "shell-mount-invalid",
+            ),
+            (
+                b"swaps_empty=true",
+                b"swaps_empty=false",
+                "swaps-invalid",
+            ),
+            (
+                b"service_active=true",
+                b"service_active=false",
+                "service-state-invalid",
+            ),
+            (
+                b"socket_listening=true",
+                b"socket_listening=false",
+                "socket-state-invalid",
+            ),
+            (
+                b"cgroups_exact=true",
+                b"cgroups_exact=false",
+                "cgroups-invalid",
+            ),
         ]
-        for expected, replacement in mutations:
-            with self.subTest(field=expected), self.assertRaises(
+        observed_codes = set()
+        for expected, replacement, code in mutations:
+            with self.subTest(field=expected, code=code), self.assertRaises(
                 controller.ClosedFailure
-            ):
+            ) as failure:
                 controller.parse_runtime_snapshot(
                     valid.replace(expected, replacement), "initial"
                 )
+            self.assertEqual(failure.exception.stage, "runtime")
+            self.assertEqual(failure.exception.code, code)
+            self.assertEqual(str(failure.exception), f"runtime:{code}")
+            observed_codes.add(code)
+        self.assertEqual(
+            observed_codes,
+            controller.RUNTIME_EVIDENCE_FAILURE_CODES
+            - {"evidence-invalid", "capabilities-invalid"},
+        )
+
+    def test_runtime_rejection_classifier_keeps_malformed_data_closed(self) -> None:
+        valid = runtime_line("initial", 0)
+        malformed = (
+            valid.replace(b" worker_pid=102", b""),
+            valid.replace(
+                b"service_pid=101",
+                b"service_pid=101 service_pid=101",
+            ),
+            valid.replace(
+                b"service_pid=101 worker_pid=102",
+                b"worker_pid=102 service_pid=101",
+            ),
+            valid.replace(b"stage=initial", b"stage=initial\x1b[31m"),
+            valid.replace(b"parent_procs=empty", b"parent_procs=empty\nspoof"),
+            valid.replace(b"worker_pid=102", b"unknown=1 worker_pid=102"),
+            b"\x1b[?2004l\r" + valid,
+            valid + (b"x" * 1025),
+        )
+        for line in malformed:
+            with self.subTest(line_length=len(line)), self.assertRaises(
+                controller.ClosedFailure
+            ) as failure:
+                controller.parse_runtime_snapshot(line, "initial")
+            self.assertEqual(failure.exception.stage, "runtime")
+            self.assertEqual(failure.exception.code, "evidence-invalid")
+            self.assertEqual(str(failure.exception), "runtime:evidence-invalid")
 
 
 class ProbeRunnerTests(unittest.TestCase):

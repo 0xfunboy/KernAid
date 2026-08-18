@@ -765,6 +765,81 @@ RUNTIME_RE = re.compile(
     rb"swaps_empty=true service_active=true socket_listening=true cgroups_exact=true$"
 )
 
+# This second grammar is diagnostic-only. RUNTIME_RE above remains the sole
+# acceptance boundary; a line rejected there may be classified only when it
+# still has the exact field order and bounded, control-free token shapes.
+# Values are compared below, and no observed value is ever copied into a
+# diagnostic.
+RUNTIME_EVIDENCE_SHAPE_RE = re.compile(
+    rb"^KERNAID_VAULT_RUNTIME_V1 "
+    rb"stage=(?P<stage>[a-z0-9-]{1,64}) "
+    rb"service_pid=(?P<service_pid>[0-9]{1,20}) "
+    rb"worker_pid=(?P<worker_pid>[0-9]{1,20}) "
+    rb"service_caps=(?P<service_caps>[a-z0-9:]{1,131}) "
+    rb"worker_caps=(?P<worker_caps>[a-z0-9:]{1,131}) "
+    rb"service_ambient=(?P<service_ambient>[a-z0-9]{1,32}) "
+    rb"worker_ambient=(?P<worker_ambient>[a-z0-9]{1,32}) "
+    rb"service_nnp=(?P<service_nnp>[a-z0-9]{1,20}) "
+    rb"worker_nnp=(?P<worker_nnp>[a-z0-9]{1,20}) "
+    rb"service_core=(?P<service_core>[a-z0-9:]{1,65}) "
+    rb"worker_core=(?P<worker_core>[a-z0-9:]{1,65}) "
+    rb"parent_procs=(?P<parent_procs>[a-z0-9-]{1,32}) "
+    rb"supervisor_procs=(?P<supervisor_procs>[a-z0-9-]{1,32}) "
+    rb"worker_procs=(?P<worker_procs>[a-z0-9-]{1,32}) "
+    rb"subtree_control=(?P<subtree_control>"
+    rb"[a-z0-9_]{0,64}(?: [a-z0-9_]{1,64}){0,15}) "
+    rb"parent_descendants=(?P<parent_descendants>[a-z0-9-]{1,32}) "
+    rb"supervisor_descendants=(?P<supervisor_descendants>[a-z0-9-]{1,32}) "
+    rb"worker_descendants=(?P<worker_descendants>[a-z0-9-]{1,32}) "
+    rb"worker_pids_current=(?P<worker_pids_current>[a-z0-9-]{1,32}) "
+    rb"leaf_exact=(?P<leaf_exact>[a-z0-9-]{1,32}) "
+    rb"mapper_count=(?P<mapper_count>[a-z0-9-]{1,32}) "
+    rb"shell_mount=(?P<shell_mount>[a-z0-9-]{1,32}) "
+    rb"swaps_empty=(?P<swaps_empty>[a-z0-9-]{1,32}) "
+    rb"service_active=(?P<service_active>[a-z0-9-]{1,32}) "
+    rb"socket_listening=(?P<socket_listening>[a-z0-9-]{1,32}) "
+    rb"cgroups_exact=(?P<cgroups_exact>[a-z0-9-]{1,32})$"
+)
+RUNTIME_CAPABILITIES_SHAPE_RE = re.compile(
+    rb"^[0-9a-f]{16}:[0-9a-f]{16}:[0-9a-f]{16}:[0-9a-f]{16}$"
+)
+RUNTIME_EVIDENCE_FAILURE_CODES = frozenset(
+    {
+        "evidence-invalid",
+        "stage-invalid",
+        "capabilities-invalid",
+        "service-pid-invalid",
+        "worker-pid-invalid",
+        "service-capabilities-invalid",
+        "worker-capabilities-invalid",
+        "service-ambient-invalid",
+        "worker-ambient-invalid",
+        "service-nnp-invalid",
+        "worker-nnp-invalid",
+        "service-core-invalid",
+        "worker-core-invalid",
+        "parent-procs-invalid",
+        "supervisor-procs-invalid",
+        "worker-procs-invalid",
+        "subtree-control-invalid",
+        "parent-descendants-invalid",
+        "supervisor-descendants-invalid",
+        "worker-descendants-invalid",
+        "worker-pids-current-invalid",
+        "leaf-exact-invalid",
+        "mapper-count-invalid",
+        "shell-mount-invalid",
+        "swaps-invalid",
+        "service-state-invalid",
+        "socket-state-invalid",
+        "cgroups-invalid",
+    }
+)
+assert all(
+    TOKEN_RE.fullmatch(code) is not None
+    for code in RUNTIME_EVIDENCE_FAILURE_CODES
+)
+
 SOCKET_OPERATIONAL_CASE = (
     'case "$socket_state" in '
     'active:listening|active:running) listening=true;; '
@@ -772,10 +847,82 @@ SOCKET_OPERATIONAL_CASE = (
 )
 
 
+def _runtime_evidence_failure_code(line: bytes, expected_stage: str) -> str:
+    if len(line) > 1024 or TOKEN_RE.fullmatch(expected_stage) is None:
+        return "evidence-invalid"
+    match = RUNTIME_EVIDENCE_SHAPE_RE.fullmatch(line)
+    if match is None:
+        return "evidence-invalid"
+    expected = expected_stage.encode("ascii")
+    checks = (
+        (match["stage"] == expected, "stage-invalid"),
+        (
+            re.fullmatch(rb"[1-9][0-9]*", match["service_pid"]) is not None,
+            "service-pid-invalid",
+        ),
+        (
+            re.fullmatch(rb"[1-9][0-9]*", match["worker_pid"]) is not None,
+            "worker-pid-invalid",
+        ),
+        (
+            RUNTIME_CAPABILITIES_SHAPE_RE.fullmatch(match["service_caps"])
+            is not None,
+            "service-capabilities-invalid",
+        ),
+        (
+            RUNTIME_CAPABILITIES_SHAPE_RE.fullmatch(match["worker_caps"])
+            is not None,
+            "worker-capabilities-invalid",
+        ),
+        (
+            match["service_ambient"] == ZERO_CAPS.encode("ascii"),
+            "service-ambient-invalid",
+        ),
+        (
+            match["worker_ambient"] == ZERO_CAPS.encode("ascii"),
+            "worker-ambient-invalid",
+        ),
+        (match["service_nnp"] == b"1", "service-nnp-invalid"),
+        (match["worker_nnp"] == b"1", "worker-nnp-invalid"),
+        (match["service_core"] == b"0:0", "service-core-invalid"),
+        (match["worker_core"] == b"0:0", "worker-core-invalid"),
+        (match["parent_procs"] == b"empty", "parent-procs-invalid"),
+        (match["supervisor_procs"] == b"service", "supervisor-procs-invalid"),
+        (match["worker_procs"] == b"worker", "worker-procs-invalid"),
+        (match["subtree_control"] == b"pids", "subtree-control-invalid"),
+        (match["parent_descendants"] == b"2", "parent-descendants-invalid"),
+        (
+            match["supervisor_descendants"] == b"0",
+            "supervisor-descendants-invalid",
+        ),
+        (match["worker_descendants"] == b"0", "worker-descendants-invalid"),
+        (match["worker_pids_current"] == b"1", "worker-pids-current-invalid"),
+        (match["leaf_exact"] == b"true", "leaf-exact-invalid"),
+        (
+            re.fullmatch(rb"[0-9]+", match["mapper_count"]) is not None,
+            "mapper-count-invalid",
+        ),
+        (match["shell_mount"] in {b"false", b"true"}, "shell-mount-invalid"),
+        (match["swaps_empty"] == b"true", "swaps-invalid"),
+        (match["service_active"] == b"true", "service-state-invalid"),
+        (match["socket_listening"] == b"true", "socket-state-invalid"),
+        (match["cgroups_exact"] == b"true", "cgroups-invalid"),
+    )
+    for valid, code in checks:
+        if not valid:
+            assert code in RUNTIME_EVIDENCE_FAILURE_CODES
+            return code
+    return "evidence-invalid"
+
+
 def parse_runtime_snapshot(line: bytes, expected_stage: str) -> RuntimeSnapshot:
     match = RUNTIME_RE.fullmatch(line)
-    if match is None or match.group(1).decode("ascii") != expected_stage:
-        raise ClosedFailure("runtime", "evidence-invalid")
+    if match is None:
+        raise ClosedFailure(
+            "runtime", _runtime_evidence_failure_code(line, expected_stage)
+        )
+    if match.group(1).decode("ascii") != expected_stage:
+        raise ClosedFailure("runtime", "stage-invalid")
     service_caps = tuple(item.decode("ascii") for item in match.groups()[3:7])
     worker_caps = tuple(item.decode("ascii") for item in match.groups()[7:11])
     exact_caps = (ZERO_CAPS, CAP_SYS_ADMIN_ONLY, CAP_SYS_ADMIN_ONLY, CAP_SYS_ADMIN_ONLY)
