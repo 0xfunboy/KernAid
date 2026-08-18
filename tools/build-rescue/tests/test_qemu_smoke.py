@@ -48,6 +48,16 @@ class QemuProcessLifecycleTests(unittest.TestCase):
     def function_definition(source: str, name: str) -> str:
         return f"{name}() {{\n{shell_function(source, name)}}}\n"
 
+    def test_trap_only_recovery_is_annotated_for_shellcheck_versions(self) -> None:
+        annotation = (
+            "# shellcheck disable=SC2317,SC2329  "
+            "# Invoked indirectly by the EXIT cleanup trap.\n"
+            "recover_qemu_start_gate_tracking() {"
+        )
+        for script in (SCRIPT, USB_SCRIPT):
+            with self.subTest(script=script.name):
+                self.assertIn(annotation, script.read_text(encoding="utf-8"))
+
     def test_capture_failure_closes_start_gate_and_reaps_for_both_harnesses(
         self,
     ) -> None:

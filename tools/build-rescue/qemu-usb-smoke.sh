@@ -260,7 +260,7 @@ close_qemu_start_gate() {
   qemu_start_fd=""
 }
 
-# shellcheck disable=SC2329  # Invoked indirectly by the EXIT cleanup trap.
+# shellcheck disable=SC2317,SC2329  # Invoked indirectly by the EXIT cleanup trap.
 recover_qemu_start_gate_tracking() {
   local spawned_fd="${QEMU_PROCESS[1]:-}"
   local spawned_pid="${QEMU_PROCESS_PID:-}"
