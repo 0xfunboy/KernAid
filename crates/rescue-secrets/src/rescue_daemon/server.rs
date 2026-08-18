@@ -7,7 +7,7 @@ use super::{
     validate_no_active_swap,
 };
 use kernaid_protocol::rescue_vault::{
-    DescriptorDeclaration, DescriptorType, ErrorToken, MAX_INITIAL_STATE_VERSION,
+    AgentRole, DescriptorDeclaration, DescriptorType, ErrorToken, MAX_INITIAL_STATE_VERSION,
     MAX_SAFE_JSON_INTEGER, Operation, PeerAllowlist, Provider, ProviderState,
     ProviderStatusPayload, RequestDecodeError, RequestPayload, ServerReceiveError, SuccessPayload,
     ValidatedRequest, VaultState, VaultStatusPayload, authenticate_seqpacket_peer,
@@ -751,7 +751,11 @@ fn validated_peer_allowlist(companion_uid: u32) -> Result<PeerAllowlist, RescueV
     let agent_uid = passwd_openai_agent_uid(&bytes, companion_uid)
         .ok_or(RescueVaultDaemonError::InvalidConfiguration)?;
     validate_openai_agent_groups(agent_uid)?;
-    PeerAllowlist::new(companion_uid, agent_uid)
+    let builder = PeerAllowlist::builder(companion_uid)
+        .agent(AgentRole::OpenAi, agent_uid)
+        .map_err(|_| RescueVaultDaemonError::InvalidConfiguration)?;
+    builder
+        .build()
         .map_err(|_| RescueVaultDaemonError::InvalidConfiguration)
 }
 
@@ -1593,7 +1597,7 @@ impl Supervisor {
         connection: ClientConnection<'_>,
     ) -> (u64, HandlerResult) {
         let operation = request.operation();
-        if !external_operation_is_enabled(operation, request.role()) {
+        if !external_request_is_enabled(&request) {
             let version = self.snapshot().version;
             return (
                 version,
@@ -3807,15 +3811,24 @@ fn external_operation_is_enabled(
                 | Operation::ProviderStatus
                 | Operation::ProviderLogout
         ),
-        kernaid_protocol::rescue_vault::PeerRole::Agent => {
-            matches!(
-                operation,
-                Operation::VaultStatus
-                    | Operation::ProviderStatus
-                    | Operation::ProviderOpenAiBorrow
-            )
-        }
+        kernaid_protocol::rescue_vault::PeerRole::Agent(AgentRole::OpenAi) => matches!(
+            operation,
+            Operation::VaultStatus | Operation::ProviderStatus | Operation::ProviderOpenAiBorrow
+        ),
+        kernaid_protocol::rescue_vault::PeerRole::Agent(
+            AgentRole::Application | AgentRole::Codex,
+        ) => false,
     }
+}
+
+fn external_request_is_enabled(request: &ValidatedRequest) -> bool {
+    external_operation_is_enabled(request.operation(), request.role())
+        && !matches!(
+            request.payload(),
+            RequestPayload::ProviderLogout {
+                provider: Provider::Codex
+            }
+        )
 }
 
 fn status_version_is_accepted(expected: u64, current: u64) -> bool {
@@ -4722,15 +4735,17 @@ mod tests {
             .as_raw();
         assert_ne!(uid, 0, "handler tests require an unprivileged peer");
         let other_uid = if uid == 1 { 2 } else { 1 };
-        let (companion_uid, agent_uid) = match role {
-            PeerRole::Companion => (uid, other_uid),
-            PeerRole::Agent => (other_uid, uid),
+        let (companion_uid, agent_role, agent_uid) = match role {
+            PeerRole::Companion => (uid, AgentRole::OpenAi, other_uid),
+            PeerRole::Agent(agent_role) => (other_uid, agent_role, uid),
         };
-        let peer = authenticate_seqpacket_peer(
-            server.as_fd(),
-            PeerAllowlist::new(companion_uid, agent_uid).expect("test allowlist"),
-        )
-        .expect("authenticated test peer");
+        let allowlist = PeerAllowlist::builder(companion_uid)
+            .agent(agent_role, agent_uid)
+            .expect("test Agent role mapping")
+            .build()
+            .expect("test allowlist");
+        let peer = authenticate_seqpacket_peer(server.as_fd(), allowlist)
+            .expect("authenticated test peer");
         let request_id = format!(
             "R-00000000-0000-0000-0000-{:012x}",
             REQUEST.fetch_add(1, Ordering::Relaxed)
@@ -5620,7 +5635,10 @@ mod tests {
                 initial.faulted = true;
                 initial.fault_marker_required = true;
             }
-            let (supervisor, runtime, worker, _, _) = fake_supervisor(initial, [], true);
+            let expected_availability = initial.availability.clone();
+            let expected_faulted = initial.faulted;
+            let expected_fault_marker_required = initial.fault_marker_required;
+            let (supervisor, runtime, worker, privacy, _) = fake_supervisor(initial, [], true);
             let (persist, persist_writer) = descriptor_request(
                 "report.persist",
                 serde_json::json!({
@@ -5629,7 +5647,7 @@ mod tests {
                     "input": {"type": "session-report-json-pipe", "size": 2}
                 }),
                 60,
-                PeerRole::Agent,
+                PeerRole::Agent(AgentRole::Application),
                 b"{}",
             );
             let requests = [
@@ -5639,7 +5657,47 @@ mod tests {
                         serde_json::json!({}),
                         60,
                         None,
-                        PeerRole::Agent,
+                        PeerRole::Agent(AgentRole::Codex),
+                    ),
+                    None,
+                ),
+                (
+                    validated_request_for_role(
+                        "provider.status",
+                        serde_json::json!({}),
+                        60,
+                        None,
+                        PeerRole::Agent(AgentRole::Codex),
+                    ),
+                    None,
+                ),
+                (
+                    validated_request_for_role(
+                        "vault.status",
+                        serde_json::json!({}),
+                        60,
+                        None,
+                        PeerRole::Agent(AgentRole::Codex),
+                    ),
+                    None,
+                ),
+                (
+                    validated_request_for_role(
+                        "provider.logout",
+                        serde_json::json!({"provider": "codex"}),
+                        60,
+                        None,
+                        PeerRole::Agent(AgentRole::Codex),
+                    ),
+                    None,
+                ),
+                (
+                    validated_request_for_role(
+                        "provider.logout",
+                        serde_json::json!({"provider": "codex"}),
+                        60,
+                        None,
+                        PeerRole::Companion,
                     ),
                     None,
                 ),
@@ -5653,7 +5711,27 @@ mod tests {
                         }),
                         60,
                         None,
-                        PeerRole::Agent,
+                        PeerRole::Agent(AgentRole::Application),
+                    ),
+                    None,
+                ),
+                (
+                    validated_request_for_role(
+                        "vault.status",
+                        serde_json::json!({}),
+                        60,
+                        None,
+                        PeerRole::Agent(AgentRole::Application),
+                    ),
+                    None,
+                ),
+                (
+                    validated_request_for_role(
+                        "provider.status",
+                        serde_json::json!({}),
+                        60,
+                        None,
+                        PeerRole::Agent(AgentRole::Application),
                     ),
                     None,
                 ),
@@ -5664,7 +5742,7 @@ mod tests {
                         serde_json::json!({}),
                         60,
                         None,
-                        PeerRole::Agent,
+                        PeerRole::Agent(AgentRole::Application),
                     ),
                     None,
                 ),
@@ -5676,7 +5754,7 @@ mod tests {
                         }),
                         60,
                         None,
-                        PeerRole::Agent,
+                        PeerRole::Agent(AgentRole::Application),
                     ),
                     None,
                 ),
@@ -5689,8 +5767,27 @@ mod tests {
                     assert_pipe_has_no_reader(writer.as_fd());
                 }
             }
-            assert_eq!(supervisor.snapshot().version, 60);
+            let state = supervisor.state.lock().expect("service state");
+            assert_eq!(state.version, 60);
+            assert_eq!(state.availability, expected_availability);
+            assert!(state.transition_origin.is_none());
+            assert!(!state.provider_operation_active);
+            assert!(state.last_unlock_attempt.is_none());
+            assert_eq!(state.faulted, expected_faulted);
+            assert_eq!(state.fault_marker_required, expected_fault_marker_required);
+            assert!(!state.marker_persistence_failed);
+            assert!(!state.clean_fault_shutdown);
+            drop(state);
+            assert!(
+                supervisor
+                    .leases
+                    .lock()
+                    .expect("lease registry")
+                    .active
+                    .is_none()
+            );
             assert!(worker.lock().expect("worker trace").calls.is_empty());
+            assert_eq!(privacy.checks.load(Ordering::Acquire), 0);
             let runtime = runtime.lock().expect("runtime trace");
             assert_eq!(
                 (runtime.arms, runtime.disarms, runtime.marker),
@@ -5763,68 +5860,50 @@ mod tests {
 
     #[test]
     fn shipping_peer_roles_have_a_closed_operation_surface() {
-        let forbidden = [
+        let operations = [
+            Operation::VaultStatus,
+            Operation::VaultUnlock,
+            Operation::VaultLock,
+            Operation::ProviderOpenAiConfigure,
+            Operation::ProviderStatus,
+            Operation::ProviderLogout,
+            Operation::ProviderOpenAiBorrow,
             Operation::ProviderCodexHomeLease,
             Operation::AuditAppend,
             Operation::ReportPersist,
             Operation::ReportList,
             Operation::ReportGet,
         ];
-        for vault in [
-            VaultState::Absent,
-            VaultState::Unprovisioned,
-            VaultState::Locked,
-            VaultState::Unlocking,
-            VaultState::Unlocked,
-            VaultState::Locking,
-            VaultState::FaultedRebootRequired,
-        ] {
-            let state = service_state(700, vault);
-            for operation in forbidden {
-                assert!(!external_operation_is_enabled(
+        for operation in operations {
+            assert_eq!(
+                external_operation_is_enabled(operation, PeerRole::Companion),
+                matches!(
                     operation,
-                    PeerRole::Companion
-                ));
-                assert!(!external_operation_is_enabled(operation, PeerRole::Agent));
-                assert_eq!(state.version, 700);
+                    Operation::VaultStatus
+                        | Operation::VaultUnlock
+                        | Operation::VaultLock
+                        | Operation::ProviderOpenAiConfigure
+                        | Operation::ProviderStatus
+                        | Operation::ProviderLogout
+                ),
+                "unexpected Companion shipping permission for {operation:?}"
+            );
+            assert_eq!(
+                external_operation_is_enabled(operation, PeerRole::Agent(AgentRole::OpenAi)),
+                matches!(
+                    operation,
+                    Operation::VaultStatus
+                        | Operation::ProviderStatus
+                        | Operation::ProviderOpenAiBorrow
+                ),
+                "unexpected OpenAI shipping permission for {operation:?}"
+            );
+            for role in [AgentRole::Application, AgentRole::Codex] {
+                assert!(
+                    !external_operation_is_enabled(operation, PeerRole::Agent(role)),
+                    "disabled {role:?} role reached {operation:?}"
+                );
             }
-        }
-        for operation in [
-            Operation::VaultStatus,
-            Operation::VaultUnlock,
-            Operation::VaultLock,
-            Operation::ProviderOpenAiConfigure,
-            Operation::ProviderStatus,
-            Operation::ProviderLogout,
-        ] {
-            assert!(external_operation_is_enabled(
-                operation,
-                PeerRole::Companion
-            ));
-        }
-        assert!(external_operation_is_enabled(
-            Operation::VaultStatus,
-            PeerRole::Agent
-        ));
-        assert!(external_operation_is_enabled(
-            Operation::ProviderStatus,
-            PeerRole::Agent
-        ));
-        assert!(external_operation_is_enabled(
-            Operation::ProviderOpenAiBorrow,
-            PeerRole::Agent
-        ));
-        assert!(!external_operation_is_enabled(
-            Operation::ProviderOpenAiBorrow,
-            PeerRole::Companion
-        ));
-        for operation in [
-            Operation::VaultUnlock,
-            Operation::VaultLock,
-            Operation::ProviderOpenAiConfigure,
-            Operation::ProviderLogout,
-        ] {
-            assert!(!external_operation_is_enabled(operation, PeerRole::Agent));
         }
     }
 
@@ -5842,7 +5921,7 @@ mod tests {
             serde_json::json!({}),
             710,
             None,
-            PeerRole::Agent,
+            PeerRole::Agent(AgentRole::OpenAi),
         );
         let (version, result) = supervisor.handle_request(request, Instant::now());
         assert_eq!(version, 710);
@@ -5870,7 +5949,11 @@ mod tests {
         let uid = rustix::process::getuid().as_raw();
         assert_ne!(uid, 0, "role test requires an unprivileged peer");
         let agent_uid = if uid == 1 { 2 } else { 1 };
-        let allowlist = PeerAllowlist::new(uid, agent_uid).expect("test allowlist");
+        let allowlist = PeerAllowlist::builder(uid)
+            .agent(AgentRole::OpenAi, agent_uid)
+            .expect("test OpenAI role mapping")
+            .build()
+            .expect("test allowlist");
         for with_descriptor in [false, true] {
             let (client, server) = socketpair(
                 AddressFamily::UNIX,
@@ -5963,7 +6046,7 @@ mod tests {
             serde_json::json!({}),
             711,
             None,
-            PeerRole::Agent,
+            PeerRole::Agent(AgentRole::OpenAi),
         );
         let (version, result) = supervisor.handle_connected_request(
             request,
@@ -6088,7 +6171,7 @@ mod tests {
             serde_json::json!({}),
             60,
             None,
-            PeerRole::Agent,
+            PeerRole::Agent(AgentRole::OpenAi),
         );
         let (version, result) = status.handle_request(request, Instant::now());
         assert_eq!(version, 60);

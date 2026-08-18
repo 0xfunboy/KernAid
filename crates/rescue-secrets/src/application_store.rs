@@ -15,7 +15,7 @@ use crate::linux::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use kernaid_device_identity::{DeviceIdentity, SignedReportEnvelope};
 use kernaid_protocol::rescue_vault::{
-    AuditEventType, AuditOutcome, ErrorToken, MAX_AUDIT_SEQUENCE, Operation, PeerRole,
+    AgentRole, AuditEventType, AuditOutcome, ErrorToken, MAX_AUDIT_SEQUENCE, Operation, PeerRole,
     RequestPayload, ValidatedRequest,
 };
 use kernaid_report_schema::{MAX_SESSION_REPORT_BYTES, validate_session_report_json};
@@ -598,7 +598,9 @@ impl<'vault> RescueVaultApplicationStore<'vault> {
         request: &ValidatedRequest,
     ) -> Result<u64, RescueApplicationStoreError> {
         self.ensure_ready()?;
-        if request.operation() != Operation::AuditAppend || request.role() != PeerRole::Agent {
+        if request.operation() != Operation::AuditAppend
+            || request.role() != PeerRole::Agent(AgentRole::Application)
+        {
             return Err(RescueApplicationStoreError::InvalidAgentAudit);
         }
         let RequestPayload::AuditAppend {
@@ -1994,7 +1996,11 @@ mod tests {
         let companion_uid = if uid == 1 { 2 } else { 1 };
         let peer = authenticate_seqpacket_peer(
             server_socket.as_fd(),
-            PeerAllowlist::new(companion_uid, uid).expect("valid Agent allowlist"),
+            PeerAllowlist::builder(companion_uid)
+                .agent(AgentRole::Application, uid)
+                .expect("valid Agent role mapping")
+                .build()
+                .expect("valid Agent allowlist"),
         )
         .expect("authenticate Agent peer");
         let payload = serde_json::json!({

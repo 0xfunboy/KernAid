@@ -1601,7 +1601,7 @@ mod tests {
         assert_eq!(
             crate::rescue_vault::authenticate_seqpacket_peer(
                 listener.as_fd(),
-                crate::rescue_vault::PeerAllowlist::new(1000, 1001).expect("test allowlist"),
+                crate::rescue_vault::PeerAllowlist::companion_only(1000).expect("test allowlist"),
             )
             .err(),
             Some(ProtocolViolation::InvalidTransport)
@@ -1883,7 +1883,7 @@ mod tests {
         assert_eq!(
             crate::rescue_vault::authenticate_seqpacket_peer(
                 socket.as_fd(),
-                crate::rescue_vault::PeerAllowlist::new(1000, 1001).expect("allowlist"),
+                crate::rescue_vault::PeerAllowlist::companion_only(1000).expect("allowlist"),
             )
             .err(),
             Some(ProtocolViolation::InvalidTransport)
@@ -1917,10 +1917,11 @@ mod tests {
     fn typed_request_encoder_matches_server_decoder_and_fd_arity() {
         let status = request(ClientRequestPayload::VaultStatus);
         let status_bytes = encode_client_request(&status, &[]).expect("status encode");
-        assert!(
-            String::from_utf8(status_bytes)
-                .expect("UTF-8")
-                .contains("\"payload\":{}")
+        assert_eq!(
+            String::from_utf8(status_bytes).expect("UTF-8"),
+            format!(
+                "{{\"apiVersion\":\"{API_VERSION}\",\"requestId\":\"{REQUEST_ID}\",\"expectedStateVersion\":7,\"operation\":\"vault.status\",\"payload\":{{}}}}"
+            )
         );
         assert_eq!(
             encode_client_request(&status, &[read_pipe().as_fd()]),

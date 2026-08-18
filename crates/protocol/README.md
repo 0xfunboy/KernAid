@@ -40,8 +40,11 @@ The closed states are `absent`, `unprovisioned`, `locked`, `unlocking`,
 allowed while faulted; every other operation returns `REBOOT_REQUIRED`.
 
 The server derives the caller PID and UID with `SO_PEERCRED` on the connected
-seqpacket socket. `PeerAllowlist` maps two distinct non-root UIDs to
-`companion` and `agent`; neither identity is accepted from JSON. A
+seqpacket socket. `PeerAllowlist` maps one non-root UID to `companion` and
+optional, purpose-specific non-root UIDs to the `application`, `openai`, and
+`codex` Agent roles; neither identity nor role is accepted from JSON. Its
+builder rejects root, a UID shared by two roles, a role assigned twice, and
+any Agent UID equal to the companion UID. There is no fallback Agent role. A
 companion-only allowlist is available for deployments that do not yet run an
 Agent identity. Authentication returns a non-cloneable borrowed connection
 capability, not a copyable identity assertion. Requests and rejection contexts
@@ -81,18 +84,18 @@ its tests must reject any future opt-in.
 
 | Operation | Allowed caller | Request FD | Success FD |
 | --- | --- | --- | --- |
-| `vault.status` | companion, agent | 0 | 0 |
+| `vault.status` | companion, application, openai, codex | 0 | 0 |
 | `vault.unlock` | companion | 1 passphrase pipe | 0 |
 | `vault.lock` | companion | 0 | 0 |
 | `provider.openai.configure` | companion | 1 API-key pipe | 0 |
-| `provider.status` | companion, agent | 0 | 0 |
-| `provider.logout` | companion | 0 | 0 |
-| `provider.openai.borrow` | agent | 0 | 1 one-shot API-key pipe |
-| `provider.codex.home_lease` | agent | 0 | 1 `O_PATH` directory |
-| `audit.append` | agent | 0 | 0 |
-| `report.persist` | agent | 1 SessionReport JSON pipe | 0 |
-| `report.list` | companion, agent | 0 | 0 |
-| `report.get` | companion, agent | 0 | 1 signed-report-envelope pipe |
+| `provider.status` | companion, application, openai, codex | 0 | 0 |
+| `provider.logout` | companion; codex only when `provider=codex` | 0 | 0 |
+| `provider.openai.borrow` | openai | 0 | 1 one-shot API-key pipe |
+| `provider.codex.home_lease` | codex | 0 | 1 `O_PATH` directory |
+| `audit.append` | application | 0 | 0 |
+| `report.persist` | application | 1 SessionReport JSON pipe | 0 |
+| `report.list` | companion, application | 0 | 0 |
+| `report.get` | companion, application | 0 | 1 signed-report-envelope pipe |
 
 SCM_RIGHTS count, file type, PIPEFS filesystem identity, access mode, CLOEXEC
 state, declared type, and declared size are checked together. Only anonymous
@@ -113,14 +116,16 @@ pidfd and waits all three factors before worker lock, unmount, or lifecycle
 marker disarm. An unconfigured daemon answers `provider.openai.borrow` with
 `PROVIDER_UNCONFIGURED` and no descriptor as a definite no-secret outcome.
 
-The feature-gated daemon enables this OpenAI borrow only for the exact Agent
-role. The supervisor creates an anonymous nonblocking pipe, gives only its
-write end to the worker, validates the private `Ready` result without reading
-credential bytes, and sends the read end with `SCM_RIGHTS` while holding the
-lifecycle linearization barrier against lock/revoke. Pending handoff,
-established lease, and revocation have separate absolute bounds; ambiguous
-worker or send outcomes revoke rather than free early. Codex, audit, and report
-operations remain disabled.
+The feature-gated daemon constructs only companion and OpenAI Agent mappings
+and enables this OpenAI borrow only for `Agent(OpenAi)`. The supervisor creates
+an anonymous nonblocking pipe, gives only its write end to the worker,
+validates the private `Ready` result without reading credential bytes, and
+sends the read end with `SCM_RIGHTS` while holding the lifecycle linearization
+barrier against lock/revoke. Pending handoff, established lease, and
+revocation have separate absolute bounds; ambiguous worker or send outcomes
+revoke rather than free early. Application and Codex roles, Codex status/home
+lease/logout requests, and audit/report operations remain disabled before
+worker dispatch.
 
 Passphrase pipes are limited to 12–1024 non-NUL bytes, matching vault writer
 v2. After the exact-size read the handler must attempt one further read, prove
@@ -165,7 +170,9 @@ does not itself create a listener, daemon, mount, store, provider process, or
 UI endpoint. The feature-gated implementation in `kernaid-rescue-secrets`
 enables vault lifecycle, provider configuration lifecycle (`provider.status`,
 `provider.openai.configure`, and OpenAI `provider.logout`), plus the leased
-Agent `provider.openai.borrow` path. The separate one-shot executor is the only
-consumer and fixes its TLS destination and Responses codec. Codex home/logout,
-audit/report operations, and generic network or UI command surfaces remain
-disabled.
+OpenAI Agent `provider.openai.borrow` path. The separate one-shot executor is
+the only consumer and fixes its TLS destination and Responses codec. The
+shipping daemon has no Application or Codex UID mapping and rejects their
+typed protocol operations before state, marker, or worker handling. Codex
+home/logout/status effects, audit/report operations, and generic network or UI
+command surfaces remain disabled.

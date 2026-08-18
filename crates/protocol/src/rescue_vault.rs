@@ -52,57 +52,162 @@ pub const SESSION_REPORT_MEDIA_TYPE: &str = "application/json";
 const PIPEFS_MAGIC: u64 = 0x5049_5045;
 
 /// The unprivileged identities allowed to connect to the service.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct PeerAllowlist {
     companion_uid: u32,
-    agent_uid: Option<u32>,
+    application_uid: Option<u32>,
+    openai_uid: Option<u32>,
+    codex_uid: Option<u32>,
+}
+
+impl fmt::Debug for PeerAllowlist {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PeerAllowlist")
+            .field("companion_configured", &(self.companion_uid != 0))
+            .field("application_configured", &self.application_uid.is_some())
+            .field("openai_configured", &self.openai_uid.is_some())
+            .field("codex_configured", &self.codex_uid.is_some())
+            .finish()
+    }
 }
 
 impl PeerAllowlist {
-    /// Constructs an allowlist. The roles must remain distinct and neither
-    /// role may silently become root.
-    pub fn new(companion_uid: u32, agent_uid: u32) -> Result<Self, ProtocolViolation> {
-        if companion_uid == 0 || agent_uid == 0 || companion_uid == agent_uid {
-            return Err(ProtocolViolation::InvalidAllowlist);
-        }
-        Ok(Self {
+    /// Starts a fail-closed allowlist builder. No peer can be authenticated
+    /// until [`PeerAllowlistBuilder::build`] validates the complete mapping.
+    #[must_use]
+    pub fn builder(companion_uid: u32) -> PeerAllowlistBuilder {
+        PeerAllowlistBuilder {
             companion_uid,
-            agent_uid: Some(agent_uid),
-        })
+            application_uid: None,
+            openai_uid: None,
+            codex_uid: None,
+        }
     }
 
-    /// Constructs the lifecycle-only allowlist used before an Agent service
+    /// Constructs the lifecycle-only allowlist used before any Agent service
     /// exists. No UID can be authenticated as [`PeerRole::Agent`].
     pub fn companion_only(companion_uid: u32) -> Result<Self, ProtocolViolation> {
-        if companion_uid == 0 {
-            return Err(ProtocolViolation::InvalidAllowlist);
-        }
-        Ok(Self {
-            companion_uid,
-            agent_uid: None,
-        })
+        Self::builder(companion_uid).build()
     }
 
     fn role_for(self, peer_uid: u32) -> Result<PeerRole, ProtocolViolation> {
         if peer_uid == self.companion_uid {
             Ok(PeerRole::Companion)
-        } else if self.agent_uid == Some(peer_uid) {
-            Ok(PeerRole::Agent)
+        } else if self.application_uid == Some(peer_uid) {
+            Ok(PeerRole::Agent(AgentRole::Application))
+        } else if self.openai_uid == Some(peer_uid) {
+            Ok(PeerRole::Agent(AgentRole::OpenAi))
+        } else if self.codex_uid == Some(peer_uid) {
+            Ok(PeerRole::Agent(AgentRole::Codex))
         } else {
             Err(ProtocolViolation::NotAuthorized)
         }
     }
 }
 
+/// Builder for the kernel-UID-to-role mapping.
+///
+/// Agent identities are optional, but every configured UID is non-root and
+/// distinct, and each UID and Agent role can occur at most once.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct PeerAllowlistBuilder {
+    companion_uid: u32,
+    application_uid: Option<u32>,
+    openai_uid: Option<u32>,
+    codex_uid: Option<u32>,
+}
+
+impl fmt::Debug for PeerAllowlistBuilder {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PeerAllowlistBuilder")
+            .field("companion_configured", &(self.companion_uid != 0))
+            .field("application_configured", &self.application_uid.is_some())
+            .field("openai_configured", &self.openai_uid.is_some())
+            .field("codex_configured", &self.codex_uid.is_some())
+            .finish()
+    }
+}
+
+impl PeerAllowlistBuilder {
+    /// Adds exactly one UID mapping for `role`.
+    pub fn agent(mut self, role: AgentRole, uid: u32) -> Result<Self, ProtocolViolation> {
+        if uid == 0
+            || uid == self.companion_uid
+            || self.application_uid == Some(uid)
+            || self.openai_uid == Some(uid)
+            || self.codex_uid == Some(uid)
+            || self.uid_for(role).is_some()
+        {
+            return Err(ProtocolViolation::InvalidAllowlist);
+        }
+        *self.uid_for_mut(role) = Some(uid);
+        Ok(self)
+    }
+
+    /// Validates and seals the complete mapping.
+    pub fn build(self) -> Result<PeerAllowlist, ProtocolViolation> {
+        let configured = [self.application_uid, self.openai_uid, self.codex_uid];
+        if self.companion_uid == 0
+            || configured
+                .iter()
+                .flatten()
+                .any(|uid| *uid == 0 || *uid == self.companion_uid)
+            || configured.iter().flatten().enumerate().any(|(index, uid)| {
+                configured
+                    .iter()
+                    .flatten()
+                    .skip(index + 1)
+                    .any(|other| other == uid)
+            })
+        {
+            return Err(ProtocolViolation::InvalidAllowlist);
+        }
+        Ok(PeerAllowlist {
+            companion_uid: self.companion_uid,
+            application_uid: self.application_uid,
+            openai_uid: self.openai_uid,
+            codex_uid: self.codex_uid,
+        })
+    }
+
+    fn uid_for(self, role: AgentRole) -> Option<u32> {
+        match role {
+            AgentRole::Application => self.application_uid,
+            AgentRole::OpenAi => self.openai_uid,
+            AgentRole::Codex => self.codex_uid,
+        }
+    }
+
+    fn uid_for_mut(&mut self, role: AgentRole) -> &mut Option<u32> {
+        match role {
+            AgentRole::Application => &mut self.application_uid,
+            AgentRole::OpenAi => &mut self.openai_uid,
+            AgentRole::Codex => &mut self.codex_uid,
+        }
+    }
+}
+
+/// Purpose-specific Agent identity derived exclusively from its allowlisted
+/// kernel UID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentRole {
+    Application,
+    OpenAi,
+    Codex,
+}
+
 /// Role derived exclusively from a kernel-authenticated peer UID.
 ///
-/// The protocol retains future Agent audit/report shapes, while the shipping
-/// Rescue daemon further restricts its OpenAI Agent UID to status plus one
-/// leased OpenAI credential borrow operation.
+/// Agent purpose is part of this server-side capability rather than the wire
+/// envelope. The shipping Rescue daemon constructs only an OpenAI Agent role
+/// and further restricts it to status plus one leased OpenAI credential borrow
+/// operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PeerRole {
     Companion,
-    Agent,
+    Agent(AgentRole),
 }
 
 /// An authenticated server-side connection to one allowlisted peer.
@@ -302,16 +407,38 @@ pub enum Operation {
 
 impl Operation {
     fn permits(self, role: PeerRole) -> bool {
-        match self {
-            Self::VaultUnlock
-            | Self::VaultLock
-            | Self::ProviderOpenAiConfigure
-            | Self::ProviderLogout => role == PeerRole::Companion,
-            Self::ProviderOpenAiBorrow
-            | Self::ProviderCodexHomeLease
-            | Self::AuditAppend
-            | Self::ReportPersist => role == PeerRole::Agent,
-            Self::VaultStatus | Self::ProviderStatus | Self::ReportList | Self::ReportGet => true,
+        match role {
+            PeerRole::Companion => matches!(
+                self,
+                Self::VaultStatus
+                    | Self::VaultUnlock
+                    | Self::VaultLock
+                    | Self::ProviderOpenAiConfigure
+                    | Self::ProviderStatus
+                    | Self::ProviderLogout
+                    | Self::ReportList
+                    | Self::ReportGet
+            ),
+            PeerRole::Agent(AgentRole::Application) => matches!(
+                self,
+                Self::VaultStatus
+                    | Self::ProviderStatus
+                    | Self::AuditAppend
+                    | Self::ReportPersist
+                    | Self::ReportList
+                    | Self::ReportGet
+            ),
+            PeerRole::Agent(AgentRole::OpenAi) => matches!(
+                self,
+                Self::VaultStatus | Self::ProviderStatus | Self::ProviderOpenAiBorrow
+            ),
+            PeerRole::Agent(AgentRole::Codex) => matches!(
+                self,
+                Self::VaultStatus
+                    | Self::ProviderStatus
+                    | Self::ProviderLogout
+                    | Self::ProviderCodexHomeLease
+            ),
         }
     }
 }
@@ -809,6 +936,16 @@ fn decode_request(
     }
 
     let payload = parse_payload(wire.operation, wire.payload).map_err(RequestDecodeError::Close)?;
+    if !request_payload_is_authorized(peer.role, &payload) {
+        return Err(rejected_request(
+            request_id,
+            wire.operation,
+            ProtocolViolation::NotAuthorized,
+            ErrorToken::NotAuthorized,
+            peer.connection_identity,
+            Arc::clone(&peer.connection_token),
+        ));
+    }
     if let Err(violation) = validate_received_descriptors(&payload, &received_descriptors) {
         let Some(error) = violation.error_token() else {
             return Err(RequestDecodeError::Close(violation));
@@ -834,6 +971,17 @@ fn decode_request(
         connection_identity: peer.connection_identity,
         connection_token: peer.connection_token,
     })
+}
+
+fn request_payload_is_authorized(role: PeerRole, payload: &RequestPayload) -> bool {
+    match (role, payload) {
+        (PeerRole::Agent(AgentRole::Codex), RequestPayload::ProviderLogout { provider }) => {
+            *provider == Provider::Codex
+        }
+        (PeerRole::Companion, RequestPayload::ProviderLogout { .. }) => true,
+        (_, RequestPayload::ProviderLogout { .. }) => false,
+        _ => true,
+    }
 }
 
 fn rejected_request(
@@ -1582,9 +1730,28 @@ mod tests {
 
     const REQUEST_ID: &str = "R-12345678-1234-1234-1234-123456789abc";
     const DEVICE_ID: &str = "KA-0123456789abcdef01234567";
+    const COMPANION_UID: u32 = 1000;
+    const APPLICATION_UID: u32 = 1001;
+    const OPENAI_UID: u32 = 1002;
+    const CODEX_UID: u32 = 1003;
 
     fn allowlist() -> PeerAllowlist {
-        PeerAllowlist::new(1000, 1001).expect("valid test allowlist")
+        PeerAllowlist::builder(COMPANION_UID)
+            .agent(AgentRole::Application, APPLICATION_UID)
+            .and_then(|builder| builder.agent(AgentRole::OpenAi, OPENAI_UID))
+            .and_then(|builder| builder.agent(AgentRole::Codex, CODEX_UID))
+            .and_then(PeerAllowlistBuilder::build)
+            .expect("valid test allowlist")
+    }
+
+    fn one_agent_allowlist(
+        companion_uid: u32,
+        role: AgentRole,
+        agent_uid: u32,
+    ) -> Result<PeerAllowlist, ProtocolViolation> {
+        PeerAllowlist::builder(companion_uid)
+            .agent(role, agent_uid)?
+            .build()
     }
 
     fn peer(uid: u32) -> PeerIdentity {
@@ -1656,7 +1823,7 @@ mod tests {
             // The production allowlist intentionally cannot authorize root as
             // either unprivileged role.
             assert_eq!(
-                PeerAllowlist::new(uid, 1).err(),
+                one_agent_allowlist(uid, AgentRole::OpenAi, 1).err(),
                 Some(ProtocolViolation::InvalidAllowlist)
             );
             return;
@@ -1664,7 +1831,7 @@ mod tests {
         let other = if uid == 1 { 2 } else { 1 };
         let authenticated = authenticate_seqpacket_peer(
             second.as_fd(),
-            PeerAllowlist::new(uid, other).expect("allowlist"),
+            one_agent_allowlist(uid, AgentRole::OpenAi, other).expect("allowlist"),
         )
         .expect("authenticated peer");
         assert_eq!(authenticated.pid(), pid);
@@ -1685,7 +1852,7 @@ mod tests {
         assert_eq!(
             authenticate_seqpacket_peer(
                 stream.as_fd(),
-                PeerAllowlist::new(uid, other).expect("allowlist"),
+                one_agent_allowlist(uid, AgentRole::OpenAi, other).expect("allowlist"),
             )
             .err(),
             Some(ProtocolViolation::InvalidTransport)
@@ -1718,7 +1885,7 @@ mod tests {
             return;
         }
         let other = if uid == 1 { 2 } else { 1 };
-        let allowlist = PeerAllowlist::new(uid, other).expect("allowlist");
+        let allowlist = one_agent_allowlist(uid, AgentRole::OpenAi, other).expect("allowlist");
         let peer_a = authenticate_seqpacket_peer(server_a.as_fd(), allowlist)
             .expect("authenticate first peer");
         let peer_a_reauthenticated = authenticate_seqpacket_peer(server_a.as_fd(), allowlist)
@@ -1825,7 +1992,7 @@ mod tests {
         let other = if uid == 1 { 2 } else { 1 };
         let peer = authenticate_seqpacket_peer(
             server.as_fd(),
-            PeerAllowlist::new(uid, other).expect("allowlist"),
+            one_agent_allowlist(uid, AgentRole::OpenAi, other).expect("allowlist"),
         )
         .expect("authenticate peer");
         crate::rescue_vault_transport::send_seqpacket(
@@ -1893,6 +2060,58 @@ mod tests {
             PeerAllowlist::companion_only(0),
             Err(ProtocolViolation::InvalidAllowlist)
         );
+    }
+
+    #[test]
+    fn allowlist_builder_rejects_root_aliases_and_duplicate_assignments() {
+        assert_eq!(
+            PeerAllowlist::builder(0).build(),
+            Err(ProtocolViolation::InvalidAllowlist)
+        );
+        assert_eq!(
+            PeerAllowlist::builder(1000)
+                .agent(AgentRole::OpenAi, 0)
+                .err(),
+            Some(ProtocolViolation::InvalidAllowlist)
+        );
+        assert_eq!(
+            PeerAllowlist::builder(1000)
+                .agent(AgentRole::OpenAi, 1000)
+                .err(),
+            Some(ProtocolViolation::InvalidAllowlist)
+        );
+        let openai = PeerAllowlist::builder(1000)
+            .agent(AgentRole::OpenAi, 1001)
+            .expect("first role assignment");
+        assert_eq!(
+            openai.agent(AgentRole::OpenAi, 1002).err(),
+            Some(ProtocolViolation::InvalidAllowlist)
+        );
+        assert_eq!(
+            openai.agent(AgentRole::Codex, 1001).err(),
+            Some(ProtocolViolation::InvalidAllowlist)
+        );
+        let builder_debug = format!("{openai:?}");
+        assert!(!builder_debug.contains("1000"));
+        assert!(!builder_debug.contains("1001"));
+
+        let allowlist = allowlist();
+        assert_eq!(
+            allowlist.role_for(APPLICATION_UID),
+            Ok(PeerRole::Agent(AgentRole::Application))
+        );
+        assert_eq!(
+            allowlist.role_for(OPENAI_UID),
+            Ok(PeerRole::Agent(AgentRole::OpenAi))
+        );
+        assert_eq!(
+            allowlist.role_for(CODEX_UID),
+            Ok(PeerRole::Agent(AgentRole::Codex))
+        );
+        let debug = format!("{allowlist:?}");
+        for uid in [COMPANION_UID, APPLICATION_UID, OPENAI_UID, CODEX_UID] {
+            assert!(!debug.contains(&uid.to_string()));
+        }
     }
 
     #[test]
@@ -2031,7 +2250,7 @@ mod tests {
                 "vault.unlock",
                 "{\"input\":{\"type\":\"passphrase-pipe\",\"size\":12}}",
             ),
-            peer(1001),
+            peer(APPLICATION_UID),
             vec![read_pipe()],
         )
         .expect_err("role rejection");
@@ -2141,7 +2360,7 @@ mod tests {
         );
         assert!(decode_request(&unlock, peer(1000), vec![read_pipe()]).is_ok());
         assert_eq!(
-            decode_request(&unlock, peer(1001), vec![read_pipe()]).err(),
+            decode_request(&unlock, peer(APPLICATION_UID), vec![read_pipe()]).err(),
             Some(ProtocolViolation::NotAuthorized)
         );
         assert_eq!(
@@ -2202,7 +2421,7 @@ mod tests {
                 "{\"input\":{\"type\":\"openai-api-key-pipe\",\"size\":64}}".to_owned(),
                 1000,
             ),
-            ("report.persist", report_payload, 1001),
+            ("report.persist", report_payload, APPLICATION_UID),
         ];
         for (operation, payload, uid) in cases {
             let (_directory, fifo) = named_fifo();
@@ -2217,21 +2436,25 @@ mod tests {
     #[test]
     fn every_operation_has_a_strict_role_and_payload() {
         let cases = [
-            ("vault.lock", "{}", 1000),
-            ("provider.status", "{}", 1001),
-            ("provider.logout", "{\"provider\":\"openai\"}", 1000),
-            ("provider.openai.borrow", "{}", 1001),
-            ("provider.codex.home_lease", "{}", 1001),
+            ("vault.lock", "{}", COMPANION_UID),
+            ("provider.status", "{}", OPENAI_UID),
+            (
+                "provider.logout",
+                "{\"provider\":\"openai\"}",
+                COMPANION_UID,
+            ),
+            ("provider.openai.borrow", "{}", OPENAI_UID),
+            ("provider.codex.home_lease", "{}", CODEX_UID),
             (
                 "audit.append",
                 "{\"sequence\":1,\"event\":\"agent-session-start\",\"outcome\":\"failed\",\"error\":\"IO_FAILED\"}",
-                1001,
+                APPLICATION_UID,
             ),
-            ("report.list", "{}", 1000),
+            ("report.list", "{}", COMPANION_UID),
             (
                 "report.get",
                 "{\"reportId\":\"RP-12345678-1234-1234-1234-123456789abc\"}",
-                1001,
+                APPLICATION_UID,
             ),
         ];
         for (operation, payload, uid) in cases {
@@ -2241,7 +2464,7 @@ mod tests {
         assert_eq!(
             decode_request(
                 &request("provider.codex.home_lease", "{}"),
-                peer(1000),
+                peer(COMPANION_UID),
                 Vec::new(),
             )
             .err(),
@@ -2268,7 +2491,7 @@ mod tests {
                 "a".repeat(64)
             ),
         );
-        assert!(decode_request(&persist, peer(1001), vec![read_pipe()]).is_ok());
+        assert!(decode_request(&persist, peer(APPLICATION_UID), vec![read_pipe()]).is_ok());
 
         let oversized_persist = request(
             "report.persist",
@@ -2279,7 +2502,7 @@ mod tests {
             ),
         );
         assert_eq!(
-            decode_request(&oversized_persist, peer(1001), vec![read_pipe()]).err(),
+            decode_request(&oversized_persist, peer(APPLICATION_UID), vec![read_pipe()],).err(),
             Some(ProtocolViolation::InvalidPayload)
         );
     }
@@ -2291,51 +2514,72 @@ mod tests {
             "{{\"reportId\":\"RP-12345678-1234-1234-1234-123456789abc\",\"payloadSha256\":\"{report_hash}\",\"input\":{{\"type\":\"session-report-json-pipe\",\"size\":512}}}}"
         );
         let cases = [
-            ("vault.status", "{}", false, true, true),
+            ("vault.status", "{}", false, [true, true, true, true]),
             (
                 "vault.unlock",
                 "{\"input\":{\"type\":\"passphrase-pipe\",\"size\":12}}",
                 true,
-                true,
-                false,
+                [true, false, false, false],
             ),
-            ("vault.lock", "{}", false, true, false),
+            ("vault.lock", "{}", false, [true, false, false, false]),
             (
                 "provider.openai.configure",
                 "{\"input\":{\"type\":\"openai-api-key-pipe\",\"size\":64}}",
                 true,
-                true,
-                false,
+                [true, false, false, false],
             ),
-            ("provider.status", "{}", false, true, true),
+            ("provider.status", "{}", false, [true, true, true, true]),
             (
                 "provider.logout",
                 "{\"provider\":\"openai\"}",
                 false,
-                true,
-                false,
+                [true, false, false, false],
             ),
-            ("provider.openai.borrow", "{}", false, false, true),
-            ("provider.codex.home_lease", "{}", false, false, true),
+            (
+                "provider.logout",
+                "{\"provider\":\"codex\"}",
+                false,
+                [true, false, false, true],
+            ),
+            (
+                "provider.openai.borrow",
+                "{}",
+                false,
+                [false, false, true, false],
+            ),
+            (
+                "provider.codex.home_lease",
+                "{}",
+                false,
+                [false, false, false, true],
+            ),
             (
                 "audit.append",
                 "{\"sequence\":1,\"event\":\"agent-session-start\",\"outcome\":\"succeeded\"}",
                 false,
-                false,
-                true,
+                [false, true, false, false],
             ),
-            ("report.persist", report_persist.as_str(), true, false, true),
-            ("report.list", "{}", false, true, true),
+            (
+                "report.persist",
+                report_persist.as_str(),
+                true,
+                [false, true, false, false],
+            ),
+            ("report.list", "{}", false, [true, true, false, false]),
             (
                 "report.get",
                 "{\"reportId\":\"RP-12345678-1234-1234-1234-123456789abc\"}",
                 false,
-                true,
-                true,
+                [true, true, false, false],
             ),
         ];
-        for (operation, payload, needs_descriptor, companion, agent) in cases {
-            for (uid, allowed) in [(1000, companion), (1001, agent)] {
+        for (operation, payload, needs_descriptor, permissions) in cases {
+            for (uid, allowed) in [
+                (COMPANION_UID, permissions[0]),
+                (APPLICATION_UID, permissions[1]),
+                (OPENAI_UID, permissions[2]),
+                (CODEX_UID, permissions[3]),
+            ] {
                 let descriptors = needs_descriptor.then(read_pipe).into_iter().collect();
                 let result = decode_request(&request(operation, payload), peer(uid), descriptors);
                 if allowed {
@@ -2364,7 +2608,12 @@ mod tests {
                 "{{\"sequence\":1,\"event\":\"{privileged_event}\",\"outcome\":\"succeeded\"}}"
             );
             assert_eq!(
-                decode_request(&request("audit.append", &payload), peer(1001), Vec::new(),).err(),
+                decode_request(
+                    &request("audit.append", &payload),
+                    peer(APPLICATION_UID),
+                    Vec::new(),
+                )
+                .err(),
                 Some(ProtocolViolation::InvalidPayload)
             );
         }
@@ -2390,7 +2639,7 @@ mod tests {
         assert!(
             decode_request(
                 &request("audit.append", &maximum_audit),
-                peer(1001),
+                peer(APPLICATION_UID),
                 Vec::new(),
             )
             .is_ok()
@@ -2402,7 +2651,7 @@ mod tests {
         assert_eq!(
             decode_request(
                 &request("audit.append", &oversized_audit),
-                peer(1001),
+                peer(APPLICATION_UID),
                 Vec::new(),
             )
             .err(),
@@ -2481,7 +2730,7 @@ mod tests {
     fn success_encoder_checks_operation_and_output_descriptor_shape() {
         let request = decode_request(
             &request("provider.openai.borrow", "{}"),
-            peer(1001),
+            peer(OPENAI_UID),
             Vec::new(),
         )
         .expect("borrow request");
@@ -2538,7 +2787,7 @@ mod tests {
         );
         let mut persist = decode_request(
             &request("report.persist", &persist_body),
-            peer(1001),
+            peer(APPLICATION_UID),
             vec![read_pipe()],
         )
         .expect("raw report payload request");
@@ -2549,7 +2798,7 @@ mod tests {
         assert_eq!(
             decode_request(
                 &request("report.persist", &wrong_input),
-                peer(1001),
+                peer(APPLICATION_UID),
                 vec![read_pipe()],
             )
             .err(),
@@ -2581,7 +2830,7 @@ mod tests {
                 "report.get",
                 "{\"reportId\":\"RP-12345678-1234-1234-1234-123456789abc\"}",
             ),
-            peer(1001),
+            peer(APPLICATION_UID),
             Vec::new(),
         )
         .expect("report get request");
@@ -2717,7 +2966,7 @@ mod tests {
     fn codex_home_response_requires_an_o_path_directory() {
         let request = decode_request(
             &request("provider.codex.home_lease", "{}"),
-            peer(1001),
+            peer(CODEX_UID),
             Vec::new(),
         )
         .expect("home lease request");

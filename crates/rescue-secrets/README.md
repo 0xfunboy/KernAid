@@ -10,10 +10,11 @@ additionally requires `privileged-probe`.
 
 It remains an experimental, feature-gated manager rather than a production
 credential service. The lifecycle daemon, terminal companion, systemd
-isolation and Rescue ISO packaging are implemented, with privileged BIOS/UEFI
-QEMU lifecycle qualification in the Rescue workflow. Physical-machine,
-real-account OpenAI TLS and rollback-resistant hardware anchoring remain
-separate release gates.
+isolation and Rescue ISO packaging are implemented, and the Rescue workflow
+defines privileged BIOS and UEFI lifecycle gates. An exact image revision is
+virtually qualified only after both lifecycle jobs finish successfully.
+Physical-machine, real-account OpenAI TLS and rollback-resistant hardware
+anchoring remain separate release gates.
 
 ## Experimental manager API
 
@@ -58,12 +59,15 @@ reboot-required host fault rather than retry inside that process.
 
 The selected vault device is different: its pre-unlock classifier reads only
 the manager's retained read-only descriptor and runs no external command.
-`cryptsetup open` is the first operation allowed to reopen that descriptor as
-a mutating capability, and it receives only
-`/proc/<daemon-pid>/fd/<retained-fd>`. Later cache-free `blkid` checks receive
-only retained mapper procfds. The direct `/dev/<node>` names remain repeated
-identity checkpoints and are never child-tool device arguments, so a udev
-rename or replacement cannot retarget an operation.
+`cryptsetup open` is the first external operation allowed to consume that
+descriptor as a mutating capability. It receives one child-owned inherited
+duplicate as `/proc/self/fd/<n>` while the passphrase remains on stdin. Later
+cache-free `blkid` checks receive one child-owned mapper duplicate on fd 0 and
+address it only as `/proc/self/fd/0`. The parent's retained descriptors remain
+CLOEXEC and are never reopened through `/proc/<parent-pid>/fd`. The direct
+`/dev/<node>` names remain repeated identity checkpoints and are never
+child-tool device arguments, so a udev rename or replacement cannot retarget
+an operation.
 
 An accepted vault must already contain this root-owned layout:
 
@@ -149,9 +153,10 @@ partition number, disk sequence, 512-byte logical sectors, at least the
 qualified 32 GB media capacity, and the exact layout-v1 p3 start/length. It
 then opens the parent and p3 direct nodes read-only with NOFOLLOW, NONBLOCK and
 CLOEXEC. Fixed, bounded `/usr/sbin/blockdev` children perform the actual
-BLKGETDISKSEQ and geometry ioctls only through
-`/proc/<locator-pid>/fd/<retained-fd>`; no mutable device pathname is handed to
-the tool and all queries share one aggregate deadline. The
+BLKGETDISKSEQ and geometry ioctls through one child-owned descriptor duplicate
+on fd 0, addressed only as `/proc/self/fd/0`; no mutable device pathname or
+parent procfd is handed to the tool and all queries share one aggregate
+deadline. The
 retained parent descriptor must contain the complete finalized layout-v1 MBR:
 qualified ISO slots 1/2 before the vault, exact slot 3, and an all-zero reserved
 slot 4. The complete mountinfo/sysfs/FD/ioctl/MBR identity is checked twice
@@ -161,8 +166,10 @@ That sealed capability can be moved directly into
 `VaultUnlockRequest::from_located`. Its validated kernel node name remains
 crate-private, and the experimental manager keeps the locator descriptor open
 while binding every pathname checkpoint to its major/minor, disk sequence and
-capacity. Cryptsetup and blkid receive only the retained daemon procfd; no IPC
-field exposes or selects the checkpoint name.
+capacity. Cryptsetup receives only its inherited child-owned device duplicate
+while stdin remains the passphrase; blkid receives only a child-owned fd-0
+duplicate. No child reopens a non-dumpable parent procfd, and no IPC field
+exposes or selects the checkpoint name.
 
 This constructor is not by itself a production unlock claim. The feature-gated
 daemon now owns the private mount namespace, restart recovery and IPC lifecycle,
@@ -177,13 +184,16 @@ not prove that p3 is provisioned; that remains a later typed service step.
 
 ## Closed application store
 
-`RescueVaultSecrets::open_application_store` is the production persistence
-surface. It is load-only for `DeviceIdentity`: an identity must already exist,
-and journal sequence one must be the sole canonical `vault.identity.bound`
-event containing the matching device ID and public-key SHA-256. Authenticated
-replay is side-effect-free; only after the complete chain is accepted may one
-tail intent be recovered. Unknown, non-canonical, duplicate, out-of-order, or
-raw caller-supplied journal events fail closed.
+`RescueVaultSecrets::open_application_store` is the closed, intended production
+library surface. It is implemented and tested, but the shipping Rescue image
+does not create an `Agent(Application)` UID, unit, socket, or allowlist entry,
+so audit and report operations are not shipping-reachable. The store is
+load-only for `DeviceIdentity`: an identity must already exist, and journal
+sequence one must be the sole canonical `vault.identity.bound` event containing
+the matching device ID and public-key SHA-256. Authenticated replay is
+side-effect-free; only after the complete chain is accepted may one tail intent
+be recovered. Unknown, non-canonical, duplicate, out-of-order, or raw
+caller-supplied journal events fail closed.
 
 The store exposes only these bounded operations:
 
@@ -194,7 +204,8 @@ The store exposes only these bounded operations:
   `RENAME_EXCHANGE`, retaining the old value as the transaction-bound stage
   until the applied completion is durable;
 - typed Agent lifecycle audit accepted only as an authenticated
-  `kernaid_protocol::rescue_vault::ValidatedRequest`. Request IDs are kept in
+  `Agent(Application)` `kernaid_protocol::rescue_vault::ValidatedRequest`.
+  OpenAI and Codex Agent identities cannot append it. Request IDs are kept in
   an exact bounded `[u8; 16]` replay set, sequence is monotonic within a
   lifecycle, and a fresh successful session-start explicitly begins a new
   lifecycle while failed/rejected starts do not replace the active one; and
@@ -277,13 +288,14 @@ Rescue ISO.
 With `experimental-vault-manager`, `kernaid-rescue-vaultd` implements the
 closed `vault.status`, `vault.unlock`, and `vault.lock` lifecycle plus the
 configuration-only `provider.status`, `provider.openai.configure`, and OpenAI
-form of `provider.logout`. The exact OpenAI Agent may also invoke
-`provider.openai.borrow`; Codex logout/home lease, Agent audit, and report
-persist/list/get remain disabled and are answered `NOT_AUTHORIZED`, with no
-output descriptor and no worker dispatch. Provider status returns only the
-configured/unconfigured state; it never returns a credential. Provider
-operations require the vault to be unlocked and are serialized with each
-other and with vault lifecycle work. Status does not change `stateVersion`;
+form of `provider.logout`. The exact `Agent(OpenAi)` identity may also invoke
+`provider.openai.borrow`; Application and Codex roles are not present in the
+shipping allowlist. Codex status/logout/home lease, Application audit, and
+report persist/list/get are rejected before state or worker dispatch and are
+answered `NOT_AUTHORIZED`, with no output descriptor. Provider status returns
+only the configured/unconfigured state; it never returns a credential.
+Provider operations require the vault to be unlocked and are serialized with
+each other and with vault lifecycle work. Status does not change `stateVersion`;
 configure and logout each reserve and complete a transition, so a correlated
 success is exactly the request version plus two. The public socket is the
 fixed top-level `/run/kernaid-rescue-vault.sock`; the daemon accepts only
@@ -431,9 +443,11 @@ root-owned runtime/tmpfiles boundary, and fail-closed core/swap and UID-1000
 policy. It also creates the dynamic `kernaid-openai` nologin/no-home identity,
 adds only that identity to `kernaid-vault`, and resolves its collision-free UID
 from the descriptor-validated passwd file before constructing the daemon peer
-allowlist. The shipping OpenAI Agent is restricted to `vault.status`,
-`provider.status`, and leased `provider.openai.borrow`; all mutation, Codex,
-audit and report operations remain unavailable at the server boundary. The
+allowlist as `Agent(OpenAi)`. No Application or Codex UID, unit, socket,
+capability, network rule, or home is created. The shipping OpenAI Agent is
+restricted to `vault.status`, `provider.status`, and leased
+`provider.openai.borrow`; all mutation, Codex, audit and report operations
+remain unavailable at the server boundary. The
 target systemd 257 vault unit intentionally omits `RestrictSUIDSGID`
 because that version implements it by denying all `openat2` calls; the daemon's
 descriptor-bound path validation requires `openat2`, while `NoNewPrivileges`,
@@ -471,8 +485,8 @@ command primitive.
   mounts visible in other namespaces;
 - exercise crash windows, additional-holder races, and real hardware in the
   privileged test matrix;
-- run the packaged service and companion through the separate BIOS/UEFI,
-  two-boot privileged QEMU lifecycle matrix; and
+- require both packaged BIOS and UEFI two-boot privileged QEMU lifecycle jobs
+  to pass on the exact image revision being qualified; and
 - add TPM/Fleet anchoring for rollback detection across full vault-image
   replay.
 
