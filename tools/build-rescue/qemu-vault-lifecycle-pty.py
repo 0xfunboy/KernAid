@@ -2090,7 +2090,7 @@ def run_companion(
             stage="secret-prompt",
         )
         if prompt_match.start() != begin_match.end():
-            raise ClosedFailure("response", "prompt-invalid")
+            raise ClosedFailure(stage, "response-prompt-invalid")
         console.send(secret, deadline=_deadline(aggregate, 5.0))
         console.send(b"\n", deadline=_deadline(aggregate, 5.0))
     end_pattern = _return_code_line_pattern(end)
@@ -2102,7 +2102,14 @@ def run_companion(
     )
     return_code = int(end_match.group(1))
     block = console.capture.snapshot()[begin_match.end() : end_match.start()]
-    response = parse_companion_response(block, command=command, return_code=return_code)
+    try:
+        response = parse_companion_response(
+            block, command=command, return_code=return_code
+        )
+    except ClosedFailure as error:
+        if error.stage == "response":
+            raise ClosedFailure(stage, f"response-{error.code}") from error
+        raise
     return response, end_match.end()
 
 

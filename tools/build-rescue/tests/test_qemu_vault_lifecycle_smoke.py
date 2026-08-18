@@ -885,6 +885,23 @@ class ResponseParserTests(unittest.TestCase):
         self.assertIn(b"READY", console.waited[1])
         self.assertEqual(console.sent[1:], [bytes(secret), b"\n"])
 
+        malformed = ScriptedConsole(
+            transcript.replace(
+                b"stateVersion: 12\r\n", b"[  12.000000] external console line\r\n"
+            )
+        )
+        with self.assertRaises(controller.ClosedFailure) as observed:
+            controller.run_companion(
+                malformed,
+                "unlock",
+                stage,
+                0,
+                time.monotonic() + 10,
+                secret,
+            )
+        self.assertEqual(observed.exception.stage, stage)
+        self.assertEqual(observed.exception.code, "response-version-invalid")
+
         missing_ready = transcript.replace(b"READY\r\n", b"NOT_READY\r\n")
         blocked = ScriptedConsole(missing_ready)
         with self.assertRaises(controller.ClosedFailure):

@@ -266,7 +266,11 @@ class VaultLivePolicyTests(unittest.TestCase):
     def test_core_dump_policy_is_global_and_fail_closed(self) -> None:
         self.assertEqual(
             active_lines(SYSCTL),
-            ["kernel.core_pattern =", "kernel.core_uses_pid = 0"],
+            [
+                "kernel.core_pattern =",
+                "kernel.core_uses_pid = 0",
+                "kernel.printk = 5 4 1 7",
+            ],
         )
         self.assertEqual(
             active_lines(COREDUMP),
@@ -275,6 +279,11 @@ class VaultLivePolicyTests(unittest.TestCase):
         ready = READY_CHECK.read_text(encoding="utf-8")
         self.assertIn("/proc/sys/kernel/core_pattern", ready)
         self.assertIn("/proc/sys/kernel/core_uses_pid", ready)
+        self.assertIn("/proc/sys/kernel/printk", ready)
+        self.assertIn(
+            '"$printk_console:$printk_default:$printk_minimum:$printk_boot" = "5:4:1:7"',
+            ready,
+        )
         self.assertIn("/proc/swaps", ready)
         self.assertIn(
             "--value kernaid-rescue-vaultd.service)", ready
@@ -300,6 +309,18 @@ class VaultLivePolicyTests(unittest.TestCase):
             bootappend,
         )
         self.assertIn("systemd.swap=0", bootappend.split())
+        self.assertEqual(bootappend.split().count("quiet"), 1)
+        self.assertEqual(bootappend.split().count("loglevel=5"), 1)
+        self.assertLess(
+            bootappend.split().index("quiet"),
+            bootappend.split().index("loglevel=5"),
+        )
+        self.assertFalse(
+            any(
+                token.startswith("loglevel=") and token != "loglevel=5"
+                for token in bootappend.split()
+            )
+        )
         self.assertNotIn("swap=true", bootappend.split())
 
         hook = SAFETY_HOOK.read_text(encoding="utf-8")
