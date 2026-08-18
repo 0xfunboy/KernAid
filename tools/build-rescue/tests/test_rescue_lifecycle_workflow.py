@@ -248,6 +248,13 @@ class RescueLifecycleWorkflowTests(unittest.TestCase):
         self.assertEqual(
             self.workflow.count("pre_terminal_capabilities_exact=true"), 2
         )
+        self.assertEqual(
+            self.workflow.count("production_ui_provider_relay_path=true"), 4
+        )
+        self.assertEqual(
+            harness.count("production_ui_provider_relay_path=true"), 2
+        )
+        self.assertEqual(harness.count("    -nic none\n"), 1)
         self.assertNotIn(" daemon_processes_stable=true", self.workflow)
         self.assertNotIn(" capabilities_exact=true", self.workflow)
         self.assertNotIn("persistent_fault_after_each_boot", self.workflow)

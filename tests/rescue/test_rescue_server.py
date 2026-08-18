@@ -1186,6 +1186,373 @@ class ObserveBrokerTests(unittest.TestCase):
                 rescue_server.BROKERS.clear()
 
 
+class ProviderRelayTests(unittest.TestCase):
+    REQUEST = (
+        b'{"apiVersion":"kernaid.dev/rescue-openai/v1alpha1",'
+        b'"requestId":"O-11111111-1111-1111-1111-111111111111",'
+        b'"operation":"provider.status","payload":{}}\n'
+    )
+    RESPONSE = (
+        b'{"apiVersion":"kernaid.dev/rescue-openai/v1alpha1",'
+        b'"requestId":"O-11111111-1111-1111-1111-111111111111",'
+        b'"operation":"provider.status","ok":true,"payload":{'
+        b'"provider":"openai","profile":"rescue-default",'
+        b'"vault":"locked","credential":"unavailable"}}\n'
+    )
+
+    class FakeProviderSocket:
+        family = socket.AF_UNIX
+
+        def __init__(
+            self,
+            response: bytes,
+            *,
+            ancillary: list[tuple[int, int, bytes]] | None = None,
+            flags: int = 0,
+        ) -> None:
+            self.response = response
+            self.ancillary = [] if ancillary is None else ancillary
+            self.flags = flags
+            self.timeouts: list[float] = []
+            self.connected: list[str] = []
+            self.sent: list[bytes] = []
+            self.recvmsg_calls: list[tuple[int, int]] = []
+            self.closed = False
+            self.peer = rescue_server.PROVIDER_SOCKET
+            self.socket_type = socket.SOCK_SEQPACKET
+            self.credentials = (123, 0, 0)
+
+        def settimeout(self, value: float) -> None:
+            self.timeouts.append(value)
+
+        def connect(self, path: str) -> None:
+            self.connected.append(path)
+
+        def send(self, value: bytes) -> int:
+            self.sent.append(value)
+            return len(value)
+
+        def recvmsg(
+            self, maximum: int, ancillary_size: int
+        ) -> tuple[bytes, list[tuple[int, int, bytes]], int, None]:
+            self.recvmsg_calls.append((maximum, ancillary_size))
+            return self.response, self.ancillary, self.flags, None
+
+        def getpeername(self) -> str:
+            return self.peer
+
+        def getsockopt(
+            self, level: int, option: int, _size: int | None = None
+        ) -> int | bytes:
+            if level != socket.SOL_SOCKET:
+                raise OSError
+            if option == socket.SO_TYPE:
+                return self.socket_type
+            if option == socket.SO_PEERCRED:
+                return rescue_server.struct.pack("3i", *self.credentials)
+            raise OSError
+
+        def close(self) -> None:
+            self.closed = True
+
+    def start_server(
+        self,
+    ) -> tuple[rescue_server.BoundedThreadingHTTPServer, int]:
+        server = rescue_server.BoundedThreadingHTTPServer(
+            ("127.0.0.1", 0), rescue_server.RescueHandler
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 2)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server, server.server_address[1]
+
+    def test_relay_uses_one_send_one_ancillary_free_recvmsg_and_absolute_deadline(
+        self,
+    ) -> None:
+        provider_socket = self.FakeProviderSocket(self.RESPONSE)
+        with (
+            patch.object(rescue_server.socket, "socket", return_value=provider_socket),
+            patch.object(rescue_server, "_validate_root_provider_peer"),
+            patch.object(rescue_server.time, "monotonic", return_value=100.0),
+        ):
+            response = rescue_server.relay_openai_provider(self.REQUEST, 240.0)
+        self.assertEqual(response, self.RESPONSE)
+        self.assertEqual(provider_socket.connected, [rescue_server.PROVIDER_SOCKET])
+        self.assertEqual(provider_socket.sent, [self.REQUEST])
+        self.assertEqual(
+            provider_socket.recvmsg_calls,
+            [(rescue_server.MAX_PROVIDER_RESPONSE_FRAME_BYTES + 1, 0)],
+        )
+        self.assertEqual(provider_socket.timeouts, [140.0, 140.0, 140.0])
+        self.assertTrue(provider_socket.closed)
+
+    def test_provider_peer_must_be_the_fixed_root_seqpacket_listener(self) -> None:
+        valid = self.FakeProviderSocket(self.RESPONSE)
+        rescue_server._validate_root_provider_peer(valid)
+
+        invalid = []
+        wrong_path = self.FakeProviderSocket(self.RESPONSE)
+        wrong_path.peer = "/run/not-kernaid.sock"
+        invalid.append(wrong_path)
+        wrong_family = self.FakeProviderSocket(self.RESPONSE)
+        wrong_family.family = socket.AF_INET
+        invalid.append(wrong_family)
+        wrong_type = self.FakeProviderSocket(self.RESPONSE)
+        wrong_type.socket_type = socket.SOCK_STREAM
+        invalid.append(wrong_type)
+        for credentials in ((0, 0, 0), (123, 1000, 0), (123, 0, 1000)):
+            wrong_credentials = self.FakeProviderSocket(self.RESPONSE)
+            wrong_credentials.credentials = credentials
+            invalid.append(wrong_credentials)
+        for provider_socket in invalid:
+            with self.assertRaisesRegex(
+                rescue_server.ProviderRelayError, "transport"
+            ):
+                rescue_server._validate_root_provider_peer(provider_socket)
+
+    def test_constructor_failure_and_absolute_timeout_always_release_lock(self) -> None:
+        with patch.object(
+            rescue_server.socket, "socket", side_effect=OSError("closed")
+        ):
+            with self.assertRaisesRegex(rescue_server.ProviderRelayError, "transport"):
+                rescue_server.relay_openai_provider(
+                    self.REQUEST, time.monotonic() + 140
+                )
+        self.assertTrue(rescue_server.PROVIDER_RELAY_LOCK.acquire(blocking=False))
+        rescue_server.PROVIDER_RELAY_LOCK.release()
+
+        close_failure = self.FakeProviderSocket(self.RESPONSE)
+
+        def fail_close() -> None:
+            raise OSError
+
+        close_failure.close = fail_close  # type: ignore[method-assign]
+        with (
+            patch.object(rescue_server.socket, "socket", return_value=close_failure),
+            patch.object(rescue_server, "_validate_root_provider_peer"),
+            patch.object(rescue_server.time, "monotonic", return_value=100.0),
+        ):
+            response = rescue_server.relay_openai_provider(self.REQUEST, 240.0)
+        self.assertEqual(response, self.RESPONSE)
+        self.assertTrue(rescue_server.PROVIDER_RELAY_LOCK.acquire(blocking=False))
+        rescue_server.PROVIDER_RELAY_LOCK.release()
+
+        provider_socket = self.FakeProviderSocket(self.RESPONSE)
+        with (
+            patch.object(rescue_server.socket, "socket", return_value=provider_socket),
+            patch.object(rescue_server, "_validate_root_provider_peer"),
+            patch.object(
+                rescue_server.time, "monotonic", side_effect=[100.0, 241.0]
+            ),
+            self.assertRaisesRegex(rescue_server.ProviderRelayError, "timeout"),
+        ):
+            rescue_server.relay_openai_provider(self.REQUEST, 240.0)
+        self.assertEqual(provider_socket.sent, [])
+        self.assertTrue(provider_socket.closed)
+        self.assertTrue(rescue_server.PROVIDER_RELAY_LOCK.acquire(blocking=False))
+        rescue_server.PROVIDER_RELAY_LOCK.release()
+
+    def test_busy_ancillary_truncation_and_multirecord_frames_fail_closed(self) -> None:
+        self.assertTrue(rescue_server.PROVIDER_RELAY_LOCK.acquire(blocking=False))
+        try:
+            with self.assertRaisesRegex(rescue_server.ProviderRelayError, "busy"):
+                rescue_server.relay_openai_provider(
+                    self.REQUEST, time.monotonic() + 140
+                )
+        finally:
+            rescue_server.PROVIDER_RELAY_LOCK.release()
+
+        for ancillary, flags in (
+            ([(socket.SOL_SOCKET, 1, b"x")], 0),
+            ([], socket.MSG_TRUNC),
+            ([], socket.MSG_CTRUNC),
+        ):
+            provider_socket = self.FakeProviderSocket(
+                self.RESPONSE, ancillary=ancillary, flags=flags
+            )
+            with (
+                patch.object(
+                    rescue_server.socket, "socket", return_value=provider_socket
+                ),
+                patch.object(rescue_server, "_validate_root_provider_peer"),
+                patch.object(rescue_server.time, "monotonic", return_value=100.0),
+                self.assertRaisesRegex(
+                    rescue_server.ProviderRelayError, "invalid_response"
+                ),
+            ):
+                rescue_server.relay_openai_provider(self.REQUEST, 240.0)
+
+        for invalid in (b"{}", b"{}\n{}\n", b"{}\r\n"):
+            with self.assertRaises(rescue_server.ProviderRelayError):
+                rescue_server.relay_openai_provider(invalid, 240.0)
+
+    def test_http_endpoint_forwards_the_complete_frame_without_reencoding(self) -> None:
+        _server, port = self.start_server()
+        with patch.object(
+            rescue_server, "relay_openai_provider", return_value=self.RESPONSE
+        ) as relay:
+            connection = HTTPConnection("127.0.0.1", port, timeout=2)
+            try:
+                connection.request(
+                    "POST",
+                    "/api/rescue/provider/openai",
+                    body=self.REQUEST,
+                    headers={
+                        "Host": "127.0.0.1:4173",
+                        "Origin": "http://127.0.0.1:4173",
+                        "Sec-Fetch-Site": "same-origin",
+                        "Content-Type": "application/json",
+                    },
+                )
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.getheader("Content-Type"), "application/json")
+                self.assertEqual(response.getheader("Cache-Control"), "no-store")
+                self.assertEqual(response.read(), self.RESPONSE)
+            finally:
+                connection.close()
+        relay.assert_called_once()
+        relayed_frame, deadline = relay.call_args.args
+        self.assertEqual(relayed_frame, self.REQUEST)
+        self.assertGreater(deadline, time.monotonic())
+        self.assertLessEqual(deadline - time.monotonic(), 140)
+
+    def test_http_endpoint_rejects_ambiguous_or_encoded_framing(self) -> None:
+        _server, port = self.start_server()
+
+        def raw_status(headers: bytes, body: bytes | None = None) -> int:
+            request_body = self.REQUEST if body is None else body
+            client = socket.create_connection(("127.0.0.1", port), timeout=2)
+            try:
+                client.sendall(
+                    b"POST /api/rescue/provider/openai HTTP/1.1\r\n"
+                    + headers
+                    + b"Connection: close\r\n\r\n"
+                    + request_body
+                )
+                response = bytearray()
+                while chunk := client.recv(4096):
+                    response.extend(chunk)
+                return int(response.split(b" ", maxsplit=2)[1])
+            finally:
+                client.close()
+
+        base = (
+            b"Host: 127.0.0.1:4173\r\n"
+            b"Origin: http://127.0.0.1:4173\r\n"
+            b"Content-Type: application/json\r\n"
+        )
+        length = str(len(self.REQUEST)).encode("ascii")
+        self.assertEqual(
+            raw_status(
+                b"Host: 127.0.0.1:4173\r\n"
+                b"Origin: http://localhost:4173\r\n"
+                b"Content-Type: application/json\r\nContent-Length: "
+                + length
+                + b"\r\n"
+            ),
+            403,
+        )
+        self.assertEqual(
+            raw_status(
+                base
+                + b"Host: 127.0.0.1:4173\r\nContent-Length: "
+                + length
+                + b"\r\n"
+            ),
+            421,
+        )
+        self.assertEqual(
+            raw_status(
+                base
+                + b"Origin: http://127.0.0.1:4173\r\nContent-Length: "
+                + length
+                + b"\r\n"
+            ),
+            403,
+        )
+        self.assertEqual(
+            raw_status(
+                base
+                + b"Content-Type: application/json\r\nContent-Length: "
+                + length
+                + b"\r\n"
+            ),
+            415,
+        )
+        self.assertEqual(
+            raw_status(
+                base
+                + b"Content-Length: "
+                + length
+                + b"\r\nContent-Length: "
+                + length
+                + b"\r\n"
+            ),
+            400,
+        )
+        self.assertEqual(
+            raw_status(base + b"Content-Length: +3\r\n", b"{}\n"), 400
+        )
+        self.assertEqual(
+            raw_status(
+                base
+                + b"Content-Encoding: identity\r\nContent-Length: "
+                + length
+                + b"\r\n"
+            ),
+            400,
+        )
+        self.assertEqual(
+            raw_status(
+                base
+                + b"Transfer-Encoding: chunked\r\nContent-Length: "
+                + length
+                + b"\r\n"
+            ),
+            400,
+        )
+        self.assertEqual(
+            raw_status(
+                base
+                + b"Sec-Fetch-Site: same-origin\r\n"
+                + b"Sec-Fetch-Site: same-origin\r\nContent-Length: "
+                + length
+                + b"\r\n"
+            ),
+            403,
+        )
+
+    def test_http_relay_error_contains_only_a_closed_code(self) -> None:
+        _server, port = self.start_server()
+        with patch.object(
+            rescue_server,
+            "relay_openai_provider",
+            side_effect=rescue_server.ProviderRelayError("transport", 503),
+        ):
+            connection = HTTPConnection("127.0.0.1", port, timeout=2)
+            try:
+                connection.request(
+                    "POST",
+                    "/api/rescue/provider/openai",
+                    body=self.REQUEST,
+                    headers={
+                        "Host": "127.0.0.1:4173",
+                        "Origin": "http://127.0.0.1:4173",
+                        "Content-Type": "application/json",
+                    },
+                )
+                response = connection.getresponse()
+                self.assertEqual(response.status, 503)
+                self.assertEqual(
+                    json.loads(response.read()), {"error": {"code": "transport"}}
+                )
+            finally:
+                connection.close()
+
+
 class InstalledTargetTests(unittest.TestCase):
     def test_qemu_requires_a_bound_fixture_selection_marker(self) -> None:
         ready_check = READY_CHECK.read_text()

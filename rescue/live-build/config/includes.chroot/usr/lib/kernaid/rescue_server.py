@@ -10,6 +10,7 @@ import os
 import signal
 import socket
 import stat
+import struct
 import subprocess
 import threading
 import time
@@ -54,6 +55,11 @@ MAX_SERVER_THREADS = 8
 SOCKET_TIMEOUT_SECONDS = 5
 REQUEST_DEADLINE_SECONDS = 30
 AUTHORIZE_DEADLINE_SECONDS = 18
+PROVIDER_REQUEST_DEADLINE_SECONDS = 142
+PROVIDER_SOCKET_TIMEOUT_SECONDS = 140
+PROVIDER_SOCKET = "/run/kernaid-rescue-openai.sock"
+MAX_PROVIDER_REQUEST_FRAME_BYTES = 96 * 1024
+MAX_PROVIDER_RESPONSE_FRAME_BYTES = 64 * 1024
 MAX_TARGET_DEVICES = 128
 MAX_TARGET_DEPTH = 8
 MAX_TARGET_FIELD_BYTES = 4 * 1024
@@ -63,6 +69,7 @@ RESCUE_TARGET_FINGERPRINT_DOMAIN = "kernaid-rescue-observe-target-v1"
 ALLOWED_HOSTS = {"127.0.0.1:4173", "localhost:4173"}
 ALLOWED_ORIGINS = {"http://127.0.0.1:4173", "http://localhost:4173"}
 TARGET_ID_KEY_FILE = "/run/kernaid-offline-inspector/target-id.key"
+PROVIDER_RELAY_LOCK = threading.Lock()
 
 
 def _load_target_id_key() -> bytes:
@@ -229,6 +236,108 @@ class PrivilegedHelperError(Exception):
         super().__init__(str(error["message"]))
         self.error = error
         self.status = status
+
+
+class ProviderRelayError(Exception):
+    """A closed local-provider transport failure without peer detail."""
+
+    def __init__(self, code: str, status: int) -> None:
+        super().__init__(code)
+        self.code = code
+        self.status = status
+
+
+def _validate_provider_frame(
+    frame: bytes, maximum: int, oversized_code: str
+) -> None:
+    if len(frame) > maximum:
+        status = 413 if oversized_code == "request_too_large" else 502
+        raise ProviderRelayError(oversized_code, status)
+    if (
+        len(frame) < 3
+        or frame[:1] != b"{"
+        or frame[-2:] != b"}\n"
+        or b"\n" in frame[:-1]
+        or b"\r" in frame
+    ):
+        request_frame = oversized_code == "request_too_large"
+        code = "invalid_request" if request_frame else "invalid_response"
+        raise ProviderRelayError(code, 400 if request_frame else 502)
+
+
+def _validate_root_provider_peer(connection: socket.socket) -> None:
+    try:
+        peer = connection.getpeername()
+        socket_type = connection.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE)
+        credentials = connection.getsockopt(
+            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
+        )
+        pid, uid, gid = struct.unpack("3i", credentials)
+    except (OSError, struct.error) as error:
+        raise ProviderRelayError("transport", 503) from error
+    if (
+        connection.family != socket.AF_UNIX
+        or socket_type != socket.SOCK_SEQPACKET
+        or peer != PROVIDER_SOCKET
+        or pid <= 0
+        or uid != 0
+        or gid != 0
+    ):
+        raise ProviderRelayError("transport", 503)
+
+
+def _set_provider_socket_deadline(
+    connection: socket.socket, deadline: float
+) -> None:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise ProviderRelayError("timeout", 504)
+    connection.settimeout(remaining)
+
+
+def relay_openai_provider(frame: bytes, deadline: float) -> bytes:
+    """Forward one already-framed record to the fixed shipping executor."""
+    _validate_provider_frame(
+        frame, MAX_PROVIDER_REQUEST_FRAME_BYTES, "request_too_large"
+    )
+    if not PROVIDER_RELAY_LOCK.acquire(blocking=False):
+        raise ProviderRelayError("busy", 429)
+    connection: socket.socket | None = None
+    try:
+        connection = socket.socket(
+            socket.AF_UNIX, socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC
+        )
+        _set_provider_socket_deadline(connection, deadline)
+        connection.connect(PROVIDER_SOCKET)
+        _validate_root_provider_peer(connection)
+        _set_provider_socket_deadline(connection, deadline)
+        if connection.send(frame) != len(frame):
+            raise ProviderRelayError("transport", 503)
+        _set_provider_socket_deadline(connection, deadline)
+        response, ancillary, flags, _address = connection.recvmsg(
+            MAX_PROVIDER_RESPONSE_FRAME_BYTES + 1, 0
+        )
+        if ancillary or flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC):
+            raise ProviderRelayError("invalid_response", 502)
+        _validate_provider_frame(
+            response, MAX_PROVIDER_RESPONSE_FRAME_BYTES, "response_too_large"
+        )
+        return response
+    except socket.timeout as error:
+        raise ProviderRelayError("timeout", 504) from error
+    except ProviderRelayError:
+        raise
+    except OSError as error:
+        raise ProviderRelayError("transport", 503) from error
+    finally:
+        try:
+            if connection is not None:
+                try:
+                    connection.close()
+                except OSError:
+                    pass
+        finally:
+            PROVIDER_RELAY_LOCK.release()
 
 
 def _remaining_seconds(deadline: float | None) -> float | None:
@@ -1580,31 +1689,58 @@ def authorize_observe(
 
 class RescueHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args: object, **kwargs: object) -> None:
+        self._request_started = 0.0
+        self._request_deadline_lock = threading.Lock()
+        self._request_deadline_generation = 0
+        self._request_deadline_timer: threading.Timer | None = None
         super().__init__(*args, directory=WEB_ROOT, **kwargs)
 
+    def _arm_request_deadline(self, maximum_seconds: float) -> None:
+        with self._request_deadline_lock:
+            self._request_deadline_generation += 1
+            generation = self._request_deadline_generation
+            if self._request_deadline_timer is not None:
+                self._request_deadline_timer.cancel()
+            remaining = max(
+                0.0,
+                self._request_started + maximum_seconds - time.monotonic(),
+            )
+
+            def expire_request() -> None:
+                with self._request_deadline_lock:
+                    if generation != self._request_deadline_generation:
+                        return
+                try:
+                    self.connection.shutdown(2)
+                except OSError:
+                    pass
+                self.connection.close()
+
+            deadline = threading.Timer(remaining, expire_request)
+            deadline.daemon = True
+            self._request_deadline_timer = deadline
+            deadline.start()
+
+    def _cancel_request_deadline(self) -> None:
+        with self._request_deadline_lock:
+            self._request_deadline_generation += 1
+            if self._request_deadline_timer is not None:
+                self._request_deadline_timer.cancel()
+                self._request_deadline_timer = None
+
     def handle(self) -> None:
-        request_started = time.monotonic()
+        self._request_started = time.monotonic()
         self.authorization_deadline = (
-            request_started + AUTHORIZE_DEADLINE_SECONDS
+            self._request_started + AUTHORIZE_DEADLINE_SECONDS
         )
-
-        def expire_request() -> None:
-            try:
-                self.connection.shutdown(2)
-            except OSError:
-                pass
-            self.connection.close()
-
-        deadline = threading.Timer(REQUEST_DEADLINE_SECONDS, expire_request)
-        deadline.daemon = True
-        deadline.start()
+        self._arm_request_deadline(REQUEST_DEADLINE_SECONDS)
         try:
             try:
                 super().handle()
             except (BrokenPipeError, ConnectionResetError):
                 pass
         finally:
-            deadline.cancel()
+            self._cancel_request_deadline()
 
     def local_authority(self) -> bool:
         return self.headers.get("Host") in ALLOWED_HOSTS
@@ -1680,28 +1816,83 @@ class RescueHandler(SimpleHTTPRequestHandler):
             if self.path == "/api/authorize-observe"
             else None
         )
-        if not self.local_authority():
-            self.send_error(421)
-            return
-        if self.headers.get("Origin") not in ALLOWED_ORIGINS:
-            self.send_error(403)
-            return
+        provider_request = self.path == "/api/rescue/provider/openai"
+        if provider_request:
+            hosts = self.headers.get_all("Host", [])
+            origins = self.headers.get_all("Origin", [])
+            fetch_sites = self.headers.get_all("Sec-Fetch-Site", [])
+            if len(hosts) != 1 or hosts[0] not in ALLOWED_HOSTS:
+                self.send_error(421)
+                return
+            if (
+                len(origins) != 1
+                or origins[0] not in ALLOWED_ORIGINS
+                or origins[0] != f"http://{hosts[0]}"
+            ):
+                self.send_error(403)
+                return
+            if len(fetch_sites) > 1 or (
+                fetch_sites and fetch_sites[0] not in {"none", "same-origin"}
+            ):
+                self.send_error(403)
+                return
+        else:
+            if not self.local_authority():
+                self.send_error(421)
+                return
+            if self.headers.get("Origin") not in ALLOWED_ORIGINS:
+                self.send_error(403)
+                return
         if self.path not in {
             "/api/authorize-observe",
             "/api/rescue/inspect-installed-target",
+            "/api/rescue/provider/openai",
             "/api/rescue/select-installed-target",
         }:
             self.send_error(405)
             return
-        if self.headers.get_content_type() != "application/json":
+        if provider_request:
+            self._arm_request_deadline(PROVIDER_REQUEST_DEADLINE_SECONDS)
+            if self.headers.get_all("Transfer-Encoding") or self.headers.get_all(
+                "Content-Encoding"
+            ):
+                self.send_error(400)
+                return
+            content_types = self.headers.get_all("Content-Type", [])
+            if content_types != ["application/json"]:
+                self.send_error(415)
+                return
+        elif self.headers.get_content_type() != "application/json":
             self.send_error(415)
             return
+        content_lengths = self.headers.get_all("Content-Length", [])
+        if provider_request and len(content_lengths) != 1:
+            self.send_error(400)
+            return
         try:
-            content_length = int(self.headers.get("Content-Length", "0"))
+            content_length_value = (
+                content_lengths[0]
+                if provider_request
+                else self.headers.get("Content-Length", "0")
+            )
+            if content_length_value is None or (
+                provider_request
+                and (
+                    not content_length_value.isascii()
+                    or not content_length_value.isdigit()
+                )
+            ):
+                raise ValueError
+            content_length = int(content_length_value)
         except ValueError:
             self.send_error(400)
             return
-        if content_length <= 0 or content_length > MAX_REQUEST_BYTES:
+        maximum_request_bytes = (
+            MAX_PROVIDER_REQUEST_FRAME_BYTES
+            if provider_request
+            else MAX_REQUEST_BYTES
+        )
+        if content_length <= 0 or content_length > maximum_request_bytes:
             self.send_error(413)
             return
         try:
@@ -1709,8 +1900,16 @@ class RescueHandler(SimpleHTTPRequestHandler):
             if len(encoded) != content_length:
                 self.send_error(400)
                 return
-            request = json.loads(encoded)
-            if not isinstance(request, dict):
+            if provider_request:
+                body = relay_openai_provider(
+                    encoded,
+                    self._request_started + PROVIDER_SOCKET_TIMEOUT_SECONDS,
+                )
+                status = 200
+                request = None
+            else:
+                request = json.loads(encoded)
+            if not provider_request and not isinstance(request, dict):
                 if self.path == "/api/rescue/inspect-installed-target":
                     raise PrivilegedHelperError(
                         {
@@ -1729,7 +1928,9 @@ class RescueHandler(SimpleHTTPRequestHandler):
                         "Richiesta di selezione del target non valida.", status=400
                     )
                 raise BrokerError("Richiesta al broker non valida.")
-            if self.path == "/api/authorize-observe":
+            if provider_request:
+                pass
+            elif self.path == "/api/authorize-observe":
                 authorize_observe(request, deadline=authorization_deadline)
                 body = b'{"status":"observed"}'
             elif self.path == "/api/rescue/inspect-installed-target":
@@ -1749,6 +1950,13 @@ class RescueHandler(SimpleHTTPRequestHandler):
         except TimeoutError:
             body = json.dumps({"error": "Timeout della richiesta locale."}).encode()
             status = 408
+        except ProviderRelayError as error:
+            body = json.dumps(
+                {"error": {"code": error.code}},
+                ensure_ascii=True,
+                separators=(",", ":"),
+            ).encode()
+            status = error.status
         except (json.JSONDecodeError, UnicodeDecodeError):
             body = json.dumps({"error": "JSON non valido."}).encode()
             status = 400

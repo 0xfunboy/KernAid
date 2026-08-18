@@ -40,7 +40,7 @@ EXPECTED_SHA256 = "23470d54d04fd4d025988e9fabf7401b12c9157c6d58162295c01817c103a
 MARKER = b"v1\n"
 
 
-def pinned_read(path: str) -> bytes:
+def pinned_read(path: str, *, expected_stat_size: int) -> bytes:
     before = os.lstat(path)
     descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
     try:
@@ -52,7 +52,7 @@ def pinned_read(path: str) -> bytes:
             or after.st_gid != 0
             or after.st_nlink != 1
             or stat.S_IMODE(after.st_mode) & 0o222
-            or after.st_size != EXPECTED_SIZE
+            or after.st_size != expected_stat_size
         ):
             raise RuntimeError
         chunks = bytearray()
@@ -127,8 +127,11 @@ def create_or_validate_marker(path: str) -> None:
 
 
 try:
-    raw = pinned_read(sys.argv[1])
-    imported = pinned_read(sys.argv[2])
+    # qemu_fw_cfg's sysfs bin_attribute intentionally reports st_size=0;
+    # systemd reads its sibling size attribute before copying the exact bytes
+    # into the regular @system credential file.
+    raw = pinned_read(sys.argv[1], expected_stat_size=0)
+    imported = pinned_read(sys.argv[2], expected_stat_size=EXPECTED_SIZE)
     if raw != imported:
         raise RuntimeError
     create_or_validate_marker(sys.argv[3])

@@ -14,6 +14,7 @@ EGRESS_SOCKET = SYSTEMD / "kernaid-rescue-openai-egress.socket"
 EGRESS_SERVICE = SYSTEMD / "kernaid-rescue-openai-egress.service"
 VAULT_SERVICE = SYSTEMD / "kernaid-rescue-vaultd.service"
 UI_SERVICE = SYSTEMD / "kernaid-ui.service"
+RESCUE_SERVER = LIVE_ROOT / "usr/lib/kernaid/rescue_server.py"
 SYSUSERS = LIVE_ROOT / "etc/sysusers.d/kernaid.conf"
 HOOK = REPO_DIR / "rescue/live-build/config/hooks/live/0100-kernaid-safety.hook.chroot"
 BUILD = REPO_DIR / "tools/build-rescue/build.sh"
@@ -78,6 +79,45 @@ def section_lines(path: Path, section: str) -> list[str]:
 
 
 class RescueOpenAiExecutorPackagingTests(unittest.TestCase):
+    def test_ui_relay_is_fixed_framed_root_authenticated_and_credential_blind(
+        self,
+    ) -> None:
+        source = RESCUE_SERVER.read_text(encoding="utf-8")
+        for value in (
+            'PROVIDER_SOCKET = "/run/kernaid-rescue-openai.sock"',
+            "PROVIDER_REQUEST_DEADLINE_SECONDS = 142",
+            "PROVIDER_SOCKET_TIMEOUT_SECONDS = 140",
+            "MAX_PROVIDER_REQUEST_FRAME_BYTES = 96 * 1024",
+            "MAX_PROVIDER_RESPONSE_FRAME_BYTES = 64 * 1024",
+            "PROVIDER_RELAY_LOCK.acquire(blocking=False)",
+            "socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC",
+            "socket.SO_PEERCRED",
+            "connection.send(frame)",
+            "MAX_PROVIDER_RESPONSE_FRAME_BYTES + 1, 0",
+            "socket.MSG_TRUNC | socket.MSG_CTRUNC",
+            '"/api/rescue/provider/openai"',
+            'self.headers.get_all("Content-Length", [])',
+            'self.headers.get_all("Transfer-Encoding")',
+            '"Content-Encoding"',
+        ):
+            self.assertIn(value, source)
+        relay_start = source.index("def _validate_root_provider_peer(")
+        relay_end = source.index("def _remaining_seconds(", relay_start)
+        relay = source[relay_start:relay_end]
+        for forbidden in (
+            "kernaid-rescue-vault",
+            "api_key",
+            "Authorization",
+            "Bearer",
+            "json.loads",
+            "subprocess",
+        ):
+            self.assertNotIn(forbidden, relay)
+        self.assertLess(
+            source.index("connection.send(frame)"),
+            source.index("connection.recvmsg(", relay_start),
+        )
+
     def test_seqpacket_socket_is_bounded_and_ui_only(self) -> None:
         sections = unit_sections(EXECUTOR_SOCKET)
         self.assertEqual(

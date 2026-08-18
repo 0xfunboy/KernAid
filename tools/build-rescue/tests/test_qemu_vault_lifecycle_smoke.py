@@ -808,6 +808,7 @@ class ResponseParserTests(unittest.TestCase):
         self.assertIn("terminal=clean-lock", clean)
         self.assertIn("hold_killed_vaultd=false", clean)
         self.assertIn("pre_terminal_daemon_stable=true", clean)
+        self.assertIn("production_ui_provider_relay_path=true", clean)
         self.assertNotIn(" daemon_stable=true", clean)
         fault = controller.boot_attestation("uefi", 2, 10, 16, 0, device_id)
         self.assertIn("terminal=persistent-fault", fault)
@@ -2001,6 +2002,70 @@ class StaticContractTests(unittest.TestCase):
             self.assertIn(path, hold)
         self.assertNotIn("api_key", normal.lower() + status.lower() + hold.lower())
 
+    def test_shipping_ui_relay_proofs_are_same_origin_correlated_and_secret_closed(
+        self,
+    ) -> None:
+        diagnose = controller._production_ui_relay_probe_source(
+            "ui-diagnose-unconfigured"
+        ).decode("ascii")
+        status = controller._production_ui_relay_probe_source(
+            "ui-status-configured"
+        ).decode("ascii")
+        for source in (diagnose, status):
+            self.assertIn('ENDPOINT="/api/rescue/provider/openai"', source)
+            self.assertIn('HOST="127.0.0.1:4173"', source)
+            self.assertIn('ORIGIN="http://127.0.0.1:4173"', source)
+            self.assertIn(
+                'connection.putheader("Sec-Fetch-Site","same-origin")', source
+            )
+            self.assertIn('connection.putheader("Content-Type","application/json")', source)
+            self.assertIn('connection.putheader("Content-Length",str(len(body)))', source)
+            self.assertIn('accepted_before=number("NAccepted",EXECUTOR)', source)
+            self.assertIn('accepted_after=number("NAccepted",EXECUTOR)', source)
+            self.assertIn("accepted_after!=accepted_before+1", source)
+            self.assertIn('number("NConnections",EXECUTOR)!=0', source)
+            self.assertIn('show("ActiveEnterTimestampMonotonic",EGRESS)', source)
+            self.assertIn(
+                'b"/usr/bin/python3\\0-I\\0/usr/lib/kernaid/rescue_server.py\\0"',
+                source,
+            )
+            self.assertIn("object_pairs_hook=unique", source)
+            self.assertIn("observed[:]=b\"\\0\"*len(observed)", source)
+            self.assertIn("encoded=json.dumps(request", source)
+            self.assertNotIn("encoded=b'", source)
+            self.assertNotIn('encoded=b"', source)
+            self.assertNotIn("body=bytearray(b'", source)
+            self.assertNotIn("api_key", source.lower())
+            self.assertLess(max(map(len, source.splitlines())), 1024)
+            compile(source.encode("ascii"), "<ui-relay-proof>", "exec", dont_inherit=True)
+
+        self.assertIn("OPERATION='provider.openai.diagnose'", diagnose)
+        self.assertIn("TIMEOUT=143.0", diagnose)
+        self.assertIn('error["code"]!="credential_unavailable"', diagnose)
+        self.assertIn("OPERATION='provider.status'", status)
+        self.assertIn("TIMEOUT=6.0", status)
+        self.assertIn(
+            'status!={"provider":"openai","profile":"rescue-default",'
+            '"vault":"unlocked","credential":"configured"}',
+            status,
+        )
+        with self.assertRaises(controller.ClosedFailure) as failure:
+            controller._production_ui_relay_probe_source("invalid-stage")
+        self.assertEqual(failure.exception.code, "stage-invalid")
+
+        lifecycle = CONTROLLER.read_text(encoding="utf-8")
+        diagnose_call = (
+            'if boot == 1:\n'
+            '        cursor = run_guest_proof(\n'
+            '            console,\n'
+            '            "ui-diagnose-unconfigured"'
+        )
+        self.assertIn(diagnose_call, lifecycle)
+        self.assertEqual(
+            lifecycle.count('_production_ui_relay_probe_source("ui-status-configured")'),
+            1,
+        )
+
     def test_new_shell_is_syntactically_valid_and_scope_is_separate(self) -> None:
         subprocess.run(["bash", "-n", SCRIPT], check=True)
         shell = SCRIPT.read_text(encoding="utf-8")
@@ -2023,6 +2088,7 @@ class StaticContractTests(unittest.TestCase):
         self.assertNotIn("losetup -d --", shell)
         self.assertIn("--timeout 1200", shell)
         self.assertEqual(shell.count("    -nic none\n"), 1)
+        self.assertIn("production_ui_provider_relay_path=true", shell)
         self.assertIn('kill -s "$signal_name" "$controller_pid"', shell)
         self.assertIn(
             "-fw_cfg \"name=opt/io.systemd.credentials/provider-lease-probe,"

@@ -2234,6 +2234,9 @@ def run_guest_proof(
 PROVIDER_STATUS_PROBE_SOCKET = "/run/kernaid-provider-executor-status-probe.sock"
 PROVIDER_LEASE_PROBE_SOCKET = "/run/kernaid-provider-lease-probe.sock"
 PROVIDER_LEASE_KILL_SOCKET = "/run/kernaid-provider-lease-kill-vaultd.sock"
+PROVIDER_EXECUTOR_SOCKET_UNIT = "kernaid-rescue-openai-executor.socket"
+PROVIDER_EGRESS_SERVICE_UNIT = "kernaid-rescue-openai-egress.service"
+PROVIDER_UI_SERVICE_UNIT = "kernaid-ui.service"
 TEST_CREDENTIAL_PREFIXES = (
     "kernaid-provider-executor-status-probe@",
     "kernaid-provider-lease-probe@",
@@ -2322,6 +2325,138 @@ try:
         time.sleep(0.05)
 except BaseException:
     sys.exit(42)
+sys.stdout.write({proof!r})
+'''.encode("ascii")
+
+
+def _production_ui_relay_probe_source(stage: str) -> bytes:
+    """Exercise the shipping HTTP relay without placing a wire frame in the PTY."""
+
+    if stage == "ui-diagnose-unconfigured":
+        operation = "provider.openai.diagnose"
+        request_id = "O-90000000-0000-0000-0000-000000000001"
+        timeout = 143.0
+    elif stage == "ui-status-configured":
+        operation = "provider.status"
+        request_id = "O-90000000-0000-0000-0000-000000000002"
+        timeout = 6.0
+    else:
+        raise ClosedFailure("provider-proof", "stage-invalid")
+    proof = f"KERNAID_QEMU_PROVIDER_PROOF_V1 stage={stage} result=true\n"
+    return f'''import http.client,json,os,re,subprocess,sys,time
+API="kernaid.dev/rescue-openai/v1alpha1"
+ENDPOINT="/api/rescue/provider/openai"
+HOST="127.0.0.1:4173"
+ORIGIN="http://127.0.0.1:4173"
+EXECUTOR={PROVIDER_EXECUTOR_SOCKET_UNIT!r}
+EGRESS={PROVIDER_EGRESS_SERVICE_UNIT!r}
+UI={PROVIDER_UI_SERVICE_UNIT!r}
+OPERATION={operation!r}
+REQUEST_ID={request_id!r}
+TIMEOUT={timeout!r}
+MAX_REQUEST=96*1024
+MAX_RESPONSE=64*1024
+def show(prop,unit):
+    result=subprocess.run(["/usr/bin/systemctl","show","--property="+prop,"--value",unit],stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=3,check=False)
+    if result.returncode!=0 or len(result.stdout)>512:
+        raise RuntimeError()
+    return result.stdout.rstrip(b"\\n")
+def number(prop,unit):
+    value=show(prop,unit)
+    if re.fullmatch(rb"0|[1-9][0-9]*",value) is None:
+        raise RuntimeError()
+    return int(value)
+def unique(pairs):
+    result={{}}
+    for key,value in pairs:
+        if key in result:
+            raise ValueError()
+        result[key]=value
+    return result
+def rejected(_value):
+    raise ValueError()
+def exact(value,keys):
+    if type(value) is not dict or set(value)!=set(keys):
+        raise RuntimeError()
+    return value
+def exchange(request):
+    encoded=json.dumps(request,ensure_ascii=True,separators=(",",":")).encode("ascii")
+    body=bytearray(encoded)
+    body.append(10)
+    if len(body)>MAX_REQUEST or body[:1]!=b"{{" or body[-2:]!=b"}}\\n" or b"\\n" in body[:-1] or b"\\r" in body:
+        raise RuntimeError()
+    connection=http.client.HTTPConnection("127.0.0.1",4173,timeout=TIMEOUT)
+    observed=bytearray()
+    try:
+        connection.putrequest("POST",ENDPOINT,skip_host=True,skip_accept_encoding=True)
+        connection.putheader("Host",HOST)
+        connection.putheader("Origin",ORIGIN)
+        connection.putheader("Sec-Fetch-Site","same-origin")
+        connection.putheader("Content-Type","application/json")
+        connection.putheader("Content-Length",str(len(body)))
+        connection.putheader("Connection","close")
+        connection.endheaders(body)
+        response=connection.getresponse()
+        lengths=response.headers.get_all("Content-Length",[])
+        if response.status!=200 or response.headers.get_all("Content-Type",[])!=["application/json"] or response.headers.get_all("Cache-Control",[])!=["no-store"] or response.headers.get_all("X-Content-Type-Options",[])!=["nosniff"] or response.headers.get_all("Transfer-Encoding",[]) or response.headers.get_all("Content-Encoding",[]) or len(lengths)!=1 or re.fullmatch(r"0|[1-9][0-9]*",lengths[0]) is None:
+            raise RuntimeError()
+        declared=int(lengths[0])
+        if declared>MAX_RESPONSE:
+            raise RuntimeError()
+        observed.extend(response.read(declared+1))
+        if len(observed)!=declared or observed[:1]!=b"{{" or observed[-2:]!=b"}}\\n" or b"\\n" in observed[:-1] or b"\\r" in observed:
+            raise RuntimeError()
+        text=observed[:-1].decode("utf-8","strict")
+        parsed=json.loads(text,object_pairs_hook=unique,parse_int=rejected,parse_float=rejected,parse_constant=rejected)
+        del text
+        return parsed
+    finally:
+        connection.close()
+        body[:]=b"\\0"*len(body)
+        observed[:]=b"\\0"*len(observed)
+try:
+    if show("ActiveState",UI)!=b"active" or show("SubState",UI)!=b"running" or show("FragmentPath",UI)!=b"/etc/systemd/system/kernaid-ui.service":
+        raise RuntimeError()
+    ui_pid=show("MainPID",UI)
+    if re.fullmatch(rb"[1-9][0-9]*",ui_pid) is None:
+        raise RuntimeError()
+    with open("/proc/"+ui_pid.decode("ascii")+"/cmdline","rb") as stream:
+        if stream.read(256)!=b"/usr/bin/python3\\0-I\\0/usr/lib/kernaid/rescue_server.py\\0":
+            raise RuntimeError()
+    if show("ActiveState",EXECUTOR)!=b"active" or show("SubState",EXECUTOR) not in (b"listening",b"running") or number("NConnections",EXECUTOR)!=0:
+        raise RuntimeError()
+    accepted_before=number("NAccepted",EXECUTOR)
+    egress_before=show("ActiveEnterTimestampMonotonic",EGRESS)
+    if show("ActiveState",EGRESS)!=b"inactive":
+        raise RuntimeError()
+    if OPERATION=="provider.openai.diagnose":
+        corpus={{"family":"windows","installationConfirmed":False,"installationMarkers":{{"windowsDirectoryPresent":False,"system32DirectoryPresent":False,"kernelPresent":False,"systemHivePresent":False,"softwareHivePresent":False,"usersDirectoryPresent":False}},"boot":{{"bootManagerPresent":False,"bcdPresent":False,"efiSystemPartition":{{"state":"not-present","microsoftBootManagerPresent":None,"bcdPresent":None,"fallbackBootloaderPresent":None}}}},"servicing":{{"pendingXmlPresent":False,"rebootPendingMarkerPresent":False}}}}
+        payload={{"objective":"Qualifica il relay Rescue in sola lettura","evidence":[{{"schemaVersion":"1.0","id":"E-QEMU-RELAY","collector":"rescue.installed-target.filesystem-content.read-only.v1","target":"selected-installed-target","contentType":"application/json","trust":"observed-untrusted","summary":"Corpus statico windows acquisito read-only; installazione non confermata","content":json.dumps(corpus,ensure_ascii=True,separators=(",",":"))}}]}}
+    else:
+        payload={{}}
+    request={{"apiVersion":API,"requestId":REQUEST_ID,"operation":OPERATION,"payload":payload}}
+    response=exchange(request)
+    accepted_after=number("NAccepted",EXECUTOR)
+    if accepted_after!=accepted_before+1 or show("ActiveState",EGRESS)!=b"inactive" or show("ActiveEnterTimestampMonotonic",EGRESS)!=egress_before:
+        raise RuntimeError()
+    deadline=time.monotonic()+5.0
+    while number("NConnections",EXECUTOR)!=0:
+        if time.monotonic()>=deadline:
+            raise RuntimeError()
+        time.sleep(0.05)
+    envelope=exact(response,("apiVersion","requestId","operation","ok","error") if OPERATION=="provider.openai.diagnose" else ("apiVersion","requestId","operation","ok","payload"))
+    if envelope["apiVersion"]!=API or envelope["requestId"]!=REQUEST_ID or envelope["operation"]!=OPERATION:
+        raise RuntimeError()
+    if OPERATION=="provider.openai.diagnose":
+        error=exact(envelope["error"],("code",))
+        if envelope["ok"] is not False or error["code"]!="credential_unavailable":
+            raise RuntimeError()
+    else:
+        status=exact(envelope["payload"],("provider","profile","vault","credential"))
+        if envelope["ok"] is not True or status!={{"provider":"openai","profile":"rescue-default","vault":"unlocked","credential":"configured"}}:
+            raise RuntimeError()
+except BaseException:
+    sys.exit(45)
 sys.stdout.write({proof!r})
 '''.encode("ascii")
 
@@ -2498,6 +2633,15 @@ def run_lifecycle(
         console, "status", "unlocked-status", cursor, aggregate
     )
     unlocked_runtime, cursor = collect_runtime(console, "unlocked", cursor, aggregate)
+    if boot == 1:
+        cursor = run_guest_proof(
+            console,
+            "ui-diagnose-unconfigured",
+            _production_ui_relay_probe_source("ui-diagnose-unconfigured"),
+            cursor,
+            aggregate,
+            timeout=150.0,
+        )
     prior_provider, cursor = run_provider_companion(
         console,
         "provider-status",
@@ -2519,6 +2663,14 @@ def run_lifecycle(
         "configured-provider-status",
         cursor,
         aggregate,
+    )
+    cursor = run_guest_proof(
+        console,
+        "ui-status-configured",
+        _production_ui_relay_probe_source("ui-status-configured"),
+        cursor,
+        aggregate,
+        timeout=15.0,
     )
     cursor = run_guest_proof(
         console,
@@ -2760,6 +2912,7 @@ def boot_attestation(
         "cgroup_topology_exact=true shell_mount_absent=true provider_configured=true "
         "production_executor_unit_binds_to_exact=true "
         "production_executor_status_path=true conditioned_agent_binds_to_runtime=true "
+        "production_ui_provider_relay_path=true "
         "normal_triple_release=true lifecycle_marker_active_before_borrow=true "
         f"hold_killed_vaultd={fault_proof} helper_binds_to_terminated={fault_proof} "
         f"worker_pdeath_cleanup={fault_proof} test_trigger_sockets_gone={fault_proof} "
@@ -2781,6 +2934,7 @@ def boot_attestation(
         r"cgroup_topology_exact=true shell_mount_absent=true provider_configured=true "
         r"production_executor_unit_binds_to_exact=true "
         r"production_executor_status_path=true conditioned_agent_binds_to_runtime=true "
+        r"production_ui_provider_relay_path=true "
         r"normal_triple_release=true lifecycle_marker_active_before_borrow=true "
         r"hold_killed_vaultd=(true|false) helper_binds_to_terminated=(true|false) "
         r"worker_pdeath_cleanup=(true|false) test_trigger_sockets_gone=(true|false) "

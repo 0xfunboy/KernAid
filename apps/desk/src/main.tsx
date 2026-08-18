@@ -45,6 +45,16 @@ import {
   type SecureRuntimeStatus,
 } from "./native";
 import {
+  getRescueOpenAiStatus,
+  rescueOpenAiReady,
+  RescueOpenAiProvider,
+  RescueProviderSessionBinding,
+  transitionRescueProviderMode,
+  type RescueOpenAiStatus,
+  type RescueProviderMode,
+  type RescueProviderPreparation,
+} from "./rescue-openai";
+import {
   formatBytes,
   finishRescueInspection,
   observationStatus,
@@ -64,14 +74,16 @@ import {
 import "./style.css";
 
 type Workflow = "Observe" | "Diagnose" | "Plan" | "Verify";
-type ProviderMode = "offline" | "openai";
+type ProviderMode = RescueProviderMode;
 
 function App() {
   const [driver, setDriver] = useState<LocalSessionDriver>();
   const [runtimeStatus, setRuntimeStatus] = useState<SecureRuntimeStatus>();
   const [runtimeReady, setRuntimeReady] = useState(false);
   const [providerMode, setProviderMode] = useState<ProviderMode>("offline");
-  const [openAiStatus, setOpenAiStatus] = useState<ResidentOpenAiStatus>();
+  const [openAiStatus, setOpenAiStatus] = useState<
+    ResidentOpenAiStatus | RescueOpenAiStatus
+  >();
   const [providerLogoutBusy, setProviderLogoutBusy] = useState(false);
   const providerLogoutInFlight = useRef(false);
   const [objective, setObjective] = useState("");
@@ -105,6 +117,15 @@ function App() {
   const [rescueInspectionBlocked, setRescueInspectionBlocked] = useState(false);
   const rescueInspectionInFlight = useRef(false);
   const rescueContextEpoch = useRef(0);
+  const rescueProviderBinding = useRef(
+    new RescueProviderSessionBinding("offline"),
+  );
+  const openAiReady =
+    openAiStatus?.profile === "resident-default"
+      ? openAiStatus.credential === "configured"
+      : openAiStatus?.profile === "rescue-default"
+        ? rescueOpenAiReady(openAiStatus)
+        : false;
 
   useEffect(() => {
     let cancelled = false;
@@ -145,9 +166,12 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (!isNative()) return;
+    if (!isNative() && !isRescueRuntime()) return;
     let cancelled = false;
-    getResidentOpenAiStatus()
+    const readStatus = isNative()
+      ? getResidentOpenAiStatus()
+      : getRescueOpenAiStatus();
+    readStatus
       .then((next) => {
         if (!cancelled) setOpenAiStatus(next);
       })
@@ -215,6 +239,8 @@ function App() {
   }, []);
 
   function invalidateSession() {
+    if (isRescueRuntime())
+      rescueProviderBinding.current.clearSessionAndPreparation();
     setEvidence([]);
     setProposal(undefined);
     setPlan(undefined);
@@ -241,7 +267,8 @@ function App() {
       selectedRescueTarget === undefined ||
       !sameRescueInspection(selectedRescueTarget, rescueInspection) ||
       sessionId === undefined ||
-      sessionDriver === undefined
+      sessionDriver === undefined ||
+      !rescueProviderBinding.current.sessionMatches(providerMode)
     )
       return;
     const operationEpoch = rescueContextEpoch.current;
@@ -261,6 +288,10 @@ function App() {
       )
         throw new Error(
           "Il target Rescue è cambiato: ripetere scansione e ispezione.",
+        );
+      if (!rescueProviderBinding.current.sessionMatches(providerMode))
+        throw new Error(
+          "Il provider Rescue è cambiato: ripetere l’ispezione del target.",
         );
       setSelectedRescueTarget(revalidated);
       setWorkflow("Diagnose");
@@ -560,18 +591,31 @@ function App() {
     setRescueTargetError(undefined);
     invalidateRescuePreparedState();
     setStatus("Ispezione del target in sola lettura, senza replay…");
+    let providerPreparation: RescueProviderPreparation | undefined;
     try {
+      providerPreparation = rescueProviderBinding.current.beginPreparation();
+      if (providerPreparation === undefined)
+        throw new Error(
+          "Binding del provider Rescue non disponibile: ripetere l’ispezione.",
+        );
       const selected = await selectRescueInstalledTarget(
         expectedScan.scanFingerprint,
         expectedSelection.target,
       );
       if (
         rescueContextEpoch.current !== operationEpoch ||
+        !rescueProviderBinding.current.preparationIsCurrent(
+          providerPreparation,
+        ) ||
         !sameRescueSelection(expectedSelection, selected)
       )
         throw new Error("Il target è cambiato durante la rivalidazione.");
       const currentRuntimeInventory = await collectLocalInventory();
-      if (rescueContextEpoch.current !== operationEpoch) return;
+      if (
+        rescueContextEpoch.current !== operationEpoch ||
+        !rescueProviderBinding.current.preparationIsCurrent(providerPreparation)
+      )
+        throw new Error("Il provider Rescue è cambiato durante l’ispezione.");
       const identity = currentRuntimeInventory.filter((item) =>
         isNativeIdentityCollector(item.collector),
       );
@@ -599,13 +643,27 @@ function App() {
         currentRuntimeInventory,
         binding,
       );
-      if (rescueContextEpoch.current !== operationEpoch) return;
-      const preparedDriver = createDriver(undefined, binding);
+      if (
+        rescueContextEpoch.current !== operationEpoch ||
+        !rescueProviderBinding.current.preparationIsCurrent(providerPreparation)
+      )
+        throw new Error("Il provider Rescue è cambiato durante l’ispezione.");
+      const preparedDriver = createDriver(
+        undefined,
+        binding,
+        providerPreparation.mode,
+      );
       const session = await preparedDriver.startSession({
         mode: "rescue",
         targetFingerprint: fingerprint,
       });
-      if (rescueContextEpoch.current !== operationEpoch) return;
+      if (
+        rescueContextEpoch.current !== operationEpoch ||
+        !rescueProviderBinding.current.preparationIsCurrent(providerPreparation)
+      )
+        throw new Error(
+          "Il provider Rescue è cambiato durante la preparazione della sessione.",
+        );
       const observed = await preparedDriver.requestEvidence(session.id, {
         collector: RESCUE_OFFLINE_EVIDENCE_COLLECTOR,
         target: RESCUE_OFFLINE_EVIDENCE_TARGET,
@@ -613,7 +671,14 @@ function App() {
         observedContent: rescueOfflineCorpusJson(inspection),
         contentType: "application/json",
       });
-      if (rescueContextEpoch.current !== operationEpoch) return;
+      if (
+        rescueContextEpoch.current !== operationEpoch ||
+        rescueProviderBinding.current.commitPreparation(providerPreparation) !==
+          providerPreparation.mode
+      )
+        throw new Error(
+          "La sessione Rescue appartiene a un provider non più corrente.",
+        );
       setNativeEvidence(currentRuntimeInventory);
       setInventoryError(undefined);
       setSelectedRescueTarget(selected);
@@ -668,6 +733,8 @@ function App() {
         setStatus(message);
       }
     } finally {
+      if (providerPreparation !== undefined)
+        rescueProviderBinding.current.cancelPreparation(providerPreparation);
       finishRescueInspection(rescueInspectionInFlight);
       setRescueInspectionBusy(false);
     }
@@ -681,6 +748,8 @@ function App() {
       busy ||
       !sessionDriver ||
       (isRescueRuntime() && rescueInspectionInFlight.current) ||
+      (isRescueRuntime() &&
+        !rescueProviderBinding.current.sessionMatches(providerMode)) ||
       (isRescueRuntime() &&
         (!sameRescueSelection(sessionRescueTarget, selectedRescueTarget) ||
           !sameRescueInspection(selectedRescueTarget, rescueInspection)))
@@ -734,16 +803,40 @@ function App() {
 
   function chooseProvider(next: ProviderMode) {
     if (
-      !isNative() ||
+      (!isNative() && !isRescueRuntime()) ||
+      next === providerMode ||
       busy ||
+      (isRescueRuntime() && rescueTargetBusy) ||
+      rescueInspectionBusy ||
+      (isRescueRuntime() && rescueInspectionInFlight.current) ||
       sessionId !== undefined ||
       driver === undefined ||
-      (next === "openai" && openAiStatus?.credential !== "configured")
+      (next === "openai" && !openAiReady)
     )
       return;
-    invalidateSession();
+    if (isRescueRuntime()) {
+      const transition = transitionRescueProviderMode(
+        rescueProviderBinding.current,
+        next,
+        rescueContextEpoch.current,
+        {
+          targetBusy: rescueTargetBusy,
+          inspectionBusy: rescueInspectionBusy,
+          inspectionInFlight: rescueInspectionInFlight.current,
+        },
+      );
+      if (!transition.changed) return;
+      rescueContextEpoch.current = transition.contextEpoch;
+      invalidateRescuePreparedState();
+    } else invalidateSession();
     setProviderMode(next);
-    setDriver(createDriver(activeAuditSink(runtimeStatus), undefined, next));
+    setDriver(
+      createDriver(
+        isNative() ? activeAuditSink(runtimeStatus) : undefined,
+        undefined,
+        next,
+      ),
+    );
     setStatus(
       next === "openai"
         ? "OpenAI selezionato. Il corpus grezzo resta locale; vengono inviati obiettivo filtrato, proposta deterministica e soli ID/collector."
@@ -813,19 +906,21 @@ function App() {
     isNative() &&
     runtimeStatus?.audit === "secure" &&
     runtimeStatus.signing !== "ready";
-  const securityLabel = !isNative()
-    ? "Vault bloccato"
-    : !runtimeReady
-      ? "Sicurezza in avvio"
-      : runtimeStatus !== undefined && secureAuditReady(runtimeStatus)
-        ? `Audit cifrato · ${runtimeStatus?.deviceId ?? "Firma attiva"}`
-        : runtimeStatus?.audit === "unavailable"
-          ? "Audit non disponibile · report non firmati"
-          : securityBlocked
-            ? "Sicurezza bloccata"
-            : runtimeStatus === undefined
-              ? "Sicurezza non disponibile"
-              : "Attivazione sicurezza richiesta";
+  const securityLabel = isRescueRuntime()
+    ? rescueVaultLabel(openAiStatus)
+    : !isNative()
+      ? "Runtime di sviluppo"
+      : !runtimeReady
+        ? "Sicurezza in avvio"
+        : runtimeStatus !== undefined && secureAuditReady(runtimeStatus)
+          ? `Audit cifrato · ${runtimeStatus?.deviceId ?? "Firma attiva"}`
+          : runtimeStatus?.audit === "unavailable"
+            ? "Audit non disponibile · report non firmati"
+            : securityBlocked
+              ? "Sicurezza bloccata"
+              : runtimeStatus === undefined
+                ? "Sicurezza non disponibile"
+                : "Attivazione sicurezza richiesta";
   const rescueSessionCurrent =
     !isRescueRuntime() ||
     sameRescueSelection(sessionRescueTarget, selectedRescueTarget);
@@ -852,11 +947,17 @@ function App() {
       <header>
         <strong>KernAid</strong>
         <div className="runtime-summary">
-          {isNative() && (
+          {(isNative() || isRescueRuntime()) && (
             <div className="provider-switch" aria-label="Provider diagnostico">
               <button
                 aria-pressed={providerMode === "offline"}
-                disabled={busy || sessionId !== undefined}
+                disabled={
+                  busy ||
+                  (isRescueRuntime() && rescueTargetBusy) ||
+                  rescueInspectionBusy ||
+                  (isRescueRuntime() && rescueInspectionInFlight.current) ||
+                  sessionId !== undefined
+                }
                 onClick={() => chooseProvider("offline")}
               >
                 Offline
@@ -865,14 +966,17 @@ function App() {
                 aria-pressed={providerMode === "openai"}
                 disabled={
                   busy ||
+                  (isRescueRuntime() && rescueTargetBusy) ||
+                  rescueInspectionBusy ||
+                  (isRescueRuntime() && rescueInspectionInFlight.current) ||
                   sessionId !== undefined ||
-                  openAiStatus?.credential !== "configured"
+                  !openAiReady
                 }
                 onClick={() => chooseProvider("openai")}
               >
                 OpenAI
               </button>
-              {openAiStatus?.credential === "configured" && (
+              {isNative() && openAiStatus?.credential === "configured" && (
                 <button
                   disabled={
                     providerLogoutBusy ||
@@ -898,6 +1002,9 @@ function App() {
               OpenAI non configurato · chiudi Desk e avvia con{" "}
               <code>configure</code> il companion nativo estratto
             </small>
+          )}
+          {isRescueRuntime() && !openAiReady && (
+            <small>{rescueOpenAiGuidance(openAiStatus)}</small>
           )}
         </div>
       </header>
@@ -1142,6 +1249,7 @@ function App() {
                 !rescueInspectionCurrent ||
                 sessionId === undefined ||
                 sessionDriver === undefined ||
+                !rescueProviderBinding.current.sessionMatches(providerMode) ||
                 rescueInspectionBlocked)) ||
             !runtimeReady ||
             !driver ||
@@ -1223,8 +1331,12 @@ function createDriver(
   providerMode: ProviderMode = "offline",
 ): LocalSessionDriver {
   return new LocalSessionDriver(
-    providerMode === "openai" && isNative()
-      ? new NativeOpenAiProvider()
+    providerMode === "openai"
+      ? isNative()
+        ? new NativeOpenAiProvider()
+        : isRescueRuntime()
+          ? new RescueOpenAiProvider()
+          : new PlatformOfflineRulesProvider()
       : new PlatformOfflineRulesProvider(),
     hasLocalCollector()
       ? {
@@ -1233,6 +1345,57 @@ function createDriver(
       : undefined,
     auditSink,
   );
+}
+
+function rescueVaultLabel(
+  status: ResidentOpenAiStatus | RescueOpenAiStatus | undefined,
+): string {
+  if (status?.profile !== "rescue-default")
+    return "Stato Vault non disponibile";
+  switch (status.vault) {
+    case "absent":
+      return "Vault assente";
+    case "unprovisioned":
+      return "Vault non inizializzato";
+    case "locked":
+      return "Vault bloccato";
+    case "unlocking":
+      return "Vault in sblocco";
+    case "unlocked":
+      return status.credential === "configured"
+        ? "Vault sbloccato · OpenAI configurato"
+        : status.credential === "absent"
+          ? "Vault sbloccato · OpenAI non configurato"
+          : "Vault sbloccato · credenziale non disponibile";
+    case "locking":
+      return "Vault in blocco";
+    case "faulted-reboot-required":
+      return "Vault in fault · riavvio richiesto";
+  }
+}
+
+function rescueOpenAiGuidance(
+  status: ResidentOpenAiStatus | RescueOpenAiStatus | undefined,
+): string {
+  if (status?.profile !== "rescue-default")
+    return "OpenAI Rescue non disponibile. Verifica dal TTY con “kernaid-rescue-vaultctl status”, poi ricarica Desk.";
+  switch (status.vault) {
+    case "absent":
+      return "Vault persistente non rilevato. Desk e companion non creano il Vault: prepara un supporto compatibile e riavvia Rescue.";
+    case "unprovisioned":
+      return "Vault persistente non inizializzato. Desk e companion non lo inizializzano: prepara il supporto con la procedura qualificata e riavvia Rescue.";
+    case "locked":
+      return "Vault bloccato. Nel TTY esegui “kernaid-rescue-vaultctl unlock”; quindi “kernaid-rescue-vaultctl openai-configure” e ricarica Desk.";
+    case "unlocking":
+    case "locking":
+      return "Transizione del Vault in corso. Attendi il completamento, verifica dal TTY con “kernaid-rescue-vaultctl status” e ricarica Desk.";
+    case "faulted-reboot-required":
+      return "Il Vault richiede un riavvio Rescue; OpenAI resta disabilitato.";
+    case "unlocked":
+      return status.credential === "absent"
+        ? "Vault sbloccato. Configura OpenAI esclusivamente dal TTY con “kernaid-rescue-vaultctl openai-configure”, poi ricarica Desk."
+        : "Credenziale non disponibile. Verifica dal TTY con “kernaid-rescue-vaultctl provider-status”, poi ricarica Desk.";
+  }
 }
 
 function activeAuditSink(
