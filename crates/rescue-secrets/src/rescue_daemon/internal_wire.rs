@@ -273,6 +273,22 @@ pub(super) enum WorkerResultCode {
     ProviderCodexHomeReady,
     #[cfg(feature = "experimental-codex-home-lease")]
     ProviderCodexHomeUnconfigured,
+    UnlockIoProbe,
+    UnlockIoProbeClassifier,
+    UnlockIoMapperName,
+    UnlockIoUnsupportedPlatform,
+    UnlockIoPrivilegeRequired,
+    UnlockIoInvalidMapperName,
+    UnlockIoClassifierUnavailable,
+    UnlockIoPassphraseUnavailable,
+    UnlockIoUnsupportedFilesystem,
+    UnlockIoUnsafeMountRoot,
+    UnlockIoMountFailed,
+    UnlockIoMountVerificationFailed,
+    UnlockIoSecureStateUnavailable,
+    UnlockIoToolUnavailable,
+    UnlockIoApplicationStore,
+    UnlockIoDeviceId,
 }
 
 impl WorkerResultCode {
@@ -314,6 +330,22 @@ impl WorkerResultCode {
             Self::ProviderCodexHomeReady => 33,
             #[cfg(feature = "experimental-codex-home-lease")]
             Self::ProviderCodexHomeUnconfigured => 34,
+            Self::UnlockIoProbe => 35,
+            Self::UnlockIoProbeClassifier => 36,
+            Self::UnlockIoMapperName => 37,
+            Self::UnlockIoUnsupportedPlatform => 38,
+            Self::UnlockIoPrivilegeRequired => 39,
+            Self::UnlockIoInvalidMapperName => 40,
+            Self::UnlockIoClassifierUnavailable => 41,
+            Self::UnlockIoPassphraseUnavailable => 42,
+            Self::UnlockIoUnsupportedFilesystem => 43,
+            Self::UnlockIoUnsafeMountRoot => 44,
+            Self::UnlockIoMountFailed => 45,
+            Self::UnlockIoMountVerificationFailed => 46,
+            Self::UnlockIoSecureStateUnavailable => 47,
+            Self::UnlockIoToolUnavailable => 48,
+            Self::UnlockIoApplicationStore => 49,
+            Self::UnlockIoDeviceId => 50,
         }
     }
 
@@ -355,6 +387,22 @@ impl WorkerResultCode {
             33 => Ok(Self::ProviderCodexHomeReady),
             #[cfg(feature = "experimental-codex-home-lease")]
             34 => Ok(Self::ProviderCodexHomeUnconfigured),
+            35 => Ok(Self::UnlockIoProbe),
+            36 => Ok(Self::UnlockIoProbeClassifier),
+            37 => Ok(Self::UnlockIoMapperName),
+            38 => Ok(Self::UnlockIoUnsupportedPlatform),
+            39 => Ok(Self::UnlockIoPrivilegeRequired),
+            40 => Ok(Self::UnlockIoInvalidMapperName),
+            41 => Ok(Self::UnlockIoClassifierUnavailable),
+            42 => Ok(Self::UnlockIoPassphraseUnavailable),
+            43 => Ok(Self::UnlockIoUnsupportedFilesystem),
+            44 => Ok(Self::UnlockIoUnsafeMountRoot),
+            45 => Ok(Self::UnlockIoMountFailed),
+            46 => Ok(Self::UnlockIoMountVerificationFailed),
+            47 => Ok(Self::UnlockIoSecureStateUnavailable),
+            48 => Ok(Self::UnlockIoToolUnavailable),
+            49 => Ok(Self::UnlockIoApplicationStore),
+            50 => Ok(Self::UnlockIoDeviceId),
             _ => Err(InternalWireError::InvalidFrame),
         }
     }
@@ -1042,6 +1090,50 @@ mod tests {
                 deadline
             ),
             Err(InternalWireError::InvalidDescriptors)
+        );
+    }
+
+    #[test]
+    fn unlock_io_diagnostic_codes_keep_the_fixed_payload_free_frame() {
+        use WorkerResultCode as Result;
+        for (code, encoded_code) in [
+            (Result::UnlockIoProbe, 35),
+            (Result::UnlockIoProbeClassifier, 36),
+            (Result::UnlockIoMapperName, 37),
+            (Result::UnlockIoUnsupportedPlatform, 38),
+            (Result::UnlockIoPrivilegeRequired, 39),
+            (Result::UnlockIoInvalidMapperName, 40),
+            (Result::UnlockIoClassifierUnavailable, 41),
+            (Result::UnlockIoPassphraseUnavailable, 42),
+            (Result::UnlockIoUnsupportedFilesystem, 43),
+            (Result::UnlockIoUnsafeMountRoot, 44),
+            (Result::UnlockIoMountFailed, 45),
+            (Result::UnlockIoMountVerificationFailed, 46),
+            (Result::UnlockIoSecureStateUnavailable, 47),
+            (Result::UnlockIoToolUnavailable, 48),
+            (Result::UnlockIoApplicationStore, 49),
+            (Result::UnlockIoDeviceId, 50),
+        ] {
+            let frame = WorkerResponse::new(7, code)
+                .encode()
+                .expect("canonical diagnostic response");
+            assert_eq!(frame.len(), RESPONSE_BYTES);
+            assert_eq!(frame[8], encoded_code);
+            assert_eq!(&frame[9..12], &[0, 0, 0]);
+            assert_eq!(&frame[12..20], &7_u64.to_be_bytes());
+            assert!(frame[20..].iter().all(|byte| *byte == 0));
+            assert_eq!(
+                WorkerResponse::decode(&frame).expect("diagnostic response round trip"),
+                WorkerResponse::new(7, code)
+            );
+        }
+        let mut reserved = WorkerResponse::new(7, Result::UnlockIoDeviceId)
+            .encode()
+            .expect("canonical diagnostic response");
+        reserved[8] = 51;
+        assert_eq!(
+            WorkerResponse::decode(&reserved),
+            Err(InternalWireError::InvalidFrame)
         );
     }
 

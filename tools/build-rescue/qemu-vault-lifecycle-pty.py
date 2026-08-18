@@ -82,6 +82,7 @@ FAILURE_PREFIX = "KERNAID_QEMU_VAULT_LIFECYCLE_FAILURE_V1"
 ATTESTATION_PREFIX = "KERNAID_QEMU_VAULT_LIFECYCLE_BOOT_V1"
 TOKEN_RE = re.compile(r"^[a-z0-9-]+$")
 DEVICE_ID_RE = re.compile(r"^KA-[0-9a-f]{24}$")
+MAX_SAFE_STATE_VERSION = 9_007_199_254_740_991
 
 # Public protocol errors are safe to classify in the sanitized lifecycle
 # evidence. Keep this mapping explicit: an unknown or malformed server token
@@ -104,6 +105,36 @@ UNLOCK_REMOTE_FAILURE_CODES = {
     "REBOOT_REQUIRED": "reboot-required",
 }
 
+UNLOCK_IO_DIAGNOSTIC_PREFIX = "KERNAID_RESCUE_VAULT_UNLOCK_DIAGNOSTIC_V1"
+UNLOCK_IO_DIAGNOSTIC_REASONS = (
+    "probe-io",
+    "probe-classifier",
+    "mapper-name",
+    "manager-unsupported-platform",
+    "manager-privilege-required",
+    "manager-invalid-mapper-name",
+    "manager-classifier-unavailable",
+    "manager-passphrase-unavailable",
+    "manager-unsupported-filesystem",
+    "manager-unsafe-mount-root",
+    "manager-mount-failed",
+    "manager-mount-verification-failed",
+    "manager-secure-state-unavailable",
+    "manager-tool-unavailable",
+    "application-store",
+    "device-id",
+)
+UNLOCK_IO_DIAGNOSTIC_RESULT_PREFIX = "KERNAID_VAULT_UNLOCK_DIAGNOSTIC_V1"
+UNLOCK_IO_DIAGNOSTIC_RESULT_PATTERN = re.compile(
+    _TRUSTED_SHELL_MARKER_START
+    + rb"(KERNAID_VAULT_UNLOCK_DIAGNOSTIC_V1 reason=("
+    + rb"|".join(
+        re.escape(reason.encode("ascii"))
+        for reason in (*UNLOCK_IO_DIAGNOSTIC_REASONS, "diagnostic-unavailable")
+    )
+    + rb"))\r?\n"
+)
+
 
 class ClosedFailure(Exception):
     """Failure carrying only closed diagnostic tokens."""
@@ -114,6 +145,14 @@ class ClosedFailure(Exception):
         self.stage = stage
         self.code = code
         super().__init__(f"{stage}:{code}")
+
+
+class UnlockRemoteFailure(ClosedFailure):
+    """Closed remote unlock failure retaining only its safe state version."""
+
+    def __init__(self, code: str, state_version: int) -> None:
+        super().__init__("response", code)
+        self.state_version = state_version
 
 
 class CaptureLimitError(Exception):
@@ -774,7 +813,9 @@ def parse_companion_response(
                 else None
             )
             if remote_code is not None:
-                raise ClosedFailure("response", f"unlock-remote-{remote_code}")
+                raise UnlockRemoteFailure(
+                    f"unlock-remote-{remote_code}", version
+                )
             raise ClosedFailure("response", "unlock-invalid")
     return CompanionResponse(version, state, device_id, error, return_code)
 
@@ -2082,6 +2123,66 @@ def collect_runtime(
     return parse_runtime_snapshot(match.group(1), stage), match.end()
 
 
+@dataclasses.dataclass(frozen=True)
+class UnlockDiagnosticExpectation:
+    service_pid: int
+    invocation_id: str
+    request_state_version: int
+
+
+def _unlock_diagnostic_command(
+    expectation: UnlockDiagnosticExpectation, response_state_version: int
+) -> bytes:
+    if (
+        expectation.service_pid <= 1
+        or re.fullmatch(r"[0-9a-f]{32}", expectation.invocation_id) is None
+        or not 0 <= expectation.request_state_version <= MAX_SAFE_STATE_VERSION
+        or not 0 <= response_state_version <= MAX_SAFE_STATE_VERSION
+    ):
+        raise ClosedFailure("unlock-diagnostic", "expectation-invalid")
+    final_cases = " ".join(
+        f'"{UNLOCK_IO_DIAGNOSTIC_PREFIX} reason={reason} '
+        f'state-version={response_state_version}${{nl}}.rc=0") '
+        f"result='{reason}'; break;;"
+        for reason in UNLOCK_IO_DIAGNOSTIC_REASONS
+    )
+    source = f"""
+unit='kernaid-rescue-vaultd.service';
+nl=$(printf '\\nX'); nl=${{nl%X}};
+bounded() {{ {{ /usr/bin/systemctl show --property="$1" --value "$unit" 2>/dev/null; printf '.rc=%s' "$?"; }} | /usr/bin/head -c "$2"; }};
+result='diagnostic-unavailable'; attempt=0;
+while [ "$attempt" -lt 50 ]; do
+pid1=$(bounded MainPID 64); inv1=$(bounded InvocationID 64); status=$(bounded StatusText 256); pid2=$(bounded MainPID 64); inv2=$(bounded InvocationID 64);
+if [ "$pid1" != "{expectation.service_pid}${{nl}}.rc=0" ] || [ "$pid2" != "{expectation.service_pid}${{nl}}.rc=0" ] || [ "$inv1" != "{expectation.invocation_id}${{nl}}.rc=0" ] || [ "$inv2" != "{expectation.invocation_id}${{nl}}.rc=0" ]; then break; fi;
+case "$status" in {final_cases} "{UNLOCK_IO_DIAGNOSTIC_PREFIX} reason=in-progress state-version={expectation.request_state_version}${{nl}}.rc=0") ;; *) ;; esac;
+attempt=$((attempt+1)); [ "$attempt" -ge 50 ] || /usr/bin/sleep 0.1;
+done;
+printf '%s\\n' "{UNLOCK_IO_DIAGNOSTIC_RESULT_PREFIX} reason=$result";
+"""
+    command = " ".join(line.strip() for line in source.splitlines() if line.strip())
+    return command.encode("ascii") + b"\n"
+
+
+def collect_unlock_diagnostic(
+    console: SerialConsole,
+    expectation: UnlockDiagnosticExpectation,
+    response_state_version: int,
+    cursor: int,
+    aggregate: float,
+) -> tuple[str, int]:
+    console.send(
+        _unlock_diagnostic_command(expectation, response_state_version),
+        deadline=_deadline(aggregate, 5.0),
+    )
+    match = console.wait_regex(
+        UNLOCK_IO_DIAGNOSTIC_RESULT_PATTERN,
+        start=cursor,
+        deadline=_deadline(aggregate, 15.0),
+        stage="unlock-diagnostic",
+    )
+    return match.group(2).decode("ascii"), match.end()
+
+
 def run_companion(
     console: SerialConsole,
     command: str,
@@ -2089,6 +2190,7 @@ def run_companion(
     cursor: int,
     aggregate: float,
     secret: bytearray | None = None,
+    unlock_diagnostic: UnlockDiagnosticExpectation | None = None,
 ) -> tuple[CompanionResponse, int]:
     if command not in {"status", "unlock", "lock"} or TOKEN_RE.fullmatch(stage) is None:
         raise ClosedFailure("command", "invalid")
@@ -2137,6 +2239,22 @@ def run_companion(
         response = parse_companion_response(
             block, command=command, return_code=return_code
         )
+    except UnlockRemoteFailure as error:
+        if error.code == "unlock-remote-io-failed" and unlock_diagnostic is not None:
+            try:
+                reason, _ = collect_unlock_diagnostic(
+                    console,
+                    unlock_diagnostic,
+                    error.state_version,
+                    end_match.end(),
+                    aggregate,
+                )
+            except (ClosedFailure, CaptureLimitError):
+                reason = "diagnostic-unavailable"
+            raise ClosedFailure(
+                stage, f"response-{error.code}-{reason}"
+            ) from error
+        raise ClosedFailure(stage, f"response-{error.code}") from error
     except ClosedFailure as error:
         if error.stage == "response":
             raise ClosedFailure(stage, f"response-{error.code}") from error
@@ -2665,7 +2783,17 @@ def run_lifecycle(
         raise ClosedFailure("rate-limit", "wait-short")
 
     unlocked, cursor = run_companion(
-        console, "unlock", "correct-unlock", cursor, aggregate, correct
+        console,
+        "unlock",
+        "correct-unlock",
+        cursor,
+        aggregate,
+        correct,
+        UnlockDiagnosticExpectation(
+            service_pid=wrong_runtime.service_pid,
+            invocation_id=wrong_runtime.invocation_id,
+            request_state_version=wrong_response.state_version,
+        ),
     )
     status_unlocked, cursor = run_companion(
         console, "status", "unlocked-status", cursor, aggregate

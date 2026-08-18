@@ -60,6 +60,8 @@ const UNLOCK_RATE_LIMIT: Duration = Duration::from_secs(2);
 const CONTROL_SOCKET_PATH: &str = "/run/kernaid-rescue-vault.sock";
 const NOTIFY_SOCKET_ENV: &str = "NOTIFY_SOCKET";
 const READY_NOTIFICATION: &[u8] = b"READY=1";
+const UNLOCK_DIAGNOSTIC_PREFIX: &str = "STATUS=KERNAID_RESCUE_VAULT_UNLOCK_DIAGNOSTIC_V1";
+const MAX_UNLOCK_DIAGNOSTIC_BYTES: usize = 192;
 const MAX_NOTIFY_SOCKET_BYTES: usize = 108;
 const PASSWD_FILE_PATH: &str = "/etc/passwd";
 const GROUP_FILE_PATH: &str = "/etc/group";
@@ -100,6 +102,7 @@ struct Supervisor {
     runtime: Mutex<Box<dyn RuntimeBoundary>>,
     worker: Option<Arc<dyn WorkerBoundary>>,
     privacy: Arc<dyn PrivacyBoundary>,
+    notifier: Arc<SystemdNotifier>,
     leases: Mutex<LeaseRegistry>,
     faulted: AtomicBool,
     stopping: Arc<AtomicBool>,
@@ -344,6 +347,126 @@ enum SystemdNotifier {
     Enabled(SocketAddrUnix),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnlockDiagnosticReason {
+    InProgress,
+    NonIo,
+    DiagnosticUnavailable,
+    Probe,
+    ProbeClassifier,
+    MapperName,
+    UnsupportedPlatform,
+    PrivilegeRequired,
+    InvalidMapperName,
+    ClassifierUnavailable,
+    PassphraseUnavailable,
+    UnsupportedFilesystem,
+    UnsafeMountRoot,
+    MountFailed,
+    MountVerificationFailed,
+    SecureStateUnavailable,
+    ToolUnavailable,
+    ApplicationStore,
+    DeviceId,
+}
+
+impl UnlockDiagnosticReason {
+    fn token(self) -> &'static str {
+        match self {
+            Self::InProgress => "in-progress",
+            Self::NonIo => "non-io",
+            Self::DiagnosticUnavailable => "diagnostic-unavailable",
+            Self::Probe => "probe-io",
+            Self::ProbeClassifier => "probe-classifier",
+            Self::MapperName => "mapper-name",
+            Self::UnsupportedPlatform => "manager-unsupported-platform",
+            Self::PrivilegeRequired => "manager-privilege-required",
+            Self::InvalidMapperName => "manager-invalid-mapper-name",
+            Self::ClassifierUnavailable => "manager-classifier-unavailable",
+            Self::PassphraseUnavailable => "manager-passphrase-unavailable",
+            Self::UnsupportedFilesystem => "manager-unsupported-filesystem",
+            Self::UnsafeMountRoot => "manager-unsafe-mount-root",
+            Self::MountFailed => "manager-mount-failed",
+            Self::MountVerificationFailed => "manager-mount-verification-failed",
+            Self::SecureStateUnavailable => "manager-secure-state-unavailable",
+            Self::ToolUnavailable => "manager-tool-unavailable",
+            Self::ApplicationStore => "application-store",
+            Self::DeviceId => "device-id",
+        }
+    }
+
+    fn from_worker_result(code: internal_wire::WorkerResultCode) -> Option<Self> {
+        use internal_wire::WorkerResultCode as Result;
+        match code {
+            Result::UnlockIoProbe => Some(Self::Probe),
+            Result::UnlockIoProbeClassifier => Some(Self::ProbeClassifier),
+            Result::UnlockIoMapperName => Some(Self::MapperName),
+            Result::UnlockIoUnsupportedPlatform => Some(Self::UnsupportedPlatform),
+            Result::UnlockIoPrivilegeRequired => Some(Self::PrivilegeRequired),
+            Result::UnlockIoInvalidMapperName => Some(Self::InvalidMapperName),
+            Result::UnlockIoClassifierUnavailable => Some(Self::ClassifierUnavailable),
+            Result::UnlockIoPassphraseUnavailable => Some(Self::PassphraseUnavailable),
+            Result::UnlockIoUnsupportedFilesystem => Some(Self::UnsupportedFilesystem),
+            Result::UnlockIoUnsafeMountRoot => Some(Self::UnsafeMountRoot),
+            Result::UnlockIoMountFailed => Some(Self::MountFailed),
+            Result::UnlockIoMountVerificationFailed => Some(Self::MountVerificationFailed),
+            Result::UnlockIoSecureStateUnavailable => Some(Self::SecureStateUnavailable),
+            Result::UnlockIoToolUnavailable => Some(Self::ToolUnavailable),
+            Result::UnlockIoApplicationStore => Some(Self::ApplicationStore),
+            Result::UnlockIoDeviceId => Some(Self::DeviceId),
+            _ => None,
+        }
+    }
+}
+
+struct UnlockDiagnosticGuard<'a> {
+    supervisor: &'a Supervisor,
+    begin_notified: bool,
+    reason: UnlockDiagnosticReason,
+    final_state_version: Option<u64>,
+}
+
+impl<'a> UnlockDiagnosticGuard<'a> {
+    fn begin(supervisor: &'a Supervisor, state_version: u64) -> Self {
+        let begin_notified = supervisor
+            .notify_unlock_diagnostic(UnlockDiagnosticReason::InProgress, state_version)
+            .is_ok();
+        Self {
+            supervisor,
+            begin_notified,
+            reason: UnlockDiagnosticReason::NonIo,
+            final_state_version: None,
+        }
+    }
+
+    fn set_worker_result(
+        &mut self,
+        code: internal_wire::WorkerResultCode,
+        final_state_version: u64,
+    ) {
+        if let Some(reason) = UnlockDiagnosticReason::from_worker_result(code) {
+            self.reason = reason;
+            self.final_state_version = Some(final_state_version);
+        }
+    }
+}
+
+impl Drop for UnlockDiagnosticGuard<'_> {
+    fn drop(&mut self) {
+        let reason = if self.begin_notified {
+            self.reason
+        } else {
+            UnlockDiagnosticReason::DiagnosticUnavailable
+        };
+        let state_version = self
+            .final_state_version
+            .unwrap_or_else(|| self.supervisor.snapshot().version);
+        let _ = self
+            .supervisor
+            .notify_unlock_diagnostic(reason, state_version);
+    }
+}
+
 impl SystemdNotifier {
     fn from_environment() -> Result<Self, RescueVaultDaemonError> {
         Self::from_value(env::var_os(NOTIFY_SOCKET_ENV).as_deref())
@@ -371,6 +494,27 @@ impl SystemdNotifier {
             return Ok(());
         };
         send_readiness_notification(address, deadline)
+    }
+
+    fn notify_unlock_by(
+        &self,
+        reason: UnlockDiagnosticReason,
+        state_version: u64,
+    ) -> Result<(), RescueVaultDaemonError> {
+        let Self::Enabled(address) = self else {
+            return Ok(());
+        };
+        let payload = format!(
+            "{UNLOCK_DIAGNOSTIC_PREFIX} reason={} state-version={state_version}",
+            reason.token()
+        );
+        if payload.len() > MAX_UNLOCK_DIAGNOSTIC_BYTES
+            || !payload.is_ascii()
+            || payload.as_bytes().contains(&b'\n')
+        {
+            return Err(RescueVaultDaemonError::RuntimeUnavailable);
+        }
+        send_notification_once(address, payload.as_bytes())
     }
 }
 
@@ -415,7 +559,7 @@ impl StopControl {
 
 pub(super) fn run(companion_uid: u32) -> Result<(), RescueVaultDaemonError> {
     enforce_process_privacy().map_err(|()| RescueVaultDaemonError::RuntimeUnavailable)?;
-    let notifier = SystemdNotifier::from_environment()?;
+    let notifier = Arc::new(SystemdNotifier::from_environment()?);
     let signal_set = block_termination_signals()?;
     let stop = StopControl::new();
     spawn_signal_waiter(signal_set, stop.clone())?;
@@ -483,6 +627,7 @@ pub(super) fn run(companion_uid: u32) -> Result<(), RescueVaultDaemonError> {
         runtime: Mutex::new(Box::new(daemon_runtime)),
         worker: worker.map(|worker| -> Arc<dyn WorkerBoundary> { worker }),
         privacy: Arc::new(ProcPrivacyBoundary),
+        notifier: Arc::clone(&notifier),
         leases: Mutex::new(LeaseRegistry::default()),
         faulted: AtomicBool::new(startup_fault),
         stopping: Arc::clone(&stop.requested),
@@ -1046,17 +1191,25 @@ fn send_readiness_notification(
     address: &SocketAddrUnix,
     deadline: Instant,
 ) -> Result<(), RescueVaultDaemonError> {
+    send_notification(address, READY_NOTIFICATION, deadline)
+}
+
+fn send_notification(
+    address: &SocketAddrUnix,
+    payload: &[u8],
+    deadline: Instant,
+) -> Result<(), RescueVaultDaemonError> {
     ensure_before(deadline).map_err(|()| RescueVaultDaemonError::RuntimeUnavailable)?;
     let socket = open_notification_socket()?;
     loop {
         ensure_before(deadline).map_err(|()| RescueVaultDaemonError::RuntimeUnavailable)?;
         match sendto(
             &socket,
-            READY_NOTIFICATION,
+            payload,
             SendFlags::DONTWAIT | SendFlags::NOSIGNAL,
             address,
         ) {
-            Ok(sent) if sent == READY_NOTIFICATION.len() => return Ok(()),
+            Ok(sent) if sent == payload.len() => return Ok(()),
             Ok(_) => return Err(RescueVaultDaemonError::RuntimeUnavailable),
             Err(error) if error == rustix::io::Errno::INTR => {}
             Err(error) if error == rustix::io::Errno::AGAIN => {
@@ -1064,6 +1217,22 @@ fn send_readiness_notification(
             }
             Err(_) => return Err(RescueVaultDaemonError::RuntimeUnavailable),
         }
+    }
+}
+
+fn send_notification_once(
+    address: &SocketAddrUnix,
+    payload: &[u8],
+) -> Result<(), RescueVaultDaemonError> {
+    let socket = open_notification_socket()?;
+    match sendto(
+        &socket,
+        payload,
+        SendFlags::DONTWAIT | SendFlags::NOSIGNAL,
+        address,
+    ) {
+        Ok(sent) if sent == payload.len() => Ok(()),
+        Ok(_) | Err(_) => Err(RescueVaultDaemonError::RuntimeUnavailable),
     }
 }
 
@@ -1701,6 +1870,14 @@ impl BlockingClientLiveness {
 }
 
 impl Supervisor {
+    fn notify_unlock_diagnostic(
+        &self,
+        reason: UnlockDiagnosticReason,
+        state_version: u64,
+    ) -> Result<(), RescueVaultDaemonError> {
+        self.notifier.notify_unlock_by(reason, state_version)
+    }
+
     fn snapshot(&self) -> Snapshot {
         let Ok(_decision) = self.lifecycle.lock() else {
             return Snapshot {
@@ -2353,6 +2530,7 @@ impl Supervisor {
         started: Instant,
         connection: &ClientConnection<'_>,
     ) -> (u64, HandlerResult) {
+        let mut diagnostic = UnlockDiagnosticGuard::begin(self, request.expected_state_version());
         let operation_deadline = started
             .checked_add(WORKER_OPERATION_TIMEOUT)
             .unwrap_or(started);
@@ -2470,7 +2648,14 @@ impl Supervisor {
             operation_deadline,
         );
         match response {
-            Ok((response, None)) => self.finish_unlock(request, response, operation_deadline),
+            Ok((response, None)) => {
+                let worker_code = response.code;
+                let result = self.finish_unlock(request, response, operation_deadline);
+                if matches!(&result.1, HandlerResult::Error(_, ErrorToken::IoFailed)) {
+                    diagnostic.set_worker_result(worker_code, result.0);
+                }
+                result
+            }
             Ok((_, Some(_))) | Err(_) => {
                 self.mark_fault_by(operation_deadline);
                 let version = self.snapshot().version;
@@ -2599,6 +2784,23 @@ impl Supervisor {
                     }
                 };
                 (version, HandlerResult::Error(request, error))
+            }
+            code if UnlockDiagnosticReason::from_worker_result(code).is_some() => {
+                let version = match self.complete_after_locked_attestation(
+                    VaultState::Unlocking,
+                    Availability::Unavailable(ErrorToken::IoFailed),
+                    deadline,
+                ) {
+                    Ok(version) => version,
+                    Err(()) => {
+                        self.mark_fault_by(deadline);
+                        return (
+                            self.snapshot().version,
+                            HandlerResult::Error(request, ErrorToken::RebootRequired),
+                        );
+                    }
+                };
+                (version, HandlerResult::Error(request, ErrorToken::IoFailed))
             }
             _ => {
                 self.mark_fault_by(deadline);
@@ -4792,6 +4994,22 @@ mod tests {
         >,
         privacy_allowed: bool,
     ) -> FakeSupervisorHarness {
+        fake_supervisor_with_notifier(
+            state,
+            responses,
+            privacy_allowed,
+            Arc::new(SystemdNotifier::Disabled),
+        )
+    }
+
+    fn fake_supervisor_with_notifier(
+        state: ServiceState,
+        responses: impl IntoIterator<
+            Item = Result<internal_wire::WorkerResponse, RescueVaultDaemonError>,
+        >,
+        privacy_allowed: bool,
+        notifier: Arc<SystemdNotifier>,
+    ) -> FakeSupervisorHarness {
         let runtime = Arc::new(Mutex::new(FakeRuntimeState::default()));
         let trace = Arc::new(Mutex::new(Vec::new()));
         let worker = Arc::new(Mutex::new(FakeWorkerState {
@@ -4814,6 +5032,7 @@ mod tests {
                 trace: Arc::clone(&trace),
             })),
             privacy: Arc::clone(&privacy) as Arc<dyn PrivacyBoundary>,
+            notifier,
             leases: Mutex::new(LeaseRegistry::default()),
             faulted: AtomicBool::new(false),
             stopping: Arc::new(AtomicBool::new(false)),
@@ -5224,7 +5443,7 @@ mod tests {
     }
 
     fn receive_notification(receiver: &OwnedFd) -> Result<Vec<u8>, rustix::io::Errno> {
-        let mut buffer = [0_u8; 64];
+        let mut buffer = [0_u8; MAX_UNLOCK_DIAGNOSTIC_BYTES];
         recv(receiver, &mut buffer, RecvFlags::DONTWAIT)
             .map(|(received, _)| buffer[..received].to_vec())
     }
@@ -5276,6 +5495,190 @@ mod tests {
             READY_NOTIFICATION
         );
         assert_no_notification(&receiver);
+    }
+
+    #[test]
+    fn unlock_diagnostics_are_linearized_versioned_and_non_dominant() {
+        let directory = tempfile::tempdir().expect("temporary notify directory");
+        let path = directory.path().join("unlock-notify.sock");
+        let address = SocketAddrUnix::new(&path).expect("notification address");
+        let receiver = notification_receiver(&address);
+        let notifier =
+            Arc::new(SystemdNotifier::from_value(Some(path.as_os_str())).expect("unlock notifier"));
+        let (supervisor, _, _, _, _) = fake_supervisor_with_notifier(
+            service_state(10, VaultState::Locked),
+            [
+                Ok(internal_wire::WorkerResponse::new(
+                    1,
+                    internal_wire::WorkerResultCode::UnlockIoUnsafeMountRoot,
+                )),
+                Ok(internal_wire::WorkerResponse::new(
+                    2,
+                    internal_wire::WorkerResultCode::AttestLocked,
+                )),
+            ],
+            true,
+            Arc::clone(&notifier),
+        );
+        let (request, _) = unlock_request(10, b"TEST_ONLY_12", false);
+        let (version, result) = supervisor.handle_request(request, Instant::now());
+        assert_eq!(version, 12);
+        assert_handler_error(result, ErrorToken::IoFailed);
+        assert_eq!(
+            receive_notification(&receiver).expect("in-progress notification"),
+            b"STATUS=KERNAID_RESCUE_VAULT_UNLOCK_DIAGNOSTIC_V1 reason=in-progress state-version=10"
+        );
+        assert_eq!(
+            receive_notification(&receiver).expect("final notification"),
+            b"STATUS=KERNAID_RESCUE_VAULT_UNLOCK_DIAGNOSTIC_V1 reason=manager-unsafe-mount-root state-version=12"
+        );
+        assert_no_notification(&receiver);
+
+        let mut diagnostic = UnlockDiagnosticGuard::begin(&supervisor, 12);
+        assert_eq!(
+            receive_notification(&receiver).expect("interleaving begin notification"),
+            b"STATUS=KERNAID_RESCUE_VAULT_UNLOCK_DIAGNOSTIC_V1 reason=in-progress state-version=12"
+        );
+        diagnostic.set_worker_result(internal_wire::WorkerResultCode::UnlockIoUnsafeMountRoot, 14);
+        supervisor.state.lock().expect("service state").version = 16;
+        drop(diagnostic);
+        assert_eq!(
+            receive_notification(&receiver).expect("correlated final notification"),
+            b"STATUS=KERNAID_RESCUE_VAULT_UNLOCK_DIAGNOSTIC_V1 reason=manager-unsafe-mount-root state-version=14"
+        );
+        assert_no_notification(&receiver);
+
+        let (supervisor, _, _, _, _) = fake_supervisor_with_notifier(
+            service_state(20, VaultState::Locked),
+            [
+                Ok(internal_wire::WorkerResponse::new(
+                    1,
+                    internal_wire::WorkerResultCode::BadPassphrase,
+                )),
+                Ok(internal_wire::WorkerResponse::new(
+                    2,
+                    internal_wire::WorkerResultCode::AttestLocked,
+                )),
+            ],
+            true,
+            notifier,
+        );
+        let (request, _) = unlock_request(20, b"TEST_ONLY_12", false);
+        let (version, result) = supervisor.handle_request(request, Instant::now());
+        assert_eq!(version, 22);
+        assert_handler_error(result, ErrorToken::BadPassphrase);
+        assert_eq!(
+            receive_notification(&receiver).expect("second in-progress notification"),
+            b"STATUS=KERNAID_RESCUE_VAULT_UNLOCK_DIAGNOSTIC_V1 reason=in-progress state-version=20"
+        );
+        assert_eq!(
+            receive_notification(&receiver).expect("non-IO final notification"),
+            b"STATUS=KERNAID_RESCUE_VAULT_UNLOCK_DIAGNOSTIC_V1 reason=non-io state-version=22"
+        );
+        assert_no_notification(&receiver);
+
+        let missing = directory.path().join("missing.sock");
+        let notifier = Arc::new(
+            SystemdNotifier::from_value(Some(missing.as_os_str())).expect("missing notifier"),
+        );
+        let (supervisor, _, _, _, _) = fake_supervisor_with_notifier(
+            service_state(30, VaultState::Locked),
+            [
+                Ok(internal_wire::WorkerResponse::new(
+                    1,
+                    internal_wire::WorkerResultCode::BadPassphrase,
+                )),
+                Ok(internal_wire::WorkerResponse::new(
+                    2,
+                    internal_wire::WorkerResultCode::AttestLocked,
+                )),
+            ],
+            true,
+            notifier,
+        );
+        let (request, _) = unlock_request(30, b"TEST_ONLY_12", false);
+        let (version, result) = supervisor.handle_request(request, Instant::now());
+        assert_eq!(version, 32);
+        assert_handler_error(result, ErrorToken::BadPassphrase);
+    }
+
+    #[test]
+    fn unlock_notification_backpressure_never_delays_the_public_result() {
+        let directory = tempfile::tempdir().expect("temporary notify directory");
+        let path = directory.path().join("backpressure.sock");
+        let address = SocketAddrUnix::new(&path).expect("notification address");
+        let _receiver = notification_receiver(&address);
+        let notifier =
+            Arc::new(SystemdNotifier::from_value(Some(path.as_os_str())).expect("unlock notifier"));
+        let mut saturated = false;
+        for version in 1..=1024 {
+            if notifier
+                .notify_unlock_by(UnlockDiagnosticReason::NonIo, version)
+                .is_err()
+            {
+                saturated = true;
+                break;
+            }
+        }
+        assert!(saturated, "notification receiver queue did not saturate");
+
+        let (supervisor, _, _, _, _) = fake_supervisor_with_notifier(
+            service_state(40, VaultState::Locked),
+            [
+                Ok(internal_wire::WorkerResponse::new(
+                    1,
+                    internal_wire::WorkerResultCode::UnlockIoUnsafeMountRoot,
+                )),
+                Ok(internal_wire::WorkerResponse::new(
+                    2,
+                    internal_wire::WorkerResultCode::AttestLocked,
+                )),
+            ],
+            true,
+            notifier,
+        );
+        let (request, _) = unlock_request(40, b"TEST_ONLY_12", false);
+        let started = Instant::now();
+        let (version, result) = supervisor.handle_request(request, started);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(version, 42);
+        assert_handler_error(result, ErrorToken::IoFailed);
+    }
+
+    #[test]
+    fn every_detailed_unlock_io_result_remains_public_io_failed() {
+        use internal_wire::WorkerResultCode as Result;
+        for code in [
+            Result::UnlockIoProbe,
+            Result::UnlockIoProbeClassifier,
+            Result::UnlockIoMapperName,
+            Result::UnlockIoUnsupportedPlatform,
+            Result::UnlockIoPrivilegeRequired,
+            Result::UnlockIoInvalidMapperName,
+            Result::UnlockIoClassifierUnavailable,
+            Result::UnlockIoPassphraseUnavailable,
+            Result::UnlockIoUnsupportedFilesystem,
+            Result::UnlockIoUnsafeMountRoot,
+            Result::UnlockIoMountFailed,
+            Result::UnlockIoMountVerificationFailed,
+            Result::UnlockIoSecureStateUnavailable,
+            Result::UnlockIoToolUnavailable,
+            Result::UnlockIoApplicationStore,
+            Result::UnlockIoDeviceId,
+        ] {
+            let (supervisor, _, _, _, _) = fake_supervisor(
+                service_state(30, VaultState::Locked),
+                [
+                    Ok(internal_wire::WorkerResponse::new(1, code)),
+                    Ok(internal_wire::WorkerResponse::new(2, Result::AttestLocked)),
+                ],
+                true,
+            );
+            let (request, _) = unlock_request(30, b"TEST_ONLY_12", false);
+            let (version, result) = supervisor.handle_request(request, Instant::now());
+            assert_eq!(version, 32, "unexpected version for {code:?}");
+            assert_handler_error(result, ErrorToken::IoFailed);
+        }
     }
 
     #[test]

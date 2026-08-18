@@ -649,7 +649,7 @@ fn unlock(
         LocatedVaultClassification::Unprovisioned => return Err(Code::Unprovisioned),
         LocatedVaultClassification::Locked => {}
     }
-    let mapper = fresh_mapper_name().map_err(|_| Code::IoFailed)?;
+    let mapper = fresh_mapper_name().map_err(|_| Code::UnlockIoMapperName)?;
     let manager = RescueVaultMountManager::acquire().map_err(map_manager_error)?;
     let request = VaultUnlockRequest::from_located(partition, mapper);
     let mounted = manager
@@ -663,14 +663,14 @@ fn unlock(
         Ok(device_id) => device_id,
         Err(_) => {
             return match mounted.shutdown() {
-                Ok(()) => Err(Code::IoFailed),
+                Ok(()) => Err(Code::UnlockIoApplicationStore),
                 Err(_) => Err(Code::CleanupFailed),
             };
         }
     };
     if kernaid_device_identity::validate_device_id(&device_id).is_err() {
         return match mounted.shutdown() {
-            Ok(()) => Err(Code::IoFailed),
+            Ok(()) => Err(Code::UnlockIoDeviceId),
             Err(_) => Err(Code::CleanupFailed),
         };
     }
@@ -764,7 +764,8 @@ fn map_probe_unlock_error(error: ProbeError) -> internal_wire::WorkerResultCode 
     match error {
         ProbeError::Absent => Result::Absent,
         ProbeError::ProfileMismatch => Result::ProfileMismatch,
-        ProbeError::ClassifierUnavailable | ProbeError::IoFailed => Result::IoFailed,
+        ProbeError::ClassifierUnavailable => Result::UnlockIoProbeClassifier,
+        ProbeError::IoFailed => Result::UnlockIoProbe,
         ProbeError::MediaChanged => Result::MediaChanged,
         ProbeError::TimedOut => Result::TimedOut,
         ProbeError::CleanupFailed => Result::CleanupFailed,
@@ -786,17 +787,17 @@ fn map_manager_error(error: VaultMountManagerError) -> internal_wire::WorkerResu
         | VaultMountManagerError::InvalidLuks2Header
         | VaultMountManagerError::WrongVaultLabel
         | VaultMountManagerError::MappingVerificationFailed => Result::MediaChanged,
-        VaultMountManagerError::UnsupportedPlatform
-        | VaultMountManagerError::PrivilegeRequired
-        | VaultMountManagerError::InvalidMapperName
-        | VaultMountManagerError::ClassifierUnavailable
-        | VaultMountManagerError::PassphraseUnavailable
-        | VaultMountManagerError::UnsupportedFilesystem
-        | VaultMountManagerError::UnsafeMountRoot
-        | VaultMountManagerError::MountFailed
-        | VaultMountManagerError::MountVerificationFailed
-        | VaultMountManagerError::SecureStateUnavailable
-        | VaultMountManagerError::ToolUnavailable => Result::IoFailed,
+        VaultMountManagerError::UnsupportedPlatform => Result::UnlockIoUnsupportedPlatform,
+        VaultMountManagerError::PrivilegeRequired => Result::UnlockIoPrivilegeRequired,
+        VaultMountManagerError::InvalidMapperName => Result::UnlockIoInvalidMapperName,
+        VaultMountManagerError::ClassifierUnavailable => Result::UnlockIoClassifierUnavailable,
+        VaultMountManagerError::PassphraseUnavailable => Result::UnlockIoPassphraseUnavailable,
+        VaultMountManagerError::UnsupportedFilesystem => Result::UnlockIoUnsupportedFilesystem,
+        VaultMountManagerError::UnsafeMountRoot => Result::UnlockIoUnsafeMountRoot,
+        VaultMountManagerError::MountFailed => Result::UnlockIoMountFailed,
+        VaultMountManagerError::MountVerificationFailed => Result::UnlockIoMountVerificationFailed,
+        VaultMountManagerError::SecureStateUnavailable => Result::UnlockIoSecureStateUnavailable,
+        VaultMountManagerError::ToolUnavailable => Result::UnlockIoToolUnavailable,
     }
 }
 
@@ -954,6 +955,66 @@ mod tests {
             map_manager_error(VaultMountManagerError::OperationTimedOut),
             internal_wire::WorkerResultCode::TimedOut
         );
+        assert_eq!(
+            map_probe_unlock_error(ProbeError::ClassifierUnavailable),
+            internal_wire::WorkerResultCode::UnlockIoProbeClassifier
+        );
+        assert_eq!(
+            map_probe_unlock_error(ProbeError::IoFailed),
+            internal_wire::WorkerResultCode::UnlockIoProbe
+        );
+        for (error, code) in [
+            (
+                VaultMountManagerError::UnsupportedPlatform,
+                internal_wire::WorkerResultCode::UnlockIoUnsupportedPlatform,
+            ),
+            (
+                VaultMountManagerError::PrivilegeRequired,
+                internal_wire::WorkerResultCode::UnlockIoPrivilegeRequired,
+            ),
+            (
+                VaultMountManagerError::InvalidMapperName,
+                internal_wire::WorkerResultCode::UnlockIoInvalidMapperName,
+            ),
+            (
+                VaultMountManagerError::ClassifierUnavailable,
+                internal_wire::WorkerResultCode::UnlockIoClassifierUnavailable,
+            ),
+            (
+                VaultMountManagerError::PassphraseUnavailable,
+                internal_wire::WorkerResultCode::UnlockIoPassphraseUnavailable,
+            ),
+            (
+                VaultMountManagerError::UnsupportedFilesystem,
+                internal_wire::WorkerResultCode::UnlockIoUnsupportedFilesystem,
+            ),
+            (
+                VaultMountManagerError::UnsafeMountRoot,
+                internal_wire::WorkerResultCode::UnlockIoUnsafeMountRoot,
+            ),
+            (
+                VaultMountManagerError::MountFailed,
+                internal_wire::WorkerResultCode::UnlockIoMountFailed,
+            ),
+            (
+                VaultMountManagerError::MountVerificationFailed,
+                internal_wire::WorkerResultCode::UnlockIoMountVerificationFailed,
+            ),
+            (
+                VaultMountManagerError::SecureStateUnavailable,
+                internal_wire::WorkerResultCode::UnlockIoSecureStateUnavailable,
+            ),
+            (
+                VaultMountManagerError::ToolUnavailable,
+                internal_wire::WorkerResultCode::UnlockIoToolUnavailable,
+            ),
+        ] {
+            assert_eq!(
+                map_manager_error(error),
+                code,
+                "wrong mapping for {error:?}"
+            );
+        }
     }
 
     #[test]

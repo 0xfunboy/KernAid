@@ -656,6 +656,9 @@ class ResponseParserTests(unittest.TestCase):
             )
         self.assertEqual(classified.exception.stage, "response")
         self.assertEqual(classified.exception.code, "unlock-remote-io-failed")
+        self.assertIsInstance(classified.exception, controller.UnlockRemoteFailure)
+        self.assertEqual(classified.exception.state_version, 24)
+        self.assertNotIn("24", str(classified.exception))
 
         with self.assertRaises(controller.ClosedFailure) as unknown:
             controller.parse_companion_response(
@@ -952,6 +955,197 @@ class ResponseParserTests(unittest.TestCase):
                 secret,
             )
         self.assertEqual(len(blocked.sent), 1, "the secret must remain unsent")
+
+
+class UnlockDiagnosticTests(unittest.TestCase):
+    expectation = controller.UnlockDiagnosticExpectation(
+        service_pid=101,
+        invocation_id="0123456789abcdef0123456789abcdef",
+        request_state_version=10,
+    )
+
+    def run_closed_shell_classifier(
+        self,
+        status: str,
+        *,
+        pid: str = "101\n",
+        invocation: str = "0123456789abcdef0123456789abcdef\n",
+        return_code: int = 0,
+    ) -> bytes:
+        command = controller._unlock_diagnostic_command(self.expectation, 12)
+        command = command.replace(b"/usr/bin/systemctl", b"mock_systemctl")
+        command = command.replace(b"/usr/bin/sleep 0.1", b":")
+        command = command.replace(b'"$attempt" -lt 50', b'"$attempt" -lt 2')
+        command = command.replace(b'"$attempt" -ge 50', b'"$attempt" -ge 2')
+        source = b"""
+mock_systemctl() {
+    case "$2" in
+        --property=MainPID) printf '%s' "$TEST_PID" ;;
+        --property=InvocationID) printf '%s' "$TEST_INVOCATION" ;;
+        --property=StatusText) printf '%s' "$TEST_STATUS" ;;
+        *) return 9 ;;
+    esac
+    return "$TEST_RC"
+}
+""" + command
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "TEST_PID": pid,
+                "TEST_INVOCATION": invocation,
+                "TEST_STATUS": status,
+                "TEST_RC": str(return_code),
+            }
+        )
+        completed = subprocess.run(
+            ["/bin/bash", "-c", source],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
+            timeout=2,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(completed.stderr, b"")
+        return completed.stdout
+
+    @unittest.skipUnless(Path("/bin/bash").is_file(), "bash required")
+    def test_closed_shell_accepts_only_correlated_final_status(self) -> None:
+        for reason in controller.UNLOCK_IO_DIAGNOSTIC_REASONS:
+            with self.subTest(reason=reason):
+                status = (
+                    f"{controller.UNLOCK_IO_DIAGNOSTIC_PREFIX} reason={reason} "
+                    "state-version=12\n"
+                )
+                self.assertEqual(
+                    self.run_closed_shell_classifier(status),
+                    (
+                        f"{controller.UNLOCK_IO_DIAGNOSTIC_RESULT_PREFIX} "
+                        f"reason={reason}\n"
+                    ).encode("ascii"),
+                )
+
+        unavailable = (
+            f"{controller.UNLOCK_IO_DIAGNOSTIC_RESULT_PREFIX} "
+            "reason=diagnostic-unavailable\n"
+        ).encode("ascii")
+        exact_prefix = controller.UNLOCK_IO_DIAGNOSTIC_PREFIX
+        invalid = [
+            (f"{exact_prefix} reason=in-progress state-version=10\n", {}),
+            (f"{exact_prefix} reason=non-io state-version=12\n", {}),
+            (f"{exact_prefix} reason=manager-unsafe-mount-root state-version=11\n", {}),
+            (f"{exact_prefix} reason=manager-unsafe-mount-root state-version=012\n", {}),
+            (f"{exact_prefix} reason=manager-unsafe-mount-root state-version=12\nextra\n", {}),
+            (f"{exact_prefix} reason=future-reason state-version=12\n", {}),
+            (f"{exact_prefix} reason=manager-unsafe-mount-root state-version=12", {}),
+            ("X" * 300, {}),
+            (
+                f"{exact_prefix} reason=manager-unsafe-mount-root state-version=12\n",
+                {"pid": "102\n"},
+            ),
+            (
+                f"{exact_prefix} reason=manager-unsafe-mount-root state-version=12\n",
+                {"invocation": "1123456789abcdef0123456789abcdef\n"},
+            ),
+            (
+                f"{exact_prefix} reason=manager-unsafe-mount-root state-version=12\n",
+                {"return_code": 1},
+            ),
+        ]
+        for status, overrides in invalid:
+            with self.subTest(status=status[:64], overrides=overrides):
+                output = self.run_closed_shell_classifier(status, **overrides)
+                self.assertEqual(output, unavailable)
+                self.assertNotIn(status.encode("ascii"), output)
+
+    def test_command_is_bounded_and_rejects_invalid_expectations(self) -> None:
+        command = controller._unlock_diagnostic_command(self.expectation, 12)
+        self.assertIn(b"status=$(bounded StatusText 256)", command)
+        self.assertIn(b'/usr/bin/head -c "$2"', command)
+        self.assertIn(b'case "$status" in', command)
+        self.assertIn(b'pid1=$(bounded MainPID 64)', command)
+        self.assertIn(b'pid2=$(bounded MainPID 64)', command)
+        self.assertIn(b'inv1=$(bounded InvocationID 64)', command)
+        self.assertIn(b'inv2=$(bounded InvocationID 64)', command)
+        self.assertNotIn(b"echo", command)
+        self.assertNotIn(b'printf \'%s\\n\' "$status"', command)
+        self.assertLess(len(command), 8192)
+
+        invalid = [
+            controller.UnlockDiagnosticExpectation(
+                1, self.expectation.invocation_id, 10
+            ),
+            controller.UnlockDiagnosticExpectation(
+                101, "A" * 32, 10
+            ),
+            controller.UnlockDiagnosticExpectation(
+                101,
+                self.expectation.invocation_id,
+                controller.MAX_SAFE_STATE_VERSION + 1,
+            ),
+        ]
+        for expectation in invalid:
+            with self.subTest(expectation=expectation), self.assertRaises(
+                controller.ClosedFailure
+            ):
+                controller._unlock_diagnostic_command(expectation, 12)
+        with self.assertRaises(controller.ClosedFailure):
+            controller._unlock_diagnostic_command(
+                self.expectation, controller.MAX_SAFE_STATE_VERSION + 1
+            )
+
+    def test_exact_io_response_is_refined_without_copying_status(self) -> None:
+        secret = bytearray(b"TEST_ONLY_SECRET")
+        transcript = (
+            b"KERNAID_VAULT_CTL_BEGIN_V1_correct-unlock\r\n"
+            b"READY\r\nVault passphrase: \r\n"
+            b"stateVersion: 12\r\nerror: IO_FAILED\r\n"
+            b"KERNAID_VAULT_CTL_END_V1_correct-unlock rc=1\r\n"
+            b"diagnostic-command-echo\r\n"
+            b"KERNAID_VAULT_UNLOCK_DIAGNOSTIC_V1 "
+            b"reason=manager-unsafe-mount-root\r\n"
+        )
+
+        class ScriptedConsole:
+            def __init__(self, data: bytes) -> None:
+                self.capture = controller.BoundedCapture(16384, [])
+                self.capture.append(data)
+                self.sent: list[bytes] = []
+
+            def send(self, value: bytes | bytearray, *, deadline: float) -> None:
+                del deadline
+                self.sent.append(bytes(value))
+
+            def wait_regex(
+                self, pattern: object, *, start: int, deadline: float, stage: str
+            ) -> object:
+                del deadline, stage
+                match = pattern.search(self.capture.snapshot(), start)
+                if match is None:
+                    raise controller.ClosedFailure("scripted", "missing")
+                return match
+
+        console = ScriptedConsole(transcript)
+        with self.assertRaises(controller.ClosedFailure) as failure:
+            controller.run_companion(
+                console,
+                "unlock",
+                "correct-unlock",
+                0,
+                time.monotonic() + 10,
+                secret,
+                self.expectation,
+            )
+        self.assertEqual(failure.exception.stage, "correct-unlock")
+        self.assertEqual(
+            failure.exception.code,
+            "response-unlock-remote-io-failed-manager-unsafe-mount-root",
+        )
+        self.assertEqual(console.sent[1:3], [bytes(secret), b"\n"])
+        self.assertNotIn(bytes(secret), console.sent[-1])
+        self.assertIn(b"state-version=12", console.sent[-1])
+        self.assertIn(b"state-version=10", console.sent[-1])
 
 
 class RuntimeEvidenceTests(unittest.TestCase):
