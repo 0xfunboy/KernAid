@@ -115,6 +115,7 @@ jobs:
             tools/build-rescue/qemu-usb-smoke.sh \
             tools/build-rescue/qemu-vault-lifecycle-smoke.sh
           python3 -I -B -c 'from pathlib import Path; path = Path("tools/build-rescue/qemu-vault-lifecycle-pty.py"); compile(path.read_bytes(), str(path), "exec", dont_inherit=True)'
+          python3 -I -B -c 'from pathlib import Path; path = Path("tools/build-rescue/provider-lease-probe.py"); compile(path.read_bytes(), str(path), "exec", dont_inherit=True)'
       - name: Build the host-only Rescue vault lifecycle probe
         run: |
           cargo fmt -p kernaid-rescue-secrets -- --check
@@ -426,13 +427,22 @@ jobs:
           )
           boot = re.compile(
               rf"KERNAID_QEMU_VAULT_LIFECYCLE_BOOT_V1 firmware={firmware} "
-              r"boot=([12]) initial_version=[0-9]+ final_version=[0-9]+ "
+              r"boot=([12]) initial_version=[0-9]+ pre_terminal_version=[0-9]+ "
+              r"terminal_epoch_version=[0-9]+ terminal=(clean-lock|persistent-fault) "
               r"device_id=KA-[0-9a-f]{24} wrong_key_rejected=true "
-              r"rate_limit_waited=true daemon_stable=true worker_stable=true "
-              r"cgroup_stable=true caps_stable=true ambient_zero=true "
+              r"rate_limit_waited=true pre_terminal_daemon_stable=true "
+              r"pre_terminal_worker_stable=true pre_terminal_cgroup_stable=true "
+              r"pre_terminal_caps_stable=true ambient_zero=true "
               r"no_new_privs=true core_limits_zero=true swaps_empty=true "
               r"cgroup_topology_exact=true shell_mount_absent=true "
-              r"residue_absent=true acpi_shutdown=true"
+              r"provider_configured=true production_executor_unit_binds_to_exact=true "
+              r"production_executor_status_path=true conditioned_agent_binds_to_runtime=true "
+              r"normal_triple_release=true lifecycle_marker_active_before_borrow=true "
+              r"hold_killed_vaultd=(true|false) helper_binds_to_terminated=(true|false) "
+              r"worker_pdeath_cleanup=(true|false) test_trigger_sockets_gone=(true|false) "
+              r"unit_credentials_cleaned=(true|false) persistent_fault_status_only=(true|false) "
+              r"lifecycle_marker_persisted=(true|false) provider_network_used=false "
+              r"tls_openai_qualified=false residue_absent=true acpi_shutdown=true"
           )
           raw = re.compile(
               rf"KERNAID_QEMU_VAULT_LIFECYCLE_RAW_V1 firmware={firmware} "
@@ -448,13 +458,22 @@ jobs:
               rf"KERNAID_QEMU_VAULT_LIFECYCLE_ATTESTATION_V1 firmware={firmware} "
               r"boot_count=2 same_usb=true device_id=KA-[0-9a-f]{24} "
               r"device_id_stable=true identity_public_key_stable=true "
-              r"guest_device_id_derived=true host_postverify=true clean_shutdown=true "
-              r"luks_profile_valid=true versions_exact_plus_two=true "
+              r"guest_device_id_derived=true host_postverify=true acpi_shutdowns_clean=true "
+              r"luks_profile_valid=true mutation_versions_exact_plus_two=true "
               r"wrong_key_rejected=true rate_limit_waited=true "
-              r"locked_after_each_boot=true daemon_processes_stable=true "
-              r"cgroups_exact=true capabilities_exact=true ambient_zero=true "
+              r"boot1_clean_lock=true boot2_persistent_fault=true "
+              r"pre_terminal_daemon_processes_stable=true "
+              r"cgroups_exact=true pre_terminal_capabilities_exact=true ambient_zero=true "
               r"no_new_privs=true core_limits_zero=true swaps_empty=true "
-              r"shell_mount_absent=true residue_absent=true qmp_acpi_shutdowns=2 "
+              r"shell_mount_absent=true provider_configured=true "
+              r"production_executor_unit_binds_to_exact=true "
+              r"production_executor_status_path=true conditioned_agent_binds_to_runtime=true "
+              r"normal_triple_release=true lifecycle_marker_active_before_borrow=true "
+              r"hold_killed_vaultd=true helper_binds_to_terminated=true "
+              r"worker_pdeath_cleanup=true test_trigger_sockets_gone=true "
+              r"unit_credentials_cleaned=true persistent_fault_status_only=true "
+              r"lifecycle_marker_persisted=true provider_network_used=false "
+              r"tls_openai_qualified=false residue_absent=true qmp_acpi_shutdowns=2 "
               rf"uefi_vars={expected_uefi_vars} ready=true"
           )
           patterns = (
@@ -465,6 +484,7 @@ jobs:
           )
           kinds = []
           boots = []
+          boot_contracts = []
           for line in lines:
               if len(line) > 2048:
                   raise SystemExit("lifecycle output line was too long")
@@ -474,11 +494,20 @@ jobs:
                       kinds.append(kind)
                       if kind == "boot":
                           boots.append(match.group(1))
+                          boot_contracts.append(match.groups())
                       break
               else:
                   raise SystemExit("lifecycle output was outside the allowlist")
           if status == 0:
-              if kinds != ["boot", "boot", "raw", "attestation"] or boots != ["1", "2"]:
+              expected_contracts = [
+                  ("1", "clean-lock", *("false",) * 7),
+                  ("2", "persistent-fault", *("true",) * 7),
+              ]
+              if (
+                  kinds != ["boot", "boot", "raw", "attestation"]
+                  or boots != ["1", "2"]
+                  or boot_contracts != expected_contracts
+              ):
                   raise SystemExit("successful lifecycle output was incomplete")
           elif "failure" not in kinds or "raw" in kinds or "attestation" in kinds:
               raise SystemExit("failed lifecycle output was not fail-closed")
@@ -669,13 +698,22 @@ jobs:
           )
           boot = re.compile(
               rf"KERNAID_QEMU_VAULT_LIFECYCLE_BOOT_V1 firmware={firmware} "
-              r"boot=([12]) initial_version=[0-9]+ final_version=[0-9]+ "
+              r"boot=([12]) initial_version=[0-9]+ pre_terminal_version=[0-9]+ "
+              r"terminal_epoch_version=[0-9]+ terminal=(clean-lock|persistent-fault) "
               r"device_id=KA-[0-9a-f]{24} wrong_key_rejected=true "
-              r"rate_limit_waited=true daemon_stable=true worker_stable=true "
-              r"cgroup_stable=true caps_stable=true ambient_zero=true "
+              r"rate_limit_waited=true pre_terminal_daemon_stable=true "
+              r"pre_terminal_worker_stable=true pre_terminal_cgroup_stable=true "
+              r"pre_terminal_caps_stable=true ambient_zero=true "
               r"no_new_privs=true core_limits_zero=true swaps_empty=true "
               r"cgroup_topology_exact=true shell_mount_absent=true "
-              r"residue_absent=true acpi_shutdown=true"
+              r"provider_configured=true production_executor_unit_binds_to_exact=true "
+              r"production_executor_status_path=true conditioned_agent_binds_to_runtime=true "
+              r"normal_triple_release=true lifecycle_marker_active_before_borrow=true "
+              r"hold_killed_vaultd=(true|false) helper_binds_to_terminated=(true|false) "
+              r"worker_pdeath_cleanup=(true|false) test_trigger_sockets_gone=(true|false) "
+              r"unit_credentials_cleaned=(true|false) persistent_fault_status_only=(true|false) "
+              r"lifecycle_marker_persisted=(true|false) provider_network_used=false "
+              r"tls_openai_qualified=false residue_absent=true acpi_shutdown=true"
           )
           raw = re.compile(
               rf"KERNAID_QEMU_VAULT_LIFECYCLE_RAW_V1 firmware={firmware} "
@@ -691,13 +729,22 @@ jobs:
               rf"KERNAID_QEMU_VAULT_LIFECYCLE_ATTESTATION_V1 firmware={firmware} "
               r"boot_count=2 same_usb=true device_id=KA-[0-9a-f]{24} "
               r"device_id_stable=true identity_public_key_stable=true "
-              r"guest_device_id_derived=true host_postverify=true clean_shutdown=true "
-              r"luks_profile_valid=true versions_exact_plus_two=true "
+              r"guest_device_id_derived=true host_postverify=true acpi_shutdowns_clean=true "
+              r"luks_profile_valid=true mutation_versions_exact_plus_two=true "
               r"wrong_key_rejected=true rate_limit_waited=true "
-              r"locked_after_each_boot=true daemon_processes_stable=true "
-              r"cgroups_exact=true capabilities_exact=true ambient_zero=true "
+              r"boot1_clean_lock=true boot2_persistent_fault=true "
+              r"pre_terminal_daemon_processes_stable=true "
+              r"cgroups_exact=true pre_terminal_capabilities_exact=true ambient_zero=true "
               r"no_new_privs=true core_limits_zero=true swaps_empty=true "
-              r"shell_mount_absent=true residue_absent=true qmp_acpi_shutdowns=2 "
+              r"shell_mount_absent=true provider_configured=true "
+              r"production_executor_unit_binds_to_exact=true "
+              r"production_executor_status_path=true conditioned_agent_binds_to_runtime=true "
+              r"normal_triple_release=true lifecycle_marker_active_before_borrow=true "
+              r"hold_killed_vaultd=true helper_binds_to_terminated=true "
+              r"worker_pdeath_cleanup=true test_trigger_sockets_gone=true "
+              r"unit_credentials_cleaned=true persistent_fault_status_only=true "
+              r"lifecycle_marker_persisted=true provider_network_used=false "
+              r"tls_openai_qualified=false residue_absent=true qmp_acpi_shutdowns=2 "
               rf"uefi_vars={expected_uefi_vars} ready=true"
           )
           patterns = (
@@ -708,6 +755,7 @@ jobs:
           )
           kinds = []
           boots = []
+          boot_contracts = []
           for line in lines:
               if len(line) > 2048:
                   raise SystemExit("lifecycle output line was too long")
@@ -717,11 +765,20 @@ jobs:
                       kinds.append(kind)
                       if kind == "boot":
                           boots.append(match.group(1))
+                          boot_contracts.append(match.groups())
                       break
               else:
                   raise SystemExit("lifecycle output was outside the allowlist")
           if status == 0:
-              if kinds != ["boot", "boot", "raw", "attestation"] or boots != ["1", "2"]:
+              expected_contracts = [
+                  ("1", "clean-lock", *("false",) * 7),
+                  ("2", "persistent-fault", *("true",) * 7),
+              ]
+              if (
+                  kinds != ["boot", "boot", "raw", "attestation"]
+                  or boots != ["1", "2"]
+                  or boot_contracts != expected_contracts
+              ):
                   raise SystemExit("successful lifecycle output was incomplete")
           elif "failure" not in kinds or "raw" in kinds or "attestation" in kinds:
               raise SystemExit("failed lifecycle output was not fail-closed")

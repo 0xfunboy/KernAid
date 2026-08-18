@@ -38,6 +38,7 @@ enum WorkerVaultState {
 }
 
 pub(super) fn run() -> Result<(), RescueVaultDaemonError> {
+    runtime::narrow_worker_capabilities()?;
     enforce_process_privacy().map_err(|()| RescueVaultDaemonError::WorkerUnavailable)?;
     let control = take_control_socket()?;
     establish_parent_lifetime(control.as_fd())?;

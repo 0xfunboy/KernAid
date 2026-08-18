@@ -2,7 +2,7 @@
 //!
 //! The wire is fixed-size binary data. It contains no pathname, secret,
 //! command string, diagnostic text, or JSON. The sole permitted descriptor is
-//! one anonymous pipe on an `Unlock`, `ProviderOpenAiConfigure`, or dormant
+//! one anonymous pipe on an `Unlock`, `ProviderOpenAiConfigure`, or leased
 //! `ProviderOpenAiBorrow` command. Borrow carries only the worker's write end;
 //! the supervisor retains the read end and never reads credential bytes.
 

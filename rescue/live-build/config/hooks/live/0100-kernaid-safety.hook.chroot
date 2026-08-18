@@ -26,6 +26,7 @@ chown root:root \
     /usr/lib/kernaid/kernaid-rescue-openai-executor \
     /usr/lib/kernaid/kernaid-rescue-vaultd \
     /usr/bin/kernaid-rescue-vaultctl
+test -x /usr/lib/systemd/systemd-socket-proxyd
 chmod 0755 \
     /usr/lib/kernaid/kernaid-rescue-openai-executor \
     /usr/lib/kernaid/kernaid-rescue-vaultd \
@@ -34,6 +35,14 @@ chown root:root \
     /etc/systemd/system/kernaid-offline-inspector-key.service \
     /etc/systemd/system/kernaid-offline-inspector.socket \
     /etc/systemd/system/kernaid-offline-inspector@.service \
+    /etc/systemd/system/kernaid-provider-executor-status-probe.socket \
+    /etc/systemd/system/kernaid-provider-executor-status-probe@.service \
+    /etc/systemd/system/kernaid-provider-lease-kill-vaultd.socket \
+    /etc/systemd/system/kernaid-provider-lease-kill-vaultd@.service \
+    /etc/systemd/system/kernaid-provider-lease-probe.socket \
+    /etc/systemd/system/kernaid-provider-lease-probe@.service \
+    /etc/systemd/system/kernaid-rescue-openai-egress.service \
+    /etc/systemd/system/kernaid-rescue-openai-egress.socket \
     /etc/systemd/system/kernaid-rescue-openai-executor.socket \
     /etc/systemd/system/kernaid-rescue-openai-executor@.service \
     /etc/systemd/system/kernaid-rescue-vaultd.service \
@@ -48,6 +57,14 @@ chmod 0644 \
     /etc/systemd/system/kernaid-offline-inspector-key.service \
     /etc/systemd/system/kernaid-offline-inspector.socket \
     /etc/systemd/system/kernaid-offline-inspector@.service \
+    /etc/systemd/system/kernaid-provider-executor-status-probe.socket \
+    /etc/systemd/system/kernaid-provider-executor-status-probe@.service \
+    /etc/systemd/system/kernaid-provider-lease-kill-vaultd.socket \
+    /etc/systemd/system/kernaid-provider-lease-kill-vaultd@.service \
+    /etc/systemd/system/kernaid-provider-lease-probe.socket \
+    /etc/systemd/system/kernaid-provider-lease-probe@.service \
+    /etc/systemd/system/kernaid-rescue-openai-egress.service \
+    /etc/systemd/system/kernaid-rescue-openai-egress.socket \
     /etc/systemd/system/kernaid-rescue-openai-executor.socket \
     /etc/systemd/system/kernaid-rescue-openai-executor@.service \
     /etc/systemd/system/kernaid-rescue-vaultd.service \
@@ -75,6 +92,7 @@ done
 systemctl enable kernaid-ready.service
 systemctl enable kernaid-ui.service
 systemctl enable kernaid-offline-inspector.socket
+systemctl enable kernaid-rescue-openai-egress.socket
 systemctl enable kernaid-rescue-openai-executor.socket
 systemctl enable kernaid-rescue-vaultd.socket
 systemctl enable kernaid-rescue-vaultd.service

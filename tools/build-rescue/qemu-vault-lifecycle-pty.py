@@ -70,7 +70,12 @@ RUNTIME_RESULT_PATTERN = re.compile(
     _TRUSTED_SHELL_MARKER_START
     + rb"(KERNAID_VAULT_RUNTIME_V1 [^\r\n]{1,1024})\r?\n"
 )
+PROVIDER_PROOF_RESULT_PATTERN = re.compile(
+    _TRUSTED_SHELL_MARKER_START
+    + rb"(KERNAID_QEMU_PROVIDER_PROOF_V1 stage=[a-z0-9-]+ result=true)\r?\n"
+)
 CAP_SYS_ADMIN_ONLY = "0000000000200000"
+CAP_SYS_ADMIN_AND_KILL = "0000000000200020"
 ZERO_CAPS = "0000000000000000"
 
 FAILURE_PREFIX = "KERNAID_QEMU_VAULT_LIFECYCLE_FAILURE_V1"
@@ -676,6 +681,15 @@ class CompanionResponse:
     return_code: int
 
 
+@dataclasses.dataclass(frozen=True)
+class ProviderCompanionResponse:
+    state_version: int
+    openai: str | None
+    codex: str | None
+    error: str | None
+    return_code: int
+
+
 def parse_companion_response(
     block: bytes, *, command: str, return_code: int
 ) -> CompanionResponse:
@@ -732,6 +746,70 @@ def parse_companion_response(
         if not (success or rejected):
             raise ClosedFailure("response", "unlock-invalid")
     return CompanionResponse(version, state, device_id, error, return_code)
+
+
+def parse_provider_companion_response(
+    block: bytes, *, command: str, return_code: int
+) -> ProviderCompanionResponse:
+    """Parse one exact production provider companion TTY response block."""
+
+    lines = _normalize(block)
+    if command == "openai-configure":
+        if lines[:2] != [b"READY", b"OpenAI API key: "]:
+            raise ClosedFailure("provider-response", "prompt-invalid")
+        lines = lines[2:]
+    elif command != "provider-status":
+        raise ClosedFailure("provider-response", "command-invalid")
+    if not lines or re.fullmatch(rb"stateVersion: (0|[1-9][0-9]*)", lines[0]) is None:
+        raise ClosedFailure("provider-response", "version-invalid")
+    version = int(lines.pop(0).split(b": ", 1)[1])
+    openai: str | None = None
+    codex: str | None = None
+    error: str | None = None
+    if len(lines) >= 2 and re.fullmatch(
+        rb"openai: (unconfigured|configured)", lines[0]
+    ):
+        openai = lines.pop(0).split(b": ", 1)[1].decode("ascii")
+        if not lines or re.fullmatch(
+            rb"codex: (unconfigured|configured)", lines[0]
+        ) is None:
+            raise ClosedFailure("provider-response", "status-invalid")
+        codex = lines.pop(0).split(b": ", 1)[1].decode("ascii")
+    elif (
+        command == "provider-status"
+        and lines[:2]
+        == [
+            b"vaultState: faulted-reboot-required",
+            b"error: REBOOT_REQUIRED",
+        ]
+    ):
+        lines = lines[2:]
+        error = "REBOOT_REQUIRED"
+    elif (
+        command == "openai-configure"
+        and lines
+        and re.fullmatch(rb"error: [A-Z][A-Z0-9_]*", lines[0])
+    ):
+        error = lines.pop(0).split(b": ", 1)[1].decode("ascii")
+    if lines:
+        raise ClosedFailure("provider-response", "extra-output")
+    success = (
+        return_code == 0
+        and openai is not None
+        and codex is not None
+        and error is None
+    )
+    rejected = (
+        return_code == 1
+        and openai is None
+        and codex is None
+        and error is not None
+    )
+    if not (success or rejected):
+        raise ClosedFailure("provider-response", "result-invalid")
+    return ProviderCompanionResponse(
+        version, openai, codex, error, return_code
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -932,8 +1010,19 @@ def parse_runtime_snapshot(line: bytes, expected_stage: str) -> RuntimeSnapshot:
         raise ClosedFailure("runtime", "worker-parent-invalid")
     service_caps = tuple(item.decode("ascii") for item in match.groups()[5:9])
     worker_caps = tuple(item.decode("ascii") for item in match.groups()[9:13])
-    exact_caps = (ZERO_CAPS, CAP_SYS_ADMIN_ONLY, CAP_SYS_ADMIN_ONLY, CAP_SYS_ADMIN_ONLY)
-    if service_caps != exact_caps or worker_caps != exact_caps:
+    exact_service_caps = (
+        ZERO_CAPS,
+        CAP_SYS_ADMIN_AND_KILL,
+        CAP_SYS_ADMIN_AND_KILL,
+        CAP_SYS_ADMIN_AND_KILL,
+    )
+    exact_worker_caps = (
+        ZERO_CAPS,
+        CAP_SYS_ADMIN_ONLY,
+        CAP_SYS_ADMIN_ONLY,
+        CAP_SYS_ADMIN_ONLY,
+    )
+    if service_caps != exact_service_caps or worker_caps != exact_worker_caps:
         raise ClosedFailure("runtime", "capabilities-invalid")
     return RuntimeSnapshot(
         stage=expected_stage,
@@ -989,6 +1078,154 @@ def validate_lifecycle(
     if status_locked != locked:
         raise ClosedFailure("lifecycle", "locked-status-mismatch")
     return unlocked.device_id
+
+
+def validate_provider_fault_lifecycle(
+    initial: CompanionResponse,
+    wrong: CompanionResponse,
+    after_wrong: CompanionResponse,
+    unlocked: CompanionResponse,
+    status_unlocked: CompanionResponse,
+    prior_provider: ProviderCompanionResponse,
+    configured: ProviderCompanionResponse,
+    provider_status: ProviderCompanionResponse,
+    faulted: CompanionResponse,
+    provider_faulted: ProviderCompanionResponse,
+    boot: int,
+) -> str:
+    if initial.vault_state != "locked" or initial.device_id is not None:
+        raise ClosedFailure("lifecycle", "initial-state-invalid")
+    if wrong.error != "BAD_PASSPHRASE" or wrong.state_version != initial.state_version + 2:
+        raise ClosedFailure("lifecycle", "wrong-key-invalid")
+    if after_wrong != CompanionResponse(
+        wrong.state_version, "locked", None, None, 0
+    ):
+        raise ClosedFailure("lifecycle", "wrong-key-residue")
+    if (
+        unlocked.state_version != wrong.state_version + 2
+        or unlocked.vault_state != "unlocked"
+        or unlocked.device_id is None
+        or DEVICE_ID_RE.fullmatch(unlocked.device_id) is None
+        or status_unlocked != unlocked
+    ):
+        raise ClosedFailure("lifecycle", "unlock-invalid")
+    validate_provider_configuration(
+        unlocked, prior_provider, configured, provider_status, boot
+    )
+    if (
+        faulted.return_code != 0
+        or faulted.vault_state != "faulted-reboot-required"
+        or faulted.device_id is not None
+        or faulted.error is not None
+        or provider_faulted.state_version != faulted.state_version
+        or provider_faulted.return_code == 0
+        or provider_faulted.openai is not None
+        or provider_faulted.codex is not None
+        or provider_faulted.error != "REBOOT_REQUIRED"
+    ):
+        raise ClosedFailure("lifecycle", "persistent-fault-invalid")
+    return unlocked.device_id
+
+
+def validate_provider_configuration(
+    unlocked: CompanionResponse,
+    prior_provider: ProviderCompanionResponse,
+    configured: ProviderCompanionResponse,
+    provider_status: ProviderCompanionResponse,
+    boot: int,
+) -> None:
+    if boot not in {1, 2}:
+        raise ClosedFailure("lifecycle", "boot-invalid")
+    expected_prior = ProviderCompanionResponse(
+        unlocked.state_version,
+        "unconfigured" if boot == 1 else "configured",
+        "unconfigured",
+        None,
+        0,
+    )
+    expected_configured = ProviderCompanionResponse(
+        unlocked.state_version + 2,
+        "configured",
+        "unconfigured",
+        None,
+        0,
+    )
+    if (
+        prior_provider != expected_prior
+        or configured != expected_configured
+        or provider_status != expected_configured
+    ):
+        raise ClosedFailure("lifecycle", "provider-configure-invalid")
+
+
+def validate_clean_provider_lifecycle(
+    initial: CompanionResponse,
+    wrong: CompanionResponse,
+    after_wrong: CompanionResponse,
+    unlocked: CompanionResponse,
+    status_unlocked: CompanionResponse,
+    prior_provider: ProviderCompanionResponse,
+    configured: ProviderCompanionResponse,
+    provider_status: ProviderCompanionResponse,
+    locked: CompanionResponse,
+    status_locked: CompanionResponse,
+    boot: int,
+) -> str:
+    if initial.vault_state != "locked" or initial.device_id is not None:
+        raise ClosedFailure("lifecycle", "initial-state-invalid")
+    if wrong.error != "BAD_PASSPHRASE" or wrong.state_version != initial.state_version + 2:
+        raise ClosedFailure("lifecycle", "wrong-key-invalid")
+    if after_wrong != CompanionResponse(
+        wrong.state_version, "locked", None, None, 0
+    ):
+        raise ClosedFailure("lifecycle", "wrong-key-residue")
+    if (
+        unlocked.state_version != wrong.state_version + 2
+        or unlocked.vault_state != "unlocked"
+        or unlocked.device_id is None
+        or DEVICE_ID_RE.fullmatch(unlocked.device_id) is None
+        or status_unlocked != unlocked
+    ):
+        raise ClosedFailure("lifecycle", "unlock-invalid")
+    validate_provider_configuration(
+        unlocked, prior_provider, configured, provider_status, boot
+    )
+    if (
+        locked.state_version != configured.state_version + 2
+        or locked.vault_state != "locked"
+        or locked.device_id is not None
+        or locked.error is not None
+        or status_locked != locked
+    ):
+        raise ClosedFailure("lifecycle", "lock-invalid")
+    return unlocked.device_id
+
+
+def validate_provider_runtime_sequence(
+    snapshots: Sequence[RuntimeSnapshot],
+) -> None:
+    if len(snapshots) != 3:
+        raise ClosedFailure("runtime", "sequence-invalid")
+    baseline = snapshots[0]
+    for snapshot in snapshots:
+        if (
+            snapshot.service_pid != baseline.service_pid
+            or snapshot.worker_pid != baseline.worker_pid
+            or snapshot.worker_ppid != baseline.worker_ppid
+            or snapshot.invocation_id != baseline.invocation_id
+            or snapshot.service_caps != baseline.service_caps
+            or snapshot.worker_caps != baseline.worker_caps
+            or snapshot.service_ambient != baseline.service_ambient
+            or snapshot.worker_ambient != baseline.worker_ambient
+            or snapshot.service_no_new_privs != baseline.service_no_new_privs
+            or snapshot.worker_no_new_privs != baseline.worker_no_new_privs
+            or snapshot.service_core != baseline.service_core
+            or snapshot.worker_core != baseline.worker_core
+            or snapshot.shell_mount
+        ):
+            raise ClosedFailure("runtime", "stability-invalid")
+    if tuple(item.mapper_count for item in snapshots) != (0, 0, 1):
+        raise ClosedFailure("runtime", "mapper-sequence-invalid")
 
 
 def validate_runtime_sequence(snapshots: Sequence[RuntimeSnapshot]) -> None:
@@ -1869,13 +2106,373 @@ def run_companion(
     return response, end_match.end()
 
 
+def run_provider_companion(
+    console: SerialConsole,
+    command: str,
+    stage: str,
+    cursor: int,
+    aggregate: float,
+    secret: bytearray | None = None,
+) -> tuple[ProviderCompanionResponse, int]:
+    if command not in {"provider-status", "openai-configure"} or TOKEN_RE.fullmatch(
+        stage
+    ) is None:
+        raise ClosedFailure("provider-command", "invalid")
+    begin = f"KERNAID_PROVIDER_CTL_BEGIN_V1_{stage}".encode("ascii")
+    end = f"KERNAID_PROVIDER_CTL_END_V1_{stage}".encode("ascii")
+    shell = (
+        b"printf '%s\\n' '"
+        + begin
+        + b"'; /usr/bin/kernaid-rescue-vaultctl "
+        + command.encode("ascii")
+        + b"; rc=$?; printf '%s rc=%s\\n' '"
+        + end
+        + b"' \"$rc\"\n"
+    )
+    console.send(shell, deadline=_deadline(aggregate, 5.0))
+    begin_match = console.wait_regex(
+        _trusted_shell_line_pattern(begin),
+        start=cursor,
+        deadline=_deadline(aggregate, 10.0),
+        stage="provider-command-start",
+    )
+    if command == "openai-configure":
+        if secret is None:
+            raise ClosedFailure("provider-command", "secret-missing")
+        prompt_match = console.wait_regex(
+            re.compile(rb"READY\r?\nOpenAI API key: "),
+            start=begin_match.end(),
+            deadline=_deadline(aggregate, 30.0),
+            stage="provider-secret-prompt",
+        )
+        if prompt_match.start() != begin_match.end():
+            raise ClosedFailure("provider-response", "prompt-invalid")
+        console.send(secret, deadline=_deadline(aggregate, 5.0))
+        console.send(b"\n", deadline=_deadline(aggregate, 5.0))
+    end_match = console.wait_regex(
+        _return_code_line_pattern(end),
+        start=begin_match.end(),
+        deadline=_deadline(
+            aggregate, 620.0 if command == "openai-configure" else 15.0
+        ),
+        stage="provider-command-finish",
+    )
+    block = console.capture.snapshot()[begin_match.end() : end_match.start()]
+    response = parse_provider_companion_response(
+        block, command=command, return_code=int(end_match.group(1))
+    )
+    return response, end_match.end()
+
+
+def _shell_single_quote(value: bytes) -> bytes:
+    return b"'" + value.replace(b"'", b"'\"'\"'") + b"'"
+
+
+def run_guest_proof(
+    console: SerialConsole,
+    stage: str,
+    python_source: bytes,
+    cursor: int,
+    aggregate: float,
+    *,
+    timeout: float = 45.0,
+) -> int:
+    """Run one source-fixed guest proof and accept only its closed marker."""
+
+    if (
+        TOKEN_RE.fullmatch(stage) is None
+        or not python_source
+        or b"\x00" in python_source
+        or len(python_source) > 16 * 1024
+    ):
+        raise ClosedFailure("provider-proof", "source-invalid")
+    begin = f"KERNAID_PROVIDER_PROOF_BEGIN_V1_{stage}".encode("ascii")
+    end = f"KERNAID_PROVIDER_PROOF_END_V1_{stage}".encode("ascii")
+    shell = (
+        b"printf '%s\\n' '"
+        + begin
+        + b"'; /usr/bin/python3 -I -B -c "
+        + _shell_single_quote(python_source)
+        + b"; rc=$?; printf '%s rc=%s\\n' '"
+        + end
+        + b"' \"$rc\"\n"
+    )
+    console.send(shell, deadline=_deadline(aggregate, 5.0))
+    begin_match = console.wait_regex(
+        _trusted_shell_line_pattern(begin),
+        start=cursor,
+        deadline=_deadline(aggregate, 10.0),
+        stage="provider-proof-start",
+    )
+    proof_match = console.wait_regex(
+        PROVIDER_PROOF_RESULT_PATTERN,
+        start=begin_match.end(),
+        deadline=_deadline(aggregate, timeout),
+        stage="provider-proof",
+    )
+    expected = (
+        f"KERNAID_QEMU_PROVIDER_PROOF_V1 stage={stage} result=true".encode(
+            "ascii"
+        )
+    )
+    if proof_match.group(1) != expected:
+        raise ClosedFailure("provider-proof", "marker-invalid")
+    end_match = console.wait_regex(
+        _return_code_line_pattern(end),
+        start=proof_match.end(),
+        deadline=_deadline(aggregate, 10.0),
+        stage="provider-proof-finish",
+    )
+    if int(end_match.group(1)) != 0:
+        raise ClosedFailure("provider-proof", "command-failed")
+    block = console.capture.snapshot()[begin_match.end() : end_match.start()]
+    if _normalize(block) != [expected]:
+        raise ClosedFailure("provider-proof", "output-invalid")
+    return end_match.end()
+
+
+PROVIDER_STATUS_PROBE_SOCKET = "/run/kernaid-provider-executor-status-probe.sock"
+PROVIDER_LEASE_PROBE_SOCKET = "/run/kernaid-provider-lease-probe.sock"
+PROVIDER_LEASE_KILL_SOCKET = "/run/kernaid-provider-lease-kill-vaultd.sock"
+TEST_CREDENTIAL_PREFIXES = (
+    "kernaid-provider-executor-status-probe@",
+    "kernaid-provider-lease-probe@",
+    "kernaid-provider-lease-kill-vaultd@",
+)
+
+
+def _socket_probe_source(
+    stage: str, path: str, request: bytes, expected: bytes
+) -> bytes:
+    if (
+        TOKEN_RE.fullmatch(stage) is None
+        or not path.startswith("/run/kernaid-")
+        or not request.endswith(b"\n")
+        or not expected.endswith(b"\n")
+        or max(len(request), len(expected)) > 256
+    ):
+        raise ClosedFailure("provider-proof", "source-invalid")
+    proof = f"KERNAID_QEMU_PROVIDER_PROOF_V1 stage={stage} result=true\n"
+    return f'''import socket,subprocess,sys
+try:
+    dependency=subprocess.run(["/usr/bin/systemctl","show","--property=BindsTo","--value","kernaid-provider-lease-probe@.service"],stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=3,check=False)
+    if dependency.returncode!=0 or dependency.stdout!=b"kernaid-rescue-vaultd.service\\n":
+        raise RuntimeError()
+    connection=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+    connection.settimeout(30.0)
+    connection.connect({path!r})
+    connection.sendall({request!r})
+    connection.shutdown(socket.SHUT_WR)
+    observed=bytearray()
+    while True:
+        chunk=connection.recv(256)
+        if not chunk:
+            break
+        observed.extend(chunk)
+        if len(observed)>256:
+            raise RuntimeError()
+    connection.close()
+    if bytes(observed)!={expected!r}:
+        raise RuntimeError()
+except BaseException:
+    sys.exit(41)
+sys.stdout.write({proof!r})
+'''.encode("ascii")
+
+
+def _production_status_probe_source() -> bytes:
+    stage = "production-status"
+    request = b"STATUS\n"
+    expected = (
+        b"KERNAID_PROVIDER_EXECUTOR_STATUS_PROBE_V1 "
+        b"status=true shipping=true\n"
+    )
+    proof = f"KERNAID_QEMU_PROVIDER_PROOF_V1 stage={stage} result=true\n"
+    return f'''import re,socket,subprocess,sys,time
+def show(prop,unit):
+    result=subprocess.run(["/usr/bin/systemctl","show","--property="+prop,"--value",unit],stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=3,check=False)
+    if result.returncode!=0 or len(result.stdout)>512:
+        raise RuntimeError()
+    return result.stdout.rstrip(b"\\n")
+try:
+    if show("BindsTo","kernaid-rescue-openai-executor@.service")!=b"kernaid-rescue-vaultd.service":
+        raise RuntimeError()
+    if show("ActiveState","kernaid-rescue-openai-egress.service")!=b"inactive":
+        raise RuntimeError()
+    connection=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+    connection.settimeout(30.0)
+    connection.connect({PROVIDER_STATUS_PROBE_SOCKET!r})
+    connection.sendall({request!r})
+    connection.shutdown(socket.SHUT_WR)
+    observed=bytearray()
+    while True:
+        chunk=connection.recv(256)
+        if not chunk:
+            break
+        observed.extend(chunk)
+        if len(observed)>256:
+            raise RuntimeError()
+    connection.close()
+    if bytes(observed)!={expected!r}:
+        raise RuntimeError()
+    deadline=time.monotonic()+5.0
+    while show("ActiveState","kernaid-rescue-openai-egress.service")!=b"inactive":
+        if time.monotonic()>=deadline:
+            raise RuntimeError()
+        time.sleep(0.05)
+except BaseException:
+    sys.exit(42)
+sys.stdout.write({proof!r})
+'''.encode("ascii")
+
+
+def _hold_probe_source(old_service_pid: int, old_worker_pid: int) -> bytes:
+    if min(old_service_pid, old_worker_pid) <= 1:
+        raise ClosedFailure("provider-proof", "identity-invalid")
+    stage = "hold-kill"
+    expected = (
+        b"KERNAID_PROVIDER_LEASE_PROBE_HOLD_V1 borrowed=true unread=true\n"
+    )
+    proof = f"KERNAID_QEMU_PROVIDER_PROOF_V1 stage={stage} result=true\n"
+    return f'''import os,re,socket,subprocess,sys,time
+def run(args):
+    result=subprocess.run(args,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=3,check=False)
+    if len(result.stdout)>4096:
+        raise RuntimeError()
+    return result
+def show(prop,unit):
+    result=run(["/usr/bin/systemctl","show","--property="+prop,"--value",unit])
+    if result.returncode!=0:
+        raise RuntimeError()
+    return result.stdout.rstrip(b"\\n")
+try:
+    connection=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+    connection.settimeout(45.0)
+    connection.connect({PROVIDER_LEASE_PROBE_SOCKET!r})
+    hold_started=time.monotonic()
+    connection.sendall(b"HOLD\\n")
+    connection.shutdown(socket.SHUT_WR)
+    discovery_deadline=time.monotonic()+10.0
+    names=[]
+    while not names:
+        units=run(["/usr/bin/systemctl","list-units","--all","--no-legend","--plain","--state=running","kernaid-provider-lease-probe@*.service"])
+        if units.returncode!=0:
+            raise RuntimeError()
+        names=[line.split(None,1)[0].decode("ascii") for line in units.stdout.splitlines() if line]
+        names=[name for name in names if name.startswith("kernaid-provider-lease-probe@") and name.endswith(".service")]
+        if len(names)>1 or (not names and time.monotonic()>=discovery_deadline):
+            raise RuntimeError()
+        if not names:
+            time.sleep(0.05)
+    unit=names[0]
+    helper_pid=show("MainPID",unit).decode("ascii")
+    invocation=show("InvocationID",unit).decode("ascii")
+    if re.fullmatch(r"[1-9][0-9]*",helper_pid) is None or re.fullmatch(r"[0-9a-f]{{32}}",invocation) is None:
+        raise RuntimeError()
+    observed=bytearray()
+    while b"\\n" not in observed:
+        chunk=connection.recv(256)
+        if not chunk:
+            raise RuntimeError()
+        observed.extend(chunk)
+        if len(observed)>256:
+            raise RuntimeError()
+    if bytes(observed)!={expected!r}:
+        raise RuntimeError()
+    while True:
+        chunk=connection.recv(256)
+        if not chunk:
+            break
+        raise RuntimeError()
+    if time.monotonic()-hold_started<15.0:
+        raise RuntimeError()
+    connection.close()
+    deadline=time.monotonic()+15.0
+    watched=(helper_pid,str({old_service_pid}),str({old_worker_pid}))
+    trigger_paths=({PROVIDER_STATUS_PROBE_SOCKET!r},{PROVIDER_LEASE_PROBE_SOCKET!r},{PROVIDER_LEASE_KILL_SOCKET!r})
+    while True:
+        processes_gone=not any(os.path.lexists("/proc/"+pid) for pid in watched)
+        sockets_gone=not any(os.path.lexists(path) for path in trigger_paths)
+        credentials_gone=not any(name.startswith({TEST_CREDENTIAL_PREFIXES!r}) for name in os.listdir("/run/credentials"))
+        if processes_gone and sockets_gone and credentials_gone:
+            break
+        if time.monotonic()>=deadline:
+            raise RuntimeError()
+        time.sleep(0.05)
+except BaseException:
+    sys.exit(43)
+sys.stdout.write({proof!r})
+'''.encode("ascii")
+
+
+def _post_fault_probe_source(
+    old_service_pid: int, old_worker_pid: int, old_invocation_id: str
+) -> bytes:
+    if (
+        min(old_service_pid, old_worker_pid) <= 1
+        or re.fullmatch(r"[0-9a-f]{32}", old_invocation_id) is None
+    ):
+        raise ClosedFailure("provider-proof", "identity-invalid")
+    stage = "post-fault"
+    proof = f"KERNAID_QEMU_PROVIDER_PROOF_V1 stage={stage} result=true\n"
+    return f'''import glob,os,re,subprocess,sys
+def run(args):
+    result=subprocess.run(args,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=3,check=False)
+    if len(result.stdout)>4096:
+        raise RuntimeError()
+    return result
+def show(prop,unit):
+    result=run(["/usr/bin/systemctl","show","--property="+prop,"--value",unit])
+    if result.returncode!=0:
+        raise RuntimeError()
+    return result.stdout.rstrip(b"\\n")
+try:
+    new_pid=show("MainPID","kernaid-rescue-vaultd.service").decode("ascii")
+    new_invocation=show("InvocationID","kernaid-rescue-vaultd.service").decode("ascii")
+    if re.fullmatch(r"[1-9][0-9]*",new_pid) is None or new_pid==str({old_service_pid}):
+        raise RuntimeError()
+    if re.fullmatch(r"[0-9a-f]{{32}}",new_invocation) is None or new_invocation=={old_invocation_id!r}:
+        raise RuntimeError()
+    children=run(["/usr/bin/pgrep","-P",new_pid])
+    if children.returncode not in (1,) or children.stdout:
+        raise RuntimeError()
+    if os.path.lexists("/proc/{old_service_pid}") or os.path.lexists("/proc/{old_worker_pid}"):
+        raise RuntimeError()
+    mapper_count=0
+    for name_path in glob.glob("/sys/block/dm-*/dm/name"):
+        with open(name_path,"rb") as stream:
+            name=stream.read(256).rstrip(b"\\n")
+        if name.startswith(b"kernaid-vault-"):
+            mapper_count+=1
+    if mapper_count!=0:
+        raise RuntimeError()
+    with open("/proc/swaps","rb") as stream:
+        if len(stream.readlines())!=1:
+            raise RuntimeError()
+    for path in ({PROVIDER_STATUS_PROBE_SOCKET!r},{PROVIDER_LEASE_PROBE_SOCKET!r},{PROVIDER_LEASE_KILL_SOCKET!r}):
+        if os.path.lexists(path):
+            raise RuntimeError()
+    if any(name.startswith({TEST_CREDENTIAL_PREFIXES!r}) for name in os.listdir("/run/credentials")):
+        raise RuntimeError()
+    if any(name.startswith("kernaid-provider-") and name!="kernaid-rescue-openai.sock" for name in os.listdir("/run")):
+        raise RuntimeError()
+except BaseException:
+    sys.exit(44)
+sys.stdout.write({proof!r})
+'''.encode("ascii")
+
+
 def run_lifecycle(
     console: SerialConsole,
     aggregate: float,
     login_credential: bytearray,
     correct: bytearray,
     wrong: bytearray,
-) -> tuple[int, int, str]:
+    provider_key: bytearray,
+    boot: int,
+) -> tuple[int, int, int, str]:
+    if boot not in {1, 2}:
+        raise ClosedFailure("lifecycle", "boot-invalid")
     cursor = establish_live_session(console, aggregate, login_credential)
     initial_runtime, cursor = collect_runtime(console, "initial", cursor, aggregate)
     initial, cursor = run_companion(console, "status", "initial-status", cursor, aggregate)
@@ -1901,25 +2498,130 @@ def run_lifecycle(
         console, "status", "unlocked-status", cursor, aggregate
     )
     unlocked_runtime, cursor = collect_runtime(console, "unlocked", cursor, aggregate)
-    locked, cursor = run_companion(console, "lock", "lock", cursor, aggregate)
-    status_locked, cursor = run_companion(
-        console, "status", "locked-status", cursor, aggregate
+    prior_provider, cursor = run_provider_companion(
+        console,
+        "provider-status",
+        "prior-provider-status",
+        cursor,
+        aggregate,
     )
-    final_runtime, _ = collect_runtime(console, "final", cursor, aggregate)
+    configured, cursor = run_provider_companion(
+        console,
+        "openai-configure",
+        "openai-configure",
+        cursor,
+        aggregate,
+        provider_key,
+    )
+    provider_status, cursor = run_provider_companion(
+        console,
+        "provider-status",
+        "configured-provider-status",
+        cursor,
+        aggregate,
+    )
+    cursor = run_guest_proof(
+        console,
+        "production-status",
+        _production_status_probe_source(),
+        cursor,
+        aggregate,
+    )
+    cursor = run_guest_proof(
+        console,
+        "normal-release",
+        _socket_probe_source(
+            "normal-release",
+            PROVIDER_LEASE_PROBE_SOCKET,
+            b"NORMAL\n",
+            b"KERNAID_PROVIDER_LEASE_PROBE_NORMAL_V1 "
+            b"borrowed=true unread=true\n",
+        ),
+        cursor,
+        aggregate,
+    )
+    if boot == 1:
+        locked, cursor = run_companion(console, "lock", "lock", cursor, aggregate)
+        status_locked, cursor = run_companion(
+            console, "status", "locked-status", cursor, aggregate
+        )
+        final_runtime, _ = collect_runtime(console, "final", cursor, aggregate)
+        device_id = validate_clean_provider_lifecycle(
+            initial,
+            wrong_response,
+            after_wrong,
+            unlocked,
+            status_unlocked,
+            prior_provider,
+            configured,
+            provider_status,
+            locked,
+            status_locked,
+            boot,
+        )
+        validate_runtime_sequence(
+            [initial_runtime, wrong_runtime, unlocked_runtime, final_runtime]
+        )
+        return (
+            initial.state_version,
+            configured.state_version,
+            locked.state_version,
+            device_id,
+        )
 
-    device_id = validate_lifecycle(
+    cursor = run_guest_proof(
+        console,
+        "hold-kill",
+        _hold_probe_source(
+            unlocked_runtime.service_pid, unlocked_runtime.worker_pid
+        ),
+        cursor,
+        aggregate,
+        timeout=90.0,
+    )
+    faulted, cursor = run_companion(
+        console, "status", "faulted-status", cursor, aggregate
+    )
+    provider_faulted, cursor = run_provider_companion(
+        console,
+        "provider-status",
+        "faulted-provider-status",
+        cursor,
+        aggregate,
+    )
+    run_guest_proof(
+        console,
+        "post-fault",
+        _post_fault_probe_source(
+            unlocked_runtime.service_pid,
+            unlocked_runtime.worker_pid,
+            unlocked_runtime.invocation_id,
+        ),
+        cursor,
+        aggregate,
+    )
+    device_id = validate_provider_fault_lifecycle(
         initial,
         wrong_response,
         after_wrong,
         unlocked,
         status_unlocked,
-        locked,
-        status_locked,
+        prior_provider,
+        configured,
+        provider_status,
+        faulted,
+        provider_faulted,
+        boot,
     )
-    validate_runtime_sequence(
-        [initial_runtime, wrong_runtime, unlocked_runtime, final_runtime]
+    validate_provider_runtime_sequence(
+        [initial_runtime, wrong_runtime, unlocked_runtime]
     )
-    return initial.state_version, locked.state_version, device_id
+    return (
+        initial.state_version,
+        configured.state_version,
+        faulted.state_version,
+        device_id,
+    )
 
 
 class ClosedArgumentParser(argparse.ArgumentParser):
@@ -1935,6 +2637,7 @@ def parse_arguments(arguments: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--correct-key-fd", type=int, required=True)
     parser.add_argument("--wrong-key-fd", type=int, required=True)
     parser.add_argument("--login-credential-fd", type=int, required=True)
+    parser.add_argument("--provider-key-fd", type=int, required=True)
     parser.add_argument("--owned-pgid-fd", type=int, required=True)
     parser.add_argument("--qmp-socket", type=Path, required=True)
     parser.add_argument("--timeout", type=int, default=1200)
@@ -1947,9 +2650,10 @@ def parse_arguments(arguments: Sequence[str]) -> argparse.Namespace:
         parsed.correct_key_fd,
         parsed.wrong_key_fd,
         parsed.login_credential_fd,
+        parsed.provider_key_fd,
         parsed.owned_pgid_fd,
     }
-    if len(descriptors) != 4 or min(descriptors) < 3:
+    if len(descriptors) != 5 or min(descriptors) < 3:
         raise ClosedFailure("arguments", "descriptor-invalid")
     if parsed.qemu_args[:1] == ["--"]:
         parsed.qemu_args = parsed.qemu_args[1:]
@@ -2021,33 +2725,68 @@ def parse_loop_detach_arguments(arguments: Sequence[str]) -> argparse.Namespace:
 
 
 def boot_attestation(
-    firmware: str, boot: int, initial_version: int, final_version: int, device_id: str
+    firmware: str,
+    boot: int,
+    initial_version: int,
+    pre_terminal_version: int,
+    terminal_epoch_version: int,
+    device_id: str,
 ) -> str:
     # `cgroup_topology_exact` is a composed claim: boot readiness follows the
     # root daemon's descriptor-bound topology setup; every successful lifecycle
     # operation re-attests that topology internally before and after worker
-    # dispatch; and the four UID-1000 RuntimeSnapshots independently bind the
+    # dispatch; and UID-1000 RuntimeSnapshots independently bind the
     # stable systemd MainPID/direct child to their exact /proc memberships.
     # It never claims that this controller traversed the root-only worker
     # cgroup directory.
-    if final_version != initial_version + 6:
+    if (
+        pre_terminal_version != initial_version + 6
+        or boot not in {1, 2}
+        or (boot == 1 and terminal_epoch_version != pre_terminal_version + 2)
+        or terminal_epoch_version < 0
+    ):
         raise ClosedFailure("attestation", "version-invalid")
+    terminal = "clean-lock" if boot == 1 else "persistent-fault"
+    fault_proof = "false" if boot == 1 else "true"
     line = (
         f"{ATTESTATION_PREFIX} firmware={firmware} boot={boot} "
-        f"initial_version={initial_version} final_version={final_version} "
+        f"initial_version={initial_version} "
+        f"pre_terminal_version={pre_terminal_version} "
+        f"terminal_epoch_version={terminal_epoch_version} terminal={terminal} "
         f"device_id={device_id} wrong_key_rejected=true rate_limit_waited=true "
-        "daemon_stable=true worker_stable=true cgroup_stable=true caps_stable=true "
+        "pre_terminal_daemon_stable=true pre_terminal_worker_stable=true "
+        "pre_terminal_cgroup_stable=true pre_terminal_caps_stable=true "
         "ambient_zero=true no_new_privs=true core_limits_zero=true swaps_empty=true "
-        "cgroup_topology_exact=true shell_mount_absent=true residue_absent=true "
+        "cgroup_topology_exact=true shell_mount_absent=true provider_configured=true "
+        "production_executor_unit_binds_to_exact=true "
+        "production_executor_status_path=true conditioned_agent_binds_to_runtime=true "
+        "normal_triple_release=true lifecycle_marker_active_before_borrow=true "
+        f"hold_killed_vaultd={fault_proof} helper_binds_to_terminated={fault_proof} "
+        f"worker_pdeath_cleanup={fault_proof} test_trigger_sockets_gone={fault_proof} "
+        f"unit_credentials_cleaned={fault_proof} persistent_fault_status_only={fault_proof} "
+        f"lifecycle_marker_persisted={fault_proof} provider_network_used=false "
+        "tls_openai_qualified=false residue_absent=true "
         "acpi_shutdown=true"
     )
     pattern = re.compile(
         rf"^{ATTESTATION_PREFIX} firmware=(bios|uefi) boot=[12] "
-        r"initial_version=(0|[1-9][0-9]*) final_version=(0|[1-9][0-9]*) "
+        r"initial_version=(0|[1-9][0-9]*) "
+        r"pre_terminal_version=(0|[1-9][0-9]*) "
+        r"terminal_epoch_version=(0|[1-9][0-9]*) "
+        r"terminal=(clean-lock|persistent-fault) "
         r"device_id=KA-[0-9a-f]{24} wrong_key_rejected=true rate_limit_waited=true "
-        r"daemon_stable=true worker_stable=true cgroup_stable=true caps_stable=true "
+        r"pre_terminal_daemon_stable=true pre_terminal_worker_stable=true "
+        r"pre_terminal_cgroup_stable=true pre_terminal_caps_stable=true "
         r"ambient_zero=true no_new_privs=true core_limits_zero=true swaps_empty=true "
-        r"cgroup_topology_exact=true shell_mount_absent=true residue_absent=true "
+        r"cgroup_topology_exact=true shell_mount_absent=true provider_configured=true "
+        r"production_executor_unit_binds_to_exact=true "
+        r"production_executor_status_path=true conditioned_agent_binds_to_runtime=true "
+        r"normal_triple_release=true lifecycle_marker_active_before_borrow=true "
+        r"hold_killed_vaultd=(true|false) helper_binds_to_terminated=(true|false) "
+        r"worker_pdeath_cleanup=(true|false) test_trigger_sockets_gone=(true|false) "
+        r"unit_credentials_cleaned=(true|false) persistent_fault_status_only=(true|false) "
+        r"lifecycle_marker_persisted=(true|false) provider_network_used=false "
+        r"tls_openai_qualified=false residue_absent=true "
         r"acpi_shutdown=true$"
     )
     if pattern.fullmatch(line) is None:
@@ -2171,6 +2910,7 @@ def main(arguments: Sequence[str]) -> int:
     login_credential = bytearray()
     correct = bytearray()
     wrong = bytearray()
+    provider_key = bytearray()
     harness: QemuHarness | None = None
     failure: ClosedFailure | None = None
     attestation: str | None = None
@@ -2183,22 +2923,36 @@ def main(arguments: Sequence[str]) -> int:
         correct = read_secret_fd(parsed.correct_key_fd)
         wrong = read_secret_fd(parsed.wrong_key_fd)
         login_credential = read_login_credential_fd(parsed.login_credential_fd)
-        if correct == wrong:
+        provider_key = read_secret_fd(parsed.provider_key_fd)
+        if (
+            correct == wrong
+            or provider_key == correct
+            or provider_key == wrong
+            or provider_key == login_credential
+        ):
             raise ClosedFailure("secret", "not-distinct")
         harness = QemuHarness(
             parsed.qemu,
             parsed.qemu_args,
             parsed.qmp_socket,
-            [correct, wrong],
-            [correct, wrong, login_credential],
+            [correct, wrong, provider_key],
+            [correct, wrong, login_credential, provider_key],
             parsed.owned_pgid_fd,
         )
         console, qmp = harness.start(_deadline(aggregate, 15.0))
         lifecycle_deadline = aggregate - SHUTDOWN_RESERVE_SECONDS
         if lifecycle_deadline <= time.monotonic():
             raise ClosedFailure("lifecycle", "shutdown-reserve-exhausted")
-        initial_version, final_version, device_id = run_lifecycle(
-            console, lifecycle_deadline, login_credential, correct, wrong
+        initial_version, pre_terminal_version, terminal_epoch_version, device_id = (
+            run_lifecycle(
+                console,
+                lifecycle_deadline,
+                login_credential,
+                correct,
+                wrong,
+                provider_key,
+                parsed.boot,
+            )
         )
         qmp.set_deadline(_deadline(aggregate, 10.0))
         qmp.system_powerdown()
@@ -2207,7 +2961,8 @@ def main(arguments: Sequence[str]) -> int:
             parsed.firmware,
             parsed.boot,
             initial_version,
-            final_version,
+            pre_terminal_version,
+            terminal_epoch_version,
             device_id,
         )
     except ClosedFailure as error:
@@ -2228,6 +2983,7 @@ def main(arguments: Sequence[str]) -> int:
         wipe(login_credential)
         wipe(correct)
         wipe(wrong)
+        wipe(provider_key)
         restore_signal_guard(previous_handlers, previous_signal_mask)
     if failure is not None:
         print(

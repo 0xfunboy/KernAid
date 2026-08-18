@@ -1,0 +1,61 @@
+[Unit]
+Description=KernAid QEMU-only shipping provider status probe connection
+Requires=kernaid-provider-executor-status-probe.socket kernaid-rescue-openai-executor.socket systemd-sysusers.service
+BindsTo=kernaid-rescue-vaultd.service
+After=kernaid-provider-executor-status-probe.socket kernaid-rescue-openai-executor.socket kernaid-rescue-vaultd.service systemd-sysusers.service
+CollectMode=inactive-or-failed
+ConditionKernelCommandLine=boot=live
+ConditionCredential=provider-lease-probe
+ConditionPathExists=/run/credentials/@system/provider-lease-probe
+ConditionPathExists=/sys/firmware/qemu_fw_cfg/by_name/opt/io.systemd.credentials/provider-lease-probe/raw
+ConditionPathExists=/run/kernaid-rescue-vault/provider-lease-probe-validated-v1
+
+[Service]
+Type=simple
+LoadCredential=provider-lease-probe
+ExecCondition=/usr/bin/python3 -I -B -c 'import hashlib,pathlib,sys; data=pathlib.Path(sys.argv[1]).read_bytes(); sys.exit(not (len(data) == 15508 and hashlib.sha256(data).hexdigest() == "23470d54d04fd4d025988e9fabf7401b12c9157c6d58162295c01817c103a08f"))' ${CREDENTIALS_DIRECTORY}/provider-lease-probe
+ExecStart=/usr/bin/python3 -I -B ${CREDENTIALS_DIRECTORY}/provider-lease-probe
+RuntimeMaxSec=15s
+TimeoutStartSec=5s
+TimeoutStopSec=5s
+Restart=no
+StandardInput=socket
+StandardOutput=null
+StandardError=null
+DynamicUser=yes
+SupplementaryGroups=kernaid-provider-client
+UMask=0077
+LimitCORE=0
+LimitNOFILE=16
+TasksMax=1
+KillMode=control-group
+SendSIGKILL=yes
+NoNewPrivileges=yes
+PrivateMounts=yes
+PrivateNetwork=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateIPC=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+DevicePolicy=closed
+InaccessiblePaths=/run/kernaid-rescue-openai-egress.sock /run/kernaid-rescue-vault.sock
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+KeyringMode=private
+RemoveIPC=yes

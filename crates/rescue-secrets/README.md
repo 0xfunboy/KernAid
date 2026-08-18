@@ -8,10 +8,12 @@ LUKS2 mount manager—is deliberately disabled by default and is available only
 with `experimental-vault-manager`; its disposable integration probe
 additionally requires `privileged-probe`.
 
-It is not yet a packaged production service or a bootable repair product. A
-Rust-only lifecycle daemon and terminal companion now exist behind
-`experimental-vault-manager`, but the systemd isolation, ISO integration and
-privileged QEMU lifecycle proof are deliberately a later tranche.
+It remains an experimental, feature-gated manager rather than a production
+credential service. The lifecycle daemon, terminal companion, systemd
+isolation and Rescue ISO packaging are implemented, with privileged BIOS/UEFI
+QEMU lifecycle qualification in the Rescue workflow. Physical-machine,
+real-account OpenAI TLS and rollback-resistant hardware anchoring remain
+separate release gates.
 
 ## Experimental manager API
 
@@ -162,11 +164,12 @@ while binding every pathname checkpoint to its major/minor, disk sequence and
 capacity. Cryptsetup and blkid receive only the retained daemon procfd; no IPC
 field exposes or selects the checkpoint name.
 
-This constructor is not yet a production unlock claim. The manager now applies
-the non-bypassable descriptor-bound classifier and repeats immutable profile
-checks before and after unlock and mount, but the feature gate remains until a
-dedicated daemon owns the private mount namespace, restart recovery and IPC
-lifecycle.
+This constructor is not by itself a production unlock claim. The feature-gated
+daemon now owns the private mount namespace, restart recovery and IPC lifecycle,
+applies the non-bypassable descriptor-bound classifier, and repeats immutable
+profile checks before and after unlock and mount. Shipping qualification still
+depends on the privileged image/runtime gates and, separately, physical-media
+coverage.
 
 The locator never invokes cryptsetup, activates device mapper, mounts a
 filesystem, reads a LUKS header, repairs metadata, or writes any byte. It does
@@ -274,8 +277,8 @@ Rescue ISO.
 With `experimental-vault-manager`, `kernaid-rescue-vaultd` implements the
 closed `vault.status`, `vault.unlock`, and `vault.lock` lifecycle plus the
 configuration-only `provider.status`, `provider.openai.configure`, and OpenAI
-form of `provider.logout`. `provider.openai.borrow`, Codex logout/home lease,
-all provider execution or network access, Agent audit, and report
+form of `provider.logout`. The exact OpenAI Agent may also invoke
+`provider.openai.borrow`; Codex logout/home lease, Agent audit, and report
 persist/list/get remain disabled and are answered `NOT_AUTHORIZED`, with no
 output descriptor and no worker dispatch. Provider status returns only the
 configured/unconfigured state; it never returns a credential. Provider
@@ -290,6 +293,19 @@ name, command, JSON secret, or configuration argument. `stateVersion` starts
 from a CSPRNG value in the exact JSON-safe range and is checked before every
 transition. `vault.status` accepts bootstrap zero or the exact current version;
 `provider.status` requires the exact current version.
+
+An OpenAI borrow acquires `SO_PEERPIDFD` directly from the authenticated
+accepted `SOCK_SEQPACKET` connection, registers the still-connected Agent as
+Pending before worker dispatch, and never derives an Agent pidfd from the
+numeric PID reported by `SO_PEERCRED`.
+The worker writes once into a private nonblocking pipe; the supervisor keeps a
+lease-output guard until its local read descriptor is closed. Normal release
+requires full socket HUP, pidfd exit, and that output-finalized publication.
+Lock, stop, fault, handoff ambiguity, and expiry transition the lease to
+Revoking, signal only the exact pidfd, and require the same three factors
+before worker lock, unmount, or marker disarm. A definite pre-worker/no-secret
+Pending outcome may instead cancel. The handoff, established lease, and
+revocation bounds are 20, 120, and 10 seconds.
 
 The supervisor remains responsive while a separate, long-lived internal
 worker owns the locator, mount manager, mounted vault, application store, and
@@ -310,20 +326,23 @@ messages have a fixed binary layout, closed result codes, bounded records,
 exact correlation and descriptor arity, and contain neither paths nor secret
 bytes. The LUKS mapper name is freshly randomized for each unlock attempt.
 
-The internal wire's `002` revision also contains a dormant, crate-private
-OpenAI borrow substrate. It does not change the public operation allowlist or
-dispatch switch. Its dedicated non-cancellable supervisor helper creates one
-anonymous CLOEXEC/NONBLOCK PIPEFS pipe, retains only the read end, and transfers
-the write end to the worker. The worker requires a write-only pipe with at
-least 512 bytes of capacity, borrows the validated key only inside the store
-callback, performs one atomic-size write (retrying only interruption), and
-closes its writer before sending a fixed response containing only the byte
-count. The supervisor never reads the pipe: under the original transaction
-deadline it requires writer HUP and an exact `FIONREAD` count, returns the read
-descriptor only for the closed `Ready` result, and closes it for every other
-outcome. Generic and cancellable worker transactions reject borrow. The
-shipping Agent request still receives `NOT_AUTHORIZED`, with no worker dispatch
-and no output descriptor; networking remains absent.
+The internal wire's `002` revision carries the crate-private OpenAI borrow
+substrate used by the shipping Agent path. Its dedicated non-cancellable
+supervisor helper creates one anonymous CLOEXEC/NONBLOCK PIPEFS pipe, retains
+only the read end, and transfers the write end to the worker. The worker
+requires a write-only pipe with at least 512 bytes of capacity, borrows the
+validated key only inside the store callback, performs one atomic-size write
+(retrying only interruption), and closes its writer before sending a fixed
+response containing only the byte count. The supervisor never reads the pipe:
+under the original transaction deadline it requires writer HUP and an exact
+`FIONREAD` count, returns the read descriptor only for the closed `Ready`
+result, and closes it for every other outcome. Generic and cancellable worker
+transactions reject borrow. The public server enables borrow only for the
+exact authenticated OpenAI Agent, registers that connection and its direct
+peer pidfd before dispatch, and sends the read descriptor only inside the
+bounded lease protocol. The vault daemon itself remains network-isolated and
+never reads credential bytes; the separate one-shot Agent owns the fixed TLS
+exchange.
 
 `/run/kernaid-rescue-vault/lifecycle-active-v1` is a daemon-created crash
 marker beneath the systemd-owned runtime directory, not a generic state file.
@@ -412,32 +431,36 @@ root-owned runtime/tmpfiles boundary, and fail-closed core/swap and UID-1000
 policy. It also creates the dynamic `kernaid-openai` nologin/no-home identity,
 adds only that identity to `kernaid-vault`, and resolves its collision-free UID
 from the descriptor-validated passwd file before constructing the daemon peer
-allowlist. The shipping OpenAI Agent is restricted to `vault.status` and
-`provider.status`; all mutation, key-borrow, Codex, audit and report operations
-remain unavailable at the server boundary without worker dispatch or an output
-descriptor. The target systemd 257 vault unit intentionally omits `RestrictSUIDSGID`
+allowlist. The shipping OpenAI Agent is restricted to `vault.status`,
+`provider.status`, and leased `provider.openai.borrow`; all mutation, Codex,
+audit and report operations remain unavailable at the server boundary. The
+target systemd 257 vault unit intentionally omits `RestrictSUIDSGID`
 because that version implements it by denying all `openat2` calls; the daemon's
 descriptor-bound path validation requires `openat2`, while `NoNewPrivileges`,
-the `CAP_SYS_ADMIN`-only bounding set, strict filesystem protection and the
-remaining sandbox gates stay enabled. The one systemd `RuntimeDirectory`
+the bootstrap-only `CAP_SYS_ADMIN|CAP_KILL|CAP_SETPCAP` bounding set, strict
+filesystem protection and the remaining sandbox gates stay enabled. Before
+READY the worker attests exact `CAP_SYS_ADMIN`; the supervisor drops
+`CAP_SETPCAP` and attests exact `CAP_SYS_ADMIN|CAP_KILL` on every existing task.
+The one systemd `RuntimeDirectory`
 bind-mount crossing is opened relative to a validated `/run` descriptor and
 accepted only when descriptor, named entry and `/run` share the exact expected
 root-owned tmpfs identity; all child operations restore no-cross-mount
-resolution. This configuration lifecycle does not call OpenAI, borrow a key,
-launch a provider process, expose a UI route, or otherwise execute network
-work. The daemon sends `READY=1` only after runtime disposition, worker probe,
+resolution. The daemon itself does not call OpenAI or receive a configurable
+network destination; only the separately sandboxed Agent consumes the leased
+pipe. The daemon sends `READY=1` only after runtime disposition, worker probe,
 an immediate worker-health recheck, and coherent Supervisor construction on a
 marker-free startup. Any fresh cgroup, spawn, Probe, or health failure exits
 without READY. A marker found before startup may become ready only as a
 contained status-only `PersistentFault` service and never starts a worker.
 Static tests and target-systemd unit verification do not qualify the real
-deployment by themselves. A separate privileged QEMU lifecycle test must still
-prove socket ownership/mode, cgroup topology and capabilities, core/swap
-policy, UID-1000 privacy, signal/stop behavior, real dm-crypt holder rejection,
-mount-namespace isolation and reboot-required recovery before this integration
-is described as shipping-qualified. The web/Python UI never receives the LUKS
-passphrase, journal key, identity seed, raw mount path, or an arbitrary command
-primitive.
+deployment by themselves. The separate privileged BIOS/UEFI QEMU lifecycle
+job must pass its socket ownership/mode, cgroup topology and capabilities,
+core/swap policy, UID-1000 privacy, signal/stop containment, mount-namespace
+isolation and reboot-required recovery gates for the exact image revision.
+That virtual qualification does not replace physical-media, real-account TLS
+or rollback-resistant hardware tests. The web/Python UI never receives the
+LUKS passphrase, journal key, identity seed, raw mount path, or an arbitrary
+command primitive.
 
 ## Remaining production gates
 

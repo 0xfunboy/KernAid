@@ -1,0 +1,26 @@
+[Unit]
+Description=KernAid QEMU-only provider lease vault-kill trigger
+Requires=systemd-sysusers.service
+BindsTo=kernaid-rescue-vaultd.service
+After=systemd-sysusers.service kernaid-rescue-vaultd.service
+ConditionKernelCommandLine=boot=live
+ConditionCredential=provider-lease-probe
+ConditionPathExists=/run/credentials/@system/provider-lease-probe
+ConditionPathExists=/sys/firmware/qemu_fw_cfg/by_name/opt/io.systemd.credentials/provider-lease-probe/raw
+ConditionPathExists=/run/kernaid-rescue-vault/provider-lease-probe-validated-v1
+
+[Socket]
+ListenStream=/run/kernaid-provider-lease-kill-vaultd.sock
+Accept=yes
+MaxConnections=1
+Backlog=1
+TriggerLimitIntervalSec=5min
+TriggerLimitBurst=1
+SocketMode=0660
+SocketUser=root
+SocketGroup=kernaid-openai
+RemoveOnStop=yes
+PassCredentials=no
+PassSecurity=no
+PassPacketInfo=no
+Timestamping=off

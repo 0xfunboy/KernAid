@@ -1,8 +1,9 @@
 //! Root Rescue vault daemon and terminal-only companion lifecycle.
 //!
 //! The daemon exposes the vault lifecycle plus presence-only provider status,
-//! OpenAI credential configuration, and OpenAI logout. Provider borrowing and
-//! execution remain disabled.
+//! OpenAI credential configuration, logout, and a lease-bound borrow operation
+//! for the authenticated provider Agent. The daemon itself never executes a
+//! provider request or opens a network path.
 //! Potentially blocking block-device and filesystem work lives in one
 //! long-lived worker process which is moved into its delegated cgroup before
 //! it receives any work.

@@ -22,6 +22,7 @@ firmware="${1:-bios}"
 iso="${2:-$repo_dir/KernAid-Rescue-amd64.iso}"
 probe_binary="${3:-$repo_dir/target/release/kernaid-rescue-vault-probe}"
 controller="$repo_dir/tools/build-rescue/qemu-vault-lifecycle-pty.py"
+provider_probe_helper="$repo_dir/tools/build-rescue/provider-lease-probe.py"
 layout_manifest="$repo_dir/rescue/image-layout/device-layout.v1.json"
 
 failure_emitted=0
@@ -316,7 +317,8 @@ cleanup() {
   if [[ -n "$key_dir" ]]; then
     case "$key_dir" in
       /dev/shm/kernaid-qemu-vault-lifecycle-key.*)
-        rm -f -- "$key_dir/correct" "$key_dir/wrong" "$key_dir/login" \
+        rm -f -- "$key_dir/correct" "$key_dir/wrong" "$key_dir/provider" \
+          "$key_dir/login" \
           >/dev/null 2>&1 || cleanup_failed=1
         rmdir -- "$key_dir" >/dev/null 2>&1 || cleanup_failed=1
         ;;
@@ -384,8 +386,22 @@ done
 [[ -f "$layout_manifest" && ! -L "$layout_manifest" ]] \
   || fail preflight layout-invalid
 [[ -f "$controller" && ! -L "$controller" ]] || fail preflight controller-invalid
+[[ -f "$provider_probe_helper" && ! -L "$provider_probe_helper" ]] \
+  || fail preflight provider-probe-invalid
+[[ "$(stat -c '%F:%h' -- "$provider_probe_helper" 2>/dev/null)" \
+  == "regular file:1" ]] || fail preflight provider-probe-metadata
+[[ "$(stat -c '%a' -- "$provider_probe_helper" 2>/dev/null)" == 755 ]] \
+  || fail preflight provider-probe-mode
+[[ "$(stat -c '%s' -- "$provider_probe_helper" 2>/dev/null)" == 15508 ]] \
+  || fail preflight provider-probe-size
+[[ "$(sha256sum -- "$provider_probe_helper" | awk 'NR == 1 { print $1 }')" \
+  == 23470d54d04fd4d025988e9fabf7401b12c9157c6d58162295c01817c103a08f ]] \
+  || fail preflight provider-probe-sha256
 [[ -f "$probe_binary" && -x "$probe_binary" && ! -L "$probe_binary" ]] \
   || fail preflight probe-invalid
+if grep -Fq -- provider-lease-probe.py "$layout_manifest"; then
+  fail preflight provider-probe-in-layout-manifest
+fi
 
 qemu_binary="$(command -v qemu-system-x86_64)"
 [[ "$qemu_binary" == /* && -x "$qemu_binary" && ! -L "$qemu_binary" ]] \
@@ -449,6 +465,20 @@ squashfs_bytes="$(stat -c '%s' -- "$squashfs" 2>/dev/null)" \
 [[ "$squashfs_bytes" =~ ^[1-9][0-9]*$ ]] \
   || fail credential squashfs-size
 ((squashfs_bytes <= 8589934592)) || fail credential squashfs-size
+provider_iso_match="$(
+  find "$iso_mount" -xdev -name provider-lease-probe.py -print -quit
+)" || fail credential provider-probe-iso-inspect
+[[ -z "$provider_iso_match" ]] || fail credential provider-probe-in-iso
+set +e
+unsquashfs -ll "$squashfs" 2>/dev/null \
+  | awk 'index($0, "/provider-lease-probe.py") { found=1 } END { exit found ? 42 : 0 }'
+provider_listing_status=("${PIPESTATUS[@]}")
+set -e
+[[ "${#provider_listing_status[@]}" == 2 \
+  && "${provider_listing_status[0]}" == 0 ]] \
+  || fail credential squashfs-list-failed
+[[ "${provider_listing_status[1]}" == 0 ]] \
+  || fail credential provider-probe-in-squashfs
 
 login_credential="$key_dir/login"
 set +e
@@ -476,21 +506,30 @@ iso_loop=""
 
 correct_key="$key_dir/correct"
 wrong_key="$key_dir/wrong"
+provider_key="$key_dir/provider"
 if ! od -An -N32 -tx1 /dev/urandom | tr -d '[:space:]' >"$correct_key"; then
   fail secret generation-failed
 fi
 if ! od -An -N32 -tx1 /dev/urandom | tr -d '[:space:]' >"$wrong_key"; then
   fail secret generation-failed
 fi
-chmod 600 -- "$correct_key" "$wrong_key" >/dev/null 2>&1 \
+if ! od -An -N32 -tx1 /dev/urandom | tr -d '[:space:]' >"$provider_key"; then
+  fail secret generation-failed
+fi
+chmod 600 -- "$correct_key" "$wrong_key" "$provider_key" >/dev/null 2>&1 \
   || fail secret mode-failed
-for secret_file in "$correct_key" "$wrong_key"; do
+for secret_file in "$correct_key" "$wrong_key" "$provider_key"; do
   [[ "$(stat -c '%a:%u:%g:%h:%s' -- "$secret_file")" == 600:0:0:1:64 ]] \
     || fail secret metadata-invalid
   grep -Eq '^[0-9a-f]{64}$' "$secret_file" \
     || fail secret alphabet-invalid
 done
 if cmp -s -- "$correct_key" "$wrong_key"; then
+  fail secret not-distinct
+fi
+if cmp -s -- "$provider_key" "$correct_key" \
+  || cmp -s -- "$provider_key" "$wrong_key" \
+  || cmp -s -- "$provider_key" "$login_credential"; then
   fail secret not-distinct
 fi
 
@@ -789,11 +828,13 @@ for ((boot = 1; boot <= boot_count; boot++)); do
     -machine accel=tcg
     -m 2048
     -smp 2
+    -nic none
     -device qemu-xhci,id=kernaid_xhci
     -drive "if=none,id=kernaid_rescue_usb,file=$rescue_media,format=raw,cache=none,aio=threads"
     -device "usb-storage,bus=kernaid_xhci.0,drive=kernaid_rescue_usb,bootindex=1"
     -drive "file=$observe_image,if=virtio,format=raw,cache=none,aio=threads"
     -drive "file=$swap_image,if=virtio,format=raw,cache=none,aio=threads"
+    -fw_cfg "name=opt/io.systemd.credentials/provider-lease-probe,file=$provider_probe_helper"
   )
   if [[ "$firmware" == uefi ]]; then
     ovmf_vars_copy="$work_dir/OVMF_VARS.boot-$boot.fd"
@@ -814,10 +855,11 @@ for ((boot = 1; boot <= boot_count; boot++)); do
   python3 -I -B "$controller" \
     --firmware "$firmware" --boot "$boot" \
     --correct-key-fd 3 --wrong-key-fd 4 \
-    --login-credential-fd 5 --owned-pgid-fd 6 --qmp-socket "$qmp_socket" \
+    --login-credential-fd 5 --provider-key-fd 7 \
+    --owned-pgid-fd 6 --qmp-socket "$qmp_socket" \
     --timeout 1200 --qemu "$qemu_binary" -- \
     "${qemu_args[@]}" 3<"$correct_key" 4<"$wrong_key" \
-    5<"$login_credential" 6>"$qemu_pgid_file" \
+    5<"$login_credential" 6>"$qemu_pgid_file" 7<"$provider_key" \
     >"$boot_output" 2>"$boot_error" &
   controller_pid=$!
   if await_owned_group_publication; then
@@ -875,22 +917,30 @@ for ((boot = 1; boot <= boot_count; boot++)); do
   fi
   [[ ! -s "$boot_error" ]] || fail controller unexpected-stderr
   [[ "$(stat -c '%s' -- "$boot_output")" =~ ^[0-9]+$ \
-    && "$(stat -c '%s' -- "$boot_output")" -le 768 ]] \
+    && "$(stat -c '%s' -- "$boot_output")" -le 2048 ]] \
     || fail controller output-invalid
   mapfile -t boot_lines <"$boot_output"
   [[ "${#boot_lines[@]}" == 1 ]] || fail controller output-invalid
   boot_line="${boot_lines[0]}"
-  if [[ ! "$boot_line" =~ ^${boot_prefix}\ firmware=${firmware}\ boot=${boot}\ initial_version=([0-9]+)\ final_version=([0-9]+)\ device_id=(KA-[0-9a-f]{24})\ wrong_key_rejected=true\ rate_limit_waited=true\ daemon_stable=true\ worker_stable=true\ cgroup_stable=true\ caps_stable=true\ ambient_zero=true\ no_new_privs=true\ core_limits_zero=true\ swaps_empty=true\ cgroup_topology_exact=true\ shell_mount_absent=true\ residue_absent=true\ acpi_shutdown=true$ ]]; then
+  if [[ "$boot" == 1 ]]; then
+    expected_terminal=clean-lock
+    expected_fault_proof=false
+  else
+    expected_terminal=persistent-fault
+    expected_fault_proof=true
+  fi
+  if [[ ! "$boot_line" =~ ^${boot_prefix}\ firmware=${firmware}\ boot=${boot}\ initial_version=([0-9]+)\ pre_terminal_version=([0-9]+)\ terminal_epoch_version=([0-9]+)\ terminal=${expected_terminal}\ device_id=(KA-[0-9a-f]{24})\ wrong_key_rejected=true\ rate_limit_waited=true\ pre_terminal_daemon_stable=true\ pre_terminal_worker_stable=true\ pre_terminal_cgroup_stable=true\ pre_terminal_caps_stable=true\ ambient_zero=true\ no_new_privs=true\ core_limits_zero=true\ swaps_empty=true\ cgroup_topology_exact=true\ shell_mount_absent=true\ provider_configured=true\ production_executor_unit_binds_to_exact=true\ production_executor_status_path=true\ conditioned_agent_binds_to_runtime=true\ normal_triple_release=true\ lifecycle_marker_active_before_borrow=true\ hold_killed_vaultd=${expected_fault_proof}\ helper_binds_to_terminated=${expected_fault_proof}\ worker_pdeath_cleanup=${expected_fault_proof}\ test_trigger_sockets_gone=${expected_fault_proof}\ unit_credentials_cleaned=${expected_fault_proof}\ persistent_fault_status_only=${expected_fault_proof}\ lifecycle_marker_persisted=${expected_fault_proof}\ provider_network_used=false\ tls_openai_qualified=false\ residue_absent=true\ acpi_shutdown=true$ ]]; then
     fail controller output-invalid
   fi
-  boot_device_id="${BASH_REMATCH[3]}"
+  boot_device_id="${BASH_REMATCH[4]}"
   if [[ -z "$device_id" ]]; then
     device_id="$boot_device_id"
   elif [[ "$device_id" != "$boot_device_id" ]]; then
     fail lifecycle device-id-changed
   fi
   if grep -Fq -f "$correct_key" "$boot_output" "$boot_error" \
-    || grep -Fq -f "$wrong_key" "$boot_output" "$boot_error"; then
+    || grep -Fq -f "$wrong_key" "$boot_output" "$boot_error" \
+    || grep -Fq -f "$provider_key" "$boot_output" "$boot_error"; then
     fail controller secret-exposure
   fi
   printf '%s\n' "$boot_line"
@@ -1006,4 +1056,4 @@ require_sha256 "$p3_post_verify_sha256"
 printf '%s\n' \
   "$raw_prefix firmware=$firmware media_bytes=$media_bytes iso_bytes=$iso_bytes prefix_before_sha256=$prefix_before_sha256 prefix_after_sha256=$prefix_after_sha256 observe_before_sha256=$observe_before_sha256 observe_after_sha256=$observe_after_sha256 swap_before_sha256=$swap_before_sha256 swap_after_sha256=$swap_after_sha256 p3_before_sha256=$p3_before_sha256 p3_guest_after_sha256=$p3_guest_after_sha256 p3_post_verify_sha256=$p3_post_verify_sha256 prefix_immutable=true observe_immutable=true swap_immutable=true p3_expected_rw=true"
 printf '%s\n' \
-  "$attestation_prefix firmware=$firmware boot_count=$boot_count same_usb=true device_id=$device_id device_id_stable=true identity_public_key_stable=true guest_device_id_derived=true host_postverify=true clean_shutdown=true luks_profile_valid=true versions_exact_plus_two=true wrong_key_rejected=true rate_limit_waited=true locked_after_each_boot=true daemon_processes_stable=true cgroups_exact=true capabilities_exact=true ambient_zero=true no_new_privs=true core_limits_zero=true swaps_empty=true shell_mount_absent=true residue_absent=true qmp_acpi_shutdowns=2 uefi_vars=$([[ "$firmware" == uefi ]] && printf fresh-per-boot || printf not-applicable) ready=true"
+  "$attestation_prefix firmware=$firmware boot_count=$boot_count same_usb=true device_id=$device_id device_id_stable=true identity_public_key_stable=true guest_device_id_derived=true host_postverify=true acpi_shutdowns_clean=true luks_profile_valid=true mutation_versions_exact_plus_two=true wrong_key_rejected=true rate_limit_waited=true boot1_clean_lock=true boot2_persistent_fault=true pre_terminal_daemon_processes_stable=true cgroups_exact=true pre_terminal_capabilities_exact=true ambient_zero=true no_new_privs=true core_limits_zero=true swaps_empty=true shell_mount_absent=true provider_configured=true production_executor_unit_binds_to_exact=true production_executor_status_path=true conditioned_agent_binds_to_runtime=true normal_triple_release=true lifecycle_marker_active_before_borrow=true hold_killed_vaultd=true helper_binds_to_terminated=true worker_pdeath_cleanup=true test_trigger_sockets_gone=true unit_credentials_cleaned=true persistent_fault_status_only=true lifecycle_marker_persisted=true provider_network_used=false tls_openai_qualified=false residue_absent=true qmp_acpi_shutdowns=2 uefi_vars=$([[ "$firmware" == uefi ]] && printf fresh-per-boot || printf not-applicable) ready=true"

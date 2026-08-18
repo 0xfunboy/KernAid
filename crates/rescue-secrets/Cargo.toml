@@ -20,8 +20,8 @@ sha2 = "0.10"
 zeroize = "1.8"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-nix = { version = "0.31.3", features = ["signal", "term"] }
-rustix = { version = "1.1.4", features = ["event", "fs", "mount", "net", "process", "termios"] }
+nix = { version = "0.31.3", features = ["pthread", "signal", "socket", "term"] }
+rustix = { version = "1.1.4", features = ["event", "fs", "mount", "net", "process", "termios", "thread"] }
 
 [dev-dependencies]
 tempfile = "3.27"

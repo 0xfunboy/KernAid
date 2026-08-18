@@ -1,0 +1,62 @@
+[Unit]
+Description=KernAid Rescue OpenAI fixed TLS egress proxy
+Requires=kernaid-rescue-openai-egress.socket systemd-sysusers.service
+After=kernaid-rescue-openai-egress.socket network-online.target systemd-sysusers.service
+Wants=network-online.target
+CollectMode=inactive-or-failed
+ConditionKernelCommandLine=boot=live
+ConditionPathIsDirectory=/run/live/medium
+
+[Service]
+Type=notify
+Sockets=kernaid-rescue-openai-egress.socket
+ExecStart=/usr/lib/systemd/systemd-socket-proxyd --connections-max=1 --exit-idle-time=10s api.openai.com:443
+TimeoutStartSec=15s
+TimeoutStopSec=10s
+Restart=no
+StandardInput=null
+StandardOutput=null
+StandardError=null
+User=kernaid-openai-egress
+Group=kernaid-openai-egress
+SupplementaryGroups=
+UMask=0077
+LimitCORE=0
+LimitNOFILE=32
+TasksMax=3
+MemoryMax=64M
+MemorySwapMax=0
+KillMode=control-group
+SendSIGKILL=yes
+NoNewPrivileges=yes
+PrivateMounts=yes
+PrivateNetwork=no
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateIPC=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+DevicePolicy=closed
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+KeyringMode=private
+RemoveIPC=yes
+
+# systemd v257 checks the current connection count before insertion, so the
+# fixed value 1 can admit at most two connections. This resource cap is not the
+# credential boundary; the vault registry permits one exact Agent lease.

@@ -1,10 +1,11 @@
 #![forbid(unsafe_code)]
 
-//! One-request, credential-free Rescue OpenAI executor scaffold.
+//! One-request Rescue OpenAI executor.
 //!
-//! The shipping binary can report presence-only OpenAI status through the
-//! authenticated Rescue vault. Provider execution and credential borrowing are
-//! intentionally absent.
+//! The shipping binary reports presence-only status or performs one fixed,
+//! leased OpenAI Responses diagnosis over its dedicated local TLS egress
+//! boundary. It exposes no configurable destination, model, tool, command, or
+//! environment surface.
 
 #[cfg(target_os = "linux")]
 mod linux;

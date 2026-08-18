@@ -10,9 +10,15 @@ use rustix::{
     net::{AddressFamily, SocketFlags, SocketType, socketpair},
     pipe::{PipeFlags, pipe_with},
     process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal},
+    thread::{
+        CapabilitySet, CapabilitySets, capabilities, capability_is_in_ambient_set,
+        capability_is_in_bounding_set, clear_ambient_capability_set,
+        remove_capability_from_bounding_set, set_capabilities,
+    },
 };
 use std::{
     ffi::{OsStr, OsString},
+    fs as stdfs,
     os::{
         fd::{AsFd, BorrowedFd},
         unix::ffi::{OsStrExt, OsStringExt},
@@ -48,6 +54,169 @@ const WORKER_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_PROVIDER_OUTPUT_BYTES: usize =
     kernaid_protocol::rescue_vault::MAX_OPENAI_KEY_BYTES as usize;
 const _: () = assert!(MAX_PROVIDER_OUTPUT_BYTES <= rustix::pipe::PIPE_BUF);
+const SUPERVISOR_STARTUP_CAPABILITIES: CapabilitySet = CapabilitySet::SYS_ADMIN
+    .union(CapabilitySet::KILL)
+    .union(CapabilitySet::SETPCAP);
+const SUPERVISOR_RUNTIME_CAPABILITIES: CapabilitySet =
+    CapabilitySet::SYS_ADMIN.union(CapabilitySet::KILL);
+const WORKER_RUNTIME_CAPABILITIES: CapabilitySet = CapabilitySet::SYS_ADMIN;
+
+pub(super) fn narrow_worker_capabilities() -> Result<(), RescueVaultDaemonError> {
+    narrow_capabilities(
+        SUPERVISOR_STARTUP_CAPABILITIES,
+        WORKER_RUNTIME_CAPABILITIES,
+        &[CapabilitySet::KILL, CapabilitySet::SETPCAP],
+    )
+}
+
+pub(super) fn narrow_supervisor_capabilities() -> Result<(), RescueVaultDaemonError> {
+    narrow_capabilities(
+        SUPERVISOR_STARTUP_CAPABILITIES,
+        SUPERVISOR_RUNTIME_CAPABILITIES,
+        &[CapabilitySet::SETPCAP],
+    )
+}
+
+pub(super) fn verify_current_supervisor_capabilities() -> Result<(), RescueVaultDaemonError> {
+    verify_exact_capabilities(SUPERVISOR_RUNTIME_CAPABILITIES)
+}
+
+pub(super) fn verify_all_supervisor_threads_capabilities() -> Result<(), RescueVaultDaemonError> {
+    let expected = format!("{:016x}", SUPERVISOR_RUNTIME_CAPABILITIES.bits());
+    let mut observed = 0_usize;
+    let tasks = stdfs::read_dir("/proc/self/task")
+        .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+    for task in tasks {
+        let task = task.map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+        let name = task.file_name();
+        if name.is_empty() || !name.as_encoded_bytes().iter().all(u8::is_ascii_digit) {
+            return Err(RescueVaultDaemonError::RuntimeUnavailable);
+        }
+        let status = stdfs::read(task.path().join("status"))
+            .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+        if !thread_status_capabilities_are_exact(&status, &expected) {
+            return Err(RescueVaultDaemonError::RuntimeUnavailable);
+        }
+        observed = observed
+            .checked_add(1)
+            .ok_or(RescueVaultDaemonError::RuntimeUnavailable)?;
+    }
+    if observed < 2 {
+        return Err(RescueVaultDaemonError::RuntimeUnavailable);
+    }
+    Ok(())
+}
+
+fn verify_worker_thread_capabilities(pid: Pid) -> Result<(), RescueVaultDaemonError> {
+    let expected = format!("{:016x}", WORKER_RUNTIME_CAPABILITIES.bits());
+    let task_root = format!("/proc/{}/task", pid.as_raw_pid());
+    let mut observed = 0_usize;
+    let tasks =
+        stdfs::read_dir(task_root).map_err(|_| RescueVaultDaemonError::WorkerUnavailable)?;
+    for task in tasks {
+        let task = task.map_err(|_| RescueVaultDaemonError::WorkerUnavailable)?;
+        let name = task.file_name();
+        if name.is_empty() || !name.as_encoded_bytes().iter().all(u8::is_ascii_digit) {
+            return Err(RescueVaultDaemonError::WorkerUnavailable);
+        }
+        let status = stdfs::read(task.path().join("status"))
+            .map_err(|_| RescueVaultDaemonError::WorkerUnavailable)?;
+        if !thread_status_capabilities_are_exact(&status, &expected) {
+            return Err(RescueVaultDaemonError::WorkerUnavailable);
+        }
+        observed = observed
+            .checked_add(1)
+            .ok_or(RescueVaultDaemonError::WorkerUnavailable)?;
+    }
+    if observed != 1 {
+        return Err(RescueVaultDaemonError::WorkerUnavailable);
+    }
+    Ok(())
+}
+
+fn thread_status_capabilities_are_exact(status: &[u8], expected: &str) -> bool {
+    let mut inheritable = None;
+    let mut permitted = None;
+    let mut effective = None;
+    let mut bounding = None;
+    let mut ambient = None;
+    for line in status.split(|byte| *byte == b'\n') {
+        let mut fields = line
+            .split(|byte| byte.is_ascii_whitespace())
+            .filter(|field| !field.is_empty());
+        let Some(name) = fields.next() else {
+            continue;
+        };
+        let Some(value) = fields.next() else {
+            continue;
+        };
+        if fields.next().is_some() {
+            continue;
+        }
+        let value = std::str::from_utf8(value).ok();
+        match name {
+            b"CapInh:" => inheritable = value,
+            b"CapPrm:" => permitted = value,
+            b"CapEff:" => effective = value,
+            b"CapBnd:" => bounding = value,
+            b"CapAmb:" => ambient = value,
+            _ => {}
+        }
+    }
+    inheritable == Some("0000000000000000")
+        && permitted == Some(expected)
+        && effective == Some(expected)
+        && bounding == Some(expected)
+        && ambient == Some("0000000000000000")
+}
+
+fn narrow_capabilities(
+    expected_initial: CapabilitySet,
+    expected_final: CapabilitySet,
+    bounding_drops: &[CapabilitySet],
+) -> Result<(), RescueVaultDaemonError> {
+    verify_exact_capabilities(expected_initial)?;
+    clear_ambient_capability_set().map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+    for capability in bounding_drops {
+        remove_capability_from_bounding_set(*capability)
+            .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+    }
+    set_capabilities(
+        None,
+        CapabilitySets {
+            effective: expected_final,
+            permitted: expected_final,
+            inheritable: CapabilitySet::empty(),
+        },
+    )
+    .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+    verify_exact_capabilities(expected_final)
+}
+
+fn verify_exact_capabilities(expected: CapabilitySet) -> Result<(), RescueVaultDaemonError> {
+    let observed = capabilities(None).map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+    if observed.effective != expected
+        || observed.permitted != expected
+        || !observed.inheritable.is_empty()
+    {
+        return Err(RescueVaultDaemonError::RuntimeUnavailable);
+    }
+    for bit in 0..u64::BITS {
+        let capability = CapabilitySet::from_bits_retain(1_u64 << bit);
+        let should_be_present = expected.intersects(capability);
+        match capability_is_in_bounding_set(capability) {
+            Ok(present) if present == should_be_present => {}
+            Err(error) if error == rustix::io::Errno::INVAL && !should_be_present => {}
+            _ => return Err(RescueVaultDaemonError::RuntimeUnavailable),
+        }
+        match capability_is_in_ambient_set(capability) {
+            Ok(false) => {}
+            Err(error) if error == rustix::io::Errno::INVAL => {}
+            _ => return Err(RescueVaultDaemonError::RuntimeUnavailable),
+        }
+    }
+    Ok(())
+}
 
 /// Runtime marker disposition at daemon startup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,7 +268,8 @@ impl DaemonRuntime {
     }
 
     /// Durably arm the lifecycle boundary immediately before the first
-    /// mutating worker command, or when worker isolation becomes ambiguous.
+    /// mutating worker command, before a provider lease can materialize a
+    /// credential, or when worker isolation becomes ambiguous.
     pub(super) fn arm_lifecycle(&mut self) -> Result<(), RescueVaultDaemonError> {
         match rfs::statat(&self.root, FAULT_MARKER_NAME, AtFlags::SYMLINK_NOFOLLOW) {
             Err(error) if error == rustix::io::Errno::NOENT => {
@@ -1156,6 +1326,7 @@ impl WorkerHandle {
             || bootstrap.device_id.is_some()
             || bootstrap.output_size.is_some()
             || cgroup.verify_exact_worker(pid).is_err()
+            || verify_worker_thread_capabilities(pid).is_err()
             || pidfd_ready(pidfd.as_fd()).unwrap_or(true)
         {
             cleanup_spawn_failure(&mut child, &pidfd, &cgroup, startup_deadline);
@@ -1201,10 +1372,8 @@ impl WorkerHandle {
         self.transact_inner(kind, secret_size, descriptor, deadline, cancellation, None)
     }
 
-    /// Dormant private substrate for the future Agent lease handler. The
-    /// shipping server does not call this method: public borrow remains
-    /// hard-denied before worker dispatch.
-    #[allow(dead_code)]
+    /// Creates the one-shot worker-to-Agent credential pipe for one registered
+    /// supervisor lease. This transaction is intentionally non-cancellable.
     pub(super) fn borrow_openai(
         &self,
         deadline: Instant,
@@ -1244,6 +1413,7 @@ impl WorkerHandle {
             return Err(RescueVaultDaemonError::WorkerUnavailable);
         }
         self.cgroup.verify_exact_worker(self.pid)?;
+        verify_worker_thread_capabilities(self.pid)?;
         if pidfd_ready(self.pidfd.as_fd())? {
             return Err(RescueVaultDaemonError::WorkerUnavailable);
         }
@@ -1325,6 +1495,7 @@ impl WorkerHandle {
             return Err(RescueVaultDaemonError::ProtocolFailure);
         }
         self.cgroup.verify_exact_worker(self.pid)?;
+        verify_worker_thread_capabilities(self.pid)?;
         if pidfd_ready(self.pidfd.as_fd())? {
             return Err(RescueVaultDaemonError::WorkerUnavailable);
         }
@@ -1344,6 +1515,7 @@ impl WorkerHandle {
             return Err(RescueVaultDaemonError::WorkerUnavailable);
         }
         self.cgroup.verify_exact_worker(self.pid)?;
+        verify_worker_thread_capabilities(self.pid)?;
         if pidfd_ready(self.pidfd.as_fd())? {
             return Err(RescueVaultDaemonError::WorkerUnavailable);
         }

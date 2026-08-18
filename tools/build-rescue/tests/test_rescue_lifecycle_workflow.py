@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 import unittest
 from pathlib import Path
@@ -8,6 +9,7 @@ from pathlib import Path
 REPO_DIR = Path(__file__).resolve().parents[3]
 WORKFLOW = REPO_DIR / ".github/workflows/rescue.yml"
 LIFECYCLE_HARNESS = REPO_DIR / "tools/build-rescue/qemu-vault-lifecycle-smoke.sh"
+PROVIDER_PROBE = REPO_DIR / "tools/build-rescue/provider-lease-probe.py"
 
 
 def job_block(source: str, name: str) -> str:
@@ -58,6 +60,7 @@ class RescueLifecycleWorkflowTests(unittest.TestCase):
         )
         self.assertIn("qemu-vault-lifecycle-smoke.sh", validation)
         self.assertIn("qemu-vault-lifecycle-pty.py", validation)
+        self.assertIn("provider-lease-probe.py", validation)
         self.assertIn("bash -n", validation)
         self.assertIn("shellcheck", validation)
         self.assertIn('compile(path.read_bytes(), str(path), "exec"', validation)
@@ -234,6 +237,32 @@ class RescueLifecycleWorkflowTests(unittest.TestCase):
         self.assertEqual(harness.count("readonly boot_count=2"), 1)
         self.assertEqual(self.workflow.count("boot_count=2"), 2)
         self.assertEqual(self.workflow.count("qmp_acpi_shutdowns=2"), 2)
+        self.assertEqual(self.workflow.count("expected_contracts = ["), 2)
+        self.assertEqual(self.workflow.count('("1", "clean-lock"'), 2)
+        self.assertEqual(self.workflow.count('("2", "persistent-fault"'), 2)
+        self.assertEqual(self.workflow.count("boot_contracts != expected_contracts"), 2)
+        self.assertEqual(self.workflow.count("acpi_shutdowns_clean=true"), 2)
+        self.assertEqual(
+            self.workflow.count("pre_terminal_daemon_processes_stable=true"), 2
+        )
+        self.assertEqual(
+            self.workflow.count("pre_terminal_capabilities_exact=true"), 2
+        )
+        self.assertNotIn(" daemon_processes_stable=true", self.workflow)
+        self.assertNotIn(" capabilities_exact=true", self.workflow)
+        self.assertNotIn("persistent_fault_after_each_boot", self.workflow)
+        self.assertIn("--provider-key-fd 7", harness)
+        self.assertIn('7<"$provider_key"', harness)
+        self.assertIn(
+            "name=opt/io.systemd.credentials/provider-lease-probe,"
+            "file=$provider_probe_helper",
+            harness,
+        )
+        self.assertIn("== 15508", harness)
+        digest = "23470d54d04fd4d025988e9fabf7401b12c9157c6d58162295c01817c103a08f"
+        self.assertIn(digest, harness)
+        self.assertEqual(PROVIDER_PROBE.stat().st_size, 15508)
+        self.assertEqual(hashlib.sha256(PROVIDER_PROBE.read_bytes()).hexdigest(), digest)
 
 
 if __name__ == "__main__":

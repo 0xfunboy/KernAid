@@ -1,0 +1,22 @@
+[Unit]
+Description=KernAid Rescue OpenAI fixed TLS egress socket
+Requires=systemd-sysusers.service
+After=systemd-sysusers.service
+ConditionKernelCommandLine=boot=live
+
+[Socket]
+ListenStream=/run/kernaid-rescue-openai-egress.sock
+Accept=no
+Backlog=1
+FlushPending=yes
+SocketMode=0660
+SocketUser=root
+SocketGroup=kernaid-openai
+RemoveOnStop=yes
+PassCredentials=no
+PassSecurity=no
+PassPacketInfo=no
+Timestamping=off
+
+[Install]
+WantedBy=sockets.target

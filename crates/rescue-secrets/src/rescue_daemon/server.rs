@@ -1,16 +1,20 @@
 use super::{
     RescueVaultDaemonError, enforce_process_privacy, group_has_exact_openai_boundaries,
     internal_wire, passwd_has_exact_companion, passwd_openai_agent_uid,
-    runtime::{DaemonRuntime, RuntimeDisposition, WorkerCgroup, WorkerHandle, WorkerSpawnResult},
+    runtime::{
+        self, DaemonRuntime, RuntimeDisposition, WorkerCgroup, WorkerHandle, WorkerSpawnResult,
+    },
     validate_no_active_swap,
 };
 use kernaid_protocol::rescue_vault::{
-    ErrorToken, MAX_INITIAL_STATE_VERSION, MAX_SAFE_JSON_INTEGER, Operation, PeerAllowlist,
-    Provider, ProviderState, ProviderStatusPayload, RequestDecodeError, RequestPayload,
-    ServerReceiveError, SuccessPayload, ValidatedRequest, VaultState, VaultStatusPayload,
-    authenticate_seqpacket_peer, gate_operation_for_vault_state, validate_passphrase_read,
+    DescriptorDeclaration, DescriptorType, ErrorToken, MAX_INITIAL_STATE_VERSION,
+    MAX_SAFE_JSON_INTEGER, Operation, PeerAllowlist, Provider, ProviderState,
+    ProviderStatusPayload, RequestDecodeError, RequestPayload, ServerReceiveError, SuccessPayload,
+    ValidatedRequest, VaultState, VaultStatusPayload, authenticate_seqpacket_peer,
+    gate_operation_for_vault_state, validate_passphrase_read,
 };
 use nix::sys::signal::{SigSet, Signal};
+use nix::sys::socket::{getsockopt, sockopt};
 use rand_core::{OsRng, RngCore};
 use rustix::{
     event::{PollFd, PollFlags, Timespec, poll},
@@ -18,9 +22,10 @@ use rustix::{
     fs::{self as rfs, FileType, OFlags},
     net::{
         AddressFamily, RecvFlags, SendFlags, SocketAddrUnix, SocketFlags, SocketType, accept_with,
-        recv, sendto, socket_with,
+        recv, sendto, socket_with, socketpair,
     },
     pipe::{PipeFlags, pipe_with},
+    process::{Signal as ProcessSignal, pidfd_send_signal},
 };
 use std::{
     env,
@@ -42,6 +47,10 @@ const CONNECTION_TIMEOUT: Duration = Duration::from_secs(3);
 const ACCEPT_POLL_SLICE: Duration = Duration::from_millis(200);
 const CLIENT_PIPE_TIMEOUT: Duration = Duration::from_secs(15);
 const WORKER_OPERATION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const WORKER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+const PROVIDER_BORROW_TIMEOUT: Duration = Duration::from_secs(20);
+const PROVIDER_LEASE_TIMEOUT: Duration = Duration::from_secs(120);
+const LEASE_REVOCATION_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(110);
 const READINESS_NOTIFICATION_TIMEOUT: Duration = Duration::from_secs(3);
 const UNLOCK_RATE_LIMIT: Duration = Duration::from_secs(2);
@@ -88,9 +97,95 @@ struct Supervisor {
     runtime: Mutex<Box<dyn RuntimeBoundary>>,
     worker: Option<Arc<dyn WorkerBoundary>>,
     privacy: Arc<dyn PrivacyBoundary>,
+    leases: Mutex<LeaseRegistry>,
     faulted: AtomicBool,
     stopping: Arc<AtomicBool>,
     stop_deadline: Arc<Mutex<Option<Instant>>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LeaseState {
+    Pending,
+    PotentiallyIssued,
+    Established,
+    Revoking,
+}
+
+struct ProviderLease {
+    id: u64,
+    socket: OwnedFd,
+    pidfd: OwnedFd,
+    state: LeaseState,
+    handoff_deadline: Instant,
+    lease_deadline: Option<Instant>,
+    output_obligation: Arc<LeaseOutputState>,
+}
+
+struct LeaseRegistry {
+    next_id: u64,
+    active: Option<ProviderLease>,
+}
+
+impl Default for LeaseRegistry {
+    fn default() -> Self {
+        Self {
+            next_id: 1,
+            active: None,
+        }
+    }
+}
+
+struct LeaseCandidate {
+    socket: OwnedFd,
+    pidfd: OwnedFd,
+}
+
+struct LeaseSnapshot {
+    id: u64,
+    socket: OwnedFd,
+    pidfd: OwnedFd,
+    deadline: Instant,
+    output_obligation: Arc<LeaseOutputState>,
+}
+
+struct LeaseOutputState {
+    finalized: AtomicBool,
+}
+
+struct LeaseOutputGuard {
+    descriptor: Option<OwnedFd>,
+    state: Arc<LeaseOutputState>,
+}
+
+impl LeaseOutputGuard {
+    fn new(state: Arc<LeaseOutputState>) -> Self {
+        Self {
+            descriptor: None,
+            state,
+        }
+    }
+
+    fn adopt(&mut self, descriptor: OwnedFd) -> Result<(), OwnedFd> {
+        if self.descriptor.is_some() {
+            return Err(descriptor);
+        }
+        self.descriptor = Some(descriptor);
+        Ok(())
+    }
+
+    fn descriptor(&self) -> Option<BorrowedFd<'_>> {
+        self.descriptor.as_ref().map(AsFd::as_fd)
+    }
+}
+
+impl Drop for LeaseOutputGuard {
+    fn drop(&mut self) {
+        // Close every supervisor-owned credential descriptor before publishing
+        // finalization. Revocation may remove the lease only after observing
+        // this release-store in addition to peer HUP and pidfd exit.
+        drop(self.descriptor.take());
+        self.state.finalized.store(true, Ordering::Release);
+    }
 }
 
 trait PrivacyBoundary: Send + Sync {
@@ -133,6 +228,10 @@ trait WorkerBoundary: Send + Sync {
         descriptor: Option<OwnedFd>,
         deadline: Instant,
     ) -> Result<(internal_wire::WorkerResponse, Option<OwnedFd>), RescueVaultDaemonError>;
+    fn borrow_openai(
+        &self,
+        deadline: Instant,
+    ) -> Result<(internal_wire::WorkerResponse, Option<OwnedFd>), RescueVaultDaemonError>;
     fn verify_healthy(&self) -> Result<(), RescueVaultDaemonError>;
     fn exited(&self) -> Result<bool, RescueVaultDaemonError>;
     fn fault_and_terminate(&self, deadline: Instant) -> Result<(), RescueVaultDaemonError>;
@@ -149,6 +248,13 @@ impl WorkerBoundary for WorkerHandle {
         deadline: Instant,
     ) -> Result<(internal_wire::WorkerResponse, Option<OwnedFd>), RescueVaultDaemonError> {
         WorkerHandle::transact(self, kind, passphrase_size, descriptor, deadline)
+    }
+
+    fn borrow_openai(
+        &self,
+        deadline: Instant,
+    ) -> Result<(internal_wire::WorkerResponse, Option<OwnedFd>), RescueVaultDaemonError> {
+        WorkerHandle::borrow_openai(self, deadline)
     }
 
     fn verify_healthy(&self) -> Result<(), RescueVaultDaemonError> {
@@ -290,15 +396,21 @@ pub(super) fn run(companion_uid: u32) -> Result<(), RescueVaultDaemonError> {
     let notifier = SystemdNotifier::from_environment()?;
     let signal_set = block_termination_signals()?;
     let stop = StopControl::new();
-    spawn_signal_waiter(signal_set, stop.clone());
+    spawn_signal_waiter(signal_set, stop.clone())?;
     let allowlist = validated_peer_allowlist(companion_uid)?;
     let listener = take_listener()?;
-    let (runtime, disposition) = DaemonRuntime::open()?;
+    let (mut daemon_runtime, disposition) = DaemonRuntime::open()?;
     let seed = state_version_seed()?;
+    let mut parent_capabilities_narrowed = false;
+    let mut parent_capability_failure = false;
 
     let (worker, availability, startup_fault, untracked_worker_may_remain) = match disposition {
         RuntimeDisposition::PersistentFault => (None, faulted_availability(), true, false),
-        RuntimeDisposition::Ready => match start_worker(&stop) {
+        RuntimeDisposition::Ready => match start_worker(
+            &stop,
+            &mut parent_capabilities_narrowed,
+            &mut parent_capability_failure,
+        ) {
             WorkerStartup::Ready {
                 worker,
                 availability,
@@ -316,6 +428,23 @@ pub(super) fn run(companion_uid: u32) -> Result<(), RescueVaultDaemonError> {
             WorkerStartup::CancelledClean => return Ok(()),
         },
     };
+    let capabilities_ready = !parent_capability_failure
+        && (parent_capabilities_narrowed || runtime::narrow_supervisor_capabilities().is_ok())
+        && runtime::verify_all_supervisor_threads_capabilities().is_ok()
+        && peer_pidfd_capability_probe().is_ok();
+    if !capabilities_ready {
+        let deadline = stop.deadline_or(Instant::now() + SHUTDOWN_TIMEOUT);
+        let worker_quiesced = !untracked_worker_may_remain
+            && worker
+                .as_ref()
+                .is_none_or(|worker| worker.fault_and_terminate(deadline).is_ok());
+        let marker_durable = daemon_runtime.arm_lifecycle().is_ok();
+        return Err(if worker_quiesced && marker_durable {
+            RescueVaultDaemonError::RuntimeUnavailable
+        } else {
+            RescueVaultDaemonError::ShutdownFailed
+        });
+    }
     let supervisor = Arc::new(Supervisor {
         state: Mutex::new(ServiceState {
             version: seed,
@@ -329,9 +458,10 @@ pub(super) fn run(companion_uid: u32) -> Result<(), RescueVaultDaemonError> {
             clean_fault_shutdown: false,
         }),
         lifecycle: Mutex::new(()),
-        runtime: Mutex::new(Box::new(runtime)),
+        runtime: Mutex::new(Box::new(daemon_runtime)),
         worker: worker.map(|worker| -> Arc<dyn WorkerBoundary> { worker }),
         privacy: Arc::new(ProcPrivacyBoundary),
+        leases: Mutex::new(LeaseRegistry::default()),
         faulted: AtomicBool::new(startup_fault),
         stopping: Arc::clone(&stop.requested),
         stop_deadline: Arc::clone(&stop.deadline),
@@ -400,7 +530,11 @@ pub(super) fn run(companion_uid: u32) -> Result<(), RescueVaultDaemonError> {
     }
 }
 
-fn start_worker(stop: &StopControl) -> WorkerStartup {
+fn start_worker(
+    stop: &StopControl,
+    parent_capabilities_narrowed: &mut bool,
+    parent_capability_failure: &mut bool,
+) -> WorkerStartup {
     if stop.requested.load(Ordering::Acquire) {
         return WorkerStartup::CancelledClean;
     }
@@ -419,8 +553,8 @@ fn start_worker(stop: &StopControl) -> WorkerStartup {
             }
         };
     }
-    let startup_deadline = Instant::now() + WORKER_OPERATION_TIMEOUT;
-    let worker = match WorkerHandle::spawn(cgroup, startup_deadline, &stop.requested) {
+    let bootstrap_deadline = Instant::now() + WORKER_STARTUP_TIMEOUT;
+    let worker = match WorkerHandle::spawn(cgroup, bootstrap_deadline, &stop.requested) {
         Ok(WorkerSpawnResult::Ready(worker)) => worker,
         Ok(WorkerSpawnResult::CancelledClean) => return WorkerStartup::CancelledClean,
         Err(_) => {
@@ -432,14 +566,27 @@ fn start_worker(stop: &StopControl) -> WorkerStartup {
             };
         }
     };
+    if runtime::narrow_supervisor_capabilities().is_err()
+        || runtime::verify_all_supervisor_threads_capabilities().is_err()
+    {
+        *parent_capability_failure = true;
+        return WorkerStartup::Faulted {
+            worker: Some(worker),
+            untracked_worker_may_remain: false,
+        };
+    }
+    *parent_capabilities_narrowed = true;
     if stop.requested.load(Ordering::Acquire) {
         return cancel_startup_worker(worker, stop);
     }
+    let probe_deadline = Instant::now()
+        .checked_add(WORKER_OPERATION_TIMEOUT)
+        .unwrap_or_else(Instant::now);
     let response = worker.transact_cancellable(
         internal_wire::WorkerCommandKind::Probe,
         None,
         None,
-        startup_deadline,
+        probe_deadline,
         Some(&stop.requested),
     );
     if stop.requested.load(Ordering::Acquire) {
@@ -452,7 +599,7 @@ fn start_worker(stop: &StopControl) -> WorkerStartup {
                 availability,
             },
             Err(()) => {
-                let _ = worker.fault_and_terminate(startup_deadline);
+                let _ = worker.fault_and_terminate(probe_deadline);
                 WorkerStartup::Faulted {
                     worker: Some(worker),
                     untracked_worker_may_remain: false,
@@ -460,7 +607,7 @@ fn start_worker(stop: &StopControl) -> WorkerStartup {
             }
         },
         Ok((_, Some(_))) | Err(_) => {
-            let _ = worker.fault_and_terminate(startup_deadline);
+            let _ = worker.fault_and_terminate(probe_deadline);
             WorkerStartup::Faulted {
                 worker: Some(worker),
                 untracked_worker_may_remain: false,
@@ -726,12 +873,38 @@ fn block_termination_signals() -> Result<SigSet, RescueVaultDaemonError> {
     Ok(signals)
 }
 
-fn spawn_signal_waiter(signals: SigSet, stop: StopControl) {
+fn spawn_signal_waiter(signals: SigSet, stop: StopControl) -> Result<(), RescueVaultDaemonError> {
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
     thread::spawn(move || {
-        if signals.wait().is_ok() {
-            stop.request();
+        let ready = runtime::narrow_supervisor_capabilities().is_ok()
+            && runtime::verify_current_supervisor_capabilities().is_ok();
+        if ready_tx.send(ready).is_err() || !ready {
+            return;
         }
+        run_signal_waiter(signals, stop, || true);
     });
+    match ready_rx.recv_timeout(CONNECTION_TIMEOUT) {
+        Ok(true) => Ok(()),
+        Ok(false) | Err(_) => Err(RescueVaultDaemonError::RuntimeUnavailable),
+    }
+}
+
+fn run_signal_waiter(signals: SigSet, stop: StopControl, keep_running: impl Fn() -> bool) {
+    while keep_running() {
+        match signals.wait() {
+            Ok(_) => stop.request(),
+            Err(_) => {
+                // Keep this already-narrowed task alive after a sigwait
+                // failure. Main will observe the stop request and exit;
+                // allowing the task to disappear could make the exact
+                // all-thread capability attestation race a clean stop.
+                stop.request();
+                while keep_running() {
+                    thread::park_timeout(ACCEPT_POLL_SLICE);
+                }
+            }
+        }
+    }
 }
 
 fn state_version_seed() -> Result<u64, RescueVaultDaemonError> {
@@ -894,15 +1067,32 @@ fn serve_connections(
     stop: &StopControl,
 ) -> Result<Instant, RescueVaultDaemonError> {
     let mut handlers: Vec<JoinHandle<()>> = Vec::new();
-    while !stop.requested.load(Ordering::Acquire) {
+    let mut terminal_error = None;
+    'serving: while !stop.requested.load(Ordering::Acquire) {
         reap_handlers(&mut handlers, &supervisor);
+        if supervisor.sweep_expired_lease().is_err() {
+            terminal_error = Some(RescueVaultDaemonError::ShutdownFailed);
+            break;
+        }
         if let Some(worker) = supervisor.worker.as_ref()
             && !supervisor.faulted.load(Ordering::Acquire)
-            && worker.exited()?
         {
-            supervisor.mark_fault();
+            match worker.exited() {
+                Ok(true) => {
+                    terminal_error = Some(RescueVaultDaemonError::WorkerUnavailable);
+                    break;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    terminal_error = Some(error);
+                    break;
+                }
+            }
         }
-        wait_listener(listener.as_fd())?;
+        if let Err(error) = wait_listener(listener.as_fd()) {
+            terminal_error = Some(error);
+            break;
+        }
         loop {
             if stop.requested.load(Ordering::Acquire) {
                 break;
@@ -918,24 +1108,45 @@ fn serve_connections(
                 Err(error) if error == rustix::io::Errno::AGAIN => break,
                 Err(error) if error == rustix::io::Errno::INTR => continue,
                 Err(_) => {
-                    supervisor.mark_fault();
-                    return Err(RescueVaultDaemonError::InvalidListener);
+                    terminal_error = Some(RescueVaultDaemonError::InvalidListener);
+                    break 'serving;
                 }
             }
         }
     }
+    stop.request();
+    drop(listener);
     let deadline = stop.deadline_or(Instant::now() + SHUTDOWN_TIMEOUT);
+    let revoke_deadline = Instant::now()
+        .checked_add(LEASE_REVOCATION_TIMEOUT)
+        .unwrap_or(deadline)
+        .min(deadline);
+    let revoke_failed = supervisor.revoke_active_lease(revoke_deadline).is_err();
+    if revoke_failed {
+        terminal_error = Some(RescueVaultDaemonError::ShutdownFailed);
+    }
+    let fault_reserved = terminal_error.is_some();
+    if fault_reserved {
+        let containment = supervisor.mark_fault_by(deadline);
+        if !containment.permits_status_service() {
+            terminal_error = Some(RescueVaultDaemonError::ShutdownFailed);
+        }
+    }
     while !handlers.is_empty() {
         reap_handlers(&mut handlers, &supervisor);
         if !handlers.is_empty() && Instant::now() >= deadline {
-            supervisor.mark_fault();
-            return Err(RescueVaultDaemonError::ShutdownFailed);
+            terminal_error = Some(RescueVaultDaemonError::ShutdownFailed);
+            break;
         }
         if !handlers.is_empty() {
             thread::sleep(Duration::from_millis(10));
         }
     }
-    Ok(deadline)
+    if let Some(error) = terminal_error {
+        Err(error)
+    } else {
+        Ok(deadline)
+    }
 }
 
 fn reap_handlers(handlers: &mut Vec<JoinHandle<()>>, supervisor: &Supervisor) {
@@ -966,10 +1177,19 @@ fn wait_listener(listener: BorrowedFd<'_>) -> Result<(), RescueVaultDaemonError>
 }
 
 fn handle_connection(connection: OwnedFd, allowlist: PeerAllowlist, supervisor: Arc<Supervisor>) {
+    handle_connection_by(connection, allowlist, supervisor, true);
+}
+
+fn handle_connection_by(
+    connection: OwnedFd,
+    allowlist: PeerAllowlist,
+    supervisor: Arc<Supervisor>,
+    validate_production_socket: bool,
+) {
     if supervisor.stopping.load(Ordering::Acquire) {
         return;
     }
-    if validate_accepted_connection(connection.as_fd()).is_err() {
+    if validate_production_socket && validate_accepted_connection(connection.as_fd()).is_err() {
         return;
     }
     let peer = match authenticate_seqpacket_peer(connection.as_fd(), allowlist) {
@@ -1016,9 +1236,52 @@ fn handle_connection(connection: OwnedFd, allowlist: PeerAllowlist, supervisor: 
         HandlerResult::Success(request, payload) => {
             let _ = peer.send_success(&request, version, &payload, &[], send_deadline);
         }
+        HandlerResult::Descriptor {
+            request,
+            payload,
+            output,
+            lease_id,
+            handoff_deadline,
+        } => {
+            let descriptor_send_deadline = send_deadline.min(handoff_deadline);
+            let sent = match output.descriptor() {
+                Some(descriptor) => supervisor.send_provider_descriptor(lease_id, || {
+                    peer.send_success(
+                        &request,
+                        version,
+                        &payload,
+                        &[descriptor],
+                        descriptor_send_deadline,
+                    )
+                    .is_ok()
+                }),
+                None => Err(RescueVaultDaemonError::PersistentFault),
+            };
+            // Publish the output-finalized latch only after the supervisor's
+            // credential read descriptor is closed. Revocation and lock wait
+            // for this latch in addition to Agent HUP and pidfd exit.
+            drop(output);
+            match sent {
+                Ok(DescriptorSend::Established) => {
+                    if supervisor.monitor_provider_lease(lease_id).is_err() {
+                        supervisor.mark_fault();
+                    }
+                }
+                Ok(DescriptorSend::RevocationRequired(snapshot)) => {
+                    if supervisor.finish_provider_revocation(snapshot).is_err() {
+                        supervisor.mark_fault();
+                    }
+                }
+                Ok(DescriptorSend::RevocationInProgress) => {}
+                Err(_) => {
+                    supervisor.mark_fault();
+                }
+            }
+        }
         HandlerResult::Error(request, error) => {
             let _ = peer.send_error(&request, version, error, send_deadline);
         }
+        HandlerResult::Drop => {}
     }
 }
 
@@ -1061,7 +1324,15 @@ fn socket_client_is_live(connection: BorrowedFd<'_>) -> bool {
 
 enum HandlerResult {
     Success(ValidatedRequest, SuccessPayload),
+    Descriptor {
+        request: ValidatedRequest,
+        payload: SuccessPayload,
+        output: LeaseOutputGuard,
+        lease_id: u64,
+        handoff_deadline: Instant,
+    },
     Error(ValidatedRequest, ErrorToken),
+    Drop,
 }
 
 enum DispatchArm {
@@ -1072,8 +1343,40 @@ enum DispatchArm {
     ClientGoneAfterArm,
 }
 
+enum ProviderDispatchArm {
+    Armed,
+    RevocationInProgress,
+    StoppedBeforeArm,
+    ClientGoneBeforeArm,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LeaseWait {
+    Released,
+    Deadline,
+}
+
+enum PotentialIssue {
+    Armed(LeaseOutputGuard),
+    CancelledBeforeSecret,
+    RevocationInProgress,
+}
+
+enum PendingCancel {
+    CancelledHere(u64),
+    RevocationInProgress,
+}
+
+enum DescriptorSend {
+    Established,
+    RevocationRequired(LeaseSnapshot),
+    RevocationInProgress,
+}
+
 enum ClientConnection<'socket> {
     Socket(BorrowedFd<'socket>),
+    #[cfg(test)]
+    LeaseTestSocket(BorrowedFd<'socket>),
     #[cfg(test)]
     AssumedLive,
     #[cfg(test)]
@@ -1085,9 +1388,154 @@ impl ClientConnection<'_> {
         match self {
             Self::Socket(socket) => socket_client_is_live(*socket),
             #[cfg(test)]
+            Self::LeaseTestSocket(socket) => socket_client_is_live(*socket),
+            #[cfg(test)]
             Self::AssumedLive => true,
             #[cfg(test)]
             Self::BlockingLive(liveness) => liveness.is_live(),
+        }
+    }
+
+    fn lease_candidate(&self) -> Result<LeaseCandidate, RescueVaultDaemonError> {
+        let (socket, production_validation) = match self {
+            Self::Socket(socket) => (socket, true),
+            #[cfg(test)]
+            Self::LeaseTestSocket(socket) => (socket, false),
+            #[cfg(test)]
+            Self::AssumedLive | Self::BlockingLive(_) => {
+                return Err(RescueVaultDaemonError::ProtocolFailure);
+            }
+        };
+        let pidfd = getsockopt(socket, sockopt::PeerPidfd)
+            .map_err(|_| RescueVaultDaemonError::ProtocolFailure)?;
+        let pidfd_flags =
+            rustix::io::fcntl_getfd(&pidfd).map_err(|_| RescueVaultDaemonError::ProtocolFailure)?;
+        if pidfd_flags != rustix::io::FdFlags::CLOEXEC || lease_pid_exited(pidfd.as_fd())? {
+            return Err(RescueVaultDaemonError::ProtocolFailure);
+        }
+        let observer = rustix::io::fcntl_dupfd_cloexec(*socket, 3)
+            .map_err(|_| RescueVaultDaemonError::ProtocolFailure)?;
+        if production_validation {
+            validate_accepted_connection(observer.as_fd())?;
+        }
+        let source = rfs::fstat(*socket).map_err(|_| RescueVaultDaemonError::ProtocolFailure)?;
+        let duplicate =
+            rfs::fstat(&observer).map_err(|_| RescueVaultDaemonError::ProtocolFailure)?;
+        if source.st_dev != duplicate.st_dev || source.st_ino != duplicate.st_ino {
+            return Err(RescueVaultDaemonError::ProtocolFailure);
+        }
+        Ok(LeaseCandidate {
+            socket: observer,
+            pidfd,
+        })
+    }
+}
+
+fn lease_pid_exited(pidfd: BorrowedFd<'_>) -> Result<bool, RescueVaultDaemonError> {
+    let zero = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    loop {
+        let mut descriptor = [PollFd::from_borrowed_fd(pidfd, PollFlags::IN)];
+        match poll(&mut descriptor, Some(&zero)) {
+            Ok(0) => return Ok(false),
+            Ok(_) => {
+                let events = descriptor[0].revents();
+                if events.intersects(PollFlags::ERR | PollFlags::NVAL) {
+                    return Err(RescueVaultDaemonError::ProtocolFailure);
+                }
+                return Ok(events.contains(PollFlags::IN));
+            }
+            Err(error) if error == rustix::io::Errno::INTR => {}
+            Err(_) => return Err(RescueVaultDaemonError::ProtocolFailure),
+        }
+    }
+}
+
+fn peer_pidfd_capability_probe() -> Result<(), RescueVaultDaemonError> {
+    let (first, second) = socketpair(
+        AddressFamily::UNIX,
+        SocketType::SEQPACKET,
+        SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+        None,
+    )
+    .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+    let first_pidfd = getsockopt(&first, sockopt::PeerPidfd)
+        .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+    let second_pidfd = getsockopt(&second, sockopt::PeerPidfd)
+        .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+    for pidfd in [&first_pidfd, &second_pidfd] {
+        if rustix::io::fcntl_getfd(pidfd).map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?
+            != rustix::io::FdFlags::CLOEXEC
+            || lease_pid_exited(pidfd.as_fd())?
+        {
+            return Err(RescueVaultDaemonError::RuntimeUnavailable);
+        }
+    }
+    Ok(())
+}
+
+fn snapshot_provider_lease(lease: &ProviderLease) -> Result<LeaseSnapshot, RescueVaultDaemonError> {
+    let socket = rustix::io::fcntl_dupfd_cloexec(&lease.socket, 3)
+        .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+    let pidfd = rustix::io::fcntl_dupfd_cloexec(&lease.pidfd, 3)
+        .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+    if rustix::io::fcntl_getfd(&socket).map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?
+        != rustix::io::FdFlags::CLOEXEC
+        || rustix::io::fcntl_getfd(&pidfd)
+            .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?
+            != rustix::io::FdFlags::CLOEXEC
+    {
+        return Err(RescueVaultDaemonError::RuntimeUnavailable);
+    }
+    Ok(LeaseSnapshot {
+        id: lease.id,
+        socket,
+        pidfd,
+        deadline: lease.lease_deadline.unwrap_or(lease.handoff_deadline),
+        output_obligation: Arc::clone(&lease.output_obligation),
+    })
+}
+
+fn wait_for_lease_evidence(
+    lease: &LeaseSnapshot,
+    deadline: Instant,
+) -> Result<LeaseWait, RescueVaultDaemonError> {
+    let mut socket_closed = false;
+    let mut process_exited = false;
+    loop {
+        let now = Instant::now();
+        let output_finalized = lease.output_obligation.finalized.load(Ordering::Acquire);
+        if socket_closed && process_exited && output_finalized {
+            return Ok(LeaseWait::Released);
+        }
+        if now >= deadline {
+            return Ok(LeaseWait::Deadline);
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        let slice = remaining.min(ACCEPT_POLL_SLICE);
+        let mut descriptors = [
+            PollFd::from_borrowed_fd(lease.socket.as_fd(), PollFlags::HUP | PollFlags::RDHUP),
+            PollFd::from_borrowed_fd(lease.pidfd.as_fd(), PollFlags::IN),
+        ];
+        match poll(&mut descriptors, Some(&duration_to_timespec(slice))) {
+            Ok(_) => {
+                let socket_events = descriptors[0].revents();
+                let process_events = descriptors[1].revents();
+                if socket_events.intersects(PollFlags::ERR | PollFlags::NVAL)
+                    || process_events.intersects(PollFlags::ERR | PollFlags::NVAL)
+                {
+                    return Err(RescueVaultDaemonError::ProtocolFailure);
+                }
+                // RDHUP is only a peer write-half close. A transferred client
+                // descriptor can still be open, so only full HUP is release
+                // evidence.
+                socket_closed |= socket_events.contains(PollFlags::HUP);
+                process_exited |= process_events.contains(PollFlags::IN);
+            }
+            Err(error) if error == rustix::io::Errno::INTR => {}
+            Err(_) => return Err(RescueVaultDaemonError::ProtocolFailure),
         }
     }
 }
@@ -1159,6 +1607,9 @@ impl Supervisor {
             Operation::ProviderStatus => self.handle_provider_status(request, started, &connection),
             Operation::ProviderOpenAiConfigure => {
                 self.handle_provider_configure(request, started, &connection)
+            }
+            Operation::ProviderOpenAiBorrow => {
+                self.handle_provider_borrow(request, started, &connection)
             }
             Operation::ProviderLogout => self.handle_provider_logout(request, started, &connection),
             _ => unreachable!("external operation allowlist is closed"),
@@ -1326,6 +1777,182 @@ impl Supervisor {
                 )
             }
         }
+    }
+
+    fn handle_provider_borrow(
+        self: &Arc<Self>,
+        request: ValidatedRequest,
+        started: Instant,
+        connection: &ClientConnection<'_>,
+    ) -> (u64, HandlerResult) {
+        let handoff_deadline = started
+            .checked_add(PROVIDER_BORROW_TIMEOUT)
+            .unwrap_or(started);
+        if !matches!(request.payload(), RequestPayload::Empty) {
+            let version = self.snapshot().version;
+            return (version, HandlerResult::Error(request, ErrorToken::IoFailed));
+        }
+        let candidate = match connection.lease_candidate() {
+            Ok(candidate) => candidate,
+            Err(_) => {
+                return (
+                    self.snapshot().version,
+                    HandlerResult::Error(request, ErrorToken::IoFailed),
+                );
+            }
+        };
+        let (_version, lease_id) = match self.begin_provider_borrow(
+            request.expected_state_version(),
+            connection,
+            candidate,
+            handoff_deadline,
+        ) {
+            Ok(result) => result,
+            Err((version, error)) => {
+                if error == ErrorToken::RebootRequired {
+                    self.mark_fault_by(handoff_deadline);
+                    return (
+                        self.snapshot().version,
+                        HandlerResult::Error(request, ErrorToken::RebootRequired),
+                    );
+                }
+                return (version, HandlerResult::Error(request, error));
+            }
+        };
+        match self.provider_borrow_dispatch_ready(lease_id, connection) {
+            Ok(ProviderDispatchArm::Armed) => {}
+            Ok(ProviderDispatchArm::RevocationInProgress) => {
+                return (self.snapshot().version, HandlerResult::Drop);
+            }
+            Ok(ProviderDispatchArm::StoppedBeforeArm) => {
+                return match self.cancel_pending_lease(lease_id) {
+                    Ok(PendingCancel::CancelledHere(version)) => {
+                        (version, HandlerResult::Error(request, ErrorToken::Busy))
+                    }
+                    Ok(PendingCancel::RevocationInProgress) => {
+                        (self.snapshot().version, HandlerResult::Drop)
+                    }
+                    Err(_) => {
+                        self.mark_fault_by(handoff_deadline);
+                        (self.snapshot().version, HandlerResult::Drop)
+                    }
+                };
+            }
+            Ok(ProviderDispatchArm::ClientGoneBeforeArm) => {
+                return match self.cancel_pending_lease(lease_id) {
+                    Ok(PendingCancel::CancelledHere(version)) => {
+                        (version, HandlerResult::Error(request, ErrorToken::IoFailed))
+                    }
+                    Ok(PendingCancel::RevocationInProgress) => {
+                        (self.snapshot().version, HandlerResult::Drop)
+                    }
+                    Err(_) => {
+                        self.mark_fault_by(handoff_deadline);
+                        (self.snapshot().version, HandlerResult::Drop)
+                    }
+                };
+            }
+            Err(_) => {
+                let _ =
+                    self.revoke_provider_lease(lease_id, Instant::now() + LEASE_REVOCATION_TIMEOUT);
+                self.mark_fault_by(handoff_deadline);
+                return (self.snapshot().version, HandlerResult::Drop);
+            }
+        }
+        let mut output = match self.mark_lease_potentially_issued(lease_id) {
+            Ok(PotentialIssue::Armed(output)) => output,
+            Ok(PotentialIssue::CancelledBeforeSecret) => {
+                return (self.snapshot().version, HandlerResult::Drop);
+            }
+            Ok(PotentialIssue::RevocationInProgress) => {
+                return (self.snapshot().version, HandlerResult::Drop);
+            }
+            Err(_) => {
+                let _ = self.cancel_pending_lease(lease_id);
+                self.mark_fault_by(handoff_deadline);
+                return (self.snapshot().version, HandlerResult::Drop);
+            }
+        };
+        let Some(worker) = self.worker.as_ref() else {
+            drop(output);
+            let _ = self.revoke_provider_lease(lease_id, Instant::now() + LEASE_REVOCATION_TIMEOUT);
+            self.mark_fault_by(handoff_deadline);
+            return (self.snapshot().version, HandlerResult::Drop);
+        };
+        match worker.borrow_openai(handoff_deadline) {
+            Ok((response, descriptor)) => {
+                if let Some(descriptor) = descriptor
+                    && let Err(descriptor) = output.adopt(descriptor)
+                {
+                    drop(descriptor);
+                    return self.fail_ambiguous_borrow(lease_id, handoff_deadline, output);
+                }
+                if response.code == internal_wire::WorkerResultCode::ProviderBorrowReady
+                    && output.descriptor().is_some()
+                {
+                    let Some(size) = response.output_size else {
+                        return self.fail_ambiguous_borrow(lease_id, handoff_deadline, output);
+                    };
+                    let version = match self.finish_provider_borrow_ready(lease_id) {
+                        Ok(Some(version)) => version,
+                        Ok(None) => {
+                            drop(output);
+                            return (self.snapshot().version, HandlerResult::Drop);
+                        }
+                        Err(_) => {
+                            return self.fail_ambiguous_borrow(lease_id, handoff_deadline, output);
+                        }
+                    };
+                    return (
+                        version,
+                        HandlerResult::Descriptor {
+                            request,
+                            payload: SuccessPayload::Descriptor(DescriptorDeclaration {
+                                kind: DescriptorType::OpenAiApiKeyPipe,
+                                size: u64::from(size),
+                            }),
+                            output,
+                            lease_id,
+                            handoff_deadline,
+                        },
+                    );
+                }
+                if response.code == internal_wire::WorkerResultCode::ProviderBorrowUnconfigured
+                    && response.output_size.is_none()
+                    && output.descriptor().is_none()
+                {
+                    drop(output);
+                    return match self.finish_provider_borrow_unconfigured(lease_id) {
+                        Ok(Some(version)) => (
+                            version,
+                            HandlerResult::Error(request, ErrorToken::ProviderUnconfigured),
+                        ),
+                        Ok(None) => (self.snapshot().version, HandlerResult::Drop),
+                        Err(_) => {
+                            self.mark_fault_by(handoff_deadline);
+                            (self.snapshot().version, HandlerResult::Drop)
+                        }
+                    };
+                }
+                self.fail_ambiguous_borrow(lease_id, handoff_deadline, output)
+            }
+            Err(_) => self.fail_ambiguous_borrow(lease_id, handoff_deadline, output),
+        }
+    }
+
+    fn fail_ambiguous_borrow(
+        &self,
+        lease_id: u64,
+        handoff_deadline: Instant,
+        output: LeaseOutputGuard,
+    ) -> (u64, HandlerResult) {
+        drop(output);
+        let revoke_deadline = Instant::now()
+            .checked_add(LEASE_REVOCATION_TIMEOUT)
+            .unwrap_or_else(Instant::now);
+        let _ = self.revoke_provider_lease(lease_id, revoke_deadline);
+        self.mark_fault_by(handoff_deadline.max(revoke_deadline));
+        (self.snapshot().version, HandlerResult::Drop)
     }
 
     fn handle_provider_configure(
@@ -1823,16 +2450,35 @@ impl Supervisor {
             let version = self.snapshot().version;
             return (version, HandlerResult::Error(request, ErrorToken::IoFailed));
         }
-        if let Err((version, error)) = self.begin_lock(request.expected_state_version(), connection)
-        {
-            if error == ErrorToken::RebootRequired {
+        let (_transition_version, lease_id) =
+            match self.begin_lock(request.expected_state_version(), connection) {
+                Ok(result) => result,
+                Err((version, error)) => {
+                    if error == ErrorToken::RebootRequired {
+                        self.mark_fault_by(operation_deadline);
+                        return (
+                            self.snapshot().version,
+                            HandlerResult::Error(request, ErrorToken::RebootRequired),
+                        );
+                    }
+                    return (version, HandlerResult::Error(request, error));
+                }
+            };
+        if let Some(lease_id) = lease_id {
+            let revoke_deadline = Instant::now()
+                .checked_add(LEASE_REVOCATION_TIMEOUT)
+                .unwrap_or(operation_deadline)
+                .min(operation_deadline);
+            if self
+                .revoke_provider_lease(lease_id, revoke_deadline)
+                .is_err()
+            {
                 self.mark_fault_by(operation_deadline);
                 return (
                     self.snapshot().version,
                     HandlerResult::Error(request, ErrorToken::RebootRequired),
                 );
             }
-            return (version, HandlerResult::Error(request, error));
         }
         match self.arm_for_dispatch(VaultState::Locking, connection) {
             Ok(DispatchArm::Armed) => {}
@@ -1933,7 +2579,7 @@ impl Supervisor {
         &self,
         expected: u64,
         connection: &ClientConnection<'_>,
-    ) -> Result<u64, (u64, ErrorToken)> {
+    ) -> Result<(u64, Option<u64>), (u64, ErrorToken)> {
         let _decision = self
             .lifecycle
             .lock()
@@ -1945,7 +2591,17 @@ impl Supervisor {
         if !connection.is_live() {
             return Err((state.version, ErrorToken::IoFailed));
         }
-        begin_lock_state(&mut state, expected, self.stopping.load(Ordering::Acquire))
+        let mut leases = self
+            .leases
+            .lock()
+            .map_err(|_| (state.version, ErrorToken::RebootRequired))?;
+        let version =
+            begin_lock_state(&mut state, expected, self.stopping.load(Ordering::Acquire))?;
+        let lease_id = leases.active.as_mut().map(|lease| {
+            lease.state = LeaseState::Revoking;
+            lease.id
+        });
+        Ok((version, lease_id))
     }
 
     fn begin_provider_operation(
@@ -1965,12 +2621,655 @@ impl Supervisor {
         if !connection.is_live() {
             return Err((state.version, ErrorToken::IoFailed));
         }
+        if self
+            .leases
+            .lock()
+            .map_err(|_| (state.version, ErrorToken::RebootRequired))?
+            .active
+            .is_some()
+        {
+            return Err((state.version, ErrorToken::Busy));
+        }
         begin_provider_operation_state(
             &mut state,
             expected,
             mutation,
             self.stopping.load(Ordering::Acquire),
         )
+    }
+
+    fn begin_provider_borrow(
+        &self,
+        expected: u64,
+        connection: &ClientConnection<'_>,
+        candidate: LeaseCandidate,
+        handoff_deadline: Instant,
+    ) -> Result<(u64, u64), (u64, ErrorToken)> {
+        let _decision = self
+            .lifecycle
+            .lock()
+            .map_err(|_| (0, ErrorToken::RebootRequired))?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| (0, ErrorToken::RebootRequired))?;
+        {
+            let leases = self
+                .leases
+                .lock()
+                .map_err(|_| (state.version, ErrorToken::RebootRequired))?;
+            if leases.active.is_some() {
+                return Err((state.version, ErrorToken::Busy));
+            }
+        }
+        let version = begin_provider_operation_state(
+            &mut state,
+            expected,
+            false,
+            self.stopping.load(Ordering::Acquire),
+        )?;
+        // The registry, rather than the generic provider-operation bit, owns
+        // the borrow lifetime. This keeps vault.lock able to revoke a lease.
+        state.provider_operation_active = false;
+        if !connection.is_live()
+            || !socket_client_is_live(candidate.socket.as_fd())
+            || lease_pid_exited(candidate.pidfd.as_fd())
+                .map_err(|_| (version, ErrorToken::RebootRequired))?
+        {
+            return Err((version, ErrorToken::IoFailed));
+        }
+        self.runtime
+            .lock()
+            .map_err(|_| (version, ErrorToken::RebootRequired))?
+            .arm_lifecycle()
+            .map_err(|_| (version, ErrorToken::RebootRequired))?;
+        // The marker fsync is intentionally outside the lease mutex. Recheck
+        // every externally mutable gate before installing Pending so a stop
+        // or peer exit during the arm cannot materialize a credential lease.
+        if self.stopping.load(Ordering::Acquire) {
+            return Err((version, ErrorToken::Busy));
+        }
+        if !connection.is_live()
+            || !socket_client_is_live(candidate.socket.as_fd())
+            || lease_pid_exited(candidate.pidfd.as_fd())
+                .map_err(|_| (version, ErrorToken::RebootRequired))?
+        {
+            return Err((version, ErrorToken::IoFailed));
+        }
+        let mut leases = self
+            .leases
+            .lock()
+            .map_err(|_| (version, ErrorToken::RebootRequired))?;
+        if leases.active.is_some() {
+            return Err((version, ErrorToken::RebootRequired));
+        }
+        let lease_id = leases.next_id;
+        leases.next_id = lease_id
+            .checked_add(1)
+            .filter(|next| *next != 0)
+            .ok_or((version, ErrorToken::RebootRequired))?;
+        leases.active = Some(ProviderLease {
+            id: lease_id,
+            socket: candidate.socket,
+            pidfd: candidate.pidfd,
+            state: LeaseState::Pending,
+            handoff_deadline,
+            lease_deadline: None,
+            output_obligation: Arc::new(LeaseOutputState {
+                finalized: AtomicBool::new(true),
+            }),
+        });
+        Ok((version, lease_id))
+    }
+
+    fn provider_borrow_dispatch_ready(
+        &self,
+        lease_id: u64,
+        connection: &ClientConnection<'_>,
+    ) -> Result<ProviderDispatchArm, RescueVaultDaemonError> {
+        let _decision = self
+            .lifecycle
+            .lock()
+            .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+        let leases = self
+            .leases
+            .lock()
+            .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+        match leases.active.as_ref() {
+            None => return Ok(ProviderDispatchArm::RevocationInProgress),
+            Some(lease) if lease.id != lease_id => {
+                return Ok(ProviderDispatchArm::RevocationInProgress);
+            }
+            Some(lease) if lease.state == LeaseState::Revoking => {
+                return Ok(ProviderDispatchArm::RevocationInProgress);
+            }
+            Some(lease) if lease.state == LeaseState::Pending => {}
+            Some(_) => return Err(RescueVaultDaemonError::PersistentFault),
+        }
+        if state.faulted
+            || state.provider_operation_active
+            || state.transition_origin.is_some()
+            || !matches!(
+                state.availability,
+                Availability::Available {
+                    state: VaultState::Unlocked,
+                    device_id: Some(_),
+                }
+            )
+        {
+            return Err(RescueVaultDaemonError::PersistentFault);
+        }
+        if !connection.is_live() {
+            return Ok(ProviderDispatchArm::ClientGoneBeforeArm);
+        }
+        if self.stopping.load(Ordering::Acquire) {
+            return Ok(ProviderDispatchArm::StoppedBeforeArm);
+        }
+        self.privacy
+            .validate_no_active_swap()
+            .map_err(|()| RescueVaultDaemonError::RuntimeUnavailable)?;
+        if self.stopping.load(Ordering::Acquire) {
+            Ok(ProviderDispatchArm::StoppedBeforeArm)
+        } else if !connection.is_live() {
+            Ok(ProviderDispatchArm::ClientGoneBeforeArm)
+        } else {
+            Ok(ProviderDispatchArm::Armed)
+        }
+    }
+
+    fn mark_lease_potentially_issued(
+        &self,
+        lease_id: u64,
+    ) -> Result<PotentialIssue, RescueVaultDaemonError> {
+        let _decision = self
+            .lifecycle
+            .lock()
+            .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+        let mut leases = self
+            .leases
+            .lock()
+            .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+        let Some(lease) = leases.active.as_ref() else {
+            return Ok(PotentialIssue::RevocationInProgress);
+        };
+        if lease.id != lease_id {
+            return Ok(PotentialIssue::RevocationInProgress);
+        }
+        match lease.state {
+            LeaseState::Pending => {}
+            LeaseState::Revoking => return Ok(PotentialIssue::RevocationInProgress),
+            LeaseState::PotentiallyIssued | LeaseState::Established => {
+                return Err(RescueVaultDaemonError::PersistentFault);
+            }
+        }
+        if state.faulted {
+            return Ok(PotentialIssue::RevocationInProgress);
+        }
+        let pid_exited = lease_pid_exited(lease.pidfd.as_fd())?;
+        let cancel_without_secret = state.provider_operation_active
+            || state.transition_origin.is_some()
+            || self.stopping.load(Ordering::Acquire)
+            || Instant::now() >= lease.handoff_deadline
+            || !socket_client_is_live(lease.socket.as_fd())
+            || pid_exited;
+        if cancel_without_secret {
+            leases.active.take();
+            return Ok(PotentialIssue::CancelledBeforeSecret);
+        }
+        let output_obligation = Arc::new(LeaseOutputState {
+            finalized: AtomicBool::new(false),
+        });
+        let lease = leases
+            .active
+            .as_mut()
+            .ok_or(RescueVaultDaemonError::PersistentFault)?;
+        lease.state = LeaseState::PotentiallyIssued;
+        lease.output_obligation = Arc::clone(&output_obligation);
+        Ok(PotentialIssue::Armed(LeaseOutputGuard::new(
+            output_obligation,
+        )))
+    }
+
+    fn cancel_pending_lease(&self, lease_id: u64) -> Result<PendingCancel, RescueVaultDaemonError> {
+        let _decision = self
+            .lifecycle
+            .lock()
+            .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+        let mut leases = self
+            .leases
+            .lock()
+            .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+        if state.faulted {
+            return Ok(PendingCancel::RevocationInProgress);
+        }
+        match leases.active.as_ref() {
+            Some(lease) if lease.id == lease_id && lease.state == LeaseState::Pending => {
+                leases.active.take();
+                Ok(PendingCancel::CancelledHere(state.version))
+            }
+            Some(lease) if lease.id == lease_id && lease.state == LeaseState::Revoking => {
+                Ok(PendingCancel::RevocationInProgress)
+            }
+            None => Ok(PendingCancel::RevocationInProgress),
+            Some(lease) if lease.id != lease_id => Ok(PendingCancel::RevocationInProgress),
+            Some(_) => Err(RescueVaultDaemonError::PersistentFault),
+        }
+    }
+
+    fn finish_provider_borrow_ready(
+        &self,
+        lease_id: u64,
+    ) -> Result<Option<u64>, RescueVaultDaemonError> {
+        let _decision = self
+            .lifecycle
+            .lock()
+            .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+        let leases = self
+            .leases
+            .lock()
+            .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+        let Some(lease) = leases.active.as_ref().filter(|lease| lease.id == lease_id) else {
+            return Ok(None);
+        };
+        if lease.state == LeaseState::Revoking
+            || self.stopping.load(Ordering::Acquire)
+            || state.faulted
+        {
+            return Ok(None);
+        }
+        if lease.state != LeaseState::PotentiallyIssued
+            || lease.output_obligation.finalized.load(Ordering::Acquire)
+            || state.provider_operation_active
+            || state.transition_origin.is_some()
+            || !matches!(
+                state.availability,
+                Availability::Available {
+                    state: VaultState::Unlocked,
+                    device_id: Some(_),
+                }
+            )
+        {
+            return Err(RescueVaultDaemonError::PersistentFault);
+        }
+        Ok(Some(state.version))
+    }
+
+    fn finish_provider_borrow_unconfigured(
+        &self,
+        lease_id: u64,
+    ) -> Result<Option<u64>, RescueVaultDaemonError> {
+        let _decision = self
+            .lifecycle
+            .lock()
+            .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+        let mut leases = self
+            .leases
+            .lock()
+            .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+        let Some(lease) = leases.active.as_ref().filter(|lease| lease.id == lease_id) else {
+            return Ok(None);
+        };
+        if lease.state == LeaseState::Revoking
+            || self.stopping.load(Ordering::Acquire)
+            || state.faulted
+        {
+            return Ok(None);
+        }
+        if lease.state != LeaseState::PotentiallyIssued
+            || !lease.output_obligation.finalized.load(Ordering::Acquire)
+            || state.provider_operation_active
+            || state.transition_origin.is_some()
+            || !matches!(
+                state.availability,
+                Availability::Available {
+                    state: VaultState::Unlocked,
+                    device_id: Some(_),
+                }
+            )
+        {
+            return Err(RescueVaultDaemonError::PersistentFault);
+        }
+        leases.active.take();
+        Ok(Some(state.version))
+    }
+
+    fn send_provider_descriptor(
+        &self,
+        lease_id: u64,
+        send: impl FnOnce() -> bool,
+    ) -> Result<DescriptorSend, RescueVaultDaemonError> {
+        let decision = self
+            .lifecycle
+            .lock()
+            .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+        let mut leases = self
+            .leases
+            .lock()
+            .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+        let Some(lease) = leases.active.as_mut().filter(|lease| lease.id == lease_id) else {
+            return Ok(DescriptorSend::RevocationInProgress);
+        };
+        if lease.state == LeaseState::Revoking {
+            return Ok(DescriptorSend::RevocationInProgress);
+        }
+        if lease.state != LeaseState::PotentiallyIssued
+            || lease.lease_deadline.is_some()
+            || lease.output_obligation.finalized.load(Ordering::Acquire)
+            || state.provider_operation_active
+            || state.transition_origin.is_some()
+            || !matches!(
+                state.availability,
+                Availability::Available {
+                    state: VaultState::Unlocked,
+                    device_id: Some(_),
+                }
+            )
+        {
+            return Err(RescueVaultDaemonError::PersistentFault);
+        }
+        let must_revoke = self.stopping.load(Ordering::Acquire)
+            || state.faulted
+            || !socket_client_is_live(lease.socket.as_fd())
+            || lease_pid_exited(lease.pidfd.as_fd())?;
+        if must_revoke {
+            lease.state = LeaseState::Revoking;
+            let mut snapshot = snapshot_provider_lease(lease)?;
+            snapshot.deadline = Instant::now()
+                .checked_add(LEASE_REVOCATION_TIMEOUT)
+                .unwrap_or_else(Instant::now);
+            drop(leases);
+            drop(state);
+            drop(decision);
+            return Ok(DescriptorSend::RevocationRequired(snapshot));
+        }
+        lease.lease_deadline = Some(
+            Instant::now()
+                .checked_add(PROVIDER_LEASE_TIMEOUT)
+                .unwrap_or_else(Instant::now),
+        );
+        drop(leases);
+        drop(state);
+
+        // The lifecycle guard is intentionally retained across SCM_RIGHTS.
+        // Lock/revoke therefore either wins before this point or waits until
+        // the send has completed or become ambiguous.
+        if send() {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+            let mut leases = self
+                .leases
+                .lock()
+                .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+            let lease = leases
+                .active
+                .as_mut()
+                .filter(|lease| lease.id == lease_id)
+                .ok_or(RescueVaultDaemonError::PersistentFault)?;
+            if lease.state != LeaseState::PotentiallyIssued
+                || lease.lease_deadline.is_none()
+                || state.faulted
+            {
+                return Err(RescueVaultDaemonError::PersistentFault);
+            }
+            lease.state = LeaseState::Established;
+            drop(leases);
+            drop(state);
+            drop(decision);
+            return Ok(DescriptorSend::Established);
+        }
+
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+        let mut leases = self
+            .leases
+            .lock()
+            .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+        let snapshot = match leases.active.as_mut().filter(|lease| lease.id == lease_id) {
+            Some(lease) if lease.state == LeaseState::PotentiallyIssued => {
+                lease.state = LeaseState::Revoking;
+                let mut snapshot = snapshot_provider_lease(lease)?;
+                snapshot.deadline = Instant::now()
+                    .checked_add(LEASE_REVOCATION_TIMEOUT)
+                    .unwrap_or_else(Instant::now);
+                Some(snapshot)
+            }
+            Some(lease) if lease.state == LeaseState::Revoking => None,
+            None => None,
+            Some(_) => return Err(RescueVaultDaemonError::PersistentFault),
+        };
+        drop(leases);
+        drop(state);
+        drop(decision);
+        if let Some(snapshot) = snapshot {
+            Ok(DescriptorSend::RevocationRequired(snapshot))
+        } else {
+            Ok(DescriptorSend::RevocationInProgress)
+        }
+    }
+
+    fn monitor_provider_lease(&self, lease_id: u64) -> Result<(), RescueVaultDaemonError> {
+        let snapshot = {
+            let _decision = self
+                .lifecycle
+                .lock()
+                .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+            let leases = self
+                .leases
+                .lock()
+                .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+            let Some(lease) = leases.active.as_ref().filter(|lease| lease.id == lease_id) else {
+                return Ok(());
+            };
+            if lease.state == LeaseState::Revoking || state.faulted {
+                return Ok(());
+            }
+            if lease.state != LeaseState::Established {
+                return Err(RescueVaultDaemonError::PersistentFault);
+            }
+            snapshot_provider_lease(lease)?
+        };
+        match wait_for_lease_evidence(&snapshot, snapshot.deadline)? {
+            LeaseWait::Released => self.complete_normal_lease(lease_id),
+            LeaseWait::Deadline => self.revoke_provider_lease(
+                lease_id,
+                Instant::now()
+                    .checked_add(LEASE_REVOCATION_TIMEOUT)
+                    .unwrap_or_else(Instant::now),
+            ),
+        }
+    }
+
+    fn complete_normal_lease(&self, lease_id: u64) -> Result<(), RescueVaultDaemonError> {
+        let _decision = self
+            .lifecycle
+            .lock()
+            .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+        let _state = self
+            .state
+            .lock()
+            .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+        let mut leases = self
+            .leases
+            .lock()
+            .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+        match leases.active.as_ref().filter(|lease| lease.id == lease_id) {
+            Some(lease)
+                if lease.state == LeaseState::Established
+                    && lease.output_obligation.finalized.load(Ordering::Acquire) =>
+            {
+                leases.active.take();
+                Ok(())
+            }
+            Some(lease) if lease.state == LeaseState::Revoking => Ok(()),
+            None => Ok(()),
+            Some(_) => Err(RescueVaultDaemonError::PersistentFault),
+        }
+    }
+
+    fn revoke_provider_lease(
+        &self,
+        lease_id: u64,
+        deadline: Instant,
+    ) -> Result<(), RescueVaultDaemonError> {
+        let snapshot = {
+            let _decision = self
+                .lifecycle
+                .lock()
+                .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+            let _state = self
+                .state
+                .lock()
+                .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+            let mut leases = self
+                .leases
+                .lock()
+                .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+            let Some(lease) = leases.active.as_mut().filter(|lease| lease.id == lease_id) else {
+                return Ok(());
+            };
+            lease.state = LeaseState::Revoking;
+            let mut snapshot = snapshot_provider_lease(lease)?;
+            snapshot.deadline = deadline;
+            snapshot
+        };
+        self.finish_provider_revocation(snapshot)
+    }
+
+    fn revoke_active_lease(&self, deadline: Instant) -> Result<(), RescueVaultDaemonError> {
+        let lease_id = {
+            let _decision = self
+                .lifecycle
+                .lock()
+                .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+            let _state = self
+                .state
+                .lock()
+                .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+            self.leases
+                .lock()
+                .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?
+                .active
+                .as_ref()
+                .map(|lease| lease.id)
+        };
+        match lease_id {
+            Some(lease_id) => self.revoke_provider_lease(lease_id, deadline),
+            None => Ok(()),
+        }
+    }
+
+    fn finish_provider_revocation(
+        &self,
+        snapshot: LeaseSnapshot,
+    ) -> Result<(), RescueVaultDaemonError> {
+        let already_exited = lease_pid_exited(snapshot.pidfd.as_fd())?;
+        let signal_result = if already_exited {
+            Ok(())
+        } else {
+            pidfd_send_signal(&snapshot.pidfd, ProcessSignal::KILL)
+        };
+        // ESRCH is only provisionally acceptable here. The dual wait below
+        // must still prove pidfd POLLIN as well as full peer-socket HUP.
+        let signal_ok = signal_result.is_ok()
+            || signal_result
+                .as_ref()
+                .is_err_and(|error| *error == rustix::io::Errno::SRCH);
+        let evidence = wait_for_lease_evidence(&snapshot, snapshot.deadline)?;
+        if evidence != LeaseWait::Released {
+            return Err(RescueVaultDaemonError::ShutdownFailed);
+        }
+        let _decision = self
+            .lifecycle
+            .lock()
+            .map_err(|_| RescueVaultDaemonError::ShutdownFailed)?;
+        let _state = self
+            .state
+            .lock()
+            .map_err(|_| RescueVaultDaemonError::ShutdownFailed)?;
+        let mut leases = self
+            .leases
+            .lock()
+            .map_err(|_| RescueVaultDaemonError::ShutdownFailed)?;
+        match leases
+            .active
+            .as_ref()
+            .filter(|lease| lease.id == snapshot.id)
+        {
+            Some(lease) if lease.state == LeaseState::Revoking => {
+                leases.active.take();
+            }
+            Some(_) => return Err(RescueVaultDaemonError::ShutdownFailed),
+            None => {}
+        }
+        if signal_ok {
+            Ok(())
+        } else {
+            Err(RescueVaultDaemonError::ShutdownFailed)
+        }
+    }
+
+    fn sweep_expired_lease(&self) -> Result<(), RescueVaultDaemonError> {
+        let expired = {
+            let _decision = self
+                .lifecycle
+                .lock()
+                .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+            let _state = self
+                .state
+                .lock()
+                .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+            self.leases
+                .lock()
+                .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?
+                .active
+                .as_ref()
+                .filter(|lease| lease.state != LeaseState::Revoking)
+                .and_then(|lease| {
+                    let deadline = lease.lease_deadline.unwrap_or(lease.handoff_deadline);
+                    (Instant::now() >= deadline).then_some(lease.id)
+                })
+        };
+        if let Some(lease_id) = expired {
+            self.revoke_provider_lease(
+                lease_id,
+                Instant::now()
+                    .checked_add(LEASE_REVOCATION_TIMEOUT)
+                    .unwrap_or_else(Instant::now),
+            )?;
+        }
+        Ok(())
     }
 
     fn provider_dispatch_ready(
@@ -2281,10 +3580,16 @@ impl Supervisor {
             Ok(state) => state,
             Err(_) => return StartupReadiness::Failed,
         };
+        let leases_empty = self
+            .leases
+            .lock()
+            .map(|leases| leases.active.is_none())
+            .unwrap_or(false);
         let faulted = self.faulted.load(Ordering::Acquire);
         let coherent = faulted == state.faulted
             && state.transition_origin.is_none()
             && !state.provider_operation_active
+            && leases_empty
             && !state.marker_persistence_failed
             && if faulted {
                 disposition == RuntimeDisposition::PersistentFault
@@ -2343,10 +3648,16 @@ impl Supervisor {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             runtime.arm_lifecycle()
         };
-        let worker_quiesced = self
+        let revoke_deadline = Instant::now()
+            .checked_add(LEASE_REVOCATION_TIMEOUT)
+            .unwrap_or(deadline)
+            .min(deadline);
+        let lease_quiesced = self.revoke_active_lease(revoke_deadline).is_ok();
+        let worker_terminated = self
             .worker
             .as_ref()
             .is_none_or(|worker| worker.fault_and_terminate(deadline).is_ok());
+        let worker_quiesced = lease_quiesced && worker_terminated;
         let marker_result = if first_marker_attempt.is_ok() {
             first_marker_attempt
         } else {
@@ -2368,7 +3679,7 @@ impl Supervisor {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.marker_persistence_failed = marker_result.is_err();
-        if state.marker_persistence_failed {
+        if state.marker_persistence_failed || !lease_quiesced || !worker_terminated {
             self.stopping.store(true, Ordering::Release);
         }
         FaultContainment {
@@ -2442,6 +3753,14 @@ impl Supervisor {
                 .state
                 .lock()
                 .map_err(|_| RescueVaultDaemonError::ShutdownFailed)?;
+            let leases = self
+                .leases
+                .lock()
+                .map_err(|_| RescueVaultDaemonError::ShutdownFailed)?;
+            if leases.active.is_some() {
+                return Err(RescueVaultDaemonError::ShutdownFailed);
+            }
+            drop(leases);
             if state.faulted {
                 if !state.fault_marker_required
                     && !state.marker_persistence_failed
@@ -2491,7 +3810,9 @@ fn external_operation_is_enabled(
         kernaid_protocol::rescue_vault::PeerRole::Agent => {
             matches!(
                 operation,
-                Operation::VaultStatus | Operation::ProviderStatus
+                Operation::VaultStatus
+                    | Operation::ProviderStatus
+                    | Operation::ProviderOpenAiBorrow
             )
         }
     }
@@ -2793,10 +4114,11 @@ mod tests {
     use kernaid_protocol::rescue_vault::{API_VERSION, PeerRole, authenticate_seqpacket_peer};
     use rustix::{
         net::{
-            AddressFamily, SendAncillaryBuffer, SendAncillaryMessage, SendFlags, SocketFlags,
-            SocketType, bind, send, sendmsg, socket_with, socketpair,
+            AddressFamily, SendAncillaryBuffer, SendAncillaryMessage, SendFlags, Shutdown,
+            SocketFlags, SocketType, bind, recv, send, sendmsg, shutdown, socket_with, socketpair,
         },
         pipe::{PipeFlags, pipe_with},
+        process::{Pid, PidfdFlags, pidfd_open},
     };
     use std::{
         collections::VecDeque,
@@ -2804,6 +4126,8 @@ mod tests {
         io::IoSlice,
         mem::MaybeUninit,
         os::unix::ffi::OsStringExt,
+        os::unix::thread::JoinHandleExt,
+        process::Command,
         sync::{
             atomic::{AtomicU64, AtomicUsize},
             mpsc,
@@ -2996,6 +4320,19 @@ mod tests {
             response.map(|response| (response, None))
         }
 
+        fn borrow_openai(
+            &self,
+            deadline: Instant,
+        ) -> Result<(internal_wire::WorkerResponse, Option<OwnedFd>), RescueVaultDaemonError>
+        {
+            self.transact(
+                internal_wire::WorkerCommandKind::ProviderOpenAiBorrow,
+                None,
+                None,
+                deadline,
+            )
+        }
+
         fn verify_healthy(&self) -> Result<(), RescueVaultDaemonError> {
             let mut state = self.state.lock().expect("fake worker");
             state.verifies += 1;
@@ -3186,11 +4523,165 @@ mod tests {
                 trace: Arc::clone(&trace),
             })),
             privacy: Arc::clone(&privacy) as Arc<dyn PrivacyBoundary>,
+            leases: Mutex::new(LeaseRegistry::default()),
             faulted: AtomicBool::new(false),
             stopping: Arc::new(AtomicBool::new(false)),
             stop_deadline: Arc::new(Mutex::new(None)),
         });
         (supervisor, runtime, worker, privacy, trace)
+    }
+
+    enum OutputBarrierPhase {
+        PreWorker,
+        WorkerReturnedPreAdopt,
+        ReadyPreScm,
+        PostScmPreLocalDrop,
+    }
+
+    fn install_output_obligated_lease(
+        supervisor: &Supervisor,
+    ) -> (LeaseOutputGuard, OwnedFd, std::process::Child) {
+        let (observer, client) = socketpair(
+            AddressFamily::UNIX,
+            SocketType::SEQPACKET,
+            SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+            None,
+        )
+        .expect("lease Agent socketpair");
+        rustix::io::fcntl_setfd(&client, rustix::io::FdFlags::empty())
+            .expect("make Agent socket inheritable");
+        let child = Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("lease Agent child");
+        rustix::io::fcntl_setfd(&client, rustix::io::FdFlags::CLOEXEC)
+            .expect("restore Agent socket CLOEXEC");
+        drop(client);
+        let pid = Pid::from_raw(i32::try_from(child.id()).expect("child pid range"))
+            .expect("nonzero child pid");
+        let pidfd = pidfd_open(pid, PidfdFlags::NONBLOCK).expect("lease Agent pidfd");
+        let output_state = Arc::new(LeaseOutputState {
+            finalized: AtomicBool::new(false),
+        });
+        supervisor.leases.lock().expect("lease registry").active = Some(ProviderLease {
+            id: 1,
+            socket: observer,
+            pidfd,
+            state: LeaseState::PotentiallyIssued,
+            handoff_deadline: Instant::now() + PROVIDER_BORROW_TIMEOUT,
+            lease_deadline: None,
+            output_obligation: Arc::clone(&output_state),
+        });
+        let (read, write) = pipe_with(PipeFlags::CLOEXEC).expect("credential output pipe");
+        rustix::io::write(&write, b"TEST_ONLY_PROVIDER_KEY").expect("credential bytes");
+        drop(write);
+        (LeaseOutputGuard::new(output_state), read, child)
+    }
+
+    fn assert_lock_waits_for_output_finalization(phase: OutputBarrierPhase) {
+        let mut unlocked = service_state(30, VaultState::Unlocked);
+        unlocked.availability = available(
+            VaultState::Unlocked,
+            Some("KA-0123456789abcdef01234567".to_owned()),
+        );
+        let (supervisor, runtime, worker, _, _) = fake_supervisor(
+            unlocked,
+            [
+                Ok(internal_wire::WorkerResponse::new(
+                    1,
+                    internal_wire::WorkerResultCode::LockSucceeded,
+                )),
+                Ok(internal_wire::WorkerResponse::new(
+                    2,
+                    internal_wire::WorkerResultCode::AttestLocked,
+                )),
+            ],
+            true,
+        );
+        let (mut output, raw_output, mut child) = install_output_obligated_lease(&supervisor);
+        let mut raw_output = Some(raw_output);
+        match phase {
+            OutputBarrierPhase::PreWorker => {
+                drop(raw_output.take());
+            }
+            OutputBarrierPhase::WorkerReturnedPreAdopt => {}
+            OutputBarrierPhase::ReadyPreScm => {
+                output
+                    .adopt(raw_output.take().expect("worker output"))
+                    .expect("single output adoption");
+                assert_eq!(supervisor.finish_provider_borrow_ready(1), Ok(Some(30)));
+            }
+            OutputBarrierPhase::PostScmPreLocalDrop => {
+                output
+                    .adopt(raw_output.take().expect("worker output"))
+                    .expect("single output adoption");
+                assert_eq!(supervisor.finish_provider_borrow_ready(1), Ok(Some(30)));
+                assert!(matches!(
+                    supervisor.send_provider_descriptor(1, || true),
+                    Ok(DescriptorSend::Established)
+                ));
+            }
+        }
+
+        let request = validated_request("vault.lock", serde_json::json!({}), 30, None);
+        let running = Arc::clone(&supervisor);
+        let (result_tx, result_rx) = mpsc::channel();
+        let handler = thread::spawn(move || {
+            result_tx
+                .send(running.handle_request(request, Instant::now()))
+                .expect("lock result");
+        });
+        let child_deadline = Instant::now() + Duration::from_secs(2);
+        while child.try_wait().expect("Agent status").is_none() {
+            assert!(
+                Instant::now() < child_deadline,
+                "lock did not terminate the registered Agent"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(matches!(
+            result_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(worker.lock().expect("worker trace").calls.is_empty());
+        assert_eq!(runtime.lock().expect("runtime trace").disarms, 0);
+        assert!(matches!(
+            supervisor
+                .leases
+                .lock()
+                .expect("lease registry")
+                .active
+                .as_ref(),
+            Some(lease) if lease.state == LeaseState::Revoking
+        ));
+
+        // A worker-returned descriptor not yet adopted is still a supervisor
+        // credential FD and must be closed before the guard publishes.
+        drop(raw_output.take());
+        drop(output);
+        let (version, result) = result_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("lock completion after output finalization");
+        handler.join().expect("lock handler");
+        assert_eq!(version, 32);
+        assert_handler_status(result, VaultState::Locked, None);
+        assert_eq!(
+            worker.lock().expect("worker trace").calls,
+            [
+                internal_wire::WorkerCommandKind::Lock,
+                internal_wire::WorkerCommandKind::AttestQuiescent,
+            ]
+        );
+        let runtime = runtime.lock().expect("runtime trace");
+        assert_eq!((runtime.disarms, runtime.marker), (1, false));
+        assert!(
+            supervisor
+                .leases
+                .lock()
+                .expect("lease registry")
+                .active
+                .is_none()
+        );
     }
 
     fn validated_request_for_role(
@@ -4144,16 +5635,6 @@ mod tests {
             let requests = [
                 (
                     validated_request_for_role(
-                        "provider.openai.borrow",
-                        serde_json::json!({}),
-                        60,
-                        None,
-                        PeerRole::Agent,
-                    ),
-                    None,
-                ),
-                (
-                    validated_request_for_role(
                         "provider.codex.home_lease",
                         serde_json::json!({}),
                         60,
@@ -4283,7 +5764,6 @@ mod tests {
     #[test]
     fn shipping_peer_roles_have_a_closed_operation_surface() {
         let forbidden = [
-            Operation::ProviderOpenAiBorrow,
             Operation::ProviderCodexHomeLease,
             Operation::AuditAppend,
             Operation::ReportPersist,
@@ -4330,6 +5810,14 @@ mod tests {
             Operation::ProviderStatus,
             PeerRole::Agent
         ));
+        assert!(external_operation_is_enabled(
+            Operation::ProviderOpenAiBorrow,
+            PeerRole::Agent
+        ));
+        assert!(!external_operation_is_enabled(
+            Operation::ProviderOpenAiBorrow,
+            PeerRole::Companion
+        ));
         for operation in [
             Operation::VaultUnlock,
             Operation::VaultLock,
@@ -4341,7 +5829,7 @@ mod tests {
     }
 
     #[test]
-    fn dormant_provider_borrow_worker_support_does_not_enable_external_dispatch() {
+    fn provider_borrow_requires_a_live_authenticated_socket_identity() {
         let (supervisor, runtime, worker, privacy, _) = fake_supervisor(
             unlocked_service_state(710),
             [Ok(internal_wire::WorkerResponse::provider_borrow_ready(
@@ -4358,7 +5846,7 @@ mod tests {
         );
         let (version, result) = supervisor.handle_request(request, Instant::now());
         assert_eq!(version, 710);
-        assert_handler_error(result, ErrorToken::NotAuthorized);
+        assert_handler_error(result, ErrorToken::IoFailed);
         assert_eq!(supervisor.snapshot().version, 710);
         let worker = worker.lock().expect("worker trace");
         assert!(worker.calls.is_empty());
@@ -4368,6 +5856,221 @@ mod tests {
         let runtime = runtime.lock().expect("runtime trace");
         assert_eq!((runtime.arms, runtime.disarms), (0, 0));
         assert!(!runtime.marker);
+    }
+
+    #[test]
+    fn companion_provider_borrow_is_rejected_before_pidfd_lease_or_any_effect() {
+        let (supervisor, runtime, worker, privacy, _) = fake_supervisor(
+            unlocked_service_state(710),
+            [Ok(internal_wire::WorkerResponse::provider_borrow_ready(
+                1, 32,
+            ))],
+            true,
+        );
+        let uid = rustix::process::getuid().as_raw();
+        assert_ne!(uid, 0, "role test requires an unprivileged peer");
+        let agent_uid = if uid == 1 { 2 } else { 1 };
+        let allowlist = PeerAllowlist::new(uid, agent_uid).expect("test allowlist");
+        for with_descriptor in [false, true] {
+            let (client, server) = socketpair(
+                AddressFamily::UNIX,
+                SocketType::SEQPACKET,
+                SocketFlags::CLOEXEC,
+                None,
+            )
+            .expect("Companion request socketpair");
+            let request_id = if with_descriptor {
+                "R-00000000-0000-0000-0000-000000000712"
+            } else {
+                "R-00000000-0000-0000-0000-000000000711"
+            };
+            let datagram = serde_json::to_vec(&serde_json::json!({
+                "apiVersion": API_VERSION,
+                "requestId": request_id,
+                "expectedStateVersion": 710,
+                "operation": "provider.openai.borrow",
+                "payload": {},
+            }))
+            .expect("Companion request");
+            let mut descriptor_writer = None;
+            if with_descriptor {
+                let (read, write) = pipe_with(PipeFlags::CLOEXEC).expect("forbidden descriptor");
+                let io = [IoSlice::new(&datagram)];
+                let rights = [read.as_fd()];
+                let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+                let mut ancillary = SendAncillaryBuffer::new(&mut space);
+                assert!(ancillary.push(SendAncillaryMessage::ScmRights(&rights)));
+                assert_eq!(
+                    sendmsg(&client, &io, &mut ancillary, SendFlags::NOSIGNAL)
+                        .expect("Companion descriptor request"),
+                    datagram.len()
+                );
+                drop(read);
+                descriptor_writer = Some(write);
+            } else {
+                assert_eq!(
+                    send(&client, &datagram, SendFlags::NOSIGNAL)
+                        .expect("Companion borrow request"),
+                    datagram.len()
+                );
+            }
+            handle_connection_by(server, allowlist, Arc::clone(&supervisor), false);
+            let mut response = [0_u8; 2048];
+            let (initialized, read) =
+                recv(&client, &mut response, RecvFlags::empty()).expect("authorization response");
+            assert_eq!(initialized, read);
+            assert!(
+                response[..read]
+                    .windows(b"NOT_AUTHORIZED".len())
+                    .any(|window| window == b"NOT_AUTHORIZED"),
+                "Companion borrow was not rejected as unauthorized"
+            );
+            if let Some(writer) = descriptor_writer {
+                assert_pipe_has_no_reader(writer.as_fd());
+            }
+        }
+        assert_eq!(supervisor.snapshot().version, 710);
+        assert!(
+            supervisor
+                .leases
+                .lock()
+                .expect("lease registry")
+                .active
+                .is_none()
+        );
+        let worker = worker.lock().expect("worker trace");
+        assert!(worker.calls.is_empty());
+        assert_eq!(worker.responses.len(), 1);
+        drop(worker);
+        assert_eq!(privacy.checks.load(Ordering::Acquire), 0);
+        let runtime = runtime.lock().expect("runtime trace");
+        assert_eq!((runtime.arms, runtime.disarms), (0, 0));
+        assert!(!runtime.marker);
+    }
+
+    #[test]
+    fn provider_borrow_unconfigured_is_definite_no_secret_and_preserves_version() {
+        let (supervisor, runtime, worker, privacy, _) = fake_supervisor(
+            unlocked_service_state(711),
+            [Ok(internal_wire::WorkerResponse::new(
+                1,
+                internal_wire::WorkerResultCode::ProviderBorrowUnconfigured,
+            ))],
+            true,
+        );
+        let (request, client, server) = validated_request_with_connection_for_role(
+            "provider.openai.borrow",
+            serde_json::json!({}),
+            711,
+            None,
+            PeerRole::Agent,
+        );
+        let (version, result) = supervisor.handle_connected_request(
+            request,
+            Instant::now(),
+            ClientConnection::LeaseTestSocket(server.as_fd()),
+        );
+        assert_eq!(version, 711);
+        assert_handler_error(result, ErrorToken::ProviderUnconfigured);
+        assert_eq!(supervisor.snapshot().version, 711);
+        assert!(
+            supervisor
+                .leases
+                .lock()
+                .expect("lease registry")
+                .active
+                .is_none()
+        );
+        assert_eq!(
+            worker.lock().expect("worker trace").calls,
+            [internal_wire::WorkerCommandKind::ProviderOpenAiBorrow]
+        );
+        assert_eq!(privacy.checks.load(Ordering::Relaxed), 1);
+        let runtime = runtime.lock().expect("runtime trace");
+        assert_eq!((runtime.arms, runtime.disarms), (1, 0));
+        assert!(runtime.marker);
+        drop(client);
+    }
+
+    #[test]
+    fn fault_reservation_wins_before_unconfigured_borrow_completion() {
+        let (supervisor, _, worker, privacy, _) =
+            fake_supervisor(unlocked_service_state(712), [], true);
+        let (output, raw_output, mut child) = install_output_obligated_lease(&supervisor);
+        drop(raw_output);
+        drop(output);
+        {
+            let _decision = supervisor.lifecycle.lock().expect("lifecycle boundary");
+            supervisor.faulted.store(true, Ordering::Release);
+            let mut state = supervisor.state.lock().expect("service state");
+            transition_state_to_fault(&mut state, true);
+        }
+
+        assert_eq!(supervisor.finish_provider_borrow_unconfigured(1), Ok(None));
+        assert!(matches!(
+            supervisor
+                .leases
+                .lock()
+                .expect("lease registry")
+                .active
+                .as_ref(),
+            Some(lease) if lease.state == LeaseState::PotentiallyIssued
+        ));
+        assert!(worker.lock().expect("worker trace").calls.is_empty());
+        assert_eq!(privacy.checks.load(Ordering::Acquire), 0);
+
+        supervisor
+            .revoke_active_lease(Instant::now() + Duration::from_secs(1))
+            .expect("fault owner revokes the retained lease");
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn fault_reservation_wins_before_pending_borrow_cancellation() {
+        let (supervisor, _, worker, privacy, _) =
+            fake_supervisor(unlocked_service_state(713), [], true);
+        let (output, raw_output, mut child) = install_output_obligated_lease(&supervisor);
+        drop(raw_output);
+        drop(output);
+        supervisor
+            .leases
+            .lock()
+            .expect("lease registry")
+            .active
+            .as_mut()
+            .expect("active lease")
+            .state = LeaseState::Pending;
+        {
+            let _decision = supervisor.lifecycle.lock().expect("lifecycle boundary");
+            supervisor.faulted.store(true, Ordering::Release);
+            let mut state = supervisor.state.lock().expect("service state");
+            transition_state_to_fault(&mut state, true);
+        }
+
+        assert!(matches!(
+            supervisor.mark_lease_potentially_issued(1),
+            Ok(PotentialIssue::RevocationInProgress)
+        ));
+        assert!(matches!(
+            supervisor.cancel_pending_lease(1),
+            Ok(PendingCancel::RevocationInProgress)
+        ));
+        assert!(matches!(
+            supervisor
+                .leases
+                .lock()
+                .expect("lease registry")
+                .active
+                .as_ref(),
+            Some(lease) if lease.state == LeaseState::Pending
+        ));
+        assert!(worker.lock().expect("worker trace").calls.is_empty());
+        assert_eq!(privacy.checks.load(Ordering::Acquire), 0);
+
+        supervisor
+            .revoke_active_lease(Instant::now() + Duration::from_secs(1))
+            .expect("fault owner revokes the retained Pending lease");
+        let _ = child.wait();
     }
 
     #[test]
@@ -4778,7 +6481,7 @@ mod tests {
                 unlock_supervisor.handle_request(unlock_request, Instant::now());
             let error = match result {
                 HandlerResult::Error(_, error) => Some(error),
-                HandlerResult::Success(_, _) => None,
+                _ => None,
             };
             unlock_tx.send((version, error)).expect("unlock result");
         });
@@ -5363,5 +7066,299 @@ mod tests {
         assert!(worker.lock().expect("worker trace").calls.is_empty());
         assert!(runtime.lock().expect("runtime trace").marker);
         assert_eq!(post_arm.snapshot().availability, faulted_availability());
+    }
+
+    #[test]
+    fn peer_pidfd_startup_probe_matches_shipping_seqpacket_mechanism() {
+        peer_pidfd_capability_probe().expect("SO_PEERPIDFD seqpacket probe");
+    }
+
+    #[test]
+    fn narrowed_signal_waiter_survives_first_stop_through_startup_attestation() {
+        let mut signals = SigSet::empty();
+        signals.add(Signal::SIGUSR1);
+        signals.thread_block().expect("block test signal");
+        let stop = StopControl::new();
+        let keep_running = Arc::new(AtomicBool::new(true));
+        let keep = Arc::clone(&keep_running);
+        let waiter_stop = stop.clone();
+        let waiter = thread::spawn(move || {
+            run_signal_waiter(signals, waiter_stop, || keep.load(Ordering::Acquire));
+        });
+        nix::sys::pthread::pthread_kill(waiter.as_pthread_t(), Signal::SIGUSR1)
+            .expect("first test signal");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !stop.requested.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "signal waiter did not request stop"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !waiter.is_finished(),
+            "the narrowed task must remain attestable after the first stop signal"
+        );
+        keep_running.store(false, Ordering::Release);
+        nix::sys::pthread::pthread_kill(waiter.as_pthread_t(), Signal::SIGUSR1)
+            .expect("wake test waiter for cleanup");
+        waiter.join().expect("test signal waiter");
+        signals.thread_unblock().expect("unblock test signal");
+    }
+
+    #[test]
+    fn lock_waits_for_output_finalization_before_worker_return() {
+        assert_lock_waits_for_output_finalization(OutputBarrierPhase::PreWorker);
+    }
+
+    #[test]
+    fn lock_waits_for_worker_returned_output_before_adoption_and_finish() {
+        assert_lock_waits_for_output_finalization(OutputBarrierPhase::WorkerReturnedPreAdopt);
+    }
+
+    #[test]
+    fn lock_waits_for_ready_output_before_scm_rights_handoff() {
+        assert_lock_waits_for_output_finalization(OutputBarrierPhase::ReadyPreScm);
+    }
+
+    #[test]
+    fn lock_waits_for_local_output_drop_after_successful_scm_rights_handoff() {
+        assert_lock_waits_for_output_finalization(OutputBarrierPhase::PostScmPreLocalDrop);
+    }
+
+    #[test]
+    fn output_finalization_timeout_faults_and_kills_worker_without_disarm() {
+        let mut unlocked = service_state(40, VaultState::Unlocked);
+        unlocked.availability = available(
+            VaultState::Unlocked,
+            Some("KA-0123456789abcdef01234567".to_owned()),
+        );
+        let (supervisor, runtime, worker, _, trace) = fake_supervisor(unlocked, [], true);
+        let (mut output, raw_output, mut child) = install_output_obligated_lease(&supervisor);
+        output.adopt(raw_output).expect("worker output adoption");
+        assert_eq!(
+            supervisor.revoke_provider_lease(1, Instant::now() + Duration::from_millis(100)),
+            Err(RescueVaultDaemonError::ShutdownFailed)
+        );
+        let containment = supervisor.mark_fault_by(Instant::now() + Duration::from_millis(100));
+        assert!(containment.marker_durable);
+        assert!(!containment.worker_quiesced);
+        assert!(supervisor.stopping.load(Ordering::Acquire));
+        assert_eq!(worker.lock().expect("worker trace").faults, 1);
+        assert_eq!(runtime.lock().expect("runtime trace").disarms, 0);
+        assert!(
+            !trace
+                .lock()
+                .expect("effect trace")
+                .contains(&TraceEvent::WorkerLock)
+        );
+        assert!(matches!(
+            supervisor
+                .leases
+                .lock()
+                .expect("lease registry")
+                .active
+                .as_ref(),
+            Some(lease) if lease.state == LeaseState::Revoking
+        ));
+
+        drop(output);
+        supervisor
+            .revoke_active_lease(Instant::now() + Duration::from_secs(1))
+            .expect("cleanup finalized lease");
+        let _ = child.wait();
+        assert!(
+            supervisor
+                .leases
+                .lock()
+                .expect("lease registry")
+                .active
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn stop_revoker_winning_pending_borrow_remains_a_clean_no_secret_shutdown() {
+        let mut unlocked = service_state(45, VaultState::Unlocked);
+        unlocked.availability = available(
+            VaultState::Unlocked,
+            Some("KA-0123456789abcdef01234567".to_owned()),
+        );
+        let (supervisor, runtime, worker, privacy, _) = fake_supervisor(unlocked, [], true);
+        let (output, raw_output, mut child) = install_output_obligated_lease(&supervisor);
+        drop(raw_output);
+        drop(output);
+        supervisor
+            .leases
+            .lock()
+            .expect("lease registry")
+            .active
+            .as_mut()
+            .expect("active lease")
+            .state = LeaseState::Pending;
+        supervisor.stopping.store(true, Ordering::Release);
+        supervisor
+            .revoke_active_lease(Instant::now() + Duration::from_secs(1))
+            .expect("stop wins Pending revocation");
+        let _ = child.wait();
+
+        assert!(matches!(
+            supervisor.provider_borrow_dispatch_ready(1, &ClientConnection::AssumedLive),
+            Ok(ProviderDispatchArm::RevocationInProgress)
+        ));
+        assert!(matches!(
+            supervisor.mark_lease_potentially_issued(1),
+            Ok(PotentialIssue::RevocationInProgress)
+        ));
+        assert!(worker.lock().expect("worker trace").calls.is_empty());
+        assert_eq!(privacy.checks.load(Ordering::Acquire), 0);
+        assert!(!supervisor.faulted.load(Ordering::Acquire));
+        {
+            let mut runtime = runtime.lock().expect("runtime trace");
+            runtime.marker = true;
+        }
+        supervisor
+            .shutdown(Instant::now() + Duration::from_secs(1))
+            .expect("clean shutdown after Pending revoke");
+        let runtime = runtime.lock().expect("runtime trace");
+        assert_eq!((runtime.disarms, runtime.marker), (1, false));
+        let worker = worker.lock().expect("worker trace");
+        assert_eq!((worker.shutdowns, worker.faults), (1, 0));
+    }
+
+    #[test]
+    fn every_lease_has_a_latch_and_false_issued_or_revoking_latches_block_removal() {
+        let mut unlocked = service_state(50, VaultState::Unlocked);
+        unlocked.availability = available(
+            VaultState::Unlocked,
+            Some("KA-0123456789abcdef01234567".to_owned()),
+        );
+        let (supervisor, _, _, _, _) = fake_supervisor(unlocked, [], true);
+        let (pending_peer, pending_server) = socketpair(
+            AddressFamily::UNIX,
+            SocketType::SEQPACKET,
+            SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+            None,
+        )
+        .expect("pending lease socketpair");
+        let pending_connection = ClientConnection::LeaseTestSocket(pending_server.as_fd());
+        let pending_candidate = pending_connection
+            .lease_candidate()
+            .expect("pending lease candidate");
+        let (_, pending_id) = supervisor
+            .begin_provider_borrow(
+                50,
+                &pending_connection,
+                pending_candidate,
+                Instant::now() + PROVIDER_BORROW_TIMEOUT,
+            )
+            .expect("pending lease");
+        assert!(matches!(
+            supervisor
+                .leases
+                .lock()
+                .expect("lease registry")
+                .active
+                .as_ref(),
+            Some(lease)
+                if lease.state == LeaseState::Pending
+                    && lease.output_obligation.finalized.load(Ordering::Acquire)
+        ));
+        supervisor
+            .cancel_pending_lease(pending_id)
+            .expect("cancel definite-no-secret pending lease");
+        drop(pending_peer);
+        drop(pending_server);
+        let (socket, _peer) = socketpair(
+            AddressFamily::UNIX,
+            SocketType::SEQPACKET,
+            SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+            None,
+        )
+        .expect("lease socketpair");
+        let (pidfd, _writer) = pipe_with(PipeFlags::CLOEXEC).expect("placeholder pidfd");
+        let output_obligation = Arc::new(LeaseOutputState {
+            finalized: AtomicBool::new(false),
+        });
+        supervisor.leases.lock().expect("lease registry").active = Some(ProviderLease {
+            id: 1,
+            socket,
+            pidfd,
+            state: LeaseState::Established,
+            handoff_deadline: Instant::now() + PROVIDER_BORROW_TIMEOUT,
+            lease_deadline: Some(Instant::now() + PROVIDER_LEASE_TIMEOUT),
+            output_obligation,
+        });
+        assert_eq!(
+            supervisor.complete_normal_lease(1),
+            Err(RescueVaultDaemonError::PersistentFault)
+        );
+        assert!(
+            supervisor
+                .leases
+                .lock()
+                .expect("lease registry")
+                .active
+                .is_some()
+        );
+        supervisor
+            .leases
+            .lock()
+            .expect("lease registry")
+            .active
+            .as_mut()
+            .expect("active lease")
+            .state = LeaseState::Revoking;
+        assert_eq!(supervisor.complete_normal_lease(1), Ok(()));
+        assert!(
+            supervisor
+                .leases
+                .lock()
+                .expect("lease registry")
+                .active
+                .is_some(),
+            "a Revoking lease is removed only by triple-factor revocation"
+        );
+    }
+
+    #[test]
+    fn lease_release_requires_full_hup_not_only_peer_write_half_close() {
+        let (observer, client) = socketpair(
+            AddressFamily::UNIX,
+            SocketType::SEQPACKET,
+            SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+            None,
+        )
+        .expect("lease socketpair");
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "sleep 0.05"])
+            .spawn()
+            .expect("short child");
+        let pid = Pid::from_raw(i32::try_from(child.id()).expect("child pid range"))
+            .expect("nonzero child pid");
+        let pidfd = pidfd_open(pid, PidfdFlags::NONBLOCK).expect("test pidfd");
+        shutdown(&client, Shutdown::Write).expect("peer write-half close");
+        child.wait().expect("child exit");
+        let first_deadline = Instant::now() + Duration::from_millis(100);
+        let snapshot = LeaseSnapshot {
+            id: 1,
+            socket: observer,
+            pidfd,
+            deadline: first_deadline,
+            output_obligation: Arc::new(LeaseOutputState {
+                finalized: AtomicBool::new(true),
+            }),
+        };
+        assert_eq!(
+            wait_for_lease_evidence(&snapshot, first_deadline),
+            Ok(LeaseWait::Deadline),
+            "RDHUP plus pidfd exit must not release a still-open peer descriptor"
+        );
+        drop(client);
+        let final_deadline = Instant::now() + Duration::from_secs(1);
+        assert_eq!(
+            wait_for_lease_evidence(&snapshot, final_deadline),
+            Ok(LeaseWait::Released)
+        );
     }
 }

@@ -91,13 +91,14 @@ def response(
 
 def runtime_line(stage: str, mapper_count: int) -> bytes:
     zero = controller.ZERO_CAPS
-    cap = controller.CAP_SYS_ADMIN_ONLY
+    service_cap = controller.CAP_SYS_ADMIN_AND_KILL
+    worker_cap = controller.CAP_SYS_ADMIN_ONLY
     return (
         f"KERNAID_VAULT_RUNTIME_V1 stage={stage} service_pid=101 worker_pid=102 "
         "worker_ppid=101 "
         "invocation_id=0123456789abcdef0123456789abcdef "
-        f"service_caps={zero}:{cap}:{cap}:{cap} "
-        f"worker_caps={zero}:{cap}:{cap}:{cap} "
+        f"service_caps={zero}:{service_cap}:{service_cap}:{service_cap} "
+        f"worker_caps={zero}:{worker_cap}:{worker_cap}:{worker_cap} "
         f"service_ambient={zero} worker_ambient={zero} "
         "service_nnp=1 worker_nnp=1 service_core=0:0 worker_core=0:0 "
         "systemd_control_group=unit service_cgroup=supervisor "
@@ -646,6 +647,176 @@ class ResponseParserTests(unittest.TestCase):
                     block, command="unlock", return_code=1
                 )
 
+    def test_provider_companion_parser_is_exact_and_boot_prior_is_correlated(self) -> None:
+        configured = controller.ProviderCompanionResponse(
+            16, "configured", "unconfigured", None, 0
+        )
+        self.assertEqual(
+            controller.parse_provider_companion_response(
+                b"READY\nOpenAI API key: \nstateVersion: 16\n"
+                b"openai: configured\ncodex: unconfigured\n",
+                command="openai-configure",
+                return_code=0,
+            ),
+            configured,
+        )
+        self.assertEqual(
+            controller.parse_provider_companion_response(
+                b"stateVersion: 0\nvaultState: faulted-reboot-required\n"
+                b"error: REBOOT_REQUIRED\n",
+                command="provider-status",
+                return_code=1,
+            ),
+            controller.ProviderCompanionResponse(
+                0, None, None, "REBOOT_REQUIRED", 1
+            ),
+        )
+        for invalid_fault in (
+            b"stateVersion: 0\nerror: REBOOT_REQUIRED\n",
+            b"stateVersion: 0\nvaultState: faulted-reboot-required\n",
+            b"stateVersion: 0\nerror: REBOOT_REQUIRED\n"
+            b"vaultState: faulted-reboot-required\n",
+            b"stateVersion: 0\nvaultState: faulted-reboot-required\n"
+            b"error: OTHER\n",
+        ):
+            with self.subTest(invalid_fault=invalid_fault), self.assertRaises(
+                controller.ClosedFailure
+            ):
+                controller.parse_provider_companion_response(
+                    invalid_fault,
+                    command="provider-status",
+                    return_code=1,
+                )
+        with self.assertRaises(controller.ClosedFailure):
+            controller.parse_provider_companion_response(
+                b"stateVersion: 0\nvaultState: faulted-reboot-required\n"
+                b"error: REBOOT_REQUIRED\n",
+                command="provider-status",
+                return_code=2,
+            )
+        unlocked = response(
+            14, "unlocked", "KA-0123456789abcdef01234567"
+        )
+        for boot, prior_state in ((1, "unconfigured"), (2, "configured")):
+            with self.subTest(boot=boot):
+                controller.validate_provider_configuration(
+                    unlocked,
+                    controller.ProviderCompanionResponse(
+                        14, prior_state, "unconfigured", None, 0
+                    ),
+                    configured,
+                    configured,
+                    boot,
+                )
+        with self.assertRaises(controller.ClosedFailure):
+            controller.validate_provider_configuration(
+                unlocked,
+                controller.ProviderCompanionResponse(
+                    14, "unconfigured", "unconfigured", None, 0
+                ),
+                configured,
+                configured,
+                2,
+            )
+
+    def test_clean_provider_lifecycle_versions_lock_after_configure(self) -> None:
+        device_id = "KA-0123456789abcdef01234567"
+        initial = response(10, "locked")
+        wrong = response(12, error="BAD_PASSPHRASE", return_code=1)
+        after_wrong = response(12, "locked")
+        unlocked = response(14, "unlocked", device_id)
+        prior = controller.ProviderCompanionResponse(
+            14, "unconfigured", "unconfigured", None, 0
+        )
+        configured = controller.ProviderCompanionResponse(
+            16, "configured", "unconfigured", None, 0
+        )
+        locked = response(18, "locked")
+        self.assertEqual(
+            controller.validate_clean_provider_lifecycle(
+                initial,
+                wrong,
+                after_wrong,
+                unlocked,
+                unlocked,
+                prior,
+                configured,
+                configured,
+                locked,
+                locked,
+                1,
+            ),
+            device_id,
+        )
+        with self.assertRaises(controller.ClosedFailure):
+            controller.validate_clean_provider_lifecycle(
+                initial,
+                wrong,
+                after_wrong,
+                unlocked,
+                unlocked,
+                prior,
+                configured,
+                configured,
+                response(16, "locked"),
+                response(16, "locked"),
+                1,
+            )
+
+    def test_fault_epoch_statuses_must_match_without_mutation(self) -> None:
+        device_id = "KA-0123456789abcdef01234567"
+        lifecycle = (
+            response(10, "locked"),
+            response(12, error="BAD_PASSPHRASE", return_code=1),
+            response(12, "locked"),
+            response(14, "unlocked", device_id),
+            response(14, "unlocked", device_id),
+            controller.ProviderCompanionResponse(
+                14, "configured", "unconfigured", None, 0
+            ),
+            controller.ProviderCompanionResponse(
+                16, "configured", "unconfigured", None, 0
+            ),
+            controller.ProviderCompanionResponse(
+                16, "configured", "unconfigured", None, 0
+            ),
+            response(0, "faulted-reboot-required"),
+        )
+        self.assertEqual(
+            controller.validate_provider_fault_lifecycle(
+                *lifecycle,
+                controller.ProviderCompanionResponse(
+                    0, None, None, "REBOOT_REQUIRED", 1
+                ),
+                2,
+            ),
+            device_id,
+        )
+        with self.assertRaises(controller.ClosedFailure) as failure:
+            controller.validate_provider_fault_lifecycle(
+                *lifecycle,
+                controller.ProviderCompanionResponse(
+                    1, None, None, "REBOOT_REQUIRED", 1
+                ),
+                2,
+            )
+        self.assertEqual(failure.exception.code, "persistent-fault-invalid")
+
+    def test_boot_attestation_separates_clean_and_fault_epochs(self) -> None:
+        device_id = "KA-0123456789abcdef01234567"
+        clean = controller.boot_attestation("bios", 1, 10, 16, 18, device_id)
+        self.assertIn("terminal=clean-lock", clean)
+        self.assertIn("hold_killed_vaultd=false", clean)
+        self.assertIn("pre_terminal_daemon_stable=true", clean)
+        self.assertNotIn(" daemon_stable=true", clean)
+        fault = controller.boot_attestation("uefi", 2, 10, 16, 0, device_id)
+        self.assertIn("terminal=persistent-fault", fault)
+        self.assertIn("hold_killed_vaultd=true", fault)
+        self.assertIn("pre_terminal_caps_stable=true", fault)
+        self.assertNotIn(" caps_stable=true", fault)
+        with self.assertRaises(controller.ClosedFailure):
+            controller.boot_attestation("bios", 1, 10, 16, 0, device_id)
+
     def test_lifecycle_requires_exact_plus_two_and_stable_device_id(self) -> None:
         device_id = "KA-0123456789abcdef01234567"
         observed = controller.validate_lifecycle(
@@ -813,17 +984,17 @@ time.sleep(30)
                 path.mkdir(parents=True, exist_ok=True)
 
             zero = controller.ZERO_CAPS
-            cap = controller.CAP_SYS_ADMIN_ONLY
-
-            def write_process(pid: int, parent: int, membership: str) -> None:
+            def write_process(
+                pid: int, parent: int, membership: str, capability: str
+            ) -> None:
                 (proc / str(pid) / "status").write_text(
                     "\n".join(
                         (
                             f"PPid:\t{parent}",
                             f"CapInh:\t{zero}",
-                            f"CapPrm:\t{cap}",
-                            f"CapEff:\t{cap}",
-                            f"CapBnd:\t{cap}",
+                            f"CapPrm:\t{capability}",
+                            f"CapEff:\t{capability}",
+                            f"CapBnd:\t{capability}",
                             f"CapAmb:\t{zero}",
                             "NoNewPrivs:\t1",
                         )
@@ -843,11 +1014,13 @@ time.sleep(30)
                 101,
                 1,
                 "0::/system.slice/kernaid-rescue-vaultd.service/supervisor",
+                controller.CAP_SYS_ADMIN_AND_KILL,
             )
             write_process(
                 102,
                 101,
                 "0::/system.slice/kernaid-rescue-vaultd.service/worker",
+                controller.CAP_SYS_ADMIN_ONLY,
             )
             (proc / "self" / "mountinfo").write_text("", encoding="ascii")
             (proc / "swaps").write_text(
@@ -994,7 +1167,7 @@ printf '%s\n' 102
         self.assertEqual(snapshot.stage, "initial")
 
         excess = valid.replace(
-            controller.CAP_SYS_ADMIN_ONLY.encode("ascii"),
+            controller.CAP_SYS_ADMIN_AND_KILL.encode("ascii"),
             b"0000000000600000",
             1,
         )
@@ -1009,7 +1182,9 @@ printf '%s\n' 102
 
     def test_runtime_parser_rejects_excess_capabilities_and_shell_mount(self) -> None:
         line = runtime_line("initial", 0).replace(
-            controller.CAP_SYS_ADMIN_ONLY.encode("ascii"), b"0000000000600000", 1
+            controller.CAP_SYS_ADMIN_AND_KILL.encode("ascii"),
+            b"0000000000600000",
+            1,
         )
         with self.assertRaises(controller.ClosedFailure) as failure:
             controller.parse_runtime_snapshot(line, "initial")
@@ -1024,7 +1199,8 @@ printf '%s\n' 102
     def test_runtime_rejection_classifier_covers_every_emitted_field(self) -> None:
         valid = runtime_line("initial", 0)
         zero = controller.ZERO_CAPS.encode("ascii")
-        cap = controller.CAP_SYS_ADMIN_ONLY.encode("ascii")
+        service_cap = controller.CAP_SYS_ADMIN_AND_KILL.encode("ascii")
+        worker_cap = controller.CAP_SYS_ADMIN_ONLY.encode("ascii")
         mutations = [
             (b"stage=initial", b"stage=other", "stage-invalid"),
             (b"service_pid=101", b"service_pid=0", "service-pid-invalid"),
@@ -1041,12 +1217,14 @@ printf '%s\n' 102
                 "invocation-id-invalid",
             ),
             (
-                b"service_caps=" + b":".join((zero, cap, cap, cap)),
+                b"service_caps="
+                + b":".join((zero, service_cap, service_cap, service_cap)),
                 b"service_caps=invalid",
                 "service-capabilities-invalid",
             ),
             (
-                b"worker_caps=" + b":".join((zero, cap, cap, cap)),
+                b"worker_caps="
+                + b":".join((zero, worker_cap, worker_cap, worker_cap)),
                 b"worker_caps=invalid",
                 "worker-capabilities-invalid",
             ),
@@ -1452,6 +1630,7 @@ class SanitizedOutputTests(unittest.TestCase):
     def test_main_mock_never_emits_secret_or_qemu_data(self) -> None:
         correct_raw = b"0123456789abcdef" * 4
         wrong_raw = b"fedcba9876543210" * 4
+        provider_raw = b"abcdef0123456789" * 4
         fake_qmp = mock.Mock()
         fake_harness = mock.Mock()
         fake_harness.start.return_value = (mock.Mock(), fake_qmp)
@@ -1461,6 +1640,7 @@ class SanitizedOutputTests(unittest.TestCase):
             correct_key_fd=3,
             wrong_key_fd=4,
             login_credential_fd=5,
+            provider_key_fd=7,
             owned_pgid_fd=6,
             qmp_socket=Path("/tmp/qmp-test.sock"),
             timeout=1200,
@@ -1475,7 +1655,11 @@ class SanitizedOutputTests(unittest.TestCase):
             mock.patch.object(
                 controller,
                 "read_secret_fd",
-                side_effect=[bytearray(correct_raw), bytearray(wrong_raw)],
+                side_effect=[
+                    bytearray(correct_raw),
+                    bytearray(wrong_raw),
+                    bytearray(provider_raw),
+                ],
             ),
             mock.patch.object(
                 controller,
@@ -1486,7 +1670,7 @@ class SanitizedOutputTests(unittest.TestCase):
             mock.patch.object(
                 controller,
                 "run_lifecycle",
-                return_value=(10, 16, "KA-0123456789abcdef01234567"),
+                return_value=(10, 16, 18, "KA-0123456789abcdef01234567"),
             ),
             contextlib.redirect_stdout(stdout),
             contextlib.redirect_stderr(stderr),
@@ -1495,6 +1679,7 @@ class SanitizedOutputTests(unittest.TestCase):
         combined = (stdout.getvalue() + stderr.getvalue()).encode("ascii")
         self.assertNotIn(correct_raw, combined)
         self.assertNotIn(wrong_raw, combined)
+        self.assertNotIn(provider_raw, combined)
         self.assertNotIn(login_credential, combined)
         self.assertEqual(stderr.getvalue(), "")
         self.assertRegex(
@@ -1508,6 +1693,7 @@ class SanitizedOutputTests(unittest.TestCase):
     def test_cleanup_failure_dominates_a_success_attestation(self) -> None:
         correct_raw = b"0123456789abcdef" * 4
         wrong_raw = b"fedcba9876543210" * 4
+        provider_raw = b"abcdef0123456789" * 4
         fake_harness = mock.Mock()
         fake_harness.start.return_value = (mock.Mock(), mock.Mock())
         fake_harness.cleanup.side_effect = controller.ClosedFailure(
@@ -1519,6 +1705,7 @@ class SanitizedOutputTests(unittest.TestCase):
             correct_key_fd=3,
             wrong_key_fd=4,
             login_credential_fd=5,
+            provider_key_fd=7,
             owned_pgid_fd=6,
             qmp_socket=Path("/tmp/qmp-test.sock"),
             timeout=1200,
@@ -1533,7 +1720,11 @@ class SanitizedOutputTests(unittest.TestCase):
             mock.patch.object(
                 controller,
                 "read_secret_fd",
-                side_effect=[bytearray(correct_raw), bytearray(wrong_raw)],
+                side_effect=[
+                    bytearray(correct_raw),
+                    bytearray(wrong_raw),
+                    bytearray(provider_raw),
+                ],
             ),
             mock.patch.object(
                 controller,
@@ -1544,7 +1735,7 @@ class SanitizedOutputTests(unittest.TestCase):
             mock.patch.object(
                 controller,
                 "run_lifecycle",
-                return_value=(10, 16, "KA-0123456789abcdef01234567"),
+                return_value=(10, 16, 18, "KA-0123456789abcdef01234567"),
             ),
             contextlib.redirect_stdout(stdout),
             contextlib.redirect_stderr(stderr),
@@ -1761,6 +1952,55 @@ class LoopDetachTests(unittest.TestCase):
 
 class StaticContractTests(unittest.TestCase):
 
+    def test_provider_guest_proofs_are_closed_bounded_and_role_separated(self) -> None:
+        normal = controller._socket_probe_source(
+            "normal-release",
+            controller.PROVIDER_LEASE_PROBE_SOCKET,
+            b"NORMAL\n",
+            b"KERNAID_PROVIDER_LEASE_PROBE_NORMAL_V1 "
+            b"borrowed=true unread=true\n",
+        ).decode("ascii")
+        self.assertIn("connection.sendall(b'NORMAL\\n')", normal)
+        self.assertIn("connection.shutdown(socket.SHUT_WR)", normal)
+        self.assertIn("kernaid-provider-lease-probe@.service", normal)
+        self.assertIn("kernaid-rescue-vaultd.service", normal)
+
+        status = controller._production_status_probe_source().decode("ascii")
+        self.assertIn(controller.PROVIDER_STATUS_PROBE_SOCKET, status)
+        self.assertIn("connection.sendall(b'STATUS\\n')", status)
+        self.assertIn("kernaid-rescue-openai-executor@.service", status)
+        self.assertIn("kernaid-rescue-openai-egress.service", status)
+        self.assertIn('!=b"inactive"', status)
+
+        hold = controller._hold_probe_source(101, 102).decode("ascii")
+        self.assertIn('connection.sendall(b"HOLD\\n")', hold)
+        self.assertLess(
+            hold.index("hold_started=time.monotonic()"),
+            hold.index('connection.sendall(b"HOLD\\n")'),
+        )
+        self.assertIn(
+            "while True:\n"
+            "        chunk=connection.recv(256)\n"
+            "        if not chunk:\n"
+            "            break\n"
+            "        raise RuntimeError()\n"
+            "    if time.monotonic()-hold_started<15.0:\n"
+            "        raise RuntimeError()",
+            hold,
+        )
+        self.assertIn("InvocationID", hold)
+        self.assertIn("MainPID", hold)
+        self.assertIn("/run/credentials", hold)
+        for prefix in controller.TEST_CREDENTIAL_PREFIXES:
+            self.assertIn(prefix, hold)
+        for path in (
+            controller.PROVIDER_STATUS_PROBE_SOCKET,
+            controller.PROVIDER_LEASE_PROBE_SOCKET,
+            controller.PROVIDER_LEASE_KILL_SOCKET,
+        ):
+            self.assertIn(path, hold)
+        self.assertNotIn("api_key", normal.lower() + status.lower() + hold.lower())
+
     def test_new_shell_is_syntactically_valid_and_scope_is_separate(self) -> None:
         subprocess.run(["bash", "-n", SCRIPT], check=True)
         shell = SCRIPT.read_text(encoding="utf-8")
@@ -1772,6 +2012,8 @@ class StaticContractTests(unittest.TestCase):
         self.assertIn('3<"$correct_key" 4<"$wrong_key"', shell)
         self.assertIn("--login-credential-fd 5", shell)
         self.assertIn('5<"$login_credential"', shell)
+        self.assertIn("--provider-key-fd 7", shell)
+        self.assertIn('7<"$provider_key"', shell)
         self.assertIn("unsquashfs -cat", shell)
         self.assertIn("0030-user-setup", shell)
         self.assertIn("squashfs-tools", shell)
@@ -1780,8 +2022,19 @@ class StaticContractTests(unittest.TestCase):
         self.assertIn('6<"$loop_device" 7<"$expected_backing"', shell)
         self.assertNotIn("losetup -d --", shell)
         self.assertIn("--timeout 1200", shell)
+        self.assertEqual(shell.count("    -nic none\n"), 1)
         self.assertIn('kill -s "$signal_name" "$controller_pid"', shell)
-        self.assertNotIn("-fw_cfg", shell)
+        self.assertIn(
+            "-fw_cfg \"name=opt/io.systemd.credentials/provider-lease-probe,"
+            "file=$provider_probe_helper\"",
+            shell,
+        )
+        self.assertIn("provider-probe-in-iso", shell)
+        self.assertIn("provider-probe-in-squashfs", shell)
+        self.assertIn(
+            "23470d54d04fd4d025988e9fabf7401b12c9157c6d58162295c01817c103a08f",
+            shell,
+        )
         self.assertNotIn('sha256_file "$correct_key"', shell)
         self.assertNotIn('sha256_file "$wrong_key"', shell)
         sources = shell + python + Path(__file__).read_text(encoding="utf-8")

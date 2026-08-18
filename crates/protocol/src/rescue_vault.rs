@@ -97,7 +97,8 @@ impl PeerAllowlist {
 /// Role derived exclusively from a kernel-authenticated peer UID.
 ///
 /// The protocol retains future Agent audit/report shapes, while the shipping
-/// Rescue daemon further restricts its OpenAI Agent UID to status operations.
+/// Rescue daemon further restricts its OpenAI Agent UID to status plus one
+/// leased OpenAI credential borrow operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PeerRole {
     Companion,

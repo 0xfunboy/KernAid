@@ -1,7 +1,8 @@
 [Unit]
 Description=KernAid Rescue OpenAI one-request executor
-Requires=kernaid-rescue-openai-executor.socket kernaid-rescue-vaultd.socket systemd-sysusers.service
-After=kernaid-rescue-openai-executor.socket kernaid-rescue-vaultd.socket systemd-sysusers.service
+Requires=kernaid-rescue-openai-executor.socket kernaid-rescue-openai-egress.socket kernaid-rescue-vaultd.socket systemd-sysusers.service
+BindsTo=kernaid-rescue-vaultd.service
+After=kernaid-rescue-openai-executor.socket kernaid-rescue-openai-egress.socket kernaid-rescue-vaultd.socket kernaid-rescue-vaultd.service systemd-sysusers.service
 CollectMode=inactive-or-failed
 ConditionKernelCommandLine=boot=live
 ConditionPathIsDirectory=/run/live/medium
@@ -9,9 +10,9 @@ ConditionPathIsDirectory=/run/live/medium
 [Service]
 Type=simple
 ExecStart=/usr/lib/kernaid/kernaid-rescue-openai-executor
-RuntimeMaxSec=5s
+RuntimeMaxSec=145s
 TimeoutStartSec=5s
-TimeoutStopSec=1s
+TimeoutStopSec=10s
 Restart=no
 StandardInput=socket
 StandardOutput=null

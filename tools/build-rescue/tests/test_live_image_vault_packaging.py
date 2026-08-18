@@ -28,6 +28,17 @@ BINARY_VERIFIER = REPO_DIR / "tools/build-rescue/verify-shipping-binary.py"
 DAEMON_SERVER = REPO_DIR / "crates/rescue-secrets/src/rescue_daemon/server.rs"
 DAEMON_RUNTIME = REPO_DIR / "crates/rescue-secrets/src/rescue_daemon/runtime.rs"
 COMPANION = REPO_DIR / "crates/rescue-secrets/src/rescue_daemon/companion.rs"
+PROBE_HELPER = REPO_DIR / "tools/build-rescue/provider-lease-probe.py"
+PROBE_MARKER = "/run/kernaid-rescue-vault/provider-lease-probe-validated-v1"
+LIFECYCLE_MARKER = "/run/kernaid-rescue-vault/lifecycle-active-v1"
+PROBE_UNITS = (
+    "kernaid-provider-executor-status-probe.socket",
+    "kernaid-provider-executor-status-probe@.service",
+    "kernaid-provider-lease-probe.socket",
+    "kernaid-provider-lease-probe@.service",
+    "kernaid-provider-lease-kill-vaultd.socket",
+    "kernaid-provider-lease-kill-vaultd@.service",
+)
 
 DEFAULT_LIVE_GROUPS = (
     "audio,cdrom,dip,floppy,video,plugdev,netdev,powerdev,scanner,bluetooth"
@@ -170,7 +181,8 @@ class VaultSystemdPackagingTests(unittest.TestCase):
             "ProtectHostname": "yes",
             "ProtectControlGroups": "no",
             "ReadWritePaths": "-/run/kernaid /run/lock -/run/cryptsetup",
-            "CapabilityBoundingSet": "CAP_SYS_ADMIN",
+            "CapabilityBoundingSet": "CAP_SYS_ADMIN CAP_KILL CAP_SETPCAP",
+            "AmbientCapabilities": "",
             "RestrictAddressFamilies": "AF_UNIX",
             "RestrictRealtime": "yes",
             "LockPersonality": "yes",
@@ -210,8 +222,13 @@ class VaultSystemdPackagingTests(unittest.TestCase):
         unit = sections["Unit"]
         self.assertEqual(
             set(unit["Requires"].split()),
-            {"kernaid-ui.service", "kernaid-rescue-vaultd.service"},
+            {
+                "kernaid-ui.service",
+                "kernaid-rescue-openai-egress.socket",
+                "kernaid-rescue-vaultd.service",
+            },
         )
+        self.assertIn("kernaid-rescue-openai-egress.socket", unit["After"].split())
         self.assertIn("kernaid-rescue-vaultd.service", unit["After"].split())
 
     def test_runtime_ownership_does_not_tmpfiles_manage_the_fault_marker(self) -> None:
@@ -219,6 +236,30 @@ class VaultSystemdPackagingTests(unittest.TestCase):
         text = TMPFILES.read_text(encoding="utf-8")
         self.assertNotIn("kernaid-rescue-vault", text)
         self.assertNotIn("lifecycle-active-v1", text)
+
+    def test_qemu_lease_probe_is_runtime_credential_only_and_marker_separated(self) -> None:
+        ready = READY_CHECK.read_text(encoding="utf-8")
+        hook = SAFETY_HOOK.read_text(encoding="utf-8")
+        build = BUILD_SCRIPT.read_text(encoding="utf-8")
+        self.assertTrue(PROBE_HELPER.is_file())
+        self.assertEqual(list(LIVE_ROOT.rglob(PROBE_HELPER.name)), [])
+        self.assertNotIn(PROBE_HELPER.name, build)
+        self.assertIn(PROBE_MARKER, ready)
+        self.assertNotIn(LIFECYCLE_MARKER, ready)
+        self.assertNotIn(PROBE_MARKER, TMPFILES.read_text(encoding="utf-8"))
+        self.assertNotIn(LIFECYCLE_MARKER, TMPFILES.read_text(encoding="utf-8"))
+        for name in PROBE_UNITS:
+            unit = SYSTEMD / name
+            self.assertTrue(unit.is_file())
+            self.assertIn(f"/etc/systemd/system/{name}", hook)
+            self.assertNotIn(f"systemctl enable {name}", hook)
+            self.assertNotIn("[Install]", unit.read_text(encoding="utf-8"))
+        kill = (SYSTEMD / "kernaid-provider-lease-kill-vaultd@.service").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(f"ConditionPathExists={LIFECYCLE_MARKER}", kill)
+        self.assertIn(f"ConditionPathExists={PROBE_MARKER}", kill)
+        self.assertNotEqual(PROBE_MARKER, LIFECYCLE_MARKER)
 
 
 class VaultLivePolicyTests(unittest.TestCase):

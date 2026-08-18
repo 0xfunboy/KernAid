@@ -13,6 +13,134 @@ fail() {
     exit 1
 }
 
+provider_probe_raw=/sys/firmware/qemu_fw_cfg/by_name/opt/io.systemd.credentials/provider-lease-probe/raw
+provider_probe_system=/run/credentials/@system/provider-lease-probe
+provider_probe_marker=/run/kernaid-rescue-vault/provider-lease-probe-validated-v1
+provider_probe_enabled=0
+raw_present=0
+system_present=0
+if [ -e "$provider_probe_raw" ] || [ -L "$provider_probe_raw" ]; then
+    raw_present=1
+fi
+if [ -e "$provider_probe_system" ] || [ -L "$provider_probe_system" ]; then
+    system_present=1
+fi
+if [ "$raw_present" != "$system_present" ]; then
+    fail "QEMU provider probe credential is only partially imported"
+fi
+if [ "$raw_present" = "1" ]; then
+    if ! python3 - "$provider_probe_raw" "$provider_probe_system" "$provider_probe_marker" <<'PY'
+import hashlib
+import os
+import stat
+import sys
+
+EXPECTED_SIZE = 15508
+EXPECTED_SHA256 = "23470d54d04fd4d025988e9fabf7401b12c9157c6d58162295c01817c103a08f"
+MARKER = b"v1\n"
+
+
+def pinned_read(path: str) -> bytes:
+    before = os.lstat(path)
+    descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        after = os.fstat(descriptor)
+        if (
+            (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+            or not stat.S_ISREG(after.st_mode)
+            or after.st_uid != 0
+            or after.st_gid != 0
+            or after.st_nlink != 1
+            or stat.S_IMODE(after.st_mode) & 0o222
+            or after.st_size != EXPECTED_SIZE
+        ):
+            raise RuntimeError
+        chunks = bytearray()
+        while len(chunks) <= EXPECTED_SIZE:
+            block = os.read(descriptor, EXPECTED_SIZE + 1 - len(chunks))
+            if not block:
+                break
+            chunks.extend(block)
+        if len(chunks) != EXPECTED_SIZE:
+            raise RuntimeError
+        value = bytes(chunks)
+        chunks[:] = b"\0" * len(chunks)
+        if hashlib.sha256(value).hexdigest() != EXPECTED_SHA256:
+            raise RuntimeError
+        return value
+    finally:
+        os.close(descriptor)
+
+
+def create_or_validate_marker(path: str) -> None:
+    directory_path, name = os.path.split(path)
+    directory = os.open(
+        directory_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    )
+    try:
+        metadata = os.fstat(directory)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != 0
+            or metadata.st_gid != 0
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+        ):
+            raise RuntimeError
+        try:
+            marker = os.open(
+                name,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | os.O_CLOEXEC
+                | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=directory,
+            )
+            try:
+                if os.write(marker, MARKER) != len(MARKER):
+                    raise RuntimeError
+                os.fchmod(marker, 0o600)
+            finally:
+                os.close(marker)
+        except FileExistsError:
+            pass
+        marker = os.open(
+            name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=directory
+        )
+        try:
+            metadata = os.fstat(marker)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != 0
+                or metadata.st_gid != 0
+                or metadata.st_nlink != 1
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+                or metadata.st_size != len(MARKER)
+                or os.read(marker, len(MARKER) + 1) != MARKER
+            ):
+                raise RuntimeError
+        finally:
+            os.close(marker)
+    finally:
+        os.close(directory)
+
+
+try:
+    raw = pinned_read(sys.argv[1])
+    imported = pinned_read(sys.argv[2])
+    if raw != imported:
+        raise RuntimeError
+    create_or_validate_marker(sys.argv[3])
+except BaseException:
+    raise SystemExit(1)
+PY
+    then
+        fail "QEMU provider probe credential failed its pinned content gate"
+    fi
+    provider_probe_enabled=1
+fi
+
 test "$(id -u kernaid 2>/dev/null)" = "1000" || fail "live user is not exact UID 1000"
 id -nG kernaid 2>/dev/null | tr ' ' '\n' | grep -Fxq kernaid-vault \
     || fail "live user is not a kernaid-vault member"
@@ -21,14 +149,30 @@ if id -nG kernaid 2>/dev/null | tr ' ' '\n' | grep -Fxq kernaid-provider-client;
 fi
 openai_identity="$(getent passwd kernaid-openai | awk -F: 'NF == 7 && $1 == "kernaid-openai" && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ && $3 == $4 && $3 != 0 && $3 != 1000 && $6 == "/nonexistent" && $7 == "/usr/sbin/nologin" { print $3 ":" $4 }')"
 test -n "$openai_identity" || fail "OpenAI Agent identity is missing or unsafe"
+openai_group_id="${openai_identity#*:}"
+getent group kernaid-openai | awk -F: -v gid="$openai_group_id" 'NF == 4 && $1 == "kernaid-openai" && $3 == gid && $4 == "" { found = 1 } END { exit !found }' \
+    || fail "OpenAI Agent group has an unsafe identity or supplementary member"
+getent passwd | awk -F: -v gid="$openai_group_id" '$4 == gid { count += 1; if ($1 != "kernaid-openai") bad = 1 } END { exit !(count == 1 && !bad) }' \
+    || fail "OpenAI Agent group authorizes another primary identity"
+if id -nG kernaid 2>/dev/null | tr ' ' '\n' | grep -Fxq kernaid-openai; then
+    fail "live user unexpectedly has OpenAI egress access"
+fi
+egress_identity="$(getent passwd kernaid-openai-egress | awk -F: 'NF == 7 && $1 == "kernaid-openai-egress" && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ && $3 == $4 && $3 != 0 && $3 != 1000 && $6 == "/nonexistent" && $7 == "/usr/sbin/nologin" { print $3 ":" $4 }')"
+test -n "$egress_identity" || fail "OpenAI egress proxy identity is missing or unsafe"
+test "$egress_identity" != "$openai_identity" || fail "OpenAI Agent and egress proxy identities are not distinct"
 id -nG kernaid-openai 2>/dev/null | tr ' ' '\n' | grep -Fxq kernaid-vault \
     || fail "OpenAI Agent is not a kernaid-vault member"
 if id -nG kernaid-openai 2>/dev/null | tr ' ' '\n' | grep -Fxq kernaid-provider-client; then
     fail "OpenAI Agent unexpectedly has provider-client access"
 fi
+for forbidden_group in kernaid-vault kernaid-provider-client kernaid-openai; do
+    if id -nG kernaid-openai-egress 2>/dev/null | tr ' ' '\n' | grep -Fxq "$forbidden_group"; then
+        fail "OpenAI egress proxy has forbidden group access"
+    fi
+done
 for subordinate_ids in /etc/subuid /etc/subgid; do
     if [ -r "$subordinate_ids" ] \
-        && grep -Eq '^(kernaid|kernaid-openai):' "$subordinate_ids"; then
+        && grep -Eq '^(kernaid|kernaid-openai|kernaid-openai-egress):' "$subordinate_ids"; then
         fail "Rescue identities unexpectedly have subordinate IDs"
     fi
 done
@@ -56,6 +200,17 @@ test -n "$vault_group_id" || fail "vault lifecycle group is missing"
 test -S /run/kernaid-rescue-vault.sock || fail "vault lifecycle pathname is not a socket"
 test "$(stat -c '%u:%g:%a:%h' -- /run/kernaid-rescue-vault.sock)" = "0:${vault_group_id}:660:1" \
     || fail "vault lifecycle socket ownership or mode is unsafe"
+test "$(systemctl show --property=ActiveState --value kernaid-rescue-openai-egress.socket)" = "active" \
+    || fail "OpenAI egress socket is not active"
+egress_socket_substate="$(systemctl show --property=SubState --value kernaid-rescue-openai-egress.socket)" \
+    || fail "OpenAI egress socket state is unavailable"
+case "$egress_socket_substate" in
+    listening|running) ;;
+    *) fail "OpenAI egress socket is not operational" ;;
+esac
+test -S /run/kernaid-rescue-openai-egress.sock || fail "OpenAI egress pathname is not a socket"
+test "$(stat -c '%u:%g:%a:%h' -- /run/kernaid-rescue-openai-egress.sock)" = "0:${openai_group_id}:660:1" \
+    || fail "OpenAI egress socket ownership or mode is unsafe"
 test "$(systemctl show --property=ActiveState --value kernaid-rescue-openai-executor.socket)" = "active" \
     || fail "OpenAI executor socket is not active"
 provider_socket_substate="$(systemctl show --property=SubState --value kernaid-rescue-openai-executor.socket)" \
@@ -69,6 +224,40 @@ test -n "$provider_group_id" || fail "provider-client group is missing"
 test -S /run/kernaid-rescue-openai.sock || fail "OpenAI executor pathname is not a socket"
 test "$(stat -c '%u:%g:%a:%h' -- /run/kernaid-rescue-openai.sock)" = "0:${provider_group_id}:660:1" \
     || fail "OpenAI executor socket ownership or mode is unsafe"
+
+if [ "$provider_probe_enabled" = "1" ]; then
+    /usr/bin/systemctl --no-ask-password --no-pager start \
+        kernaid-provider-executor-status-probe.socket \
+        kernaid-provider-lease-probe.socket \
+        kernaid-provider-lease-kill-vaultd.socket \
+        || fail "QEMU provider probe sockets did not start"
+    for unit in \
+        kernaid-provider-executor-status-probe.socket \
+        kernaid-provider-lease-probe.socket \
+        kernaid-provider-lease-kill-vaultd.socket; do
+        test "$(systemctl show --property=ActiveState --value "$unit")" = "active" \
+            || fail "QEMU provider probe socket is not active"
+    done
+    test -S /run/kernaid-provider-executor-status-probe.sock \
+        || fail "QEMU shipping-provider status probe pathname is not a socket"
+    test "$(stat -c '%u:%g:%a:%h' -- /run/kernaid-provider-executor-status-probe.sock)" = "0:${vault_group_id}:660:1" \
+        || fail "QEMU shipping-provider status probe socket is unsafe"
+    test -S /run/kernaid-provider-lease-probe.sock \
+        || fail "QEMU provider lease probe pathname is not a socket"
+    test "$(stat -c '%u:%g:%a:%h' -- /run/kernaid-provider-lease-probe.sock)" = "0:${vault_group_id}:660:1" \
+        || fail "QEMU provider lease probe socket is unsafe"
+    test -S /run/kernaid-provider-lease-kill-vaultd.sock \
+        || fail "QEMU provider lease kill pathname is not a socket"
+    test "$(stat -c '%u:%g:%a:%h' -- /run/kernaid-provider-lease-kill-vaultd.sock)" = "0:${openai_group_id}:660:1" \
+        || fail "QEMU provider lease kill socket is unsafe"
+else
+    for path in \
+        /run/kernaid-provider-executor-status-probe.sock \
+        /run/kernaid-provider-lease-probe.sock \
+        /run/kernaid-provider-lease-kill-vaultd.sock; do
+        test ! -e "$path" || fail "QEMU-only provider probe socket exists on a normal boot"
+    done
+fi
 
 if command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
     fail "live user unexpectedly has passwordless root"

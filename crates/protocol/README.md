@@ -102,21 +102,25 @@ declared byte count and then EOF within their own deadline. Error responses
 carry no descriptor. `provider.codex.home_lease` accepts only an `O_PATH`
 directory descriptor, never its pathname.
 
-A borrow/home-lease connection remains open for the lifetime of the lease and
-is bound to the authenticated Agent PID. Socket close plus pidfd process exit
-mark release. On `vault.lock`, the daemon answers `BUSY`, terminates only its
-dedicated Agent process, and waits for pidfd-confirmed exit and lease release
-before locking. An initial daemon that cannot yet supply an OpenAI key may
-answer `provider.openai.borrow` with `PROVIDER_UNCONFIGURED` and no descriptor.
+A borrow connection remains open for the lifetime of the lease. The daemon
+acquires its process identity only with `SO_PEERPIDFD` on that accepted,
+authenticated Agent socket; it never converts the numeric `SO_PEERCRED` PID
+into a pidfd. It registers Pending before worker dispatch. Normal release or
+revocation requires full socket HUP, pidfd exit, and publication that every
+supervisor-owned credential output FD has been closed. On `vault.lock`, stop,
+fault, handoff ambiguity, or expiry, the supervisor signals only that exact
+pidfd and waits all three factors before worker lock, unmount, or lifecycle
+marker disarm. An unconfigured daemon answers `provider.openai.borrow` with
+`PROVIDER_UNCONFIGURED` and no descriptor as a definite no-secret outcome.
 
-The current feature-gated daemon still hard-denies that external operation. It
-now has only a dormant private worker-pipe primitive behind a dedicated
-non-cancellable helper: the supervisor creates the anonymous nonblocking pipe,
-immediately drops its transferred writer after `sendmsg`, and verifies writer
-HUP plus the declared `FIONREAD` byte count without reading credential bytes.
-Only the private `Ready` result can retain the read end; every other result
-closes it. This is not an Agent lease, response-FD path, provider execution, or
-network-support claim.
+The feature-gated daemon enables this OpenAI borrow only for the exact Agent
+role. The supervisor creates an anonymous nonblocking pipe, gives only its
+write end to the worker, validates the private `Ready` result without reading
+credential bytes, and sends the read end with `SCM_RIGHTS` while holding the
+lifecycle linearization barrier against lock/revoke. Pending handoff,
+established lease, and revocation have separate absolute bounds; ambiguous
+worker or send outcomes revoke rather than free early. Codex, audit, and report
+operations remain disabled.
 
 Passphrase pipes are limited to 12–1024 non-NUL bytes, matching vault writer
 v2. After the exact-size read the handler must attempt one further read, prove
@@ -159,7 +163,9 @@ This protocol crate provides the codec, authorization and FD contract plus
 strict Linux record transport and typed client request/response helpers; it
 does not itself create a listener, daemon, mount, store, provider process, or
 UI endpoint. The feature-gated implementation in `kernaid-rescue-secrets`
-currently enables only vault lifecycle and provider configuration lifecycle
-(`provider.status`, `provider.openai.configure`, and OpenAI
-`provider.logout`). Borrow/home lease, provider execution and network calls,
-Codex logout, audit/report operations, and UI routes remain disabled.
+enables vault lifecycle, provider configuration lifecycle (`provider.status`,
+`provider.openai.configure`, and OpenAI `provider.logout`), plus the leased
+Agent `provider.openai.borrow` path. The separate one-shot executor is the only
+consumer and fixes its TLS destination and Responses codec. Codex home/logout,
+audit/report operations, and generic network or UI command surfaces remain
+disabled.
