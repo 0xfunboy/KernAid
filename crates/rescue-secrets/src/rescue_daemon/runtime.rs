@@ -175,7 +175,7 @@ fn narrow_capabilities(
     expected_final: CapabilitySet,
     bounding_drops: &[CapabilitySet],
 ) -> Result<(), RescueVaultDaemonError> {
-    verify_exact_capabilities(expected_initial)?;
+    normalize_bootstrap_capabilities(expected_initial)?;
     clear_ambient_capability_set().map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
     for capability in bounding_drops {
         remove_capability_from_bounding_set(*capability)
@@ -193,6 +193,37 @@ fn narrow_capabilities(
     verify_exact_capabilities(expected_final)
 }
 
+fn normalize_bootstrap_capabilities(expected: CapabilitySet) -> Result<(), RescueVaultDaemonError> {
+    // systemd 257 may retain a subset of the service's authorized bootstrap
+    // capabilities in CapInh while keeping CapEff/CapPrm/CapBnd exact. Clear
+    // that non-effective set before any capability is dropped, then require
+    // the same strict zero-inheritable shape used for the running processes.
+    let observed = capabilities(None).map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+    if !bootstrap_capability_sets_are_allowed(&observed, expected) {
+        return Err(RescueVaultDaemonError::RuntimeUnavailable);
+    }
+    verify_bounding_and_ambient_capabilities(expected)?;
+    set_capabilities(
+        None,
+        CapabilitySets {
+            effective: expected,
+            permitted: expected,
+            inheritable: CapabilitySet::empty(),
+        },
+    )
+    .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+    verify_exact_capabilities(expected)
+}
+
+fn bootstrap_capability_sets_are_allowed(
+    observed: &CapabilitySets,
+    expected: CapabilitySet,
+) -> bool {
+    observed.effective == expected
+        && observed.permitted == expected
+        && expected.contains(observed.inheritable)
+}
+
 fn verify_exact_capabilities(expected: CapabilitySet) -> Result<(), RescueVaultDaemonError> {
     let observed = capabilities(None).map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
     if observed.effective != expected
@@ -201,6 +232,12 @@ fn verify_exact_capabilities(expected: CapabilitySet) -> Result<(), RescueVaultD
     {
         return Err(RescueVaultDaemonError::RuntimeUnavailable);
     }
+    verify_bounding_and_ambient_capabilities(expected)
+}
+
+fn verify_bounding_and_ambient_capabilities(
+    expected: CapabilitySet,
+) -> Result<(), RescueVaultDaemonError> {
     for bit in 0..u64::BITS {
         let capability = CapabilitySet::from_bits_retain(1_u64 << bit);
         let should_be_present = expected.intersects(capability);
@@ -1941,6 +1978,42 @@ mod tests {
         )
         .expect("runtime descriptor");
         (directory, root)
+    }
+
+    #[test]
+    fn systemd_257_bootstrap_inheritable_subset_is_normalizable() {
+        let expected = CapabilitySet::SYS_ADMIN
+            .union(CapabilitySet::KILL)
+            .union(CapabilitySet::SETPCAP);
+        let systemd_257 = CapabilitySets {
+            effective: expected,
+            permitted: expected,
+            inheritable: CapabilitySet::SYS_ADMIN.union(CapabilitySet::SETPCAP),
+        };
+        assert!(bootstrap_capability_sets_are_allowed(
+            &systemd_257,
+            expected
+        ));
+
+        for invalid in [
+            CapabilitySets {
+                effective: expected.difference(CapabilitySet::KILL),
+                permitted: expected,
+                inheritable: CapabilitySet::empty(),
+            },
+            CapabilitySets {
+                effective: expected,
+                permitted: expected.difference(CapabilitySet::KILL),
+                inheritable: CapabilitySet::empty(),
+            },
+            CapabilitySets {
+                effective: expected,
+                permitted: expected,
+                inheritable: CapabilitySet::NET_ADMIN,
+            },
+        ] {
+            assert!(!bootstrap_capability_sets_are_allowed(&invalid, expected));
+        }
     }
 
     #[test]
