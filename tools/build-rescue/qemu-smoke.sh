@@ -4,6 +4,9 @@ repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 firmware="${1:-bios}"
 iso="${2:-$repo_dir/KernAid-Rescue-amd64.iso}"
 readonly boot_timeout_seconds=600
+readonly qemu_term_grace_seconds=5
+readonly qemu_kill_grace_seconds=5
+readonly qemu_stop_poll_seconds=0.05
 for command in cp dd debugfs mcopy mmd mkfs.ext4 mkfs.ntfs mkfs.vfat ntfsfix \
   python3 qemu-system-x86_64 sgdisk sha256sum sync tee truncate; do
   command -v "$command" >/dev/null || { echo "Missing required command: $command" >&2; exit 2; }
@@ -19,6 +22,7 @@ findmnt_command="/usr/bin/findmnt"
 stat_command="/usr/bin/stat"
 readlink_command="/usr/bin/readlink"
 mktemp_command="/usr/bin/mktemp"
+ovmf_directory="/usr/share/OVMF"
 
 trusted_root_directory_chain() {
   local directory="$1"
@@ -100,6 +104,47 @@ trusted_privileged_tool() {
   fi
 }
 
+resolve_trusted_firmware_file() {
+  local path="$1"
+  local resolved parent file_type owner_uid owner_gid permissions
+  case "$path" in
+    "$ovmf_directory"/*.fd) ;;
+    *)
+      echo "OVMF firmware path is outside the fixed system directory: $path" >&2
+      return 1
+      ;;
+  esac
+  parent="${path%/*}"
+  trusted_root_directory_chain "$parent" || return 1
+  resolved="$($readlink_command -f -- "$path")"
+  [[ -n "$resolved" ]] || {
+    echo "OVMF firmware path did not resolve: $path" >&2
+    return 1
+  }
+  case "$resolved" in
+    "$ovmf_directory"/*|/usr/share/edk2/*) ;;
+    *)
+      echo "OVMF firmware resolved outside the system allowlist: $path" >&2
+      return 1
+      ;;
+  esac
+  parent="${resolved%/*}"
+  trusted_root_directory_chain "$parent" || return 1
+  if [[ ! -f "$resolved" || -L "$resolved" ]]; then
+    echo "OVMF firmware is not a resolved regular file: $path" >&2
+    return 1
+  fi
+  IFS=: read -r file_type owner_uid owner_gid permissions \
+    <<<"$(LC_ALL=C "$stat_command" -c '%F:%u:%g:%a' -- "$resolved")"
+  if [[ "$file_type" != "regular file" || "$owner_uid" != "0" \
+    || "$owner_gid" != "0" || -z "$permissions" \
+    || $((8#$permissions & 0022)) -ne 0 ]]; then
+    echo "OVMF firmware failed root ownership and mode validation: $path" >&2
+    return 1
+  fi
+  printf '%s\n' "$resolved"
+}
+
 for inspection_tool in "$findmnt_command" "$stat_command" "$readlink_command" /usr/bin/id; do
   [[ -x "$inspection_tool" ]] \
     || { echo "Missing fixed system tool: $inspection_tool" >&2; exit 2; }
@@ -130,7 +175,11 @@ altered_windows_target_image="$($mktemp_command)"
 target_seed_dir="$($mktemp_command -d)"
 windows_esp_seed_dir="$($mktemp_command -d)"
 windows_seed_mount="$($mktemp_command -d)"
+ovmf_vars=""
+ovmf_vars_path_identity=""
 qemu_pid=""
+qemu_process_identity=""
+qemu_cleanup_safe=1
 windows_fixture_mounted=0
 windows_fixture_cleanup_safe=1
 fixture_uid="$(/usr/bin/id -u)"
@@ -198,6 +247,117 @@ unmount_disposable_windows_fixture() {
   verify_disposable_windows_fixture_unmounted
 }
 
+read_qemu_process_state_and_identity() {
+  local pid="$1"
+  local process_stat process_tail
+  local -a process_fields
+  [[ -r "/proc/$pid/stat" ]] || return 1
+  IFS= read -r process_stat <"/proc/$pid/stat" || return 1
+  [[ "$process_stat" == *") "* ]] || return 1
+  process_tail="${process_stat##*) }"
+  read -r -a process_fields <<<"$process_tail"
+  [[ "${#process_fields[@]}" -ge 20 ]] || return 1
+  printf '%s:%s\n' "${process_fields[0]}" "${process_fields[19]}"
+}
+
+capture_qemu_process_identity() {
+  local observation state
+  observation="$(read_qemu_process_state_and_identity "$qemu_pid")" || return 1
+  state="${observation%%:*}"
+  case "$state" in
+    Z|X) return 1 ;;
+  esac
+  qemu_process_identity="${observation#*:}"
+  [[ "$qemu_process_identity" =~ ^[0-9]+$ ]]
+}
+
+qemu_process_status() {
+  local observation state identity
+  if ! observation="$(read_qemu_process_state_and_identity "$qemu_pid")"; then
+    if [[ -e "/proc/$qemu_pid" ]]; then
+      printf 'unknown\n'
+    else
+      printf 'gone\n'
+    fi
+    return 0
+  fi
+  state="${observation%%:*}"
+  identity="${observation#*:}"
+  if [[ "$identity" != "$qemu_process_identity" ]]; then
+    printf 'identity-mismatch\n'
+  elif [[ "$state" == "Z" || "$state" == "X" ]]; then
+    printf 'reapable\n'
+  else
+    printf 'live\n'
+  fi
+}
+
+reap_stopped_qemu() {
+  local process_status
+  process_status="$(qemu_process_status)"
+  case "$process_status" in
+    gone|reapable)
+      wait "$qemu_pid" 2>/dev/null || true
+      qemu_pid=""
+      qemu_process_identity=""
+      return 0
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+terminate_qemu_bounded() {
+  local deadline process_status
+  if [[ -z "$qemu_pid" ]]; then
+    return 0
+  fi
+  if [[ ! "$qemu_pid" =~ ^[1-9][0-9]*$ \
+    || ! "$qemu_process_identity" =~ ^[0-9]+$ ]]; then
+    echo "QEMU process identity is invalid during cleanup" >&2
+    return 1
+  fi
+  if reap_stopped_qemu; then
+    return 0
+  fi
+  process_status="$(qemu_process_status)"
+  if [[ "$process_status" != "live" ]]; then
+    echo "QEMU process state is untrusted during cleanup: $process_status" >&2
+    return 1
+  fi
+  kill -TERM "$qemu_pid" 2>/dev/null || true
+  deadline=$((SECONDS + qemu_term_grace_seconds))
+  while ((SECONDS < deadline)); do
+    if reap_stopped_qemu; then
+      return 0
+    fi
+    [[ "$(qemu_process_status)" == "live" ]] || break
+    sleep "$qemu_stop_poll_seconds" || true
+  done
+  if reap_stopped_qemu; then
+    return 0
+  fi
+  process_status="$(qemu_process_status)"
+  if [[ "$process_status" != "live" ]]; then
+    echo "QEMU process state is untrusted after TERM: $process_status" >&2
+    return 1
+  fi
+  kill -KILL "$qemu_pid" 2>/dev/null || true
+  deadline=$((SECONDS + qemu_kill_grace_seconds))
+  while ((SECONDS < deadline)); do
+    if reap_stopped_qemu; then
+      return 0
+    fi
+    [[ "$(qemu_process_status)" == "live" ]] || break
+    sleep "$qemu_stop_poll_seconds" || true
+  done
+  if ! reap_stopped_qemu; then
+    process_status="$(qemu_process_status)"
+    echo "QEMU did not terminate within the bounded cleanup window" >&2
+    echo "QEMU terminal process state: $process_status" >&2
+    return 1
+  fi
+}
+
 # shellcheck disable=SC2329  # Invoked indirectly by the EXIT trap below.
 # This callback is reached indirectly through the EXIT trap below.
 # shellcheck disable=SC2317
@@ -205,7 +365,10 @@ cleanup() {
   local status="$1"
   local cleanup_failed=0
   trap - EXIT
-  if [[ -n "$qemu_pid" ]]; then kill "$qemu_pid" 2>/dev/null || true; fi
+  if ! terminate_qemu_bounded; then
+    qemu_cleanup_safe=0
+    cleanup_failed=1
+  fi
   if [[ "$windows_fixture_mounted" == "1" ]] \
     || "$findmnt_command" -rn --mountpoint "$windows_seed_mount" >/dev/null; then
     if ! unmount_disposable_windows_fixture no; then
@@ -213,16 +376,36 @@ cleanup() {
       cleanup_failed=1
     fi
   fi
-  if [[ "$temporary_log" == "1" ]]; then rm -f "$log"; fi
-  rm -f "$target_image"
-  rm -rf "$target_seed_dir"
-  if [[ "$windows_fixture_cleanup_safe" == "1" ]] \
-    && ! "$findmnt_command" -rn --mountpoint "$windows_seed_mount" >/dev/null; then
-    rm -f "$windows_target_image" "$windows_esp_image" \
-      "$windows_gpt_target_image" "$altered_windows_target_image"
-    rm -rf "$windows_esp_seed_dir" "$windows_seed_mount"
+  if [[ "$qemu_cleanup_safe" == "1" ]]; then
+    if [[ "$temporary_log" == "1" ]]; then rm -f "$log"; fi
+    if [[ -n "$ovmf_vars" ]]; then
+      if [[ -z "$ovmf_vars_path_identity" || -L "$ovmf_vars" \
+        || ! -f "$ovmf_vars" \
+        || "$($stat_command -c '%d:%i:%u:%g:%a:%h' -- "$ovmf_vars")" \
+          != "$ovmf_vars_path_identity" ]]; then
+        echo "Preserving an OVMF variable store whose disposable identity changed" >&2
+        cleanup_failed=1
+      else
+        rm -f -- "$ovmf_vars"
+        if [[ -e "$ovmf_vars" || -L "$ovmf_vars" ]]; then
+          echo "Failed to remove the disposable OVMF variable store" >&2
+          cleanup_failed=1
+        fi
+      fi
+    fi
+    rm -f "$target_image"
+    rm -rf "$target_seed_dir"
+    if [[ "$windows_fixture_cleanup_safe" == "1" ]] \
+      && ! "$findmnt_command" -rn --mountpoint "$windows_seed_mount" >/dev/null; then
+      rm -f "$windows_target_image" "$windows_esp_image" \
+        "$windows_gpt_target_image" "$altered_windows_target_image"
+      rm -rf "$windows_esp_seed_dir" "$windows_seed_mount"
+    else
+      echo "Preserving the still-mounted disposable Windows fixture for runner cleanup" >&2
+      cleanup_failed=1
+    fi
   else
-    echo "Preserving the still-mounted disposable Windows fixture for runner cleanup" >&2
+    echo "Preserving QEMU backing files because termination was not confirmed" >&2
     cleanup_failed=1
   fi
   if [[ "$cleanup_failed" == "1" ]]; then exit 1; fi
@@ -343,26 +526,81 @@ qemu_args=(-machine accel=tcg -m 2048 -smp 2 -cdrom "$iso" \
   -fw_cfg "name=opt/kernaid-offline-inspection,string=v1" \
   -boot d -display none -serial stdio -no-reboot)
 if [[ "$firmware" == "uefi" ]]; then
+  ovmf_code_4m="$ovmf_directory/OVMF_CODE_4M.fd"
+  ovmf_vars_4m="$ovmf_directory/OVMF_VARS_4M.fd"
+  ovmf_code_legacy="$ovmf_directory/OVMF_CODE.fd"
+  ovmf_vars_legacy="$ovmf_directory/OVMF_VARS.fd"
   ovmf_code=""
-  for candidate in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd; do
-    if [[ -f "$candidate" ]]; then
-      ovmf_code="$candidate"
-      break
+  ovmf_vars_template=""
+  if [[ -e "$ovmf_code_4m" || -L "$ovmf_code_4m" \
+    || -e "$ovmf_vars_4m" || -L "$ovmf_vars_4m" ]]; then
+    if [[ ! -f "$ovmf_code_4m" || ! -f "$ovmf_vars_4m" ]]; then
+      echo "OVMF 4M CODE/VARS firmware pair is incomplete" >&2
+      exit 2
     fi
-  done
-  [[ -n "$ovmf_code" ]] || { echo "OVMF firmware not found" >&2; exit 2; }
-  qemu_args+=(-drive "if=pflash,format=raw,readonly=on,file=$ovmf_code")
+    ovmf_code="$ovmf_code_4m"
+    ovmf_vars_template="$ovmf_vars_4m"
+  elif [[ -e "$ovmf_code_legacy" || -L "$ovmf_code_legacy" \
+    || -e "$ovmf_vars_legacy" || -L "$ovmf_vars_legacy" ]]; then
+    if [[ ! -f "$ovmf_code_legacy" || ! -f "$ovmf_vars_legacy" ]]; then
+      echo "OVMF legacy CODE/VARS firmware pair is incomplete" >&2
+      exit 2
+    fi
+    ovmf_code="$ovmf_code_legacy"
+    ovmf_vars_template="$ovmf_vars_legacy"
+  else
+    echo "OVMF CODE/VARS firmware pair not found" >&2
+    exit 2
+  fi
+  ovmf_code_resolved="$(resolve_trusted_firmware_file "$ovmf_code")" || exit 2
+  ovmf_vars_template_resolved="$(resolve_trusted_firmware_file "$ovmf_vars_template")" \
+    || exit 2
+  if [[ "$($stat_command -c '%d:%i' -- "$ovmf_code_resolved")" \
+    == "$($stat_command -c '%d:%i' -- "$ovmf_vars_template_resolved")" ]]; then
+    echo "OVMF CODE and VARS firmware files have the same identity" >&2
+    exit 2
+  fi
+  ovmf_vars_template_identity="$($stat_command -c '%d:%i:%s:%u:%g:%a:%h' -- \
+    "$ovmf_vars_template_resolved")"
+  ovmf_vars="$($mktemp_command)"
+  ovmf_vars_path_identity="$($stat_command -c '%d:%i:%u:%g:%a:%h' -- "$ovmf_vars")"
+  if [[ -L "$ovmf_vars" || ! -f "$ovmf_vars" \
+    || "$ovmf_vars_path_identity" != *":$fixture_uid:$fixture_gid:600:1" ]]; then
+    echo "Disposable OVMF variable store ownership or mode is unsafe" >&2
+    exit 1
+  fi
+  cp -- "$ovmf_vars_template_resolved" "$ovmf_vars"
+  if [[ "$($stat_command -c '%d:%i:%s:%u:%g:%a:%h' -- \
+      "$ovmf_vars_template_resolved")" \
+      != "$ovmf_vars_template_identity" \
+    || -L "$ovmf_vars" || ! -f "$ovmf_vars" \
+    || "$($stat_command -c '%d:%i:%u:%g:%a:%h' -- "$ovmf_vars")" \
+      != "$ovmf_vars_path_identity" \
+    || "$($stat_command -c '%s' -- "$ovmf_vars")" \
+      != "$($stat_command -c '%s' -- "$ovmf_vars_template_resolved")" ]]; then
+    echo "Disposable OVMF variable store copy failed identity validation" >&2
+    exit 1
+  fi
+  qemu_args+=(
+    -drive "if=pflash,format=raw,readonly=on,unit=0,file=$ovmf_code_resolved"
+    -drive "if=pflash,format=raw,unit=1,file=$ovmf_vars"
+  )
 fi
 
 qemu-system-x86_64 "${qemu_args[@]}" >"$log" 2>&1 &
 qemu_pid=$!
+if ! capture_qemu_process_identity; then
+  echo "QEMU process identity could not be captured" >&2
+  exit 1
+fi
 for ((_attempt = 1; _attempt <= boot_timeout_seconds; _attempt++)); do
   if grep -q "KERNAID_RESCUE_READY" "$log" \
     && grep -q "KERNAID_RESCUE_TARGET_SELECTION_READY" "$log" \
     && grep -q "KERNAID_RESCUE_OFFLINE_INSPECTION_READY" "$log"; then
-    kill "$qemu_pid" 2>/dev/null || true
-    wait "$qemu_pid" 2>/dev/null || true
-    qemu_pid=""
+    if ! terminate_qemu_bounded; then
+      echo "QEMU could not be stopped before target-image validation" >&2
+      exit 1
+    fi
     target_hash_after="$(sha256sum "$target_image" | awk '{print $1}')"
     if [[ "$target_hash_after" != "$target_hash_before" ]]; then
       echo "Rescue Observe boot modified the disposable target image" >&2
@@ -392,14 +630,20 @@ for ((_attempt = 1; _attempt <= boot_timeout_seconds; _attempt++)); do
     echo "PASS: KernAid Rescue booted with $firmware firmware, inspected Linux ext4, a same-disk GPT Windows NTFS plus ESP fixture, and an altered NTFS fixture read-only with zero target-image writes"
     exit 0
   fi
-  if ! kill -0 "$qemu_pid" 2>/dev/null; then
+  qemu_runtime_status="$(qemu_process_status)"
+  if [[ "$qemu_runtime_status" == "gone" \
+    || "$qemu_runtime_status" == "reapable" ]]; then
     set +e
     wait "$qemu_pid"
     status=$?
     set -e
     qemu_pid=""
+    qemu_process_identity=""
     cat "$log"
     echo "QEMU exited before both Rescue readiness markers (status $status)" >&2
+    exit 1
+  elif [[ "$qemu_runtime_status" != "live" ]]; then
+    echo "QEMU process state became untrusted: $qemu_runtime_status" >&2
     exit 1
   fi
   sleep 1

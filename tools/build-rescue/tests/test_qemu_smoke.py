@@ -6,6 +6,7 @@ import stat
 import subprocess
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 
@@ -26,8 +27,12 @@ class MockToolchain:
     def __init__(self, directory: Path) -> None:
         self.bin = directory / "bin"
         self.state = directory / "state"
+        self.ovmf = directory / "ovmf"
         self.bin.mkdir()
         self.state.mkdir()
+        self.ovmf.mkdir()
+        (self.ovmf / "OVMF_CODE_4M.fd").write_bytes(b"mock OVMF 4M code")
+        (self.ovmf / "OVMF_VARS_4M.fd").write_bytes(b"mock OVMF 4M vars")
         self._install()
 
     def _tool(self, name: str, source: str) -> None:
@@ -175,6 +180,12 @@ class MockToolchain:
                   exit 0
                 fi
                 ;;
+              OVMF_CODE_4M.fd|OVMF_VARS_4M.fd|OVMF_CODE.fd|OVMF_VARS.fd)
+                if [[ " $* " == *" %F:%u:%g:%a "* ]]; then
+                  printf 'regular file:0:0:%s\n' "${KERNAID_MOCK_OVMF_MODE:-644}"
+                  exit 0
+                fi
+                ;;
             esac
             exec /usr/bin/stat "$@"
             """,
@@ -197,7 +208,40 @@ class MockToolchain:
             r"""
             #!/usr/bin/env bash
             printf '%s\n' "$EUID" >"$KERNAID_MOCK_STATE_DIR/qemu-euid"
+            printf '%s\n' "$$" >"$KERNAID_MOCK_STATE_DIR/qemu-pid"
             printf '%s\n' "$*" >"$KERNAID_MOCK_STATE_DIR/qemu-args"
+            for argument in "$@"; do
+              case "$argument" in
+                if=pflash,format=raw,unit=1,file=*)
+                  vars_path="${argument##*,file=}"
+                  printf '%s\n' "$vars_path" >"$KERNAID_MOCK_STATE_DIR/qemu-ovmf-vars-path"
+                  /usr/bin/stat -c '%a' -- "$vars_path" \
+                    >"$KERNAID_MOCK_STATE_DIR/qemu-ovmf-vars-mode"
+                  if /usr/bin/cmp -s -- \
+                    "$KERNAID_MOCK_OVMF_VARS_TEMPLATE" "$vars_path"; then
+                    : >"$KERNAID_MOCK_STATE_DIR/qemu-ovmf-vars-match"
+                  fi
+                  ;;
+              esac
+            done
+            if [[ "${KERNAID_MOCK_QEMU_IGNORE_TERM:-0}" == "1" ]]; then
+              exec /usr/bin/python3 -c '
+import os
+import signal
+import time
+
+state = os.environ["KERNAID_MOCK_STATE_DIR"]
+
+def observe_term(_signal, _frame):
+    open(os.path.join(state, "qemu-term-observed"), "wb").close()
+
+signal.signal(signal.SIGTERM, observe_term)
+print("KERNAID_RESCUE_READY", flush=True)
+print("KERNAID_RESCUE_TARGET_SELECTION_READY", flush=True)
+print("KERNAID_RESCUE_OFFLINE_INSPECTION_READY", flush=True)
+time.sleep(30)
+'
+            fi
             printf 'KERNAID_RESCUE_READY\n'
             printf 'KERNAID_RESCUE_TARGET_SELECTION_READY\n'
             printf 'KERNAID_RESCUE_OFFLINE_INSPECTION_READY\n'
@@ -221,6 +265,7 @@ class QemuSmokeFixturePrivilegeTests(unittest.TestCase):
                 f'findmnt_command="{mocks.bin / "findmnt"}"'
             ),
             'stat_command="/usr/bin/stat"': f'stat_command="{mocks.bin / "stat"}"',
+            'ovmf_directory="/usr/share/OVMF"': f'ovmf_directory="{mocks.ovmf}"',
         }
         for fixed, test_only in replacements.items():
             self.assertEqual(source.count(fixed), 1, fixed)
@@ -239,12 +284,32 @@ class QemuSmokeFixturePrivilegeTests(unittest.TestCase):
         sync_failure: bool = False,
         mounted_fstype: str = "fuse",
         source_mismatch_after_record: int | None = None,
+        firmware: str = "bios",
+        ovmf_layout: str = "4m",
+        ovmf_mode: str = "644",
+        qemu_ignore_term: bool = False,
     ) -> tuple[
         subprocess.CompletedProcess[str], Path, Path, tempfile.TemporaryDirectory[str]
     ]:
         temporary = tempfile.TemporaryDirectory()
         directory = Path(temporary.name)
         mocks = MockToolchain(directory)
+        code_4m = mocks.ovmf / "OVMF_CODE_4M.fd"
+        vars_4m = mocks.ovmf / "OVMF_VARS_4M.fd"
+        if ovmf_layout == "missing":
+            code_4m.unlink()
+            vars_4m.unlink()
+        elif ovmf_layout == "mismatched":
+            vars_4m.unlink()
+            (mocks.ovmf / "OVMF_VARS.fd").write_bytes(b"mock legacy vars")
+        elif ovmf_layout == "same-identity":
+            vars_4m.unlink()
+            os.link(code_4m, vars_4m)
+        elif ovmf_layout == "legacy":
+            code_4m.rename(mocks.ovmf / "OVMF_CODE.fd")
+            vars_4m.rename(mocks.ovmf / "OVMF_VARS.fd")
+        elif ovmf_layout != "4m":
+            raise AssertionError(f"unsupported OVMF test layout: {ovmf_layout}")
         script = self.materialize_test_script(directory, mocks)
         iso = directory / "KernAid-Rescue-amd64.iso"
         log = directory / "bios.log"
@@ -256,6 +321,16 @@ class QemuSmokeFixturePrivilegeTests(unittest.TestCase):
                 "KERNAID_MOCK_STATE_DIR": str(mocks.state),
                 "KERNAID_MOCK_SYNC_FAILURE": "1" if sync_failure else "0",
                 "KERNAID_MOCK_FSTYPE": mounted_fstype,
+                "KERNAID_MOCK_OVMF_MODE": ovmf_mode,
+                "KERNAID_MOCK_QEMU_IGNORE_TERM": "1" if qemu_ignore_term else "0",
+                "KERNAID_MOCK_OVMF_VARS_TEMPLATE": str(
+                    mocks.ovmf
+                    / (
+                        "OVMF_VARS.fd"
+                        if ovmf_layout == "legacy"
+                        else "OVMF_VARS_4M.fd"
+                    )
+                ),
                 "KERNAID_SMOKE_LOG": str(log),
                 "TMPDIR": str(directory),
             }
@@ -265,7 +340,7 @@ class QemuSmokeFixturePrivilegeTests(unittest.TestCase):
                 source_mismatch_after_record
             )
         result = subprocess.run(
-            [str(script), "bios", str(iso)],
+            [str(script), firmware, str(iso)],
             cwd=REPO_DIR,
             env=environment,
             check=False,
@@ -326,6 +401,108 @@ class QemuSmokeFixturePrivilegeTests(unittest.TestCase):
         for package in ("dosfstools", "gdisk", "mtools"):
             self.assertIn(package, workflow)
 
+    def test_uefi_uses_paired_code_and_disposable_vars_pflash(self) -> None:
+        result, _log, state, temporary = self.run_smoke(firmware="uefi")
+        self.addCleanup(temporary.cleanup)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        arguments = (state / "qemu-args").read_text(encoding="utf-8").split()
+        pflash_drives = [
+            argument for argument in arguments if argument.startswith("if=pflash,")
+        ]
+        self.assertEqual(len(pflash_drives), 2)
+        self.assertEqual(
+            pflash_drives[0],
+            "if=pflash,format=raw,readonly=on,unit=0,file="
+            f"{state.parent / 'ovmf' / 'OVMF_CODE_4M.fd'}",
+        )
+        self.assertTrue(
+            pflash_drives[1].startswith("if=pflash,format=raw,unit=1,file=")
+        )
+        self.assertNotIn("readonly=on", pflash_drives[1])
+        vars_path = Path(
+            (state / "qemu-ovmf-vars-path").read_text(encoding="utf-8").strip()
+        )
+        self.assertFalse(vars_path.is_relative_to(state.parent / "ovmf"))
+        self.assertEqual(
+            (state / "qemu-ovmf-vars-mode").read_text(encoding="utf-8").strip(),
+            "600",
+        )
+        self.assertTrue((state / "qemu-ovmf-vars-match").exists())
+        self.assertFalse(vars_path.exists())
+        target_drives = [
+            argument for argument in arguments if "if=virtio" in argument
+        ]
+        self.assertEqual(len(target_drives), 3)
+        for target_drive in target_drives:
+            self.assertNotIn("readonly=on", target_drive)
+            self.assertNotIn("snapshot=", target_drive)
+
+    def test_term_ignoring_qemu_is_killed_reaped_and_cleaned_boundedly(self) -> None:
+        started = time.monotonic()
+        result, _log, state, temporary = self.run_smoke(
+            firmware="uefi", qemu_ignore_term=True
+        )
+        elapsed = time.monotonic() - started
+        self.addCleanup(temporary.cleanup)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertLess(elapsed, 15)
+        self.assertTrue((state / "qemu-term-observed").exists())
+        qemu_pid = int((state / "qemu-pid").read_text(encoding="utf-8").strip())
+        self.assertFalse(Path(f"/proc/{qemu_pid}").exists())
+        vars_path = Path(
+            (state / "qemu-ovmf-vars-path").read_text(encoding="utf-8").strip()
+        )
+        self.assertFalse(vars_path.exists())
+        self.assertIn("PASS: KernAid Rescue booted", result.stdout)
+
+    def test_uefi_accepts_only_the_matching_legacy_code_vars_pair(self) -> None:
+        result, _log, state, temporary = self.run_smoke(
+            firmware="uefi", ovmf_layout="legacy"
+        )
+        self.addCleanup(temporary.cleanup)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        arguments = (state / "qemu-args").read_text(encoding="utf-8").split()
+        pflash_drives = [
+            argument for argument in arguments if argument.startswith("if=pflash,")
+        ]
+        self.assertEqual(len(pflash_drives), 2)
+        self.assertTrue(pflash_drives[0].endswith("/OVMF_CODE.fd"))
+        self.assertTrue((state / "qemu-ovmf-vars-match").exists())
+
+    def test_uefi_rejects_missing_or_mismatched_firmware_pairs(self) -> None:
+        for layout, message in (
+            ("missing", "OVMF CODE/VARS firmware pair not found"),
+            ("mismatched", "OVMF 4M CODE/VARS firmware pair is incomplete"),
+            (
+                "same-identity",
+                "OVMF CODE and VARS firmware files have the same identity",
+            ),
+        ):
+            with self.subTest(layout=layout):
+                result, _log, state, temporary = self.run_smoke(
+                    firmware="uefi", ovmf_layout=layout
+                )
+                self.addCleanup(temporary.cleanup)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(message, result.stderr)
+                self.assertFalse((state / "qemu-euid").exists())
+
+    def test_uefi_rejects_writable_system_firmware_template(self) -> None:
+        result, _log, state, temporary = self.run_smoke(
+            firmware="uefi", ovmf_mode="666"
+        )
+        self.addCleanup(temporary.cleanup)
+
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn(
+            "OVMF firmware failed root ownership and mode validation",
+            result.stderr,
+        )
+        self.assertFalse((state / "qemu-euid").exists())
+
     def test_fixture_mount_is_the_only_sudo_scope_and_qemu_is_unprivileged(
         self,
     ) -> None:
@@ -364,6 +541,10 @@ class QemuSmokeFixturePrivilegeTests(unittest.TestCase):
         )
         self.assertNotEqual(os.geteuid(), 0)
         self.assertNotIn("sudo", (state / "qemu-args").read_text(encoding="utf-8"))
+        self.assertNotIn(
+            "if=pflash", (state / "qemu-args").read_text(encoding="utf-8")
+        )
+        self.assertFalse((state / "qemu-ovmf-vars-path").exists())
 
     def test_failure_after_mount_performs_verified_normal_unmount(self) -> None:
         result, _log, state, temporary = self.run_smoke(sync_failure=True)
