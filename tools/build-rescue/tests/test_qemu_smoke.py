@@ -170,7 +170,15 @@ class MockToolchain:
             set -euo pipefail
             target="${@: -1}"
             if [[ " $* " == *" %F:%u:%g:%a "* && -d "$target" ]]; then
-              printf 'directory:0:0:755\n'
+              if [[ "$target" == "${KERNAID_MOCK_CHAIN_DIRECTORY:-}" ]]; then
+                printf '%s:%s:%s:%s\n' \
+                  "${KERNAID_MOCK_CHAIN_FILE_TYPE:-directory}" \
+                  "${KERNAID_MOCK_CHAIN_UID:-0}" \
+                  "${KERNAID_MOCK_CHAIN_GID:-0}" \
+                  "${KERNAID_MOCK_CHAIN_MODE:-755}"
+              else
+                printf 'directory:0:0:755\n'
+              fi
               exit 0
             fi
             case "${target##*/}" in
@@ -287,6 +295,11 @@ class QemuSmokeFixturePrivilegeTests(unittest.TestCase):
         firmware: str = "bios",
         ovmf_layout: str = "4m",
         ovmf_mode: str = "644",
+        ovmf_directory_file_type: str = "directory",
+        ovmf_directory_uid: int = 0,
+        ovmf_directory_gid: int = 0,
+        ovmf_directory_mode: str = "755",
+        ovmf_directory_symlink: bool = False,
         qemu_ignore_term: bool = False,
     ) -> tuple[
         subprocess.CompletedProcess[str], Path, Path, tempfile.TemporaryDirectory[str]
@@ -294,6 +307,10 @@ class QemuSmokeFixturePrivilegeTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         directory = Path(temporary.name)
         mocks = MockToolchain(directory)
+        if ovmf_directory_symlink:
+            real_ovmf = directory / "ovmf-real"
+            mocks.ovmf.rename(real_ovmf)
+            mocks.ovmf.symlink_to(real_ovmf, target_is_directory=True)
         code_4m = mocks.ovmf / "OVMF_CODE_4M.fd"
         vars_4m = mocks.ovmf / "OVMF_VARS_4M.fd"
         if ovmf_layout == "missing":
@@ -322,6 +339,11 @@ class QemuSmokeFixturePrivilegeTests(unittest.TestCase):
                 "KERNAID_MOCK_SYNC_FAILURE": "1" if sync_failure else "0",
                 "KERNAID_MOCK_FSTYPE": mounted_fstype,
                 "KERNAID_MOCK_OVMF_MODE": ovmf_mode,
+                "KERNAID_MOCK_CHAIN_DIRECTORY": str(mocks.ovmf),
+                "KERNAID_MOCK_CHAIN_FILE_TYPE": ovmf_directory_file_type,
+                "KERNAID_MOCK_CHAIN_UID": str(ovmf_directory_uid),
+                "KERNAID_MOCK_CHAIN_GID": str(ovmf_directory_gid),
+                "KERNAID_MOCK_CHAIN_MODE": ovmf_directory_mode,
                 "KERNAID_MOCK_QEMU_IGNORE_TERM": "1" if qemu_ignore_term else "0",
                 "KERNAID_MOCK_OVMF_VARS_TEMPLATE": str(
                     mocks.ovmf
@@ -401,6 +423,62 @@ class QemuSmokeFixturePrivilegeTests(unittest.TestCase):
         for package in ("dosfstools", "gdisk", "mtools"):
             self.assertIn(package, workflow)
 
+    def test_workflow_hardens_exactly_three_ovmf_directory_chains(self) -> None:
+        workflow = RESCUE_WORKFLOW.read_text(encoding="utf-8")
+        marker = "      - name: Harden OVMF firmware ancestry"
+        self.assertEqual(workflow.count(marker), 3)
+
+        main_install = (
+            "          sudo apt-get install -y \\\n"
+            "            build-essential cryptsetup dosfstools e2fsprogs gdisk mtools ntfs-3g \\\n"
+            "            ovmf qemu-system-x86 shellcheck udev util-linux\n"
+        )
+        lifecycle_install = (
+            "          sudo apt-get install -y \\\n"
+            "            coreutils cryptsetup e2fsprogs gawk grep libcrypt1 mount ovmf procps \\\n"
+            "            python3 qemu-system-x86 squashfs-tools udev util-linux\n"
+        )
+        self.assertEqual(workflow.count(main_install + marker), 1)
+        self.assertEqual(workflow.count(lifecycle_install + marker), 2)
+
+        hardeners = []
+        for remainder in workflow.split(marker)[1:]:
+            hardener, separator, _following_step = remainder.partition("\n      - ")
+            self.assertTrue(separator)
+            hardeners.append(hardener)
+        self.assertEqual(len(hardeners), 3)
+        self.assertTrue(all(item == hardeners[0] for item in hardeners))
+
+        body = hardeners[0]
+        for invariant in (
+            "sudo /usr/bin/python3 -I -B - <<'PY'",
+            "os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC",
+            "os.fchown(descriptor, 0, 0)",
+            "os.fchmod(descriptor, stat.S_IMODE(before.st_mode) & ~0o022)",
+            "not stat.S_ISDIR(current.st_mode)",
+            "current.st_uid != 0",
+            "current.st_gid != 0",
+            "stat.S_IMODE(current.st_mode) & 0o022",
+            'root = os.open("/", directory_flags)',
+            "validate_trusted(root)",
+            'usr = open_child(root, "usr", required=True)',
+            'share = open_child(usr, "share", required=True)',
+            'open_child(share, "OVMF", required=True)',
+            'open_child(share, "edk2", required=False)',
+        ):
+            self.assertEqual(body.count(invariant), 1, invariant)
+        self.assertNotIn("harden(root)", body)
+
+        python_start = "          sudo /usr/bin/python3 -I -B - <<'PY'\n"
+        embedded = body.split(python_start, maxsplit=1)[1].split(
+            "\n          PY", maxsplit=1
+        )[0]
+        compile(
+            textwrap.dedent(embedded),
+            ".github/workflows/rescue.yml:ovmf-hardener",
+            "exec",
+        )
+
     def test_uefi_uses_paired_code_and_disposable_vars_pflash(self) -> None:
         result, _log, state, temporary = self.run_smoke(firmware="uefi")
         self.addCleanup(temporary.cleanup)
@@ -437,6 +515,60 @@ class QemuSmokeFixturePrivilegeTests(unittest.TestCase):
         for target_drive in target_drives:
             self.assertNotIn("readonly=on", target_drive)
             self.assertNotIn("snapshot=", target_drive)
+
+    def test_firmware_directory_chain_is_root_owned_and_not_writable(self) -> None:
+        trusted, _log, state, temporary = self.run_smoke(
+            firmware="uefi",
+            ovmf_directory_file_type="directory",
+            ovmf_directory_uid=0,
+            ovmf_directory_gid=0,
+            ovmf_directory_mode="755",
+        )
+        self.addCleanup(temporary.cleanup)
+        self.assertEqual(trusted.returncode, 0, trusted.stderr)
+        self.assertTrue((state / "qemu-euid").exists())
+
+        rejected_cases = (
+            {
+                "name": "group-writable",
+                "ovmf_directory_mode": "775",
+                "message": "untrusted parent directory",
+            },
+            {
+                "name": "sticky-world-writable",
+                "ovmf_directory_mode": "1777",
+                "message": "untrusted parent directory",
+            },
+            {
+                "name": "non-directory-metadata",
+                "ovmf_directory_file_type": "regular file",
+                "message": "untrusted parent directory",
+            },
+            {
+                "name": "non-root-owner",
+                "ovmf_directory_uid": 1001,
+                "message": "untrusted parent directory",
+            },
+            {
+                "name": "symlink",
+                "ovmf_directory_symlink": True,
+                "message": "unsafe parent directory",
+            },
+        )
+        for rejected in rejected_cases:
+            with self.subTest(case=rejected["name"]):
+                options = {
+                    key: value
+                    for key, value in rejected.items()
+                    if key not in {"name", "message"}
+                }
+                result, _log, state, temporary = self.run_smoke(
+                    firmware="uefi", **options
+                )
+                self.addCleanup(temporary.cleanup)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(rejected["message"], result.stderr)
+                self.assertFalse((state / "qemu-euid").exists())
 
     def test_term_ignoring_qemu_is_killed_reaped_and_cleaned_boundedly(self) -> None:
         started = time.monotonic()

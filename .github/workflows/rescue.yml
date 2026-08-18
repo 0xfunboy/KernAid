@@ -53,6 +53,56 @@ jobs:
           sudo apt-get install -y \
             build-essential cryptsetup dosfstools e2fsprogs gdisk mtools ntfs-3g \
             ovmf qemu-system-x86 shellcheck udev util-linux
+      - name: Harden OVMF firmware ancestry
+        run: |
+          sudo /usr/bin/python3 -I -B - <<'PY'
+          import os
+          import stat
+
+          directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+          opened = []
+
+          def validate_trusted(descriptor):
+              current = os.fstat(descriptor)
+              if (
+                  not stat.S_ISDIR(current.st_mode)
+                  or current.st_uid != 0
+                  or current.st_gid != 0
+                  or stat.S_IMODE(current.st_mode) & 0o022
+              ):
+                  raise RuntimeError("OVMF ancestry entry is not trusted")
+
+          def harden(descriptor):
+              before = os.fstat(descriptor)
+              if not stat.S_ISDIR(before.st_mode):
+                  raise RuntimeError("OVMF ancestry entry is not a directory")
+              os.fchown(descriptor, 0, 0)
+              os.fchmod(descriptor, stat.S_IMODE(before.st_mode) & ~0o022)
+              validate_trusted(descriptor)
+
+          def open_child(parent, name, *, required):
+              try:
+                  descriptor = os.open(name, directory_flags, dir_fd=parent)
+              except FileNotFoundError:
+                  if required:
+                      raise
+                  return None
+              opened.append(descriptor)
+              harden(descriptor)
+              return descriptor
+
+          try:
+              root = os.open("/", directory_flags)
+              opened.append(root)
+              validate_trusted(root)
+              usr = open_child(root, "usr", required=True)
+              share = open_child(usr, "share", required=True)
+              open_child(share, "OVMF", required=True)
+              open_child(share, "edk2", required=False)
+          finally:
+              for descriptor in reversed(opened):
+                  os.close(descriptor)
+          PY
       - name: Validate Rescue image-layout tooling
         run: |
           python3 -m unittest discover -s tools/build-rescue/tests -p 'test_*.py' -v
@@ -253,6 +303,56 @@ jobs:
           sudo apt-get install -y \
             coreutils cryptsetup e2fsprogs gawk grep libcrypt1 mount ovmf procps \
             python3 qemu-system-x86 squashfs-tools udev util-linux
+      - name: Harden OVMF firmware ancestry
+        run: |
+          sudo /usr/bin/python3 -I -B - <<'PY'
+          import os
+          import stat
+
+          directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+          opened = []
+
+          def validate_trusted(descriptor):
+              current = os.fstat(descriptor)
+              if (
+                  not stat.S_ISDIR(current.st_mode)
+                  or current.st_uid != 0
+                  or current.st_gid != 0
+                  or stat.S_IMODE(current.st_mode) & 0o022
+              ):
+                  raise RuntimeError("OVMF ancestry entry is not trusted")
+
+          def harden(descriptor):
+              before = os.fstat(descriptor)
+              if not stat.S_ISDIR(before.st_mode):
+                  raise RuntimeError("OVMF ancestry entry is not a directory")
+              os.fchown(descriptor, 0, 0)
+              os.fchmod(descriptor, stat.S_IMODE(before.st_mode) & ~0o022)
+              validate_trusted(descriptor)
+
+          def open_child(parent, name, *, required):
+              try:
+                  descriptor = os.open(name, directory_flags, dir_fd=parent)
+              except FileNotFoundError:
+                  if required:
+                      raise
+                  return None
+              opened.append(descriptor)
+              harden(descriptor)
+              return descriptor
+
+          try:
+              root = os.open("/", directory_flags)
+              opened.append(root)
+              validate_trusted(root)
+              usr = open_child(root, "usr", required=True)
+              share = open_child(usr, "share", required=True)
+              open_child(share, "OVMF", required=True)
+              open_child(share, "edk2", required=False)
+          finally:
+              for descriptor in reversed(opened):
+                  os.close(descriptor)
+          PY
       - name: Download the tested Rescue image input
         uses: actions/download-artifact@v4
         with:
@@ -446,6 +546,56 @@ jobs:
           sudo apt-get install -y \
             coreutils cryptsetup e2fsprogs gawk grep libcrypt1 mount ovmf procps \
             python3 qemu-system-x86 squashfs-tools udev util-linux
+      - name: Harden OVMF firmware ancestry
+        run: |
+          sudo /usr/bin/python3 -I -B - <<'PY'
+          import os
+          import stat
+
+          directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+          opened = []
+
+          def validate_trusted(descriptor):
+              current = os.fstat(descriptor)
+              if (
+                  not stat.S_ISDIR(current.st_mode)
+                  or current.st_uid != 0
+                  or current.st_gid != 0
+                  or stat.S_IMODE(current.st_mode) & 0o022
+              ):
+                  raise RuntimeError("OVMF ancestry entry is not trusted")
+
+          def harden(descriptor):
+              before = os.fstat(descriptor)
+              if not stat.S_ISDIR(before.st_mode):
+                  raise RuntimeError("OVMF ancestry entry is not a directory")
+              os.fchown(descriptor, 0, 0)
+              os.fchmod(descriptor, stat.S_IMODE(before.st_mode) & ~0o022)
+              validate_trusted(descriptor)
+
+          def open_child(parent, name, *, required):
+              try:
+                  descriptor = os.open(name, directory_flags, dir_fd=parent)
+              except FileNotFoundError:
+                  if required:
+                      raise
+                  return None
+              opened.append(descriptor)
+              harden(descriptor)
+              return descriptor
+
+          try:
+              root = os.open("/", directory_flags)
+              opened.append(root)
+              validate_trusted(root)
+              usr = open_child(root, "usr", required=True)
+              share = open_child(usr, "share", required=True)
+              open_child(share, "OVMF", required=True)
+              open_child(share, "edk2", required=False)
+          finally:
+              for descriptor in reversed(opened):
+                  os.close(descriptor)
+          PY
       - name: Download the tested Rescue image input
         uses: actions/download-artifact@v4
         with:
