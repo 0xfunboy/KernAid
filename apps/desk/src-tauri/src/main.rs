@@ -234,7 +234,7 @@ struct FixedCommandOutput {
     exit_code: i32,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FixedCommandFailure {
     Unavailable,
     TimedOut,
@@ -255,8 +255,120 @@ impl FixedCommandFailure {
         }
     }
 
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     const fn truncated(self) -> bool {
         matches!(self, Self::Truncated)
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MacosCollectorFailureReason {
+    CommandUnavailable,
+    Timeout,
+    Truncated,
+    ReadFailed,
+    InvalidUtf8,
+    NonzeroExit,
+    StderrNonempty,
+    ProjectionInvalid,
+    ThreadFailed,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl MacosCollectorFailureReason {
+    #[cfg(test)]
+    const fn token(self) -> &'static str {
+        match self {
+            Self::CommandUnavailable => "command-unavailable",
+            Self::Timeout => "timeout",
+            Self::Truncated => "truncated",
+            Self::ReadFailed => "read-failed",
+            Self::InvalidUtf8 => "invalid-utf8",
+            Self::NonzeroExit => "nonzero-exit",
+            Self::StderrNonempty => "stderr-nonempty",
+            Self::ProjectionInvalid => "projection-invalid",
+            Self::ThreadFailed => "thread-failed",
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl From<FixedCommandFailure> for MacosCollectorFailureReason {
+    fn from(failure: FixedCommandFailure) -> Self {
+        match failure {
+            FixedCommandFailure::Unavailable => Self::CommandUnavailable,
+            FixedCommandFailure::TimedOut => Self::Timeout,
+            FixedCommandFailure::Truncated => Self::Truncated,
+            FixedCommandFailure::ReadFailed => Self::ReadFailed,
+            FixedCommandFailure::InvalidUtf8 => Self::InvalidUtf8,
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+// Private collector state. Only the fixed token is exposed by the native test
+// probe; the public observation schema and its fail-closed output stay intact.
+enum MacosCollectorOutcome {
+    Success(Observation),
+    Failure {
+        observation: Observation,
+        #[cfg(test)]
+        reason: MacosCollectorFailureReason,
+    },
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl MacosCollectorOutcome {
+    fn success(collector: &'static str, output: String) -> Self {
+        Self::Success(Observation {
+            collector,
+            trust: "observed-untrusted",
+            output,
+            success: true,
+            truncated: false,
+        })
+    }
+
+    fn failure(collector: &'static str, reason: MacosCollectorFailureReason) -> Self {
+        Self::Failure {
+            observation: failed_macos_observation(
+                collector,
+                reason == MacosCollectorFailureReason::Truncated,
+            ),
+            #[cfg(test)]
+            reason,
+        }
+    }
+
+    #[cfg(test)]
+    fn observation(&self) -> &Observation {
+        match self {
+            Self::Success(observation) | Self::Failure { observation, .. } => observation,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn into_observation(self) -> Observation {
+        match self {
+            Self::Success(observation) | Self::Failure { observation, .. } => observation,
+        }
+    }
+
+    #[cfg(test)]
+    fn probe_failure_label(&self) -> Option<String> {
+        match self {
+            Self::Success(_) => None,
+            Self::Failure {
+                observation,
+                reason,
+            } => Some(format!(
+                "{}:reason={}:truncated={}",
+                observation.collector,
+                reason.token(),
+                observation.truncated
+            )),
+        }
     }
 }
 
@@ -702,7 +814,7 @@ async fn collect_windows_p0_inventory() -> Result<Vec<Observation>, String> {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 fn failed_macos_observation(collector: &'static str, truncated: bool) -> Observation {
     Observation {
         collector,
@@ -714,35 +826,44 @@ fn failed_macos_observation(collector: &'static str, truncated: bool) -> Observa
 }
 
 #[cfg(target_os = "macos")]
-fn validated_macos_output(collector: &'static str, output: String) -> Observation {
-    if output.len() <= QUALIFIED_MACOS_MAX_OUTPUT_BYTES
-        && macos_resident::validate_projection(collector, &output).is_ok()
-    {
-        Observation {
-            collector,
-            trust: "observed-untrusted",
-            output,
-            success: true,
-            truncated: false,
-        }
+fn validated_macos_output(collector: &'static str, output: String) -> MacosCollectorOutcome {
+    if output.len() > QUALIFIED_MACOS_MAX_OUTPUT_BYTES {
+        MacosCollectorOutcome::failure(collector, MacosCollectorFailureReason::Truncated)
+    } else if macos_resident::validate_projection(collector, &output).is_err() {
+        MacosCollectorOutcome::failure(collector, MacosCollectorFailureReason::ProjectionInvalid)
     } else {
-        failed_macos_observation(collector, output.len() > QUALIFIED_MACOS_MAX_OUTPUT_BYTES)
+        MacosCollectorOutcome::success(collector, output)
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 fn complete_macos_command(
     result: Result<FixedCommandOutput, FixedCommandFailure>,
-) -> Result<FixedCommandOutput, bool> {
-    match result {
-        Ok(output) if output.exit_code == 0 && output.stderr.trim().is_empty() => Ok(output),
-        Ok(_) => Err(false),
-        Err(error) => Err(error.truncated()),
+) -> Result<FixedCommandOutput, MacosCollectorFailureReason> {
+    let output = result.map_err(MacosCollectorFailureReason::from)?;
+    if output.exit_code != 0 {
+        Err(MacosCollectorFailureReason::NonzeroExit)
+    } else if !output.stderr.trim().is_empty() {
+        Err(MacosCollectorFailureReason::StderrNonempty)
+    } else {
+        Ok(output)
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn complete_macos_route_command(
+    result: Result<FixedCommandOutput, FixedCommandFailure>,
+) -> Result<FixedCommandOutput, MacosCollectorFailureReason> {
+    let output = result.map_err(MacosCollectorFailureReason::from)?;
+    if matches!(output.exit_code, 0 | 1) {
+        Ok(output)
+    } else {
+        Err(MacosCollectorFailureReason::NonzeroExit)
     }
 }
 
 #[cfg(target_os = "macos")]
-fn collect_macos_system() -> Observation {
+fn collect_macos_system() -> MacosCollectorOutcome {
     let output = complete_macos_command(run_fixed_command(
         macos_resident::SW_VERS,
         &macos_resident::SW_VERS_ARGS,
@@ -750,21 +871,16 @@ fn collect_macos_system() -> Observation {
         QUALIFIED_MACOS_MAX_OUTPUT_BYTES,
     ));
     match output.and_then(|output| {
-        macos_resident::normalize_system_version(&output.stdout).map_err(|_| false)
+        macos_resident::normalize_system_version(&output.stdout)
+            .map_err(|_| MacosCollectorFailureReason::ProjectionInvalid)
     }) {
-        Ok(output) => Observation {
-            collector: "macos.system",
-            trust: "observed-untrusted",
-            output,
-            success: true,
-            truncated: false,
-        },
-        Err(truncated) => failed_macos_observation("macos.system", truncated),
+        Ok(output) => MacosCollectorOutcome::success("macos.system", output),
+        Err(reason) => MacosCollectorOutcome::failure("macos.system", reason),
     }
 }
 
 #[cfg(target_os = "macos")]
-fn collect_macos_storage() -> (Observation, Observation) {
+fn collect_macos_storage() -> (MacosCollectorOutcome, MacosCollectorOutcome) {
     let result = complete_macos_command(run_fixed_command(
         macos_resident::SYSTEM_PROFILER,
         &macos_resident::SYSTEM_PROFILER_ARGS,
@@ -773,166 +889,182 @@ fn collect_macos_storage() -> (Observation, Observation) {
     ));
     match result {
         Ok(output) => {
-            let storage = macos_resident::normalize_storage(&output.stdout)
-                .map(|output| validated_macos_output("macos.storage.inventory", output))
-                .unwrap_or_else(|_| failed_macos_observation("macos.storage.inventory", false));
-            let identity = macos_resident::derive_storage_identity(&output.stdout)
-                .map(|output| Observation {
-                    collector: "macos.storage.identity",
-                    trust: "observed-untrusted",
-                    output,
-                    success: true,
-                    truncated: false,
-                })
-                .unwrap_or_else(|_| failed_macos_observation("macos.storage.identity", false));
+            let storage = match macos_resident::normalize_storage(&output.stdout) {
+                Ok(output) => validated_macos_output("macos.storage.inventory", output),
+                Err(()) => MacosCollectorOutcome::failure(
+                    "macos.storage.inventory",
+                    MacosCollectorFailureReason::ProjectionInvalid,
+                ),
+            };
+            let identity = match macos_resident::derive_storage_identity(&output.stdout) {
+                Ok(output) => MacosCollectorOutcome::success("macos.storage.identity", output),
+                Err(()) => MacosCollectorOutcome::failure(
+                    "macos.storage.identity",
+                    MacosCollectorFailureReason::ProjectionInvalid,
+                ),
+            };
             (storage, identity)
         }
-        Err(truncated) => (
-            failed_macos_observation("macos.storage.inventory", truncated),
-            failed_macos_observation("macos.storage.identity", truncated),
+        Err(reason) => (
+            MacosCollectorOutcome::failure("macos.storage.inventory", reason),
+            MacosCollectorOutcome::failure("macos.storage.identity", reason),
         ),
     }
 }
 
 #[cfg(target_os = "macos")]
-fn collect_macos_apfs() -> Observation {
+fn collect_macos_apfs() -> MacosCollectorOutcome {
     let (list, root) = thread::scope(|scope| {
         let list = scope.spawn(|| {
-            run_fixed_command(
+            complete_macos_command(run_fixed_command(
                 macos_resident::DISKUTIL,
                 &macos_resident::APFS_LIST_ARGS,
                 macos_resident::STANDARD_TIMEOUT,
                 QUALIFIED_MACOS_MAX_OUTPUT_BYTES,
-            )
+            ))
         });
         let root = scope.spawn(|| {
-            run_fixed_command(
+            complete_macos_command(run_fixed_command(
                 macos_resident::DISKUTIL,
                 &macos_resident::ROOT_INFO_ARGS,
                 macos_resident::STANDARD_TIMEOUT,
                 QUALIFIED_MACOS_MAX_OUTPUT_BYTES,
-            )
+            ))
         });
         (
-            list.join().unwrap_or(Err(FixedCommandFailure::Unavailable)),
-            root.join().unwrap_or(Err(FixedCommandFailure::Unavailable)),
+            list.join()
+                .unwrap_or(Err(MacosCollectorFailureReason::ThreadFailed)),
+            root.join()
+                .unwrap_or(Err(MacosCollectorFailureReason::ThreadFailed)),
         )
     });
-    let normalized = complete_macos_command(list).and_then(|list| {
-        complete_macos_command(root).and_then(|root| {
+    let normalized = list.and_then(|list| {
+        root.and_then(|root| {
             macos_resident::normalize_apfs(list.stdout.as_bytes(), root.stdout.as_bytes())
-                .map_err(|_| false)
+                .map_err(|_| MacosCollectorFailureReason::ProjectionInvalid)
         })
     });
     match normalized {
         Ok(output) => validated_macos_output("macos.apfs.capacity", output),
-        Err(truncated) => failed_macos_observation("macos.apfs.capacity", truncated),
+        Err(reason) => MacosCollectorOutcome::failure("macos.apfs.capacity", reason),
     }
 }
 
 #[cfg(target_os = "macos")]
-fn collect_macos_launchd() -> Observation {
+fn collect_macos_launchd() -> MacosCollectorOutcome {
     let normalized = complete_macos_command(run_fixed_command(
         macos_resident::LAUNCHCTL,
         &macos_resident::LAUNCHCTL_ARGS,
         macos_resident::STANDARD_TIMEOUT,
         QUALIFIED_MACOS_MAX_OUTPUT_BYTES,
     ))
-    .and_then(|output| macos_resident::normalize_launchd_user(&output.stdout).map_err(|_| false));
+    .and_then(|output| {
+        macos_resident::normalize_launchd_user(&output.stdout)
+            .map_err(|_| MacosCollectorFailureReason::ProjectionInvalid)
+    });
     match normalized {
         Ok(output) => validated_macos_output("macos.launchd.state", output),
-        Err(truncated) => failed_macos_observation("macos.launchd.state", truncated),
+        Err(reason) => MacosCollectorOutcome::failure("macos.launchd.state", reason),
     }
 }
 
 #[cfg(target_os = "macos")]
-fn collect_macos_network() -> Observation {
+fn collect_macos_network() -> MacosCollectorOutcome {
     let (nwi, route, dns) = thread::scope(|scope| {
         let nwi = scope.spawn(|| {
-            run_fixed_command(
+            complete_macos_command(run_fixed_command(
                 macos_resident::SCUTIL,
                 &macos_resident::NWI_ARGS,
                 macos_resident::STANDARD_TIMEOUT,
                 QUALIFIED_MACOS_MAX_OUTPUT_BYTES,
-            )
+            ))
         });
         let route = scope.spawn(|| {
-            run_fixed_command(
+            complete_macos_route_command(run_fixed_command(
                 macos_resident::ROUTE,
                 &macos_resident::ROUTE_ARGS,
                 macos_resident::STANDARD_TIMEOUT,
                 QUALIFIED_MACOS_MAX_OUTPUT_BYTES,
-            )
+            ))
         });
         let dns = scope.spawn(|| {
-            run_fixed_command(
+            complete_macos_command(run_fixed_command(
                 macos_resident::SCUTIL,
                 &macos_resident::DNS_ARGS,
                 macos_resident::STANDARD_TIMEOUT,
                 QUALIFIED_MACOS_MAX_OUTPUT_BYTES,
-            )
+            ))
         });
         (
-            nwi.join().unwrap_or(Err(FixedCommandFailure::Unavailable)),
+            nwi.join()
+                .unwrap_or(Err(MacosCollectorFailureReason::ThreadFailed)),
             route
                 .join()
-                .unwrap_or(Err(FixedCommandFailure::Unavailable)),
-            dns.join().unwrap_or(Err(FixedCommandFailure::Unavailable)),
+                .unwrap_or(Err(MacosCollectorFailureReason::ThreadFailed)),
+            dns.join()
+                .unwrap_or(Err(MacosCollectorFailureReason::ThreadFailed)),
         )
     });
-    let normalized = complete_macos_command(nwi).and_then(|nwi| {
-        complete_macos_command(dns).and_then(|dns| match route {
-            Ok(route) if matches!(route.exit_code, 0 | 1) => {
+    let normalized = nwi.and_then(|nwi| {
+        dns.and_then(|dns| {
+            route.and_then(|route| {
                 macos_resident::normalize_network(&nwi.stdout, route.exit_code, &dns.stdout)
-                    .map_err(|_| false)
-            }
-            Ok(_) => Err(false),
-            Err(error) => Err(error.truncated()),
+                    .map_err(|_| MacosCollectorFailureReason::ProjectionInvalid)
+            })
         })
     });
     match normalized {
         Ok(output) => validated_macos_output("macos.network.state", output),
-        Err(truncated) => failed_macos_observation("macos.network.state", truncated),
+        Err(reason) => MacosCollectorOutcome::failure("macos.network.state", reason),
     }
 }
 
 #[cfg(target_os = "macos")]
-fn collect_macos_updates() -> Observation {
+fn collect_macos_updates() -> MacosCollectorOutcome {
     match macos_resident::updates_unqualified_projection() {
         Ok(output) => validated_macos_output("macos.software-update.state", output),
-        Err(()) => failed_macos_observation("macos.software-update.state", false),
+        Err(()) => MacosCollectorOutcome::failure(
+            "macos.software-update.state",
+            MacosCollectorFailureReason::ProjectionInvalid,
+        ),
     }
 }
 
 #[cfg(target_os = "macos")]
-fn collect_macos_events() -> Observation {
+fn collect_macos_events() -> MacosCollectorOutcome {
     match macos_resident::events_unqualified_projection() {
         Ok(output) => validated_macos_output("macos.system-events.summary", output),
-        Err(()) => failed_macos_observation("macos.system-events.summary", false),
+        Err(()) => MacosCollectorOutcome::failure(
+            "macos.system-events.summary",
+            MacosCollectorFailureReason::ProjectionInvalid,
+        ),
     }
 }
 
 #[cfg(target_os = "macos")]
-fn collect_macos_startup() -> Observation {
+fn collect_macos_startup() -> MacosCollectorOutcome {
     let normalized = complete_macos_command(run_fixed_command(
         macos_resident::SYSCTL,
         &macos_resident::SAFE_BOOT_ARGS,
         macos_resident::STANDARD_TIMEOUT,
         QUALIFIED_MACOS_MAX_OUTPUT_BYTES,
     ))
-    .and_then(|safe_boot| macos_resident::normalize_startup(&safe_boot.stdout).map_err(|_| false));
+    .and_then(|safe_boot| {
+        macos_resident::normalize_startup(&safe_boot.stdout)
+            .map_err(|_| MacosCollectorFailureReason::ProjectionInvalid)
+    });
     match normalized {
         Ok(output) => validated_macos_output("macos.startup.state", output),
-        Err(truncated) => failed_macos_observation("macos.startup.state", truncated),
+        Err(reason) => MacosCollectorOutcome::failure("macos.startup.state", reason),
     }
 }
 
 #[cfg(target_os = "macos")]
-fn collect_macos_snapshots() -> Observation {
+fn collect_macos_snapshots() -> MacosCollectorOutcome {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
-        .map_err(|_| false);
+        .map_err(|_| MacosCollectorFailureReason::ProjectionInvalid);
     let normalized = now.and_then(|now| {
         complete_macos_command(run_fixed_command(
             macos_resident::TMUTIL,
@@ -941,28 +1073,38 @@ fn collect_macos_snapshots() -> Observation {
             QUALIFIED_MACOS_MAX_OUTPUT_BYTES,
         ))
         .and_then(|output| {
-            macos_resident::normalize_snapshots(&output.stdout, now).map_err(|_| false)
+            macos_resident::normalize_snapshots(&output.stdout, now)
+                .map_err(|_| MacosCollectorFailureReason::ProjectionInvalid)
         })
     });
     match normalized {
         Ok(output) => validated_macos_output("macos.snapshots.inventory", output),
-        Err(truncated) => failed_macos_observation("macos.snapshots.inventory", truncated),
+        Err(reason) => MacosCollectorOutcome::failure("macos.snapshots.inventory", reason),
     }
 }
 
 #[cfg(target_os = "macos")]
-fn collect_macos_identity_observations() -> Vec<Observation> {
+fn collect_macos_identity_outcomes() -> Vec<MacosCollectorOutcome> {
     let (system, (_, identity)) = thread::scope(|scope| {
         let system = scope.spawn(collect_macos_system);
         let storage = scope.spawn(collect_macos_storage);
         (
-            system
-                .join()
-                .unwrap_or_else(|_| failed_macos_observation("macos.system", false)),
+            system.join().unwrap_or_else(|_| {
+                MacosCollectorOutcome::failure(
+                    "macos.system",
+                    MacosCollectorFailureReason::ThreadFailed,
+                )
+            }),
             storage.join().unwrap_or_else(|_| {
                 (
-                    failed_macos_observation("macos.storage.inventory", false),
-                    failed_macos_observation("macos.storage.identity", false),
+                    MacosCollectorOutcome::failure(
+                        "macos.storage.inventory",
+                        MacosCollectorFailureReason::ThreadFailed,
+                    ),
+                    MacosCollectorOutcome::failure(
+                        "macos.storage.identity",
+                        MacosCollectorFailureReason::ThreadFailed,
+                    ),
                 )
             }),
         )
@@ -971,7 +1113,15 @@ fn collect_macos_identity_observations() -> Vec<Observation> {
 }
 
 #[cfg(target_os = "macos")]
-fn collect_macos_p0_observations() -> Vec<Observation> {
+fn collect_macos_identity_observations() -> Vec<Observation> {
+    collect_macos_identity_outcomes()
+        .into_iter()
+        .map(MacosCollectorOutcome::into_observation)
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn collect_macos_p0_outcomes() -> Vec<MacosCollectorOutcome> {
     thread::scope(|scope| {
         let system = scope.spawn(collect_macos_system);
         let storage = scope.spawn(collect_macos_storage);
@@ -982,41 +1132,80 @@ fn collect_macos_p0_observations() -> Vec<Observation> {
         let events = scope.spawn(collect_macos_events);
         let startup = scope.spawn(collect_macos_startup);
         let snapshots = scope.spawn(collect_macos_snapshots);
-        let system = system
-            .join()
-            .unwrap_or_else(|_| failed_macos_observation("macos.system", false));
+        let system = system.join().unwrap_or_else(|_| {
+            MacosCollectorOutcome::failure(
+                "macos.system",
+                MacosCollectorFailureReason::ThreadFailed,
+            )
+        });
         let (storage, identity) = storage.join().unwrap_or_else(|_| {
             (
-                failed_macos_observation("macos.storage.inventory", false),
-                failed_macos_observation("macos.storage.identity", false),
+                MacosCollectorOutcome::failure(
+                    "macos.storage.inventory",
+                    MacosCollectorFailureReason::ThreadFailed,
+                ),
+                MacosCollectorOutcome::failure(
+                    "macos.storage.identity",
+                    MacosCollectorFailureReason::ThreadFailed,
+                ),
             )
         });
         vec![
             system,
             storage,
-            apfs.join()
-                .unwrap_or_else(|_| failed_macos_observation("macos.apfs.capacity", false)),
-            launchd
-                .join()
-                .unwrap_or_else(|_| failed_macos_observation("macos.launchd.state", false)),
-            network
-                .join()
-                .unwrap_or_else(|_| failed_macos_observation("macos.network.state", false)),
-            updates
-                .join()
-                .unwrap_or_else(|_| failed_macos_observation("macos.software-update.state", false)),
-            events
-                .join()
-                .unwrap_or_else(|_| failed_macos_observation("macos.system-events.summary", false)),
-            startup
-                .join()
-                .unwrap_or_else(|_| failed_macos_observation("macos.startup.state", false)),
-            snapshots
-                .join()
-                .unwrap_or_else(|_| failed_macos_observation("macos.snapshots.inventory", false)),
+            apfs.join().unwrap_or_else(|_| {
+                MacosCollectorOutcome::failure(
+                    "macos.apfs.capacity",
+                    MacosCollectorFailureReason::ThreadFailed,
+                )
+            }),
+            launchd.join().unwrap_or_else(|_| {
+                MacosCollectorOutcome::failure(
+                    "macos.launchd.state",
+                    MacosCollectorFailureReason::ThreadFailed,
+                )
+            }),
+            network.join().unwrap_or_else(|_| {
+                MacosCollectorOutcome::failure(
+                    "macos.network.state",
+                    MacosCollectorFailureReason::ThreadFailed,
+                )
+            }),
+            updates.join().unwrap_or_else(|_| {
+                MacosCollectorOutcome::failure(
+                    "macos.software-update.state",
+                    MacosCollectorFailureReason::ThreadFailed,
+                )
+            }),
+            events.join().unwrap_or_else(|_| {
+                MacosCollectorOutcome::failure(
+                    "macos.system-events.summary",
+                    MacosCollectorFailureReason::ThreadFailed,
+                )
+            }),
+            startup.join().unwrap_or_else(|_| {
+                MacosCollectorOutcome::failure(
+                    "macos.startup.state",
+                    MacosCollectorFailureReason::ThreadFailed,
+                )
+            }),
+            snapshots.join().unwrap_or_else(|_| {
+                MacosCollectorOutcome::failure(
+                    "macos.snapshots.inventory",
+                    MacosCollectorFailureReason::ThreadFailed,
+                )
+            }),
             identity,
         ]
     })
+}
+
+#[cfg(target_os = "macos")]
+fn collect_macos_p0_observations() -> Vec<Observation> {
+    collect_macos_p0_outcomes()
+        .into_iter()
+        .map(MacosCollectorOutcome::into_observation)
+        .collect()
 }
 
 #[tauri::command]
@@ -1753,34 +1942,148 @@ mod tests {
         assert!(diagnose_macos_documents(unknown).is_err());
     }
 
+    #[test]
+    fn macos_failure_reason_tokens_are_closed_and_bounded() {
+        let reasons = [
+            MacosCollectorFailureReason::CommandUnavailable,
+            MacosCollectorFailureReason::Timeout,
+            MacosCollectorFailureReason::Truncated,
+            MacosCollectorFailureReason::ReadFailed,
+            MacosCollectorFailureReason::InvalidUtf8,
+            MacosCollectorFailureReason::NonzeroExit,
+            MacosCollectorFailureReason::StderrNonempty,
+            MacosCollectorFailureReason::ProjectionInvalid,
+            MacosCollectorFailureReason::ThreadFailed,
+        ];
+        assert_eq!(
+            reasons.map(MacosCollectorFailureReason::token),
+            [
+                "command-unavailable",
+                "timeout",
+                "truncated",
+                "read-failed",
+                "invalid-utf8",
+                "nonzero-exit",
+                "stderr-nonempty",
+                "projection-invalid",
+                "thread-failed",
+            ]
+        );
+        for token in reasons.map(MacosCollectorFailureReason::token) {
+            assert!(token.len() <= 19);
+            assert!(
+                token
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+            );
+        }
+    }
+
+    #[test]
+    fn macos_command_failures_have_exact_privacy_safe_classes() {
+        for (failure, expected) in [
+            (
+                FixedCommandFailure::Unavailable,
+                MacosCollectorFailureReason::CommandUnavailable,
+            ),
+            (
+                FixedCommandFailure::TimedOut,
+                MacosCollectorFailureReason::Timeout,
+            ),
+            (
+                FixedCommandFailure::Truncated,
+                MacosCollectorFailureReason::Truncated,
+            ),
+            (
+                FixedCommandFailure::ReadFailed,
+                MacosCollectorFailureReason::ReadFailed,
+            ),
+            (
+                FixedCommandFailure::InvalidUtf8,
+                MacosCollectorFailureReason::InvalidUtf8,
+            ),
+        ] {
+            assert_eq!(MacosCollectorFailureReason::from(failure), expected);
+            assert!(
+                matches!(complete_macos_command(Err(failure)), Err(reason) if reason == expected)
+            );
+        }
+
+        let output = |exit_code, stderr: &str| FixedCommandOutput {
+            stdout: "untrusted-observed-value".to_owned(),
+            stderr: stderr.to_owned(),
+            exit_code,
+        };
+        assert!(matches!(
+            complete_macos_command(Ok(output(9, ""))),
+            Err(MacosCollectorFailureReason::NonzeroExit)
+        ));
+        assert!(matches!(
+            complete_macos_command(Ok(output(0, "localized warning"))),
+            Err(MacosCollectorFailureReason::StderrNonempty)
+        ));
+        assert!(complete_macos_command(Ok(output(0, ""))).is_ok());
+
+        // The route collector already treats exit one as its documented
+        // no-default-route input and does not interpret localized stderr.
+        assert!(complete_macos_route_command(Ok(output(1, "localized warning"))).is_ok());
+        assert!(matches!(
+            complete_macos_route_command(Ok(output(2, ""))),
+            Err(MacosCollectorFailureReason::NonzeroExit)
+        ));
+    }
+
+    #[test]
+    fn macos_probe_labels_exist_only_for_failures_and_never_copy_output() {
+        let success =
+            MacosCollectorOutcome::success("macos.system", "untrusted-observed-value".to_owned());
+        assert!(success.probe_failure_label().is_none());
+
+        let failure = MacosCollectorOutcome::failure(
+            "macos.storage.identity",
+            MacosCollectorFailureReason::ProjectionInvalid,
+        );
+        assert_eq!(
+            failure.probe_failure_label().as_deref(),
+            Some("macos.storage.identity:reason=projection-invalid:truncated=false")
+        );
+        assert_eq!(
+            failure.observation().output,
+            "collector unavailable: macOS P0 evidence failed closed"
+        );
+        assert!(
+            !failure
+                .probe_failure_label()
+                .expect("failure label")
+                .contains("untrusted-observed-value")
+        );
+
+        let truncated = MacosCollectorOutcome::failure(
+            "macos.storage.inventory",
+            MacosCollectorFailureReason::Truncated,
+        );
+        assert_eq!(
+            truncated.probe_failure_label().as_deref(),
+            Some("macos.storage.inventory:reason=truncated:truncated=true")
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn resident_macos_native_runtime_probe() {
         use std::collections::BTreeSet;
 
-        let quick = collect_macos_identity_observations();
+        let quick = collect_macos_identity_outcomes();
         assert_eq!(quick.len(), 2);
         let quick_failures = quick
             .iter()
-            .filter(|item| !item.success || item.truncated)
-            .map(|item| {
-                format!(
-                    "{}:success={}:truncated={}",
-                    item.collector, item.success, item.truncated
-                )
-            })
+            .filter_map(MacosCollectorOutcome::probe_failure_label)
             .collect::<Vec<_>>();
-        let observations = collect_macos_p0_observations();
+        let observations = collect_macos_p0_outcomes();
         assert_eq!(observations.len(), macos_resident::COLLECTORS.len() + 2);
         let failed_collectors = observations
             .iter()
-            .filter(|item| !item.success || item.truncated)
-            .map(|item| {
-                format!(
-                    "{}:success={}:truncated={}",
-                    item.collector, item.success, item.truncated
-                )
-            })
+            .filter_map(MacosCollectorOutcome::probe_failure_label)
             .collect::<Vec<_>>();
         assert!(
             quick_failures.is_empty() && failed_collectors.is_empty(),
@@ -1789,7 +2092,7 @@ mod tests {
         assert_eq!(
             quick
                 .iter()
-                .map(|item| item.collector)
+                .map(|item| item.observation().collector)
                 .collect::<BTreeSet<_>>(),
             BTreeSet::from(["macos.storage.identity", "macos.system"])
         );
@@ -1800,20 +2103,25 @@ mod tests {
         assert_eq!(
             observations
                 .iter()
-                .map(|item| item.collector)
+                .map(|item| item.observation().collector)
                 .collect::<BTreeSet<_>>(),
             expected
         );
 
         let quick_identity = quick
             .iter()
+            .map(MacosCollectorOutcome::observation)
             .find(|item| item.collector == "macos.storage.identity")
             .expect("quick storage identity");
         let diagnostic_identity = observations
             .iter()
+            .map(MacosCollectorOutcome::observation)
             .find(|item| item.collector == "macos.storage.identity")
             .expect("diagnostic storage identity");
-        assert_eq!(quick_identity.output, diagnostic_identity.output);
+        assert!(
+            quick_identity.output == diagnostic_identity.output,
+            "native macOS storage identity projections differ"
+        );
 
         let evidence = macos_resident::COLLECTORS
             .into_iter()
@@ -1821,6 +2129,7 @@ mod tests {
             .map(|(index, collector)| {
                 let observation = observations
                     .iter()
+                    .map(MacosCollectorOutcome::observation)
                     .find(|item| item.collector == collector)
                     .expect("exact native P0 collector");
                 NativeDiagnosticEvidence {
