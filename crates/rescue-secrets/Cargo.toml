@@ -5,6 +5,7 @@ edition.workspace = true
 
 [features]
 experimental-vault-manager = []
+experimental-codex-home-lease = ["experimental-vault-manager"]
 privileged-probe = ["experimental-vault-manager"]
 
 [dependencies]

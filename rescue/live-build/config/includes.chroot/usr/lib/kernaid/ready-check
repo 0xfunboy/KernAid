@@ -153,6 +153,15 @@ fi
 openai_identity="$(getent passwd kernaid-openai | awk -F: 'NF == 7 && $1 == "kernaid-openai" && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ && $3 == $4 && $3 != 0 && $3 != 1000 && $6 == "/nonexistent" && $7 == "/usr/sbin/nologin" { print $3 ":" $4 }')"
 test -n "$openai_identity" || fail "OpenAI Agent identity is missing or unsafe"
 openai_group_id="${openai_identity#*:}"
+codex_identity="$(getent passwd kernaid-codex | awk -F: 'NF == 7 && $1 == "kernaid-codex" && $3 == 1003 && $4 == 1003 && $6 == "/nonexistent" && $7 == "/usr/sbin/nologin" { print $3 ":" $4 }')"
+test "$codex_identity" = "1003:1003" || fail "Codex Agent identity is missing or unsafe"
+getent passwd | awk -F: '$1 == "kernaid-codex" || $3 == 1003 || $4 == 1003 { count += 1; if (!($1 == "kernaid-codex" && $3 == 1003 && $4 == 1003)) bad = 1 } END { exit !(count == 1 && !bad) }' \
+    || fail "Codex Agent UID or primary GID collides with another identity"
+getent group | awk -F: '$1 == "kernaid-codex" || $3 == 1003 { count += 1; if (!($1 == "kernaid-codex" && $3 == 1003 && $4 == "")) bad = 1 } END { exit !(count == 1 && !bad) }' \
+    || fail "Codex Agent group is missing, colliding, or has supplementary members"
+test "$(id -nG kernaid-codex 2>/dev/null)" = "kernaid-codex" \
+    || fail "Codex Agent has unexpected supplementary access"
+test "$codex_identity" != "$openai_identity" || fail "Codex and OpenAI Agent identities are not distinct"
 getent group kernaid-openai | awk -F: -v gid="$openai_group_id" 'NF == 4 && $1 == "kernaid-openai" && $3 == gid && $4 == "" { found = 1 } END { exit !found }' \
     || fail "OpenAI Agent group has an unsafe identity or supplementary member"
 getent passwd | awk -F: -v gid="$openai_group_id" '$4 == gid { count += 1; if ($1 != "kernaid-openai") bad = 1 } END { exit !(count == 1 && !bad) }' \
@@ -175,7 +184,7 @@ for forbidden_group in kernaid-vault kernaid-provider-client kernaid-openai; do
 done
 for subordinate_ids in /etc/subuid /etc/subgid; do
     if [ -r "$subordinate_ids" ] \
-        && grep -Eq '^(kernaid|kernaid-openai|kernaid-openai-egress):' "$subordinate_ids"; then
+        && grep -Eq '^(kernaid|kernaid-codex|kernaid-openai|kernaid-openai-egress):' "$subordinate_ids"; then
         fail "Rescue identities unexpectedly have subordinate IDs"
     fi
 done

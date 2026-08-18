@@ -1705,8 +1705,8 @@ pub(crate) fn validate_o_path_directory(
     let fd_flags =
         rustix::io::fcntl_getfd(descriptor).map_err(|_| ProtocolViolation::InvalidDescriptor)?;
     if !FileType::from_raw_mode(stat.st_mode).is_dir()
-        || !status.contains(OFlags::PATH)
-        || !fd_flags.contains(rustix::io::FdFlags::CLOEXEC)
+        || status != (OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW)
+        || fd_flags != rustix::io::FdFlags::CLOEXEC
     {
         return Err(ProtocolViolation::InvalidDescriptor);
     }
@@ -2976,11 +2976,46 @@ mod tests {
         });
         let lease = rustix::fs::open(
             "/",
-            OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         )
         .expect("O_PATH directory");
         assert!(encode_success(&request, 8, &payload, &[lease.as_fd()]).is_ok());
+
+        let missing_directory = rustix::fs::open(
+            "/",
+            OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .expect("O_PATH without O_DIRECTORY");
+        assert_eq!(
+            encode_success(&request, 8, &payload, &[missing_directory.as_fd()]).err(),
+            Some(ProtocolViolation::InvalidDescriptor)
+        );
+
+        let missing_nofollow = rustix::fs::open(
+            "/",
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .expect("O_PATH without O_NOFOLLOW");
+        assert_eq!(
+            encode_success(&request, 8, &payload, &[missing_nofollow.as_fd()]).err(),
+            Some(ProtocolViolation::InvalidDescriptor)
+        );
+
+        let missing_cloexec = rustix::fs::open(
+            "/",
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .expect("O_PATH before clearing CLOEXEC");
+        rustix::io::fcntl_setfd(&missing_cloexec, rustix::io::FdFlags::empty())
+            .expect("clear CLOEXEC");
+        assert_eq!(
+            encode_success(&request, 8, &payload, &[missing_cloexec.as_fd()]).err(),
+            Some(ProtocolViolation::InvalidDescriptor)
+        );
 
         let ordinary = rustix::fs::open(
             "/",

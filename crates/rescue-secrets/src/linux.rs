@@ -130,6 +130,62 @@ impl RescueVaultSecrets {
         RescueVaultApplicationStore::open(&self.inner)
     }
 
+    /// Open the pre-provisioned Codex home as a descriptor-only capability.
+    ///
+    /// This deliberately never creates, repairs, renames, or changes ownership
+    /// of the directory. Provisioning is a separate trusted writer. `None`
+    /// means that writer has not configured a Codex home yet; every ambiguous
+    /// or unsafe object is an error.
+    #[cfg(feature = "experimental-codex-home-lease")]
+    pub(crate) fn open_codex_home_lease(&self) -> Result<Option<OwnedFd>, RescueSecretError> {
+        self.open_codex_home_lease_for(crate::CODEX_AGENT_UID, crate::CODEX_AGENT_GID)
+    }
+
+    #[cfg(feature = "experimental-codex-home-lease")]
+    fn open_codex_home_lease_for(
+        &self,
+        expected_uid: u32,
+        expected_gid: u32,
+    ) -> Result<Option<OwnedFd>, RescueSecretError> {
+        let _guard = self.inner.operation_guard()?;
+        self.inner.ensure_integrity()?;
+        let descriptor = match open_child(
+            &self.inner.root_fd,
+            Path::new(crate::CODEX_HOME_NAME),
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(descriptor) => descriptor,
+            Err(error) if error == rustix::io::Errno::NOENT => return Ok(None),
+            Err(_) => return Err(RescueSecretError::UnsafePath),
+        };
+        validate_codex_home_descriptor(
+            &descriptor,
+            &self.inner.root_fd,
+            self.inner.root_mount_id,
+            expected_uid,
+            expected_gid,
+        )?;
+        let named = rfs::statat(
+            &self.inner.root_fd,
+            crate::CODEX_HOME_NAME,
+            AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|_| RescueSecretError::StaleVault)?;
+        validate_codex_home_stat(&named, expected_uid, expected_gid)?;
+        let opened = rfs::fstat(&descriptor).map_err(|_| RescueSecretError::StorageUnavailable)?;
+        if opened.st_dev != named.st_dev || opened.st_ino != named.st_ino {
+            return Err(RescueSecretError::StaleVault);
+        }
+        self.inner.ensure_integrity()?;
+        Ok(Some(descriptor))
+    }
+
+    #[cfg(all(test, feature = "experimental-codex-home-lease"))]
+    fn open_codex_home_lease_for_test(&self) -> Result<Option<OwnedFd>, RescueSecretError> {
+        self.open_codex_home_lease_for(self.inner.owner.uid, self.inner.owner.gid)
+    }
+
     #[cfg(test)]
     pub(crate) fn open_for_test(
         root: impl AsRef<Path>,
@@ -204,6 +260,48 @@ impl RescueVaultSecrets {
         inner.ensure_integrity()?;
         Ok(Self { inner })
     }
+}
+
+#[cfg(feature = "experimental-codex-home-lease")]
+fn validate_codex_home_descriptor(
+    descriptor: &OwnedFd,
+    root: &OwnedFd,
+    expected_mount_id: u64,
+    expected_uid: u32,
+    expected_gid: u32,
+) -> Result<(), RescueSecretError> {
+    let stat = rfs::fstat(descriptor).map_err(|_| RescueSecretError::StorageUnavailable)?;
+    validate_codex_home_stat(&stat, expected_uid, expected_gid)?;
+    let root_stat = rfs::fstat(root).map_err(|_| RescueSecretError::StorageUnavailable)?;
+    let status = rfs::fcntl_getfl(descriptor).map_err(|_| RescueSecretError::StorageUnavailable)?;
+    let descriptor_flags =
+        rustix::io::fcntl_getfd(descriptor).map_err(|_| RescueSecretError::StorageUnavailable)?;
+    if stat.st_dev != root_stat.st_dev
+        || descriptor_mount_id(descriptor)? != expected_mount_id
+        || !crate::codex_home_status_flags_are_exact(status)
+        || descriptor_flags != rustix::io::FdFlags::CLOEXEC
+    {
+        return Err(RescueSecretError::UnsafePath);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "experimental-codex-home-lease")]
+fn validate_codex_home_stat(
+    stat: &Stat,
+    expected_uid: u32,
+    expected_gid: u32,
+) -> Result<(), RescueSecretError> {
+    if !FileType::from_raw_mode(stat.st_mode).is_dir() || stat.st_nlink < 2 {
+        return Err(RescueSecretError::UnsafePath);
+    }
+    if stat.st_uid != expected_uid || stat.st_gid != expected_gid {
+        return Err(RescueSecretError::WrongOwner);
+    }
+    if mode_bits(stat) != DIRECTORY_MODE {
+        return Err(RescueSecretError::UnsafePermissions);
+    }
+    Ok(())
 }
 
 /// LUKS-vault implementation of the encrypted journal's secret-store trait.
@@ -1989,6 +2087,185 @@ mod tests {
             sequence,
             entry_hash: [9; 32],
         }
+    }
+
+    #[cfg(feature = "experimental-codex-home-lease")]
+    fn create_test_codex_home(fixture: &Fixture) -> PathBuf {
+        let home = fixture.root.join(crate::CODEX_HOME_NAME);
+        fs::create_dir(&home).expect("create Codex home");
+        fs::set_permissions(&home, fs::Permissions::from_mode(DIRECTORY_MODE))
+            .expect("set Codex home mode");
+        home
+    }
+
+    #[cfg(feature = "experimental-codex-home-lease")]
+    #[test]
+    fn codex_home_lease_is_absent_or_exact_descriptor_without_creation() {
+        let fixture = Fixture::new();
+        let vault = fixture.open();
+        assert!(
+            vault
+                .open_codex_home_lease_for_test()
+                .expect("absent home")
+                .is_none()
+        );
+        assert!(!fixture.root.join(crate::CODEX_HOME_NAME).exists());
+        drop(vault);
+
+        let home = create_test_codex_home(&fixture);
+        fs::create_dir(home.join("sessions")).expect("persistent child directory");
+        let vault = fixture.open();
+        let descriptor = vault
+            .open_codex_home_lease_for_test()
+            .expect("open home")
+            .expect("configured home");
+        let stat = rfs::fstat(&descriptor).expect("home stat");
+        let named = fs::symlink_metadata(&home).expect("named home");
+        assert!(FileType::from_raw_mode(stat.st_mode).is_dir());
+        assert!(
+            stat.st_nlink >= 3,
+            "persistent subdirectories remain allowed"
+        );
+        assert_eq!(stat.st_uid, fixture.owner.uid);
+        assert_eq!(stat.st_gid, fixture.owner.gid);
+        assert_eq!(stat.st_mode & 0o7777, DIRECTORY_MODE);
+        assert_eq!(stat.st_ino, named.ino());
+        assert_eq!(
+            rfs::fcntl_getfl(&descriptor).expect("status flags"),
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW
+        );
+        assert_eq!(
+            rustix::io::fcntl_getfd(&descriptor).expect("descriptor flags"),
+            rustix::io::FdFlags::CLOEXEC
+        );
+    }
+
+    #[cfg(feature = "experimental-codex-home-lease")]
+    #[test]
+    fn codex_home_rejects_symlink_file_and_unsafe_mode() {
+        let fixture = Fixture::new();
+        let outside = fixture.root.join("outside");
+        fs::create_dir(&outside).expect("outside directory");
+        symlink(&outside, fixture.root.join(crate::CODEX_HOME_NAME)).expect("home symlink");
+        let vault = fixture.open();
+        assert!(vault.open_codex_home_lease_for_test().is_err());
+        drop(vault);
+        fs::remove_file(fixture.root.join(crate::CODEX_HOME_NAME)).expect("remove symlink");
+
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(DIRECTORY_MODE)
+            .open(fixture.root.join(crate::CODEX_HOME_NAME))
+            .expect("home regular file");
+        let vault = fixture.open();
+        assert!(vault.open_codex_home_lease_for_test().is_err());
+        drop(vault);
+        fs::remove_file(fixture.root.join(crate::CODEX_HOME_NAME)).expect("remove file");
+
+        let home = create_test_codex_home(&fixture);
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o750)).expect("unsafe mode");
+        let vault = fixture.open();
+        assert_eq!(
+            vault.open_codex_home_lease_for_test().err(),
+            Some(RescueSecretError::UnsafePermissions)
+        );
+    }
+
+    #[cfg(feature = "experimental-codex-home-lease")]
+    #[test]
+    fn codex_home_metadata_rejects_owner_link_and_mount_identity_changes() {
+        let fixture = Fixture::new();
+        let home = create_test_codex_home(&fixture);
+        let vault = fixture.open();
+        let descriptor = open_child(
+            &vault.inner.root_fd,
+            Path::new(crate::CODEX_HOME_NAME),
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .expect("home descriptor");
+        let mut stat = rfs::fstat(&descriptor).expect("home stat");
+        stat.st_uid = stat.st_uid.saturating_add(1);
+        assert_eq!(
+            validate_codex_home_stat(&stat, fixture.owner.uid, fixture.owner.gid),
+            Err(RescueSecretError::WrongOwner)
+        );
+        stat.st_uid = fixture.owner.uid;
+        stat.st_gid = stat.st_gid.saturating_add(1);
+        assert_eq!(
+            validate_codex_home_stat(&stat, fixture.owner.uid, fixture.owner.gid),
+            Err(RescueSecretError::WrongOwner)
+        );
+        stat.st_gid = fixture.owner.gid;
+        stat.st_nlink = 1;
+        assert_eq!(
+            validate_codex_home_stat(&stat, fixture.owner.uid, fixture.owner.gid),
+            Err(RescueSecretError::UnsafePath)
+        );
+        assert!(
+            validate_codex_home_descriptor(
+                &descriptor,
+                &vault.inner.root_fd,
+                vault.inner.root_mount_id.saturating_add(1),
+                fixture.owner.uid,
+                fixture.owner.gid,
+            )
+            .is_err()
+        );
+
+        for flags in [
+            OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        ] {
+            let inexact = open_child(
+                &vault.inner.root_fd,
+                Path::new(crate::CODEX_HOME_NAME),
+                flags,
+                Mode::empty(),
+            )
+            .expect("inexact O_PATH descriptor");
+            assert_eq!(
+                validate_codex_home_descriptor(
+                    &inexact,
+                    &vault.inner.root_fd,
+                    vault.inner.root_mount_id,
+                    fixture.owner.uid,
+                    fixture.owner.gid,
+                ),
+                Err(RescueSecretError::UnsafePath)
+            );
+        }
+
+        let foreign = tempfile::Builder::new()
+            .prefix("kernaid-codex-home-")
+            .tempdir_in("/dev/shm")
+            .expect("foreign tmpfs directory");
+        fs::set_permissions(foreign.path(), fs::Permissions::from_mode(DIRECTORY_MODE))
+            .expect("foreign mode");
+        let foreign_descriptor = rfs::openat2(
+            CWD,
+            foreign.path(),
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+        )
+        .expect("foreign descriptor");
+        assert_ne!(
+            descriptor_mount_id(&foreign_descriptor).expect("foreign mount id"),
+            vault.inner.root_mount_id
+        );
+        assert!(
+            validate_codex_home_descriptor(
+                &foreign_descriptor,
+                &vault.inner.root_fd,
+                vault.inner.root_mount_id,
+                fixture.owner.uid,
+                fixture.owner.gid,
+            )
+            .is_err()
+        );
+        assert!(home.is_dir());
     }
 
     fn write_test_secret_file(path: &Path, kind: SecretKind, value: &[u8]) {

@@ -25,6 +25,12 @@ const OPENAI_AGENT_SHELL: &[u8] = b"/usr/sbin/nologin";
 const OPENAI_AGENT_GROUP: &[u8] = b"kernaid-openai";
 const OPENAI_VAULT_GROUP: &[u8] = b"kernaid-vault";
 const PROVIDER_CLIENT_GROUP: &[u8] = b"kernaid-provider-client";
+#[cfg(feature = "experimental-codex-home-lease")]
+const CODEX_AGENT_NAME: &[u8] = b"kernaid-codex";
+#[cfg(feature = "experimental-codex-home-lease")]
+const CODEX_AGENT_HOME: &[u8] = b"/nonexistent";
+#[cfg(feature = "experimental-codex-home-lease")]
+const CODEX_AGENT_SHELL: &[u8] = b"/usr/sbin/nologin";
 
 const PROC_SUPER_MAGIC: u64 = 0x0000_9fa0;
 const MAX_PROC_POLICY_BYTES: usize = 4096;
@@ -443,6 +449,67 @@ pub(super) fn passwd_openai_agent_uid(bytes: &[u8], companion_uid: u32) -> Optio
     Some(uid)
 }
 
+/// Validates the fixed, collision-free Codex identity used by both the
+/// descriptor owner and the authenticated Agent role. The UID/GID are never
+/// accepted from configuration or the wire.
+#[cfg(feature = "experimental-codex-home-lease")]
+pub(super) fn passwd_has_exact_codex_agent(bytes: &[u8], companion_uid: u32) -> bool {
+    let mut matching_name = 0_usize;
+    let mut matching_uid = 0_usize;
+    let mut matching_gid = 0_usize;
+    for line in bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        if line.len() > 4096 || line.contains(&0) {
+            return false;
+        }
+        let fields: Vec<&[u8]> = line.split(|byte| *byte == b':').collect();
+        if fields.len() != 7
+            || fields[0].is_empty()
+            || fields[2].is_empty()
+            || fields[3].is_empty()
+            || !fields[2].iter().all(u8::is_ascii_digit)
+            || !fields[3].iter().all(u8::is_ascii_digit)
+            || (fields[2].len() > 1 && fields[2][0] == b'0')
+            || (fields[3].len() > 1 && fields[3][0] == b'0')
+        {
+            return false;
+        }
+        let Some(uid) = std::str::from_utf8(fields[2])
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            return false;
+        };
+        let Some(gid) = std::str::from_utf8(fields[3])
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            return false;
+        };
+        let has_name = fields[0] == CODEX_AGENT_NAME;
+        let has_uid = uid == crate::CODEX_AGENT_UID;
+        let has_gid = gid == crate::CODEX_AGENT_GID;
+        if has_name
+            && (uid != crate::CODEX_AGENT_UID
+                || gid != crate::CODEX_AGENT_GID
+                || uid == 0
+                || uid == companion_uid
+                || fields[5] != CODEX_AGENT_HOME
+                || fields[6] != CODEX_AGENT_SHELL)
+            || has_uid && !has_name
+            || has_gid && !has_name
+        {
+            return false;
+        }
+        matching_name += usize::from(has_name);
+        matching_uid += usize::from(has_uid);
+        matching_gid += usize::from(has_gid);
+    }
+    matching_name == 1 && matching_uid == 1 && matching_gid == 1
+}
+
 /// Validates the two group capabilities around the OpenAI application plane.
 /// The Agent has exactly one supplemental membership (`kernaid-vault`) and is
 /// explicitly absent from the UI-facing provider-client group.
@@ -555,6 +622,50 @@ pub(super) fn group_has_exact_openai_boundaries(bytes: &[u8], agent_uid: u32) ->
     true
 }
 
+#[cfg(feature = "experimental-codex-home-lease")]
+pub(super) fn group_has_exact_codex_boundaries(bytes: &[u8]) -> bool {
+    let mut matching_name = 0_usize;
+    let mut matching_gid = 0_usize;
+    for line in bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        if line.len() > 4096 || line.contains(&0) {
+            return false;
+        }
+        let fields: Vec<&[u8]> = line.split(|byte| *byte == b':').collect();
+        if fields.len() != 4
+            || fields[0].is_empty()
+            || fields[2].is_empty()
+            || !fields[2].iter().all(u8::is_ascii_digit)
+            || (fields[2].len() > 1 && fields[2][0] == b'0')
+        {
+            return false;
+        }
+        let Some(gid) = std::str::from_utf8(fields[2])
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            return false;
+        };
+        let has_name = fields[0] == CODEX_AGENT_NAME;
+        let has_gid = gid == crate::CODEX_AGENT_GID;
+        let members = fields[3];
+        if (!members.is_empty()
+            && members
+                .split(|byte| *byte == b',')
+                .any(|member| member == CODEX_AGENT_NAME))
+            || has_name && (gid != crate::CODEX_AGENT_GID || !members.is_empty())
+            || has_gid && !has_name
+        {
+            return false;
+        }
+        matching_name += usize::from(has_name);
+        matching_gid += usize::from(has_gid);
+    }
+    matching_name == 1 && matching_gid == 1
+}
+
 #[cfg(test)]
 mod passwd_agent_tests {
     use super::*;
@@ -632,6 +743,54 @@ kernaid-openai:x:994:\n";
             b"kernaid-vault:x:993:kernaid,kernaid-openai,extra\nkernaid-provider-client:x:992:\nkernaid-openai:x:994:\n".as_slice(),
         ] {
             assert!(!group_has_exact_openai_boundaries(invalid, 994));
+        }
+    }
+
+    #[cfg(feature = "experimental-codex-home-lease")]
+    #[test]
+    fn static_codex_identity_is_exact_and_collision_free() {
+        const PASSWD: &[u8] = b"root:x:0:0:root:/root:/bin/bash\n\
+kernaid:x:1000:1000:KernAid:/home/kernaid:/bin/bash\n\
+kernaid-codex:x:1003:1003:KernAid Rescue Codex executor:/nonexistent:/usr/sbin/nologin\n\
+kernaid-openai:x:994:994:KernAid Rescue OpenAI executor:/nonexistent:/usr/sbin/nologin\n";
+        assert!(passwd_has_exact_codex_agent(PASSWD, 1000));
+        for invalid in [
+            b"root:x:0:0:root:/root:/bin/bash\nkernaid:x:1000:1000:KernAid:/home/kernaid:/bin/bash\nkernaid-codex:x:1004:1003:Codex:/nonexistent:/usr/sbin/nologin\n".to_vec(),
+            b"root:x:0:0:root:/root:/bin/bash\nkernaid:x:1000:1000:KernAid:/home/kernaid:/bin/bash\nkernaid-codex:x:1003:1003:Codex:/home/codex:/usr/sbin/nologin\n".to_vec(),
+            [
+                PASSWD,
+                b"other:x:1003:1004:collision:/nonexistent:/usr/sbin/nologin\n",
+            ]
+            .concat(),
+            [
+                PASSWD,
+                b"other:x:1004:1003:collision:/nonexistent:/usr/sbin/nologin\n",
+            ]
+            .concat(),
+            [
+                PASSWD,
+                b"kernaid-codex:x:1004:1004:duplicate:/nonexistent:/usr/sbin/nologin\n",
+            ]
+            .concat(),
+        ] {
+            assert!(!passwd_has_exact_codex_agent(&invalid, 1000));
+        }
+    }
+
+    #[cfg(feature = "experimental-codex-home-lease")]
+    #[test]
+    fn static_codex_group_has_no_collision_or_supplementary_membership() {
+        const GROUP: &[u8] = b"root:x:0:\nkernaid-vault:x:993:kernaid,kernaid-openai\n\
+kernaid-codex:x:1003:\nkernaid-openai:x:994:\n";
+        assert!(group_has_exact_codex_boundaries(GROUP));
+        for invalid in [
+            b"root:x:0:\nkernaid-codex:x:1003:other\n".as_slice(),
+            b"root:x:0:\nkernaid-codex:x:1004:\n".as_slice(),
+            b"root:x:0:\nother:x:1003:\n".as_slice(),
+            b"root:x:0:\nkernaid-codex:x:1003:\nextra:x:1004:kernaid-codex\n".as_slice(),
+            b"root:x:0:\nkernaid-codex:x:1003:\nother:x:1003:\n".as_slice(),
+        ] {
+            assert!(!group_has_exact_codex_boundaries(invalid));
         }
     }
 }

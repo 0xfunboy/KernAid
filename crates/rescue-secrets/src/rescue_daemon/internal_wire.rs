@@ -4,7 +4,9 @@
 //! command string, diagnostic text, or JSON. The sole permitted descriptor is
 //! one anonymous pipe on an `Unlock`, `ProviderOpenAiConfigure`, or leased
 //! `ProviderOpenAiBorrow` command. Borrow carries only the worker's write end;
-//! the supervisor retains the read end and never reads credential bytes.
+//! the supervisor retains the read end and never reads credential bytes. With
+//! the separate experimental Codex-home feature, one successful response may
+//! instead carry the already validated `O_PATH` home-directory descriptor.
 
 use kernaid_protocol::rescue_vault::{
     MAX_OPENAI_KEY_BYTES, MAX_PASSPHRASE_BYTES, MIN_PASSPHRASE_BYTES,
@@ -24,6 +26,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(feature = "experimental-codex-home-lease")]
+use std::os::fd::AsFd;
+
 const COMMAND_MAGIC: &[u8; 8] = b"KRVWC002";
 const RESPONSE_MAGIC: &[u8; 8] = b"KRVWR002";
 const COMMAND_BYTES: usize = 32;
@@ -42,6 +47,8 @@ pub(super) enum WorkerCommandKind {
     ProviderOpenAiConfigure,
     ProviderOpenAiLogout,
     ProviderOpenAiBorrow,
+    #[cfg(feature = "experimental-codex-home-lease")]
+    ProviderCodexHomeLease,
     AttestQuiescent,
     Shutdown,
 }
@@ -118,6 +125,15 @@ impl WorkerCommand {
         }
     }
 
+    #[cfg(feature = "experimental-codex-home-lease")]
+    pub(super) fn provider_codex_home_lease(request_id: u64) -> Self {
+        Self {
+            request_id,
+            kind: WorkerCommandKind::ProviderCodexHomeLease,
+            secret_size: 0,
+        }
+    }
+
     pub(super) fn shutdown(request_id: u64) -> Self {
         Self {
             request_id,
@@ -159,6 +175,8 @@ impl WorkerCommand {
             WorkerCommandKind::ProviderOpenAiConfigure => 8,
             WorkerCommandKind::ProviderOpenAiLogout => 9,
             WorkerCommandKind::ProviderOpenAiBorrow => 10,
+            #[cfg(feature = "experimental-codex-home-lease")]
+            WorkerCommandKind::ProviderCodexHomeLease => 11,
         };
         bytes[16..24].copy_from_slice(&self.request_id.to_be_bytes());
         bytes[24..26].copy_from_slice(&self.secret_size.to_be_bytes());
@@ -194,6 +212,8 @@ impl WorkerCommand {
             8 => WorkerCommandKind::ProviderOpenAiConfigure,
             9 => WorkerCommandKind::ProviderOpenAiLogout,
             10 => WorkerCommandKind::ProviderOpenAiBorrow,
+            #[cfg(feature = "experimental-codex-home-lease")]
+            11 => WorkerCommandKind::ProviderCodexHomeLease,
             _ => return Err(InternalWireError::InvalidFrame),
         };
         let command = Self {
@@ -249,6 +269,10 @@ pub(super) enum WorkerResultCode {
     ProviderStateAmbiguous,
     ProviderBorrowReady,
     ProviderBorrowUnconfigured,
+    #[cfg(feature = "experimental-codex-home-lease")]
+    ProviderCodexHomeReady,
+    #[cfg(feature = "experimental-codex-home-lease")]
+    ProviderCodexHomeUnconfigured,
 }
 
 impl WorkerResultCode {
@@ -286,6 +310,10 @@ impl WorkerResultCode {
             Self::ProviderStateAmbiguous => 30,
             Self::ProviderBorrowReady => 31,
             Self::ProviderBorrowUnconfigured => 32,
+            #[cfg(feature = "experimental-codex-home-lease")]
+            Self::ProviderCodexHomeReady => 33,
+            #[cfg(feature = "experimental-codex-home-lease")]
+            Self::ProviderCodexHomeUnconfigured => 34,
         }
     }
 
@@ -323,6 +351,10 @@ impl WorkerResultCode {
             30 => Ok(Self::ProviderStateAmbiguous),
             31 => Ok(Self::ProviderBorrowReady),
             32 => Ok(Self::ProviderBorrowUnconfigured),
+            #[cfg(feature = "experimental-codex-home-lease")]
+            33 => Ok(Self::ProviderCodexHomeReady),
+            #[cfg(feature = "experimental-codex-home-lease")]
+            34 => Ok(Self::ProviderCodexHomeUnconfigured),
             _ => Err(InternalWireError::InvalidFrame),
         }
     }
@@ -362,6 +394,11 @@ impl WorkerResponse {
             device_id: None,
             output_size: Some(output_size),
         }
+    }
+
+    #[cfg(feature = "experimental-codex-home-lease")]
+    pub(super) fn provider_codex_home_ready(request_id: u64) -> Self {
+        Self::new(request_id, WorkerResultCode::ProviderCodexHomeReady)
     }
 
     fn encode(&self) -> Result<[u8; RESPONSE_BYTES], InternalWireError> {
@@ -521,6 +558,25 @@ pub(super) fn send_response(
     send_record(socket, &response.encode()?, &[], deadline)
 }
 
+#[cfg(feature = "experimental-codex-home-lease")]
+pub(super) fn send_codex_home_response(
+    socket: BorrowedFd<'_>,
+    response: &WorkerResponse,
+    descriptor: Option<BorrowedFd<'_>>,
+    deadline: Instant,
+) -> Result<(), InternalWireError> {
+    match (response.code, descriptor) {
+        (WorkerResultCode::ProviderCodexHomeReady, Some(descriptor)) => {
+            validate_codex_home_descriptor(descriptor)?;
+            send_record(socket, &response.encode()?, &[descriptor], deadline)
+        }
+        (WorkerResultCode::ProviderCodexHomeUnconfigured, None) => {
+            send_record(socket, &response.encode()?, &[], deadline)
+        }
+        _ => Err(InternalWireError::InvalidDescriptors),
+    }
+}
+
 pub(super) fn receive_response(
     socket: BorrowedFd<'_>,
     expected_request_id: u64,
@@ -535,6 +591,58 @@ pub(super) fn receive_response(
         return Err(InternalWireError::InvalidFrame);
     }
     Ok(response)
+}
+
+#[cfg(feature = "experimental-codex-home-lease")]
+pub(super) fn receive_codex_home_response(
+    socket: BorrowedFd<'_>,
+    expected_request_id: u64,
+    deadline: Instant,
+) -> Result<(WorkerResponse, Option<OwnedFd>), InternalWireError> {
+    let (bytes, mut descriptors) = receive_record(socket, deadline)?;
+    let response = WorkerResponse::decode(&bytes)?;
+    if response.request_id != expected_request_id {
+        return Err(InternalWireError::InvalidFrame);
+    }
+    match (response.code, descriptors.len()) {
+        (WorkerResultCode::ProviderCodexHomeReady, 1) => {
+            let descriptor = descriptors
+                .pop()
+                .ok_or(InternalWireError::InvalidDescriptors)?;
+            validate_codex_home_descriptor(descriptor.as_fd())?;
+            Ok((response, Some(descriptor)))
+        }
+        (
+            WorkerResultCode::ProviderCodexHomeUnconfigured
+            | WorkerResultCode::ProviderStateAmbiguous
+            | WorkerResultCode::CleanupFailed
+            | WorkerResultCode::Busy
+            | WorkerResultCode::InvalidRequest,
+            0,
+        ) => Ok((response, None)),
+        _ => Err(InternalWireError::InvalidDescriptors),
+    }
+}
+
+#[cfg(feature = "experimental-codex-home-lease")]
+fn validate_codex_home_descriptor(descriptor: BorrowedFd<'_>) -> Result<(), InternalWireError> {
+    use rustix::fs::{self as rfs, FileType};
+
+    let stat = rfs::fstat(descriptor).map_err(|_| InternalWireError::InvalidDescriptors)?;
+    let status = rfs::fcntl_getfl(descriptor).map_err(|_| InternalWireError::InvalidDescriptors)?;
+    let flags =
+        rustix::io::fcntl_getfd(descriptor).map_err(|_| InternalWireError::InvalidDescriptors)?;
+    if !FileType::from_raw_mode(stat.st_mode).is_dir()
+        || stat.st_nlink < 2
+        || stat.st_uid != crate::CODEX_AGENT_UID
+        || stat.st_gid != crate::CODEX_AGENT_GID
+        || stat.st_mode & 0o7777 != 0o700
+        || !crate::codex_home_status_flags_are_exact(status)
+        || flags != rustix::io::FdFlags::CLOEXEC
+    {
+        return Err(InternalWireError::InvalidDescriptors);
+    }
+    Ok(())
 }
 
 pub(super) fn validate_control_socket(socket: BorrowedFd<'_>) -> Result<(), InternalWireError> {
@@ -767,6 +875,21 @@ mod tests {
         assert_eq!(command, WorkerCommand::provider_openai_borrow(9));
         assert!(descriptor.is_some());
 
+        #[cfg(feature = "experimental-codex-home-lease")]
+        {
+            send_command(
+                parent.as_fd(),
+                WorkerCommand::provider_codex_home_lease(10),
+                None,
+                deadline,
+            )
+            .expect("send Codex home lease");
+            let (command, descriptor) =
+                receive_command(worker.as_fd(), deadline).expect("receive Codex home lease");
+            assert_eq!(command, WorkerCommand::provider_codex_home_lease(10));
+            assert!(descriptor.is_none());
+        }
+
         let response = WorkerResponse::unlocked(7, "KA-0123456789abcdef01234567".to_owned());
         send_response(worker.as_fd(), &response, deadline).expect("send response");
         assert_eq!(
@@ -780,6 +903,16 @@ mod tests {
             receive_response(parent.as_fd(), 9, deadline).expect("receive borrow response"),
             response
         );
+
+        #[cfg(feature = "experimental-codex-home-lease")]
+        {
+            let response = WorkerResponse::new(10, WorkerResultCode::ProviderCodexHomeUnconfigured);
+            send_response(worker.as_fd(), &response, deadline).expect("send unconfigured home");
+            let (observed, descriptor) = receive_codex_home_response(parent.as_fd(), 10, deadline)
+                .expect("receive unconfigured home");
+            assert_eq!(observed, response);
+            assert!(descriptor.is_none());
+        }
     }
 
     #[test]
@@ -807,6 +940,24 @@ mod tests {
             WorkerCommand::decode(&noncanonical_borrow),
             Err(InternalWireError::InvalidFrame)
         );
+        #[cfg(feature = "experimental-codex-home-lease")]
+        {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let home = WorkerCommand::provider_codex_home_lease(1)
+                .encode()
+                .expect("home frame");
+            assert_eq!(home[8], 11);
+            assert_eq!(&home[24..26], &[0, 0]);
+            assert_eq!(
+                send_command(
+                    pair().0.as_fd(),
+                    WorkerCommand::provider_codex_home_lease(1),
+                    Some(read_pipe_for_test().as_fd()),
+                    deadline,
+                ),
+                Err(InternalWireError::InvalidDescriptors)
+            );
+        }
         assert_eq!(
             WorkerResponse::new(1, WorkerResultCode::ProviderBorrowReady).encode(),
             Err(InternalWireError::InvalidFrame)
@@ -892,6 +1043,35 @@ mod tests {
             ),
             Err(InternalWireError::InvalidDescriptors)
         );
+    }
+
+    #[cfg(feature = "experimental-codex-home-lease")]
+    fn read_pipe_for_test() -> OwnedFd {
+        pipe_with(PipeFlags::CLOEXEC).expect("pipe").0
+    }
+
+    #[cfg(feature = "experimental-codex-home-lease")]
+    #[test]
+    fn codex_home_response_rejects_missing_or_wrong_owner_descriptors() {
+        let (sender, receiver) = pair();
+        let response = WorkerResponse::provider_codex_home_ready(41);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        assert_eq!(
+            send_codex_home_response(sender.as_fd(), &response, None, deadline),
+            Err(InternalWireError::InvalidDescriptors)
+        );
+
+        let directory = rustix::fs::open(
+            "/tmp",
+            rustix::fs::OFlags::PATH | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .expect("temporary directory");
+        assert_eq!(
+            send_codex_home_response(sender.as_fd(), &response, Some(directory.as_fd()), deadline,),
+            Err(InternalWireError::InvalidDescriptors)
+        );
+        drop(receiver);
     }
 
     #[test]

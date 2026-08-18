@@ -56,6 +56,8 @@ const PROVIDER_AGENT_CGROUP_NAME: &[u8] = b"agent";
 const PROVIDER_CONTROL_CGROUP_NAME: &[u8] = b".control";
 const SYSTEM_SLICE_CGROUP_NAME: &[u8] = b"system.slice";
 const OPENAI_EXECUTOR_UNIT_PREFIX: &[u8] = b"kernaid-rescue-openai-executor@";
+#[cfg(feature = "experimental-codex-home-lease")]
+const CODEX_EXECUTOR_UNIT_PREFIX: &[u8] = b"kernaid-rescue-codex@";
 const LEASE_PROBE_UNIT_PREFIX: &[u8] = b"kernaid-provider-lease-probe@";
 const SERVICE_UNIT_SUFFIX: &[u8] = b".service";
 const PROVIDER_UNIT_ROOT_AGENT_CONTROLS: [(&str, u32); 3] = [
@@ -725,6 +727,8 @@ impl ProviderProcessBoundary {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ProviderUnitKind {
     OpenAiExecutor,
+    #[cfg(feature = "experimental-codex-home-lease")]
+    CodexExecutor,
     LeaseProbe,
 }
 
@@ -882,6 +886,8 @@ impl ProviderCgroupTree {
         }
         let expected_children: &[&[u8]] = match self.kind {
             ProviderUnitKind::OpenAiExecutor => &[PROVIDER_AGENT_CGROUP_NAME],
+            #[cfg(feature = "experimental-codex-home-lease")]
+            ProviderUnitKind::CodexExecutor => &[PROVIDER_AGENT_CGROUP_NAME],
             ProviderUnitKind::LeaseProbe => {
                 &[PROVIDER_CONTROL_CGROUP_NAME, PROVIDER_AGENT_CGROUP_NAME]
             }
@@ -1005,6 +1011,8 @@ impl ProviderCgroupTree {
         }
         let expected_children: &[&[u8]] = match self.kind {
             ProviderUnitKind::OpenAiExecutor => &[PROVIDER_AGENT_CGROUP_NAME],
+            #[cfg(feature = "experimental-codex-home-lease")]
+            ProviderUnitKind::CodexExecutor => &[PROVIDER_AGENT_CGROUP_NAME],
             ProviderUnitKind::LeaseProbe => {
                 &[PROVIDER_CONTROL_CGROUP_NAME, PROVIDER_AGENT_CGROUP_NAME]
             }
@@ -1075,6 +1083,8 @@ fn garbage_collection_evidence_is_terminal(
 fn provider_child_directories_are_exact(kind: ProviderUnitKind, children: &[&[u8]]) -> bool {
     match kind {
         ProviderUnitKind::OpenAiExecutor => children == [PROVIDER_AGENT_CGROUP_NAME],
+        #[cfg(feature = "experimental-codex-home-lease")]
+        ProviderUnitKind::CodexExecutor => children == [PROVIDER_AGENT_CGROUP_NAME],
         ProviderUnitKind::LeaseProbe => {
             children == [PROVIDER_CONTROL_CGROUP_NAME, PROVIDER_AGENT_CGROUP_NAME]
         }
@@ -1127,6 +1137,13 @@ fn parse_provider_membership(bytes: &[u8]) -> Result<ProviderMembership, RescueV
     } else if valid_instantiated_service(unit, LEASE_PROBE_UNIT_PREFIX) {
         ProviderUnitKind::LeaseProbe
     } else {
+        #[cfg(feature = "experimental-codex-home-lease")]
+        if valid_instantiated_service(unit, CODEX_EXECUTOR_UNIT_PREFIX) {
+            ProviderUnitKind::CodexExecutor
+        } else {
+            return Err(RescueVaultDaemonError::CgroupUnavailable);
+        }
+        #[cfg(not(feature = "experimental-codex-home-lease"))]
         return Err(RescueVaultDaemonError::CgroupUnavailable);
     };
     Ok(ProviderMembership {
@@ -2383,7 +2400,11 @@ impl WorkerHandle {
         deadline: Instant,
         cancellation: Option<&AtomicBool>,
     ) -> Result<(internal_wire::WorkerResponse, Option<OwnedFd>), RescueVaultDaemonError> {
-        if kind == internal_wire::WorkerCommandKind::ProviderOpenAiBorrow {
+        #[cfg(feature = "experimental-codex-home-lease")]
+        let codex_home_lease = kind == internal_wire::WorkerCommandKind::ProviderCodexHomeLease;
+        #[cfg(not(feature = "experimental-codex-home-lease"))]
+        let codex_home_lease = false;
+        if kind == internal_wire::WorkerCommandKind::ProviderOpenAiBorrow || codex_home_lease {
             return Err(RescueVaultDaemonError::ProtocolFailure);
         }
         self.transact_inner(kind, secret_size, descriptor, deadline, cancellation, None)
@@ -2406,6 +2427,23 @@ impl WorkerHandle {
         )
     }
 
+    /// Requests the descriptor-bound Codex home only after the supervisor has
+    /// registered the complete Agent process tree as a revocable lease.
+    #[cfg(feature = "experimental-codex-home-lease")]
+    pub(super) fn lease_codex_home(
+        &self,
+        deadline: Instant,
+    ) -> Result<(internal_wire::WorkerResponse, Option<OwnedFd>), RescueVaultDaemonError> {
+        self.transact_inner(
+            internal_wire::WorkerCommandKind::ProviderCodexHomeLease,
+            None,
+            None,
+            deadline,
+            None,
+            None,
+        )
+    }
+
     fn transact_inner(
         &self,
         kind: internal_wire::WorkerCommandKind,
@@ -2416,7 +2454,13 @@ impl WorkerHandle {
         provider_output: Option<OwnedFd>,
     ) -> Result<(internal_wire::WorkerResponse, Option<OwnedFd>), RescueVaultDaemonError> {
         let borrowing = kind == internal_wire::WorkerCommandKind::ProviderOpenAiBorrow;
-        if borrowing != provider_output.is_some() || (borrowing && cancellation.is_some()) {
+        #[cfg(feature = "experimental-codex-home-lease")]
+        let leasing_codex = kind == internal_wire::WorkerCommandKind::ProviderCodexHomeLease;
+        #[cfg(not(feature = "experimental-codex-home-lease"))]
+        let leasing_codex = false;
+        if borrowing != provider_output.is_some()
+            || ((borrowing || leasing_codex) && cancellation.is_some())
+        {
             return Err(RescueVaultDaemonError::ProtocolFailure);
         }
         if self.terminal.load(Ordering::Acquire) {
@@ -2473,6 +2517,11 @@ impl WorkerHandle {
                 internal_wire::WorkerCommand::provider_openai_borrow(request_id),
                 Some(descriptor),
             ),
+            #[cfg(feature = "experimental-codex-home-lease")]
+            (internal_wire::WorkerCommandKind::ProviderCodexHomeLease, None, None) => (
+                internal_wire::WorkerCommand::provider_codex_home_lease(request_id),
+                None,
+            ),
             (internal_wire::WorkerCommandKind::AttestQuiescent, None, None) => (
                 internal_wire::WorkerCommand::attest_quiescent(request_id),
                 None,
@@ -2493,7 +2542,7 @@ impl WorkerHandle {
         // open while the worker processes the command.
         drop(outgoing);
         sent.map_err(|_| RescueVaultDaemonError::WorkerUnavailable)?;
-        let response = loop {
+        let (response, received_output) = loop {
             if cancellation.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
                 return Err(RescueVaultDaemonError::WorkerUnavailable);
             }
@@ -2502,7 +2551,22 @@ impl WorkerHandle {
                 .checked_add(Duration::from_millis(200))
                 .unwrap_or(deadline)
                 .min(deadline);
-            match internal_wire::receive_response(channel.socket.as_fd(), request_id, slice) {
+            #[cfg(feature = "experimental-codex-home-lease")]
+            let received = if leasing_codex {
+                internal_wire::receive_codex_home_response(
+                    channel.socket.as_fd(),
+                    request_id,
+                    slice,
+                )
+            } else {
+                internal_wire::receive_response(channel.socket.as_fd(), request_id, slice)
+                    .map(|response| (response, None))
+            };
+            #[cfg(not(feature = "experimental-codex-home-lease"))]
+            let received =
+                internal_wire::receive_response(channel.socket.as_fd(), request_id, slice)
+                    .map(|response| (response, None));
+            match received {
                 Ok(response) => break response,
                 Err(internal_wire::InternalWireError::TimedOut) if slice < deadline => continue,
                 Err(_) => return Err(RescueVaultDaemonError::WorkerUnavailable),
@@ -2518,8 +2582,15 @@ impl WorkerHandle {
         }
         let output = match provider_output {
             Some(output) => finalize_provider_output(output, &response, deadline)?,
-            None => None,
+            None => received_output,
         };
+        #[cfg(feature = "experimental-codex-home-lease")]
+        if leasing_codex
+            && ((response.code == internal_wire::WorkerResultCode::ProviderCodexHomeReady)
+                != output.is_some())
+        {
+            return Err(RescueVaultDaemonError::ProtocolFailure);
+        }
         Ok((response, output))
     }
 
@@ -2847,6 +2918,16 @@ fn response_matches(
                 | Result::IoFailed
                 | Result::CleanupFailed
         ),
+        #[cfg(feature = "experimental-codex-home-lease")]
+        Command::ProviderCodexHomeLease => matches!(
+            response.code,
+            Result::ProviderCodexHomeReady
+                | Result::ProviderCodexHomeUnconfigured
+                | Result::ProviderStateAmbiguous
+                | Result::InvalidRequest
+                | Result::CleanupFailed
+                | Result::Busy
+        ),
         Command::AttestQuiescent => matches!(
             response.code,
             Result::AttestAbsent
@@ -2976,6 +3057,18 @@ mod tests {
         )
         .expect("probe membership");
         assert_eq!(probe.kind, ProviderUnitKind::LeaseProbe);
+        #[cfg(feature = "experimental-codex-home-lease")]
+        {
+            let codex = parse_provider_membership(
+                b"0::/system.slice/kernaid-rescue-codex@7-auth.service/agent\n",
+            )
+            .expect("Codex membership");
+            assert_eq!(codex.kind, ProviderUnitKind::CodexExecutor);
+            assert_eq!(
+                codex.unit,
+                OsString::from("kernaid-rescue-codex@7-auth.service")
+            );
+        }
 
         for invalid in [
             b"0::/system.slice/kernaid-rescue-openai-executor@4.service\n".as_slice(),
@@ -2991,6 +3084,18 @@ mod tests {
                 Some(RescueVaultDaemonError::CgroupUnavailable)
             );
         }
+    }
+
+    #[cfg(not(feature = "experimental-codex-home-lease"))]
+    #[test]
+    fn feature_off_rejects_codex_cgroup_membership() {
+        assert_eq!(
+            parse_provider_membership(
+                b"0::/system.slice/kernaid-rescue-codex@7-auth.service/agent\n"
+            )
+            .err(),
+            Some(RescueVaultDaemonError::CgroupUnavailable)
+        );
     }
 
     #[test]
@@ -3076,6 +3181,11 @@ mod tests {
     fn provider_unit_topology_and_root_kill_ownership_are_exact() {
         assert!(provider_child_directories_are_exact(
             ProviderUnitKind::OpenAiExecutor,
+            &[PROVIDER_AGENT_CGROUP_NAME]
+        ));
+        #[cfg(feature = "experimental-codex-home-lease")]
+        assert!(provider_child_directories_are_exact(
+            ProviderUnitKind::CodexExecutor,
             &[PROVIDER_AGENT_CGROUP_NAME]
         ));
         assert!(provider_child_directories_are_exact(

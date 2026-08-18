@@ -1737,6 +1737,41 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_client_receives_only_an_exact_codex_home_o_path() {
+        let (client, daemon) = seqpacket_pair();
+        let connection = authenticated_test_server(client.as_fd());
+        let request = request(ClientRequestPayload::ProviderCodexHomeLease);
+        let response = status_response(
+            REQUEST_ID,
+            "provider.codex.home_lease",
+            "{\"output\":{\"type\":\"codex-home-o-path\",\"size\":0}}",
+        );
+        let home = rustix::fs::open(
+            "/",
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .expect("exact Codex home shape");
+        send_seqpacket(daemon.as_fd(), &response, &[home.as_fd()], test_deadline())
+            .expect("send exact Codex home response");
+
+        let mut decoded = connection
+            .receive_response(&request, test_deadline())
+            .expect("receive exact Codex home response");
+        assert_eq!(decoded.operation(), Operation::ProviderCodexHomeLease);
+        assert_eq!(decoded.descriptor_count(), 1);
+        let received = decoded.take_descriptor().expect("Codex home descriptor");
+        assert_eq!(
+            rustix::fs::fcntl_getfl(&received).expect("received status flags"),
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW
+        );
+        assert_eq!(
+            rustix::io::fcntl_getfd(&received).expect("received descriptor flags"),
+            rustix::io::FdFlags::CLOEXEC
+        );
+    }
+
+    #[test]
     fn authenticated_client_requires_exact_two_step_mutation_versions() {
         for (payload, operation, response_payload) in [
             (

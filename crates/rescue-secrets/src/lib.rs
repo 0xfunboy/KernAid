@@ -50,6 +50,19 @@ pub const VAULT_MARKER_V1: &[u8] = b"KERNAID-RESCUE-VAULT-V1\n";
 /// Marker filename at the root of the mounted LUKS2 filesystem.
 pub const VAULT_MARKER_NAME: &str = ".kernaid-rescue-vault";
 
+#[cfg(all(target_os = "linux", feature = "experimental-codex-home-lease"))]
+pub(crate) const CODEX_AGENT_UID: u32 = 1003;
+#[cfg(all(target_os = "linux", feature = "experimental-codex-home-lease"))]
+pub(crate) const CODEX_AGENT_GID: u32 = 1003;
+#[cfg(all(target_os = "linux", feature = "experimental-codex-home-lease"))]
+pub(crate) const CODEX_HOME_NAME: &str = ".kernaid-codex-home-v1";
+
+#[cfg(all(target_os = "linux", feature = "experimental-codex-home-lease"))]
+pub(crate) fn codex_home_status_flags_are_exact(flags: rustix::fs::OFlags) -> bool {
+    flags
+        == (rustix::fs::OFlags::PATH | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::NOFOLLOW)
+}
+
 /// Expected Unix owner of the vault and every KernAid secure-state object.
 /// The production mount manager currently accepts root-owned layouts only.
 #[cfg(target_os = "linux")]

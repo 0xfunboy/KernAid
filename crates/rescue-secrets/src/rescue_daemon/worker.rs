@@ -56,13 +56,28 @@ pub(super) fn run() -> Result<(), RescueVaultDaemonError> {
             Err(_) => return Err(RescueVaultDaemonError::ProtocolFailure),
         };
         let request_id = command.request_id;
-        let (response, exit) = handle_command(command, descriptor, &mut state);
-        internal_wire::send_response(
-            control.as_fd(),
-            &response,
-            Instant::now() + CONTROL_REPLY_TIMEOUT,
-        )
-        .map_err(|_| RescueVaultDaemonError::ProtocolFailure)?;
+        let mut response_descriptor = None;
+        let (response, exit) =
+            handle_command(command, descriptor, &mut state, &mut response_descriptor);
+        let response_deadline = Instant::now() + CONTROL_REPLY_TIMEOUT;
+        #[cfg(feature = "experimental-codex-home-lease")]
+        let sent = if let Some(descriptor) = response_descriptor.as_ref() {
+            internal_wire::send_codex_home_response(
+                control.as_fd(),
+                &response,
+                Some(descriptor.as_fd()),
+                response_deadline,
+            )
+        } else {
+            internal_wire::send_response(control.as_fd(), &response, response_deadline)
+        };
+        #[cfg(not(feature = "experimental-codex-home-lease"))]
+        let sent = {
+            debug_assert!(response_descriptor.is_none());
+            internal_wire::send_response(control.as_fd(), &response, response_deadline)
+        };
+        drop(response_descriptor);
+        sent.map_err(|_| RescueVaultDaemonError::ProtocolFailure)?;
         if exit {
             return if response.code == internal_wire::WorkerResultCode::ShutdownSucceeded {
                 Ok(())
@@ -130,7 +145,10 @@ fn handle_command(
     command: internal_wire::WorkerCommand,
     descriptor: Option<OwnedFd>,
     state: &mut WorkerVaultState,
+    response_descriptor: &mut Option<OwnedFd>,
 ) -> (internal_wire::WorkerResponse, bool) {
+    #[cfg(not(feature = "experimental-codex-home-lease"))]
+    let _ = &response_descriptor;
     use internal_wire::{WorkerCommandKind as Command, WorkerResultCode as Result};
     let request_id = command.request_id;
     match command.kind {
@@ -293,6 +311,39 @@ fn handle_command(
                 WorkerVaultState::Unlocked(mounted) => logout_openai(mounted),
             };
             (internal_wire::WorkerResponse::new(request_id, code), false)
+        }
+        #[cfg(feature = "experimental-codex-home-lease")]
+        Command::ProviderCodexHomeLease => {
+            if descriptor.is_some() || response_descriptor.is_some() {
+                return (
+                    internal_wire::WorkerResponse::new(request_id, Result::InvalidRequest),
+                    false,
+                );
+            }
+            let code = match state {
+                WorkerVaultState::Locked => Result::Busy,
+                WorkerVaultState::Unlocked(_) if validate_no_active_swap().is_err() => {
+                    Result::CleanupFailed
+                }
+                WorkerVaultState::Unlocked(mounted) => {
+                    match mounted.secrets().open_codex_home_lease() {
+                        Ok(Some(home)) => {
+                            *response_descriptor = Some(home);
+                            Result::ProviderCodexHomeReady
+                        }
+                        Ok(None) => Result::ProviderCodexHomeUnconfigured,
+                        Err(_) => Result::ProviderStateAmbiguous,
+                    }
+                }
+            };
+            (
+                if code == Result::ProviderCodexHomeReady {
+                    internal_wire::WorkerResponse::provider_codex_home_ready(request_id)
+                } else {
+                    internal_wire::WorkerResponse::new(request_id, code)
+                },
+                false,
+            )
         }
         Command::AttestQuiescent => {
             if descriptor.is_some() || !matches!(state, WorkerVaultState::Locked) {

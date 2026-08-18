@@ -7,6 +7,8 @@ use super::{
     },
     validate_no_active_swap,
 };
+#[cfg(feature = "experimental-codex-home-lease")]
+use super::{group_has_exact_codex_boundaries, passwd_has_exact_codex_agent};
 use kernaid_protocol::rescue_vault::{
     AgentRole, DescriptorDeclaration, DescriptorType, ErrorToken, MAX_INITIAL_STATE_VERSION,
     MAX_SAFE_JSON_INTEGER, Operation, PeerAllowlist, Provider, ProviderState,
@@ -239,6 +241,11 @@ trait WorkerBoundary: Send + Sync {
         &self,
         deadline: Instant,
     ) -> Result<(internal_wire::WorkerResponse, Option<OwnedFd>), RescueVaultDaemonError>;
+    #[cfg(feature = "experimental-codex-home-lease")]
+    fn lease_codex_home(
+        &self,
+        deadline: Instant,
+    ) -> Result<(internal_wire::WorkerResponse, Option<OwnedFd>), RescueVaultDaemonError>;
     fn verify_healthy(&self) -> Result<(), RescueVaultDaemonError>;
     fn exited(&self) -> Result<bool, RescueVaultDaemonError>;
     fn fault_and_terminate(&self, deadline: Instant) -> Result<(), RescueVaultDaemonError>;
@@ -262,6 +269,14 @@ impl WorkerBoundary for WorkerHandle {
         deadline: Instant,
     ) -> Result<(internal_wire::WorkerResponse, Option<OwnedFd>), RescueVaultDaemonError> {
         WorkerHandle::borrow_openai(self, deadline)
+    }
+
+    #[cfg(feature = "experimental-codex-home-lease")]
+    fn lease_codex_home(
+        &self,
+        deadline: Instant,
+    ) -> Result<(internal_wire::WorkerResponse, Option<OwnedFd>), RescueVaultDaemonError> {
+        WorkerHandle::lease_codex_home(self, deadline)
     }
 
     fn verify_healthy(&self) -> Result<(), RescueVaultDaemonError> {
@@ -755,15 +770,51 @@ fn validated_peer_allowlist(companion_uid: u32) -> Result<PeerAllowlist, RescueV
     if !passwd_has_exact_companion(&bytes, companion_uid) {
         return Err(RescueVaultDaemonError::InvalidConfiguration);
     }
+    #[cfg(feature = "experimental-codex-home-lease")]
+    if !passwd_has_exact_codex_agent(&bytes, companion_uid) {
+        return Err(RescueVaultDaemonError::InvalidConfiguration);
+    }
     let agent_uid = passwd_openai_agent_uid(&bytes, companion_uid)
         .ok_or(RescueVaultDaemonError::InvalidConfiguration)?;
     validate_openai_agent_groups(agent_uid)?;
+    #[cfg(feature = "experimental-codex-home-lease")]
+    validate_codex_agent_groups()?;
     let builder = PeerAllowlist::builder(companion_uid)
         .agent(AgentRole::OpenAi, agent_uid)
+        .map_err(|_| RescueVaultDaemonError::InvalidConfiguration)?;
+    #[cfg(feature = "experimental-codex-home-lease")]
+    let builder = builder
+        .agent(AgentRole::Codex, crate::CODEX_AGENT_UID)
         .map_err(|_| RescueVaultDaemonError::InvalidConfiguration)?;
     builder
         .build()
         .map_err(|_| RescueVaultDaemonError::InvalidConfiguration)
+}
+
+#[cfg(feature = "experimental-codex-home-lease")]
+fn validate_codex_agent_groups() -> Result<(), RescueVaultDaemonError> {
+    let descriptor = rfs::openat2(
+        rfs::CWD,
+        GROUP_FILE_PATH,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        rfs::Mode::empty(),
+        rfs::ResolveFlags::NO_SYMLINKS | rfs::ResolveFlags::NO_MAGICLINKS,
+    )
+    .map_err(|_| RescueVaultDaemonError::InvalidConfiguration)?;
+    let stat = rfs::fstat(&descriptor).map_err(|_| RescueVaultDaemonError::InvalidConfiguration)?;
+    if !FileType::from_raw_mode(stat.st_mode).is_file()
+        || stat.st_uid != 0
+        || stat.st_gid != 0
+        || stat.st_nlink != 1
+        || stat.st_mode & 0o022 != 0
+    {
+        return Err(RescueVaultDaemonError::InvalidConfiguration);
+    }
+    let bytes = read_file_bounded(descriptor.as_fd(), GROUP_FILE_LIMIT)?;
+    if !group_has_exact_codex_boundaries(&bytes) {
+        return Err(RescueVaultDaemonError::InvalidConfiguration);
+    }
+    Ok(())
 }
 
 fn validate_openai_agent_groups(agent_uid: u32) -> Result<(), RescueVaultDaemonError> {
@@ -1385,6 +1436,13 @@ enum DescriptorSend {
     RevocationInProgress,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProviderLeaseKind {
+    OpenAi,
+    #[cfg(feature = "experimental-codex-home-lease")]
+    CodexHome,
+}
+
 enum ClientConnection<'socket> {
     Socket(BorrowedFd<'socket>),
     #[cfg(test)]
@@ -1687,6 +1745,10 @@ impl Supervisor {
             Operation::ProviderOpenAiBorrow => {
                 self.handle_provider_borrow(request, started, &connection)
             }
+            #[cfg(feature = "experimental-codex-home-lease")]
+            Operation::ProviderCodexHomeLease => {
+                self.handle_provider_borrow(request, started, &connection)
+            }
             Operation::ProviderLogout => self.handle_provider_logout(request, started, &connection),
             _ => unreachable!("external operation allowlist is closed"),
         }
@@ -1861,6 +1923,12 @@ impl Supervisor {
         started: Instant,
         connection: &ClientConnection<'_>,
     ) -> (u64, HandlerResult) {
+        let lease_kind = match request.operation() {
+            Operation::ProviderOpenAiBorrow => ProviderLeaseKind::OpenAi,
+            #[cfg(feature = "experimental-codex-home-lease")]
+            Operation::ProviderCodexHomeLease => ProviderLeaseKind::CodexHome,
+            _ => unreachable!("provider lease operation allowlist is closed"),
+        };
         let handoff_deadline = started
             .checked_add(PROVIDER_BORROW_TIMEOUT)
             .unwrap_or(started);
@@ -1955,19 +2023,63 @@ impl Supervisor {
             self.mark_fault_by(handoff_deadline);
             return (self.snapshot().version, HandlerResult::Drop);
         };
-        match worker.borrow_openai(handoff_deadline) {
+        let borrowed = match lease_kind {
+            ProviderLeaseKind::OpenAi => worker.borrow_openai(handoff_deadline),
+            #[cfg(feature = "experimental-codex-home-lease")]
+            ProviderLeaseKind::CodexHome => worker.lease_codex_home(handoff_deadline),
+        };
+        match borrowed {
             Ok((response, descriptor)) => {
+                #[cfg(feature = "experimental-codex-home-lease")]
+                if lease_kind == ProviderLeaseKind::CodexHome
+                    && descriptor
+                        .as_ref()
+                        .is_some_and(|descriptor| validate_codex_home_handoff(descriptor).is_err())
+                {
+                    drop(descriptor);
+                    return self.fail_ambiguous_borrow(lease_id, handoff_deadline, output);
+                }
                 if let Some(descriptor) = descriptor
                     && let Err(descriptor) = output.adopt(descriptor)
                 {
                     drop(descriptor);
                     return self.fail_ambiguous_borrow(lease_id, handoff_deadline, output);
                 }
-                if response.code == internal_wire::WorkerResultCode::ProviderBorrowReady
-                    && output.descriptor().is_some()
-                {
-                    let Some(size) = response.output_size else {
-                        return self.fail_ambiguous_borrow(lease_id, handoff_deadline, output);
+                let ready = match lease_kind {
+                    ProviderLeaseKind::OpenAi => {
+                        response.code == internal_wire::WorkerResultCode::ProviderBorrowReady
+                    }
+                    #[cfg(feature = "experimental-codex-home-lease")]
+                    ProviderLeaseKind::CodexHome => {
+                        response.code == internal_wire::WorkerResultCode::ProviderCodexHomeReady
+                    }
+                };
+                if ready && output.descriptor().is_some() {
+                    let declaration = match lease_kind {
+                        ProviderLeaseKind::OpenAi => {
+                            let Some(size) = response.output_size else {
+                                return self.fail_ambiguous_borrow(
+                                    lease_id,
+                                    handoff_deadline,
+                                    output,
+                                );
+                            };
+                            DescriptorDeclaration {
+                                kind: DescriptorType::OpenAiApiKeyPipe,
+                                size: u64::from(size),
+                            }
+                        }
+                        #[cfg(feature = "experimental-codex-home-lease")]
+                        ProviderLeaseKind::CodexHome if response.output_size.is_none() => {
+                            DescriptorDeclaration {
+                                kind: DescriptorType::CodexHomeOPath,
+                                size: 0,
+                            }
+                        }
+                        #[cfg(feature = "experimental-codex-home-lease")]
+                        ProviderLeaseKind::CodexHome => {
+                            return self.fail_ambiguous_borrow(lease_id, handoff_deadline, output);
+                        }
                     };
                     let version = match self.finish_provider_borrow_ready(lease_id) {
                         Ok(Some(version)) => version,
@@ -1983,20 +2095,24 @@ impl Supervisor {
                         version,
                         HandlerResult::Descriptor {
                             request,
-                            payload: SuccessPayload::Descriptor(DescriptorDeclaration {
-                                kind: DescriptorType::OpenAiApiKeyPipe,
-                                size: u64::from(size),
-                            }),
+                            payload: SuccessPayload::Descriptor(declaration),
                             output,
                             lease_id,
                             handoff_deadline,
                         },
                     );
                 }
-                if response.code == internal_wire::WorkerResultCode::ProviderBorrowUnconfigured
-                    && response.output_size.is_none()
-                    && output.descriptor().is_none()
-                {
+                let unconfigured = match lease_kind {
+                    ProviderLeaseKind::OpenAi => {
+                        response.code == internal_wire::WorkerResultCode::ProviderBorrowUnconfigured
+                    }
+                    #[cfg(feature = "experimental-codex-home-lease")]
+                    ProviderLeaseKind::CodexHome => {
+                        response.code
+                            == internal_wire::WorkerResultCode::ProviderCodexHomeUnconfigured
+                    }
+                };
+                if unconfigured && response.output_size.is_none() && output.descriptor().is_none() {
                     drop(output);
                     return match self.finish_provider_borrow_unconfigured(lease_id) {
                         Ok(Some(version)) => (
@@ -3910,10 +4026,41 @@ fn external_operation_is_enabled(
             operation,
             Operation::VaultStatus | Operation::ProviderStatus | Operation::ProviderOpenAiBorrow
         ),
-        kernaid_protocol::rescue_vault::PeerRole::Agent(
-            AgentRole::Application | AgentRole::Codex,
-        ) => false,
+        kernaid_protocol::rescue_vault::PeerRole::Agent(AgentRole::Codex) => {
+            cfg!(feature = "experimental-codex-home-lease")
+                && matches!(
+                    operation,
+                    Operation::VaultStatus
+                        | Operation::ProviderStatus
+                        | Operation::ProviderCodexHomeLease
+                )
+        }
+        kernaid_protocol::rescue_vault::PeerRole::Agent(AgentRole::Application) => false,
     }
+}
+
+#[cfg(feature = "experimental-codex-home-lease")]
+fn validate_codex_home_handoff(descriptor: &OwnedFd) -> Result<(), RescueVaultDaemonError> {
+    const EXT4_SUPER_MAGIC: u64 = 0xef53;
+    let stat = rfs::fstat(descriptor).map_err(|_| RescueVaultDaemonError::ProtocolFailure)?;
+    let filesystem =
+        rfs::fstatfs(descriptor).map_err(|_| RescueVaultDaemonError::ProtocolFailure)?;
+    let status =
+        rfs::fcntl_getfl(descriptor).map_err(|_| RescueVaultDaemonError::ProtocolFailure)?;
+    let flags =
+        rustix::io::fcntl_getfd(descriptor).map_err(|_| RescueVaultDaemonError::ProtocolFailure)?;
+    if !FileType::from_raw_mode(stat.st_mode).is_dir()
+        || stat.st_nlink < 2
+        || stat.st_uid != crate::CODEX_AGENT_UID
+        || stat.st_gid != crate::CODEX_AGENT_GID
+        || stat.st_mode & 0o7777 != 0o700
+        || u64::try_from(filesystem.f_type).ok() != Some(EXT4_SUPER_MAGIC)
+        || !crate::codex_home_status_flags_are_exact(status)
+        || flags != rustix::io::FdFlags::CLOEXEC
+    {
+        return Err(RescueVaultDaemonError::ProtocolFailure);
+    }
+    Ok(())
 }
 
 fn provider_process_scope(role: kernaid_protocol::rescue_vault::PeerRole) -> ProcessScope {
@@ -3921,10 +4068,18 @@ fn provider_process_scope(role: kernaid_protocol::rescue_vault::PeerRole) -> Pro
         kernaid_protocol::rescue_vault::PeerRole::Agent(AgentRole::OpenAi) => {
             ProcessScope::CgroupTree
         }
+        #[cfg(feature = "experimental-codex-home-lease")]
+        kernaid_protocol::rescue_vault::PeerRole::Agent(AgentRole::Codex) => {
+            ProcessScope::CgroupTree
+        }
+        #[cfg(not(feature = "experimental-codex-home-lease"))]
+        kernaid_protocol::rescue_vault::PeerRole::Agent(AgentRole::Codex) => {
+            ProcessScope::DirectPeer
+        }
         kernaid_protocol::rescue_vault::PeerRole::Companion
-        | kernaid_protocol::rescue_vault::PeerRole::Agent(
-            AgentRole::Application | AgentRole::Codex,
-        ) => ProcessScope::DirectPeer,
+        | kernaid_protocol::rescue_vault::PeerRole::Agent(AgentRole::Application) => {
+            ProcessScope::DirectPeer
+        }
     }
 }
 
@@ -4372,6 +4527,7 @@ mod tests {
     struct FakeWorkerState {
         calls: Vec<internal_wire::WorkerCommandKind>,
         responses: VecDeque<Result<internal_wire::WorkerResponse, RescueVaultDaemonError>>,
+        outputs: VecDeque<Option<OwnedFd>>,
         passphrase_bytes: usize,
         verifies: usize,
         cancellations: usize,
@@ -4428,6 +4584,7 @@ mod tests {
                 .responses
                 .pop_front()
                 .unwrap_or(Err(RescueVaultDaemonError::ProtocolFailure));
+            let output = state.outputs.pop_front().unwrap_or(None);
             drop(state);
             if let Some((entered, release)) = block {
                 entered
@@ -4437,7 +4594,7 @@ mod tests {
                     .recv()
                     .map_err(|_| RescueVaultDaemonError::WorkerUnavailable)?;
             }
-            response.map(|response| (response, None))
+            response.map(|response| (response, output))
         }
 
         fn borrow_openai(
@@ -4447,6 +4604,20 @@ mod tests {
         {
             self.transact(
                 internal_wire::WorkerCommandKind::ProviderOpenAiBorrow,
+                None,
+                None,
+                deadline,
+            )
+        }
+
+        #[cfg(feature = "experimental-codex-home-lease")]
+        fn lease_codex_home(
+            &self,
+            deadline: Instant,
+        ) -> Result<(internal_wire::WorkerResponse, Option<OwnedFd>), RescueVaultDaemonError>
+        {
+            self.transact(
+                internal_wire::WorkerCommandKind::ProviderCodexHomeLease,
                 None,
                 None,
                 deadline,
@@ -5764,6 +5935,7 @@ mod tests {
                 b"{}",
             );
             let requests = [
+                #[cfg(not(feature = "experimental-codex-home-lease"))]
                 (
                     validated_request_for_role(
                         "provider.codex.home_lease",
@@ -5774,6 +5946,7 @@ mod tests {
                     ),
                     None,
                 ),
+                #[cfg(not(feature = "experimental-codex-home-lease"))]
                 (
                     validated_request_for_role(
                         "provider.status",
@@ -5784,6 +5957,7 @@ mod tests {
                     ),
                     None,
                 ),
+                #[cfg(not(feature = "experimental-codex-home-lease"))]
                 (
                     validated_request_for_role(
                         "vault.status",
@@ -6011,22 +6185,37 @@ mod tests {
                 ),
                 "unexpected OpenAI shipping permission for {operation:?}"
             );
-            for role in [AgentRole::Application, AgentRole::Codex] {
-                assert!(
-                    !external_operation_is_enabled(operation, PeerRole::Agent(role)),
-                    "disabled {role:?} role reached {operation:?}"
-                );
-            }
+            assert!(
+                !external_operation_is_enabled(operation, PeerRole::Agent(AgentRole::Application)),
+                "disabled Application role reached {operation:?}"
+            );
+            assert_eq!(
+                external_operation_is_enabled(operation, PeerRole::Agent(AgentRole::Codex)),
+                cfg!(feature = "experimental-codex-home-lease")
+                    && matches!(
+                        operation,
+                        Operation::VaultStatus
+                            | Operation::ProviderStatus
+                            | Operation::ProviderCodexHomeLease
+                    ),
+                "unexpected Codex permission for {operation:?}"
+            );
         }
         assert_eq!(
             provider_process_scope(PeerRole::Agent(AgentRole::OpenAi)),
             ProcessScope::CgroupTree
         );
-        for role in [
-            PeerRole::Companion,
-            PeerRole::Agent(AgentRole::Application),
-            PeerRole::Agent(AgentRole::Codex),
-        ] {
+        #[cfg(feature = "experimental-codex-home-lease")]
+        assert_eq!(
+            provider_process_scope(PeerRole::Agent(AgentRole::Codex)),
+            ProcessScope::CgroupTree
+        );
+        #[cfg(not(feature = "experimental-codex-home-lease"))]
+        assert_eq!(
+            provider_process_scope(PeerRole::Agent(AgentRole::Codex)),
+            ProcessScope::DirectPeer
+        );
+        for role in [PeerRole::Companion, PeerRole::Agent(AgentRole::Application)] {
             assert_eq!(provider_process_scope(role), ProcessScope::DirectPeer);
         }
     }
@@ -6197,6 +6386,154 @@ mod tests {
         assert_eq!((runtime.arms, runtime.disarms), (1, 0));
         assert!(runtime.marker);
         drop(client);
+    }
+
+    #[cfg(feature = "experimental-codex-home-lease")]
+    #[test]
+    fn codex_home_unconfigured_is_definite_no_descriptor_and_preserves_version() {
+        let (supervisor, runtime, worker, privacy, _) = fake_supervisor(
+            unlocked_service_state(714),
+            [Ok(internal_wire::WorkerResponse::new(
+                1,
+                internal_wire::WorkerResultCode::ProviderCodexHomeUnconfigured,
+            ))],
+            true,
+        );
+        let (request, client, server) = validated_request_with_connection_for_role(
+            "provider.codex.home_lease",
+            serde_json::json!({}),
+            714,
+            None,
+            PeerRole::Agent(AgentRole::Codex),
+        );
+        let (version, result) = supervisor.handle_connected_request(
+            request,
+            Instant::now(),
+            ClientConnection::LeaseTestSocket(server.as_fd()),
+        );
+        assert_eq!(version, 714);
+        assert_handler_error(result, ErrorToken::ProviderUnconfigured);
+        assert_eq!(supervisor.snapshot().version, 714);
+        assert!(
+            supervisor
+                .leases
+                .lock()
+                .expect("lease registry")
+                .active
+                .is_none()
+        );
+        assert_eq!(
+            worker.lock().expect("worker trace").calls,
+            [internal_wire::WorkerCommandKind::ProviderCodexHomeLease]
+        );
+        assert_eq!(privacy.checks.load(Ordering::Relaxed), 1);
+        let runtime = runtime.lock().expect("runtime trace");
+        assert_eq!((runtime.arms, runtime.disarms), (1, 0));
+        assert!(runtime.marker);
+        drop(client);
+    }
+
+    #[cfg(feature = "experimental-codex-home-lease")]
+    #[test]
+    fn codex_home_fault_and_stop_fail_before_worker_dispatch() {
+        for (mut state, stopping, expected) in [
+            (unlocked_service_state(715), true, ErrorToken::Busy),
+            (
+                {
+                    let mut state = unlocked_service_state(716);
+                    state.faulted = true;
+                    state.fault_marker_required = true;
+                    state.availability = faulted_availability();
+                    state
+                },
+                false,
+                ErrorToken::RebootRequired,
+            ),
+        ] {
+            state.provider_operation_active = false;
+            let (supervisor, _, worker, privacy, _) = fake_supervisor(state, [], true);
+            supervisor.stopping.store(stopping, Ordering::Release);
+            let expected_version = supervisor.snapshot().version;
+            let (request, client, server) = validated_request_with_connection_for_role(
+                "provider.codex.home_lease",
+                serde_json::json!({}),
+                expected_version,
+                None,
+                PeerRole::Agent(AgentRole::Codex),
+            );
+            let (version, result) = supervisor.handle_connected_request(
+                request,
+                Instant::now(),
+                ClientConnection::LeaseTestSocket(server.as_fd()),
+            );
+            assert!(version >= expected_version);
+            assert_handler_error(result, expected);
+            assert!(worker.lock().expect("worker trace").calls.is_empty());
+            assert_eq!(privacy.checks.load(Ordering::Acquire), 0);
+            drop(client);
+        }
+    }
+
+    #[cfg(feature = "experimental-codex-home-lease")]
+    #[test]
+    fn openai_and_codex_share_one_global_lease_registry() {
+        let (supervisor, _, worker, privacy, _) =
+            fake_supervisor(unlocked_service_state(717), [], true);
+        let (first_peer, first_server) = socketpair(
+            AddressFamily::UNIX,
+            SocketType::SEQPACKET,
+            SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+            None,
+        )
+        .expect("OpenAI lease socket");
+        let first_connection = ClientConnection::LeaseTestSocket(first_server.as_fd());
+        let first_candidate = first_connection
+            .lease_candidate(ProcessScope::CgroupTree)
+            .expect("OpenAI candidate");
+        let (_, lease_id) = supervisor
+            .begin_provider_borrow(
+                717,
+                &first_connection,
+                first_candidate,
+                Instant::now() + PROVIDER_BORROW_TIMEOUT,
+            )
+            .expect("OpenAI pending lease");
+
+        let (second_peer, second_server) = socketpair(
+            AddressFamily::UNIX,
+            SocketType::SEQPACKET,
+            SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+            None,
+        )
+        .expect("Codex lease socket");
+        let second_connection = ClientConnection::LeaseTestSocket(second_server.as_fd());
+        let second_candidate = second_connection
+            .lease_candidate(ProcessScope::CgroupTree)
+            .expect("Codex candidate");
+        assert_eq!(
+            supervisor.begin_provider_borrow(
+                717,
+                &second_connection,
+                second_candidate,
+                Instant::now() + PROVIDER_BORROW_TIMEOUT,
+            ),
+            Err((717, ErrorToken::Busy))
+        );
+        assert!(matches!(
+            supervisor
+                .leases
+                .lock()
+                .expect("lease registry")
+                .active
+                .as_ref(),
+            Some(lease) if lease.id == lease_id && lease.state == LeaseState::Pending
+        ));
+        supervisor
+            .cancel_pending_lease(lease_id)
+            .expect("cancel pending lease");
+        assert!(worker.lock().expect("worker trace").calls.is_empty());
+        assert_eq!(privacy.checks.load(Ordering::Acquire), 0);
+        drop((first_peer, first_server, second_peer, second_server));
     }
 
     #[test]
