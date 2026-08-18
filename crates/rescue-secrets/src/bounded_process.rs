@@ -46,11 +46,13 @@ pub(crate) struct CapturedOutput {
 /// single-threaded, and all of its external tools use this bounded spawn path.
 /// The child addresses only its own inherited descriptor, so a non-dumpable
 /// parent is never reopened via `/proc/<parent>/fd`.
+#[cfg_attr(not(feature = "experimental-vault-manager"), allow(dead_code))]
 pub(crate) struct InheritedChildDescriptor {
     descriptor: OwnedFd,
     path: PathBuf,
 }
 
+#[cfg_attr(not(feature = "experimental-vault-manager"), allow(dead_code))]
 impl InheritedChildDescriptor {
     pub(crate) fn duplicate(source: impl AsFd) -> Result<Self, BoundedProcessError> {
         let descriptor = duplicate_cloexec(source)?;
@@ -211,6 +213,7 @@ pub(crate) fn wait(
     wait_optional_descriptor(command, timeout, None)
 }
 
+#[cfg_attr(not(feature = "experimental-vault-manager"), allow(dead_code))]
 pub(crate) fn wait_with_descriptor(
     command: &mut Command,
     timeout: Duration,
