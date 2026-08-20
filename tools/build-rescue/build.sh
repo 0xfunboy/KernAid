@@ -7,10 +7,16 @@ vaultd_binary="${KERNAID_RESCUE_VAULTD_BINARY:-$repo_dir/target/release/kernaid-
 vaultctl_binary="${KERNAID_RESCUE_VAULTCTL_BINARY:-$repo_dir/target/release/kernaid-rescue-vaultctl}"
 openai_executor_binary="${KERNAID_RESCUE_OPENAI_EXECUTOR_BINARY:-$repo_dir/target/release/kernaid-rescue-openai-executor}"
 hardware_inventory_binary="${KERNAID_LINUX_HARDWARE_INVENTORY_BINARY:-$repo_dir/target/release/kernaid-linux-hardware-inventory}"
+hardware_inventory_destination="$build_dir/config/includes.chroot/usr/lib/kernaid/kernaid-linux-hardware-inventory"
+codex_bridge_binary="${KERNAID_RESCUE_CODEX_BRIDGE_BINARY:-$repo_dir/target/release/kernaid-rescue-codex}"
+codex_client_binary="${KERNAID_RESCUE_CODEX_CLIENT_BINARY:-$repo_dir/target/release/kernaid-codex-auth}"
+codex_cli_binary="${KERNAID_RESCUE_CODEX_CLI_BINARY:-$repo_dir/target/rescue-codex-root/usr/lib/kernaid/codex}"
 vaultd_destination="$build_dir/config/includes.chroot/usr/lib/kernaid/kernaid-rescue-vaultd"
 vaultctl_destination="$build_dir/config/includes.chroot/usr/bin/kernaid-rescue-vaultctl"
 openai_executor_destination="$build_dir/config/includes.chroot/usr/lib/kernaid/kernaid-rescue-openai-executor"
-hardware_inventory_destination="$build_dir/config/includes.chroot/usr/lib/kernaid/kernaid-linux-hardware-inventory"
+codex_bridge_destination="$build_dir/config/includes.chroot/usr/lib/kernaid/kernaid-rescue-codex"
+codex_client_destination="$build_dir/config/includes.chroot/usr/bin/kernaid-codex-auth"
+codex_cli_destination="$build_dir/config/includes.chroot/usr/lib/kernaid/codex"
 vaultd_destination_dir="$(dirname "$vaultd_destination")"
 vaultctl_destination_dir="$(dirname "$vaultctl_destination")"
 vaultctl_destination_dir_created=0
@@ -49,8 +55,38 @@ validate_amd64_elf "$vaultd_binary" "Rescue vault daemon"
 validate_amd64_elf "$vaultctl_binary" "Rescue vault companion"
 validate_amd64_elf "$openai_executor_binary" "Rescue OpenAI executor"
 validate_amd64_elf "$hardware_inventory_binary" "Linux hardware inventory collector"
+validate_amd64_elf "$codex_bridge_binary" "Rescue Codex bridge"
+validate_amd64_elf "$codex_client_binary" "Rescue Codex client"
 
-for destination in "$vaultd_destination" "$vaultctl_destination" "$openai_executor_destination" "$hardware_inventory_destination"; do
+python3 -I - "$repo_dir/tools/build-rescue/verify-codex-cli.py" \
+  "$repo_dir/rescue/codex/codex-cli.lock.json" "$codex_cli_binary" <<'PY'
+import importlib.util
+import os
+from pathlib import Path
+import sys
+
+module_path, lock_path, binary_path = map(Path, sys.argv[1:])
+spec = importlib.util.spec_from_file_location("kernaid_verify_codex_cli_for_build", module_path)
+if spec is None or spec.loader is None:
+    raise SystemExit("Codex verifier cannot be loaded")
+verifier = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(verifier)
+lock = verifier.load_lock(lock_path)
+descriptor = verifier._open_exact_regular(binary_path, verifier.MAX_BINARY_BYTES)
+try:
+    verifier.verify_binary(descriptor, lock, require_root=True)
+finally:
+    os.close(descriptor)
+PY
+
+for destination in \
+  "$vaultd_destination" \
+  "$vaultctl_destination" \
+  "$openai_executor_destination" \
+  "$hardware_inventory_destination" \
+  "$codex_bridge_destination" \
+  "$codex_client_destination" \
+  "$codex_cli_destination"; do
   if [[ -e "$destination" || -L "$destination" ]]; then
     echo "Refusing to overwrite a pre-existing staged Rescue binary: $destination" >&2
     exit 2
@@ -72,7 +108,14 @@ else
 fi
 
 cleanup_staged_binaries() {
-  rm -f -- "$vaultd_destination" "$vaultctl_destination" "$openai_executor_destination" "$hardware_inventory_destination"
+  rm -f -- \
+    "$vaultd_destination" \
+    "$vaultctl_destination" \
+    "$openai_executor_destination" \
+    "$hardware_inventory_destination" \
+    "$codex_bridge_destination" \
+    "$codex_client_destination" \
+    "$codex_cli_destination"
   if [[ "$vaultctl_destination_dir_created" = "1" ]]; then
     rmdir -- "$vaultctl_destination_dir"
   fi
@@ -83,14 +126,45 @@ install -o root -g root -m 0755 "$vaultd_binary" "$vaultd_destination"
 install -o root -g root -m 0755 "$vaultctl_binary" "$vaultctl_destination"
 install -o root -g root -m 0755 "$openai_executor_binary" "$openai_executor_destination"
 install -o root -g root -m 0755 "$hardware_inventory_binary" "$hardware_inventory_destination"
-test "$(stat -c '%u:%g:%a' "$vaultd_destination")" = "0:0:755"
-test "$(stat -c '%u:%g:%a' "$vaultctl_destination")" = "0:0:755"
-test "$(stat -c '%u:%g:%a' "$openai_executor_destination")" = "0:0:755"
-test "$(stat -c '%u:%g:%a' "$hardware_inventory_destination")" = "0:0:755"
+install -o root -g root -m 0755 "$codex_bridge_binary" "$codex_bridge_destination"
+install -o root -g root -m 0755 "$codex_client_binary" "$codex_client_destination"
+install -o root -g root -m 0755 "$codex_cli_binary" "$codex_cli_destination"
+for destination in \
+  "$vaultd_destination" \
+  "$vaultctl_destination" \
+  "$openai_executor_destination" \
+  "$hardware_inventory_destination" \
+  "$codex_bridge_destination" \
+  "$codex_client_destination" \
+  "$codex_cli_destination"; do
+  test "$(stat -c '%u:%g:%a' "$destination")" = "0:0:755"
+done
 python3 -I "$repo_dir/tools/build-rescue/verify-shipping-binary.py" "$vaultd_destination"
 python3 -I "$repo_dir/tools/build-rescue/verify-shipping-binary.py" "$vaultctl_destination"
 python3 -I "$repo_dir/tools/build-rescue/verify-shipping-binary.py" "$openai_executor_destination"
 python3 -I "$repo_dir/tools/build-rescue/verify-shipping-binary.py" "$hardware_inventory_destination"
+python3 -I "$repo_dir/tools/build-rescue/verify-shipping-binary.py" "$codex_bridge_destination"
+python3 -I "$repo_dir/tools/build-rescue/verify-shipping-binary.py" "$codex_client_destination"
+python3 -I - "$repo_dir/tools/build-rescue/verify-codex-cli.py" \
+  "$repo_dir/rescue/codex/codex-cli.lock.json" "$codex_cli_destination" <<'PY'
+import importlib.util
+import os
+from pathlib import Path
+import sys
+
+module_path, lock_path, binary_path = map(Path, sys.argv[1:])
+spec = importlib.util.spec_from_file_location("kernaid_verify_staged_codex_cli", module_path)
+if spec is None or spec.loader is None:
+    raise SystemExit("Codex verifier cannot be loaded")
+verifier = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(verifier)
+lock = verifier.load_lock(lock_path)
+descriptor = verifier._open_exact_regular(binary_path, verifier.MAX_BINARY_BYTES)
+try:
+    verifier.verify_binary(descriptor, lock, require_root=True)
+finally:
+    os.close(descriptor)
+PY
 
 cd "$repo_dir"
 if [[ "${KERNAID_DESK_PREBUILT:-0}" != "1" ]]; then
@@ -114,7 +188,7 @@ lb config \
   --archive-areas "main contrib non-free-firmware" \
   --debian-installer none \
   --apt-recommends false \
-  --bootappend-live "boot=live components noroot username=kernaid hostname=kernaid-rescue live-config.user-default-groups=audio,cdrom,dip,floppy,video,plugdev,netdev,powerdev,scanner,bluetooth,kernaid-vault systemd.swap=0 quiet loglevel=5 console=tty0 console=ttyS0,115200n8"
+  --bootappend-live "boot=live components noroot username=kernaid hostname=kernaid-rescue live-config.user-default-groups=audio,cdrom,dip,floppy,video,plugdev,netdev,powerdev,scanner,bluetooth,kernaid-vault,kernaid-codex-client systemd.swap=0 quiet loglevel=5 console=tty0 console=ttyS0,115200n8"
 lb build
 
 iso="$(find . -maxdepth 1 -name 'live-image-amd64*.hybrid.iso' -o -name 'live-image-amd64*.iso' | head -n 1)"

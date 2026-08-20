@@ -432,13 +432,9 @@ impl Operation {
                 self,
                 Self::VaultStatus | Self::ProviderStatus | Self::ProviderOpenAiBorrow
             ),
-            PeerRole::Agent(AgentRole::Codex) => matches!(
-                self,
-                Self::VaultStatus
-                    | Self::ProviderStatus
-                    | Self::ProviderLogout
-                    | Self::ProviderCodexHomeLease
-            ),
+            PeerRole::Agent(AgentRole::Codex) => {
+                matches!(self, Self::VaultStatus | Self::ProviderCodexHomeLease)
+            }
         }
     }
 }
@@ -2528,7 +2524,7 @@ mod tests {
                 true,
                 [true, false, false, false],
             ),
-            ("provider.status", "{}", false, [true, true, true, true]),
+            ("provider.status", "{}", false, [true, true, true, false]),
             (
                 "provider.logout",
                 "{\"provider\":\"openai\"}",
@@ -2539,7 +2535,7 @@ mod tests {
                 "provider.logout",
                 "{\"provider\":\"codex\"}",
                 false,
-                [true, false, false, true],
+                [true, false, false, false],
             ),
             (
                 "provider.openai.borrow",

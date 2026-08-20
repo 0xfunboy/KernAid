@@ -190,11 +190,16 @@ ancora un comando di wipe, recovery o reprovisioning autenticato.
 
 Il vault viene formattato LUKS2, aperto con un mapper generato localmente,
 formattato ext4 e montato con policy hardened. Vengono creati il marker Rescue,
-il lock, `/.kernaid-secure-state-v1/` e un seed Ed25519 iniziale nel formato
-letto da `kernaid-rescue-secrets`. Il writer smonta e chiude, rifiuta una chiave
-errata, riapre con quella corretta e verifica esattamente UUID LUKS/filesystem,
-label, marker e hash dell'envelope d'identità. Mapper e mount temporanei sono
-sempre sottoposti a cleanup verificato.
+il lock, `/.kernaid-secure-state-v1/`, un seed Ed25519 iniziale nel formato
+letto da `kernaid-rescue-secrets`, e
+`/.kernaid-codex-home-v1/config.toml`. La home Codex è posseduta dall'identità
+fissa 973:973, ha modo 0700 e forza esclusivamente il credential store ufficiale
+su file; il config è 0600 e il writer rifiuta qualunque voce aggiuntiva durante
+la verifica di provisioning. Nessuna credenziale o `auth.json` viene creata dal
+writer. Il writer smonta e chiude, rifiuta una chiave errata, riapre con quella
+corretta e verifica esattamente UUID LUKS/filesystem, label, marker, home Codex
+senza credenziali e hash dell'envelope d'identità. Mapper e mount temporanei
+sono sempre sottoposti a cleanup verificato.
 
 Il profilo crittografico/filesystem non dipende dai default dell'host: cipher,
 key size, settore, Argon2id, aree metadata/keyslot e data offset LUKS2, oltre a

@@ -224,6 +224,7 @@ class VaultSystemdPackagingTests(unittest.TestCase):
             set(unit["Wants"].split()),
             {
                 "kernaid-ui.service",
+                "kernaid-rescue-codex.socket",
                 "kernaid-rescue-openai-egress.socket",
                 "kernaid-rescue-vaultd.service",
             },
@@ -234,6 +235,7 @@ class VaultSystemdPackagingTests(unittest.TestCase):
             {
                 "multi-user.target",
                 "kernaid-ui.service",
+                "kernaid-rescue-codex.socket",
                 "kernaid-rescue-openai-egress.socket",
                 "kernaid-rescue-vaultd.service",
             },
@@ -498,7 +500,7 @@ class VaultLivePolicyTests(unittest.TestCase):
         self.assertGreaterEqual(build.count("install -o root -g root -m 0755"), 2)
         self.assertIn("trap cleanup_staged_binaries EXIT", build)
         self.assertIn('rmdir -- "$vaultctl_destination_dir"', build)
-        self.assertEqual(build.count("verify-shipping-binary.py"), 4)
+        self.assertEqual(build.count("verify-shipping-binary.py"), 6)
         self.assertNotIn("cargo build", build)
 
     def test_shipping_binary_dependency_parser_is_closed_and_rejects_runpath(self) -> None:
@@ -555,7 +557,7 @@ class VaultLivePolicyTests(unittest.TestCase):
         )
         self.assertNotIn("$RUNNER_TEMP/kernaid-rescue-shipping-preflight", workflow)
         self.assertIn("sudo install -o root -g root -m 0755", workflow)
-        self.assertEqual(workflow.count("verify-shipping-binary.py"), 4)
+        self.assertEqual(workflow.count("verify-shipping-binary.py"), 6)
         self.assertIn("qemu-vault-lifecycle-smoke.sh", workflow)
 
 

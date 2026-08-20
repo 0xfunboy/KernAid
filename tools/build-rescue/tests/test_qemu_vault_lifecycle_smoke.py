@@ -4,6 +4,7 @@ import contextlib
 import ctypes
 import errno
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -2512,6 +2513,24 @@ def run_proof_transcript(
 
 class StaticContractTests(unittest.TestCase):
 
+    def test_shipping_codex_status_proof_is_real_offline_and_closed(self) -> None:
+        source = controller._codex_status_probe_source().decode("ascii")
+        self.assertIn('["/usr/bin/kernaid-codex-auth","status"]', source)
+        self.assertIn('b"KernAid Codex: disconnesso\\n"', source)
+        self.assertIn("kernaid-rescue-codex@kernaid-qemu-proof.service", source)
+        self.assertIn("kernaid-rescue-vaultd.service", source)
+        self.assertIn('show("NAccepted"', source)
+        self.assertIn('show("NConnections"', source)
+        self.assertIn("timeout=60", source)
+        lifecycle = inspect.getsource(controller.run_lifecycle)
+        self.assertIn('"codex-status",', lifecycle)
+        self.assertIn("timeout=75.0", lifecycle)
+        for forbidden in ("auth.json", "device-login", "http://", "https://"):
+            self.assertNotIn(forbidden, source)
+        self.assertIn("codex_status_path=true", controller.boot_attestation(
+            "bios", 1, 10, 16, 18, "KA-0123456789abcdef01234567"
+        ))
+
     def test_readiness_controller_and_wrapper_deadlines_are_strictly_nested(
         self,
     ) -> None:
@@ -2622,6 +2641,7 @@ class StaticContractTests(unittest.TestCase):
             (
                 "ui-diagnose-unconfigured",
                 "ui-status-configured",
+                "codex-status",
                 "production-status",
                 "normal-release",
                 "hold-kill",

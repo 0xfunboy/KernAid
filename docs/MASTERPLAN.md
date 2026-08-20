@@ -508,6 +508,18 @@ OpenAI’s current Codex documentation supports ChatGPT sign-in, API-key sign-in
 
 The official CLI can be used as the reasoning loop, but KernAid retains its own action policy and audit UI.
 
+Phase 0 implementation status (20 August 2026): Rescue now packages Codex CLI
+0.147.0 from an exact release lock after offline hash, ELF, archive, Fulcio and
+Rekor verification. A socket-activated non-root bridge exposes only the
+official `login --device-auth`, `login status`, and `logout` commands. It leases
+one descriptor-bound `CODEX_HOME` from the encrypted vault, returns only a
+fixed status vocabulary plus the device URL/code, and never opens or serializes
+`auth.json`. No prompt/model invocation, provider fallback, target access, or
+broker operation is part of this tranche. Fake-CLI restart/logout/tamper/no-raw
+tests and a real-CLI offline QEMU status path are automated; successful device
+authorization with a real eligible account is still an external release gate,
+so step 10 is not yet a complete support claim.
+
 ### 8.4 Claude bridge
 
 Anthropic documents subscription OAuth as the default inside Claude Code for eligible plans and offers API and Agent SDK paths. Anthropic’s legal page states that OAuth authentication is intended for purchasers using Claude Code and other native Anthropic applications. Therefore:
@@ -943,6 +955,9 @@ The first commit should contain these non-negotiable instructions:
 8. Provider adapters cannot call the broker directly.
 9. A support claim is not complete until a physical or QEMU test backs it.
 10. Preserve user data over repair speed.
+11. Official CLI bridges use an exact verified binary and an isolated encrypted
+    home; KernAid never reads, copies, serializes or logs the CLI credential
+    store.
 
 ## 15. MVP scope and backlog
 
@@ -1172,7 +1187,10 @@ The supplied kit includes SVG logo masters, tokens, app concept, social cover, p
 7. Add one API provider behind SessionDriver.
 8. Build and boot the first Debian/SystemRescue prototype in QEMU.
 9. Add encrypted persistence and device identity.
-10. Test Codex official CLI login/device auth in Rescue.
+10. Ship the bounded Codex official-CLI authentication bridge in Rescue, then
+    record a successful device-auth login with a real eligible account. The
+    bridge, encrypted home, supply-chain pin, offline status path, and negative
+    tests are implemented; the real-account evidence remains open.
 11. Implement the first reversible action: backup and repair one controlled Linux configuration fixture.
 12. Only then add broader provider and OS packs.
 

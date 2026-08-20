@@ -20,7 +20,7 @@ if [[ "$(id -u)" -ne 0 ]]; then
   exit 2
 fi
 
-for command in blockdev chmod cryptsetup dd dmsetup findmnt grep id losetup mkdir \
+for command in blockdev chmod chown cryptsetup dd dmsetup findmnt grep id losetup mkdir \
   mkfs.ext4 mktemp mount mountpoint od rm rmdir sha256sum sleep stat sync tr \
   truncate tune2fs umount unshare udevadm; do
   command -v "$command" >/dev/null || {
@@ -233,6 +233,13 @@ printf 'KERNAID-RESCUE-VAULT-V1\n' >"$provision_mount/.kernaid-rescue-vault"
 chmod 600 "$provision_mount/.kernaid-rescue-vault"
 mkdir "$provision_mount/.kernaid-secure-state-v1"
 chmod 700 "$provision_mount/.kernaid-secure-state-v1"
+mkdir "$provision_mount/.kernaid-codex-home-v1"
+chmod 700 "$provision_mount/.kernaid-codex-home-v1"
+chown 973:973 "$provision_mount/.kernaid-codex-home-v1"
+printf 'cli_auth_credentials_store = "file"\n' \
+  >"$provision_mount/.kernaid-codex-home-v1/config.toml"
+chmod 600 "$provision_mount/.kernaid-codex-home-v1/config.toml"
+chown 973:973 "$provision_mount/.kernaid-codex-home-v1/config.toml"
 : >"$provision_mount/.kernaid-rescue-secrets.lock"
 chmod 600 "$provision_mount/.kernaid-rescue-secrets.lock"
 sync

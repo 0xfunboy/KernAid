@@ -84,6 +84,37 @@ directory listings, bytes, device identifiers, or customer paths. KernAid
 currently stages an R0 observation plan and performs no repair mutation. The
 absence of a finding is not proof that the machine is healthy.
 
+### Codex account bootstrap in an engineering Rescue image
+
+The image contains a bounded authentication bridge for the pinned official
+Codex CLI. It is not a Codex diagnosis executor: it accepts no prompt, model,
+path, command, API key, or broker operation. Use it only on a vault provisioned
+by the matching v2 writer and only after the vault is unlocked locally:
+
+```text
+kernaid-rescue-vaultctl status
+kernaid-rescue-vaultctl unlock
+kernaid-codex-auth status
+kernaid-codex-auth device-login
+kernaid-codex-auth logout
+```
+
+`unlock` reads the vault passphrase from the controlling TTY. `device-login`
+runs exactly `codex login --device-auth`; open only the displayed
+`https://auth.openai.com/codex/device` URL and enter its one-time code. Status
+returns only the authentication kind or signed-out state. Logout runs exactly
+`codex logout` and removes state through the CLI itself. Do not run the private
+`/usr/lib/kernaid/codex` binary directly.
+
+The CLI owns `auth.json` inside its mode-0700 home on the encrypted vault.
+KernAid validates only file metadata and never reads, copies, prints, or places
+that file in reports. Operations are one-shot and bounded; locking/stopping the
+vault revokes the complete service cgroup. A successful real-account device
+login, provider terms/entitlement, outbound authentication connectivity, and
+physical-media behavior remain external release gates. The automated QEMU gate
+uses the real pinned CLI only for offline signed-out status and does not create
+an account session.
+
 ## Diagnose a running operating system
 
 Download the matching artifact from a successful `desktop` run:

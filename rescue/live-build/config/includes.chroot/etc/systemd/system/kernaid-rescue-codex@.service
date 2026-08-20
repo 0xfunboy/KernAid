@@ -1,0 +1,68 @@
+[Unit]
+Description=KernAid Rescue Codex one-operation authentication bridge
+Requires=kernaid-rescue-codex.socket kernaid-rescue-vaultd.socket systemd-sysusers.service
+BindsTo=kernaid-rescue-vaultd.service
+After=kernaid-rescue-codex.socket kernaid-rescue-vaultd.socket kernaid-rescue-vaultd.service network-online.target systemd-sysusers.service
+CollectMode=inactive-or-failed
+ConditionKernelCommandLine=boot=live
+ConditionPathIsDirectory=/run/live/medium
+
+[Service]
+Type=simple
+ExecStart=/usr/lib/kernaid/kernaid-rescue-codex
+# Outer wall around the client's 990-second device-auth deadline, including
+# descriptor/hash validation and final control-group cleanup.
+RuntimeMaxSec=1020s
+TimeoutStartSec=5s
+TimeoutStopSec=10s
+Restart=no
+StandardInput=socket
+StandardOutput=null
+StandardError=null
+User=kernaid-codex
+# Preserve the dedicated primary group so every CLI-created credential-store
+# entry remains owned by the exact Codex identity. Vault socket access exists
+# only as a unit-scoped supplementary group, never in the account database.
+Group=kernaid-codex
+SupplementaryGroups=kernaid-vault
+UMask=0077
+LimitCORE=0
+LimitNOFILE=32
+TasksMax=64
+# Keep the exact delegated provider tree directly below system.slice so the
+# vault can bind and revoke the lease by authenticated peer pidfd/cgroup.
+Slice=system.slice
+MemoryPressureWatch=no
+Delegate=pids
+DelegateSubgroup=agent
+KillMode=control-group
+SendSIGKILL=yes
+NoNewPrivileges=yes
+PrivateMounts=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateIPC=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+DevicePolicy=closed
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+# systemd 257 implements RestrictSUIDSGID with an openat2 denial. The bridge's
+# descriptor-bound executable and CODEX_HOME checks require openat2; the empty
+# capability sets and NoNewPrivileges retain the privilege boundary.
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+KeyringMode=private
+RemoveIPC=yes

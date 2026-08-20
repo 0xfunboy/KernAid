@@ -112,6 +112,11 @@ VAULT_LOCK_NAME = ".kernaid-rescue-secrets.lock"
 STATE_DIRECTORY = ".kernaid-secure-state-v1"
 IDENTITY_NAME = "device-identity"
 IDENTITY_PREFIX = b"kernaid-rescue-secret-v1:device-identity-seed-v1:"
+CODEX_HOME_NAME = ".kernaid-codex-home-v1"
+CODEX_HOME_UID = 973
+CODEX_HOME_GID = 973
+CODEX_CONFIG_NAME = "config.toml"
+CODEX_CONFIG = b'cli_auth_credentials_store = "file"\n'
 IDENTITY_SEED_BYTES = 32
 MAX_SECRET_BYTES = 1024
 MIN_SECRET_BYTES = 12
@@ -2899,12 +2904,20 @@ def verify_mount(
         raise SafetyError("vault mountpoint ownership or type is unsafe")
 
 
-def _write_exact_file(directory_fd: int, name: str, contents: bytearray | bytes) -> None:
+def _write_exact_file(
+    directory_fd: int,
+    name: str,
+    contents: bytearray | bytes,
+    *,
+    owner: int = 0,
+    group: int = 0,
+) -> None:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     fd = os.open(name, flags, 0o600, dir_fd=directory_fd)
     try:
+        os.fchown(fd, owner, group)
         view = memoryview(contents)
         offset = 0
         while offset < len(contents):
@@ -2917,8 +2930,8 @@ def _write_exact_file(directory_fd: int, name: str, contents: bytearray | bytes)
         if (
             not stat.S_ISREG(details.st_mode)
             or stat.S_IMODE(details.st_mode) != 0o600
-            or details.st_uid != 0
-            or details.st_gid != 0
+            or details.st_uid != owner
+            or details.st_gid != group
             or details.st_nlink != 1
             or details.st_size != len(contents)
         ):
@@ -3015,6 +3028,30 @@ def create_vault_layout(
                 raise WriteError("ext4 lost+found metadata is unsafe")
         _write_exact_file(root_fd, VAULT_MARKER_NAME, VAULT_MARKER)
         _write_exact_file(root_fd, VAULT_LOCK_NAME, b"")
+        os.mkdir(CODEX_HOME_NAME, 0o700, dir_fd=root_fd)
+        codex_home_fd = os.open(CODEX_HOME_NAME, flags, dir_fd=root_fd)
+        try:
+            os.fchown(codex_home_fd, CODEX_HOME_UID, CODEX_HOME_GID)
+            codex_home = os.fstat(codex_home_fd)
+            if (
+                not stat.S_ISDIR(codex_home.st_mode)
+                or f"{os.major(codex_home.st_dev)}:{os.minor(codex_home.st_dev)}"
+                != mapper.major_minor
+                or codex_home.st_uid != CODEX_HOME_UID
+                or codex_home.st_gid != CODEX_HOME_GID
+                or stat.S_IMODE(codex_home.st_mode) != 0o700
+            ):
+                raise WriteError("Codex home directory metadata is unsafe")
+            _write_exact_file(
+                codex_home_fd,
+                CODEX_CONFIG_NAME,
+                CODEX_CONFIG,
+                owner=CODEX_HOME_UID,
+                group=CODEX_HOME_GID,
+            )
+            os.fsync(codex_home_fd)
+        finally:
+            os.close(codex_home_fd)
         os.mkdir(STATE_DIRECTORY, 0o700, dir_fd=root_fd)
         state_fd = os.open(STATE_DIRECTORY, flags, dir_fd=root_fd)
         try:
@@ -3049,7 +3086,13 @@ def create_vault_layout(
 
 
 def _verify_regular_at(
-    directory_fd: int, name: str, expected_sha: str, expected_size: int
+    directory_fd: int,
+    name: str,
+    expected_sha: str,
+    expected_size: int,
+    *,
+    owner: int = 0,
+    group: int = 0,
 ) -> None:
     flags = os.O_RDONLY | os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
@@ -3060,8 +3103,8 @@ def _verify_regular_at(
         if (
             not stat.S_ISREG(details.st_mode)
             or stat.S_IMODE(details.st_mode) != 0o600
-            or details.st_uid != 0
-            or details.st_gid != 0
+            or details.st_uid != owner
+            or details.st_gid != group
             or details.st_nlink != 1
             or details.st_size != expected_size
         ):
@@ -3101,13 +3144,41 @@ def verify_vault_layout(
             or stat.S_IMODE(root.st_mode) != 0o700
         ):
             raise WriteError("vault root metadata changed after reopen")
-        expected_root = {VAULT_MARKER_NAME, VAULT_LOCK_NAME, STATE_DIRECTORY}
+        expected_root = {
+            VAULT_MARKER_NAME,
+            VAULT_LOCK_NAME,
+            STATE_DIRECTORY,
+            CODEX_HOME_NAME,
+        }
         entries = set(os.listdir(root_fd))
         entries.discard("lost+found")
         if entries != expected_root:
             raise WriteError("vault root layout changed after reopen")
         _verify_regular_at(root_fd, VAULT_MARKER_NAME, evidence.marker_sha256, len(VAULT_MARKER))
         _verify_regular_at(root_fd, VAULT_LOCK_NAME, hashlib.sha256(b"").hexdigest(), 0)
+        codex_home_fd = os.open(CODEX_HOME_NAME, flags, dir_fd=root_fd)
+        try:
+            codex_home = os.fstat(codex_home_fd)
+            if (
+                not stat.S_ISDIR(codex_home.st_mode)
+                or f"{os.major(codex_home.st_dev)}:{os.minor(codex_home.st_dev)}"
+                != mapper.major_minor
+                or codex_home.st_uid != CODEX_HOME_UID
+                or codex_home.st_gid != CODEX_HOME_GID
+                or stat.S_IMODE(codex_home.st_mode) != 0o700
+                or set(os.listdir(codex_home_fd)) != {CODEX_CONFIG_NAME}
+            ):
+                raise WriteError("Codex home layout changed after reopen")
+            _verify_regular_at(
+                codex_home_fd,
+                CODEX_CONFIG_NAME,
+                hashlib.sha256(CODEX_CONFIG).hexdigest(),
+                len(CODEX_CONFIG),
+                owner=CODEX_HOME_UID,
+                group=CODEX_HOME_GID,
+            )
+        finally:
+            os.close(codex_home_fd)
         state_fd = os.open(STATE_DIRECTORY, flags, dir_fd=root_fd)
         try:
             state = os.fstat(state_fd)

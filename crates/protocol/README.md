@@ -172,7 +172,10 @@ enables vault lifecycle, provider configuration lifecycle (`provider.status`,
 `provider.openai.configure`, and OpenAI `provider.logout`), plus the leased
 OpenAI Agent `provider.openai.borrow` path. The separate one-shot executor is
 the only consumer and fixes its TLS destination and Responses codec. The
-shipping daemon has no Application or Codex UID mapping and rejects their
-typed protocol operations before state, marker, or worker handling. Codex
-home/logout/status effects, audit/report operations, and generic network or UI
-command surfaces remain disabled.
+shipping daemon has no Application UID mapping. Its feature-gated Codex
+identity is enabled only for vault status and the descriptor-only Codex-home
+lease used by the separate authentication bridge; provider status/logout are
+rejected for that identity, while the bridge invokes the official CLI's bounded
+logout command against the leased home. Codex prompt/agent
+execution, audit/report operations, and generic network or UI command surfaces
+remain disabled.

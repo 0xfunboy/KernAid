@@ -8,13 +8,15 @@ LUKS2 mount manager—is deliberately disabled by default and is available only
 with `experimental-vault-manager`; its disposable integration probe
 additionally requires `privileged-probe`.
 
-It remains an experimental, feature-gated manager rather than a production
-credential service. The lifecycle daemon, terminal companion, systemd
-isolation and Rescue ISO packaging are implemented, and the Rescue workflow
-defines privileged BIOS and UEFI lifecycle gates. An exact image revision is
-virtually qualified only after both lifecycle jobs finish successfully.
-Physical-machine, real-account OpenAI TLS and rollback-resistant hardware
-anchoring remain separate release gates.
+It remains a feature-gated manager rather than a generally reusable credential
+service. The shipping Rescue build selects `experimental-codex-home-lease` and
+therefore includes the reviewed vault lifecycle plus the descriptor-only Codex
+home operation. The lifecycle daemon, terminal companion, systemd isolation
+and Rescue ISO packaging are implemented, and the Rescue workflow defines
+privileged BIOS and UEFI lifecycle gates. An exact image revision is virtually
+qualified only after both lifecycle jobs finish successfully.
+Physical-machine, real-account OpenAI/Codex connectivity and
+rollback-resistant hardware anchoring remain separate release gates.
 
 ## Experimental manager API
 
@@ -294,11 +296,14 @@ With `experimental-vault-manager`, `kernaid-rescue-vaultd` implements the
 closed `vault.status`, `vault.unlock`, and `vault.lock` lifecycle plus the
 configuration-only `provider.status`, `provider.openai.configure`, and OpenAI
 form of `provider.logout`. The exact `Agent(OpenAi)` identity may also invoke
-`provider.openai.borrow`; Application and Codex roles are not present in the
-shipping allowlist. Codex status/logout/home lease, Application audit, and
-report persist/list/get are rejected before state or worker dispatch and are
-answered `NOT_AUTHORIZED`, with no output descriptor. Provider status returns
-only the configured/unconfigured state; it never returns a credential.
+`provider.openai.borrow`. The narrower
+`experimental-codex-home-lease` feature also admits the exact fixed
+`Agent(Codex)` identity, but only for `vault.status` and
+`provider.codex.home_lease`; provider status/logout, prompt execution,
+Application audit, and report persist/list/get are still rejected before state
+or worker dispatch. The home lease returns one
+`O_PATH` directory descriptor and no credential bytes. Provider status returns
+only configured/unconfigured state; it never returns a credential.
 Provider operations require the vault to be unlocked and are serialized with
 each other and with vault lifecycle work. Status does not change `stateVersion`;
 configure and logout each reserve and complete a transition, so a correlated
@@ -448,11 +453,13 @@ root-owned runtime/tmpfiles boundary, and fail-closed core/swap and UID-1000
 policy. It also creates the dynamic `kernaid-openai` nologin/no-home identity,
 adds only that identity to `kernaid-vault`, and resolves its collision-free UID
 from the descriptor-validated passwd file before constructing the daemon peer
-allowlist as `Agent(OpenAi)`. No Application or Codex UID, unit, socket,
-capability, network rule, or home is created. The shipping OpenAI Agent is
+allowlist as `Agent(OpenAi)`. The Codex home-lease build additionally validates
+the fixed UID/GID 973 nologin/no-home identity and admits only its exact
+systemd unit/cgroup as `Agent(Codex)`. The shipping OpenAI Agent is
 restricted to `vault.status`, `provider.status`, and leased
-`provider.openai.borrow`; all mutation, Codex, audit and report operations
-remain unavailable at the server boundary. The
+`provider.openai.borrow`; the Codex Agent is restricted to `vault.status` and
+one exclusive `provider.codex.home_lease`. All other Codex, mutation, audit and
+report operations remain unavailable at the server boundary. The
 target systemd 257 vault unit intentionally omits `RestrictSUIDSGID`
 because that version implements it by denying all `openat2` calls; the daemon's
 descriptor-bound path validation requires `openat2`, while `NoNewPrivileges`,

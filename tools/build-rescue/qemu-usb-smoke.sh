@@ -28,7 +28,7 @@ readonly probe_prefix=KERNAID_RESCUE_VAULT_PROBE_ATTESTATION_V1
 readonly probe_failure_prefix=KERNAID_RESCUE_VAULT_PROBE_FAILURE_V1
 readonly journal_binding_value=device-identity-bound-v1
 
-for command in awk blkid cat chmod cp cryptsetup dd dirname findmnt grep id \
+for command in awk blkid cat chmod chown cp cryptsetup dd dirname findmnt grep id \
   kill losetup mkdir mkfs.ext4 mktemp mount mountpoint od python3 \
   qemu-system-x86_64 readlink rm rmdir sha256sum sleep stat sync tail tee tr \
   truncate tune2fs udevadm umount; do
@@ -896,9 +896,18 @@ mkdir "$provision_mount/.kernaid-secure-state-v1"
 chmod 700 "$provision_mount/.kernaid-secure-state-v1"
 : >"$provision_mount/.kernaid-rescue-secrets.lock"
 chmod 600 "$provision_mount/.kernaid-rescue-secrets.lock"
+mkdir "$provision_mount/.kernaid-codex-home-v1"
+chmod 700 "$provision_mount/.kernaid-codex-home-v1"
+chown 973:973 "$provision_mount/.kernaid-codex-home-v1"
+printf 'cli_auth_credentials_store = "file"\n' \
+  >"$provision_mount/.kernaid-codex-home-v1/config.toml"
+chmod 600 "$provision_mount/.kernaid-codex-home-v1/config.toml"
+chown 973:973 "$provision_mount/.kernaid-codex-home-v1/config.toml"
 if [[ "$(stat -c '%a:%u:%g' -- "$provision_mount/.kernaid-rescue-vault")" != "600:0:0" \
   || "$(stat -c '%a:%u:%g' -- "$provision_mount/.kernaid-rescue-secrets.lock")" != "600:0:0" \
-  || "$(stat -c '%a:%u:%g' -- "$provision_mount/.kernaid-secure-state-v1")" != "700:0:0" ]]; then
+  || "$(stat -c '%a:%u:%g' -- "$provision_mount/.kernaid-secure-state-v1")" != "700:0:0" \
+  || "$(stat -c '%a:%u:%g' -- "$provision_mount/.kernaid-codex-home-v1")" != "700:973:973" \
+  || "$(stat -c '%a:%u:%g:%s' -- "$provision_mount/.kernaid-codex-home-v1/config.toml")" != "600:973:973:36" ]]; then
   echo "The disposable vault layout has unsafe ownership or permissions" >&2
   exit 1
 fi

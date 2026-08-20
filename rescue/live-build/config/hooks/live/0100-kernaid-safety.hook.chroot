@@ -23,13 +23,19 @@ chmod 0644 \
     /usr/lib/kernaid/ready-check \
     /usr/lib/kernaid/rescue_server.py
 chown root:root \
+    /usr/lib/kernaid/codex \
+    /usr/lib/kernaid/kernaid-rescue-codex \
     /usr/lib/kernaid/kernaid-rescue-openai-executor \
     /usr/lib/kernaid/kernaid-rescue-vaultd \
+    /usr/bin/kernaid-codex-auth \
     /usr/bin/kernaid-rescue-vaultctl
 test -x /usr/lib/systemd/systemd-socket-proxyd
 chmod 0755 \
+    /usr/lib/kernaid/codex \
+    /usr/lib/kernaid/kernaid-rescue-codex \
     /usr/lib/kernaid/kernaid-rescue-openai-executor \
     /usr/lib/kernaid/kernaid-rescue-vaultd \
+    /usr/bin/kernaid-codex-auth \
     /usr/bin/kernaid-rescue-vaultctl
 chown root:root \
     /etc/systemd/system/kernaid-offline-inspector-key.service \
@@ -45,6 +51,8 @@ chown root:root \
     /etc/systemd/system/kernaid-rescue-openai-egress.socket \
     /etc/systemd/system/kernaid-rescue-openai-executor.socket \
     /etc/systemd/system/kernaid-rescue-openai-executor@.service \
+    /etc/systemd/system/kernaid-rescue-codex.socket \
+    /etc/systemd/system/kernaid-rescue-codex@.service \
     /etc/systemd/system/kernaid-rescue-vaultd.service \
     /etc/systemd/system/kernaid-rescue-vaultd.socket \
     /etc/systemd/system/kernaid-ready.service \
@@ -67,6 +75,8 @@ chmod 0644 \
     /etc/systemd/system/kernaid-rescue-openai-egress.socket \
     /etc/systemd/system/kernaid-rescue-openai-executor.socket \
     /etc/systemd/system/kernaid-rescue-openai-executor@.service \
+    /etc/systemd/system/kernaid-rescue-codex.socket \
+    /etc/systemd/system/kernaid-rescue-codex@.service \
     /etc/systemd/system/kernaid-rescue-vaultd.service \
     /etc/systemd/system/kernaid-rescue-vaultd.socket \
     /etc/systemd/system/kernaid-ready.service \
@@ -94,6 +104,7 @@ systemctl enable kernaid-ui.service
 systemctl enable kernaid-offline-inspector.socket
 systemctl enable kernaid-rescue-openai-egress.socket
 systemctl enable kernaid-rescue-openai-executor.socket
+systemctl enable kernaid-rescue-codex.socket
 systemctl enable kernaid-rescue-vaultd.socket
 systemctl enable kernaid-rescue-vaultd.service
 systemctl mask swap.target

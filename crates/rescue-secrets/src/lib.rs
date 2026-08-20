@@ -51,9 +51,9 @@ pub const VAULT_MARKER_V1: &[u8] = b"KERNAID-RESCUE-VAULT-V1\n";
 pub const VAULT_MARKER_NAME: &str = ".kernaid-rescue-vault";
 
 #[cfg(all(target_os = "linux", feature = "experimental-codex-home-lease"))]
-pub(crate) const CODEX_AGENT_UID: u32 = 1003;
+pub(crate) const CODEX_AGENT_UID: u32 = 973;
 #[cfg(all(target_os = "linux", feature = "experimental-codex-home-lease"))]
-pub(crate) const CODEX_AGENT_GID: u32 = 1003;
+pub(crate) const CODEX_AGENT_GID: u32 = 973;
 #[cfg(all(target_os = "linux", feature = "experimental-codex-home-lease"))]
 pub(crate) const CODEX_HOME_NAME: &str = ".kernaid-codex-home-v1";
 

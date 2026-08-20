@@ -1,0 +1,29 @@
+[package]
+name = "kernaid-rescue-codex-bridge"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+kernaid-protocol = { path = "../protocol" }
+rand_core = { version = "0.6", features = ["getrandom"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+zeroize = "1.8"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1.4", features = ["event", "fs", "net", "process", "thread"] }
+
+[dev-dependencies]
+tempfile = "3.27"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "kernaid-rescue-codex"
+path = "src/bin/kernaid-rescue-codex.rs"
+
+[[bin]]
+name = "kernaid-codex-auth"
+path = "src/bin/kernaid-codex-auth.rs"

@@ -23,6 +23,7 @@ on:
       - "crates/rescue-secrets/**"
       - "crates/evidence/**"
       - "crates/rescue-openai-executor/**"
+      - "crates/rescue-codex-bridge/**"
       - "crates/rescue-openai-provider/**"
       - "crates/report-schema/**"
       - "crates/protocol/**"
@@ -167,14 +168,20 @@ jobs:
           cargo fmt -p kernaid-rescue-openai-executor -- --check
           cargo clippy --locked -p kernaid-rescue-openai-executor --all-targets -- -D warnings
           cargo test --locked -p kernaid-rescue-openai-executor
+          cargo fmt -p kernaid-rescue-codex-bridge -- --check
+          cargo clippy --locked -p kernaid-rescue-codex-bridge --all-targets -- -D warnings
+          cargo test --locked -p kernaid-rescue-codex-bridge
           cargo build --locked --release -p kernaid-rescue-secrets \
-            --features experimental-vault-manager \
+            --features experimental-codex-home-lease \
             --bin kernaid-rescue-vaultd \
             --bin kernaid-rescue-vaultctl
           cargo build --locked --release -p kernaid-rescue-openai-executor \
             --bin kernaid-rescue-openai-executor
           cargo build --locked --release -p kernaid-linux-pack \
             --bin kernaid-linux-hardware-inventory
+          cargo build --locked --release -p kernaid-rescue-codex-bridge \
+            --bin kernaid-rescue-codex \
+            --bin kernaid-codex-auth
       - name: Verify the in-guest Rescue binary ABI
         run: |
           preflight_dir="$(sudo /usr/bin/mktemp -d /root/kernaid-rescue-shipping-preflight.XXXXXXXX)"
@@ -183,6 +190,8 @@ jobs:
             sudo unlink -- "$preflight_dir/kernaid-rescue-vaultctl" 2>/dev/null || true
             sudo unlink -- "$preflight_dir/kernaid-rescue-openai-executor" 2>/dev/null || true
             sudo unlink -- "$preflight_dir/kernaid-linux-hardware-inventory" 2>/dev/null || true
+            sudo unlink -- "$preflight_dir/kernaid-rescue-codex" 2>/dev/null || true
+            sudo unlink -- "$preflight_dir/kernaid-codex-auth" 2>/dev/null || true
             sudo rmdir -- "$preflight_dir" 2>/dev/null || true
           }
           trap cleanup_preflight EXIT
@@ -202,6 +211,12 @@ jobs:
           sudo install -o root -g root -m 0755 \
             target/release/kernaid-linux-hardware-inventory \
             "$preflight_dir/kernaid-linux-hardware-inventory"
+          sudo install -o root -g root -m 0755 \
+            target/release/kernaid-rescue-codex \
+            "$preflight_dir/kernaid-rescue-codex"
+          sudo install -o root -g root -m 0755 \
+            target/release/kernaid-codex-auth \
+            "$preflight_dir/kernaid-codex-auth"
           sudo /usr/bin/python3 -I tools/build-rescue/verify-shipping-binary.py \
             "$preflight_dir/kernaid-rescue-vaultd"
           sudo /usr/bin/python3 -I tools/build-rescue/verify-shipping-binary.py \
@@ -210,6 +225,10 @@ jobs:
             "$preflight_dir/kernaid-rescue-openai-executor"
           sudo /usr/bin/python3 -I tools/build-rescue/verify-shipping-binary.py \
             "$preflight_dir/kernaid-linux-hardware-inventory"
+          sudo /usr/bin/python3 -I tools/build-rescue/verify-shipping-binary.py \
+            "$preflight_dir/kernaid-rescue-codex"
+          sudo /usr/bin/python3 -I tools/build-rescue/verify-shipping-binary.py \
+            "$preflight_dir/kernaid-codex-auth"
       - name: Build hybrid BIOS and UEFI ISO
         run: |
           docker run --rm --privileged \
@@ -218,9 +237,17 @@ jobs:
             -e KERNAID_RESCUE_VAULTCTL_BINARY=/workspace/target/release/kernaid-rescue-vaultctl \
             -e KERNAID_RESCUE_OPENAI_EXECUTOR_BINARY=/workspace/target/release/kernaid-rescue-openai-executor \
             -e KERNAID_LINUX_HARDWARE_INVENTORY_BINARY=/workspace/target/release/kernaid-linux-hardware-inventory \
+            -e KERNAID_RESCUE_CODEX_BRIDGE_BINARY=/workspace/target/release/kernaid-rescue-codex \
+            -e KERNAID_RESCUE_CODEX_CLIENT_BINARY=/workspace/target/release/kernaid-codex-auth \
+            -e KERNAID_RESCUE_CODEX_CLI_BINARY=/opt/kernaid-codex-root/usr/lib/kernaid/codex \
             -v "$PWD:/workspace" -w /workspace \
             debian:trixie-slim \
-            sh -c 'apt-get update && apt-get install -y binutils live-build ca-certificates python3 && ./tools/build-rescue/build.sh'
+            sh -c 'apt-get update && apt-get install -y binutils live-build ca-certificates openssl python3 && install -d -o root -g root -m 0755 /opt/kernaid-codex-root/usr/lib/kernaid && python3 -I tools/build-rescue/fetch-codex-cli.py --lock rescue/codex/codex-cli.lock.json --root /opt/kernaid-codex-root && ./tools/build-rescue/build.sh'
+      - name: Generate the pinned Codex SBOM tranche
+        run: |
+          python3 -I tools/build-rescue/generate-rescue-sbom.py \
+            --lock rescue/codex/codex-cli.lock.json \
+            --output KernAid-Rescue-amd64.codex.cdx.json
       - name: QEMU BIOS smoke test
         run: KERNAID_SMOKE_LOG=rescue-smoke-bios.log ./tools/build-rescue/qemu-smoke.sh bios
       - name: QEMU UEFI smoke test
@@ -345,6 +372,7 @@ jobs:
             KernAid-Rescue-amd64.iso.sha256
             KernAid-Rescue-amd64.catalog-entry.json
             KernAid-Rescue-amd64.catalog-entry-v2.json
+            KernAid-Rescue-amd64.codex.cdx.json
           if-no-files-found: error
           retention-days: 14
 
@@ -493,6 +521,7 @@ jobs:
               r"cgroup_topology_exact=true shell_mount_absent=true "
               r"provider_configured=true production_executor_unit_binds_to_exact=true "
               r"production_executor_status_path=true conditioned_agent_binds_to_runtime=true "
+              r"codex_status_path=true "
               r"production_ui_provider_relay_path=true "
               r"normal_triple_release=true lifecycle_marker_active_before_borrow=true "
               r"hold_killed_vaultd=(true|false) helper_binds_to_terminated=(true|false) "
@@ -525,6 +554,7 @@ jobs:
               r"shell_mount_absent=true provider_configured=true "
               r"production_executor_unit_binds_to_exact=true "
               r"production_executor_status_path=true conditioned_agent_binds_to_runtime=true "
+              r"codex_status_path=true "
               r"production_ui_provider_relay_path=true "
               r"normal_triple_release=true lifecycle_marker_active_before_borrow=true "
               r"hold_killed_vaultd=true helper_binds_to_terminated=true "
@@ -766,6 +796,7 @@ jobs:
               r"cgroup_topology_exact=true shell_mount_absent=true "
               r"provider_configured=true production_executor_unit_binds_to_exact=true "
               r"production_executor_status_path=true conditioned_agent_binds_to_runtime=true "
+              r"codex_status_path=true "
               r"production_ui_provider_relay_path=true "
               r"normal_triple_release=true lifecycle_marker_active_before_borrow=true "
               r"hold_killed_vaultd=(true|false) helper_binds_to_terminated=(true|false) "
@@ -798,6 +829,7 @@ jobs:
               r"shell_mount_absent=true provider_configured=true "
               r"production_executor_unit_binds_to_exact=true "
               r"production_executor_status_path=true conditioned_agent_binds_to_runtime=true "
+              r"codex_status_path=true "
               r"production_ui_provider_relay_path=true "
               r"normal_triple_release=true lifecycle_marker_active_before_borrow=true "
               r"hold_killed_vaultd=true helper_binds_to_terminated=true "

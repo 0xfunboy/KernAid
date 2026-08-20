@@ -10,5 +10,8 @@
 8. Provider adapters cannot call the broker directly.
 9. A support claim is not complete until a physical or QEMU test backs it.
 10. Preserve user data over repair speed.
+11. Official CLI bridges use an exact verified binary and an isolated encrypted
+    home; KernAid never reads, copies, serializes, or logs the CLI credential
+    store.
 
 These rules apply to the whole repository. Phase 0 is diagnosis-only: no production mutation handlers.

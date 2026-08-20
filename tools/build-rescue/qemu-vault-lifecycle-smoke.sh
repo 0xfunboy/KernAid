@@ -376,7 +376,7 @@ fi
 
 # Future workflow wiring must install squashfs-tools; this separate smoke
 # fail-closes here until its unsquashfs reader is available.
-for command in awk blkid chmod cmp cp cryptsetup dd findmnt grep id losetup \
+for command in awk blkid chmod chown cmp cp cryptsetup dd findmnt grep id losetup \
   mkdir mkfs.ext4 mktemp mkswap mount mountpoint od python3 qemu-system-x86_64 \
   ps readlink rm rmdir sha256sum sleep stat sync timeout tr truncate tune2fs \
   udevadm umount unsquashfs; do
@@ -730,9 +730,23 @@ chmod 700 -- "$provision_mount/.kernaid-secure-state-v1" >/dev/null 2>&1 \
 : >"$provision_mount/.kernaid-rescue-secrets.lock"
 chmod 600 -- "$provision_mount/.kernaid-rescue-secrets.lock" >/dev/null 2>&1 \
   || fail provisioning lock-mode-failed
+mkdir -- "$provision_mount/.kernaid-codex-home-v1" >/dev/null 2>&1 \
+  || fail provisioning codex-home-create-failed
+chmod 700 -- "$provision_mount/.kernaid-codex-home-v1" >/dev/null 2>&1 \
+  || fail provisioning codex-home-mode-failed
+chown 973:973 -- "$provision_mount/.kernaid-codex-home-v1" >/dev/null 2>&1 \
+  || fail provisioning codex-home-owner-failed
+printf 'cli_auth_credentials_store = "file"\n' \
+  >"$provision_mount/.kernaid-codex-home-v1/config.toml"
+chmod 600 -- "$provision_mount/.kernaid-codex-home-v1/config.toml" >/dev/null 2>&1 \
+  || fail provisioning codex-config-mode-failed
+chown 973:973 -- "$provision_mount/.kernaid-codex-home-v1/config.toml" >/dev/null 2>&1 \
+  || fail provisioning codex-config-owner-failed
 [[ "$(stat -c '%a:%u:%g' -- "$provision_mount/.kernaid-rescue-vault")" == 600:0:0 \
   && "$(stat -c '%a:%u:%g' -- "$provision_mount/.kernaid-rescue-secrets.lock")" == 600:0:0 \
-  && "$(stat -c '%a:%u:%g' -- "$provision_mount/.kernaid-secure-state-v1")" == 700:0:0 ]] \
+  && "$(stat -c '%a:%u:%g' -- "$provision_mount/.kernaid-secure-state-v1")" == 700:0:0 \
+  && "$(stat -c '%a:%u:%g' -- "$provision_mount/.kernaid-codex-home-v1")" == 700:973:973 \
+  && "$(stat -c '%a:%u:%g:%s' -- "$provision_mount/.kernaid-codex-home-v1/config.toml")" == 600:973:973:36 ]] \
   || fail provisioning layout-metadata-invalid
 sync -f "$provision_mount" >/dev/null 2>&1 || fail provisioning sync-failed
 umount -- "$provision_mount" >/dev/null 2>&1 \
@@ -934,7 +948,7 @@ for ((boot = 1; boot <= boot_count; boot++)); do
     expected_terminal=persistent-fault
     expected_fault_proof=true
   fi
-  if [[ ! "$boot_line" =~ ^${boot_prefix}\ firmware=${firmware}\ boot=${boot}\ initial_version=([0-9]+)\ pre_terminal_version=([0-9]+)\ terminal_epoch_version=([0-9]+)\ terminal=${expected_terminal}\ device_id=(KA-[0-9a-f]{24})\ wrong_key_rejected=true\ rate_limit_waited=true\ pre_terminal_daemon_stable=true\ pre_terminal_worker_stable=true\ pre_terminal_cgroup_stable=true\ pre_terminal_caps_stable=true\ ambient_zero=true\ no_new_privs=true\ core_limits_zero=true\ swaps_empty=true\ cgroup_topology_exact=true\ shell_mount_absent=true\ provider_configured=true\ production_executor_unit_binds_to_exact=true\ production_executor_status_path=true\ conditioned_agent_binds_to_runtime=true\ production_ui_provider_relay_path=true\ normal_triple_release=true\ lifecycle_marker_active_before_borrow=true\ hold_killed_vaultd=${expected_fault_proof}\ helper_binds_to_terminated=${expected_fault_proof}\ worker_pdeath_cleanup=${expected_fault_proof}\ test_trigger_sockets_gone=${expected_fault_proof}\ unit_credentials_cleaned=${expected_fault_proof}\ persistent_fault_status_only=${expected_fault_proof}\ lifecycle_marker_persisted=${expected_fault_proof}\ provider_network_used=false\ tls_openai_qualified=false\ residue_absent=true\ acpi_shutdown=true$ ]]; then
+  if [[ ! "$boot_line" =~ ^${boot_prefix}\ firmware=${firmware}\ boot=${boot}\ initial_version=([0-9]+)\ pre_terminal_version=([0-9]+)\ terminal_epoch_version=([0-9]+)\ terminal=${expected_terminal}\ device_id=(KA-[0-9a-f]{24})\ wrong_key_rejected=true\ rate_limit_waited=true\ pre_terminal_daemon_stable=true\ pre_terminal_worker_stable=true\ pre_terminal_cgroup_stable=true\ pre_terminal_caps_stable=true\ ambient_zero=true\ no_new_privs=true\ core_limits_zero=true\ swaps_empty=true\ cgroup_topology_exact=true\ shell_mount_absent=true\ provider_configured=true\ production_executor_unit_binds_to_exact=true\ production_executor_status_path=true\ conditioned_agent_binds_to_runtime=true\ codex_status_path=true\ production_ui_provider_relay_path=true\ normal_triple_release=true\ lifecycle_marker_active_before_borrow=true\ hold_killed_vaultd=${expected_fault_proof}\ helper_binds_to_terminated=${expected_fault_proof}\ worker_pdeath_cleanup=${expected_fault_proof}\ test_trigger_sockets_gone=${expected_fault_proof}\ unit_credentials_cleaned=${expected_fault_proof}\ persistent_fault_status_only=${expected_fault_proof}\ lifecycle_marker_persisted=${expected_fault_proof}\ provider_network_used=false\ tls_openai_qualified=false\ residue_absent=true\ acpi_shutdown=true$ ]]; then
     fail controller output-invalid
   fi
   boot_device_id="${BASH_REMATCH[4]}"
@@ -1061,4 +1075,4 @@ require_sha256 "$p3_post_verify_sha256"
 printf '%s\n' \
   "$raw_prefix firmware=$firmware media_bytes=$media_bytes iso_bytes=$iso_bytes prefix_before_sha256=$prefix_before_sha256 prefix_after_sha256=$prefix_after_sha256 observe_before_sha256=$observe_before_sha256 observe_after_sha256=$observe_after_sha256 swap_before_sha256=$swap_before_sha256 swap_after_sha256=$swap_after_sha256 p3_before_sha256=$p3_before_sha256 p3_guest_after_sha256=$p3_guest_after_sha256 p3_post_verify_sha256=$p3_post_verify_sha256 prefix_immutable=true observe_immutable=true swap_immutable=true p3_expected_rw=true"
 printf '%s\n' \
-  "$attestation_prefix firmware=$firmware boot_count=$boot_count same_usb=true device_id=$device_id device_id_stable=true identity_public_key_stable=true guest_device_id_derived=true host_postverify=true acpi_shutdowns_clean=true luks_profile_valid=true mutation_versions_exact_plus_two=true wrong_key_rejected=true rate_limit_waited=true boot1_clean_lock=true boot2_persistent_fault=true pre_terminal_daemon_processes_stable=true cgroups_exact=true pre_terminal_capabilities_exact=true ambient_zero=true no_new_privs=true core_limits_zero=true swaps_empty=true shell_mount_absent=true provider_configured=true production_executor_unit_binds_to_exact=true production_executor_status_path=true conditioned_agent_binds_to_runtime=true production_ui_provider_relay_path=true normal_triple_release=true lifecycle_marker_active_before_borrow=true hold_killed_vaultd=true helper_binds_to_terminated=true worker_pdeath_cleanup=true test_trigger_sockets_gone=true unit_credentials_cleaned=true persistent_fault_status_only=true lifecycle_marker_persisted=true provider_network_used=false tls_openai_qualified=false residue_absent=true qmp_acpi_shutdowns=2 uefi_vars=$([[ "$firmware" == uefi ]] && printf fresh-per-boot || printf not-applicable) ready=true"
+  "$attestation_prefix firmware=$firmware boot_count=$boot_count same_usb=true device_id=$device_id device_id_stable=true identity_public_key_stable=true guest_device_id_derived=true host_postverify=true acpi_shutdowns_clean=true luks_profile_valid=true mutation_versions_exact_plus_two=true wrong_key_rejected=true rate_limit_waited=true boot1_clean_lock=true boot2_persistent_fault=true pre_terminal_daemon_processes_stable=true cgroups_exact=true pre_terminal_capabilities_exact=true ambient_zero=true no_new_privs=true core_limits_zero=true swaps_empty=true shell_mount_absent=true provider_configured=true production_executor_unit_binds_to_exact=true production_executor_status_path=true conditioned_agent_binds_to_runtime=true codex_status_path=true production_ui_provider_relay_path=true normal_triple_release=true lifecycle_marker_active_before_borrow=true hold_killed_vaultd=true helper_binds_to_terminated=true worker_pdeath_cleanup=true test_trigger_sockets_gone=true unit_credentials_cleaned=true persistent_fault_status_only=true lifecycle_marker_persisted=true provider_network_used=false tls_openai_qualified=false residue_absent=true qmp_acpi_shutdowns=2 uefi_vars=$([[ "$firmware" == uefi ]] && printf fresh-per-boot || printf not-applicable) ready=true"

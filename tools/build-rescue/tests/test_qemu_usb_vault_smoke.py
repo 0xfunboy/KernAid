@@ -118,12 +118,21 @@ class MockToolchain:
             #!/usr/bin/env bash
             if [[ "$*" == *"%a:%u:%g"* ]]; then
               case "${@: -1}" in
+                */.kernaid-codex-home-v1/config.toml) printf '600:973:973:36\n' ;;
+                */.kernaid-codex-home-v1) printf '700:973:973\n' ;;
                 */.kernaid-secure-state-v1) printf '700:0:0\n' ;;
                 *) printf '600:0:0\n' ;;
               esac
             else
               /usr/bin/stat "$@"
             fi
+            """,
+        )
+        self._tool(
+            "chown",
+            """
+            #!/usr/bin/env bash
+            exit 0
             """,
         )
         self._tool(

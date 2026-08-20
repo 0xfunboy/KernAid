@@ -96,6 +96,7 @@ PROVIDER_PROOF_UI_STAGES = (
     "ui-status-configured",
 )
 PROVIDER_PROOF_CLOSED_STAGES = PROVIDER_PROOF_UI_STAGES + (
+    "codex-status",
     "production-status",
     "normal-release",
     "hold-kill",
@@ -2566,6 +2567,9 @@ PROVIDER_LEASE_TEMPLATE_PATH = (
 )
 PROVIDER_EGRESS_SERVICE_UNIT = "kernaid-rescue-openai-egress.service"
 PROVIDER_UI_SERVICE_UNIT = "kernaid-ui.service"
+CODEX_SOCKET_UNIT = "kernaid-rescue-codex.socket"
+CODEX_PROOF_UNIT = "kernaid-rescue-codex@kernaid-qemu-proof.service"
+CODEX_TEMPLATE_PATH = "/etc/systemd/system/kernaid-rescue-codex@.service"
 TEST_CREDENTIAL_PREFIXES = (
     "kernaid-provider-executor-status-probe@",
     "kernaid-provider-lease-probe@",
@@ -2660,6 +2664,43 @@ try:
         time.sleep(0.05)
 except BaseException:
     sys.exit(42)
+sys.stdout.write({proof!r})
+'''.encode("ascii")
+
+
+def _codex_status_probe_source() -> bytes:
+    """Exercise the shipping Codex bridge with the real pinned CLI, offline."""
+
+    stage = "codex-status"
+    proof = f"KERNAID_QEMU_PROVIDER_PROOF_V1 stage={stage} result=true\n"
+    return f'''import re,subprocess,sys,time
+def show(prop,unit):
+    result=subprocess.run(["/usr/bin/systemctl","show","--property="+prop,"--value",unit],stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=3,check=False)
+    if result.returncode!=0 or len(result.stdout)>512:
+        raise RuntimeError()
+    return result.stdout.rstrip(b"\\n")
+try:
+    template={CODEX_PROOF_UNIT!r}
+    if show("LoadState",template)!=b"loaded" or show("FragmentPath",template)!={CODEX_TEMPLATE_PATH.encode('ascii')!r} or show("BindsTo",template)!=b"kernaid-rescue-vaultd.service" or show("User",template)!=b"kernaid-codex" or show("Group",template)!=b"kernaid-codex" or show("SupplementaryGroups",template)!=b"kernaid-vault":
+        raise RuntimeError()
+    if show("ActiveState",{CODEX_SOCKET_UNIT!r})!=b"active":
+        raise RuntimeError()
+    accepted=show("NAccepted",{CODEX_SOCKET_UNIT!r})
+    if re.fullmatch(rb"0|[1-9][0-9]*",accepted) is None:
+        raise RuntimeError()
+    before=int(accepted)
+    result=subprocess.run(["/usr/bin/kernaid-codex-auth","status"],stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,env={{"LC_ALL":"C","PATH":"/usr/bin:/bin"}},timeout=60,check=False)
+    if result.returncode!=0 or result.stdout!=b"KernAid Codex: disconnesso\\n" or result.stderr:
+        raise RuntimeError()
+    if show("NAccepted",{CODEX_SOCKET_UNIT!r})!=str(before+1).encode("ascii"):
+        raise RuntimeError()
+    deadline=time.monotonic()+5.0
+    while show("NConnections",{CODEX_SOCKET_UNIT!r})!=b"0":
+        if time.monotonic()>=deadline:
+            raise RuntimeError()
+        time.sleep(0.05)
+except BaseException:
+    sys.exit(46)
 sys.stdout.write({proof!r})
 '''.encode("ascii")
 
@@ -3079,6 +3120,14 @@ def run_lifecycle(
         cursor,
         aggregate,
     )
+    cursor = run_guest_proof(
+        console,
+        "codex-status",
+        _codex_status_probe_source(),
+        cursor,
+        aggregate,
+        timeout=75.0,
+    )
     configured, cursor = run_provider_companion(
         console,
         "openai-configure",
@@ -3342,6 +3391,7 @@ def boot_attestation(
         "cgroup_topology_exact=true shell_mount_absent=true provider_configured=true "
         "production_executor_unit_binds_to_exact=true "
         "production_executor_status_path=true conditioned_agent_binds_to_runtime=true "
+        "codex_status_path=true "
         "production_ui_provider_relay_path=true "
         "normal_triple_release=true lifecycle_marker_active_before_borrow=true "
         f"hold_killed_vaultd={fault_proof} helper_binds_to_terminated={fault_proof} "
@@ -3364,6 +3414,7 @@ def boot_attestation(
         r"cgroup_topology_exact=true shell_mount_absent=true provider_configured=true "
         r"production_executor_unit_binds_to_exact=true "
         r"production_executor_status_path=true conditioned_agent_binds_to_runtime=true "
+        r"codex_status_path=true "
         r"production_ui_provider_relay_path=true "
         r"normal_triple_release=true lifecycle_marker_active_before_borrow=true "
         r"hold_killed_vaultd=(true|false) helper_binds_to_terminated=(true|false) "

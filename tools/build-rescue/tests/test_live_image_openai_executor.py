@@ -337,7 +337,12 @@ class RescueOpenAiExecutorPackagingTests(unittest.TestCase):
             'u kernaid-openai-egress - "KernAid Rescue OpenAI TLS egress proxy" /nonexistent /usr/sbin/nologin',
             lines,
         )
-        self.assertFalse(any("kernaid-codex" in line for line in lines))
+        self.assertIn("g kernaid-codex-client - -", lines)
+        self.assertIn("g kernaid-codex 973 -", lines)
+        self.assertIn(
+            'u kernaid-codex 973:973 "KernAid Rescue Codex executor" /nonexistent /usr/sbin/nologin',
+            lines,
+        )
         for line in lines:
             fields = line.split()
             if fields[0] not in {"u", "u!"}:
@@ -368,17 +373,16 @@ class RescueOpenAiExecutorPackagingTests(unittest.TestCase):
         self.assertIn('$7 == "/usr/sbin/nologin"', ready)
         self.assertIn("OpenAI Agent unexpectedly has provider-client access", ready)
         self.assertIn("live user unexpectedly has provider-client access", ready)
-        self.assertNotIn("getent passwd kernaid-codex", ready)
-        self.assertNotIn("id -nG kernaid-codex", ready)
+        self.assertIn("getent passwd kernaid-codex", ready)
+        self.assertIn("id -nG kernaid-codex", ready)
         self.assertIn(
             "'^(kernaid|kernaid-codex|kernaid-openai|kernaid-openai-egress):'",
             ready,
         )
 
-    def test_shipping_vault_binary_keeps_codex_home_feature_off(self) -> None:
+    def test_shipping_vault_binary_enables_the_bounded_codex_home_lease(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
-        self.assertIn("--features experimental-vault-manager", workflow)
-        self.assertNotIn("experimental-codex-home-lease", workflow)
+        self.assertIn("--features experimental-codex-home-lease", workflow)
         server = VAULT_SERVER_SOURCE.read_text(encoding="utf-8")
         self.assertIn('cfg!(feature = "experimental-codex-home-lease")', server)
 

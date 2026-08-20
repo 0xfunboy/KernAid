@@ -1,7 +1,7 @@
 [Unit]
 Description=KernAid Rescue readiness marker
-After=multi-user.target kernaid-ui.service kernaid-rescue-openai-egress.socket kernaid-rescue-vaultd.service
-Wants=kernaid-ui.service kernaid-rescue-openai-egress.socket kernaid-rescue-vaultd.service
+After=multi-user.target kernaid-ui.service kernaid-rescue-codex.socket kernaid-rescue-openai-egress.socket kernaid-rescue-vaultd.service
+Wants=kernaid-ui.service kernaid-rescue-codex.socket kernaid-rescue-openai-egress.socket kernaid-rescue-vaultd.service
 
 [Service]
 Type=oneshot

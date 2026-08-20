@@ -198,6 +198,24 @@ id -nG kernaid 2>/dev/null | tr ' ' '\n' | grep -Fxq kernaid-vault \
 if id -nG kernaid 2>/dev/null | tr ' ' '\n' | grep -Fxq kernaid-provider-client; then
     fail "live user unexpectedly has provider-client access"
 fi
+id -nG kernaid 2>/dev/null | tr ' ' '\n' | grep -Fxq kernaid-codex-client \
+    || fail "live user cannot access the Codex authentication bridge"
+if id -nG kernaid 2>/dev/null | tr ' ' '\n' | grep -Fxq kernaid-codex; then
+    fail "live user unexpectedly has the Codex executor identity"
+fi
+codex_identity="$(getent passwd kernaid-codex | awk -F: 'NF == 7 && $1 == "kernaid-codex" && $3 == 973 && $4 == 973 && $6 == "/nonexistent" && $7 == "/usr/sbin/nologin" { print $3 ":" $4 }')"
+test "$codex_identity" = "973:973" || fail "Codex Agent identity is missing or unsafe"
+getent group kernaid-codex | awk -F: 'NF == 4 && $1 == "kernaid-codex" && $3 == 973 && $4 == "" { found = 1 } END { exit !found }' \
+    || fail "Codex Agent group has an unsafe identity or supplementary member"
+getent passwd | awk -F: '$3 == 973 || $4 == 973 { count += 1; if ($1 != "kernaid-codex" || $3 != 973 || $4 != 973) bad = 1 } END { exit !(count == 1 && !bad) }' \
+    || fail "Codex Agent numeric identity collides with another account"
+codex_client_group_id="$(getent group kernaid-codex-client | awk -F: 'NF == 4 && $1 == "kernaid-codex-client" && $3 ~ /^[0-9]+$/ { print $3 }')"
+test -n "$codex_client_group_id" || fail "Codex client group is missing"
+getent group kernaid-codex-client | awk -F: 'NF == 4 { count = split($4, members, ","); if (count == 1 && members[1] == "kernaid") found = 1 } END { exit !found }' \
+    || fail "Codex client group authorizes an unexpected identity"
+if id -nG kernaid-codex 2>/dev/null | tr ' ' '\n' | grep -E -x 'kernaid-vault|kernaid-provider-client|kernaid-codex-client'; then
+    fail "Codex Agent has a persistent privileged group membership"
+fi
 openai_identity="$(getent passwd kernaid-openai | awk -F: 'NF == 7 && $1 == "kernaid-openai" && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ && $3 == $4 && $3 != 0 && $3 != 1000 && $6 == "/nonexistent" && $7 == "/usr/sbin/nologin" { print $3 ":" $4 }')"
 test -n "$openai_identity" || fail "OpenAI Agent identity is missing or unsafe"
 openai_group_id="${openai_identity#*:}"
@@ -285,6 +303,27 @@ test -n "$provider_group_id" || fail "provider-client group is missing"
 test -S /run/kernaid-rescue-openai.sock || fail "OpenAI executor pathname is not a socket"
 test "$(stat -c '%u:%g:%a:%h' -- /run/kernaid-rescue-openai.sock)" = "0:${provider_group_id}:660:1" \
     || fail "OpenAI executor socket ownership or mode is unsafe"
+test "$(systemctl show --property=ActiveState --value kernaid-rescue-codex.socket)" = "active" \
+    || fail "Codex authentication bridge socket is not active"
+codex_socket_substate="$(systemctl show --property=SubState --value kernaid-rescue-codex.socket)" \
+    || fail "Codex authentication bridge socket state is unavailable"
+case "$codex_socket_substate" in
+    listening|running) ;;
+    *) fail "Codex authentication bridge socket is not operational" ;;
+esac
+test -S /run/kernaid-rescue-codex.sock || fail "Codex authentication bridge pathname is not a socket"
+test "$(stat -c '%u:%g:%a:%h' -- /run/kernaid-rescue-codex.sock)" = "0:${codex_client_group_id}:660:1" \
+    || fail "Codex authentication bridge socket ownership or mode is unsafe"
+for codex_helper in \
+    /usr/lib/kernaid/kernaid-rescue-codex \
+    /usr/bin/kernaid-codex-auth; do
+    test "$(stat -c '%F:%u:%g:%a:%h' -- "$codex_helper")" = "regular file:0:0:755:1" \
+        || fail "Codex authentication helper metadata is unsafe"
+done
+test "$(stat -c '%F:%u:%g:%a:%h:%s' -- /usr/lib/kernaid/codex)" = "regular file:0:0:755:1:258278208" \
+    || fail "pinned Codex CLI metadata is unsafe"
+test "$(sha256sum /usr/lib/kernaid/codex | awk '{ print $1 }')" = "cb0a15567e9a60a5820d54b0f6ae86d504dc3805c1eab21a47f70e3eb7b73a40" \
+    || fail "pinned Codex CLI digest changed"
 
 if [ "$provider_probe_enabled" = "1" ]; then
     /usr/bin/systemctl --no-ask-password --no-pager start \

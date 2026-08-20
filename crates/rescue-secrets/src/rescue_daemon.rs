@@ -751,25 +751,25 @@ kernaid-openai:x:994:\n";
     fn static_codex_identity_is_exact_and_collision_free() {
         const PASSWD: &[u8] = b"root:x:0:0:root:/root:/bin/bash\n\
 kernaid:x:1000:1000:KernAid:/home/kernaid:/bin/bash\n\
-kernaid-codex:x:1003:1003:KernAid Rescue Codex executor:/nonexistent:/usr/sbin/nologin\n\
+kernaid-codex:x:973:973:KernAid Rescue Codex executor:/nonexistent:/usr/sbin/nologin\n\
 kernaid-openai:x:994:994:KernAid Rescue OpenAI executor:/nonexistent:/usr/sbin/nologin\n";
         assert!(passwd_has_exact_codex_agent(PASSWD, 1000));
         for invalid in [
-            b"root:x:0:0:root:/root:/bin/bash\nkernaid:x:1000:1000:KernAid:/home/kernaid:/bin/bash\nkernaid-codex:x:1004:1003:Codex:/nonexistent:/usr/sbin/nologin\n".to_vec(),
-            b"root:x:0:0:root:/root:/bin/bash\nkernaid:x:1000:1000:KernAid:/home/kernaid:/bin/bash\nkernaid-codex:x:1003:1003:Codex:/home/codex:/usr/sbin/nologin\n".to_vec(),
+            b"root:x:0:0:root:/root:/bin/bash\nkernaid:x:1000:1000:KernAid:/home/kernaid:/bin/bash\nkernaid-codex:x:974:973:Codex:/nonexistent:/usr/sbin/nologin\n".to_vec(),
+            b"root:x:0:0:root:/root:/bin/bash\nkernaid:x:1000:1000:KernAid:/home/kernaid:/bin/bash\nkernaid-codex:x:973:973:Codex:/home/codex:/usr/sbin/nologin\n".to_vec(),
             [
                 PASSWD,
-                b"other:x:1003:1004:collision:/nonexistent:/usr/sbin/nologin\n",
+                b"other:x:973:974:collision:/nonexistent:/usr/sbin/nologin\n",
             ]
             .concat(),
             [
                 PASSWD,
-                b"other:x:1004:1003:collision:/nonexistent:/usr/sbin/nologin\n",
+                b"other:x:974:973:collision:/nonexistent:/usr/sbin/nologin\n",
             ]
             .concat(),
             [
                 PASSWD,
-                b"kernaid-codex:x:1004:1004:duplicate:/nonexistent:/usr/sbin/nologin\n",
+                b"kernaid-codex:x:974:974:duplicate:/nonexistent:/usr/sbin/nologin\n",
             ]
             .concat(),
         ] {
@@ -781,14 +781,14 @@ kernaid-openai:x:994:994:KernAid Rescue OpenAI executor:/nonexistent:/usr/sbin/n
     #[test]
     fn static_codex_group_has_no_collision_or_supplementary_membership() {
         const GROUP: &[u8] = b"root:x:0:\nkernaid-vault:x:993:kernaid,kernaid-openai\n\
-kernaid-codex:x:1003:\nkernaid-openai:x:994:\n";
+kernaid-codex:x:973:\nkernaid-openai:x:994:\n";
         assert!(group_has_exact_codex_boundaries(GROUP));
         for invalid in [
-            b"root:x:0:\nkernaid-codex:x:1003:other\n".as_slice(),
-            b"root:x:0:\nkernaid-codex:x:1004:\n".as_slice(),
-            b"root:x:0:\nother:x:1003:\n".as_slice(),
-            b"root:x:0:\nkernaid-codex:x:1003:\nextra:x:1004:kernaid-codex\n".as_slice(),
-            b"root:x:0:\nkernaid-codex:x:1003:\nother:x:1003:\n".as_slice(),
+            b"root:x:0:\nkernaid-codex:x:973:other\n".as_slice(),
+            b"root:x:0:\nkernaid-codex:x:974:\n".as_slice(),
+            b"root:x:0:\nother:x:973:\n".as_slice(),
+            b"root:x:0:\nkernaid-codex:x:973:\nextra:x:974:kernaid-codex\n".as_slice(),
+            b"root:x:0:\nkernaid-codex:x:973:\nother:x:973:\n".as_slice(),
         ] {
             assert!(!group_has_exact_codex_boundaries(invalid));
         }

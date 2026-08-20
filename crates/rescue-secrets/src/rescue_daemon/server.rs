@@ -4299,9 +4299,7 @@ fn external_operation_is_enabled(
             cfg!(feature = "experimental-codex-home-lease")
                 && matches!(
                     operation,
-                    Operation::VaultStatus
-                        | Operation::ProviderStatus
-                        | Operation::ProviderCodexHomeLease
+                    Operation::VaultStatus | Operation::ProviderCodexHomeLease
                 )
         }
         kernaid_protocol::rescue_vault::PeerRole::Agent(AgentRole::Application) => false,
@@ -6531,29 +6529,8 @@ mod tests {
                 #[cfg(not(feature = "experimental-codex-home-lease"))]
                 (
                     validated_request_for_role(
-                        "provider.status",
-                        serde_json::json!({}),
-                        60,
-                        None,
-                        PeerRole::Agent(AgentRole::Codex),
-                    ),
-                    None,
-                ),
-                #[cfg(not(feature = "experimental-codex-home-lease"))]
-                (
-                    validated_request_for_role(
                         "vault.status",
                         serde_json::json!({}),
-                        60,
-                        None,
-                        PeerRole::Agent(AgentRole::Codex),
-                    ),
-                    None,
-                ),
-                (
-                    validated_request_for_role(
-                        "provider.logout",
-                        serde_json::json!({"provider": "codex"}),
                         60,
                         None,
                         PeerRole::Agent(AgentRole::Codex),
@@ -6776,9 +6753,7 @@ mod tests {
                 cfg!(feature = "experimental-codex-home-lease")
                     && matches!(
                         operation,
-                        Operation::VaultStatus
-                            | Operation::ProviderStatus
-                            | Operation::ProviderCodexHomeLease
+                        Operation::VaultStatus | Operation::ProviderCodexHomeLease
                     ),
                 "unexpected Codex permission for {operation:?}"
             );

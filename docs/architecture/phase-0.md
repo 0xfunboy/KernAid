@@ -25,14 +25,25 @@ collector grants provider output access to the broker.
   DMI, PCI and USB collector with per-source status and no serial, UUID, asset
   tag, bus-address or caller-path fields. Its published schema is
   `linux-hardware-inventory.schema.json`.
+- Rescue includes the exact supply-chain-verified Codex CLI and a one-request,
+  non-root authentication bridge. Its closed grammar is device login, status,
+  and logout only; it receives an exclusive descriptor-bound `CODEX_HOME` from
+  the unlocked vault, disables the CLI's PATH/tool aliases, and never opens
+  `auth.json`.
+- Fake-CLI tests cover persistent state across bridge restarts, logout, raw
+  output suppression, home tamper, executable tamper, and exact CLI arguments.
+  The privileged QEMU lifecycle additionally requires an offline signed-out
+  status through the shipping client, bridge, vault lease, and pinned real CLI.
 
 ## Open release gates
 
 The repository now defines legacy-BIOS/UEFI QEMU boot gates, a feature-gated
 encrypted Rescue vault/provider lifecycle, and closed signed-report library
 primitives. An exact Rescue image is virtually qualified only when both
-privileged lifecycle jobs pass, and the shipping peer allowlist still exposes
-neither the Application audit/report role nor Codex. Secure Boot,
-browser-renderer/WebKit/GPU compatibility, live provider TLS with a real
-account, promotion of vault provisioning into the trusted physical writer, and
-physical hardware/media support remain open release gates.
+privileged lifecycle jobs pass. The shipping peer allowlist exposes the Codex
+role only to the fixed non-root authentication unit and only for an exclusive
+home lease; Application audit/report, Codex prompt execution, model selection,
+target access, and broker access remain absent. Secure Boot,
+browser-renderer/WebKit/GPU compatibility, a completed Codex device login with
+a real enabled account, live provider TLS, and physical hardware/media support
+remain open release gates.

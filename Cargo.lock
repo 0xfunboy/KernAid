@@ -2389,6 +2389,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "kernaid-rescue-codex-bridge"
+version = "0.1.0"
+dependencies = [
+ "kernaid-protocol",
+ "rand_core 0.6.4",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "zeroize",
+]
+
+[[package]]
 name = "kernaid-rescue-openai-executor"
 version = "0.1.0"
 dependencies = [
