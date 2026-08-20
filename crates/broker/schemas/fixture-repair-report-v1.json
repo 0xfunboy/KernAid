@@ -1,0 +1,230 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kernaid.dev/schemas/fixture-repair-report-v1.json",
+  "title": "FixtureRepairReport",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "apiVersion",
+    "kind",
+    "deviceId",
+    "journalId",
+    "journalSequence",
+    "repair",
+    "rollback",
+    "finalState"
+  ],
+  "properties": {
+    "apiVersion": { "const": "kernaid.dev/fixture-repair-report/v1" },
+    "kind": { "const": "FixtureRepairReport" },
+    "deviceId": { "type": "string", "pattern": "^KA-[0-9a-f]{24}$" },
+    "journalId": { "$ref": "#/$defs/journalId" },
+    "journalSequence": { "type": "integer", "minimum": 1 },
+    "repair": { "$ref": "#/$defs/repair" },
+    "rollback": { "$ref": "#/$defs/rollback" },
+    "finalState": { "const": "rolled-back" }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "journalId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "typedId": {
+      "type": "string",
+      "pattern": "^[A-Z]-[A-Za-z0-9-]{1,126}$",
+      "maxLength": 128
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "sha256"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^E-[A-Za-z0-9-]{1,126}$",
+          "maxLength": 128
+        },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "repair": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "apiVersion",
+        "kind",
+        "deviceId",
+        "journalId",
+        "journalSequence",
+        "intentJournalSequence",
+        "approvalId",
+        "approvalSequence",
+        "approvalDecision",
+        "risk",
+        "sessionId",
+        "planId",
+        "planHash",
+        "actionId",
+        "resourceId",
+        "diagnosisSha256",
+        "findingId",
+        "findingVersion",
+        "evidence",
+        "targetSnapshot",
+        "beforeSha256",
+        "afterSha256",
+        "afterTargetPrecondition",
+        "diffSha256",
+        "backupLocator",
+        "backupSha256",
+        "backup",
+        "validation",
+        "rollback",
+        "validationPassed",
+        "metadataPreserved",
+        "beforeMode",
+        "beforeUid",
+        "beforeGid"
+      ],
+      "properties": {
+        "apiVersion": { "const": "kernaid.dev/fixture-repair-receipt/v2" },
+        "kind": { "const": "FixtureRepairReceipt" },
+        "deviceId": { "type": "string", "pattern": "^KA-[0-9a-f]{24}$" },
+        "journalId": { "$ref": "#/$defs/journalId" },
+        "journalSequence": { "type": "integer", "minimum": 1 },
+        "intentJournalSequence": { "type": "integer", "minimum": 1 },
+        "approvalId": {
+          "type": "string",
+          "pattern": "^A-[A-Za-z0-9-]{1,126}$",
+          "maxLength": 128
+        },
+        "approvalSequence": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1024
+        },
+        "approvalDecision": { "const": "approved" },
+        "risk": { "const": "R2" },
+        "sessionId": {
+          "type": "string",
+          "pattern": "^S-[A-Za-z0-9-]{1,126}$",
+          "maxLength": 128
+        },
+        "planId": {
+          "type": "string",
+          "pattern": "^P-[A-Za-z0-9-]{1,126}$",
+          "maxLength": 128
+        },
+        "planHash": { "$ref": "#/$defs/sha256" },
+        "actionId": { "const": "linux.fstab.repair-entry.fixture-v1" },
+        "resourceId": { "const": "fixture:linux-fstab-v1" },
+        "diagnosisSha256": { "$ref": "#/$defs/sha256" },
+        "findingId": { "const": "KA-LNX-P0-003" },
+        "findingVersion": { "const": 2 },
+        "evidence": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "uniqueItems": true,
+          "description": "Canonical evidence bindings are emitted in strictly increasing id order. Evidence IDs are semantically unique even when two bindings carry different sha256 values; uniqueItems additionally rejects exact duplicate bindings.",
+          "items": { "$ref": "#/$defs/evidence" }
+        },
+        "targetSnapshot": { "$ref": "#/$defs/sha256" },
+        "beforeSha256": { "$ref": "#/$defs/sha256" },
+        "afterSha256": { "$ref": "#/$defs/sha256" },
+        "afterTargetPrecondition": { "$ref": "#/$defs/sha256" },
+        "diffSha256": { "$ref": "#/$defs/sha256" },
+        "backupLocator": {
+          "type": "string",
+          "pattern": "^fixture-lab-backup://linux-fstab/fstab-[0-9a-f]{16}\\.bak$"
+        },
+        "backupSha256": { "$ref": "#/$defs/sha256" },
+        "backup": { "const": "created-and-byte-verified" },
+        "validation": {
+          "const": "fstab is syntactically parsed and the unique missing UUID entry is disabled"
+        },
+        "rollback": {
+          "const": "atomically restore the byte-verified backup and original mode/uid/gid"
+        },
+        "validationPassed": { "const": true },
+        "metadataPreserved": { "const": true },
+        "beforeMode": { "type": "integer", "minimum": 0, "maximum": 4095 },
+        "beforeUid": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "beforeGid": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        }
+      }
+    },
+    "rollback": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "journalSequence",
+        "intentJournalSequence",
+        "approvalId",
+        "approvalSequence",
+        "approvalDecision",
+        "risk",
+        "planId",
+        "planHash",
+        "actionId",
+        "resourceId",
+        "targetSnapshot",
+        "replacedSha256",
+        "restoredSha256",
+        "backupLocator",
+        "backupSha256",
+        "validation",
+        "validationPassed",
+        "metadataPreserved"
+      ],
+      "properties": {
+        "journalSequence": { "type": "integer", "minimum": 1 },
+        "intentJournalSequence": { "type": "integer", "minimum": 1 },
+        "approvalId": {
+          "type": "string",
+          "pattern": "^A-[A-Za-z0-9-]{1,126}$",
+          "maxLength": 128
+        },
+        "approvalSequence": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1024
+        },
+        "approvalDecision": { "const": "approved" },
+        "risk": { "const": "R2" },
+        "planId": {
+          "type": "string",
+          "pattern": "^P-[A-Za-z0-9-]{1,126}$",
+          "maxLength": 128
+        },
+        "planHash": { "$ref": "#/$defs/sha256" },
+        "actionId": { "const": "linux.fstab.restore" },
+        "resourceId": { "const": "fixture:linux-fstab-v1" },
+        "targetSnapshot": { "$ref": "#/$defs/sha256" },
+        "replacedSha256": { "$ref": "#/$defs/sha256" },
+        "restoredSha256": { "$ref": "#/$defs/sha256" },
+        "backupLocator": {
+          "type": "string",
+          "pattern": "^fixture-lab-backup://linux-fstab/fstab-[0-9a-f]{16}\\.bak$"
+        },
+        "backupSha256": { "$ref": "#/$defs/sha256" },
+        "validation": {
+          "const": "restored fstab bytes and original mode/uid/gid match the verified backup"
+        },
+        "validationPassed": { "const": true },
+        "metadataPreserved": { "const": true }
+      }
+    }
+  }
+}

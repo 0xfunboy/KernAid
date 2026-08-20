@@ -4,7 +4,7 @@ use kernaid_protocol::BrokerRequest;
 /// Dormant, Linux-only broker core for the explicitly marked disposable
 /// `fstab` fixture. It is not connected to IPC, Core, the desktop, or a
 /// production target.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "fixture-repair-lab"))]
 pub mod fixture_repair;
 
 #[derive(Debug, PartialEq, Eq)]

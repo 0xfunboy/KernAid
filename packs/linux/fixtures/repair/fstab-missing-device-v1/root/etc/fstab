@@ -1,0 +1,3 @@
+# Synthetic fixture: one healthy root plus one required missing device.
+UUID=11111111-2222-3333-4444-555555555555 / ext4 defaults 0 1
+UUID=missing-data /mnt/data ext4 defaults 0 2

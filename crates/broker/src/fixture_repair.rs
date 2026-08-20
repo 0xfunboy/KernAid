@@ -8,8 +8,10 @@
 
 use kernaid_device_identity::{DeviceIdentity, SignedReportEnvelope};
 use kernaid_linux_pack::{
-    action_contract::{FIXTURE_ACTION_ID, FIXTURE_RESOURCE_ID, parse_fixture_fstab_repair_input},
+    PreservedMetadata, RepairReceipt,
+    action_contract::{FIXTURE_ACTION_ID, FIXTURE_RESOURCE_ID, FIXTURE_ROLLBACK_ID},
     execute_missing_fstab_device_repair, preview_missing_fstab_device,
+    preview_missing_fstab_device_rollback, rollback_missing_fstab_device_repair,
 };
 use kernaid_storage::{
     JournalAnchor, JournalEntry, JournalEntryRef, JournalReplayError, JournalReplayLimits,
@@ -24,13 +26,25 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const RECEIPT_API_VERSION: &str = "kernaid.dev/fixture-repair-receipt/v1";
+const RECEIPT_API_VERSION: &str = "kernaid.dev/fixture-repair-receipt/v2";
 const RECEIPT_KIND: &str = "FixtureRepairReceipt";
 const RECEIPT_MEDIA_TYPE: &str = "application/vnd.kernaid.fixture-repair-receipt+json";
-const PLAN_HASH_DOMAIN: &[u8] = b"KERNAID-FIXTURE-REPAIR-PLAN-V1\0";
+const REPORT_API_VERSION: &str = "kernaid.dev/fixture-repair-report/v1";
+const REPORT_KIND: &str = "FixtureRepairReport";
+const REPORT_MEDIA_TYPE: &str = "application/vnd.kernaid.fixture-repair-report+json";
+pub const FIXTURE_REPAIR_REPORT_SCHEMA_JSON: &str =
+    include_str!("../schemas/fixture-repair-report-v1.json");
+const PLAN_HASH_DOMAIN: &[u8] = b"KERNAID-FIXTURE-REPAIR-PLAN-V2\0";
+const ROLLBACK_PLAN_HASH_DOMAIN: &[u8] = b"KERNAID-FIXTURE-ROLLBACK-PLAN-V1\0";
+const DIFF_HASH_DOMAIN: &[u8] = b"KERNAID-FIXTURE-REPAIR-DIFF-V1\0";
+const FINDING_ID: &str = "KA-LNX-P0-003";
+const FINDING_VERSION: u32 = 2;
+const BACKUP_LOCATOR_PREFIX: &str = "fixture-lab-backup://linux-fstab/";
 pub const DEVICE_BINDING_EVENT_KIND: &str = "fixture.repair.device-bound.v1";
 pub const INTENT_EVENT_KIND: &str = "fixture.repair.intent.v1";
 pub const COMPLETED_EVENT_KIND: &str = "fixture.repair.completed.v1";
+pub const ROLLBACK_INTENT_EVENT_KIND: &str = "fixture.rollback.intent.v1";
+pub const ROLLED_BACK_EVENT_KIND: &str = "fixture.rollback.completed.v1";
 pub const RECOVERY_EVENT_KIND: &str = "fixture.repair.recovery.v1";
 const RECOVERY_DISPOSITION: &str = "manual-inspection-required";
 const RISK: &str = "R2";
@@ -40,6 +54,8 @@ const VALIDATION_DECLARATION: &str =
     "fstab is syntactically parsed and the unique missing UUID entry is disabled";
 const ROLLBACK_DECLARATION: &str =
     "atomically restore the byte-verified backup and original mode/uid/gid";
+const ROLLBACK_VALIDATION_DECLARATION: &str =
+    "restored fstab bytes and original mode/uid/gid match the verified backup";
 const MAX_ID_BYTES: usize = 128;
 const MAX_EVIDENCE_IDS: usize = 32;
 const MAX_APPROVALS: usize = 1024;
@@ -82,13 +98,47 @@ impl fmt::Debug for FixtureRepairConfig {
     }
 }
 
-/// Unserialized request used to stage the single fixture action.
+/// Evidence identity and digest supplied by the read-only diagnosis pipeline.
+/// Construction validates the closed ID/hash forms before a plan can exist.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FixtureEvidenceBinding {
+    id: String,
+    sha256: String,
+}
+
+impl FixtureEvidenceBinding {
+    pub fn new(
+        id: impl Into<String>,
+        sha256: impl Into<String>,
+    ) -> Result<Self, FixtureRepairError> {
+        let binding = Self {
+            id: id.into(),
+            sha256: sha256.into(),
+        };
+        validate_evidence_binding(&binding).map_err(|_| FixtureRepairError::InvalidStage)?;
+        Ok(binding)
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+}
+
+/// Unserialized, typed request used to stage the single fixture action. It
+/// deliberately accepts no path, command, replacement bytes, or raw JSON.
 pub struct StageFixtureRepairRequest<'request> {
     pub session_id: &'request str,
     pub plan_id: &'request str,
     pub action_id: &'request str,
-    pub contract_input: &'request [u8],
-    pub evidence_ids: &'request [String],
+    pub diagnosis_sha256: &'request str,
+    pub finding_id: &'request str,
+    pub finding_version: u32,
+    pub evidence: &'request [FixtureEvidenceBinding],
 }
 
 impl fmt::Debug for StageFixtureRepairRequest<'_> {
@@ -98,8 +148,10 @@ impl fmt::Debug for StageFixtureRepairRequest<'_> {
             .field("session_id_bytes", &self.session_id.len())
             .field("plan_id_bytes", &self.plan_id.len())
             .field("action_id_bytes", &self.action_id.len())
-            .field("contract_input_bytes", &self.contract_input.len())
-            .field("evidence_id_count", &self.evidence_ids.len())
+            .field("diagnosis_sha256_bytes", &self.diagnosis_sha256.len())
+            .field("finding_id_bytes", &self.finding_id.len())
+            .field("finding_version", &self.finding_version)
+            .field("evidence_count", &self.evidence.len())
             .finish()
     }
 }
@@ -118,10 +170,15 @@ pub struct StagedFixtureRepair {
     plan_id: String,
     action_id: &'static str,
     resource_id: &'static str,
-    evidence_ids: Vec<String>,
+    diagnosis_sha256: String,
+    finding_id: &'static str,
+    finding_version: u32,
+    evidence: Vec<FixtureEvidenceBinding>,
     target_snapshot: String,
     expected_before_sha256: String,
     expected_after_sha256: String,
+    diff_sha256: String,
+    backup_locator: String,
     plan_hash: String,
 }
 
@@ -142,8 +199,20 @@ impl StagedFixtureRepair {
         self.resource_id
     }
 
-    pub fn evidence_ids(&self) -> &[String] {
-        &self.evidence_ids
+    pub fn diagnosis_sha256(&self) -> &str {
+        &self.diagnosis_sha256
+    }
+
+    pub const fn finding_id(&self) -> &'static str {
+        self.finding_id
+    }
+
+    pub const fn finding_version(&self) -> u32 {
+        self.finding_version
+    }
+
+    pub fn evidence(&self) -> &[FixtureEvidenceBinding] {
+        &self.evidence
     }
 
     pub fn target_snapshot(&self) -> &str {
@@ -156,6 +225,14 @@ impl StagedFixtureRepair {
 
     pub fn expected_after_sha256(&self) -> &str {
         &self.expected_after_sha256
+    }
+
+    pub fn diff_sha256(&self) -> &str {
+        &self.diff_sha256
+    }
+
+    pub fn backup_locator(&self) -> &str {
+        &self.backup_locator
     }
 
     pub fn plan_hash(&self) -> &str {
@@ -204,6 +281,114 @@ impl fmt::Debug for FixtureRepairApproval<'_> {
     }
 }
 
+/// Typed request for the second, explicitly approved transaction. The repair
+/// receipt is resolved from the authenticated journal, never supplied by the
+/// caller.
+pub struct StageFixtureRollbackRequest<'request> {
+    pub session_id: &'request str,
+    pub plan_id: &'request str,
+    pub repair_approval_id: &'request str,
+}
+
+impl fmt::Debug for StageFixtureRollbackRequest<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StageFixtureRollbackRequest")
+            .field("session_id_bytes", &self.session_id.len())
+            .field("plan_id_bytes", &self.plan_id.len())
+            .field("repair_approval_id_bytes", &self.repair_approval_id.len())
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StagedFixtureRollback {
+    session_id: String,
+    plan_id: String,
+    repair_approval_id: String,
+    repair_plan_hash: String,
+    resource_id: &'static str,
+    target_snapshot: String,
+    installed_sha256: String,
+    restored_sha256: String,
+    backup_locator: String,
+    backup_sha256: String,
+    plan_hash: String,
+}
+
+impl StagedFixtureRollback {
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub fn plan_id(&self) -> &str {
+        &self.plan_id
+    }
+
+    pub fn repair_approval_id(&self) -> &str {
+        &self.repair_approval_id
+    }
+
+    pub const fn action_id(&self) -> &'static str {
+        FIXTURE_ROLLBACK_ID
+    }
+
+    pub const fn resource_id(&self) -> &'static str {
+        self.resource_id
+    }
+
+    pub fn target_snapshot(&self) -> &str {
+        &self.target_snapshot
+    }
+
+    pub fn installed_sha256(&self) -> &str {
+        &self.installed_sha256
+    }
+
+    pub fn restored_sha256(&self) -> &str {
+        &self.restored_sha256
+    }
+
+    pub fn backup_locator(&self) -> &str {
+        &self.backup_locator
+    }
+
+    pub fn plan_hash(&self) -> &str {
+        &self.plan_hash
+    }
+
+    pub const fn risk(&self) -> FixtureRepairRisk {
+        FixtureRepairRisk::R2
+    }
+
+    pub const fn validation_declaration(&self) -> &'static str {
+        ROLLBACK_VALIDATION_DECLARATION
+    }
+}
+
+pub struct FixtureRollbackApproval<'approval> {
+    pub approval_id: &'approval str,
+    pub approval_sequence: u64,
+    pub session_id: &'approval str,
+    pub plan_id: &'approval str,
+    pub plan_hash: &'approval str,
+    pub target_snapshot: &'approval str,
+}
+
+impl fmt::Debug for FixtureRollbackApproval<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FixtureRollbackApproval")
+            .field("approval_id_bytes", &self.approval_id.len())
+            .field("approval_sequence", &self.approval_sequence)
+            .field("session_id_bytes", &self.session_id.len())
+            .field("plan_id_bytes", &self.plan_id.len())
+            .field("plan_hash_bytes", &self.plan_hash.len())
+            .field("target_snapshot_bytes", &self.target_snapshot.len())
+            .finish()
+    }
+}
+
 /// Closed, signed receipt payload. Every field is covered by the device
 /// signature and the exact completed-event journal head.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -217,15 +402,23 @@ pub struct FixtureRepairReceiptPayload {
     intent_journal_sequence: u64,
     approval_id: String,
     approval_sequence: u64,
+    approval_decision: String,
+    risk: String,
     session_id: String,
     plan_id: String,
     plan_hash: String,
     action_id: String,
     resource_id: String,
-    evidence_ids: Vec<String>,
+    diagnosis_sha256: String,
+    finding_id: String,
+    finding_version: u32,
+    evidence: Vec<FixtureEvidenceBinding>,
     target_snapshot: String,
     before_sha256: String,
     after_sha256: String,
+    after_target_precondition: String,
+    diff_sha256: String,
+    backup_locator: String,
     backup_sha256: String,
     backup: String,
     validation: String,
@@ -262,12 +455,36 @@ impl FixtureRepairReceiptPayload {
         &self.plan_hash
     }
 
+    pub fn diagnosis_sha256(&self) -> &str {
+        &self.diagnosis_sha256
+    }
+
+    pub fn finding_id(&self) -> &str {
+        &self.finding_id
+    }
+
+    pub const fn finding_version(&self) -> u32 {
+        self.finding_version
+    }
+
+    pub fn evidence(&self) -> &[FixtureEvidenceBinding] {
+        &self.evidence
+    }
+
     pub fn before_sha256(&self) -> &str {
         &self.before_sha256
     }
 
     pub fn after_sha256(&self) -> &str {
         &self.after_sha256
+    }
+
+    pub fn diff_sha256(&self) -> &str {
+        &self.diff_sha256
+    }
+
+    pub fn backup_locator(&self) -> &str {
+        &self.backup_locator
     }
 
     pub fn backup_sha256(&self) -> &str {
@@ -341,6 +558,129 @@ impl Serialize for SignedFixtureRepairReceipt {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FixtureRollbackReportPayload {
+    journal_sequence: u64,
+    intent_journal_sequence: u64,
+    approval_id: String,
+    approval_sequence: u64,
+    approval_decision: String,
+    risk: String,
+    plan_id: String,
+    plan_hash: String,
+    action_id: String,
+    resource_id: String,
+    target_snapshot: String,
+    replaced_sha256: String,
+    restored_sha256: String,
+    backup_locator: String,
+    backup_sha256: String,
+    validation: String,
+    validation_passed: bool,
+    metadata_preserved: bool,
+}
+
+/// Final strict, signed and replay-verifiable report for the entire fixture
+/// cycle. The nested repair receipt binds evidence through backup creation;
+/// the rollback section binds the second approval and exact restoration.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FixtureRepairReportPayload {
+    api_version: String,
+    kind: String,
+    device_id: String,
+    journal_id: String,
+    journal_sequence: u64,
+    repair: FixtureRepairReceiptPayload,
+    rollback: FixtureRollbackReportPayload,
+    final_state: String,
+}
+
+impl FixtureRepairReportPayload {
+    pub fn device_id(&self) -> &str {
+        &self.device_id
+    }
+
+    pub fn repair(&self) -> &FixtureRepairReceiptPayload {
+        &self.repair
+    }
+
+    pub fn rollback_plan_hash(&self) -> &str {
+        &self.rollback.plan_hash
+    }
+
+    pub fn rollback_approval_id(&self) -> &str {
+        &self.rollback.approval_id
+    }
+
+    pub fn restored_sha256(&self) -> &str {
+        &self.rollback.restored_sha256
+    }
+
+    pub const fn journal_sequence(&self) -> u64 {
+        self.journal_sequence
+    }
+
+    pub fn final_state(&self) -> &str {
+        &self.final_state
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct SignedFixtureRepairReport {
+    envelope: SignedReportEnvelope,
+}
+
+impl SignedFixtureRepairReport {
+    pub fn envelope(&self) -> &SignedReportEnvelope {
+        &self.envelope
+    }
+
+    pub fn verify(
+        &self,
+        expected_public_key: &[u8; 32],
+    ) -> Result<FixtureRepairReportPayload, FixtureRepairError> {
+        if self.envelope.payload_media_type != REPORT_MEDIA_TYPE {
+            return Err(FixtureRepairError::InvalidReceipt);
+        }
+        let verified = self
+            .envelope
+            .verify(expected_public_key)
+            .map_err(|_| FixtureRepairError::InvalidReceipt)?;
+        let payload: FixtureRepairReportPayload =
+            strict_json(verified.as_bytes()).map_err(|_| FixtureRepairError::InvalidReceipt)?;
+        validate_report_payload(&payload).map_err(|_| FixtureRepairError::InvalidReceipt)?;
+        if payload.device_id != self.envelope.device_id
+            || payload.journal_sequence != self.envelope.journal_sequence
+        {
+            return Err(FixtureRepairError::InvalidReceipt);
+        }
+        Ok(payload)
+    }
+}
+
+impl fmt::Debug for SignedFixtureRepairReport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("SignedFixtureRepairReport")
+            .field(&self.envelope)
+            .finish()
+    }
+}
+
+impl Serialize for SignedFixtureRepairReport {
+    fn serialize<SerializerType>(
+        &self,
+        serializer: SerializerType,
+    ) -> Result<SerializerType::Ok, SerializerType::Error>
+    where
+        SerializerType: Serializer,
+    {
+        self.envelope.serialize(serializer)
+    }
+}
+
 /// Sanitized fixture-broker failures. No variant stores an OS path, target
 /// content, pack error, journal plaintext, or provider-controlled string.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -401,6 +741,7 @@ pub struct FixtureRepairBroker<'attached, Store: JournalSecretStore> {
     head: JournalAnchor,
     used_approval_ids: HashSet<String>,
     completed_receipts: HashMap<String, RecoverableReceipt>,
+    completed_reports: HashMap<String, RecoverableReport>,
     last_approval_sequence: u64,
     mutation_blocked: bool,
 }
@@ -413,6 +754,7 @@ impl<Store: JournalSecretStore> fmt::Debug for FixtureRepairBroker<'_, Store> {
             .field("journal_sequence", &self.head.sequence)
             .field("used_approval_count", &self.used_approval_ids.len())
             .field("completed_receipt_count", &self.completed_receipts.len())
+            .field("completed_report_count", &self.completed_reports.len())
             .field("last_approval_sequence", &self.last_approval_sequence)
             .field("mutation_blocked", &self.mutation_blocked)
             .finish_non_exhaustive()
@@ -458,6 +800,7 @@ impl<'attached, Store: JournalSecretStore> FixtureRepairBroker<'attached, Store>
                 head: anchor_from_entry(summary.head.journal_id, &entry),
                 used_approval_ids: replay.used_approval_ids,
                 completed_receipts: replay.completed_receipts,
+                completed_reports: replay.completed_reports,
                 last_approval_sequence: replay.last_approval_sequence,
                 mutation_blocked: false,
             });
@@ -474,6 +817,7 @@ impl<'attached, Store: JournalSecretStore> FixtureRepairBroker<'attached, Store>
             head: summary.head,
             used_approval_ids: replay.used_approval_ids,
             completed_receipts: replay.completed_receipts,
+            completed_reports: replay.completed_reports,
             last_approval_sequence: replay.last_approval_sequence,
             mutation_blocked: replay.mutation_blocked,
         };
@@ -481,7 +825,7 @@ impl<'attached, Store: JournalSecretStore> FixtureRepairBroker<'attached, Store>
         if let Some(pending) = replay.pending.take() {
             broker.mutation_blocked = true;
             broker
-                .append_recovery(&pending)
+                .append_pending_recovery(&pending)
                 .map_err(|_| FixtureRepairError::JournalUnavailable)?;
         }
         Ok(broker)
@@ -537,6 +881,100 @@ impl<'attached, Store: JournalSecretStore> FixtureRepairBroker<'attached, Store>
         Ok(SignedFixtureRepairReceipt { envelope })
     }
 
+    /// Reissue the final cycle report from the authenticated rolled-back
+    /// completion. The lookup key is the original repair approval ID.
+    pub fn reissue_completed_report(
+        &mut self,
+        repair_approval_id: &str,
+    ) -> Result<SignedFixtureRepairReport, FixtureRepairError> {
+        validate_approval_id(repair_approval_id)
+            .map_err(|_| FixtureRepairError::InvalidApproval)?;
+        let current = self
+            .journal
+            .head()
+            .map_err(|_| FixtureRepairError::JournalUnavailable)?;
+        if current != self.head {
+            return Err(FixtureRepairError::JournalUnavailable);
+        }
+        let completed = self
+            .completed_reports
+            .get(repair_approval_id)
+            .ok_or(FixtureRepairError::InvalidReceipt)?;
+        validate_report_payload(&completed.payload)
+            .map_err(|_| FixtureRepairError::InvalidReceipt)?;
+        let payload_bytes = serde_json::to_vec(&completed.payload)
+            .map_err(|_| FixtureRepairError::ReceiptUnavailable)?;
+        let envelope = self
+            .identity
+            .sign_report_envelope(
+                &payload_bytes,
+                REPORT_MEDIA_TYPE,
+                completed.journal_sequence,
+                &completed.journal_entry_hash,
+            )
+            .map_err(|_| FixtureRepairError::ReceiptUnavailable)?;
+        Ok(SignedFixtureRepairReport { envelope })
+    }
+
+    /// Read-only staging for the rollback transaction. The trusted repair
+    /// receipt and backup path are reconstructed only from the journal and
+    /// local configuration.
+    pub fn stage_rollback(
+        &self,
+        request: StageFixtureRollbackRequest<'_>,
+    ) -> Result<StagedFixtureRollback, FixtureRepairError> {
+        if self.mutation_blocked {
+            return Err(FixtureRepairError::MutationBlocked);
+        }
+        validate_session_id(request.session_id).map_err(|_| FixtureRepairError::InvalidStage)?;
+        validate_plan_id(request.plan_id).map_err(|_| FixtureRepairError::InvalidStage)?;
+        validate_approval_id(request.repair_approval_id)
+            .map_err(|_| FixtureRepairError::InvalidStage)?;
+        if self
+            .completed_reports
+            .contains_key(request.repair_approval_id)
+        {
+            return Err(FixtureRepairError::InvalidStage);
+        }
+        let completed = self
+            .completed_receipts
+            .get(request.repair_approval_id)
+            .ok_or(FixtureRepairError::InvalidStage)?;
+        let repair_payload = &completed.payload;
+        if repair_payload.session_id != request.session_id
+            || repair_payload.plan_id == request.plan_id
+        {
+            return Err(FixtureRepairError::InvalidStage);
+        }
+        let repair = pack_repair_receipt(&self.config, repair_payload)
+            .map_err(|_| FixtureRepairError::InvalidReceipt)?;
+        let preview = preview_missing_fstab_device_rollback(&self.config.fixture_root, &repair)
+            .map_err(|_| FixtureRepairError::StaleTarget)?;
+        if preview.target_fingerprint != repair_payload.after_target_precondition
+            || preview.installed_sha256 != repair_payload.after_sha256
+            || preview.restored_sha256 != repair_payload.before_sha256
+            || preview.backup_sha256 != repair_payload.backup_sha256
+            || preview.validation != ROLLBACK_VALIDATION_DECLARATION
+        {
+            return Err(FixtureRepairError::InvalidReceipt);
+        }
+        let mut staged = StagedFixtureRollback {
+            session_id: request.session_id.to_owned(),
+            plan_id: request.plan_id.to_owned(),
+            repair_approval_id: request.repair_approval_id.to_owned(),
+            repair_plan_hash: repair_payload.plan_hash.clone(),
+            resource_id: FIXTURE_RESOURCE_ID,
+            target_snapshot: preview.target_fingerprint,
+            installed_sha256: preview.installed_sha256,
+            restored_sha256: preview.restored_sha256,
+            backup_locator: repair_payload.backup_locator.clone(),
+            backup_sha256: preview.backup_sha256,
+            plan_hash: String::new(),
+        };
+        staged.plan_hash = compute_rollback_plan_hash(&staged);
+        Ok(staged)
+    }
+
     /// Preview and bind the pinned fixture transaction without writing either
     /// the journal or target.
     pub fn stage(
@@ -551,18 +989,21 @@ impl<'attached, Store: JournalSecretStore> FixtureRepairBroker<'attached, Store>
         }
         validate_session_id(request.session_id).map_err(|_| FixtureRepairError::InvalidStage)?;
         validate_plan_id(request.plan_id).map_err(|_| FixtureRepairError::InvalidStage)?;
-        let evidence_ids = canonical_evidence_ids(request.evidence_ids)
+        validate_sha256(request.diagnosis_sha256).map_err(|_| FixtureRepairError::InvalidStage)?;
+        if request.finding_id != FINDING_ID || request.finding_version != FINDING_VERSION {
+            return Err(FixtureRepairError::InvalidStage);
+        }
+        let evidence = canonical_evidence_bindings(request.evidence)
             .map_err(|_| FixtureRepairError::InvalidStage)?;
-        let parsed = parse_fixture_fstab_repair_input(request.action_id, request.contract_input)
-            .map_err(|_| FixtureRepairError::InvalidStage)?;
+        let evidence_ids = evidence
+            .iter()
+            .map(|binding| binding.id.clone())
+            .collect::<Vec<_>>();
         let preview = preview_missing_fstab_device(&self.config.fixture_root, &evidence_ids)
             .map_err(|_| FixtureRepairError::FixtureRejected)?;
         let actual_before = preview.target_content_fingerprint;
         let actual_after = sha256_bytes(preview.after.as_bytes());
-        if parsed.expected_before_sha256().as_str() != actual_before
-            || parsed.expected_after_sha256().as_str() != actual_after
-            || parsed.resource_id() != FIXTURE_RESOURCE_ID
-            || !preview.backup_required
+        if !preview.backup_required
             || preview.validation != VALIDATION_DECLARATION
             || preview.rollback != ROLLBACK_DECLARATION
         {
@@ -570,16 +1011,29 @@ impl<'attached, Store: JournalSecretStore> FixtureRepairBroker<'attached, Store>
         }
         validate_sha256(&preview.target_fingerprint)
             .map_err(|_| FixtureRepairError::FixtureRejected)?;
+        let backup_locator =
+            backup_locator_for(&actual_before).map_err(|_| FixtureRepairError::FixtureRejected)?;
+        let backup_path = backup_path_for(&self.config.backup_dir, &actual_before)
+            .map_err(|_| FixtureRepairError::FixtureRejected)?;
+        match fs::symlink_metadata(backup_path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return Err(FixtureRepairError::FixtureRejected),
+        }
 
         let mut staged = StagedFixtureRepair {
             session_id: request.session_id.to_owned(),
             plan_id: request.plan_id.to_owned(),
             action_id: FIXTURE_ACTION_ID,
             resource_id: FIXTURE_RESOURCE_ID,
-            evidence_ids,
+            diagnosis_sha256: request.diagnosis_sha256.to_owned(),
+            finding_id: FINDING_ID,
+            finding_version: FINDING_VERSION,
+            evidence,
             target_snapshot: preview.target_fingerprint,
             expected_before_sha256: actual_before,
             expected_after_sha256: actual_after,
+            diff_sha256: diff_sha256(preview.before.as_bytes(), preview.after.as_bytes()),
+            backup_locator,
             plan_hash: String::new(),
         };
         staged.plan_hash = compute_plan_hash(&staged);
@@ -610,11 +1064,16 @@ impl<'attached, Store: JournalSecretStore> FixtureRepairBroker<'attached, Store>
             approval.approval_sequence,
             staged.plan_hash.strip_prefix("sha256:").unwrap_or_default()
         );
+        let evidence_ids = staged
+            .evidence
+            .iter()
+            .map(|binding| binding.id.clone())
+            .collect::<Vec<_>>();
         let repair = match execute_missing_fstab_device_repair(
             &self.config.fixture_root,
             &self.config.backup_dir,
             &staged.target_snapshot,
-            &staged.evidence_ids,
+            &evidence_ids,
             &internal_approval,
         ) {
             Ok(repair) => repair,
@@ -627,6 +1086,14 @@ impl<'attached, Store: JournalSecretStore> FixtureRepairBroker<'attached, Store>
         if repair.before_fingerprint != staged.expected_before_sha256
             || repair.after_fingerprint != staged.expected_after_sha256
             || repair.backup_fingerprint != staged.expected_before_sha256
+            || repair.backup_path
+                != match backup_path_for(&self.config.backup_dir, &staged.expected_before_sha256) {
+                    Ok(path) => path,
+                    Err(_) => {
+                        self.block_with_recovery(&pending);
+                        return Err(FixtureRepairError::ExecutionOutcomeUnknown);
+                    }
+                }
             || !repair.validation_passed
             || !repair.metadata_preserved
         {
@@ -650,15 +1117,23 @@ impl<'attached, Store: JournalSecretStore> FixtureRepairBroker<'attached, Store>
             intent_journal_sequence: pending.journal_sequence,
             approval_id: pending.approval_id.clone(),
             approval_sequence: pending.approval_sequence,
+            approval_decision: "approved".to_owned(),
+            risk: RISK.to_owned(),
             session_id: pending.session_id.clone(),
             plan_id: pending.plan_id.clone(),
             plan_hash: pending.plan_hash.clone(),
             action_id: pending.action_id.clone(),
             resource_id: pending.resource_id.clone(),
-            evidence_ids: pending.evidence_ids.clone(),
+            diagnosis_sha256: pending.diagnosis_sha256.clone(),
+            finding_id: pending.finding_id.clone(),
+            finding_version: pending.finding_version,
+            evidence: pending.evidence.clone(),
             target_snapshot: pending.target_snapshot.clone(),
             before_sha256: repair.before_fingerprint,
             after_sha256: repair.after_fingerprint,
+            after_target_precondition: repair.after_target_precondition,
+            diff_sha256: pending.diff_sha256.clone(),
+            backup_locator: pending.backup_locator.clone(),
             backup_sha256: repair.backup_fingerprint,
             backup: BACKUP_RESULT.to_owned(),
             validation: VALIDATION_DECLARATION.to_owned(),
@@ -704,6 +1179,231 @@ impl<'attached, Store: JournalSecretStore> FixtureRepairBroker<'attached, Store>
         self.reissue_completed_receipt(&pending.approval_id)
     }
 
+    /// Execute the separately staged and approved rollback, then sign the
+    /// strict end-to-end cycle report against the rolled-back journal head.
+    pub fn execute_rollback(
+        &mut self,
+        staged: &StagedFixtureRollback,
+        approval: FixtureRollbackApproval<'_>,
+    ) -> Result<SignedFixtureRepairReport, FixtureRepairError> {
+        self.validate_rollback_approval(staged, &approval)?;
+        let repair_payload = self
+            .completed_receipts
+            .get(&staged.repair_approval_id)
+            .ok_or(FixtureRepairError::InvalidReceipt)?
+            .payload
+            .clone();
+        self.fresh_rollback_preview_matches(staged, &repair_payload)?;
+
+        let pending = match self.append_rollback_intent(staged, &approval, &repair_payload) {
+            Ok(pending) => pending,
+            Err(error) => {
+                self.mutation_blocked = true;
+                return Err(error);
+            }
+        };
+        let repair = match pack_repair_receipt(&self.config, &repair_payload) {
+            Ok(repair) => repair,
+            Err(_) => {
+                self.block_with_rollback_recovery(&pending);
+                return Err(FixtureRepairError::ExecutionOutcomeUnknown);
+            }
+        };
+        let internal_approval = format!(
+            "fixture-broker-rollback-v1:{}:{}",
+            approval.approval_sequence,
+            staged.plan_hash.strip_prefix("sha256:").unwrap_or_default()
+        );
+        let rollback = match rollback_missing_fstab_device_repair(
+            &self.config.fixture_root,
+            &repair,
+            &internal_approval,
+        ) {
+            Ok(rollback) => rollback,
+            Err(_) => {
+                self.block_with_rollback_recovery(&pending);
+                return Err(FixtureRepairError::ExecutionOutcomeUnknown);
+            }
+        };
+        if rollback.replaced_fingerprint != staged.installed_sha256
+            || rollback.restored_fingerprint != staged.restored_sha256
+            || rollback.backup_fingerprint != staged.backup_sha256
+            || rollback.backup_path
+                != match backup_path_for(&self.config.backup_dir, &staged.restored_sha256) {
+                    Ok(path) => path,
+                    Err(_) => {
+                        self.block_with_rollback_recovery(&pending);
+                        return Err(FixtureRepairError::ExecutionOutcomeUnknown);
+                    }
+                }
+            || rollback.automatic
+            || !rollback.validation_passed
+            || !rollback.metadata_preserved
+        {
+            self.block_with_rollback_recovery(&pending);
+            return Err(FixtureRepairError::ExecutionOutcomeUnknown);
+        }
+
+        let completion_sequence = match self.head.sequence.checked_add(1) {
+            Some(sequence) => sequence,
+            None => {
+                self.block_with_rollback_recovery(&pending);
+                return Err(FixtureRepairError::ExecutionOutcomeUnknown);
+            }
+        };
+        let report = FixtureRepairReportPayload {
+            api_version: REPORT_API_VERSION.to_owned(),
+            kind: REPORT_KIND.to_owned(),
+            device_id: self.identity.device_id(),
+            journal_id: hex_bytes(&self.head.journal_id),
+            journal_sequence: completion_sequence,
+            repair: repair_payload,
+            rollback: FixtureRollbackReportPayload {
+                journal_sequence: completion_sequence,
+                intent_journal_sequence: pending.journal_sequence,
+                approval_id: pending.approval_id.clone(),
+                approval_sequence: pending.approval_sequence,
+                approval_decision: "approved".to_owned(),
+                risk: RISK.to_owned(),
+                plan_id: pending.plan_id.clone(),
+                plan_hash: pending.plan_hash.clone(),
+                action_id: pending.action_id.clone(),
+                resource_id: pending.resource_id.clone(),
+                target_snapshot: pending.target_snapshot.clone(),
+                replaced_sha256: rollback.replaced_fingerprint,
+                restored_sha256: rollback.restored_fingerprint,
+                backup_locator: pending.backup_locator.clone(),
+                backup_sha256: rollback.backup_fingerprint,
+                validation: ROLLBACK_VALIDATION_DECLARATION.to_owned(),
+                validation_passed: rollback.validation_passed,
+                metadata_preserved: rollback.metadata_preserved,
+            },
+            final_state: "rolled-back".to_owned(),
+        };
+        let payload_bytes = match serde_json::to_vec(&report) {
+            Ok(bytes) if bytes.len() <= MAX_BROKER_EVENT_BYTES => bytes,
+            _ => {
+                self.block_with_rollback_recovery(&pending);
+                return Err(FixtureRepairError::ExecutionOutcomeUnknown);
+            }
+        };
+        let completed = RolledBackEvent {
+            report,
+            report_payload_sha256: sha256_bytes(&payload_bytes),
+        };
+        let completed_entry =
+            match self.append_event(&JournalEvent::RolledBack(Box::new(completed.clone()))) {
+                Ok(entry) => entry,
+                Err(_) => {
+                    self.block_with_rollback_recovery(&pending);
+                    return Err(FixtureRepairError::ExecutionOutcomeUnknown);
+                }
+            };
+        if completed_entry.sequence != completion_sequence {
+            self.mutation_blocked = true;
+            return Err(FixtureRepairError::ReceiptUnavailable);
+        }
+        self.completed_reports.insert(
+            staged.repair_approval_id.clone(),
+            RecoverableReport {
+                payload: completed.report,
+                journal_sequence: completed_entry.sequence,
+                journal_entry_hash: completed_entry.entry_hash,
+            },
+        );
+        self.reissue_completed_report(&staged.repair_approval_id)
+    }
+
+    fn validate_rollback_approval(
+        &self,
+        staged: &StagedFixtureRollback,
+        approval: &FixtureRollbackApproval<'_>,
+    ) -> Result<(), FixtureRepairError> {
+        if self.mutation_blocked {
+            return Err(FixtureRepairError::MutationBlocked);
+        }
+        validate_approval_id(approval.approval_id)
+            .map_err(|_| FixtureRepairError::InvalidApproval)?;
+        if self.used_approval_ids.contains(approval.approval_id) {
+            return Err(FixtureRepairError::ApprovalReused);
+        }
+        if self.used_approval_ids.len() >= MAX_APPROVALS {
+            return Err(FixtureRepairError::CapacityExceeded);
+        }
+        if approval.approval_sequence != self.next_approval_sequence()? {
+            return Err(FixtureRepairError::NonMonotonicApproval);
+        }
+        if self
+            .completed_reports
+            .contains_key(&staged.repair_approval_id)
+            || approval.session_id != staged.session_id
+            || approval.plan_id != staged.plan_id
+            || approval.plan_hash != staged.plan_hash
+            || approval.target_snapshot != staged.target_snapshot
+            || staged.resource_id != FIXTURE_RESOURCE_ID
+            || compute_rollback_plan_hash(staged) != staged.plan_hash
+        {
+            return Err(FixtureRepairError::ApprovalMismatch);
+        }
+        Ok(())
+    }
+
+    fn fresh_rollback_preview_matches(
+        &self,
+        staged: &StagedFixtureRollback,
+        repair_payload: &FixtureRepairReceiptPayload,
+    ) -> Result<(), FixtureRepairError> {
+        let repair = pack_repair_receipt(&self.config, repair_payload)
+            .map_err(|_| FixtureRepairError::InvalidReceipt)?;
+        let preview = preview_missing_fstab_device_rollback(&self.config.fixture_root, &repair)
+            .map_err(|_| FixtureRepairError::StaleTarget)?;
+        if preview.target_fingerprint != staged.target_snapshot
+            || preview.installed_sha256 != staged.installed_sha256
+            || preview.restored_sha256 != staged.restored_sha256
+            || preview.backup_sha256 != staged.backup_sha256
+            || preview.validation != ROLLBACK_VALIDATION_DECLARATION
+            || staged.backup_locator != repair_payload.backup_locator
+        {
+            return Err(FixtureRepairError::StaleTarget);
+        }
+        Ok(())
+    }
+
+    fn append_rollback_intent(
+        &mut self,
+        staged: &StagedFixtureRollback,
+        approval: &FixtureRollbackApproval<'_>,
+        repair: &FixtureRepairReceiptPayload,
+    ) -> Result<RollbackIntentEvent, FixtureRepairError> {
+        let journal_sequence = self
+            .head
+            .sequence
+            .checked_add(1)
+            .ok_or(FixtureRepairError::CapacityExceeded)?;
+        let intent = RollbackIntentEvent {
+            journal_sequence,
+            approval_id: approval.approval_id.to_owned(),
+            approval_sequence: approval.approval_sequence,
+            session_id: staged.session_id.clone(),
+            plan_id: staged.plan_id.clone(),
+            plan_hash: staged.plan_hash.clone(),
+            repair_approval_id: staged.repair_approval_id.clone(),
+            repair_plan_hash: staged.repair_plan_hash.clone(),
+            repair_journal_sequence: repair.journal_sequence,
+            action_id: FIXTURE_ROLLBACK_ID.to_owned(),
+            resource_id: FIXTURE_RESOURCE_ID.to_owned(),
+            target_snapshot: staged.target_snapshot.clone(),
+            installed_sha256: staged.installed_sha256.clone(),
+            restored_sha256: staged.restored_sha256.clone(),
+            backup_locator: staged.backup_locator.clone(),
+            backup_sha256: staged.backup_sha256.clone(),
+        };
+        self.append_event(&JournalEvent::RollbackIntent(intent.clone()))?;
+        self.used_approval_ids.insert(intent.approval_id.clone());
+        self.last_approval_sequence = intent.approval_sequence;
+        Ok(intent)
+    }
+
     fn validate_approval(
         &self,
         staged: &StagedFixtureRepair,
@@ -740,11 +1440,20 @@ impl<'attached, Store: JournalSecretStore> FixtureRepairBroker<'attached, Store>
         &self,
         staged: &StagedFixtureRepair,
     ) -> Result<(), FixtureRepairError> {
-        let preview = preview_missing_fstab_device(&self.config.fixture_root, &staged.evidence_ids)
+        let evidence_ids = staged
+            .evidence
+            .iter()
+            .map(|binding| binding.id.clone())
+            .collect::<Vec<_>>();
+        let preview = preview_missing_fstab_device(&self.config.fixture_root, &evidence_ids)
             .map_err(|_| FixtureRepairError::StaleTarget)?;
         if preview.target_fingerprint != staged.target_snapshot
             || preview.target_content_fingerprint != staged.expected_before_sha256
             || sha256_bytes(preview.after.as_bytes()) != staged.expected_after_sha256
+            || diff_sha256(preview.before.as_bytes(), preview.after.as_bytes())
+                != staged.diff_sha256
+            || backup_locator_for(&staged.expected_before_sha256).as_deref()
+                != Ok(staged.backup_locator.as_str())
             || !preview.backup_required
             || preview.validation != VALIDATION_DECLARATION
             || preview.rollback != ROLLBACK_DECLARATION
@@ -773,10 +1482,15 @@ impl<'attached, Store: JournalSecretStore> FixtureRepairBroker<'attached, Store>
             plan_hash: staged.plan_hash.clone(),
             action_id: FIXTURE_ACTION_ID.to_owned(),
             resource_id: FIXTURE_RESOURCE_ID.to_owned(),
-            evidence_ids: staged.evidence_ids.clone(),
+            diagnosis_sha256: staged.diagnosis_sha256.clone(),
+            finding_id: staged.finding_id.to_owned(),
+            finding_version: staged.finding_version,
+            evidence: staged.evidence.clone(),
             target_snapshot: staged.target_snapshot.clone(),
             expected_before_sha256: staged.expected_before_sha256.clone(),
             expected_after_sha256: staged.expected_after_sha256.clone(),
+            diff_sha256: staged.diff_sha256.clone(),
+            backup_locator: staged.backup_locator.clone(),
         };
         self.append_event(&JournalEvent::Intent(intent.clone()))?;
         self.used_approval_ids.insert(intent.approval_id.clone());
@@ -802,13 +1516,20 @@ impl<'attached, Store: JournalSecretStore> FixtureRepairBroker<'attached, Store>
     }
 
     fn append_recovery(&mut self, pending: &IntentEvent) -> Result<(), FixtureRepairError> {
+        self.append_pending_recovery(&PendingIntent::Repair(pending.clone()))
+    }
+
+    fn append_pending_recovery(
+        &mut self,
+        pending: &PendingIntent,
+    ) -> Result<(), FixtureRepairError> {
         let recovery = JournalEvent::Recovery(RecoveryEvent {
-            approval_id: pending.approval_id.clone(),
-            approval_sequence: pending.approval_sequence,
-            session_id: pending.session_id.clone(),
-            plan_id: pending.plan_id.clone(),
-            plan_hash: pending.plan_hash.clone(),
-            intent_journal_sequence: pending.journal_sequence,
+            approval_id: pending.approval_id().to_owned(),
+            approval_sequence: pending.approval_sequence(),
+            session_id: pending.session_id().to_owned(),
+            plan_id: pending.plan_id().to_owned(),
+            plan_hash: pending.plan_hash().to_owned(),
+            intent_journal_sequence: pending.journal_sequence(),
             disposition: RECOVERY_DISPOSITION.to_owned(),
         });
         self.append_event(&recovery)?;
@@ -819,6 +1540,11 @@ impl<'attached, Store: JournalSecretStore> FixtureRepairBroker<'attached, Store>
     fn block_with_recovery(&mut self, pending: &IntentEvent) {
         self.mutation_blocked = true;
         let _ = self.append_recovery(pending);
+    }
+
+    fn block_with_rollback_recovery(&mut self, pending: &RollbackIntentEvent) {
+        self.mutation_blocked = true;
+        let _ = self.append_pending_recovery(&PendingIntent::Rollback(pending.clone()));
     }
 }
 
@@ -841,10 +1567,15 @@ struct IntentEvent {
     plan_hash: String,
     action_id: String,
     resource_id: String,
-    evidence_ids: Vec<String>,
+    diagnosis_sha256: String,
+    finding_id: String,
+    finding_version: u32,
+    evidence: Vec<FixtureEvidenceBinding>,
     target_snapshot: String,
     expected_before_sha256: String,
     expected_after_sha256: String,
+    diff_sha256: String,
+    backup_locator: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -852,6 +1583,34 @@ struct IntentEvent {
 struct CompletedEvent {
     receipt: FixtureRepairReceiptPayload,
     receipt_payload_sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RollbackIntentEvent {
+    journal_sequence: u64,
+    approval_id: String,
+    approval_sequence: u64,
+    session_id: String,
+    plan_id: String,
+    plan_hash: String,
+    repair_approval_id: String,
+    repair_plan_hash: String,
+    repair_journal_sequence: u64,
+    action_id: String,
+    resource_id: String,
+    target_snapshot: String,
+    installed_sha256: String,
+    restored_sha256: String,
+    backup_locator: String,
+    backup_sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RolledBackEvent {
+    report: FixtureRepairReportPayload,
+    report_payload_sha256: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -873,6 +1632,63 @@ struct RecoverableReceipt {
     journal_entry_hash: [u8; 32],
 }
 
+#[derive(Clone)]
+struct RecoverableReport {
+    payload: FixtureRepairReportPayload,
+    journal_sequence: u64,
+    journal_entry_hash: [u8; 32],
+}
+
+#[derive(Clone)]
+enum PendingIntent {
+    Repair(IntentEvent),
+    Rollback(RollbackIntentEvent),
+}
+
+impl PendingIntent {
+    fn approval_id(&self) -> &str {
+        match self {
+            Self::Repair(intent) => &intent.approval_id,
+            Self::Rollback(intent) => &intent.approval_id,
+        }
+    }
+
+    fn approval_sequence(&self) -> u64 {
+        match self {
+            Self::Repair(intent) => intent.approval_sequence,
+            Self::Rollback(intent) => intent.approval_sequence,
+        }
+    }
+
+    fn session_id(&self) -> &str {
+        match self {
+            Self::Repair(intent) => &intent.session_id,
+            Self::Rollback(intent) => &intent.session_id,
+        }
+    }
+
+    fn plan_id(&self) -> &str {
+        match self {
+            Self::Repair(intent) => &intent.plan_id,
+            Self::Rollback(intent) => &intent.plan_id,
+        }
+    }
+
+    fn plan_hash(&self) -> &str {
+        match self {
+            Self::Repair(intent) => &intent.plan_hash,
+            Self::Rollback(intent) => &intent.plan_hash,
+        }
+    }
+
+    fn journal_sequence(&self) -> u64 {
+        match self {
+            Self::Repair(intent) => intent.journal_sequence,
+            Self::Rollback(intent) => intent.journal_sequence,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "event", deny_unknown_fields)]
 enum JournalEvent {
@@ -882,6 +1698,10 @@ enum JournalEvent {
     Intent(IntentEvent),
     #[serde(rename = "fixture.repair.completed.v1")]
     Completed(Box<CompletedEvent>),
+    #[serde(rename = "fixture.rollback.intent.v1")]
+    RollbackIntent(RollbackIntentEvent),
+    #[serde(rename = "fixture.rollback.completed.v1")]
+    RolledBack(Box<RolledBackEvent>),
     #[serde(rename = "fixture.repair.recovery.v1")]
     Recovery(RecoveryEvent),
 }
@@ -893,8 +1713,9 @@ struct ReplayState {
     bound_journal_id: Option<String>,
     used_approval_ids: HashSet<String>,
     completed_receipts: HashMap<String, RecoverableReceipt>,
+    completed_reports: HashMap<String, RecoverableReport>,
     last_approval_sequence: u64,
-    pending: Option<IntentEvent>,
+    pending: Option<PendingIntent>,
     mutation_blocked: bool,
 }
 
@@ -907,6 +1728,7 @@ impl ReplayState {
             bound_journal_id: None,
             used_approval_ids: HashSet::new(),
             completed_receipts: HashMap::new(),
+            completed_reports: HashMap::new(),
             last_approval_sequence: 0,
             pending: None,
             mutation_blocked: false,
@@ -951,10 +1773,12 @@ impl ReplayState {
                 }
                 self.used_approval_ids.insert(intent.approval_id.clone());
                 self.last_approval_sequence = intent.approval_sequence;
-                self.pending = Some(intent);
+                self.pending = Some(PendingIntent::Repair(intent));
             }
             JournalEvent::Completed(completed) => {
-                let pending = self.pending.as_ref().ok_or(ReplayFailure)?;
+                let Some(PendingIntent::Repair(pending)) = self.pending.as_ref() else {
+                    return Err(ReplayFailure);
+                };
                 let journal_id = self.bound_journal_id.as_deref().ok_or(ReplayFailure)?;
                 validate_completed(
                     &completed,
@@ -979,14 +1803,69 @@ impl ReplayState {
                 }
                 self.pending = None;
             }
+            JournalEvent::RollbackIntent(intent) => {
+                let repair = self
+                    .completed_receipts
+                    .get(&intent.repair_approval_id)
+                    .ok_or(ReplayFailure)?;
+                if !self.bound
+                    || self.mutation_blocked
+                    || self.pending.is_some()
+                    || self.used_approval_ids.len() >= MAX_APPROVALS
+                    || self
+                        .completed_reports
+                        .contains_key(&intent.repair_approval_id)
+                    || intent.journal_sequence != entry.sequence
+                    || intent.approval_sequence
+                        != self
+                            .last_approval_sequence
+                            .checked_add(1)
+                            .ok_or(ReplayFailure)?
+                    || self.used_approval_ids.contains(&intent.approval_id)
+                    || validate_rollback_intent(&intent, &repair.payload).is_err()
+                {
+                    return Err(ReplayFailure);
+                }
+                self.used_approval_ids.insert(intent.approval_id.clone());
+                self.last_approval_sequence = intent.approval_sequence;
+                self.pending = Some(PendingIntent::Rollback(intent));
+            }
+            JournalEvent::RolledBack(rolled_back) => {
+                let Some(PendingIntent::Rollback(pending)) = self.pending.as_ref() else {
+                    return Err(ReplayFailure);
+                };
+                let journal_id = self.bound_journal_id.as_deref().ok_or(ReplayFailure)?;
+                validate_rolled_back(
+                    &rolled_back,
+                    pending,
+                    &self.expected_device_id,
+                    journal_id,
+                    entry.sequence,
+                )?;
+                if self
+                    .completed_reports
+                    .insert(
+                        pending.repair_approval_id.clone(),
+                        RecoverableReport {
+                            payload: rolled_back.report,
+                            journal_sequence: entry.sequence,
+                            journal_entry_hash: entry.entry_hash,
+                        },
+                    )
+                    .is_some()
+                {
+                    return Err(ReplayFailure);
+                }
+                self.pending = None;
+            }
             JournalEvent::Recovery(recovery) => {
                 let pending = self.pending.as_ref().ok_or(ReplayFailure)?;
-                if recovery.approval_id != pending.approval_id
-                    || recovery.approval_sequence != pending.approval_sequence
-                    || recovery.session_id != pending.session_id
-                    || recovery.plan_id != pending.plan_id
-                    || recovery.plan_hash != pending.plan_hash
-                    || recovery.intent_journal_sequence != pending.journal_sequence
+                if recovery.approval_id != pending.approval_id()
+                    || recovery.approval_sequence != pending.approval_sequence()
+                    || recovery.session_id != pending.session_id()
+                    || recovery.plan_id != pending.plan_id()
+                    || recovery.plan_hash != pending.plan_hash()
+                    || recovery.intent_journal_sequence != pending.journal_sequence()
                     || recovery.disposition != RECOVERY_DISPOSITION
                 {
                     return Err(ReplayFailure);
@@ -1015,13 +1894,19 @@ fn validate_intent(intent: &IntentEvent) -> Result<(), ReplayFailure> {
     validate_session_id(&intent.session_id)?;
     validate_plan_id(&intent.plan_id)?;
     validate_sha256(&intent.plan_hash)?;
+    validate_sha256(&intent.diagnosis_sha256)?;
     validate_sha256(&intent.target_snapshot)?;
     validate_sha256(&intent.expected_before_sha256)?;
     validate_sha256(&intent.expected_after_sha256)?;
+    validate_sha256(&intent.diff_sha256)?;
     if intent.expected_before_sha256 == intent.expected_after_sha256
         || intent.action_id != FIXTURE_ACTION_ID
         || intent.resource_id != FIXTURE_RESOURCE_ID
-        || !canonical_evidence_slice(&intent.evidence_ids)
+        || intent.finding_id != FINDING_ID
+        || intent.finding_version != FINDING_VERSION
+        || !canonical_evidence_binding_slice(&intent.evidence)
+        || backup_locator_for(&intent.expected_before_sha256).as_deref()
+            != Ok(intent.backup_locator.as_str())
     {
         return Err(ReplayFailure);
     }
@@ -1030,10 +1915,15 @@ fn validate_intent(intent: &IntentEvent) -> Result<(), ReplayFailure> {
         plan_id: intent.plan_id.clone(),
         action_id: FIXTURE_ACTION_ID,
         resource_id: FIXTURE_RESOURCE_ID,
-        evidence_ids: intent.evidence_ids.clone(),
+        diagnosis_sha256: intent.diagnosis_sha256.clone(),
+        finding_id: FINDING_ID,
+        finding_version: FINDING_VERSION,
+        evidence: intent.evidence.clone(),
         target_snapshot: intent.target_snapshot.clone(),
         expected_before_sha256: intent.expected_before_sha256.clone(),
         expected_after_sha256: intent.expected_after_sha256.clone(),
+        diff_sha256: intent.diff_sha256.clone(),
+        backup_locator: intent.backup_locator.clone(),
         plan_hash: String::new(),
     };
     if compute_plan_hash(&staged) != intent.plan_hash {
@@ -1064,12 +1954,168 @@ fn validate_completed(
         || payload.plan_hash != pending.plan_hash
         || payload.action_id != pending.action_id
         || payload.resource_id != pending.resource_id
-        || payload.evidence_ids != pending.evidence_ids
+        || payload.diagnosis_sha256 != pending.diagnosis_sha256
+        || payload.finding_id != pending.finding_id
+        || payload.finding_version != pending.finding_version
+        || payload.evidence != pending.evidence
         || payload.target_snapshot != pending.target_snapshot
         || payload.before_sha256 != pending.expected_before_sha256
         || payload.after_sha256 != pending.expected_after_sha256
+        || payload.diff_sha256 != pending.diff_sha256
+        || payload.backup_locator != pending.backup_locator
         || payload.backup_sha256 != pending.expected_before_sha256
     {
+        return Err(ReplayFailure);
+    }
+    Ok(())
+}
+
+fn validate_rollback_intent(
+    intent: &RollbackIntentEvent,
+    repair: &FixtureRepairReceiptPayload,
+) -> Result<(), ReplayFailure> {
+    validate_approval_id(&intent.approval_id)?;
+    validate_session_id(&intent.session_id)?;
+    validate_plan_id(&intent.plan_id)?;
+    validate_sha256(&intent.plan_hash)?;
+    validate_sha256(&intent.repair_plan_hash)?;
+    validate_sha256(&intent.target_snapshot)?;
+    validate_sha256(&intent.installed_sha256)?;
+    validate_sha256(&intent.restored_sha256)?;
+    validate_sha256(&intent.backup_sha256)?;
+    if intent.action_id != FIXTURE_ROLLBACK_ID
+        || intent.resource_id != FIXTURE_RESOURCE_ID
+        || intent.session_id != repair.session_id
+        || intent.repair_approval_id != repair.approval_id
+        || intent.repair_plan_hash != repair.plan_hash
+        || intent.repair_journal_sequence != repair.journal_sequence
+        || intent.target_snapshot != repair.after_target_precondition
+        || intent.installed_sha256 != repair.after_sha256
+        || intent.restored_sha256 != repair.before_sha256
+        || intent.backup_locator != repair.backup_locator
+        || intent.backup_sha256 != repair.backup_sha256
+    {
+        return Err(ReplayFailure);
+    }
+    let staged = StagedFixtureRollback {
+        session_id: intent.session_id.clone(),
+        plan_id: intent.plan_id.clone(),
+        repair_approval_id: intent.repair_approval_id.clone(),
+        repair_plan_hash: intent.repair_plan_hash.clone(),
+        resource_id: FIXTURE_RESOURCE_ID,
+        target_snapshot: intent.target_snapshot.clone(),
+        installed_sha256: intent.installed_sha256.clone(),
+        restored_sha256: intent.restored_sha256.clone(),
+        backup_locator: intent.backup_locator.clone(),
+        backup_sha256: intent.backup_sha256.clone(),
+        plan_hash: String::new(),
+    };
+    if compute_rollback_plan_hash(&staged) != intent.plan_hash {
+        return Err(ReplayFailure);
+    }
+    Ok(())
+}
+
+fn validate_rolled_back(
+    completed: &RolledBackEvent,
+    pending: &RollbackIntentEvent,
+    expected_device_id: &str,
+    journal_id: &str,
+    journal_sequence: u64,
+) -> Result<(), ReplayFailure> {
+    validate_report_payload(&completed.report)?;
+    let bytes = serde_json::to_vec(&completed.report).map_err(|_| ReplayFailure)?;
+    let rollback = &completed.report.rollback;
+    if completed.report_payload_sha256 != sha256_bytes(&bytes)
+        || completed.report.device_id != expected_device_id
+        || completed.report.journal_id != journal_id
+        || completed.report.journal_sequence != journal_sequence
+        || rollback.journal_sequence != journal_sequence
+        || rollback.intent_journal_sequence != pending.journal_sequence
+        || rollback.approval_id != pending.approval_id
+        || rollback.approval_sequence != pending.approval_sequence
+        || rollback.plan_id != pending.plan_id
+        || rollback.plan_hash != pending.plan_hash
+        || rollback.action_id != pending.action_id
+        || rollback.resource_id != pending.resource_id
+        || rollback.target_snapshot != pending.target_snapshot
+        || rollback.replaced_sha256 != pending.installed_sha256
+        || rollback.restored_sha256 != pending.restored_sha256
+        || rollback.backup_locator != pending.backup_locator
+        || rollback.backup_sha256 != pending.backup_sha256
+        || completed.report.repair.approval_id != pending.repair_approval_id
+        || completed.report.repair.plan_hash != pending.repair_plan_hash
+        || completed.report.repair.journal_sequence != pending.repair_journal_sequence
+    {
+        return Err(ReplayFailure);
+    }
+    Ok(())
+}
+
+fn validate_report_payload(payload: &FixtureRepairReportPayload) -> Result<(), ReplayFailure> {
+    validate_receipt_payload(&payload.repair)?;
+    let rollback = &payload.rollback;
+    let expected_intent_sequence = rollback
+        .approval_sequence
+        .checked_mul(2)
+        .ok_or(ReplayFailure)?;
+    let expected_completion_sequence = expected_intent_sequence
+        .checked_add(1)
+        .ok_or(ReplayFailure)?;
+    if payload.api_version != REPORT_API_VERSION
+        || payload.kind != REPORT_KIND
+        || payload.final_state != "rolled-back"
+        || payload.device_id != payload.repair.device_id
+        || payload.journal_id != payload.repair.journal_id
+        || payload.journal_sequence != rollback.journal_sequence
+        || rollback.journal_sequence != expected_completion_sequence
+        || rollback.intent_journal_sequence != expected_intent_sequence
+        || rollback.approval_sequence
+            != payload
+                .repair
+                .approval_sequence
+                .checked_add(1)
+                .ok_or(ReplayFailure)?
+        || rollback.action_id != FIXTURE_ROLLBACK_ID
+        || rollback.resource_id != FIXTURE_RESOURCE_ID
+        || rollback.approval_decision != "approved"
+        || rollback.risk != RISK
+        || rollback.target_snapshot != payload.repair.after_target_precondition
+        || rollback.replaced_sha256 != payload.repair.after_sha256
+        || rollback.restored_sha256 != payload.repair.before_sha256
+        || rollback.backup_locator != payload.repair.backup_locator
+        || rollback.backup_sha256 != payload.repair.backup_sha256
+        || rollback.validation != ROLLBACK_VALIDATION_DECLARATION
+        || !rollback.validation_passed
+        || !rollback.metadata_preserved
+    {
+        return Err(ReplayFailure);
+    }
+    kernaid_device_identity::validate_device_id(&payload.device_id).map_err(|_| ReplayFailure)?;
+    if !valid_journal_id(&payload.journal_id) {
+        return Err(ReplayFailure);
+    }
+    validate_approval_id(&rollback.approval_id)?;
+    validate_plan_id(&rollback.plan_id)?;
+    validate_sha256(&rollback.plan_hash)?;
+    validate_sha256(&rollback.target_snapshot)?;
+    validate_sha256(&rollback.replaced_sha256)?;
+    validate_sha256(&rollback.restored_sha256)?;
+    validate_sha256(&rollback.backup_sha256)?;
+    let staged = StagedFixtureRollback {
+        session_id: payload.repair.session_id.clone(),
+        plan_id: rollback.plan_id.clone(),
+        repair_approval_id: payload.repair.approval_id.clone(),
+        repair_plan_hash: payload.repair.plan_hash.clone(),
+        resource_id: FIXTURE_RESOURCE_ID,
+        target_snapshot: rollback.target_snapshot.clone(),
+        installed_sha256: rollback.replaced_sha256.clone(),
+        restored_sha256: rollback.restored_sha256.clone(),
+        backup_locator: rollback.backup_locator.clone(),
+        backup_sha256: rollback.backup_sha256.clone(),
+        plan_hash: String::new(),
+    };
+    if compute_rollback_plan_hash(&staged) != rollback.plan_hash {
         return Err(ReplayFailure);
     }
     Ok(())
@@ -1087,6 +2133,10 @@ fn validate_receipt_payload(payload: &FixtureRepairReceiptPayload) -> Result<(),
         || payload.kind != RECEIPT_KIND
         || payload.action_id != FIXTURE_ACTION_ID
         || payload.resource_id != FIXTURE_RESOURCE_ID
+        || payload.approval_decision != "approved"
+        || payload.risk != RISK
+        || payload.finding_id != FINDING_ID
+        || payload.finding_version != FINDING_VERSION
         || payload.backup != BACKUP_RESULT
         || payload.validation != VALIDATION_DECLARATION
         || payload.rollback != ROLLBACK_DECLARATION
@@ -1099,6 +2149,8 @@ fn validate_receipt_payload(payload: &FixtureRepairReceiptPayload) -> Result<(),
         || !valid_journal_id(&payload.journal_id)
         || payload.before_sha256 == payload.after_sha256
         || payload.backup_sha256 != payload.before_sha256
+        || backup_locator_for(&payload.before_sha256).as_deref()
+            != Ok(payload.backup_locator.as_str())
         || payload.before_mode & !0o7777 != 0
     {
         return Err(ReplayFailure);
@@ -1108,11 +2160,14 @@ fn validate_receipt_payload(payload: &FixtureRepairReceiptPayload) -> Result<(),
     validate_session_id(&payload.session_id)?;
     validate_plan_id(&payload.plan_id)?;
     validate_sha256(&payload.plan_hash)?;
+    validate_sha256(&payload.diagnosis_sha256)?;
     validate_sha256(&payload.target_snapshot)?;
     validate_sha256(&payload.before_sha256)?;
     validate_sha256(&payload.after_sha256)?;
+    validate_sha256(&payload.after_target_precondition)?;
+    validate_sha256(&payload.diff_sha256)?;
     validate_sha256(&payload.backup_sha256)?;
-    if !canonical_evidence_slice(&payload.evidence_ids) {
+    if !canonical_evidence_binding_slice(&payload.evidence) {
         return Err(ReplayFailure);
     }
     let staged = StagedFixtureRepair {
@@ -1120,16 +2175,46 @@ fn validate_receipt_payload(payload: &FixtureRepairReceiptPayload) -> Result<(),
         plan_id: payload.plan_id.clone(),
         action_id: FIXTURE_ACTION_ID,
         resource_id: FIXTURE_RESOURCE_ID,
-        evidence_ids: payload.evidence_ids.clone(),
+        diagnosis_sha256: payload.diagnosis_sha256.clone(),
+        finding_id: FINDING_ID,
+        finding_version: FINDING_VERSION,
+        evidence: payload.evidence.clone(),
         target_snapshot: payload.target_snapshot.clone(),
         expected_before_sha256: payload.before_sha256.clone(),
         expected_after_sha256: payload.after_sha256.clone(),
+        diff_sha256: payload.diff_sha256.clone(),
+        backup_locator: payload.backup_locator.clone(),
         plan_hash: String::new(),
     };
     if compute_plan_hash(&staged) != payload.plan_hash {
         return Err(ReplayFailure);
     }
     Ok(())
+}
+
+fn pack_repair_receipt(
+    config: &FixtureRepairConfig,
+    payload: &FixtureRepairReceiptPayload,
+) -> Result<RepairReceipt, ReplayFailure> {
+    validate_receipt_payload(payload)?;
+    let backup_path = backup_path_for(&config.backup_dir, &payload.before_sha256)?;
+    if backup_locator_for(&payload.before_sha256)? != payload.backup_locator {
+        return Err(ReplayFailure);
+    }
+    Ok(RepairReceipt {
+        before_fingerprint: payload.before_sha256.clone(),
+        after_fingerprint: payload.after_sha256.clone(),
+        after_target_precondition: payload.after_target_precondition.clone(),
+        backup_path,
+        backup_fingerprint: payload.backup_sha256.clone(),
+        before_metadata: PreservedMetadata {
+            mode: payload.before_mode,
+            uid: payload.before_uid,
+            gid: payload.before_gid,
+        },
+        validation_passed: payload.validation_passed,
+        metadata_preserved: payload.metadata_preserved,
+    })
 }
 
 fn canonical_directory(path: &Path) -> Result<PathBuf, FixtureRepairError> {
@@ -1170,28 +2255,35 @@ fn validate_approval_id(value: &str) -> Result<(), ReplayFailure> {
     validate_typed_id(value, "A-")
 }
 
-fn canonical_evidence_ids(values: &[String]) -> Result<Vec<String>, ReplayFailure> {
+fn validate_evidence_binding(binding: &FixtureEvidenceBinding) -> Result<(), ReplayFailure> {
+    validate_evidence_id(&binding.id)?;
+    validate_sha256(&binding.sha256)
+}
+
+fn canonical_evidence_bindings(
+    values: &[FixtureEvidenceBinding],
+) -> Result<Vec<FixtureEvidenceBinding>, ReplayFailure> {
     if values.is_empty() || values.len() > MAX_EVIDENCE_IDS {
         return Err(ReplayFailure);
     }
     for value in values {
-        validate_evidence_id(value)?;
+        validate_evidence_binding(value)?;
     }
     let mut canonical = values.to_vec();
-    canonical.sort();
-    if canonical.windows(2).any(|pair| pair[0] == pair[1]) {
+    canonical.sort_by(|left, right| left.id.cmp(&right.id));
+    if canonical.windows(2).any(|pair| pair[0].id == pair[1].id) {
         return Err(ReplayFailure);
     }
     Ok(canonical)
 }
 
-fn canonical_evidence_slice(values: &[String]) -> bool {
+fn canonical_evidence_binding_slice(values: &[FixtureEvidenceBinding]) -> bool {
     !values.is_empty()
         && values.len() <= MAX_EVIDENCE_IDS
         && values
             .iter()
-            .all(|value| validate_evidence_id(value).is_ok())
-        && values.windows(2).all(|pair| pair[0] < pair[1])
+            .all(|value| validate_evidence_binding(value).is_ok())
+        && values.windows(2).all(|pair| pair[0].id < pair[1].id)
 }
 
 fn validate_sha256(value: &str) -> Result<(), ReplayFailure> {
@@ -1215,6 +2307,33 @@ fn valid_journal_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
+fn backup_name_for(before_sha256: &str) -> Result<String, ReplayFailure> {
+    validate_sha256(before_sha256)?;
+    let digest = before_sha256.strip_prefix("sha256:").ok_or(ReplayFailure)?;
+    Ok(format!("fstab-{}.bak", &digest[..16]))
+}
+
+fn backup_locator_for(before_sha256: &str) -> Result<String, ReplayFailure> {
+    Ok(format!(
+        "{BACKUP_LOCATOR_PREFIX}{}",
+        backup_name_for(before_sha256)?
+    ))
+}
+
+fn backup_path_for(backup_dir: &Path, before_sha256: &str) -> Result<PathBuf, ReplayFailure> {
+    Ok(backup_dir.join(backup_name_for(before_sha256)?))
+}
+
+fn diff_sha256(before: &[u8], after: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(DIFF_HASH_DOMAIN);
+    hash_part(&mut digest, b"before");
+    hash_part(&mut digest, before);
+    hash_part(&mut digest, b"after");
+    hash_part(&mut digest, after);
+    format!("sha256:{:x}", digest.finalize())
+}
+
 fn compute_plan_hash(staged: &StagedFixtureRepair) -> String {
     let mut digest = Sha256::new();
     digest.update(PLAN_HASH_DOMAIN);
@@ -1226,10 +2345,17 @@ fn compute_plan_hash(staged: &StagedFixtureRepair) -> String {
     hash_part(&mut digest, staged.action_id.as_bytes());
     hash_part(&mut digest, b"resourceId");
     hash_part(&mut digest, staged.resource_id.as_bytes());
-    hash_part(&mut digest, b"evidenceIds");
-    digest.update((staged.evidence_ids.len() as u64).to_be_bytes());
-    for evidence_id in &staged.evidence_ids {
-        hash_part(&mut digest, evidence_id.as_bytes());
+    hash_part(&mut digest, b"diagnosisSha256");
+    hash_part(&mut digest, staged.diagnosis_sha256.as_bytes());
+    hash_part(&mut digest, b"findingId");
+    hash_part(&mut digest, staged.finding_id.as_bytes());
+    hash_part(&mut digest, b"findingVersion");
+    digest.update(u64::from(staged.finding_version).to_be_bytes());
+    hash_part(&mut digest, b"evidence");
+    digest.update((staged.evidence.len() as u64).to_be_bytes());
+    for binding in &staged.evidence {
+        hash_part(&mut digest, binding.id.as_bytes());
+        hash_part(&mut digest, binding.sha256.as_bytes());
     }
     hash_part(&mut digest, b"targetSnapshot");
     hash_part(&mut digest, staged.target_snapshot.as_bytes());
@@ -1237,6 +2363,10 @@ fn compute_plan_hash(staged: &StagedFixtureRepair) -> String {
     hash_part(&mut digest, staged.expected_before_sha256.as_bytes());
     hash_part(&mut digest, b"expectedAfterSha256");
     hash_part(&mut digest, staged.expected_after_sha256.as_bytes());
+    hash_part(&mut digest, b"diffSha256");
+    hash_part(&mut digest, staged.diff_sha256.as_bytes());
+    hash_part(&mut digest, b"backupLocator");
+    hash_part(&mut digest, staged.backup_locator.as_bytes());
     hash_part(&mut digest, b"risk");
     hash_part(&mut digest, RISK.as_bytes());
     hash_part(&mut digest, b"backup");
@@ -1245,6 +2375,51 @@ fn compute_plan_hash(staged: &StagedFixtureRepair) -> String {
     hash_part(&mut digest, VALIDATION_DECLARATION.as_bytes());
     hash_part(&mut digest, b"rollback");
     hash_part(&mut digest, ROLLBACK_DECLARATION.as_bytes());
+    format!("sha256:{:x}", digest.finalize())
+}
+
+fn compute_rollback_plan_hash(staged: &StagedFixtureRollback) -> String {
+    let mut digest = Sha256::new();
+    digest.update(ROLLBACK_PLAN_HASH_DOMAIN);
+    for (label, value) in [
+        (b"sessionId".as_slice(), staged.session_id.as_bytes()),
+        (b"planId".as_slice(), staged.plan_id.as_bytes()),
+        (
+            b"repairApprovalId".as_slice(),
+            staged.repair_approval_id.as_bytes(),
+        ),
+        (
+            b"repairPlanHash".as_slice(),
+            staged.repair_plan_hash.as_bytes(),
+        ),
+        (b"actionId".as_slice(), FIXTURE_ROLLBACK_ID.as_bytes()),
+        (b"resourceId".as_slice(), staged.resource_id.as_bytes()),
+        (
+            b"targetSnapshot".as_slice(),
+            staged.target_snapshot.as_bytes(),
+        ),
+        (
+            b"installedSha256".as_slice(),
+            staged.installed_sha256.as_bytes(),
+        ),
+        (
+            b"restoredSha256".as_slice(),
+            staged.restored_sha256.as_bytes(),
+        ),
+        (
+            b"backupLocator".as_slice(),
+            staged.backup_locator.as_bytes(),
+        ),
+        (b"backupSha256".as_slice(), staged.backup_sha256.as_bytes()),
+        (b"risk".as_slice(), RISK.as_bytes()),
+        (
+            b"validation".as_slice(),
+            ROLLBACK_VALIDATION_DECLARATION.as_bytes(),
+        ),
+    ] {
+        hash_part(&mut digest, label);
+        hash_part(&mut digest, value);
+    }
     format!("sha256:{:x}", digest.finalize())
 }
 
@@ -1290,10 +2465,15 @@ fn anchor_from_entry(journal_id: [u8; 16], entry: &JournalEntry) -> JournalAncho
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kernaid_linux_pack::diagnostics::{
+        DiagnosticReport, EvidenceInput, LinuxP0Inputs, diagnose_linux_p0,
+    };
     use kernaid_storage::{JOURNAL_KEY_BYTES, JournalKey, SecretStoreError};
-    use serde_json::json;
     use std::{
-        env, process,
+        collections::BTreeSet,
+        env,
+        os::unix::fs::{MetadataExt, PermissionsExt},
+        process,
         sync::{
             Arc, Mutex,
             atomic::{AtomicU64, Ordering},
@@ -1302,7 +2482,29 @@ mod tests {
     use zeroize::Zeroizing;
 
     static NEXT: AtomicU64 = AtomicU64::new(1);
-    const BROKEN_FSTAB: &[u8] = b"# test\nUUID=missing-data /mnt/data ext4 defaults 0 2\n";
+    const BROKEN_FSTAB: &[u8] = include_bytes!(
+        "../../../packs/linux/fixtures/repair/fstab-missing-device-v1/root/etc/fstab"
+    );
+    const DISPOSABLE_MARKER: &[u8] = include_bytes!(
+        "../../../packs/linux/fixtures/repair/fstab-missing-device-v1/root/.kernaid-disposable-fixture"
+    );
+    const HEALTHY_LSBLK: &[u8] =
+        include_bytes!("../../../packs/linux/fixtures/diagnostics/healthy/lsblk.json");
+    const HEALTHY_READ_ONLY_MOUNTS: &[u8] =
+        include_bytes!("../../../packs/linux/fixtures/diagnostics/healthy/findmnt-read-only.json");
+    const HEALTHY_FAILED: &[u8] =
+        include_bytes!("../../../packs/linux/fixtures/diagnostics/healthy/systemctl-failed.txt");
+    const HEALTHY_UNIT_STATE: &[u8] = include_bytes!(
+        "../../../packs/linux/fixtures/diagnostics/healthy/systemctl-unit-state.txt"
+    );
+    const HEALTHY_DF: &[u8] =
+        include_bytes!("../../../packs/linux/fixtures/diagnostics/healthy/df.txt");
+    const HEALTHY_LINK: &[u8] =
+        include_bytes!("../../../packs/linux/fixtures/diagnostics/healthy/ip-link.json");
+    const HEALTHY_ROUTE: &[u8] =
+        include_bytes!("../../../packs/linux/fixtures/diagnostics/healthy/ip-route.json");
+    const HEALTHY_DPKG: &[u8] =
+        include_bytes!("../../../packs/linux/fixtures/diagnostics/healthy/dpkg-audit.txt");
 
     #[derive(Default)]
     struct MemorySecretState {
@@ -1368,7 +2570,7 @@ mod tests {
             fs::create_dir_all(root.join("backup")).expect("create backup fixture");
             fs::write(
                 root.join("target/.kernaid-disposable-fixture"),
-                b"KERNAID_DISPOSABLE_FIXTURE_V1\n",
+                DISPOSABLE_MARKER,
             )
             .expect("write fixture marker");
             fs::write(root.join("target/etc/fstab"), BROKEN_FSTAB).expect("write fixture fstab");
@@ -1402,30 +2604,98 @@ mod tests {
         }
     }
 
-    fn action_input(tree: &TestTree, evidence: &[String]) -> Vec<u8> {
-        let preview = preview_missing_fstab_device(&tree.target(), evidence)
-            .expect("preview fixture for action input");
-        serde_json::to_vec(&json!({
-            "resourceId": FIXTURE_RESOURCE_ID,
-            "expectedBeforeSha256": preview.target_content_fingerprint,
-            "expectedAfterSha256": sha256_bytes(preview.after.as_bytes()),
-        }))
-        .expect("serialize action input")
+    fn evidence_bindings() -> Vec<FixtureEvidenceBinding> {
+        vec![
+            FixtureEvidenceBinding::new("E-001", sha256_bytes(b"fstab evidence"))
+                .expect("valid evidence binding"),
+            FixtureEvidenceBinding::new("E-002", sha256_bytes(b"block evidence"))
+                .expect("valid evidence binding"),
+        ]
+    }
+
+    fn diagnostic_report(fstab: &[u8]) -> DiagnosticReport {
+        let evidence = |id, body| EvidenceInput { id, body };
+        diagnose_linux_p0(LinuxP0Inputs {
+            lsblk_json: evidence("E-LINUX-LSBLK", HEALTHY_LSBLK),
+            read_only_mounts_json: evidence("E-LINUX-MOUNTS-READ-ONLY", HEALTHY_READ_ONLY_MOUNTS),
+            systemctl_failed: evidence("E-LINUX-SYSTEMD-FAILED", HEALTHY_FAILED),
+            systemctl_unit_state: evidence("E-LINUX-SYSTEMD-STATE", HEALTHY_UNIT_STATE),
+            fstab: evidence("E-LINUX-FSTAB", fstab),
+            df: evidence("E-LINUX-DF", HEALTHY_DF),
+            ip_link_json: evidence("E-LINUX-IP-LINK", HEALTHY_LINK),
+            ip_route_json: evidence("E-LINUX-IP-ROUTE", HEALTHY_ROUTE),
+            dpkg_audit: evidence("E-LINUX-DPKG", HEALTHY_DPKG),
+        })
+        .expect("diagnose coherent fixture")
+    }
+
+    fn contains_fixture_finding(report: &DiagnosticReport) -> bool {
+        report
+            .findings
+            .iter()
+            .any(|finding| finding.rule_id == FINDING_ID && finding.rule_version == 2)
+    }
+
+    fn diagnostic_bindings() -> Vec<FixtureEvidenceBinding> {
+        vec![
+            FixtureEvidenceBinding::new("E-LINUX-FSTAB", sha256_bytes(BROKEN_FSTAB))
+                .expect("fstab evidence binding"),
+            FixtureEvidenceBinding::new("E-LINUX-LSBLK", sha256_bytes(HEALTHY_LSBLK))
+                .expect("lsblk evidence binding"),
+        ]
+    }
+
+    fn assert_required_key_parity(value: &serde_json::Value, required: &serde_json::Value) {
+        let actual = value
+            .as_object()
+            .expect("strict payload object")
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let declared = required
+            .as_array()
+            .expect("schema required array")
+            .iter()
+            .map(|key| key.as_str().expect("schema key"))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual, declared);
+    }
+
+    fn file_metadata(path: &Path) -> (u32, u32, u32) {
+        let metadata = fs::metadata(path).expect("read fixture metadata");
+        (metadata.mode() & 0o7777, metadata.uid(), metadata.gid())
+    }
+
+    fn assert_signed_report_value_rejected(
+        identity: &DeviceIdentity,
+        public_key: &[u8; 32],
+        journal_sequence: u64,
+        value: &serde_json::Value,
+    ) {
+        let bytes = serde_json::to_vec(value).expect("serialize invalid report value");
+        let envelope = identity
+            .sign_report_envelope(&bytes, REPORT_MEDIA_TYPE, journal_sequence, &[0x62; 32])
+            .expect("sign invalid report value");
+        assert_eq!(
+            SignedFixtureRepairReport { envelope }.verify(public_key),
+            Err(FixtureRepairError::InvalidReceipt)
+        );
     }
 
     fn stage<'a, Store: JournalSecretStore>(
         broker: &FixtureRepairBroker<'a, Store>,
-        tree: &TestTree,
+        _tree: &TestTree,
     ) -> StagedFixtureRepair {
-        let evidence = vec!["E-001".to_owned(), "E-002".to_owned()];
-        let input = action_input(tree, &evidence);
+        let evidence = evidence_bindings();
         broker
             .stage(StageFixtureRepairRequest {
                 session_id: "S-fixture",
                 plan_id: "P-fixture",
                 action_id: FIXTURE_ACTION_ID,
-                contract_input: &input,
-                evidence_ids: &evidence,
+                diagnosis_sha256: &sha256_bytes(b"diagnosis with KA-LNX-P0-003"),
+                finding_id: FINDING_ID,
+                finding_version: FINDING_VERSION,
+                evidence: &evidence,
             })
             .expect("stage fixture repair")
     }
@@ -1436,6 +2706,21 @@ mod tests {
         approval_sequence: u64,
     ) -> FixtureRepairApproval<'a> {
         FixtureRepairApproval {
+            approval_id,
+            approval_sequence,
+            session_id: staged.session_id(),
+            plan_id: staged.plan_id(),
+            plan_hash: staged.plan_hash(),
+            target_snapshot: staged.target_snapshot(),
+        }
+    }
+
+    fn rollback_approval<'a>(
+        staged: &'a StagedFixtureRollback,
+        approval_id: &'a str,
+        approval_sequence: u64,
+    ) -> FixtureRollbackApproval<'a> {
+        FixtureRollbackApproval {
             approval_id,
             approval_sequence,
             session_id: staged.session_id(),
@@ -1525,6 +2810,365 @@ mod tests {
     }
 
     #[test]
+    fn coherent_fixture_runs_diagnosis_repair_verify_rollback_and_signed_report() {
+        let tree = TestTree::new("diagnosis-repair-rollback");
+        fs::set_permissions(tree.fstab(), fs::Permissions::from_mode(0o640))
+            .expect("set checked fixture mode");
+        let expected_metadata = file_metadata(&tree.fstab());
+        assert_eq!(expected_metadata.0, 0o640);
+        let original = fs::read(tree.fstab()).expect("read checked fixture copy");
+        assert_eq!(original, BROKEN_FSTAB);
+        let diagnosis_before = diagnostic_report(&original);
+        assert!(contains_fixture_finding(&diagnosis_before));
+        let finding = diagnosis_before
+            .findings
+            .iter()
+            .find(|finding| finding.rule_id == FINDING_ID)
+            .expect("fixture finding");
+        assert_eq!(finding.evidence_ids, vec!["E-LINUX-FSTAB", "E-LINUX-LSBLK"]);
+
+        let diagnosis_sha256 = sha256_bytes(
+            &serde_json::to_vec(&diagnosis_before).expect("serialize deterministic diagnosis"),
+        );
+        let evidence = diagnostic_bindings();
+        let store = MemorySecretStore::default();
+        let identity = DeviceIdentity::from_seed(&[0x61; 32]).expect("test identity");
+        let public_key = identity.public_key();
+        let mut journal =
+            SecureJournal::open(&tree.journal(), store.clone()).expect("open journal");
+        let final_envelope;
+        {
+            let mut broker = FixtureRepairBroker::attach(tree.config(), &mut journal, &identity)
+                .expect("attach broker");
+            let staged = broker
+                .stage(StageFixtureRepairRequest {
+                    session_id: "S-e2e",
+                    plan_id: "P-repair",
+                    action_id: FIXTURE_ACTION_ID,
+                    diagnosis_sha256: &diagnosis_sha256,
+                    finding_id: FINDING_ID,
+                    finding_version: 2,
+                    evidence: &evidence,
+                })
+                .expect("stage diagnosis-bound repair");
+            assert_eq!(staged.diagnosis_sha256(), diagnosis_sha256);
+            assert_eq!(staged.finding_id(), FINDING_ID);
+            assert_eq!(staged.finding_version(), 2);
+            assert_eq!(staged.evidence(), evidence);
+            assert_eq!(staged.risk(), FixtureRepairRisk::R2);
+            assert!(staged.backup_locator().starts_with(BACKUP_LOCATOR_PREFIX));
+            assert_ne!(staged.diff_sha256(), staged.expected_before_sha256());
+
+            let repair_receipt = broker
+                .execute(&staged, approval(&staged, "A-repair", 1))
+                .expect("execute approved repair");
+            let verified_repair = repair_receipt
+                .verify(&public_key)
+                .expect("verify repair receipt");
+            assert_eq!(verified_repair.diagnosis_sha256(), diagnosis_sha256);
+            assert_eq!(verified_repair.evidence(), evidence);
+            assert_eq!(verified_repair.diff_sha256(), staged.diff_sha256());
+            assert_eq!(verified_repair.backup_locator(), staged.backup_locator());
+            assert_eq!(
+                (
+                    verified_repair.before_mode,
+                    verified_repair.before_uid,
+                    verified_repair.before_gid,
+                ),
+                expected_metadata
+            );
+
+            let repaired = fs::read(tree.fstab()).expect("read repaired fixture");
+            assert!(!contains_fixture_finding(&diagnostic_report(&repaired)));
+            assert_eq!(file_metadata(&tree.fstab()), expected_metadata);
+
+            let rollback = broker
+                .stage_rollback(StageFixtureRollbackRequest {
+                    session_id: "S-e2e",
+                    plan_id: "P-rollback",
+                    repair_approval_id: "A-repair",
+                })
+                .expect("stage journal-bound rollback");
+            assert_eq!(rollback.action_id(), FIXTURE_ROLLBACK_ID);
+            assert_eq!(rollback.risk(), FixtureRepairRisk::R2);
+            assert_eq!(rollback.installed_sha256(), staged.expected_after_sha256());
+            assert_eq!(rollback.restored_sha256(), staged.expected_before_sha256());
+            assert_eq!(rollback.backup_locator(), staged.backup_locator());
+
+            let report = broker
+                .execute_rollback(&rollback, rollback_approval(&rollback, "A-rollback", 2))
+                .expect("execute approved rollback");
+            let verified = report.verify(&public_key).expect("verify final report");
+            assert_eq!(verified.final_state(), "rolled-back");
+            assert_eq!(verified.journal_sequence(), 5);
+            assert_eq!(verified.repair().plan_hash(), staged.plan_hash());
+            assert_eq!(verified.rollback_plan_hash(), rollback.plan_hash());
+            assert_eq!(verified.rollback_approval_id(), "A-rollback");
+            assert_eq!(verified.restored_sha256(), staged.expected_before_sha256());
+            let report_value = serde_json::to_value(&verified).expect("serialize report value");
+            let report_schema: serde_json::Value =
+                serde_json::from_str(FIXTURE_REPAIR_REPORT_SCHEMA_JSON)
+                    .expect("parse report schema");
+            assert_required_key_parity(&report_value, &report_schema["required"]);
+            assert_required_key_parity(
+                &report_value["repair"],
+                &report_schema["$defs"]["repair"]["required"],
+            );
+            assert_required_key_parity(
+                &report_value["rollback"],
+                &report_schema["$defs"]["rollback"]["required"],
+            );
+            let mut impossible = report_value.clone();
+            impossible
+                .as_object_mut()
+                .expect("report object")
+                .insert("unknownField".to_owned(), serde_json::Value::Bool(true));
+            assert_signed_report_value_rejected(
+                &identity,
+                &public_key,
+                verified.journal_sequence(),
+                &impossible,
+            );
+
+            for field in ["validation", "rollback"] {
+                let mut wrong_declaration = report_value.clone();
+                wrong_declaration["repair"][field] =
+                    serde_json::Value::String("not-the-pinned-declaration".to_owned());
+                assert_signed_report_value_rejected(
+                    &identity,
+                    &public_key,
+                    verified.journal_sequence(),
+                    &wrong_declaration,
+                );
+            }
+            for field in ["beforeUid", "beforeGid"] {
+                let mut out_of_range_identity = report_value.clone();
+                out_of_range_identity["repair"][field] =
+                    serde_json::Value::from(u64::from(u32::MAX) + 1);
+                assert_signed_report_value_rejected(
+                    &identity,
+                    &public_key,
+                    verified.journal_sequence(),
+                    &out_of_range_identity,
+                );
+            }
+            let mut duplicate_binding = report_value.clone();
+            let duplicate = duplicate_binding["repair"]["evidence"][0].clone();
+            duplicate_binding["repair"]["evidence"]
+                .as_array_mut()
+                .expect("evidence array")
+                .insert(1, duplicate);
+            assert_signed_report_value_rejected(
+                &identity,
+                &public_key,
+                verified.journal_sequence(),
+                &duplicate_binding,
+            );
+
+            let mut duplicate_semantic_id = report_value.clone();
+            let mut same_id_different_hash = duplicate_semantic_id["repair"]["evidence"][0].clone();
+            same_id_different_hash["sha256"] = serde_json::Value::String(sha256_bytes(
+                b"different bytes under the same semantic evidence id",
+            ));
+            duplicate_semantic_id["repair"]["evidence"]
+                .as_array_mut()
+                .expect("evidence array")
+                .insert(1, same_id_different_hash);
+            assert_signed_report_value_rejected(
+                &identity,
+                &public_key,
+                verified.journal_sequence(),
+                &duplicate_semantic_id,
+            );
+            final_envelope = report.envelope().clone();
+        }
+
+        let restored = fs::read(tree.fstab()).expect("read restored fixture");
+        assert_eq!(
+            restored, original,
+            "rollback must restore exact fixture bytes"
+        );
+        assert_eq!(file_metadata(&tree.fstab()), expected_metadata);
+        assert!(contains_fixture_finding(&diagnostic_report(&restored)));
+        let events = decode_events(&mut journal);
+        assert!(matches!(
+            events.as_slice(),
+            [
+                JournalEvent::DeviceBound(_),
+                JournalEvent::Intent(_),
+                JournalEvent::Completed(_),
+                JournalEvent::RollbackIntent(_),
+                JournalEvent::RolledBack(_),
+            ]
+        ));
+        drop(journal);
+
+        let mut reopened = SecureJournal::open(&tree.journal(), store).expect("reopen journal");
+        let mut broker = FixtureRepairBroker::attach(tree.config(), &mut reopened, &identity)
+            .expect("replay complete cycle");
+        assert_eq!(broker.next_approval_sequence(), Ok(3));
+        let reissued = broker
+            .reissue_completed_report("A-repair")
+            .expect("reissue final report");
+        assert_eq!(reissued.envelope(), &final_envelope);
+        reissued
+            .verify(&public_key)
+            .expect("verify replayed report");
+    }
+
+    #[test]
+    fn rollback_tamper_and_invalid_approval_fail_before_intent() {
+        let tree = TestTree::new("rollback-pre-intent-rejections");
+        let store = MemorySecretStore::default();
+        let identity = DeviceIdentity::from_seed(&[0x63; 32]).expect("test identity");
+        let mut journal = SecureJournal::open(&tree.journal(), store).expect("open journal");
+        let mut broker = FixtureRepairBroker::attach(tree.config(), &mut journal, &identity)
+            .expect("attach broker");
+        let repair_plan = stage(&broker, &tree);
+        broker
+            .execute(&repair_plan, approval(&repair_plan, "A-repair", 1))
+            .expect("execute repair");
+        let rollback = broker
+            .stage_rollback(StageFixtureRollbackRequest {
+                session_id: "S-fixture",
+                plan_id: "P-rollback",
+                repair_approval_id: "A-repair",
+            })
+            .expect("stage rollback");
+        let completed_head = broker.head;
+
+        assert_eq!(
+            broker.execute_rollback(
+                &rollback,
+                rollback_approval(&rollback, "A-wrong-sequence", 3),
+            ),
+            Err(FixtureRepairError::NonMonotonicApproval)
+        );
+        let wrong_hash = FixtureRollbackApproval {
+            plan_hash: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ..rollback_approval(&rollback, "A-wrong-hash", 2)
+        };
+        assert_eq!(
+            broker.execute_rollback(&rollback, wrong_hash),
+            Err(FixtureRepairError::ApprovalMismatch)
+        );
+        assert_eq!(broker.head, completed_head);
+
+        let external = b"# external edit after repair\nUUID=other / ext4 defaults 0 1\n";
+        fs::write(tree.fstab(), external).expect("make rollback target stale");
+        assert_eq!(
+            broker.execute_rollback(
+                &rollback,
+                rollback_approval(&rollback, "A-stale-rollback", 2),
+            ),
+            Err(FixtureRepairError::StaleTarget)
+        );
+        assert_eq!(broker.head, completed_head);
+        assert_eq!(
+            fs::read(tree.fstab()).expect("read external state"),
+            external
+        );
+    }
+
+    #[test]
+    fn tampered_backup_blocks_rollback_staging_without_journal_write() {
+        let tree = TestTree::new("rollback-backup-tamper");
+        let store = MemorySecretStore::default();
+        let identity = DeviceIdentity::from_seed(&[0x64; 32]).expect("test identity");
+        let mut journal = SecureJournal::open(&tree.journal(), store).expect("open journal");
+        let mut broker = FixtureRepairBroker::attach(tree.config(), &mut journal, &identity)
+            .expect("attach broker");
+        let repair_plan = stage(&broker, &tree);
+        broker
+            .execute(&repair_plan, approval(&repair_plan, "A-repair", 1))
+            .expect("execute repair");
+        let completed_head = broker.head;
+        let repaired = fs::read(tree.fstab()).expect("read repaired target");
+        let backup_path = backup_path_for(&tree.backup(), repair_plan.expected_before_sha256())
+            .expect("derive trusted backup path");
+        fs::write(backup_path, b"tampered backup").expect("tamper backup fixture");
+        assert_eq!(
+            broker.stage_rollback(StageFixtureRollbackRequest {
+                session_id: "S-fixture",
+                plan_id: "P-rollback",
+                repair_approval_id: "A-repair",
+            }),
+            Err(FixtureRepairError::StaleTarget)
+        );
+        assert_eq!(broker.head, completed_head);
+        assert_eq!(
+            fs::read(tree.fstab()).expect("read unchanged repair"),
+            repaired
+        );
+    }
+
+    #[test]
+    fn dangling_rollback_intent_gets_durable_recovery_and_blocks_reopen() {
+        let tree = TestTree::new("dangling-rollback");
+        let store = MemorySecretStore::default();
+        let identity = DeviceIdentity::from_seed(&[0x65; 32]).expect("test identity");
+        let mut journal =
+            SecureJournal::open(&tree.journal(), store.clone()).expect("open journal");
+        let repaired;
+        {
+            let mut broker = FixtureRepairBroker::attach(tree.config(), &mut journal, &identity)
+                .expect("attach broker");
+            let repair_plan = stage(&broker, &tree);
+            broker
+                .execute(&repair_plan, approval(&repair_plan, "A-repair", 1))
+                .expect("execute repair");
+            let rollback = broker
+                .stage_rollback(StageFixtureRollbackRequest {
+                    session_id: "S-fixture",
+                    plan_id: "P-rollback",
+                    repair_approval_id: "A-repair",
+                })
+                .expect("stage rollback");
+            let repair_payload = broker
+                .completed_receipts
+                .get("A-repair")
+                .expect("completed repair")
+                .payload
+                .clone();
+            broker
+                .append_rollback_intent(
+                    &rollback,
+                    &rollback_approval(&rollback, "A-rollback", 2),
+                    &repair_payload,
+                )
+                .expect("append rollback intent without mutation");
+            repaired = fs::read(tree.fstab()).expect("read repaired target");
+        }
+        drop(journal);
+
+        let mut reopened =
+            SecureJournal::open(&tree.journal(), store.clone()).expect("reopen journal");
+        let broker = FixtureRepairBroker::attach(tree.config(), &mut reopened, &identity)
+            .expect("attach records rollback recovery");
+        assert!(broker.is_mutation_blocked());
+        assert_eq!(fs::read(tree.fstab()).expect("read target"), repaired);
+        drop(broker);
+        let events = decode_events(&mut reopened);
+        assert!(matches!(
+            events.as_slice(),
+            [
+                JournalEvent::DeviceBound(_),
+                JournalEvent::Intent(_),
+                JournalEvent::Completed(_),
+                JournalEvent::RollbackIntent(_),
+                JournalEvent::Recovery(_),
+            ]
+        ));
+        drop(reopened);
+
+        let mut again =
+            SecureJournal::open(&tree.journal(), store).expect("reopen blocked journal");
+        let broker = FixtureRepairBroker::attach(tree.config(), &mut again, &identity)
+            .expect("reattach blocked broker");
+        assert!(broker.is_mutation_blocked());
+    }
+
+    #[test]
     fn signed_receipt_rejects_broker_impossible_approval_sequence() {
         let tree = TestTree::new("impossible-receipt-sequence");
         let store = MemorySecretStore::default();
@@ -1571,20 +3215,25 @@ mod tests {
             .expect("attach broker");
         let binding_head = broker.head;
         let before = fs::read(tree.fstab()).expect("read fixture before");
-        let evidence = vec!["E-001".to_owned()];
+        let evidence = evidence_bindings();
         assert_eq!(
             broker.stage(StageFixtureRepairRequest {
                 session_id: "S-fixture",
                 plan_id: "P-fixture",
                 action_id: FIXTURE_ACTION_ID,
-                contract_input: br#"{"resourceId":"fixture:linux-fstab-v1","command":"id"}"#,
-                evidence_ids: &evidence,
+                diagnosis_sha256: "not-a-digest",
+                finding_id: FINDING_ID,
+                finding_version: FINDING_VERSION,
+                evidence: &evidence,
             }),
             Err(FixtureRepairError::InvalidStage)
         );
-        let valid_input = action_input(&tree, &evidence);
-        let wrong_evidence = vec!["A-cross-domain".to_owned()];
-        for (session_id, plan_id, evidence_ids) in [
+        let diagnosis = sha256_bytes(b"diagnosis with KA-LNX-P0-003");
+        let wrong_evidence = vec![FixtureEvidenceBinding {
+            id: "A-cross-domain".to_owned(),
+            sha256: sha256_bytes(b"wrong evidence"),
+        }];
+        for (session_id, plan_id, evidence) in [
             ("A-cross-domain", "P-fixture", evidence.as_slice()),
             ("S-fixture", "E-cross-domain", evidence.as_slice()),
             ("S-fixture", "P-fixture", wrong_evidence.as_slice()),
@@ -1594,20 +3243,27 @@ mod tests {
                     session_id,
                     plan_id,
                     action_id: FIXTURE_ACTION_ID,
-                    contract_input: &valid_input,
-                    evidence_ids,
+                    diagnosis_sha256: &diagnosis,
+                    finding_id: FINDING_ID,
+                    finding_version: FINDING_VERSION,
+                    evidence,
                 }),
                 Err(FixtureRepairError::InvalidStage)
             );
         }
-        let oversized_evidence = vec![format!("E-{}", "a".repeat(MAX_ID_BYTES))];
+        let oversized_evidence = vec![FixtureEvidenceBinding {
+            id: format!("E-{}", "a".repeat(MAX_ID_BYTES)),
+            sha256: sha256_bytes(b"oversized evidence id"),
+        }];
         assert_eq!(
             broker.stage(StageFixtureRepairRequest {
                 session_id: "S-fixture",
                 plan_id: "P-fixture",
                 action_id: FIXTURE_ACTION_ID,
-                contract_input: &valid_input,
-                evidence_ids: &oversized_evidence,
+                diagnosis_sha256: &diagnosis,
+                finding_id: FINDING_ID,
+                finding_version: FINDING_VERSION,
+                evidence: &oversized_evidence,
             }),
             Err(FixtureRepairError::InvalidStage)
         );
@@ -1642,6 +3298,71 @@ mod tests {
         assert_eq!(
             fs::read(tree.fstab()).expect("read unchanged fixture"),
             before
+        );
+    }
+
+    #[test]
+    fn plan_hash_binds_diagnosis_evidence_diff_and_backup_locator() {
+        let tree = TestTree::new("plan-bindings");
+        let store = MemorySecretStore::default();
+        let identity = DeviceIdentity::from_seed(&[0x66; 32]).expect("test identity");
+        let mut journal = SecureJournal::open(&tree.journal(), store).expect("open journal");
+        let broker = FixtureRepairBroker::attach(tree.config(), &mut journal, &identity)
+            .expect("attach broker");
+        let staged = stage(&broker, &tree);
+
+        let mut diagnosis_tamper = staged.clone();
+        diagnosis_tamper.diagnosis_sha256 = sha256_bytes(b"different diagnosis");
+        assert_ne!(compute_plan_hash(&diagnosis_tamper), staged.plan_hash());
+
+        let mut evidence_tamper = staged.clone();
+        evidence_tamper.evidence[0].sha256 = sha256_bytes(b"different evidence");
+        assert_ne!(compute_plan_hash(&evidence_tamper), staged.plan_hash());
+
+        let mut diff_tamper = staged.clone();
+        diff_tamper.diff_sha256 = sha256_bytes(b"different diff");
+        assert_ne!(compute_plan_hash(&diff_tamper), staged.plan_hash());
+
+        let mut locator_tamper = staged.clone();
+        locator_tamper.backup_locator =
+            "fixture-lab-backup://linux-fstab/fstab-aaaaaaaaaaaaaaaa.bak".to_owned();
+        assert_ne!(compute_plan_hash(&locator_tamper), staged.plan_hash());
+    }
+
+    #[test]
+    fn checked_report_schema_is_closed_and_matches_pinned_contract() {
+        let schema: serde_json::Value = serde_json::from_str(FIXTURE_REPAIR_REPORT_SCHEMA_JSON)
+            .expect("parse checked report schema");
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(
+            schema["properties"]["apiVersion"]["const"],
+            REPORT_API_VERSION
+        );
+        assert_eq!(schema["properties"]["kind"]["const"], REPORT_KIND);
+        assert_eq!(schema["$defs"]["repair"]["additionalProperties"], false);
+        let repair_properties = &schema["$defs"]["repair"]["properties"];
+        assert_eq!(repair_properties["findingId"]["const"], FINDING_ID);
+        assert_eq!(
+            repair_properties["findingVersion"]["const"],
+            FINDING_VERSION
+        );
+        assert_eq!(
+            repair_properties["validation"]["const"],
+            VALIDATION_DECLARATION
+        );
+        assert_eq!(repair_properties["rollback"]["const"], ROLLBACK_DECLARATION);
+        assert_eq!(repair_properties["beforeUid"]["maximum"], u32::MAX);
+        assert_eq!(repair_properties["beforeGid"]["maximum"], u32::MAX);
+        assert_eq!(repair_properties["evidence"]["uniqueItems"], true);
+        assert!(
+            repair_properties["evidence"]["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("semantically unique"))
+        );
+        assert_eq!(schema["$defs"]["rollback"]["additionalProperties"], false);
+        assert_eq!(
+            schema["$defs"]["rollback"]["properties"]["actionId"]["const"],
+            FIXTURE_ROLLBACK_ID
         );
     }
 
@@ -1703,13 +3424,25 @@ mod tests {
             plan_id: "P-next".to_owned(),
             action_id: FIXTURE_ACTION_ID,
             resource_id: FIXTURE_RESOURCE_ID,
-            evidence_ids: vec!["E-003".to_owned()],
+            diagnosis_sha256:
+                "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
+            finding_id: FINDING_ID,
+            finding_version: FINDING_VERSION,
+            evidence: vec![FixtureEvidenceBinding {
+                id: "E-003".to_owned(),
+                sha256: "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                    .to_owned(),
+            }],
             target_snapshot:
                 "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
             expected_before_sha256:
                 "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
             expected_after_sha256:
                 "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_owned(),
+            diff_sha256: "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                .to_owned(),
+            backup_locator: "fixture-lab-backup://linux-fstab/fstab-bbbbbbbbbbbbbbbb.bak"
+                .to_owned(),
             plan_hash: String::new(),
         };
         let mut staged = staged;
@@ -1889,15 +3622,20 @@ mod tests {
             FixtureRepairError::ExecutionOutcomeUnknown,
             FixtureRepairError::ExecutionOutcomeUnknown
         );
-        let untrusted_evidence = vec![CALLER_CANARY.to_owned()];
+        let untrusted_evidence = vec![FixtureEvidenceBinding {
+            id: CALLER_CANARY.to_owned(),
+            sha256: CALLER_CANARY.to_owned(),
+        }];
         let caller_debug = format!(
             "{:?} {:?}",
             StageFixtureRepairRequest {
                 session_id: CALLER_CANARY,
                 plan_id: CALLER_CANARY,
                 action_id: CALLER_CANARY,
-                contract_input: CALLER_CANARY.as_bytes(),
-                evidence_ids: &untrusted_evidence,
+                diagnosis_sha256: CALLER_CANARY,
+                finding_id: CALLER_CANARY,
+                finding_version: 1,
+                evidence: &untrusted_evidence,
             },
             FixtureRepairApproval {
                 approval_id: CALLER_CANARY,
