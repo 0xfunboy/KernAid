@@ -25,6 +25,13 @@ const snapshotSha256 = readFileSync(
   ),
   "utf8",
 ).trim();
+const hardwareInventory = readFileSync(
+  new URL(
+    "../../../tests/fixtures/linux-hardware-inventory/healthy.v1.json",
+    import.meta.url,
+  ),
+  "utf8",
+);
 const linuxP0Collectors = [
   "linux.block.inventory",
   "linux.mounts.read-only",
@@ -471,8 +478,13 @@ test("unsupported multi-filesystem snapshots are rejected for Resident and Rescu
   }
 });
 
-test("production-shaped Resident corpus reaches the provider only when all 11 records are exact", async () => {
+test("production-shaped Resident corpus reaches the provider only when all 12 records are exact", async () => {
   let providerCalled = false;
+  const hardwareWithRedactionCanary = hardwareInventory.replace(
+    '"biosVendor":"Example BIOS"',
+    '"biosVendor":"OPENAI_API_KEY=hardware-canary-token"',
+  );
+  assert.notEqual(hardwareWithRedactionCanary, hardwareInventory);
   const provider: Provider = {
     capabilities: {
       streaming: false,
@@ -482,6 +494,10 @@ test("production-shaped Resident corpus reaches the provider only when all 11 re
     },
     async diagnose(_objective, evidence) {
       providerCalled = true;
+      const hardware = evidence.find(
+        (item) => item.evidence.collector === "linux.hardware.inventory",
+      );
+      assert.equal(hardware?.content, hardwareWithRedactionCanary);
       return {
         schemaVersion: "1.0",
         diagnosis: "Bound Linux snapshot admitted.",
@@ -512,6 +528,16 @@ test("production-shaped Resident corpus reaches the provider only when all 11 re
     target: "local-machine",
     observedContent: "production-hostname",
   });
+  const [hardwareEvidence] = await driver.requestEvidence(session.id, {
+    collector: "linux.hardware.inventory",
+    target: "local-machine",
+    contentType: "application/json",
+    observedContent: hardwareWithRedactionCanary,
+  });
+  assert.equal(
+    hardwareEvidence?.sha256,
+    createHash("sha256").update(hardwareWithRedactionCanary).digest("hex"),
+  );
   for (const collector of linuxP0Collectors)
     await driver.requestEvidence(session.id, {
       collector,

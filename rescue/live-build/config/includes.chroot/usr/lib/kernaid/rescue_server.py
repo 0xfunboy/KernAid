@@ -22,6 +22,10 @@ WEB_ROOT = "/opt/kernaid/desk"
 COMMANDS = (
     ("system.hostname", ("/usr/bin/hostname",)),
     (
+        "linux.hardware.inventory",
+        ("/usr/lib/kernaid/kernaid-linux-hardware-inventory",),
+    ),
+    (
         "linux.block.inventory",
         (
             "/usr/bin/lsblk",

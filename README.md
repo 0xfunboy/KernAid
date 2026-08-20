@@ -53,6 +53,12 @@ CI produces engineering-preview desktop installers for Windows, Linux, Intel mac
   `/boot/efi`), `/efi`, `/usr`, or `/var`, KernAid marks the corpus unsupported
   and blocks diagnosis; multi-mount parity is not claimed.
 - **Windows, Linux or macOS that does boot:** download that operating system's desktop artifact, install it, and launch KernAid like a normal application. Windows and macOS startup collect only a fast, derived target identity; the deeper P0 collection starts once when **Diagnostica** is selected. macOS queries only the current-user `launchd` table and safe-boot integer, and explicitly reports system `launchd`, software-update availability, system-event analysis, and login/background-item counts as unqualified instead of inventing results. The fixed commands do not request repairs, although native Windows tools such as DISM may still update their own operating-system logs.
+- **Linux machine inventory:** Resident and Rescue use the same bounded Rust
+  collector for CPU count/model, total RAM, firmware boot mode, selected public
+  DMI model fields, and normalized PCI/USB class/vendor/product IDs. It excludes
+  serial numbers, UUIDs, asset tags, bus addresses and arbitrary paths, and
+  reports each source as complete, partial, truncated, unavailable or invalid
+  instead of converting missing data into a healthy result.
 - **Optional Resident OpenAI reasoning:** configure the public
   `resident-default` profile from the hidden native TTY prompts of
   `kernaid-provider-key configure`, then explicitly select OpenAI in Desk. The
@@ -91,7 +97,17 @@ See the [operator guide](docs/operator-guide.md), [architecture](docs/architectu
   active physical writer does not provision that vault, and live TLS with a
   real account, physical-media qualification and the isolated Codex CLI bridge
   remain incomplete.
-- Native production host inventory is intentionally limited and has no mutation or repair handler; the opt-in fixture lab is not a production host path. Windows SFC is explicitly reported as `not-run-unqualified` until a locale-independent result adapter and physical qualification exist. macOS likewise leaves system-domain `launchd`, update freshness, incident counts, and login/background-item counts explicitly unqualified until observation-only sources are physically qualified. KernAid does not turn absent, stale or ambiguous data into a clean result.
+- Native production host inventory has no mutation or repair handler; the
+  opt-in fixture lab is not a production host path. The parameter-free Linux
+  hardware command, schema and packaging are virtually exercised, and the CI
+  gate requires complete core CPU/RAM facts. DMI/PCI/USB shapes have shared
+  fixture coverage, while physical hardware compatibility remains a release
+  gate. Windows SFC is explicitly reported as
+  `not-run-unqualified` until a locale-independent result adapter and physical
+  qualification exist. macOS likewise leaves system-domain `launchd`, update
+  freshness, incident counts, and login/background-item counts explicitly
+  unqualified until observation-only sources are physically qualified. KernAid
+  does not turn absent, stale or ambiguous data into a clean result.
 - Promotion of encrypted Rescue persistence to trusted physical media, Secure
   Boot, physical-machine validation and actual repair actions remain release
   gates.

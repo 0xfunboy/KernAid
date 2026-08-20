@@ -21,6 +21,10 @@ collector grants provider output access to the broker.
 - Provider diagnoses require evidence IDs.
 - Seeded API-shaped secrets are redacted.
 - Fixture file hashes are identical before and after Observe collection.
+- Linux Resident and Rescue expose one shared normalized CPU, RAM, firmware,
+  DMI, PCI and USB collector with per-source status and no serial, UUID, asset
+  tag, bus-address or caller-path fields. Its published schema is
+  `linux-hardware-inventory.schema.json`.
 
 ## Open release gates
 

@@ -615,6 +615,7 @@ class RescueOpenAiExecutorPackagingTests(unittest.TestCase):
         self.assertIn("systemctl enable kernaid-rescue-openai-egress.socket", hook)
         self.assertIn("/usr/lib/systemd/systemd-socket-proxyd", hook)
         self.assertIn("KERNAID_RESCUE_OPENAI_EXECUTOR_BINARY", build)
+        self.assertIn("KERNAID_LINUX_HARDWARE_INVENTORY_BINARY", build)
         self.assertIn('- "crates/rescue-openai-executor/**"', workflow)
         self.assertIn('- "crates/rescue-openai-provider/**"', workflow)
         self.assertIn(

@@ -19,6 +19,7 @@ import {
   nativeObservationContentType,
   nativeObservationSummary,
   parseNativeObservations,
+  parseLinuxHardwareInventory,
   parseRescueOfflineCorpus,
   parseRescueOfflineInspection,
   parseRescueTargetScan,
@@ -32,6 +33,7 @@ import {
   rescueOfflineEvidenceSummary,
   LINUX_NORMALIZED_SNAPSHOT_COLLECTOR,
   LINUX_P0_COLLECTORS,
+  type LinuxHardwareInventory,
   RESCUE_OFFLINE_EVIDENCE_COLLECTOR,
   RESCUE_OFFLINE_EVIDENCE_TARGET,
   RescueOfflineInspectionError,
@@ -112,6 +114,184 @@ test("native inventory requires explicit bounded truncation state", () => {
         },
       ]),
     /Inventario nativo non valido/,
+  );
+});
+
+const linuxHardwareInventory = JSON.parse(
+  readFileSync(
+    new URL(
+      "../../../tests/fixtures/linux-hardware-inventory/healthy.v1.json",
+      import.meta.url,
+    ),
+    "utf8",
+  ),
+) as LinuxHardwareInventory;
+
+test("Linux hardware inventory is strict, normalized, and privacy-reduced", () => {
+  const output = JSON.stringify(linuxHardwareInventory);
+  assert.deepEqual(parseLinuxHardwareInventory(output), linuxHardwareInventory);
+  assert.deepEqual(
+    parseLinuxHardwareInventory(`${output}\n`),
+    linuxHardwareInventory,
+  );
+  const unicodeOrder = {
+    ...linuxHardwareInventory,
+    cpu: {
+      ...linuxHardwareInventory.cpu,
+      models: ["\ue000", "\u{10000}"],
+    },
+  };
+  assert.deepEqual(
+    parseLinuxHardwareInventory(JSON.stringify(unicodeOrder)),
+    unicodeOrder,
+  );
+  const observation = {
+    collector: "linux.hardware.inventory",
+    trust: "observed-untrusted" as const,
+    output,
+    success: true,
+    truncated: false,
+  };
+  assert.deepEqual(parseNativeObservations([observation]), [observation]);
+  assert.equal(nativeObservationContentType(observation), "application/json");
+  for (const invalid of [
+    { ...linuxHardwareInventory, serial: "secret" },
+    {
+      ...linuxHardwareInventory,
+      cpu: { ...linuxHardwareInventory.cpu, logicalProcessors: 0 },
+    },
+    {
+      ...linuxHardwareInventory,
+      firmware: {
+        ...linuxHardwareInventory.firmware,
+        bootMode: "unknown",
+        dmi: { ...linuxHardwareInventory.firmware.dmi, biosVendor: null },
+      },
+    },
+    {
+      ...linuxHardwareInventory,
+      firmware: {
+        ...linuxHardwareInventory.firmware,
+        dmi: {
+          ...linuxHardwareInventory.firmware.dmi,
+          biosVendor: "invalid\u0000vendor",
+        },
+      },
+    },
+    {
+      ...linuxHardwareInventory,
+      firmware: {
+        ...linuxHardwareInventory.firmware,
+        dmi: {
+          ...linuxHardwareInventory.firmware.dmi,
+          biosVendor: "invalid\u0085vendor",
+        },
+      },
+    },
+    {
+      ...linuxHardwareInventory,
+      firmware: {
+        ...linuxHardwareInventory.firmware,
+        dmi: {
+          ...linuxHardwareInventory.firmware.dmi,
+          biosVendor: "invalid\ud800surrogate",
+        },
+      },
+    },
+    {
+      ...linuxHardwareInventory,
+      firmware: {
+        ...linuxHardwareInventory.firmware,
+        dmi: {
+          ...linuxHardwareInventory.firmware.dmi,
+          biosVendor: "invalid\ufeffbyte-order-mark",
+        },
+      },
+    },
+    {
+      ...linuxHardwareInventory,
+      firmware: {
+        ...linuxHardwareInventory.firmware,
+        dmi: {
+          ...linuxHardwareInventory.firmware.dmi,
+          biosVendor: "invalid\u202ebidirectional-control",
+        },
+      },
+    },
+    {
+      ...linuxHardwareInventory,
+      cpu: {
+        ...linuxHardwareInventory.cpu,
+        models: ["Invalid  double-space CPU"],
+      },
+    },
+    {
+      ...linuxHardwareInventory,
+      cpu: {
+        ...linuxHardwareInventory.cpu,
+        models: ["Invalid\u00a0space"],
+      },
+    },
+    {
+      ...linuxHardwareInventory,
+      cpu: {
+        ...linuxHardwareInventory.cpu,
+        models: ["\u{10000}", "\ue000"],
+      },
+    },
+    {
+      ...linuxHardwareInventory,
+      pci: {
+        ...linuxHardwareInventory.pci,
+        devices: [
+          {
+            class: "0x030000",
+            vendorId: "0x1234",
+            deviceId: "0x1111",
+            count: 1,
+            address: "0000:00:02.0",
+          },
+        ],
+      },
+    },
+    {
+      ...linuxHardwareInventory,
+      usb: {
+        ...linuxHardwareInventory.usb,
+        devices: [
+          {
+            class: "0x00",
+            vendorId: "0x1d6b",
+            productId: "0x0002",
+            count: 1,
+          },
+          {
+            class: "0x00",
+            vendorId: "0x1d6b",
+            productId: "0x0002",
+            count: 1,
+          },
+        ],
+      },
+    },
+  ])
+    assert.throws(
+      () => parseLinuxHardwareInventory(JSON.stringify(invalid)),
+      /Inventario hardware Linux non valido/,
+    );
+  assert.throws(
+    () =>
+      parseLinuxHardwareInventory(
+        output.replace(
+          '"schemaVersion":"1.0",',
+          '"schemaVersion":"1.0","schemaVersion":"1.0",',
+        ),
+      ),
+    /Inventario hardware Linux non valido/,
+  );
+  assert.throws(
+    () => parseLinuxHardwareInventory(` ${output}`),
+    /Inventario hardware Linux non valido/,
   );
 });
 
@@ -1709,6 +1889,22 @@ test("Resident Linux provider requires the exact local-machine corpus", async ()
       },
       content: "production-hostname",
     },
+    {
+      evidence: {
+        schemaVersion: "1.0" as const,
+        id: "E-HARDWARE",
+        collector: "linux.hardware.inventory",
+        target: "local-machine",
+        capturedAt: "2026-08-20T00:00:00.000Z",
+        contentType: "application/json",
+        sha256: "d".repeat(64),
+        sensitivity: "system" as const,
+        trust: "observed-untrusted" as const,
+        summary: "Comando di inventario completato",
+        blobRef: `sha256:${"d".repeat(64)}`,
+      },
+      content: JSON.stringify(linuxHardwareInventory),
+    },
     ...LINUX_P0_COLLECTORS.map((collector, index) => ({
       evidence: {
         schemaVersion: "1.0" as const,
@@ -1741,6 +1937,12 @@ test("Resident Linux provider requires the exact local-machine corpus", async ()
   ];
   const duplicateId = structuredClone(corpus);
   duplicateId[2]!.evidence.id = duplicateId[1]!.evidence.id;
+  const unavailableHardware = structuredClone(corpus);
+  unavailableHardware[2]!.evidence.contentType = "text/plain";
+  unavailableHardware[2]!.evidence.summary =
+    "Comando di inventario non disponibile";
+  unavailableHardware[2]!.content =
+    "collector unavailable: normalized hardware inventory did not complete safely";
   const provider = new PlatformOfflineRulesProvider();
   for (const invalid of [foreign, extra, duplicateId]) {
     const proposal = await provider.diagnose("Analizza", invalid);
@@ -1748,6 +1950,10 @@ test("Resident Linux provider requires the exact local-machine corpus", async ()
     assert.equal(proposal.confidence, 0.1);
     assert.ok(proposal.requestedEvidence.includes("linux.p0.corpus.exact.v1"));
   }
+  const unavailable = await provider.diagnose("Analizza", unavailableHardware);
+  assert.match(unavailable.diagnosis, /Diagnosi Linux incompleta/);
+  assert.equal(unavailable.confidence, 0.1);
+  assert.ok(unavailable.requestedEvidence.includes("linux.hardware.inventory"));
 });
 
 test("unsupported topology blocks Resident and Rescue providers before findings", async () => {

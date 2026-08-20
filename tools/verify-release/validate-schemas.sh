@@ -7,6 +7,7 @@ expected_schemas=(
   diagnosis-proposal.schema.json
   evidence.schema.json
   execution-event.schema.json
+  linux-hardware-inventory.schema.json
   linux-normalized-snapshot.schema.json
   rescue-openai-request.schema.json
   rescue-openai-response.schema.json

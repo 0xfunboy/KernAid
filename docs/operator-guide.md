@@ -51,8 +51,11 @@ physical validation item.
 2. Confirm that the selected target says `metadata-only`. If no candidate is
    safe to select, stop; do not mount or unlock it manually just to bypass the
    gate.
-3. Confirm that Storage, Boot and Network observations appear. Expand an
-   observation to inspect the raw, untrusted command output.
+3. Confirm that Hardware, Storage, Boot and Network observations appear. The
+   Linux hardware document contains normalized public facts and an explicit
+   status for CPU, memory, firmware/DMI, PCI and USB. It intentionally omits
+   serial numbers, UUIDs, asset tags and bus addresses. Expand other
+   observations only when the untrusted command output is needed for diagnosis.
 4. Describe the symptom and select **Diagnostica**. KernAid re-scans and binds
    the exact target again before it starts the session; a topology change
    cancels the selection.
@@ -90,6 +93,13 @@ Download the matching artifact from a successful `desktop` run:
 - macOS: `.dmg` for Apple silicon (`aarch64`) or Intel (`x64`).
 
 These engineering installers are not code-signed. Operating-system warnings are therefore expected, and production/customer distribution must wait for signed artifacts. Launch KernAid normally; the header says `Resident · Offline rules` and inventory is collected through a fixed native command allowlist.
+
+On Linux, the Hardware observation is produced by the same no-argument Rust
+collector shipped in Rescue. CPU and RAM come from bounded `/proc` reads;
+firmware/DMI, PCI and USB come from fixed `/sys` locations. Only normalized
+model/class/vendor/product facts cross the UI boundary. A partial, changing or
+unavailable kernel source remains visible as a non-complete source status and
+is not treated as a clean hardware diagnosis.
 
 On Windows, startup and the Verify gate collect only the same fast, derived
 storage identity. The deeper P0 collection starts once when **Diagnostica** is

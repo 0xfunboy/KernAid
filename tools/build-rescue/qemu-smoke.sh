@@ -831,6 +831,7 @@ while ((SECONDS < qemu_deadline)); do
     exit 1
   fi
   if grep -q "KERNAID_RESCUE_READY" "$log" \
+    && grep -aEq '^KERNAID_RESCUE_HARDWARE_INVENTORY_READY(\r)?$' "$log" \
     && grep -q "KERNAID_RESCUE_TARGET_SELECTION_READY" "$log" \
     && grep -q "KERNAID_RESCUE_OFFLINE_INSPECTION_READY" "$log" \
     && grep -q '^KERNAID_RESCUE_LINUX_SNAPSHOT_E2E_V1 semantic_sha256=' "$log"; then
@@ -840,6 +841,13 @@ while ((SECONDS < qemu_deadline)); do
     fi
     if rescue_not_ready_observed; then
       echo "Rescue guest reported a not-ready marker" >&2
+      exit 1
+    fi
+    mapfile -t hardware_inventory_ready_markers \
+      < <(LC_ALL=C tr -d '\r' <"$log" \
+        | grep -aE '^KERNAID_RESCUE_HARDWARE_INVENTORY_READY$')
+    if [[ "${#hardware_inventory_ready_markers[@]}" -ne 1 ]]; then
+      echo "Rescue hardware inventory marker was not unique" >&2
       exit 1
     fi
     target_hash_after="$(sha256sum "$target_image" | awk '{print $1}')"

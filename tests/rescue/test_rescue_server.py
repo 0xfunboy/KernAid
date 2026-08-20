@@ -406,6 +406,10 @@ class ObserveBrokerTests(unittest.TestCase):
     def test_inventory_uses_minimized_fixed_collectors(self) -> None:
         commands = dict(rescue_server.COMMANDS)
         self.assertNotIn("linux.fstab", commands)
+        self.assertEqual(
+            commands["linux.hardware.inventory"],
+            ("/usr/lib/kernaid/kernaid-linux-hardware-inventory",),
+        )
         lsblk = commands["linux.block.inventory"]
         fields = lsblk[lsblk.index("--output") + 1].split(",")
         self.assertEqual(
@@ -1642,6 +1646,7 @@ class InstalledTargetTests(unittest.TestCase):
         self.assertIn("mkfs.ext4", qemu_smoke)
         self.assertIn(
             'grep -q "KERNAID_RESCUE_READY" "$log" \\\n'
+            "    && grep -aEq '^KERNAID_RESCUE_HARDWARE_INVENTORY_READY(\\r)?$' \"$log\" \\\n"
             '    && grep -q "KERNAID_RESCUE_TARGET_SELECTION_READY" "$log"',
             qemu_smoke,
         )

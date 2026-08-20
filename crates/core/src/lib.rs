@@ -265,8 +265,9 @@ pub const LINUX_RESIDENT_P0_COLLECTORS: [&str; 9] = [
     "linux.dpkg.audit",
 ];
 
-pub const LINUX_RESIDENT_REQUIRED_COLLECTORS: [&str; 10] = [
+pub const LINUX_RESIDENT_REQUIRED_COLLECTORS: [&str; 11] = [
     "system.hostname",
+    "linux.hardware.inventory",
     "linux.block.inventory",
     "linux.mounts.read-only",
     "linux.systemd.failed",
@@ -416,7 +417,7 @@ mod tests {
             Err(LinuxSnapshotAdmissionError::IncompleteLinuxCorpus)
         );
         let production_corpus = resident_corpus(snapshot_evidence);
-        assert_eq!(production_corpus.len(), 11);
+        assert_eq!(production_corpus.len(), 12);
         session
             .linux_evidence_complete(&production_corpus)
             .expect("Linux evidence complete");

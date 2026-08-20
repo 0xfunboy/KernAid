@@ -53,6 +53,7 @@ const MAX_PROMPT_LENGTH = 8 * 1024;
 const MAX_PROPOSALS_PER_SESSION = 128;
 const MAX_APPROVALS_PER_SESSION = 128;
 const MAX_EVENTS_PER_SESSION = 1_024;
+const LINUX_HARDWARE_INVENTORY_COLLECTOR = "linux.hardware.inventory";
 const LINUX_P0_COLLECTORS = [
   "linux.block.inventory",
   "linux.mounts.read-only",
@@ -67,6 +68,7 @@ const LINUX_P0_COLLECTORS = [
 const LINUX_RESIDENT_CORPUS_COLLECTORS = [
   "system.hostname",
   LINUX_NORMALIZED_SNAPSHOT_COLLECTOR,
+  LINUX_HARDWARE_INVENTORY_COLLECTOR,
   ...LINUX_P0_COLLECTORS,
 ] as const;
 const LINUX_RESCUE_CORPUS_COLLECTORS = [
@@ -289,7 +291,8 @@ export class LocalSessionDriver implements SessionDriver {
       if (bytes.byteLength > evidenceByteLimit(request.collector))
         throw new Error("evidence content exceeds the safe limit");
       const providerContent =
-        request.collector === LINUX_NORMALIZED_SNAPSHOT_COLLECTOR
+        request.collector === LINUX_NORMALIZED_SNAPSHOT_COLLECTOR ||
+        request.collector === LINUX_HARDWARE_INVENTORY_COLLECTOR
           ? observedContent
           : redactSecretsForLocalEvidence(observedContent);
       const hash = await sha256(providerContent);

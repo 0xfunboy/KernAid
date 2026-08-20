@@ -48,6 +48,17 @@ const MAX_RESCUE_INSPECTION_RESPONSE_BYTES = 64 * 1024;
 const MAX_RESCUE_INSPECTION_CORPUS_BYTES = 48 * 1024;
 const MAX_NATIVE_OBSERVATION_BYTES = 64 * 1024;
 const MAX_QUALIFIED_NATIVE_OBSERVATION_BYTES = 1024 * 1024;
+const LINUX_HARDWARE_COLLECTOR = "linux.hardware.inventory";
+const LINUX_HARDWARE_KIND = "linux-hardware-inventory";
+const HARDWARE_SOURCE_STATUSES = new Set([
+  "complete",
+  "partial",
+  "truncated",
+  "unavailable",
+  "invalid",
+]);
+type HardwareSourceStatus =
+  "complete" | "partial" | "truncated" | "unavailable" | "invalid";
 const DISK_REF = /^disk-[1-9][0-9]{0,2}$/u;
 const VOLUME_REF = /^disk-[1-9][0-9]{0,2}\/volume-[1-9][0-9]{0,2}$/u;
 const PUBLIC_TOKEN = /^[a-z0-9][a-z0-9-]{0,63}$/u;
@@ -66,6 +77,7 @@ export const LINUX_P0_COLLECTORS = [
 const LINUX_RESIDENT_CORPUS_COLLECTORS = [
   "system.hostname",
   LINUX_NORMALIZED_SNAPSHOT_COLLECTOR,
+  LINUX_HARDWARE_COLLECTOR,
   ...LINUX_P0_COLLECTORS,
 ] as const;
 const WINDOWS_P0_COLLECTORS = [
@@ -145,6 +157,50 @@ export interface NativeObservation {
   output: string;
   success: boolean;
   truncated: boolean;
+}
+
+export interface LinuxHardwareInventory {
+  schemaVersion: "1.0";
+  kind: typeof LINUX_HARDWARE_KIND;
+  architecture: string;
+  cpu: {
+    status: HardwareSourceStatus;
+    logicalProcessors: number | null;
+    vendors: string[];
+    models: string[];
+    virtualizationFlagPresent: boolean | null;
+  };
+  memory: { status: HardwareSourceStatus; totalBytes: number | null };
+  firmware: {
+    status: HardwareSourceStatus;
+    bootMode: "uefi" | "bios-or-legacy" | "unknown";
+    dmi: {
+      biosVendor: string | null;
+      biosVersion: string | null;
+      boardName: string | null;
+      boardVendor: string | null;
+      productName: string | null;
+      systemVendor: string | null;
+    };
+  };
+  pci: {
+    status: HardwareSourceStatus;
+    devices: Array<{
+      class: string;
+      vendorId: string;
+      deviceId: string;
+      count: number;
+    }>;
+  };
+  usb: {
+    status: HardwareSourceStatus;
+    devices: Array<{
+      class: string;
+      vendorId: string;
+      productId: string;
+      count: number;
+    }>;
+  };
 }
 
 export interface ObserveAuthorization {
@@ -856,14 +912,257 @@ export function parseNativeObservations(value: unknown): NativeObservation[] {
       (item.truncated && item.success)
     )
       throw new Error("Inventario nativo non valido.");
+    if (item.collector === LINUX_HARDWARE_COLLECTOR && item.success)
+      parseLinuxHardwareInventory(item.output);
     return item as unknown as NativeObservation;
   });
+}
+
+function hardwareStatus(value: unknown): HardwareSourceStatus {
+  if (typeof value !== "string" || !HARDWARE_SOURCE_STATUSES.has(value))
+    throw new Error("Inventario hardware Linux non valido.");
+  return value as HardwareSourceStatus;
+}
+
+function exactHardwareRecord(
+  value: unknown,
+  keys: readonly string[],
+): Record<string, unknown> {
+  try {
+    return exactRecord(value, keys);
+  } catch {
+    throw new Error("Inventario hardware Linux non valido.");
+  }
+}
+
+function nullableHardwareText(value: unknown): string | null {
+  if (value === null) return null;
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    new TextEncoder().encode(value).byteLength > 256 ||
+    !hasOnlyUnicodeScalarValues(value) ||
+    hasUnsafePublicTextCharacter(value) ||
+    value.split(/\s+/u).join(" ") !== value
+  )
+    throw new Error("Inventario hardware Linux non valido.");
+  return value;
+}
+
+function hasOnlyUnicodeScalarValues(value: string): boolean {
+  for (const character of value) {
+    const codePoint = character.codePointAt(0);
+    if (codePoint === undefined || (codePoint >= 0xd800 && codePoint <= 0xdfff))
+      return false;
+  }
+  return true;
+}
+
+function compareUtf8(left: string, right: string): number {
+  const encoder = new TextEncoder();
+  const leftBytes = encoder.encode(left);
+  const rightBytes = encoder.encode(right);
+  const sharedLength = Math.min(leftBytes.length, rightBytes.length);
+  for (let index = 0; index < sharedLength; index += 1) {
+    const difference = leftBytes[index]! - rightBytes[index]!;
+    if (difference !== 0) return difference;
+  }
+  return leftBytes.length - rightBytes.length;
+}
+
+function hasUnsafePublicTextCharacter(value: string): boolean {
+  for (const character of value) {
+    const codePoint = character.codePointAt(0);
+    if (
+      codePoint !== undefined &&
+      (codePoint <= 0x1f ||
+        (codePoint >= 0x7f && codePoint <= 0x9f) ||
+        codePoint === 0x61c ||
+        codePoint === 0x200e ||
+        codePoint === 0x200f ||
+        (codePoint >= 0x202a && codePoint <= 0x202e) ||
+        (codePoint >= 0x2066 && codePoint <= 0x2069))
+    )
+      return true;
+  }
+  return false;
+}
+
+function hardwareTextArray(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length > 16)
+    throw new Error("Inventario hardware Linux non valido.");
+  const texts = value.map(nullableHardwareText);
+  if (
+    texts.some((item) => item === null) ||
+    texts.some(
+      (item, index) => index > 0 && compareUtf8(texts[index - 1]!, item!) >= 0,
+    )
+  )
+    throw new Error("Inventario hardware Linux non valido.");
+  return texts as string[];
+}
+
+function exactHardwareDevices(
+  value: unknown,
+  kind: "pci" | "usb",
+): Array<Record<string, unknown>> {
+  if (!Array.isArray(value) || value.length > 256)
+    throw new Error("Inventario hardware Linux non valido.");
+  const devices = value.map((raw) => {
+    const keys =
+      kind === "pci"
+        ? ["class", "vendorId", "deviceId", "count"]
+        : ["class", "vendorId", "productId", "count"];
+    const item = exactHardwareRecord(raw, keys);
+    const expected =
+      kind === "pci"
+        ? { class: 6, vendorId: 4, deviceId: 4 }
+        : { class: 2, vendorId: 4, productId: 4 };
+    for (const [key, digits] of Object.entries(expected)) {
+      const field = item[key];
+      if (
+        typeof field !== "string" ||
+        !new RegExp(`^0x[0-9a-f]{${digits}}$`, "u").test(field)
+      )
+        throw new Error("Inventario hardware Linux non valido.");
+    }
+    if (
+      !Number.isSafeInteger(item.count) ||
+      Number(item.count) < 1 ||
+      Number(item.count) > 256
+    )
+      throw new Error("Inventario hardware Linux non valido.");
+    return item;
+  });
+  const canonical = devices.map((device) =>
+    kind === "pci"
+      ? `${String(device.class)}\u0000${String(device.vendorId)}\u0000${String(device.deviceId)}`
+      : `${String(device.class)}\u0000${String(device.vendorId)}\u0000${String(device.productId)}`,
+  );
+  if (
+    canonical.some(
+      (item, index) => index > 0 && item <= canonical[index - 1]!,
+    ) ||
+    devices.reduce((total, device) => total + Number(device.count), 0) > 256
+  )
+    throw new Error("Inventario hardware Linux non valido.");
+  return devices;
+}
+
+export function parseLinuxHardwareInventory(
+  json: string,
+): LinuxHardwareInventory {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(json);
+  } catch {
+    throw new Error("Inventario hardware Linux non valido.");
+  }
+  const canonicalFrame = json.endsWith("\n") ? json.slice(0, -1) : json;
+  if (!canonicalFrame || JSON.stringify(raw) !== canonicalFrame)
+    throw new Error("Inventario hardware Linux non valido.");
+  const item = exactHardwareRecord(raw, [
+    "schemaVersion",
+    "kind",
+    "architecture",
+    "cpu",
+    "memory",
+    "firmware",
+    "pci",
+    "usb",
+  ]);
+  if (
+    item.schemaVersion !== "1.0" ||
+    item.kind !== LINUX_HARDWARE_KIND ||
+    typeof item.architecture !== "string" ||
+    !/^[a-z0-9][a-z0-9_.-]{0,31}$/u.test(item.architecture)
+  )
+    throw new Error("Inventario hardware Linux non valido.");
+
+  const cpu = exactHardwareRecord(item.cpu, [
+    "status",
+    "logicalProcessors",
+    "vendors",
+    "models",
+    "virtualizationFlagPresent",
+  ]);
+  const cpuStatus = hardwareStatus(cpu.status);
+  if (
+    !(
+      cpu.logicalProcessors === null ||
+      (Number.isSafeInteger(cpu.logicalProcessors) &&
+        Number(cpu.logicalProcessors) >= 1 &&
+        Number(cpu.logicalProcessors) <= 4096)
+    ) ||
+    !(
+      cpu.virtualizationFlagPresent === null ||
+      typeof cpu.virtualizationFlagPresent === "boolean"
+    )
+  )
+    throw new Error("Inventario hardware Linux non valido.");
+  hardwareTextArray(cpu.vendors);
+  hardwareTextArray(cpu.models);
+  if (
+    cpuStatus === "complete" &&
+    (cpu.logicalProcessors === null || cpu.virtualizationFlagPresent === null)
+  )
+    throw new Error("Inventario hardware Linux non valido.");
+
+  const memory = exactHardwareRecord(item.memory, ["status", "totalBytes"]);
+  const memoryStatus = hardwareStatus(memory.status);
+  if (
+    !(
+      memory.totalBytes === null ||
+      (Number.isSafeInteger(memory.totalBytes) && Number(memory.totalBytes) > 0)
+    ) ||
+    (memoryStatus === "complete" && memory.totalBytes === null)
+  )
+    throw new Error("Inventario hardware Linux non valido.");
+
+  const firmware = exactHardwareRecord(item.firmware, [
+    "status",
+    "bootMode",
+    "dmi",
+  ]);
+  const firmwareStatus = hardwareStatus(firmware.status);
+  if (
+    firmware.bootMode !== "uefi" &&
+    firmware.bootMode !== "bios-or-legacy" &&
+    firmware.bootMode !== "unknown"
+  )
+    throw new Error("Inventario hardware Linux non valido.");
+  const dmi = exactHardwareRecord(firmware.dmi, [
+    "biosVendor",
+    "biosVersion",
+    "boardName",
+    "boardVendor",
+    "productName",
+    "systemVendor",
+  ]);
+  const dmiValues = Object.values(dmi);
+  dmiValues.forEach(nullableHardwareText);
+  if (
+    firmwareStatus === "complete" &&
+    (firmware.bootMode === "unknown" ||
+      dmiValues.some((value) => value === null))
+  )
+    throw new Error("Inventario hardware Linux non valido.");
+
+  const pci = exactHardwareRecord(item.pci, ["status", "devices"]);
+  hardwareStatus(pci.status);
+  exactHardwareDevices(pci.devices, "pci");
+  const usb = exactHardwareRecord(item.usb, ["status", "devices"]);
+  hardwareStatus(usb.status);
+  exactHardwareDevices(usb.devices, "usb");
+  return item as unknown as LinuxHardwareInventory;
 }
 
 export function nativeObservationContentType(
   observation: NativeObservation,
 ): "application/json" | "text/plain" {
-  return observation.success && observation.collector.startsWith("macos.")
+  return observation.success &&
+    (observation.collector.startsWith("macos.") ||
+      observation.collector === LINUX_HARDWARE_COLLECTOR)
     ? "application/json"
     : "text/plain";
 }
@@ -1713,8 +2012,13 @@ export class PlatformOfflineRulesProvider implements Provider {
     const snapshotEvidence = evidence.filter(
       (item) => item.evidence.collector === LINUX_NORMALIZED_SNAPSHOT_COLLECTOR,
     );
+    const hardwareEvidence = evidence.filter(
+      (item) => item.evidence.collector === LINUX_HARDWARE_COLLECTOR,
+    );
     const hasLinuxCorpus =
-      linuxEvidence.length > 0 || snapshotEvidence.length > 0;
+      linuxEvidence.length > 0 ||
+      snapshotEvidence.length > 0 ||
+      hardwareEvidence.length > 0;
     const windowsEvidence = evidence.filter((item) =>
       WINDOWS_P0_COLLECTORS.includes(
         item.evidence.collector as (typeof WINDOWS_P0_COLLECTORS)[number],
@@ -1810,6 +2114,23 @@ export class PlatformOfflineRulesProvider implements Provider {
 
     if (!hasLinuxCorpus) return this.#fallback.diagnose(objective, evidence);
 
+    let hardwareValid = false;
+    if (
+      hardwareEvidence.length === 1 &&
+      hardwareEvidence[0]?.evidence.target === "local-machine" &&
+      hardwareEvidence[0].evidence.contentType === "application/json" &&
+      hardwareEvidence[0].evidence.trust === "observed-untrusted" &&
+      hardwareEvidence[0].evidence.summary ===
+        "Comando di inventario completato"
+    ) {
+      try {
+        parseLinuxHardwareInventory(hardwareEvidence[0].content);
+        hardwareValid = true;
+      } catch {
+        hardwareValid = false;
+      }
+    }
+
     let admittedSnapshot: LinuxNormalizedSnapshotEnvelope | undefined;
     if (
       snapshotEvidence.length === 1 &&
@@ -1836,13 +2157,14 @@ export class PlatformOfflineRulesProvider implements Provider {
         confidence: 0.1,
         evidenceIds: Array.from(
           new Set(
-            [...linuxEvidence, ...snapshotEvidence].map(
+            [...linuxEvidence, ...snapshotEvidence, ...hardwareEvidence].map(
               (item) => item.evidence.id,
             ),
           ),
         ),
         requestedEvidence: [
           LINUX_NORMALIZED_SNAPSHOT_COLLECTOR,
+          ...(hardwareValid ? [] : [LINUX_HARDWARE_COLLECTOR]),
           ...LINUX_P0_COLLECTORS.filter(
             (collector) =>
               !linuxEvidence.some(
@@ -1861,7 +2183,7 @@ export class PlatformOfflineRulesProvider implements Provider {
         confidence: 0.1,
         evidenceIds: Array.from(
           new Set(
-            [...linuxEvidence, ...snapshotEvidence].map(
+            [...linuxEvidence, ...snapshotEvidence, ...hardwareEvidence].map(
               (item) => item.evidence.id,
             ),
           ),
@@ -1895,6 +2217,7 @@ export class PlatformOfflineRulesProvider implements Provider {
       );
     const complete =
       exactCorpus &&
+      hardwareValid &&
       selected.every((item) => item !== undefined) &&
       LINUX_P0_COLLECTORS.every(
         (collector) =>
@@ -1930,6 +2253,7 @@ export class PlatformOfflineRulesProvider implements Provider {
         hostname[0]?.evidence.summary !== "Comando di inventario completato"
       )
         requestedEvidence.unshift("system.hostname");
+      if (!hardwareValid) requestedEvidence.push(LINUX_HARDWARE_COLLECTOR);
       if (!exactCorpus) requestedEvidence.push("linux.p0.corpus.exact.v1");
       return parseDiagnosisProposal({
         schemaVersion: "1.0",
@@ -1955,7 +2279,11 @@ export class PlatformOfflineRulesProvider implements Provider {
     return parseDiagnosisProposal({
       ...proposal,
       evidenceIds: Array.from(
-        new Set([...proposal.evidenceIds, snapshotEvidence[0]!.evidence.id]),
+        new Set([
+          ...proposal.evidenceIds,
+          snapshotEvidence[0]!.evidence.id,
+          hardwareEvidence[0]!.evidence.id,
+        ]),
       ),
     });
   }

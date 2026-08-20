@@ -40,9 +40,10 @@ const MAX_OUTPUT_TOKENS: u64 = 4_096;
 const MAX_PENDING_REQUESTS: usize = 1;
 const MAX_CANCEL_INTENTS: usize = 128;
 
-const LINUX_COLLECTORS: [&str; 11] = [
+const LINUX_COLLECTORS: [&str; 12] = [
     "system.hostname",
     "linux.normalized-snapshot.v1",
+    "linux.hardware.inventory",
     "linux.block.inventory",
     "linux.mounts.read-only",
     "linux.systemd.failed",
@@ -655,6 +656,12 @@ fn normalize_linux_corpus(
     if !snapshot.capture.is_resident() || !snapshot.snapshot.topology.supported {
         return Err(invalid_request());
     }
+    let hardware_evidence = corpus_evidence(indexed, "linux.hardware.inventory")?;
+    if hardware_evidence.content_type != "application/json" {
+        return Err(invalid_request());
+    }
+    kernaid_linux_pack::hardware::parse_bounded_json(hardware_evidence.content.as_bytes())
+        .map_err(|_| invalid_request())?;
     let normalized_snapshot_projection = json!({
         "family": "linux",
         "scope": &snapshot.snapshot.scope,
@@ -1386,6 +1393,12 @@ mod tests {
                 "application/json",
             ),
             test_evidence(
+                "E-12",
+                "linux.hardware.inventory",
+                include_str!("../../../../tests/fixtures/linux-hardware-inventory/healthy.v1.json"),
+                "application/json",
+            ),
+            test_evidence(
                 "E-1",
                 "linux.block.inventory",
                 include_str!("../../../../packs/linux/fixtures/diagnostics/healthy/lsblk.json"),
@@ -1753,6 +1766,11 @@ mod tests {
             "RAW-NAME-CANARY",
             "RAW-PRETTY-NAME-CANARY",
             "RAW-VERSION-CANARY",
+            "Example BIOS",
+            "Example CPU",
+            "Example Product",
+            "0x1234",
+            "0x1d6b",
         ] {
             assert!(
                 !serialized.contains(private_value),
@@ -1860,6 +1878,69 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn rejects_noncontractual_hardware_fields_before_network() {
+        let key = b"synthetic-hardware-validation-key";
+        let server = mock_server(response(valid_proposal()), Duration::ZERO);
+        let runtime = runtime_for(&server, key, Duration::from_secs(2));
+        let mut diagnostic_request = request("identity");
+        let hardware = diagnostic_request
+            .evidence
+            .iter_mut()
+            .find(|evidence| evidence.collector == "linux.hardware.inventory")
+            .expect("Linux hardware evidence");
+        let mut document: serde_json::Value =
+            serde_json::from_str(&hardware.content).expect("hardware test fixture");
+        document
+            .as_object_mut()
+            .expect("hardware object")
+            .insert("serial".to_owned(), json!("must-not-cross"));
+        hardware.content = serde_json::to_string(&document).expect("hardware JSON");
+        hardware.sha256 = sha256_hex(hardware.content.as_bytes());
+        let error = runtime
+            .diagnose(diagnostic_request)
+            .await
+            .expect_err("unknown hardware fields must fail");
+        assert_eq!(error.code, ResidentOpenAiErrorCode::InvalidRequest);
+        assert!(
+            server
+                .captured
+                .recv_timeout(Duration::from_millis(100))
+                .is_err()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn rejects_unavailable_hardware_before_network() {
+        let key = b"synthetic-hardware-unavailable-key";
+        let server = mock_server(response(valid_proposal()), Duration::ZERO);
+        let runtime = runtime_for(&server, key, Duration::from_secs(2));
+        let mut diagnostic_request = request("identity");
+        let hardware = diagnostic_request
+            .evidence
+            .iter_mut()
+            .find(|evidence| evidence.collector == "linux.hardware.inventory")
+            .expect("Linux hardware evidence");
+        hardware.content_type = "text/plain".to_owned();
+        hardware.content =
+            "collector unavailable: normalized hardware inventory did not complete safely"
+                .to_owned();
+        hardware.sha256 = sha256_hex(hardware.content.as_bytes());
+        let error = runtime
+            .diagnose(diagnostic_request)
+            .await
+            .expect_err("unavailable hardware must fail before network");
+        assert_eq!(error.code, ResidentOpenAiErrorCode::InvalidRequest);
+        assert!(
+            server
+                .captured
+                .recv_timeout(Duration::from_millis(100))
+                .is_err()
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn upstream_secret_echo_and_unbound_evidence_fail_closed() {
         let key = b"custom-runtime-key-echo";
@@ -1921,6 +2002,26 @@ mod tests {
             .await
             .expect_err("identity-only evidence id must not be provider-bindable");
         assert_eq!(error.code, ResidentOpenAiErrorCode::InvalidResponse);
+
+        #[cfg(target_os = "linux")]
+        {
+            let server = mock_server(
+                response(json!({
+                    "schemaVersion": "1.0",
+                    "diagnosis": "Local-only hardware must remain local",
+                    "confidence": 0.2,
+                    "evidenceIds": ["E-12"],
+                    "requestedEvidence": []
+                })),
+                Duration::ZERO,
+            );
+            let runtime = runtime_for(&server, key, Duration::from_secs(2));
+            let error = runtime
+                .diagnose(request("Diagnose"))
+                .await
+                .expect_err("hardware evidence id must not be provider-bindable");
+            assert_eq!(error.code, ResidentOpenAiErrorCode::InvalidResponse);
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

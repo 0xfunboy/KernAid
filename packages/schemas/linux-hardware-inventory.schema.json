@@ -1,0 +1,207 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.kernaid.dev/v1/linux-hardware-inventory.json",
+  "title": "KernAid normalized Linux machine hardware inventory",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "kind",
+    "architecture",
+    "cpu",
+    "memory",
+    "firmware",
+    "pci",
+    "usb"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "1.0" },
+    "kind": { "const": "linux-hardware-inventory" },
+    "architecture": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_.-]{0,31}$"
+    },
+    "cpu": { "$ref": "#/$defs/cpu" },
+    "memory": { "$ref": "#/$defs/memory" },
+    "firmware": { "$ref": "#/$defs/firmware" },
+    "pci": { "$ref": "#/$defs/pci" },
+    "usb": { "$ref": "#/$defs/usb" }
+  },
+  "$defs": {
+    "status": {
+      "enum": ["complete", "partial", "truncated", "unavailable", "invalid"]
+    },
+    "publicText": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[^\\s\\u0000-\\u001f\\u007f-\\u009f\\u061c\\u200e\\u200f\\u202a-\\u202e\\u2066-\\u2069\\ud800-\\udfff]+(?: [^\\s\\u0000-\\u001f\\u007f-\\u009f\\u061c\\u200e\\u200f\\u202a-\\u202e\\u2066-\\u2069\\ud800-\\udfff]+)*$"
+    },
+    "nullablePublicText": {
+      "oneOf": [{ "$ref": "#/$defs/publicText" }, { "type": "null" }]
+    },
+    "cpu": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "logicalProcessors",
+        "vendors",
+        "models",
+        "virtualizationFlagPresent"
+      ],
+      "properties": {
+        "status": { "$ref": "#/$defs/status" },
+        "logicalProcessors": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "maximum": 4096
+        },
+        "vendors": {
+          "type": "array",
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/publicText" }
+        },
+        "models": {
+          "type": "array",
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/publicText" }
+        },
+        "virtualizationFlagPresent": { "type": ["boolean", "null"] }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "const": "complete" } } },
+          "then": {
+            "properties": {
+              "logicalProcessors": { "type": "integer" },
+              "virtualizationFlagPresent": { "type": "boolean" }
+            }
+          }
+        }
+      ]
+    },
+    "memory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "totalBytes"],
+      "properties": {
+        "status": { "$ref": "#/$defs/status" },
+        "totalBytes": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "maximum": 9007199254740991
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "const": "complete" } } },
+          "then": { "properties": { "totalBytes": { "type": "integer" } } }
+        }
+      ]
+    },
+    "dmi": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "biosVendor",
+        "biosVersion",
+        "boardName",
+        "boardVendor",
+        "productName",
+        "systemVendor"
+      ],
+      "properties": {
+        "biosVendor": { "$ref": "#/$defs/nullablePublicText" },
+        "biosVersion": { "$ref": "#/$defs/nullablePublicText" },
+        "boardName": { "$ref": "#/$defs/nullablePublicText" },
+        "boardVendor": { "$ref": "#/$defs/nullablePublicText" },
+        "productName": { "$ref": "#/$defs/nullablePublicText" },
+        "systemVendor": { "$ref": "#/$defs/nullablePublicText" }
+      }
+    },
+    "firmware": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "bootMode", "dmi"],
+      "properties": {
+        "status": { "$ref": "#/$defs/status" },
+        "bootMode": { "enum": ["uefi", "bios-or-legacy", "unknown"] },
+        "dmi": { "$ref": "#/$defs/dmi" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "const": "complete" } } },
+          "then": {
+            "properties": {
+              "bootMode": { "enum": ["uefi", "bios-or-legacy"] },
+              "dmi": {
+                "type": "object",
+                "properties": {
+                  "biosVendor": { "$ref": "#/$defs/publicText" },
+                  "biosVersion": { "$ref": "#/$defs/publicText" },
+                  "boardName": { "$ref": "#/$defs/publicText" },
+                  "boardVendor": { "$ref": "#/$defs/publicText" },
+                  "productName": { "$ref": "#/$defs/publicText" },
+                  "systemVendor": { "$ref": "#/$defs/publicText" }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "pciDevice": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["class", "vendorId", "deviceId", "count"],
+      "properties": {
+        "class": { "type": "string", "pattern": "^0x[0-9a-f]{6}$" },
+        "vendorId": { "type": "string", "pattern": "^0x[0-9a-f]{4}$" },
+        "deviceId": { "type": "string", "pattern": "^0x[0-9a-f]{4}$" },
+        "count": { "type": "integer", "minimum": 1, "maximum": 256 }
+      }
+    },
+    "usbDevice": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["class", "vendorId", "productId", "count"],
+      "properties": {
+        "class": { "type": "string", "pattern": "^0x[0-9a-f]{2}$" },
+        "vendorId": { "type": "string", "pattern": "^0x[0-9a-f]{4}$" },
+        "productId": { "type": "string", "pattern": "^0x[0-9a-f]{4}$" },
+        "count": { "type": "integer", "minimum": 1, "maximum": 256 }
+      }
+    },
+    "pci": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "devices"],
+      "properties": {
+        "status": { "$ref": "#/$defs/status" },
+        "devices": {
+          "type": "array",
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/pciDevice" }
+        }
+      }
+    },
+    "usb": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "devices"],
+      "properties": {
+        "status": { "$ref": "#/$defs/status" },
+        "devices": {
+          "type": "array",
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/usbDevice" }
+        }
+      }
+    }
+  }
+}

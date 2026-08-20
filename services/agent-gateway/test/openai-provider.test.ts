@@ -100,6 +100,29 @@ function normalizedSnapshotCanaryEvidence(): ObservedEvidence {
   };
 }
 
+function localHardwareCanaryEvidence(): ObservedEvidence {
+  const content = JSON.stringify({
+    rawHardwareCanary: "RAW-HARDWARE-CONTENT-MUST-STAY-LOCAL",
+  });
+  const sha256 = createHash("sha256").update(content).digest("hex");
+  return {
+    evidence: {
+      schemaVersion: "1.0",
+      id: "E-HARDWARE-LOCAL-ONLY",
+      collector: "linux.hardware.inventory",
+      target: "local-machine",
+      capturedAt: "2026-08-20T00:00:00.000Z",
+      contentType: "application/json",
+      sha256,
+      sensitivity: "system",
+      trust: "observed-untrusted",
+      summary: "RAW-HARDWARE-SUMMARY-MUST-STAY-LOCAL",
+      blobRef: `sha256:${sha256}`,
+    },
+    content,
+  };
+}
+
 interface CapturedRequest {
   method?: string;
   url?: string;
@@ -305,16 +328,20 @@ test("OpenAI-compatible supports an explicitly selected Ollama/LAN model", async
 });
 
 test("generic OpenAI providers send only the structural normalized snapshot projection", async (context) => {
+  const snapshotProposal = {
+    ...validProposal,
+    evidenceIds: ["E-SNAPSHOT"],
+  };
   const server = await localServer(context, (request, response) => {
     if (request.url === "/v1/responses")
-      sendJson(response, responsesEnvelope(JSON.stringify(validProposal)));
+      sendJson(response, responsesEnvelope(JSON.stringify(snapshotProposal)));
     else
       sendJson(response, {
         choices: [
           {
             message: {
               role: "assistant",
-              content: JSON.stringify(validProposal),
+              content: JSON.stringify(snapshotProposal),
             },
           },
         ],
@@ -333,10 +360,11 @@ test("generic OpenAI providers send only the structural normalized snapshot proj
     }),
   ];
   const evidence = normalizedSnapshotCanaryEvidence();
+  const hardware = localHardwareCanaryEvidence();
   for (const provider of providers)
     assert.deepEqual(
-      await provider.diagnose("Diagnose the snapshot", [evidence]),
-      validProposal,
+      await provider.diagnose("Diagnose the snapshot", [evidence, hardware]),
+      snapshotProposal,
     );
 
   assert.equal(server.requests.length, 2);
@@ -347,6 +375,9 @@ test("generic OpenAI providers send only the structural normalized snapshot proj
       "RAW-PRETTY-NAME-CANARY",
       "RAW-VERSION-CANARY",
       "RAW-SUMMARY-CANARY",
+      "E-HARDWARE-LOCAL-ONLY",
+      "RAW-HARDWARE-CONTENT-MUST-STAY-LOCAL",
+      "RAW-HARDWARE-SUMMARY-MUST-STAY-LOCAL",
     ])
       assert.doesNotMatch(request.body, new RegExp(canary, "u"));
     const body = JSON.parse(request.body) as {
@@ -385,6 +416,28 @@ test("generic OpenAI providers send only the structural normalized snapshot proj
       error instanceof ProviderError && error.code === "invalid_request",
   );
   assert.equal(server.requests.length, 2);
+
+  const unboundServer = await localServer(context, (_request, response) => {
+    sendJson(
+      response,
+      responsesEnvelope(
+        JSON.stringify({
+          ...snapshotProposal,
+          evidenceIds: ["E-HARDWARE-LOCAL-ONLY"],
+        }),
+      ),
+    );
+  });
+  const unboundProvider = new OpenAIResponsesProvider({
+    baseUrl: unboundServer.baseUrl,
+    allowInsecureLoopback: true,
+    apiKey: () => "synthetic-local-only-hardware-key",
+  });
+  await assert.rejects(
+    unboundProvider.diagnose("Diagnose the snapshot", [evidence, hardware]),
+    (error: unknown) =>
+      error instanceof ProviderError && error.code === "invalid_response",
+  );
 });
 
 test("plain HTTP requires explicit loopback opt-in", () => {

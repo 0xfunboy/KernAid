@@ -501,6 +501,7 @@ signal.signal(signal.SIGTERM, observe_term)
 if os.environ.get("KERNAID_MOCK_QEMU_NOT_READY") == "1":
     print("KERNAID_RESCUE_NOT_READY: private-reason=must-not-escape", flush=True)
 print("KERNAID_RESCUE_READY", flush=True)
+print("KERNAID_RESCUE_HARDWARE_INVENTORY_READY", flush=True)
 print("KERNAID_RESCUE_TARGET_SELECTION_READY", flush=True)
 print("KERNAID_RESCUE_OFFLINE_INSPECTION_READY", flush=True)
 snapshot_marker = "KERNAID_RESCUE_LINUX_SNAPSHOT_E2E_V1 semantic_sha256=" + os.environ["KERNAID_MOCK_SNAPSHOT_DIGEST"]
@@ -512,6 +513,7 @@ time.sleep(30)
 '
             fi
             printf 'KERNAID_RESCUE_READY\n'
+            printf 'KERNAID_RESCUE_HARDWARE_INVENTORY_READY\n'
             printf 'KERNAID_RESCUE_TARGET_SELECTION_READY\n'
             printf 'KERNAID_RESCUE_OFFLINE_INSPECTION_READY\n'
             printf 'serial-prefix-without-line-feed'
@@ -527,6 +529,32 @@ time.sleep(30)
 
 
 class QemuSmokeFixturePrivilegeTests(unittest.TestCase):
+    def test_hardware_inventory_marker_is_framed_strict_and_unique(self) -> None:
+        ready = READY_CHECK.read_text(encoding="utf-8")
+        script = SCRIPT.read_text(encoding="utf-8")
+        validation = 'data.get("cpu", {}).get("status") == "complete"'
+        emission = (
+            "printf '\\nKERNAID_RESCUE_HARDWARE_INVENTORY_READY\\n' "
+            ">/dev/ttyS0"
+        )
+        self.assertEqual(ready.count(emission), 1)
+        self.assertLess(ready.index(validation), ready.index(emission))
+        self.assertIn(
+            "grep -aEq '^KERNAID_RESCUE_HARDWARE_INVENTORY_READY(\\r)?$'",
+            script,
+        )
+        self.assertIn(
+            "Rescue hardware inventory marker was not unique",
+            script,
+        )
+        stream = "serial-prefix-without-line-feed\nKERNAID_RESCUE_HARDWARE_INVENTORY_READY\r\n"
+        markers = re.findall(
+            r"^KERNAID_RESCUE_HARDWARE_INVENTORY_READY$",
+            stream.replace("\r", ""),
+            re.MULTILINE,
+        )
+        self.assertEqual(markers, ["KERNAID_RESCUE_HARDWARE_INVENTORY_READY"])
+
     def materialize_test_script(self, directory: Path, mocks: MockToolchain) -> Path:
         source = SCRIPT.read_text(encoding="utf-8")
         replacements = {

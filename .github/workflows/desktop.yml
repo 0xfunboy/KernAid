@@ -9,6 +9,7 @@ on:
       - "packs/**"
       - "packages/**"
       - "services/**"
+      - "tests/fixtures/linux-hardware-inventory/**"
       - "tests/fixtures/linux-normalized-snapshot/**"
       - "tests/integration/linux-snapshot-resident-ipc.sh"
       - "tests/integration/run-linux-snapshot-resident-ipc-ci.sh"
@@ -16,7 +17,7 @@ on:
       - "Cargo.lock"
       - "pnpm-lock.yaml"
       - ".github/workflows/desktop.yml"
-permissions: {contents: read}
+permissions: { contents: read }
 jobs:
   build:
     strategy:
@@ -52,9 +53,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
-        with: {version: 9.15.9}
+        with: { version: 9.15.9 }
       - uses: actions/setup-node@v4
-        with: {node-version: 24.18.0, cache: pnpm}
+        with: { node-version: 24.18.0, cache: pnpm }
       - uses: dtolnay/rust-toolchain@1.88.0
         with:
           targets: ${{ matrix.targets }}

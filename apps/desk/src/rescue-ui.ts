@@ -361,7 +361,11 @@ function collectorBelongsTo(
 ): boolean {
   switch (category) {
     case "Hardware":
-      return collector === "system.hostname" || collector.endsWith(".system");
+      return (
+        collector === "system.hostname" ||
+        collector === "linux.hardware.inventory" ||
+        collector.endsWith(".system")
+      );
     case "Storage":
       return /block\.inventory|\.disks$|\.storage(?:\.|$)|\.df$/u.test(
         collector,

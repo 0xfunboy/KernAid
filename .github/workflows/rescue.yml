@@ -14,6 +14,7 @@ on:
       - "tools/make-device/trusted-rescue-images.v2.schema.json"
       - "apps/desk/**"
       - "packs/linux/**"
+      - "tests/fixtures/linux-hardware-inventory/**"
       - "tests/fixtures/linux-normalized-snapshot/**"
       - "tests/integration/linux-snapshot-resident-ipc.sh"
       - "tests/integration/run-linux-snapshot-resident-ipc-ci.sh"
@@ -172,6 +173,8 @@ jobs:
             --bin kernaid-rescue-vaultctl
           cargo build --locked --release -p kernaid-rescue-openai-executor \
             --bin kernaid-rescue-openai-executor
+          cargo build --locked --release -p kernaid-linux-pack \
+            --bin kernaid-linux-hardware-inventory
       - name: Verify the in-guest Rescue binary ABI
         run: |
           preflight_dir="$(sudo /usr/bin/mktemp -d /root/kernaid-rescue-shipping-preflight.XXXXXXXX)"
@@ -179,6 +182,7 @@ jobs:
             sudo unlink -- "$preflight_dir/kernaid-rescue-vaultd" 2>/dev/null || true
             sudo unlink -- "$preflight_dir/kernaid-rescue-vaultctl" 2>/dev/null || true
             sudo unlink -- "$preflight_dir/kernaid-rescue-openai-executor" 2>/dev/null || true
+            sudo unlink -- "$preflight_dir/kernaid-linux-hardware-inventory" 2>/dev/null || true
             sudo rmdir -- "$preflight_dir" 2>/dev/null || true
           }
           trap cleanup_preflight EXIT
@@ -195,12 +199,17 @@ jobs:
           sudo install -o root -g root -m 0755 \
             target/release/kernaid-rescue-openai-executor \
             "$preflight_dir/kernaid-rescue-openai-executor"
+          sudo install -o root -g root -m 0755 \
+            target/release/kernaid-linux-hardware-inventory \
+            "$preflight_dir/kernaid-linux-hardware-inventory"
           sudo /usr/bin/python3 -I tools/build-rescue/verify-shipping-binary.py \
             "$preflight_dir/kernaid-rescue-vaultd"
           sudo /usr/bin/python3 -I tools/build-rescue/verify-shipping-binary.py \
             "$preflight_dir/kernaid-rescue-vaultctl"
           sudo /usr/bin/python3 -I tools/build-rescue/verify-shipping-binary.py \
             "$preflight_dir/kernaid-rescue-openai-executor"
+          sudo /usr/bin/python3 -I tools/build-rescue/verify-shipping-binary.py \
+            "$preflight_dir/kernaid-linux-hardware-inventory"
       - name: Build hybrid BIOS and UEFI ISO
         run: |
           docker run --rm --privileged \
@@ -208,6 +217,7 @@ jobs:
             -e KERNAID_RESCUE_VAULTD_BINARY=/workspace/target/release/kernaid-rescue-vaultd \
             -e KERNAID_RESCUE_VAULTCTL_BINARY=/workspace/target/release/kernaid-rescue-vaultctl \
             -e KERNAID_RESCUE_OPENAI_EXECUTOR_BINARY=/workspace/target/release/kernaid-rescue-openai-executor \
+            -e KERNAID_LINUX_HARDWARE_INVENTORY_BINARY=/workspace/target/release/kernaid-linux-hardware-inventory \
             -v "$PWD:/workspace" -w /workspace \
             debian:trixie-slim \
             sh -c 'apt-get update && apt-get install -y binutils live-build ca-certificates python3 && ./tools/build-rescue/build.sh'

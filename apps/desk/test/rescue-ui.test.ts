@@ -50,6 +50,12 @@ test("Rescue environment status uses collector identity and success", () => {
     "observed",
   );
   assert.equal(
+    observationStatus("Hardware", [
+      { ...base, collector: "linux.hardware.inventory" },
+    ]),
+    "observed",
+  );
+  assert.equal(
     observationStatus("Boot", [{ ...base, collector: "linux.network.links" }]),
     "pending",
   );

@@ -15,6 +15,7 @@ const schemaFiles = [
   "diagnosis-proposal.schema.json",
   "evidence.schema.json",
   "execution-event.schema.json",
+  "linux-hardware-inventory.schema.json",
   "linux-normalized-snapshot.schema.json",
   "rescue-openai-request.schema.json",
   "rescue-openai-response.schema.json",
@@ -29,6 +30,130 @@ test("published schema basenames match the expected release set", () => {
     .filter((file) => file.endsWith(".schema.json"))
     .sort();
   assert.deepEqual(publishedSchemaFiles, schemaFiles);
+});
+
+test("Linux hardware schema admits normalized public facts and rejects identity leakage", () => {
+  const ajv = new Ajv2020({ allErrors: true, strict: true });
+  const schema = JSON.parse(
+    readFileSync(
+      new URL("../linux-hardware-inventory.schema.json", import.meta.url),
+      "utf8",
+    ),
+  );
+  const validate = ajv.compile(schema);
+  const inventory = JSON.parse(
+    readFileSync(
+      new URL(
+        "../../../tests/fixtures/linux-hardware-inventory/healthy.v1.json",
+        import.meta.url,
+      ),
+      "utf8",
+    ),
+  ) as {
+    pci: { devices: Array<Record<string, unknown>> };
+    [key: string]: unknown;
+  };
+  assert.equal(validate(inventory), true);
+  assert.equal(validate({ ...inventory, serial: "secret" }), false);
+  assert.equal(
+    validate({
+      ...inventory,
+      firmware: {
+        ...(inventory.firmware as Record<string, unknown>),
+        dmi: {
+          ...((inventory.firmware as Record<string, unknown>).dmi as Record<
+            string,
+            unknown
+          >),
+          biosVendor: "invalid\u0085vendor",
+        },
+      },
+    }),
+    false,
+  );
+  assert.equal(
+    validate({
+      ...inventory,
+      firmware: {
+        ...(inventory.firmware as Record<string, unknown>),
+        dmi: {
+          ...((inventory.firmware as Record<string, unknown>).dmi as Record<
+            string,
+            unknown
+          >),
+          biosVendor: "invalid\u202ebidirectional-control",
+        },
+      },
+    }),
+    false,
+  );
+  assert.equal(
+    validate({
+      ...inventory,
+      firmware: {
+        ...(inventory.firmware as Record<string, unknown>),
+        dmi: {
+          ...((inventory.firmware as Record<string, unknown>).dmi as Record<
+            string,
+            unknown
+          >),
+          biosVendor: "invalid\ufeffbyte-order-mark",
+        },
+      },
+    }),
+    false,
+  );
+  assert.equal(
+    validate({
+      ...inventory,
+      firmware: {
+        ...(inventory.firmware as Record<string, unknown>),
+        dmi: {
+          ...((inventory.firmware as Record<string, unknown>).dmi as Record<
+            string,
+            unknown
+          >),
+          biosVendor: "invalid\ud800surrogate",
+        },
+      },
+    }),
+    false,
+  );
+  assert.equal(
+    validate({
+      ...inventory,
+      memory: { status: "complete", totalBytes: null },
+    }),
+    false,
+  );
+  assert.equal(
+    validate({
+      ...inventory,
+      firmware: {
+        status: "complete",
+        bootMode: "unknown",
+        dmi: {
+          biosVendor: null,
+          biosVersion: "1.2.3",
+          boardName: "Example Board",
+          boardVendor: "Example Vendor",
+          productName: "Example Product",
+          systemVendor: "Example System",
+        },
+      },
+    }),
+    false,
+  );
+  assert.equal(
+    validate({
+      ...inventory,
+      pci: {
+        ...inventory.pci,
+        devices: [{ ...inventory.pci.devices[0], address: "0000:00:02.0" }],
+      },
+    }),
+    false,
+  );
 });
 
 test("all published JSON schemas compile together", () => {

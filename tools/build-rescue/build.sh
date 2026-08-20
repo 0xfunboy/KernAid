@@ -6,9 +6,11 @@ build_dir="$repo_dir/rescue/live-build"
 vaultd_binary="${KERNAID_RESCUE_VAULTD_BINARY:-$repo_dir/target/release/kernaid-rescue-vaultd}"
 vaultctl_binary="${KERNAID_RESCUE_VAULTCTL_BINARY:-$repo_dir/target/release/kernaid-rescue-vaultctl}"
 openai_executor_binary="${KERNAID_RESCUE_OPENAI_EXECUTOR_BINARY:-$repo_dir/target/release/kernaid-rescue-openai-executor}"
+hardware_inventory_binary="${KERNAID_LINUX_HARDWARE_INVENTORY_BINARY:-$repo_dir/target/release/kernaid-linux-hardware-inventory}"
 vaultd_destination="$build_dir/config/includes.chroot/usr/lib/kernaid/kernaid-rescue-vaultd"
 vaultctl_destination="$build_dir/config/includes.chroot/usr/bin/kernaid-rescue-vaultctl"
 openai_executor_destination="$build_dir/config/includes.chroot/usr/lib/kernaid/kernaid-rescue-openai-executor"
+hardware_inventory_destination="$build_dir/config/includes.chroot/usr/lib/kernaid/kernaid-linux-hardware-inventory"
 vaultd_destination_dir="$(dirname "$vaultd_destination")"
 vaultctl_destination_dir="$(dirname "$vaultctl_destination")"
 vaultctl_destination_dir_created=0
@@ -46,8 +48,9 @@ PY
 validate_amd64_elf "$vaultd_binary" "Rescue vault daemon"
 validate_amd64_elf "$vaultctl_binary" "Rescue vault companion"
 validate_amd64_elf "$openai_executor_binary" "Rescue OpenAI executor"
+validate_amd64_elf "$hardware_inventory_binary" "Linux hardware inventory collector"
 
-for destination in "$vaultd_destination" "$vaultctl_destination" "$openai_executor_destination"; do
+for destination in "$vaultd_destination" "$vaultctl_destination" "$openai_executor_destination" "$hardware_inventory_destination"; do
   if [[ -e "$destination" || -L "$destination" ]]; then
     echo "Refusing to overwrite a pre-existing staged Rescue binary: $destination" >&2
     exit 2
@@ -69,7 +72,7 @@ else
 fi
 
 cleanup_staged_binaries() {
-  rm -f -- "$vaultd_destination" "$vaultctl_destination" "$openai_executor_destination"
+  rm -f -- "$vaultd_destination" "$vaultctl_destination" "$openai_executor_destination" "$hardware_inventory_destination"
   if [[ "$vaultctl_destination_dir_created" = "1" ]]; then
     rmdir -- "$vaultctl_destination_dir"
   fi
@@ -79,12 +82,15 @@ trap cleanup_staged_binaries EXIT
 install -o root -g root -m 0755 "$vaultd_binary" "$vaultd_destination"
 install -o root -g root -m 0755 "$vaultctl_binary" "$vaultctl_destination"
 install -o root -g root -m 0755 "$openai_executor_binary" "$openai_executor_destination"
+install -o root -g root -m 0755 "$hardware_inventory_binary" "$hardware_inventory_destination"
 test "$(stat -c '%u:%g:%a' "$vaultd_destination")" = "0:0:755"
 test "$(stat -c '%u:%g:%a' "$vaultctl_destination")" = "0:0:755"
 test "$(stat -c '%u:%g:%a' "$openai_executor_destination")" = "0:0:755"
+test "$(stat -c '%u:%g:%a' "$hardware_inventory_destination")" = "0:0:755"
 python3 -I "$repo_dir/tools/build-rescue/verify-shipping-binary.py" "$vaultd_destination"
 python3 -I "$repo_dir/tools/build-rescue/verify-shipping-binary.py" "$vaultctl_destination"
 python3 -I "$repo_dir/tools/build-rescue/verify-shipping-binary.py" "$openai_executor_destination"
+python3 -I "$repo_dir/tools/build-rescue/verify-shipping-binary.py" "$hardware_inventory_destination"
 
 cd "$repo_dir"
 if [[ "${KERNAID_DESK_PREBUILT:-0}" != "1" ]]; then

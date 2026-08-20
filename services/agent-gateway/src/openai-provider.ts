@@ -26,6 +26,7 @@ const DEFAULT_MAX_RESPONSE_BYTES = 256 * 1024;
 const DEFAULT_MAX_OUTPUT_TOKENS = 2_048;
 const MAX_CONFIGURED_BYTES = 16 * 1024 * 1024;
 const MAX_TIMEOUT_MS = 5 * 60_000;
+const LOCAL_ONLY_HARDWARE_COLLECTOR = "linux.hardware.inventory";
 
 const DIAGNOSIS_INSTRUCTIONS = [
   "Diagnose the reported computer fault only from the supplied observations.",
@@ -129,7 +130,7 @@ export class OpenAIResponsesProvider implements Provider {
     evidence: readonly ObservedEvidence[],
     options: ProviderRequestOptions = {},
   ): Promise<DiagnosisProposal> {
-    const input = await safeDiagnosisInput(objective, evidence);
+    const context = await safeDiagnosisInput(objective, evidence);
     const envelope = await postJson(
       this.#request,
       {
@@ -137,7 +138,7 @@ export class OpenAIResponsesProvider implements Provider {
         store: false,
         max_output_tokens: this.#request.maxOutputTokens,
         instructions: DIAGNOSIS_INSTRUCTIONS,
-        input: [{ role: "user", content: JSON.stringify(input) }],
+        input: [{ role: "user", content: JSON.stringify(context.input) }],
         text: {
           format: {
             type: "json_schema",
@@ -149,7 +150,10 @@ export class OpenAIResponsesProvider implements Provider {
       },
       options.signal,
     );
-    return validatedProposal(extractResponsesText(envelope));
+    return validatedProposal(
+      extractResponsesText(envelope),
+      context.evidenceIds,
+    );
   }
 }
 
@@ -182,7 +186,7 @@ export class OpenAICompatibleProvider implements Provider {
     evidence: readonly ObservedEvidence[],
     options: ProviderRequestOptions = {},
   ): Promise<DiagnosisProposal> {
-    const input = await safeDiagnosisInput(objective, evidence);
+    const context = await safeDiagnosisInput(objective, evidence);
     const responseFormat =
       this.#responseFormat === "json-schema"
         ? {
@@ -202,13 +206,16 @@ export class OpenAICompatibleProvider implements Provider {
         max_tokens: this.#request.maxOutputTokens,
         messages: [
           { role: "system", content: DIAGNOSIS_INSTRUCTIONS },
-          { role: "user", content: JSON.stringify(input) },
+          { role: "user", content: JSON.stringify(context.input) },
         ],
         response_format: responseFormat,
       },
       options.signal,
     );
-    return validatedProposal(extractChatCompletionText(envelope));
+    return validatedProposal(
+      extractChatCompletionText(envelope),
+      context.evidenceIds,
+    );
   }
 }
 
@@ -307,9 +314,20 @@ async function sha256Hex(value: string): Promise<string> {
 async function safeDiagnosisInput(
   objective: string,
   evidence: readonly ObservedEvidence[],
-): Promise<object> {
+): Promise<{ input: object; evidenceIds: ReadonlySet<string> }> {
   try {
-    return await diagnosisInput(objective, evidence);
+    const visibleEvidence = evidence.filter(
+      (item) => item.evidence.collector !== LOCAL_ONLY_HARDWARE_COLLECTOR,
+    );
+    const evidenceIds = new Set(
+      visibleEvidence.map((item) => item.evidence.id),
+    );
+    if (evidenceIds.size !== visibleEvidence.length)
+      throw new ProviderError("invalid_request", "Provider input is invalid");
+    return {
+      input: await diagnosisInput(objective, visibleEvidence),
+      evidenceIds,
+    };
   } catch (error) {
     if (error instanceof ProviderError) throw error;
     throw new ProviderError("invalid_request", "Provider input is invalid");
@@ -703,11 +721,17 @@ function extractChatCompletionText(value: unknown): string {
   return text;
 }
 
-function validatedProposal(text: string): DiagnosisProposal {
+function validatedProposal(
+  text: string,
+  evidenceIds: ReadonlySet<string>,
+): DiagnosisProposal {
   let candidate: unknown;
   try {
     candidate = extractJson(text);
-    return parseDiagnosisProposal(candidate);
+    const proposal = parseDiagnosisProposal(candidate);
+    if (proposal.evidenceIds.some((evidenceId) => !evidenceIds.has(evidenceId)))
+      throw invalidResponse();
+    return proposal;
   } catch (error) {
     if (error instanceof ProviderError) throw error;
     throw invalidResponse();

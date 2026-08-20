@@ -2,6 +2,7 @@
 //! Linux read-only diagnostics and opt-in disposable fixture repair primitives.
 
 pub mod diagnostics;
+pub mod hardware;
 pub mod snapshot;
 
 #[cfg(feature = "fixture-repair-lab")]

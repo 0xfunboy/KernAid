@@ -155,6 +155,13 @@ class LinuxSnapshotEndToEndTests(unittest.TestCase):
         self.assertIn("collect_current_root_snapshot()", command)
         self.assertNotIn("fixture", command.lower())
         self.assertNotIn("Path", command)
+        hardware_start = source.index(
+            "#[tauri::command]\nasync fn collect_local_inventory()"
+        )
+        hardware_end = source.index("\n#[tauri::command]", hardware_start + 1)
+        hardware_command = source[hardware_start:hardware_end]
+        self.assertIn("collect_local_inventory_sync", hardware_command)
+        self.assertNotIn("Path", hardware_command)
         handler_start = source.index("macro_rules! production_invoke_handler")
         handler_end = source.index("\nfn main()", handler_start)
         production_handler = source[handler_start:handler_end]
@@ -162,15 +169,17 @@ class LinuxSnapshotEndToEndTests(unittest.TestCase):
             production_handler.count("collect_linux_normalized_snapshot"),
             1,
         )
+        self.assertEqual(production_handler.count("collect_local_inventory"), 1)
         self.assertEqual(
             source.count(".invoke_handler(production_invoke_handler!())"),
-            2,
+            3,
         )
         self.assertEqual(source.count("tauri::generate_handler!["), 1)
         harness = RESIDENT_HARNESS.read_text(encoding="utf-8")
         for token in (
             "unshare --user --map-root-user --mount --pid --fork",
             "--exact \"$probe_name\" --ignored",
+            "--exact \"$hardware_probe_name\" --ignored",
             "tree_fingerprint",
         ):
             self.assertIn(token, harness)
@@ -179,6 +188,15 @@ class LinuxSnapshotEndToEndTests(unittest.TestCase):
             '"\\nKERNAID_RESIDENT_LINUX_SNAPSHOT_E2E_V1 '
             'semantic_sha256={semantic_digest:x}"',
             source,
+        )
+        self.assertIn(
+            '"\\nKERNAID_RESIDENT_LINUX_HARDWARE_IPC_V1 '
+            'document_sha256={digest:x}"',
+            source,
+        )
+        self.assertIn(
+            "Resident hardware IPC digest marker was not unique",
+            harness,
         )
         self.assertIn('rb"^" + re.escape(prefix.encode("ascii"))', harness)
         marker = (

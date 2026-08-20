@@ -23,6 +23,9 @@ path="src/main.rs"
 name="kernaid-linux-diagnose"
 path="src/bin/diagnose.rs"
 [[bin]]
+name="kernaid-linux-hardware-inventory"
+path="src/bin/hardware_inventory.rs"
+[[bin]]
 name="kernaid-linux-snapshot-fixture"
 path="src/bin/snapshot_fixture.rs"
 required-features=["fixture-snapshot-cli"]

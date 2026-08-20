@@ -25,6 +25,8 @@ use std::fs::File;
 use std::os::unix::process::CommandExt;
 #[cfg(unix)]
 use std::process::Child;
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicU8, Ordering};
 #[cfg(target_os = "macos")]
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
@@ -49,6 +51,16 @@ const QUALIFIED_MACOS_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_BROKER_SESSIONS: usize = 1_024;
 #[cfg(target_os = "linux")]
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(target_os = "linux")]
+const HARDWARE_COLLECTOR_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(target_os = "linux")]
+const HARDWARE_COLLECTOR_IDLE: u8 = 0;
+#[cfg(target_os = "linux")]
+const HARDWARE_COLLECTOR_RUNNING: u8 = 1;
+#[cfg(target_os = "linux")]
+const HARDWARE_COLLECTOR_POISONED: u8 = 2;
+#[cfg(target_os = "linux")]
+static HARDWARE_COLLECTOR_STATE: AtomicU8 = AtomicU8::new(HARDWARE_COLLECTOR_IDLE);
 const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 #[cfg(unix)]
 const TERMINATION_GRACE: Duration = Duration::from_millis(250);
@@ -1238,6 +1250,7 @@ fn collect_local_inventory_sync() -> Vec<Observation> {
     #[cfg(target_os = "linux")]
     {
         observations.push(fixed_command("system.hostname", "/usr/bin/hostname", &[]));
+        observations.push(collect_linux_hardware_inventory());
         observations.push(fixed_command(
             "linux.block.inventory",
             "/usr/bin/lsblk",
@@ -1303,6 +1316,86 @@ fn collect_local_inventory_sync() -> Vec<Observation> {
         observations.extend(collect_macos_identity_observations());
     }
     observations
+}
+
+#[cfg(target_os = "linux")]
+fn collect_linux_hardware_inventory() -> Observation {
+    match collect_linux_hardware_inventory_bounded(
+        &HARDWARE_COLLECTOR_STATE,
+        HARDWARE_COLLECTOR_TIMEOUT,
+        kernaid_linux_pack::hardware::collect_current_machine,
+    )
+    .and_then(|inventory| kernaid_linux_pack::hardware::to_bounded_json(&inventory).map_err(|_| ()))
+    {
+        Ok(output) => Observation {
+            collector: kernaid_linux_pack::hardware::COLLECTOR,
+            trust: "observed-untrusted",
+            output,
+            success: true,
+            truncated: false,
+        },
+        Err(_) => Observation {
+            collector: kernaid_linux_pack::hardware::COLLECTOR,
+            trust: "observed-untrusted",
+            output: "collector unavailable: normalized hardware inventory did not complete safely"
+                .to_owned(),
+            success: false,
+            truncated: false,
+        },
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn collect_linux_hardware_inventory_bounded(
+    state: &'static AtomicU8,
+    timeout: Duration,
+    collect: impl FnOnce() -> kernaid_linux_pack::hardware::HardwareInventory + Send + 'static,
+) -> Result<kernaid_linux_pack::hardware::HardwareInventory, ()> {
+    if state
+        .compare_exchange(
+            HARDWARE_COLLECTOR_IDLE,
+            HARDWARE_COLLECTOR_RUNNING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return Err(());
+    }
+    let (sender, receiver) = mpsc::sync_channel(0);
+    if thread::Builder::new()
+        .name("kernaid-linux-hardware-inventory".to_owned())
+        .spawn(move || {
+            let inventory = collect();
+            let _ = sender.send(inventory);
+        })
+        .is_err()
+    {
+        state.store(HARDWARE_COLLECTOR_IDLE, Ordering::Release);
+        return Err(());
+    }
+    match receiver.recv_timeout(timeout) {
+        Ok(inventory) => {
+            state
+                .compare_exchange(
+                    HARDWARE_COLLECTOR_RUNNING,
+                    HARDWARE_COLLECTOR_IDLE,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .map_err(|_| ())?;
+            Ok(inventory)
+        }
+        Err(_) => {
+            let _ = state.compare_exchange(
+                HARDWARE_COLLECTOR_RUNNING,
+                HARDWARE_COLLECTOR_POISONED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            Err(())
+        }
+    }
 }
 
 #[tauri::command]
@@ -1691,6 +1784,46 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn linux_inventory_ipc_request(
+        webview: &tauri::WebviewWindow<tauri::test::MockRuntime>,
+        body: tauri::ipc::InvokeBody,
+    ) -> serde_json::Value {
+        tauri::test::get_ipc_response(
+            webview,
+            tauri::webview::InvokeRequest {
+                cmd: "collect_local_inventory".into(),
+                callback: tauri::ipc::CallbackFn(0),
+                error: tauri::ipc::CallbackFn(1),
+                url: "tauri://localhost".parse().expect("fixed Tauri URL"),
+                body,
+                headers: Default::default(),
+                invoke_key: tauri::test::INVOKE_KEY.to_owned(),
+            },
+        )
+        .expect("Resident inventory IPC command")
+        .deserialize()
+        .expect("Resident inventory IPC JSON")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn hardware_document_from_ipc(response: &serde_json::Value) -> &str {
+        let matches = response
+            .as_array()
+            .expect("Resident inventory array")
+            .iter()
+            .filter(|item| item["collector"] == kernaid_linux_pack::hardware::COLLECTOR)
+            .collect::<Vec<_>>();
+        assert_eq!(matches.len(), 1, "hardware observation cardinality");
+        let observation = matches[0];
+        assert_eq!(observation["trust"], "observed-untrusted");
+        assert_eq!(observation["success"], true);
+        assert_eq!(observation["truncated"], false);
+        observation["output"]
+            .as_str()
+            .expect("normalized hardware document")
+    }
+
+    #[cfg(target_os = "linux")]
     fn assert_rootless_single_id_mapping() {
         let mapping =
             std::fs::read_to_string("/proc/self/uid_map").expect("rootless user-namespace UID map");
@@ -1703,6 +1836,102 @@ mod tests {
         assert_eq!(rows[0][0], "0", "the namespace UID must be root");
         assert_ne!(rows[0][1], "0", "the outer UID must remain unprivileged");
         assert_eq!(rows[0][2], "1", "the namespace must map one UID only");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fixture_hardware_inventory() -> kernaid_linux_pack::hardware::HardwareInventory {
+        kernaid_linux_pack::hardware::parse_bounded_json(include_bytes!(
+            "../../../../tests/fixtures/linux-hardware-inventory/healthy.v1.json"
+        ))
+        .expect("fixed hardware fixture")
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_hardware_bounded_worker_releases_before_success_handoff() {
+        let state: &'static AtomicU8 = Box::leak(Box::new(AtomicU8::new(HARDWARE_COLLECTOR_IDLE)));
+        let inventory = collect_linux_hardware_inventory_bounded(
+            state,
+            Duration::from_secs(1),
+            fixture_hardware_inventory,
+        )
+        .expect("bounded hardware collection");
+        assert_eq!(inventory, fixture_hardware_inventory());
+        assert_eq!(state.load(Ordering::Acquire), HARDWARE_COLLECTOR_IDLE);
+
+        collect_linux_hardware_inventory_bounded(
+            state,
+            Duration::from_secs(1),
+            fixture_hardware_inventory,
+        )
+        .expect("immediate bounded hardware recollection");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_hardware_bounded_worker_rejects_concurrent_collection() {
+        let state: &'static AtomicU8 = Box::leak(Box::new(AtomicU8::new(HARDWARE_COLLECTOR_IDLE)));
+        let (entered_sender, entered_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let first = thread::spawn(move || {
+            collect_linux_hardware_inventory_bounded(state, Duration::from_secs(1), move || {
+                entered_sender.send(()).expect("worker entry signal");
+                release_receiver.recv().expect("worker release signal");
+                fixture_hardware_inventory()
+            })
+        });
+        entered_receiver.recv().expect("bounded worker entered");
+        assert!(
+            collect_linux_hardware_inventory_bounded(
+                state,
+                Duration::from_millis(10),
+                fixture_hardware_inventory,
+            )
+            .is_err(),
+            "a concurrent hardware collection must fail closed",
+        );
+        assert_eq!(state.load(Ordering::Acquire), HARDWARE_COLLECTOR_RUNNING);
+        release_sender.send(()).expect("release bounded worker");
+        first
+            .join()
+            .expect("bounded worker thread")
+            .expect("first bounded collection");
+        assert_eq!(state.load(Ordering::Acquire), HARDWARE_COLLECTOR_IDLE);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_hardware_bounded_worker_poison_is_permanent_after_timeout() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        };
+
+        let state: &'static AtomicU8 = Box::leak(Box::new(AtomicU8::new(HARDWARE_COLLECTOR_IDLE)));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let worker_attempts = Arc::clone(&attempts);
+        assert!(
+            collect_linux_hardware_inventory_bounded(state, Duration::from_millis(10), move || {
+                worker_attempts.fetch_add(1, AtomicOrdering::AcqRel);
+                thread::sleep(Duration::from_millis(100));
+                fixture_hardware_inventory()
+            },)
+            .is_err(),
+            "a timed-out hardware collection must fail closed",
+        );
+        assert_eq!(state.load(Ordering::Acquire), HARDWARE_COLLECTOR_POISONED);
+        assert!(
+            collect_linux_hardware_inventory_bounded(
+                state,
+                Duration::from_millis(10),
+                fixture_hardware_inventory,
+            )
+            .is_err(),
+            "a poisoned hardware collector must not spawn another worker",
+        );
+        thread::sleep(Duration::from_millis(120));
+        assert_eq!(attempts.load(AtomicOrdering::Acquire), 1);
+        assert_eq!(state.load(Ordering::Acquire), HARDWARE_COLLECTOR_POISONED);
     }
 
     #[cfg(target_os = "linux")]
@@ -1807,6 +2036,52 @@ mod tests {
         let semantic_digest =
             Sha256::digest([E2E_SEMANTIC_HASH_DOMAIN, sorted_snapshot.as_slice()].concat());
         println!("\nKERNAID_RESIDENT_LINUX_SNAPSHOT_E2E_V1 semantic_sha256={semantic_digest:x}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "run only through the Resident production IPC harness"]
+    fn resident_linux_hardware_tauri_ipc_probe() {
+        use sha2::{Digest, Sha256};
+
+        const HASH_DOMAIN: &[u8] = b"KERNAID_LINUX_HARDWARE_INVENTORY_IPC_V1\0";
+        let app = tauri::test::mock_builder()
+            .invoke_handler(production_invoke_handler!())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("mock Tauri application");
+        let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .expect("mock Tauri webview");
+
+        let response = linux_inventory_ipc_request(&webview, Default::default());
+        let output = hardware_document_from_ipc(&response);
+        let inventory = kernaid_linux_pack::hardware::parse_bounded_json(output.as_bytes())
+            .expect("strict hardware document");
+        assert_eq!(
+            inventory.cpu.status,
+            kernaid_linux_pack::hardware::SourceStatus::Complete
+        );
+        assert_eq!(
+            inventory.memory.status,
+            kernaid_linux_pack::hardware::SourceStatus::Complete
+        );
+        assert!(inventory.cpu.logical_processors.is_some());
+        assert!(inventory.memory.total_bytes.is_some());
+
+        let marker_body = serde_json::json!({
+            "root": "/outside-root/KERNAID_HARDWARE_CALLER_PATH_MUST_BE_IGNORED"
+        });
+        let marker_attempt =
+            linux_inventory_ipc_request(&webview, tauri::ipc::InvokeBody::Json(marker_body));
+        let marker_output = hardware_document_from_ipc(&marker_attempt);
+        assert!(
+            marker_output == output,
+            "caller JSON changed the parameter-free hardware document"
+        );
+        assert!(!output.contains("KERNAID_HARDWARE_CALLER_PATH_MUST_BE_IGNORED"));
+
+        let digest = Sha256::digest([HASH_DOMAIN, output.as_bytes()].concat());
+        println!("\nKERNAID_RESIDENT_LINUX_HARDWARE_IPC_V1 document_sha256={digest:x}");
     }
 
     fn macos_fixture_evidence() -> Vec<NativeDiagnosticEvidence> {
