@@ -1676,8 +1676,9 @@ mod tests {
         );
         diagnostic_request.objective =
             "Diagnose username=alice from C:\\Users\\alice\\report.txt".to_owned();
-        #[cfg(not(target_os = "linux"))]
-        diagnostic_request.evidence[0].target = "host=customer-workstation".to_owned();
+        if cfg!(not(target_os = "linux")) {
+            diagnostic_request.evidence[0].target = "host=customer-workstation".to_owned();
+        }
         diagnostic_request.evidence[0].summary =
             "owner=alice https://example.test/private/history".to_owned();
         let proposal = runtime

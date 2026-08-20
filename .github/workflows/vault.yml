@@ -27,7 +27,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88.0
-        with: { components: rustfmt, clippy }
+        with:
+          components: "rustfmt, clippy"
       - name: Install disposable-image tooling
         run: sudo apt-get update && sudo apt-get install -y cryptsetup e2fsprogs gdisk shellcheck
       - name: Validate the vault test shell
