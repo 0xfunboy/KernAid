@@ -1,12 +1,20 @@
 # KernAid
 
-KernAid is an evidence-first machine diagnosis and repair platform. This repository implements the Phase 0 feasibility spike from `KERNAID_PRODUCT_AND_REPO_MASTERPLAN.md`.
+KernAid is an evidence-first machine diagnosis and repair platform. This repository implements the Phase 0 feasibility spike described in the [masterplan](docs/MASTERPLAN.md).
 
-The current vertical slice is deliberately safe: start a session, collect a normalized read-only host snapshot, run deterministic offline diagnostic rules, validate an R0 plan through Core, and export a downloadable, hashed JSON report. No target mutation is implemented.
+The current production vertical slice is deliberately safe: start a session, collect a normalized read-only host snapshot, run deterministic offline diagnostic rules, validate an R0 plan through Core, and export a downloadable, hashed JSON report. Production target mutation is not implemented. A separate opt-in `fixture-repair-lab` feature exercises one pinned repair and rollback only against a marked disposable fixture; it is absent from normal builds and is not connected to Core, IPC, Tauri, providers, Rescue, or production target selection.
 
 ## Quick start
 
 Requirements: Rust stable (pinned by `rust-toolchain.toml`), Node 24.18.0, pnpm 9, and `just`.
+
+On Debian or Ubuntu development hosts, install the native linker and Tauri
+prerequisites used by CI before running the commands below:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y build-essential pkg-config libwebkit2gtk-4.1-dev curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+```
 
 ```bash
 just bootstrap
@@ -15,18 +23,23 @@ just test
 just run-desk
 ```
 
-`just test-observe` copies a disposable fixture, runs the collector, then byte-compares the fixture tree. It never accepts a physical block-device path.
+`just test-observe` runs against the repository-owned Linux fixture and compares
+every file path and byte before and after collection. It never accepts a
+physical block-device path.
 
 CI produces engineering-preview desktop installers for Windows, Linux, Intel macOS and Apple-silicon macOS, plus a separate amd64 hybrid BIOS/UEFI Rescue ISO. Download them from the successful GitHub Actions run artifacts. Production distribution still requires Windows code signing and Apple signing/notarization.
 
 ## Use in the workshop
 
-- **PC that does not boot (controlled engineering preview):** download the
-  catalog-authorized `KernAid-Rescue-amd64` image, verify it, and use the
-  catalog-enforcing Linux writer in `tools/make-device` to create the USB. The
-  currently active writer v1 copies and verifies only the ISO prefix and does
-  not provision the persistent vault; physical USB boot and firmware remain
-  unqualified. On a successful boot, select the
+- **PC that does not boot (controlled engineering preview):** no currently
+  downloadable Rescue ISO is authorized by the checked-in catalogs. The v1
+  entry is historical and its workflow artifact is no longer available; v2
+  authorizes no image. Do not write a current workflow artifact to physical
+  USB. After an exact image is explicitly promoted, verify it and use the
+  catalog-enforcing Linux writer in `tools/make-device`; the active writer v1
+  copies and verifies only the ISO prefix and does not provision the persistent
+  vault. Physical USB boot and firmware remain unqualified. On a successful
+  boot, select the
   installed-system candidate in the left rail, and keep Secure Boot disabled
   for this engineering preview. The target is re-scanned before every session;
   target selection itself remains metadata-only. When **Diagnostica** starts,
@@ -65,7 +78,7 @@ rendering, live provider TLS, a real account, Secure Boot, or physical media.
 
 ## Trust boundaries
 
-The React UI talks only to a `SessionDriver`. Providers return diagnosis proposals and cannot reach the broker. Core validates plans and policy. The broker accepts an allowlisted typed envelope; in Phase 0 its only action is `system.observe.noop`.
+The React UI talks only to a `SessionDriver`. Providers return diagnosis proposals and cannot reach the broker. Core validates plans and policy. The default production broker accepts an allowlisted typed envelope; in Phase 0 its only action is `system.observe.noop`.
 
 See the [operator guide](docs/operator-guide.md), [architecture](docs/architecture/phase-0.md), [security policy](SECURITY.md), and the complete [masterplan](docs/MASTERPLAN.md).
 
@@ -78,7 +91,7 @@ See the [operator guide](docs/operator-guide.md), [architecture](docs/architectu
   active physical writer does not provision that vault, and live TLS with a
   real account, physical-media qualification and the isolated Codex CLI bridge
   remain incomplete.
-- Native host inventory is intentionally limited and has no mutation or repair handler. Windows SFC is explicitly reported as `not-run-unqualified` until a locale-independent result adapter and physical qualification exist. macOS likewise leaves system-domain `launchd`, update freshness, incident counts, and login/background-item counts explicitly unqualified until observation-only sources are physically qualified. KernAid does not turn absent, stale or ambiguous data into a clean result.
+- Native production host inventory is intentionally limited and has no mutation or repair handler; the opt-in fixture lab is not a production host path. Windows SFC is explicitly reported as `not-run-unqualified` until a locale-independent result adapter and physical qualification exist. macOS likewise leaves system-domain `launchd`, update freshness, incident counts, and login/background-item counts explicitly unqualified until observation-only sources are physically qualified. KernAid does not turn absent, stale or ambiguous data into a clean result.
 - Promotion of encrypted Rescue persistence to trusted physical media, Secure
   Boot, physical-machine validation and actual repair actions remain release
   gates.

@@ -14,12 +14,12 @@ The local gate is `tests/integration/linux-snapshot-parity.sh`. It runs both
 language implementations against the fixed fixture and proves that contents,
 directory topology, modes, sizes, mtimes, and ctimes did not change.
 
-The QEMU promotion gate is a second phase because it requires the promoted b19
-Rescue ISO. It must collect this same fixture once through the Resident command
-and once through the selected-installed-target Rescue API, then apply the same
-snapshot/hash comparison and verify the Rescue capture claims. Passing the
-local gate alone does not attest physical media read-only behavior, firmware
-coverage, or a promoted ISO artifact.
+The QEMU promotion gate is a second phase because it requires an exact promoted
+candidate Rescue ISO. It must collect this same fixture once through the
+Resident command and once through the selected-installed-target Rescue API,
+then apply the same snapshot/hash comparison and verify the Rescue capture
+claims. Passing the local gate alone does not attest physical media read-only
+behavior, firmware coverage, or a promoted ISO artifact.
 
 `healthy` is a single-root-filesystem topology. `multi-fs` deliberately
 declares separate `/boot`, `/usr`, and `/var` filesystems and contains

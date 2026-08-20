@@ -52,15 +52,11 @@ duplicate bindings.
 
 ## Verification
 
-With the repository's pinned linker wrapper available:
+With the repository's pinned Rust toolchain and a system C linker available:
 
 ```sh
-CC=/tmp/kernaid-zig-cc \
-CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/tmp/kernaid-zig-cc \
 cargo test --locked -p kernaid-linux-pack --features fixture-repair-lab
 
-CC=/tmp/kernaid-zig-cc \
-CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/tmp/kernaid-zig-cc \
 cargo test --locked -p kernaid-broker --features fixture-repair-lab \
   coherent_fixture_runs_diagnosis_repair_verify_rollback_and_signed_report
 ```

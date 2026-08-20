@@ -14,6 +14,12 @@ costruita e avviata con successo in QEMU BIOS e UEFI nel run GitHub Actions
 immagine viene rifiutata fail-closed; non basta fornire un SHA-256 arbitrario
 dalla riga di comando.
 
+La voce v1 è storica e l'artefatto del workflow collegato non è più
+scaricabile. Nessun artefatto Rescue corrente è stato promosso nei cataloghi
+in questa revisione, mentre il catalogo v2 resta vuoto. Di conseguenza il
+flusso ufficiale download + writer è sospeso: non sostituire l'ISO con un
+artefatto Actions non promosso.
+
 Questa evidenza v1 avvia l'immagine come CD-ROM virtuale QEMU: non prova il boot
 da USB né firmware o hardware fisici. Il writer v1 copia e verifica il prefisso
 ISO ma non provisiona la p3 persistente.

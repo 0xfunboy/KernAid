@@ -23,7 +23,7 @@ jobs:
         run: cargo test --locked -p kernaid-broker --features fixture-repair-lab
       - name: Prove Observe fixture makes zero writes
         run: ./tests/integration/observe-zero-writes.sh
-      - name: Prove Resident and Rescue Linux snapshot parity without writes
+      - name: Prove snapshot parity without content or tracked-metadata changes
         run: bash ./tests/integration/linux-snapshot-parity.sh
       - name: Test Rescue authorization boundary
         run: python3 -m unittest discover -s tests/rescue -p 'test_*.py'

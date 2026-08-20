@@ -136,4 +136,4 @@ else:
 PY
 done
 
-echo "PASS: Resident and Rescue snapshots match supported and multi-fs goldens with zero fixture writes"
+echo "PASS: Resident and Rescue snapshots match goldens without content or tracked-metadata changes"

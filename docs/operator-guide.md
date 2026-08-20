@@ -6,6 +6,12 @@ unattended repair until those release gates are completed.
 
 ## Create the Rescue USB
 
+This procedure is currently suspended: the checked-in v1 entry is historical
+and its GitHub artifact is no longer downloadable, while the v2 catalog
+authorizes no image. Do not substitute an unpromoted workflow artifact. Resume
+these steps only after an exact Rescue image and matching writer bundle are
+explicitly promoted.
+
 1. Download the released `KernAid-Rescue-amd64.iso`, its checksum, and the
    matching `make-device` bundle. Do not use an ISO from an untrusted mirror.
 2. Extract the files and keep the ISO on a disk other than the USB that will be
@@ -20,8 +26,8 @@ unattended repair until those release gates are completed.
    as documented in `tools/make-device/README.md`. It accepts only an ISO in the
    built-in attested catalog, requires an explicit whole USB device, asks for a
    physical confirmation, writes it, and verifies every ISO byte. **The selected
-   USB is overwritten.** Rufus or balenaEtcher remain an engineering fallback
-   on Windows/macOS, but they do not enforce the KernAid trust catalog.
+   USB is overwritten.** Do not substitute Rufus, balenaEtcher, or another
+   writer: they do not enforce the KernAid trust catalog.
 5. Attempt to boot the target PC from its one-time boot menu. The current boot
    evidence is QEMU-only; physical USB and firmware compatibility are not yet
    qualified. For the engineering image, disable Secure Boot if firmware

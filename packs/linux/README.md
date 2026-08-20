@@ -8,7 +8,9 @@ collectors after sandboxing and redaction tests exist.
 The library contains a deliberately isolated R2 repair transaction for one
 known missing-device `fstab` entry. It is **fixture-only**: the exact
 `.kernaid-disposable-fixture` marker is mandatory, and the code is not wired to
-Tauri, Rescue, the broker, or real disks.
+Tauri, Rescue, the production broker build, or real disks. An opt-in broker
+feature exposes only the typed fixture-lab transaction; default broker builds
+do not depend on this pack or its storage mutation implementation.
 
 `action-pack.fixture-v1.yaml` and its JSON input schema pin the single
 `linux.fstab.repair-entry.fixture-v1` contract at compile time. That manifest
@@ -76,8 +78,8 @@ evidence documents:
   between records;
 - a normalized `fstab` projection containing only UUID and `nofail` state,
   compared with UUIDs from the bound `lsblk` evidence;
-- C-locale, byte-valued `df` rows (`Filesystem ... Used Available Use% Mounted
-  on`);
+- C-locale, byte-valued `df` rows
+  (`Filesystem ... Used Available Use% Mounted on`);
 - `ip -json link` data;
 - `ip -json route` data; and
 - `dpkg --audit` output, where empty output is healthy and non-empty output is
