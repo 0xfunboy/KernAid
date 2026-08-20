@@ -924,6 +924,33 @@ class ResponseParserTests(unittest.TestCase):
         self.assertEqual(unknown.exception.stage, "response")
         self.assertEqual(unknown.exception.code, "unlock-invalid")
 
+    def test_lock_parser_classifies_only_exact_faulted_reboot_response(self) -> None:
+        with self.assertRaises(controller.ClosedFailure) as classified:
+            controller.parse_companion_response(
+                b"stateVersion: 28\nvaultState: faulted-reboot-required\n"
+                b"error: REBOOT_REQUIRED\n",
+                command="lock",
+                return_code=1,
+            )
+        self.assertEqual(classified.exception.stage, "response")
+        self.assertEqual(
+            classified.exception.code, "lock-remote-reboot-required"
+        )
+
+        for block in [
+            b"stateVersion: 28\nvaultState: faulted-reboot-required\n"
+            b"error: FUTURE_ERROR\n",
+            b"stateVersion: 28\nvaultState: faulted-reboot-required\n"
+            b"error: REBOOT_REQUIRED\nextra\n",
+        ]:
+            with self.subTest(block=block), self.assertRaises(
+                controller.ClosedFailure
+            ) as rejected:
+                controller.parse_companion_response(
+                    block, command="lock", return_code=1
+                )
+            self.assertEqual(rejected.exception.code, "extra-output")
+
     def test_provider_companion_parser_is_exact_and_boot_prior_is_correlated(self) -> None:
         configured = controller.ProviderCompanionResponse(
             16, "configured", "unconfigured", None, 0

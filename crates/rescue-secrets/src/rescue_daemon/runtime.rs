@@ -932,15 +932,28 @@ impl ProviderCgroupTree {
                     if self.validate_populated_topology().is_ok() {
                         return Ok(false);
                     }
-                    // Population may drop and systemd may collect the unit
-                    // between the fresh populated=1 read and the topology
-                    // walk. Accept that race only through the same exact
-                    // named-path-absence plus retained ENODEV proof.
-                    if self.verify_garbage_collected()? {
-                        Ok(true)
-                    } else {
-                        Err(RescueVaultDaemonError::CgroupUnavailable)
-                    }
+                    // Population may drop while systemd recursively trims
+                    // .control, agent, and finally the unit root between the
+                    // fresh populated=1 read and the topology walk. Re-read
+                    // the retained events file: an exact populated=0 is the
+                    // same terminal evidence accepted above. A still-live or
+                    // ENODEV descriptor remains closed unless the complete
+                    // named-path-absence plus retained ENODEV proof succeeds.
+                    let population = match read_cgroup_events_fd(self.events.as_fd()) {
+                        Ok(false) => RetainedPopulationState::Empty,
+                        Ok(true) => RetainedPopulationState::Populated,
+                        Err(error) if error == rustix::io::Errno::NODEV => {
+                            RetainedPopulationState::Gone
+                        }
+                        Err(_) => return Err(RescueVaultDaemonError::CgroupUnavailable),
+                    };
+                    let garbage_collected = match population {
+                        RetainedPopulationState::Empty => false,
+                        RetainedPopulationState::Populated | RetainedPopulationState::Gone => {
+                            self.verify_garbage_collected()?
+                        }
+                    };
+                    classify_topology_race(population, garbage_collected)
                 }
                 Err(error) if error == rustix::io::Errno::NODEV => self.verify_garbage_collected(),
                 Err(_) => Err(RescueVaultDaemonError::CgroupUnavailable),
@@ -1070,6 +1083,28 @@ impl ProviderCgroupTree {
 enum NamedCgroupState {
     Present,
     Absent,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RetainedPopulationState {
+    Populated,
+    Empty,
+    Gone,
+}
+
+fn classify_topology_race(
+    population: RetainedPopulationState,
+    garbage_collected: bool,
+) -> Result<bool, RescueVaultDaemonError> {
+    match population {
+        RetainedPopulationState::Empty => Ok(true),
+        RetainedPopulationState::Populated | RetainedPopulationState::Gone if garbage_collected => {
+            Ok(true)
+        }
+        RetainedPopulationState::Populated | RetainedPopulationState::Gone => {
+            Err(RescueVaultDaemonError::CgroupUnavailable)
+        }
+    }
 }
 
 fn garbage_collection_evidence_is_terminal(
@@ -3176,6 +3211,27 @@ mod tests {
                 incomplete.1,
                 incomplete.2
             ));
+        }
+
+        assert_eq!(
+            classify_topology_race(RetainedPopulationState::Empty, false),
+            Ok(true),
+            "a second populated=0 read closes the systemd trim race"
+        );
+        for population in [
+            RetainedPopulationState::Populated,
+            RetainedPopulationState::Gone,
+        ] {
+            assert_eq!(
+                classify_topology_race(population, true),
+                Ok(true),
+                "a live/ENODEV descriptor requires the full GC proof"
+            );
+            assert_eq!(
+                classify_topology_race(population, false),
+                Err(RescueVaultDaemonError::CgroupUnavailable),
+                "partial topology without terminal proof stays fail-closed"
+            );
         }
     }
 

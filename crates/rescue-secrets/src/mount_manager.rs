@@ -36,7 +36,8 @@ use std::{
     os::unix::ffi::OsStrExt,
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
-    time::Duration,
+    thread,
+    time::{Duration, Instant},
 };
 
 const MANAGER_LOCK_PATH: &str = "/run/lock/kernaid-rescue-vault-manager.lock";
@@ -51,6 +52,8 @@ const MAPPER_SUFFIX_BYTES: usize = 16;
 const MAPPER_NAME_BYTES: usize = MAPPER_PREFIX.len() + MAPPER_SUFFIX_BYTES;
 const COMMAND_OUTPUT_LIMIT: usize = 4096;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFERRED_REMOVE_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFERRED_REMOVE_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const SECURE_DIRECTORY_MODE: u32 = 0o700;
 const SECURE_FILE_MODE: u32 = 0o600;
 const TMPFS_MAGIC: u64 = 0x0102_1994;
@@ -633,6 +636,7 @@ struct Activation<R: VaultOps> {
     mapping: Option<MappingIdentity>,
     attestation: Option<VaultMountAttestation>,
     mapping_open: bool,
+    deferred_remove_armed: bool,
     mounted: bool,
     mutator_invoked: bool,
     cleanup_attempted: bool,
@@ -661,6 +665,7 @@ impl<R: VaultOps> Activation<R> {
             mapping: None,
             attestation: None,
             mapping_open: false,
+            deferred_remove_armed: false,
             mounted: false,
             mutator_invoked: false,
             cleanup_attempted: false,
@@ -754,6 +759,23 @@ impl<R: VaultOps> Activation<R> {
                 return Err(VaultMountManagerError::CleanupFailed);
             }
         }
+        // Once the exact mapping descriptor is retained, make kernel removal
+        // owner-bound before performing any further fallible work. If this
+        // process is killed, the private mount and retained descriptor are the
+        // remaining users; device-mapper removes the mapping when they close.
+        self.ops
+            .arm_deferred_mapping_removal(&self.request.mapper)?;
+        self.deferred_remove_armed = true;
+        let mapping = self
+            .mapping
+            .as_ref()
+            .ok_or(VaultMountManagerError::MappingVerificationFailed)?;
+        self.ops.verify_deferred_mapping_removal(
+            &self.request.device,
+            &self.request.mapper,
+            self.header,
+            mapping,
+        )?;
         open_result?;
         if self.ops.classify_outer_profile(&self.request.device)? != self.outer_profile {
             return Err(VaultMountManagerError::ProfileMismatch);
@@ -841,15 +863,24 @@ impl<R: VaultOps> Activation<R> {
                 mapping,
             )?;
             // A retained descriptor is required for every verification and
-            // mount operation, but device-mapper refuses an exact close while
-            // any process still has that block device open.
+            // mount operation. A deferred mapping is removed by the kernel
+            // after this final descriptor closes; a pre-arm failure retains
+            // the original explicit-close path.
             drop(self.mapping.take());
-            self.ops.close_mapping(&self.request.mapper)?;
-            self.ops.verify_closed_mapping_absence(
-                &self.request.device,
-                &self.request.mapper,
-                &self.request.mapper_path,
-            )?;
+            if self.deferred_remove_armed {
+                self.ops.wait_for_deferred_mapping_absence(
+                    &self.request.device,
+                    &self.request.mapper,
+                    &self.request.mapper_path,
+                )?;
+            } else {
+                self.ops.close_mapping(&self.request.mapper)?;
+                self.ops.verify_closed_mapping_absence(
+                    &self.request.device,
+                    &self.request.mapper,
+                    &self.request.mapper_path,
+                )?;
+            }
             self.mapping_open = false;
         }
         Ok(())
@@ -912,7 +943,24 @@ trait VaultOps {
         mapper: &MapperName,
         mapper_path: &Path,
     ) -> Result<(), VaultMountManagerError>;
+    fn arm_deferred_mapping_removal(
+        &mut self,
+        mapper: &MapperName,
+    ) -> Result<(), VaultMountManagerError>;
+    fn verify_deferred_mapping_removal(
+        &mut self,
+        device: &BlockDevice,
+        mapper: &MapperName,
+        header: HeaderIdentity,
+        expected: &MappingIdentity,
+    ) -> Result<(), VaultMountManagerError>;
     fn verify_closed_mapping_absence(
+        &mut self,
+        device: &BlockDevice,
+        mapper: &MapperName,
+        mapper_path: &Path,
+    ) -> Result<(), VaultMountManagerError>;
+    fn wait_for_deferred_mapping_absence(
         &mut self,
         device: &BlockDevice,
         mapper: &MapperName,
@@ -992,6 +1040,33 @@ impl SystemOps {
             .revalidate()
             .map_err(|_| VaultMountManagerError::CleanupFailed)?;
         verify_mapper_absence_checkpoint(device, mapper, mapper_path)?;
+        device
+            .revalidate()
+            .map_err(|_| VaultMountManagerError::CleanupFailed)?;
+        verify_mapper_absence_checkpoint(device, mapper, mapper_path)
+    }
+
+    fn wait_for_mapping_absence(
+        device: &BlockDevice,
+        mapper: &MapperName,
+        mapper_path: &Path,
+    ) -> Result<(), VaultMountManagerError> {
+        device
+            .revalidate()
+            .map_err(|_| VaultMountManagerError::CleanupFailed)?;
+        let deadline = Instant::now()
+            .checked_add(DEFERRED_REMOVE_TIMEOUT)
+            .ok_or(VaultMountManagerError::CleanupFailed)?;
+        loop {
+            if mapping_absence_checkpoint(device, mapper, mapper_path)? {
+                break;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(VaultMountManagerError::CleanupFailed);
+            }
+            thread::sleep(DEFERRED_REMOVE_POLL_INTERVAL.min(deadline.duration_since(now)));
+        }
         device
             .revalidate()
             .map_err(|_| VaultMountManagerError::CleanupFailed)?;
@@ -1204,6 +1279,23 @@ impl VaultOps for SystemOps {
         Self::verify_mapping_absence(device, mapper, mapper_path)
     }
 
+    fn arm_deferred_mapping_removal(
+        &mut self,
+        mapper: &MapperName,
+    ) -> Result<(), VaultMountManagerError> {
+        Self::run_quiet(cryptsetup_deferred_close_command(mapper))
+    }
+
+    fn verify_deferred_mapping_removal(
+        &mut self,
+        device: &BlockDevice,
+        mapper: &MapperName,
+        header: HeaderIdentity,
+        expected: &MappingIdentity,
+    ) -> Result<(), VaultMountManagerError> {
+        expected.revalidate(device, mapper, header)
+    }
+
     fn verify_closed_mapping_absence(
         &mut self,
         device: &BlockDevice,
@@ -1211,6 +1303,15 @@ impl VaultOps for SystemOps {
         mapper_path: &Path,
     ) -> Result<(), VaultMountManagerError> {
         Self::verify_mapping_absence(device, mapper, mapper_path)
+    }
+
+    fn wait_for_deferred_mapping_absence(
+        &mut self,
+        device: &BlockDevice,
+        mapper: &MapperName,
+        mapper_path: &Path,
+    ) -> Result<(), VaultMountManagerError> {
+        Self::wait_for_mapping_absence(device, mapper, mapper_path)
     }
 
     fn inspect_filesystem(
@@ -1422,6 +1523,15 @@ fn cryptsetup_open_command(device: &Path, mapper: &MapperName) -> Command {
         .arg("--key-file")
         .arg("-")
         .arg(device)
+        .arg(mapper.as_os_str());
+    command
+}
+
+fn cryptsetup_deferred_close_command(mapper: &MapperName) -> Command {
+    let mut command = Command::new(CRYPTSETUP_PATH);
+    command
+        .arg("close")
+        .arg("--deferred")
         .arg(mapper.as_os_str());
     command
 }
@@ -1777,20 +1887,34 @@ fn verify_mapper_absence_checkpoint(
     mapper: &MapperName,
     mapper_path: &Path,
 ) -> Result<(), VaultMountManagerError> {
+    if mapping_absence_checkpoint(device, mapper, mapper_path)? {
+        Ok(())
+    } else {
+        Err(VaultMountManagerError::CleanupFailed)
+    }
+}
+
+fn mapping_absence_checkpoint(
+    device: &BlockDevice,
+    mapper: &MapperName,
+    mapper_path: &Path,
+) -> Result<bool, VaultMountManagerError> {
     match rfs::statat(CWD, mapper_path, AtFlags::SYMLINK_NOFOLLOW) {
         Err(error) if error == rustix::io::Errno::NOENT => {}
-        Ok(_) | Err(_) => return Err(VaultMountManagerError::CleanupFailed),
+        Ok(_) => return Ok(false),
+        Err(_) => return Err(VaultMountManagerError::CleanupFailed),
     }
     if sysfs_mapper_name_exists(mapper).map_err(|_| VaultMountManagerError::CleanupFailed)? {
-        return Err(VaultMountManagerError::CleanupFailed);
+        return Ok(false);
     }
     let (major, minor) = device.major_minor();
     let mut holders = fs::read_dir(format!("/sys/dev/block/{major}:{minor}/holders"))
         .map_err(|_| VaultMountManagerError::CleanupFailed)?;
-    match holders.next() {
-        None => Ok(()),
-        Some(_) => Err(VaultMountManagerError::CleanupFailed),
-    }
+    holders
+        .next()
+        .transpose()
+        .map(|entry| entry.is_none())
+        .map_err(|_| VaultMountManagerError::CleanupFailed)
 }
 
 fn single_backing_device(directory: &Path) -> Result<(u32, u32), VaultMountManagerError> {
@@ -2082,6 +2206,8 @@ mod tests {
         Open,
         Mapping,
         FailedOpenAbsent,
+        ArmDeferred,
+        VerifyDeferred,
         Filesystem,
         Prepare,
         Mount,
@@ -2093,6 +2219,7 @@ mod tests {
         VerifyMapping,
         Close,
         ClosedAbsent,
+        WaitDeferredAbsent,
     }
 
     #[derive(Default)]
@@ -2105,6 +2232,7 @@ mod tests {
         absence_proof_fails: bool,
         unmount_absence_proof_fails: bool,
         close_absence_proof_fails: bool,
+        deferred_absence_proof_fails: bool,
         open_error: Option<VaultMountManagerError>,
         pre_open_error: Option<VaultMountManagerError>,
         pre_mount_error: Option<VaultMountManagerError>,
@@ -2220,6 +2348,23 @@ mod tests {
             }
         }
 
+        fn arm_deferred_mapping_removal(
+            &mut self,
+            _mapper: &MapperName,
+        ) -> Result<(), VaultMountManagerError> {
+            self.step(Step::ArmDeferred)
+        }
+
+        fn verify_deferred_mapping_removal(
+            &mut self,
+            _device: &BlockDevice,
+            _mapper: &MapperName,
+            _header: HeaderIdentity,
+            _expected: &MappingIdentity,
+        ) -> Result<(), VaultMountManagerError> {
+            self.step(Step::VerifyDeferred)
+        }
+
         fn verify_closed_mapping_absence(
             &mut self,
             _device: &BlockDevice,
@@ -2232,6 +2377,25 @@ mod tests {
                 .lock()
                 .expect("fake state lock")
                 .close_absence_proof_fails
+            {
+                Err(VaultMountManagerError::CleanupFailed)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn wait_for_deferred_mapping_absence(
+            &mut self,
+            _device: &BlockDevice,
+            _mapper: &MapperName,
+            _mapper_path: &Path,
+        ) -> Result<(), VaultMountManagerError> {
+            self.step(Step::WaitDeferredAbsent)?;
+            if self
+                .0
+                .lock()
+                .expect("fake state lock")
+                .deferred_absence_proof_fails
             {
                 Err(VaultMountManagerError::CleanupFailed)
             } else {
@@ -2954,6 +3118,22 @@ mod tests {
     }
 
     #[test]
+    fn deferred_close_command_has_only_the_fixed_mapper_target() {
+        let mapper = MapperName::parse("kernaid-vault-0123456789abcdef").expect("mapper");
+        let command = cryptsetup_deferred_close_command(&mapper);
+        assert_eq!(command.get_program(), OsStr::new(CRYPTSETUP_PATH));
+        let arguments: Vec<_> = command.get_args().collect();
+        assert_eq!(
+            arguments,
+            vec![
+                OsStr::new("close"),
+                OsStr::new("--deferred"),
+                OsStr::new("kernaid-vault-0123456789abcdef"),
+            ]
+        );
+    }
+
+    #[test]
     fn activation_is_typed_and_cleanup_runs_in_reverse_order() {
         let state = Arc::new(Mutex::new(FakeState::default()));
         let mut activation = start_fake(Arc::clone(&state)).expect("activate");
@@ -2967,6 +3147,8 @@ mod tests {
                 Step::Profile,
                 Step::Open,
                 Step::Mapping,
+                Step::ArmDeferred,
+                Step::VerifyDeferred,
                 Step::Profile,
                 Step::Filesystem,
                 Step::Prepare,
@@ -2978,8 +3160,7 @@ mod tests {
                 Step::Unmount,
                 Step::VerifyUnmounted,
                 Step::VerifyMapping,
-                Step::Close,
-                Step::ClosedAbsent,
+                Step::WaitDeferredAbsent,
             ]
         );
     }
@@ -3003,9 +3184,10 @@ mod tests {
                 Step::Profile,
                 Step::Open,
                 Step::Mapping,
+                Step::ArmDeferred,
+                Step::VerifyDeferred,
                 Step::VerifyMapping,
-                Step::Close,
-                Step::ClosedAbsent,
+                Step::WaitDeferredAbsent,
             ]
         );
     }
@@ -3180,12 +3362,13 @@ mod tests {
                     Step::Profile,
                     Step::Open,
                     Step::Mapping,
+                    Step::ArmDeferred,
+                    Step::VerifyDeferred,
                     Step::Profile,
                     Step::Filesystem,
                     Step::Prepare,
                     Step::VerifyMapping,
-                    Step::Close,
-                    Step::ClosedAbsent,
+                    Step::WaitDeferredAbsent,
                 ],
                 "a read-only failure before mount must close only the owned mapper"
             );
@@ -3211,11 +3394,12 @@ mod tests {
                 Step::Profile,
                 Step::Open,
                 Step::Mapping,
+                Step::ArmDeferred,
+                Step::VerifyDeferred,
                 Step::Profile,
                 Step::Filesystem,
                 Step::VerifyMapping,
-                Step::Close,
-                Step::ClosedAbsent,
+                Step::WaitDeferredAbsent,
             ]
         );
     }
@@ -3239,6 +3423,8 @@ mod tests {
                 Step::Profile,
                 Step::Open,
                 Step::Mapping,
+                Step::ArmDeferred,
+                Step::VerifyDeferred,
                 Step::Profile,
                 Step::Filesystem,
                 Step::Prepare,
@@ -3250,8 +3436,7 @@ mod tests {
                 Step::Unmount,
                 Step::VerifyUnmounted,
                 Step::VerifyMapping,
-                Step::Close,
-                Step::ClosedAbsent,
+                Step::WaitDeferredAbsent,
             ]
         );
     }
@@ -3272,6 +3457,7 @@ mod tests {
         assert!(steps.contains(&Step::VerifyMount));
         assert!(steps.contains(&Step::Unmount));
         assert!(!steps.contains(&Step::Close));
+        assert!(!steps.contains(&Step::WaitDeferredAbsent));
         assert_eq!(
             steps.iter().filter(|step| **step == Step::Unmount).count(),
             1,
@@ -3295,8 +3481,8 @@ mod tests {
         assert!(steps.contains(&Step::Unmount));
         assert!(steps.contains(&Step::VerifyUnmounted));
         assert!(steps.contains(&Step::VerifyMapping));
-        assert!(steps.contains(&Step::Close));
-        assert!(steps.contains(&Step::ClosedAbsent));
+        assert!(steps.contains(&Step::WaitDeferredAbsent));
+        assert!(!steps.contains(&Step::Close));
     }
 
     #[test]
@@ -3315,12 +3501,13 @@ mod tests {
         assert!(steps.contains(&Step::Unmount));
         assert!(steps.contains(&Step::VerifyUnmounted));
         assert!(!steps.contains(&Step::Close));
+        assert!(!steps.contains(&Step::WaitDeferredAbsent));
     }
 
     #[test]
-    fn successful_close_requires_a_double_checked_absence_postcondition() {
+    fn deferred_cleanup_requires_a_bounded_absence_postcondition() {
         let state = Arc::new(Mutex::new(FakeState {
-            close_absence_proof_fails: true,
+            deferred_absence_proof_fails: true,
             ..FakeState::default()
         }));
         let mut activation = start_fake(Arc::clone(&state)).expect("activate");
@@ -3330,13 +3517,82 @@ mod tests {
         );
         drop(activation);
         let steps = &state.lock().expect("state").steps;
+        assert!(steps.contains(&Step::WaitDeferredAbsent));
+        assert!(!steps.contains(&Step::Close));
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|step| **step == Step::WaitDeferredAbsent)
+                .count(),
+            1,
+            "Drop must not retry an ambiguous deferred-removal wait"
+        );
+    }
+
+    #[test]
+    fn failed_deferred_arm_preserves_verified_explicit_close() {
+        let state = Arc::new(Mutex::new(FakeState {
+            fail_at: Some(Step::ArmDeferred),
+            ..FakeState::default()
+        }));
+        assert_eq!(
+            start_fake(Arc::clone(&state)).err(),
+            Some(VaultMountManagerError::MountVerificationFailed)
+        );
+        assert_eq!(
+            state.lock().expect("state").steps,
+            vec![
+                Step::DeviceUnused,
+                Step::MapperAbsent,
+                Step::Profile,
+                Step::Open,
+                Step::Mapping,
+                Step::ArmDeferred,
+                Step::VerifyMapping,
+                Step::Close,
+                Step::ClosedAbsent,
+            ]
+        );
+    }
+
+    #[test]
+    fn pre_arm_close_requires_a_double_checked_absence_postcondition() {
+        let state = Arc::new(Mutex::new(FakeState {
+            fail_at: Some(Step::ArmDeferred),
+            close_absence_proof_fails: true,
+            ..FakeState::default()
+        }));
+        assert_eq!(
+            start_fake(Arc::clone(&state)).err(),
+            Some(VaultMountManagerError::CleanupFailed)
+        );
+        let steps = &state.lock().expect("state").steps;
         assert!(steps.contains(&Step::Close));
         assert!(steps.contains(&Step::ClosedAbsent));
+        assert!(!steps.contains(&Step::WaitDeferredAbsent));
         assert_eq!(
             steps.iter().filter(|step| **step == Step::Close).count(),
             1,
-            "Drop must not retry an ambiguous close"
+            "Drop must not retry an ambiguous explicit close"
         );
+    }
+
+    #[test]
+    fn post_arm_verification_failure_uses_only_deferred_removal() {
+        let state = Arc::new(Mutex::new(FakeState {
+            fail_at: Some(Step::VerifyDeferred),
+            ..FakeState::default()
+        }));
+        assert_eq!(
+            start_fake(Arc::clone(&state)).err(),
+            Some(VaultMountManagerError::MountVerificationFailed)
+        );
+        let steps = &state.lock().expect("state").steps;
+        assert!(steps.contains(&Step::ArmDeferred));
+        assert!(steps.contains(&Step::VerifyDeferred));
+        assert!(steps.contains(&Step::VerifyMapping));
+        assert!(steps.contains(&Step::WaitDeferredAbsent));
+        assert!(!steps.contains(&Step::Close));
     }
 
     #[test]
@@ -3352,6 +3608,7 @@ mod tests {
         let steps = &state.lock().expect("state").steps;
         assert!(steps.contains(&Step::Unmount));
         assert!(!steps.contains(&Step::Close));
+        assert!(!steps.contains(&Step::WaitDeferredAbsent));
         assert_eq!(
             steps.iter().filter(|step| **step == Step::Unmount).count(),
             1
@@ -3372,6 +3629,7 @@ mod tests {
         assert!(steps.contains(&Step::VerifyMount));
         assert!(!steps.contains(&Step::Unmount));
         assert!(!steps.contains(&Step::Close));
+        assert!(!steps.contains(&Step::WaitDeferredAbsent));
         assert_eq!(
             steps
                 .iter()

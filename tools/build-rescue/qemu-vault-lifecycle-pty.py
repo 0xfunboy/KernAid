@@ -865,6 +865,17 @@ def parse_companion_response(
             device_id = lines.pop(0).split(b": ", 1)[1].decode("ascii")
     elif lines and re.fullmatch(rb"error: [A-Z][A-Z0-9_]*", lines[0]):
         error = lines.pop(0).split(b": ", 1)[1].decode("ascii")
+    if (
+        command == "lock"
+        and return_code == 1
+        and state == "faulted-reboot-required"
+        and device_id is None
+        and lines == [b"error: REBOOT_REQUIRED"]
+    ):
+        # The production companion intentionally prints the public state
+        # snapshot before the command-level error. Classify only this exact
+        # closed compound response; arbitrary output remains rejected below.
+        raise ClosedFailure("response", "lock-remote-reboot-required")
     if lines:
         raise ClosedFailure("response", "extra-output")
 
