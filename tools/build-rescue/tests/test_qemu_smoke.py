@@ -489,6 +489,7 @@ class MockToolchain:
               exec /usr/bin/python3 -c '
 import os
 import signal
+import sys
 import time
 
 state = os.environ["KERNAID_MOCK_STATE_DIR"]
@@ -503,7 +504,8 @@ print("KERNAID_RESCUE_READY", flush=True)
 print("KERNAID_RESCUE_TARGET_SELECTION_READY", flush=True)
 print("KERNAID_RESCUE_OFFLINE_INSPECTION_READY", flush=True)
 snapshot_marker = "KERNAID_RESCUE_LINUX_SNAPSHOT_E2E_V1 semantic_sha256=" + os.environ["KERNAID_MOCK_SNAPSHOT_DIGEST"]
-print(snapshot_marker, flush=True)
+sys.stdout.write("serial-prefix-without-line-feed")
+print("\n" + snapshot_marker, flush=True)
 if os.environ.get("KERNAID_MOCK_DUPLICATE_SNAPSHOT_MARKER") == "1":
     print(snapshot_marker, flush=True)
 time.sleep(30)
@@ -512,7 +514,8 @@ time.sleep(30)
             printf 'KERNAID_RESCUE_READY\n'
             printf 'KERNAID_RESCUE_TARGET_SELECTION_READY\n'
             printf 'KERNAID_RESCUE_OFFLINE_INSPECTION_READY\n'
-            printf 'KERNAID_RESCUE_LINUX_SNAPSHOT_E2E_V1 semantic_sha256=%s\n' \
+            printf 'serial-prefix-without-line-feed'
+            printf '\nKERNAID_RESCUE_LINUX_SNAPSHOT_E2E_V1 semantic_sha256=%s\n' \
               "$KERNAID_MOCK_SNAPSHOT_DIGEST"
             if [[ "${KERNAID_MOCK_DUPLICATE_SNAPSHOT_MARKER:-0}" == "1" ]]; then
               printf 'KERNAID_RESCUE_LINUX_SNAPSHOT_E2E_V1 semantic_sha256=%s\n' \

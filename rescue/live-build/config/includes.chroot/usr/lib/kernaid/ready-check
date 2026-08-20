@@ -361,7 +361,8 @@ if [ -n "$selection_request" ]; then
         case "$snapshot_semantic_sha256" in
             *[!0-9a-f]*|'') fail "Linux snapshot semantic digest is invalid" ;;
         esac
-        echo "KERNAID_RESCUE_LINUX_SNAPSHOT_E2E_V1 semantic_sha256=$snapshot_semantic_sha256" >/dev/ttyS0
+        printf '\nKERNAID_RESCUE_LINUX_SNAPSHOT_E2E_V1 semantic_sha256=%s\n' \
+            "$snapshot_semantic_sha256" >/dev/ttyS0
         windows_selection_request="$(printf '%s' "$targets" | python3 -c 'import json,sys; data=json.load(sys.stdin); disks={item.get("id"):item for item in data.get("disks", [])}; candidates=[item for item in data.get("candidates", []) if item.get("osFamilyHint") == "windows" and item.get("diskId") in disks and disks[item["diskId"]].get("partitionTable") == "gpt" and item.get("sourceRef", "").startswith(disks[item["diskId"]].get("ref", "") + "/volume-")]; len(candidates) == 1 or sys.exit("one GPT partition Windows fixture target is required"); print(json.dumps({"scanFingerprint":data["scanFingerprint"],"targetId":candidates[0]["targetId"]}, separators=(",", ":")))')" || fail "Windows GPT target selection request failed"
         windows_selection="$(curl --fail --silent --show-error --max-time 22 -H 'Origin: http://127.0.0.1:4173' -H 'Content-Type: application/json' --data "$windows_selection_request" "$base_url/api/rescue/select-installed-target")" || fail "Windows target selection endpoint failed"
         printf '%s' "$windows_selection" | python3 -c 'import json,sys; request=json.loads(sys.argv[1]); data=json.load(sys.stdin); target=data.get("target", {}); data.get("status") == "observe-target-validated" and data.get("scanFingerprint") == request.get("scanFingerprint") and target.get("targetId") == request.get("targetId") and target.get("osFamilyHint") == "windows" or sys.exit("Windows target binding failed")' "$windows_selection_request" || fail "Windows target selection contract failed"

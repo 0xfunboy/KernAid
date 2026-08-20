@@ -301,9 +301,23 @@ class LinuxSnapshotEndToEndTests(unittest.TestCase):
         ):
             self.assertIn(raw_marker, ready[digest:marker])
         marker_line = next(
-            line for line in ready.splitlines() if "echo \"KERNAID_RESCUE_LINUX" in line
+            line
+            for line in ready.splitlines()
+            if "KERNAID_RESCUE_LINUX_SNAPSHOT_E2E_V1" in line
         )
+        self.assertIn("printf '\\nKERNAID_RESCUE_LINUX", marker_line)
         self.assertNotIn("$inspection", marker_line)
+        serial_output = (
+            b"systemd-status-without-line-feed"
+            b"\nKERNAID_RESCUE_LINUX_SNAPSHOT_E2E_V1 "
+            + f"semantic_sha256={DIGEST}\r\n".encode("ascii")
+        ).replace(b"\r", b"")
+        marker_pattern = re.compile(
+            rb"^KERNAID_RESCUE_LINUX_SNAPSHOT_E2E_V1 "
+            rb"semantic_sha256=([0-9a-f]{64})$",
+            re.MULTILINE,
+        )
+        self.assertEqual(marker_pattern.findall(serial_output), [DIGEST.encode("ascii")])
 
     def test_qemu_recipe_requires_one_exact_runtime_resident_marker(self) -> None:
         source = QEMU_WITH_RESIDENT.read_text(encoding="utf-8")
