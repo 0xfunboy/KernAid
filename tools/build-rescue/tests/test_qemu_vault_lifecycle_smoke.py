@@ -2589,6 +2589,32 @@ class StaticContractTests(unittest.TestCase):
         self.assertEqual(failure.exception.stage, "provider-proof")
         self.assertEqual(failure.exception.code, "command-failed")
 
+    def test_provider_proof_classifies_closed_stage_command_failures(self) -> None:
+        self.assertEqual(
+            controller.PROVIDER_PROOF_CLOSED_STAGES,
+            (
+                "ui-diagnose-unconfigured",
+                "ui-status-configured",
+                "production-status",
+                "normal-release",
+                "hold-kill",
+                "post-fault",
+            ),
+        )
+        for stage in controller.PROVIDER_PROOF_CLOSED_STAGES:
+            with self.subTest(stage=stage):
+                transcript = (
+                    f"KERNAID_PROVIDER_PROOF_BEGIN_V1_{stage}\r\n"
+                    f"KERNAID_PROVIDER_PROOF_END_V1_{stage} rc=45\r\n"
+                ).encode()
+                with self.assertRaises(controller.ClosedFailure) as failure:
+                    run_proof_transcript(stage, transcript)
+                self.assertEqual(failure.exception.stage, "provider-proof")
+                self.assertEqual(
+                    failure.exception.code,
+                    f"{stage}-command-failed",
+                )
+
     def test_provider_proof_failure_checkpoints_are_closed_and_correlated(self) -> None:
         self.assertEqual(
             controller.PROVIDER_PROOF_UI_ERROR_CHECKPOINTS,

@@ -29,7 +29,10 @@ SupplementaryGroups=kernaid-vault
 UMask=0077
 LimitCORE=0
 LimitNOFILE=16
-TasksMax=1
+# Permit the credential preflight control process to hand off to ExecStart.
+TasksMax=2
+# Keep that transient handoff allowance from becoming a child-process budget.
+SystemCallFilter=~clone clone3 fork vfork
 # Match the production executor's exact direct system.slice membership; the
 # implicit per-template slice would be rejected by the lease validator.
 Slice=system.slice

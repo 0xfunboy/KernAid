@@ -473,6 +473,14 @@ class RescueOpenAiExecutorPackagingTests(unittest.TestCase):
             self.assertFalse(
                 any(line.startswith("ExecCondition=") for line in service_lines)
             )
+            self.assertEqual(
+                [
+                    line
+                    for line in service_lines
+                    if line.startswith("SystemCallFilter=")
+                ],
+                ["SystemCallFilter=~clone clone3 fork vfork"],
+            )
 
     def test_qemu_provider_bridge_units_keep_roles_and_kill_surface_exact(self) -> None:
         expected_sockets = {
@@ -516,7 +524,7 @@ class RescueOpenAiExecutorPackagingTests(unittest.TestCase):
         self.assertEqual(lease["User"], "kernaid-openai")
         self.assertEqual(lease["Group"], "kernaid-openai")
         self.assertEqual(lease["SupplementaryGroups"], "kernaid-vault")
-        self.assertEqual(lease["TasksMax"], "1")
+        self.assertEqual(lease["TasksMax"], "2")
         self.assertEqual(lease["Slice"], "system.slice")
         self.assertEqual(lease["MemoryPressureWatch"], "no")
         self.assertEqual(lease["Delegate"], "pids")
@@ -536,7 +544,7 @@ class RescueOpenAiExecutorPackagingTests(unittest.TestCase):
         self.assertEqual(status["SupplementaryGroups"], "kernaid-provider-client")
         self.assertNotIn("User", status)
         self.assertNotIn("Group", status)
-        self.assertEqual(status["TasksMax"], "1")
+        self.assertEqual(status["TasksMax"], "2")
         self.assertEqual(status["PrivateNetwork"], "yes")
         self.assertEqual(status["RestrictAddressFamilies"], "AF_UNIX")
         self.assertEqual(status["CapabilityBoundingSet"], "")
@@ -560,6 +568,7 @@ class RescueOpenAiExecutorPackagingTests(unittest.TestCase):
         self.assertEqual(kill["StandardOutput"], "null")
         self.assertEqual(kill["StandardError"], "null")
         self.assertEqual(kill["SupplementaryGroups"], "")
+        self.assertEqual(kill["TasksMax"], "2")
         self.assertEqual(kill["CapabilityBoundingSet"], "")
         self.assertEqual(kill["AmbientCapabilities"], "")
         self.assertNotIn("Delegate", kill)

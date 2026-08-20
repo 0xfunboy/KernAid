@@ -95,6 +95,12 @@ PROVIDER_PROOF_UI_STAGES = (
     "ui-diagnose-unconfigured",
     "ui-status-configured",
 )
+PROVIDER_PROOF_CLOSED_STAGES = PROVIDER_PROOF_UI_STAGES + (
+    "production-status",
+    "normal-release",
+    "hold-kill",
+    "post-fault",
+)
 PROVIDER_PROOF_UI_CHECKPOINTS = (
     "ui-identity",
     "socket-baseline",
@@ -2480,6 +2486,10 @@ def run_guest_proof(
     )
     if event_match.group("end") is not None:
         return_code = _canonical_return_code(event_match.group("return_code"))
+        if return_code != 0 and stage in PROVIDER_PROOF_CLOSED_STAGES:
+            # The stage is selected by this controller from the closed tuple
+            # above; no guest output or return-code text reaches the artifact.
+            raise ClosedFailure("provider-proof", f"{stage}-command-failed")
         raise ClosedFailure(
             "provider-proof",
             "marker-missing" if return_code == 0 else "command-failed",
