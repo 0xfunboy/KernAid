@@ -3,14 +3,25 @@
 #[cfg(target_os = "linux")]
 mod linux_probe {
     use kernaid_rescue_secrets::{MapperName, RescueVaultMountManager, VaultUnlockRequest};
-    use std::{fmt::Write as _, io, os::fd::AsFd, path::PathBuf};
+    use std::{ffi::OsStr, fmt::Write as _, io, os::fd::AsFd, path::PathBuf};
 
     const JOURNAL_BINDING: &str = "device-identity-bound-v1";
     const ATTESTATION_PREFIX: &str = "KERNAID_RESCUE_VAULT_PROBE_ATTESTATION_V1";
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Mode {
         Initialize,
         Verify,
+        CrashCleanup,
+    }
+
+    fn parse_mode(mode: &OsStr) -> Option<Mode> {
+        match mode.to_str() {
+            Some("initialize") => Some(Mode::Initialize),
+            Some("verify") => Some(Mode::Verify),
+            Some("crash-cleanup") => Some(Mode::CrashCleanup),
+            _ => None,
+        }
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,6 +43,7 @@ mod linux_probe {
         VerifyIdentityMissing,
         VerifyApplicationOpen,
         VerifyApplicationMismatch,
+        CrashMarkerWrite,
         EncodePublicKey,
         Shutdown(kernaid_rescue_secrets::VaultMountManagerError),
     }
@@ -56,6 +68,7 @@ mod linux_probe {
                 Self::VerifyIdentityMissing => "verify-identity-state",
                 Self::VerifyApplicationOpen => "verify-application-open",
                 Self::VerifyApplicationMismatch => "verify-application-binding",
+                Self::CrashMarkerWrite => "crash-marker",
                 Self::EncodePublicKey => "encode-public-key",
                 Self::Shutdown(_) => "shutdown",
             }
@@ -76,6 +89,7 @@ mod linux_probe {
                 | Self::InitializeApplicationOpen
                 | Self::VerifyIdentityLoad
                 | Self::VerifyApplicationOpen => "storage-operation-failed",
+                Self::CrashMarkerWrite => "write-failed",
                 Self::InitializeJournalNotEmpty | Self::InitializeIdentityPresent => {
                     "unexpected-existing-state"
                 }
@@ -99,6 +113,19 @@ mod linux_probe {
             write!(&mut encoded, "{byte:02x}").map_err(|_| ProbeFailure::EncodePublicKey)?;
         }
         Ok(encoded)
+    }
+
+    fn emit_crash_marker() -> Result<(), ProbeFailure> {
+        use std::io::Write as _;
+
+        let stderr = io::stderr();
+        let mut stderr = stderr.lock();
+        writeln!(
+            stderr,
+            "KERNAID_RESCUE_VAULT_PROBE_CRASH_POINT_V1 mode=crash-cleanup unlock_complete=true cleanup=awaiting-sigkill"
+        )
+        .map_err(|_| ProbeFailure::CrashMarkerWrite)?;
+        stderr.flush().map_err(|_| ProbeFailure::CrashMarkerWrite)
     }
 
     fn run() -> Result<ProbeAttestation, ProbeFailure> {
@@ -128,11 +155,7 @@ mod linux_probe {
         {
             return Err(ProbeFailure::InvalidArguments);
         }
-        let mode = match mode.to_str() {
-            Some("initialize") => Mode::Initialize,
-            Some("verify") => Mode::Verify,
-            _ => return Err(ProbeFailure::InvalidArguments),
-        };
+        let mode = parse_mode(&mode).ok_or(ProbeFailure::InvalidArguments)?;
         let mapper = mapper
             .into_string()
             .map_err(|_| ProbeFailure::InvalidMapperName)?;
@@ -200,6 +223,18 @@ mod linux_probe {
                     identity_public_key: encode_public_key(identity.public_key())?,
                 })
             }
+            Mode::CrashCleanup => {
+                // This binary is unavailable without the privileged-probe
+                // feature. The disposable integration test runs this branch
+                // in a private mount namespace, after deferred mapper removal
+                // has been armed by unlock_from_fd. It owns this direct PID,
+                // waits for the flushed marker, then sends SIGKILL so Rust
+                // Drop cannot run and kernel-owned teardown is tested.
+                emit_crash_marker()?;
+                loop {
+                    std::thread::park();
+                }
+            }
         })();
 
         // Every successfully mounted lifecycle reaches the verified shutdown
@@ -256,6 +291,7 @@ mod linux_probe {
                 ProbeFailure::VerifyIdentityMissing,
                 ProbeFailure::VerifyApplicationOpen,
                 ProbeFailure::VerifyApplicationMismatch,
+                ProbeFailure::CrashMarkerWrite,
                 ProbeFailure::EncodePublicKey,
                 ProbeFailure::Shutdown(VaultMountManagerError::CleanupFailed),
             ];
@@ -267,6 +303,16 @@ mod linux_probe {
                     }));
                 }
             }
+        }
+
+        #[test]
+        fn crash_cleanup_is_an_exact_probe_only_mode() {
+            assert_eq!(
+                parse_mode(OsStr::new("crash-cleanup")),
+                Some(Mode::CrashCleanup)
+            );
+            assert_eq!(parse_mode(OsStr::new("crash_cleanup")), None);
+            assert_eq!(parse_mode(OsStr::new("crash-cleanup-extra")), None);
         }
     }
 }

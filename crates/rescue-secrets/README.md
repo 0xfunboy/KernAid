@@ -255,7 +255,12 @@ identity-binding event. The second unlocks the same volume and opens that store
 again, thereby authenticating the journal key/anchor and exact identity
 binding before reporting the same public key. No provider or report fixture is
 written. The script also requires a wrong passphrase to fail without leaving a
-mount or mapping.
+mount or mapping. The feature-only `crash-cleanup` mode emits one fixed marker
+after unlock and then parks indefinitely. The script runs it without an
+intermediate `unshare --fork` process in a private disposable mount namespace,
+waits for the marker with a deadline, sends SIGKILL to the directly owned PID,
+and reaps status 137. Deferred removal must then eliminate the exact mapper
+within a bounded wait before a final authenticated reopen.
 
 The successful probe output is one machine-readable, non-secret line:
 

@@ -20,9 +20,9 @@ if [[ "$(id -u)" -ne 0 ]]; then
   exit 2
 fi
 
-for command in blockdev chmod cryptsetup dd findmnt id losetup mkdir mkfs.ext4 \
-  mktemp mount mountpoint od rm rmdir sha256sum stat sync tr truncate tune2fs \
-  umount udevadm; do
+for command in blockdev chmod cryptsetup dd dmsetup findmnt grep id losetup mkdir \
+  mkfs.ext4 mktemp mount mountpoint od rm rmdir sha256sum sleep stat sync tr \
+  truncate tune2fs umount unshare udevadm; do
   command -v "$command" >/dev/null || {
     echo "missing required disposable-probe tooling" >&2
     exit 2
@@ -40,6 +40,7 @@ if [[ ! "$random_suffix" =~ ^[0-9a-f]{16}$ ]]; then
 fi
 manager_mapper="kernaid-vault-$random_suffix"
 provision_mapper="kernaid-provision-$random_suffix"
+manager_mapper_path="/dev/mapper/$manager_mapper"
 manager_mount="/run/kernaid/vault/$manager_mapper"
 work_dir="$(mktemp -d /tmp/kernaid-rescue-manager.XXXXXX)"
 key_dir="$(mktemp -d /dev/shm/kernaid-rescue-manager-key.XXXXXX)"
@@ -47,7 +48,9 @@ image="$work_dir/vault.img"
 key_file="$key_dir/key"
 wrong_key_file="$key_dir/wrong-key"
 provision_mount="$work_dir/provision"
+crash_log="$work_dir/crash-cleanup.log"
 loop_device=""
+crash_pid=""
 provision_open=false
 provision_mounted=false
 logical_sector_bytes=512
@@ -64,13 +67,32 @@ cleanup() {
   trap - EXIT
   set +e
 
+  # The background crash probe is always a direct child because unshare is
+  # deliberately invoked without --fork. Every error path kills and reaps it
+  # before attempting mount, mapper, or loop-device cleanup.
+  if [[ -n "$crash_pid" ]]; then
+    if kill -0 "$crash_pid" 2>/dev/null; then
+      if ! kill -KILL "$crash_pid" 2>/dev/null; then
+        echo "failed to terminate the disposable crash probe" >&2
+        cleanup_failed=true
+      fi
+    fi
+    wait "$crash_pid" >/dev/null 2>&1
+    crash_pid=""
+    if [[ "$result" -eq 0 ]]; then
+      echo "the disposable crash probe required unexpected EXIT cleanup" >&2
+      cleanup_failed=true
+    fi
+  fi
+
   if mountpoint -q "$manager_mount" 2>/dev/null; then
     if ! umount "$manager_mount"; then
       echo "failed to unmount the disposable managed vault" >&2
       cleanup_failed=true
     fi
   fi
-  if cryptsetup status "$manager_mapper" >/dev/null 2>&1; then
+  if cryptsetup status "$manager_mapper" >/dev/null 2>&1 ||
+    dmsetup info "$manager_mapper" >/dev/null 2>&1; then
     if ! cryptsetup close "$manager_mapper"; then
       echo "failed to close the disposable managed mapper" >&2
       cleanup_failed=true
@@ -135,6 +157,16 @@ cleanup() {
 trap 'cleanup $?' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+mapper_is_absent() {
+  if cryptsetup status "$manager_mapper" >/dev/null 2>&1; then
+    return 1
+  fi
+  if dmsetup info "$manager_mapper" >/dev/null 2>&1; then
+    return 1
+  fi
+  [[ ! -e "$manager_mapper_path" && ! -L "$manager_mapper_path" ]]
+}
 
 if ((vault_sector_count * logical_sector_bytes != vault_bytes)) ||
   ((vault_bytes - luks_data_offset_bytes != payload_bytes)) ||
@@ -252,7 +284,75 @@ if [[ ! "$verify_attestation" =~ ^KERNAID_RESCUE_VAULT_PROBE_ATTESTATION_V1\ mod
 fi
 printf '%s\n' "$verify_attestation"
 
-if mountpoint -q "$manager_mount" || cryptsetup status "$manager_mapper" >/dev/null 2>&1; then
+# Without --fork, unshare execs the probe in place and the shell retains the
+# exact process PID whose death also releases the private mount namespace.
+unshare --mount --propagation private -- \
+  "$probe_binary" --device "$loop_device" --mapper "$manager_mapper" \
+  --mode crash-cleanup <"$key_file" >"$crash_log" 2>&1 &
+crash_pid="$!"
+if [[ ! "$crash_pid" =~ ^[1-9][0-9]*$ ]]; then
+  echo "the crash-cleanup probe did not expose a direct child PID" >&2
+  exit 1
+fi
+
+crash_ready=false
+for ((attempt = 0; attempt < 400; attempt += 1)); do
+  if grep -Fxq \
+    'KERNAID_RESCUE_VAULT_PROBE_CRASH_POINT_V1 mode=crash-cleanup unlock_complete=true cleanup=awaiting-sigkill' \
+    "$crash_log"; then
+    crash_ready=true
+    break
+  fi
+  if ! kill -0 "$crash_pid" 2>/dev/null; then
+    break
+  fi
+  sleep 0.05
+done
+if [[ "$crash_ready" != true ]]; then
+  echo "the crash-cleanup probe did not prove a completed unlock" >&2
+  exit 1
+fi
+if ! kill -KILL "$crash_pid" 2>/dev/null; then
+  echo "the crash-cleanup probe exited before the owned SIGKILL" >&2
+  exit 1
+fi
+crash_status=0
+if wait "$crash_pid" >/dev/null 2>&1; then
+  crash_status=0
+else
+  crash_status="$?"
+fi
+crash_pid=""
+if [[ "$crash_status" -ne 137 ]]; then
+  echo "the crash-cleanup probe did not terminate with owned SIGKILL status" >&2
+  exit 1
+fi
+
+mapper_absent=false
+for ((attempt = 0; attempt < 200; attempt += 1)); do
+  if mapper_is_absent; then
+    mapper_absent=true
+    break
+  fi
+  sleep 0.05
+done
+if [[ "$mapper_absent" != true ]]; then
+  echo "deferred removal did not release the crashed probe mapper" >&2
+  exit 1
+fi
+
+post_crash_attestation="$(
+  "$probe_binary" --device "$loop_device" --mapper "$manager_mapper" \
+    --mode verify <"$key_file"
+)"
+if [[ ! "$post_crash_attestation" =~ ^KERNAID_RESCUE_VAULT_PROBE_ATTESTATION_V1\ mode=verify\ journal_binding=device-identity-bound-v1\ identity_public_key=([0-9a-f]{64})\ clean_shutdown=true$ ]] ||
+  [[ "${BASH_REMATCH[1]:-}" != "$identity_public_key" ]]; then
+  echo "the vault did not reopen canonically after crash cleanup" >&2
+  exit 1
+fi
+printf '%s\n' "$post_crash_attestation"
+
+if mountpoint -q "$manager_mount" || ! mapper_is_absent; then
   echo "the Rescue manager left a mount or mapping active" >&2
   exit 1
 fi
@@ -266,4 +366,4 @@ if [[ "$header_digest_after" != "$header_digest_before" ]]; then
   exit 1
 fi
 
-echo "PASS: exact sparse 8 GiB p3 profile was stable, wrong key was rejected, and journal/identity persisted across reopen"
+echo "PASS: exact sparse 8 GiB p3 profile survived clean reopen and no-Drop crash cleanup without a residual mapper"
