@@ -58,6 +58,8 @@ const DEVICE_LOGIN_TIMEOUT: Duration = Duration::from_secs(16 * 60);
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const PROCESS_STOP_GRACE: Duration = Duration::from_secs(2);
 const CHILD_DESCRIPTOR_MINIMUM: i32 = 8;
+const READER_CHANNEL_CAPACITY: usize = 4;
+const READER_CHUNK_BYTES: usize = 1024;
 static SPAWN_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -279,6 +281,7 @@ pub struct BridgeError;
 
 trait Responder {
     fn send(&mut self, payload: &ResponsePayload<'_>) -> Result<(), ()>;
+    fn ensure_client_connected(&self) -> Result<(), ()>;
 }
 
 struct SocketResponder<'socket> {
@@ -320,6 +323,10 @@ impl Responder for SocketResponder<'_> {
             return Err(());
         }
         Ok(())
+    }
+
+    fn ensure_client_connected(&self) -> Result<(), ()> {
+        ensure_socket_peer_connected(self.socket)
     }
 }
 
@@ -867,19 +874,18 @@ fn validate_log_directory(directory: &OwnedFd, policy: HomePolicy) -> Result<(),
         return Err(ExecutionError::UnsafeHome);
     }
     let entries_path = format!("/proc/self/fd/{}", descriptor.as_raw_fd());
-    let names = std::fs::read_dir(entries_path)
-        .map_err(|_| ExecutionError::UnsafeHome)?
-        .map(|entry| entry.map(|entry| entry.file_name()))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| ExecutionError::UnsafeHome)?;
-    if names.len() > 1
-        || names
-            .first()
-            .is_some_and(|name| name != OsStr::new("codex-login.log"))
-    {
+    let mut entries = std::fs::read_dir(entries_path).map_err(|_| ExecutionError::UnsafeHome)?;
+    let login_log_present = match entries.next() {
+        None => false,
+        Some(Ok(entry)) if entry.file_name() == OsStr::new("codex-login.log") => true,
+        Some(_) => return Err(ExecutionError::UnsafeHome),
+    };
+    // The log directory has a one-file closed shape. Stop fail-closed at the
+    // second result instead of collecting attacker-influenced entry names.
+    if entries.next().is_some() {
         return Err(ExecutionError::UnsafeHome);
     }
-    if !names.is_empty() {
+    if login_log_present {
         validate_metadata_only_file(
             &descriptor,
             "codex-login.log",
@@ -939,15 +945,21 @@ fn collect_cli(
 ) -> Result<CollectedCli, ExecutionError> {
     let stdout = child.stdout.take().ok_or(ExecutionError::CliUnavailable)?;
     let stderr = child.stderr.take().ok_or(ExecutionError::CliUnavailable)?;
-    let (sender, receiver) = mpsc::channel();
+    // A malicious or malfunctioning CLI must not queue output faster than the
+    // bridge can classify it. Two blocking readers still drain both pipes,
+    // while this small queue bounds their combined in-flight chunks.
+    let (sender, receiver) = mpsc::sync_channel(READER_CHANNEL_CAPACITY);
     let stdout_reader = spawn_reader(stdout, StreamKind::Stdout, sender.clone());
     let stderr_reader = spawn_reader(stderr, StreamKind::Stderr, sender);
-    let mut stdout = Zeroizing::new(Vec::new());
-    let mut stderr = Zeroizing::new(Vec::new());
+    let mut stdout = Zeroizing::new(Vec::with_capacity(MAX_CLI_OUTPUT_BYTES));
+    let mut stderr = Zeroizing::new(Vec::with_capacity(MAX_CLI_OUTPUT_BYTES));
     let mut readers_closed = 0_usize;
     let mut status = None;
     let mut device_code_sent = false;
     loop {
+        responder
+            .ensure_client_connected()
+            .map_err(|_| ExecutionError::ClientGone)?;
         if Instant::now() >= deadline {
             return Err(ExecutionError::TimedOut);
         }
@@ -1004,10 +1016,10 @@ fn collect_cli(
 fn spawn_reader<R: Read + Send + 'static>(
     mut reader: R,
     kind: StreamKind,
-    sender: mpsc::Sender<ReaderEvent>,
+    sender: mpsc::SyncSender<ReaderEvent>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        let mut buffer = [0_u8; 1024];
+        let mut buffer = [0_u8; READER_CHUNK_BYTES];
         loop {
             match reader.read(&mut buffer) {
                 Ok(0) => {
@@ -1030,6 +1042,33 @@ fn spawn_reader<R: Read + Send + 'static>(
         }
         buffer.zeroize();
     })
+}
+
+fn ensure_socket_peer_connected(socket: BorrowedFd<'_>) -> Result<(), ()> {
+    let mut descriptors = [PollFd::from_borrowed_fd(
+        socket,
+        PollFlags::HUP | PollFlags::RDHUP,
+    )];
+    let immediate = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    loop {
+        match poll(&mut descriptors, Some(&immediate)) {
+            Ok(_) => {
+                let events = descriptors[0].revents();
+                return if events.intersects(
+                    PollFlags::ERR | PollFlags::HUP | PollFlags::RDHUP | PollFlags::NVAL,
+                ) {
+                    Err(())
+                } else {
+                    Ok(())
+                };
+            }
+            Err(error) if error == rustix::io::Errno::INTR => {}
+            Err(_) => return Err(()),
+        }
+    }
 }
 
 fn classify_cli_result(
@@ -1385,6 +1424,10 @@ mod tests {
                 .push(serde_json::to_string(payload).map_err(|_| ())?);
             Ok(())
         }
+
+        fn ensure_client_connected(&self) -> Result<(), ()> {
+            Ok(())
+        }
     }
 
     struct Fixture {
@@ -1463,6 +1506,14 @@ mod tests {
             )
             .expect("bridge operation");
             responder
+        }
+
+        fn replace_cli(&mut self, script: &[u8]) {
+            fs::write(&self.cli.path, script).expect("replace fake CLI");
+            fs::set_permissions(&self.cli.path, fs::Permissions::from_mode(0o755))
+                .expect("replacement mode");
+            self.cli.size = script.len() as u64;
+            self.cli.sha256 = format!("{:x}", Sha256::digest(script));
         }
     }
 
@@ -1551,11 +1602,7 @@ mod tests {
     fn failed_cli_side_effect_is_re_attested_and_fails_closed() {
         let mut fixture = Fixture::new();
         let script = b"#!/bin/sh\nset -eu\nprintf x >\"$CODEX_HOME/unexpected\"\nexit 1\n";
-        fs::write(&fixture.cli.path, script).expect("replace fake CLI");
-        fs::set_permissions(&fixture.cli.path, fs::Permissions::from_mode(0o755))
-            .expect("replacement mode");
-        fixture.cli.size = script.len() as u64;
-        fixture.cli.sha256 = format!("{:x}", Sha256::digest(script));
+        fixture.replace_cli(script);
         let mut responder = CapturingResponder::default();
         assert_eq!(
             execute_with_home(
@@ -1568,6 +1615,114 @@ mod tests {
             Err(ExecutionError::UnsafeHome)
         );
         assert!(responder.frames.is_empty());
+    }
+
+    #[test]
+    fn log_directory_with_many_entries_fails_closed_without_collecting_them() {
+        let fixture = Fixture::new();
+        let log_path = fixture.home_path.join("log");
+        fs::create_dir(&log_path).expect("log directory");
+        fs::set_permissions(&log_path, fs::Permissions::from_mode(0o700)).expect("log mode");
+        fs::write(log_path.join("codex-login.log"), b"").expect("allowed login log");
+        fs::set_permissions(
+            log_path.join("codex-login.log"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .expect("login log mode");
+        for index in 0..1024 {
+            fs::write(log_path.join(format!("unexpected-{index:04}")), b"")
+                .expect("unexpected log entry");
+        }
+
+        assert_eq!(
+            validate_log_directory(&fixture.home, fixture.home_policy),
+            Err(ExecutionError::UnsafeHome)
+        );
+    }
+
+    #[test]
+    fn bounded_readers_fail_closed_on_dual_stream_flood_without_deadlock() {
+        let mut fixture = Fixture::new();
+        fixture.replace_cli(
+            b"#!/bin/sh\nset -eu\ni=0\nwhile [ \"$i\" -lt 4096 ]; do\n  printf '0123456789abcdef'\n  printf 'fedcba9876543210' >&2\n  i=$((i + 1))\ndone\n",
+        );
+        let mut responder = CapturingResponder::default();
+        let started = Instant::now();
+
+        assert_eq!(
+            execute_with_home(
+                Operation::Status,
+                &fixture.home,
+                &fixture.cli,
+                fixture.home_policy,
+                &mut responder,
+            ),
+            Err(ExecutionError::CliFailed)
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(responder.frames.is_empty());
+    }
+
+    #[test]
+    fn device_login_client_hangup_cancels_a_sleeping_cli_promptly() {
+        let mut fixture = Fixture::new();
+        fixture.replace_cli(
+            b"#!/bin/sh\nset -eu\nprintf 'https://auth.openai.com/codex/device\\nABCD-1234\\n'\nsleep 5\n",
+        );
+        let (client, server) = rustix::net::socketpair(
+            AddressFamily::UNIX,
+            SocketType::SEQPACKET,
+            SocketFlags::CLOEXEC,
+            None,
+        )
+        .expect("client socket pair");
+        let peer = thread::spawn(move || {
+            let mut frame = [0_u8; MAX_RESPONSE_BYTES];
+            let (count, record_length) = rustix::net::recv(&client, &mut frame, RecvFlags::empty())
+                .expect("device-code response");
+            assert_eq!(count, record_length);
+            let frame = std::str::from_utf8(&frame[..count]).expect("UTF-8 response");
+            assert!(frame.contains("\"stage\":\"device-code\""));
+            // Dropping the peer produces HUP/RDHUP while the fake CLI sleeps.
+        });
+        let request = Request {
+            api_version: API_VERSION.to_owned(),
+            request_id: "C-01234567-89ab-4def-8123-456789abcdef".to_owned(),
+            operation: Operation::DeviceLogin,
+        };
+        let mut responder = SocketResponder {
+            socket: server.as_fd(),
+            request: &request,
+        };
+        let started = Instant::now();
+
+        assert_eq!(
+            execute_with_home(
+                Operation::DeviceLogin,
+                &fixture.home,
+                &fixture.cli,
+                fixture.home_policy,
+                &mut responder,
+            ),
+            Err(ExecutionError::ClientGone)
+        );
+        peer.join().expect("client observer");
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn client_write_half_close_is_detected_as_loss() {
+        let (client, server) = rustix::net::socketpair(
+            AddressFamily::UNIX,
+            SocketType::SEQPACKET,
+            SocketFlags::CLOEXEC,
+            None,
+        )
+        .expect("client socket pair");
+        rustix::net::shutdown(&client, rustix::net::Shutdown::Write)
+            .expect("client write-half close");
+
+        assert_eq!(ensure_socket_peer_connected(server.as_fd()), Err(()));
     }
 
     #[test]

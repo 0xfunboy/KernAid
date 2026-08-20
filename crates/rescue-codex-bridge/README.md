@@ -20,6 +20,11 @@ fallback temp store. CLI output is reduced to a fixed status vocabulary plus
 the one-time device URL/code. Raw stdout, stderr, CLI errors, and credential
 bytes never cross the bridge.
 
+While an authentication command is running, the bridge observes client socket
+hangup every 25 ms. Client loss terminates the complete CLI process group,
+re-attests the leased home, and closes the lease instead of retaining a busy
+device-login operation until its 16-minute command deadline.
+
 The live user calls `/usr/bin/kernaid-codex-auth`. No Codex prompt or agent run
 is exposed in Phase 0, and neither this client nor the Codex process has access
 to the repair broker or target block devices. Real-account device login remains

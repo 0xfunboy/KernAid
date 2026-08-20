@@ -88,8 +88,8 @@ its tests must reject any future opt-in.
 | `vault.unlock` | companion | 1 passphrase pipe | 0 |
 | `vault.lock` | companion | 0 | 0 |
 | `provider.openai.configure` | companion | 1 API-key pipe | 0 |
-| `provider.status` | companion, application, openai, codex | 0 | 0 |
-| `provider.logout` | companion; codex only when `provider=codex` | 0 | 0 |
+| `provider.status` | companion, application, openai | 0 | 0 |
+| `provider.logout` | companion | 0 | 0 |
 | `provider.openai.borrow` | openai | 0 | 1 one-shot API-key pipe |
 | `provider.codex.home_lease` | codex | 0 | 1 `O_PATH` directory |
 | `audit.append` | application | 0 | 0 |
