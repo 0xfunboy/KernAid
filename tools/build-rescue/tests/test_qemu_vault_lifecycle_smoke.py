@@ -2729,13 +2729,25 @@ class StaticContractTests(unittest.TestCase):
         ).decode("ascii")
         self.assertIn("connection.sendall(b'NORMAL\\n')", normal)
         self.assertIn("connection.shutdown(socket.SHUT_WR)", normal)
-        self.assertIn("kernaid-provider-lease-probe@.service", normal)
+        self.assertIn(controller.PROVIDER_LEASE_PROOF_UNIT, normal)
+        self.assertIn(controller.PROVIDER_LEASE_TEMPLATE_PATH, normal)
+        for property_name in ("LoadState", "FragmentPath", "BindsTo"):
+            self.assertIn(f'show("{property_name}",template)', normal)
+        self.assertIsNone(
+            re.search(r"[\"']kernaid-provider-lease-probe@\.service[\"']", normal)
+        )
         self.assertIn("kernaid-rescue-vaultd.service", normal)
 
         status = controller._production_status_probe_source().decode("ascii")
         self.assertIn(controller.PROVIDER_STATUS_PROBE_SOCKET, status)
         self.assertIn("connection.sendall(b'STATUS\\n')", status)
-        self.assertIn("kernaid-rescue-openai-executor@.service", status)
+        self.assertIn(controller.PROVIDER_EXECUTOR_PROOF_UNIT, status)
+        self.assertIn(controller.PROVIDER_EXECUTOR_TEMPLATE_PATH, status)
+        for property_name in ("LoadState", "FragmentPath", "BindsTo"):
+            self.assertIn(f'show("{property_name}",template)', status)
+        self.assertIsNone(
+            re.search(r"[\"']kernaid-rescue-openai-executor@\.service[\"']", status)
+        )
         self.assertIn("kernaid-rescue-openai-egress.service", status)
         self.assertIn('!=b"inactive"', status)
 
@@ -2799,7 +2811,15 @@ class StaticContractTests(unittest.TestCase):
             )
             self.assertIn('connection.putheader("Content-Type","application/json")', source)
             self.assertIn('connection.putheader("Content-Length",str(len(body)))', source)
-            self.assertIn('accepted_before=number("NAccepted",EXECUTOR)', source)
+            self.assertIn('response.headers.get_all("Retry-After",[])', source)
+            self.assertIn("MAX_BUSY_RETRIES=5", source)
+            self.assertIn("BUSY_BODY=b'{\"error\":{\"code\":\"busy\"}}'", source)
+            self.assertIn("def exchange_with_busy_retry(request,baseline):", source)
+            self.assertIn("wait_retry_interval()", source)
+            self.assertIn('checkpoint="relay-busy"', source)
+            self.assertIn("def capture_baseline():", source)
+            self.assertIn('accepted=number("NAccepted",EXECUTOR)', source)
+            self.assertIn("accepted_before,egress_before=attempt_baseline", source)
             self.assertIn('accepted_after=number("NAccepted",EXECUTOR)', source)
             self.assertIn("accepted_after!=accepted_before+1", source)
             self.assertIn('number("NConnections",EXECUTOR)!=0', source)
@@ -2938,6 +2958,237 @@ class StaticContractTests(unittest.TestCase):
             listener.close()
         self.assertFalse(server.is_alive())
         self.assertEqual(server_errors, [])
+
+    def test_ui_relay_retries_only_a_canonical_busy_response(self) -> None:
+        source = controller._production_ui_relay_probe_source(
+            "ui-status-configured"
+        ).decode("ascii")
+        support, separator, _transaction = source.partition(
+            'try:\n    checkpoint="ui-identity"'
+        )
+        self.assertEqual(separator, 'try:\n    checkpoint="ui-identity"')
+        namespace: dict[str, object] = {}
+        exec(compile(support, "<ui-relay-support>", "exec"), namespace)
+
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(2)
+        listener.settimeout(3.0)
+        port = listener.getsockname()[1]
+        server_errors: list[str] = []
+        bodies = (b'{"error":{"code":"busy"}}', b'{"ok":false}\n')
+
+        def serve_busy_then_success() -> None:
+            try:
+                for index, response_body in enumerate(bodies):
+                    connection, _address = listener.accept()
+                    with connection:
+                        connection.settimeout(2.0)
+                        request = bytearray()
+                        while b"\r\n\r\n" not in request:
+                            chunk = connection.recv(4096)
+                            if not chunk:
+                                raise AssertionError("request headers truncated")
+                            request.extend(chunk)
+                            if len(request) > 128 * 1024:
+                                raise AssertionError("request oversized")
+                        headers, body = request.split(b"\r\n\r\n", 1)
+                        length_match = re.search(
+                            rb"(?:^|\r\n)Content-Length: ([0-9]+)(?:\r\n|$)",
+                            headers,
+                        )
+                        if length_match is None:
+                            raise AssertionError("content length missing")
+                        declared = int(length_match.group(1))
+                        while len(body) < declared:
+                            chunk = connection.recv(4096)
+                            if not chunk:
+                                raise AssertionError("request body truncated")
+                            body += chunk
+                        if len(body) != declared:
+                            raise AssertionError("request body invalid")
+                        status = (
+                            b"429 Too Many Requests" if index == 0 else b"200 OK"
+                        )
+                        retry = b"Retry-After: 1\r\n" if index == 0 else b""
+                        connection.sendall(
+                            b"HTTP/1.0 "
+                            + status
+                            + b"\r\nContent-Type: application/json\r\n"
+                            b"Cache-Control: no-store\r\n"
+                            b"X-Content-Type-Options: nosniff\r\n"
+                            + retry
+                            + f"Content-Length: {len(response_body)}\r\n".encode()
+                            + b"Connection: close\r\n\r\n"
+                            + response_body
+                        )
+            except BaseException as error:
+                server_errors.append(type(error).__name__)
+
+        server = threading.Thread(target=serve_busy_then_success)
+        server.start()
+        baselines: list[int] = []
+
+        def baseline() -> int:
+            baselines.append(len(baselines) + 1)
+            return baselines[-1]
+
+        started = time.monotonic()
+        try:
+            namespace["PORT"] = port
+            namespace["TIMEOUT"] = 2.0
+            namespace["DEADLINE"] = started + 4.0
+            observed, accepted_baseline = namespace["exchange_with_busy_retry"](
+                {"probe": "fixed"}, baseline
+            )
+        finally:
+            server.join(3.0)
+            listener.close()
+        self.assertFalse(server.is_alive())
+        self.assertEqual(server_errors, [])
+        self.assertEqual(observed, {"ok": False})
+        self.assertEqual(accepted_baseline, 2)
+        self.assertEqual(baselines, [1, 2])
+        self.assertGreaterEqual(time.monotonic() - started, 1.0)
+
+    def test_ui_relay_busy_retry_is_bounded_by_count_and_absolute_deadline(
+        self,
+    ) -> None:
+        source = controller._production_ui_relay_probe_source(
+            "ui-status-configured"
+        ).decode("ascii")
+        support, separator, _transaction = source.partition(
+            'try:\n    checkpoint="ui-identity"'
+        )
+        self.assertEqual(separator, 'try:\n    checkpoint="ui-identity"')
+        namespace: dict[str, object] = {}
+        exec(compile(support, "<ui-relay-support>", "exec"), namespace)
+
+        class FakeTime:
+            def __init__(self) -> None:
+                self.now = 0.0
+
+            def monotonic(self) -> float:
+                return self.now
+
+            def sleep(self, delay: float) -> None:
+                if delay < 0:
+                    raise AssertionError("negative retry delay")
+                self.now += delay
+
+        fake_time = FakeTime()
+        calls: list[int] = []
+        baselines: list[int] = []
+        namespace["time"] = fake_time
+        namespace["DEADLINE"] = 10.0
+        namespace["exchange"] = lambda _request: (
+            calls.append(len(calls) + 1) or namespace["BUSY"]
+        )
+
+        def baseline() -> int:
+            baselines.append(len(baselines) + 1)
+            return baselines[-1]
+
+        observed, accepted_baseline = namespace["exchange_with_busy_retry"](
+            {"probe": "fixed"}, baseline
+        )
+        self.assertIs(observed, namespace["BUSY"])
+        self.assertIsNone(accepted_baseline)
+        self.assertEqual(calls, [1, 2, 3, 4, 5, 6])
+        self.assertEqual(baselines, [1, 2, 3, 4, 5, 6])
+        self.assertEqual(fake_time.now, 5.0)
+
+        fake_time.now = 0.0
+        namespace["DEADLINE"] = 0.5
+        with self.assertRaises(RuntimeError):
+            namespace["exchange_with_busy_retry"]({"probe": "fixed"}, baseline)
+
+    def test_ui_relay_rejects_noncanonical_busy_without_retry(self) -> None:
+        source = controller._production_ui_relay_probe_source(
+            "ui-status-configured"
+        ).decode("ascii")
+        support, separator, _transaction = source.partition(
+            'try:\n    checkpoint="ui-identity"'
+        )
+        self.assertEqual(separator, 'try:\n    checkpoint="ui-identity"')
+        namespace: dict[str, object] = {}
+        exec(compile(support, "<ui-relay-support>", "exec"), namespace)
+
+        canonical_body = b'{"error":{"code":"busy"}}'
+        common = (
+            b"Content-Type: application/json\r\n"
+            b"Cache-Control: no-store\r\n"
+            b"X-Content-Type-Options: nosniff\r\n"
+        )
+        malformed = {
+            "missing-retry": common,
+            "duplicate-retry": common
+            + b"Retry-After: 1\r\nRetry-After: 1\r\n",
+            "wrong-retry": common + b"Retry-After: 2\r\n",
+            "encoded": common
+            + b"Retry-After: 1\r\nContent-Encoding: identity\r\n",
+            "newline-body": common + b"Retry-After: 1\r\n",
+            "altered-body": common + b"Retry-After: 1\r\n",
+        }
+        for name, headers in malformed.items():
+            with self.subTest(name=name):
+                response_body = canonical_body
+                if name == "newline-body":
+                    response_body += b"\n"
+                elif name == "altered-body":
+                    response_body = b'{"error":{"code":"basy"}}'
+                listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                listener.bind(("127.0.0.1", 0))
+                listener.listen(1)
+                listener.settimeout(2.0)
+                port = listener.getsockname()[1]
+                server_errors: list[str] = []
+
+                def serve_malformed() -> None:
+                    try:
+                        connection, _address = listener.accept()
+                        with connection:
+                            connection.settimeout(2.0)
+                            request = bytearray()
+                            while b"\r\n\r\n" not in request:
+                                chunk = connection.recv(4096)
+                                if not chunk:
+                                    raise AssertionError("request truncated")
+                                request.extend(chunk)
+                            connection.sendall(
+                                b"HTTP/1.0 429 Too Many Requests\r\n"
+                                + headers
+                                + f"Content-Length: {len(response_body)}\r\n".encode()
+                                + b"Connection: close\r\n\r\n"
+                                + response_body
+                            )
+                    except BaseException as error:
+                        server_errors.append(type(error).__name__)
+
+                server = threading.Thread(target=serve_malformed)
+                server.start()
+                baseline_calls: list[int] = []
+
+                def baseline() -> int:
+                    baseline_calls.append(1)
+                    return 1
+
+                try:
+                    namespace["PORT"] = port
+                    namespace["TIMEOUT"] = 1.0
+                    namespace["DEADLINE"] = time.monotonic() + 2.0
+                    with self.assertRaises(RuntimeError):
+                        namespace["exchange_with_busy_retry"](
+                            {"probe": "fixed"}, baseline
+                        )
+                finally:
+                    server.join(2.0)
+                    listener.close()
+                self.assertFalse(server.is_alive())
+                self.assertEqual(server_errors, [])
+                self.assertEqual(baseline_calls, [1])
 
     def test_new_shell_is_syntactically_valid_and_scope_is_separate(self) -> None:
         subprocess.run(["bash", "-n", SCRIPT], check=True)

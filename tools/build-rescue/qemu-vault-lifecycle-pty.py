@@ -99,6 +99,7 @@ PROVIDER_PROOF_UI_CHECKPOINTS = (
     "ui-identity",
     "socket-baseline",
     "http-response",
+    "relay-busy",
     "socket-accounting",
     "quiescence",
     "envelope",
@@ -2532,6 +2533,16 @@ PROVIDER_STATUS_PROBE_SOCKET = "/run/kernaid-provider-executor-status-probe.sock
 PROVIDER_LEASE_PROBE_SOCKET = "/run/kernaid-provider-lease-probe.sock"
 PROVIDER_LEASE_KILL_SOCKET = "/run/kernaid-provider-lease-kill-vaultd.sock"
 PROVIDER_EXECUTOR_SOCKET_UNIT = "kernaid-rescue-openai-executor.socket"
+PROVIDER_EXECUTOR_PROOF_UNIT = (
+    "kernaid-rescue-openai-executor@kernaid-qemu-proof.service"
+)
+PROVIDER_EXECUTOR_TEMPLATE_PATH = (
+    "/etc/systemd/system/kernaid-rescue-openai-executor@.service"
+)
+PROVIDER_LEASE_PROOF_UNIT = "kernaid-provider-lease-probe@kernaid-qemu-proof.service"
+PROVIDER_LEASE_TEMPLATE_PATH = (
+    "/etc/systemd/system/kernaid-provider-lease-probe@.service"
+)
 PROVIDER_EGRESS_SERVICE_UNIT = "kernaid-rescue-openai-egress.service"
 PROVIDER_UI_SERVICE_UNIT = "kernaid-ui.service"
 TEST_CREDENTIAL_PREFIXES = (
@@ -2554,9 +2565,14 @@ def _socket_probe_source(
         raise ClosedFailure("provider-proof", "source-invalid")
     proof = f"KERNAID_QEMU_PROVIDER_PROOF_V1 stage={stage} result=true\n"
     return f'''import socket,subprocess,sys
+def show(prop,unit):
+    result=subprocess.run(["/usr/bin/systemctl","show","--property="+prop,"--value",unit],stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=3,check=False)
+    if result.returncode!=0 or len(result.stdout)>512:
+        raise RuntimeError()
+    return result.stdout.rstrip(b"\\n")
 try:
-    dependency=subprocess.run(["/usr/bin/systemctl","show","--property=BindsTo","--value","kernaid-provider-lease-probe@.service"],stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=3,check=False)
-    if dependency.returncode!=0 or dependency.stdout!=b"kernaid-rescue-vaultd.service\\n":
+    template={PROVIDER_LEASE_PROOF_UNIT!r}
+    if show("LoadState",template)!=b"loaded" or show("FragmentPath",template)!={PROVIDER_LEASE_TEMPLATE_PATH.encode('ascii')!r} or show("BindsTo",template)!=b"kernaid-rescue-vaultd.service":
         raise RuntimeError()
     connection=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
     connection.settimeout(30.0)
@@ -2595,7 +2611,8 @@ def show(prop,unit):
         raise RuntimeError()
     return result.stdout.rstrip(b"\\n")
 try:
-    if show("BindsTo","kernaid-rescue-openai-executor@.service")!=b"kernaid-rescue-vaultd.service":
+    template={PROVIDER_EXECUTOR_PROOF_UNIT!r}
+    if show("LoadState",template)!=b"loaded" or show("FragmentPath",template)!={PROVIDER_EXECUTOR_TEMPLATE_PATH.encode('ascii')!r} or show("BindsTo",template)!=b"kernaid-rescue-vaultd.service":
         raise RuntimeError()
     if show("ActiveState","kernaid-rescue-openai-egress.service")!=b"inactive":
         raise RuntimeError()
@@ -2666,6 +2683,9 @@ TIMEOUT={timeout!r}
 BUDGET={budget!r}
 MAX_REQUEST=96*1024
 MAX_RESPONSE=64*1024
+MAX_BUSY_RETRIES=5
+BUSY_BODY=b'{{"error":{{"code":"busy"}}}}'
+BUSY=object()
 FAILURES={{
 {failures}
 }}
@@ -2702,6 +2722,15 @@ def exact(value,keys):
     if type(value) is not dict or set(value)!=set(keys):
         raise RuntimeError()
     return value
+def wait_retry_interval():
+    target=time.monotonic()+1.0
+    if target>=DEADLINE:
+        raise RuntimeError()
+    while True:
+        delay=target-time.monotonic()
+        if delay<=0:
+            return
+        time.sleep(delay)
 def exchange(request):
     encoded=json.dumps(request,ensure_ascii=True,separators=(",",":")).encode("ascii")
     body=bytearray(encoded)
@@ -2727,14 +2756,21 @@ def exchange(request):
         transport.settimeout(remaining(TIMEOUT))
         response=connection.getresponse()
         lengths=response.headers.get_all("Content-Length",[])
-        if response.status!=200 or response.headers.get_all("Content-Type",[])!=["application/json"] or response.headers.get_all("Cache-Control",[])!=["no-store"] or response.headers.get_all("X-Content-Type-Options",[])!=["nosniff"] or response.headers.get_all("Transfer-Encoding",[]) or response.headers.get_all("Content-Encoding",[]) or len(lengths)!=1 or re.fullmatch(r"0|[1-9][0-9]*",lengths[0]) is None:
+        retries=response.headers.get_all("Retry-After",[])
+        if response.status not in (200,429) or response.headers.get_all("Content-Type",[])!=["application/json"] or response.headers.get_all("Cache-Control",[])!=["no-store"] or response.headers.get_all("X-Content-Type-Options",[])!=["nosniff"] or response.headers.get_all("Transfer-Encoding",[]) or response.headers.get_all("Content-Encoding",[]) or len(lengths)!=1 or re.fullmatch(r"0|[1-9][0-9]*",lengths[0]) is None:
             raise RuntimeError()
         declared=int(lengths[0])
         if declared>MAX_RESPONSE:
             raise RuntimeError()
         transport.settimeout(remaining(TIMEOUT))
         observed.extend(response.read(declared+1))
-        if len(observed)!=declared or observed[:1]!=b"{{" or observed[-2:]!=b"}}\\n" or b"\\n" in observed[:-1] or b"\\r" in observed:
+        if len(observed)!=declared:
+            raise RuntimeError()
+        if response.status==429:
+            if lengths!=["25"] or retries!=["1"] or bytes(observed)!=BUSY_BODY:
+                raise RuntimeError()
+            return BUSY
+        if retries or observed[:1]!=b"{{" or observed[-2:]!=b"}}\\n" or b"\\n" in observed[:-1] or b"\\r" in observed:
             raise RuntimeError()
         text=observed[:-1].decode("utf-8","strict")
         parsed=json.loads(text,object_pairs_hook=unique,parse_int=rejected,parse_float=rejected,parse_constant=rejected)
@@ -2748,6 +2784,16 @@ def exchange(request):
             transport.close()
         body[:]=b"\\0"*len(body)
         observed[:]=b"\\0"*len(observed)
+def exchange_with_busy_retry(request,baseline):
+    for attempt in range(MAX_BUSY_RETRIES+1):
+        attempt_baseline=baseline()
+        response=exchange(request)
+        if response is not BUSY:
+            return response,attempt_baseline
+        if attempt==MAX_BUSY_RETRIES:
+            return BUSY,None
+        wait_retry_interval()
+    raise RuntimeError()
 try:
     checkpoint="ui-identity"
     if show("ActiveState",UI)!=b"active" or show("SubState",UI)!=b"running" or show("FragmentPath",UI)!=b"/etc/systemd/system/kernaid-ui.service":
@@ -2758,13 +2804,17 @@ try:
     with open("/proc/"+ui_pid.decode("ascii")+"/cmdline","rb") as stream:
         if stream.read(256)!=b"/usr/bin/python3\\0-I\\0/usr/lib/kernaid/rescue_server.py\\0":
             raise RuntimeError()
-    checkpoint="socket-baseline"
-    if show("ActiveState",EXECUTOR)!=b"active" or show("SubState",EXECUTOR) not in (b"listening",b"running") or number("NConnections",EXECUTOR)!=0:
-        raise RuntimeError()
-    accepted_before=number("NAccepted",EXECUTOR)
-    egress_before=show("ActiveEnterTimestampMonotonic",EGRESS)
-    if show("ActiveState",EGRESS)!=b"inactive":
-        raise RuntimeError()
+    def capture_baseline():
+        global checkpoint
+        checkpoint="socket-baseline"
+        if show("ActiveState",EXECUTOR)!=b"active" or show("SubState",EXECUTOR) not in (b"listening",b"running") or number("NConnections",EXECUTOR)!=0:
+            raise RuntimeError()
+        accepted=number("NAccepted",EXECUTOR)
+        egress_enter=show("ActiveEnterTimestampMonotonic",EGRESS)
+        if show("ActiveState",EGRESS)!=b"inactive":
+            raise RuntimeError()
+        checkpoint="http-response"
+        return accepted,egress_enter
     if OPERATION=="provider.openai.diagnose":
         corpus={{"family":"windows","installationConfirmed":False,"installationMarkers":{{"windowsDirectoryPresent":False,"system32DirectoryPresent":False,"kernelPresent":False,"systemHivePresent":False,"softwareHivePresent":False,"usersDirectoryPresent":False}},"boot":{{"bootManagerPresent":False,"bcdPresent":False,"efiSystemPartition":{{"state":"not-present","microsoftBootManagerPresent":None,"bcdPresent":None,"fallbackBootloaderPresent":None}}}},"servicing":{{"pendingXmlPresent":False,"rebootPendingMarkerPresent":False}}}}
         payload={{"objective":"Qualifica il relay Rescue in sola lettura","evidence":[{{"schemaVersion":"1.0","id":"E-QEMU-RELAY","collector":"rescue.installed-target.filesystem-content.read-only.v1","target":"selected-installed-target","contentType":"application/json","trust":"observed-untrusted","summary":"Corpus statico windows acquisito read-only; installazione non confermata","content":json.dumps(corpus,ensure_ascii=True,separators=(",",":"))}}]}}
@@ -2772,7 +2822,11 @@ try:
         payload={{}}
     request={{"apiVersion":API,"requestId":REQUEST_ID,"operation":OPERATION,"payload":payload}}
     checkpoint="http-response"
-    response=exchange(request)
+    response,attempt_baseline=exchange_with_busy_retry(request,capture_baseline)
+    if response is BUSY or attempt_baseline is None:
+        checkpoint="relay-busy"
+        raise RuntimeError()
+    accepted_before,egress_before=attempt_baseline
     checkpoint="socket-accounting"
     accepted_after=number("NAccepted",EXECUTOR)
     if accepted_after!=accepted_before+1 or show("ActiveState",EGRESS)!=b"inactive" or show("ActiveEnterTimestampMonotonic",EGRESS)!=egress_before:

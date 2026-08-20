@@ -13,7 +13,8 @@ ConditionPathExists=/run/kernaid-rescue-vault/provider-lease-probe-validated-v1
 [Service]
 Type=simple
 LoadCredential=provider-lease-probe
-ExecCondition=/usr/bin/python3 -I -B -c 'import hashlib,pathlib,sys; data=pathlib.Path(sys.argv[1]).read_bytes(); sys.exit(not (len(data) == 15508 and hashlib.sha256(data).hexdigest() == "23470d54d04fd4d025988e9fabf7401b12c9157c6d58162295c01817c103a08f"))' ${CREDENTIALS_DIRECTORY}/provider-lease-probe
+# systemd v257 exposes service credentials to start phases, not ExecCondition.
+ExecStartPre=/usr/bin/python3 -I -B -c 'import hashlib,pathlib,sys; data=pathlib.Path(sys.argv[1]).read_bytes(); sys.exit(not (len(data) == 15508 and hashlib.sha256(data).hexdigest() == "23470d54d04fd4d025988e9fabf7401b12c9157c6d58162295c01817c103a08f"))' ${CREDENTIALS_DIRECTORY}/provider-lease-probe
 ExecStart=/usr/bin/python3 -I -B ${CREDENTIALS_DIRECTORY}/provider-lease-probe
 RuntimeMaxSec=15s
 TimeoutStartSec=5s

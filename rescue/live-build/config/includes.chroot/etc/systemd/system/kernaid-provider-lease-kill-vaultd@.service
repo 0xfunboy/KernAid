@@ -14,7 +14,8 @@ ConditionPathExists=/run/kernaid-rescue-vault/lifecycle-active-v1
 [Service]
 Type=oneshot
 LoadCredential=provider-lease-probe
-ExecCondition=/usr/bin/python3 -I -B -c 'import hashlib,pathlib,sys; data=pathlib.Path(sys.argv[1]).read_bytes(); sys.exit(not (len(data) == 15508 and hashlib.sha256(data).hexdigest() == "23470d54d04fd4d025988e9fabf7401b12c9157c6d58162295c01817c103a08f"))' ${CREDENTIALS_DIRECTORY}/provider-lease-probe
+# systemd v257 exposes service credentials to start phases, not ExecCondition.
+ExecStartPre=/usr/bin/python3 -I -B -c 'import hashlib,pathlib,sys; data=pathlib.Path(sys.argv[1]).read_bytes(); sys.exit(not (len(data) == 15508 and hashlib.sha256(data).hexdigest() == "23470d54d04fd4d025988e9fabf7401b12c9157c6d58162295c01817c103a08f"))' ${CREDENTIALS_DIRECTORY}/provider-lease-probe
 ExecStart=/usr/bin/systemctl --no-ask-password --no-pager kill --signal=KILL --kill-whom=main kernaid-rescue-vaultd.service
 TimeoutStartSec=10s
 TimeoutStopSec=5s

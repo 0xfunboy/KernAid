@@ -455,11 +455,24 @@ class RescueOpenAiExecutorPackagingTests(unittest.TestCase):
             self.assertIn(f"/etc/systemd/system/{path.name}", HOOK.read_text(encoding="utf-8"))
 
         for path in (LEASE_PROBE_SERVICE, LEASE_KILL_SERVICE, STATUS_PROBE_SERVICE):
-            service = "\n".join(section_lines(path, "Service"))
+            service_lines = section_lines(path, "Service")
+            service = "\n".join(service_lines)
             self.assertIn("LoadCredential=provider-lease-probe", service)
             self.assertIn(str(PROBE_SIZE), service)
             self.assertIn(PROBE_SHA256, service)
             self.assertIn("${CREDENTIALS_DIRECTORY}/provider-lease-probe", service)
+            preflights = [
+                line for line in service_lines if line.startswith("ExecStartPre=")
+            ]
+            self.assertEqual(len(preflights), 1)
+            self.assertIn(str(PROBE_SIZE), preflights[0])
+            self.assertIn(PROBE_SHA256, preflights[0])
+            self.assertIn(
+                "${CREDENTIALS_DIRECTORY}/provider-lease-probe", preflights[0]
+            )
+            self.assertFalse(
+                any(line.startswith("ExecCondition=") for line in service_lines)
+            )
 
     def test_qemu_provider_bridge_units_keep_roles_and_kill_surface_exact(self) -> None:
         expected_sockets = {

@@ -1552,6 +1552,43 @@ class ProviderRelayTests(unittest.TestCase):
             finally:
                 connection.close()
 
+    def test_http_relay_busy_response_is_canonical_and_retryable(self) -> None:
+        _server, port = self.start_server()
+        with patch.object(
+            rescue_server,
+            "relay_openai_provider",
+            side_effect=rescue_server.ProviderRelayError("busy", 429),
+        ):
+            connection = HTTPConnection("127.0.0.1", port, timeout=2)
+            try:
+                connection.request(
+                    "POST",
+                    "/api/rescue/provider/openai",
+                    body=self.REQUEST,
+                    headers={
+                        "Host": "127.0.0.1:4173",
+                        "Origin": "http://127.0.0.1:4173",
+                        "Sec-Fetch-Site": "same-origin",
+                        "Content-Type": "application/json",
+                    },
+                )
+                response = connection.getresponse()
+                self.assertEqual(response.status, 429)
+                self.assertEqual(
+                    response.headers.get_all("Content-Type"), ["application/json"]
+                )
+                self.assertEqual(response.headers.get_all("Cache-Control"), ["no-store"])
+                self.assertEqual(
+                    response.headers.get_all("X-Content-Type-Options"), ["nosniff"]
+                )
+                self.assertEqual(response.headers.get_all("Retry-After"), ["1"])
+                self.assertEqual(response.headers.get_all("Content-Length"), ["25"])
+                self.assertEqual(response.headers.get_all("Transfer-Encoding", []), [])
+                self.assertEqual(response.headers.get_all("Content-Encoding", []), [])
+                self.assertEqual(response.read(), b'{"error":{"code":"busy"}}')
+            finally:
+                connection.close()
+
 
 class InstalledTargetTests(unittest.TestCase):
     def test_qemu_requires_a_bound_fixture_selection_marker(self) -> None:
