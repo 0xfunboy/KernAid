@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import os
 from pathlib import Path
+import re
 import stat
 import subprocess
 import sys
@@ -174,6 +175,23 @@ class LinuxSnapshotEndToEndTests(unittest.TestCase):
         ):
             self.assertIn(token, harness)
         self.assertIn("rustix::process::chroot(&fixture_path)", source)
+        self.assertIn(
+            '"\\nKERNAID_RESIDENT_LINUX_SNAPSHOT_E2E_V1 '
+            'semantic_sha256={semantic_digest:x}"',
+            source,
+        )
+        self.assertIn('rb"^" + re.escape(prefix.encode("ascii"))', harness)
+        marker = (
+            "KERNAID_RESIDENT_LINUX_SNAPSHOT_E2E_V1 "
+            f"semantic_sha256={DIGEST}"
+        ).encode("ascii")
+        libtest_output = b"test tests::resident_probe ... \n" + marker + b"\nok\n"
+        marker_pattern = re.compile(
+            rb"^KERNAID_RESIDENT_LINUX_SNAPSHOT_E2E_V1 "
+            rb"semantic_sha256=([0-9a-f]{64})$",
+            re.MULTILINE,
+        )
+        self.assertEqual(marker_pattern.findall(libtest_output), [DIGEST.encode("ascii")])
 
     def test_hosted_ci_policy_runner_is_closed_and_restores(self) -> None:
         source = CI_RESIDENT_RUNNER.read_text(encoding="utf-8")

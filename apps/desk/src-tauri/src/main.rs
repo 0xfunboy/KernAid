@@ -1806,7 +1806,7 @@ mod tests {
             serde_json::to_vec(&sorted_snapshot).expect("sorted semantic snapshot JSON");
         let semantic_digest =
             Sha256::digest([E2E_SEMANTIC_HASH_DOMAIN, sorted_snapshot.as_slice()].concat());
-        println!("KERNAID_RESIDENT_LINUX_SNAPSHOT_E2E_V1 semantic_sha256={semantic_digest:x}");
+        println!("\nKERNAID_RESIDENT_LINUX_SNAPSHOT_E2E_V1 semantic_sha256={semantic_digest:x}");
     }
 
     fn macos_fixture_evidence() -> Vec<NativeDiagnosticEvidence> {
