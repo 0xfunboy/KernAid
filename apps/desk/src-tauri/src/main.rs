@@ -1313,6 +1313,26 @@ async fn collect_local_inventory() -> Result<Vec<Observation>, String> {
 }
 
 #[tauri::command]
+async fn collect_linux_normalized_snapshot() -> Result<serde_json::Value, String> {
+    #[cfg(target_os = "linux")]
+    {
+        tauri::async_runtime::spawn_blocking(|| {
+            let envelope = kernaid_linux_pack::snapshot::collect_current_root_snapshot()
+                .map_err(|_| "Lo snapshot Linux normalizzato non è disponibile.".to_owned())?;
+            serde_json::to_value(envelope)
+                .map_err(|_| "Lo snapshot Linux normalizzato non è serializzabile.".to_owned())
+        })
+        .await
+        .map_err(|_| "Lo snapshot Linux normalizzato non è stato completato.".to_owned())?
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err("Lo snapshot Linux è disponibile solo su sistemi Linux.".to_owned())
+    }
+}
+
+#[tauri::command]
 fn diagnose_linux_p0(evidence: Vec<NativeDiagnosticEvidence>) -> Result<serde_json::Value, String> {
     #[cfg(target_os = "linux")]
     {
@@ -1613,6 +1633,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             collect_local_inventory,
+            collect_linux_normalized_snapshot,
             collect_macos_p0_inventory,
             collect_windows_p0_inventory,
             diagnose_linux_p0,

@@ -15,6 +15,7 @@ on:
       - "apps/desk/**"
       - "packs/linux/**"
       - "crates/rescue-secrets/**"
+      - "crates/evidence/**"
       - "crates/rescue-openai-executor/**"
       - "crates/rescue-openai-provider/**"
       - "crates/report-schema/**"
@@ -32,7 +33,7 @@ on:
       - "pnpm-workspace.yaml"
       - "pnpm-lock.yaml"
       - ".github/workflows/rescue.yml"
-permissions: {contents: read}
+permissions: { contents: read }
 jobs:
   build-and-smoke-test:
     runs-on: ubuntu-24.04
@@ -40,11 +41,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88.0
-        with: {components: rustfmt, clippy}
+        with: { components: rustfmt, clippy }
       - uses: pnpm/action-setup@v4
-        with: {version: 9.15.9}
+        with: { version: 9.15.9 }
       - uses: actions/setup-node@v4
-        with: {node-version: 24.18.0, cache: pnpm}
+        with: { node-version: 24.18.0, cache: pnpm }
       - run: pnpm install --frozen-lockfile
       - run: pnpm --filter @kernaid/desk build
       - name: Install VM tooling

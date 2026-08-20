@@ -1,4 +1,7 @@
 #![forbid(unsafe_code)]
+
+pub mod linux_snapshot;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Evidence {
     pub id: String,

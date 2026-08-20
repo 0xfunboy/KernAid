@@ -1,0 +1,326 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.kernaid.dev/v1/linux-normalized-snapshot.json",
+  "title": "Linux normalized snapshot envelope",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "kind",
+    "snapshotSha256",
+    "capture",
+    "snapshot"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "1.0" },
+    "kind": { "const": "linux-normalized-snapshot" },
+    "snapshotSha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "capture": {
+      "oneOf": [
+        { "$ref": "#/$defs/residentCapture" },
+        { "$ref": "#/$defs/rescueCapture" }
+      ]
+    },
+    "snapshot": { "$ref": "#/$defs/snapshot" }
+  },
+  "$defs": {
+    "nullableReleaseValue": {
+      "anyOf": [
+        {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f]+$"
+        },
+        { "type": "null" }
+      ]
+    },
+    "residentCapture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "targetScope",
+        "accessPolicy",
+        "callerSuppliedPath",
+        "mutationRequested",
+        "crossDeviceTraversalAllowed"
+      ],
+      "properties": {
+        "mode": { "const": "resident" },
+        "targetScope": { "const": "running-root" },
+        "accessPolicy": { "const": "fixed-descriptor-read-only" },
+        "callerSuppliedPath": { "const": false },
+        "mutationRequested": { "const": false },
+        "crossDeviceTraversalAllowed": { "const": false }
+      }
+    },
+    "rescueCapture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "targetScope",
+        "accessPolicy",
+        "deviceOpenedReadOnly",
+        "journalReplayPrevented",
+        "privateMountNamespace",
+        "mountCleanupVerified",
+        "mutationPerformed",
+        "crossDeviceTraversalAllowed"
+      ],
+      "properties": {
+        "mode": { "const": "rescue" },
+        "targetScope": { "const": "selected-installed-target" },
+        "accessPolicy": { "const": "temporary-read-only-no-replay" },
+        "deviceOpenedReadOnly": { "const": true },
+        "journalReplayPrevented": { "const": true },
+        "privateMountNamespace": { "const": true },
+        "mountCleanupVerified": { "const": true },
+        "mutationPerformed": { "const": false },
+        "crossDeviceTraversalAllowed": { "const": false }
+      }
+    },
+    "snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "family",
+        "scope",
+        "installationConfirmed",
+        "topology",
+        "release",
+        "boot",
+        "configuration",
+        "packageDatabases"
+      ],
+      "properties": {
+        "family": { "const": "linux" },
+        "scope": { "const": "installed-root-static" },
+        "installationConfirmed": { "type": "boolean" },
+        "topology": { "$ref": "#/$defs/topology" },
+        "release": { "$ref": "#/$defs/release" },
+        "boot": { "$ref": "#/$defs/boot" },
+        "configuration": { "$ref": "#/$defs/configuration" },
+        "packageDatabases": { "$ref": "#/$defs/packageDatabases" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "type": "object",
+            "properties": { "installationConfirmed": { "const": true } }
+          },
+          "then": {
+            "type": "object",
+            "properties": {
+              "release": {
+                "type": "object",
+                "properties": { "id": { "type": "string" } }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "topology": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "collectionScope",
+        "separateEtcMountPresent",
+        "separateBootMountPresent",
+        "separateUsrMountPresent",
+        "separateVarMountPresent",
+        "relevantSeparateMountPresent",
+        "supported"
+      ],
+      "properties": {
+        "collectionScope": { "const": "root-filesystem-only" },
+        "separateEtcMountPresent": { "type": "boolean" },
+        "separateBootMountPresent": { "type": "boolean" },
+        "separateUsrMountPresent": { "type": "boolean" },
+        "separateVarMountPresent": { "type": "boolean" },
+        "relevantSeparateMountPresent": { "type": "boolean" },
+        "supported": { "type": "boolean" }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "separateBootMountPresent": { "const": false },
+            "separateEtcMountPresent": { "const": false },
+            "separateUsrMountPresent": { "const": false },
+            "separateVarMountPresent": { "const": false },
+            "relevantSeparateMountPresent": { "const": false },
+            "supported": { "const": true }
+          }
+        },
+        {
+          "properties": {
+            "relevantSeparateMountPresent": { "const": true },
+            "supported": { "const": false }
+          },
+          "anyOf": [
+            { "properties": { "separateBootMountPresent": { "const": true } } },
+            { "properties": { "separateEtcMountPresent": { "const": true } } },
+            { "properties": { "separateUsrMountPresent": { "const": true } } },
+            { "properties": { "separateVarMountPresent": { "const": true } } }
+          ]
+        }
+      ]
+    },
+    "release": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "prettyName", "versionId", "source"],
+      "properties": {
+        "id": { "$ref": "#/$defs/nullableReleaseValue" },
+        "name": { "$ref": "#/$defs/nullableReleaseValue" },
+        "prettyName": { "$ref": "#/$defs/nullableReleaseValue" },
+        "versionId": { "$ref": "#/$defs/nullableReleaseValue" },
+        "source": {
+          "enum": ["etc-os-release", "usr-lib-os-release", "absent"]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "type": "object",
+            "properties": { "source": { "const": "absent" } }
+          },
+          "then": {
+            "type": "object",
+            "properties": {
+              "id": { "const": null },
+              "name": { "const": null },
+              "prettyName": { "const": null },
+              "versionId": { "const": null }
+            }
+          }
+        }
+      ]
+    },
+    "boot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "directoryPresent",
+        "kernelArtifactCount",
+        "initramfsArtifactCount",
+        "bootloaderDirectoryCount",
+        "symlinkArtifactCount"
+      ],
+      "properties": {
+        "directoryPresent": { "type": "boolean" },
+        "kernelArtifactCount": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 512
+        },
+        "initramfsArtifactCount": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 512
+        },
+        "bootloaderDirectoryCount": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 3
+        },
+        "symlinkArtifactCount": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 512
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "type": "object",
+            "properties": { "directoryPresent": { "const": false } }
+          },
+          "then": {
+            "type": "object",
+            "properties": {
+              "kernelArtifactCount": { "const": 0 },
+              "initramfsArtifactCount": { "const": 0 },
+              "bootloaderDirectoryCount": { "const": 0 },
+              "symlinkArtifactCount": { "const": 0 }
+            }
+          }
+        }
+      ]
+    },
+    "configuration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fstab", "machineIdPresent"],
+      "properties": {
+        "fstab": { "$ref": "#/$defs/fstab" },
+        "machineIdPresent": { "type": "boolean" }
+      }
+    },
+    "fstab": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "present",
+        "entryCount",
+        "rootEntryPresent",
+        "efiEntryPresent",
+        "swapEntryCount",
+        "networkEntryCount",
+        "malformedLineCount"
+      ],
+      "properties": {
+        "present": { "type": "boolean" },
+        "entryCount": { "type": "integer", "minimum": 0, "maximum": 65536 },
+        "rootEntryPresent": { "type": "boolean" },
+        "efiEntryPresent": { "type": "boolean" },
+        "swapEntryCount": { "type": "integer", "minimum": 0, "maximum": 65536 },
+        "networkEntryCount": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65536
+        },
+        "malformedLineCount": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65536
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "type": "object",
+            "properties": { "present": { "const": false } }
+          },
+          "then": {
+            "type": "object",
+            "properties": {
+              "entryCount": { "const": 0 },
+              "rootEntryPresent": { "const": false },
+              "efiEntryPresent": { "const": false },
+              "swapEntryCount": { "const": 0 },
+              "networkEntryCount": { "const": 0 },
+              "malformedLineCount": { "const": 0 }
+            }
+          }
+        }
+      ]
+    },
+    "packageDatabases": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "dpkgStatusPresent",
+        "rpmDatabasePresent",
+        "pacmanDatabasePresent"
+      ],
+      "properties": {
+        "dpkgStatusPresent": { "type": "boolean" },
+        "rpmDatabasePresent": { "type": "boolean" },
+        "pacmanDatabasePresent": { "type": "boolean" }
+      }
+    }
+  }
+}

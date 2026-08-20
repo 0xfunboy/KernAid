@@ -128,7 +128,7 @@ function rescueEvidence(): ObservedEvidence {
       summary: "Corpus Rescue statico",
       blobRef: `sha256:${"a".repeat(64)}`,
     },
-    content: '{"family":"linux"}',
+    content: '{"family":"windows"}',
   };
 }
 

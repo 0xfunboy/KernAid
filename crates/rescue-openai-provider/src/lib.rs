@@ -12,6 +12,7 @@ mod local_wire;
 mod openai_wire;
 mod rescue_corpus;
 
+pub use kernaid_evidence::linux_snapshot::COLLECTOR as LINUX_NORMALIZED_SNAPSHOT_COLLECTOR;
 pub use local_wire::{
     API_VERSION, CredentialState, FrameError, MAX_REQUEST_FRAME_BYTES, MAX_RESPONSE_FRAME_BYTES,
     ProviderErrorCode, ProviderOperation, ProviderRequest, ProviderResponse, ProviderStatus,

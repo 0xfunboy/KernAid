@@ -60,6 +60,11 @@ physical validation item.
    partition has the standard ESP type; zero, multiple, or otherwise
    unqualified siblings produce `not-present`, `ambiguous`, or `unsupported`
    and make no boot-failure claim.
+   Linux P0 snapshot parity v1 is root-filesystem-only in both Resident and
+   Rescue. If `fstab` declares a separate mount at or below `/etc` (including
+   `/etc/machine-id`), `/boot` (including `/boot/efi`), `/efi`, `/usr`, or
+   `/var`, stop: KernAid reports the corpus as unsupported and blocks diagnosis.
+   This release does not claim parity for multi-mount Linux installations.
 6. Download the JSON report and retain its displayed SHA-256 prefix with the job
    record.
 7. Shut the live system down before removing the USB drive.

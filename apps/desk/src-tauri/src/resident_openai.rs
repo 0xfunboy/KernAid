@@ -40,8 +40,9 @@ const MAX_OUTPUT_TOKENS: u64 = 4_096;
 const MAX_PENDING_REQUESTS: usize = 1;
 const MAX_CANCEL_INTENTS: usize = 128;
 
-const LINUX_COLLECTORS: [&str; 10] = [
+const LINUX_COLLECTORS: [&str; 11] = [
     "system.hostname",
+    "linux.normalized-snapshot.v1",
     "linux.block.inventory",
     "linux.mounts.read-only",
     "linux.systemd.failed",
@@ -635,6 +636,38 @@ fn normalize_linux_corpus(
     use kernaid_linux_pack::diagnostics::{
         EvidenceInput, LinuxP0Inputs, diagnose_linux_p0, proposal_from_report,
     };
+    if indexed
+        .values()
+        .any(|evidence| evidence.target != "local-machine")
+    {
+        return Err(invalid_request());
+    }
+    let snapshot_evidence = corpus_evidence(indexed, "linux.normalized-snapshot.v1")?;
+    if snapshot_evidence.target != "local-machine"
+        || snapshot_evidence.content_type != "application/json"
+    {
+        return Err(invalid_request());
+    }
+    let snapshot = kernaid_evidence::linux_snapshot::LinuxNormalizedSnapshotEnvelope::parse(
+        snapshot_evidence.content.as_bytes(),
+    )
+    .map_err(|_| invalid_request())?;
+    if !snapshot.capture.is_resident() || !snapshot.snapshot.topology.supported {
+        return Err(invalid_request());
+    }
+    let normalized_snapshot_projection = json!({
+        "family": "linux",
+        "scope": &snapshot.snapshot.scope,
+        "installationConfirmed": snapshot.snapshot.installation_confirmed,
+        "topology": &snapshot.snapshot.topology,
+        "release": {
+            "idPresent": snapshot.snapshot.release.id.is_some(),
+            "source": &snapshot.snapshot.release.source,
+        },
+        "boot": &snapshot.snapshot.boot,
+        "configuration": &snapshot.snapshot.configuration,
+        "packageDatabases": &snapshot.snapshot.package_databases,
+    });
     let input = |collector| {
         let evidence = corpus_evidence(indexed, collector)?;
         Ok::<_, ResidentOpenAiError>(EvidenceInput {
@@ -655,12 +688,15 @@ fn normalize_linux_corpus(
     })
     .map_err(|_| invalid_request())?;
     let proposal = proposal_from_report(&report);
-    let evidence_ids = report.evidence_ids.iter().cloned().collect();
+    let mut evidence_ids: HashSet<String> = report.evidence_ids.iter().cloned().collect();
+    evidence_ids.insert(snapshot_evidence.id.clone());
     Ok(NormalizedCorpus {
         context: json!({
             "platform": "linux",
             "validation": "strict-complete",
             "corpusVersion": report.corpus_version,
+            "normalizedSnapshot": normalized_snapshot_projection,
+            "snapshotSha256": snapshot.snapshot_sha256,
             "deterministicProposal": proposal,
         }),
         evidence_ids,
@@ -1319,10 +1355,36 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    fn resident_snapshot_content() -> String {
+        let mut snapshot: kernaid_evidence::linux_snapshot::LinuxNormalizedSnapshot =
+            serde_json::from_str(include_str!(
+                "../../../../tests/fixtures/linux-normalized-snapshot/expected/snapshot.v1.json"
+            ))
+            .expect("shared Linux snapshot fixture");
+        snapshot.release.id = Some("RAW-ID-CANARY".to_owned());
+        snapshot.release.name = Some("RAW-NAME-CANARY".to_owned());
+        snapshot.release.pretty_name = Some("RAW-PRETTY-NAME-CANARY".to_owned());
+        snapshot.release.version_id = Some("RAW-VERSION-CANARY".to_owned());
+        let envelope = kernaid_evidence::linux_snapshot::LinuxNormalizedSnapshotEnvelope::new(
+            kernaid_evidence::linux_snapshot::LinuxSnapshotCapture::resident(),
+            snapshot,
+        )
+        .expect("Resident snapshot envelope");
+        String::from_utf8(envelope.canonical_json().expect("canonical snapshot"))
+            .expect("snapshot UTF-8")
+    }
+
     fn request(identity_content: &str) -> ResidentOpenAiDiagnosisRequest {
         #[cfg(target_os = "linux")]
         let evidence = vec![
             test_evidence("E-10", "system.hostname", identity_content, "text/plain"),
+            test_evidence(
+                "E-11",
+                "linux.normalized-snapshot.v1",
+                &resident_snapshot_content(),
+                "application/json",
+            ),
             test_evidence(
                 "E-1",
                 "linux.block.inventory",
@@ -1597,7 +1659,7 @@ mod tests {
 
     fn strict_pack_evidence_count() -> usize {
         #[cfg(target_os = "linux")]
-        return 9;
+        return 10;
         #[cfg(target_os = "windows")]
         return 11;
         #[cfg(target_os = "macos")]
@@ -1614,6 +1676,7 @@ mod tests {
         );
         diagnostic_request.objective =
             "Diagnose username=alice from C:\\Users\\alice\\report.txt".to_owned();
+        #[cfg(not(target_os = "linux"))]
         diagnostic_request.evidence[0].target = "host=customer-workstation".to_owned();
         diagnostic_request.evidence[0].summary =
             "owner=alice https://example.test/private/history".to_owned();
@@ -1685,6 +1748,10 @@ mod tests {
             "192.0.2.1",
             "11111111-2222-3333-4444-555555555555",
             "/dev/vda1",
+            "RAW-ID-CANARY",
+            "RAW-NAME-CANARY",
+            "RAW-PRETTY-NAME-CANARY",
+            "RAW-VERSION-CANARY",
         ] {
             assert!(
                 !serialized.contains(private_value),
@@ -1693,6 +1760,32 @@ mod tests {
         }
         assert!(serialized.contains("strict-complete"));
         assert!(serialized.contains("deterministicProposal"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn linux_provider_rejects_a_foreign_p0_target_before_network() {
+        let key = b"synthetic-target-binding-key";
+        let server = mock_server(response(valid_proposal()), Duration::ZERO);
+        let runtime = runtime_for(&server, key, Duration::from_secs(2));
+        let mut diagnostic_request = request("identity");
+        diagnostic_request
+            .evidence
+            .iter_mut()
+            .find(|evidence| evidence.collector == "linux.block.inventory")
+            .expect("Linux block evidence")
+            .target = "foreign-machine".to_owned();
+        let error = runtime
+            .diagnose(diagnostic_request)
+            .await
+            .expect_err("foreign Linux target must fail");
+        assert_eq!(error.code, ResidentOpenAiErrorCode::InvalidRequest);
+        assert!(
+            server
+                .captured
+                .recv_timeout(Duration::from_millis(100))
+                .is_err()
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

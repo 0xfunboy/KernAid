@@ -2264,8 +2264,10 @@ dependencies = [
 name = "kernaid-core"
 version = "0.1.0"
 dependencies = [
+ "kernaid-evidence",
  "kernaid-policy",
  "kernaid-protocol",
+ "sha2",
 ]
 
 [[package]]
@@ -2276,6 +2278,7 @@ dependencies = [
  "fs2",
  "kernaid-broker",
  "kernaid-device-identity",
+ "kernaid-evidence",
  "kernaid-linux-pack",
  "kernaid-macos-pack",
  "kernaid-native-secrets",
@@ -2315,15 +2318,22 @@ dependencies = [
 [[package]]
 name = "kernaid-evidence"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+]
 
 [[package]]
 name = "kernaid-linux-pack"
 version = "0.1.0"
 dependencies = [
+ "kernaid-evidence",
  "rustix",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -2396,6 +2406,7 @@ dependencies = [
 name = "kernaid-rescue-openai-provider"
 version = "0.1.0"
 dependencies = [
+ "kernaid-evidence",
  "regex",
  "serde",
  "serde_json",

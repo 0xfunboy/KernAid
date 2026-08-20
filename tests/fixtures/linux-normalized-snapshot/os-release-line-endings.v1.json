@@ -1,0 +1,17 @@
+{
+  "schemaVersion": "1.0",
+  "cases": [
+    {
+      "name": "crlf-valid",
+      "payload": "ID=x\r\nNAME=X\r\n",
+      "accepted": true,
+      "id": "x"
+    },
+    {
+      "name": "lone-cr-at-eof-invalid",
+      "payload": "ID=x\r",
+      "accepted": false,
+      "id": null
+    }
+  ]
+}

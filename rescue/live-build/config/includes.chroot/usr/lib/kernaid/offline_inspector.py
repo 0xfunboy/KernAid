@@ -584,6 +584,7 @@ def _verify_unmounted(mountpoint: str, major_minor: str) -> None:
 
 
 def _open_directory_chain(root_fd: int, components: tuple[str, ...]) -> int | None:
+    root_device = os.fstat(root_fd).st_dev
     descriptor = os.dup(root_fd)
     try:
         for component in components:
@@ -601,6 +602,12 @@ def _open_directory_chain(root_fd: int, components: tuple[str, ...]) -> int | No
                     "unsafe-target-content",
                     "Un elemento del filesystem ispezionato non è sicuro.",
                 ) from error
+            if os.fstat(next_descriptor).st_dev != root_device:
+                os.close(next_descriptor)
+                raise InspectionError(
+                    "unsupported-cross-device-content",
+                    "Il corpus Linux non attraversa filesystem separati.",
+                )
             os.close(descriptor)
             descriptor = next_descriptor
         return descriptor
@@ -638,7 +645,11 @@ def _read_regular(
             ) from error
         try:
             metadata = os.fstat(descriptor)
-            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > limit:
+            if (
+                metadata.st_dev != os.fstat(root_fd).st_dev
+                or not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_size > limit
+            ):
                 raise InspectionError(
                     "unsafe-target-content",
                     "Un file del filesystem ispezionato non rispetta i limiti.",
@@ -655,6 +666,28 @@ def _read_regular(
                 raise InspectionError(
                     "unsafe-target-content",
                     "Un file del filesystem ispezionato supera il limite.",
+                )
+            after = os.fstat(descriptor)
+            if (
+                (
+                    metadata.st_dev,
+                    metadata.st_ino,
+                    metadata.st_size,
+                    metadata.st_mtime_ns,
+                    metadata.st_ctime_ns,
+                )
+                != (
+                    after.st_dev,
+                    after.st_ino,
+                    after.st_size,
+                    after.st_mtime_ns,
+                    after.st_ctime_ns,
+                )
+                or len(payload) != metadata.st_size
+            ):
+                raise InspectionError(
+                    "unsafe-target-content",
+                    "Un file del filesystem è cambiato durante l'ispezione.",
                 )
             return bytes(payload)
         finally:
@@ -676,6 +709,11 @@ def _path_kind(root_fd: int, components: tuple[str, ...]) -> str:
             return "absent"
     finally:
         os.close(parent)
+    if metadata.st_dev != os.fstat(root_fd).st_dev:
+        raise InspectionError(
+            "unsupported-cross-device-content",
+            "Il corpus Linux non attraversa filesystem separati.",
+        )
     if stat.S_ISREG(metadata.st_mode):
         return "regular"
     if stat.S_ISDIR(metadata.st_mode):
@@ -700,7 +738,10 @@ def _require_safe_kind(
 def _bounded_release_value(value: str) -> str | None:
     if not value or len(value.encode("utf-8")) > MAX_RELEASE_VALUE_BYTES:
         return None
-    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+    if any(
+        ord(character) < 32 or 127 <= ord(character) <= 159
+        for character in value
+    ):
         return None
     return value
 
@@ -735,6 +776,14 @@ def _parse_os_release(payload: bytes | None) -> dict[str, str | None]:
     }
     if payload is None:
         return selected
+    if any(
+        byte == 13 and (index + 1 == len(payload) or payload[index + 1] != 10)
+        for index, byte in enumerate(payload)
+    ):
+        raise InspectionError(
+            "invalid-installed-os-metadata",
+            "Il formato di os-release non è valido.",
+        )
     try:
         text = payload.decode("utf-8", errors="strict")
     except UnicodeDecodeError as error:
@@ -744,7 +793,8 @@ def _parse_os_release(payload: bytes | None) -> dict[str, str | None]:
         ) from error
     mapping = {"ID": "id", "NAME": "name", "PRETTY_NAME": "prettyName", "VERSION_ID": "versionId"}
     seen: set[str] = set()
-    for line in text.splitlines():
+    for raw_line in text.split("\n"):
+        line = raw_line[:-1] if raw_line.endswith("\r") else raw_line
         if not line or line.startswith("#"):
             continue
         key, separator, value = line.partition("=")
@@ -770,7 +820,9 @@ def _parse_os_release(payload: bytes | None) -> dict[str, str | None]:
     return selected
 
 
-def _fstab_summary(payload: bytes | None) -> dict[str, object]:
+def _fstab_projection(
+    payload: bytes | None,
+) -> tuple[dict[str, object], dict[str, object]]:
     summary: dict[str, object] = {
         "present": payload is not None,
         "entryCount": 0,
@@ -780,34 +832,157 @@ def _fstab_summary(payload: bytes | None) -> dict[str, object]:
         "networkEntryCount": 0,
         "malformedLineCount": 0,
     }
+    topology: dict[str, object] = {
+        "collectionScope": "root-filesystem-only",
+        "separateEtcMountPresent": False,
+        "separateBootMountPresent": False,
+        "separateUsrMountPresent": False,
+        "separateVarMountPresent": False,
+        "relevantSeparateMountPresent": False,
+        "supported": True,
+    }
     if payload is None:
-        return summary
+        return summary, topology
     try:
-        lines = payload.decode("utf-8", errors="strict").splitlines()
+        text = payload.decode("utf-8", errors="strict")
     except UnicodeDecodeError as error:
         raise InspectionError(
             "invalid-installed-os-metadata",
             "Il file fstab non è UTF-8 valido.",
         ) from error
+    if any(
+        (ord(character) < 32 or 127 <= ord(character) <= 159)
+        and character not in {"\n", "\t", "\r"}
+        for character in text
+    ):
+        raise InspectionError(
+            "invalid-installed-os-metadata",
+            "Il file fstab contiene caratteri di controllo non validi.",
+        )
+    lines = [line[:-1] if line.endswith("\r") else line for line in text.split("\n")]
     for line in lines:
-        stripped = line.strip()
+        stripped = line.lstrip(" \t\r\n\v\f")
         if not stripped or stripped.startswith("#"):
             continue
-        fields = stripped.split()
-        if len(fields) < 4 or len(fields) > 6:
+        fields = _parse_fstab_line(stripped)
+        if fields is None:
             summary["malformedLineCount"] = int(summary["malformedLineCount"]) + 1
             continue
         _source, target, filesystem, options = fields[:4]
+        if not _canonical_fstab_target(target):
+            raise InspectionError(
+                "invalid-installed-os-metadata",
+                "fstab contiene un mountpoint non canonico.",
+            )
         summary["entryCount"] = int(summary["entryCount"]) + 1
         if target == "/":
             summary["rootEntryPresent"] = True
         if target in {"/boot/efi", "/efi"}:
             summary["efiEntryPresent"] = True
+        topology["separateEtcMountPresent"] = bool(
+            topology["separateEtcMountPresent"]
+            or _mount_target_is_within(target, "/etc")
+        )
+        topology["separateBootMountPresent"] = bool(
+            topology["separateBootMountPresent"]
+            or _mount_target_is_within(target, "/boot")
+            or _mount_target_is_within(target, "/efi")
+        )
+        topology["separateUsrMountPresent"] = bool(
+            topology["separateUsrMountPresent"]
+            or _mount_target_is_within(target, "/usr")
+        )
+        topology["separateVarMountPresent"] = bool(
+            topology["separateVarMountPresent"]
+            or _mount_target_is_within(target, "/var")
+        )
         if filesystem == "swap" or target == "none" and "sw" in options.split(","):
             summary["swapEntryCount"] = int(summary["swapEntryCount"]) + 1
         if filesystem in {"cifs", "nfs", "nfs4", "sshfs"}:
             summary["networkEntryCount"] = int(summary["networkEntryCount"]) + 1
-    return summary
+    topology["relevantSeparateMountPresent"] = any(
+        topology[key]
+        for key in (
+            "separateEtcMountPresent",
+            "separateBootMountPresent",
+            "separateUsrMountPresent",
+            "separateVarMountPresent",
+        )
+    )
+    topology["supported"] = not topology["relevantSeparateMountPresent"]
+    return summary, topology
+
+
+def _mount_target_is_within(target: str, root: str) -> bool:
+    return target == root or target.startswith(f"{root}/")
+
+
+def _canonical_fstab_target(target: str) -> bool:
+    if target in {"none", "/"}:
+        return True
+    if not target.startswith("/"):
+        return False
+    return all(segment not in {"", ".", ".."} for segment in target[1:].split("/"))
+
+
+def _parse_fstab_line(line: str) -> list[str] | None:
+    raw_fields: list[bytes] = []
+    for raw_field in line.encode("utf-8").split():
+        if raw_field.startswith(b"#"):
+            break
+        raw_fields.append(raw_field)
+        if len(raw_fields) > 6:
+            return None
+    if len(raw_fields) < 4:
+        return None
+    fields: list[str] = []
+    for raw_field in raw_fields:
+        decoded = _decode_fstab_field(raw_field)
+        if decoded is None:
+            return None
+        fields.append(decoded)
+    for numeric in fields[4:]:
+        if re.fullmatch(r"\+?[0-9]+", numeric) is None:
+            return None
+        if int(numeric, 10) > 4_294_967_295:
+            return None
+    return fields
+
+
+def _decode_fstab_field(field: bytes) -> str | None:
+    decoded = bytearray()
+    index = 0
+    while index < len(field):
+        if field[index] != ord("\\"):
+            decoded.append(field[index])
+            index += 1
+            continue
+        if index + 3 >= len(field):
+            return None
+        digits = field[index + 1 : index + 4]
+        if any(digit < ord("0") or digit > ord("7") for digit in digits):
+            return None
+        value = (digits[0] - ord("0")) * 64
+        value += (digits[1] - ord("0")) * 8
+        value += digits[2] - ord("0")
+        if value > 255:
+            return None
+        decoded.append(value)
+        index += 4
+    try:
+        value = bytes(decoded).decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return None
+    if (
+        not value
+        or len(value.encode("utf-8")) > 1024
+        or any(
+            ord(character) < 32 or 127 <= ord(character) <= 159
+            for character in value
+        )
+    ):
+        return None
+    return value
 
 
 def _boot_summary(root_fd: int, deadline: float) -> dict[str, int | bool]:
@@ -839,6 +1014,7 @@ def _boot_summary(root_fd: int, deadline: float) -> dict[str, int | bool]:
                 if not name or name in {".", ".."}:
                     continue
                 metadata = entry.stat(follow_symlinks=False)
+                _require_same_device(root_fd, metadata)
                 if stat.S_ISLNK(metadata.st_mode):
                     symlink_count += 1
                 elif stat.S_ISREG(metadata.st_mode):
@@ -863,17 +1039,40 @@ def _boot_summary(root_fd: int, deadline: float) -> dict[str, int | bool]:
         os.close(boot_fd)
 
 
+def _require_same_device(root_fd: int, metadata: object) -> None:
+    if getattr(metadata, "st_dev", None) != os.fstat(root_fd).st_dev:
+        raise InspectionError(
+            "unsupported-cross-device-content",
+            "Il corpus Linux non attraversa filesystem separati.",
+        )
+
+
 def collect_linux(root_fd: int, deadline: float) -> dict[str, object]:
     _check_deadline(deadline)
-    release_payload = _read_regular(
+    fstab_payload = _read_regular(
         root_fd,
-        ("etc", "os-release"),
-        MAX_OS_RELEASE_BYTES,
-        symlink_is_absent=True,
+        ("etc", "fstab"),
+        MAX_TEXT_FILE_BYTES,
         deadline=deadline,
     )
-    release_source = "etc-os-release"
-    if release_payload is None:
+    fstab, topology = _fstab_projection(fstab_payload)
+    release_payload = (
+        None
+        if topology["separateEtcMountPresent"]
+        else _read_regular(
+            root_fd,
+            ("etc", "os-release"),
+            MAX_OS_RELEASE_BYTES,
+            symlink_is_absent=True,
+            deadline=deadline,
+        )
+    )
+    release_source = "etc-os-release" if release_payload is not None else "absent"
+    if (
+        release_payload is None
+        and not topology["separateEtcMountPresent"]
+        and not topology["separateUsrMountPresent"]
+    ):
         release_payload = _read_regular(
             root_fd,
             ("usr", "lib", "os-release"),
@@ -881,44 +1080,62 @@ def collect_linux(root_fd: int, deadline: float) -> dict[str, object]:
             deadline=deadline,
         )
         release_source = "usr-lib-os-release" if release_payload is not None else "absent"
-    fstab_payload = _read_regular(
-        root_fd,
-        ("etc", "fstab"),
-        MAX_TEXT_FILE_BYTES,
-        deadline=deadline,
-    )
     release = _parse_os_release(release_payload)
     _check_deadline(deadline)
-    boot = _boot_summary(root_fd, deadline)
-    package_databases = {
-        "dpkgStatusPresent": _require_safe_kind(
-            root_fd, ("var", "lib", "dpkg", "status"), {"regular"}
-        )
-        == "regular",
-        "rpmDatabasePresent": _require_safe_kind(
-            root_fd, ("var", "lib", "rpm"), {"directory"}
-        )
-        == "directory",
-        "pacmanDatabasePresent": _require_safe_kind(
-            root_fd, ("var", "lib", "pacman", "local"), {"directory"}
-        )
-        == "directory",
-    }
-    machine_id_kind = _require_safe_kind(
-        root_fd, ("etc", "machine-id"), {"regular"}
+    boot = (
+        {
+            "directoryPresent": False,
+            "kernelArtifactCount": 0,
+            "initramfsArtifactCount": 0,
+            "bootloaderDirectoryCount": 0,
+            "symlinkArtifactCount": 0,
+        }
+        if topology["separateBootMountPresent"]
+        else _boot_summary(root_fd, deadline)
+    )
+    package_databases = (
+        {
+            "dpkgStatusPresent": False,
+            "rpmDatabasePresent": False,
+            "pacmanDatabasePresent": False,
+        }
+        if topology["separateVarMountPresent"]
+        else {
+            "dpkgStatusPresent": _require_safe_kind(
+                root_fd, ("var", "lib", "dpkg", "status"), {"regular"}
+            )
+            == "regular",
+            "rpmDatabasePresent": _require_safe_kind(
+                root_fd, ("var", "lib", "rpm"), {"directory"}
+            )
+            == "directory",
+            "pacmanDatabasePresent": _require_safe_kind(
+                root_fd, ("var", "lib", "pacman", "local"), {"directory"}
+            )
+            == "directory",
+        }
+    )
+    machine_id_kind = (
+        "absent"
+        if topology["separateEtcMountPresent"]
+        else _require_safe_kind(root_fd, ("etc", "machine-id"), {"regular"})
     )
     installation_confirmed = bool(
         release["id"]
+        and not topology["separateEtcMountPresent"]
         and _require_safe_kind(root_fd, ("etc",), {"directory"}) == "directory"
+        and not topology["separateUsrMountPresent"]
         and _require_safe_kind(root_fd, ("usr",), {"directory"}) == "directory"
     )
     return {
         "family": "linux",
+        "scope": "installed-root-static",
         "installationConfirmed": installation_confirmed,
+        "topology": topology,
         "release": {**release, "source": release_source},
         "boot": boot,
         "configuration": {
-            "fstab": _fstab_summary(fstab_payload),
+            "fstab": fstab,
             "machineIdPresent": machine_id_kind == "regular",
         },
         "packageDatabases": package_databases,

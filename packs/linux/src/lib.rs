@@ -4,6 +4,7 @@
 
 pub mod action_contract;
 pub mod diagnostics;
+pub mod snapshot;
 
 use rustix::{
     fd::OwnedFd,

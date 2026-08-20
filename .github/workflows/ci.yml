@@ -1,13 +1,13 @@
 name: ci
 on: [push, pull_request]
-permissions: {contents: read}
+permissions: { contents: read }
 jobs:
   rust:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88.0
-        with: {components: rustfmt, clippy}
+        with: { components: rustfmt, clippy }
       - name: Install Tauri Linux prerequisites
         run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
       - run: cargo fmt --all --check
@@ -15,6 +15,8 @@ jobs:
       - run: cargo test --workspace
       - name: Prove Observe fixture makes zero writes
         run: ./tests/integration/observe-zero-writes.sh
+      - name: Prove Resident and Rescue Linux snapshot parity without writes
+        run: bash ./tests/integration/linux-snapshot-parity.sh
       - name: Test Rescue authorization boundary
         run: python3 -m unittest discover -s tests/rescue -p 'test_*.py'
   typescript:
@@ -22,9 +24,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
-        with: {version: 9.15.9}
+        with: { version: 9.15.9 }
       - uses: actions/setup-node@v4
-        with: {node-version: 24.18.0, cache: pnpm}
+        with: { node-version: 24.18.0, cache: pnpm }
       - run: pnpm install --frozen-lockfile
       - name: Validate versioned schemas
         run: ./tools/verify-release/validate-schemas.sh

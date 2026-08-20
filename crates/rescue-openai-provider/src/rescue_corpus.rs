@@ -2,6 +2,11 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, sync::LazyLock};
 
+use kernaid_evidence::linux_snapshot::{
+    COLLECTOR as LINUX_NORMALIZED_SNAPSHOT_COLLECTOR, LinuxNormalizedSnapshot,
+    LinuxNormalizedSnapshotEnvelope,
+};
+
 pub const RESCUE_EVIDENCE_COLLECTOR: &str =
     "rescue.installed-target.filesystem-content.read-only.v1";
 pub const RESCUE_EVIDENCE_TARGET: &str = "selected-installed-target";
@@ -185,7 +190,10 @@ pub(crate) fn project_diagnosis(
     let item = evidence.first().ok_or(CorpusError::Invalid)?;
     if item.schema_version != "1.0"
         || !valid_evidence_id(&item.id)
-        || item.collector != RESCUE_EVIDENCE_COLLECTOR
+        || !matches!(
+            item.collector.as_str(),
+            RESCUE_EVIDENCE_COLLECTOR | LINUX_NORMALIZED_SNAPSHOT_COLLECTOR
+        )
         || item.target != RESCUE_EVIDENCE_TARGET
         || item.content_type != "application/json"
         || item.trust != "observed-untrusted"
@@ -195,11 +203,32 @@ pub(crate) fn project_diagnosis(
     {
         return Err(CorpusError::Invalid);
     }
-    let corpus = parse_corpus(&item.content)?;
-    if item.summary != corpus.summary() {
+    let (deterministic_proposal, expected_summary, observation_collector) =
+        if item.collector == LINUX_NORMALIZED_SNAPSHOT_COLLECTOR {
+            let envelope = LinuxNormalizedSnapshotEnvelope::parse(item.content.as_bytes())
+                .map_err(|_| CorpusError::Invalid)?;
+            if !envelope.capture.is_rescue() || !envelope.snapshot.topology.supported {
+                return Err(CorpusError::Invalid);
+            }
+            (
+                proposal_from_linux_snapshot(&envelope.snapshot, &item.id),
+                linux_snapshot_summary(&envelope.snapshot),
+                LINUX_NORMALIZED_SNAPSHOT_COLLECTOR,
+            )
+        } else {
+            let corpus = parse_corpus(&item.content)?;
+            if matches!(&corpus, RescueCorpus::Linux(_)) {
+                return Err(CorpusError::Invalid);
+            }
+            (
+                corpus.proposal(&item.id),
+                corpus.summary(),
+                RESCUE_EVIDENCE_COLLECTOR,
+            )
+        };
+    if item.summary != expected_summary {
         return Err(CorpusError::Invalid);
     }
-    let deterministic_proposal = corpus.proposal(&item.id);
     if !deterministic_proposal.validate() {
         return Err(CorpusError::Invalid);
     }
@@ -208,10 +237,54 @@ pub(crate) fn project_diagnosis(
         deterministic_proposal,
         observations: vec![ProjectedObservation {
             id: item.id.clone(),
-            collector: RESCUE_EVIDENCE_COLLECTOR,
+            collector: observation_collector,
             trust: "observed-untrusted",
         }],
     })
+}
+
+fn linux_snapshot_summary(snapshot: &LinuxNormalizedSnapshot) -> String {
+    if snapshot.installation_confirmed {
+        "Snapshot statico Linux rescue acquisito read-only e validato".to_owned()
+    } else {
+        "Snapshot statico Linux rescue acquisito read-only; installazione non confermata".to_owned()
+    }
+}
+
+fn proposal_from_linux_snapshot(
+    snapshot: &LinuxNormalizedSnapshot,
+    evidence_id: &str,
+) -> DiagnosisProposal {
+    if !snapshot.installation_confirmed {
+        return DiagnosisProposal::deterministic(
+            UNCONFIRMED_DIAGNOSIS,
+            0.2,
+            evidence_id,
+            "rescue.installed-target.installation-confirmation.read-only.v1",
+        );
+    }
+    if snapshot.configuration.fstab.malformed_line_count > 0 {
+        DiagnosisProposal::deterministic(
+            LINUX_FSTAB_DIAGNOSIS,
+            0.84,
+            evidence_id,
+            "rescue.linux.fstab.review.read-only.v1",
+        )
+    } else if snapshot.boot.directory_present && snapshot.boot.kernel_artifact_count == 0 {
+        DiagnosisProposal::deterministic(
+            LINUX_KERNEL_DIAGNOSIS,
+            0.68,
+            evidence_id,
+            "rescue.linux.boot-layout.read-only.v1",
+        )
+    } else {
+        DiagnosisProposal::deterministic(
+            LINUX_GENERIC_DIAGNOSIS,
+            0.58,
+            evidence_id,
+            "rescue.linux.targeted-health.read-only.v1",
+        )
+    }
 }
 
 fn redact_untrusted(input: &str) -> Result<String, CorpusError> {

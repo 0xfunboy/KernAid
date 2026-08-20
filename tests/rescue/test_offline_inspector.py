@@ -170,6 +170,23 @@ class FakeTargets:
 
 
 class CorpusTests(unittest.TestCase):
+    def test_shared_os_release_line_ending_vectors_match_the_contract(self) -> None:
+        vectors = json.loads(
+            (
+                ROOT
+                / "tests/fixtures/linux-normalized-snapshot/os-release-line-endings.v1.json"
+            ).read_text(encoding="utf-8")
+        )
+        for case in vectors["cases"]:
+            with self.subTest(case=case["name"]):
+                payload = case["payload"].encode("utf-8")
+                if case["accepted"]:
+                    release = offline_inspector._parse_os_release(payload)
+                    self.assertEqual(release["id"], case["id"])
+                else:
+                    with self.assertRaises(offline_inspector.InspectionError):
+                        offline_inspector._parse_os_release(payload)
+
     def test_linux_corpus_is_normalized_bounded_and_does_not_return_identifiers(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -198,6 +215,7 @@ class CorpusTests(unittest.TestCase):
                 os.close(root_fd)
         self.assertTrue(result["installationConfirmed"])
         self.assertEqual(result["family"], "linux")
+        self.assertEqual(result["scope"], "installed-root-static")
         self.assertEqual(result["release"]["id"], "debian")
         self.assertEqual(result["boot"]["kernelArtifactCount"], 1)
         self.assertTrue(result["configuration"]["machineIdPresent"])
@@ -224,6 +242,72 @@ class CorpusTests(unittest.TestCase):
                 os.close(root_fd)
         self.assertEqual(result["release"]["id"], "fallback")
         self.assertEqual(result["release"]["source"], "usr-lib-os-release")
+
+    def test_multi_filesystem_topology_skips_all_closed_path_placeholders(self) -> None:
+        root = ROOT / "tests/fixtures/linux-normalized-snapshot/multi-fs/root"
+        root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            result = offline_inspector.collect_linux(
+                root_fd, time.monotonic() + 2
+            )
+        finally:
+            os.close(root_fd)
+        self.assertFalse(result["topology"]["supported"])
+        self.assertTrue(result["topology"]["relevantSeparateMountPresent"])
+        self.assertTrue(result["topology"]["separateEtcMountPresent"])
+        self.assertFalse(result["installationConfirmed"])
+        self.assertEqual(result["release"]["source"], "absent")
+        self.assertFalse(result["configuration"]["machineIdPresent"])
+        self.assertFalse(result["boot"]["directoryPresent"])
+        self.assertFalse(any(result["packageDatabases"].values()))
+        encoded = json.dumps(result)
+        for canary in (
+            "kernaid-multi-fs",
+            "cross-device-kernel-placeholder",
+            "cross-device-usr-placeholder",
+            "cross-device-var-placeholder",
+        ):
+            self.assertNotIn(canary, encoded)
+
+    def test_shared_fstab_target_vectors_match_the_contract(self) -> None:
+        vectors = json.loads(
+            (
+                ROOT
+                / "tests/fixtures/linux-normalized-snapshot/fstab-targets.v1.json"
+            ).read_text(encoding="utf-8")
+        )
+        for case in vectors["cases"]:
+            target = case["target"]
+            with self.subTest(name=case["name"], target=target):
+                self.assertEqual(
+                    offline_inspector._canonical_fstab_target(target),
+                    case["accepted"],
+                )
+                if not case["accepted"] and target:
+                    with self.assertRaises(
+                        offline_inspector.InspectionError
+                    ) as context:
+                        offline_inspector._fstab_projection(
+                            f"LABEL=x {target} ext4 defaults 0 2\n".encode("ascii")
+                        )
+                    self.assertEqual(
+                        context.exception.code, "invalid-installed-os-metadata"
+                    )
+
+    def test_boot_entry_from_another_device_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                foreign = type(
+                    "ForeignMetadata",
+                    (),
+                    {"st_dev": os.fstat(root_fd).st_dev + 1},
+                )()
+                with self.assertRaises(offline_inspector.InspectionError) as context:
+                    offline_inspector._require_same_device(root_fd, foreign)
+            finally:
+                os.close(root_fd)
+        self.assertEqual(context.exception.code, "unsupported-cross-device-content")
 
     def test_windows_corpus_uses_only_static_presence_markers(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -532,6 +616,7 @@ class EngineTests(unittest.TestCase):
 
         normalized_linux = {
             "family": "linux",
+            "scope": "installed-root-static",
             "installationConfirmed": True,
             "release": {
                 "id": "debian",

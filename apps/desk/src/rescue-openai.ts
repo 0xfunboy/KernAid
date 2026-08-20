@@ -5,7 +5,11 @@ import {
   type ProviderRequestOptions,
 } from "@kernaid/agent-gateway";
 import {
+  LINUX_NORMALIZED_SNAPSHOT_COLLECTOR,
+  LINUX_NORMALIZED_SNAPSHOT_HASH_DOMAIN,
+  canonicalLinuxSnapshotJson,
   parseDiagnosisProposal,
+  parseLinuxNormalizedSnapshotEnvelopeJson,
   type DiagnosisProposal,
 } from "@kernaid/schemas";
 
@@ -180,7 +184,8 @@ export function transitionRescueProviderMode(
 interface RescueEvidence {
   schemaVersion: "1.0";
   id: string;
-  collector: typeof RESCUE_COLLECTOR;
+  collector:
+    typeof RESCUE_COLLECTOR | typeof LINUX_NORMALIZED_SNAPSHOT_COLLECTOR;
   target: typeof RESCUE_TARGET;
   contentType: "application/json";
   trust: "observed-untrusted";
@@ -234,7 +239,7 @@ export class RescueOpenAiProvider implements Provider {
   ): Promise<DiagnosisProposal> {
     if (options.signal?.aborted)
       throw new ProviderError("cancelled", "Richiesta OpenAI annullata.");
-    const rescueEvidence = prepareEvidence(objective, evidence);
+    const rescueEvidence = await prepareEvidence(objective, evidence);
     const requestId = newRequestId();
     const response = await exchange(
       this.#fetch,
@@ -271,10 +276,10 @@ export class RescueOpenAiProvider implements Provider {
   }
 }
 
-function prepareEvidence(
+async function prepareEvidence(
   objective: string,
   evidence: readonly ObservedEvidence[],
-): RescueEvidence {
+): Promise<RescueEvidence> {
   if (!boundedNonemptyUtf8(objective, MAX_OBJECTIVE_BYTES))
     throw providerError("invalid_request");
   if (evidence.length !== 1) throw providerError("invalid_request");
@@ -285,7 +290,8 @@ function prepareEvidence(
     item.schemaVersion !== "1.0" ||
     !EVIDENCE_ID.test(item.id) ||
     utf8Length(item.id) > 128 ||
-    item.collector !== RESCUE_COLLECTOR ||
+    (item.collector !== RESCUE_COLLECTOR &&
+      item.collector !== LINUX_NORMALIZED_SNAPSHOT_COLLECTOR) ||
     item.target !== RESCUE_TARGET ||
     item.contentType !== "application/json" ||
     item.trust !== "observed-untrusted" ||
@@ -293,16 +299,56 @@ function prepareEvidence(
     !boundedNonemptyUtf8(observed.content, MAX_EVIDENCE_CONTENT_BYTES)
   )
     throw providerError("invalid_request");
+  try {
+    if (item.collector === LINUX_NORMALIZED_SNAPSHOT_COLLECTOR) {
+      const envelope = parseLinuxNormalizedSnapshotEnvelopeJson(
+        UTF8_ENCODER.encode(observed.content),
+      );
+      if (
+        envelope.capture.mode !== "rescue" ||
+        !envelope.snapshot.topology.supported ||
+        envelope.snapshotSha256 !==
+          (await sha256Text(
+            `${LINUX_NORMALIZED_SNAPSHOT_HASH_DOMAIN}${canonicalLinuxSnapshotJson(
+              envelope.snapshot,
+            )}`,
+          ))
+      )
+        throw providerError("invalid_request");
+    } else {
+      const content = JSON.parse(observed.content) as unknown;
+      if (
+        typeof content !== "object" ||
+        content === null ||
+        Array.isArray(content) ||
+        (content as Record<string, unknown>).family !== "windows"
+      )
+        throw providerError("invalid_request");
+    }
+  } catch (error) {
+    if (error instanceof ProviderError) throw error;
+    throw providerError("invalid_request");
+  }
   return {
     schemaVersion: "1.0",
     id: item.id,
-    collector: RESCUE_COLLECTOR,
+    collector: item.collector,
     target: RESCUE_TARGET,
     contentType: "application/json",
     trust: "observed-untrusted",
     summary: item.summary,
     content: observed.content,
   };
+}
+
+async function sha256Text(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    UTF8_ENCODER.encode(value),
+  );
+  return Array.from(new Uint8Array(digest), (byte) =>
+    byte.toString(16).padStart(2, "0"),
+  ).join("");
 }
 
 async function exchange(

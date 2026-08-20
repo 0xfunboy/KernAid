@@ -1,0 +1,4 @@
+ID=kernaid-multi-fs
+NAME="KernAid Multi Filesystem Fixture"
+PRETTY_NAME="KernAid unsupported multi-filesystem fixture"
+VERSION_ID=1

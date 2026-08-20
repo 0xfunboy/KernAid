@@ -3,6 +3,10 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import type { AuditSealRequest } from "@kernaid/session-driver";
 import {
+  LINUX_NORMALIZED_SNAPSHOT_HASH_DOMAIN,
+  canonicalLinuxSnapshotJson,
+} from "@kernaid/schemas";
+import {
   NativeOpenAiProvider,
   PlatformOfflineRulesProvider,
   authorizeObserve,
@@ -10,6 +14,8 @@ import {
   fingerprintNativeTarget,
   fingerprintRescueTarget,
   inspectRescueInstalledTarget,
+  linuxNormalizedSnapshotEvidenceSummary,
+  linuxNormalizedSnapshotFromRescue,
   nativeObservationContentType,
   nativeObservationSummary,
   parseNativeObservations,
@@ -24,6 +30,8 @@ import {
   selectRescueInstalledTarget,
   rescueOfflineCorpusJson,
   rescueOfflineEvidenceSummary,
+  LINUX_NORMALIZED_SNAPSHOT_COLLECTOR,
+  LINUX_P0_COLLECTORS,
   RESCUE_OFFLINE_EVIDENCE_COLLECTOR,
   RESCUE_OFFLINE_EVIDENCE_TARGET,
   RescueOfflineInspectionError,
@@ -657,6 +665,30 @@ test("Rescue inspection errors are typed, non-retried, and never expose backend 
       Response.json(
         {
           error: {
+            code: "unsupported-cross-device-content",
+            message: "separate filesystem rejected safely",
+            retryable: false,
+            claims: rescueInspectionClaims(),
+          },
+        },
+        { status: 422 },
+      ),
+    );
+    await assert.rejects(
+      inspectRescueInstalledTarget(selection),
+      (error: unknown) => {
+        assert.equal(
+          (error as RescueOfflineInspectionError).code,
+          "unsupported-cross-device-content",
+        );
+        return true;
+      },
+    );
+
+    setFetch(async () =>
+      Response.json(
+        {
+          error: {
             code: "associated-efi-read-only-mount-failed",
             message: "ESP mount rejected safely",
             retryable: false,
@@ -1159,7 +1191,9 @@ test("Rescue corpus diagnosis is deterministic and independent of browser global
   Reflect.deleteProperty(globalThis, "window");
   try {
     const provider = new PlatformOfflineRulesProvider();
-    const linuxEvidence = rescueCorpusEvidence(rescueLinuxInspectionFixture());
+    const linuxEvidence = await rescueCorpusEvidence(
+      rescueLinuxInspectionFixture(),
+    );
     const linux = await provider.diagnose("Analizza il target", [
       linuxEvidence,
     ]);
@@ -1167,7 +1201,7 @@ test("Rescue corpus diagnosis is deterministic and independent of browser global
     assert.equal(linux.confidence, 0.84);
     assert.deepEqual(linux.evidenceIds, ["E-RESCUE-CORPUS"]);
 
-    const windowsEvidence = rescueCorpusEvidence(
+    const windowsEvidence = await rescueCorpusEvidence(
       rescueWindowsInspectionFixture(),
     );
     const windows = await provider.diagnose("Analizza il target", [
@@ -1277,7 +1311,7 @@ test("Rescue OpenAI golden requests preserve deterministic TypeScript parity", a
 
 test("Rescue corpus provider requires one exact canonically summarized evidence", async () => {
   const provider = new PlatformOfflineRulesProvider();
-  const valid = rescueCorpusEvidence(rescueWindowsInspectionFixture());
+  const valid = await rescueCorpusEvidence(rescueWindowsInspectionFixture());
   const assertBlocked = async (
     values: Parameters<PlatformOfflineRulesProvider["diagnose"]>[1],
   ): Promise<void> => {
@@ -1572,6 +1606,219 @@ test("partial native Linux evidence fails closed instead of using generic rules"
   } finally {
     restoreProperty("window", originalWindow);
   }
+});
+
+test("snapshot-only Linux evidence is structural and never reaches text fallback", async () => {
+  const snapshot = JSON.parse(
+    readFileSync(
+      new URL(
+        "../../../tests/fixtures/linux-normalized-snapshot/expected/snapshot.v1.json",
+        import.meta.url,
+      ),
+      "utf8",
+    ),
+  ) as {
+    release: { prettyName: string | null };
+  };
+  snapshot.release.prettyName = "I/O error storage filesystem failed canary";
+  const snapshotSha256 = await sha256(
+    `${LINUX_NORMALIZED_SNAPSHOT_HASH_DOMAIN}${canonicalLinuxSnapshotJson(snapshot)}`,
+  );
+  const content = JSON.stringify({
+    schemaVersion: "1.0",
+    kind: "linux-normalized-snapshot",
+    snapshotSha256,
+    capture: {
+      mode: "resident",
+      targetScope: "running-root",
+      accessPolicy: "fixed-descriptor-read-only",
+      callerSuppliedPath: false,
+      mutationRequested: false,
+      crossDeviceTraversalAllowed: false,
+    },
+    snapshot,
+  });
+  const evidence = residentSnapshotEvidence(content, "application/json");
+  const proposal = await new PlatformOfflineRulesProvider().diagnose(
+    "Analizza",
+    [evidence],
+  );
+  assert.match(proposal.diagnosis, /Diagnosi Linux incompleta/);
+  assert.doesNotMatch(proposal.diagnosis, /storage|I\/O error/iu);
+  assert.equal(proposal.confidence, 0.1);
+  assert.deepEqual(proposal.evidenceIds, ["E-SNAPSHOT"]);
+  assert.ok(proposal.requestedEvidence.includes("linux.block.inventory"));
+
+  for (const invalid of [
+    residentSnapshotEvidence("I/O error storage failed", "application/json"),
+    residentSnapshotEvidence(content, "text/plain"),
+  ]) {
+    const blocked = await new PlatformOfflineRulesProvider().diagnose(
+      "Analizza",
+      [invalid],
+    );
+    assert.match(blocked.diagnosis, /snapshot statico normalizzato/);
+    assert.equal(blocked.confidence, 0.1);
+    assert.deepEqual(blocked.evidenceIds, ["E-SNAPSHOT"]);
+    assert.doesNotMatch(blocked.diagnosis, /storage|I\/O error/iu);
+  }
+});
+
+test("Resident Linux provider requires the exact local-machine corpus", async () => {
+  const snapshot = JSON.parse(
+    readFileSync(
+      new URL(
+        "../../../tests/fixtures/linux-normalized-snapshot/expected/snapshot.v1.json",
+        import.meta.url,
+      ),
+      "utf8",
+    ),
+  ) as unknown;
+  const snapshotSha256 = await sha256(
+    `${LINUX_NORMALIZED_SNAPSHOT_HASH_DOMAIN}${canonicalLinuxSnapshotJson(snapshot)}`,
+  );
+  const snapshotContent = JSON.stringify({
+    schemaVersion: "1.0",
+    kind: "linux-normalized-snapshot",
+    snapshotSha256,
+    capture: {
+      mode: "resident",
+      targetScope: "running-root",
+      accessPolicy: "fixed-descriptor-read-only",
+      callerSuppliedPath: false,
+      mutationRequested: false,
+      crossDeviceTraversalAllowed: false,
+    },
+    snapshot,
+  });
+  const corpus = [
+    residentSnapshotEvidence(snapshotContent, "application/json"),
+    {
+      evidence: {
+        schemaVersion: "1.0" as const,
+        id: "E-HOSTNAME",
+        collector: "system.hostname",
+        target: "local-machine",
+        capturedAt: "2026-08-20T00:00:00.000Z",
+        contentType: "text/plain",
+        sha256: "b".repeat(64),
+        sensitivity: "system" as const,
+        trust: "observed-untrusted" as const,
+        summary: "Comando di inventario completato",
+        blobRef: `sha256:${"b".repeat(64)}`,
+      },
+      content: "production-hostname",
+    },
+    ...LINUX_P0_COLLECTORS.map((collector, index) => ({
+      evidence: {
+        schemaVersion: "1.0" as const,
+        id: `E-P0-${index}`,
+        collector,
+        target: "local-machine",
+        capturedAt: "2026-08-20T00:00:00.000Z",
+        contentType: "text/plain",
+        sha256: "c".repeat(64),
+        sensitivity: "system" as const,
+        trust: "observed-untrusted" as const,
+        summary: "Comando di inventario completato",
+        blobRef: `sha256:${"c".repeat(64)}`,
+      },
+      content: "fixture",
+    })),
+  ];
+  const foreign = structuredClone(corpus);
+  foreign[2]!.evidence.target = "foreign-machine";
+  const extra = [
+    ...corpus,
+    {
+      ...providerEvidence(),
+      evidence: {
+        ...providerEvidence().evidence,
+        id: "E-EXTRA",
+        collector: "linux.raw.uncontracted",
+      },
+    },
+  ];
+  const duplicateId = structuredClone(corpus);
+  duplicateId[2]!.evidence.id = duplicateId[1]!.evidence.id;
+  const provider = new PlatformOfflineRulesProvider();
+  for (const invalid of [foreign, extra, duplicateId]) {
+    const proposal = await provider.diagnose("Analizza", invalid);
+    assert.match(proposal.diagnosis, /Diagnosi Linux incompleta/);
+    assert.equal(proposal.confidence, 0.1);
+    assert.ok(proposal.requestedEvidence.includes("linux.p0.corpus.exact.v1"));
+  }
+});
+
+test("unsupported topology blocks Resident and Rescue providers before findings", async () => {
+  const snapshot = JSON.parse(
+    readFileSync(
+      new URL(
+        "../../../tests/fixtures/linux-normalized-snapshot/expected/multi-fs.snapshot.v1.json",
+        import.meta.url,
+      ),
+      "utf8",
+    ),
+  ) as unknown;
+  const snapshotSha256 = await sha256(
+    `${LINUX_NORMALIZED_SNAPSHOT_HASH_DOMAIN}${canonicalLinuxSnapshotJson(snapshot)}`,
+  );
+  const residentContent = JSON.stringify({
+    schemaVersion: "1.0",
+    kind: "linux-normalized-snapshot",
+    snapshotSha256,
+    capture: {
+      mode: "resident",
+      targetScope: "running-root",
+      accessPolicy: "fixed-descriptor-read-only",
+      callerSuppliedPath: false,
+      mutationRequested: false,
+      crossDeviceTraversalAllowed: false,
+    },
+    snapshot,
+  });
+  const resident = await new PlatformOfflineRulesProvider().diagnose(
+    "Analizza",
+    [residentSnapshotEvidence(residentContent, "application/json")],
+  );
+  assert.match(resident.diagnosis, /topologia non supportata/);
+  assert.equal(resident.confidence, 0.1);
+  assert.deepEqual(resident.requestedEvidence, [
+    "linux.topology.single-filesystem.v1",
+  ]);
+
+  const rescueFixture = rescueLinuxInspectionFixture();
+  rescueFixture.status = "content-inspected-installation-unconfirmed";
+  rescueFixture.os.installationConfirmed = false;
+  rescueFixture.claims.installedOsConfirmed = false;
+  rescueFixture.os.topology = {
+    collectionScope: "root-filesystem-only",
+    separateEtcMountPresent: true,
+    separateBootMountPresent: true,
+    separateUsrMountPresent: true,
+    separateVarMountPresent: true,
+    relevantSeparateMountPresent: true,
+    supported: false,
+  };
+  rescueFixture.os.release = {
+    id: null,
+    name: null,
+    prettyName: null,
+    versionId: null,
+    source: "absent",
+  };
+  const rescue = await new PlatformOfflineRulesProvider().diagnose("Analizza", [
+    await rescueCorpusEvidence(rescueFixture),
+  ]);
+  assert.match(
+    rescue.diagnosis,
+    /topologia multi-filesystem|filesystem separati/,
+  );
+  assert.equal(rescue.confidence, 0.1);
+  assert.deepEqual(rescue.requestedEvidence, [
+    "linux.topology.single-filesystem.v1",
+  ]);
+  assert.doesNotMatch(rescue.diagnosis, /fstab malformate|nessuna anomalia/iu);
 });
 
 test("partial native Windows evidence fails closed instead of using generic rules", async () => {
@@ -1949,7 +2196,17 @@ function rescueLinuxInspectionFixture() {
     claims: rescueInspectionClaims(),
     os: {
       family: "linux",
+      scope: "installed-root-static",
       installationConfirmed: true,
+      topology: {
+        collectionScope: "root-filesystem-only",
+        separateEtcMountPresent: false,
+        separateBootMountPresent: false,
+        separateUsrMountPresent: false,
+        separateVarMountPresent: false,
+        relevantSeparateMountPresent: false,
+        supported: true,
+      },
       release: {
         id: "debian",
         name: "Debian GNU/Linux",
@@ -1991,7 +2248,7 @@ function rescueLinuxInspectionFixture() {
   };
 }
 
-function rescueCorpusEvidence(
+async function rescueCorpusEvidence(
   inspection:
     | ReturnType<typeof rescueWindowsInspectionFixture>
     | ReturnType<typeof rescueLinuxInspectionFixture>,
@@ -2002,21 +2259,55 @@ function rescueCorpusEvidence(
       ? rescueLinuxTargetSelectionFixture()
       : rescueTargetSelectionFixture(),
   );
+  const linuxSnapshot =
+    parsed.os.family === "linux"
+      ? await linuxNormalizedSnapshotFromRescue(parsed)
+      : undefined;
+  const content =
+    linuxSnapshot === undefined
+      ? rescueOfflineCorpusJson(parsed)
+      : JSON.stringify(linuxSnapshot);
+  const contentHash = await sha256(content);
   return {
     evidence: {
       schemaVersion: "1.0" as const,
       id: "E-RESCUE-CORPUS",
-      collector: RESCUE_OFFLINE_EVIDENCE_COLLECTOR,
+      collector:
+        linuxSnapshot === undefined
+          ? RESCUE_OFFLINE_EVIDENCE_COLLECTOR
+          : LINUX_NORMALIZED_SNAPSHOT_COLLECTOR,
       target: RESCUE_OFFLINE_EVIDENCE_TARGET,
       capturedAt: "2026-08-17T00:00:00.000Z",
       contentType: "application/json",
-      sha256: "1".repeat(64),
+      sha256: contentHash,
       sensitivity: "system" as const,
       trust: "observed-untrusted" as const,
-      summary: rescueOfflineEvidenceSummary(parsed),
-      blobRef: `sha256:${"1".repeat(64)}`,
+      summary:
+        linuxSnapshot === undefined
+          ? rescueOfflineEvidenceSummary(parsed)
+          : linuxNormalizedSnapshotEvidenceSummary(linuxSnapshot),
+      blobRef: `sha256:${contentHash}`,
     },
-    content: rescueOfflineCorpusJson(parsed),
+    content,
+  };
+}
+
+function residentSnapshotEvidence(content: string, contentType: string) {
+  return {
+    evidence: {
+      schemaVersion: "1.0" as const,
+      id: "E-SNAPSHOT",
+      collector: LINUX_NORMALIZED_SNAPSHOT_COLLECTOR,
+      target: "local-machine",
+      capturedAt: "2026-08-20T00:00:00.000Z",
+      contentType,
+      sha256: "a".repeat(64),
+      sensitivity: "system" as const,
+      trust: "observed-untrusted" as const,
+      summary: "Snapshot statico Linux resident acquisito read-only e validato",
+      blobRef: `sha256:${"a".repeat(64)}`,
+    },
+    content,
   };
 }
 

@@ -7,7 +7,12 @@ import {
   type ProviderSecretSupplier,
 } from "@kernaid/provider-types";
 import {
+  LINUX_NORMALIZED_SNAPSHOT_COLLECTOR,
+  LINUX_NORMALIZED_SNAPSHOT_CONTENT_TYPE,
+  LINUX_NORMALIZED_SNAPSHOT_HASH_DOMAIN,
+  canonicalLinuxSnapshotJson,
   parseDiagnosisProposal,
+  parseLinuxNormalizedSnapshotEnvelopeJson,
   type DiagnosisProposal,
 } from "@kernaid/schemas";
 import { redactForProvider } from "./redaction.js";
@@ -124,7 +129,7 @@ export class OpenAIResponsesProvider implements Provider {
     evidence: readonly ObservedEvidence[],
     options: ProviderRequestOptions = {},
   ): Promise<DiagnosisProposal> {
-    const input = safeDiagnosisInput(objective, evidence);
+    const input = await safeDiagnosisInput(objective, evidence);
     const envelope = await postJson(
       this.#request,
       {
@@ -177,7 +182,7 @@ export class OpenAICompatibleProvider implements Provider {
     evidence: readonly ObservedEvidence[],
     options: ProviderRequestOptions = {},
   ): Promise<DiagnosisProposal> {
-    const input = safeDiagnosisInput(objective, evidence);
+    const input = await safeDiagnosisInput(objective, evidence);
     const responseFormat =
       this.#responseFormat === "json-schema"
         ? {
@@ -207,10 +212,10 @@ export class OpenAICompatibleProvider implements Provider {
   }
 }
 
-function diagnosisInput(
+async function diagnosisInput(
   objective: string,
   evidence: readonly ObservedEvidence[],
-): object {
+): Promise<object> {
   if (
     typeof objective !== "string" ||
     !objective.trim() ||
@@ -219,27 +224,92 @@ function diagnosisInput(
     throw new ProviderError("invalid_request", "Provider input is invalid");
   return {
     objective: redactForProvider(objective),
-    observations: evidence.map((item) => ({
-      id: item.evidence.id,
-      collector: redactForProvider(item.evidence.collector),
-      target: redactForProvider(item.evidence.target),
-      capturedAt: item.evidence.capturedAt,
-      contentType: item.evidence.contentType,
-      sha256: item.evidence.sha256,
-      sensitivity: item.evidence.sensitivity,
-      trust: "observed-untrusted",
-      summary: redactForProvider(item.evidence.summary),
-      content: redactForProvider(item.content),
-    })),
+    observations: await Promise.all(
+      evidence.map(async (item) => {
+        const snapshotProjection =
+          await normalizedLinuxSnapshotProjection(item);
+        return {
+          id: item.evidence.id,
+          collector: redactForProvider(item.evidence.collector),
+          target: redactForProvider(item.evidence.target),
+          capturedAt: item.evidence.capturedAt,
+          contentType: item.evidence.contentType,
+          sha256: item.evidence.sha256,
+          sensitivity: item.evidence.sensitivity,
+          trust: "observed-untrusted",
+          summary:
+            snapshotProjection === undefined
+              ? redactForProvider(item.evidence.summary)
+              : "Validated structural Linux snapshot projection",
+          content: snapshotProjection ?? redactForProvider(item.content),
+        };
+      }),
+    ),
   };
 }
 
-function safeDiagnosisInput(
+async function normalizedLinuxSnapshotProjection(
+  item: ObservedEvidence,
+): Promise<string | undefined> {
+  if (item.evidence.collector !== LINUX_NORMALIZED_SNAPSHOT_COLLECTOR)
+    return undefined;
+  if (
+    item.evidence.contentType !== LINUX_NORMALIZED_SNAPSHOT_CONTENT_TYPE ||
+    item.evidence.sha256 !== (await sha256Hex(item.content)) ||
+    item.evidence.blobRef !== `sha256:${item.evidence.sha256}`
+  )
+    throw new ProviderError("invalid_request", "Provider input is invalid");
+  const envelope = parseLinuxNormalizedSnapshotEnvelopeJson(
+    new TextEncoder().encode(item.content),
+  );
+  const expectedSnapshotHash = await sha256Hex(
+    `${LINUX_NORMALIZED_SNAPSHOT_HASH_DOMAIN}${canonicalLinuxSnapshotJson(
+      envelope.snapshot,
+    )}`,
+  );
+  const expectedTarget =
+    envelope.capture.mode === "resident"
+      ? "local-machine"
+      : "selected-installed-target";
+  if (
+    envelope.snapshotSha256 !== expectedSnapshotHash ||
+    item.evidence.target !== expectedTarget ||
+    !envelope.snapshot.topology.supported
+  )
+    throw new ProviderError("invalid_request", "Provider input is invalid");
+  return JSON.stringify({
+    schemaVersion: "1.0",
+    kind: "linux-normalized-snapshot-projection",
+    snapshotSha256: envelope.snapshotSha256,
+    captureMode: envelope.capture.mode,
+    installationConfirmed: envelope.snapshot.installationConfirmed,
+    topology: envelope.snapshot.topology,
+    release: {
+      idPresent: envelope.snapshot.release.id !== null,
+      source: envelope.snapshot.release.source,
+    },
+    boot: envelope.snapshot.boot,
+    configuration: envelope.snapshot.configuration,
+    packageDatabases: envelope.snapshot.packageDatabases,
+  });
+}
+
+async function sha256Hex(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(value),
+  );
+  return Array.from(new Uint8Array(digest), (byte) =>
+    byte.toString(16).padStart(2, "0"),
+  ).join("");
+}
+
+async function safeDiagnosisInput(
   objective: string,
   evidence: readonly ObservedEvidence[],
-): object {
+): Promise<object> {
   try {
-    return diagnosisInput(objective, evidence);
+    return await diagnosisInput(objective, evidence);
   } catch (error) {
     if (error instanceof ProviderError) throw error;
     throw new ProviderError("invalid_request", "Provider input is invalid");

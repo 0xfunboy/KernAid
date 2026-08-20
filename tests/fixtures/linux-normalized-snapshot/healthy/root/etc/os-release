@@ -1,0 +1,4 @@
+ID=kernaid-fixture
+NAME="KernAid Fixture Linux"
+PRETTY_NAME="KernAid deterministic fixture"
+VERSION_ID="1"

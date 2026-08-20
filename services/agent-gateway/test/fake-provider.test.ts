@@ -22,7 +22,7 @@ async function stagedDriver(): Promise<{
     mode: "resident",
   });
   await driver.requestEvidence(session.id, {
-    collector: "linux.systemd.failed",
+    collector: "legacy.systemd.failed",
     target: "local-machine",
     observedContent: "demo.service loaded failed failed Demo",
   });
@@ -237,7 +237,7 @@ test("hashes exactly the secret-redacted evidence retained at the local boundary
     mode: "resident",
   });
   const [evidence] = await driver.requestEvidence(session.id, {
-    collector: "linux.systemd.failed",
+    collector: "legacy.systemd.failed",
     target: "local-machine",
     observedContent: sensitive,
   });
@@ -308,7 +308,7 @@ test("admits the qualified Windows evidence bound without widening other collect
   });
   await assert.rejects(
     driver.requestEvidence(session.id, {
-      collector: "linux.systemd.failed",
+      collector: "legacy.systemd.failed",
       target: "local-machine",
       observedContent: largerThanLegacyBound,
     }),

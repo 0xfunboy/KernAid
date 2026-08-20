@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://schemas.kernaid.dev/v1/rescue-openai-request.json",
   "title": "RescueOpenAiRequest",
-  "$comment": "The raw one-line frame is capped at 98304 bytes. Rust additionally enforces UTF-8 byte limits for objective, summary, and corpus content and parses the nested corpus with duplicate and trailing-value rejection.",
+  "$comment": "The raw one-line frame is capped at 98304 bytes. Rust additionally enforces UTF-8 byte limits, admits linux.normalized-snapshot.v1 only with a valid Rescue capture/hash, admits the legacy collector only for Windows, and parses nested content with duplicate and trailing-value rejection.",
   "oneOf": [
     {
       "type": "object",
@@ -74,7 +74,10 @@
           "maxLength": 128
         },
         "collector": {
-          "const": "rescue.installed-target.filesystem-content.read-only.v1"
+          "enum": [
+            "linux.normalized-snapshot.v1",
+            "rescue.installed-target.filesystem-content.read-only.v1"
+          ]
         },
         "target": { "const": "selected-installed-target" },
         "contentType": { "const": "application/json" },

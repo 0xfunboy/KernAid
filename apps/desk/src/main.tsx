@@ -9,6 +9,7 @@ import type {
 } from "@kernaid/schemas";
 import {
   authorizeObserve,
+  collectLinuxNormalizedSnapshot,
   collectLocalInventory,
   collectMacosP0Inventory,
   collectWindowsP0Inventory,
@@ -26,12 +27,15 @@ import {
   PlatformOfflineRulesProvider,
   fingerprintNativeTarget,
   inspectRescueInstalledTarget,
+  linuxNormalizedSnapshotEvidenceSummary,
+  linuxNormalizedSnapshotFromRescue,
   scanRescueInstalledTargets,
   secureAuditReady,
   selectRescueInstalledTarget,
   rescueOfflineCorpusJson,
   rescueOfflineEvidenceSummary,
   logoutResidentOpenAi,
+  LINUX_NORMALIZED_SNAPSHOT_COLLECTOR,
   RESCUE_OFFLINE_EVIDENCE_COLLECTOR,
   RESCUE_OFFLINE_EVIDENCE_TARGET,
   type NativeObservation,
@@ -333,13 +337,15 @@ function App() {
       return;
     }
     if (!objective.trim() || busy || !driver) return;
-    const activeDriver = driver;
+    let activeDriver = driver;
     setBusy(true);
     invalidateSession();
     try {
       setWorkflow("Observe");
       setStatus("Raccolta evidenze in sola lettura…");
       let currentNativeEvidence: NativeObservation[] = [];
+      let currentLinuxSnapshot:
+        Awaited<ReturnType<typeof collectLinuxNormalizedSnapshot>> | undefined;
       if (hasLocalCollector()) {
         try {
           const currentIdentity = await collectLocalInventory();
@@ -409,6 +415,24 @@ function App() {
         throw new Error(
           "L’inventario locale non ha restituito evidenze: diagnosi bloccata.",
         );
+      if (
+        isNative() &&
+        currentNativeEvidence.some(
+          (item) => item.collector === "linux.block.inventory",
+        )
+      ) {
+        currentLinuxSnapshot = await collectLinuxNormalizedSnapshot();
+      }
+      if (currentLinuxSnapshot !== undefined) {
+        activeDriver = createDriver(
+          runtimeStatus !== undefined && secureAuditReady(runtimeStatus)
+            ? new NativeAuditSink()
+            : undefined,
+          undefined,
+          providerMode,
+          "linux-p0-v1",
+        );
+      }
       if (hasLocalCollector()) {
         setNativeEvidence(currentNativeEvidence);
         setInventoryError(undefined);
@@ -445,6 +469,17 @@ function App() {
               summary: nativeObservationSummary(item),
               observedContent: item.output,
               contentType: nativeObservationContentType(item),
+            })),
+          );
+        if (currentLinuxSnapshot !== undefined)
+          observed.push(
+            ...(await activeDriver.requestEvidence(session.id, {
+              collector: LINUX_NORMALIZED_SNAPSHOT_COLLECTOR,
+              target: "local-machine",
+              summary:
+                linuxNormalizedSnapshotEvidenceSummary(currentLinuxSnapshot),
+              observedContent: JSON.stringify(currentLinuxSnapshot),
+              contentType: "application/json",
             })),
           );
       } else if (!hasLocalCollector()) {
@@ -652,6 +687,7 @@ function App() {
         undefined,
         binding,
         providerPreparation.mode,
+        inspection.os.family === "linux" ? "linux-p0-v1" : "legacy-non-linux",
       );
       const session = await preparedDriver.startSession({
         mode: "rescue",
@@ -664,11 +700,24 @@ function App() {
         throw new Error(
           "Il provider Rescue è cambiato durante la preparazione della sessione.",
         );
+      const linuxSnapshot =
+        inspection.os.family === "linux"
+          ? await linuxNormalizedSnapshotFromRescue(inspection)
+          : undefined;
       const observed = await preparedDriver.requestEvidence(session.id, {
-        collector: RESCUE_OFFLINE_EVIDENCE_COLLECTOR,
+        collector:
+          linuxSnapshot === undefined
+            ? RESCUE_OFFLINE_EVIDENCE_COLLECTOR
+            : LINUX_NORMALIZED_SNAPSHOT_COLLECTOR,
         target: RESCUE_OFFLINE_EVIDENCE_TARGET,
-        summary: rescueOfflineEvidenceSummary(inspection),
-        observedContent: rescueOfflineCorpusJson(inspection),
+        summary:
+          linuxSnapshot === undefined
+            ? rescueOfflineEvidenceSummary(inspection)
+            : linuxNormalizedSnapshotEvidenceSummary(linuxSnapshot),
+        observedContent:
+          linuxSnapshot === undefined
+            ? rescueOfflineCorpusJson(inspection)
+            : JSON.stringify(linuxSnapshot),
         contentType: "application/json",
       });
       if (
@@ -1329,6 +1378,7 @@ function createDriver(
   auditSink?: AuditSink,
   rescueTarget?: RescueTargetBinding,
   providerMode: ProviderMode = "offline",
+  evidenceProfile: "legacy-non-linux" | "linux-p0-v1" = "legacy-non-linux",
 ): LocalSessionDriver {
   return new LocalSessionDriver(
     providerMode === "openai"
@@ -1344,6 +1394,7 @@ function createDriver(
         }
       : undefined,
     auditSink,
+    evidenceProfile,
   );
 }
 

@@ -31,7 +31,7 @@ test("volatile audit records every transition in order and seals an explicit uns
   assert.deepEqual(session.auditStatus, UNAVAILABLE_AUDIT_STATUS);
 
   await driver.requestEvidence(session.id, {
-    collector: "linux.systemd.failed",
+    collector: "legacy.systemd.failed",
     target: "local-machine",
     summary: `OPENAI_API_KEY=${promptSecret}`,
     observedContent: `demo.service loaded failed failed Demo\nBearer ${bearerSecret}`,

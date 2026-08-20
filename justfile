@@ -22,9 +22,13 @@ test:
     pnpm test
     python3 -m unittest discover -s tests/rescue -p 'test_*.py'
     just test-observe
+    just test-snapshot-parity
 
 test-observe:
     ./tests/integration/observe-zero-writes.sh
+
+test-snapshot-parity:
+    bash ./tests/integration/linux-snapshot-parity.sh
 
 test-provider-contracts:
     pnpm --filter @kernaid/agent-gateway test

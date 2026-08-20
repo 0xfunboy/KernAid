@@ -65,14 +65,108 @@ export interface SessionReport {
   verification: "not-run" | "passed" | "failed";
   unresolvedRisks: string[];
 }
+
+export interface LinuxResidentSnapshotCapture {
+  mode: "resident";
+  targetScope: "running-root";
+  accessPolicy: "fixed-descriptor-read-only";
+  callerSuppliedPath: false;
+  mutationRequested: false;
+  crossDeviceTraversalAllowed: false;
+}
+
+export interface LinuxRescueSnapshotCapture {
+  mode: "rescue";
+  targetScope: "selected-installed-target";
+  accessPolicy: "temporary-read-only-no-replay";
+  deviceOpenedReadOnly: true;
+  journalReplayPrevented: true;
+  privateMountNamespace: true;
+  mountCleanupVerified: true;
+  mutationPerformed: false;
+  crossDeviceTraversalAllowed: false;
+}
+
+export type LinuxSnapshotCapture =
+  LinuxResidentSnapshotCapture | LinuxRescueSnapshotCapture;
+
+export interface LinuxReleaseSnapshot {
+  id: string | null;
+  name: string | null;
+  prettyName: string | null;
+  versionId: string | null;
+  source: "etc-os-release" | "usr-lib-os-release" | "absent";
+}
+
+export interface LinuxBootSnapshot {
+  directoryPresent: boolean;
+  kernelArtifactCount: number;
+  initramfsArtifactCount: number;
+  bootloaderDirectoryCount: number;
+  symlinkArtifactCount: number;
+}
+
+export interface LinuxFilesystemTopologySnapshot {
+  collectionScope: "root-filesystem-only";
+  separateEtcMountPresent: boolean;
+  separateBootMountPresent: boolean;
+  separateUsrMountPresent: boolean;
+  separateVarMountPresent: boolean;
+  relevantSeparateMountPresent: boolean;
+  supported: boolean;
+}
+
+export interface LinuxFstabSnapshot {
+  present: boolean;
+  entryCount: number;
+  rootEntryPresent: boolean;
+  efiEntryPresent: boolean;
+  swapEntryCount: number;
+  networkEntryCount: number;
+  malformedLineCount: number;
+}
+
+export interface LinuxNormalizedSnapshot {
+  family: "linux";
+  scope: "installed-root-static";
+  installationConfirmed: boolean;
+  topology: LinuxFilesystemTopologySnapshot;
+  release: LinuxReleaseSnapshot;
+  boot: LinuxBootSnapshot;
+  configuration: {
+    fstab: LinuxFstabSnapshot;
+    machineIdPresent: boolean;
+  };
+  packageDatabases: {
+    dpkgStatusPresent: boolean;
+    rpmDatabasePresent: boolean;
+    pacmanDatabasePresent: boolean;
+  };
+}
+
+export interface LinuxNormalizedSnapshotEnvelope {
+  schemaVersion: "1.0";
+  kind: "linux-normalized-snapshot";
+  snapshotSha256: string;
+  capture: LinuxSnapshotCapture;
+  snapshot: LinuxNormalizedSnapshot;
+}
 export {
+  LINUX_NORMALIZED_SNAPSHOT_COLLECTOR,
+  LINUX_NORMALIZED_SNAPSHOT_CONTENT_TYPE,
+  LINUX_NORMALIZED_SNAPSHOT_HASH_DOMAIN,
+  MAX_LINUX_NORMALIZED_SNAPSHOT_BYTES,
   MAX_SESSION_REPORT_BYTES,
   SchemaValidationError,
+  canonicalLinuxSnapshotJson,
   decodeSessionReportJson,
   parseApproval,
   parseDiagnosisProposal,
   parseEvidence,
   parseExecutionEvent,
+  parseLinuxNormalizedSnapshot,
+  parseLinuxNormalizedSnapshotEnvelope,
+  parseLinuxNormalizedSnapshotEnvelopeJson,
   parseSessionReport,
   parseSessionReportJson,
   parseValidatedPlan,

@@ -7,8 +7,18 @@ import {
   type ProviderRequestOptions,
 } from "@kernaid/agent-gateway";
 import {
+  LINUX_NORMALIZED_SNAPSHOT_COLLECTOR,
+  LINUX_NORMALIZED_SNAPSHOT_CONTENT_TYPE,
+  LINUX_NORMALIZED_SNAPSHOT_HASH_DOMAIN,
+  MAX_LINUX_NORMALIZED_SNAPSHOT_BYTES,
+  canonicalLinuxSnapshotJson,
   parseDiagnosisProposal,
+  parseLinuxNormalizedSnapshot,
+  parseLinuxNormalizedSnapshotEnvelope,
+  parseLinuxNormalizedSnapshotEnvelopeJson,
   type DiagnosisProposal,
+  type LinuxNormalizedSnapshot,
+  type LinuxNormalizedSnapshotEnvelope,
 } from "@kernaid/schemas";
 import {
   SECURE_AUDIT_STATUS,
@@ -30,6 +40,7 @@ const RESCUE_INSPECTION_API_VERSION =
   "kernaid.dev/rescue-offline-inspection/v1alpha1";
 export const RESCUE_OFFLINE_EVIDENCE_COLLECTOR =
   "rescue.installed-target.filesystem-content.read-only.v1";
+export { LINUX_NORMALIZED_SNAPSHOT_COLLECTOR };
 export const RESCUE_OFFLINE_EVIDENCE_TARGET = "selected-installed-target";
 const MAX_INVENTORY_RESPONSE_BYTES = 2 * 1024 * 1024;
 const MAX_RESCUE_TARGET_RESPONSE_BYTES = 64 * 1024;
@@ -41,7 +52,7 @@ const DISK_REF = /^disk-[1-9][0-9]{0,2}$/u;
 const VOLUME_REF = /^disk-[1-9][0-9]{0,2}\/volume-[1-9][0-9]{0,2}$/u;
 const PUBLIC_TOKEN = /^[a-z0-9][a-z0-9-]{0,63}$/u;
 const FILESYSTEM_TOKEN = /^[a-z0-9][a-z0-9_-]{0,63}$/u;
-const LINUX_P0_COLLECTORS = [
+export const LINUX_P0_COLLECTORS = [
   "linux.block.inventory",
   "linux.mounts.read-only",
   "linux.systemd.failed",
@@ -51,6 +62,11 @@ const LINUX_P0_COLLECTORS = [
   "linux.network.links",
   "linux.network.routes",
   "linux.dpkg.audit",
+] as const;
+const LINUX_RESIDENT_CORPUS_COLLECTORS = [
+  "system.hostname",
+  LINUX_NORMALIZED_SNAPSHOT_COLLECTOR,
+  ...LINUX_P0_COLLECTORS,
 ] as const;
 const WINDOWS_P0_COLLECTORS = [
   "windows.event-log.window",
@@ -116,6 +132,7 @@ const RESCUE_INSPECTION_ERROR_CODES = new Set([
   "target-resolution-invalid",
   "target-revalidation-failed",
   "unsafe-target-content",
+  "unsupported-cross-device-content",
   "unsupported-apple-filesystem",
   "unsupported-complex-storage",
   "unsupported-encrypted-storage",
@@ -230,41 +247,7 @@ export interface RescueOfflineInspectionClaims {
   repairAttempted: false;
 }
 
-export interface RescueLinuxOfflineCorpus {
-  family: "linux";
-  installationConfirmed: boolean;
-  release: {
-    id: string | null;
-    name: string | null;
-    prettyName: string | null;
-    versionId: string | null;
-    source: "etc-os-release" | "usr-lib-os-release" | "absent";
-  };
-  boot: {
-    directoryPresent: boolean;
-    kernelArtifactCount: number;
-    initramfsArtifactCount: number;
-    bootloaderDirectoryCount: number;
-    symlinkArtifactCount: number;
-  };
-  configuration: {
-    fstab: {
-      present: boolean;
-      entryCount: number;
-      rootEntryPresent: boolean;
-      efiEntryPresent: boolean;
-      swapEntryCount: number;
-      networkEntryCount: number;
-      malformedLineCount: number;
-    };
-    machineIdPresent: boolean;
-  };
-  packageDatabases: {
-    dpkgStatusPresent: boolean;
-    rpmDatabasePresent: boolean;
-    pacmanDatabasePresent: boolean;
-  };
-}
+export type RescueLinuxOfflineCorpus = LinuxNormalizedSnapshot;
 
 export interface RescueWindowsOfflineCorpus {
   family: "windows";
@@ -363,6 +346,7 @@ export type RescueOfflineInspectionErrorCode =
   | "target-resolution-invalid"
   | "target-revalidation-failed"
   | "unsafe-target-content"
+  | "unsupported-cross-device-content"
   | "unsupported-apple-filesystem"
   | "unsupported-complex-storage"
   | "unsupported-encrypted-storage"
@@ -454,6 +438,15 @@ export async function collectLocalInventory(): Promise<NativeObservation[]> {
     throw new Error("collector HTTP 429");
   }
   return [];
+}
+
+export async function collectLinuxNormalizedSnapshot(): Promise<LinuxNormalizedSnapshotEnvelope> {
+  if (!isNative())
+    throw new Error("Lo snapshot Linux Resident richiede KernAid Desk nativo.");
+  return verifyLinuxNormalizedSnapshotEnvelope(
+    await invoke("collect_linux_normalized_snapshot"),
+    "resident",
+  );
 }
 
 export async function collectWindowsP0Inventory(): Promise<
@@ -724,6 +717,10 @@ export function rescueOfflineCorpusJson(
   inspection: RescueOfflineInspection,
 ): string {
   const corpus = rescueOfflineProjectionCorpus(inspection);
+  if (corpus.family !== "windows")
+    throw new Error(
+      "Il corpus Linux richiede lo snapshot normalizzato con attestazione Rescue.",
+    );
   const encoded = JSON.stringify(corpus);
   if (
     new TextEncoder().encode(encoded).byteLength >
@@ -731,6 +728,69 @@ export function rescueOfflineCorpusJson(
   )
     throw new Error("Corpus offline Rescue oltre il limite.");
   return encoded;
+}
+
+export async function linuxNormalizedSnapshotFromRescue(
+  inspection: RescueOfflineInspection,
+): Promise<LinuxNormalizedSnapshotEnvelope> {
+  const snapshot = rescueOfflineProjectionCorpus(inspection);
+  if (snapshot.family !== "linux")
+    throw new Error("Il target Rescue non contiene uno snapshot Linux.");
+  const canonical = canonicalLinuxSnapshotJson(snapshot);
+  const snapshotSha256 = await sha256(
+    `${LINUX_NORMALIZED_SNAPSHOT_HASH_DOMAIN}${canonical}`,
+  );
+  return verifyLinuxNormalizedSnapshotEnvelope(
+    {
+      schemaVersion: "1.0",
+      kind: "linux-normalized-snapshot",
+      snapshotSha256,
+      capture: {
+        mode: "rescue",
+        targetScope: "selected-installed-target",
+        accessPolicy: "temporary-read-only-no-replay",
+        deviceOpenedReadOnly: inspection.inspection.deviceOpenedReadOnly,
+        journalReplayPrevented: inspection.inspection.journalReplayPrevented,
+        privateMountNamespace: inspection.inspection.privateMountNamespace,
+        mountCleanupVerified: inspection.claims.mountCleanupVerified,
+        mutationPerformed: inspection.claims.mutationPerformed,
+        crossDeviceTraversalAllowed: false,
+      },
+      snapshot,
+    },
+    "rescue",
+  );
+}
+
+export function linuxNormalizedSnapshotEvidenceSummary(
+  envelope: LinuxNormalizedSnapshotEnvelope,
+): string {
+  if (!envelope.snapshot.topology.supported)
+    return `Snapshot statico Linux ${envelope.capture.mode} root-only; topologia multi-filesystem non supportata`;
+  return envelope.snapshot.installationConfirmed
+    ? `Snapshot statico Linux ${envelope.capture.mode} acquisito read-only e validato`
+    : `Snapshot statico Linux ${envelope.capture.mode} acquisito read-only; installazione non confermata`;
+}
+
+async function verifyLinuxNormalizedSnapshotEnvelope(
+  value: unknown,
+  expectedMode: "resident" | "rescue",
+): Promise<LinuxNormalizedSnapshotEnvelope> {
+  const envelope = parseLinuxNormalizedSnapshotEnvelope(value);
+  const encoded = JSON.stringify(envelope);
+  if (
+    new TextEncoder().encode(encoded).byteLength >
+      MAX_LINUX_NORMALIZED_SNAPSHOT_BYTES ||
+    envelope.capture.mode !== expectedMode ||
+    envelope.snapshotSha256 !==
+      (await sha256(
+        `${LINUX_NORMALIZED_SNAPSHOT_HASH_DOMAIN}${canonicalLinuxSnapshotJson(
+          envelope.snapshot,
+        )}`,
+      ))
+  )
+    throw new Error("Snapshot Linux normalizzato non valido.");
+  return envelope;
 }
 
 export function rescueOfflineEvidenceSummary(
@@ -1179,6 +1239,7 @@ function validRescueInspectionErrorContract(
     case "invalid-installed-os-metadata":
     case "read-only-mount-failed":
     case "unsafe-target-content":
+    case "unsupported-cross-device-content":
     case "unsupported-apple-filesystem":
     case "unsupported-complex-storage":
     case "unsupported-encrypted-storage":
@@ -1296,105 +1357,7 @@ function parseRescueOfflineInspectionClaims(
 function parseRescueLinuxOfflineCorpus(
   value: unknown,
 ): RescueLinuxOfflineCorpus {
-  const item = exactRecord(value, [
-    "family",
-    "installationConfirmed",
-    "release",
-    "boot",
-    "configuration",
-    "packageDatabases",
-  ]);
-  const release = exactRecord(item.release, [
-    "id",
-    "name",
-    "prettyName",
-    "versionId",
-    "source",
-  ]);
-  const boot = exactRecord(item.boot, [
-    "directoryPresent",
-    "kernelArtifactCount",
-    "initramfsArtifactCount",
-    "bootloaderDirectoryCount",
-    "symlinkArtifactCount",
-  ]);
-  const configuration = exactRecord(item.configuration, [
-    "fstab",
-    "machineIdPresent",
-  ]);
-  const fstab = exactRecord(configuration.fstab, [
-    "present",
-    "entryCount",
-    "rootEntryPresent",
-    "efiEntryPresent",
-    "swapEntryCount",
-    "networkEntryCount",
-    "malformedLineCount",
-  ]);
-  const packageDatabases = exactRecord(item.packageDatabases, [
-    "dpkgStatusPresent",
-    "rpmDatabasePresent",
-    "pacmanDatabasePresent",
-  ]);
-  const releaseValues = [
-    release.id,
-    release.name,
-    release.prettyName,
-    release.versionId,
-  ];
-  if (
-    item.family !== "linux" ||
-    typeof item.installationConfirmed !== "boolean" ||
-    releaseValues.some(
-      (entry) =>
-        entry !== null &&
-        (typeof entry !== "string" || !boundedControlFreeText(entry, 256)),
-    ) ||
-    !(
-      release.source === "etc-os-release" ||
-      release.source === "usr-lib-os-release" ||
-      release.source === "absent"
-    ) ||
-    (release.source === "absent" &&
-      releaseValues.some((entry) => entry !== null)) ||
-    (item.installationConfirmed === true && typeof release.id !== "string") ||
-    typeof boot.directoryPresent !== "boolean" ||
-    !boundedInteger(boot.kernelArtifactCount, 512) ||
-    !boundedInteger(boot.initramfsArtifactCount, 512) ||
-    !boundedInteger(boot.bootloaderDirectoryCount, 3) ||
-    !boundedInteger(boot.symlinkArtifactCount, 512) ||
-    (boot.directoryPresent === false &&
-      (boot.kernelArtifactCount !== 0 ||
-        boot.initramfsArtifactCount !== 0 ||
-        boot.bootloaderDirectoryCount !== 0 ||
-        boot.symlinkArtifactCount !== 0)) ||
-    typeof fstab.present !== "boolean" ||
-    !boundedInteger(fstab.entryCount, 65_536) ||
-    typeof fstab.rootEntryPresent !== "boolean" ||
-    typeof fstab.efiEntryPresent !== "boolean" ||
-    !boundedInteger(fstab.swapEntryCount, Number(fstab.entryCount)) ||
-    !boundedInteger(fstab.networkEntryCount, Number(fstab.entryCount)) ||
-    !boundedInteger(fstab.malformedLineCount, 65_536) ||
-    Number(fstab.entryCount) + Number(fstab.malformedLineCount) > 65_536 ||
-    (fstab.present === false &&
-      (fstab.entryCount !== 0 ||
-        fstab.rootEntryPresent !== false ||
-        fstab.efiEntryPresent !== false ||
-        fstab.swapEntryCount !== 0 ||
-        fstab.networkEntryCount !== 0 ||
-        fstab.malformedLineCount !== 0)) ||
-    typeof configuration.machineIdPresent !== "boolean" ||
-    Object.values(packageDatabases).some((entry) => typeof entry !== "boolean")
-  )
-    throw new Error("Corpus Linux offline non valido.");
-  return structuredClone({
-    family: item.family,
-    installationConfirmed: item.installationConfirmed,
-    release,
-    boot,
-    configuration: { fstab, machineIdPresent: configuration.machineIdPresent },
-    packageDatabases,
-  }) as RescueLinuxOfflineCorpus;
+  return structuredClone(parseLinuxNormalizedSnapshot(value));
 }
 
 function parseRescueWindowsOfflineCorpus(
@@ -1474,15 +1437,6 @@ function parseRescueWindowsOfflineCorpus(
     },
     servicing,
   }) as RescueWindowsOfflineCorpus;
-}
-
-function boundedInteger(value: unknown, maximum: number): value is number {
-  return (
-    typeof value === "number" &&
-    Number.isSafeInteger(value) &&
-    value >= 0 &&
-    value <= maximum
-  );
 }
 
 function boundedControlFreeText(value: string, maximumBytes: number): boolean {
@@ -1733,7 +1687,9 @@ export class PlatformOfflineRulesProvider implements Provider {
   ): Promise<DiagnosisProposal> {
     if (!objective.trim()) throw new Error("objective is required");
     const rescueCorpusEvidence = evidence.filter(
-      (item) => item.evidence.collector === RESCUE_OFFLINE_EVIDENCE_COLLECTOR,
+      (item) =>
+        item.evidence.collector === RESCUE_OFFLINE_EVIDENCE_COLLECTOR ||
+        item.evidence.collector === LINUX_NORMALIZED_SNAPSHOT_COLLECTOR,
     );
     const rescueScopedEvidence = evidence.filter(
       (item) =>
@@ -1742,13 +1698,23 @@ export class PlatformOfflineRulesProvider implements Provider {
         item.evidence.target === "selected-installed-target-candidate" ||
         item.evidence.target === RESCUE_OFFLINE_EVIDENCE_TARGET,
     );
-    if (rescueCorpusEvidence.length > 0 || rescueScopedEvidence.length > 0)
-      return diagnoseRescueOfflineCorpus(evidence, rescueCorpusEvidence);
+    if (
+      rescueScopedEvidence.length > 0 ||
+      rescueCorpusEvidence.some(
+        (item) => item.evidence.collector === RESCUE_OFFLINE_EVIDENCE_COLLECTOR,
+      )
+    )
+      return await diagnoseRescueOfflineCorpus(evidence, rescueCorpusEvidence);
     const linuxEvidence = evidence.filter((item) =>
       LINUX_P0_COLLECTORS.includes(
         item.evidence.collector as (typeof LINUX_P0_COLLECTORS)[number],
       ),
     );
+    const snapshotEvidence = evidence.filter(
+      (item) => item.evidence.collector === LINUX_NORMALIZED_SNAPSHOT_COLLECTOR,
+    );
+    const hasLinuxCorpus =
+      linuxEvidence.length > 0 || snapshotEvidence.length > 0;
     const windowsEvidence = evidence.filter((item) =>
       WINDOWS_P0_COLLECTORS.includes(
         item.evidence.collector as (typeof WINDOWS_P0_COLLECTORS)[number],
@@ -1760,7 +1726,7 @@ export class PlatformOfflineRulesProvider implements Provider {
       ),
     );
 
-    if (windowsEvidence.length > 0) {
+    if (windowsEvidence.length > 0 && !hasLinuxCorpus) {
       const selected = WINDOWS_P0_COLLECTORS.map((collector) =>
         evidence.find((item) => item.evidence.collector === collector),
       );
@@ -1802,7 +1768,7 @@ export class PlatformOfflineRulesProvider implements Provider {
       );
     }
 
-    if (macosEvidence.length > 0) {
+    if (macosEvidence.length > 0 && !hasLinuxCorpus) {
       const selected = MACOS_P0_COLLECTORS.map((collector) =>
         evidence.find((item) => item.evidence.collector === collector),
       );
@@ -1842,39 +1808,138 @@ export class PlatformOfflineRulesProvider implements Provider {
       );
     }
 
-    if (linuxEvidence.length === 0)
-      return this.#fallback.diagnose(objective, evidence);
+    if (!hasLinuxCorpus) return this.#fallback.diagnose(objective, evidence);
+
+    let admittedSnapshot: LinuxNormalizedSnapshotEnvelope | undefined;
+    if (
+      snapshotEvidence.length === 1 &&
+      snapshotEvidence[0]?.evidence.target === "local-machine" &&
+      snapshotEvidence[0].evidence.contentType ===
+        LINUX_NORMALIZED_SNAPSHOT_CONTENT_TYPE
+    ) {
+      try {
+        admittedSnapshot = await verifyLinuxNormalizedSnapshotEnvelope(
+          parseLinuxNormalizedSnapshotEnvelopeJson(
+            new TextEncoder().encode(snapshotEvidence[0].content),
+          ),
+          "resident",
+        );
+      } catch {
+        admittedSnapshot = undefined;
+      }
+    }
+    if (admittedSnapshot === undefined) {
+      return parseDiagnosisProposal({
+        schemaVersion: "1.0",
+        diagnosis:
+          "Diagnosi Linux incompleta e bloccata: manca uno snapshot statico normalizzato e attestato della root Resident.",
+        confidence: 0.1,
+        evidenceIds: Array.from(
+          new Set(
+            [...linuxEvidence, ...snapshotEvidence].map(
+              (item) => item.evidence.id,
+            ),
+          ),
+        ),
+        requestedEvidence: [
+          LINUX_NORMALIZED_SNAPSHOT_COLLECTOR,
+          ...LINUX_P0_COLLECTORS.filter(
+            (collector) =>
+              !linuxEvidence.some(
+                (item) => item.evidence.collector === collector,
+              ),
+          ),
+        ],
+      });
+    }
+
+    if (!admittedSnapshot.snapshot.topology.supported) {
+      return parseDiagnosisProposal({
+        schemaVersion: "1.0",
+        diagnosis:
+          "Diagnosi Linux bloccata: lo snapshot dichiara filesystem separati sotto /etc, /boot (incluso /boot/efi), /efi, /usr o /var, una topologia non supportata dal profilo root-filesystem-only v1.",
+        confidence: 0.1,
+        evidenceIds: Array.from(
+          new Set(
+            [...linuxEvidence, ...snapshotEvidence].map(
+              (item) => item.evidence.id,
+            ),
+          ),
+        ),
+        requestedEvidence: ["linux.topology.single-filesystem.v1"],
+      });
+    }
 
     const selected = LINUX_P0_COLLECTORS.map((collector) =>
       evidence.find((item) => item.evidence.collector === collector),
     );
+    const collectorCounts = new Map<string, number>();
+    for (const item of evidence)
+      collectorCounts.set(
+        item.evidence.collector,
+        (collectorCounts.get(item.evidence.collector) ?? 0) + 1,
+      );
+    const exactCorpus =
+      evidence.length === LINUX_RESIDENT_CORPUS_COLLECTORS.length &&
+      new Set(evidence.map((item) => item.evidence.id)).size ===
+        evidence.length &&
+      evidence.every(
+        (item) =>
+          item.evidence.target === "local-machine" &&
+          LINUX_RESIDENT_CORPUS_COLLECTORS.some(
+            (collector) => collector === item.evidence.collector,
+          ),
+      ) &&
+      LINUX_RESIDENT_CORPUS_COLLECTORS.every(
+        (collector) => (collectorCounts.get(collector) ?? 0) === 1,
+      );
     const complete =
+      exactCorpus &&
       selected.every((item) => item !== undefined) &&
       LINUX_P0_COLLECTORS.every(
         (collector) =>
           evidence.filter((item) => item.evidence.collector === collector)
             .length === 1,
       );
-    const successful = selected.every(
-      (item) => item?.evidence.summary === "Comando di inventario completato",
-    );
+    const successful =
+      selected.every(
+        (item) => item?.evidence.summary === "Comando di inventario completato",
+      ) &&
+      evidence.some(
+        (item) =>
+          item.evidence.collector === "system.hostname" &&
+          item.evidence.summary === "Comando di inventario completato",
+      );
     if (!complete || !successful) {
-      const requestedEvidence = LINUX_P0_COLLECTORS.filter((collector) => {
-        const matches = evidence.filter(
-          (item) => item.evidence.collector === collector,
-        );
-        return (
-          matches.length !== 1 ||
-          matches[0]?.evidence.summary !== "Comando di inventario completato"
-        );
-      });
+      const requestedEvidence: string[] = LINUX_P0_COLLECTORS.filter(
+        (collector) => {
+          const matches = evidence.filter(
+            (item) => item.evidence.collector === collector,
+          );
+          return (
+            matches.length !== 1 ||
+            matches[0]?.evidence.summary !== "Comando di inventario completato"
+          );
+        },
+      );
+      const hostname = evidence.filter(
+        (item) => item.evidence.collector === "system.hostname",
+      );
+      if (
+        hostname.length !== 1 ||
+        hostname[0]?.evidence.summary !== "Comando di inventario completato"
+      )
+        requestedEvidence.unshift("system.hostname");
+      if (!exactCorpus) requestedEvidence.push("linux.p0.corpus.exact.v1");
       return parseDiagnosisProposal({
         schemaVersion: "1.0",
         diagnosis:
           "Diagnosi Linux incompleta: una o più evidenze P0 richieste non sono disponibili o affidabili. Nessuna conclusione sullo stato del sistema viene formulata.",
         confidence: 0.1,
-        evidenceIds: linuxEvidence.map((item) => item.evidence.id),
-        requestedEvidence,
+        evidenceIds: Array.from(
+          new Set(evidence.map((item) => item.evidence.id)),
+        ),
+        requestedEvidence: Array.from(new Set(requestedEvidence)),
       });
     }
 
@@ -1886,14 +1951,24 @@ export class PlatformOfflineRulesProvider implements Provider {
     const response = await invoke("diagnose_linux_p0", {
       evidence: documents,
     });
-    return parseDiagnosisProposal(response);
+    const proposal = parseDiagnosisProposal(response);
+    return parseDiagnosisProposal({
+      ...proposal,
+      evidenceIds: Array.from(
+        new Set([...proposal.evidenceIds, snapshotEvidence[0]!.evidence.id]),
+      ),
+    });
   }
 }
 
-function diagnoseRescueOfflineCorpus(
+async function diagnoseRescueOfflineCorpus(
   evidence: readonly ObservedEvidence[],
   matching: readonly ObservedEvidence[],
-): DiagnosisProposal {
+): Promise<DiagnosisProposal> {
+  const requestedCollector =
+    matching[0]?.evidence.collector === LINUX_NORMALIZED_SNAPSHOT_COLLECTOR
+      ? LINUX_NORMALIZED_SNAPSHOT_COLLECTOR
+      : RESCUE_OFFLINE_EVIDENCE_COLLECTOR;
   const invalid = (): DiagnosisProposal =>
     parseDiagnosisProposal({
       schemaVersion: "1.0",
@@ -1901,7 +1976,7 @@ function diagnoseRescueOfflineCorpus(
         "Il corpus offline Rescue non è valido, è duplicato o contiene evidenze fuori scope. La diagnosi resta bloccata senza formulare conclusioni sul sistema installato.",
       confidence: 0.1,
       evidenceIds: evidence.map((item) => item.evidence.id),
-      requestedEvidence: [RESCUE_OFFLINE_EVIDENCE_COLLECTOR],
+      requestedEvidence: [requestedCollector],
     });
   if (evidence.length !== 1 || matching.length !== 1) return invalid();
   const selected = matching[0]!;
@@ -1915,13 +1990,39 @@ function diagnoseRescueOfflineCorpus(
     return invalid();
   let corpus: RescueOfflineCorpus;
   try {
-    corpus = parseRescueOfflineCorpus(JSON.parse(selected.content) as unknown);
+    const parsed = JSON.parse(selected.content) as unknown;
+    if (selected.evidence.collector === LINUX_NORMALIZED_SNAPSHOT_COLLECTOR) {
+      const envelope = await verifyLinuxNormalizedSnapshotEnvelope(
+        parseLinuxNormalizedSnapshotEnvelopeJson(
+          new TextEncoder().encode(selected.content),
+        ),
+        "rescue",
+      );
+      corpus = envelope.snapshot;
+      if (
+        selected.evidence.summary !==
+        linuxNormalizedSnapshotEvidenceSummary(envelope)
+      )
+        return invalid();
+    } else {
+      corpus = parseRescueOfflineCorpus(parsed);
+      if (corpus.family !== "windows") return invalid();
+      if (selected.evidence.summary !== rescueOfflineCorpusSummary(corpus))
+        return invalid();
+    }
   } catch {
     return invalid();
   }
-  if (selected.evidence.summary !== rescueOfflineCorpusSummary(corpus))
-    return invalid();
   const evidenceIds = [selected.evidence.id];
+  if (corpus.family === "linux" && !corpus.topology.supported)
+    return parseDiagnosisProposal({
+      schemaVersion: "1.0",
+      diagnosis:
+        "Diagnosi Linux Rescue bloccata: il target dichiara filesystem separati sotto /etc, /boot (incluso /boot/efi), /efi, /usr o /var, non supportati dal profilo root-filesystem-only v1.",
+      confidence: 0.1,
+      evidenceIds,
+      requestedEvidence: ["linux.topology.single-filesystem.v1"],
+    });
   if (!corpus.installationConfirmed)
     return parseDiagnosisProposal({
       schemaVersion: "1.0",

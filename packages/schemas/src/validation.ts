@@ -3,6 +3,12 @@ import type {
   DiagnosisProposal,
   Evidence,
   ExecutionEvent,
+  LinuxBootSnapshot,
+  LinuxFstabSnapshot,
+  LinuxNormalizedSnapshot,
+  LinuxNormalizedSnapshotEnvelope,
+  LinuxReleaseSnapshot,
+  LinuxSnapshotCapture,
   PlanStep,
   SessionReport,
   ValidatedPlan,
@@ -21,6 +27,12 @@ const DATE_TIME =
   /^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2}(?:\.\d+)?)([Zz]|([+-])(\d{2}):(\d{2}))$/;
 const MAX_COLLECTION_ITEMS = 128;
 const MAX_TEXT_LENGTH = 64 * 1024;
+export const LINUX_NORMALIZED_SNAPSHOT_COLLECTOR =
+  "linux.normalized-snapshot.v1";
+export const LINUX_NORMALIZED_SNAPSHOT_CONTENT_TYPE = "application/json";
+export const LINUX_NORMALIZED_SNAPSHOT_HASH_DOMAIN =
+  "KERNAID_LINUX_NORMALIZED_SNAPSHOT_V1\0";
+export const MAX_LINUX_NORMALIZED_SNAPSHOT_BYTES = 48 * 1024;
 export const MAX_SESSION_REPORT_BYTES = 1024 * 1024;
 
 export class SchemaValidationError extends Error {
@@ -212,6 +224,411 @@ function deepFreeze<T>(value: T, seen = new WeakSet<object>()): T {
   seen.add(value);
   for (const child of Object.values(value)) deepFreeze(child, seen);
   return Object.freeze(value);
+}
+
+function booleanValue(schema: string, value: unknown): boolean {
+  if (typeof value !== "boolean") return fail(schema, "expected a boolean");
+  return value;
+}
+
+function boundedInteger(
+  schema: string,
+  value: unknown,
+  maximum: number,
+): number {
+  if (
+    typeof value !== "number" ||
+    !Number.isSafeInteger(value) ||
+    value < 0 ||
+    value > maximum
+  ) {
+    return fail(schema, "expected a bounded non-negative integer");
+  }
+  return value;
+}
+
+function nullableLinuxReleaseValue(
+  schema: string,
+  value: unknown,
+): string | null {
+  if (value === null) return null;
+  const text = stringValue(schema, value, false, 256);
+  if (
+    new TextEncoder().encode(text).byteLength > 256 ||
+    [...text].some((character) => {
+      const code = character.codePointAt(0) ?? 0;
+      return code < 32 || (code >= 127 && code <= 159);
+    })
+  ) {
+    return fail(schema, "invalid Linux release value");
+  }
+  return text;
+}
+
+function parseLinuxSnapshotCapture(value: unknown): LinuxSnapshotCapture {
+  const schema = "LinuxNormalizedSnapshot.capture";
+  const capture = record(schema, value);
+  if (capture.mode === "resident") {
+    exactKeys(schema, capture, [
+      "mode",
+      "targetScope",
+      "accessPolicy",
+      "callerSuppliedPath",
+      "mutationRequested",
+      "crossDeviceTraversalAllowed",
+    ]);
+    if (
+      capture.targetScope !== "running-root" ||
+      capture.accessPolicy !== "fixed-descriptor-read-only" ||
+      capture.callerSuppliedPath !== false ||
+      capture.mutationRequested !== false ||
+      capture.crossDeviceTraversalAllowed !== false
+    ) {
+      fail(schema, "invalid Resident capture attestation");
+    }
+    return deepFreeze({
+      mode: "resident",
+      targetScope: "running-root",
+      accessPolicy: "fixed-descriptor-read-only",
+      callerSuppliedPath: false,
+      mutationRequested: false,
+      crossDeviceTraversalAllowed: false,
+    });
+  }
+  if (capture.mode === "rescue") {
+    exactKeys(schema, capture, [
+      "mode",
+      "targetScope",
+      "accessPolicy",
+      "deviceOpenedReadOnly",
+      "journalReplayPrevented",
+      "privateMountNamespace",
+      "mountCleanupVerified",
+      "mutationPerformed",
+      "crossDeviceTraversalAllowed",
+    ]);
+    if (
+      capture.targetScope !== "selected-installed-target" ||
+      capture.accessPolicy !== "temporary-read-only-no-replay" ||
+      capture.deviceOpenedReadOnly !== true ||
+      capture.journalReplayPrevented !== true ||
+      capture.privateMountNamespace !== true ||
+      capture.mountCleanupVerified !== true ||
+      capture.mutationPerformed !== false ||
+      capture.crossDeviceTraversalAllowed !== false
+    ) {
+      fail(schema, "invalid Rescue capture attestation");
+    }
+    return deepFreeze({
+      mode: "rescue",
+      targetScope: "selected-installed-target",
+      accessPolicy: "temporary-read-only-no-replay",
+      deviceOpenedReadOnly: true,
+      journalReplayPrevented: true,
+      privateMountNamespace: true,
+      mountCleanupVerified: true,
+      mutationPerformed: false,
+      crossDeviceTraversalAllowed: false,
+    });
+  }
+  return fail(schema, "unsupported capture mode");
+}
+
+function parseLinuxRelease(value: unknown): LinuxReleaseSnapshot {
+  const schema = "LinuxNormalizedSnapshot.release";
+  const release = record(schema, value);
+  exactKeys(schema, release, [
+    "id",
+    "name",
+    "prettyName",
+    "versionId",
+    "source",
+  ]);
+  const id = nullableLinuxReleaseValue(schema, release.id);
+  const name = nullableLinuxReleaseValue(schema, release.name);
+  const prettyName = nullableLinuxReleaseValue(schema, release.prettyName);
+  const versionId = nullableLinuxReleaseValue(schema, release.versionId);
+  if (
+    release.source !== "etc-os-release" &&
+    release.source !== "usr-lib-os-release" &&
+    release.source !== "absent"
+  ) {
+    fail(schema, "invalid release source");
+  }
+  if (
+    release.source === "absent" &&
+    [id, name, prettyName, versionId].some((item) => item !== null)
+  ) {
+    fail(schema, "absent release source must not contain release values");
+  }
+  return deepFreeze({
+    id,
+    name,
+    prettyName,
+    versionId,
+    source: release.source,
+  });
+}
+
+function parseLinuxBoot(value: unknown): LinuxBootSnapshot {
+  const schema = "LinuxNormalizedSnapshot.boot";
+  const boot = record(schema, value);
+  exactKeys(schema, boot, [
+    "directoryPresent",
+    "kernelArtifactCount",
+    "initramfsArtifactCount",
+    "bootloaderDirectoryCount",
+    "symlinkArtifactCount",
+  ]);
+  const parsed: LinuxBootSnapshot = {
+    directoryPresent: booleanValue(schema, boot.directoryPresent),
+    kernelArtifactCount: boundedInteger(schema, boot.kernelArtifactCount, 512),
+    initramfsArtifactCount: boundedInteger(
+      schema,
+      boot.initramfsArtifactCount,
+      512,
+    ),
+    bootloaderDirectoryCount: boundedInteger(
+      schema,
+      boot.bootloaderDirectoryCount,
+      3,
+    ),
+    symlinkArtifactCount: boundedInteger(
+      schema,
+      boot.symlinkArtifactCount,
+      512,
+    ),
+  };
+  if (
+    !parsed.directoryPresent &&
+    (parsed.kernelArtifactCount !== 0 ||
+      parsed.initramfsArtifactCount !== 0 ||
+      parsed.bootloaderDirectoryCount !== 0 ||
+      parsed.symlinkArtifactCount !== 0)
+  ) {
+    fail(schema, "absent boot directory must have zero counts");
+  }
+  return deepFreeze(parsed);
+}
+
+function parseLinuxFilesystemTopology(value: unknown) {
+  const schema = "LinuxNormalizedSnapshot.topology";
+  const topology = record(schema, value);
+  exactKeys(schema, topology, [
+    "collectionScope",
+    "separateEtcMountPresent",
+    "separateBootMountPresent",
+    "separateUsrMountPresent",
+    "separateVarMountPresent",
+    "relevantSeparateMountPresent",
+    "supported",
+  ]);
+  if (topology.collectionScope !== "root-filesystem-only")
+    fail(schema, "invalid collection scope");
+  const separateBootMountPresent = booleanValue(
+    schema,
+    topology.separateBootMountPresent,
+  );
+  const separateEtcMountPresent = booleanValue(
+    schema,
+    topology.separateEtcMountPresent,
+  );
+  const separateUsrMountPresent = booleanValue(
+    schema,
+    topology.separateUsrMountPresent,
+  );
+  const separateVarMountPresent = booleanValue(
+    schema,
+    topology.separateVarMountPresent,
+  );
+  const supported = booleanValue(schema, topology.supported);
+  const relevantSeparateMountPresent = booleanValue(
+    schema,
+    topology.relevantSeparateMountPresent,
+  );
+  if (
+    relevantSeparateMountPresent !==
+      (separateEtcMountPresent ||
+        separateBootMountPresent ||
+        separateUsrMountPresent ||
+        separateVarMountPresent) ||
+    supported !== !relevantSeparateMountPresent
+  )
+    fail(schema, "inconsistent filesystem topology support");
+  return deepFreeze({
+    collectionScope: "root-filesystem-only" as const,
+    separateEtcMountPresent,
+    separateBootMountPresent,
+    separateUsrMountPresent,
+    separateVarMountPresent,
+    relevantSeparateMountPresent,
+    supported,
+  });
+}
+
+function parseLinuxFstab(value: unknown): LinuxFstabSnapshot {
+  const schema = "LinuxNormalizedSnapshot.configuration.fstab";
+  const fstab = record(schema, value);
+  exactKeys(schema, fstab, [
+    "present",
+    "entryCount",
+    "rootEntryPresent",
+    "efiEntryPresent",
+    "swapEntryCount",
+    "networkEntryCount",
+    "malformedLineCount",
+  ]);
+  const parsed: LinuxFstabSnapshot = {
+    present: booleanValue(schema, fstab.present),
+    entryCount: boundedInteger(schema, fstab.entryCount, 65_536),
+    rootEntryPresent: booleanValue(schema, fstab.rootEntryPresent),
+    efiEntryPresent: booleanValue(schema, fstab.efiEntryPresent),
+    swapEntryCount: boundedInteger(schema, fstab.swapEntryCount, 65_536),
+    networkEntryCount: boundedInteger(schema, fstab.networkEntryCount, 65_536),
+    malformedLineCount: boundedInteger(
+      schema,
+      fstab.malformedLineCount,
+      65_536,
+    ),
+  };
+  if (
+    parsed.swapEntryCount > parsed.entryCount ||
+    parsed.networkEntryCount > parsed.entryCount ||
+    parsed.entryCount + parsed.malformedLineCount > 65_536 ||
+    (!parsed.present &&
+      (parsed.entryCount !== 0 ||
+        parsed.rootEntryPresent ||
+        parsed.efiEntryPresent ||
+        parsed.swapEntryCount !== 0 ||
+        parsed.networkEntryCount !== 0 ||
+        parsed.malformedLineCount !== 0))
+  ) {
+    fail(schema, "inconsistent fstab summary");
+  }
+  return deepFreeze(parsed);
+}
+
+export function parseLinuxNormalizedSnapshot(
+  value: unknown,
+): LinuxNormalizedSnapshot {
+  const schema = "LinuxNormalizedSnapshot";
+  const snapshot = record(schema, value);
+  exactKeys(schema, snapshot, [
+    "family",
+    "scope",
+    "installationConfirmed",
+    "topology",
+    "release",
+    "boot",
+    "configuration",
+    "packageDatabases",
+  ]);
+  if (snapshot.family !== "linux" || snapshot.scope !== "installed-root-static")
+    fail(schema, "invalid family or scope");
+  const installationConfirmed = booleanValue(
+    schema,
+    snapshot.installationConfirmed,
+  );
+  const release = parseLinuxRelease(snapshot.release);
+  if (installationConfirmed && release.id === null)
+    fail(schema, "confirmed installation requires a release id");
+  const configuration = record(schema, snapshot.configuration);
+  exactKeys(schema, configuration, ["fstab", "machineIdPresent"]);
+  const packageDatabases = record(schema, snapshot.packageDatabases);
+  exactKeys(schema, packageDatabases, [
+    "dpkgStatusPresent",
+    "rpmDatabasePresent",
+    "pacmanDatabasePresent",
+  ]);
+  return deepFreeze({
+    family: "linux",
+    scope: "installed-root-static",
+    installationConfirmed,
+    topology: parseLinuxFilesystemTopology(snapshot.topology),
+    release,
+    boot: parseLinuxBoot(snapshot.boot),
+    configuration: {
+      fstab: parseLinuxFstab(configuration.fstab),
+      machineIdPresent: booleanValue(schema, configuration.machineIdPresent),
+    },
+    packageDatabases: {
+      dpkgStatusPresent: booleanValue(
+        schema,
+        packageDatabases.dpkgStatusPresent,
+      ),
+      rpmDatabasePresent: booleanValue(
+        schema,
+        packageDatabases.rpmDatabasePresent,
+      ),
+      pacmanDatabasePresent: booleanValue(
+        schema,
+        packageDatabases.pacmanDatabasePresent,
+      ),
+    },
+  });
+}
+
+export function parseLinuxNormalizedSnapshotEnvelope(
+  value: unknown,
+): LinuxNormalizedSnapshotEnvelope {
+  const schema = "LinuxNormalizedSnapshotEnvelope";
+  const envelope = record(schema, value);
+  exactKeys(schema, envelope, [
+    "schemaVersion",
+    "kind",
+    "snapshotSha256",
+    "capture",
+    "snapshot",
+  ]);
+  if (
+    envelope.schemaVersion !== "1.0" ||
+    envelope.kind !== "linux-normalized-snapshot"
+  ) {
+    fail(schema, "unsupported version or kind");
+  }
+  const snapshotSha256 = stringValue(schema, envelope.snapshotSha256);
+  if (!HASH.test(snapshotSha256)) fail(schema, "invalid snapshot hash");
+  return deepFreeze({
+    schemaVersion: "1.0",
+    kind: "linux-normalized-snapshot",
+    snapshotSha256,
+    capture: parseLinuxSnapshotCapture(envelope.capture),
+    snapshot: parseLinuxNormalizedSnapshot(envelope.snapshot),
+  });
+}
+
+export function parseLinuxNormalizedSnapshotEnvelopeJson(
+  input: Uint8Array,
+): LinuxNormalizedSnapshotEnvelope {
+  const schema = "LinuxNormalizedSnapshotEnvelope";
+  if (
+    !(input instanceof Uint8Array) ||
+    input.byteLength === 0 ||
+    input.byteLength > MAX_LINUX_NORMALIZED_SNAPSHOT_BYTES
+  )
+    return fail(schema, "envelope JSON exceeds the byte limit");
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(
+      input,
+    );
+  } catch {
+    return fail(schema, "invalid UTF-8 JSON document");
+  }
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(text) as unknown;
+  } catch {
+    return fail(schema, "invalid JSON document");
+  }
+  const envelope = parseLinuxNormalizedSnapshotEnvelope(decoded);
+  if (JSON.stringify(envelope) !== text)
+    fail(schema, "envelope JSON is not canonical");
+  return envelope;
+}
+
+export function canonicalLinuxSnapshotJson(value: unknown): string {
+  return JSON.stringify(parseLinuxNormalizedSnapshot(value));
 }
 
 export function parseEvidence(value: unknown): Evidence {

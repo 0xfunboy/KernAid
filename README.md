@@ -34,6 +34,11 @@ CI produces engineering-preview desktop installers for Windows, Linux, Intel mac
   read-only. For a Windows partition on GPT it also inspects exactly one
   unmounted direct-sibling FAT EFI System Partition, when uniquely qualified,
   and returns only fixed boot-marker booleans. No repair or unlock is attempted.
+  Linux P0 snapshot parity between Resident and Rescue v1 is limited to content
+  on the root filesystem. If the installation's `fstab` declares a separate
+  mount at or below `/etc` (including `/etc/machine-id`), `/boot` (including
+  `/boot/efi`), `/efi`, `/usr`, or `/var`, KernAid marks the corpus unsupported
+  and blocks diagnosis; multi-mount parity is not claimed.
 - **Windows, Linux or macOS that does boot:** download that operating system's desktop artifact, install it, and launch KernAid like a normal application. Windows and macOS startup collect only a fast, derived target identity; the deeper P0 collection starts once when **Diagnostica** is selected. macOS queries only the current-user `launchd` table and safe-boot integer, and explicitly reports system `launchd`, software-update availability, system-event analysis, and login/background-item counts as unqualified instead of inventing results. The fixed commands do not request repairs, although native Windows tools such as DISM may still update their own operating-system logs.
 - **Optional Resident OpenAI reasoning:** configure the public
   `resident-default` profile from the hidden native TTY prompts of

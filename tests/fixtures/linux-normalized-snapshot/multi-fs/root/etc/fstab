@@ -1,0 +1,5 @@
+UUID=root / ext4 defaults 0 1
+UUID=etc /etc ext4 defaults 0 2
+UUID=boot /boot ext4 defaults 0 2
+UUID=usr /usr ext4 defaults 0 2
+UUID=var /var ext4 defaults 0 2

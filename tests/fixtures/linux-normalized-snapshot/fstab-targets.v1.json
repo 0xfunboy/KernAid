@@ -1,0 +1,65 @@
+{
+  "schemaVersion": "1.0",
+  "cases": [
+    {
+      "name": "root",
+      "target": "/",
+      "accepted": true
+    },
+    {
+      "name": "canonical-absolute",
+      "target": "/mnt/data",
+      "accepted": true
+    },
+    {
+      "name": "swap-none",
+      "target": "none",
+      "accepted": true
+    },
+    {
+      "name": "empty",
+      "target": "",
+      "accepted": false
+    },
+    {
+      "name": "dot",
+      "target": ".",
+      "accepted": false
+    },
+    {
+      "name": "dot-dot",
+      "target": "..",
+      "accepted": false
+    },
+    {
+      "name": "relative",
+      "target": "foo/bar",
+      "accepted": false
+    },
+    {
+      "name": "relative-double-slash",
+      "target": "foo//bar",
+      "accepted": false
+    },
+    {
+      "name": "absolute-dot-dot",
+      "target": "/boot/../usr",
+      "accepted": false
+    },
+    {
+      "name": "absolute-dot",
+      "target": "/./usr",
+      "accepted": false
+    },
+    {
+      "name": "absolute-double-slash",
+      "target": "//usr",
+      "accepted": false
+    },
+    {
+      "name": "absolute-trailing-slash",
+      "target": "/usr/",
+      "accepted": false
+    }
+  ]
+}

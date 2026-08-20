@@ -19,10 +19,15 @@ import {
   parseAuditSinkStatus,
 } from "@kernaid/session-driver";
 import {
+  LINUX_NORMALIZED_SNAPSHOT_COLLECTOR,
+  LINUX_NORMALIZED_SNAPSHOT_CONTENT_TYPE,
+  LINUX_NORMALIZED_SNAPSHOT_HASH_DOMAIN,
+  canonicalLinuxSnapshotJson,
   parseApproval,
   parseDiagnosisProposal,
   parseEvidence,
   parseExecutionEvent,
+  parseLinuxNormalizedSnapshotEnvelopeJson,
   parseSessionReport,
   parseValidatedPlan,
   type Approval,
@@ -48,6 +53,25 @@ const MAX_PROMPT_LENGTH = 8 * 1024;
 const MAX_PROPOSALS_PER_SESSION = 128;
 const MAX_APPROVALS_PER_SESSION = 128;
 const MAX_EVENTS_PER_SESSION = 1_024;
+const LINUX_P0_COLLECTORS = [
+  "linux.block.inventory",
+  "linux.mounts.read-only",
+  "linux.systemd.failed",
+  "linux.systemd.state",
+  "linux.fstab",
+  "linux.df",
+  "linux.network.links",
+  "linux.network.routes",
+  "linux.dpkg.audit",
+] as const;
+const LINUX_RESIDENT_CORPUS_COLLECTORS = [
+  "system.hostname",
+  LINUX_NORMALIZED_SNAPSHOT_COLLECTOR,
+  ...LINUX_P0_COLLECTORS,
+] as const;
+const LINUX_RESCUE_CORPUS_COLLECTORS = [
+  LINUX_NORMALIZED_SNAPSHOT_COLLECTOR,
+] as const;
 
 const QUALIFIED_LARGE_WINDOWS_COLLECTORS = new Set([
   "windows.event-log.window",
@@ -96,6 +120,7 @@ const fixtureExecutor: ActionExecutor = {
 
 interface SessionRecord {
   input: StartSession;
+  evidenceProfile: "legacy-non-linux" | "linux-p0-v1";
   state: DriverState;
   auditStatus: AuditSinkStatus;
   auditSequence: number;
@@ -105,6 +130,14 @@ interface SessionRecord {
   proposals: DiagnosisProposal[];
   decisions: Approval[];
   events: ExecutionEvent[];
+  linuxSnapshot?: LinuxSnapshotAdmission;
+}
+
+interface LinuxSnapshotAdmission {
+  evidenceId: string;
+  snapshotSha256: string;
+  captureMode: "resident" | "rescue";
+  targetFingerprint: string;
 }
 
 interface PlanRecord {
@@ -123,6 +156,8 @@ export class LocalSessionDriver implements SessionDriver {
     private readonly provider: Provider = new OfflineRulesProvider(),
     private readonly executor: ActionExecutor = fixtureExecutor,
     private readonly auditSink: AuditSink = new InMemoryAuditSink(),
+    private readonly evidenceProfile:
+      "legacy-non-linux" | "linux-p0-v1" = "legacy-non-linux",
   ) {}
 
   async startSession(input: StartSession): Promise<SessionInfo> {
@@ -132,9 +167,12 @@ export class LocalSessionDriver implements SessionDriver {
       throw new Error("invalid target fingerprint");
     if (input.mode !== "resident" && input.mode !== "rescue")
       throw new Error("invalid session mode");
+    if ("evidenceProfile" in input)
+      throw new Error("the evidence profile is trusted driver context");
     const id = `S-${crypto.randomUUID()}`;
     const session: SessionRecord = {
       input: Object.freeze(structuredClone(input)),
+      evidenceProfile: this.evidenceProfile,
       state: "observe",
       auditStatus: this.sinkStatus(),
       auditSequence: 0,
@@ -178,6 +216,7 @@ export class LocalSessionDriver implements SessionDriver {
           throw new Error("objective is required and must be bounded");
         if (session.evidence.length === 0)
           throw new Error("evidence is required");
+        this.assertLinuxSnapshotAdmission(session);
         if (session.proposals.length >= MAX_PROPOSALS_PER_SESSION)
           throw new Error("diagnosis limit reached");
         resolveStatus({
@@ -240,11 +279,19 @@ export class LocalSessionDriver implements SessionDriver {
         throw new Error("evidence limit reached");
       if (!request.collector.trim() || !request.target.trim())
         throw new Error("collector and target are required");
+      if (
+        session.evidenceProfile === "legacy-non-linux" &&
+        request.collector.startsWith("linux.")
+      )
+        throw new Error("Linux evidence requires trusted Linux P0 context");
       const observedContent = request.observedContent ?? "fixture inventory";
       const bytes = new TextEncoder().encode(observedContent);
       if (bytes.byteLength > evidenceByteLimit(request.collector))
         throw new Error("evidence content exceeds the safe limit");
-      const providerContent = redactSecretsForLocalEvidence(observedContent);
+      const providerContent =
+        request.collector === LINUX_NORMALIZED_SNAPSHOT_COLLECTOR
+          ? observedContent
+          : redactSecretsForLocalEvidence(observedContent);
       const hash = await sha256(providerContent);
       const item = parseEvidence({
         schemaVersion: "1.0",
@@ -261,6 +308,11 @@ export class LocalSessionDriver implements SessionDriver {
         ),
         blobRef: `sha256:${hash}`,
       });
+      const linuxSnapshot = await validateLinuxSnapshotAdmission(
+        session,
+        item,
+        providerContent,
+      );
       await this.appendAudit(
         session,
         sessionId,
@@ -274,6 +326,7 @@ export class LocalSessionDriver implements SessionDriver {
       );
       session.evidence.push(item);
       this.content.set(item.id, providerContent);
+      if (linuxSnapshot !== undefined) session.linuxSnapshot = linuxSnapshot;
       return [structuredClone(item)];
     });
   }
@@ -653,6 +706,65 @@ export class LocalSessionDriver implements SessionDriver {
       throw new Error("proposal references evidence outside this session");
   }
 
+  private assertLinuxSnapshotAdmission(session: SessionRecord): void {
+    const collectorCounts = new Map<string, number>();
+    for (const evidence of session.evidence)
+      collectorCounts.set(
+        evidence.collector,
+        (collectorCounts.get(evidence.collector) ?? 0) + 1,
+      );
+    const snapshotCount =
+      collectorCounts.get(LINUX_NORMALIZED_SNAPSHOT_COLLECTOR) ?? 0;
+    if (snapshotCount > 0 !== (session.linuxSnapshot !== undefined))
+      throw new Error("normalized Linux snapshot admission is inconsistent");
+    if (session.evidenceProfile !== "linux-p0-v1") {
+      if (snapshotCount > 0)
+        throw new Error(
+          "normalized Linux snapshot requires the Linux P0 profile",
+        );
+      return;
+    }
+    const expectedCollectors =
+      session.input.mode === "resident"
+        ? LINUX_RESIDENT_CORPUS_COLLECTORS
+        : LINUX_RESCUE_CORPUS_COLLECTORS;
+    const expectedTarget =
+      session.input.mode === "resident"
+        ? "local-machine"
+        : "selected-installed-target";
+    const evidenceIds = new Set(
+      session.evidence.map((evidence) => evidence.id),
+    );
+    const exactCorpus =
+      session.evidence.length === expectedCollectors.length &&
+      evidenceIds.size === session.evidence.length &&
+      session.evidence.every(
+        (evidence) =>
+          evidence.target === expectedTarget &&
+          expectedCollectors.some(
+            (collector) => collector === evidence.collector,
+          ),
+      ) &&
+      expectedCollectors.every(
+        (collector) => (collectorCounts.get(collector) ?? 0) === 1,
+      );
+    if (
+      !exactCorpus ||
+      snapshotCount !== 1 ||
+      session.linuxSnapshot === undefined
+    )
+      throw new Error(
+        session.input.mode === "resident"
+          ? "exact Linux Resident P0 corpus is required"
+          : "exact Linux Rescue snapshot corpus is required",
+      );
+    if (
+      session.linuxSnapshot !== undefined &&
+      session.linuxSnapshot.captureMode !== session.input.mode
+    )
+      throw new Error("normalized Linux snapshot admission is inconsistent");
+  }
+
   private session(id: string): SessionRecord {
     const session = this.sessions.get(id);
     if (!session) throw new Error("unknown session");
@@ -664,6 +776,53 @@ export class LocalSessionDriver implements SessionDriver {
     if (!plan) throw new Error("unknown plan");
     return plan;
   }
+}
+
+async function validateLinuxSnapshotAdmission(
+  session: SessionRecord,
+  evidence: Evidence,
+  content: string,
+): Promise<LinuxSnapshotAdmission | undefined> {
+  if (evidence.collector !== LINUX_NORMALIZED_SNAPSHOT_COLLECTOR)
+    return undefined;
+  if (session.evidenceProfile !== "linux-p0-v1")
+    throw new Error("normalized Linux snapshot requires the Linux P0 profile");
+  if (session.linuxSnapshot !== undefined)
+    throw new Error("normalized Linux snapshot evidence is duplicated");
+  if (evidence.contentType !== LINUX_NORMALIZED_SNAPSHOT_CONTENT_TYPE)
+    throw new Error("normalized Linux snapshot media type is invalid");
+  let envelope;
+  try {
+    envelope = parseLinuxNormalizedSnapshotEnvelopeJson(
+      new TextEncoder().encode(content),
+    );
+  } catch {
+    throw new Error("normalized Linux snapshot envelope is invalid");
+  }
+  const expectedMode = session.input.mode;
+  const expectedTarget =
+    expectedMode === "resident" ? "local-machine" : "selected-installed-target";
+  if (
+    envelope.capture.mode !== expectedMode ||
+    evidence.target !== expectedTarget ||
+    envelope.snapshotSha256 !==
+      (await sha256(
+        `${LINUX_NORMALIZED_SNAPSHOT_HASH_DOMAIN}${canonicalLinuxSnapshotJson(
+          envelope.snapshot,
+        )}`,
+      ))
+  )
+    throw new Error("normalized Linux snapshot admission binding is invalid");
+  if (!envelope.snapshot.topology.supported)
+    throw new Error(
+      "normalized Linux snapshot topology is unsupported by the root-filesystem-only profile",
+    );
+  return {
+    evidenceId: evidence.id,
+    snapshotSha256: envelope.snapshotSha256,
+    captureMode: envelope.capture.mode,
+    targetFingerprint: session.input.targetFingerprint,
+  };
 }
 
 function sameProposal(

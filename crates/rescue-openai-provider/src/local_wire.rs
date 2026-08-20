@@ -658,7 +658,7 @@ mod tests {
 
     #[test]
     fn objective_evidence_and_frame_byte_limits_are_enforced() {
-        let bytes = read_fixture("valid/linux-malformed-fstab.request.raw");
+        let bytes = read_fixture("valid/windows-generic.request.raw");
         let parsed: Result<Value, _> = serde_json::from_slice(&bytes);
         assert!(parsed.is_ok());
         let mut value = parsed.unwrap_or(Value::Null);

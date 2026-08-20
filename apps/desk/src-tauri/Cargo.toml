@@ -21,6 +21,7 @@ tokio = { version = "1.53", features = ["macros", "sync", "time"] }
 zeroize = "1.8"
 kernaid-broker = { path = "../../../crates/broker" }
 kernaid-device-identity = { path = "../../../crates/device-identity" }
+kernaid-evidence = { path = "../../../crates/evidence" }
 kernaid-macos-pack = { path = "../../../packs/macos" }
 kernaid-native-secrets = { path = "../../../crates/native-secrets" }
 kernaid-protocol = { path = "../../../crates/protocol" }

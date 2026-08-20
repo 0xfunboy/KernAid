@@ -1,0 +1,6 @@
+# Deterministic static-root corpus shared by Resident and Rescue parity tests.
+UUID=fixture-root / ext4 defaults 0 1
+server:/fixture /srv/data nfs4 ro,_netdev 0 0
+/swapfile none swap sw 0 0
+LABEL=escaped /srv/fixture\040data ext4 defaults 0 2
+malformed fixture line
