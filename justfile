@@ -44,10 +44,10 @@ build-rescue:
     ./tools/build-rescue/build.sh
 
 qemu-bios:
-    ./tools/build-rescue/qemu-smoke.sh bios
+    ./tools/build-rescue/qemu-with-resident-snapshot.sh bios
 
 qemu-uefi:
-    ./tools/build-rescue/qemu-smoke.sh uefi
+    ./tools/build-rescue/qemu-with-resident-snapshot.sh uefi
 
 qemu-secureboot:
     @echo "Secure Boot is an open release gate; no shipping signed boot chain exists yet."

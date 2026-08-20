@@ -10,7 +10,7 @@ jobs:
         with:
           components: "rustfmt, clippy"
       - name: Install Tauri Linux prerequisites
-        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev procps util-linux
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
@@ -26,6 +26,9 @@ jobs:
         run: ./tests/integration/observe-zero-writes.sh
       - name: Prove snapshot parity without content or tracked-metadata changes
         run: bash ./tests/integration/linux-snapshot-parity.sh
+      - name: Exercise the production Resident snapshot command through Tauri IPC
+        shell: bash
+        run: ./tests/integration/run-linux-snapshot-resident-ipc-ci.sh
       - name: Test Rescue authorization boundary
         run: python3 -m unittest discover -s tests/rescue -p 'test_*.py'
   typescript:

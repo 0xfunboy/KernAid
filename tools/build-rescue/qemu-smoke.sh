@@ -3,13 +3,15 @@ set -euo pipefail
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 firmware="${1:-bios}"
 iso="${2:-$repo_dir/KernAid-Rescue-amd64.iso}"
+snapshot_fixture="$repo_dir/tests/fixtures/linux-normalized-snapshot/healthy/root"
+snapshot_golden="$repo_dir/tests/fixtures/linux-normalized-snapshot/expected/snapshot.v1.json"
 readonly boot_timeout_seconds=1200
 readonly qemu_identity_capture_seconds=5
 readonly qemu_term_grace_seconds=5
 readonly qemu_kill_grace_seconds=5
 readonly qemu_stop_poll_seconds=0.05
 for command in cp dd debugfs mcopy mmd mkfs.ext4 mkfs.ntfs mkfs.vfat ntfsfix \
-  python3 qemu-system-x86_64 sgdisk sha256sum sync tee truncate; do
+  python3 qemu-system-x86_64 sgdisk sha256sum sync tee tr truncate; do
   command -v "$command" >/dev/null || { echo "Missing required command: $command" >&2; exit 2; }
 done
 [[ -x /usr/bin/python3 ]] || {
@@ -165,6 +167,39 @@ if [[ "$firmware" != "bios" && "$firmware" != "uefi" ]]; then
   exit 2
 fi
 test -f "$iso" || { echo "ISO not found: $iso" >&2; exit 2; }
+[[ -d "$snapshot_fixture" && ! -L "$snapshot_fixture" ]] \
+  || { echo "Shared Linux snapshot fixture not found" >&2; exit 2; }
+snapshot_golden_semantic_sha256="$(/usr/bin/python3 -I -B - "$snapshot_golden" <<'PY'
+import hashlib
+import json
+import sys
+
+with open(sys.argv[1], "rb") as stream:
+    snapshot = json.load(stream)
+canonical = json.dumps(
+    snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+).encode("utf-8")
+print(
+    hashlib.sha256(
+        b"KERNAID_LINUX_NORMALIZED_SNAPSHOT_E2E_SEMANTIC_V1\0" + canonical
+    ).hexdigest()
+)
+PY
+)" || { echo "Shared Linux snapshot semantic digest failed" >&2; exit 2; }
+if [[ ! "$snapshot_golden_semantic_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "Shared Linux snapshot semantic digest is invalid" >&2
+  exit 2
+fi
+resident_snapshot_semantic_sha256="${KERNAID_RESIDENT_SNAPSHOT_SEMANTIC_SHA256:-}"
+if [[ -z "$resident_snapshot_semantic_sha256" ]]; then
+  echo "Resident Linux snapshot digest is required" >&2
+  exit 2
+fi
+if [[ ! "$resident_snapshot_semantic_sha256" =~ ^[0-9a-f]{64}$ \
+  || "$resident_snapshot_semantic_sha256" != "$snapshot_golden_semantic_sha256" ]]; then
+  echo "Resident Linux snapshot digest did not match the shared healthy fixture" >&2
+  exit 2
+fi
 python3 -I "$repo_dir/tools/build-rescue/finalize-device-layout.py" verify \
   --manifest "$repo_dir/rescue/image-layout/device-layout.v1.json" \
   --image "$iso"
@@ -597,21 +632,7 @@ cleanup() {
   exit "$status"
 }
 trap 'cleanup $?' EXIT
-mkdir -p "$target_seed_dir/etc" "$target_seed_dir/usr/lib" \
-  "$target_seed_dir/boot/grub" "$target_seed_dir/var/lib/dpkg"
-cat >"$target_seed_dir/etc/os-release" <<'EOF'
-ID=kernaid-qemu-fixture
-NAME="KernAid QEMU Fixture"
-PRETTY_NAME="KernAid deterministic installed-Linux fixture"
-VERSION_ID="1"
-EOF
-cat >"$target_seed_dir/etc/fstab" <<'EOF'
-LABEL=KERNAID_TARGET / ext4 defaults 0 1
-EOF
-printf '%s\n' KERNAID_OBSERVE_TARGET_SENTINEL > \
-  "$target_seed_dir/boot/vmlinuz-kernaid-fixture"
-printf '%s\n' 'Package: kernaid-fixture' > \
-  "$target_seed_dir/var/lib/dpkg/status"
+cp -a -- "$snapshot_fixture/." "$target_seed_dir/"
 truncate -s 128M "$target_image"
 mkfs.ext4 -q -F -L KERNAID_TARGET -d "$target_seed_dir" "$target_image"
 # A read-only ext4 mount can still replay a journal. Mark the disposable
@@ -811,7 +832,8 @@ while ((SECONDS < qemu_deadline)); do
   fi
   if grep -q "KERNAID_RESCUE_READY" "$log" \
     && grep -q "KERNAID_RESCUE_TARGET_SELECTION_READY" "$log" \
-    && grep -q "KERNAID_RESCUE_OFFLINE_INSPECTION_READY" "$log"; then
+    && grep -q "KERNAID_RESCUE_OFFLINE_INSPECTION_READY" "$log" \
+    && grep -q '^KERNAID_RESCUE_LINUX_SNAPSHOT_E2E_V1 semantic_sha256=' "$log"; then
     if ! terminate_qemu_bounded; then
       echo "QEMU could not be stopped before target-image validation" >&2
       exit 1
@@ -840,6 +862,21 @@ while ((SECONDS < qemu_deadline)); do
       echo "Rescue ISO changed during the QEMU smoke test" >&2
       exit 1
     fi
+    mapfile -t rescue_snapshot_markers \
+      < <(LC_ALL=C tr -d '\r' <"$log" \
+        | grep -aE '^KERNAID_RESCUE_LINUX_SNAPSHOT_E2E_V1 semantic_sha256=[0-9a-f]{64}$')
+    if [[ "${#rescue_snapshot_markers[@]}" -ne 1 ]]; then
+      echo "Rescue Linux snapshot digest marker was not unique" >&2
+      exit 1
+    fi
+    rescue_snapshot_semantic_sha256="${rescue_snapshot_markers[0]##*=}"
+    if [[ "$rescue_snapshot_semantic_sha256" != "$resident_snapshot_semantic_sha256" ]]; then
+      echo "Resident and Rescue Linux snapshots were not semantically equal" >&2
+      exit 1
+    fi
+    printf '%s\n' \
+      "KERNAID_QEMU_LINUX_SNAPSHOT_E2E_V1 firmware=$firmware semantic_sha256=$rescue_snapshot_semantic_sha256 semantic_equal=true" \
+      | tee -a "$log"
     printf '%s\n' \
       "KERNAID_QEMU_ATTESTATION_V1 firmware=$firmware iso_sha256=$iso_hash_after target_before_sha256=$target_hash_before target_after_sha256=$target_hash_after ready=true" \
       | tee -a "$log"

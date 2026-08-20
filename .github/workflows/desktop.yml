@@ -3,7 +3,19 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
-    paths: ["apps/desk/**", "crates/**", "packs/**", "packages/**", "services/**", "Cargo.lock", "pnpm-lock.yaml", ".github/workflows/desktop.yml"]
+    paths:
+      - "apps/desk/**"
+      - "crates/**"
+      - "packs/**"
+      - "packages/**"
+      - "services/**"
+      - "tests/fixtures/linux-normalized-snapshot/**"
+      - "tests/integration/linux-snapshot-resident-ipc.sh"
+      - "tests/integration/run-linux-snapshot-resident-ipc-ci.sh"
+      - "tools/test-linux-snapshot/**"
+      - "Cargo.lock"
+      - "pnpm-lock.yaml"
+      - ".github/workflows/desktop.yml"
 permissions: {contents: read}
 jobs:
   build:
@@ -48,10 +60,14 @@ jobs:
           targets: ${{ matrix.targets }}
       - name: Install Linux prerequisites
         if: matrix.platform == 'ubuntu-24.04'
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libdbus-1-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libdbus-1-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf procps util-linux
       - run: pnpm install --frozen-lockfile
       - name: Generate platform icons
         run: pnpm --filter @kernaid/desk tauri icon icon.svg
+      - name: Exercise the production Resident snapshot command through Tauri IPC
+        if: matrix.name == 'linux-x86_64'
+        shell: bash
+        run: ./tests/integration/run-linux-snapshot-resident-ipc-ci.sh
       - name: Test Resident OpenAI and credential companion boundaries
         if: matrix.name != 'macos-x86_64'
         shell: bash

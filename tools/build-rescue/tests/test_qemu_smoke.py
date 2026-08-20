@@ -25,6 +25,9 @@ READY_CHECK = (
     REPO_DIR
     / "rescue/live-build/config/includes.chroot/usr/lib/kernaid/ready-check"
 )
+SNAPSHOT_DIGEST = (
+    "5ddfda2212ab077621f2c2092a1b9400c0d83853d4df7056a185ac78cc243774"
+)
 
 
 def executable(path: Path, source: str) -> None:
@@ -499,12 +502,22 @@ if os.environ.get("KERNAID_MOCK_QEMU_NOT_READY") == "1":
 print("KERNAID_RESCUE_READY", flush=True)
 print("KERNAID_RESCUE_TARGET_SELECTION_READY", flush=True)
 print("KERNAID_RESCUE_OFFLINE_INSPECTION_READY", flush=True)
+snapshot_marker = "KERNAID_RESCUE_LINUX_SNAPSHOT_E2E_V1 semantic_sha256=" + os.environ["KERNAID_MOCK_SNAPSHOT_DIGEST"]
+print(snapshot_marker, flush=True)
+if os.environ.get("KERNAID_MOCK_DUPLICATE_SNAPSHOT_MARKER") == "1":
+    print(snapshot_marker, flush=True)
 time.sleep(30)
 '
             fi
             printf 'KERNAID_RESCUE_READY\n'
             printf 'KERNAID_RESCUE_TARGET_SELECTION_READY\n'
             printf 'KERNAID_RESCUE_OFFLINE_INSPECTION_READY\n'
+            printf 'KERNAID_RESCUE_LINUX_SNAPSHOT_E2E_V1 semantic_sha256=%s\n' \
+              "$KERNAID_MOCK_SNAPSHOT_DIGEST"
+            if [[ "${KERNAID_MOCK_DUPLICATE_SNAPSHOT_MARKER:-0}" == "1" ]]; then
+              printf 'KERNAID_RESCUE_LINUX_SNAPSHOT_E2E_V1 semantic_sha256=%s\n' \
+                "$KERNAID_MOCK_SNAPSHOT_DIGEST"
+            fi
             exec /usr/bin/sleep 30
             """,
         )
@@ -514,6 +527,14 @@ class QemuSmokeFixturePrivilegeTests(unittest.TestCase):
     def materialize_test_script(self, directory: Path, mocks: MockToolchain) -> Path:
         source = SCRIPT.read_text(encoding="utf-8")
         replacements = {
+            'snapshot_fixture="$repo_dir/tests/fixtures/linux-normalized-snapshot/healthy/root"': (
+                f'snapshot_fixture="{REPO_DIR / "tests/fixtures/linux-normalized-snapshot/healthy/root"}'
+                '"'
+            ),
+            'snapshot_golden="$repo_dir/tests/fixtures/linux-normalized-snapshot/expected/snapshot.v1.json"': (
+                f'snapshot_golden="{REPO_DIR / "tests/fixtures/linux-normalized-snapshot/expected/snapshot.v1.json"}'
+                '"'
+            ),
             'ntfs_3g_command="/usr/bin/ntfs-3g"': (
                 f'ntfs_3g_command="{mocks.bin / "ntfs-3g"}"'
             ),
@@ -554,6 +575,9 @@ class QemuSmokeFixturePrivilegeTests(unittest.TestCase):
         ovmf_directory_symlink: bool = False,
         qemu_ignore_term: bool = False,
         qemu_not_ready: bool = False,
+        snapshot_digest: str = SNAPSHOT_DIGEST,
+        duplicate_snapshot_marker: bool = False,
+        resident_snapshot_digest: str | None = SNAPSHOT_DIGEST,
     ) -> tuple[
         subprocess.CompletedProcess[str], Path, Path, tempfile.TemporaryDirectory[str]
     ]:
@@ -603,6 +627,10 @@ class QemuSmokeFixturePrivilegeTests(unittest.TestCase):
                 "KERNAID_MOCK_QEMU_NOT_READY": (
                     "1" if qemu_not_ready else "0"
                 ),
+                "KERNAID_MOCK_SNAPSHOT_DIGEST": snapshot_digest,
+                "KERNAID_MOCK_DUPLICATE_SNAPSHOT_MARKER": (
+                    "1" if duplicate_snapshot_marker else "0"
+                ),
                 "KERNAID_MOCK_OVMF_VARS_TEMPLATE": str(
                     mocks.ovmf
                     / (
@@ -615,6 +643,11 @@ class QemuSmokeFixturePrivilegeTests(unittest.TestCase):
                 "TMPDIR": str(directory),
             }
         )
+        environment.pop("KERNAID_RESIDENT_SNAPSHOT_SEMANTIC_SHA256", None)
+        if resident_snapshot_digest is not None:
+            environment["KERNAID_RESIDENT_SNAPSHOT_SEMANTIC_SHA256"] = (
+                resident_snapshot_digest
+            )
         if source_mismatch_after_record is not None:
             environment["KERNAID_MOCK_SOURCE_MISMATCH_AFTER_RECORD"] = str(
                 source_mismatch_after_record
@@ -963,6 +996,43 @@ class QemuSmokeFixturePrivilegeTests(unittest.TestCase):
             "if=pflash", (state / "qemu-args").read_text(encoding="utf-8")
         )
         self.assertFalse((state / "qemu-ovmf-vars-path").exists())
+
+    def test_snapshot_gate_rejects_wrong_and_duplicate_guest_markers(self) -> None:
+        for options in (
+            {"snapshot_digest": "0" * 64},
+            {"duplicate_snapshot_marker": True},
+        ):
+            with self.subTest(options=options):
+                result, log, state, temporary = self.run_smoke(**options)
+                self.addCleanup(temporary.cleanup)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertNotIn(
+                    "KERNAID_QEMU_LINUX_SNAPSHOT_E2E_V1",
+                    result.stdout + result.stderr,
+                )
+                self.assertNotIn(
+                    "KERNAID_QEMU_ATTESTATION_V1", log.read_text(encoding="utf-8")
+                )
+                qemu_pid = int(
+                    (state / "qemu-pid").read_text(encoding="utf-8").strip()
+                )
+                self.assertFalse(Path(f"/proc/{qemu_pid}").exists())
+
+    def test_snapshot_gate_requires_the_runtime_resident_digest(self) -> None:
+        for resident_digest, expected_error in (
+            (None, "Resident Linux snapshot digest is required"),
+            ("0" * 64, "did not match the shared healthy fixture"),
+        ):
+            with self.subTest(resident_digest=resident_digest):
+                result, log, state, temporary = self.run_smoke(
+                    resident_snapshot_digest=resident_digest
+                )
+                self.addCleanup(temporary.cleanup)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(expected_error, result.stderr)
+                self.assertFalse(log.exists())
+                self.assertFalse((state / "sudo-calls").exists())
+                self.assertFalse((state / "qemu-euid").exists())
 
     def test_failure_after_mount_performs_verified_normal_unmount(self) -> None:
         result, _log, state, temporary = self.run_smoke(sync_failure=True)

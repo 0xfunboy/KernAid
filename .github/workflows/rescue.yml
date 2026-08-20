@@ -14,6 +14,11 @@ on:
       - "tools/make-device/trusted-rescue-images.v2.schema.json"
       - "apps/desk/**"
       - "packs/linux/**"
+      - "tests/fixtures/linux-normalized-snapshot/**"
+      - "tests/integration/linux-snapshot-resident-ipc.sh"
+      - "tests/integration/run-linux-snapshot-resident-ipc-ci.sh"
+      - "tools/test-linux-snapshot/**"
+      - "justfile"
       - "crates/rescue-secrets/**"
       - "crates/evidence/**"
       - "crates/rescue-openai-executor/**"
@@ -105,19 +110,45 @@ jobs:
               for descriptor in reversed(opened):
                   os.close(descriptor)
           PY
+      - name: Install Resident IPC probe prerequisites
+        run: |
+          sudo apt-get install -y \
+            pkg-config libdbus-1-dev libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev librsvg2-dev procps
       - name: Validate Rescue image-layout tooling
         run: |
           python3 -m unittest discover -s tools/build-rescue/tests -p 'test_*.py' -v
           bash -n tools/build-rescue/build.sh \
             tools/build-rescue/qemu-smoke.sh \
+            tools/build-rescue/qemu-with-resident-snapshot.sh \
             tools/build-rescue/qemu-usb-smoke.sh \
-            tools/build-rescue/qemu-vault-lifecycle-smoke.sh
+            tools/build-rescue/qemu-vault-lifecycle-smoke.sh \
+            tests/integration/linux-snapshot-resident-ipc.sh \
+            tests/integration/run-linux-snapshot-resident-ipc-ci.sh
           shellcheck tools/build-rescue/build.sh \
             tools/build-rescue/qemu-smoke.sh \
+            tools/build-rescue/qemu-with-resident-snapshot.sh \
             tools/build-rescue/qemu-usb-smoke.sh \
-            tools/build-rescue/qemu-vault-lifecycle-smoke.sh
+            tools/build-rescue/qemu-vault-lifecycle-smoke.sh \
+            tests/integration/linux-snapshot-resident-ipc.sh \
+            tests/integration/run-linux-snapshot-resident-ipc-ci.sh
+          python3 -I -B -c 'from pathlib import Path; path = Path("tools/test-linux-snapshot/sanitize_e2e.py"); compile(path.read_bytes(), str(path), "exec", dont_inherit=True)'
+          python3 -I -B -c 'from pathlib import Path; path = Path("tools/test-linux-snapshot/tree_fingerprint.py"); compile(path.read_bytes(), str(path), "exec", dont_inherit=True)'
           python3 -I -B -c 'from pathlib import Path; path = Path("tools/build-rescue/qemu-vault-lifecycle-pty.py"); compile(path.read_bytes(), str(path), "exec", dont_inherit=True)'
           python3 -I -B -c 'from pathlib import Path; path = Path("tools/build-rescue/provider-lease-probe.py"); compile(path.read_bytes(), str(path), "exec", dont_inherit=True)'
+      - name: Exercise Resident snapshot through Tauri IPC in a rootless chroot
+        shell: bash
+        run: |
+          resident_evidence="$RUNNER_TEMP/kernaid-linux-snapshot-resident.e2e.log"
+          ./tests/integration/run-linux-snapshot-resident-ipc-ci.sh \
+            >"$resident_evidence"
+          resident_line="$(cat "$resident_evidence")"
+          if [[ ! "$resident_line" =~ ^KERNAID_RESIDENT_LINUX_SNAPSHOT_E2E_V1\ semantic_sha256=([0-9a-f]{64})$ ]]; then
+            echo "Resident snapshot evidence was outside the allowlist" >&2
+            exit 1
+          fi
+          printf 'KERNAID_RESIDENT_SNAPSHOT_SEMANTIC_SHA256=%s\n' \
+            "${BASH_REMATCH[1]}" >>"$GITHUB_ENV"
       - name: Build the host-only Rescue vault lifecycle probe
         run: |
           cargo fmt -p kernaid-rescue-secrets -- --check
@@ -184,6 +215,13 @@ jobs:
         run: KERNAID_SMOKE_LOG=rescue-smoke-bios.log ./tools/build-rescue/qemu-smoke.sh bios
       - name: QEMU UEFI smoke test
         run: KERNAID_SMOKE_LOG=rescue-smoke-uefi.log ./tools/build-rescue/qemu-smoke.sh uefi
+      - name: Publish only allowlisted Resident and Rescue snapshot digests
+        run: |
+          python3 -I -B tools/test-linux-snapshot/sanitize_e2e.py \
+            --resident "$RUNNER_TEMP/kernaid-linux-snapshot-resident.e2e.log" \
+            --bios "$PWD/rescue-smoke-bios.log" \
+            --uefi "$PWD/rescue-smoke-uefi.log" \
+            --output "$RUNNER_TEMP/kernaid-linux-snapshot-e2e.sanitized.log"
       - name: QEMU BIOS USB-style two-boot smoke test
         run: |
           log="$PWD/rescue-usb-smoke-bios.log"
@@ -278,9 +316,15 @@ jobs:
         with:
           name: KernAid-Rescue-smoke-logs
           path: |
-            rescue-smoke-*.log
             rescue-usb-smoke-*.log
           if-no-files-found: warn
+          retention-days: 14
+      - name: Publish sanitized Linux snapshot E2E evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: KernAid-Linux-snapshot-e2e-evidence
+          path: ${{ runner.temp }}/kernaid-linux-snapshot-e2e.sanitized.log
+          if-no-files-found: error
           retention-days: 14
       - name: Publish checksums and image
         uses: actions/upload-artifact@v4

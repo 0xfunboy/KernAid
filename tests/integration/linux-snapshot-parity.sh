@@ -3,6 +3,7 @@ set -euo pipefail
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 expected_dir="$repo_dir/tests/fixtures/linux-normalized-snapshot/expected"
+fingerprint_helper="$repo_dir/tools/test-linux-snapshot/tree_fingerprint.py"
 
 temporary_dir="$(mktemp -d)"
 cleanup() {
@@ -12,12 +13,7 @@ trap cleanup EXIT
 
 tree_fingerprint() {
   local fixture="$1"
-  (
-    cd "$fixture"
-    find . -mindepth 1 -printf '%P\0%y\0%m\0%s\0%T@\0%C@\0' \
-      | sort -z
-    find . -type f -print0 | sort -z | xargs -0 -r sha256sum
-  ) | sha256sum
+  /usr/bin/python3 -I -B "$fingerprint_helper" "$fixture"
 }
 
 if cargo run --quiet \

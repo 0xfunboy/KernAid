@@ -1621,17 +1621,9 @@ fn authorize_observe_for_fingerprint(
         .map_err(broker_error)
 }
 
-fn main() {
-    tauri::Builder::default()
-        .manage(ObserveBrokers::default())
-        .setup(|app| {
-            let app_data_directory = app.path().app_data_dir()?;
-            let runtime = SecureRuntime::open(&app_data_directory)?;
-            app.manage(runtime);
-            app.manage(ResidentOpenAiRuntime::open(&app_data_directory));
-            Ok(())
-        })
-        .invoke_handler(tauri::generate_handler![
+macro_rules! production_invoke_handler {
+    () => {
+        tauri::generate_handler![
             collect_local_inventory,
             collect_linux_normalized_snapshot,
             collect_macos_p0_inventory,
@@ -1648,7 +1640,21 @@ fn main() {
             resident_openai_diagnose,
             resident_openai_cancel,
             resident_openai_logout
-        ])
+        ]
+    };
+}
+
+fn main() {
+    tauri::Builder::default()
+        .manage(ObserveBrokers::default())
+        .setup(|app| {
+            let app_data_directory = app.path().app_data_dir()?;
+            let runtime = SecureRuntime::open(&app_data_directory)?;
+            app.manage(runtime);
+            app.manage(ResidentOpenAiRuntime::open(&app_data_directory));
+            Ok(())
+        })
+        .invoke_handler(production_invoke_handler!())
         .run(tauri::generate_context!())
         .expect("failed to run KernAid Desk");
 }
@@ -1656,6 +1662,152 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    const LINUX_SNAPSHOT_GOLDEN: &[u8] = include_bytes!(
+        "../../../../tests/fixtures/linux-normalized-snapshot/expected/snapshot.v1.json"
+    );
+
+    #[cfg(target_os = "linux")]
+    fn linux_snapshot_ipc_request(
+        webview: &tauri::WebviewWindow<tauri::test::MockRuntime>,
+        body: tauri::ipc::InvokeBody,
+    ) -> serde_json::Value {
+        tauri::test::get_ipc_response(
+            webview,
+            tauri::webview::InvokeRequest {
+                cmd: "collect_linux_normalized_snapshot".into(),
+                callback: tauri::ipc::CallbackFn(0),
+                error: tauri::ipc::CallbackFn(1),
+                url: "tauri://localhost".parse().expect("fixed Tauri URL"),
+                body,
+                headers: Default::default(),
+                invoke_key: tauri::test::INVOKE_KEY.to_owned(),
+            },
+        )
+        .expect("Resident snapshot IPC command")
+        .deserialize()
+        .expect("Resident snapshot IPC JSON")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_rootless_single_id_mapping() {
+        let mapping =
+            std::fs::read_to_string("/proc/self/uid_map").expect("rootless user-namespace UID map");
+        let rows = mapping
+            .lines()
+            .map(|line| line.split_ascii_whitespace().collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 1, "the probe requires one rootless UID mapping");
+        assert_eq!(rows[0].len(), 3, "the UID mapping must have three fields");
+        assert_eq!(rows[0][0], "0", "the namespace UID must be root");
+        assert_ne!(rows[0][1], "0", "the outer UID must remain unprivileged");
+        assert_eq!(rows[0][2], "1", "the namespace must map one UID only");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "run only through the rootless Resident IPC isolation harness"]
+    fn resident_linux_snapshot_tauri_ipc_chroot_probe() {
+        use rustix::fd::AsFd;
+        use sha2::{Digest, Sha256};
+        use std::{fs::File, path::Path};
+
+        const HASH_DOMAIN: &[u8] = b"KERNAID_LINUX_NORMALIZED_SNAPSHOT_V1\0";
+        const E2E_SEMANTIC_HASH_DOMAIN: &[u8] =
+            b"KERNAID_LINUX_NORMALIZED_SNAPSHOT_E2E_SEMANTIC_V1\0";
+        const FORBIDDEN_MARKERS: [&str; 4] = [
+            "fixture-machine-id-must-never-be-projected",
+            "fixture-secret-package-name",
+            "UUID=fixture-root",
+            "server:/fixture",
+        ];
+
+        assert_rootless_single_id_mapping();
+        let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../tests/fixtures/linux-normalized-snapshot/healthy/root");
+        let fixture = File::open(&fixture_path).expect("fixed healthy fixture root");
+        let fixture_identity = rustix::fs::fstat(fixture.as_fd()).expect("fixture identity");
+
+        let app = tauri::test::mock_builder()
+            .invoke_handler(production_invoke_handler!())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("mock Tauri application");
+        let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .expect("mock Tauri webview");
+
+        rustix::process::chroot(&fixture_path).expect("rootless fixture chroot");
+        rustix::fs::chdir("/").expect("fixture working directory");
+        let isolated_root = File::open("/").expect("isolated root");
+        let isolated_identity =
+            rustix::fs::fstat(isolated_root.as_fd()).expect("isolated root identity");
+        assert_eq!(
+            (isolated_identity.st_dev, isolated_identity.st_ino),
+            (fixture_identity.st_dev, fixture_identity.st_ino),
+            "the production collector must see the fixed fixture only as /",
+        );
+        assert!(
+            !Path::new("/proc").exists(),
+            "the chroot must not expose the host process filesystem",
+        );
+
+        let envelope = linux_snapshot_ipc_request(&webview, Default::default());
+        let snapshot = envelope
+            .get("snapshot")
+            .expect("normalized snapshot projection");
+        let expected: serde_json::Value =
+            serde_json::from_slice(LINUX_SNAPSHOT_GOLDEN).expect("snapshot golden");
+        assert_eq!(
+            snapshot, &expected,
+            "Resident IPC snapshot must match the golden"
+        );
+        assert_eq!(envelope["capture"]["mode"], "resident");
+        assert_eq!(envelope["capture"]["targetScope"], "running-root");
+        assert_eq!(envelope["capture"]["callerSuppliedPath"], false);
+
+        let marker_body = serde_json::json!({
+            "root": "/outside-root/KERNAID_CALLER_PATH_MARKER_MUST_BE_IGNORED"
+        });
+        let marker_attempt =
+            linux_snapshot_ipc_request(&webview, tauri::ipc::InvokeBody::Json(marker_body));
+        assert_eq!(
+            marker_attempt, envelope,
+            "caller JSON must not influence the parameter-free IPC command",
+        );
+
+        let golden_canonical_snapshot = LINUX_SNAPSHOT_GOLDEN
+            .strip_suffix(b"\n")
+            .unwrap_or(LINUX_SNAPSHOT_GOLDEN);
+        let serialized_envelope = serde_json::to_vec(&envelope).expect("snapshot envelope JSON");
+        for marker in FORBIDDEN_MARKERS {
+            assert!(
+                !serialized_envelope
+                    .windows(marker.len())
+                    .any(|window| window == marker.as_bytes()),
+                "raw fixture marker escaped the normalized snapshot",
+            );
+        }
+        assert!(
+            !serialized_envelope
+                .windows(b"KERNAID_CALLER_PATH_MARKER_MUST_BE_IGNORED".len())
+                .any(|window| window == b"KERNAID_CALLER_PATH_MARKER_MUST_BE_IGNORED"),
+            "caller marker escaped the parameter-free IPC boundary",
+        );
+        let native_digest = Sha256::digest([HASH_DOMAIN, golden_canonical_snapshot].concat());
+        assert_eq!(
+            envelope["snapshotSha256"],
+            format!("{native_digest:x}"),
+            "the IPC envelope digest must bind the semantic snapshot",
+        );
+        let mut sorted_snapshot = snapshot.clone();
+        sorted_snapshot.sort_all_objects();
+        let sorted_snapshot =
+            serde_json::to_vec(&sorted_snapshot).expect("sorted semantic snapshot JSON");
+        let semantic_digest =
+            Sha256::digest([E2E_SEMANTIC_HASH_DOMAIN, sorted_snapshot.as_slice()].concat());
+        println!("KERNAID_RESIDENT_LINUX_SNAPSHOT_E2E_V1 semantic_sha256={semantic_digest:x}");
+    }
 
     fn macos_fixture_evidence() -> Vec<NativeDiagnosticEvidence> {
         let documents = [
