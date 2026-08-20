@@ -3074,6 +3074,7 @@ mod tests {
             b"0::/system.slice/kernaid-rescue-openai-executor@4.service\n".as_slice(),
             b"0::/system.slice/kernaid-rescue-openai-executor@4.service/agent/nested\n",
             b"0::/system.slice/kernaid-rescue-openai-executor@.service/agent\n",
+            b"0::/system.slice/system-kernaid\\x2drescue\\x2dopenai\\x2dexecutor.slice/kernaid-rescue-openai-executor@4.service/agent\n",
             b"0::/user.slice/kernaid-rescue-openai-executor@4.service/agent\n",
             b"0::/system.slice/unrelated@4.service/agent\n",
             b"0::/system.slice/kernaid-rescue-openai-executor@4.service/agent\n0::/other\n",

@@ -2590,6 +2590,29 @@ class StaticContractTests(unittest.TestCase):
         self.assertEqual(failure.exception.code, "command-failed")
 
     def test_provider_proof_failure_checkpoints_are_closed_and_correlated(self) -> None:
+        self.assertEqual(
+            controller.PROVIDER_PROOF_UI_ERROR_CHECKPOINTS,
+            (
+                ("busy", "outcome-busy"),
+                ("invalid_request", "outcome-invalid-request"),
+                ("invalid_response", "outcome-invalid-response"),
+                ("request_too_large", "outcome-request-too-large"),
+                ("response_too_large", "outcome-response-too-large"),
+                ("timeout", "outcome-timeout"),
+                ("transport", "outcome-transport"),
+                ("upstream", "outcome-upstream"),
+            ),
+        )
+        self.assertEqual(
+            len(dict(controller.PROVIDER_PROOF_UI_ERROR_CHECKPOINTS)),
+            len(controller.PROVIDER_PROOF_UI_ERROR_CHECKPOINTS),
+        )
+        self.assertTrue(
+            {
+                checkpoint
+                for _error, checkpoint in controller.PROVIDER_PROOF_UI_ERROR_CHECKPOINTS
+            }.issubset(controller.PROVIDER_PROOF_UI_CHECKPOINTS)
+        )
         for stage in controller.PROVIDER_PROOF_UI_STAGES:
             for checkpoint in controller.PROVIDER_PROOF_UI_CHECKPOINTS:
                 with self.subTest(stage=stage, checkpoint=checkpoint):
@@ -2758,6 +2781,16 @@ class StaticContractTests(unittest.TestCase):
             ("ui-diagnose-unconfigured", diagnose),
             ("ui-status-configured", status),
         ):
+            support, separator, _transaction = source.partition(
+                'try:\n    checkpoint="ui-identity"'
+            )
+            self.assertEqual(separator, 'try:\n    checkpoint="ui-identity"')
+            namespace: dict[str, object] = {}
+            exec(compile(support, "<ui-relay-support>", "exec"), namespace)
+            self.assertEqual(
+                namespace["OUTCOME_CHECKPOINTS"],
+                dict(controller.PROVIDER_PROOF_UI_ERROR_CHECKPOINTS),
+            )
             self.assertIn('ENDPOINT="/api/rescue/provider/openai"', source)
             self.assertIn('HOST="127.0.0.1:4173"', source)
             self.assertIn('ORIGIN="http://127.0.0.1:4173"', source)
@@ -2785,12 +2818,15 @@ class StaticContractTests(unittest.TestCase):
             self.assertIn("response.close()", source)
             self.assertIn("transport.close()", source)
             for checkpoint in controller.PROVIDER_PROOF_UI_CHECKPOINTS:
-                self.assertIn(f'checkpoint="{checkpoint}"', source)
                 self.assertIn(
                     "KERNAID_QEMU_PROVIDER_PROOF_FAILURE_V1 "
                     f"stage={stage} checkpoint={checkpoint}",
                     source,
                 )
+            for checkpoint in controller.PROVIDER_PROOF_UI_CHECKPOINTS[:7]:
+                self.assertIn(f'checkpoint="{checkpoint}"', source)
+            for error, checkpoint in controller.PROVIDER_PROOF_UI_ERROR_CHECKPOINTS:
+                self.assertIn(f"{error!r}: {checkpoint!r}", source)
             self.assertNotIn("encoded=b'", source)
             self.assertNotIn('encoded=b"', source)
             self.assertNotIn("body=bytearray(b'", source)

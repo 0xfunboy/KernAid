@@ -103,6 +103,24 @@ PROVIDER_PROOF_UI_CHECKPOINTS = (
     "quiescence",
     "envelope",
     "outcome",
+    "outcome-busy",
+    "outcome-invalid-request",
+    "outcome-invalid-response",
+    "outcome-request-too-large",
+    "outcome-response-too-large",
+    "outcome-timeout",
+    "outcome-transport",
+    "outcome-upstream",
+)
+PROVIDER_PROOF_UI_ERROR_CHECKPOINTS = (
+    ("busy", "outcome-busy"),
+    ("invalid_request", "outcome-invalid-request"),
+    ("invalid_response", "outcome-invalid-response"),
+    ("request_too_large", "outcome-request-too-large"),
+    ("response_too_large", "outcome-response-too-large"),
+    ("timeout", "outcome-timeout"),
+    ("transport", "outcome-transport"),
+    ("upstream", "outcome-upstream"),
 )
 PROVIDER_PROOF_SUCCESS_PREFIX = b"KERNAID_QEMU_PROVIDER_PROOF_V1"
 PROVIDER_PROOF_FAILURE_PREFIX = b"KERNAID_QEMU_PROVIDER_PROOF_FAILURE_V1"
@@ -2624,13 +2642,15 @@ def _production_ui_relay_probe_source(stage: str) -> bytes:
     else:
         raise ClosedFailure("provider-proof", "stage-invalid")
     proof = f"KERNAID_QEMU_PROVIDER_PROOF_V1 stage={stage} result=true\n"
-    failures = {
-        checkpoint: (
-            "KERNAID_QEMU_PROVIDER_PROOF_FAILURE_V1 "
-            f"stage={stage} checkpoint={checkpoint}\n"
-        )
+    failures = "\n".join(
+        f"    {checkpoint!r}: "
+        f"{'KERNAID_QEMU_PROVIDER_PROOF_FAILURE_V1 ' f'stage={stage} checkpoint={checkpoint}\n'!r},"
         for checkpoint in PROVIDER_PROOF_UI_CHECKPOINTS
-    }
+    )
+    outcome_checkpoints = "\n".join(
+        f"    {error!r}: {checkpoint!r},"
+        for error, checkpoint in PROVIDER_PROOF_UI_ERROR_CHECKPOINTS
+    )
     return f'''import http.client,json,os,re,subprocess,sys,time
 API="kernaid.dev/rescue-openai/v1alpha1"
 ENDPOINT="/api/rescue/provider/openai"
@@ -2646,7 +2666,12 @@ TIMEOUT={timeout!r}
 BUDGET={budget!r}
 MAX_REQUEST=96*1024
 MAX_RESPONSE=64*1024
-FAILURES={failures!r}
+FAILURES={{
+{failures}
+}}
+OUTCOME_CHECKPOINTS={{
+{outcome_checkpoints}
+}}
 DEADLINE=time.monotonic()+BUDGET
 checkpoint="ui-identity"
 def remaining(limit):
@@ -2765,7 +2790,10 @@ try:
     checkpoint="outcome"
     if OPERATION=="provider.openai.diagnose":
         error=exact(envelope["error"],("code",))
-        if envelope["ok"] is not False or error["code"]!="credential_unavailable":
+        if envelope["ok"] is not False:
+            raise RuntimeError()
+        if error["code"]!="credential_unavailable":
+            checkpoint=OUTCOME_CHECKPOINTS.get(error["code"],"outcome")
             raise RuntimeError()
     else:
         status=exact(envelope["payload"],("provider","profile","vault","credential"))

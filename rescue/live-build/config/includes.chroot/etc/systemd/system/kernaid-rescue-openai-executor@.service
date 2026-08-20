@@ -24,6 +24,10 @@ UMask=0077
 LimitCORE=0
 LimitNOFILE=16
 TasksMax=1
+# Accept=yes template instances otherwise inherit systemd's implicit
+# per-template slice. Keep the exact delegated tree directly below
+# system.slice, as required by the vault's descriptor-bound lease validator.
+Slice=system.slice
 # Keep systemd from bind-mounting the unit memory.pressure file into the
 # otherwise read-only cgroup2 view. The vault validates one exact cgroup2
 # mount before granting a provider lease.

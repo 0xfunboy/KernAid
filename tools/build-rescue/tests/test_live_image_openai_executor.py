@@ -185,6 +185,7 @@ class RescueOpenAiExecutorPackagingTests(unittest.TestCase):
                 "LimitCORE": "0",
                 "LimitNOFILE": "16",
                 "TasksMax": "1",
+                "Slice": "system.slice",
                 "MemoryPressureWatch": "no",
                 "Delegate": "pids",
                 "DelegateSubgroup": "agent",
@@ -503,6 +504,7 @@ class RescueOpenAiExecutorPackagingTests(unittest.TestCase):
         self.assertEqual(lease["Group"], "kernaid-openai")
         self.assertEqual(lease["SupplementaryGroups"], "kernaid-vault")
         self.assertEqual(lease["TasksMax"], "1")
+        self.assertEqual(lease["Slice"], "system.slice")
         self.assertEqual(lease["MemoryPressureWatch"], "no")
         self.assertEqual(lease["Delegate"], "pids")
         self.assertEqual(lease["DelegateSubgroup"], "agent")
