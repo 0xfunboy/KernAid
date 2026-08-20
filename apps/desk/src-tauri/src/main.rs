@@ -1738,7 +1738,7 @@ mod tests {
             .expect("mock Tauri webview");
 
         rustix::process::chroot(&fixture_path).expect("rootless fixture chroot");
-        rustix::fs::chdir("/").expect("fixture working directory");
+        rustix::process::chdir("/").expect("fixture working directory");
         let isolated_root = File::open("/").expect("isolated root");
         let isolated_identity =
             rustix::fs::fstat(isolated_root.as_fd()).expect("isolated root identity");
