@@ -29,6 +29,9 @@ UMask=0077
 LimitCORE=0
 LimitNOFILE=16
 TasksMax=1
+# The lease proof is subject to the same exact cgroup2 mount invariant as the
+# production executor; a systemd PSI bind would make its mount view ambiguous.
+MemoryPressureWatch=no
 Delegate=pids
 DelegateSubgroup=agent
 KillMode=control-group

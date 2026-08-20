@@ -65,6 +65,12 @@ BRACKETED_PASTE_DISABLE_PREFIX = b"\x1b[?2004l\r"
 _TRUSTED_SHELL_MARKER_START = (
     rb"(?:^|\r?\n)(?:" + re.escape(BRACKETED_PASTE_DISABLE_PREFIX) + rb")?"
 )
+# Unlike the generic transcript patterns above, a proof transaction advances
+# its cursor past the preceding newline.  Keep that boundary zero-width so an
+# immediately adjacent marker remains visible from the exact cursor.
+_TRUSTED_SHELL_ZERO_WIDTH_START = (
+    rb"(?:\A|(?<=\n))(?:(?:" + re.escape(BRACKETED_PASTE_DISABLE_PREFIX) + rb"))?"
+)
 NOT_READY_PREFIX_PATTERN = re.compile(
     rb"(?:^|\r?\n)" + re.escape(NOT_READY_LINE_PREFIX)
 )
@@ -85,10 +91,21 @@ RUNTIME_RESULT_PATTERN = re.compile(
     _TRUSTED_SHELL_MARKER_START
     + rb"(KERNAID_VAULT_RUNTIME_V1 [^\r\n]{1,1024})\r?\n"
 )
-PROVIDER_PROOF_RESULT_PATTERN = re.compile(
-    _TRUSTED_SHELL_MARKER_START
-    + rb"(KERNAID_QEMU_PROVIDER_PROOF_V1 stage=[a-z0-9-]+ result=true)\r?\n"
+PROVIDER_PROOF_UI_STAGES = (
+    "ui-diagnose-unconfigured",
+    "ui-status-configured",
 )
+PROVIDER_PROOF_UI_CHECKPOINTS = (
+    "ui-identity",
+    "socket-baseline",
+    "http-response",
+    "socket-accounting",
+    "quiescence",
+    "envelope",
+    "outcome",
+)
+PROVIDER_PROOF_SUCCESS_PREFIX = b"KERNAID_QEMU_PROVIDER_PROOF_V1"
+PROVIDER_PROOF_FAILURE_PREFIX = b"KERNAID_QEMU_PROVIDER_PROOF_FAILURE_V1"
 CAP_SYS_ADMIN_ONLY = "0000000000200000"
 CAP_SYS_ADMIN_AND_KILL = "0000000000200020"
 ZERO_CAPS = "0000000000000000"
@@ -343,6 +360,35 @@ def _return_code_line_pattern(line: bytes) -> re.Pattern[bytes]:
     return re.compile(
         rb"(?:^|\r?\n)" + re.escape(line) + rb" rc=([0-9]{1,3})\r?\n"
     )
+
+
+def _provider_proof_event_pattern(end: bytes) -> re.Pattern[bytes]:
+    """Match the earliest closed proof marker or its exact transaction END."""
+
+    return re.compile(
+        _TRUSTED_SHELL_ZERO_WIDTH_START
+        + rb"(?:"
+        + rb"(?P<success>"
+        + re.escape(PROVIDER_PROOF_SUCCESS_PREFIX)
+        + rb" stage=(?P<success_stage>[a-z0-9-]+) result=true)"
+        + rb"|(?P<failure>"
+        + re.escape(PROVIDER_PROOF_FAILURE_PREFIX)
+        + rb" stage=(?P<failure_stage>[a-z0-9-]+) checkpoint="
+        + rb"(?P<failure_checkpoint>[a-z0-9-]+))"
+        + rb"|(?P<end>"
+        + re.escape(end)
+        + rb" rc=(?P<return_code>[0-9]{1,3}))"
+        + rb")\r?\n"
+    )
+
+
+def _canonical_return_code(value: bytes) -> int:
+    if re.fullmatch(rb"0|[1-9][0-9]{0,2}", value) is None:
+        raise ClosedFailure("provider-proof", "return-code-invalid")
+    result = int(value)
+    if result > 255:
+        raise ClosedFailure("provider-proof", "return-code-invalid")
+    return result
 
 
 def _normalize(block: bytes) -> list[bytes]:
@@ -2374,6 +2420,13 @@ def run_guest_proof(
         raise ClosedFailure("provider-proof", "source-invalid")
     begin = f"KERNAID_PROVIDER_PROOF_BEGIN_V1_{stage}".encode("ascii")
     end = f"KERNAID_PROVIDER_PROOF_END_V1_{stage}".encode("ascii")
+    started = time.monotonic()
+    # Reserve the complete local transaction before sending anything.  This
+    # prevents the aggregate lifecycle deadline from silently shortening a
+    # proof and misclassifying aggregate exhaustion as a guest timeout.
+    required = 15.0 + timeout + 10.0
+    if aggregate - started < required:
+        raise ClosedFailure("provider-proof", "aggregate-budget")
     shell = (
         b"printf '%s\\n' '"
         + begin
@@ -2383,17 +2436,22 @@ def run_guest_proof(
         + end
         + b"' \"$rc\"\n"
     )
-    console.send(shell, deadline=_deadline(aggregate, 5.0))
+    console.send(shell, deadline=started + 5.0)
     begin_match = console.wait_regex(
         _trusted_shell_line_pattern(begin),
         start=cursor,
-        deadline=_deadline(aggregate, 10.0),
+        deadline=started + 15.0,
         stage="provider-proof-start",
     )
-    proof_match = console.wait_regex(
-        PROVIDER_PROOF_RESULT_PATTERN,
+    proof_deadline = time.monotonic() + timeout
+    end_deadline = proof_deadline + 10.0
+    if end_deadline > aggregate:
+        raise ClosedFailure("provider-proof", "aggregate-budget")
+    event_pattern = _provider_proof_event_pattern(end)
+    event_match = console.wait_regex(
+        event_pattern,
         start=begin_match.end(),
-        deadline=_deadline(aggregate, timeout),
+        deadline=proof_deadline,
         stage="provider-proof",
     )
     expected = (
@@ -2401,20 +2459,55 @@ def run_guest_proof(
             "ascii"
         )
     )
-    if proof_match.group(1) != expected:
+    if event_match.group("end") is not None:
+        return_code = _canonical_return_code(event_match.group("return_code"))
+        raise ClosedFailure(
+            "provider-proof",
+            "marker-missing" if return_code == 0 else "command-failed",
+        )
+
+    marker = event_match.group("success") or event_match.group("failure")
+    if marker is None:
         raise ClosedFailure("provider-proof", "marker-invalid")
     end_match = console.wait_regex(
-        _return_code_line_pattern(end),
-        start=proof_match.end(),
-        deadline=_deadline(aggregate, 10.0),
+        event_pattern,
+        start=event_match.end(),
+        deadline=end_deadline,
         stage="provider-proof-finish",
     )
-    if int(end_match.group(1)) != 0:
-        raise ClosedFailure("provider-proof", "command-failed")
-    block = console.capture.snapshot()[begin_match.end() : end_match.start()]
-    if _normalize(block) != [expected]:
+    if end_match.group("end") is None:
         raise ClosedFailure("provider-proof", "output-invalid")
-    return end_match.end()
+    return_code = _canonical_return_code(end_match.group("return_code"))
+    block = console.capture.snapshot()[begin_match.end() : end_match.start()]
+
+    if event_match.group("success") is not None:
+        if marker != expected:
+            raise ClosedFailure("provider-proof", "marker-invalid")
+        if return_code != 0:
+            raise ClosedFailure("provider-proof", "command-failed")
+        if _normalize(block) != [expected]:
+            raise ClosedFailure("provider-proof", "output-invalid")
+        return end_match.end()
+
+    failure_stage = event_match.group("failure_stage").decode("ascii")
+    failure_checkpoint = event_match.group("failure_checkpoint").decode("ascii")
+    if (
+        failure_stage != stage
+        or failure_stage not in PROVIDER_PROOF_UI_STAGES
+        or failure_checkpoint not in PROVIDER_PROOF_UI_CHECKPOINTS
+    ):
+        raise ClosedFailure("provider-proof", "marker-invalid")
+    expected_failure = (
+        f"KERNAID_QEMU_PROVIDER_PROOF_FAILURE_V1 stage={failure_stage} "
+        f"checkpoint={failure_checkpoint}"
+    ).encode("ascii")
+    if marker != expected_failure or _normalize(block) != [expected_failure]:
+        raise ClosedFailure("provider-proof", "output-invalid")
+    if return_code != 45:
+        raise ClosedFailure("provider-proof", "command-failed")
+    # Both components were matched against closed tuples above; no guest text
+    # or exception material can reach the sanitized lifecycle artifact.
+    raise ClosedFailure("provider-proof", f"{failure_stage}-{failure_checkpoint}")
 
 
 PROVIDER_STATUS_PROBE_SOCKET = "/run/kernaid-provider-executor-status-probe.sock"
@@ -2521,29 +2614,48 @@ def _production_ui_relay_probe_source(stage: str) -> bytes:
     if stage == "ui-diagnose-unconfigured":
         operation = "provider.openai.diagnose"
         request_id = "O-90000000-0000-0000-0000-000000000001"
-        timeout = 143.0
+        timeout = 130.0
+        budget = 140.0
     elif stage == "ui-status-configured":
         operation = "provider.status"
         request_id = "O-90000000-0000-0000-0000-000000000002"
-        timeout = 6.0
+        timeout = 5.0
+        budget = 10.0
     else:
         raise ClosedFailure("provider-proof", "stage-invalid")
     proof = f"KERNAID_QEMU_PROVIDER_PROOF_V1 stage={stage} result=true\n"
+    failures = {
+        checkpoint: (
+            "KERNAID_QEMU_PROVIDER_PROOF_FAILURE_V1 "
+            f"stage={stage} checkpoint={checkpoint}\n"
+        )
+        for checkpoint in PROVIDER_PROOF_UI_CHECKPOINTS
+    }
     return f'''import http.client,json,os,re,subprocess,sys,time
 API="kernaid.dev/rescue-openai/v1alpha1"
 ENDPOINT="/api/rescue/provider/openai"
 HOST="127.0.0.1:4173"
 ORIGIN="http://127.0.0.1:4173"
+PORT=4173
 EXECUTOR={PROVIDER_EXECUTOR_SOCKET_UNIT!r}
 EGRESS={PROVIDER_EGRESS_SERVICE_UNIT!r}
 UI={PROVIDER_UI_SERVICE_UNIT!r}
 OPERATION={operation!r}
 REQUEST_ID={request_id!r}
 TIMEOUT={timeout!r}
+BUDGET={budget!r}
 MAX_REQUEST=96*1024
 MAX_RESPONSE=64*1024
+FAILURES={failures!r}
+DEADLINE=time.monotonic()+BUDGET
+checkpoint="ui-identity"
+def remaining(limit):
+    value=DEADLINE-time.monotonic()
+    if value<=0:
+        raise RuntimeError()
+    return min(limit,value)
 def show(prop,unit):
-    result=subprocess.run(["/usr/bin/systemctl","show","--property="+prop,"--value",unit],stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=3,check=False)
+    result=subprocess.run(["/usr/bin/systemctl","show","--property="+prop,"--value",unit],stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=remaining(3.0),check=False)
     if result.returncode!=0 or len(result.stdout)>512:
         raise RuntimeError()
     return result.stdout.rstrip(b"\\n")
@@ -2571,8 +2683,10 @@ def exchange(request):
     body.append(10)
     if len(body)>MAX_REQUEST or body[:1]!=b"{{" or body[-2:]!=b"}}\\n" or b"\\n" in body[:-1] or b"\\r" in body:
         raise RuntimeError()
-    connection=http.client.HTTPConnection("127.0.0.1",4173,timeout=TIMEOUT)
+    connection=http.client.HTTPConnection("127.0.0.1",PORT,timeout=remaining(TIMEOUT))
     observed=bytearray()
+    response=None
+    transport=None
     try:
         connection.putrequest("POST",ENDPOINT,skip_host=True,skip_accept_encoding=True)
         connection.putheader("Host",HOST)
@@ -2582,6 +2696,10 @@ def exchange(request):
         connection.putheader("Content-Length",str(len(body)))
         connection.putheader("Connection","close")
         connection.endheaders(body)
+        if connection.sock is None:
+            raise RuntimeError()
+        transport=connection.sock
+        transport.settimeout(remaining(TIMEOUT))
         response=connection.getresponse()
         lengths=response.headers.get_all("Content-Length",[])
         if response.status!=200 or response.headers.get_all("Content-Type",[])!=["application/json"] or response.headers.get_all("Cache-Control",[])!=["no-store"] or response.headers.get_all("X-Content-Type-Options",[])!=["nosniff"] or response.headers.get_all("Transfer-Encoding",[]) or response.headers.get_all("Content-Encoding",[]) or len(lengths)!=1 or re.fullmatch(r"0|[1-9][0-9]*",lengths[0]) is None:
@@ -2589,6 +2707,7 @@ def exchange(request):
         declared=int(lengths[0])
         if declared>MAX_RESPONSE:
             raise RuntimeError()
+        transport.settimeout(remaining(TIMEOUT))
         observed.extend(response.read(declared+1))
         if len(observed)!=declared or observed[:1]!=b"{{" or observed[-2:]!=b"}}\\n" or b"\\n" in observed[:-1] or b"\\r" in observed:
             raise RuntimeError()
@@ -2597,10 +2716,15 @@ def exchange(request):
         del text
         return parsed
     finally:
+        if response is not None:
+            response.close()
         connection.close()
+        if transport is not None:
+            transport.close()
         body[:]=b"\\0"*len(body)
         observed[:]=b"\\0"*len(observed)
 try:
+    checkpoint="ui-identity"
     if show("ActiveState",UI)!=b"active" or show("SubState",UI)!=b"running" or show("FragmentPath",UI)!=b"/etc/systemd/system/kernaid-ui.service":
         raise RuntimeError()
     ui_pid=show("MainPID",UI)
@@ -2609,6 +2733,7 @@ try:
     with open("/proc/"+ui_pid.decode("ascii")+"/cmdline","rb") as stream:
         if stream.read(256)!=b"/usr/bin/python3\\0-I\\0/usr/lib/kernaid/rescue_server.py\\0":
             raise RuntimeError()
+    checkpoint="socket-baseline"
     if show("ActiveState",EXECUTOR)!=b"active" or show("SubState",EXECUTOR) not in (b"listening",b"running") or number("NConnections",EXECUTOR)!=0:
         raise RuntimeError()
     accepted_before=number("NAccepted",EXECUTOR)
@@ -2621,18 +2746,23 @@ try:
     else:
         payload={{}}
     request={{"apiVersion":API,"requestId":REQUEST_ID,"operation":OPERATION,"payload":payload}}
+    checkpoint="http-response"
     response=exchange(request)
+    checkpoint="socket-accounting"
     accepted_after=number("NAccepted",EXECUTOR)
     if accepted_after!=accepted_before+1 or show("ActiveState",EGRESS)!=b"inactive" or show("ActiveEnterTimestampMonotonic",EGRESS)!=egress_before:
         raise RuntimeError()
-    deadline=time.monotonic()+5.0
+    checkpoint="quiescence"
+    deadline=min(time.monotonic()+5.0,DEADLINE)
     while number("NConnections",EXECUTOR)!=0:
         if time.monotonic()>=deadline:
             raise RuntimeError()
         time.sleep(0.05)
+    checkpoint="envelope"
     envelope=exact(response,("apiVersion","requestId","operation","ok","error") if OPERATION=="provider.openai.diagnose" else ("apiVersion","requestId","operation","ok","payload"))
     if envelope["apiVersion"]!=API or envelope["requestId"]!=REQUEST_ID or envelope["operation"]!=OPERATION:
         raise RuntimeError()
+    checkpoint="outcome"
     if OPERATION=="provider.openai.diagnose":
         error=exact(envelope["error"],("code",))
         if envelope["ok"] is not False or error["code"]!="credential_unavailable":
@@ -2642,6 +2772,7 @@ try:
         if envelope["ok"] is not True or status!={{"provider":"openai","profile":"rescue-default","vault":"unlocked","credential":"configured"}}:
             raise RuntimeError()
 except BaseException:
+    sys.stdout.write(FAILURES[checkpoint])
     sys.exit(45)
 sys.stdout.write({proof!r})
 '''.encode("ascii")

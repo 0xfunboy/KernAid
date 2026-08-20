@@ -418,6 +418,55 @@ exec /bin/bash --noprofile --norc -i
                 controller.wipe(scripted.credential)
                 scripted.capture.wipe()
 
+    def test_real_interactive_bash_proof_success_and_failure_are_prompt(self) -> None:
+        for success in (True, False):
+            with self.subTest(success=success), self.real_interactive_bash_console() as (
+                console,
+                _capture,
+                credential,
+            ):
+                aggregate = time.monotonic() + 60.0
+                cursor = controller.establish_live_session(
+                    console, aggregate, credential
+                )
+                stage = "real-pty-proof"
+                if success:
+                    source = (
+                        "import sys;sys.stdout.write("
+                        f"'KERNAID_QEMU_PROVIDER_PROOF_V1 stage={stage} "
+                        "result=true\\n')"
+                    ).encode()
+                else:
+                    source = b"raise SystemExit(45)"
+                started = time.monotonic()
+                if success:
+                    self.assertGreater(
+                        controller.run_guest_proof(
+                            console,
+                            stage,
+                            source,
+                            cursor,
+                            aggregate,
+                            timeout=2.0,
+                        ),
+                        cursor,
+                    )
+                else:
+                    with self.assertRaises(controller.ClosedFailure) as failure:
+                        controller.run_guest_proof(
+                            console,
+                            stage,
+                            source,
+                            cursor,
+                            aggregate,
+                            timeout=2.0,
+                        )
+                    self.assertEqual(
+                        (failure.exception.stage, failure.exception.code),
+                        ("provider-proof", "command-failed"),
+                    )
+                self.assertLess(time.monotonic() - started, 1.0)
+
     def test_real_pty_not_ready_precedes_ready_without_exposing_reason(self) -> None:
         master, slave = os.openpty()
         tty.setraw(slave)
@@ -2406,6 +2455,34 @@ class LoopDetachTests(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 2)
 
 
+def run_proof_transcript(
+    stage: str, transcript: bytes, *, timeout: float = 0.1
+) -> int:
+    """Exercise the real nonblocking serial parser with a fixed transcript."""
+
+    local, peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    capture = controller.BoundedCapture(64 * 1024, [])
+    console = None
+    try:
+        local.setblocking(False)
+        peer.sendall(transcript)
+        console = controller.SerialConsole(local.detach(), capture, lambda: None)
+        return controller.run_guest_proof(
+            console,
+            stage,
+            b"raise SystemExit(0)",
+            0,
+            time.monotonic() + 30.0,
+            timeout=timeout,
+        )
+    finally:
+        if console is not None:
+            console.close()
+        local.close()
+        peer.close()
+        capture.wipe()
+
+
 class StaticContractTests(unittest.TestCase):
 
     def test_readiness_controller_and_wrapper_deadlines_are_strictly_nested(
@@ -2484,6 +2561,141 @@ class StaticContractTests(unittest.TestCase):
             self.assertLess(pid_capture, deadline_capture)
             self.assertLess(deadline_capture, publication_wait)
 
+    def test_provider_proof_accepts_adjacent_lf_and_crlf_markers(self) -> None:
+        stage = "adjacent-proof"
+        for newline in (b"\n", b"\r\n"):
+            with self.subTest(newline=newline):
+                transcript = newline.join(
+                    (
+                        f"KERNAID_PROVIDER_PROOF_BEGIN_V1_{stage}".encode(),
+                        f"KERNAID_QEMU_PROVIDER_PROOF_V1 stage={stage} "
+                        "result=true".encode(),
+                        f"KERNAID_PROVIDER_PROOF_END_V1_{stage} rc=0".encode(),
+                        b"",
+                    )
+                )
+                self.assertEqual(run_proof_transcript(stage, transcript), len(transcript))
+
+    def test_provider_proof_classifies_end_before_marker_without_waiting(self) -> None:
+        stage = "failed-proof"
+        transcript = (
+            f"KERNAID_PROVIDER_PROOF_BEGIN_V1_{stage}\r\n"
+            f"KERNAID_PROVIDER_PROOF_END_V1_{stage} rc=45\r\n"
+        ).encode()
+        started = time.monotonic()
+        with self.assertRaises(controller.ClosedFailure) as failure:
+            run_proof_transcript(stage, transcript, timeout=2.0)
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertEqual(failure.exception.stage, "provider-proof")
+        self.assertEqual(failure.exception.code, "command-failed")
+
+    def test_provider_proof_failure_checkpoints_are_closed_and_correlated(self) -> None:
+        for stage in controller.PROVIDER_PROOF_UI_STAGES:
+            for checkpoint in controller.PROVIDER_PROOF_UI_CHECKPOINTS:
+                with self.subTest(stage=stage, checkpoint=checkpoint):
+                    transcript = (
+                        f"KERNAID_PROVIDER_PROOF_BEGIN_V1_{stage}\r\n"
+                        "KERNAID_QEMU_PROVIDER_PROOF_FAILURE_V1 "
+                        f"stage={stage} checkpoint={checkpoint}\r\n"
+                        f"KERNAID_PROVIDER_PROOF_END_V1_{stage} rc=45\r\n"
+                    ).encode()
+                    with self.assertRaises(controller.ClosedFailure) as failure:
+                        run_proof_transcript(stage, transcript)
+                    self.assertEqual(failure.exception.stage, "provider-proof")
+                    self.assertEqual(
+                        failure.exception.code, f"{stage}-{checkpoint}"
+                    )
+
+    def test_provider_proof_rejects_malformed_conflicting_and_noisy_results(
+        self,
+    ) -> None:
+        stage = "ui-diagnose-unconfigured"
+        begin = f"KERNAID_PROVIDER_PROOF_BEGIN_V1_{stage}\r\n"
+        end = f"KERNAID_PROVIDER_PROOF_END_V1_{stage} rc=45\r\n"
+        invalid = {
+            "unknown-checkpoint": (
+                begin
+                + "KERNAID_QEMU_PROVIDER_PROOF_FAILURE_V1 "
+                f"stage={stage} checkpoint=future-check\r\n"
+                + end,
+                "marker-invalid",
+            ),
+            "wrong-stage": (
+                begin
+                + "KERNAID_QEMU_PROVIDER_PROOF_FAILURE_V1 "
+                "stage=ui-status-configured checkpoint=ui-identity\r\n"
+                + end,
+                "marker-invalid",
+            ),
+            "duplicate": (
+                begin
+                + f"KERNAID_QEMU_PROVIDER_PROOF_V1 stage={stage} result=true\r\n"
+                + f"KERNAID_QEMU_PROVIDER_PROOF_V1 stage={stage} result=true\r\n"
+                + f"KERNAID_PROVIDER_PROOF_END_V1_{stage} rc=0\r\n",
+                "output-invalid",
+            ),
+            "extra-output": (
+                begin
+                + f"KERNAID_QEMU_PROVIDER_PROOF_V1 stage={stage} result=true\r\n"
+                + "untrusted detail\r\n"
+                + f"KERNAID_PROVIDER_PROOF_END_V1_{stage} rc=0\r\n",
+                "output-invalid",
+            ),
+            "failure-with-zero": (
+                begin
+                + "KERNAID_QEMU_PROVIDER_PROOF_FAILURE_V1 "
+                f"stage={stage} checkpoint=ui-identity\r\n"
+                + f"KERNAID_PROVIDER_PROOF_END_V1_{stage} rc=0\r\n",
+                "command-failed",
+            ),
+            "success-with-failure-return": (
+                begin
+                + f"KERNAID_QEMU_PROVIDER_PROOF_V1 stage={stage} result=true\r\n"
+                + end,
+                "command-failed",
+            ),
+            "end-zero-without-marker": (
+                begin + f"KERNAID_PROVIDER_PROOF_END_V1_{stage} rc=0\r\n",
+                "marker-missing",
+            ),
+            "noncanonical-return": (
+                begin + f"KERNAID_PROVIDER_PROOF_END_V1_{stage} rc=00\r\n",
+                "return-code-invalid",
+            ),
+            "out-of-range-return": (
+                begin + f"KERNAID_PROVIDER_PROOF_END_V1_{stage} rc=999\r\n",
+                "return-code-invalid",
+            ),
+        }
+        for name, (transcript, expected_code) in invalid.items():
+            with self.subTest(name=name), self.assertRaises(
+                controller.ClosedFailure
+            ) as failure:
+                run_proof_transcript(stage, transcript.encode())
+            self.assertEqual(failure.exception.code, expected_code)
+
+    def test_provider_proof_requires_its_complete_local_budget_before_send(
+        self,
+    ) -> None:
+        class NoSendConsole:
+            def send(self, _value: bytes, *, deadline: float) -> None:
+                del deadline
+                raise AssertionError("proof sent before aggregate budget validation")
+
+        with self.assertRaises(controller.ClosedFailure) as failure:
+            controller.run_guest_proof(
+                NoSendConsole(),
+                "budget-proof",
+                b"raise SystemExit(0)",
+                0,
+                time.monotonic() + 24.0,
+                timeout=1.0,
+            )
+        self.assertEqual(
+            (failure.exception.stage, failure.exception.code),
+            ("provider-proof", "aggregate-budget"),
+        )
+
     def test_provider_guest_proofs_are_closed_bounded_and_role_separated(self) -> None:
         normal = controller._socket_probe_source(
             "normal-release",
@@ -2542,7 +2754,10 @@ class StaticContractTests(unittest.TestCase):
         status = controller._production_ui_relay_probe_source(
             "ui-status-configured"
         ).decode("ascii")
-        for source in (diagnose, status):
+        for stage, source in (
+            ("ui-diagnose-unconfigured", diagnose),
+            ("ui-status-configured", status),
+        ):
             self.assertIn('ENDPOINT="/api/rescue/provider/openai"', source)
             self.assertIn('HOST="127.0.0.1:4173"', source)
             self.assertIn('ORIGIN="http://127.0.0.1:4173"', source)
@@ -2563,6 +2778,19 @@ class StaticContractTests(unittest.TestCase):
             self.assertIn("object_pairs_hook=unique", source)
             self.assertIn("observed[:]=b\"\\0\"*len(observed)", source)
             self.assertIn("encoded=json.dumps(request", source)
+            self.assertIn("DEADLINE=time.monotonic()+BUDGET", source)
+            self.assertIn("timeout=remaining(3.0)", source)
+            self.assertIn("transport=connection.sock", source)
+            self.assertIn("transport.settimeout(remaining(TIMEOUT))", source)
+            self.assertIn("response.close()", source)
+            self.assertIn("transport.close()", source)
+            for checkpoint in controller.PROVIDER_PROOF_UI_CHECKPOINTS:
+                self.assertIn(f'checkpoint="{checkpoint}"', source)
+                self.assertIn(
+                    "KERNAID_QEMU_PROVIDER_PROOF_FAILURE_V1 "
+                    f"stage={stage} checkpoint={checkpoint}",
+                    source,
+                )
             self.assertNotIn("encoded=b'", source)
             self.assertNotIn('encoded=b"', source)
             self.assertNotIn("body=bytearray(b'", source)
@@ -2571,10 +2799,12 @@ class StaticContractTests(unittest.TestCase):
             compile(source.encode("ascii"), "<ui-relay-proof>", "exec", dont_inherit=True)
 
         self.assertIn("OPERATION='provider.openai.diagnose'", diagnose)
-        self.assertIn("TIMEOUT=143.0", diagnose)
+        self.assertIn("TIMEOUT=130.0", diagnose)
+        self.assertIn("BUDGET=140.0", diagnose)
         self.assertIn('error["code"]!="credential_unavailable"', diagnose)
         self.assertIn("OPERATION='provider.status'", status)
-        self.assertIn("TIMEOUT=6.0", status)
+        self.assertIn("TIMEOUT=5.0", status)
+        self.assertIn("BUDGET=10.0", status)
         self.assertIn(
             'status!={"provider":"openai","profile":"rescue-default",'
             '"vault":"unlocked","credential":"configured"}',
@@ -2596,6 +2826,82 @@ class StaticContractTests(unittest.TestCase):
             lifecycle.count('_production_ui_relay_probe_source("ui-status-configured")'),
             1,
         )
+
+    def test_ui_relay_exchange_reads_a_real_http10_connection_close_response(
+        self,
+    ) -> None:
+        source = controller._production_ui_relay_probe_source(
+            "ui-diagnose-unconfigured"
+        ).decode("ascii")
+        support, separator, _transaction = source.partition(
+            'try:\n    checkpoint="ui-identity"'
+        )
+        self.assertEqual(separator, 'try:\n    checkpoint="ui-identity"')
+        namespace: dict[str, object] = {}
+        exec(compile(support, "<ui-relay-support>", "exec"), namespace)
+
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener.settimeout(2.0)
+        port = listener.getsockname()[1]
+        server_errors: list[str] = []
+        response_body = b'{"ok":false}\n'
+
+        def serve_http10() -> None:
+            try:
+                connection, _address = listener.accept()
+                with connection:
+                    connection.settimeout(2.0)
+                    request = bytearray()
+                    while b"\r\n\r\n" not in request:
+                        chunk = connection.recv(4096)
+                        if not chunk:
+                            raise AssertionError("request headers truncated")
+                        request.extend(chunk)
+                        if len(request) > 128 * 1024:
+                            raise AssertionError("request oversized")
+                    headers, body = request.split(b"\r\n\r\n", 1)
+                    length_match = re.search(
+                        rb"(?:^|\r\n)Content-Length: ([0-9]+)(?:\r\n|$)",
+                        headers,
+                    )
+                    if length_match is None:
+                        raise AssertionError("content length missing")
+                    declared = int(length_match.group(1))
+                    while len(body) < declared:
+                        chunk = connection.recv(4096)
+                        if not chunk:
+                            raise AssertionError("request body truncated")
+                        body += chunk
+                    if len(body) != declared or not body.endswith(b"\n"):
+                        raise AssertionError("request body invalid")
+                    connection.sendall(
+                        b"HTTP/1.0 200 OK\r\n"
+                        b"Content-Type: application/json\r\n"
+                        b"Cache-Control: no-store\r\n"
+                        b"X-Content-Type-Options: nosniff\r\n"
+                        + f"Content-Length: {len(response_body)}\r\n".encode()
+                        + b"Connection: close\r\n\r\n"
+                        + response_body
+                    )
+            except BaseException as error:
+                server_errors.append(type(error).__name__)
+
+        server = threading.Thread(target=serve_http10)
+        server.start()
+        try:
+            namespace["PORT"] = port
+            namespace["TIMEOUT"] = 2.0
+            namespace["DEADLINE"] = time.monotonic() + 3.0
+            observed = namespace["exchange"]({"probe": "fixed"})
+            self.assertEqual(observed, {"ok": False})
+        finally:
+            server.join(3.0)
+            listener.close()
+        self.assertFalse(server.is_alive())
+        self.assertEqual(server_errors, [])
 
     def test_new_shell_is_syntactically_valid_and_scope_is_separate(self) -> None:
         subprocess.run(["bash", "-n", SCRIPT], check=True)

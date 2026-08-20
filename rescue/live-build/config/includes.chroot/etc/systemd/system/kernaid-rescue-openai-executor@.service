@@ -24,6 +24,10 @@ UMask=0077
 LimitCORE=0
 LimitNOFILE=16
 TasksMax=1
+# Keep systemd from bind-mounting the unit memory.pressure file into the
+# otherwise read-only cgroup2 view. The vault validates one exact cgroup2
+# mount before granting a provider lease.
+MemoryPressureWatch=no
 Delegate=pids
 DelegateSubgroup=agent
 KillMode=control-group

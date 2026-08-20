@@ -3126,6 +3126,7 @@ mod tests {
             b"36 25 0:28 / /other ro - cgroup2 cgroup2 rw\n",
             b"36 25 0:28 / /sys/fs/cgroup ro,rw - cgroup2 cgroup2 rw\n",
             b"36 25 0:28 / /sys/fs/cgroup ro - cgroup2 cgroup2 rw\n37 25 0:28 / /other ro - cgroup2 cgroup2 rw\n",
+            b"36 25 0:28 / /sys/fs/cgroup ro - cgroup2 cgroup2 rw\n37 36 0:28 /system.slice/kernaid-rescue-openai-executor@1.service/memory.pressure /sys/fs/cgroup/system.slice/kernaid-rescue-openai-executor@1.service/memory.pressure rw,nosuid,nodev,noexec - cgroup2 cgroup2 rw\n",
         ] {
             assert_eq!(
                 mountinfo_has_exact_cgroup2_access(invalid, device, false),
