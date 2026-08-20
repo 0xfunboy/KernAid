@@ -569,6 +569,11 @@ rescue_not_ready_observed() {
   LC_ALL=C grep -aq '^KERNAID_RESCUE_NOT_READY:' "$log"
 }
 
+hardware_inventory_ready_observed() {
+  LC_ALL=C tr -d '\r' <"$log" \
+    | grep -aE '^KERNAID_RESCUE_HARDWARE_INVENTORY_READY$' >/dev/null
+}
+
 # shellcheck disable=SC2329  # Invoked indirectly by the EXIT trap below.
 # This callback is reached indirectly through the EXIT trap below.
 # shellcheck disable=SC2317
@@ -831,7 +836,7 @@ while ((SECONDS < qemu_deadline)); do
     exit 1
   fi
   if grep -q "KERNAID_RESCUE_READY" "$log" \
-    && grep -aEq '^KERNAID_RESCUE_HARDWARE_INVENTORY_READY(\r)?$' "$log" \
+    && hardware_inventory_ready_observed \
     && grep -q "KERNAID_RESCUE_TARGET_SELECTION_READY" "$log" \
     && grep -q "KERNAID_RESCUE_OFFLINE_INSPECTION_READY" "$log" \
     && grep -q '^KERNAID_RESCUE_LINUX_SNAPSHOT_E2E_V1 semantic_sha256=' "$log"; then

@@ -1646,7 +1646,7 @@ class InstalledTargetTests(unittest.TestCase):
         self.assertIn("mkfs.ext4", qemu_smoke)
         self.assertIn(
             'grep -q "KERNAID_RESCUE_READY" "$log" \\\n'
-            "    && grep -aEq '^KERNAID_RESCUE_HARDWARE_INVENTORY_READY(\\r)?$' \"$log\" \\\n"
+            "    && hardware_inventory_ready_observed \\\n"
             '    && grep -q "KERNAID_RESCUE_TARGET_SELECTION_READY" "$log"',
             qemu_smoke,
         )

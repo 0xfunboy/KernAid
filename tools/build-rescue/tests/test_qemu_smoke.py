@@ -501,7 +501,11 @@ signal.signal(signal.SIGTERM, observe_term)
 if os.environ.get("KERNAID_MOCK_QEMU_NOT_READY") == "1":
     print("KERNAID_RESCUE_NOT_READY: private-reason=must-not-escape", flush=True)
 print("KERNAID_RESCUE_READY", flush=True)
-print("KERNAID_RESCUE_HARDWARE_INVENTORY_READY", flush=True)
+hardware_marker = "KERNAID_RESCUE_HARDWARE_INVENTORY_READY"
+sys.stdout.write(hardware_marker + "\r\n")
+if os.environ.get("KERNAID_MOCK_DUPLICATE_HARDWARE_MARKER") == "1":
+    sys.stdout.write(hardware_marker + "\r\n")
+sys.stdout.flush()
 print("KERNAID_RESCUE_TARGET_SELECTION_READY", flush=True)
 print("KERNAID_RESCUE_OFFLINE_INSPECTION_READY", flush=True)
 snapshot_marker = "KERNAID_RESCUE_LINUX_SNAPSHOT_E2E_V1 semantic_sha256=" + os.environ["KERNAID_MOCK_SNAPSHOT_DIGEST"]
@@ -513,7 +517,10 @@ time.sleep(30)
 '
             fi
             printf 'KERNAID_RESCUE_READY\n'
-            printf 'KERNAID_RESCUE_HARDWARE_INVENTORY_READY\n'
+            printf 'KERNAID_RESCUE_HARDWARE_INVENTORY_READY\r\n'
+            if [[ "${KERNAID_MOCK_DUPLICATE_HARDWARE_MARKER:-0}" == "1" ]]; then
+              printf 'KERNAID_RESCUE_HARDWARE_INVENTORY_READY\r\n'
+            fi
             printf 'KERNAID_RESCUE_TARGET_SELECTION_READY\n'
             printf 'KERNAID_RESCUE_OFFLINE_INSPECTION_READY\n'
             printf 'serial-prefix-without-line-feed'
@@ -540,9 +547,16 @@ class QemuSmokeFixturePrivilegeTests(unittest.TestCase):
         self.assertEqual(ready.count(emission), 1)
         self.assertLess(ready.index(validation), ready.index(emission))
         self.assertIn(
-            "grep -aEq '^KERNAID_RESCUE_HARDWARE_INVENTORY_READY(\\r)?$'",
+            "hardware_inventory_ready_observed() {",
             script,
         )
+        self.assertIn(
+            "LC_ALL=C tr -d '\\r' <\"$log\" \\\n"
+            "    | grep -aE '^KERNAID_RESCUE_HARDWARE_INVENTORY_READY$' "
+            ">/dev/null",
+            script,
+        )
+        self.assertIn("&& hardware_inventory_ready_observed \\", script)
         self.assertIn(
             "Rescue hardware inventory marker was not unique",
             script,
@@ -554,6 +568,33 @@ class QemuSmokeFixturePrivilegeTests(unittest.TestCase):
             re.MULTILINE,
         )
         self.assertEqual(markers, ["KERNAID_RESCUE_HARDWARE_INVENTORY_READY"])
+
+        matcher = (
+            "set -o pipefail; LC_ALL=C tr -d '\\r' | "
+            "grep -aE '^KERNAID_RESCUE_HARDWARE_INVENTORY_READY$' >/dev/null"
+        )
+        accepted = subprocess.run(
+            ["bash", "-c", matcher],
+            input=(
+                "KERNAID_RESCUE_HARDWARE_INVENTORY_READY\r\n"
+                + ("bounded-noise\n" * 131_072)
+            ),
+            text=True,
+            check=False,
+        )
+        self.assertEqual(accepted.returncode, 0)
+        for rejected_stream in (
+            "serial-prefixKERNAID_RESCUE_HARDWARE_INVENTORY_READY\r\n",
+            "KERNAID_RESCUE_HARDWARE_INVENTORY_READY-suffix\r\n",
+        ):
+            with self.subTest(rejected_stream=rejected_stream):
+                rejected = subprocess.run(
+                    ["bash", "-c", matcher],
+                    input=rejected_stream,
+                    text=True,
+                    check=False,
+                )
+                self.assertNotEqual(rejected.returncode, 0)
 
     def materialize_test_script(self, directory: Path, mocks: MockToolchain) -> Path:
         source = SCRIPT.read_text(encoding="utf-8")
@@ -607,6 +648,7 @@ class QemuSmokeFixturePrivilegeTests(unittest.TestCase):
         qemu_ignore_term: bool = False,
         qemu_not_ready: bool = False,
         snapshot_digest: str = SNAPSHOT_DIGEST,
+        duplicate_hardware_marker: bool = False,
         duplicate_snapshot_marker: bool = False,
         resident_snapshot_digest: str | None = SNAPSHOT_DIGEST,
     ) -> tuple[
@@ -659,6 +701,9 @@ class QemuSmokeFixturePrivilegeTests(unittest.TestCase):
                     "1" if qemu_not_ready else "0"
                 ),
                 "KERNAID_MOCK_SNAPSHOT_DIGEST": snapshot_digest,
+                "KERNAID_MOCK_DUPLICATE_HARDWARE_MARKER": (
+                    "1" if duplicate_hardware_marker else "0"
+                ),
                 "KERNAID_MOCK_DUPLICATE_SNAPSHOT_MARKER": (
                     "1" if duplicate_snapshot_marker else "0"
                 ),
@@ -1048,6 +1093,22 @@ class QemuSmokeFixturePrivilegeTests(unittest.TestCase):
                     (state / "qemu-pid").read_text(encoding="utf-8").strip()
                 )
                 self.assertFalse(Path(f"/proc/{qemu_pid}").exists())
+
+    def test_hardware_inventory_gate_rejects_duplicate_guest_markers(self) -> None:
+        result, log, state, temporary = self.run_smoke(
+            duplicate_hardware_marker=True
+        )
+        self.addCleanup(temporary.cleanup)
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(
+            "Rescue hardware inventory marker was not unique", result.stderr
+        )
+        self.assertNotIn(
+            "KERNAID_QEMU_ATTESTATION_V1", log.read_text(encoding="utf-8")
+        )
+        qemu_pid = int((state / "qemu-pid").read_text(encoding="utf-8").strip())
+        self.assertFalse(Path(f"/proc/{qemu_pid}").exists())
 
     def test_snapshot_gate_requires_the_runtime_resident_digest(self) -> None:
         for resident_digest, expected_error in (
