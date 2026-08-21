@@ -18,7 +18,7 @@ MAX_BINARY_BYTES = 128 * 1024 * 1024
 MAX_TOOL_OUTPUT_BYTES = 64 * 1024
 TOOL_TIMEOUT_SECONDS = 5
 EXPECTED_INTERPRETER = "/lib64/ld-linux-x86-64.so.2"
-ALLOWED_NEEDED = frozenset(
+MINIMAL_ALLOWED_NEEDED = frozenset(
     {
         "ld-linux-x86-64.so.2",
         "libc.so.6",
@@ -26,6 +26,34 @@ ALLOWED_NEEDED = frozenset(
         "libm.so.6",
     }
 )
+TAURI_WEBKIT_ALLOWED_NEEDED = frozenset(
+    {
+        *MINIMAL_ALLOWED_NEEDED,
+        "libcairo-gobject.so.2",
+        "libcairo.so.2",
+        "libdbus-1.so.3",
+        "libgdk-3.so.0",
+        "libgdk_pixbuf-2.0.so.0",
+        "libgio-2.0.so.0",
+        "libglib-2.0.so.0",
+        "libgobject-2.0.so.0",
+        "libgtk-3.so.0",
+        "libjavascriptcoregtk-4.1.so.0",
+        "libpango-1.0.so.0",
+        "libsoup-3.0.so.0",
+        "libwebkit2gtk-4.1.so.0",
+    }
+)
+PROFILES = {
+    "minimal": (
+        MINIMAL_ALLOWED_NEEDED,
+        frozenset({"libc.so.6"}),
+    ),
+    "tauri-webkit": (
+        TAURI_WEBKIT_ALLOWED_NEEDED,
+        TAURI_WEBKIT_ALLOWED_NEEDED,
+    ),
+}
 NEEDED_PATTERN = re.compile(r"\(NEEDED\).*Shared library: \[([^\[\]]+)\]")
 INTERPRETER_PATTERN = re.compile(r"Requesting program interpreter: ([^\[\]]+)\]")
 
@@ -101,7 +129,13 @@ def _readelf(binary_descriptor: int, readelf_descriptor: int) -> str:
             raise VerificationError("ELF inspection output is not ASCII") from error
 
 
-def parse_readelf_output(output: str) -> frozenset[str]:
+def parse_readelf_output(
+    output: str, profile: str = "minimal"
+) -> frozenset[str]:
+    try:
+        allowed_needed, required_needed = PROFILES[profile]
+    except KeyError as error:
+        raise VerificationError("shipping binary profile is unknown") from error
     if len(output.encode("ascii")) > MAX_TOOL_OUTPUT_BYTES:
         raise VerificationError("ELF inspection output exceeded its limit")
     if "(RPATH)" in output or "(RUNPATH)" in output:
@@ -119,15 +153,15 @@ def parse_readelf_output(output: str) -> frozenset[str]:
         if match is None:
             raise VerificationError("shipping binary has malformed dependency metadata")
         dependency = match.group(1)
-        if dependency not in ALLOWED_NEEDED:
+        if dependency not in allowed_needed:
             raise VerificationError("shipping binary has an unapproved runtime dependency")
         dependencies.add(dependency)
-    if "libc.so.6" not in dependencies:
-        raise VerificationError("shipping binary is missing its pinned libc dependency")
+    if not required_needed.issubset(dependencies):
+        raise VerificationError("shipping binary is missing a required runtime dependency")
     return frozenset(dependencies)
 
 
-def verify(path: Path) -> None:
+def verify(path: Path, profile: str = "minimal") -> None:
     binary_descriptor = _open_exact_regular(path, require_root_0755=True)
     try:
         metadata = os.fstat(binary_descriptor)
@@ -143,7 +177,9 @@ def verify(path: Path) -> None:
 
         readelf_descriptor = _open_exact_regular(READELF, require_root_0755=True)
         try:
-            parse_readelf_output(_readelf(binary_descriptor, readelf_descriptor))
+            parse_readelf_output(
+                _readelf(binary_descriptor, readelf_descriptor), profile
+            )
         finally:
             os.close(readelf_descriptor)
     finally:
@@ -151,11 +187,18 @@ def verify(path: Path) -> None:
 
 
 def main(arguments: list[str]) -> int:
-    if len(arguments) != 1:
-        print("usage: verify-shipping-binary.py BINARY", file=sys.stderr)
+    if len(arguments) == 1:
+        profile, binary = "minimal", arguments[0]
+    elif len(arguments) == 3 and arguments[:2] == ["--profile", "tauri-webkit"]:
+        profile, binary = arguments[1], arguments[2]
+    else:
+        print(
+            "usage: verify-shipping-binary.py [--profile tauri-webkit] BINARY",
+            file=sys.stderr,
+        )
         return 2
     try:
-        verify(Path(arguments[0]))
+        verify(Path(binary), profile)
     except VerificationError as error:
         print(f"Rescue shipping binary rejected: {error}", file=sys.stderr)
         return 2

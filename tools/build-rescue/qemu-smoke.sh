@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 firmware="${1:-bios}"
 iso="${2:-$repo_dir/KernAid-Rescue-amd64.iso}"
@@ -226,6 +227,14 @@ windows_fixture_mounted=0
 windows_fixture_cleanup_safe=1
 fixture_uid="$(/usr/bin/id -u)"
 fixture_gid="$(/usr/bin/id -g)"
+ui_smoke_dir="$($mktemp_command -d)"
+ui_smoke_dir_identity="$($stat_command -c '%d:%i:%u:%g:%a' -- "$ui_smoke_dir")"
+qmp_socket="$ui_smoke_dir/qmp.sock"
+if [[ -L "$ui_smoke_dir" || ! -d "$ui_smoke_dir" \
+  || "$ui_smoke_dir_identity" != *":$fixture_uid:$fixture_gid:700" ]]; then
+  echo "Disposable Tauri UI smoke directory is unsafe" >&2
+  exit 1
+fi
 
 verify_disposable_windows_fixture_mount() {
   local require_policy="${1:-yes}"
@@ -574,6 +583,46 @@ hardware_inventory_ready_observed() {
     | grep -aE '^KERNAID_RESCUE_HARDWARE_INVENTORY_READY$' >/dev/null
 }
 
+# shellcheck disable=SC2317,SC2329  # Invoked indirectly by the EXIT cleanup trap.
+cleanup_ui_smoke_directory() {
+  local path file_type owner_uid owner_gid hard_links
+  if [[ -L "$ui_smoke_dir" || ! -d "$ui_smoke_dir" \
+    || "$($stat_command -c '%d:%i:%u:%g:%a' -- "$ui_smoke_dir")" \
+      != "$ui_smoke_dir_identity" ]]; then
+    echo "Preserving a Tauri UI smoke directory whose identity changed" >&2
+    return 1
+  fi
+  for path in "$qmp_socket" "$ui_smoke_dir/before.ppm" "$ui_smoke_dir/after.ppm"; do
+    if [[ ! -e "$path" && ! -L "$path" ]]; then
+      continue
+    fi
+    if [[ -L "$path" ]]; then
+      echo "Preserving a symlink in the Tauri UI smoke directory" >&2
+      return 1
+    fi
+    IFS=: read -r file_type owner_uid owner_gid hard_links \
+      <<<"$(LC_ALL=C "$stat_command" -c '%F:%u:%g:%h' -- "$path")"
+    if [[ "$owner_uid" != "$fixture_uid" || "$owner_gid" != "$fixture_gid" \
+      || "$hard_links" != "1" ]]; then
+      echo "Preserving a Tauri UI smoke artifact whose identity is unsafe" >&2
+      return 1
+    fi
+    if [[ "$path" == "$qmp_socket" && "$file_type" != "socket" ]]; then
+      echo "Preserving a non-socket QMP path" >&2
+      return 1
+    fi
+    if [[ "$path" != "$qmp_socket" && "$file_type" != "regular file" ]]; then
+      echo "Preserving a non-regular Tauri UI screenshot" >&2
+      return 1
+    fi
+    rm -f -- "$path"
+  done
+  if ! rmdir -- "$ui_smoke_dir"; then
+    echo "Tauri UI smoke directory contained an unexpected entry" >&2
+    return 1
+  fi
+}
+
 # shellcheck disable=SC2329  # Invoked indirectly by the EXIT trap below.
 # This callback is reached indirectly through the EXIT trap below.
 # shellcheck disable=SC2317
@@ -617,6 +666,9 @@ cleanup() {
           cleanup_failed=1
         fi
       fi
+    fi
+    if ! cleanup_ui_smoke_directory; then
+      cleanup_failed=1
     fi
     rm -f "$target_image"
     rm -rf "$target_seed_dir"
@@ -735,7 +787,8 @@ qemu_args=(-machine accel=tcg -m 2048 -smp 2 -cdrom "$iso" \
   -drive "file=$windows_gpt_target_image,if=virtio,format=raw,cache=none" \
   -drive "file=$altered_windows_target_image,if=virtio,format=raw,cache=none" \
   -fw_cfg "name=opt/kernaid-offline-inspection,string=v1" \
-  -boot d -display none -serial stdio -no-reboot)
+  -qmp "unix:$qmp_socket,server=on,wait=off" \
+  -boot d -vga std -display none -serial stdio -no-reboot)
 if [[ "$firmware" == "uefi" ]]; then
   ovmf_code_4m="$ovmf_directory/OVMF_CODE_4M.fd"
   ovmf_vars_4m="$ovmf_directory/OVMF_VARS_4M.fd"
@@ -839,7 +892,21 @@ while ((SECONDS < qemu_deadline)); do
     && hardware_inventory_ready_observed \
     && grep -q "KERNAID_RESCUE_TARGET_SELECTION_READY" "$log" \
     && grep -q "KERNAID_RESCUE_OFFLINE_INSPECTION_READY" "$log" \
+    && grep -q '^KERNAID_RESCUE_TAURI_GUEST_V1 shell=shipping renderer=webkit2gtk-4[.]1 window=visible display=active-xorg ' "$log" \
     && grep -q '^KERNAID_RESCUE_LINUX_SNAPSHOT_E2E_V1 semantic_sha256=' "$log"; then
+    tauri_ui_attestation="$(
+      /usr/bin/python3 -I -B "$repo_dir/tools/build-rescue/qemu-tauri-ui-smoke.py" \
+        --socket "$qmp_socket" --work-dir "$ui_smoke_dir" --firmware "$firmware"
+    )" || {
+      echo "QEMU Tauri UI render/input gate failed closed" >&2
+      exit 1
+    }
+    if [[ ! "$tauri_ui_attestation" =~ ^KERNAID_QEMU_TAURI_UI_ATTESTATION_V1\ firmware=(bios|uefi)\ shell=shipping\ renderer=webkit2gtk-4\.1\ display=default\ rendered=true\ input=true\ width=[1-9][0-9]{2,3}\ height=[1-9][0-9]{2,3}\ changed_pixels=[1-9][0-9]*$ \
+      || "${BASH_REMATCH[1]}" != "$firmware" ]]; then
+      echo "QEMU Tauri UI attestation was outside the sanitized allowlist" >&2
+      exit 1
+    fi
+    printf '%s\n' "$tauri_ui_attestation" | tee -a "$log"
     if ! terminate_qemu_bounded; then
       echo "QEMU could not be stopped before target-image validation" >&2
       exit 1
@@ -896,7 +963,7 @@ while ((SECONDS < qemu_deadline)); do
     printf '%s\n' \
       "KERNAID_QEMU_OFFLINE_INSPECTION_ATTESTATION_V1 firmware=$firmware linux_before_sha256=$target_hash_before linux_after_sha256=$target_hash_after windows_gpt_before_sha256=$windows_gpt_target_hash_before windows_gpt_after_sha256=$windows_gpt_target_hash_after windows_altered_before_sha256=$altered_windows_target_hash_before windows_altered_after_sha256=$altered_windows_target_hash_after ready=true" \
       | tee -a "$log"
-    echo "PASS: KernAid Rescue booted with $firmware firmware, inspected Linux ext4, a same-disk GPT Windows NTFS plus ESP fixture, and an altered NTFS fixture read-only with zero target-image writes"
+    echo "PASS: KernAid Rescue booted its Tauri/WebKit UI with rendered keyboard interaction under $firmware firmware, inspected Linux ext4, a same-disk GPT Windows NTFS plus ESP fixture, and an altered NTFS fixture read-only with zero target-image writes"
     exit 0
   fi
   qemu_runtime_status="$(qemu_process_status)"

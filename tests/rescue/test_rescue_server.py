@@ -936,6 +936,18 @@ class ObserveBrokerTests(unittest.TestCase):
             response = connection.getresponse()
             self.assertEqual(response.status, 429)
             self.assertEqual(response.getheader("Retry-After"), "1")
+            self.assertEqual(
+                response.getheader("Content-Security-Policy"),
+                rescue_server.CONTENT_SECURITY_POLICY,
+            )
+            self.assertEqual(response.getheader("X-Frame-Options"), "DENY")
+            self.assertEqual(response.getheader("Referrer-Policy"), "no-referrer")
+            self.assertEqual(
+                response.getheader("Cross-Origin-Opener-Policy"), "same-origin"
+            )
+            self.assertEqual(
+                response.getheader("Cross-Origin-Resource-Policy"), "same-origin"
+            )
             connection.close()
 
     def test_slow_request_body_is_timed_out(self) -> None:

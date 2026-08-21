@@ -460,15 +460,47 @@ interface NativeSignedArtifact {
   envelopeSchema: typeof SIGNED_REPORT_SCHEMA;
 }
 
-export function isNative(): boolean {
+export function hasTauriBridge(): boolean {
   return "__TAURI_INTERNALS__" in window;
 }
 
-export function hasLocalCollector(): boolean {
+export function isRescueHttpOrigin(): boolean {
   return (
-    isNative() ||
-    (location.hostname === "127.0.0.1" && location.port === "4173")
+    location.protocol === "http:" &&
+    location.hostname === "127.0.0.1" &&
+    location.port === "4173"
   );
+}
+
+export function isNative(): boolean {
+  return hasTauriBridge() && !isRescueHttpOrigin();
+}
+
+export function hasLocalCollector(): boolean {
+  return isNative() || isRescueHttpOrigin();
+}
+
+/**
+ * A Rescue web bundle can run inside the minimal Tauri/WebKit shell, but its
+ * loopback HTTP origin must never inherit Resident IPC.  The shipping Rescue
+ * shell registers no commands and configures no remote capability; this
+ * runtime probe makes an accidental future widening fail closed in the UI.
+ */
+export async function verifyRescueTauriIpcIsolation(
+  nativeInvoke: NativeInvoke = invoke,
+): Promise<void> {
+  if (!hasTauriBridge() || !isRescueHttpOrigin()) return;
+  let residentCommandExposed = false;
+  try {
+    await nativeInvoke("secure_runtime_status");
+    residentCommandExposed = true;
+  } catch {
+    // Expected: Tauri rejects the remote origin before command dispatch.
+  }
+  if (residentCommandExposed)
+    throw new Error(
+      "Il confine IPC Rescue non e sicuro; il runtime resta bloccato.",
+    );
 }
 
 export async function collectLocalInventory(): Promise<NativeObservation[]> {

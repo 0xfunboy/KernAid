@@ -1,0 +1,44 @@
+[Unit]
+Description=KernAid Rescue Tauri desktop shell
+Requires=kernaid-ui.service live-config.service
+After=kernaid-ui.service live-config.service display-manager.service
+Wants=display-manager.service
+Before=kernaid-ready.service
+ConditionKernelCommandLine=boot=live
+StartLimitIntervalSec=120s
+StartLimitBurst=30
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/kernaid-rescue-desk-shell
+Restart=on-failure
+RestartSec=1s
+User=kernaid
+Group=kernaid
+Environment=HOME=/home/kernaid
+Environment=USER=kernaid
+Environment=LOGNAME=kernaid
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/kernaid/.Xauthority
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+Environment=GDK_BACKEND=x11
+UMask=0077
+LimitCORE=0
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectClock=yes
+ProtectHostname=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=graphical.target

@@ -72,6 +72,19 @@ TARGET_SCAN_API_VERSION = "kernaid.dev/rescue-targets/v1alpha1"
 RESCUE_TARGET_FINGERPRINT_DOMAIN = "kernaid-rescue-observe-target-v1"
 ALLOWED_HOSTS = {"127.0.0.1:4173", "localhost:4173"}
 ALLOWED_ORIGINS = {"http://127.0.0.1:4173", "http://localhost:4173"}
+CONTENT_SECURITY_POLICY = (
+    "default-src 'none'; "
+    "script-src 'self'; "
+    "style-src 'self'; "
+    "img-src 'self' data:; "
+    "font-src 'self'; "
+    "connect-src 'self'; "
+    "manifest-src 'self'; "
+    "base-uri 'none'; "
+    "form-action 'none'; "
+    "frame-ancestors 'none'; "
+    "object-src 'none'"
+)
 TARGET_ID_KEY_FILE = "/run/kernaid-offline-inspector/target-id.key"
 PROVIDER_RELAY_LOCK = threading.Lock()
 
@@ -1758,6 +1771,23 @@ class RescueHandler(SimpleHTTPRequestHandler):
             "same-origin",
         }
 
+    def end_headers(self) -> None:
+        # These headers protect both the immutable Desk bundle and API error
+        # responses.  The Tauri shell loads this exact loopback origin without
+        # granting it any native capability.
+        self.send_header("Content-Security-Policy", CONTENT_SECURITY_POLICY)
+        self.send_header("Cross-Origin-Opener-Policy", "same-origin")
+        self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+        self.send_header(
+            "Permissions-Policy",
+            "accelerometer=(), camera=(), geolocation=(), gyroscope=(), "
+            "microphone=(), payment=(), usb=()",
+        )
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        super().end_headers()
+
     def do_GET(self) -> None:
         if not self.local_authority():
             self.send_error(421)
@@ -1775,7 +1805,6 @@ class RescueHandler(SimpleHTTPRequestHandler):
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Cache-Control", "no-store")
-            self.send_header("X-Content-Type-Options", "nosniff")
             if status == 429:
                 self.send_header("Retry-After", "1")
             self.send_header("Content-Length", str(len(body)))
@@ -1805,7 +1834,6 @@ class RescueHandler(SimpleHTTPRequestHandler):
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Cache-Control", "no-store")
-            self.send_header("X-Content-Type-Options", "nosniff")
             if status == 429:
                 self.send_header("Retry-After", "1")
             self.send_header("Content-Length", str(len(body)))
@@ -1990,7 +2018,6 @@ class RescueHandler(SimpleHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Content-Type-Options", "nosniff")
         if status == 429:
             self.send_header("Retry-After", "1")
         self.send_header("Content-Length", str(len(body)))

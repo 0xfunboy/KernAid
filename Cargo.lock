@@ -2403,6 +2403,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "kernaid-rescue-desk-shell"
+version = "0.1.0"
+dependencies = [
+ "tauri",
+ "tauri-build",
+]
+
+[[package]]
 name = "kernaid-rescue-openai-executor"
 version = "0.1.0"
 dependencies = [

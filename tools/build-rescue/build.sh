@@ -17,6 +17,8 @@ openai_executor_destination="$build_dir/config/includes.chroot/usr/lib/kernaid/k
 codex_bridge_destination="$build_dir/config/includes.chroot/usr/lib/kernaid/kernaid-rescue-codex"
 codex_client_destination="$build_dir/config/includes.chroot/usr/bin/kernaid-codex-auth"
 codex_cli_destination="$build_dir/config/includes.chroot/usr/lib/kernaid/codex"
+desk_shell_binary="${KERNAID_RESCUE_DESK_SHELL_BINARY:-$repo_dir/target/release/kernaid-rescue-desk-shell}"
+desk_shell_destination="$build_dir/config/includes.chroot/usr/bin/kernaid-rescue-desk-shell"
 vaultd_destination_dir="$(dirname "$vaultd_destination")"
 vaultctl_destination_dir="$(dirname "$vaultctl_destination")"
 vaultctl_destination_dir_created=0
@@ -57,6 +59,7 @@ validate_amd64_elf "$openai_executor_binary" "Rescue OpenAI executor"
 validate_amd64_elf "$hardware_inventory_binary" "Linux hardware inventory collector"
 validate_amd64_elf "$codex_bridge_binary" "Rescue Codex bridge"
 validate_amd64_elf "$codex_client_binary" "Rescue Codex client"
+validate_amd64_elf "$desk_shell_binary" "Rescue Tauri Desk shell"
 
 python3 -I - "$repo_dir/tools/build-rescue/verify-codex-cli.py" \
   "$repo_dir/rescue/codex/codex-cli.lock.json" "$codex_cli_binary" <<'PY'
@@ -86,7 +89,8 @@ for destination in \
   "$hardware_inventory_destination" \
   "$codex_bridge_destination" \
   "$codex_client_destination" \
-  "$codex_cli_destination"; do
+  "$codex_cli_destination" \
+  "$desk_shell_destination"; do
   if [[ -e "$destination" || -L "$destination" ]]; then
     echo "Refusing to overwrite a pre-existing staged Rescue binary: $destination" >&2
     exit 2
@@ -115,7 +119,8 @@ cleanup_staged_binaries() {
     "$hardware_inventory_destination" \
     "$codex_bridge_destination" \
     "$codex_client_destination" \
-    "$codex_cli_destination"
+    "$codex_cli_destination" \
+    "$desk_shell_destination"
   if [[ "$vaultctl_destination_dir_created" = "1" ]]; then
     rmdir -- "$vaultctl_destination_dir"
   fi
@@ -129,6 +134,7 @@ install -o root -g root -m 0755 "$hardware_inventory_binary" "$hardware_inventor
 install -o root -g root -m 0755 "$codex_bridge_binary" "$codex_bridge_destination"
 install -o root -g root -m 0755 "$codex_client_binary" "$codex_client_destination"
 install -o root -g root -m 0755 "$codex_cli_binary" "$codex_cli_destination"
+install -o root -g root -m 0755 "$desk_shell_binary" "$desk_shell_destination"
 for destination in \
   "$vaultd_destination" \
   "$vaultctl_destination" \
@@ -136,7 +142,8 @@ for destination in \
   "$hardware_inventory_destination" \
   "$codex_bridge_destination" \
   "$codex_client_destination" \
-  "$codex_cli_destination"; do
+  "$codex_cli_destination" \
+  "$desk_shell_destination"; do
   test "$(stat -c '%u:%g:%a' "$destination")" = "0:0:755"
 done
 python3 -I "$repo_dir/tools/build-rescue/verify-shipping-binary.py" "$vaultd_destination"
@@ -165,6 +172,8 @@ try:
 finally:
     os.close(descriptor)
 PY
+python3 -I "$repo_dir/tools/build-rescue/verify-shipping-binary.py" \
+  --profile tauri-webkit "$desk_shell_destination"
 
 cd "$repo_dir"
 if [[ "${KERNAID_DESK_PREBUILT:-0}" != "1" ]]; then

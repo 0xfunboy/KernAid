@@ -225,6 +225,7 @@ class VaultSystemdPackagingTests(unittest.TestCase):
             {
                 "kernaid-ui.service",
                 "kernaid-rescue-codex.socket",
+                "kernaid-rescue-desk-shell.service",
                 "kernaid-rescue-openai-egress.socket",
                 "kernaid-rescue-vaultd.service",
             },
@@ -236,6 +237,7 @@ class VaultSystemdPackagingTests(unittest.TestCase):
                 "multi-user.target",
                 "kernaid-ui.service",
                 "kernaid-rescue-codex.socket",
+                "kernaid-rescue-desk-shell.service",
                 "kernaid-rescue-openai-egress.socket",
                 "kernaid-rescue-vaultd.service",
             },
@@ -496,11 +498,16 @@ class VaultLivePolicyTests(unittest.TestCase):
             "config/includes.chroot/usr/lib/kernaid/kernaid-linux-hardware-inventory",
             build,
         )
+        self.assertIn("KERNAID_RESCUE_DESK_SHELL_BINARY", build)
+        self.assertIn(
+            "config/includes.chroot/usr/bin/kernaid-rescue-desk-shell", build
+        )
         self.assertIn("validate_amd64_elf", build)
         self.assertGreaterEqual(build.count("install -o root -g root -m 0755"), 2)
         self.assertIn("trap cleanup_staged_binaries EXIT", build)
         self.assertIn('rmdir -- "$vaultctl_destination_dir"', build)
-        self.assertEqual(build.count("verify-shipping-binary.py"), 6)
+        self.assertEqual(build.count("verify-shipping-binary.py"), 7)
+        self.assertIn("--profile tauri-webkit", build)
         self.assertNotIn("cargo build", build)
 
     def test_shipping_binary_dependency_parser_is_closed_and_rejects_runpath(self) -> None:
@@ -533,6 +540,8 @@ class VaultLivePolicyTests(unittest.TestCase):
         self.assertIn("--bin kernaid-rescue-vaultctl", workflow)
         self.assertIn("--bin kernaid-rescue-openai-executor", workflow)
         self.assertIn("--bin kernaid-linux-hardware-inventory", workflow)
+        self.assertIn("--bin kernaid-rescue-desk-shell", workflow)
+        self.assertIn("-p kernaid-rescue-desk-shell", workflow)
         self.assertIn(
             "KERNAID_RESCUE_VAULTD_BINARY=/workspace/target/release/kernaid-rescue-vaultd",
             workflow,
@@ -549,6 +558,10 @@ class VaultLivePolicyTests(unittest.TestCase):
             "KERNAID_LINUX_HARDWARE_INVENTORY_BINARY=/workspace/target/release/kernaid-linux-hardware-inventory",
             workflow,
         )
+        self.assertIn(
+            "KERNAID_RESCUE_DESK_SHELL_BINARY=/workspace/target/release/kernaid-rescue-desk-shell",
+            workflow,
+        )
         self.assertIn("apt-get install -y binutils live-build", workflow)
         self.assertIn("Verify the in-guest Rescue binary ABI", workflow)
         self.assertIn(
@@ -557,7 +570,8 @@ class VaultLivePolicyTests(unittest.TestCase):
         )
         self.assertNotIn("$RUNNER_TEMP/kernaid-rescue-shipping-preflight", workflow)
         self.assertIn("sudo install -o root -g root -m 0755", workflow)
-        self.assertEqual(workflow.count("verify-shipping-binary.py"), 6)
+        self.assertEqual(workflow.count("verify-shipping-binary.py"), 7)
+        self.assertIn("--profile tauri-webkit", workflow)
         self.assertIn("qemu-vault-lifecycle-smoke.sh", workflow)
 
 

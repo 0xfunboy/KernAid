@@ -17,14 +17,17 @@ chmod 0755 \
 chown root:root \
     /usr/lib/kernaid/offline_inspector.py \
     /usr/lib/kernaid/ready-check \
-    /usr/lib/kernaid/rescue_server.py
+    /usr/lib/kernaid/rescue_server.py \
+    /usr/lib/kernaid/tauri_ui_ready_check.py
 chmod 0644 \
     /usr/lib/kernaid/offline_inspector.py \
     /usr/lib/kernaid/ready-check \
-    /usr/lib/kernaid/rescue_server.py
+    /usr/lib/kernaid/rescue_server.py \
+    /usr/lib/kernaid/tauri_ui_ready_check.py
 chown root:root \
     /usr/lib/kernaid/codex \
     /usr/lib/kernaid/kernaid-rescue-codex \
+    /usr/bin/kernaid-rescue-desk-shell \
     /usr/lib/kernaid/kernaid-rescue-openai-executor \
     /usr/lib/kernaid/kernaid-rescue-vaultd \
     /usr/bin/kernaid-codex-auth \
@@ -33,6 +36,7 @@ test -x /usr/lib/systemd/systemd-socket-proxyd
 chmod 0755 \
     /usr/lib/kernaid/codex \
     /usr/lib/kernaid/kernaid-rescue-codex \
+    /usr/bin/kernaid-rescue-desk-shell \
     /usr/lib/kernaid/kernaid-rescue-openai-executor \
     /usr/lib/kernaid/kernaid-rescue-vaultd \
     /usr/bin/kernaid-codex-auth \
@@ -53,6 +57,7 @@ chown root:root \
     /etc/systemd/system/kernaid-rescue-openai-executor@.service \
     /etc/systemd/system/kernaid-rescue-codex.socket \
     /etc/systemd/system/kernaid-rescue-codex@.service \
+    /etc/systemd/system/kernaid-rescue-desk-shell.service \
     /etc/systemd/system/kernaid-rescue-vaultd.service \
     /etc/systemd/system/kernaid-rescue-vaultd.socket \
     /etc/systemd/system/kernaid-ready.service \
@@ -77,6 +82,7 @@ chmod 0644 \
     /etc/systemd/system/kernaid-rescue-openai-executor@.service \
     /etc/systemd/system/kernaid-rescue-codex.socket \
     /etc/systemd/system/kernaid-rescue-codex@.service \
+    /etc/systemd/system/kernaid-rescue-desk-shell.service \
     /etc/systemd/system/kernaid-rescue-vaultd.service \
     /etc/systemd/system/kernaid-rescue-vaultd.socket \
     /etc/systemd/system/kernaid-ready.service \
@@ -101,6 +107,7 @@ done
 
 systemctl enable kernaid-ready.service
 systemctl enable kernaid-ui.service
+systemctl enable kernaid-rescue-desk-shell.service
 systemctl enable kernaid-offline-inspector.socket
 systemctl enable kernaid-rescue-openai-egress.socket
 systemctl enable kernaid-rescue-openai-executor.socket

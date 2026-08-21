@@ -35,6 +35,7 @@ import {
   rescueOfflineCorpusJson,
   rescueOfflineEvidenceSummary,
   logoutResidentOpenAi,
+  verifyRescueTauriIpcIsolation,
   LINUX_NORMALIZED_SNAPSHOT_COLLECTOR,
   RESCUE_OFFLINE_EVIDENCE_COLLECTOR,
   RESCUE_OFFLINE_EVIDENCE_TARGET,
@@ -135,9 +136,18 @@ function App() {
     let cancelled = false;
     async function startRuntime() {
       if (!isNative()) {
-        if (!cancelled) {
-          setDriver(createDriver());
-          setRuntimeReady(true);
+        try {
+          await verifyRescueTauriIpcIsolation();
+          if (!cancelled) setDriver(createDriver());
+        } catch {
+          if (!cancelled) {
+            setDriver(undefined);
+            setStatus(
+              "Confine IPC Rescue non sicuro; riavviare KernAid da un supporto verificato.",
+            );
+          }
+        } finally {
+          if (!cancelled) setRuntimeReady(true);
         }
         return;
       }

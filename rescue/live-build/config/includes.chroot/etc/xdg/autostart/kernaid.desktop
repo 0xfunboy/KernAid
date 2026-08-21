@@ -1,7 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=KernAid Desk
-Comment=Diagnose. Repair. Verify.
-Exec=chromium --no-first-run --disable-sync --app=http://127.0.0.1:4173/
-Terminal=false
-X-GNOME-Autostart-enabled=true

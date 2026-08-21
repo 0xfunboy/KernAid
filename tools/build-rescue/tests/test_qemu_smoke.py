@@ -280,11 +280,31 @@ class MockToolchain:
         self.bin = directory / "bin"
         self.state = directory / "state"
         self.ovmf = directory / "ovmf"
+        self.qmp_helper = directory / "qemu-tauri-ui-smoke.py"
         self.bin.mkdir()
         self.state.mkdir()
         self.ovmf.mkdir()
         (self.ovmf / "OVMF_CODE_4M.fd").write_bytes(b"mock OVMF 4M code")
         (self.ovmf / "OVMF_VARS_4M.fd").write_bytes(b"mock OVMF 4M vars")
+        executable(
+            self.qmp_helper,
+            """
+            #!/usr/bin/python3
+            import argparse
+
+            parser = argparse.ArgumentParser()
+            parser.add_argument("--socket", required=True)
+            parser.add_argument("--work-dir", required=True)
+            parser.add_argument("--firmware", required=True, choices=("bios", "uefi"))
+            options = parser.parse_args()
+            print(
+                "KERNAID_QEMU_TAURI_UI_ATTESTATION_V1 "
+                f"firmware={options.firmware} shell=shipping "
+                "renderer=webkit2gtk-4.1 display=default rendered=true input=true "
+                "width=1024 height=768 changed_pixels=128"
+            )
+            """,
+        )
         self._install()
 
     def _tool(self, name: str, source: str) -> None:
@@ -508,6 +528,7 @@ if os.environ.get("KERNAID_MOCK_DUPLICATE_HARDWARE_MARKER") == "1":
 sys.stdout.flush()
 print("KERNAID_RESCUE_TARGET_SELECTION_READY", flush=True)
 print("KERNAID_RESCUE_OFFLINE_INSPECTION_READY", flush=True)
+print("KERNAID_RESCUE_TAURI_GUEST_V1 shell=shipping renderer=webkit2gtk-4.1 window=visible display=active-xorg width=1024 height=768", flush=True)
 snapshot_marker = "KERNAID_RESCUE_LINUX_SNAPSHOT_E2E_V1 semantic_sha256=" + os.environ["KERNAID_MOCK_SNAPSHOT_DIGEST"]
 sys.stdout.write("serial-prefix-without-line-feed")
 print("\n" + snapshot_marker, flush=True)
@@ -523,6 +544,7 @@ time.sleep(30)
             fi
             printf 'KERNAID_RESCUE_TARGET_SELECTION_READY\n'
             printf 'KERNAID_RESCUE_OFFLINE_INSPECTION_READY\n'
+            printf 'KERNAID_RESCUE_TAURI_GUEST_V1 shell=shipping renderer=webkit2gtk-4.1 window=visible display=active-xorg width=1024 height=768\n'
             printf 'serial-prefix-without-line-feed'
             printf '\nKERNAID_RESCUE_LINUX_SNAPSHOT_E2E_V1 semantic_sha256=%s\n' \
               "$KERNAID_MOCK_SNAPSHOT_DIGEST"
@@ -619,6 +641,9 @@ class QemuSmokeFixturePrivilegeTests(unittest.TestCase):
             ),
             'stat_command="/usr/bin/stat"': f'stat_command="{mocks.bin / "stat"}"',
             'ovmf_directory="/usr/share/OVMF"': f'ovmf_directory="{mocks.ovmf}"',
+            '"$repo_dir/tools/build-rescue/qemu-tauri-ui-smoke.py"': (
+                f'"{mocks.qmp_helper}"'
+            ),
         }
         for fixed, test_only in replacements.items():
             self.assertEqual(source.count(fixed), 1, fixed)

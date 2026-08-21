@@ -169,8 +169,8 @@ The supported workshop procedure in this section is Resident-only. Rescue
 contains feature-gated persistent-vault OpenAI plumbing and a loopback
 UI-server relay, but an exact revision is virtually qualified only after both
 privileged BIOS and UEFI lifecycle jobs pass. The active physical writer v1
-does not create that vault, and Chromium rendering, live provider TLS with a
-real account, and physical media are not qualified; do not present Rescue
+does not create that vault, and live provider TLS with a real account and
+physical media are not qualified; do not present Rescue
 OpenAI as supported on customer media yet. The Resident credential companion
 is not included in the desktop installer and is not added to `PATH`. From the
 same successful Desktop workflow run, download and extract
@@ -250,9 +250,13 @@ customer authorization and applicable data-processing requirements first.
 
 ## Troubleshooting the Rescue environment
 
-- If the UI does not open, browse to `http://127.0.0.1:4173/` from Chromium
-  inside the live desktop. This is a troubleshooting step, not browser-renderer
-  qualification.
+- If the UI does not open, do not install or launch a browser fallback. From the
+  live console check `systemctl status kernaid-ui.service`, then
+  `systemctl status kernaid-rescue-desk-shell.service`. The latter is the
+  unprivileged, restart-bounded owner of
+  `/usr/bin/kernaid-rescue-desk-shell`; there is no desktop-file or browser
+  fallback. Rescue readiness fails closed unless that shell, its WebKit
+  renderer and its visible window are all present.
 - If the page opens but Rescue observations or the target selector do not
   appear, check `systemctl status kernaid-ui.service` from the live console.
 - If firmware does not list the USB, rewrite it in raw/DD mode and retry another port. Secure Boot support is not yet claimed.

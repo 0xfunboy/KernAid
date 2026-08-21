@@ -12,7 +12,8 @@ lightdm
 network-manager
 network-manager-gnome
 iproute2
-chromium
+libwebkit2gtk-4.1-0
+xdotool
 python3-minimal
 ca-certificates
 curl

@@ -79,8 +79,11 @@ local UI service and API to become ready, and verifies that each complete target
 image is byte-identical before and after boot. A separate privileged two-boot
 lifecycle qualifies an exact revision only when both BIOS and UEFI jobs pass;
 it exercises the shipping Python UI server's strict same-origin HTTP-to-AF_UNIX
-provider relay with provider networking disabled. It does not exercise Chromium
-rendering, live provider TLS, a real account, Secure Boot, or physical media.
+provider relay with provider networking disabled. The ordinary BIOS and UEFI
+smoke now also requires the shipping Tauri/WebKitGTK shell process, a descendant
+renderer, a visible branded framebuffer, and a real keyboard event that changes
+that framebuffer; raw screenshots are never published. It does not exercise live
+provider TLS, a real account, Secure Boot, or physical media.
 
 ## Trust boundaries
 

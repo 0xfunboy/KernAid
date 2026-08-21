@@ -138,6 +138,8 @@ jobs:
           python3 -I -B -c 'from pathlib import Path; path = Path("tools/test-linux-snapshot/tree_fingerprint.py"); compile(path.read_bytes(), str(path), "exec", dont_inherit=True)'
           python3 -I -B -c 'from pathlib import Path; path = Path("tools/build-rescue/qemu-vault-lifecycle-pty.py"); compile(path.read_bytes(), str(path), "exec", dont_inherit=True)'
           python3 -I -B -c 'from pathlib import Path; path = Path("tools/build-rescue/provider-lease-probe.py"); compile(path.read_bytes(), str(path), "exec", dont_inherit=True)'
+          python3 -I -B -c 'from pathlib import Path; path = Path("tools/build-rescue/qemu-tauri-ui-smoke.py"); compile(path.read_bytes(), str(path), "exec", dont_inherit=True)'
+          python3 -I -B -c 'from pathlib import Path; path = Path("rescue/live-build/config/includes.chroot/usr/lib/kernaid/tauri_ui_ready_check.py"); compile(path.read_bytes(), str(path), "exec", dont_inherit=True)'
       - name: Exercise Resident snapshot through Tauri IPC in a rootless chroot
         shell: bash
         run: |
@@ -163,7 +165,7 @@ jobs:
           path: target/release/kernaid-rescue-vault-probe
           if-no-files-found: error
           retention-days: 1
-      - name: Build the in-guest Rescue vault lifecycle binaries
+      - name: Build the in-guest Rescue shipping binaries
         run: |
           cargo fmt -p kernaid-rescue-openai-executor -- --check
           cargo clippy --locked -p kernaid-rescue-openai-executor --all-targets -- -D warnings
@@ -182,6 +184,13 @@ jobs:
           cargo build --locked --release -p kernaid-rescue-codex-bridge \
             --bin kernaid-rescue-codex \
             --bin kernaid-codex-auth
+          cargo fmt -p kernaid-rescue-desk-shell -- --check
+          cargo clippy --locked -p kernaid-rescue-desk-shell \
+            --all-targets -- -D warnings
+          cargo test --locked -p kernaid-rescue-desk-shell \
+            --all-targets
+          cargo build --locked --release -p kernaid-rescue-desk-shell \
+            --bin kernaid-rescue-desk-shell
       - name: Verify the in-guest Rescue binary ABI
         run: |
           preflight_dir="$(sudo /usr/bin/mktemp -d /root/kernaid-rescue-shipping-preflight.XXXXXXXX)"
@@ -192,6 +201,7 @@ jobs:
             sudo unlink -- "$preflight_dir/kernaid-linux-hardware-inventory" 2>/dev/null || true
             sudo unlink -- "$preflight_dir/kernaid-rescue-codex" 2>/dev/null || true
             sudo unlink -- "$preflight_dir/kernaid-codex-auth" 2>/dev/null || true
+            sudo unlink -- "$preflight_dir/kernaid-rescue-desk-shell" 2>/dev/null || true
             sudo rmdir -- "$preflight_dir" 2>/dev/null || true
           }
           trap cleanup_preflight EXIT
@@ -217,6 +227,9 @@ jobs:
           sudo install -o root -g root -m 0755 \
             target/release/kernaid-codex-auth \
             "$preflight_dir/kernaid-codex-auth"
+          sudo install -o root -g root -m 0755 \
+            target/release/kernaid-rescue-desk-shell \
+            "$preflight_dir/kernaid-rescue-desk-shell"
           sudo /usr/bin/python3 -I tools/build-rescue/verify-shipping-binary.py \
             "$preflight_dir/kernaid-rescue-vaultd"
           sudo /usr/bin/python3 -I tools/build-rescue/verify-shipping-binary.py \
@@ -229,6 +242,8 @@ jobs:
             "$preflight_dir/kernaid-rescue-codex"
           sudo /usr/bin/python3 -I tools/build-rescue/verify-shipping-binary.py \
             "$preflight_dir/kernaid-codex-auth"
+          sudo /usr/bin/python3 -I tools/build-rescue/verify-shipping-binary.py \
+            --profile tauri-webkit "$preflight_dir/kernaid-rescue-desk-shell"
       - name: Build hybrid BIOS and UEFI ISO
         run: |
           docker run --rm --privileged \
@@ -240,6 +255,7 @@ jobs:
             -e KERNAID_RESCUE_CODEX_BRIDGE_BINARY=/workspace/target/release/kernaid-rescue-codex \
             -e KERNAID_RESCUE_CODEX_CLIENT_BINARY=/workspace/target/release/kernaid-codex-auth \
             -e KERNAID_RESCUE_CODEX_CLI_BINARY=/opt/kernaid-codex-root/usr/lib/kernaid/codex \
+            -e KERNAID_RESCUE_DESK_SHELL_BINARY=/workspace/target/release/kernaid-rescue-desk-shell \
             -v "$PWD:/workspace" -w /workspace \
             debian:trixie-slim \
             sh -c 'apt-get update && apt-get install -y binutils live-build ca-certificates openssl python3 && install -d -o root -g root -m 0755 /opt/kernaid-codex-root/usr/lib/kernaid && python3 -I tools/build-rescue/fetch-codex-cli.py --lock rescue/codex/codex-cli.lock.json --root /opt/kernaid-codex-root && ./tools/build-rescue/build.sh'

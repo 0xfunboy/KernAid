@@ -29,6 +29,10 @@ import {
   parseSecureRuntimeStatus,
   scanRescueInstalledTargets,
   selectRescueInstalledTarget,
+  hasLocalCollector,
+  isNative,
+  isRescueRuntime,
+  verifyRescueTauriIpcIsolation,
   rescueOfflineCorpusJson,
   rescueOfflineEvidenceSummary,
   LINUX_NORMALIZED_SNAPSHOT_COLLECTOR,
@@ -295,6 +299,70 @@ test("Linux hardware inventory is strict, normalized, and privacy-reduced", () =
   );
 });
 
+test("the exact loopback HTTP origin remains Rescue inside Tauri", async () => {
+  const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const originalLocation = Object.getOwnPropertyDescriptor(
+    globalThis,
+    "location",
+  );
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: { __TAURI_INTERNALS__: {} },
+  });
+  Object.defineProperty(globalThis, "location", {
+    configurable: true,
+    value: { protocol: "http:", hostname: "127.0.0.1", port: "4173" },
+  });
+
+  try {
+    assert.equal(isNative(), false);
+    assert.equal(hasLocalCollector(), true);
+    assert.equal(isRescueRuntime(), true);
+    await assert.doesNotReject(
+      verifyRescueTauriIpcIsolation(async () => {
+        throw new Error("remote command rejected");
+      }),
+    );
+    await assert.rejects(
+      verifyRescueTauriIpcIsolation(async () => ({ audit: "unsafe" })),
+      /confine IPC Rescue non e sicuro/,
+    );
+  } finally {
+    restoreProperty("window", originalWindow);
+    restoreProperty("location", originalLocation);
+  }
+});
+
+test("nearby origins never acquire the Rescue runtime classification", () => {
+  const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const originalLocation = Object.getOwnPropertyDescriptor(
+    globalThis,
+    "location",
+  );
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: {},
+  });
+
+  try {
+    for (const location of [
+      { protocol: "https:", hostname: "127.0.0.1", port: "4173" },
+      { protocol: "http:", hostname: "localhost", port: "4173" },
+      { protocol: "http:", hostname: "127.0.0.1", port: "4174" },
+    ]) {
+      Object.defineProperty(globalThis, "location", {
+        configurable: true,
+        value: location,
+      });
+      assert.equal(hasLocalCollector(), false);
+      assert.equal(isRescueRuntime(), false);
+    }
+  } finally {
+    restoreProperty("window", originalWindow);
+    restoreProperty("location", originalLocation);
+  }
+});
+
 test("failed macOS observations are never mislabeled as JSON", () => {
   const observation = {
     collector: "macos.system-events.summary",
@@ -358,7 +426,7 @@ test("Rescue inventory retries a bounded 429 response", async () => {
   });
   Object.defineProperty(globalThis, "location", {
     configurable: true,
-    value: { hostname: "127.0.0.1", port: "4173" },
+    value: { protocol: "http:", hostname: "127.0.0.1", port: "4173" },
   });
   Object.defineProperty(globalThis, "fetch", {
     configurable: true,
@@ -666,7 +734,7 @@ test("Rescue inspection HTTP contract is minimal and rejects malformed success",
   });
   Object.defineProperty(globalThis, "location", {
     configurable: true,
-    value: { hostname: "127.0.0.1", port: "4173" },
+    value: { protocol: "http:", hostname: "127.0.0.1", port: "4173" },
   });
   Object.defineProperty(globalThis, "fetch", {
     configurable: true,
@@ -763,7 +831,7 @@ test("Rescue inspection errors are typed, non-retried, and never expose backend 
   });
   Object.defineProperty(globalThis, "location", {
     configurable: true,
-    value: { hostname: "127.0.0.1", port: "4173" },
+    value: { protocol: "http:", hostname: "127.0.0.1", port: "4173" },
   });
   const setFetch = (implementation: () => Promise<Response>): void => {
     Object.defineProperty(globalThis, "fetch", {
@@ -1087,7 +1155,7 @@ test("Rescue selection HTTP response must match the exact requested target", asy
   });
   Object.defineProperty(globalThis, "location", {
     configurable: true,
-    value: { hostname: "127.0.0.1", port: "4173" },
+    value: { protocol: "http:", hostname: "127.0.0.1", port: "4173" },
   });
   Object.defineProperty(globalThis, "fetch", {
     configurable: true,
@@ -1147,7 +1215,7 @@ test("Rescue Observe authorization carries the exact session target binding", as
   });
   Object.defineProperty(globalThis, "location", {
     configurable: true,
-    value: { hostname: "127.0.0.1", port: "4173" },
+    value: { protocol: "http:", hostname: "127.0.0.1", port: "4173" },
   });
   Object.defineProperty(globalThis, "fetch", {
     configurable: true,
@@ -1574,7 +1642,7 @@ test("Rescue evidence is never presented as an installed-system diagnosis", asyn
   });
   Object.defineProperty(globalThis, "location", {
     configurable: true,
-    value: { hostname: "127.0.0.1", port: "4173" },
+    value: { protocol: "http:", hostname: "127.0.0.1", port: "4173" },
   });
 
   try {
@@ -1627,7 +1695,7 @@ test("Rescue never falls back to the synthetic healthy fixture", async () => {
   });
   Object.defineProperty(globalThis, "location", {
     configurable: true,
-    value: { hostname: "127.0.0.1", port: "4173" },
+    value: { protocol: "http:", hostname: "127.0.0.1", port: "4173" },
   });
 
   try {
@@ -1674,7 +1742,7 @@ test("Rescue selected-target metadata still cannot become an OS diagnosis", asyn
   });
   Object.defineProperty(globalThis, "location", {
     configurable: true,
-    value: { hostname: "127.0.0.1", port: "4173" },
+    value: { protocol: "http:", hostname: "127.0.0.1", port: "4173" },
   });
   try {
     const proposal = await new PlatformOfflineRulesProvider().diagnose(
@@ -1719,7 +1787,7 @@ test("Rescue rejects malformed, mis-scoped, and duplicate selection evidence", a
   });
   Object.defineProperty(globalThis, "location", {
     configurable: true,
-    value: { hostname: "127.0.0.1", port: "4173" },
+    value: { protocol: "http:", hostname: "127.0.0.1", port: "4173" },
   });
   try {
     const provider = new PlatformOfflineRulesProvider();
