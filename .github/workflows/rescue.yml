@@ -174,7 +174,7 @@ jobs:
           cargo clippy --locked -p kernaid-rescue-secrets --all-targets \
             --features experimental-codex-home-lease -- -D warnings
           cargo test --locked -p kernaid-rescue-secrets \
-            --features experimental-codex-home-lease
+            --features experimental-codex-home-lease -- --test-threads=1
           cargo fmt -p kernaid-rescue-openai-executor -- --check
           cargo clippy --locked -p kernaid-rescue-openai-executor --all-targets -- -D warnings
           cargo test --locked -p kernaid-rescue-openai-executor
