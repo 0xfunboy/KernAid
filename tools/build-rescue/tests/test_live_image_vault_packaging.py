@@ -356,7 +356,13 @@ class VaultSystemdPackagingTests(unittest.TestCase):
         )
 
     def test_runtime_ownership_does_not_tmpfiles_manage_the_fault_marker(self) -> None:
-        self.assertEqual(active_lines(TMPFILES), ["d /run/kernaid 0700 root root -"])
+        self.assertEqual(
+            active_lines(TMPFILES),
+            [
+                "d /run/kernaid 0700 root root -",
+                "d /run/kernaid-rescue-ui-session 0700 kernaid-rescue-ui kernaid-rescue-ui -",
+            ],
+        )
         text = TMPFILES.read_text(encoding="utf-8")
         self.assertNotIn("kernaid-rescue-vault", text)
         self.assertNotIn("lifecycle-active-v1", text)
