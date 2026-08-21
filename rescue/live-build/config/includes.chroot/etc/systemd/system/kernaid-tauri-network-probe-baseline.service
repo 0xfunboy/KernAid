@@ -1,0 +1,39 @@
+[Unit]
+Description=KernAid QEMU-only Tauri network probe baseline
+ConditionPathExists=/sys/firmware/qemu_fw_cfg/by_name/opt/kernaid-tauri-sandbox-probe/raw
+Requires=kernaid-tauri-network-probe.socket
+After=kernaid-tauri-network-probe.socket
+Before=kernaid-rescue-desk-shell.service
+PartOf=kernaid-tauri-network-probe.socket
+
+[Service]
+Type=oneshot
+ExecStartPre=/usr/bin/python3 -I /usr/lib/kernaid/tauri_network_probe.py verify-marker
+ExecStart=/usr/bin/python3 -I /usr/lib/kernaid/tauri_network_probe.py baseline
+RemainAfterExit=yes
+User=root
+Group=root
+RuntimeDirectory=kernaid-tauri-network-probe
+RuntimeDirectoryMode=0755
+UMask=0077
+LimitCORE=0
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_NETLINK
+IPAddressDeny=any
+IPAddressAllow=192.0.2.1/32
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native

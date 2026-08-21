@@ -1,32 +1,41 @@
 [Unit]
 Description=KernAid Rescue Tauri desktop shell
-Requires=kernaid-ui.service live-config.service
-After=kernaid-ui.service live-config.service display-manager.service
-Wants=display-manager.service
+Requires=kernaid-ui.service live-config.service kernaid-rescue-ui-session-ready.service kernaid-offline-inspector.socket kernaid-rescue-vaultd.socket kernaid-rescue-openai-executor.socket kernaid-rescue-openai-egress.socket kernaid-rescue-codex.socket
+After=kernaid-ui.service live-config.service kernaid-rescue-ui-session-ready.service display-manager.service kernaid-offline-inspector.socket kernaid-rescue-vaultd.socket kernaid-rescue-openai-executor.socket kernaid-rescue-openai-egress.socket kernaid-rescue-codex.socket kernaid-tauri-network-probe-baseline.service
+Wants=display-manager.service kernaid-tauri-network-probe-baseline.service
 Before=kernaid-ready.service
 ConditionKernelCommandLine=boot=live
 StartLimitIntervalSec=120s
 StartLimitBurst=30
 
 [Service]
-Type=simple
+Type=notify
 ExecStart=/usr/bin/kernaid-rescue-desk-shell
+NotifyAccess=main
+TimeoutStartSec=120s
 Restart=on-failure
 RestartSec=1s
-User=kernaid
-Group=kernaid
-Environment=HOME=/home/kernaid
-Environment=USER=kernaid
-Environment=LOGNAME=kernaid
+User=kernaid-rescue-ui
+Group=kernaid-rescue-ui
+Environment=HOME=/run/kernaid-rescue-desk-shell
+Environment=USER=kernaid-rescue-ui
+Environment=LOGNAME=kernaid-rescue-ui
 Environment=DISPLAY=:0
-Environment=XAUTHORITY=/home/kernaid/.Xauthority
-Environment=XDG_RUNTIME_DIR=/run/user/1000
-Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+Environment=XAUTHORITY=/run/lightdm/kernaid-rescue-ui/xauthority
+Environment=XDG_RUNTIME_DIR=/run/kernaid-rescue-desk-shell
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/kernaid-rescue-desk-shell/no-session-bus
+Environment=DBUS_SYSTEM_BUS_ADDRESS=unix:path=/run/kernaid-rescue-desk-shell/no-system-bus
 Environment=GDK_BACKEND=x11
+Environment=NO_AT_BRIDGE=1
+Environment=WEBKIT_DISABLE_COMPOSITING_MODE=1
+Environment=WEBKIT_DISABLE_DMABUF_RENDERER=1
+RuntimeDirectory=kernaid-rescue-desk-shell
+RuntimeDirectoryMode=0700
 UMask=0077
 LimitCORE=0
 NoNewPrivileges=yes
 ProtectSystem=strict
+ProtectHome=yes
 ProtectControlGroups=yes
 ProtectKernelLogs=yes
 ProtectKernelModules=yes
@@ -39,6 +48,19 @@ RestrictRealtime=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
 SystemCallArchitectures=native
+PrivatePIDs=yes
+ProtectProc=invisible
+ProcSubset=pid
+PrivateDevices=yes
+DevicePolicy=closed
+PrivateTmp=yes
+TemporaryFileSystem=/run:ro
+BindPaths=/run/kernaid-rescue-desk-shell
+BindReadOnlyPaths=/run/lightdm/kernaid-rescue-ui/xauthority /run/systemd/notify -/run/kernaid-tauri-network-probe/baseline-v1
+BindReadOnlyPaths=/tmp/.X11-unix/X0
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+IPAddressDeny=any
+IPAddressAllow=localhost
 
 [Install]
 WantedBy=graphical.target

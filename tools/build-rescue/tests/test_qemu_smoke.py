@@ -528,7 +528,7 @@ if os.environ.get("KERNAID_MOCK_DUPLICATE_HARDWARE_MARKER") == "1":
 sys.stdout.flush()
 print("KERNAID_RESCUE_TARGET_SELECTION_READY", flush=True)
 print("KERNAID_RESCUE_OFFLINE_INSPECTION_READY", flush=True)
-print("KERNAID_RESCUE_TAURI_GUEST_V1 shell=shipping renderer=webkit2gtk-4.1 window=visible display=active-xorg width=1024 height=768", flush=True)
+print("KERNAID_RESCUE_TAURI_GUEST_V1 identity=isolated pidns=private shell-bus=mount-masked session-bus=env-disabled-polkit-denied fs-sockets=allowlisted abstract-unix=not-attested devices=private device-fds=no-privileged shell=shipping renderer=webkit2gtk-4.1 window=visible display=active-xorg http=loopback x11=connected privileged-fs-sockets=absent nonloopback=denied width=1024 height=768", flush=True)
 snapshot_marker = "KERNAID_RESCUE_LINUX_SNAPSHOT_E2E_V1 semantic_sha256=" + os.environ["KERNAID_MOCK_SNAPSHOT_DIGEST"]
 sys.stdout.write("serial-prefix-without-line-feed")
 print("\n" + snapshot_marker, flush=True)
@@ -544,7 +544,7 @@ time.sleep(30)
             fi
             printf 'KERNAID_RESCUE_TARGET_SELECTION_READY\n'
             printf 'KERNAID_RESCUE_OFFLINE_INSPECTION_READY\n'
-            printf 'KERNAID_RESCUE_TAURI_GUEST_V1 shell=shipping renderer=webkit2gtk-4.1 window=visible display=active-xorg width=1024 height=768\n'
+            printf 'KERNAID_RESCUE_TAURI_GUEST_V1 identity=isolated pidns=private shell-bus=mount-masked session-bus=env-disabled-polkit-denied fs-sockets=allowlisted abstract-unix=not-attested devices=private device-fds=no-privileged shell=shipping renderer=webkit2gtk-4.1 window=visible display=active-xorg http=loopback x11=connected privileged-fs-sockets=absent nonloopback=denied width=1024 height=768\n'
             printf 'serial-prefix-without-line-feed'
             printf '\nKERNAID_RESCUE_LINUX_SNAPSHOT_E2E_V1 semantic_sha256=%s\n' \
               "$KERNAID_MOCK_SNAPSHOT_DIGEST"

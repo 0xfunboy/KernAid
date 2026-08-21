@@ -5,12 +5,11 @@ systemd-sysv
 linux-image-amd64
 grub-pc-bin
 grub-efi-amd64-bin
-xfce4
-xfce4-terminal
-xorg
+xfwm4
+xserver-xorg
 lightdm
+xauth
 network-manager
-network-manager-gnome
 iproute2
 libwebkit2gtk-4.1-0
 xdotool

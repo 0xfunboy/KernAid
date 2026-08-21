@@ -1,8 +1,27 @@
 #![forbid(unsafe_code)]
 
+use nix::{
+    libc,
+    sys::socket::{
+        AddressFamily, MsgFlags, SockFlag, SockProtocol, SockType, UnixAddr, sendto, socket,
+    },
+    unistd::{Group, User, getegid, geteuid, getgid, getgroups, getuid},
+};
 use std::{
-    io::{Read, Write},
+    env,
+    ffi::OsStr,
+    fs::{self, OpenOptions},
+    io::{self, Read, Write},
     net::{SocketAddr, TcpStream},
+    os::{
+        fd::AsRawFd,
+        unix::ffi::OsStrExt,
+        unix::{
+            fs::{MetadataExt, OpenOptionsExt},
+            net::UnixStream,
+        },
+    },
+    path::Path,
     thread,
     time::{Duration, Instant},
 };
@@ -16,6 +35,91 @@ const STARTUP_DEADLINE: Duration = Duration::from_secs(90);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 const PROBE_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_PROBE_RESPONSE_BYTES: usize = 16 * 1024;
+const X11_SOCKET_PATH: &str = "/tmp/.X11-unix/X0";
+const UI_ACCOUNT: &str = "kernaid-rescue-ui";
+const UI_HOME: &str = "/nonexistent";
+const UI_SHELL: &str = "/usr/sbin/nologin";
+const UI_XAUTHORITY: &str = "/run/lightdm/kernaid-rescue-ui/xauthority";
+const FAKE_SESSION_BUS: &str = "unix:path=/run/kernaid-rescue-desk-shell/no-session-bus";
+const FAKE_SYSTEM_BUS: &str = "unix:path=/run/kernaid-rescue-desk-shell/no-system-bus";
+const SANDBOX_STATUS_QEMU: &str = "KERNAID_RESCUE_TAURI_SANDBOX_V1 identity=isolated pidns=private shell-bus=mount-masked session-bus=env-disabled-polkit-denied http=loopback x11=connected privileged-fs-sockets=absent nonloopback=denied";
+const SANDBOX_STATUS_NORMAL: &str = "KERNAID_RESCUE_TAURI_SANDBOX_V1 identity=isolated pidns=private shell-bus=mount-masked session-bus=env-disabled-polkit-denied http=loopback x11=connected privileged-fs-sockets=absent nonloopback=systemd-policy";
+const QEMU_PROBE_MARKER_PATH: &str =
+    "/sys/firmware/qemu_fw_cfg/by_name/opt/kernaid-tauri-sandbox-probe/raw";
+const QEMU_BASELINE_MARKER_PATH: &str = "/run/kernaid-tauri-network-probe/baseline-v1";
+const QEMU_BASELINE_MARKER: &[u8] = b"KERNAID_RESCUE_TAURI_NETWORK_BASELINE_V1 connected=true\n";
+const QEMU_NON_LOOPBACK_ADDRESS: [u8; 4] = [192, 0, 2, 1];
+const QEMU_NON_LOOPBACK_PORT: u16 = 41_917;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SandboxProbeFailure {
+    Http,
+    X11,
+    HttpAndX11,
+    OfflineInspector,
+    Vault,
+    OpenAiExecutor,
+    OpenAiEgress,
+    Codex,
+    ProbeMode,
+    Baseline,
+    NonLoopback,
+    Identity,
+    PidNamespace,
+    SessionBus,
+    SystemBus,
+    Notify,
+}
+
+impl SandboxProbeFailure {
+    fn status(self) -> &'static str {
+        match self {
+            Self::Http => "KERNAID_RESCUE_TAURI_SANDBOX_FAILURE_V1 stage=http",
+            Self::X11 => "KERNAID_RESCUE_TAURI_SANDBOX_FAILURE_V1 stage=x11",
+            Self::HttpAndX11 => "KERNAID_RESCUE_TAURI_SANDBOX_FAILURE_V1 stage=http-x11",
+            Self::OfflineInspector => {
+                "KERNAID_RESCUE_TAURI_SANDBOX_FAILURE_V1 stage=socket-offline-inspector"
+            }
+            Self::Vault => "KERNAID_RESCUE_TAURI_SANDBOX_FAILURE_V1 stage=socket-vault",
+            Self::OpenAiExecutor => {
+                "KERNAID_RESCUE_TAURI_SANDBOX_FAILURE_V1 stage=socket-openai-executor"
+            }
+            Self::OpenAiEgress => {
+                "KERNAID_RESCUE_TAURI_SANDBOX_FAILURE_V1 stage=socket-openai-egress"
+            }
+            Self::Codex => "KERNAID_RESCUE_TAURI_SANDBOX_FAILURE_V1 stage=socket-codex",
+            Self::ProbeMode => "KERNAID_RESCUE_TAURI_SANDBOX_FAILURE_V1 stage=probe-mode",
+            Self::Baseline => "KERNAID_RESCUE_TAURI_SANDBOX_FAILURE_V1 stage=baseline",
+            Self::NonLoopback => "KERNAID_RESCUE_TAURI_SANDBOX_FAILURE_V1 stage=nonloopback",
+            Self::Identity => "KERNAID_RESCUE_TAURI_SANDBOX_FAILURE_V1 stage=identity",
+            Self::PidNamespace => "KERNAID_RESCUE_TAURI_SANDBOX_FAILURE_V1 stage=pidns",
+            Self::SessionBus => "KERNAID_RESCUE_TAURI_SANDBOX_FAILURE_V1 stage=session-bus",
+            Self::SystemBus => "KERNAID_RESCUE_TAURI_SANDBOX_FAILURE_V1 stage=system-bus",
+            Self::Notify => "KERNAID_RESCUE_TAURI_SANDBOX_FAILURE_V1 stage=notify",
+        }
+    }
+}
+
+const PRIVILEGED_SOCKETS: [(&str, SandboxProbeFailure); 6] = [
+    (
+        "/run/kernaid-offline-inspector.sock",
+        SandboxProbeFailure::OfflineInspector,
+    ),
+    ("/run/kernaid-rescue-vault.sock", SandboxProbeFailure::Vault),
+    (
+        "/run/kernaid-rescue-openai.sock",
+        SandboxProbeFailure::OpenAiExecutor,
+    ),
+    (
+        "/run/kernaid-rescue-openai-egress.sock",
+        SandboxProbeFailure::OpenAiEgress,
+    ),
+    ("/run/kernaid-rescue-codex.sock", SandboxProbeFailure::Codex),
+    (
+        "/run/dbus/system_bus_socket",
+        SandboxProbeFailure::SystemBus,
+    ),
+];
 
 fn allowed_rescue_navigation(url: &Url) -> bool {
     url.scheme() == "http"
@@ -84,24 +188,331 @@ fn rescue_ui_ready_once() -> bool {
     valid_rescue_ui_response(&response)
 }
 
-fn wait_for_rescue_ui() -> std::io::Result<()> {
+fn rescue_x11_ready_once() -> bool {
+    UnixStream::connect(X11_SOCKET_PATH).is_ok()
+}
+
+fn wait_for_rescue_channels() -> Result<(), SandboxProbeFailure> {
     let started = Instant::now();
+    let mut http_ready = false;
+    let mut x11_ready = false;
     while started.elapsed() < STARTUP_DEADLINE {
-        if rescue_ui_ready_once() {
+        http_ready = http_ready || rescue_ui_ready_once();
+        x11_ready = x11_ready || rescue_x11_ready_once();
+        if http_ready && x11_ready {
             return Ok(());
         }
         thread::sleep(PROBE_INTERVAL);
     }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::TimedOut,
-        "Rescue UI did not become ready",
-    ))
+    Err(match (http_ready, x11_ready) {
+        (false, false) => SandboxProbeFailure::HttpAndX11,
+        (false, true) => SandboxProbeFailure::Http,
+        (true, false) => SandboxProbeFailure::X11,
+        (true, true) => unreachable!("both channels return before the deadline"),
+    })
 }
 
+fn privileged_socket_absent(root_alias: &str, path: &str) -> bool {
+    let candidate = format!("{root_alias}{path}");
+    matches!(
+        fs::symlink_metadata(candidate),
+        Err(error) if error.kind() == io::ErrorKind::NotFound
+    )
+}
+
+fn privileged_sockets_absent() -> Result<(), SandboxProbeFailure> {
+    // PrivatePIDs makes this process PID 1 and hides every host process.  Probe
+    // both proc-root aliases as well as the direct paths so a future mount
+    // namespace change cannot silently reintroduce the same-UID /proc escape.
+    for (path, failure) in PRIVILEGED_SOCKETS {
+        for root_alias in ["", "/proc/1/root", "/proc/self/root"] {
+            if !privileged_socket_absent(root_alias, path) {
+                return Err(failure);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn denied_non_loopback_error(kind: io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        io::ErrorKind::PermissionDenied | io::ErrorKind::TimedOut
+    )
+}
+
+fn non_loopback_denied() -> bool {
+    let address = SocketAddr::from((QEMU_NON_LOOPBACK_ADDRESS, QEMU_NON_LOOPBACK_PORT));
+    match TcpStream::connect_timeout(&address, PROBE_TIMEOUT) {
+        Ok(_) => false,
+        Err(error) => denied_non_loopback_error(error.kind()),
+    }
+}
+
+fn bounded_fixed_file(
+    path: &str,
+    expected_uid: u32,
+    expected_gid: u32,
+    expected_mode: u32,
+    expected: &[u8],
+) -> io::Result<()> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.uid() != expected_uid
+        || metadata.gid() != expected_gid
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o7777 != expected_mode
+        || (metadata.len() != 0 && metadata.len() != expected.len() as u64)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "fixed marker identity was unsafe",
+        ));
+    }
+    let mut payload = vec![0_u8; expected.len() + 1];
+    let length = file.read(&mut payload)?;
+    if &payload[..length] != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "fixed marker content was invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn qemu_probe_mode() -> Result<bool, SandboxProbeFailure> {
+    match fs::symlink_metadata(QEMU_PROBE_MARKER_PATH) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(SandboxProbeFailure::ProbeMode),
+        Ok(metadata) => {
+            if !metadata.is_file()
+                || metadata.uid() != 0
+                || metadata.gid() != 0
+                || metadata.mode() & 0o222 != 0
+            {
+                return Err(SandboxProbeFailure::ProbeMode);
+            }
+            let mut file = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+                .open(QEMU_PROBE_MARKER_PATH)
+                .map_err(|_| SandboxProbeFailure::ProbeMode)?;
+            let mut payload = [0_u8; 4];
+            let length = file
+                .read(&mut payload)
+                .map_err(|_| SandboxProbeFailure::ProbeMode)?;
+            matches!(&payload[..length], b"v1" | b"v1\0")
+                .then_some(true)
+                .ok_or(SandboxProbeFailure::ProbeMode)
+        }
+    }
+}
+
+fn qemu_baseline_ready() -> bool {
+    bounded_fixed_file(QEMU_BASELINE_MARKER_PATH, 0, 0, 0o444, QEMU_BASELINE_MARKER).is_ok()
+}
+
+fn isolated_identity_ready() -> bool {
+    let uid = getuid();
+    let gid = getgid();
+    if uid != geteuid() || gid != getegid() || uid.is_root() || uid.as_raw() == 1000 {
+        return false;
+    }
+    let Ok(Some(user)) = User::from_uid(uid) else {
+        return false;
+    };
+    let Ok(Some(group)) = Group::from_gid(gid) else {
+        return false;
+    };
+    if user.name != UI_ACCOUNT
+        || group.name != UI_ACCOUNT
+        || user.gid != gid
+        || user.dir != Path::new(UI_HOME)
+        || user.shell != Path::new(UI_SHELL)
+    {
+        return false;
+    }
+    let Ok(groups) = getgroups() else {
+        return false;
+    };
+    if groups.iter().any(|supplementary| *supplementary != gid) {
+        return false;
+    }
+    if env::var_os("DISPLAY").as_deref() != Some(OsStr::new(":0"))
+        || env::var_os("XAUTHORITY").as_deref() != Some(OsStr::new(UI_XAUTHORITY))
+        || env::var_os("DBUS_SESSION_BUS_ADDRESS").as_deref() != Some(OsStr::new(FAKE_SESSION_BUS))
+        || env::var_os("DBUS_SYSTEM_BUS_ADDRESS").as_deref() != Some(OsStr::new(FAKE_SYSTEM_BUS))
+    {
+        return false;
+    }
+    let Ok(file) = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(UI_XAUTHORITY)
+    else {
+        return false;
+    };
+    let Ok(metadata) = file.metadata() else {
+        return false;
+    };
+    metadata.is_file()
+        && metadata.uid() == uid.as_raw()
+        && metadata.gid() == gid.as_raw()
+        && metadata.nlink() == 1
+        && metadata.mode() & 0o7777 == 0o600
+        && (1..=64 * 1024).contains(&metadata.len())
+}
+
+fn private_pid_namespace_ready() -> bool {
+    if std::process::id() != 1 {
+        return false;
+    }
+    let Ok(status) = fs::read("/proc/self/status") else {
+        return false;
+    };
+    if status.len() > 64 * 1024 {
+        return false;
+    }
+    let nspid = status
+        .split(|byte| *byte == b'\n')
+        .find(|line| line.starts_with(b"NSpid:"));
+    if nspid.map(|line| {
+        line.split(|byte| byte.is_ascii_whitespace())
+            .filter(|field| !field.is_empty())
+            .collect::<Vec<_>>()
+    }) != Some(vec![b"NSpid:".as_slice(), b"1".as_slice()])
+    {
+        return false;
+    }
+    let Ok(executable) = fs::read_link("/proc/1/exe") else {
+        return false;
+    };
+    if executable != Path::new("/usr/bin/kernaid-rescue-desk-shell") {
+        return false;
+    }
+    let Ok(processes) = fs::read_dir("/proc") else {
+        return false;
+    };
+    processes
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .as_bytes()
+                .iter()
+                .all(|byte| byte.is_ascii_digit())
+        })
+        .count()
+        == 1
+}
+
+fn user_runtime_absent() -> bool {
+    let runtime = format!("/run/user/{}", getuid().as_raw());
+    ["", "/proc/1/root", "/proc/self/root"]
+        .iter()
+        .all(|root_alias| {
+            let path = format!("{root_alias}{runtime}");
+            matches!(
+                fs::symlink_metadata(path),
+                Err(error) if error.kind() == io::ErrorKind::NotFound
+            )
+        })
+}
+
+fn notify_systemd(status: &str, ready: bool) -> io::Result<()> {
+    if !status.is_ascii()
+        || status.bytes().any(|byte| matches!(byte, b'\n' | b'\r' | 0))
+        || status.len() > 512
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "systemd status was outside the fixed policy",
+        ));
+    }
+    let notify_socket = env::var_os("NOTIFY_SOCKET").ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "systemd notify socket was missing")
+    })?;
+    let notify_bytes = notify_socket.as_bytes();
+    let address = if let Some(abstract_name) = notify_bytes.strip_prefix(b"@") {
+        UnixAddr::new_abstract(abstract_name)
+    } else {
+        UnixAddr::new(Path::new(OsStr::from_bytes(notify_bytes)))
+    }
+    .map_err(io::Error::other)?;
+    let descriptor = socket(
+        AddressFamily::Unix,
+        SockType::Datagram,
+        SockFlag::SOCK_CLOEXEC,
+        None::<SockProtocol>,
+    )
+    .map_err(io::Error::other)?;
+    let payload = if ready {
+        format!("READY=1\nSTATUS={status}")
+    } else {
+        format!("STATUS={status}")
+    };
+    let sent = sendto(
+        descriptor.as_raw_fd(),
+        payload.as_bytes(),
+        &address,
+        MsgFlags::MSG_NOSIGNAL,
+    )
+    .map_err(io::Error::other)?;
+    if sent != payload.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            "systemd notify payload was truncated",
+        ));
+    }
+    Ok(())
+}
+
+fn attest_rescue_sandbox() -> Result<&'static str, SandboxProbeFailure> {
+    if !isolated_identity_ready() {
+        return Err(SandboxProbeFailure::Identity);
+    }
+    if !private_pid_namespace_ready() {
+        return Err(SandboxProbeFailure::PidNamespace);
+    }
+    if !user_runtime_absent() {
+        return Err(SandboxProbeFailure::SessionBus);
+    }
+    wait_for_rescue_channels()?;
+    privileged_sockets_absent()?;
+    let qemu_probe = qemu_probe_mode()?;
+    if qemu_probe {
+        if !qemu_baseline_ready() {
+            return Err(SandboxProbeFailure::Baseline);
+        }
+        if !non_loopback_denied() {
+            return Err(SandboxProbeFailure::NonLoopback);
+        }
+    }
+    Ok(if qemu_probe {
+        SANDBOX_STATUS_QEMU
+    } else {
+        SANDBOX_STATUS_NORMAL
+    })
+}
+
+// The QEMU canary is deliberately reachable before this service enters its
+// cgroup. A timeout is therefore a negative result from systemd's IP filter,
+// not an absent route. Normal boots have no canary and rely on the exact,
+// statically verified IPAddressDeny/Allow policy in the unit.
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    wait_for_rescue_ui()?;
+    let status = attest_rescue_sandbox().map_err(|failure| {
+        let _ = notify_systemd(failure.status(), false);
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Rescue shell sandbox probe failed",
+        )
+    })?;
     tauri::Builder::default()
-        .setup(|app| {
+        .setup(move |app| {
             let rescue_url: Url = RESCUE_UI_URL.parse()?;
             WebviewWindowBuilder::new(app, "main", WebviewUrl::External(rescue_url))
                 .title("KernAid Rescue")
@@ -116,6 +527,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .on_new_window(|_, _| NewWindowResponse::Deny)
                 .on_download(|_, _| false)
                 .build()?;
+            notify_systemd(status, true).map_err(|_| {
+                let _ = notify_systemd(SandboxProbeFailure::Notify.status(), false);
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "Rescue shell notification failed",
+                )
+            })?;
             Ok(())
         })
         // This binary intentionally registers no invoke handler.  Together
@@ -189,5 +607,46 @@ X-Content-Type-Options: nosniff\r\n\
             b'x';
             MAX_PROBE_RESPONSE_BYTES + 1
         ]));
+    }
+
+    #[test]
+    fn non_loopback_probe_rejects_absent_routes_and_listeners() {
+        assert!(denied_non_loopback_error(io::ErrorKind::PermissionDenied));
+        assert!(denied_non_loopback_error(io::ErrorKind::TimedOut));
+        assert!(!denied_non_loopback_error(io::ErrorKind::ConnectionRefused));
+        assert!(!denied_non_loopback_error(
+            io::ErrorKind::NetworkUnreachable
+        ));
+    }
+
+    #[test]
+    fn sandbox_failure_statuses_are_fixed_and_path_free() {
+        let failures = [
+            SandboxProbeFailure::Http,
+            SandboxProbeFailure::X11,
+            SandboxProbeFailure::HttpAndX11,
+            SandboxProbeFailure::OfflineInspector,
+            SandboxProbeFailure::Vault,
+            SandboxProbeFailure::OpenAiExecutor,
+            SandboxProbeFailure::OpenAiEgress,
+            SandboxProbeFailure::Codex,
+            SandboxProbeFailure::ProbeMode,
+            SandboxProbeFailure::Baseline,
+            SandboxProbeFailure::NonLoopback,
+            SandboxProbeFailure::Identity,
+            SandboxProbeFailure::PidNamespace,
+            SandboxProbeFailure::SessionBus,
+            SandboxProbeFailure::SystemBus,
+            SandboxProbeFailure::Notify,
+        ];
+        for failure in failures {
+            let status = failure.status();
+            assert!(status.starts_with("KERNAID_RESCUE_TAURI_SANDBOX_FAILURE_V1 stage="));
+            assert!(
+                !status
+                    .bytes()
+                    .any(|byte| matches!(byte, b'/' | b'\n' | b'\r' | 0))
+            );
+        }
     }
 }

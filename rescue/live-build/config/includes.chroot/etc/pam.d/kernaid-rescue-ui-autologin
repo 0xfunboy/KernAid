@@ -1,0 +1,17 @@
+#%PAM-1.0
+
+# This is the only PAM entry point allowed to bypass the account's nologin
+# shell. LightDM pins this service to the fixed Rescue UI identity.
+auth      requisite pam_succeed_if.so user = kernaid-rescue-ui
+auth      requisite pam_nologin.so
+auth      required  pam_permit.so
+
+account   requisite pam_succeed_if.so user = kernaid-rescue-ui
+@include common-account
+
+session   required  pam_env.so readenv=1
+session   required  pam_env.so readenv=1 envfile=/etc/default/locale
+session   required  pam_limits.so
+session   required  pam_loginuid.so
+
+password  required  pam_deny.so

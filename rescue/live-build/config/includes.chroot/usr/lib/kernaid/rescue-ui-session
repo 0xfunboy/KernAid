@@ -1,0 +1,28 @@
+#!/bin/sh
+set -eu
+umask 077
+
+test "$(id -un)" = kernaid-rescue-ui
+test "$(id -gn)" = kernaid-rescue-ui
+test "$(id -G | wc -w)" -eq 1
+test "$DISPLAY" = :0
+test "$XAUTHORITY" = /run/lightdm/kernaid-rescue-ui/xauthority
+test -d /run/kernaid-rescue-ui-session
+test "$(stat -c '%u:%g:%a' /run/kernaid-rescue-ui-session)" = "$(id -u):$(id -g):700"
+export XDG_RUNTIME_DIR=/run/kernaid-rescue-ui-session
+unset DBUS_SESSION_BUS_ADDRESS
+test ! -e "$XDG_RUNTIME_DIR/bus" && test ! -L "$XDG_RUNTIME_DIR/bus"
+test ! -e "$XDG_RUNTIME_DIR/systemd" && test ! -L "$XDG_RUNTIME_DIR/systemd"
+
+session_home="$XDG_RUNTIME_DIR/home"
+install -d -m 0700 "$session_home"
+export HOME="$session_home"
+export XDG_CONFIG_HOME="$session_home/config"
+export XDG_CACHE_HOME="$session_home/cache"
+export XDG_DATA_HOME="$session_home/data"
+export DBUS_SESSION_BUS_ADDRESS=unix:path="$XDG_RUNTIME_DIR/no-session-bus"
+export DBUS_SYSTEM_BUS_ADDRESS=unix:path="$XDG_RUNTIME_DIR/no-system-bus"
+export GDK_BACKEND=x11
+export NO_AT_BRIDGE=1
+
+exec /usr/bin/xfwm4 --compositor=off --display=:0

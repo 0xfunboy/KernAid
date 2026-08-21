@@ -8,6 +8,7 @@ build = "build.rs"
 tauri-build = { version = "2.2", features = [] }
 
 [dependencies]
+nix = { version = "0.31.3", features = ["socket", "user"] }
 tauri = { version = "2.5", features = [] }
 
 [lints]

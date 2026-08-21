@@ -578,6 +578,24 @@ rescue_not_ready_observed() {
   LC_ALL=C grep -aq '^KERNAID_RESCUE_NOT_READY:' "$log"
 }
 
+report_tauri_sandbox_failure() {
+  local marker
+  marker="$(
+    LC_ALL=C tr -d '\r' <"$log" \
+      | grep -aE '^KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=(http|x11|http-x11|socket-offline-inspector|socket-vault|socket-openai-executor|socket-openai-egress|socket-codex|system-bus|probe-mode|baseline|nonloopback|identity|pidns|session-bus|notify|service|process-tree|renderer|window|display|xauthority|run-view|devices|device-fds|proc-alias|endpoint-post)$' \
+      | tail -n 1 \
+      || true
+  )"
+  if [[ -n "$marker" ]]; then
+    printf '%s\n' "$marker" >&2
+  fi
+}
+
+report_rescue_not_ready() {
+  report_tauri_sandbox_failure
+  echo "Rescue guest reported a not-ready marker" >&2
+}
+
 hardware_inventory_ready_observed() {
   LC_ALL=C tr -d '\r' <"$log" \
     | grep -aE '^KERNAID_RESCUE_HARDWARE_INVENTORY_READY$' >/dev/null
@@ -787,8 +805,9 @@ qemu_args=(-machine accel=tcg -m 2048 -smp 2 -cdrom "$iso" \
   -drive "file=$windows_gpt_target_image,if=virtio,format=raw,cache=none" \
   -drive "file=$altered_windows_target_image,if=virtio,format=raw,cache=none" \
   -fw_cfg "name=opt/kernaid-offline-inspection,string=v1" \
+  -fw_cfg "name=opt/kernaid-tauri-sandbox-probe,string=v1" \
   -qmp "unix:$qmp_socket,server=on,wait=off" \
-  -boot d -vga std -display none -serial stdio -no-reboot)
+  -boot d -vga std -display none -serial stdio -nic none -no-reboot)
 if [[ "$firmware" == "uefi" ]]; then
   ovmf_code_4m="$ovmf_directory/OVMF_CODE_4M.fd"
   ovmf_vars_4m="$ovmf_directory/OVMF_VARS_4M.fd"
@@ -885,14 +904,14 @@ while ((SECONDS < qemu_deadline)); do
       echo "QEMU could not be stopped after the not-ready marker" >&2
       exit 1
     fi
-    echo "Rescue guest reported a not-ready marker" >&2
+    report_rescue_not_ready
     exit 1
   fi
   if grep -q "KERNAID_RESCUE_READY" "$log" \
     && hardware_inventory_ready_observed \
     && grep -q "KERNAID_RESCUE_TARGET_SELECTION_READY" "$log" \
     && grep -q "KERNAID_RESCUE_OFFLINE_INSPECTION_READY" "$log" \
-    && grep -q '^KERNAID_RESCUE_TAURI_GUEST_V1 shell=shipping renderer=webkit2gtk-4[.]1 window=visible display=active-xorg ' "$log" \
+    && grep -q '^KERNAID_RESCUE_TAURI_GUEST_V1 identity=isolated pidns=private shell-bus=mount-masked session-bus=env-disabled-polkit-denied fs-sockets=allowlisted abstract-unix=not-attested devices=private device-fds=no-privileged shell=shipping renderer=webkit2gtk-4[.]1 window=visible display=active-xorg http=loopback x11=connected privileged-fs-sockets=absent nonloopback=denied ' "$log" \
     && grep -q '^KERNAID_RESCUE_LINUX_SNAPSHOT_E2E_V1 semantic_sha256=' "$log"; then
     tauri_ui_attestation="$(
       /usr/bin/python3 -I -B "$repo_dir/tools/build-rescue/qemu-tauri-ui-smoke.py" \
@@ -912,7 +931,7 @@ while ((SECONDS < qemu_deadline)); do
       exit 1
     fi
     if rescue_not_ready_observed; then
-      echo "Rescue guest reported a not-ready marker" >&2
+      report_rescue_not_ready
       exit 1
     fi
     mapfile -t hardware_inventory_ready_markers \
@@ -975,7 +994,7 @@ while ((SECONDS < qemu_deadline)); do
     }
     status="$qemu_last_status"
     if rescue_not_ready_observed; then
-      echo "Rescue guest reported a not-ready marker" >&2
+      report_rescue_not_ready
       exit 1
     fi
     cat "$log"
@@ -992,7 +1011,7 @@ if ! terminate_qemu_bounded; then
   exit 1
 fi
 if rescue_not_ready_observed; then
-  echo "Rescue guest reported a not-ready marker" >&2
+  report_rescue_not_ready
   exit 1
 fi
 tail -n 200 "$log"

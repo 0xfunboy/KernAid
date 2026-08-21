@@ -1,0 +1,36 @@
+[Unit]
+Description=KernAid isolated Rescue UI session readiness
+Requires=display-manager.service systemd-sysusers.service
+After=display-manager.service systemd-sysusers.service systemd-user-sessions.service
+Before=kernaid-rescue-desk-shell.service
+ConditionKernelCommandLine=boot=live
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I /usr/lib/kernaid/rescue_ui_session_ready.py
+RemainAfterExit=yes
+User=root
+Group=root
+UMask=0077
+LimitCORE=0
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_SYS_PTRACE
+AmbientCapabilities=
+PrivateDevices=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=~ptrace process_vm_readv process_vm_writev kcmp

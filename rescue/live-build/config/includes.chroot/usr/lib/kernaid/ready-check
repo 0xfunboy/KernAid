@@ -13,6 +13,37 @@ fail() {
     exit 1
 }
 
+tauri_sandbox_smoke=0
+tauri_sandbox_marker=/sys/firmware/qemu_fw_cfg/by_name/opt/kernaid-tauri-sandbox-probe/raw
+if [ -e "$tauri_sandbox_marker" ] || [ -L "$tauri_sandbox_marker" ]; then
+    if ! python3 -I - "$tauri_sandbox_marker" <<'PY'
+import os
+import stat
+import sys
+
+descriptor = os.open(sys.argv[1], os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+try:
+    metadata = os.fstat(descriptor)
+    payload = os.read(descriptor, 4)
+finally:
+    os.close(descriptor)
+if (
+    not stat.S_ISREG(metadata.st_mode)
+    or metadata.st_uid != 0
+    or metadata.st_gid != 0
+    or metadata.st_nlink != 1
+    or stat.S_IMODE(metadata.st_mode) & 0o222
+    or metadata.st_size not in (0, 2, 3)
+    or payload not in (b"v1", b"v1\0")
+):
+    raise SystemExit(1)
+PY
+    then
+        fail "Tauri sandbox probe marker failed its pinned content gate"
+    fi
+    tauri_sandbox_smoke=1
+fi
+
 fail_vaultd_startup() {
     vaultd_startup_status="$(
         /usr/bin/timeout --signal=TERM --kill-after=1s 5s \
@@ -419,12 +450,50 @@ fi
 if [ "$offline_inspection_smoke" = "1" ] && [ -z "$selection_request" ]; then
     fail "Linux fixture target is missing"
 fi
-tauri_guest_attestation="$(
+if ! tauri_guest_attestation="$(
     /usr/bin/timeout --signal=TERM --kill-after=2s 190s \
         /usr/bin/python3 -I /usr/lib/kernaid/tauri_ui_ready_check.py
-)" || fail "shipping Tauri WebKit window did not pass its guest gate"
+)"; then
+    case "$tauri_guest_attestation" in
+        "KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=http"|\
+        "KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=x11"|\
+        "KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=http-x11"|\
+        "KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=socket-offline-inspector"|\
+        "KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=socket-vault"|\
+        "KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=socket-openai-executor"|\
+        "KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=socket-openai-egress"|\
+        "KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=socket-codex"|\
+        "KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=system-bus"|\
+        "KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=probe-mode"|\
+        "KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=baseline"|\
+        "KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=nonloopback"|\
+        "KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=identity"|\
+        "KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=pidns"|\
+        "KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=session-bus"|\
+        "KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=notify"|\
+        "KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=service"|\
+        "KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=process-tree"|\
+        "KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=renderer"|\
+        "KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=window"|\
+        "KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=display"|\
+        "KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=xauthority"|\
+        "KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=run-view"|\
+        "KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=devices"|\
+        "KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=device-fds"|\
+        "KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=proc-alias"|\
+        "KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=endpoint-post")
+            printf '\n%s\n' "$tauri_guest_attestation" >/dev/ttyS0
+            ;;
+    esac
+    fail "shipping Tauri WebKit window did not pass its guest gate"
+fi
+if [ "$tauri_sandbox_smoke" = "1" ]; then
+    tauri_nonloopback=denied
+else
+    tauri_nonloopback=systemd-policy
+fi
 printf '%s\n' "$tauri_guest_attestation" \
-    | grep -Eq '^KERNAID_RESCUE_TAURI_GUEST_V1 shell=shipping renderer=webkit2gtk-4[.]1 window=visible display=active-xorg width=[1-9][0-9]{2,3} height=[1-9][0-9]{2,3}$' \
+    | grep -Eq "^KERNAID_RESCUE_TAURI_GUEST_V1 identity=isolated pidns=private shell-bus=mount-masked session-bus=env-disabled-polkit-denied fs-sockets=allowlisted abstract-unix=not-attested devices=private device-fds=no-privileged shell=shipping renderer=webkit2gtk-4[.]1 window=visible display=active-xorg http=loopback x11=connected privileged-fs-sockets=absent nonloopback=${tauri_nonloopback} width=[1-9][0-9]{2,3} height=[1-9][0-9]{2,3}$" \
     || fail "shipping Tauri WebKit guest attestation was invalid"
 test "$(printf '%s\n' "$tauri_guest_attestation" | wc -l)" -eq 1 \
     || fail "shipping Tauri WebKit guest attestation was not unique"

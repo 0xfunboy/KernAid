@@ -1,0 +1,7 @@
+[Desktop Entry]
+Version=1.0
+Name=KernAid Rescue UI
+Comment=Minimal isolated session for the KernAid Rescue shell
+Exec=/usr/lib/kernaid/rescue-ui-session
+Type=Application
+DesktopNames=KERNAID_RESCUE_UI
