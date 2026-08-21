@@ -1,6 +1,7 @@
 [Unit]
 Description=KernAid QEMU-only Tauri network probe sink
-ConditionPathExists=/sys/firmware/qemu_fw_cfg/by_name/opt/kernaid-tauri-sandbox-probe/raw
+ConditionVirtualization=|qemu
+ConditionVirtualization=|kvm
 
 [Service]
 Type=oneshot

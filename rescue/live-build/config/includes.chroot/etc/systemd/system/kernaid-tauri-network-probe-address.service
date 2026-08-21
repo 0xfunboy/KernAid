@@ -1,12 +1,15 @@
 [Unit]
 Description=KernAid QEMU-only Tauri network probe address
-ConditionPathExists=/sys/firmware/qemu_fw_cfg/by_name/opt/kernaid-tauri-sandbox-probe/raw
+ConditionVirtualization=|qemu
+ConditionVirtualization=|kvm
+Wants=systemd-modules-load.service systemd-udev-settle.service
+After=systemd-modules-load.service systemd-udev-settle.service
 Before=kernaid-tauri-network-probe.socket kernaid-tauri-network-probe-baseline.service kernaid-rescue-desk-shell.service
 PartOf=kernaid-tauri-network-probe.socket
 
 [Service]
 Type=oneshot
-ExecStartPre=/usr/bin/python3 -I /usr/lib/kernaid/tauri_network_probe.py verify-marker
+ExecStartPre=/usr/bin/python3 -I /usr/lib/kernaid/tauri_network_probe.py wait-marker
 ExecStart=/usr/sbin/ip address replace 192.0.2.1/32 dev lo
 ExecStartPost=/usr/bin/python3 -I /usr/lib/kernaid/tauri_network_probe.py verify-alias
 ExecStop=-/usr/sbin/ip address del 192.0.2.1/32 dev lo

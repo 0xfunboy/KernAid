@@ -564,10 +564,52 @@ class RescueTauriBoundaryTests(unittest.TestCase):
             / "rescue/live-build/config/includes.chroot/etc/systemd/system"
             / "kernaid-tauri-network-probe-baseline.service"
         ).read_text(encoding="utf-8")
+        address_service = (
+            REPO_DIR
+            / "rescue/live-build/config/includes.chroot/etc/systemd/system"
+            / "kernaid-tauri-network-probe-address.service"
+        ).read_text(encoding="utf-8")
+        socket_service = (
+            REPO_DIR
+            / "rescue/live-build/config/includes.chroot/etc/systemd/system"
+            / "kernaid-tauri-network-probe.socket"
+        ).read_text(encoding="utf-8")
+        sink_service = (
+            REPO_DIR
+            / "rescue/live-build/config/includes.chroot/etc/systemd/system"
+            / "kernaid-tauri-network-probe@.service"
+        ).read_text(encoding="utf-8")
+        modules_load = (
+            REPO_DIR
+            / "rescue/live-build/config/includes.chroot/etc/modules-load.d"
+            / "kernaid-qemu-fw-cfg.conf"
+        ).read_text(encoding="utf-8")
         self.assertIn(
             "RestrictAddressFamilies=AF_UNIX AF_INET AF_NETLINK",
             baseline_service,
         )
+        for probe_unit in (
+            address_service,
+            socket_service,
+            baseline_service,
+            sink_service,
+        ):
+            self.assertNotIn("ConditionPathExists=", probe_unit)
+            self.assertIn("ConditionVirtualization=|qemu", probe_unit)
+            self.assertIn("ConditionVirtualization=|kvm", probe_unit)
+        self.assertIn(
+            "Wants=systemd-modules-load.service systemd-udev-settle.service",
+            address_service,
+        )
+        self.assertIn(
+            "After=systemd-modules-load.service systemd-udev-settle.service",
+            address_service,
+        )
+        self.assertIn(
+            "ExecStartPre=/usr/bin/python3 -I /usr/lib/kernaid/tauri_network_probe.py wait-marker",
+            address_service,
+        )
+        self.assertEqual(modules_load, "qemu_fw_cfg\n")
 
     def test_lightdm_session_is_minimal_and_busless(self) -> None:
         root = REPO_DIR / "rescue/live-build/config/includes.chroot"

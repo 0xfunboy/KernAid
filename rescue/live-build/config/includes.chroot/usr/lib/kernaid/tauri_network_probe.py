@@ -9,6 +9,7 @@ import socket
 import stat
 import subprocess
 import sys
+import time
 
 
 FW_CFG_PATH = (
@@ -20,6 +21,8 @@ BASELINE_DIRECTORY = "/run/kernaid-tauri-network-probe"
 BASELINE_PATH = f"{BASELINE_DIRECTORY}/baseline-v1"
 BASELINE = b"KERNAID_RESCUE_TAURI_NETWORK_BASELINE_V1 connected=true\n"
 MAX_IP_OUTPUT_BYTES = 64 * 1024
+FW_CFG_WAIT_SECONDS = 5.0
+FW_CFG_POLL_SECONDS = 0.05
 
 
 class ProbeError(Exception):
@@ -46,6 +49,18 @@ def _read_fw_cfg() -> None:
         os.close(descriptor)
     if payload not in (b"v1", b"v1\0"):
         raise ProbeError
+
+
+def _wait_for_fw_cfg() -> None:
+    deadline = time.monotonic() + FW_CFG_WAIT_SECONDS
+    while True:
+        try:
+            _read_fw_cfg()
+            return
+        except FileNotFoundError:
+            if time.monotonic() >= deadline:
+                raise ProbeError
+            time.sleep(FW_CFG_POLL_SECONDS)
 
 
 def _alias_ready() -> None:
@@ -134,6 +149,9 @@ def _write_baseline() -> None:
 
 
 def run(mode: str) -> None:
+    if mode == "wait-marker":
+        _wait_for_fw_cfg()
+        return
     _read_fw_cfg()
     if mode == "verify-marker":
         return
