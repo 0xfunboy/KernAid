@@ -658,6 +658,8 @@ class RescueTauriBoundaryTests(unittest.TestCase):
         )
         self.assertIn("AmbientCapabilities=\n", attestor_unit)
         self.assertIn("PrivateNetwork=yes", attestor_unit)
+        self.assertIn("ProtectHome=tmpfs", attestor_unit)
+        self.assertIn("BindPaths=/run/user", attestor_unit)
         self.assertIn(
             "SystemCallFilter=~ptrace process_vm_readv process_vm_writev kcmp",
             attestor_unit,
