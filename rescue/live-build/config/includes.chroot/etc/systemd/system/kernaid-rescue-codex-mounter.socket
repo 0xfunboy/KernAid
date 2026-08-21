@@ -1,18 +1,18 @@
 [Unit]
-Description=KernAid Rescue Codex authentication bridge socket
+Description=KernAid Rescue Codex mount broker socket
 Requires=systemd-sysusers.service
 After=systemd-sysusers.service
-Before=kernaid-ui.service
+Before=kernaid-rescue-vaultd.service
 ConditionKernelCommandLine=boot=live
 
 [Socket]
-ListenSequentialPacket=/run/kernaid-rescue-codex.sock
+ListenSequentialPacket=/run/kernaid-rescue-codex-mounter.sock
 Accept=yes
 MaxConnections=1
 Backlog=1
-SocketMode=0660
+SocketMode=0600
 SocketUser=root
-SocketGroup=kernaid-codex-client
+SocketGroup=root
 RemoveOnStop=yes
 PassCredentials=no
 PassSecurity=no

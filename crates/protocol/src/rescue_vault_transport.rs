@@ -20,7 +20,7 @@ use crate::rescue_vault::{
     MAX_SIGNED_REPORT_ENVELOPE_BYTES, MIN_PASSPHRASE_BYTES, Operation, ProtocolViolation, Provider,
     ProviderState, ProviderStatusPayload, ReportId, ReportSummary, RequestId, Sha256,
     SuccessPayload, VaultState, VaultStatusPayload, valid_report_list, validate_borrowed_pipe,
-    validate_o_path_directory,
+    validate_mount_namespace_descriptor, validate_mount_root_descriptor, validate_o_path_directory,
 };
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::net::{
@@ -238,7 +238,7 @@ pub(crate) fn recv_seqpacket<Fd: AsFd>(
     if unexpected_ancillary {
         return Err(SeqpacketTransportError::UnexpectedAncillary);
     }
-    if descriptors.len() > 1 {
+    if descriptors.len() > 2 {
         return Err(SeqpacketTransportError::TooManyDescriptors);
     }
     if descriptors.iter().any(|descriptor| {
@@ -345,7 +345,7 @@ fn classify_zero_length_receive(
 
 /// Sends exactly one bounded AF_UNIX `SOCK_SEQPACKET` record.
 ///
-/// At most one descriptor is accepted. `MSG_NOSIGNAL` prevents a closed peer
+/// At most two descriptors are accepted. `MSG_NOSIGNAL` prevents a closed peer
 /// from terminating the process, and any non-full send is an error.
 pub(crate) fn send_seqpacket<Fd: AsFd>(
     socket: Fd,
@@ -362,13 +362,13 @@ pub(crate) fn send_seqpacket<Fd: AsFd>(
     if bytes.len() > MAX_DATAGRAM_BYTES {
         return Err(SeqpacketTransportError::DatagramTooLarge);
     }
-    if descriptors.len() > 1 {
+    if descriptors.len() > 2 {
         return Err(SeqpacketTransportError::TooManyDescriptors);
     }
     ensure_deadline(deadline)?;
 
     let io = [IoSlice::new(bytes)];
-    let mut control_space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+    let mut control_space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(2))];
     let mut control = SendAncillaryBuffer::new(&mut control_space);
     if !descriptors.is_empty() && !control.push(SendAncillaryMessage::ScmRights(descriptors)) {
         return Err(SeqpacketTransportError::IoFailed);
@@ -659,6 +659,13 @@ struct InputRequestPayload<'a> {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexHomeLeaseRequestPayload {
+    mount_namespace: DescriptorDeclaration,
+    mount_root: DescriptorDeclaration,
+}
+
+#[derive(Serialize)]
 struct LogoutRequestPayload {
     provider: Provider,
 }
@@ -700,7 +707,6 @@ pub fn encode_client_request(
         | ClientRequestPayload::VaultLock
         | ClientRequestPayload::ProviderStatus
         | ClientRequestPayload::ProviderOpenAiBorrow
-        | ClientRequestPayload::ProviderCodexHomeLease
         | ClientRequestPayload::ReportList => {
             encode_client_request_payload(request, EmptyRequestPayload {})
         }
@@ -711,6 +717,19 @@ pub fn encode_client_request(
                 input: declaration
                     .as_ref()
                     .ok_or(ProtocolViolation::InvalidPayload)?,
+            },
+        ),
+        ClientRequestPayload::ProviderCodexHomeLease => encode_client_request_payload(
+            request,
+            CodexHomeLeaseRequestPayload {
+                mount_namespace: DescriptorDeclaration {
+                    kind: DescriptorType::CodexMountNamespace,
+                    size: 0,
+                },
+                mount_root: DescriptorDeclaration {
+                    kind: DescriptorType::CodexMountRoot,
+                    size: 0,
+                },
             },
         ),
         ClientRequestPayload::ProviderLogout { provider } => encode_client_request_payload(
@@ -775,11 +794,32 @@ fn validate_client_request_descriptors(
     request: &ClientRequest,
     descriptors: &[BorrowedFd<'_>],
 ) -> Result<(), ProtocolViolation> {
+    if matches!(
+        request.payload(),
+        ClientRequestPayload::ProviderCodexHomeLease
+    ) {
+        return match descriptors {
+            [] | [_] => Err(ProtocolViolation::FdRequired),
+            [namespace, root] => {
+                validate_mount_namespace_descriptor(*namespace)?;
+                validate_mount_root_descriptor(*root)
+            }
+            [_, _, ..] => Err(ProtocolViolation::FdForbidden),
+        };
+    }
     match (request.payload.input_declaration(), descriptors) {
         (None, []) => Ok(()),
         (None, [_, ..]) | (Some(_), [_, _, ..]) => Err(ProtocolViolation::FdForbidden),
         (Some(_), []) => Err(ProtocolViolation::FdRequired),
-        (Some(_), [descriptor]) => validate_borrowed_pipe(*descriptor),
+        (Some(declaration), [descriptor]) => match declaration.kind {
+            DescriptorType::CodexMountNamespace => validate_mount_namespace_descriptor(*descriptor),
+            DescriptorType::PassphrasePipe
+            | DescriptorType::OpenAiApiKeyPipe
+            | DescriptorType::SessionReportJsonPipe => validate_borrowed_pipe(*descriptor),
+            DescriptorType::CodexHomeOPath
+            | DescriptorType::CodexMountRoot
+            | DescriptorType::SignedReportEnvelopePipe => Err(ProtocolViolation::InvalidPayload),
+        },
     }
 }
 
@@ -1311,9 +1351,10 @@ fn validate_one_descriptor(
             validate_borrowed_pipe(descriptor)
         }
         DescriptorType::CodexHomeOPath => validate_o_path_directory(descriptor),
-        DescriptorType::PassphrasePipe | DescriptorType::SessionReportJsonPipe => {
-            Err(ProtocolViolation::InvalidDescriptor)
-        }
+        DescriptorType::PassphrasePipe
+        | DescriptorType::CodexMountNamespace
+        | DescriptorType::CodexMountRoot
+        | DescriptorType::SessionReportJsonPipe => Err(ProtocolViolation::InvalidDescriptor),
     };
     result.map_err(|_| ClientResponseDecodeError::InvalidDescriptor)
 }
@@ -1353,6 +1394,24 @@ mod tests {
     fn read_pipe() -> OwnedFd {
         let (read, _write) = pipe_with(PipeFlags::CLOEXEC).expect("pipe");
         read
+    }
+
+    fn mount_namespace() -> OwnedFd {
+        rustix::fs::open(
+            "/proc/self/ns/mnt",
+            OFlags::RDONLY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .expect("mount namespace")
+    }
+
+    fn mount_root() -> OwnedFd {
+        rustix::fs::open(
+            "/",
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .expect("mount root")
     }
 
     fn test_deadline() -> Instant {
@@ -1623,23 +1682,28 @@ mod tests {
         let (sender, receiver) = seqpacket_pair();
         let (first_read, first_write) = pipe_with(PipeFlags::CLOEXEC).expect("first pipe");
         let (second_read, second_write) = pipe_with(PipeFlags::CLOEXEC).expect("second pipe");
+        let (third_read, third_write) = pipe_with(PipeFlags::CLOEXEC).expect("third pipe");
         let first_inode = rustix::fs::fstat(&first_read).expect("first stat").st_ino;
         let second_inode = rustix::fs::fstat(&second_read).expect("second stat").st_ino;
+        let third_inode = rustix::fs::fstat(&third_read).expect("third stat").st_ino;
         raw_send_descriptors(
             sender.as_fd(),
-            b"two",
-            &[first_read.as_fd(), second_read.as_fd()],
+            b"three",
+            &[first_read.as_fd(), second_read.as_fd(), third_read.as_fd()],
         );
         drop(first_read);
         drop(second_read);
+        drop(third_read);
         assert_eq!(
             recv_seqpacket(receiver.as_fd(), test_deadline()).err(),
             Some(SeqpacketTransportError::TooManyDescriptors)
         );
         assert_eq!(count_open_pipe_inode(first_inode), 1);
         assert_eq!(count_open_pipe_inode(second_inode), 1);
+        assert_eq!(count_open_pipe_inode(third_inode), 1);
         drop(first_write);
         drop(second_write);
+        drop(third_write);
     }
 
     #[test]
@@ -1977,6 +2041,23 @@ mod tests {
                 .expect("UTF-8")
                 .contains("passphrase-pipe")
         );
+        let codex = request(ClientRequestPayload::ProviderCodexHomeLease);
+        assert_eq!(
+            encode_client_request(&codex, &[]),
+            Err(ProtocolViolation::FdRequired)
+        );
+        assert_eq!(
+            encode_client_request(&codex, &[read_pipe().as_fd()]),
+            Err(ProtocolViolation::FdRequired)
+        );
+        let namespace = mount_namespace();
+        let root = mount_root();
+        let bytes = encode_client_request(&codex, &[namespace.as_fd(), root.as_fd()])
+            .expect("Codex namespace request");
+        let encoded = String::from_utf8(bytes).expect("UTF-8");
+        assert!(encoded.contains("codex-mount-namespace"));
+        assert!(encoded.contains("codex-mount-root"));
+        assert!(encoded.contains("\"size\":0"));
         assert_eq!(
             ClientRequest::new(
                 RequestId::parse(REQUEST_ID).expect("request ID"),

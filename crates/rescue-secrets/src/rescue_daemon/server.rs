@@ -45,6 +45,9 @@ use std::{
 };
 use zeroize::Zeroizing;
 
+#[cfg(test)]
+use rustix::fs::Mode;
+
 const CONNECTION_LIMIT: usize = 16;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(3);
 const ACCEPT_POLL_SLICE: Duration = Duration::from_millis(200);
@@ -2163,7 +2166,7 @@ impl Supervisor {
 
     fn handle_provider_borrow(
         self: &Arc<Self>,
-        request: ValidatedRequest,
+        mut request: ValidatedRequest,
         started: Instant,
         connection: &ClientConnection<'_>,
     ) -> (u64, HandlerResult) {
@@ -2176,7 +2179,39 @@ impl Supervisor {
         let handoff_deadline = started
             .checked_add(PROVIDER_BORROW_TIMEOUT)
             .unwrap_or(started);
-        if !matches!(request.payload(), RequestPayload::Empty) {
+        let (_codex_mount_namespace, _codex_mount_root): (Option<OwnedFd>, Option<OwnedFd>) =
+            match lease_kind {
+                ProviderLeaseKind::OpenAi if matches!(request.payload(), RequestPayload::Empty) => {
+                    if request.take_descriptor().is_some() {
+                        let version = self.snapshot().version;
+                        return (version, HandlerResult::Error(request, ErrorToken::IoFailed));
+                    }
+                    (None, None)
+                }
+                #[cfg(feature = "experimental-codex-home-lease")]
+                ProviderLeaseKind::CodexHome
+                    if matches!(
+                        request.payload(),
+                        RequestPayload::ProviderCodexHomeLease { .. }
+                    ) =>
+                {
+                    let root = request.take_descriptor();
+                    let namespace = request.take_descriptor();
+                    if request.take_descriptor().is_some() {
+                        let version = self.snapshot().version;
+                        return (version, HandlerResult::Error(request, ErrorToken::IoFailed));
+                    }
+                    (namespace, root)
+                }
+                _ => {
+                    let version = self.snapshot().version;
+                    return (version, HandlerResult::Error(request, ErrorToken::IoFailed));
+                }
+            };
+        #[cfg(feature = "experimental-codex-home-lease")]
+        if lease_kind == ProviderLeaseKind::CodexHome
+            && (_codex_mount_namespace.is_none() || _codex_mount_root.is_none())
+        {
             let version = self.snapshot().version;
             return (version, HandlerResult::Error(request, ErrorToken::IoFailed));
         }
@@ -2282,6 +2317,32 @@ impl Supervisor {
                 {
                     drop(descriptor);
                     return self.fail_ambiguous_borrow(lease_id, handoff_deadline, output);
+                }
+                #[cfg(feature = "experimental-codex-home-lease")]
+                if lease_kind == ProviderLeaseKind::CodexHome
+                    && response.code == internal_wire::WorkerResultCode::ProviderCodexHomeReady
+                    && response.output_size.is_none()
+                {
+                    let Some(home) = descriptor.as_ref() else {
+                        return self.fail_ambiguous_borrow(lease_id, handoff_deadline, output);
+                    };
+                    let Some(namespace) = _codex_mount_namespace.as_ref() else {
+                        return self.fail_ambiguous_borrow(lease_id, handoff_deadline, output);
+                    };
+                    let Some(root) = _codex_mount_root.as_ref() else {
+                        return self.fail_ambiguous_borrow(lease_id, handoff_deadline, output);
+                    };
+                    if super::codex_mounter::mount_codex_home(
+                        home.as_fd(),
+                        namespace.as_fd(),
+                        root.as_fd(),
+                        handoff_deadline,
+                    )
+                    .is_err()
+                    {
+                        drop(descriptor);
+                        return self.fail_ambiguous_borrow(lease_id, handoff_deadline, output);
+                    }
                 }
                 if let Some(descriptor) = descriptor
                     && let Err(descriptor) = output.adopt(descriptor)
@@ -4307,7 +4368,9 @@ fn external_operation_is_enabled(
 }
 
 #[cfg(feature = "experimental-codex-home-lease")]
-fn validate_codex_home_handoff(descriptor: &OwnedFd) -> Result<(), RescueVaultDaemonError> {
+pub(super) fn validate_codex_home_handoff(
+    descriptor: &OwnedFd,
+) -> Result<(), RescueVaultDaemonError> {
     const EXT4_SUPER_MAGIC: u64 = 0xef53;
     let stat = rfs::fstat(descriptor).map_err(|_| RescueVaultDaemonError::ProtocolFailure)?;
     let filesystem =
@@ -5328,8 +5391,18 @@ mod tests {
         .expect("request json");
         if let Some(descriptor) = descriptor {
             let io = [IoSlice::new(&datagram)];
-            let rights = [descriptor];
-            let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+            let mount_root = (operation == "provider.codex.home_lease").then(|| {
+                rfs::open(
+                    "/",
+                    OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .expect("mount root")
+            });
+            let rights = mount_root
+                .as_ref()
+                .map_or_else(|| vec![descriptor], |root| vec![descriptor, root.as_fd()]);
+            let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(2))];
             let mut ancillary = SendAncillaryBuffer::new(&mut space);
             assert!(ancillary.push(SendAncillaryMessage::ScmRights(&rights)));
             assert_eq!(
@@ -6956,11 +7029,20 @@ mod tests {
             ))],
             true,
         );
+        let namespace = rfs::open(
+            "/proc/self/ns/mnt",
+            OFlags::RDONLY | OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .expect("mount namespace");
         let (request, client, server) = validated_request_with_connection_for_role(
             "provider.codex.home_lease",
-            serde_json::json!({}),
+            serde_json::json!({
+                "mountNamespace": {"type": "codex-mount-namespace", "size": 0},
+                "mountRoot": {"type": "codex-mount-root", "size": 0}
+            }),
             714,
-            None,
+            Some(namespace.as_fd()),
             PeerRole::Agent(AgentRole::Codex),
         );
         let (version, result) = supervisor.handle_connected_request(
@@ -7011,11 +7093,20 @@ mod tests {
             let (supervisor, _, worker, privacy, _) = fake_supervisor(state, [], true);
             supervisor.stopping.store(stopping, Ordering::Release);
             let expected_version = supervisor.snapshot().version;
+            let namespace = rfs::open(
+                "/proc/self/ns/mnt",
+                OFlags::RDONLY | OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .expect("mount namespace");
             let (request, client, server) = validated_request_with_connection_for_role(
                 "provider.codex.home_lease",
-                serde_json::json!({}),
+                serde_json::json!({
+                    "mountNamespace": {"type": "codex-mount-namespace", "size": 0},
+                    "mountRoot": {"type": "codex-mount-root", "size": 0}
+                }),
                 expected_version,
-                None,
+                Some(namespace.as_fd()),
                 PeerRole::Agent(AgentRole::Codex),
             );
             let (version, result) = supervisor.handle_connected_request(

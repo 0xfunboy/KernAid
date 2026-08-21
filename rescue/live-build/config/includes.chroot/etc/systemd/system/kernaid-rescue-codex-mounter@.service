@@ -1,0 +1,58 @@
+[Unit]
+Description=KernAid Rescue one-shot Codex mount broker
+Requires=kernaid-rescue-codex-mounter.socket
+BindsTo=kernaid-rescue-vaultd.service
+After=kernaid-rescue-codex-mounter.socket kernaid-rescue-vaultd.service
+CollectMode=inactive-or-failed
+ConditionKernelCommandLine=boot=live
+ConditionPathIsDirectory=/run/live/medium
+
+[Service]
+Type=simple
+ExecStart=/usr/lib/kernaid/kernaid-rescue-codex-mounter
+RuntimeMaxSec=10s
+TimeoutStartSec=3s
+TimeoutStopSec=3s
+Restart=no
+StandardInput=socket
+StandardOutput=null
+StandardError=null
+User=root
+Group=root
+UMask=0077
+LimitCORE=0
+LimitNOFILE=16
+TasksMax=1
+KillMode=process
+SendSIGKILL=yes
+NoNewPrivileges=yes
+PrivateMounts=yes
+PrivateNetwork=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateIPC=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+# The broker attests /proc/swaps, the vault peer cgroup, namespace ownership,
+# and its post-setns mount table. ProcSubset=pid hides those kernel records.
+DevicePolicy=closed
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETPCAP
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=mnt
+RestrictRealtime=yes
+# systemd 257 implements RestrictSUIDSGID with an openat2 denial. The broker
+# uses openat2 for its fixed target and bounded procfs attestations; exact
+# capabilities, NoNewPrivileges and the fixed protocol retain the boundary.
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+KeyringMode=private
+RemoveIPC=yes

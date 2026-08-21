@@ -1,7 +1,7 @@
 [Unit]
 Description=KernAid Rescue vault lifecycle daemon
-Requires=kernaid-rescue-vaultd.socket live-config.service systemd-sysusers.service
-After=kernaid-rescue-vaultd.socket live-config.service systemd-sysusers.service systemd-sysctl.service systemd-tmpfiles-setup.service
+Requires=kernaid-rescue-vaultd.socket kernaid-rescue-codex-mounter.socket live-config.service systemd-sysusers.service
+After=kernaid-rescue-vaultd.socket kernaid-rescue-codex-mounter.socket live-config.service systemd-sysusers.service systemd-sysctl.service systemd-tmpfiles-setup.service
 Before=kernaid-ready.service
 ConditionKernelCommandLine=boot=live
 ConditionPathIsDirectory=/run/live/medium

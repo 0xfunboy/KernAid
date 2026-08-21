@@ -8,11 +8,16 @@
 //! long-lived worker process which is moved into its delegated cgroup before
 //! it receives any work.
 
+#[cfg(feature = "experimental-codex-home-lease")]
+mod codex_mounter;
 mod companion;
 mod internal_wire;
 mod runtime;
 mod server;
 mod worker;
+
+#[cfg(feature = "experimental-codex-home-lease")]
+pub use codex_mounter::run_rescue_codex_mounter;
 
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, ResolveFlags};
 use std::{error::Error, ffi::OsString, fmt};

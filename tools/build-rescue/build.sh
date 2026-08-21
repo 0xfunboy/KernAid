@@ -4,6 +4,7 @@ set -euo pipefail
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 build_dir="$repo_dir/rescue/live-build"
 vaultd_binary="${KERNAID_RESCUE_VAULTD_BINARY:-$repo_dir/target/release/kernaid-rescue-vaultd}"
+codex_mounter_binary="${KERNAID_RESCUE_CODEX_MOUNTER_BINARY:-$repo_dir/target/release/kernaid-rescue-codex-mounter}"
 vaultctl_binary="${KERNAID_RESCUE_VAULTCTL_BINARY:-$repo_dir/target/release/kernaid-rescue-vaultctl}"
 openai_executor_binary="${KERNAID_RESCUE_OPENAI_EXECUTOR_BINARY:-$repo_dir/target/release/kernaid-rescue-openai-executor}"
 hardware_inventory_binary="${KERNAID_LINUX_HARDWARE_INVENTORY_BINARY:-$repo_dir/target/release/kernaid-linux-hardware-inventory}"
@@ -12,6 +13,7 @@ codex_bridge_binary="${KERNAID_RESCUE_CODEX_BRIDGE_BINARY:-$repo_dir/target/rele
 codex_client_binary="${KERNAID_RESCUE_CODEX_CLIENT_BINARY:-$repo_dir/target/release/kernaid-codex-auth}"
 codex_cli_binary="${KERNAID_RESCUE_CODEX_CLI_BINARY:-$repo_dir/target/rescue-codex-root/usr/lib/kernaid/codex}"
 vaultd_destination="$build_dir/config/includes.chroot/usr/lib/kernaid/kernaid-rescue-vaultd"
+codex_mounter_destination="$build_dir/config/includes.chroot/usr/lib/kernaid/kernaid-rescue-codex-mounter"
 vaultctl_destination="$build_dir/config/includes.chroot/usr/bin/kernaid-rescue-vaultctl"
 openai_executor_destination="$build_dir/config/includes.chroot/usr/lib/kernaid/kernaid-rescue-openai-executor"
 codex_bridge_destination="$build_dir/config/includes.chroot/usr/lib/kernaid/kernaid-rescue-codex"
@@ -54,6 +56,7 @@ PY
 }
 
 validate_amd64_elf "$vaultd_binary" "Rescue vault daemon"
+validate_amd64_elf "$codex_mounter_binary" "Rescue Codex mount broker"
 validate_amd64_elf "$vaultctl_binary" "Rescue vault companion"
 validate_amd64_elf "$openai_executor_binary" "Rescue OpenAI executor"
 validate_amd64_elf "$hardware_inventory_binary" "Linux hardware inventory collector"
@@ -84,6 +87,7 @@ PY
 
 for destination in \
   "$vaultd_destination" \
+  "$codex_mounter_destination" \
   "$vaultctl_destination" \
   "$openai_executor_destination" \
   "$hardware_inventory_destination" \
@@ -114,6 +118,7 @@ fi
 cleanup_staged_binaries() {
   rm -f -- \
     "$vaultd_destination" \
+    "$codex_mounter_destination" \
     "$vaultctl_destination" \
     "$openai_executor_destination" \
     "$hardware_inventory_destination" \
@@ -128,6 +133,7 @@ cleanup_staged_binaries() {
 trap cleanup_staged_binaries EXIT
 
 install -o root -g root -m 0755 "$vaultd_binary" "$vaultd_destination"
+install -o root -g root -m 0755 "$codex_mounter_binary" "$codex_mounter_destination"
 install -o root -g root -m 0755 "$vaultctl_binary" "$vaultctl_destination"
 install -o root -g root -m 0755 "$openai_executor_binary" "$openai_executor_destination"
 install -o root -g root -m 0755 "$hardware_inventory_binary" "$hardware_inventory_destination"
@@ -137,6 +143,7 @@ install -o root -g root -m 0755 "$codex_cli_binary" "$codex_cli_destination"
 install -o root -g root -m 0755 "$desk_shell_binary" "$desk_shell_destination"
 for destination in \
   "$vaultd_destination" \
+  "$codex_mounter_destination" \
   "$vaultctl_destination" \
   "$openai_executor_destination" \
   "$hardware_inventory_destination" \
@@ -147,6 +154,7 @@ for destination in \
   test "$(stat -c '%u:%g:%a' "$destination")" = "0:0:755"
 done
 python3 -I "$repo_dir/tools/build-rescue/verify-shipping-binary.py" "$vaultd_destination"
+python3 -I "$repo_dir/tools/build-rescue/verify-shipping-binary.py" "$codex_mounter_destination"
 python3 -I "$repo_dir/tools/build-rescue/verify-shipping-binary.py" "$vaultctl_destination"
 python3 -I "$repo_dir/tools/build-rescue/verify-shipping-binary.py" "$openai_executor_destination"
 python3 -I "$repo_dir/tools/build-rescue/verify-shipping-binary.py" "$hardware_inventory_destination"

@@ -10,6 +10,7 @@ on:
       - "crates/rescue-openai-executor/**"
       - "crates/rescue-openai-provider/**"
       - "crates/protocol/**"
+      - "crates/linux-nsfs/**"
       - "crates/storage/**"
       - "crates/device-identity/**"
       - "packages/schemas/rescue-openai-request.schema.json"

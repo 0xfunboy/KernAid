@@ -24,6 +24,7 @@ on:
       - "crates/evidence/**"
       - "crates/rescue-openai-executor/**"
       - "crates/rescue-codex-bridge/**"
+      - "crates/linux-nsfs/**"
       - "crates/rescue-openai-provider/**"
       - "crates/report-schema/**"
       - "crates/protocol/**"
@@ -167,6 +168,13 @@ jobs:
           retention-days: 1
       - name: Build the in-guest Rescue shipping binaries
         run: |
+          cargo fmt -p kernaid-linux-nsfs -- --check
+          cargo clippy --locked -p kernaid-linux-nsfs --all-targets -- -D warnings
+          cargo test --locked -p kernaid-linux-nsfs
+          cargo clippy --locked -p kernaid-rescue-secrets --all-targets \
+            --features experimental-codex-home-lease -- -D warnings
+          cargo test --locked -p kernaid-rescue-secrets \
+            --features experimental-codex-home-lease
           cargo fmt -p kernaid-rescue-openai-executor -- --check
           cargo clippy --locked -p kernaid-rescue-openai-executor --all-targets -- -D warnings
           cargo test --locked -p kernaid-rescue-openai-executor
@@ -176,7 +184,8 @@ jobs:
           cargo build --locked --release -p kernaid-rescue-secrets \
             --features experimental-codex-home-lease \
             --bin kernaid-rescue-vaultd \
-            --bin kernaid-rescue-vaultctl
+            --bin kernaid-rescue-vaultctl \
+            --bin kernaid-rescue-codex-mounter
           cargo build --locked --release -p kernaid-rescue-openai-executor \
             --bin kernaid-rescue-openai-executor
           cargo build --locked --release -p kernaid-linux-pack \
@@ -196,6 +205,7 @@ jobs:
           preflight_dir="$(sudo /usr/bin/mktemp -d /root/kernaid-rescue-shipping-preflight.XXXXXXXX)"
           cleanup_preflight() {
             sudo unlink -- "$preflight_dir/kernaid-rescue-vaultd" 2>/dev/null || true
+            sudo unlink -- "$preflight_dir/kernaid-rescue-codex-mounter" 2>/dev/null || true
             sudo unlink -- "$preflight_dir/kernaid-rescue-vaultctl" 2>/dev/null || true
             sudo unlink -- "$preflight_dir/kernaid-rescue-openai-executor" 2>/dev/null || true
             sudo unlink -- "$preflight_dir/kernaid-linux-hardware-inventory" 2>/dev/null || true
@@ -212,6 +222,9 @@ jobs:
           sudo install -o root -g root -m 0755 \
             target/release/kernaid-rescue-vaultd \
             "$preflight_dir/kernaid-rescue-vaultd"
+          sudo install -o root -g root -m 0755 \
+            target/release/kernaid-rescue-codex-mounter \
+            "$preflight_dir/kernaid-rescue-codex-mounter"
           sudo install -o root -g root -m 0755 \
             target/release/kernaid-rescue-vaultctl \
             "$preflight_dir/kernaid-rescue-vaultctl"
@@ -233,6 +246,8 @@ jobs:
           sudo /usr/bin/python3 -I tools/build-rescue/verify-shipping-binary.py \
             "$preflight_dir/kernaid-rescue-vaultd"
           sudo /usr/bin/python3 -I tools/build-rescue/verify-shipping-binary.py \
+            "$preflight_dir/kernaid-rescue-codex-mounter"
+          sudo /usr/bin/python3 -I tools/build-rescue/verify-shipping-binary.py \
             "$preflight_dir/kernaid-rescue-vaultctl"
           sudo /usr/bin/python3 -I tools/build-rescue/verify-shipping-binary.py \
             "$preflight_dir/kernaid-rescue-openai-executor"
@@ -249,6 +264,7 @@ jobs:
           docker run --rm --privileged \
             -e KERNAID_DESK_PREBUILT=1 \
             -e KERNAID_RESCUE_VAULTD_BINARY=/workspace/target/release/kernaid-rescue-vaultd \
+            -e KERNAID_RESCUE_CODEX_MOUNTER_BINARY=/workspace/target/release/kernaid-rescue-codex-mounter \
             -e KERNAID_RESCUE_VAULTCTL_BINARY=/workspace/target/release/kernaid-rescue-vaultctl \
             -e KERNAID_RESCUE_OPENAI_EXECUTOR_BINARY=/workspace/target/release/kernaid-rescue-openai-executor \
             -e KERNAID_LINUX_HARDWARE_INVENTORY_BINARY=/workspace/target/release/kernaid-linux-hardware-inventory \

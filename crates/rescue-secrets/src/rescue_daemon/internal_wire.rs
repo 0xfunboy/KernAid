@@ -713,7 +713,7 @@ pub(super) fn validate_control_socket(socket: BorrowedFd<'_>) -> Result<(), Inte
     Ok(())
 }
 
-fn send_record(
+pub(super) fn send_record(
     socket: BorrowedFd<'_>,
     bytes: &[u8],
     descriptors: &[BorrowedFd<'_>],
@@ -721,11 +721,11 @@ fn send_record(
 ) -> Result<(), InternalWireError> {
     ensure_deadline(deadline)?;
     validate_control_socket(socket)?;
-    if bytes.is_empty() || bytes.len() > MAX_RECORD_BYTES || descriptors.len() > 1 {
+    if bytes.is_empty() || bytes.len() > MAX_RECORD_BYTES || descriptors.len() > 3 {
         return Err(InternalWireError::InvalidFrame);
     }
     let io = [IoSlice::new(bytes)];
-    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(3))];
     let mut ancillary = SendAncillaryBuffer::new(&mut space);
     if !descriptors.is_empty() && !ancillary.push(SendAncillaryMessage::ScmRights(descriptors)) {
         return Err(InternalWireError::IoFailed);
@@ -749,7 +749,7 @@ fn send_record(
     }
 }
 
-fn receive_record(
+pub(super) fn receive_record(
     socket: BorrowedFd<'_>,
     deadline: Instant,
 ) -> Result<(Vec<u8>, Vec<OwnedFd>), InternalWireError> {
@@ -757,7 +757,7 @@ fn receive_record(
     validate_control_socket(socket)?;
     let mut bytes = [0_u8; MAX_RECORD_BYTES + 1];
     let mut io = [IoSliceMut::new(&mut bytes)];
-    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(2), ScmCredentials(1))];
+    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(3), ScmCredentials(1))];
     let mut ancillary = RecvAncillaryBuffer::new(&mut space);
     let message = loop {
         ensure_deadline(deadline)?;
@@ -793,7 +793,7 @@ fn receive_record(
         }
     }
     if unexpected
-        || descriptors.len() > 1
+        || descriptors.len() > 3
         || descriptors.iter().any(|descriptor| {
             rustix::io::fcntl_getfd(descriptor)
                 .map(|flags| !flags.contains(rustix::io::FdFlags::CLOEXEC))

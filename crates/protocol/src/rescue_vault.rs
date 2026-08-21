@@ -1,7 +1,7 @@
 //! Closed local IPC contract for the Rescue vault service.
 //!
 //! The transport is AF_UNIX `SOCK_SEQPACKET`. One packet contains exactly one
-//! UTF-8 JSON document and at most one `SCM_RIGHTS` descriptor. Peer identity
+//! UTF-8 JSON document and at most two `SCM_RIGHTS` descriptors. Peer identity
 //! is always taken from `SO_PEERCRED`; a PID or UID in JSON would be attacker
 //! input and is therefore not part of the wire format.
 
@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use std::{
     fmt,
-    os::fd::{BorrowedFd, OwnedFd},
+    os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
+    path::PathBuf,
     sync::Arc,
     time::Instant,
 };
@@ -50,6 +51,7 @@ pub const MAX_REPORTS_PER_RESPONSE: usize = 256;
 /// Fixed authenticated media type for every persisted SessionReport payload.
 pub const SESSION_REPORT_MEDIA_TYPE: &str = "application/json";
 const PIPEFS_MAGIC: u64 = 0x5049_5045;
+const NSFS_MAGIC: u64 = 0x6e73_6673;
 
 /// The unprivileged identities allowed to connect to the service.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -508,6 +510,10 @@ pub enum DescriptorType {
     OpenAiApiKeyPipe,
     #[serde(rename = "codex-home-o-path")]
     CodexHomeOPath,
+    #[serde(rename = "codex-mount-namespace")]
+    CodexMountNamespace,
+    #[serde(rename = "codex-mount-root")]
+    CodexMountRoot,
     #[serde(rename = "session-report-json-pipe")]
     SessionReportJsonPipe,
     #[serde(rename = "signed-report-envelope-pipe")]
@@ -583,6 +589,10 @@ pub enum RequestPayload {
     },
     ProviderOpenAiConfigure {
         input: DescriptorDeclaration,
+    },
+    ProviderCodexHomeLease {
+        mount_namespace: DescriptorDeclaration,
+        mount_root: DescriptorDeclaration,
     },
     ProviderLogout {
         provider: Provider,
@@ -863,6 +873,13 @@ struct DescriptorPayload {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CodexHomeLeasePayload {
+    mount_namespace: DescriptorDeclaration,
+    mount_root: DescriptorDeclaration,
+}
+
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LogoutPayload {
     provider: Provider,
@@ -1007,7 +1024,6 @@ fn parse_payload(
         | Operation::VaultLock
         | Operation::ProviderStatus
         | Operation::ProviderOpenAiBorrow
-        | Operation::ProviderCodexHomeLease
         | Operation::ReportList => {
             serde_json::from_str::<EmptyPayload>(raw.get())
                 .map_err(|_| ProtocolViolation::InvalidPayload)?;
@@ -1037,6 +1053,21 @@ fn parse_payload(
             )?;
             Ok(RequestPayload::ProviderOpenAiConfigure {
                 input: payload.input,
+            })
+        }
+        Operation::ProviderCodexHomeLease => {
+            let payload = serde_json::from_str::<CodexHomeLeasePayload>(raw.get())
+                .map_err(|_| ProtocolViolation::InvalidPayload)?;
+            validate_declaration(
+                &payload.mount_namespace,
+                DescriptorType::CodexMountNamespace,
+                0,
+                0,
+            )?;
+            validate_declaration(&payload.mount_root, DescriptorType::CodexMountRoot, 0, 0)?;
+            Ok(RequestPayload::ProviderCodexHomeLease {
+                mount_namespace: payload.mount_namespace,
+                mount_root: payload.mount_root,
             })
         }
         Operation::ProviderLogout => {
@@ -1142,6 +1173,7 @@ fn payload_descriptor(payload: &RequestPayload) -> Option<&DescriptorDeclaration
         RequestPayload::VaultUnlock { input }
         | RequestPayload::ProviderOpenAiConfigure { input }
         | RequestPayload::ReportPersist { input, .. } => Some(input),
+        RequestPayload::ProviderCodexHomeLease { .. } => None,
         RequestPayload::Empty
         | RequestPayload::ProviderLogout { .. }
         | RequestPayload::AuditAppend { .. }
@@ -1153,9 +1185,37 @@ fn validate_received_descriptors(
     payload: &RequestPayload,
     descriptors: &[OwnedFd],
 ) -> Result<(), ProtocolViolation> {
+    if let RequestPayload::ProviderCodexHomeLease {
+        mount_namespace,
+        mount_root,
+    } = payload
+    {
+        validate_declaration(mount_namespace, DescriptorType::CodexMountNamespace, 0, 0)?;
+        validate_declaration(mount_root, DescriptorType::CodexMountRoot, 0, 0)?;
+        return match descriptors {
+            [] | [_] => Err(ProtocolViolation::FdRequired),
+            [namespace, root] => {
+                validate_mount_namespace_descriptor(namespace.as_fd())?;
+                validate_mount_root_descriptor(root.as_fd())
+            }
+            [_, _, ..] => Err(ProtocolViolation::FdForbidden),
+        };
+    }
     match (payload_descriptor(payload), descriptors) {
         (Some(_), []) => return Err(ProtocolViolation::FdRequired),
-        (Some(_), [descriptor]) => validate_pipe_descriptor(descriptor)?,
+        (Some(declaration), [descriptor]) => match declaration.kind {
+            DescriptorType::CodexMountNamespace => {
+                validate_mount_namespace_descriptor(descriptor.as_fd())?
+            }
+            DescriptorType::PassphrasePipe
+            | DescriptorType::OpenAiApiKeyPipe
+            | DescriptorType::SessionReportJsonPipe => validate_pipe_descriptor(descriptor)?,
+            DescriptorType::CodexHomeOPath
+            | DescriptorType::CodexMountRoot
+            | DescriptorType::SignedReportEnvelopePipe => {
+                return Err(ProtocolViolation::InvalidPayload);
+            }
+        },
         (Some(_), [_, ..]) | (None, [_, ..]) => return Err(ProtocolViolation::FdForbidden),
         (None, []) => {}
     }
@@ -1177,6 +1237,62 @@ fn validate_pipe_descriptor(descriptor: &OwnedFd) -> Result<(), ProtocolViolatio
         || status & OFlags::ACCMODE != OFlags::RDONLY
         || !fd_flags.contains(rustix::io::FdFlags::CLOEXEC)
         || stat.st_size != 0
+    {
+        return Err(ProtocolViolation::InvalidDescriptor);
+    }
+    Ok(())
+}
+
+/// Validates the descriptor-only mount namespace capability used by the
+/// Codex home lease. The nsfs identity plus the kernel's fixed `mnt:[N]`
+/// procfs rendering distinguishes it from every other namespace kind without
+/// accepting a caller-provided path or identifier.
+pub fn validate_mount_namespace_descriptor(
+    descriptor: BorrowedFd<'_>,
+) -> Result<(), ProtocolViolation> {
+    use rustix::fs::{self as rfs, OFlags};
+
+    let filesystem = rfs::fstatfs(descriptor).map_err(|_| ProtocolViolation::InvalidDescriptor)?;
+    let status = rfs::fcntl_getfl(descriptor).map_err(|_| ProtocolViolation::InvalidDescriptor)?;
+    let flags =
+        rustix::io::fcntl_getfd(descriptor).map_err(|_| ProtocolViolation::InvalidDescriptor)?;
+    if u64::try_from(filesystem.f_type).ok() != Some(NSFS_MAGIC)
+        || status & OFlags::ACCMODE != OFlags::RDONLY
+        || flags != rustix::io::FdFlags::CLOEXEC
+    {
+        return Err(ProtocolViolation::InvalidDescriptor);
+    }
+    let target = std::fs::read_link(PathBuf::from(format!(
+        "/proc/self/fd/{}",
+        descriptor.as_raw_fd()
+    )))
+    .map_err(|_| ProtocolViolation::InvalidDescriptor)?;
+    let bytes = target.as_os_str().as_encoded_bytes();
+    let Some(identifier) = bytes
+        .strip_prefix(b"mnt:[")
+        .and_then(|value| value.strip_suffix(b"]"))
+    else {
+        return Err(ProtocolViolation::InvalidDescriptor);
+    };
+    if identifier.is_empty() || !identifier.iter().all(u8::is_ascii_digit) {
+        return Err(ProtocolViolation::InvalidDescriptor);
+    }
+    Ok(())
+}
+
+/// Validates the bridge root capability paired with its mount namespace.
+pub fn validate_mount_root_descriptor(descriptor: BorrowedFd<'_>) -> Result<(), ProtocolViolation> {
+    use rustix::fs::{self as rfs, FileType, OFlags};
+
+    let stat = rfs::fstat(descriptor).map_err(|_| ProtocolViolation::InvalidDescriptor)?;
+    let status = rfs::fcntl_getfl(descriptor).map_err(|_| ProtocolViolation::InvalidDescriptor)?;
+    let flags =
+        rustix::io::fcntl_getfd(descriptor).map_err(|_| ProtocolViolation::InvalidDescriptor)?;
+    if !FileType::from_raw_mode(stat.st_mode).is_dir()
+        || stat.st_uid != 0
+        || stat.st_gid != 0
+        || status != OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW
+        || flags != rustix::io::FdFlags::CLOEXEC
     {
         return Err(ProtocolViolation::InvalidDescriptor);
     }
@@ -1621,7 +1737,7 @@ fn validate_success(
         }
         (
             Operation::ProviderCodexHomeLease,
-            RequestPayload::Empty,
+            RequestPayload::ProviderCodexHomeLease { .. },
             SuccessPayload::Descriptor(declaration),
         ) if declaration.kind == DescriptorType::CodexHomeOPath && declaration.size == 0 => {
             Some(declaration)
@@ -1654,9 +1770,10 @@ fn validate_success(
                 validate_borrowed_pipe(*descriptor)
             }
             DescriptorType::CodexHomeOPath => validate_o_path_directory(*descriptor),
-            DescriptorType::PassphrasePipe | DescriptorType::SessionReportJsonPipe => {
-                Err(ProtocolViolation::InvalidPayload)
-            }
+            DescriptorType::PassphrasePipe
+            | DescriptorType::CodexMountNamespace
+            | DescriptorType::CodexMountRoot
+            | DescriptorType::SessionReportJsonPipe => Err(ProtocolViolation::InvalidPayload),
         },
     }
 }
@@ -1781,6 +1898,24 @@ mod tests {
     fn read_pipe() -> OwnedFd {
         let (read, _write) = pipe_with(PipeFlags::CLOEXEC).expect("pipe");
         read
+    }
+
+    fn mount_namespace() -> OwnedFd {
+        rustix::fs::open(
+            "/proc/self/ns/mnt",
+            OFlags::RDONLY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .expect("mount namespace")
+    }
+
+    fn mount_root() -> OwnedFd {
+        rustix::fs::open(
+            "/",
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .expect("mount root")
     }
 
     fn named_fifo() -> (tempfile::TempDir, OwnedFd) {
@@ -2440,7 +2575,6 @@ mod tests {
                 COMPANION_UID,
             ),
             ("provider.openai.borrow", "{}", OPENAI_UID),
-            ("provider.codex.home_lease", "{}", CODEX_UID),
             (
                 "audit.append",
                 "{\"sequence\":1,\"event\":\"agent-session-start\",\"outcome\":\"failed\",\"error\":\"IO_FAILED\"}",
@@ -2457,11 +2591,23 @@ mod tests {
             let decoded = decode_request(&request(operation, payload), peer(uid), Vec::new());
             assert!(decoded.is_ok(), "operation contract failed: {operation}");
         }
+        let codex = request(
+            "provider.codex.home_lease",
+            "{\"mountNamespace\":{\"type\":\"codex-mount-namespace\",\"size\":0},\"mountRoot\":{\"type\":\"codex-mount-root\",\"size\":0}}",
+        );
+        assert!(
+            decode_request(
+                &codex,
+                peer(CODEX_UID),
+                vec![mount_namespace(), mount_root()]
+            )
+            .is_ok()
+        );
         assert_eq!(
             decode_request(
-                &request("provider.codex.home_lease", "{}"),
+                &codex,
                 peer(COMPANION_UID),
-                Vec::new(),
+                vec![mount_namespace(), mount_root()],
             )
             .err(),
             Some(ProtocolViolation::NotAuthorized)
@@ -2545,8 +2691,8 @@ mod tests {
             ),
             (
                 "provider.codex.home_lease",
-                "{}",
-                false,
+                "{\"mountNamespace\":{\"type\":\"codex-mount-namespace\",\"size\":0},\"mountRoot\":{\"type\":\"codex-mount-root\",\"size\":0}}",
+                true,
                 [false, false, false, true],
             ),
             (
@@ -2576,7 +2722,11 @@ mod tests {
                 (OPENAI_UID, permissions[2]),
                 (CODEX_UID, permissions[3]),
             ] {
-                let descriptors = needs_descriptor.then(read_pipe).into_iter().collect();
+                let descriptors = if operation == "provider.codex.home_lease" {
+                    vec![mount_namespace(), mount_root()]
+                } else {
+                    needs_descriptor.then(read_pipe).into_iter().collect()
+                };
                 let result = decode_request(&request(operation, payload), peer(uid), descriptors);
                 if allowed {
                     assert!(result.is_ok(), "{operation} rejected UID {uid}");
@@ -2961,9 +3111,12 @@ mod tests {
     #[test]
     fn codex_home_response_requires_an_o_path_directory() {
         let request = decode_request(
-            &request("provider.codex.home_lease", "{}"),
+            &request(
+                "provider.codex.home_lease",
+                "{\"mountNamespace\":{\"type\":\"codex-mount-namespace\",\"size\":0},\"mountRoot\":{\"type\":\"codex-mount-root\",\"size\":0}}",
+            ),
             peer(CODEX_UID),
-            Vec::new(),
+            vec![mount_namespace(), mount_root()],
         )
         .expect("home lease request");
         let payload = SuccessPayload::Descriptor(DescriptorDeclaration {

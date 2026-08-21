@@ -2325,6 +2325,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "kernaid-linux-nsfs"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "rustix",
+]
+
+[[package]]
 name = "kernaid-linux-pack"
 version = "0.1.0"
 dependencies = [
@@ -2441,6 +2449,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "kernaid-device-identity",
+ "kernaid-linux-nsfs",
  "kernaid-protocol",
  "kernaid-report-schema",
  "kernaid-storage",

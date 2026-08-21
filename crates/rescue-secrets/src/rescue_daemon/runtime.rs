@@ -82,6 +82,10 @@ const SUPERVISOR_STARTUP_CAPABILITIES: CapabilitySet = CapabilitySet::SYS_ADMIN
 const SUPERVISOR_RUNTIME_CAPABILITIES: CapabilitySet =
     CapabilitySet::SYS_ADMIN.union(CapabilitySet::KILL);
 const WORKER_RUNTIME_CAPABILITIES: CapabilitySet = CapabilitySet::SYS_ADMIN;
+#[cfg(feature = "experimental-codex-home-lease")]
+const CODEX_MOUNTER_BOOTSTRAP_CAPABILITIES: CapabilitySet = CapabilitySet::SYS_ADMIN
+    .union(CapabilitySet::SYS_CHROOT)
+    .union(CapabilitySet::SETPCAP);
 
 pub(super) fn narrow_worker_capabilities() -> Result<(), RescueVaultDaemonError> {
     narrow_capabilities(
@@ -101,6 +105,25 @@ pub(super) fn narrow_supervisor_capabilities() -> Result<(), RescueVaultDaemonEr
 
 pub(super) fn verify_current_supervisor_capabilities() -> Result<(), RescueVaultDaemonError> {
     verify_exact_capabilities(SUPERVISOR_RUNTIME_CAPABILITIES)
+}
+
+#[cfg(feature = "experimental-codex-home-lease")]
+pub(super) fn normalize_codex_mounter_capabilities() -> Result<(), RescueVaultDaemonError> {
+    normalize_bootstrap_capabilities(CODEX_MOUNTER_BOOTSTRAP_CAPABILITIES)
+}
+
+#[cfg(feature = "experimental-codex-home-lease")]
+pub(super) fn drop_codex_mounter_chroot_capability() -> Result<(), RescueVaultDaemonError> {
+    narrow_capabilities(
+        CODEX_MOUNTER_BOOTSTRAP_CAPABILITIES,
+        CapabilitySet::SYS_ADMIN,
+        &[CapabilitySet::SYS_CHROOT, CapabilitySet::SETPCAP],
+    )
+}
+
+#[cfg(feature = "experimental-codex-home-lease")]
+pub(super) fn verify_codex_mounter_mount_capability() -> Result<(), RescueVaultDaemonError> {
+    verify_exact_capabilities(CapabilitySet::SYS_ADMIN)
 }
 
 pub(super) fn verify_all_supervisor_threads_capabilities() -> Result<(), RescueVaultDaemonError> {

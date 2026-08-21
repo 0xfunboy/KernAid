@@ -345,8 +345,20 @@ esac
 test -S /run/kernaid-rescue-codex.sock || fail "Codex authentication bridge pathname is not a socket"
 test "$(stat -c '%u:%g:%a:%h' -- /run/kernaid-rescue-codex.sock)" = "0:${codex_client_group_id}:660:1" \
     || fail "Codex authentication bridge socket ownership or mode is unsafe"
+test "$(systemctl show --property=ActiveState --value kernaid-rescue-codex-mounter.socket)" = "active" \
+    || fail "Codex mount broker socket is not active"
+codex_mounter_substate="$(systemctl show --property=SubState --value kernaid-rescue-codex-mounter.socket)" \
+    || fail "Codex mount broker socket state is unavailable"
+case "$codex_mounter_substate" in
+    listening|running) ;;
+    *) fail "Codex mount broker socket is not operational" ;;
+esac
+test -S /run/kernaid-rescue-codex-mounter.sock || fail "Codex mount broker pathname is not a socket"
+test "$(stat -c '%u:%g:%a:%h' -- /run/kernaid-rescue-codex-mounter.sock)" = "0:0:600:1" \
+    || fail "Codex mount broker socket ownership or mode is unsafe"
 for codex_helper in \
     /usr/lib/kernaid/kernaid-rescue-codex \
+    /usr/lib/kernaid/kernaid-rescue-codex-mounter \
     /usr/bin/kernaid-codex-auth; do
     test "$(stat -c '%F:%u:%g:%a:%h' -- "$codex_helper")" = "regular file:0:0:755:1" \
         || fail "Codex authentication helper metadata is unsafe"

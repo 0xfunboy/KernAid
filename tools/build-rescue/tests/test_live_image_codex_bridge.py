@@ -11,6 +11,8 @@ LIVE = REPO / "rescue/live-build/config/includes.chroot"
 SYSTEMD = LIVE / "etc/systemd/system"
 SOCKET = SYSTEMD / "kernaid-rescue-codex.socket"
 SERVICE = SYSTEMD / "kernaid-rescue-codex@.service"
+MOUNTER_SOCKET = SYSTEMD / "kernaid-rescue-codex-mounter.socket"
+MOUNTER_SERVICE = SYSTEMD / "kernaid-rescue-codex-mounter@.service"
 SYSUSERS = LIVE / "etc/sysusers.d/kernaid.conf"
 READY = LIVE / "usr/lib/kernaid/ready-check"
 HOOK = REPO / "rescue/live-build/config/hooks/live/0100-kernaid-safety.hook.chroot"
@@ -36,8 +38,8 @@ class ShippingCodexBridgeTests(unittest.TestCase):
             {
                 "ListenSequentialPacket": "/run/kernaid-rescue-codex.sock",
                 "Accept": "yes",
-                "MaxConnections": "2",
-                "Backlog": "2",
+                "MaxConnections": "1",
+                "Backlog": "1",
                 "SocketMode": "0660",
                 "SocketUser": "root",
                 "SocketGroup": "kernaid-codex-client",
@@ -68,9 +70,51 @@ class ShippingCodexBridgeTests(unittest.TestCase):
         self.assertEqual(service["DevicePolicy"], "closed")
         self.assertEqual(service["CapabilityBoundingSet"], "")
         self.assertEqual(service["AmbientCapabilities"], "")
+        self.assertEqual(
+            service["TemporaryFileSystem"],
+            "/run/kernaid-codex-home:rw,nosuid,nodev,noexec,nosymfollow,size=4k,mode=000,uid=0,gid=0",
+        )
         self.assertEqual(service["RestrictAddressFamilies"], "AF_UNIX AF_INET AF_INET6")
         self.assertNotIn("RestrictSUIDSGID", service)
         self.assertEqual(sections["Unit"]["BindsTo"], "kernaid-rescue-vaultd.service")
+
+    def test_mount_broker_is_root_only_one_shot_and_capability_narrowed(self) -> None:
+        socket = unit(MOUNTER_SOCKET)["Socket"]
+        self.assertEqual(
+            dict(socket),
+            {
+                "ListenSequentialPacket": "/run/kernaid-rescue-codex-mounter.sock",
+                "Accept": "yes",
+                "MaxConnections": "1",
+                "Backlog": "1",
+                "SocketMode": "0600",
+                "SocketUser": "root",
+                "SocketGroup": "root",
+                "RemoveOnStop": "yes",
+                "PassCredentials": "no",
+                "PassSecurity": "no",
+                "PassPacketInfo": "no",
+                "Timestamping": "off",
+            },
+        )
+        service = unit(MOUNTER_SERVICE)["Service"]
+        self.assertEqual(
+            service["ExecStart"], "/usr/lib/kernaid/kernaid-rescue-codex-mounter"
+        )
+        self.assertEqual(service["User"], "root")
+        self.assertEqual(service["Group"], "root")
+        self.assertEqual(service["StandardInput"], "socket")
+        self.assertEqual(
+            service["CapabilityBoundingSet"],
+            "CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETPCAP",
+        )
+        self.assertEqual(service["AmbientCapabilities"], "")
+        self.assertEqual(service["RestrictNamespaces"], "mnt")
+        self.assertEqual(service["TasksMax"], "1")
+        self.assertEqual(service["ProtectProc"], "invisible")
+        self.assertNotIn("ProcSubset", service)
+        self.assertNotIn("PrivatePIDs", service)
+        self.assertNotIn("RestrictSUIDSGID", service)
 
     def test_identity_and_readiness_are_exact(self) -> None:
         sysusers = SYSUSERS.read_text(encoding="utf-8")
@@ -134,6 +178,9 @@ class ShippingCodexBridgeTests(unittest.TestCase):
         self.assertIn("generate-rescue-sbom.py", workflow)
         self.assertIn("KernAid-Rescue-amd64.codex.cdx.json", workflow)
         self.assertIn("systemctl enable kernaid-rescue-codex.socket", hook)
+        self.assertIn("systemctl enable kernaid-rescue-codex-mounter.socket", hook)
+        self.assertIn("KERNAID_RESCUE_CODEX_MOUNTER_BINARY", build)
+        self.assertIn("--bin kernaid-rescue-codex-mounter", workflow)
         self.assertIn("/usr/lib/kernaid/codex", hook)
 
 

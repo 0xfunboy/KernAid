@@ -183,6 +183,10 @@ pub use rescue_daemon::{
     run_rescue_vault_daemon,
 };
 
+#[cfg(all(target_os = "linux", feature = "experimental-codex-home-lease"))]
+#[doc(hidden)]
+pub use rescue_daemon::run_rescue_codex_mounter;
+
 #[cfg(all(target_os = "linux", feature = "experimental-vault-manager"))]
 #[doc(hidden)]
 pub use rescue_daemon::run_internal_rescue_vault_worker;

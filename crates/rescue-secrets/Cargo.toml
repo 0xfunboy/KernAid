@@ -5,12 +5,13 @@ edition.workspace = true
 
 [features]
 experimental-vault-manager = []
-experimental-codex-home-lease = ["experimental-vault-manager"]
+experimental-codex-home-lease = ["experimental-vault-manager", "dep:kernaid-linux-nsfs"]
 privileged-probe = ["experimental-vault-manager"]
 
 [dependencies]
 base64 = "0.22"
 kernaid-device-identity = { path = "../device-identity" }
+kernaid-linux-nsfs = { path = "../linux-nsfs", optional = true }
 kernaid-protocol = { path = "../protocol" }
 kernaid-report-schema = { path = "../report-schema" }
 kernaid-storage = { path = "../storage" }
@@ -21,7 +22,7 @@ sha2 = "0.10"
 zeroize = "1.8"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-nix = { version = "0.31.3", features = ["pthread", "signal", "socket", "term"] }
+nix = { version = "0.31.3", features = ["pthread", "sched", "signal", "socket", "term"] }
 rustix = { version = "1.1.4", features = ["event", "fs", "mount", "net", "process", "termios", "thread"] }
 
 [dev-dependencies]
@@ -44,3 +45,8 @@ required-features = ["experimental-vault-manager"]
 name = "kernaid-rescue-vaultctl"
 path = "src/bin/kernaid-rescue-vaultctl.rs"
 required-features = ["experimental-vault-manager"]
+
+[[bin]]
+name = "kernaid-rescue-codex-mounter"
+path = "src/bin/kernaid-rescue-codex-mounter.rs"
+required-features = ["experimental-codex-home-lease"]

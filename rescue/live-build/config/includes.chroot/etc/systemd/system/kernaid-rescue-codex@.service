@@ -42,6 +42,7 @@ PrivateMounts=yes
 PrivateTmp=yes
 PrivateDevices=yes
 PrivateIPC=yes
+TemporaryFileSystem=/run/kernaid-codex-home:rw,nosuid,nodev,noexec,nosymfollow,size=4k,mode=000,uid=0,gid=0
 ProtectSystem=strict
 ProtectHome=yes
 ProtectControlGroups=yes

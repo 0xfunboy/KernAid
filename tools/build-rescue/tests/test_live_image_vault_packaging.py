@@ -134,11 +134,13 @@ class VaultSystemdPackagingTests(unittest.TestCase):
             set(unit["Requires"].split()),
             {
                 "kernaid-rescue-vaultd.socket",
+                "kernaid-rescue-codex-mounter.socket",
                 "live-config.service",
                 "systemd-sysusers.service",
             },
         )
         self.assertIn("kernaid-rescue-vaultd.socket", unit["After"].split())
+        self.assertIn("kernaid-rescue-codex-mounter.socket", unit["After"].split())
         self.assertIn("live-config.service", unit["After"].split())
         self.assertIn("systemd-sysusers.service", unit["After"].split())
         self.assertIn("systemd-sysctl.service", unit["After"].split())
@@ -506,7 +508,7 @@ class VaultLivePolicyTests(unittest.TestCase):
         self.assertGreaterEqual(build.count("install -o root -g root -m 0755"), 2)
         self.assertIn("trap cleanup_staged_binaries EXIT", build)
         self.assertIn('rmdir -- "$vaultctl_destination_dir"', build)
-        self.assertEqual(build.count("verify-shipping-binary.py"), 7)
+        self.assertEqual(build.count("verify-shipping-binary.py"), 8)
         self.assertIn("--profile tauri-webkit", build)
         self.assertNotIn("cargo build", build)
 
@@ -538,6 +540,7 @@ class VaultLivePolicyTests(unittest.TestCase):
         self.assertIn('- "crates/protocol/**"', workflow)
         self.assertIn("--bin kernaid-rescue-vaultd", workflow)
         self.assertIn("--bin kernaid-rescue-vaultctl", workflow)
+        self.assertIn("--bin kernaid-rescue-codex-mounter", workflow)
         self.assertIn("--bin kernaid-rescue-openai-executor", workflow)
         self.assertIn("--bin kernaid-linux-hardware-inventory", workflow)
         self.assertIn("--bin kernaid-rescue-desk-shell", workflow)
@@ -570,7 +573,7 @@ class VaultLivePolicyTests(unittest.TestCase):
         )
         self.assertNotIn("$RUNNER_TEMP/kernaid-rescue-shipping-preflight", workflow)
         self.assertIn("sudo install -o root -g root -m 0755", workflow)
-        self.assertEqual(workflow.count("verify-shipping-binary.py"), 7)
+        self.assertEqual(workflow.count("verify-shipping-binary.py"), 8)
         self.assertIn("--profile tauri-webkit", workflow)
         self.assertIn("qemu-vault-lifecycle-smoke.sh", workflow)
 

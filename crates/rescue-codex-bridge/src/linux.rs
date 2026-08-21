@@ -24,7 +24,7 @@ use std::{
     io::{self, IoSliceMut, Read, Write},
     mem::MaybeUninit,
     os::{fd::AsRawFd, unix::process::CommandExt},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{Mutex, mpsc},
     thread,
@@ -35,6 +35,7 @@ use zeroize::{Zeroize, Zeroizing};
 const API_VERSION: &str = "kernaid.dev/rescue-codex-auth/v1alpha1";
 const BRIDGE_SOCKET_PATH: &str = "/run/kernaid-rescue-codex.sock";
 const VAULT_SOCKET_PATH: &str = "/run/kernaid-rescue-vault.sock";
+const CODEX_HOME_PATH: &str = "/run/kernaid-codex-home";
 const SHIPPING_CODEX_PATH: &str = "/usr/lib/kernaid/codex";
 const SHIPPING_CODEX_SIZE: u64 = 258_278_208;
 const SHIPPING_CODEX_SHA256: &str =
@@ -385,6 +386,7 @@ fn run_socket_activated_once_inner() -> Result<(), ()> {
     let outcome = execute_with_home(
         request.operation,
         &lease.home,
+        Path::new(CODEX_HOME_PATH),
         &CliPolicy::shipping(),
         HomePolicy::shipping(),
         &mut responder,
@@ -484,8 +486,24 @@ fn lease_home(request_id: &str, deadline: Instant) -> Result<HomeLease, SafeErro
     let socket = connect_vault(deadline)?;
     let authenticated =
         authenticate_root_seqpacket_server(socket.as_fd()).map_err(|_| SafeError::Transport)?;
+    let mount_namespace = rfs::open(
+        "/proc/self/ns/mnt",
+        OFlags::RDONLY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|_| SafeError::Transport)?;
+    let mount_root = rfs::open(
+        "/",
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|_| SafeError::Transport)?;
     authenticated
-        .send_request(&request, &[], deadline)
+        .send_request(
+            &request,
+            &[mount_namespace.as_fd(), mount_root.as_fd()],
+            deadline,
+        )
         .map_err(|_| SafeError::Transport)?;
     let mut response = authenticated
         .receive_response(&request, deadline)
@@ -551,12 +569,14 @@ fn connect_vault(deadline: Instant) -> Result<OwnedFd, SafeError> {
 fn execute_with_home(
     operation: Operation,
     home: &OwnedFd,
+    home_path: &Path,
     cli: &CliPolicy,
     home_policy: HomePolicy,
     responder: &mut dyn Responder,
 ) -> Result<(), ExecutionError> {
     validate_home(home, home_policy)?;
-    let mut child = spawn_cli(operation, home, cli)?;
+    validate_home_alias(home, home_path, home_policy)?;
+    let mut child = spawn_cli(operation, home_path, cli)?;
     let deadline = Instant::now()
         .checked_add(operation.timeout())
         .ok_or(ExecutionError::TimedOut)?;
@@ -572,6 +592,7 @@ fn execute_with_home(
     // output bound, or lost its client. An interrupted official command may
     // have changed its credential store before the operational error.
     validate_home(home, home_policy)?;
+    validate_home_alias(home, home_path, home_policy)?;
     let (status, mut stdout, mut stderr) = outcome?;
     let result = classify_cli_result(operation, status, &stdout, &stderr);
     stdout.zeroize();
@@ -584,22 +605,19 @@ fn execute_with_home(
 
 fn spawn_cli(
     operation: Operation,
-    home: &OwnedFd,
+    home_path: &Path,
     policy: &CliPolicy,
 ) -> Result<Child, ExecutionError> {
     let executable = open_verified_executable(policy)?;
-    let inherited_home = rustix::io::fcntl_dupfd_cloexec(home, CHILD_DESCRIPTOR_MINIMUM)
-        .map_err(|_| ExecutionError::UnsafeHome)?;
     let inherited_executable =
         rustix::io::fcntl_dupfd_cloexec(&executable, CHILD_DESCRIPTOR_MINIMUM)
             .map_err(|_| ExecutionError::UnsafeExecutable)?;
-    let home_path = format!("/proc/self/fd/{}", inherited_home.as_raw_fd());
     let executable_path = format!("/proc/self/fd/{}", inherited_executable.as_raw_fd());
     let mut command = Command::new(executable_path);
     command
         .args(operation.cli_arguments())
         .env_clear()
-        .env("CODEX_HOME", &home_path)
+        .env("CODEX_HOME", home_path)
         .env("HOME", "/nonexistent")
         .env("LANG", "C")
         .env("LC_ALL", "C")
@@ -611,7 +629,7 @@ fn spawn_cli(
         // symlinks under the credential directory. ProtectSystem=strict makes
         // `/` unusable for unrelated temporary writes as well.
         .env("TMPDIR", "/")
-        .current_dir(&home_path)
+        .current_dir(home_path)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -620,15 +638,10 @@ fn spawn_cli(
     let _guard = SPAWN_LOCK
         .lock()
         .map_err(|_| ExecutionError::CliUnavailable)?;
-    for descriptor in [&inherited_home, &inherited_executable] {
-        rustix::io::fcntl_setfd(descriptor, rustix::io::FdFlags::empty())
-            .map_err(|_| ExecutionError::CliUnavailable)?;
-    }
+    rustix::io::fcntl_setfd(&inherited_executable, rustix::io::FdFlags::empty())
+        .map_err(|_| ExecutionError::CliUnavailable)?;
     let spawned = command.spawn();
-    for descriptor in [&inherited_home, &inherited_executable] {
-        let _ = rustix::io::fcntl_setfd(descriptor, rustix::io::FdFlags::CLOEXEC);
-    }
-    drop(inherited_home);
+    let _ = rustix::io::fcntl_setfd(&inherited_executable, rustix::io::FdFlags::CLOEXEC);
     drop(inherited_executable);
     spawned.map_err(|_| ExecutionError::CliUnavailable)
 }
@@ -769,6 +782,41 @@ fn validate_home(home: &OwnedFd, policy: HomePolicy) -> Result<(), ExecutionErro
         final_stat.st_ctime,
         final_stat.st_ctime_nsec,
     ) {
+        return Err(ExecutionError::UnsafeHome);
+    }
+    Ok(())
+}
+
+fn validate_home_alias(
+    home: &OwnedFd,
+    home_path: &Path,
+    policy: HomePolicy,
+) -> Result<(), ExecutionError> {
+    let alias = rfs::openat2(
+        rfs::CWD,
+        home_path,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+    )
+    .map_err(|_| ExecutionError::UnsafeHome)?;
+    let home_stat = rfs::fstat(home).map_err(|_| ExecutionError::UnsafeHome)?;
+    let alias_stat = rfs::fstat(&alias).map_err(|_| ExecutionError::UnsafeHome)?;
+    let alias_filesystem = rfs::fstatfs(&alias).map_err(|_| ExecutionError::UnsafeHome)?;
+    let alias_flags = rfs::fcntl_getfl(&alias).map_err(|_| ExecutionError::UnsafeHome)?;
+    let descriptor_flags =
+        rustix::io::fcntl_getfd(&alias).map_err(|_| ExecutionError::UnsafeHome)?;
+    if (home_stat.st_dev, home_stat.st_ino) != (alias_stat.st_dev, alias_stat.st_ino)
+        || !FileType::from_raw_mode(alias_stat.st_mode).is_dir()
+        || alias_stat.st_uid != policy.uid
+        || alias_stat.st_gid != policy.gid
+        || alias_stat.st_nlink < 2
+        || alias_stat.st_mode & 0o7777 != 0o700
+        || alias_flags != (OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW)
+        || descriptor_flags != rustix::io::FdFlags::CLOEXEC
+        || (policy.require_ext4
+            && u64::try_from(alias_filesystem.f_type).ok() != Some(EXT4_SUPER_MAGIC))
+    {
         return Err(ExecutionError::UnsafeHome);
     }
     Ok(())
@@ -1057,9 +1105,7 @@ fn ensure_socket_peer_connected(socket: BorrowedFd<'_>) -> Result<(), ()> {
         match poll(&mut descriptors, Some(&immediate)) {
             Ok(_) => {
                 let events = descriptors[0].revents();
-                return if events.intersects(
-                    PollFlags::ERR | PollFlags::HUP | PollFlags::RDHUP | PollFlags::NVAL,
-                ) {
+                return if events.intersects(PollFlags::ERR | PollFlags::HUP | PollFlags::NVAL) {
                     Err(())
                 } else {
                     Ok(())
@@ -1500,6 +1546,7 @@ mod tests {
             execute_with_home(
                 operation,
                 &self.home,
+                &self.home_path,
                 &self.cli,
                 self.home_policy,
                 &mut responder,
@@ -1565,6 +1612,7 @@ mod tests {
             execute_with_home(
                 Operation::Status,
                 &fixture.home,
+                &fixture.home_path,
                 &fixture.cli,
                 fixture.home_policy,
                 &mut responder,
@@ -1589,6 +1637,7 @@ mod tests {
             execute_with_home(
                 Operation::Status,
                 &fixture.home,
+                &fixture.home_path,
                 &fixture.cli,
                 fixture.home_policy,
                 &mut responder,
@@ -1608,6 +1657,7 @@ mod tests {
             execute_with_home(
                 Operation::Status,
                 &fixture.home,
+                &fixture.home_path,
                 &fixture.cli,
                 fixture.home_policy,
                 &mut responder,
@@ -1653,6 +1703,7 @@ mod tests {
             execute_with_home(
                 Operation::Status,
                 &fixture.home,
+                &fixture.home_path,
                 &fixture.cli,
                 fixture.home_policy,
                 &mut responder,
@@ -1700,6 +1751,7 @@ mod tests {
             execute_with_home(
                 Operation::DeviceLogin,
                 &fixture.home,
+                &fixture.home_path,
                 &fixture.cli,
                 fixture.home_policy,
                 &mut responder,
@@ -1711,7 +1763,7 @@ mod tests {
     }
 
     #[test]
-    fn client_write_half_close_is_detected_as_loss() {
+    fn client_write_half_close_can_receive_terminal_response() {
         let (client, server) = rustix::net::socketpair(
             AddressFamily::UNIX,
             SocketType::SEQPACKET,
@@ -1721,6 +1773,38 @@ mod tests {
         .expect("client socket pair");
         rustix::net::shutdown(&client, rustix::net::Shutdown::Write)
             .expect("client write-half close");
+
+        assert_eq!(ensure_socket_peer_connected(server.as_fd()), Ok(()));
+        let request = Request {
+            api_version: API_VERSION.to_owned(),
+            request_id: "C-01234567-89ab-4def-8123-456789abcdef".to_owned(),
+            operation: Operation::Status,
+        };
+        SocketResponder {
+            socket: server.as_fd(),
+            request: &request,
+        }
+        .send(&ResponsePayload::Complete {
+            status: AuthStatus::SignedOut,
+        })
+        .expect("terminal response after write-half close");
+        let mut frame = [0_u8; MAX_RESPONSE_BYTES];
+        let (count, record_length) = rustix::net::recv(&client, &mut frame, RecvFlags::empty())
+            .expect("receive terminal response");
+        assert_eq!(count, record_length);
+        assert!(frame[..count].ends_with(b"\n"));
+    }
+
+    #[test]
+    fn full_client_close_is_detected_as_loss() {
+        let (client, server) = rustix::net::socketpair(
+            AddressFamily::UNIX,
+            SocketType::SEQPACKET,
+            SocketFlags::CLOEXEC,
+            None,
+        )
+        .expect("client socket pair");
+        drop(client);
 
         assert_eq!(ensure_socket_peer_connected(server.as_fd()), Err(()));
     }
