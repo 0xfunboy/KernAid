@@ -557,7 +557,7 @@ class RescueTauriBoundaryTests(unittest.TestCase):
             {
                 "/run/lightdm/kernaid-rescue-ui/xauthority",
                 "/run/systemd/notify",
-                "-/run/kernaid-tauri-network-probe/baseline-v1",
+                "/run/kernaid-tauri-network-probe",
                 "/tmp/.X11-unix/X0",
             }
             <= unit_values["BindReadOnlyPaths"]
