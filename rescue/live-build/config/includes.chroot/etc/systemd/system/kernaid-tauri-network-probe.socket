@@ -2,9 +2,14 @@
 Description=KernAid QEMU-only Tauri network probe listener
 ConditionVirtualization=|qemu
 ConditionVirtualization=|kvm
-Requires=kernaid-tauri-network-probe-address.service
-After=kernaid-tauri-network-probe-address.service
-Before=kernaid-tauri-network-probe-baseline.service kernaid-rescue-desk-shell.service
+# This is a late, network-dependent socket. The normal implicit
+# Before=sockets.target edge would cycle through basic.target and the address
+# service, so restore the other lifecycle dependencies explicitly.
+DefaultDependencies=no
+Requires=basic.target kernaid-tauri-network-probe-address.service
+After=basic.target kernaid-tauri-network-probe-address.service
+Conflicts=shutdown.target
+Before=kernaid-tauri-network-probe-baseline.service kernaid-rescue-desk-shell.service shutdown.target
 
 [Socket]
 ListenStream=192.0.2.1:41917

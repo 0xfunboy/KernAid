@@ -630,6 +630,39 @@ class RescueTauriBoundaryTests(unittest.TestCase):
             self.assertIn("ConditionVirtualization=|qemu", probe_unit)
             self.assertIn("ConditionVirtualization=|kvm", probe_unit)
         self.assertIn("FreeBind=yes", socket_service)
+        socket_unit_values: dict[str, set[str]] = {}
+        for raw_line in socket_service.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith(("#", ";")) or "=" not in line:
+                continue
+            directive, value = line.split("=", 1)
+            socket_unit_values.setdefault(directive, set()).update(value.split())
+        # DefaultDependencies=no is the guard against the implicit
+        # socket -> sockets.target edge that would close an ordering cycle.
+        self.assertEqual(socket_unit_values["DefaultDependencies"], {"no"})
+        self.assertEqual(
+            socket_unit_values["Requires"],
+            {"basic.target", "kernaid-tauri-network-probe-address.service"},
+        )
+        self.assertEqual(
+            socket_unit_values["After"],
+            {"basic.target", "kernaid-tauri-network-probe-address.service"},
+        )
+        self.assertEqual(socket_unit_values["Conflicts"], {"shutdown.target"})
+        self.assertEqual(
+            socket_unit_values["Before"],
+            {
+                "kernaid-tauri-network-probe-baseline.service",
+                "kernaid-rescue-desk-shell.service",
+                "shutdown.target",
+            },
+        )
+        self.assertFalse(
+            any(
+                "sockets.target" in values
+                for values in socket_unit_values.values()
+            )
+        )
         self.assertIn(
             "Wants=systemd-modules-load.service systemd-udev-settle.service "
             "live-config.service NetworkManager.service "
