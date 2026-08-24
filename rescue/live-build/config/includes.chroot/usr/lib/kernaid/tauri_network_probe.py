@@ -10,6 +10,7 @@ import stat
 import subprocess
 import sys
 import time
+from typing import Callable
 
 
 FW_CFG_PATH = (
@@ -21,8 +22,17 @@ BASELINE_DIRECTORY = "/run/kernaid-tauri-network-probe"
 BASELINE_PATH = f"{BASELINE_DIRECTORY}/baseline-v1"
 BASELINE = b"KERNAID_RESCUE_TAURI_NETWORK_BASELINE_V1 connected=true\n"
 MAX_IP_OUTPUT_BYTES = 64 * 1024
-FW_CFG_WAIT_SECONDS = 30.0
+FW_CFG_WAIT_SECONDS = 180.0
 FW_CFG_POLL_SECONDS = 0.05
+SCHEDULING_WAIT_SECONDS = 30.0
+SCHEDULING_POLL_SECONDS = 0.1
+CONNECT_TIMEOUT_SECONDS = 2
+FAILURE_STAGES = {
+    "wait-marker": "wait-marker",
+    "verify-marker": "verify-marker",
+    "verify-alias": "verify-alias",
+    "baseline": "baseline",
+}
 
 
 class ProbeError(Exception):
@@ -57,13 +67,13 @@ def _wait_for_fw_cfg() -> None:
         try:
             _read_fw_cfg()
             return
-        except FileNotFoundError:
+        except (OSError, ProbeError):
             if time.monotonic() >= deadline:
-                raise ProbeError
+                raise ProbeError from None
             time.sleep(FW_CFG_POLL_SECONDS)
 
 
-def _alias_ready() -> None:
+def _alias_ready_once() -> None:
     try:
         result = subprocess.run(
             ["/usr/sbin/ip", "-j", "-4", "address", "show", "dev", "lo"],
@@ -95,12 +105,34 @@ def _alias_ready() -> None:
         raise ProbeError
 
 
-def _connect() -> None:
+def _connect_once() -> None:
     try:
-        connection = socket.create_connection((PROBE_ADDRESS, PROBE_PORT), 2)
+        connection = socket.create_connection(
+            (PROBE_ADDRESS, PROBE_PORT), CONNECT_TIMEOUT_SECONDS
+        )
     except OSError as error:
         raise ProbeError from error
     connection.close()
+
+
+def _retry_scheduling(probe: Callable[[], None]) -> None:
+    deadline = time.monotonic() + SCHEDULING_WAIT_SECONDS
+    while True:
+        try:
+            probe()
+            return
+        except (OSError, ProbeError):
+            if time.monotonic() >= deadline:
+                raise ProbeError from None
+            time.sleep(SCHEDULING_POLL_SECONDS)
+
+
+def _wait_for_alias() -> None:
+    _retry_scheduling(_alias_ready_once)
+
+
+def _wait_for_connect() -> None:
+    _retry_scheduling(_connect_once)
 
 
 def _write_baseline() -> None:
@@ -156,23 +188,28 @@ def run(mode: str) -> None:
     if mode == "verify-marker":
         return
     if mode == "verify-alias":
-        _alias_ready()
+        _wait_for_alias()
         return
     if mode == "baseline":
-        _alias_ready()
-        _connect()
+        _wait_for_alias()
+        _wait_for_connect()
         _write_baseline()
         return
     raise ProbeError
 
 
 def main() -> int:
+    mode = sys.argv[1] if len(sys.argv) == 2 else "mode"
     try:
-        if len(sys.argv) != 2:
+        if mode not in FAILURE_STAGES:
             raise ProbeError
-        run(sys.argv[1])
+        run(mode)
     except (ProbeError, OSError, ValueError):
-        print("KernAid Tauri network probe failed", file=sys.stderr)
+        stage = FAILURE_STAGES.get(mode, "mode")
+        print(
+            f"KERNAID_TAURI_NETWORK_PROBE_FAILURE_V1 stage={stage}",
+            file=sys.stderr,
+        )
         return 1
     return 0
 

@@ -51,6 +51,12 @@ session_ui = load_module(
     / "rescue/live-build/config/includes.chroot/usr/lib/kernaid"
     / "rescue_ui_session_ready.py",
 )
+network_probe = load_module(
+    "kernaid_tauri_network_probe",
+    REPO_DIR
+    / "rescue/live-build/config/includes.chroot/usr/lib/kernaid"
+    / "tauri_network_probe.py",
+)
 binary_verifier = load_module(
     "kernaid_shipping_binary_profiles",
     TOOLS_DIR / "verify-shipping-binary.py",
@@ -610,7 +616,71 @@ class RescueTauriBoundaryTests(unittest.TestCase):
             "ExecStartPre=/usr/bin/python3 -I /usr/lib/kernaid/tauri_network_probe.py wait-marker",
             address_service,
         )
+        self.assertIn("TimeoutStartSec=240s", address_service)
+        self.assertIn("TimeoutStartSec=90s", baseline_service)
+        self.assertEqual(network_probe.FW_CFG_WAIT_SECONDS, 180.0)
+        self.assertEqual(network_probe.SCHEDULING_WAIT_SECONDS, 30.0)
+        for probe_service in (address_service, baseline_service):
+            self.assertIn("StandardOutput=journal+console", probe_service)
+            self.assertIn("StandardError=journal+console", probe_service)
         self.assertEqual(modules_load, "qemu_fw_cfg\n")
+
+    def test_network_probe_retries_alias_and_baseline_connect(self) -> None:
+        with (
+            mock.patch.object(network_probe, "_read_fw_cfg"),
+            mock.patch.object(
+                network_probe,
+                "_alias_ready_once",
+                side_effect=[network_probe.ProbeError(), None, None],
+            ) as alias,
+            mock.patch.object(
+                network_probe,
+                "_connect_once",
+                side_effect=[network_probe.ProbeError(), None],
+            ) as connect,
+            mock.patch.object(network_probe, "_write_baseline") as write,
+            mock.patch.object(network_probe.time, "sleep"),
+        ):
+            network_probe.run("verify-alias")
+            network_probe.run("baseline")
+        self.assertEqual(alias.call_count, 3)
+        self.assertEqual(connect.call_count, 2)
+        write.assert_called_once_with()
+
+    def test_network_probe_scheduling_retry_is_bounded(self) -> None:
+        with (
+            mock.patch.object(
+                network_probe,
+                "_alias_ready_once",
+                side_effect=network_probe.ProbeError(),
+            ),
+            mock.patch.object(
+                network_probe.time, "monotonic", side_effect=[0.0, 31.0]
+            ),
+            mock.patch.object(network_probe.time, "sleep") as sleep,
+        ):
+            with self.assertRaises(network_probe.ProbeError):
+                network_probe._wait_for_alias()
+        sleep.assert_not_called()
+
+    def test_network_probe_failure_is_fixed_and_stage_only(self) -> None:
+        for mode in ("wait-marker", "verify-alias", "baseline"):
+            with self.subTest(mode=mode):
+                output = io.StringIO()
+                with (
+                    mock.patch.object(network_probe.sys, "argv", ["probe", mode]),
+                    mock.patch.object(
+                        network_probe,
+                        "run",
+                        side_effect=network_probe.ProbeError(),
+                    ),
+                    redirect_stderr(output),
+                ):
+                    self.assertEqual(network_probe.main(), 1)
+                self.assertEqual(
+                    output.getvalue(),
+                    f"KERNAID_TAURI_NETWORK_PROBE_FAILURE_V1 stage={mode}\n",
+                )
 
     def test_lightdm_session_is_minimal_and_busless(self) -> None:
         root = REPO_DIR / "rescue/live-build/config/includes.chroot"
@@ -719,6 +789,11 @@ class RescueTauriBoundaryTests(unittest.TestCase):
             ready_check,
         )
         self.assertIn("|devices|device-fds|proc-alias|", qemu_smoke)
+        self.assertIn(
+            "KERNAID_TAURI_NETWORK_PROBE_FAILURE_V1 "
+            "stage=(wait-marker|verify-marker|verify-alias|baseline)",
+            qemu_smoke,
+        )
 
     def test_qemu_bios_and_uefi_share_the_render_and_input_gate(self) -> None:
         script = (TOOLS_DIR / "qemu-smoke.sh").read_text(encoding="utf-8")
