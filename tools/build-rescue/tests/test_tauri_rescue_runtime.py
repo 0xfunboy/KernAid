@@ -533,10 +533,11 @@ class RescueTauriBoundaryTests(unittest.TestCase):
             unit_values.setdefault(directive, set()).update(value.split())
         for directive in ("Requires", "After"):
             self.assertTrue(shipping_sockets.keys() <= unit_values[directive])
-        self.assertIn(
-            "kernaid-tauri-network-probe-baseline.service",
-            unit_values["Requires"],
-        )
+        for directive in ("Requires", "After"):
+            self.assertIn(
+                "kernaid-tauri-network-probe-baseline.service",
+                unit_values[directive],
+            )
         self.assertNotIn(
             "kernaid-tauri-network-probe-baseline.service", unit_values["Wants"]
         )
@@ -557,7 +558,7 @@ class RescueTauriBoundaryTests(unittest.TestCase):
             {
                 "/run/lightdm/kernaid-rescue-ui/xauthority",
                 "/run/systemd/notify",
-                "/run/kernaid-tauri-network-probe",
+                "-/run/kernaid-tauri-network-probe/baseline-v1",
                 "/tmp/.X11-unix/X0",
             }
             <= unit_values["BindReadOnlyPaths"]
@@ -640,6 +641,9 @@ class RescueTauriBoundaryTests(unittest.TestCase):
         )
         self.assertIn("TimeoutStartSec=240s", address_service)
         self.assertIn("TimeoutStartSec=90s", baseline_service)
+        self.assertIn("RuntimeDirectory=kernaid-tauri-network-probe", baseline_service)
+        self.assertIn("RuntimeDirectoryMode=0755", baseline_service)
+        self.assertIn("RemainAfterExit=yes", baseline_service)
         self.assertEqual(network_probe.FW_CFG_WAIT_SECONDS, 180.0)
         self.assertEqual(network_probe.SCHEDULING_WAIT_SECONDS, 30.0)
         for probe_service in (address_service, baseline_service):
@@ -703,6 +707,42 @@ class RescueTauriBoundaryTests(unittest.TestCase):
                     output.getvalue(),
                     f"KERNAID_TAURI_NETWORK_PROBE_FAILURE_V1 stage={mode}\n",
                 )
+
+    def test_guest_baseline_rechecks_unit_and_live_endpoint(self) -> None:
+        active = {
+            "ActiveState": "active",
+            "SubState": "exited",
+            "Result": "success",
+        }
+        with (
+            mock.patch.object(guest_ui, "_systemctl_show", return_value=active) as show,
+            mock.patch.object(
+                guest_ui, "_qemu_endpoint_post_ready", return_value=True
+            ) as endpoint,
+        ):
+            self.assertTrue(guest_ui._qemu_baseline_ready())
+        show.assert_called_once_with(
+            guest_ui.NETWORK_BASELINE_UNIT,
+            ("ActiveState", "SubState", "Result"),
+        )
+        endpoint.assert_called_once_with()
+
+        with (
+            mock.patch.object(guest_ui, "_systemctl_show", return_value=active),
+            mock.patch.object(
+                guest_ui, "_qemu_endpoint_post_ready", return_value=False
+            ),
+        ):
+            self.assertFalse(guest_ui._qemu_baseline_ready())
+
+        with (
+            mock.patch.object(guest_ui, "_systemctl_show", return_value=None),
+            mock.patch.object(
+                guest_ui, "_qemu_endpoint_post_ready", return_value=True
+            ) as endpoint,
+        ):
+            self.assertFalse(guest_ui._qemu_baseline_ready())
+        endpoint.assert_not_called()
 
     def test_lightdm_session_is_minimal_and_busless(self) -> None:
         root = REPO_DIR / "rescue/live-build/config/includes.chroot"

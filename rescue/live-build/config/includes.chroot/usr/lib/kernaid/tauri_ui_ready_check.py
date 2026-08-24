@@ -22,6 +22,7 @@ from typing import NamedTuple
 
 SHELL_UNIT = "kernaid-rescue-desk-shell.service"
 SESSION_READY_UNIT = "kernaid-rescue-ui-session-ready.service"
+NETWORK_BASELINE_UNIT = "kernaid-tauri-network-probe-baseline.service"
 SHELL_PATH = "/usr/bin/kernaid-rescue-desk-shell"
 XFWM_PATH = "/usr/bin/xfwm4"
 XORG_PATH = "/usr/lib/xorg/Xorg"
@@ -665,10 +666,14 @@ def _qemu_probe_mode(path: str = QEMU_PROBE_MARKER_PATH) -> bool:
 
 
 def _qemu_baseline_ready() -> bool:
-    try:
-        return _fixed_file(QEMU_BASELINE_PATH, QEMU_BASELINE, 0, 0, 0o444)
-    except FileNotFoundError:
-        return False
+    state = _systemctl_show(
+        NETWORK_BASELINE_UNIT, ("ActiveState", "SubState", "Result")
+    )
+    return state == {
+        "ActiveState": "active",
+        "SubState": "exited",
+        "Result": "success",
+    } and _qemu_endpoint_post_ready()
 
 
 def _qemu_endpoint_post_ready() -> bool:
