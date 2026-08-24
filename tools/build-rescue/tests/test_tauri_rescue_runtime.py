@@ -11,7 +11,7 @@ import sys
 import tempfile
 import threading
 import unittest
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -255,6 +255,80 @@ class TauriFramebufferTests(unittest.TestCase):
 
 
 class RescueTauriBoundaryTests(unittest.TestCase):
+    def test_session_gate_retries_only_the_nonfinal_ui_executable(self) -> None:
+        account = mock.Mock(pw_uid=991, pw_gid=991)
+        valid_status = (
+            b"Uid:\t991\t991\t991\t991\n"
+            b"Gid:\t991\t991\t991\t991\n"
+            b"Groups:\t991\n"
+        )
+        scanner = mock.MagicMock()
+        entry = mock.Mock()
+        entry.name = "41"
+        scanner.__enter__.return_value = [entry]
+        final_environment = {
+            b"DISPLAY": session_ui.DISPLAY,
+            b"XAUTHORITY": session_ui.XAUTHORITY.encode("ascii"),
+            b"XDG_RUNTIME_DIR": session_ui.UI_RUNTIME.encode("ascii"),
+            b"HOME": f"{session_ui.UI_RUNTIME}/home".encode("ascii"),
+            b"DBUS_SESSION_BUS_ADDRESS": (
+                f"unix:path={session_ui.UI_RUNTIME}/no-session-bus".encode("ascii")
+            ),
+            b"DBUS_SYSTEM_BUS_ADDRESS": (
+                f"unix:path={session_ui.UI_RUNTIME}/no-system-bus".encode("ascii")
+            ),
+        }
+
+        def observe(executable: str, status: bytes, environment: dict[bytes, bytes]):
+            with (
+                mock.patch.object(session_ui, "PRIVILEGED_GROUPS", ()),
+                mock.patch.object(
+                    session_ui.pwd,
+                    "getpwnam",
+                    return_value=mock.Mock(pw_uid=111),
+                ),
+                mock.patch.object(session_ui.os, "scandir", return_value=scanner),
+                mock.patch.object(session_ui, "_bounded_file", return_value=status),
+                mock.patch.object(session_ui.os, "readlink", return_value=executable),
+                mock.patch.object(
+                    session_ui, "_environment", return_value=environment
+                ),
+            ):
+                return session_ui._session_process_ready(account)
+
+        self.assertFalse(observe("/usr/bin/dash", valid_status, final_environment))
+        with self.assertRaises(session_ui.SessionError):
+            observe(
+                session_ui.XFWM_PATH,
+                valid_status,
+                final_environment | {b"XDG_RUNTIME_DIR": b"/run/user/991"},
+            )
+        with self.assertRaises(session_ui.SessionError):
+            observe(
+                "/usr/bin/dash",
+                valid_status.replace(b"Groups:\t991", b"Groups:\t992"),
+                final_environment,
+            )
+
+    def test_session_failure_marker_exposes_only_an_allowlisted_stage(self) -> None:
+        for stage in ("process", "user-runtime-mask", "not-allowlisted"):
+            with self.subTest(stage=stage):
+                output = io.StringIO()
+                with (
+                    mock.patch.object(
+                        session_ui,
+                        "attest",
+                        side_effect=session_ui.SessionError(stage),
+                    ),
+                    redirect_stdout(output),
+                ):
+                    self.assertEqual(session_ui.main(), 1)
+                expected = stage if stage in session_ui.SESSION_FAILURE_STAGES else "internal"
+                self.assertEqual(
+                    output.getvalue(),
+                    f"{session_ui.SESSION_FAILURE_PREFIX}{expected}\n",
+                )
+
     def test_shell_readiness_is_root_attested_not_a_uid_marker(self) -> None:
         normal = {
             "ActiveState": "active",

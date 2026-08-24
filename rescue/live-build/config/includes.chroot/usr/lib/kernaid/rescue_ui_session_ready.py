@@ -41,10 +41,34 @@ FORBIDDEN_UI_PROCESS_NAMES = {
     "xfce4-panel",
     "xfce4-terminal",
 }
+SESSION_FAILURE_STAGES = frozenset(
+    {
+        "account",
+        "user-runtime-mask",
+        "xauthority",
+        "runtime",
+        "process",
+        "timeout",
+        "internal",
+    }
+)
+SESSION_FAILURE_PREFIX = "KERNAID_RESCUE_UI_SESSION_FAILURE_V1 stage="
 
 
 class SessionError(Exception):
     """A sanitized UI-session readiness failure."""
+
+    def __init__(self, stage: str = "internal") -> None:
+        sanitized = stage if stage in SESSION_FAILURE_STAGES else "internal"
+        super().__init__(sanitized)
+        self.stage = sanitized
+
+
+def _at_stage(stage: str, operation):
+    try:
+        return operation()
+    except (KeyError, OSError, SessionError) as error:
+        raise SessionError(stage) from error
 
 
 def _bounded_file(path: str) -> bytes:
@@ -343,9 +367,16 @@ def _session_process_ready(account: pwd.struct_passwd) -> bool:
                 or not groups.issubset({account.pw_gid})
             ):
                 raise SessionError
+            # LightDM executes the fixed wrapper and session scripts through
+            # dash before the process becomes xfwm4.  Seeing that non-final
+            # UI-owned process is a retryable readiness observation: it can
+            # never produce success, and a persistent process still reaches
+            # the bounded timeout.  Once xfwm4 exists, every identity and
+            # environment mismatch remains an immediate hard failure.
+            if executable != XFWM_PATH:
+                return False
             if (
-                executable != XFWM_PATH
-                or environment.get(b"DISPLAY") != DISPLAY
+                environment.get(b"DISPLAY") != DISPLAY
                 or environment.get(b"XAUTHORITY") != XAUTHORITY.encode("ascii")
                 or environment.get(b"XDG_RUNTIME_DIR") != UI_RUNTIME.encode("ascii")
                 or environment.get(b"HOME") != f"{UI_RUNTIME}/home".encode("ascii")
@@ -362,25 +393,28 @@ def _session_process_ready(account: pwd.struct_passwd) -> bool:
 
 
 def attest() -> None:
-    account = _account()
-    _prepare_masked_user_runtime(account)
+    account = _at_stage("account", _account)
+    _at_stage("user-runtime-mask", lambda: _prepare_masked_user_runtime(account))
     deadline = time.monotonic() + READY_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
         if (
-            _xauthority_ready(account)
-            and _runtime_ready(account)
-            and _session_process_ready(account)
+            _at_stage("xauthority", lambda: _xauthority_ready(account))
+            and _at_stage("runtime", lambda: _runtime_ready(account))
+            and _at_stage("process", lambda: _session_process_ready(account))
         ):
             return
         time.sleep(0.5)
-    raise SessionError
+    raise SessionError("timeout")
 
 
 def main() -> int:
     try:
         attest()
-    except (KeyError, OSError, SessionError):
-        print("KernAid isolated UI session did not become ready")
+    except SessionError as error:
+        print(f"{SESSION_FAILURE_PREFIX}{error.stage}")
+        return 1
+    except (KeyError, OSError):
+        print(f"{SESSION_FAILURE_PREFIX}internal")
         return 1
     return 0
 

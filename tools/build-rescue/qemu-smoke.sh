@@ -575,11 +575,18 @@ terminate_qemu_bounded() {
 }
 
 rescue_not_ready_observed() {
-  LC_ALL=C grep -aq '^KERNAID_RESCUE_NOT_READY:' "$log"
+  LC_ALL=C grep -aq '^KERNAID_RESCUE_NOT_READY:' "$log" \
+    || LC_ALL=C grep -aqE 'KERNAID_RESCUE_UI_SESSION_FAILURE_V1 stage=(account|user-runtime-mask|xauthority|runtime|process|timeout|internal)[[:space:]]*$' "$log"
 }
 
 report_tauri_sandbox_failure() {
-  local marker network_probe_marker sandbox_marker
+  local marker network_probe_marker sandbox_marker session_marker
+  session_marker="$(
+    LC_ALL=C tr -d '\r' <"$log" \
+      | grep -aoE 'KERNAID_RESCUE_UI_SESSION_FAILURE_V1 stage=(account|user-runtime-mask|xauthority|runtime|process|timeout|internal)$' \
+      | tail -n 1 \
+      || true
+  )"
   network_probe_marker="$(
     LC_ALL=C tr -d '\r' <"$log" \
       | grep -aE '^KERNAID_TAURI_NETWORK_PROBE_FAILURE_V1 stage=(wait-marker|verify-marker|verify-alias|baseline)$' \
@@ -598,6 +605,9 @@ report_tauri_sandbox_failure() {
       | tail -n 1 \
       || true
   )"
+  if [[ -n "$session_marker" ]]; then
+    printf '%s\n' "$session_marker" >&2
+  fi
   if [[ -n "$network_probe_marker" ]]; then
     printf '%s\n' "$network_probe_marker" >&2
   fi

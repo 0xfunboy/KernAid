@@ -61,6 +61,49 @@ class QemuProcessLifecycleTests(unittest.TestCase):
             with self.subTest(script=script.name):
                 self.assertIn(annotation, script.read_text(encoding="utf-8"))
 
+    def test_ui_session_failure_is_detected_and_reported_as_a_fixed_marker(
+        self,
+    ) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        definitions = "\n".join(
+            self.function_definition(source, name)
+            for name in (
+                "rescue_not_ready_observed",
+                "report_tauri_sandbox_failure",
+            )
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            log = Path(temporary) / "qemu.log"
+            log.write_text(
+                "[   86.656583] python3[936]: "
+                "KERNAID_RESCUE_UI_SESSION_FAILURE_V1 stage=process\n"
+                "untrusted diagnostic detail must not be reported\n",
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    "set -euo pipefail\n"
+                    'log="$1"\n'
+                    f"{definitions}\n"
+                    "rescue_not_ready_observed\n"
+                    "report_tauri_sandbox_failure\n",
+                    "bash",
+                    str(log),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(
+            result.stderr,
+            "KERNAID_RESCUE_UI_SESSION_FAILURE_V1 stage=process\n",
+        )
+
     def test_capture_failure_closes_start_gate_and_reaps_for_both_harnesses(
         self,
     ) -> None:
