@@ -11,4 +11,4 @@ ListenStream=192.0.2.1:41917
 Accept=yes
 MaxConnections=4
 Backlog=4
-FreeBind=no
+FreeBind=yes

@@ -597,6 +597,7 @@ class RescueTauriBoundaryTests(unittest.TestCase):
             self.assertNotIn("ConditionPathExists=", probe_unit)
             self.assertIn("ConditionVirtualization=|qemu", probe_unit)
             self.assertIn("ConditionVirtualization=|kvm", probe_unit)
+        self.assertIn("FreeBind=yes", socket_service)
         self.assertIn(
             "Wants=systemd-modules-load.service systemd-udev-settle.service",
             address_service,
