@@ -516,29 +516,31 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "Rescue shell sandbox probe failed",
         )
     })?;
+    let rescue_url: Url = RESCUE_UI_URL.parse()?;
+    notify_systemd(WINDOW_STARTUP_STATUS, false).map_err(|_| {
+        let failure_status = SandboxProbeFailure::Notify.status();
+        eprintln!("{failure_status}");
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Rescue shell startup notification failed",
+        )
+    })?;
+    // READY attests the completed sandbox preflight, not UI readiness.
+    // Notify before Tauri initializes so its synchronous framework and
+    // WebKit startup cannot deadlock the systemd Type=notify gate. The
+    // independent root checker still requires the exact renderer, visible
+    // window, active display and post-start endpoint proof.
+    notify_systemd(status, true).map_err(|_| {
+        let failure_status = SandboxProbeFailure::Notify.status();
+        let _ = notify_systemd(failure_status, false);
+        eprintln!("{failure_status}");
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Rescue shell notification failed",
+        )
+    })?;
     tauri::Builder::default()
         .setup(move |app| {
-            let rescue_url: Url = RESCUE_UI_URL.parse()?;
-            notify_systemd(WINDOW_STARTUP_STATUS, false).map_err(|_| {
-                let failure_status = SandboxProbeFailure::Notify.status();
-                eprintln!("{failure_status}");
-                io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "Rescue shell startup notification failed",
-                )
-            })?;
-            // READY attests the completed sandbox preflight, not UI readiness.
-            // The independent root checker still requires the exact renderer,
-            // visible window, active display and post-start endpoint proof.
-            notify_systemd(status, true).map_err(|_| {
-                let failure_status = SandboxProbeFailure::Notify.status();
-                let _ = notify_systemd(failure_status, false);
-                eprintln!("{failure_status}");
-                io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "Rescue shell notification failed",
-                )
-            })?;
             WebviewWindowBuilder::new(app, "main", WebviewUrl::External(rescue_url))
                 .title("KernAid Rescue")
                 .fullscreen(true)
