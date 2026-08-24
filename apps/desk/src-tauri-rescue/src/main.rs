@@ -11,6 +11,7 @@ use std::{
     io::{self, Read, Write},
     net::{SocketAddr, TcpStream},
     os::unix::{
+        ffi::OsStrExt,
         fs::{MetadataExt, OpenOptionsExt},
         net::UnixStream,
     },
@@ -586,7 +587,6 @@ X-Content-Type-Options: nosniff\r\n\
             SandboxProbeFailure::PidNamespace,
             SandboxProbeFailure::SessionBus,
             SandboxProbeFailure::SystemBus,
-            SandboxProbeFailure::Notify,
             SandboxProbeFailure::WindowStartup,
         ];
         for failure in failures {
