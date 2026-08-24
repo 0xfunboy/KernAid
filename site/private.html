@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex,nofollow,noarchive">
+  <meta name="theme-color" content="#0b0f0e">
+  <title>Artefatti riservati — KernAid</title>
+  <link rel="icon" href="/mark.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="site-header private-header">
+    <a class="brand" href="/" aria-label="KernAid home">
+      <img src="/mark.svg" alt="" width="42" height="42">
+      <span>KernAid</span>
+    </a>
+    <div class="private-nav">
+      <span class="private-badge">Area riservata</span>
+      <form method="post" action="/private/logout">
+        <button class="link-button" type="submit">Esci</button>
+      </form>
+    </div>
+  </header>
+
+  <main class="private-main">
+    <section class="private-hero">
+      <p class="eyebrow">Artefatti engineering</p>
+      <h1>Build controllate.<br><em>Stato dichiarato.</em></h1>
+      <p>Ogni file è accompagnato dalla propria provenienza e dal checksum letto dal server. La presenza in quest'area non equivale a una release.</p>
+    </section>
+
+    <section class="release-card" aria-labelledby="artifact-title">
+      <div class="release-heading">
+        <div>
+          <p class="card-kicker">{{channel}}</p>
+          <h2 id="artifact-title">{{artifactName}}</h2>
+        </div>
+        <span class="release-status {{stateClass}}"><i></i>{{artifactState}}</span>
+      </div>
+
+      <div class="danger-note" role="note">
+        <strong>Non usare su USB fisica</strong>
+        <p>{{warning}}</p>
+      </div>
+
+      <dl class="release-meta">
+        <div><dt>File</dt><dd><code>{{downloadName}}</code></dd></div>
+        <div><dt>Versione artefatto</dt><dd><code>{{artifactVersion}}</code></dd></div>
+        <div><dt>Commit sorgente</dt><dd><code>{{sourceCommit}}</code></dd></div>
+        <div><dt>Dimensione</dt><dd>{{size}}</dd></div>
+        <div><dt>Modificato</dt><dd>{{modified}}</dd></div>
+        <div><dt>SHA-256</dt><dd><code class="full-hash">{{hash}}</code></dd></div>
+      </dl>
+
+      <div class="qualification-note">
+        <span>Copertura corrente</span>
+        <p>{{qualification}}</p>
+        <a href="{{workflowUrl}}" target="_blank" rel="noreferrer">Apri il workflow di provenienza ↗</a>
+      </div>
+
+      <div class="release-actions">
+        <a class="button primary" href="/private/downloads/iso">Scarica candidato ISO</a>
+        <a class="button ghost" href="/private/downloads/checksum">Scarica SHA-256</a>
+      </div>
+    </section>
+
+    <section class="verify-card" aria-labelledby="verify-title">
+      <div>
+        <p class="card-kicker">Integrità</p>
+        <h2 id="verify-title">Verifica sempre prima dell'uso in laboratorio.</h2>
+      </div>
+      <div class="verify-commands">
+        <p>Linux</p><code>sha256sum -c KernAid-Rescue-amd64-preview.iso.sha256</code>
+        <p>Windows PowerShell</p><code>Get-FileHash .\KernAid-Rescue-amd64-preview.iso -Algorithm SHA256</code>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <p>KernAid internal distribution</p>
+    <a href="/">Sito pubblico</a>
+  </footer>
+</body>
+</html>

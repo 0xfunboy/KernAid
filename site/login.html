@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex,nofollow,noarchive">
+  <meta name="theme-color" content="#0b0f0e">
+  <title>Accesso riservato — KernAid</title>
+  <link rel="icon" href="/mark.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body class="auth-body">
+  <main class="auth-shell">
+    <a class="brand" href="/" aria-label="Torna alla home KernAid">
+      <img src="/mark.svg" alt="" width="42" height="42">
+      <span>KernAid</span>
+    </a>
+    <section class="auth-card" aria-labelledby="login-title">
+      <p class="eyebrow">Distribuzione controllata</p>
+      <h1 id="login-title">Area riservata</h1>
+      <p>Accedi agli artefatti engineering interni. Le credenziali non vengono registrate nei log.</p>
+      {{error}}
+      <form method="post" action="/private/login">
+        <label for="username">Utente</label>
+        <input id="username" name="username" type="text" value="{{username}}" autocomplete="username" required>
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" required autofocus>
+        <button class="button primary" type="submit">Accedi</button>
+      </form>
+      <a class="back-link" href="/">← Torna al sito pubblico</a>
+    </section>
+  </main>
+</body>
+</html>

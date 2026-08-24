@@ -1,8 +1,8 @@
 # KernAid
 
-KernAid is an evidence-first machine diagnosis and repair platform. This repository implements the Phase 0 feasibility spike described in the [masterplan](docs/MASTERPLAN.md).
+KernAid is an evidence-first machine diagnosis and repair platform. This repository implements the Phase 0 feasibility spike described in the [masterplan](docs/MASTERPLAN.md). For the concise, date-stamped distinction between what works now and what remains unqualified, start with [Current status](docs/CURRENT_STATUS.md).
 
-The current production vertical slice is deliberately safe: start a session, collect a normalized read-only host snapshot, run deterministic offline diagnostic rules, validate an R0 plan through Core, and export a downloadable, hashed JSON report. Production target mutation is not implemented. A separate opt-in `fixture-repair-lab` feature exercises one pinned repair and rollback only against a marked disposable fixture; it is absent from normal builds and is not connected to Core, IPC, Tauri, providers, Rescue, or production target selection.
+The current Phase 0 engineering vertical slice is deliberately safe: start a session, collect a normalized read-only host snapshot, run deterministic offline diagnostic rules, validate an R0 plan through Core, and export a downloadable, hashed JSON report. Production target mutation is not implemented. A separate opt-in `fixture-repair-lab` feature exercises one pinned repair and rollback only against a marked disposable fixture; it is absent from normal builds and is not connected to Core, IPC, Tauri, providers, Rescue, or production target selection.
 
 ## Quick start
 
@@ -72,7 +72,7 @@ CI produces engineering-preview desktop installers for Windows, Linux, Intel mac
   remain the startup/default provider and require no account or network.
 - **Do not use on customer data as a repair tool yet:** the current workflow diagnoses and stages an R0 no-write plan. It deliberately cannot execute real repairs.
 
-The Rescue artifact is rebuilt and boot-tested in QEMU using both legacy BIOS
+Qualified Rescue candidates are boot-tested in QEMU using both legacy BIOS
 and UEFI firmware. Each test attaches only disposable target images, including
 one same-disk GPT Windows fixture with NTFS and EFI partitions, requires the
 local UI service and API to become ready, and verifies that each complete target
@@ -83,13 +83,16 @@ provider relay with provider networking disabled. The ordinary BIOS and UEFI
 smoke now also requires the shipping Tauri/WebKitGTK shell process, a descendant
 renderer, a visible branded framebuffer, and a real keyboard event that changes
 that framebuffer; raw screenshots are never published. It does not exercise live
-provider TLS, a real account, Secure Boot, or physical media.
+provider TLS, a real account, Secure Boot, or physical media. The current
+workflow and downloadable-artifact status is tracked in
+[Current status](docs/CURRENT_STATUS.md); do not infer that every `main` commit
+has produced a publishable ISO.
 
 ## Trust boundaries
 
 The React UI talks only to a `SessionDriver`. Providers return diagnosis proposals and cannot reach the broker. Core validates plans and policy. The default production broker accepts an allowlisted typed envelope; in Phase 0 its only action is `system.observe.noop`.
 
-See the [operator guide](docs/operator-guide.md), [architecture](docs/architecture/phase-0.md), [security policy](SECURITY.md), and the complete [masterplan](docs/MASTERPLAN.md).
+See [Current status](docs/CURRENT_STATUS.md), the [operator guide](docs/operator-guide.md), [architecture](docs/architecture/phase-0.md), [security policy](SECURITY.md), and the complete [masterplan](docs/MASTERPLAN.md).
 
 ## Current limitations
 

@@ -33,7 +33,9 @@ Ogni voce lega esattamente:
 Il catalogo è il trust anchor locale: programma, catalogo e tutta la loro
 directory devono essere posseduti da `root` e non scrivibili da gruppo/altri.
 
-Il writer v1 resta l'unico percorso attivo per l'immagine pubblicata corrente.
+Il writer v1 resta l'unico percorso implementato per l'immagine storica
+autorizzata, ma non esiste oggi un artefatto scaricabile che corrisponda a tale
+voce: il flusso operativo resta quindi sospeso.
 Il percorso separato `make-device-v2.py` è implementato e testabile, ma resta
 **inattivo in produzione**: `trusted-rescue-images.v2.json` ha revisione zero e
 l'elenco immagini è vuoto. Il launcher v2 non consulta mai il catalogo v1 e

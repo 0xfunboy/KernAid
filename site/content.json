@@ -1,0 +1,14 @@
+{
+  "schema": "dev.kernaid.site-content.v1",
+  "release": {
+    "name": "KernAid Rescue AMD64",
+    "channel": "Internal candidate",
+    "sourceCommit": "b843178c9254c798e128b0e0890cb00045dde17b",
+    "artifactVersion": "ci-32432064694-1",
+    "workflowUrl": "https://github.com/0xfunboy/KernAid/actions/runs/32432064694",
+    "downloadName": "KernAid-Rescue-amd64-preview.iso",
+    "checksumName": "KernAid-Rescue-amd64-preview.iso.sha256",
+    "qualification": "Smoke QEMU disponibile per BIOS e UEFI; il gate vault lifecycle non è superato.",
+    "warning": "Candidato engineering interno non promosso: il catalogo trusted v2 è vuoto e il vault lifecycle è fallito. Non è una release e non è qualificato per scrittura o avvio da USB fisica."
+  }
+}

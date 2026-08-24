@@ -1,5 +1,9 @@
 # KernAid — Product, Architecture and Repository Masterplan
 
+> This is the long-range product plan originally written on 1 August 2026.
+> For implemented behavior, qualification and active release gates, the
+> authoritative source is [Current status](CURRENT_STATUS.md).
+
 Version 0.1 — 1 August 2026
 Working brand: **KernAid**
 Physical product: **KernAid One**
@@ -81,7 +85,9 @@ The interface should borrow the information density of an IDE, not its coding me
 - **Bottom panel:** evidence, terminal, audit log and raw output.
 - **Top bar:** Rescue/Resident mode, provider, connectivity, device-vault state and session identity.
 
-The deterministic visual concept is included in the brand kit at ui/kernaid-app-shell.svg.
+The visual concept is represented by the implemented Desk/Rescue UI under
+`apps/desk`; the separate historical brand kit is not a repository runtime
+dependency.
 
 ### 3.2 Persistent workflow states
 
@@ -145,7 +151,7 @@ The gateway may ask a provider to reason about evidence. Only Core may create an
 | --- | --- | --- |
 | Desktop shell | Tauri 2, React, TypeScript | Cross-platform window, machine UI, approvals, reports |
 | UI components | React, TanStack Query, xterm.js, Monaco only for logs/config/diffs | IDE-like experience without making source code the primary object |
-| Agent gateway | Node.js 22 LTS, TypeScript | Provider adapters, streaming, context assembly, structured response validation |
+| Agent gateway | Node.js 24.18.0, TypeScript | Provider adapters, streaming, context assembly, structured response validation |
 | KernAid Core | Rust | Session state, evidence graph, policies, plan validation, audit journal |
 | Privileged broker | Rust | Unix socket / Windows named pipe / macOS XPC helper; least-privilege action execution |
 | Evidence store | SQLite plus content-addressed blobs | Immutable evidence, checksums, provenance and reports |
@@ -1208,7 +1214,8 @@ raw disk writes, password bypass, firmware operations or arbitrary privileged sh
 First:
 1. Read the masterplan completely.
 2. Create the monorepo structure defined in section 13.
-3. Add AGENTS.md with the ten rules from section 14.3.
+3. Keep `AGENTS.md` aligned with the active engineering invariants; it currently
+   contains eleven rules.
 4. Scaffold a Tauri 2 + React desktop app, a Rust workspace, and a TypeScript
    agent-gateway behind the SessionDriver interface.
 5. Define versioned JSON Schemas for Evidence, DiagnosisProposal, ValidatedPlan,

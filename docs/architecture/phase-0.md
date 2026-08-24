@@ -43,7 +43,8 @@ primitives. An exact Rescue image is virtually qualified only when both
 privileged lifecycle jobs pass. The shipping peer allowlist exposes the Codex
 role only to the fixed non-root authentication unit and only for an exclusive
 home lease; Application audit/report, Codex prompt execution, model selection,
-target access, and broker access remain absent. Secure Boot,
-browser-renderer/WebKit/GPU compatibility, a completed Codex device login with
-a real enabled account, live provider TLS, and physical hardware/media support
-remain open release gates.
+target access, and broker access remain absent. QEMU now exercises the shipping
+WebKit shell, renderer, branded framebuffer and keyboard input; physical
+browser-renderer/WebKit/GPU compatibility remains unqualified. Secure Boot, a
+completed Codex device login with a real enabled account, live provider TLS,
+and physical hardware/media support remain open release gates.

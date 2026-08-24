@@ -259,5 +259,9 @@ customer authorization and applicable data-processing requirements first.
   renderer and its visible window are all present.
 - If the page opens but Rescue observations or the target selector do not
   appear, check `systemctl status kernaid-ui.service` from the live console.
-- If firmware does not list the USB, rewrite it in raw/DD mode and retry another port. Secure Boot support is not yet claimed.
+- Only after an exact ISO is promoted in the trusted catalog, if firmware does
+  not list that qualified test USB, rewrite the same promoted image in raw/DD
+  mode and retry another port. The current download/writer flow is suspended;
+  see [Current status](CURRENT_STATUS.md). Secure Boot support is not yet
+  claimed.
 - Keep the original disk untouched when hardware failure is suspected; collect the report and move to a controlled imaging workflow.
