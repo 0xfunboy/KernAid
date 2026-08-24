@@ -460,7 +460,7 @@ class LinuxSnapshotEndToEndTests(unittest.TestCase):
         )
         smoke_upload = rescue.index("      - name: Publish smoke diagnostics")
         next_step = rescue.index("\n      - name:", smoke_upload + 1)
-        self.assertNotIn("rescue-smoke-*.log", rescue[smoke_upload:next_step])
+        self.assertIn("rescue-smoke-*.log", rescue[smoke_upload:next_step])
 
 
 if __name__ == "__main__":
