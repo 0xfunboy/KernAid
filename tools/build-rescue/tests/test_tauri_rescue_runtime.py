@@ -525,6 +525,13 @@ class RescueTauriBoundaryTests(unittest.TestCase):
             unit_values.setdefault(directive, set()).update(value.split())
         for directive in ("Requires", "After"):
             self.assertTrue(shipping_sockets.keys() <= unit_values[directive])
+        self.assertIn(
+            "kernaid-tauri-network-probe-baseline.service",
+            unit_values["Requires"],
+        )
+        self.assertNotIn(
+            "kernaid-tauri-network-probe-baseline.service", unit_values["Wants"]
+        )
         self.assertNotIn("InaccessiblePaths", unit_values)
         self.assertEqual(
             unit_values["RestrictAddressFamilies"],
@@ -608,11 +615,13 @@ class RescueTauriBoundaryTests(unittest.TestCase):
             self.assertIn("ConditionVirtualization=|kvm", probe_unit)
         self.assertIn("FreeBind=yes", socket_service)
         self.assertIn(
-            "Wants=systemd-modules-load.service systemd-udev-settle.service",
+            "Wants=systemd-modules-load.service systemd-udev-settle.service "
+            "live-config.service NetworkManager.service network-online.target",
             address_service,
         )
         self.assertIn(
-            "After=systemd-modules-load.service systemd-udev-settle.service",
+            "After=systemd-modules-load.service systemd-udev-settle.service "
+            "live-config.service NetworkManager.service network-online.target",
             address_service,
         )
         self.assertIn(

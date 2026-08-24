@@ -2,8 +2,8 @@
 Description=KernAid QEMU-only Tauri network probe address
 ConditionVirtualization=|qemu
 ConditionVirtualization=|kvm
-Wants=systemd-modules-load.service systemd-udev-settle.service
-After=systemd-modules-load.service systemd-udev-settle.service
+Wants=systemd-modules-load.service systemd-udev-settle.service live-config.service NetworkManager.service network-online.target
+After=systemd-modules-load.service systemd-udev-settle.service live-config.service NetworkManager.service network-online.target
 Before=kernaid-tauri-network-probe.socket kernaid-tauri-network-probe-baseline.service kernaid-rescue-desk-shell.service
 PartOf=kernaid-tauri-network-probe.socket
 
