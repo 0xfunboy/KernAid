@@ -616,12 +616,14 @@ class RescueTauriBoundaryTests(unittest.TestCase):
         self.assertIn("FreeBind=yes", socket_service)
         self.assertIn(
             "Wants=systemd-modules-load.service systemd-udev-settle.service "
-            "live-config.service NetworkManager.service network-online.target",
+            "live-config.service NetworkManager.service "
+            "NetworkManager-wait-online.service",
             address_service,
         )
         self.assertIn(
             "After=systemd-modules-load.service systemd-udev-settle.service "
-            "live-config.service NetworkManager.service network-online.target",
+            "live-config.service NetworkManager.service "
+            "NetworkManager-wait-online.service",
             address_service,
         )
         self.assertIn(
