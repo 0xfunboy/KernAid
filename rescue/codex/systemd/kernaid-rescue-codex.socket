@@ -1,0 +1,22 @@
+[Unit]
+Description=KernAid experimental Rescue Codex exec socket
+Requires=systemd-sysusers.service
+After=systemd-sysusers.service
+ConditionKernelCommandLine=boot=live
+ConditionKernelCommandLine=kernaid.experimental_codex_exec=1
+ConditionFileIsExecutable=/usr/lib/kernaid/kernaid-rescue-codex-executor
+ConditionFileIsExecutable=/usr/lib/kernaid/codex
+
+[Socket]
+ListenSequentialPacket=/run/kernaid-rescue-codex.sock
+Accept=yes
+MaxConnections=1
+Backlog=1
+SocketMode=0660
+SocketUser=root
+SocketGroup=kernaid-provider-client
+RemoveOnStop=yes
+PassCredentials=no
+PassSecurity=no
+PassPacketInfo=no
+Timestamping=off

@@ -1,0 +1,28 @@
+[package]
+name = "kernaid-rescue-codex-executor"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+experimental-codex-exec = []
+
+[dependencies]
+kernaid-protocol = { path = "../protocol" }
+kernaid-rescue-openai-provider = { path = "../rescue-openai-provider" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1.4", features = ["event", "fs", "net", "pipe", "process"] }
+
+[dev-dependencies]
+tempfile = "3.23.0"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "kernaid-rescue-codex-executor"
+path = "src/main.rs"
+required-features = ["experimental-codex-exec"]

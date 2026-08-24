@@ -2379,6 +2379,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "kernaid-rescue-codex-executor"
+version = "0.1.0"
+dependencies = [
+ "kernaid-protocol",
+ "kernaid-rescue-openai-provider",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "kernaid-rescue-openai-executor"
 version = "0.1.0"
 dependencies = [
