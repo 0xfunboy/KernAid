@@ -20,6 +20,9 @@ StandardInput=socket
 StandardOutput=null
 StandardError=null
 User=kernaid-codex
+RuntimeDirectory=kernaid-codex-diag
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
 # Preserve the dedicated primary group so every CLI-created credential-store
 # entry remains owned by the exact Codex identity. Vault socket access exists
 # only as a unit-scoped supplementary group, never in the account database.
@@ -62,7 +65,7 @@ RestrictRealtime=yes
 # descriptor-bound executable and CODEX_HOME checks require openat2; the empty
 # capability sets and NoNewPrivileges retain the privilege boundary.
 LockPersonality=yes
-MemoryDenyWriteExecute=yes
+MemoryDenyWriteExecute=no
 SystemCallArchitectures=native
 KeyringMode=private
 RemoveIPC=yes

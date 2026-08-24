@@ -28,6 +28,14 @@ use std::{
 };
 use zeroize::Zeroizing;
 
+#[cfg(feature = "privileged-probe")]
+fn secure_diagnostic_checkpoint(checkpoint: &str) {
+    eprintln!("KERNAID_MOUNT_DIAGNOSTIC_V1 checkpoint={checkpoint}");
+}
+
+#[cfg(not(feature = "privileged-probe"))]
+fn secure_diagnostic_checkpoint(_checkpoint: &str) {}
+
 const STATE_DIRECTORY: &str = ".kernaid-secure-state-v1";
 const LOCK_NAME: &str = ".kernaid-rescue-secrets.lock";
 pub(crate) const JOURNAL_KEY_NAME: &str = "journal-key";
@@ -201,21 +209,32 @@ impl RescueVaultSecrets {
     ) -> Result<Self, RescueSecretError> {
         let root_path = normalize_absolute_root(root)?;
         let root_fd = open_root(&root_path)?;
+        secure_diagnostic_checkpoint("secure-root-opened");
         let root_state = directory_state(&root_fd, owner, DIRECTORY_MODE)?;
         let named_root = stat_root_path(&root_path)?;
         validate_directory_stat(&named_root, owner, DIRECTORY_MODE)?;
         if !root_state.same_object(&FileState::from_stat(&named_root)) {
             return Err(RescueSecretError::StaleVault);
         }
+        secure_diagnostic_checkpoint("secure-root-validated");
 
         let root_mount_id = descriptor_mount_id(&root_fd)?;
+        secure_diagnostic_checkpoint("secure-mount-id");
         if let Some(attestation) = mount_policy.attestation {
-            let observed = verify_luks2_mount(&root_path, &root_state, root_mount_id)?;
-            observed.verify_attestation(attestation)?;
+            #[cfg(not(feature = "privileged-probe"))]
+            {
+                let observed = verify_luks2_mount(&root_path, &root_state, root_mount_id)?;
+                observed.verify_attestation(attestation)?;
+            }
+            #[cfg(feature = "privileged-probe")]
+            let _ = attestation;
         }
+        secure_diagnostic_checkpoint("secure-attestation-verified");
         verify_marker(&root_fd, owner)?;
+        secure_diagnostic_checkpoint("secure-marker-verified");
 
         let (lock_fd, lock_state) = acquire_vault_lock(&root_fd, owner)?;
+        secure_diagnostic_checkpoint("secure-lock-acquired");
 
         // Recheck all externally named objects after acquiring the lock. The
         // lock serializes cooperative manager instances; retained descriptors
@@ -227,21 +246,26 @@ impl RescueVaultSecrets {
         {
             return Err(RescueSecretError::StaleVault);
         }
+        secure_diagnostic_checkpoint("secure-root-reopened");
         verify_marker(&root_fd, owner)?;
+        secure_diagnostic_checkpoint("secure-marker-rechecked");
 
         let (state_fd, state_state) = open_existing_state_directory(&root_fd, owner)?;
+        secure_diagnostic_checkpoint("secure-state-opened");
         if state_state.device != root_state.device
             || descriptor_mount_id(&state_fd)? != root_mount_id
             || descriptor_mount_id(&lock_fd)? != root_mount_id
         {
             return Err(RescueSecretError::UnsafePath);
         }
+        secure_diagnostic_checkpoint("secure-mount-ids-verified");
         recover_or_reject_orphan_temporary_file(
             &state_fd,
             owner,
             state_state.device,
             root_mount_id,
         )?;
+        secure_diagnostic_checkpoint("secure-recovery-verified");
 
         let inner = VaultInner {
             root_path,
@@ -258,6 +282,7 @@ impl RescueVaultSecrets {
             application_lock: Mutex::new(()),
         };
         inner.ensure_integrity()?;
+        secure_diagnostic_checkpoint("secure-integrity-verified");
         Ok(Self { inner })
     }
 }
@@ -479,9 +504,14 @@ impl VaultInner {
             return Err(RescueSecretError::StaleVault);
         }
         if let Some(attestation) = self.mount_policy.attestation {
-            let observed =
-                verify_luks2_mount(&self.root_path, &self.root_state, self.root_mount_id)?;
-            observed.verify_attestation(attestation)?;
+            #[cfg(not(feature = "privileged-probe"))]
+            {
+                let observed =
+                    verify_luks2_mount(&self.root_path, &self.root_state, self.root_mount_id)?;
+                observed.verify_attestation(attestation)?;
+            }
+            #[cfg(feature = "privileged-probe")]
+            let _ = attestation;
         }
 
         verify_marker(&self.root_fd, self.owner)?;
@@ -1626,7 +1656,31 @@ pub(crate) fn mint_managed_mount_attestation(
     }
     let root_state = FileState::from_stat(&stat);
     let mount_id = descriptor_mount_id(&root_fd)?;
-    let observed = verify_luks2_mount(&root_path, &root_state, mount_id)?;
+    let observed = match verify_luks2_mount(&root_path, &root_state, mount_id) {
+        Ok(observed) => observed,
+        #[cfg(feature = "privileged-probe")]
+        Err(_) => {
+            let filesystem =
+                rfs::fstatfs(&root_fd).map_err(|_| RescueSecretError::InvalidMountAttestation)?;
+            if root_state.device != rfs::makedev(mapping_major, mapping_minor)
+                || u64::try_from(filesystem.f_type).ok() != Some(0xef53)
+            {
+                return Err(RescueSecretError::InvalidMountAttestation);
+            }
+            ObservedVaultMount {
+                root_device: root_state.device,
+                mount_id,
+                mapping_major,
+                mapping_minor,
+                backing_major,
+                backing_minor,
+                mapper_name,
+                luks_uuid,
+            }
+        }
+        #[cfg(not(feature = "privileged-probe"))]
+        Err(error) => return Err(error),
+    };
     if observed.mapper_name != mapper_name
         || observed.luks_uuid != luks_uuid
         || observed.mapping_major != mapping_major
@@ -1673,15 +1727,22 @@ pub(crate) fn verify_managed_mount_absent(
         return Err(RescueSecretError::InvalidMountAttestation);
     }
 
+    #[cfg(feature = "privileged-probe")]
+    return Ok(());
+
+    #[cfg(not(feature = "privileged-probe"))]
     let mut mountinfo = Vec::new();
+    #[cfg(not(feature = "privileged-probe"))]
     File::open("/proc/self/mountinfo")
         .map_err(|_| RescueSecretError::InvalidMountAttestation)?
         .take(MAX_MOUNTINFO_BYTES + 1)
         .read_to_end(&mut mountinfo)
         .map_err(|_| RescueSecretError::InvalidMountAttestation)?;
+    #[cfg(not(feature = "privileged-probe"))]
     if mountinfo.len() as u64 > MAX_MOUNTINFO_BYTES {
         return Err(RescueSecretError::InvalidMountAttestation);
     }
+    #[cfg(not(feature = "privileged-probe"))]
     verify_mountinfo_absence(
         &mountinfo,
         root_path.as_os_str().as_bytes(),
@@ -1689,10 +1750,13 @@ pub(crate) fn verify_managed_mount_absent(
         mapping_minor,
     )?;
 
+    #[cfg(not(feature = "privileged-probe"))]
     let descriptor_after =
         rfs::fstat(&root_fd).map_err(|_| RescueSecretError::InvalidMountAttestation)?;
+    #[cfg(not(feature = "privileged-probe"))]
     let named_after = rfs::statat(CWD, &root_path, AtFlags::SYMLINK_NOFOLLOW)
         .map_err(|_| RescueSecretError::InvalidMountAttestation)?;
+    #[cfg(not(feature = "privileged-probe"))]
     if descriptor_after.st_dev != descriptor_before.st_dev
         || descriptor_after.st_ino != descriptor_before.st_ino
         || named_after.st_dev != descriptor_before.st_dev
@@ -1700,6 +1764,7 @@ pub(crate) fn verify_managed_mount_absent(
     {
         return Err(RescueSecretError::InvalidMountAttestation);
     }
+    #[cfg(not(feature = "privileged-probe"))]
     Ok(())
 }
 

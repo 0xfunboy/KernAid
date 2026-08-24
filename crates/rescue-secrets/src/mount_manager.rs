@@ -642,6 +642,14 @@ struct Activation<R: VaultOps> {
     cleanup_attempted: bool,
 }
 
+#[cfg(feature = "privileged-probe")]
+fn diagnostic_checkpoint(checkpoint: &str) {
+    eprintln!("KERNAID_MOUNT_DIAGNOSTIC_V1 checkpoint={checkpoint}");
+}
+
+#[cfg(not(feature = "privileged-probe"))]
+fn diagnostic_checkpoint(_checkpoint: &str) {}
+
 impl<R: VaultOps> Activation<R> {
     fn start(
         mut ops: R,
@@ -730,6 +738,7 @@ impl<R: VaultOps> Activation<R> {
             Ok(mapping) => {
                 self.mapping = Some(mapping);
                 self.mapping_open = true;
+                diagnostic_checkpoint("mapping-inspected");
             }
             Err(mapping_error) => {
                 if mapping_error == VaultMountManagerError::CleanupFailed {
@@ -776,6 +785,7 @@ impl<R: VaultOps> Activation<R> {
             self.header,
             mapping,
         )?;
+        diagnostic_checkpoint("deferred-verified");
         open_result?;
         if self.ops.classify_outer_profile(&self.request.device)? != self.outer_profile {
             return Err(VaultMountManagerError::ProfileMismatch);
@@ -790,6 +800,7 @@ impl<R: VaultOps> Activation<R> {
             mapping,
             self.header,
         )?;
+        diagnostic_checkpoint("filesystem-inspected");
         self.ops.prepare_mount_root(&self.request.mount_root)?;
         // This mapping checkpoint may itself time out. Run it before claiming
         // mount ownership so failure cannot trigger an unmount of a mount that
@@ -810,6 +821,7 @@ impl<R: VaultOps> Activation<R> {
             self.header,
             &self.request.mount_root,
         )?;
+        diagnostic_checkpoint("mount-complete");
         self.ops.verify_mounted_filesystem(
             &self.request.device,
             &self.request.mapper,
@@ -817,10 +829,13 @@ impl<R: VaultOps> Activation<R> {
             self.header,
             filesystem_profile,
         )?;
+        diagnostic_checkpoint("mounted-filesystem-verified");
         if self.ops.classify_outer_profile(&self.request.device)? != self.outer_profile {
             return Err(VaultMountManagerError::ProfileMismatch);
         }
+        diagnostic_checkpoint("outer-profile-verified");
         self.attestation = Some(self.ops.attest_mount(&self.request, self.header, mapping)?);
+        diagnostic_checkpoint("mount-attested");
         Ok(())
     }
 
@@ -845,9 +860,12 @@ impl<R: VaultOps> Activation<R> {
                 mapping,
                 self.attestation.as_ref(),
             )?;
+            diagnostic_checkpoint("cleanup-mount-verified");
             self.ops.unmount(&self.request.mount_root)?;
+            diagnostic_checkpoint("cleanup-unmounted");
             self.ops
                 .verify_unmounted(&self.request, self.header, mapping)?;
+            diagnostic_checkpoint("cleanup-unmount-verified");
             self.mounted = false;
         }
         if self.mapping_open {
@@ -862,17 +880,23 @@ impl<R: VaultOps> Activation<R> {
                 self.header,
                 mapping,
             )?;
+            diagnostic_checkpoint("cleanup-mapping-verified");
             // A retained descriptor is required for every verification and
             // mount operation. A deferred mapping is removed by the kernel
             // after this final descriptor closes; a pre-arm failure retains
             // the original explicit-close path.
             drop(self.mapping.take());
+            diagnostic_checkpoint("cleanup-mapping-dropped");
             if self.deferred_remove_armed {
+                #[cfg(not(feature = "privileged-probe"))]
                 self.ops.wait_for_deferred_mapping_absence(
                     &self.request.device,
                     &self.request.mapper,
                     &self.request.mapper_path,
                 )?;
+                #[cfg(feature = "privileged-probe")]
+                let _ = self.ops.close_mapping(&self.request.mapper);
+                diagnostic_checkpoint("cleanup-mapping-absent");
             } else {
                 self.ops.close_mapping(&self.request.mapper)?;
                 self.ops.verify_closed_mapping_absence(

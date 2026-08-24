@@ -45,7 +45,7 @@ ACPI_SHUTDOWN_SECONDS = 180.0
 SHUTDOWN_RESERVE_SECONDS = ACPI_SHUTDOWN_SECONDS + 15.0
 PROCESS_CLEANUP_SECONDS = 5.0
 PROBE_OUTPUT_LIMIT = 256
-PROBE_STDERR_LIMIT = 256
+PROBE_STDERR_LIMIT = 4096
 PROBE_TIMEOUT_SECONDS = 620.0
 
 LOOP_CLR_FD = 0x4C01
@@ -95,6 +95,7 @@ PROVIDER_PROOF_UI_STAGES = (
     "ui-diagnose-unconfigured",
     "ui-status-configured",
 )
+PROVIDER_PROOF_DIAGNOSTIC_STAGES = PROVIDER_PROOF_UI_STAGES + ("codex-status",)
 PROVIDER_PROOF_CLOSED_STAGES = PROVIDER_PROOF_UI_STAGES + (
     "codex-status",
     "production-status",
@@ -119,6 +120,60 @@ PROVIDER_PROOF_UI_CHECKPOINTS = (
     "outcome-timeout",
     "outcome-transport",
     "outcome-upstream",
+)
+CODEX_STATUS_DIAGNOSTIC_CHECKPOINTS = (
+    "bridge-diagnostic-hash",
+    "bridge-diagnostic-unit",
+    "bridge-diagnostic-execstart",
+    "matrix-tmpdir-signed-out",
+    "matrix-mdwe-signed-out",
+    "unit-load",
+    "unit-fragment",
+    "unit-binds",
+    "unit-user",
+    "unit-group",
+    "unit-supplementary-group",
+    "socket-active",
+    "accepted-format",
+    "client-transport-empty",
+    "client-vault-locked",
+    "client-vault-unconfigured",
+    "client-busy",
+    "client-reboot-required",
+    "client-timeout",
+    "client-cli-unavailable",
+    "client-unsafe-state",
+    "client-operation-failed",
+    "bridge-vault-locked",
+    "bridge-vault-unconfigured",
+    "bridge-busy",
+    "bridge-reboot-required",
+    "bridge-transport",
+    "bridge-cli-unavailable",
+    "bridge-cli-failed",
+    "bridge-timeout",
+    "bridge-unsafe-home",
+    "bridge-unsafe-executable",
+    "bridge-response-invalid",
+    "diag-collect-output-bound",
+    "diag-collect-reader-failed",
+    "diag-collect-channel-disconnected",
+    "diag-collect-try-wait",
+    "diag-collect-stdout-join",
+    "diag-collect-stderr-join",
+    "diag-collect-device-code-missing",
+    "diag-collect-status-missing",
+    "diag-missing",
+    "diag-invalid",
+    "client-output-unclassified",
+    "client-success-output",
+    "accepted-delta",
+    "connection-drain",
+)
+CODEX_DIAGNOSTIC_CLASSIFY_CHECKPOINT_RE = re.compile(
+    r"^diag-classify-(empty|nonempty)-(zero|one|other|signal)-"
+    r"(empty|exact-not-logged|contains-not-logged|other)-"
+    r"(zero|tiny|small|bounded-large)$"
 )
 PROVIDER_PROOF_UI_ERROR_CHECKPOINTS = (
     ("busy", "outcome-busy"),
@@ -1606,6 +1661,67 @@ PROBE_ATTESTATION_RE = re.compile(
     rb"mode=(initialize|verify) journal_binding=device-identity-bound-v1 "
     rb"identity_public_key=([0-9a-f]{64}) clean_shutdown=true\n$"
 )
+PROBE_FAILURE_RE = re.compile(
+    rb"KERNAID_RESCUE_VAULT_PROBE_FAILURE_V1 "
+    rb"stage=([a-z0-9-]{1,64}) code=([a-z0-9-]{1,64})\n"
+)
+MOUNT_DIAGNOSTIC_RE = re.compile(
+    rb"KERNAID_MOUNT_DIAGNOSTIC_V1 checkpoint=([a-z0-9-]{1,64})"
+)
+MOUNT_DIAGNOSTIC_CHECKPOINTS = {
+    b"mapping-inspected",
+    b"deferred-verified",
+    b"filesystem-inspected",
+    b"mount-complete",
+    b"mounted-filesystem-verified",
+    b"outer-profile-verified",
+    b"mount-attested",
+    b"secure-root-opened",
+    b"secure-root-validated",
+    b"secure-mount-id",
+    b"secure-attestation-verified",
+    b"secure-marker-verified",
+    b"secure-lock-acquired",
+    b"secure-root-reopened",
+    b"secure-marker-rechecked",
+    b"secure-state-opened",
+    b"secure-mount-ids-verified",
+    b"secure-recovery-verified",
+    b"secure-integrity-verified",
+    b"cleanup-mount-verified",
+    b"cleanup-unmounted",
+    b"cleanup-unmount-verified",
+    b"cleanup-mapping-verified",
+    b"cleanup-mapping-dropped",
+    b"cleanup-mapping-absent",
+}
+MOUNT_DIAGNOSTIC_SEQUENCE = (
+    b"mapping-inspected",
+    b"deferred-verified",
+    b"filesystem-inspected",
+    b"mount-complete",
+    b"mounted-filesystem-verified",
+    b"outer-profile-verified",
+    b"mount-attested",
+    b"secure-root-opened",
+    b"secure-root-validated",
+    b"secure-mount-id",
+    b"secure-attestation-verified",
+    b"secure-marker-verified",
+    b"secure-lock-acquired",
+    b"secure-root-reopened",
+    b"secure-marker-rechecked",
+    b"secure-state-opened",
+    b"secure-mount-ids-verified",
+    b"secure-recovery-verified",
+    b"secure-integrity-verified",
+    b"cleanup-mount-verified",
+    b"cleanup-unmounted",
+    b"cleanup-unmount-verified",
+    b"cleanup-mapping-verified",
+    b"cleanup-mapping-dropped",
+    b"cleanup-mapping-absent",
+)
 
 
 def _write_secret_to_pipe(
@@ -1749,9 +1865,61 @@ def run_bounded_probe(parsed: argparse.Namespace) -> str:
         stdout_drainer.join(1.0)
         stderr_drainer.join(1.0)
         if process.returncode != 0:
+            stderr = stderr_capture.snapshot()
+            probe_failure = PROBE_FAILURE_RE.fullmatch(stderr)
+            if probe_failure is not None and not stdout_capture.snapshot():
+                stage = probe_failure.group(1).decode("ascii")
+                code = probe_failure.group(2).decode("ascii")
+                raise ClosedFailure("host-probe", f"{stage}-{code}")
+            lines = stderr.splitlines()
+            if lines and not stdout_capture.snapshot():
+                final_failure = PROBE_FAILURE_RE.fullmatch(lines[-1] + b"\n")
+                checkpoints = [MOUNT_DIAGNOSTIC_RE.fullmatch(line) for line in lines[:-1]]
+                if (
+                    final_failure is not None
+                    and checkpoints
+                    and all(match is not None for match in checkpoints)
+                    and all(
+                        match.group(1) in MOUNT_DIAGNOSTIC_CHECKPOINTS
+                        for match in checkpoints
+                        if match is not None
+                    )
+                ):
+                    secure_checkpoints = [
+                        match
+                        for match in checkpoints
+                        if match is not None
+                        and match.group(1).startswith(b"secure-")
+                    ]
+                    last = (
+                        secure_checkpoints[-1]
+                        if secure_checkpoints
+                        else checkpoints[-1]
+                    )
+                    assert last is not None
+                    stage = final_failure.group(1).decode("ascii")
+                    code = final_failure.group(2).decode("ascii")
+                    checkpoint = last.group(1).decode("ascii")
+                    raise ClosedFailure(
+                        "host-probe", f"after-{checkpoint}-{stage}-{code}"
+                    )
             raise ClosedFailure("probe", "failed")
-        if stderr_capture.snapshot():
-            raise ClosedFailure("probe-stderr", "unexpected")
+        stderr = stderr_capture.snapshot()
+        if stderr:
+            diagnostic_lines = stderr.splitlines()
+            diagnostic_matches = [
+                MOUNT_DIAGNOSTIC_RE.fullmatch(line) for line in diagnostic_lines
+            ]
+            if (
+                any(match is None for match in diagnostic_matches)
+                or tuple(
+                    match.group(1)
+                    for match in diagnostic_matches
+                    if match is not None
+                )
+                != MOUNT_DIAGNOSTIC_SEQUENCE
+            ):
+                raise ClosedFailure("probe-stderr", "unexpected")
         output = stdout_capture.snapshot()
         match = PROBE_ATTESTATION_RE.fullmatch(output)
         if match is None or match.group(1).decode("ascii") != parsed.mode:
@@ -2532,10 +2700,23 @@ def run_guest_proof(
 
     failure_stage = event_match.group("failure_stage").decode("ascii")
     failure_checkpoint = event_match.group("failure_checkpoint").decode("ascii")
+    diagnostic_classify_checkpoint = (
+        failure_stage == "codex-status"
+        and CODEX_DIAGNOSTIC_CLASSIFY_CHECKPOINT_RE.fullmatch(failure_checkpoint)
+        is not None
+    )
+    codex_diagnostic_checkpoint = (
+        failure_stage == "codex-status"
+        and failure_checkpoint in CODEX_STATUS_DIAGNOSTIC_CHECKPOINTS
+    )
     if (
         failure_stage != stage
-        or failure_stage not in PROVIDER_PROOF_UI_STAGES
-        or failure_checkpoint not in PROVIDER_PROOF_UI_CHECKPOINTS
+        or failure_stage not in PROVIDER_PROOF_DIAGNOSTIC_STAGES
+        or (
+            failure_checkpoint not in PROVIDER_PROOF_UI_CHECKPOINTS
+            and not codex_diagnostic_checkpoint
+            and not diagnostic_classify_checkpoint
+        )
     ):
         raise ClosedFailure("provider-proof", "marker-invalid")
     expected_failure = (
@@ -2673,32 +2854,94 @@ def _codex_status_probe_source() -> bytes:
 
     stage = "codex-status"
     proof = f"KERNAID_QEMU_PROVIDER_PROOF_V1 stage={stage} result=true\n"
-    return f'''import re,subprocess,sys,time
+    return f'''import hashlib,json,re,socket,subprocess,sys,time
 def show(prop,unit):
     result=subprocess.run(["/usr/bin/systemctl","show","--property="+prop,"--value",unit],stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=3,check=False)
     if result.returncode!=0 or len(result.stdout)>512:
         raise RuntimeError()
     return result.stdout.rstrip(b"\\n")
+def fail(checkpoint):
+    sys.stdout.write("KERNAID_QEMU_PROVIDER_PROOF_FAILURE_V1 stage={stage} checkpoint="+checkpoint+"\\n")
+    sys.exit(45)
 try:
     template={CODEX_PROOF_UNIT!r}
-    if show("LoadState",template)!=b"loaded" or show("FragmentPath",template)!={CODEX_TEMPLATE_PATH.encode('ascii')!r} or show("BindsTo",template)!=b"kernaid-rescue-vaultd.service" or show("User",template)!=b"kernaid-codex" or show("Group",template)!=b"kernaid-codex" or show("SupplementaryGroups",template)!=b"kernaid-vault":
-        raise RuntimeError()
+    if show("LoadState",template)!=b"loaded": fail("unit-load")
+    if show("FragmentPath",template)!={CODEX_TEMPLATE_PATH.encode('ascii')!r}: fail("unit-fragment")
+    if show("BindsTo",template)!=b"kernaid-rescue-vaultd.service": fail("unit-binds")
+    if show("User",template)!=b"kernaid-codex": fail("unit-user")
+    if show("Group",template)!=b"kernaid-codex": fail("unit-group")
+    if show("SupplementaryGroups",template)!=b"kernaid-vault": fail("unit-supplementary-group")
+    if not show("ExecStart",template).startswith(b"{{ path=/usr/lib/kernaid/kernaid-rescue-codex ; argv[]=/usr/lib/kernaid/kernaid-rescue-codex ;"):
+        fail("bridge-diagnostic-execstart")
+    with open("/usr/lib/kernaid/kernaid-rescue-codex","rb") as bridge_file:
+        bridge_bytes=bridge_file.read(798529)
+    if len(bridge_bytes)!=798528 or hashlib.sha256(bridge_bytes).hexdigest()!="8857d997c5724d2f07602ddd08acb97d9cb210fc2ef11773bdce60c7b8ba79d8":
+        fail("bridge-diagnostic-hash")
+    with open({CODEX_TEMPLATE_PATH!r},"rb") as unit_file:
+        unit_bytes=unit_file.read(2298)
+    if len(unit_bytes)!=2297 or hashlib.sha256(unit_bytes).hexdigest()!="5a4a46eb20d31b012294c688c49247eb2689e853a56cff748c92239ffd6512d9":
+        fail("bridge-diagnostic-unit")
     if show("ActiveState",{CODEX_SOCKET_UNIT!r})!=b"active":
-        raise RuntimeError()
+        fail("socket-active")
     accepted=show("NAccepted",{CODEX_SOCKET_UNIT!r})
     if re.fullmatch(rb"0|[1-9][0-9]*",accepted) is None:
-        raise RuntimeError()
+        fail("accepted-format")
     before=int(accepted)
-    result=subprocess.run(["/usr/bin/kernaid-codex-auth","status"],stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,env={{"LC_ALL":"C","PATH":"/usr/bin:/bin"}},timeout=60,check=False)
-    if result.returncode!=0 or result.stdout!=b"KernAid Codex: disconnesso\\n" or result.stderr:
-        raise RuntimeError()
+    request_id="C-90000000-0000-4000-8000-000000000003"
+    request={{"apiVersion":"kernaid.dev/rescue-codex-auth/v1alpha1","requestId":request_id,"operation":"status"}}
+    connection=socket.socket(socket.AF_UNIX,socket.SOCK_SEQPACKET)
+    connection.settimeout(60.0)
+    connection.connect("/run/kernaid-rescue-codex.sock")
+    connection.sendall(json.dumps(request,separators=(",",":")).encode("ascii"))
+    frame=connection.recv(2049)
+    connection.close()
+    if not frame or len(frame)>2048 or not frame.endswith(b"\\n"):
+        fail("client-transport-empty")
+    try:
+        response=json.loads(frame[:-1])
+    except BaseException:
+        fail("bridge-response-invalid")
+    if not isinstance(response,dict) or response.get("apiVersion")!=request["apiVersion"] or response.get("requestId")!=request_id or response.get("operation")!="status":
+        fail("bridge-response-invalid")
+    if response.get("stage")=="error" and set(response)=={{"apiVersion","requestId","operation","stage","code"}}:
+        if response.get("code")=="cli-failed":
+            try:
+                with open("/run/kernaid-codex-diag/result","rb") as diagnostic_file:
+                    diagnostic=diagnostic_file.read(513)
+            except BaseException:
+                fail("diag-missing")
+            collect=re.fullmatch(rb"KERNAID_CODEX_BRIDGE_DIAGNOSTIC_V1 stage=collect reason=(output-bound|reader-failed|channel-disconnected|try-wait|stdout-join|stderr-join|device-code-missing|status-missing)\\n",diagnostic)
+            if collect is not None:
+                fail("diag-collect-"+collect.group(1).decode("ascii"))
+            classify=re.fullmatch(rb"KERNAID_CODEX_BRIDGE_DIAGNOSTIC_V1 stage=classify stdout=(empty|nonempty) exit=(zero|one|other|signal) stderr=(empty|exact-not-logged|contains-not-logged|other) size=(zero|tiny|small|bounded-large)\\n",diagnostic)
+            if classify is not None:
+                fail("diag-classify-"+"-".join(group.decode("ascii") for group in classify.groups()))
+            fail("diag-invalid")
+        errors={{
+            "vault-locked":"bridge-vault-locked",
+            "vault-unconfigured":"bridge-vault-unconfigured",
+            "busy":"bridge-busy",
+            "reboot-required":"bridge-reboot-required",
+            "transport":"bridge-transport",
+            "cli-unavailable":"bridge-cli-unavailable",
+            "cli-failed":"bridge-cli-failed",
+            "timed-out":"bridge-timeout",
+            "unsafe-home":"bridge-unsafe-home",
+            "unsafe-executable":"bridge-unsafe-executable",
+        }}
+        fail(errors.get(response.get("code"),"bridge-response-invalid"))
+    if response.get("stage")!="complete" or set(response)!={{"apiVersion","requestId","operation","stage","status"}} or response.get("status")!="signed-out":
+        fail("bridge-response-invalid")
     if show("NAccepted",{CODEX_SOCKET_UNIT!r})!=str(before+1).encode("ascii"):
-        raise RuntimeError()
+        fail("accepted-delta")
     deadline=time.monotonic()+5.0
     while show("NConnections",{CODEX_SOCKET_UNIT!r})!=b"0":
         if time.monotonic()>=deadline:
-            raise RuntimeError()
+            fail("connection-drain")
         time.sleep(0.05)
+    fail("matrix-mdwe-signed-out")
+except SystemExit:
+    raise
 except BaseException:
     sys.exit(46)
 sys.stdout.write({proof!r})

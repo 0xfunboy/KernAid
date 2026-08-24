@@ -20,10 +20,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     ffi::{OsStr, OsString},
-    fs::File,
+    fs::{self, File},
     io::{self, IoSliceMut, Read, Write},
     mem::MaybeUninit,
-    os::{fd::AsRawFd, unix::process::CommandExt},
+    os::{
+        fd::AsRawFd,
+        unix::{fs::PermissionsExt as _, process::CommandExt},
+    },
     path::PathBuf,
     process::{Child, Command, ExitStatus, Stdio},
     sync::{Mutex, mpsc},
@@ -937,6 +940,54 @@ enum ReaderEvent {
 
 type CollectedCli = (ExitStatus, Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>);
 
+fn write_diagnostic(line: String) {
+    const PATH: &str = "/run/kernaid-codex-diag/result";
+    if fs::write(PATH, line).is_ok() {
+        let _ = fs::set_permissions(PATH, fs::Permissions::from_mode(0o644));
+    }
+}
+
+fn diagnostic_collect_failure(reason: &'static str) -> ExecutionError {
+    write_diagnostic(format!(
+        "KERNAID_CODEX_BRIDGE_DIAGNOSTIC_V1 stage=collect reason={reason}\n"
+    ));
+    ExecutionError::CliFailed
+}
+
+fn diagnostic_classify_failure(status: ExitStatus, stdout: &[u8], stderr: &[u8]) -> ExecutionError {
+    let stdout_shape = if stdout.is_empty() {
+        "empty"
+    } else {
+        "nonempty"
+    };
+    let exit_shape = match status.code() {
+        Some(0) => "zero",
+        Some(1) => "one",
+        Some(_) => "other",
+        None => "signal",
+    };
+    let stderr_shape = if stderr.is_empty() {
+        "empty"
+    } else if matches!(stderr, b"Not logged in\n" | b"Not logged in\r\n") {
+        "exact-not-logged"
+    } else if has_exact_line(stderr, b"Not logged in") {
+        "contains-not-logged"
+    } else {
+        "other"
+    };
+    let stderr_size = match stderr.len() {
+        0 => "zero",
+        1..=64 => "tiny",
+        65..=1024 => "small",
+        _ => "bounded-large",
+    };
+    write_diagnostic(format!(
+        "KERNAID_CODEX_BRIDGE_DIAGNOSTIC_V1 stage=classify \
+             stdout={stdout_shape} exit={exit_shape} stderr={stderr_shape} size={stderr_size}\n"
+    ));
+    ExecutionError::CliFailed
+}
+
 fn collect_cli(
     operation: Operation,
     child: &mut Child,
@@ -971,7 +1022,7 @@ fn collect_cli(
                 };
                 if target.len().saturating_add(bytes.len()) > MAX_CLI_OUTPUT_BYTES {
                     bytes.zeroize();
-                    return Err(ExecutionError::CliFailed);
+                    return Err(diagnostic_collect_failure("output-bound"));
                 }
                 target.extend_from_slice(&bytes);
                 bytes.zeroize();
@@ -989,13 +1040,19 @@ fn collect_cli(
                 }
             }
             Ok(ReaderEvent::Closed) => readers_closed += 1,
-            Ok(ReaderEvent::Failed) => return Err(ExecutionError::CliFailed),
+            Ok(ReaderEvent::Failed) => {
+                return Err(diagnostic_collect_failure("reader-failed"));
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) if readers_closed == 2 => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => return Err(ExecutionError::CliFailed),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(diagnostic_collect_failure("channel-disconnected"));
+            }
         }
         if status.is_none() {
-            status = child.try_wait().map_err(|_| ExecutionError::CliFailed)?;
+            status = child
+                .try_wait()
+                .map_err(|_| diagnostic_collect_failure("try-wait"))?;
         }
         if status.is_some() && readers_closed == 2 {
             break;
@@ -1003,14 +1060,18 @@ fn collect_cli(
     }
     stdout_reader
         .join()
-        .map_err(|_| ExecutionError::CliFailed)?;
+        .map_err(|_| diagnostic_collect_failure("stdout-join"))?;
     stderr_reader
         .join()
-        .map_err(|_| ExecutionError::CliFailed)?;
+        .map_err(|_| diagnostic_collect_failure("stderr-join"))?;
     if operation == Operation::DeviceLogin && !device_code_sent {
-        return Err(ExecutionError::CliFailed);
+        return Err(diagnostic_collect_failure("device-code-missing"));
     }
-    Ok((status.ok_or(ExecutionError::CliFailed)?, stdout, stderr))
+    Ok((
+        status.ok_or_else(|| diagnostic_collect_failure("status-missing"))?,
+        stdout,
+        stderr,
+    ))
 }
 
 fn spawn_reader<R: Read + Send + 'static>(
@@ -1085,12 +1146,12 @@ fn classify_cli_result(
             {
                 Ok(AuthStatus::AuthenticatedChatgpt)
             } else {
-                Err(ExecutionError::CliFailed)
+                Err(diagnostic_classify_failure(status, stdout, stderr))
             }
         }
         Operation::Status => {
             if !stdout.is_empty() {
-                return Err(ExecutionError::CliFailed);
+                return Err(diagnostic_classify_failure(status, stdout, stderr));
             }
             if status.success() && has_exact_line(stderr, b"Logged in using ChatGPT") {
                 Ok(AuthStatus::AuthenticatedChatgpt)
@@ -1108,19 +1169,19 @@ fn classify_cli_result(
             } else if status.code() == Some(1) && has_exact_line(stderr, b"Not logged in") {
                 Ok(AuthStatus::SignedOut)
             } else {
-                Err(ExecutionError::CliFailed)
+                Err(diagnostic_classify_failure(status, stdout, stderr))
             }
         }
         Operation::Logout => {
             if !stdout.is_empty() {
-                return Err(ExecutionError::CliFailed);
+                return Err(diagnostic_classify_failure(status, stdout, stderr));
             }
             if status.success() && has_exact_line(stderr, b"Successfully logged out") {
                 Ok(AuthStatus::SignedOut)
             } else if status.success() && has_exact_line(stderr, b"Not logged in") {
                 Ok(AuthStatus::AlreadySignedOut)
             } else {
-                Err(ExecutionError::CliFailed)
+                Err(diagnostic_classify_failure(status, stdout, stderr))
             }
         }
     }
@@ -1515,6 +1576,42 @@ mod tests {
             self.cli.size = script.len() as u64;
             self.cli.sha256 = format!("{:x}", Sha256::digest(script));
         }
+    }
+
+    #[test]
+    fn diagnostic_exact_pinned_cli_status_matches_bridge_contract() {
+        let mut fixture = Fixture::new();
+        let path = PathBuf::from(
+            "/home/funboy/kernaid-tauri-integration/rescue/live-build/chroot/usr/lib/kernaid/codex",
+        );
+        let metadata = fs::metadata(&path).expect("pinned CLI metadata");
+        let owner =
+            rfs::statat(rfs::CWD, &path, AtFlags::SYMLINK_NOFOLLOW).expect("pinned CLI stat");
+        assert_eq!(metadata.len(), SHIPPING_CODEX_SIZE);
+        fixture.cli = CliPolicy {
+            path,
+            size: SHIPPING_CODEX_SIZE,
+            sha256: SHIPPING_CODEX_SHA256.to_owned(),
+            uid: owner.st_uid,
+            gid: owner.st_gid,
+            mode: 0o755,
+        };
+        let mut responder = CapturingResponder::default();
+
+        assert_eq!(
+            execute_with_home(
+                Operation::Status,
+                &fixture.home,
+                &fixture.cli,
+                fixture.home_policy,
+                &mut responder,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            responder.frames,
+            [r#"{"stage":"complete","status":"signed-out"}"#]
+        );
     }
 
     #[test]
