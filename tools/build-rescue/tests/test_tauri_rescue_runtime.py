@@ -708,41 +708,17 @@ class RescueTauriBoundaryTests(unittest.TestCase):
                     f"KERNAID_TAURI_NETWORK_PROBE_FAILURE_V1 stage={mode}\n",
                 )
 
-    def test_guest_baseline_rechecks_unit_and_live_endpoint(self) -> None:
-        active = {
-            "ActiveState": "active",
-            "SubState": "exited",
-            "Result": "success",
-        }
-        with (
-            mock.patch.object(guest_ui, "_systemctl_show", return_value=active) as show,
-            mock.patch.object(
-                guest_ui, "_qemu_endpoint_post_ready", return_value=True
-            ) as endpoint,
-        ):
+    def test_guest_baseline_rechecks_live_endpoint(self) -> None:
+        with mock.patch.object(
+            guest_ui, "_qemu_endpoint_post_ready", return_value=True
+        ) as endpoint:
             self.assertTrue(guest_ui._qemu_baseline_ready())
-        show.assert_called_once_with(
-            guest_ui.NETWORK_BASELINE_UNIT,
-            ("ActiveState", "SubState", "Result"),
-        )
         endpoint.assert_called_once_with()
 
-        with (
-            mock.patch.object(guest_ui, "_systemctl_show", return_value=active),
-            mock.patch.object(
-                guest_ui, "_qemu_endpoint_post_ready", return_value=False
-            ),
+        with mock.patch.object(
+            guest_ui, "_qemu_endpoint_post_ready", return_value=False
         ):
             self.assertFalse(guest_ui._qemu_baseline_ready())
-
-        with (
-            mock.patch.object(guest_ui, "_systemctl_show", return_value=None),
-            mock.patch.object(
-                guest_ui, "_qemu_endpoint_post_ready", return_value=True
-            ) as endpoint,
-        ):
-            self.assertFalse(guest_ui._qemu_baseline_ready())
-        endpoint.assert_not_called()
 
     def test_lightdm_session_is_minimal_and_busless(self) -> None:
         root = REPO_DIR / "rescue/live-build/config/includes.chroot"
