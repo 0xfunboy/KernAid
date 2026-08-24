@@ -742,37 +742,26 @@ def _host_privileged_sockets_ready() -> None:
             raise SandboxFailure(failure_stage)
 
 
-def _shell_service_ready(qemu_probe: bool) -> int:
+def _shell_service_ready(_qemu_probe: bool) -> int:
     properties = (
         "ActiveState",
         "SubState",
         "MainPID",
-        "StatusText",
         "User",
         "Group",
         "Type",
-        "NotifyAccess",
         "PrivateDevices",
         "DevicePolicy",
     )
     values = _systemctl_show(SHELL_UNIT, properties)
     if values is None:
         return 0
-    status = values["StatusText"]
-    if status.startswith(SANDBOX_FAILURE_PREFIX):
-        stage = status.removeprefix(SANDBOX_FAILURE_PREFIX)
-        if stage not in SHELL_FAILURE_STAGES:
-            raise SandboxFailure("service")
-        raise SandboxFailure(stage)
-    expected = SANDBOX_STATUS_QEMU if qemu_probe else SANDBOX_STATUS_NORMAL
     if (
         values["ActiveState"] != "active"
         or values["SubState"] != "running"
-        or values["StatusText"] != expected
         or values["User"] != UI_ACCOUNT
         or values["Group"] != UI_ACCOUNT
-        or values["Type"] != "notify"
-        or values["NotifyAccess"] != "main"
+        or values["Type"] != "exec"
         or values["PrivateDevices"] != "yes"
         or values["DevicePolicy"] != "closed"
         or not values["MainPID"].isdecimal()
@@ -1138,7 +1127,7 @@ def _proc_aliases_absent(
 
 def _private_run_ready(shell_pid: int, ui: pwd.struct_passwd, qemu_probe: bool) -> bool:
     root = f"/proc/{shell_pid}/root"
-    required_socket_paths = {"/run/systemd/notify"}
+    required_socket_paths: set[str] = set()
     observed_sockets: set[str] = set()
     entries_seen = 0
     try:
@@ -1160,6 +1149,7 @@ def _private_run_ready(shell_pid: int, ui: pwd.struct_passwd, qemu_probe: bool) 
             "/run/user/{uid}/bus",
             "/run/user/{uid}/systemd/private",
             "/run/udev/control",
+            "/run/systemd/notify",
             "/run/systemd/private",
             "/run/systemd/journal/socket",
             "/run/systemd/journal/stdout",

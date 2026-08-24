@@ -255,16 +255,14 @@ class TauriFramebufferTests(unittest.TestCase):
 
 
 class RescueTauriBoundaryTests(unittest.TestCase):
-    def test_shell_status_is_root_owned_systemd_state_not_a_uid_marker(self) -> None:
+    def test_shell_readiness_is_root_attested_not_a_uid_marker(self) -> None:
         normal = {
             "ActiveState": "active",
             "SubState": "running",
             "MainPID": "431",
-            "StatusText": guest_ui.SANDBOX_STATUS_NORMAL,
             "User": guest_ui.UI_ACCOUNT,
             "Group": guest_ui.UI_ACCOUNT,
-            "Type": "notify",
-            "NotifyAccess": "main",
+            "Type": "exec",
             "PrivateDevices": "yes",
             "DevicePolicy": "closed",
         }
@@ -277,18 +275,10 @@ class RescueTauriBoundaryTests(unittest.TestCase):
             guest_ui, "_systemctl_show", side_effect=[normal, session]
         ):
             self.assertEqual(guest_ui._shell_service_ready(False), 431)
-        with mock.patch.object(guest_ui, "_systemctl_show", return_value=normal):
+        with mock.patch.object(
+            guest_ui, "_systemctl_show", return_value=normal | {"Type": "notify"}
+        ):
             self.assertEqual(guest_ui._shell_service_ready(True), 0)
-
-        failure = normal | {
-            "StatusText": (
-                "KERNAID_RESCUE_TAURI_SANDBOX_FAILURE_V1 stage=system-bus"
-            )
-        }
-        with mock.patch.object(guest_ui, "_systemctl_show", return_value=failure):
-            with self.assertRaises(guest_ui.SandboxFailure) as caught:
-                guest_ui._shell_service_ready(False)
-        self.assertEqual(caught.exception.stage, "system-bus")
 
     def test_guest_requires_the_default_display_xorg_vt_to_be_active(self) -> None:
         self.assertEqual(guest_ui._active_vt_from_payload(b"tty7\n"), 7)
@@ -462,19 +452,17 @@ class RescueTauriBoundaryTests(unittest.TestCase):
         )
         self.assertLess(
             source.index("let status = attest_rescue_sandbox()"),
-            source.index("notify_systemd(WINDOW_STARTUP_STATUS, false)"),
+            source.index('eprintln!("{status}")'),
         )
         self.assertLess(
-            source.index("notify_systemd(WINDOW_STARTUP_STATUS, false)"),
-            source.index("notify_systemd(status, true)"),
-        )
-        self.assertLess(
-            source.index("notify_systemd(status, true)"),
+            source.index('eprintln!("{status}")'),
             source.index("tauri::Builder::default()"),
         )
         self.assertLess(
-            source.index("notify_systemd(status, true)"), source.index(".build()")
+            source.index("tauri::Builder::default()"),
+            source.index("WebviewWindowBuilder::new"),
         )
+        self.assertNotIn("notify_systemd", source)
         self.assertNotIn("sandbox-attestation-v1", source)
         self.assertNotIn("sandbox-failure-v1", source)
         self.assertIn('["", "/proc/1/root", "/proc/self/root"]', source)
@@ -512,12 +500,13 @@ class RescueTauriBoundaryTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertFalse(legacy_autostart.exists())
         self.assertIn("ExecStart=/usr/bin/kernaid-rescue-desk-shell", service)
-        self.assertIn("Type=notify", service)
-        self.assertIn("NotifyAccess=main", service)
+        self.assertIn("Type=exec", service)
+        self.assertNotIn("NotifyAccess=", service)
+        self.assertNotIn("/run/systemd/notify", service)
         self.assertIn("User=kernaid-rescue-ui", service)
         self.assertIn("Group=kernaid-rescue-ui", service)
         self.assertIn("Restart=on-failure", service)
-        self.assertIn("TimeoutStartSec=600s", service)
+        self.assertNotIn("TimeoutStartSec=", service)
         self.assertEqual(guest_ui.PROBE_TIMEOUT_SECONDS, 620)
         ready_check = (
             REPO_DIR
@@ -569,7 +558,6 @@ class RescueTauriBoundaryTests(unittest.TestCase):
         self.assertTrue(
             {
                 "/run/lightdm/kernaid-rescue-ui/xauthority",
-                "/run/systemd/notify",
                 "-/run/kernaid-tauri-network-probe/baseline-v1",
                 "/tmp/.X11-unix/X0",
             }
@@ -817,7 +805,7 @@ class RescueTauriBoundaryTests(unittest.TestCase):
             "WebKitGPUProcess",
             "os.setresuid",
             "os.setgroups([])",
-            "StatusText",
+            'values["Type"] != "exec"',
         ):
             self.assertIn(token, source)
         self.assertNotIn("sandbox-attestation-v1", source)

@@ -2,9 +2,6 @@
 
 use nix::{
     libc,
-    sys::socket::{
-        AddressFamily, MsgFlags, SockFlag, SockProtocol, SockType, UnixAddr, sendto, socket,
-    },
     unistd::{Group, User, getegid, geteuid, getgid, getgroups, getuid},
 };
 use std::{
@@ -13,13 +10,9 @@ use std::{
     fs::{self, OpenOptions},
     io::{self, Read, Write},
     net::{SocketAddr, TcpStream},
-    os::{
-        fd::AsRawFd,
-        unix::ffi::OsStrExt,
-        unix::{
-            fs::{MetadataExt, OpenOptionsExt},
-            net::UnixStream,
-        },
+    os::unix::{
+        fs::{MetadataExt, OpenOptionsExt},
+        net::UnixStream,
     },
     path::Path,
     thread,
@@ -69,7 +62,6 @@ enum SandboxProbeFailure {
     PidNamespace,
     SessionBus,
     SystemBus,
-    Notify,
     WindowStartup,
 }
 
@@ -97,7 +89,6 @@ impl SandboxProbeFailure {
             Self::PidNamespace => "KERNAID_RESCUE_TAURI_SANDBOX_FAILURE_V1 stage=pidns",
             Self::SessionBus => "KERNAID_RESCUE_TAURI_SANDBOX_FAILURE_V1 stage=session-bus",
             Self::SystemBus => "KERNAID_RESCUE_TAURI_SANDBOX_FAILURE_V1 stage=system-bus",
-            Self::Notify => "KERNAID_RESCUE_TAURI_SANDBOX_FAILURE_V1 stage=notify",
             Self::WindowStartup => "KERNAID_RESCUE_TAURI_SANDBOX_FAILURE_V1 stage=window-startup",
         }
     }
@@ -426,54 +417,6 @@ fn user_runtime_absent() -> bool {
         })
 }
 
-fn notify_systemd(status: &str, ready: bool) -> io::Result<()> {
-    if !status.is_ascii()
-        || status.bytes().any(|byte| matches!(byte, b'\n' | b'\r' | 0))
-        || status.len() > 512
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "systemd status was outside the fixed policy",
-        ));
-    }
-    let notify_socket = env::var_os("NOTIFY_SOCKET").ok_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, "systemd notify socket was missing")
-    })?;
-    let notify_bytes = notify_socket.as_bytes();
-    let address = if let Some(abstract_name) = notify_bytes.strip_prefix(b"@") {
-        UnixAddr::new_abstract(abstract_name)
-    } else {
-        UnixAddr::new(Path::new(OsStr::from_bytes(notify_bytes)))
-    }
-    .map_err(io::Error::other)?;
-    let descriptor = socket(
-        AddressFamily::Unix,
-        SockType::Datagram,
-        SockFlag::SOCK_CLOEXEC,
-        None::<SockProtocol>,
-    )
-    .map_err(io::Error::other)?;
-    let payload = if ready {
-        format!("READY=1\nSTATUS={status}")
-    } else {
-        format!("STATUS={status}")
-    };
-    let sent = sendto(
-        descriptor.as_raw_fd(),
-        payload.as_bytes(),
-        &address,
-        MsgFlags::MSG_NOSIGNAL,
-    )
-    .map_err(io::Error::other)?;
-    if sent != payload.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::WriteZero,
-            "systemd notify payload was truncated",
-        ));
-    }
-    Ok(())
-}
-
 fn attest_rescue_sandbox() -> Result<&'static str, SandboxProbeFailure> {
     if !isolated_identity_ready() {
         return Err(SandboxProbeFailure::Identity);
@@ -509,7 +452,6 @@ fn attest_rescue_sandbox() -> Result<&'static str, SandboxProbeFailure> {
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let status = attest_rescue_sandbox().map_err(|failure| {
         let failure_status = failure.status();
-        let _ = notify_systemd(failure_status, false);
         eprintln!("{failure_status}");
         io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -517,28 +459,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         )
     })?;
     let rescue_url: Url = RESCUE_UI_URL.parse()?;
-    notify_systemd(WINDOW_STARTUP_STATUS, false).map_err(|_| {
-        let failure_status = SandboxProbeFailure::Notify.status();
-        eprintln!("{failure_status}");
-        io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "Rescue shell startup notification failed",
-        )
-    })?;
-    // READY attests the completed sandbox preflight, not UI readiness.
-    // Notify before Tauri initializes so its synchronous framework and
-    // WebKit startup cannot deadlock the systemd Type=notify gate. The
-    // independent root checker still requires the exact renderer, visible
-    // window, active display and post-start endpoint proof.
-    notify_systemd(status, true).map_err(|_| {
-        let failure_status = SandboxProbeFailure::Notify.status();
-        let _ = notify_systemd(failure_status, false);
-        eprintln!("{failure_status}");
-        io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "Rescue shell notification failed",
-        )
-    })?;
+    // These fixed console lines are diagnostic only. The root-owned checker is
+    // the single readiness authority and independently re-attests the process,
+    // renderer, window, display, sandbox and live endpoint.
+    eprintln!("{status}");
+    eprintln!("{WINDOW_STARTUP_STATUS}");
     tauri::Builder::default()
         .setup(move |app| {
             WebviewWindowBuilder::new(app, "main", WebviewUrl::External(rescue_url))
@@ -556,7 +481,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .build()
                 .inspect_err(|_| {
                     let failure_status = SandboxProbeFailure::WindowStartup.status();
-                    let _ = notify_systemd(failure_status, false);
                     eprintln!("{failure_status}");
                 })?;
             Ok(())
