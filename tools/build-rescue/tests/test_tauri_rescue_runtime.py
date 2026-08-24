@@ -462,6 +462,13 @@ class RescueTauriBoundaryTests(unittest.TestCase):
             source.index("tauri::Builder::default()"),
             source.index("WebviewWindowBuilder::new"),
         )
+        self.assertIn("RunEvent::ExitRequested", source)
+        self.assertIn("!window_created.load(Ordering::Acquire)", source)
+        self.assertIn("api.prevent_exit()", source)
+        self.assertLess(
+            source.index("WebviewWindowBuilder::new"),
+            source.index("setup_window_created.store(true, Ordering::Release)"),
+        )
         self.assertNotIn("notify_systemd", source)
         self.assertNotIn("sandbox-attestation-v1", source)
         self.assertNotIn("sandbox-failure-v1", source)
@@ -505,7 +512,7 @@ class RescueTauriBoundaryTests(unittest.TestCase):
         self.assertNotIn("/run/systemd/notify", service)
         self.assertIn("User=kernaid-rescue-ui", service)
         self.assertIn("Group=kernaid-rescue-ui", service)
-        self.assertIn("Restart=on-failure", service)
+        self.assertIn("Restart=always", service)
         self.assertNotIn("TimeoutStartSec=", service)
         self.assertEqual(guest_ui.PROBE_TIMEOUT_SECONDS, 620)
         ready_check = (

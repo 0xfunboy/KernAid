@@ -16,11 +16,15 @@ use std::{
         net::UnixStream,
     },
     path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
 use tauri::{
-    Url, WebviewUrl,
+    RunEvent, Url, WebviewUrl,
     webview::{NewWindowResponse, WebviewWindowBuilder},
 };
 
@@ -465,7 +469,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // renderer, window, display, sandbox and live endpoint.
     eprintln!("{status}");
     eprintln!("{WINDOW_STARTUP_STATUS}");
-    tauri::Builder::default()
+    let window_created = Arc::new(AtomicBool::new(false));
+    let setup_window_created = Arc::clone(&window_created);
+    let app = tauri::Builder::default()
         .setup(move |app| {
             WebviewWindowBuilder::new(app, "main", WebviewUrl::External(rescue_url))
                 .title("KernAid Rescue")
@@ -484,12 +490,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     let failure_status = SandboxProbeFailure::WindowStartup.status();
                     eprintln!("{failure_status}");
                 })?;
+            setup_window_created.store(true, Ordering::Release);
             Ok(())
         })
         // This binary intentionally registers no invoke handler.  Together
         // with the no-permission capability above, the remote loopback origin
         // cannot dispatch Resident or plugin commands.
-        .run(tauri::generate_context!())?;
+        .build(tauri::generate_context!())?;
+    app.run(move |_, event| {
+        if let RunEvent::ExitRequested { api, .. } = event {
+            if !window_created.load(Ordering::Acquire) {
+                // An empty initial config must not win the race against setup().
+                // Once setup has built the secured window, a later close is
+                // allowed to exit so systemd can restart the full shell.
+                api.prevent_exit();
+            }
+        }
+    });
     Ok(())
 }
 

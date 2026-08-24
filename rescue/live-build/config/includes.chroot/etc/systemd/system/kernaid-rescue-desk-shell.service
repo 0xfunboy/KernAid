@@ -11,7 +11,7 @@ StartLimitBurst=30
 [Service]
 Type=exec
 ExecStart=/usr/bin/kernaid-rescue-desk-shell
-Restart=on-failure
+Restart=always
 RestartSec=1s
 StandardOutput=journal+console
 StandardError=journal+console
