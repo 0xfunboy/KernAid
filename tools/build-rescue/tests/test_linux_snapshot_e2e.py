@@ -163,7 +163,10 @@ class LinuxSnapshotEndToEndTests(unittest.TestCase):
         self.assertIn("collect_local_inventory_sync", hardware_command)
         self.assertNotIn("Path", hardware_command)
         handler_start = source.index("macro_rules! production_invoke_handler")
-        handler_end = source.index("\nfn main()", handler_start)
+        handler_end = source.index(
+            "\n#[cfg(all(target_os = \"linux\", feature = \"fixture-repair-lab\"))]",
+            handler_start,
+        )
         production_handler = source[handler_start:handler_end]
         self.assertEqual(
             production_handler.count("collect_linux_normalized_snapshot"),
@@ -172,9 +175,12 @@ class LinuxSnapshotEndToEndTests(unittest.TestCase):
         self.assertEqual(production_handler.count("collect_local_inventory"), 1)
         self.assertEqual(
             source.count(".invoke_handler(production_invoke_handler!())"),
-            3,
+            2,
         )
-        self.assertEqual(source.count("tauri::generate_handler!["), 1)
+        self.assertEqual(source.count(".invoke_handler(active_invoke_handler!())"), 1)
+        self.assertEqual(production_handler.count("tauri::generate_handler!["), 1)
+        self.assertEqual(source.count("tauri::generate_handler!["), 2)
+        self.assertIn("fixture_repair_lab::fixture_lab_stage", source)
         harness = RESIDENT_HARNESS.read_text(encoding="utf-8")
         for token in (
             "unshare --user --map-root-user --mount --pid --fork",

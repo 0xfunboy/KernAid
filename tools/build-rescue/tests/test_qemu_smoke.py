@@ -47,11 +47,6 @@ def shell_function(source: str, name: str) -> str:
 
 
 class QemuProcessLifecycleTests(unittest.TestCase):
-    def test_workflow_always_uploads_primary_firmware_smoke_logs(self) -> None:
-        workflow = RESCUE_WORKFLOW.read_text(encoding="utf-8")
-        self.assertIn("rescue-smoke-*.log", workflow)
-        self.assertIn("rescue-usb-smoke-*.log", workflow)
-
     @staticmethod
     def function_definition(source: str, name: str) -> str:
         return f"{name}() {{\n{shell_function(source, name)}}}\n"

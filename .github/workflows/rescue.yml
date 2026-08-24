@@ -385,7 +385,6 @@ jobs:
         with:
           name: KernAid-Rescue-smoke-logs
           path: |
-            rescue-smoke-*.log
             rescue-usb-smoke-*.log
           if-no-files-found: warn
           retention-days: 14
