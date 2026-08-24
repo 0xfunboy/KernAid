@@ -12,9 +12,11 @@ StartLimitBurst=30
 Type=notify
 ExecStart=/usr/bin/kernaid-rescue-desk-shell
 NotifyAccess=main
-TimeoutStartSec=120s
+TimeoutStartSec=360s
 Restart=on-failure
 RestartSec=1s
+StandardOutput=journal+console
+StandardError=journal+console
 User=kernaid-rescue-ui
 Group=kernaid-rescue-ui
 Environment=HOME=/run/kernaid-rescue-desk-shell

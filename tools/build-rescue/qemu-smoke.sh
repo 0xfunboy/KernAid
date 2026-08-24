@@ -579,7 +579,7 @@ rescue_not_ready_observed() {
 }
 
 report_tauri_sandbox_failure() {
-  local marker network_probe_marker
+  local marker network_probe_marker sandbox_marker
   network_probe_marker="$(
     LC_ALL=C tr -d '\r' <"$log" \
       | grep -aE '^KERNAID_TAURI_NETWORK_PROBE_FAILURE_V1 stage=(wait-marker|verify-marker|verify-alias|baseline)$' \
@@ -588,7 +588,13 @@ report_tauri_sandbox_failure() {
   )"
   marker="$(
     LC_ALL=C tr -d '\r' <"$log" \
-      | grep -aE '^KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=(http|x11|http-x11|socket-offline-inspector|socket-vault|socket-openai-executor|socket-openai-egress|socket-codex|system-bus|probe-mode|baseline|nonloopback|identity|pidns|session-bus|notify|service|process-tree|renderer|window|display|xauthority|run-view|devices|device-fds|proc-alias|endpoint-post)$' \
+      | grep -aE '^KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=(http|x11|http-x11|socket-offline-inspector|socket-vault|socket-openai-executor|socket-openai-egress|socket-codex|system-bus|probe-mode|baseline|nonloopback|identity|pidns|session-bus|notify|window-startup|service|process-tree|renderer|window|display|xauthority|run-view|devices|device-fds|proc-alias|endpoint-post)$' \
+      | tail -n 1 \
+      || true
+  )"
+  sandbox_marker="$(
+    LC_ALL=C tr -d '\r' <"$log" \
+      | grep -aE '^KERNAID_RESCUE_TAURI_SANDBOX_FAILURE_V1 stage=(http|x11|http-x11|socket-offline-inspector|socket-vault|socket-openai-executor|socket-openai-egress|socket-codex|system-bus|probe-mode|baseline|nonloopback|identity|pidns|session-bus|notify|window-startup)$' \
       | tail -n 1 \
       || true
   )"
@@ -597,6 +603,9 @@ report_tauri_sandbox_failure() {
   fi
   if [[ -n "$marker" ]]; then
     printf '%s\n' "$marker" >&2
+  fi
+  if [[ -n "$sandbox_marker" ]]; then
+    printf '%s\n' "$sandbox_marker" >&2
   fi
 }
 

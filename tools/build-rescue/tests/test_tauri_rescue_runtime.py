@@ -461,7 +461,7 @@ class RescueTauriBoundaryTests(unittest.TestCase):
             source.index("tauri::Builder::default()"),
         )
         self.assertLess(
-            source.index(".build()?;"), source.index("notify_systemd(status, true)")
+            source.index(".build()"), source.index("notify_systemd(status, true)")
         )
         self.assertNotIn("sandbox-attestation-v1", source)
         self.assertNotIn("sandbox-failure-v1", source)
@@ -505,6 +505,9 @@ class RescueTauriBoundaryTests(unittest.TestCase):
         self.assertIn("User=kernaid-rescue-ui", service)
         self.assertIn("Group=kernaid-rescue-ui", service)
         self.assertIn("Restart=on-failure", service)
+        self.assertIn("TimeoutStartSec=360s", service)
+        self.assertIn("StandardOutput=journal+console", service)
+        self.assertIn("StandardError=journal+console", service)
         self.assertIn("NoNewPrivileges=yes", service)
         self.assertIn("CapabilityBoundingSet=\n", service)
         shipping_sockets = {
@@ -789,6 +792,12 @@ class RescueTauriBoundaryTests(unittest.TestCase):
             ready_check,
         )
         self.assertIn("|devices|device-fds|proc-alias|", qemu_smoke)
+        self.assertIn("|notify|window-startup|service|", qemu_smoke)
+        self.assertIn(
+            "KERNAID_RESCUE_TAURI_SANDBOX_FAILURE_V1 "
+            "stage=(http|x11|http-x11|socket-offline-inspector|socket-vault|",
+            qemu_smoke,
+        )
         self.assertIn(
             "KERNAID_TAURI_NETWORK_PROBE_FAILURE_V1 "
             "stage=(wait-marker|verify-marker|verify-alias|baseline)",

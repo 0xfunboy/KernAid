@@ -44,6 +44,7 @@ const FAKE_SESSION_BUS: &str = "unix:path=/run/kernaid-rescue-desk-shell/no-sess
 const FAKE_SYSTEM_BUS: &str = "unix:path=/run/kernaid-rescue-desk-shell/no-system-bus";
 const SANDBOX_STATUS_QEMU: &str = "KERNAID_RESCUE_TAURI_SANDBOX_V1 identity=isolated pidns=private shell-bus=mount-masked session-bus=env-disabled-polkit-denied http=loopback x11=connected privileged-fs-sockets=absent nonloopback=denied";
 const SANDBOX_STATUS_NORMAL: &str = "KERNAID_RESCUE_TAURI_SANDBOX_V1 identity=isolated pidns=private shell-bus=mount-masked session-bus=env-disabled-polkit-denied http=loopback x11=connected privileged-fs-sockets=absent nonloopback=systemd-policy";
+const WINDOW_STARTUP_STATUS: &str = "KERNAID_RESCUE_TAURI_STARTUP_V1 stage=window";
 const QEMU_PROBE_MARKER_PATH: &str =
     "/sys/firmware/qemu_fw_cfg/by_name/opt/kernaid-tauri-sandbox-probe/raw";
 const QEMU_BASELINE_MARKER_PATH: &str = "/run/kernaid-tauri-network-probe/baseline-v1";
@@ -69,6 +70,7 @@ enum SandboxProbeFailure {
     SessionBus,
     SystemBus,
     Notify,
+    WindowStartup,
 }
 
 impl SandboxProbeFailure {
@@ -96,6 +98,7 @@ impl SandboxProbeFailure {
             Self::SessionBus => "KERNAID_RESCUE_TAURI_SANDBOX_FAILURE_V1 stage=session-bus",
             Self::SystemBus => "KERNAID_RESCUE_TAURI_SANDBOX_FAILURE_V1 stage=system-bus",
             Self::Notify => "KERNAID_RESCUE_TAURI_SANDBOX_FAILURE_V1 stage=notify",
+            Self::WindowStartup => "KERNAID_RESCUE_TAURI_SANDBOX_FAILURE_V1 stage=window-startup",
         }
     }
 }
@@ -505,7 +508,9 @@ fn attest_rescue_sandbox() -> Result<&'static str, SandboxProbeFailure> {
 // statically verified IPAddressDeny/Allow policy in the unit.
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let status = attest_rescue_sandbox().map_err(|failure| {
-        let _ = notify_systemd(failure.status(), false);
+        let failure_status = failure.status();
+        let _ = notify_systemd(failure_status, false);
+        eprintln!("{failure_status}");
         io::Error::new(
             io::ErrorKind::PermissionDenied,
             "Rescue shell sandbox probe failed",
@@ -514,6 +519,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     tauri::Builder::default()
         .setup(move |app| {
             let rescue_url: Url = RESCUE_UI_URL.parse()?;
+            notify_systemd(WINDOW_STARTUP_STATUS, false).map_err(|_| {
+                let failure_status = SandboxProbeFailure::Notify.status();
+                eprintln!("{failure_status}");
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "Rescue shell startup notification failed",
+                )
+            })?;
             WebviewWindowBuilder::new(app, "main", WebviewUrl::External(rescue_url))
                 .title("KernAid Rescue")
                 .fullscreen(true)
@@ -526,9 +539,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .on_navigation(allowed_rescue_navigation)
                 .on_new_window(|_, _| NewWindowResponse::Deny)
                 .on_download(|_, _| false)
-                .build()?;
+                .build()
+                .map_err(|error| {
+                    let failure_status = SandboxProbeFailure::WindowStartup.status();
+                    let _ = notify_systemd(failure_status, false);
+                    eprintln!("{failure_status}");
+                    error
+                })?;
             notify_systemd(status, true).map_err(|_| {
-                let _ = notify_systemd(SandboxProbeFailure::Notify.status(), false);
+                let failure_status = SandboxProbeFailure::Notify.status();
+                let _ = notify_systemd(failure_status, false);
+                eprintln!("{failure_status}");
                 io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "Rescue shell notification failed",
@@ -638,6 +659,7 @@ X-Content-Type-Options: nosniff\r\n\
             SandboxProbeFailure::SessionBus,
             SandboxProbeFailure::SystemBus,
             SandboxProbeFailure::Notify,
+            SandboxProbeFailure::WindowStartup,
         ];
         for failure in failures {
             let status = failure.status();

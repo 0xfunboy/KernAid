@@ -75,6 +75,7 @@ SHELL_FAILURE_STAGES = {
     "pidns",
     "session-bus",
     "notify",
+    "window-startup",
 }
 GUEST_FAILURE_STAGES = SHELL_FAILURE_STAGES | {
     "service",

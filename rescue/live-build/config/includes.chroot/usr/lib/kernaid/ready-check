@@ -483,6 +483,7 @@ if ! tauri_guest_attestation="$(
         "KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=pidns"|\
         "KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=session-bus"|\
         "KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=notify"|\
+        "KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=window-startup"|\
         "KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=service"|\
         "KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=process-tree"|\
         "KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=renderer"|\
