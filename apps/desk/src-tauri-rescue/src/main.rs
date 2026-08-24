@@ -540,11 +540,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .on_new_window(|_, _| NewWindowResponse::Deny)
                 .on_download(|_, _| false)
                 .build()
-                .map_err(|error| {
+                .inspect_err(|_| {
                     let failure_status = SandboxProbeFailure::WindowStartup.status();
                     let _ = notify_systemd(failure_status, false);
                     eprintln!("{failure_status}");
-                    error
                 })?;
             notify_systemd(status, true).map_err(|_| {
                 let failure_status = SandboxProbeFailure::Notify.status();
