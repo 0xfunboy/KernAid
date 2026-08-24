@@ -20,7 +20,10 @@ DISPLAY = b":0"
 DISPLAY_ZERO = {b":0", b":0.0", b"unix:0", b"unix:0.0"}
 MAX_FILE_BYTES = 64 * 1024
 MAX_PROCESSES = 4096
-READY_TIMEOUT_SECONDS = 90
+# QEMU's TCG BIOS path can spend most of systemd's historical 90-second
+# default start timeout bringing up Xorg and LightDM.  Keep this gate bounded,
+# but give the real graphical session (rather than runner speed) the deadline.
+READY_TIMEOUT_SECONDS = 240
 PRIVILEGED_GROUPS = (
     "kernaid-vault",
     "kernaid-provider-client",
@@ -307,7 +310,13 @@ def _session_process_ready(account: pwd.struct_passwd) -> bool:
                 continue
             executable_name = os.path.basename(executable).lower()
             if executable_name in FORBIDDEN_UI_PROCESS_NAMES:
-                raise SessionError
+                # LightDM may briefly own a greeter while the fixed autologin
+                # session is being handed over.  This is not a success state,
+                # but it is a readiness observation rather than an immediate
+                # permanent failure.  A persistent greeter still fails closed
+                # at the bounded deadline and the final root attestor repeats
+                # the process-tree exclusion before Rescue can become ready.
+                return False
             if (
                 account.pw_uid not in uids
                 and 1000 not in uids
