@@ -2,6 +2,9 @@
 name = "kernaid-policy"
 version.workspace = true
 edition.workspace = true
+[features]
+default = []
+fixture-repair-lab = []
 [dependencies]
 kernaid-protocol = { path = "../protocol" }
 [lints]

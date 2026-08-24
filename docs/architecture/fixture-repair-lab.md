@@ -2,8 +2,20 @@
 
 `fixture-repair-lab` is an opt-in Rust feature for demonstrating one complete,
 reversible Linux repair against a checked disposable fixture. It is absent from
-normal builds and is not connected to Core, IPC, Tauri commands, providers, or
-production target selection.
+normal builds and Rescue. The Linux-only Desk lab connects the existing broker
+to a closed Tauri command set and a dedicated TypeScript driver; it cannot use
+Desk target selection, providers, a caller-supplied path, or production disks.
+The standard Phase 0 session and production invoke handler remain
+diagnosis-only.
+
+The feature build creates its target, backup directory, authenticated journal
+and ephemeral signing identity inside an application-owned temporary directory.
+Its status exposes only typed IDs, declarations and `sha256:` values. The webview
+can request the five fixed transitions `status`, `stage`, `execute`,
+`stage rollback` and `execute rollback`. Two read-only reconciliation calls can
+reissue an already committed in-memory receipt if IPC fails after completion;
+they never retry a mutation. Native IPC accepts no action selector, path,
+command, environment, replacement bytes or arbitrary JSON operation.
 
 ## Closed transaction
 
@@ -51,6 +63,17 @@ different hashes; the schema's `uniqueItems` also rejects byte-equivalent
 duplicate bindings.
 
 ## Verification
+
+Launch the interactive Linux lab with:
+
+```sh
+just run-desk-fixture
+```
+
+The visible cycle requires one typed approval for the R2 repair and a different,
+later typed approval for rollback. Desk re-runs the deterministic diagnosis
+after each operation: `KA-LNX-P0-003` disappears after repair, then reappears
+only after the original bytes have been restored.
 
 With the repository's pinned Rust toolchain and a system C linker available:
 

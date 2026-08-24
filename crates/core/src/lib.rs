@@ -6,10 +6,22 @@ use kernaid_evidence::{
         LinuxNormalizedSnapshotEnvelope, SnapshotError,
     },
 };
+#[cfg(feature = "fixture-repair-lab")]
+use kernaid_policy::validate_fixture_repair_lab_plan as validate_fixture_repair_lab_policy;
 use kernaid_policy::{PolicyError, validate_phase_zero};
 use kernaid_protocol::ValidatedPlan;
 use sha2::{Digest, Sha256};
 use std::{collections::HashSet, error::Error, fmt};
+
+/// Apply Core's closed admission boundary to the one disposable-fixture plan.
+/// The broker calls this same entry point before returning a staged R2 plan.
+#[cfg(feature = "fixture-repair-lab")]
+pub fn validate_fixture_repair_lab_plan(
+    plan: &ValidatedPlan,
+    target_fingerprint: &str,
+) -> Result<(), PolicyError> {
+    validate_fixture_repair_lab_policy(plan, target_fingerprint)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum State {
@@ -251,6 +263,19 @@ impl Session {
         self.state = State::Plan;
         Ok(())
     }
+
+    /// Stage the one disposable-fixture R2 action when the lab feature is
+    /// explicitly compiled. This is a separate entry point so the normal
+    /// Phase 0 path cannot accidentally inherit mutation admission.
+    #[cfg(feature = "fixture-repair-lab")]
+    pub fn stage_fixture_repair_lab(&mut self, plan: &ValidatedPlan) -> Result<(), PolicyError> {
+        if self.state != State::Diagnose {
+            return Err(PolicyError::MutationDisabled);
+        }
+        validate_fixture_repair_lab_plan(plan, &self.fingerprint)?;
+        self.state = State::Plan;
+        Ok(())
+    }
 }
 
 pub const LINUX_RESIDENT_P0_COLLECTORS: [&str; 9] = [
@@ -397,6 +422,48 @@ mod tests {
                 rollback: None,
             }],
         }
+    }
+
+    #[cfg(feature = "fixture-repair-lab")]
+    const FIXTURE_TARGET: &str =
+        "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+
+    #[cfg(feature = "fixture-repair-lab")]
+    fn fixture_r2_plan() -> ValidatedPlan {
+        use kernaid_policy::{
+            FIXTURE_FSTAB_ACTION_ID, FIXTURE_FSTAB_BACKUP, FIXTURE_FSTAB_PREFLIGHT_ID,
+            FIXTURE_FSTAB_ROLLBACK_ID, FIXTURE_FSTAB_VALIDATION_ID,
+        };
+
+        ValidatedPlan {
+            plan_id: "P-fixture-repair".to_owned(),
+            target_fingerprint: FIXTURE_TARGET.to_owned(),
+            steps: vec![ActionStep {
+                action: FIXTURE_FSTAB_ACTION_ID.to_owned(),
+                risk: Risk::R2,
+                target_fingerprint: FIXTURE_TARGET.to_owned(),
+                evidence_ids: vec!["E-SNAPSHOT".to_owned(), "E-P0-2".to_owned()],
+                preconditions: vec![FIXTURE_FSTAB_PREFLIGHT_ID.to_owned()],
+                backup: Some(FIXTURE_FSTAB_BACKUP.to_owned()),
+                validation: FIXTURE_FSTAB_VALIDATION_ID.to_owned(),
+                rollback: Some(FIXTURE_FSTAB_ROLLBACK_ID.to_owned()),
+            }],
+        }
+    }
+
+    #[cfg(feature = "fixture-repair-lab")]
+    fn diagnosed_fixture_session() -> Session {
+        let bytes = envelope(LinuxSnapshotCapture::resident());
+        let snapshot = evidence("local-machine", &bytes);
+        let corpus = resident_corpus(snapshot.clone());
+        let mut session = Session::new(FIXTURE_TARGET, SessionMode::LinuxResident);
+        session
+            .admit_linux_snapshot(&snapshot, &bytes)
+            .expect("admit fixture snapshot");
+        session
+            .linux_evidence_complete(&corpus)
+            .expect("complete fixture evidence");
+        session
     }
 
     #[test]
@@ -567,6 +634,60 @@ mod tests {
             );
             assert_eq!(session.state(), &State::Observe);
         }
+    }
+
+    #[cfg(feature = "fixture-repair-lab")]
+    #[test]
+    fn exact_fixture_r2_plan_uses_only_the_lab_admission() {
+        let plan = fixture_r2_plan();
+        let mut phase_zero = diagnosed_fixture_session();
+        assert_eq!(phase_zero.stage(&plan), Err(PolicyError::MutationDisabled));
+        assert_eq!(phase_zero.state(), &State::Diagnose);
+
+        phase_zero
+            .stage_fixture_repair_lab(&plan)
+            .expect("stage the exact fixture-only plan");
+        assert_eq!(phase_zero.state(), &State::Plan);
+    }
+
+    #[cfg(feature = "fixture-repair-lab")]
+    #[test]
+    fn lab_admission_rejects_contract_drift_without_advancing_state() {
+        let mut wrong_action = fixture_r2_plan();
+        wrong_action.steps[0].action = "linux.fstab.repair-entry".to_owned();
+        let mut session = diagnosed_fixture_session();
+        assert_eq!(
+            session.stage_fixture_repair_lab(&wrong_action),
+            Err(PolicyError::MutationDisabled)
+        );
+        assert_eq!(session.state(), &State::Diagnose);
+
+        let mut wrong_precondition = fixture_r2_plan();
+        wrong_precondition.steps[0].preconditions = vec!["target.still_matches".to_owned()];
+        assert_eq!(
+            session.stage_fixture_repair_lab(&wrong_precondition),
+            Err(PolicyError::InvalidFixturePrecondition)
+        );
+        assert_eq!(session.state(), &State::Diagnose);
+
+        let mut wrong_target = fixture_r2_plan();
+        wrong_target.steps[0].target_fingerprint = format!("sha256:{}", "2".repeat(64));
+        assert_eq!(
+            session.stage_fixture_repair_lab(&wrong_target),
+            Err(PolicyError::IncoherentTargetFingerprint)
+        );
+        assert_eq!(session.state(), &State::Diagnose);
+    }
+
+    #[cfg(feature = "fixture-repair-lab")]
+    #[test]
+    fn lab_admission_still_requires_the_diagnose_state() {
+        let mut session = Session::new(FIXTURE_TARGET, SessionMode::LinuxResident);
+        assert_eq!(
+            session.stage_fixture_repair_lab(&fixture_r2_plan()),
+            Err(PolicyError::MutationDisabled)
+        );
+        assert_eq!(session.state(), &State::Observe);
     }
 
     #[test]

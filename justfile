@@ -40,6 +40,9 @@ test-vault:
 run-desk:
     pnpm run run:desk
 
+run-desk-fixture:
+    pnpm --filter @kernaid/desk tauri dev --features fixture-repair-lab
+
 build-rescue:
     ./tools/build-rescue/build.sh
 

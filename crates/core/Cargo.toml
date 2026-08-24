@@ -2,6 +2,9 @@
 name = "kernaid-core"
 version.workspace = true
 edition.workspace = true
+[features]
+default = []
+fixture-repair-lab = ["kernaid-policy/fixture-repair-lab"]
 [dependencies]
 kernaid-evidence = { path = "../evidence" }
 kernaid-policy = { path = "../policy" }

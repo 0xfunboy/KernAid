@@ -4,6 +4,13 @@ version.workspace=true
 edition.workspace=true
 build="build.rs"
 default-run="kernaid-desk-shell"
+[features]
+default = []
+fixture-repair-lab = [
+  "kernaid-broker/fixture-repair-lab",
+  "kernaid-linux-pack/fixture-repair-lab",
+  "dep:tempfile",
+]
 [build-dependencies]
 tauri-build = { version = "2.2", features = [] }
 [dependencies]
@@ -37,6 +44,7 @@ process-wrap = { version = "9.1.0", default-features = false, features = ["std",
 
 [target.'cfg(target_os = "linux")'.dependencies]
 kernaid-linux-pack = { path = "../../../packs/linux" }
+tempfile = { version = "3.27", optional = true }
 
 [dev-dependencies]
 tempfile = "3.27"

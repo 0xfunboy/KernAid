@@ -2,7 +2,7 @@
 
 KernAid is an evidence-first machine diagnosis and repair platform. This repository implements the Phase 0 feasibility spike described in the [masterplan](docs/MASTERPLAN.md). For the concise, date-stamped distinction between what works now and what remains unqualified, start with [Current status](docs/CURRENT_STATUS.md).
 
-The current Phase 0 engineering vertical slice is deliberately safe: start a session, collect a normalized read-only host snapshot, run deterministic offline diagnostic rules, validate an R0 plan through Core, and export a downloadable, hashed JSON report. Production target mutation is not implemented. A separate opt-in `fixture-repair-lab` feature exercises one pinned repair and rollback only against a marked disposable fixture; it is absent from normal builds and is not connected to Core, IPC, Tauri, providers, Rescue, or production target selection.
+The current Phase 0 engineering vertical slice is deliberately safe: start a session, collect a normalized read-only host snapshot, run deterministic offline diagnostic rules, validate an R0 plan through Core, and export a downloadable, hashed JSON report. Production target mutation is not implemented. On Linux, a separate opt-in `fixture-repair-lab` Desk build exposes one complete, explicitly approved repair and separately approved rollback against an internally created disposable fixture. It is absent from normal builds and Rescue and cannot select a host path, disk or production target.
 
 ## Quick start
 
@@ -22,6 +22,10 @@ just check
 just test
 just run-desk
 ```
+
+To exercise the closed repair cycle on Linux without touching the host target,
+run `just run-desk-fixture`. The panel is compiled only into that development
+build and uses a fresh temporary fixture and journal on every launch.
 
 `just test-observe` runs against the repository-owned Linux fixture and compares
 every file path and byte before and after collection. It never accepts a

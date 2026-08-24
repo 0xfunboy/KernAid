@@ -1,9 +1,8 @@
 #![forbid(unsafe_code)]
 use kernaid_protocol::BrokerRequest;
 
-/// Dormant, Linux-only broker core for the explicitly marked disposable
-/// `fstab` fixture. It is not connected to IPC, Core, the desktop, or a
-/// production target.
+/// Linux-only broker for the explicitly marked disposable `fstab` fixture.
+/// Its opt-in Desk bridge remains disconnected from production targets.
 #[cfg(all(target_os = "linux", feature = "fixture-repair-lab"))]
 pub mod fixture_repair;
 

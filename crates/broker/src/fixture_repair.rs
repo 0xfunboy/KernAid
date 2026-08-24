@@ -6,6 +6,7 @@
 //! accepted only through [`FixtureRepairConfig`], which is local-only and is
 //! neither serializable nor exposed by receipts or errors.
 
+use kernaid_core::validate_fixture_repair_lab_plan;
 use kernaid_device_identity::{DeviceIdentity, SignedReportEnvelope};
 use kernaid_linux_pack::{
     PreservedMetadata, RepairReceipt,
@@ -13,6 +14,7 @@ use kernaid_linux_pack::{
     execute_missing_fstab_device_repair, preview_missing_fstab_device,
     preview_missing_fstab_device_rollback, rollback_missing_fstab_device_repair,
 };
+use kernaid_protocol::{ActionStep, Risk, ValidatedPlan};
 use kernaid_storage::{
     JournalAnchor, JournalEntry, JournalEntryRef, JournalReplayError, JournalReplayLimits,
     JournalSecretStore, SecureJournal,
@@ -1037,6 +1039,26 @@ impl<'attached, Store: JournalSecretStore> FixtureRepairBroker<'attached, Store>
             plan_hash: String::new(),
         };
         staged.plan_hash = compute_plan_hash(&staged);
+        let core_plan = ValidatedPlan {
+            plan_id: staged.plan_id.clone(),
+            target_fingerprint: staged.target_snapshot.clone(),
+            steps: vec![ActionStep {
+                action: staged.action_id.to_owned(),
+                risk: Risk::R2,
+                target_fingerprint: staged.target_snapshot.clone(),
+                evidence_ids: staged
+                    .evidence
+                    .iter()
+                    .map(|binding| binding.id.clone())
+                    .collect(),
+                preconditions: vec!["linux.fstab.preflight".to_owned()],
+                backup: Some("required".to_owned()),
+                validation: "linux.boot.validate-fstab".to_owned(),
+                rollback: Some(FIXTURE_ROLLBACK_ID.to_owned()),
+            }],
+        };
+        validate_fixture_repair_lab_plan(&core_plan, &staged.target_snapshot)
+            .map_err(|_| FixtureRepairError::ContractMismatch)?;
         Ok(staged)
     }
 

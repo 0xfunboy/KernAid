@@ -5,6 +5,7 @@ edition.workspace = true
 [features]
 default = []
 fixture-repair-lab = [
+    "dep:kernaid-core",
     "dep:kernaid-device-identity",
     "dep:kernaid-linux-pack",
     "dep:kernaid-storage",
@@ -17,6 +18,7 @@ fixture-repair-lab = [
 kernaid-protocol = { path = "../protocol" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+kernaid-core = { path = "../core", optional = true, features = ["fixture-repair-lab"] }
 kernaid-device-identity = { path = "../device-identity", optional = true }
 kernaid-linux-pack = { path = "../../packs/linux", optional = true }
 kernaid-storage = { path = "../storage", optional = true }

@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+#[cfg(all(target_os = "linux", feature = "fixture-repair-lab"))]
+mod fixture_repair_lab;
 #[cfg(any(target_os = "macos", test))]
 mod macos_resident;
 mod resident_openai;
@@ -7,6 +9,8 @@ mod secure_runtime;
 #[cfg(any(target_os = "windows", test))]
 mod windows_resident;
 
+#[cfg(all(target_os = "linux", feature = "fixture-repair-lab"))]
+use fixture_repair_lab::FixtureRepairLab;
 use kernaid_broker::{BrokerError, ObserveBroker};
 use kernaid_protocol::BrokerRequest;
 use resident_openai::{
@@ -1737,6 +1741,44 @@ macro_rules! production_invoke_handler {
     };
 }
 
+#[cfg(all(target_os = "linux", feature = "fixture-repair-lab"))]
+macro_rules! active_invoke_handler {
+    () => {
+        tauri::generate_handler![
+            collect_local_inventory,
+            collect_linux_normalized_snapshot,
+            collect_macos_p0_inventory,
+            collect_windows_p0_inventory,
+            diagnose_linux_p0,
+            diagnose_macos_p0,
+            diagnose_windows_p0,
+            authorize_observe,
+            secure_runtime_status,
+            initialize_device_identity,
+            append_audit_record,
+            seal_signed_report,
+            resident_openai_status,
+            resident_openai_diagnose,
+            resident_openai_cancel,
+            resident_openai_logout,
+            fixture_repair_lab::fixture_lab_status,
+            fixture_repair_lab::fixture_lab_stage,
+            fixture_repair_lab::fixture_lab_execute,
+            fixture_repair_lab::fixture_lab_reconcile_execute,
+            fixture_repair_lab::fixture_lab_stage_rollback,
+            fixture_repair_lab::fixture_lab_execute_rollback,
+            fixture_repair_lab::fixture_lab_reconcile_rollback
+        ]
+    };
+}
+
+#[cfg(not(all(target_os = "linux", feature = "fixture-repair-lab")))]
+macro_rules! active_invoke_handler {
+    () => {
+        production_invoke_handler!()
+    };
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(ObserveBrokers::default())
@@ -1745,9 +1787,11 @@ fn main() {
             let runtime = SecureRuntime::open(&app_data_directory)?;
             app.manage(runtime);
             app.manage(ResidentOpenAiRuntime::open(&app_data_directory));
+            #[cfg(all(target_os = "linux", feature = "fixture-repair-lab"))]
+            app.manage(FixtureRepairLab::new()?);
             Ok(())
         })
-        .invoke_handler(production_invoke_handler!())
+        .invoke_handler(active_invoke_handler!())
         .run(tauri::generate_context!())
         .expect("failed to run KernAid Desk");
 }

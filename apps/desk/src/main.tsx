@@ -76,6 +76,7 @@ import {
   tryStartRescueInspection,
   type InventoryCategory,
 } from "./rescue-ui";
+import { FixtureRepairLabPanel } from "./fixture-repair-lab-panel";
 import "./style.css";
 
 type Workflow = "Observe" | "Diagnose" | "Plan" | "Verify";
@@ -1254,6 +1255,7 @@ function App() {
             </p>
           )}
         </article>
+        {isNative() && <FixtureRepairLabPanel />}
         {(securityNeedsActivation || securityBlocked) && (
           <div className={`security ${securityBlocked ? "blocked" : ""}`}>
             <b>

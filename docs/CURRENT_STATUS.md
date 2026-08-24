@@ -42,7 +42,7 @@ WinPE Companion and Fleet management remain later milestones.
 | Reporting | Downloadable JSON report with a content hash |
 | Rescue security | Isolated credential-vault and fail-closed Codex login/status/logout bridge plumbing; it does not yet run prompts or diagnoses |
 | Virtual testing | Disposable QEMU fixtures, mutation checks and BIOS/UEFI workflow coverage |
-| Repair experiment | One feature-gated disposable-fixture lab, absent from normal builds and disconnected from production targets |
+| Repair experiment | Linux-only feature-gated Desk lab for one typed R2 repair, verification and separately approved rollback on an internal temporary fixture; absent from normal/Rescue builds and disconnected from production targets |
 
 The canonical repository is `/home/funboy/kernaid`, branch `main`. Temporary
 integration worktrees are not product branches and should not be treated as a
