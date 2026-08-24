@@ -461,7 +461,11 @@ class RescueTauriBoundaryTests(unittest.TestCase):
             source.index("tauri::Builder::default()"),
         )
         self.assertLess(
-            source.index(".build()"), source.index("notify_systemd(status, true)")
+            source.index("notify_systemd(WINDOW_STARTUP_STATUS, false)"),
+            source.index("notify_systemd(status, true)"),
+        )
+        self.assertLess(
+            source.index("notify_systemd(status, true)"), source.index(".build()")
         )
         self.assertNotIn("sandbox-attestation-v1", source)
         self.assertNotIn("sandbox-failure-v1", source)

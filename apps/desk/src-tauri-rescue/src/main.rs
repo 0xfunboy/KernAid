@@ -527,6 +527,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "Rescue shell startup notification failed",
                 )
             })?;
+            // READY attests the completed sandbox preflight, not UI readiness.
+            // The independent root checker still requires the exact renderer,
+            // visible window, active display and post-start endpoint proof.
+            notify_systemd(status, true).map_err(|_| {
+                let failure_status = SandboxProbeFailure::Notify.status();
+                let _ = notify_systemd(failure_status, false);
+                eprintln!("{failure_status}");
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "Rescue shell notification failed",
+                )
+            })?;
             WebviewWindowBuilder::new(app, "main", WebviewUrl::External(rescue_url))
                 .title("KernAid Rescue")
                 .fullscreen(true)
@@ -545,15 +557,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     let _ = notify_systemd(failure_status, false);
                     eprintln!("{failure_status}");
                 })?;
-            notify_systemd(status, true).map_err(|_| {
-                let failure_status = SandboxProbeFailure::Notify.status();
-                let _ = notify_systemd(failure_status, false);
-                eprintln!("{failure_status}");
-                io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "Rescue shell notification failed",
-                )
-            })?;
             Ok(())
         })
         // This binary intentionally registers no invoke handler.  Together
