@@ -194,11 +194,11 @@ MAX_PROCESS_ARGUMENTS = 256
 MAX_FDS_PER_NATIVE_PROCESS = 256
 MAX_NATIVE_FDS = 1024
 MAX_TOOL_OUTPUT_BYTES = 4 * 1024
-# The supervised shell has a 360-second bounded start window because WebKitGTK
+# The supervised shell has a 600-second bounded start window because WebKitGTK
 # can initialize slowly under QEMU TCG.  The root attestor must outlive that
 # service deadline so it can observe the final active/failure state instead of
 # declaring a still-valid startup attempt failed early.
-PROBE_TIMEOUT_SECONDS = 390
+PROBE_TIMEOUT_SECONDS = 620
 TOOL_TIMEOUT_SECONDS = 3
 
 

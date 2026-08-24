@@ -463,7 +463,7 @@ if [ "$offline_inspection_smoke" = "1" ] && [ -z "$selection_request" ]; then
     fail "Linux fixture target is missing"
 fi
 if ! tauri_guest_attestation="$(
-    /usr/bin/timeout --signal=TERM --kill-after=2s 400s \
+    /usr/bin/timeout --signal=TERM --kill-after=2s 630s \
         /usr/bin/python3 -I /usr/lib/kernaid/tauri_ui_ready_check.py
 )"; then
     case "$tauri_guest_attestation" in
