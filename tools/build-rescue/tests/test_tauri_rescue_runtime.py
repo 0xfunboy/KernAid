@@ -712,17 +712,20 @@ class RescueTauriBoundaryTests(unittest.TestCase):
                     f"KERNAID_TAURI_NETWORK_PROBE_FAILURE_V1 stage={mode}\n",
                 )
 
-    def test_guest_baseline_rechecks_live_endpoint(self) -> None:
-        with mock.patch.object(
-            guest_ui, "_qemu_endpoint_post_ready", return_value=True
-        ) as endpoint:
-            self.assertTrue(guest_ui._qemu_baseline_ready())
-        endpoint.assert_called_once_with()
-
-        with mock.patch.object(
-            guest_ui, "_qemu_endpoint_post_ready", return_value=False
-        ):
-            self.assertFalse(guest_ui._qemu_baseline_ready())
+    def test_guest_defers_live_endpoint_to_the_final_retrying_gate(self) -> None:
+        source = (
+            REPO_DIR
+            / "rescue/live-build/config/includes.chroot/usr/lib/kernaid"
+            / "tauri_ui_ready_check.py"
+        ).read_text(encoding="utf-8")
+        attest_source = source[source.index("def attest()") : source.index("\ndef main()")]
+        self.assertNotIn("_qemu_baseline_ready", source)
+        self.assertLess(
+            attest_source.index("_private_run_ready"),
+            attest_source.index("_qemu_endpoint_post_ready"),
+        )
+        self.assertIn('last_stage = "endpoint-post"', attest_source)
+        self.assertIn("continue\n        return *window, qemu_probe", attest_source)
 
     def test_lightdm_session_is_minimal_and_busless(self) -> None:
         root = REPO_DIR / "rescue/live-build/config/includes.chroot"

@@ -193,10 +193,10 @@ MAX_PROCESS_ARGUMENTS = 256
 MAX_FDS_PER_NATIVE_PROCESS = 256
 MAX_NATIVE_FDS = 1024
 MAX_TOOL_OUTPUT_BYTES = 4 * 1024
-# The supervised shell has a 600-second bounded start window because WebKitGTK
-# can initialize slowly under QEMU TCG.  The root attestor must outlive that
-# service deadline so it can observe the final active/failure state instead of
-# declaring a still-valid startup attempt failed early.
+# The root attestor keeps a bounded 620-second window because WebKitGTK can
+# initialize slowly under QEMU TCG.  The shell's systemd READY state attests
+# only its completed sandbox preflight; this checker still requires the exact
+# renderer, visible window and post-start endpoint proof.
 PROBE_TIMEOUT_SECONDS = 620
 TOOL_TIMEOUT_SECONDS = 3
 
@@ -662,10 +662,6 @@ def _qemu_probe_mode(path: str = QEMU_PROBE_MARKER_PATH) -> bool:
     ):
         raise SandboxFailure("probe-mode")
     return True
-
-
-def _qemu_baseline_ready() -> bool:
-    return _qemu_endpoint_post_ready()
 
 
 def _qemu_endpoint_post_ready() -> bool:
@@ -1289,8 +1285,6 @@ def attest() -> tuple[int, int, bool]:
     if not polkit_ready:
         raise SandboxFailure("system-bus")
     qemu_probe = _qemu_probe_mode()
-    if qemu_probe and not _qemu_baseline_ready():
-        raise SandboxFailure("baseline")
     last_stage = "service"
     deadline = time.monotonic() + PROBE_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
@@ -1350,7 +1344,9 @@ def attest() -> tuple[int, int, bool]:
             time.sleep(0.5)
             continue
         if qemu_probe and not _qemu_endpoint_post_ready():
-            raise SandboxFailure("endpoint-post")
+            last_stage = "endpoint-post"
+            time.sleep(0.5)
+            continue
         return *window, qemu_probe
     raise SandboxFailure(last_stage)
 
