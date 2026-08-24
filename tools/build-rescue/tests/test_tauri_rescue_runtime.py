@@ -506,6 +506,14 @@ class RescueTauriBoundaryTests(unittest.TestCase):
         self.assertIn("Group=kernaid-rescue-ui", service)
         self.assertIn("Restart=on-failure", service)
         self.assertIn("TimeoutStartSec=360s", service)
+        self.assertEqual(guest_ui.PROBE_TIMEOUT_SECONDS, 390)
+        ready_check = (
+            REPO_DIR
+            / "rescue/live-build/config/includes.chroot/usr/lib/kernaid/ready-check"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "/usr/bin/timeout --signal=TERM --kill-after=2s 400s", ready_check
+        )
         self.assertIn("StandardOutput=journal+console", service)
         self.assertIn("StandardError=journal+console", service)
         self.assertIn("NoNewPrivileges=yes", service)
