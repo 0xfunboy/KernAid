@@ -53,9 +53,11 @@ const MAX_AUTH_FILE_BYTES: u64 = 128 * 1024;
 const MAX_LOGIN_LOG_BYTES: u64 = 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const VAULT_TIMEOUT: Duration = Duration::from_secs(20);
+const CLI_PREPARE_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const STATUS_TIMEOUT: Duration = Duration::from_secs(15);
 const LOGOUT_TIMEOUT: Duration = Duration::from_secs(45);
 const DEVICE_LOGIN_TIMEOUT: Duration = Duration::from_secs(16 * 60);
+const CLIENT_COMPLETION_GRACE: Duration = Duration::from_secs(10);
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const PROCESS_STOP_GRACE: Duration = Duration::from_secs(2);
 const CHILD_DESCRIPTOR_MINIMUM: i32 = 8;
@@ -86,6 +88,10 @@ impl Operation {
             Self::Status => STATUS_TIMEOUT,
             Self::Logout => LOGOUT_TIMEOUT,
         }
+    }
+
+    fn client_timeout(self) -> Duration {
+        VAULT_TIMEOUT + CLI_PREPARE_TIMEOUT + self.timeout() + CLIENT_COMPLETION_GRACE
     }
 }
 
@@ -574,9 +580,15 @@ fn execute_with_home(
     home_policy: HomePolicy,
     responder: &mut dyn Responder,
 ) -> Result<(), ExecutionError> {
+    let preparation_deadline = Instant::now()
+        .checked_add(CLI_PREPARE_TIMEOUT)
+        .ok_or(ExecutionError::TimedOut)?;
+    ensure_execution_deadline(preparation_deadline)?;
     validate_home(home, home_policy)?;
+    ensure_execution_deadline(preparation_deadline)?;
     validate_home_alias(home, home_path, home_policy)?;
-    let mut child = spawn_cli(operation, home_path, cli)?;
+    ensure_execution_deadline(preparation_deadline)?;
+    let mut child = spawn_cli(operation, home_path, cli, preparation_deadline)?;
     let deadline = Instant::now()
         .checked_add(operation.timeout())
         .ok_or(ExecutionError::TimedOut)?;
@@ -607,8 +619,11 @@ fn spawn_cli(
     operation: Operation,
     home_path: &Path,
     policy: &CliPolicy,
+    preparation_deadline: Instant,
 ) -> Result<Child, ExecutionError> {
-    let executable = open_verified_executable(policy)?;
+    ensure_execution_deadline(preparation_deadline)?;
+    let executable = open_verified_executable(policy, preparation_deadline)?;
+    ensure_execution_deadline(preparation_deadline)?;
     let inherited_executable =
         rustix::io::fcntl_dupfd_cloexec(&executable, CHILD_DESCRIPTOR_MINIMUM)
             .map_err(|_| ExecutionError::UnsafeExecutable)?;
@@ -638,15 +653,40 @@ fn spawn_cli(
     let _guard = SPAWN_LOCK
         .lock()
         .map_err(|_| ExecutionError::CliUnavailable)?;
+    ensure_execution_deadline(preparation_deadline)?;
     rustix::io::fcntl_setfd(&inherited_executable, rustix::io::FdFlags::empty())
         .map_err(|_| ExecutionError::CliUnavailable)?;
     let spawned = command.spawn();
     let _ = rustix::io::fcntl_setfd(&inherited_executable, rustix::io::FdFlags::CLOEXEC);
     drop(inherited_executable);
-    spawned.map_err(|_| ExecutionError::CliUnavailable)
+    let child = spawned.map_err(|_| ExecutionError::CliUnavailable)?;
+    enforce_spawn_deadline(child, preparation_deadline)
 }
 
-fn open_verified_executable(policy: &CliPolicy) -> Result<File, ExecutionError> {
+fn enforce_spawn_deadline(
+    mut child: Child,
+    preparation_deadline: Instant,
+) -> Result<Child, ExecutionError> {
+    if ensure_execution_deadline(preparation_deadline).is_err() {
+        terminate_child_group(&mut child);
+        return Err(ExecutionError::TimedOut);
+    }
+    Ok(child)
+}
+
+fn ensure_execution_deadline(deadline: Instant) -> Result<(), ExecutionError> {
+    if Instant::now() >= deadline {
+        Err(ExecutionError::TimedOut)
+    } else {
+        Ok(())
+    }
+}
+
+fn open_verified_executable(
+    policy: &CliPolicy,
+    preparation_deadline: Instant,
+) -> Result<File, ExecutionError> {
+    ensure_execution_deadline(preparation_deadline)?;
     let descriptor = rfs::openat2(
         rfs::CWD,
         &policy.path,
@@ -655,7 +695,9 @@ fn open_verified_executable(policy: &CliPolicy) -> Result<File, ExecutionError> 
         ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
     )
     .map_err(|_| ExecutionError::CliUnavailable)?;
+    ensure_execution_deadline(preparation_deadline)?;
     let before = rfs::fstat(&descriptor).map_err(|_| ExecutionError::UnsafeExecutable)?;
+    ensure_execution_deadline(preparation_deadline)?;
     if !FileType::from_raw_mode(before.st_mode).is_file()
         || before.st_uid != policy.uid
         || before.st_gid != policy.gid
@@ -670,9 +712,11 @@ fn open_verified_executable(policy: &CliPolicy) -> Result<File, ExecutionError> 
     let mut buffer = [0_u8; 64 * 1024];
     let mut total = 0_u64;
     loop {
+        ensure_execution_deadline(preparation_deadline)?;
         let count = file
             .read(&mut buffer)
             .map_err(|_| ExecutionError::UnsafeExecutable)?;
+        ensure_execution_deadline(preparation_deadline)?;
         if count == 0 {
             break;
         }
@@ -685,7 +729,9 @@ fn open_verified_executable(policy: &CliPolicy) -> Result<File, ExecutionError> 
         digest.update(&buffer[..count]);
     }
     buffer.zeroize();
+    ensure_execution_deadline(preparation_deadline)?;
     let after = rfs::fstat(&file).map_err(|_| ExecutionError::UnsafeExecutable)?;
+    ensure_execution_deadline(preparation_deadline)?;
     if total != policy.size
         || (
             before.st_dev,
@@ -1272,7 +1318,7 @@ fn run_client_inner(arguments: impl Iterator<Item = OsString>) -> Result<(), ()>
         return Err(());
     }
     let deadline = Instant::now()
-        .checked_add(operation.timeout() + VAULT_TIMEOUT + Duration::from_secs(10))
+        .checked_add(operation.client_timeout())
         .ok_or(())?;
     let socket = connect_bridge(deadline)?;
     if send(&socket, &frame, SendFlags::NOSIGNAL).map_err(|_| ())? != frame.len() {
@@ -1562,6 +1608,50 @@ mod tests {
             self.cli.size = script.len() as u64;
             self.cli.sha256 = format!("{:x}", Sha256::digest(script));
         }
+    }
+
+    #[test]
+    fn client_deadlines_cover_vault_preparation_and_operation() {
+        assert_eq!(CLI_PREPARE_TIMEOUT, Duration::from_secs(120));
+        assert_eq!(Operation::Status.client_timeout(), Duration::from_secs(165));
+        assert_eq!(Operation::Logout.client_timeout(), Duration::from_secs(195));
+        assert_eq!(
+            Operation::DeviceLogin.client_timeout(),
+            Duration::from_secs(1110)
+        );
+        assert!(CLIENT_COMPLETION_GRACE > PROCESS_STOP_GRACE);
+    }
+
+    #[test]
+    fn expired_preparation_stops_before_hash_and_reaps_a_spawned_child() {
+        let fixture = Fixture::new();
+        let expired = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("expired deadline");
+        assert!(matches!(
+            open_verified_executable(&fixture.cli, expired),
+            Err(ExecutionError::TimedOut)
+        ));
+        assert!(!fixture.trace_path.exists());
+
+        let mut command = Command::new("/bin/sleep");
+        command
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let child = command.spawn().expect("deadline cleanup child");
+        let pid = Pid::from_raw(i32::try_from(child.id()).expect("child pid range"))
+            .expect("positive child pid");
+        assert!(matches!(
+            enforce_spawn_deadline(child, expired),
+            Err(ExecutionError::TimedOut)
+        ));
+        assert_eq!(
+            rustix::process::test_kill_process(pid).err(),
+            Some(rustix::io::Errno::SRCH)
+        );
     }
 
     #[test]

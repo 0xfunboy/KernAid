@@ -2531,7 +2531,13 @@ class StaticContractTests(unittest.TestCase):
         self.assertIn('show("SubState"', source)
         self.assertIn('show("NAccepted"', source)
         self.assertIn('show("NConnections"', source)
-        self.assertIn("connection.settimeout(60.0)", source)
+        self.assertEqual(controller.CODEX_STATUS_SOCKET_TIMEOUT_SECONDS, 180.0)
+        self.assertEqual(controller.CODEX_STATUS_PROOF_TIMEOUT_SECONDS, 195.0)
+        self.assertLess(
+            controller.CODEX_STATUS_SOCKET_TIMEOUT_SECONDS,
+            controller.CODEX_STATUS_PROOF_TIMEOUT_SECONDS,
+        )
+        self.assertIn("connection.settimeout(180.0)", source)
         for checkpoint in controller.PROVIDER_PROOF_CODEX_CHECKPOINTS:
             self.assertIn(
                 "KERNAID_QEMU_PROVIDER_PROOF_FAILURE_V1 "
@@ -2540,7 +2546,7 @@ class StaticContractTests(unittest.TestCase):
             )
         lifecycle = inspect.getsource(controller.run_lifecycle)
         self.assertIn('"codex-status",', lifecycle)
-        self.assertIn("timeout=75.0", lifecycle)
+        self.assertIn("timeout=CODEX_STATUS_PROOF_TIMEOUT_SECONDS", lifecycle)
         for forbidden in (
             "auth.json",
             "device-login",

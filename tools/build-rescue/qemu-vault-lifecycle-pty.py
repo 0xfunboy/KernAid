@@ -47,6 +47,8 @@ PROCESS_CLEANUP_SECONDS = 5.0
 PROBE_OUTPUT_LIMIT = 256
 PROBE_STDERR_LIMIT = 256
 PROBE_TIMEOUT_SECONDS = 620.0
+CODEX_STATUS_SOCKET_TIMEOUT_SECONDS = 180.0
+CODEX_STATUS_PROOF_TIMEOUT_SECONDS = 195.0
 
 LOOP_CLR_FD = 0x4C01
 LOOP_GET_STATUS64 = 0x4C05
@@ -2744,7 +2746,7 @@ try:
     encoded=json.dumps(request,ensure_ascii=True,separators=(",",":")).encode("ascii")
     checkpoint="transport"
     connection=socket.socket(socket.AF_UNIX,socket.SOCK_SEQPACKET|socket.SOCK_CLOEXEC)
-    connection.settimeout(60.0)
+    connection.settimeout({CODEX_STATUS_SOCKET_TIMEOUT_SECONDS!r})
     connection.connect(SOCKET_PATH)
     if connection.send(encoded)!=len(encoded):
         raise RuntimeError()
@@ -3207,7 +3209,7 @@ def run_lifecycle(
         _codex_status_probe_source(),
         cursor,
         aggregate,
-        timeout=75.0,
+        timeout=CODEX_STATUS_PROOF_TIMEOUT_SECONDS,
     )
     configured, cursor = run_provider_companion(
         console,

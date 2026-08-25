@@ -10,9 +10,9 @@ ConditionPathIsDirectory=/run/live/medium
 [Service]
 Type=simple
 ExecStart=/usr/lib/kernaid/kernaid-rescue-codex
-# Outer wall around the client's 990-second device-auth deadline, including
-# descriptor/hash validation and final control-group cleanup.
-RuntimeMaxSec=1020s
+# Outer wall around the client's 1110-second device-auth deadline, including
+# bounded descriptor/hash validation and final control-group cleanup.
+RuntimeMaxSec=1140s
 TimeoutStartSec=5s
 TimeoutStopSec=10s
 Restart=no

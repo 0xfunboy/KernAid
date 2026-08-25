@@ -62,7 +62,7 @@ class ShippingCodexBridgeTests(unittest.TestCase):
         self.assertEqual(service["StandardInput"], "socket")
         self.assertEqual(service["StandardOutput"], "null")
         self.assertEqual(service["StandardError"], "null")
-        self.assertEqual(service["RuntimeMaxSec"], "1020s")
+        self.assertEqual(service["RuntimeMaxSec"], "1140s")
         self.assertEqual(service["Delegate"], "pids")
         self.assertEqual(service["DelegateSubgroup"], "agent")
         self.assertEqual(service["KillMode"], "control-group")
