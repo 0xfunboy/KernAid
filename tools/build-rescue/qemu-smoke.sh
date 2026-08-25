@@ -595,7 +595,7 @@ report_tauri_sandbox_failure() {
   )"
   marker="$(
     LC_ALL=C tr -d '\r' <"$log" \
-      | grep -aE '^KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=(http|x11|http-x11|socket-offline-inspector|socket-vault|socket-openai-executor|socket-openai-egress|socket-codex|system-bus|probe-mode|baseline|nonloopback|identity|pidns|session-bus|notify|window-startup|service|process-tree|renderer|window|display|xauthority|run-view|devices|device-fds|proc-alias|endpoint-post)$' \
+      | grep -aE '^KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=(http|x11|http-x11|socket-offline-inspector|socket-vault|socket-openai-executor|socket-openai-egress|socket-codex|system-bus|probe-mode|baseline|nonloopback|identity|pidns|session-bus|notify|window-startup|service|process-tree|process-count|process-forbidden|process-executable|process-ancestry|process-metadata-access|process-metadata-format|process-environ-access|process-environ-format|renderer|window|display|xauthority|run-view|devices|device-fds|proc-alias|endpoint-post)$' \
       | tail -n 1 \
       || true
   )"

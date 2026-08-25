@@ -80,6 +80,14 @@ SHELL_FAILURE_STAGES = {
 GUEST_FAILURE_STAGES = SHELL_FAILURE_STAGES | {
     "service",
     "process-tree",
+    "process-count",
+    "process-forbidden",
+    "process-executable",
+    "process-ancestry",
+    "process-metadata-access",
+    "process-metadata-format",
+    "process-environ-access",
+    "process-environ-format",
     "renderer",
     "window",
     "display",
@@ -103,6 +111,10 @@ WEBKIT_EXECUTABLES = {
     f"{WEBKIT_ROOT}/WebKitNetworkProcess",
     f"{WEBKIT_ROOT}/WebKitWebProcess",
 }
+GSTREAMER_PLUGIN_SCANNER = (
+    "/usr/lib/x86_64-linux-gnu/gstreamer1.0/gstreamer-1.0/gst-plugin-scanner"
+)
+SHIPPING_NATIVE_EXECUTABLES = WEBKIT_EXECUTABLES | {GSTREAMER_PLUGIN_SCANNER}
 FORBIDDEN_UI_PROCESS_NAMES = {
     "chrome",
     "chromium",
@@ -217,6 +229,21 @@ class SandboxFailure(AttestationError):
         self.stage = stage
 
 
+class ProcessObservationFailure(AttestationError):
+    """A sanitized, retryable failure while reading the process table."""
+
+    def __init__(self, stage: str) -> None:
+        if stage not in {
+            "process-metadata-access",
+            "process-metadata-format",
+            "process-environ-access",
+            "process-environ-format",
+        }:
+            raise AttestationError("the process observation stage was invalid")
+        super().__init__("the process table could not be observed safely")
+        self.stage = stage
+
+
 class ProcessIdentity(NamedTuple):
     parent: int
     uids: tuple[int, int, int, int]
@@ -230,14 +257,16 @@ _Observation = TypeVar("_Observation")
 
 
 def _retryable_process_observation(
-    operation: Callable[[], _Observation],
-) -> _Observation | None:
+    operation: Callable[[], _Observation], fallback_stage: str
+) -> tuple[_Observation | None, str | None]:
     try:
-        return operation()
+        return operation(), None
     except SandboxFailure:
         raise
+    except ProcessObservationFailure as error:
+        return None, error.stage
     except (AttestationError, OSError):
-        return None
+        return None, fallback_stage
 
 
 def _bounded_file(path: str) -> bytes:
@@ -284,33 +313,52 @@ def _process_identity(
 ) -> ProcessIdentity | None:
     try:
         stat_payload = _bounded_file(f"/proc/{pid}/stat")
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    except (AttestationError, OSError) as error:
+        raise ProcessObservationFailure("process-metadata-access") from error
+    try:
         status_payload = _bounded_file(f"/proc/{pid}/status")
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    except (AttestationError, OSError) as error:
+        raise ProcessObservationFailure("process-metadata-access") from error
+    try:
         executable = os.readlink(f"/proc/{pid}/exe")
     except (FileNotFoundError, ProcessLookupError):
         return None
-    except PermissionError as error:
-        raise AttestationError("process identity access was denied") from error
+    except OSError as error:
+        raise ProcessObservationFailure("process-metadata-access") from error
     close_parenthesis = stat_payload.rfind(b") ")
     if close_parenthesis < 0:
-        raise AttestationError("process relationship metadata was invalid")
+        raise ProcessObservationFailure("process-metadata-format")
     fields = stat_payload[close_parenthesis + 2 :].split()
     if len(fields) < 2:
-        raise AttestationError("process relationship metadata was invalid")
+        raise ProcessObservationFailure("process-metadata-format")
     try:
         parent_pid = int(fields[1])
     except ValueError as error:
-        raise AttestationError("process relationship metadata was invalid") from error
-    uids = _status_values(status_payload, b"Uid:\t", 4)
-    gids = _status_values(status_payload, b"Gid:\t", 4)
-    groups = frozenset(_status_values(status_payload, b"Groups:", None))
+        raise ProcessObservationFailure("process-metadata-format") from error
+    try:
+        uids = _status_values(status_payload, b"Uid:\t", 4)
+        gids = _status_values(status_payload, b"Gid:\t", 4)
+        groups = frozenset(_status_values(status_payload, b"Groups:", None))
+    except AttestationError as error:
+        raise ProcessObservationFailure("process-metadata-format") from error
     environment = {}
     if environment_uids.intersection(uids) or environment_gids.intersection(
         groups | frozenset(gids)
     ) or os.path.basename(executable) in environment_names:
         try:
-            environment = _environment(_bounded_file(f"/proc/{pid}/environ"))
+            environment_payload = _bounded_file(f"/proc/{pid}/environ")
         except (FileNotFoundError, ProcessLookupError):
             return None
+        except (AttestationError, OSError) as error:
+            raise ProcessObservationFailure("process-environ-access") from error
+        try:
+            environment = _environment(environment_payload)
+        except AttestationError as error:
+            raise ProcessObservationFailure("process-environ-format") from error
     return ProcessIdentity(parent_pid, uids, gids, groups, executable, environment)
 
 
@@ -383,7 +431,7 @@ def _shipping_process(
     ui_gids = (ui.pw_gid,) * 4
     for identity in processes.values():
         if os.path.basename(identity.executable).lower() in FORBIDDEN_UI_PROCESS_NAMES:
-            raise SandboxFailure("process-tree")
+            raise SandboxFailure("process-forbidden")
         display_access = (
             identity.environment.get(b"DISPLAY") in DISPLAY_ZERO
             or identity.environment.get(b"XAUTHORITY") == XAUTHORITY.encode("ascii")
@@ -425,7 +473,7 @@ def _shipping_process(
             continue
         ui_processes += 1
         if ui_processes > MAX_PRIVATE_PROCESSES + 1:
-            raise SandboxFailure("process-tree")
+            raise SandboxFailure("process-count")
         if pid == window_manager_pid:
             if (
                 identity.environment.get(b"DISPLAY") != DISPLAY.encode("ascii")
@@ -442,10 +490,10 @@ def _shipping_process(
             ):
                 raise SandboxFailure("session-bus")
             continue
-        if identity.executable not in WEBKIT_EXECUTABLES | {SHELL_PATH} or not _descends_from(
-            pid, shell_pid, processes
-        ):
-            raise SandboxFailure("process-tree")
+        if identity.executable not in SHIPPING_NATIVE_EXECUTABLES | {SHELL_PATH}:
+            raise SandboxFailure("process-executable")
+        if not _descends_from(pid, shell_pid, processes):
+            raise SandboxFailure("process-ancestry")
         native_processes[pid] = identity
         if (
             identity.environment.get(b"DISPLAY") != DISPLAY.encode("ascii")
@@ -517,7 +565,7 @@ def _privileged_device_fds_absent(
         frozenset(),
         frozenset(
             os.path.basename(executable)
-            for executable in WEBKIT_EXECUTABLES
+            for executable in SHIPPING_NATIVE_EXECUTABLES
             | {SHELL_PATH, WINDOW_MANAGER_PATH}
         ),
     )
@@ -1324,14 +1372,16 @@ def attest() -> tuple[int, int, bool]:
             live.pw_uid, live.pw_gid, lambda: _open_denied(XAUTHORITY)
         ):
             raise SandboxFailure("xauthority")
-        process_snapshot = _retryable_process_observation(
-            lambda: _shipping_process(ui, shell_pid)
+        process_snapshot, process_failure_stage = _retryable_process_observation(
+            lambda: _shipping_process(ui, shell_pid), "process-metadata-access"
         )
         if process_snapshot is None:
             unstable_process_snapshots += 1
             if unstable_process_snapshots >= MAX_UNSTABLE_PROCESS_SNAPSHOTS:
-                raise SandboxFailure("process-tree")
-            last_stage = "process-tree"
+                raise SandboxFailure(
+                    process_failure_stage or "process-metadata-access"
+                )
+            last_stage = process_failure_stage or "process-metadata-access"
             time.sleep(0.5)
             continue
         unstable_process_snapshots = 0
@@ -1344,8 +1394,9 @@ def attest() -> tuple[int, int, bool]:
             last_stage = "renderer"
             time.sleep(0.5)
             continue
-        device_fds_ready = _retryable_process_observation(
-            lambda: _privileged_device_fds_absent(native_processes, ui)
+        device_fds_ready, _device_failure_stage = _retryable_process_observation(
+            lambda: _privileged_device_fds_absent(native_processes, ui),
+            "device-fds",
         )
         if device_fds_ready is None:
             unstable_device_snapshots += 1

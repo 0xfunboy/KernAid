@@ -518,18 +518,37 @@ class RescueTauriBoundaryTests(unittest.TestCase):
 
     def test_process_observation_retries_only_unstable_snapshots(self) -> None:
         expected = object()
-        self.assertIs(
-            guest_ui._retryable_process_observation(lambda: expected), expected
+        self.assertEqual(
+            guest_ui._retryable_process_observation(
+                lambda: expected, "process-metadata-access"
+            ),
+            (expected, None),
         )
         for error in (
             guest_ui.AttestationError("unstable process metadata"),
             PermissionError("process changed during observation"),
         ):
             operation = mock.Mock(side_effect=error)
-            self.assertIsNone(guest_ui._retryable_process_observation(operation))
+            self.assertEqual(
+                guest_ui._retryable_process_observation(
+                    operation, "process-metadata-access"
+                ),
+                (None, "process-metadata-access"),
+            )
+        observation_error = guest_ui.ProcessObservationFailure(
+            "process-environ-access"
+        )
+        self.assertEqual(
+            guest_ui._retryable_process_observation(
+                mock.Mock(side_effect=observation_error),
+                "process-metadata-access",
+            ),
+            (None, "process-environ-access"),
+        )
         with self.assertRaises(guest_ui.SandboxFailure):
             guest_ui._retryable_process_observation(
-                mock.Mock(side_effect=guest_ui.SandboxFailure("identity"))
+                mock.Mock(side_effect=guest_ui.SandboxFailure("identity")),
+                "process-metadata-access",
             )
 
     def test_pid_namespace_failure_path_returns_only_none(self) -> None:
@@ -1119,6 +1138,16 @@ class RescueTauriBoundaryTests(unittest.TestCase):
         )
         self.assertIn("|devices|device-fds|proc-alias|", qemu_smoke)
         self.assertIn("|notify|window-startup|service|", qemu_smoke)
+        self.assertIn("|process-executable|process-ancestry|", qemu_smoke)
+        self.assertEqual(
+            guest_ui.GSTREAMER_PLUGIN_SCANNER,
+            "/usr/lib/x86_64-linux-gnu/gstreamer1.0/"
+            "gstreamer-1.0/gst-plugin-scanner",
+        )
+        self.assertIn(
+            guest_ui.GSTREAMER_PLUGIN_SCANNER,
+            guest_ui.SHIPPING_NATIVE_EXECUTABLES,
+        )
         self.assertIn(
             "KERNAID_RESCUE_TAURI_SANDBOX_FAILURE_V1 "
             "stage=(http|x11|http-x11|socket-offline-inspector|socket-vault|",
