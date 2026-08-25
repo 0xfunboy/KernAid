@@ -17,7 +17,7 @@ import stat
 import subprocess
 import tempfile
 import time
-from typing import NamedTuple
+from typing import Callable, NamedTuple, TypeVar
 
 
 SHELL_UNIT = "kernaid-rescue-desk-shell.service"
@@ -194,6 +194,7 @@ MAX_PROCESS_ARGUMENTS = 256
 MAX_FDS_PER_NATIVE_PROCESS = 256
 MAX_NATIVE_FDS = 1024
 MAX_TOOL_OUTPUT_BYTES = 4 * 1024
+MAX_UNSTABLE_PROCESS_SNAPSHOTS = 16
 # The root attestor keeps a bounded 620-second window because WebKitGTK can
 # initialize slowly under QEMU TCG.  The shell's systemd READY state attests
 # only its completed sandbox preflight; this checker still requires the exact
@@ -223,6 +224,20 @@ class ProcessIdentity(NamedTuple):
     groups: frozenset[int]
     executable: str
     environment: dict[bytes, bytes]
+
+
+_Observation = TypeVar("_Observation")
+
+
+def _retryable_process_observation(
+    operation: Callable[[], _Observation],
+) -> _Observation | None:
+    try:
+        return operation()
+    except SandboxFailure:
+        raise
+    except (AttestationError, OSError):
+        return None
 
 
 def _bounded_file(path: str) -> bytes:
@@ -1289,6 +1304,8 @@ def attest() -> tuple[int, int, bool]:
         raise SandboxFailure("system-bus")
     qemu_probe = _qemu_probe_mode()
     last_stage = "service"
+    unstable_process_snapshots = 0
+    unstable_device_snapshots = 0
     deadline = time.monotonic() + PROBE_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
         shell_pid = _shell_service_ready(qemu_probe)
@@ -1307,9 +1324,18 @@ def attest() -> tuple[int, int, bool]:
             live.pw_uid, live.pw_gid, lambda: _open_denied(XAUTHORITY)
         ):
             raise SandboxFailure("xauthority")
-        shell_pid, window_manager_pid, native_processes = _shipping_process(
-            ui, shell_pid
+        process_snapshot = _retryable_process_observation(
+            lambda: _shipping_process(ui, shell_pid)
         )
+        if process_snapshot is None:
+            unstable_process_snapshots += 1
+            if unstable_process_snapshots >= MAX_UNSTABLE_PROCESS_SNAPSHOTS:
+                raise SandboxFailure("process-tree")
+            last_stage = "process-tree"
+            time.sleep(0.5)
+            continue
+        unstable_process_snapshots = 0
+        shell_pid, window_manager_pid, native_processes = process_snapshot
         if not shell_pid:
             last_stage = "process-tree"
             time.sleep(0.5)
@@ -1318,11 +1344,17 @@ def attest() -> tuple[int, int, bool]:
             last_stage = "renderer"
             time.sleep(0.5)
             continue
-        device_fds_ready = _privileged_device_fds_absent(native_processes, ui)
+        device_fds_ready = _retryable_process_observation(
+            lambda: _privileged_device_fds_absent(native_processes, ui)
+        )
         if device_fds_ready is None:
+            unstable_device_snapshots += 1
+            if unstable_device_snapshots >= MAX_UNSTABLE_PROCESS_SNAPSHOTS:
+                raise SandboxFailure("device-fds")
             last_stage = "device-fds"
             time.sleep(0.5)
             continue
+        unstable_device_snapshots = 0
         if not device_fds_ready:
             raise SandboxFailure("device-fds")
         aliases = _private_pid_namespace_aliases(shell_pid, window_manager_pid)

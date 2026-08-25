@@ -516,6 +516,22 @@ class RescueTauriBoundaryTests(unittest.TestCase):
         self.assertTrue(guest_ui._descends_from(12, 10, processes))
         self.assertFalse(guest_ui._descends_from(20, 10, processes))
 
+    def test_process_observation_retries_only_unstable_snapshots(self) -> None:
+        expected = object()
+        self.assertIs(
+            guest_ui._retryable_process_observation(lambda: expected), expected
+        )
+        for error in (
+            guest_ui.AttestationError("unstable process metadata"),
+            PermissionError("process changed during observation"),
+        ):
+            operation = mock.Mock(side_effect=error)
+            self.assertIsNone(guest_ui._retryable_process_observation(operation))
+        with self.assertRaises(guest_ui.SandboxFailure):
+            guest_ui._retryable_process_observation(
+                mock.Mock(side_effect=guest_ui.SandboxFailure("identity"))
+            )
+
     def test_pid_namespace_failure_path_returns_only_none(self) -> None:
         with mock.patch.object(guest_ui.os, "stat") as stat_result:
             stat_result.return_value.st_ino = 7
