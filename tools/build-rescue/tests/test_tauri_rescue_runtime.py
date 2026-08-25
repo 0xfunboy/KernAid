@@ -946,7 +946,13 @@ class RescueTauriBoundaryTests(unittest.TestCase):
             "-kbdconfig /usr/lib/kernaid/matchbox-kbdconfig", session
         )
         self.assertNotIn("=", keyboard_map)
-        self.assertIn("/usr/lib/kernaid/matchbox-kbdconfig", safety_hook)
+        self.assertEqual(
+            safety_hook.count("/usr/lib/kernaid/matchbox-kbdconfig"), 2
+        )
+        self.assertIn(
+            "unset MB_HUNG_APP_HANDLER MB_AGGRESSIVE_PING MB_SYNC SESSION_MANAGER",
+            session,
+        )
         self.assertNotIn("install -d", session)
         self.assertIn("stat -c '%u:%g:%a' \"$session_home\"", session)
         self.assertNotIn("xfce4-session", session)

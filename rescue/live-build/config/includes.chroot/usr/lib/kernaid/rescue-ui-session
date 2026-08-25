@@ -25,6 +25,7 @@ export DBUS_SESSION_BUS_ADDRESS=unix:path="$XDG_RUNTIME_DIR/no-session-bus"
 export DBUS_SYSTEM_BUS_ADDRESS=unix:path="$XDG_RUNTIME_DIR/no-system-bus"
 export GDK_BACKEND=x11
 export NO_AT_BRIDGE=1
+unset MB_HUNG_APP_HANDLER MB_AGGRESSIVE_PING MB_SYNC SESSION_MANAGER
 
 exec /usr/bin/matchbox-window-manager \
     -display :0 \
