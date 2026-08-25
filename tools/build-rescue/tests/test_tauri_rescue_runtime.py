@@ -523,6 +523,9 @@ class RescueTauriBoundaryTests(unittest.TestCase):
             )
         )
         self.assertTrue(session_ui._valid_xauthority_payload(payload))
+        with tempfile.TemporaryFile() as empty:
+            self.assertEqual(session_ui._read_all(empty.fileno()), b"")
+        self.assertFalse(session_ui._valid_xauthority_payload(b""))
         self.assertFalse(session_ui._valid_xauthority_payload(payload[:-1]))
         self.assertFalse(
             session_ui._valid_xauthority_payload(

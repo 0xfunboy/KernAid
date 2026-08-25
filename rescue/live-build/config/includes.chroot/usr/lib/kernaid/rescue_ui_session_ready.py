@@ -154,7 +154,7 @@ def _read_all(descriptor: int) -> bytes:
         if not block:
             break
         payload.extend(block)
-    if not 0 < len(payload) <= MAX_FILE_BYTES:
+    if len(payload) > MAX_FILE_BYTES:
         raise SessionError
     return bytes(payload)
 
@@ -245,7 +245,7 @@ def _xauthority_ready(account: pwd.struct_passwd) -> bool:
             or metadata.st_gid != account.pw_gid
             or metadata.st_nlink != 1
             or stat.S_IMODE(metadata.st_mode) != 0o600
-            or not 0 < metadata.st_size <= MAX_FILE_BYTES
+            or metadata.st_size > MAX_FILE_BYTES
         ):
             raise SessionError
         return _valid_xauthority_payload(_read_all(authority))
