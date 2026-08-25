@@ -199,6 +199,16 @@ FORBIDDEN_DEVICE_NAME = re.compile(
 WINDOW_TITLE_PATTERN = "^KernAid Rescue$"
 DISPLAY = ":0"
 DISPLAY_ZERO = {b":0", b":0.0", b"unix:0", b"unix:0.0"}
+ATTESTED_ENVIRONMENT_NAMES = frozenset(
+    {
+        b"DISPLAY",
+        b"XAUTHORITY",
+        b"XDG_RUNTIME_DIR",
+        b"HOME",
+        b"DBUS_SESSION_BUS_ADDRESS",
+        b"DBUS_SYSTEM_BUS_ADDRESS",
+    }
+)
 MAX_PROCESS_FILE_BYTES = 64 * 1024
 MAX_PROCESSES = 4096
 MAX_PRIVATE_PROCESSES = 32
@@ -294,11 +304,19 @@ def _status_values(payload: bytes, prefix: bytes, count: int | None) -> tuple[in
 
 
 def _environment(payload: bytes) -> dict[bytes, bytes]:
+    """Extract only values used by the attestation contract.
+
+    A process may legally carry duplicate or non-key/value entries inherited
+    from unrelated launchers. They cannot affect this gate. Duplicate names
+    that the gate actually consumes remain ambiguous and fail closed.
+    """
     values: dict[bytes, bytes] = {}
     for item in payload.rstrip(b"\0").split(b"\0") if payload else ():
         if b"=" not in item:
-            raise AttestationError("process environment metadata was invalid")
+            continue
         name, value = item.split(b"=", 1)
+        if name not in ATTESTED_ENVIRONMENT_NAMES:
+            continue
         if name in values:
             raise AttestationError("process environment metadata was invalid")
         values[name] = value

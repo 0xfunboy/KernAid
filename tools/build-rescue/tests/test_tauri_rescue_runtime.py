@@ -551,6 +551,22 @@ class RescueTauriBoundaryTests(unittest.TestCase):
                 "process-metadata-access",
             )
 
+    def test_process_environment_extracts_only_attested_unique_names(self) -> None:
+        self.assertEqual(
+            guest_ui._environment(
+                b"PATH=/bin\0PATH=/usr/bin\0malformed\0DISPLAY=:0\0"
+                b"XAUTHORITY=/run/lightdm/kernaid-rescue-ui/xauthority\0"
+            ),
+            {
+                b"DISPLAY": b":0",
+                b"XAUTHORITY": (
+                    b"/run/lightdm/kernaid-rescue-ui/xauthority"
+                ),
+            },
+        )
+        with self.assertRaises(guest_ui.AttestationError):
+            guest_ui._environment(b"DISPLAY=:0\0DISPLAY=:0.0\0")
+
     def test_pid_namespace_failure_path_returns_only_none(self) -> None:
         with mock.patch.object(guest_ui.os, "stat") as stat_result:
             stat_result.return_value.st_ino = 7
