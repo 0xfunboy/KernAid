@@ -255,6 +255,22 @@ class TauriFramebufferTests(unittest.TestCase):
 
 
 class RescueTauriBoundaryTests(unittest.TestCase):
+    def test_session_timeout_reports_the_complete_fixed_pending_set(self) -> None:
+        for states, expected in (
+            ((True, True, True), None),
+            ((False, True, True), "wait-xauthority"),
+            ((True, False, True), "wait-runtime"),
+            ((True, True, False), "wait-process"),
+            ((False, False, True), "wait-xauthority-runtime"),
+            ((False, True, False), "wait-xauthority-process"),
+            ((True, False, False), "wait-runtime-process"),
+            ((False, False, False), "wait-xauthority-runtime-process"),
+        ):
+            with self.subTest(states=states):
+                self.assertEqual(session_ui._pending_stage(*states), expected)
+                if expected is not None:
+                    self.assertIn(expected, session_ui.SESSION_FAILURE_STAGES)
+
     def test_session_gate_retries_only_the_nonfinal_ui_executable(self) -> None:
         account = mock.Mock(pw_uid=991, pw_gid=991)
         valid_status = (

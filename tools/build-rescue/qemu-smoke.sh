@@ -576,14 +576,14 @@ terminate_qemu_bounded() {
 
 rescue_not_ready_observed() {
   LC_ALL=C grep -aq '^KERNAID_RESCUE_NOT_READY:' "$log" \
-    || LC_ALL=C grep -aqE 'KERNAID_RESCUE_UI_SESSION_FAILURE_V1 stage=(account|user-runtime-mask|xauthority|runtime|process|timeout|internal)[[:space:]]*$' "$log"
+    || LC_ALL=C grep -aqE 'KERNAID_RESCUE_UI_SESSION_FAILURE_V1 stage=(account|user-runtime-mask|xauthority|runtime|process|timeout|wait-(xauthority|runtime|process|xauthority-runtime|xauthority-process|runtime-process|xauthority-runtime-process)|internal)[[:space:]]*$' "$log"
 }
 
 report_tauri_sandbox_failure() {
   local marker network_probe_marker sandbox_marker session_marker
   session_marker="$(
     LC_ALL=C tr -d '\r' <"$log" \
-      | grep -aoE 'KERNAID_RESCUE_UI_SESSION_FAILURE_V1 stage=(account|user-runtime-mask|xauthority|runtime|process|timeout|internal)$' \
+      | grep -aoE 'KERNAID_RESCUE_UI_SESSION_FAILURE_V1 stage=(account|user-runtime-mask|xauthority|runtime|process|timeout|wait-(xauthority|runtime|process|xauthority-runtime|xauthority-process|runtime-process|xauthority-runtime-process)|internal)$' \
       | tail -n 1 \
       || true
   )"

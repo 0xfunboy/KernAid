@@ -49,6 +49,13 @@ SESSION_FAILURE_STAGES = frozenset(
         "runtime",
         "process",
         "timeout",
+        "wait-xauthority",
+        "wait-runtime",
+        "wait-process",
+        "wait-xauthority-runtime",
+        "wait-xauthority-process",
+        "wait-runtime-process",
+        "wait-xauthority-runtime-process",
         "internal",
     }
 )
@@ -69,6 +76,21 @@ def _at_stage(stage: str, operation):
         return operation()
     except (KeyError, OSError, SessionError) as error:
         raise SessionError(stage) from error
+
+
+def _pending_stage(
+    xauthority_ready: bool, runtime_ready: bool, process_ready: bool
+) -> str | None:
+    pending = tuple(
+        name
+        for name, ready in (
+            ("xauthority", xauthority_ready),
+            ("runtime", runtime_ready),
+            ("process", process_ready),
+        )
+        if not ready
+    )
+    return None if not pending else f"wait-{'-'.join(pending)}"
 
 
 def _bounded_file(path: str) -> bytes:
@@ -396,15 +418,17 @@ def attest() -> None:
     account = _at_stage("account", _account)
     _at_stage("user-runtime-mask", lambda: _prepare_masked_user_runtime(account))
     deadline = time.monotonic() + READY_TIMEOUT_SECONDS
+    pending_stage = "wait-xauthority-runtime-process"
     while time.monotonic() < deadline:
-        if (
-            _at_stage("xauthority", lambda: _xauthority_ready(account))
-            and _at_stage("runtime", lambda: _runtime_ready(account))
-            and _at_stage("process", lambda: _session_process_ready(account))
-        ):
+        pending_stage = _pending_stage(
+            _at_stage("xauthority", lambda: _xauthority_ready(account)),
+            _at_stage("runtime", lambda: _runtime_ready(account)),
+            _at_stage("process", lambda: _session_process_ready(account)),
+        )
+        if pending_stage is None:
             return
         time.sleep(0.5)
-    raise SessionError("timeout")
+    raise SessionError(pending_stage)
 
 
 def main() -> int:
