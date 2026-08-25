@@ -929,6 +929,7 @@ class RescueTauriBoundaryTests(unittest.TestCase):
         self.assertEqual(guest_ui.UI_HOME, ui_home)
         self.assertIn("autologin-user=kernaid-rescue-ui", lightdm)
         self.assertIn("autologin-session=kernaid-rescue-ui", lightdm)
+        self.assertIn("run-directory=/run/lightdm", lightdm)
         self.assertIn(
             "xserver-command=X -extension DRI2 -extension DRI3 -extension XTEST",
             lightdm,
