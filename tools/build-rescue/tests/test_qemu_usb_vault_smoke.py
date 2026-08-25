@@ -482,6 +482,13 @@ class QemuUsbVaultSmokeTests(unittest.TestCase):
         self.assertIn("termination was not confirmed", cleanup)
         self.assertIn("qemu_cleanup_safe", cleanup)
         self.assertIn("qemu_process_status", boot)
+        self.assertEqual(
+            boot.count(
+                '-fw_cfg "name=opt/kernaid-tauri-sandbox-probe,string=v1"'
+            ),
+            1,
+        )
+        self.assertNotIn("opt/kernaid-offline-inspection", boot)
 
     def test_profile_helper_rejects_a_misbound_dm_slave(self) -> None:
         scan = mock.MagicMock()

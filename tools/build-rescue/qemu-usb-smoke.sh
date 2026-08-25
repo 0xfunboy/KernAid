@@ -1044,6 +1044,7 @@ run_boot() {
     -drive "if=none,id=kernaid_rescue_usb,file=$rescue_media,format=raw,cache=none,aio=threads"
     -device "usb-storage,bus=kernaid_xhci.0,drive=kernaid_rescue_usb,bootindex=1"
     -drive "file=$target_image,if=virtio,format=raw,cache=none,aio=threads"
+    -fw_cfg "name=opt/kernaid-tauri-sandbox-probe,string=v1"
     -display none
     -serial stdio
     -no-reboot
