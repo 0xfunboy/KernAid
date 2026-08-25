@@ -17,31 +17,12 @@ UI_HOME = f"{UI_RUNTIME}/home"
 XAUTHORITY = "/run/lightdm/kernaid-rescue-ui/xauthority"
 WINDOW_MANAGER_PATH = "/usr/bin/matchbox-window-manager"
 DISPLAY = b":0"
-DISPLAY_ZERO = {b":0", b":0.0", b"unix:0", b"unix:0.0"}
 MAX_FILE_BYTES = 64 * 1024
 MAX_PROCESSES = 4096
 # QEMU's TCG BIOS path can spend most of systemd's historical 90-second
 # default start timeout bringing up Xorg and LightDM.  Keep this gate bounded,
 # but give the real graphical session (rather than runner speed) the deadline.
 READY_TIMEOUT_SECONDS = 240
-PRIVILEGED_GROUPS = (
-    "kernaid-vault",
-    "kernaid-provider-client",
-    "kernaid-codex-client",
-    "kernaid-codex",
-)
-FORBIDDEN_UI_PROCESS_NAMES = {
-    "chrome",
-    "chromium",
-    "chromium-browser",
-    "lightdm-gtk-greeter",
-    "slick-greeter",
-    "xterm",
-    "xfwm4",
-    "xfce4-appfinder",
-    "xfce4-panel",
-    "xfce4-terminal",
-}
 SESSION_FAILURE_STAGES = frozenset(
     {
         "account",
@@ -352,8 +333,6 @@ def _process_identity(
 
 
 def _session_process_ready(account: pwd.struct_passwd) -> bool:
-    privileged_gids = {grp.getgrnam(name).gr_gid for name in PRIVILEGED_GROUPS}
-    lightdm_uid = pwd.getpwnam("lightdm").pw_uid
     numeric_entries = 0
     window_managers = 0
     with os.scandir("/proc") as entries:
@@ -365,33 +344,18 @@ def _session_process_ready(account: pwd.struct_passwd) -> bool:
                 raise SessionError
             pid = int(entry.name)
             try:
-                identity = _process_identity(pid)
+                executable = os.readlink(f"/proc/{pid}/exe")
             except (FileNotFoundError, ProcessLookupError):
                 continue
-            except (OSError, SessionError):
-                # /proc status and exe are not an atomic snapshot while a
-                # process exits or changes credentials. An unreadable sample
-                # cannot authorize readiness; retry the complete bounded scan.
-                return False
-            uids, gids, groups, executable = identity
-            executable_name = os.path.basename(executable).lower()
-            if executable_name in FORBIDDEN_UI_PROCESS_NAMES:
-                # LightDM may briefly own a greeter while the fixed autologin
-                # session is being handed over.  This is not a success state,
-                # but it is a readiness observation rather than an immediate
-                # permanent failure.  A persistent greeter still fails closed
-                # at the bounded deadline and the final root attestor repeats
-                # the process-tree exclusion before Rescue can become ready.
-                return False
-            if (
-                account.pw_uid not in uids
-                and 1000 not in uids
-                and lightdm_uid not in uids
-                and not privileged_gids.intersection(groups | set(gids))
-                and executable_name not in {"lightdm", "xorg"}
-            ):
+            except OSError:
+                # A disappearing or protected unrelated process must not hide
+                # the fixed session executable. The final root attestor scans
+                # the complete process tree before Rescue can become ready.
+                continue
+            if executable != WINDOW_MANAGER_PATH:
                 continue
             try:
+                identity = _process_identity(pid)
                 environment = _environment(pid)
                 stable_identity = _process_identity(pid)
             except (FileNotFoundError, ProcessLookupError):
@@ -400,28 +364,14 @@ def _session_process_ready(account: pwd.struct_passwd) -> bool:
                 return False
             if stable_identity != identity:
                 return False
-            display_access = (
-                environment.get(b"DISPLAY") in DISPLAY_ZERO
-                or environment.get(b"XAUTHORITY") == XAUTHORITY.encode("ascii")
-            )
-            if display_access and account.pw_uid not in uids:
-                raise SessionError("process-foreign-display")
-            if account.pw_uid not in uids:
-                continue
+            uids, gids, groups, stable_executable = identity
             if (
-                uids != (account.pw_uid,) * 4
+                stable_executable != WINDOW_MANAGER_PATH
+                or uids != (account.pw_uid,) * 4
                 or gids != (account.pw_gid,) * 4
                 or not groups.issubset({account.pw_gid})
             ):
                 raise SessionError("process-identity")
-            # LightDM executes the fixed wrapper and session scripts through
-            # dash before the process becomes Matchbox. Seeing that non-final
-            # UI-owned process is a retryable readiness observation: it can
-            # never produce success, and a persistent process still reaches
-            # the bounded timeout. Once Matchbox exists, every identity and
-            # environment mismatch remains an immediate hard failure.
-            if executable != WINDOW_MANAGER_PATH:
-                return False
             if (
                 environment.get(b"DISPLAY") != DISPLAY
                 or environment.get(b"XAUTHORITY") != XAUTHORITY.encode("ascii")

@@ -297,12 +297,6 @@ class RescueTauriBoundaryTests(unittest.TestCase):
 
         def observe(executable: str, status: bytes, environment: dict[bytes, bytes]):
             with (
-                mock.patch.object(session_ui, "PRIVILEGED_GROUPS", ()),
-                mock.patch.object(
-                    session_ui.pwd,
-                    "getpwnam",
-                    return_value=mock.Mock(pw_uid=111),
-                ),
                 mock.patch.object(session_ui.os, "scandir", return_value=scanner),
                 mock.patch.object(session_ui, "_bounded_file", return_value=status),
                 mock.patch.object(session_ui.os, "readlink", return_value=executable),
@@ -313,6 +307,35 @@ class RescueTauriBoundaryTests(unittest.TestCase):
                 return session_ui._session_process_ready(account)
 
         self.assertFalse(observe("/usr/bin/dash", valid_status, final_environment))
+        self.assertTrue(
+            observe(
+                session_ui.WINDOW_MANAGER_PATH,
+                valid_status,
+                final_environment,
+            )
+        )
+        handoff_scanner = mock.MagicMock()
+        handoff_entries = [mock.Mock(), mock.Mock()]
+        handoff_entries[0].name = "40"
+        handoff_entries[1].name = "41"
+        handoff_scanner.__enter__.return_value = handoff_entries
+
+        def handoff_executable(path: str) -> str:
+            return (
+                "/usr/bin/dash"
+                if path == "/proc/40/exe"
+                else session_ui.WINDOW_MANAGER_PATH
+            )
+
+        with (
+            mock.patch.object(session_ui.os, "scandir", return_value=handoff_scanner),
+            mock.patch.object(session_ui, "_bounded_file", return_value=valid_status),
+            mock.patch.object(session_ui.os, "readlink", side_effect=handoff_executable),
+            mock.patch.object(
+                session_ui, "_environment", return_value=final_environment
+            ),
+        ):
+            self.assertTrue(session_ui._session_process_ready(account))
         with self.assertRaises(session_ui.SessionError) as environment_error:
             observe(
                 session_ui.WINDOW_MANAGER_PATH,
@@ -322,7 +345,7 @@ class RescueTauriBoundaryTests(unittest.TestCase):
         self.assertEqual(environment_error.exception.stage, "process-environment")
         with self.assertRaises(session_ui.SessionError) as identity_error:
             observe(
-                "/usr/bin/dash",
+                session_ui.WINDOW_MANAGER_PATH,
                 valid_status.replace(b"Groups:\t991", b"Groups:\t992"),
                 final_environment,
             )
@@ -332,21 +355,15 @@ class RescueTauriBoundaryTests(unittest.TestCase):
             b"Gid:\t1000\t1000\t1000\t1000\n"
             b"Groups:\t1000\n"
         )
-        with self.assertRaises(session_ui.SessionError) as foreign_error:
+        self.assertFalse(
             observe(
                 "/usr/bin/sleep",
                 foreign_status,
                 {b"DISPLAY": session_ui.DISPLAY},
             )
-        self.assertEqual(foreign_error.exception.stage, "process-foreign-display")
+        )
 
         with (
-            mock.patch.object(session_ui, "PRIVILEGED_GROUPS", ()),
-            mock.patch.object(
-                session_ui.pwd,
-                "getpwnam",
-                return_value=mock.Mock(pw_uid=111),
-            ),
             mock.patch.object(session_ui.os, "scandir", return_value=scanner),
             mock.patch.object(
                 session_ui,
