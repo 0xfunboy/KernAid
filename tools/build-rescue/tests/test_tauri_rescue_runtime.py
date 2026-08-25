@@ -652,6 +652,16 @@ class RescueTauriBoundaryTests(unittest.TestCase):
             )
         )
 
+    def test_session_gate_retries_an_incomplete_xauthority_handoff(self) -> None:
+        account = mock.Mock()
+        with mock.patch.object(
+            session_ui,
+            "_xauthority_ready",
+            side_effect=[session_ui.SessionError("xauthority"), True],
+        ):
+            self.assertFalse(session_ui._xauthority_observation(account))
+            self.assertTrue(session_ui._xauthority_observation(account))
+
     def test_window_binds_inner_pid_one_not_systemd_host_pid(self) -> None:
         ui = mock.Mock()
         with mock.patch.object(

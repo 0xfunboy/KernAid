@@ -238,6 +238,18 @@ def _xauthority_ready(account: pwd.struct_passwd) -> bool:
             os.close(descriptor)
 
 
+def _xauthority_observation(account: pwd.struct_passwd) -> bool:
+    """Wait through LightDM's bounded handoff until the file is exact.
+
+    The final root attestor repeats the complete metadata and record check, so
+    a persistently unsafe authority can never authorize Rescue readiness.
+    """
+    try:
+        return _xauthority_ready(account)
+    except (OSError, SessionError):
+        return False
+
+
 def _runtime_ready(account: pwd.struct_passwd) -> bool:
     try:
         descriptor = os.open(
@@ -396,7 +408,7 @@ def attest() -> None:
     pending_stage = "wait-xauthority-runtime-process"
     while time.monotonic() < deadline:
         pending_stage = _pending_stage(
-            _at_stage("xauthority", lambda: _xauthority_ready(account)),
+            _xauthority_observation(account),
             _at_stage("runtime", lambda: _runtime_ready(account)),
             _at_stage("process", lambda: _session_process_ready(account)),
         )
