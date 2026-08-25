@@ -40,7 +40,7 @@
       </div>
 
       <div class="danger-note" role="note">
-        <strong>Non usare su USB fisica</strong>
+        <strong>Solo laboratorio controllato</strong>
         <p>{{warning}}</p>
       </div>
 
@@ -71,8 +71,8 @@
         <h2 id="verify-title">Verifica sempre prima dell'uso in laboratorio.</h2>
       </div>
       <div class="verify-commands">
-        <p>Linux</p><code>sha256sum -c KernAid-Rescue-amd64-preview.iso.sha256</code>
-        <p>Windows PowerShell</p><code>Get-FileHash .\KernAid-Rescue-amd64-preview.iso -Algorithm SHA256</code>
+        <p>Linux</p><code>sha256sum -c {{checksumName}}</code>
+        <p>Windows PowerShell</p><code>Get-FileHash .\{{downloadName}} -Algorithm SHA256</code>
       </div>
     </section>
   </main>

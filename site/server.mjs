@@ -20,6 +20,7 @@ const maxFailedLoginKeys = 2048;
 
 const content = loadContent(path.join(root, "content.json"));
 const password = readSecret(authFile);
+const configuredArtifact = loadArtifactSnapshot();
 const publicFiles = new Map([
   ["/", loadPublicFile("index.html", "text/html; charset=utf-8")],
   ["/index.html", loadPublicFile("index.html", "text/html; charset=utf-8")],
@@ -40,9 +41,36 @@ function parsePort(value) {
 }
 
 function readSecret(filePath) {
+  const stat = fs.lstatSync(filePath);
+  assertOwnerOnlyFile(filePath, stat);
   const value = fs.readFileSync(filePath, "utf8").trim();
   if (!value) throw new Error(`Authentication file is empty: ${filePath}`);
   return value;
+}
+
+function assertOwnerOnlyFile(filePath, stat) {
+  if (!stat.isFile() || stat.isSymbolicLink()) {
+    throw new Error(`Expected a regular non-symlink file: ${filePath}`);
+  }
+  if (typeof process.getuid === "function" && stat.uid !== process.getuid()) {
+    throw new Error(`File is not owned by the service user: ${filePath}`);
+  }
+  if ((stat.mode & 0o077) !== 0) {
+    throw new Error(`File must not be accessible by group or others: ${filePath}`);
+  }
+}
+
+function assertOwnerOnlyDirectory(directoryPath) {
+  const stat = fs.lstatSync(directoryPath);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw new Error(`Expected a non-symlink directory: ${directoryPath}`);
+  }
+  if (typeof process.getuid === "function" && stat.uid !== process.getuid()) {
+    throw new Error(`Directory is not owned by the service user: ${directoryPath}`);
+  }
+  if ((stat.mode & 0o077) !== 0) {
+    throw new Error(`Directory must not be accessible by group or others: ${directoryPath}`);
+  }
 }
 
 function loadContent(filePath) {
@@ -239,20 +267,56 @@ function renderLogin(error = "") {
   });
 }
 
-function readArtifact() {
+function loadArtifactSnapshot() {
   if (!isoPath || !isoSha256Path) {
-    throw new Error("KAID_ISO_PATH is not configured");
+    return { artifact: null, error: new Error("KAID_ISO_PATH is not configured") };
   }
-  const stat = fs.statSync(isoPath);
-  if (!stat.isFile() || stat.size < 1) throw new Error("Configured ISO is not a non-empty regular file");
-  const checksumText = fs.readFileSync(isoSha256Path, "utf8");
-  const match = /^([a-fA-F0-9]{64})(?:\s+[*]?.+)?$/m.exec(checksumText);
-  if (!match) throw new Error("Configured checksum file does not contain a SHA-256 value");
-  return {
-    bytes: stat.size,
-    hash: match[1].toLowerCase(),
-    modified: stat.mtime.toISOString(),
-  };
+  let fd;
+  try {
+    assertOwnerOnlyDirectory(path.dirname(isoPath));
+    assertOwnerOnlyFile(isoSha256Path, fs.lstatSync(isoSha256Path));
+    const checksumText = fs.readFileSync(isoSha256Path, "utf8");
+    const match = /^([a-fA-F0-9]{64})(?:\s+[*]?.+)?$/m.exec(checksumText);
+    if (!match) throw new Error("Configured checksum file does not contain a SHA-256 value");
+
+    fd = fs.openSync(isoPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    const stat = fs.fstatSync(fd);
+    assertOwnerOnlyFile(isoPath, stat);
+    if (stat.size < 1) throw new Error("Configured ISO is empty");
+
+    const hash = crypto.createHash("sha256");
+    const buffer = Buffer.allocUnsafe(4 * 1024 * 1024);
+    let position = 0;
+    while (position < stat.size) {
+      const bytesRead = fs.readSync(fd, buffer, 0, Math.min(buffer.length, stat.size - position), position);
+      if (bytesRead < 1) throw new Error("Configured ISO ended before its declared size");
+      hash.update(buffer.subarray(0, bytesRead));
+      position += bytesRead;
+    }
+    const actualHash = hash.digest("hex");
+    const expectedHash = match[1].toLowerCase();
+    if (!safeEqual(actualHash, expectedHash)) {
+      throw new Error("Configured ISO does not match its SHA-256 sidecar");
+    }
+    return {
+      artifact: Object.freeze({
+        bytes: stat.size,
+        fd,
+        hash: actualHash,
+        modified: stat.mtime.toISOString(),
+      }),
+      error: null,
+    };
+  } catch (error) {
+    if (fd !== undefined) fs.closeSync(fd);
+    console.error(`KernAid artifact unavailable: ${error.message}`);
+    return { artifact: null, error };
+  }
+}
+
+function readArtifact() {
+  if (!configuredArtifact.artifact) throw configuredArtifact.error;
+  return configuredArtifact.artifact;
 }
 
 function formatBytes(bytes) {
@@ -268,7 +332,7 @@ function formatDate(isoDate) {
 
 function renderPrivate() {
   let artifact;
-  let artifactState = "Disponibile";
+  let artifactState = "File scaricabile";
   let stateClass = "status-ready";
   try {
     artifact = readArtifact();
@@ -283,6 +347,7 @@ function renderPrivate() {
     artifactState,
     artifactVersion: escapeHtml(release.artifactVersion),
     channel: escapeHtml(release.channel),
+    checksumName: escapeHtml(release.checksumName),
     downloadName: escapeHtml(release.downloadName),
     hash: escapeHtml(artifact.hash),
     modified: artifact.bytes ? escapeHtml(formatDate(artifact.modified)) : "Non disponibile",
@@ -355,7 +420,12 @@ function serveIso(req, res) {
     res.end();
     return;
   }
-  const stream = fs.createReadStream(isoPath, { start, end });
+  const stream = fs.createReadStream(isoPath, {
+    autoClose: false,
+    fd: artifact.fd,
+    start,
+    end,
+  });
   stream.on("error", () => res.destroy());
   stream.pipe(res);
 }
@@ -500,5 +570,8 @@ const server = http.createServer((req, res) => {
 
 server.listen(port, host, () => console.log(`KernAid project site listening on http://${host}:${port}`));
 for (const signal of ["SIGINT", "SIGTERM"]) {
-  process.on(signal, () => server.close(() => process.exit(0)));
+  process.on(signal, () => server.close(() => {
+    if (configuredArtifact.artifact) fs.closeSync(configuredArtifact.artifact.fd);
+    process.exit(0);
+  }));
 }

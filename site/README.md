@@ -43,12 +43,15 @@ The authentication file must contain one non-empty password. Keep it and any
 Cloudflare tunnel credentials outside the repository with owner-only
 permissions. The server reads the password once at startup and never logs it.
 
-The ISO is not loaded into memory. Its size and modification time come from
-`stat`; the expected SHA-256 comes from the configured sidecar. The server reads
-these values when rendering the private page and when starting a download, so
-replacing an artifact does not require editing HTML. It does not hash the full
-ISO on every request: operators and users must verify the downloaded file using
-the sidecar.
+The ISO is not loaded into memory. At process start the server opens it without
+following a final symlink, verifies owner-only permissions, hashes every byte
+against the configured sidecar and keeps that exact file descriptor pinned for
+downloads. A mismatch leaves the artifact unavailable. Operators and users
+must still verify the downloaded file using the sidecar.
+
+Keep the private artifact directory owner-only (`0700`) and the ISO, checksum
+and metadata files owner-readable only (`0600`). Web authentication is not a
+substitute for local filesystem permissions.
 
 ## Content and artifact updates
 
@@ -59,6 +62,10 @@ candidate changes, update together:
 2. workflow URL;
 3. qualification statement and warning;
 4. configured ISO and matching checksum sidecar.
+
+`content.json` and the verified artifact snapshot are loaded once at process
+start, so restart `kaid-site.service` after changing release metadata or the
+configured artifact path.
 
 Do not soften the warning based only on the existence of a workflow artifact.
 For the current `b843178` candidate, BIOS/UEFI QEMU smoke evidence exists, but
