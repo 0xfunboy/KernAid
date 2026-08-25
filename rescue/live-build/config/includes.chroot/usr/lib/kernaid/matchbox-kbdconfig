@@ -1,0 +1,2 @@
+# Intentionally empty: the Rescue kiosk session exposes no window-manager
+# shortcut that can launch another application or close the shipping UI.

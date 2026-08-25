@@ -15,7 +15,7 @@ UI_SHELL = "/usr/sbin/nologin"
 UI_RUNTIME = "/run/kernaid-rescue-ui-session"
 UI_HOME = f"{UI_RUNTIME}/home"
 XAUTHORITY = "/run/lightdm/kernaid-rescue-ui/xauthority"
-XFWM_PATH = "/usr/bin/xfwm4"
+WINDOW_MANAGER_PATH = "/usr/bin/matchbox-window-manager"
 DISPLAY = b":0"
 DISPLAY_ZERO = {b":0", b":0.0", b"unix:0", b"unix:0.0"}
 MAX_FILE_BYTES = 64 * 1024
@@ -37,6 +37,7 @@ FORBIDDEN_UI_PROCESS_NAMES = {
     "lightdm-gtk-greeter",
     "slick-greeter",
     "xterm",
+    "xfwm4",
     "xfce4-appfinder",
     "xfce4-panel",
     "xfce4-terminal",
@@ -354,7 +355,7 @@ def _session_process_ready(account: pwd.struct_passwd) -> bool:
     privileged_gids = {grp.getgrnam(name).gr_gid for name in PRIVILEGED_GROUPS}
     lightdm_uid = pwd.getpwnam("lightdm").pw_uid
     numeric_entries = 0
-    xfwm = 0
+    window_managers = 0
     with os.scandir("/proc") as entries:
         for entry in entries:
             if not entry.name.isascii() or not entry.name.isdecimal():
@@ -414,12 +415,12 @@ def _session_process_ready(account: pwd.struct_passwd) -> bool:
             ):
                 raise SessionError("process-identity")
             # LightDM executes the fixed wrapper and session scripts through
-            # dash before the process becomes xfwm4.  Seeing that non-final
+            # dash before the process becomes Matchbox. Seeing that non-final
             # UI-owned process is a retryable readiness observation: it can
             # never produce success, and a persistent process still reaches
-            # the bounded timeout.  Once xfwm4 exists, every identity and
+            # the bounded timeout. Once Matchbox exists, every identity and
             # environment mismatch remains an immediate hard failure.
-            if executable != XFWM_PATH:
+            if executable != WINDOW_MANAGER_PATH:
                 return False
             if (
                 environment.get(b"DISPLAY") != DISPLAY
@@ -432,10 +433,10 @@ def _session_process_ready(account: pwd.struct_passwd) -> bool:
                 != f"unix:path={UI_RUNTIME}/no-system-bus".encode("ascii")
             ):
                 raise SessionError("process-environment")
-            xfwm += 1
-    if xfwm > 1:
+            window_managers += 1
+    if window_managers > 1:
         raise SessionError("process-multiple")
-    return xfwm == 1
+    return window_managers == 1
 
 
 def attest() -> None:

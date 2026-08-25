@@ -315,7 +315,7 @@ class RescueTauriBoundaryTests(unittest.TestCase):
         self.assertFalse(observe("/usr/bin/dash", valid_status, final_environment))
         with self.assertRaises(session_ui.SessionError) as environment_error:
             observe(
-                session_ui.XFWM_PATH,
+                session_ui.WINDOW_MANAGER_PATH,
                 valid_status,
                 final_environment | {b"XDG_RUNTIME_DIR": b"/run/user/991"},
             )
@@ -711,7 +711,8 @@ class RescueTauriBoundaryTests(unittest.TestCase):
         self.assertIn("kernaid-rescue-desk-shell.service", ready_service)
         self.assertIn("libwebkit2gtk-4.1-0", packages)
         self.assertIn("xdotool", packages)
-        self.assertIn("xfwm4", packages)
+        self.assertIn("matchbox-window-manager", packages)
+        self.assertNotIn("xfwm4", packages)
         self.assertIn("xserver-xorg", packages)
         self.assertNotIn("xorg", packages)
         self.assertNotIn("xfce4", packages)
@@ -904,6 +905,9 @@ class RescueTauriBoundaryTests(unittest.TestCase):
         session = (root / "usr/lib/kernaid/rescue-ui-session").read_text(
             encoding="utf-8"
         )
+        keyboard_map = (root / "usr/lib/kernaid/matchbox-kbdconfig").read_text(
+            encoding="utf-8"
+        )
         attestor_unit = (
             root / "etc/systemd/system/kernaid-rescue-ui-session-ready.service"
         ).read_text(encoding="utf-8")
@@ -937,10 +941,16 @@ class RescueTauriBoundaryTests(unittest.TestCase):
         self.assertIn("allow-user-switching=false", lightdm)
         self.assertNotIn("common-session", pam)
         self.assertNotIn("pam_systemd", pam)
-        self.assertIn("exec /usr/bin/xfwm4", session)
+        self.assertIn("exec /usr/bin/matchbox-window-manager", session)
+        self.assertIn(
+            "-kbdconfig /usr/lib/kernaid/matchbox-kbdconfig", session
+        )
+        self.assertNotIn("=", keyboard_map)
+        self.assertIn("/usr/lib/kernaid/matchbox-kbdconfig", safety_hook)
         self.assertNotIn("install -d", session)
         self.assertIn("stat -c '%u:%g:%a' \"$session_home\"", session)
         self.assertNotIn("xfce4-session", session)
+        self.assertNotIn("xfwm4", session)
         self.assertIn("no-session-bus", session)
         self.assertIn("no-system-bus", session)
         self.assertIn(

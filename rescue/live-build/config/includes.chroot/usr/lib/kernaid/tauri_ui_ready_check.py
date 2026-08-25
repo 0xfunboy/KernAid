@@ -23,7 +23,7 @@ from typing import NamedTuple
 SHELL_UNIT = "kernaid-rescue-desk-shell.service"
 SESSION_READY_UNIT = "kernaid-rescue-ui-session-ready.service"
 SHELL_PATH = "/usr/bin/kernaid-rescue-desk-shell"
-XFWM_PATH = "/usr/bin/xfwm4"
+WINDOW_MANAGER_PATH = "/usr/bin/matchbox-window-manager"
 XORG_PATH = "/usr/lib/xorg/Xorg"
 LIGHTDM_PATH = "/usr/sbin/lightdm"
 UI_ACCOUNT = "kernaid-rescue-ui"
@@ -110,6 +110,7 @@ FORBIDDEN_UI_PROCESS_NAMES = {
     "lightdm-gtk-greeter",
     "slick-greeter",
     "xterm",
+    "xfwm4",
     "xfce4-appfinder",
     "xfce4-panel",
     "xfce4-terminal",
@@ -385,15 +386,22 @@ def _shipping_process(
         for pid, identity in processes.items()
         if identity.executable == SHELL_PATH and identity.uids == ui_uids
     ]
-    xfwm = [
+    window_managers = [
         pid
         for pid, identity in processes.items()
-        if identity.executable == XFWM_PATH and identity.uids == ui_uids
+        if (
+            identity.executable == WINDOW_MANAGER_PATH
+            and identity.uids == ui_uids
+        )
     ]
-    if len(shells) != 1 or shells[0] != expected_main_pid or len(xfwm) != 1:
+    if (
+        len(shells) != 1
+        or shells[0] != expected_main_pid
+        or len(window_managers) != 1
+    ):
         return 0, 0, {}
     shell_pid = shells[0]
-    xfwm_pid = xfwm[0]
+    window_manager_pid = window_managers[0]
     renderer = False
     native_processes: dict[int, ProcessIdentity] = {}
     ui_processes = 0
@@ -403,7 +411,7 @@ def _shipping_process(
         ui_processes += 1
         if ui_processes > MAX_PRIVATE_PROCESSES + 1:
             raise SandboxFailure("process-tree")
-        if pid == xfwm_pid:
+        if pid == window_manager_pid:
             if (
                 identity.environment.get(b"DISPLAY") != DISPLAY.encode("ascii")
                 or identity.environment.get(b"XAUTHORITY")
@@ -438,7 +446,7 @@ def _shipping_process(
             raise SandboxFailure("session-bus")
         if identity.executable == f"{WEBKIT_ROOT}/WebKitWebProcess":
             renderer = True
-    return shell_pid, xfwm_pid, native_processes if renderer else {}
+    return shell_pid, window_manager_pid, native_processes if renderer else {}
 
 
 def _safe_native_character_device(metadata: os.stat_result) -> bool:
@@ -494,13 +502,15 @@ def _privileged_device_fds_absent(
         frozenset(),
         frozenset(
             os.path.basename(executable)
-            for executable in WEBKIT_EXECUTABLES | {SHELL_PATH, XFWM_PATH}
+            for executable in WEBKIT_EXECUTABLES
+            | {SHELL_PATH, WINDOW_MANAGER_PATH}
         ),
     )
     rebound_native = {
         pid: identity
         for pid, identity in rebound_processes.items()
-        if ui.pw_uid in identity.uids and identity.executable != XFWM_PATH
+        if ui.pw_uid in identity.uids
+        and identity.executable != WINDOW_MANAGER_PATH
     }
     if rebound_native != native_processes:
         return None
@@ -1074,7 +1084,9 @@ def _path_absent(path: str) -> bool:
     return False
 
 
-def _private_pid_namespace_aliases(shell_pid: int, xfwm_pid: int) -> list[str] | None:
+def _private_pid_namespace_aliases(
+    shell_pid: int, window_manager_pid: int
+) -> list[str] | None:
     try:
         if os.stat(f"/proc/{shell_pid}/ns/pid").st_ino == os.stat("/proc/1/ns/pid").st_ino:
             return None
@@ -1091,7 +1103,7 @@ def _private_pid_namespace_aliases(shell_pid: int, xfwm_pid: int) -> list[str] |
         ]
         if not 2 <= len(entries) <= MAX_PRIVATE_PROCESSES or "1" not in entries:
             return None
-        if os.path.lexists(f"{private_proc}/{xfwm_pid}"):
+        if os.path.lexists(f"{private_proc}/{window_manager_pid}"):
             return None
         return [f"/proc/{shell_pid}/root"] + [
             f"{private_proc}/{inner_pid}/root" for inner_pid in entries
@@ -1294,7 +1306,9 @@ def attest() -> tuple[int, int, bool]:
             live.pw_uid, live.pw_gid, lambda: _open_denied(XAUTHORITY)
         ):
             raise SandboxFailure("xauthority")
-        shell_pid, xfwm_pid, native_processes = _shipping_process(ui, shell_pid)
+        shell_pid, window_manager_pid, native_processes = _shipping_process(
+            ui, shell_pid
+        )
         if not shell_pid:
             last_stage = "process-tree"
             time.sleep(0.5)
@@ -1310,7 +1324,7 @@ def attest() -> tuple[int, int, bool]:
             continue
         if not device_fds_ready:
             raise SandboxFailure("device-fds")
-        aliases = _private_pid_namespace_aliases(shell_pid, xfwm_pid)
+        aliases = _private_pid_namespace_aliases(shell_pid, window_manager_pid)
         if aliases is None:
             raise SandboxFailure("pidns")
         if not _proc_aliases_absent(shell_pid, aliases, ui):

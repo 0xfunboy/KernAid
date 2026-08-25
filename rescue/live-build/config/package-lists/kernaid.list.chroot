@@ -5,7 +5,7 @@ systemd-sysv
 linux-image-amd64
 grub-pc-bin
 grub-efi-amd64-bin
-xfwm4
+matchbox-window-manager
 xserver-xorg
 lightdm
 xauth

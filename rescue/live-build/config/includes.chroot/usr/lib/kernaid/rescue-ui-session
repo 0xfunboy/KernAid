@@ -26,4 +26,8 @@ export DBUS_SYSTEM_BUS_ADDRESS=unix:path="$XDG_RUNTIME_DIR/no-system-bus"
 export GDK_BACKEND=x11
 export NO_AT_BRIDGE=1
 
-exec /usr/bin/xfwm4 --compositor=off --display=:0
+exec /usr/bin/matchbox-window-manager \
+    -display :0 \
+    -use_titlebar no \
+    -use_desktop_mode plain \
+    -kbdconfig /usr/lib/kernaid/matchbox-kbdconfig

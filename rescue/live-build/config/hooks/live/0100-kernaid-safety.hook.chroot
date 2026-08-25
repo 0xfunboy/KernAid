@@ -19,6 +19,7 @@ chown root:root \
     /usr/lib/kernaid/ready-check \
     /usr/lib/kernaid/rescue_server.py \
     /usr/lib/kernaid/rescue_ui_session_ready.py \
+    /usr/lib/kernaid/matchbox-kbdconfig \
     /usr/lib/kernaid/tauri_network_probe.py \
     /usr/lib/kernaid/tauri_ui_ready_check.py
 chmod 0644 \
@@ -26,6 +27,7 @@ chmod 0644 \
     /usr/lib/kernaid/ready-check \
     /usr/lib/kernaid/rescue_server.py \
     /usr/lib/kernaid/rescue_ui_session_ready.py \
+    /usr/lib/kernaid/matchbox-kbdconfig \
     /usr/lib/kernaid/tauri_network_probe.py \
     /usr/lib/kernaid/tauri_ui_ready_check.py
 chown root:root \
