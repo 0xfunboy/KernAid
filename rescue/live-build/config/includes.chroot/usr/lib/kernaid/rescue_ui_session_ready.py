@@ -48,6 +48,10 @@ SESSION_FAILURE_STAGES = frozenset(
         "xauthority",
         "runtime",
         "process",
+        "process-environment",
+        "process-foreign-display",
+        "process-identity",
+        "process-multiple",
         "timeout",
         "wait-xauthority",
         "wait-runtime",
@@ -74,7 +78,11 @@ class SessionError(Exception):
 def _at_stage(stage: str, operation):
     try:
         return operation()
-    except (KeyError, OSError, SessionError) as error:
+    except SessionError as error:
+        if error.stage.startswith(f"{stage}-"):
+            raise
+        raise SessionError(stage) from error
+    except (KeyError, OSError) as error:
         raise SessionError(stage) from error
 
 
@@ -330,6 +338,18 @@ def _environment(pid: int) -> dict[bytes, bytes]:
     return values
 
 
+def _process_identity(
+    pid: int,
+) -> tuple[tuple[int, int, int, int], tuple[int, int, int, int], frozenset[int], str]:
+    status = _bounded_file(f"/proc/{pid}/status")
+    return (
+        _quad(status, b"Uid:\t"),
+        _quad(status, b"Gid:\t"),
+        frozenset(_groups(status)),
+        os.readlink(f"/proc/{pid}/exe"),
+    )
+
+
 def _session_process_ready(account: pwd.struct_passwd) -> bool:
     privileged_gids = {grp.getgrnam(name).gr_gid for name in PRIVILEGED_GROUPS}
     lightdm_uid = pwd.getpwnam("lightdm").pw_uid
@@ -344,16 +364,10 @@ def _session_process_ready(account: pwd.struct_passwd) -> bool:
                 raise SessionError
             pid = int(entry.name)
             try:
-                status = _bounded_file(f"/proc/{pid}/status")
-                uids = _quad(status, b"Uid:\t")
-                gids = _quad(status, b"Gid:\t")
-                groups = _groups(status)
+                identity = _process_identity(pid)
             except (FileNotFoundError, ProcessLookupError):
                 continue
-            try:
-                executable = os.readlink(f"/proc/{pid}/exe")
-            except (FileNotFoundError, ProcessLookupError):
-                continue
+            uids, gids, groups, executable = identity
             executable_name = os.path.basename(executable).lower()
             if executable_name in FORBIDDEN_UI_PROCESS_NAMES:
                 # LightDM may briefly own a greeter while the fixed autologin
@@ -373,14 +387,19 @@ def _session_process_ready(account: pwd.struct_passwd) -> bool:
                 continue
             try:
                 environment = _environment(pid)
+                stable_identity = _process_identity(pid)
             except (FileNotFoundError, ProcessLookupError):
                 continue
+            except PermissionError:
+                return False
+            if stable_identity != identity:
+                return False
             display_access = (
                 environment.get(b"DISPLAY") in DISPLAY_ZERO
                 or environment.get(b"XAUTHORITY") == XAUTHORITY.encode("ascii")
             )
             if display_access and account.pw_uid not in uids:
-                raise SessionError
+                raise SessionError("process-foreign-display")
             if account.pw_uid not in uids:
                 continue
             if (
@@ -388,7 +407,7 @@ def _session_process_ready(account: pwd.struct_passwd) -> bool:
                 or gids != (account.pw_gid,) * 4
                 or not groups.issubset({account.pw_gid})
             ):
-                raise SessionError
+                raise SessionError("process-identity")
             # LightDM executes the fixed wrapper and session scripts through
             # dash before the process becomes xfwm4.  Seeing that non-final
             # UI-owned process is a retryable readiness observation: it can
@@ -407,10 +426,10 @@ def _session_process_ready(account: pwd.struct_passwd) -> bool:
                 or environment.get(b"DBUS_SYSTEM_BUS_ADDRESS")
                 != f"unix:path={UI_RUNTIME}/no-system-bus".encode("ascii")
             ):
-                raise SessionError
+                raise SessionError("process-environment")
             xfwm += 1
     if xfwm > 1:
-        raise SessionError
+        raise SessionError("process-multiple")
     return xfwm == 1
 
 

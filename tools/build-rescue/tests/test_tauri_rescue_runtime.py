@@ -313,21 +313,40 @@ class RescueTauriBoundaryTests(unittest.TestCase):
                 return session_ui._session_process_ready(account)
 
         self.assertFalse(observe("/usr/bin/dash", valid_status, final_environment))
-        with self.assertRaises(session_ui.SessionError):
+        with self.assertRaises(session_ui.SessionError) as environment_error:
             observe(
                 session_ui.XFWM_PATH,
                 valid_status,
                 final_environment | {b"XDG_RUNTIME_DIR": b"/run/user/991"},
             )
-        with self.assertRaises(session_ui.SessionError):
+        self.assertEqual(environment_error.exception.stage, "process-environment")
+        with self.assertRaises(session_ui.SessionError) as identity_error:
             observe(
                 "/usr/bin/dash",
                 valid_status.replace(b"Groups:\t991", b"Groups:\t992"),
                 final_environment,
             )
+        self.assertEqual(identity_error.exception.stage, "process-identity")
+        foreign_status = (
+            b"Uid:\t1000\t1000\t1000\t1000\n"
+            b"Gid:\t1000\t1000\t1000\t1000\n"
+            b"Groups:\t1000\n"
+        )
+        with self.assertRaises(session_ui.SessionError) as foreign_error:
+            observe(
+                "/usr/bin/sleep",
+                foreign_status,
+                {b"DISPLAY": session_ui.DISPLAY},
+            )
+        self.assertEqual(foreign_error.exception.stage, "process-foreign-display")
 
     def test_session_failure_marker_exposes_only_an_allowlisted_stage(self) -> None:
-        for stage in ("process", "user-runtime-mask", "not-allowlisted"):
+        for stage in (
+            "process",
+            "process-foreign-display",
+            "user-runtime-mask",
+            "not-allowlisted",
+        ):
             with self.subTest(stage=stage):
                 output = io.StringIO()
                 with (

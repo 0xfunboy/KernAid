@@ -77,7 +77,7 @@ class QemuProcessLifecycleTests(unittest.TestCase):
             log.write_text(
                 "[   86.656583] python3[936]: "
                 "KERNAID_RESCUE_UI_SESSION_FAILURE_V1 "
-                "stage=wait-xauthority-process\n"
+                "stage=process-environment\n"
                 "untrusted diagnostic detail must not be reported\n",
                 encoding="utf-8",
             )
@@ -103,7 +103,7 @@ class QemuProcessLifecycleTests(unittest.TestCase):
         self.assertEqual(
             result.stderr,
             "KERNAID_RESCUE_UI_SESSION_FAILURE_V1 "
-            "stage=wait-xauthority-process\n",
+            "stage=process-environment\n",
         )
 
     def test_capture_failure_closes_start_gate_and_reaps_for_both_harnesses(
