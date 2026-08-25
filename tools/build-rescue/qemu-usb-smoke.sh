@@ -981,6 +981,21 @@ rescue_not_ready_observed() {
   LC_ALL=C grep -aq '^KERNAID_RESCUE_NOT_READY:' "$boot_log"
 }
 
+report_rescue_not_ready() {
+  local boot_log="$1"
+  local marker
+  marker="$(
+    LC_ALL=C tr -d '\r' <"$boot_log" \
+      | grep -aE '^KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=(http|x11|http-x11|socket-offline-inspector|socket-vault|socket-openai-executor|socket-openai-egress|socket-codex|system-bus|probe-mode|baseline|nonloopback|identity|pidns|session-bus|notify|window-startup|service|process-tree|process-count|process-forbidden|process-executable|process-ancestry|process-metadata-access|process-metadata-format|process-environ-access|process-environ-format|renderer|window|display|xauthority|run-view|devices|device-fds|proc-alias|endpoint-post)$' \
+      | tail -n 1 \
+      || true
+  )"
+  if [[ -n "$marker" ]]; then
+    printf '%s\n' "$marker" >&2
+  fi
+  echo "Rescue guest reported a not-ready marker" >&2
+}
+
 assert_boot_images_unchanged() {
   local boot="$1"
   local prefix_after
@@ -1080,14 +1095,14 @@ run_boot() {
       if ! stop_qemu; then
         return 1
       fi
-      echo "Rescue guest reported a not-ready marker" >&2
+      report_rescue_not_ready "$boot_log"
       return 1
     fi
     if grep -Fq "KERNAID_RESCUE_READY" "$boot_log" \
       && grep -Fq "KERNAID_RESCUE_TARGET_SELECTION_READY" "$boot_log"; then
       stop_qemu
       if rescue_not_ready_observed "$boot_log"; then
-        echo "Rescue guest reported a not-ready marker" >&2
+        report_rescue_not_ready "$boot_log"
         return 1
       fi
       {
@@ -1109,7 +1124,7 @@ run_boot() {
       }
       status="$qemu_last_status"
       if rescue_not_ready_observed "$boot_log"; then
-        echo "Rescue guest reported a not-ready marker" >&2
+        report_rescue_not_ready "$boot_log"
         return 1
       fi
       {
@@ -1129,7 +1144,7 @@ run_boot() {
 
   stop_qemu
   if rescue_not_ready_observed "$boot_log"; then
-    echo "Rescue guest reported a not-ready marker" >&2
+    report_rescue_not_ready "$boot_log"
     return 1
   fi
   {

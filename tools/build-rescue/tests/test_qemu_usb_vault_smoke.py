@@ -367,6 +367,7 @@ def observe_term(_signal, _frame):
 
 signal.signal(signal.SIGTERM, observe_term)
 if os.environ.get("KERNAID_MOCK_QEMU_NOT_READY") == "1":
+    print("KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=process-tree", flush=True)
     print("KERNAID_RESCUE_NOT_READY: private-reason=must-not-escape", flush=True)
 print("KERNAID_RESCUE_READY", flush=True)
 print("KERNAID_RESCUE_TARGET_SELECTION_READY", flush=True)
@@ -604,6 +605,10 @@ class QemuUsbVaultSmokeTests(unittest.TestCase):
         qemu_pid = int((state / "qemu-pid").read_text(encoding="utf-8"))
         self.assertFalse(Path(f"/proc/{qemu_pid}").exists())
         combined_output = result.stdout + result.stderr
+        self.assertIn(
+            "KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=process-tree",
+            result.stderr,
+        )
         self.assertIn("Rescue guest reported a not-ready marker", result.stderr)
         self.assertNotIn("KERNAID_RESCUE_NOT_READY:", combined_output)
         self.assertNotIn("private-reason=must-not-escape", combined_output)
