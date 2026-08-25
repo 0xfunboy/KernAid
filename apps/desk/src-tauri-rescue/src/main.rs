@@ -35,7 +35,7 @@ const PROBE_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_PROBE_RESPONSE_BYTES: usize = 16 * 1024;
 const X11_SOCKET_PATH: &str = "/tmp/.X11-unix/X0";
 const UI_ACCOUNT: &str = "kernaid-rescue-ui";
-const UI_HOME: &str = "/nonexistent";
+const UI_HOME: &str = "/run/kernaid-rescue-ui-session/home";
 const UI_SHELL: &str = "/usr/sbin/nologin";
 const UI_XAUTHORITY: &str = "/run/lightdm/kernaid-rescue-ui/xauthority";
 const FAKE_SESSION_BUS: &str = "unix:path=/run/kernaid-rescue-desk-shell/no-session-bus";

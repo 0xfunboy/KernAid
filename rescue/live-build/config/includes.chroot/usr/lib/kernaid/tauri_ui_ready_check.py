@@ -731,11 +731,12 @@ def _systemctl_show(unit: str, properties: tuple[str, ...]) -> dict[str, str] | 
 def _host_privileged_sockets_ready() -> None:
     for path, unit, group_name, mode, failure_stage in PRIVILEGED_SOCKET_ENDPOINTS:
         values = _systemctl_show(unit, ("ActiveState", "SubState", "Result"))
-        if values != {
-            "ActiveState": "active",
-            "SubState": "listening",
-            "Result": "success",
-        }:
+        if (
+            values is None
+            or values.get("ActiveState") != "active"
+            or values.get("SubState") not in {"listening", "running"}
+            or values.get("Result") != "success"
+        ):
             raise SandboxFailure(failure_stage)
         try:
             expected_gid = 0 if group_name is None else grp.getgrnam(group_name).gr_gid

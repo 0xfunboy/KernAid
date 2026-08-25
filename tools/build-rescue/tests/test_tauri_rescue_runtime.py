@@ -422,6 +422,57 @@ class RescueTauriBoundaryTests(unittest.TestCase):
         ):
             self.assertEqual(guest_ui._shell_service_ready(True), 0)
 
+    def test_privileged_socket_accepts_both_operational_substates(self) -> None:
+        endpoint = (
+            "/run/test.sock",
+            "test.socket",
+            "test-group",
+            0o660,
+            "socket-vault",
+        )
+        metadata = mock.Mock(
+            st_mode=stat.S_IFSOCK | 0o660,
+            st_uid=0,
+            st_gid=77,
+            st_nlink=1,
+        )
+        with (
+            mock.patch.object(
+                guest_ui, "PRIVILEGED_SOCKET_ENDPOINTS", (endpoint,)
+            ),
+            mock.patch.object(
+                guest_ui.grp, "getgrnam", return_value=mock.Mock(gr_gid=77)
+            ),
+            mock.patch.object(guest_ui.os, "lstat", return_value=metadata),
+        ):
+            for substate in ("listening", "running"):
+                with (
+                    self.subTest(substate=substate),
+                    mock.patch.object(
+                        guest_ui,
+                        "_systemctl_show",
+                        return_value={
+                            "ActiveState": "active",
+                            "SubState": substate,
+                            "Result": "success",
+                        },
+                    ),
+                ):
+                    guest_ui._host_privileged_sockets_ready()
+            with (
+                mock.patch.object(
+                    guest_ui,
+                    "_systemctl_show",
+                    return_value={
+                        "ActiveState": "active",
+                        "SubState": "dead",
+                        "Result": "success",
+                    },
+                ),
+                self.assertRaises(guest_ui.SandboxFailure),
+            ):
+                guest_ui._host_privileged_sockets_ready()
+
     def test_guest_requires_the_default_display_xorg_vt_to_be_active(self) -> None:
         self.assertEqual(guest_ui._active_vt_from_payload(b"tty7\n"), 7)
         self.assertEqual(
@@ -948,6 +999,10 @@ class RescueTauriBoundaryTests(unittest.TestCase):
         )
         self.assertEqual(session_ui.UI_HOME, ui_home)
         self.assertEqual(guest_ui.UI_HOME, ui_home)
+        rescue_shell = (
+            REPO_DIR / "apps/desk/src-tauri-rescue/src/main.rs"
+        ).read_text(encoding="utf-8")
+        self.assertIn(f'const UI_HOME: &str = "{ui_home}";', rescue_shell)
         self.assertIn("autologin-user=kernaid-rescue-ui", lightdm)
         self.assertIn("autologin-session=kernaid-rescue-ui", lightdm)
         self.assertIn("run-directory=/run/lightdm", lightdm)
