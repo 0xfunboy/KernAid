@@ -853,6 +853,7 @@ for ((boot = 1; boot <= boot_count; boot++)); do
     -device "usb-storage,bus=kernaid_xhci.0,drive=kernaid_rescue_usb,bootindex=1"
     -drive "file=$observe_image,if=virtio,format=raw,cache=none,aio=threads"
     -drive "file=$swap_image,if=virtio,format=raw,cache=none,aio=threads"
+    -fw_cfg "name=opt/kernaid-tauri-sandbox-probe,string=v1"
     -fw_cfg "name=opt/io.systemd.credentials/provider-lease-probe,file=$provider_probe_helper"
   )
   if [[ "$firmware" == uefi ]]; then

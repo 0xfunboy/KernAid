@@ -3292,6 +3292,13 @@ class StaticContractTests(unittest.TestCase):
             "file=$provider_probe_helper\"",
             shell,
         )
+        self.assertEqual(
+            shell.count(
+                '    -fw_cfg "name=opt/kernaid-tauri-sandbox-probe,string=v1"\n'
+            ),
+            1,
+        )
+        self.assertNotIn("opt/kernaid-offline-inspection", shell)
         self.assertIn("provider-probe-in-iso", shell)
         self.assertIn("provider-probe-in-squashfs", shell)
         self.assertIn(
