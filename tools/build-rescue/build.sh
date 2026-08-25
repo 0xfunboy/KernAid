@@ -197,6 +197,8 @@ cp -a apps/desk/dist/assets "$build_dir/config/includes.chroot/opt/kernaid/desk/
 
 cd "$build_dir"
 lb clean || true
+# Keep Debian live-config from rewriting LightDM's pinned isolated autologin
+# identity to the regular live user from username=kernaid.
 lb config \
   --mode debian \
   --distribution trixie \
@@ -205,7 +207,7 @@ lb config \
   --archive-areas "main contrib non-free-firmware" \
   --debian-installer none \
   --apt-recommends false \
-  --bootappend-live "boot=live components noroot username=kernaid hostname=kernaid-rescue live-config.user-default-groups=audio,cdrom,dip,floppy,video,plugdev,netdev,powerdev,scanner,bluetooth,kernaid-vault,kernaid-codex-client systemd.swap=0 quiet loglevel=5 console=tty0 console=ttyS0,115200n8"
+  --bootappend-live "boot=live components noroot username=kernaid hostname=kernaid-rescue live-config.nox11autologin live-config.user-default-groups=audio,cdrom,dip,floppy,video,plugdev,netdev,powerdev,scanner,bluetooth,kernaid-vault,kernaid-codex-client systemd.swap=0 quiet loglevel=5 console=tty0 console=ttyS0,115200n8"
 lb build
 
 iso="$(find . -maxdepth 1 -name 'live-image-amd64*.hybrid.iso' -o -name 'live-image-amd64*.iso' | head -n 1)"

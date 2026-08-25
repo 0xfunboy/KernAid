@@ -447,6 +447,9 @@ class VaultLivePolicyTests(unittest.TestCase):
         match = re.search(r'--bootappend-live "([^"]+)"', build)
         self.assertIsNotNone(match)
         bootappend = match.group(1) if match else ""
+        self.assertEqual(
+            bootappend.split().count("live-config.nox11autologin"), 1
+        )
         self.assertIn(
             f"live-config.user-default-groups={DEFAULT_LIVE_GROUPS},kernaid-vault",
             bootappend,
