@@ -857,14 +857,22 @@ class RescueTauriBoundaryTests(unittest.TestCase):
             REPO_DIR
             / "rescue/live-build/config/hooks/live/0100-kernaid-safety.hook.chroot"
         ).read_text(encoding="utf-8")
+        ui_home = "/run/kernaid-rescue-ui-session/home"
         self.assertIn(
-            'u kernaid-rescue-ui - "KernAid Rescue isolated graphical shell" /nonexistent /usr/sbin/nologin',
+            'u kernaid-rescue-ui - "KernAid Rescue isolated graphical shell" '
+            f"{ui_home} /usr/sbin/nologin",
             sysusers,
         )
         self.assertIn(
             "d /run/kernaid-rescue-ui-session 0700 kernaid-rescue-ui kernaid-rescue-ui -",
             tmpfiles,
         )
+        self.assertIn(
+            f"d {ui_home} 0700 kernaid-rescue-ui kernaid-rescue-ui -",
+            tmpfiles,
+        )
+        self.assertEqual(session_ui.UI_HOME, ui_home)
+        self.assertEqual(guest_ui.UI_HOME, ui_home)
         self.assertIn("autologin-user=kernaid-rescue-ui", lightdm)
         self.assertIn("autologin-session=kernaid-rescue-ui", lightdm)
         self.assertIn(
@@ -875,6 +883,8 @@ class RescueTauriBoundaryTests(unittest.TestCase):
         self.assertNotIn("common-session", pam)
         self.assertNotIn("pam_systemd", pam)
         self.assertIn("exec /usr/bin/xfwm4", session)
+        self.assertNotIn("install -d", session)
+        self.assertIn("stat -c '%u:%g:%a' \"$session_home\"", session)
         self.assertNotIn("xfce4-session", session)
         self.assertIn("no-session-bus", session)
         self.assertIn("no-system-bus", session)

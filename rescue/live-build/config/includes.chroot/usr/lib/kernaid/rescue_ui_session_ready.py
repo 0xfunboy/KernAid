@@ -11,9 +11,9 @@ import time
 
 
 UI_ACCOUNT = "kernaid-rescue-ui"
-UI_HOME = "/nonexistent"
 UI_SHELL = "/usr/sbin/nologin"
 UI_RUNTIME = "/run/kernaid-rescue-ui-session"
+UI_HOME = f"{UI_RUNTIME}/home"
 XAUTHORITY = "/run/lightdm/kernaid-rescue-ui/xauthority"
 XFWM_PATH = "/usr/bin/xfwm4"
 DISPLAY = b":0"
