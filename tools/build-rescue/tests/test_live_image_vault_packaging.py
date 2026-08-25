@@ -361,6 +361,7 @@ class VaultSystemdPackagingTests(unittest.TestCase):
             [
                 "d /run/kernaid 0700 root root -",
                 "d /run/kernaid-rescue-ui-session 0700 kernaid-rescue-ui kernaid-rescue-ui -",
+                "d /run/kernaid-rescue-ui-session/home 0700 kernaid-rescue-ui kernaid-rescue-ui -",
             ],
         )
         text = TMPFILES.read_text(encoding="utf-8")
