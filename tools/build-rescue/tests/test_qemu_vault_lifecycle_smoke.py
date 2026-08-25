@@ -2515,18 +2515,42 @@ class StaticContractTests(unittest.TestCase):
 
     def test_shipping_codex_status_proof_is_real_offline_and_closed(self) -> None:
         source = controller._codex_status_probe_source().decode("ascii")
-        self.assertIn('["/usr/bin/kernaid-codex-auth","status"]', source)
-        self.assertIn('b"KernAid Codex: disconnesso\\n"', source)
+        self.assertNotIn("/usr/bin/kernaid-codex-auth", source)
+        self.assertNotIn("KernAid Codex: disconnesso", source)
+        self.assertIn("kernaid.dev/rescue-codex-auth/v1alpha1", source)
+        self.assertIn("/run/kernaid-rescue-codex.sock", source)
+        self.assertIn("socket.SOCK_SEQPACKET|socket.SOCK_CLOEXEC", source)
+        self.assertIn('"operation":"status"', source)
+        self.assertIn("connection.shutdown(socket.SHUT_WR)", source)
+        self.assertIn("connection.recvmsg(2049)", source)
+        self.assertIn("socket.MSG_TRUNC|socket.MSG_CTRUNC", source)
+        self.assertIn('response.get("status")!="signed-out"', source)
         self.assertIn("kernaid-rescue-codex@kernaid-qemu-proof.service", source)
         self.assertIn("kernaid-rescue-vaultd.service", source)
+        self.assertIn('show("ActiveState"', source)
+        self.assertIn('show("SubState"', source)
         self.assertIn('show("NAccepted"', source)
         self.assertIn('show("NConnections"', source)
-        self.assertIn("timeout=60", source)
+        self.assertIn("connection.settimeout(60.0)", source)
+        for checkpoint in controller.PROVIDER_PROOF_CODEX_CHECKPOINTS:
+            self.assertIn(
+                "KERNAID_QEMU_PROVIDER_PROOF_FAILURE_V1 "
+                f"stage=codex-status checkpoint={checkpoint}",
+                source,
+            )
         lifecycle = inspect.getsource(controller.run_lifecycle)
         self.assertIn('"codex-status",', lifecycle)
         self.assertIn("timeout=75.0", lifecycle)
-        for forbidden in ("auth.json", "device-login", "http://", "https://"):
+        for forbidden in (
+            "auth.json",
+            "device-login",
+            "http://",
+            "https://",
+            "/run/kernaid-codex-diag",
+            "bridge-diagnostic",
+        ):
             self.assertNotIn(forbidden, source)
+        compile(source, "<codex-status-proof>", "exec", dont_inherit=True)
         self.assertIn("codex_status_path=true", controller.boot_attestation(
             "bios", 1, 10, 16, 18, "KA-0123456789abcdef01234567"
         ))
@@ -2701,6 +2725,54 @@ class StaticContractTests(unittest.TestCase):
                     self.assertEqual(
                         failure.exception.code, f"{stage}-{checkpoint}"
                     )
+
+    def test_codex_status_failure_checkpoints_are_closed_and_correlated(self) -> None:
+        self.assertEqual(
+            controller.PROVIDER_PROOF_CODEX_CHECKPOINTS,
+            (
+                "unit",
+                "socket",
+                "accepted",
+                "connection-drain",
+                "vault-locked",
+                "vault-unconfigured",
+                "busy",
+                "reboot-required",
+                "transport",
+                "cli-unavailable",
+                "cli-failed",
+                "timed-out",
+                "unsafe-home",
+                "unsafe-executable",
+            ),
+        )
+        stage = "codex-status"
+        for checkpoint in controller.PROVIDER_PROOF_CODEX_CHECKPOINTS:
+            with self.subTest(checkpoint=checkpoint):
+                transcript = (
+                    f"KERNAID_PROVIDER_PROOF_BEGIN_V1_{stage}\r\n"
+                    "KERNAID_QEMU_PROVIDER_PROOF_FAILURE_V1 "
+                    f"stage={stage} checkpoint={checkpoint}\r\n"
+                    f"KERNAID_PROVIDER_PROOF_END_V1_{stage} rc=45\r\n"
+                ).encode()
+                with self.assertRaises(controller.ClosedFailure) as failure:
+                    run_proof_transcript(stage, transcript)
+                self.assertEqual(failure.exception.stage, "provider-proof")
+                self.assertEqual(
+                    failure.exception.code, f"{stage}-{checkpoint}"
+                )
+
+        for checkpoint in ("future-checkpoint", "ui-identity"):
+            with self.subTest(rejected=checkpoint):
+                transcript = (
+                    f"KERNAID_PROVIDER_PROOF_BEGIN_V1_{stage}\r\n"
+                    "KERNAID_QEMU_PROVIDER_PROOF_FAILURE_V1 "
+                    f"stage={stage} checkpoint={checkpoint}\r\n"
+                    f"KERNAID_PROVIDER_PROOF_END_V1_{stage} rc=45\r\n"
+                ).encode()
+                with self.assertRaises(controller.ClosedFailure) as failure:
+                    run_proof_transcript(stage, transcript)
+                self.assertEqual(failure.exception.code, "marker-invalid")
 
     def test_provider_proof_rejects_malformed_conflicting_and_noisy_results(
         self,

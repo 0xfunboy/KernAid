@@ -120,6 +120,22 @@ PROVIDER_PROOF_UI_CHECKPOINTS = (
     "outcome-transport",
     "outcome-upstream",
 )
+PROVIDER_PROOF_CODEX_CHECKPOINTS = (
+    "unit",
+    "socket",
+    "accepted",
+    "connection-drain",
+    "vault-locked",
+    "vault-unconfigured",
+    "busy",
+    "reboot-required",
+    "transport",
+    "cli-unavailable",
+    "cli-failed",
+    "timed-out",
+    "unsafe-home",
+    "unsafe-executable",
+)
 PROVIDER_PROOF_UI_ERROR_CHECKPOINTS = (
     ("busy", "outcome-busy"),
     ("invalid_request", "outcome-invalid-request"),
@@ -2532,11 +2548,14 @@ def run_guest_proof(
 
     failure_stage = event_match.group("failure_stage").decode("ascii")
     failure_checkpoint = event_match.group("failure_checkpoint").decode("ascii")
-    if (
-        failure_stage != stage
-        or failure_stage not in PROVIDER_PROOF_UI_STAGES
-        or failure_checkpoint not in PROVIDER_PROOF_UI_CHECKPOINTS
-    ):
+    closed_checkpoint = (
+        failure_stage in PROVIDER_PROOF_UI_STAGES
+        and failure_checkpoint in PROVIDER_PROOF_UI_CHECKPOINTS
+    ) or (
+        failure_stage == "codex-status"
+        and failure_checkpoint in PROVIDER_PROOF_CODEX_CHECKPOINTS
+    )
+    if failure_stage != stage or not closed_checkpoint:
         raise ClosedFailure("provider-proof", "marker-invalid")
     expected_failure = (
         f"KERNAID_QEMU_PROVIDER_PROOF_FAILURE_V1 stage={failure_stage} "
@@ -2669,38 +2688,100 @@ sys.stdout.write({proof!r})
 
 
 def _codex_status_probe_source() -> bytes:
-    """Exercise the shipping Codex bridge with the real pinned CLI, offline."""
+    """Exercise the shipping Codex bridge protocol and pinned CLI, offline."""
 
     stage = "codex-status"
     proof = f"KERNAID_QEMU_PROVIDER_PROOF_V1 stage={stage} result=true\n"
-    return f'''import re,subprocess,sys,time
+    failures = "\n".join(
+        f"    {checkpoint!r}: "
+        f"{'KERNAID_QEMU_PROVIDER_PROOF_FAILURE_V1 ' f'stage={stage} checkpoint={checkpoint}\n'!r},"
+        for checkpoint in PROVIDER_PROOF_CODEX_CHECKPOINTS
+    )
+    error_codes = PROVIDER_PROOF_CODEX_CHECKPOINTS[4:]
+    return f'''import json,re,socket,subprocess,sys,time
+API="kernaid.dev/rescue-codex-auth/v1alpha1"
+REQUEST_ID="C-90000000-0000-4000-8000-000000000003"
+SOCKET_PATH="/run/kernaid-rescue-codex.sock"
+ERROR_CODES={error_codes!r}
+FAILURES={{
+{failures}
+}}
 def show(prop,unit):
     result=subprocess.run(["/usr/bin/systemctl","show","--property="+prop,"--value",unit],stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=3,check=False)
     if result.returncode!=0 or len(result.stdout)>512:
         raise RuntimeError()
     return result.stdout.rstrip(b"\\n")
+def fail(checkpoint):
+    marker=FAILURES.get(checkpoint)
+    if marker is None:
+        sys.exit(46)
+    sys.stdout.write(marker)
+    sys.exit(45)
+def unique(pairs):
+    result={{}}
+    for key,value in pairs:
+        if type(key) is not str or key in result:
+            raise ValueError()
+        result[key]=value
+    return result
+def rejected(_value):
+    raise ValueError()
+checkpoint="unit"
+connection=None
 try:
     template={CODEX_PROOF_UNIT!r}
     if show("LoadState",template)!=b"loaded" or show("FragmentPath",template)!={CODEX_TEMPLATE_PATH.encode('ascii')!r} or show("BindsTo",template)!=b"kernaid-rescue-vaultd.service" or show("User",template)!=b"kernaid-codex" or show("Group",template)!=b"kernaid-codex" or show("SupplementaryGroups",template)!=b"kernaid-vault":
         raise RuntimeError()
-    if show("ActiveState",{CODEX_SOCKET_UNIT!r})!=b"active":
+    checkpoint="socket"
+    if show("ActiveState",{CODEX_SOCKET_UNIT!r})!=b"active" or show("SubState",{CODEX_SOCKET_UNIT!r})!=b"listening":
         raise RuntimeError()
+    checkpoint="accepted"
     accepted=show("NAccepted",{CODEX_SOCKET_UNIT!r})
     if re.fullmatch(rb"0|[1-9][0-9]*",accepted) is None:
         raise RuntimeError()
     before=int(accepted)
-    result=subprocess.run(["/usr/bin/kernaid-codex-auth","status"],stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,env={{"LC_ALL":"C","PATH":"/usr/bin:/bin"}},timeout=60,check=False)
-    if result.returncode!=0 or result.stdout!=b"KernAid Codex: disconnesso\\n" or result.stderr:
+    request={{"apiVersion":API,"requestId":REQUEST_ID,"operation":"status"}}
+    encoded=json.dumps(request,ensure_ascii=True,separators=(",",":")).encode("ascii")
+    checkpoint="transport"
+    connection=socket.socket(socket.AF_UNIX,socket.SOCK_SEQPACKET|socket.SOCK_CLOEXEC)
+    connection.settimeout(60.0)
+    connection.connect(SOCKET_PATH)
+    if connection.send(encoded)!=len(encoded):
         raise RuntimeError()
+    connection.shutdown(socket.SHUT_WR)
+    frame,ancillary,flags,_address=connection.recvmsg(2049)
+    if ancillary or flags&(socket.MSG_TRUNC|socket.MSG_CTRUNC) or not frame or len(frame)>2048 or not frame.endswith(b"\\n") or b"\\n" in frame[:-1] or b"\\r" in frame:
+        raise RuntimeError()
+    connection.close()
+    connection=None
+    response=json.loads(frame[:-1].decode("ascii"),object_pairs_hook=unique,parse_constant=rejected)
+    if type(response) is not dict or response.get("apiVersion")!=API or response.get("requestId")!=REQUEST_ID or response.get("operation")!="status":
+        raise RuntimeError()
+    remote_error=None
+    if response.get("stage")=="error":
+        if set(response)!={{"apiVersion","requestId","operation","stage","code"}} or response.get("code") not in ERROR_CODES:
+            raise RuntimeError()
+        remote_error=response["code"]
+    elif set(response)!={{"apiVersion","requestId","operation","stage","status"}} or response.get("stage")!="complete" or response.get("status")!="signed-out":
+        raise RuntimeError()
+    checkpoint="accepted"
     if show("NAccepted",{CODEX_SOCKET_UNIT!r})!=str(before+1).encode("ascii"):
         raise RuntimeError()
+    checkpoint="connection-drain"
     deadline=time.monotonic()+5.0
     while show("NConnections",{CODEX_SOCKET_UNIT!r})!=b"0":
         if time.monotonic()>=deadline:
             raise RuntimeError()
         time.sleep(0.05)
+    if remote_error is not None:
+        fail(remote_error)
+except SystemExit:
+    raise
 except BaseException:
-    sys.exit(46)
+    fail(checkpoint)
+finally:
+    if connection is not None:
+        connection.close()
 sys.stdout.write({proof!r})
 '''.encode("ascii")
 
