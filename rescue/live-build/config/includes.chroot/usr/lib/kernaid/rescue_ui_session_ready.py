@@ -367,6 +367,11 @@ def _session_process_ready(account: pwd.struct_passwd) -> bool:
                 identity = _process_identity(pid)
             except (FileNotFoundError, ProcessLookupError):
                 continue
+            except (OSError, SessionError):
+                # /proc status and exe are not an atomic snapshot while a
+                # process exits or changes credentials. An unreadable sample
+                # cannot authorize readiness; retry the complete bounded scan.
+                return False
             uids, gids, groups, executable = identity
             executable_name = os.path.basename(executable).lower()
             if executable_name in FORBIDDEN_UI_PROCESS_NAMES:
@@ -390,7 +395,7 @@ def _session_process_ready(account: pwd.struct_passwd) -> bool:
                 stable_identity = _process_identity(pid)
             except (FileNotFoundError, ProcessLookupError):
                 continue
-            except PermissionError:
+            except (OSError, SessionError):
                 return False
             if stable_identity != identity:
                 return False

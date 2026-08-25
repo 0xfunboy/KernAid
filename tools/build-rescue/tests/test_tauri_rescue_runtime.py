@@ -340,6 +340,22 @@ class RescueTauriBoundaryTests(unittest.TestCase):
             )
         self.assertEqual(foreign_error.exception.stage, "process-foreign-display")
 
+        with (
+            mock.patch.object(session_ui, "PRIVILEGED_GROUPS", ()),
+            mock.patch.object(
+                session_ui.pwd,
+                "getpwnam",
+                return_value=mock.Mock(pw_uid=111),
+            ),
+            mock.patch.object(session_ui.os, "scandir", return_value=scanner),
+            mock.patch.object(
+                session_ui,
+                "_process_identity",
+                side_effect=session_ui.SessionError(),
+            ),
+        ):
+            self.assertFalse(session_ui._session_process_ready(account))
+
     def test_session_failure_marker_exposes_only_an_allowlisted_stage(self) -> None:
         for stage in (
             "process",
