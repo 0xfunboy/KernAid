@@ -43,8 +43,6 @@ const FAKE_SYSTEM_BUS: &str = "unix:path=/run/kernaid-rescue-desk-shell/no-syste
 const SANDBOX_STATUS_QEMU: &str = "KERNAID_RESCUE_TAURI_SANDBOX_V1 identity=isolated pidns=private shell-bus=mount-masked session-bus=env-disabled-polkit-denied http=loopback x11=connected privileged-fs-sockets=absent nonloopback=denied";
 const SANDBOX_STATUS_NORMAL: &str = "KERNAID_RESCUE_TAURI_SANDBOX_V1 identity=isolated pidns=private shell-bus=mount-masked session-bus=env-disabled-polkit-denied http=loopback x11=connected privileged-fs-sockets=absent nonloopback=systemd-policy";
 const WINDOW_STARTUP_STATUS: &str = "KERNAID_RESCUE_TAURI_STARTUP_V1 stage=window";
-const QEMU_PROBE_MARKER_PATH: &str =
-    "/sys/firmware/qemu_fw_cfg/by_name/opt/kernaid-tauri-sandbox-probe/raw";
 const QEMU_BASELINE_MARKER_PATH: &str = "/run/kernaid-tauri-network-probe/baseline-v1";
 const QEMU_BASELINE_MARKER: &[u8] = b"KERNAID_RESCUE_TAURI_NETWORK_BASELINE_V1 connected=true\n";
 const QEMU_NON_LOOPBACK_ADDRESS: [u8; 4] = [192, 0, 2, 1];
@@ -284,30 +282,12 @@ fn bounded_fixed_file(
 }
 
 fn qemu_probe_mode() -> Result<bool, SandboxProbeFailure> {
-    match fs::symlink_metadata(QEMU_PROBE_MARKER_PATH) {
+    match fs::symlink_metadata(QEMU_BASELINE_MARKER_PATH) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(_) => Err(SandboxProbeFailure::ProbeMode),
-        Ok(metadata) => {
-            if !metadata.is_file()
-                || metadata.uid() != 0
-                || metadata.gid() != 0
-                || metadata.mode() & 0o222 != 0
-            {
-                return Err(SandboxProbeFailure::ProbeMode);
-            }
-            let mut file = OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-                .open(QEMU_PROBE_MARKER_PATH)
-                .map_err(|_| SandboxProbeFailure::ProbeMode)?;
-            let mut payload = [0_u8; 4];
-            let length = file
-                .read(&mut payload)
-                .map_err(|_| SandboxProbeFailure::ProbeMode)?;
-            matches!(&payload[..length], b"v1" | b"v1\0")
-                .then_some(true)
-                .ok_or(SandboxProbeFailure::ProbeMode)
-        }
+        Ok(_) => qemu_baseline_ready()
+            .then_some(true)
+            .ok_or(SandboxProbeFailure::ProbeMode),
     }
 }
 

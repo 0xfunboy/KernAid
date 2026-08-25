@@ -1003,6 +1003,10 @@ class RescueTauriBoundaryTests(unittest.TestCase):
             REPO_DIR / "apps/desk/src-tauri-rescue/src/main.rs"
         ).read_text(encoding="utf-8")
         self.assertIn(f'const UI_HOME: &str = "{ui_home}";', rescue_shell)
+        self.assertNotIn("qemu_fw_cfg", rescue_shell)
+        self.assertIn(
+            "fs::symlink_metadata(QEMU_BASELINE_MARKER_PATH)", rescue_shell
+        )
         self.assertIn("autologin-user=kernaid-rescue-ui", lightdm)
         self.assertIn("autologin-session=kernaid-rescue-ui", lightdm)
         self.assertIn("run-directory=/run/lightdm", lightdm)
