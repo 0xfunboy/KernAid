@@ -887,7 +887,8 @@ class RescueTauriBoundaryTests(unittest.TestCase):
         self.assertIn("TimeoutStartSec=270s", attestor_unit)
         self.assertIn("StandardOutput=journal+console", attestor_unit)
         self.assertIn("StandardError=journal+console", attestor_unit)
-        self.assertIn("ProtectHome=tmpfs", attestor_unit)
+        self.assertNotIn("ProtectHome=", attestor_unit)
+        self.assertIn("InaccessiblePaths=/home /root", attestor_unit)
         self.assertIn("BindPaths=/run/user", attestor_unit)
         self.assertIn(
             "SystemCallFilter=~ptrace process_vm_readv process_vm_writev kcmp",
