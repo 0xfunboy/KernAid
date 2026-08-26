@@ -3083,6 +3083,16 @@ class StaticContractTests(unittest.TestCase):
             self.assertIn('ORIGIN="http://127.0.0.1:4173"', source)
             self.assertIn('"Sec-Fetch-Site":"same-origin"', source)
             self.assertIn("payloadSha256", source)
+            self.assertIn(
+                'urlsafe(envelope["payloadSha256"],32)'
+                "!=hashlib.sha256(expected_payload).digest()",
+                source,
+            )
+            self.assertNotIn(
+                'envelope["payloadSha256"]'
+                "!=hashlib.sha256(expected_payload).hexdigest()",
+                source,
+            )
             self.assertIn("journalEntryHash", source)
             self.assertIn("signature", source)
             self.assertIn('["report-export",CURRENT]', source)
