@@ -1,12 +1,16 @@
 # KernAid make-device
 
-`make-device.py` scrive una ISO ufficiale KernAid Rescue su un solo supporto USB
-selezionato esplicitamente. **Il prefisso lungo quanto la ISO viene
-sovrascritto.** La coda non viene cancellata.
+`make-device-v2.py` è il writer previsto per una futura ISO KernAid Rescue
+autorizzata dal catalogo v2. Verifica la copia e provisiona il vault cifrato su
+un supporto USB factory-new selezionato esplicitamente. **Il prefisso lungo
+quanto la ISO e la partizione vault vengono sovrascritti.** Non è uno strumento
+di sanitizzazione dell'intero supporto. Il catalogo v2 distribuito è oggi vuoto,
+quindi il percorso fisico rifiuta ogni ISO prima di aprire il target in
+scrittura.
 
 ## Stato del trust catalog
 
-Il catalogo ufficiale `trusted-rescue-images.v1.json` autorizza la ISO
+Il catalogo storico `trusted-rescue-images.v1.json` autorizza la ISO
 `ci-30698824356-1`, SHA-256
 `11a0ade7e05a01a06cf72770403f8f9197a40608d5975635dd360cea4d307801`,
 costruita e avviata con successo in QEMU BIOS e UEFI nel run GitHub Actions
@@ -15,42 +19,41 @@ immagine viene rifiutata fail-closed; non basta fornire un SHA-256 arbitrario
 dalla riga di comando.
 
 La voce v1 è storica e l'artefatto del workflow collegato non è più
-scaricabile. Nessun artefatto Rescue corrente è stato promosso nei cataloghi
-in questa revisione, mentre il catalogo v2 resta vuoto. Di conseguenza il
-flusso ufficiale download + writer è sospeso: non sostituire l'ISO con un
-artefatto Actions non promosso.
+scaricabile. Il catalogo v2 ha `catalogRevision: 0` e non autorizza alcuna
+immagine. La candidata privata identificata in `docs/CURRENT_STATUS.md` non è
+promossa perché il suo workflow completo è rosso; non sostituirla nel catalogo
+con un artefatto Actions non qualificato.
 
 Questa evidenza v1 avvia l'immagine come CD-ROM virtuale QEMU: non prova il boot
-da USB né firmware o hardware fisici. Il writer v1 copia e verifica il prefisso
-ISO ma non provisiona la p3 persistente.
+da USB né firmware o hardware fisici. Il writer v1, mantenuto soltanto per
+verificabilità storica, copia e verifica il prefisso ISO ma non provisiona la
+p3 persistente.
 
-Ogni voce lega esattamente:
+Ogni voce v1 lega esattamente:
 
 - nome e versione dell'artefatto;
 - SHA-256 e dimensione in byte;
 - run GitHub Actions e SHA-256 dei log QEMU BIOS e UEFI passati.
 
+Una voce v2 lega inoltre il manifest di layout e il profilo vault immutabili,
+insieme alle attestazioni USB two-boot e vault BIOS/UEFI della stessa ISO.
+
 Il catalogo è il trust anchor locale: programma, catalogo e tutta la loro
 directory devono essere posseduti da `root` e non scrivibili da gruppo/altri.
 
-Il writer v1 resta l'unico percorso implementato per l'immagine storica
-autorizzata, ma non esiste oggi un artefatto scaricabile che corrisponda a tale
-voce: il flusso operativo resta quindi sospeso.
-Il percorso separato `make-device-v2.py` è implementato e testabile, ma resta
-**inattivo in produzione**: `trusted-rescue-images.v2.json` ha revisione zero e
-l'elenco immagini è vuoto. Il launcher v2 non consulta mai il catalogo v1 e
-non effettua downgrade; con il trust anchor presente nel repository rifiuta
-ogni ISO prima di aprire il target in scrittura.
+Il writer v1 resta disponibile soltanto per verificabilità storica e non
+provisiona la persistenza. `make-device-v2.py` non consulta mai il catalogo v1,
+non effettua downgrade e, con il trust anchor corrente, rifiuta ogni ISO prima
+di aprire il target in scrittura.
 
 `trusted-rescue-images.v2.schema.json`, `catalog_v2.py` e
-`catalog-entry-v2.py` definiscono il relativo contratto di trust. Il writer v2
-potrà diventare operativo soltanto quando una release reale avrà entrambe le
-prove BIOS/UEFI descritte sotto e la relativa voce sarà revisionata e inserita
-esplicitamente nel catalogo. La fixture dello smoke loop privilegiato vive
+`catalog-entry-v2.py` definiscono il relativo contratto di trust. Una voce può
+essere attivata soltanto dopo entrambe le prove BIOS/UEFI descritte sotto e una
+revisione esplicita del catalogo. La fixture dello smoke loop privilegiato vive
 soltanto in una directory temporanea root-owned e non promuove il catalogo
 distribuito.
 
-Una futura promozione v2 richiederà, per la stessa ISO e lo stesso layout
+Ogni promozione v2 richiede, per la stessa ISO e lo stesso layout
 immutabile, entrambe queste famiglie di prove indipendenti per BIOS e UEFI:
 
 - due boot consecutivi della stessa immagine raw come `usb-storage`, con
@@ -77,33 +80,17 @@ Nessun artefatto può essere promosso nel catalogo v2 finché entrambe le
 famiglie di attestazioni non sono legate alla stessa revisione in una voce di
 catalogo revisionata.
 
-## Installazione operatore
+## Installazione operatore v2
 
 Servono Linux FHS a 64 bit, `/usr/bin/python3` 3.10 o successivo, util-linux
 recente (`lsblk`, `losetup`, `wipefs`), `udevadm` da systemd-udev e GNU `dd`.
 L'interprete è fissato a `/usr/bin/python3 -I`; non usare una copia del tool da
 una checkout scrivibile dall'utente.
 
-Installare la copia revisionata del tool e del catalogo ufficiale:
-
-```text
-sudo install -d -o root -g root -m 0755 /usr/local/libexec/kernaid/make-device
-sudo install -o root -g root -m 0755 \
-  tools/make-device/make-device.py \
-  /usr/local/libexec/kernaid/make-device/make-device.py
-sudo install -o root -g root -m 0644 \
-  tools/make-device/trusted-rescue-images.v1.json \
-  /usr/local/libexec/kernaid/make-device/trusted-rescue-images.v1.json
-```
-
-Uso:
-
-```text
-sudo /usr/local/libexec/kernaid/make-device/make-device.py \
-  --iso /percorso/KernAid-Rescue-amd64.iso \
-  --sha256 HASH_UFFICIALE_DA_64_CARATTERI \
-  --device /dev/sdX
-```
+Questa procedura resta sospesa finché una ISO non viene promossa nel catalogo
+v2. Dopo la promozione, installare il bundle root-owned descritto nella sezione
+**Writer USB v2 e vault cifrato** e usare esclusivamente l'ISO esatta autorizzata
+dal trust anchor installato.
 
 Il target deve essere il path assoluto di un intero flash drive USB. È ammesso
 un SSD USB portatile solo se firmware e udev lo espongono come rimovibile e
@@ -144,19 +131,19 @@ lo dichiara. Questo non è uno strumento di sanitizzazione.
 
 Il report v1 dichiara anche che il vault persistente **non viene creato**: il
 writer v1 non provisiona intenzionalmente la p3. Il writer v2 e il relativo
-lifecycle esistono, ma il catalogo distribuito resta inattivo; recovery
-autenticata e rollback restano gate separati. Il report contiene la prova udev
+lifecycle sono implementati ma il trust resta inattivo; recovery autenticata e
+rollback restano gate separati. Il report contiene la prova udev
 verificata, incluso `ID_PATH`, ma dichiara esplicitamente di essere JSON locale
 **non firmato e non autenticato**: non è una ricevuta crittografica.
 
 Questa dichiarazione riguarda esclusivamente `make-device.py` v1. Il percorso
-v2 crea e verifica il vault, ma non può ancora autorizzare un'immagine di
-produzione perché il catalogo v2 distribuito è vuoto.
+v2 crea e verifica il vault soltanto per un'immagine autorizzata dal catalogo
+v2 distribuito.
 
 ## Writer USB v2 e vault cifrato (implementato, trust inattivo)
 
-Quando una futura voce catalog-v2 sarà realmente trusted, il launcher v2
-accetterà soltanto un supporto che espone almeno `32000000000` byte. Scrive e
+Quando il catalogo contiene una voce promossa, il launcher v2 accetta soltanto
+un supporto che espone almeno `32000000000` byte. Scrive e
 verifica il prefisso ISO esatto, richiede che lo slot MBR 3 coincida con il
 manifest installato e fa riesaminare la tabella al kernel. La p3 deve essere:
 
@@ -254,8 +241,9 @@ sudo install -o root -g root -m 0644 \
 ```
 
 Il launcher verifica ownership e mode del bundle **prima** di importare il
-core. Oggi il comando seguente rifiuta correttamente con “catalog v2 inactive”;
-diventerà operativo soltanto dopo una promozione catalogata reale:
+core. Oggi il comando seguente fallisce chiuso perché il catalogo v2 è vuoto;
+dopo una promozione accetterà soltanto l'ISO esatta presente nel catalogo
+installato:
 
 ```text
 sudo /usr/local/libexec/kernaid/make-device-v2/make-device-v2.py \
@@ -266,35 +254,38 @@ sudo /usr/local/libexec/kernaid/make-device-v2/make-device-v2.py \
 
 ## Popolare il catalogo dopo CI
 
-La pipeline Rescue calcola l'hash della stessa ISO avviata da QEMU e fa
-aggiungere a ciascun log una singola attestazione strutturata con firmware,
-SHA-256 ISO, marker ready e hash del target prima/dopo identici. Soltanto dopo i
-due smoke BIOS e UEFI, `catalog-entry.py` verifica quelle righe e calcola
-direttamente gli hash dei log. Il job pubblica
-`KernAid-Rescue-amd64.catalog-entry.json` insieme alla ISO, al checksum e agli
-stessi log. ID e URL provengono da `GITHUB_RUN_ID` e dal contesto del run, non da
-una dichiarazione manuale.
+La pipeline Rescue calcola l'hash della stessa ISO avviata due volte come USB
+virtuale in BIOS e UEFI. Ogni log lega ISO, layout immutabile, regioni
+byte-identiche, marker ready distinti e il vault LUKS2/ext4 sopravvissuto ai due
+boot. `catalog-entry-v2.py` verifica queste prove e calcola direttamente gli
+hash dei log. Il job pubblica
+`KernAid-Rescue-amd64.catalog-entry-v2.json` insieme a ISO, checksum e log; una
+promozione è consentita soltanto se termina con successo anche l'intero
+workflow, inclusi entrambi i job privilegiati di lifecycle BIOS e UEFI. ID e
+URL provengono da `GITHUB_RUN_ID` e dal contesto del run, non da una
+dichiarazione manuale.
 
 Per riprodurre localmente la derivazione su artefatti scaricati dallo stesso
 run:
 
 ```text
-tools/make-device/catalog-entry.py \
+tools/make-device/catalog-entry-v2.py \
   --iso /percorso/assoluto/KernAid-Rescue-amd64.iso \
   --sha256 SHA256_ISO \
+  --layout-manifest rescue/image-layout/device-layout.v1.json \
   --artifact-version VERSIONE_RELEASE \
   --bios-run-id ID_RUN_BIOS \
   --bios-run-url https://github.com/0xfunboy/KernAid/actions/runs/ID_RUN_BIOS \
-  --bios-log /percorso/assoluto/rescue-smoke-bios.log \
+  --bios-log /percorso/assoluto/rescue-usb-smoke-bios.log \
   --uefi-run-id ID_RUN_UEFI \
   --uefi-run-url https://github.com/0xfunboy/KernAid/actions/runs/ID_RUN_UEFI \
-  --uefi-log /percorso/assoluto/rescue-smoke-uefi.log \
-  > /tmp/kernaid-catalog-entry.json
+  --uefi-log /percorso/assoluto/rescue-usb-smoke-uefi.log \
+  > /tmp/kernaid-catalog-entry-v2.json
 ```
 
 Revisionare la voce, inserirla nell'array `images`, incrementare
 `catalogRevision`, rieseguire i test e commettere il catalogo insieme alla
-release. `catalog-entry.py` non modifica automaticamente il trust anchor.
+release. `catalog-entry-v2.py` non modifica automaticamente il trust anchor.
 
 ## Test
 

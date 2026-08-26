@@ -68,9 +68,12 @@ start, so restart `kaid-site.service` after changing release metadata or the
 configured artifact path.
 
 Do not soften the warning based only on the existence of a workflow artifact.
-For the current `b843178` candidate, BIOS/UEFI QEMU smoke evidence exists, but
-the vault lifecycle gate failed and the trusted v2 catalog is empty. It is not
-a release and is not qualified for writing or booting on physical USB media.
+For the current `e9340bb` candidate, hybrid ISO, ordinary BIOS/UEFI QEMU smoke,
+USB-style two-boot and persistent-vault evidence exist. Both final privileged
+lifecycle jobs fail at the local Codex status bridge, and the trusted v2
+catalog is empty. It is not a release. Its private availability is limited to
+controlled first-boot qualification on factory-new or disposable USB and
+non-customer hardware.
 
 ## Local validation
 

@@ -6,41 +6,49 @@ unattended repair until those release gates are completed.
 
 ## Create the Rescue USB
 
-This procedure is currently suspended: the checked-in v1 entry is historical
-and its GitHub artifact is no longer downloadable, while the v2 catalog
-authorizes no image. Do not substitute an unpromoted workflow artifact. Resume
-these steps only after an exact Rescue image and matching writer bundle are
-explicitly promoted.
+There is currently no catalog-authorized physical release. The private project
+area exposes one exact candidate from commit `e9340bb` only to collect the
+first physical-boot evidence. Its exact version, size, workflow and SHA-256 are
+recorded in `CURRENT_STATUS.md`; do not substitute another Actions artifact or
+an image from a mirror.
 
-1. Download the released `KernAid-Rescue-amd64.iso`, its checksum, and the
-   matching `make-device` bundle. Do not use an ISO from an untrusted mirror.
-2. Extract the files and keep the ISO on a disk other than the USB that will be
-   overwritten.
-3. Verify the image before writing it:
+The checked-in trusted v2 catalog is empty. Consequently the Linux v2 writer
+correctly rejects this candidate and encrypted-vault provisioning is suspended
+until a complete Rescue workflow passes and one exact ISO is reviewed and
+promoted. The Windows procedure below is deliberately a raw boot test, not the
+trusted provisioning flow.
 
-   - Linux: `sha256sum -c KernAid-Rescue-amd64.iso.sha256`
-   - macOS: `shasum -a 256 KernAid-Rescue-amd64.iso` and compare the value in the checksum file.
-   - Windows PowerShell: `Get-FileHash .\KernAid-Rescue-amd64.iso -Algorithm SHA256` and compare the value in the checksum file.
-
-4. On a Linux preparation machine, install and run the reviewed writer exactly
-   as documented in `tools/make-device/README.md`. It accepts only an ISO in the
-   built-in attested catalog, requires an explicit whole USB device, asks for a
-   physical confirmation, writes it, and verifies every ISO byte. **The selected
-   USB is overwritten.** Do not substitute Rufus, balenaEtcher, or another
-   writer: they do not enforce the KernAid trust catalog.
-5. Attempt to boot the target PC from its one-time boot menu. The current boot
-   evidence is QEMU-only; physical USB and firmware compatibility are not yet
-   qualified. For the engineering image, disable Secure Boot if firmware
-   refuses to start it. Do not change the internal-disk boot order permanently.
-6. On a successful boot, KernAid starts its local desktop and opens the
-   interface automatically. The
-   header must say `Rescue · Offline rules`; the target initially says
-   `Ambiente Rescue · target non selezionato`.
-
-The current Rescue image targets amd64 legacy BIOS and UEFI. Its current boot
-evidence is QEMU-only; physical PCs, firmware and USB media are unqualified. It
+The Rescue build target is amd64 legacy BIOS and UEFI. Its boot evidence is
+QEMU-only; physical PCs, firmware and USB media are unqualified. It
 is not an Apple-silicon boot image, and Intel Mac external boot remains a
 physical validation item.
+
+### Windows: physical boot qualification only
+
+Use only the exact private candidate identified in `docs/CURRENT_STATUS.md`.
+This checks whether that image boots on real hardware; it bypasses the trust
+catalog and does not create or qualify the encrypted persistent vault.
+
+1. Use a factory-new or disposable USB drive of at least 32 GB. Rufus overwrites
+   the image-sized bootable prefix, but residual tail data may remain
+   recoverable; this procedure is not media sanitization.
+2. Verify the downloaded ISO in PowerShell with
+   `Get-FileHash .\KernAid-Rescue-amd64-e9340bb-internal.iso -Algorithm SHA256`
+   and compare the complete digest with the downloaded `.sha256` file and the
+   exact value in `CURRENT_STATUS.md`.
+3. Write that exact ISO with Rufus. If Rufus asks between ISO and DD modes,
+   choose **DD mode**. Double-check the selected USB before starting.
+4. For this engineering preview, disable Secure Boot. Disconnect customer,
+   irreplaceable and unrelated data drives whenever practical, then use the
+   firmware one-time boot menu rather than changing the permanent boot order.
+5. Confirm that the KernAid UI opens, record machine/firmware/network results,
+   and stop if the UI or expected read-only state is missing. Do not perform
+   customer repairs from this qualification medium.
+
+Rufus is preferred over balenaEtcher for this Windows qualification procedure
+because it exposes the target and DD-mode choice clearly. The Linux v2 writer
+becomes the vault-provisioning path only after the catalog contains a promoted
+image.
 
 ## Diagnose from Rescue
 
@@ -167,11 +175,12 @@ release gates.
 
 The supported workshop procedure in this section is Resident-only. Rescue
 contains feature-gated persistent-vault OpenAI plumbing and a loopback
-UI-server relay, but an exact revision is virtually qualified only after both
-privileged BIOS and UEFI lifecycle jobs pass. The active physical writer v1
-does not create that vault, and live provider TLS with a real account and
-physical media are not qualified; do not present Rescue
-OpenAI as supported on customer media yet. The Resident credential companion
+UI-server relay, but an exact revision is virtually qualified only after the
+full Rescue workflow passes, including both privileged BIOS and UEFI lifecycle
+jobs. The v2 writer is implemented, but the empty trusted catalog prevents it
+from authorizing the current candidate. Physical media and live provider TLS
+with a real account are still not qualified. Do not present Rescue OpenAI as
+supported on customer media yet. The Resident credential companion
 is not included in the desktop installer and is not added to `PATH`. From the
 same successful Desktop workflow run, download and extract
 the outer GitHub artifact matching the installed Desk build:
@@ -259,9 +268,9 @@ customer authorization and applicable data-processing requirements first.
   renderer and its visible window are all present.
 - If the page opens but Rescue observations or the target selector do not
   appear, check `systemctl status kernaid-ui.service` from the live console.
-- Only after an exact ISO is promoted in the trusted catalog, if firmware does
-  not list that qualified test USB, rewrite the same promoted image in raw/DD
-  mode and retry another port. The current download/writer flow is suspended;
-  see [Current status](CURRENT_STATUS.md). Secure Boot support is not yet
+- During the controlled qualification of the exact private candidate, if
+  firmware does not list the USB, rewrite the same verified image in raw/DD
+  mode and retry another port. See [Current status](CURRENT_STATUS.md) for the
+  exact candidate; this does not promote it. Secure Boot support is not yet
   claimed.
 - Keep the original disk untouched when hardware failure is suspected; collect the report and move to a controlled imaging workflow.

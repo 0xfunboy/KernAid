@@ -485,6 +485,10 @@ A “KernAid account per key” must not imply that the provider account is shar
 
 ### 8.2 Provider matrix as of 1 August 2026
 
+This matrix records the planned product decision as of the research date; it
+is not an implementation or qualification claim. The date-stamped
+[current status](CURRENT_STATUS.md) is authoritative for shipped behavior.
+
 | Provider mode | Product support | Authentication path | Decision |
 | --- | --- | --- | --- |
 | OpenAI API | Full embedded UI | Platform API key | Supported P0 |
@@ -1183,6 +1187,11 @@ The supplied kit includes SVG logo masters, tokens, app concept, social cover, p
 | Scope explodes across OSes | High | Linux-first core, Windows next, macOS resident later |
 
 ## 21. Immediate implementation order
+
+This is the original implementation sequence, retained as historical product
+context. See [current status](CURRENT_STATUS.md) for completed and open gates;
+item 11 is implemented only inside the isolated fixture repair lab, not on
+production targets.
 
 1. Create the kernaid monorepo and commit this document plus AGENTS.md.
 2. Scaffold Tauri/React UI and Rust workspace.

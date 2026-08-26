@@ -6,7 +6,13 @@ Desk UI -> SessionDriver -> Agent Gateway -> Provider
                           -> Evidence / journal
 ```
 
-Provider output is an untrusted proposal. It cannot call the broker. Core links claims to evidence, validates action metadata, and admits only R0 in this phase. The fake broker recognizes only `system.observe.noop`, checks the target fingerprint, and rejects repeated or decreasing sequence numbers.
+Provider output is an untrusted proposal. It cannot call the broker. In the
+default production path, Core links claims to evidence, validates action
+metadata, and admits only R0 in this phase. The fake broker recognizes only
+`system.observe.noop`, checks the target fingerprint, and rejects repeated or
+decreasing sequence numbers. A separate Linux-only, feature-gated fixture lab
+admits one exact R2 action against a process-created temporary fixture; it is
+absent from normal builds and Rescue and cannot select a production target.
 
 The Resident Linux fixture collector accepts exactly one directory and reads
 metadata only. Rescue has a separate one-shot, descriptor-bound inspector for
@@ -17,7 +23,9 @@ collector grants provider output access to the broker.
 ## Implemented acceptance checks
 
 - Unknown broker actions are rejected.
-- R1–R4 plans are rejected by Phase 0 policy.
+- R1–R4 plans are rejected by the default Phase 0 production policy; the
+  isolated fixture-lab exception is compile-time constrained to one exact R2
+  repair and rollback cycle.
 - Provider diagnoses require evidence IDs.
 - Seeded API-shaped secrets are redacted.
 - Fixture file hashes are identical before and after Observe collection.

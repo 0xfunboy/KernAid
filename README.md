@@ -31,19 +31,19 @@ build and uses a fresh temporary fixture and journal on every launch.
 every file path and byte before and after collection. It never accepts a
 physical block-device path.
 
-CI produces engineering-preview desktop installers for Windows, Linux, Intel macOS and Apple-silicon macOS, plus a separate amd64 hybrid BIOS/UEFI Rescue ISO. Download them from the successful GitHub Actions run artifacts. Production distribution still requires Windows code signing and Apple signing/notarization.
+The CI workflows are configured to produce engineering-preview desktop installers for Windows, Linux, Intel macOS and Apple-silicon macOS, plus a separate amd64 hybrid BIOS/UEFI Rescue ISO. A build is usable only when its exact workflow and qualification gates pass; see [Current status](docs/CURRENT_STATUS.md) before downloading an artifact. Production distribution still requires Windows code signing and Apple signing/notarization.
 
 ## Use in the workshop
 
-- **PC that does not boot (controlled engineering preview):** no currently
-  downloadable Rescue ISO is authorized by the checked-in catalogs. The v1
-  entry is historical and its workflow artifact is no longer available; v2
-  authorizes no image. Do not write a current workflow artifact to physical
-  USB. After an exact image is explicitly promoted, verify it and use the
-  catalog-enforcing Linux writer in `tools/make-device`; the active writer v1
-  copies and verifies only the ISO prefix and does not provision the persistent
-  vault. Physical USB boot and firmware remain unqualified. On a successful
-  boot, select the
+- **PC that does not boot (controlled engineering preview):** the private area
+  exposes the exact Rescue candidate identified in
+  [Current status](docs/CURRENT_STATUS.md) only for first physical-boot
+  qualification. Verify its checksum and, on Windows, write it with Rufus in
+  DD mode to a factory-new or disposable USB of at least 32 GB. The trusted v2
+  catalog is currently empty, so the Linux writer rejects this image and the
+  manual Windows path does not provision or qualify the encrypted vault.
+  Physical USB boot and firmware remain unqualified. On a successful boot,
+  select the
   installed-system candidate in the left rail, and keep Secure Boot disabled
   for this engineering preview. The target is re-scanned before every session;
   target selection itself remains metadata-only. When **Diagnostica** starts,
@@ -76,19 +76,17 @@ CI produces engineering-preview desktop installers for Windows, Linux, Intel mac
   remain the startup/default provider and require no account or network.
 - **Do not use on customer data as a repair tool yet:** the current workflow diagnoses and stages an R0 no-write plan. It deliberately cannot execute real repairs.
 
-Qualified Rescue candidates are boot-tested in QEMU using both legacy BIOS
-and UEFI firmware. Each test attaches only disposable target images, including
-one same-disk GPT Windows fixture with NTFS and EFI partitions, requires the
-local UI service and API to become ready, and verifies that each complete target
-image is byte-identical before and after boot. A separate privileged two-boot
-lifecycle qualifies an exact revision only when both BIOS and UEFI jobs pass;
-it exercises the shipping Python UI server's strict same-origin HTTP-to-AF_UNIX
-provider relay with provider networking disabled. The ordinary BIOS and UEFI
-smoke now also requires the shipping Tauri/WebKitGTK shell process, a descendant
-renderer, a visible branded framebuffer, and a real keyboard event that changes
-that framebuffer; raw screenshots are never published. It does not exercise live
-provider TLS, a real account, Secure Boot, or physical media. The current
-workflow and downloadable-artifact status is tracked in
+Qualified Rescue candidates pass three separate QEMU gates under both legacy
+BIOS and UEFI. The ordinary boot smoke requires the local UI and API, the
+shipping Tauri/WebKitGTK shell and descendant renderer, a visible branded
+framebuffer, a real keyboard event, and byte-identical disposable targets. A
+USB-style gate then boots the same raw image twice and verifies its pinned
+layout and persistent vault without altering the ISO prefix or unrelated target
+regions. Finally, privileged lifecycle jobs exercise the shipping Python UI
+server's strict same-origin HTTP-to-AF_UNIX provider relay with provider
+networking disabled. Raw screenshots are never published. These gates do not
+exercise live provider TLS, a real account, Secure Boot, or physical media. The
+current workflow and downloadable-artifact status is tracked in
 [Current status](docs/CURRENT_STATUS.md); do not infer that every `main` commit
 has produced a publishable ISO.
 
@@ -103,10 +101,12 @@ See [Current status](docs/CURRENT_STATUS.md), the [operator guide](docs/operator
 - Resident mode has one bounded diagnosis-only OpenAI Responses adapter plus
   deterministic offline rules. Rescue includes feature-gated persistent-vault,
   executor and loopback UI-server relay plumbing; an exact image is virtually
-  qualified only when both privileged BIOS and UEFI lifecycle jobs pass. The
-  active physical writer does not provision that vault, and live TLS with a
-  real account, physical-media qualification and the isolated Codex CLI bridge
-  remain incomplete.
+  qualified only after the full Rescue workflow passes, including both
+  privileged BIOS and UEFI lifecycle jobs. The
+  v2 writer can provision that vault only for an exact catalog-authorized image
+  on factory-new controlled-lab media; no image is currently authorized.
+  Real-account Codex authorization, live provider TLS and physical-media
+  qualification remain incomplete.
 - Native production host inventory has no mutation or repair handler; the
   opt-in fixture lab is not a production host path. The parameter-free Linux
   hardware command, schema and packaging are virtually exercised, and the CI

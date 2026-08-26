@@ -3,12 +3,12 @@
   "release": {
     "name": "KernAid Rescue AMD64",
     "channel": "Internal candidate",
-    "sourceCommit": "b843178c9254c798e128b0e0890cb00045dde17b",
-    "artifactVersion": "ci-32432064694-1",
-    "workflowUrl": "https://github.com/0xfunboy/KernAid/actions/runs/32432064694",
-    "downloadName": "KernAid-Rescue-amd64-preview.iso",
-    "checksumName": "KernAid-Rescue-amd64-preview.iso.sha256",
-    "qualification": "Smoke QEMU disponibile per BIOS e UEFI; il gate vault lifecycle non è superato.",
-    "warning": "Candidato engineering interno non promosso: il catalogo trusted v2 è vuoto e il vault lifecycle è fallito. Non è una release e non è qualificato per scrittura o avvio da USB fisica."
+    "sourceCommit": "e9340bbe98fa73a0398cde12010a260b3a7951af",
+    "artifactVersion": "ci-32915064704-1",
+    "workflowUrl": "https://github.com/0xfunboy/KernAid/actions/runs/32915064704",
+    "downloadName": "KernAid-Rescue-amd64-e9340bb-internal.iso",
+    "checksumName": "KernAid-Rescue-amd64-e9340bb-internal.iso.sha256",
+    "qualification": "Build, ABI, SBOM, boot QEMU BIOS/UEFI e USB-style two-boot con vault LUKS2/ext4 superati. Falliscono i due gate finali del bridge locale Codex status.",
+    "warning": "Candidata interna non promossa: workflow rosso, catalogo trusted v2 vuoto, Secure Boot e USB fisica non qualificati. Solo test su chiavetta nuova o sacrificabile e hardware non cliente; non usare per riparazioni."
   }
 }
