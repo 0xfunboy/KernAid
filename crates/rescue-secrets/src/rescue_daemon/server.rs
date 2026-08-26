@@ -7251,12 +7251,12 @@ mod tests {
                     && lease.state == LeaseState::Pending
                     && lease.lease_timeout == CODEX_PROVIDER_LEASE_TIMEOUT
         ));
-        let mut codex_output = match supervisor
+        let codex_issue = supervisor
             .mark_lease_potentially_issued(codex_lease_id)
-            .expect("arm Codex output")
-        {
-            PotentialIssue::Armed(output) => output,
-            _ => panic!("Codex lease was not armed"),
+            .expect("arm Codex output");
+        assert!(matches!(&codex_issue, PotentialIssue::Armed(_)));
+        let PotentialIssue::Armed(mut codex_output) = codex_issue else {
+            return;
         };
         let (codex_home, codex_home_writer) =
             pipe_with(PipeFlags::CLOEXEC).expect("Codex home test descriptor");
