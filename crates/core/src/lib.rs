@@ -23,6 +23,413 @@ pub fn validate_fixture_repair_lab_plan(
     validate_fixture_repair_lab_policy(plan, target_fingerprint)
 }
 
+/// Immutable broker-derived bindings for one fixture-only R2 mutation.
+///
+/// This type is deliberately available only in the disposable fixture build.
+/// Callers cannot change any binding after staging, and every later transition
+/// must present the same values again.
+#[cfg(feature = "fixture-repair-lab")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FixtureMutationBinding {
+    plan_id: String,
+    plan_hash: String,
+    target_snapshot: String,
+    resource_id: String,
+    resource_precondition: String,
+}
+
+#[cfg(feature = "fixture-repair-lab")]
+impl FixtureMutationBinding {
+    pub fn new(
+        plan_id: impl Into<String>,
+        plan_hash: impl Into<String>,
+        target_snapshot: impl Into<String>,
+        resource_id: impl Into<String>,
+        resource_precondition: impl Into<String>,
+    ) -> Result<Self, FixtureTransactionError> {
+        let binding = Self {
+            plan_id: plan_id.into(),
+            plan_hash: plan_hash.into(),
+            target_snapshot: target_snapshot.into(),
+            resource_id: resource_id.into(),
+            resource_precondition: resource_precondition.into(),
+        };
+        if !valid_fixture_identifier(&binding.plan_id)
+            || !valid_fixture_sha256(&binding.plan_hash)
+            || !valid_fixture_sha256(&binding.target_snapshot)
+            || !valid_fixture_identifier(&binding.resource_id)
+            || !valid_fixture_sha256(&binding.resource_precondition)
+        {
+            return Err(FixtureTransactionError::InvalidBinding);
+        }
+        Ok(binding)
+    }
+
+    pub fn plan_id(&self) -> &str {
+        &self.plan_id
+    }
+
+    pub fn plan_hash(&self) -> &str {
+        &self.plan_hash
+    }
+
+    pub fn target_snapshot(&self) -> &str {
+        &self.target_snapshot
+    }
+
+    pub fn resource_id(&self) -> &str {
+        &self.resource_id
+    }
+
+    pub fn resource_precondition(&self) -> &str {
+        &self.resource_precondition
+    }
+}
+
+/// Complete immutable proof presented for approval and every later mutation
+/// transition. The approval identifier and sequence become immutable on the
+/// first successful `approve` call.
+#[cfg(feature = "fixture-repair-lab")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FixtureTransitionProof {
+    mutation: FixtureMutationBinding,
+    approval_id: String,
+    approval_sequence: u64,
+}
+
+#[cfg(feature = "fixture-repair-lab")]
+impl FixtureTransitionProof {
+    pub fn new(
+        mutation: FixtureMutationBinding,
+        approval_id: impl Into<String>,
+        approval_sequence: u64,
+    ) -> Result<Self, FixtureTransactionError> {
+        let proof = Self {
+            mutation,
+            approval_id: approval_id.into(),
+            approval_sequence,
+        };
+        if !valid_fixture_identifier(&proof.approval_id) || proof.approval_sequence == 0 {
+            return Err(FixtureTransactionError::InvalidApproval);
+        }
+        Ok(proof)
+    }
+
+    pub fn mutation(&self) -> &FixtureMutationBinding {
+        &self.mutation
+    }
+
+    pub fn approval_id(&self) -> &str {
+        &self.approval_id
+    }
+
+    pub const fn approval_sequence(&self) -> u64 {
+        self.approval_sequence
+    }
+}
+
+#[cfg(feature = "fixture-repair-lab")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FixtureVerificationOutcome {
+    Succeeded,
+    Failed,
+}
+
+#[cfg(feature = "fixture-repair-lab")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FixtureRepairTransactionState {
+    Staged,
+    Approved,
+    Repairing,
+    Verified(FixtureVerificationOutcome),
+    Complete(FixtureVerificationOutcome),
+}
+
+#[cfg(feature = "fixture-repair-lab")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FixtureRollbackTransactionState {
+    Staged,
+    Approved,
+    RollingBack,
+    Verified(FixtureVerificationOutcome),
+    Complete(FixtureVerificationOutcome),
+}
+
+#[cfg(feature = "fixture-repair-lab")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FixtureTransactionError {
+    InvalidBinding,
+    InvalidApproval,
+    InvalidTransition,
+    BindingMismatch,
+    ApprovalMismatch,
+    RollbackApprovalNotDistinct,
+}
+
+#[cfg(feature = "fixture-repair-lab")]
+impl fmt::Display for FixtureTransactionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidBinding => "fixture transaction binding is invalid",
+            Self::InvalidApproval => "fixture transaction approval is invalid",
+            Self::InvalidTransition => "fixture transaction transition is invalid",
+            Self::BindingMismatch => "fixture transaction binding changed after staging",
+            Self::ApprovalMismatch => "fixture transaction approval changed after approval",
+            Self::RollbackApprovalNotDistinct => "fixture rollback requires a distinct approval",
+        })
+    }
+}
+
+#[cfg(feature = "fixture-repair-lab")]
+impl Error for FixtureTransactionError {}
+
+#[cfg(feature = "fixture-repair-lab")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BoundFixtureTransaction {
+    mutation: FixtureMutationBinding,
+    approval_id: Option<String>,
+    approval_sequence: Option<u64>,
+}
+
+#[cfg(feature = "fixture-repair-lab")]
+impl BoundFixtureTransaction {
+    fn staged(mutation: FixtureMutationBinding) -> Self {
+        Self {
+            mutation,
+            approval_id: None,
+            approval_sequence: None,
+        }
+    }
+
+    fn approve(&mut self, proof: &FixtureTransitionProof) -> Result<(), FixtureTransactionError> {
+        self.validate_mutation(proof)?;
+        if self.approval_id.is_some() || self.approval_sequence.is_some() {
+            return Err(FixtureTransactionError::InvalidTransition);
+        }
+        self.approval_id = Some(proof.approval_id.clone());
+        self.approval_sequence = Some(proof.approval_sequence);
+        Ok(())
+    }
+
+    fn validate_proof(
+        &self,
+        proof: &FixtureTransitionProof,
+    ) -> Result<(), FixtureTransactionError> {
+        self.validate_mutation(proof)?;
+        if self.approval_id.as_deref() != Some(proof.approval_id.as_str())
+            || self.approval_sequence != Some(proof.approval_sequence)
+        {
+            return Err(FixtureTransactionError::ApprovalMismatch);
+        }
+        Ok(())
+    }
+
+    fn validate_mutation(
+        &self,
+        proof: &FixtureTransitionProof,
+    ) -> Result<(), FixtureTransactionError> {
+        if self.mutation != proof.mutation {
+            return Err(FixtureTransactionError::BindingMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// Feature-gated Core state machine for the disposable fixture repair.
+#[cfg(feature = "fixture-repair-lab")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FixtureRepairTransaction {
+    bound: BoundFixtureTransaction,
+    state: FixtureRepairTransactionState,
+}
+
+#[cfg(feature = "fixture-repair-lab")]
+impl FixtureRepairTransaction {
+    pub fn stage(mutation: FixtureMutationBinding) -> Self {
+        Self {
+            bound: BoundFixtureTransaction::staged(mutation),
+            state: FixtureRepairTransactionState::Staged,
+        }
+    }
+
+    pub const fn state(&self) -> FixtureRepairTransactionState {
+        self.state
+    }
+
+    pub fn binding(&self) -> &FixtureMutationBinding {
+        &self.bound.mutation
+    }
+
+    pub fn approve(
+        &mut self,
+        proof: &FixtureTransitionProof,
+    ) -> Result<(), FixtureTransactionError> {
+        if self.state != FixtureRepairTransactionState::Staged {
+            return Err(FixtureTransactionError::InvalidTransition);
+        }
+        self.bound.approve(proof)?;
+        self.state = FixtureRepairTransactionState::Approved;
+        Ok(())
+    }
+
+    pub fn begin_repair(
+        &mut self,
+        proof: &FixtureTransitionProof,
+    ) -> Result<(), FixtureTransactionError> {
+        if self.state != FixtureRepairTransactionState::Approved {
+            return Err(FixtureTransactionError::InvalidTransition);
+        }
+        self.bound.validate_proof(proof)?;
+        self.state = FixtureRepairTransactionState::Repairing;
+        Ok(())
+    }
+
+    pub fn record_verification(
+        &mut self,
+        proof: &FixtureTransitionProof,
+        outcome: FixtureVerificationOutcome,
+    ) -> Result<(), FixtureTransactionError> {
+        if self.state != FixtureRepairTransactionState::Repairing {
+            return Err(FixtureTransactionError::InvalidTransition);
+        }
+        self.bound.validate_proof(proof)?;
+        self.state = FixtureRepairTransactionState::Verified(outcome);
+        Ok(())
+    }
+
+    pub fn complete(
+        &mut self,
+        proof: &FixtureTransitionProof,
+    ) -> Result<(), FixtureTransactionError> {
+        let FixtureRepairTransactionState::Verified(outcome) = self.state else {
+            return Err(FixtureTransactionError::InvalidTransition);
+        };
+        self.bound.validate_proof(proof)?;
+        self.state = FixtureRepairTransactionState::Complete(outcome);
+        Ok(())
+    }
+}
+
+/// Feature-gated Core state machine for the separately approved rollback.
+#[cfg(feature = "fixture-repair-lab")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FixtureRollbackTransaction {
+    bound: BoundFixtureTransaction,
+    repair_approval_id: String,
+    repair_plan_hash: String,
+    state: FixtureRollbackTransactionState,
+}
+
+#[cfg(feature = "fixture-repair-lab")]
+impl FixtureRollbackTransaction {
+    pub fn stage(
+        mutation: FixtureMutationBinding,
+        repair_approval_id: impl Into<String>,
+        repair_plan_hash: impl Into<String>,
+    ) -> Result<Self, FixtureTransactionError> {
+        let repair_approval_id = repair_approval_id.into();
+        let repair_plan_hash = repair_plan_hash.into();
+        if !valid_fixture_identifier(&repair_approval_id)
+            || !valid_fixture_sha256(&repair_plan_hash)
+        {
+            return Err(FixtureTransactionError::InvalidBinding);
+        }
+        Ok(Self {
+            bound: BoundFixtureTransaction::staged(mutation),
+            repair_approval_id,
+            repair_plan_hash,
+            state: FixtureRollbackTransactionState::Staged,
+        })
+    }
+
+    pub const fn state(&self) -> FixtureRollbackTransactionState {
+        self.state
+    }
+
+    pub fn binding(&self) -> &FixtureMutationBinding {
+        &self.bound.mutation
+    }
+
+    pub fn repair_approval_id(&self) -> &str {
+        &self.repair_approval_id
+    }
+
+    pub fn repair_plan_hash(&self) -> &str {
+        &self.repair_plan_hash
+    }
+
+    pub fn approve(
+        &mut self,
+        proof: &FixtureTransitionProof,
+    ) -> Result<(), FixtureTransactionError> {
+        if self.state != FixtureRollbackTransactionState::Staged {
+            return Err(FixtureTransactionError::InvalidTransition);
+        }
+        if proof.approval_id == self.repair_approval_id {
+            return Err(FixtureTransactionError::RollbackApprovalNotDistinct);
+        }
+        self.bound.approve(proof)?;
+        self.state = FixtureRollbackTransactionState::Approved;
+        Ok(())
+    }
+
+    pub fn begin_rollback(
+        &mut self,
+        proof: &FixtureTransitionProof,
+    ) -> Result<(), FixtureTransactionError> {
+        if self.state != FixtureRollbackTransactionState::Approved {
+            return Err(FixtureTransactionError::InvalidTransition);
+        }
+        self.bound.validate_proof(proof)?;
+        self.state = FixtureRollbackTransactionState::RollingBack;
+        Ok(())
+    }
+
+    pub fn record_verification(
+        &mut self,
+        proof: &FixtureTransitionProof,
+        outcome: FixtureVerificationOutcome,
+    ) -> Result<(), FixtureTransactionError> {
+        if self.state != FixtureRollbackTransactionState::RollingBack {
+            return Err(FixtureTransactionError::InvalidTransition);
+        }
+        self.bound.validate_proof(proof)?;
+        self.state = FixtureRollbackTransactionState::Verified(outcome);
+        Ok(())
+    }
+
+    pub fn complete(
+        &mut self,
+        proof: &FixtureTransitionProof,
+    ) -> Result<(), FixtureTransactionError> {
+        let FixtureRollbackTransactionState::Verified(outcome) = self.state else {
+            return Err(FixtureTransactionError::InvalidTransition);
+        };
+        self.bound.validate_proof(proof)?;
+        self.state = FixtureRollbackTransactionState::Complete(outcome);
+        Ok(())
+    }
+}
+
+#[cfg(feature = "fixture-repair-lab")]
+fn valid_fixture_sha256(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+#[cfg(feature = "fixture-repair-lab")]
+fn valid_fixture_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum State {
     Observe,
@@ -452,6 +859,28 @@ mod tests {
     }
 
     #[cfg(feature = "fixture-repair-lab")]
+    fn fixture_mutation(plan_id: &str, marker: char) -> FixtureMutationBinding {
+        FixtureMutationBinding::new(
+            plan_id,
+            format!("sha256:{}", marker.to_string().repeat(64)),
+            FIXTURE_TARGET,
+            "linux.fstab",
+            format!("sha256:{}", "b".repeat(64)),
+        )
+        .expect("valid fixture mutation binding")
+    }
+
+    #[cfg(feature = "fixture-repair-lab")]
+    fn fixture_proof(
+        mutation: &FixtureMutationBinding,
+        approval_id: &str,
+        sequence: u64,
+    ) -> FixtureTransitionProof {
+        FixtureTransitionProof::new(mutation.clone(), approval_id, sequence)
+            .expect("valid fixture transition proof")
+    }
+
+    #[cfg(feature = "fixture-repair-lab")]
     fn diagnosed_fixture_session() -> Session {
         let bytes = envelope(LinuxSnapshotCapture::resident());
         let snapshot = evidence("local-machine", &bytes);
@@ -688,6 +1117,106 @@ mod tests {
             Err(PolicyError::MutationDisabled)
         );
         assert_eq!(session.state(), &State::Observe);
+    }
+
+    #[cfg(feature = "fixture-repair-lab")]
+    #[test]
+    fn fixture_repair_transaction_requires_bound_approval_and_ordered_transitions() {
+        let mutation = fixture_mutation("P-fixture-repair", 'a');
+        let proof = fixture_proof(&mutation, "A-fixture-repair", 7);
+        let mut transaction = FixtureRepairTransaction::stage(mutation.clone());
+
+        assert_eq!(
+            transaction.begin_repair(&proof),
+            Err(FixtureTransactionError::InvalidTransition)
+        );
+        transaction.approve(&proof).expect("approve repair");
+        assert_eq!(transaction.state(), FixtureRepairTransactionState::Approved);
+
+        let changed_binding = fixture_mutation("P-foreign-repair", 'a');
+        let changed_proof = fixture_proof(&changed_binding, "A-fixture-repair", 7);
+        assert_eq!(
+            transaction.begin_repair(&changed_proof),
+            Err(FixtureTransactionError::BindingMismatch)
+        );
+        let changed_approval = fixture_proof(&mutation, "A-foreign-repair", 7);
+        assert_eq!(
+            transaction.begin_repair(&changed_approval),
+            Err(FixtureTransactionError::ApprovalMismatch)
+        );
+
+        transaction.begin_repair(&proof).expect("begin repair");
+        transaction
+            .record_verification(&proof, FixtureVerificationOutcome::Succeeded)
+            .expect("record successful verification");
+        transaction.complete(&proof).expect("complete repair");
+        assert_eq!(
+            transaction.state(),
+            FixtureRepairTransactionState::Complete(FixtureVerificationOutcome::Succeeded)
+        );
+        assert_eq!(transaction.binding(), &mutation);
+        assert_eq!(
+            transaction.complete(&proof),
+            Err(FixtureTransactionError::InvalidTransition)
+        );
+    }
+
+    #[cfg(feature = "fixture-repair-lab")]
+    #[test]
+    fn fixture_repair_failure_is_an_explicit_completed_outcome() {
+        let mutation = fixture_mutation("P-fixture-failed", 'c');
+        let proof = fixture_proof(&mutation, "A-fixture-failed", 8);
+        let mut transaction = FixtureRepairTransaction::stage(mutation);
+        transaction.approve(&proof).expect("approve repair");
+        transaction.begin_repair(&proof).expect("begin repair");
+        transaction
+            .record_verification(&proof, FixtureVerificationOutcome::Failed)
+            .expect("record failed verification");
+        transaction.complete(&proof).expect("complete failure");
+        assert_eq!(
+            transaction.state(),
+            FixtureRepairTransactionState::Complete(FixtureVerificationOutcome::Failed)
+        );
+    }
+
+    #[cfg(feature = "fixture-repair-lab")]
+    #[test]
+    fn fixture_rollback_is_bound_to_repair_but_requires_a_new_approval() {
+        let mutation = fixture_mutation("P-fixture-rollback", 'd');
+        let repair_plan_hash = format!("sha256:{}", "a".repeat(64));
+        let mut transaction = FixtureRollbackTransaction::stage(
+            mutation.clone(),
+            "A-fixture-repair",
+            &repair_plan_hash,
+        )
+        .expect("stage rollback");
+        assert_eq!(transaction.repair_approval_id(), "A-fixture-repair");
+        assert_eq!(transaction.repair_plan_hash(), repair_plan_hash);
+
+        let reused_approval = fixture_proof(&mutation, "A-fixture-repair", 9);
+        assert_eq!(
+            transaction.approve(&reused_approval),
+            Err(FixtureTransactionError::RollbackApprovalNotDistinct)
+        );
+        assert_eq!(transaction.state(), FixtureRollbackTransactionState::Staged);
+
+        let rollback_approval = fixture_proof(&mutation, "A-fixture-rollback", 9);
+        transaction
+            .approve(&rollback_approval)
+            .expect("approve rollback separately");
+        transaction
+            .begin_rollback(&rollback_approval)
+            .expect("begin rollback");
+        transaction
+            .record_verification(&rollback_approval, FixtureVerificationOutcome::Succeeded)
+            .expect("verify rollback");
+        transaction
+            .complete(&rollback_approval)
+            .expect("complete rollback");
+        assert_eq!(
+            transaction.state(),
+            FixtureRollbackTransactionState::Complete(FixtureVerificationOutcome::Succeeded)
+        );
     }
 
     #[test]

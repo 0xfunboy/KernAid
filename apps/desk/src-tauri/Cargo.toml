@@ -8,6 +8,7 @@ default-run="kernaid-desk-shell"
 default = []
 fixture-repair-lab = [
   "kernaid-broker/fixture-repair-lab",
+  "dep:kernaid-core",
   "kernaid-linux-pack/fixture-repair-lab",
   "dep:tempfile",
 ]
@@ -27,6 +28,7 @@ rustls = { version = "0.23.43", default-features = false, features = ["ring", "s
 tokio = { version = "1.53", features = ["macros", "sync", "time"] }
 zeroize = "1.8"
 kernaid-broker = { path = "../../../crates/broker" }
+kernaid-core = { path = "../../../crates/core", optional = true, features = ["fixture-repair-lab"] }
 kernaid-device-identity = { path = "../../../crates/device-identity" }
 kernaid-evidence = { path = "../../../crates/evidence" }
 kernaid-macos-pack = { path = "../../../packs/macos" }

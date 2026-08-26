@@ -2278,6 +2278,7 @@ dependencies = [
  "dirs",
  "fs2",
  "kernaid-broker",
+ "kernaid-core",
  "kernaid-device-identity",
  "kernaid-evidence",
  "kernaid-linux-pack",

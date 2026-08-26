@@ -10,6 +10,11 @@ use kernaid_broker::fixture_repair::{
     FixtureRollbackApproval, StageFixtureRepairRequest, StageFixtureRollbackRequest,
     StagedFixtureRepair, StagedFixtureRollback,
 };
+use kernaid_core::{
+    FixtureMutationBinding, FixtureRepairTransaction, FixtureRepairTransactionState,
+    FixtureRollbackTransaction, FixtureRollbackTransactionState, FixtureTransactionError,
+    FixtureTransitionProof, FixtureVerificationOutcome,
+};
 use kernaid_device_identity::DeviceIdentity;
 use kernaid_linux_pack::{
     action_contract::FIXTURE_ACTION_ID,
@@ -108,6 +113,8 @@ struct FixtureLabInner {
     identity: DeviceIdentity,
     staged_repairs: HashMap<String, StagedFixtureRepair>,
     staged_rollbacks: HashMap<String, StagedFixtureRollback>,
+    repair_transactions: HashMap<String, FixtureRepairTransaction>,
+    rollback_transactions: HashMap<String, FixtureRollbackTransaction>,
     completed_repairs: HashMap<String, FixtureLabExecuteResponse>,
     completed_rollbacks: HashMap<String, FixtureLabRollbackExecuteResponse>,
 }
@@ -306,6 +313,8 @@ impl FixtureRepairLab {
             identity,
             staged_repairs: HashMap::new(),
             staged_rollbacks: HashMap::new(),
+            repair_transactions: HashMap::new(),
+            rollback_transactions: HashMap::new(),
             completed_repairs: HashMap::new(),
             completed_rollbacks: HashMap::new(),
         })))
@@ -385,6 +394,12 @@ impl FixtureRepairLab {
                 .map_err(|_| stage_error())?
         };
         let response = stage_response(&staged);
+        let transaction = FixtureRepairTransaction::stage(
+            repair_mutation_binding(&staged).map_err(|_| stage_error())?,
+        );
+        inner
+            .repair_transactions
+            .insert(request.plan_id.clone(), transaction);
         inner.staged_repairs.insert(request.plan_id, staged);
         Ok(response)
     }
@@ -399,67 +414,106 @@ impl FixtureRepairLab {
             .get(&request.plan_id)
             .cloned()
             .ok_or_else(execution_error)?;
-        let config = FixtureRepairConfig::new(&inner.fixture_root, &inner.backup_root)
+        let mut transaction = inner
+            .repair_transactions
+            .get(&request.plan_id)
+            .cloned()
+            .ok_or_else(execution_error)?;
+        let proof = repair_transition_proof(&staged, &request).map_err(|_| execution_error())?;
+        transaction
+            .approve(&proof)
+            .and_then(|()| transaction.begin_repair(&proof))
             .map_err(|_| execution_error())?;
-        let public_key = inner.identity.public_key();
-        let receipt = {
-            let FixtureLabInner {
-                journal, identity, ..
-            } = &mut *inner;
-            let mut broker = FixtureRepairBroker::attach(config, journal, identity)
+        inner
+            .repair_transactions
+            .insert(request.plan_id.clone(), transaction.clone());
+
+        let committed = (|| {
+            let config = FixtureRepairConfig::new(&inner.fixture_root, &inner.backup_root)
                 .map_err(|_| execution_error())?;
-            broker
-                .execute(
-                    &staged,
-                    FixtureRepairApproval {
-                        approval_id: &request.approval_id,
-                        approval_sequence: request.approval_sequence,
-                        session_id: &request.session_id,
-                        plan_id: &request.plan_id,
-                        plan_hash: &request.plan_hash,
-                        target_snapshot: &request.target_snapshot,
-                    },
-                )
-                .map_err(|_| execution_error())?
-        };
-        let payload = receipt.verify(&public_key).map_err(|_| execution_error())?;
-        let response = FixtureLabExecuteResponse {
-            approval_id: payload.approval_id().to_owned(),
-            approval_sequence: payload.approval_sequence(),
-            session_id: staged.session_id().to_owned(),
-            plan_id: staged.plan_id().to_owned(),
-            plan_hash: payload.plan_hash().to_owned(),
-            action_id: staged.action_id(),
-            resource_id: staged.resource_id(),
-            risk: "R2",
-            diagnosis_sha256: payload.diagnosis_sha256().to_owned(),
-            finding_id: staged.finding_id(),
-            finding_version: staged.finding_version(),
-            evidence: payload
-                .evidence()
-                .iter()
-                .map(|binding| FixtureLabEvidenceSummary {
-                    id: binding.id().to_owned(),
-                    sha256: binding.sha256().to_owned(),
-                })
-                .collect(),
-            target_snapshot: staged.target_snapshot().to_owned(),
-            before_sha256: payload.before_sha256().to_owned(),
-            after_sha256: payload.after_sha256().to_owned(),
-            backup_locator: payload.backup_locator().to_owned(),
-            backup_sha256: payload.backup_sha256().to_owned(),
-            validation_passed: payload.validation_passed(),
-        };
-        inner.staged_repairs.remove(&request.plan_id);
+            let public_key = inner.identity.public_key();
+            let receipt = {
+                let FixtureLabInner {
+                    journal, identity, ..
+                } = &mut *inner;
+                let mut broker = FixtureRepairBroker::attach(config, journal, identity)
+                    .map_err(|_| execution_error())?;
+                broker
+                    .execute(
+                        &staged,
+                        FixtureRepairApproval {
+                            approval_id: &request.approval_id,
+                            approval_sequence: request.approval_sequence,
+                            session_id: &request.session_id,
+                            plan_id: &request.plan_id,
+                            plan_hash: &request.plan_hash,
+                            target_snapshot: &request.target_snapshot,
+                        },
+                    )
+                    .map_err(|_| execution_error())?
+            };
+            let payload = receipt.verify(&public_key).map_err(|_| execution_error())?;
+            let response = FixtureLabExecuteResponse {
+                approval_id: payload.approval_id().to_owned(),
+                approval_sequence: payload.approval_sequence(),
+                session_id: staged.session_id().to_owned(),
+                plan_id: staged.plan_id().to_owned(),
+                plan_hash: payload.plan_hash().to_owned(),
+                action_id: staged.action_id(),
+                resource_id: staged.resource_id(),
+                risk: "R2",
+                diagnosis_sha256: payload.diagnosis_sha256().to_owned(),
+                finding_id: staged.finding_id(),
+                finding_version: staged.finding_version(),
+                evidence: payload
+                    .evidence()
+                    .iter()
+                    .map(|binding| FixtureLabEvidenceSummary {
+                        id: binding.id().to_owned(),
+                        sha256: binding.sha256().to_owned(),
+                    })
+                    .collect(),
+                target_snapshot: staged.target_snapshot().to_owned(),
+                before_sha256: payload.before_sha256().to_owned(),
+                after_sha256: payload.after_sha256().to_owned(),
+                backup_locator: payload.backup_locator().to_owned(),
+                backup_sha256: payload.backup_sha256().to_owned(),
+                validation_passed: payload.validation_passed(),
+            };
+            Ok(response)
+        })();
+
+        // A verified signed receipt means the broker may already have committed.
+        // Make reconciliation available before running the independent
+        // diagnostic post-verification.
+        let response = committed?;
         inner
             .completed_repairs
             .insert(response.approval_id.clone(), response.clone());
-        let installed_fstab =
-            fs::read(inner.fixture_root.join("etc/fstab")).map_err(|_| execution_error())?;
-        let verification = diagnostic_report(&installed_fstab).map_err(|_| execution_error())?;
-        if fixture_finding_present(&verification) {
+        let post_verification = (|| {
+            let installed_fstab =
+                fs::read(inner.fixture_root.join("etc/fstab")).map_err(|_| execution_error())?;
+            let verification =
+                diagnostic_report(&installed_fstab).map_err(|_| execution_error())?;
+            Ok(response.validation_passed && !fixture_finding_present(&verification))
+        })();
+        let outcome = if matches!(post_verification, Ok(true)) {
+            FixtureVerificationOutcome::Succeeded
+        } else {
+            FixtureVerificationOutcome::Failed
+        };
+        transaction
+            .record_verification(&proof, outcome)
+            .and_then(|()| transaction.complete(&proof))
+            .map_err(|_| execution_error())?;
+        if outcome == FixtureVerificationOutcome::Failed {
+            inner
+                .repair_transactions
+                .insert(request.plan_id.clone(), transaction);
             return Err(execution_error());
         }
+        inner.repair_transactions.remove(&request.plan_id);
+        inner.staged_repairs.remove(&request.plan_id);
         Ok(response)
     }
 
@@ -467,13 +521,25 @@ impl FixtureRepairLab {
         &self,
         request: FixtureLabReconcileRequest,
     ) -> Result<FixtureLabExecuteResponse, String> {
-        self.0
-            .lock()
-            .map_err(|_| execution_error())?
+        let inner = self.0.lock().map_err(|_| execution_error())?;
+        let response = inner
             .completed_repairs
             .get(&request.approval_id)
             .cloned()
-            .ok_or_else(execution_error)
+            .ok_or_else(execution_error)?;
+        if inner
+            .repair_transactions
+            .get(&response.plan_id)
+            .is_some_and(|transaction| {
+                transaction.state()
+                    != FixtureRepairTransactionState::Complete(
+                        FixtureVerificationOutcome::Succeeded,
+                    )
+            })
+        {
+            return Err(execution_error());
+        }
+        Ok(response)
     }
 
     fn stage_rollback(
@@ -509,6 +575,15 @@ impl FixtureRepairLab {
                 .map_err(|_| rollback_stage_error())?
         };
         let response = rollback_stage_response(&staged, &completed_repair);
+        let transaction = FixtureRollbackTransaction::stage(
+            rollback_mutation_binding(&staged).map_err(|_| rollback_stage_error())?,
+            staged.repair_approval_id(),
+            &completed_repair.plan_hash,
+        )
+        .map_err(|_| rollback_stage_error())?;
+        inner
+            .rollback_transactions
+            .insert(request.plan_id.clone(), transaction);
         inner.staged_rollbacks.insert(request.plan_id, staged);
         Ok(response)
     }
@@ -528,63 +603,99 @@ impl FixtureRepairLab {
             .get(staged.repair_approval_id())
             .cloned()
             .ok_or_else(rollback_execution_error)?;
-        let config = FixtureRepairConfig::new(&inner.fixture_root, &inner.backup_root)
+        let mut transaction = inner
+            .rollback_transactions
+            .get(&request.plan_id)
+            .cloned()
+            .ok_or_else(rollback_execution_error)?;
+        let proof =
+            rollback_transition_proof(&staged, &request).map_err(|_| rollback_execution_error())?;
+        transaction
+            .approve(&proof)
+            .and_then(|()| transaction.begin_rollback(&proof))
             .map_err(|_| rollback_execution_error())?;
-        let public_key = inner.identity.public_key();
-        let report = {
-            let FixtureLabInner {
-                journal, identity, ..
-            } = &mut *inner;
-            let mut broker = FixtureRepairBroker::attach(config, journal, identity)
+        inner
+            .rollback_transactions
+            .insert(request.plan_id.clone(), transaction.clone());
+
+        let committed = (|| {
+            let config = FixtureRepairConfig::new(&inner.fixture_root, &inner.backup_root)
                 .map_err(|_| rollback_execution_error())?;
-            broker
-                .execute_rollback(
-                    &staged,
-                    FixtureRollbackApproval {
-                        approval_id: &request.approval_id,
-                        approval_sequence: request.approval_sequence,
-                        session_id: &request.session_id,
-                        plan_id: &request.plan_id,
-                        plan_hash: &request.plan_hash,
-                        target_snapshot: &request.target_snapshot,
-                    },
-                )
-                .map_err(|_| rollback_execution_error())?
-        };
-        let payload = report
-            .verify(&public_key)
-            .map_err(|_| rollback_execution_error())?;
-        let response = FixtureLabRollbackExecuteResponse {
-            repair_approval_id: staged.repair_approval_id().to_owned(),
-            rollback_approval_id: payload.rollback_approval_id().to_owned(),
-            approval_sequence: request.approval_sequence,
-            session_id: staged.session_id().to_owned(),
-            plan_id: staged.plan_id().to_owned(),
-            plan_hash: staged.plan_hash().to_owned(),
-            action_id: staged.action_id(),
-            resource_id: staged.resource_id(),
-            risk: "R2",
-            target_snapshot: staged.target_snapshot().to_owned(),
-            replaced_sha256: staged.installed_sha256().to_owned(),
-            restored_sha256: payload.restored_sha256().to_owned(),
-            backup_locator: staged.backup_locator().to_owned(),
-            backup_sha256: completed_repair.backup_sha256,
-            validation_passed: true,
-            final_state: payload.final_state().to_owned(),
-        };
-        inner.staged_rollbacks.remove(&request.plan_id);
+            let public_key = inner.identity.public_key();
+            let report = {
+                let FixtureLabInner {
+                    journal, identity, ..
+                } = &mut *inner;
+                let mut broker = FixtureRepairBroker::attach(config, journal, identity)
+                    .map_err(|_| rollback_execution_error())?;
+                broker
+                    .execute_rollback(
+                        &staged,
+                        FixtureRollbackApproval {
+                            approval_id: &request.approval_id,
+                            approval_sequence: request.approval_sequence,
+                            session_id: &request.session_id,
+                            plan_id: &request.plan_id,
+                            plan_hash: &request.plan_hash,
+                            target_snapshot: &request.target_snapshot,
+                        },
+                    )
+                    .map_err(|_| rollback_execution_error())?
+            };
+            let payload = report
+                .verify(&public_key)
+                .map_err(|_| rollback_execution_error())?;
+            let response = FixtureLabRollbackExecuteResponse {
+                repair_approval_id: staged.repair_approval_id().to_owned(),
+                rollback_approval_id: payload.rollback_approval_id().to_owned(),
+                approval_sequence: request.approval_sequence,
+                session_id: staged.session_id().to_owned(),
+                plan_id: staged.plan_id().to_owned(),
+                plan_hash: staged.plan_hash().to_owned(),
+                action_id: staged.action_id(),
+                resource_id: staged.resource_id(),
+                risk: "R2",
+                target_snapshot: staged.target_snapshot().to_owned(),
+                replaced_sha256: staged.installed_sha256().to_owned(),
+                restored_sha256: payload.restored_sha256().to_owned(),
+                backup_locator: staged.backup_locator().to_owned(),
+                backup_sha256: completed_repair.backup_sha256.clone(),
+                validation_passed: true,
+                final_state: payload.final_state().to_owned(),
+            };
+            Ok(response)
+        })();
+
+        // Preserve a verified signed rollback report for reconciliation before
+        // the independent diagnostic post-verification.
+        let response = committed?;
         inner
             .completed_rollbacks
             .insert(response.rollback_approval_id.clone(), response.clone());
-        let restored_fstab = fs::read(inner.fixture_root.join("etc/fstab"))
+        let post_verification = (|| {
+            let restored_fstab = fs::read(inner.fixture_root.join("etc/fstab"))
+                .map_err(|_| rollback_execution_error())?;
+            let verification =
+                diagnostic_report(&restored_fstab).map_err(|_| rollback_execution_error())?;
+            Ok(restored_fstab == BROKEN_FSTAB && fixture_finding_present(&verification))
+        })();
+        let outcome = if matches!(post_verification, Ok(true)) {
+            FixtureVerificationOutcome::Succeeded
+        } else {
+            FixtureVerificationOutcome::Failed
+        };
+        transaction
+            .record_verification(&proof, outcome)
+            .and_then(|()| transaction.complete(&proof))
             .map_err(|_| rollback_execution_error())?;
-        if restored_fstab != BROKEN_FSTAB
-            || !fixture_finding_present(
-                &diagnostic_report(&restored_fstab).map_err(|_| rollback_execution_error())?,
-            )
-        {
+        if outcome == FixtureVerificationOutcome::Failed {
+            inner
+                .rollback_transactions
+                .insert(request.plan_id.clone(), transaction);
             return Err(rollback_execution_error());
         }
+        inner.rollback_transactions.remove(&request.plan_id);
+        inner.staged_rollbacks.remove(&request.plan_id);
         Ok(response)
     }
 
@@ -592,13 +703,25 @@ impl FixtureRepairLab {
         &self,
         request: FixtureLabReconcileRequest,
     ) -> Result<FixtureLabRollbackExecuteResponse, String> {
-        self.0
-            .lock()
-            .map_err(|_| rollback_execution_error())?
+        let inner = self.0.lock().map_err(|_| rollback_execution_error())?;
+        let response = inner
             .completed_rollbacks
             .get(&request.approval_id)
             .cloned()
-            .ok_or_else(rollback_execution_error)
+            .ok_or_else(rollback_execution_error)?;
+        if inner
+            .rollback_transactions
+            .get(&response.plan_id)
+            .is_some_and(|transaction| {
+                transaction.state()
+                    != FixtureRollbackTransactionState::Complete(
+                        FixtureVerificationOutcome::Succeeded,
+                    )
+            })
+        {
+            return Err(rollback_execution_error());
+        }
+        Ok(response)
     }
 }
 
@@ -655,6 +778,58 @@ pub(crate) fn fixture_lab_reconcile_rollback(
     request: FixtureLabReconcileRequest,
 ) -> Result<FixtureLabRollbackExecuteResponse, String> {
     state.reconcile_rollback(request)
+}
+
+fn repair_mutation_binding(
+    staged: &StagedFixtureRepair,
+) -> Result<FixtureMutationBinding, FixtureTransactionError> {
+    FixtureMutationBinding::new(
+        staged.plan_id(),
+        staged.plan_hash(),
+        staged.target_snapshot(),
+        staged.resource_id(),
+        staged.expected_before_sha256(),
+    )
+}
+
+fn repair_transition_proof(
+    staged: &StagedFixtureRepair,
+    request: &FixtureLabExecuteRequest,
+) -> Result<FixtureTransitionProof, FixtureTransactionError> {
+    let mutation = FixtureMutationBinding::new(
+        &request.plan_id,
+        &request.plan_hash,
+        &request.target_snapshot,
+        staged.resource_id(),
+        staged.expected_before_sha256(),
+    )?;
+    FixtureTransitionProof::new(mutation, &request.approval_id, request.approval_sequence)
+}
+
+fn rollback_mutation_binding(
+    staged: &StagedFixtureRollback,
+) -> Result<FixtureMutationBinding, FixtureTransactionError> {
+    FixtureMutationBinding::new(
+        staged.plan_id(),
+        staged.plan_hash(),
+        staged.target_snapshot(),
+        staged.resource_id(),
+        staged.installed_sha256(),
+    )
+}
+
+fn rollback_transition_proof(
+    staged: &StagedFixtureRollback,
+    request: &FixtureLabRollbackExecuteRequest,
+) -> Result<FixtureTransitionProof, FixtureTransactionError> {
+    let mutation = FixtureMutationBinding::new(
+        &request.plan_id,
+        &request.plan_hash,
+        &request.target_snapshot,
+        staged.resource_id(),
+        staged.installed_sha256(),
+    )?;
+    FixtureTransitionProof::new(mutation, &request.approval_id, request.approval_sequence)
 }
 
 fn diagnose_fixture(fstab: &[u8]) -> Result<(String, Vec<FixtureEvidenceBinding>), String> {
