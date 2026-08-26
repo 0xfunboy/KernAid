@@ -40,7 +40,7 @@ The CI workflows are configured to produce engineering-preview desktop installer
   [Current status](docs/CURRENT_STATUS.md) only for first physical-boot
   qualification. Verify its checksum and, on Windows, write it with Rufus in
   DD mode to a factory-new or disposable USB of at least 32 GB. The trusted v2
-  catalog revision 1 authorizes only this exact ISO, so the Linux writer can
+  catalog revision 2 authorizes only this exact ISO, so the Linux writer can
   verify, copy and provision its encrypted vault. The manual Windows path does
   not perform that trusted vault provisioning.
   Physical USB boot and firmware remain unqualified. On a successful boot,
@@ -61,9 +61,10 @@ The CI workflows are configured to produce engineering-preview desktop installer
   unlock it from the native TTY before Desk initializes. After diagnosis, use
   `kernaid-rescue-vaultctl report-list` and
   `kernaid-rescue-vaultctl report-export RP-...` to place a verified envelope
-  at `/home/kernaid/KernAid-Reports/<id>.signed.json`. The current private ISO
-  predates qualification of this new path; do not infer support until a later
-  Rescue workflow passes its dedicated lifecycle gate.
+  at `/home/kernaid/KernAid-Reports/<id>.signed.json`. The exact current private
+  ISO passed persistence, retrieval and fixed-path signed-envelope export on
+  that same artifact under virtual BIOS and UEFI. Physical USB behavior remains
+  a separate qualification gate.
 - **Windows, Linux or macOS that does boot:** download that operating system's desktop artifact, install it, and launch KernAid like a normal application. Windows and macOS startup collect only a fast, derived target identity; the deeper P0 collection starts once when **Diagnostica** is selected. macOS queries only the current-user `launchd` table and safe-boot integer, and explicitly reports system `launchd`, software-update availability, system-event analysis, and login/background-item counts as unqualified instead of inventing results. The fixed commands do not request repairs, although native Windows tools such as DISM may still update their own operating-system logs.
 - **Linux machine inventory:** Resident and Rescue use the same bounded Rust
   collector for CPU count/model, total RAM, firmware boot mode, selected public
@@ -112,11 +113,12 @@ See [Current status](docs/CURRENT_STATUS.md), the [operator guide](docs/operator
   qualified only after the full Rescue workflow passes, including both
   privileged BIOS and UEFI lifecycle jobs. The
   v2 writer can provision that vault only for an exact catalog-authorized image
-  on factory-new controlled-lab media; revision 1 authorizes the exact current
+  on factory-new controlled-lab media; revision 2 authorizes the exact current
   internally qualified candidate.
-  The Rescue report relay is loopback/internal-only and has not yet passed its
-  shipping-image lifecycle gate. Real-account Codex authorization, live
-  provider TLS and physical-media qualification remain incomplete.
+  The Rescue report relay is loopback/internal-only; the exact current image
+  passed its signed-report shipping lifecycle under virtual BIOS and UEFI.
+  Real-account Codex authorization, live provider TLS and physical-media
+  qualification remain incomplete.
 - Native production host inventory has no mutation or repair handler; the
   opt-in fixture lab is not a production host path. The parameter-free Linux
   hardware command, schema and packaging are virtually exercised, and the CI

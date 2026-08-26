@@ -198,14 +198,14 @@ class CatalogV2Tests(unittest.TestCase):
         Draft202012Validator(schema).validate(catalog_document)
 
         catalog = catalog_v2.parse_trust_catalog_v2(catalog_raw)
-        self.assertEqual(catalog.revision, 1)
+        self.assertEqual(catalog.revision, 2)
         self.assertEqual(len(catalog.images), 1)
         image = catalog.images[0]
         self.assertEqual(image.artifact_name, "KernAid-Rescue-amd64.iso")
-        self.assertEqual(image.artifact_version, "ci-32925221006-1")
+        self.assertEqual(image.artifact_version, "ci-32939869047-1")
         self.assertEqual(
             image.sha256,
-            "7d0ad0dce852381640d613d54d6e82708e27bf254b6c41060c63d736c63b68c0",
+            "9376269567869026bd34ab050fcfcba1f5c5633b97ec827b23916a1635322fb6",
         )
         self.assertEqual(image.size, 1_221_148_672)
         layout = catalog_v2.load_device_layout(MANIFEST_PATH)

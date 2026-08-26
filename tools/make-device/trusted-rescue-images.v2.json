@@ -1,11 +1,11 @@
 {
   "schema": "dev.kernaid.trusted-rescue-images.v2",
-  "catalogRevision": 1,
+  "catalogRevision": 2,
   "images": [
     {
       "artifactName": "KernAid-Rescue-amd64.iso",
-      "artifactVersion": "ci-32925221006-1",
-      "sha256": "7d0ad0dce852381640d613d54d6e82708e27bf254b6c41060c63d736c63b68c0",
+      "artifactVersion": "ci-32939869047-1",
+      "sha256": "9376269567869026bd34ab050fcfcba1f5c5633b97ec827b23916a1635322fb6",
       "bytes": 1221148672,
       "deviceLayout": {
         "schema": "kernaid.rescue-device-layout.v1",
@@ -31,18 +31,18 @@
           "bootTransport": "usb-storage",
           "bootCount": 2,
           "targetZeroWritesVerified": true,
-          "workflowRunId": 32925221006,
-          "workflowRunUrl": "https://github.com/0xfunboy/KernAid/actions/runs/32925221006",
-          "logSha256": "576ef01129b33ca74869f6f00bf368f83f7433e8f90ce2086114d0639c92cd81"
+          "workflowRunId": 32939869047,
+          "workflowRunUrl": "https://github.com/0xfunboy/KernAid/actions/runs/32939869047",
+          "logSha256": "e98adffcbfdae3f464379afbaea3e19082aa1b953843eb1ae4d4ddf2682ffe00"
         },
         "uefi": {
           "passed": true,
           "bootTransport": "usb-storage",
           "bootCount": 2,
           "targetZeroWritesVerified": true,
-          "workflowRunId": 32925221006,
-          "workflowRunUrl": "https://github.com/0xfunboy/KernAid/actions/runs/32925221006",
-          "logSha256": "7a31a25d402d148785ce4d251cb03ccd713cf1259f39d6c86fbcb36c32b0714d"
+          "workflowRunId": 32939869047,
+          "workflowRunUrl": "https://github.com/0xfunboy/KernAid/actions/runs/32939869047",
+          "logSha256": "e09b4f3df8ed52dea0ff269bde4c40a379ee844bf90243b26511c13de1b923b7"
         }
       },
       "qemuVaultAttestations": {
@@ -59,9 +59,9 @@
           "journalIdentityBindingVerified": true,
           "identityVerified": true,
           "wrongKeyRejected": true,
-          "workflowRunId": 32925221006,
-          "workflowRunUrl": "https://github.com/0xfunboy/KernAid/actions/runs/32925221006",
-          "logSha256": "576ef01129b33ca74869f6f00bf368f83f7433e8f90ce2086114d0639c92cd81"
+          "workflowRunId": 32939869047,
+          "workflowRunUrl": "https://github.com/0xfunboy/KernAid/actions/runs/32939869047",
+          "logSha256": "e98adffcbfdae3f464379afbaea3e19082aa1b953843eb1ae4d4ddf2682ffe00"
         },
         "uefi": {
           "passed": true,
@@ -76,9 +76,9 @@
           "journalIdentityBindingVerified": true,
           "identityVerified": true,
           "wrongKeyRejected": true,
-          "workflowRunId": 32925221006,
-          "workflowRunUrl": "https://github.com/0xfunboy/KernAid/actions/runs/32925221006",
-          "logSha256": "7a31a25d402d148785ce4d251cb03ccd713cf1259f39d6c86fbcb36c32b0714d"
+          "workflowRunId": 32939869047,
+          "workflowRunUrl": "https://github.com/0xfunboy/KernAid/actions/runs/32939869047",
+          "logSha256": "e09b4f3df8ed52dea0ff269bde4c40a379ee844bf90243b26511c13de1b923b7"
         }
       }
     }

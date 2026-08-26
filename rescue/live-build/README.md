@@ -36,9 +36,9 @@ The native TTY companion lists stored report IDs with
 `kernaid-rescue-vaultctl report-export RP-...`. Export is fixed to
 `/home/kernaid/KernAid-Reports/<id>.signed.json`, creates a mode-0700 directory
 and mode-0600 regular file, publishes atomically, and never overwrites an
-existing name. This pipeline remains an engineering implementation until its
-dedicated BIOS/UEFI shipping-image lifecycle gate passes; it does not add a
-production repair handler.
+existing name. It remains engineering-only and may be claimed only for an exact
+catalog-authorized image that passed its dedicated BIOS/UEFI shipping-image
+lifecycle gate; it does not add a production repair handler.
 
 The separate mode-0660 root:`kernaid-codex-client` socket starts one operation
 as fixed UID 973 `kernaid-codex`, with an empty capability set, closed devices,

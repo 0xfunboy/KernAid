@@ -7,12 +7,12 @@ unattended repair until those release gates are completed.
 ## Create the Rescue USB
 
 There is currently no physically qualified release. The private project area
-exposes one exact internally qualified candidate from commit `ba33828` to
+exposes one exact internally qualified candidate from commit `2767a19` to
 collect the first physical-boot evidence. Its exact version, size, workflow
 and SHA-256 are recorded in `CURRENT_STATUS.md`; do not substitute another
 Actions artifact or an image from a mirror.
 
-Trusted catalog v2 revision 1 authorizes only this exact ISO after its complete
+Trusted catalog v2 revision 2 authorizes only this exact ISO after its complete
 virtual BIOS/UEFI workflow passed. The Linux v2 writer can therefore verify,
 copy and provision its encrypted vault. The Windows procedure below remains a
 raw physical boot test and does not perform trusted vault provisioning.
@@ -32,7 +32,7 @@ catalog and does not create or qualify the encrypted persistent vault.
    the image-sized bootable prefix, but residual tail data may remain
    recoverable; this procedure is not media sanitization.
 2. Verify the downloaded ISO in PowerShell with
-   `Get-FileHash .\KernAid-Rescue-amd64-ba33828-internal.iso -Algorithm SHA256`
+   `Get-FileHash .\KernAid-Rescue-amd64-2767a19-internal.iso -Algorithm SHA256`
    and compare the complete digest with the downloaded `.sha256` file and the
    exact value in `CURRENT_STATUS.md`.
 3. Write that exact ISO with Rufus. If Rufus asks between ISO and DD modes,
@@ -119,9 +119,10 @@ absence of a finding is not proof that the machine is healthy.
 
 The graphical application reaches report persistence only through a bounded
 same-origin loopback HTTP-to-AF_UNIX relay. That endpoint is internal to the
-Rescue image; it is not a public or remotely supported API. The signed-report
-flow remains unqualified until its dedicated shipping-image lifecycle gate
-passes.
+Rescue image; it is not a public or remotely supported API. The exact current
+candidate passed signed-report persistence, retrieval and fixed-path export on
+the same shipping image under virtual BIOS and UEFI. Physical USB behavior and
+recovery remain separate gates.
 
 ### Codex account bootstrap in an engineering Rescue image
 
@@ -208,7 +209,7 @@ The supported workshop procedure in this section is Resident-only. Rescue
 contains feature-gated persistent-vault OpenAI plumbing and a loopback
 UI-server relay. The current exact candidate passed the full virtual workflow,
 including both privileged BIOS and UEFI lifecycle jobs, and trusted catalog v2
-revision 1 authorizes that ISO. Physical media and live provider TLS with a
+revision 2 authorizes that ISO. Physical media and live provider TLS with a
 real account are still not qualified. Do not present Rescue OpenAI as supported
 on customer media yet. The Resident credential companion
 is not included in the desktop installer and is not added to `PATH`. From the

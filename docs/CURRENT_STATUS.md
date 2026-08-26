@@ -62,12 +62,11 @@ treated as a newer release.
 - Desktop installers are unsigned engineering previews.
 - Rescue provider login with a real account, live TLS and physical encrypted
   persistence are incomplete release gates.
-- The signed Rescue report path is implemented but is not present in the
-  currently published private candidate and has not yet passed its dedicated
-  BIOS/UEFI shipping-image lifecycle gate. Its HTTP relay is internal loopback
-  plumbing, not a public API.
+- The signed Rescue report HTTP relay remains internal loopback plumbing, not a
+  public API. Its virtual shipping-image gate has passed, but physical USB and
+  recovery behavior are not yet qualified.
 - The v2 USB writer can copy, verify and provision an exact catalog-authorized
-  image. Catalog revision 1 authorizes only the exact internally qualified
+  image. Catalog revision 2 authorizes only the exact internally qualified
   candidate documented below; this is not physical-hardware qualification.
 - Hardware and firmware support claims still require physical test evidence.
 
@@ -75,23 +74,24 @@ treated as a newer release.
 
 The private project area serves one controlled physical-qualification
 candidate built from commit
-[`ba338287b58b3692afc5b1765e3264e261071bc1`](https://github.com/0xfunboy/KernAid/commit/ba338287b58b3692afc5b1765e3264e261071bc1):
+[`2767a196c977d3b6f21418c20bd80131b1bcb3e6`](https://github.com/0xfunboy/KernAid/commit/2767a196c977d3b6f21418c20bd80131b1bcb3e6):
 
 | Field | Exact value |
 | --- | --- |
-| Artifact version | `ci-32925221006-1` |
+| Artifact version | `ci-32939869047-1` |
 | Size | `1,221,148,672` bytes |
-| SHA-256 | `7d0ad0dce852381640d613d54d6e82708e27bf254b6c41060c63d736c63b68c0` |
-| Workflow | [Rescue run 32925221006](https://github.com/0xfunboy/KernAid/actions/runs/32925221006) |
+| SHA-256 | `9376269567869026bd34ab050fcfcba1f5c5633b97ec827b23916a1635322fb6` |
+| Workflow | [Rescue run 32939869047](https://github.com/0xfunboy/KernAid/actions/runs/32939869047) |
 
 That run successfully built the hybrid ISO, validated shipping binaries and
 SBOM, passed ordinary BIOS/UEFI QEMU smoke, and passed the BIOS/UEFI two-boot
 USB-style layout and persistent LUKS2/ext4 vault checks with byte-identical
 disposable targets. Both final privileged lifecycle jobs also passed the
-bounded Codex offline signed-out path on the same artifact. The exact locally
-re-derived catalog entry matched the workflow artifact and is now the sole
-image authorized by trusted catalog v2 revision 1. This is an **internally and
-virtually qualified candidate**, not a production release.
+bounded Codex offline signed-out path and the signed-report persist, list, get,
+cross-boot signer and fixed-path export path on the same artifact. The exact
+locally verified catalog entry is now the sole image authorized by trusted
+catalog v2 revision 2. This is an **internally and virtually qualified
+candidate**, not a production release.
 
 The candidate is exposed privately only to unblock the first physical boot
 test. On Windows, verify the exact checksum and use Rufus in DD mode on a
@@ -99,19 +99,23 @@ factory-new or disposable USB of at least 32 GB. Keep Secure Boot disabled,
 use non-customer hardware, and do not treat that manual write as encrypted-vault
 provisioning or as a supported repair medium.
 
+The latest complete unsigned Desk packaging matrix was built from commit
+[`ad86e11330b3a5f97b8e01677a2e5c50e1ae1f1c`](https://github.com/0xfunboy/KernAid/commit/ad86e11330b3a5f97b8e01677a2e5c50e1ae1f1c)
+in [Desktop run 32935382680](https://github.com/0xfunboy/KernAid/actions/runs/32935382680).
+Linux x86-64, Windows x86-64, Intel macOS and Apple-silicon macOS packaging all
+passed; signing, notarization and physical-machine qualification remain open.
+
 ## Immediate next gates
 
 1. Boot that exact image from physical USB on a small hardware matrix and
    record firmware, storage, network and UI evidence.
-2. Qualify signed Rescue report persistence, retrieval and fixed-path export in
-   the shipping image under both BIOS and UEFI.
-3. Finish the real-account Rescue provider/vault lifecycle without exposing or
+2. Finish the real-account Rescue provider/vault lifecycle without exposing or
    copying the CLI credential store.
-4. Qualify Secure Boot and signed release delivery.
-5. Define the first production repair action with typed preconditions, backup,
+3. Qualify Secure Boot and signed release delivery.
+4. Define the first production repair action with typed preconditions, backup,
    explicit approval, verification and rollback; keep it disabled until the
    complete safety case passes.
-6. Add a repeatable release channel for Desk and Rescue artifacts.
+5. Add a repeatable release channel for Desk and Rescue artifacts.
 
 ## Where to look
 

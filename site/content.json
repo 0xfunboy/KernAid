@@ -3,12 +3,12 @@
   "release": {
     "name": "KernAid Rescue AMD64",
     "channel": "Internal qualified candidate",
-    "sourceCommit": "ba338287b58b3692afc5b1765e3264e261071bc1",
-    "artifactVersion": "ci-32925221006-1",
-    "workflowUrl": "https://github.com/0xfunboy/KernAid/actions/runs/32925221006",
-    "downloadName": "KernAid-Rescue-amd64-ba33828-internal.iso",
-    "checksumName": "KernAid-Rescue-amd64-ba33828-internal.iso.sha256",
-    "qualification": "Build, ABI, SBOM, boot QEMU BIOS/UEFI, USB-style two-boot e lifecycle privilegiato BIOS/UEFI con vault LUKS2/ext4 e percorso Codex offline signed-out superati sullo stesso artefatto.",
-    "warning": "Candidata interna qualificata virtualmente e autorizzata dal catalogo trusted v2 revision 1. Secure Boot, USB fisica, login Codex con account reale/TLS live e riparazioni restano non qualificati; usare solo su chiavetta nuova o sacrificabile e hardware non cliente."
+    "sourceCommit": "2767a196c977d3b6f21418c20bd80131b1bcb3e6",
+    "artifactVersion": "ci-32939869047-1",
+    "workflowUrl": "https://github.com/0xfunboy/KernAid/actions/runs/32939869047",
+    "downloadName": "KernAid-Rescue-amd64-2767a19-internal.iso",
+    "checksumName": "KernAid-Rescue-amd64-2767a19-internal.iso.sha256",
+    "qualification": "Build, ABI, SBOM, boot QEMU BIOS/UEFI, USB-style two-boot e lifecycle privilegiato BIOS/UEFI superati sullo stesso artefatto, inclusi vault LUKS2/ext4 e persistenza, lettura ed export del report firmato.",
+    "warning": "Candidata interna qualificata virtualmente e autorizzata dal catalogo trusted v2 revision 2. Secure Boot, USB fisica, login Codex con account reale/TLS live e riparazioni restano non qualificati; usare solo su chiavetta nuova o sacrificabile e hardware non cliente."
   }
 }
