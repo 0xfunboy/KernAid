@@ -130,6 +130,9 @@ PROVIDER_PROOF_CODEX_CHECKPOINTS = (
     "connect",
     "send",
     "receive",
+    "receive-active",
+    "receive-ended",
+    "receive-state",
     "frame",
     "decode",
     "response",
@@ -2806,6 +2809,16 @@ try:
 except SystemExit:
     raise
 except BaseException:
+    if checkpoint=="receive":
+        try:
+            connections=show("NConnections",{CODEX_SOCKET_UNIT!r})
+        except BaseException:
+            fail("receive-state")
+        if connections==b"1":
+            fail("receive-active")
+        if connections==b"0":
+            fail("receive-ended")
+        fail("receive-state")
     fail(checkpoint)
 finally:
     if connection is not None:

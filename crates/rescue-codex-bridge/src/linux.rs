@@ -60,6 +60,7 @@ const DEVICE_LOGIN_TIMEOUT: Duration = Duration::from_secs(16 * 60);
 const CLIENT_COMPLETION_GRACE: Duration = Duration::from_secs(10);
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const PROCESS_STOP_GRACE: Duration = Duration::from_secs(2);
+const PROCESS_KILL_GRACE: Duration = Duration::from_secs(2);
 const CHILD_DESCRIPTOR_MINIMUM: i32 = 8;
 const READER_CHANNEL_CAPACITY: usize = 4;
 const READER_CHUNK_BYTES: usize = 1024;
@@ -1285,7 +1286,17 @@ fn terminate_child_group(child: &mut Child) {
     }
     let _ = rustix::process::kill_process_group(group, Signal::KILL);
     let _ = child.kill();
-    let _ = child.wait();
+    // A child stuck in uninterruptible I/O must not prevent the bridge from
+    // returning its already-classified bounded error. The socket-activated
+    // service exits immediately afterwards and KillMode=control-group remains
+    // the final process-tree cleanup boundary.
+    let kill_deadline = Instant::now() + PROCESS_KILL_GRACE;
+    while Instant::now() < kill_deadline {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) => thread::sleep(PROCESS_POLL_INTERVAL),
+        }
+    }
 }
 
 /// Run the live-user client for one closed operation.
@@ -1619,7 +1630,7 @@ mod tests {
             Operation::DeviceLogin.client_timeout(),
             Duration::from_secs(1110)
         );
-        assert!(CLIENT_COMPLETION_GRACE > PROCESS_STOP_GRACE);
+        assert!(CLIENT_COMPLETION_GRACE > PROCESS_STOP_GRACE + PROCESS_KILL_GRACE);
     }
 
     #[test]
