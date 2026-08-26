@@ -22,6 +22,42 @@ QEMU-only; physical PCs, firmware and USB media are unqualified. It
 is not an Apple-silicon boot image, and Intel Mac external boot remains a
 physical validation item.
 
+### Rescue qualification manifest v1
+
+On the protected `main` branch, the `rescue` workflow publishes
+`KernAid-Rescue-amd64-qualified` only after the image build/smoke job and both
+isolated BIOS and UEFI two-boot Vault lifecycle jobs succeed. The bundle
+contains the exact ISO, checksum, catalog-v2 entry,
+pinned-Codex SBOM tranche and the evidence files. Its canonical
+`KernAid-Rescue-amd64.qualified.json` binds the source commit, workflow run and
+attempt, artifact version, ISO byte size and SHA-256, and the SHA-256 of every
+catalog, SBOM and evidence input. This is virtual qualification only; it does
+not satisfy the physical-machine or Secure Boot gates.
+
+GitHub signs both standard build provenance and a custom Sigstore attestation
+whose subject is the ISO and whose predicate is that exact manifest. The
+downloaded artifact contains both returned bundles under deterministic names.
+With an online GitHub CLI, verify the repository and signing workflow before
+trusting the files:
+
+```bash
+gh attestation verify KernAid-Rescue-amd64.iso \
+  -R 0xfunboy/KernAid \
+  --signer-workflow 0xfunboy/KernAid/.github/workflows/rescue.yml \
+  --source-ref refs/heads/main
+
+gh attestation verify KernAid-Rescue-amd64.iso \
+  -R 0xfunboy/KernAid \
+  --signer-workflow 0xfunboy/KernAid/.github/workflows/rescue.yml \
+  --source-ref refs/heads/main \
+  --predicate-type \
+  'https://github.com/0xfunboy/KernAid/blob/main/docs/operator-guide.md#rescue-qualification-manifest-v1'
+```
+
+Then compare `KernAid-Rescue-amd64.iso` with its `.sha256` file. A build-only
+`KernAid-Rescue-amd64` artifact is an intermediate input, not the qualified
+release bundle.
+
 ### Windows: physical boot qualification only
 
 Use only the exact private candidate identified in `docs/CURRENT_STATUS.md`.

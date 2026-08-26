@@ -266,6 +266,74 @@ class RescueLifecycleWorkflowTests(unittest.TestCase):
                 self.assertNotIn("catalog", upload.lower())
                 self.assertIn("if-no-files-found: error", upload)
 
+    def test_qualified_release_is_a_same_run_fail_closed_final_job(self) -> None:
+        qualified = job_block(self.workflow, "qualified-release")
+        self.assertIn("    if: github.ref == 'refs/heads/main'\n", qualified)
+        for dependency in (
+            "build-and-smoke-test",
+            "vault-lifecycle-bios",
+            "vault-lifecycle-uefi",
+        ):
+            self.assertIn(f"      - {dependency}\n", qualified)
+        self.assertNotIn("if: always()", qualified)
+        self.assertIn("      contents: read\n", qualified)
+        self.assertIn("      id-token: write\n", qualified)
+        self.assertIn("      attestations: write\n", qualified)
+
+        expected_inputs = {
+            "KernAid-Rescue-amd64",
+            "KernAid-Rescue-smoke-logs",
+            "KernAid-Linux-snapshot-e2e-evidence",
+            "KernAid-Rescue-vault-lifecycle-bios-evidence",
+            "KernAid-Rescue-vault-lifecycle-uefi-evidence",
+        }
+        self.assertEqual(
+            set(re.findall(r"^          name: (KernAid-[^\n]+)$", qualified, re.MULTILINE))
+            & expected_inputs,
+            expected_inputs,
+        )
+        self.assertNotIn("run-id:", qualified)
+
+        assembly = named_step(
+            qualified, "Assemble and verify the canonical qualified release"
+        )
+        self.assertIn("qualification-manifest.py", assembly)
+        self.assertIn('create "${manifest_args[@]}"', assembly)
+        self.assertIn('verify "${manifest_args[@]}"', assembly)
+        for identity in (
+            "$GITHUB_REPOSITORY",
+            "$GITHUB_SHA",
+            "$GITHUB_RUN_ID",
+            "$GITHUB_RUN_ATTEMPT",
+        ):
+            self.assertIn(identity, assembly)
+
+        provenance = named_step(qualified, "Attest the ISO build provenance")
+        self.assertIn("uses: actions/attest@v4", provenance)
+        self.assertIn("subject-path:", provenance)
+        self.assertNotIn("predicate-type:", provenance)
+
+        attestation = named_step(
+            qualified, "Attest the ISO with the qualification manifest"
+        )
+        self.assertIn("uses: actions/attest@v4", attestation)
+        self.assertIn("subject-path:", attestation)
+        self.assertIn("predicate-type:", attestation)
+        self.assertIn("predicate-path:", attestation)
+
+        bundles = named_step(qualified, "Include the GitHub Sigstore bundles")
+        self.assertIn("attest_provenance.outputs.bundle-path", bundles)
+        self.assertIn("attest_qualification.outputs.bundle-path", bundles)
+        self.assertIn("KernAid-Rescue-amd64.provenance.sigstore.json", bundles)
+        self.assertIn("KernAid-Rescue-amd64.qualification.sigstore.json", bundles)
+
+        publication = named_step(qualified, "Publish the qualified Rescue release")
+        self.assertIn("uses: actions/upload-artifact@v4", publication)
+        self.assertIn("name: KernAid-Rescue-amd64-qualified", publication)
+        self.assertIn("if-no-files-found: error", publication)
+        self.assertEqual(qualified.count("uses: actions/attest@v4"), 2)
+        self.assertLess(qualified.rindex("uses: actions/attest@v4"), qualified.index(publication))
+
     def test_workflow_and_harness_freeze_the_two_boot_contract(self) -> None:
         harness = LIFECYCLE_HARNESS.read_text(encoding="utf-8")
         self.assertEqual(harness.count("readonly boot_count=2"), 1)

@@ -140,6 +140,7 @@ jobs:
           python3 -I -B -c 'from pathlib import Path; path = Path("tools/build-rescue/qemu-vault-lifecycle-pty.py"); compile(path.read_bytes(), str(path), "exec", dont_inherit=True)'
           python3 -I -B -c 'from pathlib import Path; path = Path("tools/build-rescue/provider-lease-probe.py"); compile(path.read_bytes(), str(path), "exec", dont_inherit=True)'
           python3 -I -B -c 'from pathlib import Path; path = Path("tools/build-rescue/qemu-tauri-ui-smoke.py"); compile(path.read_bytes(), str(path), "exec", dont_inherit=True)'
+          python3 -I -B -c 'from pathlib import Path; path = Path("tools/build-rescue/qualification-manifest.py"); compile(path.read_bytes(), str(path), "exec", dont_inherit=True)'
           python3 -I -B -c 'from pathlib import Path; path = Path("rescue/live-build/config/includes.chroot/usr/lib/kernaid/tauri_ui_ready_check.py"); compile(path.read_bytes(), str(path), "exec", dont_inherit=True)'
       - name: Exercise Resident snapshot through Tauri IPC in a rootless chroot
         shell: bash
@@ -962,3 +963,115 @@ jobs:
           path: ${{ runner.temp }}/kernaid-vault-lifecycle-uefi.sanitized.log
           if-no-files-found: error
           retention-days: 14
+
+  qualified-release:
+    if: github.ref == 'refs/heads/main'
+    needs:
+      - build-and-smoke-test
+      - vault-lifecycle-bios
+      - vault-lifecycle-uefi
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download the same-run Rescue image inputs
+        uses: actions/download-artifact@v4
+        with:
+          name: KernAid-Rescue-amd64
+          path: ${{ runner.temp }}/kernaid-qualified-input/image
+      - name: Download the same-run USB smoke evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: KernAid-Rescue-smoke-logs
+          path: ${{ runner.temp }}/kernaid-qualified-input/smoke
+      - name: Download the same-run Linux snapshot evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: KernAid-Linux-snapshot-e2e-evidence
+          path: ${{ runner.temp }}/kernaid-qualified-input/snapshot
+      - name: Download the same-run BIOS lifecycle evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: KernAid-Rescue-vault-lifecycle-bios-evidence
+          path: ${{ runner.temp }}/kernaid-qualified-input/lifecycle-bios
+      - name: Download the same-run UEFI lifecycle evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: KernAid-Rescue-vault-lifecycle-uefi-evidence
+          path: ${{ runner.temp }}/kernaid-qualified-input/lifecycle-uefi
+      - name: Assemble and verify the canonical qualified release
+        env:
+          KERNAID_ARTIFACT_VERSION: ci-${{ github.run_id }}-${{ github.run_attempt }}
+          KERNAID_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          input="$RUNNER_TEMP/kernaid-qualified-input"
+          qualified="$RUNNER_TEMP/kernaid-rescue-qualified"
+          install -d -m 0755 -- "$qualified"
+          install -m 0644 -- \
+            "$input/image/KernAid-Rescue-amd64.iso" \
+            "$input/image/KernAid-Rescue-amd64.iso.sha256" \
+            "$input/image/KernAid-Rescue-amd64.catalog-entry-v2.json" \
+            "$input/image/KernAid-Rescue-amd64.codex.cdx.json" \
+            "$input/smoke/rescue-usb-smoke-bios.log" \
+            "$input/smoke/rescue-usb-smoke-uefi.log" \
+            "$input/snapshot/kernaid-linux-snapshot-e2e.sanitized.log" \
+            "$input/lifecycle-bios/kernaid-vault-lifecycle-bios.sanitized.log" \
+            "$input/lifecycle-uefi/kernaid-vault-lifecycle-uefi.sanitized.log" \
+            "$qualified/"
+          manifest_args=(
+            --repository "$GITHUB_REPOSITORY"
+            --commit "$GITHUB_SHA"
+            --run-id "$GITHUB_RUN_ID"
+            --run-attempt "$GITHUB_RUN_ATTEMPT"
+            --run-url "$KERNAID_RUN_URL"
+            --artifact-version "$KERNAID_ARTIFACT_VERSION"
+            --iso "$qualified/KernAid-Rescue-amd64.iso"
+            --checksum "$qualified/KernAid-Rescue-amd64.iso.sha256"
+            --catalog "$qualified/KernAid-Rescue-amd64.catalog-entry-v2.json"
+            --sbom "$qualified/KernAid-Rescue-amd64.codex.cdx.json"
+            --snapshot-evidence "$qualified/kernaid-linux-snapshot-e2e.sanitized.log"
+            --usb-bios-evidence "$qualified/rescue-usb-smoke-bios.log"
+            --usb-uefi-evidence "$qualified/rescue-usb-smoke-uefi.log"
+            --lifecycle-bios-evidence "$qualified/kernaid-vault-lifecycle-bios.sanitized.log"
+            --lifecycle-uefi-evidence "$qualified/kernaid-vault-lifecycle-uefi.sanitized.log"
+          )
+          python3 -I -B tools/build-rescue/qualification-manifest.py \
+            create "${manifest_args[@]}" \
+            --output "$qualified/KernAid-Rescue-amd64.qualified.json"
+          python3 -I -B tools/build-rescue/qualification-manifest.py \
+            verify "${manifest_args[@]}" \
+            --manifest "$qualified/KernAid-Rescue-amd64.qualified.json"
+      - name: Attest the ISO build provenance
+        id: attest_provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: ${{ runner.temp }}/kernaid-rescue-qualified/KernAid-Rescue-amd64.iso
+      - name: Attest the ISO with the qualification manifest
+        id: attest_qualification
+        uses: actions/attest@v4
+        with:
+          subject-path: ${{ runner.temp }}/kernaid-rescue-qualified/KernAid-Rescue-amd64.iso
+          predicate-type: https://github.com/0xfunboy/KernAid/blob/main/docs/operator-guide.md#rescue-qualification-manifest-v1
+          predicate-path: ${{ runner.temp }}/kernaid-rescue-qualified/KernAid-Rescue-amd64.qualified.json
+      - name: Include the GitHub Sigstore bundles
+        run: |
+          install -m 0644 -- \
+            "${{ steps.attest_provenance.outputs.bundle-path }}" \
+            "$RUNNER_TEMP/kernaid-rescue-qualified/KernAid-Rescue-amd64.provenance.sigstore.json"
+          install -m 0644 -- \
+            "${{ steps.attest_qualification.outputs.bundle-path }}" \
+            "$RUNNER_TEMP/kernaid-rescue-qualified/KernAid-Rescue-amd64.qualification.sigstore.json"
+      - name: Publish the qualified Rescue release
+        uses: actions/upload-artifact@v4
+        with:
+          name: KernAid-Rescue-amd64-qualified
+          path: ${{ runner.temp }}/kernaid-rescue-qualified
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
