@@ -245,14 +245,20 @@ fn storage_records(raw: &str) -> Result<(Vec<StorageDeviceProjection>, Vec<Strin
     let mut identity = BTreeSet::new();
     for record in records {
         let record = object(record)?;
-        let physical = object(record.get("physical_drive").ok_or(())?)?;
+        // `system_profiler` can include logical/disk-image rows which have no
+        // physical-drive projection. They are outside this collector's typed
+        // device scope and must not poison otherwise complete physical data.
+        let physical = match record.get("physical_drive") {
+            None | Some(Value::Null) => continue,
+            Some(value) => object(value)?,
+        };
         let internal = yes_no(physical.get("is_internal_disk").ok_or(())?)?;
         let solid_state = match physical.get("medium_type") {
             None | Some(Value::Null) => None,
             Some(Value::String(value)) => match value.trim().to_ascii_lowercase().as_str() {
                 "ssd" | "solid state" | "solid_state" => Some(true),
                 "hdd" | "rotational" | "rotating" => Some(false),
-                _ => return Err(()),
+                _ => None,
             },
             Some(_) => return Err(()),
         };
@@ -262,7 +268,8 @@ fn storage_records(raw: &str) -> Result<(Vec<StorageDeviceProjection>, Vec<Strin
             Some(Value::String(value)) if value.eq_ignore_ascii_case("failing") => "failing",
             Some(Value::String(value))
                 if value.eq_ignore_ascii_case("unsupported")
-                    || value.eq_ignore_ascii_case("not supported") =>
+                    || value.eq_ignore_ascii_case("not supported")
+                    || value.eq_ignore_ascii_case("not available") =>
             {
                 "unsupported"
             }
@@ -281,11 +288,17 @@ fn storage_records(raw: &str) -> Result<(Vec<StorageDeviceProjection>, Vec<Strin
             (
                 "physical",
                 physical,
-                &["device_name", "media_name", "protocol", "serial_number"][..],
+                &[
+                    "_name",
+                    "device_name",
+                    "media_name",
+                    "protocol",
+                    "serial_number",
+                ][..],
             ),
         ] {
             for field in fields {
-                if let Some(value) = source.get(*field) {
+                if let Some(value) = source.get(*field).filter(|value| !value.is_null()) {
                     let value = bounded_identity_value(value)?;
                     let token = format!("{prefix}.{field}={value}");
                     if prefix == "physical" {
@@ -295,7 +308,7 @@ fn storage_records(raw: &str) -> Result<(Vec<StorageDeviceProjection>, Vec<Strin
                 }
             }
         }
-        if record_identity.is_empty() || physical_identity.is_empty() {
+        if physical_identity.is_empty() {
             return Err(());
         }
         let physical_key = physical_identity.join("\0");
@@ -831,6 +844,44 @@ mod tests {
             first,
             derive_storage_identity(&value.to_string()).expect("changed identity")
         );
+    }
+
+    #[test]
+    fn storage_ignores_nonphysical_rows_and_keeps_unknown_capabilities_typed() {
+        let raw = r#"{
+          "SPStorageDataType": [
+            {"_name":"mounted disk image","bsd_name":"disk9s1"},
+            {"physical_drive":null},
+            {
+              "_name":null,
+              "bsd_name":null,
+              "physical_drive":{
+                "_name":"runner virtual storage",
+                "is_internal_disk":"yes",
+                "medium_type":"virtual",
+                "smart_status":"not available",
+                "serial_number":null
+              }
+            }
+          ]
+        }"#;
+
+        assert_eq!(
+            assert_valid("macos.storage.inventory", normalize_storage(raw)),
+            r#"{"schemaVersion":"1.0","queryComplete":true,"devices":[{"internal":true,"solidState":null,"smartStatus":"unsupported"}]}"#
+        );
+        let identity = derive_storage_identity(raw).expect("qualified storage identity");
+        assert!(identity.contains(r#""source":"macos.storage.inventory""#));
+        assert!(identity.contains(r#""identitySha256":"sha256:"#));
+
+        for malformed in [
+            r#"{"SPStorageDataType":[{"physical_drive":[]}]}"#,
+            r#"{"SPStorageDataType":[{"physical_drive":{"_name":"disk"}}]}"#,
+            r#"{"SPStorageDataType":[{"physical_drive":{"_name":"disk","is_internal_disk":"yes","smart_status":"failing soon"}}]}"#,
+            r#"{"SPStorageDataType":[{"physical_drive":{"_name":7,"is_internal_disk":"yes"}}]}"#,
+        ] {
+            assert!(normalize_storage(malformed).is_err());
+        }
     }
 
     #[test]
