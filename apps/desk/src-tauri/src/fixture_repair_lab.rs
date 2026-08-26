@@ -490,7 +490,7 @@ impl FixtureRepairLab {
         inner
             .completed_repairs
             .insert(response.approval_id.clone(), response.clone());
-        let post_verification = (|| {
+        let post_verification: Result<bool, String> = (|| {
             let installed_fstab =
                 fs::read(inner.fixture_root.join("etc/fstab")).map_err(|_| execution_error())?;
             let verification =
@@ -696,7 +696,7 @@ impl FixtureRepairLab {
         inner
             .completed_rollbacks
             .insert(response.rollback_approval_id.clone(), response.clone());
-        let post_verification = (|| {
+        let post_verification: Result<bool, String> = (|| {
             let restored_fstab = fs::read(inner.fixture_root.join("etc/fstab"))
                 .map_err(|_| rollback_execution_error())?;
             let verification =

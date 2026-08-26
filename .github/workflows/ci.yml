@@ -25,7 +25,7 @@ jobs:
       - name: Test fixture repair Core admission
         run: cargo test --locked -p kernaid-core --features fixture-repair-lab
       - name: Compile and exercise the isolated Desk repair cycle
-        run: cargo test --locked -p kernaid-desk-shell --features fixture-repair-lab typed_fixture_cycle_repairs_then_restores_embedded_fstab
+        run: cargo test --locked -p kernaid-desk-shell --features fixture-repair-lab fixture_repair_lab::tests
       - name: Prove Observe fixture makes zero writes
         run: ./tests/integration/observe-zero-writes.sh
       - name: Prove snapshot parity without content or tracked-metadata changes
