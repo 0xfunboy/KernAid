@@ -55,7 +55,9 @@ const CLIENT_PIPE_TIMEOUT: Duration = Duration::from_secs(15);
 const WORKER_OPERATION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const WORKER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const PROVIDER_BORROW_TIMEOUT: Duration = Duration::from_secs(20);
-const PROVIDER_LEASE_TIMEOUT: Duration = Duration::from_secs(120);
+const OPENAI_PROVIDER_LEASE_TIMEOUT: Duration = Duration::from_secs(120);
+#[cfg(feature = "experimental-codex-home-lease")]
+const CODEX_PROVIDER_LEASE_TIMEOUT: Duration = Duration::from_secs(18 * 60 + 10);
 const LEASE_REVOCATION_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(110);
 const READINESS_NOTIFICATION_TIMEOUT: Duration = Duration::from_secs(3);
@@ -129,6 +131,7 @@ struct ProviderLease {
     process: ProviderProcessBoundary,
     state: LeaseState,
     handoff_deadline: Instant,
+    lease_timeout: Duration,
     lease_deadline: Option<Instant>,
     output_obligation: Arc<LeaseOutputState>,
 }
@@ -1682,6 +1685,20 @@ enum ProviderLeaseKind {
     CodexHome,
 }
 
+impl ProviderLeaseKind {
+    fn lease_timeout(self) -> Duration {
+        match self {
+            Self::OpenAi => OPENAI_PROVIDER_LEASE_TIMEOUT,
+            #[cfg(feature = "experimental-codex-home-lease")]
+            // Covers the bridge's 120-second executable preparation plus its
+            // 16-minute device-login operation and bounded cleanup. The
+            // socket-activated bridge retains a separate 1140-second outer
+            // wall, so this longer credential lease is still fail-closed.
+            Self::CodexHome => CODEX_PROVIDER_LEASE_TIMEOUT,
+        }
+    }
+}
+
 enum ClientConnection<'socket> {
     Socket(BorrowedFd<'socket>),
     #[cfg(test)]
@@ -2229,6 +2246,7 @@ impl Supervisor {
             connection,
             candidate,
             handoff_deadline,
+            lease_kind,
         ) {
             Ok(result) => result,
             Err((version, error)) => {
@@ -3166,6 +3184,7 @@ impl Supervisor {
         connection: &ClientConnection<'_>,
         candidate: LeaseCandidate,
         handoff_deadline: Instant,
+        lease_kind: ProviderLeaseKind,
     ) -> Result<(u64, u64), (u64, ErrorToken)> {
         let _decision = self
             .lifecycle
@@ -3246,6 +3265,7 @@ impl Supervisor {
             process: candidate.process,
             state: LeaseState::Pending,
             handoff_deadline,
+            lease_timeout: lease_kind.lease_timeout(),
             lease_deadline: None,
             output_obligation: Arc::new(LeaseOutputState {
                 finalized: AtomicBool::new(true),
@@ -3549,7 +3569,7 @@ impl Supervisor {
         lease.process.verify_initial_peer(lease.peer_pid)?;
         lease.lease_deadline = Some(
             Instant::now()
-                .checked_add(PROVIDER_LEASE_TIMEOUT)
+                .checked_add(lease.lease_timeout)
                 .unwrap_or_else(Instant::now),
         );
         drop(leases);
@@ -5213,6 +5233,7 @@ mod tests {
             process: direct_peer_boundary(),
             state: LeaseState::PotentiallyIssued,
             handoff_deadline: Instant::now() + PROVIDER_BORROW_TIMEOUT,
+            lease_timeout: ProviderLeaseKind::OpenAi.lease_timeout(),
             lease_deadline: None,
             output_obligation: Arc::clone(&output_state),
         });
@@ -5260,10 +5281,18 @@ mod tests {
                     .adopt(raw_output.take().expect("worker output"))
                     .expect("single output adoption");
                 assert_eq!(supervisor.finish_provider_borrow_ready(1), Ok(Some(30)));
+                let armed_before = Instant::now();
                 assert!(matches!(
                     supervisor.send_provider_descriptor(1, || true),
                     Ok(DescriptorSend::Established)
                 ));
+                let armed_after = Instant::now();
+                let leases = supervisor.leases.lock().expect("lease registry");
+                let lease = leases.active.as_ref().expect("established lease");
+                assert_eq!(lease.lease_timeout, OPENAI_PROVIDER_LEASE_TIMEOUT);
+                let deadline = lease.lease_deadline.expect("armed lease deadline");
+                assert!(deadline >= armed_before + lease.lease_timeout);
+                assert!(deadline <= armed_after + lease.lease_timeout);
             }
         }
 
@@ -7124,6 +7153,20 @@ mod tests {
 
     #[cfg(feature = "experimental-codex-home-lease")]
     #[test]
+    fn provider_lease_deadlines_match_each_provider_operation() {
+        let openai = ProviderLeaseKind::OpenAi.lease_timeout();
+        let codex = ProviderLeaseKind::CodexHome.lease_timeout();
+
+        assert_eq!(openai, Duration::from_secs(120));
+        assert_eq!(codex, Duration::from_secs(120 + 16 * 60 + 10));
+        assert!(
+            Duration::from_secs(5 + 20) + codex + LEASE_REVOCATION_TIMEOUT
+                < Duration::from_secs(1140)
+        );
+    }
+
+    #[cfg(feature = "experimental-codex-home-lease")]
+    #[test]
     fn openai_and_codex_share_one_global_lease_registry() {
         let (supervisor, _, worker, privacy, _) =
             fake_supervisor(unlocked_service_state(717), [], true);
@@ -7144,6 +7187,7 @@ mod tests {
                 &first_connection,
                 first_candidate,
                 Instant::now() + PROVIDER_BORROW_TIMEOUT,
+                ProviderLeaseKind::OpenAi,
             )
             .expect("OpenAI pending lease");
 
@@ -7164,6 +7208,7 @@ mod tests {
                 &second_connection,
                 second_candidate,
                 Instant::now() + PROVIDER_BORROW_TIMEOUT,
+                ProviderLeaseKind::CodexHome,
             ),
             Err((717, ErrorToken::Busy))
         );
@@ -7174,11 +7219,68 @@ mod tests {
                 .expect("lease registry")
                 .active
                 .as_ref(),
-            Some(lease) if lease.id == lease_id && lease.state == LeaseState::Pending
+            Some(lease)
+                if lease.id == lease_id
+                    && lease.state == LeaseState::Pending
+                    && lease.lease_timeout == OPENAI_PROVIDER_LEASE_TIMEOUT
         ));
         supervisor
             .cancel_pending_lease(lease_id)
             .expect("cancel pending lease");
+        let codex_candidate = second_connection
+            .lease_candidate(ProcessScope::CgroupTree)
+            .expect("Codex candidate after OpenAI release");
+        let (_, codex_lease_id) = supervisor
+            .begin_provider_borrow(
+                717,
+                &second_connection,
+                codex_candidate,
+                Instant::now() + PROVIDER_BORROW_TIMEOUT,
+                ProviderLeaseKind::CodexHome,
+            )
+            .expect("Codex pending lease");
+        assert!(matches!(
+            supervisor
+                .leases
+                .lock()
+                .expect("lease registry")
+                .active
+                .as_ref(),
+            Some(lease)
+                if lease.id == codex_lease_id
+                    && lease.state == LeaseState::Pending
+                    && lease.lease_timeout == CODEX_PROVIDER_LEASE_TIMEOUT
+        ));
+        let mut codex_output = match supervisor
+            .mark_lease_potentially_issued(codex_lease_id)
+            .expect("arm Codex output")
+        {
+            PotentialIssue::Armed(output) => output,
+            _ => panic!("Codex lease was not armed"),
+        };
+        let (codex_home, codex_home_writer) =
+            pipe_with(PipeFlags::CLOEXEC).expect("Codex home test descriptor");
+        drop(codex_home_writer);
+        codex_output
+            .adopt(codex_home)
+            .expect("adopt Codex home descriptor");
+        assert_eq!(
+            supervisor.finish_provider_borrow_ready(codex_lease_id),
+            Ok(Some(717))
+        );
+        let armed_before = Instant::now();
+        assert!(matches!(
+            supervisor.send_provider_descriptor(codex_lease_id, || true),
+            Ok(DescriptorSend::Established)
+        ));
+        let armed_after = Instant::now();
+        let leases = supervisor.leases.lock().expect("lease registry");
+        let lease = leases.active.as_ref().expect("Codex established lease");
+        let deadline = lease.lease_deadline.expect("Codex deadline");
+        assert!(deadline >= armed_before + CODEX_PROVIDER_LEASE_TIMEOUT);
+        assert!(deadline <= armed_after + CODEX_PROVIDER_LEASE_TIMEOUT);
+        drop(leases);
+        drop(codex_output);
         assert!(worker.lock().expect("worker trace").calls.is_empty());
         assert_eq!(privacy.checks.load(Ordering::Acquire), 0);
         drop((first_peer, first_server, second_peer, second_server));
@@ -8444,6 +8546,7 @@ mod tests {
                 &pending_connection,
                 pending_candidate,
                 Instant::now() + PROVIDER_BORROW_TIMEOUT,
+                ProviderLeaseKind::OpenAi,
             )
             .expect("pending lease");
         assert!(matches!(
@@ -8481,7 +8584,8 @@ mod tests {
             process: direct_peer_boundary(),
             state: LeaseState::Established,
             handoff_deadline: Instant::now() + PROVIDER_BORROW_TIMEOUT,
-            lease_deadline: Some(Instant::now() + PROVIDER_LEASE_TIMEOUT),
+            lease_timeout: ProviderLeaseKind::OpenAi.lease_timeout(),
+            lease_deadline: Some(Instant::now() + ProviderLeaseKind::OpenAi.lease_timeout()),
             output_obligation,
         });
         assert_eq!(
