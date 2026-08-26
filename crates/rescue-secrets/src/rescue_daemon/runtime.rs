@@ -92,6 +92,9 @@ const CODEX_MOUNTER_BOOTSTRAP_CAPABILITIES: CapabilitySet = CapabilitySet::SYS_A
     .union(CapabilitySet::SYS_CHROOT)
     .union(CapabilitySet::SETPCAP);
 
+pub(super) type WorkerReportGetResult =
+    Result<(internal_wire::WorkerResponse, Option<Zeroizing<Vec<u8>>>), RescueVaultDaemonError>;
+
 pub(super) fn narrow_worker_capabilities() -> Result<(), RescueVaultDaemonError> {
     narrow_capabilities(
         SUPERVISOR_STARTUP_CAPABILITIES,
@@ -2332,6 +2335,13 @@ struct WorkerChannel {
     next_request_id: u64,
 }
 
+#[derive(Default)]
+struct WorkerTransactionContext<'a> {
+    cancellation: Option<&'a AtomicBool>,
+    provider_output: Option<OwnedFd>,
+    application: Option<internal_wire::WorkerApplicationCommand>,
+}
+
 impl WorkerHandle {
     pub(super) fn spawn(
         cgroup: WorkerCgroup,
@@ -2475,9 +2485,10 @@ impl WorkerHandle {
             secret_size,
             descriptor,
             deadline,
-            cancellation,
-            None,
-            None,
+            WorkerTransactionContext {
+                cancellation,
+                ..WorkerTransactionContext::default()
+            },
         )
     }
 
@@ -2493,9 +2504,10 @@ impl WorkerHandle {
             None,
             Some(write),
             deadline,
-            None,
-            Some(read),
-            None,
+            WorkerTransactionContext {
+                provider_output: Some(read),
+                ..WorkerTransactionContext::default()
+            },
         )
     }
 
@@ -2511,9 +2523,7 @@ impl WorkerHandle {
             None,
             None,
             deadline,
-            None,
-            None,
-            None,
+            WorkerTransactionContext::default(),
         )
     }
 
@@ -2545,9 +2555,10 @@ impl WorkerHandle {
             None,
             None,
             deadline,
-            None,
-            None,
-            Some(application),
+            WorkerTransactionContext {
+                application: Some(application),
+                ..WorkerTransactionContext::default()
+            },
         )
         .and_then(|(response, output)| {
             if output.is_none() {
@@ -2577,9 +2588,10 @@ impl WorkerHandle {
             None,
             Some(input),
             deadline,
-            None,
-            None,
-            Some(application),
+            WorkerTransactionContext {
+                application: Some(application),
+                ..WorkerTransactionContext::default()
+            },
         )
         .and_then(|(response, output)| {
             if output.is_none() {
@@ -2620,8 +2632,7 @@ impl WorkerHandle {
         &self,
         report_id: &ReportId,
         deadline: Instant,
-    ) -> Result<(internal_wire::WorkerResponse, Option<Zeroizing<Vec<u8>>>), RescueVaultDaemonError>
-    {
+    ) -> WorkerReportGetResult {
         let (response, bytes) = self.transact_application_output(
             internal_wire::WorkerApplicationCommand::ReportGet {
                 report_id: report_id.clone(),
@@ -2669,9 +2680,10 @@ impl WorkerHandle {
                     None,
                     Some(write),
                     deadline,
-                    None,
-                    None,
-                    Some(application),
+                    WorkerTransactionContext {
+                        application: Some(application),
+                        ..WorkerTransactionContext::default()
+                    },
                 )
             });
             let output = read_bounded_application_pipe(read, maximum, deadline);
@@ -2692,10 +2704,13 @@ impl WorkerHandle {
         secret_size: Option<u16>,
         descriptor: Option<OwnedFd>,
         deadline: Instant,
-        cancellation: Option<&AtomicBool>,
-        provider_output: Option<OwnedFd>,
-        application: Option<internal_wire::WorkerApplicationCommand>,
+        context: WorkerTransactionContext<'_>,
     ) -> Result<(internal_wire::WorkerResponse, Option<OwnedFd>), RescueVaultDaemonError> {
+        let WorkerTransactionContext {
+            cancellation,
+            provider_output,
+            application,
+        } = context;
         let borrowing = kind == internal_wire::WorkerCommandKind::ProviderOpenAiBorrow;
         #[cfg(feature = "experimental-codex-home-lease")]
         let leasing_codex = kind == internal_wire::WorkerCommandKind::ProviderCodexHomeLease;
@@ -4093,10 +4108,11 @@ mod tests {
                     match rustix::io::write(&write, &body[offset..]) {
                         Ok(written) => offset += written,
                         Err(error) if error == rustix::io::Errno::INTR => {}
-                        Err(error) => panic!("application pipe write failed: {error}"),
+                        Err(error) => return Err(error),
                     }
                 }
                 drop(write);
+                Ok(())
             });
             let observed = read_bounded_application_pipe(
                 read,
@@ -4104,7 +4120,10 @@ mod tests {
                 Instant::now() + Duration::from_secs(2),
             )
             .expect("bounded application output");
-            writer.join().expect("application writer");
+            writer
+                .join()
+                .expect("application writer thread")
+                .expect("application pipe write");
             observed
         });
         assert_eq!(observed.as_slice(), body.as_slice());

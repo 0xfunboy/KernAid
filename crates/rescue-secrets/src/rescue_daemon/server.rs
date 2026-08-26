@@ -4,7 +4,7 @@ use super::{
     passwd_openai_agent_uid,
     runtime::{
         self, DaemonRuntime, ProcessScope, ProviderProcessBoundary, RuntimeDisposition,
-        WorkerCgroup, WorkerHandle, WorkerSpawnResult,
+        WorkerCgroup, WorkerHandle, WorkerReportGetResult, WorkerSpawnResult,
     },
     validate_no_active_swap,
 };
@@ -274,11 +274,7 @@ trait WorkerBoundary: Send + Sync {
         &self,
         deadline: Instant,
     ) -> Result<(internal_wire::WorkerResponse, Vec<ReportSummary>), RescueVaultDaemonError>;
-    fn report_get(
-        &self,
-        report_id: &ReportId,
-        deadline: Instant,
-    ) -> Result<(internal_wire::WorkerResponse, Option<Zeroizing<Vec<u8>>>), RescueVaultDaemonError>;
+    fn report_get(&self, report_id: &ReportId, deadline: Instant) -> WorkerReportGetResult;
     fn verify_healthy(&self) -> Result<(), RescueVaultDaemonError>;
     fn exited(&self) -> Result<bool, RescueVaultDaemonError>;
     fn fault_and_terminate(&self, deadline: Instant) -> Result<(), RescueVaultDaemonError>;
@@ -338,12 +334,7 @@ impl WorkerBoundary for WorkerHandle {
         WorkerHandle::report_list(self, deadline)
     }
 
-    fn report_get(
-        &self,
-        report_id: &ReportId,
-        deadline: Instant,
-    ) -> Result<(internal_wire::WorkerResponse, Option<Zeroizing<Vec<u8>>>), RescueVaultDaemonError>
-    {
+    fn report_get(&self, report_id: &ReportId, deadline: Instant) -> WorkerReportGetResult {
         WorkerHandle::report_get(self, report_id, deadline)
     }
 
@@ -5587,14 +5578,7 @@ mod tests {
             })
         }
 
-        fn report_get(
-            &self,
-            _report_id: &ReportId,
-            deadline: Instant,
-        ) -> Result<
-            (internal_wire::WorkerResponse, Option<Zeroizing<Vec<u8>>>),
-            RescueVaultDaemonError,
-        > {
+        fn report_get(&self, _report_id: &ReportId, deadline: Instant) -> WorkerReportGetResult {
             self.transact(
                 internal_wire::WorkerCommandKind::ReportGet,
                 None,

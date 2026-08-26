@@ -376,7 +376,7 @@ class RescueOpenAiExecutorPackagingTests(unittest.TestCase):
         self.assertIn("getent passwd kernaid-codex", ready)
         self.assertIn("id -nG kernaid-codex", ready)
         self.assertIn(
-            "'^(kernaid|kernaid-codex|kernaid-openai|kernaid-openai-egress):'",
+            "'^(kernaid|kernaid-application|kernaid-codex|kernaid-openai|kernaid-openai-egress):'",
             ready,
         )
 
@@ -665,8 +665,8 @@ class RescueOpenAiExecutorPackagingTests(unittest.TestCase):
         worker = VAULT_WORKER_SOURCE.read_text(encoding="utf-8")
         runtime = VAULT_RUNTIME_SOURCE.read_text(encoding="utf-8")
         server = VAULT_SERVER_SOURCE.read_text(encoding="utf-8")
-        self.assertIn('b"KRVWC002"', wire)
-        self.assertIn('b"KRVWR002"', wire)
+        self.assertIn('b"KRVWC003"', wire)
+        self.assertIn('b"KRVWR003"', wire)
         self.assertIn("ProviderOpenAiBorrow", wire)
         self.assertIn("validate_internal_output_pipe", worker)
         self.assertIn("with_openai_api_key", worker)

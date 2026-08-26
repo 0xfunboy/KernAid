@@ -672,6 +672,7 @@ impl<'vault> RescueVaultApplicationStore<'vault> {
     /// Presence-only reconciliation hook for an interrupted worker audit
     /// append. The opaque request identifier never leaves the worker and no
     /// journal body is exposed.
+    #[cfg(feature = "experimental-vault-manager")]
     pub(crate) fn contains_agent_audit_request(
         &self,
         request_id: &RequestId,
