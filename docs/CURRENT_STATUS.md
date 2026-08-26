@@ -40,7 +40,7 @@ WinPE Companion and Fleet management remain later milestones.
 | Evidence | Normalized Linux snapshots, bounded hardware inventory and provenance framing |
 | Diagnosis | Deterministic offline rules plus a bounded optional Resident OpenAI reasoning adapter |
 | Planning | Typed R0 no-write plan validated by Core |
-| Reporting | Downloadable JSON report with a content hash |
+| Reporting | Resident Desk downloads a hashed JSON report; Rescue can persist the exact report plus audit sequence as a signed Vault envelope and export it through the native TTY companion |
 | Rescue credential boundary | Isolated credential vault and fail-closed Codex login/status/logout bridge; it does not run prompts or diagnoses |
 | Rescue provider plumbing | Feature-gated OpenAI executor and loopback relay are implemented, but live TLS and a real-account lifecycle are not yet qualified |
 | Virtual testing | Disposable QEMU fixtures, byte-level mutation checks, BIOS/UEFI boot and two-boot USB/vault coverage |
@@ -62,6 +62,10 @@ treated as a newer release.
 - Desktop installers are unsigned engineering previews.
 - Rescue provider login with a real account, live TLS and physical encrypted
   persistence are incomplete release gates.
+- The signed Rescue report path is implemented but is not present in the
+  currently published private candidate and has not yet passed its dedicated
+  BIOS/UEFI shipping-image lifecycle gate. Its HTTP relay is internal loopback
+  plumbing, not a public API.
 - The v2 USB writer can copy, verify and provision an exact catalog-authorized
   image. Catalog revision 1 authorizes only the exact internally qualified
   candidate documented below; this is not physical-hardware qualification.
@@ -99,13 +103,15 @@ provisioning or as a supported repair medium.
 
 1. Boot that exact image from physical USB on a small hardware matrix and
    record firmware, storage, network and UI evidence.
-2. Finish the real-account Rescue provider/vault lifecycle without exposing or
+2. Qualify signed Rescue report persistence, retrieval and fixed-path export in
+   the shipping image under both BIOS and UEFI.
+3. Finish the real-account Rescue provider/vault lifecycle without exposing or
    copying the CLI credential store.
-3. Qualify Secure Boot and signed release delivery.
-4. Define the first production repair action with typed preconditions, backup,
+4. Qualify Secure Boot and signed release delivery.
+5. Define the first production repair action with typed preconditions, backup,
    explicit approval, verification and rollback; keep it disabled until the
    complete safety case passes.
-5. Add a repeatable release channel for Desk and Rescue artifacts.
+6. Add a repeatable release channel for Desk and Rescue artifacts.
 
 ## Where to look
 

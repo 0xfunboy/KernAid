@@ -1,0 +1,55 @@
+[Unit]
+Description=KernAid Rescue persistent Application relay
+Requires=kernaid-rescue-application.socket kernaid-rescue-vaultd.socket systemd-sysusers.service
+BindsTo=kernaid-rescue-vaultd.service
+After=kernaid-rescue-application.socket kernaid-rescue-vaultd.socket kernaid-rescue-vaultd.service systemd-sysusers.service
+CollectMode=inactive-or-failed
+ConditionKernelCommandLine=boot=live
+ConditionPathIsDirectory=/run/live/medium
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -I /usr/lib/kernaid/rescue_application_relay.py
+Sockets=kernaid-rescue-application.socket
+TimeoutStartSec=5s
+TimeoutStopSec=5s
+Restart=on-failure
+RestartSec=1s
+KillMode=control-group
+StandardOutput=null
+StandardError=null
+User=kernaid-application
+Group=kernaid-application
+SupplementaryGroups=kernaid-vault
+UMask=0077
+LimitCORE=0
+LimitNOFILE=16
+TasksMax=4
+NoNewPrivileges=yes
+PrivateMounts=yes
+PrivateNetwork=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateIPC=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+DevicePolicy=closed
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+KeyringMode=private
+RemoveIPC=yes

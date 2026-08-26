@@ -63,6 +63,7 @@ SHELL_FAILURE_STAGES = {
     "x11",
     "http-x11",
     "socket-offline-inspector",
+    "socket-application-relay",
     "socket-vault",
     "socket-openai-executor",
     "socket-openai-egress",
@@ -128,6 +129,7 @@ FORBIDDEN_UI_PROCESS_NAMES = {
     "xfce4-terminal",
 }
 PRIVILEGED_GROUPS = {
+    "kernaid-application-client",
     "kernaid-vault",
     "kernaid-provider-client",
     "kernaid-codex-client",
@@ -140,6 +142,13 @@ PRIVILEGED_SOCKET_ENDPOINTS = (
         "kernaid-inspect",
         0o660,
         "socket-offline-inspector",
+    ),
+    (
+        "/run/kernaid-rescue-application.sock",
+        "kernaid-rescue-application.socket",
+        "kernaid-application-client",
+        0o660,
+        "socket-application-relay",
     ),
     (
         "/run/kernaid-rescue-vault.sock",

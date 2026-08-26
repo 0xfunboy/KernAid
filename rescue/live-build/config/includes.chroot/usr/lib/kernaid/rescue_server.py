@@ -3,10 +3,14 @@
 
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from concurrent.futures import ThreadPoolExecutor
+import array
+import fcntl
 import hashlib
 import hmac
 import json
 import os
+import re
+import select
 import signal
 import socket
 import stat
@@ -64,6 +68,59 @@ PROVIDER_SOCKET_TIMEOUT_SECONDS = 140
 PROVIDER_SOCKET = "/run/kernaid-rescue-openai.sock"
 MAX_PROVIDER_REQUEST_FRAME_BYTES = 96 * 1024
 MAX_PROVIDER_RESPONSE_FRAME_BYTES = 64 * 1024
+APPLICATION_HTTP_API_VERSION = "kernaid.dev/rescue-application-http/v1alpha1"
+APPLICATION_RELAY_API_VERSION = "kernaid.dev/rescue-application-relay/v1alpha1"
+APPLICATION_RELAY_SOCKET = "/run/kernaid-rescue-application.sock"
+MAX_APPLICATION_RELAY_FRAME_BYTES = 64 * 1024
+MAX_APPLICATION_REPORT_BYTES = 1024 * 1024
+MAX_APPLICATION_ENVELOPE_BYTES = 1536 * 1024
+# reportJson is an exact JSON string, so quotes and escapes can make the HTTP
+# wrapper larger than the decoded report bytes.  The decoded UTF-8 domain is
+# still capped independently at one MiB before any pipe is created.
+MAX_APPLICATION_HTTP_REQUEST_BYTES = 2_097_664
+APPLICATION_REQUEST_DEADLINE_SECONDS = 28
+MAX_STATE_VERSION = 9_007_199_254_740_991
+MAX_AUDIT_SEQUENCE = 1_000_000
+APPLICATION_REPORT_ID = re.compile(
+    r"^RP-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+APPLICATION_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+APPLICATION_SESSION_ID = re.compile(r"^S-[A-Za-z0-9-]+$")
+APPLICATION_TARGET_FINGERPRINT = re.compile(r"^sha256:[a-f0-9]{64}$")
+APPLICATION_AUDIT_EVENTS = {
+    "agent-session-start",
+    "agent-diagnosis-complete",
+    "agent-session-end",
+}
+APPLICATION_AUDIT_OUTCOMES = {"succeeded", "rejected", "failed"}
+APPLICATION_VAULT_ERROR_TOKENS = {
+    "ABSENT",
+    "UNPROVISIONED",
+    "LOCKED",
+    "BAD_PASSPHRASE",
+    "MEDIA_CHANGED",
+    "PROFILE_MISMATCH",
+    "STALE_STATE",
+    "FD_REQUIRED",
+    "FD_FORBIDDEN",
+    "NOT_AUTHORIZED",
+    "RATE_LIMITED",
+    "BUSY",
+    "PROVIDER_UNCONFIGURED",
+    "REPORT_TOO_LARGE",
+    "IO_FAILED",
+    "REBOOT_REQUIRED",
+}
+APPLICATION_ERROR_TOKENS = {
+    *APPLICATION_VAULT_ERROR_TOKENS,
+    "INVALID_REQUEST",
+    "INVALID_FRAME",
+    "VAULT_UNAVAILABLE",
+    "VAULT_INVALID_RESPONSE",
+    "TIMEOUT",
+    "TRANSPORT",
+    "RELAY_UNAVAILABLE",
+}
 MAX_TARGET_DEVICES = 128
 MAX_TARGET_DEPTH = 8
 MAX_TARGET_FIELD_BYTES = 4 * 1024
@@ -262,6 +319,480 @@ class ProviderRelayError(Exception):
         super().__init__(code)
         self.code = code
         self.status = status
+
+
+class ApplicationRelayError(Exception):
+    """A closed Application/vault error safe for the local HTTP response."""
+
+    def __init__(
+        self, code: str, status: int, state_version: int | None = None
+    ) -> None:
+        super().__init__(code)
+        self.code = code
+        self.status = status
+        self.state_version = state_version
+
+
+def _application_http_status(token: str) -> int:
+    if token in {"INVALID_REQUEST", "INVALID_FRAME"}:
+        return 400
+    if token in {"NOT_AUTHORIZED", "FD_REQUIRED", "FD_FORBIDDEN"}:
+        return 403
+    if token in {"ABSENT", "UNPROVISIONED", "LOCKED"}:
+        return 423
+    if token in {"STALE_STATE", "MEDIA_CHANGED", "PROFILE_MISMATCH"}:
+        return 409
+    if token in {"RATE_LIMITED", "BUSY"}:
+        return 429
+    if token == "REPORT_TOO_LARGE":
+        return 413
+    if token == "TIMEOUT":
+        return 504
+    return 503
+
+
+def _reject_json_duplicates(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON member")
+        result[key] = value
+    return result
+
+
+def _strict_json_object(payload: bytes, maximum: int) -> dict[str, object]:
+    if (
+        not 2 <= len(payload) <= maximum
+    ):
+        raise ValueError("invalid JSON object framing")
+    value = json.loads(
+        payload.decode("utf-8", errors="strict"),
+        object_pairs_hook=_reject_json_duplicates,
+        parse_constant=lambda _value: (_ for _ in ()).throw(
+            ValueError("invalid JSON constant")
+        ),
+    )
+    if not isinstance(value, dict):
+        raise ValueError("JSON value is not an object")
+    return value
+
+
+def _preliminary_application_report(value: dict[str, object]) -> None:
+    if set(value) != {
+        "schemaVersion",
+        "sessionId",
+        "targetFingerprint",
+        "facts",
+        "inferences",
+        "decisions",
+        "events",
+        "verification",
+        "unresolvedRisks",
+    }:
+        raise ApplicationRelayError("INVALID_REQUEST", 400)
+    session_id = value.get("sessionId")
+    target = value.get("targetFingerprint")
+    facts = value.get("facts")
+    inferences = value.get("inferences")
+    decisions = value.get("decisions")
+    events = value.get("events")
+    risks = value.get("unresolvedRisks")
+    if (
+        value.get("schemaVersion") != "1.0"
+        or not isinstance(session_id, str)
+        or len(session_id) > 128
+        or APPLICATION_SESSION_ID.fullmatch(session_id) is None
+        or not isinstance(target, str)
+        or APPLICATION_TARGET_FINGERPRINT.fullmatch(target) is None
+        or not isinstance(facts, list)
+        or len(facts) > 128
+        or not all(isinstance(item, dict) for item in facts)
+        or not isinstance(inferences, list)
+        or len(inferences) > 128
+        or not all(isinstance(item, dict) for item in inferences)
+        or not isinstance(decisions, list)
+        or len(decisions) > 128
+        or not all(isinstance(item, dict) for item in decisions)
+        or not isinstance(events, list)
+        or len(events) > 1024
+        or not all(isinstance(item, dict) for item in events)
+        or not isinstance(value.get("verification"), str)
+        or value.get("verification") not in {"not-run", "passed", "failed"}
+        or not isinstance(risks, list)
+        or len(risks) > 128
+        or not all(isinstance(item, str) and len(item) <= 8192 for item in risks)
+        or len(set(risks)) != len(risks)
+    ):
+        raise ApplicationRelayError("INVALID_REQUEST", 400)
+
+
+def _valid_application_state_version(value: object) -> bool:
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 0 <= value <= MAX_STATE_VERSION
+    )
+
+
+def _validate_application_relay_peer(connection: socket.socket) -> None:
+    # With Accept=no the root system manager owns the listening endpoint; the
+    # long-running unprivileged relay only inherits it and accepts connections.
+    # Client-side SO_PEERCRED therefore authenticates PID 1, while vaultd sees
+    # the stable kernaid-application PID on the relay's outbound connection.
+    try:
+        peer = connection.getpeername()
+        socket_type = connection.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE)
+        credentials = connection.getsockopt(
+            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
+        )
+        pid, uid, gid = struct.unpack("3i", credentials)
+    except (OSError, struct.error) as error:
+        raise ApplicationRelayError("RELAY_UNAVAILABLE", 503) from error
+    if (
+        connection.family != socket.AF_UNIX
+        or socket_type != socket.SOCK_SEQPACKET
+        or peer != APPLICATION_RELAY_SOCKET
+        or pid != 1
+        or uid != 0
+        or gid != 0
+    ):
+        raise ApplicationRelayError("RELAY_UNAVAILABLE", 503)
+
+
+def _application_record(
+    connection: socket.socket,
+) -> tuple[bytes, list[int]]:
+    receive_flags = getattr(socket, "MSG_CMSG_CLOEXEC", 0)
+    payload, ancillary, flags, _address = connection.recvmsg(
+        MAX_APPLICATION_RELAY_FRAME_BYTES + 1,
+        socket.CMSG_SPACE(array.array("i", [0, 0]).itemsize * 2),
+        receive_flags,
+    )
+    if (
+        not payload
+        or len(payload) > MAX_APPLICATION_RELAY_FRAME_BYTES
+        or flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC)
+    ):
+        raise ApplicationRelayError("INVALID_FRAME", 502)
+    descriptors: list[int] = []
+    for level, kind, data in ancillary:
+        if level != socket.SOL_SOCKET or kind != socket.SCM_RIGHTS:
+            for descriptor in descriptors:
+                os.close(descriptor)
+            raise ApplicationRelayError("INVALID_FRAME", 502)
+        values = array.array("i")
+        usable = len(data) - len(data) % values.itemsize
+        values.frombytes(data[:usable])
+        descriptors.extend(values.tolist())
+    if len(descriptors) > 1:
+        for descriptor in descriptors:
+            os.close(descriptor)
+        raise ApplicationRelayError("INVALID_FRAME", 502)
+    for descriptor in descriptors:
+        fcntl.fcntl(descriptor, fcntl.F_SETFD, fcntl.FD_CLOEXEC)
+    return payload, descriptors
+
+
+def _send_application_record(
+    connection: socket.socket, payload: bytes, descriptor: int | None
+) -> None:
+    ancillary: list[tuple[int, int, bytes]] = []
+    if descriptor is not None:
+        ancillary.append(
+            (
+                socket.SOL_SOCKET,
+                socket.SCM_RIGHTS,
+                array.array("i", [descriptor]).tobytes(),
+            )
+        )
+    sent = connection.sendmsg(
+        [payload], ancillary, getattr(socket, "MSG_NOSIGNAL", 0)
+    )
+    if sent != len(payload):
+        raise ApplicationRelayError("TRANSPORT", 503)
+
+
+def relay_application_request(
+    operation: str,
+    expected_state_version: int,
+    payload: dict[str, object],
+    deadline: float,
+    input_descriptor: int | None = None,
+) -> tuple[dict[str, object], int | None]:
+    frame = json.dumps(
+        {
+            "apiVersion": APPLICATION_RELAY_API_VERSION,
+            "operation": operation,
+            "expectedStateVersion": expected_state_version,
+            "payload": payload,
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    if len(frame) > MAX_APPLICATION_RELAY_FRAME_BYTES:
+        raise ApplicationRelayError("INVALID_REQUEST", 400)
+    connection: socket.socket | None = None
+    received_descriptors: list[int] = []
+    try:
+        connection = socket.socket(
+            socket.AF_UNIX, socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC
+        )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ApplicationRelayError("TIMEOUT", 504)
+        connection.settimeout(remaining)
+        connection.connect(APPLICATION_RELAY_SOCKET)
+        _validate_application_relay_peer(connection)
+        _send_application_record(connection, frame, input_descriptor)
+        response_bytes, received_descriptors = _application_record(connection)
+        try:
+            response = _strict_json_object(
+                response_bytes, MAX_APPLICATION_RELAY_FRAME_BYTES
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+            raise ApplicationRelayError("INVALID_FRAME", 502) from error
+    except socket.timeout as error:
+        raise ApplicationRelayError("TIMEOUT", 504) from error
+    except ApplicationRelayError:
+        for descriptor in received_descriptors:
+            os.close(descriptor)
+        received_descriptors.clear()
+        raise
+    except OSError as error:
+        raise ApplicationRelayError("RELAY_UNAVAILABLE", 503) from error
+    finally:
+        if connection is not None:
+            connection.close()
+
+    if (
+        response.get("apiVersion") != APPLICATION_RELAY_API_VERSION
+        or not isinstance(response.get("outcome"), str)
+        or response.get("outcome") not in {"ok", "error"}
+    ):
+        for descriptor in received_descriptors:
+            os.close(descriptor)
+        raise ApplicationRelayError("INVALID_FRAME", 502)
+    if response["outcome"] == "error":
+        allowed = {"apiVersion", "outcome", "error", "operation", "stateVersion"}
+        code = response.get("error")
+        state_version = response.get("stateVersion")
+        if (
+            not set(response).issubset(allowed)
+            or set(response) - {"operation", "stateVersion"}
+            != {"apiVersion", "outcome", "error"}
+            or not isinstance(code, str)
+            or code not in APPLICATION_ERROR_TOKENS
+            or (
+                "operation" in response
+                and response.get("operation") != operation
+            )
+            or (
+                "stateVersion" in response
+                and not _valid_application_state_version(state_version)
+            )
+            or received_descriptors
+        ):
+            for descriptor in received_descriptors:
+                os.close(descriptor)
+            raise ApplicationRelayError("INVALID_FRAME", 502)
+        raise ApplicationRelayError(
+            str(code),
+            _application_http_status(str(code)),
+            int(state_version) if isinstance(state_version, int) else None,
+        )
+
+    if (
+        set(response)
+        != {"apiVersion", "operation", "outcome", "stateVersion", "payload"}
+        or response.get("operation") != operation
+        or not _valid_application_state_version(response.get("stateVersion"))
+        or not isinstance(response.get("payload"), dict)
+        or (operation == "report.get") != (len(received_descriptors) == 1)
+    ):
+        for descriptor in received_descriptors:
+            os.close(descriptor)
+        raise ApplicationRelayError("INVALID_FRAME", 502)
+    return response, received_descriptors[0] if received_descriptors else None
+
+
+def _write_application_pipe(
+    descriptor: int,
+    payload: bytes,
+    deadline: float,
+    failures: list[bool],
+) -> None:
+    try:
+        os.set_blocking(descriptor, False)
+        offset = 0
+        while offset < len(payload):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError
+            _readable, writable, _errors = select.select(
+                [], [descriptor], [], remaining
+            )
+            if not writable:
+                raise TimeoutError
+            offset += os.write(
+                descriptor, payload[offset : offset + 64 * 1024]
+            )
+    except (OSError, TimeoutError):
+        failures.append(True)
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
+def relay_application_report(
+    expected_state_version: int,
+    report_id: str,
+    payload_sha256: str,
+    report_bytes: bytes,
+    deadline: float,
+) -> dict[str, object]:
+    read_descriptor, write_descriptor = os.pipe2(os.O_CLOEXEC)
+    failures: list[bool] = []
+    writer = threading.Thread(
+        target=_write_application_pipe,
+        args=(write_descriptor, report_bytes, deadline, failures),
+        daemon=True,
+    )
+    writer.start()
+    try:
+        response, output = relay_application_request(
+            "report.persist",
+            expected_state_version,
+            {
+                "reportId": report_id,
+                "payloadSha256": payload_sha256,
+                "input": {
+                    "type": "session-report-json-pipe",
+                    "size": len(report_bytes),
+                },
+            },
+            deadline,
+            read_descriptor,
+        )
+        if output is not None:
+            os.close(output)
+            raise ApplicationRelayError("INVALID_FRAME", 502)
+    finally:
+        os.close(read_descriptor)
+        writer.join(timeout=max(0.0, deadline - time.monotonic()))
+    if writer.is_alive() or failures:
+        raise ApplicationRelayError("TRANSPORT", 503)
+    return response
+
+
+def _application_status(deadline: float) -> dict[str, object]:
+    response, descriptor = relay_application_request(
+        "vault.status", 0, {}, deadline
+    )
+    if descriptor is not None:
+        os.close(descriptor)
+        raise ApplicationRelayError("INVALID_FRAME", 502)
+    payload = response["payload"]
+    vault_state = payload.get("vaultState")
+    if not isinstance(vault_state, str) or vault_state not in {
+        "absent",
+        "unprovisioned",
+        "locked",
+        "unlocking",
+        "unlocked",
+        "locking",
+        "faulted-reboot-required",
+    }:
+        raise ApplicationRelayError("INVALID_FRAME", 502)
+    return response
+
+
+def _versioned_application_read(
+    operation: str, payload: dict[str, object], deadline: float
+) -> tuple[dict[str, object], int | None]:
+    # Status is the sole operation that accepts bootstrap zero.  A concurrent
+    # vault transition can make the following read stale; retry that closed
+    # race once, never a transport or storage failure.
+    for attempt in range(2):
+        status = _application_status(deadline)
+        try:
+            return relay_application_request(
+                operation, int(status["stateVersion"]), payload, deadline
+            )
+        except ApplicationRelayError as error:
+            if error.code != "STALE_STATE" or attempt != 0:
+                raise
+    raise ApplicationRelayError("STALE_STATE", 409)
+
+
+def _read_application_output(
+    descriptor: int, size: int, expected_sha256: str, deadline: float
+) -> bytes:
+    if not 2 <= size <= MAX_APPLICATION_ENVELOPE_BYTES:
+        raise ApplicationRelayError("INVALID_FRAME", 502)
+    os.set_blocking(descriptor, False)
+    retained = bytearray()
+    while len(retained) < size:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ApplicationRelayError("TIMEOUT", 504)
+        readable, _writable, _errors = select.select(
+            [descriptor], [], [], remaining
+        )
+        if not readable:
+            raise ApplicationRelayError("TIMEOUT", 504)
+        block = os.read(descriptor, min(64 * 1024, size - len(retained)))
+        if not block:
+            raise ApplicationRelayError("INVALID_FRAME", 502)
+        retained.extend(block)
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ApplicationRelayError("TIMEOUT", 504)
+        readable, _writable, _errors = select.select(
+            [descriptor], [], [], remaining
+        )
+        if not readable:
+            raise ApplicationRelayError("TIMEOUT", 504)
+        extra = os.read(descriptor, 1)
+        if not extra:
+            break
+        raise ApplicationRelayError("INVALID_FRAME", 502)
+    exact = bytes(retained)
+    if not hmac.compare_digest(hashlib.sha256(exact).hexdigest(), expected_sha256):
+        raise ApplicationRelayError("INVALID_FRAME", 502)
+    try:
+        _strict_json_object(exact, MAX_APPLICATION_ENVELOPE_BYTES)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        raise ApplicationRelayError("INVALID_FRAME", 502) from error
+    return exact
+
+
+def _application_report_summary(value: object) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != {
+        "reportId",
+        "envelopeSize",
+        "envelopeSha256",
+    }:
+        raise ApplicationRelayError("INVALID_FRAME", 502)
+    report_id = value.get("reportId")
+    envelope_size = value.get("envelopeSize")
+    envelope_sha256 = value.get("envelopeSha256")
+    if (
+        not isinstance(report_id, str)
+        or APPLICATION_REPORT_ID.fullmatch(report_id) is None
+        or not isinstance(envelope_size, int)
+        or isinstance(envelope_size, bool)
+        or not 2 <= envelope_size <= MAX_APPLICATION_ENVELOPE_BYTES
+        or not isinstance(envelope_sha256, str)
+        or APPLICATION_SHA256.fullmatch(envelope_sha256) is None
+    ):
+        raise ApplicationRelayError("INVALID_FRAME", 502)
+    return value
 
 
 def _validate_provider_frame(
@@ -1788,12 +2319,347 @@ class RescueHandler(SimpleHTTPRequestHandler):
         self.send_header("X-Frame-Options", "DENY")
         super().end_headers()
 
+    def _application_deadline(self) -> float:
+        self._arm_request_deadline(APPLICATION_REQUEST_DEADLINE_SECONDS)
+        return self._request_started + APPLICATION_REQUEST_DEADLINE_SECONDS - 1
+
+    def _send_application_json(
+        self, status: int, value: dict[str, object]
+    ) -> None:
+        body = json.dumps(
+            value,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        if status == 429:
+            self.send_header("Retry-After", "1")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_application_failure(self, error: ApplicationRelayError) -> None:
+        body: dict[str, object] = {
+            "apiVersion": APPLICATION_HTTP_API_VERSION,
+            "error": error.code,
+        }
+        self._send_application_json(error.status, body)
+
+    def _application_post_headers(self) -> bool:
+        hosts = self.headers.get_all("Host", [])
+        origins = self.headers.get_all("Origin", [])
+        fetch_sites = self.headers.get_all("Sec-Fetch-Site", [])
+        if len(hosts) != 1 or hosts[0] not in ALLOWED_HOSTS:
+            self.send_error(421)
+            return False
+        if (
+            len(origins) != 1
+            or origins[0] not in ALLOWED_ORIGINS
+            or origins[0] != f"http://{hosts[0]}"
+        ):
+            self.send_error(403)
+            return False
+        if len(fetch_sites) > 1 or (
+            fetch_sites and fetch_sites[0] not in {"none", "same-origin"}
+        ):
+            self.send_error(403)
+            return False
+        if self.headers.get_all("Transfer-Encoding") or self.headers.get_all(
+            "Content-Encoding"
+        ):
+            self._send_application_failure(
+                ApplicationRelayError("INVALID_REQUEST", 400)
+            )
+            return False
+        if self.headers.get_all("Content-Type", []) != ["application/json"]:
+            self._send_application_failure(
+                ApplicationRelayError("INVALID_REQUEST", 415)
+            )
+            return False
+        return True
+
+    def _application_post_body(self) -> dict[str, object]:
+        lengths = self.headers.get_all("Content-Length", [])
+        if (
+            len(lengths) != 1
+            or not lengths[0].isascii()
+            or not lengths[0].isdigit()
+        ):
+            raise ApplicationRelayError("INVALID_REQUEST", 400)
+        length = int(lengths[0])
+        if not 2 <= length <= MAX_APPLICATION_HTTP_REQUEST_BYTES:
+            raise ApplicationRelayError(
+                "INVALID_REQUEST", 413 if length > 0 else 400
+            )
+        encoded = self.rfile.read(length)
+        if len(encoded) != length:
+            raise ApplicationRelayError("INVALID_REQUEST", 400)
+        try:
+            return _strict_json_object(
+                encoded, MAX_APPLICATION_HTTP_REQUEST_BYTES
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+            raise ApplicationRelayError("INVALID_REQUEST", 400) from error
+
+    def _handle_application_get(self) -> bool:
+        if self.path == "/api/rescue/vault/status":
+            deadline = self._application_deadline()
+            try:
+                response = _application_status(deadline)
+                payload = response["payload"]
+                self._send_application_json(
+                    200,
+                    {
+                        "apiVersion": APPLICATION_HTTP_API_VERSION,
+                        "stateVersion": response["stateVersion"],
+                        "vaultState": payload["vaultState"],
+                    },
+                )
+            except ApplicationRelayError as error:
+                self._send_application_failure(error)
+            return True
+
+        if self.path == "/api/rescue/reports":
+            deadline = self._application_deadline()
+            try:
+                response, descriptor = _versioned_application_read(
+                    "report.list", {}, deadline
+                )
+                if descriptor is not None:
+                    os.close(descriptor)
+                    raise ApplicationRelayError("INVALID_FRAME", 502)
+                payload = response["payload"]
+                reports = payload.get("reports")
+                if (
+                    set(payload) != {"reports"}
+                    or not isinstance(reports, list)
+                    or len(reports) > 256
+                ):
+                    raise ApplicationRelayError("INVALID_FRAME", 502)
+                seen: set[str] = set()
+                for report in reports:
+                    summary = _application_report_summary(report)
+                    report_id = str(summary["reportId"])
+                    if report_id in seen:
+                        raise ApplicationRelayError("INVALID_FRAME", 502)
+                    seen.add(report_id)
+                self._send_application_json(
+                    200,
+                    {
+                        "apiVersion": APPLICATION_HTTP_API_VERSION,
+                        "stateVersion": response["stateVersion"],
+                        "reports": reports,
+                    },
+                )
+            except ApplicationRelayError as error:
+                self._send_application_failure(error)
+            return True
+
+        prefix = "/api/rescue/reports/"
+        if not self.path.startswith(prefix):
+            return False
+        report_id = self.path.removeprefix(prefix)
+        if APPLICATION_REPORT_ID.fullmatch(report_id) is None:
+            self._send_application_failure(
+                ApplicationRelayError("INVALID_REQUEST", 400)
+            )
+            return True
+        deadline = self._application_deadline()
+        descriptor: int | None = None
+        try:
+            response, descriptor = _versioned_application_read(
+                "report.get", {"reportId": report_id}, deadline
+            )
+            payload = response["payload"]
+            if set(payload) != {"report", "output"}:
+                raise ApplicationRelayError("INVALID_FRAME", 502)
+            report = _application_report_summary(payload["report"])
+            output = payload["output"]
+            if (
+                report["reportId"] != report_id
+                or not isinstance(output, dict)
+                or set(output) != {"type", "size"}
+                or output.get("type") != "signed-report-envelope-pipe"
+                or output.get("size") != report["envelopeSize"]
+                or descriptor is None
+            ):
+                raise ApplicationRelayError("INVALID_FRAME", 502)
+            envelope = _read_application_output(
+                descriptor,
+                int(report["envelopeSize"]),
+                str(report["envelopeSha256"]),
+                deadline,
+            )
+            self.send_response(200)
+            self.send_header(
+                "Content-Type", "application/vnd.kernaid.signed-report+json"
+            )
+            self.send_header("Cache-Control", "no-store")
+            self.send_header(
+                "X-KernAid-Envelope-Sha256", str(report["envelopeSha256"])
+            )
+            self.send_header(
+                "ETag", f'"sha256-{report["envelopeSha256"]}"'
+            )
+            self.send_header("Content-Length", str(len(envelope)))
+            self.end_headers()
+            self.wfile.write(envelope)
+        except ApplicationRelayError as error:
+            self._send_application_failure(error)
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+        return True
+
+    def _handle_application_post(self) -> bool:
+        if self.path not in {
+            "/api/rescue/audit-append",
+            "/api/rescue/report-persist",
+        }:
+            return False
+        if not self._application_post_headers():
+            return True
+        deadline = self._application_deadline()
+        try:
+            request = self._application_post_body()
+            expected = request.get("expectedStateVersion")
+            if not _valid_application_state_version(expected):
+                raise ApplicationRelayError("INVALID_REQUEST", 400)
+            if self.path == "/api/rescue/audit-append":
+                outcome = request.get("outcome")
+                error = request.get("error")
+                if (
+                    set(request)
+                    not in (
+                        {
+                            "expectedStateVersion",
+                            "sequence",
+                            "event",
+                            "outcome",
+                        },
+                        {
+                            "expectedStateVersion",
+                            "sequence",
+                            "event",
+                            "outcome",
+                            "error",
+                        },
+                    )
+                    or not isinstance(request.get("sequence"), int)
+                    or isinstance(request.get("sequence"), bool)
+                    or not 1
+                    <= int(request["sequence"])
+                    <= MAX_AUDIT_SEQUENCE
+                    or not isinstance(request.get("event"), str)
+                    or request.get("event") not in APPLICATION_AUDIT_EVENTS
+                    or not isinstance(outcome, str)
+                    or outcome not in APPLICATION_AUDIT_OUTCOMES
+                    or not (
+                        outcome == "succeeded" and "error" not in request
+                        or outcome != "succeeded"
+                        and isinstance(error, str)
+                        and error in APPLICATION_VAULT_ERROR_TOKENS
+                    )
+                ):
+                    raise ApplicationRelayError("INVALID_REQUEST", 400)
+                payload = {
+                    key: value
+                    for key, value in request.items()
+                    if key != "expectedStateVersion"
+                }
+                response, descriptor = relay_application_request(
+                    "audit.append", int(expected), payload, deadline
+                )
+                if descriptor is not None:
+                    os.close(descriptor)
+                    raise ApplicationRelayError("INVALID_FRAME", 502)
+                result = response["payload"]
+                if (
+                    set(result) != {"sequence"}
+                    or result.get("sequence") != request["sequence"]
+                ):
+                    raise ApplicationRelayError("INVALID_FRAME", 502)
+                self._send_application_json(
+                    200,
+                    {
+                        "apiVersion": APPLICATION_HTTP_API_VERSION,
+                        "stateVersion": response["stateVersion"],
+                        "sequence": result["sequence"],
+                    },
+                )
+                return True
+
+            if set(request) != {
+                "expectedStateVersion",
+                "reportId",
+                "payloadSha256",
+                "reportJson",
+            }:
+                raise ApplicationRelayError("INVALID_REQUEST", 400)
+            report_id = request.get("reportId")
+            payload_sha256 = request.get("payloadSha256")
+            report_json = request.get("reportJson")
+            if (
+                not isinstance(report_id, str)
+                or APPLICATION_REPORT_ID.fullmatch(report_id) is None
+                or not isinstance(payload_sha256, str)
+                or APPLICATION_SHA256.fullmatch(payload_sha256) is None
+                or not isinstance(report_json, str)
+            ):
+                raise ApplicationRelayError("INVALID_REQUEST", 400)
+            try:
+                report_bytes = report_json.encode("utf-8")
+            except UnicodeEncodeError as error:
+                raise ApplicationRelayError("INVALID_REQUEST", 400) from error
+            if not 2 <= len(report_bytes) <= MAX_APPLICATION_REPORT_BYTES:
+                raise ApplicationRelayError(
+                    "REPORT_TOO_LARGE" if len(report_bytes) > 1 else "INVALID_REQUEST",
+                    413 if len(report_bytes) > 1 else 400,
+                )
+            if not hmac.compare_digest(
+                hashlib.sha256(report_bytes).hexdigest(), payload_sha256
+            ):
+                raise ApplicationRelayError("INVALID_REQUEST", 400)
+            try:
+                report = _strict_json_object(
+                    report_bytes, MAX_APPLICATION_REPORT_BYTES
+                )
+                _preliminary_application_report(report)
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+                raise ApplicationRelayError("INVALID_REQUEST", 400) from error
+            response = relay_application_report(
+                int(expected),
+                report_id,
+                payload_sha256,
+                report_bytes,
+                deadline,
+            )
+            report = _application_report_summary(response["payload"])
+            if report["reportId"] != report_id:
+                raise ApplicationRelayError("INVALID_FRAME", 502)
+            self._send_application_json(
+                200,
+                {
+                    "apiVersion": APPLICATION_HTTP_API_VERSION,
+                    "stateVersion": response["stateVersion"],
+                    "report": report,
+                },
+            )
+        except ApplicationRelayError as error:
+            self._send_application_failure(error)
+        return True
+
     def do_GET(self) -> None:
         if not self.local_authority():
             self.send_error(421)
             return
         if not self.same_site_request():
             self.send_error(403)
+            return
+        if self._handle_application_get():
             return
         if self.path == "/api/inventory":
             try:
@@ -1843,6 +2709,8 @@ class RescueHandler(SimpleHTTPRequestHandler):
         super().do_GET()
 
     def do_POST(self) -> None:
+        if self._handle_application_post():
+            return
         authorization_deadline = (
             self.authorization_deadline
             if self.path == "/api/authorize-observe"

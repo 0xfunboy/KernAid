@@ -229,6 +229,9 @@ id -nG kernaid 2>/dev/null | tr ' ' '\n' | grep -Fxq kernaid-vault \
 if id -nG kernaid 2>/dev/null | tr ' ' '\n' | grep -Fxq kernaid-provider-client; then
     fail "live user unexpectedly has provider-client access"
 fi
+if id -nG kernaid 2>/dev/null | tr ' ' '\n' | grep -Fxq kernaid-application-client; then
+    fail "live user unexpectedly has Application relay client access"
+fi
 id -nG kernaid 2>/dev/null | tr ' ' '\n' | grep -Fxq kernaid-codex-client \
     || fail "live user cannot access the Codex authentication bridge"
 if id -nG kernaid 2>/dev/null | tr ' ' '\n' | grep -Fxq kernaid-codex; then
@@ -254,6 +257,23 @@ getent group kernaid-openai | awk -F: -v gid="$openai_group_id" 'NF == 4 && $1 =
     || fail "OpenAI Agent group has an unsafe identity or supplementary member"
 getent passwd | awk -F: -v gid="$openai_group_id" '$4 == gid { count += 1; if ($1 != "kernaid-openai") bad = 1 } END { exit !(count == 1 && !bad) }' \
     || fail "OpenAI Agent group authorizes another primary identity"
+application_identity="$(getent passwd kernaid-application | awk -F: 'NF == 7 && $1 == "kernaid-application" && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ && $3 == $4 && $3 != 0 && $3 != 1000 && $6 == "/nonexistent" && $7 == "/usr/sbin/nologin" { print $3 ":" $4 }')"
+test -n "$application_identity" || fail "Application Agent identity is missing or unsafe"
+test "$application_identity" != "$openai_identity" || fail "Application and OpenAI Agent identities are not distinct"
+application_group_id="${application_identity#*:}"
+getent group kernaid-application | awk -F: -v gid="$application_group_id" 'NF == 4 && $1 == "kernaid-application" && $3 == gid && $4 == "" { found = 1 } END { exit !found }' \
+    || fail "Application Agent group has an unsafe identity or supplementary member"
+getent passwd | awk -F: -v gid="$application_group_id" '$4 == gid { count += 1; if ($1 != "kernaid-application") bad = 1 } END { exit !(count == 1 && !bad) }' \
+    || fail "Application Agent group authorizes another primary identity"
+id -nG kernaid-application 2>/dev/null | tr ' ' '\n' | grep -Fxq kernaid-vault \
+    || fail "Application Agent is not a kernaid-vault member"
+if id -nG kernaid-application 2>/dev/null | tr ' ' '\n' | grep -E -x 'kernaid-application-client|kernaid-provider-client|kernaid-codex-client|kernaid-codex|kernaid-openai'; then
+    fail "Application Agent has a forbidden persistent group membership"
+fi
+application_client_group_id="$(getent group kernaid-application-client | awk -F: 'NF == 4 && $1 == "kernaid-application-client" && $3 ~ /^[0-9]+$/ && $4 == "" { print $3 }')"
+test -n "$application_client_group_id" || fail "Application relay client group is missing or has static members"
+getent group kernaid-vault | awk -F: 'NF == 4 && $1 == "kernaid-vault" { count = split($4, members, ","); for (index = 1; index <= count; index += 1) { seen[members[index]] += 1 } if (count == 3 && seen["kernaid"] == 1 && seen["kernaid-openai"] == 1 && seen["kernaid-application"] == 1) found = 1 } END { exit !found }' \
+    || fail "vault group does not have the exact companion and Agent members"
 if id -nG kernaid 2>/dev/null | tr ' ' '\n' | grep -Fxq kernaid-openai; then
     fail "live user unexpectedly has OpenAI egress access"
 fi
@@ -272,7 +292,7 @@ for forbidden_group in kernaid-vault kernaid-provider-client kernaid-openai; do
 done
 for subordinate_ids in /etc/subuid /etc/subgid; do
     if [ -r "$subordinate_ids" ] \
-        && grep -Eq '^(kernaid|kernaid-codex|kernaid-openai|kernaid-openai-egress):' "$subordinate_ids"; then
+        && grep -Eq '^(kernaid|kernaid-application|kernaid-codex|kernaid-openai|kernaid-openai-egress):' "$subordinate_ids"; then
         fail "Rescue identities unexpectedly have subordinate IDs"
     fi
 done
@@ -310,6 +330,17 @@ test -n "$vault_group_id" || fail "vault lifecycle group is missing"
 test -S /run/kernaid-rescue-vault.sock || fail "vault lifecycle pathname is not a socket"
 test "$(stat -c '%u:%g:%a:%h' -- /run/kernaid-rescue-vault.sock)" = "0:${vault_group_id}:660:1" \
     || fail "vault lifecycle socket ownership or mode is unsafe"
+test "$(systemctl show --property=ActiveState --value kernaid-rescue-application.socket)" = "active" \
+    || fail "Application relay socket is not active"
+application_socket_substate="$(systemctl show --property=SubState --value kernaid-rescue-application.socket)" \
+    || fail "Application relay socket state is unavailable"
+case "$application_socket_substate" in
+    listening|running) ;;
+    *) fail "Application relay socket is not operational" ;;
+esac
+test -S /run/kernaid-rescue-application.sock || fail "Application relay pathname is not a socket"
+test "$(stat -c '%u:%g:%a:%h' -- /run/kernaid-rescue-application.sock)" = "0:${application_client_group_id}:660:1" \
+    || fail "Application relay socket ownership or mode is unsafe"
 test "$(systemctl show --property=ActiveState --value kernaid-rescue-openai-egress.socket)" = "active" \
     || fail "OpenAI egress socket is not active"
 egress_socket_substate="$(systemctl show --property=SubState --value kernaid-rescue-openai-egress.socket)" \
@@ -417,6 +448,25 @@ while [ "$attempt" -le 30 ]; do
 done
 test -n "$index" || fail "local UI server did not answer"
 
+application_status="$(curl --fail --silent --show-error --max-time 25 "$base_url/api/rescue/vault/status")" \
+    || fail "Application relay status endpoint failed"
+printf '%s' "$application_status" | python3 -c 'import json,sys; data=json.load(sys.stdin); set(data) == {"apiVersion","stateVersion","vaultState"} or sys.exit("Application status shape failed"); data.get("apiVersion") == "kernaid.dev/rescue-application-http/v1alpha1" or sys.exit("Application status version failed"); isinstance(data.get("stateVersion"), int) and not isinstance(data.get("stateVersion"), bool) and 0 <= data["stateVersion"] <= 9007199254740991 or sys.exit("Application state version failed"); data.get("vaultState") in {"absent","unprovisioned","locked","unlocking","unlocked","locking","faulted-reboot-required"} or sys.exit("Application vault state failed")' \
+    || fail "Application relay status contract failed"
+test "$(systemctl show --property=ActiveState --value kernaid-rescue-application.service)" = "active" \
+    || fail "persistent Application relay is not active"
+application_relay_pid="$(systemctl show --property=MainPID --value kernaid-rescue-application.service)" \
+    || fail "persistent Application relay PID is unavailable"
+case "$application_relay_pid" in
+    ''|*[!0-9]*|0|1) fail "persistent Application relay PID is invalid" ;;
+esac
+application_status_again="$(curl --fail --silent --show-error --max-time 25 "$base_url/api/rescue/vault/status")" \
+    || fail "persistent Application relay second status failed"
+test "$application_status_again" = "$application_status" \
+    || fail "persistent Application relay changed a read-only status response"
+test "$(systemctl show --property=MainPID --value kernaid-rescue-application.service)" = "$application_relay_pid" \
+    || fail "Application relay identity changed between lifecycle requests"
+printf '\nKERNAID_RESCUE_APPLICATION_RELAY_READY\n' >/dev/ttyS0
+
 script_path="$(printf '%s' "$index" | sed -n 's/.*src="\.\/\([^"?]*\)".*/\1/p' | head -n 1)"
 case "$script_path" in assets/*.js) ;; *) fail "JavaScript bundle path is missing" ;; esac
 curl --fail --silent --show-error --max-time 10 "$base_url/$script_path" >/dev/null || fail "JavaScript bundle is unavailable"
@@ -471,6 +521,7 @@ if ! tauri_guest_attestation="$(
         "KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=x11"|\
         "KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=http-x11"|\
         "KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=socket-offline-inspector"|\
+        "KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=socket-application-relay"|\
         "KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=socket-vault"|\
         "KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=socket-openai-executor"|\
         "KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=socket-openai-egress"|\

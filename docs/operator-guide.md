@@ -50,6 +50,20 @@ is the catalog-bound vault-provisioning path for this exact promoted image.
 
 ## Diagnose from Rescue
 
+Before Desk initializes, open a native TTY and unlock the writer-provisioned
+Vault locally:
+
+```text
+kernaid-rescue-vaultctl status
+kernaid-rescue-vaultctl unlock
+```
+
+The passphrase is read only from the controlling TTY. If Desk has already
+initialized while the Vault was locked, unlock the Vault and reload Desk before
+starting the session. A session begun with the fallback in-memory audit sink
+cannot later be upgraded to persistent audit, and its report is not written to
+the Vault.
+
 1. Use the target buttons in the left rail to select the installation candidate
    that belongs to the customer machine. The family shown is a low-confidence
    storage-metadata hint, not confirmation that Windows, Linux, or macOS was
@@ -80,8 +94,21 @@ is the catalog-bound vault-provisioning path for this exact promoted image.
    `/etc/machine-id`), `/boot` (including `/boot/efi`), `/efi`, `/usr`, or
    `/var`, stop: KernAid reports the corpus as unsupported and blocks diagnosis.
    This release does not claim parity for multi-mount Linux installations.
-6. Download the JSON report and retain its displayed SHA-256 prefix with the job
-   record.
+6. On successful completion, Rescue persists the exact JSON report and its
+   audit sequence in the encrypted Vault as a signed envelope. From a native
+   TTY, list the available report IDs and export the selected envelope:
+
+   ```text
+   kernaid-rescue-vaultctl report-list
+   kernaid-rescue-vaultctl report-export RP-...
+   ```
+
+   Export always uses the fixed path
+   `/home/kernaid/KernAid-Reports/<id>.signed.json`. The directory is private,
+   the file is mode `0600`, publication is atomic, and an existing filename is
+   never overwritten. The companion accepts a canonical `RP-...` identifier,
+   not a caller-selected path. Copy that exported file to the intended exchange
+   medium only after checking the reported envelope SHA-256.
 7. Shut the live system down before removing the USB drive.
 
 The Windows EFI result contains only presence booleans for BCD, Windows Boot
@@ -89,6 +116,12 @@ Manager, and the x86-64 fallback loader. It contains no discovered filenames,
 directory listings, bytes, device identifiers, or customer paths. KernAid
 currently stages an R0 observation plan and performs no repair mutation. The
 absence of a finding is not proof that the machine is healthy.
+
+The graphical application reaches report persistence only through a bounded
+same-origin loopback HTTP-to-AF_UNIX relay. That endpoint is internal to the
+Rescue image; it is not a public or remotely supported API. The signed-report
+flow remains unqualified until its dedicated shipping-image lifecycle gate
+passes.
 
 ### Codex account bootstrap in an engineering Rescue image
 

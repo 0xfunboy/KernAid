@@ -1,0 +1,24 @@
+[Unit]
+Description=KernAid Rescue UI-to-Application relay socket
+Requires=systemd-sysusers.service
+After=systemd-sysusers.service
+Before=kernaid-ui.service
+ConditionKernelCommandLine=boot=live
+
+[Socket]
+ListenSequentialPacket=/run/kernaid-rescue-application.sock
+Accept=no
+Backlog=8
+Service=kernaid-rescue-application.service
+FileDescriptorName=application
+SocketMode=0660
+SocketUser=root
+SocketGroup=kernaid-application-client
+RemoveOnStop=yes
+PassCredentials=no
+PassSecurity=no
+PassPacketInfo=no
+Timestamping=off
+
+[Install]
+WantedBy=sockets.target

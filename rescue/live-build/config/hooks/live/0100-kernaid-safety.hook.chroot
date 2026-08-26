@@ -17,6 +17,7 @@ chmod 0755 \
 chown root:root \
     /usr/lib/kernaid/offline_inspector.py \
     /usr/lib/kernaid/ready-check \
+    /usr/lib/kernaid/rescue_application_relay.py \
     /usr/lib/kernaid/rescue_server.py \
     /usr/lib/kernaid/rescue_ui_session_ready.py \
     /usr/lib/kernaid/matchbox-kbdconfig \
@@ -25,6 +26,7 @@ chown root:root \
 chmod 0644 \
     /usr/lib/kernaid/offline_inspector.py \
     /usr/lib/kernaid/ready-check \
+    /usr/lib/kernaid/rescue_application_relay.py \
     /usr/lib/kernaid/rescue_server.py \
     /usr/lib/kernaid/rescue_ui_session_ready.py \
     /usr/lib/kernaid/matchbox-kbdconfig \
@@ -71,6 +73,8 @@ chown root:root \
     /etc/systemd/system/kernaid-rescue-openai-egress.socket \
     /etc/systemd/system/kernaid-rescue-openai-executor.socket \
     /etc/systemd/system/kernaid-rescue-openai-executor@.service \
+    /etc/systemd/system/kernaid-rescue-application.socket \
+    /etc/systemd/system/kernaid-rescue-application.service \
     /etc/systemd/system/kernaid-rescue-codex.socket \
     /etc/systemd/system/kernaid-rescue-codex@.service \
     /etc/systemd/system/kernaid-rescue-codex-mounter.socket \
@@ -106,6 +110,8 @@ chmod 0644 \
     /etc/systemd/system/kernaid-rescue-openai-egress.socket \
     /etc/systemd/system/kernaid-rescue-openai-executor.socket \
     /etc/systemd/system/kernaid-rescue-openai-executor@.service \
+    /etc/systemd/system/kernaid-rescue-application.socket \
+    /etc/systemd/system/kernaid-rescue-application.service \
     /etc/systemd/system/kernaid-rescue-codex.socket \
     /etc/systemd/system/kernaid-rescue-codex@.service \
     /etc/systemd/system/kernaid-rescue-codex-mounter.socket \
@@ -145,6 +151,7 @@ systemctl enable kernaid-rescue-desk-shell.service
 systemctl enable kernaid-offline-inspector.socket
 systemctl enable kernaid-rescue-openai-egress.socket
 systemctl enable kernaid-rescue-openai-executor.socket
+systemctl enable kernaid-rescue-application.socket
 systemctl enable kernaid-rescue-codex.socket
 systemctl enable kernaid-rescue-codex-mounter.socket
 systemctl enable kernaid-rescue-vaultd.socket

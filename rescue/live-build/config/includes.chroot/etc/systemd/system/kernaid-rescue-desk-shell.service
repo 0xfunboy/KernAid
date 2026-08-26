@@ -1,7 +1,7 @@
 [Unit]
 Description=KernAid Rescue Tauri desktop shell
-Requires=kernaid-ui.service live-config.service kernaid-rescue-ui-session-ready.service kernaid-offline-inspector.socket kernaid-rescue-vaultd.socket kernaid-rescue-openai-executor.socket kernaid-rescue-openai-egress.socket kernaid-rescue-codex.socket kernaid-tauri-network-probe-baseline.service
-After=kernaid-ui.service live-config.service kernaid-rescue-ui-session-ready.service display-manager.service kernaid-offline-inspector.socket kernaid-rescue-vaultd.socket kernaid-rescue-openai-executor.socket kernaid-rescue-openai-egress.socket kernaid-rescue-codex.socket kernaid-tauri-network-probe-baseline.service
+Requires=kernaid-ui.service live-config.service kernaid-rescue-ui-session-ready.service kernaid-offline-inspector.socket kernaid-rescue-application.socket kernaid-rescue-vaultd.socket kernaid-rescue-openai-executor.socket kernaid-rescue-openai-egress.socket kernaid-rescue-codex.socket kernaid-tauri-network-probe-baseline.service
+After=kernaid-ui.service live-config.service kernaid-rescue-ui-session-ready.service display-manager.service kernaid-offline-inspector.socket kernaid-rescue-application.socket kernaid-rescue-vaultd.socket kernaid-rescue-openai-executor.socket kernaid-rescue-openai-egress.socket kernaid-rescue-codex.socket kernaid-tauri-network-probe-baseline.service
 Wants=display-manager.service
 Before=kernaid-ready.service
 ConditionKernelCommandLine=boot=live

@@ -59,6 +59,7 @@ import {
   type RescueProviderMode,
   type RescueProviderPreparation,
 } from "./rescue-openai";
+import { createRescueAuditSink, type RescueAuditSink } from "./rescue-audit";
 import {
   formatBytes,
   finishRescueInspection,
@@ -84,6 +85,7 @@ type ProviderMode = RescueProviderMode;
 
 function App() {
   const [driver, setDriver] = useState<LocalSessionDriver>();
+  const [rescueAuditSink, setRescueAuditSink] = useState<RescueAuditSink>();
   const [runtimeStatus, setRuntimeStatus] = useState<SecureRuntimeStatus>();
   const [runtimeReady, setRuntimeReady] = useState(false);
   const [providerMode, setProviderMode] = useState<ProviderMode>("offline");
@@ -139,7 +141,6 @@ function App() {
       if (!isNative()) {
         try {
           await verifyRescueTauriIpcIsolation();
-          if (!cancelled) setDriver(createDriver());
         } catch {
           if (!cancelled) {
             setDriver(undefined);
@@ -147,8 +148,30 @@ function App() {
               "Confine IPC Rescue non sicuro; riavviare KernAid da un supporto verificato.",
             );
           }
-        } finally {
           if (!cancelled) setRuntimeReady(true);
+          return;
+        }
+        let auditSink: RescueAuditSink | undefined;
+        if (isRescueRuntime()) {
+          try {
+            auditSink = await createRescueAuditSink();
+          } catch {
+            if (!cancelled)
+              setStatus(
+                "Audit persistente Rescue non disponibile: sbloccare il Vault e ricaricare Desk. La diagnosi corrente resta in sola lettura.",
+              );
+          }
+        }
+        if (!cancelled) {
+          setRescueAuditSink(auditSink);
+          setDriver(createDriver(auditSink));
+          if (isRescueRuntime() && auditSink === undefined)
+            setStatus((current) =>
+              current.startsWith("Audit persistente")
+                ? current
+                : "Vault Rescue bloccato o assente: la diagnosi resta disponibile, ma il report non sarà persistente finché il Vault non viene sbloccato e Desk ricaricato.",
+            );
+          setRuntimeReady(true);
         }
         return;
       }
@@ -695,7 +718,7 @@ function App() {
       )
         throw new Error("Il provider Rescue è cambiato durante l’ispezione.");
       const preparedDriver = createDriver(
-        undefined,
+        rescueAuditSink,
         binding,
         providerPreparation.mode,
         inspection.os.family === "linux" ? "linux-p0-v1" : "legacy-non-linux",
@@ -892,7 +915,7 @@ function App() {
     setProviderMode(next);
     setDriver(
       createDriver(
-        isNative() ? activeAuditSink(runtimeStatus) : undefined,
+        isNative() ? activeAuditSink(runtimeStatus) : rescueAuditSink,
         undefined,
         next,
       ),
@@ -1345,17 +1368,25 @@ function App() {
           )}
         {report && (
           <p className="report">
-            <a
-              href={report.uri}
-              download={
-                report.auditStatus.signed
-                  ? "KernAid-signed-report.json"
-                  : "KernAid-report.json"
-              }
-            >
-              Scarica{" "}
-              {report.auditStatus.signed ? "report firmato" : "report JSON"}
-            </a>{" "}
+            {isRescueRuntime() ? (
+              report.auditStatus.signed ? (
+                <>Report firmato e persistito nel Vault Rescue</>
+              ) : (
+                <>Report temporaneo: sblocca il Vault e ripeti la diagnosi</>
+              )
+            ) : (
+              <a
+                href={report.uri}
+                download={
+                  report.auditStatus.signed
+                    ? "KernAid-signed-report.json"
+                    : "KernAid-report.json"
+                }
+              >
+                Scarica{" "}
+                {report.auditStatus.signed ? "report firmato" : "report JSON"}
+              </a>
+            )}{" "}
             · SHA-256 <code>{report.sha256.slice(0, 12)}…</code>
           </p>
         )}

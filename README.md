@@ -2,7 +2,7 @@
 
 KernAid is an evidence-first machine diagnosis and repair platform. This repository implements the Phase 0 feasibility spike described in the [masterplan](docs/MASTERPLAN.md). For the concise, date-stamped distinction between what works now and what remains unqualified, start with [Current status](docs/CURRENT_STATUS.md).
 
-The current Phase 0 engineering vertical slice is deliberately safe: start a session, collect a normalized read-only host snapshot, run deterministic offline diagnostic rules, validate an R0 plan through Core, and export a downloadable, hashed JSON report. Production target mutation is not implemented. On Linux, a separate opt-in `fixture-repair-lab` Desk build exposes one complete, explicitly approved repair and separately approved rollback against an internally created disposable fixture. It is absent from normal builds and Rescue and cannot select a host path, disk or production target.
+The current Phase 0 engineering vertical slice is deliberately safe: start a session, collect a normalized read-only host snapshot, run deterministic offline diagnostic rules, validate an R0 plan through Core, and produce a hashed JSON report. Resident Desk can download that report directly. In Rescue, when the encrypted Vault is unlocked before Desk starts, the report and its audit sequence are persisted as a signed envelope and can be exported later from the native TTY companion. Production target mutation is not implemented. On Linux, a separate opt-in `fixture-repair-lab` Desk build exposes one complete, explicitly approved repair and separately approved rollback against an internally created disposable fixture. It is absent from normal builds and Rescue and cannot select a host path, disk or production target.
 
 ## Quick start
 
@@ -57,6 +57,13 @@ The CI workflows are configured to produce engineering-preview desktop installer
   mount at or below `/etc` (including `/etc/machine-id`), `/boot` (including
   `/boot/efi`), `/efi`, `/usr`, or `/var`, KernAid marks the corpus unsupported
   and blocks diagnosis; multi-mount parity is not claimed.
+  The signed persistent-report path requires a writer-provisioned Vault:
+  unlock it from the native TTY before Desk initializes. After diagnosis, use
+  `kernaid-rescue-vaultctl report-list` and
+  `kernaid-rescue-vaultctl report-export RP-...` to place a verified envelope
+  at `/home/kernaid/KernAid-Reports/<id>.signed.json`. The current private ISO
+  predates qualification of this new path; do not infer support until a later
+  Rescue workflow passes its dedicated lifecycle gate.
 - **Windows, Linux or macOS that does boot:** download that operating system's desktop artifact, install it, and launch KernAid like a normal application. Windows and macOS startup collect only a fast, derived target identity; the deeper P0 collection starts once when **Diagnostica** is selected. macOS queries only the current-user `launchd` table and safe-boot integer, and explicitly reports system `launchd`, software-update availability, system-event analysis, and login/background-item counts as unqualified instead of inventing results. The fixed commands do not request repairs, although native Windows tools such as DISM may still update their own operating-system logs.
 - **Linux machine inventory:** Resident and Rescue use the same bounded Rust
   collector for CPU count/model, total RAM, firmware boot mode, selected public
@@ -101,14 +108,15 @@ See [Current status](docs/CURRENT_STATUS.md), the [operator guide](docs/operator
 
 - Resident mode has one bounded diagnosis-only OpenAI Responses adapter plus
   deterministic offline rules. Rescue includes feature-gated persistent-vault,
-  executor and loopback UI-server relay plumbing; an exact image is virtually
+  signed-report, executor and loopback UI-server relay plumbing; an exact image is virtually
   qualified only after the full Rescue workflow passes, including both
   privileged BIOS and UEFI lifecycle jobs. The
   v2 writer can provision that vault only for an exact catalog-authorized image
   on factory-new controlled-lab media; revision 1 authorizes the exact current
   internally qualified candidate.
-  Real-account Codex authorization, live provider TLS and physical-media
-  qualification remain incomplete.
+  The Rescue report relay is loopback/internal-only and has not yet passed its
+  shipping-image lifecycle gate. Real-account Codex authorization, live
+  provider TLS and physical-media qualification remain incomplete.
 - Native production host inventory has no mutation or repair handler; the
   opt-in fixture lab is not a production host path. The parameter-free Linux
   hardware command, schema and packaging are virtually exercised, and the CI
