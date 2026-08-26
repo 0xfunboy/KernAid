@@ -44,7 +44,7 @@ WinPE Companion and Fleet management remain later milestones.
 | Rescue credential boundary | Isolated credential vault and fail-closed Codex login/status/logout bridge; it does not run prompts or diagnoses |
 | Rescue provider plumbing | Feature-gated OpenAI executor and loopback relay are implemented, but live TLS and a real-account lifecycle are not yet qualified |
 | Virtual testing | Disposable QEMU fixtures, byte-level mutation checks, BIOS/UEFI boot and two-boot USB/vault coverage |
-| Repair experiment | Linux-only feature-gated Desk lab for one typed R2 repair, verification and separately approved rollback on an internal temporary fixture; absent from normal/Rescue builds and disconnected from production targets |
+| Repair experiment | Linux-only feature-gated Desk lab for one typed R2 repair and separately approved rollback on an internal temporary fixture. It now traverses the standard `SessionDriver`, Agent Gateway, explicit Core transaction states and typed broker; it remains absent from normal/Rescue builds and disconnected from production targets |
 
 The canonical repository is
 [`0xfunboy/KernAid`](https://github.com/0xfunboy/KernAid), branch `main`.
@@ -55,6 +55,9 @@ treated as a newer release.
 
 - There are no production mutation handlers and no real customer-machine
   repair path.
+- The fixture lab's exported webview artifact is deliberately marked volatile
+  and unsigned because the closed native bridge does not expose its signed
+  broker envelope. It is development evidence, not a release receipt.
 - Physical USB boot has not been qualified. The current private candidate may
   be used only for a controlled first-boot test on a factory-new or disposable
   USB and non-customer hardware.
@@ -93,6 +96,13 @@ locally verified catalog entry is now the sole image authorized by trusted
 catalog v2 revision 2. This is an **internally and virtually qualified
 candidate**, not a production release.
 
+New `main` candidates must additionally pass a final fail-closed qualification
+job. It hashes the ISO, checksum, catalog entry, SBOM and all BIOS/UEFI
+lifecycle evidence into one canonical manifest, then emits GitHub/Sigstore
+build-provenance and qualification attestations for that exact ISO. This gate
+does not retroactively attest the candidate listed above; that candidate stays
+pinned until a newer run is independently verified and explicitly promoted.
+
 The candidate is exposed privately only to unblock the first physical boot
 test. On Windows, verify the exact checksum and use Rufus in DD mode on a
 factory-new or disposable USB of at least 32 GB. Keep Secure Boot disabled,
@@ -112,8 +122,9 @@ passed; signing, notarization and physical-machine qualification remain open.
 2. Finish the real-account Rescue provider/vault lifecycle without exposing or
    copying the CLI credential store.
 3. Qualify Secure Boot and signed release delivery.
-4. Define the first production repair action with typed preconditions, backup,
-   explicit approval, verification and rollback; keep it disabled until the
+4. Promote the fixture transaction pattern into the first production repair
+   action with typed preconditions, a backup on a separate physical device,
+   exact approval, verification and rollback; keep it disabled until the
    complete safety case passes.
 5. Add a repeatable release channel for Desk and Rescue artifacts.
 

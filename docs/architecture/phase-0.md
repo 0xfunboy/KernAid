@@ -11,8 +11,10 @@ default production path, Core links claims to evidence, validates action
 metadata, and admits only R0 in this phase. The fake broker recognizes only
 `system.observe.noop`, checks the target fingerprint, and rejects repeated or
 decreasing sequence numbers. A separate Linux-only, feature-gated fixture lab
-admits one exact R2 action against a process-created temporary fixture; it is
-absent from normal builds and Rescue and cannot select a production target.
+uses the standard SessionDriver/Gateway boundary and explicit Core transaction
+states to admit one exact R2 action against a process-created temporary
+fixture; it is absent from normal builds and Rescue and cannot select a
+production target.
 
 The Resident Linux fixture collector accepts exactly one directory and reads
 metadata only. Rescue has a separate one-shot, descriptor-bound inspector for

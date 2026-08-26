@@ -22,8 +22,9 @@ Observe -> Diagnose -> Plan -> Approve -> Repair -> Verify -> Roll back
 ```
 
 The production path currently stops after reporting. One Linux-only fixture
-lab exercises repair and rollback against a disposable repository-owned test
-tree; it cannot select a host path, disk or customer target.
+lab exercises the same `SessionDriver -> Agent Gateway -> Core -> broker`
+shape for repair and rollback against a disposable repository-owned test tree;
+it cannot select a host path, disk or customer target.
 
 ## Product surfaces
 
@@ -72,11 +73,14 @@ logout and reboot.
 2. The Rescue workflow builds one exact ISO and proves BIOS/UEFI boot,
    USB-style two-boot persistence, byte-identical disposable targets and the
    privileged Vault lifecycle on that same artifact.
-3. The ISO, checksum, catalog-entry evidence and workflow identity are
-   downloaded and verified locally.
-4. Promotion is an explicit repository change: a new trusted-catalog revision
+3. A final job binds the ISO, checksum, catalog entry, SBOM and lifecycle
+   evidence into a canonical manifest and emits provenance and qualification
+   attestations for the ISO.
+4. The ISO, checksums, qualification manifest, attestations and workflow
+   identity are downloaded and verified locally.
+5. Promotion is an explicit repository change: a new trusted-catalog revision
    authorizes one exact name, size, digest, layout and evidence set.
-5. Only then are the private site metadata and pinned local artifact changed
+6. Only then are the private site metadata and pinned local artifact changed
    together and the service restarted.
 
 The existence of a GitHub Actions artifact alone never promotes it. Physical
@@ -103,4 +107,3 @@ proof is physical USB boot on disposable media and non-customer hardware;
 after that come Secure Boot, signed delivery, real-account provider lifecycle
 and the first production repair action with preconditions, backup,
 verification and rollback.
-

@@ -5,7 +5,11 @@ reversible Linux repair against a checked disposable fixture. It is absent from
 normal builds and Rescue. The Linux-only Desk lab connects the existing broker
 to a closed Tauri command set and a dedicated TypeScript driver; it cannot use
 Desk target selection, providers, a caller-supplied path, or production disks.
-The standard Phase 0 session and production invoke handler remain
+The lab is orchestrated through the same `SessionDriver` contract used by the
+normal product path. Its Agent Gateway adapter obtains closed evidence, stages
+plans, displays and binds the native monotonic approval sequence, and performs
+postcondition inspection. Core independently tracks repair and rollback as
+bound state machines. The standard Phase 0 production invoke handler remains
 diagnosis-only.
 
 The feature build creates its target, backup directory, authenticated journal
@@ -14,8 +18,11 @@ Its status exposes only typed IDs, declarations and `sha256:` values. The webvie
 can request the five fixed transitions `status`, `stage`, `execute`,
 `stage rollback` and `execute rollback`. Two read-only reconciliation calls can
 reissue an already committed in-memory receipt if IPC fails after completion;
-they never retry a mutation. Native IPC accepts no action selector, path,
-command, environment, replacement bytes or arbitrary JSON operation.
+they never retry a mutation. A separate recovery-only lookup exposes a bound
+repair receipt solely when Core recorded `Complete(Failed)`, allowing a newly
+approved rollback without relabelling the repair as successful. Native IPC
+accepts no action selector, path, command, environment, replacement bytes or
+arbitrary JSON operation.
 
 ## Closed transaction
 
@@ -42,6 +49,12 @@ preflight verifies the installed file and backup before rollback intent. The
 completion is a strict, device-signed cycle report bound to the exact journal
 head. It contains only IDs, declarations, hashes, supported metadata, and a
 deterministic logical backup locator.
+
+The Desk UI does not run a second repair orchestrator beside `SessionDriver`.
+It consumes a strict session artifact containing the staged plans, approvals,
+receipts and postcondition flags. That webview artifact is explicitly volatile
+and unsigned: the native signed cycle report stays behind the closed bridge and
+is not represented as if it had been exported.
 
 ## Threat model and limits
 
