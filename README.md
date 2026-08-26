@@ -40,8 +40,9 @@ The CI workflows are configured to produce engineering-preview desktop installer
   [Current status](docs/CURRENT_STATUS.md) only for first physical-boot
   qualification. Verify its checksum and, on Windows, write it with Rufus in
   DD mode to a factory-new or disposable USB of at least 32 GB. The trusted v2
-  catalog is currently empty, so the Linux writer rejects this image and the
-  manual Windows path does not provision or qualify the encrypted vault.
+  catalog revision 1 authorizes only this exact ISO, so the Linux writer can
+  verify, copy and provision its encrypted vault. The manual Windows path does
+  not perform that trusted vault provisioning.
   Physical USB boot and firmware remain unqualified. On a successful boot,
   select the
   installed-system candidate in the left rail, and keep Secure Boot disabled
@@ -104,7 +105,8 @@ See [Current status](docs/CURRENT_STATUS.md), the [operator guide](docs/operator
   qualified only after the full Rescue workflow passes, including both
   privileged BIOS and UEFI lifecycle jobs. The
   v2 writer can provision that vault only for an exact catalog-authorized image
-  on factory-new controlled-lab media; no image is currently authorized.
+  on factory-new controlled-lab media; revision 1 authorizes the exact current
+  internally qualified candidate.
   Real-account Codex authorization, live provider TLS and physical-media
   qualification remain incomplete.
 - Native production host inventory has no mutation or repair handler; the

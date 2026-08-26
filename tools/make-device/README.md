@@ -1,12 +1,13 @@
 # KernAid make-device
 
-`make-device-v2.py` è il writer previsto per una futura ISO KernAid Rescue
+`make-device-v2.py` è il writer trust-bound per una ISO KernAid Rescue
 autorizzata dal catalogo v2. Verifica la copia e provisiona il vault cifrato su
 un supporto USB factory-new selezionato esplicitamente. **Il prefisso lungo
 quanto la ISO e la partizione vault vengono sovrascritti.** Non è uno strumento
-di sanitizzazione dell'intero supporto. Il catalogo v2 distribuito è oggi vuoto,
-quindi il percorso fisico rifiuta ogni ISO prima di aprire il target in
-scrittura.
+di sanitizzazione dell'intero supporto. Il catalogo v2 distribuito, revisione 1,
+autorizza una sola ISO internamente e virtualmente qualificata; ogni immagine
+diversa viene rifiutata prima di aprire il target in scrittura. Questa
+autorizzazione non costituisce qualifica di supporti o hardware fisici.
 
 ## Stato del trust catalog
 
@@ -19,10 +20,15 @@ immagine viene rifiutata fail-closed; non basta fornire un SHA-256 arbitrario
 dalla riga di comando.
 
 La voce v1 è storica e l'artefatto del workflow collegato non è più
-scaricabile. Il catalogo v2 ha `catalogRevision: 0` e non autorizza alcuna
-immagine. La candidata privata identificata in `docs/CURRENT_STATUS.md` non è
-promossa perché il suo workflow completo è rosso; non sostituirla nel catalogo
-con un artefatto Actions non qualificato.
+scaricabile. Il catalogo v2 ha `catalogRevision: 1` e autorizza esclusivamente
+`KernAid-Rescue-amd64.iso`, versione `ci-32925221006-1`, di
+`1,221,148,672` byte e SHA-256
+`7d0ad0dce852381640d613d54d6e82708e27bf254b6c41060c63d736c63b68c0`,
+costruita dal commit `ba338287b58b3692afc5b1765e3264e261071bc1` nel run
+GitHub Actions `32925221006`. Lo stesso artefatto ha superato le prove QEMU
+BIOS/UEFI, USB two-boot, vault e lifecycle richieste ed è l'unica voce v2
+promossa. È una candidata **internamente e virtualmente qualificata**, non una
+release di produzione né una qualifica di boot fisico, firmware o Secure Boot.
 
 Questa evidenza v1 avvia l'immagine come CD-ROM virtuale QEMU: non prova il boot
 da USB né firmware o hardware fisici. Il writer v1, mantenuto soltanto per
@@ -43,8 +49,9 @@ directory devono essere posseduti da `root` e non scrivibili da gruppo/altri.
 
 Il writer v1 resta disponibile soltanto per verificabilità storica e non
 provisiona la persistenza. `make-device-v2.py` non consulta mai il catalogo v1,
-non effettua downgrade e, con il trust anchor corrente, rifiuta ogni ISO prima
-di aprire il target in scrittura.
+non effettua downgrade e, con il trust anchor corrente, accetta soltanto
+l'esatta ISO autorizzata dalla revisione 1; ogni altra immagine viene rifiutata
+prima di aprire il target in scrittura.
 
 `trusted-rescue-images.v2.schema.json`, `catalog_v2.py` e
 `catalog-entry-v2.py` definiscono il relativo contratto di trust. Una voce può
@@ -87,10 +94,11 @@ recente (`lsblk`, `losetup`, `wipefs`), `udevadm` da systemd-udev e GNU `dd`.
 L'interprete è fissato a `/usr/bin/python3 -I`; non usare una copia del tool da
 una checkout scrivibile dall'utente.
 
-Questa procedura resta sospesa finché una ISO non viene promossa nel catalogo
-v2. Dopo la promozione, installare il bundle root-owned descritto nella sezione
-**Writer USB v2 e vault cifrato** e usare esclusivamente l'ISO esatta autorizzata
-dal trust anchor installato.
+Questa procedura è abilitata soltanto per l'esatta ISO autorizzata dalla
+revisione 1 e resta limitata alla prima qualifica fisica controllata descritta
+in `docs/CURRENT_STATUS.md`. Installare il bundle root-owned descritto nella
+sezione **Writer USB v2 e vault cifrato** e usare esclusivamente l'immagine che
+corrisponde per nome, dimensione, SHA-256 e layout al trust anchor installato.
 
 Il target deve essere il path assoluto di un intero flash drive USB. È ammesso
 un SSD USB portatile solo se firmware e udev lo espongono come rimovibile e
@@ -131,8 +139,9 @@ lo dichiara. Questo non è uno strumento di sanitizzazione.
 
 Il report v1 dichiara anche che il vault persistente **non viene creato**: il
 writer v1 non provisiona intenzionalmente la p3. Il writer v2 e il relativo
-lifecycle sono implementati ma il trust resta inattivo; recovery autenticata e
-rollback restano gate separati. Il report contiene la prova udev
+lifecycle sono implementati e il trust v2 è attivo soltanto per l'esatta
+candidata della revisione 1; recovery autenticata e rollback restano gate
+separati. Il report contiene la prova udev
 verificata, incluso `ID_PATH`, ma dichiara esplicitamente di essere JSON locale
 **non firmato e non autenticato**: non è una ricevuta crittografica.
 
@@ -140,12 +149,13 @@ Questa dichiarazione riguarda esclusivamente `make-device.py` v1. Il percorso
 v2 crea e verifica il vault soltanto per un'immagine autorizzata dal catalogo
 v2 distribuito.
 
-## Writer USB v2 e vault cifrato (implementato, trust inattivo)
+## Writer USB v2 e vault cifrato (implementato, catalogo revisione 1)
 
-Quando il catalogo contiene una voce promossa, il launcher v2 accetta soltanto
-un supporto che espone almeno `32000000000` byte. Scrive e
-verifica il prefisso ISO esatto, richiede che lo slot MBR 3 coincida con il
-manifest installato e fa riesaminare la tabella al kernel. La p3 deve essere:
+Il catalogo distribuito contiene una sola voce promossa. Il launcher v2 accetta
+quell'immagine soltanto su un supporto che espone almeno `32000000000` byte.
+Scrive e verifica il prefisso ISO esatto, richiede che lo slot MBR 3 coincida
+con il manifest installato e fa riesaminare la tabella al kernel. La p3 deve
+essere:
 
 - numero `3`, tipo MBR `0x83`;
 - start LBA `33554432` (16 GiB);
@@ -241,9 +251,9 @@ sudo install -o root -g root -m 0644 \
 ```
 
 Il launcher verifica ownership e mode del bundle **prima** di importare il
-core. Oggi il comando seguente fallisce chiuso perché il catalogo v2 è vuoto;
-dopo una promozione accetterà soltanto l'ISO esatta presente nel catalogo
-installato:
+core. Con la revisione 1 il comando seguente accetta soltanto l'ISO esatta
+presente nel catalogo installato; nome, dimensione o SHA-256 differenti
+falliscono chiuso prima di aprire il target:
 
 ```text
 sudo /usr/local/libexec/kernaid/make-device-v2/make-device-v2.py \
