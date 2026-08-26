@@ -54,6 +54,17 @@ const REPORT_FILE_SUFFIX: &str = ".signed.json";
 const REPORT_TEMP_RANDOM_BYTES: usize = 16;
 const REPORT_TEMP_CREATE_ATTEMPTS: usize = 4;
 
+#[derive(Clone, Copy)]
+struct ReportOwner {
+    uid: u32,
+    gid: u32,
+}
+
+const SHIPPING_REPORT_OWNER: ReportOwner = ReportOwner {
+    uid: COMPANION_UID,
+    gid: COMPANION_UID,
+};
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Command {
     Status,
@@ -996,12 +1007,12 @@ fn persist_verified_report(
 ) -> Result<String, RescueVaultCompanionError> {
     let home = open_report_home()?;
     let directory = open_or_create_report_directory(&home)?;
-    persist_verified_report_in_directory(directory.as_fd(), report_id, bytes)
+    persist_verified_report_in_directory(directory.as_fd(), report_id, bytes, SHIPPING_REPORT_OWNER)
 }
 
 fn open_report_home() -> Result<OwnedFd, RescueVaultCompanionError> {
-    if rustix::process::geteuid().as_raw() != COMPANION_UID
-        || rustix::process::getegid().as_raw() != COMPANION_UID
+    if rustix::process::geteuid().as_raw() != SHIPPING_REPORT_OWNER.uid
+        || rustix::process::getegid().as_raw() != SHIPPING_REPORT_OWNER.gid
     {
         return Err(RescueVaultCompanionError::TransportUnavailable);
     }
@@ -1013,7 +1024,7 @@ fn open_report_home() -> Result<OwnedFd, RescueVaultCompanionError> {
         ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
     )
     .map_err(|_| RescueVaultCompanionError::TransportUnavailable)?;
-    validate_report_directory(home.as_fd(), false)?;
+    validate_report_directory(home.as_fd(), false, SHIPPING_REPORT_OWNER)?;
     Ok(home)
 }
 
@@ -1044,7 +1055,7 @@ fn open_or_create_report_directory(home: &OwnedFd) -> Result<OwnedFd, RescueVaul
         rfs::fsync(&directory).map_err(|_| RescueVaultCompanionError::TransportUnavailable)?;
         rfs::fsync(home).map_err(|_| RescueVaultCompanionError::TransportUnavailable)?;
     }
-    validate_report_directory(directory.as_fd(), true)?;
+    validate_report_directory(directory.as_fd(), true, SHIPPING_REPORT_OWNER)?;
     let opened =
         rfs::fstat(&directory).map_err(|_| RescueVaultCompanionError::TransportUnavailable)?;
     let named = rfs::statat(home, REPORT_DIRECTORY_NAME, AtFlags::SYMLINK_NOFOLLOW)
@@ -1058,6 +1069,7 @@ fn open_or_create_report_directory(home: &OwnedFd) -> Result<OwnedFd, RescueVaul
 fn validate_report_directory(
     directory: BorrowedFd<'_>,
     exact_private_mode: bool,
+    owner: ReportOwner,
 ) -> Result<(), RescueVaultCompanionError> {
     let stat =
         rfs::fstat(directory).map_err(|_| RescueVaultCompanionError::TransportUnavailable)?;
@@ -1066,8 +1078,8 @@ fn validate_report_directory(
     let permissions = stat.st_mode & 0o7777;
     if !FileType::from_raw_mode(stat.st_mode).is_dir()
         || stat.st_nlink < 2
-        || stat.st_uid != COMPANION_UID
-        || stat.st_gid != COMPANION_UID
+        || stat.st_uid != owner.uid
+        || stat.st_gid != owner.gid
         || permissions & 0o700 != 0o700
         || permissions & 0o7022 != 0
         || (exact_private_mode && permissions != 0o700)
@@ -1082,17 +1094,18 @@ fn persist_verified_report_in_directory(
     directory: BorrowedFd<'_>,
     report_id: &ReportId,
     bytes: &[u8],
+    owner: ReportOwner,
 ) -> Result<String, RescueVaultCompanionError> {
-    validate_report_directory(directory, true)?;
+    validate_report_directory(directory, true, owner)?;
     if bytes.len() < 2 || bytes.len() > MAX_SIGNED_REPORT_ENVELOPE_BYTES as usize {
         return Err(RescueVaultCompanionError::ProtocolFailure);
     }
     let final_name = format!("{}{REPORT_FILE_SUFFIX}", report_id.as_str());
-    let (temporary, temporary_name) = create_report_temp(directory, report_id)?;
+    let (temporary, temporary_name) = create_report_temp(directory, report_id, owner)?;
     let result = (|| {
         write_export_file(temporary.as_fd(), bytes)?;
         rfs::fsync(&temporary).map_err(|_| RescueVaultCompanionError::TransportUnavailable)?;
-        validate_export_file(temporary.as_fd(), bytes.len())?;
+        validate_export_file(temporary.as_fd(), bytes.len(), owner)?;
         let temporary_stat =
             rfs::fstat(&temporary).map_err(|_| RescueVaultCompanionError::TransportUnavailable)?;
         let named_temporary = rfs::statat(
@@ -1121,8 +1134,8 @@ fn persist_verified_report_in_directory(
             || published.st_ino != temporary_stat.st_ino
             || !FileType::from_raw_mode(published.st_mode).is_file()
             || published.st_nlink != 1
-            || published.st_uid != COMPANION_UID
-            || published.st_gid != COMPANION_UID
+            || published.st_uid != owner.uid
+            || published.st_gid != owner.gid
             || published.st_mode & 0o7777 != 0o600
             || usize::try_from(published.st_size).ok() != Some(bytes.len())
         {
@@ -1142,6 +1155,7 @@ fn persist_verified_report_in_directory(
 fn create_report_temp(
     directory: BorrowedFd<'_>,
     report_id: &ReportId,
+    owner: ReportOwner,
 ) -> Result<(OwnedFd, String), RescueVaultCompanionError> {
     for _ in 0..REPORT_TEMP_CREATE_ATTEMPTS {
         let mut random = [0_u8; REPORT_TEMP_RANDOM_BYTES];
@@ -1168,7 +1182,7 @@ fn create_report_temp(
             Ok(descriptor) => {
                 let prepared = rfs::fchmod(&descriptor, Mode::RUSR | Mode::WUSR)
                     .map_err(|_| RescueVaultCompanionError::TransportUnavailable)
-                    .and_then(|()| validate_export_file(descriptor.as_fd(), 0));
+                    .and_then(|()| validate_export_file(descriptor.as_fd(), 0, owner));
                 if let Err(error) = prepared {
                     drop(descriptor);
                     let _ = rfs::unlinkat(directory, name.as_str(), AtFlags::empty());
@@ -1186,6 +1200,7 @@ fn create_report_temp(
 fn validate_export_file(
     descriptor: BorrowedFd<'_>,
     expected_size: usize,
+    owner: ReportOwner,
 ) -> Result<(), RescueVaultCompanionError> {
     let stat =
         rfs::fstat(descriptor).map_err(|_| RescueVaultCompanionError::TransportUnavailable)?;
@@ -1193,8 +1208,8 @@ fn validate_export_file(
         .map_err(|_| RescueVaultCompanionError::TransportUnavailable)?;
     if !FileType::from_raw_mode(stat.st_mode).is_file()
         || stat.st_nlink != 1
-        || stat.st_uid != COMPANION_UID
-        || stat.st_gid != COMPANION_UID
+        || stat.st_uid != owner.uid
+        || stat.st_gid != owner.gid
         || stat.st_mode & 0o7777 != 0o600
         || usize::try_from(stat.st_size).ok() != Some(expected_size)
         || flags != rustix::io::FdFlags::CLOEXEC
@@ -2002,7 +2017,7 @@ mod tests {
         read
     }
 
-    fn private_test_directory(directory: &tempfile::TempDir) -> OwnedFd {
+    fn private_test_directory(directory: &tempfile::TempDir, owner: ReportOwner) -> OwnedFd {
         let descriptor = rfs::openat2(
             rfs::CWD,
             directory.path(),
@@ -2013,7 +2028,7 @@ mod tests {
         .expect("open private test directory");
         rfs::fchmod(&descriptor, Mode::RUSR | Mode::WUSR | Mode::XUSR)
             .expect("private test directory mode");
-        validate_report_directory(descriptor.as_fd(), true).expect("secure test directory");
+        validate_report_directory(descriptor.as_fd(), true, owner).expect("secure test directory");
         descriptor
     }
 
@@ -2056,13 +2071,21 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let temporary_root = tempfile::tempdir().expect("temporary report directory");
-        let directory = private_test_directory(&temporary_root);
+        let owner = ReportOwner {
+            uid: rustix::process::geteuid().as_raw(),
+            gid: rustix::process::getegid().as_raw(),
+        };
+        let directory = private_test_directory(&temporary_root, owner);
         let body = br#"{"payload":{"report":"ok"},"signature":"test"}"#;
         let summary = report_summary(body);
         let expected_name = format!("{}{REPORT_FILE_SUFFIX}", summary.report_id().as_str());
-        let fixed_path =
-            persist_verified_report_in_directory(directory.as_fd(), summary.report_id(), body)
-                .expect("first report export");
+        let fixed_path = persist_verified_report_in_directory(
+            directory.as_fd(),
+            summary.report_id(),
+            body,
+            owner,
+        )
+        .expect("first report export");
         assert_eq!(
             fixed_path,
             format!("{REPORT_HOME_PATH}/{REPORT_DIRECTORY_NAME}/{expected_name}")
@@ -2078,6 +2101,7 @@ mod tests {
                 directory.as_fd(),
                 summary.report_id(),
                 b"different signed report",
+                owner,
             )
             .err(),
             Some(RescueVaultCompanionError::TransportUnavailable)
