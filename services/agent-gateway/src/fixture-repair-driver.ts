@@ -79,6 +79,11 @@ export interface FixtureRepairExecuteRequestDto {
   readonly approval: FixtureBridgeApprovalDto;
 }
 
+/** Closed reconciliation lookup; it cannot select a target or action. */
+export interface FixtureRepairRecoveryRequestDto {
+  readonly approvalId: string;
+}
+
 export interface FixtureRepairReceiptDto {
   readonly approvalId: string;
   readonly approvalSequence: number;
@@ -154,6 +159,9 @@ export interface FixtureRepairBridge {
   execute(
     request: FixtureRepairExecuteRequestDto,
   ): Promise<FixtureRepairReceiptDto>;
+  recoverRepairForRollback(
+    request: FixtureRepairRecoveryRequestDto,
+  ): Promise<FixtureRepairReceiptDto>;
   stageRollback(
     request: FixtureRollbackStageRequestDto,
   ): Promise<StagedFixtureRollbackDto>;
@@ -162,10 +170,48 @@ export interface FixtureRepairBridge {
   ): Promise<FixtureRollbackReceiptDto>;
 }
 
+/** Strict DTO parsers shared by closed bridge adapters and report artifacts. */
+export function parseFixtureRepairStatusDto(
+  value: unknown,
+): FixtureRepairStatusDto {
+  return parseStatus(value);
+}
+
+export function parseFixtureRepairFindingDto(
+  value: unknown,
+): FixtureRepairFindingDto {
+  return parseFinding(value);
+}
+
+export function parseStagedFixtureRepairDto(
+  value: unknown,
+): StagedFixtureRepairDto {
+  return parseStagedRepair(value);
+}
+
+export function parseFixtureRepairReceiptDto(
+  value: unknown,
+): FixtureRepairReceiptDto {
+  return parseRepairReceipt(value);
+}
+
+export function parseStagedFixtureRollbackDto(
+  value: unknown,
+): StagedFixtureRollbackDto {
+  return parseStagedRollback(value);
+}
+
+export function parseFixtureRollbackReceiptDto(
+  value: unknown,
+): FixtureRollbackReceiptDto {
+  return parseRollbackReceipt(value);
+}
+
 interface RepairRecord {
   staged: StagedFixtureRepairDto;
   executionAttempted: boolean;
   receipt?: FixtureRepairReceiptDto;
+  recoveryReceipt?: FixtureRepairReceiptDto;
 }
 
 interface RollbackRecord {
@@ -175,8 +221,9 @@ interface RollbackRecord {
 }
 
 /**
- * Fixture-only orchestration. This class is intentionally separate from the
- * shipping SessionDriver and cannot change LocalSessionDriver defaults.
+ * Closed fixture-only bridge orchestration used below the opt-in
+ * FixtureRepairSessionDriver. Constructing the normal LocalSessionDriver never
+ * creates this class and cannot change its diagnosis-only defaults.
  */
 export class FixtureRepairDriver {
   private readonly repairs = new Map<string, RepairRecord>();
@@ -238,6 +285,7 @@ export class FixtureRepairDriver {
         sessionId: record.staged.sessionId,
       };
       record.executionAttempted = true;
+      this.approvalIds.add(approval.approvalId);
       let receipt: FixtureRepairReceiptDto;
       try {
         receipt = parseRepairReceipt(
@@ -248,14 +296,34 @@ export class FixtureRepairDriver {
         );
         assertRepairReceiptBinding(record.staged, bridgeApproval, receipt);
       } catch {
+        try {
+          const recovered = parseRepairReceipt(
+            await this.bridge.recoverRepairForRollback({
+              approvalId: approval.approvalId,
+            }),
+          );
+          assertRepairReceiptBinding(record.staged, bridgeApproval, recovered);
+          record.receipt = clone(recovered);
+          record.recoveryReceipt = clone(recovered);
+        } catch {
+          // Recovery is intentionally best-effort and never changes failure to
+          // success. A strictly bound receipt only enables a separate rollback.
+        }
         throw new Error(
           "fixture repair execution outcome requires bridge reconciliation",
         );
       }
-      this.approvalIds.add(approval.approvalId);
       record.receipt = clone(receipt);
       return clone(receipt);
     });
+  }
+
+  recoveryReceipt(planId: string): FixtureRepairReceiptDto | null {
+    const record = this.repairs.get(planId);
+    if (record === undefined) throw new Error("unknown fixture repair plan");
+    return record.recoveryReceipt === undefined
+      ? null
+      : clone(record.recoveryReceipt);
   }
 
   async stageRollback(
@@ -322,6 +390,7 @@ export class FixtureRepairDriver {
         sessionId: record.staged.sessionId,
       };
       record.executionAttempted = true;
+      this.approvalIds.add(approval.approvalId);
       let receipt: FixtureRollbackReceiptDto;
       try {
         receipt = parseRollbackReceipt(
@@ -336,7 +405,6 @@ export class FixtureRepairDriver {
           "fixture rollback outcome requires bridge reconciliation",
         );
       }
-      this.approvalIds.add(approval.approvalId);
       record.receipt = clone(receipt);
       return clone(receipt);
     });

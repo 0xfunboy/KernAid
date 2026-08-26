@@ -15,6 +15,7 @@ import {
   type FixtureRepairBridge,
   type FixtureRepairExecuteRequestDto,
   type FixtureRepairReceiptDto,
+  type FixtureRepairRecoveryRequestDto,
   type FixtureRepairStageRequestDto,
   type FixtureRepairStatusDto,
   type FixtureRollbackExecuteRequestDto,
@@ -74,6 +75,12 @@ class RecordingBridge implements FixtureRepairBridge {
     };
   }
 
+  async recoverRepairForRollback(
+    _request: FixtureRepairRecoveryRequestDto,
+  ): Promise<FixtureRepairReceiptDto> {
+    throw new Error("no failed execution to recover");
+  }
+
   async stageRollback(
     request: FixtureRollbackStageRequestDto,
   ): Promise<StagedFixtureRollbackDto> {
@@ -123,6 +130,29 @@ class RecordingBridge implements FixtureRepairBridge {
       validationPassed: true,
       finalState: "rolled-back",
     };
+  }
+}
+
+class RecoveringBridge extends RecordingBridge {
+  recovered?: FixtureRepairReceiptDto;
+
+  override async execute(
+    request: FixtureRepairExecuteRequestDto,
+  ): Promise<FixtureRepairReceiptDto> {
+    this.recovered = await super.execute(request);
+    throw new Error("simulated lost execute response");
+  }
+
+  override async recoverRepairForRollback(
+    request: FixtureRepairRecoveryRequestDto,
+  ): Promise<FixtureRepairReceiptDto> {
+    this.calls.push({
+      method: "recoverRepairForRollback",
+      value: structuredClone(request),
+    });
+    if (this.recovered?.approvalId !== request.approvalId)
+      throw new Error("recovery unavailable");
+    return structuredClone(this.recovered);
   }
 }
 
@@ -237,5 +267,36 @@ test("rejects uncontracted input and approvals not bound to the staged hash", as
   assert.equal(
     bridge.calls.filter((call) => call.method === "execute").length,
     0,
+  );
+});
+
+test("stores a strictly bound recovery receipt for rollback but still fails execute", async () => {
+  const bridge = new RecoveringBridge();
+  const driver = new FixtureRepairDriver(bridge);
+  const repair = await driver.stage(finding());
+  await assert.rejects(
+    driver.execute({
+      approvalId: "A-recovered",
+      approvalSequence: 11,
+      planId: repair.planId,
+      planHash: repair.planHash,
+      targetSnapshot: repair.targetSnapshot,
+    }),
+    /requires bridge reconciliation/iu,
+  );
+  assert.equal(
+    driver.recoveryReceipt(repair.planId)?.approvalId,
+    "A-recovered",
+  );
+  const rollback = await driver.stageRollback({
+    sessionId: repair.sessionId,
+    planId: "P-recovered-rollback",
+    repairApprovalId: "A-recovered",
+  });
+  assert.equal(rollback.repairApprovalId, "A-recovered");
+  assert.equal(
+    bridge.calls.filter((call) => call.method === "recoverRepairForRollback")
+      .length,
+    1,
   );
 });

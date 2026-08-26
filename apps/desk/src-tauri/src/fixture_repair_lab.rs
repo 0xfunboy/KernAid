@@ -542,6 +542,30 @@ impl FixtureRepairLab {
         Ok(response)
     }
 
+    fn recover_repair_for_rollback(
+        &self,
+        request: FixtureLabReconcileRequest,
+    ) -> Result<FixtureLabExecuteResponse, String> {
+        let inner = self.0.lock().map_err(|_| execution_error())?;
+        let response = inner
+            .completed_repairs
+            .get(&request.approval_id)
+            .cloned()
+            .ok_or_else(execution_error)?;
+        let transaction = inner
+            .repair_transactions
+            .get(&response.plan_id)
+            .ok_or_else(execution_error)?;
+        if response.approval_id != request.approval_id
+            || transaction.state()
+                != FixtureRepairTransactionState::Complete(FixtureVerificationOutcome::Failed)
+            || !repair_receipt_matches_transaction(&response, transaction)
+        {
+            return Err(execution_error());
+        }
+        Ok(response)
+    }
+
     fn stage_rollback(
         &self,
         request: FixtureLabRollbackStageRequest,
@@ -757,6 +781,14 @@ pub(crate) fn fixture_lab_reconcile_execute(
 }
 
 #[tauri::command]
+pub(crate) fn fixture_lab_recover_repair_for_rollback(
+    state: State<'_, FixtureRepairLab>,
+    request: FixtureLabReconcileRequest,
+) -> Result<FixtureLabExecuteResponse, String> {
+    state.recover_repair_for_rollback(request)
+}
+
+#[tauri::command]
 pub(crate) fn fixture_lab_stage_rollback(
     state: State<'_, FixtureRepairLab>,
     request: FixtureLabRollbackStageRequest,
@@ -790,6 +822,21 @@ fn repair_mutation_binding(
         staged.resource_id(),
         staged.expected_before_sha256(),
     )
+}
+
+fn repair_receipt_matches_transaction(
+    response: &FixtureLabExecuteResponse,
+    transaction: &FixtureRepairTransaction,
+) -> bool {
+    let binding = transaction.binding();
+    response.validation_passed
+        && response.plan_id == binding.plan_id()
+        && response.plan_hash == binding.plan_hash()
+        && response.target_snapshot == binding.target_snapshot()
+        && response.resource_id == binding.resource_id()
+        && response.before_sha256 == binding.resource_precondition()
+        && transaction.approval_id() == Some(response.approval_id.as_str())
+        && transaction.approval_sequence() == Some(response.approval_sequence)
 }
 
 fn repair_transition_proof(
@@ -1068,5 +1115,138 @@ mod tests {
         let serialized = serde_json::to_string(&completed).expect("serialize response");
         assert!(!serialized.contains(inner.fixture_root.to_string_lossy().as_ref()));
         assert!(!serialized.contains("UUID=missing-data"));
+    }
+
+    #[test]
+    fn rollback_recovery_exposes_only_exact_failed_core_transaction() {
+        let lab = FixtureRepairLab::new().expect("initialize isolated fixture lab");
+        assert!(
+            lab.recover_repair_for_rollback(FixtureLabReconcileRequest {
+                approval_id: "A-unknown-repair".to_owned(),
+            })
+            .is_err()
+        );
+
+        let status = lab.status().expect("read fixture lab status");
+        let stage = lab
+            .stage(FixtureLabStageRequest {
+                session_id: "S-recovery-fixture".to_owned(),
+                plan_id: "P-recovery-repair".to_owned(),
+            })
+            .expect("stage repair");
+        let repair = lab
+            .execute(FixtureLabExecuteRequest {
+                approval_id: "A-recovery-repair".to_owned(),
+                approval_sequence: status.next_approval_sequence.expect("repair sequence"),
+                session_id: stage.session_id.clone(),
+                plan_id: stage.plan_id.clone(),
+                plan_hash: stage.plan_hash.clone(),
+                target_snapshot: stage.target_snapshot.clone(),
+            })
+            .expect("execute repair");
+        let recovery_request = FixtureLabReconcileRequest {
+            approval_id: repair.approval_id.clone(),
+        };
+        assert!(
+            lab.recover_repair_for_rollback(FixtureLabReconcileRequest {
+                approval_id: recovery_request.approval_id.clone(),
+            })
+            .is_err(),
+            "a successful transaction must not enter recovery"
+        );
+
+        let binding = FixtureMutationBinding::new(
+            &repair.plan_id,
+            &repair.plan_hash,
+            &repair.target_snapshot,
+            repair.resource_id,
+            &repair.before_sha256,
+        )
+        .expect("reconstruct bound repair transaction");
+        let proof = FixtureTransitionProof::new(
+            binding.clone(),
+            &repair.approval_id,
+            repair.approval_sequence,
+        )
+        .expect("reconstruct bound approval");
+        let mut transaction = FixtureRepairTransaction::stage(binding);
+        {
+            let mut inner = lab.0.lock().expect("fixture lab lock");
+            inner
+                .repair_transactions
+                .insert(repair.plan_id.clone(), transaction.clone());
+        }
+        assert!(
+            lab.recover_repair_for_rollback(FixtureLabReconcileRequest {
+                approval_id: recovery_request.approval_id.clone(),
+            })
+            .is_err(),
+            "a staged transaction must not enter recovery"
+        );
+
+        transaction.approve(&proof).expect("approve transaction");
+        transaction.begin_repair(&proof).expect("begin transaction");
+        {
+            let mut inner = lab.0.lock().expect("fixture lab lock");
+            inner
+                .repair_transactions
+                .insert(repair.plan_id.clone(), transaction.clone());
+        }
+        assert!(
+            lab.recover_repair_for_rollback(FixtureLabReconcileRequest {
+                approval_id: recovery_request.approval_id.clone(),
+            })
+            .is_err(),
+            "an in-progress transaction must not enter recovery"
+        );
+
+        transaction
+            .record_verification(&proof, FixtureVerificationOutcome::Failed)
+            .expect("record failed post-verification");
+        transaction
+            .complete(&proof)
+            .expect("complete failed transaction");
+        {
+            let mut inner = lab.0.lock().expect("fixture lab lock");
+            inner
+                .repair_transactions
+                .insert(repair.plan_id.clone(), transaction);
+            let mut mismatched_response = repair.clone();
+            mismatched_response.plan_hash = format!("sha256:{}", "0".repeat(64));
+            inner
+                .completed_repairs
+                .insert(repair.approval_id.clone(), mismatched_response);
+        }
+        assert!(
+            lab.recover_repair_for_rollback(FixtureLabReconcileRequest {
+                approval_id: recovery_request.approval_id.clone(),
+            })
+            .is_err(),
+            "a receipt that differs from the Core binding must not enter recovery"
+        );
+        lab.0
+            .lock()
+            .expect("fixture lab lock")
+            .completed_repairs
+            .insert(repair.approval_id.clone(), repair.clone());
+        assert!(
+            lab.reconcile_execute(FixtureLabReconcileRequest {
+                approval_id: recovery_request.approval_id.clone(),
+            })
+            .is_err(),
+            "ordinary reconciliation must reject failed post-verification"
+        );
+        let recovered = lab
+            .recover_repair_for_rollback(recovery_request)
+            .expect("recover exact failed repair for rollback");
+        assert_eq!(recovered.plan_hash, repair.plan_hash);
+        assert_eq!(recovered.before_sha256, repair.before_sha256);
+
+        lab.stage_rollback(FixtureLabRollbackStageRequest {
+            session_id: "S-recovery-fixture".to_owned(),
+            plan_id: "P-recovery-rollback".to_owned(),
+            repair_approval_id: recovered.approval_id,
+        })
+        .expect("stage rollback from recovery-only receipt");
     }
 }

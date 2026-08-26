@@ -260,6 +260,14 @@ impl FixtureRepairTransaction {
         &self.bound.mutation
     }
 
+    pub fn approval_id(&self) -> Option<&str> {
+        self.bound.approval_id.as_deref()
+    }
+
+    pub const fn approval_sequence(&self) -> Option<u64> {
+        self.bound.approval_sequence
+    }
+
     pub fn approve(
         &mut self,
         proof: &FixtureTransitionProof,

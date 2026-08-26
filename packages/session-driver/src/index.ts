@@ -54,6 +54,30 @@ export interface SessionDriver {
   exportReport(sessionId: string, format: ReportFormat): Promise<ArtifactRef>;
 }
 
+/**
+ * Approval data that a UI may display for a staged reversible plan. The
+ * hashes are opaque broker bindings; they are never paths or commands.
+ */
+export interface PlanApprovalRequirement {
+  schemaVersion: "1.0";
+  planId: string;
+  risk: "R1" | "R2" | "R3";
+  typedConfirmation: string;
+  planHash: string;
+  targetSnapshot: string;
+  nextApprovalSequence: number;
+}
+
+/**
+ * Additive extension for drivers that can stage and prove a rollback. A
+ * plain SessionDriver remains fully supported for diagnosis-only sessions.
+ */
+export interface ReversibleSessionDriver extends SessionDriver {
+  getApprovalRequirement(planId: string): Promise<PlanApprovalRequirement>;
+  stageRollback(planId: string): Promise<ValidatedPlan>;
+  exportRepairArtifact(sessionId: string): Promise<ArtifactRef>;
+}
+
 export {
   AuditContractError,
   SECURE_AUDIT_STATUS,

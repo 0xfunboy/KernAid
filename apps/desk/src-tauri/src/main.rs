@@ -1765,6 +1765,7 @@ macro_rules! active_invoke_handler {
             fixture_repair_lab::fixture_lab_stage,
             fixture_repair_lab::fixture_lab_execute,
             fixture_repair_lab::fixture_lab_reconcile_execute,
+            fixture_repair_lab::fixture_lab_recover_repair_for_rollback,
             fixture_repair_lab::fixture_lab_stage_rollback,
             fixture_repair_lab::fixture_lab_execute_rollback,
             fixture_repair_lab::fixture_lab_reconcile_rollback

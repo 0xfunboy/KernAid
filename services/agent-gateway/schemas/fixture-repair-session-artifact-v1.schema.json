@@ -1,0 +1,359 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kernaid.dev/schemas/fixture-repair-session-artifact-v1.json",
+  "title": "FixtureRepairSessionArtifact",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "apiVersion",
+    "kind",
+    "sessionId",
+    "targetFingerprint",
+    "persistence",
+    "repair",
+    "rollback",
+    "finalState"
+  ],
+  "properties": {
+    "apiVersion": {
+      "const": "kernaid.dev/fixture-repair-session-artifact/v1"
+    },
+    "kind": { "const": "FixtureRepairSessionArtifact" },
+    "sessionId": { "$ref": "#/$defs/sessionId" },
+    "targetFingerprint": { "$ref": "#/$defs/sha256" },
+    "persistence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["persistent", "signed", "reason"],
+      "properties": {
+        "persistent": { "const": false },
+        "signed": { "const": false },
+        "reason": {
+          "const": "native signed receipt envelope is not exposed by this bridge"
+        }
+      }
+    },
+    "repair": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "staged",
+        "approval",
+        "receipt",
+        "executionAttempted",
+        "postconditionVerified"
+      ],
+      "properties": {
+        "staged": { "$ref": "#/$defs/stagedRepair" },
+        "approval": {
+          "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/approval" }]
+        },
+        "receipt": {
+          "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/repairReceipt" }]
+        },
+        "executionAttempted": { "type": "boolean" },
+        "postconditionVerified": { "type": "boolean" }
+      }
+    },
+    "rollback": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "staged",
+            "approval",
+            "receipt",
+            "executionAttempted",
+            "postconditionVerified"
+          ],
+          "properties": {
+            "staged": { "$ref": "#/$defs/stagedRollback" },
+            "approval": {
+              "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/approval" }]
+            },
+            "receipt": {
+              "oneOf": [
+                { "type": "null" },
+                { "$ref": "#/$defs/rollbackReceipt" }
+              ]
+            },
+            "executionAttempted": { "type": "boolean" },
+            "postconditionVerified": { "type": "boolean" }
+          }
+        }
+      ]
+    },
+    "finalState": {
+      "enum": [
+        "repair-staged",
+        "repair-reconciliation-required",
+        "repaired",
+        "rollback-staged",
+        "rollback-reconciliation-required",
+        "rolled-back"
+      ]
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "sessionId": {
+      "type": "string",
+      "pattern": "^S-[A-Za-z0-9-]+$",
+      "maxLength": 128
+    },
+    "planId": {
+      "type": "string",
+      "pattern": "^P-[A-Za-z0-9-]+$",
+      "maxLength": 128
+    },
+    "approvalId": {
+      "type": "string",
+      "pattern": "^A-[A-Za-z0-9-]+$",
+      "maxLength": 128
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "sha256"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^E-[A-Za-z0-9-]+$",
+          "maxLength": 128
+        },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "evidenceList": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 32,
+      "uniqueItems": true,
+      "description": "Bindings are canonical and evidence IDs are also required to be unique by the strict runtime parser.",
+      "items": { "$ref": "#/$defs/evidence" }
+    },
+    "backupLocator": {
+      "type": "string",
+      "pattern": "^fixture-lab-backup://linux-fstab/sha256:[0-9a-f]{64}$"
+    },
+    "approval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "approvalId",
+        "planId",
+        "targetFingerprint",
+        "approvedAt",
+        "approvedBy",
+        "typedConfirmation",
+        "sessionId",
+        "approvalSequence",
+        "planHash",
+        "targetSnapshot"
+      ],
+      "properties": {
+        "schemaVersion": { "const": "1.0" },
+        "approvalId": { "$ref": "#/$defs/approvalId" },
+        "planId": { "$ref": "#/$defs/planId" },
+        "targetFingerprint": { "$ref": "#/$defs/sha256" },
+        "approvedAt": { "type": "string", "format": "date-time" },
+        "approvedBy": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "typedConfirmation": {
+          "enum": ["APPROVO RIPARAZIONE R2", "APPROVO ROLLBACK R2"]
+        },
+        "sessionId": { "$ref": "#/$defs/sessionId" },
+        "approvalSequence": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "planHash": { "$ref": "#/$defs/sha256" },
+        "targetSnapshot": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "stagedRepair": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sessionId",
+        "planId",
+        "diagnosisSha256",
+        "findingId",
+        "findingVersion",
+        "evidence",
+        "actionId",
+        "resourceId",
+        "risk",
+        "targetSnapshot",
+        "expectedBeforeSha256",
+        "expectedAfterSha256",
+        "diffSha256",
+        "backupLocator",
+        "planHash",
+        "backup",
+        "validation",
+        "rollback"
+      ],
+      "properties": {
+        "sessionId": { "$ref": "#/$defs/sessionId" },
+        "planId": { "$ref": "#/$defs/planId" },
+        "diagnosisSha256": { "$ref": "#/$defs/sha256" },
+        "findingId": { "const": "KA-LNX-P0-003" },
+        "findingVersion": { "const": 2 },
+        "evidence": { "$ref": "#/$defs/evidenceList" },
+        "actionId": { "const": "linux.fstab.repair-entry.fixture-v1" },
+        "resourceId": { "const": "fixture:linux-fstab-v1" },
+        "risk": { "const": "R2" },
+        "targetSnapshot": { "$ref": "#/$defs/sha256" },
+        "expectedBeforeSha256": { "$ref": "#/$defs/sha256" },
+        "expectedAfterSha256": { "$ref": "#/$defs/sha256" },
+        "diffSha256": { "$ref": "#/$defs/sha256" },
+        "backupLocator": { "$ref": "#/$defs/backupLocator" },
+        "planHash": { "$ref": "#/$defs/sha256" },
+        "backup": { "const": "required-separate-byte-verified-copy" },
+        "validation": {
+          "const": "fstab is syntactically parsed and the unique missing UUID entry is disabled"
+        },
+        "rollback": {
+          "const": "atomically restore the byte-verified backup and original mode/uid/gid"
+        }
+      }
+    },
+    "repairReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "approvalId",
+        "approvalSequence",
+        "sessionId",
+        "planId",
+        "planHash",
+        "actionId",
+        "resourceId",
+        "risk",
+        "diagnosisSha256",
+        "findingId",
+        "findingVersion",
+        "evidence",
+        "targetSnapshot",
+        "beforeSha256",
+        "afterSha256",
+        "backupLocator",
+        "backupSha256",
+        "validationPassed"
+      ],
+      "properties": {
+        "approvalId": { "$ref": "#/$defs/approvalId" },
+        "approvalSequence": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "sessionId": { "$ref": "#/$defs/sessionId" },
+        "planId": { "$ref": "#/$defs/planId" },
+        "planHash": { "$ref": "#/$defs/sha256" },
+        "actionId": { "const": "linux.fstab.repair-entry.fixture-v1" },
+        "resourceId": { "const": "fixture:linux-fstab-v1" },
+        "risk": { "const": "R2" },
+        "diagnosisSha256": { "$ref": "#/$defs/sha256" },
+        "findingId": { "const": "KA-LNX-P0-003" },
+        "findingVersion": { "const": 2 },
+        "evidence": { "$ref": "#/$defs/evidenceList" },
+        "targetSnapshot": { "$ref": "#/$defs/sha256" },
+        "beforeSha256": { "$ref": "#/$defs/sha256" },
+        "afterSha256": { "$ref": "#/$defs/sha256" },
+        "backupLocator": { "$ref": "#/$defs/backupLocator" },
+        "backupSha256": { "$ref": "#/$defs/sha256" },
+        "validationPassed": { "const": true }
+      }
+    },
+    "stagedRollback": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sessionId",
+        "planId",
+        "repairApprovalId",
+        "repairPlanHash",
+        "actionId",
+        "resourceId",
+        "risk",
+        "targetSnapshot",
+        "installedSha256",
+        "restoredSha256",
+        "backupLocator",
+        "backupSha256",
+        "planHash",
+        "validation"
+      ],
+      "properties": {
+        "sessionId": { "$ref": "#/$defs/sessionId" },
+        "planId": { "$ref": "#/$defs/planId" },
+        "repairApprovalId": { "$ref": "#/$defs/approvalId" },
+        "repairPlanHash": { "$ref": "#/$defs/sha256" },
+        "actionId": { "const": "linux.fstab.restore" },
+        "resourceId": { "const": "fixture:linux-fstab-v1" },
+        "risk": { "const": "R2" },
+        "targetSnapshot": { "$ref": "#/$defs/sha256" },
+        "installedSha256": { "$ref": "#/$defs/sha256" },
+        "restoredSha256": { "$ref": "#/$defs/sha256" },
+        "backupLocator": { "$ref": "#/$defs/backupLocator" },
+        "backupSha256": { "$ref": "#/$defs/sha256" },
+        "planHash": { "$ref": "#/$defs/sha256" },
+        "validation": {
+          "const": "restored fstab bytes and original mode/uid/gid match the verified backup"
+        }
+      }
+    },
+    "rollbackReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repairApprovalId",
+        "rollbackApprovalId",
+        "approvalSequence",
+        "sessionId",
+        "planId",
+        "planHash",
+        "actionId",
+        "resourceId",
+        "risk",
+        "targetSnapshot",
+        "replacedSha256",
+        "restoredSha256",
+        "backupLocator",
+        "backupSha256",
+        "validationPassed",
+        "finalState"
+      ],
+      "properties": {
+        "repairApprovalId": { "$ref": "#/$defs/approvalId" },
+        "rollbackApprovalId": { "$ref": "#/$defs/approvalId" },
+        "approvalSequence": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "sessionId": { "$ref": "#/$defs/sessionId" },
+        "planId": { "$ref": "#/$defs/planId" },
+        "planHash": { "$ref": "#/$defs/sha256" },
+        "actionId": { "const": "linux.fstab.restore" },
+        "resourceId": { "const": "fixture:linux-fstab-v1" },
+        "risk": { "const": "R2" },
+        "targetSnapshot": { "$ref": "#/$defs/sha256" },
+        "replacedSha256": { "$ref": "#/$defs/sha256" },
+        "restoredSha256": { "$ref": "#/$defs/sha256" },
+        "backupLocator": { "$ref": "#/$defs/backupLocator" },
+        "backupSha256": { "$ref": "#/$defs/sha256" },
+        "validationPassed": { "const": true },
+        "finalState": { "const": "rolled-back" }
+      }
+    }
+  }
+}

@@ -5,6 +5,7 @@ import {
   type FixtureRepairBridge,
   type FixtureRepairExecuteRequestDto,
   type FixtureRepairFindingDto,
+  type FixtureRepairRecoveryRequestDto,
   type FixtureRepairReceiptDto,
   type FixtureRepairStageRequestDto,
   type FixtureRepairStatusDto,
@@ -59,6 +60,15 @@ export class NativeFixtureRepairBridge implements FixtureRepairBridge {
         request: { approvalId: request.approval.approvalId },
       });
     }
+  }
+
+  async recoverRepairForRollback(
+    request: FixtureRepairRecoveryRequestDto,
+  ): Promise<FixtureRepairReceiptDto> {
+    return invoke<FixtureRepairReceiptDto>(
+      "fixture_lab_recover_repair_for_rollback",
+      { request },
+    );
   }
 
   async stageRollback(
