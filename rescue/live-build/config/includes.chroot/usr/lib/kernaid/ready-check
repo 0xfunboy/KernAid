@@ -272,7 +272,7 @@ if id -nG kernaid-application 2>/dev/null | tr ' ' '\n' | grep -E -x 'kernaid-ap
 fi
 application_client_group_id="$(getent group kernaid-application-client | awk -F: 'NF == 4 && $1 == "kernaid-application-client" && $3 ~ /^[0-9]+$/ && $4 == "" { print $3 }')"
 test -n "$application_client_group_id" || fail "Application relay client group is missing or has static members"
-getent group kernaid-vault | awk -F: 'NF == 4 && $1 == "kernaid-vault" { count = split($4, members, ","); for (index = 1; index <= count; index += 1) { seen[members[index]] += 1 } if (count == 3 && seen["kernaid"] == 1 && seen["kernaid-openai"] == 1 && seen["kernaid-application"] == 1) found = 1 } END { exit !found }' \
+getent group kernaid-vault | awk -F: 'NF == 4 && $1 == "kernaid-vault" { count = split($4, members, ","); for (member_index = 1; member_index <= count; member_index += 1) { seen[members[member_index]] += 1 } if (count == 3 && seen["kernaid"] == 1 && seen["kernaid-openai"] == 1 && seen["kernaid-application"] == 1) found = 1 } END { exit !found }' \
     || fail "vault group does not have the exact companion and Agent members"
 if id -nG kernaid 2>/dev/null | tr ' ' '\n' | grep -Fxq kernaid-openai; then
     fail "live user unexpectedly has OpenAI egress access"

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import re
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -252,6 +253,34 @@ class VaultSystemdPackagingTests(unittest.TestCase):
             "printf '\\nKERNAID_RESCUE_NOT_READY: %s\\n' \"$*\" >/dev/ttyS0",
             READY_CHECK.read_text(encoding="utf-8"),
         )
+
+    def test_vault_group_readiness_awk_is_portable_and_exact(self) -> None:
+        program = (
+            'NF == 4 && $1 == "kernaid-vault" { '
+            'count = split($4, members, ","); '
+            "for (member_index = 1; member_index <= count; member_index += 1) { "
+            "seen[members[member_index]] += 1 } "
+            'if (count == 3 && seen["kernaid"] == 1 '
+            '&& seen["kernaid-openai"] == 1 '
+            '&& seen["kernaid-application"] == 1) found = 1 '
+            "} END { exit !found }"
+        )
+        self.assertIn(program, READY_CHECK.read_text(encoding="utf-8"))
+
+        for members, expected in [
+            ("kernaid,kernaid-openai,kernaid-application", 0),
+            ("kernaid-application,kernaid,kernaid-openai", 0),
+            ("kernaid,kernaid-openai", 1),
+            ("kernaid,kernaid-openai,kernaid-openai", 1),
+        ]:
+            result = subprocess.run(
+                ["/usr/bin/awk", "-F:", program],
+                input=f"kernaid-vault:x:995:{members}\n",
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, expected, result.stderr)
 
     def test_vault_startup_status_is_fixed_bounded_and_stage_ordered(self) -> None:
         ready = READY_CHECK.read_text(encoding="utf-8")
