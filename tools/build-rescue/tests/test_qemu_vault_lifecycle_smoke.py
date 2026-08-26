@@ -2544,6 +2544,23 @@ class StaticContractTests(unittest.TestCase):
                 f"stage=codex-status checkpoint={checkpoint}",
                 source,
             )
+        self.assertLessEqual(
+            set(controller.PROVIDER_PROOF_CODEX_REMOTE_ERRORS),
+            set(controller.PROVIDER_PROOF_CODEX_CHECKPOINTS),
+        )
+        for local_checkpoint in (
+            "connect",
+            "send",
+            "receive",
+            "frame",
+            "decode",
+            "response",
+            "server-transport",
+        ):
+            self.assertNotIn(
+                local_checkpoint,
+                controller.PROVIDER_PROOF_CODEX_REMOTE_ERRORS,
+            )
         lifecycle = inspect.getsource(controller.run_lifecycle)
         self.assertIn('"codex-status",', lifecycle)
         self.assertIn("timeout=CODEX_STATUS_PROOF_TIMEOUT_SECONDS", lifecycle)

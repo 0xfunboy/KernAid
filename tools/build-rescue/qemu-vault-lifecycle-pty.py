@@ -127,6 +127,25 @@ PROVIDER_PROOF_CODEX_CHECKPOINTS = (
     "socket",
     "accepted",
     "connection-drain",
+    "connect",
+    "send",
+    "receive",
+    "frame",
+    "decode",
+    "response",
+    "server-transport",
+    "vault-locked",
+    "vault-unconfigured",
+    "busy",
+    "reboot-required",
+    "transport",
+    "cli-unavailable",
+    "cli-failed",
+    "timed-out",
+    "unsafe-home",
+    "unsafe-executable",
+)
+PROVIDER_PROOF_CODEX_REMOTE_ERRORS = (
     "vault-locked",
     "vault-unconfigured",
     "busy",
@@ -2699,7 +2718,7 @@ def _codex_status_probe_source() -> bytes:
         f"{'KERNAID_QEMU_PROVIDER_PROOF_FAILURE_V1 ' f'stage={stage} checkpoint={checkpoint}\n'!r},"
         for checkpoint in PROVIDER_PROOF_CODEX_CHECKPOINTS
     )
-    error_codes = PROVIDER_PROOF_CODEX_CHECKPOINTS[4:]
+    error_codes = PROVIDER_PROOF_CODEX_REMOTE_ERRORS
     return f'''import json,re,socket,subprocess,sys,time
 API="kernaid.dev/rescue-codex-auth/v1alpha1"
 REQUEST_ID="C-90000000-0000-4000-8000-000000000003"
@@ -2744,19 +2763,24 @@ try:
     before=int(accepted)
     request={{"apiVersion":API,"requestId":REQUEST_ID,"operation":"status"}}
     encoded=json.dumps(request,ensure_ascii=True,separators=(",",":")).encode("ascii")
-    checkpoint="transport"
+    checkpoint="connect"
     connection=socket.socket(socket.AF_UNIX,socket.SOCK_SEQPACKET|socket.SOCK_CLOEXEC)
     connection.settimeout({CODEX_STATUS_SOCKET_TIMEOUT_SECONDS!r})
     connection.connect(SOCKET_PATH)
+    checkpoint="send"
     if connection.send(encoded)!=len(encoded):
         raise RuntimeError()
     connection.shutdown(socket.SHUT_WR)
+    checkpoint="receive"
     frame,ancillary,flags,_address=connection.recvmsg(2049)
+    checkpoint="frame"
     if ancillary or flags&(socket.MSG_TRUNC|socket.MSG_CTRUNC) or not frame or len(frame)>2048 or not frame.endswith(b"\\n") or b"\\n" in frame[:-1] or b"\\r" in frame:
         raise RuntimeError()
     connection.close()
     connection=None
+    checkpoint="decode"
     response=json.loads(frame[:-1].decode("ascii"),object_pairs_hook=unique,parse_constant=rejected)
+    checkpoint="response"
     if type(response) is not dict or response.get("apiVersion")!=API or response.get("requestId")!=REQUEST_ID or response.get("operation")!="status":
         raise RuntimeError()
     remote_error=None
@@ -2776,6 +2800,8 @@ try:
             raise RuntimeError()
         time.sleep(0.05)
     if remote_error is not None:
+        if remote_error=="transport":
+            fail("server-transport")
         fail(remote_error)
 except SystemExit:
     raise
