@@ -1,6 +1,7 @@
 use super::{
-    RescueVaultDaemonError, enforce_process_privacy, group_has_exact_openai_boundaries,
-    internal_wire, passwd_has_exact_companion, passwd_openai_agent_uid,
+    RescueVaultDaemonError, enforce_process_privacy, group_has_exact_application_boundaries,
+    internal_wire, passwd_application_agent_uid, passwd_has_exact_companion,
+    passwd_openai_agent_uid,
     runtime::{
         self, DaemonRuntime, ProcessScope, ProviderProcessBoundary, RuntimeDisposition,
         WorkerCgroup, WorkerHandle, WorkerSpawnResult,
@@ -12,9 +13,9 @@ use super::{group_has_exact_codex_boundaries, passwd_has_exact_codex_agent};
 use kernaid_protocol::rescue_vault::{
     AgentRole, DescriptorDeclaration, DescriptorType, ErrorToken, MAX_INITIAL_STATE_VERSION,
     MAX_SAFE_JSON_INTEGER, Operation, PeerAllowlist, Provider, ProviderState,
-    ProviderStatusPayload, RequestDecodeError, RequestPayload, ServerReceiveError, SuccessPayload,
-    ValidatedRequest, VaultState, VaultStatusPayload, authenticate_seqpacket_peer,
-    gate_operation_for_vault_state, validate_passphrase_read,
+    ProviderStatusPayload, ReportId, ReportSummary, RequestDecodeError, RequestPayload,
+    ServerReceiveError, Sha256, SuccessPayload, ValidatedRequest, VaultState, VaultStatusPayload,
+    authenticate_seqpacket_peer, gate_operation_for_vault_state, validate_passphrase_read,
 };
 use nix::sys::signal::{SigSet, Signal};
 use nix::sys::socket::{getsockopt, sockopt};
@@ -256,6 +257,28 @@ trait WorkerBoundary: Send + Sync {
         &self,
         deadline: Instant,
     ) -> Result<(internal_wire::WorkerResponse, Option<OwnedFd>), RescueVaultDaemonError>;
+    fn audit_append(
+        &self,
+        request: &ValidatedRequest,
+        deadline: Instant,
+    ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError>;
+    fn report_persist(
+        &self,
+        report_id: &ReportId,
+        payload_sha256: &Sha256,
+        input_size: u64,
+        input: OwnedFd,
+        deadline: Instant,
+    ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError>;
+    fn report_list(
+        &self,
+        deadline: Instant,
+    ) -> Result<(internal_wire::WorkerResponse, Vec<ReportSummary>), RescueVaultDaemonError>;
+    fn report_get(
+        &self,
+        report_id: &ReportId,
+        deadline: Instant,
+    ) -> Result<(internal_wire::WorkerResponse, Option<Zeroizing<Vec<u8>>>), RescueVaultDaemonError>;
     fn verify_healthy(&self) -> Result<(), RescueVaultDaemonError>;
     fn exited(&self) -> Result<bool, RescueVaultDaemonError>;
     fn fault_and_terminate(&self, deadline: Instant) -> Result<(), RescueVaultDaemonError>;
@@ -287,6 +310,41 @@ impl WorkerBoundary for WorkerHandle {
         deadline: Instant,
     ) -> Result<(internal_wire::WorkerResponse, Option<OwnedFd>), RescueVaultDaemonError> {
         WorkerHandle::lease_codex_home(self, deadline)
+    }
+
+    fn audit_append(
+        &self,
+        request: &ValidatedRequest,
+        deadline: Instant,
+    ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
+        WorkerHandle::audit_append(self, request, deadline)
+    }
+
+    fn report_persist(
+        &self,
+        report_id: &ReportId,
+        payload_sha256: &Sha256,
+        input_size: u64,
+        input: OwnedFd,
+        deadline: Instant,
+    ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
+        WorkerHandle::report_persist(self, report_id, payload_sha256, input_size, input, deadline)
+    }
+
+    fn report_list(
+        &self,
+        deadline: Instant,
+    ) -> Result<(internal_wire::WorkerResponse, Vec<ReportSummary>), RescueVaultDaemonError> {
+        WorkerHandle::report_list(self, deadline)
+    }
+
+    fn report_get(
+        &self,
+        report_id: &ReportId,
+        deadline: Instant,
+    ) -> Result<(internal_wire::WorkerResponse, Option<Zeroizing<Vec<u8>>>), RescueVaultDaemonError>
+    {
+        WorkerHandle::report_get(self, report_id, deadline)
     }
 
     fn verify_healthy(&self) -> Result<(), RescueVaultDaemonError> {
@@ -992,13 +1050,16 @@ fn validated_peer_allowlist(companion_uid: u32) -> Result<PeerAllowlist, RescueV
     if !passwd_has_exact_codex_agent(&bytes, companion_uid) {
         return Err(RescueVaultDaemonError::InvalidConfiguration);
     }
-    let agent_uid = passwd_openai_agent_uid(&bytes, companion_uid)
+    let openai_uid = passwd_openai_agent_uid(&bytes, companion_uid)
         .ok_or(RescueVaultDaemonError::InvalidConfiguration)?;
-    validate_openai_agent_groups(agent_uid)?;
+    let application_uid = passwd_application_agent_uid(&bytes, companion_uid)
+        .ok_or(RescueVaultDaemonError::InvalidConfiguration)?;
+    validate_application_agent_groups(openai_uid, application_uid)?;
     #[cfg(feature = "experimental-codex-home-lease")]
     validate_codex_agent_groups()?;
     let builder = PeerAllowlist::builder(companion_uid)
-        .agent(AgentRole::OpenAi, agent_uid)
+        .agent(AgentRole::OpenAi, openai_uid)
+        .and_then(|builder| builder.agent(AgentRole::Application, application_uid))
         .map_err(|_| RescueVaultDaemonError::InvalidConfiguration)?;
     #[cfg(feature = "experimental-codex-home-lease")]
     let builder = builder
@@ -1035,7 +1096,10 @@ fn validate_codex_agent_groups() -> Result<(), RescueVaultDaemonError> {
     Ok(())
 }
 
-fn validate_openai_agent_groups(agent_uid: u32) -> Result<(), RescueVaultDaemonError> {
+fn validate_application_agent_groups(
+    openai_uid: u32,
+    application_uid: u32,
+) -> Result<(), RescueVaultDaemonError> {
     let descriptor = rfs::openat2(
         rfs::CWD,
         GROUP_FILE_PATH,
@@ -1054,7 +1118,7 @@ fn validate_openai_agent_groups(agent_uid: u32) -> Result<(), RescueVaultDaemonE
         return Err(RescueVaultDaemonError::InvalidConfiguration);
     }
     let bytes = read_file_bounded(descriptor.as_fd(), GROUP_FILE_LIMIT)?;
-    if !group_has_exact_openai_boundaries(&bytes, agent_uid) {
+    if !group_has_exact_application_boundaries(&bytes, openai_uid, application_uid) {
         return Err(RescueVaultDaemonError::InvalidConfiguration);
     }
     Ok(())
@@ -1516,6 +1580,8 @@ fn handle_connection_by(
             | Operation::VaultLock
             | Operation::ProviderOpenAiConfigure
             | Operation::ProviderLogout
+            | Operation::AuditAppend
+            | Operation::ReportPersist
     );
     let started = Instant::now();
     let (version, result) = supervisor.handle_connected_request(
@@ -1539,6 +1605,23 @@ fn handle_connection_by(
     match result {
         HandlerResult::Success(request, payload) => {
             let _ = peer.send_success(&request, version, &payload, &[], send_deadline);
+        }
+        HandlerResult::Report {
+            request,
+            payload,
+            envelope,
+        } => {
+            let Ok((read, write)) = pipe_with(PipeFlags::CLOEXEC) else {
+                let _ = peer.send_error(&request, version, ErrorToken::IoFailed, send_deadline);
+                return;
+            };
+            if peer
+                .send_success(&request, version, &payload, &[read.as_fd()], send_deadline)
+                .is_ok()
+            {
+                drop(read);
+                let _ = write_report_pipe(write, &envelope, send_deadline);
+            }
         }
         HandlerResult::Descriptor {
             request,
@@ -1629,6 +1712,11 @@ fn socket_client_is_live(connection: BorrowedFd<'_>) -> bool {
 
 enum HandlerResult {
     Success(ValidatedRequest, SuccessPayload),
+    Report {
+        request: ValidatedRequest,
+        payload: SuccessPayload,
+        envelope: Zeroizing<Vec<u8>>,
+    },
     Descriptor {
         request: ValidatedRequest,
         payload: SuccessPayload,
@@ -2014,7 +2102,20 @@ impl Supervisor {
                 self.handle_provider_borrow(request, started, &connection)
             }
             Operation::ProviderLogout => self.handle_provider_logout(request, started, &connection),
-            _ => unreachable!("external operation allowlist is closed"),
+            Operation::AuditAppend => self.handle_application_audit(request, started, &connection),
+            Operation::ReportPersist => {
+                self.handle_application_report_persist(request, started, &connection)
+            }
+            Operation::ReportList => {
+                self.handle_application_report_list(request, started, &connection)
+            }
+            Operation::ReportGet => {
+                self.handle_application_report_get(request, started, &connection)
+            }
+            #[cfg(not(feature = "experimental-codex-home-lease"))]
+            Operation::ProviderCodexHomeLease => {
+                unreachable!("external operation allowlist is closed")
+            }
         }
     }
 
@@ -2054,6 +2155,407 @@ impl Supervisor {
                         )
                     }
                 }
+            }
+        }
+    }
+
+    fn prepare_application_operation(
+        &self,
+        expected_state_version: u64,
+        mutation: bool,
+        connection: &ClientConnection<'_>,
+        deadline: Instant,
+    ) -> Result<(), (u64, ErrorToken)> {
+        if let Err((version, error)) =
+            self.begin_provider_operation(expected_state_version, mutation, connection)
+        {
+            if error == ErrorToken::RebootRequired {
+                self.mark_fault_by(deadline);
+                return Err((self.snapshot().version, ErrorToken::RebootRequired));
+            }
+            return Err((version, error));
+        }
+
+        let arm = match self.provider_dispatch_ready(mutation, connection) {
+            Ok(arm) => arm,
+            Err(_) => {
+                self.mark_fault_by(deadline);
+                return Err((self.snapshot().version, ErrorToken::RebootRequired));
+            }
+        };
+        match arm {
+            DispatchArm::Armed => Ok(()),
+            DispatchArm::StoppedBeforeArm => {
+                Err(self.cancel_application_operation(mutation, ErrorToken::Busy, deadline))
+            }
+            DispatchArm::ClientGoneBeforeArm => {
+                Err(self.cancel_application_operation(mutation, ErrorToken::IoFailed, deadline))
+            }
+            DispatchArm::StoppedAfterArm | DispatchArm::ClientGoneAfterArm if mutation => {
+                self.mark_fault_by(deadline);
+                Err((self.snapshot().version, ErrorToken::RebootRequired))
+            }
+            DispatchArm::StoppedAfterArm => {
+                Err(self.cancel_application_operation(false, ErrorToken::Busy, deadline))
+            }
+            DispatchArm::ClientGoneAfterArm => {
+                Err(self.cancel_application_operation(false, ErrorToken::IoFailed, deadline))
+            }
+        }
+    }
+
+    fn cancel_application_operation(
+        &self,
+        mutation: bool,
+        error: ErrorToken,
+        deadline: Instant,
+    ) -> (u64, ErrorToken) {
+        let completed = if mutation {
+            self.complete_provider_mutation()
+        } else {
+            self.release_provider_status()
+        };
+        match completed {
+            Ok(version) => (version, error),
+            Err(()) => {
+                self.mark_fault_by(deadline);
+                (self.snapshot().version, ErrorToken::RebootRequired)
+            }
+        }
+    }
+
+    fn finish_application_mutation(
+        &self,
+        request: ValidatedRequest,
+        payload: Result<SuccessPayload, ErrorToken>,
+        deadline: Instant,
+    ) -> (u64, HandlerResult) {
+        match self.complete_provider_mutation() {
+            Ok(version) => match payload {
+                Ok(payload) => (version, HandlerResult::Success(request, payload)),
+                Err(error) => (version, HandlerResult::Error(request, error)),
+            },
+            Err(()) => {
+                self.mark_fault_by(deadline);
+                (
+                    self.snapshot().version,
+                    HandlerResult::Error(request, ErrorToken::RebootRequired),
+                )
+            }
+        }
+    }
+
+    fn finish_application_read(
+        &self,
+        request: ValidatedRequest,
+        payload: Result<SuccessPayload, ErrorToken>,
+        deadline: Instant,
+    ) -> (u64, HandlerResult) {
+        match self.release_provider_status() {
+            Ok(version) => match payload {
+                Ok(payload) => (version, HandlerResult::Success(request, payload)),
+                Err(error) => (version, HandlerResult::Error(request, error)),
+            },
+            Err(()) => {
+                self.mark_fault_by(deadline);
+                (
+                    self.snapshot().version,
+                    HandlerResult::Error(request, ErrorToken::RebootRequired),
+                )
+            }
+        }
+    }
+
+    fn handle_application_audit(
+        self: &Arc<Self>,
+        request: ValidatedRequest,
+        started: Instant,
+        connection: &ClientConnection<'_>,
+    ) -> (u64, HandlerResult) {
+        let deadline = started
+            .checked_add(WORKER_OPERATION_TIMEOUT)
+            .unwrap_or(started);
+        let sequence = match request.payload() {
+            RequestPayload::AuditAppend { sequence, .. } => *sequence,
+            _ => {
+                let version = self.snapshot().version;
+                return (version, HandlerResult::Error(request, ErrorToken::IoFailed));
+            }
+        };
+        if let Err((version, error)) = self.prepare_application_operation(
+            request.expected_state_version(),
+            true,
+            connection,
+            deadline,
+        ) {
+            return (version, HandlerResult::Error(request, error));
+        }
+        let Some(worker) = self.worker.as_ref() else {
+            self.mark_fault_by(deadline);
+            return (
+                self.snapshot().version,
+                HandlerResult::Error(request, ErrorToken::RebootRequired),
+            );
+        };
+        use internal_wire::WorkerResultCode as ResultCode;
+        match worker.audit_append(&request, deadline) {
+            Ok(response)
+                if response.code == ResultCode::ApplicationAuditAppended
+                    && response.audit_sequence == Some(sequence) =>
+            {
+                self.finish_application_mutation(
+                    request,
+                    Ok(SuccessPayload::AuditAppended { sequence }),
+                    deadline,
+                )
+            }
+            Ok(response)
+                if matches!(
+                    response.code,
+                    ResultCode::ApplicationInvalidRequest | ResultCode::ApplicationMutationAborted
+                ) =>
+            {
+                self.finish_application_mutation(request, Err(ErrorToken::IoFailed), deadline)
+            }
+            Ok(response) if response.code == ResultCode::ApplicationStaleSequence => {
+                self.finish_application_mutation(request, Err(ErrorToken::StaleState), deadline)
+            }
+            Ok(_) | Err(_) => {
+                self.mark_fault_by(deadline);
+                (
+                    self.snapshot().version,
+                    HandlerResult::Error(request, ErrorToken::RebootRequired),
+                )
+            }
+        }
+    }
+
+    fn handle_application_report_persist(
+        self: &Arc<Self>,
+        mut request: ValidatedRequest,
+        started: Instant,
+        connection: &ClientConnection<'_>,
+    ) -> (u64, HandlerResult) {
+        let deadline = started
+            .checked_add(WORKER_OPERATION_TIMEOUT)
+            .unwrap_or(started);
+        let (report_id, payload_sha256, input_size) = match request.payload() {
+            RequestPayload::ReportPersist {
+                report_id,
+                payload_sha256,
+                input,
+            } => (report_id.clone(), payload_sha256.clone(), input.size),
+            _ => {
+                let version = self.snapshot().version;
+                return (version, HandlerResult::Error(request, ErrorToken::IoFailed));
+            }
+        };
+        if let Err((version, error)) = self.prepare_application_operation(
+            request.expected_state_version(),
+            true,
+            connection,
+            deadline,
+        ) {
+            return (version, HandlerResult::Error(request, error));
+        }
+        let Some(input) = request.take_descriptor() else {
+            return self.finish_application_mutation(
+                request,
+                Err(ErrorToken::FdRequired),
+                deadline,
+            );
+        };
+        let Some(worker) = self.worker.as_ref() else {
+            self.mark_fault_by(deadline);
+            return (
+                self.snapshot().version,
+                HandlerResult::Error(request, ErrorToken::RebootRequired),
+            );
+        };
+        use internal_wire::WorkerResultCode as ResultCode;
+        match worker.report_persist(&report_id, &payload_sha256, input_size, input, deadline) {
+            Ok(response) if response.code == ResultCode::ApplicationReportPersisted => {
+                let summary = response
+                    .report
+                    .as_ref()
+                    .and_then(|summary| summary.to_protocol().ok());
+                match summary {
+                    Some(summary) if summary.report_id() == &report_id => self
+                        .finish_application_mutation(
+                            request,
+                            Ok(SuccessPayload::ReportStored(summary)),
+                            deadline,
+                        ),
+                    _ => {
+                        self.mark_fault_by(deadline);
+                        (
+                            self.snapshot().version,
+                            HandlerResult::Error(request, ErrorToken::RebootRequired),
+                        )
+                    }
+                }
+            }
+            Ok(response) if response.code == ResultCode::ApplicationReportTooLarge => {
+                self.finish_application_mutation(request, Err(ErrorToken::ReportTooLarge), deadline)
+            }
+            Ok(response)
+                if matches!(
+                    response.code,
+                    ResultCode::ApplicationInvalidRequest | ResultCode::ApplicationMutationAborted
+                ) =>
+            {
+                self.finish_application_mutation(request, Err(ErrorToken::IoFailed), deadline)
+            }
+            Ok(_) | Err(_) => {
+                self.mark_fault_by(deadline);
+                (
+                    self.snapshot().version,
+                    HandlerResult::Error(request, ErrorToken::RebootRequired),
+                )
+            }
+        }
+    }
+
+    fn handle_application_report_list(
+        self: &Arc<Self>,
+        request: ValidatedRequest,
+        started: Instant,
+        connection: &ClientConnection<'_>,
+    ) -> (u64, HandlerResult) {
+        let deadline = started
+            .checked_add(WORKER_OPERATION_TIMEOUT)
+            .unwrap_or(started);
+        if !matches!(request.payload(), RequestPayload::Empty) {
+            let version = self.snapshot().version;
+            return (version, HandlerResult::Error(request, ErrorToken::IoFailed));
+        }
+        if let Err((version, error)) = self.prepare_application_operation(
+            request.expected_state_version(),
+            false,
+            connection,
+            deadline,
+        ) {
+            return (version, HandlerResult::Error(request, error));
+        }
+        let Some(worker) = self.worker.as_ref() else {
+            self.mark_fault_by(deadline);
+            return (
+                self.snapshot().version,
+                HandlerResult::Error(request, ErrorToken::RebootRequired),
+            );
+        };
+        match worker.report_list(deadline) {
+            Ok((response, reports))
+                if response.code == internal_wire::WorkerResultCode::ApplicationReportListReady =>
+            {
+                self.finish_application_read(
+                    request,
+                    Ok(SuccessPayload::ReportList { reports }),
+                    deadline,
+                )
+            }
+            Ok((response, _))
+                if response.code == internal_wire::WorkerResultCode::ApplicationInvalidRequest =>
+            {
+                self.finish_application_read(request, Err(ErrorToken::IoFailed), deadline)
+            }
+            Ok(_) | Err(_) => {
+                self.mark_fault_by(deadline);
+                (
+                    self.snapshot().version,
+                    HandlerResult::Error(request, ErrorToken::RebootRequired),
+                )
+            }
+        }
+    }
+
+    fn handle_application_report_get(
+        self: &Arc<Self>,
+        request: ValidatedRequest,
+        started: Instant,
+        connection: &ClientConnection<'_>,
+    ) -> (u64, HandlerResult) {
+        let deadline = started
+            .checked_add(WORKER_OPERATION_TIMEOUT)
+            .unwrap_or(started);
+        let report_id = match request.payload() {
+            RequestPayload::ReportGet { report_id } => report_id.clone(),
+            _ => {
+                let version = self.snapshot().version;
+                return (version, HandlerResult::Error(request, ErrorToken::IoFailed));
+            }
+        };
+        if let Err((version, error)) = self.prepare_application_operation(
+            request.expected_state_version(),
+            false,
+            connection,
+            deadline,
+        ) {
+            return (version, HandlerResult::Error(request, error));
+        }
+        let Some(worker) = self.worker.as_ref() else {
+            self.mark_fault_by(deadline);
+            return (
+                self.snapshot().version,
+                HandlerResult::Error(request, ErrorToken::RebootRequired),
+            );
+        };
+        use internal_wire::WorkerResultCode as ResultCode;
+        match worker.report_get(&report_id, deadline) {
+            Ok((response, Some(envelope)))
+                if response.code == ResultCode::ApplicationReportReady =>
+            {
+                let summary = response
+                    .report
+                    .as_ref()
+                    .and_then(|summary| summary.to_protocol().ok());
+                let Some(summary) = summary.filter(|summary| {
+                    summary.report_id() == &report_id
+                        && usize::try_from(summary.envelope_size()).ok() == Some(envelope.len())
+                }) else {
+                    self.mark_fault_by(deadline);
+                    return (
+                        self.snapshot().version,
+                        HandlerResult::Error(request, ErrorToken::RebootRequired),
+                    );
+                };
+                let version = match self.release_provider_status() {
+                    Ok(version) => version,
+                    Err(()) => {
+                        self.mark_fault_by(deadline);
+                        return (
+                            self.snapshot().version,
+                            HandlerResult::Error(request, ErrorToken::RebootRequired),
+                        );
+                    }
+                };
+                let declaration = DescriptorDeclaration {
+                    kind: DescriptorType::SignedReportEnvelopePipe,
+                    size: summary.envelope_size(),
+                };
+                (
+                    version,
+                    HandlerResult::Report {
+                        request,
+                        payload: SuccessPayload::Report(summary, declaration),
+                        envelope,
+                    },
+                )
+            }
+            Ok((response, None))
+                if matches!(
+                    response.code,
+                    ResultCode::ApplicationReportNotFound | ResultCode::ApplicationInvalidRequest
+                ) =>
+            {
+                self.finish_application_read(request, Err(ErrorToken::IoFailed), deadline)
+            }
+            Ok(_) | Err(_) => {
+                self.mark_fault_by(deadline);
+                (
+                    self.snapshot().version,
+                    HandlerResult::Error(request, ErrorToken::RebootRequired),
+                )
             }
         }
     }
@@ -4371,6 +4873,8 @@ fn external_operation_is_enabled(
                 | Operation::ProviderOpenAiConfigure
                 | Operation::ProviderStatus
                 | Operation::ProviderLogout
+                | Operation::ReportList
+                | Operation::ReportGet
         ),
         kernaid_protocol::rescue_vault::PeerRole::Agent(AgentRole::OpenAi) => matches!(
             operation,
@@ -4383,7 +4887,15 @@ fn external_operation_is_enabled(
                     Operation::VaultStatus | Operation::ProviderCodexHomeLease
                 )
         }
-        kernaid_protocol::rescue_vault::PeerRole::Agent(AgentRole::Application) => false,
+        kernaid_protocol::rescue_vault::PeerRole::Agent(AgentRole::Application) => matches!(
+            operation,
+            Operation::VaultStatus
+                | Operation::ProviderStatus
+                | Operation::AuditAppend
+                | Operation::ReportPersist
+                | Operation::ReportList
+                | Operation::ReportGet
+        ),
     }
 }
 
@@ -4701,6 +5213,28 @@ fn repipe_passphrase(secret: &[u8]) -> Result<OwnedFd, ()> {
     Ok(read)
 }
 
+fn write_report_pipe(descriptor: OwnedFd, envelope: &[u8], deadline: Instant) -> Result<(), ()> {
+    let status = rfs::fcntl_getfl(&descriptor).map_err(|_| ())?;
+    if status & OFlags::ACCMODE != OFlags::WRONLY {
+        return Err(());
+    }
+    rfs::fcntl_setfl(&descriptor, status | OFlags::NONBLOCK).map_err(|_| ())?;
+    let mut written = 0_usize;
+    while written < envelope.len() {
+        ensure_before(deadline)?;
+        match rustix::io::write(&descriptor, &envelope[written..]) {
+            Ok(0) => return Err(()),
+            Ok(count) => written = written.checked_add(count).ok_or(())?,
+            Err(error) if error == rustix::io::Errno::INTR => {}
+            Err(error) if error == rustix::io::Errno::AGAIN => {
+                wait_pipe_writable(descriptor.as_fd(), deadline)?;
+            }
+            Err(_) => return Err(()),
+        }
+    }
+    Ok(())
+}
+
 fn wait_pipe(descriptor: BorrowedFd<'_>, deadline: Instant) -> Result<(), ()> {
     let remaining = deadline.checked_duration_since(Instant::now()).ok_or(())?;
     let mut descriptors = [PollFd::from_borrowed_fd(descriptor, PollFlags::IN)];
@@ -4708,6 +5242,25 @@ fn wait_pipe(descriptor: BorrowedFd<'_>, deadline: Instant) -> Result<(), ()> {
         Ok(0) => Err(()),
         Ok(_) if descriptors[0].revents().contains(PollFlags::NVAL) => Err(()),
         Ok(_) => Ok(()),
+        Err(error) if error == rustix::io::Errno::INTR => Ok(()),
+        Err(_) => Err(()),
+    }
+}
+
+fn wait_pipe_writable(descriptor: BorrowedFd<'_>, deadline: Instant) -> Result<(), ()> {
+    let remaining = deadline.checked_duration_since(Instant::now()).ok_or(())?;
+    let mut descriptors = [PollFd::from_borrowed_fd(descriptor, PollFlags::OUT)];
+    match poll(&mut descriptors, Some(&duration_to_timespec(remaining))) {
+        Ok(0) => Err(()),
+        Ok(_)
+            if descriptors[0]
+                .revents()
+                .intersects(PollFlags::ERR | PollFlags::HUP | PollFlags::NVAL) =>
+        {
+            Err(())
+        }
+        Ok(_) if descriptors[0].revents().contains(PollFlags::OUT) => Ok(()),
+        Ok(_) => Err(()),
         Err(error) if error == rustix::io::Errno::INTR => Ok(()),
         Err(_) => Err(()),
     }
@@ -4972,6 +5525,97 @@ mod tests {
                 None,
                 deadline,
             )
+        }
+
+        fn audit_append(
+            &self,
+            _request: &ValidatedRequest,
+            deadline: Instant,
+        ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
+            self.transact(
+                internal_wire::WorkerCommandKind::AuditAppend,
+                None,
+                None,
+                deadline,
+            )
+            .and_then(|(response, output)| {
+                output
+                    .is_none()
+                    .then_some(response)
+                    .ok_or(RescueVaultDaemonError::ProtocolFailure)
+            })
+        }
+
+        fn report_persist(
+            &self,
+            _report_id: &ReportId,
+            _payload_sha256: &Sha256,
+            _input_size: u64,
+            input: OwnedFd,
+            deadline: Instant,
+        ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
+            self.transact(
+                internal_wire::WorkerCommandKind::ReportPersist,
+                None,
+                Some(input),
+                deadline,
+            )
+            .and_then(|(response, output)| {
+                output
+                    .is_none()
+                    .then_some(response)
+                    .ok_or(RescueVaultDaemonError::ProtocolFailure)
+            })
+        }
+
+        fn report_list(
+            &self,
+            deadline: Instant,
+        ) -> Result<(internal_wire::WorkerResponse, Vec<ReportSummary>), RescueVaultDaemonError>
+        {
+            self.transact(
+                internal_wire::WorkerCommandKind::ReportList,
+                None,
+                None,
+                deadline,
+            )
+            .and_then(|(response, output)| {
+                output
+                    .is_none()
+                    .then_some((response, Vec::new()))
+                    .ok_or(RescueVaultDaemonError::ProtocolFailure)
+            })
+        }
+
+        fn report_get(
+            &self,
+            _report_id: &ReportId,
+            deadline: Instant,
+        ) -> Result<
+            (internal_wire::WorkerResponse, Option<Zeroizing<Vec<u8>>>),
+            RescueVaultDaemonError,
+        > {
+            self.transact(
+                internal_wire::WorkerCommandKind::ReportGet,
+                None,
+                None,
+                deadline,
+            )
+            .and_then(|(response, output)| {
+                let bytes = output
+                    .map(|descriptor| {
+                        read_file_bounded(
+                            descriptor.as_fd(),
+                            usize::try_from(
+                                kernaid_protocol::rescue_vault::MAX_SIGNED_REPORT_ENVELOPE_BYTES,
+                            )
+                            .map_err(|_| RescueVaultDaemonError::ProtocolFailure)?,
+                        )
+                        .map(Zeroizing::new)
+                    })
+                    .transpose()?;
+                Ok((response, bytes))
+            })
         }
 
         fn verify_healthy(&self) -> Result<(), RescueVaultDaemonError> {
@@ -6586,7 +7230,7 @@ mod tests {
     }
 
     #[test]
-    fn supervisor_rejects_all_deferred_requests_in_every_state_without_effects() {
+    fn supervisor_rejects_unsupported_shipping_requests_without_effects() {
         for vault in [
             VaultState::Absent,
             VaultState::Unprovisioned,
@@ -6605,108 +7249,16 @@ mod tests {
             let expected_faulted = initial.faulted;
             let expected_fault_marker_required = initial.fault_marker_required;
             let (supervisor, runtime, worker, privacy, _) = fake_supervisor(initial, [], true);
-            let (persist, persist_writer) = descriptor_request(
-                "report.persist",
-                serde_json::json!({
-                    "reportId": "RP-00000000-0000-0000-0000-000000000001",
-                    "payloadSha256": "0".repeat(64),
-                    "input": {"type": "session-report-json-pipe", "size": 2}
-                }),
-                60,
-                PeerRole::Agent(AgentRole::Application),
-                b"{}",
-            );
-            let requests = [
-                #[cfg(not(feature = "experimental-codex-home-lease"))]
-                (
-                    validated_request_for_role(
-                        "provider.codex.home_lease",
-                        serde_json::json!({}),
-                        60,
-                        None,
-                        PeerRole::Agent(AgentRole::Codex),
-                    ),
+            let requests: Vec<(ValidatedRequest, Option<OwnedFd>)> = vec![(
+                validated_request_for_role(
+                    "provider.logout",
+                    serde_json::json!({"provider": "codex"}),
+                    60,
                     None,
+                    PeerRole::Companion,
                 ),
-                #[cfg(not(feature = "experimental-codex-home-lease"))]
-                (
-                    validated_request_for_role(
-                        "vault.status",
-                        serde_json::json!({}),
-                        60,
-                        None,
-                        PeerRole::Agent(AgentRole::Codex),
-                    ),
-                    None,
-                ),
-                (
-                    validated_request_for_role(
-                        "provider.logout",
-                        serde_json::json!({"provider": "codex"}),
-                        60,
-                        None,
-                        PeerRole::Companion,
-                    ),
-                    None,
-                ),
-                (
-                    validated_request_for_role(
-                        "audit.append",
-                        serde_json::json!({
-                            "sequence": 1,
-                            "event": "agent-session-start",
-                            "outcome": "succeeded"
-                        }),
-                        60,
-                        None,
-                        PeerRole::Agent(AgentRole::Application),
-                    ),
-                    None,
-                ),
-                (
-                    validated_request_for_role(
-                        "vault.status",
-                        serde_json::json!({}),
-                        60,
-                        None,
-                        PeerRole::Agent(AgentRole::Application),
-                    ),
-                    None,
-                ),
-                (
-                    validated_request_for_role(
-                        "provider.status",
-                        serde_json::json!({}),
-                        60,
-                        None,
-                        PeerRole::Agent(AgentRole::Application),
-                    ),
-                    None,
-                ),
-                (persist, Some(persist_writer)),
-                (
-                    validated_request_for_role(
-                        "report.list",
-                        serde_json::json!({}),
-                        60,
-                        None,
-                        PeerRole::Agent(AgentRole::Application),
-                    ),
-                    None,
-                ),
-                (
-                    validated_request_for_role(
-                        "report.get",
-                        serde_json::json!({
-                            "reportId": "RP-00000000-0000-0000-0000-000000000001"
-                        }),
-                        60,
-                        None,
-                        PeerRole::Agent(AgentRole::Application),
-                    ),
-                    None,
-                ),
-            ];
+                None,
+            )];
             for (request, writer) in requests {
                 let (version, result) = supervisor.handle_request(request, Instant::now());
                 assert_eq!(version, 60);
@@ -6833,6 +7385,8 @@ mod tests {
                         | Operation::ProviderOpenAiConfigure
                         | Operation::ProviderStatus
                         | Operation::ProviderLogout
+                        | Operation::ReportList
+                        | Operation::ReportGet
                 ),
                 "unexpected Companion shipping permission for {operation:?}"
             );
@@ -6846,9 +7400,18 @@ mod tests {
                 ),
                 "unexpected OpenAI shipping permission for {operation:?}"
             );
-            assert!(
-                !external_operation_is_enabled(operation, PeerRole::Agent(AgentRole::Application)),
-                "disabled Application role reached {operation:?}"
+            assert_eq!(
+                external_operation_is_enabled(operation, PeerRole::Agent(AgentRole::Application)),
+                matches!(
+                    operation,
+                    Operation::VaultStatus
+                        | Operation::ProviderStatus
+                        | Operation::AuditAppend
+                        | Operation::ReportPersist
+                        | Operation::ReportList
+                        | Operation::ReportGet
+                ),
+                "unexpected Application shipping permission for {operation:?}"
             );
             assert_eq!(
                 external_operation_is_enabled(operation, PeerRole::Agent(AgentRole::Codex)),
@@ -7450,6 +8013,129 @@ mod tests {
             [internal_wire::WorkerCommandKind::ProviderOpenAiLogout]
         );
         assert_eq!(runtime.lock().expect("runtime trace").arms, 1);
+    }
+
+    #[test]
+    fn application_audit_and_report_roundtrip_use_exact_versions_and_payloads() {
+        let report_id =
+            ReportId::parse("RP-00000000-0000-0000-0000-000000000001").expect("report id");
+        let envelope = br#"{"apiVersion":"kernaid.dev/signed-report/v1"}"#;
+        let summary = internal_wire::WorkerReportSummary {
+            report_id: report_id.clone(),
+            envelope_size: u64::try_from(envelope.len()).expect("envelope size"),
+            envelope_sha256: [7_u8; 32],
+        };
+        let (supervisor, runtime, worker, privacy, _) = fake_supervisor(
+            unlocked_service_state(60),
+            [
+                Ok(internal_wire::WorkerResponse::audit_appended(1, 1)),
+                Ok(internal_wire::WorkerResponse::report_persisted(
+                    2,
+                    summary.clone(),
+                )),
+                Ok(internal_wire::WorkerResponse::report_list_ready(3, 0, 0)),
+                Ok(internal_wire::WorkerResponse::report_ready(
+                    4,
+                    summary.clone(),
+                )),
+            ],
+            true,
+        );
+        let (report_read, report_write) = pipe_with(PipeFlags::CLOEXEC).expect("report output");
+        rustix::io::write(&report_write, envelope).expect("report envelope");
+        drop(report_write);
+        worker
+            .lock()
+            .expect("worker state")
+            .outputs
+            .extend([None, None, None, Some(report_read)]);
+
+        let audit = validated_request_for_role(
+            "audit.append",
+            serde_json::json!({
+                "sequence": 1,
+                "event": "agent-session-start",
+                "outcome": "succeeded"
+            }),
+            60,
+            None,
+            PeerRole::Agent(AgentRole::Application),
+        );
+        let (version, result) = supervisor.handle_request(audit, Instant::now());
+        assert_eq!(version, 62);
+        assert!(matches!(
+            result,
+            HandlerResult::Success(_, SuccessPayload::AuditAppended { sequence: 1 })
+        ));
+
+        let (persist, writer) = descriptor_request(
+            "report.persist",
+            serde_json::json!({
+                "reportId": report_id.as_str(),
+                "payloadSha256": "0".repeat(64),
+                "input": {"type": "session-report-json-pipe", "size": 2}
+            }),
+            62,
+            PeerRole::Agent(AgentRole::Application),
+            b"{}",
+        );
+        drop(writer);
+        let (version, result) = supervisor.handle_request(persist, Instant::now());
+        assert_eq!(version, 64);
+        assert!(matches!(
+            result,
+            HandlerResult::Success(_, SuccessPayload::ReportStored(item))
+                if item.report_id() == &report_id
+        ));
+
+        let list = validated_request_for_role(
+            "report.list",
+            serde_json::json!({}),
+            64,
+            None,
+            PeerRole::Agent(AgentRole::Application),
+        );
+        let (version, result) = supervisor.handle_request(list, Instant::now());
+        assert_eq!(version, 64);
+        assert!(matches!(
+            result,
+            HandlerResult::Success(_, SuccessPayload::ReportList { reports })
+                if reports.is_empty()
+        ));
+
+        let get = validated_request_for_role(
+            "report.get",
+            serde_json::json!({"reportId": report_id.as_str()}),
+            64,
+            None,
+            PeerRole::Agent(AgentRole::Application),
+        );
+        let (version, result) = supervisor.handle_request(get, Instant::now());
+        assert_eq!(version, 64);
+        assert!(matches!(
+            result,
+            HandlerResult::Report {
+                payload: SuccessPayload::Report(item, DescriptorDeclaration {
+                    kind: DescriptorType::SignedReportEnvelopePipe,
+                    size,
+                }),
+                envelope: value,
+                ..
+            } if item.report_id() == &report_id
+                && size == envelope.len() as u64
+                && value.as_slice() == envelope
+        ));
+        assert_eq!(privacy.checks.load(Ordering::Relaxed), 4);
+        assert_eq!(runtime.lock().expect("runtime state").arms, 2);
+        assert_eq!(
+            worker.lock().expect("worker state").calls,
+            [
+                internal_wire::WorkerCommandKind::AuditAppend,
+                internal_wire::WorkerCommandKind::ReportPersist,
+                internal_wire::WorkerCommandKind::ReportList,
+                internal_wire::WorkerCommandKind::ReportGet,
+            ]
+        );
     }
 
     #[test]

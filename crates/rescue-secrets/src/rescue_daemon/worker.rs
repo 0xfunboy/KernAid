@@ -5,9 +5,13 @@ use super::{
 use crate::{
     BootVaultLocation, BootVaultLocatorError, LocatedVaultClassification,
     LocatedVaultClassificationError, MapperName, MountedRescueVault, ProviderCredentialStatus,
-    RescueVaultMountManager, VaultMountManagerError, VaultUnlockRequest, locate_boot_vault,
+    RescueApplicationStoreError, RescueVaultMountManager, VaultMountManagerError,
+    VaultUnlockRequest, locate_boot_vault,
 };
-use kernaid_protocol::rescue_vault::{MAX_OPENAI_KEY_BYTES, validate_openai_api_key_bytes};
+use kernaid_protocol::rescue_vault::{
+    AuditEventType, AuditOutcome, ErrorToken, MAX_OPENAI_KEY_BYTES, MAX_SESSION_REPORT_JSON_BYTES,
+    MAX_SIGNED_REPORT_ENVELOPE_BYTES, ReportId, RequestId, validate_openai_api_key_bytes,
+};
 use nix::sys::signal::{SigSet, Signal as NixSignal};
 use rand_core::{OsRng, RngCore};
 use rustix::{
@@ -28,8 +32,11 @@ const CONTROL_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(10);
 const CLASSIFICATION_TIMEOUT: Duration = Duration::from_secs(9 * 60);
 const PROVIDER_PIPE_TIMEOUT: Duration = Duration::from_secs(15);
+const APPLICATION_PIPE_TIMEOUT: Duration = Duration::from_secs(30);
 const PIPEFS_MAGIC: u64 = 0x5049_5045;
 const MAX_PROVIDER_OUTPUT_BYTES: usize = MAX_OPENAI_KEY_BYTES as usize;
+const MAX_REPORT_INPUT_BYTES: usize = MAX_SESSION_REPORT_JSON_BYTES as usize;
+const MAX_REPORT_OUTPUT_BYTES: usize = MAX_SIGNED_REPORT_ENVELOPE_BYTES as usize;
 const _: () = assert!(MAX_PROVIDER_OUTPUT_BYTES <= rustix::pipe::PIPE_BUF);
 
 enum WorkerVaultState {
@@ -312,6 +319,159 @@ fn handle_command(
             };
             (internal_wire::WorkerResponse::new(request_id, code), false)
         }
+        Command::AuditAppend => {
+            if descriptor.is_some() {
+                return (
+                    internal_wire::WorkerResponse::new(request_id, Result::InvalidRequest),
+                    false,
+                );
+            }
+            let Some(internal_wire::WorkerApplicationCommand::AuditAppend {
+                request_id: agent_request_id,
+                peer_uid,
+                peer_pid,
+                sequence,
+                event,
+                outcome,
+                error,
+            }) = command.application.as_ref()
+            else {
+                return (
+                    internal_wire::WorkerResponse::new(request_id, Result::InvalidRequest),
+                    false,
+                );
+            };
+            let appended = match state {
+                WorkerVaultState::Locked => Err(Result::Busy),
+                WorkerVaultState::Unlocked(_) if validate_no_active_swap().is_err() => {
+                    Err(Result::CleanupFailed)
+                }
+                WorkerVaultState::Unlocked(mounted) => append_agent_audit(
+                    mounted,
+                    agent_request_id,
+                    *peer_uid,
+                    *peer_pid,
+                    *sequence,
+                    *event,
+                    *outcome,
+                    *error,
+                ),
+            };
+            let response = match appended {
+                Ok(sequence) => internal_wire::WorkerResponse::audit_appended(request_id, sequence),
+                Err(code) => internal_wire::WorkerResponse::new(request_id, code),
+            };
+            (response, false)
+        }
+        Command::ReportPersist => {
+            let Some(input) = descriptor else {
+                return (
+                    internal_wire::WorkerResponse::new(request_id, Result::InvalidRequest),
+                    false,
+                );
+            };
+            if validate_internal_secret_pipe(input.as_fd()).is_err() {
+                return (
+                    internal_wire::WorkerResponse::new(request_id, Result::InvalidRequest),
+                    false,
+                );
+            }
+            let Some(internal_wire::WorkerApplicationCommand::ReportPersist {
+                report_id,
+                payload_sha256,
+                input_size,
+            }) = command.application.as_ref()
+            else {
+                return (
+                    internal_wire::WorkerResponse::new(request_id, Result::InvalidRequest),
+                    false,
+                );
+            };
+            let persisted = match state {
+                WorkerVaultState::Locked => Err(Result::Busy),
+                WorkerVaultState::Unlocked(_) if validate_no_active_swap().is_err() => {
+                    Err(Result::CleanupFailed)
+                }
+                WorkerVaultState::Unlocked(mounted) => {
+                    persist_report(mounted, report_id, payload_sha256, *input_size, input)
+                }
+            };
+            let response = match persisted {
+                Ok(report) => internal_wire::WorkerResponse::report_persisted(request_id, report),
+                Err(code) => internal_wire::WorkerResponse::new(request_id, code),
+            };
+            (response, false)
+        }
+        Command::ReportList => {
+            let Some(output) = descriptor else {
+                return (
+                    internal_wire::WorkerResponse::new(request_id, Result::InvalidRequest),
+                    false,
+                );
+            };
+            if !matches!(
+                command.application.as_ref(),
+                Some(internal_wire::WorkerApplicationCommand::ReportList)
+            ) || validate_internal_application_output_pipe(output.as_fd()).is_err()
+            {
+                return (
+                    internal_wire::WorkerResponse::new(request_id, Result::InvalidRequest),
+                    false,
+                );
+            }
+            let listed = match state {
+                WorkerVaultState::Locked => Err(Result::Busy),
+                WorkerVaultState::Unlocked(_) if validate_no_active_swap().is_err() => {
+                    Err(Result::CleanupFailed)
+                }
+                WorkerVaultState::Unlocked(mounted) => list_reports(mounted, output),
+            };
+            let response = match listed {
+                Ok((size, count)) => {
+                    internal_wire::WorkerResponse::report_list_ready(request_id, size, count)
+                }
+                Err(code) => internal_wire::WorkerResponse::new(request_id, code),
+            };
+            (response, false)
+        }
+        Command::ReportGet => {
+            let Some(output) = descriptor else {
+                return (
+                    internal_wire::WorkerResponse::new(request_id, Result::InvalidRequest),
+                    false,
+                );
+            };
+            if validate_internal_application_output_pipe(output.as_fd()).is_err() {
+                return (
+                    internal_wire::WorkerResponse::new(request_id, Result::InvalidRequest),
+                    false,
+                );
+            }
+            let Some(internal_wire::WorkerApplicationCommand::ReportGet { report_id }) =
+                command.application.as_ref()
+            else {
+                return (
+                    internal_wire::WorkerResponse::new(request_id, Result::InvalidRequest),
+                    false,
+                );
+            };
+            let fetched = match state {
+                WorkerVaultState::Locked => Err(Result::Busy),
+                WorkerVaultState::Unlocked(_) if validate_no_active_swap().is_err() => {
+                    Err(Result::CleanupFailed)
+                }
+                WorkerVaultState::Unlocked(mounted) => get_report(mounted, report_id, output),
+            };
+            let response = match fetched {
+                Ok(Some(report)) => internal_wire::WorkerResponse::report_ready(request_id, report),
+                Ok(None) => internal_wire::WorkerResponse::new(
+                    request_id,
+                    Result::ApplicationReportNotFound,
+                ),
+                Err(code) => internal_wire::WorkerResponse::new(request_id, code),
+            };
+            (response, false)
+        }
         #[cfg(feature = "experimental-codex-home-lease")]
         Command::ProviderCodexHomeLease => {
             if descriptor.is_some() || response_descriptor.is_some() {
@@ -532,6 +692,230 @@ fn classify_provider_mutation(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn append_agent_audit(
+    mounted: &MountedRescueVault,
+    request_id: &RequestId,
+    peer_uid: u32,
+    peer_pid: u32,
+    sequence: u64,
+    event: AuditEventType,
+    outcome: AuditOutcome,
+    error: Option<ErrorToken>,
+) -> Result<u64, internal_wire::WorkerResultCode> {
+    use internal_wire::WorkerResultCode as Result;
+    let mut store = mounted
+        .secrets()
+        .open_application_store()
+        .map_err(|_| Result::ApplicationStateAmbiguous)?;
+    match store.contains_agent_audit_request(request_id) {
+        Ok(true) => return Err(Result::ApplicationStaleSequence),
+        Ok(false) => {}
+        Err(_) => return Err(Result::ApplicationStateAmbiguous),
+    }
+    let operation = store.append_agent_audit_fields(
+        request_id, peer_uid, peer_pid, sequence, event, outcome, error,
+    );
+    drop(store);
+    let observed = mounted
+        .secrets()
+        .open_application_store()
+        .and_then(|store| store.contains_agent_audit_request(request_id));
+    match (operation, observed) {
+        (_, Ok(true)) => Ok(sequence),
+        (Err(RescueApplicationStoreError::StaleAgentSequence), Ok(false)) => {
+            Err(Result::ApplicationStaleSequence)
+        }
+        (Err(RescueApplicationStoreError::InvalidAgentAudit), Ok(false)) => {
+            Err(Result::ApplicationInvalidRequest)
+        }
+        (Err(_), Ok(false)) => Err(Result::ApplicationMutationAborted),
+        (Ok(_), Ok(false)) | (_, Err(_)) => Err(Result::ApplicationStateAmbiguous),
+    }
+}
+
+fn persist_report(
+    mounted: &MountedRescueVault,
+    report_id: &ReportId,
+    payload_sha256: &[u8; 32],
+    input_size: u64,
+    input: OwnedFd,
+) -> Result<internal_wire::WorkerReportSummary, internal_wire::WorkerResultCode> {
+    use internal_wire::WorkerResultCode as Result;
+    let input_size = usize::try_from(input_size)
+        .ok()
+        .filter(|size| (2..=MAX_REPORT_INPUT_BYTES).contains(size))
+        .ok_or(Result::ApplicationReportTooLarge)?;
+    let raw_report =
+        read_exact_application_pipe(input, input_size, Instant::now() + APPLICATION_PIPE_TIMEOUT)
+            .map_err(|_| Result::ApplicationInvalidRequest)?;
+    let mut store = mounted
+        .secrets()
+        .open_application_store()
+        .map_err(|_| Result::ApplicationStateAmbiguous)?;
+    let prior = store
+        .list_reports()
+        .map_err(|_| Result::ApplicationStateAmbiguous)?;
+    if prior
+        .iter()
+        .any(|report| report.report_id() == report_id.as_str())
+    {
+        return Err(Result::ApplicationInvalidRequest);
+    }
+    let operation = store.persist_report(report_id.as_str(), payload_sha256, raw_report);
+    drop(store);
+    let observed = reopen_report_summary(mounted, report_id);
+    match (operation, observed) {
+        (_, Ok(Some(summary))) => Ok(summary),
+        (
+            Err(
+                RescueApplicationStoreError::InvalidReportIdentifier
+                | RescueApplicationStoreError::InvalidReport
+                | RescueApplicationStoreError::ReportHashMismatch
+                | RescueApplicationStoreError::ReportAlreadyExists,
+            ),
+            Ok(None),
+        ) => Err(Result::ApplicationInvalidRequest),
+        (Err(RescueApplicationStoreError::ReportLimitReached), Ok(None)) => {
+            Err(Result::ApplicationReportTooLarge)
+        }
+        (Err(_), Ok(None)) => Err(Result::ApplicationMutationAborted),
+        (Ok(_), Ok(None)) | (_, Err(_)) => Err(Result::ApplicationStateAmbiguous),
+    }
+}
+
+fn reopen_report_summary(
+    mounted: &MountedRescueVault,
+    report_id: &ReportId,
+) -> Result<Option<internal_wire::WorkerReportSummary>, RescueApplicationStoreError> {
+    let store = mounted.secrets().open_application_store()?;
+    store
+        .list_reports()?
+        .iter()
+        .find(|report| report.report_id() == report_id.as_str())
+        .map(internal_wire::WorkerReportSummary::from_store)
+        .transpose()
+        .map_err(|_| RescueApplicationStoreError::CorruptApplicationState)
+}
+
+fn list_reports(
+    mounted: &MountedRescueVault,
+    output: OwnedFd,
+) -> Result<(u64, u16), internal_wire::WorkerResultCode> {
+    use internal_wire::WorkerResultCode as Result;
+    let store = mounted
+        .secrets()
+        .open_application_store()
+        .map_err(|_| Result::ApplicationStateAmbiguous)?;
+    let reports = store
+        .list_reports()
+        .map_err(|_| Result::ApplicationStateAmbiguous)?
+        .iter()
+        .map(internal_wire::WorkerReportSummary::from_store)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|_| Result::ApplicationStateAmbiguous)?;
+    let encoded = internal_wire::encode_report_records(&reports)
+        .map_err(|_| Result::ApplicationStateAmbiguous)?;
+    let count = u16::try_from(reports.len()).map_err(|_| Result::ApplicationStateAmbiguous)?;
+    let size = u64::try_from(encoded.len()).map_err(|_| Result::ApplicationStateAmbiguous)?;
+    write_application_output(output, &encoded, Instant::now() + APPLICATION_PIPE_TIMEOUT)
+        .map_err(|_| Result::IoFailed)?;
+    Ok((size, count))
+}
+
+fn get_report(
+    mounted: &MountedRescueVault,
+    report_id: &ReportId,
+    output: OwnedFd,
+) -> Result<Option<internal_wire::WorkerReportSummary>, internal_wire::WorkerResultCode> {
+    use internal_wire::WorkerResultCode as Result;
+    let store = mounted
+        .secrets()
+        .open_application_store()
+        .map_err(|_| Result::ApplicationStateAmbiguous)?;
+    let summary = store
+        .list_reports()
+        .map_err(|_| Result::ApplicationStateAmbiguous)?
+        .iter()
+        .find(|report| report.report_id() == report_id.as_str())
+        .map(internal_wire::WorkerReportSummary::from_store)
+        .transpose()
+        .map_err(|_| Result::ApplicationStateAmbiguous)?;
+    let Some(summary) = summary else {
+        drop(output);
+        return Ok(None);
+    };
+    let write_result = store
+        .with_report_envelope(report_id.as_str(), |envelope| {
+            if envelope.len() != summary.envelope_size as usize
+                || envelope.len() > MAX_REPORT_OUTPUT_BYTES
+                || Sha256::digest(envelope).as_slice() != summary.envelope_sha256
+            {
+                return Err(());
+            }
+            write_application_output(output, envelope, Instant::now() + APPLICATION_PIPE_TIMEOUT)
+        })
+        .map_err(|_| Result::ApplicationStateAmbiguous)?;
+    match write_result {
+        Some(Ok(())) => Ok(Some(summary)),
+        Some(Err(())) => Err(Result::IoFailed),
+        None => Err(Result::ApplicationStateAmbiguous),
+    }
+}
+
+fn read_exact_application_pipe(
+    descriptor: OwnedFd,
+    expected: usize,
+    deadline: Instant,
+) -> Result<Zeroizing<Vec<u8>>, ()> {
+    if !(2..=MAX_REPORT_INPUT_BYTES).contains(&expected) {
+        return Err(());
+    }
+    let status = rfs::fcntl_getfl(&descriptor).map_err(|_| ())?;
+    rfs::fcntl_setfl(&descriptor, status | OFlags::NONBLOCK).map_err(|_| ())?;
+    let mut value = Zeroizing::new(Vec::with_capacity(expected));
+    while value.len() < expected {
+        ensure_pipe_deadline(deadline)?;
+        let mut chunk = [0_u8; 8192];
+        let remaining = expected - value.len();
+        let chunk_size = remaining.min(chunk.len());
+        match rustix::io::read(&descriptor, &mut chunk[..chunk_size]) {
+            Ok(0) => return Err(()),
+            Ok(read) => value.extend_from_slice(&chunk[..read]),
+            Err(error) if error == rustix::io::Errno::INTR => {}
+            Err(error) if error == rustix::io::Errno::AGAIN => {
+                wait_pipe_ready(descriptor.as_fd(), PollFlags::IN, deadline)?;
+            }
+            Err(_) => return Err(()),
+        }
+    }
+    require_pipe_eof(descriptor.as_fd(), deadline)?;
+    Ok(value)
+}
+
+fn write_application_output(output: OwnedFd, value: &[u8], deadline: Instant) -> Result<(), ()> {
+    if value.len() > MAX_REPORT_OUTPUT_BYTES {
+        return Err(());
+    }
+    let status = rfs::fcntl_getfl(&output).map_err(|_| ())?;
+    rfs::fcntl_setfl(&output, status | OFlags::NONBLOCK).map_err(|_| ())?;
+    let mut written = 0_usize;
+    while written < value.len() {
+        ensure_pipe_deadline(deadline)?;
+        match rustix::io::write(&output, &value[written..]) {
+            Ok(0) => return Err(()),
+            Ok(size) => written += size,
+            Err(error) if error == rustix::io::Errno::INTR => {}
+            Err(error) if error == rustix::io::Errno::AGAIN => {
+                wait_pipe_ready(output.as_fd(), PollFlags::OUT, deadline)?;
+            }
+            Err(_) => return Err(()),
+        }
+    }
+    drop(output);
+    Ok(())
+}
+
 fn read_exact_openai_api_key(
     descriptor: OwnedFd,
     declared_size: u16,
@@ -586,9 +970,29 @@ fn ensure_pipe_deadline(deadline: Instant) -> Result<(), ()> {
         .ok_or(())
 }
 
-fn wait_provider_pipe(descriptor: BorrowedFd<'_>, deadline: Instant) -> Result<(), ()> {
+fn require_pipe_eof(descriptor: BorrowedFd<'_>, deadline: Instant) -> Result<(), ()> {
+    loop {
+        ensure_pipe_deadline(deadline)?;
+        let mut extra = [0_u8; 1];
+        match rustix::io::read(descriptor, &mut extra) {
+            Ok(0) => return Ok(()),
+            Ok(_) => return Err(()),
+            Err(error) if error == rustix::io::Errno::INTR => {}
+            Err(error) if error == rustix::io::Errno::AGAIN => {
+                wait_pipe_ready(descriptor, PollFlags::IN, deadline)?;
+            }
+            Err(_) => return Err(()),
+        }
+    }
+}
+
+fn wait_pipe_ready(
+    descriptor: BorrowedFd<'_>,
+    interest: PollFlags,
+    deadline: Instant,
+) -> Result<(), ()> {
     let remaining = deadline.checked_duration_since(Instant::now()).ok_or(())?;
-    let mut descriptors = [PollFd::from_borrowed_fd(descriptor, PollFlags::IN)];
+    let mut descriptors = [PollFd::from_borrowed_fd(descriptor, interest)];
     let seconds = i64::try_from(remaining.as_secs()).unwrap_or(i64::MAX);
     let timeout = Timespec {
         tv_sec: seconds,
@@ -605,6 +1009,10 @@ fn wait_provider_pipe(descriptor: BorrowedFd<'_>, deadline: Instant) -> Result<(
         Err(error) if error == rustix::io::Errno::INTR => Ok(()),
         Err(_) => Err(()),
     }
+}
+
+fn wait_provider_pipe(descriptor: BorrowedFd<'_>, deadline: Instant) -> Result<(), ()> {
+    wait_pipe_ready(descriptor, PollFlags::IN, deadline)
 }
 
 fn attest_quiescent() -> internal_wire::WorkerResultCode {
@@ -837,6 +1245,23 @@ fn validate_internal_output_pipe(descriptor: BorrowedFd<'_>) -> Result<(), ()> {
     Ok(())
 }
 
+fn validate_internal_application_output_pipe(descriptor: BorrowedFd<'_>) -> Result<(), ()> {
+    let stat = rfs::fstat(descriptor).map_err(|_| ())?;
+    let filesystem = rfs::fstatfs(descriptor).map_err(|_| ())?;
+    let filesystem_type = u64::try_from(filesystem.f_type).map_err(|_| ())?;
+    let status = rfs::fcntl_getfl(descriptor).map_err(|_| ())?;
+    let descriptor_flags = rustix::io::fcntl_getfd(descriptor).map_err(|_| ())?;
+    if !FileType::from_raw_mode(stat.st_mode).is_fifo()
+        || filesystem_type != PIPEFS_MAGIC
+        || status != OFlags::WRONLY
+        || descriptor_flags != rustix::io::FdFlags::CLOEXEC
+        || stat.st_size != 0
+    {
+        return Err(());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -908,6 +1333,61 @@ mod tests {
         )
         .expect("socket pair");
         assert_eq!(validate_internal_output_pipe(socket.as_fd()), Err(()));
+    }
+
+    #[test]
+    fn internal_application_output_requires_blocking_write_only_anonymous_pipe() {
+        let (read, write) = pipe_with(PipeFlags::CLOEXEC).expect("application output pipe");
+        assert_eq!(
+            validate_internal_application_output_pipe(write.as_fd()),
+            Ok(())
+        );
+        assert_eq!(
+            validate_internal_application_output_pipe(read.as_fd()),
+            Err(())
+        );
+
+        let (_read, nonblocking) =
+            pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK).expect("nonblocking pipe");
+        assert_eq!(
+            validate_internal_application_output_pipe(nonblocking.as_fd()),
+            Err(())
+        );
+    }
+
+    #[test]
+    fn application_pipe_input_is_exact_and_output_closes_at_eof() {
+        let body = br#"{"report":"TEST_ONLY"}"#;
+        let (read, write) = pipe_with(PipeFlags::CLOEXEC).expect("report input");
+        rustix::io::write(&write, body).expect("write report input");
+        drop(write);
+        let observed =
+            read_exact_application_pipe(read, body.len(), Instant::now() + Duration::from_secs(1))
+                .expect("exact report input");
+        assert_eq!(observed.as_slice(), body);
+
+        let (extra_read, extra_write) = pipe_with(PipeFlags::CLOEXEC).expect("extra input");
+        rustix::io::write(&extra_write, b"{}x").expect("write extra input");
+        drop(extra_write);
+        assert!(
+            read_exact_application_pipe(extra_read, 2, Instant::now() + Duration::from_secs(1))
+                .is_err()
+        );
+
+        let (output_read, output_write) = pipe_with(PipeFlags::CLOEXEC).expect("report output");
+        write_application_output(output_write, body, Instant::now() + Duration::from_secs(1))
+            .expect("write report output");
+        assert_eq!(
+            rustix::io::ioctl_fionread(output_read.as_fd()),
+            Ok(body.len() as u64)
+        );
+        let mut bytes = vec![0_u8; body.len()];
+        assert_eq!(
+            rustix::io::read(output_read.as_fd(), &mut bytes),
+            Ok(body.len())
+        );
+        assert_eq!(bytes, body);
+        assert_eq!(rustix::io::read(output_read.as_fd(), &mut [0_u8; 1]), Ok(0));
     }
 
     #[test]

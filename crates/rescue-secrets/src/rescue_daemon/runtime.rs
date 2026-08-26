@@ -1,6 +1,9 @@
 //! Descriptor-bound daemon runtime, fault marker, cgroup, and worker process.
 
 use super::{RescueVaultDaemonError, internal_wire};
+use kernaid_protocol::rescue_vault::{
+    MAX_SIGNED_REPORT_ENVELOPE_BYTES, ReportId, ReportSummary, Sha256, ValidatedRequest,
+};
 use rustix::{
     event::{PollFd, PollFlags, Timespec, poll},
     fd::OwnedFd,
@@ -17,6 +20,7 @@ use rustix::{
         remove_capability_from_bounding_set, set_capabilities,
     },
 };
+use sha2::Digest;
 use std::{
     ffi::{OsStr, OsString},
     fs as stdfs,
@@ -33,6 +37,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use zeroize::Zeroizing;
 
 const RUNTIME_ROOT_NAME: &str = "kernaid-rescue-vault";
 const DAEMON_LOCK_NAME: &str = "kernaid-rescue-vaultd.lock";
@@ -2465,7 +2470,15 @@ impl WorkerHandle {
         if kind == internal_wire::WorkerCommandKind::ProviderOpenAiBorrow || codex_home_lease {
             return Err(RescueVaultDaemonError::ProtocolFailure);
         }
-        self.transact_inner(kind, secret_size, descriptor, deadline, cancellation, None)
+        self.transact_inner(
+            kind,
+            secret_size,
+            descriptor,
+            deadline,
+            cancellation,
+            None,
+            None,
+        )
     }
 
     /// Creates the one-shot worker-to-Agent credential pipe for one registered
@@ -2482,6 +2495,7 @@ impl WorkerHandle {
             deadline,
             None,
             Some(read),
+            None,
         )
     }
 
@@ -2499,7 +2513,177 @@ impl WorkerHandle {
             deadline,
             None,
             None,
+            None,
         )
+    }
+
+    pub(super) fn audit_append(
+        &self,
+        request: &ValidatedRequest,
+        deadline: Instant,
+    ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
+        let kernaid_protocol::rescue_vault::RequestPayload::AuditAppend {
+            sequence,
+            event,
+            outcome,
+            error,
+        } = request.payload()
+        else {
+            return Err(RescueVaultDaemonError::ProtocolFailure);
+        };
+        let application = internal_wire::WorkerApplicationCommand::AuditAppend {
+            request_id: request.request_id().clone(),
+            peer_uid: request.peer_uid(),
+            peer_pid: request.peer_pid(),
+            sequence: *sequence,
+            event: *event,
+            outcome: *outcome,
+            error: *error,
+        };
+        self.transact_inner(
+            internal_wire::WorkerCommandKind::AuditAppend,
+            None,
+            None,
+            deadline,
+            None,
+            None,
+            Some(application),
+        )
+        .and_then(|(response, output)| {
+            if output.is_none() {
+                Ok(response)
+            } else {
+                Err(RescueVaultDaemonError::ProtocolFailure)
+            }
+        })
+    }
+
+    pub(super) fn report_persist(
+        &self,
+        report_id: &ReportId,
+        payload_sha256: &Sha256,
+        input_size: u64,
+        input: OwnedFd,
+        deadline: Instant,
+    ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
+        let application = internal_wire::WorkerApplicationCommand::ReportPersist {
+            report_id: report_id.clone(),
+            payload_sha256: internal_wire::decode_sha256(payload_sha256)
+                .map_err(|_| RescueVaultDaemonError::ProtocolFailure)?,
+            input_size,
+        };
+        self.transact_inner(
+            internal_wire::WorkerCommandKind::ReportPersist,
+            None,
+            Some(input),
+            deadline,
+            None,
+            None,
+            Some(application),
+        )
+        .and_then(|(response, output)| {
+            if output.is_none() {
+                Ok(response)
+            } else {
+                Err(RescueVaultDaemonError::ProtocolFailure)
+            }
+        })
+    }
+
+    pub(super) fn report_list(
+        &self,
+        deadline: Instant,
+    ) -> Result<(internal_wire::WorkerResponse, Vec<ReportSummary>), RescueVaultDaemonError> {
+        let (response, bytes) = self.transact_application_output(
+            internal_wire::WorkerApplicationCommand::ReportList,
+            internal_wire::MAX_APPLICATION_REPORT_LIST_BYTES,
+            deadline,
+        )?;
+        if response.code != internal_wire::WorkerResultCode::ApplicationReportListReady {
+            if bytes.is_empty() {
+                return Ok((response, Vec::new()));
+            }
+            return Err(RescueVaultDaemonError::ProtocolFailure);
+        }
+        let count = response
+            .application_record_count
+            .ok_or(RescueVaultDaemonError::ProtocolFailure)?;
+        if response.application_output_size != u64::try_from(bytes.len()).ok() {
+            return Err(RescueVaultDaemonError::ProtocolFailure);
+        }
+        let reports = internal_wire::decode_report_records(&bytes, count)
+            .map_err(|_| RescueVaultDaemonError::ProtocolFailure)?;
+        Ok((response, reports))
+    }
+
+    pub(super) fn report_get(
+        &self,
+        report_id: &ReportId,
+        deadline: Instant,
+    ) -> Result<(internal_wire::WorkerResponse, Option<Zeroizing<Vec<u8>>>), RescueVaultDaemonError>
+    {
+        let (response, bytes) = self.transact_application_output(
+            internal_wire::WorkerApplicationCommand::ReportGet {
+                report_id: report_id.clone(),
+            },
+            MAX_SIGNED_REPORT_ENVELOPE_BYTES as usize,
+            deadline,
+        )?;
+        match response.code {
+            internal_wire::WorkerResultCode::ApplicationReportReady => {
+                let report = response
+                    .report
+                    .as_ref()
+                    .ok_or(RescueVaultDaemonError::ProtocolFailure)?;
+                let expected = usize::try_from(report.envelope_size)
+                    .map_err(|_| RescueVaultDaemonError::ProtocolFailure)?;
+                if bytes.len() != expected
+                    || response.application_output_size != Some(report.envelope_size)
+                    || sha2::Sha256::digest(bytes.as_slice()).as_slice() != report.envelope_sha256
+                {
+                    return Err(RescueVaultDaemonError::ProtocolFailure);
+                }
+                Ok((response, Some(bytes)))
+            }
+            internal_wire::WorkerResultCode::ApplicationReportNotFound if bytes.is_empty() => {
+                Ok((response, None))
+            }
+            _ if bytes.is_empty() => Ok((response, None)),
+            _ => Err(RescueVaultDaemonError::ProtocolFailure),
+        }
+    }
+
+    fn transact_application_output(
+        &self,
+        application: internal_wire::WorkerApplicationCommand,
+        maximum: usize,
+        deadline: Instant,
+    ) -> Result<(internal_wire::WorkerResponse, Zeroizing<Vec<u8>>), RescueVaultDaemonError> {
+        let kind = application.kind();
+        let (read, write) =
+            pipe_with(PipeFlags::CLOEXEC).map_err(|_| RescueVaultDaemonError::WorkerUnavailable)?;
+        std::thread::scope(|scope| {
+            let transaction = scope.spawn(move || {
+                self.transact_inner(
+                    kind,
+                    None,
+                    Some(write),
+                    deadline,
+                    None,
+                    None,
+                    Some(application),
+                )
+            });
+            let output = read_bounded_application_pipe(read, maximum, deadline);
+            let transaction = transaction
+                .join()
+                .map_err(|_| RescueVaultDaemonError::WorkerUnavailable)?;
+            let (response, descriptor) = transaction?;
+            if descriptor.is_some() {
+                return Err(RescueVaultDaemonError::ProtocolFailure);
+            }
+            Ok((response, output?))
+        })
     }
 
     fn transact_inner(
@@ -2510,6 +2694,7 @@ impl WorkerHandle {
         deadline: Instant,
         cancellation: Option<&AtomicBool>,
         provider_output: Option<OwnedFd>,
+        application: Option<internal_wire::WorkerApplicationCommand>,
     ) -> Result<(internal_wire::WorkerResponse, Option<OwnedFd>), RescueVaultDaemonError> {
         let borrowing = kind == internal_wire::WorkerCommandKind::ProviderOpenAiBorrow;
         #[cfg(feature = "experimental-codex-home-lease")]
@@ -2518,6 +2703,9 @@ impl WorkerHandle {
         let leasing_codex = false;
         if borrowing != provider_output.is_some()
             || ((borrowing || leasing_codex) && cancellation.is_some())
+            || application
+                .as_ref()
+                .is_some_and(|application| application.kind() != kind)
         {
             return Err(RescueVaultDaemonError::ProtocolFailure);
         }
@@ -2541,21 +2729,25 @@ impl WorkerHandle {
             .checked_add(1)
             .filter(|next| *next != 0)
             .ok_or(RescueVaultDaemonError::WorkerUnavailable)?;
-        let (command, outgoing) = match (kind, secret_size, descriptor) {
-            (internal_wire::WorkerCommandKind::Bootstrap, _, _) => {
+        let (command, outgoing) = match (kind, secret_size, descriptor, application) {
+            (kind, None, descriptor, Some(application)) if kind == application.kind() => (
+                internal_wire::WorkerCommand::application(request_id, application),
+                descriptor,
+            ),
+            (internal_wire::WorkerCommandKind::Bootstrap, _, _, _) => {
                 return Err(RescueVaultDaemonError::ProtocolFailure);
             }
-            (internal_wire::WorkerCommandKind::Probe, None, None) => {
+            (internal_wire::WorkerCommandKind::Probe, None, None, None) => {
                 (internal_wire::WorkerCommand::probe(request_id), None)
             }
-            (internal_wire::WorkerCommandKind::Unlock, Some(size), Some(descriptor)) => (
+            (internal_wire::WorkerCommandKind::Unlock, Some(size), Some(descriptor), None) => (
                 internal_wire::WorkerCommand::unlock(request_id, size),
                 Some(descriptor),
             ),
-            (internal_wire::WorkerCommandKind::Lock, None, None) => {
+            (internal_wire::WorkerCommandKind::Lock, None, None, None) => {
                 (internal_wire::WorkerCommand::lock(request_id), None)
             }
-            (internal_wire::WorkerCommandKind::ProviderStatus, None, None) => (
+            (internal_wire::WorkerCommandKind::ProviderStatus, None, None, None) => (
                 internal_wire::WorkerCommand::provider_status(request_id),
                 None,
             ),
@@ -2563,28 +2755,34 @@ impl WorkerHandle {
                 internal_wire::WorkerCommandKind::ProviderOpenAiConfigure,
                 Some(size),
                 Some(descriptor),
+                None,
             ) => (
                 internal_wire::WorkerCommand::provider_openai_configure(request_id, size),
                 Some(descriptor),
             ),
-            (internal_wire::WorkerCommandKind::ProviderOpenAiLogout, None, None) => (
+            (internal_wire::WorkerCommandKind::ProviderOpenAiLogout, None, None, None) => (
                 internal_wire::WorkerCommand::provider_openai_logout(request_id),
                 None,
             ),
-            (internal_wire::WorkerCommandKind::ProviderOpenAiBorrow, None, Some(descriptor)) => (
+            (
+                internal_wire::WorkerCommandKind::ProviderOpenAiBorrow,
+                None,
+                Some(descriptor),
+                None,
+            ) => (
                 internal_wire::WorkerCommand::provider_openai_borrow(request_id),
                 Some(descriptor),
             ),
             #[cfg(feature = "experimental-codex-home-lease")]
-            (internal_wire::WorkerCommandKind::ProviderCodexHomeLease, None, None) => (
+            (internal_wire::WorkerCommandKind::ProviderCodexHomeLease, None, None, None) => (
                 internal_wire::WorkerCommand::provider_codex_home_lease(request_id),
                 None,
             ),
-            (internal_wire::WorkerCommandKind::AttestQuiescent, None, None) => (
+            (internal_wire::WorkerCommandKind::AttestQuiescent, None, None, None) => (
                 internal_wire::WorkerCommand::attest_quiescent(request_id),
                 None,
             ),
-            (internal_wire::WorkerCommandKind::Shutdown, None, None) => {
+            (internal_wire::WorkerCommandKind::Shutdown, None, None, None) => {
                 (internal_wire::WorkerCommand::shutdown(request_id), None)
             }
             _ => return Err(RescueVaultDaemonError::ProtocolFailure),
@@ -2798,6 +2996,69 @@ fn cleanup_deadline(absolute_deadline: Instant) -> Instant {
         .min(absolute_deadline)
 }
 
+fn read_bounded_application_pipe(
+    descriptor: OwnedFd,
+    maximum: usize,
+    deadline: Instant,
+) -> Result<Zeroizing<Vec<u8>>, RescueVaultDaemonError> {
+    let stat = rfs::fstat(&descriptor).map_err(|_| RescueVaultDaemonError::WorkerUnavailable)?;
+    let filesystem =
+        rfs::fstatfs(&descriptor).map_err(|_| RescueVaultDaemonError::WorkerUnavailable)?;
+    let filesystem_type =
+        u64::try_from(filesystem.f_type).map_err(|_| RescueVaultDaemonError::WorkerUnavailable)?;
+    let flags = rustix::io::fcntl_getfd(&descriptor)
+        .map_err(|_| RescueVaultDaemonError::WorkerUnavailable)?;
+    let status =
+        rfs::fcntl_getfl(&descriptor).map_err(|_| RescueVaultDaemonError::WorkerUnavailable)?;
+    if maximum > MAX_SIGNED_REPORT_ENVELOPE_BYTES as usize
+        || !FileType::from_raw_mode(stat.st_mode).is_fifo()
+        || filesystem_type != PIPEFS_MAGIC
+        || status != OFlags::RDONLY
+        || flags != rustix::io::FdFlags::CLOEXEC
+        || stat.st_size != 0
+    {
+        return Err(RescueVaultDaemonError::ProtocolFailure);
+    }
+    rfs::fcntl_setfl(&descriptor, OFlags::RDONLY | OFlags::NONBLOCK)
+        .map_err(|_| RescueVaultDaemonError::WorkerUnavailable)?;
+    let mut output = Zeroizing::new(Vec::new());
+    loop {
+        if Instant::now() >= deadline {
+            return Err(RescueVaultDaemonError::WorkerUnavailable);
+        }
+        let mut chunk = Zeroizing::new([0_u8; 8192]);
+        match rustix::io::read(&descriptor, &mut chunk[..]) {
+            Ok(0) => return Ok(output),
+            Ok(read) => {
+                if output.len().saturating_add(read) > maximum {
+                    return Err(RescueVaultDaemonError::ProtocolFailure);
+                }
+                output.extend_from_slice(&chunk[..read]);
+            }
+            Err(error) if error == rustix::io::Errno::INTR => {}
+            Err(error) if error == rustix::io::Errno::AGAIN => {
+                let remaining = deadline
+                    .checked_duration_since(Instant::now())
+                    .ok_or(RescueVaultDaemonError::WorkerUnavailable)?;
+                let mut descriptors = [PollFd::from_borrowed_fd(
+                    descriptor.as_fd(),
+                    PollFlags::IN | PollFlags::HUP,
+                )];
+                match poll(&mut descriptors, Some(&duration_to_timespec(remaining))) {
+                    Ok(0) => return Err(RescueVaultDaemonError::WorkerUnavailable),
+                    Ok(_) if descriptors[0].revents().contains(PollFlags::NVAL) => {
+                        return Err(RescueVaultDaemonError::ProtocolFailure);
+                    }
+                    Ok(_) => {}
+                    Err(error) if error == rustix::io::Errno::INTR => {}
+                    Err(_) => return Err(RescueVaultDaemonError::WorkerUnavailable),
+                }
+            }
+            Err(_) => return Err(RescueVaultDaemonError::WorkerUnavailable),
+        }
+    }
+}
+
 fn create_provider_output_pipe() -> Result<(OwnedFd, OwnedFd), RescueVaultDaemonError> {
     let (read, write) = pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK)
         .map_err(|_| RescueVaultDaemonError::WorkerUnavailable)?;
@@ -2975,6 +3236,43 @@ fn response_matches(
                 | Result::ProviderStateAmbiguous
                 | Result::IoFailed
                 | Result::CleanupFailed
+        ),
+        Command::AuditAppend => matches!(
+            response.code,
+            Result::ApplicationAuditAppended
+                | Result::ApplicationInvalidRequest
+                | Result::ApplicationStaleSequence
+                | Result::ApplicationMutationAborted
+                | Result::ApplicationStateAmbiguous
+                | Result::CleanupFailed
+                | Result::Busy
+        ),
+        Command::ReportPersist => matches!(
+            response.code,
+            Result::ApplicationReportPersisted
+                | Result::ApplicationInvalidRequest
+                | Result::ApplicationReportTooLarge
+                | Result::ApplicationMutationAborted
+                | Result::ApplicationStateAmbiguous
+                | Result::CleanupFailed
+                | Result::Busy
+        ),
+        Command::ReportList => matches!(
+            response.code,
+            Result::ApplicationReportListReady
+                | Result::ApplicationStateAmbiguous
+                | Result::IoFailed
+                | Result::CleanupFailed
+                | Result::Busy
+        ),
+        Command::ReportGet => matches!(
+            response.code,
+            Result::ApplicationReportReady
+                | Result::ApplicationReportNotFound
+                | Result::ApplicationStateAmbiguous
+                | Result::IoFailed
+                | Result::CleanupFailed
+                | Result::Busy
         ),
         #[cfg(feature = "experimental-codex-home-lease")]
         Command::ProviderCodexHomeLease => matches!(
@@ -3683,6 +3981,21 @@ mod tests {
                 &internal_wire::WorkerResponse::new(3, divergent)
             ));
         }
+
+        let audit = internal_wire::WorkerResponse::audit_appended(4, 1);
+        assert!(response_matches(
+            internal_wire::WorkerCommandKind::AuditAppend,
+            &audit
+        ));
+        assert!(!response_matches(
+            internal_wire::WorkerCommandKind::ReportPersist,
+            &audit
+        ));
+        let list = internal_wire::WorkerResponse::report_list_ready(5, 0, 0);
+        assert!(response_matches(
+            internal_wire::WorkerCommandKind::ReportList,
+            &list
+        ));
     }
 
     #[test]
@@ -3765,6 +4078,42 @@ mod tests {
                 &unconfigured,
                 Instant::now() + Duration::from_secs(1)
             ),
+            Err(RescueVaultDaemonError::ProtocolFailure)
+        ));
+    }
+
+    #[test]
+    fn application_output_reader_drains_more_than_pipe_capacity_with_an_exact_bound() {
+        let body = vec![0x5a_u8; 256 * 1024];
+        let (read, write) = pipe_with(PipeFlags::CLOEXEC).expect("application pipe");
+        let observed = std::thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                let mut offset = 0_usize;
+                while offset < body.len() {
+                    match rustix::io::write(&write, &body[offset..]) {
+                        Ok(written) => offset += written,
+                        Err(error) if error == rustix::io::Errno::INTR => {}
+                        Err(error) => panic!("application pipe write failed: {error}"),
+                    }
+                }
+                drop(write);
+            });
+            let observed = read_bounded_application_pipe(
+                read,
+                body.len(),
+                Instant::now() + Duration::from_secs(2),
+            )
+            .expect("bounded application output");
+            writer.join().expect("application writer");
+            observed
+        });
+        assert_eq!(observed.as_slice(), body.as_slice());
+
+        let (read, write) = pipe_with(PipeFlags::CLOEXEC).expect("overflow pipe");
+        rustix::io::write(&write, b"abc").expect("overflow bytes");
+        drop(write);
+        assert!(matches!(
+            read_bounded_application_pipe(read, 2, Instant::now() + Duration::from_secs(1)),
             Err(RescueVaultDaemonError::ProtocolFailure)
         ));
     }

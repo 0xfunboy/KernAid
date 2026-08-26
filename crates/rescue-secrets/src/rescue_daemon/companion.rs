@@ -4,8 +4,9 @@ use super::{
 };
 use kernaid_protocol::{
     rescue_vault::{
-        MAX_OPENAI_KEY_BYTES, MAX_PASSPHRASE_BYTES, MIN_PASSPHRASE_BYTES, Provider, ProviderState,
-        RequestId, SuccessPayload, VaultState, validate_openai_api_key_bytes,
+        MAX_OPENAI_KEY_BYTES, MAX_PASSPHRASE_BYTES, MAX_SIGNED_REPORT_ENVELOPE_BYTES,
+        MIN_PASSPHRASE_BYTES, Provider, ProviderState, ReportId, ReportSummary, RequestId,
+        SuccessPayload, VaultState, validate_openai_api_key_bytes,
     },
     rescue_vault_transport::{
         ClientExchangeError, ClientRequest, ClientRequestPayload, ClientResponse,
@@ -17,7 +18,7 @@ use rand_core::{OsRng, RngCore};
 use rustix::{
     event::{PollFd, PollFlags, Timespec, poll},
     fd::{AsFd, BorrowedFd, OwnedFd},
-    fs::{self as rfs, FileType, Mode, OFlags, ResolveFlags},
+    fs::{self as rfs, AtFlags, FileType, Mode, OFlags, RenameFlags, ResolveFlags},
     net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType, connect, socket_with},
     pipe::{PipeFlags, pipe_with},
     termios::{
@@ -25,6 +26,7 @@ use rustix::{
         tcsetattr,
     },
 };
+use sha2::{Digest, Sha256 as Sha256Hasher};
 use std::{
     ffi::OsString,
     sync::{
@@ -46,8 +48,13 @@ const TTY_POLL_SLICE: Duration = Duration::from_millis(100);
 const RESPONSE_POLL_SLICE: Duration = Duration::from_millis(100);
 const RECONCILIATION_RESERVE: Duration = Duration::from_secs(5);
 const MAX_PASSWD_BYTES: usize = 1024 * 1024;
+const REPORT_HOME_PATH: &str = "/home/kernaid";
+const REPORT_DIRECTORY_NAME: &str = "KernAid-Reports";
+const REPORT_FILE_SUFFIX: &str = ".signed.json";
+const REPORT_TEMP_RANDOM_BYTES: usize = 16;
+const REPORT_TEMP_CREATE_ATTEMPTS: usize = 4;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Command {
     Status,
     Unlock,
@@ -55,6 +62,8 @@ enum Command {
     ProviderStatus,
     OpenAiConfigure,
     OpenAiLogout,
+    ReportList,
+    ReportExport(ReportId),
 }
 
 pub(super) fn run<I>(arguments: I) -> Result<(), RescueVaultCompanionError>
@@ -86,6 +95,17 @@ where
         Some(value) if value == "provider-status" => Command::ProviderStatus,
         Some(value) if value == "openai-configure" => Command::OpenAiConfigure,
         Some(value) if value == "openai-logout" => Command::OpenAiLogout,
+        Some(value) if value == "report-list" => Command::ReportList,
+        Some(value) if value == "report-export" => {
+            let report_id = arguments
+                .next()
+                .and_then(|value| value.into_string().ok())
+                .ok_or(RescueVaultCompanionError::InvalidCommand)?;
+            Command::ReportExport(
+                ReportId::parse(&report_id)
+                    .map_err(|_| RescueVaultCompanionError::InvalidCommand)?,
+            )
+        }
         _ => return Err(RescueVaultCompanionError::InvalidCommand),
     };
     if arguments.next().is_some() {
@@ -186,7 +206,7 @@ fn execute(
     if interrupted.load(Ordering::Acquire) {
         return Err(RescueVaultCompanionError::Interrupted);
     }
-    if command == Command::Status {
+    if matches!(&command, Command::Status) {
         return display_response(tty, &status);
     }
     let state_version = status.state_version();
@@ -195,7 +215,7 @@ fn execute(
         ClientResponseOutcome::Error(_) => return display_response(tty, &status),
         _ => return Err(RescueVaultCompanionError::ProtocolFailure),
     };
-    if let Some(error) = command_source_error(command, status_payload.vault_state()) {
+    if let Some(error) = command_source_error(&command, status_payload.vault_state()) {
         display_response(tty, &status)?;
         return Err(RescueVaultCompanionError::Remote(error));
     }
@@ -291,13 +311,24 @@ fn execute(
                 }),
             )?
         }
+        Command::ReportList => exchange(
+            ClientRequestPayload::ReportList,
+            state_version,
+            &[],
+            STATUS_TIMEOUT,
+            Some(interrupted),
+            None,
+        )?,
+        Command::ReportExport(report_id) => {
+            return export_report(tty, state_version, report_id, interrupted);
+        }
         Command::Status => return Err(RescueVaultCompanionError::InvalidCommand),
     };
     display_response(tty, &response)
 }
 
 fn command_source_error(
-    command: Command,
+    command: &Command,
     state: VaultState,
 ) -> Option<kernaid_protocol::rescue_vault::ErrorToken> {
     use kernaid_protocol::rescue_vault::ErrorToken;
@@ -307,7 +338,8 @@ fn command_source_error(
         | (
             Command::ProviderStatus | Command::OpenAiConfigure | Command::OpenAiLogout,
             VaultState::Unlocked,
-        ) => None,
+        )
+        | (Command::ReportList | Command::ReportExport(_), VaultState::Unlocked) => None,
         (_, VaultState::Absent) => Some(ErrorToken::Absent),
         (_, VaultState::Unprovisioned) => Some(ErrorToken::Unprovisioned),
         (Command::Lock, VaultState::Locked) => Some(ErrorToken::Locked),
@@ -316,7 +348,10 @@ fn command_source_error(
         (
             Command::ProviderStatus | Command::OpenAiConfigure | Command::OpenAiLogout,
             VaultState::Locked,
-        ) => Some(ErrorToken::Locked),
+        )
+        | (Command::ReportList | Command::ReportExport(_), VaultState::Locked) => {
+            Some(ErrorToken::Locked)
+        }
         (_, VaultState::FaultedRebootRequired) => Some(ErrorToken::RebootRequired),
         (Command::Status, _) => Some(ErrorToken::NotAuthorized),
     }
@@ -853,6 +888,353 @@ fn fresh_request_id() -> Result<RequestId, RescueVaultCompanionError> {
     RequestId::parse(value).map_err(|_| RescueVaultCompanionError::ProtocolFailure)
 }
 
+fn export_report(
+    tty: BorrowedFd<'_>,
+    state_version: u64,
+    report_id: ReportId,
+    interrupted: &AtomicBool,
+) -> Result<(), RescueVaultCompanionError> {
+    let mut response = exchange(
+        ClientRequestPayload::ReportGet {
+            report_id: report_id.clone(),
+        },
+        state_version,
+        &[],
+        STATUS_TIMEOUT,
+        Some(interrupted),
+        None,
+    )?;
+    let report = match response.outcome() {
+        ClientResponseOutcome::Error(_) => return display_response(tty, &response),
+        ClientResponseOutcome::Success(SuccessPayload::Report(report, output))
+            if report.report_id() == &report_id
+                && output.size == report.envelope_size()
+                && response.descriptor_count() == 1 =>
+        {
+            report.clone()
+        }
+        _ => return Err(RescueVaultCompanionError::ProtocolFailure),
+    };
+    let input = response
+        .take_descriptor()
+        .ok_or(RescueVaultCompanionError::ProtocolFailure)?;
+    if response.descriptor_count() != 0 {
+        return Err(RescueVaultCompanionError::ProtocolFailure);
+    }
+    let (bytes, observed_sha256) = read_verified_report(input.as_fd(), &report, interrupted)?;
+    drop(input);
+    if interrupted.load(Ordering::Acquire) {
+        return Err(RescueVaultCompanionError::Interrupted);
+    }
+    let path = persist_verified_report(&report_id, &bytes)?;
+    drop(bytes);
+    display_report_export(
+        tty,
+        response.state_version(),
+        &report,
+        &observed_sha256,
+        &path,
+    )
+}
+
+fn read_verified_report(
+    input: BorrowedFd<'_>,
+    report: &ReportSummary,
+    interrupted: &AtomicBool,
+) -> Result<(Zeroizing<Vec<u8>>, String), RescueVaultCompanionError> {
+    let expected = usize::try_from(report.envelope_size())
+        .ok()
+        .filter(|size| (2..=MAX_SIGNED_REPORT_ENVELOPE_BYTES as usize).contains(size))
+        .ok_or(RescueVaultCompanionError::ProtocolFailure)?;
+    let mut bytes = Zeroizing::new(Vec::with_capacity(expected));
+    let mut buffer = Zeroizing::new([0_u8; 4096]);
+    while bytes.len() < expected {
+        if interrupted.load(Ordering::Acquire) {
+            return Err(RescueVaultCompanionError::Interrupted);
+        }
+        let wanted = (expected - bytes.len()).min(buffer.len());
+        match rustix::io::read(input, &mut buffer[..wanted]) {
+            Ok(0) => return Err(RescueVaultCompanionError::ProtocolFailure),
+            Ok(read) => bytes.extend_from_slice(&buffer[..read]),
+            Err(error) if error == rustix::io::Errno::INTR => {}
+            Err(_) => return Err(RescueVaultCompanionError::ProtocolFailure),
+        }
+    }
+    loop {
+        if interrupted.load(Ordering::Acquire) {
+            return Err(RescueVaultCompanionError::Interrupted);
+        }
+        let mut extra = Zeroizing::new([0_u8; 1]);
+        match rustix::io::read(input, &mut extra[..]) {
+            Ok(0) => break,
+            Ok(_) => return Err(RescueVaultCompanionError::ProtocolFailure),
+            Err(error) if error == rustix::io::Errno::INTR => {}
+            Err(_) => return Err(RescueVaultCompanionError::ProtocolFailure),
+        }
+    }
+    let observed_sha256 = lowercase_sha256(&bytes);
+    if observed_sha256 != report.envelope_sha256().as_str() {
+        return Err(RescueVaultCompanionError::ProtocolFailure);
+    }
+    Ok((bytes, observed_sha256))
+}
+
+fn lowercase_sha256(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256Hasher::digest(bytes);
+    let mut output = String::with_capacity(64);
+    for byte in digest {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    output
+}
+
+fn persist_verified_report(
+    report_id: &ReportId,
+    bytes: &[u8],
+) -> Result<String, RescueVaultCompanionError> {
+    let home = open_report_home()?;
+    let directory = open_or_create_report_directory(&home)?;
+    persist_verified_report_in_directory(directory.as_fd(), report_id, bytes)
+}
+
+fn open_report_home() -> Result<OwnedFd, RescueVaultCompanionError> {
+    if rustix::process::geteuid().as_raw() != COMPANION_UID
+        || rustix::process::getegid().as_raw() != COMPANION_UID
+    {
+        return Err(RescueVaultCompanionError::TransportUnavailable);
+    }
+    let home = rfs::openat2(
+        rfs::CWD,
+        REPORT_HOME_PATH,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+    )
+    .map_err(|_| RescueVaultCompanionError::TransportUnavailable)?;
+    validate_report_directory(home.as_fd(), false)?;
+    Ok(home)
+}
+
+fn open_or_create_report_directory(home: &OwnedFd) -> Result<OwnedFd, RescueVaultCompanionError> {
+    let created = match rfs::mkdirat(
+        home,
+        REPORT_DIRECTORY_NAME,
+        Mode::RUSR | Mode::WUSR | Mode::XUSR,
+    ) {
+        Ok(()) => true,
+        Err(error) if error == rustix::io::Errno::EXIST => false,
+        Err(_) => return Err(RescueVaultCompanionError::TransportUnavailable),
+    };
+    let directory = rfs::openat2(
+        home,
+        REPORT_DIRECTORY_NAME,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::BENEATH
+            | ResolveFlags::NO_SYMLINKS
+            | ResolveFlags::NO_MAGICLINKS
+            | ResolveFlags::NO_XDEV,
+    )
+    .map_err(|_| RescueVaultCompanionError::TransportUnavailable)?;
+    if created {
+        rfs::fchmod(&directory, Mode::RUSR | Mode::WUSR | Mode::XUSR)
+            .map_err(|_| RescueVaultCompanionError::TransportUnavailable)?;
+        rfs::fsync(&directory).map_err(|_| RescueVaultCompanionError::TransportUnavailable)?;
+        rfs::fsync(home).map_err(|_| RescueVaultCompanionError::TransportUnavailable)?;
+    }
+    validate_report_directory(directory.as_fd(), true)?;
+    let opened =
+        rfs::fstat(&directory).map_err(|_| RescueVaultCompanionError::TransportUnavailable)?;
+    let named = rfs::statat(home, REPORT_DIRECTORY_NAME, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|_| RescueVaultCompanionError::TransportUnavailable)?;
+    if opened.st_dev != named.st_dev || opened.st_ino != named.st_ino {
+        return Err(RescueVaultCompanionError::TransportUnavailable);
+    }
+    Ok(directory)
+}
+
+fn validate_report_directory(
+    directory: BorrowedFd<'_>,
+    exact_private_mode: bool,
+) -> Result<(), RescueVaultCompanionError> {
+    let stat =
+        rfs::fstat(directory).map_err(|_| RescueVaultCompanionError::TransportUnavailable)?;
+    let flags = rustix::io::fcntl_getfd(directory)
+        .map_err(|_| RescueVaultCompanionError::TransportUnavailable)?;
+    let permissions = stat.st_mode & 0o7777;
+    if !FileType::from_raw_mode(stat.st_mode).is_dir()
+        || stat.st_nlink < 2
+        || stat.st_uid != COMPANION_UID
+        || stat.st_gid != COMPANION_UID
+        || permissions & 0o700 != 0o700
+        || permissions & 0o7022 != 0
+        || (exact_private_mode && permissions != 0o700)
+        || flags != rustix::io::FdFlags::CLOEXEC
+    {
+        return Err(RescueVaultCompanionError::TransportUnavailable);
+    }
+    Ok(())
+}
+
+fn persist_verified_report_in_directory(
+    directory: BorrowedFd<'_>,
+    report_id: &ReportId,
+    bytes: &[u8],
+) -> Result<String, RescueVaultCompanionError> {
+    validate_report_directory(directory, true)?;
+    if bytes.len() < 2 || bytes.len() > MAX_SIGNED_REPORT_ENVELOPE_BYTES as usize {
+        return Err(RescueVaultCompanionError::ProtocolFailure);
+    }
+    let final_name = format!("{}{REPORT_FILE_SUFFIX}", report_id.as_str());
+    let (temporary, temporary_name) = create_report_temp(directory, report_id)?;
+    let result = (|| {
+        write_export_file(temporary.as_fd(), bytes)?;
+        rfs::fsync(&temporary).map_err(|_| RescueVaultCompanionError::TransportUnavailable)?;
+        validate_export_file(temporary.as_fd(), bytes.len())?;
+        let temporary_stat =
+            rfs::fstat(&temporary).map_err(|_| RescueVaultCompanionError::TransportUnavailable)?;
+        let named_temporary = rfs::statat(
+            directory,
+            temporary_name.as_str(),
+            AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|_| RescueVaultCompanionError::TransportUnavailable)?;
+        if named_temporary.st_dev != temporary_stat.st_dev
+            || named_temporary.st_ino != temporary_stat.st_ino
+            || !FileType::from_raw_mode(named_temporary.st_mode).is_file()
+        {
+            return Err(RescueVaultCompanionError::TransportUnavailable);
+        }
+        rfs::renameat_with(
+            directory,
+            temporary_name.as_str(),
+            directory,
+            final_name.as_str(),
+            RenameFlags::NOREPLACE,
+        )
+        .map_err(|_| RescueVaultCompanionError::TransportUnavailable)?;
+        let published = rfs::statat(directory, final_name.as_str(), AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|_| RescueVaultCompanionError::TransportUnavailable)?;
+        if published.st_dev != temporary_stat.st_dev
+            || published.st_ino != temporary_stat.st_ino
+            || !FileType::from_raw_mode(published.st_mode).is_file()
+            || published.st_nlink != 1
+            || published.st_uid != COMPANION_UID
+            || published.st_gid != COMPANION_UID
+            || published.st_mode & 0o7777 != 0o600
+            || usize::try_from(published.st_size).ok() != Some(bytes.len())
+        {
+            return Err(RescueVaultCompanionError::TransportUnavailable);
+        }
+        rfs::fsync(directory).map_err(|_| RescueVaultCompanionError::TransportUnavailable)
+    })();
+    if result.is_err() {
+        let _ = rfs::unlinkat(directory, temporary_name.as_str(), AtFlags::empty());
+    }
+    result?;
+    Ok(format!(
+        "{REPORT_HOME_PATH}/{REPORT_DIRECTORY_NAME}/{final_name}"
+    ))
+}
+
+fn create_report_temp(
+    directory: BorrowedFd<'_>,
+    report_id: &ReportId,
+) -> Result<(OwnedFd, String), RescueVaultCompanionError> {
+    for _ in 0..REPORT_TEMP_CREATE_ATTEMPTS {
+        let mut random = [0_u8; REPORT_TEMP_RANDOM_BYTES];
+        OsRng
+            .try_fill_bytes(&mut random)
+            .map_err(|_| RescueVaultCompanionError::TransportUnavailable)?;
+        let mut suffix = String::with_capacity(REPORT_TEMP_RANDOM_BYTES * 2);
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        for byte in random {
+            suffix.push(char::from(HEX[usize::from(byte >> 4)]));
+            suffix.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+        let name = format!(".{}.{}.tmp", report_id.as_str(), suffix);
+        match rfs::openat2(
+            directory,
+            name.as_str(),
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+            ResolveFlags::BENEATH
+                | ResolveFlags::NO_SYMLINKS
+                | ResolveFlags::NO_MAGICLINKS
+                | ResolveFlags::NO_XDEV,
+        ) {
+            Ok(descriptor) => {
+                let prepared = rfs::fchmod(&descriptor, Mode::RUSR | Mode::WUSR)
+                    .map_err(|_| RescueVaultCompanionError::TransportUnavailable)
+                    .and_then(|()| validate_export_file(descriptor.as_fd(), 0));
+                if let Err(error) = prepared {
+                    drop(descriptor);
+                    let _ = rfs::unlinkat(directory, name.as_str(), AtFlags::empty());
+                    return Err(error);
+                }
+                return Ok((descriptor, name));
+            }
+            Err(error) if error == rustix::io::Errno::EXIST => {}
+            Err(_) => return Err(RescueVaultCompanionError::TransportUnavailable),
+        }
+    }
+    Err(RescueVaultCompanionError::TransportUnavailable)
+}
+
+fn validate_export_file(
+    descriptor: BorrowedFd<'_>,
+    expected_size: usize,
+) -> Result<(), RescueVaultCompanionError> {
+    let stat =
+        rfs::fstat(descriptor).map_err(|_| RescueVaultCompanionError::TransportUnavailable)?;
+    let flags = rustix::io::fcntl_getfd(descriptor)
+        .map_err(|_| RescueVaultCompanionError::TransportUnavailable)?;
+    if !FileType::from_raw_mode(stat.st_mode).is_file()
+        || stat.st_nlink != 1
+        || stat.st_uid != COMPANION_UID
+        || stat.st_gid != COMPANION_UID
+        || stat.st_mode & 0o7777 != 0o600
+        || usize::try_from(stat.st_size).ok() != Some(expected_size)
+        || flags != rustix::io::FdFlags::CLOEXEC
+    {
+        return Err(RescueVaultCompanionError::TransportUnavailable);
+    }
+    Ok(())
+}
+
+fn write_export_file(
+    descriptor: BorrowedFd<'_>,
+    bytes: &[u8],
+) -> Result<(), RescueVaultCompanionError> {
+    let mut written = 0_usize;
+    while written < bytes.len() {
+        match rustix::io::write(descriptor, &bytes[written..]) {
+            Ok(0) => return Err(RescueVaultCompanionError::TransportUnavailable),
+            Ok(count) => written += count,
+            Err(error) if error == rustix::io::Errno::INTR => {}
+            Err(_) => return Err(RescueVaultCompanionError::TransportUnavailable),
+        }
+    }
+    Ok(())
+}
+
+fn display_report_export(
+    tty: BorrowedFd<'_>,
+    state_version: u64,
+    report: &ReportSummary,
+    observed_sha256: &str,
+    path: &str,
+) -> Result<(), RescueVaultCompanionError> {
+    let output = format!(
+        "stateVersion: {state_version}\nreportId: {}\nenvelopeSize: {}\nenvelopeSha256: {observed_sha256}\npath: {path}\n",
+        report.report_id().as_str(),
+        report.envelope_size(),
+    );
+    write_tty(tty, output.as_bytes())
+}
+
 fn display_response(
     tty: BorrowedFd<'_>,
     response: &ClientResponse,
@@ -891,6 +1273,20 @@ fn display_response(
             };
             let line = format!("openai: {openai}\ncodex: {codex}\n");
             write_tty(tty, line.as_bytes())
+        }
+        ClientResponseOutcome::Success(SuccessPayload::ReportList { reports }) => {
+            let header = format!("reports: {}\n", reports.len());
+            write_tty(tty, header.as_bytes())?;
+            for report in reports {
+                let line = format!(
+                    "{} {} {}\n",
+                    report.report_id().as_str(),
+                    report.envelope_size(),
+                    report.envelope_sha256().as_str(),
+                );
+                write_tty(tty, line.as_bytes())?;
+            }
+            Ok(())
         }
         _ => Err(RescueVaultCompanionError::ProtocolFailure),
     }
@@ -1543,6 +1939,19 @@ mod tests {
             parse_command([OsString::from("openai-logout")]),
             Ok(Command::OpenAiLogout)
         );
+        assert_eq!(
+            parse_command([OsString::from("report-list")]),
+            Ok(Command::ReportList)
+        );
+        let report_id =
+            ReportId::parse("RP-12345678-1234-1234-1234-123456789abc").expect("report ID");
+        assert_eq!(
+            parse_command([
+                OsString::from("report-export"),
+                OsString::from(report_id.as_str()),
+            ]),
+            Ok(Command::ReportExport(report_id))
+        );
         assert!(parse_command([OsString::from("unlock"), OsString::from("/dev/sda")]).is_err());
         for command in ["provider-status", "openai-configure", "openai-logout"] {
             assert!(
@@ -1550,7 +1959,135 @@ mod tests {
                 "{command} accepted a path-like extra argument"
             );
         }
+        assert!(parse_command([OsString::from("report-export")]).is_err());
+        assert!(
+            parse_command([
+                OsString::from("report-export"),
+                OsString::from("/tmp/injected"),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_command([
+                OsString::from("report-export"),
+                OsString::from("RP-12345678-1234-1234-1234-123456789abc"),
+                OsString::from("/tmp/injected"),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_command([
+                OsString::from("report-list"),
+                OsString::from("/tmp/injected"),
+            ])
+            .is_err()
+        );
         assert!(parse_command([OsString::from("--socket=/tmp/x")]).is_err());
+    }
+
+    fn report_summary(body: &[u8]) -> ReportSummary {
+        use kernaid_protocol::rescue_vault::Sha256;
+        ReportSummary::new(
+            ReportId::parse("RP-12345678-1234-1234-1234-123456789abc").expect("report ID"),
+            body.len() as u64,
+            Sha256::parse(&lowercase_sha256(body)).expect("report hash"),
+        )
+        .expect("report summary")
+    }
+
+    fn closed_report_pipe(body: &[u8]) -> OwnedFd {
+        let (read, write) = pipe_with(PipeFlags::CLOEXEC).expect("report pipe");
+        assert_eq!(rustix::io::write(&write, body), Ok(body.len()));
+        drop(write);
+        read
+    }
+
+    fn private_test_directory(directory: &tempfile::TempDir) -> OwnedFd {
+        let descriptor = rfs::openat2(
+            rfs::CWD,
+            directory.path(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+        )
+        .expect("open private test directory");
+        rfs::fchmod(&descriptor, Mode::RUSR | Mode::WUSR | Mode::XUSR)
+            .expect("private test directory mode");
+        validate_report_directory(descriptor.as_fd(), true).expect("secure test directory");
+        descriptor
+    }
+
+    #[test]
+    fn signed_report_pipe_requires_exact_size_hash_and_eof() {
+        let body = br#"{"payload":{"report":"ok"},"signature":"test"}"#;
+        let summary = report_summary(body);
+        let interrupted = AtomicBool::new(false);
+        let exact = closed_report_pipe(body);
+        let (observed, hash) =
+            read_verified_report(exact.as_fd(), &summary, &interrupted).expect("exact report");
+        assert_eq!(observed.as_slice(), body);
+        assert_eq!(hash, summary.envelope_sha256().as_str());
+
+        let short = closed_report_pipe(&body[..body.len() - 1]);
+        assert_eq!(
+            read_verified_report(short.as_fd(), &summary, &interrupted).err(),
+            Some(RescueVaultCompanionError::ProtocolFailure)
+        );
+
+        let mut extra_body = body.to_vec();
+        extra_body.push(b'x');
+        let extra = closed_report_pipe(&extra_body);
+        assert_eq!(
+            read_verified_report(extra.as_fd(), &summary, &interrupted).err(),
+            Some(RescueVaultCompanionError::ProtocolFailure)
+        );
+
+        let different = br#"{"payload":{"report":"no"},"signature":"test"}"#;
+        assert_eq!(different.len(), body.len());
+        let wrong_hash = closed_report_pipe(different);
+        assert_eq!(
+            read_verified_report(wrong_hash.as_fd(), &summary, &interrupted).err(),
+            Some(RescueVaultCompanionError::ProtocolFailure)
+        );
+    }
+
+    #[test]
+    fn verified_report_export_is_private_atomic_and_never_overwrites() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary_root = tempfile::tempdir().expect("temporary report directory");
+        let directory = private_test_directory(&temporary_root);
+        let body = br#"{"payload":{"report":"ok"},"signature":"test"}"#;
+        let summary = report_summary(body);
+        let expected_name = format!("{}{REPORT_FILE_SUFFIX}", summary.report_id().as_str());
+        let fixed_path =
+            persist_verified_report_in_directory(directory.as_fd(), summary.report_id(), body)
+                .expect("first report export");
+        assert_eq!(
+            fixed_path,
+            format!("{REPORT_HOME_PATH}/{REPORT_DIRECTORY_NAME}/{expected_name}")
+        );
+        let exported = temporary_root.path().join(&expected_name);
+        assert_eq!(std::fs::read(&exported).expect("exported report"), body);
+        let metadata = std::fs::symlink_metadata(&exported).expect("export metadata");
+        assert!(metadata.file_type().is_file());
+        assert_eq!(metadata.permissions().mode() & 0o7777, 0o600);
+
+        assert_eq!(
+            persist_verified_report_in_directory(
+                directory.as_fd(),
+                summary.report_id(),
+                b"different signed report",
+            )
+            .err(),
+            Some(RescueVaultCompanionError::TransportUnavailable)
+        );
+        assert_eq!(std::fs::read(&exported).expect("original report"), body);
+        let entries = std::fs::read_dir(temporary_root.path())
+            .expect("report directory")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("report entries");
+        assert_eq!(entries.len(), 1, "temporary export leaked");
     }
 
     #[test]
@@ -2416,8 +2953,8 @@ mod tests {
             ),
         ];
         for (state, unlock_error, lock_error) in cases {
-            let unlock = command_source_error(Command::Unlock, state);
-            let lock = command_source_error(Command::Lock, state);
+            let unlock = command_source_error(&Command::Unlock, state);
+            let lock = command_source_error(&Command::Lock, state);
             if state == VaultState::Locked {
                 assert_eq!(unlock, None);
             } else {

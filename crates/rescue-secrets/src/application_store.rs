@@ -16,7 +16,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use kernaid_device_identity::{DeviceIdentity, SignedReportEnvelope};
 use kernaid_protocol::rescue_vault::{
     AgentRole, AuditEventType, AuditOutcome, ErrorToken, MAX_AUDIT_SEQUENCE, Operation, PeerRole,
-    RequestPayload, ValidatedRequest,
+    RequestId, RequestPayload, ValidatedRequest,
 };
 use kernaid_report_schema::{MAX_SESSION_REPORT_BYTES, validate_session_report_json};
 use kernaid_storage::{
@@ -612,36 +612,74 @@ impl<'vault> RescueVaultApplicationStore<'vault> {
         else {
             return Err(RescueApplicationStoreError::InvalidAgentAudit);
         };
-        let peer_uid = request.peer_uid();
-        let peer_pid = request.peer_pid();
-        let request_id = decode_request_id(request.request_id().as_str())
+        self.append_agent_audit_fields(
+            request.request_id(),
+            request.peer_uid(),
+            request.peer_pid(),
+            *sequence,
+            *event,
+            *outcome,
+            *error,
+        )
+    }
+
+    /// Worker-side equivalent of [`Self::append_agent_audit`] after the
+    /// authenticated server has reduced a `ValidatedRequest` to the closed
+    /// binary parent/worker frame. Keeping this crate-private prevents callers
+    /// outside the daemon boundary from bypassing protocol authorization.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn append_agent_audit_fields(
+        &mut self,
+        request_id: &RequestId,
+        peer_uid: u32,
+        peer_pid: u32,
+        sequence: u64,
+        event: AuditEventType,
+        outcome: AuditOutcome,
+        error: Option<ErrorToken>,
+    ) -> Result<u64, RescueApplicationStoreError> {
+        self.ensure_ready()?;
+        let decoded_request_id = decode_request_id(request_id.as_str())
             .map_err(|_| RescueApplicationStoreError::InvalidAgentAudit)?;
-        if self.state.agent_request_ids.contains(&request_id) {
+        if self.state.agent_request_ids.contains(&decoded_request_id) {
             return Err(RescueApplicationStoreError::StaleAgentSequence);
         }
-        let next = self.expected_agent_audit_sequence(peer_uid, peer_pid, *event)?;
-        if *sequence != next {
+        let next = self.expected_agent_audit_sequence(peer_uid, peer_pid, event)?;
+        if sequence != next {
             return Err(RescueApplicationStoreError::StaleAgentSequence);
         }
-        if (*outcome == AuditOutcome::Succeeded && error.is_some())
-            || (*outcome != AuditOutcome::Succeeded && error.is_none())
+        if (outcome == AuditOutcome::Succeeded && error.is_some())
+            || (outcome != AuditOutcome::Succeeded && error.is_none())
         {
             return Err(RescueApplicationStoreError::InvalidAgentAudit);
         }
         self.validate_materialized_state()?;
         self.healthy = false;
         self.append_event(ApplicationEvent::AgentAuditAppend {
-            request_id: request.request_id().as_str().to_owned(),
-            sequence: *sequence,
+            request_id: request_id.as_str().to_owned(),
+            sequence,
             peer_uid,
             peer_pid,
-            event: *event,
-            outcome: *outcome,
-            error: *error,
+            event,
+            outcome,
+            error,
         })?;
         self.validate_materialized_state()?;
         self.healthy = true;
-        Ok(*sequence)
+        Ok(sequence)
+    }
+
+    /// Presence-only reconciliation hook for an interrupted worker audit
+    /// append. The opaque request identifier never leaves the worker and no
+    /// journal body is exposed.
+    pub(crate) fn contains_agent_audit_request(
+        &self,
+        request_id: &RequestId,
+    ) -> Result<bool, RescueApplicationStoreError> {
+        self.ensure_ready()?;
+        let request_id = decode_request_id(request_id.as_str())
+            .map_err(|_| RescueApplicationStoreError::InvalidAgentAudit)?;
+        Ok(self.state.agent_request_ids.contains(&request_id))
     }
 
     fn expected_agent_audit_sequence(
