@@ -1036,7 +1036,8 @@ class ResponseParserTests(unittest.TestCase):
         configured = controller.ProviderCompanionResponse(
             16, "configured", "unconfigured", None, 0
         )
-        locked = response(18, "locked")
+        report_status = response(24, "unlocked", device_id)
+        locked = response(26, "locked")
         self.assertEqual(
             controller.validate_clean_provider_lifecycle(
                 initial,
@@ -1047,6 +1048,7 @@ class ResponseParserTests(unittest.TestCase):
                 prior,
                 configured,
                 configured,
+                report_status,
                 locked,
                 locked,
                 1,
@@ -1063,8 +1065,9 @@ class ResponseParserTests(unittest.TestCase):
                 prior,
                 configured,
                 configured,
-                response(16, "locked"),
-                response(16, "locked"),
+                report_status,
+                response(24, "locked"),
+                response(24, "locked"),
                 1,
             )
 
@@ -1085,6 +1088,7 @@ class ResponseParserTests(unittest.TestCase):
             controller.ProviderCompanionResponse(
                 16, "configured", "unconfigured", None, 0
             ),
+            response(24, "unlocked", device_id),
             response(0, "faulted-reboot-required"),
         )
         self.assertEqual(
@@ -1109,19 +1113,20 @@ class ResponseParserTests(unittest.TestCase):
 
     def test_boot_attestation_separates_clean_and_fault_epochs(self) -> None:
         device_id = "KA-0123456789abcdef01234567"
-        clean = controller.boot_attestation("bios", 1, 10, 16, 18, device_id)
+        clean = controller.boot_attestation("bios", 1, 10, 24, 26, device_id)
         self.assertIn("terminal=clean-lock", clean)
         self.assertIn("hold_killed_vaultd=false", clean)
         self.assertIn("pre_terminal_daemon_stable=true", clean)
         self.assertIn("production_ui_provider_relay_path=true", clean)
+        self.assertIn("signed_report_path=true", clean)
         self.assertNotIn(" daemon_stable=true", clean)
-        fault = controller.boot_attestation("uefi", 2, 10, 16, 0, device_id)
+        fault = controller.boot_attestation("uefi", 2, 10, 24, 0, device_id)
         self.assertIn("terminal=persistent-fault", fault)
         self.assertIn("hold_killed_vaultd=true", fault)
         self.assertIn("pre_terminal_caps_stable=true", fault)
         self.assertNotIn(" caps_stable=true", fault)
         with self.assertRaises(controller.ClosedFailure):
-            controller.boot_attestation("bios", 1, 10, 16, 0, device_id)
+            controller.boot_attestation("bios", 1, 10, 24, 0, device_id)
 
     def test_lifecycle_requires_exact_plus_two_and_stable_device_id(self) -> None:
         device_id = "KA-0123456789abcdef01234567"
@@ -2203,7 +2208,7 @@ class SanitizedOutputTests(unittest.TestCase):
             mock.patch.object(
                 controller,
                 "run_lifecycle",
-                return_value=(10, 16, 18, "KA-0123456789abcdef01234567"),
+                return_value=(10, 24, 26, "KA-0123456789abcdef01234567"),
             ),
             contextlib.redirect_stdout(stdout),
             contextlib.redirect_stderr(stderr),
@@ -2578,7 +2583,7 @@ class StaticContractTests(unittest.TestCase):
             self.assertNotIn(forbidden, source)
         compile(source, "<codex-status-proof>", "exec", dont_inherit=True)
         self.assertIn("codex_status_path=true", controller.boot_attestation(
-            "bios", 1, 10, 16, 18, "KA-0123456789abcdef01234567"
+            "bios", 1, 10, 24, 26, "KA-0123456789abcdef01234567"
         ))
 
     def test_readiness_controller_and_wrapper_deadlines_are_strictly_nested(
@@ -2694,6 +2699,7 @@ class StaticContractTests(unittest.TestCase):
                 "codex-status",
                 "production-status",
                 "normal-release",
+                "signed-report",
                 "hold-kill",
                 "post-fault",
             ),
@@ -3064,6 +3070,39 @@ class StaticContractTests(unittest.TestCase):
             1,
         )
 
+    def test_signed_report_proof_uses_shipping_http_path_and_two_boot_index(
+        self,
+    ) -> None:
+        first = controller._signed_report_probe_source(1, 16).decode("ascii")
+        second = controller._signed_report_probe_source(2, 30).decode("ascii")
+        for source, version, report_count in ((first, 16, 1), (second, 30, 2)):
+            self.assertIn(f"EXPECTED_VERSION={version}", source)
+            self.assertIn('"/api/rescue/audit-append"', source)
+            self.assertIn('"/api/rescue/report-persist"', source)
+            self.assertIn('"/api/rescue/reports"', source)
+            self.assertIn('ORIGIN="http://127.0.0.1:4173"', source)
+            self.assertIn('"Sec-Fetch-Site":"same-origin"', source)
+            self.assertIn("payloadSha256", source)
+            self.assertIn("journalEntryHash", source)
+            self.assertIn("signature", source)
+            self.assertIn('["report-export",CURRENT]', source)
+            self.assertIn('KernAid-Reports/"+CURRENT+".signed.json"', source)
+            self.assertIn("stat.S_IMODE(file_stat.st_mode)!=0o600", source)
+            self.assertEqual(source.count("S-qemu-signed-report-"), report_count)
+            self.assertLess(len(source), 16 * 1024)
+            compile(source, "<signed-report-proof>", "exec", dont_inherit=True)
+        self.assertNotIn("000000000002", first)
+        self.assertIn("000000000001", second)
+        self.assertIn("000000000002", second)
+        with self.assertRaises(controller.ClosedFailure):
+            controller._signed_report_probe_source(3, 16)
+        with self.assertRaises(controller.ClosedFailure):
+            controller._signed_report_probe_source(1, controller.MAX_SAFE_STATE_VERSION)
+        lifecycle = inspect.getsource(controller.run_lifecycle)
+        self.assertIn('"signed-report",', lifecycle)
+        self.assertIn("_signed_report_probe_source(boot, configured.state_version)", lifecycle)
+        self.assertIn("timeout=150.0", lifecycle)
+
     def test_ui_relay_exchange_reads_a_real_http10_connection_close_response(
         self,
     ) -> None:
@@ -3394,6 +3433,7 @@ class StaticContractTests(unittest.TestCase):
         self.assertIn('--timeout "$qemu_controller_timeout_seconds"', shell)
         self.assertEqual(shell.count("    -nic none\n"), 1)
         self.assertIn("production_ui_provider_relay_path=true", shell)
+        self.assertIn("signed_report_path=true", shell)
         self.assertIn('kill -s "$signal_name" "$controller_pid"', shell)
         self.assertIn(
             "-fw_cfg \"name=opt/io.systemd.credentials/provider-lease-probe,"

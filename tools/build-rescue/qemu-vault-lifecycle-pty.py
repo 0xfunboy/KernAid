@@ -101,6 +101,7 @@ PROVIDER_PROOF_CLOSED_STAGES = PROVIDER_PROOF_UI_STAGES + (
     "codex-status",
     "production-status",
     "normal-release",
+    "signed-report",
     "hold-kill",
     "post-fault",
 )
@@ -1299,6 +1300,7 @@ def validate_provider_fault_lifecycle(
     prior_provider: ProviderCompanionResponse,
     configured: ProviderCompanionResponse,
     provider_status: ProviderCompanionResponse,
+    report_status: CompanionResponse,
     faulted: CompanionResponse,
     provider_faulted: ProviderCompanionResponse,
     boot: int,
@@ -1323,7 +1325,15 @@ def validate_provider_fault_lifecycle(
         unlocked, prior_provider, configured, provider_status, boot
     )
     if (
-        faulted.return_code != 0
+        report_status
+        != CompanionResponse(
+            configured.state_version + 8,
+            "unlocked",
+            unlocked.device_id,
+            None,
+            0,
+        )
+        or faulted.return_code != 0
         or faulted.vault_state != "faulted-reboot-required"
         or faulted.device_id is not None
         or faulted.error is not None
@@ -1377,6 +1387,7 @@ def validate_clean_provider_lifecycle(
     prior_provider: ProviderCompanionResponse,
     configured: ProviderCompanionResponse,
     provider_status: ProviderCompanionResponse,
+    report_status: CompanionResponse,
     locked: CompanionResponse,
     status_locked: CompanionResponse,
     boot: int,
@@ -1401,7 +1412,15 @@ def validate_clean_provider_lifecycle(
         unlocked, prior_provider, configured, provider_status, boot
     )
     if (
-        locked.state_version != configured.state_version + 2
+        report_status
+        != CompanionResponse(
+            configured.state_version + 8,
+            "unlocked",
+            unlocked.device_id,
+            None,
+            0,
+        )
+        or locked.state_version != report_status.state_version + 2
         or locked.vault_state != "locked"
         or locked.device_id is not None
         or locked.error is not None
@@ -2827,6 +2846,218 @@ sys.stdout.write({proof!r})
 '''.encode("ascii")
 
 
+def _signed_report_probe_source(boot: int, expected_state_version: int) -> bytes:
+    """Prove the shipping UI audit/report path and cross-boot persistence."""
+
+    if (
+        boot not in {1, 2}
+        or not 0 <= expected_state_version <= MAX_SAFE_STATE_VERSION - 8
+    ):
+        raise ClosedFailure("provider-proof", "source-invalid")
+    reports: dict[str, str] = {}
+    for index in range(1, boot + 1):
+        report_id = f"RP-90000000-0000-4000-8000-{index:012d}"
+        reports[report_id] = json.dumps(
+            {
+                "schemaVersion": "1.0",
+                "sessionId": f"S-qemu-signed-report-{index}",
+                "targetFingerprint": f"sha256:{'a' * 64}",
+                "facts": [],
+                "inferences": [],
+                "decisions": [],
+                "events": [],
+                "verification": "not-run",
+                "unresolvedRisks": ["QEMU qualification report"],
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+    current_report_id = next(reversed(reports))
+    proof = "KERNAID_QEMU_PROVIDER_PROOF_V1 stage=signed-report result=true\n"
+    return f'''import base64,errno,hashlib,http.client,json,os,re,select,stat,sys,time
+API="kernaid.dev/rescue-application-http/v1alpha1"
+HOST="127.0.0.1:4173"
+ORIGIN="http://127.0.0.1:4173"
+SIGNED_MEDIA="application/vnd.kernaid.signed-report+json"
+REPORTS={reports!r}
+CURRENT={current_report_id!r}
+EXPECTED_VERSION={expected_state_version}
+MAX_BODY=1536*1024
+def rejected(_value):
+    raise ValueError()
+def unique(pairs):
+    result={{}}
+    for key,value in pairs:
+        if type(key) is not str or key in result:
+            raise ValueError()
+        result[key]=value
+    return result
+def decode(data):
+    return json.loads(data.decode("ascii"),object_pairs_hook=unique,parse_float=rejected,parse_constant=rejected)
+def exact(value,keys):
+    if type(value) is not dict or set(value)!=set(keys):
+        raise RuntimeError()
+    return value
+def request(method,path,body=None,accept="application/json"):
+    encoded=None
+    headers={{"Host":HOST,"Origin":ORIGIN,"Sec-Fetch-Site":"same-origin","Accept":accept}}
+    if body is not None:
+        encoded=json.dumps(body,ensure_ascii=True,separators=(",", ":")).encode("ascii")
+        headers["Content-Type"]="application/json"
+    connection=http.client.HTTPConnection("127.0.0.1",4173,timeout=15.0)
+    try:
+        connection.request(method,path,body=encoded,headers=headers)
+        response=connection.getresponse()
+        data=response.read(MAX_BODY+1)
+        if len(data)>MAX_BODY:
+            raise RuntimeError()
+        return response.status,response.headers,data
+    finally:
+        connection.close()
+def json_response(method,path,body=None):
+    status,headers,data=request(method,path,body)
+    if status!=200 or headers.get_all("Content-Type")!=["application/json"] or headers.get_all("Content-Length")!=[str(len(data))]:
+        raise RuntimeError()
+    return decode(data)
+def safe_version(value):
+    return type(value) is int and 0<=value<=9007199254740991
+def summary(value):
+    item=exact(value,("reportId","envelopeSize","envelopeSha256"))
+    if type(item["reportId"]) is not str or re.fullmatch(r"RP-[0-9a-f]{{8}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}}",item["reportId"]) is None or type(item["envelopeSize"]) is not int or not 2<=item["envelopeSize"]<=MAX_BODY or type(item["envelopeSha256"]) is not str or re.fullmatch(r"[0-9a-f]{{64}}",item["envelopeSha256"]) is None:
+        raise RuntimeError()
+    return item
+def urlsafe(value,size):
+    if type(value) is not str or re.fullmatch(r"[A-Za-z0-9_-]+",value) is None:
+        raise RuntimeError()
+    try:
+        decoded=base64.b64decode(value+"="*((4-len(value)%4)%4),altchars=b"-_",validate=True)
+    except BaseException as error:
+        raise RuntimeError() from error
+    if len(decoded)!=size:
+        raise RuntimeError()
+    return decoded
+def companion(arguments):
+    pid,master=os.forkpty()
+    if pid==0:
+        try:
+            os.execv("/usr/bin/kernaid-rescue-vaultctl",["kernaid-rescue-vaultctl",*arguments])
+        except BaseException:
+            os._exit(127)
+    output=bytearray()
+    child_status=None
+    eof=False
+    deadline=time.monotonic()+15.0
+    os.set_blocking(master,False)
+    try:
+        while child_status is None or not eof:
+            if time.monotonic()>=deadline:
+                if child_status is None:
+                    os.kill(pid,9)
+                    child_status=os.waitpid(pid,0)[1]
+                raise RuntimeError()
+            if child_status is None:
+                waited,status=os.waitpid(pid,os.WNOHANG)
+                if waited==pid:
+                    child_status=status
+            readable,_,_=select.select([master],[],[],0.1)
+            if readable:
+                try:
+                    chunk=os.read(master,4096)
+                except OSError as error:
+                    if error.errno!=errno.EIO:
+                        raise
+                    chunk=b""
+                if chunk:
+                    output.extend(chunk)
+                    if len(output)>2048:
+                        raise RuntimeError()
+                else:
+                    eof=True
+        if child_status is None or os.waitstatus_to_exitcode(child_status)!=0:
+            raise RuntimeError()
+        return bytes(output).replace(b"\\r\\n",b"\\n")
+    finally:
+        if child_status is None:
+            try:
+                os.kill(pid,9)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(pid,0)
+            except ChildProcessError:
+                pass
+        os.close(master)
+try:
+    status=json_response("GET","/api/rescue/vault/status")
+    exact(status,("apiVersion","stateVersion","vaultState"))
+    if status["apiVersion"]!=API or status["vaultState"]!="unlocked" or not safe_version(status["stateVersion"]) or status["stateVersion"]!=EXPECTED_VERSION:
+        raise RuntimeError()
+    version=EXPECTED_VERSION
+    for sequence,event in enumerate(("agent-session-start","agent-diagnosis-complete","agent-session-end"),1):
+        outcome=json_response("POST","/api/rescue/audit-append",{{"expectedStateVersion":version,"sequence":sequence,"event":event,"outcome":"succeeded"}})
+        exact(outcome,("apiVersion","stateVersion","sequence"))
+        version+=2
+        if not safe_version(outcome["stateVersion"]) or type(outcome["sequence"]) is not int or outcome!={{"apiVersion":API,"stateVersion":version,"sequence":sequence}}:
+            raise RuntimeError()
+    report_json=REPORTS[CURRENT]
+    payload_sha256=hashlib.sha256(report_json.encode("ascii")).hexdigest()
+    stored=json_response("POST","/api/rescue/report-persist",{{"expectedStateVersion":version,"reportId":CURRENT,"payloadSha256":payload_sha256,"reportJson":report_json}})
+    exact(stored,("apiVersion","stateVersion","report"))
+    version+=2
+    current_summary=summary(stored["report"])
+    if stored["apiVersion"]!=API or not safe_version(stored["stateVersion"]) or stored["stateVersion"]!=version or current_summary["reportId"]!=CURRENT or version!=EXPECTED_VERSION+8:
+        raise RuntimeError()
+    listing=json_response("GET","/api/rescue/reports")
+    exact(listing,("apiVersion","stateVersion","reports"))
+    if listing["apiVersion"]!=API or not safe_version(listing["stateVersion"]) or listing["stateVersion"]!=version or type(listing["reports"]) is not list or len(listing["reports"])!=len(REPORTS):
+        raise RuntimeError()
+    indexed={{item["reportId"]:item for item in map(summary,listing["reports"])}}
+    if set(indexed)!=set(REPORTS) or indexed[CURRENT]!=current_summary:
+        raise RuntimeError()
+    signers=set()
+    current_envelope=None
+    for report_id,expected_json in REPORTS.items():
+        item=indexed[report_id]
+        status_code,headers,envelope_bytes=request("GET","/api/rescue/reports/"+report_id,accept=SIGNED_MEDIA)
+        if status_code!=200 or headers.get_all("Content-Type")!=[SIGNED_MEDIA] or headers.get_all("Content-Length")!=[str(item["envelopeSize"])] or headers.get_all("X-KernAid-Envelope-Sha256")!=[item["envelopeSha256"]] or headers.get_all("ETag")!=['"sha256-'+item["envelopeSha256"]+'"'] or len(envelope_bytes)!=item["envelopeSize"] or hashlib.sha256(envelope_bytes).hexdigest()!=item["envelopeSha256"]:
+            raise RuntimeError()
+        envelope=exact(decode(envelope_bytes),("schema","kind","algorithm","deviceId","journalSequence","journalEntryHash","payloadMediaType","payloadSha256","payload","publicKey","signature"))
+        expected_payload=expected_json.encode("ascii")
+        if envelope["schema"]!="https://schemas.kernaid.dev/v1/signed-report-envelope.json" or envelope["kind"]!="kernaid.signed-report" or envelope["algorithm"]!="Ed25519" or type(envelope["deviceId"]) is not str or re.fullmatch(r"KA-[0-9a-f]{{24}}",envelope["deviceId"]) is None or type(envelope["journalSequence"]) is not int or envelope["journalSequence"]<1 or envelope["payloadMediaType"]!="application/json" or envelope["payloadSha256"]!=hashlib.sha256(expected_payload).hexdigest() or urlsafe(envelope["journalEntryHash"],32) is None or urlsafe(envelope["payload"],len(expected_payload))!=expected_payload or urlsafe(envelope["publicKey"],32) is None or urlsafe(envelope["signature"],64) is None:
+            raise RuntimeError()
+        signers.add((envelope["deviceId"],envelope["publicKey"]))
+        if report_id==CURRENT:
+            current_envelope=envelope_bytes
+    if len(signers)!=1 or current_envelope is None:
+        raise RuntimeError()
+    item=indexed[CURRENT]
+    export_path="/home/kernaid/KernAid-Reports/"+CURRENT+".signed.json"
+    expected_output=("stateVersion: "+str(version)+"\\nreportId: "+CURRENT+"\\nenvelopeSize: "+str(item["envelopeSize"])+"\\nenvelopeSha256: "+item["envelopeSha256"]+"\\npath: "+export_path+"\\n").encode("ascii")
+    if companion(["report-export",CURRENT])!=expected_output:
+        raise RuntimeError()
+    directory_stat=os.lstat("/home/kernaid/KernAid-Reports")
+    named_stat=os.lstat(export_path)
+    descriptor=os.open(export_path,os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW)
+    try:
+        file_stat=os.fstat(descriptor)
+        exported=bytearray()
+        while len(exported)<=MAX_BODY:
+            chunk=os.read(descriptor,min(65536,MAX_BODY+1-len(exported)))
+            if not chunk:
+                break
+            exported.extend(chunk)
+    finally:
+        os.close(descriptor)
+    if not stat.S_ISDIR(directory_stat.st_mode) or stat.S_IMODE(directory_stat.st_mode)!=0o700 or directory_stat.st_uid!=1000 or directory_stat.st_gid!=1000 or (named_stat.st_dev,named_stat.st_ino)!=(file_stat.st_dev,file_stat.st_ino) or not stat.S_ISREG(file_stat.st_mode) or stat.S_IMODE(file_stat.st_mode)!=0o600 or file_stat.st_uid!=1000 or file_stat.st_gid!=1000 or file_stat.st_nlink!=1 or file_stat.st_size!=len(current_envelope):
+        raise RuntimeError()
+    if bytes(exported)!=current_envelope or hashlib.sha256(exported).hexdigest()!=item["envelopeSha256"]:
+        raise RuntimeError()
+except BaseException:
+    sys.exit(47)
+sys.stdout.write({proof!r})
+'''.encode("ascii")
+
+
 def _production_ui_relay_probe_source(stage: str) -> bytes:
     """Exercise the shipping HTTP relay without placing a wire frame in the PTY."""
 
@@ -3293,6 +3524,17 @@ def run_lifecycle(
         cursor,
         aggregate,
     )
+    cursor = run_guest_proof(
+        console,
+        "signed-report",
+        _signed_report_probe_source(boot, configured.state_version),
+        cursor,
+        aggregate,
+        timeout=150.0,
+    )
+    report_status, cursor = run_companion(
+        console, "status", "signed-report-status", cursor, aggregate
+    )
     if boot == 1:
         locked, cursor = run_companion(console, "lock", "lock", cursor, aggregate)
         status_locked, cursor = run_companion(
@@ -3308,6 +3550,7 @@ def run_lifecycle(
             prior_provider,
             configured,
             provider_status,
+            report_status,
             locked,
             status_locked,
             boot,
@@ -3317,7 +3560,7 @@ def run_lifecycle(
         )
         return (
             initial.state_version,
-            configured.state_version,
+            report_status.state_version,
             locked.state_version,
             device_id,
         )
@@ -3362,6 +3605,7 @@ def run_lifecycle(
         prior_provider,
         configured,
         provider_status,
+        report_status,
         faulted,
         provider_faulted,
         boot,
@@ -3371,7 +3615,7 @@ def run_lifecycle(
     )
     return (
         initial.state_version,
-        configured.state_version,
+        report_status.state_version,
         faulted.state_version,
         device_id,
     )
@@ -3493,7 +3737,7 @@ def boot_attestation(
     # It never claims that this controller traversed the root-only worker
     # cgroup directory.
     if (
-        pre_terminal_version != initial_version + 6
+        pre_terminal_version != initial_version + 14
         or boot not in {1, 2}
         or (boot == 1 and terminal_epoch_version != pre_terminal_version + 2)
         or terminal_epoch_version < 0
@@ -3515,6 +3759,7 @@ def boot_attestation(
         "production_executor_status_path=true conditioned_agent_binds_to_runtime=true "
         "codex_status_path=true "
         "production_ui_provider_relay_path=true "
+        "signed_report_path=true "
         "normal_triple_release=true lifecycle_marker_active_before_borrow=true "
         f"hold_killed_vaultd={fault_proof} helper_binds_to_terminated={fault_proof} "
         f"worker_pdeath_cleanup={fault_proof} test_trigger_sockets_gone={fault_proof} "
@@ -3538,6 +3783,7 @@ def boot_attestation(
         r"production_executor_status_path=true conditioned_agent_binds_to_runtime=true "
         r"codex_status_path=true "
         r"production_ui_provider_relay_path=true "
+        r"signed_report_path=true "
         r"normal_triple_release=true lifecycle_marker_active_before_borrow=true "
         r"hold_killed_vaultd=(true|false) helper_binds_to_terminated=(true|false) "
         r"worker_pdeath_cleanup=(true|false) test_trigger_sockets_gone=(true|false) "
