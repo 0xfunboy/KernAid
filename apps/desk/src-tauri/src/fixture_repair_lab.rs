@@ -428,7 +428,7 @@ impl FixtureRepairLab {
             .repair_transactions
             .insert(request.plan_id.clone(), transaction.clone());
 
-        let committed = (|| {
+        let committed: Result<FixtureLabExecuteResponse, String> = (|| {
             let config = FixtureRepairConfig::new(&inner.fixture_root, &inner.backup_root)
                 .map_err(|_| execution_error())?;
             let public_key = inner.identity.public_key();
@@ -642,7 +642,7 @@ impl FixtureRepairLab {
             .rollback_transactions
             .insert(request.plan_id.clone(), transaction.clone());
 
-        let committed = (|| {
+        let committed: Result<FixtureLabRollbackExecuteResponse, String> = (|| {
             let config = FixtureRepairConfig::new(&inner.fixture_root, &inner.backup_root)
                 .map_err(|_| rollback_execution_error())?;
             let public_key = inner.identity.public_key();
