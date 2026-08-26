@@ -190,13 +190,34 @@ def synthetic_log(
 
 
 class CatalogV2Tests(unittest.TestCase):
-    def test_checked_in_catalog_is_empty_and_fails_closed(self) -> None:
-        catalog = catalog_v2.parse_trust_catalog_v2(
-            CATALOG_PATH.read_text(encoding="utf-8")
+    def test_checked_in_catalog_pins_the_qualified_release(self) -> None:
+        catalog_raw = CATALOG_PATH.read_text(encoding="utf-8")
+        catalog_document = json.loads(catalog_raw)
+        schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+        Draft202012Validator.check_schema(schema)
+        Draft202012Validator(schema).validate(catalog_document)
+
+        catalog = catalog_v2.parse_trust_catalog_v2(catalog_raw)
+        self.assertEqual(catalog.revision, 1)
+        self.assertEqual(len(catalog.images), 1)
+        image = catalog.images[0]
+        self.assertEqual(image.artifact_name, "KernAid-Rescue-amd64.iso")
+        self.assertEqual(image.artifact_version, "ci-32925221006-1")
+        self.assertEqual(
+            image.sha256,
+            "7d0ad0dce852381640d613d54d6e82708e27bf254b6c41060c63d736c63b68c0",
         )
-        self.assertEqual(catalog.revision, 0)
-        self.assertEqual(catalog.images, ())
+        self.assertEqual(image.size, 1_221_148_672)
         layout = catalog_v2.load_device_layout(MANIFEST_PATH)
+        self.assertEqual(
+            catalog.authorize(
+                image.artifact_name,
+                image.sha256,
+                image.size,
+                current_layout=layout,
+            ),
+            image,
+        )
         with self.assertRaisesRegex(catalog_v2.CatalogV2Error, "not uniquely authorized"):
             catalog.authorize(
                 "KernAid-Rescue-amd64.iso",

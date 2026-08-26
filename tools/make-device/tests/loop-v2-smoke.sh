@@ -176,21 +176,21 @@ PY
 checksum="$(sha256sum "$iso")"
 checksum="${checksum%% *}"
 iso_size="$(stat --format='%s' "$iso")"
-exec {inactive_fd}< <(printf 'catalog-inactive-fixture')
+exec {untrusted_fd}< <(printf 'catalog-untrusted-fixture')
 set +e
 "$install_dir/make-device-v2.py" \
   --iso "$iso" \
   --sha256 "$checksum" \
   --device /dev/kernaid-must-not-exist \
-  --ci-disposable-loop-token catalog-inactive-fixture \
-  --ci-passphrase-fd "$inactive_fd" \
-  >"$test_dir/inactive.stdout" 2>"$test_dir/inactive.stderr"
-inactive_result="$?"
+  --ci-disposable-loop-token catalog-untrusted-fixture \
+  --ci-passphrase-fd "$untrusted_fd" \
+  >"$test_dir/untrusted.stdout" 2>"$test_dir/untrusted.stderr"
+untrusted_result="$?"
 set -e
-exec {inactive_fd}<&-
-if [[ "$inactive_result" -ne 3 ]] || \
-  ! grep -Fq 'catalog v2 is inactive' "$test_dir/inactive.stderr"; then
-  echo "Root-owned bundle did not fail closed on the empty shipping catalog" >&2
+exec {untrusted_fd}<&-
+if [[ "$untrusted_result" -ne 3 ]] || \
+  ! grep -Fq 'not uniquely authorized' "$test_dir/untrusted.stderr"; then
+  echo "Root-owned bundle did not reject an image absent from the shipping catalog" >&2
   exit 1
 fi
 

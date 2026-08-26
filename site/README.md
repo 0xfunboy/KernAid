@@ -68,12 +68,14 @@ start, so restart `kaid-site.service` after changing release metadata or the
 configured artifact path.
 
 Do not soften the warning based only on the existence of a workflow artifact.
-For the current `e9340bb` candidate, hybrid ISO, ordinary BIOS/UEFI QEMU smoke,
-USB-style two-boot and persistent-vault evidence exist. Both final privileged
-lifecycle jobs fail at the local Codex status bridge, and the trusted v2
-catalog is empty. It is not a release. Its private availability is limited to
+For the current `ba33828` candidate, the hybrid ISO, ordinary BIOS/UEFI QEMU
+smoke, USB-style two-boot and both privileged persistent-vault lifecycle jobs
+passed on the same exact artifact. Its locally re-derived entry matched the CI
+artifact and trusted catalog v2 revision 1 now authorizes only that image. It
+is still not a production release: private availability is limited to
 controlled first-boot qualification on factory-new or disposable USB and
-non-customer hardware.
+non-customer hardware until physical USB, Secure Boot and real-account/TLS
+gates are recorded.
 
 ## Local validation
 

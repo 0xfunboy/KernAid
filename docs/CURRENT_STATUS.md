@@ -63,29 +63,31 @@ treated as a newer release.
 - Rescue provider login with a real account, live TLS and physical encrypted
   persistence are incomplete release gates.
 - The v2 USB writer can copy, verify and provision an exact catalog-authorized
-  image, but the current v2 catalog is empty and rejects the private candidate.
+  image. Catalog revision 1 authorizes only the exact internally qualified
+  candidate documented below; this is not physical-hardware qualification.
 - Hardware and firmware support claims still require physical test evidence.
 
 ## Build and ISO status
 
 The private project area serves one controlled physical-qualification
 candidate built from commit
-[`e9340bbe98fa73a0398cde12010a260b3a7951af`](https://github.com/0xfunboy/KernAid/commit/e9340bbe98fa73a0398cde12010a260b3a7951af):
+[`ba338287b58b3692afc5b1765e3264e261071bc1`](https://github.com/0xfunboy/KernAid/commit/ba338287b58b3692afc5b1765e3264e261071bc1):
 
 | Field | Exact value |
 | --- | --- |
-| Artifact version | `ci-32915064704-1` |
+| Artifact version | `ci-32925221006-1` |
 | Size | `1,221,148,672` bytes |
-| SHA-256 | `f89e4cc59465268d857d6d13b3ec5884112b1d432e990f02cfe7e520875f0ecb` |
-| Workflow | [Rescue run 32915064704](https://github.com/0xfunboy/KernAid/actions/runs/32915064704) |
+| SHA-256 | `7d0ad0dce852381640d613d54d6e82708e27bf254b6c41060c63d736c63b68c0` |
+| Workflow | [Rescue run 32925221006](https://github.com/0xfunboy/KernAid/actions/runs/32925221006) |
 
 That run successfully built the hybrid ISO, validated shipping binaries and
 SBOM, passed ordinary BIOS/UEFI QEMU smoke, and passed the BIOS/UEFI two-boot
 USB-style layout and persistent LUKS2/ext4 vault checks with byte-identical
-disposable targets. Both final privileged lifecycle jobs failed at the local
-Codex status bridge (`provider-proof / codex-status-transport`). Therefore the
-workflow is red, the trusted v2 catalog remains at revision zero with no
-authorized images, and this artifact is **not a release**.
+disposable targets. Both final privileged lifecycle jobs also passed the
+bounded Codex offline signed-out path on the same artifact. The exact locally
+re-derived catalog entry matched the workflow artifact and is now the sole
+image authorized by trusted catalog v2 revision 1. This is an **internally and
+virtually qualified candidate**, not a production release.
 
 The candidate is exposed privately only to unblock the first physical boot
 test. On Windows, verify the exact checksum and use Rufus in DD mode on a
@@ -95,19 +97,15 @@ provisioning or as a supported repair medium.
 
 ## Immediate next gates
 
-1. Fix the bounded local Codex status bridge and get both privileged
-   vault-lifecycle jobs green on the same revision.
-2. Promote one exact ISO into the trusted catalog only after its full
-   virtual qualification succeeds.
-3. Boot that exact image from physical USB on a small hardware matrix and
+1. Boot that exact image from physical USB on a small hardware matrix and
    record firmware, storage, network and UI evidence.
-4. Finish the real-account Rescue provider/vault lifecycle without exposing or
+2. Finish the real-account Rescue provider/vault lifecycle without exposing or
    copying the CLI credential store.
-5. Define the first production repair action with typed preconditions, backup,
+3. Qualify Secure Boot and signed release delivery.
+4. Define the first production repair action with typed preconditions, backup,
    explicit approval, verification and rollback; keep it disabled until the
    complete safety case passes.
-6. Add signing/notarization and a repeatable release channel for Desk and
-   Rescue artifacts.
+5. Add a repeatable release channel for Desk and Rescue artifacts.
 
 ## Where to look
 

@@ -6,17 +6,16 @@ unattended repair until those release gates are completed.
 
 ## Create the Rescue USB
 
-There is currently no catalog-authorized physical release. The private project
-area exposes one exact candidate from commit `e9340bb` only to collect the
-first physical-boot evidence. Its exact version, size, workflow and SHA-256 are
-recorded in `CURRENT_STATUS.md`; do not substitute another Actions artifact or
-an image from a mirror.
+There is currently no physically qualified release. The private project area
+exposes one exact internally qualified candidate from commit `ba33828` to
+collect the first physical-boot evidence. Its exact version, size, workflow
+and SHA-256 are recorded in `CURRENT_STATUS.md`; do not substitute another
+Actions artifact or an image from a mirror.
 
-The checked-in trusted v2 catalog is empty. Consequently the Linux v2 writer
-correctly rejects this candidate and encrypted-vault provisioning is suspended
-until a complete Rescue workflow passes and one exact ISO is reviewed and
-promoted. The Windows procedure below is deliberately a raw boot test, not the
-trusted provisioning flow.
+Trusted catalog v2 revision 1 authorizes only this exact ISO after its complete
+virtual BIOS/UEFI workflow passed. The Linux v2 writer can therefore verify,
+copy and provision its encrypted vault. The Windows procedure below remains a
+raw physical boot test and does not perform trusted vault provisioning.
 
 The Rescue build target is amd64 legacy BIOS and UEFI. Its boot evidence is
 QEMU-only; physical PCs, firmware and USB media are unqualified. It
@@ -33,7 +32,7 @@ catalog and does not create or qualify the encrypted persistent vault.
    the image-sized bootable prefix, but residual tail data may remain
    recoverable; this procedure is not media sanitization.
 2. Verify the downloaded ISO in PowerShell with
-   `Get-FileHash .\KernAid-Rescue-amd64-e9340bb-internal.iso -Algorithm SHA256`
+   `Get-FileHash .\KernAid-Rescue-amd64-ba33828-internal.iso -Algorithm SHA256`
    and compare the complete digest with the downloaded `.sha256` file and the
    exact value in `CURRENT_STATUS.md`.
 3. Write that exact ISO with Rufus. If Rufus asks between ISO and DD modes,
@@ -47,8 +46,7 @@ catalog and does not create or qualify the encrypted persistent vault.
 
 Rufus is preferred over balenaEtcher for this Windows qualification procedure
 because it exposes the target and DD-mode choice clearly. The Linux v2 writer
-becomes the vault-provisioning path only after the catalog contains a promoted
-image.
+is the catalog-bound vault-provisioning path for this exact promoted image.
 
 ## Diagnose from Rescue
 
@@ -119,9 +117,9 @@ KernAid validates only file metadata and never reads, copies, prints, or places
 that file in reports. Operations are one-shot and bounded; locking/stopping the
 vault revokes the complete service cgroup. A successful real-account device
 login, provider terms/entitlement, outbound authentication connectivity, and
-physical-media behavior remain external release gates. The automated QEMU gate
-uses the real pinned CLI only for offline signed-out status and does not create
-an account session.
+physical-media behavior remain external release gates. The automated BIOS and
+UEFI lifecycle gates passed the real pinned CLI's offline signed-out status
+path and do not create an account session.
 
 ## Diagnose a running operating system
 
@@ -175,12 +173,11 @@ release gates.
 
 The supported workshop procedure in this section is Resident-only. Rescue
 contains feature-gated persistent-vault OpenAI plumbing and a loopback
-UI-server relay, but an exact revision is virtually qualified only after the
-full Rescue workflow passes, including both privileged BIOS and UEFI lifecycle
-jobs. The v2 writer is implemented, but the empty trusted catalog prevents it
-from authorizing the current candidate. Physical media and live provider TLS
-with a real account are still not qualified. Do not present Rescue OpenAI as
-supported on customer media yet. The Resident credential companion
+UI-server relay. The current exact candidate passed the full virtual workflow,
+including both privileged BIOS and UEFI lifecycle jobs, and trusted catalog v2
+revision 1 authorizes that ISO. Physical media and live provider TLS with a
+real account are still not qualified. Do not present Rescue OpenAI as supported
+on customer media yet. The Resident credential companion
 is not included in the desktop installer and is not added to `PATH`. From the
 same successful Desktop workflow run, download and extract
 the outer GitHub artifact matching the installed Desk build:
