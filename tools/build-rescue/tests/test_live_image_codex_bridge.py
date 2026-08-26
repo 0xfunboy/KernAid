@@ -19,6 +19,7 @@ HOOK = REPO / "rescue/live-build/config/hooks/live/0100-kernaid-safety.hook.chro
 BUILD = REPO / "tools/build-rescue/build.sh"
 WORKFLOW = REPO / ".github/workflows/rescue.yml"
 BRIDGE = REPO / "crates/rescue-codex-bridge/src/linux.rs"
+MOUNTER = REPO / "crates/rescue-secrets/src/rescue_daemon/codex_mounter.rs"
 WRITER = REPO / "tools/make-device/make_device_v2.py"
 LOCK = REPO / "rescue/codex/codex-cli.lock.json"
 
@@ -115,6 +116,9 @@ class ShippingCodexBridgeTests(unittest.TestCase):
         self.assertNotIn("ProcSubset", service)
         self.assertNotIn("PrivatePIDs", service)
         self.assertNotIn("RestrictSUIDSGID", service)
+        source = MOUNTER.read_text(encoding="utf-8")
+        self.assertIn("OpenTreeFlags::OPEN_TREE_CLONE", source)
+        self.assertIn("MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH", source)
 
     def test_identity_and_readiness_are_exact(self) -> None:
         sysusers = SYSUSERS.read_text(encoding="utf-8")

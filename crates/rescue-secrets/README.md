@@ -490,9 +490,10 @@ command primitive.
 
 ## Remaining production gates
 
-- replace the current private-namespace pathname mount attachment with a
-  descriptor-based attachment (`open_tree`/`move_mount` or an equivalent
-  design);
+The Codex home broker now clones the validated home as a detached mount in the
+vault namespace and transfers it with `open_tree`/`move_mount`; no foreign
+namespace pathname is used. Remaining gates are to:
+
 - define and test restart recovery for an interrupted process and mappings or
   mounts visible in other namespaces;
 - exercise crash windows, additional-holder races, and real hardware in the

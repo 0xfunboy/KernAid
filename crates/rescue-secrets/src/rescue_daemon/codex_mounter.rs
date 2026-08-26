@@ -1,8 +1,8 @@
 //! Root-only, socket-activated broker for one Codex-home bind mount.
 //!
 //! The protocol has one request, one acknowledgement, no caller-supplied path,
-//! and exactly three descriptors: the already validated vault home plus the
-//! requesting bridge's mount namespace and root.
+//! and exactly three descriptors: a detached clone of the validated vault
+//! home plus the requesting bridge's mount namespace and root.
 
 use super::{
     RescueVaultDaemonError, enforce_process_privacy, internal_wire,
@@ -10,7 +10,6 @@ use super::{
         drop_codex_mounter_chroot_capability, normalize_codex_mounter_capabilities,
         verify_codex_mounter_mount_capability,
     },
-    server::validate_codex_home_handoff,
 };
 use kernaid_linux_nsfs::{NamespaceType, namespace_type, owner_user_namespace};
 use kernaid_protocol::rescue_vault::{
@@ -24,13 +23,12 @@ use rustix::{
     event::{PollFd, PollFlags, Timespec, poll},
     fd::{AsFd, BorrowedFd, OwnedFd},
     fs::{self as rfs, AtFlags, FileType, Mode, OFlags, ResolveFlags, StatxFlags},
-    mount::{MountFlags, UnmountFlags},
+    mount::{MountFlags, MoveMountFlags, OpenTreeFlags, UnmountFlags},
     net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType, connect, socket_with},
 };
 use std::{
     fs::File,
     io::Read,
-    os::fd::AsRawFd,
     time::{Duration, Instant},
 };
 
@@ -53,6 +51,10 @@ pub(super) fn mount_codex_home(
     mount_root: BorrowedFd<'_>,
     deadline: Instant,
 ) -> Result<(), RescueVaultDaemonError> {
+    // Clone the home while the vault mount is still present in this namespace.
+    // The detached mount descriptor can cross SCM_RIGHTS and mount namespaces;
+    // a pathname through /proc/self/fd cannot safely do that.
+    let detached_home = clone_codex_home(home)?;
     let deadline = deadline.min(
         Instant::now()
             .checked_add(HELPER_TIMEOUT)
@@ -81,7 +83,7 @@ pub(super) fn mount_codex_home(
     internal_wire::send_record(
         socket.as_fd(),
         REQUEST,
-        &[home, mount_namespace, mount_root],
+        &[detached_home.as_fd(), mount_namespace, mount_root],
         deadline,
     )
     .map_err(|_| RescueVaultDaemonError::ProtocolFailure)?;
@@ -123,10 +125,10 @@ pub fn run_rescue_codex_mounter() -> Result<(), RescueVaultDaemonError> {
     let mount_namespace = descriptors
         .pop()
         .ok_or(RescueVaultDaemonError::ProtocolFailure)?;
-    let home = descriptors
+    let detached_home = descriptors
         .pop()
         .ok_or(RescueVaultDaemonError::ProtocolFailure)?;
-    validate_codex_home_handoff(&home)?;
+    validate_detached_codex_home(&detached_home)?;
     validate_mount_namespace_descriptor(mount_namespace.as_fd())
         .map_err(|_| RescueVaultDaemonError::ProtocolFailure)?;
     validate_mount_root(&mount_root)?;
@@ -145,9 +147,14 @@ pub fn run_rescue_codex_mounter() -> Result<(), RescueVaultDaemonError> {
 
     let target = open_and_validate_empty_target()?;
     let pre_mount_id = descriptor_mount_id(&target)?;
-    let source = format!("/proc/self/fd/{}", home.as_raw_fd());
-    rustix::mount::mount_bind(&source, CODEX_HOME_TARGET)
-        .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+    rustix::mount::move_mount(
+        &detached_home,
+        "",
+        rfs::CWD,
+        CODEX_HOME_TARGET,
+        MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
+    )
+    .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
     let mut mounted = MountedTarget { armed: true };
     rustix::mount::mount_remount(
         CODEX_HOME_TARGET,
@@ -160,8 +167,8 @@ pub fn run_rescue_codex_mounter() -> Result<(), RescueVaultDaemonError> {
     )
     .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
 
-    validate_mounted_target(&home, pre_mount_id)?;
-    validate_codex_home_handoff(&home)?;
+    validate_mounted_target(&detached_home, pre_mount_id)?;
+    validate_detached_codex_home(&detached_home)?;
     validate_vaultd_peer(socket.as_fd())?;
     validate_live_pidfd(peer_pidfd.as_fd())?;
     verify_codex_mounter_mount_capability()?;
@@ -252,6 +259,46 @@ fn validate_vaultd_peer(socket: BorrowedFd<'_>) -> Result<(), RescueVaultDaemonE
     )?;
     if cgroup != VAULTD_CGROUP {
         return Err(RescueVaultDaemonError::InvalidListener);
+    }
+    Ok(())
+}
+
+fn clone_codex_home(home: BorrowedFd<'_>) -> Result<OwnedFd, RescueVaultDaemonError> {
+    let source = rfs::fstat(home).map_err(|_| RescueVaultDaemonError::ProtocolFailure)?;
+    let detached = rustix::mount::open_tree(
+        home,
+        "",
+        OpenTreeFlags::OPEN_TREE_CLONE
+            | OpenTreeFlags::OPEN_TREE_CLOEXEC
+            | OpenTreeFlags::AT_EMPTY_PATH
+            | OpenTreeFlags::AT_NO_AUTOMOUNT
+            | OpenTreeFlags::AT_SYMLINK_NOFOLLOW,
+    )
+    .map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+    validate_detached_codex_home(&detached)?;
+    let cloned = rfs::fstat(&detached).map_err(|_| RescueVaultDaemonError::RuntimeUnavailable)?;
+    if (source.st_dev, source.st_ino) != (cloned.st_dev, cloned.st_ino) {
+        return Err(RescueVaultDaemonError::RuntimeUnavailable);
+    }
+    Ok(detached)
+}
+
+fn validate_detached_codex_home(home: &OwnedFd) -> Result<(), RescueVaultDaemonError> {
+    let stat = rfs::fstat(home).map_err(|_| RescueVaultDaemonError::ProtocolFailure)?;
+    let filesystem = rfs::fstatfs(home).map_err(|_| RescueVaultDaemonError::ProtocolFailure)?;
+    let status = rfs::fcntl_getfl(home).map_err(|_| RescueVaultDaemonError::ProtocolFailure)?;
+    let flags =
+        rustix::io::fcntl_getfd(home).map_err(|_| RescueVaultDaemonError::ProtocolFailure)?;
+    if !FileType::from_raw_mode(stat.st_mode).is_dir()
+        || stat.st_nlink < 2
+        || stat.st_uid != crate::CODEX_AGENT_UID
+        || stat.st_gid != crate::CODEX_AGENT_GID
+        || stat.st_mode & 0o7777 != 0o700
+        || u64::try_from(filesystem.f_type).ok() != Some(EXT4_SUPER_MAGIC)
+        || status != OFlags::PATH
+        || flags != rustix::io::FdFlags::CLOEXEC
+    {
+        return Err(RescueVaultDaemonError::ProtocolFailure);
     }
     Ok(())
 }
@@ -555,6 +602,13 @@ mod tests {
         assert!(!mountinfo_has_secure_target(stacked, 42, b"ext4"));
         let too_many = [stacked.as_slice(), valid.as_slice()].concat();
         assert!(!mountinfo_has_secure_target(&too_many, 41, b"ext4"));
+    }
+
+    #[test]
+    fn detached_mount_protocol_is_descriptor_only() {
+        let source = include_str!("codex_mounter.rs");
+        assert!(source.contains("OpenTreeFlags::OPEN_TREE_CLONE"));
+        assert!(source.contains("MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH"));
     }
 
     #[test]
