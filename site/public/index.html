@@ -3,155 +3,307 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="KernAid è una piattaforma evidence-first per diagnosticare sistemi, proporre interventi verificabili e preservare i dati dell'utente.">
-  <meta name="theme-color" content="#0b0f0e">
-  <title>KernAid — Diagnose. Repair. Verify.</title>
+  <meta name="description" content="KernAid trasforma evidenze di sistema in diagnosi tracciabili e interventi controllati, dentro il sistema operativo o da ambiente Rescue.">
+  <meta name="theme-color" content="#07100d">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="KernAid">
+  <meta property="og:title" content="KernAid — Evidence-first system recovery">
+  <meta property="og:description" content="Capire cosa è successo. Sapere cosa cambierà. Verificare che abbia funzionato.">
+  <meta property="og:url" content="https://kaid.funboy.eu.cc/">
+  <link rel="canonical" href="https://kaid.funboy.eu.cc/">
+  <title>KernAid — Evidence-first system recovery</title>
   <link rel="icon" href="/mark.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/styles.css">
 </head>
-<body>
-  <header class="site-header">
+<body class="public-body">
+  <a class="skip-link" href="#main">Vai al contenuto</a>
+
+  <div class="preview-bar">
+    <div>
+      <span class="live-dot" aria-hidden="true"></span>
+      <strong>Engineering preview</strong>
+      <span>Il percorso pubblico è oggi diagnostico e read-only.</span>
+    </div>
+    <a href="#status">Stato verificato <span aria-hidden="true">↗</span></a>
+  </div>
+
+  <header class="site-header public-header">
     <a class="brand" href="/" aria-label="KernAid home">
       <img src="/mark.svg" alt="" width="42" height="42">
       <span>KernAid</span>
     </a>
     <nav aria-label="Navigazione principale">
-      <a href="#prodotto">Prodotto</a>
-      <a href="#stato">Stato</a>
-      <a href="https://github.com/0xfunboy/KernAid/blob/main/docs/PROJECT_MAP.md" target="_blank" rel="noreferrer">Mappa</a>
-      <a href="https://github.com/0xfunboy/KernAid" target="_blank" rel="noreferrer">GitHub</a>
-      <a class="nav-cta" href="/private/">Area riservata</a>
+      <a href="#platform">Piattaforma</a>
+      <a href="#products">Prodotti</a>
+      <a href="#enterprise">Enterprise</a>
+      <a href="#security">Sicurezza</a>
+      <a href="#status">Stato</a>
+      <a class="nav-cta" href="/private/">Area riservata <span aria-hidden="true">↗</span></a>
     </nav>
   </header>
 
-  <main>
-    <section class="hero" aria-labelledby="hero-title">
+  <main id="main">
+    <section class="hero commercial-hero" aria-labelledby="hero-title">
       <div class="hero-copy">
-        <p class="eyebrow"><span></span> Phase 0 · Engineering preview</p>
-        <h1 id="hero-title">Capire prima.<br><em>Intervenire con prove.</em></h1>
-        <p class="lede">KernAid raccoglie evidenze tecniche, costruisce una diagnosi tracciabile e prepara interventi controllati. Ogni decisione resta verificabile; i dati dell'utente vengono prima della velocità.</p>
+        <p class="eyebrow"><span></span> Evidence-first machine operations</p>
+        <h1 id="hero-title">Ogni intervento tecnico dovrebbe lasciare <em>una prova.</em></h1>
+        <p class="lede">KernAid raccoglie evidenze, costruisce diagnosi tracciabili e prepara interventi controllati su workstation e sistemi che non si avviano. Una sola disciplina operativa, dentro il sistema o da ambiente Rescue.</p>
         <div class="hero-actions">
-          <a class="button primary" href="#prodotto">Scopri KernAid</a>
-          <a class="button ghost" href="https://github.com/0xfunboy/KernAid" target="_blank" rel="noreferrer">Esplora il codice <span aria-hidden="true">↗</span></a>
+          <a class="button primary" href="#platform">Scopri la piattaforma <span aria-hidden="true">↓</span></a>
+          <a class="button ghost" href="#enterprise">KernAid per i team</a>
+        </div>
+        <div class="hero-footnote">
+          <span>Read-only by default</span>
+          <span>BYO AI provider</span>
+          <span>Audit verificabile</span>
         </div>
       </div>
-      <aside class="principle" aria-label="Principio di sicurezza KernAid">
-        <p class="card-kicker">Principio operativo</p>
-        <blockquote>Il modello propone.<br>La policy decide.<br>Il sistema verifica.</blockquote>
-        <div class="signal-row">
-          <span><i class="signal green"></i> Evidence-first</span>
-          <span><i class="signal blue"></i> Local approval</span>
+
+      <div class="product-window" aria-label="Anteprima concettuale dell'interfaccia KernAid">
+        <div class="window-topbar">
+          <div class="window-dots" aria-hidden="true"><i></i><i></i><i></i></div>
+          <span>Sessione diagnostica</span>
+          <span class="mode-pill">Resident · Read-only</span>
         </div>
-      </aside>
+        <div class="window-grid">
+          <aside class="machine-rail">
+            <p class="ui-label">Target</p>
+            <div class="machine-identity">
+              <span class="machine-icon">K</span>
+              <div><strong>WORKSTATION-07</strong><small>Windows · UEFI</small></div>
+            </div>
+            <ul class="rail-list">
+              <li class="active"><span>Overview</span><b>12</b></li>
+              <li><span>Storage</span><b>4</b></li>
+              <li><span>Boot</span><b>6</b></li>
+              <li><span>Network</span><b>2</b></li>
+            </ul>
+            <div class="target-state"><i></i><span>Target protetto<br><small>Nessuna scrittura</small></span></div>
+          </aside>
+          <div class="evidence-pane">
+            <div class="pane-heading">
+              <div><p class="ui-label">Evidence graph</p><strong>Analisi del sistema</strong></div>
+              <span class="verified-tag">12 evidenze</span>
+            </div>
+            <div class="diagnosis-card">
+              <div class="diagnosis-icon">⌁</div>
+              <div>
+                <span>Ipotesi supportata</span>
+                <strong>Configurazione di avvio incoerente</strong>
+                <p>La conclusione resta separata dai fatti osservati e collegata alle fonti.</p>
+              </div>
+            </div>
+            <div class="evidence-lines" aria-hidden="true">
+              <span class="line-88"></span><span class="line-72"></span><span class="line-94"></span>
+            </div>
+            <div class="evidence-row"><span><i class="cyan-dot"></i> Firmware mode</span><strong>UEFI</strong></div>
+            <div class="evidence-row"><span><i class="lime-dot"></i> Target policy</span><strong>Read-only</strong></div>
+          </div>
+          <aside class="plan-rail">
+            <div><p class="ui-label">Piano controllato</p><strong>3 passaggi</strong></div>
+            <ol>
+              <li class="complete"><span>1</span><div><strong>Osserva</strong><small>Evidenze acquisite</small></div></li>
+              <li class="current"><span>2</span><div><strong>Diagnostica</strong><small>Verifica delle cause</small></div></li>
+              <li><span>3</span><div><strong>Proponi</strong><small>In attesa di policy</small></div></li>
+            </ol>
+            <div class="policy-box"><span>Policy decision</span><strong>Scritture bloccate</strong></div>
+          </aside>
+        </div>
+      </div>
     </section>
 
-    <section class="section" id="prodotto" aria-labelledby="product-title">
-      <div class="section-intro">
-        <p class="eyebrow">Un progetto, due ambienti</p>
-        <h2 id="product-title">La stessa disciplina, sia dentro il sistema sia fuori.</h2>
-        <p>KernAid separa interfaccia, raccolta delle evidenze, ragionamento e privilegi. Nessun provider può raggiungere direttamente il broker delle operazioni.</p>
+    <section class="trust-strip" aria-label="Principi KernAid">
+      <div><strong>01</strong><span>Fatti e inferenze<br>restano separati</span></div>
+      <div><strong>02</strong><span>Il modello non riceve<br>una shell privilegiata</span></div>
+      <div><strong>03</strong><span>Ogni azione futura<br>richiede approvazione</span></div>
+      <div><strong>04</strong><span>Provider e credenziali<br>restano del cliente</span></div>
+    </section>
+
+    <section class="section platform-section" id="platform" aria-labelledby="platform-title">
+      <div class="section-heading split-heading">
+        <div>
+          <p class="eyebrow">Una nuova disciplina operativa</p>
+          <h2 id="platform-title">Capire cosa è successo.<br>Sapere cosa cambierà.</h2>
+        </div>
+        <p>KernAid porta raccolta delle evidenze, ragionamento, policy e privilegi dentro confini distinti. Il risultato è un processo tecnico leggibile prima, durante e dopo ogni intervento.</p>
       </div>
-      <div class="product-grid">
-        <article class="product-card">
-          <span class="product-number">01</span>
-          <div>
-            <p class="card-kicker">Sistema avviabile</p>
+
+      <div class="workflow-map" aria-label="Workflow KernAid">
+        <article><span>01</span><i></i><h3>Observe</h3><p>Raccoglie soltanto segnali tipizzati, delimitati e con provenienza.</p></article>
+        <article><span>02</span><i></i><h3>Diagnose</h3><p>Collega ogni conclusione alle evidenze che la sostengono.</p></article>
+        <article><span>03</span><i></i><h3>Plan</h3><p>Dichiara impatto, rischio, precondizioni e strategia di ritorno.</p></article>
+        <article><span>04</span><i></i><h3>Approve</h3><p>Lascia la decisione locale alla persona e alle policy del team.</p></article>
+        <article><span>05</span><i></i><h3>Verify</h3><p>Misura l'esito e conserva una traccia verificabile della sessione.</p></article>
+      </div>
+
+      <div class="principle-banner">
+        <p class="card-kicker">Il confine che conta</p>
+        <blockquote>Il provider propone. <em>La policy decide.</em> Il sistema verifica.</blockquote>
+        <span>KernAid Core</span>
+      </div>
+    </section>
+
+    <section class="section products-section" id="products" aria-labelledby="products-title">
+      <div class="section-heading">
+        <p class="eyebrow">Un prodotto, due modalità</p>
+        <h2 id="products-title">La stessa interfaccia.<br>Due punti di accesso alla macchina.</h2>
+        <p>Dalla workstation ancora operativa al computer che non completa più l'avvio, KernAid conserva lo stesso modello di evidenza e controllo.</p>
+      </div>
+
+      <div class="product-showcase">
+        <article class="mode-card desk-card">
+          <div class="mode-card-top">
+            <span class="index">01 / Resident</span>
+            <span class="stage-badge preview">Preview disponibile</span>
+          </div>
+          <div class="mode-visual desk-visual" aria-hidden="true">
+            <div class="device-screen">
+              <div class="mini-sidebar"><i></i><i></i><i></i><i></i></div>
+              <div class="mini-content"><span></span><strong></strong><i></i><i></i><i></i></div>
+              <div class="mini-plan"><span></span><i></i><i></i><i></i></div>
+            </div>
+            <div class="os-row"><span>WIN</span><span>LNX</span><span>MAC</span></div>
+          </div>
+          <div class="mode-copy">
+            <p class="card-kicker">Per sistemi operativi avviabili</p>
             <h3>KernAid Desk</h3>
-            <p>Applicazione nativa per Windows, Linux e macOS. Osserva il sistema tramite comandi tipizzati e produce un report verificabile.</p>
+            <p>La diagnostica vive dove lavora il sistema. Un'applicazione nativa per raccogliere evidenze normalizzate, distinguere fatti e inferenze e produrre report verificabili.</p>
+            <ul class="feature-list">
+              <li>Snapshot e inventario read-only</li>
+              <li>Diagnostica offline deterministica</li>
+              <li>Reasoning OpenAI opzionale in modalità Resident</li>
+              <li>Piano R0 e report JSON con hash</li>
+            </ul>
+            <div class="card-footer-note"><span>Windows</span><span>Linux</span><span>macOS</span><small>Build engineering non firmate</small></div>
           </div>
-          <span class="availability">Engineering builds</span>
         </article>
-        <article class="product-card accent-card">
-          <span class="product-number">02</span>
-          <div>
-            <p class="card-kicker">Sistema non avviabile</p>
+
+        <article class="mode-card rescue-card">
+          <div class="mode-card-top">
+            <span class="index">02 / Bootable</span>
+            <span class="stage-badge qualify">Candidato interno</span>
+          </div>
+          <div class="mode-visual rescue-visual" aria-hidden="true">
+            <div class="rescue-drive"><img src="/mark.svg" alt=""><span>KERNAID</span><small>RESCUE / AMD64</small></div>
+            <div class="boot-lines"><span>UEFI</span><i></i><span>READ ONLY</span></div>
+          </div>
+          <div class="mode-copy">
+            <p class="card-kicker">Per sistemi che non si avviano</p>
             <h3>KernAid Rescue</h3>
-            <p>Ambiente amd64 ibrido BIOS/UEFI per ispezionare in sola lettura le installazioni candidate supportate dal collector, senza trasformare l'incertezza in una diagnosi.</p>
+            <p>Un ambiente indipendente per osservare hardware, storage, boot e installazioni candidate senza affidarsi al sistema compromesso.</p>
+            <ul class="feature-list">
+              <li>Immagine ibrida BIOS/UEFI qualificata in QEMU</li>
+              <li>Target supportati mantenuti in sola lettura</li>
+              <li>Vault cifrato e identità del dispositivo</li>
+              <li>Report firmati, persistenti ed esportabili</li>
+            </ul>
+            <div class="card-footer-note"><span>AMD64</span><span>BIOS</span><span>UEFI</span><small>Qualifica fisica ancora aperta</small></div>
           </div>
-          <span class="availability warning-label">Lab only</span>
         </article>
       </div>
     </section>
 
-    <section class="section workflow" aria-labelledby="workflow-title">
-      <div class="section-intro compact">
-        <p class="eyebrow">Metodo</p>
-        <h2 id="workflow-title">Diagnose. Repair. Verify.</h2>
+    <section class="section enterprise-section" id="enterprise" aria-labelledby="enterprise-title">
+      <div class="enterprise-intro">
+        <div>
+          <p class="eyebrow">KernAid Enterprise</p>
+          <h2 id="enterprise-title">Dalla bravura del singolo a un processo tecnico ripetibile.</h2>
+        </div>
+        <div class="enterprise-copy">
+          <p>Per MSP, service desk e team IT, la qualità non può dipendere soltanto da chi prende in carico il ticket. KernAid è progettato per rendere diagnosi, approvazioni e recovery coerenti tra tecnici, sedi e dispositivi.</p>
+          <span class="stage-badge roadmap">Fleet &amp; Enterprise · Design partner program</span>
+        </div>
       </div>
-      <ol class="steps">
-        <li>
-          <span>01</span>
-          <h3>Osserva</h3>
-          <p>Snapshot normalizzati e letture limitate producono evidenze con provenienza esplicita.</p>
-        </li>
-        <li>
-          <span>02</span>
-          <h3>Decidi</h3>
-          <p>Regole locali o provider opzionali propongono una diagnosi; Core valida un piano tipizzato.</p>
-        </li>
-        <li>
-          <span>03</span>
-          <h3>Verifica</h3>
-          <p>Nel modello completo, approvazione, precondizioni, backup, controllo e rollback restano nello stesso flusso. Oggi le scritture vivono soltanto nel laboratorio R2 su fixture temporanee.</p>
-        </li>
-      </ol>
+
+      <div class="enterprise-grid">
+        <article><span class="enterprise-icon">P</span><h3>Policy operative</h3><p>Livelli di rischio, permessi e soglie di approvazione condivisi dal team.</p></article>
+        <article><span class="enterprise-icon">R</span><h3>Repair pack firmati</h3><p>Procedure versionate con precondizioni, backup, verifica e rollback dichiarati.</p></article>
+        <article><span class="enterprise-icon">A</span><h3>Audit per sessione</h3><p>Una traccia leggibile di evidenze, decisioni, autorizzazioni ed esiti.</p></article>
+        <article><span class="enterprise-icon">F</span><h3>Fleet governance</h3><p>Profili, rollout e visibilità centralizzata, senza rimuovere il controllo locale.</p></article>
+      </div>
+
+      <div class="business-model">
+        <div class="business-heading">
+          <div><p class="card-kicker">Modello commerciale</p><h3>Valore operativo, non rivendita di token.</h3></div>
+          <p>Il modello è in validazione con tecnici e design partner. Il ricavo ricorrente deriva da immagini qualificate, compatibilità, repair pack, audit e governance. L'utilizzo del provider AI resta sul contratto del cliente.</p>
+        </div>
+        <div class="offer-grid">
+          <article><div><span>Professional</span><small>Licenza per tecnico</small></div><h4>KernAid Pro</h4><p>Desk, aggiornamenti, report e catalogo dei repair pack verificati.</p><strong>Abbonamento per seat</strong></article>
+          <article class="featured-offer"><div><span>Field kit</span><small>Hardware + software</small></div><h4>KernAid One</h4><p>Supporto SSD qualificato con Rescue, vault cifrato e workspace tecnico.</p><strong>Acquisto device + Pro</strong></article>
+          <article><div><span>Organization</span><small>MSP &amp; IT</small></div><h4>KernAid Fleet</h4><p>Policy, ruoli, audit, distribuzione controllata e supporto concordato.</p><strong>Contratto annuale</strong></article>
+        </div>
+        <div class="byo-note"><strong>BYO provider.</strong><span>OpenAI, provider compatibili e futuri adapter restano separati dalla licenza KernAid: nessun account consumer condiviso, nessun token estratto o rivenduto.</span></div>
+      </div>
     </section>
 
-    <section class="section status-section" id="stato" aria-labelledby="status-title">
-      <div class="section-intro">
-        <p class="eyebrow">Stato del progetto</p>
-        <h2 id="status-title">Fondamenta di sicurezza attive. Prodotto ancora in qualifica.</h2>
-        <p>La Phase 0 dimostra il percorso di diagnosi senza scritture di produzione. Le funzioni non provate restano dichiarate come non qualificate.</p>
+    <section class="section security-section" id="security" aria-labelledby="security-title">
+      <div class="section-heading split-heading">
+        <div><p class="eyebrow">Security by architecture</p><h2 id="security-title">L'intelligenza non coincide con il privilegio.</h2></div>
+        <p>KernAid tratta output, log e contenuti osservati come dati non attendibili. Il provider può ragionare sulle evidenze, ma non può raggiungere direttamente il broker delle operazioni.</p>
       </div>
-      <div class="status-grid">
-        <article class="status-card done">
-          <p class="card-kicker"><i class="signal green"></i> Disponibile nel prototipo</p>
-          <ul>
-            <li>Inventario normalizzato e raccolta read-only</li>
-            <li>Regole diagnostiche offline deterministiche</li>
-            <li>Piano R0 validato e report JSON con hash</li>
-            <li>Laboratorio R2 reversibile su fixture temporanea</li>
-            <li>Build Desk multipiattaforma non firmate</li>
-            <li>Smoke Rescue virtuali BIOS/UEFI in QEMU</li>
-            <li>Report Rescue firmato, persistito ed esportato dal Vault in QEMU</li>
-          </ul>
-        </article>
-        <article class="status-card next">
-          <p class="card-kicker"><i class="signal amber"></i> Release gate</p>
-          <ul>
-            <li>Qualifica su USB e hardware fisico</li>
-            <li>Secure Boot e catena di rilascio</li>
-            <li>Firma e notarizzazione degli installer</li>
-            <li>Qualifica del vault su USB fisica e account reale</li>
-            <li>Promozione sicura delle riparazioni su target reali</li>
-          </ul>
-        </article>
+
+      <div class="architecture" aria-label="Architettura di fiducia KernAid">
+        <div class="architecture-flow">
+          <article><span>Unprivileged</span><strong>Desk UI</strong><small>Interazione e consenso</small></article><i aria-hidden="true">→</i>
+          <article><span>Untrusted reasoning</span><strong>Agent Gateway</strong><small>Contesto e provider</small></article><i aria-hidden="true">→</i>
+          <article class="core-node"><span>Policy boundary</span><strong>KernAid Core</strong><small>Piani e decisioni</small></article><i aria-hidden="true">→</i>
+          <article><span>Least privilege</span><strong>Typed Broker</strong><small>Azioni autorizzate</small></article>
+        </div>
+        <div class="security-points">
+          <article><span>01</span><h3>Nessuna raw shell</h3><p>Soltanto envelope tipizzati e validati possono raggiungere il broker.</p></article>
+          <article><span>02</span><h3>Read-only predefinito</h3><p>I target non diventano scrivibili perché una diagnosi sembra plausibile.</p></article>
+          <article><span>03</span><h3>Credenziali isolate</h3><p>Keychain di sistema in Desk e vault LUKS2 dedicato in Rescue.</p></article>
+          <article><span>04</span><h3>Supply chain esplicita</h3><p>Checksum, catalogo di fiducia, SBOM e attestazioni legano codice e artefatto.</p></article>
+        </div>
       </div>
-      <p class="safety-note"><strong>Nota:</strong> KernAid non è ancora autorizzato come strumento di riparazione su dati cliente. Gli artefatti interni restano separati dalle release pubbliche.</p>
     </section>
 
-    <section class="closing" aria-labelledby="closing-title">
-      <p class="eyebrow">Sviluppo aperto, distribuzione controllata</p>
-      <h2 id="closing-title">Segui l'architettura.<br>Accedi agli artefatti solo se autorizzato.</h2>
-      <div class="hero-actions">
-        <a class="button primary" href="https://github.com/0xfunboy/KernAid/blob/main/docs/PROJECT_MAP.md" target="_blank" rel="noreferrer">Mappa del progetto</a>
-        <a class="button ghost" href="https://github.com/0xfunboy/KernAid/blob/main/docs/CURRENT_STATUS.md" target="_blank" rel="noreferrer">Dove siamo <span aria-hidden="true">↗</span></a>
-        <a class="button ghost" href="https://github.com/0xfunboy/KernAid/blob/main/docs/MASTERPLAN.md" target="_blank" rel="noreferrer">Roadmap</a>
-        <a class="button ghost" href="/private/">Area riservata</a>
+    <section class="section status-section" id="status" aria-labelledby="status-title">
+      <div class="status-heading">
+        <div><p class="eyebrow">Trasparenza di prodotto</p><h2 id="status-title">Costruito in pubblico.<br>Distribuito con cautela.</h2></div>
+        <p>KernAid oggi è una preview diagnostica avanzata, non ancora uno strumento di riparazione autorizzato su dati cliente. Capacità e limiti sono pubblicati perché la fiducia tecnica richiede prove, non promesse indistinte.</p>
+      </div>
+
+      <div class="status-board">
+        <article class="available-column"><div><span class="status-dot"></span><strong>Disponibile nella preview</strong></div><ul><li>Desk multipiattaforma e Rescue amd64</li><li>Raccolta evidence-first e diagnosi deterministica</li><li>Piani R0 senza scritture e report con hash</li><li>Vault e report firmati qualificati in QEMU</li></ul></article>
+        <article class="qualification-column"><div><span class="status-dot"></span><strong>In qualifica</strong></div><ul><li>USB e matrice hardware fisica</li><li>Secure Boot e installer firmati</li><li>Account reale e TLS live in Rescue</li><li>Prima riparazione Linux reale e reversibile</li></ul></article>
+        <article class="roadmap-column"><div><span class="status-dot"></span><strong>Roadmap</strong></div><ul><li>KernAid One e aggiornamenti A/B</li><li>Repair pack Windows e WinPE Companion</li><li>Profondità nativa macOS</li><li>KernAid Fleet e policy enterprise</li></ul></article>
+      </div>
+
+      <div class="status-links">
+        <a href="https://github.com/0xfunboy/KernAid/blob/main/docs/CURRENT_STATUS.md" target="_blank" rel="noreferrer">Stato tecnico corrente <span aria-hidden="true">↗</span></a>
+        <a href="https://github.com/0xfunboy/KernAid/blob/main/docs/MASTERPLAN.md" target="_blank" rel="noreferrer">Masterplan di prodotto <span aria-hidden="true">↗</span></a>
+        <a href="https://github.com/0xfunboy/KernAid/blob/main/SECURITY.md" target="_blank" rel="noreferrer">Security policy <span aria-hidden="true">↗</span></a>
+      </div>
+    </section>
+
+    <section class="section faq-section" aria-labelledby="faq-title">
+      <div class="faq-intro"><p class="eyebrow">Domande essenziali</p><h2 id="faq-title">Prima della prima sessione.</h2></div>
+      <div class="faq-list">
+        <details><summary>KernAid ripara già computer reali?<span>+</span></summary><p>No. La preview pubblica raccoglie evidenze, formula diagnosi e produce piani senza scritture. Le riparazioni R2 esistono soltanto in un laboratorio isolato su fixture temporanee.</p></details>
+        <details><summary>I dati vengono inviati automaticamente a un'AI?<span>+</span></summary><p>No. Le regole locali funzionano offline. L'uso di un provider è opzionale ed esplicito; KernAid limita e struttura il contesto prima dell'invio.</p></details>
+        <details><summary>KernAid Rescue funziona con Secure Boot?<span>+</span></summary><p>Non ancora come supporto dichiarato. La candidata attuale supera i gate virtuali BIOS/UEFI, mentre Secure Boot e hardware fisico restano passaggi di qualifica aperti.</p></details>
+        <details><summary>Come si integra nei team IT e MSP?<span>+</span></summary><p>Il modello Enterprise prevede licenze per tecnico, policy condivise, repair pack firmati, audit e Fleet. Queste capacità sono in roadmap e vengono progettate con i primi design partner.</p></details>
+      </div>
+    </section>
+
+    <section class="closing commercial-closing" aria-labelledby="closing-title">
+      <div><p class="eyebrow">The machine repair agent that boots when the OS cannot.</p><h2 id="closing-title">Porta evidenza e controllo in ogni intervento tecnico.</h2></div>
+      <div class="closing-copy">
+        <p>Segui l'evoluzione della piattaforma, valuta l'architettura oppure accedi alle build qualificate se fai parte del programma interno.</p>
+        <div class="hero-actions"><a class="button primary" href="https://github.com/0xfunboy/KernAid" target="_blank" rel="noreferrer">Esplora KernAid <span aria-hidden="true">↗</span></a><a class="button ghost" href="/private/">Area riservata</a></div>
       </div>
     </section>
   </main>
 
-  <footer>
-    <a class="brand footer-brand" href="/">
-      <img src="/mark.svg" alt="" width="34" height="34">
-      <span>KernAid</span>
-    </a>
-    <p>Evidence-first machine diagnosis and repair platform.</p>
-    <div>
-      <a href="https://github.com/0xfunboy/KernAid/blob/main/SECURITY.md" target="_blank" rel="noreferrer">Security</a>
-      <a href="https://github.com/0xfunboy/KernAid" target="_blank" rel="noreferrer">Repository</a>
+  <footer class="commercial-footer">
+    <div class="footer-main"><a class="brand footer-brand" href="/"><img src="/mark.svg" alt="" width="36" height="36"><span>KernAid</span></a><p>Evidence-first machine diagnosis and controlled recovery.</p></div>
+    <div class="footer-links">
+      <div><strong>Prodotto</strong><a href="#products">Desk</a><a href="#products">Rescue</a><a href="#enterprise">Enterprise</a></div>
+      <div><strong>Risorse</strong><a href="#status">Stato</a><a href="https://github.com/0xfunboy/KernAid" target="_blank" rel="noreferrer">GitHub</a><a href="/private/">Download</a></div>
+      <div><strong>Trust</strong><a href="#security">Architettura</a><a href="https://github.com/0xfunboy/KernAid/blob/main/SECURITY.md" target="_blank" rel="noreferrer">Security</a></div>
     </div>
+    <div class="footer-bottom"><span>© 2026 KernAid. Engineering preview.</span><span>Diagnose · Repair · Verify</span></div>
   </footer>
 </body>
 </html>

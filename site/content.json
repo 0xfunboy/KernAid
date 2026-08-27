@@ -3,12 +3,12 @@
   "release": {
     "name": "KernAid Rescue AMD64",
     "channel": "Internal qualified candidate",
-    "sourceCommit": "2767a196c977d3b6f21418c20bd80131b1bcb3e6",
-    "artifactVersion": "ci-32939869047-1",
-    "workflowUrl": "https://github.com/0xfunboy/KernAid/actions/runs/32939869047",
-    "downloadName": "KernAid-Rescue-amd64-2767a19-internal.iso",
-    "checksumName": "KernAid-Rescue-amd64-2767a19-internal.iso.sha256",
-    "qualification": "Build, ABI, SBOM, boot QEMU BIOS/UEFI, USB-style two-boot e lifecycle privilegiato BIOS/UEFI superati sullo stesso artefatto, inclusi vault LUKS2/ext4 e persistenza, lettura ed export del report firmato.",
-    "warning": "Candidata interna qualificata virtualmente e autorizzata dal catalogo trusted v2 revision 2. Secure Boot, USB fisica, login Codex con account reale/TLS live e riparazioni restano non qualificati; usare solo su chiavetta nuova o sacrificabile e hardware non cliente."
+    "sourceCommit": "015ee8f767116d99ae46acb20c29e0951ca88bb2",
+    "artifactVersion": "ci-32951615549-1",
+    "workflowUrl": "https://github.com/0xfunboy/KernAid/actions/runs/32951615549",
+    "downloadName": "KernAid-Rescue-amd64-015ee8f-internal.iso",
+    "checksumName": "KernAid-Rescue-amd64-015ee8f-internal.iso.sha256",
+    "qualification": "Build, ABI, SBOM, boot QEMU BIOS/UEFI, USB-style two-boot e lifecycle privilegiato BIOS/UEFI superati sullo stesso artefatto. Manifest canonico, provenienza e attestazione di qualifica Sigstore verificati prima della promozione.",
+    "warning": "Candidata interna qualificata virtualmente e autorizzata dal catalogo trusted v2 revision 3. Secure Boot, USB fisica, login Codex con account reale/TLS live e riparazioni restano non qualificati; usare solo su chiavetta nuova o sacrificabile e hardware non cliente."
   }
 }

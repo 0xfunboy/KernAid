@@ -68,10 +68,10 @@ start, so restart `kaid-site.service` after changing release metadata or the
 configured artifact path.
 
 Do not soften the warning based only on the existence of a workflow artifact.
-For the current `2767a19` candidate, the hybrid ISO, ordinary BIOS/UEFI QEMU
+For the current `015ee8f` candidate, the hybrid ISO, ordinary BIOS/UEFI QEMU
 smoke, USB-style two-boot and both privileged persistent-vault lifecycle jobs
 passed on the same exact artifact. Its locally re-derived entry matched the CI
-artifact and trusted catalog v2 revision 2 now authorizes only that image. The
+artifact and trusted catalog v2 revision 3 now authorizes only that image. The
 same lifecycle proved signed-report persistence, retrieval and fixed-path
 export under both virtual firmware modes. It is still not a production release:
 private availability is limited to

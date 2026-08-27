@@ -1,6 +1,6 @@
 # KernAid current status
 
-Last updated: 26 August 2026
+Last updated: 27 August 2026
 
 This page separates the product vision from what the repository can safely do
 today. The short version is: **the default KernAid Phase 0 product path is a
@@ -69,7 +69,7 @@ treated as a newer release.
   public API. Its virtual shipping-image gate has passed, but physical USB and
   recovery behavior are not yet qualified.
 - The v2 USB writer can copy, verify and provision an exact catalog-authorized
-  image. Catalog revision 2 authorizes only the exact internally qualified
+  image. Catalog revision 3 authorizes only the exact internally qualified
   candidate documented below; this is not physical-hardware qualification.
 - Hardware and firmware support claims still require physical test evidence.
 
@@ -77,14 +77,14 @@ treated as a newer release.
 
 The private project area serves one controlled physical-qualification
 candidate built from commit
-[`2767a196c977d3b6f21418c20bd80131b1bcb3e6`](https://github.com/0xfunboy/KernAid/commit/2767a196c977d3b6f21418c20bd80131b1bcb3e6):
+[`015ee8f767116d99ae46acb20c29e0951ca88bb2`](https://github.com/0xfunboy/KernAid/commit/015ee8f767116d99ae46acb20c29e0951ca88bb2):
 
 | Field | Exact value |
 | --- | --- |
-| Artifact version | `ci-32939869047-1` |
+| Artifact version | `ci-32951615549-1` |
 | Size | `1,221,148,672` bytes |
-| SHA-256 | `9376269567869026bd34ab050fcfcba1f5c5633b97ec827b23916a1635322fb6` |
-| Workflow | [Rescue run 32939869047](https://github.com/0xfunboy/KernAid/actions/runs/32939869047) |
+| SHA-256 | `ff1c2de71f69ad36f14e3a0f094b0f5be0af2547f84245a735ae9298e50b2d01` |
+| Workflow | [Rescue run 32951615549](https://github.com/0xfunboy/KernAid/actions/runs/32951615549) |
 
 That run successfully built the hybrid ISO, validated shipping binaries and
 SBOM, passed ordinary BIOS/UEFI QEMU smoke, and passed the BIOS/UEFI two-boot
@@ -93,15 +93,16 @@ disposable targets. Both final privileged lifecycle jobs also passed the
 bounded Codex offline signed-out path and the signed-report persist, list, get,
 cross-boot signer and fixed-path export path on the same artifact. The exact
 locally verified catalog entry is now the sole image authorized by trusted
-catalog v2 revision 2. This is an **internally and virtually qualified
-candidate**, not a production release.
+catalog v2 revision 3. The final qualification job also bound the ISO,
+checksum, catalog entry, SBOM and lifecycle evidence into one canonical
+manifest. Both its GitHub/Sigstore build-provenance and custom qualification
+attestations were independently verified before promotion. This is an
+**internally and virtually qualified candidate**, not a production release.
 
-New `main` candidates must additionally pass a final fail-closed qualification
-job. It hashes the ISO, checksum, catalog entry, SBOM and all BIOS/UEFI
-lifecycle evidence into one canonical manifest, then emits GitHub/Sigstore
-build-provenance and qualification attestations for that exact ISO. This gate
-does not retroactively attest the candidate listed above; that candidate stays
-pinned until a newer run is independently verified and explicitly promoted.
+New `main` candidates must pass the same final fail-closed qualification job,
+then have their manifest, checksum and attestations independently verified.
+No newer workflow artifact replaces the candidate listed above until another
+explicit catalog and private-site promotion is completed.
 
 The candidate is exposed privately only to unblock the first physical boot
 test. On Windows, verify the exact checksum and use Rufus in DD mode on a
@@ -110,8 +111,8 @@ use non-customer hardware, and do not treat that manual write as encrypted-vault
 provisioning or as a supported repair medium.
 
 The latest complete unsigned Desk packaging matrix was built from commit
-[`ad86e11330b3a5f97b8e01677a2e5c50e1ae1f1c`](https://github.com/0xfunboy/KernAid/commit/ad86e11330b3a5f97b8e01677a2e5c50e1ae1f1c)
-in [Desktop run 32935382680](https://github.com/0xfunboy/KernAid/actions/runs/32935382680).
+[`015ee8f767116d99ae46acb20c29e0951ca88bb2`](https://github.com/0xfunboy/KernAid/commit/015ee8f767116d99ae46acb20c29e0951ca88bb2)
+in [Desktop run 32951615530](https://github.com/0xfunboy/KernAid/actions/runs/32951615530).
 Linux x86-64, Windows x86-64, Intel macOS and Apple-silicon macOS packaging all
 passed; signing, notarization and physical-machine qualification remain open.
 

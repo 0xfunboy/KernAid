@@ -7,12 +7,12 @@ unattended repair until those release gates are completed.
 ## Create the Rescue USB
 
 There is currently no physically qualified release. The private project area
-exposes one exact internally qualified candidate from commit `2767a19` to
+exposes one exact internally qualified candidate from commit `015ee8f` to
 collect the first physical-boot evidence. Its exact version, size, workflow
 and SHA-256 are recorded in `CURRENT_STATUS.md`; do not substitute another
 Actions artifact or an image from a mirror.
 
-Trusted catalog v2 revision 2 authorizes only this exact ISO after its complete
+Trusted catalog v2 revision 3 authorizes only this exact ISO after its complete
 virtual BIOS/UEFI workflow passed. The Linux v2 writer can therefore verify,
 copy and provision its encrypted vault. The Windows procedure below remains a
 raw physical boot test and does not perform trusted vault provisioning.
@@ -37,8 +37,10 @@ not satisfy the physical-machine or Secure Boot gates.
 GitHub signs both standard build provenance and a custom Sigstore attestation
 whose subject is the ISO and whose predicate is that exact manifest. The
 downloaded artifact contains both returned bundles under deterministic names.
-With an online GitHub CLI, verify the repository and signing workflow before
-trusting the files:
+With a current GitHub CLI that supports `gh attestation`, verify the repository
+and signing workflow before trusting the files. The custom qualification
+predicate contains a URL fragment, so verify its downloaded bundle directly
+instead of relying on an API predicate lookup:
 
 ```bash
 gh attestation verify KernAid-Rescue-amd64.iso \
@@ -48,6 +50,7 @@ gh attestation verify KernAid-Rescue-amd64.iso \
 
 gh attestation verify KernAid-Rescue-amd64.iso \
   -R 0xfunboy/KernAid \
+  --bundle KernAid-Rescue-amd64.qualification.sigstore.json \
   --signer-workflow 0xfunboy/KernAid/.github/workflows/rescue.yml \
   --source-ref refs/heads/main \
   --predicate-type \
@@ -68,7 +71,7 @@ catalog and does not create or qualify the encrypted persistent vault.
    the image-sized bootable prefix, but residual tail data may remain
    recoverable; this procedure is not media sanitization.
 2. Verify the downloaded ISO in PowerShell with
-   `Get-FileHash .\KernAid-Rescue-amd64-2767a19-internal.iso -Algorithm SHA256`
+   `Get-FileHash .\KernAid-Rescue-amd64-015ee8f-internal.iso -Algorithm SHA256`
    and compare the complete digest with the downloaded `.sha256` file and the
    exact value in `CURRENT_STATUS.md`.
 3. Write that exact ISO with Rufus. If Rufus asks between ISO and DD modes,
@@ -245,7 +248,7 @@ The supported workshop procedure in this section is Resident-only. Rescue
 contains feature-gated persistent-vault OpenAI plumbing and a loopback
 UI-server relay. The current exact candidate passed the full virtual workflow,
 including both privileged BIOS and UEFI lifecycle jobs, and trusted catalog v2
-revision 2 authorizes that ISO. Physical media and live provider TLS with a
+revision 3 authorizes that ISO. Physical media and live provider TLS with a
 real account are still not qualified. Do not present Rescue OpenAI as supported
 on customer media yet. The Resident credential companion
 is not included in the desktop installer and is not added to `PATH`. From the
