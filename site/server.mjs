@@ -24,6 +24,10 @@ const configuredArtifact = loadArtifactSnapshot();
 const publicFiles = new Map([
   ["/", loadPublicFile("index.html", "text/html; charset=utf-8")],
   ["/index.html", loadPublicFile("index.html", "text/html; charset=utf-8")],
+  ["/enterprise/", loadPublicFile("enterprise.html", "text/html; charset=utf-8")],
+  ["/enterprise/index.html", loadPublicFile("enterprise.html", "text/html; charset=utf-8")],
+  ["/retail.css", loadPublicFile("retail.css", "text/css; charset=utf-8")],
+  ["/enterprise.css", loadPublicFile("enterprise.css", "text/css; charset=utf-8")],
   ["/styles.css", loadPublicFile("styles.css", "text/css; charset=utf-8")],
   ["/mark.svg", loadPublicFile("mark.svg", "image/svg+xml")],
 ]);
@@ -473,6 +477,11 @@ async function handleRequest(req, res) {
       return;
     }
     send(req, res, 200, publicFile.body, { "Content-Type": publicFile.type }, { cache: "public, max-age=300" });
+    return;
+  }
+
+  if (url.pathname === "/enterprise") {
+    redirect(res, "/enterprise/");
     return;
   }
 

@@ -5,6 +5,9 @@ project site and its private engineering-artifact area. It is deliberately
 small: one Node.js HTTP server, server-rendered HTML, CSS, the existing KernAid
 SVG mark, and one reviewed metadata file.
 
+The audience split, claim boundaries and independent Retail/Enterprise visual
+systems are defined in [`DESIGN_ARCHITECTURE.md`](DESIGN_ARCHITECTURE.md).
+
 The site does not promote artifacts. A file remains an internal candidate until
 the repository trust catalog and the applicable qualification gates explicitly
 authorize it.
@@ -13,7 +16,9 @@ authorize it.
 
 | Route | Access | Purpose |
 | --- | --- | --- |
-| `/`, `/styles.css`, `/mark.svg` | Public | Product, architecture and honest project status |
+| `/`, `/retail.css`, `/mark.svg` | Public | Simple consumer product journey and planned single-use offer |
+| `/enterprise/`, `/enterprise.css` | Public | Enterprise platform, governance and Design Partner model |
+| `/styles.css` | Public asset | Isolated styling for login and authenticated distribution |
 | `/healthz` | Public | Minimal process health response |
 | `/private/login` | Public | Form login, without browser Basic Auth |
 | `/private/` | Authenticated | Candidate provenance, qualification and checksum |

@@ -1,0 +1,443 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="KernAid Enterprise trasforma la diagnosi e il recovery dei sistemi in un processo governato, evidence-first e verificabile per team IT e MSP.">
+  <meta name="theme-color" content="#080b0d">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="KernAid Enterprise">
+  <meta property="og:title" content="KernAid Enterprise — Govern every recovery">
+  <meta property="og:description" content="Un modello operativo per osservare, diagnosticare, autorizzare e verificare ogni intervento tecnico.">
+  <meta property="og:url" content="https://kaid.funboy.eu.cc/enterprise/">
+  <link rel="canonical" href="https://kaid.funboy.eu.cc/enterprise/">
+  <title>KernAid Enterprise — Govern every recovery</title>
+  <link rel="icon" href="/mark.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/enterprise.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Vai al contenuto</a>
+
+  <div class="status-rail" role="status">
+    <div class="status-rail__inner">
+      <span class="status-rail__label"><i aria-hidden="true"></i> Enterprise program</span>
+      <span class="status-rail__message">Engineering preview · percorso attuale diagnostico e read-only</span>
+      <a href="#readiness">Readiness report <span aria-hidden="true">↗</span></a>
+    </div>
+  </div>
+
+  <header class="site-header">
+    <a class="brand" href="/enterprise/" aria-label="KernAid Enterprise home">
+      <img src="/mark.svg" width="40" height="40" alt="">
+      <span class="brand__name">KernAid</span>
+      <span class="brand__edition">Enterprise</span>
+    </a>
+
+    <nav aria-label="Navigazione principale">
+      <a href="#platform">Piattaforma</a>
+      <a href="#operations">Operations</a>
+      <a href="#trust">Trust</a>
+      <a href="#program">Programma</a>
+    </nav>
+
+    <div class="header-actions">
+      <a class="text-link" href="/">Per privati</a>
+      <a class="header-cta" href="#program">Design Partner <span aria-hidden="true">↘</span></a>
+    </div>
+  </header>
+
+  <main id="main">
+    <section class="hero" aria-labelledby="hero-title">
+      <div class="hero-grid" aria-hidden="true"></div>
+      <div class="hero-copy">
+        <p class="overline"><span>01</span> Recovery operations, governed</p>
+        <h1 id="hero-title">Il downtime è inevitabile.<br><em>L’improvvisazione no.</em></h1>
+        <p class="hero-lede">KernAid trasforma diagnosi e recovery in un processo evidence-first: osservabile, autorizzabile e verificabile. Per ogni tecnico, ogni sede, ogni incidente.</p>
+        <div class="hero-actions">
+          <a class="button button--signal" href="#platform">Esplora la piattaforma <span aria-hidden="true">↓</span></a>
+          <a class="button button--quiet" href="#trust">Valuta il trust model</a>
+        </div>
+        <p class="hero-note">Desk e Rescue sono disponibili come engineering preview. Le riparazioni di produzione e Fleet sono in sviluppo.</p>
+      </div>
+
+      <div class="ops-console" aria-hidden="true">
+        <div class="console-topbar">
+          <div class="console-brand"><span class="console-mark">K</span><strong>RECOVERY CONTROL</strong></div>
+          <span class="environment">ENV / DESIGN PARTNER</span>
+          <span class="health"><i aria-hidden="true"></i> POLICY ACTIVE</span>
+        </div>
+
+        <div class="console-layout">
+          <aside class="console-nav" aria-hidden="true">
+            <span class="nav-symbol active">OV</span>
+            <span class="nav-symbol">EV</span>
+            <span class="nav-symbol">PL</span>
+            <span class="nav-symbol">AU</span>
+            <span class="nav-spacer"></span>
+            <span class="nav-symbol">ST</span>
+          </aside>
+
+          <div class="console-main">
+            <div class="incident-head">
+              <div>
+                <p>ACTIVE SESSION / KRN-042</p>
+                <h2>Endpoint recovery</h2>
+              </div>
+              <span class="mode-chip">R0 · OBSERVE ONLY</span>
+            </div>
+
+            <div class="target-line">
+              <div class="target-identity">
+                <span class="target-glyph">W7</span>
+                <div><small>SELECTED TARGET</small><strong>WORKSTATION-07</strong></div>
+              </div>
+              <div class="target-meta"><small>SURFACE</small><strong>RESCUE</strong></div>
+              <div class="target-meta"><small>BOOT</small><strong>UEFI</strong></div>
+              <div class="target-lock"><i aria-hidden="true"></i><span>WRITE ACCESS<br><strong>BLOCKED</strong></span></div>
+            </div>
+
+            <div class="console-panels">
+              <section class="evidence-panel" aria-label="Evidenze della sessione">
+                <div class="panel-head"><span>EVIDENCE STREAM</span><strong>12 OBJECTS</strong></div>
+                <div class="evidence-item"><i class="evidence-state ok"></i><span><small>OBSERVED / FIRMWARE</small><strong>UEFI mode confirmed</strong></span><time>09:41:02</time></div>
+                <div class="evidence-item"><i class="evidence-state ok"></i><span><small>OBSERVED / STORAGE</small><strong>Target mounted read-only</strong></span><time>09:41:04</time></div>
+                <div class="evidence-item selected"><i class="evidence-state signal"></i><span><small>INFERENCE / BOOT</small><strong>Boot configuration inconsistent</strong></span><time>09:41:11</time></div>
+                <div class="trace-line"><span></span><span></span><span></span><span></span></div>
+              </section>
+
+              <section class="decision-panel" aria-label="Decisione della policy">
+                <div class="panel-head"><span>POLICY DECISION</span><strong class="cyan-text">EVALUATED</strong></div>
+                <div class="decision-seal">
+                  <div class="seal-ring"><span>K</span></div>
+                  <p>Proposal contained</p>
+                  <strong>No privileged path granted</strong>
+                </div>
+                <dl>
+                  <div><dt>Risk class</dt><dd>R0</dd></div>
+                  <div><dt>Approval</dt><dd>Not required</dd></div>
+                  <div><dt>Audit</dt><dd>Sealed</dd></div>
+                </dl>
+              </section>
+            </div>
+          </div>
+        </div>
+
+        <div class="console-footer">
+          <span>PROVIDER / CUSTOMER-OWNED</span>
+          <span>SESSION / LOCALLY BOUND</span>
+          <span class="console-footer__right"><i aria-hidden="true"></i> AUDIT RECORD COMPLETE</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="invariant-strip" aria-label="Invarianti architetturali KernAid">
+      <article><span class="invariant-value">0</span><div><strong>Raw shell al modello</strong><small>Il reasoning resta fuori dal confine privilegiato.</small></div></article>
+      <article><span class="invariant-value">R0</span><div><strong>Modalità predefinita</strong><small>Osservare prima di proporre qualsiasi modifica.</small></div></article>
+      <article><span class="invariant-glyph">◇</span><div><strong>Provider ownership</strong><small>Account e consumo restano del cliente.</small></div></article>
+      <article><span class="invariant-glyph">⌁</span><div><strong>Evidence continuity</strong><small>Fatti, decisioni ed esiti nello stesso record.</small></div></article>
+    </section>
+
+    <section class="section exposure" aria-labelledby="exposure-title">
+      <div class="section-index">02 / OPERATING EXPOSURE</div>
+      <div class="section-heading section-heading--wide">
+        <div>
+          <p class="overline">Quando l’endpoint si ferma</p>
+          <h2 id="exposure-title">Il rischio non è soltanto il guasto.<br>È ciò che il processo non sa dimostrare.</h2>
+        </div>
+        <p>Ticket, script e memoria del tecnico raramente formano una storia completa. KernAid nasce per rendere l’intervento una sequenza governata, non un insieme di tentativi.</p>
+      </div>
+
+      <div class="exposure-grid">
+        <article>
+          <span class="card-number">A / 01</span>
+          <div class="card-rule"></div>
+          <h3>Quale macchina stiamo davvero toccando?</h3>
+          <p>Selezione esplicita del target e fingerprint della sessione riducono l’ambiguità tra sistema live, installazione offline e supporto di recovery.</p>
+        </article>
+        <article>
+          <span class="card-number">A / 02</span>
+          <div class="card-rule"></div>
+          <h3>Perché il tecnico propone questa azione?</h3>
+          <p>Le inferenze restano distinte dai fatti osservati. Ogni proposta dichiara evidenze, precondizioni, impatto e rischio.</p>
+        </article>
+        <article>
+          <span class="card-number">A / 03</span>
+          <div class="card-rule"></div>
+          <h3>Chi l’ha autorizzata e ha funzionato?</h3>
+          <p>Approvazioni ed esiti appartengono allo stesso audit trail. La roadmap estende questo modello a repair pack e policy organizzative.</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="section platform" id="platform" aria-labelledby="platform-title">
+      <div class="section-index">03 / ONE OPERATING MODEL</div>
+      <div class="section-heading">
+        <div>
+          <p class="overline">Una piattaforma, due superfici</p>
+          <h2 id="platform-title">Continuità operativa prima e dopo il boot.</h2>
+        </div>
+        <p>Desk osserva dall’interno di un sistema avviabile. Rescue porta lo stesso modello diagnostico su una macchina che non completa l’avvio. Evidenze, policy e audit restano coerenti.</p>
+      </div>
+
+      <div class="surface-system">
+        <article class="surface-card surface-card--desk">
+          <div class="surface-card__head">
+            <span class="surface-code">01 / RESIDENT</span>
+            <span class="availability">ENGINEERING PREVIEW</span>
+          </div>
+          <div class="surface-icon surface-icon--desk" aria-hidden="true">
+            <div class="screen-frame"><i></i><i></i><i></i><span></span></div>
+            <div class="screen-base"></div>
+          </div>
+          <div class="surface-copy">
+            <p class="overline">Inside the operating system</p>
+            <h3>KernAid Desk</h3>
+            <p>Inventario e diagnostica evidence-first per workstation ancora operative, con regole offline e reasoning opzionale attraverso un provider configurato dal cliente.</p>
+            <ul>
+              <li><span>01</span>Snapshot normalizzati e con provenienza</li>
+              <li><span>02</span>Piani R0 senza scritture</li>
+              <li><span>03</span>Report JSON con hash</li>
+            </ul>
+          </div>
+          <div class="surface-foot"><span>Windows build target</span><span>Linux build target</span><span>macOS build target</span></div>
+        </article>
+
+        <div class="shared-kernel" aria-label="Livelli condivisi fra KernAid Desk e Rescue">
+          <div class="kernel-title"><span>SHARED CONTROL PLANE</span><strong>Same rules.<br>Different access.</strong></div>
+          <div class="kernel-layer"><span>E</span><div><strong>Evidence model</strong><small>Typed · bounded · sourced</small></div></div>
+          <div class="kernel-layer"><span>P</span><div><strong>Policy boundary</strong><small>Risk · approval · scope</small></div></div>
+          <div class="kernel-layer"><span>A</span><div><strong>Audit record</strong><small>Decision · outcome · seal</small></div></div>
+          <div class="kernel-status"><i aria-hidden="true"></i><span>LOCAL-FIRST CONTROL</span></div>
+        </div>
+
+        <article class="surface-card surface-card--rescue">
+          <div class="surface-card__head">
+            <span class="surface-code">02 / BOOTABLE</span>
+            <span class="availability">INTERNAL CANDIDATE</span>
+          </div>
+          <div class="surface-icon surface-icon--rescue" aria-hidden="true">
+            <div class="rescue-device"><img src="/mark.svg" alt=""><strong>KERNAID</strong><span>RESCUE / AMD64</span></div>
+            <div class="rescue-port"></div>
+          </div>
+          <div class="surface-copy">
+            <p class="overline">Outside the failed system</p>
+            <h3>KernAid Rescue</h3>
+            <p>Ambiente indipendente per osservare hardware, storage, boot e installazioni candidate senza dipendere dal sistema operativo compromesso.</p>
+            <ul>
+              <li><span>01</span>Target mantenuti in sola lettura</li>
+              <li><span>02</span>Vault cifrato dedicato</li>
+              <li><span>03</span>Report firmati ed esportabili</li>
+            </ul>
+          </div>
+          <div class="surface-foot"><span>AMD64</span><span>BIOS / UEFI in QEMU</span><span>Hardware qualification open</span></div>
+        </article>
+      </div>
+    </section>
+
+    <section class="section operations" id="operations" aria-labelledby="operations-title">
+      <div class="section-index">04 / CONTROLLED OPERATIONS</div>
+      <div class="operations-layout">
+        <div class="operations-copy">
+          <p class="overline">Dal segnale al record</p>
+          <h2 id="operations-title">Ogni passaggio ha un proprietario. Ogni confine ha una funzione.</h2>
+          <p>Il provider può aiutare a formulare un’ipotesi. Non ottiene una shell privilegiata, non decide la policy e non può trasformare da solo una proposta in una mutazione.</p>
+          <a class="inline-link" href="#trust">Approfondisci il modello di sicurezza <span aria-hidden="true">↘</span></a>
+        </div>
+
+        <ol class="operations-sequence">
+          <li>
+            <span class="sequence-number">01</span>
+            <div><small>COLLECTORS</small><strong>Observe</strong><p>Raccolgono segnali delimitati e ne dichiarano origine e sensibilità.</p></div>
+            <span class="sequence-state state-now">AVAILABLE</span>
+          </li>
+          <li>
+            <span class="sequence-number">02</span>
+            <div><small>GATEWAY + PROVIDER</small><strong>Diagnose</strong><p>Separa evidenze e inferenze; può operare offline o con provider opzionale.</p></div>
+            <span class="sequence-state state-now">AVAILABLE</span>
+          </li>
+          <li>
+            <span class="sequence-number">03</span>
+            <div><small>KERNAID CORE</small><strong>Plan &amp; decide</strong><p>Valida schema, target, rischio, precondizioni e approvazione richiesta.</p></div>
+            <span class="sequence-state state-now">R0 TODAY</span>
+          </li>
+          <li>
+            <span class="sequence-number">04</span>
+            <div><small>TYPED BROKER</small><strong>Execute</strong><p>In futuro eseguirà soltanto operazioni tipizzate, firmate e autorizzate.</p></div>
+            <span class="sequence-state state-next">IN DEVELOPMENT</span>
+          </li>
+          <li>
+            <span class="sequence-number">05</span>
+            <div><small>AUDIT SINK</small><strong>Verify &amp; record</strong><p>Conserva evidenze, decisioni ed esito in un artefatto verificabile.</p></div>
+            <span class="sequence-state state-now">REPORTING READY</span>
+          </li>
+        </ol>
+      </div>
+    </section>
+
+    <section class="section governance" aria-labelledby="governance-title">
+      <div class="section-index">05 / ORGANIZATIONAL LEVERAGE</div>
+      <div class="section-heading section-heading--wide">
+        <div>
+          <p class="overline">Designed for IT organizations</p>
+          <h2 id="governance-title">Portare il metodo del miglior tecnico a ogni intervento.</h2>
+        </div>
+        <p>Il valore Enterprise non è “più AI”. È una disciplina operativa condivisa che riduce l’ambiguità tra persone, sedi e clienti.</p>
+      </div>
+
+      <div class="governance-matrix">
+        <article>
+          <div class="matrix-head"><span>CIO / IT DIRECTOR</span><i>01</i></div>
+          <h3>Governance senza perdere velocità</h3>
+          <p>Un linguaggio comune per rischio, autorizzazioni e risultati. Il management vede il processo; il tecnico conserva gli strumenti per agire.</p>
+          <ul><li>Policy operative condivise <em>Roadmap</em></li><li>Record verificabile per incidente</li><li>Provider e dati sotto controllo cliente</li></ul>
+        </article>
+        <article>
+          <div class="matrix-head"><span>SERVICE DESK</span><i>02</i></div>
+          <h3>Diagnosi coerenti, passaggi di consegna leggibili</h3>
+          <p>La sessione raccoglie ciò che è stato osservato, cosa è stato dedotto e quale passo successivo è ammesso.</p>
+          <ul><li>Desk e Rescue, stesso workflow</li><li>Report strutturati ed esportabili</li><li>Repair pack controllati <em>Roadmap</em></li></ul>
+        </article>
+        <article>
+          <div class="matrix-head"><span>MSP OPERATIONS</span><i>03</i></div>
+          <h3>Ripetibilità tra tecnici e tenant</h3>
+          <p>Profili, distribuzione e visibilità centralizzata sono il livello Fleet pianificato, costruito sopra una decisione che resta locale.</p>
+          <ul><li>Separazione di ruoli e contesti <em>Planned</em></li><li>Cataloghi firmati <em>Planned</em></li><li>Fleet governance <em>Planned</em></li></ul>
+        </article>
+      </div>
+    </section>
+
+    <section class="section trust" id="trust" aria-labelledby="trust-title">
+      <div class="section-index">06 / TRUST BOUNDARY</div>
+      <div class="trust-layout">
+        <div class="trust-copy">
+          <p class="overline">AI is a reasoning input, not root</p>
+          <h2 id="trust-title">L’intelligenza non coincide con il privilegio.</h2>
+          <p>KernAid tratta output del modello, log e contenuti osservati come dati non attendibili. Il percorso privilegiato rimane stretto, tipizzato e soggetto alle decisioni di Core.</p>
+          <div class="trust-callout"><span>ARCHITECTURAL INVARIANT</span><blockquote>Il provider propone.<br><em>La policy decide.</em><br>Il sistema verifica.</blockquote></div>
+        </div>
+
+        <div class="boundary-map" aria-label="Mappa del confine di fiducia KernAid">
+          <div class="boundary-zone zone-untrusted">
+            <span class="zone-label">UNTRUSTED / UNPRIVILEGED</span>
+            <div class="boundary-node"><i>UI</i><div><strong>Desk / Rescue UI</strong><small>Interaction · consent</small></div></div>
+            <div class="boundary-arrow" aria-hidden="true">↓ <span>BOUNDED CONTEXT</span></div>
+            <div class="boundary-node"><i>AG</i><div><strong>Agent Gateway</strong><small>Provider · inference</small></div></div>
+          </div>
+          <div class="policy-gate">
+            <span>SCHEMA</span><span>TARGET</span><span>RISK</span><span>APPROVAL</span>
+          </div>
+          <div class="boundary-zone zone-trusted">
+            <span class="zone-label">LOCAL TRUST BOUNDARY</span>
+            <div class="boundary-node core"><i>KC</i><div><strong>KernAid Core</strong><small>Policy · state machine</small></div></div>
+            <div class="boundary-arrow" aria-hidden="true">↓ <span>TYPED ENVELOPE</span></div>
+            <div class="boundary-node"><i>TB</i><div><strong>Typed Broker</strong><small>Least privilege · explicit actions</small></div></div>
+          </div>
+          <div class="boundary-output"><span>AUDIT OUTPUT</span><strong>Evidence + decision + outcome</strong><i aria-hidden="true">✓</i></div>
+        </div>
+      </div>
+
+      <div class="trust-principles">
+        <article><span>01</span><h3>Local-first</h3><p>La diagnostica deterministica può funzionare offline; l’uso di un provider è opzionale.</p></article>
+        <article><span>02</span><h3>Customer-owned AI</h3><p>Account, chiavi e consumo restano del cliente. KernAid non rivende token.</p></article>
+        <article><span>03</span><h3>Fail-closed</h3><p>Target ambiguo, schema invalido o autorizzazione mancante interrompono il percorso.</p></article>
+        <article><span>04</span><h3>Supply-chain aware</h3><p>Checksum, SBOM, catalogo e attestazioni collegano sorgente e candidata Rescue.</p></article>
+      </div>
+    </section>
+
+    <section class="section program" id="program" aria-labelledby="program-title">
+      <div class="section-index">07 / DESIGN PARTNER PROGRAM</div>
+      <div class="program-shell">
+        <div class="program-copy">
+          <span class="program-tag"><i aria-hidden="true"></i> PLANNED LAUNCH ACCESS</span>
+          <p class="overline">Costruire con operatori reali</p>
+          <h2 id="program-title">Una partnership operativa, prima di una licenza.</h2>
+          <p>Il programma Design Partner è pensato per team IT e MSP che vogliono contribuire a qualificare workflow, hardware e policy prima della disponibilità generale.</p>
+          <div class="fit-list">
+            <div><span>01</span><p><strong>Ambiente controllato</strong>Endpoint non cliente e tecnici disponibili per sessioni guidate.</p></div>
+            <div><span>02</span><p><strong>Feedback operativo</strong>Casi reali anonimizzati, requisiti e revisione dei workflow.</p></div>
+            <div><span>03</span><p><strong>Adozione progressiva</strong>Diagnosi prima; capability di repair soltanto dopo qualifica.</p></div>
+          </div>
+        </div>
+
+        <aside class="program-offer" aria-label="Ipotesi commerciale Design Partner">
+          <div class="offer-head"><span>KERNAID / ENTERPRISE</span><strong>DESIGN PARTNER</strong></div>
+          <div class="offer-price"><small>Planned launch pricing from</small><div><sup>$</sup><strong>299</strong><span>/ month</span></div></div>
+          <p class="offer-positioning">Accesso pianificato al percorso Enterprise per organizzazioni selezionate.</p>
+          <ul>
+            <li><span>✓</span>Desk engineering access</li>
+            <li><span>✓</span>Rescue qualification track</li>
+            <li><span>✓</span>Architecture &amp; workflow reviews</li>
+            <li><span>↗</span>Fleet input and roadmap sessions</li>
+          </ul>
+          <span class="button button--quiet button--full program-closed" aria-disabled="true">Candidature non ancora aperte</span>
+          <p class="offer-disclaimer">Indicazione di prezzo in validazione, non un’offerta attualmente acquistabile. Accesso, perimetro e condizioni dipenderanno dalla qualifica e da un accordo dedicato.</p>
+        </aside>
+      </div>
+
+      <div class="commercial-model">
+        <div class="commercial-model__intro"><span>COMMERCIAL ARCHITECTURE</span><strong>Pagare per controllo e continuità.<br>Non per una scatola nera.</strong></div>
+        <article><span>01</span><h3>Subscription</h3><p>Software, release qualificate, workflow, audit e futuro controllo Fleet.</p><small>Design Partner from $299/month · planned</small></article>
+        <article><span>02</span><h3>KernAid One</h3><p>Kit hardware Rescue qualificato e gestito, separato dalla licenza.</p><small>Pricing after physical qualification</small></article>
+        <article><span>03</span><h3>BYO provider</h3><p>Il cliente sceglie e paga direttamente il proprio provider AI.</p><small>No token resale · optional usage</small></article>
+      </div>
+    </section>
+
+    <section class="section readiness" id="readiness" aria-labelledby="readiness-title">
+      <div class="section-index">08 / PRODUCT READINESS</div>
+      <div class="section-heading section-heading--wide">
+        <div>
+          <p class="overline">Evidence before claims</p>
+          <h2 id="readiness-title">La roadmap è pubblica.<br>I limiti anche.</h2>
+        </div>
+        <p>KernAid non è oggi autorizzato a eseguire riparazioni di produzione su dati cliente. La preview serve a validare la disciplina diagnostica e la catena di fiducia.</p>
+      </div>
+
+      <div class="readiness-board">
+        <article class="readiness-card readiness-card--ready">
+          <div class="readiness-head"><span><i aria-hidden="true"></i> AVAILABLE NOW</span><strong>ENGINEERING PREVIEW</strong></div>
+          <ul><li>Desk build target per Windows, Linux e macOS</li><li>Rescue amd64 qualificata virtualmente BIOS/UEFI</li><li>Diagnosi deterministica e provider opzionale</li><li>Piani R0, report con hash e audit Rescue firmato</li></ul>
+        </article>
+        <article class="readiness-card readiness-card--active">
+          <div class="readiness-head"><span><i aria-hidden="true"></i> ACTIVE GATES</span><strong>QUALIFICATION</strong></div>
+          <ul><li>USB e matrice hardware fisica</li><li>Secure Boot e installer firmati</li><li>Account reale e TLS live in Rescue</li><li>Prima riparazione Linux reale e reversibile</li></ul>
+        </article>
+        <article class="readiness-card readiness-card--planned">
+          <div class="readiness-head"><span><i aria-hidden="true"></i> NEXT SYSTEM</span><strong>ROADMAP</strong></div>
+          <ul><li>Repair pack firmati e aggiornamenti A/B</li><li>Windows offline e WinPE Companion</li><li>Profondità nativa macOS</li><li>Fleet, ruoli e policy organizzative</li></ul>
+        </article>
+      </div>
+
+      <div class="evidence-links">
+        <a href="https://github.com/0xfunboy/KernAid/blob/main/docs/CURRENT_STATUS.md" target="_blank" rel="noreferrer"><span>01 / CURRENT STATUS</span><strong>Capacità e gate correnti</strong><i aria-hidden="true">↗</i></a>
+        <a href="https://github.com/0xfunboy/KernAid/blob/main/SECURITY.md" target="_blank" rel="noreferrer"><span>02 / SECURITY POLICY</span><strong>Modello di sicurezza</strong><i aria-hidden="true">↗</i></a>
+        <a href="https://github.com/0xfunboy/KernAid/blob/main/docs/MASTERPLAN.md" target="_blank" rel="noreferrer"><span>03 / MASTERPLAN</span><strong>Architettura e roadmap</strong><i aria-hidden="true">↗</i></a>
+      </div>
+    </section>
+
+    <section class="closing" aria-labelledby="closing-title">
+      <div class="closing-signal" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span></div>
+      <div class="closing-copy">
+        <p class="overline">Build the recovery standard</p>
+        <h2 id="closing-title">Quando una macchina si ferma,<br>il processo deve restare operativo.</h2>
+      </div>
+      <div class="closing-actions">
+        <p>Valuta l’architettura oggi. Contribuisci a definire il modello Enterprise di domani.</p>
+        <div><a class="button button--signal" href="https://github.com/0xfunboy/KernAid" target="_blank" rel="noreferrer">Esplora il progetto <span aria-hidden="true">↗</span></a><a class="button button--quiet" href="/private/">Area riservata</a></div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="footer-primary">
+      <a class="brand" href="/enterprise/"><img src="/mark.svg" width="36" height="36" alt=""><span class="brand__name">KernAid</span><span class="brand__edition">Enterprise</span></a>
+      <p>Evidence-first machine diagnosis<br>and controlled recovery.</p>
+    </div>
+    <div class="footer-nav">
+      <div><strong>Platform</strong><a href="#platform">Desk + Rescue</a><a href="#operations">Operating model</a><a href="#trust">Trust boundary</a></div>
+      <div><strong>Program</strong><a href="#program">Design Partner</a><a href="#readiness">Product readiness</a><a href="/private/">Authorized downloads</a></div>
+      <div><strong>Company</strong><a href="/">Consumer experience</a><a href="https://github.com/0xfunboy/KernAid" target="_blank" rel="noreferrer">GitHub</a><a href="https://github.com/0xfunboy/KernAid/blob/main/SECURITY.md" target="_blank" rel="noreferrer">Security</a></div>
+    </div>
+    <div class="footer-bottom"><span>© 2026 KernAid · Engineering preview</span><span>OBSERVE / DIAGNOSE / GOVERN / VERIFY</span></div>
+  </footer>
+</body>
+</html>
