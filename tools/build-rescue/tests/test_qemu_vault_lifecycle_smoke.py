@@ -2255,6 +2255,7 @@ class SanitizedOutputTests(unittest.TestCase):
                 return_value=bytearray(login_credential),
             ),
             mock.patch.object(controller, "QemuHarness", return_value=fake_harness),
+            mock.patch.object(controller, "wait_firstboot_attestation"),
             mock.patch.object(
                 controller,
                 "run_lifecycle",
@@ -2320,6 +2321,7 @@ class SanitizedOutputTests(unittest.TestCase):
                 return_value=bytearray(login_credential),
             ),
             mock.patch.object(controller, "QemuHarness", return_value=fake_harness),
+            mock.patch.object(controller, "wait_firstboot_attestation"),
             mock.patch.object(
                 controller,
                 "run_lifecycle",
@@ -2567,6 +2569,35 @@ def run_proof_transcript(
 
 
 class StaticContractTests(unittest.TestCase):
+
+    def test_firstboot_result_requires_success_attestation(self) -> None:
+        success = (
+            b"\nKERNAID_RESCUE_FIRSTBOOT_ATTESTATION_V1 state=provisioned "
+            b"verified=true cleanup=complete "
+            b"luks_uuid=12345678-1234-4abc-8def-123456789abc "
+            b"filesystem_uuid=abcdef01-2345-4abc-9def-123456789abc "
+            b"device_id=KA-0123456789abcdef01234567\r\n"
+        )
+        failure = (
+            b"\nKERNAID_RESCUE_FIRSTBOOT_FAILURE_V1 "
+            b"code=vault-profile-mismatch success=false\r\n"
+        )
+        success_match = controller.FIRSTBOOT_RESULT_PATTERN.search(success)
+        failure_match = controller.FIRSTBOOT_RESULT_PATTERN.search(failure)
+        self.assertIsNotNone(success_match)
+        self.assertIsNotNone(failure_match)
+        assert success_match is not None and failure_match is not None
+        self.assertIsNone(success_match.group(1))
+        self.assertEqual(failure_match.group(1), b"vault-profile-mismatch")
+
+        console = mock.Mock()
+        console.wait_regex.return_value = failure_match
+        with self.assertRaises(controller.ClosedFailure) as rejected:
+            controller.wait_firstboot_attestation(console, 7, time.monotonic() + 1)
+        self.assertEqual(
+            (rejected.exception.stage, rejected.exception.code),
+            ("firstboot", "provisioning-failed"),
+        )
 
     def test_shipping_codex_status_proof_is_real_offline_and_closed(self) -> None:
         source = controller._codex_status_probe_source().decode("ascii")

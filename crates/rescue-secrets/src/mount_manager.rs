@@ -765,6 +765,8 @@ struct Activation<R: VaultOps> {
     provisioning_filesystem_uuid: Option<[u8; 36]>,
     #[cfg(feature = "experimental-firstboot-provisioner")]
     provisioning_key_size: Option<usize>,
+    #[cfg(feature = "experimental-firstboot-provisioner")]
+    mounted_filesystem_profile: Option<Ext4ProfileEvidence>,
 }
 
 impl<R: VaultOps> Activation<R> {
@@ -835,6 +837,8 @@ impl<R: VaultOps> Activation<R> {
             provisioning_filesystem_uuid,
             #[cfg(feature = "experimental-firstboot-provisioner")]
             provisioning_key_size,
+            #[cfg(feature = "experimental-firstboot-provisioner")]
+            mounted_filesystem_profile: None,
         };
 
         let result = activation.continue_start(passphrase);
@@ -1009,6 +1013,10 @@ impl<R: VaultOps> Activation<R> {
             self.header,
             filesystem_profile,
         )?;
+        #[cfg(feature = "experimental-firstboot-provisioner")]
+        {
+            self.mounted_filesystem_profile = Some(filesystem_profile);
+        }
         if self.ops.classify_outer_profile(&self.request.device)? != self.outer_profile {
             return Err(VaultMountManagerError::ProfileMismatch);
         }
@@ -1861,24 +1869,11 @@ fn initialize_firstboot_secure_state(
     activation: &mut Activation<SystemOps>,
     filesystem_uuid: [u8; 36],
 ) -> Result<InitializedSecureStateEvidence, VaultMountManagerError> {
+    let observed_filesystem = revalidate_firstboot_filesystem(activation, filesystem_uuid)?;
     let mapping = activation
         .mapping
         .as_ref()
         .ok_or(VaultMountManagerError::MappingVerificationFailed)?;
-    mapping.revalidate(
-        &activation.request.device,
-        &activation.request.mapper,
-        activation.header,
-    )?;
-    let observed_filesystem = activation.ops.inspect_filesystem(
-        &activation.request.device,
-        &activation.request.mapper,
-        mapping,
-        activation.header,
-    )?;
-    if observed_filesystem.uuid_ascii() != filesystem_uuid {
-        return Err(VaultMountManagerError::ProfileMismatch);
-    }
     let attestation = activation
         .attestation
         .as_ref()
@@ -1935,6 +1930,35 @@ fn initialize_firstboot_secure_state(
         device_id,
         identity_public_key,
     })
+}
+
+#[cfg(feature = "experimental-firstboot-provisioner")]
+fn revalidate_firstboot_filesystem<R: VaultOps>(
+    activation: &mut Activation<R>,
+    filesystem_uuid: [u8; 36],
+) -> Result<Ext4ProfileEvidence, VaultMountManagerError> {
+    // `inspect_filesystem` deliberately applies the pre-mount ext4 profile.
+    // Reusing it after `Activation::continue_start` mounted the vault would
+    // reject the kernel's valid mounted-state runtime bits.  Retain the exact
+    // pre-mount evidence and revalidate it only with the mounted classifier.
+    let observed = activation
+        .mounted_filesystem_profile
+        .ok_or(VaultMountManagerError::MountVerificationFailed)?;
+    if observed.uuid_ascii() != filesystem_uuid {
+        return Err(VaultMountManagerError::ProfileMismatch);
+    }
+    let mapping = activation
+        .mapping
+        .as_ref()
+        .ok_or(VaultMountManagerError::MappingVerificationFailed)?;
+    activation.ops.verify_mounted_filesystem(
+        &activation.request.device,
+        &activation.request.mapper,
+        mapping,
+        activation.header,
+        observed,
+    )?;
+    Ok(observed)
 }
 
 #[cfg(feature = "experimental-firstboot-provisioner")]
@@ -3215,7 +3239,13 @@ mod tests {
             _header: HeaderIdentity,
         ) -> Result<Ext4ProfileEvidence, VaultMountManagerError> {
             self.step(Step::Filesystem)?;
-            Ok(Ext4ProfileEvidence::fixture([7_u8; 16], 1024))
+            Ok(Ext4ProfileEvidence::fixture(
+                [
+                    0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x42, 0x22, 0x82, 0x22, 0x22, 0x22, 0x22,
+                    0x22, 0x22, 0x22,
+                ],
+                1024,
+            ))
         }
 
         fn prepare_mount_root(&mut self, _root: &Path) -> Result<(), VaultMountManagerError> {
@@ -4566,6 +4596,39 @@ mod tests {
             1
         );
         assert!(position(Step::Unmount) < position(Step::WaitDeferredAbsent));
+    }
+
+    #[cfg(feature = "experimental-firstboot-provisioner")]
+    #[test]
+    fn firstboot_revalidates_retained_mounted_profile_without_premount_reinspection() {
+        let state = Arc::new(Mutex::new(FakeState::default()));
+        let mut activation =
+            start_fake_firstboot(Arc::clone(&state)).expect("firstboot activation");
+        let observed = revalidate_firstboot_filesystem(
+            &mut activation,
+            *b"22222222-2222-4222-8222-222222222222",
+        )
+        .expect("mounted firstboot profile");
+        assert_eq!(
+            observed.uuid_ascii(),
+            *b"22222222-2222-4222-8222-222222222222"
+        );
+
+        let steps = &state.lock().expect("state").steps;
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|step| **step == Step::Filesystem)
+                .count(),
+            1
+        );
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|step| **step == Step::MountedFilesystem)
+                .count(),
+            2
+        );
     }
 
     #[cfg(feature = "experimental-firstboot-provisioner")]

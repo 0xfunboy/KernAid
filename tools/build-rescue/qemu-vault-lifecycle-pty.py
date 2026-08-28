@@ -59,6 +59,19 @@ LOOP_INFO64 = struct.Struct("=QQQQQIIII64s64s32sQQ")
 
 READY_LINE = b"KERNAID_RESCUE_READY"
 NOT_READY_LINE_PREFIX = b"KERNAID_RESCUE_NOT_READY:"
+FIRSTBOOT_RESULT_PATTERN = re.compile(
+    rb"(?:^|\r?\n)(?:"
+    rb"KERNAID_RESCUE_FIRSTBOOT_ATTESTATION_V1 "
+    rb"state=provisioned verified=true cleanup=complete "
+    rb"luks_uuid=[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-"
+    rb"[89ab][0-9a-f]{3}-[0-9a-f]{12} "
+    rb"filesystem_uuid=[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-"
+    rb"[89ab][0-9a-f]{3}-[0-9a-f]{12} "
+    rb"device_id=KA-[0-9a-f]{24}"
+    rb"|KERNAID_RESCUE_FIRSTBOOT_FAILURE_V1 "
+    rb"code=([a-z0-9-]{1,64}) success=false"
+    rb")\r?\n"
+)
 LOGIN_OK_LINE = b"KERNAID_VAULT_LOGIN_V1 uid=1000 user=kernaid group=true"
 LOGIN_FAIL_LINE = b"KERNAID_VAULT_LOGIN_V1 invalid=true"
 # Interactive Bash places this one bracketed-paste disable sequence between an
@@ -257,6 +270,22 @@ class UnlockRemoteFailure(ClosedFailure):
 
 class CaptureLimitError(Exception):
     pass
+
+
+def wait_firstboot_attestation(
+    console: "SerialConsole", start: int, deadline: float
+) -> int:
+    """Require the shipping provisioner to attest complete durable state."""
+
+    result = console.wait_regex(
+        FIRSTBOOT_RESULT_PATTERN,
+        start=start,
+        deadline=deadline,
+        stage="firstboot-result",
+    )
+    if result.group(1) is not None:
+        raise ClosedFailure("firstboot", "provisioning-failed")
+    return result.end()
 
 
 class SecretExposureError(Exception):
@@ -3990,7 +4019,7 @@ def main(arguments: Sequence[str]) -> int:
             )
             qmp.set_deadline(_deadline(aggregate, 10.0))
             qmp.send_hex_line(correct)
-            console.wait_regex(
+            confirmation = console.wait_regex(
                 re.compile(
                     rb"KERNAID_RESCUE_FIRSTBOOT_PROMPT_READY_V1 step=confirmation"
                 ),
@@ -4000,6 +4029,11 @@ def main(arguments: Sequence[str]) -> int:
             )
             qmp.set_deadline(_deadline(aggregate, 10.0))
             qmp.send_hex_line(correct)
+            wait_firstboot_attestation(
+                console,
+                confirmation.end(),
+                _deadline(aggregate, READINESS_TIMEOUT_SECONDS),
+            )
         initial_version, pre_terminal_version, terminal_epoch_version, device_id = (
             run_lifecycle(
                 console,
