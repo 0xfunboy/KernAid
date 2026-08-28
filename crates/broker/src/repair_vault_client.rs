@@ -29,6 +29,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+use zeroize::Zeroizing;
 
 const REPAIR_VAULT_SOCKET: &str = "/run/kernaid-rescue-vault.sock";
 
@@ -134,7 +135,29 @@ impl VersionGuard {
 /// The body is deliberately omitted from `Debug`.
 pub struct RetrievedRepairBackup {
     status: RepairBackupStatusPayload,
-    bytes: Vec<u8>,
+    bytes: RepairBackupBytes,
+}
+
+/// Owned backup bytes which are zeroized before their allocation is released.
+/// The bytes intentionally have no `Debug` implementation.
+pub struct RepairBackupBytes(Zeroizing<Vec<u8>>);
+
+impl RepairBackupBytes {
+    fn new(bytes: Zeroizing<Vec<u8>>) -> Self {
+        Self(bytes)
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 impl RetrievedRepairBackup {
@@ -143,10 +166,10 @@ impl RetrievedRepairBackup {
     }
 
     pub fn bytes(&self) -> &[u8] {
-        &self.bytes
+        self.bytes.as_slice()
     }
 
-    pub fn into_bytes(self) -> Vec<u8> {
+    pub fn into_bytes(self) -> RepairBackupBytes {
         self.bytes
     }
 }
@@ -165,9 +188,17 @@ impl fmt::Debug for RetrievedRepairBackup {
 ///
 /// A new client has no trusted state version. Its first `reserve` uses
 /// `expectedStateVersion = 0`; an authenticated `STALE_STATE` supplies the
-/// version for one fresh, newly correlated retry. No other mutation retries.
+/// version for one fresh, newly correlated retry. If a reserve response is
+/// lost, only the exact same draft may use the retained last version to
+/// reconcile it. No other mutation retries.
 pub struct RepairVaultClient {
     guard: VersionGuard,
+    ambiguous_reserve: Option<RepairBackupDraft>,
+}
+
+struct ReserveAttempt<T> {
+    state_version: u64,
+    outcome: Result<T, RepairVaultClientError>,
 }
 
 impl Default for RepairVaultClient {
@@ -189,6 +220,7 @@ impl RepairVaultClient {
     pub const fn new() -> Self {
         Self {
             guard: VersionGuard::Uninitialized,
+            ambiguous_reserve: None,
         }
     }
 
@@ -203,50 +235,108 @@ impl RepairVaultClient {
         }
     }
 
+    fn observe_completed_read(&mut self, state_version: u64) {
+        if self.ambiguous_reserve.is_some() {
+            self.guard.mark_ambiguous(state_version);
+        } else {
+            self.guard.reconcile(state_version);
+        }
+    }
+
     /// Reserves bounded backup capacity. This is the sole state-version
-    /// bootstrap path; it performs at most one retry, and only after an
-    /// authenticated, correlated `STALE_STATE` response to expected version 0.
+    /// bootstrap path and the sole mutation which can reconcile an ambiguous
+    /// response by presenting the exact same draft again. It accepts at most
+    /// one authenticated `STALE_STATE` and retries at the observed version.
     pub fn reserve(
         &mut self,
         draft: &RepairBackupDraft,
         deadline: Instant,
     ) -> Result<RepairBackupStatusPayload, RepairVaultClientError> {
-        let bootstrapping = self.guard == VersionGuard::Uninitialized;
-        let expected_state_version = if bootstrapping {
-            0
-        } else {
-            self.guard.mutation_version()?
-        };
-        let first = self.mutation_exchange(
-            expected_state_version,
-            ClientRequestPayload::RepairBackupReserve {
-                draft: draft.clone(),
-            },
-            &[],
+        self.reserve_with_exchange(
+            draft,
             deadline,
-        )?;
+            |expected_state_version, draft, deadline| {
+                let response = exchange_once(
+                    expected_state_version,
+                    ClientRequestPayload::RepairBackupReserve {
+                        draft: draft.clone(),
+                    },
+                    &[],
+                    deadline,
+                )?;
+                Ok(ReserveAttempt {
+                    state_version: response.state_version(),
+                    outcome: status_result(&response),
+                })
+            },
+        )
+    }
 
-        if bootstrapping
-            && matches!(
-                first.outcome(),
-                ClientResponseOutcome::Error(ErrorToken::StaleState)
-            )
-        {
-            let observed = first.state_version();
-            if observed == expected_state_version {
-                return Err(RepairVaultClientError::Protocol);
+    fn reserve_with_exchange<T, F>(
+        &mut self,
+        draft: &RepairBackupDraft,
+        deadline: Instant,
+        mut exchange: F,
+    ) -> Result<T, RepairVaultClientError>
+    where
+        F: FnMut(u64, &RepairBackupDraft, Instant) -> Result<ReserveAttempt<T>, ExchangeFailure>,
+    {
+        let reconciling_ambiguous_reserve =
+            matches!(self.guard, VersionGuard::ReconciliationRequired(_));
+        let mut expected_state_version = match self.guard {
+            VersionGuard::Uninitialized => 0,
+            VersionGuard::Ready(state_version) => state_version,
+            VersionGuard::ReconciliationRequired(last_state_version)
+                if self.ambiguous_reserve.as_ref() == Some(draft) =>
+            {
+                last_state_version
             }
-            let retry = self.mutation_exchange(
-                observed,
-                ClientRequestPayload::RepairBackupReserve {
-                    draft: draft.clone(),
-                },
-                &[],
-                deadline,
-            )?;
-            return status_result(&retry);
+            VersionGuard::ReconciliationRequired(_) => {
+                return Err(RepairVaultClientError::ReconciliationRequired);
+            }
+        };
+
+        for attempt in 0..=1 {
+            let response = match exchange(expected_state_version, draft, deadline) {
+                Ok(response) => response,
+                Err(failure) if failure.request_may_have_been_sent => {
+                    self.guard.mark_ambiguous(expected_state_version);
+                    self.ambiguous_reserve = Some(draft.clone());
+                    return Err(RepairVaultClientError::ReconciliationRequired);
+                }
+                Err(failure) => return Err(failure.error),
+            };
+            match response.outcome {
+                Err(RepairVaultClientError::Remote(ErrorToken::StaleState)) if attempt == 0 => {
+                    if response.state_version == expected_state_version {
+                        if reconciling_ambiguous_reserve {
+                            self.guard.mark_ambiguous(response.state_version);
+                        } else {
+                            self.guard.reconcile(response.state_version);
+                            self.ambiguous_reserve = None;
+                        }
+                        return Err(RepairVaultClientError::Protocol);
+                    }
+                    expected_state_version = response.state_version;
+                    if reconciling_ambiguous_reserve {
+                        self.guard.mark_ambiguous(response.state_version);
+                    } else {
+                        self.guard.reconcile(response.state_version);
+                        self.ambiguous_reserve = None;
+                    }
+                }
+                outcome => {
+                    if outcome.is_ok() || !reconciling_ambiguous_reserve {
+                        self.guard.reconcile(response.state_version);
+                        self.ambiguous_reserve = None;
+                    } else {
+                        self.guard.mark_ambiguous(response.state_version);
+                    }
+                    return outcome;
+                }
+            }
         }
-        status_result(&first)
+        unreachable!("bounded reserve retry loop always returns")
     }
 
     /// Persists the exact backup body through a one-shot input pipe.
@@ -318,11 +408,11 @@ impl RepairVaultClient {
         let state_version = response.state_version();
         match status_result(&response) {
             Ok(status) => {
-                self.guard.reconcile(state_version);
+                self.observe_completed_read(state_version);
                 Ok(status)
             }
             Err(RepairVaultClientError::Remote(ErrorToken::Absent)) => {
-                self.guard.reconcile(state_version);
+                self.observe_completed_read(state_version);
                 Err(RepairVaultClientError::Remote(ErrorToken::Absent))
             }
             Err(error) => {
@@ -351,7 +441,7 @@ impl RepairVaultClient {
                 (**status).clone()
             }
             ClientResponseOutcome::Error(ErrorToken::Absent) => {
-                self.guard.reconcile(state_version);
+                self.observe_completed_read(state_version);
                 return Err(RepairVaultClientError::Remote(ErrorToken::Absent));
             }
             ClientResponseOutcome::Error(error) => {
@@ -370,8 +460,11 @@ impl RepairVaultClient {
         if digest(&bytes) != status.expected_backup_sha256().bytes() {
             return Err(RepairVaultClientError::Protocol);
         }
-        self.guard.reconcile(state_version);
-        Ok(RetrievedRepairBackup { status, bytes })
+        self.observe_completed_read(state_version);
+        Ok(RetrievedRepairBackup {
+            status,
+            bytes: RepairBackupBytes::new(bytes),
+        })
     }
 
     pub fn cancel(
@@ -420,10 +513,12 @@ impl RepairVaultClient {
         match exchange_once(expected_state_version, payload, descriptors, deadline) {
             Ok(response) => {
                 self.guard.reconcile(response.state_version());
+                self.ambiguous_reserve = None;
                 Ok(response)
             }
             Err(failure) if failure.request_may_have_been_sent => {
                 self.guard.mark_ambiguous(expected_state_version);
+                self.ambiguous_reserve = None;
                 Err(RepairVaultClientError::ReconciliationRequired)
             }
             Err(failure) => Err(failure.error),
@@ -629,7 +724,7 @@ fn read_exact_pipe(
     descriptor: OwnedFd,
     expected_size: u64,
     deadline: Instant,
-) -> Result<Vec<u8>, RepairVaultClientError> {
+) -> Result<Zeroizing<Vec<u8>>, RepairVaultClientError> {
     let expected = usize::try_from(expected_size)
         .ok()
         .filter(|size| *size > 0)
@@ -641,10 +736,10 @@ fn read_exact_pipe(
     }
     rfs::fcntl_setfl(&descriptor, status | OFlags::NONBLOCK)
         .map_err(|_| RepairVaultClientError::InvalidTransport)?;
-    let mut bytes = Vec::with_capacity(expected);
+    let mut bytes = Zeroizing::new(Vec::with_capacity(expected));
     while bytes.len() < expected {
         ensure_before(deadline)?;
-        let mut chunk = [0_u8; 8192];
+        let mut chunk = Zeroizing::new([0_u8; 8192]);
         let wanted = (expected - bytes.len()).min(chunk.len());
         match rustix::io::read(&descriptor, &mut chunk[..wanted]) {
             Ok(0) => return Err(RepairVaultClientError::PipeIoFailed),
@@ -658,8 +753,8 @@ fn read_exact_pipe(
     }
     loop {
         ensure_before(deadline)?;
-        let mut extra = [0_u8; 1];
-        match rustix::io::read(&descriptor, &mut extra) {
+        let mut extra = Zeroizing::new([0_u8; 1]);
+        match rustix::io::read(&descriptor, &mut extra[..]) {
             Ok(0) => return Ok(bytes),
             Ok(_) => return Err(RepairVaultClientError::Protocol),
             Err(error) if error == rustix::io::Errno::INTR => {}
@@ -742,6 +837,27 @@ mod tests {
         .expect("draft")
     }
 
+    fn different_draft() -> RepairBackupDraft {
+        let metadata = RepairFileMetadataV1::new(0o644, 0, 0).expect("metadata");
+        RepairBackupDraft::new(
+            "S-different-session",
+            "selected-linux-root",
+            hash('1'),
+            hash('3'),
+            metadata.canonical_sha256(),
+            4,
+            4096,
+        )
+        .expect("different draft")
+    }
+
+    fn ambiguous_reserve_client(draft: &RepairBackupDraft) -> RepairVaultClient {
+        let mut client = RepairVaultClient::new();
+        client.guard.mark_ambiguous(17);
+        client.ambiguous_reserve = Some(draft.clone());
+        client
+    }
+
     #[test]
     fn request_codec_remains_typed_and_path_free() {
         let request = ClientRequest::new(
@@ -793,14 +909,179 @@ mod tests {
     }
 
     #[test]
+    fn unrelated_status_and_get_reads_do_not_clear_an_ambiguous_reserve() {
+        let original = draft();
+        let different = different_draft();
+        let mut client = ambiguous_reserve_client(&original);
+
+        // A successful status and a successful/Absent get both carry useful
+        // authenticated versions, but neither proves the lost reserve result.
+        client.observe_completed_read(21);
+        client.observe_completed_read(24);
+        assert_eq!(
+            client.state(),
+            RepairVaultClientState::ReconciliationRequired {
+                last_state_version: 24
+            }
+        );
+        assert_eq!(client.ambiguous_reserve.as_ref(), Some(&original));
+
+        let mut exchanged = false;
+        let result: Result<u8, _> = client.reserve_with_exchange(
+            &different,
+            Instant::now() + Duration::from_secs(1),
+            |_, _, _| {
+                exchanged = true;
+                Err(definite_failure(RepairVaultClientError::Protocol))
+            },
+        );
+        assert_eq!(result, Err(RepairVaultClientError::ReconciliationRequired));
+        assert!(!exchanged);
+        assert_eq!(client.ambiguous_reserve.as_ref(), Some(&original));
+    }
+
+    #[test]
+    fn ambiguous_reserve_retries_exact_draft_at_one_observed_stale_version() {
+        let draft = draft();
+        let mut client = ambiguous_reserve_client(&draft);
+        let mut versions = Vec::new();
+        let result = client.reserve_with_exchange(
+            &draft,
+            Instant::now() + Duration::from_secs(1),
+            |expected_state_version, observed_draft, _| {
+                assert_eq!(observed_draft, &draft);
+                versions.push(expected_state_version);
+                if versions.len() == 1 {
+                    Ok(ReserveAttempt {
+                        state_version: 21,
+                        outcome: Err(RepairVaultClientError::Remote(ErrorToken::StaleState)),
+                    })
+                } else {
+                    Ok(ReserveAttempt {
+                        state_version: 22,
+                        outcome: Ok(7_u8),
+                    })
+                }
+            },
+        );
+
+        assert_eq!(result, Ok(7));
+        assert_eq!(versions, [17, 21]);
+        assert_eq!(
+            client.state(),
+            RepairVaultClientState::Ready { state_version: 22 }
+        );
+        assert!(client.ambiguous_reserve.is_none());
+    }
+
+    #[test]
+    fn repeated_reserve_response_loss_remains_ambiguous_at_last_version() {
+        let draft = draft();
+        let mut client = ambiguous_reserve_client(&draft);
+        let mut attempts = 0;
+        let result: Result<u8, _> = client.reserve_with_exchange(
+            &draft,
+            Instant::now() + Duration::from_secs(1),
+            |expected_state_version, _, _| {
+                attempts += 1;
+                if attempts == 1 {
+                    assert_eq!(expected_state_version, 17);
+                    Ok(ReserveAttempt {
+                        state_version: 21,
+                        outcome: Err(RepairVaultClientError::Remote(ErrorToken::StaleState)),
+                    })
+                } else {
+                    assert_eq!(expected_state_version, 21);
+                    Err(ExchangeFailure {
+                        error: RepairVaultClientError::TimedOut,
+                        request_may_have_been_sent: true,
+                    })
+                }
+            },
+        );
+
+        assert_eq!(result, Err(RepairVaultClientError::ReconciliationRequired));
+        assert_eq!(attempts, 2);
+        assert_eq!(
+            client.state(),
+            RepairVaultClientState::ReconciliationRequired {
+                last_state_version: 21
+            }
+        );
+        assert_eq!(client.ambiguous_reserve.as_ref(), Some(&draft));
+    }
+
+    #[test]
+    fn ambiguous_reserve_rejects_a_different_draft_without_an_exchange() {
+        let original = draft();
+        let different = different_draft();
+        let mut client = ambiguous_reserve_client(&original);
+        let mut exchanged = false;
+        let result: Result<u8, _> = client.reserve_with_exchange(
+            &different,
+            Instant::now() + Duration::from_secs(1),
+            |_, _, _| {
+                exchanged = true;
+                Err(definite_failure(RepairVaultClientError::Protocol))
+            },
+        );
+
+        assert_eq!(result, Err(RepairVaultClientError::ReconciliationRequired));
+        assert!(!exchanged);
+        assert_eq!(client.ambiguous_reserve.as_ref(), Some(&original));
+        assert_eq!(
+            client.state(),
+            RepairVaultClientState::ReconciliationRequired {
+                last_state_version: 17
+            }
+        );
+    }
+
+    #[test]
+    fn reserve_accepts_only_one_stale_response() {
+        let draft = draft();
+        let mut client = ambiguous_reserve_client(&draft);
+        let mut versions = Vec::new();
+        let result: Result<u8, _> = client.reserve_with_exchange(
+            &draft,
+            Instant::now() + Duration::from_secs(1),
+            |expected_state_version, _, _| {
+                versions.push(expected_state_version);
+                Ok(ReserveAttempt {
+                    state_version: if versions.len() == 1 { 21 } else { 22 },
+                    outcome: Err(RepairVaultClientError::Remote(ErrorToken::StaleState)),
+                })
+            },
+        );
+
+        assert_eq!(
+            result,
+            Err(RepairVaultClientError::Remote(ErrorToken::StaleState))
+        );
+        assert_eq!(versions, [17, 21]);
+        assert_eq!(
+            client.state(),
+            RepairVaultClientState::ReconciliationRequired {
+                last_state_version: 22
+            }
+        );
+        assert_eq!(client.ambiguous_reserve.as_ref(), Some(&draft));
+    }
+
+    #[test]
     fn pipe_helpers_enforce_exact_body_and_do_not_debug_bytes() {
         let body = b"test";
         let (read, write) = pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK).expect("pipe");
         let deadline = Instant::now() + Duration::from_secs(1);
         thread::scope(|scope| {
             let writer = scope.spawn(move || write_exact_pipe(write, body, deadline));
-            assert_eq!(read_exact_pipe(read, 4, deadline).expect("read"), body);
+            let read_back: Zeroizing<Vec<u8>> = read_exact_pipe(read, 4, deadline).expect("read");
+            assert_eq!(read_back.as_slice(), body);
             writer.join().expect("writer thread").expect("write");
         });
+        let owned = RepairBackupBytes::new(Zeroizing::new(body.to_vec()));
+        assert_eq!(owned.as_slice(), body);
+        assert_eq!(owned.len(), body.len());
+        assert!(!owned.is_empty());
     }
 }

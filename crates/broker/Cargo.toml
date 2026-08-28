@@ -28,6 +28,7 @@ rescue-fstab-production-candidate = [
 repair-vault-client = [
     "dep:rustix",
     "dep:sha2",
+    "dep:zeroize",
     "kernaid-protocol/experimental-repair-store",
 ]
 rescue-target-physical-parent = [
@@ -48,6 +49,7 @@ rustix = { version = "1.1.4", features = ["event", "fs", "mount", "net", "pipe",
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 sha2 = { version = "0.10", optional = true }
+zeroize = { version = "1.8", optional = true }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 kernaid-evidence = { path = "../evidence" }
