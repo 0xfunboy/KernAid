@@ -35,6 +35,14 @@ const OPENAI_AGENT_GROUP: &[u8] = b"kernaid-openai";
 const APPLICATION_AGENT_GROUP: &[u8] = b"kernaid-application";
 const OPENAI_VAULT_GROUP: &[u8] = b"kernaid-vault";
 const PROVIDER_CLIENT_GROUP: &[u8] = b"kernaid-provider-client";
+#[cfg(feature = "experimental-repair-store")]
+const REPAIR_BROKER_NAME: &[u8] = b"kernaid-repair";
+#[cfg(feature = "experimental-repair-store")]
+const REPAIR_BROKER_GECOS: &[u8] = b"KernAid Rescue repair broker";
+#[cfg(feature = "experimental-repair-store")]
+const REPAIR_BROKER_HOME: &[u8] = b"/nonexistent";
+#[cfg(feature = "experimental-repair-store")]
+const REPAIR_BROKER_SHELL: &[u8] = b"/usr/sbin/nologin";
 #[cfg(feature = "experimental-codex-home-lease")]
 const CODEX_AGENT_NAME: &[u8] = b"kernaid-codex";
 #[cfg(feature = "experimental-codex-home-lease")]
@@ -474,6 +482,157 @@ fn passwd_isolated_agent_uid(
     Some(uid)
 }
 
+/// Resolves the dynamically allocated, dedicated repair broker identity from
+/// the already trusted `/etc/passwd` descriptor. The private UID/GID pair may
+/// not collide with any other account and is never accepted from an argument,
+/// environment variable, or wire field.
+#[cfg(feature = "experimental-repair-store")]
+pub(super) fn passwd_repair_broker_uid(bytes: &[u8], companion_uid: u32) -> Option<u32> {
+    struct Entry<'a> {
+        name: &'a [u8],
+        uid: u32,
+        gid: u32,
+    }
+
+    let mut entries = Vec::new();
+    let mut repair_uid = None;
+    for line in bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        if line.len() > 4096 || line.contains(&0) {
+            return None;
+        }
+        let fields: Vec<&[u8]> = line.split(|byte| *byte == b':').collect();
+        if fields.len() != 7
+            || fields[0].is_empty()
+            || fields[2].is_empty()
+            || fields[3].is_empty()
+            || !fields[2].iter().all(u8::is_ascii_digit)
+            || !fields[3].iter().all(u8::is_ascii_digit)
+            || (fields[2].len() > 1 && fields[2][0] == b'0')
+            || (fields[3].len() > 1 && fields[3][0] == b'0')
+        {
+            return None;
+        }
+        let uid = std::str::from_utf8(fields[2])
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())?;
+        let gid = std::str::from_utf8(fields[3])
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())?;
+        entries.push(Entry {
+            name: fields[0],
+            uid,
+            gid,
+        });
+        if fields[0] == REPAIR_BROKER_NAME {
+            if repair_uid.is_some()
+                || uid == 0
+                || uid == COMPANION_UID
+                || uid == companion_uid
+                || gid != uid
+                || fields[4] != REPAIR_BROKER_GECOS
+                || fields[5] != REPAIR_BROKER_HOME
+                || fields[6] != REPAIR_BROKER_SHELL
+            {
+                return None;
+            }
+            repair_uid = Some(uid);
+        }
+    }
+
+    let uid = repair_uid?;
+    if entries
+        .iter()
+        .filter(|entry| entry.name == REPAIR_BROKER_NAME)
+        .count()
+        != 1
+        || entries.iter().filter(|entry| entry.uid == uid).count() != 1
+        || entries.iter().filter(|entry| entry.gid == uid).count() != 1
+    {
+        return None;
+    }
+    Some(uid)
+}
+
+/// Validates the private primary group for the repair broker. The group must
+/// have the same dynamically allocated numeric identity, no colliding name or
+/// GID, and the account may not appear in any static membership list.
+#[cfg(feature = "experimental-repair-store")]
+pub(super) fn group_has_exact_repair_broker(bytes: &[u8], repair_uid: u32) -> bool {
+    struct Entry<'a> {
+        name: &'a [u8],
+        gid: u32,
+        members: Vec<&'a [u8]>,
+    }
+
+    if repair_uid == 0 || repair_uid == COMPANION_UID {
+        return false;
+    }
+    let mut entries = Vec::new();
+    for line in bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        if line.len() > 4096 || line.contains(&0) {
+            return false;
+        }
+        let fields: Vec<&[u8]> = line.split(|byte| *byte == b':').collect();
+        if fields.len() != 4
+            || fields[0].is_empty()
+            || fields[2].is_empty()
+            || !fields[2].iter().all(u8::is_ascii_digit)
+            || (fields[2].len() > 1 && fields[2][0] == b'0')
+        {
+            return false;
+        }
+        let Some(gid) = std::str::from_utf8(fields[2])
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            return false;
+        };
+        let members = if fields[3].is_empty() {
+            Vec::new()
+        } else {
+            let members: Vec<&[u8]> = fields[3].split(|byte| *byte == b',').collect();
+            if members.iter().any(|member| member.is_empty()) {
+                return false;
+            }
+            for (index, member) in members.iter().enumerate() {
+                if members[..index].contains(member) {
+                    return false;
+                }
+            }
+            members
+        };
+        entries.push(Entry {
+            name: fields[0],
+            gid,
+            members,
+        });
+    }
+
+    let mut matching = entries
+        .iter()
+        .filter(|entry| entry.name == REPAIR_BROKER_NAME);
+    let Some(repair_group) = matching.next() else {
+        return false;
+    };
+    matching.next().is_none()
+        && repair_group.gid == repair_uid
+        && repair_group.members.is_empty()
+        && entries
+            .iter()
+            .filter(|entry| entry.gid == repair_uid)
+            .count()
+            == 1
+        && !entries
+            .iter()
+            .any(|entry| entry.members.contains(&REPAIR_BROKER_NAME))
+}
+
 /// Validates the fixed, collision-free Codex identity used by both the
 /// descriptor owner and the authenticated Agent role. The UID/GID are never
 /// accepted from configuration or the wire.
@@ -808,6 +967,56 @@ kernaid-openai:x:994:\n";
         ] {
             assert!(!group_has_exact_application_boundaries(invalid, 994, 995));
         }
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    #[test]
+    fn repair_broker_passwd_identity_is_exact_and_collision_free() {
+        const PASSWD: &[u8] = b"root:x:0:0:root:/root:/bin/bash\n\
+kernaid:x:1000:1000:KernAid:/home/kernaid:/bin/bash\n\
+kernaid-repair:x:996:996:KernAid Rescue repair broker:/nonexistent:/usr/sbin/nologin\n\
+kernaid-openai:x:994:994:KernAid Rescue OpenAI executor:/nonexistent:/usr/sbin/nologin\n";
+        assert_eq!(passwd_repair_broker_uid(PASSWD, 1000), Some(996));
+
+        for invalid in [
+            b"root:x:0:0:root:/root:/bin/bash\nkernaid-repair:x:0:0:KernAid Rescue repair broker:/nonexistent:/usr/sbin/nologin\n".to_vec(),
+            b"root:x:0:0:root:/root:/bin/bash\nkernaid-repair:x:1000:1000:KernAid Rescue repair broker:/nonexistent:/usr/sbin/nologin\n".to_vec(),
+            b"root:x:0:0:root:/root:/bin/bash\nkernaid-repair:x:996:995:KernAid Rescue repair broker:/nonexistent:/usr/sbin/nologin\n".to_vec(),
+            b"root:x:0:0:root:/root:/bin/bash\nkernaid-repair:x:996:996:repair:/nonexistent:/usr/sbin/nologin\n".to_vec(),
+            b"root:x:0:0:root:/root:/bin/bash\nkernaid-repair:x:996:996:KernAid Rescue repair broker:/home/repair:/usr/sbin/nologin\n".to_vec(),
+            b"root:x:0:0:root:/root:/bin/bash\nkernaid-repair:x:996:996:KernAid Rescue repair broker:/nonexistent:/bin/bash\n".to_vec(),
+            [
+                PASSWD,
+                b"kernaid-repair:x:995:995:KernAid Rescue repair broker:/nonexistent:/usr/sbin/nologin\n",
+            ]
+            .concat(),
+            [PASSWD, b"other:x:996:995:collision:/nonexistent:/usr/sbin/nologin\n"].concat(),
+            [PASSWD, b"other:x:995:996:collision:/nonexistent:/usr/sbin/nologin\n"].concat(),
+        ] {
+            assert_eq!(passwd_repair_broker_uid(&invalid, 1000), None);
+        }
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    #[test]
+    fn repair_broker_group_is_private_and_collision_free() {
+        const GROUP: &[u8] = b"root:x:0:\n\
+kernaid-vault:x:993:kernaid,kernaid-openai,kernaid-application\n\
+kernaid-repair:x:996:\n\
+kernaid-openai:x:994:\n";
+        assert!(group_has_exact_repair_broker(GROUP, 996));
+        for invalid in [
+            b"root:x:0:\nkernaid-repair:x:995:\n".to_vec(),
+            b"root:x:0:\nkernaid-repair:x:996:other\n".to_vec(),
+            b"root:x:0:\nkernaid-repair:x:996:\nextra:x:995:kernaid-repair\n".to_vec(),
+            b"root:x:0:\nkernaid-repair:x:996:\nkernaid-repair:x:995:\n".to_vec(),
+            b"root:x:0:\nkernaid-repair:x:996:\nother:x:996:\n".to_vec(),
+            b"root:x:0:\nkernaid-repair:x:0996:\n".to_vec(),
+        ] {
+            assert!(!group_has_exact_repair_broker(&invalid, 996));
+        }
+        assert!(!group_has_exact_repair_broker(GROUP, 0));
+        assert!(!group_has_exact_repair_broker(GROUP, 1000));
     }
 
     #[cfg(feature = "experimental-codex-home-lease")]

@@ -13,6 +13,8 @@ use super::{
 #[cfg(feature = "experimental-codex-home-lease")]
 use super::{group_has_exact_codex_boundaries, passwd_has_exact_codex_agent};
 #[cfg(feature = "experimental-repair-store")]
+use super::{group_has_exact_repair_broker, passwd_repair_broker_uid};
+#[cfg(feature = "experimental-repair-store")]
 use kernaid_protocol::rescue_repair_vault::{
     MAX_REPAIR_BACKUP_BYTES, RepairBackupBinding, RepairBackupDraft, RepairBackupReleasePayload,
     RepairBackupState, RepairBackupStatusPayload, RepairFileMetadataV1, RepairReservationId,
@@ -1174,7 +1176,12 @@ fn validated_peer_allowlist(companion_uid: u32) -> Result<PeerAllowlist, RescueV
         .ok_or(RescueVaultDaemonError::InvalidConfiguration)?;
     let application_uid = passwd_application_agent_uid(&bytes, companion_uid)
         .ok_or(RescueVaultDaemonError::InvalidConfiguration)?;
+    #[cfg(feature = "experimental-repair-store")]
+    let repair_uid = passwd_repair_broker_uid(&bytes, companion_uid)
+        .ok_or(RescueVaultDaemonError::InvalidConfiguration)?;
     validate_application_agent_groups(openai_uid, application_uid)?;
+    #[cfg(feature = "experimental-repair-store")]
+    validate_repair_broker_group(repair_uid)?;
     #[cfg(feature = "experimental-codex-home-lease")]
     validate_codex_agent_groups()?;
     let builder = PeerAllowlist::builder(companion_uid)
@@ -1185,9 +1192,39 @@ fn validated_peer_allowlist(companion_uid: u32) -> Result<PeerAllowlist, RescueV
     let builder = builder
         .agent(AgentRole::Codex, crate::CODEX_AGENT_UID)
         .map_err(|_| RescueVaultDaemonError::InvalidConfiguration)?;
+    #[cfg(feature = "experimental-repair-store")]
+    let builder = builder
+        .repair_broker(repair_uid)
+        .map_err(|_| RescueVaultDaemonError::InvalidConfiguration)?;
     builder
         .build()
         .map_err(|_| RescueVaultDaemonError::InvalidConfiguration)
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn validate_repair_broker_group(repair_uid: u32) -> Result<(), RescueVaultDaemonError> {
+    let descriptor = rfs::openat2(
+        rfs::CWD,
+        GROUP_FILE_PATH,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        rfs::Mode::empty(),
+        rfs::ResolveFlags::NO_SYMLINKS | rfs::ResolveFlags::NO_MAGICLINKS,
+    )
+    .map_err(|_| RescueVaultDaemonError::InvalidConfiguration)?;
+    let stat = rfs::fstat(&descriptor).map_err(|_| RescueVaultDaemonError::InvalidConfiguration)?;
+    if !FileType::from_raw_mode(stat.st_mode).is_file()
+        || stat.st_uid != 0
+        || stat.st_gid != 0
+        || stat.st_nlink != 1
+        || stat.st_mode & 0o022 != 0
+    {
+        return Err(RescueVaultDaemonError::InvalidConfiguration);
+    }
+    let bytes = read_file_bounded(descriptor.as_fd(), GROUP_FILE_LIMIT)?;
+    if !group_has_exact_repair_broker(&bytes, repair_uid) {
+        return Err(RescueVaultDaemonError::InvalidConfiguration);
+    }
+    Ok(())
 }
 
 #[cfg(feature = "experimental-codex-home-lease")]

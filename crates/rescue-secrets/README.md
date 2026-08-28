@@ -243,7 +243,12 @@ installs into the retained directory with fsync, then verifies the complete
 named object. Status and Get require the opaque reservation plus its draft
 binding and expose no host path. The daemon carries the full capability,
 canonical root-owned `fstab` metadata and durable plan/approval binding over a
-feature-specific closed internal wire ABI; its default ABI is unchanged.
+feature-specific closed internal wire ABI; its default ABI is unchanged. With
+the feature enabled, startup resolves `kernaid-repair` only from trusted
+root-owned `/etc/passwd` and `/etc/group` descriptors, requires the exact
+private account/group contract, and adds that dynamic UID as the sole Repair
+Broker peer; any missing, malformed, colliding, or statically grouped identity
+fails closed.
 
 The journal binds durable Vault identity to the authenticated LUKS UUID and
 provisioned device-identity public key before crash recovery. The live physical
