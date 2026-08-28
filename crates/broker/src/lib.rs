@@ -12,6 +12,16 @@ pub mod fixture_repair;
 #[cfg(all(target_os = "linux", feature = "rescue-fstab-production-candidate"))]
 pub mod rescue_fstab_candidate;
 
+/// Descriptor-only, detached read-only ext4 observation for the Rescue
+/// `fstab` candidate. The module is absent from default broker builds.
+#[cfg(all(target_os = "linux", feature = "rescue-fstab-production-candidate"))]
+pub mod rescue_fstab_observer;
+
+/// Linux-only client for the fixed, root-authenticated Rescue repair-vault
+/// endpoint. It is opt-in and exposes only the closed repair lifecycle.
+#[cfg(all(target_os = "linux", feature = "repair-vault-client"))]
+pub mod repair_vault_client;
+
 /// Linux-only client for the root-owned, fixed Rescue target-capability
 /// endpoint. It transfers a read-only block descriptor and path-free claims;
 /// no normal broker build contains this transport.
