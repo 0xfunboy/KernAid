@@ -1974,6 +1974,56 @@ class ProbeRunnerTests(unittest.TestCase):
 
 
 class QmpTests(unittest.TestCase):
+    def test_firstboot_hex_line_is_paced_one_key_per_qmp_request(self) -> None:
+        secret = bytearray(b"0123456789abcdef" * 4)
+        client = controller.QmpClient(mock.Mock(), time.monotonic() + 5)
+        calls: list[tuple[str, dict[str, object]]] = []
+
+        def accept(command: str, arguments: dict[str, object]) -> None:
+            calls.append((command, arguments))
+
+        try:
+            with (
+                mock.patch.object(client, "execute", side_effect=accept),
+                mock.patch.object(controller.time, "sleep") as sleep,
+            ):
+                client.send_hex_line(secret)
+        finally:
+            controller.wipe(secret)
+
+        expected_qcodes = list("0123456789abcdef" * 4) + ["ret"]
+        self.assertEqual(len(calls), len(expected_qcodes))
+        for (command, arguments), expected_qcode in zip(
+            calls, expected_qcodes, strict=True
+        ):
+            self.assertEqual(command, "input-send-event")
+            events = arguments["events"]
+            self.assertEqual(len(events), 2)
+            self.assertEqual(
+                [event["data"]["down"] for event in events], [True, False]
+            )
+            self.assertEqual(
+                [event["data"]["key"] for event in events],
+                [{"type": "qcode", "data": expected_qcode}] * 2,
+            )
+        self.assertEqual(
+            sleep.call_args_list,
+            [mock.call(controller.QMP_KEY_SETTLE_SECONDS)] * len(expected_qcodes),
+        )
+
+    def test_firstboot_hex_line_rejects_invalid_alphabet_before_qmp(self) -> None:
+        client = controller.QmpClient(mock.Mock(), time.monotonic() + 5)
+        with (
+            mock.patch.object(client, "execute") as execute,
+            self.assertRaises(controller.ClosedFailure) as failure,
+        ):
+            client.send_hex_line(bytearray(b"NOT_HEX"))
+        self.assertEqual(
+            (failure.exception.stage, failure.exception.code),
+            ("firstboot", "key-alphabet-invalid"),
+        )
+        execute.assert_not_called()
+
     def test_qmp_capabilities_and_acpi_powerdown_are_correlated(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "qmp.sock"

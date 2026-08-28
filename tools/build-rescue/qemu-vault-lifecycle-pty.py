@@ -41,6 +41,7 @@ RATE_LIMIT_WAIT_SECONDS = 2.25
 QEMU_START_TIMEOUT_SECONDS = 15.0
 READINESS_TIMEOUT_SECONDS = 1200.0
 CONTROLLER_TIMEOUT_SECONDS = 1800
+QMP_KEY_SETTLE_SECONDS = 0.02
 ACPI_SHUTDOWN_SECONDS = 180.0
 SHUTDOWN_RESERVE_SECONDS = ACPI_SHUTDOWN_SECONDS + 15.0
 PROCESS_CLEANUP_SECONDS = 5.0
@@ -1606,20 +1607,29 @@ class QmpClient:
     def send_hex_line(self, secret: bytearray) -> None:
         if not secret or any(value not in b"0123456789abcdef" for value in secret):
             raise ClosedFailure("firstboot", "key-alphabet-invalid")
-        events: list[dict[str, object]] = []
-        for value in bytes(secret) + b"\n":
-            qcode = "ret" if value == 10 else chr(value)
-            for down in (True, False):
-                events.append(
-                    {
-                        "type": "key",
-                        "data": {
-                            "down": down,
-                            "key": {"type": "qcode", "data": qcode},
-                        },
-                    }
-                )
+        # A single 64-byte line is 130 key down/up events including Return.
+        # Sending that as one QMP burst can overrun the emulated keyboard path:
+        # QMP acknowledges command acceptance, not consumption by tty1.  Keep
+        # each correlated request bounded to one key and give i8042/tty1 time
+        # to consume it before the next request.  Never retry a whole secret
+        # line because a partial delivery would then concatenate credentials.
+        for value in secret:
+            self._send_paced_qcode(chr(value))
+        self._send_paced_qcode("ret")
+
+    def _send_paced_qcode(self, qcode: str) -> None:
+        events = [
+            {
+                "type": "key",
+                "data": {
+                    "down": down,
+                    "key": {"type": "qcode", "data": qcode},
+                },
+            }
+            for down in (True, False)
+        ]
         self.execute("input-send-event", {"events": events})
+        time.sleep(QMP_KEY_SETTLE_SECONDS)
 
     def quit(self) -> None:
         self.execute("quit")
