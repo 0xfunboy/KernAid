@@ -1506,7 +1506,10 @@ mod tests {
         )
         .expect("apply exact replacement");
         assert_eq!(observation.resource_sha256, *intent.after_sha256());
-        assert_eq!(fs::read(tree.path().join(FSTAB_RESOURCE)).unwrap(), AFTER);
+        assert_eq!(
+            fs::read(tree.path().join(FSTAB_RESOURCE)).expect("read replaced fstab"),
+            AFTER
+        );
         assert!(!tree.path().join(execution_stage_name(RESERVATION)).exists());
 
         let restored = restore_exact_backup(
@@ -1519,7 +1522,10 @@ mod tests {
         )
         .expect("restore exact backup");
         assert_eq!(restored.resource_sha256, *intent.before_sha256());
-        assert_eq!(fs::read(tree.path().join(FSTAB_RESOURCE)).unwrap(), BEFORE);
+        assert_eq!(
+            fs::read(tree.path().join(FSTAB_RESOURCE)).expect("read restored fstab"),
+            BEFORE
+        );
         assert!(!tree.path().join(restore_stage_name(RESERVATION)).exists());
     }
 
@@ -1549,6 +1555,9 @@ mod tests {
             )
             .is_err()
         );
-        assert_eq!(fs::read(tree.path().join(FSTAB_RESOURCE)).unwrap(), third);
+        assert_eq!(
+            fs::read(tree.path().join(FSTAB_RESOURCE)).expect("read independently edited fstab"),
+            third
+        );
     }
 }
