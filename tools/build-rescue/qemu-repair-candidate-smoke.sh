@@ -71,6 +71,14 @@ after_sha256="sha256:$(sha256sum "$expected_after" | awk '{print $1}')"
 truncate -s 256M -- "$target_image"
 mkfs.ext4 -q -F -U 11111111-1111-4111-8111-111111111111 \
   -L KERNAID_REPAIR_TARGET -d "$seed" "$target_image"
+# mkfs.ext4 -d preserves the unprivileged runner ownership and umask.  Normalize
+# the disposable guest fixture to the production metadata contract before boot.
+debugfs -w -R "set_inode_field /etc uid 0" "$target_image" >/dev/null 2>&1
+debugfs -w -R "set_inode_field /etc gid 0" "$target_image" >/dev/null 2>&1
+debugfs -w -R "set_inode_field /etc mode 040755" "$target_image" >/dev/null 2>&1
+debugfs -w -R "set_inode_field /etc/fstab uid 0" "$target_image" >/dev/null 2>&1
+debugfs -w -R "set_inode_field /etc/fstab gid 0" "$target_image" >/dev/null 2>&1
+debugfs -w -R "set_inode_field /etc/fstab mode 0100644" "$target_image" >/dev/null 2>&1
 target_before_sha256="$(sha256sum "$target_image" | awk '{print $1}')"
 
 iso_bytes="$(stat -c '%s' -- "$iso")"

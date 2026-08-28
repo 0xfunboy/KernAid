@@ -22,6 +22,15 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
         )
         self.assertEqual(source.count("serial=KERNAID-REPAIR-V1"), 1)
         self.assertIn("mkfs.ext4", source)
+        for required in (
+            'set_inode_field /etc uid 0',
+            'set_inode_field /etc gid 0',
+            'set_inode_field /etc mode 040755',
+            'set_inode_field /etc/fstab uid 0',
+            'set_inode_field /etc/fstab gid 0',
+            'set_inode_field /etc/fstab mode 0100644',
+        ):
+            self.assertIn(required, source)
         self.assertIn("physical_parents=distinct", source)
         self.assertIn("host_physical_devices=false", source)
         self.assertNotIn("/dev/sd", source)
