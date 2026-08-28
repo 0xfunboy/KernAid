@@ -10,6 +10,7 @@ LIVE = REPO / "rescue/live-build/config/includes.chroot"
 CANDIDATE = REPO / "rescue/live-build/candidate"
 BUILD = REPO / "tools/build-rescue/build.sh"
 HOOK = REPO / "rescue/live-build/config/hooks/live/0100-kernaid-safety.hook.chroot"
+WORKFLOW = REPO / ".github/workflows/rescue-repair-candidate.yml"
 
 
 def unit_directives(path: Path) -> dict[str, dict[str, list[str]]]:
@@ -30,6 +31,18 @@ def unit_directives(path: Path) -> dict[str, dict[str, list[str]]]:
 
 
 class RepairCandidatePackagingTests(unittest.TestCase):
+    def test_candidate_workflow_is_manual_isolated_and_publishes_only_iso(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("on:\n  workflow_dispatch:\n", workflow)
+        self.assertNotIn("\n  push:", workflow)
+        self.assertIn("node-version: 24.18.0", workflow)
+        self.assertIn("KERNAID_REPAIR_CANDIDATE=1", workflow)
+        self.assertIn("--features rescue-fstab-production-candidate", workflow)
+        self.assertEqual(workflow.count("./tools/build-rescue/qemu-smoke.sh"), 2)
+        self.assertIn("name: KernAid-Rescue-amd64-repair-candidate", workflow)
+        for forbidden in ("catalog-entry", "qualified-release", "deploy-pages"):
+            self.assertNotIn(forbidden, workflow)
+
     def test_default_profile_contains_no_candidate_artifact_or_client_group(self) -> None:
         absent = (
             LIVE / "usr/lib/kernaid/kernaid-rescue-repaird",
@@ -238,10 +251,8 @@ class RepairCandidatePackagingTests(unittest.TestCase):
         self.assertEqual(
             dropin["Unit"]["After"], ["kernaid-rescue-repaird.service"]
         )
-        self.assertEqual(
-            dropin["Service"]["SupplementaryGroups"],
-            ["kernaid-repair-client"],
-        )
+        self.assertEqual(dropin["Service"]["Group"], ["kernaid-repair-client"])
+        self.assertNotIn("SupplementaryGroups", dropin["Service"])
         ready_dropin = unit_directives(
             CANDIDATE / "50-kernaid-repair-candidate-ready.conf"
         )["Unit"]

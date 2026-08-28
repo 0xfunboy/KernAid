@@ -1,0 +1,143 @@
+name: rescue repair candidate
+
+on:
+  workflow_dispatch:
+
+permissions: { contents: read }
+
+jobs:
+  build-and-smoke-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: pnpm/action-setup@v4
+        with: { version: 9.15.9 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 24.18.0, cache: pnpm }
+      - name: Build Desk
+        run: |
+          test "$(node --version)" = "v24.18.0"
+          pnpm install --frozen-lockfile
+          pnpm --filter @kernaid/desk build
+
+      - name: Install build and VM tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cryptsetup dosfstools e2fsprogs gdisk mtools ntfs-3g \
+            ovmf pkg-config qemu-system-x86 shellcheck udev util-linux \
+            libdbus-1-dev libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev librsvg2-dev procps
+
+      - name: Validate candidate packaging and shell syntax
+        run: |
+          python3 -m unittest \
+            tools/build-rescue/tests/test_repair_candidate_packaging.py \
+            tools/build-rescue/tests/test_live_image_vault_packaging.py -v
+          bash -n tools/build-rescue/build.sh tools/build-rescue/qemu-smoke.sh
+          shellcheck tools/build-rescue/build.sh tools/build-rescue/qemu-smoke.sh
+          pnpm exec prettier --check \
+            .github/workflows/rescue-repair-candidate.yml
+
+      - name: Build standard Rescue binaries and repair candidate daemon
+        run: |
+          cargo build --locked --release -p kernaid-rescue-secrets \
+            --features experimental-codex-home-lease,experimental-firstboot-provisioner,experimental-repair-store \
+            --bin kernaid-rescue-vaultd \
+            --bin kernaid-rescue-vaultctl \
+            --bin kernaid-rescue-codex-mounter \
+            --bin kernaid-rescue-firstboot
+          cargo build --locked --release -p kernaid-rescue-openai-executor \
+            --bin kernaid-rescue-openai-executor
+          cargo build --locked --release -p kernaid-linux-pack \
+            --bin kernaid-linux-hardware-inventory
+          cargo build --locked --release -p kernaid-rescue-codex-bridge \
+            --bin kernaid-rescue-codex \
+            --bin kernaid-codex-auth
+          cargo build --locked --release -p kernaid-rescue-desk-shell \
+            --bin kernaid-rescue-desk-shell
+          cargo build --locked --release -p kernaid-broker \
+            --features rescue-fstab-production-candidate \
+            --bin kernaid-rescue-repaird
+
+      - name: Build isolated repair candidate ISO
+        run: |
+          docker run --rm --privileged \
+            -e KERNAID_DESK_PREBUILT=1 \
+            -e KERNAID_REPAIR_CANDIDATE=1 \
+            -e KERNAID_RESCUE_REPAIRD_BINARY=/workspace/target/release/kernaid-rescue-repaird \
+            -e KERNAID_RESCUE_VAULTD_BINARY=/workspace/target/release/kernaid-rescue-vaultd \
+            -e KERNAID_RESCUE_FIRSTBOOT_BINARY=/workspace/target/release/kernaid-rescue-firstboot \
+            -e KERNAID_RESCUE_CODEX_MOUNTER_BINARY=/workspace/target/release/kernaid-rescue-codex-mounter \
+            -e KERNAID_RESCUE_VAULTCTL_BINARY=/workspace/target/release/kernaid-rescue-vaultctl \
+            -e KERNAID_RESCUE_OPENAI_EXECUTOR_BINARY=/workspace/target/release/kernaid-rescue-openai-executor \
+            -e KERNAID_LINUX_HARDWARE_INVENTORY_BINARY=/workspace/target/release/kernaid-linux-hardware-inventory \
+            -e KERNAID_RESCUE_CODEX_BRIDGE_BINARY=/workspace/target/release/kernaid-rescue-codex \
+            -e KERNAID_RESCUE_CODEX_CLIENT_BINARY=/workspace/target/release/kernaid-codex-auth \
+            -e KERNAID_RESCUE_CODEX_CLI_BINARY=/opt/kernaid-codex-root/usr/lib/kernaid/codex \
+            -e KERNAID_RESCUE_DESK_SHELL_BINARY=/workspace/target/release/kernaid-rescue-desk-shell \
+            -v "$PWD:/workspace" -w /workspace \
+            debian:trixie-slim \
+            sh -c 'apt-get update && apt-get install -y binutils live-build ca-certificates openssl python3 && install -d -o root -g root -m 0755 /opt/kernaid-codex-root/usr/lib/kernaid && python3 -I tools/build-rescue/fetch-codex-cli.py --lock rescue/codex/codex-cli.lock.json --root /opt/kernaid-codex-root && ./tools/build-rescue/build.sh'
+
+      - name: Verify candidate checksum
+        run: |
+          test -f KernAid-Rescue-amd64-repair-candidate.iso
+          test -f KernAid-Rescue-amd64-repair-candidate.iso.sha256
+          sha256sum --check --strict \
+            KernAid-Rescue-amd64-repair-candidate.iso.sha256
+
+      - name: Bind smoke tests to the shared snapshot fixture
+        shell: bash
+        run: |
+          semantic_sha256="$(python3 -I -B - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          snapshot = json.loads(
+              Path(
+                  "tests/fixtures/linux-normalized-snapshot/expected/snapshot.v1.json"
+              ).read_text(encoding="utf-8")
+          )
+          canonical = json.dumps(
+              snapshot,
+              ensure_ascii=False,
+              sort_keys=True,
+              separators=(",", ":"),
+          ).encode("utf-8")
+          print(
+              hashlib.sha256(
+                  b"KERNAID_LINUX_NORMALIZED_SNAPSHOT_E2E_SEMANTIC_V1\0"
+                  + canonical
+              ).hexdigest()
+          )
+          PY
+          )"
+          test "${#semantic_sha256}" -eq 64
+          printf 'KERNAID_RESIDENT_SNAPSHOT_SEMANTIC_SHA256=%s\n' \
+            "$semantic_sha256" >>"$GITHUB_ENV"
+
+      - name: QEMU BIOS candidate smoke test
+        run: |
+          KERNAID_SMOKE_LOG=rescue-repair-candidate-bios.log \
+            ./tools/build-rescue/qemu-smoke.sh bios \
+            "$PWD/KernAid-Rescue-amd64-repair-candidate.iso"
+
+      - name: QEMU UEFI candidate smoke test
+        run: |
+          KERNAID_SMOKE_LOG=rescue-repair-candidate-uefi.log \
+            ./tools/build-rescue/qemu-smoke.sh uefi \
+            "$PWD/KernAid-Rescue-amd64-repair-candidate.iso"
+
+      - name: Upload repair candidate ISO
+        uses: actions/upload-artifact@v4
+        with:
+          name: KernAid-Rescue-amd64-repair-candidate
+          path: |
+            KernAid-Rescue-amd64-repair-candidate.iso
+            KernAid-Rescue-amd64-repair-candidate.iso.sha256
+          if-no-files-found: error
+          retention-days: 7
