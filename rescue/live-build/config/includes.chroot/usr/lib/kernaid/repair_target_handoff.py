@@ -50,7 +50,10 @@ ISOLATED_SHELL = b"/usr/sbin/nologin"
 MAX_PASSWD_BYTES = 256 * 1024
 MAX_REQUEST_BYTES = 1024
 MAX_RESPONSE_BYTES = 2048
-IO_TIMEOUT_SECONDS = 8
+# One acquisition performs repeated inventory/identity observations around the
+# detached mount. Keep the helper bounded while allowing the same closed path
+# to complete on slow recovery media and under the QEMU TCG qualification.
+IO_TIMEOUT_SECONDS = 30
 UUID_INVENTORY_SCHEMA = "kernaid.dev/rescue-uuid-inventory/v1"
 MAX_UUID_INVENTORY_ENTRIES = 4096
 MAX_UUID_BYTES = 128

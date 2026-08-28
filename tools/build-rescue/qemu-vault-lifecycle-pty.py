@@ -191,9 +191,11 @@ PROVIDER_PROOF_REPAIR_CHECKPOINTS = (
     "target-identity",
     "prepare-submit",
     "prepare-terminal",
+    "prepare-state",
     "prepare-contract",
     "approve-submit",
     "execute-terminal",
+    "execute-state",
     "execute-contract",
 )
 PROVIDER_PROOF_UI_ERROR_CHECKPOINTS = (

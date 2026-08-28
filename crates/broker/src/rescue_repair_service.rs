@@ -20,7 +20,10 @@ use std::{
 pub const REPAIR_SERVICE_API_VERSION: &str = "kernaid.dev/rescue-repair-service/v1alpha1";
 pub const REPAIR_SERVICE_MAX_FRAME_BYTES: usize = 4096;
 
-const PREPARE_TIMEOUT: Duration = Duration::from_secs(45);
+// Preparation includes the repeated root-owned target observation plus the
+// first durable Vault reservation. Slow USB media and the TCG qualification
+// must retain useful time for both while the operation remains bounded.
+const PREPARE_TIMEOUT: Duration = Duration::from_secs(120);
 const EXECUTE_TIMEOUT: Duration = Duration::from_secs(150);
 const CANCEL_TIMEOUT: Duration = Duration::from_secs(15);
 const RISK_ID: &str = "R2";

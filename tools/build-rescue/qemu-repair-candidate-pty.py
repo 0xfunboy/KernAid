@@ -152,9 +152,12 @@ try:
         raise RuntimeError()
     checkpoint="prepare-terminal"
     prepared=prepare if prepare.get("state")=="prepared" else status_until({{"prepared","failed","restored","manual-reconciliation-required"}},deadline)
+    checkpoint="prepare-state"
+    if prepared.get("state")!="prepared":
+        raise RuntimeError()
     checkpoint="prepare-contract"
     detail=prepared.get("detail",{{}})
-    if prepared.get("state")!="prepared" or detail.get("actionId")!="linux.fstab.disable-missing-uuid.v1" or detail.get("beforeSha256")!=BEFORE or detail.get("afterSha256")!=AFTER or detail.get("backup")!={{"state":"reserved","vaultDistinct":True}} or detail.get("confirmationRequired")!="DISABILITA VOCE FSTAB":
+    if detail.get("actionId")!="linux.fstab.disable-missing-uuid.v1" or detail.get("beforeSha256")!=BEFORE or detail.get("afterSha256")!=AFTER or detail.get("backup")!={{"state":"reserved","vaultDistinct":True}} or detail.get("confirmationRequired")!="DISABILITA VOCE FSTAB":
         raise RuntimeError()
     checkpoint="approve-submit"
     approved=repair({{"apiVersion":API,"requestId":request_id(),"operation":"repair.fstab.approve","preparedId":detail["preparedId"],"sessionId":detail["sessionId"],"planId":detail["planId"],"planHash":detail["planHash"],"approvalId":"A-"+secrets.token_hex(16),"approvalSequence":detail["nextApprovalSequence"],"typedConfirmation":"DISABILITA VOCE FSTAB"}})
@@ -162,9 +165,12 @@ try:
         raise RuntimeError()
     checkpoint="execute-terminal"
     terminal=approved if approved.get("state")=="succeeded" else status_until({{"succeeded","restored","failed","manual-reconciliation-required"}},deadline)
+    checkpoint="execute-state"
+    if terminal.get("state")!="succeeded":
+        raise RuntimeError()
     checkpoint="execute-contract"
     terminal_detail=terminal.get("detail",{{}})
-    if terminal.get("state")!="succeeded" or terminal_detail.get("terminalOutcome")!="committed" or not isinstance(terminal_detail.get("reservationId"),str) or not isinstance(terminal_detail.get("transactionBindingSha256"),str):
+    if terminal_detail.get("terminalOutcome")!="committed" or not isinstance(terminal_detail.get("reservationId"),str) or not isinstance(terminal_detail.get("transactionBindingSha256"),str):
         raise RuntimeError()
 except BaseException:
     fail(checkpoint)
