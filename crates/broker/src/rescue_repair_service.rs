@@ -1399,11 +1399,7 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(2));
         }
-        assert_eq!(
-            service.public_state(),
-            state,
-            "state transition timed out"
-        );
+        assert_eq!(service.public_state(), state, "state transition timed out");
     }
 
     #[test]
