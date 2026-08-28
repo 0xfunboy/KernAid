@@ -12,6 +12,12 @@ pub mod fixture_repair;
 #[cfg(all(target_os = "linux", feature = "rescue-fstab-production-candidate"))]
 pub mod rescue_fstab_candidate;
 
+/// Linux-only client for the root-owned, fixed Rescue target-capability
+/// endpoint. It transfers a read-only block descriptor and path-free claims;
+/// no normal broker build contains this transport.
+#[cfg(all(target_os = "linux", feature = "rescue-fstab-production-candidate"))]
+pub mod target_capability_client;
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum BrokerError {
     InvalidRequest,

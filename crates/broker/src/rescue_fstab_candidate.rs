@@ -33,6 +33,26 @@ use kernaid_protocol::rescue_repair::{
 };
 use std::{collections::BTreeSet, fmt};
 
+use crate::target_capability_client::RescueTargetReadOnlyCapability;
+
+impl RescueTargetReadOnlyCapability {
+    /// Rebuilds the existing pure transaction claim from the authenticated,
+    /// fd-backed target authority and a physical-parent fingerprint derived
+    /// locally from that descriptor. The wire response is never trusted for
+    /// physical ancestry. The returned value is evidence binding; the
+    /// non-cloneable `self` must still be retained as the actual authority.
+    pub fn selected_target_claims(
+        &self,
+        derived_physical_parent_fingerprint: &str,
+    ) -> Result<SelectedTargetCapability, CandidateTransactionError> {
+        SelectedTargetCapability::new(
+            self.claims().target_id(),
+            self.claims().scan_fingerprint(),
+            derived_physical_parent_fingerprint,
+        )
+    }
+}
+
 /// Sanitized failures returned by a trusted target/Vault capability resolver.
 /// No variant can carry a path, command, raw observation or provider text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

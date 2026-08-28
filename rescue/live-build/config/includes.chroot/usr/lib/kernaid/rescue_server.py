@@ -1708,7 +1708,9 @@ def _normalize_installed_targets_with_resolutions(
                 "target", {"disk": canonical_disk, "device": candidate["identity"]}
             )
             if target_id in seen_target_ids:
-                continue
+                raise TargetScanError(
+                    "Identificatore target duplicato; scansione rifiutata."
+                )
             seen_target_ids.add(target_id)
             public_candidate = {
                 "targetId": target_id,

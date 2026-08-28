@@ -2256,6 +2256,7 @@ dependencies = [
  "kernaid-linux-pack",
  "kernaid-protocol",
  "kernaid-storage",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",
