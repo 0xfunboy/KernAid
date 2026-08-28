@@ -12,7 +12,15 @@ use kernaid_protocol::{
     rescue_physical_parent::{
         PhysicalParentClaims, canonical_physical_parent_digest, render_physical_parent_raw,
     },
-    rescue_repair_vault::RepairFileMetadataV1,
+    rescue_repair_vault::{
+        RepairBackupBinding as ProtocolRepairBackupBinding,
+        RepairBackupStatusPayload as ProtocolRepairBackupStatusPayload, RepairExecutionIntentV1,
+        RepairFileMetadataV1, RepairReservationId as ProtocolRepairReservationId,
+        RepairTransactionPhase, RepairTransactionResolution, RepairTransactionResolutionOutcome,
+        RepairTransactionStatusPayload, RepairTransactionStatusResultPayload,
+        RepairTransactionStatusSelector,
+    },
+    rescue_vault::Sha256 as ProtocolSha256,
 };
 use kernaid_storage::{
     JOURNAL_KEY_BYTES, JournalAnchor, JournalEntryRef, JournalKey, JournalReplayLimits,
@@ -291,6 +299,7 @@ pub struct RepairBinding {
     approval_sha256: [u8; 32],
     resource_id: String,
     resource_sha256: [u8; 32],
+    execution_intent: RepairExecutionIntentV1,
 }
 
 impl RepairBinding {
@@ -301,6 +310,7 @@ impl RepairBinding {
         approval_sha256: [u8; 32],
         resource_id: impl Into<String>,
         resource_sha256: [u8; 32],
+        execution_intent: RepairExecutionIntentV1,
     ) -> Result<Self, RepairVaultStoreError> {
         let value = Self {
             plan_id: plan_id.into(),
@@ -309,6 +319,7 @@ impl RepairBinding {
             approval_sha256,
             resource_id: resource_id.into(),
             resource_sha256,
+            execution_intent,
         };
         value.validate()?;
         Ok(value)
@@ -321,6 +332,24 @@ impl RepairBinding {
             || self.approval_sha256 == [0; 32]
             || self.resource_id != FSTAB_RESOURCE_ID
             || self.resource_sha256 == [0; 32]
+            || !valid_execution_intent(&self.execution_intent)
+            || self.resource_sha256 != self.execution_intent.before_sha256().bytes()
+        {
+            return Err(RepairVaultStoreError::InvalidBinding);
+        }
+        Ok(())
+    }
+
+    fn validate_for_record(&self, record: &ReservationRecord) -> Result<(), RepairVaultStoreError> {
+        self.validate()?;
+        let intent = &self.execution_intent;
+        if intent.session_id() != record.draft.session_id
+            || intent.target_id() != record.draft.target_id
+            || intent.target_fingerprint().bytes() != record.draft.target_fingerprint
+            || intent.before_sha256().bytes() != record.draft.expected_backup_sha256
+            || intent.before_metadata().canonical_sha256().bytes() != record.draft.metadata_sha256
+            || intent.target_physical_parent_fingerprint().as_str()
+                == record.physical_parent_fingerprint
         {
             return Err(RepairVaultStoreError::InvalidBinding);
         }
@@ -355,6 +384,11 @@ impl RepairBinding {
     #[must_use]
     pub const fn resource_sha256(&self) -> &[u8; 32] {
         &self.resource_sha256
+    }
+
+    #[must_use]
+    pub const fn execution_intent(&self) -> &RepairExecutionIntentV1 {
+        &self.execution_intent
     }
 }
 
@@ -530,6 +564,7 @@ pub struct VerifiedBackupMetadata {
     approval_sha256: String,
     resource_id: String,
     resource_sha256: String,
+    execution_intent: RepairExecutionIntentV1,
 }
 
 impl VerifiedBackupMetadata {
@@ -612,13 +647,18 @@ impl VerifiedBackupMetadata {
     pub fn resource_sha256(&self) -> &str {
         &self.resource_sha256
     }
+
+    #[must_use]
+    pub const fn execution_intent(&self) -> &RepairExecutionIntentV1 {
+        &self.execution_intent
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RepairBackupStatus {
     Absent,
     Reserved(RepairBackupSummary),
-    Durable(VerifiedBackupMetadata),
+    Durable(Box<VerifiedBackupMetadata>),
     ReconciliationRequired,
 }
 
@@ -685,6 +725,23 @@ enum RepairEvent {
         #[serde(rename = "reservationId")]
         reservation_id: ReservationId,
     },
+    #[serde(rename = "repair.transaction.resolve.intent")]
+    TransactionResolveIntent {
+        #[serde(rename = "reservationId")]
+        reservation_id: ReservationId,
+        #[serde(rename = "transactionBindingSha256")]
+        transaction_binding_sha256: String,
+        #[serde(rename = "expectedPhase")]
+        expected_phase: RepairTransactionPhase,
+        resolution: RepairTransactionResolution,
+    },
+    #[serde(rename = "repair.transaction.resolve.complete")]
+    TransactionResolveComplete {
+        #[serde(rename = "reservationId")]
+        reservation_id: ReservationId,
+        #[serde(rename = "transactionBindingSha256")]
+        transaction_binding_sha256: String,
+    },
     #[serde(rename = "repair.backup.cancel.intent")]
     CancelIntent {
         #[serde(rename = "reservationId")]
@@ -736,8 +793,21 @@ enum ReservationPhase {
     Reserved,
     PersistPending(RepairBinding),
     CancelPending,
-    RetirePending(RepairBinding),
+    RetirePending(RepairBinding, RepairTransactionResolution),
     Durable(RepairBinding),
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct RepairTransactionRecord {
+    resolution: Option<RepairTransactionResolution>,
+    pending_resolution: Option<PendingTransactionResolution>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct PendingTransactionResolution {
+    transaction_binding_sha256: String,
+    expected_phase: RepairTransactionPhase,
+    resolution: RepairTransactionResolution,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -777,6 +847,8 @@ struct RecoveredState {
     released: BTreeMap<ReservationId, ReleaseTombstone>,
     seen_reservation_ids: BTreeSet<ReservationId>,
     pending: Option<ReservationId>,
+    transactions: BTreeMap<ReservationId, RepairTransactionRecord>,
+    unresolved_transaction: Option<ReservationId>,
     logical_event_clock: u64,
     compaction_generation: u64,
     previous_compaction_anchor: Option<JournalAnchor>,
@@ -913,6 +985,9 @@ impl<'vault> RepairVaultStore<'vault> {
         {
             return Ok(reserved);
         }
+        if self.state.unresolved_transaction.is_some() {
+            return Err(RepairVaultStoreError::ReconciliationRequired);
+        }
         self.require_event_capacity(2)?;
         if self.state.reservations.len() >= MAX_RESERVATIONS {
             return Err(RepairVaultStoreError::InsufficientCapacity);
@@ -996,13 +1071,17 @@ impl<'vault> RepairVaultStore<'vault> {
     ) -> Result<DurableRepairBackup, RepairVaultStoreError> {
         binding.validate()?;
         self.require_mutable()?;
-        self.require_event_capacity(2)?;
         self.consume_checkout(reservation.reservation_id())?;
+        if self.state.unresolved_transaction.is_some() {
+            return Err(RepairVaultStoreError::ReconciliationRequired);
+        }
+        self.require_event_capacity(2)?;
         let record = self
             .state
             .reservations
             .get(reservation.reservation_id())
             .ok_or(RepairVaultStoreError::ReservationNotFound)?;
+        binding.validate_for_record(record)?;
         self.verify_record_live_parent(record)?;
         if binding.resource_sha256 != record.draft.expected_backup_sha256 {
             return Err(RepairVaultStoreError::InvalidBinding);
@@ -1140,6 +1219,14 @@ impl<'vault> RepairVaultStore<'vault> {
         {
             return Err(RepairVaultStoreError::ReservationConflict);
         }
+        let transaction = self
+            .state
+            .transactions
+            .get(expected.reservation_id())
+            .ok_or(RepairVaultStoreError::CorruptJournal)?;
+        if transaction_phase(transaction) != RepairTransactionPhase::Resolved {
+            return Err(RepairVaultStoreError::ReconciliationRequired);
+        }
         self.verify_durable_file(expected.reservation_id(), record)?;
         let released_bytes = record.reserved_capacity_bytes;
         let reservation_id = expected.reservation_id().clone();
@@ -1214,7 +1301,7 @@ impl<'vault> RepairVaultStore<'vault> {
             ReservationPhase::ReservePending
             | ReservationPhase::PersistPending(_)
             | ReservationPhase::CancelPending
-            | ReservationPhase::RetirePending(_) => Ok(RepairBackupStatus::ReconciliationRequired),
+            | ReservationPhase::RetirePending(..) => Ok(RepairBackupStatus::ReconciliationRequired),
             ReservationPhase::Reserved => {
                 self.verify_reserved_file(reservation_id, record)?;
                 Ok(RepairBackupStatus::Reserved(
@@ -1223,11 +1310,108 @@ impl<'vault> RepairVaultStore<'vault> {
             }
             ReservationPhase::Durable(_) => {
                 self.verify_durable_file(reservation_id, record)?;
-                Ok(RepairBackupStatus::Durable(
+                Ok(RepairBackupStatus::Durable(Box::new(
                     self.verified_metadata(reservation_id)?,
-                ))
+                )))
             }
         }
+    }
+
+    /// Look up authenticated transaction state without enumerating unrelated
+    /// reservations. The singleton selector returns only the sole unresolved
+    /// transaction used during reboot recovery.
+    pub fn transaction_status(
+        &self,
+        selector: &RepairTransactionStatusSelector,
+    ) -> Result<RepairTransactionStatusResultPayload, RepairVaultStoreError> {
+        self.validate_store_boundary()?;
+        if self.state.pending.is_some() {
+            return Err(RepairVaultStoreError::ReconciliationRequired);
+        }
+        let reservation_id = match selector {
+            RepairTransactionStatusSelector::PendingSingleton => {
+                let Some(reservation_id) = self.state.unresolved_transaction.as_ref() else {
+                    return Ok(RepairTransactionStatusResultPayload::absent());
+                };
+                reservation_id.clone()
+            }
+            RepairTransactionStatusSelector::Exact { reservation_id, .. } => {
+                let reservation_id = ReservationId::parse(reservation_id.as_str())?;
+                if !self.state.transactions.contains_key(&reservation_id) {
+                    return Err(RepairVaultStoreError::ReservationNotFound);
+                }
+                reservation_id
+            }
+        };
+        let status = self.transaction_status_for_id(&reservation_id)?;
+        match selector {
+            RepairTransactionStatusSelector::PendingSingleton if !status.is_unresolved() => {
+                Err(RepairVaultStoreError::CorruptJournal)
+            }
+            RepairTransactionStatusSelector::Exact {
+                transaction_binding_sha256,
+                ..
+            } if status.transaction_binding_sha256() != transaction_binding_sha256 => {
+                Err(RepairVaultStoreError::ReservationConflict)
+            }
+            _ => Ok(RepairTransactionStatusResultPayload::found(status)),
+        }
+    }
+
+    /// Append one exact transaction resolution. Replaying a response-lost
+    /// request returns the same authenticated status without another event.
+    pub fn resolve_transaction(
+        &mut self,
+        expected: &RepairTransactionStatusPayload,
+        resolution: RepairTransactionResolution,
+    ) -> Result<RepairTransactionStatusPayload, RepairVaultStoreError> {
+        self.require_mutable()?;
+        validate_protocol_transaction_status(expected)?;
+        let reservation_id = ReservationId::parse(expected.backup().reservation_id().as_str())?;
+        let current = self.transaction_status_for_id(&reservation_id)?;
+        if &current != expected {
+            if current.backup() == expected.backup()
+                && current.transaction_binding_sha256() == expected.transaction_binding_sha256()
+                && current.resolution() == Some(&resolution)
+            {
+                return Ok(current);
+            }
+            return Err(RepairVaultStoreError::ReservationConflict);
+        }
+        let reservation = self
+            .state
+            .reservations
+            .get(&reservation_id)
+            .ok_or(RepairVaultStoreError::ReservationNotFound)?;
+        let binding = match &reservation.phase {
+            ReservationPhase::Durable(binding) => binding,
+            _ => return Err(RepairVaultStoreError::ReservationNotReady),
+        };
+        validate_resolution_against_intent(&resolution, &binding.execution_intent)?;
+        let transaction = self
+            .state
+            .transactions
+            .get(&reservation_id)
+            .ok_or(RepairVaultStoreError::CorruptJournal)?;
+        if transaction.resolution.as_ref() == Some(&resolution) {
+            return Ok(current);
+        }
+        if transaction_phase(transaction) == RepairTransactionPhase::Resolved {
+            return Err(RepairVaultStoreError::ReservationConflict);
+        }
+        self.require_event_capacity(2)?;
+        let transaction_binding_sha256 = current.transaction_binding_sha256().as_str().to_owned();
+        self.append_event(RepairEvent::TransactionResolveIntent {
+            reservation_id: reservation_id.clone(),
+            transaction_binding_sha256: transaction_binding_sha256.clone(),
+            expected_phase: current.phase(),
+            resolution,
+        })?;
+        self.append_event(RepairEvent::TransactionResolveComplete {
+            reservation_id: reservation_id.clone(),
+            transaction_binding_sha256,
+        })?;
+        self.transaction_status_for_id(&reservation_id)
     }
 
     /// Verify the complete durable backup, lend a size-bounded reader to the
@@ -1296,6 +1480,28 @@ impl<'vault> RepairVaultStore<'vault> {
             return Err(RepairVaultStoreError::ReconciliationRequired);
         }
         self.validate_store_boundary()
+    }
+
+    fn transaction_status_for_id(
+        &self,
+        reservation_id: &ReservationId,
+    ) -> Result<RepairTransactionStatusPayload, RepairVaultStoreError> {
+        let reservation = self
+            .state
+            .reservations
+            .get(reservation_id)
+            .ok_or(RepairVaultStoreError::ReservationNotFound)?;
+        self.verify_record_vault_identity(reservation)?;
+        if !matches!(reservation.phase, ReservationPhase::Durable(_)) {
+            return Err(RepairVaultStoreError::ReservationNotReady);
+        }
+        self.verify_durable_file(reservation_id, reservation)?;
+        let transaction = self
+            .state
+            .transactions
+            .get(reservation_id)
+            .ok_or(RepairVaultStoreError::CorruptJournal)?;
+        protocol_transaction_status_from_record(reservation_id, reservation, transaction)
     }
 
     fn require_event_capacity(&mut self, required: u64) -> Result<(), RepairVaultStoreError> {
@@ -1368,8 +1574,21 @@ impl<'vault> RepairVaultStore<'vault> {
             return Err(RepairVaultStoreError::CorruptJournal);
         }
         match (&released.operation, &released.record.phase) {
-            (ReleaseOperation::Cancel, ReservationPhase::CancelPending)
-            | (ReleaseOperation::Retire, ReservationPhase::RetirePending(_)) => Ok(()),
+            (ReleaseOperation::Cancel, ReservationPhase::CancelPending) => Ok(()),
+            (ReleaseOperation::Retire, ReservationPhase::RetirePending(binding, resolution)) => {
+                binding
+                    .validate_for_record(&released.record)
+                    .map_err(|_| RepairVaultStoreError::CorruptJournal)?;
+                validate_resolution_against_intent(resolution, &binding.execution_intent)
+                    .map_err(|_| RepairVaultStoreError::CorruptJournal)?;
+                if matches!(
+                    resolution.outcome(),
+                    RepairTransactionResolutionOutcome::ManualReconciliationRequired
+                ) {
+                    return Err(RepairVaultStoreError::CorruptJournal);
+                }
+                Ok(())
+            }
             _ => Err(RepairVaultStoreError::CorruptJournal),
         }
     }
@@ -1451,6 +1670,8 @@ impl<'vault> RepairVaultStore<'vault> {
             .map_err(|_| RepairVaultStoreError::CorruptJournal)?;
         let expected_reservations = self.state.reservations.clone();
         let expected_releases = retained_release_tombstones(&self.state);
+        let expected_transactions = self.state.transactions.clone();
+        let expected_unresolved_transaction = self.state.unresolved_transaction.clone();
         let expected_clock = self.state.logical_event_clock;
         let expected_generation = self
             .state
@@ -1460,6 +1681,7 @@ impl<'vault> RepairVaultStore<'vault> {
         let events = compaction_events(
             &expected_reservations,
             &expected_releases,
+            &expected_transactions,
             expected_clock,
             expected_generation,
             previous_anchor,
@@ -1498,6 +1720,8 @@ impl<'vault> RepairVaultStore<'vault> {
             &staged_state,
             &expected_reservations,
             &expected_releases,
+            &expected_transactions,
+            expected_unresolved_transaction.as_ref(),
             expected_clock,
             expected_generation,
             previous_anchor,
@@ -1566,6 +1790,8 @@ impl<'vault> RepairVaultStore<'vault> {
             &state,
             &expected_reservations,
             &expected_releases,
+            &expected_transactions,
+            expected_unresolved_transaction.as_ref(),
             expected_clock,
             expected_generation,
             previous_anchor,
@@ -1695,7 +1921,7 @@ impl<'vault> RepairVaultStore<'vault> {
         released: &ReleaseTombstone,
     ) -> Result<VerifiedBackupMetadata, RepairVaultStoreError> {
         self.verify_release_tombstone(released)?;
-        let ReservationPhase::RetirePending(binding) = &released.record.phase else {
+        let ReservationPhase::RetirePending(binding, _) = &released.record.phase else {
             return Err(RepairVaultStoreError::ReservationConflict);
         };
         Ok(verified_metadata_from_record(
@@ -1900,6 +2126,18 @@ impl<'vault> RepairVaultStore<'vault> {
         let Some(reservation_id) = self.state.pending.clone() else {
             return Ok(());
         };
+        if let Some(transaction_binding_sha256) = self
+            .state
+            .transactions
+            .get(&reservation_id)
+            .and_then(|transaction| transaction.pending_resolution.as_ref())
+            .map(|pending| pending.transaction_binding_sha256.clone())
+        {
+            return self.append_event(RepairEvent::TransactionResolveComplete {
+                reservation_id,
+                transaction_binding_sha256,
+            });
+        }
         let record = self
             .state
             .reservations
@@ -1978,7 +2216,7 @@ impl<'vault> RepairVaultStore<'vault> {
                     released_at_event: None,
                 })
             }
-            ReservationPhase::RetirePending(_) => {
+            ReservationPhase::RetirePending(..) => {
                 if let Some((_, state)) =
                     self.open_pending_backup_file(&reservation_id, OFlags::RDONLY)?
                 {
@@ -2162,6 +2400,9 @@ impl<'vault> RepairVaultStore<'vault> {
 
     fn validate_layout(&self) -> Result<(), RepairVaultStoreError> {
         self.validate_store_boundary()?;
+        if !transactions_are_consistent(&self.state) {
+            return Err(RepairVaultStoreError::CorruptJournal);
+        }
         scan_namespace(self)?;
         scan_backups(self)
     }
@@ -2221,7 +2462,158 @@ fn verified_metadata_from_record(
         approval_sha256: encode_hex(&binding.approval_sha256),
         resource_id: binding.resource_id.clone(),
         resource_sha256: encode_hex(&binding.resource_sha256),
+        execution_intent: binding.execution_intent.clone(),
     }
+}
+
+fn protocol_backup_status_from_record(
+    reservation_id: &ReservationId,
+    record: &ReservationRecord,
+) -> Result<ProtocolRepairBackupStatusPayload, RepairVaultStoreError> {
+    let binding = match &record.phase {
+        ReservationPhase::Durable(binding) | ReservationPhase::RetirePending(binding, _) => binding,
+        _ => return Err(RepairVaultStoreError::ReservationNotReady),
+    };
+    let reservation_id = ProtocolRepairReservationId::parse(reservation_id.as_str())
+        .map_err(|_| RepairVaultStoreError::CorruptStore)?;
+    let protocol_binding = ProtocolRepairBackupBinding::new(
+        binding.plan_id.clone(),
+        protocol_sha256_bytes(binding.plan_sha256)?,
+        binding.approval_id.clone(),
+        protocol_sha256_bytes(binding.approval_sha256)?,
+        binding.resource_id.clone(),
+        protocol_sha256_bytes(binding.resource_sha256)?,
+        binding.execution_intent.clone(),
+    )
+    .map_err(|_| RepairVaultStoreError::CorruptStore)?;
+    ProtocolRepairBackupStatusPayload::durable(
+        reservation_id.clone(),
+        protocol_sha256_str(&record.reservation_binding_sha256)?,
+        reservation_id.locator(),
+        record.vault_id.clone(),
+        protocol_sha256_str(&record.vault_identity_fingerprint)?,
+        protocol_sha256_str(&record.physical_parent_fingerprint)?,
+        record.reserved_capacity_bytes,
+        record.draft.backup_size_bytes,
+        protocol_sha256_bytes(record.draft.expected_backup_sha256)?,
+        protocol_sha256_bytes(record.draft.metadata_sha256)?,
+        protocol_binding,
+    )
+    .map_err(|_| RepairVaultStoreError::CorruptStore)
+}
+
+fn protocol_transaction_status_from_record(
+    reservation_id: &ReservationId,
+    reservation: &ReservationRecord,
+    transaction: &RepairTransactionRecord,
+) -> Result<RepairTransactionStatusPayload, RepairVaultStoreError> {
+    let backup = protocol_backup_status_from_record(reservation_id, reservation)?;
+    match &transaction.resolution {
+        Some(resolution) => RepairTransactionStatusPayload::resolved(backup, resolution.clone()),
+        None => RepairTransactionStatusPayload::pending(backup),
+    }
+    .map_err(|_| RepairVaultStoreError::CorruptStore)
+}
+
+fn protocol_sha256_bytes(bytes: [u8; 32]) -> Result<ProtocolSha256, RepairVaultStoreError> {
+    protocol_sha256_str(&encode_hex(&bytes))
+}
+
+fn protocol_sha256_str(value: &str) -> Result<ProtocolSha256, RepairVaultStoreError> {
+    ProtocolSha256::parse(value).map_err(|_| RepairVaultStoreError::CorruptStore)
+}
+
+fn transaction_phase(transaction: &RepairTransactionRecord) -> RepairTransactionPhase {
+    match transaction
+        .resolution
+        .as_ref()
+        .map(RepairTransactionResolution::outcome)
+    {
+        None => RepairTransactionPhase::Pending,
+        Some(RepairTransactionResolutionOutcome::ManualReconciliationRequired) => {
+            RepairTransactionPhase::ManualReconciliationRequired
+        }
+        Some(
+            RepairTransactionResolutionOutcome::CommittedAfter
+            | RepairTransactionResolutionOutcome::ClosedBeforeUnchanged
+            | RepairTransactionResolutionOutcome::ClosedBeforeRestored,
+        ) => RepairTransactionPhase::Resolved,
+    }
+}
+
+fn validate_resolution_against_intent(
+    resolution: &RepairTransactionResolution,
+    intent: &RepairExecutionIntentV1,
+) -> Result<(), RepairVaultStoreError> {
+    let canonical = RepairTransactionResolution::new(
+        resolution.outcome(),
+        resolution.observed_resource_sha256().clone(),
+        resolution.observed_metadata_sha256().clone(),
+        resolution.mount_cleanup_verified(),
+        intent,
+    )
+    .map_err(|_| RepairVaultStoreError::InvalidBinding)?;
+    if canonical != *resolution {
+        return Err(RepairVaultStoreError::InvalidBinding);
+    }
+    Ok(())
+}
+
+fn validate_protocol_transaction_status(
+    status: &RepairTransactionStatusPayload,
+) -> Result<(), RepairVaultStoreError> {
+    let canonical = match status.resolution() {
+        Some(resolution) => {
+            RepairTransactionStatusPayload::resolved(status.backup().clone(), resolution.clone())
+        }
+        None => RepairTransactionStatusPayload::pending(status.backup().clone()),
+    }
+    .map_err(|_| RepairVaultStoreError::InvalidBinding)?;
+    if canonical != *status {
+        return Err(RepairVaultStoreError::InvalidBinding);
+    }
+    Ok(())
+}
+
+fn transactions_are_consistent(state: &RecoveredState) -> bool {
+    let mut unresolved = None;
+    let mut durable_count = 0_usize;
+    for (reservation_id, record) in &state.reservations {
+        match &record.phase {
+            ReservationPhase::Durable(_) => {
+                durable_count = match durable_count.checked_add(1) {
+                    Some(value) => value,
+                    None => return false,
+                };
+                let Some(transaction) = state.transactions.get(reservation_id) else {
+                    return false;
+                };
+                if transaction.pending_resolution.is_some() {
+                    return false;
+                }
+                if protocol_transaction_status_from_record(reservation_id, record, transaction)
+                    .is_err()
+                {
+                    return false;
+                }
+                if transaction_phase(transaction) != RepairTransactionPhase::Resolved
+                    && unresolved.replace(reservation_id).is_some()
+                {
+                    return false;
+                }
+            }
+            ReservationPhase::Reserved => {
+                if state.transactions.contains_key(reservation_id) {
+                    return false;
+                }
+            }
+            ReservationPhase::ReservePending
+            | ReservationPhase::PersistPending(_)
+            | ReservationPhase::CancelPending
+            | ReservationPhase::RetirePending(..) => return false,
+        }
+    }
+    durable_count == state.transactions.len() && unresolved == state.unresolved_transaction.as_ref()
 }
 
 fn retained_release_tombstones(
@@ -2256,6 +2648,7 @@ fn retained_release_tombstones(
 fn compaction_events(
     reservations: &BTreeMap<ReservationId, ReservationRecord>,
     releases: &BTreeMap<ReservationId, ReleaseTombstone>,
+    transactions: &BTreeMap<ReservationId, RepairTransactionRecord>,
     logical_event_clock: u64,
     generation: u64,
     previous_anchor: JournalAnchor,
@@ -2270,11 +2663,36 @@ fn compaction_events(
             .map_err(|_| RepairVaultStoreError::CorruptStore)?,
         previous_anchor: encode_hex(&previous_anchor.to_bytes()),
     });
-    for (reservation_id, record) in reservations {
-        append_reservation_snapshot(&mut events, reservation_id, record)?;
+    let unresolved_id = transactions
+        .iter()
+        .find_map(|(reservation_id, transaction)| {
+            (transaction_phase(transaction) != RepairTransactionPhase::Resolved)
+                .then_some(reservation_id)
+        });
+    for (reservation_id, record) in reservations
+        .iter()
+        .filter(|(reservation_id, _)| Some(*reservation_id) != unresolved_id)
+    {
+        append_reservation_snapshot(
+            &mut events,
+            reservation_id,
+            record,
+            transactions.get(reservation_id),
+        )?;
     }
     for (reservation_id, released) in releases {
         append_release_snapshot(&mut events, reservation_id, released)?;
+    }
+    if let Some(reservation_id) = unresolved_id {
+        let record = reservations
+            .get(reservation_id)
+            .ok_or(RepairVaultStoreError::CorruptJournal)?;
+        append_reservation_snapshot(
+            &mut events,
+            reservation_id,
+            record,
+            transactions.get(reservation_id),
+        )?;
     }
     events.push(RepairEvent::CompactionComplete { generation });
     Ok(events)
@@ -2320,16 +2738,54 @@ fn append_reservation_snapshot(
     events: &mut Vec<RepairEvent>,
     reservation_id: &ReservationId,
     record: &ReservationRecord,
+    transaction: Option<&RepairTransactionRecord>,
 ) -> Result<(), RepairVaultStoreError> {
     append_reserve_snapshot(events, reservation_id, record);
     match &record.phase {
         ReservationPhase::Reserved => Ok(()),
         ReservationPhase::Durable(binding) => {
             append_persist_snapshot(events, reservation_id, record, binding);
+            append_transaction_snapshot(
+                events,
+                reservation_id,
+                record,
+                transaction.ok_or(RepairVaultStoreError::CorruptJournal)?,
+            )?;
             Ok(())
         }
         _ => Err(RepairVaultStoreError::ReconciliationRequired),
     }
+}
+
+fn append_transaction_snapshot(
+    events: &mut Vec<RepairEvent>,
+    reservation_id: &ReservationId,
+    record: &ReservationRecord,
+    transaction: &RepairTransactionRecord,
+) -> Result<(), RepairVaultStoreError> {
+    let Some(resolution) = transaction.resolution.as_ref() else {
+        return Ok(());
+    };
+    let pending = protocol_transaction_status_from_record(
+        reservation_id,
+        record,
+        &RepairTransactionRecord {
+            resolution: None,
+            pending_resolution: None,
+        },
+    )?;
+    let transaction_binding_sha256 = pending.transaction_binding_sha256().as_str().to_owned();
+    events.push(RepairEvent::TransactionResolveIntent {
+        reservation_id: reservation_id.clone(),
+        transaction_binding_sha256: transaction_binding_sha256.clone(),
+        expected_phase: RepairTransactionPhase::Pending,
+        resolution: resolution.clone(),
+    });
+    events.push(RepairEvent::TransactionResolveComplete {
+        reservation_id: reservation_id.clone(),
+        transaction_binding_sha256,
+    });
+    Ok(())
 }
 
 fn append_release_snapshot(
@@ -2349,8 +2805,21 @@ fn append_release_snapshot(
             });
             Ok(())
         }
-        (ReleaseOperation::Retire, ReservationPhase::RetirePending(binding)) => {
+        (ReleaseOperation::Retire, ReservationPhase::RetirePending(binding, resolution)) => {
             append_persist_snapshot(events, reservation_id, &released.record, binding);
+            let durable_record = ReservationRecord {
+                phase: ReservationPhase::Durable(binding.clone()),
+                ..released.record.clone()
+            };
+            append_transaction_snapshot(
+                events,
+                reservation_id,
+                &durable_record,
+                &RepairTransactionRecord {
+                    resolution: Some(resolution.clone()),
+                    pending_resolution: None,
+                },
+            )?;
             events.push(RepairEvent::RetireIntent {
                 reservation_id: reservation_id.clone(),
             });
@@ -2364,10 +2833,13 @@ fn append_release_snapshot(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_compacted_state(
     state: &RecoveredState,
     reservations: &BTreeMap<ReservationId, ReservationRecord>,
     releases: &BTreeMap<ReservationId, ReleaseTombstone>,
+    transactions: &BTreeMap<ReservationId, RepairTransactionRecord>,
+    unresolved_transaction: Option<&ReservationId>,
     logical_event_clock: u64,
     generation: u64,
     previous_anchor: JournalAnchor,
@@ -2379,6 +2851,8 @@ fn validate_compacted_state(
         .collect();
     if &state.reservations != reservations
         || &state.released != releases
+        || &state.transactions != transactions
+        || state.unresolved_transaction.as_ref() != unresolved_transaction
         || state.seen_reservation_ids != expected_seen
         || state.pending.is_some()
         || state.logical_event_clock != logical_event_clock
@@ -2443,6 +2917,8 @@ fn apply_repair_event(
                 || !state.released.is_empty()
                 || !state.seen_reservation_ids.is_empty()
                 || state.pending.is_some()
+                || !state.transactions.is_empty()
+                || state.unresolved_transaction.is_some()
                 || state.logical_event_clock != 0
                 || state.compaction_generation != 0
                 || state.previous_compaction_anchor.is_some()
@@ -2479,6 +2955,7 @@ fn apply_repair_event(
                         ReservationPhase::Reserved | ReservationPhase::Durable(_)
                     )
                 })
+                || !transactions_are_consistent(state)
             {
                 return Err(RepairVaultStoreError::CorruptJournal);
             }
@@ -2498,6 +2975,7 @@ fn apply_repair_event(
                 || reservation_binding_sha256 != reservation_binding(&draft)
                 || reserved_capacity_bytes != draft.required_capacity_bytes
                 || state.pending.is_some()
+                || state.unresolved_transaction.is_some()
                 || state.reservations.len() >= MAX_RESERVATIONS
                 || state.reservations.contains_key(&reservation_id)
                 || state.released.contains_key(&reservation_id)
@@ -2557,9 +3035,16 @@ fn apply_repair_event(
             binding,
         } => {
             binding.validate()?;
-            if state.pending.is_some() {
+            if state.pending.is_some() || state.unresolved_transaction.is_some() {
                 return Err(RepairVaultStoreError::CorruptJournal);
             }
+            let existing = state
+                .reservations
+                .get(&reservation_id)
+                .ok_or(RepairVaultStoreError::CorruptJournal)?;
+            binding
+                .validate_for_record(existing)
+                .map_err(|_| RepairVaultStoreError::CorruptJournal)?;
             let record = state
                 .reservations
                 .get_mut(&reservation_id)
@@ -2593,6 +3078,21 @@ fn apply_repair_event(
                 return Err(RepairVaultStoreError::CorruptJournal);
             };
             record.phase = ReservationPhase::Durable(binding.clone());
+            if state
+                .transactions
+                .insert(
+                    reservation_id.clone(),
+                    RepairTransactionRecord {
+                        resolution: None,
+                        pending_resolution: None,
+                    },
+                )
+                .is_some()
+                || state.unresolved_transaction.is_some()
+            {
+                return Err(RepairVaultStoreError::CorruptJournal);
+            }
+            state.unresolved_transaction = Some(reservation_id.clone());
             state.pending = None;
         }
         RepairEvent::PersistAbort { reservation_id } => {
@@ -2607,6 +3107,96 @@ fn apply_repair_event(
                 return Err(RepairVaultStoreError::CorruptJournal);
             }
             record.phase = ReservationPhase::Reserved;
+            state.pending = None;
+        }
+        RepairEvent::TransactionResolveIntent {
+            reservation_id,
+            transaction_binding_sha256,
+            expected_phase,
+            resolution,
+        } => {
+            if state.pending.is_some()
+                || !valid_sha256(&transaction_binding_sha256)
+                || state.unresolved_transaction.as_ref() != Some(&reservation_id)
+            {
+                return Err(RepairVaultStoreError::CorruptJournal);
+            }
+            let reservation = state
+                .reservations
+                .get(&reservation_id)
+                .ok_or(RepairVaultStoreError::CorruptJournal)?;
+            let ReservationPhase::Durable(binding) = &reservation.phase else {
+                return Err(RepairVaultStoreError::CorruptJournal);
+            };
+            let transaction = state
+                .transactions
+                .get(&reservation_id)
+                .ok_or(RepairVaultStoreError::CorruptJournal)?;
+            let status =
+                protocol_transaction_status_from_record(&reservation_id, reservation, transaction)
+                    .map_err(|_| RepairVaultStoreError::CorruptJournal)?;
+            if transaction_binding_sha256 != status.transaction_binding_sha256().as_str()
+                || expected_phase != status.phase()
+                || expected_phase == RepairTransactionPhase::Resolved
+                || transaction.resolution.as_ref() == Some(&resolution)
+                || transaction.pending_resolution.is_some()
+            {
+                return Err(RepairVaultStoreError::CorruptJournal);
+            }
+            validate_resolution_against_intent(&resolution, &binding.execution_intent)
+                .map_err(|_| RepairVaultStoreError::CorruptJournal)?;
+            let transaction = state
+                .transactions
+                .get_mut(&reservation_id)
+                .ok_or(RepairVaultStoreError::CorruptJournal)?;
+            transaction.pending_resolution = Some(PendingTransactionResolution {
+                transaction_binding_sha256,
+                expected_phase,
+                resolution,
+            });
+            state.pending = Some(reservation_id);
+        }
+        RepairEvent::TransactionResolveComplete {
+            reservation_id,
+            transaction_binding_sha256,
+        } => {
+            if state.pending.as_ref() != Some(&reservation_id)
+                || !valid_sha256(&transaction_binding_sha256)
+                || state.unresolved_transaction.as_ref() != Some(&reservation_id)
+            {
+                return Err(RepairVaultStoreError::CorruptJournal);
+            }
+            let reservation = state
+                .reservations
+                .get(&reservation_id)
+                .ok_or(RepairVaultStoreError::CorruptJournal)?;
+            let transaction = state
+                .transactions
+                .get(&reservation_id)
+                .ok_or(RepairVaultStoreError::CorruptJournal)?;
+            let pending = transaction
+                .pending_resolution
+                .as_ref()
+                .ok_or(RepairVaultStoreError::CorruptJournal)?;
+            let status =
+                protocol_transaction_status_from_record(&reservation_id, reservation, transaction)
+                    .map_err(|_| RepairVaultStoreError::CorruptJournal)?;
+            if pending.transaction_binding_sha256 != transaction_binding_sha256
+                || status.transaction_binding_sha256().as_str() != transaction_binding_sha256
+                || status.phase() != pending.expected_phase
+            {
+                return Err(RepairVaultStoreError::CorruptJournal);
+            }
+            let resolution = pending.resolution.clone();
+            let transaction = state
+                .transactions
+                .get_mut(&reservation_id)
+                .ok_or(RepairVaultStoreError::CorruptJournal)?;
+            transaction.pending_resolution = None;
+            transaction.resolution = Some(resolution);
+            if transaction_phase(transaction) == RepairTransactionPhase::Resolved {
+                state.unresolved_transaction = None;
+            }
             state.pending = None;
         }
         RepairEvent::CancelIntent { reservation_id } => {
@@ -2689,7 +3279,20 @@ fn apply_repair_event(
             let ReservationPhase::Durable(binding) = &record.phase else {
                 return Err(RepairVaultStoreError::CorruptJournal);
             };
-            record.phase = ReservationPhase::RetirePending(binding.clone());
+            let transaction = state
+                .transactions
+                .get(&reservation_id)
+                .ok_or(RepairVaultStoreError::CorruptJournal)?;
+            if transaction_phase(transaction) != RepairTransactionPhase::Resolved
+                || state.unresolved_transaction.as_ref() == Some(&reservation_id)
+            {
+                return Err(RepairVaultStoreError::CorruptJournal);
+            }
+            let resolution = transaction
+                .resolution
+                .clone()
+                .ok_or(RepairVaultStoreError::CorruptJournal)?;
+            record.phase = ReservationPhase::RetirePending(binding.clone(), resolution);
             state.pending = Some(reservation_id);
         }
         RepairEvent::RetireComplete {
@@ -2715,7 +3318,7 @@ fn apply_repair_event(
                         .reservations
                         .get(&reservation_id)
                         .map(|record| &record.phase),
-                    Some(ReservationPhase::RetirePending(_))
+                    Some(ReservationPhase::RetirePending(..))
                 )
             {
                 return Err(RepairVaultStoreError::CorruptJournal);
@@ -2724,6 +3327,15 @@ fn apply_repair_event(
                 .reservations
                 .remove(&reservation_id)
                 .ok_or(RepairVaultStoreError::CorruptJournal)?;
+            let transaction = state
+                .transactions
+                .remove(&reservation_id)
+                .ok_or(RepairVaultStoreError::CorruptJournal)?;
+            if transaction_phase(&transaction) != RepairTransactionPhase::Resolved
+                || state.unresolved_transaction.as_ref() == Some(&reservation_id)
+            {
+                return Err(RepairVaultStoreError::CorruptJournal);
+            }
             state.released.insert(
                 reservation_id,
                 ReleaseTombstone {
@@ -4534,6 +5146,24 @@ fn valid_sha256(value: &str) -> bool {
     valid_lower_hex(value, 64)
 }
 
+fn valid_execution_intent(intent: &RepairExecutionIntentV1) -> bool {
+    RepairExecutionIntentV1::new(
+        intent.session_id(),
+        intent.approval_sequence(),
+        intent.target_id(),
+        intent.scan_fingerprint(),
+        intent.target_fingerprint().clone(),
+        intent.target_physical_parent_fingerprint().clone(),
+        intent.lock_identity(),
+        intent.before_sha256().clone(),
+        intent.after_sha256().clone(),
+        intent.diff_sha256().clone(),
+        intent.observed_uuid_set_sha256().clone(),
+        intent.before_metadata().clone(),
+    )
+    .is_ok_and(|canonical| canonical == *intent)
+}
+
 fn valid_lower_hex(value: &str, length: usize) -> bool {
     value.len() == length
         && value
@@ -4576,6 +5206,7 @@ fn hex_nibble(byte: u8) -> Option<u8> {
 mod tests {
     use super::*;
     use crate::{RescueVaultSecrets, VAULT_MARKER_NAME, VAULT_MARKER_V1, VaultOwner};
+    use kernaid_protocol::rescue_vault::Sha256 as ProtocolSha256;
     use rustix::pipe::{PipeFlags, pipe_with};
     use std::{
         fs::{self, OpenOptions},
@@ -4648,6 +5279,23 @@ mod tests {
     }
 
     fn binding(bytes: &[u8]) -> RepairBinding {
+        let before_sha256 = ProtocolSha256::parse(&encode_hex(&Sha256::digest(bytes)))
+            .expect("protocol before digest");
+        let execution_intent = RepairExecutionIntentV1::new(
+            "S-repair-test",
+            1,
+            "target-test",
+            format!("scan:{}", "1".repeat(64)),
+            ProtocolSha256::parse(&encode_hex(&[7; 32])).expect("target digest"),
+            ProtocolSha256::parse(&"d".repeat(64)).expect("target parent digest"),
+            format!("lock:{}", "2".repeat(64)),
+            before_sha256,
+            ProtocolSha256::parse(&"3".repeat(64)).expect("after digest"),
+            ProtocolSha256::parse(&"4".repeat(64)).expect("diff digest"),
+            ProtocolSha256::parse(&"5".repeat(64)).expect("UUID-set digest"),
+            RepairFileMetadataV1::new(0o644, 0, 0).expect("fstab metadata"),
+        )
+        .expect("execution intent");
         RepairBinding::new(
             "P-repair-test",
             [9; 32],
@@ -4655,8 +5303,56 @@ mod tests {
             [10; 32],
             "rescue:selected-linux-root:etc/fstab",
             Sha256::digest(bytes).into(),
+            execution_intent,
         )
         .expect("valid binding")
+    }
+
+    fn committed_resolution(
+        status: &RepairTransactionStatusPayload,
+    ) -> RepairTransactionResolution {
+        let intent = status
+            .backup()
+            .execution_intent()
+            .expect("durable transaction intent");
+        RepairTransactionResolution::new(
+            RepairTransactionResolutionOutcome::CommittedAfter,
+            intent.after_sha256().clone(),
+            intent.before_metadata().canonical_sha256(),
+            true,
+            intent,
+        )
+        .expect("committed resolution")
+    }
+
+    fn restored_resolution(status: &RepairTransactionStatusPayload) -> RepairTransactionResolution {
+        let intent = status
+            .backup()
+            .execution_intent()
+            .expect("durable transaction intent");
+        RepairTransactionResolution::new(
+            RepairTransactionResolutionOutcome::ClosedBeforeRestored,
+            intent.before_sha256().clone(),
+            intent.before_metadata().canonical_sha256(),
+            true,
+            intent,
+        )
+        .expect("restored resolution")
+    }
+
+    fn manual_resolution(status: &RepairTransactionStatusPayload) -> RepairTransactionResolution {
+        let intent = status
+            .backup()
+            .execution_intent()
+            .expect("durable transaction intent");
+        RepairTransactionResolution::new(
+            RepairTransactionResolutionOutcome::ManualReconciliationRequired,
+            ProtocolSha256::parse(&"e".repeat(64)).expect("third-state digest"),
+            ProtocolSha256::parse(&"f".repeat(64)).expect("third-state metadata digest"),
+            false,
+            intent,
+        )
+        .expect("manual resolution")
     }
 
     fn reservation_id(hex_digit: char) -> ReservationId {
@@ -4803,6 +5499,9 @@ mod tests {
         let durable = store
             .reserve_backup(durable_draft.clone())
             .expect("reserve durable backup");
+        let released = store
+            .reserve_backup(released_draft.clone())
+            .expect("reserve released backup");
         store
             .persist_backup(
                 durable,
@@ -4810,9 +5509,6 @@ mod tests {
                 fixture.read_only_source(durable_bytes),
             )
             .expect("persist durable backup");
-        let released = store
-            .reserve_backup(released_draft.clone())
-            .expect("reserve released backup");
         store
             .cancel_reservation(released)
             .expect("release reserved backup");
@@ -4901,6 +5597,278 @@ mod tests {
         assert_eq!(metadata.backup_locator(), locator);
         assert_eq!(metadata.reservation_binding_sha256(), binding_hash);
         assert_eq!(metadata.backup_sha256(), encode_hex(&Sha256::digest(bytes)));
+    }
+
+    #[test]
+    fn transaction_pending_is_singleton_and_resolution_replay_is_exact() {
+        let fixture = Fixture::new();
+        let first_bytes = b"first transaction backup\n";
+        let second_bytes = b"second transaction backup\n";
+        let mut store = fixture
+            .vault
+            .open_repair_store()
+            .expect("open repair store");
+        let first = store
+            .reserve_backup(draft(first_bytes, 4096))
+            .expect("reserve first backup");
+        let second = store
+            .reserve_backup(draft(second_bytes, 4096))
+            .expect("reserve second backup");
+        let second_id = second.reservation_id().clone();
+        let second_binding = second.reservation_binding_sha256().to_owned();
+        store
+            .persist_backup(
+                first,
+                binding(first_bytes),
+                fixture.read_only_source(first_bytes),
+            )
+            .expect("persist first transaction");
+
+        let pending = store
+            .transaction_status(&RepairTransactionStatusSelector::pending_singleton())
+            .expect("pending singleton status")
+            .transaction()
+            .expect("pending transaction")
+            .clone();
+        assert_eq!(pending.phase(), RepairTransactionPhase::Pending);
+        let exact = RepairTransactionStatusSelector::for_status(&pending);
+        assert_eq!(
+            store
+                .transaction_status(&exact)
+                .expect("exact pending lookup")
+                .transaction(),
+            Some(&pending)
+        );
+        let wrong_binding = RepairTransactionStatusSelector::exact(
+            pending.backup().reservation_id().clone(),
+            ProtocolSha256::parse(&"f".repeat(64)).expect("wrong binding digest"),
+        );
+        assert_eq!(
+            store.transaction_status(&wrong_binding),
+            Err(RepairVaultStoreError::ReservationConflict)
+        );
+        let unknown_id =
+            if pending.backup().reservation_id().as_str() == "B-ffffffffffffffffffffffffffffffff" {
+                "B-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+            } else {
+                "B-ffffffffffffffffffffffffffffffff"
+            };
+        let unknown = RepairTransactionStatusSelector::exact(
+            ProtocolRepairReservationId::parse(unknown_id).expect("unknown reservation ID"),
+            pending.transaction_binding_sha256().clone(),
+        );
+        assert_eq!(
+            store.transaction_status(&unknown),
+            Err(RepairVaultStoreError::ReservationNotFound)
+        );
+        assert_eq!(
+            store.persist_backup(
+                second,
+                binding(second_bytes),
+                fixture.read_only_source(second_bytes),
+            ),
+            Err(RepairVaultStoreError::ReconciliationRequired)
+        );
+        assert_eq!(
+            store
+                .reserve_backup(draft(b"new reservation while pending\n", 4096))
+                .err(),
+            Some(RepairVaultStoreError::ReconciliationRequired)
+        );
+
+        let resolution = committed_resolution(&pending);
+        let before_resolve_events = store.event_count;
+        let resolved = store
+            .resolve_transaction(&pending, resolution.clone())
+            .expect("resolve transaction");
+        assert_eq!(resolved.phase(), RepairTransactionPhase::Resolved);
+        assert_eq!(store.event_count, before_resolve_events + 2);
+        assert_eq!(
+            store
+                .resolve_transaction(&pending, resolution)
+                .expect("replay response-lost resolution"),
+            resolved
+        );
+        assert_eq!(store.event_count, before_resolve_events + 2);
+        assert!(
+            store
+                .transaction_status(&RepairTransactionStatusSelector::pending_singleton())
+                .expect("no unresolved transaction")
+                .transaction()
+                .is_none()
+        );
+
+        let resumed = store
+            .resume_reserved(&second_id, &second_binding)
+            .expect("resume capability consumed by blocked persist");
+        store
+            .persist_backup(
+                resumed,
+                binding(second_bytes),
+                fixture.read_only_source(second_bytes),
+            )
+            .expect("persist after first transaction closes");
+        assert!(
+            store
+                .transaction_status(&RepairTransactionStatusSelector::pending_singleton())
+                .expect("second pending singleton")
+                .transaction()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn reboot_completes_authenticated_transaction_resolve_intent() {
+        let fixture = Fixture::new();
+        let bytes = b"resolve intent backup\n";
+        let (pending, resolution, intent_event_count) = {
+            let mut store = fixture
+                .vault
+                .open_repair_store()
+                .expect("open repair store");
+            let reserved = store
+                .reserve_backup(draft(bytes, 4096))
+                .expect("reserve backup");
+            store
+                .persist_backup(reserved, binding(bytes), fixture.read_only_source(bytes))
+                .expect("persist transaction backup");
+            let pending = store
+                .transaction_status(&RepairTransactionStatusSelector::pending_singleton())
+                .expect("pending status")
+                .transaction()
+                .expect("pending transaction")
+                .clone();
+            let resolution = committed_resolution(&pending);
+            store
+                .append_event(RepairEvent::TransactionResolveIntent {
+                    reservation_id: ReservationId::parse(
+                        pending.backup().reservation_id().as_str(),
+                    )
+                    .expect("store reservation ID"),
+                    transaction_binding_sha256: pending
+                        .transaction_binding_sha256()
+                        .as_str()
+                        .to_owned(),
+                    expected_phase: RepairTransactionPhase::Pending,
+                    resolution: resolution.clone(),
+                })
+                .expect("append resolve intent before simulated reboot");
+            (pending, resolution, store.event_count)
+        };
+
+        let mut store = fixture
+            .vault
+            .open_repair_store()
+            .expect("reconcile resolve intent after reboot");
+        assert_eq!(store.event_count, intent_event_count + 1);
+        let exact = RepairTransactionStatusSelector::for_status(&pending);
+        let resolved = store
+            .transaction_status(&exact)
+            .expect("exact resolved status")
+            .transaction()
+            .expect("resolved transaction")
+            .clone();
+        assert_eq!(resolved.phase(), RepairTransactionPhase::Resolved);
+        assert_eq!(
+            store
+                .resolve_transaction(&pending, resolution)
+                .expect("replay recovered response-loss request"),
+            resolved
+        );
+        assert_eq!(store.event_count, intent_event_count + 1);
+    }
+
+    #[test]
+    fn manual_transaction_survives_compaction_and_blocks_until_restored() {
+        let fixture = Fixture::new();
+        let bytes = b"manual recovery backup\n";
+        let later_bytes = b"mutation after manual recovery\n";
+        let (reservation_id, transaction_binding, later_id, later_binding) = {
+            let mut store = fixture
+                .vault
+                .open_repair_store()
+                .expect("open repair store");
+            let reserved = store
+                .reserve_backup(draft(bytes, 4096))
+                .expect("reserve backup");
+            let reservation_id = reserved.reservation_id().clone();
+            let later = store
+                .reserve_backup(draft(later_bytes, 4096))
+                .expect("reserve later backup");
+            let later_id = later.reservation_id().clone();
+            let later_binding = later.reservation_binding_sha256().to_owned();
+            store
+                .persist_backup(reserved, binding(bytes), fixture.read_only_source(bytes))
+                .expect("persist transaction backup");
+            let pending = store
+                .transaction_status(&RepairTransactionStatusSelector::pending_singleton())
+                .expect("pending status")
+                .transaction()
+                .expect("pending transaction")
+                .clone();
+            let manual = store
+                .resolve_transaction(&pending, manual_resolution(&pending))
+                .expect("record manual reconciliation");
+            assert_eq!(
+                manual.phase(),
+                RepairTransactionPhase::ManualReconciliationRequired
+            );
+            assert_eq!(
+                store.persist_backup(
+                    later,
+                    binding(later_bytes),
+                    fixture.read_only_source(later_bytes),
+                ),
+                Err(RepairVaultStoreError::ReconciliationRequired)
+            );
+            let binding = manual.transaction_binding_sha256().as_str().to_owned();
+            store.compact_journal().expect("compact manual transaction");
+            (reservation_id, binding, later_id, later_binding)
+        };
+
+        let mut store = fixture
+            .vault
+            .open_repair_store()
+            .expect("reopen manual transaction");
+        let manual = store
+            .transaction_status(&RepairTransactionStatusSelector::pending_singleton())
+            .expect("manual singleton after reboot")
+            .transaction()
+            .expect("manual transaction after reboot")
+            .clone();
+        assert_eq!(
+            manual.phase(),
+            RepairTransactionPhase::ManualReconciliationRequired
+        );
+        assert_eq!(
+            manual.transaction_binding_sha256().as_str(),
+            transaction_binding
+        );
+        assert_eq!(
+            manual.backup().reservation_id().as_str(),
+            reservation_id.as_str()
+        );
+        let restored = store
+            .resolve_transaction(&manual, restored_resolution(&manual))
+            .expect("close after verified restore");
+        assert_eq!(restored.phase(), RepairTransactionPhase::Resolved);
+        assert!(
+            store
+                .transaction_status(&RepairTransactionStatusSelector::pending_singleton())
+                .expect("manual transaction closed")
+                .transaction()
+                .is_none()
+        );
+        let later = store
+            .resume_reserved(&later_id, &later_binding)
+            .expect("resume later repair after manual close");
+        store
+            .persist_backup(
+                later,
+                binding(later_bytes),
+                fixture.read_only_source(later_bytes),
+            )
+            .expect("persist after manual transaction closes");
     }
 
     #[test]
@@ -5370,6 +6338,7 @@ mod tests {
             RepairBackupDraft::new("S-ok", "/dev/sda", [1; 32], [2; 32], [3; 32], 1, 1),
             Err(RepairVaultStoreError::InvalidDraft)
         );
+        let valid = binding(b"resource binding\n");
         assert!(
             RepairBinding::new(
                 "P-real-resource",
@@ -5377,7 +6346,8 @@ mod tests {
                 "A-real-resource",
                 [2; 32],
                 "rescue:selected-linux-root:etc/fstab",
-                [3; 32],
+                *valid.resource_sha256(),
+                valid.execution_intent().clone(),
             )
             .is_ok()
         );
@@ -5388,7 +6358,8 @@ mod tests {
                 "A-bad-resource",
                 [2; 32],
                 "/etc/fstab",
-                [3; 32],
+                *valid.resource_sha256(),
+                valid.execution_intent().clone(),
             ),
             Err(RepairVaultStoreError::InvalidBinding)
         );
@@ -5484,6 +6455,15 @@ mod tests {
             let durable = store
                 .persist_backup(reserved, binding(bytes), fixture.read_only_source(bytes))
                 .expect("persist backup");
+            let pending = store
+                .transaction_status(&RepairTransactionStatusSelector::pending_singleton())
+                .expect("pending transaction status")
+                .transaction()
+                .expect("pending transaction")
+                .clone();
+            store
+                .resolve_transaction(&pending, committed_resolution(&pending))
+                .expect("resolve before retirement");
             (reservation_id, draft_binding, durable.metadata().clone())
         };
         {
@@ -5531,6 +6511,9 @@ mod tests {
             Err(RepairVaultStoreError::ReservationConflict)
         );
         assert!(store.reserve_backup(draft(b"slot reused\n", 4096)).is_ok());
+        store
+            .compact_journal()
+            .expect("compact retired transaction tombstone");
         drop(store);
 
         let mut store = fixture
@@ -5569,6 +6552,11 @@ mod tests {
                 .expect("reserve durable backup");
             let durable_id = durable.reservation_id().clone();
             let durable_binding = durable.reservation_binding_sha256().to_owned();
+            let cancelled = store
+                .reserve_backup(draft(cancelled_bytes, 4096))
+                .expect("reserve cancelled backup");
+            let cancelled_id = cancelled.reservation_id().clone();
+            let cancelled_binding = cancelled.reservation_binding_sha256().to_owned();
             store
                 .persist_backup(
                     durable,
@@ -5577,11 +6565,6 @@ mod tests {
                 )
                 .expect("persist durable backup");
 
-            let cancelled = store
-                .reserve_backup(draft(cancelled_bytes, 4096))
-                .expect("reserve cancelled backup");
-            let cancelled_id = cancelled.reservation_id().clone();
-            let cancelled_binding = cancelled.reservation_binding_sha256().to_owned();
             store
                 .cancel_reservation(cancelled)
                 .expect("cancel retryable backup");
@@ -5629,6 +6612,17 @@ mod tests {
                 .expect("durable status"),
             RepairBackupStatus::Durable(_)
         ));
+        let pending = store
+            .transaction_status(&RepairTransactionStatusSelector::pending_singleton())
+            .expect("transaction survives compaction and reopen")
+            .transaction()
+            .expect("pending transaction after compaction")
+            .clone();
+        assert_eq!(pending.phase(), RepairTransactionPhase::Pending);
+        assert_eq!(
+            pending.backup().reservation_id().as_str(),
+            durable_id.as_str()
+        );
         assert_eq!(
             store.cancel_reserved(&cancelled_id, &cancelled_binding),
             Ok(4096)
