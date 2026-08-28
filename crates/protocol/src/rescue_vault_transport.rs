@@ -13,6 +13,11 @@
 //! filters other control-message kinds before this crate can reject or close
 //! them.
 
+#[cfg(feature = "experimental-repair-store")]
+use crate::rescue_repair_vault::{
+    MAX_REPAIR_BACKUP_BYTES, RepairBackupBinding, RepairBackupDraft, RepairBackupState,
+    RepairBackupStatusPayload, RepairReservationId,
+};
 use crate::rescue_vault::{
     API_VERSION, AuditEventType, AuditOutcome, DescriptorDeclaration, DescriptorType, ErrorToken,
     MAX_AUDIT_SEQUENCE, MAX_DATAGRAM_BYTES, MAX_OPENAI_KEY_BYTES, MAX_PASSPHRASE_BYTES,
@@ -518,6 +523,24 @@ pub enum ClientRequestPayload {
     ReportGet {
         report_id: ReportId,
     },
+    #[cfg(feature = "experimental-repair-store")]
+    RepairBackupReserve {
+        draft: RepairBackupDraft,
+    },
+    #[cfg(feature = "experimental-repair-store")]
+    RepairBackupPersist {
+        expected: Box<RepairBackupStatusPayload>,
+        binding: RepairBackupBinding,
+        input_size: u64,
+    },
+    #[cfg(feature = "experimental-repair-store")]
+    RepairBackupStatus {
+        expected: Box<RepairBackupStatusPayload>,
+    },
+    #[cfg(feature = "experimental-repair-store")]
+    RepairBackupGet {
+        expected: Box<RepairBackupStatusPayload>,
+    },
 }
 
 impl ClientRequestPayload {
@@ -536,6 +559,14 @@ impl ClientRequestPayload {
             Self::ReportPersist { .. } => Operation::ReportPersist,
             Self::ReportList => Operation::ReportList,
             Self::ReportGet { .. } => Operation::ReportGet,
+            #[cfg(feature = "experimental-repair-store")]
+            Self::RepairBackupReserve { .. } => Operation::RepairBackupReserve,
+            #[cfg(feature = "experimental-repair-store")]
+            Self::RepairBackupPersist { .. } => Operation::RepairBackupPersist,
+            #[cfg(feature = "experimental-repair-store")]
+            Self::RepairBackupStatus { .. } => Operation::RepairBackupStatus,
+            #[cfg(feature = "experimental-repair-store")]
+            Self::RepairBackupGet { .. } => Operation::RepairBackupGet,
         }
     }
 
@@ -553,6 +584,11 @@ impl ClientRequestPayload {
                 kind: DescriptorType::SessionReportJsonPipe,
                 size: *input_size,
             }),
+            #[cfg(feature = "experimental-repair-store")]
+            Self::RepairBackupPersist { input_size, .. } => Some(DescriptorDeclaration {
+                kind: DescriptorType::RepairBackupInputPipe,
+                size: *input_size,
+            }),
             Self::VaultStatus
             | Self::VaultLock
             | Self::ProviderStatus
@@ -562,6 +598,10 @@ impl ClientRequestPayload {
             | Self::AuditAppend { .. }
             | Self::ReportList
             | Self::ReportGet { .. } => None,
+            #[cfg(feature = "experimental-repair-store")]
+            Self::RepairBackupReserve { .. }
+            | Self::RepairBackupStatus { .. }
+            | Self::RepairBackupGet { .. } => None,
         }
     }
 }
@@ -629,6 +669,17 @@ fn valid_client_payload(payload: &ClientRequestPayload) -> bool {
         ClientRequestPayload::ReportPersist { input_size, .. } => {
             (2..=MAX_SESSION_REPORT_JSON_BYTES).contains(input_size)
         }
+        #[cfg(feature = "experimental-repair-store")]
+        ClientRequestPayload::RepairBackupPersist {
+            expected,
+            input_size,
+            ..
+        } => {
+            expected.validate().is_ok()
+                && expected.state() == RepairBackupState::Reserved
+                && expected.backup_size() == *input_size
+                && (1..=MAX_REPAIR_BACKUP_BYTES).contains(input_size)
+        }
         ClientRequestPayload::VaultStatus
         | ClientRequestPayload::VaultLock
         | ClientRequestPayload::ProviderStatus
@@ -637,6 +688,14 @@ fn valid_client_payload(payload: &ClientRequestPayload) -> bool {
         | ClientRequestPayload::ProviderCodexHomeLease
         | ClientRequestPayload::ReportList
         | ClientRequestPayload::ReportGet { .. } => true,
+        #[cfg(feature = "experimental-repair-store")]
+        ClientRequestPayload::RepairBackupReserve { .. } => true,
+        #[cfg(feature = "experimental-repair-store")]
+        ClientRequestPayload::RepairBackupStatus { expected } => expected.validate().is_ok(),
+        #[cfg(feature = "experimental-repair-store")]
+        ClientRequestPayload::RepairBackupGet { expected } => {
+            expected.validate().is_ok() && expected.state() == RepairBackupState::Durable
+        }
     }
 }
 
@@ -692,6 +751,42 @@ struct PersistRequestPayload<'a> {
 #[serde(rename_all = "camelCase")]
 struct GetRequestPayload<'a> {
     report_id: &'a ReportId,
+}
+
+#[cfg(feature = "experimental-repair-store")]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RepairBackupReserveRequestPayload<'a> {
+    session_id: &'a str,
+    target_id: &'a str,
+    target_fingerprint: &'a Sha256,
+    expected_backup_sha256: &'a Sha256,
+    metadata_sha256: &'a Sha256,
+    backup_size: u64,
+    required_capacity_bytes: u64,
+}
+
+#[cfg(feature = "experimental-repair-store")]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RepairBackupPersistRequestPayload<'a> {
+    reservation_id: &'a RepairReservationId,
+    draft_binding_sha256: &'a Sha256,
+    plan_id: &'a str,
+    plan_sha256: &'a Sha256,
+    approval_id: &'a str,
+    approval_sha256: &'a Sha256,
+    resource_id: &'a str,
+    resource_sha256: &'a Sha256,
+    input: &'a DescriptorDeclaration,
+}
+
+#[cfg(feature = "experimental-repair-store")]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RepairBackupReferenceRequestPayload<'a> {
+    reservation_id: &'a RepairReservationId,
+    draft_binding_sha256: &'a Sha256,
 }
 
 /// Encodes a typed client request and validates the exact outgoing descriptor
@@ -769,6 +864,47 @@ pub fn encode_client_request(
         ClientRequestPayload::ReportGet { report_id } => {
             encode_client_request_payload(request, GetRequestPayload { report_id })
         }
+        #[cfg(feature = "experimental-repair-store")]
+        ClientRequestPayload::RepairBackupReserve { draft } => encode_client_request_payload(
+            request,
+            RepairBackupReserveRequestPayload {
+                session_id: draft.session_id(),
+                target_id: draft.target_id(),
+                target_fingerprint: draft.target_fingerprint(),
+                expected_backup_sha256: draft.expected_backup_sha256(),
+                metadata_sha256: draft.metadata_sha256(),
+                backup_size: draft.backup_size(),
+                required_capacity_bytes: draft.required_capacity_bytes(),
+            },
+        ),
+        #[cfg(feature = "experimental-repair-store")]
+        ClientRequestPayload::RepairBackupPersist {
+            expected, binding, ..
+        } => encode_client_request_payload(
+            request,
+            RepairBackupPersistRequestPayload {
+                reservation_id: expected.reservation_id(),
+                draft_binding_sha256: expected.draft_binding_sha256(),
+                plan_id: binding.plan_id(),
+                plan_sha256: binding.plan_sha256(),
+                approval_id: binding.approval_id(),
+                approval_sha256: binding.approval_sha256(),
+                resource_id: binding.resource_id(),
+                resource_sha256: binding.resource_sha256(),
+                input: declaration
+                    .as_ref()
+                    .ok_or(ProtocolViolation::InvalidPayload)?,
+            },
+        ),
+        #[cfg(feature = "experimental-repair-store")]
+        ClientRequestPayload::RepairBackupStatus { expected }
+        | ClientRequestPayload::RepairBackupGet { expected } => encode_client_request_payload(
+            request,
+            RepairBackupReferenceRequestPayload {
+                reservation_id: expected.reservation_id(),
+                draft_binding_sha256: expected.draft_binding_sha256(),
+            },
+        ),
     }?;
     if bytes.len() > MAX_DATAGRAM_BYTES {
         return Err(ProtocolViolation::DatagramTooLarge);
@@ -816,9 +952,13 @@ fn validate_client_request_descriptors(
             DescriptorType::PassphrasePipe
             | DescriptorType::OpenAiApiKeyPipe
             | DescriptorType::SessionReportJsonPipe => validate_borrowed_pipe(*descriptor),
+            #[cfg(feature = "experimental-repair-store")]
+            DescriptorType::RepairBackupInputPipe => validate_borrowed_pipe(*descriptor),
             DescriptorType::CodexHomeOPath
             | DescriptorType::CodexMountRoot
             | DescriptorType::SignedReportEnvelopePipe => Err(ProtocolViolation::InvalidPayload),
+            #[cfg(feature = "experimental-repair-store")]
+            DescriptorType::RepairBackupOutputPipe => Err(ProtocolViolation::InvalidPayload),
         },
     }
 }
@@ -1105,17 +1245,27 @@ fn validate_success_state_version(
     state_version: u64,
     request: &ClientRequest,
 ) -> Result<(), ClientResponseDecodeError> {
-    if matches!(
+    let base_mutation = matches!(
         request.payload(),
         ClientRequestPayload::VaultUnlock { .. }
             | ClientRequestPayload::VaultLock
             | ClientRequestPayload::ProviderOpenAiConfigure { .. }
             | ClientRequestPayload::ProviderLogout { .. }
-    ) && request
-        .expected_state_version()
-        .checked_add(2)
-        .filter(|version| *version <= MAX_SAFE_JSON_INTEGER)
-        != Some(state_version)
+    );
+    #[cfg(feature = "experimental-repair-store")]
+    let repair_mutation = matches!(
+        request.payload(),
+        ClientRequestPayload::RepairBackupReserve { .. }
+            | ClientRequestPayload::RepairBackupPersist { .. }
+    );
+    #[cfg(not(feature = "experimental-repair-store"))]
+    let repair_mutation = false;
+    if (base_mutation || repair_mutation)
+        && request
+            .expected_state_version()
+            .checked_add(2)
+            .filter(|version| *version <= MAX_SAFE_JSON_INTEGER)
+            != Some(state_version)
     {
         return Err(ClientResponseDecodeError::InvalidStateVersion);
     }
@@ -1152,6 +1302,14 @@ struct ReportListResponseWire {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ReportResponseWire {
     report: ReportSummaryWire,
+    output: DescriptorDeclaration,
+}
+
+#[cfg(feature = "experimental-repair-store")]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RepairBackupResponseWire {
+    backup: RepairBackupStatusPayload,
     output: DescriptorDeclaration,
 }
 
@@ -1268,6 +1426,71 @@ fn decode_success_payload(
             validate_one_descriptor(descriptors, DescriptorType::SignedReportEnvelopePipe)?;
             Ok(SuccessPayload::Report(report, response.output))
         }
+        #[cfg(feature = "experimental-repair-store")]
+        ClientRequestPayload::RepairBackupReserve { draft } => {
+            require_no_descriptors(descriptors)?;
+            let status: RepairBackupStatusPayload = decode_payload(raw)?;
+            if status.validate().is_err()
+                || status.state() != RepairBackupState::Reserved
+                || status.draft_binding_sha256() != &draft.draft_binding_sha256()
+                || status.backup_size() != draft.backup_size()
+                || status.expected_backup_sha256() != draft.expected_backup_sha256()
+                || status.metadata_sha256() != draft.metadata_sha256()
+                || status.reserved_bytes() < draft.required_capacity_bytes()
+            {
+                return Err(ClientResponseDecodeError::InvalidPayload);
+            }
+            Ok(SuccessPayload::RepairBackupStatus(Box::new(status)))
+        }
+        #[cfg(feature = "experimental-repair-store")]
+        ClientRequestPayload::RepairBackupPersist {
+            expected,
+            binding,
+            input_size,
+        } => {
+            require_no_descriptors(descriptors)?;
+            let status: RepairBackupStatusPayload = decode_payload(raw)?;
+            if status.validate().is_err()
+                || status.state() != RepairBackupState::Durable
+                || !status.immutable_fields_match(expected)
+                || status.backup_size() != *input_size
+                || status.plan_id() != Some(binding.plan_id())
+                || status.plan_sha256() != Some(binding.plan_sha256())
+                || status.approval_id() != Some(binding.approval_id())
+                || status.approval_sha256() != Some(binding.approval_sha256())
+                || status.resource_id() != Some(binding.resource_id())
+                || status.resource_sha256() != Some(binding.resource_sha256())
+            {
+                return Err(ClientResponseDecodeError::InvalidPayload);
+            }
+            Ok(SuccessPayload::RepairBackupStatus(Box::new(status)))
+        }
+        #[cfg(feature = "experimental-repair-store")]
+        ClientRequestPayload::RepairBackupStatus { expected } => {
+            require_no_descriptors(descriptors)?;
+            let status: RepairBackupStatusPayload = decode_payload(raw)?;
+            if status.validate().is_err() || !status.immutable_fields_match(expected) {
+                return Err(ClientResponseDecodeError::InvalidPayload);
+            }
+            Ok(SuccessPayload::RepairBackupStatus(Box::new(status)))
+        }
+        #[cfg(feature = "experimental-repair-store")]
+        ClientRequestPayload::RepairBackupGet { expected } => {
+            let response: RepairBackupResponseWire = decode_payload(raw)?;
+            if response.backup.validate().is_err()
+                || response.backup.state() != RepairBackupState::Durable
+                || !response.backup.immutable_fields_match(expected)
+                || response.output.kind != DescriptorType::RepairBackupOutputPipe
+                || response.output.size != response.backup.backup_size()
+            {
+                return Err(ClientResponseDecodeError::InvalidPayload);
+            }
+            validate_one_descriptor(descriptors, DescriptorType::RepairBackupOutputPipe)?;
+            Ok(SuccessPayload::RepairBackup(
+                Box::new(response.backup),
+                response.output,
+            ))
+        }
     }
 }
 
@@ -1350,11 +1573,15 @@ fn validate_one_descriptor(
         DescriptorType::OpenAiApiKeyPipe | DescriptorType::SignedReportEnvelopePipe => {
             validate_borrowed_pipe(descriptor)
         }
+        #[cfg(feature = "experimental-repair-store")]
+        DescriptorType::RepairBackupOutputPipe => validate_borrowed_pipe(descriptor),
         DescriptorType::CodexHomeOPath => validate_o_path_directory(descriptor),
         DescriptorType::PassphrasePipe
         | DescriptorType::CodexMountNamespace
         | DescriptorType::CodexMountRoot
         | DescriptorType::SessionReportJsonPipe => Err(ProtocolViolation::InvalidDescriptor),
+        #[cfg(feature = "experimental-repair-store")]
+        DescriptorType::RepairBackupInputPipe => Err(ProtocolViolation::InvalidDescriptor),
     };
     result.map_err(|_| ClientResponseDecodeError::InvalidDescriptor)
 }
@@ -2066,6 +2293,162 @@ mod tests {
             ),
             Err(ProtocolViolation::InvalidPayload)
         );
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    #[test]
+    fn repair_backup_client_codec_binds_mutations_and_descriptor_direction() {
+        use crate::rescue_repair_vault::{
+            RepairBackupBinding, RepairBackupDraft, RepairBackupStatusPayload, RepairReservationId,
+        };
+
+        let hash = |byte: char| Sha256::parse(&byte.to_string().repeat(64)).expect("test SHA-256");
+        let draft = RepairBackupDraft::new(
+            "S-session-1",
+            "target-1",
+            hash('1'),
+            hash('2'),
+            hash('3'),
+            4096,
+            8192,
+        )
+        .expect("repair draft");
+        let reserve = request(ClientRequestPayload::RepairBackupReserve {
+            draft: draft.clone(),
+        });
+        let encoded = encode_client_request(&reserve, &[]).expect("reserve request");
+        let encoded = String::from_utf8(encoded).expect("UTF-8 request");
+        assert!(encoded.contains("repair.backup.reserve"));
+        assert!(!encoded.contains("/dev/"));
+        assert_eq!(
+            encode_client_request(&reserve, &[read_pipe().as_fd()]),
+            Err(ProtocolViolation::FdForbidden)
+        );
+
+        let reservation =
+            RepairReservationId::parse("B-0123456789abcdef0123456789abcdef").expect("reservation");
+        let draft_binding = draft.draft_binding_sha256();
+        let reserved = RepairBackupStatusPayload::reserved(
+            reservation.clone(),
+            draft_binding.clone(),
+            reservation.locator(),
+            "V-0123456789abcdef0123456789abcdef",
+            hash('5'),
+            hash('6'),
+            8192,
+            4096,
+            hash('2'),
+            hash('3'),
+        )
+        .expect("reserved status");
+        let response = success_response(
+            REQUEST_ID,
+            9,
+            "repair.backup.reserve",
+            &serde_json::to_string(&reserved).expect("reserved JSON"),
+        );
+        assert!(decode_client_response(&response, Vec::new(), &reserve).is_ok());
+        let mut wrong_binding = serde_json::to_value(&reserved).expect("reserved JSON value");
+        wrong_binding["draftBindingSha256"] = serde_json::Value::String("0".repeat(64));
+        let wrong_binding = success_response(
+            REQUEST_ID,
+            9,
+            "repair.backup.reserve",
+            &serde_json::to_string(&wrong_binding).expect("wrong binding JSON"),
+        );
+        assert_eq!(
+            decode_client_response(&wrong_binding, Vec::new(), &reserve).err(),
+            Some(ClientResponseDecodeError::InvalidPayload)
+        );
+        let stale = success_response(
+            REQUEST_ID,
+            8,
+            "repair.backup.reserve",
+            &serde_json::to_string(&reserved).expect("reserved JSON"),
+        );
+        assert_eq!(
+            decode_client_response(&stale, Vec::new(), &reserve).err(),
+            Some(ClientResponseDecodeError::InvalidStateVersion)
+        );
+
+        let binding = RepairBackupBinding::new(
+            "P-plan-1",
+            hash('7'),
+            "A-approval-1",
+            hash('8'),
+            "rescue:selected-linux-root:etc/fstab",
+            hash('9'),
+        )
+        .expect("repair binding");
+        let persist = request(ClientRequestPayload::RepairBackupPersist {
+            expected: Box::new(reserved.clone()),
+            binding: binding.clone(),
+            input_size: 4096,
+        });
+        assert_eq!(
+            encode_client_request(&persist, &[]),
+            Err(ProtocolViolation::FdRequired)
+        );
+        let input = read_pipe();
+        let persist_json = encode_client_request(&persist, &[input.as_fd()])
+            .expect("persist request with input pipe");
+        assert!(
+            String::from_utf8(persist_json)
+                .expect("UTF-8 persist")
+                .contains("repair-backup-input-pipe")
+        );
+
+        let durable = RepairBackupStatusPayload::durable(
+            reservation.clone(),
+            draft_binding,
+            reservation.locator(),
+            "V-0123456789abcdef0123456789abcdef",
+            hash('5'),
+            hash('6'),
+            8192,
+            4096,
+            hash('2'),
+            hash('3'),
+            binding,
+        )
+        .expect("durable status");
+        let persist_response = success_response(
+            REQUEST_ID,
+            9,
+            "repair.backup.persist",
+            &serde_json::to_string(&durable).expect("durable JSON"),
+        );
+        assert!(decode_client_response(&persist_response, Vec::new(), &persist).is_ok());
+        let mut vault_drift = serde_json::to_value(&durable).expect("durable JSON value");
+        vault_drift["vaultId"] =
+            serde_json::Value::String("V-ffffffffffffffffffffffffffffffff".into());
+        let vault_drift = success_response(
+            REQUEST_ID,
+            9,
+            "repair.backup.persist",
+            &serde_json::to_string(&vault_drift).expect("drift JSON"),
+        );
+        assert_eq!(
+            decode_client_response(&vault_drift, Vec::new(), &persist).err(),
+            Some(ClientResponseDecodeError::InvalidPayload)
+        );
+
+        let get = request(ClientRequestPayload::RepairBackupGet {
+            expected: Box::new(durable.clone()),
+        });
+        let get_payload = format!(
+            "{{\"backup\":{},\"output\":{{\"type\":\"repair-backup-output-pipe\",\"size\":4096}}}}",
+            serde_json::to_string(&durable).expect("durable JSON")
+        );
+        let get_response = success_response(REQUEST_ID, 9, "repair.backup.get", &get_payload);
+        assert_eq!(
+            decode_client_response(&get_response, Vec::new(), &get).err(),
+            Some(ClientResponseDecodeError::FdRequired)
+        );
+        let output = read_pipe();
+        let decoded = decode_client_response(&get_response, vec![output], &get)
+            .expect("get response with output pipe");
+        assert_eq!(decoded.descriptor_count(), 1);
     }
 
     #[test]

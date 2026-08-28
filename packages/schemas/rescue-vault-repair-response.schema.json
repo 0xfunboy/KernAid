@@ -1,0 +1,614 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.kernaid.dev/experimental/rescue-vault-repair-response-v1alpha1.json",
+  "title": "ExperimentalRescueVaultRepairResponse",
+  "description": "Closed, path-free and secret-free response for one Rescue vault seqpacket request. repair.backup.* operations are available only in the off-by-default experimental repair-store build.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "apiVersion",
+    "requestId",
+    "stateVersion",
+    "operation",
+    "outcome"
+  ],
+  "properties": {
+    "apiVersion": { "const": "kernaid.dev/rescue-vault/v1alpha1" },
+    "requestId": {
+      "type": "string",
+      "pattern": "^R-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "stateVersion": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "operation": {
+      "enum": [
+        "vault.status",
+        "vault.unlock",
+        "vault.lock",
+        "provider.openai.configure",
+        "provider.status",
+        "provider.logout",
+        "provider.openai.borrow",
+        "provider.codex.home_lease",
+        "audit.append",
+        "report.persist",
+        "report.list",
+        "report.get",
+        "repair.backup.reserve",
+        "repair.backup.persist",
+        "repair.backup.status",
+        "repair.backup.get"
+      ]
+    },
+    "outcome": { "enum": ["ok", "error"] },
+    "payload": { "type": "object" },
+    "error": { "$ref": "#/$defs/errorToken" }
+  },
+  "$defs": {
+    "emptyPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "maxProperties": 0
+    },
+    "errorToken": {
+      "enum": [
+        "ABSENT",
+        "UNPROVISIONED",
+        "LOCKED",
+        "BAD_PASSPHRASE",
+        "MEDIA_CHANGED",
+        "PROFILE_MISMATCH",
+        "STALE_STATE",
+        "FD_REQUIRED",
+        "FD_FORBIDDEN",
+        "NOT_AUTHORIZED",
+        "RATE_LIMITED",
+        "BUSY",
+        "PROVIDER_UNCONFIGURED",
+        "REPORT_TOO_LARGE",
+        "IO_FAILED",
+        "REBOOT_REQUIRED"
+      ]
+    },
+    "vaultStatus": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["vaultState"],
+          "properties": {
+            "vaultState": {
+              "enum": [
+                "absent",
+                "unprovisioned",
+                "locked",
+                "unlocking",
+                "locking",
+                "faulted-reboot-required"
+              ]
+            }
+          }
+        },
+        { "$ref": "#/$defs/unlockedVaultStatus" }
+      ]
+    },
+    "unlockedVaultStatus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["vaultState", "deviceId"],
+      "properties": {
+        "vaultState": { "const": "unlocked" },
+        "deviceId": { "$ref": "#/$defs/deviceId" }
+      }
+    },
+    "deviceId": {
+      "type": "string",
+      "pattern": "^KA-[0-9a-f]{24}$"
+    },
+    "providerStatus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["openai", "codex"],
+      "properties": {
+        "openai": { "enum": ["unconfigured", "configured"] },
+        "codex": { "enum": ["unconfigured", "configured"] }
+      }
+    },
+    "openaiOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "size"],
+      "properties": {
+        "type": { "const": "openai-api-key-pipe" },
+        "size": { "type": "integer", "minimum": 1, "maximum": 512 }
+      }
+    },
+    "codexOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "size"],
+      "properties": {
+        "type": { "const": "codex-home-o-path" },
+        "size": { "const": 0 }
+      }
+    },
+    "signedReportEnvelopeOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "size"],
+      "properties": {
+        "type": { "const": "signed-report-envelope-pipe" },
+        "size": {
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 1572864
+        }
+      }
+    },
+    "repairBackupOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "size"],
+      "properties": {
+        "type": { "const": "repair-backup-output-pipe" },
+        "size": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16777216
+        }
+      }
+    },
+    "reportSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reportId", "envelopeSize", "envelopeSha256"],
+      "properties": {
+        "reportId": {
+          "type": "string",
+          "pattern": "^RP-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "envelopeSize": {
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 1572864
+        },
+        "envelopeSha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "reservationId": {
+      "type": "string",
+      "pattern": "^B-[0-9a-f]{32}$"
+    },
+    "repairReservedBackup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "reservationId",
+        "draftBindingSha256",
+        "locator",
+        "vaultId",
+        "vaultIdentityFingerprint",
+        "physicalParentFingerprint",
+        "reservedBytes",
+        "backupSize",
+        "expectedBackupSha256",
+        "metadataSha256"
+      ],
+      "properties": {
+        "state": { "const": "reserved" },
+        "reservationId": { "$ref": "#/$defs/reservationId" },
+        "draftBindingSha256": { "$ref": "#/$defs/sha256" },
+        "locator": {
+          "type": "string",
+          "pattern": "^vault://repair/B-[0-9a-f]{32}$"
+        },
+        "vaultId": {
+          "type": "string",
+          "pattern": "^V-[0-9a-f]{32}$"
+        },
+        "vaultIdentityFingerprint": { "$ref": "#/$defs/sha256" },
+        "physicalParentFingerprint": { "$ref": "#/$defs/sha256" },
+        "reservedBytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16777216
+        },
+        "backupSize": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16777216
+        },
+        "expectedBackupSha256": { "$ref": "#/$defs/sha256" },
+        "metadataSha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "repairDurableBackup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "reservationId",
+        "draftBindingSha256",
+        "locator",
+        "vaultId",
+        "vaultIdentityFingerprint",
+        "physicalParentFingerprint",
+        "reservedBytes",
+        "backupSize",
+        "expectedBackupSha256",
+        "metadataSha256",
+        "planId",
+        "planSha256",
+        "approvalId",
+        "approvalSha256",
+        "resourceId",
+        "resourceSha256"
+      ],
+      "properties": {
+        "state": { "const": "durable" },
+        "reservationId": { "$ref": "#/$defs/reservationId" },
+        "draftBindingSha256": { "$ref": "#/$defs/sha256" },
+        "locator": {
+          "type": "string",
+          "pattern": "^vault://repair/B-[0-9a-f]{32}$"
+        },
+        "vaultId": {
+          "type": "string",
+          "pattern": "^V-[0-9a-f]{32}$"
+        },
+        "vaultIdentityFingerprint": { "$ref": "#/$defs/sha256" },
+        "physicalParentFingerprint": { "$ref": "#/$defs/sha256" },
+        "reservedBytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16777216
+        },
+        "backupSize": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16777216
+        },
+        "expectedBackupSha256": { "$ref": "#/$defs/sha256" },
+        "metadataSha256": { "$ref": "#/$defs/sha256" },
+        "planId": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 128,
+          "pattern": "^P-[A-Za-z0-9-]+$"
+        },
+        "planSha256": { "$ref": "#/$defs/sha256" },
+        "approvalId": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 128,
+          "pattern": "^A-[A-Za-z0-9-]+$"
+        },
+        "approvalSha256": { "$ref": "#/$defs/sha256" },
+        "resourceId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9_.:/-]+$",
+          "not": {
+            "anyOf": [
+              { "pattern": "^/" },
+              { "pattern": "\\.\\." }
+            ]
+          }
+        },
+        "resourceSha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "repairBackupStatus": {
+      "oneOf": [
+        { "$ref": "#/$defs/repairReservedBackup" },
+        { "$ref": "#/$defs/repairDurableBackup" }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "outcome": { "const": "ok" } },
+        "required": ["outcome"]
+      },
+      "then": {
+        "properties": { "payload": {} },
+        "required": ["payload"],
+        "not": {
+          "properties": { "error": {} },
+          "required": ["error"]
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "outcome": { "const": "error" } },
+        "required": ["outcome"]
+      },
+      "then": {
+        "properties": { "error": { "$ref": "#/$defs/errorToken" } },
+        "required": ["error"],
+        "not": {
+          "properties": { "payload": {} },
+          "required": ["payload"]
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": { "const": "ok" },
+          "operation": { "const": "vault.status" }
+        },
+        "required": ["outcome", "operation"]
+      },
+      "then": { "properties": { "payload": { "$ref": "#/$defs/vaultStatus" } } }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": { "const": "ok" },
+          "operation": { "const": "vault.unlock" }
+        },
+        "required": ["outcome", "operation"]
+      },
+      "then": {
+        "properties": {
+          "payload": { "$ref": "#/$defs/unlockedVaultStatus" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": { "const": "ok" },
+          "operation": { "const": "vault.lock" }
+        },
+        "required": ["outcome", "operation"]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["vaultState"],
+            "properties": { "vaultState": { "const": "locked" } }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": { "const": "ok" },
+          "operation": { "const": "provider.openai.configure" }
+        },
+        "required": ["outcome", "operation"]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["openai", "codex"],
+            "properties": {
+              "openai": { "const": "configured" },
+              "codex": { "enum": ["unconfigured", "configured"] }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": { "const": "ok" },
+          "operation": { "enum": ["provider.status", "provider.logout"] }
+        },
+        "required": ["outcome", "operation"]
+      },
+      "then": {
+        "properties": { "payload": { "$ref": "#/$defs/providerStatus" } }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": { "const": "ok" },
+          "operation": { "const": "provider.openai.borrow" }
+        },
+        "required": ["outcome", "operation"]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["output"],
+            "properties": {
+              "output": { "$ref": "#/$defs/openaiOutput" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": { "const": "ok" },
+          "operation": { "const": "provider.codex.home_lease" }
+        },
+        "required": ["outcome", "operation"]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["output"],
+            "properties": {
+              "output": { "$ref": "#/$defs/codexOutput" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": { "const": "ok" },
+          "operation": { "const": "audit.append" }
+        },
+        "required": ["outcome", "operation"]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["sequence"],
+            "properties": {
+              "sequence": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 1000000
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": { "const": "ok" },
+          "operation": { "const": "report.persist" }
+        },
+        "required": ["outcome", "operation"]
+      },
+      "then": {
+        "properties": { "payload": { "$ref": "#/$defs/reportSummary" } }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": { "const": "ok" },
+          "operation": { "const": "report.list" }
+        },
+        "required": ["outcome", "operation"]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["reports"],
+            "properties": {
+              "reports": {
+                "type": "array",
+                "maxItems": 256,
+                "items": { "$ref": "#/$defs/reportSummary" }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": { "const": "ok" },
+          "operation": { "const": "report.get" }
+        },
+        "required": ["outcome", "operation"]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["report", "output"],
+            "properties": {
+              "report": { "$ref": "#/$defs/reportSummary" },
+              "output": { "$ref": "#/$defs/signedReportEnvelopeOutput" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": { "const": "ok" },
+          "operation": { "const": "repair.backup.reserve" }
+        },
+        "required": ["outcome", "operation"]
+      },
+      "then": {
+        "properties": {
+          "payload": { "$ref": "#/$defs/repairReservedBackup" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": { "const": "ok" },
+          "operation": { "const": "repair.backup.persist" }
+        },
+        "required": ["outcome", "operation"]
+      },
+      "then": {
+        "properties": {
+          "payload": { "$ref": "#/$defs/repairDurableBackup" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": { "const": "ok" },
+          "operation": { "const": "repair.backup.status" }
+        },
+        "required": ["outcome", "operation"]
+      },
+      "then": {
+        "properties": {
+          "payload": { "$ref": "#/$defs/repairBackupStatus" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": { "const": "ok" },
+          "operation": { "const": "repair.backup.get" }
+        },
+        "required": ["outcome", "operation"]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["backup", "output"],
+            "properties": {
+              "backup": { "$ref": "#/$defs/repairDurableBackup" },
+              "output": { "$ref": "#/$defs/repairBackupOutput" }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

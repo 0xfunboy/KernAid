@@ -5,6 +5,11 @@
 //! is always taken from `SO_PEERCRED`; a PID or UID in JSON would be attacker
 //! input and is therefore not part of the wire format.
 
+#[cfg(feature = "experimental-repair-store")]
+use crate::rescue_repair_vault::{
+    MAX_REPAIR_BACKUP_BYTES, RepairBackupBinding, RepairBackupDraft, RepairBackupState,
+    RepairBackupStatusPayload, RepairReservationId,
+};
 use crate::rescue_vault_transport::{
     SeqpacketSocketIdentity, SeqpacketTransportError, ensure_deadline, recv_seqpacket,
     send_seqpacket, validate_bound_seqpacket_socket, validate_seqpacket_socket,
@@ -60,17 +65,24 @@ pub struct PeerAllowlist {
     application_uid: Option<u32>,
     openai_uid: Option<u32>,
     codex_uid: Option<u32>,
+    #[cfg(feature = "experimental-repair-store")]
+    repair_broker_uid: Option<u32>,
 }
 
 impl fmt::Debug for PeerAllowlist {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("PeerAllowlist")
+        let mut debug = formatter.debug_struct("PeerAllowlist");
+        debug
             .field("companion_configured", &(self.companion_uid != 0))
             .field("application_configured", &self.application_uid.is_some())
             .field("openai_configured", &self.openai_uid.is_some())
-            .field("codex_configured", &self.codex_uid.is_some())
-            .finish()
+            .field("codex_configured", &self.codex_uid.is_some());
+        #[cfg(feature = "experimental-repair-store")]
+        debug.field(
+            "repair_broker_configured",
+            &self.repair_broker_uid.is_some(),
+        );
+        debug.finish()
     }
 }
 
@@ -84,6 +96,8 @@ impl PeerAllowlist {
             application_uid: None,
             openai_uid: None,
             codex_uid: None,
+            #[cfg(feature = "experimental-repair-store")]
+            repair_broker_uid: None,
         }
     }
 
@@ -102,6 +116,15 @@ impl PeerAllowlist {
             Ok(PeerRole::Agent(AgentRole::OpenAi))
         } else if self.codex_uid == Some(peer_uid) {
             Ok(PeerRole::Agent(AgentRole::Codex))
+        } else if cfg!(feature = "experimental-repair-store")
+            && self.repair_broker_uid() == Some(peer_uid)
+        {
+            #[cfg(feature = "experimental-repair-store")]
+            {
+                Ok(PeerRole::RepairBroker)
+            }
+            #[cfg(not(feature = "experimental-repair-store"))]
+            unreachable!()
         } else {
             Err(ProtocolViolation::NotAuthorized)
         }
@@ -118,17 +141,24 @@ pub struct PeerAllowlistBuilder {
     application_uid: Option<u32>,
     openai_uid: Option<u32>,
     codex_uid: Option<u32>,
+    #[cfg(feature = "experimental-repair-store")]
+    repair_broker_uid: Option<u32>,
 }
 
 impl fmt::Debug for PeerAllowlistBuilder {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("PeerAllowlistBuilder")
+        let mut debug = formatter.debug_struct("PeerAllowlistBuilder");
+        debug
             .field("companion_configured", &(self.companion_uid != 0))
             .field("application_configured", &self.application_uid.is_some())
             .field("openai_configured", &self.openai_uid.is_some())
-            .field("codex_configured", &self.codex_uid.is_some())
-            .finish()
+            .field("codex_configured", &self.codex_uid.is_some());
+        #[cfg(feature = "experimental-repair-store")]
+        debug.field(
+            "repair_broker_configured",
+            &self.repair_broker_uid.is_some(),
+        );
+        debug.finish()
     }
 }
 
@@ -140,6 +170,7 @@ impl PeerAllowlistBuilder {
             || self.application_uid == Some(uid)
             || self.openai_uid == Some(uid)
             || self.codex_uid == Some(uid)
+            || self.repair_broker_uid() == Some(uid)
             || self.uid_for(role).is_some()
         {
             return Err(ProtocolViolation::InvalidAllowlist);
@@ -148,9 +179,32 @@ impl PeerAllowlistBuilder {
         Ok(self)
     }
 
+    /// Adds the sole UID permitted to call the experimental repair store.
+    /// Root is rejected: a privileged process must cross into the dedicated
+    /// `kernaid-repair` identity before using this shared Vault socket.
+    #[cfg(feature = "experimental-repair-store")]
+    pub fn repair_broker(mut self, uid: u32) -> Result<Self, ProtocolViolation> {
+        if uid == 0
+            || uid == self.companion_uid
+            || self.application_uid == Some(uid)
+            || self.openai_uid == Some(uid)
+            || self.codex_uid == Some(uid)
+            || self.repair_broker_uid.is_some()
+        {
+            return Err(ProtocolViolation::InvalidAllowlist);
+        }
+        self.repair_broker_uid = Some(uid);
+        Ok(self)
+    }
+
     /// Validates and seals the complete mapping.
     pub fn build(self) -> Result<PeerAllowlist, ProtocolViolation> {
-        let configured = [self.application_uid, self.openai_uid, self.codex_uid];
+        let configured = [
+            self.application_uid,
+            self.openai_uid,
+            self.codex_uid,
+            self.repair_broker_uid(),
+        ];
         if self.companion_uid == 0
             || configured
                 .iter()
@@ -171,6 +225,8 @@ impl PeerAllowlistBuilder {
             application_uid: self.application_uid,
             openai_uid: self.openai_uid,
             codex_uid: self.codex_uid,
+            #[cfg(feature = "experimental-repair-store")]
+            repair_broker_uid: self.repair_broker_uid,
         })
     }
 
@@ -187,6 +243,30 @@ impl PeerAllowlistBuilder {
             AgentRole::Application => &mut self.application_uid,
             AgentRole::OpenAi => &mut self.openai_uid,
             AgentRole::Codex => &mut self.codex_uid,
+        }
+    }
+
+    fn repair_broker_uid(&self) -> Option<u32> {
+        #[cfg(feature = "experimental-repair-store")]
+        {
+            self.repair_broker_uid
+        }
+        #[cfg(not(feature = "experimental-repair-store"))]
+        {
+            None
+        }
+    }
+}
+
+impl PeerAllowlist {
+    fn repair_broker_uid(&self) -> Option<u32> {
+        #[cfg(feature = "experimental-repair-store")]
+        {
+            self.repair_broker_uid
+        }
+        #[cfg(not(feature = "experimental-repair-store"))]
+        {
+            None
         }
     }
 }
@@ -210,6 +290,8 @@ pub enum AgentRole {
 pub enum PeerRole {
     Companion,
     Agent(AgentRole),
+    #[cfg(feature = "experimental-repair-store")]
+    RepairBroker,
 }
 
 /// An authenticated server-side connection to one allowlisted peer.
@@ -405,6 +487,18 @@ pub enum Operation {
     ReportList,
     #[serde(rename = "report.get")]
     ReportGet,
+    #[cfg(feature = "experimental-repair-store")]
+    #[serde(rename = "repair.backup.reserve")]
+    RepairBackupReserve,
+    #[cfg(feature = "experimental-repair-store")]
+    #[serde(rename = "repair.backup.persist")]
+    RepairBackupPersist,
+    #[cfg(feature = "experimental-repair-store")]
+    #[serde(rename = "repair.backup.status")]
+    RepairBackupStatus,
+    #[cfg(feature = "experimental-repair-store")]
+    #[serde(rename = "repair.backup.get")]
+    RepairBackupGet,
 }
 
 impl Operation {
@@ -437,6 +531,14 @@ impl Operation {
             PeerRole::Agent(AgentRole::Codex) => {
                 matches!(self, Self::VaultStatus | Self::ProviderCodexHomeLease)
             }
+            #[cfg(feature = "experimental-repair-store")]
+            PeerRole::RepairBroker => matches!(
+                self,
+                Self::RepairBackupReserve
+                    | Self::RepairBackupPersist
+                    | Self::RepairBackupStatus
+                    | Self::RepairBackupGet
+            ),
         }
     }
 }
@@ -481,6 +583,16 @@ impl ReportId {
 #[serde(transparent)]
 pub struct Sha256(String);
 
+impl<'de> Deserialize<'de> for Sha256 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).map_err(serde::de::Error::custom)
+    }
+}
+
 impl Sha256 {
     /// Reconstruct a persisted lowercase SHA-256 value with the exact wire
     /// grammar.
@@ -498,6 +610,23 @@ impl Sha256 {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Returns the canonical 32 digest bytes represented by this value.
+    pub fn bytes(&self) -> [u8; 32] {
+        let mut bytes = [0_u8; 32];
+        for (index, pair) in self.0.as_bytes().chunks_exact(2).enumerate() {
+            bytes[index] = (hex_nibble(pair[0]) << 4) | hex_nibble(pair[1]);
+        }
+        bytes
+    }
+}
+
+fn hex_nibble(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        _ => unreachable!("Sha256 validates lowercase hexadecimal input"),
     }
 }
 
@@ -518,6 +647,12 @@ pub enum DescriptorType {
     SessionReportJsonPipe,
     #[serde(rename = "signed-report-envelope-pipe")]
     SignedReportEnvelopePipe,
+    #[cfg(feature = "experimental-repair-store")]
+    #[serde(rename = "repair-backup-input-pipe")]
+    RepairBackupInputPipe,
+    #[cfg(feature = "experimental-repair-store")]
+    #[serde(rename = "repair-backup-output-pipe")]
+    RepairBackupOutputPipe,
 }
 
 /// Declared one-shot descriptor body. `size` is the exact number of bytes the
@@ -610,6 +745,27 @@ pub enum RequestPayload {
     },
     ReportGet {
         report_id: ReportId,
+    },
+    #[cfg(feature = "experimental-repair-store")]
+    RepairBackupReserve {
+        draft: RepairBackupDraft,
+    },
+    #[cfg(feature = "experimental-repair-store")]
+    RepairBackupPersist {
+        reservation_id: RepairReservationId,
+        draft_binding_sha256: Sha256,
+        binding: RepairBackupBinding,
+        input: DescriptorDeclaration,
+    },
+    #[cfg(feature = "experimental-repair-store")]
+    RepairBackupStatus {
+        reservation_id: RepairReservationId,
+        draft_binding_sha256: Sha256,
+    },
+    #[cfg(feature = "experimental-repair-store")]
+    RepairBackupGet {
+        reservation_id: RepairReservationId,
+        draft_binding_sha256: Sha256,
     },
 }
 
@@ -908,6 +1064,42 @@ struct GetPayload {
     report_id: String,
 }
 
+#[cfg(feature = "experimental-repair-store")]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RepairBackupReservePayload {
+    session_id: String,
+    target_id: String,
+    target_fingerprint: String,
+    expected_backup_sha256: String,
+    metadata_sha256: String,
+    backup_size: u64,
+    required_capacity_bytes: u64,
+}
+
+#[cfg(feature = "experimental-repair-store")]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RepairBackupPersistPayload {
+    reservation_id: String,
+    draft_binding_sha256: String,
+    plan_id: String,
+    plan_sha256: String,
+    approval_id: String,
+    approval_sha256: String,
+    resource_id: String,
+    resource_sha256: String,
+    input: DescriptorDeclaration,
+}
+
+#[cfg(feature = "experimental-repair-store")]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RepairBackupReferencePayload {
+    reservation_id: String,
+    draft_binding_sha256: String,
+}
+
 /// Decodes and authorizes one complete request packet for an already-bound
 /// peer identity. The public entry point is [`AuthenticatedPeer::receive_request`].
 ///
@@ -1115,7 +1307,70 @@ fn parse_payload(
                 report_id: ReportId::parse(&payload.report_id)?,
             })
         }
+        #[cfg(feature = "experimental-repair-store")]
+        Operation::RepairBackupReserve => {
+            let payload = serde_json::from_str::<RepairBackupReservePayload>(raw.get())
+                .map_err(|_| ProtocolViolation::InvalidPayload)?;
+            Ok(RequestPayload::RepairBackupReserve {
+                draft: RepairBackupDraft::new(
+                    payload.session_id,
+                    payload.target_id,
+                    Sha256::parse(&payload.target_fingerprint)?,
+                    Sha256::parse(&payload.expected_backup_sha256)?,
+                    Sha256::parse(&payload.metadata_sha256)?,
+                    payload.backup_size,
+                    payload.required_capacity_bytes,
+                )?,
+            })
+        }
+        #[cfg(feature = "experimental-repair-store")]
+        Operation::RepairBackupPersist => {
+            let payload = serde_json::from_str::<RepairBackupPersistPayload>(raw.get())
+                .map_err(|_| ProtocolViolation::InvalidPayload)?;
+            validate_declaration(
+                &payload.input,
+                DescriptorType::RepairBackupInputPipe,
+                1,
+                MAX_REPAIR_BACKUP_BYTES,
+            )?;
+            Ok(RequestPayload::RepairBackupPersist {
+                reservation_id: RepairReservationId::parse(&payload.reservation_id)?,
+                draft_binding_sha256: Sha256::parse(&payload.draft_binding_sha256)?,
+                binding: RepairBackupBinding::new(
+                    payload.plan_id,
+                    Sha256::parse(&payload.plan_sha256)?,
+                    payload.approval_id,
+                    Sha256::parse(&payload.approval_sha256)?,
+                    payload.resource_id,
+                    Sha256::parse(&payload.resource_sha256)?,
+                )?,
+                input: payload.input,
+            })
+        }
+        #[cfg(feature = "experimental-repair-store")]
+        Operation::RepairBackupStatus | Operation::RepairBackupGet => {
+            let payload = serde_json::from_str::<RepairBackupReferencePayload>(raw.get())
+                .map_err(|_| ProtocolViolation::InvalidPayload)?;
+            let reservation_id = RepairReservationId::parse(&payload.reservation_id)?;
+            let draft_binding_sha256 = Sha256::parse(&payload.draft_binding_sha256)?;
+            if wire_operation_is_repair_status(operation) {
+                Ok(RequestPayload::RepairBackupStatus {
+                    reservation_id,
+                    draft_binding_sha256,
+                })
+            } else {
+                Ok(RequestPayload::RepairBackupGet {
+                    reservation_id,
+                    draft_binding_sha256,
+                })
+            }
+        }
     }
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn wire_operation_is_repair_status(operation: Operation) -> bool {
+    operation == Operation::RepairBackupStatus
 }
 
 fn validate_declaration(
@@ -1173,11 +1428,17 @@ fn payload_descriptor(payload: &RequestPayload) -> Option<&DescriptorDeclaration
         RequestPayload::VaultUnlock { input }
         | RequestPayload::ProviderOpenAiConfigure { input }
         | RequestPayload::ReportPersist { input, .. } => Some(input),
+        #[cfg(feature = "experimental-repair-store")]
+        RequestPayload::RepairBackupPersist { input, .. } => Some(input),
         RequestPayload::ProviderCodexHomeLease { .. } => None,
         RequestPayload::Empty
         | RequestPayload::ProviderLogout { .. }
         | RequestPayload::AuditAppend { .. }
         | RequestPayload::ReportGet { .. } => None,
+        #[cfg(feature = "experimental-repair-store")]
+        RequestPayload::RepairBackupReserve { .. }
+        | RequestPayload::RepairBackupStatus { .. }
+        | RequestPayload::RepairBackupGet { .. } => None,
     }
 }
 
@@ -1210,9 +1471,15 @@ fn validate_received_descriptors(
             DescriptorType::PassphrasePipe
             | DescriptorType::OpenAiApiKeyPipe
             | DescriptorType::SessionReportJsonPipe => validate_pipe_descriptor(descriptor)?,
+            #[cfg(feature = "experimental-repair-store")]
+            DescriptorType::RepairBackupInputPipe => validate_pipe_descriptor(descriptor)?,
             DescriptorType::CodexHomeOPath
             | DescriptorType::CodexMountRoot
             | DescriptorType::SignedReportEnvelopePipe => {
+                return Err(ProtocolViolation::InvalidPayload);
+            }
+            #[cfg(feature = "experimental-repair-store")]
+            DescriptorType::RepairBackupOutputPipe => {
                 return Err(ProtocolViolation::InvalidPayload);
             }
         },
@@ -1470,10 +1737,18 @@ pub enum SuccessPayload {
     VaultStatus(VaultStatusPayload),
     ProviderStatus(ProviderStatusPayload),
     Descriptor(DescriptorDeclaration),
-    AuditAppended { sequence: u64 },
+    AuditAppended {
+        sequence: u64,
+    },
     ReportStored(ReportSummary),
-    ReportList { reports: Vec<ReportSummary> },
+    ReportList {
+        reports: Vec<ReportSummary>,
+    },
     Report(ReportSummary, DescriptorDeclaration),
+    #[cfg(feature = "experimental-repair-store")]
+    RepairBackupStatus(Box<RepairBackupStatusPayload>),
+    #[cfg(feature = "experimental-repair-store")]
+    RepairBackup(Box<RepairBackupStatusPayload>, DescriptorDeclaration),
 }
 
 #[derive(Serialize)]
@@ -1520,6 +1795,14 @@ struct ReportListResponse<'a> {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ReportResponse<'a> {
     report: &'a ReportSummary,
+    output: &'a DescriptorDeclaration,
+}
+
+#[cfg(feature = "experimental-repair-store")]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RepairBackupResponse<'a> {
+    backup: &'a RepairBackupStatusPayload,
     output: &'a DescriptorDeclaration,
 }
 
@@ -1595,6 +1878,27 @@ fn encode_success(
             operation,
             outcome: "ok",
             payload: ReportResponse { report, output },
+        }),
+        #[cfg(feature = "experimental-repair-store")]
+        SuccessPayload::RepairBackupStatus(status) => serde_json::to_vec(&SuccessWire {
+            api_version: API_VERSION,
+            request_id,
+            state_version,
+            operation,
+            outcome: "ok",
+            payload: status,
+        }),
+        #[cfg(feature = "experimental-repair-store")]
+        SuccessPayload::RepairBackup(status, output) => serde_json::to_vec(&SuccessWire {
+            api_version: API_VERSION,
+            request_id,
+            state_version,
+            operation,
+            outcome: "ok",
+            payload: RepairBackupResponse {
+                backup: status,
+                output,
+            },
         }),
     }
     .map_err(|_| ProtocolViolation::InvalidPayload)?;
@@ -1758,6 +2062,76 @@ fn validate_success(
         {
             Some(declaration)
         }
+        #[cfg(feature = "experimental-repair-store")]
+        (
+            Operation::RepairBackupReserve,
+            RequestPayload::RepairBackupReserve { draft },
+            SuccessPayload::RepairBackupStatus(status),
+        ) if status.validate().is_ok()
+            && status.state() == RepairBackupState::Reserved
+            && status.draft_binding_sha256() == &draft.draft_binding_sha256()
+            && status.backup_size() == draft.backup_size()
+            && status.expected_backup_sha256() == draft.expected_backup_sha256()
+            && status.metadata_sha256() == draft.metadata_sha256()
+            && status.reserved_bytes() >= draft.required_capacity_bytes() =>
+        {
+            None
+        }
+        #[cfg(feature = "experimental-repair-store")]
+        (
+            Operation::RepairBackupPersist,
+            RequestPayload::RepairBackupPersist {
+                reservation_id,
+                draft_binding_sha256,
+                binding,
+                input,
+            },
+            SuccessPayload::RepairBackupStatus(status),
+        ) if status.validate().is_ok()
+            && status.state() == RepairBackupState::Durable
+            && status.reservation_id() == reservation_id
+            && status.draft_binding_sha256() == draft_binding_sha256
+            && status.backup_size() == input.size
+            && status.plan_id() == Some(binding.plan_id())
+            && status.plan_sha256() == Some(binding.plan_sha256())
+            && status.approval_id() == Some(binding.approval_id())
+            && status.approval_sha256() == Some(binding.approval_sha256())
+            && status.resource_id() == Some(binding.resource_id())
+            && status.resource_sha256() == Some(binding.resource_sha256()) =>
+        {
+            None
+        }
+        #[cfg(feature = "experimental-repair-store")]
+        (
+            Operation::RepairBackupStatus,
+            RequestPayload::RepairBackupStatus {
+                reservation_id,
+                draft_binding_sha256,
+            },
+            SuccessPayload::RepairBackupStatus(status),
+        ) if status.validate().is_ok()
+            && status.reservation_id() == reservation_id
+            && status.draft_binding_sha256() == draft_binding_sha256 =>
+        {
+            None
+        }
+        #[cfg(feature = "experimental-repair-store")]
+        (
+            Operation::RepairBackupGet,
+            RequestPayload::RepairBackupGet {
+                reservation_id,
+                draft_binding_sha256,
+            },
+            SuccessPayload::RepairBackup(status, declaration),
+        ) if status.validate().is_ok()
+            && status.state() == RepairBackupState::Durable
+            && status.reservation_id() == reservation_id
+            && status.draft_binding_sha256() == draft_binding_sha256
+            && declaration.kind == DescriptorType::RepairBackupOutputPipe
+            && declaration.size == status.backup_size() =>
+        {
+            Some(declaration)
+        }
         _ => return Err(ProtocolViolation::InvalidPayload),
     };
 
@@ -1769,11 +2143,15 @@ fn validate_success(
             DescriptorType::OpenAiApiKeyPipe | DescriptorType::SignedReportEnvelopePipe => {
                 validate_borrowed_pipe(*descriptor)
             }
+            #[cfg(feature = "experimental-repair-store")]
+            DescriptorType::RepairBackupOutputPipe => validate_borrowed_pipe(*descriptor),
             DescriptorType::CodexHomeOPath => validate_o_path_directory(*descriptor),
             DescriptorType::PassphrasePipe
             | DescriptorType::CodexMountNamespace
             | DescriptorType::CodexMountRoot
             | DescriptorType::SessionReportJsonPipe => Err(ProtocolViolation::InvalidPayload),
+            #[cfg(feature = "experimental-repair-store")]
+            DescriptorType::RepairBackupInputPipe => Err(ProtocolViolation::InvalidPayload),
         },
     }
 }
@@ -1847,6 +2225,8 @@ mod tests {
     const APPLICATION_UID: u32 = 1001;
     const OPENAI_UID: u32 = 1002;
     const CODEX_UID: u32 = 1003;
+    #[cfg(feature = "experimental-repair-store")]
+    const REPAIR_UID: u32 = 1004;
 
     fn allowlist() -> PeerAllowlist {
         PeerAllowlist::builder(COMPANION_UID)
@@ -1875,6 +2255,27 @@ mod tests {
             connection_identity: SeqpacketSocketIdentity {
                 device: 7,
                 inode: 11,
+            },
+            connection_token: Arc::new(()),
+        }
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    fn repair_peer() -> PeerIdentity {
+        let allowlist = PeerAllowlist::builder(COMPANION_UID)
+            .agent(AgentRole::Application, APPLICATION_UID)
+            .and_then(|builder| builder.agent(AgentRole::OpenAi, OPENAI_UID))
+            .and_then(|builder| builder.agent(AgentRole::Codex, CODEX_UID))
+            .and_then(|builder| builder.repair_broker(REPAIR_UID))
+            .and_then(PeerAllowlistBuilder::build)
+            .expect("repair test allowlist");
+        PeerIdentity {
+            pid: 4243,
+            uid: REPAIR_UID,
+            role: allowlist.role_for(REPAIR_UID).expect("repair broker UID"),
+            connection_identity: SeqpacketSocketIdentity {
+                device: 7,
+                inode: 12,
             },
             connection_token: Arc::new(()),
         }
@@ -2242,6 +2643,196 @@ mod tests {
         let debug = format!("{allowlist:?}");
         for uid in [COMPANION_UID, APPLICATION_UID, OPENAI_UID, CODEX_UID] {
             assert!(!debug.contains(&uid.to_string()));
+        }
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    #[test]
+    fn repair_broker_role_and_four_operations_are_closed_and_path_free() {
+        use crate::rescue_repair_vault::{
+            RepairBackupBinding, RepairBackupStatusPayload, RepairReservationId,
+            repair_backup_output,
+        };
+
+        let repair_allowlist = PeerAllowlist::builder(COMPANION_UID)
+            .repair_broker(REPAIR_UID)
+            .and_then(PeerAllowlistBuilder::build)
+            .expect("repair allowlist");
+        assert_eq!(
+            repair_allowlist.role_for(REPAIR_UID),
+            Ok(PeerRole::RepairBroker)
+        );
+        assert!(
+            PeerAllowlist::builder(COMPANION_UID)
+                .repair_broker(0)
+                .is_err()
+        );
+        assert!(
+            PeerAllowlist::builder(COMPANION_UID)
+                .agent(AgentRole::Application, REPAIR_UID)
+                .and_then(|builder| builder.repair_broker(REPAIR_UID))
+                .is_err()
+        );
+
+        let hash = |byte: char| byte.to_string().repeat(64);
+        let reserve = request(
+            "repair.backup.reserve",
+            &format!(
+                "{{\"sessionId\":\"S-session-1\",\"targetId\":\"target-1\",\"targetFingerprint\":\"{}\",\"expectedBackupSha256\":\"{}\",\"metadataSha256\":\"{}\",\"backupSize\":4096,\"requiredCapacityBytes\":8192}}",
+                hash('1'),
+                hash('2'),
+                hash('3')
+            ),
+        );
+        let reserve_request =
+            decode_request(&reserve, repair_peer(), Vec::new()).expect("repair broker reserve");
+        assert_eq!(reserve_request.role(), PeerRole::RepairBroker);
+        assert!(matches!(
+            reserve_request.payload(),
+            RequestPayload::RepairBackupReserve { .. }
+        ));
+        assert_eq!(
+            decode_request(&reserve, peer(COMPANION_UID), Vec::new()).err(),
+            Some(ProtocolViolation::NotAuthorized)
+        );
+
+        let reservation =
+            RepairReservationId::parse("B-0123456789abcdef0123456789abcdef").expect("reservation");
+        let draft = match reserve_request.payload() {
+            RequestPayload::RepairBackupReserve { draft } => draft,
+            _ => unreachable!("decoded reserve payload"),
+        };
+        let reserved = RepairBackupStatusPayload::reserved(
+            reservation.clone(),
+            draft.draft_binding_sha256(),
+            reservation.locator(),
+            "V-0123456789abcdef0123456789abcdef",
+            Sha256::parse(&hash('8')).expect("hash"),
+            Sha256::parse(&hash('9')).expect("hash"),
+            8192,
+            4096,
+            Sha256::parse(&hash('2')).expect("hash"),
+            Sha256::parse(&hash('3')).expect("hash"),
+        )
+        .expect("reserved backup");
+        assert!(
+            encode_success(
+                &reserve_request,
+                9,
+                &SuccessPayload::RepairBackupStatus(Box::new(reserved)),
+                &[],
+            )
+            .is_ok()
+        );
+        let wrong_binding = RepairBackupStatusPayload::reserved(
+            reservation.clone(),
+            Sha256::parse(&hash('0')).expect("hash"),
+            reservation.locator(),
+            "V-0123456789abcdef0123456789abcdef",
+            Sha256::parse(&hash('8')).expect("hash"),
+            Sha256::parse(&hash('9')).expect("hash"),
+            8192,
+            4096,
+            Sha256::parse(&hash('2')).expect("hash"),
+            Sha256::parse(&hash('3')).expect("hash"),
+        )
+        .expect("shape-valid wrong binding");
+        assert_eq!(
+            encode_success(
+                &reserve_request,
+                9,
+                &SuccessPayload::RepairBackupStatus(Box::new(wrong_binding)),
+                &[],
+            ),
+            Err(ProtocolViolation::InvalidPayload)
+        );
+        let binding = RepairBackupBinding::new(
+            "P-plan-1",
+            Sha256::parse(&hash('4')).expect("hash"),
+            "A-approval-1",
+            Sha256::parse(&hash('5')).expect("hash"),
+            "rescue:selected-linux-root:etc/fstab",
+            Sha256::parse(&hash('6')).expect("hash"),
+        )
+        .expect("binding");
+        let durable = RepairBackupStatusPayload::durable(
+            reservation.clone(),
+            Sha256::parse(&hash('7')).expect("hash"),
+            reservation.locator(),
+            "V-0123456789abcdef0123456789abcdef",
+            Sha256::parse(&hash('8')).expect("hash"),
+            Sha256::parse(&hash('9')).expect("hash"),
+            8192,
+            4096,
+            Sha256::parse(&hash('2')).expect("hash"),
+            Sha256::parse(&hash('3')).expect("hash"),
+            binding,
+        )
+        .expect("durable backup");
+
+        let persist = request(
+            "repair.backup.persist",
+            &format!(
+                "{{\"reservationId\":\"{}\",\"draftBindingSha256\":\"{}\",\"planId\":\"P-plan-1\",\"planSha256\":\"{}\",\"approvalId\":\"A-approval-1\",\"approvalSha256\":\"{}\",\"resourceId\":\"rescue:selected-linux-root:etc/fstab\",\"resourceSha256\":\"{}\",\"input\":{{\"type\":\"repair-backup-input-pipe\",\"size\":4096}}}}",
+                reservation.as_str(),
+                hash('7'),
+                hash('4'),
+                hash('5'),
+                hash('6')
+            ),
+        );
+        let input = read_pipe();
+        let mut persist_request =
+            decode_request(&persist, repair_peer(), vec![input]).expect("repair backup persist");
+        assert!(persist_request.take_descriptor().is_some());
+        let encoded = encode_success(
+            &persist_request,
+            9,
+            &SuccessPayload::RepairBackupStatus(Box::new(durable.clone())),
+            &[],
+        )
+        .expect("durable persist response");
+        let encoded = String::from_utf8(encoded).expect("UTF-8 response");
+        assert!(encoded.contains("vault://repair/B-"));
+        assert!(!encoded.contains("/dev/"));
+        assert!(!encoded.contains("/mnt/"));
+
+        for operation in ["repair.backup.status", "repair.backup.get"] {
+            let reference = request(
+                operation,
+                &format!(
+                    "{{\"reservationId\":\"{}\",\"draftBindingSha256\":\"{}\"}}",
+                    reservation.as_str(),
+                    hash('7')
+                ),
+            );
+            let request = decode_request(&reference, repair_peer(), Vec::new())
+                .expect("repair backup reference");
+            if operation.ends_with("status") {
+                assert!(
+                    encode_success(
+                        &request,
+                        9,
+                        &SuccessPayload::RepairBackupStatus(Box::new(durable.clone())),
+                        &[],
+                    )
+                    .is_ok()
+                );
+            } else {
+                let output = read_pipe();
+                assert!(
+                    encode_success(
+                        &request,
+                        9,
+                        &SuccessPayload::RepairBackup(
+                            Box::new(durable.clone()),
+                            repair_backup_output(4096).expect("output declaration"),
+                        ),
+                        &[output.as_fd()],
+                    )
+                    .is_ok()
+                );
+            }
         }
     }
 

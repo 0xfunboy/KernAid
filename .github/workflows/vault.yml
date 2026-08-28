@@ -15,6 +15,8 @@ on:
       - "crates/device-identity/**"
       - "packages/schemas/rescue-openai-request.schema.json"
       - "packages/schemas/rescue-openai-response.schema.json"
+      - "packages/schemas/rescue-vault-repair-request.schema.json"
+      - "packages/schemas/rescue-vault-repair-response.schema.json"
       - "packages/schemas/fixtures/rescue-openai/**"
       - "Cargo.toml"
       - "Cargo.lock"

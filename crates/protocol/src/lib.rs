@@ -2,6 +2,9 @@
 
 pub mod rescue_repair;
 
+#[cfg(all(target_os = "linux", feature = "experimental-repair-store"))]
+pub mod rescue_repair_vault;
+
 #[cfg(target_os = "linux")]
 pub mod rescue_vault;
 

@@ -20,6 +20,8 @@ const schemaFiles = [
   "rescue-fstab-repair-approval.schema.json",
   "rescue-openai-request.schema.json",
   "rescue-openai-response.schema.json",
+  "rescue-vault-repair-request.schema.json",
+  "rescue-vault-repair-response.schema.json",
   "rescue-vault-request.schema.json",
   "rescue-vault-response.schema.json",
   "session-report.schema.json",
@@ -167,12 +169,14 @@ test("all published JSON schemas compile together", () => {
     );
     ajv.addSchema(JSON.parse(contents));
   }
-  for (const file of schemaFiles)
+  for (const file of schemaFiles) {
+    const id = file.startsWith("rescue-vault-repair-")
+      ? `https://schemas.kernaid.dev/experimental/${file.replace(".schema.json", "-v1alpha1.json")}`
+      : `https://schemas.kernaid.dev/v1/${file.replace(".schema", "")}`;
     assert.ok(
-      ajv.getSchema(
-        `https://schemas.kernaid.dev/v1/${file.replace(".schema", "")}`,
-      ),
+      ajv.getSchema(id),
     );
+  }
 });
 
 test("Rescue fstab R2 approval is closed and leaves Approval v1 unchanged", () => {
@@ -545,6 +549,80 @@ test("Rescue vault schemas keep path and secret data out of IPC JSON", () => {
     }),
     false,
   );
+});
+
+test("experimental Repair Vault schemas are isolated and structurally closed", () => {
+  const ajv = new Ajv2020({ allErrors: true, strict: true });
+  const requestSchema = JSON.parse(
+    readFileSync(
+      new URL("../rescue-vault-repair-request.schema.json", import.meta.url),
+      "utf8",
+    ),
+  );
+  const responseSchema = JSON.parse(
+    readFileSync(
+      new URL("../rescue-vault-repair-response.schema.json", import.meta.url),
+      "utf8",
+    ),
+  );
+  assert.match(requestSchema.$id, /experimental\/rescue-vault-repair-request/);
+  assert.match(responseSchema.$id, /experimental\/rescue-vault-repair-response/);
+  const validateRequest = ajv.compile(requestSchema);
+  const validateResponse = ajv.compile(responseSchema);
+  const envelope = {
+    apiVersion: "kernaid.dev/rescue-vault/v1alpha1",
+    requestId: "R-12345678-1234-1234-1234-123456789abc",
+    expectedStateVersion: 7,
+  };
+  const reserve = {
+    ...envelope,
+    operation: "repair.backup.reserve",
+    payload: {
+      sessionId: `S-${"a".repeat(126)}`,
+      targetId: "target-1",
+      targetFingerprint: "1".repeat(64),
+      expectedBackupSha256: "2".repeat(64),
+      metadataSha256: "3".repeat(64),
+      backupSize: 4096,
+      requiredCapacityBytes: 8192,
+    },
+  };
+  assert.equal(validateRequest(reserve), true);
+  assert.equal(
+    validateRequest({
+      ...reserve,
+      payload: { ...reserve.payload, targetId: "/dev/sda2" },
+    }),
+    false,
+  );
+  const reservationId = `B-${"a".repeat(32)}`;
+  const reserved = {
+    apiVersion: envelope.apiVersion,
+    requestId: envelope.requestId,
+    stateVersion: 9,
+    operation: "repair.backup.reserve",
+    outcome: "ok",
+    payload: {
+      state: "reserved",
+      reservationId,
+      draftBindingSha256: "4".repeat(64),
+      locator: `vault://repair/${reservationId}`,
+      vaultId: `V-${"b".repeat(32)}`,
+      vaultIdentityFingerprint: "5".repeat(64),
+      physicalParentFingerprint: "6".repeat(64),
+      reservedBytes: 8192,
+      backupSize: 4096,
+      expectedBackupSha256: "2".repeat(64),
+      metadataSha256: "3".repeat(64),
+    },
+  };
+  assert.equal(validateResponse(reserved), true);
+  const missingVaultId = structuredClone(reserved);
+  delete (missingVaultId.payload as { vaultId?: string }).vaultId;
+  assert.equal(validateResponse(missingVaultId), false);
+  const pathLeak = structuredClone(reserved);
+  (pathLeak.payload as Record<string, unknown>).path = "/mnt/vault/backup";
+  assert.equal(validateResponse(pathLeak), false);
 });
 
 test("runtime validation rejects provider fields outside the contract", () => {

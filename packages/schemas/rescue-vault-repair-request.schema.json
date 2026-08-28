@@ -1,0 +1,426 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.kernaid.dev/experimental/rescue-vault-repair-request-v1alpha1.json",
+  "title": "ExperimentalRescueVaultRepairRequest",
+  "description": "One UTF-8 AF_UNIX SOCK_SEQPACKET request. Peer PID, UID and received descriptors are authenticated out of band. repair.backup.* operations are available only in the off-by-default experimental repair-store build.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "apiVersion",
+    "requestId",
+    "expectedStateVersion",
+    "operation",
+    "payload"
+  ],
+  "properties": {
+    "apiVersion": { "const": "kernaid.dev/rescue-vault/v1alpha1" },
+    "requestId": {
+      "type": "string",
+      "pattern": "^R-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "expectedStateVersion": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "operation": {
+      "enum": [
+        "vault.status",
+        "vault.unlock",
+        "vault.lock",
+        "provider.openai.configure",
+        "provider.status",
+        "provider.logout",
+        "provider.openai.borrow",
+        "provider.codex.home_lease",
+        "audit.append",
+        "report.persist",
+        "report.list",
+        "report.get",
+        "repair.backup.reserve",
+        "repair.backup.persist",
+        "repair.backup.status",
+        "repair.backup.get"
+      ]
+    },
+    "payload": { "type": "object" }
+  },
+  "$defs": {
+    "emptyPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "maxProperties": 0
+    },
+    "passphraseDescriptor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "size"],
+      "properties": {
+        "type": { "const": "passphrase-pipe" },
+        "size": { "type": "integer", "minimum": 12, "maximum": 1024 }
+      }
+    },
+    "openaiKeyDescriptor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "size"],
+      "properties": {
+        "type": { "const": "openai-api-key-pipe" },
+        "size": { "type": "integer", "minimum": 1, "maximum": 512 }
+      }
+    },
+    "sessionReportDescriptor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "size"],
+      "properties": {
+        "type": { "const": "session-report-json-pipe" },
+        "size": {
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 1048576
+        }
+      }
+    },
+    "repairBackupInputDescriptor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "size"],
+      "properties": {
+        "type": { "const": "repair-backup-input-pipe" },
+        "size": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16777216
+        }
+      }
+    },
+    "errorToken": {
+      "enum": [
+        "ABSENT",
+        "UNPROVISIONED",
+        "LOCKED",
+        "BAD_PASSPHRASE",
+        "MEDIA_CHANGED",
+        "PROFILE_MISMATCH",
+        "STALE_STATE",
+        "FD_REQUIRED",
+        "FD_FORBIDDEN",
+        "NOT_AUTHORIZED",
+        "RATE_LIMITED",
+        "BUSY",
+        "PROVIDER_UNCONFIGURED",
+        "REPORT_TOO_LARGE",
+        "IO_FAILED",
+        "REBOOT_REQUIRED"
+      ]
+    },
+    "reportId": {
+      "type": "string",
+      "pattern": "^RP-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "reservationId": {
+      "type": "string",
+      "pattern": "^B-[0-9a-f]{32}$"
+    },
+    "prefixedSessionId": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 128,
+      "pattern": "^S-[A-Za-z0-9-]+$"
+    },
+    "prefixedPlanId": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 128,
+      "pattern": "^P-[A-Za-z0-9-]+$"
+    },
+    "prefixedApprovalId": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 128,
+      "pattern": "^A-[A-Za-z0-9-]+$"
+    },
+    "opaqueTargetId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9_.:-]+$",
+      "not": { "pattern": "\\.\\." }
+    },
+    "resourceId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9_.:/-]+$",
+      "not": {
+        "anyOf": [
+          { "pattern": "^/" },
+          { "pattern": "\\.\\." }
+        ]
+      }
+    },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "operation": {
+            "enum": [
+              "vault.status",
+              "vault.lock",
+              "provider.status",
+              "provider.openai.borrow",
+              "provider.codex.home_lease",
+              "report.list"
+            ]
+          }
+        },
+        "required": ["operation"]
+      },
+      "then": {
+        "properties": { "payload": { "$ref": "#/$defs/emptyPayload" } }
+      }
+    },
+    {
+      "if": {
+        "properties": { "operation": { "const": "vault.unlock" } },
+        "required": ["operation"]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["input"],
+            "properties": {
+              "input": { "$ref": "#/$defs/passphraseDescriptor" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "operation": { "const": "provider.openai.configure" }
+        },
+        "required": ["operation"]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["input"],
+            "properties": {
+              "input": { "$ref": "#/$defs/openaiKeyDescriptor" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "operation": { "const": "provider.logout" } },
+        "required": ["operation"]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["provider"],
+            "properties": {
+              "provider": { "enum": ["openai", "codex"] }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "operation": { "const": "audit.append" } },
+        "required": ["operation"]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["sequence", "event", "outcome"],
+            "properties": {
+              "sequence": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 1000000
+              },
+              "event": {
+                "enum": [
+                  "agent-session-start",
+                  "agent-diagnosis-complete",
+                  "agent-session-end"
+                ]
+              },
+              "outcome": { "enum": ["succeeded", "rejected", "failed"] },
+              "error": { "$ref": "#/$defs/errorToken" }
+            },
+            "oneOf": [
+              {
+                "properties": { "outcome": { "const": "succeeded" } },
+                "not": {
+                  "properties": { "error": {} },
+                  "required": ["error"]
+                }
+              },
+              {
+                "properties": {
+                  "outcome": { "enum": ["rejected", "failed"] }
+                },
+                "required": ["error"]
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "operation": { "const": "report.persist" } },
+        "required": ["operation"]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["reportId", "payloadSha256", "input"],
+            "properties": {
+              "reportId": { "$ref": "#/$defs/reportId" },
+              "payloadSha256": { "$ref": "#/$defs/sha256" },
+              "input": { "$ref": "#/$defs/sessionReportDescriptor" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "operation": { "const": "report.get" } },
+        "required": ["operation"]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["reportId"],
+            "properties": {
+              "reportId": { "$ref": "#/$defs/reportId" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "operation": { "const": "repair.backup.reserve" } },
+        "required": ["operation"]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "sessionId",
+              "targetId",
+              "targetFingerprint",
+              "expectedBackupSha256",
+              "metadataSha256",
+              "backupSize",
+              "requiredCapacityBytes"
+            ],
+            "properties": {
+              "sessionId": { "$ref": "#/$defs/prefixedSessionId" },
+              "targetId": { "$ref": "#/$defs/opaqueTargetId" },
+              "targetFingerprint": { "$ref": "#/$defs/sha256" },
+              "expectedBackupSha256": { "$ref": "#/$defs/sha256" },
+              "metadataSha256": { "$ref": "#/$defs/sha256" },
+              "backupSize": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 16777216
+              },
+              "requiredCapacityBytes": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 16777216
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "operation": { "const": "repair.backup.persist" } },
+        "required": ["operation"]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "reservationId",
+              "draftBindingSha256",
+              "planId",
+              "planSha256",
+              "approvalId",
+              "approvalSha256",
+              "resourceId",
+              "resourceSha256",
+              "input"
+            ],
+            "properties": {
+              "reservationId": { "$ref": "#/$defs/reservationId" },
+              "draftBindingSha256": { "$ref": "#/$defs/sha256" },
+              "planId": { "$ref": "#/$defs/prefixedPlanId" },
+              "planSha256": { "$ref": "#/$defs/sha256" },
+              "approvalId": { "$ref": "#/$defs/prefixedApprovalId" },
+              "approvalSha256": { "$ref": "#/$defs/sha256" },
+              "resourceId": { "$ref": "#/$defs/resourceId" },
+              "resourceSha256": { "$ref": "#/$defs/sha256" },
+              "input": { "$ref": "#/$defs/repairBackupInputDescriptor" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "operation": {
+            "enum": ["repair.backup.status", "repair.backup.get"]
+          }
+        },
+        "required": ["operation"]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["reservationId", "draftBindingSha256"],
+            "properties": {
+              "reservationId": { "$ref": "#/$defs/reservationId" },
+              "draftBindingSha256": { "$ref": "#/$defs/sha256" }
+            }
+          }
+        }
+      }
+    }
+  ]
+}
