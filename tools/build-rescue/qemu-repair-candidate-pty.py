@@ -103,7 +103,7 @@ def status_until(states,deadline):
         time.sleep(.2)
     raise RuntimeError()
 try:
-    deadline=time.monotonic()+240
+    deadline=time.monotonic()+360
     while True:
         try:
             initial=repair({{"apiVersion":API,"requestId":request_id(),"operation":"repair.status"}})
@@ -155,7 +155,9 @@ try:
     checkpoint="prepare-state"
     if prepared.get("state")!="prepared":
         checkpoint={{
-            "target-capability":"prepare-target-capability",
+            "target-capability-timed-out":"prepare-target-capability-timed-out",
+            "target-capability-identity-changed":"prepare-target-capability-identity-changed",
+            "target-capability-unavailable":"prepare-target-capability-unavailable",
             "observation-preview":"prepare-observation-preview",
             "vault-reserve":"prepare-vault-reserve",
             "admission-internal":"prepare-admission-internal",
@@ -263,7 +265,7 @@ def main(arguments: Sequence[str]) -> int:
             repair_source(parsed.before_sha256, parsed.after_sha256),
             cursor,
             aggregate,
-            timeout=300.0,
+            timeout=420.0,
         )
         qmp.set_deadline(LIFECYCLE._deadline(aggregate, 10.0))
         qmp.system_powerdown()

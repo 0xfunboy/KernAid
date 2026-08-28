@@ -23,7 +23,7 @@ pub const REPAIR_SERVICE_MAX_FRAME_BYTES: usize = 4096;
 // Preparation includes the repeated root-owned target observation plus the
 // first durable Vault reservation. Slow USB media and the TCG qualification
 // must retain useful time for both while the operation remains bounded.
-const PREPARE_TIMEOUT: Duration = Duration::from_secs(120);
+const PREPARE_TIMEOUT: Duration = Duration::from_secs(150);
 const EXECUTE_TIMEOUT: Duration = Duration::from_secs(150);
 const CANCEL_TIMEOUT: Duration = Duration::from_secs(15);
 const RISK_ID: &str = "R2";
@@ -268,7 +268,9 @@ impl BoundRepairApproval {
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum RepairPrepareFailureStage {
-    TargetCapability,
+    TargetCapabilityTimedOut,
+    TargetCapabilityIdentityChanged,
+    TargetCapabilityUnavailable,
     ObservationPreview,
     VaultReserve,
     AdmissionInternal,
@@ -1554,8 +1556,16 @@ mod tests {
     fn prepare_failure_detail_exposes_only_the_closed_stage_token() {
         for (stage, expected) in [
             (
-                RepairPrepareFailureStage::TargetCapability,
-                "target-capability",
+                RepairPrepareFailureStage::TargetCapabilityTimedOut,
+                "target-capability-timed-out",
+            ),
+            (
+                RepairPrepareFailureStage::TargetCapabilityIdentityChanged,
+                "target-capability-identity-changed",
+            ),
+            (
+                RepairPrepareFailureStage::TargetCapabilityUnavailable,
+                "target-capability-unavailable",
             ),
             (
                 RepairPrepareFailureStage::ObservationPreview,

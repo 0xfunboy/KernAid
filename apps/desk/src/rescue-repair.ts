@@ -45,7 +45,9 @@ export type RescueRepairTerminalOutcome =
   | "failed";
 
 export type RescueRepairPrepareFailureStage =
-  | "target-capability"
+  | "target-capability-timed-out"
+  | "target-capability-identity-changed"
+  | "target-capability-unavailable"
   | "observation-preview"
   | "vault-reserve"
   | "admission-internal";
@@ -552,7 +554,9 @@ function parseTerminalDetail(
     "failed",
   ];
   const prepareFailureStages: readonly RescueRepairPrepareFailureStage[] = [
-    "target-capability",
+    "target-capability-timed-out",
+    "target-capability-identity-changed",
+    "target-capability-unavailable",
     "observation-preview",
     "vault-reserve",
     "admission-internal",

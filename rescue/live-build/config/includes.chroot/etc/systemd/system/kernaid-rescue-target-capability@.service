@@ -11,7 +11,7 @@ Type=simple
 ExecStart=/usr/bin/python3 -I -B /usr/lib/kernaid/repair_target_handoff.py
 Environment=KERNAID_TARGET_ID_KEY_FILE=/run/kernaid-offline-inspector/target-id.key
 Environment=KERNAID_TARGET_HANDOFF_PROFILE=readonly
-RuntimeMaxSec=35s
+RuntimeMaxSec=90s
 TimeoutStartSec=5s
 TimeoutStopSec=2s
 Restart=no

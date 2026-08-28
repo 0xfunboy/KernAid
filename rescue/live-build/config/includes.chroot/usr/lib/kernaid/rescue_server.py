@@ -113,7 +113,9 @@ REPAIR_ERROR_TOKENS = {
     "internal",
 }
 REPAIR_PREPARE_FAILURE_STAGES = {
-    "target-capability",
+    "target-capability-timed-out",
+    "target-capability-identity-changed",
+    "target-capability-unavailable",
     "observation-preview",
     "vault-reserve",
     "admission-internal",

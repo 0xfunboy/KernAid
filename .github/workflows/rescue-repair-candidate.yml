@@ -188,7 +188,8 @@ jobs:
 
       - name: QEMU BIOS repair candidate apply qualification
         run: |
-          ./tools/build-rescue/qemu-repair-candidate-smoke.sh \
+          KERNAID_QEMU_SMP=4 \
+            ./tools/build-rescue/qemu-repair-candidate-smoke.sh \
             "$PWD/KernAid-Rescue-amd64-repair-candidate.iso"
 
       - name: Upload private repair candidate forensics

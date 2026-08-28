@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import socket
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -45,6 +46,15 @@ RECOVERY_REQUEST = {
     "operation": "target.recovery.readonly.acquire",
     "recoveryFingerprint": RECOVERY_FINGERPRINT,
 }
+
+
+class RepairTargetHandoffDeadlineTests(unittest.TestCase):
+    def test_expired_deadline_uses_closed_timeout_token(self) -> None:
+        with self.assertRaises(handoff.HandoffFailure) as raised:
+            handoff._ensure_deadline(time.monotonic() - 1, REQUEST["requestId"])
+        self.assertEqual(raised.exception.token, "TARGET_TIMED_OUT")
+        self.assertEqual(raised.exception.request_id, REQUEST["requestId"])
+
 
 BLOCK_INVENTORY = json.dumps(
     {

@@ -51,7 +51,9 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
             'detail.get("afterSha256")!=AFTER',
             '"vaultDistinct":True',
             'terminal_detail.get("terminalOutcome")!="committed"',
-            '"target-capability":"prepare-target-capability"',
+            '"target-capability-timed-out":"prepare-target-capability-timed-out"',
+            '"target-capability-identity-changed":"prepare-target-capability-identity-changed"',
+            '"target-capability-unavailable":"prepare-target-capability-unavailable"',
             '"observation-preview":"prepare-observation-preview"',
             '"vault-reserve":"prepare-vault-reserve"',
             '"admission-internal":"prepare-admission-internal"',
@@ -65,6 +67,11 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
             workflow.count("./tools/build-rescue/qemu-repair-candidate-smoke.sh"),
             1,
         )
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('readonly qemu_smp="${KERNAID_QEMU_SMP:-2}"', source)
+        self.assertIn('1|2|4|8)', source)
+        self.assertIn('-smp "$qemu_smp"', source)
+        self.assertIn("KERNAID_QEMU_SMP=4", workflow)
 
     def test_workflow_always_retains_private_forensics_without_promoting_failure(
         self,

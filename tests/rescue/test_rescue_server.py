@@ -1354,7 +1354,7 @@ class RepairRelayTests(unittest.TestCase):
                 "reservationId": None,
                 "transactionBindingSha256": None,
                 "rebootRequired": False,
-                "prepareFailureStage": "target-capability",
+                "prepareFailureStage": "target-capability-unavailable",
             },
         }
         rescue_server._validate_repair_response(failed_prepare, self.STATUS)

@@ -118,6 +118,8 @@ pub enum TargetCapabilityErrorToken {
     InvalidRequest,
     #[serde(rename = "TARGET_UNAVAILABLE")]
     TargetUnavailable,
+    #[serde(rename = "TARGET_TIMED_OUT")]
+    TargetTimedOut,
     #[serde(rename = "TARGET_UNSUPPORTED")]
     TargetUnsupported,
     #[serde(rename = "TARGET_CHANGED")]
@@ -1218,6 +1220,29 @@ mod tests {
             )
             .err(),
             Some(TargetCapabilityClientError::InvalidFrame)
+        );
+
+        let received = ReceivedFrame {
+            bytes: format!(
+                "{{\"apiVersion\":\"{API_VERSION}\",\"requestId\":\"{REQUEST_ID}\",\"operation\":\"{ACQUIRE_OPERATION}\",\"outcome\":\"error\",\"error\":\"TARGET_TIMED_OUT\"}}"
+            )
+            .into_bytes(),
+            descriptors: Vec::new(),
+        };
+        assert_eq!(
+            decode_response(
+                received,
+                REQUEST_ID,
+                ExpectedClaims::Selected {
+                    scan_fingerprint: &scan,
+                    target_fingerprint: &fingerprint,
+                    target_id: &target,
+                },
+            )
+            .err(),
+            Some(TargetCapabilityClientError::TargetRejected(
+                TargetCapabilityErrorToken::TargetTimedOut
+            ))
         );
     }
 

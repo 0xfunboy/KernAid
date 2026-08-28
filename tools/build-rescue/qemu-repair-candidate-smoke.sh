@@ -7,6 +7,15 @@ iso="${1:-$repo_dir/KernAid-Rescue-amd64-repair-candidate.iso}"
 controller="$repo_dir/tools/build-rescue/qemu-repair-candidate-pty.py"
 readonly media_bytes=32000000000
 readonly p3_start_bytes=17179869184
+readonly qemu_smp="${KERNAID_QEMU_SMP:-2}"
+
+case "$qemu_smp" in
+  1|2|4|8) ;;
+  *)
+    echo "KERNAID_QEMU_SMP must be one of: 1, 2, 4, 8" >&2
+    exit 2
+    ;;
+esac
 
 if [[ "$EUID" -eq 0 ]]; then
   echo "qemu-repair-candidate-smoke.sh must run as an unprivileged user" >&2
@@ -120,7 +129,7 @@ chmod 600 -- "$vault_key"
 qemu_args=(
   -machine accel=tcg
   -m 2048
-  -smp 2
+  -smp "$qemu_smp"
   -nic none
   -device qemu-xhci,id=kernaid_xhci
   -drive "if=none,id=kernaid_rescue_usb,file=$rescue_media,format=raw,cache=none,aio=threads"

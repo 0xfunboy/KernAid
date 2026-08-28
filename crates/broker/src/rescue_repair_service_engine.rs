@@ -6,7 +6,8 @@
 
 use crate::{
     rescue_fstab_candidate::{
-        ApprovedRescueFstabTransaction, PreparedRescueFstabPlan, RescueFstabPreflightError,
+        ApprovedRescueFstabTransaction, PreparedRescueFstabPlan,
+        RescueFstabCapabilityResolutionError, RescueFstabPreflightError,
         prepare_rescue_fstab_candidate,
     },
     rescue_fstab_executor::{
@@ -226,9 +227,16 @@ fn cancel_failed_prepare<T>(
 
 fn map_preflight_failure(error: RescueFstabPreflightError) -> RepairEngineFailure {
     let stage = match error {
-        RescueFstabPreflightError::TargetCapability(_) => {
-            RepairPrepareFailureStage::TargetCapability
-        }
+        RescueFstabPreflightError::TargetCapability(
+            RescueFstabCapabilityResolutionError::TimedOut,
+        ) => RepairPrepareFailureStage::TargetCapabilityTimedOut,
+        RescueFstabPreflightError::TargetCapability(
+            RescueFstabCapabilityResolutionError::IdentityChanged,
+        ) => RepairPrepareFailureStage::TargetCapabilityIdentityChanged,
+        RescueFstabPreflightError::TargetCapability(
+            RescueFstabCapabilityResolutionError::Unavailable
+            | RescueFstabCapabilityResolutionError::LockUnavailable,
+        ) => RepairPrepareFailureStage::TargetCapabilityUnavailable,
         RescueFstabPreflightError::Observation(_)
         | RescueFstabPreflightError::TargetIdentityMismatch
         | RescueFstabPreflightError::EvidenceBindingMismatch
@@ -286,7 +294,19 @@ mod tests {
                 RescueFstabPreflightError::TargetCapability(
                     RescueFstabCapabilityResolutionError::Unavailable,
                 ),
-                RepairPrepareFailureStage::TargetCapability,
+                RepairPrepareFailureStage::TargetCapabilityUnavailable,
+            ),
+            (
+                RescueFstabPreflightError::TargetCapability(
+                    RescueFstabCapabilityResolutionError::TimedOut,
+                ),
+                RepairPrepareFailureStage::TargetCapabilityTimedOut,
+            ),
+            (
+                RescueFstabPreflightError::TargetCapability(
+                    RescueFstabCapabilityResolutionError::IdentityChanged,
+                ),
+                RepairPrepareFailureStage::TargetCapabilityIdentityChanged,
             ),
             (
                 RescueFstabPreflightError::Observation(

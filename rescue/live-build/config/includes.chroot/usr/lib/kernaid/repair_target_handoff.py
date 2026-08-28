@@ -53,7 +53,7 @@ MAX_RESPONSE_BYTES = 2048
 # One acquisition performs repeated inventory/identity observations around the
 # detached mount. Keep the helper bounded while allowing the same closed path
 # to complete on slow recovery media and under the QEMU TCG qualification.
-IO_TIMEOUT_SECONDS = 30
+IO_TIMEOUT_SECONDS = 75
 UUID_INVENTORY_SCHEMA = "kernaid.dev/rescue-uuid-inventory/v1"
 MAX_UUID_INVENTORY_ENTRIES = 4096
 MAX_UUID_BYTES = 128
@@ -125,6 +125,7 @@ _UUID = re.compile(r"^[0-9a-f-]{1,128}$")
 _ERRORS = {
     "INVALID_REQUEST",
     "TARGET_UNAVAILABLE",
+    "TARGET_TIMED_OUT",
     "TARGET_UNSUPPORTED",
     "TARGET_CHANGED",
     "DEVICE_UNAVAILABLE",
@@ -1432,7 +1433,7 @@ def _recompute_target_fingerprint(
 
 def _ensure_deadline(deadline: float, request_id: str) -> None:
     if time.monotonic() >= deadline:
-        raise HandoffFailure("TARGET_UNAVAILABLE", request_id)
+        raise HandoffFailure("TARGET_TIMED_OUT", request_id)
 
 
 def _open_block_pair(
@@ -1816,11 +1817,17 @@ class RepairTargetHandoff:
                     getattr(self.targets, "TargetScanBusy", None),
                     getattr(self.targets, "TargetScanError", None),
                     getattr(self.targets, "TargetSelectionError", None),
-                    TimeoutError,
                 )
                 if isinstance(error_type, type)
             )
-            token = "TARGET_UNAVAILABLE" if isinstance(error, target_errors) else "INTERNAL"
+            if isinstance(error, TimeoutError):
+                token = "TARGET_TIMED_OUT"
+            else:
+                token = (
+                    "TARGET_UNAVAILABLE"
+                    if isinstance(error, target_errors)
+                    else "INTERNAL"
+                )
             raise HandoffFailure(token, request_id) from error
         return (
             {
@@ -1893,6 +1900,8 @@ class RepairTargetHandoff:
                     resolution_b,
                     expected_recovery_fingerprint=recovery_fingerprint,
                 )
+            except TimeoutError as error:
+                raise HandoffFailure("TARGET_TIMED_OUT", request_id) from error
             except Exception as error:
                 raise HandoffFailure("TARGET_CHANGED", request_id) from error
             if (
@@ -1994,11 +2003,17 @@ class RepairTargetHandoff:
                     getattr(self.targets, "TargetScanBusy", None),
                     getattr(self.targets, "TargetScanError", None),
                     getattr(self.targets, "TargetSelectionError", None),
-                    TimeoutError,
                 )
                 if isinstance(error_type, type)
             )
-            token = "TARGET_UNAVAILABLE" if isinstance(error, target_errors) else "INTERNAL"
+            if isinstance(error, TimeoutError):
+                token = "TARGET_TIMED_OUT"
+            else:
+                token = (
+                    "TARGET_UNAVAILABLE"
+                    if isinstance(error, target_errors)
+                    else "INTERNAL"
+                )
             raise HandoffFailure(token, request_id) from error
         return (
             {

@@ -601,6 +601,9 @@ fn map_target_client_error(
     match error {
         TargetCapabilityClientError::TimedOut => RescueFstabCapabilityResolutionError::TimedOut,
         TargetCapabilityClientError::TargetRejected(
+            crate::target_capability_client::TargetCapabilityErrorToken::TargetTimedOut,
+        ) => RescueFstabCapabilityResolutionError::TimedOut,
+        TargetCapabilityClientError::TargetRejected(
             crate::target_capability_client::TargetCapabilityErrorToken::TargetChanged,
         ) => RescueFstabCapabilityResolutionError::IdentityChanged,
         _ => RescueFstabCapabilityResolutionError::Unavailable,
