@@ -2792,6 +2792,7 @@ class StaticContractTests(unittest.TestCase):
                 "signed-report",
                 "hold-kill",
                 "post-fault",
+                "repair-apply",
             ),
         )
         for stage in controller.PROVIDER_PROOF_CLOSED_STAGES:
