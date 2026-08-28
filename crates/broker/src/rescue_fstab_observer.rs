@@ -1,11 +1,8 @@
-//! Real read-only observation for the Rescue `fstab` candidate.
+//! Read-only observation for the Rescue `fstab` candidate.
 //!
-//! This boundary accepts only a retained target/physical-parent guard. It
-//! creates an unattached ext4 mount from the held leaf descriptor with
-//! `ro,noload,nodev,nosuid,noexec`, opens exactly `etc/fstab` beneath that
-//! detached mount, and inventories UUIDs through the fixed trusted kernel
-//! `/dev/disk/by-uuid` view. No mount is attached to the caller's namespace,
-//! and no writable descriptor or caller-selected path exists in this API.
+//! The root-owned handoff has already created and authenticated the detached
+//! ext4 mount and sealed UUID inventory. Observation only consumes those held
+//! capabilities; it neither mounts nor searches a device namespace.
 
 use crate::target_physical_parent::RescueTargetPhysicalParentGuard;
 use kernaid_linux_pack::rescue_fstab_transaction_candidate::{
@@ -13,44 +10,19 @@ use kernaid_linux_pack::rescue_fstab_transaction_candidate::{
 };
 use kernaid_protocol::rescue_repair_vault::RepairFileMetadataV1;
 use rustix::{
-    fd::{AsFd, BorrowedFd, OwnedFd},
-    fs::{
-        self as rfs, AtFlags, CWD, FileType, Mode, OFlags, RawDir, ResolveFlags, StatVfsMountFlags,
-    },
-    mount::{
-        FsMountFlags, FsOpenFlags, MountAttrFlags, fsconfig_create, fsconfig_set_flag,
-        fsconfig_set_string, fsmount, fsopen,
-    },
+    fd::{AsFd, BorrowedFd},
+    fs::{self as rfs, AtFlags, FileType, Mode, OFlags, ResolveFlags},
 };
 use sha2::{Digest, Sha256};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fmt,
-    fs::File,
-    io::Read,
-    mem::MaybeUninit,
-    os::fd::AsRawFd,
-    path::{Path, PathBuf},
-};
+use std::{collections::BTreeSet, fmt, fs::File, io::Read};
 
-const PROC_SELF_FD_PREFIX: &str = "/proc/self/fd/";
-const SYS_ROOT: &str = "/sys";
-const DEV_ROOT: &str = "/dev";
-const UUID_DIRECTORY: &str = "disk/by-uuid";
 const FSTAB_RESOURCE: &str = "etc/fstab";
-const EXT4_FILESYSTEM: &str = "ext4";
-const EXT_SUPER_MAGIC: u64 = 0xef53;
-const SYSFS_MAGIC: u64 = 0x6265_6572;
-const TMPFS_MAGIC: u64 = 0x0102_1994;
 const MAX_FSTAB_BYTES: usize = 1024 * 1024;
-const MAX_UUIDS: usize = 4096;
-const MAX_UUID_BYTES: usize = 128;
-const UUID_SCAN_BUFFER_BYTES: usize = 8192;
 const OBSERVED_UUID_SET_HASH_DOMAIN: &[u8] =
     b"kernaid:linux.fstab.disable-missing-uuid.v1:observed-uuid-set:v1\0";
 
 /// Closed observation failures. No error contains a device identifier,
-/// pathname, mount option, command output, target byte, or OS error string.
+/// pathname, mount option, target byte, or OS error string.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RescueFstabObservationError {
     TargetChanged,
@@ -83,9 +55,6 @@ impl fmt::Display for RescueFstabObservationError {
 impl std::error::Error for RescueFstabObservationError {}
 
 /// Immutable read-only observations for one candidate preflight.
-///
-/// Deliberately not `Clone`: the exact byte snapshot and evidence set should
-/// be moved once into the preflight material rather than silently duplicated.
 pub struct ObservedRescueFstab {
     fstab_bytes: Vec<u8>,
     metadata: RepairFileMetadataV1,
@@ -140,19 +109,23 @@ impl fmt::Debug for ObservedRescueFstab {
     }
 }
 
-/// Observe exactly `etc/fstab` and the normalized UUID inventory while the
-/// supplied target guard retains both leaf and physical-parent descriptors.
+/// Observes exactly `etc/fstab` through the handed-off detached mount and uses
+/// only the handed-off sealed UUID inventory for the candidate evidence.
 pub fn observe_rescue_fstab(
     target: &RescueTargetPhysicalParentGuard,
 ) -> Result<ObservedRescueFstab, RescueFstabObservationError> {
     target
         .revalidate()
         .map_err(|_| RescueFstabObservationError::TargetChanged)?;
-
-    let mount = create_detached_ext4_mount(target.target_block_descriptor())?;
-    let (fstab_bytes, metadata) = read_exact_fstab(&mount)?;
-    let observed_uuids = collect_normalized_uuids()?;
-
+    let (fstab_bytes, metadata) = read_exact_fstab(target.target_detached_mount_descriptor())?;
+    let observed_uuids = target
+        .target_observed_uuids()
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if observed_uuids.is_empty() {
+        return Err(RescueFstabObservationError::InvalidUuidInventory);
+    }
     target
         .revalidate()
         .map_err(|_| RescueFstabObservationError::TargetChanged)?;
@@ -165,84 +138,9 @@ pub fn observe_rescue_fstab(
     })
 }
 
-fn create_detached_ext4_mount(
-    leaf: BorrowedFd<'_>,
-) -> Result<OwnedFd, RescueFstabObservationError> {
-    let before = block_snapshot(leaf).ok_or(RescueFstabObservationError::TargetChanged)?;
-    let source = descriptor_source_path(leaf)?;
-    let proc_snapshot = rfs::statat(CWD, &source, AtFlags::empty())
-        .map(BlockSnapshot::from_stat)
-        .map_err(|_| RescueFstabObservationError::TargetChanged)?;
-    if proc_snapshot != before {
-        return Err(RescueFstabObservationError::TargetChanged);
-    }
-
-    let context = fsopen(EXT4_FILESYSTEM, FsOpenFlags::FSOPEN_CLOEXEC)
-        .map_err(|_| RescueFstabObservationError::DetachedMountUnavailable)?;
-    fsconfig_set_string(&context, "source", &source)
-        .map_err(|_| RescueFstabObservationError::DetachedMountUnavailable)?;
-    fsconfig_set_flag(&context, "ro")
-        .map_err(|_| RescueFstabObservationError::DetachedMountUnavailable)?;
-    // Ext4 may replay a journal even for a read-only mount unless `noload` is
-    // explicit. Failure to admit this flag is terminal; there is no fallback.
-    fsconfig_set_flag(&context, "noload")
-        .map_err(|_| RescueFstabObservationError::DetachedMountUnavailable)?;
-    fsconfig_create(&context).map_err(|_| RescueFstabObservationError::DetachedMountUnavailable)?;
-    let attributes = MountAttrFlags::MOUNT_ATTR_RDONLY
-        | MountAttrFlags::MOUNT_ATTR_NODEV
-        | MountAttrFlags::MOUNT_ATTR_NOSUID
-        | MountAttrFlags::MOUNT_ATTR_NOEXEC;
-    let mount = fsmount(&context, FsMountFlags::FSMOUNT_CLOEXEC, attributes)
-        .map_err(|_| RescueFstabObservationError::DetachedMountUnavailable)?;
-    validate_detached_mount(&mount)?;
-
-    if block_snapshot(leaf) != Some(before)
-        || rfs::statat(CWD, &source, AtFlags::empty())
-            .map(BlockSnapshot::from_stat)
-            .ok()
-            != Some(before)
-    {
-        return Err(RescueFstabObservationError::TargetChanged);
-    }
-    Ok(mount)
-}
-
-fn descriptor_source_path(
-    descriptor: BorrowedFd<'_>,
-) -> Result<PathBuf, RescueFstabObservationError> {
-    let number = descriptor.as_raw_fd();
-    if number < 0 {
-        return Err(RescueFstabObservationError::TargetChanged);
-    }
-    Ok(PathBuf::from(format!("{PROC_SELF_FD_PREFIX}{number}")))
-}
-
-fn validate_detached_mount(mount: &OwnedFd) -> Result<(), RescueFstabObservationError> {
-    let stat = rfs::fstat(mount).map_err(|_| RescueFstabObservationError::UnsafeDetachedMount)?;
-    let filesystem =
-        rfs::fstatfs(mount).map_err(|_| RescueFstabObservationError::UnsafeDetachedMount)?;
-    let filesystem_flags =
-        rfs::fstatvfs(mount).map_err(|_| RescueFstabObservationError::UnsafeDetachedMount)?;
-    let descriptor_flags = rustix::io::fcntl_getfd(mount)
-        .map_err(|_| RescueFstabObservationError::UnsafeDetachedMount)?;
-    let required = StatVfsMountFlags::RDONLY
-        | StatVfsMountFlags::NODEV
-        | StatVfsMountFlags::NOSUID
-        | StatVfsMountFlags::NOEXEC;
-    if !FileType::from_raw_mode(stat.st_mode).is_dir()
-        || filesystem.f_type as u64 != EXT_SUPER_MAGIC
-        || !filesystem_flags.f_flag.contains(required)
-        || !descriptor_flags.contains(rustix::io::FdFlags::CLOEXEC)
-    {
-        return Err(RescueFstabObservationError::UnsafeDetachedMount);
-    }
-    Ok(())
-}
-
 fn read_exact_fstab(
-    mount: &OwnedFd,
+    mount: BorrowedFd<'_>,
 ) -> Result<(Vec<u8>, RepairFileMetadataV1), RescueFstabObservationError> {
-    validate_detached_mount(mount)?;
     let descriptor = rfs::openat2(
         mount,
         FSTAB_RESOURCE,
@@ -252,9 +150,6 @@ fn read_exact_fstab(
     )
     .map_err(|_| RescueFstabObservationError::FstabUnavailable)?;
     let before = file_snapshot(&descriptor)?;
-    // The Vault persistence contract admits only the canonical system fstab
-    // ownership/mode. Refuse a readable but non-canonical object before its
-    // bytes can become candidate evidence.
     if before.mode & 0o7777 != 0o644 || before.uid != 0 || before.gid != 0 {
         return Err(RescueFstabObservationError::UnsafeFstab);
     }
@@ -262,8 +157,6 @@ fn read_exact_fstab(
         .ok()
         .filter(|size| (1..=MAX_FSTAB_BYTES).contains(size))
         .ok_or(RescueFstabObservationError::FstabTooLarge)?;
-    // RepairFileMetadataV1 declares xattrs and POSIX ACLs absent. Refuse any
-    // extended attribute rather than silently losing metadata during backup.
     let mut xattr_probe = [0_u8; 0];
     let xattr_bytes = rfs::flistxattr(&descriptor, &mut xattr_probe)
         .map_err(|_| RescueFstabObservationError::UnsafeFstab)?;
@@ -287,46 +180,10 @@ fn read_exact_fstab(
     if before != after || after != named {
         return Err(RescueFstabObservationError::UnsafeFstab);
     }
-    validate_detached_mount(mount)?;
 
     let metadata = RepairFileMetadataV1::new(0o644, 0, 0)
         .map_err(|_| RescueFstabObservationError::UnsafeFstab)?;
     Ok((bytes, metadata))
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct BlockSnapshot {
-    device: u64,
-    inode: u64,
-    rdev: u64,
-}
-
-impl BlockSnapshot {
-    fn from_stat(stat: rustix::fs::Stat) -> Self {
-        Self {
-            device: stat.st_dev,
-            inode: stat.st_ino,
-            rdev: stat.st_rdev,
-        }
-    }
-
-    fn major_minor(self) -> (u32, u32) {
-        (rfs::major(self.rdev), rfs::minor(self.rdev))
-    }
-}
-
-fn block_snapshot(descriptor: BorrowedFd<'_>) -> Option<BlockSnapshot> {
-    let stat = rfs::fstat(descriptor).ok()?;
-    let status = rfs::fcntl_getfl(descriptor).ok()?;
-    let descriptor_flags = rustix::io::fcntl_getfd(descriptor).ok()?;
-    if !FileType::from_raw_mode(stat.st_mode).is_block_device()
-        || status & OFlags::ACCMODE != OFlags::RDONLY
-        || !status.contains(OFlags::NONBLOCK)
-        || !descriptor_flags.contains(rustix::io::FdFlags::CLOEXEC)
-    {
-        return None;
-    }
-    Some(BlockSnapshot::from_stat(stat))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -373,148 +230,11 @@ fn file_snapshot(descriptor: &impl AsFd) -> Result<FileSnapshot, RescueFstabObse
         || stat.st_size <= 0
         || status & OFlags::ACCMODE != OFlags::RDONLY
         || !status.contains(OFlags::NONBLOCK)
-        || !descriptor_flags.contains(rustix::io::FdFlags::CLOEXEC)
+        || descriptor_flags != rustix::io::FdFlags::CLOEXEC
     {
         return Err(RescueFstabObservationError::UnsafeFstab);
     }
     Ok(FileSnapshot::from_stat(stat))
-}
-
-fn collect_normalized_uuids() -> Result<BTreeSet<String>, RescueFstabObservationError> {
-    // `/dev/disk/by-uuid` is treated strictly as the host's trusted udev view:
-    // its fixed roots and every resolved block node are kernel-cross-checked,
-    // then the entire inventory is scanned twice to reject concurrent change.
-    let sys = open_trusted_root(Path::new(SYS_ROOT), SYSFS_MAGIC)?;
-    let dev = open_trusted_root(Path::new(DEV_ROOT), TMPFS_MAGIC)?;
-    let first = scan_uuid_inventory(&sys, &dev)?;
-    let second = scan_uuid_inventory(&sys, &dev)?;
-    if first != second {
-        return Err(RescueFstabObservationError::InvalidUuidInventory);
-    }
-    Ok(first.into_keys().collect())
-}
-
-fn open_trusted_root(
-    path: &Path,
-    expected_magic: u64,
-) -> Result<OwnedFd, RescueFstabObservationError> {
-    let descriptor = rfs::open(
-        path,
-        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::empty(),
-    )
-    .map_err(|_| RescueFstabObservationError::UuidInventoryUnavailable)?;
-    let stat = rfs::fstat(&descriptor)
-        .map_err(|_| RescueFstabObservationError::UuidInventoryUnavailable)?;
-    let filesystem = rfs::fstatfs(&descriptor)
-        .map_err(|_| RescueFstabObservationError::UuidInventoryUnavailable)?;
-    if !FileType::from_raw_mode(stat.st_mode).is_dir()
-        || stat.st_uid != 0
-        || filesystem.f_type as u64 != expected_magic
-        || !rustix::io::fcntl_getfd(&descriptor)
-            .map_err(|_| RescueFstabObservationError::UuidInventoryUnavailable)?
-            .contains(rustix::io::FdFlags::CLOEXEC)
-    {
-        return Err(RescueFstabObservationError::UuidInventoryUnavailable);
-    }
-    Ok(descriptor)
-}
-
-fn scan_uuid_inventory(
-    sys: &OwnedFd,
-    dev: &OwnedFd,
-) -> Result<BTreeMap<String, BlockSnapshot>, RescueFstabObservationError> {
-    let directory = rfs::openat2(
-        dev,
-        UUID_DIRECTORY,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::empty(),
-        ResolveFlags::BENEATH | ResolveFlags::NO_MAGICLINKS | ResolveFlags::NO_SYMLINKS,
-    )
-    .map_err(|_| RescueFstabObservationError::UuidInventoryUnavailable)?;
-    let mut buffer = [MaybeUninit::uninit(); UUID_SCAN_BUFFER_BYTES];
-    let mut entries = RawDir::new(&directory, &mut buffer);
-    let mut inventory = BTreeMap::new();
-    let mut count = 0_usize;
-    while let Some(entry) = entries.next() {
-        let entry = entry.map_err(|_| RescueFstabObservationError::InvalidUuidInventory)?;
-        let name = entry.file_name().to_bytes();
-        if matches!(name, b"." | b"..") {
-            continue;
-        }
-        count = count
-            .checked_add(1)
-            .filter(|count| *count <= MAX_UUIDS)
-            .ok_or(RescueFstabObservationError::InvalidUuidInventory)?;
-        let uuid = normalize_uuid(name)?;
-        let target = open_uuid_target(sys, dev, &uuid)?;
-        if inventory.insert(uuid, target).is_some() {
-            return Err(RescueFstabObservationError::InvalidUuidInventory);
-        }
-    }
-    if inventory.is_empty() {
-        return Err(RescueFstabObservationError::InvalidUuidInventory);
-    }
-    Ok(inventory)
-}
-
-fn open_uuid_target(
-    sys: &OwnedFd,
-    dev: &OwnedFd,
-    uuid: &str,
-) -> Result<BlockSnapshot, RescueFstabObservationError> {
-    let relative = PathBuf::from(UUID_DIRECTORY).join(uuid);
-    let descriptor = rfs::openat2(
-        dev,
-        &relative,
-        OFlags::PATH | OFlags::CLOEXEC,
-        Mode::empty(),
-        ResolveFlags::BENEATH | ResolveFlags::NO_MAGICLINKS,
-    )
-    .map_err(|_| RescueFstabObservationError::InvalidUuidInventory)?;
-    let stat =
-        rfs::fstat(&descriptor).map_err(|_| RescueFstabObservationError::InvalidUuidInventory)?;
-    if !FileType::from_raw_mode(stat.st_mode).is_block_device()
-        || !rustix::io::fcntl_getfd(&descriptor)
-            .map_err(|_| RescueFstabObservationError::InvalidUuidInventory)?
-            .contains(rustix::io::FdFlags::CLOEXEC)
-    {
-        return Err(RescueFstabObservationError::InvalidUuidInventory);
-    }
-    let snapshot = BlockSnapshot::from_stat(stat);
-    let (major, minor) = snapshot.major_minor();
-    let sysfs_link = format!("dev/block/{major}:{minor}");
-    let sysfs = rfs::openat2(
-        sys,
-        sysfs_link,
-        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-        ResolveFlags::BENEATH | ResolveFlags::NO_MAGICLINKS,
-    )
-    .map_err(|_| RescueFstabObservationError::InvalidUuidInventory)?;
-    let sysfs_stat =
-        rfs::fstat(&sysfs).map_err(|_| RescueFstabObservationError::InvalidUuidInventory)?;
-    if !FileType::from_raw_mode(sysfs_stat.st_mode).is_dir() || sysfs_stat.st_uid != 0 {
-        return Err(RescueFstabObservationError::InvalidUuidInventory);
-    }
-    Ok(snapshot)
-}
-
-fn normalize_uuid(bytes: &[u8]) -> Result<String, RescueFstabObservationError> {
-    if bytes.is_empty()
-        || bytes.len() > MAX_UUID_BYTES
-        || bytes.first() == Some(&b'-')
-        || bytes.last() == Some(&b'-')
-        || !bytes
-            .iter()
-            .all(|byte| byte.is_ascii_hexdigit() || *byte == b'-')
-    {
-        return Err(RescueFstabObservationError::InvalidUuidInventory);
-    }
-    let uuid = std::str::from_utf8(bytes)
-        .map_err(|_| RescueFstabObservationError::InvalidUuidInventory)?
-        .to_ascii_lowercase();
-    Ok(uuid)
 }
 
 fn evidence_bindings(
@@ -551,26 +271,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn uuid_normalization_and_hash_are_canonical() {
-        let observed = ["DEAD-BEEF", "aaaa-bbbb"]
-            .into_iter()
-            .map(|uuid| normalize_uuid(uuid.as_bytes()).expect("canonical UUID"))
-            .collect::<BTreeSet<_>>();
-        assert_eq!(
-            observed,
-            BTreeSet::from(["aaaa-bbbb".to_owned(), "dead-beef".to_owned()])
-        );
+    fn handed_inventory_hash_is_canonical() {
+        let observed = BTreeSet::from(["aaaa-bbbb".to_owned(), "dead-beef".to_owned()]);
         assert_eq!(
             observed_uuid_set_sha256(&observed),
             "sha256:90138e9f8e6b75b9cd2ec66951ee541f8bde7d89060061b455141ccbd684aac7"
-        );
-        assert_eq!(
-            normalize_uuid(b"../../sda"),
-            Err(RescueFstabObservationError::InvalidUuidInventory)
-        );
-        assert_eq!(
-            normalize_uuid(b"mapper/root"),
-            Err(RescueFstabObservationError::InvalidUuidInventory)
         );
     }
 

@@ -41,6 +41,7 @@ rescue-target-physical-parent = [
     "dep:rustix",
     "dep:serde",
     "dep:serde_json",
+    "dep:sha2",
     "kernaid-protocol/experimental-physical-parent-fingerprint",
 ]
 [dependencies]

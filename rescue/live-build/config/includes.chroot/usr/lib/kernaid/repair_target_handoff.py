@@ -3,13 +3,18 @@
 
 The normal operation accepts boot-ephemeral opaque identifiers. The recovery
 operation accepts only a reboot-stable opaque digest. Both rescan twice and
-return fresh path-free claims plus one read-only block-device descriptor.
+return fresh path-free claims plus an ordered, closed read-only capability
+bundle: selected leaf, physical parent, sealed UUID inventory and detached
+ext4 mount. No writable device or attached mount crosses this boundary.
 """
 
 from __future__ import annotations
 
 import array
+import ctypes
+import errno
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -22,7 +27,7 @@ import time
 import types
 
 
-API_VERSION = "kernaid.dev/rescue-target-capability/v1alpha1"
+API_VERSION = "kernaid.dev/rescue-target-capability/v1alpha2"
 ACQUIRE_OPERATION = "target.readonly.acquire"
 RECOVERY_OPERATION = "target.recovery.readonly.acquire"
 # Kept as the existing operation alias for callers which only use acquisition.
@@ -36,8 +41,52 @@ ISOLATED_HOME = b"/nonexistent"
 ISOLATED_SHELL = b"/usr/sbin/nologin"
 MAX_PASSWD_BYTES = 256 * 1024
 MAX_REQUEST_BYTES = 1024
-MAX_RESPONSE_BYTES = 1024
+MAX_RESPONSE_BYTES = 2048
 IO_TIMEOUT_SECONDS = 8
+UUID_INVENTORY_SCHEMA = "kernaid.dev/rescue-uuid-inventory/v1"
+MAX_UUID_INVENTORY_ENTRIES = 4096
+MAX_UUID_BYTES = 128
+MAX_UUID_INVENTORY_BYTES = 536_635
+BUNDLE_CAPABILITY = "linux-ext4-direct-leaf-readonly-bundle-v2"
+BUNDLE_DESCRIPTOR_TYPES = (
+    "selected-target-block-readonly",
+    "physical-parent-block-identity-path",
+    "uuid-inventory-memfd-sealed",
+    "selected-target-ext4-mount-readonly-detached",
+)
+BLOCK_INVENTORY_COLLECTOR = "linux.block.inventory"
+
+# Linux UAPI values from linux/memfd.h, linux/fcntl.h and linux/mount.h.  The
+# numeric fallbacks keep the closed helper usable with Python builds which do
+# not publish every Linux-only constant while still requiring the kernel to
+# enforce the requested flags.
+MFD_CLOEXEC = getattr(os, "MFD_CLOEXEC", 0x0001)
+MFD_ALLOW_SEALING = getattr(os, "MFD_ALLOW_SEALING", 0x0002)
+F_ADD_SEALS = getattr(fcntl, "F_ADD_SEALS", 1033)
+F_GET_SEALS = getattr(fcntl, "F_GET_SEALS", 1034)
+F_SEAL_SEAL = getattr(fcntl, "F_SEAL_SEAL", 0x0001)
+F_SEAL_SHRINK = getattr(fcntl, "F_SEAL_SHRINK", 0x0002)
+F_SEAL_GROW = getattr(fcntl, "F_SEAL_GROW", 0x0004)
+F_SEAL_WRITE = getattr(fcntl, "F_SEAL_WRITE", 0x0008)
+UUID_INVENTORY_SEALS = F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL
+
+FSOPEN_CLOEXEC = 0x00000001
+FSCONFIG_SET_FLAG = 0
+FSCONFIG_SET_STRING = 1
+FSCONFIG_CMD_CREATE_EXCL = 8
+FSMOUNT_CLOEXEC = 0x00000001
+MOUNT_ATTR_RDONLY = 0x00000001
+MOUNT_ATTR_NOSUID = 0x00000002
+MOUNT_ATTR_NODEV = 0x00000004
+MOUNT_ATTR_NOEXEC = 0x00000008
+REQUIRED_MOUNT_ATTRIBUTES = (
+    MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV | MOUNT_ATTR_NOEXEC
+)
+EXT4_SUPER_MAGIC = 0xEF53
+BLKSSZGET = 0x1268
+BLKGETSIZE64 = 0x80081272
+BLKGETDISKSEQ = 0x80081280
+KERNEL_SECTOR_BYTES = 512
 
 _REQUEST_ID = re.compile(
     r"^R-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
@@ -50,6 +99,7 @@ _TARGET_FINGERPRINT = re.compile(r"^sha256:[0-9a-f]{64}$")
 _RECOVERY_FINGERPRINT = re.compile(r"^recovery:[0-9a-f]{64}$")
 _MAJOR_MINOR = re.compile(r"^(0|[1-9][0-9]{0,9}):(0|[1-9][0-9]{0,9})$")
 _SAFE_DEVNAME = re.compile(r"^[A-Za-z0-9._+-]{1,128}$")
+_UUID = re.compile(r"^[0-9a-f-]{1,128}$")
 _ERRORS = {
     "INVALID_REQUEST",
     "TARGET_UNAVAILABLE",
@@ -368,7 +418,7 @@ def _qualify(
     resolution: object,
     *,
     expected_recovery_fingerprint: str | None = None,
-) -> tuple[str, str, int, int]:
+) -> tuple[str, str, int, int, str, int, int, int, int]:
     request_id = request["requestId"]
     if not isinstance(selection, dict) or not isinstance(resolution, dict):
         raise HandoffFailure("TARGET_UNSUPPORTED", request_id)
@@ -390,6 +440,18 @@ def _qualify(
     candidate = resolution.get("candidate")
     identity = resolution.get("deviceIdentity")
     major_minor = resolution.get("majorMinor")
+    physical_parent = resolution.get("physicalParent")
+    parent_identity = (
+        physical_parent.get("deviceIdentity")
+        if isinstance(physical_parent, dict)
+        else None
+    )
+    parent_major_minor = (
+        physical_parent.get("majorMinor")
+        if isinstance(physical_parent, dict)
+        else None
+    )
+    kernel_kind = resolution.get("kernelKind")
     recovery_fingerprint = resolution.get("recoveryFingerprint")
     ephemeral_request = request.get("operation") == ACQUIRE_OPERATION
     if (
@@ -405,16 +467,38 @@ def _qualify(
         or candidate.get("requiresUnlock") is not False
         or candidate.get("selectionEligible") is not True
         or resolution.get("filesystem") != "ext4"
-        or resolution.get("kernelKind") not in {"disk", "part"}
+        or kernel_kind not in {"disk", "part"}
         or resolution.get("leaf") is not True
         or resolution.get("directOnDisk") is not True
         or not isinstance(identity, dict)
         or identity.get("maj:min") != major_minor
-        or identity.get("type") != resolution.get("kernelKind")
+        or identity.get("type") != kernel_kind
         or identity.get("fstype") != "ext4"
         or identity.get("ro") is not False
         or not isinstance(identity.get("mountpoints"), list)
         or any(bool(item) for item in identity["mountpoints"])
+        or not isinstance(physical_parent, dict)
+        or set(physical_parent)
+        != {"deviceIdentity", "majorMinor", "kernelKind"}
+        or physical_parent.get("kernelKind") != "disk"
+        or not isinstance(parent_identity, dict)
+        or parent_identity.get("maj:min") != parent_major_minor
+        or parent_identity.get("type") != "disk"
+        or parent_identity.get("ro") is not False
+        or not isinstance(parent_identity.get("mountpoints"), list)
+        or any(bool(item) for item in parent_identity["mountpoints"])
+        or not isinstance(identity.get("size"), int)
+        or isinstance(identity.get("size"), bool)
+        or int(identity["size"]) <= 0
+        or not isinstance(parent_identity.get("size"), int)
+        or isinstance(parent_identity.get("size"), bool)
+        or int(parent_identity["size"]) < int(identity["size"])
+        or (kernel_kind == "disk" and parent_major_minor != major_minor)
+        or (kernel_kind == "part" and parent_major_minor == major_minor)
+        or (
+            kernel_kind == "disk"
+            and _canonical(parent_identity) != _canonical(identity)
+        )
         or not isinstance(recovery_fingerprint, str)
         or _RECOVERY_FINGERPRINT.fullmatch(recovery_fingerprint) is None
         or resolution.get("recoveryUnique") is not True
@@ -426,10 +510,21 @@ def _qualify(
         raise HandoffFailure("TARGET_UNSUPPORTED", request_id)
     try:
         major, minor = _major_minor(major_minor)
+        parent_major, parent_minor = _major_minor(parent_major_minor)
     except HandoffFailure as error:
         error.request_id = request_id
         raise
-    return recovery_fingerprint, str(major_minor), major, minor
+    return (
+        recovery_fingerprint,
+        str(major_minor),
+        major,
+        minor,
+        str(parent_major_minor),
+        parent_major,
+        parent_minor,
+        int(identity["size"]),
+        int(parent_identity["size"]),
+    )
 
 
 def _mountinfo_has_device(major_minor: str) -> bool:
@@ -475,6 +570,120 @@ def _assert_block_fd(descriptor: int, major: int, minor: int) -> None:
         raise HandoffFailure("DEVICE_UNAVAILABLE")
 
 
+def _assert_readonly_block_capability(descriptor: int) -> None:
+    metadata = os.fstat(descriptor)
+    flags = fcntl.fcntl(descriptor, fcntl.F_GETFL)
+    fd_flags = fcntl.fcntl(descriptor, fcntl.F_GETFD)
+    if (
+        not stat.S_ISBLK(metadata.st_mode)
+        or flags & os.O_ACCMODE != os.O_RDONLY
+        or not flags & os.O_NONBLOCK
+        or not fd_flags & fcntl.FD_CLOEXEC
+    ):
+        raise HandoffFailure("DEVICE_UNAVAILABLE")
+
+
+def _assert_block_identity_fd(descriptor: int, major: int, minor: int) -> None:
+    metadata = os.fstat(descriptor)
+    flags = fcntl.fcntl(descriptor, fcntl.F_GETFL)
+    fd_flags = fcntl.fcntl(descriptor, fcntl.F_GETFD)
+    if (
+        not stat.S_ISBLK(metadata.st_mode)
+        or os.major(metadata.st_rdev) != major
+        or os.minor(metadata.st_rdev) != minor
+        or flags & os.O_PATH != os.O_PATH
+        or not fd_flags & fcntl.FD_CLOEXEC
+    ):
+        raise HandoffFailure("DEVICE_UNAVAILABLE")
+
+
+def _probe_u64(descriptor: int, request: int) -> int:
+    buffer = bytearray(8)
+    try:
+        fcntl.ioctl(descriptor, request, buffer, True)
+        value = struct.unpack("=Q", buffer)[0]
+    except (OSError, struct.error) as error:
+        raise HandoffFailure("DEVICE_UNAVAILABLE") from error
+    if not 0 < value <= 0xFFFF_FFFF_FFFF_FFFF:
+        raise HandoffFailure("DEVICE_UNAVAILABLE")
+    return value
+
+
+def _probe_u32(descriptor: int, request: int) -> int:
+    buffer = bytearray(4)
+    try:
+        fcntl.ioctl(descriptor, request, buffer, True)
+        value = struct.unpack("=I", buffer)[0]
+    except (OSError, struct.error) as error:
+        raise HandoffFailure("DEVICE_UNAVAILABLE") from error
+    if not 0 < value <= 0xFFFF_FFFF:
+        raise HandoffFailure("DEVICE_UNAVAILABLE")
+    return value
+
+
+def _probe_physical_parent_claims(
+    leaf_descriptor: int,
+    parent_descriptor: int,
+    leaf_size_bytes: int,
+    parent_size_bytes: int,
+    parent_major: int,
+    parent_minor: int,
+) -> dict[str, int]:
+    leaf_disk_sequence = _probe_u64(leaf_descriptor, BLKGETDISKSEQ)
+    parent_disk_sequence = _probe_u64(parent_descriptor, BLKGETDISKSEQ)
+    leaf_size = _probe_u64(leaf_descriptor, BLKGETSIZE64)
+    parent_size = _probe_u64(parent_descriptor, BLKGETSIZE64)
+    leaf_sector_bytes = _probe_u32(leaf_descriptor, BLKSSZGET)
+    parent_sector_bytes = _probe_u32(parent_descriptor, BLKSSZGET)
+    if (
+        leaf_disk_sequence != parent_disk_sequence
+        or leaf_size != leaf_size_bytes
+        or parent_size != parent_size_bytes
+        or leaf_size > parent_size
+        or leaf_size % KERNEL_SECTOR_BYTES
+        or parent_size % KERNEL_SECTOR_BYTES
+        or leaf_sector_bytes != parent_sector_bytes
+        or not KERNEL_SECTOR_BYTES <= parent_sector_bytes <= 65_536
+        or parent_sector_bytes & (parent_sector_bytes - 1)
+    ):
+        raise HandoffFailure("TARGET_CHANGED")
+    return {
+        "parentMajor": parent_major,
+        "parentMinor": parent_minor,
+        "diskSequence": parent_disk_sequence,
+        "mediaSectorCount": parent_size // KERNEL_SECTOR_BYTES,
+        "logicalSectorBytes": parent_sector_bytes,
+        "leafSectorCount": leaf_size // KERNEL_SECTOR_BYTES,
+    }
+
+
+def _validate_physical_parent_claims_wire(value: object) -> dict[str, int]:
+    keys = {
+        "parentMajor",
+        "parentMinor",
+        "diskSequence",
+        "mediaSectorCount",
+        "logicalSectorBytes",
+        "leafSectorCount",
+    }
+    if not isinstance(value, dict) or set(value) != keys:
+        raise HandoffFailure("INTERNAL")
+    if any(not isinstance(value[key], int) or isinstance(value[key], bool) for key in keys):
+        raise HandoffFailure("INTERNAL")
+    claims = {key: int(value[key]) for key in keys}
+    if (
+        not 0 <= claims["parentMajor"] <= 0xFFFF_FFFF
+        or not 0 <= claims["parentMinor"] <= 0xFFFF_FFFF
+        or not 0 < claims["diskSequence"] <= 0xFFFF_FFFF_FFFF_FFFF
+        or not 0 < claims["mediaSectorCount"] <= 0xFFFF_FFFF_FFFF_FFFF // 512
+        or not 0 < claims["leafSectorCount"] <= claims["mediaSectorCount"]
+        or not KERNEL_SECTOR_BYTES <= claims["logicalSectorBytes"] <= 65_536
+        or claims["logicalSectorBytes"] & (claims["logicalSectorBytes"] - 1)
+    ):
+        raise HandoffFailure("INTERNAL")
+    return claims
+
+
 def _open_bound_block_device(major_minor: str, major: int, minor: int) -> int:
     dev_fd = os.open(
         "/dev", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
@@ -517,15 +726,343 @@ def _open_bound_block_device(major_minor: str, major: int, minor: int) -> int:
         os.close(dev_fd)
 
 
+def _open_bound_block_identity(major: int, minor: int) -> int:
+    dev_fd = os.open(
+        "/dev", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    )
+    matches: list[str] = []
+    try:
+        with os.scandir(dev_fd) as entries:
+            for index, entry in enumerate(entries, start=1):
+                if index > 4096:
+                    raise HandoffFailure("DEVICE_UNAVAILABLE")
+                if _SAFE_DEVNAME.fullmatch(entry.name) is None:
+                    continue
+                try:
+                    metadata = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                if (
+                    stat.S_ISBLK(metadata.st_mode)
+                    and os.major(metadata.st_rdev) == major
+                    and os.minor(metadata.st_rdev) == minor
+                ):
+                    matches.append(entry.name)
+        if len(matches) != 1:
+            raise HandoffFailure("DEVICE_UNAVAILABLE")
+        descriptor = os.open(
+            matches[0],
+            os.O_PATH | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=dev_fd,
+        )
+        try:
+            _assert_block_identity_fd(descriptor, major, minor)
+            current = os.stat(matches[0], dir_fd=dev_fd, follow_symlinks=False)
+            if current.st_rdev != os.fstat(descriptor).st_rdev:
+                raise HandoffFailure("DEVICE_UNAVAILABLE")
+        except Exception:
+            os.close(descriptor)
+            raise
+        return descriptor
+    finally:
+        os.close(dev_fd)
+
+
 def _canonical(value: object) -> bytes:
     return json.dumps(
         value, ensure_ascii=True, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
 
 
+def _normalize_uuid_inventory(values: object) -> tuple[str, ...]:
+    if not isinstance(values, list) or len(values) > MAX_UUID_INVENTORY_ENTRIES:
+        raise HandoffFailure("TARGET_UNAVAILABLE")
+    normalized: set[str] = set()
+    for value in values:
+        if not isinstance(value, str) or not value.isascii():
+            raise HandoffFailure("TARGET_UNAVAILABLE")
+        canonical = value.lower()
+        if (
+            not 1 <= len(canonical) <= MAX_UUID_BYTES
+            or _UUID.fullmatch(canonical) is None
+            or canonical.startswith("-")
+            or canonical.endswith("-")
+        ):
+            raise HandoffFailure("TARGET_UNAVAILABLE")
+        normalized.add(canonical)
+    ordered = tuple(sorted(normalized))
+    if not 1 <= len(ordered) <= MAX_UUID_INVENTORY_ENTRIES:
+        raise HandoffFailure("TARGET_UNAVAILABLE")
+    return ordered
+
+
+def _uuid_inventory_from_observations(
+    observations: list[dict[str, object]], request_id: str
+) -> tuple[str, ...]:
+    matches = [
+        item
+        for item in observations
+        if isinstance(item, dict)
+        and item.get("collector") == BLOCK_INVENTORY_COLLECTOR
+    ]
+    if len(matches) != 1:
+        raise HandoffFailure("TARGET_UNAVAILABLE", request_id)
+    observation = matches[0]
+    output = observation.get("output")
+    if (
+        observation.get("success") is not True
+        or observation.get("truncated") is True
+        or not isinstance(output, str)
+        or not output
+        or len(output.encode("utf-8")) > MAX_UUID_INVENTORY_BYTES
+    ):
+        raise HandoffFailure("TARGET_UNAVAILABLE", request_id)
+    try:
+        decoded = json.loads(
+            output,
+            object_pairs_hook=_reject_duplicates,
+            parse_constant=lambda _value: (_ for _ in ()).throw(ValueError()),
+        )
+    except (json.JSONDecodeError, ValueError) as error:
+        raise HandoffFailure("TARGET_UNAVAILABLE", request_id) from error
+    if not isinstance(decoded, dict) or set(decoded) != {"blockdevices"}:
+        raise HandoffFailure("TARGET_UNAVAILABLE", request_id)
+    roots = decoded.get("blockdevices")
+    if not isinstance(roots, list):
+        raise HandoffFailure("TARGET_UNAVAILABLE", request_id)
+
+    values: list[str] = []
+    device_count = 0
+
+    def visit(device: object, depth: int) -> None:
+        nonlocal device_count
+        if depth > 8 or not isinstance(device, dict) or "uuid" not in device:
+            raise HandoffFailure("TARGET_UNAVAILABLE", request_id)
+        device_count += 1
+        if device_count > MAX_UUID_INVENTORY_ENTRIES:
+            raise HandoffFailure("TARGET_UNAVAILABLE", request_id)
+        value = device.get("uuid")
+        if value is not None:
+            if not isinstance(value, str):
+                raise HandoffFailure("TARGET_UNAVAILABLE", request_id)
+            values.append(value)
+        children = device.get("children", [])
+        if not isinstance(children, list):
+            raise HandoffFailure("TARGET_UNAVAILABLE", request_id)
+        for child in children:
+            visit(child, depth + 1)
+
+    for root in roots:
+        visit(root, 0)
+    try:
+        return _normalize_uuid_inventory(values)
+    except HandoffFailure as error:
+        error.request_id = request_id
+        raise
+
+
+def _uuid_inventory_payload(uuids: tuple[str, ...]) -> bytes:
+    payload = _canonical({"schema": UUID_INVENTORY_SCHEMA, "uuids": list(uuids)})
+    if not payload or len(payload) > MAX_UUID_INVENTORY_BYTES:
+        raise HandoffFailure("TARGET_UNAVAILABLE")
+    return payload
+
+
+def _assert_uuid_inventory_fd(descriptor: int, payload: bytes) -> None:
+    metadata = os.fstat(descriptor)
+    fd_flags = fcntl.fcntl(descriptor, fcntl.F_GETFD)
+    status = fcntl.fcntl(descriptor, fcntl.F_GETFL)
+    seals = fcntl.fcntl(descriptor, F_GET_SEALS)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) != 0o400
+        or metadata.st_size != len(payload)
+        or len(payload) > MAX_UUID_INVENTORY_BYTES
+        or not fd_flags & fcntl.FD_CLOEXEC
+        or status & os.O_ACCMODE != os.O_RDWR
+        or seals != UUID_INVENTORY_SEALS
+        or os.lseek(descriptor, 0, os.SEEK_CUR) != 0
+        or os.pread(descriptor, len(payload) + 1, 0) != payload
+    ):
+        raise HandoffFailure("DEVICE_UNAVAILABLE")
+
+
+def _create_uuid_inventory_memfd(
+    uuids: tuple[str, ...],
+) -> tuple[int, dict[str, object]]:
+    payload = _uuid_inventory_payload(uuids)
+    try:
+        descriptor = os.memfd_create(
+            "kernaid-rescue-uuid-inventory",
+            MFD_CLOEXEC | MFD_ALLOW_SEALING,
+        )
+    except (AttributeError, OSError) as error:
+        raise HandoffFailure("DEVICE_UNAVAILABLE") from error
+    try:
+        offset = 0
+        while offset < len(payload):
+            written = os.write(descriptor, payload[offset:])
+            if written <= 0:
+                raise OSError("short UUID inventory write")
+            offset += written
+        os.fchmod(descriptor, 0o400)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        fcntl.fcntl(descriptor, F_ADD_SEALS, UUID_INVENTORY_SEALS)
+        _assert_uuid_inventory_fd(descriptor, payload)
+    except Exception:
+        os.close(descriptor)
+        raise
+    return (
+        descriptor,
+        {
+            "schema": UUID_INVENTORY_SCHEMA,
+            "entryCount": len(uuids),
+            "byteLength": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        },
+    )
+
+
+class _GlibcMountApi:
+    def __init__(self) -> None:
+        try:
+            library = ctypes.CDLL(None, use_errno=True)
+            self.fsopen = library.fsopen
+            self.fsconfig = library.fsconfig
+            self.fsmount = library.fsmount
+            self.fstatfs = library.fstatfs
+        except (AttributeError, OSError) as error:
+            raise HandoffFailure("DEVICE_UNAVAILABLE") from error
+        self.fsopen.argtypes = [ctypes.c_char_p, ctypes.c_uint]
+        self.fsopen.restype = ctypes.c_int
+        self.fsconfig.argtypes = [
+            ctypes.c_int,
+            ctypes.c_uint,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_int,
+        ]
+        self.fsconfig.restype = ctypes.c_int
+        self.fsmount.argtypes = [ctypes.c_int, ctypes.c_uint, ctypes.c_uint]
+        self.fsmount.restype = ctypes.c_int
+        self.fstatfs.argtypes = [ctypes.c_int, ctypes.c_void_p]
+        self.fstatfs.restype = ctypes.c_int
+
+
+def _checked_mount_call(function: object, *arguments: object) -> int:
+    if not callable(function):
+        raise HandoffFailure("DEVICE_UNAVAILABLE")
+    ctypes.set_errno(0)
+    result = int(function(*arguments))
+    if result < 0:
+        code = ctypes.get_errno() or errno.EIO
+        raise OSError(code, "Linux mount API call failed")
+    return result
+
+
+def _configured_ext4_context(
+    api: _GlibcMountApi, leaf_descriptor: int, create_command: int
+) -> int:
+    context = _checked_mount_call(api.fsopen, b"ext4", FSOPEN_CLOEXEC)
+    try:
+        source = f"/proc/self/fd/{leaf_descriptor}".encode("ascii")
+        _checked_mount_call(
+            api.fsconfig,
+            context,
+            FSCONFIG_SET_STRING,
+            b"source",
+            source,
+            0,
+        )
+        _checked_mount_call(
+            api.fsconfig, context, FSCONFIG_SET_FLAG, b"ro", None, 0
+        )
+        _checked_mount_call(
+            api.fsconfig, context, FSCONFIG_SET_FLAG, b"noload", None, 0
+        )
+        _checked_mount_call(api.fsconfig, context, create_command, None, None, 0)
+        return context
+    except Exception:
+        os.close(context)
+        raise
+
+
+def _ext4_super_magic(api: _GlibcMountApi, descriptor: int) -> int:
+    # f_type is the first native long in every Linux struct statfs ABI.  A
+    # deliberately oversized writable buffer avoids mirroring the remaining
+    # architecture-dependent structure in Python.
+    buffer = ctypes.create_string_buffer(512)
+    _checked_mount_call(api.fstatfs, descriptor, ctypes.byref(buffer))
+    return int(ctypes.c_long.from_buffer(buffer).value)
+
+
+def _assert_detached_ext4_mount_fd(
+    descriptor: int,
+    leaf_major: int,
+    leaf_minor: int,
+    *,
+    api: _GlibcMountApi | None = None,
+) -> None:
+    mount_api = _GlibcMountApi() if api is None else api
+    metadata = os.fstat(descriptor)
+    fd_flags = fcntl.fcntl(descriptor, fcntl.F_GETFD)
+    status = fcntl.fcntl(descriptor, fcntl.F_GETFL)
+    filesystem = os.fstatvfs(descriptor)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_dev != os.makedev(leaf_major, leaf_minor)
+        or not fd_flags & fcntl.FD_CLOEXEC
+        or status & os.O_PATH != os.O_PATH
+        or _ext4_super_magic(mount_api, descriptor) != EXT4_SUPER_MAGIC
+        or filesystem.f_flag & REQUIRED_MOUNT_ATTRIBUTES
+        != REQUIRED_MOUNT_ATTRIBUTES
+    ):
+        raise HandoffFailure("DEVICE_UNAVAILABLE")
+
+
+def _create_detached_ext4_mount(
+    leaf_descriptor: int, leaf_major: int, leaf_minor: int
+) -> int:
+    api = _GlibcMountApi()
+    try:
+        context = _configured_ext4_context(
+            api, leaf_descriptor, FSCONFIG_CMD_CREATE_EXCL
+        )
+    except OSError as error:
+        raise HandoffFailure("DEVICE_UNAVAILABLE") from error
+    try:
+        descriptor = _checked_mount_call(
+            api.fsmount,
+            context,
+            FSMOUNT_CLOEXEC,
+            REQUIRED_MOUNT_ATTRIBUTES,
+        )
+    except OSError as error:
+        raise HandoffFailure("DEVICE_UNAVAILABLE") from error
+    finally:
+        os.close(context)
+    try:
+        _assert_detached_ext4_mount_fd(
+            descriptor, leaf_major, leaf_minor, api=api
+        )
+    except Exception:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _close_descriptors(descriptors: list[int]) -> None:
+    while descriptors:
+        descriptor = descriptors.pop()
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
 def _observed_inventory_fingerprint(
     targets: object, deadline: float, request_id: str
-) -> str:
+) -> tuple[str, tuple[str, ...]]:
     observations = targets.inventory(deadline=deadline)
     if not isinstance(observations, list):
         raise HandoffFailure("TARGET_UNAVAILABLE", request_id)
@@ -552,7 +1089,7 @@ def _observed_inventory_fingerprint(
         or _TARGET_FINGERPRINT.fullmatch(fingerprint) is None
     ):
         raise HandoffFailure("INTERNAL", request_id)
-    return fingerprint
+    return fingerprint, _uuid_inventory_from_observations(observations, request_id)
 
 
 def _recompute_target_fingerprint(
@@ -576,87 +1113,293 @@ def _recompute_target_fingerprint(
     return fingerprint
 
 
+def _ensure_deadline(deadline: float, request_id: str) -> None:
+    if time.monotonic() >= deadline:
+        raise HandoffFailure("TARGET_UNAVAILABLE", request_id)
+
+
+def _open_block_pair(
+    leaf_major_minor: str,
+    leaf_major: int,
+    leaf_minor: int,
+    parent_major_minor: str,
+    parent_major: int,
+    parent_minor: int,
+    request_id: str,
+) -> list[int]:
+    if _mountinfo_has_device(leaf_major_minor) or _mountinfo_has_device(
+        parent_major_minor
+    ):
+        raise HandoffFailure("TARGET_UNSUPPORTED", request_id)
+    descriptors: list[int] = []
+    try:
+        descriptors.append(
+            _open_bound_block_device(leaf_major_minor, leaf_major, leaf_minor)
+        )
+        descriptors.append(
+            _open_bound_block_device(parent_major_minor, parent_major, parent_minor)
+        )
+        _assert_block_fd(descriptors[0], leaf_major, leaf_minor)
+        _assert_block_fd(descriptors[1], parent_major, parent_minor)
+    except Exception:
+        _close_descriptors(descriptors)
+        raise
+    return descriptors
+
+
+def _revalidate_block_pair(
+    descriptors: list[int],
+    leaf_major_minor: str,
+    leaf_major: int,
+    leaf_minor: int,
+    parent_major_minor: str,
+    parent_major: int,
+    parent_minor: int,
+    request_id: str,
+) -> None:
+    if len(descriptors) < 2:
+        raise HandoffFailure("DEVICE_UNAVAILABLE", request_id)
+    _assert_block_fd(descriptors[0], leaf_major, leaf_minor)
+    _assert_block_fd(descriptors[1], parent_major, parent_minor)
+    if _mountinfo_has_device(leaf_major_minor) or _mountinfo_has_device(
+        parent_major_minor
+    ):
+        raise HandoffFailure("TARGET_CHANGED", request_id)
+
+
+def _complete_read_only_bundle(
+    descriptors: list[int],
+    uuids: tuple[str, ...],
+    leaf_major_minor: str,
+    leaf_major: int,
+    leaf_minor: int,
+    parent_major_minor: str,
+    parent_major: int,
+    parent_minor: int,
+    leaf_size_bytes: int,
+    parent_size_bytes: int,
+    deadline: float,
+    request_id: str,
+) -> tuple[dict[str, object], dict[str, int]]:
+    _ensure_deadline(deadline, request_id)
+    uuid_descriptor, uuid_metadata = _create_uuid_inventory_memfd(uuids)
+    descriptors.append(uuid_descriptor)
+    _ensure_deadline(deadline, request_id)
+    descriptors.append(
+        _create_detached_ext4_mount(descriptors[0], leaf_major, leaf_minor)
+    )
+    _ensure_deadline(deadline, request_id)
+    _revalidate_block_pair(
+        descriptors,
+        leaf_major_minor,
+        leaf_major,
+        leaf_minor,
+        parent_major_minor,
+        parent_major,
+        parent_minor,
+        request_id,
+    )
+    _assert_uuid_inventory_fd(descriptors[2], _uuid_inventory_payload(uuids))
+    _assert_detached_ext4_mount_fd(descriptors[3], leaf_major, leaf_minor)
+    physical_parent_claims = _probe_physical_parent_claims(
+        descriptors[0],
+        descriptors[1],
+        leaf_size_bytes,
+        parent_size_bytes,
+        parent_major,
+        parent_minor,
+    )
+    parent_identity = _open_bound_block_identity(parent_major, parent_minor)
+    try:
+        _assert_block_identity_fd(parent_identity, parent_major, parent_minor)
+    except Exception:
+        os.close(parent_identity)
+        raise
+    parent_readable = descriptors[1]
+    descriptors[1] = parent_identity
+    os.close(parent_readable)
+    return uuid_metadata, physical_parent_claims
+
+
+def _descriptor_manifest() -> list[dict[str, object]]:
+    return [
+        {"index": index, "type": descriptor_type}
+        for index, descriptor_type in enumerate(BUNDLE_DESCRIPTOR_TYPES)
+    ]
+
+
+def _revalidate_final_bundle(
+    descriptors: list[int],
+    uuids: tuple[str, ...],
+    claims: dict[str, int],
+    leaf_major_minor: str,
+    leaf_major: int,
+    leaf_minor: int,
+    parent_major_minor: str,
+    parent_major: int,
+    parent_minor: int,
+    request_id: str,
+) -> None:
+    claims = _validate_physical_parent_claims_wire(claims)
+    if len(descriptors) != len(BUNDLE_DESCRIPTOR_TYPES):
+        raise HandoffFailure("DEVICE_UNAVAILABLE", request_id)
+    _assert_block_fd(descriptors[0], leaf_major, leaf_minor)
+    _assert_block_identity_fd(descriptors[1], parent_major, parent_minor)
+    if (
+        _probe_u64(descriptors[0], BLKGETDISKSEQ) != claims["diskSequence"]
+        or _probe_u64(descriptors[0], BLKGETSIZE64)
+        != claims["leafSectorCount"] * KERNEL_SECTOR_BYTES
+        or _probe_u32(descriptors[0], BLKSSZGET)
+        != claims["logicalSectorBytes"]
+        or claims["parentMajor"] != parent_major
+        or claims["parentMinor"] != parent_minor
+        or claims["leafSectorCount"] > claims["mediaSectorCount"]
+        or _mountinfo_has_device(leaf_major_minor)
+        or _mountinfo_has_device(parent_major_minor)
+    ):
+        raise HandoffFailure("TARGET_CHANGED", request_id)
+    _assert_uuid_inventory_fd(descriptors[2], _uuid_inventory_payload(uuids))
+    _assert_detached_ext4_mount_fd(descriptors[3], leaf_major, leaf_minor)
+
+
 class RepairTargetHandoff:
     def __init__(self, targets: object | None = None) -> None:
         self.targets = _load_target_module() if targets is None else targets
 
-    def acquire(self, request: dict[str, str]) -> tuple[dict[str, object], int]:
+    def acquire(self, request: dict[str, str]) -> tuple[dict[str, object], list[int]]:
         if request.get("operation") == RECOVERY_OPERATION:
             return self._recover(request)
         return self._acquire_selected(request)
 
     def _acquire_selected(
         self, request: dict[str, str]
-    ) -> tuple[dict[str, object], int]:
+    ) -> tuple[dict[str, object], list[int]]:
         request_id = request["requestId"]
         reference = {
             "scanFingerprint": request["scanFingerprint"],
             "targetId": request["targetId"],
         }
         deadline = time.monotonic() + IO_TIMEOUT_SECONDS
+        descriptors: list[int] = []
         try:
             selection_a, resolution_a = self.targets.resolve_installed_target(
                 reference, deadline=deadline
             )
-            recovery_fingerprint_a, major_minor, major, minor = _qualify(
+            qualified_a = _qualify(
                 self.targets, request, selection_a, resolution_a
             )
-            if _mountinfo_has_device(major_minor):
-                raise HandoffFailure("TARGET_UNSUPPORTED", request_id)
-            descriptor = _open_bound_block_device(major_minor, major, minor)
-            try:
-                runtime_fingerprint = _observed_inventory_fingerprint(
-                    self.targets, deadline, request_id
-                )
-                selection_b, resolution_b = self.targets.resolve_installed_target(
-                    reference, deadline=deadline
-                )
-                recovery_fingerprint_b, _major_minor_b, _major_b, _minor_b = _qualify(
-                    self.targets, request, selection_b, resolution_b
-                )
-                if (
-                    self.targets.canonical_target_selection(selection_a)
-                    != self.targets.canonical_target_selection(selection_b)
-                    or _canonical(resolution_a) != _canonical(resolution_b)
-                    or recovery_fingerprint_a != recovery_fingerprint_b
-                ):
-                    raise HandoffFailure("TARGET_CHANGED", request_id)
-                candidate_a = resolution_a.get("candidate")
-                candidate_b = resolution_b.get("candidate")
-                if not isinstance(candidate_a, dict) or not isinstance(
-                    candidate_b, dict
-                ):
-                    raise HandoffFailure("INTERNAL", request_id)
-                fingerprint_a = _recompute_target_fingerprint(
-                    self.targets,
-                    runtime_fingerprint,
-                    request["scanFingerprint"],
-                    candidate_a,
-                    request_id,
-                )
-                fingerprint_b = _recompute_target_fingerprint(
-                    self.targets,
-                    runtime_fingerprint,
-                    request["scanFingerprint"],
-                    candidate_b,
-                    request_id,
-                )
-                if (
-                    fingerprint_a != fingerprint_b
-                    or fingerprint_a != request["targetFingerprint"]
-                ):
-                    raise HandoffFailure("TARGET_CHANGED", request_id)
-                _assert_block_fd(descriptor, major, minor)
-                if _mountinfo_has_device(major_minor):
-                    raise HandoffFailure("TARGET_CHANGED", request_id)
-            except Exception:
-                os.close(descriptor)
-                raise
+            (
+                recovery_fingerprint_a,
+                major_minor,
+                major,
+                minor,
+                parent_major_minor,
+                parent_major,
+                parent_minor,
+                leaf_size_bytes,
+                parent_size_bytes,
+            ) = qualified_a
+            descriptors = _open_block_pair(
+                major_minor,
+                major,
+                minor,
+                parent_major_minor,
+                parent_major,
+                parent_minor,
+                request_id,
+            )
+            runtime_fingerprint, uuids = _observed_inventory_fingerprint(
+                self.targets, deadline, request_id
+            )
+            selection_b, resolution_b = self.targets.resolve_installed_target(
+                reference, deadline=deadline
+            )
+            qualified_b = _qualify(self.targets, request, selection_b, resolution_b)
+            if (
+                self.targets.canonical_target_selection(selection_a)
+                != self.targets.canonical_target_selection(selection_b)
+                or _canonical(resolution_a) != _canonical(resolution_b)
+                or qualified_a != qualified_b
+            ):
+                raise HandoffFailure("TARGET_CHANGED", request_id)
+            candidate_a = resolution_a.get("candidate")
+            candidate_b = resolution_b.get("candidate")
+            if not isinstance(candidate_a, dict) or not isinstance(candidate_b, dict):
+                raise HandoffFailure("INTERNAL", request_id)
+            fingerprint_a = _recompute_target_fingerprint(
+                self.targets,
+                runtime_fingerprint,
+                request["scanFingerprint"],
+                candidate_a,
+                request_id,
+            )
+            fingerprint_b = _recompute_target_fingerprint(
+                self.targets,
+                runtime_fingerprint,
+                request["scanFingerprint"],
+                candidate_b,
+                request_id,
+            )
+            if (
+                fingerprint_a != fingerprint_b
+                or fingerprint_a != request["targetFingerprint"]
+            ):
+                raise HandoffFailure("TARGET_CHANGED", request_id)
+            _revalidate_block_pair(
+                descriptors,
+                major_minor,
+                major,
+                minor,
+                parent_major_minor,
+                parent_major,
+                parent_minor,
+                request_id,
+            )
+            uuid_metadata, physical_parent_claims = _complete_read_only_bundle(
+                descriptors,
+                uuids,
+                major_minor,
+                major,
+                minor,
+                parent_major_minor,
+                parent_major,
+                parent_minor,
+                leaf_size_bytes,
+                parent_size_bytes,
+                deadline,
+                request_id,
+            )
+            _ensure_deadline(deadline, request_id)
+            selection_c, resolution_c = self.targets.resolve_installed_target(
+                reference, deadline=deadline
+            )
+            qualified_c = _qualify(self.targets, request, selection_c, resolution_c)
+            if (
+                self.targets.canonical_target_selection(selection_a)
+                != self.targets.canonical_target_selection(selection_c)
+                or _canonical(resolution_a) != _canonical(resolution_c)
+                or qualified_a != qualified_c
+            ):
+                raise HandoffFailure("TARGET_CHANGED", request_id)
+            _revalidate_final_bundle(
+                descriptors,
+                uuids,
+                physical_parent_claims,
+                major_minor,
+                major,
+                minor,
+                parent_major_minor,
+                parent_major,
+                parent_minor,
+                request_id,
+            )
         except HandoffFailure as error:
+            _close_descriptors(descriptors)
             if error.request_id is None:
                 error.request_id = request_id
             raise
         except Exception as error:
+            _close_descriptors(descriptors)
             target_errors = tuple(
                 error_type
                 for error_type in (
@@ -680,107 +1423,161 @@ class RepairTargetHandoff:
                 "targetId": request["targetId"],
                 "recoveryFingerprint": recovery_fingerprint_a,
                 "outcome": "ok",
-                "capability": "linux-ext4-direct-leaf-readonly-block-v1",
-                "descriptor": {
-                    "type": "selected-target-block-readonly",
-                    "count": 1,
-                },
+                "capability": BUNDLE_CAPABILITY,
+                "descriptors": _descriptor_manifest(),
+                "physicalParentClaims": physical_parent_claims,
+                "uuidInventory": uuid_metadata,
             },
-            descriptor,
+            descriptors,
         )
 
-    def _recover(self, request: dict[str, str]) -> tuple[dict[str, object], int]:
+    def _recover(
+        self, request: dict[str, str]
+    ) -> tuple[dict[str, object], list[int]]:
         request_id = request["requestId"]
         recovery_fingerprint = request["recoveryFingerprint"]
         reference = {"recoveryFingerprint": recovery_fingerprint}
         deadline = time.monotonic() + IO_TIMEOUT_SECONDS
+        descriptors: list[int] = []
         try:
             selection_a, resolution_a = self.targets.resolve_recovery_target(
                 reference, deadline=deadline
             )
-            (
-                recovery_fingerprint_a,
-                major_minor,
-                major,
-                minor,
-            ) = _qualify(
+            qualified_a = _qualify(
                 self.targets,
                 request,
                 selection_a,
                 resolution_a,
                 expected_recovery_fingerprint=recovery_fingerprint,
             )
-            if _mountinfo_has_device(major_minor):
-                raise HandoffFailure("TARGET_UNSUPPORTED", request_id)
-            descriptor = _open_bound_block_device(major_minor, major, minor)
+            (
+                recovery_fingerprint_a,
+                major_minor,
+                major,
+                minor,
+                parent_major_minor,
+                parent_major,
+                parent_minor,
+                leaf_size_bytes,
+                parent_size_bytes,
+            ) = qualified_a
+            descriptors = _open_block_pair(
+                major_minor,
+                major,
+                minor,
+                parent_major_minor,
+                parent_major,
+                parent_minor,
+                request_id,
+            )
             try:
-                runtime_fingerprint = _observed_inventory_fingerprint(
+                runtime_fingerprint, uuids = _observed_inventory_fingerprint(
                     self.targets, deadline, request_id
                 )
-                try:
-                    selection_b, resolution_b = self.targets.resolve_recovery_target(
-                        reference, deadline=deadline
-                    )
-                    (
-                        recovery_fingerprint_b,
-                        _major_minor_b,
-                        _major_b,
-                        _minor_b,
-                    ) = _qualify(
-                        self.targets,
-                        request,
-                        selection_b,
-                        resolution_b,
-                        expected_recovery_fingerprint=recovery_fingerprint,
-                    )
-                except Exception as error:
-                    raise HandoffFailure("TARGET_CHANGED", request_id) from error
-                if (
-                    self.targets.canonical_target_selection(selection_a)
-                    != self.targets.canonical_target_selection(selection_b)
-                    or _canonical(resolution_a) != _canonical(resolution_b)
-                    or recovery_fingerprint_a != recovery_fingerprint_b
-                ):
-                    raise HandoffFailure("TARGET_CHANGED", request_id)
-                candidate_a = resolution_a.get("candidate")
-                candidate_b = resolution_b.get("candidate")
-                if not isinstance(candidate_a, dict) or not isinstance(
-                    candidate_b, dict
-                ):
-                    raise HandoffFailure("INTERNAL", request_id)
-                scan_fingerprint = selection_a.get("scanFingerprint")
-                target_id = candidate_a.get("targetId")
-                if not isinstance(scan_fingerprint, str) or not isinstance(
-                    target_id, str
-                ):
-                    raise HandoffFailure("INTERNAL", request_id)
-                fingerprint_a = _recompute_target_fingerprint(
-                    self.targets,
-                    runtime_fingerprint,
-                    scan_fingerprint,
-                    candidate_a,
-                    request_id,
+                selection_b, resolution_b = self.targets.resolve_recovery_target(
+                    reference, deadline=deadline
                 )
-                fingerprint_b = _recompute_target_fingerprint(
+                qualified_b = _qualify(
                     self.targets,
-                    runtime_fingerprint,
-                    scan_fingerprint,
-                    candidate_b,
-                    request_id,
+                    request,
+                    selection_b,
+                    resolution_b,
+                    expected_recovery_fingerprint=recovery_fingerprint,
                 )
-                if fingerprint_a != fingerprint_b:
-                    raise HandoffFailure("TARGET_CHANGED", request_id)
-                _assert_block_fd(descriptor, major, minor)
-                if _mountinfo_has_device(major_minor):
-                    raise HandoffFailure("TARGET_CHANGED", request_id)
-            except Exception:
-                os.close(descriptor)
-                raise
+            except Exception as error:
+                raise HandoffFailure("TARGET_CHANGED", request_id) from error
+            if (
+                self.targets.canonical_target_selection(selection_a)
+                != self.targets.canonical_target_selection(selection_b)
+                or _canonical(resolution_a) != _canonical(resolution_b)
+                or qualified_a != qualified_b
+            ):
+                raise HandoffFailure("TARGET_CHANGED", request_id)
+            candidate_a = resolution_a.get("candidate")
+            candidate_b = resolution_b.get("candidate")
+            if not isinstance(candidate_a, dict) or not isinstance(candidate_b, dict):
+                raise HandoffFailure("INTERNAL", request_id)
+            scan_fingerprint = selection_a.get("scanFingerprint")
+            target_id = candidate_a.get("targetId")
+            if not isinstance(scan_fingerprint, str) or not isinstance(target_id, str):
+                raise HandoffFailure("INTERNAL", request_id)
+            fingerprint_a = _recompute_target_fingerprint(
+                self.targets,
+                runtime_fingerprint,
+                scan_fingerprint,
+                candidate_a,
+                request_id,
+            )
+            fingerprint_b = _recompute_target_fingerprint(
+                self.targets,
+                runtime_fingerprint,
+                scan_fingerprint,
+                candidate_b,
+                request_id,
+            )
+            if fingerprint_a != fingerprint_b:
+                raise HandoffFailure("TARGET_CHANGED", request_id)
+            _revalidate_block_pair(
+                descriptors,
+                major_minor,
+                major,
+                minor,
+                parent_major_minor,
+                parent_major,
+                parent_minor,
+                request_id,
+            )
+            uuid_metadata, physical_parent_claims = _complete_read_only_bundle(
+                descriptors,
+                uuids,
+                major_minor,
+                major,
+                minor,
+                parent_major_minor,
+                parent_major,
+                parent_minor,
+                leaf_size_bytes,
+                parent_size_bytes,
+                deadline,
+                request_id,
+            )
+            _ensure_deadline(deadline, request_id)
+            selection_c, resolution_c = self.targets.resolve_recovery_target(
+                reference, deadline=deadline
+            )
+            qualified_c = _qualify(
+                self.targets,
+                request,
+                selection_c,
+                resolution_c,
+                expected_recovery_fingerprint=recovery_fingerprint,
+            )
+            if (
+                self.targets.canonical_target_selection(selection_a)
+                != self.targets.canonical_target_selection(selection_c)
+                or _canonical(resolution_a) != _canonical(resolution_c)
+                or qualified_a != qualified_c
+            ):
+                raise HandoffFailure("TARGET_CHANGED", request_id)
+            _revalidate_final_bundle(
+                descriptors,
+                uuids,
+                physical_parent_claims,
+                major_minor,
+                major,
+                minor,
+                parent_major_minor,
+                parent_major,
+                parent_minor,
+                request_id,
+            )
         except HandoffFailure as error:
+            _close_descriptors(descriptors)
             if error.request_id is None:
                 error.request_id = request_id
             raise
         except Exception as error:
+            _close_descriptors(descriptors)
             target_errors = tuple(
                 error_type
                 for error_type in (
@@ -804,13 +1601,12 @@ class RepairTargetHandoff:
                 "targetId": target_id,
                 "recoveryFingerprint": recovery_fingerprint_a,
                 "outcome": "ok",
-                "capability": "linux-ext4-direct-leaf-readonly-block-v1",
-                "descriptor": {
-                    "type": "selected-target-block-readonly",
-                    "count": 1,
-                },
+                "capability": BUNDLE_CAPABILITY,
+                "descriptors": _descriptor_manifest(),
+                "physicalParentClaims": physical_parent_claims,
+                "uuidInventory": uuid_metadata,
             },
-            descriptor,
+            descriptors,
         )
 
 
@@ -839,21 +1635,49 @@ def _received_record(connection: socket.socket) -> bytes:
 def _send_record(
     connection: socket.socket,
     response: dict[str, object],
-    descriptor: int | None,
+    descriptors: list[int],
 ) -> None:
     encoded = _canonical(response)
-    if len(encoded) > MAX_RESPONSE_BYTES:
+    if len(encoded) >= MAX_RESPONSE_BYTES:
+        request_id = response.get("requestId")
+        raise HandoffFailure(
+            "INTERNAL", request_id if isinstance(request_id, str) else None
+        )
+    success = response.get("outcome") == "ok"
+    if success:
+        claims = _validate_physical_parent_claims_wire(
+            response.get("physicalParentClaims")
+        )
+        if (
+            response.get("capability") != BUNDLE_CAPABILITY
+            or response.get("descriptors") != _descriptor_manifest()
+            or len(descriptors) != len(BUNDLE_DESCRIPTOR_TYPES)
+            or len(set(descriptors)) != len(descriptors)
+            or any(
+                not isinstance(item, int) or isinstance(item, bool)
+                for item in descriptors
+            )
+        ):
+            request_id = response.get("requestId")
+            raise HandoffFailure(
+                "INTERNAL", request_id if isinstance(request_id, str) else None
+            )
+        _assert_readonly_block_capability(descriptors[0])
+        _assert_block_identity_fd(
+            descriptors[1], claims["parentMajor"], claims["parentMinor"]
+        )
+    elif descriptors:
         request_id = response.get("requestId")
         raise HandoffFailure(
             "INTERNAL", request_id if isinstance(request_id, str) else None
         )
     ancillary = []
-    if descriptor is not None:
+    if descriptors:
         ancillary = [
             (
                 socket.SOL_SOCKET,
                 socket.SCM_RIGHTS,
-                array.array("i", [descriptor]).tobytes(),
+                array.array("i", descriptors).tobytes(),
             )
         ]
     if connection.sendmsg([encoded], ancillary) != len(encoded):
@@ -867,7 +1691,7 @@ def serve_connection(
     *,
     expected_local: str | None = SOCKET_PATH,
 ) -> None:
-    descriptor: int | None = None
+    descriptors: list[int] = []
     request: dict[str, str] | None = None
     try:
         _validate_peer(connection, expected_peer_uid, expected_local=expected_local)
@@ -875,8 +1699,8 @@ def serve_connection(
         return
     try:
         request = _decode_request(_received_record(connection))
-        response, descriptor = (service or RepairTargetHandoff()).acquire(request)
-        _send_record(connection, response, descriptor)
+        response, descriptors = (service or RepairTargetHandoff()).acquire(request)
+        _send_record(connection, response, descriptors)
     except HandoffFailure as error:
         if error.request_id is None:
             return
@@ -895,7 +1719,7 @@ def serve_connection(
             "error": error.token,
         }
         try:
-            _send_record(connection, response, None)
+            _send_record(connection, response, [])
         except (HandoffFailure, OSError):
             pass
     except Exception:
@@ -911,13 +1735,12 @@ def serve_connection(
                     "outcome": "error",
                     "error": "INTERNAL",
                 },
-                None,
+                [],
             )
         except (HandoffFailure, OSError):
             pass
     finally:
-        if descriptor is not None:
-            os.close(descriptor)
+        _close_descriptors(descriptors)
 
 
 def _systemd_connection() -> socket.socket:

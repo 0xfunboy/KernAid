@@ -41,10 +41,12 @@ ProtectClock=yes
 ProtectHostname=yes
 ProtectProc=invisible
 ProcSubset=pid
-ReadOnlyPaths=/run
+ReadOnlyPaths=/run /dev
 DevicePolicy=closed
 DeviceAllow=block-* r
-CapabilityBoundingSet=
+# Only this root-owned, socket-activated handoff may create the detached
+# read-only ext4 mount which is transferred to the unprivileged repair daemon.
+CapabilityBoundingSet=CAP_SYS_ADMIN
 AmbientCapabilities=
 RestrictAddressFamilies=AF_UNIX
 RestrictNamespaces=yes
@@ -53,5 +55,7 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
+SystemCallFilter=@system-service fsopen fsconfig fsmount
+SystemCallErrorNumber=EPERM
 KeyringMode=private
 RemoveIPC=yes

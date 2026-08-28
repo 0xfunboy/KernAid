@@ -2,15 +2,16 @@
 //!
 //! The normal wire request contains only boot-ephemeral opaque identifiers;
 //! the recovery request contains only one reboot-stable opaque digest. A
-//! successful response carries exactly one read-only block descriptor and
-//! fresh path-free identity claims. This module never mounts or writes.
+//! successful response carries one closed, ordered bundle: the selected leaf,
+//! its physical parent, a sealed UUID inventory, and a detached read-only ext4
+//! mount. This module never opens a device path, mounts, or writes.
 
 use kernaid_protocol::{
     rescue_vault::RequestId, rescue_vault_transport::authenticate_root_seqpacket_server,
 };
 use rustix::{
     event::{PollFd, PollFlags, Timespec, poll},
-    fs::{self as rfs, FileType, OFlags},
+    fs::{self as rfs, FileType, OFlags, SealFlags, SeekFrom, StatVfsMountFlags},
     net::{
         AddressFamily, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags,
         SendAncillaryBuffer, SendFlags, SocketAddrUnix, SocketFlags, SocketType, connect, recvmsg,
@@ -18,7 +19,9 @@ use rustix::{
     },
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeSet,
     fmt,
     io::{IoSlice, IoSliceMut},
     mem::MaybeUninit,
@@ -27,12 +30,24 @@ use std::{
 };
 
 const TARGET_CAPABILITY_SOCKET: &str = "/run/kernaid-rescue-target-capability.sock";
-const API_VERSION: &str = "kernaid.dev/rescue-target-capability/v1alpha1";
+const API_VERSION: &str = "kernaid.dev/rescue-target-capability/v1alpha2";
 const ACQUIRE_OPERATION: &str = "target.readonly.acquire";
 const RECOVERY_OPERATION: &str = "target.recovery.readonly.acquire";
-const CAPABILITY_TYPE: &str = "linux-ext4-direct-leaf-readonly-block-v1";
-const DESCRIPTOR_TYPE: &str = "selected-target-block-readonly";
-const MAX_FRAME_BYTES: usize = 1_024;
+const CAPABILITY_TYPE: &str = "linux-ext4-direct-leaf-readonly-bundle-v2";
+const DESCRIPTOR_TYPES: [&str; 4] = [
+    "selected-target-block-readonly",
+    "physical-parent-block-identity-path",
+    "uuid-inventory-memfd-sealed",
+    "selected-target-ext4-mount-readonly-detached",
+];
+const UUID_INVENTORY_SCHEMA: &str = "kernaid.dev/rescue-uuid-inventory/v1";
+const MAX_UUID_INVENTORY_ENTRIES: usize = 4_096;
+const MAX_UUID_BYTES: usize = 128;
+const MAX_UUID_INVENTORY_BYTES: usize = 536_635;
+const EXT_SUPER_MAGIC: u64 = 0xef53;
+const TMPFS_MAGIC: u64 = 0x0102_1994;
+const MAX_REQUEST_FRAME_BYTES: usize = 1_024;
+const MAX_RESPONSE_FRAME_BYTES: usize = 2_048;
 const MAX_OPAQUE_ID_BYTES: usize = 128;
 
 /// Sanitized target-capability failures. No variant can carry peer text, a
@@ -53,7 +68,11 @@ pub enum TargetCapabilityClientError {
     DescriptorCountMismatch,
     DescriptorNotCloseOnExec,
     DescriptorNotReadOnly,
+    DescriptorNotNonblocking,
     DescriptorNotBlockDevice,
+    InvalidUuidInventoryDescriptor,
+    InvalidUuidInventory,
+    InvalidDetachedMount,
     CorrelationMismatch,
     ClaimsMismatch,
     TargetRejected(TargetCapabilityErrorToken),
@@ -76,7 +95,13 @@ impl fmt::Display for TargetCapabilityClientError {
             Self::DescriptorCountMismatch => "target capability descriptor count mismatch",
             Self::DescriptorNotCloseOnExec => "target capability descriptor is inheritable",
             Self::DescriptorNotReadOnly => "target capability descriptor is not read-only",
+            Self::DescriptorNotNonblocking => "target capability descriptor is not nonblocking",
             Self::DescriptorNotBlockDevice => "target capability descriptor is not a block device",
+            Self::InvalidUuidInventoryDescriptor => {
+                "invalid target capability UUID inventory descriptor"
+            }
+            Self::InvalidUuidInventory => "invalid target capability UUID inventory",
+            Self::InvalidDetachedMount => "invalid target capability detached mount",
             Self::CorrelationMismatch => "target capability response correlation mismatch",
             Self::ClaimsMismatch => "target capability response claims mismatch",
             Self::TargetRejected(_) => "target capability request rejected",
@@ -156,6 +181,11 @@ impl fmt::Debug for RescueTargetCapabilityClaims {
 /// block-device path or permits replacing the descriptor.
 pub struct RescueTargetReadOnlyCapability {
     block: OwnedFd,
+    physical_parent: OwnedFd,
+    uuid_inventory_descriptor: OwnedFd,
+    detached_mount: OwnedFd,
+    uuid_inventory: UuidInventory,
+    physical_parent_claims: PhysicalParentNumericClaims,
     claims: RescueTargetCapabilityClaims,
 }
 
@@ -170,16 +200,67 @@ impl RescueTargetReadOnlyCapability {
     pub fn block_descriptor(&self) -> BorrowedFd<'_> {
         self.block.as_fd()
     }
+
+    pub(crate) fn physical_parent_descriptor(&self) -> BorrowedFd<'_> {
+        self.physical_parent.as_fd()
+    }
+
+    pub(crate) fn detached_mount_descriptor(&self) -> BorrowedFd<'_> {
+        self.detached_mount.as_fd()
+    }
+
+    pub(crate) fn observed_uuids(&self) -> &BTreeSet<String> {
+        &self.uuid_inventory.uuids
+    }
+
+    pub(crate) const fn physical_parent_claims(&self) -> PhysicalParentNumericClaims {
+        self.physical_parent_claims
+    }
+
+    pub(crate) fn revalidate_bundle(&self) -> Result<(), TargetCapabilityClientError> {
+        let leaf = validate_block_descriptor(self.block.as_fd())?;
+        validate_parent_identity_descriptor(
+            self.physical_parent.as_fd(),
+            self.physical_parent_claims,
+        )?;
+        validate_uuid_inventory_descriptor(
+            self.uuid_inventory_descriptor.as_fd(),
+            &self.uuid_inventory.metadata,
+            Some(&self.uuid_inventory.uuids),
+        )?;
+        validate_detached_mount(self.detached_mount.as_fd(), leaf.rdev)
+    }
 }
 
 impl fmt::Debug for RescueTargetReadOnlyCapability {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("RescueTargetReadOnlyCapability")
-            .field("block", &"[owned read-only block capability]")
+            .field("block", &"[owned read-only leaf capability]")
+            .field(
+                "physical_parent",
+                &"[owned parent identity path capability]",
+            )
+            .field("uuid_inventory", &"[owned sealed inventory capability]")
+            .field("detached_mount", &"[owned detached read-only ext4 mount]")
             .field("claims", &self.claims)
             .finish()
     }
+}
+
+struct UuidInventory {
+    metadata: UuidInventoryMetadataWire,
+    uuids: BTreeSet<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PhysicalParentNumericClaims {
+    pub(crate) parent_major: u32,
+    pub(crate) parent_minor: u32,
+    pub(crate) disk_sequence: u64,
+    pub(crate) media_sector_count: u64,
+    pub(crate) logical_sector_bytes: u64,
+    pub(crate) leaf_sector_count: u64,
 }
 
 #[derive(Serialize)]
@@ -218,9 +299,36 @@ enum CapabilityOutcome {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct DescriptorWire {
+    index: u8,
     #[serde(rename = "type")]
     descriptor_type: String,
-    count: u8,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UuidInventoryMetadataWire {
+    schema: String,
+    entry_count: usize,
+    byte_length: usize,
+    sha256: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct UuidInventoryPayloadWire {
+    schema: String,
+    uuids: Vec<String>,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PhysicalParentClaimsWire {
+    parent_major: u32,
+    parent_minor: u32,
+    disk_sequence: u64,
+    media_sector_count: u64,
+    logical_sector_bytes: u64,
+    leaf_sector_count: u64,
 }
 
 #[derive(Deserialize)]
@@ -236,7 +344,9 @@ struct SuccessResponseWire {
     target_id: String,
     recovery_fingerprint: String,
     capability: String,
-    descriptor: DescriptorWire,
+    descriptors: Vec<DescriptorWire>,
+    physical_parent_claims: PhysicalParentClaimsWire,
+    uuid_inventory: UuidInventoryMetadataWire,
 }
 
 #[derive(Deserialize)]
@@ -318,7 +428,7 @@ pub fn acquire_rescue_target_capability(
     };
     let encoded =
         serde_json::to_vec(&request).map_err(|_| TargetCapabilityClientError::InvalidRequest)?;
-    if encoded.is_empty() || encoded.len() > MAX_FRAME_BYTES {
+    if encoded.is_empty() || encoded.len() > MAX_REQUEST_FRAME_BYTES {
         return Err(TargetCapabilityClientError::InvalidRequest);
     }
     send_frame(connection.as_fd(), &encoded, deadline)?;
@@ -361,7 +471,7 @@ pub fn reacquire_rescue_target_capability(
     };
     let encoded =
         serde_json::to_vec(&request).map_err(|_| TargetCapabilityClientError::InvalidRequest)?;
-    if encoded.is_empty() || encoded.len() > MAX_FRAME_BYTES {
+    if encoded.is_empty() || encoded.len() > MAX_REQUEST_FRAME_BYTES {
         return Err(TargetCapabilityClientError::InvalidRequest);
     }
     send_frame(connection.as_fd(), &encoded, deadline)?;
@@ -429,7 +539,7 @@ fn send_frame(
     frame: &[u8],
     deadline: Instant,
 ) -> Result<(), TargetCapabilityClientError> {
-    if frame.is_empty() || frame.len() > MAX_FRAME_BYTES {
+    if frame.is_empty() || frame.len() > MAX_REQUEST_FRAME_BYTES {
         return Err(TargetCapabilityClientError::FrameTooLarge);
     }
     let io = [IoSlice::new(frame)];
@@ -461,13 +571,13 @@ fn receive_frame(
     socket: BorrowedFd<'_>,
     deadline: Instant,
 ) -> Result<ReceivedFrame, TargetCapabilityClientError> {
-    let mut bytes = vec![0_u8; MAX_FRAME_BYTES + 1];
+    let mut bytes = vec![0_u8; MAX_RESPONSE_FRAME_BYTES + 1];
     let mut io = [IoSliceMut::new(&mut bytes)];
-    // Capacity for two rights detects an arity violation. Credentials are
-    // also representable so they can be explicitly rejected rather than
-    // silently accepted; excess control data causes MSG_CTRUNC.
+    // Capacity is deliberately n+1 for the four-FD success contract. A fifth
+    // right is materialized and rejected; still larger or mixed ancillary
+    // records cause MSG_CTRUNC or the explicit unexpected-record rejection.
     let mut control_space =
-        [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(2), ScmCredentials(1))];
+        [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(5), ScmCredentials(1))];
     let mut control = RecvAncillaryBuffer::new(&mut control_space);
     let message = loop {
         ensure_before(deadline)?;
@@ -491,9 +601,13 @@ fn receive_frame(
     // path, including MSG_CTRUNC and an oversized data record.
     let mut descriptors = Vec::new();
     let mut unexpected = false;
+    let mut rights_records = 0_u8;
     for ancillary in control.drain() {
         match ancillary {
-            RecvAncillaryMessage::ScmRights(rights) => descriptors.extend(rights),
+            RecvAncillaryMessage::ScmRights(rights) => {
+                rights_records = rights_records.saturating_add(1);
+                descriptors.extend(rights);
+            }
             RecvAncillaryMessage::ScmCredentials(_) => unexpected = true,
             _ => unexpected = true,
         }
@@ -502,16 +616,16 @@ fn receive_frame(
     if message.flags.contains(ReturnFlags::CTRUNC) {
         return Err(TargetCapabilityClientError::AncillaryTruncated);
     }
-    if message.flags.contains(ReturnFlags::TRUNC) || message.bytes > MAX_FRAME_BYTES {
+    if message.flags.contains(ReturnFlags::TRUNC) || message.bytes > MAX_RESPONSE_FRAME_BYTES {
         return Err(TargetCapabilityClientError::FrameTooLarge);
     }
     if message.bytes == 0 {
         return Err(TargetCapabilityClientError::InvalidFrame);
     }
-    if unexpected {
+    if unexpected || rights_records > 1 {
         return Err(TargetCapabilityClientError::UnexpectedAncillary);
     }
-    if descriptors.len() > 1 {
+    if descriptors.len() > DESCRIPTOR_TYPES.len() {
         return Err(TargetCapabilityClientError::DescriptorCountMismatch);
     }
 
@@ -556,24 +670,55 @@ fn decode_response(
                         && valid_prefixed_hash(&response.target_id, "target:")
                 }
             };
+            let manifest_matches = response.descriptors.len() == DESCRIPTOR_TYPES.len()
+                && response
+                    .descriptors
+                    .iter()
+                    .zip(DESCRIPTOR_TYPES)
+                    .enumerate()
+                    .all(|(index, (descriptor, expected_type))| {
+                        descriptor.index == u8::try_from(index).unwrap_or(u8::MAX)
+                            && descriptor.descriptor_type == expected_type
+                    });
             if !claims_match
                 || response.capability != CAPABILITY_TYPE
-                || response.descriptor.descriptor_type != DESCRIPTOR_TYPE
-                || response.descriptor.count != 1
+                || !manifest_matches
+                || response.uuid_inventory.schema != UUID_INVENTORY_SCHEMA
             {
                 return Err(TargetCapabilityClientError::ClaimsMismatch);
             }
-            let mut descriptors = received.descriptors;
-            let block = match descriptors.len() {
-                0 => return Err(TargetCapabilityClientError::DescriptorRequired),
-                1 => descriptors
-                    .pop()
-                    .ok_or(TargetCapabilityClientError::DescriptorRequired)?,
-                _ => return Err(TargetCapabilityClientError::DescriptorCountMismatch),
-            };
-            validate_block_descriptor(block.as_fd())?;
+            let physical_parent_claims =
+                validate_physical_parent_claims(&response.physical_parent_claims)?;
+            if received.descriptors.is_empty() {
+                return Err(TargetCapabilityClientError::DescriptorRequired);
+            }
+            let [
+                block,
+                physical_parent,
+                uuid_inventory_descriptor,
+                detached_mount,
+            ]: [OwnedFd; 4] = received
+                .descriptors
+                .try_into()
+                .map_err(|_| TargetCapabilityClientError::DescriptorCountMismatch)?;
+            let leaf = validate_block_descriptor(block.as_fd())?;
+            validate_parent_identity_descriptor(physical_parent.as_fd(), physical_parent_claims)?;
+            let uuids = validate_uuid_inventory_descriptor(
+                uuid_inventory_descriptor.as_fd(),
+                &response.uuid_inventory,
+                None,
+            )?;
+            validate_detached_mount(detached_mount.as_fd(), leaf.rdev)?;
             Ok(RescueTargetReadOnlyCapability {
                 block,
+                physical_parent,
+                uuid_inventory_descriptor,
+                detached_mount,
+                uuid_inventory: UuidInventory {
+                    metadata: response.uuid_inventory,
+                    uuids,
+                },
+                physical_parent_claims,
                 claims: RescueTargetCapabilityClaims {
                     request_id: response.request_id,
                     scan_fingerprint: response.scan_fingerprint,
@@ -600,9 +745,38 @@ fn decode_response(
     }
 }
 
+fn validate_physical_parent_claims(
+    claims: &PhysicalParentClaimsWire,
+) -> Result<PhysicalParentNumericClaims, TargetCapabilityClientError> {
+    if claims.disk_sequence == 0
+        || claims.media_sector_count == 0
+        || claims.leaf_sector_count == 0
+        || claims.leaf_sector_count > claims.media_sector_count
+        || !(512..=65_536).contains(&claims.logical_sector_bytes)
+        || !claims.logical_sector_bytes.is_power_of_two()
+        || claims.media_sector_count.checked_mul(512).is_none()
+        || claims.leaf_sector_count.checked_mul(512).is_none()
+    {
+        return Err(TargetCapabilityClientError::ClaimsMismatch);
+    }
+    Ok(PhysicalParentNumericClaims {
+        parent_major: claims.parent_major,
+        parent_minor: claims.parent_minor,
+        disk_sequence: claims.disk_sequence,
+        media_sector_count: claims.media_sector_count,
+        logical_sector_bytes: claims.logical_sector_bytes,
+        leaf_sector_count: claims.leaf_sector_count,
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BlockDescriptorSnapshot {
+    rdev: u64,
+}
+
 fn validate_block_descriptor(
     descriptor: BorrowedFd<'_>,
-) -> Result<(), TargetCapabilityClientError> {
+) -> Result<BlockDescriptorSnapshot, TargetCapabilityClientError> {
     let descriptor_flags = rustix::io::fcntl_getfd(descriptor)
         .map_err(|_| TargetCapabilityClientError::InvalidTransport)?;
     if descriptor_flags != rustix::io::FdFlags::CLOEXEC {
@@ -613,11 +787,155 @@ fn validate_block_descriptor(
     if status & OFlags::ACCMODE != OFlags::RDONLY {
         return Err(TargetCapabilityClientError::DescriptorNotReadOnly);
     }
+    if !status.contains(OFlags::NONBLOCK) {
+        return Err(TargetCapabilityClientError::DescriptorNotNonblocking);
+    }
     let stat = rfs::fstat(descriptor).map_err(|_| TargetCapabilityClientError::InvalidTransport)?;
     if !FileType::from_raw_mode(stat.st_mode).is_block_device() {
         return Err(TargetCapabilityClientError::DescriptorNotBlockDevice);
     }
+    Ok(BlockDescriptorSnapshot { rdev: stat.st_rdev })
+}
+
+fn validate_parent_identity_descriptor(
+    descriptor: BorrowedFd<'_>,
+    claims: PhysicalParentNumericClaims,
+) -> Result<(), TargetCapabilityClientError> {
+    let descriptor_flags = rustix::io::fcntl_getfd(descriptor)
+        .map_err(|_| TargetCapabilityClientError::InvalidTransport)?;
+    let status =
+        rfs::fcntl_getfl(descriptor).map_err(|_| TargetCapabilityClientError::InvalidTransport)?;
+    let stat = rfs::fstat(descriptor).map_err(|_| TargetCapabilityClientError::InvalidTransport)?;
+    if descriptor_flags != rustix::io::FdFlags::CLOEXEC
+        || !status.contains(OFlags::PATH)
+        || !FileType::from_raw_mode(stat.st_mode).is_block_device()
+        || rfs::major(stat.st_rdev) != claims.parent_major
+        || rfs::minor(stat.st_rdev) != claims.parent_minor
+    {
+        return Err(TargetCapabilityClientError::ClaimsMismatch);
+    }
     Ok(())
+}
+
+fn validate_uuid_inventory_descriptor(
+    descriptor: BorrowedFd<'_>,
+    metadata: &UuidInventoryMetadataWire,
+    expected: Option<&BTreeSet<String>>,
+) -> Result<BTreeSet<String>, TargetCapabilityClientError> {
+    let descriptor_flags = rustix::io::fcntl_getfd(descriptor)
+        .map_err(|_| TargetCapabilityClientError::InvalidUuidInventoryDescriptor)?;
+    let status = rfs::fcntl_getfl(descriptor)
+        .map_err(|_| TargetCapabilityClientError::InvalidUuidInventoryDescriptor)?;
+    let stat = rfs::fstat(descriptor)
+        .map_err(|_| TargetCapabilityClientError::InvalidUuidInventoryDescriptor)?;
+    let filesystem = rfs::fstatfs(descriptor)
+        .map_err(|_| TargetCapabilityClientError::InvalidUuidInventoryDescriptor)?;
+    let required_seals = SealFlags::WRITE | SealFlags::GROW | SealFlags::SHRINK | SealFlags::SEAL;
+    let seals = rfs::fcntl_get_seals(descriptor)
+        .map_err(|_| TargetCapabilityClientError::InvalidUuidInventoryDescriptor)?;
+    if descriptor_flags != rustix::io::FdFlags::CLOEXEC
+        || status & OFlags::ACCMODE != OFlags::RDWR
+        || !FileType::from_raw_mode(stat.st_mode).is_file()
+        || stat.st_uid != 0
+        || stat.st_gid != 0
+        || stat.st_mode & 0o7777 != 0o400
+        || stat.st_nlink != 0
+        || filesystem.f_type as u64 != TMPFS_MAGIC
+        || seals != required_seals
+        || rfs::seek(descriptor, SeekFrom::Current(0)).ok() != Some(0)
+        || metadata.schema != UUID_INVENTORY_SCHEMA
+        || !(1..=MAX_UUID_INVENTORY_ENTRIES).contains(&metadata.entry_count)
+        || !(1..=MAX_UUID_INVENTORY_BYTES).contains(&metadata.byte_length)
+        || usize::try_from(stat.st_size).ok() != Some(metadata.byte_length)
+        || !valid_raw_sha256(&metadata.sha256)
+    {
+        return Err(TargetCapabilityClientError::InvalidUuidInventoryDescriptor);
+    }
+
+    let mut bytes = vec![0_u8; metadata.byte_length + 1];
+    let read = rustix::io::pread(descriptor, bytes.as_mut_slice(), 0)
+        .map_err(|_| TargetCapabilityClientError::InvalidUuidInventoryDescriptor)?;
+    bytes.truncate(read);
+    if bytes.len() != metadata.byte_length
+        || format!("{:x}", Sha256::digest(&bytes)) != metadata.sha256
+    {
+        return Err(TargetCapabilityClientError::InvalidUuidInventory);
+    }
+    validate_uuid_inventory_payload(&bytes, metadata, expected)
+}
+
+fn validate_uuid_inventory_payload(
+    bytes: &[u8],
+    metadata: &UuidInventoryMetadataWire,
+    expected: Option<&BTreeSet<String>>,
+) -> Result<BTreeSet<String>, TargetCapabilityClientError> {
+    let payload: UuidInventoryPayloadWire = serde_json::from_slice(bytes)
+        .map_err(|_| TargetCapabilityClientError::InvalidUuidInventory)?;
+    let canonical = serde_json::to_vec(&payload)
+        .map_err(|_| TargetCapabilityClientError::InvalidUuidInventory)?;
+    if payload.schema != UUID_INVENTORY_SCHEMA
+        || canonical != bytes
+        || payload.uuids.len() != metadata.entry_count
+        || payload.uuids.len() > MAX_UUID_INVENTORY_ENTRIES
+        || !payload.uuids.iter().all(|uuid| valid_uuid(uuid))
+        || !payload
+            .uuids
+            .windows(2)
+            .all(|pair| pair[0].as_bytes() < pair[1].as_bytes())
+    {
+        return Err(TargetCapabilityClientError::InvalidUuidInventory);
+    }
+    let uuids = payload.uuids.into_iter().collect::<BTreeSet<_>>();
+    if uuids.len() != metadata.entry_count || expected.is_some_and(|expected| expected != &uuids) {
+        return Err(TargetCapabilityClientError::InvalidUuidInventory);
+    }
+    Ok(uuids)
+}
+
+fn validate_detached_mount(
+    descriptor: BorrowedFd<'_>,
+    expected_device: u64,
+) -> Result<(), TargetCapabilityClientError> {
+    let stat =
+        rfs::fstat(descriptor).map_err(|_| TargetCapabilityClientError::InvalidDetachedMount)?;
+    let filesystem =
+        rfs::fstatfs(descriptor).map_err(|_| TargetCapabilityClientError::InvalidDetachedMount)?;
+    let filesystem_flags =
+        rfs::fstatvfs(descriptor).map_err(|_| TargetCapabilityClientError::InvalidDetachedMount)?;
+    let descriptor_flags = rustix::io::fcntl_getfd(descriptor)
+        .map_err(|_| TargetCapabilityClientError::InvalidDetachedMount)?;
+    let status = rfs::fcntl_getfl(descriptor)
+        .map_err(|_| TargetCapabilityClientError::InvalidDetachedMount)?;
+    let required = StatVfsMountFlags::RDONLY
+        | StatVfsMountFlags::NODEV
+        | StatVfsMountFlags::NOSUID
+        | StatVfsMountFlags::NOEXEC;
+    if descriptor_flags != rustix::io::FdFlags::CLOEXEC
+        || !status.contains(OFlags::PATH)
+        || !FileType::from_raw_mode(stat.st_mode).is_dir()
+        || stat.st_dev != expected_device
+        || filesystem.f_type as u64 != EXT_SUPER_MAGIC
+        || !filesystem_flags.f_flag.contains(required)
+    {
+        return Err(TargetCapabilityClientError::InvalidDetachedMount);
+    }
+    Ok(())
+}
+
+fn valid_uuid(value: &str) -> bool {
+    (1..=MAX_UUID_BYTES).contains(&value.len())
+        && !value.starts_with('-')
+        && !value.ends_with('-')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte) || byte == b'-')
+}
+
+fn valid_raw_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn valid_prefixed_hash(value: &str, prefix: &str) -> bool {
@@ -720,7 +1038,7 @@ mod tests {
 
     fn send_raw(socket: BorrowedFd<'_>, bytes: &[u8], descriptors: &[BorrowedFd<'_>]) {
         let io = [IoSlice::new(bytes)];
-        let mut control_space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(2))];
+        let mut control_space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(5))];
         let mut control = SendAncillaryBuffer::new(&mut control_space);
         if !descriptors.is_empty() {
             assert!(control.push(SendAncillaryMessage::ScmRights(descriptors)));
@@ -751,7 +1069,12 @@ mod tests {
         recovery_fingerprint: &str,
     ) -> Vec<u8> {
         format!(
-            "{{\"apiVersion\":\"{API_VERSION}\",\"requestId\":\"{REQUEST_ID}\",\"operation\":\"{operation}\",\"outcome\":\"ok\",\"scanFingerprint\":\"{scan_fingerprint}\",\"targetFingerprint\":\"{target_fingerprint}\",\"targetId\":\"{target_id}\",\"recoveryFingerprint\":\"{recovery_fingerprint}\",\"capability\":\"{CAPABILITY_TYPE}\",\"descriptor\":{{\"type\":\"{DESCRIPTOR_TYPE}\",\"count\":1}}}}",
+            "{{\"apiVersion\":\"{API_VERSION}\",\"requestId\":\"{REQUEST_ID}\",\"operation\":\"{operation}\",\"outcome\":\"ok\",\"scanFingerprint\":\"{scan_fingerprint}\",\"targetFingerprint\":\"{target_fingerprint}\",\"targetId\":\"{target_id}\",\"recoveryFingerprint\":\"{recovery_fingerprint}\",\"capability\":\"{CAPABILITY_TYPE}\",\"descriptors\":[{{\"index\":0,\"type\":\"{}\"}},{{\"index\":1,\"type\":\"{}\"}},{{\"index\":2,\"type\":\"{}\"}},{{\"index\":3,\"type\":\"{}\"}}],\"physicalParentClaims\":{{\"parentMajor\":8,\"parentMinor\":0,\"diskSequence\":77,\"mediaSectorCount\":4096,\"logicalSectorBytes\":512,\"leafSectorCount\":2048}},\"uuidInventory\":{{\"schema\":\"{UUID_INVENTORY_SCHEMA}\",\"entryCount\":1,\"byteLength\":70,\"sha256\":\"{}\"}}}}",
+            DESCRIPTOR_TYPES[0],
+            DESCRIPTOR_TYPES[1],
+            DESCRIPTOR_TYPES[2],
+            DESCRIPTOR_TYPES[3],
+            "0".repeat(64),
         )
         .into_bytes()
     }
@@ -827,7 +1150,7 @@ mod tests {
     }
 
     #[test]
-    fn response_codec_denies_unknown_fields_and_requires_one_descriptor() {
+    fn response_codec_denies_unknown_fields_and_requires_complete_bundle() {
         let scan = scan('a');
         let fingerprint = fingerprint_value('c');
         let target = target('b');
@@ -899,7 +1222,7 @@ mod tests {
     }
 
     #[test]
-    fn socketpair_rejects_credentials_and_multiple_rights() {
+    fn socketpair_rejects_credentials_and_five_rights() {
         let (sender, receiver) = pair();
         rustix::net::sockopt::set_socket_passcred(&receiver, true)
             .expect("enable credentials for rejection test");
@@ -910,11 +1233,10 @@ mod tests {
         );
 
         let (sender, receiver) = pair();
-        let first = open("/dev/null", OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
-            .expect("first descriptor");
-        let second = open("/dev/null", OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
-            .expect("second descriptor");
-        send_raw(sender.as_fd(), b"{}", &[first.as_fd(), second.as_fd()]);
+        let descriptor =
+            open("/dev/null", OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty()).expect("descriptor");
+        let descriptors = [descriptor.as_fd(); 5];
+        send_raw(sender.as_fd(), b"{}", &descriptors);
         assert_eq!(
             receive_frame(receiver.as_fd(), deadline()).err(),
             Some(TargetCapabilityClientError::DescriptorCountMismatch)
@@ -922,9 +1244,31 @@ mod tests {
     }
 
     #[test]
+    fn socketpair_sets_cloexec_on_all_four_received_rights() {
+        let (sender, receiver) = pair();
+        let descriptor =
+            open("/dev/null", OFlags::RDONLY, Mode::empty()).expect("inheritable descriptor");
+        assert_eq!(
+            rustix::io::fcntl_getfd(&descriptor).expect("sender flags"),
+            rustix::io::FdFlags::empty()
+        );
+        let descriptors = [descriptor.as_fd(); 4];
+        send_raw(sender.as_fd(), b"{}", &descriptors);
+        let received = receive_frame(receiver.as_fd(), deadline()).expect("receive four rights");
+        assert_eq!(received.descriptors.len(), 4);
+        assert!(received.descriptors.iter().all(|descriptor| {
+            rustix::io::fcntl_getfd(descriptor).ok() == Some(rustix::io::FdFlags::CLOEXEC)
+        }));
+    }
+
+    #[test]
     fn socketpair_rejects_truncated_frame_and_fd_on_error() {
         let (sender, receiver) = pair();
-        send_raw(sender.as_fd(), &vec![b'x'; MAX_FRAME_BYTES + 1], &[]);
+        send_raw(
+            sender.as_fd(),
+            &vec![b'x'; MAX_RESPONSE_FRAME_BYTES + 1],
+            &[],
+        );
         assert_eq!(
             receive_frame(receiver.as_fd(), deadline()).err(),
             Some(TargetCapabilityClientError::FrameTooLarge)
@@ -967,25 +1311,44 @@ mod tests {
 
     #[test]
     fn rejects_non_block_and_non_read_only_descriptors() {
-        let read_only = open("/dev/null", OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
-            .expect("read-only character descriptor");
+        let read_only = open(
+            "/dev/null",
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            Mode::empty(),
+        )
+        .expect("read-only character descriptor");
         assert_eq!(
             validate_block_descriptor(read_only.as_fd()),
             Err(TargetCapabilityClientError::DescriptorNotBlockDevice)
         );
 
-        let writable = open("/dev/null", OFlags::WRONLY | OFlags::CLOEXEC, Mode::empty())
-            .expect("writable descriptor");
+        let writable = open(
+            "/dev/null",
+            OFlags::WRONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            Mode::empty(),
+        )
+        .expect("writable descriptor");
         assert_eq!(
             validate_block_descriptor(writable.as_fd()),
             Err(TargetCapabilityClientError::DescriptorNotReadOnly)
         );
 
-        let inheritable =
-            open("/dev/null", OFlags::RDONLY, Mode::empty()).expect("inheritable descriptor");
+        let inheritable = open(
+            "/dev/null",
+            OFlags::RDONLY | OFlags::NONBLOCK,
+            Mode::empty(),
+        )
+        .expect("inheritable descriptor");
         assert_eq!(
             validate_block_descriptor(inheritable.as_fd()),
             Err(TargetCapabilityClientError::DescriptorNotCloseOnExec)
+        );
+
+        let blocking = open("/dev/null", OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
+            .expect("blocking descriptor");
+        assert_eq!(
+            validate_block_descriptor(blocking.as_fd()),
+            Err(TargetCapabilityClientError::DescriptorNotNonblocking)
         );
     }
 
@@ -1064,5 +1427,80 @@ mod tests {
             .err(),
             Some(TargetCapabilityClientError::ClaimsMismatch)
         );
+    }
+
+    #[test]
+    fn uuid_inventory_payload_requires_canonical_sorted_lowercase_unique_json() {
+        let bytes = br#"{"schema":"kernaid.dev/rescue-uuid-inventory/v1","uuids":["aaaa-bbbb","dead-beef"]}"#;
+        let metadata = UuidInventoryMetadataWire {
+            schema: UUID_INVENTORY_SCHEMA.to_owned(),
+            entry_count: 2,
+            byte_length: bytes.len(),
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+        };
+        assert_eq!(
+            validate_uuid_inventory_payload(bytes, &metadata, None).expect("canonical inventory"),
+            BTreeSet::from(["aaaa-bbbb".to_owned(), "dead-beef".to_owned()])
+        );
+
+        for rejected in [
+            br#"{"schema":"kernaid.dev/rescue-uuid-inventory/v1", "uuids":["aaaa-bbbb","dead-beef"]}"#.as_slice(),
+            br#"{"schema":"kernaid.dev/rescue-uuid-inventory/v1","uuids":["dead-beef","aaaa-bbbb"]}"#.as_slice(),
+            br#"{"schema":"kernaid.dev/rescue-uuid-inventory/v1","uuids":["AAAA-BBBB","dead-beef"]}"#.as_slice(),
+            br#"{"schema":"kernaid.dev/rescue-uuid-inventory/v1","uuids":["aaaa-bbbb","aaaa-bbbb"]}"#.as_slice(),
+        ] {
+            let rejected_metadata = UuidInventoryMetadataWire {
+                schema: UUID_INVENTORY_SCHEMA.to_owned(),
+                entry_count: 2,
+                byte_length: rejected.len(),
+                sha256: format!("{:x}", Sha256::digest(rejected)),
+            };
+            assert_eq!(
+                validate_uuid_inventory_payload(rejected, &rejected_metadata, None),
+                Err(TargetCapabilityClientError::InvalidUuidInventory)
+            );
+        }
+    }
+
+    #[test]
+    fn physical_parent_claims_are_bounded_before_descriptor_admission() {
+        let valid = PhysicalParentClaimsWire {
+            parent_major: 8,
+            parent_minor: 0,
+            disk_sequence: 77,
+            media_sector_count: 4096,
+            logical_sector_bytes: 512,
+            leaf_sector_count: 2048,
+        };
+        assert_eq!(
+            validate_physical_parent_claims(&valid).expect("bounded claims"),
+            PhysicalParentNumericClaims {
+                parent_major: 8,
+                parent_minor: 0,
+                disk_sequence: 77,
+                media_sector_count: 4096,
+                logical_sector_bytes: 512,
+                leaf_sector_count: 2048,
+            }
+        );
+        for invalid in [
+            PhysicalParentClaimsWire {
+                disk_sequence: 0,
+                ..valid
+            },
+            PhysicalParentClaimsWire {
+                leaf_sector_count: 4097,
+                ..valid
+            },
+            PhysicalParentClaimsWire {
+                logical_sector_bytes: 1000,
+                ..valid
+            },
+        ] {
+            assert_eq!(
+                validate_physical_parent_claims(&invalid),
+                Err(TargetCapabilityClientError::ClaimsMismatch)
+            );
+        }
     }
 }

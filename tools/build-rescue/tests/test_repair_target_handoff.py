@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import array
+import fcntl
 from importlib.util import module_from_spec, spec_from_file_location
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -30,7 +32,7 @@ handoff = load_module("kernaid_repair_target_handoff_tests", HANDOFF_PATH)
 rescue_server = load_module("kernaid_rescue_server_handoff_tests", SERVER_PATH)
 
 REQUEST = {
-    "apiVersion": "kernaid.dev/rescue-target-capability/v1alpha1",
+    "apiVersion": "kernaid.dev/rescue-target-capability/v1alpha2",
     "scanFingerprint": "scan:" + "1" * 64,
     "targetId": "target:" + "2" * 64,
     "requestId": "R-12345678-1234-1234-1234-123456789abc",
@@ -44,6 +46,29 @@ RECOVERY_REQUEST = {
     "recoveryFingerprint": RECOVERY_FINGERPRINT,
 }
 
+BLOCK_INVENTORY = json.dumps(
+    {
+        "blockdevices": [
+            {
+                "name": "sda",
+                "uuid": "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE",
+                "children": [
+                    {
+                        "name": "sda2",
+                        "uuid": "11111111-2222-3333-4444-555555555555",
+                    },
+                    {
+                        "name": "sda3",
+                        "uuid": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                    },
+                ],
+            }
+        ]
+    },
+    sort_keys=True,
+    separators=(",", ":"),
+)
+
 IDENTITY_OBSERVATIONS: list[dict[str, object]] = [
     {
         "collector": "system.hostname",
@@ -51,7 +76,14 @@ IDENTITY_OBSERVATIONS: list[dict[str, object]] = [
         "output": "kernaid-fixture\n",
         "success": True,
         "truncated": False,
-    }
+    },
+    {
+        "collector": "linux.block.inventory",
+        "trust": "observed-untrusted",
+        "output": BLOCK_INVENTORY,
+        "success": True,
+        "truncated": False,
+    },
 ]
 
 
@@ -93,6 +125,25 @@ REQUEST["targetFingerprint"] = rescue_server.rescue_target_fingerprint(
 
 
 def _resolution(candidate: dict[str, object], filesystem: str = "ext4") -> dict[str, object]:
+    parent_identity = {
+        "name": "sda",
+        "maj:min": "8:0",
+        "type": "disk",
+        "size": 2 * 1024 * 1024,
+        "ro": False,
+        "rm": False,
+        "tran": "sata",
+        "fstype": None,
+        "fsver": None,
+        "mountpoints": [None],
+        "uuid": None,
+        "partuuid": None,
+        "ptuuid": "fixture-table",
+        "pttype": "gpt",
+        "parttype": None,
+        "serial": "fixture-serial",
+        "wwn": None,
+    }
     return {
         "candidate": candidate,
         "deviceIdentity": {
@@ -115,6 +166,11 @@ def _resolution(candidate: dict[str, object], filesystem: str = "ext4") -> dict[
             "wwn": None,
         },
         "majorMinor": "8:2",
+        "physicalParent": {
+            "deviceIdentity": parent_identity,
+            "majorMinor": "8:0",
+            "kernelKind": "disk",
+        },
         "filesystem": filesystem,
         "kernelKind": "part",
         "leaf": True,
@@ -204,7 +260,9 @@ class FakeTargets:
 def _receive(connection: socket.socket) -> tuple[dict[str, object], list[int]]:
     item_size = array.array("i").itemsize
     payload, ancillary, flags, _address = connection.recvmsg(
-        2048, socket.CMSG_SPACE(4 * item_size)
+        4096,
+        socket.CMSG_SPACE(5 * item_size),
+        socket.MSG_CMSG_CLOEXEC,
     )
     if flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC):
         raise AssertionError("response was truncated")
@@ -214,7 +272,23 @@ def _receive(connection: socket.socket) -> tuple[dict[str, object], list[int]]:
             rights = array.array("i")
             rights.frombytes(data[: len(data) - len(data) % item_size])
             descriptors.extend(rights)
+    if any(
+        fcntl.fcntl(descriptor, fcntl.F_GETFD) & fcntl.FD_CLOEXEC == 0
+        for descriptor in descriptors
+    ):
+        raise AssertionError("received descriptor is inheritable")
     return json.loads(payload.decode("utf-8")), descriptors
+
+
+def _pipe_capability(payload: bytes) -> int:
+    read_descriptor, write_descriptor = os.pipe()
+    try:
+        written = os.write(write_descriptor, payload)
+        if written != len(payload):
+            raise RuntimeError("short fixture pipe write")
+    finally:
+        os.close(write_descriptor)
+    return read_descriptor
 
 
 class RepairTargetHandoffTests(unittest.TestCase):
@@ -279,10 +353,15 @@ class RepairTargetHandoffTests(unittest.TestCase):
         self.assertIn("PrivateMounts=yes", service_unit)
         self.assertIn("PrivateNetwork=yes", service_unit)
         self.assertIn("ProtectSystem=strict", service_unit)
-        self.assertIn("ReadOnlyPaths=/run", service_unit)
+        self.assertIn("ReadOnlyPaths=/run /dev", service_unit)
         self.assertIn("DevicePolicy=closed", service_unit)
         self.assertIn("DeviceAllow=block-* r", service_unit)
-        self.assertIn("CapabilityBoundingSet=\n", service_unit)
+        self.assertIn("CapabilityBoundingSet=CAP_SYS_ADMIN", service_unit)
+        self.assertIn("AmbientCapabilities=\n", service_unit)
+        self.assertIn(
+            "SystemCallFilter=@system-service fsopen fsconfig fsmount", service_unit
+        )
+        self.assertIn("SystemCallErrorNumber=EPERM", service_unit)
         self.assertIn("RestrictAddressFamilies=AF_UNIX", service_unit)
         self.assertIn("RestrictNamespaces=yes", service_unit)
         self.assertIn("kernaid-offline-inspector-key.service", service_unit)
@@ -392,31 +471,69 @@ class RepairTargetHandoffTests(unittest.TestCase):
         self.assertFalse(thread.is_alive())
         return response
 
-    def test_success_resolves_twice_and_transfers_exactly_one_read_only_capability(
+    def test_success_transfers_the_exact_ordered_read_only_bundle_v2(
         self,
     ) -> None:
         targets = FakeTargets()
         service = handoff.RepairTargetHandoff(targets)
-        read_descriptor, write_descriptor = os.pipe()
-        os.close(write_descriptor)
+        leaf_descriptor = _pipe_capability(b"L")
+        parent_descriptor = _pipe_capability(b"P")
+        parent_identity_descriptor = os.open(
+            "/dev/null", os.O_PATH | os.O_CLOEXEC | os.O_NOFOLLOW
+        )
+        mount_descriptor = _pipe_capability(b"M")
         with (
             patch.object(handoff, "_mountinfo_has_device", return_value=False),
             patch.object(
-                handoff, "_open_bound_block_device", return_value=read_descriptor
+                handoff,
+                "_open_bound_block_device",
+                side_effect=[leaf_descriptor, parent_descriptor],
             ),
             patch.object(handoff, "_assert_block_fd", return_value=None),
+            patch.object(
+                handoff, "_assert_readonly_block_capability", return_value=None
+            ),
+            patch.object(
+                handoff,
+                "_probe_physical_parent_claims",
+                return_value={
+                    "parentMajor": 8,
+                    "parentMinor": 0,
+                    "diskSequence": 77,
+                    "mediaSectorCount": 4096,
+                    "logicalSectorBytes": 512,
+                    "leafSectorCount": 2048,
+                },
+            ),
+            patch.object(
+                handoff,
+                "_open_bound_block_identity",
+                return_value=parent_identity_descriptor,
+            ),
+            patch.object(handoff, "_assert_block_identity_fd", return_value=None),
+            patch.object(handoff, "_revalidate_final_bundle", return_value=None),
+            patch.object(
+                handoff,
+                "_create_detached_ext4_mount",
+                return_value=mount_descriptor,
+            ),
+            patch.object(
+                handoff, "_assert_detached_ext4_mount_fd", return_value=None
+            ),
         ):
             response, descriptors = self._exchange(service, REQUEST)
         try:
-            self.assertEqual(targets.calls, 2)
-            self.assertEqual(targets.events, ["resolve", "inventory", "resolve"])
+            self.assertEqual(targets.calls, 3)
+            self.assertEqual(
+                targets.events, ["resolve", "inventory", "resolve", "resolve"]
+            )
             self.assertEqual(
                 handoff.SOCKET_PATH,
                 "/run/kernaid-rescue-target-capability.sock",
             )
             self.assertEqual(
                 response["apiVersion"],
-                "kernaid.dev/rescue-target-capability/v1alpha1",
+                "kernaid.dev/rescue-target-capability/v1alpha2",
             )
             self.assertEqual(response["outcome"], "ok")
             self.assertEqual(response["requestId"], REQUEST["requestId"])
@@ -433,11 +550,30 @@ class RepairTargetHandoffTests(unittest.TestCase):
             )
             self.assertEqual(
                 response["capability"],
-                "linux-ext4-direct-leaf-readonly-block-v1",
+                "linux-ext4-direct-leaf-readonly-bundle-v2",
             )
             self.assertEqual(
-                response["descriptor"],
-                {"type": "selected-target-block-readonly", "count": 1},
+                response["descriptors"],
+                [
+                    {"index": 0, "type": "selected-target-block-readonly"},
+                    {"index": 1, "type": "physical-parent-block-identity-path"},
+                    {"index": 2, "type": "uuid-inventory-memfd-sealed"},
+                    {
+                        "index": 3,
+                        "type": "selected-target-ext4-mount-readonly-detached",
+                    },
+                ],
+            )
+            self.assertEqual(
+                response["physicalParentClaims"],
+                {
+                    "parentMajor": 8,
+                    "parentMinor": 0,
+                    "diskSequence": 77,
+                    "mediaSectorCount": 4096,
+                    "logicalSectorBytes": 512,
+                    "leafSectorCount": 2048,
+                },
             )
             self.assertEqual(
                 set(response),
@@ -451,17 +587,59 @@ class RepairTargetHandoffTests(unittest.TestCase):
                     "targetId",
                     "recoveryFingerprint",
                     "capability",
-                    "descriptor",
+                    "descriptors",
+                    "physicalParentClaims",
+                    "uuidInventory",
                 },
             )
-            self.assertEqual(len(descriptors), 1)
+            self.assertLess(
+                len(json.dumps(response, sort_keys=True, separators=(",", ":"))),
+                2048,
+            )
+            self.assertEqual(len(descriptors), 4)
+            self.assertEqual(os.read(descriptors[0], 1), b"L")
+            with self.assertRaises(OSError):
+                os.read(descriptors[1], 1)
+            self.assertEqual(
+                fcntl.fcntl(descriptors[1], fcntl.F_GETFL) & os.O_PATH,
+                os.O_PATH,
+            )
+            with self.assertRaises(handoff.HandoffFailure):
+                handoff._probe_u64(descriptors[1], handoff.BLKGETDISKSEQ)
+            uuid_payload = os.pread(descriptors[2], 1024, 0)
+            self.assertEqual(
+                json.loads(uuid_payload.decode("ascii")),
+                {
+                    "schema": "kernaid.dev/rescue-uuid-inventory/v1",
+                    "uuids": [
+                        "11111111-2222-3333-4444-555555555555",
+                        "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                    ],
+                },
+            )
+            self.assertEqual(
+                response["uuidInventory"],
+                {
+                    "schema": "kernaid.dev/rescue-uuid-inventory/v1",
+                    "entryCount": 2,
+                    "byteLength": len(uuid_payload),
+                    "sha256": hashlib.sha256(uuid_payload).hexdigest(),
+                },
+            )
+            self.assertEqual(
+                handoff.fcntl.fcntl(descriptors[2], handoff.F_GET_SEALS),
+                handoff.UUID_INVENTORY_SEALS,
+            )
+            with self.assertRaises(OSError):
+                os.pwrite(descriptors[2], b"x", 0)
+            with self.assertRaises(OSError):
+                os.ftruncate(descriptors[2], 0)
+            self.assertEqual(os.read(descriptors[3], 1), b"M")
             serialized = json.dumps(response, separators=(",", ":"))
             for forbidden in (
                 "/dev/",
                 "sda2",
                 "8:2",
-                "majorMinor",
-                "physicalParent",
                 "11111111-2222-3333-4444-555555555555",
                 "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
             ):
@@ -470,23 +648,303 @@ class RepairTargetHandoffTests(unittest.TestCase):
             for descriptor in descriptors:
                 os.close(descriptor)
 
+    def test_uuid_inventory_bounds_and_canonical_maximum_are_exact(self) -> None:
+        self.assertEqual(
+            handoff._normalize_uuid_inventory(
+                [
+                    "BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB",
+                    "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                    "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                ]
+            ),
+            (
+                "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            ),
+        )
+        for values in (
+            [],
+            ["-a"],
+            ["a-"],
+            ["g"],
+            ["a" * 129],
+            ["a"] * 4097,
+        ):
+            with self.subTest(values=(len(values), values[:1])):
+                with self.assertRaises(handoff.HandoffFailure):
+                    handoff._normalize_uuid_inventory(values)
+        maximum = tuple(f"{index:04x}" + "a" * 124 for index in range(4096))
+        self.assertEqual(
+            len(handoff._uuid_inventory_payload(maximum)),
+            handoff.MAX_UUID_INVENTORY_BYTES,
+        )
+        maximum_response = {
+            "apiVersion": handoff.API_VERSION,
+            "requestId": REQUEST["requestId"],
+            "operation": handoff.RECOVERY_OPERATION,
+            "scanFingerprint": REQUEST["scanFingerprint"],
+            "targetFingerprint": REQUEST["targetFingerprint"],
+            "targetId": REQUEST["targetId"],
+            "recoveryFingerprint": RECOVERY_FINGERPRINT,
+            "outcome": "ok",
+            "capability": handoff.BUNDLE_CAPABILITY,
+            "descriptors": handoff._descriptor_manifest(),
+            "physicalParentClaims": {
+                "parentMajor": 4_294_967_295,
+                "parentMinor": 4_294_967_295,
+                "diskSequence": 18_446_744_073_709_551_615,
+                "mediaSectorCount": 36_028_797_018_963_967,
+                "logicalSectorBytes": 65_536,
+                "leafSectorCount": 36_028_797_018_963_967,
+            },
+            "uuidInventory": {
+                "schema": handoff.UUID_INVENTORY_SCHEMA,
+                "entryCount": handoff.MAX_UUID_INVENTORY_ENTRIES,
+                "byteLength": handoff.MAX_UUID_INVENTORY_BYTES,
+                "sha256": "f" * 64,
+            },
+        }
+        self.assertLess(
+            len(handoff._canonical(maximum_response)), handoff.MAX_RESPONSE_BYTES
+        )
+
+    def test_parent_claims_are_derived_from_both_readable_block_fds(self) -> None:
+        with (
+            patch.object(
+                handoff,
+                "_probe_u64",
+                side_effect=[77, 77, 1024 * 1024, 2 * 1024 * 1024],
+            ),
+            patch.object(handoff, "_probe_u32", side_effect=[512, 512]),
+        ):
+            self.assertEqual(
+                handoff._probe_physical_parent_claims(
+                    10, 11, 1024 * 1024, 2 * 1024 * 1024, 8, 0
+                ),
+                {
+                    "parentMajor": 8,
+                    "parentMinor": 0,
+                    "diskSequence": 77,
+                    "mediaSectorCount": 4096,
+                    "logicalSectorBytes": 512,
+                    "leafSectorCount": 2048,
+                },
+            )
+        with (
+            patch.object(
+                handoff,
+                "_probe_u64",
+                side_effect=[77, 78, 1024 * 1024, 2 * 1024 * 1024],
+            ),
+            patch.object(handoff, "_probe_u32", side_effect=[512, 512]),
+        ):
+            with self.assertRaises(handoff.HandoffFailure):
+                handoff._probe_physical_parent_claims(
+                    10, 11, 1024 * 1024, 2 * 1024 * 1024, 8, 0
+                )
+
+    def test_mount_builder_uses_only_leaf_fd_ro_noload_and_create_excl(self) -> None:
+        class FakeMountApi:
+            def __init__(self) -> None:
+                self.context = os.open("/dev/null", os.O_RDONLY | os.O_CLOEXEC)
+                self.mount = os.open("/dev/null", os.O_RDONLY | os.O_CLOEXEC)
+                self.calls: list[tuple[object, ...]] = []
+
+            def fsopen(self, filesystem: bytes, flags: int) -> int:
+                self.calls.append(("fsopen", filesystem, flags))
+                return self.context
+
+            def fsconfig(
+                self,
+                context: int,
+                command: int,
+                key: bytes | None,
+                value: bytes | None,
+                auxiliary: int,
+            ) -> int:
+                self.calls.append(
+                    ("fsconfig", context, command, key, value, auxiliary)
+                )
+                return 0
+
+            def fsmount(self, context: int, flags: int, attributes: int) -> int:
+                self.calls.append(("fsmount", context, flags, attributes))
+                return self.mount
+
+            def fstatfs(self, _descriptor: int, _buffer: object) -> int:
+                raise AssertionError("validation is patched in this fixture")
+
+        leaf = os.open("/dev/null", os.O_RDONLY | os.O_CLOEXEC)
+        api = FakeMountApi()
+        try:
+            with (
+                patch.object(handoff, "_GlibcMountApi", return_value=api),
+                patch.object(
+                    handoff, "_assert_detached_ext4_mount_fd", return_value=None
+                ),
+            ):
+                mount = handoff._create_detached_ext4_mount(leaf, 8, 2)
+            self.assertEqual(mount, api.mount)
+            self.assertEqual(
+                api.calls,
+                [
+                    ("fsopen", b"ext4", handoff.FSOPEN_CLOEXEC),
+                    (
+                        "fsconfig",
+                        api.context,
+                        handoff.FSCONFIG_SET_STRING,
+                        b"source",
+                        f"/proc/self/fd/{leaf}".encode("ascii"),
+                        0,
+                    ),
+                    (
+                        "fsconfig",
+                        api.context,
+                        handoff.FSCONFIG_SET_FLAG,
+                        b"ro",
+                        None,
+                        0,
+                    ),
+                    (
+                        "fsconfig",
+                        api.context,
+                        handoff.FSCONFIG_SET_FLAG,
+                        b"noload",
+                        None,
+                        0,
+                    ),
+                    (
+                        "fsconfig",
+                        api.context,
+                        handoff.FSCONFIG_CMD_CREATE_EXCL,
+                        None,
+                        None,
+                        0,
+                    ),
+                    (
+                        "fsmount",
+                        api.context,
+                        handoff.FSMOUNT_CLOEXEC,
+                        handoff.REQUIRED_MOUNT_ATTRIBUTES,
+                    ),
+                ],
+            )
+            with self.assertRaises(OSError):
+                os.fstat(api.context)
+        finally:
+            os.close(leaf)
+            os.close(api.mount)
+
+    def test_mount_builder_fails_closed_when_create_excl_is_unavailable(self) -> None:
+        class UnsupportedExclusiveMountApi:
+            def __init__(self) -> None:
+                self.context = os.open("/dev/null", os.O_RDONLY | os.O_CLOEXEC)
+                self.commands: list[int] = []
+                self.fsopen_calls = 0
+
+            def fsopen(self, _filesystem: bytes, _flags: int) -> int:
+                self.fsopen_calls += 1
+                return self.context
+
+            def fsconfig(
+                self,
+                _context: int,
+                command: int,
+                _key: bytes | None,
+                _value: bytes | None,
+                _auxiliary: int,
+            ) -> int:
+                self.commands.append(command)
+                if command == handoff.FSCONFIG_CMD_CREATE_EXCL:
+                    handoff.ctypes.set_errno(handoff.errno.EOPNOTSUPP)
+                    return -1
+                return 0
+
+            def fsmount(
+                self, _context: int, _flags: int, _attributes: int
+            ) -> int:
+                raise AssertionError("an unsupported exclusive create must not mount")
+
+            def fstatfs(self, _descriptor: int, _buffer: object) -> int:
+                raise AssertionError("an unsupported exclusive create must not validate")
+
+        leaf = os.open("/dev/null", os.O_RDONLY | os.O_CLOEXEC)
+        api = UnsupportedExclusiveMountApi()
+        try:
+            with patch.object(handoff, "_GlibcMountApi", return_value=api):
+                with self.assertRaises(handoff.HandoffFailure) as raised:
+                    handoff._create_detached_ext4_mount(leaf, 8, 2)
+            self.assertEqual(raised.exception.token, "DEVICE_UNAVAILABLE")
+            self.assertEqual(api.fsopen_calls, 1)
+            self.assertEqual(
+                api.commands,
+                [
+                    handoff.FSCONFIG_SET_STRING,
+                    handoff.FSCONFIG_SET_FLAG,
+                    handoff.FSCONFIG_SET_FLAG,
+                    handoff.FSCONFIG_CMD_CREATE_EXCL,
+                ],
+            )
+            with self.assertRaises(OSError):
+                os.fstat(api.context)
+        finally:
+            os.close(leaf)
+
     def test_recovery_rescans_twice_and_returns_only_fresh_opaque_claims(
         self,
     ) -> None:
         targets = FakeTargets()
         service = handoff.RepairTargetHandoff(targets)
-        read_descriptor, write_descriptor = os.pipe()
-        os.close(write_descriptor)
+        leaf_descriptor = _pipe_capability(b"L")
+        parent_descriptor = _pipe_capability(b"P")
+        parent_identity_descriptor = os.open(
+            "/dev/null", os.O_PATH | os.O_CLOEXEC | os.O_NOFOLLOW
+        )
+        mount_descriptor = _pipe_capability(b"M")
         with (
             patch.object(handoff, "_mountinfo_has_device", return_value=False),
             patch.object(
-                handoff, "_open_bound_block_device", return_value=read_descriptor
+                handoff,
+                "_open_bound_block_device",
+                side_effect=[leaf_descriptor, parent_descriptor],
             ),
             patch.object(handoff, "_assert_block_fd", return_value=None),
+            patch.object(
+                handoff, "_assert_readonly_block_capability", return_value=None
+            ),
+            patch.object(
+                handoff,
+                "_probe_physical_parent_claims",
+                return_value={
+                    "parentMajor": 8,
+                    "parentMinor": 0,
+                    "diskSequence": 77,
+                    "mediaSectorCount": 4096,
+                    "logicalSectorBytes": 512,
+                    "leafSectorCount": 2048,
+                },
+            ),
+            patch.object(
+                handoff,
+                "_open_bound_block_identity",
+                return_value=parent_identity_descriptor,
+            ),
+            patch.object(handoff, "_assert_block_identity_fd", return_value=None),
+            patch.object(handoff, "_revalidate_final_bundle", return_value=None),
+            patch.object(
+                handoff,
+                "_create_detached_ext4_mount",
+                return_value=mount_descriptor,
+            ),
+            patch.object(
+                handoff, "_assert_detached_ext4_mount_fd", return_value=None
+            ),
         ):
             response, descriptors = self._exchange(service, RECOVERY_REQUEST)
         try:
-            self.assertEqual(targets.events, ["recover", "inventory", "recover"])
+            self.assertEqual(
+                targets.events, ["recover", "inventory", "recover", "recover"]
+            )
             self.assertEqual(response["outcome"], "ok")
             self.assertEqual(response["operation"], RECOVERY_REQUEST["operation"])
             self.assertEqual(
@@ -497,13 +955,12 @@ class RepairTargetHandoffTests(unittest.TestCase):
             self.assertEqual(
                 response["targetFingerprint"], REQUEST["targetFingerprint"]
             )
-            self.assertEqual(len(descriptors), 1)
+            self.assertEqual(len(descriptors), 4)
             serialized = json.dumps(response, separators=(",", ":"))
             for forbidden in (
                 "/dev/",
                 "sda2",
                 "8:2",
-                "majorMinor",
                 "11111111-2222-3333-4444-555555555555",
                 "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
             ):
@@ -528,12 +985,14 @@ class RepairTargetHandoffTests(unittest.TestCase):
 
         targets = DriftTargets()
         service = handoff.RepairTargetHandoff(targets)
-        read_descriptor, write_descriptor = os.pipe()
-        os.close(write_descriptor)
+        leaf_descriptor = _pipe_capability(b"")
+        parent_descriptor = _pipe_capability(b"")
         with (
             patch.object(handoff, "_mountinfo_has_device", return_value=False),
             patch.object(
-                handoff, "_open_bound_block_device", return_value=read_descriptor
+                handoff,
+                "_open_bound_block_device",
+                side_effect=[leaf_descriptor, parent_descriptor],
             ),
             patch.object(handoff, "_assert_block_fd", return_value=None),
         ):
@@ -542,8 +1001,102 @@ class RepairTargetHandoffTests(unittest.TestCase):
         self.assertEqual(response["operation"], RECOVERY_REQUEST["operation"])
         self.assertEqual(response["error"], "TARGET_CHANGED")
         self.assertEqual(descriptors, [])
-        with self.assertRaises(OSError):
-            os.fstat(read_descriptor)
+        for descriptor in (leaf_descriptor, parent_descriptor):
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
+
+    def test_parent_drift_between_root_owned_scans_closes_both_block_fds(
+        self,
+    ) -> None:
+        class ParentDriftTargets(FakeTargets):
+            def resolve_installed_target(
+                self, request: dict[str, object], *, deadline: float
+            ) -> tuple[dict[str, object], dict[str, object]]:
+                selection, resolution = super().resolve_installed_target(
+                    request, deadline=deadline
+                )
+                if self.calls == 2:
+                    changed = dict(resolution)
+                    parent = dict(changed["physicalParent"])
+                    identity = dict(parent["deviceIdentity"])
+                    identity["maj:min"] = "8:16"
+                    parent["deviceIdentity"] = identity
+                    parent["majorMinor"] = "8:16"
+                    changed["physicalParent"] = parent
+                    return selection, changed
+                return selection, resolution
+
+        targets = ParentDriftTargets()
+        service = handoff.RepairTargetHandoff(targets)
+        leaf_descriptor = _pipe_capability(b"")
+        parent_descriptor = _pipe_capability(b"")
+        with (
+            patch.object(handoff, "_mountinfo_has_device", return_value=False),
+            patch.object(
+                handoff,
+                "_open_bound_block_device",
+                side_effect=[leaf_descriptor, parent_descriptor],
+            ),
+            patch.object(handoff, "_assert_block_fd", return_value=None),
+        ):
+            response, descriptors = self._exchange(service, REQUEST)
+        self.assertEqual(response["outcome"], "error")
+        self.assertEqual(response["error"], "TARGET_CHANGED")
+        self.assertEqual(descriptors, [])
+        for descriptor in (leaf_descriptor, parent_descriptor):
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
+
+    def test_third_fresh_resolution_rejects_last_moment_parent_drift(self) -> None:
+        class ThirdScanDriftTargets(FakeTargets):
+            def resolve_installed_target(
+                self, request: dict[str, object], *, deadline: float
+            ) -> tuple[dict[str, object], dict[str, object]]:
+                selection, resolution = super().resolve_installed_target(
+                    request, deadline=deadline
+                )
+                if self.calls == 3:
+                    changed = dict(resolution)
+                    parent = dict(changed["physicalParent"])
+                    identity = dict(parent["deviceIdentity"])
+                    identity["maj:min"] = "8:16"
+                    parent["deviceIdentity"] = identity
+                    parent["majorMinor"] = "8:16"
+                    changed["physicalParent"] = parent
+                    return selection, changed
+                return selection, resolution
+
+        targets = ThirdScanDriftTargets()
+        service = handoff.RepairTargetHandoff(targets)
+        leaf_descriptor = _pipe_capability(b"")
+        parent_descriptor = _pipe_capability(b"")
+        claims = {
+            "parentMajor": 8,
+            "parentMinor": 0,
+            "diskSequence": 77,
+            "mediaSectorCount": 4096,
+            "logicalSectorBytes": 512,
+            "leafSectorCount": 2048,
+        }
+        with (
+            patch.object(handoff, "_mountinfo_has_device", return_value=False),
+            patch.object(
+                handoff,
+                "_open_bound_block_device",
+                side_effect=[leaf_descriptor, parent_descriptor],
+            ),
+            patch.object(handoff, "_assert_block_fd", return_value=None),
+            patch.object(
+                handoff,
+                "_complete_read_only_bundle",
+                return_value=({"schema": handoff.UUID_INVENTORY_SCHEMA}, claims),
+            ),
+        ):
+            response, descriptors = self._exchange(service, REQUEST)
+        self.assertEqual(targets.calls, 3)
+        self.assertEqual(response["outcome"], "error")
+        self.assertEqual(response["error"], "TARGET_CHANGED")
+        self.assertEqual(descriptors, [])
 
     def test_target_fingerprint_is_recomputed_and_mismatch_sends_no_rights(
         self,
@@ -552,12 +1105,14 @@ class RepairTargetHandoffTests(unittest.TestCase):
         service = handoff.RepairTargetHandoff(targets)
         request = dict(REQUEST)
         request["targetFingerprint"] = "sha256:" + "f" * 64
-        read_descriptor, write_descriptor = os.pipe()
-        os.close(write_descriptor)
+        leaf_descriptor = _pipe_capability(b"")
+        parent_descriptor = _pipe_capability(b"")
         with (
             patch.object(handoff, "_mountinfo_has_device", return_value=False),
             patch.object(
-                handoff, "_open_bound_block_device", return_value=read_descriptor
+                handoff,
+                "_open_bound_block_device",
+                side_effect=[leaf_descriptor, parent_descriptor],
             ),
             patch.object(handoff, "_assert_block_fd", return_value=None),
         ):
@@ -566,19 +1121,22 @@ class RepairTargetHandoffTests(unittest.TestCase):
         self.assertEqual(response["outcome"], "error")
         self.assertEqual(response["error"], "TARGET_CHANGED")
         self.assertEqual(descriptors, [])
-        with self.assertRaises(OSError):
-            os.fstat(read_descriptor)
+        for descriptor in (leaf_descriptor, parent_descriptor):
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
 
     def test_incomplete_identity_inventory_fails_closed(self) -> None:
         targets = FakeTargets()
         targets.observations[0]["success"] = False
         service = handoff.RepairTargetHandoff(targets)
-        read_descriptor, write_descriptor = os.pipe()
-        os.close(write_descriptor)
+        leaf_descriptor = _pipe_capability(b"")
+        parent_descriptor = _pipe_capability(b"")
         with (
             patch.object(handoff, "_mountinfo_has_device", return_value=False),
             patch.object(
-                handoff, "_open_bound_block_device", return_value=read_descriptor
+                handoff,
+                "_open_bound_block_device",
+                side_effect=[leaf_descriptor, parent_descriptor],
             ),
             patch.object(handoff, "_assert_block_fd", return_value=None),
         ):
@@ -587,8 +1145,9 @@ class RepairTargetHandoffTests(unittest.TestCase):
         self.assertEqual(response["outcome"], "error")
         self.assertEqual(response["error"], "TARGET_UNAVAILABLE")
         self.assertEqual(descriptors, [])
-        with self.assertRaises(OSError):
-            os.fstat(read_descriptor)
+        for descriptor in (leaf_descriptor, parent_descriptor):
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
 
     def test_closed_request_unsupported_target_and_wrong_peer_never_send_rights(
         self,
@@ -636,6 +1195,82 @@ class RepairTargetHandoffTests(unittest.TestCase):
             client.settimeout(0.2)
             self.assertEqual(client.recv(1), b"")
             client.close()
+
+    def test_root_resolver_retains_the_selected_leaf_physical_parent(self) -> None:
+        def device(
+            name: str,
+            major_minor: str,
+            kind: str,
+            *,
+            filesystem: str | None = None,
+            filesystem_uuid: str | None = None,
+            partition_uuid: str | None = None,
+            children: list[dict[str, object]] | None = None,
+        ) -> dict[str, object]:
+            value: dict[str, object] = {
+                "name": name,
+                "maj:min": major_minor,
+                "type": kind,
+                "size": 2 * 1024 * 1024 if kind == "disk" else 1024 * 1024,
+                "ro": False,
+                "rm": False,
+                "tran": "sata",
+                "fstype": filesystem,
+                "fsver": "1.0" if filesystem else None,
+                "mountpoints": [None],
+                "uuid": filesystem_uuid,
+                "partuuid": partition_uuid,
+                "ptuuid": "fixture-table" if kind == "disk" else None,
+                "pttype": "gpt" if kind == "disk" else None,
+                "parttype": None,
+                "serial": "fixture-serial" if kind == "disk" else None,
+                "wwn": None,
+            }
+            if children is not None:
+                value["children"] = children
+            return value
+
+        snapshot, resolutions = rescue_server._normalize_installed_targets_with_resolutions(
+            json.dumps(
+                {
+                    "blockdevices": [
+                        device(
+                            "sda",
+                            "8:0",
+                            "disk",
+                            children=[
+                                device(
+                                    "sda2",
+                                    "8:2",
+                                    "part",
+                                    filesystem="ext4",
+                                    filesystem_uuid=(
+                                        "11111111-2222-3333-4444-555555555555"
+                                    ),
+                                    partition_uuid=(
+                                        "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+                                    ),
+                                )
+                            ],
+                        )
+                    ]
+                }
+            )
+        )
+        target_id = snapshot["candidates"][0]["targetId"]
+        parent = resolutions[target_id]["physicalParent"]
+        self.assertEqual(
+            parent,
+            {
+                "deviceIdentity": {
+                    key: value
+                    for key, value in device("sda", "8:0", "disk").items()
+                    if key != "children"
+                },
+                "majorMinor": "8:0",
+                "kernelKind": "disk",
+            },
+        )
 
     def test_duplicate_target_identifier_fails_the_canonical_scan_closed(self) -> None:
         def device(

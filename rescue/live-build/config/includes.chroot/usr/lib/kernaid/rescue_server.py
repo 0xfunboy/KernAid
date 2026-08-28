@@ -2214,6 +2214,16 @@ def _normalize_installed_targets_with_resolutions(
                 "candidate": public_candidate,
                 "deviceIdentity": candidate["identity"],
                 "majorMinor": candidate["major_minor"],
+                # Root-only repair handoff metadata.  This object never crosses
+                # the HTTP target-selection boundary; it lets the dedicated
+                # helper bind the selected direct leaf to the exact parent from
+                # the same fresh lsblk tree without reconstructing ancestry
+                # from a client value or a device pathname.
+                "physicalParent": {
+                    "deviceIdentity": disk["identity"],
+                    "majorMinor": disk["major_minor"],
+                    "kernelKind": disk["kind"],
+                },
                 "filesystem": candidate["filesystem"],
                 "kernelKind": candidate["kind"],
                 "leaf": not candidate_children,
