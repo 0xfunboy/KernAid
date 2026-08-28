@@ -2,6 +2,11 @@
 name = "kernaid-broker"
 version.workspace = true
 edition.workspace = true
+
+[[bin]]
+name = "kernaid-rescue-repaird"
+path = "src/bin/kernaid-rescue-repaird.rs"
+required-features = ["rescue-fstab-production-candidate"]
 [features]
 default = []
 fixture-repair-lab = [
@@ -20,6 +25,7 @@ rescue-fstab-production-candidate = [
     "rescue-target-physical-parent",
     "dep:kernaid-core",
     "dep:kernaid-linux-pack",
+    "dep:kernaid-linux-systemd",
     "dep:serde",
     "dep:serde_json",
     "kernaid-core/rescue-fstab-production-candidate",
@@ -44,6 +50,7 @@ kernaid-protocol = { path = "../protocol" }
 kernaid-core = { path = "../core", optional = true }
 kernaid-device-identity = { path = "../device-identity", optional = true }
 kernaid-linux-pack = { path = "../../packs/linux", optional = true }
+kernaid-linux-systemd = { path = "../linux-systemd", optional = true }
 kernaid-storage = { path = "../storage", optional = true }
 rustix = { version = "1.1.4", features = ["event", "fs", "mount", "net", "pipe", "rand"], optional = true }
 serde = { version = "1", features = ["derive"], optional = true }

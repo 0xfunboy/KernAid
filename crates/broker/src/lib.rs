@@ -27,6 +27,20 @@ pub mod rescue_fstab_observer;
 #[cfg(all(target_os = "linux", feature = "rescue-fstab-production-candidate"))]
 pub mod rescue_fstab_preflight_resolver;
 
+/// Closed bounded local API and single-authority state machine for the gated
+/// Rescue repair service.
+#[cfg(all(target_os = "linux", feature = "rescue-fstab-production-candidate"))]
+pub mod rescue_repair_service;
+
+/// Production Core/preflight/executor composition behind the closed repair
+/// service. It is absent from every default build.
+#[cfg(all(target_os = "linux", feature = "rescue-fstab-production-candidate"))]
+pub mod rescue_repair_service_engine;
+
+/// Authenticated systemd-activated local transport for repaird.
+#[cfg(all(target_os = "linux", feature = "rescue-fstab-production-candidate"))]
+pub mod rescue_repair_service_transport;
+
 /// Linux-only client for the fixed, root-authenticated Rescue repair-vault
 /// endpoint. It is opt-in and exposes only the closed repair lifecycle.
 #[cfg(all(target_os = "linux", feature = "repair-vault-client"))]

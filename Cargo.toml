@@ -7,6 +7,7 @@ members = [
   "crates/rescue-openai-provider", "crates/rescue-openai-executor",
   "crates/rescue-codex-bridge",
   "crates/linux-nsfs",
+  "crates/linux-systemd",
   "packs/linux", "packs/macos", "packs/windows", "apps/desk/src-tauri",
   "apps/desk/src-tauri-rescue"
 ]

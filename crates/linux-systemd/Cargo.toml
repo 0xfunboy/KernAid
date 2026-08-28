@@ -1,0 +1,14 @@
+[package]
+name = "kernaid-linux-systemd"
+version.workspace = true
+edition.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1.4", features = ["fs", "process"] }
+
+[lints.clippy]
+unwrap_used = "deny"
+panic = "deny"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
