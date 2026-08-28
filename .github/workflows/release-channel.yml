@@ -544,10 +544,6 @@ jobs:
             echo "Release already exists: $tag" >&2
             exit 1
           fi
-          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
-            echo "Tag already exists without the expected release: $tag" >&2
-            exit 1
-          fi
           notes="$RUNNER_TEMP/kernaid-release-notes.md"
           printf '%s\n' \
             "Internal KernAid candidate channel sequence ${CHANNEL_SEQUENCE}." \
@@ -561,16 +557,21 @@ jobs:
             "This prerelease does not claim Secure Boot, physical hardware qualification, or production support." \
             >"$notes"
 
-          # GITHUB_TOKEN cannot ask the Releases API to create a tag at an
-          # arbitrary historical commit through `--target`. Create and verify
-          # the exact lightweight ref first, then follow GitHub's immutable-
-          # release sequence: draft, attach every asset, publish once.
-          gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
-            -f ref="refs/tags/$tag" \
-            -f sha="$SOURCE_COMMIT" >/dev/null
-          observed_tag="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq '.object.sha')"
+          # An Actions installation token cannot create a tag at a historical
+          # commit containing workflow changes. A bootstrap publisher may
+          # pre-create only the exact lightweight ref; every other existing
+          # tag is rejected. Current-head releases remain fully automatic.
+          if ! git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f ref="refs/tags/$tag" \
+              -f sha="$SOURCE_COMMIT" >/dev/null
+          fi
+          observed_tag="$(
+            gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" \
+              --jq 'select(.object.type == "commit") | .object.sha'
+          )"
           if [[ "$observed_tag" != "$SOURCE_COMMIT" ]]; then
-            echo "Created release tag does not resolve to the exact source commit" >&2
+            echo "Release tag is not the exact lightweight source ref" >&2
             exit 1
           fi
           gh release create "$tag" \

@@ -126,17 +126,28 @@ the same full commit. Before publication it:
 For sequence 2 and later the operator must name the current published channel
 head and its manifest SHA-256. The workflow downloads and validates that
 manifest, requires the immediately preceding sequence, and rejects a fork or
-a second sequence 1 before publishing. It refuses an existing tag or release
-instead of replacing assets.
+a second sequence 1 before publishing. It refuses every existing release and
+accepts an existing tag only when it is a lightweight ref resolving to the
+exact qualified source commit; it never replaces assets or moves a ref.
+
+GitHub's installation-scoped Actions token cannot create a tag at a historical
+commit containing workflow-file changes. The first channel bootstrap may
+therefore require an authorized publisher to pre-create that one exact
+lightweight tag. This exception supplies only the immutable source ref: the
+workflow still downloads, verifies, inventories, attests and publishes every
+asset. Candidates released while their source commit is the workflow's current
+head do not need the bootstrap.
 
 The manual workflow holds `contents:write` solely so its final step can create
 the internal prerelease; its preceding scripts do not publish repository
 content. Repository release immutability was enabled on 28 August 2026 and the
-workflow fails before publication if that setting is no longer active. It
-applies only to releases published while enabled. Consumers must still verify
-the included channel attestation and manifest hash. This permission does not
-code-sign MSI, DMG, AppImage or the boot chain. Those assets remain explicitly
-unsigned engineering candidates.
+publisher verifies that the exact published release reports `immutable: true`.
+The Actions installation token cannot read the repository-level setting in
+advance, so the operator must also retain the enabled setting as a release
+precondition. Immutability applies only to releases published while enabled.
+Consumers must still verify the included channel attestation and manifest
+hash. This permission does not code-sign MSI, DMG, AppImage or the boot chain.
+Those assets remain explicitly unsigned engineering candidates.
 
 The checked-in JSON Schema is
 `tools/release/release-channel.v1.schema.json`. Run the focused local contract
