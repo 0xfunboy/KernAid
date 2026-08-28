@@ -49,13 +49,22 @@ complex storage remains read-only.
 The feature-gated Rust candidate now includes a pure immutable transaction-plan
 binding for the preview hashes, selected-target scan identity, target physical
 parent, authenticated boot-Vault identity, Vault physical parent, opaque backup
-locator and the two canonical diagnostic evidence hashes. The plan also binds
+locator, durable reservation ID/binding, reserved capacity and the two
+canonical diagnostic evidence hashes. A free-space observation alone is not a
+backup capability. The plan also binds
 its risk, safety declarations, timeout, cancellation, idempotency and redaction
 policy. It rejects equal physical parents, insufficient Vault capacity and
 path-like capability IDs. Core and policy expose a separate, feature-gated,
 single-use approval transition bound to session, plan hash, target fingerprint
-and `fstab` snapshot. This remains admission material only: it has no I/O,
-trusted broker dispatch, Vault backup or mutation handler.
+and `fstab` snapshot. The broker crate now has a feature-gated, path-free
+preflight boundary that consumes that non-cloneable admission, acquires an
+opaque read-only target lock, retains the exact Vault reservation guard, asks
+a trusted resolver for observations and rebuilds the preview and transaction
+plan. Its `ready-read-only` receipt is audit evidence only: it is never
+execution authority and cannot replace the non-cloneable prepared object that
+holds the admission and both guards. No production resolver or IPC route
+exists yet, so this remains admission material only: it has no filesystem I/O,
+durable Vault store or mutation handler.
 
 ## Backup boundary
 

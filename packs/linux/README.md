@@ -18,7 +18,11 @@ explicitly `productionCandidateOnly`, disabled by default, and its Rust code is
 compiled only with the off-by-default `rescue-fstab-production-candidate`
 feature. It currently consists of the action contract, a pure preview,
 an immutable transaction plan and a separate Core/policy approval boundary.
-There is no filesystem I/O, trusted Rescue broker/UI route, backup
+The broker crate can rebuild these bindings behind the same feature while
+consuming the non-cloneable approval admission and retaining both an opaque
+read-only target lock and the exact Vault reservation guard. Its receipt is
+audit evidence, never execution authority. There is no filesystem I/O,
+production resolver/IPC/UI route, backup
 implementation, or production mutation handler, so it does **not** make the
 repair available to users yet.
 
@@ -46,8 +50,10 @@ the line terminator is outside both frames. All four values use lowercase
 The immutable candidate plan additionally binds the session and plan IDs,
 canonical evidence hashes, selected-target scan identity, target and Vault
 physical-parent identities, authenticated Vault identity and opaque backup
-locator, sufficient capacity, exact risk/preflight/backup/validation/rollback
-declarations, timeout, cancellation, idempotency and redaction policy. The
+locator, a durable reservation ID and binding, actually reserved capacity,
+exact risk/preflight/backup/validation/rollback declarations, timeout,
+cancellation, idempotency and redaction policy. A mutable free-space snapshot
+is deliberately not treated as a capability. The
 target and Vault must have distinct physical parents. These values are still
 admission material supplied to pure code; a future trusted broker must derive
 and recheck them before any write is possible.

@@ -4,7 +4,7 @@
 //! performs no filesystem access and cannot execute a repair.
 
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, fmt};
 
 const MAX_FSTAB_BYTES: usize = 1024 * 1024;
 const MAX_FSTAB_LINE_BYTES: usize = 16 * 1024;
@@ -30,7 +30,7 @@ pub enum PreviewError {
     UnsupportedFilesystem,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct DisableMissingUuidPreview {
     selected_uuid: String,
     selected_mountpoint: String,
@@ -40,6 +40,20 @@ pub struct DisableMissingUuidPreview {
     observed_uuid_set_sha256: String,
     after_sha256: String,
     diff_sha256: String,
+}
+
+impl fmt::Debug for DisableMissingUuidPreview {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DisableMissingUuidPreview")
+            .field("source_line", &self.source_line)
+            .field("proposed_fstab_bytes", &self.proposed_fstab.len())
+            .field("before_sha256", &self.before_sha256)
+            .field("observed_uuid_set_sha256", &self.observed_uuid_set_sha256)
+            .field("after_sha256", &self.after_sha256)
+            .field("diff_sha256", &self.diff_sha256)
+            .finish_non_exhaustive()
+    }
 }
 
 impl DisableMissingUuidPreview {
@@ -426,6 +440,9 @@ mod tests {
         assert_eq!(first.selected_uuid(), "dead-beef");
         assert_eq!(first.selected_mountpoint(), "/mnt/archive");
         assert_eq!(first.source_line(), 3);
+        let debug = format!("{first:?}");
+        assert!(!debug.contains("DEAD-BEEF"));
+        assert!(!debug.contains("/mnt/archive"));
         assert_eq!(
             first.proposed_fstab(),
             b"# system\nUUID=AAAA-BBBB / ext4 defaults 0 1\n# KernAid Rescue disabled missing UUID: \tUUID=DEAD-BEEF\t/mnt/archive ext4 defaults 0 2\n"

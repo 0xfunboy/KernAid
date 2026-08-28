@@ -7,17 +7,17 @@
 
 use crate::{
     production_candidate_contract::{
-        ACTION_ID, BACKUP_PHYSICAL_PARENT_POLICY, BACKUP_POLICY_ID, CANCELLATION_POLICY_ID,
-        FINDING_ID, FINDING_VERSION, IDEMPOTENCY_POLICY_ID, PREFLIGHT_ID, REDACTION_POLICY_ID,
-        RESOURCE_ID, ROLLBACK_ID, SUPPORTED_FILESYSTEM, TRANSACTION_TIMEOUT_MILLISECONDS,
-        VALIDATE_ID,
+        ACTION_ID, BACKUP_PHYSICAL_PARENT_POLICY, BACKUP_POLICY_ID, BACKUP_RESERVATION_POLICY_ID,
+        CANCELLATION_POLICY_ID, FINDING_ID, FINDING_VERSION, IDEMPOTENCY_POLICY_ID, PREFLIGHT_ID,
+        REDACTION_POLICY_ID, RESOURCE_ID, ROLLBACK_ID, SUPPORTED_FILESYSTEM,
+        TRANSACTION_TIMEOUT_MILLISECONDS, VALIDATE_ID,
     },
     rescue_fstab_candidate::DisableMissingUuidPreview,
 };
 use sha2::{Digest, Sha256};
 
 const PLAN_HASH_DOMAIN: &[u8] =
-    b"kernaid:linux.fstab.disable-missing-uuid.v1:transaction-plan:v2\0";
+    b"kernaid:linux.fstab.disable-missing-uuid.v1:transaction-plan:v3\0";
 const MAX_ID_BYTES: usize = 128;
 const MAX_OPAQUE_BYTES: usize = 96;
 
@@ -83,44 +83,57 @@ impl SelectedTargetCapability {
     }
 }
 
+/// Broker-resolved proof of a durable Vault reservation minted before the
+/// final plan. `reservation_binding_sha256` binds the pre-plan draft and must
+/// not depend on `plan_sha256`, avoiding a circular capability definition.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BootVaultBackupCapability {
     vault_id: String,
+    reservation_id: String,
+    reservation_binding_sha256: String,
     backup_locator: String,
     vault_identity_fingerprint: String,
     physical_parent_fingerprint: String,
     authenticated_and_unlocked: bool,
     required_capacity_bytes: u64,
-    available_capacity_bytes: u64,
+    reserved_capacity_bytes: u64,
 }
 
 impl BootVaultBackupCapability {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         vault_id: impl Into<String>,
+        reservation_id: impl Into<String>,
+        reservation_binding_sha256: impl Into<String>,
         backup_locator: impl Into<String>,
         vault_identity_fingerprint: impl Into<String>,
         physical_parent_fingerprint: impl Into<String>,
         authenticated_and_unlocked: bool,
         required_capacity_bytes: u64,
-        available_capacity_bytes: u64,
+        reserved_capacity_bytes: u64,
     ) -> Result<Self, CandidateTransactionError> {
         let value = Self {
             vault_id: vault_id.into(),
+            reservation_id: reservation_id.into(),
+            reservation_binding_sha256: reservation_binding_sha256.into(),
             backup_locator: backup_locator.into(),
             vault_identity_fingerprint: vault_identity_fingerprint.into(),
             physical_parent_fingerprint: physical_parent_fingerprint.into(),
             authenticated_and_unlocked,
             required_capacity_bytes,
-            available_capacity_bytes,
+            reserved_capacity_bytes,
         };
-        if !valid_opaque_id(&value.vault_id) {
+        if !valid_opaque_id(&value.vault_id) || !valid_prefixed_id(&value.reservation_id, "B-") {
             return Err(CandidateTransactionError::InvalidCapability);
         }
-        if !valid_vault_locator(&value.backup_locator) {
+        if !valid_vault_locator(&value.backup_locator)
+            || value.backup_locator.strip_prefix("vault://repair/")
+                != Some(value.reservation_id.as_str())
+        {
             return Err(CandidateTransactionError::InvalidVaultLocator);
         }
-        if !valid_sha256(&value.vault_identity_fingerprint)
+        if !valid_sha256(&value.reservation_binding_sha256)
+            || !valid_sha256(&value.vault_identity_fingerprint)
             || !valid_sha256(&value.physical_parent_fingerprint)
         {
             return Err(CandidateTransactionError::InvalidFingerprint);
@@ -128,10 +141,10 @@ impl BootVaultBackupCapability {
         if !value.authenticated_and_unlocked {
             return Err(CandidateTransactionError::VaultNotAuthenticated);
         }
-        if value.required_capacity_bytes == 0 || value.available_capacity_bytes == 0 {
+        if value.required_capacity_bytes == 0 || value.reserved_capacity_bytes == 0 {
             return Err(CandidateTransactionError::InvalidVaultCapacity);
         }
-        if value.available_capacity_bytes < value.required_capacity_bytes {
+        if value.reserved_capacity_bytes < value.required_capacity_bytes {
             return Err(CandidateTransactionError::VaultCapacityInsufficient);
         }
         Ok(value)
@@ -139,6 +152,12 @@ impl BootVaultBackupCapability {
 
     pub fn vault_id(&self) -> &str {
         &self.vault_id
+    }
+    pub fn reservation_id(&self) -> &str {
+        &self.reservation_id
+    }
+    pub fn reservation_binding_sha256(&self) -> &str {
+        &self.reservation_binding_sha256
     }
     pub fn backup_locator(&self) -> &str {
         &self.backup_locator
@@ -155,8 +174,8 @@ impl BootVaultBackupCapability {
     pub const fn required_capacity_bytes(&self) -> u64 {
         self.required_capacity_bytes
     }
-    pub const fn available_capacity_bytes(&self) -> u64 {
-        self.available_capacity_bytes
+    pub const fn reserved_capacity_bytes(&self) -> u64 {
+        self.reserved_capacity_bytes
     }
 }
 
@@ -206,6 +225,7 @@ pub struct CandidatePlanClaimsInput<'a> {
     pub supported_filesystem: &'a str,
     pub preflight_id: &'a str,
     pub backup_policy_id: &'a str,
+    pub backup_reservation_policy_id: &'a str,
     pub backup_physical_parent_policy: &'a str,
     pub validation_id: &'a str,
     pub rollback_id: &'a str,
@@ -227,6 +247,7 @@ pub struct CandidatePlanClaims {
     supported_filesystem: String,
     preflight_id: String,
     backup_policy_id: String,
+    backup_reservation_policy_id: String,
     backup_physical_parent_policy: String,
     validation_id: String,
     rollback_id: String,
@@ -252,6 +273,7 @@ impl CandidatePlanClaims {
             || input.supported_filesystem != SUPPORTED_FILESYSTEM
             || input.preflight_id != PREFLIGHT_ID
             || input.backup_policy_id != BACKUP_POLICY_ID
+            || input.backup_reservation_policy_id != BACKUP_RESERVATION_POLICY_ID
             || input.backup_physical_parent_policy != BACKUP_PHYSICAL_PARENT_POLICY
             || input.validation_id != VALIDATE_ID
             || input.rollback_id != ROLLBACK_ID
@@ -273,6 +295,7 @@ impl CandidatePlanClaims {
             supported_filesystem: input.supported_filesystem.into(),
             preflight_id: input.preflight_id.into(),
             backup_policy_id: input.backup_policy_id.into(),
+            backup_reservation_policy_id: input.backup_reservation_policy_id.into(),
             backup_physical_parent_policy: input.backup_physical_parent_policy.into(),
             validation_id: input.validation_id.into(),
             rollback_id: input.rollback_id.into(),
@@ -312,6 +335,9 @@ impl CandidatePlanClaims {
     }
     pub fn backup_policy_id(&self) -> &str {
         &self.backup_policy_id
+    }
+    pub fn backup_reservation_policy_id(&self) -> &str {
+        &self.backup_reservation_policy_id
     }
     pub fn backup_physical_parent_policy(&self) -> &str {
         &self.backup_physical_parent_policy
@@ -407,6 +433,7 @@ impl FstabCandidateTransactionPlan {
             self.claims.supported_filesystem.as_str(),
             self.claims.preflight_id.as_str(),
             self.claims.backup_policy_id.as_str(),
+            self.claims.backup_reservation_policy_id.as_str(),
             self.claims.backup_physical_parent_policy.as_str(),
             self.claims.validation_id.as_str(),
             self.claims.rollback_id.as_str(),
@@ -422,6 +449,8 @@ impl FstabCandidateTransactionPlan {
             self.target.scan_fingerprint.as_str(),
             self.target.physical_parent_fingerprint.as_str(),
             self.vault.vault_id.as_str(),
+            self.vault.reservation_id.as_str(),
+            self.vault.reservation_binding_sha256.as_str(),
             self.vault.backup_locator.as_str(),
             self.vault.vault_identity_fingerprint.as_str(),
             self.vault.physical_parent_fingerprint.as_str(),
@@ -430,7 +459,7 @@ impl FstabCandidateTransactionPlan {
         }
         digest.update([u8::from(self.vault.authenticated_and_unlocked)]);
         digest.update(self.vault.required_capacity_bytes.to_be_bytes());
-        digest.update(self.vault.available_capacity_bytes.to_be_bytes());
+        digest.update(self.vault.reserved_capacity_bytes.to_be_bytes());
         for binding in &self.evidence {
             hash_string(&mut digest, &binding.evidence_id);
             hash_string(&mut digest, &binding.sha256);
@@ -567,6 +596,7 @@ mod tests {
             supported_filesystem: SUPPORTED_FILESYSTEM,
             preflight_id: PREFLIGHT_ID,
             backup_policy_id: BACKUP_POLICY_ID,
+            backup_reservation_policy_id: BACKUP_RESERVATION_POLICY_ID,
             backup_physical_parent_policy: BACKUP_PHYSICAL_PARENT_POLICY,
             validation_id: VALIDATE_ID,
             rollback_id: ROLLBACK_ID,
@@ -589,8 +619,13 @@ mod tests {
         required: u64,
         available: u64,
     ) -> BootVaultBackupCapability {
+        let reservation_id = locator
+            .strip_prefix("vault://repair/")
+            .unwrap_or("B-invalid");
         BootVaultBackupCapability::new(
             "vault-01",
+            reservation_id,
+            hash('6'),
             locator,
             hash(identity),
             hash(parent),
@@ -633,6 +668,10 @@ mod tests {
         assert_eq!(plan.claims().preflight_id(), PREFLIGHT_ID);
         assert_eq!(plan.claims().backup_policy_id(), BACKUP_POLICY_ID);
         assert_eq!(
+            plan.claims().backup_reservation_policy_id(),
+            BACKUP_RESERVATION_POLICY_ID
+        );
+        assert_eq!(
             plan.claims().backup_physical_parent_policy(),
             BACKUP_PHYSICAL_PARENT_POLICY
         );
@@ -652,12 +691,14 @@ mod tests {
         assert_eq!(plan.target().scan_fingerprint(), scan('1'));
         assert_eq!(plan.target().physical_parent_fingerprint(), hash('a'));
         assert_eq!(plan.vault().vault_id(), "vault-01");
+        assert_eq!(plan.vault().reservation_id(), "B-before");
+        assert_eq!(plan.vault().reservation_binding_sha256(), hash('6'));
         assert_eq!(plan.vault().backup_locator(), "vault://repair/B-before");
         assert_eq!(plan.vault().vault_identity_fingerprint(), hash('2'));
         assert_eq!(plan.vault().physical_parent_fingerprint(), hash('b'));
         assert!(plan.vault().authenticated_and_unlocked());
         assert_eq!(plan.vault().required_capacity_bytes(), 4096);
-        assert_eq!(plan.vault().available_capacity_bytes(), 8192);
+        assert_eq!(plan.vault().reserved_capacity_bytes(), 8192);
         assert_eq!(plan.evidence()[0].evidence_id(), FSTAB_EVIDENCE_ID);
         assert_eq!(plan.evidence()[0].sha256(), hash('3'));
         assert_eq!(plan.evidence()[1].evidence_id(), LSBLK_EVIDENCE_ID);
@@ -723,6 +764,7 @@ mod tests {
         reject!(supported_filesystem, "xfs");
         reject!(preflight_id, "other.preflight");
         reject!(backup_policy_id, "other.backup");
+        reject!(backup_reservation_policy_id, "other.reservation");
         reject!(backup_physical_parent_policy, "same-device");
         reject!(validation_id, "other.validation");
         reject!(rollback_id, "other.rollback");
@@ -750,6 +792,7 @@ mod tests {
         bound!(supported_filesystem, "xfs".into());
         bound!(preflight_id, "other.preflight".into());
         bound!(backup_policy_id, "other.backup".into());
+        bound!(backup_reservation_policy_id, "other.reservation".into());
         bound!(backup_physical_parent_policy, "same-device".into());
         bound!(validation_id, "other.validation".into());
         bound!(rollback_id, "other.rollback".into());
@@ -815,6 +858,8 @@ mod tests {
         let make = |locator, unlocked, required, available| {
             BootVaultBackupCapability::new(
                 "vault",
+                "B-before",
+                hash('6'),
                 locator,
                 hash('2'),
                 hash('b'),
@@ -842,6 +887,34 @@ mod tests {
         assert_eq!(
             make("vault://repair/B-before", true, 8192, 4096),
             Err(CandidateTransactionError::VaultCapacityInsufficient)
+        );
+        assert_eq!(
+            BootVaultBackupCapability::new(
+                "vault",
+                "reservation-without-type",
+                hash('6'),
+                "vault://repair/B-before",
+                hash('2'),
+                hash('b'),
+                true,
+                4096,
+                8192,
+            ),
+            Err(CandidateTransactionError::InvalidCapability)
+        );
+        assert_eq!(
+            BootVaultBackupCapability::new(
+                "vault",
+                "B-before",
+                "sha256:bad",
+                "vault://repair/B-before",
+                hash('2'),
+                hash('b'),
+                true,
+                4096,
+                8192,
+            ),
+            Err(CandidateTransactionError::InvalidFingerprint)
         );
         assert_eq!(
             FstabCandidateTransactionPlan::stage(
@@ -916,6 +989,13 @@ mod tests {
                     .expect("drift plan");
             assert_ne!(base.plan_sha256(), changed.plan_sha256());
         }
+
+        let mut changed_reservation = base.clone();
+        changed_reservation.vault.reservation_id = "B-other".into();
+        assert_ne!(base.plan_sha256(), changed_reservation.compute_hash());
+        changed_reservation.vault.reservation_id = "B-before".into();
+        changed_reservation.vault.reservation_binding_sha256 = hash('7');
+        assert_ne!(base.plan_sha256(), changed_reservation.compute_hash());
 
         let changed_preview = preview_disable_missing_uuid(
             b"# changed\nUUID=AAAA-BBBB / ext4 defaults 0 1\nUUID=DEAD-BEEF /srv/archive ext4 defaults 0 2\n",

@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+pub mod rescue_repair;
+
 #[cfg(target_os = "linux")]
 pub mod rescue_vault;
 

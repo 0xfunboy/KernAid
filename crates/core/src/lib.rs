@@ -592,7 +592,7 @@ pub enum RescueFstabCandidateAdmissionState {
 /// Admission and approval state only. There is intentionally no execute,
 /// repair, verify, rollback, broker, or filesystem transition on this type.
 #[cfg(feature = "rescue-fstab-production-candidate")]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct RescueFstabCandidateAdmission {
     binding: RescueFstabCandidateBinding,
     state: RescueFstabCandidateAdmissionState,

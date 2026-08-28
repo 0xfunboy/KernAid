@@ -2,7 +2,7 @@ apiVersion: kernaid.dev/v1alpha1
 kind: ActionPack
 metadata:
   name: linux-fstab-production-candidate
-  version: 0.1.0
+  version: 0.2.0
 spec:
   productionCandidateOnly: true
   enabledByDefault: false
@@ -16,6 +16,7 @@ spec:
       requiresBackup: true
       supportedFilesystems: [ext4]
       backupPolicy: rescue.boot-vault.byte-exact-before-write.v1
+      backupReservationPolicy: rescue.boot-vault.durable-reservation-before-approval.v1
       backupPhysicalParent: distinct
       timeoutMilliseconds: 120000
       cancellationPolicy: rescue.transaction.safe-boundaries-auto-restore.v1

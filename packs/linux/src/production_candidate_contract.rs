@@ -14,7 +14,7 @@ pub const INPUT_SCHEMA_JSON: &str =
 pub const ACTION_PACK_API_VERSION: &str = "kernaid.dev/v1alpha1";
 pub const ACTION_PACK_KIND: &str = "ActionPack";
 pub const ACTION_PACK_NAME: &str = "linux-fstab-production-candidate";
-pub const ACTION_PACK_VERSION: &str = "0.1.0";
+pub const ACTION_PACK_VERSION: &str = "0.2.0";
 pub const ACTION_ID: &str = "linux.fstab.disable-missing-uuid.v1";
 pub const RESOURCE_ID: &str = "rescue:selected-linux-root:etc/fstab";
 pub const FINDING_ID: &str = "KA-LNX-P0-003";
@@ -28,6 +28,8 @@ pub const VALIDATE_ID: &str = "linux.boot.validate-fstab";
 pub const ROLLBACK_ID: &str = "linux.fstab.restore";
 pub const SUPPORTED_FILESYSTEM: &str = "ext4";
 pub const BACKUP_POLICY_ID: &str = "rescue.boot-vault.byte-exact-before-write.v1";
+pub const BACKUP_RESERVATION_POLICY_ID: &str =
+    "rescue.boot-vault.durable-reservation-before-approval.v1";
 pub const BACKUP_PHYSICAL_PARENT_POLICY: &str = "distinct";
 pub const TRANSACTION_TIMEOUT_MILLISECONDS: u64 = 120_000;
 pub const CANCELLATION_POLICY_ID: &str = "rescue.transaction.safe-boundaries-auto-restore.v1";
@@ -59,6 +61,7 @@ pub struct ProductionCandidateActionContract {
     pub requires_backup: bool,
     pub supported_filesystem: &'static str,
     pub backup_policy: &'static str,
+    pub backup_reservation_policy: &'static str,
     pub backup_physical_parent_policy: &'static str,
     pub timeout_milliseconds: u64,
     pub cancellation_policy: &'static str,
@@ -82,6 +85,7 @@ pub const FSTAB_DISABLE_MISSING_UUID_ACTION: ProductionCandidateActionContract =
         requires_backup: true,
         supported_filesystem: SUPPORTED_FILESYSTEM,
         backup_policy: BACKUP_POLICY_ID,
+        backup_reservation_policy: BACKUP_RESERVATION_POLICY_ID,
         backup_physical_parent_policy: BACKUP_PHYSICAL_PARENT_POLICY,
         timeout_milliseconds: TRANSACTION_TIMEOUT_MILLISECONDS,
         cancellation_policy: CANCELLATION_POLICY_ID,
@@ -300,8 +304,12 @@ mod tests {
         assert!(ACTION_PACK_MANIFEST_YAML.contains("platforms: [linux-rescue]"));
         assert!(ACTION_PACK_MANIFEST_YAML.contains("productionCandidateOnly: true"));
         assert!(ACTION_PACK_MANIFEST_YAML.contains("enabledByDefault: false"));
+        assert!(ACTION_PACK_MANIFEST_YAML.contains(&format!("version: {ACTION_PACK_VERSION}")));
         assert!(ACTION_PACK_MANIFEST_YAML.contains("supportedFilesystems: [ext4]"));
         assert!(ACTION_PACK_MANIFEST_YAML.contains(&format!("backupPolicy: {BACKUP_POLICY_ID}")));
+        assert!(ACTION_PACK_MANIFEST_YAML.contains(&format!(
+            "backupReservationPolicy: {BACKUP_RESERVATION_POLICY_ID}"
+        )));
         assert!(ACTION_PACK_MANIFEST_YAML.contains("backupPhysicalParent: distinct"));
         assert!(ACTION_PACK_MANIFEST_YAML.contains("timeoutMilliseconds: 120000"));
         assert!(
@@ -326,6 +334,10 @@ mod tests {
         assert!(contract.requires_backup);
         assert_eq!(contract.supported_filesystem, SUPPORTED_FILESYSTEM);
         assert_eq!(contract.backup_policy, BACKUP_POLICY_ID);
+        assert_eq!(
+            contract.backup_reservation_policy,
+            BACKUP_RESERVATION_POLICY_ID
+        );
         assert_eq!(
             contract.backup_physical_parent_policy,
             BACKUP_PHYSICAL_PARENT_POLICY

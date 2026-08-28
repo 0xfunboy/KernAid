@@ -28,6 +28,10 @@ jobs:
             --features rescue-fstab-production-candidate -- -D warnings
           cargo test --locked -p kernaid-core \
             --features rescue-fstab-production-candidate
+          cargo clippy --locked -p kernaid-broker --all-targets \
+            --features rescue-fstab-production-candidate -- -D warnings
+          cargo test --locked -p kernaid-broker \
+            --features rescue-fstab-production-candidate
           cargo clippy --locked -p kernaid-linux-pack --all-targets \
             --features rescue-fstab-production-candidate -- -D warnings
           cargo test --locked -p kernaid-linux-pack \

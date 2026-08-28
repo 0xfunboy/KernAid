@@ -12,13 +12,20 @@ fixture-repair-lab = [
     "dep:serde",
     "dep:serde_json",
     "dep:sha2",
+    "kernaid-core/fixture-repair-lab",
     "kernaid-linux-pack/fixture-repair-lab",
+]
+rescue-fstab-production-candidate = [
+    "dep:kernaid-core",
+    "dep:kernaid-linux-pack",
+    "kernaid-core/rescue-fstab-production-candidate",
+    "kernaid-linux-pack/rescue-fstab-production-candidate",
 ]
 [dependencies]
 kernaid-protocol = { path = "../protocol" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-kernaid-core = { path = "../core", optional = true, features = ["fixture-repair-lab"] }
+kernaid-core = { path = "../core", optional = true }
 kernaid-device-identity = { path = "../device-identity", optional = true }
 kernaid-linux-pack = { path = "../../packs/linux", optional = true }
 kernaid-storage = { path = "../storage", optional = true }
@@ -27,6 +34,8 @@ serde_json = { version = "1", optional = true }
 sha2 = { version = "0.10", optional = true }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
+kernaid-evidence = { path = "../evidence" }
+sha2 = "0.10"
 zeroize = "1.8"
 [lints]
 workspace = true

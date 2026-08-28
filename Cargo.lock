@@ -2252,6 +2252,7 @@ version = "0.1.0"
 dependencies = [
  "kernaid-core",
  "kernaid-device-identity",
+ "kernaid-evidence",
  "kernaid-linux-pack",
  "kernaid-protocol",
  "kernaid-storage",

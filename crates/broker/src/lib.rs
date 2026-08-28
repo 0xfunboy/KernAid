@@ -6,6 +6,12 @@ use kernaid_protocol::BrokerRequest;
 #[cfg(all(target_os = "linux", feature = "fixture-repair-lab"))]
 pub mod fixture_repair;
 
+/// Linux-only, read-only preflight for the disabled Rescue `fstab` candidate.
+/// This module is not registered as a broker action and contains no mutation
+/// or filesystem implementation.
+#[cfg(all(target_os = "linux", feature = "rescue-fstab-production-candidate"))]
+pub mod rescue_fstab_candidate;
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum BrokerError {
     InvalidRequest,
