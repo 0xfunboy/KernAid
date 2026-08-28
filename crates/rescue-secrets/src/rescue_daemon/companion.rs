@@ -1455,6 +1455,7 @@ fn read_secret_after_privacy_with_foreground_check(
         interrupted,
         foreground_check,
         HiddenSecretKind::VaultPassphrase,
+        None,
     )
 }
 
@@ -1468,6 +1469,7 @@ fn read_openai_api_key_from_tty(
         interrupted,
         ensure_foreground_tty,
         HiddenSecretKind::OpenAiApiKey,
+        None,
     )
 }
 
@@ -1527,12 +1529,14 @@ Press Ctrl+C to skip and continue without a persistent Vault.\n",
         &interrupted,
         ensure_foreground_tty,
         HiddenSecretKind::VaultPassphrase,
+        Some(b"KERNAID_RESCUE_FIRSTBOOT_PROMPT_READY_V1 step=passphrase\n"),
     )?;
     let confirmation = read_hidden_secret_after_privacy_with_foreground_check(
         tty.as_fd(),
         &interrupted,
         ensure_foreground_tty,
         HiddenSecretKind::FirstBootPassphraseConfirmation,
+        Some(b"KERNAID_RESCUE_FIRSTBOOT_PROMPT_READY_V1 step=confirmation\n"),
     )?;
     Ok((first, confirmation))
 }
@@ -1542,6 +1546,7 @@ fn read_hidden_secret_after_privacy_with_foreground_check(
     interrupted: &AtomicBool,
     foreground_check: fn(BorrowedFd<'_>) -> Result<(), RescueVaultCompanionError>,
     kind: HiddenSecretKind,
+    ready_marker: Option<&'static [u8]>,
 ) -> Result<Zeroizing<Vec<u8>>, RescueVaultCompanionError> {
     // Allocate before echo is disabled so allocator failure cannot strand the
     // controlling terminal in the hidden state.
@@ -1550,6 +1555,14 @@ fn read_hidden_secret_after_privacy_with_foreground_check(
     let prompt_deadline = Instant::now() + Duration::from_secs(2);
     if let Err(error) = write_tty_all(tty, kind.prompt(), prompt_deadline, Some(interrupted)) {
         return Err(guard.abort_after_hide(error));
+    }
+    if let Some(marker) = ready_marker {
+        let mut stdout = std::io::stdout().lock();
+        if std::io::Write::write_all(&mut stdout, marker).is_err()
+            || std::io::Write::flush(&mut stdout).is_err()
+        {
+            return Err(guard.abort_after_hide(RescueVaultCompanionError::TtyUnavailable));
+        }
     }
     let result = read_hidden_secret_line(tty, interrupted, value, kind);
     guard.cleanup_after_hide()?;
@@ -2198,6 +2211,7 @@ mod tests {
             &AtomicBool::new(false),
             assume_foreground,
             HiddenSecretKind::OpenAiApiKey,
+            None,
         )
         .expect("hidden key input");
         writer.join().expect("writer");
@@ -2300,6 +2314,7 @@ mod tests {
                 &AtomicBool::new(true),
                 assume_foreground,
                 HiddenSecretKind::OpenAiApiKey,
+                None,
             ),
             Err(RescueVaultCompanionError::Interrupted)
         );

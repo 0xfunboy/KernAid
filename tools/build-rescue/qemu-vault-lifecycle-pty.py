@@ -1561,12 +1561,15 @@ class QmpClient:
                 raise ClosedFailure("qmp", "oversized")
             self._buffer.extend(chunk)
 
-    def execute(self, command: str) -> None:
+    def execute(
+        self, command: str, arguments: dict[str, object] | None = None
+    ) -> None:
         request_id = self._next_id
         self._next_id += 1
-        payload = json.dumps(
-            {"execute": command, "id": request_id}, separators=(",", ":")
-        ).encode("ascii") + b"\r\n"
+        request: dict[str, object] = {"execute": command, "id": request_id}
+        if arguments is not None:
+            request["arguments"] = arguments
+        payload = json.dumps(request, separators=(",", ":")).encode("ascii") + b"\r\n"
         view = memoryview(payload)
         sent = 0
         try:
@@ -1599,6 +1602,24 @@ class QmpClient:
 
     def system_powerdown(self) -> None:
         self.execute("system_powerdown")
+
+    def send_hex_line(self, secret: bytearray) -> None:
+        if not secret or any(value not in b"0123456789abcdef" for value in secret):
+            raise ClosedFailure("firstboot", "key-alphabet-invalid")
+        events: list[dict[str, object]] = []
+        for value in bytes(secret) + b"\n":
+            qcode = "ret" if value == 10 else chr(value)
+            for down in (True, False):
+                events.append(
+                    {
+                        "type": "key",
+                        "data": {
+                            "down": down,
+                            "key": {"type": "qcode", "data": qcode},
+                        },
+                    }
+                )
+        self.execute("input-send-event", {"events": events})
 
     def quit(self) -> None:
         self.execute("quit")
@@ -3948,6 +3969,27 @@ def main(arguments: Sequence[str]) -> int:
         lifecycle_deadline = aggregate - SHUTDOWN_RESERVE_SECONDS
         if lifecycle_deadline <= time.monotonic():
             raise ClosedFailure("lifecycle", "shutdown-reserve-exhausted")
+        if parsed.boot == 1:
+            console.wait_regex(
+                re.compile(
+                    rb"KERNAID_RESCUE_FIRSTBOOT_PROMPT_READY_V1 step=passphrase"
+                ),
+                start=0,
+                deadline=_deadline(aggregate, READINESS_TIMEOUT_SECONDS),
+                stage="firstboot-start",
+            )
+            qmp.set_deadline(_deadline(aggregate, 10.0))
+            qmp.send_hex_line(correct)
+            console.wait_regex(
+                re.compile(
+                    rb"KERNAID_RESCUE_FIRSTBOOT_PROMPT_READY_V1 step=confirmation"
+                ),
+                start=0,
+                deadline=_deadline(aggregate, READINESS_TIMEOUT_SECONDS),
+                stage="firstboot-confirmation",
+            )
+            qmp.set_deadline(_deadline(aggregate, 10.0))
+            qmp.send_hex_line(correct)
         initial_version, pre_terminal_version, terminal_epoch_version, device_id = (
             run_lifecycle(
                 console,

@@ -36,11 +36,7 @@ vault_loop=""
 iso_loop=""
 iso_mount=""
 iso_mounted=0
-provision_mapper=""
 manager_mapper=""
-provision_mount=""
-provision_open=0
-provision_mounted=0
 controller_pid=""
 owned_pgid=""
 owned_pgid_file=""
@@ -286,14 +282,6 @@ cleanup() {
   set +e
   stop_active_controller TERM || cleanup_failed=1
   clear_owned_group_tracking || cleanup_failed=1
-  if [[ "$provision_mounted" == 1 && -n "$provision_mount" ]]; then
-    umount -- "$provision_mount" >/dev/null 2>&1 || cleanup_failed=1
-    provision_mounted=0
-  fi
-  if [[ "$provision_open" == 1 ]] && mapper_active "$provision_mapper"; then
-    cryptsetup close "$provision_mapper" >/dev/null 2>&1 || cleanup_failed=1
-    provision_open=0
-  fi
   if mapper_active "$manager_mapper"; then
     manager_mount="/run/kernaid/vault/$manager_mapper"
     if mountpoint -q "$manager_mount" >/dev/null 2>&1; then
@@ -337,7 +325,7 @@ cleanup() {
       *) cleanup_failed=1 ;;
     esac
   fi
-  if mapper_active "$provision_mapper" || mapper_active "$manager_mapper"; then
+  if mapper_active "$manager_mapper"; then
     cleanup_failed=1
   fi
   if [[ "$cleanup_failed" != 0 ]]; then
@@ -626,9 +614,8 @@ rescue_media="$work_dir/KernAid-Rescue-usb.raw"
 observe_image="$work_dir/observe-target.raw"
 swap_image="$work_dir/decoy-swap.raw"
 observe_seed="$work_dir/observe-seed"
-provision_mount="$work_dir/provision"
 mkdir -p -- "$observe_seed/etc" "$observe_seed/boot" \
-  "$observe_seed/var/lib/dpkg" "$provision_mount" >/dev/null 2>&1 \
+  "$observe_seed/var/lib/dpkg" >/dev/null 2>&1 \
   || fail provisioning directory-failed
 printf '%s\n' \
   'ID=kernaid-lifecycle-fixture' \
@@ -662,126 +649,7 @@ random_suffix="$(od -An -N8 -tx1 /dev/urandom | tr -d '[:space:]')" \
   || fail provisioning suffix-failed
 [[ "$random_suffix" =~ ^[0-9a-f]{16}$ ]] \
   || fail provisioning suffix-invalid
-provision_mapper="kernaid-provision-$random_suffix"
 manager_mapper="kernaid-vault-$random_suffix"
-
-rescue_loops_before="$(losetup -j "$rescue_media" 2>/dev/null)" \
-  || fail provisioning loop-inspect-failed
-[[ -z "$rescue_loops_before" ]] || fail provisioning loop-residue
-vault_loop="$(
-  losetup --find --show --offset "$p3_start_bytes" \
-    --sizelimit "$p3_bytes" -- "$rescue_media" 2>/dev/null
-)" || fail provisioning loop-failed
-[[ "$vault_loop" =~ ^/dev/loop[0-9]+$ && -b "$vault_loop" ]] \
-  || fail provisioning loop-invalid
-udevadm settle >/dev/null 2>&1 || fail provisioning udev-failed
-observed_backing="$(
-  losetup --noheadings --raw --output BACK-FILE -- "$vault_loop" 2>/dev/null
-)" || fail provisioning loop-inspect-failed
-observed_offset="$(
-  losetup --noheadings --raw --output OFFSET -- "$vault_loop" 2>/dev/null \
-    | tr -d '[:space:]'
-)" || fail provisioning loop-inspect-failed
-observed_limit="$(
-  losetup --noheadings --raw --output SIZELIMIT -- "$vault_loop" 2>/dev/null \
-    | tr -d '[:space:]'
-)" || fail provisioning loop-inspect-failed
-[[ "$(readlink -f -- "$observed_backing")" == "$(readlink -f -- "$rescue_media")" \
-  && "$observed_offset" == "$p3_start_bytes" \
-  && "$observed_limit" == "$p3_bytes" ]] \
-  || fail provisioning loop-scope-invalid
-
-cryptsetup luksFormat --type luks2 --batch-mode --label KERNAID_VAULT \
-  --cipher aes-xts-plain64 --key-size 512 --hash sha256 --sector-size 512 \
-  --pbkdf argon2id --pbkdf-force-iterations 4 --pbkdf-memory 65536 \
-  --pbkdf-parallel 1 --key-slot 0 --keyslot-cipher aes-xts-plain64 \
-  --keyslot-key-size 512 --luks2-metadata-size 16384 \
-  --luks2-keyslots-size 16744448 --use-urandom \
-  --key-file - --keyfile-size 64 "$vault_loop" <"$correct_key" \
-  >/dev/null 2>&1 || fail provisioning luks-format-failed
-cryptsetup open --type luks2 --batch-mode --tries 1 \
-  --disable-external-tokens --key-file - --keyfile-size 64 \
-  "$vault_loop" "$provision_mapper" <"$correct_key" \
-  >/dev/null 2>&1 || fail provisioning luks-open-failed
-provision_open=1
-udevadm settle >/dev/null 2>&1 || fail provisioning udev-failed
-mkfs.ext4 -q -F -t ext4 -b 4096 -I 256 -i 16384 -g 32768 -G 16 \
-  -m 0 -o linux -e remount-ro -J size=128 \
-  -E lazy_itable_init=0,lazy_journal_init=0 \
-  -O none,has_journal,ext_attr,resize_inode,dir_index,filetype,extent,64bit,flex_bg,sparse_super,large_file,huge_file,dir_nlink,extra_isize,metadata_csum \
-  -L KERNAID_VAULT -M / "/dev/mapper/$provision_mapper" \
-  >/dev/null 2>&1 || fail provisioning ext4-format-failed
-tune2fs -c 0 -i 0 -e remount-ro -m 0 -o '^acl,^user_xattr' -M / \
-  "/dev/mapper/$provision_mapper" >/dev/null 2>&1 \
-  || fail provisioning ext4-profile-failed
-mount -t ext4 -o rw,nosuid,nodev,noexec,nosymfollow \
-  "/dev/mapper/$provision_mapper" "$provision_mount" >/dev/null 2>&1 \
-  || fail provisioning mount-failed
-provision_mounted=1
-chmod 700 -- "$provision_mount" >/dev/null 2>&1 \
-  || fail provisioning mount-mode-failed
-printf 'KERNAID-RESCUE-VAULT-V1\n' >"$provision_mount/.kernaid-rescue-vault"
-chmod 600 -- "$provision_mount/.kernaid-rescue-vault" >/dev/null 2>&1 \
-  || fail provisioning marker-mode-failed
-mkdir -- "$provision_mount/.kernaid-secure-state-v1" >/dev/null 2>&1 \
-  || fail provisioning state-directory-failed
-chmod 700 -- "$provision_mount/.kernaid-secure-state-v1" >/dev/null 2>&1 \
-  || fail provisioning state-mode-failed
-: >"$provision_mount/.kernaid-rescue-secrets.lock"
-chmod 600 -- "$provision_mount/.kernaid-rescue-secrets.lock" >/dev/null 2>&1 \
-  || fail provisioning lock-mode-failed
-mkdir -- "$provision_mount/.kernaid-codex-home-v1" >/dev/null 2>&1 \
-  || fail provisioning codex-home-create-failed
-chmod 700 -- "$provision_mount/.kernaid-codex-home-v1" >/dev/null 2>&1 \
-  || fail provisioning codex-home-mode-failed
-chown 973:973 -- "$provision_mount/.kernaid-codex-home-v1" >/dev/null 2>&1 \
-  || fail provisioning codex-home-owner-failed
-printf 'cli_auth_credentials_store = "file"\n' \
-  >"$provision_mount/.kernaid-codex-home-v1/config.toml"
-chmod 600 -- "$provision_mount/.kernaid-codex-home-v1/config.toml" >/dev/null 2>&1 \
-  || fail provisioning codex-config-mode-failed
-chown 973:973 -- "$provision_mount/.kernaid-codex-home-v1/config.toml" >/dev/null 2>&1 \
-  || fail provisioning codex-config-owner-failed
-[[ "$(stat -c '%a:%u:%g' -- "$provision_mount/.kernaid-rescue-vault")" == 600:0:0 \
-  && "$(stat -c '%a:%u:%g' -- "$provision_mount/.kernaid-rescue-secrets.lock")" == 600:0:0 \
-  && "$(stat -c '%a:%u:%g' -- "$provision_mount/.kernaid-secure-state-v1")" == 700:0:0 \
-  && "$(stat -c '%a:%u:%g' -- "$provision_mount/.kernaid-codex-home-v1")" == 700:973:973 \
-  && "$(stat -c '%a:%u:%g:%s' -- "$provision_mount/.kernaid-codex-home-v1/config.toml")" == 600:973:973:36 ]] \
-  || fail provisioning layout-metadata-invalid
-sync -f "$provision_mount" >/dev/null 2>&1 || fail provisioning sync-failed
-umount -- "$provision_mount" >/dev/null 2>&1 \
-  || fail provisioning unmount-failed
-provision_mounted=0
-cryptsetup close "$provision_mapper" >/dev/null 2>&1 \
-  || fail provisioning close-failed
-provision_open=0
-
-probe_line=""
-run_host_probe provisioning initialize
-initial_identity_public_key="${probe_line#* identity_public_key=}"
-initial_identity_public_key="${initial_identity_public_key%% *}"
-[[ "$initial_identity_public_key" =~ ^[0-9a-f]{64}$ ]] \
-  || fail provisioning initialize-identity-invalid
-if mapper_active "$manager_mapper" \
-  || mountpoint -q "/run/kernaid/vault/$manager_mapper" >/dev/null 2>&1; then
-  fail provisioning initialize-residue
-fi
-
-cryptsetup isLuks --type luks2 "$vault_loop" >/dev/null 2>&1 \
-  || fail provisioning luks-profile-invalid
-[[ "$(blkid --probe --cache-file /dev/null --no-encoding --output value --match-tag TYPE "$vault_loop" 2>/dev/null)" == crypto_LUKS \
-  && "$(blkid --probe --cache-file /dev/null --no-encoding --output value --match-tag VERSION "$vault_loop" 2>/dev/null)" == 2 \
-  && "$(blkid --probe --cache-file /dev/null --no-encoding --output value --match-tag LABEL "$vault_loop" 2>/dev/null)" == KERNAID_VAULT ]] \
-  || fail provisioning luks-profile-invalid
-
-detach_owned_loop_bounded \
-  "$vault_loop" "$rescue_media" "$rescue_loops_before" \
-  "$p3_start_bytes" "$p3_bytes" 0 \
-  || fail provisioning loop-detach-failed
-vault_loop=""
-udevadm settle >/dev/null 2>&1 || fail provisioning udev-failed
-[[ -z "$(losetup -j "$rescue_media" 2>/dev/null)" ]] \
-  || fail provisioning loop-residue
 
 sha256_file() {
   sha256sum -- "$1" | awk 'NR == 1 { print $1 }'
@@ -815,6 +683,8 @@ for digest in "$iso_sha256" "$prefix_before_sha256" "$p3_before_sha256" \
 done
 [[ "$prefix_before_sha256" == "$iso_sha256" ]] \
   || fail digest prefix-mismatch
+[[ "$p3_before_sha256" == ebfb4ef19ae410f190327b5ebd312711263bc7579970e87d9c1e2d84e06b3c25 ]] \
+  || fail provisioning p3-not-zero
 
 ovmf_code=""
 ovmf_vars_template=""
@@ -1032,23 +902,18 @@ probe_line=""
 run_host_probe postverify verify
 final_identity_public_key="${probe_line#* identity_public_key=}"
 final_identity_public_key="${final_identity_public_key%% *}"
-[[ "$final_identity_public_key" =~ ^[0-9a-f]{64}$ \
-  && "$final_identity_public_key" == "$initial_identity_public_key" ]] \
-  || fail postverify identity-changed
+[[ "$final_identity_public_key" =~ ^[0-9a-f]{64}$ ]] \
+  || fail postverify identity-invalid
 
 device_id_from_public_key() {
   python3 -I -B -c \
     'import hashlib,re,sys; value=sys.stdin.buffer.read(65); sys.exit(2) if re.fullmatch(b"[0-9a-f]{64}",value) is None else print("KA-"+hashlib.sha256(bytes.fromhex(value.decode("ascii"))).hexdigest()[:24])'
 }
-initial_derived_device_id="$(
-  printf '%s' "$initial_identity_public_key" | device_id_from_public_key
-)" || fail postverify device-id-derive-failed
 final_derived_device_id="$(
   printf '%s' "$final_identity_public_key" | device_id_from_public_key
 )" || fail postverify device-id-derive-failed
-[[ "$initial_derived_device_id" =~ ^KA-[0-9a-f]{24}$ \
-  && "$initial_derived_device_id" == "$final_derived_device_id" \
-  && "$initial_derived_device_id" == "$device_id" ]] \
+[[ "$final_derived_device_id" =~ ^KA-[0-9a-f]{24}$ \
+  && "$final_derived_device_id" == "$device_id" ]] \
   || fail postverify device-id-mismatch
 
 cryptsetup isLuks --type luks2 "$vault_loop" >/dev/null 2>&1 \
@@ -1076,4 +941,4 @@ require_sha256 "$p3_post_verify_sha256"
 printf '%s\n' \
   "$raw_prefix firmware=$firmware media_bytes=$media_bytes iso_bytes=$iso_bytes prefix_before_sha256=$prefix_before_sha256 prefix_after_sha256=$prefix_after_sha256 observe_before_sha256=$observe_before_sha256 observe_after_sha256=$observe_after_sha256 swap_before_sha256=$swap_before_sha256 swap_after_sha256=$swap_after_sha256 p3_before_sha256=$p3_before_sha256 p3_guest_after_sha256=$p3_guest_after_sha256 p3_post_verify_sha256=$p3_post_verify_sha256 prefix_immutable=true observe_immutable=true swap_immutable=true p3_expected_rw=true"
 printf '%s\n' \
-  "$attestation_prefix firmware=$firmware boot_count=$boot_count same_usb=true device_id=$device_id device_id_stable=true identity_public_key_stable=true guest_device_id_derived=true host_postverify=true acpi_shutdowns_clean=true luks_profile_valid=true mutation_versions_exact_plus_two=true wrong_key_rejected=true rate_limit_waited=true boot1_clean_lock=true boot2_persistent_fault=true pre_terminal_daemon_processes_stable=true cgroups_exact=true pre_terminal_capabilities_exact=true ambient_zero=true no_new_privs=true core_limits_zero=true swaps_empty=true shell_mount_absent=true provider_configured=true production_executor_unit_binds_to_exact=true production_executor_status_path=true conditioned_agent_binds_to_runtime=true codex_status_path=true production_ui_provider_relay_path=true signed_report_path=true normal_triple_release=true lifecycle_marker_active_before_borrow=true hold_killed_vaultd=true helper_binds_to_terminated=true worker_pdeath_cleanup=true test_trigger_sockets_gone=true unit_credentials_cleaned=true persistent_fault_status_only=true lifecycle_marker_persisted=true provider_network_used=false tls_openai_qualified=false residue_absent=true qmp_acpi_shutdowns=2 uefi_vars=$([[ "$firmware" == uefi ]] && printf fresh-per-boot || printf not-applicable) ready=true"
+  "$attestation_prefix firmware=$firmware boot_count=$boot_count same_usb=true p3_initially_zero=true firstboot_tty1_qmp=true firstboot_persisted=true device_id=$device_id device_id_stable=true guest_device_id_derived=true host_postverify=true acpi_shutdowns_clean=true luks_profile_valid=true mutation_versions_exact_plus_two=true wrong_key_rejected=true rate_limit_waited=true boot1_clean_lock=true boot2_persistent_fault=true pre_terminal_daemon_processes_stable=true cgroups_exact=true pre_terminal_capabilities_exact=true ambient_zero=true no_new_privs=true core_limits_zero=true swaps_empty=true shell_mount_absent=true provider_configured=true production_executor_unit_binds_to_exact=true production_executor_status_path=true conditioned_agent_binds_to_runtime=true codex_status_path=true production_ui_provider_relay_path=true signed_report_path=true normal_triple_release=true lifecycle_marker_active_before_borrow=true hold_killed_vaultd=true helper_binds_to_terminated=true worker_pdeath_cleanup=true test_trigger_sockets_gone=true unit_credentials_cleaned=true persistent_fault_status_only=true lifecycle_marker_persisted=true provider_network_used=false tls_openai_qualified=false residue_absent=true qmp_acpi_shutdowns=2 uefi_vars=$([[ "$firmware" == uefi ]] && printf fresh-per-boot || printf not-applicable) ready=true"

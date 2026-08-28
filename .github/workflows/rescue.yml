@@ -587,8 +587,10 @@ jobs:
           )
           attestation = re.compile(
               rf"KERNAID_QEMU_VAULT_LIFECYCLE_ATTESTATION_V1 firmware={firmware} "
-              r"boot_count=2 same_usb=true device_id=KA-[0-9a-f]{24} "
-              r"device_id_stable=true identity_public_key_stable=true "
+              r"boot_count=2 same_usb=true p3_initially_zero=true "
+              r"firstboot_tty1_qmp=true firstboot_persisted=true "
+              r"device_id=KA-[0-9a-f]{24} "
+              r"device_id_stable=true "
               r"guest_device_id_derived=true host_postverify=true acpi_shutdowns_clean=true "
               r"luks_profile_valid=true mutation_versions_exact_plus_two=true "
               r"wrong_key_rejected=true rate_limit_waited=true "
@@ -864,8 +866,10 @@ jobs:
           )
           attestation = re.compile(
               rf"KERNAID_QEMU_VAULT_LIFECYCLE_ATTESTATION_V1 firmware={firmware} "
-              r"boot_count=2 same_usb=true device_id=KA-[0-9a-f]{24} "
-              r"device_id_stable=true identity_public_key_stable=true "
+              r"boot_count=2 same_usb=true p3_initially_zero=true "
+              r"firstboot_tty1_qmp=true firstboot_persisted=true "
+              r"device_id=KA-[0-9a-f]{24} "
+              r"device_id_stable=true "
               r"guest_device_id_derived=true host_postverify=true acpi_shutdowns_clean=true "
               r"luks_profile_valid=true mutation_versions_exact_plus_two=true "
               r"wrong_key_rejected=true rate_limit_waited=true "

@@ -3495,6 +3495,16 @@ class StaticContractTests(unittest.TestCase):
         self.assertIn("start_new_session=True", python)
         self.assertIn("--owned-pgid-fd 6", shell)
         self.assertIn("guest_device_id_derived=true", shell)
+        self.assertIn("p3_initially_zero=true", shell)
+        self.assertIn("firstboot_tty1_qmp=true", shell)
+        self.assertIn("qmp.send_hex_line(correct)", python)
+        self.assertIn(
+            "KERNAID_RESCUE_FIRSTBOOT_PROMPT_READY_V1 step=passphrase", python
+        )
+        self.assertIn(
+            "KERNAID_RESCUE_FIRSTBOOT_PROMPT_READY_V1 step=confirmation", python
+        )
+        self.assertNotIn("cryptsetup luksFormat", shell)
         self.assertIn('"-serial",\n            "pty"', python)
         self.assertIn("qmp.system_powerdown()", python)
         self.assertIn("close_fds=True", python)
