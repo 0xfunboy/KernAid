@@ -45,7 +45,12 @@ controller_output="$work_dir/controller.out"
 controller_error="$work_dir/controller.err"
 qmp_socket="$work_dir/qmp.sock"
 
-mkdir -p -- "$seed/etc" "$seed/boot" "$seed/var/lib/dpkg" "$seed/srv/archive"
+mkdir -p -- \
+  "$seed/etc" \
+  "$seed/boot" \
+  "$seed/usr" \
+  "$seed/var/lib/dpkg" \
+  "$seed/srv/archive"
 printf '%s\n' \
   'ID=kernaid-repair-fixture' \
   'NAME="KernAid repair qualification fixture"' \
