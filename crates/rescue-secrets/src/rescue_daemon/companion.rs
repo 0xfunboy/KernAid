@@ -1476,6 +1476,7 @@ fn read_openai_api_key_from_tty(
 #[derive(Clone, Copy)]
 enum HiddenSecretKind {
     VaultPassphrase,
+    #[cfg(feature = "experimental-firstboot-provisioner")]
     FirstBootPassphraseConfirmation,
     OpenAiApiKey,
 }
@@ -1483,9 +1484,9 @@ enum HiddenSecretKind {
 impl HiddenSecretKind {
     const fn maximum(self) -> usize {
         match self {
-            Self::VaultPassphrase | Self::FirstBootPassphraseConfirmation => {
-                MAX_PASSPHRASE_BYTES as usize
-            }
+            Self::VaultPassphrase => MAX_PASSPHRASE_BYTES as usize,
+            #[cfg(feature = "experimental-firstboot-provisioner")]
+            Self::FirstBootPassphraseConfirmation => MAX_PASSPHRASE_BYTES as usize,
             Self::OpenAiApiKey => MAX_OPENAI_KEY_BYTES as usize,
         }
     }
@@ -1493,6 +1494,7 @@ impl HiddenSecretKind {
     const fn prompt(self) -> &'static [u8] {
         match self {
             Self::VaultPassphrase => b"READY\nVault passphrase: ",
+            #[cfg(feature = "experimental-firstboot-provisioner")]
             Self::FirstBootPassphraseConfirmation => b"Repeat vault passphrase: ",
             Self::OpenAiApiKey => b"READY\nOpenAI API key: ",
         }
@@ -1500,7 +1502,13 @@ impl HiddenSecretKind {
 
     fn validate(self, value: &[u8]) -> bool {
         match self {
-            Self::VaultPassphrase | Self::FirstBootPassphraseConfirmation => {
+            Self::VaultPassphrase => {
+                (MIN_PASSPHRASE_BYTES as usize..=MAX_PASSPHRASE_BYTES as usize)
+                    .contains(&value.len())
+                    && !value.contains(&0)
+            }
+            #[cfg(feature = "experimental-firstboot-provisioner")]
+            Self::FirstBootPassphraseConfirmation => {
                 (MIN_PASSPHRASE_BYTES as usize..=MAX_PASSPHRASE_BYTES as usize)
                     .contains(&value.len())
                     && !value.contains(&0)

@@ -1,3 +1,5 @@
+#[cfg(feature = "experimental-repair-store")]
+use super::runtime::WorkerRepairGetResult;
 use super::{
     RescueVaultDaemonError, enforce_process_privacy, group_has_exact_application_boundaries,
     internal_wire, passwd_application_agent_uid, passwd_has_exact_companion,
@@ -10,6 +12,11 @@ use super::{
 };
 #[cfg(feature = "experimental-codex-home-lease")]
 use super::{group_has_exact_codex_boundaries, passwd_has_exact_codex_agent};
+#[cfg(feature = "experimental-repair-store")]
+use kernaid_protocol::rescue_repair_vault::{
+    MAX_REPAIR_BACKUP_BYTES, RepairBackupBinding, RepairBackupDraft, RepairBackupState,
+    RepairBackupStatusPayload, RepairFileMetadataV1,
+};
 use kernaid_protocol::rescue_vault::{
     AgentRole, DescriptorDeclaration, DescriptorType, ErrorToken, MAX_INITIAL_STATE_VERSION,
     MAX_SAFE_JSON_INTEGER, Operation, PeerAllowlist, Provider, ProviderState,
@@ -31,6 +38,8 @@ use rustix::{
     pipe::{PipeFlags, pipe_with},
     process::{Signal as ProcessSignal, pidfd_send_signal},
 };
+#[cfg(feature = "experimental-repair-store")]
+use sha2::Digest;
 use std::{
     env,
     ffi::OsStr,
@@ -275,6 +284,46 @@ trait WorkerBoundary: Send + Sync {
         deadline: Instant,
     ) -> Result<(internal_wire::WorkerResponse, Vec<ReportSummary>), RescueVaultDaemonError>;
     fn report_get(&self, report_id: &ReportId, deadline: Instant) -> WorkerReportGetResult;
+    #[cfg(feature = "experimental-repair-store")]
+    fn repair_backup_reserve(
+        &self,
+        draft: &RepairBackupDraft,
+        deadline: Instant,
+    ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
+        let _ = (draft, deadline);
+        Err(RescueVaultDaemonError::ProtocolFailure)
+    }
+    #[cfg(feature = "experimental-repair-store")]
+    fn repair_backup_persist(
+        &self,
+        expected: &RepairBackupStatusPayload,
+        binding: &RepairBackupBinding,
+        metadata: &RepairFileMetadataV1,
+        input_size: u64,
+        input: OwnedFd,
+        deadline: Instant,
+    ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
+        let _ = (expected, binding, metadata, input_size, input, deadline);
+        Err(RescueVaultDaemonError::ProtocolFailure)
+    }
+    #[cfg(feature = "experimental-repair-store")]
+    fn repair_backup_status(
+        &self,
+        expected: &RepairBackupStatusPayload,
+        deadline: Instant,
+    ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
+        let _ = (expected, deadline);
+        Err(RescueVaultDaemonError::ProtocolFailure)
+    }
+    #[cfg(feature = "experimental-repair-store")]
+    fn repair_backup_get(
+        &self,
+        expected: &RepairBackupStatusPayload,
+        deadline: Instant,
+    ) -> WorkerRepairGetResult {
+        let _ = (expected, deadline);
+        Err(RescueVaultDaemonError::ProtocolFailure)
+    }
     fn verify_healthy(&self) -> Result<(), RescueVaultDaemonError>;
     fn exited(&self) -> Result<bool, RescueVaultDaemonError>;
     fn fault_and_terminate(&self, deadline: Instant) -> Result<(), RescueVaultDaemonError>;
@@ -336,6 +385,48 @@ impl WorkerBoundary for WorkerHandle {
 
     fn report_get(&self, report_id: &ReportId, deadline: Instant) -> WorkerReportGetResult {
         WorkerHandle::report_get(self, report_id, deadline)
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    fn repair_backup_reserve(
+        &self,
+        draft: &RepairBackupDraft,
+        deadline: Instant,
+    ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
+        WorkerHandle::repair_backup_reserve(self, draft, deadline)
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    fn repair_backup_persist(
+        &self,
+        expected: &RepairBackupStatusPayload,
+        binding: &RepairBackupBinding,
+        metadata: &RepairFileMetadataV1,
+        input_size: u64,
+        input: OwnedFd,
+        deadline: Instant,
+    ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
+        WorkerHandle::repair_backup_persist(
+            self, expected, binding, metadata, input_size, input, deadline,
+        )
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    fn repair_backup_status(
+        &self,
+        expected: &RepairBackupStatusPayload,
+        deadline: Instant,
+    ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
+        WorkerHandle::repair_backup_status(self, expected, deadline)
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    fn repair_backup_get(
+        &self,
+        expected: &RepairBackupStatusPayload,
+        deadline: Instant,
+    ) -> WorkerRepairGetResult {
+        WorkerHandle::repair_backup_get(self, expected, deadline)
     }
 
     fn verify_healthy(&self) -> Result<(), RescueVaultDaemonError> {
@@ -1574,6 +1665,12 @@ fn handle_connection_by(
             | Operation::AuditAppend
             | Operation::ReportPersist
     );
+    #[cfg(feature = "experimental-repair-store")]
+    let mutation = mutation
+        || matches!(
+            request.operation(),
+            Operation::RepairBackupReserve | Operation::RepairBackupPersist
+        );
     let started = Instant::now();
     let (version, result) = supervisor.handle_connected_request(
         request,
@@ -1612,6 +1709,24 @@ fn handle_connection_by(
             {
                 drop(read);
                 let _ = write_report_pipe(write, &envelope, send_deadline);
+            }
+        }
+        #[cfg(feature = "experimental-repair-store")]
+        HandlerResult::RepairBackup {
+            request,
+            payload,
+            backup,
+        } => {
+            let Ok((read, write)) = pipe_with(PipeFlags::CLOEXEC) else {
+                let _ = peer.send_error(&request, version, ErrorToken::IoFailed, send_deadline);
+                return;
+            };
+            if peer
+                .send_success(&request, version, &payload, &[read.as_fd()], send_deadline)
+                .is_ok()
+            {
+                drop(read);
+                let _ = write_repair_backup_pipe(write, &backup, send_deadline);
             }
         }
         HandlerResult::Descriptor {
@@ -1707,6 +1822,12 @@ enum HandlerResult {
         request: ValidatedRequest,
         payload: SuccessPayload,
         envelope: Zeroizing<Vec<u8>>,
+    },
+    #[cfg(feature = "experimental-repair-store")]
+    RepairBackup {
+        request: ValidatedRequest,
+        payload: SuccessPayload,
+        backup: Zeroizing<Vec<u8>>,
     },
     Descriptor {
         request: ValidatedRequest,
@@ -2102,6 +2223,22 @@ impl Supervisor {
             }
             Operation::ReportGet => {
                 self.handle_application_report_get(request, started, &connection)
+            }
+            #[cfg(feature = "experimental-repair-store")]
+            Operation::RepairBackupReserve => {
+                self.handle_repair_backup_reserve(request, started, &connection)
+            }
+            #[cfg(feature = "experimental-repair-store")]
+            Operation::RepairBackupPersist => {
+                self.handle_repair_backup_persist(request, started, &connection)
+            }
+            #[cfg(feature = "experimental-repair-store")]
+            Operation::RepairBackupStatus => {
+                self.handle_repair_backup_status(request, started, &connection)
+            }
+            #[cfg(feature = "experimental-repair-store")]
+            Operation::RepairBackupGet => {
+                self.handle_repair_backup_get(request, started, &connection)
             }
             #[cfg(not(feature = "experimental-codex-home-lease"))]
             Operation::ProviderCodexHomeLease => {
@@ -2549,6 +2686,331 @@ impl Supervisor {
                 )
             }
         }
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    fn handle_repair_backup_reserve(
+        self: &Arc<Self>,
+        request: ValidatedRequest,
+        started: Instant,
+        connection: &ClientConnection<'_>,
+    ) -> (u64, HandlerResult) {
+        let deadline = started
+            .checked_add(WORKER_OPERATION_TIMEOUT)
+            .unwrap_or(started);
+        let draft = match request.payload() {
+            RequestPayload::RepairBackupReserve { draft } => draft.clone(),
+            _ => {
+                let version = self.snapshot().version;
+                return (version, HandlerResult::Error(request, ErrorToken::IoFailed));
+            }
+        };
+        if let Err((version, error)) = self.prepare_application_operation(
+            request.expected_state_version(),
+            true,
+            connection,
+            deadline,
+        ) {
+            return (version, HandlerResult::Error(request, error));
+        }
+        let Some(worker) = self.worker.as_ref() else {
+            self.mark_fault_by(deadline);
+            return (
+                self.snapshot().version,
+                HandlerResult::Error(request, ErrorToken::RebootRequired),
+            );
+        };
+        match worker.repair_backup_reserve(&draft, deadline) {
+            Ok(response)
+                if response.code == internal_wire::WorkerResultCode::RepairBackupReserved =>
+            {
+                let status = response
+                    .repair_status
+                    .as_deref()
+                    .and_then(|status| status.to_protocol().ok());
+                match status.filter(|status| {
+                    status.state() == RepairBackupState::Reserved
+                        && status.draft_binding_sha256() == &draft.draft_binding_sha256()
+                        && status.backup_size() == draft.backup_size()
+                        && status.expected_backup_sha256() == draft.expected_backup_sha256()
+                        && status.metadata_sha256() == draft.metadata_sha256()
+                        && status.reserved_bytes() >= draft.required_capacity_bytes()
+                }) {
+                    Some(status) => self.finish_application_mutation(
+                        request,
+                        Ok(SuccessPayload::RepairBackupStatus(Box::new(status))),
+                        deadline,
+                    ),
+                    None => self.repair_worker_fault(request, deadline),
+                }
+            }
+            Ok(response) => self.finish_repair_error(request, response.code, true, deadline),
+            Err(_) => self.repair_worker_fault(request, deadline),
+        }
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    fn handle_repair_backup_persist(
+        self: &Arc<Self>,
+        mut request: ValidatedRequest,
+        started: Instant,
+        connection: &ClientConnection<'_>,
+    ) -> (u64, HandlerResult) {
+        let deadline = started
+            .checked_add(WORKER_OPERATION_TIMEOUT)
+            .unwrap_or(started);
+        let (expected, binding, metadata, input_size) = match request.payload() {
+            RequestPayload::RepairBackupPersist {
+                expected,
+                binding,
+                metadata,
+                input,
+            } => (
+                (**expected).clone(),
+                binding.clone(),
+                metadata.clone(),
+                input.size,
+            ),
+            _ => {
+                let version = self.snapshot().version;
+                return (version, HandlerResult::Error(request, ErrorToken::IoFailed));
+            }
+        };
+        if metadata.mode() != 0o644
+            || metadata.uid() != 0
+            || metadata.gid() != 0
+            || metadata.canonical_sha256() != *expected.metadata_sha256()
+            || binding.resource_sha256() != expected.expected_backup_sha256()
+            || expected.state() != RepairBackupState::Reserved
+            || input_size != expected.backup_size()
+        {
+            let version = self.snapshot().version;
+            return (version, HandlerResult::Error(request, ErrorToken::IoFailed));
+        }
+        if let Err((version, error)) = self.prepare_application_operation(
+            request.expected_state_version(),
+            true,
+            connection,
+            deadline,
+        ) {
+            return (version, HandlerResult::Error(request, error));
+        }
+        let Some(input) = request.take_descriptor() else {
+            return self.finish_application_mutation(
+                request,
+                Err(ErrorToken::FdRequired),
+                deadline,
+            );
+        };
+        let Some(worker) = self.worker.as_ref() else {
+            self.mark_fault_by(deadline);
+            return (
+                self.snapshot().version,
+                HandlerResult::Error(request, ErrorToken::RebootRequired),
+            );
+        };
+        match worker
+            .repair_backup_persist(&expected, &binding, &metadata, input_size, input, deadline)
+        {
+            Ok(response)
+                if response.code == internal_wire::WorkerResultCode::RepairBackupDurable =>
+            {
+                let status = response
+                    .repair_status
+                    .as_deref()
+                    .and_then(|status| status.to_protocol().ok());
+                match status.filter(|status| {
+                    status.state() == RepairBackupState::Durable
+                        && repair_status_immutable_fields_match(status, &expected)
+                        && status.plan_id() == Some(binding.plan_id())
+                        && status.plan_sha256() == Some(binding.plan_sha256())
+                        && status.approval_id() == Some(binding.approval_id())
+                        && status.approval_sha256() == Some(binding.approval_sha256())
+                        && status.resource_id() == Some(binding.resource_id())
+                        && status.resource_sha256() == Some(binding.resource_sha256())
+                }) {
+                    Some(status) => self.finish_application_mutation(
+                        request,
+                        Ok(SuccessPayload::RepairBackupStatus(Box::new(status))),
+                        deadline,
+                    ),
+                    None => self.repair_worker_fault(request, deadline),
+                }
+            }
+            Ok(response) => self.finish_repair_error(request, response.code, true, deadline),
+            Err(_) => self.repair_worker_fault(request, deadline),
+        }
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    fn handle_repair_backup_status(
+        self: &Arc<Self>,
+        request: ValidatedRequest,
+        started: Instant,
+        connection: &ClientConnection<'_>,
+    ) -> (u64, HandlerResult) {
+        let deadline = started
+            .checked_add(WORKER_OPERATION_TIMEOUT)
+            .unwrap_or(started);
+        let expected = match request.payload() {
+            RequestPayload::RepairBackupStatus { expected } => (**expected).clone(),
+            _ => {
+                let version = self.snapshot().version;
+                return (version, HandlerResult::Error(request, ErrorToken::IoFailed));
+            }
+        };
+        if let Err((version, error)) = self.prepare_application_operation(
+            request.expected_state_version(),
+            false,
+            connection,
+            deadline,
+        ) {
+            return (version, HandlerResult::Error(request, error));
+        }
+        let Some(worker) = self.worker.as_ref() else {
+            self.mark_fault_by(deadline);
+            return (
+                self.snapshot().version,
+                HandlerResult::Error(request, ErrorToken::RebootRequired),
+            );
+        };
+        match worker.repair_backup_status(&expected, deadline) {
+            Ok(response)
+                if response.code == internal_wire::WorkerResultCode::RepairBackupStatusReady =>
+            {
+                let status = response
+                    .repair_status
+                    .as_deref()
+                    .and_then(|status| status.to_protocol().ok());
+                match status
+                    .filter(|status| repair_status_immutable_fields_match(status, &expected))
+                {
+                    Some(status) => self.finish_application_read(
+                        request,
+                        Ok(SuccessPayload::RepairBackupStatus(Box::new(status))),
+                        deadline,
+                    ),
+                    None => self.repair_worker_fault(request, deadline),
+                }
+            }
+            Ok(response) => self.finish_repair_error(request, response.code, false, deadline),
+            Err(_) => self.repair_worker_fault(request, deadline),
+        }
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    fn handle_repair_backup_get(
+        self: &Arc<Self>,
+        request: ValidatedRequest,
+        started: Instant,
+        connection: &ClientConnection<'_>,
+    ) -> (u64, HandlerResult) {
+        let deadline = started
+            .checked_add(WORKER_OPERATION_TIMEOUT)
+            .unwrap_or(started);
+        let expected = match request.payload() {
+            RequestPayload::RepairBackupGet { expected } => (**expected).clone(),
+            _ => {
+                let version = self.snapshot().version;
+                return (version, HandlerResult::Error(request, ErrorToken::IoFailed));
+            }
+        };
+        if expected.state() != RepairBackupState::Durable {
+            let version = self.snapshot().version;
+            return (version, HandlerResult::Error(request, ErrorToken::IoFailed));
+        }
+        if let Err((version, error)) = self.prepare_application_operation(
+            request.expected_state_version(),
+            false,
+            connection,
+            deadline,
+        ) {
+            return (version, HandlerResult::Error(request, error));
+        }
+        let Some(worker) = self.worker.as_ref() else {
+            self.mark_fault_by(deadline);
+            return (
+                self.snapshot().version,
+                HandlerResult::Error(request, ErrorToken::RebootRequired),
+            );
+        };
+        match worker.repair_backup_get(&expected, deadline) {
+            Ok((response, Some(backup)))
+                if response.code == internal_wire::WorkerResultCode::RepairBackupReady =>
+            {
+                let status = response
+                    .repair_status
+                    .as_deref()
+                    .and_then(|status| status.to_protocol().ok());
+                let Some(status) = status.filter(|status| {
+                    status.state() == RepairBackupState::Durable
+                        && status == &expected
+                        && usize::try_from(status.backup_size()).ok() == Some(backup.len())
+                        && sha2::Sha256::digest(backup.as_slice()).as_slice()
+                            == status.expected_backup_sha256().bytes()
+                }) else {
+                    return self.repair_worker_fault(request, deadline);
+                };
+                let version = match self.release_provider_status() {
+                    Ok(version) => version,
+                    Err(()) => return self.repair_worker_fault(request, deadline),
+                };
+                let output = DescriptorDeclaration {
+                    kind: DescriptorType::RepairBackupOutputPipe,
+                    size: status.backup_size(),
+                };
+                (
+                    version,
+                    HandlerResult::RepairBackup {
+                        request,
+                        payload: SuccessPayload::RepairBackup(Box::new(status), output),
+                        backup,
+                    },
+                )
+            }
+            Ok((response, None)) => {
+                self.finish_repair_error(request, response.code, false, deadline)
+            }
+            Ok((_, Some(_))) | Err(_) => self.repair_worker_fault(request, deadline),
+        }
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    fn finish_repair_error(
+        &self,
+        request: ValidatedRequest,
+        code: internal_wire::WorkerResultCode,
+        mutation: bool,
+        deadline: Instant,
+    ) -> (u64, HandlerResult) {
+        use internal_wire::WorkerResultCode as Result;
+        let error = match code {
+            Result::RepairInvalidRequest | Result::RepairBackupNotFound => ErrorToken::IoFailed,
+            Result::RepairConflict => ErrorToken::StaleState,
+            Result::Busy => ErrorToken::Busy,
+            Result::RepairReconciliationRequired
+            | Result::RepairStorageUnavailable
+            | Result::CleanupFailed => return self.repair_worker_fault(request, deadline),
+            _ => return self.repair_worker_fault(request, deadline),
+        };
+        if mutation {
+            self.finish_application_mutation(request, Err(error), deadline)
+        } else {
+            self.finish_application_read(request, Err(error), deadline)
+        }
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    fn repair_worker_fault(
+        &self,
+        request: ValidatedRequest,
+        deadline: Instant,
+    ) -> (u64, HandlerResult) {
+        self.mark_fault_by(deadline);
+        (
+            self.snapshot().version,
+            HandlerResult::Error(request, ErrorToken::RebootRequired),
+        )
     }
 
     fn handle_provider_status(
@@ -4887,6 +5349,14 @@ fn external_operation_is_enabled(
                 | Operation::ReportList
                 | Operation::ReportGet
         ),
+        #[cfg(feature = "experimental-repair-store")]
+        kernaid_protocol::rescue_vault::PeerRole::RepairBroker => matches!(
+            operation,
+            Operation::RepairBackupReserve
+                | Operation::RepairBackupPersist
+                | Operation::RepairBackupStatus
+                | Operation::RepairBackupGet
+        ),
     }
 }
 
@@ -4933,6 +5403,8 @@ fn provider_process_scope(role: kernaid_protocol::rescue_vault::PeerRole) -> Pro
         | kernaid_protocol::rescue_vault::PeerRole::Agent(AgentRole::Application) => {
             ProcessScope::DirectPeer
         }
+        #[cfg(feature = "experimental-repair-store")]
+        kernaid_protocol::rescue_vault::PeerRole::RepairBroker => ProcessScope::DirectPeer,
     }
 }
 
@@ -5224,6 +5696,53 @@ fn write_report_pipe(descriptor: OwnedFd, envelope: &[u8], deadline: Instant) ->
         }
     }
     Ok(())
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn write_repair_backup_pipe(
+    descriptor: OwnedFd,
+    backup: &[u8],
+    deadline: Instant,
+) -> Result<(), ()> {
+    if backup.is_empty() || backup.len() > MAX_REPAIR_BACKUP_BYTES as usize {
+        return Err(());
+    }
+    let status = rfs::fcntl_getfl(&descriptor).map_err(|_| ())?;
+    if status & OFlags::ACCMODE != OFlags::WRONLY {
+        return Err(());
+    }
+    rfs::fcntl_setfl(&descriptor, status | OFlags::NONBLOCK).map_err(|_| ())?;
+    let mut written = 0_usize;
+    while written < backup.len() {
+        ensure_before(deadline)?;
+        match rustix::io::write(&descriptor, &backup[written..]) {
+            Ok(0) => return Err(()),
+            Ok(count) => written = written.checked_add(count).ok_or(())?,
+            Err(error) if error == rustix::io::Errno::INTR => {}
+            Err(error) if error == rustix::io::Errno::AGAIN => {
+                wait_pipe_writable(descriptor.as_fd(), deadline)?;
+            }
+            Err(_) => return Err(()),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn repair_status_immutable_fields_match(
+    left: &RepairBackupStatusPayload,
+    right: &RepairBackupStatusPayload,
+) -> bool {
+    left.reservation_id() == right.reservation_id()
+        && left.draft_binding_sha256() == right.draft_binding_sha256()
+        && left.locator() == right.locator()
+        && left.vault_id() == right.vault_id()
+        && left.vault_identity_fingerprint() == right.vault_identity_fingerprint()
+        && left.physical_parent_fingerprint() == right.physical_parent_fingerprint()
+        && left.reserved_bytes() == right.reserved_bytes()
+        && left.backup_size() == right.backup_size()
+        && left.expected_backup_sha256() == right.expected_backup_sha256()
+        && left.metadata_sha256() == right.metadata_sha256()
 }
 
 fn wait_pipe(descriptor: BorrowedFd<'_>, deadline: Instant) -> Result<(), ()> {
@@ -6023,15 +6542,15 @@ mod tests {
             .as_raw();
         assert_ne!(uid, 0, "handler tests require an unprivileged peer");
         let other_uid = if uid == 1 { 2 } else { 1 };
-        let (companion_uid, agent_role, agent_uid) = match role {
-            PeerRole::Companion => (uid, AgentRole::OpenAi, other_uid),
-            PeerRole::Agent(agent_role) => (other_uid, agent_role, uid),
-        };
-        let allowlist = PeerAllowlist::builder(companion_uid)
-            .agent(agent_role, agent_uid)
-            .expect("test Agent role mapping")
-            .build()
-            .expect("test allowlist");
+        let allowlist = match role {
+            PeerRole::Companion => PeerAllowlist::builder(uid).agent(AgentRole::OpenAi, other_uid),
+            PeerRole::Agent(agent_role) => PeerAllowlist::builder(other_uid).agent(agent_role, uid),
+            #[cfg(feature = "experimental-repair-store")]
+            PeerRole::RepairBroker => PeerAllowlist::builder(other_uid).repair_broker(uid),
+        }
+        .expect("test peer role mapping")
+        .build()
+        .expect("test allowlist");
         let peer = authenticate_seqpacket_peer(server.as_fd(), allowlist)
             .expect("authenticated test peer");
         let request_id = format!(
@@ -7424,6 +7943,48 @@ mod tests {
         for role in [PeerRole::Companion, PeerRole::Agent(AgentRole::Application)] {
             assert_eq!(provider_process_scope(role), ProcessScope::DirectPeer);
         }
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    #[test]
+    fn repair_broker_has_only_the_four_repair_operations() {
+        let repair_operations = [
+            Operation::RepairBackupReserve,
+            Operation::RepairBackupPersist,
+            Operation::RepairBackupStatus,
+            Operation::RepairBackupGet,
+        ];
+        for operation in repair_operations {
+            assert!(external_operation_is_enabled(
+                operation,
+                PeerRole::RepairBroker
+            ));
+            for role in [
+                PeerRole::Companion,
+                PeerRole::Agent(AgentRole::OpenAi),
+                PeerRole::Agent(AgentRole::Codex),
+                PeerRole::Agent(AgentRole::Application),
+            ] {
+                assert!(!external_operation_is_enabled(operation, role));
+            }
+        }
+        for operation in [
+            Operation::VaultStatus,
+            Operation::VaultUnlock,
+            Operation::VaultLock,
+            Operation::ProviderStatus,
+            Operation::ReportPersist,
+            Operation::ReportGet,
+        ] {
+            assert!(!external_operation_is_enabled(
+                operation,
+                PeerRole::RepairBroker
+            ));
+        }
+        assert_eq!(
+            provider_process_scope(PeerRole::RepairBroker),
+            ProcessScope::DirectPeer
+        );
     }
 
     #[test]

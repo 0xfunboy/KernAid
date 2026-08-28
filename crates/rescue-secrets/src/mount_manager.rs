@@ -4,10 +4,11 @@
 //! in the current mount namespace; it is not a production claim of atomic
 //! ownership against another privileged actor.
 
-use super::{
-    RescueSecretError, RescueVaultSecrets, VAULT_MARKER_NAME, VAULT_MARKER_V1,
-    VaultMountAttestation,
-};
+#[cfg(feature = "experimental-repair-store")]
+use super::RepairPhysicalParentClaims;
+use super::{RescueSecretError, RescueVaultSecrets, VaultMountAttestation};
+#[cfg(feature = "experimental-firstboot-provisioner")]
+use super::{VAULT_MARKER_NAME, VAULT_MARKER_V1};
 use crate::{
     bounded_process,
     device_locator::{
@@ -25,19 +26,22 @@ use crate::{
 };
 #[cfg(feature = "experimental-firstboot-provisioner")]
 use rand_core::{OsRng, RngCore};
+#[cfg(feature = "experimental-firstboot-provisioner")]
+use rustix::fs::RawDir;
 use rustix::{
     fd::{AsFd, OwnedFd},
     fs::{
-        self as rfs, AtFlags, CWD, FileType, FlockOperation, Mode, OFlags, RawDir, ResolveFlags,
-        Stat, StatxFlags,
+        self as rfs, AtFlags, CWD, FileType, FlockOperation, Mode, OFlags, ResolveFlags, Stat,
+        StatxFlags,
     },
     mount::{MountFlags, UnmountFlags},
 };
+#[cfg(feature = "experimental-firstboot-provisioner")]
+use std::mem::MaybeUninit;
 use std::{
     error::Error,
     ffi::OsStr,
     fs::{self, File},
-    mem::MaybeUninit,
     os::fd::AsRawFd,
     os::unix::ffi::OsStrExt,
     path::{Component, Path, PathBuf},
@@ -617,6 +621,18 @@ impl BlockDevice {
 
     fn major_minor(&self) -> (u32, u32) {
         (rfs::major(self.rdev), rfs::minor(self.rdev))
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    fn repair_physical_parent_claims(&self) -> Option<RepairPhysicalParentClaims> {
+        self.located_identity
+            .map(|identity| RepairPhysicalParentClaims {
+                parent_major: identity.parent_major,
+                parent_minor: identity.parent_minor,
+                disk_sequence: identity.disk_sequence,
+                media_sector_count: identity.media_sector_count,
+                logical_sector_bytes: identity.logical_sector_bytes,
+            })
     }
 
     fn revalidate_profile_capability(&self) -> Result<(), ProfileClassifierError> {
@@ -1682,7 +1698,10 @@ impl VaultOps for SystemOps {
         mapping: &MappingIdentity,
     ) -> Result<VaultMountAttestation, VaultMountManagerError> {
         with_mount_attestation_revalidation(
-            || mapping.revalidate(&request.device, &request.mapper, header),
+            || {
+                request.device.revalidate()?;
+                mapping.revalidate(&request.device, &request.mapper, header)
+            },
             || {
                 linux::mint_managed_mount_attestation(
                     &request.mount_root,
@@ -1692,6 +1711,8 @@ impl VaultOps for SystemOps {
                     mapping.minor,
                     mapping.backing_major,
                     mapping.backing_minor,
+                    #[cfg(feature = "experimental-repair-store")]
+                    request.device.repair_physical_parent_claims(),
                 )
                 .map_err(|_| VaultMountManagerError::MountVerificationFailed)
             },
@@ -1716,6 +1737,8 @@ impl VaultOps for SystemOps {
             mapping.minor,
             mapping.backing_major,
             mapping.backing_minor,
+            #[cfg(feature = "experimental-repair-store")]
+            request.device.repair_physical_parent_claims(),
         )
         .map_err(|_| VaultMountManagerError::CleanupFailed)?;
         mapping
@@ -3124,6 +3147,7 @@ mod tests {
         FailedOpenAbsent,
         ArmDeferred,
         VerifyDeferred,
+        #[cfg(feature = "experimental-firstboot-provisioner")]
         FormatFilesystem,
         Filesystem,
         Prepare,
@@ -3404,6 +3428,8 @@ mod tests {
                     backing_minor: mapping.backing_minor,
                     mapper_name: request.mapper.as_fixed_bytes(),
                     luks_uuid: header.uuid,
+                    #[cfg(feature = "experimental-repair-store")]
+                    repair_physical_parent: request.device.repair_physical_parent_claims(),
                 },
             })
         }

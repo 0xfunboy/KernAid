@@ -42,6 +42,19 @@ pub(crate) struct MountAttestationClaims {
     pub(crate) backing_minor: u32,
     pub(crate) mapper_name: [u8; 30],
     pub(crate) luks_uuid: [u8; 36],
+    #[cfg(feature = "experimental-repair-store")]
+    pub(crate) repair_physical_parent: Option<RepairPhysicalParentClaims>,
+}
+
+/// Parent-disk identity material sealed into a production mount attestation.
+#[cfg(all(target_os = "linux", feature = "experimental-repair-store"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RepairPhysicalParentClaims {
+    pub(crate) parent_major: u32,
+    pub(crate) parent_minor: u32,
+    pub(crate) disk_sequence: u64,
+    pub(crate) media_sector_count: u64,
+    pub(crate) logical_sector_bytes: u64,
 }
 
 /// Exact contents of the root marker created by the separate provisioning
@@ -163,6 +176,9 @@ mod linux;
 #[cfg(target_os = "linux")]
 mod application_store;
 
+#[cfg(all(target_os = "linux", feature = "experimental-repair-store"))]
+mod repair_store;
+
 #[cfg(target_os = "linux")]
 mod bounded_process;
 
@@ -208,6 +224,12 @@ pub use linux::{RescueDeviceIdentityStore, RescueJournalSecretStore};
 pub use mount_manager::{
     MapperName, MountedRescueVault, RescueVaultMountManager, VaultMountManagerError,
     VaultUnlockRequest,
+};
+#[cfg(all(target_os = "linux", feature = "experimental-repair-store"))]
+pub use repair_store::{
+    DurableRepairBackup, RepairBackupDraft, RepairBackupStatus, RepairBackupSummary, RepairBinding,
+    RepairVaultStore, RepairVaultStoreError, ReservationId, ReservedRepairBackup,
+    VerifiedBackupMetadata, canonical_fstab_metadata_sha256,
 };
 #[cfg(all(target_os = "linux", feature = "experimental-vault-manager"))]
 pub use rescue_daemon::{

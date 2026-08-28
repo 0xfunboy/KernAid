@@ -233,6 +233,28 @@ each journal operation. A concurrent root actor able to replace pathname state
 inside that narrow interval remains an explicit residual threat until a
 descriptor-bound SQLite VFS or private privileged daemon boundary replaces it.
 
+## Disabled Repair Vault candidate
+
+The off-default `experimental-repair-store` feature adds a separate
+`.kernaid-repair-store-v1` namespace for exact pre-repair backups. Reserve
+physically allocates and reads back the requested capacity. Persist accepts
+only a closed anonymous PIPEFS input, checks exact byte count, EOF and SHA-256,
+installs into the retained directory with fsync, then verifies the complete
+named object. Status and Get require the opaque reservation plus its draft
+binding and expose no host path. The daemon carries the full capability,
+canonical root-owned `fstab` metadata and durable plan/approval binding over a
+feature-specific closed internal wire ABI; its default ABI is unchanged.
+
+The journal binds durable Vault identity to the authenticated LUKS UUID and
+provisioned device-identity public key before crash recovery. The live physical
+parent is separately required when a Reserved capability is resumed or
+persisted, while an already Durable backup remains verifiable after reboot.
+Reserve, persist and cancel transitions are intent/complete journal pairs with
+idempotent recovery. The feature is not reachable in the shipping image: no
+RepairBroker account is provisioned and no target resolver or mutation handler
+is installed. Stable cancellation after parent-epoch drift, backup retention
+and journal compaction remain promotion gates.
+
 ## Provisioning and disposable probe
 
 The default Rust production surface contains no format, erase, raw-write, LUKS

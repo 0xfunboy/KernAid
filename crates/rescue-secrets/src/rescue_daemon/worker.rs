@@ -8,6 +8,13 @@ use crate::{
     RescueApplicationStoreError, RescueVaultMountManager, VaultMountManagerError,
     VaultUnlockRequest, locate_boot_vault,
 };
+#[cfg(feature = "experimental-repair-store")]
+use crate::{
+    RepairBackupDraft as StoreRepairBackupDraft, RepairBackupStatus as StoreRepairBackupStatus,
+    RepairBackupSummary as StoreRepairBackupSummary, RepairBinding as StoreRepairBinding,
+    RepairVaultStoreError, ReservationId as StoreReservationId,
+    VerifiedBackupMetadata as StoreVerifiedBackupMetadata,
+};
 use kernaid_protocol::rescue_vault::{
     AuditEventType, AuditOutcome, ErrorToken, MAX_OPENAI_KEY_BYTES, MAX_SESSION_REPORT_JSON_BYTES,
     MAX_SIGNED_REPORT_ENVELOPE_BYTES, ReportId, RequestId, validate_openai_api_key_bytes,
@@ -21,6 +28,8 @@ use rustix::{
     process::{Signal, getppid, set_parent_process_death_signal},
 };
 use sha2::{Digest, Sha256};
+#[cfg(feature = "experimental-repair-store")]
+use std::io::Read;
 use std::{
     io,
     time::{Duration, Instant},
@@ -37,6 +46,9 @@ const PIPEFS_MAGIC: u64 = 0x5049_5045;
 const MAX_PROVIDER_OUTPUT_BYTES: usize = MAX_OPENAI_KEY_BYTES as usize;
 const MAX_REPORT_INPUT_BYTES: usize = MAX_SESSION_REPORT_JSON_BYTES as usize;
 const MAX_REPORT_OUTPUT_BYTES: usize = MAX_SIGNED_REPORT_ENVELOPE_BYTES as usize;
+#[cfg(feature = "experimental-repair-store")]
+const MAX_REPAIR_BYTES: usize =
+    kernaid_protocol::rescue_repair_vault::MAX_REPAIR_BACKUP_BYTES as usize;
 const _: () = assert!(MAX_PROVIDER_OUTPUT_BYTES <= rustix::pipe::PIPE_BUF);
 
 enum WorkerVaultState {
@@ -472,6 +484,163 @@ fn handle_command(
             };
             (response, false)
         }
+        #[cfg(feature = "experimental-repair-store")]
+        Command::RepairBackupReserve => {
+            if descriptor.is_some() {
+                return (
+                    internal_wire::WorkerResponse::new(request_id, Result::RepairInvalidRequest),
+                    false,
+                );
+            }
+            let Some(internal_wire::WorkerRepairCommand::Reserve { draft }) =
+                command.repair.as_ref()
+            else {
+                return (
+                    internal_wire::WorkerResponse::new(request_id, Result::RepairInvalidRequest),
+                    false,
+                );
+            };
+            let reserved = match state {
+                WorkerVaultState::Locked => Err(Result::Busy),
+                WorkerVaultState::Unlocked(_) if validate_no_active_swap().is_err() => {
+                    Err(Result::CleanupFailed)
+                }
+                WorkerVaultState::Unlocked(mounted) => reserve_repair_backup(mounted, draft),
+            };
+            let response = match reserved {
+                Ok(status) => internal_wire::WorkerResponse::repair(
+                    request_id,
+                    Result::RepairBackupReserved,
+                    status,
+                ),
+                Err(code) => internal_wire::WorkerResponse::new(request_id, code),
+            };
+            (response, false)
+        }
+        #[cfg(feature = "experimental-repair-store")]
+        Command::RepairBackupPersist => {
+            let Some(source) = descriptor else {
+                return (
+                    internal_wire::WorkerResponse::new(request_id, Result::RepairInvalidRequest),
+                    false,
+                );
+            };
+            let Some(internal_wire::WorkerRepairCommand::Persist {
+                expected,
+                binding,
+                metadata,
+                input_size,
+            }) = command.repair.as_ref()
+            else {
+                return (
+                    internal_wire::WorkerResponse::new(request_id, Result::RepairInvalidRequest),
+                    false,
+                );
+            };
+            if validate_internal_repair_source_pipe(source.as_fd(), *input_size).is_err()
+                || !metadata.is_supported_root_file()
+                || expected.metadata_sha256
+                    != metadata
+                        .to_protocol()
+                        .map(|value| value.canonical_sha256().bytes())
+                        .unwrap_or([0; 32])
+            {
+                return (
+                    internal_wire::WorkerResponse::new(request_id, Result::RepairInvalidRequest),
+                    false,
+                );
+            }
+            let persisted = match state {
+                WorkerVaultState::Locked => Err(Result::Busy),
+                WorkerVaultState::Unlocked(_) if validate_no_active_swap().is_err() => {
+                    Err(Result::CleanupFailed)
+                }
+                WorkerVaultState::Unlocked(mounted) => {
+                    persist_repair_backup(mounted, expected, binding, *input_size, source)
+                }
+            };
+            let response = match persisted {
+                Ok(status) => internal_wire::WorkerResponse::repair(
+                    request_id,
+                    Result::RepairBackupDurable,
+                    status,
+                ),
+                Err(code) => internal_wire::WorkerResponse::new(request_id, code),
+            };
+            (response, false)
+        }
+        #[cfg(feature = "experimental-repair-store")]
+        Command::RepairBackupStatus => {
+            if descriptor.is_some() {
+                return (
+                    internal_wire::WorkerResponse::new(request_id, Result::RepairInvalidRequest),
+                    false,
+                );
+            }
+            let Some(internal_wire::WorkerRepairCommand::Status { expected }) =
+                command.repair.as_ref()
+            else {
+                return (
+                    internal_wire::WorkerResponse::new(request_id, Result::RepairInvalidRequest),
+                    false,
+                );
+            };
+            let status = match state {
+                WorkerVaultState::Locked => Err(Result::Busy),
+                WorkerVaultState::Unlocked(_) if validate_no_active_swap().is_err() => {
+                    Err(Result::CleanupFailed)
+                }
+                WorkerVaultState::Unlocked(mounted) => repair_backup_status(mounted, expected),
+            };
+            let response = match status {
+                Ok(status) => internal_wire::WorkerResponse::repair(
+                    request_id,
+                    Result::RepairBackupStatusReady,
+                    status,
+                ),
+                Err(code) => internal_wire::WorkerResponse::new(request_id, code),
+            };
+            (response, false)
+        }
+        #[cfg(feature = "experimental-repair-store")]
+        Command::RepairBackupGet => {
+            let Some(output) = descriptor else {
+                return (
+                    internal_wire::WorkerResponse::new(request_id, Result::RepairInvalidRequest),
+                    false,
+                );
+            };
+            if validate_internal_application_output_pipe(output.as_fd()).is_err() {
+                return (
+                    internal_wire::WorkerResponse::new(request_id, Result::RepairInvalidRequest),
+                    false,
+                );
+            }
+            let Some(internal_wire::WorkerRepairCommand::Get { expected }) =
+                command.repair.as_ref()
+            else {
+                return (
+                    internal_wire::WorkerResponse::new(request_id, Result::RepairInvalidRequest),
+                    false,
+                );
+            };
+            let backup = match state {
+                WorkerVaultState::Locked => Err(Result::Busy),
+                WorkerVaultState::Unlocked(_) if validate_no_active_swap().is_err() => {
+                    Err(Result::CleanupFailed)
+                }
+                WorkerVaultState::Unlocked(mounted) => get_repair_backup(mounted, expected, output),
+            };
+            let response = match backup {
+                Ok(status) => internal_wire::WorkerResponse::repair(
+                    request_id,
+                    Result::RepairBackupReady,
+                    status,
+                ),
+                Err(code) => internal_wire::WorkerResponse::new(request_id, code),
+            };
+            (response, false)
+        }
         #[cfg(feature = "experimental-codex-home-lease")]
         Command::ProviderCodexHomeLease => {
             if descriptor.is_some() || response_descriptor.is_some() {
@@ -861,6 +1030,333 @@ fn get_report(
         Some(Err(())) => Err(Result::IoFailed),
         None => Err(Result::ApplicationStateAmbiguous),
     }
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn reserve_repair_backup(
+    mounted: &MountedRescueVault,
+    draft: &internal_wire::WorkerRepairDraft,
+) -> Result<internal_wire::WorkerRepairStatus, internal_wire::WorkerResultCode> {
+    let draft = StoreRepairBackupDraft::new(
+        draft.session_id.clone(),
+        draft.target_id.clone(),
+        draft.target_fingerprint,
+        draft.expected_backup_sha256,
+        draft.metadata_sha256,
+        draft.backup_size,
+        draft.required_capacity_bytes,
+    )
+    .map_err(map_repair_store_error)?;
+    let mut store = mounted
+        .secrets()
+        .open_repair_store()
+        .map_err(map_repair_store_error)?;
+    let reserved = store
+        .reserve_backup(draft)
+        .map_err(map_repair_store_error)?;
+    repair_reserved_status(reserved.summary())
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn persist_repair_backup(
+    mounted: &MountedRescueVault,
+    expected: &internal_wire::WorkerRepairStatus,
+    binding: &internal_wire::WorkerRepairBinding,
+    input_size: u64,
+    source: OwnedFd,
+) -> Result<internal_wire::WorkerRepairStatus, internal_wire::WorkerResultCode> {
+    use internal_wire::{WorkerRepairState, WorkerResultCode as Result};
+    if expected.state != WorkerRepairState::Reserved
+        || expected.backup_size != input_size
+        || binding.resource_sha256 != expected.expected_backup_sha256
+    {
+        return Err(Result::RepairInvalidRequest);
+    }
+    let reservation_id = StoreReservationId::parse(expected.reservation_id.clone())
+        .map_err(map_repair_store_error)?;
+    let mut store = mounted
+        .secrets()
+        .open_repair_store()
+        .map_err(map_repair_store_error)?;
+    let reserved = store
+        .resume_reserved(
+            &reservation_id,
+            &encode_worker_sha256(expected.draft_binding_sha256),
+        )
+        .map_err(map_repair_store_error)?;
+    let observed = repair_reserved_status(reserved.summary())?;
+    if &observed != expected {
+        return Err(Result::RepairConflict);
+    }
+    let expected_binding = binding.clone();
+    let binding = StoreRepairBinding::new(
+        binding.plan_id.clone(),
+        binding.plan_sha256,
+        binding.approval_id.clone(),
+        binding.approval_sha256,
+        binding.resource_id.clone(),
+        binding.resource_sha256,
+    )
+    .map_err(map_repair_store_error)?;
+    let source_deadline = Instant::now()
+        .checked_add(APPLICATION_PIPE_TIMEOUT)
+        .ok_or(Result::RepairStorageUnavailable)?;
+    let durable = store
+        .persist_backup_until(reserved, binding, source, source_deadline)
+        .map_err(map_repair_store_error)?;
+    let status = repair_durable_status(durable.metadata())?;
+    if !status.immutable_fields_match(expected)
+        || status.state != WorkerRepairState::Durable
+        || status.binding.as_ref() != Some(&expected_binding)
+    {
+        return Err(Result::RepairConflict);
+    }
+    Ok(status)
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn repair_backup_status(
+    mounted: &MountedRescueVault,
+    expected: &internal_wire::WorkerRepairStatus,
+) -> Result<internal_wire::WorkerRepairStatus, internal_wire::WorkerResultCode> {
+    use internal_wire::{WorkerRepairState, WorkerResultCode as Result};
+    let reservation_id = StoreReservationId::parse(expected.reservation_id.clone())
+        .map_err(map_repair_store_error)?;
+    let store = mounted
+        .secrets()
+        .open_repair_store()
+        .map_err(map_repair_store_error)?;
+    let draft_binding = encode_worker_sha256(expected.draft_binding_sha256);
+    let observed = match store
+        .backup_status(&reservation_id, &draft_binding)
+        .map_err(map_repair_store_error)?
+    {
+        StoreRepairBackupStatus::Absent => return Err(Result::RepairBackupNotFound),
+        StoreRepairBackupStatus::Reserved(summary) => repair_reserved_status(&summary)?,
+        StoreRepairBackupStatus::Durable(metadata) => repair_durable_status(&metadata)?,
+        StoreRepairBackupStatus::ReconciliationRequired => {
+            return Err(Result::RepairReconciliationRequired);
+        }
+    };
+    if !observed.immutable_fields_match(expected)
+        || expected.state == WorkerRepairState::Durable && &observed != expected
+        || expected.state == WorkerRepairState::Durable
+            && observed.state != WorkerRepairState::Durable
+    {
+        return Err(Result::RepairConflict);
+    }
+    Ok(observed)
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn get_repair_backup(
+    mounted: &MountedRescueVault,
+    expected: &internal_wire::WorkerRepairStatus,
+    output: OwnedFd,
+) -> Result<internal_wire::WorkerRepairStatus, internal_wire::WorkerResultCode> {
+    use internal_wire::{WorkerRepairState, WorkerResultCode as Result};
+    if expected.state != WorkerRepairState::Durable {
+        return Err(Result::RepairInvalidRequest);
+    }
+    let reservation_id = StoreReservationId::parse(expected.reservation_id.clone())
+        .map_err(map_repair_store_error)?;
+    let store = mounted
+        .secrets()
+        .open_repair_store()
+        .map_err(map_repair_store_error)?;
+    let draft_binding = encode_worker_sha256(expected.draft_binding_sha256);
+    let status = match store
+        .backup_status(&reservation_id, &draft_binding)
+        .map_err(map_repair_store_error)?
+    {
+        StoreRepairBackupStatus::Absent => return Err(Result::RepairBackupNotFound),
+        StoreRepairBackupStatus::Durable(metadata) => repair_durable_status(&metadata)?,
+        StoreRepairBackupStatus::Reserved(_) => return Err(Result::RepairConflict),
+        StoreRepairBackupStatus::ReconciliationRequired => {
+            return Err(Result::RepairReconciliationRequired);
+        }
+    };
+    if &status != expected {
+        return Err(Result::RepairConflict);
+    }
+    let expected_size = expected.backup_size;
+    let expected_hash = expected.expected_backup_sha256;
+    let callback = store
+        .with_verified_backup(&reservation_id, &draft_binding, |reader| {
+            write_repair_output(
+                output,
+                reader,
+                expected_size,
+                expected_hash,
+                Instant::now() + APPLICATION_PIPE_TIMEOUT,
+            )
+            .map_err(|_| RepairVaultStoreError::StorageUnavailable)
+        })
+        .map_err(map_repair_store_error)?;
+    let final_status = repair_durable_status(&callback)?;
+    if final_status != status {
+        return Err(Result::RepairConflict);
+    }
+    Ok(status)
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn repair_reserved_status(
+    summary: &StoreRepairBackupSummary,
+) -> Result<internal_wire::WorkerRepairStatus, internal_wire::WorkerResultCode> {
+    Ok(internal_wire::WorkerRepairStatus {
+        state: internal_wire::WorkerRepairState::Reserved,
+        reservation_id: summary.reservation_id().as_str().to_owned(),
+        draft_binding_sha256: parse_store_sha256(summary.reservation_binding_sha256())?,
+        locator: summary.backup_locator().to_owned(),
+        vault_id: summary.vault_id().to_owned(),
+        vault_identity_fingerprint: parse_store_sha256(summary.vault_identity_fingerprint())?,
+        physical_parent_fingerprint: parse_store_sha256(summary.physical_parent_fingerprint())?,
+        reserved_bytes: summary.reserved_capacity_bytes(),
+        backup_size: summary.backup_size_bytes(),
+        expected_backup_sha256: parse_store_sha256(summary.expected_backup_sha256())?,
+        metadata_sha256: parse_store_sha256(summary.metadata_sha256())?,
+        binding: None,
+    })
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn repair_durable_status(
+    metadata: &StoreVerifiedBackupMetadata,
+) -> Result<internal_wire::WorkerRepairStatus, internal_wire::WorkerResultCode> {
+    Ok(internal_wire::WorkerRepairStatus {
+        state: internal_wire::WorkerRepairState::Durable,
+        reservation_id: metadata.reservation_id().as_str().to_owned(),
+        draft_binding_sha256: parse_store_sha256(metadata.reservation_binding_sha256())?,
+        locator: metadata.backup_locator().to_owned(),
+        vault_id: metadata.vault_id().to_owned(),
+        vault_identity_fingerprint: parse_store_sha256(metadata.vault_identity_fingerprint())?,
+        physical_parent_fingerprint: parse_store_sha256(metadata.physical_parent_fingerprint())?,
+        reserved_bytes: metadata.reserved_capacity_bytes(),
+        backup_size: metadata.backup_size_bytes(),
+        expected_backup_sha256: parse_store_sha256(metadata.backup_sha256())?,
+        metadata_sha256: parse_store_sha256(metadata.metadata_sha256())?,
+        binding: Some(internal_wire::WorkerRepairBinding {
+            plan_id: metadata.plan_id().to_owned(),
+            plan_sha256: parse_store_sha256(metadata.plan_sha256())?,
+            approval_id: metadata.approval_id().to_owned(),
+            approval_sha256: parse_store_sha256(metadata.approval_sha256())?,
+            resource_id: metadata.resource_id().to_owned(),
+            resource_sha256: parse_store_sha256(metadata.resource_sha256())?,
+        }),
+    })
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn parse_store_sha256(value: &str) -> Result<[u8; 32], internal_wire::WorkerResultCode> {
+    let value = kernaid_protocol::rescue_vault::Sha256::parse(value)
+        .map_err(|_| internal_wire::WorkerResultCode::RepairStorageUnavailable)?;
+    internal_wire::decode_sha256(&value)
+        .map_err(|_| internal_wire::WorkerResultCode::RepairStorageUnavailable)
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn encode_worker_sha256(value: [u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(64);
+    for byte in value {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    output
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn map_repair_store_error(error: RepairVaultStoreError) -> internal_wire::WorkerResultCode {
+    use internal_wire::WorkerResultCode as Result;
+    match error {
+        RepairVaultStoreError::InvalidDraft
+        | RepairVaultStoreError::InvalidBinding
+        | RepairVaultStoreError::InvalidReservationId
+        | RepairVaultStoreError::UnsafeSource
+        | RepairVaultStoreError::SourceHashMismatch => Result::RepairInvalidRequest,
+        RepairVaultStoreError::ReservationNotFound => Result::RepairBackupNotFound,
+        RepairVaultStoreError::ReservationConflict
+        | RepairVaultStoreError::ReservationNotReady
+        | RepairVaultStoreError::ConcurrentWrite => Result::RepairConflict,
+        RepairVaultStoreError::ReconciliationRequired => Result::RepairReconciliationRequired,
+        RepairVaultStoreError::InsufficientCapacity
+        | RepairVaultStoreError::PhysicalParentUnavailable
+        | RepairVaultStoreError::CorruptJournal
+        | RepairVaultStoreError::CorruptStore
+        | RepairVaultStoreError::WriteVerificationFailed
+        | RepairVaultStoreError::StorageUnavailable => Result::RepairStorageUnavailable,
+    }
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn write_repair_output(
+    output: OwnedFd,
+    reader: &mut dyn Read,
+    expected_size: u64,
+    expected_sha256: [u8; 32],
+    deadline: Instant,
+) -> Result<(), ()> {
+    let expected = usize::try_from(expected_size)
+        .ok()
+        .filter(|size| (1..=MAX_REPAIR_BYTES).contains(size))
+        .ok_or(())?;
+    let status = rfs::fcntl_getfl(&output).map_err(|_| ())?;
+    rfs::fcntl_setfl(&output, status | OFlags::NONBLOCK).map_err(|_| ())?;
+    let mut written = 0_usize;
+    let mut hasher = Sha256::new();
+    let mut buffer = Zeroizing::new([0_u8; 8192]);
+    while written < expected {
+        let wanted = (expected - written).min(buffer.len());
+        let read = reader.read(&mut buffer[..wanted]).map_err(|_| ())?;
+        if read == 0 {
+            return Err(());
+        }
+        hasher.update(&buffer[..read]);
+        let mut offset = 0_usize;
+        while offset < read {
+            ensure_pipe_deadline(deadline)?;
+            match rustix::io::write(&output, &buffer[offset..read]) {
+                Ok(0) => return Err(()),
+                Ok(size) => offset += size,
+                Err(error) if error == rustix::io::Errno::INTR => {}
+                Err(error) if error == rustix::io::Errno::AGAIN => {
+                    wait_pipe_ready(output.as_fd(), PollFlags::OUT, deadline)?;
+                }
+                Err(_) => return Err(()),
+            }
+        }
+        written += read;
+    }
+    let mut extra = [0_u8; 1];
+    if reader.read(&mut extra).map_err(|_| ())? != 0
+        || hasher.finalize().as_slice() != expected_sha256
+    {
+        return Err(());
+    }
+    drop(output);
+    Ok(())
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn validate_internal_repair_source_pipe(
+    descriptor: BorrowedFd<'_>,
+    expected_size: u64,
+) -> Result<(), ()> {
+    let stat = rfs::fstat(descriptor).map_err(|_| ())?;
+    let filesystem = rfs::fstatfs(descriptor).map_err(|_| ())?;
+    let status = rfs::fcntl_getfl(descriptor).map_err(|_| ())?;
+    let flags = rustix::io::fcntl_getfd(descriptor).map_err(|_| ())?;
+    if !(1..=MAX_REPAIR_BYTES as u64).contains(&expected_size)
+        || !FileType::from_raw_mode(stat.st_mode).is_fifo()
+        || u64::try_from(filesystem.f_type).ok() != Some(PIPEFS_MAGIC)
+        || stat.st_size != 0
+        || status & OFlags::ACCMODE != OFlags::RDONLY
+        || flags != rustix::io::FdFlags::CLOEXEC
+    {
+        return Err(());
+    }
+    Ok(())
 }
 
 fn read_exact_application_pipe(

@@ -7,6 +7,7 @@ edition.workspace = true
 experimental-vault-manager = []
 experimental-codex-home-lease = ["experimental-vault-manager", "dep:kernaid-linux-nsfs"]
 experimental-firstboot-provisioner = ["experimental-vault-manager"]
+experimental-repair-store = ["experimental-vault-manager", "kernaid-protocol/experimental-repair-store"]
 privileged-probe = ["experimental-vault-manager"]
 
 [dependencies]

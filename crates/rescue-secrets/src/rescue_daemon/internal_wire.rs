@@ -8,6 +8,11 @@
 //! the separate experimental Codex-home feature, one successful response may
 //! instead carry the already validated `O_PATH` home-directory descriptor.
 
+#[cfg(feature = "experimental-repair-store")]
+use kernaid_protocol::rescue_repair_vault::{
+    MAX_REPAIR_BACKUP_BYTES, RepairBackupBinding, RepairBackupDraft, RepairBackupState,
+    RepairBackupStatusPayload, RepairFileMetadataV1, RepairReservationId,
+};
 use kernaid_protocol::rescue_vault::{
     AuditEventType, AuditOutcome, ErrorToken, MAX_AUDIT_SEQUENCE, MAX_OPENAI_KEY_BYTES,
     MAX_PASSPHRASE_BYTES, MAX_REPORTS_PER_RESPONSE, MAX_SESSION_REPORT_JSON_BYTES,
@@ -32,11 +37,30 @@ use std::{
 #[cfg(feature = "experimental-codex-home-lease")]
 use std::os::fd::AsFd;
 
+#[cfg(feature = "experimental-repair-store")]
+const COMMAND_MAGIC: &[u8; 8] = b"KRVWC004";
+#[cfg(not(feature = "experimental-repair-store"))]
 const COMMAND_MAGIC: &[u8; 8] = b"KRVWC003";
+#[cfg(feature = "experimental-repair-store")]
+const RESPONSE_MAGIC: &[u8; 8] = b"KRVWR004";
+#[cfg(not(feature = "experimental-repair-store"))]
 const RESPONSE_MAGIC: &[u8; 8] = b"KRVWR003";
+// Repair capabilities intentionally remain one canonical fixed-size binary
+// record. 2048 bytes covers the closed set of bounded (<=128 byte) opaque IDs
+// and hashes without introducing JSON, paths, or a second framing language.
+#[cfg(feature = "experimental-repair-store")]
+const COMMAND_BYTES: usize = 2048;
+#[cfg(not(feature = "experimental-repair-store"))]
 const COMMAND_BYTES: usize = 128;
+#[cfg(feature = "experimental-repair-store")]
+const RESPONSE_BYTES: usize = 2048;
+#[cfg(not(feature = "experimental-repair-store"))]
 const RESPONSE_BYTES: usize = 128;
-const MAX_RECORD_BYTES: usize = RESPONSE_BYTES;
+const MAX_RECORD_BYTES: usize = if COMMAND_BYTES > RESPONSE_BYTES {
+    COMMAND_BYTES
+} else {
+    RESPONSE_BYTES
+};
 const COMMAND_VALUE_OFFSET: usize = 20;
 const COMMAND_PEER_UID_OFFSET: usize = 28;
 const COMMAND_PEER_PID_OFFSET: usize = 32;
@@ -51,6 +75,322 @@ const MAX_DEVICE_ID_BYTES: usize = 32;
 pub(super) const APPLICATION_REPORT_RECORD_BYTES: usize = 64;
 pub(super) const MAX_APPLICATION_REPORT_LIST_BYTES: usize =
     MAX_REPORTS_PER_RESPONSE * APPLICATION_REPORT_RECORD_BYTES;
+#[cfg(feature = "experimental-repair-store")]
+const REPAIR_PAYLOAD_OFFSET: usize = 20;
+#[cfg(feature = "experimental-repair-store")]
+const MAX_REPAIR_ID_BYTES: usize = 128;
+
+#[cfg(feature = "experimental-repair-store")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum WorkerRepairState {
+    Reserved,
+    Durable,
+}
+
+#[cfg(feature = "experimental-repair-store")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct WorkerRepairDraft {
+    pub(super) session_id: String,
+    pub(super) target_id: String,
+    pub(super) target_fingerprint: [u8; 32],
+    pub(super) expected_backup_sha256: [u8; 32],
+    pub(super) metadata_sha256: [u8; 32],
+    pub(super) backup_size: u64,
+    pub(super) required_capacity_bytes: u64,
+}
+
+#[cfg(feature = "experimental-repair-store")]
+impl WorkerRepairDraft {
+    pub(super) fn from_protocol(value: &RepairBackupDraft) -> Self {
+        Self {
+            session_id: value.session_id().to_owned(),
+            target_id: value.target_id().to_owned(),
+            target_fingerprint: value.target_fingerprint().bytes(),
+            expected_backup_sha256: value.expected_backup_sha256().bytes(),
+            metadata_sha256: value.metadata_sha256().bytes(),
+            backup_size: value.backup_size(),
+            required_capacity_bytes: value.required_capacity_bytes(),
+        }
+    }
+
+    fn validate(&self) -> Result<(), InternalWireError> {
+        RepairBackupDraft::new(
+            self.session_id.clone(),
+            self.target_id.clone(),
+            protocol_sha256(self.target_fingerprint)?,
+            protocol_sha256(self.expected_backup_sha256)?,
+            protocol_sha256(self.metadata_sha256)?,
+            self.backup_size,
+            self.required_capacity_bytes,
+        )
+        .map(|_| ())
+        .map_err(|_| InternalWireError::InvalidFrame)
+    }
+}
+
+#[cfg(feature = "experimental-repair-store")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct WorkerRepairBinding {
+    pub(super) plan_id: String,
+    pub(super) plan_sha256: [u8; 32],
+    pub(super) approval_id: String,
+    pub(super) approval_sha256: [u8; 32],
+    pub(super) resource_id: String,
+    pub(super) resource_sha256: [u8; 32],
+}
+
+#[cfg(feature = "experimental-repair-store")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct WorkerRepairFileMetadata {
+    pub(super) mode: u32,
+    pub(super) uid: u32,
+    pub(super) gid: u32,
+}
+
+#[cfg(feature = "experimental-repair-store")]
+impl WorkerRepairFileMetadata {
+    pub(super) fn from_protocol(value: &RepairFileMetadataV1) -> Self {
+        Self {
+            mode: value.mode(),
+            uid: value.uid(),
+            gid: value.gid(),
+        }
+    }
+
+    pub(super) fn to_protocol(self) -> Result<RepairFileMetadataV1, InternalWireError> {
+        RepairFileMetadataV1::new(self.mode, self.uid, self.gid)
+            .map_err(|_| InternalWireError::InvalidFrame)
+    }
+
+    pub(super) fn is_supported_root_file(self) -> bool {
+        self.mode == 0o644 && self.uid == 0 && self.gid == 0
+    }
+}
+
+#[cfg(feature = "experimental-repair-store")]
+impl WorkerRepairBinding {
+    pub(super) fn from_protocol(value: &RepairBackupBinding) -> Self {
+        Self {
+            plan_id: value.plan_id().to_owned(),
+            plan_sha256: value.plan_sha256().bytes(),
+            approval_id: value.approval_id().to_owned(),
+            approval_sha256: value.approval_sha256().bytes(),
+            resource_id: value.resource_id().to_owned(),
+            resource_sha256: value.resource_sha256().bytes(),
+        }
+    }
+
+    fn to_protocol(&self) -> Result<RepairBackupBinding, InternalWireError> {
+        RepairBackupBinding::new(
+            self.plan_id.clone(),
+            protocol_sha256(self.plan_sha256)?,
+            self.approval_id.clone(),
+            protocol_sha256(self.approval_sha256)?,
+            self.resource_id.clone(),
+            protocol_sha256(self.resource_sha256)?,
+        )
+        .map_err(|_| InternalWireError::InvalidFrame)
+    }
+}
+
+#[cfg(feature = "experimental-repair-store")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct WorkerRepairStatus {
+    pub(super) state: WorkerRepairState,
+    pub(super) reservation_id: String,
+    pub(super) draft_binding_sha256: [u8; 32],
+    pub(super) locator: String,
+    pub(super) vault_id: String,
+    pub(super) vault_identity_fingerprint: [u8; 32],
+    pub(super) physical_parent_fingerprint: [u8; 32],
+    pub(super) reserved_bytes: u64,
+    pub(super) backup_size: u64,
+    pub(super) expected_backup_sha256: [u8; 32],
+    pub(super) metadata_sha256: [u8; 32],
+    pub(super) binding: Option<WorkerRepairBinding>,
+}
+
+#[cfg(feature = "experimental-repair-store")]
+impl WorkerRepairStatus {
+    pub(super) fn from_protocol(
+        value: &RepairBackupStatusPayload,
+    ) -> Result<Self, InternalWireError> {
+        let binding = match value.state() {
+            RepairBackupState::Reserved => None,
+            RepairBackupState::Durable => Some(WorkerRepairBinding {
+                plan_id: value
+                    .plan_id()
+                    .ok_or(InternalWireError::InvalidFrame)?
+                    .to_owned(),
+                plan_sha256: value
+                    .plan_sha256()
+                    .ok_or(InternalWireError::InvalidFrame)?
+                    .bytes(),
+                approval_id: value
+                    .approval_id()
+                    .ok_or(InternalWireError::InvalidFrame)?
+                    .to_owned(),
+                approval_sha256: value
+                    .approval_sha256()
+                    .ok_or(InternalWireError::InvalidFrame)?
+                    .bytes(),
+                resource_id: value
+                    .resource_id()
+                    .ok_or(InternalWireError::InvalidFrame)?
+                    .to_owned(),
+                resource_sha256: value
+                    .resource_sha256()
+                    .ok_or(InternalWireError::InvalidFrame)?
+                    .bytes(),
+            }),
+        };
+        let status = Self {
+            state: match value.state() {
+                RepairBackupState::Reserved => WorkerRepairState::Reserved,
+                RepairBackupState::Durable => WorkerRepairState::Durable,
+            },
+            reservation_id: value.reservation_id().as_str().to_owned(),
+            draft_binding_sha256: value.draft_binding_sha256().bytes(),
+            locator: value.locator().to_owned(),
+            vault_id: value.vault_id().to_owned(),
+            vault_identity_fingerprint: value.vault_identity_fingerprint().bytes(),
+            physical_parent_fingerprint: value.physical_parent_fingerprint().bytes(),
+            reserved_bytes: value.reserved_bytes(),
+            backup_size: value.backup_size(),
+            expected_backup_sha256: value.expected_backup_sha256().bytes(),
+            metadata_sha256: value.metadata_sha256().bytes(),
+            binding,
+        };
+        status.validate()?;
+        Ok(status)
+    }
+
+    pub(super) fn to_protocol(&self) -> Result<RepairBackupStatusPayload, InternalWireError> {
+        let reservation_id = RepairReservationId::parse(&self.reservation_id)
+            .map_err(|_| InternalWireError::InvalidFrame)?;
+        let common = (
+            reservation_id,
+            protocol_sha256(self.draft_binding_sha256)?,
+            self.locator.clone(),
+            self.vault_id.clone(),
+            protocol_sha256(self.vault_identity_fingerprint)?,
+            protocol_sha256(self.physical_parent_fingerprint)?,
+            self.reserved_bytes,
+            self.backup_size,
+            protocol_sha256(self.expected_backup_sha256)?,
+            protocol_sha256(self.metadata_sha256)?,
+        );
+        match (self.state, self.binding.as_ref()) {
+            (WorkerRepairState::Reserved, None) => RepairBackupStatusPayload::reserved(
+                common.0, common.1, common.2, common.3, common.4, common.5, common.6, common.7,
+                common.8, common.9,
+            ),
+            (WorkerRepairState::Durable, Some(binding)) => RepairBackupStatusPayload::durable(
+                common.0,
+                common.1,
+                common.2,
+                common.3,
+                common.4,
+                common.5,
+                common.6,
+                common.7,
+                common.8,
+                common.9,
+                binding.to_protocol()?,
+            ),
+            _ => return Err(InternalWireError::InvalidFrame),
+        }
+        .map_err(|_| InternalWireError::InvalidFrame)
+    }
+
+    fn validate(&self) -> Result<(), InternalWireError> {
+        self.to_protocol().map(|_| ())
+    }
+
+    pub(super) fn immutable_fields_match(&self, other: &Self) -> bool {
+        self.reservation_id == other.reservation_id
+            && self.draft_binding_sha256 == other.draft_binding_sha256
+            && self.locator == other.locator
+            && self.vault_id == other.vault_id
+            && self.vault_identity_fingerprint == other.vault_identity_fingerprint
+            && self.physical_parent_fingerprint == other.physical_parent_fingerprint
+            && self.reserved_bytes == other.reserved_bytes
+            && self.backup_size == other.backup_size
+            && self.expected_backup_sha256 == other.expected_backup_sha256
+            && self.metadata_sha256 == other.metadata_sha256
+    }
+}
+
+#[cfg(feature = "experimental-repair-store")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum WorkerRepairCommand {
+    Reserve {
+        draft: WorkerRepairDraft,
+    },
+    Persist {
+        expected: Box<WorkerRepairStatus>,
+        binding: WorkerRepairBinding,
+        metadata: WorkerRepairFileMetadata,
+        input_size: u64,
+    },
+    Status {
+        expected: Box<WorkerRepairStatus>,
+    },
+    Get {
+        expected: Box<WorkerRepairStatus>,
+    },
+}
+
+#[cfg(feature = "experimental-repair-store")]
+impl WorkerRepairCommand {
+    pub(super) const fn kind(&self) -> WorkerCommandKind {
+        match self {
+            Self::Reserve { .. } => WorkerCommandKind::RepairBackupReserve,
+            Self::Persist { .. } => WorkerCommandKind::RepairBackupPersist,
+            Self::Status { .. } => WorkerCommandKind::RepairBackupStatus,
+            Self::Get { .. } => WorkerCommandKind::RepairBackupGet,
+        }
+    }
+
+    fn validate(&self) -> Result<(), InternalWireError> {
+        match self {
+            Self::Reserve { draft } => draft.validate(),
+            Self::Persist {
+                expected,
+                binding,
+                metadata,
+                input_size,
+            } => {
+                expected.validate()?;
+                binding.to_protocol()?;
+                let metadata_hash = metadata.to_protocol()?.canonical_sha256().bytes();
+                if expected.state != WorkerRepairState::Reserved
+                    || expected.backup_size != *input_size
+                    || expected.metadata_sha256 != metadata_hash
+                    || binding.resource_sha256 != expected.expected_backup_sha256
+                    || !metadata.is_supported_root_file()
+                    || !(1..=MAX_REPAIR_BACKUP_BYTES).contains(input_size)
+                {
+                    return Err(InternalWireError::InvalidFrame);
+                }
+                Ok(())
+            }
+            Self::Status { expected } => expected.validate(),
+            Self::Get { expected } => {
+                expected.validate()?;
+                if expected.state != WorkerRepairState::Durable {
+                    return Err(InternalWireError::InvalidFrame);
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn protocol_sha256(value: [u8; 32]) -> Result<Sha256, InternalWireError> {
+    Sha256::parse(&encode_sha256(&value)).map_err(|_| InternalWireError::InvalidFrame)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum WorkerApplicationCommand {
@@ -101,6 +441,14 @@ pub(super) enum WorkerCommandKind {
     ReportPersist,
     ReportList,
     ReportGet,
+    #[cfg(feature = "experimental-repair-store")]
+    RepairBackupReserve,
+    #[cfg(feature = "experimental-repair-store")]
+    RepairBackupPersist,
+    #[cfg(feature = "experimental-repair-store")]
+    RepairBackupStatus,
+    #[cfg(feature = "experimental-repair-store")]
+    RepairBackupGet,
     AttestQuiescent,
     Shutdown,
 }
@@ -111,6 +459,8 @@ pub(super) struct WorkerCommand {
     pub(super) kind: WorkerCommandKind,
     pub(super) secret_size: u16,
     pub(super) application: Option<WorkerApplicationCommand>,
+    #[cfg(feature = "experimental-repair-store")]
+    pub(super) repair: Option<WorkerRepairCommand>,
 }
 
 impl WorkerCommand {
@@ -120,6 +470,8 @@ impl WorkerCommand {
             kind: WorkerCommandKind::Bootstrap,
             secret_size: 0,
             application: None,
+            #[cfg(feature = "experimental-repair-store")]
+            repair: None,
         }
     }
 
@@ -129,6 +481,8 @@ impl WorkerCommand {
             kind: WorkerCommandKind::Probe,
             secret_size: 0,
             application: None,
+            #[cfg(feature = "experimental-repair-store")]
+            repair: None,
         }
     }
 
@@ -138,6 +492,8 @@ impl WorkerCommand {
             kind: WorkerCommandKind::Unlock,
             secret_size: passphrase_size,
             application: None,
+            #[cfg(feature = "experimental-repair-store")]
+            repair: None,
         }
     }
 
@@ -147,6 +503,8 @@ impl WorkerCommand {
             kind: WorkerCommandKind::Lock,
             secret_size: 0,
             application: None,
+            #[cfg(feature = "experimental-repair-store")]
+            repair: None,
         }
     }
 
@@ -156,6 +514,8 @@ impl WorkerCommand {
             kind: WorkerCommandKind::ProviderStatus,
             secret_size: 0,
             application: None,
+            #[cfg(feature = "experimental-repair-store")]
+            repair: None,
         }
     }
 
@@ -165,6 +525,8 @@ impl WorkerCommand {
             kind: WorkerCommandKind::ProviderOpenAiConfigure,
             secret_size: api_key_size,
             application: None,
+            #[cfg(feature = "experimental-repair-store")]
+            repair: None,
         }
     }
 
@@ -174,6 +536,8 @@ impl WorkerCommand {
             kind: WorkerCommandKind::ProviderOpenAiLogout,
             secret_size: 0,
             application: None,
+            #[cfg(feature = "experimental-repair-store")]
+            repair: None,
         }
     }
 
@@ -183,6 +547,8 @@ impl WorkerCommand {
             kind: WorkerCommandKind::ProviderOpenAiBorrow,
             secret_size: 0,
             application: None,
+            #[cfg(feature = "experimental-repair-store")]
+            repair: None,
         }
     }
 
@@ -193,6 +559,8 @@ impl WorkerCommand {
             kind: WorkerCommandKind::ProviderCodexHomeLease,
             secret_size: 0,
             application: None,
+            #[cfg(feature = "experimental-repair-store")]
+            repair: None,
         }
     }
 
@@ -202,6 +570,19 @@ impl WorkerCommand {
             kind: application.kind(),
             secret_size: 0,
             application: Some(application),
+            #[cfg(feature = "experimental-repair-store")]
+            repair: None,
+        }
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    pub(super) fn repair(request_id: u64, repair: WorkerRepairCommand) -> Self {
+        Self {
+            request_id,
+            kind: repair.kind(),
+            secret_size: 0,
+            application: None,
+            repair: Some(repair),
         }
     }
 
@@ -211,6 +592,8 @@ impl WorkerCommand {
             kind: WorkerCommandKind::Shutdown,
             secret_size: 0,
             application: None,
+            #[cfg(feature = "experimental-repair-store")]
+            repair: None,
         }
     }
 
@@ -220,6 +603,8 @@ impl WorkerCommand {
             kind: WorkerCommandKind::AttestQuiescent,
             secret_size: 0,
             application: None,
+            #[cfg(feature = "experimental-repair-store")]
+            repair: None,
         }
     }
 
@@ -228,6 +613,22 @@ impl WorkerCommand {
             .application
             .as_ref()
             .map(WorkerApplicationCommand::kind);
+        #[cfg(feature = "experimental-repair-store")]
+        let repair_kind = self.repair.as_ref().map(WorkerRepairCommand::kind);
+        #[cfg(feature = "experimental-repair-store")]
+        if repair_kind.is_some_and(|kind| kind != self.kind)
+            || (repair_kind.is_some() && (application_kind.is_some() || self.secret_size != 0))
+            || (repair_kind.is_none()
+                && matches!(
+                    self.kind,
+                    WorkerCommandKind::RepairBackupReserve
+                        | WorkerCommandKind::RepairBackupPersist
+                        | WorkerCommandKind::RepairBackupStatus
+                        | WorkerCommandKind::RepairBackupGet
+                ))
+        {
+            return Err(InternalWireError::InvalidFrame);
+        }
         if self.request_id == 0
             || application_kind.is_some_and(|kind| kind != self.kind)
             || (application_kind.is_some() && self.secret_size != 0)
@@ -269,6 +670,14 @@ impl WorkerCommand {
             WorkerCommandKind::ReportPersist => 13,
             WorkerCommandKind::ReportList => 14,
             WorkerCommandKind::ReportGet => 15,
+            #[cfg(feature = "experimental-repair-store")]
+            WorkerCommandKind::RepairBackupReserve => 16,
+            #[cfg(feature = "experimental-repair-store")]
+            WorkerCommandKind::RepairBackupPersist => 17,
+            #[cfg(feature = "experimental-repair-store")]
+            WorkerCommandKind::RepairBackupStatus => 18,
+            #[cfg(feature = "experimental-repair-store")]
+            WorkerCommandKind::RepairBackupGet => 19,
         };
         bytes[12..20].copy_from_slice(&self.request_id.to_be_bytes());
         if let Some(application) = &self.application {
@@ -323,7 +732,17 @@ impl WorkerCommand {
                         .copy_from_slice(&encode_identifier(report_id.as_str(), b"RP-")?);
                 }
             }
-        } else {
+        }
+        #[cfg(feature = "experimental-repair-store")]
+        if let Some(repair) = &self.repair {
+            repair.validate()?;
+            encode_repair_command(&mut bytes, repair)?;
+        } else if self.application.is_none() {
+            bytes[COMMAND_VALUE_OFFSET..COMMAND_VALUE_OFFSET + 2]
+                .copy_from_slice(&self.secret_size.to_be_bytes());
+        }
+        #[cfg(not(feature = "experimental-repair-store"))]
+        if self.application.is_none() {
             bytes[COMMAND_VALUE_OFFSET..COMMAND_VALUE_OFFSET + 2]
                 .copy_from_slice(&self.secret_size.to_be_bytes());
         }
@@ -361,6 +780,14 @@ impl WorkerCommand {
             13 => WorkerCommandKind::ReportPersist,
             14 => WorkerCommandKind::ReportList,
             15 => WorkerCommandKind::ReportGet,
+            #[cfg(feature = "experimental-repair-store")]
+            16 => WorkerCommandKind::RepairBackupReserve,
+            #[cfg(feature = "experimental-repair-store")]
+            17 => WorkerCommandKind::RepairBackupPersist,
+            #[cfg(feature = "experimental-repair-store")]
+            18 => WorkerCommandKind::RepairBackupStatus,
+            #[cfg(feature = "experimental-repair-store")]
+            19 => WorkerCommandKind::RepairBackupGet,
             _ => return Err(InternalWireError::InvalidFrame),
         };
         let application = match kind {
@@ -416,20 +843,336 @@ impl WorkerCommand {
             }),
             _ => None,
         };
+        #[cfg(feature = "experimental-repair-store")]
+        let repair = match kind {
+            WorkerCommandKind::RepairBackupReserve
+            | WorkerCommandKind::RepairBackupPersist
+            | WorkerCommandKind::RepairBackupStatus
+            | WorkerCommandKind::RepairBackupGet => Some(decode_repair_command(bytes, kind)?),
+            _ => None,
+        };
+        #[cfg(feature = "experimental-repair-store")]
+        let payload_command = application.is_some() || repair.is_some();
+        #[cfg(not(feature = "experimental-repair-store"))]
+        let payload_command = application.is_some();
         let command = Self {
             request_id,
             kind,
-            secret_size: if application.is_some() {
-                0
-            } else {
-                secret_size
-            },
+            secret_size: if payload_command { 0 } else { secret_size },
             application,
+            #[cfg(feature = "experimental-repair-store")]
+            repair,
         };
         if command.encode()?.as_slice() != bytes {
             return Err(InternalWireError::InvalidFrame);
         }
         Ok(command)
+    }
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn encode_repair_command(
+    bytes: &mut [u8; COMMAND_BYTES],
+    command: &WorkerRepairCommand,
+) -> Result<(), InternalWireError> {
+    let mut writer = ClosedFrameWriter::new(&mut bytes[REPAIR_PAYLOAD_OFFSET..]);
+    match command {
+        WorkerRepairCommand::Reserve { draft } => encode_repair_draft(&mut writer, draft)?,
+        WorkerRepairCommand::Persist {
+            expected,
+            binding,
+            metadata,
+            input_size,
+        } => {
+            encode_repair_status(&mut writer, expected)?;
+            encode_repair_binding(&mut writer, binding)?;
+            writer.u32(metadata.mode)?;
+            writer.u32(metadata.uid)?;
+            writer.u32(metadata.gid)?;
+            writer.u64(*input_size)?;
+        }
+        WorkerRepairCommand::Status { expected } | WorkerRepairCommand::Get { expected } => {
+            encode_repair_status(&mut writer, expected)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn decode_repair_command(
+    bytes: &[u8],
+    kind: WorkerCommandKind,
+) -> Result<WorkerRepairCommand, InternalWireError> {
+    let mut reader = ClosedFrameReader::new(
+        bytes
+            .get(REPAIR_PAYLOAD_OFFSET..)
+            .ok_or(InternalWireError::InvalidFrame)?,
+    );
+    let command = match kind {
+        WorkerCommandKind::RepairBackupReserve => WorkerRepairCommand::Reserve {
+            draft: decode_repair_draft(&mut reader)?,
+        },
+        WorkerCommandKind::RepairBackupPersist => WorkerRepairCommand::Persist {
+            expected: Box::new(decode_repair_status(&mut reader)?),
+            binding: decode_repair_binding(&mut reader)?,
+            metadata: WorkerRepairFileMetadata {
+                mode: reader.u32()?,
+                uid: reader.u32()?,
+                gid: reader.u32()?,
+            },
+            input_size: reader.u64()?,
+        },
+        WorkerCommandKind::RepairBackupStatus => WorkerRepairCommand::Status {
+            expected: Box::new(decode_repair_status(&mut reader)?),
+        },
+        WorkerCommandKind::RepairBackupGet => WorkerRepairCommand::Get {
+            expected: Box::new(decode_repair_status(&mut reader)?),
+        },
+        _ => return Err(InternalWireError::InvalidFrame),
+    };
+    if !reader.remaining_is_zero() {
+        return Err(InternalWireError::InvalidFrame);
+    }
+    command.validate()?;
+    Ok(command)
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn encode_repair_draft(
+    writer: &mut ClosedFrameWriter<'_>,
+    draft: &WorkerRepairDraft,
+) -> Result<(), InternalWireError> {
+    draft.validate()?;
+    writer.string(&draft.session_id, MAX_REPAIR_ID_BYTES)?;
+    writer.string(&draft.target_id, MAX_REPAIR_ID_BYTES)?;
+    writer.hash(draft.target_fingerprint)?;
+    writer.hash(draft.expected_backup_sha256)?;
+    writer.hash(draft.metadata_sha256)?;
+    writer.u64(draft.backup_size)?;
+    writer.u64(draft.required_capacity_bytes)
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn decode_repair_draft(
+    reader: &mut ClosedFrameReader<'_>,
+) -> Result<WorkerRepairDraft, InternalWireError> {
+    let draft = WorkerRepairDraft {
+        session_id: reader.string(MAX_REPAIR_ID_BYTES)?,
+        target_id: reader.string(MAX_REPAIR_ID_BYTES)?,
+        target_fingerprint: reader.hash()?,
+        expected_backup_sha256: reader.hash()?,
+        metadata_sha256: reader.hash()?,
+        backup_size: reader.u64()?,
+        required_capacity_bytes: reader.u64()?,
+    };
+    draft.validate()?;
+    Ok(draft)
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn encode_repair_binding(
+    writer: &mut ClosedFrameWriter<'_>,
+    binding: &WorkerRepairBinding,
+) -> Result<(), InternalWireError> {
+    binding.to_protocol()?;
+    writer.string(&binding.plan_id, MAX_REPAIR_ID_BYTES)?;
+    writer.hash(binding.plan_sha256)?;
+    writer.string(&binding.approval_id, MAX_REPAIR_ID_BYTES)?;
+    writer.hash(binding.approval_sha256)?;
+    writer.string(&binding.resource_id, MAX_REPAIR_ID_BYTES)?;
+    writer.hash(binding.resource_sha256)
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn decode_repair_binding(
+    reader: &mut ClosedFrameReader<'_>,
+) -> Result<WorkerRepairBinding, InternalWireError> {
+    let binding = WorkerRepairBinding {
+        plan_id: reader.string(MAX_REPAIR_ID_BYTES)?,
+        plan_sha256: reader.hash()?,
+        approval_id: reader.string(MAX_REPAIR_ID_BYTES)?,
+        approval_sha256: reader.hash()?,
+        resource_id: reader.string(MAX_REPAIR_ID_BYTES)?,
+        resource_sha256: reader.hash()?,
+    };
+    binding.to_protocol()?;
+    Ok(binding)
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn encode_repair_status(
+    writer: &mut ClosedFrameWriter<'_>,
+    status: &WorkerRepairStatus,
+) -> Result<(), InternalWireError> {
+    status.validate()?;
+    writer.u8(match status.state {
+        WorkerRepairState::Reserved => 1,
+        WorkerRepairState::Durable => 2,
+    })?;
+    writer.string(&status.reservation_id, MAX_REPAIR_ID_BYTES)?;
+    writer.hash(status.draft_binding_sha256)?;
+    writer.string(&status.locator, MAX_REPAIR_ID_BYTES)?;
+    writer.string(&status.vault_id, MAX_REPAIR_ID_BYTES)?;
+    writer.hash(status.vault_identity_fingerprint)?;
+    writer.hash(status.physical_parent_fingerprint)?;
+    writer.u64(status.reserved_bytes)?;
+    writer.u64(status.backup_size)?;
+    writer.hash(status.expected_backup_sha256)?;
+    writer.hash(status.metadata_sha256)?;
+    if let Some(binding) = status.binding.as_ref() {
+        encode_repair_binding(writer, binding)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn decode_repair_status(
+    reader: &mut ClosedFrameReader<'_>,
+) -> Result<WorkerRepairStatus, InternalWireError> {
+    let state = match reader.u8()? {
+        1 => WorkerRepairState::Reserved,
+        2 => WorkerRepairState::Durable,
+        _ => return Err(InternalWireError::InvalidFrame),
+    };
+    let status = WorkerRepairStatus {
+        state,
+        reservation_id: reader.string(MAX_REPAIR_ID_BYTES)?,
+        draft_binding_sha256: reader.hash()?,
+        locator: reader.string(MAX_REPAIR_ID_BYTES)?,
+        vault_id: reader.string(MAX_REPAIR_ID_BYTES)?,
+        vault_identity_fingerprint: reader.hash()?,
+        physical_parent_fingerprint: reader.hash()?,
+        reserved_bytes: reader.u64()?,
+        backup_size: reader.u64()?,
+        expected_backup_sha256: reader.hash()?,
+        metadata_sha256: reader.hash()?,
+        binding: if state == WorkerRepairState::Durable {
+            Some(decode_repair_binding(reader)?)
+        } else {
+            None
+        },
+    };
+    status.validate()?;
+    Ok(status)
+}
+
+#[cfg(feature = "experimental-repair-store")]
+struct ClosedFrameWriter<'a> {
+    bytes: &'a mut [u8],
+    offset: usize,
+}
+
+#[cfg(feature = "experimental-repair-store")]
+impl<'a> ClosedFrameWriter<'a> {
+    fn new(bytes: &'a mut [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn raw(&mut self, value: &[u8]) -> Result<(), InternalWireError> {
+        let end = self
+            .offset
+            .checked_add(value.len())
+            .filter(|end| *end <= self.bytes.len())
+            .ok_or(InternalWireError::InvalidFrame)?;
+        self.bytes[self.offset..end].copy_from_slice(value);
+        self.offset = end;
+        Ok(())
+    }
+
+    fn u8(&mut self, value: u8) -> Result<(), InternalWireError> {
+        self.raw(&[value])
+    }
+
+    fn u64(&mut self, value: u64) -> Result<(), InternalWireError> {
+        self.raw(&value.to_be_bytes())
+    }
+
+    fn u32(&mut self, value: u32) -> Result<(), InternalWireError> {
+        self.raw(&value.to_be_bytes())
+    }
+
+    fn hash(&mut self, value: [u8; 32]) -> Result<(), InternalWireError> {
+        self.raw(&value)
+    }
+
+    fn string(&mut self, value: &str, maximum: usize) -> Result<(), InternalWireError> {
+        if value.is_empty() || value.len() > maximum {
+            return Err(InternalWireError::InvalidFrame);
+        }
+        let length = u16::try_from(value.len()).map_err(|_| InternalWireError::InvalidFrame)?;
+        self.raw(&length.to_be_bytes())?;
+        self.raw(value.as_bytes())
+    }
+}
+
+#[cfg(feature = "experimental-repair-store")]
+struct ClosedFrameReader<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+#[cfg(feature = "experimental-repair-store")]
+impl<'a> ClosedFrameReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn raw(&mut self, length: usize) -> Result<&'a [u8], InternalWireError> {
+        let end = self
+            .offset
+            .checked_add(length)
+            .filter(|end| *end <= self.bytes.len())
+            .ok_or(InternalWireError::InvalidFrame)?;
+        let value = &self.bytes[self.offset..end];
+        self.offset = end;
+        Ok(value)
+    }
+
+    fn u8(&mut self) -> Result<u8, InternalWireError> {
+        self.raw(1)?
+            .first()
+            .copied()
+            .ok_or(InternalWireError::InvalidFrame)
+    }
+
+    fn u64(&mut self) -> Result<u64, InternalWireError> {
+        Ok(u64::from_be_bytes(
+            self.raw(8)?
+                .try_into()
+                .map_err(|_| InternalWireError::InvalidFrame)?,
+        ))
+    }
+
+    fn u32(&mut self) -> Result<u32, InternalWireError> {
+        Ok(u32::from_be_bytes(
+            self.raw(4)?
+                .try_into()
+                .map_err(|_| InternalWireError::InvalidFrame)?,
+        ))
+    }
+
+    fn hash(&mut self) -> Result<[u8; 32], InternalWireError> {
+        self.raw(32)?
+            .try_into()
+            .map_err(|_| InternalWireError::InvalidFrame)
+    }
+
+    fn string(&mut self, maximum: usize) -> Result<String, InternalWireError> {
+        let length = usize::from(u16::from_be_bytes(
+            self.raw(2)?
+                .try_into()
+                .map_err(|_| InternalWireError::InvalidFrame)?,
+        ));
+        if length == 0 || length > maximum {
+            return Err(InternalWireError::InvalidFrame);
+        }
+        std::str::from_utf8(self.raw(length)?)
+            .map(str::to_owned)
+            .map_err(|_| InternalWireError::InvalidFrame)
+    }
+
+    fn remaining_is_zero(&self) -> bool {
+        self.bytes[self.offset..].iter().all(|byte| *byte == 0)
     }
 }
 
@@ -728,6 +1471,24 @@ pub(super) enum WorkerResultCode {
     ApplicationReportTooLarge,
     ApplicationMutationAborted,
     ApplicationStateAmbiguous,
+    #[cfg(feature = "experimental-repair-store")]
+    RepairBackupReserved,
+    #[cfg(feature = "experimental-repair-store")]
+    RepairBackupDurable,
+    #[cfg(feature = "experimental-repair-store")]
+    RepairBackupStatusReady,
+    #[cfg(feature = "experimental-repair-store")]
+    RepairBackupReady,
+    #[cfg(feature = "experimental-repair-store")]
+    RepairBackupNotFound,
+    #[cfg(feature = "experimental-repair-store")]
+    RepairInvalidRequest,
+    #[cfg(feature = "experimental-repair-store")]
+    RepairConflict,
+    #[cfg(feature = "experimental-repair-store")]
+    RepairReconciliationRequired,
+    #[cfg(feature = "experimental-repair-store")]
+    RepairStorageUnavailable,
 }
 
 impl WorkerResultCode {
@@ -795,6 +1556,24 @@ impl WorkerResultCode {
             Self::ApplicationReportTooLarge => 58,
             Self::ApplicationMutationAborted => 59,
             Self::ApplicationStateAmbiguous => 60,
+            #[cfg(feature = "experimental-repair-store")]
+            Self::RepairBackupReserved => 61,
+            #[cfg(feature = "experimental-repair-store")]
+            Self::RepairBackupDurable => 62,
+            #[cfg(feature = "experimental-repair-store")]
+            Self::RepairBackupStatusReady => 63,
+            #[cfg(feature = "experimental-repair-store")]
+            Self::RepairBackupReady => 64,
+            #[cfg(feature = "experimental-repair-store")]
+            Self::RepairBackupNotFound => 65,
+            #[cfg(feature = "experimental-repair-store")]
+            Self::RepairInvalidRequest => 66,
+            #[cfg(feature = "experimental-repair-store")]
+            Self::RepairConflict => 67,
+            #[cfg(feature = "experimental-repair-store")]
+            Self::RepairReconciliationRequired => 68,
+            #[cfg(feature = "experimental-repair-store")]
+            Self::RepairStorageUnavailable => 69,
         }
     }
 
@@ -862,6 +1641,24 @@ impl WorkerResultCode {
             58 => Ok(Self::ApplicationReportTooLarge),
             59 => Ok(Self::ApplicationMutationAborted),
             60 => Ok(Self::ApplicationStateAmbiguous),
+            #[cfg(feature = "experimental-repair-store")]
+            61 => Ok(Self::RepairBackupReserved),
+            #[cfg(feature = "experimental-repair-store")]
+            62 => Ok(Self::RepairBackupDurable),
+            #[cfg(feature = "experimental-repair-store")]
+            63 => Ok(Self::RepairBackupStatusReady),
+            #[cfg(feature = "experimental-repair-store")]
+            64 => Ok(Self::RepairBackupReady),
+            #[cfg(feature = "experimental-repair-store")]
+            65 => Ok(Self::RepairBackupNotFound),
+            #[cfg(feature = "experimental-repair-store")]
+            66 => Ok(Self::RepairInvalidRequest),
+            #[cfg(feature = "experimental-repair-store")]
+            67 => Ok(Self::RepairConflict),
+            #[cfg(feature = "experimental-repair-store")]
+            68 => Ok(Self::RepairReconciliationRequired),
+            #[cfg(feature = "experimental-repair-store")]
+            69 => Ok(Self::RepairStorageUnavailable),
             _ => Err(InternalWireError::InvalidFrame),
         }
     }
@@ -911,6 +1708,8 @@ pub(super) struct WorkerResponse {
     pub(super) report: Option<WorkerReportSummary>,
     pub(super) application_output_size: Option<u64>,
     pub(super) application_record_count: Option<u16>,
+    #[cfg(feature = "experimental-repair-store")]
+    pub(super) repair_status: Option<Box<WorkerRepairStatus>>,
 }
 
 impl WorkerResponse {
@@ -924,6 +1723,8 @@ impl WorkerResponse {
             report: None,
             application_output_size: None,
             application_record_count: None,
+            #[cfg(feature = "experimental-repair-store")]
+            repair_status: None,
         }
     }
 
@@ -937,6 +1738,8 @@ impl WorkerResponse {
             report: None,
             application_output_size: None,
             application_record_count: None,
+            #[cfg(feature = "experimental-repair-store")]
+            repair_status: None,
         }
     }
 
@@ -950,6 +1753,8 @@ impl WorkerResponse {
             report: None,
             application_output_size: None,
             application_record_count: None,
+            #[cfg(feature = "experimental-repair-store")]
+            repair_status: None,
         }
     }
 
@@ -979,6 +1784,17 @@ impl WorkerResponse {
         response
     }
 
+    #[cfg(feature = "experimental-repair-store")]
+    pub(super) fn repair(
+        request_id: u64,
+        code: WorkerResultCode,
+        status: WorkerRepairStatus,
+    ) -> Self {
+        let mut response = Self::new(request_id, code);
+        response.repair_status = Some(Box::new(status));
+        response
+    }
+
     #[cfg(feature = "experimental-codex-home-lease")]
     pub(super) fn provider_codex_home_ready(request_id: u64) -> Self {
         Self::new(request_id, WorkerResultCode::ProviderCodexHomeReady)
@@ -991,6 +1807,28 @@ impl WorkerResponse {
         let persisted_metadata = self.code == WorkerResultCode::ApplicationReportPersisted;
         let list_metadata = self.code == WorkerResultCode::ApplicationReportListReady;
         let report_metadata = self.code == WorkerResultCode::ApplicationReportReady;
+        #[cfg(feature = "experimental-repair-store")]
+        let repair_metadata = matches!(
+            self.code,
+            WorkerResultCode::RepairBackupReserved
+                | WorkerResultCode::RepairBackupDurable
+                | WorkerResultCode::RepairBackupStatusReady
+                | WorkerResultCode::RepairBackupReady
+        );
+        #[cfg(feature = "experimental-repair-store")]
+        if repair_metadata != self.repair_status.is_some()
+            || self.repair_status.as_ref().is_some_and(|status| {
+                status.validate().is_err()
+                    || matches!(self.code, WorkerResultCode::RepairBackupReserved)
+                        && status.state != WorkerRepairState::Reserved
+                    || matches!(
+                        self.code,
+                        WorkerResultCode::RepairBackupDurable | WorkerResultCode::RepairBackupReady
+                    ) && status.state != WorkerRepairState::Durable
+            })
+        {
+            return Err(InternalWireError::InvalidFrame);
+        }
         if self.request_id == 0
             || device_metadata != self.device_id.is_some()
             || provider_metadata != self.output_size.is_some()
@@ -1057,6 +1895,11 @@ impl WorkerResponse {
                 .copy_from_slice(&report.envelope_sha256);
         }
         bytes[DEVICE_ID_OFFSET..DEVICE_ID_OFFSET + device.len()].copy_from_slice(device);
+        #[cfg(feature = "experimental-repair-store")]
+        if let Some(status) = self.repair_status.as_ref() {
+            let mut writer = ClosedFrameWriter::new(&mut bytes[REPAIR_PAYLOAD_OFFSET..]);
+            encode_repair_status(&mut writer, status)?;
+        }
         Ok(bytes)
     }
 
@@ -1065,6 +1908,18 @@ impl WorkerResponse {
             return Err(InternalWireError::InvalidFrame);
         }
         let code = WorkerResultCode::decode(bytes[8])?;
+        #[cfg(feature = "experimental-repair-store")]
+        let repair_metadata = matches!(
+            code,
+            WorkerResultCode::RepairBackupReserved
+                | WorkerResultCode::RepairBackupDurable
+                | WorkerResultCode::RepairBackupStatusReady
+                | WorkerResultCode::RepairBackupReady
+        );
+        #[cfg(feature = "experimental-repair-store")]
+        let repair_wire = repair_metadata;
+        #[cfg(not(feature = "experimental-repair-store"))]
+        let repair_wire = false;
         let device_len = usize::from(bytes[9]);
         let output_size = u16::from_be_bytes(
             bytes[10..12]
@@ -1072,9 +1927,10 @@ impl WorkerResponse {
                 .map_err(|_| InternalWireError::InvalidFrame)?,
         );
         if device_len > MAX_DEVICE_ID_BYTES
-            || bytes[DEVICE_ID_OFFSET + device_len..DEVICE_ID_OFFSET + MAX_DEVICE_ID_BYTES]
-                .iter()
-                .any(|byte| *byte != 0)
+            || (!repair_wire
+                && bytes[DEVICE_ID_OFFSET + device_len..DEVICE_ID_OFFSET + MAX_DEVICE_ID_BYTES]
+                    .iter()
+                    .any(|byte| *byte != 0))
         {
             return Err(InternalWireError::InvalidFrame);
         }
@@ -1124,6 +1980,21 @@ impl WorkerResponse {
         } else {
             None
         };
+        #[cfg(feature = "experimental-repair-store")]
+        let repair_status = if repair_metadata {
+            let mut reader = ClosedFrameReader::new(
+                bytes
+                    .get(REPAIR_PAYLOAD_OFFSET..)
+                    .ok_or(InternalWireError::InvalidFrame)?,
+            );
+            let status = decode_repair_status(&mut reader)?;
+            if !reader.remaining_is_zero() {
+                return Err(InternalWireError::InvalidFrame);
+            }
+            Some(Box::new(status))
+        } else {
+            None
+        };
         let response = Self {
             request_id,
             code,
@@ -1139,6 +2010,8 @@ impl WorkerResponse {
             .then_some(value),
             application_record_count: (code == WorkerResultCode::ApplicationReportListReady)
                 .then_some(count),
+            #[cfg(feature = "experimental-repair-store")]
+            repair_status,
         };
         if response.encode()?.as_slice() != bytes {
             return Err(InternalWireError::InvalidFrame);
@@ -1183,27 +2056,10 @@ pub(super) fn send_command(
     deadline: Instant,
 ) -> Result<(), InternalWireError> {
     let bytes = command.encode()?;
-    match (command.kind, descriptor) {
-        (
-            WorkerCommandKind::Unlock
-            | WorkerCommandKind::ProviderOpenAiConfigure
-            | WorkerCommandKind::ProviderOpenAiBorrow
-            | WorkerCommandKind::ReportPersist
-            | WorkerCommandKind::ReportList
-            | WorkerCommandKind::ReportGet,
-            Some(descriptor),
-        ) => send_record(socket, &bytes, &[descriptor], deadline),
-        (
-            WorkerCommandKind::Unlock
-            | WorkerCommandKind::ProviderOpenAiConfigure
-            | WorkerCommandKind::ProviderOpenAiBorrow
-            | WorkerCommandKind::ReportPersist
-            | WorkerCommandKind::ReportList
-            | WorkerCommandKind::ReportGet,
-            None,
-        )
-        | (_, Some(_)) => Err(InternalWireError::InvalidDescriptors),
-        (_, None) => send_record(socket, &bytes, &[], deadline),
+    match (command_requires_descriptor(command.kind), descriptor) {
+        (true, Some(descriptor)) => send_record(socket, &bytes, &[descriptor], deadline),
+        (true, None) | (false, Some(_)) => Err(InternalWireError::InvalidDescriptors),
+        (false, None) => send_record(socket, &bytes, &[], deadline),
     }
 }
 
@@ -1213,28 +2069,31 @@ pub(super) fn receive_command(
 ) -> Result<(WorkerCommand, Option<OwnedFd>), InternalWireError> {
     let (bytes, mut descriptors) = receive_record(socket, deadline)?;
     let command = WorkerCommand::decode(&bytes)?;
-    match (command.kind, descriptors.len()) {
-        (
-            WorkerCommandKind::Unlock
-            | WorkerCommandKind::ProviderOpenAiConfigure
-            | WorkerCommandKind::ProviderOpenAiBorrow
-            | WorkerCommandKind::ReportPersist
-            | WorkerCommandKind::ReportList
-            | WorkerCommandKind::ReportGet,
-            1,
-        ) => Ok((command, descriptors.pop())),
-        (
-            WorkerCommandKind::Unlock
-            | WorkerCommandKind::ProviderOpenAiConfigure
-            | WorkerCommandKind::ProviderOpenAiBorrow
-            | WorkerCommandKind::ReportPersist
-            | WorkerCommandKind::ReportList
-            | WorkerCommandKind::ReportGet,
-            _,
-        )
-        | (_, 1..) => Err(InternalWireError::InvalidDescriptors),
-        (_, 0) => Ok((command, None)),
+    match (command_requires_descriptor(command.kind), descriptors.len()) {
+        (true, 1) => Ok((command, descriptors.pop())),
+        (true, _) | (false, 1..) => Err(InternalWireError::InvalidDescriptors),
+        (false, 0) => Ok((command, None)),
     }
+}
+
+fn command_requires_descriptor(kind: WorkerCommandKind) -> bool {
+    let base = matches!(
+        kind,
+        WorkerCommandKind::Unlock
+            | WorkerCommandKind::ProviderOpenAiConfigure
+            | WorkerCommandKind::ProviderOpenAiBorrow
+            | WorkerCommandKind::ReportPersist
+            | WorkerCommandKind::ReportList
+            | WorkerCommandKind::ReportGet
+    );
+    #[cfg(feature = "experimental-repair-store")]
+    let repair = matches!(
+        kind,
+        WorkerCommandKind::RepairBackupPersist | WorkerCommandKind::RepairBackupGet
+    );
+    #[cfg(not(feature = "experimental-repair-store"))]
+    let repair = false;
+    base || repair
 }
 
 pub(super) fn send_response(
@@ -1519,6 +2378,87 @@ mod tests {
             None,
         )
         .expect("socketpair")
+    }
+
+    #[cfg(not(feature = "experimental-repair-store"))]
+    #[test]
+    fn shipping_v003_frames_remain_byte_for_byte_stable() {
+        let request_id = 0x0102_0304_0506_0708_u64;
+        let mut expected_command = [0_u8; 128];
+        expected_command[..8].copy_from_slice(b"KRVWC003");
+        expected_command[8] = 2;
+        expected_command[12..20].copy_from_slice(&request_id.to_be_bytes());
+        assert_eq!(
+            WorkerCommand::probe(request_id).encode(),
+            Ok(expected_command)
+        );
+
+        let mut expected_response = [0_u8; 128];
+        expected_response[..8].copy_from_slice(b"KRVWR003");
+        expected_response[8] = 4;
+        expected_response[12..20].copy_from_slice(&request_id.to_be_bytes());
+        assert_eq!(
+            WorkerResponse::new(request_id, WorkerResultCode::ProbeLocked).encode(),
+            Ok(expected_response)
+        );
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    #[test]
+    fn repair_frames_round_trip_full_capability_metadata_and_closed_padding() {
+        let metadata = RepairFileMetadataV1::new(0o644, 0, 0).expect("root file metadata");
+        let expected_hash = [0x22; 32];
+        let reserved = WorkerRepairStatus {
+            state: WorkerRepairState::Reserved,
+            reservation_id: format!("B-{}", "1".repeat(32)),
+            draft_binding_sha256: [0x11; 32],
+            locator: format!("vault://repair/B-{}", "1".repeat(32)),
+            vault_id: format!("V-{}", "2".repeat(32)),
+            vault_identity_fingerprint: [0x33; 32],
+            physical_parent_fingerprint: [0x44; 32],
+            reserved_bytes: 8192,
+            backup_size: 4096,
+            expected_backup_sha256: expected_hash,
+            metadata_sha256: metadata.canonical_sha256().bytes(),
+            binding: None,
+        };
+        let binding = WorkerRepairBinding {
+            plan_id: "P-plan".to_owned(),
+            plan_sha256: [0x55; 32],
+            approval_id: "A-approval".to_owned(),
+            approval_sha256: [0x66; 32],
+            resource_id: "repair-image".to_owned(),
+            resource_sha256: expected_hash,
+        };
+        let persist = WorkerCommand::repair(
+            41,
+            WorkerRepairCommand::Persist {
+                expected: Box::new(reserved.clone()),
+                binding: binding.clone(),
+                metadata: WorkerRepairFileMetadata::from_protocol(&metadata),
+                input_size: 4096,
+            },
+        );
+        let encoded = persist.encode().expect("repair persist frame");
+        assert_eq!(encoded.len(), 2048);
+        assert_eq!(&encoded[..8], b"KRVWC004");
+        assert_eq!(WorkerCommand::decode(&encoded), Ok(persist));
+
+        let mut noncanonical = encoded;
+        noncanonical[COMMAND_BYTES - 1] = 1;
+        assert_eq!(
+            WorkerCommand::decode(&noncanonical),
+            Err(InternalWireError::InvalidFrame)
+        );
+
+        let mut durable = reserved;
+        durable.state = WorkerRepairState::Durable;
+        durable.binding = Some(binding);
+        let response = WorkerResponse::repair(41, WorkerResultCode::RepairBackupDurable, durable);
+        let encoded = response.encode().expect("repair response frame");
+        assert_eq!(encoded.len(), 2048);
+        assert_eq!(&encoded[..8], b"KRVWR004");
+        assert_eq!(WorkerResponse::decode(&encoded), Ok(response));
     }
 
     #[test]

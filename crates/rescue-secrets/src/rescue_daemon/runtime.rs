@@ -1,6 +1,11 @@
 //! Descriptor-bound daemon runtime, fault marker, cgroup, and worker process.
 
 use super::{RescueVaultDaemonError, internal_wire};
+#[cfg(feature = "experimental-repair-store")]
+use kernaid_protocol::rescue_repair_vault::{
+    MAX_REPAIR_BACKUP_BYTES, RepairBackupBinding, RepairBackupDraft, RepairBackupStatusPayload,
+    RepairFileMetadataV1,
+};
 use kernaid_protocol::rescue_vault::{
     MAX_SIGNED_REPORT_ENVELOPE_BYTES, ReportId, ReportSummary, Sha256, ValidatedRequest,
 };
@@ -93,6 +98,9 @@ const CODEX_MOUNTER_BOOTSTRAP_CAPABILITIES: CapabilitySet = CapabilitySet::SYS_A
     .union(CapabilitySet::SETPCAP);
 
 pub(super) type WorkerReportGetResult =
+    Result<(internal_wire::WorkerResponse, Option<Zeroizing<Vec<u8>>>), RescueVaultDaemonError>;
+#[cfg(feature = "experimental-repair-store")]
+pub(super) type WorkerRepairGetResult =
     Result<(internal_wire::WorkerResponse, Option<Zeroizing<Vec<u8>>>), RescueVaultDaemonError>;
 
 pub(super) fn narrow_worker_capabilities() -> Result<(), RescueVaultDaemonError> {
@@ -2340,6 +2348,8 @@ struct WorkerTransactionContext<'a> {
     cancellation: Option<&'a AtomicBool>,
     provider_output: Option<OwnedFd>,
     application: Option<internal_wire::WorkerApplicationCommand>,
+    #[cfg(feature = "experimental-repair-store")]
+    repair: Option<internal_wire::WorkerRepairCommand>,
 }
 
 impl WorkerHandle {
@@ -2664,6 +2674,215 @@ impl WorkerHandle {
         }
     }
 
+    #[cfg(feature = "experimental-repair-store")]
+    pub(super) fn repair_backup_reserve(
+        &self,
+        draft: &RepairBackupDraft,
+        deadline: Instant,
+    ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
+        self.transact_repair_without_descriptor(
+            internal_wire::WorkerRepairCommand::Reserve {
+                draft: internal_wire::WorkerRepairDraft::from_protocol(draft),
+            },
+            deadline,
+        )
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    pub(super) fn repair_backup_persist(
+        &self,
+        expected: &RepairBackupStatusPayload,
+        binding: &RepairBackupBinding,
+        metadata: &RepairFileMetadataV1,
+        input_size: u64,
+        input: OwnedFd,
+        deadline: Instant,
+    ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
+        let expected = internal_wire::WorkerRepairStatus::from_protocol(expected)
+            .map_err(|_| RescueVaultDaemonError::ProtocolFailure)?;
+        let metadata = internal_wire::WorkerRepairFileMetadata::from_protocol(metadata);
+        if !metadata.is_supported_root_file()
+            || expected.metadata_sha256
+                != metadata
+                    .to_protocol()
+                    .map_err(|_| RescueVaultDaemonError::ProtocolFailure)?
+                    .canonical_sha256()
+                    .bytes()
+            || expected.backup_size != input_size
+        {
+            return Err(RescueVaultDaemonError::ProtocolFailure);
+        }
+        let bytes = read_exact_repair_input_pipe(
+            input,
+            input_size,
+            expected.expected_backup_sha256,
+            deadline,
+        )?;
+        let repair = internal_wire::WorkerRepairCommand::Persist {
+            expected: Box::new(expected),
+            binding: internal_wire::WorkerRepairBinding::from_protocol(binding),
+            metadata,
+            input_size,
+        };
+        self.transact_repair_input(repair, bytes.as_slice(), deadline)
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    pub(super) fn repair_backup_status(
+        &self,
+        expected: &RepairBackupStatusPayload,
+        deadline: Instant,
+    ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
+        self.transact_repair_without_descriptor(
+            internal_wire::WorkerRepairCommand::Status {
+                expected: Box::new(
+                    internal_wire::WorkerRepairStatus::from_protocol(expected)
+                        .map_err(|_| RescueVaultDaemonError::ProtocolFailure)?,
+                ),
+            },
+            deadline,
+        )
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    pub(super) fn repair_backup_get(
+        &self,
+        expected: &RepairBackupStatusPayload,
+        deadline: Instant,
+    ) -> WorkerRepairGetResult {
+        let expected_wire = internal_wire::WorkerRepairStatus::from_protocol(expected)
+            .map_err(|_| RescueVaultDaemonError::ProtocolFailure)?;
+        let (response, bytes) = self.transact_repair_output(
+            internal_wire::WorkerRepairCommand::Get {
+                expected: Box::new(expected_wire.clone()),
+            },
+            MAX_REPAIR_BACKUP_BYTES as usize,
+            deadline,
+        )?;
+        match response.code {
+            internal_wire::WorkerResultCode::RepairBackupReady => {
+                let status = response
+                    .repair_status
+                    .as_deref()
+                    .ok_or(RescueVaultDaemonError::ProtocolFailure)?;
+                if !status.immutable_fields_match(&expected_wire)
+                    || status.state != internal_wire::WorkerRepairState::Durable
+                    || status.binding != expected_wire.binding
+                    || usize::try_from(status.backup_size).ok() != Some(bytes.len())
+                    || sha2::Sha256::digest(bytes.as_slice()).as_slice()
+                        != status.expected_backup_sha256
+                {
+                    return Err(RescueVaultDaemonError::ProtocolFailure);
+                }
+                Ok((response, Some(bytes)))
+            }
+            _ if bytes.is_empty() => Ok((response, None)),
+            _ => Err(RescueVaultDaemonError::ProtocolFailure),
+        }
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    fn transact_repair_without_descriptor(
+        &self,
+        repair: internal_wire::WorkerRepairCommand,
+        deadline: Instant,
+    ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
+        self.transact_inner(
+            repair.kind(),
+            None,
+            None,
+            deadline,
+            WorkerTransactionContext {
+                repair: Some(repair),
+                ..WorkerTransactionContext::default()
+            },
+        )
+        .and_then(|(response, output)| {
+            if output.is_none() {
+                Ok(response)
+            } else {
+                Err(RescueVaultDaemonError::ProtocolFailure)
+            }
+        })
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    fn transact_repair_input(
+        &self,
+        repair: internal_wire::WorkerRepairCommand,
+        bytes: &[u8],
+        deadline: Instant,
+    ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
+        if bytes.is_empty() || bytes.len() > MAX_REPAIR_BACKUP_BYTES as usize {
+            return Err(RescueVaultDaemonError::ProtocolFailure);
+        }
+        let kind = repair.kind();
+        let (read, write) =
+            pipe_with(PipeFlags::CLOEXEC).map_err(|_| RescueVaultDaemonError::WorkerUnavailable)?;
+        validate_runtime_repair_pipe_pair(read.as_fd(), write.as_fd())?;
+        std::thread::scope(|scope| {
+            let transaction = scope.spawn(move || {
+                self.transact_inner(
+                    kind,
+                    None,
+                    Some(read),
+                    deadline,
+                    WorkerTransactionContext {
+                        repair: Some(repair),
+                        ..WorkerTransactionContext::default()
+                    },
+                )
+            });
+            let write_result = write_exact_repair_source_pipe(write, bytes, deadline);
+            let transaction = transaction
+                .join()
+                .map_err(|_| RescueVaultDaemonError::WorkerUnavailable)?;
+            let (response, descriptor) = transaction?;
+            if descriptor.is_some()
+                || (write_result.is_err()
+                    && response.code == internal_wire::WorkerResultCode::RepairBackupDurable)
+            {
+                return Err(RescueVaultDaemonError::ProtocolFailure);
+            }
+            Ok(response)
+        })
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    fn transact_repair_output(
+        &self,
+        repair: internal_wire::WorkerRepairCommand,
+        maximum: usize,
+        deadline: Instant,
+    ) -> Result<(internal_wire::WorkerResponse, Zeroizing<Vec<u8>>), RescueVaultDaemonError> {
+        let kind = repair.kind();
+        let (read, write) =
+            pipe_with(PipeFlags::CLOEXEC).map_err(|_| RescueVaultDaemonError::WorkerUnavailable)?;
+        std::thread::scope(|scope| {
+            let transaction = scope.spawn(move || {
+                self.transact_inner(
+                    kind,
+                    None,
+                    Some(write),
+                    deadline,
+                    WorkerTransactionContext {
+                        repair: Some(repair),
+                        ..WorkerTransactionContext::default()
+                    },
+                )
+            });
+            let output = read_bounded_application_pipe(read, maximum, deadline);
+            let transaction = transaction
+                .join()
+                .map_err(|_| RescueVaultDaemonError::WorkerUnavailable)?;
+            let (response, descriptor) = transaction?;
+            if descriptor.is_some() {
+                return Err(RescueVaultDaemonError::ProtocolFailure);
+            }
+            Ok((response, output?))
+        })
+    }
+
     fn transact_application_output(
         &self,
         application: internal_wire::WorkerApplicationCommand,
@@ -2710,6 +2929,8 @@ impl WorkerHandle {
             cancellation,
             provider_output,
             application,
+            #[cfg(feature = "experimental-repair-store")]
+            repair,
         } = context;
         let borrowing = kind == internal_wire::WorkerCommandKind::ProviderOpenAiBorrow;
         #[cfg(feature = "experimental-codex-home-lease")]
@@ -2722,6 +2943,10 @@ impl WorkerHandle {
                 .as_ref()
                 .is_some_and(|application| application.kind() != kind)
         {
+            return Err(RescueVaultDaemonError::ProtocolFailure);
+        }
+        #[cfg(feature = "experimental-repair-store")]
+        if repair.as_ref().is_some_and(|repair| repair.kind() != kind) {
             return Err(RescueVaultDaemonError::ProtocolFailure);
         }
         if self.terminal.load(Ordering::Acquire) {
@@ -2744,25 +2969,45 @@ impl WorkerHandle {
             .checked_add(1)
             .filter(|next| *next != 0)
             .ok_or(RescueVaultDaemonError::WorkerUnavailable)?;
-        let (command, outgoing) = match (kind, secret_size, descriptor, application) {
-            (kind, None, descriptor, Some(application)) if kind == application.kind() => (
+        #[cfg(feature = "experimental-repair-store")]
+        if application.is_some() && repair.is_some() {
+            return Err(RescueVaultDaemonError::ProtocolFailure);
+        }
+        #[cfg(feature = "experimental-repair-store")]
+        let repair_payload = repair;
+        #[cfg(not(feature = "experimental-repair-store"))]
+        let repair_payload: Option<()> = None;
+        let (command, outgoing) = match (kind, secret_size, descriptor, application, repair_payload)
+        {
+            #[cfg(feature = "experimental-repair-store")]
+            (kind, None, descriptor, None, Some(repair)) if kind == repair.kind() => (
+                internal_wire::WorkerCommand::repair(request_id, repair),
+                descriptor,
+            ),
+            (kind, None, descriptor, Some(application), None) if kind == application.kind() => (
                 internal_wire::WorkerCommand::application(request_id, application),
                 descriptor,
             ),
-            (internal_wire::WorkerCommandKind::Bootstrap, _, _, _) => {
+            (internal_wire::WorkerCommandKind::Bootstrap, _, _, _, _) => {
                 return Err(RescueVaultDaemonError::ProtocolFailure);
             }
-            (internal_wire::WorkerCommandKind::Probe, None, None, None) => {
+            (internal_wire::WorkerCommandKind::Probe, None, None, None, None) => {
                 (internal_wire::WorkerCommand::probe(request_id), None)
             }
-            (internal_wire::WorkerCommandKind::Unlock, Some(size), Some(descriptor), None) => (
+            (
+                internal_wire::WorkerCommandKind::Unlock,
+                Some(size),
+                Some(descriptor),
+                None,
+                None,
+            ) => (
                 internal_wire::WorkerCommand::unlock(request_id, size),
                 Some(descriptor),
             ),
-            (internal_wire::WorkerCommandKind::Lock, None, None, None) => {
+            (internal_wire::WorkerCommandKind::Lock, None, None, None, None) => {
                 (internal_wire::WorkerCommand::lock(request_id), None)
             }
-            (internal_wire::WorkerCommandKind::ProviderStatus, None, None, None) => (
+            (internal_wire::WorkerCommandKind::ProviderStatus, None, None, None, None) => (
                 internal_wire::WorkerCommand::provider_status(request_id),
                 None,
             ),
@@ -2771,11 +3016,12 @@ impl WorkerHandle {
                 Some(size),
                 Some(descriptor),
                 None,
+                None,
             ) => (
                 internal_wire::WorkerCommand::provider_openai_configure(request_id, size),
                 Some(descriptor),
             ),
-            (internal_wire::WorkerCommandKind::ProviderOpenAiLogout, None, None, None) => (
+            (internal_wire::WorkerCommandKind::ProviderOpenAiLogout, None, None, None, None) => (
                 internal_wire::WorkerCommand::provider_openai_logout(request_id),
                 None,
             ),
@@ -2784,20 +3030,21 @@ impl WorkerHandle {
                 None,
                 Some(descriptor),
                 None,
+                None,
             ) => (
                 internal_wire::WorkerCommand::provider_openai_borrow(request_id),
                 Some(descriptor),
             ),
             #[cfg(feature = "experimental-codex-home-lease")]
-            (internal_wire::WorkerCommandKind::ProviderCodexHomeLease, None, None, None) => (
+            (internal_wire::WorkerCommandKind::ProviderCodexHomeLease, None, None, None, None) => (
                 internal_wire::WorkerCommand::provider_codex_home_lease(request_id),
                 None,
             ),
-            (internal_wire::WorkerCommandKind::AttestQuiescent, None, None, None) => (
+            (internal_wire::WorkerCommandKind::AttestQuiescent, None, None, None, None) => (
                 internal_wire::WorkerCommand::attest_quiescent(request_id),
                 None,
             ),
-            (internal_wire::WorkerCommandKind::Shutdown, None, None, None) => {
+            (internal_wire::WorkerCommandKind::Shutdown, None, None, None, None) => {
                 (internal_wire::WorkerCommand::shutdown(request_id), None)
             }
             _ => return Err(RescueVaultDaemonError::ProtocolFailure),
@@ -3025,7 +3272,12 @@ fn read_bounded_application_pipe(
         .map_err(|_| RescueVaultDaemonError::WorkerUnavailable)?;
     let status =
         rfs::fcntl_getfl(&descriptor).map_err(|_| RescueVaultDaemonError::WorkerUnavailable)?;
-    if maximum > MAX_SIGNED_REPORT_ENVELOPE_BYTES as usize
+    #[cfg(feature = "experimental-repair-store")]
+    let maximum_allowed =
+        (MAX_REPAIR_BACKUP_BYTES as usize).max(MAX_SIGNED_REPORT_ENVELOPE_BYTES as usize);
+    #[cfg(not(feature = "experimental-repair-store"))]
+    let maximum_allowed = MAX_SIGNED_REPORT_ENVELOPE_BYTES as usize;
+    if maximum > maximum_allowed
         || !FileType::from_raw_mode(stat.st_mode).is_fifo()
         || filesystem_type != PIPEFS_MAGIC
         || status != OFlags::RDONLY
@@ -3072,6 +3324,169 @@ fn read_bounded_application_pipe(
             Err(_) => return Err(RescueVaultDaemonError::WorkerUnavailable),
         }
     }
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn read_exact_repair_input_pipe(
+    descriptor: OwnedFd,
+    expected_size: u64,
+    expected_sha256: [u8; 32],
+    deadline: Instant,
+) -> Result<Zeroizing<Vec<u8>>, RescueVaultDaemonError> {
+    let expected = usize::try_from(expected_size)
+        .ok()
+        .filter(|size| (1..=MAX_REPAIR_BACKUP_BYTES as usize).contains(size))
+        .ok_or(RescueVaultDaemonError::ProtocolFailure)?;
+    let stat = rfs::fstat(&descriptor).map_err(|_| RescueVaultDaemonError::ProtocolFailure)?;
+    let filesystem =
+        rfs::fstatfs(&descriptor).map_err(|_| RescueVaultDaemonError::ProtocolFailure)?;
+    let status =
+        rfs::fcntl_getfl(&descriptor).map_err(|_| RescueVaultDaemonError::ProtocolFailure)?;
+    let flags = rustix::io::fcntl_getfd(&descriptor)
+        .map_err(|_| RescueVaultDaemonError::ProtocolFailure)?;
+    if !FileType::from_raw_mode(stat.st_mode).is_fifo()
+        || u64::try_from(filesystem.f_type).ok() != Some(PIPEFS_MAGIC)
+        || status & OFlags::ACCMODE != OFlags::RDONLY
+        || flags != rustix::io::FdFlags::CLOEXEC
+        || stat.st_size != 0
+    {
+        return Err(RescueVaultDaemonError::ProtocolFailure);
+    }
+    rfs::fcntl_setfl(&descriptor, OFlags::RDONLY | OFlags::NONBLOCK)
+        .map_err(|_| RescueVaultDaemonError::WorkerUnavailable)?;
+    let mut output = Zeroizing::new(Vec::with_capacity(expected));
+    while output.len() < expected {
+        if Instant::now() >= deadline {
+            return Err(RescueVaultDaemonError::WorkerUnavailable);
+        }
+        let mut chunk = Zeroizing::new([0_u8; 8192]);
+        let wanted = (expected - output.len()).min(chunk.len());
+        match rustix::io::read(&descriptor, &mut chunk[..wanted]) {
+            Ok(0) => return Err(RescueVaultDaemonError::ProtocolFailure),
+            Ok(read) => output.extend_from_slice(&chunk[..read]),
+            Err(error) if error == rustix::io::Errno::INTR => {}
+            Err(error) if error == rustix::io::Errno::AGAIN => {
+                wait_runtime_pipe(descriptor.as_fd(), PollFlags::IN, deadline)?;
+            }
+            Err(_) => return Err(RescueVaultDaemonError::ProtocolFailure),
+        }
+    }
+    loop {
+        if Instant::now() >= deadline {
+            return Err(RescueVaultDaemonError::WorkerUnavailable);
+        }
+        let mut extra = Zeroizing::new([0_u8; 1]);
+        match rustix::io::read(&descriptor, &mut extra[..]) {
+            Ok(0) => break,
+            Ok(_) => return Err(RescueVaultDaemonError::ProtocolFailure),
+            Err(error) if error == rustix::io::Errno::INTR => {}
+            Err(error) if error == rustix::io::Errno::AGAIN => {
+                wait_runtime_pipe(descriptor.as_fd(), PollFlags::IN | PollFlags::HUP, deadline)?;
+            }
+            Err(_) => return Err(RescueVaultDaemonError::ProtocolFailure),
+        }
+    }
+    if sha2::Sha256::digest(output.as_slice()).as_slice() != expected_sha256 {
+        return Err(RescueVaultDaemonError::ProtocolFailure);
+    }
+    Ok(output)
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn wait_runtime_pipe(
+    descriptor: BorrowedFd<'_>,
+    interest: PollFlags,
+    deadline: Instant,
+) -> Result<(), RescueVaultDaemonError> {
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or(RescueVaultDaemonError::WorkerUnavailable)?;
+    let mut descriptors = [PollFd::from_borrowed_fd(descriptor, interest)];
+    match poll(&mut descriptors, Some(&duration_to_timespec(remaining))) {
+        Ok(0) => Err(RescueVaultDaemonError::WorkerUnavailable),
+        Ok(_)
+            if descriptors[0]
+                .revents()
+                .intersects(PollFlags::NVAL | PollFlags::ERR) =>
+        {
+            Err(RescueVaultDaemonError::ProtocolFailure)
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error == rustix::io::Errno::INTR => Ok(()),
+        Err(_) => Err(RescueVaultDaemonError::WorkerUnavailable),
+    }
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn validate_runtime_repair_pipe_pair(
+    read: BorrowedFd<'_>,
+    write: BorrowedFd<'_>,
+) -> Result<(), RescueVaultDaemonError> {
+    let read_stat = rfs::fstat(read).map_err(|_| RescueVaultDaemonError::WorkerUnavailable)?;
+    let write_stat = rfs::fstat(write).map_err(|_| RescueVaultDaemonError::WorkerUnavailable)?;
+    let filesystem = rfs::fstatfs(read).map_err(|_| RescueVaultDaemonError::WorkerUnavailable)?;
+    let read_status =
+        rfs::fcntl_getfl(read).map_err(|_| RescueVaultDaemonError::WorkerUnavailable)?;
+    let write_status =
+        rfs::fcntl_getfl(write).map_err(|_| RescueVaultDaemonError::WorkerUnavailable)?;
+    let read_flags =
+        rustix::io::fcntl_getfd(read).map_err(|_| RescueVaultDaemonError::WorkerUnavailable)?;
+    let write_flags =
+        rustix::io::fcntl_getfd(write).map_err(|_| RescueVaultDaemonError::WorkerUnavailable)?;
+    if !FileType::from_raw_mode(read_stat.st_mode).is_fifo()
+        || !FileType::from_raw_mode(write_stat.st_mode).is_fifo()
+        || read_stat.st_dev != write_stat.st_dev
+        || read_stat.st_ino != write_stat.st_ino
+        || read_stat.st_size != 0
+        || write_stat.st_size != 0
+        || u64::try_from(filesystem.f_type).ok() != Some(PIPEFS_MAGIC)
+        || read_status & OFlags::ACCMODE != OFlags::RDONLY
+        || write_status & OFlags::ACCMODE != OFlags::WRONLY
+        || read_flags != rustix::io::FdFlags::CLOEXEC
+        || write_flags != rustix::io::FdFlags::CLOEXEC
+    {
+        return Err(RescueVaultDaemonError::ProtocolFailure);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn write_exact_repair_source_pipe(
+    descriptor: OwnedFd,
+    bytes: &[u8],
+    deadline: Instant,
+) -> Result<(), RescueVaultDaemonError> {
+    let status =
+        rfs::fcntl_getfl(&descriptor).map_err(|_| RescueVaultDaemonError::WorkerUnavailable)?;
+    if status & OFlags::ACCMODE != OFlags::WRONLY {
+        return Err(RescueVaultDaemonError::ProtocolFailure);
+    }
+    rfs::fcntl_setfl(&descriptor, status | OFlags::NONBLOCK)
+        .map_err(|_| RescueVaultDaemonError::WorkerUnavailable)?;
+    let mut written = 0_usize;
+    while written < bytes.len() {
+        if Instant::now() >= deadline {
+            return Err(RescueVaultDaemonError::WorkerUnavailable);
+        }
+        match rustix::io::write(&descriptor, &bytes[written..]) {
+            Ok(0) => return Err(RescueVaultDaemonError::ProtocolFailure),
+            Ok(count) => {
+                written = written
+                    .checked_add(count)
+                    .ok_or(RescueVaultDaemonError::ProtocolFailure)?
+            }
+            Err(error) if error == rustix::io::Errno::INTR => {}
+            Err(error) if error == rustix::io::Errno::AGAIN => {
+                wait_runtime_pipe(descriptor.as_fd(), PollFlags::OUT, deadline)?;
+            }
+            Err(error) if error == rustix::io::Errno::PIPE => {
+                return Err(RescueVaultDaemonError::ProtocolFailure);
+            }
+            Err(_) => return Err(RescueVaultDaemonError::WorkerUnavailable),
+        }
+    }
+    Ok(())
 }
 
 fn create_provider_output_pipe() -> Result<(OwnedFd, OwnedFd), RescueVaultDaemonError> {
@@ -3285,6 +3700,53 @@ fn response_matches(
             Result::ApplicationReportReady
                 | Result::ApplicationReportNotFound
                 | Result::ApplicationStateAmbiguous
+                | Result::IoFailed
+                | Result::CleanupFailed
+                | Result::Busy
+        ),
+        #[cfg(feature = "experimental-repair-store")]
+        Command::RepairBackupReserve => matches!(
+            response.code,
+            Result::RepairBackupReserved
+                | Result::RepairInvalidRequest
+                | Result::RepairConflict
+                | Result::RepairReconciliationRequired
+                | Result::RepairStorageUnavailable
+                | Result::CleanupFailed
+                | Result::Busy
+        ),
+        #[cfg(feature = "experimental-repair-store")]
+        Command::RepairBackupPersist => matches!(
+            response.code,
+            Result::RepairBackupDurable
+                | Result::RepairInvalidRequest
+                | Result::RepairConflict
+                | Result::RepairReconciliationRequired
+                | Result::RepairStorageUnavailable
+                | Result::CleanupFailed
+                | Result::Busy
+        ),
+        #[cfg(feature = "experimental-repair-store")]
+        Command::RepairBackupStatus => matches!(
+            response.code,
+            Result::RepairBackupStatusReady
+                | Result::RepairBackupNotFound
+                | Result::RepairInvalidRequest
+                | Result::RepairConflict
+                | Result::RepairReconciliationRequired
+                | Result::RepairStorageUnavailable
+                | Result::CleanupFailed
+                | Result::Busy
+        ),
+        #[cfg(feature = "experimental-repair-store")]
+        Command::RepairBackupGet => matches!(
+            response.code,
+            Result::RepairBackupReady
+                | Result::RepairBackupNotFound
+                | Result::RepairInvalidRequest
+                | Result::RepairConflict
+                | Result::RepairReconciliationRequired
+                | Result::RepairStorageUnavailable
                 | Result::IoFailed
                 | Result::CleanupFailed
                 | Result::Busy

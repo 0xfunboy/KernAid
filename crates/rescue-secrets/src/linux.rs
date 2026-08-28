@@ -1,8 +1,12 @@
+#[cfg(feature = "experimental-repair-store")]
+use super::RepairPhysicalParentClaims;
 use super::{
     MountAttestationClaims, RescueSecretError, VAULT_MARKER_NAME, VAULT_MARKER_V1,
     VaultMountAttestation, VaultOwner,
 };
 use crate::application_store::{RescueApplicationStoreError, RescueVaultApplicationStore};
+#[cfg(feature = "experimental-repair-store")]
+use crate::repair_store::{RepairVaultStore, RepairVaultStoreError};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use kernaid_device_identity::DeviceIdentity;
 use kernaid_storage::{
@@ -151,6 +155,16 @@ impl RescueVaultSecrets {
         RescueVaultApplicationStore::open(&self.inner)
     }
 
+    /// Open the isolated, feature-gated Repair Vault namespace.
+    ///
+    /// This explicit operation may initialize the dedicated repair namespace
+    /// inside an already authenticated vault. It never accepts or returns a
+    /// host path.
+    #[cfg(feature = "experimental-repair-store")]
+    pub fn open_repair_store(&self) -> Result<RepairVaultStore<'_>, RepairVaultStoreError> {
+        RepairVaultStore::open(&self.inner)
+    }
+
     /// Open the pre-provisioned Codex home as a descriptor-only capability.
     ///
     /// This deliberately never creates, repairs, renames, or changes ownership
@@ -277,6 +291,8 @@ impl RescueVaultSecrets {
             mount_policy,
             operation_lock: Mutex::new(()),
             application_lock: Mutex::new(()),
+            #[cfg(feature = "experimental-repair-store")]
+            repair_lock: Mutex::new(()),
         };
         inner.ensure_integrity()?;
         Ok(Self { inner })
@@ -458,6 +474,8 @@ pub(crate) struct VaultInner {
     mount_policy: MountPolicy,
     operation_lock: Mutex<()>,
     application_lock: Mutex<()>,
+    #[cfg(feature = "experimental-repair-store")]
+    repair_lock: Mutex<()>,
 }
 
 impl VaultInner {
@@ -486,6 +504,14 @@ impl VaultInner {
                 std::sync::TryLockError::WouldBlock => RescueSecretError::VaultLocked,
                 std::sync::TryLockError::Poisoned(_) => RescueSecretError::StorageUnavailable,
             })
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    pub(crate) fn repair_guard(&self) -> Result<MutexGuard<'_, ()>, RescueSecretError> {
+        self.repair_lock.try_lock().map_err(|error| match error {
+            std::sync::TryLockError::WouldBlock => RescueSecretError::VaultLocked,
+            std::sync::TryLockError::Poisoned(_) => RescueSecretError::StorageUnavailable,
+        })
     }
 
     pub(crate) fn ensure_integrity(&self) -> Result<(), RescueSecretError> {
@@ -566,6 +592,48 @@ impl VaultInner {
 
     pub(crate) const fn owner(&self) -> VaultOwner {
         self.owner
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    pub(crate) fn root_directory_fd(&self) -> &OwnedFd {
+        &self.root_fd
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    pub(crate) fn root_path(&self) -> &Path {
+        &self.root_path
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    pub(crate) const fn root_device(&self) -> u64 {
+        self.root_state.device
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    pub(crate) const fn mount_attestation_claims(&self) -> Option<MountAttestationClaims> {
+        self.mount_policy.attestation
+    }
+
+    /// Sealed parent-disk claims for Repair Vault physical separation.
+    #[cfg(all(feature = "experimental-repair-store", not(test)))]
+    pub(crate) fn repair_physical_parent_claims(&self) -> Option<RepairPhysicalParentClaims> {
+        self.mount_policy
+            .attestation
+            .and_then(|claims| claims.repair_physical_parent)
+    }
+
+    #[cfg(all(feature = "experimental-repair-store", test))]
+    pub(crate) fn repair_physical_parent_claims(&self) -> Option<RepairPhysicalParentClaims> {
+        match self.mount_policy.attestation {
+            Some(claims) => claims.repair_physical_parent,
+            None => Some(RepairPhysicalParentClaims {
+                parent_major: rfs::major(self.root_state.device),
+                parent_minor: rfs::minor(self.root_state.device),
+                disk_sequence: 1,
+                media_sector_count: 1,
+                logical_sector_bytes: 512,
+            }),
+        }
     }
 
     fn load_secret(
@@ -1517,6 +1585,14 @@ impl ObservedVaultMount {
                 backing_minor: self.backing_minor,
                 mapper_name: self.mapper_name,
                 luks_uuid: self.luks_uuid,
+                #[cfg(feature = "experimental-repair-store")]
+                repair_physical_parent: Some(RepairPhysicalParentClaims {
+                    parent_major: rfs::major(self.root_device),
+                    parent_minor: rfs::minor(self.root_device),
+                    disk_sequence: 1,
+                    media_sector_count: 1,
+                    logical_sector_bytes: 512,
+                }),
             },
         }
     }
@@ -1638,6 +1714,7 @@ fn verify_mount_entry_identity(
 }
 
 #[cfg(feature = "experimental-vault-manager")]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn mint_managed_mount_attestation(
     root_path: &Path,
     mapper_name: [u8; 30],
@@ -1646,6 +1723,9 @@ pub(crate) fn mint_managed_mount_attestation(
     mapping_minor: u32,
     backing_major: u32,
     backing_minor: u32,
+    #[cfg(feature = "experimental-repair-store")] repair_physical_parent: Option<
+        RepairPhysicalParentClaims,
+    >,
 ) -> Result<VaultMountAttestation, RescueSecretError> {
     let root_path = normalize_absolute_root(root_path)?;
     let root_fd = open_root(&root_path)?;
@@ -1675,6 +1755,8 @@ pub(crate) fn mint_managed_mount_attestation(
             backing_minor: observed.backing_minor,
             mapper_name: observed.mapper_name,
             luks_uuid: observed.luks_uuid,
+            #[cfg(feature = "experimental-repair-store")]
+            repair_physical_parent,
         },
     })
 }
@@ -3307,6 +3389,8 @@ mod tests {
                 backing_minor: 8,
                 mapper_name: *b"kernaid-vault-0123456789abcdef",
                 luks_uuid: *b"a9950603-ffce-492a-b082-43fba5c492a1",
+                #[cfg(feature = "experimental-repair-store")]
+                repair_physical_parent: None,
             },
         };
         let expected = if rustix::process::geteuid().is_root() {

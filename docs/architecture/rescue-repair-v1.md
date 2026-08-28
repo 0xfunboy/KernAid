@@ -56,15 +56,24 @@ its risk, safety declarations, timeout, cancellation, idempotency and redaction
 policy. It rejects equal physical parents, insufficient Vault capacity and
 path-like capability IDs. Core and policy expose a separate, feature-gated,
 single-use approval transition bound to session, plan hash, target fingerprint
-and `fstab` snapshot. The broker crate now has a feature-gated, path-free
-preflight boundary that consumes that non-cloneable admission, acquires an
-opaque read-only target lock, retains the exact Vault reservation guard, asks
-a trusted resolver for observations and rebuilds the preview and transaction
+and `fstab` snapshot. The broker crate has a feature-gated, path-free preflight
+boundary that consumes that non-cloneable admission, acquires an opaque
+read-only target lock, retains the exact Vault reservation guard, asks a
+trusted resolver for observations and rebuilds the preview and transaction
 plan. Its `ready-read-only` receipt is audit evidence only: it is never
 execution authority and cannot replace the non-cloneable prepared object that
-holds the admission and both guards. No production resolver or IPC route
-exists yet, so this remains admission material only: it has no filesystem I/O,
-durable Vault store or mutation handler.
+holds the admission and both guards.
+
+The off-default `experimental-repair-store` implementation now provides a
+separate encrypted Repair Vault namespace and a closed
+Reserve/Persist/Status/Get daemon protocol for the exact backup capability. It
+reserves physical blocks, accepts bytes only through anonymous pipes, verifies
+exact size, EOF, SHA-256, allocation and named readback, journals crash
+boundaries, and keeps durable identity stable across reboot while treating the
+kernel physical-parent claim as live authority for reserve-to-persist. The
+default daemon ABI remains unchanged. No production RepairBroker UID is
+provisioned, so the route is not reachable in a shipping image. A production
+target capability resolver and mutation handler still do not exist.
 
 ## Backup boundary
 
@@ -77,6 +86,15 @@ The broker must prove through kernel block ancestry that the vault's physical
 parent differs from the target's physical parent. An unavailable or locked
 vault, insufficient space, ambiguous ancestry, identity drift or failed
 read-back blocks the repair.
+
+The implemented candidate persists only path-free IDs and hashes. Its stable
+Vault identity is derived from the authenticated LUKS UUID and provisioned
+device-identity public key; boot-local mount IDs, device-mapper numbers and
+disk sequence remain live attestations rather than durable identity. Recovery
+authenticates the stable identity before it may reconcile an interrupted
+journal intent. Durable backups can therefore be verified after a reboot,
+while a stale reserved write capability cannot be resumed across a changed
+physical-parent epoch.
 
 ## Required transaction
 
@@ -110,6 +128,8 @@ Desk build, public
 Rescue image or default broker may enable it until all of these are true:
 
 - broker, Core, policy, vault backup and signed-report integration are complete;
+- stable-bound cancellation, bounded retention and crash-safe journal
+  compaction/retirement are complete;
 - disposable two-disk QEMU tests cover stale targets, tampered backups,
   cancellation, process termination, automatic restore and reconciliation;
 - the exact image passes BIOS and UEFI repair/rollback qualification; and

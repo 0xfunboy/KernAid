@@ -14,6 +14,16 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - name: Check the disabled Repair Vault contract and store
+        run: |
+          cargo clippy --locked -p kernaid-protocol --all-targets \
+            --features experimental-repair-store -- -D warnings
+          cargo test --locked -p kernaid-protocol \
+            --features experimental-repair-store
+          cargo clippy --locked -p kernaid-rescue-secrets --all-targets \
+            --features experimental-repair-store -- -D warnings
+          cargo test --locked -p kernaid-rescue-secrets \
+            --features experimental-repair-store -- --test-threads=1
       - name: Clippy fixture repair Linux pack feature
         run: cargo clippy --locked -p kernaid-linux-pack --all-targets --features fixture-repair-lab -- -D warnings
       - name: Test fixture repair Linux pack feature
