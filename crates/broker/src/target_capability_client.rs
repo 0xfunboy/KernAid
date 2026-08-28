@@ -108,6 +108,7 @@ pub enum TargetCapabilityErrorToken {
 pub struct RescueTargetCapabilityClaims {
     request_id: String,
     scan_fingerprint: String,
+    target_fingerprint: String,
     target_id: String,
 }
 
@@ -118,6 +119,10 @@ impl RescueTargetCapabilityClaims {
 
     pub fn scan_fingerprint(&self) -> &str {
         &self.scan_fingerprint
+    }
+
+    pub fn target_fingerprint(&self) -> &str {
+        &self.target_fingerprint
     }
 
     pub fn target_id(&self) -> &str {
@@ -131,6 +136,7 @@ impl fmt::Debug for RescueTargetCapabilityClaims {
             .debug_struct("RescueTargetCapabilityClaims")
             .field("request_id", &"[opaque]")
             .field("scan_fingerprint", &"[opaque]")
+            .field("target_fingerprint", &"[opaque]")
             .field("target_id", &"[opaque]")
             .finish()
     }
@@ -175,6 +181,7 @@ struct CapabilityRequestWire<'a> {
     request_id: &'a str,
     operation: &'static str,
     scan_fingerprint: &'a str,
+    target_fingerprint: &'a str,
     target_id: &'a str,
 }
 
@@ -208,6 +215,7 @@ struct SuccessResponseWire {
     #[serde(rename = "outcome")]
     _outcome: SuccessOutcome,
     scan_fingerprint: String,
+    target_fingerprint: String,
     target_id: String,
     capability: String,
     descriptor: DescriptorWire,
@@ -248,10 +256,11 @@ struct ReceivedFrame {
 pub fn acquire_rescue_target_capability(
     request_id: &RequestId,
     scan_fingerprint: &str,
+    target_fingerprint: &str,
     target_id: &str,
     deadline: Instant,
 ) -> Result<RescueTargetReadOnlyCapability, TargetCapabilityClientError> {
-    validate_request_fields(scan_fingerprint, target_id)?;
+    validate_request_fields(scan_fingerprint, target_fingerprint, target_id)?;
     ensure_before(deadline)?;
     let connection = connect_fixed_endpoint(deadline)?;
     authenticate_root_seqpacket_server(connection.as_fd()).map_err(|error| match error {
@@ -266,6 +275,7 @@ pub fn acquire_rescue_target_capability(
         request_id: request_id.as_str(),
         operation: ACQUIRE_OPERATION,
         scan_fingerprint,
+        target_fingerprint,
         target_id,
     };
     let encoded =
@@ -275,7 +285,13 @@ pub fn acquire_rescue_target_capability(
     }
     send_frame(connection.as_fd(), &encoded, deadline)?;
     let received = receive_frame(connection.as_fd(), deadline)?;
-    decode_response(received, request_id.as_str(), scan_fingerprint, target_id)
+    decode_response(
+        received,
+        request_id.as_str(),
+        scan_fingerprint,
+        target_fingerprint,
+        target_id,
+    )
 }
 
 fn connect_fixed_endpoint(deadline: Instant) -> Result<OwnedFd, TargetCapabilityClientError> {
@@ -303,9 +319,11 @@ fn connect_fixed_endpoint(deadline: Instant) -> Result<OwnedFd, TargetCapability
 
 fn validate_request_fields(
     scan_fingerprint: &str,
+    target_fingerprint: &str,
     target_id: &str,
 ) -> Result<(), TargetCapabilityClientError> {
     if !valid_prefixed_hash(scan_fingerprint, "scan:")
+        || !valid_prefixed_hash(target_fingerprint, "sha256:")
         || !valid_prefixed_hash(target_id, "target:")
         || target_id.len() > MAX_OPAQUE_ID_BYTES
     {
@@ -413,6 +431,7 @@ fn decode_response(
     received: ReceivedFrame,
     request_id: &str,
     scan_fingerprint: &str,
+    target_fingerprint: &str,
     target_id: &str,
 ) -> Result<RescueTargetReadOnlyCapability, TargetCapabilityClientError> {
     let probe: OutcomeProbe = serde_json::from_slice(&received.bytes)
@@ -428,6 +447,7 @@ fn decode_response(
                 return Err(TargetCapabilityClientError::CorrelationMismatch);
             }
             if response.scan_fingerprint != scan_fingerprint
+                || response.target_fingerprint != target_fingerprint
                 || response.target_id != target_id
                 || response.capability != CAPABILITY_TYPE
                 || response.descriptor.descriptor_type != DESCRIPTOR_TYPE
@@ -449,6 +469,7 @@ fn decode_response(
                 claims: RescueTargetCapabilityClaims {
                     request_id: response.request_id,
                     scan_fingerprint: response.scan_fingerprint,
+                    target_fingerprint: response.target_fingerprint,
                     target_id: response.target_id,
                 },
             })
@@ -566,6 +587,10 @@ mod tests {
         format!("target:{}", character.to_string().repeat(64))
     }
 
+    fn fingerprint_value(character: char) -> String {
+        format!("sha256:{}", character.to_string().repeat(64))
+    }
+
     fn pair() -> (OwnedFd, OwnedFd) {
         socketpair(
             AddressFamily::UNIX,
@@ -605,9 +630,9 @@ mod tests {
         );
     }
 
-    fn success_frame(scan_fingerprint: &str, target_id: &str) -> Vec<u8> {
+    fn success_frame(scan_fingerprint: &str, target_fingerprint: &str, target_id: &str) -> Vec<u8> {
         format!(
-            "{{\"apiVersion\":\"{API_VERSION}\",\"requestId\":\"{REQUEST_ID}\",\"operation\":\"{ACQUIRE_OPERATION}\",\"outcome\":\"ok\",\"scanFingerprint\":\"{scan_fingerprint}\",\"targetId\":\"{target_id}\",\"capability\":\"{CAPABILITY_TYPE}\",\"descriptor\":{{\"type\":\"{DESCRIPTOR_TYPE}\",\"count\":1}}}}",
+            "{{\"apiVersion\":\"{API_VERSION}\",\"requestId\":\"{REQUEST_ID}\",\"operation\":\"{ACQUIRE_OPERATION}\",\"outcome\":\"ok\",\"scanFingerprint\":\"{scan_fingerprint}\",\"targetFingerprint\":\"{target_fingerprint}\",\"targetId\":\"{target_id}\",\"capability\":\"{CAPABILITY_TYPE}\",\"descriptor\":{{\"type\":\"{DESCRIPTOR_TYPE}\",\"count\":1}}}}",
         )
         .into_bytes()
     }
@@ -615,18 +640,20 @@ mod tests {
     #[test]
     fn request_codec_is_closed_and_path_free() {
         let scan = scan('a');
+        let fingerprint = fingerprint_value('c');
         let target = target('b');
         let request = CapabilityRequestWire {
             api_version: API_VERSION,
             request_id: REQUEST_ID,
             operation: ACQUIRE_OPERATION,
             scan_fingerprint: &scan,
+            target_fingerprint: &fingerprint,
             target_id: &target,
         };
         let encoded = serde_json::to_vec(&request).expect("encode request");
         let value: serde_json::Value = serde_json::from_slice(&encoded).expect("request JSON");
         let object = value.as_object().expect("request object");
-        assert_eq!(object.len(), 5);
+        assert_eq!(object.len(), 6);
         assert_eq!(
             object.get("apiVersion").and_then(|value| value.as_str()),
             Some(API_VERSION)
@@ -646,6 +673,12 @@ mod tests {
             Some(scan.as_str())
         );
         assert_eq!(
+            object
+                .get("targetFingerprint")
+                .and_then(|value| value.as_str()),
+            Some(fingerprint.as_str())
+        );
+        assert_eq!(
             object.get("targetId").and_then(|value| value.as_str()),
             Some(target.as_str())
         );
@@ -655,18 +688,28 @@ mod tests {
     #[test]
     fn response_codec_denies_unknown_fields_and_requires_one_descriptor() {
         let scan = scan('a');
+        let fingerprint = fingerprint_value('c');
         let target = target('b');
-        let response = success_frame(&scan, &target);
+        let response = success_frame(&scan, &fingerprint, &target);
         let received = ReceivedFrame {
             bytes: response,
             descriptors: Vec::new(),
         };
         assert_eq!(
-            decode_response(received, REQUEST_ID, &scan, &target).err(),
+            decode_response(received, REQUEST_ID, &scan, &fingerprint, &target).err(),
             Some(TargetCapabilityClientError::DescriptorRequired)
         );
 
-        let mut unknown = success_frame(&scan, &target);
+        let received = ReceivedFrame {
+            bytes: success_frame(&scan, &fingerprint_value('d'), &target),
+            descriptors: Vec::new(),
+        };
+        assert_eq!(
+            decode_response(received, REQUEST_ID, &scan, &fingerprint, &target).err(),
+            Some(TargetCapabilityClientError::ClaimsMismatch)
+        );
+
+        let mut unknown = success_frame(&scan, &fingerprint, &target);
         let suffix = b",\"path\":\"/dev/sda\"}";
         unknown.pop();
         unknown.extend_from_slice(suffix);
@@ -675,7 +718,7 @@ mod tests {
             descriptors: Vec::new(),
         };
         assert_eq!(
-            decode_response(received, REQUEST_ID, &scan, &target).err(),
+            decode_response(received, REQUEST_ID, &scan, &fingerprint, &target).err(),
             Some(TargetCapabilityClientError::InvalidFrame)
         );
     }
@@ -721,7 +764,14 @@ mod tests {
         send_raw(sender.as_fd(), error.as_bytes(), &[descriptor.as_fd()]);
         let received = receive_frame(receiver.as_fd(), deadline()).expect("receive error frame");
         assert_eq!(
-            decode_response(received, REQUEST_ID, &scan('a'), &target('b')).err(),
+            decode_response(
+                received,
+                REQUEST_ID,
+                &scan('a'),
+                &fingerprint_value('c'),
+                &target('b'),
+            )
+            .err(),
             Some(TargetCapabilityClientError::DescriptorForbidden)
         );
     }
@@ -764,13 +814,17 @@ mod tests {
 
     #[test]
     fn validates_only_canonical_opaque_request_ids() {
-        assert!(validate_request_fields(&scan('a'), &target('b')).is_ok());
+        assert!(validate_request_fields(&scan('a'), &fingerprint_value('c'), &target('b')).is_ok());
         assert_eq!(
-            validate_request_fields("scan:AA", &target('b')),
+            validate_request_fields("scan:AA", &fingerprint_value('c'), &target('b')),
             Err(TargetCapabilityClientError::InvalidRequest)
         );
         assert_eq!(
-            validate_request_fields(&scan('a'), "/dev/sda"),
+            validate_request_fields(&scan('a'), "sha256:AA", &target('b')),
+            Err(TargetCapabilityClientError::InvalidRequest)
+        );
+        assert_eq!(
+            validate_request_fields(&scan('a'), &fingerprint_value('c'), "/dev/sda"),
             Err(TargetCapabilityClientError::InvalidRequest)
         );
     }

@@ -37,6 +37,16 @@ REQUEST = {
     "operation": "target.readonly.acquire",
 }
 
+IDENTITY_OBSERVATIONS: list[dict[str, object]] = [
+    {
+        "collector": "system.hostname",
+        "trust": "observed-untrusted",
+        "output": "kernaid-fixture\n",
+        "success": True,
+        "truncated": False,
+    }
+]
+
 
 def _candidate(family: str = "linux") -> dict[str, object]:
     return {
@@ -66,6 +76,13 @@ def _selection(candidate: dict[str, object]) -> dict[str, object]:
             "mutationPerformed": False,
         },
     }
+
+
+REQUEST["targetFingerprint"] = rescue_server.rescue_target_fingerprint(
+    rescue_server.inventory_fingerprint(IDENTITY_OBSERVATIONS),
+    str(REQUEST["scanFingerprint"]),
+    _candidate(),
+)
 
 
 def _resolution(candidate: dict[str, object], filesystem: str = "ext4") -> dict[str, object]:
@@ -102,6 +119,7 @@ def _resolution(candidate: dict[str, object], filesystem: str = "ext4") -> dict[
 
 
 class FakeTargets:
+    InventoryBusy = type("InventoryBusy", (Exception,), {})
     TargetScanBusy = type("TargetScanBusy", (Exception,), {})
     TargetScanError = type("TargetScanError", (Exception,), {})
     TargetSelectionError = type("TargetSelectionError", (Exception,), {})
@@ -111,6 +129,8 @@ class FakeTargets:
         self.selection = _selection(candidate)
         self.resolution = _resolution(candidate, filesystem)
         self.calls = 0
+        self.events: list[str] = []
+        self.observations = [dict(item) for item in IDENTITY_OBSERVATIONS]
 
     def canonical_target_selection(self, value: object) -> str:
         return json.dumps(value, sort_keys=True, separators=(",", ":"))
@@ -132,12 +152,35 @@ class FakeTargets:
         self, request: dict[str, object], *, deadline: float
     ) -> tuple[dict[str, object], dict[str, object]]:
         self.calls += 1
+        self.events.append("resolve")
         if request != {
             "scanFingerprint": REQUEST["scanFingerprint"],
             "targetId": REQUEST["targetId"],
         } or deadline <= 0:
             raise AssertionError("unexpected canonical resolver request")
         return self.selection, self.resolution
+
+    def inventory(self, *, deadline: float) -> list[dict[str, object]]:
+        if deadline <= 0:
+            raise AssertionError("unexpected inventory deadline")
+        self.events.append("inventory")
+        return [dict(item) for item in self.observations]
+
+    def is_identity_observation(self, collector: str) -> bool:
+        return rescue_server.is_identity_observation(collector)
+
+    def inventory_fingerprint(self, observations: list[dict[str, object]]) -> str:
+        return rescue_server.inventory_fingerprint(observations)
+
+    def rescue_target_fingerprint(
+        self,
+        runtime_inventory_fingerprint: str,
+        scan_fingerprint: str,
+        candidate: dict[str, object],
+    ) -> str:
+        return rescue_server.rescue_target_fingerprint(
+            runtime_inventory_fingerprint, scan_fingerprint, candidate
+        )
 
 
 def _receive(connection: socket.socket) -> tuple[dict[str, object], list[int]]:
@@ -348,6 +391,7 @@ class RepairTargetHandoffTests(unittest.TestCase):
             response, descriptors = self._exchange(service, REQUEST)
         try:
             self.assertEqual(targets.calls, 2)
+            self.assertEqual(targets.events, ["resolve", "inventory", "resolve"])
             self.assertEqual(
                 handoff.SOCKET_PATH,
                 "/run/kernaid-rescue-target-capability.sock",
@@ -364,6 +408,9 @@ class RepairTargetHandoffTests(unittest.TestCase):
             )
             self.assertEqual(response["targetId"], REQUEST["targetId"])
             self.assertEqual(
+                response["targetFingerprint"], REQUEST["targetFingerprint"]
+            )
+            self.assertEqual(
                 response["capability"],
                 "linux-ext4-direct-leaf-readonly-block-v1",
             )
@@ -379,6 +426,7 @@ class RepairTargetHandoffTests(unittest.TestCase):
                     "operation",
                     "outcome",
                     "scanFingerprint",
+                    "targetFingerprint",
                     "targetId",
                     "capability",
                     "descriptor",
@@ -397,6 +445,51 @@ class RepairTargetHandoffTests(unittest.TestCase):
         finally:
             for descriptor in descriptors:
                 os.close(descriptor)
+
+    def test_target_fingerprint_is_recomputed_and_mismatch_sends_no_rights(
+        self,
+    ) -> None:
+        targets = FakeTargets()
+        service = handoff.RepairTargetHandoff(targets)
+        request = dict(REQUEST)
+        request["targetFingerprint"] = "sha256:" + "f" * 64
+        read_descriptor, write_descriptor = os.pipe()
+        os.close(write_descriptor)
+        with (
+            patch.object(handoff, "_mountinfo_has_device", return_value=False),
+            patch.object(
+                handoff, "_open_bound_block_device", return_value=read_descriptor
+            ),
+            patch.object(handoff, "_assert_block_fd", return_value=None),
+        ):
+            response, descriptors = self._exchange(service, request)
+        self.assertEqual(targets.events, ["resolve", "inventory", "resolve"])
+        self.assertEqual(response["outcome"], "error")
+        self.assertEqual(response["error"], "TARGET_CHANGED")
+        self.assertEqual(descriptors, [])
+        with self.assertRaises(OSError):
+            os.fstat(read_descriptor)
+
+    def test_incomplete_identity_inventory_fails_closed(self) -> None:
+        targets = FakeTargets()
+        targets.observations[0]["success"] = False
+        service = handoff.RepairTargetHandoff(targets)
+        read_descriptor, write_descriptor = os.pipe()
+        os.close(write_descriptor)
+        with (
+            patch.object(handoff, "_mountinfo_has_device", return_value=False),
+            patch.object(
+                handoff, "_open_bound_block_device", return_value=read_descriptor
+            ),
+            patch.object(handoff, "_assert_block_fd", return_value=None),
+        ):
+            response, descriptors = self._exchange(service, REQUEST)
+        self.assertEqual(targets.events, ["resolve", "inventory"])
+        self.assertEqual(response["outcome"], "error")
+        self.assertEqual(response["error"], "TARGET_UNAVAILABLE")
+        self.assertEqual(descriptors, [])
+        with self.assertRaises(OSError):
+            os.fstat(read_descriptor)
 
     def test_closed_request_unsupported_target_and_wrong_peer_never_send_rights(
         self,
@@ -424,6 +517,12 @@ class RepairTargetHandoffTests(unittest.TestCase):
             {"apiVersion", "requestId", "operation", "outcome", "error"},
         )
         self.assertNotIn("/dev", json.dumps(response))
+        self.assertEqual(descriptors, [])
+
+        malformed_fingerprint = dict(REQUEST)
+        malformed_fingerprint["targetFingerprint"] = "sha256:" + "A" * 64
+        response, descriptors = self._exchange(unsupported, malformed_fingerprint)
+        self.assertEqual(response["error"], "INVALID_REQUEST")
         self.assertEqual(descriptors, [])
 
         if os.getuid() != 0:

@@ -44,6 +44,7 @@ _EPHEMERAL_ID = {
     prefix: re.compile(rf"^{prefix}:[0-9a-f]{{64}}$")
     for prefix in ("scan", "target")
 }
+_TARGET_FINGERPRINT = re.compile(r"^sha256:[0-9a-f]{64}$")
 _MAJOR_MINOR = re.compile(r"^(0|[1-9][0-9]{0,9}):(0|[1-9][0-9]{0,9})$")
 _SAFE_DEVNAME = re.compile(r"^[A-Za-z0-9._+-]{1,128}$")
 _ERRORS = {
@@ -96,16 +97,20 @@ def _decode_request(payload: bytes) -> dict[str, str]:
     if set(value) != {
         "apiVersion",
         "scanFingerprint",
+        "targetFingerprint",
         "targetId",
         "requestId",
         "operation",
     }:
         raise HandoffFailure("INVALID_REQUEST", request_id)
     scan = value.get("scanFingerprint")
+    target_fingerprint = value.get("targetFingerprint")
     target = value.get("targetId")
     if (
         not isinstance(scan, str)
         or _EPHEMERAL_ID["scan"].fullmatch(scan) is None
+        or not isinstance(target_fingerprint, str)
+        or _TARGET_FINGERPRINT.fullmatch(target_fingerprint) is None
         or not isinstance(target, str)
         or _EPHEMERAL_ID["target"].fullmatch(target) is None
     ):
@@ -115,6 +120,7 @@ def _decode_request(payload: bytes) -> dict[str, str]:
         "requestId": request_id,
         "operation": OPERATION,
         "scanFingerprint": scan,
+        "targetFingerprint": target_fingerprint,
         "targetId": target,
     }
 
@@ -475,6 +481,59 @@ def _canonical(value: object) -> bytes:
     ).encode("utf-8")
 
 
+def _observed_inventory_fingerprint(
+    targets: object, deadline: float, request_id: str
+) -> str:
+    observations = targets.inventory(deadline=deadline)
+    if not isinstance(observations, list):
+        raise HandoffFailure("TARGET_UNAVAILABLE", request_id)
+    try:
+        identity_observations = [
+            item
+            for item in observations
+            if isinstance(item, dict)
+            and isinstance(item.get("collector"), str)
+            and targets.is_identity_observation(str(item["collector"]))
+        ]
+        if not identity_observations or any(
+            item.get("success") is not True or item.get("truncated") is True
+            for item in identity_observations
+        ):
+            raise HandoffFailure("TARGET_UNAVAILABLE", request_id)
+        fingerprint = targets.inventory_fingerprint(observations)
+    except HandoffFailure:
+        raise
+    except Exception as error:
+        raise HandoffFailure("INTERNAL", request_id) from error
+    if (
+        not isinstance(fingerprint, str)
+        or _TARGET_FINGERPRINT.fullmatch(fingerprint) is None
+    ):
+        raise HandoffFailure("INTERNAL", request_id)
+    return fingerprint
+
+
+def _recompute_target_fingerprint(
+    targets: object,
+    runtime_inventory_fingerprint: str,
+    scan_fingerprint: str,
+    candidate: dict[str, object],
+    request_id: str,
+) -> str:
+    try:
+        fingerprint = targets.rescue_target_fingerprint(
+            runtime_inventory_fingerprint, scan_fingerprint, candidate
+        )
+    except Exception as error:
+        raise HandoffFailure("INTERNAL", request_id) from error
+    if (
+        not isinstance(fingerprint, str)
+        or _TARGET_FINGERPRINT.fullmatch(fingerprint) is None
+    ):
+        raise HandoffFailure("INTERNAL", request_id)
+    return fingerprint
+
+
 class RepairTargetHandoff:
     def __init__(self, targets: object | None = None) -> None:
         self.targets = _load_target_module() if targets is None else targets
@@ -497,6 +556,9 @@ class RepairTargetHandoff:
                 raise HandoffFailure("TARGET_UNSUPPORTED", request_id)
             descriptor = _open_bound_block_device(major_minor, major, minor)
             try:
+                runtime_fingerprint = _observed_inventory_fingerprint(
+                    self.targets, deadline, request_id
+                )
                 selection_b, resolution_b = self.targets.resolve_installed_target(
                     reference, deadline=deadline
                 )
@@ -505,6 +567,31 @@ class RepairTargetHandoff:
                     self.targets.canonical_target_selection(selection_a)
                     != self.targets.canonical_target_selection(selection_b)
                     or _canonical(resolution_a) != _canonical(resolution_b)
+                ):
+                    raise HandoffFailure("TARGET_CHANGED", request_id)
+                candidate_a = resolution_a.get("candidate")
+                candidate_b = resolution_b.get("candidate")
+                if not isinstance(candidate_a, dict) or not isinstance(
+                    candidate_b, dict
+                ):
+                    raise HandoffFailure("INTERNAL", request_id)
+                fingerprint_a = _recompute_target_fingerprint(
+                    self.targets,
+                    runtime_fingerprint,
+                    request["scanFingerprint"],
+                    candidate_a,
+                    request_id,
+                )
+                fingerprint_b = _recompute_target_fingerprint(
+                    self.targets,
+                    runtime_fingerprint,
+                    request["scanFingerprint"],
+                    candidate_b,
+                    request_id,
+                )
+                if (
+                    fingerprint_a != fingerprint_b
+                    or fingerprint_a != request["targetFingerprint"]
                 ):
                     raise HandoffFailure("TARGET_CHANGED", request_id)
                 _assert_block_fd(descriptor, major, minor)
@@ -521,6 +608,7 @@ class RepairTargetHandoff:
             target_errors = tuple(
                 error_type
                 for error_type in (
+                    getattr(self.targets, "InventoryBusy", None),
                     getattr(self.targets, "TargetScanBusy", None),
                     getattr(self.targets, "TargetScanError", None),
                     getattr(self.targets, "TargetSelectionError", None),
@@ -536,6 +624,7 @@ class RepairTargetHandoff:
                 "requestId": request_id,
                 "operation": OPERATION,
                 "scanFingerprint": request["scanFingerprint"],
+                "targetFingerprint": fingerprint_a,
                 "targetId": request["targetId"],
                 "outcome": "ok",
                 "capability": "linux-ext4-direct-leaf-readonly-block-v1",
