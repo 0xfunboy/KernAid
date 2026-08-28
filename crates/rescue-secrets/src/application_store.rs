@@ -2436,9 +2436,12 @@ mod tests {
     #[test]
     fn unsafe_provider_and_stray_report_paths_fail_closed() {
         let fixture = Fixture::new();
-        fixture.provision_identity();
+        let vault = fixture.open_vault();
+        vault
+            .device_identity_store()
+            .create_device_identity()
+            .expect("provision identity");
         {
-            let vault = fixture.open_vault();
             let mut store = vault
                 .open_application_store()
                 .expect("open application store");
@@ -2453,15 +2456,12 @@ mod tests {
             fixture.state_path("provider-hardlink"),
         )
         .expect("hardlink provider");
-        let vault = fixture.open_vault();
         assert!(vault.open_application_store().is_err());
-        drop(vault);
 
         fs::remove_file(fixture.state_path("provider-hardlink")).expect("remove hardlink");
         let stray = fixture.state_path("report-v1-RP-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.json");
         symlink(fixture.state_path(PROVIDER_FILE_NAME), stray)
             .expect("create stray report symlink");
-        let vault = fixture.open_vault();
         assert!(vault.open_application_store().is_err());
     }
 
