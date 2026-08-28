@@ -50,22 +50,37 @@ const JOURNAL_WAL_NAME: &str = "journal.sqlite3-wal";
 const JOURNAL_SHM_NAME: &str = "journal.sqlite3-shm";
 const JOURNAL_KEY_NAME: &str = "journal-key";
 const JOURNAL_ANCHOR_NAME: &str = "journal-anchor";
+const COMPACTION_DATABASE_NAME: &str = ".journal-compaction.sqlite3";
+const COMPACTION_WAL_NAME: &str = ".journal-compaction.sqlite3-wal";
+const COMPACTION_SHM_NAME: &str = ".journal-compaction.sqlite3-shm";
+const COMPACTION_KEY_NAME: &str = ".journal-compaction-key";
+const COMPACTION_ANCHOR_NAME: &str = ".journal-compaction-anchor";
+const COMPACTION_BACKUP_DATABASE_NAME: &str = ".journal-backup.sqlite3";
+const COMPACTION_BACKUP_WAL_NAME: &str = ".journal-backup.sqlite3-wal";
+const COMPACTION_BACKUP_SHM_NAME: &str = ".journal-backup.sqlite3-shm";
+const COMPACTION_BACKUP_KEY_NAME: &str = ".journal-backup-key";
+const COMPACTION_BACKUP_ANCHOR_NAME: &str = ".journal-backup-anchor";
+const COMPACTION_INTENT_NAME: &str = ".journal-compaction-intent";
+const COMPACTION_INTENT_TEMP_NAME: &str = ".journal-compaction-intent.tmp";
 const BACKUP_PREFIX: &str = "backup-";
 const TEMP_PREFIX: &str = ".tmp-";
 const DIRECTORY_MODE: u32 = 0o700;
 const FILE_MODE: u32 = 0o600;
 const MAX_BACKUP_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_RESERVATIONS: usize = 64;
-// Bounded at 16 MiB of authenticated event payload. This permits repeated
-// reserve/persist/retire lifecycles while journal compaction remains a
-// separate promotion gate; it is intentionally finite.
+// Bounded at 16 MiB of authenticated event payload. Automatic compaction runs
+// before this hard replay ceiling, leaving room for crash reconciliation.
 const MAX_JOURNAL_EVENTS: u64 = 4096;
 const MAX_EVENT_BYTES: u64 = 4096;
+const JOURNAL_COMPACTION_TRIGGER_EVENTS: u64 = 3072;
 // Release acknowledgements are retained independently from active reservation
-// slots so a lost response can be replayed exactly. Every tombstone requires
-// at least an authenticated intent/complete pair, so the journal bound also
-// gives this map a strict lifetime bound without inventing unbounded state.
+// slots so a lost response can be replayed exactly. Compaction retains only a
+// deterministic event-clock TTL and the newest bounded subset.
 const MAX_RELEASE_TOMBSTONES: usize = (MAX_JOURNAL_EVENTS / 2) as usize;
+const MAX_RETAINED_RELEASE_TOMBSTONES: usize = 64;
+const RELEASE_TOMBSTONE_EVENT_TTL: u64 = 512;
+const COMPACTION_PREPARED: &[u8] = b"KERNAID-REPAIR-JOURNAL-COMPACTION-V1 PREPARED\n";
+const COMPACTION_COMMITTED: &[u8] = b"KERNAID-REPAIR-JOURNAL-COMPACTION-V1 COMMITTED\n";
 const PIPEFS_MAGIC: u64 = 0x5049_5045;
 const DEFAULT_SOURCE_DEADLINE: Duration = Duration::from_secs(30);
 const MAX_LAYOUT_ENTRIES: usize = 72;
@@ -610,6 +625,20 @@ pub enum RepairBackupStatus {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type", deny_unknown_fields)]
 enum RepairEvent {
+    #[serde(rename = "repair.journal.compaction.begin")]
+    CompactionBegin {
+        generation: u64,
+        #[serde(rename = "logicalEventClock")]
+        logical_event_clock: u64,
+        #[serde(rename = "activeReservations")]
+        active_reservations: u64,
+        #[serde(rename = "retainedReleases")]
+        retained_releases: u64,
+        #[serde(rename = "previousAnchor")]
+        previous_anchor: String,
+    },
+    #[serde(rename = "repair.journal.compaction.complete")]
+    CompactionComplete { generation: u64 },
     #[serde(rename = "repair.backup.reserve.intent")]
     ReserveIntent {
         #[serde(rename = "reservationId")]
@@ -665,6 +694,12 @@ enum RepairEvent {
     CancelComplete {
         #[serde(rename = "reservationId")]
         reservation_id: ReservationId,
+        #[serde(
+            rename = "releasedAtEvent",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        released_at_event: Option<u64>,
     },
     #[serde(rename = "repair.backup.retire.intent")]
     RetireIntent {
@@ -675,9 +710,16 @@ enum RepairEvent {
     RetireComplete {
         #[serde(rename = "reservationId")]
         reservation_id: ReservationId,
+        #[serde(
+            rename = "releasedAtEvent",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        released_at_event: Option<u64>,
     },
 }
 
+#[derive(Clone, PartialEq, Eq)]
 struct ReservationRecord {
     draft: RepairBackupDraft,
     reservation_binding_sha256: String,
@@ -688,7 +730,7 @@ struct ReservationRecord {
     phase: ReservationPhase,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 enum ReservationPhase {
     ReservePending,
     Reserved,
@@ -704,17 +746,41 @@ enum ReleaseOperation {
     Retire,
 }
 
+#[derive(Clone, PartialEq, Eq)]
 struct ReleaseTombstone {
     operation: ReleaseOperation,
     record: ReservationRecord,
+    released_at_event: u64,
 }
 
-#[derive(Default)]
+#[derive(Clone, PartialEq, Eq)]
+struct CompactionReplay {
+    generation: u64,
+    active_reservations: usize,
+    retained_releases: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompactionBoundary {
+    Never,
+    #[cfg(test)]
+    AfterPrepared,
+    #[cfg(test)]
+    AfterFirstInstall,
+    #[cfg(test)]
+    AfterCommittedCleanup,
+}
+
+#[derive(Clone, Default, PartialEq, Eq)]
 struct RecoveredState {
     reservations: BTreeMap<ReservationId, ReservationRecord>,
     released: BTreeMap<ReservationId, ReleaseTombstone>,
     seen_reservation_ids: BTreeSet<ReservationId>,
     pending: Option<ReservationId>,
+    logical_event_clock: u64,
+    compaction_generation: u64,
+    previous_compaction_anchor: Option<JournalAnchor>,
+    compaction_replay: Option<CompactionReplay>,
 }
 
 struct FilesystemState {
@@ -745,6 +811,19 @@ impl FilesystemState {
     fn same_object(&self, other: &Self) -> bool {
         self.device == other.device && self.inode == other.inode
     }
+
+    fn retained_copy(&self) -> Self {
+        Self {
+            device: self.device,
+            inode: self.inode,
+            size: self.size,
+            blocks: self.blocks,
+            mode: self.mode,
+            uid: self.uid,
+            gid: self.gid,
+            links: self.links,
+        }
+    }
 }
 
 /// Exclusive handle for the isolated Repair Vault namespace.
@@ -755,7 +834,7 @@ pub struct RepairVaultStore<'vault> {
     backups_fd: OwnedFd,
     backups_state: FilesystemState,
     _lock_fd: OwnedFd,
-    journal: SecureJournal<RepairJournalSecretStore<'vault>>,
+    journal: Option<SecureJournal<RepairJournalSecretStore<'vault>>>,
     state: RecoveredState,
     vault_id: String,
     vault_identity_fingerprint: String,
@@ -787,40 +866,9 @@ impl<'vault> RepairVaultStore<'vault> {
             inner.root_device(),
             inner.root_mount_id(),
         )?;
-        let journal_descriptor = rustix::io::fcntl_dupfd_cloexec(&namespace_fd, 3)
-            .map_err(|_| RepairVaultStoreError::StorageUnavailable)?;
-        let journal_path = inner
-            .root_path()
-            .join(REPAIR_NAMESPACE)
-            .join(JOURNAL_DATABASE_NAME);
-        let mut journal = SecureJournal::open(
-            &journal_path,
-            RepairJournalSecretStore {
-                inner,
-                directory: journal_descriptor,
-                directory_state: FilesystemState {
-                    device: namespace_state.device,
-                    inode: namespace_state.inode,
-                    size: namespace_state.size,
-                    blocks: namespace_state.blocks,
-                    mode: namespace_state.mode,
-                    uid: namespace_state.uid,
-                    gid: namespace_state.gid,
-                    links: namespace_state.links,
-                },
-            },
-        )
-        .map_err(|_| RepairVaultStoreError::CorruptJournal)?;
-        let replay_limits =
-            JournalReplayLimits::new(MAX_JOURNAL_EVENTS, MAX_JOURNAL_EVENTS * MAX_EVENT_BYTES)
-                .map_err(|_| RepairVaultStoreError::CorruptJournal)?;
-        let (state, replay) = journal
-            .fold(
-                replay_limits,
-                RecoveredState::default(),
-                replay_repair_event,
-            )
-            .map_err(|_| RepairVaultStoreError::CorruptJournal)?;
+        recover_journal_compaction(inner, &namespace_fd, &namespace_state)?;
+        let (journal, state, event_count) =
+            open_journal_generation(inner, &namespace_fd, &namespace_state, ACTIVE_JOURNAL_NAMES)?;
         let mut store = Self {
             inner,
             namespace_fd,
@@ -828,12 +876,12 @@ impl<'vault> RepairVaultStore<'vault> {
             backups_fd,
             backups_state,
             _lock_fd: lock_fd,
-            journal,
+            journal: Some(journal),
             state,
             vault_id,
             vault_identity_fingerprint,
             physical_parent_fingerprint,
-            event_count: replay.entries,
+            event_count,
             checked_out: BTreeSet::new(),
             healthy: true,
             _repair_guard: repair_guard,
@@ -845,6 +893,9 @@ impl<'vault> RepairVaultStore<'vault> {
         store.verify_recovered_vault_identity()?;
         store.reconcile_pending()?;
         store.validate_layout()?;
+        if store.compaction_due(0) {
+            store.compact_journal()?;
+        }
         Ok(store)
     }
 
@@ -980,6 +1031,7 @@ impl<'vault> RepairVaultStore<'vault> {
         if !valid_sha256(reservation_binding_sha256) {
             return Err(RepairVaultStoreError::ReservationConflict);
         }
+        self.require_event_capacity(0)?;
         if let Some(released) = self.state.released.get(reservation_id) {
             self.verify_release_tombstone(released)?;
             if released.operation == ReleaseOperation::Cancel
@@ -1013,7 +1065,10 @@ impl<'vault> RepairVaultStore<'vault> {
         {
             self.remove_pending_backup_file(&reservation_id, &existing)?;
         }
-        self.append_event(RepairEvent::CancelComplete { reservation_id })?;
+        self.append_event(RepairEvent::CancelComplete {
+            reservation_id,
+            released_at_event: None,
+        })?;
         Ok(released_bytes)
     }
 
@@ -1025,6 +1080,7 @@ impl<'vault> RepairVaultStore<'vault> {
         expected: &VerifiedBackupMetadata,
     ) -> Result<u64, RepairVaultStoreError> {
         self.require_mutable()?;
+        self.require_event_capacity(0)?;
         if let Some(released) = self.state.released.get(expected.reservation_id()) {
             self.verify_release_tombstone(released)?;
             if released.operation == ReleaseOperation::Retire
@@ -1058,7 +1114,10 @@ impl<'vault> RepairVaultStore<'vault> {
         {
             self.remove_pending_backup_file(&reservation_id, &existing)?;
         }
-        self.append_event(RepairEvent::RetireComplete { reservation_id })?;
+        self.append_event(RepairEvent::RetireComplete {
+            reservation_id,
+            released_at_event: None,
+        })?;
         Ok(released_bytes)
     }
 
@@ -1202,12 +1261,28 @@ impl<'vault> RepairVaultStore<'vault> {
         self.validate_store_boundary()
     }
 
-    fn require_event_capacity(&self, required: u64) -> Result<(), RepairVaultStoreError> {
+    fn require_event_capacity(&mut self, required: u64) -> Result<(), RepairVaultStoreError> {
+        if self.compaction_due(required) {
+            self.compact_journal()?;
+        }
         if self.event_count.saturating_add(required) > MAX_JOURNAL_EVENTS {
             Err(RepairVaultStoreError::InsufficientCapacity)
         } else {
             Ok(())
         }
+    }
+
+    fn compaction_due(&self, required: u64) -> bool {
+        self.event_count.saturating_add(required) > JOURNAL_COMPACTION_TRIGGER_EVENTS
+            || self.state.released.len() > MAX_RETAINED_RELEASE_TOMBSTONES
+            || self.state.released.values().any(|released| {
+                released.released_at_event <= self.state.logical_event_clock
+                    && self
+                        .state
+                        .logical_event_clock
+                        .saturating_sub(released.released_at_event)
+                        > RELEASE_TOMBSTONE_EVENT_TTL
+            })
     }
 
     fn verify_recovered_vault_identity(&self) -> Result<(), RepairVaultStoreError> {
@@ -1250,6 +1325,11 @@ impl<'vault> RepairVaultStore<'vault> {
         released: &ReleaseTombstone,
     ) -> Result<(), RepairVaultStoreError> {
         self.verify_record_vault_identity(&released.record)?;
+        if released.released_at_event == 0
+            || released.released_at_event > self.state.logical_event_clock
+        {
+            return Err(RepairVaultStoreError::CorruptJournal);
+        }
         match (&released.operation, &released.record.phase) {
             (ReleaseOperation::Cancel, ReservationPhase::CancelPending)
             | (ReleaseOperation::Retire, ReservationPhase::RetirePending(_)) => Ok(()),
@@ -1279,7 +1359,12 @@ impl<'vault> RepairVaultStore<'vault> {
         if encoded.len() as u64 > MAX_EVENT_BYTES {
             return Err(RepairVaultStoreError::CorruptStore);
         }
-        let entry = match self.journal.append(&encoded) {
+        let entry = match self
+            .journal
+            .as_mut()
+            .ok_or(RepairVaultStoreError::ReconciliationRequired)?
+            .append(&encoded)
+        {
             Ok(entry) => entry,
             Err(_) => {
                 self.healthy = false;
@@ -1301,6 +1386,190 @@ impl<'vault> RepairVaultStore<'vault> {
             .checked_add(1)
             .ok_or(RepairVaultStoreError::CorruptJournal)?;
         Ok(())
+    }
+
+    fn compact_journal(&mut self) -> Result<(), RepairVaultStoreError> {
+        let result = self.compact_journal_until(CompactionBoundary::Never);
+        if result.is_err() {
+            self.healthy = false;
+        }
+        result
+    }
+
+    fn compact_journal_until(
+        &mut self,
+        boundary: CompactionBoundary,
+    ) -> Result<(), RepairVaultStoreError> {
+        if !self.healthy || self.state.pending.is_some() || self.state.compaction_replay.is_some() {
+            return Err(RepairVaultStoreError::ReconciliationRequired);
+        }
+        self.validate_layout()?;
+        ensure_compaction_artifacts_absent(&self.namespace_fd, self.inner)?;
+
+        let previous_anchor = self
+            .journal
+            .as_mut()
+            .ok_or(RepairVaultStoreError::ReconciliationRequired)?
+            .head()
+            .map_err(|_| RepairVaultStoreError::CorruptJournal)?;
+        let expected_reservations = self.state.reservations.clone();
+        let expected_releases = retained_release_tombstones(&self.state);
+        let expected_clock = self.state.logical_event_clock;
+        let expected_generation = self
+            .state
+            .compaction_generation
+            .checked_add(1)
+            .ok_or(RepairVaultStoreError::CorruptJournal)?;
+        let events = compaction_events(
+            &expected_reservations,
+            &expected_releases,
+            expected_clock,
+            expected_generation,
+            previous_anchor,
+        )?;
+        if events.len() as u64 >= JOURNAL_COMPACTION_TRIGGER_EVENTS {
+            return Err(RepairVaultStoreError::InsufficientCapacity);
+        }
+
+        let (mut staged, empty, staged_entries) = open_journal_generation(
+            self.inner,
+            &self.namespace_fd,
+            &self.namespace_state,
+            COMPACTION_JOURNAL_NAMES,
+        )?;
+        if staged_entries != 0 || empty != RecoveredState::default() {
+            return Err(RepairVaultStoreError::CorruptJournal);
+        }
+        for event in events {
+            append_compaction_event(&mut staged, event)?;
+        }
+        drop(staged);
+        ensure_sidecars_absent(
+            &self.namespace_fd,
+            self.inner,
+            COMPACTION_WAL_NAME,
+            COMPACTION_SHM_NAME,
+        )?;
+
+        let (staged, staged_state, staged_entries) = open_journal_generation(
+            self.inner,
+            &self.namespace_fd,
+            &self.namespace_state,
+            COMPACTION_JOURNAL_NAMES,
+        )?;
+        validate_compacted_state(
+            &staged_state,
+            &expected_reservations,
+            &expected_releases,
+            expected_clock,
+            expected_generation,
+            previous_anchor,
+        )?;
+        drop(staged);
+        ensure_sidecars_absent(
+            &self.namespace_fd,
+            self.inner,
+            COMPACTION_WAL_NAME,
+            COMPACTION_SHM_NAME,
+        )?;
+
+        store_compaction_marker(&self.namespace_fd, self.inner, COMPACTION_PREPARED, false)?;
+        #[cfg(test)]
+        if boundary == CompactionBoundary::AfterPrepared {
+            drop(
+                self.journal
+                    .take()
+                    .ok_or(RepairVaultStoreError::ReconciliationRequired)?,
+            );
+            self.healthy = false;
+            return Err(RepairVaultStoreError::StorageUnavailable);
+        }
+        drop(
+            self.journal
+                .take()
+                .ok_or(RepairVaultStoreError::ReconciliationRequired)?,
+        );
+        ensure_sidecars_absent(
+            &self.namespace_fd,
+            self.inner,
+            JOURNAL_WAL_NAME,
+            JOURNAL_SHM_NAME,
+        )?;
+
+        move_generation(
+            &self.namespace_fd,
+            self.inner,
+            ACTIVE_JOURNAL_NAMES,
+            BACKUP_JOURNAL_NAMES,
+            None,
+        )?;
+        move_generation(
+            &self.namespace_fd,
+            self.inner,
+            COMPACTION_JOURNAL_NAMES,
+            ACTIVE_JOURNAL_NAMES,
+            Some(boundary),
+        )?;
+        #[cfg(test)]
+        if boundary == CompactionBoundary::AfterFirstInstall {
+            self.healthy = false;
+            return Err(RepairVaultStoreError::StorageUnavailable);
+        }
+
+        let (journal, state, event_count) = open_journal_generation(
+            self.inner,
+            &self.namespace_fd,
+            &self.namespace_state,
+            ACTIVE_JOURNAL_NAMES,
+        )?;
+        if event_count != staged_entries {
+            return Err(RepairVaultStoreError::CorruptJournal);
+        }
+        validate_compacted_state(
+            &state,
+            &expected_reservations,
+            &expected_releases,
+            expected_clock,
+            expected_generation,
+            previous_anchor,
+        )?;
+        verify_previous_anchor_against_backup(
+            self.inner,
+            &self.namespace_fd,
+            &self.namespace_state,
+            &state,
+        )?;
+        self.journal = Some(journal);
+        self.state = state;
+        self.event_count = event_count;
+
+        store_compaction_marker(&self.namespace_fd, self.inner, COMPACTION_COMMITTED, true)?;
+        remove_generation_component(
+            &self.namespace_fd,
+            self.inner,
+            BACKUP_JOURNAL_NAMES.database,
+        )?;
+        #[cfg(test)]
+        if boundary == CompactionBoundary::AfterCommittedCleanup {
+            self.healthy = false;
+            return Err(RepairVaultStoreError::StorageUnavailable);
+        }
+        remove_generation_component(&self.namespace_fd, self.inner, BACKUP_JOURNAL_NAMES.key)?;
+        remove_generation_component(&self.namespace_fd, self.inner, BACKUP_JOURNAL_NAMES.anchor)?;
+        remove_generation_component(&self.namespace_fd, self.inner, COMPACTION_INTENT_NAME)?;
+        self.validate_layout()?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn simulate_compaction_crash(
+        &mut self,
+        boundary: CompactionBoundary,
+    ) -> Result<(), RepairVaultStoreError> {
+        if boundary == CompactionBoundary::Never {
+            return Err(RepairVaultStoreError::CorruptStore);
+        }
+        self.compact_journal_until(boundary)
     }
 
     fn generate_unused_reservation_id(&self) -> Result<ReservationId, RepairVaultStoreError> {
@@ -1667,7 +1936,10 @@ impl<'vault> RepairVaultStore<'vault> {
                 {
                     self.remove_pending_backup_file(&reservation_id, &state)?;
                 }
-                self.append_event(RepairEvent::CancelComplete { reservation_id })
+                self.append_event(RepairEvent::CancelComplete {
+                    reservation_id,
+                    released_at_event: None,
+                })
             }
             ReservationPhase::RetirePending(_) => {
                 if let Some((_, state)) =
@@ -1675,7 +1947,10 @@ impl<'vault> RepairVaultStore<'vault> {
                 {
                     self.remove_pending_backup_file(&reservation_id, &state)?;
                 }
-                self.append_event(RepairEvent::RetireComplete { reservation_id })
+                self.append_event(RepairEvent::RetireComplete {
+                    reservation_id,
+                    released_at_event: None,
+                })
             }
             ReservationPhase::Reserved | ReservationPhase::Durable(_) => {
                 Err(RepairVaultStoreError::CorruptJournal)
@@ -1912,6 +2187,173 @@ fn verified_metadata_from_record(
     }
 }
 
+fn retained_release_tombstones(
+    state: &RecoveredState,
+) -> BTreeMap<ReservationId, ReleaseTombstone> {
+    let mut retained: Vec<(&ReservationId, &ReleaseTombstone)> = state
+        .released
+        .iter()
+        .filter(|(_, released)| {
+            released.released_at_event <= state.logical_event_clock
+                && state
+                    .logical_event_clock
+                    .saturating_sub(released.released_at_event)
+                    <= RELEASE_TOMBSTONE_EVENT_TTL
+        })
+        .collect();
+    retained.sort_by(|(left_id, left), (right_id, right)| {
+        left.released_at_event
+            .cmp(&right.released_at_event)
+            .then_with(|| left_id.cmp(right_id))
+    });
+    let discard = retained
+        .len()
+        .saturating_sub(MAX_RETAINED_RELEASE_TOMBSTONES);
+    retained
+        .into_iter()
+        .skip(discard)
+        .map(|(reservation_id, released)| (reservation_id.clone(), released.clone()))
+        .collect()
+}
+
+fn compaction_events(
+    reservations: &BTreeMap<ReservationId, ReservationRecord>,
+    releases: &BTreeMap<ReservationId, ReleaseTombstone>,
+    logical_event_clock: u64,
+    generation: u64,
+    previous_anchor: JournalAnchor,
+) -> Result<Vec<RepairEvent>, RepairVaultStoreError> {
+    let mut events = Vec::new();
+    events.push(RepairEvent::CompactionBegin {
+        generation,
+        logical_event_clock,
+        active_reservations: u64::try_from(reservations.len())
+            .map_err(|_| RepairVaultStoreError::CorruptStore)?,
+        retained_releases: u64::try_from(releases.len())
+            .map_err(|_| RepairVaultStoreError::CorruptStore)?,
+        previous_anchor: encode_hex(&previous_anchor.to_bytes()),
+    });
+    for (reservation_id, record) in reservations {
+        append_reservation_snapshot(&mut events, reservation_id, record)?;
+    }
+    for (reservation_id, released) in releases {
+        append_release_snapshot(&mut events, reservation_id, released)?;
+    }
+    events.push(RepairEvent::CompactionComplete { generation });
+    Ok(events)
+}
+
+fn append_reserve_snapshot(
+    events: &mut Vec<RepairEvent>,
+    reservation_id: &ReservationId,
+    record: &ReservationRecord,
+) {
+    events.push(RepairEvent::ReserveIntent {
+        reservation_id: reservation_id.clone(),
+        draft: record.draft.clone(),
+        reservation_binding_sha256: record.reservation_binding_sha256.clone(),
+        reserved_capacity_bytes: record.reserved_capacity_bytes,
+        vault_id: record.vault_id.clone(),
+        vault_identity_fingerprint: record.vault_identity_fingerprint.clone(),
+        physical_parent_fingerprint: record.physical_parent_fingerprint.clone(),
+    });
+    events.push(RepairEvent::ReserveComplete {
+        reservation_id: reservation_id.clone(),
+    });
+}
+
+fn append_persist_snapshot(
+    events: &mut Vec<RepairEvent>,
+    reservation_id: &ReservationId,
+    record: &ReservationRecord,
+    binding: &RepairBinding,
+) {
+    events.push(RepairEvent::PersistIntent {
+        reservation_id: reservation_id.clone(),
+        binding: binding.clone(),
+    });
+    events.push(RepairEvent::PersistComplete {
+        reservation_id: reservation_id.clone(),
+        backup_sha256: encode_hex(&record.draft.expected_backup_sha256),
+        backup_size_bytes: record.draft.backup_size_bytes,
+    });
+}
+
+fn append_reservation_snapshot(
+    events: &mut Vec<RepairEvent>,
+    reservation_id: &ReservationId,
+    record: &ReservationRecord,
+) -> Result<(), RepairVaultStoreError> {
+    append_reserve_snapshot(events, reservation_id, record);
+    match &record.phase {
+        ReservationPhase::Reserved => Ok(()),
+        ReservationPhase::Durable(binding) => {
+            append_persist_snapshot(events, reservation_id, record, binding);
+            Ok(())
+        }
+        _ => Err(RepairVaultStoreError::ReconciliationRequired),
+    }
+}
+
+fn append_release_snapshot(
+    events: &mut Vec<RepairEvent>,
+    reservation_id: &ReservationId,
+    released: &ReleaseTombstone,
+) -> Result<(), RepairVaultStoreError> {
+    append_reserve_snapshot(events, reservation_id, &released.record);
+    match (&released.operation, &released.record.phase) {
+        (ReleaseOperation::Cancel, ReservationPhase::CancelPending) => {
+            events.push(RepairEvent::CancelIntent {
+                reservation_id: reservation_id.clone(),
+            });
+            events.push(RepairEvent::CancelComplete {
+                reservation_id: reservation_id.clone(),
+                released_at_event: Some(released.released_at_event),
+            });
+            Ok(())
+        }
+        (ReleaseOperation::Retire, ReservationPhase::RetirePending(binding)) => {
+            append_persist_snapshot(events, reservation_id, &released.record, binding);
+            events.push(RepairEvent::RetireIntent {
+                reservation_id: reservation_id.clone(),
+            });
+            events.push(RepairEvent::RetireComplete {
+                reservation_id: reservation_id.clone(),
+                released_at_event: Some(released.released_at_event),
+            });
+            Ok(())
+        }
+        _ => Err(RepairVaultStoreError::CorruptJournal),
+    }
+}
+
+fn validate_compacted_state(
+    state: &RecoveredState,
+    reservations: &BTreeMap<ReservationId, ReservationRecord>,
+    releases: &BTreeMap<ReservationId, ReleaseTombstone>,
+    logical_event_clock: u64,
+    generation: u64,
+    previous_anchor: JournalAnchor,
+) -> Result<(), RepairVaultStoreError> {
+    let expected_seen: BTreeSet<ReservationId> = reservations
+        .keys()
+        .chain(releases.keys())
+        .cloned()
+        .collect();
+    if &state.reservations != reservations
+        || &state.released != releases
+        || state.seen_reservation_ids != expected_seen
+        || state.pending.is_some()
+        || state.logical_event_clock != logical_event_clock
+        || state.compaction_generation != generation
+        || state.previous_compaction_anchor != Some(previous_anchor)
+        || state.compaction_replay.is_some()
+    {
+        return Err(RepairVaultStoreError::CorruptJournal);
+    }
+    Ok(())
+}
+
 fn replay_repair_event(
     state: &mut RecoveredState,
     entry: JournalEntryRef<'_>,
@@ -1929,9 +2371,82 @@ fn replay_repair_event(
 fn apply_repair_event(
     state: &mut RecoveredState,
     event: RepairEvent,
-    _entry: JournalEntryRef<'_>,
+    entry: JournalEntryRef<'_>,
 ) -> Result<(), RepairVaultStoreError> {
+    let control_event = matches!(
+        &event,
+        RepairEvent::CompactionBegin { .. } | RepairEvent::CompactionComplete { .. }
+    );
+    let restoring_snapshot = state.compaction_replay.is_some();
+    if !control_event && !restoring_snapshot {
+        state.logical_event_clock = state
+            .logical_event_clock
+            .checked_add(1)
+            .ok_or(RepairVaultStoreError::CorruptJournal)?;
+    }
     match event {
+        RepairEvent::CompactionBegin {
+            generation,
+            logical_event_clock,
+            active_reservations,
+            retained_releases,
+            previous_anchor,
+        } => {
+            let previous_anchor = decode_compaction_anchor(&previous_anchor)
+                .ok_or(RepairVaultStoreError::CorruptJournal)?;
+            let active_reservations = usize::try_from(active_reservations)
+                .map_err(|_| RepairVaultStoreError::CorruptJournal)?;
+            let retained_releases = usize::try_from(retained_releases)
+                .map_err(|_| RepairVaultStoreError::CorruptJournal)?;
+            if entry.sequence != 1
+                || generation == 0
+                || active_reservations > MAX_RESERVATIONS
+                || retained_releases > MAX_RETAINED_RELEASE_TOMBSTONES
+                || !state.reservations.is_empty()
+                || !state.released.is_empty()
+                || !state.seen_reservation_ids.is_empty()
+                || state.pending.is_some()
+                || state.logical_event_clock != 0
+                || state.compaction_generation != 0
+                || state.previous_compaction_anchor.is_some()
+                || state.compaction_replay.is_some()
+            {
+                return Err(RepairVaultStoreError::CorruptJournal);
+            }
+            state.logical_event_clock = logical_event_clock;
+            state.compaction_generation = generation;
+            state.previous_compaction_anchor = Some(previous_anchor);
+            state.compaction_replay = Some(CompactionReplay {
+                generation,
+                active_reservations,
+                retained_releases,
+            });
+        }
+        RepairEvent::CompactionComplete { generation } => {
+            let replay = state
+                .compaction_replay
+                .as_ref()
+                .ok_or(RepairVaultStoreError::CorruptJournal)?;
+            if generation != replay.generation
+                || state.pending.is_some()
+                || state.reservations.len() != replay.active_reservations
+                || state.released.len() != replay.retained_releases
+                || state.seen_reservation_ids.len()
+                    != replay
+                        .active_reservations
+                        .checked_add(replay.retained_releases)
+                        .ok_or(RepairVaultStoreError::CorruptJournal)?
+                || state.reservations.values().any(|record| {
+                    !matches!(
+                        record.phase,
+                        ReservationPhase::Reserved | ReservationPhase::Durable(_)
+                    )
+                })
+            {
+                return Err(RepairVaultStoreError::CorruptJournal);
+            }
+            state.compaction_replay = None;
+        }
         RepairEvent::ReserveIntent {
             reservation_id,
             draft,
@@ -2076,7 +2591,21 @@ fn apply_repair_event(
                 .ok_or(RepairVaultStoreError::CorruptJournal)?
                 .phase = ReservationPhase::CancelPending;
         }
-        RepairEvent::CancelComplete { reservation_id } => {
+        RepairEvent::CancelComplete {
+            reservation_id,
+            released_at_event,
+        } => {
+            let released_at_event = match (restoring_snapshot, released_at_event) {
+                (false, None) => state.logical_event_clock,
+                (true, Some(released_at_event))
+                    if released_at_event <= state.logical_event_clock
+                        && state.logical_event_clock.saturating_sub(released_at_event)
+                            <= RELEASE_TOMBSTONE_EVENT_TTL =>
+                {
+                    released_at_event
+                }
+                _ => return Err(RepairVaultStoreError::CorruptJournal),
+            };
             if state.pending.as_ref() != Some(&reservation_id)
                 || state.released.len() >= MAX_RELEASE_TOMBSTONES
                 || state.released.contains_key(&reservation_id)
@@ -2099,6 +2628,7 @@ fn apply_repair_event(
                 ReleaseTombstone {
                     operation: ReleaseOperation::Cancel,
                     record,
+                    released_at_event,
                 },
             );
             state.pending = None;
@@ -2125,7 +2655,21 @@ fn apply_repair_event(
             record.phase = ReservationPhase::RetirePending(binding.clone());
             state.pending = Some(reservation_id);
         }
-        RepairEvent::RetireComplete { reservation_id } => {
+        RepairEvent::RetireComplete {
+            reservation_id,
+            released_at_event,
+        } => {
+            let released_at_event = match (restoring_snapshot, released_at_event) {
+                (false, None) => state.logical_event_clock,
+                (true, Some(released_at_event))
+                    if released_at_event <= state.logical_event_clock
+                        && state.logical_event_clock.saturating_sub(released_at_event)
+                            <= RELEASE_TOMBSTONE_EVENT_TTL =>
+                {
+                    released_at_event
+                }
+                _ => return Err(RepairVaultStoreError::CorruptJournal),
+            };
             if state.pending.as_ref() != Some(&reservation_id)
                 || state.released.len() >= MAX_RELEASE_TOMBSTONES
                 || state.released.contains_key(&reservation_id)
@@ -2148,6 +2692,7 @@ fn apply_repair_event(
                 ReleaseTombstone {
                     operation: ReleaseOperation::Retire,
                     record,
+                    released_at_event,
                 },
             );
             state.pending = None;
@@ -2257,7 +2802,7 @@ fn cleanup_repair_secret_orphan(
     };
     if let Some(final_envelope) = read_optional_file(
         directory,
-        kind.name(),
+        kind.name(ACTIVE_JOURNAL_NAMES),
         owner,
         expected_device,
         expected_mount_id,
@@ -2362,7 +2907,31 @@ struct RepairJournalSecretStore<'vault> {
     inner: &'vault VaultInner,
     directory: OwnedFd,
     directory_state: FilesystemState,
+    names: JournalGenerationNames,
 }
+
+#[derive(Clone, Copy)]
+struct JournalGenerationNames {
+    database: &'static str,
+    key: &'static str,
+    anchor: &'static str,
+}
+
+const ACTIVE_JOURNAL_NAMES: JournalGenerationNames = JournalGenerationNames {
+    database: JOURNAL_DATABASE_NAME,
+    key: JOURNAL_KEY_NAME,
+    anchor: JOURNAL_ANCHOR_NAME,
+};
+const COMPACTION_JOURNAL_NAMES: JournalGenerationNames = JournalGenerationNames {
+    database: COMPACTION_DATABASE_NAME,
+    key: COMPACTION_KEY_NAME,
+    anchor: COMPACTION_ANCHOR_NAME,
+};
+const BACKUP_JOURNAL_NAMES: JournalGenerationNames = JournalGenerationNames {
+    database: COMPACTION_BACKUP_DATABASE_NAME,
+    key: COMPACTION_BACKUP_KEY_NAME,
+    anchor: COMPACTION_BACKUP_ANCHOR_NAME,
+};
 
 #[derive(Clone, Copy)]
 enum RepairSecretKind {
@@ -2371,10 +2940,10 @@ enum RepairSecretKind {
 }
 
 impl RepairSecretKind {
-    const fn name(self) -> &'static str {
+    const fn name(self, names: JournalGenerationNames) -> &'static str {
         match self {
-            Self::Key => JOURNAL_KEY_NAME,
-            Self::Anchor => JOURNAL_ANCHOR_NAME,
+            Self::Key => names.key,
+            Self::Anchor => names.anchor,
         }
     }
 
@@ -2451,7 +3020,7 @@ impl RepairJournalSecretStore<'_> {
         self.validate()?;
         let Some(envelope) = read_optional_file(
             &self.directory,
-            kind.name(),
+            kind.name(self.names),
             self.inner.owner(),
             self.inner.root_device(),
             self.inner.root_mount_id(),
@@ -2475,13 +3044,640 @@ impl RepairJournalSecretStore<'_> {
         self.validate()?;
         atomic_store_secret(
             &self.directory,
-            kind.name(),
+            kind.name(self.names),
             envelope.as_slice(),
             self.inner.owner(),
             self.inner.root_device(),
             self.inner.root_mount_id(),
         )
     }
+}
+
+fn open_journal_generation<'vault>(
+    inner: &'vault VaultInner,
+    directory: &OwnedFd,
+    directory_state: &FilesystemState,
+    names: JournalGenerationNames,
+) -> Result<
+    (
+        SecureJournal<RepairJournalSecretStore<'vault>>,
+        RecoveredState,
+        u64,
+    ),
+    RepairVaultStoreError,
+> {
+    let journal_descriptor = rustix::io::fcntl_dupfd_cloexec(directory, 3)
+        .map_err(|_| RepairVaultStoreError::StorageUnavailable)?;
+    let journal_path = inner
+        .root_path()
+        .join(REPAIR_NAMESPACE)
+        .join(names.database);
+    let mut journal = SecureJournal::open(
+        &journal_path,
+        RepairJournalSecretStore {
+            inner,
+            directory: journal_descriptor,
+            directory_state: directory_state.retained_copy(),
+            names,
+        },
+    )
+    .map_err(|_| RepairVaultStoreError::CorruptJournal)?;
+    let replay_limits =
+        JournalReplayLimits::new(MAX_JOURNAL_EVENTS, MAX_JOURNAL_EVENTS * MAX_EVENT_BYTES)
+            .map_err(|_| RepairVaultStoreError::CorruptJournal)?;
+    let (state, replay) = journal
+        .fold(
+            replay_limits,
+            RecoveredState::default(),
+            replay_repair_event,
+        )
+        .map_err(|_| RepairVaultStoreError::CorruptJournal)?;
+    if state.compaction_replay.is_some() {
+        return Err(RepairVaultStoreError::CorruptJournal);
+    }
+    Ok((journal, state, replay.entries))
+}
+
+fn append_compaction_event(
+    journal: &mut SecureJournal<RepairJournalSecretStore<'_>>,
+    event: RepairEvent,
+) -> Result<(), RepairVaultStoreError> {
+    let encoded = serde_json::to_vec(&event).map_err(|_| RepairVaultStoreError::CorruptStore)?;
+    if encoded.len() as u64 > MAX_EVENT_BYTES {
+        return Err(RepairVaultStoreError::CorruptStore);
+    }
+    journal
+        .append(&encoded)
+        .map(|_| ())
+        .map_err(|_| RepairVaultStoreError::CorruptJournal)
+}
+
+fn validate_compaction_namespace(
+    directory: &OwnedFd,
+    inner: &VaultInner,
+) -> Result<(), RepairVaultStoreError> {
+    inner
+        .ensure_integrity()
+        .map_err(|_| RepairVaultStoreError::CorruptStore)?;
+    let descriptor = validate_directory(
+        directory,
+        inner.owner(),
+        inner.root_device(),
+        inner.root_mount_id(),
+    )?;
+    let named = named_directory_state(
+        inner.root_directory_fd(),
+        REPAIR_NAMESPACE,
+        inner.owner(),
+        inner.root_device(),
+    )?;
+    if !descriptor.same_object(&named) {
+        return Err(RepairVaultStoreError::ConcurrentWrite);
+    }
+    Ok(())
+}
+
+fn generation_presence(
+    directory: &OwnedFd,
+    inner: &VaultInner,
+    names: JournalGenerationNames,
+) -> Result<[bool; 3], RepairVaultStoreError> {
+    Ok([
+        named_optional_state(
+            directory,
+            names.database,
+            inner.owner(),
+            inner.root_device(),
+            None,
+        )?
+        .is_some(),
+        named_optional_state(
+            directory,
+            names.key,
+            inner.owner(),
+            inner.root_device(),
+            None,
+        )?
+        .is_some(),
+        named_optional_state(
+            directory,
+            names.anchor,
+            inner.owner(),
+            inner.root_device(),
+            None,
+        )?
+        .is_some(),
+    ])
+}
+
+fn ensure_sidecars_absent(
+    directory: &OwnedFd,
+    inner: &VaultInner,
+    wal_name: &str,
+    shm_name: &str,
+) -> Result<(), RepairVaultStoreError> {
+    for name in [wal_name, shm_name] {
+        if named_optional_state(directory, name, inner.owner(), inner.root_device(), None)?
+            .is_some()
+        {
+            return Err(RepairVaultStoreError::CorruptJournal);
+        }
+    }
+    Ok(())
+}
+
+fn ensure_compaction_artifacts_absent(
+    directory: &OwnedFd,
+    inner: &VaultInner,
+) -> Result<(), RepairVaultStoreError> {
+    for name in [
+        COMPACTION_DATABASE_NAME,
+        COMPACTION_WAL_NAME,
+        COMPACTION_SHM_NAME,
+        COMPACTION_KEY_NAME,
+        COMPACTION_ANCHOR_NAME,
+        COMPACTION_BACKUP_DATABASE_NAME,
+        COMPACTION_BACKUP_WAL_NAME,
+        COMPACTION_BACKUP_SHM_NAME,
+        COMPACTION_BACKUP_KEY_NAME,
+        COMPACTION_BACKUP_ANCHOR_NAME,
+        COMPACTION_INTENT_NAME,
+        COMPACTION_INTENT_TEMP_NAME,
+    ] {
+        if named_optional_state(directory, name, inner.owner(), inner.root_device(), None)?
+            .is_some()
+        {
+            return Err(RepairVaultStoreError::ReconciliationRequired);
+        }
+    }
+    Ok(())
+}
+
+fn store_compaction_marker(
+    directory: &OwnedFd,
+    inner: &VaultInner,
+    contents: &[u8],
+    replace: bool,
+) -> Result<(), RepairVaultStoreError> {
+    if contents != COMPACTION_PREPARED && contents != COMPACTION_COMMITTED {
+        return Err(RepairVaultStoreError::CorruptStore);
+    }
+    let _guard = inner
+        .operation_guard()
+        .map_err(|_| RepairVaultStoreError::StorageUnavailable)?;
+    validate_compaction_namespace(directory, inner)?;
+    if named_optional_state(
+        directory,
+        COMPACTION_INTENT_TEMP_NAME,
+        inner.owner(),
+        inner.root_device(),
+        None,
+    )?
+    .is_some()
+    {
+        return Err(RepairVaultStoreError::ConcurrentWrite);
+    }
+    let existing = read_optional_file(
+        directory,
+        COMPACTION_INTENT_NAME,
+        inner.owner(),
+        inner.root_device(),
+        inner.root_mount_id(),
+        COMPACTION_COMMITTED.len(),
+    )?;
+    if replace {
+        if existing.as_ref().map(|value| value.as_slice()) != Some(COMPACTION_PREPARED) {
+            return Err(RepairVaultStoreError::CorruptStore);
+        }
+    } else if existing.is_some() {
+        return Err(RepairVaultStoreError::ConcurrentWrite);
+    }
+
+    let descriptor = open_child(
+        directory,
+        Path::new(COMPACTION_INTENT_TEMP_NAME),
+        OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    )
+    .map_err(|_| RepairVaultStoreError::ConcurrentWrite)?;
+    rfs::fchmod(&descriptor, Mode::RUSR | Mode::WUSR)
+        .map_err(|_| RepairVaultStoreError::StorageUnavailable)?;
+    let state = validate_regular_file(
+        &descriptor,
+        inner.owner(),
+        inner.root_device(),
+        inner.root_mount_id(),
+        Some(0),
+    )?;
+    let mut temporary_guard = TemporaryFileGuard {
+        directory: rustix::io::fcntl_dupfd_cloexec(directory, 3)
+            .map_err(|_| RepairVaultStoreError::StorageUnavailable)?,
+        name: COMPACTION_INTENT_TEMP_NAME.to_owned(),
+        state,
+        armed: true,
+    };
+    let mut temporary = File::from(descriptor);
+    temporary
+        .write_all(contents)
+        .map_err(|_| RepairVaultStoreError::StorageUnavailable)?;
+    temporary
+        .sync_all()
+        .map_err(|_| RepairVaultStoreError::StorageUnavailable)?;
+    let readback = read_optional_file(
+        directory,
+        COMPACTION_INTENT_TEMP_NAME,
+        inner.owner(),
+        inner.root_device(),
+        inner.root_mount_id(),
+        contents.len(),
+    )?
+    .ok_or(RepairVaultStoreError::WriteVerificationFailed)?;
+    if readback.as_slice() != contents {
+        return Err(RepairVaultStoreError::WriteVerificationFailed);
+    }
+    let renamed = if replace {
+        rfs::renameat(
+            directory,
+            COMPACTION_INTENT_TEMP_NAME,
+            directory,
+            COMPACTION_INTENT_NAME,
+        )
+    } else {
+        rfs::renameat_with(
+            directory,
+            COMPACTION_INTENT_TEMP_NAME,
+            directory,
+            COMPACTION_INTENT_NAME,
+            RenameFlags::NOREPLACE,
+        )
+    };
+    renamed.map_err(|_| RepairVaultStoreError::ConcurrentWrite)?;
+    temporary_guard.disarm();
+    rfs::fsync(directory).map_err(|_| RepairVaultStoreError::StorageUnavailable)?;
+    let persisted = read_optional_file(
+        directory,
+        COMPACTION_INTENT_NAME,
+        inner.owner(),
+        inner.root_device(),
+        inner.root_mount_id(),
+        contents.len(),
+    )?
+    .ok_or(RepairVaultStoreError::WriteVerificationFailed)?;
+    if persisted.as_slice() != contents {
+        return Err(RepairVaultStoreError::WriteVerificationFailed);
+    }
+    Ok(())
+}
+
+fn move_generation(
+    directory: &OwnedFd,
+    inner: &VaultInner,
+    source: JournalGenerationNames,
+    destination: JournalGenerationNames,
+    stop_after_first: Option<CompactionBoundary>,
+) -> Result<(), RepairVaultStoreError> {
+    for (index, (source, destination)) in [
+        (source.database, destination.database),
+        (source.key, destination.key),
+        (source.anchor, destination.anchor),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        move_generation_component(directory, inner, source, destination)?;
+        #[cfg(test)]
+        if index == 0 && stop_after_first == Some(CompactionBoundary::AfterFirstInstall) {
+            return Ok(());
+        }
+        #[cfg(not(test))]
+        let _ = (index, stop_after_first);
+    }
+    Ok(())
+}
+
+fn move_generation_component(
+    directory: &OwnedFd,
+    inner: &VaultInner,
+    source: &str,
+    destination: &str,
+) -> Result<(), RepairVaultStoreError> {
+    let _guard = inner
+        .operation_guard()
+        .map_err(|_| RepairVaultStoreError::StorageUnavailable)?;
+    validate_compaction_namespace(directory, inner)?;
+    let source_state =
+        named_file_state(directory, source, inner.owner(), inner.root_device(), None)?;
+    if named_optional_state(
+        directory,
+        destination,
+        inner.owner(),
+        inner.root_device(),
+        None,
+    )?
+    .is_some()
+    {
+        return Err(RepairVaultStoreError::ConcurrentWrite);
+    }
+    rfs::renameat_with(
+        directory,
+        source,
+        directory,
+        destination,
+        RenameFlags::NOREPLACE,
+    )
+    .map_err(|_| RepairVaultStoreError::ConcurrentWrite)?;
+    rfs::fsync(directory).map_err(|_| RepairVaultStoreError::StorageUnavailable)?;
+    let destination_state = named_file_state(
+        directory,
+        destination,
+        inner.owner(),
+        inner.root_device(),
+        None,
+    )?;
+    if !source_state.same_object(&destination_state) {
+        return Err(RepairVaultStoreError::ConcurrentWrite);
+    }
+    Ok(())
+}
+
+fn remove_generation_component(
+    directory: &OwnedFd,
+    inner: &VaultInner,
+    name: &str,
+) -> Result<(), RepairVaultStoreError> {
+    let _guard = inner
+        .operation_guard()
+        .map_err(|_| RepairVaultStoreError::StorageUnavailable)?;
+    validate_compaction_namespace(directory, inner)?;
+    let Some(before) =
+        named_optional_state(directory, name, inner.owner(), inner.root_device(), None)?
+    else {
+        return Ok(());
+    };
+    let rechecked = named_file_state(directory, name, inner.owner(), inner.root_device(), None)?;
+    if !before.same_object(&rechecked) || before.size != rechecked.size {
+        return Err(RepairVaultStoreError::ConcurrentWrite);
+    }
+    rfs::unlinkat(directory, name, AtFlags::empty())
+        .map_err(|_| RepairVaultStoreError::ConcurrentWrite)?;
+    rfs::fsync(directory).map_err(|_| RepairVaultStoreError::StorageUnavailable)?;
+    if named_optional_state(directory, name, inner.owner(), inner.root_device(), None)?.is_some() {
+        return Err(RepairVaultStoreError::ConcurrentWrite);
+    }
+    Ok(())
+}
+
+fn verify_previous_anchor_against_backup(
+    inner: &VaultInner,
+    directory: &OwnedFd,
+    directory_state: &FilesystemState,
+    compacted_state: &RecoveredState,
+) -> Result<(), RepairVaultStoreError> {
+    let expected = compacted_state
+        .previous_compaction_anchor
+        .ok_or(RepairVaultStoreError::CorruptJournal)?;
+    let (mut backup, state, _) =
+        open_journal_generation(inner, directory, directory_state, BACKUP_JOURNAL_NAMES)?;
+    if state.pending.is_some() || state.compaction_replay.is_some() {
+        return Err(RepairVaultStoreError::CorruptJournal);
+    }
+    let observed = backup
+        .head()
+        .map_err(|_| RepairVaultStoreError::CorruptJournal)?;
+    drop(backup);
+    ensure_sidecars_absent(
+        directory,
+        inner,
+        COMPACTION_BACKUP_WAL_NAME,
+        COMPACTION_BACKUP_SHM_NAME,
+    )?;
+    if observed != expected {
+        return Err(RepairVaultStoreError::CorruptJournal);
+    }
+    Ok(())
+}
+
+fn recover_journal_compaction(
+    inner: &VaultInner,
+    directory: &OwnedFd,
+    directory_state: &FilesystemState,
+) -> Result<(), RepairVaultStoreError> {
+    remove_generation_component(directory, inner, COMPACTION_INTENT_TEMP_NAME)?;
+    let marker = read_optional_file(
+        directory,
+        COMPACTION_INTENT_NAME,
+        inner.owner(),
+        inner.root_device(),
+        inner.root_mount_id(),
+        COMPACTION_COMMITTED.len(),
+    )?;
+    let active = generation_presence(directory, inner, ACTIVE_JOURNAL_NAMES)?;
+    let staging = generation_presence(directory, inner, COMPACTION_JOURNAL_NAMES)?;
+    let backup = generation_presence(directory, inner, BACKUP_JOURNAL_NAMES)?;
+    let backup_count = backup.iter().filter(|present| **present).count();
+    let staging_sidecars = [COMPACTION_WAL_NAME, COMPACTION_SHM_NAME]
+        .into_iter()
+        .map(|name| {
+            named_optional_state(directory, name, inner.owner(), inner.root_device(), None)
+                .map(|state| state.is_some())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let backup_sidecars = [COMPACTION_BACKUP_WAL_NAME, COMPACTION_BACKUP_SHM_NAME]
+        .into_iter()
+        .map(|name| {
+            named_optional_state(directory, name, inner.owner(), inner.root_device(), None)
+                .map(|state| state.is_some())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let Some(marker) = marker else {
+        if backup_count != 0 || backup_sidecars.iter().any(|present| *present) {
+            return Err(RepairVaultStoreError::CorruptJournal);
+        }
+        if staging.iter().any(|present| *present) || staging_sidecars.iter().any(|present| *present)
+        {
+            if !active.iter().all(|present| *present) {
+                return Err(RepairVaultStoreError::CorruptJournal);
+            }
+            cleanup_staging_generation(directory, inner)?;
+        }
+        return Ok(());
+    };
+    if staging_sidecars.iter().any(|present| *present) {
+        return Err(RepairVaultStoreError::CorruptJournal);
+    }
+    if marker.as_slice() == COMPACTION_COMMITTED {
+        if backup_sidecars.iter().any(|present| *present) {
+            return Err(RepairVaultStoreError::CorruptJournal);
+        }
+        if !active.iter().all(|present| *present) || staging.iter().any(|present| *present) {
+            return Err(RepairVaultStoreError::CorruptJournal);
+        }
+        let (journal, state, _) =
+            open_journal_generation(inner, directory, directory_state, ACTIVE_JOURNAL_NAMES)?;
+        if state.pending.is_some()
+            || state.compaction_replay.is_some()
+            || state.compaction_generation == 0
+        {
+            return Err(RepairVaultStoreError::CorruptJournal);
+        }
+        if backup_count == 3 {
+            verify_previous_anchor_against_backup(inner, directory, directory_state, &state)?;
+        }
+        drop(journal);
+        cleanup_backup_generation(directory, inner)?;
+        remove_generation_component(directory, inner, COMPACTION_INTENT_NAME)?;
+        return Ok(());
+    }
+    if marker.as_slice() != COMPACTION_PREPARED {
+        return Err(RepairVaultStoreError::CorruptJournal);
+    }
+    if backup_count != 3 && backup_sidecars.iter().any(|present| *present) {
+        return Err(RepairVaultStoreError::CorruptJournal);
+    }
+
+    match backup_count {
+        0 => {
+            if !active.iter().all(|present| *present) {
+                return Err(RepairVaultStoreError::CorruptJournal);
+            }
+            cleanup_staging_generation(directory, inner)?;
+            remove_generation_component(directory, inner, COMPACTION_INTENT_NAME)?;
+        }
+        1 | 2 => {
+            rollback_to_backup(directory, inner, active, staging, backup)?;
+            remove_generation_component(directory, inner, COMPACTION_INTENT_NAME)?;
+        }
+        3 => {
+            let can_roll_forward = active
+                .iter()
+                .zip(staging.iter())
+                .all(|(active, staging)| *active != *staging);
+            if can_roll_forward {
+                for ((present, source), destination) in staging
+                    .iter()
+                    .zip([
+                        COMPACTION_JOURNAL_NAMES.database,
+                        COMPACTION_JOURNAL_NAMES.key,
+                        COMPACTION_JOURNAL_NAMES.anchor,
+                    ])
+                    .zip([
+                        ACTIVE_JOURNAL_NAMES.database,
+                        ACTIVE_JOURNAL_NAMES.key,
+                        ACTIVE_JOURNAL_NAMES.anchor,
+                    ])
+                {
+                    if *present {
+                        move_generation_component(directory, inner, source, destination)?;
+                    }
+                }
+                let valid = open_journal_generation(
+                    inner,
+                    directory,
+                    directory_state,
+                    ACTIVE_JOURNAL_NAMES,
+                )
+                .map(|(journal, state, _)| {
+                    let complete = state.pending.is_none()
+                        && state.compaction_replay.is_none()
+                        && state.compaction_generation > 0
+                        && verify_previous_anchor_against_backup(
+                            inner,
+                            directory,
+                            directory_state,
+                            &state,
+                        )
+                        .is_ok();
+                    drop(journal);
+                    complete
+                })
+                .unwrap_or(false);
+                if valid {
+                    store_compaction_marker(directory, inner, COMPACTION_COMMITTED, true)?;
+                    cleanup_backup_generation(directory, inner)?;
+                    remove_generation_component(directory, inner, COMPACTION_INTENT_NAME)?;
+                    return Ok(());
+                }
+            }
+            let active = generation_presence(directory, inner, ACTIVE_JOURNAL_NAMES)?;
+            let staging = generation_presence(directory, inner, COMPACTION_JOURNAL_NAMES)?;
+            let backup = generation_presence(directory, inner, BACKUP_JOURNAL_NAMES)?;
+            rollback_to_backup(directory, inner, active, staging, backup)?;
+            remove_generation_component(directory, inner, COMPACTION_INTENT_NAME)?;
+        }
+        _ => return Err(RepairVaultStoreError::CorruptJournal),
+    }
+    Ok(())
+}
+
+fn rollback_to_backup(
+    directory: &OwnedFd,
+    inner: &VaultInner,
+    active: [bool; 3],
+    staging: [bool; 3],
+    backup: [bool; 3],
+) -> Result<(), RepairVaultStoreError> {
+    let active_names = [
+        ACTIVE_JOURNAL_NAMES.database,
+        ACTIVE_JOURNAL_NAMES.key,
+        ACTIVE_JOURNAL_NAMES.anchor,
+    ];
+    let staging_names = [
+        COMPACTION_JOURNAL_NAMES.database,
+        COMPACTION_JOURNAL_NAMES.key,
+        COMPACTION_JOURNAL_NAMES.anchor,
+    ];
+    let backup_names = [
+        BACKUP_JOURNAL_NAMES.database,
+        BACKUP_JOURNAL_NAMES.key,
+        BACKUP_JOURNAL_NAMES.anchor,
+    ];
+    for index in 0..3 {
+        if backup[index] {
+            if active[index] {
+                remove_generation_component(directory, inner, active_names[index])?;
+            }
+            move_generation_component(directory, inner, backup_names[index], active_names[index])?;
+        } else if !active[index] {
+            return Err(RepairVaultStoreError::CorruptJournal);
+        }
+        if staging[index] {
+            remove_generation_component(directory, inner, staging_names[index])?;
+        }
+    }
+    cleanup_staging_generation(directory, inner)
+}
+
+fn cleanup_staging_generation(
+    directory: &OwnedFd,
+    inner: &VaultInner,
+) -> Result<(), RepairVaultStoreError> {
+    for name in [
+        COMPACTION_DATABASE_NAME,
+        COMPACTION_KEY_NAME,
+        COMPACTION_ANCHOR_NAME,
+        COMPACTION_WAL_NAME,
+        COMPACTION_SHM_NAME,
+    ] {
+        remove_generation_component(directory, inner, name)?;
+    }
+    Ok(())
+}
+
+fn cleanup_backup_generation(
+    directory: &OwnedFd,
+    inner: &VaultInner,
+) -> Result<(), RepairVaultStoreError> {
+    for name in [
+        COMPACTION_BACKUP_DATABASE_NAME,
+        COMPACTION_BACKUP_WAL_NAME,
+        COMPACTION_BACKUP_SHM_NAME,
+        COMPACTION_BACKUP_KEY_NAME,
+        COMPACTION_BACKUP_ANCHOR_NAME,
+    ] {
+        remove_generation_component(directory, inner, name)?;
+    }
+    Ok(())
 }
 
 fn secret_error(error: RepairVaultStoreError) -> SecretStoreError {
@@ -3298,7 +4494,11 @@ fn valid_opaque_id(value: &str) -> bool {
 }
 
 fn valid_sha256(value: &str) -> bool {
-    value.len() == 64
+    valid_lower_hex(value, 64)
+}
+
+fn valid_lower_hex(value: &str, length: usize) -> bool {
+    value.len() == length
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
@@ -3312,6 +4512,27 @@ fn encode_hex(bytes: &[u8]) -> String {
         encoded.push(HEX[(byte & 0x0f) as usize] as char);
     }
     encoded
+}
+
+fn decode_compaction_anchor(value: &str) -> Option<JournalAnchor> {
+    if !valid_lower_hex(value, JournalAnchor::ENCODED_BYTES * 2) {
+        return None;
+    }
+    let mut decoded = [0_u8; JournalAnchor::ENCODED_BYTES];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let high = hex_nibble(pair[0])?;
+        let low = hex_nibble(pair[1])?;
+        decoded[index] = (high << 4) | low;
+    }
+    JournalAnchor::from_bytes(&decoded).ok()
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -3404,6 +4625,10 @@ mod tests {
     fn reservation_id(hex_digit: char) -> ReservationId {
         ReservationId::parse(format!("B-{}", hex_digit.to_string().repeat(32)))
             .expect("valid fixed reservation id")
+    }
+
+    fn numbered_reservation_id(value: u64) -> ReservationId {
+        ReservationId::parse(format!("B-{value:032x}")).expect("valid numbered reservation id")
     }
 
     fn backup_path(fixture: &Fixture, reservation_id: &ReservationId) -> PathBuf {
@@ -4147,5 +5372,208 @@ mod tests {
             .open_repair_store()
             .expect("rebuild retire tombstone after second restart");
         assert_eq!(store.retire_backup(&metadata), Ok(4096));
+    }
+
+    #[test]
+    fn compaction_preserves_reserved_durable_and_retryable_release() {
+        let fixture = Fixture::new();
+        let reserved_bytes = b"reserved across compaction\n";
+        let durable_bytes = b"durable across compaction\n";
+        let cancelled_bytes = b"cancelled retry\n";
+        let (
+            reserved_id,
+            reserved_binding,
+            durable_id,
+            durable_binding,
+            cancelled_id,
+            cancelled_binding,
+        ) = {
+            let mut store = fixture
+                .vault
+                .open_repair_store()
+                .expect("open repair store");
+            let reserved = store
+                .reserve_backup(draft(reserved_bytes, 4096))
+                .expect("reserve active backup");
+            let reserved_id = reserved.reservation_id().clone();
+            let reserved_binding = reserved.reservation_binding_sha256().to_owned();
+
+            let durable = store
+                .reserve_backup(draft(durable_bytes, 4096))
+                .expect("reserve durable backup");
+            let durable_id = durable.reservation_id().clone();
+            let durable_binding = durable.reservation_binding_sha256().to_owned();
+            store
+                .persist_backup(
+                    durable,
+                    binding(durable_bytes),
+                    fixture.read_only_source(durable_bytes),
+                )
+                .expect("persist durable backup");
+
+            let cancelled = store
+                .reserve_backup(draft(cancelled_bytes, 4096))
+                .expect("reserve cancelled backup");
+            let cancelled_id = cancelled.reservation_id().clone();
+            let cancelled_binding = cancelled.reservation_binding_sha256().to_owned();
+            store
+                .cancel_reservation(cancelled)
+                .expect("cancel retryable backup");
+
+            let previous_anchor = store
+                .journal
+                .as_mut()
+                .expect("active journal")
+                .head()
+                .expect("authenticated pre-compaction anchor");
+            store.compact_journal().expect("compact repair journal");
+            assert_eq!(
+                store.state.previous_compaction_anchor,
+                Some(previous_anchor)
+            );
+            assert!(backup_path(&fixture, &reserved_id).exists());
+            assert!(backup_path(&fixture, &durable_id).exists());
+            assert_eq!(
+                store.cancel_reserved(&cancelled_id, &cancelled_binding),
+                Ok(4096)
+            );
+            (
+                reserved_id,
+                reserved_binding,
+                durable_id,
+                durable_binding,
+                cancelled_id,
+                cancelled_binding,
+            )
+        };
+
+        let mut store = fixture
+            .vault
+            .open_repair_store()
+            .expect("reopen compacted repair store");
+        assert!(matches!(
+            store
+                .backup_status(&reserved_id, &reserved_binding)
+                .expect("reserved status"),
+            RepairBackupStatus::Reserved(_)
+        ));
+        assert!(matches!(
+            store
+                .backup_status(&durable_id, &durable_binding)
+                .expect("durable status"),
+            RepairBackupStatus::Durable(_)
+        ));
+        assert_eq!(
+            store.cancel_reserved(&cancelled_id, &cancelled_binding),
+            Ok(4096)
+        );
+    }
+
+    #[test]
+    fn compaction_recovery_covers_prepared_install_and_committed_boundaries() {
+        for boundary in [
+            CompactionBoundary::AfterPrepared,
+            CompactionBoundary::AfterFirstInstall,
+            CompactionBoundary::AfterCommittedCleanup,
+        ] {
+            let fixture = Fixture::new();
+            let bytes = b"active backup survives compaction crash\n";
+            let durable_bytes = b"durable backup survives compaction crash\n";
+            let (reservation_id, draft_binding, durable_id, durable_binding) = {
+                let mut store = fixture
+                    .vault
+                    .open_repair_store()
+                    .expect("open repair store");
+                let reserved = store
+                    .reserve_backup(draft(bytes, 4096))
+                    .expect("reserve active backup");
+                let reservation_id = reserved.reservation_id().clone();
+                let draft_binding = reserved.reservation_binding_sha256().to_owned();
+                let durable = store
+                    .reserve_backup(draft(durable_bytes, 4096))
+                    .expect("reserve durable backup");
+                let durable_id = durable.reservation_id().clone();
+                let durable_binding = durable.reservation_binding_sha256().to_owned();
+                store
+                    .persist_backup(
+                        durable,
+                        binding(durable_bytes),
+                        fixture.read_only_source(durable_bytes),
+                    )
+                    .expect("persist durable backup");
+                assert_eq!(
+                    store.simulate_compaction_crash(boundary),
+                    Err(RepairVaultStoreError::StorageUnavailable)
+                );
+                (reservation_id, draft_binding, durable_id, durable_binding)
+            };
+
+            let store = fixture
+                .vault
+                .open_repair_store()
+                .expect("recover interrupted compaction");
+            assert!(matches!(
+                store
+                    .backup_status(&reservation_id, &draft_binding)
+                    .expect("active status after recovery"),
+                RepairBackupStatus::Reserved(_)
+            ));
+            assert!(matches!(
+                store
+                    .backup_status(&durable_id, &durable_binding)
+                    .expect("durable status after recovery"),
+                RepairBackupStatus::Durable(_)
+            ));
+            assert!(backup_path(&fixture, &reservation_id).exists());
+            assert!(backup_path(&fixture, &durable_id).exists());
+            ensure_compaction_artifacts_absent(&store.namespace_fd, store.inner)
+                .expect("compaction artifacts recovered");
+        }
+    }
+
+    #[test]
+    fn tombstone_retention_uses_event_ttl_and_newest_count_bound() {
+        let fixture = Fixture::new();
+        let bytes = b"retention seed\n";
+        let mut store = fixture
+            .vault
+            .open_repair_store()
+            .expect("open repair store");
+        let reserved = store
+            .reserve_backup(draft(bytes, 4096))
+            .expect("reserve seed");
+        store
+            .cancel_reservation(reserved)
+            .expect("cancel retention seed");
+        let seed = store
+            .state
+            .released
+            .values()
+            .next()
+            .expect("release tombstone")
+            .clone();
+        store.state.released.clear();
+        store.state.logical_event_clock = RELEASE_TOMBSTONE_EVENT_TTL + 100;
+        for offset in 0..=MAX_RETAINED_RELEASE_TOMBSTONES {
+            let mut released = seed.clone();
+            released.released_at_event = 100 + offset as u64;
+            store
+                .state
+                .released
+                .insert(numbered_reservation_id(offset as u64 + 1), released);
+        }
+        let mut expired = seed;
+        expired.released_at_event = 99;
+        store
+            .state
+            .released
+            .insert(numbered_reservation_id(10_000), expired);
+
+        assert!(store.compaction_due(0));
+        let retained = retained_release_tombstones(&store.state);
+        assert_eq!(retained.len(), MAX_RETAINED_RELEASE_TOMBSTONES);
+        assert!(!retained.contains_key(&numbered_reservation_id(1)));
+        assert!(!retained.contains_key(&numbered_reservation_id(10_000)));
+        assert!(retained.contains_key(&numbered_reservation_id(65)));
     }
 }
