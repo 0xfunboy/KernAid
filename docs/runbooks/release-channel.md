@@ -119,7 +119,8 @@ the same full commit. Before publication it:
 - wraps each immutable Actions artifact under a versioned filename, builds
   and re-verifies the canonical manifest;
 - attests the complete staged channel with GitHub OIDC; and
-- creates one non-overwriting GitHub **prerelease** whose tag is
+- requires repository release immutability and creates one immutable GitHub
+  **prerelease** whose tag is
   `kernaid-internal-v<VERSION>`.
 
 For sequence 2 and later the operator must name the current published channel
@@ -130,11 +131,12 @@ instead of replacing assets.
 
 The manual workflow holds `contents:write` solely so its final step can create
 the internal prerelease; its preceding scripts do not publish repository
-content. The repository currently does not enforce GitHub's immutable-release
-setting, so an administrator could still alter or delete a published release;
-consumers must verify the included channel attestation and manifest hash. This
-permission does not code-sign MSI, DMG, AppImage or the boot chain. Those
-assets remain explicitly unsigned engineering candidates.
+content. Repository release immutability was enabled on 28 August 2026 and the
+workflow fails before publication if that setting is no longer active. It
+applies only to releases published while enabled. Consumers must still verify
+the included channel attestation and manifest hash. This permission does not
+code-sign MSI, DMG, AppImage or the boot chain. Those assets remain explicitly
+unsigned engineering candidates.
 
 The checked-in JSON Schema is
 `tools/release/release-channel.v1.schema.json`. Run the focused local contract

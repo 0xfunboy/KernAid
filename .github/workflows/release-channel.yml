@@ -154,6 +154,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          immutable="$RUNNER_TEMP/kernaid-immutable-releases.json"
+          gh api "repos/$GITHUB_REPOSITORY/immutable-releases" >"$immutable"
+          python3 -I -B - "$immutable" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          document = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if document.get("enabled") is not True:
+              raise SystemExit("repository release immutability is not enabled")
+          PY
           releases="$RUNNER_TEMP/kernaid-internal-releases.jsonl"
           gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
             --jq '.[] | @base64' >"$releases"
@@ -530,7 +541,7 @@ jobs:
             "${{ steps.attest_channel.outputs.bundle-path }}" \
             "$RUNNER_TEMP/kernaid-channel-assets/KernAid-release-channel-internal-v1.sigstore.json"
 
-      - name: Publish a non-overwriting internal prerelease
+      - name: Publish an immutable internal prerelease
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -552,17 +563,89 @@ jobs:
             "Source commit: ${SOURCE_COMMIT}" \
             "Desktop run: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${DESKTOP_RUN_ID}" \
             "Rescue run: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${RESCUE_RUN_ID}" \
+            "Publisher run: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
             "" \
             "These are unsigned engineering installers and a virtually qualified Rescue candidate." \
             "This prerelease does not claim Secure Boot, physical hardware qualification, or production support." \
             >"$notes"
+
+          # GITHUB_TOKEN cannot ask the Releases API to create a tag at an
+          # arbitrary historical commit through `--target`. Create and verify
+          # the exact lightweight ref first, then follow GitHub's immutable-
+          # release sequence: draft, attach every asset, publish once.
+          gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+            -f ref="refs/tags/$tag" \
+            -f sha="$SOURCE_COMMIT" >/dev/null
+          observed_tag="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq '.object.sha')"
+          if [[ "$observed_tag" != "$SOURCE_COMMIT" ]]; then
+            echo "Created release tag does not resolve to the exact source commit" >&2
+            exit 1
+          fi
           gh release create "$tag" \
             --repo "$GITHUB_REPOSITORY" \
-            --target "$SOURCE_COMMIT" \
+            --verify-tag \
             --title "KernAid ${VERSION} — internal candidate" \
             --notes-file "$notes" \
+            --draft \
             --prerelease \
             "$RUNNER_TEMP"/kernaid-channel-assets/*
+
+          draft="$RUNNER_TEMP/kernaid-channel-draft.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" >"$draft"
+          python3 -I -B - "$draft" "$RUNNER_TEMP/kernaid-channel-assets" "$tag" <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          import stat
+          import sys
+
+          document = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          root = Path(sys.argv[2])
+          if (
+              document.get("tag_name") != sys.argv[3]
+              or document.get("draft") is not True
+              or document.get("prerelease") is not True
+          ):
+              raise SystemExit("release draft identity is invalid")
+          expected = {}
+          for path in root.iterdir():
+              details = path.lstat()
+              if not stat.S_ISREG(details.st_mode) or details.st_nlink != 1:
+                  raise SystemExit("staged release asset is unsafe")
+              digest = hashlib.sha256()
+              with path.open("rb") as stream:
+                  for chunk in iter(lambda: stream.read(4 * 1024 * 1024), b""):
+                      digest.update(chunk)
+              expected[path.name] = (details.st_size, f"sha256:{digest.hexdigest()}")
+          observed = {
+              asset.get("name"): (asset.get("size"), asset.get("digest"))
+              for asset in document.get("assets", [])
+              if isinstance(asset, dict)
+          }
+          if observed != expected:
+              raise SystemExit("release draft assets do not match the staged channel")
+          PY
+          gh release edit "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --draft=false
+
+          published="$RUNNER_TEMP/kernaid-channel-published.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" >"$published"
+          python3 -I -B - "$published" "$tag" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          document = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if (
+              document.get("tag_name") != sys.argv[2]
+              or document.get("draft") is not False
+              or document.get("prerelease") is not True
+              or document.get("immutable") is not True
+          ):
+              raise SystemExit("published release is not the exact immutable prerelease")
+          PY
 
       - name: Retain the exact published channel as workflow evidence
         uses: actions/upload-artifact@v4
