@@ -652,6 +652,48 @@ class RescueTauriBoundaryTests(unittest.TestCase):
             )
         )
 
+    def test_process_metadata_bounded_read_collects_fragmented_chunks(self) -> None:
+        expected = b"DISPLAY=:0\0XAUTHORITY=/run/lightdm/rescue/xauthority\0"
+        fragments = [expected[:11], expected[11:37], expected[37:], b""]
+        for module in (session_ui, guest_ui):
+            with self.subTest(module=module.__name__):
+                with (
+                    mock.patch.object(module.os, "open", return_value=71),
+                    mock.patch.object(
+                        module.os,
+                        "read",
+                        side_effect=fragments.copy(),
+                    ) as read,
+                    mock.patch.object(module.os, "close") as close,
+                ):
+                    self.assertEqual(module._bounded_file("/proc/71/environ"), expected)
+                self.assertEqual(read.call_count, len(fragments))
+                close.assert_called_once_with(71)
+
+    def test_process_metadata_bounded_read_rejects_oversize_payload(self) -> None:
+        cases = (
+            (session_ui, session_ui.MAX_FILE_BYTES, session_ui.SessionError),
+            (
+                guest_ui,
+                guest_ui.MAX_PROCESS_FILE_BYTES,
+                guest_ui.AttestationError,
+            ),
+        )
+        for module, limit, error in cases:
+            with self.subTest(module=module.__name__):
+                with (
+                    mock.patch.object(module.os, "open", return_value=72),
+                    mock.patch.object(
+                        module.os,
+                        "read",
+                        side_effect=[b"x" * limit, b"x"],
+                    ),
+                    mock.patch.object(module.os, "close") as close,
+                ):
+                    with self.assertRaises(error):
+                        module._bounded_file("/proc/72/environ")
+                close.assert_called_once_with(72)
+
     def test_session_gate_retries_an_incomplete_xauthority_handoff(self) -> None:
         account = mock.Mock()
         with mock.patch.object(

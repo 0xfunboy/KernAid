@@ -291,12 +291,20 @@ def _retryable_process_observation(
 def _bounded_file(path: str) -> bytes:
     descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
     try:
-        payload = os.read(descriptor, MAX_PROCESS_FILE_BYTES + 1)
+        payload = bytearray()
+        while len(payload) <= MAX_PROCESS_FILE_BYTES:
+            block = os.read(
+                descriptor,
+                MAX_PROCESS_FILE_BYTES + 1 - len(payload),
+            )
+            if not block:
+                break
+            payload.extend(block)
     finally:
         os.close(descriptor)
     if len(payload) > MAX_PROCESS_FILE_BYTES:
         raise AttestationError("process metadata exceeded its bound")
-    return payload
+    return bytes(payload)
 
 
 def _status_values(payload: bytes, prefix: bytes, count: int | None) -> tuple[int, ...]:

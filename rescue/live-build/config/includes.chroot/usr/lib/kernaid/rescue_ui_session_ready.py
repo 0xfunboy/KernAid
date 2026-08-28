@@ -86,12 +86,9 @@ def _pending_stage(
 def _bounded_file(path: str) -> bytes:
     descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
     try:
-        payload = os.read(descriptor, MAX_FILE_BYTES + 1)
+        return _read_all(descriptor)
     finally:
         os.close(descriptor)
-    if len(payload) > MAX_FILE_BYTES:
-        raise SessionError
-    return payload
 
 
 def _account() -> pwd.struct_passwd:
