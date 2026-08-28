@@ -1,16 +1,19 @@
 [Unit]
-Description=KernAid dormant read-only target capability handoff
-Requires=kernaid-rescue-target-capability.socket kernaid-offline-inspector-key.service systemd-sysusers.service
-After=kernaid-rescue-target-capability.socket kernaid-offline-inspector-key.service systemd-sysusers.service
+Description=KernAid candidate write-only target capability handoff
+Requires=kernaid-rescue-target-write-capability.socket kernaid-rescue-vaultd.service kernaid-offline-inspector-key.service systemd-sysusers.service
+After=kernaid-rescue-target-write-capability.socket kernaid-rescue-vaultd.service kernaid-offline-inspector-key.service systemd-sysusers.service
+BindsTo=kernaid-rescue-vaultd.service
 CollectMode=inactive-or-failed
 ConditionKernelCommandLine=boot=live
+ConditionKernelCommandLine=kernaid.repair=fstab-v1
+ConditionPathExists=/usr/lib/kernaid/repair-candidate-image-v1
 ConditionPathExists=/run/kernaid-offline-inspector/target-id.key
 
 [Service]
 Type=simple
 ExecStart=/usr/bin/python3 -I -B /usr/lib/kernaid/repair_target_handoff.py
+Environment=KERNAID_TARGET_HANDOFF_PROFILE=write
 Environment=KERNAID_TARGET_ID_KEY_FILE=/run/kernaid-offline-inspector/target-id.key
-Environment=KERNAID_TARGET_HANDOFF_PROFILE=readonly
 RuntimeMaxSec=12s
 TimeoutStartSec=5s
 TimeoutStopSec=2s
@@ -44,9 +47,7 @@ ProtectProc=invisible
 ProcSubset=pid
 ReadOnlyPaths=/run /dev
 DevicePolicy=closed
-DeviceAllow=block-* r
-# Only this root-owned, socket-activated handoff may create the detached
-# read-only ext4 mount which is transferred to the unprivileged repair daemon.
+DeviceAllow=block-* rw
 CapabilityBoundingSet=CAP_SYS_ADMIN
 AmbientCapabilities=
 RestrictAddressFamilies=AF_UNIX

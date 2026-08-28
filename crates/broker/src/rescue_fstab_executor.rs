@@ -3,8 +3,8 @@
 //! The public entrypoint accepts no pathname, device name, command, or raw
 //! replacement supplied by a client. It consumes the broker-owned approved
 //! authority, makes the exact pre-change bytes and a Pending transaction
-//! durable in the Repair Vault, and only then creates a detached writable
-//! ext4 mount rooted at the retained target descriptor.
+//! durable in the Repair Vault, and only then consumes the root helper's
+//! single-use detached writable ext4 mount capability.
 
 use crate::{
     repair_vault_client::{RepairVaultClient, RepairVaultClientError},
@@ -15,6 +15,10 @@ use crate::{
     rescue_fstab_preflight_resolver::{
         ProductionRescueFstabTargetGuard, ProductionRescueFstabVaultReservation,
         reacquire_target_for_recovery,
+    },
+    target_write_capability_client::{
+        RescueTargetWriteMountCapability, TargetWriteCapabilityClientError,
+        acquire_pending_target_write_mount,
     },
 };
 use kernaid_protocol::{
@@ -29,20 +33,14 @@ use kernaid_protocol::{
 use rustix::{
     fd::{AsFd, BorrowedFd, OwnedFd},
     fs::{
-        self as rfs, AtFlags, CWD, FileType, FlockOperation, Gid, Mode, OFlags, RenameFlags,
-        ResolveFlags, StatVfsMountFlags, Uid,
-    },
-    mount::{
-        FsMountFlags, FsOpenFlags, MountAttrFlags, fsconfig_create, fsconfig_set_flag,
-        fsconfig_set_string, fsmount, fsopen,
+        self as rfs, AtFlags, FileType, FlockOperation, Gid, Mode, OFlags, RenameFlags,
+        ResolveFlags, Uid,
     },
 };
 use sha2::{Digest, Sha256 as Sha256Hasher};
 use std::{
     fs::File,
     io::{Read, Seek, SeekFrom, Write},
-    os::fd::AsRawFd,
-    path::PathBuf,
     sync::{Mutex, MutexGuard, TryLockError},
     thread,
     time::{Duration, Instant},
@@ -51,9 +49,6 @@ use zeroize::Zeroizing;
 
 const FSTAB_RESOURCE: &str = "fstab";
 const ETC_DIRECTORY: &str = "etc";
-const EXT4_FILESYSTEM: &str = "ext4";
-const EXT_SUPER_MAGIC: u64 = 0xef53;
-const PROC_SELF_FD_PREFIX: &str = "/proc/self/fd/";
 const REPAIR_LOCK_DIRECTORY: &str = "/run/lock/kernaid-repair";
 const MAX_FSTAB_BYTES: usize = 1024 * 1024;
 const NONCANONICAL_METADATA_DOMAIN: &[u8] =
@@ -109,6 +104,7 @@ pub enum RescueFstabExecutionError {
     UnsafeTarget,
     MutationFailed,
     RecoveryUnavailable,
+    RecoveryRequired,
 }
 
 impl std::fmt::Display for RescueFstabExecutionError {
@@ -124,6 +120,7 @@ impl std::fmt::Display for RescueFstabExecutionError {
             Self::UnsafeTarget => "repair target is unsafe",
             Self::MutationFailed => "repair mutation failed",
             Self::RecoveryUnavailable => "durable repair recovery unavailable",
+            Self::RecoveryRequired => "durable repair recovery required",
         })
     }
 }
@@ -141,12 +138,9 @@ pub fn execute_approved_rescue_fstab(
     >,
     deadline: Instant,
 ) -> Result<RescueFstabExecutionReceipt, RescueFstabExecutionError> {
-    let (operation_deadline, safety_deadline) = match (
-        reserve_cleanup_window(deadline),
-        reserve_resolution_window(deadline),
-    ) {
-        (Ok(operation), Ok(safety)) => (operation, safety),
-        (Err(error), _) | (_, Err(error)) => {
+    let operation_deadline = match reserve_cleanup_window(deadline) {
+        Ok(operation) => operation,
+        Err(error) => {
             approved
                 .cancel(deadline)
                 .map_err(|_| RescueFstabExecutionError::VaultReconciliationRequired)?;
@@ -230,24 +224,20 @@ pub fn execute_approved_rescue_fstab(
     let pending = RepairTransactionStatusPayload::pending(durable)
         .map_err(|_| RescueFstabExecutionError::InvalidAuthority)?;
 
-    let target_closure = match execute_same_boot_target(
-        &target_guard,
+    // The read-only detached mount must be gone before the root helper creates
+    // the exclusive writable superblock. From here the durable Pending record,
+    // not any boot-local descriptor retained by this process, is authority.
+    drop(target_guard);
+    let write_mount = acquire_pending_target_write_mount(&pending, operation_deadline)
+        .map_err(map_write_capability_error)?;
+    let target_closure = execute_same_boot_target(
+        write_mount,
         &backup_bytes,
         preview.proposed_fstab(),
         &intent,
         pending.backup().reservation_id().as_str(),
         operation_deadline,
-    ) {
-        Ok(closure) => closure,
-        Err(_) => recover_same_boot_target(
-            &target_guard,
-            &backup_bytes,
-            &intent,
-            pending.backup().reservation_id().as_str(),
-            RepairTransactionResolutionOutcome::ClosedBeforeUnchanged,
-            safety_deadline,
-        )?,
-    };
+    )?;
 
     let resolution = RepairTransactionResolution::new(
         target_closure.outcome,
@@ -328,7 +318,8 @@ pub fn recover_pending_rescue_fstab(
         RepairTransactionResolutionOutcome::ClosedBeforeRestored
     };
     let target_closure = recover_same_boot_target(
-        &target,
+        target,
+        &pending,
         retrieved.bytes(),
         &intent,
         pending.backup().reservation_id().as_str(),
@@ -535,6 +526,14 @@ fn map_capability_error(error: RescueFstabCapabilityResolutionError) -> RescueFs
     }
 }
 
+fn map_write_capability_error(
+    _error: TargetWriteCapabilityClientError,
+) -> RescueFstabExecutionError {
+    // The transaction is already durable Pending whenever this client is
+    // called. No local distinction can authorize cancel or a second acquire.
+    RescueFstabExecutionError::RecoveryRequired
+}
+
 struct TargetLock {
     descriptor: OwnedFd,
 }
@@ -646,7 +645,7 @@ enum ExactTargetState {
 }
 
 fn execute_same_boot_target(
-    target: &ProductionRescueFstabTargetGuard,
+    write_mount: RescueTargetWriteMountCapability,
     backup: &[u8],
     proposed: &[u8],
     intent: &RepairExecutionIntentV1,
@@ -655,16 +654,16 @@ fn execute_same_boot_target(
 ) -> Result<TargetClosure, RescueFstabExecutionError> {
     ensure_exact_bytes(backup, intent.before_sha256())?;
     ensure_exact_bytes(proposed, intent.after_sha256())?;
-    target
-        .inner()
+    validate_write_capability(&write_mount, intent, reservation_id)?;
+    write_mount
         .revalidate()
-        .map_err(|_| RescueFstabExecutionError::TargetChanged)?;
+        .map_err(map_write_capability_error)?;
 
     let result = {
-        let mount = create_detached_ext4_mount(target.inner().target_block_descriptor(), false)?;
-        let etc = open_etc_directory(&mount)?;
+        let mount = write_mount.mount();
+        let etc = open_etc_directory(mount.as_fd())?;
         let result = match apply_exact_replacement(
-            &mount,
+            mount,
             &etc,
             backup,
             proposed,
@@ -678,52 +677,36 @@ fn execute_same_boot_target(
                 cleanup_verified: false,
             }),
             Err(_) => {
-                close_after_failed_mutation(&mount, &etc, backup, intent, reservation_id, deadline)
+                close_after_failed_mutation(mount, &etc, backup, intent, reservation_id, deadline)
             }
         };
         drop(etc);
-        drop(mount);
         result
     }?;
-    target
-        .inner()
+    write_mount
         .revalidate()
-        .map_err(|_| RescueFstabExecutionError::TargetChanged)?;
+        .map_err(map_write_capability_error)?;
+    drop(write_mount);
     Ok(TargetClosure {
         cleanup_verified: true,
         ..result
     })
 }
 
-/// Same-boot fail-safe closure used when the first writable attempt could not
-/// prove a terminal state. Reboot reacquisition is a separate stable-capability
-/// path and never uses the boot-local IDs retained by this guard.
+/// Classifies recovery through the freshly reacquired read-only mount. Write
+/// authority is consumed only for an exact `After` state and is used once for
+/// restore and verification in the same detached mount.
 fn recover_same_boot_target(
-    target: &ProductionRescueFstabTargetGuard,
+    target: ProductionRescueFstabTargetGuard,
+    pending: &RepairTransactionStatusPayload,
     backup: &[u8],
     intent: &RepairExecutionIntentV1,
     reservation_id: &str,
     before_outcome: RepairTransactionResolutionOutcome,
     deadline: Instant,
 ) -> Result<TargetClosure, RescueFstabExecutionError> {
-    target
-        .inner()
-        .revalidate()
-        .map_err(|_| RescueFstabExecutionError::TargetChanged)?;
-    let read_observation = {
-        let mount = create_detached_ext4_mount(target.inner().target_block_descriptor(), true)?;
-        let etc = open_etc_directory(&mount)?;
-        let snapshot = snapshot_fstab(&etc)?;
-        let state = exact_state(&snapshot, intent);
-        let observation = snapshot.observation();
-        drop(etc);
-        drop(mount);
-        (state, observation)
-    };
-    target
-        .inner()
-        .revalidate()
-        .map_err(|_| RescueFstabExecutionError::TargetChanged)?;
+    ensure_exact_bytes(backup, intent.before_sha256())?;
+    let read_observation = classify_with_retained_read_mount(&target, intent)?;
 
     match read_observation.0 {
         ExactTargetState::Before => Ok(TargetClosure {
@@ -736,51 +719,105 @@ fn recover_same_boot_target(
             observation: read_observation.1,
             cleanup_verified: true,
         }),
-        ExactTargetState::After => {
-            let result = {
-                let mount =
-                    create_detached_ext4_mount(target.inner().target_block_descriptor(), false)?;
-                let etc = open_etc_directory(&mount)?;
-                let result = match restore_exact_backup(
-                    &mount,
-                    &etc,
-                    backup,
-                    intent,
-                    reservation_id,
-                    deadline,
-                ) {
-                    Ok(observation) => TargetClosure {
-                        outcome: RepairTransactionResolutionOutcome::ClosedBeforeRestored,
-                        observation,
-                        cleanup_verified: false,
-                    },
-                    Err(_) => {
-                        let snapshot = snapshot_fstab(&etc)?;
-                        TargetClosure {
-                            outcome: if exact_state(&snapshot, intent) == ExactTargetState::Before {
-                                RepairTransactionResolutionOutcome::ClosedBeforeRestored
-                            } else {
-                                RepairTransactionResolutionOutcome::ManualReconciliationRequired
-                            },
-                            observation: snapshot.observation(),
-                            cleanup_verified: false,
-                        }
-                    }
-                };
-                drop(etc);
-                drop(mount);
-                result
-            };
-            target
-                .inner()
-                .revalidate()
-                .map_err(|_| RescueFstabExecutionError::TargetChanged)?;
+        ExactTargetState::After if pending.phase() != RepairTransactionPhase::Pending => {
             Ok(TargetClosure {
+                outcome: RepairTransactionResolutionOutcome::ManualReconciliationRequired,
+                observation: read_observation.1,
                 cleanup_verified: true,
-                ..result
             })
         }
+        ExactTargetState::After => {
+            // The fresh RO mount is the classification authority. Drop it
+            // before asking the helper to consume the sole write lease and
+            // create the exclusive writable superblock.
+            drop(target);
+            let write_mount = acquire_pending_target_write_mount(pending, deadline)
+                .map_err(map_write_capability_error)?;
+            restore_recovery_target(write_mount, backup, intent, reservation_id, deadline)
+        }
     }
+}
+
+fn classify_with_retained_read_mount(
+    target: &ProductionRescueFstabTargetGuard,
+    intent: &RepairExecutionIntentV1,
+) -> Result<(ExactTargetState, ClosedObservation), RescueFstabExecutionError> {
+    target
+        .inner()
+        .revalidate()
+        .map_err(|_| RescueFstabExecutionError::TargetChanged)?;
+    let mount = target.inner().target_detached_mount_descriptor();
+    let etc = open_etc_directory(mount)?;
+    let snapshot = snapshot_fstab(&etc)?;
+    let result = (exact_state(&snapshot, intent), snapshot.observation());
+    drop(etc);
+    target
+        .inner()
+        .revalidate()
+        .map_err(|_| RescueFstabExecutionError::TargetChanged)?;
+    Ok(result)
+}
+
+fn restore_recovery_target(
+    write_mount: RescueTargetWriteMountCapability,
+    backup: &[u8],
+    intent: &RepairExecutionIntentV1,
+    reservation_id: &str,
+    deadline: Instant,
+) -> Result<TargetClosure, RescueFstabExecutionError> {
+    validate_write_capability(&write_mount, intent, reservation_id)?;
+    write_mount
+        .revalidate()
+        .map_err(map_write_capability_error)?;
+    let result = {
+        let mount = write_mount.mount();
+        let etc = open_etc_directory(mount.as_fd())?;
+        let result =
+            match restore_exact_backup(mount, &etc, backup, intent, reservation_id, deadline) {
+                Ok(observation) => TargetClosure {
+                    outcome: RepairTransactionResolutionOutcome::ClosedBeforeRestored,
+                    observation,
+                    cleanup_verified: false,
+                },
+                Err(_) => {
+                    let snapshot = snapshot_fstab(&etc)?;
+                    TargetClosure {
+                        outcome: if exact_state(&snapshot, intent) == ExactTargetState::Before {
+                            RepairTransactionResolutionOutcome::ClosedBeforeRestored
+                        } else {
+                            RepairTransactionResolutionOutcome::ManualReconciliationRequired
+                        },
+                        observation: snapshot.observation(),
+                        cleanup_verified: false,
+                    }
+                }
+            };
+        drop(etc);
+        result
+    };
+    write_mount
+        .revalidate()
+        .map_err(map_write_capability_error)?;
+    drop(write_mount);
+    Ok(TargetClosure {
+        cleanup_verified: true,
+        ..result
+    })
+}
+
+fn validate_write_capability(
+    capability: &RescueTargetWriteMountCapability,
+    intent: &RepairExecutionIntentV1,
+    reservation_id: &str,
+) -> Result<(), RescueFstabExecutionError> {
+    if capability.reservation_id() != reservation_id
+        || capability.target_recovery_fingerprint() != intent.target_recovery_fingerprint()
+        || capability.transaction_binding_sha256().is_empty()
+        || capability.lease_binding_sha256().is_empty()
+    {
+        return Err(RescueFstabExecutionError::RecoveryRequired);
+    }
+    Ok(())
 }
 
 fn close_after_failed_mutation(
@@ -939,75 +976,7 @@ fn restore_exact_backup(
     Ok(final_state.observation())
 }
 
-fn create_detached_ext4_mount(
-    leaf: BorrowedFd<'_>,
-    read_only: bool,
-) -> Result<OwnedFd, RescueFstabExecutionError> {
-    let before = block_snapshot(leaf).ok_or(RescueFstabExecutionError::TargetChanged)?;
-    let source = descriptor_source_path(leaf)?;
-    let proc_snapshot = rfs::statat(CWD, &source, AtFlags::empty())
-        .map(BlockSnapshot::from_stat)
-        .map_err(|_| RescueFstabExecutionError::TargetChanged)?;
-    if proc_snapshot != before {
-        return Err(RescueFstabExecutionError::TargetChanged);
-    }
-    let context = fsopen(EXT4_FILESYSTEM, FsOpenFlags::FSOPEN_CLOEXEC)
-        .map_err(|_| RescueFstabExecutionError::DetachedMountUnavailable)?;
-    fsconfig_set_string(&context, "source", &source)
-        .map_err(|_| RescueFstabExecutionError::DetachedMountUnavailable)?;
-    if read_only {
-        fsconfig_set_flag(&context, "ro")
-            .map_err(|_| RescueFstabExecutionError::DetachedMountUnavailable)?;
-        // Journal replay itself is a write. Recovery classification first
-        // observes with `noload`; only an already durable Pending transaction
-        // may later admit the separate RW restore mount.
-        fsconfig_set_flag(&context, "noload")
-            .map_err(|_| RescueFstabExecutionError::DetachedMountUnavailable)?;
-    }
-    fsconfig_create(&context).map_err(|_| RescueFstabExecutionError::DetachedMountUnavailable)?;
-    let mut attributes = MountAttrFlags::MOUNT_ATTR_NODEV
-        | MountAttrFlags::MOUNT_ATTR_NOSUID
-        | MountAttrFlags::MOUNT_ATTR_NOEXEC;
-    if read_only {
-        attributes |= MountAttrFlags::MOUNT_ATTR_RDONLY;
-    }
-    let mount = fsmount(&context, FsMountFlags::FSMOUNT_CLOEXEC, attributes)
-        .map_err(|_| RescueFstabExecutionError::DetachedMountUnavailable)?;
-    validate_detached_mount(&mount, read_only)?;
-    if block_snapshot(leaf) != Some(before)
-        || rfs::statat(CWD, &source, AtFlags::empty())
-            .map(BlockSnapshot::from_stat)
-            .ok()
-            != Some(before)
-    {
-        return Err(RescueFstabExecutionError::TargetChanged);
-    }
-    Ok(mount)
-}
-
-fn validate_detached_mount(
-    mount: &OwnedFd,
-    read_only: bool,
-) -> Result<(), RescueFstabExecutionError> {
-    let stat = rfs::fstat(mount).map_err(|_| RescueFstabExecutionError::UnsafeTarget)?;
-    let filesystem = rfs::fstatfs(mount).map_err(|_| RescueFstabExecutionError::UnsafeTarget)?;
-    let flags = rfs::fstatvfs(mount).map_err(|_| RescueFstabExecutionError::UnsafeTarget)?;
-    let descriptor_flags =
-        rustix::io::fcntl_getfd(mount).map_err(|_| RescueFstabExecutionError::UnsafeTarget)?;
-    let required = StatVfsMountFlags::NODEV | StatVfsMountFlags::NOSUID | StatVfsMountFlags::NOEXEC;
-    let actual_read_only = flags.f_flag.contains(StatVfsMountFlags::RDONLY);
-    if !FileType::from_raw_mode(stat.st_mode).is_dir()
-        || filesystem.f_type as u64 != EXT_SUPER_MAGIC
-        || !flags.f_flag.contains(required)
-        || actual_read_only != read_only
-        || !descriptor_flags.contains(rustix::io::FdFlags::CLOEXEC)
-    {
-        return Err(RescueFstabExecutionError::UnsafeTarget);
-    }
-    Ok(())
-}
-
-fn open_etc_directory(mount: &OwnedFd) -> Result<OwnedFd, RescueFstabExecutionError> {
+fn open_etc_directory(mount: BorrowedFd<'_>) -> Result<OwnedFd, RescueFstabExecutionError> {
     let etc = rfs::openat2(
         mount,
         ETC_DIRECTORY,
@@ -1028,47 +997,6 @@ fn open_etc_directory(mount: &OwnedFd) -> Result<OwnedFd, RescueFstabExecutionEr
         return Err(RescueFstabExecutionError::UnsafeTarget);
     }
     Ok(etc)
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct BlockSnapshot {
-    device: u64,
-    inode: u64,
-    rdev: u64,
-}
-
-impl BlockSnapshot {
-    fn from_stat(stat: rustix::fs::Stat) -> Self {
-        Self {
-            device: stat.st_dev,
-            inode: stat.st_ino,
-            rdev: stat.st_rdev,
-        }
-    }
-}
-
-fn block_snapshot(descriptor: BorrowedFd<'_>) -> Option<BlockSnapshot> {
-    let stat = rfs::fstat(descriptor).ok()?;
-    let status = rfs::fcntl_getfl(descriptor).ok()?;
-    let descriptor_flags = rustix::io::fcntl_getfd(descriptor).ok()?;
-    if !FileType::from_raw_mode(stat.st_mode).is_block_device()
-        || status & OFlags::ACCMODE != OFlags::RDONLY
-        || !status.contains(OFlags::NONBLOCK)
-        || !descriptor_flags.contains(rustix::io::FdFlags::CLOEXEC)
-    {
-        return None;
-    }
-    Some(BlockSnapshot::from_stat(stat))
-}
-
-fn descriptor_source_path(
-    descriptor: BorrowedFd<'_>,
-) -> Result<PathBuf, RescueFstabExecutionError> {
-    let number = descriptor.as_raw_fd();
-    if number < 0 {
-        return Err(RescueFstabExecutionError::TargetChanged);
-    }
-    Ok(PathBuf::from(format!("{PROC_SELF_FD_PREFIX}{number}")))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

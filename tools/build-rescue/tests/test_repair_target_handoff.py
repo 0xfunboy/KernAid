@@ -448,6 +448,7 @@ class RepairTargetHandoffTests(unittest.TestCase):
         request: dict[str, object],
         *,
         expected_uid: int | None = None,
+        profile: str = "readonly",
     ) -> tuple[dict[str, object], list[int]]:
         client, server = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
 
@@ -458,6 +459,7 @@ class RepairTargetHandoffTests(unittest.TestCase):
                     os.getuid() if expected_uid is None else expected_uid,
                     service,
                     expected_local=None,
+                    profile=profile,
                 )
 
         thread = threading.Thread(target=run)
@@ -470,6 +472,103 @@ class RepairTargetHandoffTests(unittest.TestCase):
             thread.join(timeout=2)
         self.assertFalse(thread.is_alive())
         return response
+
+    def test_write_profile_is_separate_and_candidate_gated(self) -> None:
+        systemd = REPO_DIR / "rescue/live-build/config/includes.chroot/etc/systemd/system"
+        readonly = (systemd / "kernaid-rescue-target-capability@.service").read_text()
+        write_socket = (systemd / "kernaid-rescue-target-write-capability.socket").read_text()
+        write_service = (systemd / "kernaid-rescue-target-write-capability@.service").read_text()
+        self.assertIn("KERNAID_TARGET_HANDOFF_PROFILE=readonly", readonly)
+        self.assertIn("ListenSequentialPacket=/run/kernaid-rescue-target-write-capability.sock", write_socket)
+        self.assertIn("SocketMode=0660", write_socket)
+        self.assertIn("SocketGroup=kernaid-repair", write_socket)
+        for unit in (write_socket, write_service):
+            self.assertIn("ConditionKernelCommandLine=kernaid.repair=fstab-v1", unit)
+            self.assertIn("ConditionPathExists=/usr/lib/kernaid/repair-candidate-image-v1", unit)
+        self.assertIn("KERNAID_TARGET_HANDOFF_PROFILE=write", write_service)
+        self.assertIn("DeviceAllow=block-* rw", write_service)
+        self.assertIn("CapabilityBoundingSet=CAP_SYS_ADMIN", write_service)
+        self.assertIn("SystemCallFilter=@system-service fsopen fsconfig fsmount", write_service)
+        write_request = {"apiVersion": handoff.API_VERSION, "requestId": REQUEST["requestId"],
+                         "operation": handoff.WRITE_OPERATION,
+                         "reservationId": "B-" + "a" * 32,
+                         "transactionBindingSha256": "b" * 64}
+        self.assertEqual(handoff._decode_request(handoff._canonical(write_request), "write"), write_request)
+        with self.assertRaises(handoff.HandoffFailure):
+            handoff._decode_request(handoff._canonical(write_request), "readonly")
+        with self.assertRaises(handoff.HandoffFailure):
+            handoff._decode_request(handoff._canonical(REQUEST), "write")
+
+    def test_write_acquire_consumes_lease_then_sends_only_detached_mount(self) -> None:
+        targets = FakeTargets()
+        service = handoff.RepairTargetHandoff(targets)
+        request = {"apiVersion": handoff.API_VERSION, "requestId": REQUEST["requestId"],
+                   "operation": handoff.WRITE_OPERATION, "reservationId": "B-" + "a" * 32,
+                   "transactionBindingSha256": "b" * 64}
+        claims = {"parentMajor": 8, "parentMinor": 0, "diskSequence": 77,
+                  "mediaSectorCount": 4096, "logicalSectorBytes": 512,
+                  "leafSectorCount": 2048}
+        lease = {"recoveryFingerprint": RECOVERY_FINGERPRINT,
+                 "leaseBindingSha256": "c" * 64}
+        leaf, parent, mount = (_pipe_capability(b"L"), _pipe_capability(b"P"),
+                               _pipe_capability(b"M"))
+        with (patch.object(handoff, "_consume_write_lease", return_value=lease),
+              patch.object(handoff, "_mountinfo_has_device", return_value=False),
+              patch.object(handoff, "_open_bound_block_device", side_effect=[leaf, parent]),
+              patch.object(handoff, "_probe_physical_parent_claims",
+                           return_value=claims) as probe,
+              patch.object(handoff, "_revalidate_block_pair", return_value=None),
+              patch.object(handoff, "_create_detached_ext4_write_mount", return_value=mount),
+              patch.object(handoff, "_assert_detached_ext4_write_mount_fd", return_value=None)):
+            response, descriptors = self._exchange(service, request, profile="write")
+        try:
+            self.assertEqual(targets.calls, 3)
+            self.assertEqual(response["capability"], handoff.WRITE_CAPABILITY)
+            self.assertEqual(response["descriptor"], {"type": handoff.WRITE_DESCRIPTOR_TYPE, "count": 1})
+            self.assertEqual(len(descriptors), 1)
+            self.assertEqual(os.read(descriptors[0], 1), b"M")
+            self.assertEqual(probe.call_count, 2)
+            for call in probe.call_args_list:
+                self.assertEqual(call.args[2:], (1024 * 1024, 2 * 1024 * 1024, 8, 0))
+        finally:
+            for descriptor in descriptors:
+                os.close(descriptor)
+
+    def test_vault_consume_retries_only_one_authenticated_stale_state(self) -> None:
+        reservation, binding = "B-" + "a" * 32, "b" * 64
+        replies = [
+            {"apiVersion": handoff.VAULT_API_VERSION, "requestId": "placeholder",
+             "stateVersion": 9, "operation": handoff.VAULT_WRITE_OPERATION,
+             "outcome": "error", "error": "STALE_STATE"},
+            {"apiVersion": handoff.VAULT_API_VERSION, "requestId": "placeholder",
+             "stateVersion": 10, "operation": handoff.VAULT_WRITE_OPERATION,
+             "outcome": "ok", "payload": {"receipt": True}},
+        ]
+        requests = []
+
+        def exchange(request, _deadline):
+            requests.append(request)
+            reply = replies.pop(0)
+            reply["requestId"] = request["requestId"]
+            return reply
+
+        with (patch.object(handoff, "_vault_exchange", side_effect=exchange),
+              patch.object(handoff, "_validate_write_lease", return_value={"ok": "yes"})):
+            self.assertEqual(handoff._consume_write_lease(reservation, binding,
+                                                          handoff.time.monotonic() + 1),
+                             {"ok": "yes"})
+        self.assertEqual([item["expectedStateVersion"] for item in requests], [0, 9])
+        self.assertNotEqual(requests[0]["requestId"], requests[1]["requestId"])
+
+        bad = {"apiVersion": handoff.VAULT_API_VERSION,
+               "requestId": "placeholder", "stateVersion": 1,
+               "operation": handoff.VAULT_WRITE_OPERATION,
+               "outcome": "error", "error": "IO_FAILED"}
+        with patch.object(handoff, "_vault_exchange",
+                          side_effect=lambda request, _deadline: dict(bad, requestId=request["requestId"])) as mocked:
+            with self.assertRaises(handoff.HandoffFailure):
+                handoff._consume_write_lease(reservation, binding, handoff.time.monotonic() + 1)
+        self.assertEqual(mocked.call_count, 1)
 
     def test_success_transfers_the_exact_ordered_read_only_bundle_v2(
         self,

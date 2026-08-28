@@ -19,6 +19,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import socket
 import stat
 import struct
@@ -33,6 +34,13 @@ RECOVERY_OPERATION = "target.recovery.readonly.acquire"
 # Kept as the existing operation alias for callers which only use acquisition.
 OPERATION = ACQUIRE_OPERATION
 SOCKET_PATH = "/run/kernaid-rescue-target-capability.sock"
+WRITE_SOCKET_PATH = "/run/kernaid-rescue-target-write-capability.sock"
+VAULT_HELPER_SOCKET_PATH = "/run/kernaid-rescue-vault/repair-target-helper-v1.sock"
+PROFILE_READONLY = "readonly"
+PROFILE_WRITE = "write"
+WRITE_OPERATION = "target.pending.readwrite.acquire"
+VAULT_API_VERSION = "kernaid.dev/rescue-vault/v1alpha1"
+VAULT_WRITE_OPERATION = "repair.transaction.write-lease.consume"
 TARGET_MODULE_PATH = "/usr/lib/kernaid/rescue_server.py"
 PASSWD_PATH = "/etc/passwd"
 REPAIR_BROKER_NAME = b"kernaid-repair"
@@ -54,6 +62,11 @@ BUNDLE_DESCRIPTOR_TYPES = (
     "uuid-inventory-memfd-sealed",
     "selected-target-ext4-mount-readonly-detached",
 )
+WRITE_CAPABILITY = "linux-ext4-direct-leaf-readwrite-mount-v1"
+WRITE_DESCRIPTOR_TYPE = "selected-target-ext4-mount-readwrite-detached"
+VAULT_WRITE_CAPABILITY = "fstab-direct-leaf-rw-v1"
+REPAIR_ACTION = "linux.fstab.disable-missing-uuid.v1"
+REPAIR_RESOURCE = "rescue:selected-linux-root:etc/fstab"
 BLOCK_INVENTORY_COLLECTOR = "linux.block.inventory"
 
 # Linux UAPI values from linux/memfd.h, linux/fcntl.h and linux/mount.h.  The
@@ -82,6 +95,7 @@ MOUNT_ATTR_NOEXEC = 0x00000008
 REQUIRED_MOUNT_ATTRIBUTES = (
     MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV | MOUNT_ATTR_NOEXEC
 )
+REQUIRED_WRITE_MOUNT_ATTRIBUTES = MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV | MOUNT_ATTR_NOEXEC
 EXT4_SUPER_MAGIC = 0xEF53
 BLKSSZGET = 0x1268
 BLKGETSIZE64 = 0x80081272
@@ -97,6 +111,11 @@ _EPHEMERAL_ID = {
 }
 _TARGET_FINGERPRINT = re.compile(r"^sha256:[0-9a-f]{64}$")
 _RECOVERY_FINGERPRINT = re.compile(r"^recovery:[0-9a-f]{64}$")
+_RESERVATION_ID = re.compile(r"^B-[0-9a-f]{32}$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_OPAQUE_ID = re.compile(r"^[A-Za-z0-9_:.\-]{1,128}$")
+_PREFIXED_ID = re.compile(r"^[SPA]-[A-Za-z0-9\-]{1,126}$")
+_VAULT_ID = re.compile(r"^V-[0-9a-f]{32}$")
 _MAJOR_MINOR = re.compile(r"^(0|[1-9][0-9]{0,9}):(0|[1-9][0-9]{0,9})$")
 _SAFE_DEVNAME = re.compile(r"^[A-Za-z0-9._+-]{1,128}$")
 _UUID = re.compile(r"^[0-9a-f-]{1,128}$")
@@ -134,7 +153,14 @@ def _reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return result
 
 
-def _decode_request(payload: bytes) -> dict[str, str]:
+def _profile() -> str:
+    value = os.environ.get("KERNAID_TARGET_HANDOFF_PROFILE", PROFILE_READONLY)
+    if value not in {PROFILE_READONLY, PROFILE_WRITE}:
+        raise RuntimeError("invalid target handoff profile")
+    return value
+
+
+def _decode_request(payload: bytes, profile: str = PROFILE_READONLY) -> dict[str, str]:
     try:
         value = json.loads(
             payload.decode("utf-8", errors="strict"),
@@ -151,10 +177,25 @@ def _decode_request(payload: bytes) -> dict[str, str]:
         not isinstance(request_id, str)
         or _REQUEST_ID.fullmatch(request_id) is None
         or value.get("apiVersion") != API_VERSION
-        or operation not in {ACQUIRE_OPERATION, RECOVERY_OPERATION}
+        or operation not in {ACQUIRE_OPERATION, RECOVERY_OPERATION, WRITE_OPERATION}
     ):
         raise HandoffFailure("INVALID_REQUEST")
     common = {"apiVersion", "requestId", "operation"}
+    if operation == WRITE_OPERATION:
+        if profile != PROFILE_WRITE or set(value) != common | {
+            "reservationId", "transactionBindingSha256"
+        }:
+            raise HandoffFailure("INVALID_REQUEST", request_id, operation)
+        reservation = value.get("reservationId")
+        binding = value.get("transactionBindingSha256")
+        if (not isinstance(reservation, str) or _RESERVATION_ID.fullmatch(reservation) is None
+                or not isinstance(binding, str) or _SHA256.fullmatch(binding) is None):
+            raise HandoffFailure("INVALID_REQUEST", request_id, operation)
+        return {"apiVersion": API_VERSION, "requestId": request_id,
+                "operation": operation, "reservationId": reservation,
+                "transactionBindingSha256": binding}
+    if profile != PROFILE_READONLY:
+        raise HandoffFailure("INVALID_REQUEST", request_id, operation)
     if operation == RECOVERY_OPERATION:
         if set(value) != common | {"recoveryFingerprint"}:
             raise HandoffFailure("INVALID_REQUEST", request_id, operation)
@@ -555,7 +596,9 @@ def _mountinfo_has_device(major_minor: str) -> bool:
     return False
 
 
-def _assert_block_fd(descriptor: int, major: int, minor: int) -> None:
+def _assert_block_fd(
+    descriptor: int, major: int, minor: int, *, writable: bool = False
+) -> None:
     metadata = os.fstat(descriptor)
     flags = fcntl.fcntl(descriptor, fcntl.F_GETFL)
     fd_flags = fcntl.fcntl(descriptor, fcntl.F_GETFD)
@@ -563,7 +606,7 @@ def _assert_block_fd(descriptor: int, major: int, minor: int) -> None:
         not stat.S_ISBLK(metadata.st_mode)
         or os.major(metadata.st_rdev) != major
         or os.minor(metadata.st_rdev) != minor
-        or flags & os.O_ACCMODE != os.O_RDONLY
+        or flags & os.O_ACCMODE != (os.O_RDWR if writable else os.O_RDONLY)
         or not flags & os.O_NONBLOCK
         or not fd_flags & fcntl.FD_CLOEXEC
     ):
@@ -684,7 +727,9 @@ def _validate_physical_parent_claims_wire(value: object) -> dict[str, int]:
     return claims
 
 
-def _open_bound_block_device(major_minor: str, major: int, minor: int) -> int:
+def _open_bound_block_device(
+    major_minor: str, major: int, minor: int, *, writable: bool = False
+) -> int:
     dev_fd = os.open(
         "/dev", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
     )
@@ -710,11 +755,12 @@ def _open_bound_block_device(major_minor: str, major: int, minor: int) -> int:
             raise HandoffFailure("DEVICE_UNAVAILABLE")
         descriptor = os.open(
             matches[0],
-            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+            (os.O_RDWR if writable else os.O_RDONLY)
+            | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
             dir_fd=dev_fd,
         )
         try:
-            _assert_block_fd(descriptor, major, minor)
+            _assert_block_fd(descriptor, major, minor, writable=writable)
             current = os.stat(matches[0], dir_fd=dev_fd, follow_symlinks=False)
             if current.st_rdev != os.fstat(descriptor).st_rdev:
                 raise HandoffFailure("DEVICE_UNAVAILABLE")
@@ -1051,6 +1097,274 @@ def _create_detached_ext4_mount(
     return descriptor
 
 
+def _configured_ext4_write_context(api: _GlibcMountApi, leaf_descriptor: int) -> int:
+    context = _checked_mount_call(api.fsopen, b"ext4", FSOPEN_CLOEXEC)
+    try:
+        source = f"/proc/self/fd/{leaf_descriptor}".encode("ascii")
+        _checked_mount_call(api.fsconfig, context, FSCONFIG_SET_STRING,
+                            b"source", source, 0)
+        _checked_mount_call(api.fsconfig, context, FSCONFIG_CMD_CREATE_EXCL,
+                            None, None, 0)
+        return context
+    except Exception:
+        os.close(context)
+        raise
+
+
+def _assert_detached_ext4_write_mount_fd(
+    descriptor: int, leaf_major: int, leaf_minor: int, *, api: _GlibcMountApi | None = None
+) -> None:
+    mount_api = _GlibcMountApi() if api is None else api
+    metadata = os.fstat(descriptor)
+    flags = os.fstatvfs(descriptor).f_flag
+    if (not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_dev != os.makedev(leaf_major, leaf_minor)
+            or not fcntl.fcntl(descriptor, fcntl.F_GETFD) & fcntl.FD_CLOEXEC
+            or fcntl.fcntl(descriptor, fcntl.F_GETFL) & os.O_PATH != os.O_PATH
+            or _ext4_super_magic(mount_api, descriptor) != EXT4_SUPER_MAGIC
+            or flags & REQUIRED_WRITE_MOUNT_ATTRIBUTES != REQUIRED_WRITE_MOUNT_ATTRIBUTES
+            or flags & MOUNT_ATTR_RDONLY):
+        raise HandoffFailure("DEVICE_UNAVAILABLE")
+
+
+def _create_detached_ext4_write_mount(
+    leaf_descriptor: int, leaf_major: int, leaf_minor: int
+) -> int:
+    api = _GlibcMountApi()
+    descriptor: int | None = None
+    try:
+        context = _configured_ext4_write_context(api, leaf_descriptor)
+        try:
+            descriptor = _checked_mount_call(api.fsmount, context, FSMOUNT_CLOEXEC,
+                                             REQUIRED_WRITE_MOUNT_ATTRIBUTES)
+        finally:
+            os.close(context)
+        _assert_detached_ext4_write_mount_fd(descriptor, leaf_major, leaf_minor, api=api)
+        return descriptor
+    except Exception as error:
+        if descriptor is not None:
+            os.close(descriptor)
+        if isinstance(error, HandoffFailure):
+            raise
+        raise HandoffFailure("DEVICE_UNAVAILABLE") from error
+
+
+def _hash_fields(domain: bytes, fields: list[bytes]) -> str:
+    digest = hashlib.sha256(domain)
+    for field in fields:
+        digest.update(len(field).to_bytes(8, "big"))
+        digest.update(field)
+    return digest.hexdigest()
+
+
+def _digest(value: object, *, prefixed: str | None = None) -> bytes:
+    if not isinstance(value, str):
+        raise HandoffFailure("INTERNAL")
+    raw = value
+    if prefixed is not None:
+        if not value.startswith(prefixed):
+            raise HandoffFailure("INTERNAL")
+        raw = value[len(prefixed):]
+    if _SHA256.fullmatch(raw) is None:
+        raise HandoffFailure("INTERNAL")
+    return bytes.fromhex(raw)
+
+
+def _physical_parent_fingerprint(claims: dict[str, int]) -> str:
+    digest = hashlib.sha256(b"KERNAID-REPAIR-PHYSICAL-PARENT-V1\0")
+    for key, width in (("parentMajor", 4), ("parentMinor", 4),
+                       ("diskSequence", 8), ("mediaSectorCount", 8),
+                       ("logicalSectorBytes", 8)):
+        digest.update(claims[key].to_bytes(width, "big"))
+    return digest.hexdigest()
+
+
+def _strict_object(value: object, keys: set[str]) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != keys:
+        raise HandoffFailure("INTERNAL")
+    return value
+
+
+def _validate_write_lease(payload: object, reservation: str, binding: str) -> dict[str, str]:
+    lease = _strict_object(payload, {"capability", "bootEpochSha256",
+                                     "leaseBindingSha256", "transaction"})
+    transaction = _strict_object(lease["transaction"],
+                                 {"phase", "transactionBindingSha256", "backup"})
+    backup_keys = {"state", "reservationId", "draftBindingSha256", "locator", "vaultId",
+                   "vaultIdentityFingerprint", "physicalParentFingerprint", "reservedBytes",
+                   "backupSize", "expectedBackupSha256", "metadataSha256", "planId",
+                   "planSha256", "approvalId", "approvalSha256", "resourceId",
+                   "resourceSha256", "executionIntent"}
+    backup = _strict_object(transaction["backup"], backup_keys)
+    intent_keys = {"actionId", "sessionId", "approvalSequence", "targetId", "scanFingerprint",
+                   "targetFingerprint", "targetPhysicalParentFingerprint",
+                   "targetRecoveryFingerprint", "lockIdentity", "beforeSha256", "afterSha256",
+                   "diffSha256", "observedUuidSetSha256", "beforeMetadata"}
+    intent = _strict_object(backup["executionIntent"], intent_keys)
+    metadata = _strict_object(intent["beforeMetadata"], {"mode", "uid", "gid", "xattrs", "posixAcl"})
+    digests = ["draftBindingSha256", "vaultIdentityFingerprint", "physicalParentFingerprint",
+               "expectedBackupSha256", "metadataSha256", "planSha256", "approvalSha256",
+               "resourceSha256"]
+    if (lease["capability"] != VAULT_WRITE_CAPABILITY or transaction["phase"] != "pending"
+            or transaction["transactionBindingSha256"] != binding
+            or backup["state"] != "durable" or backup["reservationId"] != reservation
+            or backup["locator"] != "vault://repair/" + reservation
+            or backup["resourceId"] != REPAIR_RESOURCE or intent["actionId"] != REPAIR_ACTION
+            or intent["targetRecoveryFingerprint"] is None
+            or _RECOVERY_FINGERPRINT.fullmatch(str(intent["targetRecoveryFingerprint"])) is None
+            or not isinstance(intent["targetPhysicalParentFingerprint"], str)
+            or _SHA256.fullmatch(intent["targetPhysicalParentFingerprint"]) is None
+            or not isinstance(intent["sessionId"], str) or _PREFIXED_ID.fullmatch(intent["sessionId"]) is None
+            or not intent["sessionId"].startswith("S-")
+            or not isinstance(intent["targetId"], str) or _OPAQUE_ID.fullmatch(intent["targetId"]) is None
+            or ".." in intent["targetId"]
+            or not isinstance(intent["scanFingerprint"], str) or _EPHEMERAL_ID["scan"].fullmatch(intent["scanFingerprint"]) is None
+            or not isinstance(intent["approvalSequence"], int) or isinstance(intent["approvalSequence"], bool)
+            or not 1 <= intent["approvalSequence"] <= 9_007_199_254_740_991
+            or not isinstance(backup["planId"], str) or not backup["planId"].startswith("P-")
+            or _PREFIXED_ID.fullmatch(backup["planId"]) is None
+            or not isinstance(backup["approvalId"], str) or not backup["approvalId"].startswith("A-")
+            or _PREFIXED_ID.fullmatch(backup["approvalId"]) is None
+            or not isinstance(backup["vaultId"], str) or _VAULT_ID.fullmatch(backup["vaultId"]) is None
+            or not isinstance(backup["reservedBytes"], int) or isinstance(backup["reservedBytes"], bool)
+            or not isinstance(backup["backupSize"], int) or isinstance(backup["backupSize"], bool)
+            or not 1 <= backup["backupSize"] <= backup["reservedBytes"] <= 16 * 1024 * 1024
+            or not isinstance(metadata["mode"], int) or not 0 <= metadata["mode"] <= 0o7777
+            or not isinstance(metadata["uid"], int) or not 0 <= metadata["uid"] <= 0xffffffff
+            or not isinstance(metadata["gid"], int) or not 0 <= metadata["gid"] <= 0xffffffff
+            or metadata["xattrs"] != "none" or metadata["posixAcl"] != "none"):
+        raise HandoffFailure("INTERNAL")
+    for key in digests:
+        _digest(backup[key])
+    boot = _digest(lease["bootEpochSha256"])
+    if not any(boot):
+        raise HandoffFailure("INTERNAL")
+    for key in ("targetFingerprint", "targetPhysicalParentFingerprint"):
+        _digest(intent[key])
+    for key in ("beforeSha256", "afterSha256", "diffSha256", "observedUuidSetSha256"):
+        _digest(intent[key])
+    metadata_hash = _hash_fields(b"KERNAID-REPAIR-FILE-METADATA-V1\0", [
+        metadata["mode"].to_bytes(4, "big"), metadata["uid"].to_bytes(4, "big"),
+        metadata["gid"].to_bytes(4, "big"), b"\0", b"\0"])
+    if (backup["metadataSha256"] != metadata_hash
+            or backup["expectedBackupSha256"] != intent["beforeSha256"]
+            or backup["metadataSha256"] != metadata_hash
+            or backup["physicalParentFingerprint"]
+            == intent["targetPhysicalParentFingerprint"]):
+        raise HandoffFailure("INTERNAL")
+    expected_draft = _hash_fields(b"KERNAID-REPAIR-RESERVATION-V1\0", [
+        intent["sessionId"].encode(), intent["targetId"].encode(),
+        _digest(intent["targetFingerprint"]),
+        intent["targetRecoveryFingerprint"].encode(), _digest(backup["expectedBackupSha256"]),
+        _digest(backup["metadataSha256"]), backup["backupSize"].to_bytes(8, "big"),
+        backup["reservedBytes"].to_bytes(8, "big")])
+    if backup["draftBindingSha256"] != expected_draft:
+        raise HandoffFailure("INTERNAL")
+    intent_binding = _hash_fields(b"KERNAID-REPAIR-EXECUTION-INTENT-V1\0", [
+        intent["actionId"].encode(), intent["sessionId"].encode(),
+        intent["approvalSequence"].to_bytes(8, "big"), intent["targetId"].encode(),
+        intent["scanFingerprint"].encode(), _digest(intent["targetFingerprint"]),
+        _digest(intent["targetPhysicalParentFingerprint"]),
+        intent["targetRecoveryFingerprint"].encode(), str(intent["lockIdentity"]).encode(),
+        _digest(intent["beforeSha256"]), _digest(intent["afterSha256"]),
+        _digest(intent["diffSha256"]), _digest(intent["observedUuidSetSha256"]),
+        _digest(metadata_hash)])
+    expected_transaction = _hash_fields(b"KERNAID-REPAIR-TRANSACTION-V1\0", [
+        reservation.encode(), _digest(backup["draftBindingSha256"]), backup["locator"].encode(),
+        backup["vaultId"].encode(), _digest(backup["vaultIdentityFingerprint"]),
+        _digest(backup["physicalParentFingerprint"]), backup["reservedBytes"].to_bytes(8, "big"),
+        backup["backupSize"].to_bytes(8, "big"), _digest(backup["expectedBackupSha256"]),
+        _digest(backup["metadataSha256"]), backup["planId"].encode(),
+        _digest(backup["planSha256"]), backup["approvalId"].encode(),
+        _digest(backup["approvalSha256"]), backup["resourceId"].encode(),
+        _digest(backup["resourceSha256"]), _digest(intent_binding)])
+    if expected_transaction != binding:
+        raise HandoffFailure("INTERNAL")
+    expected_lock = "lock:" + _hash_fields(
+        b"kernaid:rescue-fstab:target-lock:v2\0",
+        [str(intent["targetRecoveryFingerprint"]).encode(), REPAIR_RESOURCE.encode()])
+    if intent["lockIdentity"] != expected_lock or backup["resourceSha256"] != intent["beforeSha256"]:
+        raise HandoffFailure("INTERNAL")
+    expected_lease = _hash_fields(b"KERNAID-REPAIR-WRITE-LEASE-V1\0", [
+        VAULT_WRITE_CAPABILITY.encode(), _digest(binding), boot,
+        str(intent["targetRecoveryFingerprint"]).encode(), expected_lock.encode()])
+    if lease["leaseBindingSha256"] != expected_lease:
+        raise HandoffFailure("INTERNAL")
+    return {"recoveryFingerprint": str(intent["targetRecoveryFingerprint"]),
+            "leaseBindingSha256": expected_lease}
+
+
+def _fresh_request_id() -> str:
+    raw = secrets.token_hex(16)
+    return f"R-{raw[:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:]}"
+
+
+def _vault_exchange(request: dict[str, object], deadline: float) -> dict[str, object]:
+    _ensure_deadline(deadline)
+    endpoint = os.stat(VAULT_HELPER_SOCKET_PATH, follow_symlinks=False)
+    if (not stat.S_ISSOCK(endpoint.st_mode) or endpoint.st_uid != 0
+            or stat.S_IMODE(endpoint.st_mode) != 0o600):
+        raise HandoffFailure("INTERNAL")
+    connection = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC)
+    try:
+        connection.settimeout(max(0.001, deadline - time.monotonic()))
+        connection.connect(VAULT_HELPER_SOCKET_PATH)
+        credentials = connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+        _pid, uid, _gid = struct.unpack("3i", credentials)
+        if (uid != 0 or connection.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE)
+                != socket.SOCK_SEQPACKET or connection.getpeername() != VAULT_HELPER_SOCKET_PATH):
+            raise HandoffFailure("INTERNAL")
+        encoded = _canonical(request)
+        if connection.sendmsg([encoded]) != len(encoded):
+            raise HandoffFailure("INTERNAL")
+        payload, ancillary, flags, _address = connection.recvmsg(64 * 1024 + 1, socket.CMSG_SPACE(4))
+        if (not payload or len(payload) > 64 * 1024 or ancillary
+                or flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC)):
+            raise HandoffFailure("INTERNAL")
+        response = json.loads(payload.decode("utf-8", errors="strict"),
+                              object_pairs_hook=_reject_duplicates,
+                              parse_constant=lambda _value: (_ for _ in ()).throw(ValueError()))
+        after = os.stat(VAULT_HELPER_SOCKET_PATH, follow_symlinks=False)
+        if (endpoint.st_dev, endpoint.st_ino, endpoint.st_uid, endpoint.st_mode) != (
+                after.st_dev, after.st_ino, after.st_uid, after.st_mode):
+            raise HandoffFailure("INTERNAL")
+        return response
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        raise HandoffFailure("INTERNAL") from error
+    finally:
+        connection.close()
+
+
+def _consume_write_lease(reservation: str, binding: str, deadline: float) -> dict[str, str]:
+    state_version = 0
+    for attempt in range(2):
+        request_id = _fresh_request_id()
+        request = {"apiVersion": VAULT_API_VERSION, "requestId": request_id,
+                   "expectedStateVersion": state_version, "operation": VAULT_WRITE_OPERATION,
+                   "payload": {"selector": {"kind": "exact", "reservationId": reservation,
+                                              "transactionBindingSha256": binding}}}
+        response = _vault_exchange(request, deadline)
+        common = {"apiVersion", "requestId", "stateVersion", "operation", "outcome"}
+        if (not isinstance(response, dict) or response.get("apiVersion") != VAULT_API_VERSION
+                or response.get("requestId") != request_id
+                or response.get("operation") != VAULT_WRITE_OPERATION
+                or not isinstance(response.get("stateVersion"), int)
+                or isinstance(response.get("stateVersion"), bool)
+                or not 0 <= response["stateVersion"] <= 9_007_199_254_740_991):
+            raise HandoffFailure("INTERNAL")
+        if response.get("outcome") == "error":
+            if (set(response) == common | {"error"} and attempt == 0
+                    and response.get("error") == "STALE_STATE"
+                    and response["stateVersion"] != state_version):
+                state_version = response["stateVersion"]
+                continue
+            raise HandoffFailure("INTERNAL")
+        if response.get("outcome") != "ok" or set(response) != common | {"payload"}:
+            raise HandoffFailure("INTERNAL")
+        return _validate_write_lease(response["payload"], reservation, binding)
+    raise HandoffFailure("INTERNAL")
+
+
 def _close_descriptors(descriptors: list[int]) -> None:
     while descriptors:
         descriptor = descriptors.pop()
@@ -1156,10 +1470,12 @@ def _revalidate_block_pair(
     parent_major: int,
     parent_minor: int,
     request_id: str,
+    *,
+    writable_leaf: bool = False,
 ) -> None:
     if len(descriptors) < 2:
         raise HandoffFailure("DEVICE_UNAVAILABLE", request_id)
-    _assert_block_fd(descriptors[0], leaf_major, leaf_minor)
+    _assert_block_fd(descriptors[0], leaf_major, leaf_minor, writable=writable_leaf)
     _assert_block_fd(descriptors[1], parent_major, parent_minor)
     if _mountinfo_has_device(leaf_major_minor) or _mountinfo_has_device(
         parent_major_minor
@@ -1267,9 +1583,99 @@ class RepairTargetHandoff:
         self.targets = _load_target_module() if targets is None else targets
 
     def acquire(self, request: dict[str, str]) -> tuple[dict[str, object], list[int]]:
+        if request.get("operation") == WRITE_OPERATION:
+            return self._acquire_write(request)
         if request.get("operation") == RECOVERY_OPERATION:
             return self._recover(request)
         return self._acquire_selected(request)
+
+    def _acquire_write(
+        self, request: dict[str, str]
+    ) -> tuple[dict[str, object], list[int]]:
+        request_id = request["requestId"]
+        deadline = time.monotonic() + IO_TIMEOUT_SECONDS
+        descriptors: list[int] = []
+        try:
+            # Consumption is deliberately first and is never retried except for
+            # one explicit authenticated stale-state response.
+            lease = _consume_write_lease(request["reservationId"],
+                                         request["transactionBindingSha256"], deadline)
+            recovery = lease["recoveryFingerprint"]
+            reference = {"recoveryFingerprint": recovery}
+            selection_a, resolution_a = self.targets.resolve_recovery_target(
+                reference, deadline=deadline)
+            qualified_a = _qualify(self.targets, request, selection_a, resolution_a,
+                                   expected_recovery_fingerprint=recovery)
+            (_recovery, major_minor, major, minor, parent_major_minor, parent_major,
+             parent_minor, leaf_size_bytes, parent_size_bytes) = qualified_a
+            if _mountinfo_has_device(major_minor) or _mountinfo_has_device(parent_major_minor):
+                raise HandoffFailure("TARGET_UNSUPPORTED", request_id)
+            descriptors = [
+                _open_bound_block_device(major_minor, major, minor, writable=True),
+                _open_bound_block_device(parent_major_minor, parent_major, parent_minor),
+            ]
+            claims = _probe_physical_parent_claims(
+                descriptors[0], descriptors[1], leaf_size_bytes, parent_size_bytes,
+                parent_major, parent_minor)
+            current_parent_fingerprint = _physical_parent_fingerprint(claims)
+            selection_b, resolution_b = self.targets.resolve_recovery_target(
+                reference, deadline=deadline)
+            qualified_b = _qualify(self.targets, request, selection_b, resolution_b,
+                                   expected_recovery_fingerprint=recovery)
+            if (self.targets.canonical_target_selection(selection_a)
+                    != self.targets.canonical_target_selection(selection_b)
+                    or _canonical(resolution_a) != _canonical(resolution_b)
+                    or qualified_a != qualified_b):
+                raise HandoffFailure("TARGET_CHANGED", request_id)
+            _revalidate_block_pair(descriptors, major_minor, major, minor,
+                                   parent_major_minor, parent_major, parent_minor, request_id,
+                                   writable_leaf=True)
+            mount = _create_detached_ext4_write_mount(descriptors[0], major, minor)
+            descriptors.append(mount)
+            selection_c, resolution_c = self.targets.resolve_recovery_target(
+                reference, deadline=deadline)
+            qualified_c = _qualify(self.targets, request, selection_c, resolution_c,
+                                   expected_recovery_fingerprint=recovery)
+            if (self.targets.canonical_target_selection(selection_a)
+                    != self.targets.canonical_target_selection(selection_c)
+                    or _canonical(resolution_a) != _canonical(resolution_c)
+                    or qualified_a != qualified_c):
+                raise HandoffFailure("TARGET_CHANGED", request_id)
+            _revalidate_block_pair(descriptors, major_minor, major, minor,
+                                   parent_major_minor, parent_major, parent_minor, request_id,
+                                   writable_leaf=True)
+            fresh_claims = _probe_physical_parent_claims(
+                descriptors[0], descriptors[1], leaf_size_bytes, parent_size_bytes,
+                parent_major, parent_minor)
+            # The transaction's physical-parent digest is intentionally
+            # boot-local. Durable recovery is authorized by the stable
+            # recovery fingerprint, while this helper requires the freshly
+            # probed current-boot parent to remain byte-identical throughout
+            # all three resolutions and detached-mount creation.
+            if (fresh_claims != claims
+                    or _physical_parent_fingerprint(fresh_claims)
+                    != current_parent_fingerprint):
+                raise HandoffFailure("TARGET_CHANGED", request_id)
+            _assert_detached_ext4_write_mount_fd(mount, major, minor)
+            # Raw block capabilities remain inside the root helper TCB.
+            os.close(descriptors.pop(1))
+            os.close(descriptors.pop(0))
+        except HandoffFailure as error:
+            _close_descriptors(descriptors)
+            if error.request_id is None:
+                error.request_id = request_id
+            raise
+        except Exception as error:
+            _close_descriptors(descriptors)
+            raise HandoffFailure("INTERNAL", request_id) from error
+        return ({"apiVersion": API_VERSION, "requestId": request_id,
+                 "operation": WRITE_OPERATION, "outcome": "ok",
+                 "capability": WRITE_CAPABILITY,
+                 "reservationId": request["reservationId"],
+                 "transactionBindingSha256": request["transactionBindingSha256"],
+                 "targetRecoveryFingerprint": recovery,
+                 "leaseBindingSha256": lease["leaseBindingSha256"],
+                 "descriptor": {"type": WRITE_DESCRIPTOR_TYPE, "count": 1}}, descriptors)
 
     def _acquire_selected(
         self, request: dict[str, str]
@@ -1645,6 +2051,11 @@ def _send_record(
         )
     success = response.get("outcome") == "ok"
     if success:
+        if response.get("capability") == WRITE_CAPABILITY:
+            if (response.get("descriptor") != {"type": WRITE_DESCRIPTOR_TYPE, "count": 1}
+                    or len(descriptors) != 1):
+                raise HandoffFailure("INTERNAL", response.get("requestId"))
+            return _send_encoded_record(connection, encoded, descriptors)
         claims = _validate_physical_parent_claims_wire(
             response.get("physicalParentClaims")
         )
@@ -1671,6 +2082,10 @@ def _send_record(
         raise HandoffFailure(
             "INTERNAL", request_id if isinstance(request_id, str) else None
         )
+    _send_encoded_record(connection, encoded, descriptors)
+
+
+def _send_encoded_record(connection: socket.socket, encoded: bytes, descriptors: list[int]) -> None:
     ancillary = []
     if descriptors:
         ancillary = [
@@ -1690,6 +2105,7 @@ def serve_connection(
     service: RepairTargetHandoff | None = None,
     *,
     expected_local: str | None = SOCKET_PATH,
+    profile: str = PROFILE_READONLY,
 ) -> None:
     descriptors: list[int] = []
     request: dict[str, str] | None = None
@@ -1698,7 +2114,7 @@ def serve_connection(
     except HandoffFailure:
         return
     try:
-        request = _decode_request(_received_record(connection))
+        request = _decode_request(_received_record(connection), profile)
         response, descriptors = (service or RepairTargetHandoff()).acquire(request)
         _send_record(connection, response, descriptors)
     except HandoffFailure as error:
@@ -1706,11 +2122,11 @@ def serve_connection(
             return
         operation = (
             error.operation
-            if error.operation in {ACQUIRE_OPERATION, RECOVERY_OPERATION}
+            if error.operation in {ACQUIRE_OPERATION, RECOVERY_OPERATION, WRITE_OPERATION}
             else request.get("operation") if request is not None else None
         )
-        if operation not in {ACQUIRE_OPERATION, RECOVERY_OPERATION}:
-            operation = ACQUIRE_OPERATION
+        if operation not in {ACQUIRE_OPERATION, RECOVERY_OPERATION, WRITE_OPERATION}:
+            operation = WRITE_OPERATION if profile == PROFILE_WRITE else ACQUIRE_OPERATION
         response: dict[str, object] = {
             "apiVersion": API_VERSION,
             "requestId": error.request_id,
@@ -1743,11 +2159,13 @@ def serve_connection(
         _close_descriptors(descriptors)
 
 
-def _systemd_connection() -> socket.socket:
+def _systemd_connection(profile: str) -> socket.socket:
+    expected_name = "target-write-capability" if profile == PROFILE_WRITE else "target-capability"
+    expected_path = WRITE_SOCKET_PATH if profile == PROFILE_WRITE else SOCKET_PATH
     if (
         os.environ.get("LISTEN_PID") != str(os.getpid())
         or os.environ.get("LISTEN_FDS") != "1"
-        or os.environ.get("LISTEN_FDNAMES") != "target-capability"
+        or os.environ.get("LISTEN_FDNAMES") != expected_name
     ):
         raise RuntimeError("exactly one named accepted connection is required")
     connection = socket.socket(fileno=3)
@@ -1757,7 +2175,7 @@ def _systemd_connection() -> socket.socket:
         or connection.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE)
         != socket.SOCK_SEQPACKET
         or connection.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN) != 0
-        or connection.getsockname() != SOCKET_PATH
+        or connection.getsockname() != expected_path
     ):
         connection.close()
         raise RuntimeError("accepted connection does not match fixed endpoint")
@@ -1768,13 +2186,16 @@ def main() -> int:
     if os.geteuid() != 0 or sys.argv != [sys.argv[0]]:
         return 1
     try:
+        profile = _profile()
         expected_uid = _repair_broker_uid()
-        connection = _systemd_connection()
+        connection = _systemd_connection(profile)
     except (RuntimeError, OSError):
         return 1
     with connection:
         connection.settimeout(IO_TIMEOUT_SECONDS)
-        serve_connection(connection, expected_uid)
+        serve_connection(connection, expected_uid,
+                         expected_local=(WRITE_SOCKET_PATH if profile == PROFILE_WRITE else SOCKET_PATH),
+                         profile=profile)
     return 0
 
 

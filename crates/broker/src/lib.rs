@@ -57,6 +57,11 @@ pub mod target_capability_client;
 #[cfg(all(target_os = "linux", feature = "rescue-target-physical-parent"))]
 pub mod target_physical_parent;
 
+/// One-shot client for the root-owned Pending-transaction write-mount
+/// handoff. It is absent from default and diagnosis-only builds.
+#[cfg(all(target_os = "linux", feature = "rescue-fstab-production-candidate"))]
+pub mod target_write_capability_client;
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum BrokerError {
     InvalidRequest,

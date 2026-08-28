@@ -1,0 +1,25 @@
+[Unit]
+Description=KernAid candidate Rescue target write capability socket
+Requires=kernaid-offline-inspector-key.service systemd-sysusers.service
+After=kernaid-offline-inspector-key.service systemd-sysusers.service
+ConditionKernelCommandLine=boot=live
+ConditionKernelCommandLine=kernaid.repair=fstab-v1
+ConditionPathExists=/usr/lib/kernaid/repair-candidate-image-v1
+ConditionPathExists=/run/kernaid-offline-inspector/target-id.key
+
+[Socket]
+ListenSequentialPacket=/run/kernaid-rescue-target-write-capability.sock
+Accept=yes
+MaxConnections=1
+Backlog=1
+FileDescriptorName=target-write-capability
+SocketMode=0660
+SocketUser=root
+SocketGroup=kernaid-repair
+RemoveOnStop=yes
+PassCredentials=no
+PassSecurity=no
+PassPacketInfo=no
+Timestamping=off
+
+# Candidate packaging enables this socket through repaird dependencies.

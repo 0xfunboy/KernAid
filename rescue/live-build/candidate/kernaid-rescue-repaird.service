@@ -1,8 +1,8 @@
 [Unit]
 Description=KernAid Rescue fstab repair candidate broker
-Requires=kernaid-rescue-repaird.socket kernaid-rescue-vaultd.socket kernaid-rescue-vaultd.service kernaid-rescue-target-capability.socket systemd-sysusers.service systemd-tmpfiles-setup.service
+Requires=kernaid-rescue-repaird.socket kernaid-rescue-vaultd.socket kernaid-rescue-vaultd.service kernaid-rescue-target-capability.socket kernaid-rescue-target-write-capability.socket systemd-sysusers.service systemd-tmpfiles-setup.service
 BindsTo=kernaid-rescue-vaultd.service
-After=kernaid-rescue-repaird.socket kernaid-rescue-vaultd.socket kernaid-rescue-vaultd.service kernaid-rescue-target-capability.socket systemd-sysusers.service systemd-tmpfiles-setup.service
+After=kernaid-rescue-repaird.socket kernaid-rescue-vaultd.socket kernaid-rescue-vaultd.service kernaid-rescue-target-capability.socket kernaid-rescue-target-write-capability.socket systemd-sysusers.service systemd-tmpfiles-setup.service
 Before=kernaid-ui.service kernaid-ready.service
 ConditionKernelCommandLine=boot=live
 ConditionKernelCommandLine=kernaid.repair=fstab-v1
@@ -35,10 +35,9 @@ NoNewPrivileges=yes
 PrivateMounts=yes
 PrivateNetwork=yes
 PrivateTmp=yes
-# Candidate promotion blocker: the broker still resolves the exact physical
-# parent through /dev. DevicePolicy limits access, but PrivateDevices cannot be
-# enabled until the target helper transfers the retained parent/RW descriptor.
-PrivateDevices=no
+# Target block and mount authority arrives only through the authenticated
+# capability sockets; the unprivileged broker has no host /dev access.
+PrivateDevices=yes
 PrivateIPC=yes
 ProtectSystem=strict
 ProtectHome=yes
@@ -52,11 +51,8 @@ ProtectProc=invisible
 ProcSubset=pid
 ReadWritePaths=/run/lock/kernaid-repair
 DevicePolicy=closed
-# Candidate-wide block access is still required while the broker resolves the
-# physical parent through /dev; remove it when the root helper passes that FD.
-DeviceAllow=block-* rw
-CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_OVERRIDE CAP_FOWNER CAP_CHOWN
-AmbientCapabilities=CAP_SYS_ADMIN CAP_DAC_OVERRIDE CAP_FOWNER CAP_CHOWN
+CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_FOWNER CAP_CHOWN
+AmbientCapabilities=CAP_DAC_OVERRIDE CAP_FOWNER CAP_CHOWN
 RestrictAddressFamilies=AF_UNIX
 RestrictNamespaces=yes
 RestrictRealtime=yes

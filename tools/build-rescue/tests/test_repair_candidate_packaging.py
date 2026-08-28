@@ -187,17 +187,20 @@ class RepairCandidatePackagingTests(unittest.TestCase):
                 "kernaid-rescue-vaultd.socket",
                 "kernaid-rescue-vaultd.service",
                 "kernaid-rescue-target-capability.socket",
+                "kernaid-rescue-target-write-capability.socket",
                 "systemd-sysusers.service",
                 "systemd-tmpfiles-setup.service",
             }
             <= required
         )
+        after = set(service_unit["After"][0].split())
+        self.assertIn("kernaid-rescue-target-write-capability.socket", after)
 
     def test_candidate_caps_mount_and_device_surface_are_minimal_and_private(self) -> None:
         service = unit_directives(
             CANDIDATE / "kernaid-rescue-repaird.service"
         )["Service"]
-        caps = "CAP_SYS_ADMIN CAP_DAC_OVERRIDE CAP_FOWNER CAP_CHOWN"
+        caps = "CAP_DAC_OVERRIDE CAP_FOWNER CAP_CHOWN"
         self.assertEqual(service["CapabilityBoundingSet"], [caps])
         self.assertEqual(service["AmbientCapabilities"], [caps])
         for directive in (
@@ -214,20 +217,21 @@ class RepairCandidatePackagingTests(unittest.TestCase):
         ):
             self.assertIn(service[directive][0], ("yes", "strict"), directive)
         self.assertEqual(service["RestrictAddressFamilies"], ["AF_UNIX"])
-        self.assertEqual(service["PrivateDevices"], ["no"])
+        self.assertEqual(service["PrivateDevices"], ["yes"])
         self.assertEqual(service["DevicePolicy"], ["closed"])
-        self.assertEqual(service["DeviceAllow"], ["block-* rw"])
+        self.assertNotIn("DeviceAllow", service)
         self.assertEqual(
             service["ReadWritePaths"], ["/run/lock/kernaid-repair"]
         )
         self.assertNotIn("DynamicUser", service)
         self.assertNotIn("CAP_DAC_READ_SEARCH", caps)
         self.assertNotIn("CAP_MKNOD", caps)
+        self.assertNotIn("CAP_SYS_ADMIN", caps)
         unit_source = (
             CANDIDATE / "kernaid-rescue-repaird.service"
         ).read_text(encoding="utf-8")
-        self.assertIn("Candidate promotion blocker", unit_source)
-        self.assertIn("parent/RW descriptor", unit_source)
+        self.assertIn("authenticated", unit_source)
+        self.assertIn("no host /dev access", unit_source)
 
     def test_only_loopback_server_gets_candidate_client_group(self) -> None:
         self.assertEqual(
