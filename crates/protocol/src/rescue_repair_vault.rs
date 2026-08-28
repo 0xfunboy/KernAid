@@ -17,6 +17,69 @@ pub const REPAIR_BACKUP_LOCATOR_PREFIX: &str = "vault://repair/";
 
 const MAX_OPAQUE_ID_BYTES: usize = 128;
 const RESERVATION_BINDING_DOMAIN: &[u8] = b"KERNAID-REPAIR-RESERVATION-V1\0";
+const FILE_METADATA_DOMAIN: &[u8] = b"KERNAID-REPAIR-FILE-METADATA-V1\0";
+const MAX_PERMISSION_MODE: u32 = 0o7777;
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RepairMetadataAbsence {
+    None,
+}
+
+/// Closed, path-free metadata for the first regular-file repair resource.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RepairFileMetadataV1 {
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    xattrs: RepairMetadataAbsence,
+    posix_acl: RepairMetadataAbsence,
+}
+
+impl RepairFileMetadataV1 {
+    pub fn new(mode: u32, uid: u32, gid: u32) -> Result<Self, ProtocolViolation> {
+        if mode > MAX_PERMISSION_MODE {
+            return Err(ProtocolViolation::InvalidPayload);
+        }
+        Ok(Self {
+            mode,
+            uid,
+            gid,
+            xattrs: RepairMetadataAbsence::None,
+            posix_acl: RepairMetadataAbsence::None,
+        })
+    }
+    pub const fn mode(&self) -> u32 {
+        self.mode
+    }
+    pub const fn uid(&self) -> u32 {
+        self.uid
+    }
+    pub const fn gid(&self) -> u32 {
+        self.gid
+    }
+    pub fn canonical_sha256(&self) -> Sha256 {
+        canonical_repair_file_metadata_sha256(self)
+    }
+    pub(crate) fn validate(&self) -> Result<(), ProtocolViolation> {
+        if self.mode > MAX_PERMISSION_MODE {
+            return Err(ProtocolViolation::InvalidPayload);
+        }
+        Ok(())
+    }
+}
+
+pub fn canonical_repair_file_metadata_sha256(metadata: &RepairFileMetadataV1) -> Sha256 {
+    let mut hasher = Sha256Hasher::new();
+    hasher.update(FILE_METADATA_DOMAIN);
+    hash_field(&mut hasher, &metadata.mode.to_be_bytes());
+    hash_field(&mut hasher, &metadata.uid.to_be_bytes());
+    hash_field(&mut hasher, &metadata.gid.to_be_bytes());
+    hash_field(&mut hasher, &[0]);
+    hash_field(&mut hasher, &[0]);
+    Sha256::parse(&encode_hex(&hasher.finalize())).expect("SHA-256 digest is canonical")
+}
 
 /// Opaque backup reservation identifier (`B-` plus 32 lowercase hex digits).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -688,5 +751,24 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn file_metadata_v1_is_closed_bounded_and_hash_bound() {
+        let metadata = RepairFileMetadataV1::new(0o640, 1000, 1001).expect("metadata");
+        assert_eq!(metadata.mode(), 0o640);
+        assert_eq!(metadata.uid(), 1000);
+        assert_eq!(metadata.gid(), 1001);
+        assert_eq!(
+            metadata.canonical_sha256(),
+            canonical_repair_file_metadata_sha256(&metadata)
+        );
+        assert!(RepairFileMetadataV1::new(0o10000, 0, 0).is_err());
+        let json = serde_json::to_string(&metadata).expect("metadata JSON");
+        assert_eq!(
+            json,
+            r#"{"mode":416,"uid":1000,"gid":1001,"xattrs":"none","posixAcl":"none"}"#
+        );
+        assert!(!json.contains('/'));
     }
 }

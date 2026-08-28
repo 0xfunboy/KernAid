@@ -46,6 +46,42 @@
     "payload": { "type": "object" }
   },
   "$defs": {
+    "repairBackupStatus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "reservationId", "draftBindingSha256", "locator", "vaultId", "vaultIdentityFingerprint", "physicalParentFingerprint", "reservedBytes", "backupSize", "expectedBackupSha256", "metadataSha256"],
+      "properties": {
+        "state": { "enum": ["reserved", "durable"] },
+        "reservationId": { "$ref": "#/$defs/reservationId" },
+        "draftBindingSha256": { "$ref": "#/$defs/sha256" },
+        "locator": { "type": "string", "pattern": "^vault://repair/B-[0-9a-f]{32}$" },
+        "vaultId": { "type": "string", "pattern": "^V-[0-9a-f]{32}$" },
+        "vaultIdentityFingerprint": { "$ref": "#/$defs/sha256" },
+        "physicalParentFingerprint": { "$ref": "#/$defs/sha256" },
+        "reservedBytes": { "type": "integer", "minimum": 1, "maximum": 16777216 },
+        "backupSize": { "type": "integer", "minimum": 1, "maximum": 16777216 },
+        "expectedBackupSha256": { "$ref": "#/$defs/sha256" },
+        "metadataSha256": { "$ref": "#/$defs/sha256" },
+        "planId": { "$ref": "#/$defs/prefixedPlanId" },
+        "planSha256": { "$ref": "#/$defs/sha256" },
+        "approvalId": { "$ref": "#/$defs/prefixedApprovalId" },
+        "approvalSha256": { "$ref": "#/$defs/sha256" },
+        "resourceId": { "$ref": "#/$defs/resourceId" },
+        "resourceSha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "repairFileMetadataV1": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "uid", "gid", "xattrs", "posixAcl"],
+      "properties": {
+        "mode": { "type": "integer", "minimum": 0, "maximum": 4095 },
+        "uid": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "gid": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "xattrs": { "const": "none" },
+        "posixAcl": { "const": "none" }
+      }
+    },
     "emptyPayload": {
       "type": "object",
       "additionalProperties": false,
@@ -374,8 +410,8 @@
             "type": "object",
             "additionalProperties": false,
             "required": [
-              "reservationId",
-              "draftBindingSha256",
+              "expected",
+              "metadata",
               "planId",
               "planSha256",
               "approvalId",
@@ -385,8 +421,8 @@
               "input"
             ],
             "properties": {
-              "reservationId": { "$ref": "#/$defs/reservationId" },
-              "draftBindingSha256": { "$ref": "#/$defs/sha256" },
+              "expected": { "$ref": "#/$defs/repairBackupStatus" },
+              "metadata": { "$ref": "#/$defs/repairFileMetadataV1" },
               "planId": { "$ref": "#/$defs/prefixedPlanId" },
               "planSha256": { "$ref": "#/$defs/sha256" },
               "approvalId": { "$ref": "#/$defs/prefixedApprovalId" },
@@ -413,10 +449,9 @@
           "payload": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["reservationId", "draftBindingSha256"],
+            "required": ["expected"],
             "properties": {
-              "reservationId": { "$ref": "#/$defs/reservationId" },
-              "draftBindingSha256": { "$ref": "#/$defs/sha256" }
+              "expected": { "$ref": "#/$defs/repairBackupStatus" }
             }
           }
         }

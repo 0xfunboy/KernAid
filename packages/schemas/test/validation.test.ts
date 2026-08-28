@@ -617,6 +617,41 @@ test("experimental Repair Vault schemas are isolated and structurally closed", (
     },
   };
   assert.equal(validateResponse(reserved), true);
+  const persist = {
+    ...envelope,
+    operation: "repair.backup.persist",
+    payload: {
+      expected: reserved.payload,
+      metadata: { mode: 420, uid: 0, gid: 0, xattrs: "none", posixAcl: "none" },
+      planId: "P-plan-1",
+      planSha256: "7".repeat(64),
+      approvalId: "A-approval-1",
+      approvalSha256: "8".repeat(64),
+      resourceId: "rescue:selected-linux-root:etc/fstab",
+      resourceSha256: "9".repeat(64),
+      input: { type: "repair-backup-input-pipe", size: 4096 },
+    },
+  };
+  assert.equal(validateRequest(persist), true);
+  assert.equal(
+    validateRequest({ ...persist, payload: { ...persist.payload, path: "/etc/fstab" } }),
+    false,
+  );
+  assert.equal(
+    validateRequest({
+      ...persist,
+      payload: { ...persist.payload, metadata: { ...persist.payload.metadata, xattrs: {} } },
+    }),
+    false,
+  );
+  assert.equal(
+    validateRequest({
+      ...envelope,
+      operation: "repair.backup.status",
+      payload: { expected: reserved.payload },
+    }),
+    true,
+  );
   const missingVaultId = structuredClone(reserved);
   delete (missingVaultId.payload as { vaultId?: string }).vaultId;
   assert.equal(validateResponse(missingVaultId), false);

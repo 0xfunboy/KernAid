@@ -16,7 +16,7 @@
 #[cfg(feature = "experimental-repair-store")]
 use crate::rescue_repair_vault::{
     MAX_REPAIR_BACKUP_BYTES, RepairBackupBinding, RepairBackupDraft, RepairBackupState,
-    RepairBackupStatusPayload, RepairReservationId,
+    RepairBackupStatusPayload, RepairFileMetadataV1,
 };
 use crate::rescue_vault::{
     API_VERSION, AuditEventType, AuditOutcome, DescriptorDeclaration, DescriptorType, ErrorToken,
@@ -531,6 +531,7 @@ pub enum ClientRequestPayload {
     RepairBackupPersist {
         expected: Box<RepairBackupStatusPayload>,
         binding: RepairBackupBinding,
+        metadata: RepairFileMetadataV1,
         input_size: u64,
     },
     #[cfg(feature = "experimental-repair-store")]
@@ -672,12 +673,15 @@ fn valid_client_payload(payload: &ClientRequestPayload) -> bool {
         #[cfg(feature = "experimental-repair-store")]
         ClientRequestPayload::RepairBackupPersist {
             expected,
+            metadata,
             input_size,
             ..
         } => {
             expected.validate().is_ok()
                 && expected.state() == RepairBackupState::Reserved
                 && expected.backup_size() == *input_size
+                && metadata.validate().is_ok()
+                && metadata.canonical_sha256() == *expected.metadata_sha256()
                 && (1..=MAX_REPAIR_BACKUP_BYTES).contains(input_size)
         }
         ClientRequestPayload::VaultStatus
@@ -770,8 +774,8 @@ struct RepairBackupReserveRequestPayload<'a> {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RepairBackupPersistRequestPayload<'a> {
-    reservation_id: &'a RepairReservationId,
-    draft_binding_sha256: &'a Sha256,
+    expected: &'a RepairBackupStatusPayload,
+    metadata: &'a RepairFileMetadataV1,
     plan_id: &'a str,
     plan_sha256: &'a Sha256,
     approval_id: &'a str,
@@ -785,8 +789,7 @@ struct RepairBackupPersistRequestPayload<'a> {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RepairBackupReferenceRequestPayload<'a> {
-    reservation_id: &'a RepairReservationId,
-    draft_binding_sha256: &'a Sha256,
+    expected: &'a RepairBackupStatusPayload,
 }
 
 /// Encodes a typed client request and validates the exact outgoing descriptor
@@ -879,12 +882,15 @@ pub fn encode_client_request(
         ),
         #[cfg(feature = "experimental-repair-store")]
         ClientRequestPayload::RepairBackupPersist {
-            expected, binding, ..
+            expected,
+            binding,
+            metadata,
+            ..
         } => encode_client_request_payload(
             request,
             RepairBackupPersistRequestPayload {
-                reservation_id: expected.reservation_id(),
-                draft_binding_sha256: expected.draft_binding_sha256(),
+                expected,
+                metadata,
                 plan_id: binding.plan_id(),
                 plan_sha256: binding.plan_sha256(),
                 approval_id: binding.approval_id(),
@@ -898,13 +904,9 @@ pub fn encode_client_request(
         ),
         #[cfg(feature = "experimental-repair-store")]
         ClientRequestPayload::RepairBackupStatus { expected }
-        | ClientRequestPayload::RepairBackupGet { expected } => encode_client_request_payload(
-            request,
-            RepairBackupReferenceRequestPayload {
-                reservation_id: expected.reservation_id(),
-                draft_binding_sha256: expected.draft_binding_sha256(),
-            },
-        ),
+        | ClientRequestPayload::RepairBackupGet { expected } => {
+            encode_client_request_payload(request, RepairBackupReferenceRequestPayload { expected })
+        }
     }?;
     if bytes.len() > MAX_DATAGRAM_BYTES {
         return Err(ProtocolViolation::DatagramTooLarge);
@@ -1447,6 +1449,7 @@ fn decode_success_payload(
             expected,
             binding,
             input_size,
+            ..
         } => {
             require_no_descriptors(descriptors)?;
             let status: RepairBackupStatusPayload = decode_payload(raw)?;
@@ -2299,16 +2302,18 @@ mod tests {
     #[test]
     fn repair_backup_client_codec_binds_mutations_and_descriptor_direction() {
         use crate::rescue_repair_vault::{
-            RepairBackupBinding, RepairBackupDraft, RepairBackupStatusPayload, RepairReservationId,
+            RepairBackupBinding, RepairBackupDraft, RepairBackupStatusPayload,
+            RepairFileMetadataV1, RepairReservationId,
         };
 
         let hash = |byte: char| Sha256::parse(&byte.to_string().repeat(64)).expect("test SHA-256");
+        let metadata = RepairFileMetadataV1::new(0o644, 0, 0).expect("file metadata");
         let draft = RepairBackupDraft::new(
             "S-session-1",
             "target-1",
             hash('1'),
             hash('2'),
-            hash('3'),
+            metadata.canonical_sha256(),
             4096,
             8192,
         )
@@ -2338,7 +2343,7 @@ mod tests {
             8192,
             4096,
             hash('2'),
-            hash('3'),
+            metadata.canonical_sha256(),
         )
         .expect("reserved status");
         let response = success_response(
@@ -2383,6 +2388,7 @@ mod tests {
         let persist = request(ClientRequestPayload::RepairBackupPersist {
             expected: Box::new(reserved.clone()),
             binding: binding.clone(),
+            metadata: metadata.clone(),
             input_size: 4096,
         });
         assert_eq!(
@@ -2408,7 +2414,7 @@ mod tests {
             8192,
             4096,
             hash('2'),
-            hash('3'),
+            metadata.canonical_sha256(),
             binding,
         )
         .expect("durable status");

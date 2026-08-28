@@ -8,7 +8,7 @@
 #[cfg(feature = "experimental-repair-store")]
 use crate::rescue_repair_vault::{
     MAX_REPAIR_BACKUP_BYTES, RepairBackupBinding, RepairBackupDraft, RepairBackupState,
-    RepairBackupStatusPayload, RepairReservationId,
+    RepairBackupStatusPayload, RepairFileMetadataV1,
 };
 use crate::rescue_vault_transport::{
     SeqpacketSocketIdentity, SeqpacketTransportError, ensure_deadline, recv_seqpacket,
@@ -752,20 +752,18 @@ pub enum RequestPayload {
     },
     #[cfg(feature = "experimental-repair-store")]
     RepairBackupPersist {
-        reservation_id: RepairReservationId,
-        draft_binding_sha256: Sha256,
+        expected: Box<RepairBackupStatusPayload>,
         binding: RepairBackupBinding,
+        metadata: RepairFileMetadataV1,
         input: DescriptorDeclaration,
     },
     #[cfg(feature = "experimental-repair-store")]
     RepairBackupStatus {
-        reservation_id: RepairReservationId,
-        draft_binding_sha256: Sha256,
+        expected: Box<RepairBackupStatusPayload>,
     },
     #[cfg(feature = "experimental-repair-store")]
     RepairBackupGet {
-        reservation_id: RepairReservationId,
-        draft_binding_sha256: Sha256,
+        expected: Box<RepairBackupStatusPayload>,
     },
 }
 
@@ -1081,8 +1079,8 @@ struct RepairBackupReservePayload {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RepairBackupPersistPayload {
-    reservation_id: String,
-    draft_binding_sha256: String,
+    expected: RepairBackupStatusPayload,
+    metadata: RepairFileMetadataV1,
     plan_id: String,
     plan_sha256: String,
     approval_id: String,
@@ -1096,8 +1094,7 @@ struct RepairBackupPersistPayload {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RepairBackupReferencePayload {
-    reservation_id: String,
-    draft_binding_sha256: String,
+    expected: RepairBackupStatusPayload,
 }
 
 /// Decodes and authorizes one complete request packet for an already-bound
@@ -1327,6 +1324,13 @@ fn parse_payload(
         Operation::RepairBackupPersist => {
             let payload = serde_json::from_str::<RepairBackupPersistPayload>(raw.get())
                 .map_err(|_| ProtocolViolation::InvalidPayload)?;
+            payload.expected.validate()?;
+            payload.metadata.validate()?;
+            if payload.expected.state() != RepairBackupState::Reserved
+                || payload.metadata.canonical_sha256() != *payload.expected.metadata_sha256()
+            {
+                return Err(ProtocolViolation::InvalidPayload);
+            }
             validate_declaration(
                 &payload.input,
                 DescriptorType::RepairBackupInputPipe,
@@ -1334,8 +1338,7 @@ fn parse_payload(
                 MAX_REPAIR_BACKUP_BYTES,
             )?;
             Ok(RequestPayload::RepairBackupPersist {
-                reservation_id: RepairReservationId::parse(&payload.reservation_id)?,
-                draft_binding_sha256: Sha256::parse(&payload.draft_binding_sha256)?,
+                expected: Box::new(payload.expected),
                 binding: RepairBackupBinding::new(
                     payload.plan_id,
                     Sha256::parse(&payload.plan_sha256)?,
@@ -1344,6 +1347,7 @@ fn parse_payload(
                     payload.resource_id,
                     Sha256::parse(&payload.resource_sha256)?,
                 )?,
+                metadata: payload.metadata,
                 input: payload.input,
             })
         }
@@ -1351,17 +1355,19 @@ fn parse_payload(
         Operation::RepairBackupStatus | Operation::RepairBackupGet => {
             let payload = serde_json::from_str::<RepairBackupReferencePayload>(raw.get())
                 .map_err(|_| ProtocolViolation::InvalidPayload)?;
-            let reservation_id = RepairReservationId::parse(&payload.reservation_id)?;
-            let draft_binding_sha256 = Sha256::parse(&payload.draft_binding_sha256)?;
+            payload.expected.validate()?;
+            if operation == Operation::RepairBackupGet
+                && payload.expected.state() != RepairBackupState::Durable
+            {
+                return Err(ProtocolViolation::InvalidPayload);
+            }
             if wire_operation_is_repair_status(operation) {
                 Ok(RequestPayload::RepairBackupStatus {
-                    reservation_id,
-                    draft_binding_sha256,
+                    expected: Box::new(payload.expected),
                 })
             } else {
                 Ok(RequestPayload::RepairBackupGet {
-                    reservation_id,
-                    draft_binding_sha256,
+                    expected: Box::new(payload.expected),
                 })
             }
         }
@@ -2081,16 +2087,16 @@ fn validate_success(
         (
             Operation::RepairBackupPersist,
             RequestPayload::RepairBackupPersist {
-                reservation_id,
-                draft_binding_sha256,
+                expected,
                 binding,
+                metadata,
                 input,
             },
             SuccessPayload::RepairBackupStatus(status),
         ) if status.validate().is_ok()
             && status.state() == RepairBackupState::Durable
-            && status.reservation_id() == reservation_id
-            && status.draft_binding_sha256() == draft_binding_sha256
+            && status.immutable_fields_match(expected)
+            && metadata.canonical_sha256() == *expected.metadata_sha256()
             && status.backup_size() == input.size
             && status.plan_id() == Some(binding.plan_id())
             && status.plan_sha256() == Some(binding.plan_sha256())
@@ -2104,29 +2110,22 @@ fn validate_success(
         #[cfg(feature = "experimental-repair-store")]
         (
             Operation::RepairBackupStatus,
-            RequestPayload::RepairBackupStatus {
-                reservation_id,
-                draft_binding_sha256,
-            },
+            RequestPayload::RepairBackupStatus { expected },
             SuccessPayload::RepairBackupStatus(status),
         ) if status.validate().is_ok()
-            && status.reservation_id() == reservation_id
-            && status.draft_binding_sha256() == draft_binding_sha256 =>
+            && status.immutable_fields_match(expected)
+            && status.state() == expected.state() =>
         {
             None
         }
         #[cfg(feature = "experimental-repair-store")]
         (
             Operation::RepairBackupGet,
-            RequestPayload::RepairBackupGet {
-                reservation_id,
-                draft_binding_sha256,
-            },
+            RequestPayload::RepairBackupGet { expected },
             SuccessPayload::RepairBackup(status, declaration),
         ) if status.validate().is_ok()
             && status.state() == RepairBackupState::Durable
-            && status.reservation_id() == reservation_id
-            && status.draft_binding_sha256() == draft_binding_sha256
+            && status.as_ref() == expected.as_ref()
             && declaration.kind == DescriptorType::RepairBackupOutputPipe
             && declaration.size == status.backup_size() =>
         {
@@ -2650,8 +2649,8 @@ mod tests {
     #[test]
     fn repair_broker_role_and_four_operations_are_closed_and_path_free() {
         use crate::rescue_repair_vault::{
-            RepairBackupBinding, RepairBackupStatusPayload, RepairReservationId,
-            repair_backup_output,
+            RepairBackupBinding, RepairBackupStatusPayload, RepairFileMetadataV1,
+            RepairReservationId, repair_backup_output,
         };
 
         let repair_allowlist = PeerAllowlist::builder(COMPANION_UID)
@@ -2675,13 +2674,15 @@ mod tests {
         );
 
         let hash = |byte: char| byte.to_string().repeat(64);
+        let metadata = RepairFileMetadataV1::new(0o644, 0, 0).expect("metadata");
+        let metadata_sha256 = metadata.canonical_sha256();
         let reserve = request(
             "repair.backup.reserve",
             &format!(
                 "{{\"sessionId\":\"S-session-1\",\"targetId\":\"target-1\",\"targetFingerprint\":\"{}\",\"expectedBackupSha256\":\"{}\",\"metadataSha256\":\"{}\",\"backupSize\":4096,\"requiredCapacityBytes\":8192}}",
                 hash('1'),
                 hash('2'),
-                hash('3')
+                metadata_sha256.as_str()
             ),
         );
         let reserve_request =
@@ -2712,14 +2713,14 @@ mod tests {
             8192,
             4096,
             Sha256::parse(&hash('2')).expect("hash"),
-            Sha256::parse(&hash('3')).expect("hash"),
+            metadata_sha256.clone(),
         )
         .expect("reserved backup");
         assert!(
             encode_success(
                 &reserve_request,
                 9,
-                &SuccessPayload::RepairBackupStatus(Box::new(reserved)),
+                &SuccessPayload::RepairBackupStatus(Box::new(reserved.clone())),
                 &[],
             )
             .is_ok()
@@ -2734,7 +2735,7 @@ mod tests {
             8192,
             4096,
             Sha256::parse(&hash('2')).expect("hash"),
-            Sha256::parse(&hash('3')).expect("hash"),
+            metadata_sha256.clone(),
         )
         .expect("shape-valid wrong binding");
         assert_eq!(
@@ -2757,7 +2758,7 @@ mod tests {
         .expect("binding");
         let durable = RepairBackupStatusPayload::durable(
             reservation.clone(),
-            Sha256::parse(&hash('7')).expect("hash"),
+            draft.draft_binding_sha256(),
             reservation.locator(),
             "V-0123456789abcdef0123456789abcdef",
             Sha256::parse(&hash('8')).expect("hash"),
@@ -2765,7 +2766,7 @@ mod tests {
             8192,
             4096,
             Sha256::parse(&hash('2')).expect("hash"),
-            Sha256::parse(&hash('3')).expect("hash"),
+            metadata_sha256,
             binding,
         )
         .expect("durable backup");
@@ -2773,9 +2774,9 @@ mod tests {
         let persist = request(
             "repair.backup.persist",
             &format!(
-                "{{\"reservationId\":\"{}\",\"draftBindingSha256\":\"{}\",\"planId\":\"P-plan-1\",\"planSha256\":\"{}\",\"approvalId\":\"A-approval-1\",\"approvalSha256\":\"{}\",\"resourceId\":\"rescue:selected-linux-root:etc/fstab\",\"resourceSha256\":\"{}\",\"input\":{{\"type\":\"repair-backup-input-pipe\",\"size\":4096}}}}",
-                reservation.as_str(),
-                hash('7'),
+                "{{\"expected\":{},\"metadata\":{},\"planId\":\"P-plan-1\",\"planSha256\":\"{}\",\"approvalId\":\"A-approval-1\",\"approvalSha256\":\"{}\",\"resourceId\":\"rescue:selected-linux-root:etc/fstab\",\"resourceSha256\":\"{}\",\"input\":{{\"type\":\"repair-backup-input-pipe\",\"size\":4096}}}}",
+                serde_json::to_string(&reserved).expect("reserved JSON"),
+                serde_json::to_string(&metadata).expect("metadata JSON"),
                 hash('4'),
                 hash('5'),
                 hash('6')
@@ -2801,9 +2802,8 @@ mod tests {
             let reference = request(
                 operation,
                 &format!(
-                    "{{\"reservationId\":\"{}\",\"draftBindingSha256\":\"{}\"}}",
-                    reservation.as_str(),
-                    hash('7')
+                    "{{\"expected\":{}}}",
+                    serde_json::to_string(&durable).expect("durable JSON")
                 ),
             );
             let request = decode_request(&reference, repair_peer(), Vec::new())

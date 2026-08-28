@@ -227,7 +227,10 @@
           "maximum": 16777216
         },
         "expectedBackupSha256": { "$ref": "#/$defs/sha256" },
-        "metadataSha256": { "$ref": "#/$defs/sha256" }
+        "metadataSha256": {
+          "allOf": [{ "$ref": "#/$defs/sha256" }],
+          "description": "Canonical KERNAID-REPAIR-FILE-METADATA-V1 digest bound by persist."
+        }
       }
     },
     "repairDurableBackup": {
@@ -277,7 +280,10 @@
           "maximum": 16777216
         },
         "expectedBackupSha256": { "$ref": "#/$defs/sha256" },
-        "metadataSha256": { "$ref": "#/$defs/sha256" },
+        "metadataSha256": {
+          "allOf": [{ "$ref": "#/$defs/sha256" }],
+          "description": "Canonical KERNAID-REPAIR-FILE-METADATA-V1 digest bound by persist."
+        },
         "planId": {
           "type": "string",
           "minLength": 3,
