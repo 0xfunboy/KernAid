@@ -60,7 +60,14 @@ LOOP_INFO64 = struct.Struct("=QQQQQIIII64s64s32sQQ")
 READY_LINE = b"KERNAID_RESCUE_READY"
 NOT_READY_LINE_PREFIX = b"KERNAID_RESCUE_NOT_READY:"
 FIRSTBOOT_RESULT_PATTERN = re.compile(
-    rb"(?:^|\r?\n)(?:"
+    rb"(?:^|\r?\n)"
+    # `StandardOutput=journal+console` preserves one bounded kernel-console
+    # prefix.  Accept only the exact firstboot unit identifier and numeric
+    # framing observed on the shipping console; arbitrary line prefixes stay
+    # unable to forge a terminal provisioning result.
+    rb"(?:\[[ ]{0,8}[0-9]{1,6}\.[0-9]{6}\] "
+    rb"kernaid-rescue-firstboot\[[1-9][0-9]{0,9}\]: )?"
+    rb"(?:"
     rb"KERNAID_RESCUE_FIRSTBOOT_ATTESTATION_V1 "
     rb"state=provisioned verified=true cleanup=complete "
     rb"luks_uuid=[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-"

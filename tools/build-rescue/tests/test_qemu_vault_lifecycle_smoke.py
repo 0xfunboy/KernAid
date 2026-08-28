@@ -2572,7 +2572,8 @@ class StaticContractTests(unittest.TestCase):
 
     def test_firstboot_result_requires_success_attestation(self) -> None:
         success = (
-            b"\nKERNAID_RESCUE_FIRSTBOOT_ATTESTATION_V1 state=provisioned "
+            b"\n[   81.726552] kernaid-rescue-firstboot[860]: "
+            b"KERNAID_RESCUE_FIRSTBOOT_ATTESTATION_V1 state=provisioned "
             b"verified=true cleanup=complete "
             b"luks_uuid=12345678-1234-4abc-8def-123456789abc "
             b"filesystem_uuid=abcdef01-2345-4abc-9def-123456789abc "
@@ -2589,6 +2590,14 @@ class StaticContractTests(unittest.TestCase):
         assert success_match is not None and failure_match is not None
         self.assertIsNone(success_match.group(1))
         self.assertEqual(failure_match.group(1), b"vault-profile-mismatch")
+        self.assertIsNone(
+            controller.FIRSTBOOT_RESULT_PATTERN.search(
+                success.replace(
+                    b"kernaid-rescue-firstboot[860]",
+                    b"untrusted-firstboot[860]",
+                )
+            )
+        )
 
         console = mock.Mock()
         console.wait_regex.return_value = failure_match
