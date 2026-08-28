@@ -458,6 +458,10 @@ fn valid_fixture_identifier(value: &str) -> bool {
 #[cfg(feature = "rescue-fstab-production-candidate")]
 pub const RESCUE_FSTAB_TYPED_CONFIRMATION: &str = "DISABILITA VOCE FSTAB";
 
+#[cfg(feature = "rescue-fstab-production-candidate")]
+const RESCUE_FSTAB_APPROVAL_HASH_DOMAIN: &[u8] =
+    b"kernaid:linux.fstab.disable-missing-uuid.v1:approval:v1\0";
+
 /// Immutable material admitted for the candidate approval transition.
 #[cfg(feature = "rescue-fstab-production-candidate")]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -599,6 +603,7 @@ pub struct RescueFstabCandidateAdmission {
     next_approval_sequence: u64,
     approval_id: Option<String>,
     approval_sequence: Option<u64>,
+    approval_sha256: Option<String>,
 }
 
 #[cfg(feature = "rescue-fstab-production-candidate")]
@@ -616,6 +621,7 @@ impl RescueFstabCandidateAdmission {
             next_approval_sequence,
             approval_id: None,
             approval_sequence: None,
+            approval_sha256: None,
         })
     }
 
@@ -639,6 +645,13 @@ impl RescueFstabCandidateAdmission {
         self.approval_sequence
     }
 
+    /// Canonical, domain-separated binding of the exact accepted approval.
+    /// It exists only after the single-use transition to `Approved` and is
+    /// suitable for the durable Repair Vault binding.
+    pub fn approval_sha256(&self) -> Option<&str> {
+        self.approval_sha256.as_deref()
+    }
+
     pub fn approve(
         &mut self,
         approval: &RescueFstabCandidateApproval,
@@ -656,11 +669,35 @@ impl RescueFstabCandidateAdmission {
             return Err(RescueFstabCandidateAdmissionError::TypedConfirmationMismatch);
         }
 
+        let approval_sha256 = rescue_fstab_approval_sha256(approval);
         self.approval_id = Some(approval.approval_id.clone());
         self.approval_sequence = Some(approval.approval_sequence);
+        self.approval_sha256 = Some(approval_sha256);
         self.state = RescueFstabCandidateAdmissionState::Approved;
         Ok(())
     }
+}
+
+#[cfg(feature = "rescue-fstab-production-candidate")]
+fn rescue_fstab_approval_sha256(approval: &RescueFstabCandidateApproval) -> String {
+    let mut digest = Sha256::new();
+    digest.update(RESCUE_FSTAB_APPROVAL_HASH_DOMAIN);
+    for value in [
+        approval.binding.session_id.as_str(),
+        approval.binding.plan_id.as_str(),
+        approval.binding.plan_hash.as_str(),
+        approval.binding.target_fingerprint.as_str(),
+        approval.binding.resource_precondition.as_str(),
+        RESCUE_FSTAB_RESOURCE_ID,
+        approval.approval_id.as_str(),
+    ] {
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value.as_bytes());
+    }
+    digest.update(approval.approval_sequence.to_be_bytes());
+    digest.update((approval.typed_confirmation.len() as u64).to_be_bytes());
+    digest.update(approval.typed_confirmation.as_bytes());
+    format!("sha256:{:x}", digest.finalize())
 }
 
 #[cfg(feature = "rescue-fstab-production-candidate")]
@@ -1581,6 +1618,7 @@ mod tests {
             )
             .expect("stage candidate");
         let binding = admission.binding().clone();
+        assert_eq!(admission.approval_sha256(), None);
 
         assert_eq!(
             RescueFstabCandidateApproval::new(
@@ -1674,6 +1712,9 @@ mod tests {
         );
         assert_eq!(admission.approval_id(), Some("A-rescue-1"));
         assert_eq!(admission.approval_sequence(), Some(7));
+        let approval_sha256 = admission.approval_sha256().expect("accepted approval hash");
+        assert!(valid_rescue_candidate_sha256(approval_sha256));
+        assert_eq!(approval_sha256, rescue_fstab_approval_sha256(&approval));
         assert_eq!(
             admission.approve(&approval),
             Err(RescueFstabCandidateAdmissionError::ApprovalReplay)

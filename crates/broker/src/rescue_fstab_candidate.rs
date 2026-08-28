@@ -307,6 +307,18 @@ impl<TargetGuard, Reservation> ApprovedRescueFstabTransaction<TargetGuard, Reser
             .expect("Approved admission always has an approval ID")
     }
 
+    pub fn approval_sequence(&self) -> u64 {
+        self.admission
+            .approval_sequence()
+            .expect("Approved admission always has an approval sequence")
+    }
+
+    pub fn approval_sha256(&self) -> &str {
+        self.admission
+            .approval_sha256()
+            .expect("Approved admission always has an approval hash")
+    }
+
     pub const fn target_guard(&self) -> &TargetGuard {
         &self.target_guard
     }
@@ -1001,6 +1013,8 @@ mod tests {
             .authorize(admission, deadline)
             .expect("exact later approval");
         assert_eq!(approved.approval_id(), APPROVAL_ID);
+        assert_eq!(approved.approval_sequence(), APPROVAL_SEQUENCE);
+        assert!(approved.approval_sha256().starts_with("sha256:"));
         assert_eq!(approved.backup_bytes(), FSTAB);
         assert_eq!(approved.metadata().mode(), 0o644);
         assert_ne!(approved.proposed_fstab(), FSTAB);
