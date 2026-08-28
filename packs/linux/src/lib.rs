@@ -11,6 +11,9 @@ pub mod production_candidate_contract;
 #[cfg(feature = "rescue-fstab-production-candidate")]
 pub mod rescue_fstab_candidate;
 
+#[cfg(feature = "rescue-fstab-production-candidate")]
+pub mod rescue_fstab_transaction_candidate;
+
 #[cfg(feature = "fixture-repair-lab")]
 pub mod action_contract;
 

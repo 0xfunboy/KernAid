@@ -44,6 +44,13 @@ before any write and retain descriptors across every identity checkpoint. The
 first version accepts only a simple, clean, directly mounted ext4 target. More
 complex storage remains read-only.
 
+The feature-gated Rust candidate now includes a pure immutable transaction-plan
+binding for the preview hashes, selected-target scan identity, target physical
+parent, authenticated boot-Vault identity, Vault physical parent and diagnostic
+evidence hash. It rejects equal physical parents and path-like capability IDs.
+This is admission material only: it has no I/O, approval transition, broker
+dispatch or mutation handler.
+
 ## Backup boundary
 
 The pre-change `fstab` bytes and supported metadata must be written to the
@@ -92,3 +99,9 @@ Rescue image or default broker may enable it until all of these are true:
 - the exact image passes BIOS and UEFI repair/rollback qualification; and
 - physical USB testing proves separate-device backup and power-loss recovery
   on the supported hardware matrix.
+
+In particular, Phase 0 remains diagnosis-only under `AGENTS.md`. A production
+handler cannot be added merely by enabling this candidate feature. Promotion
+requires a formal phase/policy change plus production target-locator and Vault
+backup capabilities, then reuse or generalization of the already exercised
+fixture transaction/broker state machine.
