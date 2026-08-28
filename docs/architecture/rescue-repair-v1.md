@@ -5,6 +5,14 @@ default/stable image remains diagnosis-only. This document describes the gated
 candidate implementation, not a claim that a shipping image can repair a
 customer filesystem.
 
+The source-level write isolation described here landed in
+[`bf7beca257ea19273b546a3b49a3dbc8728036d0`](https://github.com/0xfunboy/KernAid/commit/bf7beca257ea19273b546a3b49a3dbc8728036d0).
+The currently listed private repair ISO was built earlier, from
+[`fcb81ab98d7fcadbda208654ba4eb667a8f323de`](https://github.com/0xfunboy/KernAid/commit/fcb81ab98d7fcadbda208654ba4eb667a8f323de),
+and does **not** contain the separate write helper or tightened `repaird`
+sandbox. It remains the listed artifact until a newer build completes and is
+recorded with exact-image evidence.
+
 ## First supported action
 
 `linux.fstab.disable-missing-uuid.v1` is an R2 Rescue-only action for one
@@ -36,7 +44,11 @@ Core stages that exact plan; local user sees target, diff and backup destination
         |
 separate approval bound to the complete plan
         |
-persist/read back backup -> target recheck -> atomic edit -> validation
+persist/read back backup -> target recheck
+        |
+separate root helper consumes Vault lease and returns one detached RW mount
+        |
+atomic edit -> validation
         |
 durable terminal receipt or automatic restore
 ```
@@ -83,28 +95,48 @@ pipes, verifies exact size, EOF, SHA-256, allocation and named readback,
 journals crash boundaries, and keeps durable identity stable across reboot
 while treating the kernel physical-parent claim as live authority for
 reserve-to-persist. The default daemon ABI remains unchanged. The separate
-off-default v1alpha2 target handoff performs three matching fresh resolutions and transfers
-a read-only leaf FD, an `O_PATH` physical-parent identity FD, a sealed bounded
-UUID-inventory memfd and an unattached `ro,noload` ext4 mount over a fixed
-root-owned `SOCK_SEQPACKET` endpoint. A strict Rust client validates the complete
+off-default v1alpha2 read-only target handoff performs three matching fresh
+resolutions and transfers exactly four descriptors over a fixed root-owned
+`SOCK_SEQPACKET` endpoint: a read-only leaf FD, an `O_PATH` physical-parent
+identity FD, a sealed bounded UUID-inventory memfd and an unattached
+`ro,noload` ext4 mount. A strict Rust client validates the complete four-FD
 bundle. The observer and physical-parent guard consume those capabilities and
-do not open `/dev` or `/sys`. A dedicated system account and hardened static
-unit files are packaged for qualification. The feature-gated Vault daemon
-resolves and allowlists only that exact private account. The candidate image
-now adds a persistent
-unprivileged repair daemon, strict local `SOCK_SEQPACKET` control plane, bounded
-single-authority state machine and dedicated UI group. Its executor persists
-and reads back the Vault backup before acquiring write authority, mounts only
-the retained ext4 target privately, uses an atomic exchange, verifies exact
-bytes/metadata and restores automatically on failure. These components are
-absent from the default/stable image.
+do not open `/dev` or `/sys`.
+
+Write authority crosses a different root-owned, socket-activated
+`SOCK_SEQPACKET` endpoint. The unprivileged daemon can request it only for one
+already durable Pending transaction, using its opaque reservation ID and exact
+transaction binding. The write helper first consumes that transaction's
+boot-scoped, single-use Vault lease, obtains its approval-bound stable recovery
+fingerprint, resolves the target three times from fresh current-boot state,
+creates one detached read-write ext4 mount, closes its raw leaf and parent FDs
+and transfers only the mount FD. Once the request has been sent, every failure
+is treated as ambiguous lease consumption and requires reconciliation; it is
+never retried or converted into cancellation authority.
+
+A dedicated system account and hardened static unit files are packaged for
+qualification. The feature-gated Vault daemon resolves and allowlists only
+that exact private account. `repaird` runs with `PrivateDevices=yes` and a
+closed device policy, with no `DeviceAllow` and no `CAP_SYS_ADMIN`; the executor
+no longer creates a mount or receives a raw block device. The candidate image
+also adds a persistent unprivileged repair daemon, strict local
+`SOCK_SEQPACKET` control plane, bounded single-authority state machine and
+dedicated UI group. Its executor persists and reads back the Vault backup
+before acquiring the single write-mount capability, uses an atomic exchange,
+verifies exact bytes and metadata, and restores automatically on failure.
+These components are absent from the default/stable image.
 
 On startup the candidate daemon treats recovery as a readiness barrier. It
-queries the single unresolved transaction, authenticates the live Vault
-identity/physical parent, reacquires the target only by its stable recovery
-fingerprint and classifies the resource as exact `Before`, exact `After` or a
-third state. `Before` closes unchanged, `After` restores the authenticated
-backup, and a third or ambiguous state becomes manual without any overwrite.
+queries the single unresolved transaction and authenticates the live Vault
+identity and physical parent. Post-reboot target reacquisition uses only the
+approval-bound stable recovery fingerprint: the read-only helper resolves it
+three times from fresh current-boot discovery and transfers a newly validated
+four-FD bundle. The daemon classifies the resource as exact `Before`, exact
+`After` or a third state. `Before` closes unchanged; for `After`, the separate
+write helper consumes the current boot's lease and independently repeats the
+stable-fingerprint triple resolution before returning the one RW mount used to
+restore the authenticated backup. A third or ambiguous state becomes manual
+without any overwrite.
 
 Vault and broker candidate builds now share one pure, feature-gated V1 formula
 for the physical-parent digest, including raw and `sha256:` renderings. Kernel
@@ -134,8 +166,10 @@ while a stale reserved write capability cannot be resumed across a changed
 physical-parent epoch.
 
 The Vault now atomically consumes one transaction-bound repair write lease per
-boot epoch. The lease is boot-scoped and single-use; it does not make a durable
-reservation or backup into reusable write authority after reboot.
+boot epoch. Only the separate write root helper consumes it, before resolving
+devices or creating the detached RW mount. The lease is boot-scoped and
+single-use; it does not make a durable reservation or backup into reusable
+write authority after reboot.
 
 Reserved capacity can be cancelled with the stable reservation ID plus its
 exact draft binding without re-minting live-parent write authority. Durable
@@ -165,8 +199,10 @@ generation installs.
 6. Recheck the held target and Vault identities and fingerprints.
 7. Persist and read back the original bytes, metadata and transaction intent
    in the vault.
-8. Mount only the selected target privately and read-write for the bounded
-   operation.
+8. Drop the read-only target bundle, then use the separate root-helper socket
+   to consume the single-use Vault lease, resolve the stable recovery
+   fingerprint three times from fresh current-boot state and receive only one
+   detached read-write mount FD.
 9. Install the locally derived replacement atomically, then fsync the file and
    containing directory.
 10. Parse and byte-verify the installed `fstab`, repeat diagnosis and confirm
@@ -191,12 +227,10 @@ Rescue image or default broker may enable it until all of these are true:
 - the exact image passes BIOS and UEFI repair/rollback qualification; and
 - physical USB testing proves separate-device backup and power-loss recovery
   on the supported hardware matrix;
-- the read-write mount/executor no longer acquires its target directly and is
-  migrated to a narrowly typed root-helper capability; only then can the
-  repair daemon's still-broad block-device sandbox be closed; and
 - Secure Boot is qualified for the exact promoted image.
 
 In particular, Phase 0 remains diagnosis-only under `AGENTS.md`. A production
 handler cannot become shipping merely by enabling this candidate feature.
-Promotion requires the remaining isolation and physical qualification gates,
-an explicit policy/release decision and an exact candidate-image promotion.
+Promotion requires the remaining QEMU repair, destructive power-loss, physical
+and Secure Boot qualification gates, an explicit policy/release decision and
+an exact candidate-image promotion.

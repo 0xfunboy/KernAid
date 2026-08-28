@@ -45,7 +45,7 @@ WinPE Companion and Fleet management remain later milestones.
 | Rescue provider plumbing | Feature-gated OpenAI executor and loopback relay are implemented, but live TLS and a real-account lifecycle are not yet qualified |
 | Virtual testing | Disposable QEMU fixtures, byte-level mutation checks, BIOS/UEFI boot and two-boot USB/vault coverage |
 | Repair experiment | Linux-only feature-gated Desk lab for one typed R2 repair and separately approved rollback on an internal temporary fixture. It now traverses the standard `SessionDriver`, Agent Gateway, explicit Core transaction states and typed broker; it remains absent from normal/Rescue builds and disconnected from production targets |
-| Feature-gated Rescue repair candidate | The off-default candidate implements one ext4-only path for disabling a non-critical `fstab` entry whose UUID is freshly proven missing: closed repair daemon and UI, broker-owned observation/plan preparation, distinct-device Vault backup, exact Core approval, bounded atomic replacement, verification, automatic restore and crash/reboot reconciliation. Its root helper v1alpha2 hands off a read-only leaf, an `O_PATH` physical-parent identity, a sealed UUID-inventory memfd and a detached read-only mount; the observer and parent guard no longer open `/dev` or `/sys`. The Vault also has a boot-scoped, single-consumption write lease. None of this is present in the default/stable Rescue image, which remains diagnosis-only. The candidate is not isolation-qualified, physically qualified or promoted. |
+| Feature-gated Rescue repair candidate | The off-default candidate implements one ext4-only path for disabling a non-critical `fstab` entry whose UUID is freshly proven missing: closed repair daemon and UI, broker-owned observation/plan preparation, distinct-device Vault backup, exact Core approval, bounded atomic replacement, verification, automatic restore and crash/reboot reconciliation. Its v1alpha2 read-only root helper transfers an exact four-FD bundle: a read-only leaf, an `O_PATH` physical-parent identity, a sealed UUID-inventory memfd and a detached `ro,noload` ext4 mount. After the transaction is durable Pending, a separate write-helper socket consumes the Vault's boot-scoped, single-use write lease, resolves the stable recovery fingerprint three times against fresh current-boot claims and transfers only one detached read-write mount; raw block FDs stay inside the root helper. `repaird` now has `PrivateDevices=yes`, no `DeviceAllow` and no `CAP_SYS_ADMIN`; its observer and parent guard do not open `/dev` or `/sys`. None of this is present in the default/stable Rescue image, which remains diagnosis-only. The candidate is not exact-image repair-qualified, physically qualified or promoted. |
 | Rescue first boot | The promoted image provisions an all-zero p3 into the canonical LUKS2/ext4 Vault, seeds its identity and Codex home, closes it and verifies the locked profile; the exact flow passed two-boot BIOS/UEFI QEMU qualification |
 | Release channel | Canonical Release Channel v1, anti-rollback links, strict verification and an immutable internal prerelease are active through sequence 2; this is not an automatic updater or signed production channel |
 
@@ -59,11 +59,12 @@ treated as a newer release.
 - There is no mutation handler in the default/stable product and no supported
   customer-machine repair path. The only real handler is the explicitly
   feature-gated `fstab` candidate.
-- The candidate build profile wires its dedicated repair account, socket-activated
-  control plane, UI, executor and startup recovery barrier. Read-only discovery
-  and observation now use the root helper's narrow descriptor bundle, but the
-  read-write mount/executor path has not yet been migrated to that helper. The
-  repair daemon sandbox therefore remains broader than the promotion target.
+- The source candidate wires its dedicated repair account, socket-activated
+  control plane, UI, executor and startup recovery barrier. Both read-only
+  observation and post-lease read-write mounting now cross narrowly typed root
+  helper sockets, and the repair daemon's device and mount privileges have been
+  removed. This newer isolation is not yet present in the private artifact
+  listed below and remains unqualified until an exact new build is tested.
 - Repair Vault retention, crash-safe compaction and pending-transaction
   reconciliation are implemented; customer retention policy and destructive
   power-loss qualification remain promotion gates.
@@ -130,6 +131,14 @@ A separate, private repair candidate was built from
 It does **not** replace the stable retail image or the promoted internal release
 above.
 
+The newer source isolation landed in
+[`bf7beca257ea19273b546a3b49a3dbc8728036d0`](https://github.com/0xfunboy/KernAid/commit/bf7beca257ea19273b546a3b49a3dbc8728036d0),
+after this ISO was built. The `fcb81ab` artifact therefore does **not** contain
+the separate write-helper socket, post-lease write-mount handoff or tightened
+`repaird` device sandbox. It remains the private candidate listed here until a
+new build completes and its exact checksum and evidence replace this entry; do
+not attribute the newer isolation to the ISO below.
+
 | Field | Exact value |
 | --- | --- |
 | Workflow | [Repair candidate run 33179291646](https://github.com/0xfunboy/KernAid/actions/runs/33179291646) |
@@ -163,8 +172,9 @@ passed; signing, notarization and physical-machine qualification remain open.
 2. Finish the real-account Rescue provider/vault lifecycle without exposing or
    copying the CLI credential store.
 3. Qualify Secure Boot and signed release delivery.
-4. Migrate the read-write mount/executor to a narrow root-helper capability,
-   then finish tightening the repair daemon sandbox before promotion.
+4. Build a new exact repair candidate from `bf7beca` or later and qualify it in
+   disposable two-disk BIOS/UEFI QEMU for repair, rollback, interrupted-process
+   and reboot reconciliation, and destructive power-loss recovery.
 5. Add and qualify the signed consumer/update path on top of the verified
    internal Release Channel v1 sequence.
 6. Qualify the exact repair-candidate image on disposable two-device hardware,
