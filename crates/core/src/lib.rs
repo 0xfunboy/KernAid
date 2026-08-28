@@ -9,6 +9,11 @@ use kernaid_evidence::{
 #[cfg(feature = "fixture-repair-lab")]
 use kernaid_policy::validate_fixture_repair_lab_plan as validate_fixture_repair_lab_policy;
 use kernaid_policy::{PolicyError, validate_phase_zero};
+#[cfg(feature = "rescue-fstab-production-candidate")]
+use kernaid_policy::{
+    RESCUE_FSTAB_RESOURCE_ID,
+    validate_rescue_fstab_production_candidate_plan as validate_rescue_fstab_candidate_policy,
+};
 use kernaid_protocol::ValidatedPlan;
 use sha2::{Digest, Sha256};
 use std::{collections::HashSet, error::Error, fmt};
@@ -21,6 +26,17 @@ pub fn validate_fixture_repair_lab_plan(
     target_fingerprint: &str,
 ) -> Result<(), PolicyError> {
     validate_fixture_repair_lab_policy(plan, target_fingerprint)
+}
+
+/// Apply Core's admission-only boundary to the disabled Rescue `fstab`
+/// production candidate. This validates metadata and cannot dispatch a broker
+/// action or touch a filesystem.
+#[cfg(feature = "rescue-fstab-production-candidate")]
+pub fn validate_rescue_fstab_production_candidate_plan(
+    plan: &ValidatedPlan,
+    target_fingerprint: &str,
+) -> Result<(), PolicyError> {
+    validate_rescue_fstab_candidate_policy(plan, target_fingerprint)
 }
 
 /// Immutable broker-derived bindings for one fixture-only R2 mutation.
@@ -438,6 +454,275 @@ fn valid_fixture_identifier(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
 }
 
+/// Exact local confirmation required by the disabled R2 candidate.
+#[cfg(feature = "rescue-fstab-production-candidate")]
+pub const RESCUE_FSTAB_TYPED_CONFIRMATION: &str = "DISABILITA VOCE FSTAB";
+
+/// Immutable material admitted for the candidate approval transition.
+#[cfg(feature = "rescue-fstab-production-candidate")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RescueFstabCandidateBinding {
+    session_id: String,
+    plan_id: String,
+    plan_hash: String,
+    target_fingerprint: String,
+    resource_precondition: String,
+}
+
+#[cfg(feature = "rescue-fstab-production-candidate")]
+impl RescueFstabCandidateBinding {
+    pub fn new(
+        session_id: impl Into<String>,
+        plan_id: impl Into<String>,
+        plan_hash: impl Into<String>,
+        target_fingerprint: impl Into<String>,
+        resource_precondition: impl Into<String>,
+    ) -> Result<Self, RescueFstabCandidateAdmissionError> {
+        let binding = Self {
+            session_id: session_id.into(),
+            plan_id: plan_id.into(),
+            plan_hash: plan_hash.into(),
+            target_fingerprint: target_fingerprint.into(),
+            resource_precondition: resource_precondition.into(),
+        };
+        if !valid_rescue_candidate_id(&binding.session_id, "S-")
+            || !valid_rescue_candidate_id(&binding.plan_id, "P-")
+            || !valid_rescue_candidate_sha256(&binding.plan_hash)
+            || !valid_rescue_candidate_sha256(&binding.target_fingerprint)
+            || !valid_rescue_candidate_sha256(&binding.resource_precondition)
+        {
+            return Err(RescueFstabCandidateAdmissionError::InvalidBinding);
+        }
+        Ok(binding)
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub fn plan_id(&self) -> &str {
+        &self.plan_id
+    }
+
+    pub fn plan_hash(&self) -> &str {
+        &self.plan_hash
+    }
+
+    pub fn target_fingerprint(&self) -> &str {
+        &self.target_fingerprint
+    }
+
+    pub const fn resource_id(&self) -> &'static str {
+        RESCUE_FSTAB_RESOURCE_ID
+    }
+
+    /// SHA-256 of the exact selected-root `fstab` snapshot that must still
+    /// match before any later execution layer could write the resource.
+    pub fn resource_precondition(&self) -> &str {
+        &self.resource_precondition
+    }
+
+    /// Schema-aligned alias for [`Self::resource_precondition`].
+    pub fn target_snapshot(&self) -> &str {
+        self.resource_precondition()
+    }
+}
+
+/// Caller-presented approval proof. Every mutable field is compared with the
+/// immutable staged binding before the approval state can advance.
+#[cfg(feature = "rescue-fstab-production-candidate")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RescueFstabCandidateApproval {
+    binding: RescueFstabCandidateBinding,
+    approval_id: String,
+    approval_sequence: u64,
+    typed_confirmation: String,
+}
+
+#[cfg(feature = "rescue-fstab-production-candidate")]
+impl RescueFstabCandidateApproval {
+    pub fn new(
+        binding: RescueFstabCandidateBinding,
+        approval_id: impl Into<String>,
+        approval_sequence: u64,
+        typed_confirmation: impl Into<String>,
+    ) -> Result<Self, RescueFstabCandidateAdmissionError> {
+        let approval = Self {
+            binding,
+            approval_id: approval_id.into(),
+            approval_sequence,
+            typed_confirmation: typed_confirmation.into(),
+        };
+        if !valid_rescue_candidate_id(&approval.approval_id, "A-")
+            || approval.approval_sequence == 0
+        {
+            return Err(RescueFstabCandidateAdmissionError::InvalidApproval);
+        }
+        Ok(approval)
+    }
+
+    pub fn binding(&self) -> &RescueFstabCandidateBinding {
+        &self.binding
+    }
+
+    pub fn session_id(&self) -> &str {
+        self.binding.session_id()
+    }
+
+    pub fn approval_id(&self) -> &str {
+        &self.approval_id
+    }
+
+    pub const fn approval_sequence(&self) -> u64 {
+        self.approval_sequence
+    }
+
+    pub fn typed_confirmation(&self) -> &str {
+        &self.typed_confirmation
+    }
+}
+
+#[cfg(feature = "rescue-fstab-production-candidate")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RescueFstabCandidateAdmissionState {
+    Staged,
+    Approved,
+}
+
+/// Admission and approval state only. There is intentionally no execute,
+/// repair, verify, rollback, broker, or filesystem transition on this type.
+#[cfg(feature = "rescue-fstab-production-candidate")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RescueFstabCandidateAdmission {
+    binding: RescueFstabCandidateBinding,
+    state: RescueFstabCandidateAdmissionState,
+    next_approval_sequence: u64,
+    approval_id: Option<String>,
+    approval_sequence: Option<u64>,
+}
+
+#[cfg(feature = "rescue-fstab-production-candidate")]
+impl RescueFstabCandidateAdmission {
+    fn stage(
+        binding: RescueFstabCandidateBinding,
+        last_approval_sequence: u64,
+    ) -> Result<Self, RescueFstabCandidateAdmissionError> {
+        let next_approval_sequence = last_approval_sequence
+            .checked_add(1)
+            .ok_or(RescueFstabCandidateAdmissionError::SequenceExhausted)?;
+        Ok(Self {
+            binding,
+            state: RescueFstabCandidateAdmissionState::Staged,
+            next_approval_sequence,
+            approval_id: None,
+            approval_sequence: None,
+        })
+    }
+
+    pub const fn state(&self) -> RescueFstabCandidateAdmissionState {
+        self.state
+    }
+
+    pub fn binding(&self) -> &RescueFstabCandidateBinding {
+        &self.binding
+    }
+
+    pub const fn next_approval_sequence(&self) -> u64 {
+        self.next_approval_sequence
+    }
+
+    pub fn approval_id(&self) -> Option<&str> {
+        self.approval_id.as_deref()
+    }
+
+    pub const fn approval_sequence(&self) -> Option<u64> {
+        self.approval_sequence
+    }
+
+    pub fn approve(
+        &mut self,
+        approval: &RescueFstabCandidateApproval,
+    ) -> Result<(), RescueFstabCandidateAdmissionError> {
+        if self.state != RescueFstabCandidateAdmissionState::Staged {
+            return Err(RescueFstabCandidateAdmissionError::ApprovalReplay);
+        }
+        if approval.binding != self.binding {
+            return Err(RescueFstabCandidateAdmissionError::BindingMismatch);
+        }
+        if approval.approval_sequence != self.next_approval_sequence {
+            return Err(RescueFstabCandidateAdmissionError::NonMonotonicApproval);
+        }
+        if approval.typed_confirmation != RESCUE_FSTAB_TYPED_CONFIRMATION {
+            return Err(RescueFstabCandidateAdmissionError::TypedConfirmationMismatch);
+        }
+
+        self.approval_id = Some(approval.approval_id.clone());
+        self.approval_sequence = Some(approval.approval_sequence);
+        self.state = RescueFstabCandidateAdmissionState::Approved;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "rescue-fstab-production-candidate")]
+#[derive(Debug, PartialEq, Eq)]
+pub enum RescueFstabCandidateAdmissionError {
+    InvalidSessionState,
+    WrongSessionMode,
+    PolicyRejected(PolicyError),
+    InvalidBinding,
+    InvalidApproval,
+    BindingMismatch,
+    NonMonotonicApproval,
+    TypedConfirmationMismatch,
+    ApprovalReplay,
+    SequenceExhausted,
+}
+
+#[cfg(feature = "rescue-fstab-production-candidate")]
+impl fmt::Display for RescueFstabCandidateAdmissionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidSessionState => "Rescue fstab candidate admission is outside Diagnose",
+            Self::WrongSessionMode => "Rescue fstab candidate requires LinuxRescue mode",
+            Self::PolicyRejected(_) => "Rescue fstab candidate policy rejected the plan",
+            Self::InvalidBinding => "Rescue fstab candidate binding is invalid",
+            Self::InvalidApproval => "Rescue fstab candidate approval is invalid",
+            Self::BindingMismatch => "Rescue fstab candidate approval binding does not match",
+            Self::NonMonotonicApproval => "Rescue fstab approval sequence is not next",
+            Self::TypedConfirmationMismatch => {
+                "Rescue fstab candidate requires the exact typed confirmation"
+            }
+            Self::ApprovalReplay => "Rescue fstab candidate approval was already consumed",
+            Self::SequenceExhausted => "Rescue fstab approval sequence is exhausted",
+        })
+    }
+}
+
+#[cfg(feature = "rescue-fstab-production-candidate")]
+impl Error for RescueFstabCandidateAdmissionError {}
+
+#[cfg(feature = "rescue-fstab-production-candidate")]
+fn valid_rescue_candidate_sha256(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+#[cfg(feature = "rescue-fstab-production-candidate")]
+fn valid_rescue_candidate_id(value: &str, prefix: &str) -> bool {
+    let Some(suffix) = value.strip_prefix(prefix) else {
+        return false;
+    };
+    !suffix.is_empty()
+        && value.len() <= 128
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum State {
     Observe,
@@ -691,6 +976,39 @@ impl Session {
         self.state = State::Plan;
         Ok(())
     }
+
+    /// Stage admission metadata for the disabled Rescue `fstab` candidate.
+    ///
+    /// A successful call advances only to `Plan` and returns an approval-only
+    /// state object. It cannot execute or dispatch the action.
+    #[cfg(feature = "rescue-fstab-production-candidate")]
+    pub fn stage_rescue_fstab_production_candidate(
+        &mut self,
+        plan: &ValidatedPlan,
+        session_id: impl Into<String>,
+        plan_hash: impl Into<String>,
+        resource_precondition: impl Into<String>,
+        last_approval_sequence: u64,
+    ) -> Result<RescueFstabCandidateAdmission, RescueFstabCandidateAdmissionError> {
+        if self.state != State::Diagnose {
+            return Err(RescueFstabCandidateAdmissionError::InvalidSessionState);
+        }
+        if self.mode != SessionMode::LinuxRescue {
+            return Err(RescueFstabCandidateAdmissionError::WrongSessionMode);
+        }
+        validate_rescue_fstab_production_candidate_plan(plan, &self.fingerprint)
+            .map_err(RescueFstabCandidateAdmissionError::PolicyRejected)?;
+        let binding = RescueFstabCandidateBinding::new(
+            session_id,
+            plan.plan_id.clone(),
+            plan_hash,
+            plan.target_fingerprint.clone(),
+            resource_precondition,
+        )?;
+        let admission = RescueFstabCandidateAdmission::stage(binding, last_approval_sequence)?;
+        self.state = State::Plan;
+        Ok(admission)
+    }
 }
 
 pub const LINUX_RESIDENT_P0_COLLECTORS: [&str; 9] = [
@@ -837,6 +1155,58 @@ mod tests {
                 rollback: None,
             }],
         }
+    }
+
+    #[cfg(feature = "rescue-fstab-production-candidate")]
+    const RESCUE_CANDIDATE_TARGET: &str =
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[cfg(feature = "rescue-fstab-production-candidate")]
+    const RESCUE_CANDIDATE_PLAN_HASH: &str =
+        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    #[cfg(feature = "rescue-fstab-production-candidate")]
+    const RESCUE_CANDIDATE_TARGET_SNAPSHOT: &str =
+        "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+    #[cfg(feature = "rescue-fstab-production-candidate")]
+    fn rescue_candidate_plan() -> ValidatedPlan {
+        use kernaid_policy::{
+            RESCUE_FSTAB_ACTION_ID, RESCUE_FSTAB_BACKUP, RESCUE_FSTAB_EVIDENCE_IDS,
+            RESCUE_FSTAB_PREFLIGHT_ID, RESCUE_FSTAB_ROLLBACK_ID, RESCUE_FSTAB_VALIDATION_ID,
+        };
+
+        ValidatedPlan {
+            plan_id: "P-rescue-fstab-candidate".to_owned(),
+            target_fingerprint: RESCUE_CANDIDATE_TARGET.to_owned(),
+            steps: vec![ActionStep {
+                action: RESCUE_FSTAB_ACTION_ID.to_owned(),
+                risk: Risk::R2,
+                target_fingerprint: RESCUE_CANDIDATE_TARGET.to_owned(),
+                evidence_ids: RESCUE_FSTAB_EVIDENCE_IDS
+                    .iter()
+                    .map(|value| (*value).to_owned())
+                    .collect(),
+                preconditions: vec![RESCUE_FSTAB_PREFLIGHT_ID.to_owned()],
+                backup: Some(RESCUE_FSTAB_BACKUP.to_owned()),
+                validation: RESCUE_FSTAB_VALIDATION_ID.to_owned(),
+                rollback: Some(RESCUE_FSTAB_ROLLBACK_ID.to_owned()),
+            }],
+        }
+    }
+
+    #[cfg(feature = "rescue-fstab-production-candidate")]
+    fn diagnosed_rescue_candidate_session() -> Session {
+        let bytes = envelope(LinuxSnapshotCapture::rescue());
+        let snapshot = evidence("selected-installed-target", &bytes);
+        let mut session = Session::new(RESCUE_CANDIDATE_TARGET, SessionMode::LinuxRescue);
+        session
+            .admit_linux_snapshot(&snapshot, &bytes)
+            .expect("admit Rescue snapshot");
+        session
+            .linux_evidence_complete(std::slice::from_ref(&snapshot))
+            .expect("complete Rescue evidence");
+        session
     }
 
     #[cfg(feature = "fixture-repair-lab")]
@@ -1071,6 +1441,243 @@ mod tests {
             );
             assert_eq!(session.state(), &State::Observe);
         }
+    }
+
+    #[cfg(feature = "rescue-fstab-production-candidate")]
+    #[test]
+    fn rescue_candidate_has_a_separate_rescue_diagnose_only_entrypoint() {
+        let plan = rescue_candidate_plan();
+        let mut normal_phase_zero = diagnosed_rescue_candidate_session();
+        assert_eq!(
+            normal_phase_zero.stage(&plan),
+            Err(PolicyError::MutationDisabled)
+        );
+        assert_eq!(normal_phase_zero.state(), &State::Diagnose);
+
+        let mut observe = Session::new(RESCUE_CANDIDATE_TARGET, SessionMode::LinuxRescue);
+        assert_eq!(
+            observe.stage_rescue_fstab_production_candidate(
+                &plan,
+                "S-rescue-1",
+                RESCUE_CANDIDATE_PLAN_HASH,
+                RESCUE_CANDIDATE_TARGET_SNAPSHOT,
+                6,
+            ),
+            Err(RescueFstabCandidateAdmissionError::InvalidSessionState)
+        );
+
+        let mut non_rescue = Session::new(RESCUE_CANDIDATE_TARGET, SessionMode::NonLinux);
+        non_rescue.evidence_complete().expect("enter Diagnose");
+        assert_eq!(
+            non_rescue.stage_rescue_fstab_production_candidate(
+                &plan,
+                "S-rescue-1",
+                RESCUE_CANDIDATE_PLAN_HASH,
+                RESCUE_CANDIDATE_TARGET_SNAPSHOT,
+                6,
+            ),
+            Err(RescueFstabCandidateAdmissionError::WrongSessionMode)
+        );
+
+        let mut rescue = diagnosed_rescue_candidate_session();
+        let admission = rescue
+            .stage_rescue_fstab_production_candidate(
+                &plan,
+                "S-rescue-1",
+                RESCUE_CANDIDATE_PLAN_HASH,
+                RESCUE_CANDIDATE_TARGET_SNAPSHOT,
+                6,
+            )
+            .expect("stage admission metadata only");
+        assert_eq!(rescue.state(), &State::Plan);
+        assert_eq!(
+            admission.state(),
+            RescueFstabCandidateAdmissionState::Staged
+        );
+        assert_eq!(admission.next_approval_sequence(), 7);
+        assert_eq!(admission.binding().session_id(), "S-rescue-1");
+        assert_eq!(admission.binding().plan_id(), plan.plan_id);
+        assert_eq!(admission.binding().plan_hash(), RESCUE_CANDIDATE_PLAN_HASH);
+        assert_eq!(
+            admission.binding().target_fingerprint(),
+            RESCUE_CANDIDATE_TARGET
+        );
+        assert_eq!(
+            admission.binding().target_snapshot(),
+            RESCUE_CANDIDATE_TARGET_SNAPSHOT
+        );
+        assert_eq!(admission.binding().resource_id(), RESCUE_FSTAB_RESOURCE_ID);
+    }
+
+    #[cfg(feature = "rescue-fstab-production-candidate")]
+    #[test]
+    fn rescue_candidate_rejects_invalid_binding_and_policy_without_staging() {
+        let plan = rescue_candidate_plan();
+        let mut session = diagnosed_rescue_candidate_session();
+        assert_eq!(
+            session.stage_rescue_fstab_production_candidate(
+                &plan,
+                "session-without-type",
+                RESCUE_CANDIDATE_PLAN_HASH,
+                RESCUE_CANDIDATE_TARGET_SNAPSHOT,
+                6,
+            ),
+            Err(RescueFstabCandidateAdmissionError::InvalidBinding)
+        );
+        assert_eq!(session.state(), &State::Diagnose);
+
+        assert_eq!(
+            session.stage_rescue_fstab_production_candidate(
+                &plan,
+                "S-rescue-1",
+                "sha256:not-a-hash",
+                RESCUE_CANDIDATE_TARGET_SNAPSHOT,
+                6,
+            ),
+            Err(RescueFstabCandidateAdmissionError::InvalidBinding)
+        );
+        assert_eq!(session.state(), &State::Diagnose);
+
+        assert_eq!(
+            session.stage_rescue_fstab_production_candidate(
+                &plan,
+                "S-rescue-1",
+                RESCUE_CANDIDATE_PLAN_HASH,
+                RESCUE_CANDIDATE_TARGET_SNAPSHOT,
+                u64::MAX,
+            ),
+            Err(RescueFstabCandidateAdmissionError::SequenceExhausted)
+        );
+        assert_eq!(session.state(), &State::Diagnose);
+
+        let mut drifted = plan;
+        drifted.steps[0].evidence_ids.reverse();
+        assert_eq!(
+            session.stage_rescue_fstab_production_candidate(
+                &drifted,
+                "S-rescue-1",
+                RESCUE_CANDIDATE_PLAN_HASH,
+                RESCUE_CANDIDATE_TARGET_SNAPSHOT,
+                6,
+            ),
+            Err(RescueFstabCandidateAdmissionError::PolicyRejected(
+                PolicyError::InvalidRescueFstabEvidence
+            ))
+        );
+        assert_eq!(session.state(), &State::Diagnose);
+    }
+
+    #[cfg(feature = "rescue-fstab-production-candidate")]
+    #[test]
+    fn rescue_candidate_approval_is_exact_bound_fresh_and_single_use() {
+        let mut session = diagnosed_rescue_candidate_session();
+        let mut admission = session
+            .stage_rescue_fstab_production_candidate(
+                &rescue_candidate_plan(),
+                "S-rescue-1",
+                RESCUE_CANDIDATE_PLAN_HASH,
+                RESCUE_CANDIDATE_TARGET_SNAPSHOT,
+                6,
+            )
+            .expect("stage candidate");
+        let binding = admission.binding().clone();
+
+        assert_eq!(
+            RescueFstabCandidateApproval::new(
+                binding.clone(),
+                "A-rescue-1",
+                0,
+                RESCUE_FSTAB_TYPED_CONFIRMATION,
+            ),
+            Err(RescueFstabCandidateAdmissionError::InvalidApproval)
+        );
+
+        for sequence in [6, 8] {
+            let approval = RescueFstabCandidateApproval::new(
+                binding.clone(),
+                "A-rescue-1",
+                sequence,
+                RESCUE_FSTAB_TYPED_CONFIRMATION,
+            )
+            .expect("well-formed but non-next approval");
+            assert_eq!(
+                admission.approve(&approval),
+                Err(RescueFstabCandidateAdmissionError::NonMonotonicApproval)
+            );
+        }
+
+        for confirmation in ["disabilita voce fstab", "DISABILITA VOCE FSTAB "] {
+            let approval =
+                RescueFstabCandidateApproval::new(binding.clone(), "A-rescue-1", 7, confirmation)
+                    .expect("well-formed approval");
+            assert_eq!(
+                admission.approve(&approval),
+                Err(RescueFstabCandidateAdmissionError::TypedConfirmationMismatch)
+            );
+        }
+
+        for foreign_binding in [
+            RescueFstabCandidateBinding::new(
+                "S-foreign",
+                binding.plan_id(),
+                binding.plan_hash(),
+                binding.target_fingerprint(),
+                binding.target_snapshot(),
+            ),
+            RescueFstabCandidateBinding::new(
+                binding.session_id(),
+                binding.plan_id(),
+                format!("sha256:{}", "d".repeat(64)),
+                binding.target_fingerprint(),
+                binding.target_snapshot(),
+            ),
+            RescueFstabCandidateBinding::new(
+                binding.session_id(),
+                binding.plan_id(),
+                binding.plan_hash(),
+                format!("sha256:{}", "e".repeat(64)),
+                binding.target_snapshot(),
+            ),
+            RescueFstabCandidateBinding::new(
+                binding.session_id(),
+                binding.plan_id(),
+                binding.plan_hash(),
+                binding.target_fingerprint(),
+                format!("sha256:{}", "f".repeat(64)),
+            ),
+        ] {
+            let approval = RescueFstabCandidateApproval::new(
+                foreign_binding.expect("valid foreign binding"),
+                "A-rescue-1",
+                7,
+                RESCUE_FSTAB_TYPED_CONFIRMATION,
+            )
+            .expect("well-formed foreign approval");
+            assert_eq!(
+                admission.approve(&approval),
+                Err(RescueFstabCandidateAdmissionError::BindingMismatch)
+            );
+        }
+
+        let approval = RescueFstabCandidateApproval::new(
+            binding,
+            "A-rescue-1",
+            7,
+            RESCUE_FSTAB_TYPED_CONFIRMATION,
+        )
+        .expect("exact approval");
+        assert_eq!(approval.session_id(), "S-rescue-1");
+        admission.approve(&approval).expect("approve once");
+        assert_eq!(
+            admission.state(),
+            RescueFstabCandidateAdmissionState::Approved
+        );
+        assert_eq!(admission.approval_id(), Some("A-rescue-1"));
+        assert_eq!(admission.approval_sequence(), Some(7));
+        assert_eq!(
+            admission.approve(&approval),
+            Err(RescueFstabCandidateAdmissionError::ApprovalReplay)
+        );
     }
 
     #[cfg(feature = "fixture-repair-lab")]

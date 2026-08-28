@@ -9,11 +9,13 @@ repair a customer filesystem.
 `linux.fstab.disable-missing-uuid.v1` is an R2 Rescue-only action for one
 deterministically diagnosed `KA-LNX-P0-003` finding. It may comment exactly one
 mandatory `UUID=` entry whose UUID is absent from the freshly observed block
-inventory and whose mount point is below `/mnt/`, `/media/` or `/srv/`.
+inventory, whose filesystem is `ext4`, and whose mount point is below `/mnt/`,
+`/media/` or `/srv/`.
 
 The action rejects malformed or ambiguous `fstab` data, missing critical
 mounts, swap, bind and network entries, optional `nofail`/`noauto` entries and
-every mount point outside that data-only allowlist. Provider output cannot
+other filesystem types or every mount point outside that data-only allowlist.
+Provider output cannot
 select the entry, path, command or replacement bytes.
 
 ## Trust boundaries
@@ -46,10 +48,14 @@ complex storage remains read-only.
 
 The feature-gated Rust candidate now includes a pure immutable transaction-plan
 binding for the preview hashes, selected-target scan identity, target physical
-parent, authenticated boot-Vault identity, Vault physical parent and diagnostic
-evidence hash. It rejects equal physical parents and path-like capability IDs.
-This is admission material only: it has no I/O, approval transition, broker
-dispatch or mutation handler.
+parent, authenticated boot-Vault identity, Vault physical parent, opaque backup
+locator and the two canonical diagnostic evidence hashes. The plan also binds
+its risk, safety declarations, timeout, cancellation, idempotency and redaction
+policy. It rejects equal physical parents, insufficient Vault capacity and
+path-like capability IDs. Core and policy expose a separate, feature-gated,
+single-use approval transition bound to session, plan hash, target fingerprint
+and `fstab` snapshot. This remains admission material only: it has no I/O,
+trusted broker dispatch, Vault backup or mutation handler.
 
 ## Backup boundary
 
@@ -89,8 +95,9 @@ plan and approval and refuses to overwrite any post-repair external edit.
 
 ## Feature and qualification gates
 
-The contract and pure preview compile only with the off-by-default
-`rescue-fstab-production-candidate` feature. No normal Desk build, public
+The contract, pure preview, immutable plan and approval boundary compile only
+with the off-by-default `rescue-fstab-production-candidate` feature. No normal
+Desk build, public
 Rescue image or default broker may enable it until all of these are true:
 
 - broker, Core, policy, vault backup and signed-report integration are complete;

@@ -5,6 +5,7 @@ edition.workspace = true
 [features]
 default = []
 fixture-repair-lab = ["kernaid-policy/fixture-repair-lab"]
+rescue-fstab-production-candidate = ["kernaid-policy/rescue-fstab-production-candidate"]
 [dependencies]
 kernaid-evidence = { path = "../evidence" }
 kernaid-policy = { path = "../policy" }

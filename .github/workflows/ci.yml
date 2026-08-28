@@ -20,6 +20,14 @@ jobs:
         run: cargo test --locked -p kernaid-linux-pack --features fixture-repair-lab
       - name: Check the disabled Rescue fstab production candidate
         run: |
+          cargo clippy --locked -p kernaid-policy --all-targets \
+            --features rescue-fstab-production-candidate -- -D warnings
+          cargo test --locked -p kernaid-policy \
+            --features rescue-fstab-production-candidate
+          cargo clippy --locked -p kernaid-core --all-targets \
+            --features rescue-fstab-production-candidate -- -D warnings
+          cargo test --locked -p kernaid-core \
+            --features rescue-fstab-production-candidate
           cargo clippy --locked -p kernaid-linux-pack --all-targets \
             --features rescue-fstab-production-candidate -- -D warnings
           cargo test --locked -p kernaid-linux-pack \

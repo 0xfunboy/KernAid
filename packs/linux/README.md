@@ -16,19 +16,20 @@ The separate `action-pack.production-candidate-v1.yaml` describes the first
 Rescue-only production candidate, `linux.fstab.disable-missing-uuid.v1`. It is
 explicitly `productionCandidateOnly`, disabled by default, and its Rust code is
 compiled only with the off-by-default `rescue-fstab-production-candidate`
-feature. This is currently a contract plus a pure preview function: there is
-no filesystem I/O, broker/UI route, backup implementation, approval path, or
-production mutation handler, so it does **not** make the repair available to
-users yet.
+feature. It currently consists of the action contract, a pure preview,
+an immutable transaction plan and a separate Core/policy approval boundary.
+There is no filesystem I/O, trusted Rescue broker/UI route, backup
+implementation, or production mutation handler, so it does **not** make the
+repair available to users yet.
 
 The candidate can propose commenting only one active, mandatory UUID entry
 that is absent from a caller-supplied observed UUID set and mounts below
-`/mnt/`, `/media/`, or `/srv/`. It fails closed for malformed input, multiple
-targets, critical mount trees (`/`, boot, system directories, home, or swap),
-other mount locations, bind mounts, and network filesystems. Its strict JSON
-input binds the version-2 `KA-LNX-P0-003` finding and exact before, observed
-UUID-set, and proposed-after SHA-256 fingerprints; it accepts no path,
-replacement bytes, or command.
+`/mnt/`, `/media/`, or `/srv/` on `ext4`. It fails closed for malformed input,
+multiple targets, critical mount trees (`/`, boot, system directories, home,
+or swap), other mount locations or filesystem types, bind mounts, and network
+filesystems. Its strict JSON input binds the version-2 `KA-LNX-P0-003` finding
+and exact before, observed UUID-set, and proposed-after SHA-256 fingerprints;
+it accepts no path, replacement bytes, or command.
 
 The pure preview emits all three contract bindings plus `diffSha256`.
 `beforeSha256` and `afterSha256` hash the exact input and proposed byte streams.
@@ -41,6 +42,15 @@ byte length plus its bytes. `diffSha256` similarly uses the ASCII domain
 `u64` start/end offsets, and length-framed original/replacement line bytes;
 the line terminator is outside both frames. All four values use lowercase
 `sha256:<hex>` form.
+
+The immutable candidate plan additionally binds the session and plan IDs,
+canonical evidence hashes, selected-target scan identity, target and Vault
+physical-parent identities, authenticated Vault identity and opaque backup
+locator, sufficient capacity, exact risk/preflight/backup/validation/rollback
+declarations, timeout, cancellation, idempotency and redaction policy. The
+target and Vault must have distinct physical parents. These values are still
+admission material supplied to pure code; a future trusted broker must derive
+and recheck them before any write is possible.
 
 `action-pack.fixture-v1.yaml` and its JSON input schema pin the single
 `linux.fstab.repair-entry.fixture-v1` contract at compile time. That manifest

@@ -14,6 +14,13 @@ spec:
       risk: R2
       reversible: true
       requiresBackup: true
+      supportedFilesystems: [ext4]
+      backupPolicy: rescue.boot-vault.byte-exact-before-write.v1
+      backupPhysicalParent: distinct
+      timeoutMilliseconds: 120000
+      cancellationPolicy: rescue.transaction.safe-boundaries-auto-restore.v1
+      idempotencyPolicy: rescue.fstab.disable-missing-uuid.converge-once.v1
+      redactionPolicy: rescue.transaction.opaque-identifiers-and-hashes-only.v1
       handler: kernaid-action-linux-rescue
       inputSchema: schemas/linux.fstab.disable-missing-uuid.v1.json
       preflight: linux.fstab.preflight

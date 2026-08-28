@@ -26,6 +26,13 @@ pub const INPUT_SCHEMA_ID: &str =
 pub const PREFLIGHT_ID: &str = "linux.fstab.preflight";
 pub const VALIDATE_ID: &str = "linux.boot.validate-fstab";
 pub const ROLLBACK_ID: &str = "linux.fstab.restore";
+pub const SUPPORTED_FILESYSTEM: &str = "ext4";
+pub const BACKUP_POLICY_ID: &str = "rescue.boot-vault.byte-exact-before-write.v1";
+pub const BACKUP_PHYSICAL_PARENT_POLICY: &str = "distinct";
+pub const TRANSACTION_TIMEOUT_MILLISECONDS: u64 = 120_000;
+pub const CANCELLATION_POLICY_ID: &str = "rescue.transaction.safe-boundaries-auto-restore.v1";
+pub const IDEMPOTENCY_POLICY_ID: &str = "rescue.fstab.disable-missing-uuid.converge-once.v1";
+pub const REDACTION_POLICY_ID: &str = "rescue.transaction.opaque-identifiers-and-hashes-only.v1";
 pub const MAX_ACTION_INPUT_BYTES: usize = 768;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,6 +57,13 @@ pub struct ProductionCandidateActionContract {
     pub risk: CandidateRisk,
     pub reversible: bool,
     pub requires_backup: bool,
+    pub supported_filesystem: &'static str,
+    pub backup_policy: &'static str,
+    pub backup_physical_parent_policy: &'static str,
+    pub timeout_milliseconds: u64,
+    pub cancellation_policy: &'static str,
+    pub idempotency_policy: &'static str,
+    pub redaction_policy: &'static str,
     pub handler: &'static str,
     pub input_schema: &'static str,
     pub preflight: &'static str,
@@ -66,6 +80,13 @@ pub const FSTAB_DISABLE_MISSING_UUID_ACTION: ProductionCandidateActionContract =
         risk: CandidateRisk::R2,
         reversible: true,
         requires_backup: true,
+        supported_filesystem: SUPPORTED_FILESYSTEM,
+        backup_policy: BACKUP_POLICY_ID,
+        backup_physical_parent_policy: BACKUP_PHYSICAL_PARENT_POLICY,
+        timeout_milliseconds: TRANSACTION_TIMEOUT_MILLISECONDS,
+        cancellation_policy: CANCELLATION_POLICY_ID,
+        idempotency_policy: IDEMPOTENCY_POLICY_ID,
+        redaction_policy: REDACTION_POLICY_ID,
         handler: HANDLER_ID,
         input_schema: INPUT_SCHEMA_PATH,
         preflight: PREFLIGHT_ID,
@@ -279,6 +300,21 @@ mod tests {
         assert!(ACTION_PACK_MANIFEST_YAML.contains("platforms: [linux-rescue]"));
         assert!(ACTION_PACK_MANIFEST_YAML.contains("productionCandidateOnly: true"));
         assert!(ACTION_PACK_MANIFEST_YAML.contains("enabledByDefault: false"));
+        assert!(ACTION_PACK_MANIFEST_YAML.contains("supportedFilesystems: [ext4]"));
+        assert!(ACTION_PACK_MANIFEST_YAML.contains(&format!("backupPolicy: {BACKUP_POLICY_ID}")));
+        assert!(ACTION_PACK_MANIFEST_YAML.contains("backupPhysicalParent: distinct"));
+        assert!(ACTION_PACK_MANIFEST_YAML.contains("timeoutMilliseconds: 120000"));
+        assert!(
+            ACTION_PACK_MANIFEST_YAML
+                .contains(&format!("cancellationPolicy: {CANCELLATION_POLICY_ID}"))
+        );
+        assert!(
+            ACTION_PACK_MANIFEST_YAML
+                .contains(&format!("idempotencyPolicy: {IDEMPOTENCY_POLICY_ID}"))
+        );
+        assert!(
+            ACTION_PACK_MANIFEST_YAML.contains(&format!("redactionPolicy: {REDACTION_POLICY_ID}"))
+        );
         assert_eq!(ACTION_PACK_MANIFEST_YAML.matches("    - id:").count(), 1);
 
         let contract = std::hint::black_box(FSTAB_DISABLE_MISSING_UUID_ACTION);
@@ -288,6 +324,19 @@ mod tests {
         assert_eq!(contract.risk, CandidateRisk::R2);
         assert!(contract.reversible);
         assert!(contract.requires_backup);
+        assert_eq!(contract.supported_filesystem, SUPPORTED_FILESYSTEM);
+        assert_eq!(contract.backup_policy, BACKUP_POLICY_ID);
+        assert_eq!(
+            contract.backup_physical_parent_policy,
+            BACKUP_PHYSICAL_PARENT_POLICY
+        );
+        assert_eq!(
+            contract.timeout_milliseconds,
+            TRANSACTION_TIMEOUT_MILLISECONDS
+        );
+        assert_eq!(contract.cancellation_policy, CANCELLATION_POLICY_ID);
+        assert_eq!(contract.idempotency_policy, IDEMPOTENCY_POLICY_ID);
+        assert_eq!(contract.redaction_policy, REDACTION_POLICY_ID);
 
         let schema: Value = serde_json::from_str(INPUT_SCHEMA_JSON).expect("parse schema");
         assert_eq!(schema["$id"], INPUT_SCHEMA_ID);

@@ -27,6 +27,7 @@ pub enum PreviewError {
     CriticalMountMissing,
     UnsupportedMountMissing,
     UnsupportedEntryKind,
+    UnsupportedFilesystem,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -368,6 +369,9 @@ pub fn preview_disable_missing_uuid(
         {
             return Err(PreviewError::UnsupportedEntryKind);
         }
+        if filesystem != "ext4" {
+            return Err(PreviewError::UnsupportedFilesystem);
+        }
         if !is_allowed_data_mount(mountpoint) {
             return Err(PreviewError::UnsupportedMountMissing);
         }
@@ -517,6 +521,13 @@ mod tests {
                 Err(PreviewError::UnsupportedEntryKind)
             );
         }
+        assert_eq!(
+            preview_disable_missing_uuid(
+                b"UUID=DEAD-BEEF /srv/archive xfs defaults 0 2\n",
+                &BTreeSet::new()
+            ),
+            Err(PreviewError::UnsupportedFilesystem)
+        );
     }
 
     #[test]

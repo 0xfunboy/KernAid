@@ -5,6 +5,7 @@ edition.workspace = true
 [features]
 default = []
 fixture-repair-lab = []
+rescue-fstab-production-candidate = []
 [dependencies]
 kernaid-protocol = { path = "../protocol" }
 [lints]

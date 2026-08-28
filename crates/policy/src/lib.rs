@@ -1,7 +1,10 @@
 #![forbid(unsafe_code)]
 use kernaid_protocol::{ActionStep, Risk};
 
-#[cfg(feature = "fixture-repair-lab")]
+#[cfg(any(
+    feature = "fixture-repair-lab",
+    feature = "rescue-fstab-production-candidate"
+))]
 use kernaid_protocol::ValidatedPlan;
 
 /// The only mutating action that the disposable fixture lab may admit.
@@ -19,6 +22,28 @@ pub const FIXTURE_FSTAB_VALIDATION_ID: &str = "linux.boot.validate-fstab";
 /// The only rollback action admitted for the fixture mutation.
 #[cfg(feature = "fixture-repair-lab")]
 pub const FIXTURE_FSTAB_ROLLBACK_ID: &str = "linux.fstab.restore";
+
+/// The only R2 action admitted by the disabled Rescue production candidate.
+#[cfg(feature = "rescue-fstab-production-candidate")]
+pub const RESCUE_FSTAB_ACTION_ID: &str = "linux.fstab.disable-missing-uuid.v1";
+/// The opaque resource selected by the Rescue target resolver.
+#[cfg(feature = "rescue-fstab-production-candidate")]
+pub const RESCUE_FSTAB_RESOURCE_ID: &str = "rescue:selected-linux-root:etc/fstab";
+/// The exact read-only preflight required before candidate admission.
+#[cfg(feature = "rescue-fstab-production-candidate")]
+pub const RESCUE_FSTAB_PREFLIGHT_ID: &str = "linux.fstab.preflight";
+/// The candidate always requires a separate, verified backup.
+#[cfg(feature = "rescue-fstab-production-candidate")]
+pub const RESCUE_FSTAB_BACKUP: &str = "required";
+/// The exact validation contract for the candidate.
+#[cfg(feature = "rescue-fstab-production-candidate")]
+pub const RESCUE_FSTAB_VALIDATION_ID: &str = "linux.boot.validate-fstab";
+/// The only rollback declaration accepted for the candidate.
+#[cfg(feature = "rescue-fstab-production-candidate")]
+pub const RESCUE_FSTAB_ROLLBACK_ID: &str = "linux.fstab.restore";
+/// Canonical evidence order bound into the one-step candidate plan.
+#[cfg(feature = "rescue-fstab-production-candidate")]
+pub const RESCUE_FSTAB_EVIDENCE_IDS: [&str; 2] = ["E-LINUX-FSTAB", "E-LINUX-LSBLK"];
 
 #[cfg(feature = "fixture-repair-lab")]
 const MAX_FIXTURE_EVIDENCE_IDS: usize = 32;
@@ -46,6 +71,20 @@ pub enum PolicyError {
     InvalidFixtureValidation,
     #[cfg(feature = "fixture-repair-lab")]
     InvalidFixtureRollback,
+    #[cfg(feature = "rescue-fstab-production-candidate")]
+    InvalidRescueFstabPlan,
+    #[cfg(feature = "rescue-fstab-production-candidate")]
+    IncoherentRescueTargetFingerprint,
+    #[cfg(feature = "rescue-fstab-production-candidate")]
+    InvalidRescueFstabEvidence,
+    #[cfg(feature = "rescue-fstab-production-candidate")]
+    InvalidRescueFstabPrecondition,
+    #[cfg(feature = "rescue-fstab-production-candidate")]
+    InvalidRescueFstabBackup,
+    #[cfg(feature = "rescue-fstab-production-candidate")]
+    InvalidRescueFstabValidation,
+    #[cfg(feature = "rescue-fstab-production-candidate")]
+    InvalidRescueFstabRollback,
 }
 
 pub fn validate_phase_zero(step: &ActionStep) -> Result<(), PolicyError> {
@@ -114,6 +153,51 @@ pub fn validate_fixture_repair_lab_plan(
     Ok(())
 }
 
+/// Admit only the immutable, one-step Rescue `fstab` production candidate.
+///
+/// This feature-gated validator does not enable mutation and is deliberately
+/// separate from [`validate_phase_zero`]. It validates admission metadata only;
+/// no handler, filesystem access, or broker dispatch exists here.
+#[cfg(feature = "rescue-fstab-production-candidate")]
+pub fn validate_rescue_fstab_production_candidate_plan(
+    plan: &ValidatedPlan,
+    session_target_fingerprint: &str,
+) -> Result<(), PolicyError> {
+    if !valid_sha256_fingerprint(session_target_fingerprint)
+        || plan.target_fingerprint != session_target_fingerprint
+    {
+        return Err(PolicyError::IncoherentRescueTargetFingerprint);
+    }
+
+    let [step] = plan.steps.as_slice() else {
+        return Err(PolicyError::InvalidRescueFstabPlan);
+    };
+    if step.action != RESCUE_FSTAB_ACTION_ID || step.risk != Risk::R2 {
+        return Err(PolicyError::MutationDisabled);
+    }
+    if step.target_fingerprint != plan.target_fingerprint
+        || !valid_sha256_fingerprint(&step.target_fingerprint)
+    {
+        return Err(PolicyError::IncoherentRescueTargetFingerprint);
+    }
+    if step.evidence_ids.as_slice() != RESCUE_FSTAB_EVIDENCE_IDS {
+        return Err(PolicyError::InvalidRescueFstabEvidence);
+    }
+    if step.preconditions.as_slice() != [RESCUE_FSTAB_PREFLIGHT_ID] {
+        return Err(PolicyError::InvalidRescueFstabPrecondition);
+    }
+    if step.backup.as_deref() != Some(RESCUE_FSTAB_BACKUP) {
+        return Err(PolicyError::InvalidRescueFstabBackup);
+    }
+    if step.validation != RESCUE_FSTAB_VALIDATION_ID {
+        return Err(PolicyError::InvalidRescueFstabValidation);
+    }
+    if step.rollback.as_deref() != Some(RESCUE_FSTAB_ROLLBACK_ID) {
+        return Err(PolicyError::InvalidRescueFstabRollback);
+    }
+    Ok(())
+}
+
 #[cfg(feature = "fixture-repair-lab")]
 fn validate_fixture_evidence_ids(evidence_ids: &[String]) -> Result<(), PolicyError> {
     if evidence_ids.is_empty() || evidence_ids.len() > MAX_FIXTURE_EVIDENCE_IDS {
@@ -142,7 +226,10 @@ fn valid_typed_id(value: &str, prefix: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
-#[cfg(feature = "fixture-repair-lab")]
+#[cfg(any(
+    feature = "fixture-repair-lab",
+    feature = "rescue-fstab-production-candidate"
+))]
 fn valid_sha256_fingerprint(value: &str) -> bool {
     value.strip_prefix("sha256:").is_some_and(|digest| {
         digest.len() == 64
@@ -189,6 +276,146 @@ mod tests {
             validate_phase_zero(&fixture),
             Err(PolicyError::MutationDisabled)
         );
+
+        fixture.action = "linux.fstab.disable-missing-uuid.v1".into();
+        assert_eq!(
+            validate_phase_zero(&fixture),
+            Err(PolicyError::MutationDisabled)
+        );
+    }
+
+    #[cfg(feature = "rescue-fstab-production-candidate")]
+    mod rescue_fstab_production_candidate {
+        use super::*;
+
+        const TARGET: &str =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+        fn candidate_plan() -> ValidatedPlan {
+            ValidatedPlan {
+                plan_id: "P-rescue-fstab-candidate".into(),
+                target_fingerprint: TARGET.into(),
+                steps: vec![ActionStep {
+                    action: RESCUE_FSTAB_ACTION_ID.into(),
+                    risk: Risk::R2,
+                    target_fingerprint: TARGET.into(),
+                    evidence_ids: RESCUE_FSTAB_EVIDENCE_IDS
+                        .iter()
+                        .map(|value| (*value).to_owned())
+                        .collect(),
+                    preconditions: vec![RESCUE_FSTAB_PREFLIGHT_ID.into()],
+                    backup: Some(RESCUE_FSTAB_BACKUP.into()),
+                    validation: RESCUE_FSTAB_VALIDATION_ID.into(),
+                    rollback: Some(RESCUE_FSTAB_ROLLBACK_ID.into()),
+                }],
+            }
+        }
+
+        #[test]
+        fn admits_only_the_exact_one_step_r2_contract() {
+            assert_eq!(
+                validate_rescue_fstab_production_candidate_plan(&candidate_plan(), TARGET),
+                Ok(())
+            );
+
+            let mut wrong_action = candidate_plan();
+            wrong_action.steps[0].action = "linux.fstab.restore".into();
+            assert_eq!(
+                validate_rescue_fstab_production_candidate_plan(&wrong_action, TARGET),
+                Err(PolicyError::MutationDisabled)
+            );
+
+            let mut wrong_risk = candidate_plan();
+            wrong_risk.steps[0].risk = Risk::R3;
+            assert_eq!(
+                validate_rescue_fstab_production_candidate_plan(&wrong_risk, TARGET),
+                Err(PolicyError::MutationDisabled)
+            );
+
+            let mut extra_step = candidate_plan();
+            extra_step.steps.push(extra_step.steps[0].clone());
+            assert_eq!(
+                validate_rescue_fstab_production_candidate_plan(&extra_step, TARGET),
+                Err(PolicyError::InvalidRescueFstabPlan)
+            );
+        }
+
+        #[test]
+        fn requires_one_coherent_sha256_target() {
+            let mut plan_target = candidate_plan();
+            plan_target.target_fingerprint = format!("sha256:{}", "b".repeat(64));
+            assert_eq!(
+                validate_rescue_fstab_production_candidate_plan(&plan_target, TARGET),
+                Err(PolicyError::IncoherentRescueTargetFingerprint)
+            );
+
+            let mut step_target = candidate_plan();
+            step_target.steps[0].target_fingerprint = format!("sha256:{}", "b".repeat(64));
+            assert_eq!(
+                validate_rescue_fstab_production_candidate_plan(&step_target, TARGET),
+                Err(PolicyError::IncoherentRescueTargetFingerprint)
+            );
+
+            assert_eq!(
+                validate_rescue_fstab_production_candidate_plan(
+                    &candidate_plan(),
+                    "scan:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                ),
+                Err(PolicyError::IncoherentRescueTargetFingerprint)
+            );
+        }
+
+        #[test]
+        fn requires_the_two_canonical_evidence_ids_in_order() {
+            for evidence_ids in [
+                vec!["E-LINUX-FSTAB".into()],
+                vec!["E-LINUX-LSBLK".into(), "E-LINUX-FSTAB".into()],
+                vec!["E-LINUX-FSTAB".into(), "E-LINUX-FSTAB".into()],
+                vec![
+                    "E-LINUX-FSTAB".into(),
+                    "E-LINUX-LSBLK".into(),
+                    "E-FOREIGN".into(),
+                ],
+            ] {
+                let mut plan = candidate_plan();
+                plan.steps[0].evidence_ids = evidence_ids;
+                assert_eq!(
+                    validate_rescue_fstab_production_candidate_plan(&plan, TARGET),
+                    Err(PolicyError::InvalidRescueFstabEvidence)
+                );
+            }
+        }
+
+        #[test]
+        fn rejects_every_safety_declaration_drift() {
+            let mut preflight = candidate_plan();
+            preflight.steps[0].preconditions = vec!["target.still-matches".into()];
+            assert_eq!(
+                validate_rescue_fstab_production_candidate_plan(&preflight, TARGET),
+                Err(PolicyError::InvalidRescueFstabPrecondition)
+            );
+
+            let mut backup = candidate_plan();
+            backup.steps[0].backup = Some("inherited".into());
+            assert_eq!(
+                validate_rescue_fstab_production_candidate_plan(&backup, TARGET),
+                Err(PolicyError::InvalidRescueFstabBackup)
+            );
+
+            let mut validation = candidate_plan();
+            validation.steps[0].validation = "evidence.exists".into();
+            assert_eq!(
+                validate_rescue_fstab_production_candidate_plan(&validation, TARGET),
+                Err(PolicyError::InvalidRescueFstabValidation)
+            );
+
+            let mut rollback = candidate_plan();
+            rollback.steps[0].rollback = None;
+            assert_eq!(
+                validate_rescue_fstab_production_candidate_plan(&rollback, TARGET),
+                Err(PolicyError::InvalidRescueFstabRollback)
+            );
+        }
     }
 
     #[cfg(feature = "fixture-repair-lab")]

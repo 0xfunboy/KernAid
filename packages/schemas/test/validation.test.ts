@@ -17,6 +17,7 @@ const schemaFiles = [
   "execution-event.schema.json",
   "linux-hardware-inventory.schema.json",
   "linux-normalized-snapshot.schema.json",
+  "rescue-fstab-repair-approval.schema.json",
   "rescue-openai-request.schema.json",
   "rescue-openai-response.schema.json",
   "rescue-vault-request.schema.json",
@@ -172,6 +173,58 @@ test("all published JSON schemas compile together", () => {
         `https://schemas.kernaid.dev/v1/${file.replace(".schema", "")}`,
       ),
     );
+});
+
+test("Rescue fstab R2 approval is closed and leaves Approval v1 unchanged", () => {
+  const ajv = new Ajv2020({ allErrors: true, strict: true });
+  addFormats(ajv);
+  const approvalSchema = JSON.parse(
+    readFileSync(new URL("../approval.schema.json", import.meta.url), "utf8"),
+  );
+  const repairApprovalSchema = JSON.parse(
+    readFileSync(
+      new URL("../rescue-fstab-repair-approval.schema.json", import.meta.url),
+      "utf8",
+    ),
+  );
+  const validateApproval = ajv.compile(approvalSchema);
+  const validateRepairApproval = ajv.compile(repairApprovalSchema);
+  const hash = `sha256:${"a".repeat(64)}`;
+  const candidate = {
+    schemaVersion: "1.0",
+    approvalId: "A-rescue-fstab-1",
+    approvalSequence: 1,
+    sessionId: "S-rescue-1",
+    planId: "P-rescue-fstab-1",
+    planHash: hash,
+    targetFingerprint: hash,
+    targetSnapshot: hash,
+    resourceId: "rescue:selected-linux-root:etc/fstab",
+    typedConfirmation: "DISABILITA VOCE FSTAB",
+    approvedAt: "2026-08-28T12:00:00Z",
+  };
+
+  assert.equal(validateRepairApproval(candidate), true);
+  for (const invalid of [
+    { ...candidate, approvalSequence: 0 },
+    { ...candidate, planHash: `sha256:${"A".repeat(64)}` },
+    { ...candidate, resourceId: "rescue:selected-linux-root:etc/other" },
+    { ...candidate, typedConfirmation: "APPROVO RIPARAZIONE R2" },
+    { ...candidate, unexpected: true },
+  ])
+    assert.equal(validateRepairApproval(invalid), false);
+
+  assert.equal(
+    validateApproval({
+      schemaVersion: "1.0",
+      approvalId: "A-existing-v1",
+      planId: "P-existing-v1",
+      targetFingerprint: hash,
+      approvedAt: "2026-08-28T12:00:00Z",
+      approvedBy: "local-user",
+    }),
+    true,
+  );
 });
 
 test("Rescue OpenAI golden frames agree with the closed published schemas", () => {

@@ -45,6 +45,19 @@ export interface Approval {
   approvedBy: string;
   typedConfirmation?: string;
 }
+export interface RescueFstabRepairApproval {
+  schemaVersion: "1.0";
+  approvalId: string;
+  approvalSequence: number;
+  sessionId: string;
+  planId: string;
+  planHash: string;
+  targetFingerprint: string;
+  targetSnapshot: string;
+  resourceId: "rescue:selected-linux-root:etc/fstab";
+  typedConfirmation: "DISABILITA VOCE FSTAB";
+  approvedAt: string;
+}
 export interface ExecutionEvent {
   schemaVersion: "1.0";
   planId: string;

@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.kernaid.dev/v1/rescue-fstab-repair-approval.json",
+  "title": "RescueFstabRepairApproval",
+  "description": "Candidate R2 approval bound to one staged Rescue repair of the selected Linux root fstab.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "approvalId",
+    "approvalSequence",
+    "sessionId",
+    "planId",
+    "planHash",
+    "targetFingerprint",
+    "targetSnapshot",
+    "resourceId",
+    "typedConfirmation",
+    "approvedAt"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "1.0" },
+    "approvalId": {
+      "type": "string",
+      "pattern": "^A-[A-Za-z0-9-]+$",
+      "maxLength": 128
+    },
+    "approvalSequence": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "sessionId": {
+      "type": "string",
+      "pattern": "^S-[A-Za-z0-9-]+$",
+      "maxLength": 128
+    },
+    "planId": {
+      "type": "string",
+      "pattern": "^P-[A-Za-z0-9-]+$",
+      "maxLength": 128
+    },
+    "planHash": {
+      "type": "string",
+      "minLength": 71,
+      "maxLength": 71,
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "targetFingerprint": {
+      "type": "string",
+      "minLength": 71,
+      "maxLength": 71,
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "targetSnapshot": {
+      "type": "string",
+      "minLength": 71,
+      "maxLength": 71,
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "resourceId": {
+      "const": "rescue:selected-linux-root:etc/fstab"
+    },
+    "typedConfirmation": {
+      "const": "DISABILITA VOCE FSTAB"
+    },
+    "approvedAt": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt](?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-9]{2}(?:\\.[0-9]+)?(?:[Zz]|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])$"
+    }
+  }
+}
