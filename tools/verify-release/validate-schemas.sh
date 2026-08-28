@@ -12,6 +12,8 @@ expected_schemas=(
   rescue-fstab-repair-approval.schema.json
   rescue-openai-request.schema.json
   rescue-openai-response.schema.json
+  rescue-vault-repair-request.schema.json
+  rescue-vault-repair-response.schema.json
   rescue-vault-request.schema.json
   rescue-vault-response.schema.json
   session-report.schema.json
