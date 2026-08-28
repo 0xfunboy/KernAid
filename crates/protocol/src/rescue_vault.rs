@@ -7,8 +7,8 @@
 
 #[cfg(feature = "experimental-repair-store")]
 use crate::rescue_repair_vault::{
-    MAX_REPAIR_BACKUP_BYTES, RepairBackupBinding, RepairBackupDraft, RepairBackupState,
-    RepairBackupStatusPayload, RepairFileMetadataV1,
+    MAX_REPAIR_BACKUP_BYTES, RepairBackupBinding, RepairBackupDraft, RepairBackupReleasePayload,
+    RepairBackupState, RepairBackupStatusPayload, RepairFileMetadataV1, RepairReservationId,
 };
 use crate::rescue_vault_transport::{
     SeqpacketSocketIdentity, SeqpacketTransportError, ensure_deadline, recv_seqpacket,
@@ -499,6 +499,12 @@ pub enum Operation {
     #[cfg(feature = "experimental-repair-store")]
     #[serde(rename = "repair.backup.get")]
     RepairBackupGet,
+    #[cfg(feature = "experimental-repair-store")]
+    #[serde(rename = "repair.backup.cancel")]
+    RepairBackupCancel,
+    #[cfg(feature = "experimental-repair-store")]
+    #[serde(rename = "repair.backup.retire")]
+    RepairBackupRetire,
 }
 
 impl Operation {
@@ -538,6 +544,8 @@ impl Operation {
                     | Self::RepairBackupPersist
                     | Self::RepairBackupStatus
                     | Self::RepairBackupGet
+                    | Self::RepairBackupCancel
+                    | Self::RepairBackupRetire
             ),
         }
     }
@@ -763,6 +771,15 @@ pub enum RequestPayload {
     },
     #[cfg(feature = "experimental-repair-store")]
     RepairBackupGet {
+        expected: Box<RepairBackupStatusPayload>,
+    },
+    #[cfg(feature = "experimental-repair-store")]
+    RepairBackupCancel {
+        reservation_id: RepairReservationId,
+        draft_binding_sha256: Sha256,
+    },
+    #[cfg(feature = "experimental-repair-store")]
+    RepairBackupRetire {
         expected: Box<RepairBackupStatusPayload>,
     },
 }
@@ -1097,6 +1114,14 @@ struct RepairBackupReferencePayload {
     expected: RepairBackupStatusPayload,
 }
 
+#[cfg(feature = "experimental-repair-store")]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RepairBackupCancelPayload {
+    reservation_id: String,
+    draft_binding_sha256: String,
+}
+
 /// Decodes and authorizes one complete request packet for an already-bound
 /// peer identity. The public entry point is [`AuthenticatedPeer::receive_request`].
 ///
@@ -1352,31 +1377,43 @@ fn parse_payload(
             })
         }
         #[cfg(feature = "experimental-repair-store")]
-        Operation::RepairBackupStatus | Operation::RepairBackupGet => {
+        Operation::RepairBackupStatus
+        | Operation::RepairBackupGet
+        | Operation::RepairBackupRetire => {
             let payload = serde_json::from_str::<RepairBackupReferencePayload>(raw.get())
                 .map_err(|_| ProtocolViolation::InvalidPayload)?;
             payload.expected.validate()?;
-            if operation == Operation::RepairBackupGet
-                && payload.expected.state() != RepairBackupState::Durable
+            if matches!(
+                operation,
+                Operation::RepairBackupGet | Operation::RepairBackupRetire
+            ) && payload.expected.state() != RepairBackupState::Durable
             {
                 return Err(ProtocolViolation::InvalidPayload);
             }
-            if wire_operation_is_repair_status(operation) {
+            if operation == Operation::RepairBackupStatus {
                 Ok(RequestPayload::RepairBackupStatus {
                     expected: Box::new(payload.expected),
                 })
-            } else {
+            } else if operation == Operation::RepairBackupGet {
                 Ok(RequestPayload::RepairBackupGet {
+                    expected: Box::new(payload.expected),
+                })
+            } else {
+                Ok(RequestPayload::RepairBackupRetire {
                     expected: Box::new(payload.expected),
                 })
             }
         }
+        #[cfg(feature = "experimental-repair-store")]
+        Operation::RepairBackupCancel => {
+            let payload = serde_json::from_str::<RepairBackupCancelPayload>(raw.get())
+                .map_err(|_| ProtocolViolation::InvalidPayload)?;
+            Ok(RequestPayload::RepairBackupCancel {
+                reservation_id: RepairReservationId::parse(&payload.reservation_id)?,
+                draft_binding_sha256: Sha256::parse(&payload.draft_binding_sha256)?,
+            })
+        }
     }
-}
-
-#[cfg(feature = "experimental-repair-store")]
-fn wire_operation_is_repair_status(operation: Operation) -> bool {
-    operation == Operation::RepairBackupStatus
 }
 
 fn validate_declaration(
@@ -1444,7 +1481,9 @@ fn payload_descriptor(payload: &RequestPayload) -> Option<&DescriptorDeclaration
         #[cfg(feature = "experimental-repair-store")]
         RequestPayload::RepairBackupReserve { .. }
         | RequestPayload::RepairBackupStatus { .. }
-        | RequestPayload::RepairBackupGet { .. } => None,
+        | RequestPayload::RepairBackupGet { .. }
+        | RequestPayload::RepairBackupCancel { .. }
+        | RequestPayload::RepairBackupRetire { .. } => None,
     }
 }
 
@@ -1755,6 +1794,8 @@ pub enum SuccessPayload {
     RepairBackupStatus(Box<RepairBackupStatusPayload>),
     #[cfg(feature = "experimental-repair-store")]
     RepairBackup(Box<RepairBackupStatusPayload>, DescriptorDeclaration),
+    #[cfg(feature = "experimental-repair-store")]
+    RepairBackupReleased(RepairBackupReleasePayload),
 }
 
 #[derive(Serialize)]
@@ -1905,6 +1946,15 @@ fn encode_success(
                 backup: status,
                 output,
             },
+        }),
+        #[cfg(feature = "experimental-repair-store")]
+        SuccessPayload::RepairBackupReleased(released) => serde_json::to_vec(&SuccessWire {
+            api_version: API_VERSION,
+            request_id,
+            state_version,
+            operation,
+            outcome: "ok",
+            payload: released,
         }),
     }
     .map_err(|_| ProtocolViolation::InvalidPayload)?;
@@ -2130,6 +2180,33 @@ fn validate_success(
             && declaration.size == status.backup_size() =>
         {
             Some(declaration)
+        }
+        #[cfg(feature = "experimental-repair-store")]
+        (
+            Operation::RepairBackupCancel,
+            RequestPayload::RepairBackupCancel {
+                reservation_id,
+                draft_binding_sha256,
+            },
+            SuccessPayload::RepairBackupReleased(released),
+        ) if released.validate().is_ok()
+            && released.reservation_id() == reservation_id
+            && released.draft_binding_sha256() == draft_binding_sha256 =>
+        {
+            None
+        }
+        #[cfg(feature = "experimental-repair-store")]
+        (
+            Operation::RepairBackupRetire,
+            RequestPayload::RepairBackupRetire { expected },
+            SuccessPayload::RepairBackupReleased(released),
+        ) if expected.state() == RepairBackupState::Durable
+            && released.validate().is_ok()
+            && released.reservation_id() == expected.reservation_id()
+            && released.draft_binding_sha256() == expected.draft_binding_sha256()
+            && released.released_bytes() == expected.reserved_bytes() =>
+        {
+            None
         }
         _ => return Err(ProtocolViolation::InvalidPayload),
     };
@@ -2647,10 +2724,10 @@ mod tests {
 
     #[cfg(feature = "experimental-repair-store")]
     #[test]
-    fn repair_broker_role_and_four_operations_are_closed_and_path_free() {
+    fn repair_broker_role_and_six_operations_are_closed_and_path_free() {
         use crate::rescue_repair_vault::{
-            RepairBackupBinding, RepairBackupStatusPayload, RepairFileMetadataV1,
-            RepairReservationId, repair_backup_output,
+            RepairBackupBinding, RepairBackupReleasePayload, RepairBackupStatusPayload,
+            RepairFileMetadataV1, RepairReservationId, repair_backup_output,
         };
 
         let repair_allowlist = PeerAllowlist::builder(COMPANION_UID)
@@ -2834,6 +2911,49 @@ mod tests {
                 );
             }
         }
+
+        let cancel = request(
+            "repair.backup.cancel",
+            &format!(
+                "{{\"reservationId\":\"{}\",\"draftBindingSha256\":\"{}\"}}",
+                reservation.as_str(),
+                draft.draft_binding_sha256().as_str()
+            ),
+        );
+        let cancel = decode_request(&cancel, repair_peer(), Vec::new()).expect("stable cancel");
+        let released = RepairBackupReleasePayload::new(
+            reservation.clone(),
+            draft.draft_binding_sha256(),
+            8192,
+        )
+        .expect("release acknowledgement");
+        assert!(
+            encode_success(
+                &cancel,
+                11,
+                &SuccessPayload::RepairBackupReleased(released.clone()),
+                &[],
+            )
+            .is_ok()
+        );
+
+        let retire = request(
+            "repair.backup.retire",
+            &format!(
+                "{{\"expected\":{}}}",
+                serde_json::to_string(&durable).expect("durable JSON")
+            ),
+        );
+        let retire = decode_request(&retire, repair_peer(), Vec::new()).expect("durable retire");
+        assert!(
+            encode_success(
+                &retire,
+                13,
+                &SuccessPayload::RepairBackupReleased(released),
+                &[],
+            )
+            .is_ok()
+        );
     }
 
     #[test]

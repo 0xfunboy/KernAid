@@ -173,9 +173,7 @@ test("all published JSON schemas compile together", () => {
     const id = file.startsWith("rescue-vault-repair-")
       ? `https://schemas.kernaid.dev/experimental/${file.replace(".schema.json", "-v1alpha1.json")}`
       : `https://schemas.kernaid.dev/v1/${file.replace(".schema", "")}`;
-    assert.ok(
-      ajv.getSchema(id),
-    );
+    assert.ok(ajv.getSchema(id));
   }
 });
 
@@ -566,7 +564,10 @@ test("experimental Repair Vault schemas are isolated and structurally closed", (
     ),
   );
   assert.match(requestSchema.$id, /experimental\/rescue-vault-repair-request/);
-  assert.match(responseSchema.$id, /experimental\/rescue-vault-repair-response/);
+  assert.match(
+    responseSchema.$id,
+    /experimental\/rescue-vault-repair-response/,
+  );
   const validateRequest = ajv.compile(requestSchema);
   const validateResponse = ajv.compile(responseSchema);
   const envelope = {
@@ -634,13 +635,19 @@ test("experimental Repair Vault schemas are isolated and structurally closed", (
   };
   assert.equal(validateRequest(persist), true);
   assert.equal(
-    validateRequest({ ...persist, payload: { ...persist.payload, path: "/etc/fstab" } }),
+    validateRequest({
+      ...persist,
+      payload: { ...persist.payload, path: "/etc/fstab" },
+    }),
     false,
   );
   assert.equal(
     validateRequest({
       ...persist,
-      payload: { ...persist.payload, metadata: { ...persist.payload.metadata, xattrs: {} } },
+      payload: {
+        ...persist.payload,
+        metadata: { ...persist.payload.metadata, xattrs: {} },
+      },
     }),
     false,
   );
@@ -651,6 +658,57 @@ test("experimental Repair Vault schemas are isolated and structurally closed", (
       payload: { expected: reserved.payload },
     }),
     true,
+  );
+  const cancel = {
+    ...envelope,
+    operation: "repair.backup.cancel",
+    payload: {
+      reservationId,
+      draftBindingSha256: reserved.payload.draftBindingSha256,
+    },
+  };
+  assert.equal(validateRequest(cancel), true);
+  const released = {
+    apiVersion: envelope.apiVersion,
+    requestId: envelope.requestId,
+    stateVersion: 11,
+    operation: "repair.backup.cancel",
+    outcome: "ok",
+    payload: { ...cancel.payload, releasedBytes: 8192 },
+  };
+  assert.equal(validateResponse(released), true);
+  assert.equal(
+    validateResponse({
+      ...released,
+      payload: { ...released.payload, releasedBytes: 0 },
+    }),
+    false,
+  );
+  const durable = {
+    ...reserved.payload,
+    state: "durable",
+    planId: persist.payload.planId,
+    planSha256: persist.payload.planSha256,
+    approvalId: persist.payload.approvalId,
+    approvalSha256: persist.payload.approvalSha256,
+    resourceId: persist.payload.resourceId,
+    resourceSha256: persist.payload.resourceSha256,
+  };
+  assert.equal(
+    validateRequest({
+      ...envelope,
+      operation: "repair.backup.retire",
+      payload: { expected: durable },
+    }),
+    true,
+  );
+  assert.equal(
+    validateRequest({
+      ...envelope,
+      operation: "repair.backup.retire",
+      payload: { expected: reserved.payload },
+    }),
+    false,
   );
   const missingVaultId = structuredClone(reserved);
   delete (missingVaultId.payload as { vaultId?: string }).vaultId;

@@ -15,8 +15,8 @@
 
 #[cfg(feature = "experimental-repair-store")]
 use crate::rescue_repair_vault::{
-    MAX_REPAIR_BACKUP_BYTES, RepairBackupBinding, RepairBackupDraft, RepairBackupState,
-    RepairBackupStatusPayload, RepairFileMetadataV1,
+    MAX_REPAIR_BACKUP_BYTES, RepairBackupBinding, RepairBackupDraft, RepairBackupReleasePayload,
+    RepairBackupState, RepairBackupStatusPayload, RepairFileMetadataV1, RepairReservationId,
 };
 use crate::rescue_vault::{
     API_VERSION, AuditEventType, AuditOutcome, DescriptorDeclaration, DescriptorType, ErrorToken,
@@ -542,6 +542,15 @@ pub enum ClientRequestPayload {
     RepairBackupGet {
         expected: Box<RepairBackupStatusPayload>,
     },
+    #[cfg(feature = "experimental-repair-store")]
+    RepairBackupCancel {
+        reservation_id: RepairReservationId,
+        draft_binding_sha256: Sha256,
+    },
+    #[cfg(feature = "experimental-repair-store")]
+    RepairBackupRetire {
+        expected: Box<RepairBackupStatusPayload>,
+    },
 }
 
 impl ClientRequestPayload {
@@ -568,6 +577,10 @@ impl ClientRequestPayload {
             Self::RepairBackupStatus { .. } => Operation::RepairBackupStatus,
             #[cfg(feature = "experimental-repair-store")]
             Self::RepairBackupGet { .. } => Operation::RepairBackupGet,
+            #[cfg(feature = "experimental-repair-store")]
+            Self::RepairBackupCancel { .. } => Operation::RepairBackupCancel,
+            #[cfg(feature = "experimental-repair-store")]
+            Self::RepairBackupRetire { .. } => Operation::RepairBackupRetire,
         }
     }
 
@@ -602,7 +615,9 @@ impl ClientRequestPayload {
             #[cfg(feature = "experimental-repair-store")]
             Self::RepairBackupReserve { .. }
             | Self::RepairBackupStatus { .. }
-            | Self::RepairBackupGet { .. } => None,
+            | Self::RepairBackupGet { .. }
+            | Self::RepairBackupCancel { .. }
+            | Self::RepairBackupRetire { .. } => None,
         }
     }
 }
@@ -700,6 +715,12 @@ fn valid_client_payload(payload: &ClientRequestPayload) -> bool {
         ClientRequestPayload::RepairBackupGet { expected } => {
             expected.validate().is_ok() && expected.state() == RepairBackupState::Durable
         }
+        #[cfg(feature = "experimental-repair-store")]
+        ClientRequestPayload::RepairBackupCancel { .. } => true,
+        #[cfg(feature = "experimental-repair-store")]
+        ClientRequestPayload::RepairBackupRetire { expected } => {
+            expected.validate().is_ok() && expected.state() == RepairBackupState::Durable
+        }
     }
 }
 
@@ -790,6 +811,14 @@ struct RepairBackupPersistRequestPayload<'a> {
 #[serde(rename_all = "camelCase")]
 struct RepairBackupReferenceRequestPayload<'a> {
     expected: &'a RepairBackupStatusPayload,
+}
+
+#[cfg(feature = "experimental-repair-store")]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RepairBackupCancelRequestPayload<'a> {
+    reservation_id: &'a RepairReservationId,
+    draft_binding_sha256: &'a Sha256,
 }
 
 /// Encodes a typed client request and validates the exact outgoing descriptor
@@ -904,9 +933,21 @@ pub fn encode_client_request(
         ),
         #[cfg(feature = "experimental-repair-store")]
         ClientRequestPayload::RepairBackupStatus { expected }
-        | ClientRequestPayload::RepairBackupGet { expected } => {
+        | ClientRequestPayload::RepairBackupGet { expected }
+        | ClientRequestPayload::RepairBackupRetire { expected } => {
             encode_client_request_payload(request, RepairBackupReferenceRequestPayload { expected })
         }
+        #[cfg(feature = "experimental-repair-store")]
+        ClientRequestPayload::RepairBackupCancel {
+            reservation_id,
+            draft_binding_sha256,
+        } => encode_client_request_payload(
+            request,
+            RepairBackupCancelRequestPayload {
+                reservation_id,
+                draft_binding_sha256,
+            },
+        ),
     }?;
     if bytes.len() > MAX_DATAGRAM_BYTES {
         return Err(ProtocolViolation::DatagramTooLarge);
@@ -1259,6 +1300,8 @@ fn validate_success_state_version(
         request.payload(),
         ClientRequestPayload::RepairBackupReserve { .. }
             | ClientRequestPayload::RepairBackupPersist { .. }
+            | ClientRequestPayload::RepairBackupCancel { .. }
+            | ClientRequestPayload::RepairBackupRetire { .. }
     );
     #[cfg(not(feature = "experimental-repair-store"))]
     let repair_mutation = false;
@@ -1493,6 +1536,34 @@ fn decode_success_payload(
                 Box::new(response.backup),
                 response.output,
             ))
+        }
+        #[cfg(feature = "experimental-repair-store")]
+        ClientRequestPayload::RepairBackupCancel {
+            reservation_id,
+            draft_binding_sha256,
+        } => {
+            require_no_descriptors(descriptors)?;
+            let released: RepairBackupReleasePayload = decode_payload(raw)?;
+            if released.validate().is_err()
+                || released.reservation_id() != reservation_id
+                || released.draft_binding_sha256() != draft_binding_sha256
+            {
+                return Err(ClientResponseDecodeError::InvalidPayload);
+            }
+            Ok(SuccessPayload::RepairBackupReleased(released))
+        }
+        #[cfg(feature = "experimental-repair-store")]
+        ClientRequestPayload::RepairBackupRetire { expected } => {
+            require_no_descriptors(descriptors)?;
+            let released: RepairBackupReleasePayload = decode_payload(raw)?;
+            if released.validate().is_err()
+                || released.reservation_id() != expected.reservation_id()
+                || released.draft_binding_sha256() != expected.draft_binding_sha256()
+                || released.released_bytes() != expected.reserved_bytes()
+            {
+                return Err(ClientResponseDecodeError::InvalidPayload);
+            }
+            Ok(SuccessPayload::RepairBackupReleased(released))
         }
     }
 }
@@ -2455,6 +2526,35 @@ mod tests {
         let decoded = decode_client_response(&get_response, vec![output], &get)
             .expect("get response with output pipe");
         assert_eq!(decoded.descriptor_count(), 1);
+
+        let release_json = format!(
+            "{{\"reservationId\":\"{}\",\"draftBindingSha256\":\"{}\",\"releasedBytes\":8192}}",
+            reservation.as_str(),
+            durable.draft_binding_sha256().as_str()
+        );
+        let cancel = request(ClientRequestPayload::RepairBackupCancel {
+            reservation_id: reservation.clone(),
+            draft_binding_sha256: durable.draft_binding_sha256().clone(),
+        });
+        let cancel_json = encode_client_request(&cancel, &[]).expect("cancel request");
+        assert!(
+            String::from_utf8(cancel_json)
+                .expect("UTF-8 cancel")
+                .contains("repair.backup.cancel")
+        );
+        let cancel_response =
+            success_response(REQUEST_ID, 9, "repair.backup.cancel", &release_json);
+        assert!(decode_client_response(&cancel_response, Vec::new(), &cancel).is_ok());
+        let zero_release = release_json.replace("\"releasedBytes\":8192", "\"releasedBytes\":0");
+        let zero_response = success_response(REQUEST_ID, 9, "repair.backup.cancel", &zero_release);
+        assert!(decode_client_response(&zero_response, Vec::new(), &cancel).is_err());
+
+        let retire = request(ClientRequestPayload::RepairBackupRetire {
+            expected: Box::new(durable),
+        });
+        let retire_response =
+            success_response(REQUEST_ID, 9, "repair.backup.retire", &release_json);
+        assert!(decode_client_response(&retire_response, Vec::new(), &retire).is_ok());
     }
 
     #[test]

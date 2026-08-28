@@ -249,11 +249,16 @@ The journal binds durable Vault identity to the authenticated LUKS UUID and
 provisioned device-identity public key before crash recovery. The live physical
 parent is separately required when a Reserved capability is resumed or
 persisted, while an already Durable backup remains verifiable after reboot.
-Reserve, persist and cancel transitions are intent/complete journal pairs with
-idempotent recovery. The feature is not reachable in the shipping image: no
-RepairBroker account is provisioned and no target resolver or mutation handler
-is installed. Stable cancellation after parent-epoch drift, backup retention
-and journal compaction remain promotion gates.
+Reserve, persist, stable cancel and exact durable retire transitions are
+intent/complete journal pairs with idempotent recovery. Cancel requires the
+reservation ID and draft binding; retire requires the full durable
+plan/approval/resource-bound status. The authenticated journal remains bounded
+to 4096 events (at most 16 MiB of event payload); bounded authenticated release
+tombstones make an exact retry deterministic after a lost response. The feature
+is not reachable in the shipping image: no RepairBroker account or
+target-capability service is activated, and no guard-integrated resolver or
+mutation handler is installed. Automatic bounded retention and crash-safe
+journal compaction remain promotion gates.
 
 ## Provisioning and disposable probe
 

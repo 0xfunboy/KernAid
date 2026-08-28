@@ -4,7 +4,7 @@ use super::{RescueVaultDaemonError, internal_wire};
 #[cfg(feature = "experimental-repair-store")]
 use kernaid_protocol::rescue_repair_vault::{
     MAX_REPAIR_BACKUP_BYTES, RepairBackupBinding, RepairBackupDraft, RepairBackupStatusPayload,
-    RepairFileMetadataV1,
+    RepairFileMetadataV1, RepairReservationId,
 };
 use kernaid_protocol::rescue_vault::{
     MAX_SIGNED_REPORT_ENVELOPE_BYTES, ReportId, ReportSummary, Sha256, ValidatedRequest,
@@ -2782,6 +2782,39 @@ impl WorkerHandle {
     }
 
     #[cfg(feature = "experimental-repair-store")]
+    pub(super) fn repair_backup_cancel(
+        &self,
+        reservation_id: &RepairReservationId,
+        draft_binding_sha256: &Sha256,
+        deadline: Instant,
+    ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
+        self.transact_repair_without_descriptor(
+            internal_wire::WorkerRepairCommand::Cancel {
+                reservation_id: reservation_id.as_str().to_owned(),
+                draft_binding_sha256: draft_binding_sha256.bytes(),
+            },
+            deadline,
+        )
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    pub(super) fn repair_backup_retire(
+        &self,
+        expected: &RepairBackupStatusPayload,
+        deadline: Instant,
+    ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
+        self.transact_repair_without_descriptor(
+            internal_wire::WorkerRepairCommand::Retire {
+                expected: Box::new(
+                    internal_wire::WorkerRepairStatus::from_protocol(expected)
+                        .map_err(|_| RescueVaultDaemonError::ProtocolFailure)?,
+                ),
+            },
+            deadline,
+        )
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
     fn transact_repair_without_descriptor(
         &self,
         repair: internal_wire::WorkerRepairCommand,
@@ -3748,6 +3781,30 @@ fn response_matches(
                 | Result::RepairReconciliationRequired
                 | Result::RepairStorageUnavailable
                 | Result::IoFailed
+                | Result::CleanupFailed
+                | Result::Busy
+        ),
+        #[cfg(feature = "experimental-repair-store")]
+        Command::RepairBackupCancel => matches!(
+            response.code,
+            Result::RepairBackupCancelled
+                | Result::RepairBackupNotFound
+                | Result::RepairInvalidRequest
+                | Result::RepairConflict
+                | Result::RepairReconciliationRequired
+                | Result::RepairStorageUnavailable
+                | Result::CleanupFailed
+                | Result::Busy
+        ),
+        #[cfg(feature = "experimental-repair-store")]
+        Command::RepairBackupRetire => matches!(
+            response.code,
+            Result::RepairBackupRetired
+                | Result::RepairBackupNotFound
+                | Result::RepairInvalidRequest
+                | Result::RepairConflict
+                | Result::RepairReconciliationRequired
+                | Result::RepairStorageUnavailable
                 | Result::CleanupFailed
                 | Result::Busy
         ),

@@ -641,6 +641,76 @@ fn handle_command(
             };
             (response, false)
         }
+        #[cfg(feature = "experimental-repair-store")]
+        Command::RepairBackupCancel => {
+            if descriptor.is_some() {
+                return (
+                    internal_wire::WorkerResponse::new(request_id, Result::RepairInvalidRequest),
+                    false,
+                );
+            }
+            let Some(internal_wire::WorkerRepairCommand::Cancel {
+                reservation_id,
+                draft_binding_sha256,
+            }) = command.repair.as_ref()
+            else {
+                return (
+                    internal_wire::WorkerResponse::new(request_id, Result::RepairInvalidRequest),
+                    false,
+                );
+            };
+            let cancelled = match state {
+                WorkerVaultState::Locked => Err(Result::Busy),
+                WorkerVaultState::Unlocked(_) if validate_no_active_swap().is_err() => {
+                    Err(Result::CleanupFailed)
+                }
+                WorkerVaultState::Unlocked(mounted) => {
+                    cancel_repair_backup(mounted, reservation_id, *draft_binding_sha256)
+                }
+            };
+            let response = match cancelled {
+                Ok(released) => internal_wire::WorkerResponse::repair_released(
+                    request_id,
+                    Result::RepairBackupCancelled,
+                    released,
+                ),
+                Err(code) => internal_wire::WorkerResponse::new(request_id, code),
+            };
+            (response, false)
+        }
+        #[cfg(feature = "experimental-repair-store")]
+        Command::RepairBackupRetire => {
+            if descriptor.is_some() {
+                return (
+                    internal_wire::WorkerResponse::new(request_id, Result::RepairInvalidRequest),
+                    false,
+                );
+            }
+            let Some(internal_wire::WorkerRepairCommand::Retire { expected }) =
+                command.repair.as_ref()
+            else {
+                return (
+                    internal_wire::WorkerResponse::new(request_id, Result::RepairInvalidRequest),
+                    false,
+                );
+            };
+            let retired = match state {
+                WorkerVaultState::Locked => Err(Result::Busy),
+                WorkerVaultState::Unlocked(_) if validate_no_active_swap().is_err() => {
+                    Err(Result::CleanupFailed)
+                }
+                WorkerVaultState::Unlocked(mounted) => retire_repair_backup(mounted, expected),
+            };
+            let response = match retired {
+                Ok(released) => internal_wire::WorkerResponse::repair_released(
+                    request_id,
+                    Result::RepairBackupRetired,
+                    released,
+                ),
+                Err(code) => internal_wire::WorkerResponse::new(request_id, code),
+            };
+            (response, false)
+        }
         #[cfg(feature = "experimental-codex-home-lease")]
         Command::ProviderCodexHomeLease => {
             if descriptor.is_some() || response_descriptor.is_some() {
@@ -1198,6 +1268,58 @@ fn get_repair_backup(
         return Err(Result::RepairConflict);
     }
     Ok(status)
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn cancel_repair_backup(
+    mounted: &MountedRescueVault,
+    reservation_id: &str,
+    draft_binding_sha256: [u8; 32],
+) -> Result<u64, internal_wire::WorkerResultCode> {
+    let reservation_id =
+        StoreReservationId::parse(reservation_id).map_err(map_repair_store_error)?;
+    let mut store = mounted
+        .secrets()
+        .open_repair_store()
+        .map_err(map_repair_store_error)?;
+    store
+        .cancel_reserved(&reservation_id, &encode_worker_sha256(draft_binding_sha256))
+        .map_err(map_repair_store_error)
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn retire_repair_backup(
+    mounted: &MountedRescueVault,
+    expected: &internal_wire::WorkerRepairStatus,
+) -> Result<u64, internal_wire::WorkerResultCode> {
+    use internal_wire::{WorkerRepairState, WorkerResultCode as Result};
+    if expected.state != WorkerRepairState::Durable || expected.binding.is_none() {
+        return Err(Result::RepairInvalidRequest);
+    }
+    let reservation_id = StoreReservationId::parse(expected.reservation_id.clone())
+        .map_err(map_repair_store_error)?;
+    let mut store = mounted
+        .secrets()
+        .open_repair_store()
+        .map_err(map_repair_store_error)?;
+    let draft_binding = encode_worker_sha256(expected.draft_binding_sha256);
+    let metadata = match store
+        .backup_status(&reservation_id, &draft_binding)
+        .map_err(map_repair_store_error)?
+    {
+        StoreRepairBackupStatus::Absent => return Err(Result::RepairBackupNotFound),
+        StoreRepairBackupStatus::Durable(metadata) => metadata,
+        StoreRepairBackupStatus::Reserved(_) => return Err(Result::RepairConflict),
+        StoreRepairBackupStatus::ReconciliationRequired => {
+            return Err(Result::RepairReconciliationRequired);
+        }
+    };
+    if repair_durable_status(&metadata)? != *expected {
+        return Err(Result::RepairConflict);
+    }
+    store
+        .retire_backup(&metadata)
+        .map_err(map_repair_store_error)
 }
 
 #[cfg(feature = "experimental-repair-store")]

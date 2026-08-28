@@ -40,7 +40,9 @@
         "repair.backup.reserve",
         "repair.backup.persist",
         "repair.backup.status",
-        "repair.backup.get"
+        "repair.backup.get",
+        "repair.backup.cancel",
+        "repair.backup.retire"
       ]
     },
     "outcome": { "enum": ["ok", "error"] },
@@ -304,10 +306,7 @@
           "maxLength": 128,
           "pattern": "^[A-Za-z0-9_.:/-]+$",
           "not": {
-            "anyOf": [
-              { "pattern": "^/" },
-              { "pattern": "\\.\\." }
-            ]
+            "anyOf": [{ "pattern": "^/" }, { "pattern": "\\.\\." }]
           }
         },
         "resourceSha256": { "$ref": "#/$defs/sha256" }
@@ -318,6 +317,20 @@
         { "$ref": "#/$defs/repairReservedBackup" },
         { "$ref": "#/$defs/repairDurableBackup" }
       ]
+    },
+    "repairBackupReleased": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reservationId", "draftBindingSha256", "releasedBytes"],
+      "properties": {
+        "reservationId": { "$ref": "#/$defs/reservationId" },
+        "draftBindingSha256": { "$ref": "#/$defs/sha256" },
+        "releasedBytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16777216
+        }
+      }
     }
   },
   "allOf": [
@@ -613,6 +626,22 @@
               "output": { "$ref": "#/$defs/repairBackupOutput" }
             }
           }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": { "const": "ok" },
+          "operation": {
+            "enum": ["repair.backup.cancel", "repair.backup.retire"]
+          }
+        },
+        "required": ["outcome", "operation"]
+      },
+      "then": {
+        "properties": {
+          "payload": { "$ref": "#/$defs/repairBackupReleased" }
         }
       }
     }

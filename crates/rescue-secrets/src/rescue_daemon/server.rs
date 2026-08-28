@@ -14,8 +14,8 @@ use super::{
 use super::{group_has_exact_codex_boundaries, passwd_has_exact_codex_agent};
 #[cfg(feature = "experimental-repair-store")]
 use kernaid_protocol::rescue_repair_vault::{
-    MAX_REPAIR_BACKUP_BYTES, RepairBackupBinding, RepairBackupDraft, RepairBackupState,
-    RepairBackupStatusPayload, RepairFileMetadataV1,
+    MAX_REPAIR_BACKUP_BYTES, RepairBackupBinding, RepairBackupDraft, RepairBackupReleasePayload,
+    RepairBackupState, RepairBackupStatusPayload, RepairFileMetadataV1, RepairReservationId,
 };
 use kernaid_protocol::rescue_vault::{
     AgentRole, DescriptorDeclaration, DescriptorType, ErrorToken, MAX_INITIAL_STATE_VERSION,
@@ -324,6 +324,25 @@ trait WorkerBoundary: Send + Sync {
         let _ = (expected, deadline);
         Err(RescueVaultDaemonError::ProtocolFailure)
     }
+    #[cfg(feature = "experimental-repair-store")]
+    fn repair_backup_cancel(
+        &self,
+        reservation_id: &RepairReservationId,
+        draft_binding_sha256: &Sha256,
+        deadline: Instant,
+    ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
+        let _ = (reservation_id, draft_binding_sha256, deadline);
+        Err(RescueVaultDaemonError::ProtocolFailure)
+    }
+    #[cfg(feature = "experimental-repair-store")]
+    fn repair_backup_retire(
+        &self,
+        expected: &RepairBackupStatusPayload,
+        deadline: Instant,
+    ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
+        let _ = (expected, deadline);
+        Err(RescueVaultDaemonError::ProtocolFailure)
+    }
     fn verify_healthy(&self) -> Result<(), RescueVaultDaemonError>;
     fn exited(&self) -> Result<bool, RescueVaultDaemonError>;
     fn fault_and_terminate(&self, deadline: Instant) -> Result<(), RescueVaultDaemonError>;
@@ -427,6 +446,25 @@ impl WorkerBoundary for WorkerHandle {
         deadline: Instant,
     ) -> WorkerRepairGetResult {
         WorkerHandle::repair_backup_get(self, expected, deadline)
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    fn repair_backup_cancel(
+        &self,
+        reservation_id: &RepairReservationId,
+        draft_binding_sha256: &Sha256,
+        deadline: Instant,
+    ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
+        WorkerHandle::repair_backup_cancel(self, reservation_id, draft_binding_sha256, deadline)
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    fn repair_backup_retire(
+        &self,
+        expected: &RepairBackupStatusPayload,
+        deadline: Instant,
+    ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
+        WorkerHandle::repair_backup_retire(self, expected, deadline)
     }
 
     fn verify_healthy(&self) -> Result<(), RescueVaultDaemonError> {
@@ -1669,7 +1707,10 @@ fn handle_connection_by(
     let mutation = mutation
         || matches!(
             request.operation(),
-            Operation::RepairBackupReserve | Operation::RepairBackupPersist
+            Operation::RepairBackupReserve
+                | Operation::RepairBackupPersist
+                | Operation::RepairBackupCancel
+                | Operation::RepairBackupRetire
         );
     let started = Instant::now();
     let (version, result) = supervisor.handle_connected_request(
@@ -2239,6 +2280,14 @@ impl Supervisor {
             #[cfg(feature = "experimental-repair-store")]
             Operation::RepairBackupGet => {
                 self.handle_repair_backup_get(request, started, &connection)
+            }
+            #[cfg(feature = "experimental-repair-store")]
+            Operation::RepairBackupCancel => {
+                self.handle_repair_backup_cancel(request, started, &connection)
+            }
+            #[cfg(feature = "experimental-repair-store")]
+            Operation::RepairBackupRetire => {
+                self.handle_repair_backup_retire(request, started, &connection)
             }
             #[cfg(not(feature = "experimental-codex-home-lease"))]
             Operation::ProviderCodexHomeLease => {
@@ -2972,6 +3021,123 @@ impl Supervisor {
                 self.finish_repair_error(request, response.code, false, deadline)
             }
             Ok((_, Some(_))) | Err(_) => self.repair_worker_fault(request, deadline),
+        }
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    fn handle_repair_backup_cancel(
+        self: &Arc<Self>,
+        request: ValidatedRequest,
+        started: Instant,
+        connection: &ClientConnection<'_>,
+    ) -> (u64, HandlerResult) {
+        let deadline = started
+            .checked_add(WORKER_OPERATION_TIMEOUT)
+            .unwrap_or(started);
+        let (reservation_id, draft_binding_sha256) = match request.payload() {
+            RequestPayload::RepairBackupCancel {
+                reservation_id,
+                draft_binding_sha256,
+            } => (reservation_id.clone(), draft_binding_sha256.clone()),
+            _ => {
+                let version = self.snapshot().version;
+                return (version, HandlerResult::Error(request, ErrorToken::IoFailed));
+            }
+        };
+        if let Err((version, error)) = self.prepare_application_operation(
+            request.expected_state_version(),
+            true,
+            connection,
+            deadline,
+        ) {
+            return (version, HandlerResult::Error(request, error));
+        }
+        let Some(worker) = self.worker.as_ref() else {
+            self.mark_fault_by(deadline);
+            return (
+                self.snapshot().version,
+                HandlerResult::Error(request, ErrorToken::RebootRequired),
+            );
+        };
+        match worker.repair_backup_cancel(&reservation_id, &draft_binding_sha256, deadline) {
+            Ok(response)
+                if response.code == internal_wire::WorkerResultCode::RepairBackupCancelled =>
+            {
+                let released = response.repair_released_bytes.and_then(|bytes| {
+                    RepairBackupReleasePayload::new(reservation_id, draft_binding_sha256, bytes)
+                        .ok()
+                });
+                match released {
+                    Some(released) => self.finish_application_mutation(
+                        request,
+                        Ok(SuccessPayload::RepairBackupReleased(released)),
+                        deadline,
+                    ),
+                    None => self.repair_worker_fault(request, deadline),
+                }
+            }
+            Ok(response) => self.finish_repair_error(request, response.code, true, deadline),
+            Err(_) => self.repair_worker_fault(request, deadline),
+        }
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    fn handle_repair_backup_retire(
+        self: &Arc<Self>,
+        request: ValidatedRequest,
+        started: Instant,
+        connection: &ClientConnection<'_>,
+    ) -> (u64, HandlerResult) {
+        let deadline = started
+            .checked_add(WORKER_OPERATION_TIMEOUT)
+            .unwrap_or(started);
+        let expected = match request.payload() {
+            RequestPayload::RepairBackupRetire { expected } => (**expected).clone(),
+            _ => {
+                let version = self.snapshot().version;
+                return (version, HandlerResult::Error(request, ErrorToken::IoFailed));
+            }
+        };
+        if expected.state() != RepairBackupState::Durable {
+            let version = self.snapshot().version;
+            return (version, HandlerResult::Error(request, ErrorToken::IoFailed));
+        }
+        if let Err((version, error)) = self.prepare_application_operation(
+            request.expected_state_version(),
+            true,
+            connection,
+            deadline,
+        ) {
+            return (version, HandlerResult::Error(request, error));
+        }
+        let Some(worker) = self.worker.as_ref() else {
+            self.mark_fault_by(deadline);
+            return (
+                self.snapshot().version,
+                HandlerResult::Error(request, ErrorToken::RebootRequired),
+            );
+        };
+        match worker.repair_backup_retire(&expected, deadline) {
+            Ok(response)
+                if response.code == internal_wire::WorkerResultCode::RepairBackupRetired
+                    && response.repair_released_bytes == Some(expected.reserved_bytes()) =>
+            {
+                let released = RepairBackupReleasePayload::new(
+                    expected.reservation_id().clone(),
+                    expected.draft_binding_sha256().clone(),
+                    expected.reserved_bytes(),
+                );
+                match released {
+                    Ok(released) => self.finish_application_mutation(
+                        request,
+                        Ok(SuccessPayload::RepairBackupReleased(released)),
+                        deadline,
+                    ),
+                    Err(_) => self.repair_worker_fault(request, deadline),
+                }
+            }
+            Ok(response) => self.finish_repair_error(request, response.code, true, deadline),
+            Err(_) => self.repair_worker_fault(request, deadline),
         }
     }
 
@@ -5356,6 +5522,8 @@ fn external_operation_is_enabled(
                 | Operation::RepairBackupPersist
                 | Operation::RepairBackupStatus
                 | Operation::RepairBackupGet
+                | Operation::RepairBackupCancel
+                | Operation::RepairBackupRetire
         ),
     }
 }
@@ -7947,12 +8115,14 @@ mod tests {
 
     #[cfg(feature = "experimental-repair-store")]
     #[test]
-    fn repair_broker_has_only_the_four_repair_operations() {
+    fn repair_broker_has_only_the_six_repair_operations() {
         let repair_operations = [
             Operation::RepairBackupReserve,
             Operation::RepairBackupPersist,
             Operation::RepairBackupStatus,
             Operation::RepairBackupGet,
+            Operation::RepairBackupCancel,
+            Operation::RepairBackupRetire,
         ];
         for operation in repair_operations {
             assert!(external_operation_is_enabled(

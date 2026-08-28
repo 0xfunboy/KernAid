@@ -51,8 +51,16 @@ const DIRECTORY_MODE: u32 = 0o700;
 const FILE_MODE: u32 = 0o600;
 const MAX_BACKUP_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_RESERVATIONS: usize = 64;
-const MAX_JOURNAL_EVENTS: u64 = 256;
+// Bounded at 16 MiB of authenticated event payload. This permits repeated
+// reserve/persist/retire lifecycles while journal compaction remains a
+// separate promotion gate; it is intentionally finite.
+const MAX_JOURNAL_EVENTS: u64 = 4096;
 const MAX_EVENT_BYTES: u64 = 4096;
+// Release acknowledgements are retained independently from active reservation
+// slots so a lost response can be replayed exactly. Every tombstone requires
+// at least an authenticated intent/complete pair, so the journal bound also
+// gives this map a strict lifetime bound without inventing unbounded state.
+const MAX_RELEASE_TOMBSTONES: usize = (MAX_JOURNAL_EVENTS / 2) as usize;
 const PIPEFS_MAGIC: u64 = 0x5049_5045;
 const DEFAULT_SOURCE_DEADLINE: Duration = Duration::from_secs(30);
 const MAX_LAYOUT_ENTRIES: usize = 72;
@@ -654,6 +662,16 @@ enum RepairEvent {
         #[serde(rename = "reservationId")]
         reservation_id: ReservationId,
     },
+    #[serde(rename = "repair.backup.retire.intent")]
+    RetireIntent {
+        #[serde(rename = "reservationId")]
+        reservation_id: ReservationId,
+    },
+    #[serde(rename = "repair.backup.retire.complete")]
+    RetireComplete {
+        #[serde(rename = "reservationId")]
+        reservation_id: ReservationId,
+    },
 }
 
 struct ReservationRecord {
@@ -672,12 +690,26 @@ enum ReservationPhase {
     Reserved,
     PersistPending(RepairBinding),
     CancelPending,
+    RetirePending(RepairBinding),
     Durable(RepairBinding),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReleaseOperation {
+    Cancel,
+    Retire,
+}
+
+struct ReleaseTombstone {
+    operation: ReleaseOperation,
+    record: ReservationRecord,
 }
 
 #[derive(Default)]
 struct RecoveredState {
     reservations: BTreeMap<ReservationId, ReservationRecord>,
+    released: BTreeMap<ReservationId, ReleaseTombstone>,
+    seen_reservation_ids: BTreeSet<ReservationId>,
     pending: Option<ReservationId>,
 }
 
@@ -919,28 +951,56 @@ impl<'vault> RepairVaultStore<'vault> {
         })
     }
 
-    /// Cancel one authenticated, still-empty reservation. The backing object
-    /// is durably removed before the cancellation is committed to the journal.
+    /// Cancel one checked-out, still-empty reservation capability.
     pub fn cancel_reservation(
         &mut self,
         reservation: ReservedRepairBackup,
     ) -> Result<(), RepairVaultStoreError> {
-        self.require_mutable()?;
-        self.require_event_capacity(2)?;
         self.consume_checkout(reservation.reservation_id())?;
+        self.cancel_reserved(
+            reservation.reservation_id(),
+            reservation.reservation_binding_sha256(),
+        )
+        .map(|_| ())
+    }
+
+    /// Cancel a stable Reserved reservation using only its opaque identifier
+    /// and exact draft binding. This lifecycle release deliberately does not
+    /// re-mint live-parent write authority.
+    pub fn cancel_reserved(
+        &mut self,
+        reservation_id: &ReservationId,
+        reservation_binding_sha256: &str,
+    ) -> Result<u64, RepairVaultStoreError> {
+        self.require_mutable()?;
+        if !valid_sha256(reservation_binding_sha256) {
+            return Err(RepairVaultStoreError::ReservationConflict);
+        }
+        if let Some(released) = self.state.released.get(reservation_id) {
+            self.verify_release_tombstone(released)?;
+            if released.operation == ReleaseOperation::Cancel
+                && released.record.reservation_binding_sha256 == reservation_binding_sha256
+            {
+                return Ok(released.record.reserved_capacity_bytes);
+            }
+            return Err(RepairVaultStoreError::ReservationConflict);
+        }
+        self.require_event_capacity(2)?;
         let record = self
             .state
             .reservations
-            .get(reservation.reservation_id())
+            .get(reservation_id)
             .ok_or(RepairVaultStoreError::ReservationNotFound)?;
         self.verify_record_vault_identity(record)?;
         if !matches!(record.phase, ReservationPhase::Reserved)
-            || reservation.reservation_binding_sha256() != record.reservation_binding_sha256
-            || reservation.vault_identity_fingerprint() != self.vault_identity_fingerprint
+            || reservation_binding_sha256 != record.reservation_binding_sha256
         {
             return Err(RepairVaultStoreError::ReservationConflict);
         }
-        let reservation_id = reservation.reservation_id().clone();
+        self.verify_reserved_file(reservation_id, record)?;
+        let released_bytes = record.reserved_capacity_bytes;
+        let reservation_id = reservation_id.clone();
+        self.checked_out.remove(&reservation_id);
         self.append_event(RepairEvent::CancelIntent {
             reservation_id: reservation_id.clone(),
         })?;
@@ -949,7 +1009,53 @@ impl<'vault> RepairVaultStore<'vault> {
         {
             self.remove_pending_backup_file(&reservation_id, &existing)?;
         }
-        self.append_event(RepairEvent::CancelComplete { reservation_id })
+        self.append_event(RepairEvent::CancelComplete { reservation_id })?;
+        Ok(released_bytes)
+    }
+
+    /// Crash-safely retire one exact Durable backup. The caller must present
+    /// every immutable reservation field and the complete persisted
+    /// plan/approval/resource binding as returned by the store.
+    pub fn retire_backup(
+        &mut self,
+        expected: &VerifiedBackupMetadata,
+    ) -> Result<u64, RepairVaultStoreError> {
+        self.require_mutable()?;
+        if let Some(released) = self.state.released.get(expected.reservation_id()) {
+            self.verify_release_tombstone(released)?;
+            if released.operation == ReleaseOperation::Retire
+                && self.released_verified_metadata(expected.reservation_id(), released)?
+                    == *expected
+            {
+                return Ok(released.record.reserved_capacity_bytes);
+            }
+            return Err(RepairVaultStoreError::ReservationConflict);
+        }
+        self.require_event_capacity(2)?;
+        let record = self
+            .state
+            .reservations
+            .get(expected.reservation_id())
+            .ok_or(RepairVaultStoreError::ReservationNotFound)?;
+        self.verify_record_vault_identity(record)?;
+        if !matches!(record.phase, ReservationPhase::Durable(_))
+            || self.verified_metadata(expected.reservation_id())? != *expected
+        {
+            return Err(RepairVaultStoreError::ReservationConflict);
+        }
+        self.verify_durable_file(expected.reservation_id(), record)?;
+        let released_bytes = record.reserved_capacity_bytes;
+        let reservation_id = expected.reservation_id().clone();
+        self.append_event(RepairEvent::RetireIntent {
+            reservation_id: reservation_id.clone(),
+        })?;
+        if let Some((_, existing)) =
+            self.open_pending_backup_file(&reservation_id, OFlags::RDONLY)?
+        {
+            self.remove_pending_backup_file(&reservation_id, &existing)?;
+        }
+        self.append_event(RepairEvent::RetireComplete { reservation_id })?;
+        Ok(released_bytes)
     }
 
     /// Rehydrate a reserved capability from authenticated journal state after
@@ -992,6 +1098,12 @@ impl<'vault> RepairVaultStore<'vault> {
             return Ok(RepairBackupStatus::ReconciliationRequired);
         }
         let Some(record) = self.state.reservations.get(reservation_id) else {
+            if let Some(released) = self.state.released.get(reservation_id) {
+                self.verify_release_tombstone(released)?;
+                if released.record.reservation_binding_sha256 != reservation_binding_sha256 {
+                    return Err(RepairVaultStoreError::ReservationConflict);
+                }
+            }
             return Ok(RepairBackupStatus::Absent);
         };
         self.verify_record_vault_identity(record)?;
@@ -1001,7 +1113,8 @@ impl<'vault> RepairVaultStore<'vault> {
         match &record.phase {
             ReservationPhase::ReservePending
             | ReservationPhase::PersistPending(_)
-            | ReservationPhase::CancelPending => Ok(RepairBackupStatus::ReconciliationRequired),
+            | ReservationPhase::CancelPending
+            | ReservationPhase::RetirePending(_) => Ok(RepairBackupStatus::ReconciliationRequired),
             ReservationPhase::Reserved => {
                 self.verify_reserved_file(reservation_id, record)?;
                 Ok(RepairBackupStatus::Reserved(
@@ -1097,6 +1210,9 @@ impl<'vault> RepairVaultStore<'vault> {
         for record in self.state.reservations.values() {
             self.verify_record_vault_identity(record)?;
         }
+        for released in self.state.released.values() {
+            self.verify_release_tombstone(released)?;
+        }
         Ok(())
     }
 
@@ -1122,6 +1238,18 @@ impl<'vault> RepairVaultStore<'vault> {
             Err(RepairVaultStoreError::ReservationConflict)
         } else {
             Ok(())
+        }
+    }
+
+    fn verify_release_tombstone(
+        &self,
+        released: &ReleaseTombstone,
+    ) -> Result<(), RepairVaultStoreError> {
+        self.verify_record_vault_identity(&released.record)?;
+        match (&released.operation, &released.record.phase) {
+            (ReleaseOperation::Cancel, ReservationPhase::CancelPending)
+            | (ReleaseOperation::Retire, ReservationPhase::RetirePending(_)) => Ok(()),
+            _ => Err(RepairVaultStoreError::CorruptJournal),
         }
     }
 
@@ -1174,7 +1302,7 @@ impl<'vault> RepairVaultStore<'vault> {
     fn generate_unused_reservation_id(&self) -> Result<ReservationId, RepairVaultStoreError> {
         for _ in 0..16 {
             let candidate = ReservationId::generate();
-            if !self.state.reservations.contains_key(&candidate)
+            if !self.state.seen_reservation_ids.contains(&candidate)
                 && named_optional_state(
                     &self.backups_fd,
                     &backup_filename(&candidate),
@@ -1244,24 +1372,27 @@ impl<'vault> RepairVaultStore<'vault> {
         let ReservationPhase::Durable(binding) = &record.phase else {
             return Err(RepairVaultStoreError::ReservationNotReady);
         };
-        Ok(VerifiedBackupMetadata {
-            reservation_id: reservation_id.clone(),
-            backup_locator: backup_locator(reservation_id),
-            reservation_binding_sha256: record.reservation_binding_sha256.clone(),
-            backup_sha256: encode_hex(&record.draft.expected_backup_sha256),
-            metadata_sha256: encode_hex(&record.draft.metadata_sha256),
-            backup_size_bytes: record.draft.backup_size_bytes,
-            reserved_capacity_bytes: record.reserved_capacity_bytes,
-            vault_id: record.vault_id.clone(),
-            vault_identity_fingerprint: record.vault_identity_fingerprint.clone(),
-            physical_parent_fingerprint: record.physical_parent_fingerprint.clone(),
-            plan_id: binding.plan_id.clone(),
-            plan_sha256: encode_hex(&binding.plan_sha256),
-            approval_id: binding.approval_id.clone(),
-            approval_sha256: encode_hex(&binding.approval_sha256),
-            resource_id: binding.resource_id.clone(),
-            resource_sha256: encode_hex(&binding.resource_sha256),
-        })
+        Ok(verified_metadata_from_record(
+            reservation_id,
+            record,
+            binding,
+        ))
+    }
+
+    fn released_verified_metadata(
+        &self,
+        reservation_id: &ReservationId,
+        released: &ReleaseTombstone,
+    ) -> Result<VerifiedBackupMetadata, RepairVaultStoreError> {
+        self.verify_release_tombstone(released)?;
+        let ReservationPhase::RetirePending(binding) = &released.record.phase else {
+            return Err(RepairVaultStoreError::ReservationConflict);
+        };
+        Ok(verified_metadata_from_record(
+            reservation_id,
+            &released.record,
+            binding,
+        ))
     }
 
     fn allocate_and_verify(
@@ -1534,6 +1665,14 @@ impl<'vault> RepairVaultStore<'vault> {
                 }
                 self.append_event(RepairEvent::CancelComplete { reservation_id })
             }
+            ReservationPhase::RetirePending(_) => {
+                if let Some((_, state)) =
+                    self.open_pending_backup_file(&reservation_id, OFlags::RDONLY)?
+                {
+                    self.remove_pending_backup_file(&reservation_id, &state)?;
+                }
+                self.append_event(RepairEvent::RetireComplete { reservation_id })
+            }
             ReservationPhase::Reserved | ReservationPhase::Durable(_) => {
                 Err(RepairVaultStoreError::CorruptJournal)
             }
@@ -1744,6 +1883,31 @@ impl<'vault> RepairVaultStore<'vault> {
     }
 }
 
+fn verified_metadata_from_record(
+    reservation_id: &ReservationId,
+    record: &ReservationRecord,
+    binding: &RepairBinding,
+) -> VerifiedBackupMetadata {
+    VerifiedBackupMetadata {
+        reservation_id: reservation_id.clone(),
+        backup_locator: backup_locator(reservation_id),
+        reservation_binding_sha256: record.reservation_binding_sha256.clone(),
+        backup_sha256: encode_hex(&record.draft.expected_backup_sha256),
+        metadata_sha256: encode_hex(&record.draft.metadata_sha256),
+        backup_size_bytes: record.draft.backup_size_bytes,
+        reserved_capacity_bytes: record.reserved_capacity_bytes,
+        vault_id: record.vault_id.clone(),
+        vault_identity_fingerprint: record.vault_identity_fingerprint.clone(),
+        physical_parent_fingerprint: record.physical_parent_fingerprint.clone(),
+        plan_id: binding.plan_id.clone(),
+        plan_sha256: encode_hex(&binding.plan_sha256),
+        approval_id: binding.approval_id.clone(),
+        approval_sha256: encode_hex(&binding.approval_sha256),
+        resource_id: binding.resource_id.clone(),
+        resource_sha256: encode_hex(&binding.resource_sha256),
+    }
+}
+
 fn replay_repair_event(
     state: &mut RecoveredState,
     entry: JournalEntryRef<'_>,
@@ -1780,12 +1944,15 @@ fn apply_repair_event(
                 || state.pending.is_some()
                 || state.reservations.len() >= MAX_RESERVATIONS
                 || state.reservations.contains_key(&reservation_id)
+                || state.released.contains_key(&reservation_id)
+                || state.seen_reservation_ids.contains(&reservation_id)
                 || !valid_vault_id(&vault_id)
                 || !valid_sha256(&vault_identity_fingerprint)
                 || !valid_sha256(&physical_parent_fingerprint)
             {
                 return Err(RepairVaultStoreError::CorruptJournal);
             }
+            state.seen_reservation_ids.insert(reservation_id.clone());
             state.pending = Some(reservation_id.clone());
             state.reservations.insert(
                 reservation_id,
@@ -1907,6 +2074,8 @@ fn apply_repair_event(
         }
         RepairEvent::CancelComplete { reservation_id } => {
             if state.pending.as_ref() != Some(&reservation_id)
+                || state.released.len() >= MAX_RELEASE_TOMBSTONES
+                || state.released.contains_key(&reservation_id)
                 || !matches!(
                     state
                         .reservations
@@ -1917,7 +2086,66 @@ fn apply_repair_event(
             {
                 return Err(RepairVaultStoreError::CorruptJournal);
             }
-            state.reservations.remove(&reservation_id);
+            let record = state
+                .reservations
+                .remove(&reservation_id)
+                .ok_or(RepairVaultStoreError::CorruptJournal)?;
+            state.released.insert(
+                reservation_id,
+                ReleaseTombstone {
+                    operation: ReleaseOperation::Cancel,
+                    record,
+                },
+            );
+            state.pending = None;
+        }
+        RepairEvent::RetireIntent { reservation_id } => {
+            if state.pending.is_some()
+                || !matches!(
+                    state
+                        .reservations
+                        .get(&reservation_id)
+                        .map(|record| &record.phase),
+                    Some(ReservationPhase::Durable(_))
+                )
+            {
+                return Err(RepairVaultStoreError::CorruptJournal);
+            }
+            let record = state
+                .reservations
+                .get_mut(&reservation_id)
+                .ok_or(RepairVaultStoreError::CorruptJournal)?;
+            let ReservationPhase::Durable(binding) = &record.phase else {
+                return Err(RepairVaultStoreError::CorruptJournal);
+            };
+            record.phase = ReservationPhase::RetirePending(binding.clone());
+            state.pending = Some(reservation_id);
+        }
+        RepairEvent::RetireComplete { reservation_id } => {
+            if state.pending.as_ref() != Some(&reservation_id)
+                || state.released.len() >= MAX_RELEASE_TOMBSTONES
+                || state.released.contains_key(&reservation_id)
+                || !matches!(
+                    state
+                        .reservations
+                        .get(&reservation_id)
+                        .map(|record| &record.phase),
+                    Some(ReservationPhase::RetirePending(_))
+                )
+            {
+                return Err(RepairVaultStoreError::CorruptJournal);
+            }
+            let record = state
+                .reservations
+                .remove(&reservation_id)
+                .ok_or(RepairVaultStoreError::CorruptJournal)?;
+            state.released.insert(
+                reservation_id,
+                ReleaseTombstone {
+                    operation: ReleaseOperation::Retire,
+                    record,
+                },
+            );
             state.pending = None;
         }
     }
@@ -3768,5 +3996,151 @@ mod tests {
             ),
             Err(RepairVaultStoreError::InvalidBinding)
         );
+    }
+
+    #[test]
+    fn stable_cancel_releases_reserved_capacity_without_live_parent_authority() {
+        let fixture = Fixture::new();
+        let bytes = b"cancel without parent remint\n";
+        let reservation_id = reservation_id('a');
+        let backup_draft = draft(bytes, 4096);
+        let draft_binding = reservation_binding(&backup_draft);
+        let mut store = fixture
+            .vault
+            .open_repair_store()
+            .expect("open repair store");
+        let stale_parent = if store.physical_parent_fingerprint == "f".repeat(64) {
+            "e".repeat(64)
+        } else {
+            "f".repeat(64)
+        };
+        store
+            .append_event(RepairEvent::ReserveIntent {
+                reservation_id: reservation_id.clone(),
+                draft: backup_draft,
+                reservation_binding_sha256: draft_binding.clone(),
+                reserved_capacity_bytes: 4096,
+                vault_id: store.vault_id.clone(),
+                vault_identity_fingerprint: store.vault_identity_fingerprint.clone(),
+                physical_parent_fingerprint: stale_parent,
+            })
+            .expect("append historical reserve intent");
+        store
+            .allocate_and_verify(&reservation_id, 4096)
+            .expect("allocate reservation");
+        store
+            .append_event(RepairEvent::ReserveComplete {
+                reservation_id: reservation_id.clone(),
+            })
+            .expect("complete reservation");
+        assert_eq!(
+            store.resume_reserved(&reservation_id, &draft_binding).err(),
+            Some(RepairVaultStoreError::ReservationConflict)
+        );
+        assert_eq!(
+            store.cancel_reserved(&reservation_id, &draft_binding),
+            Ok(4096)
+        );
+        // A lost success response must be retryable without another journal
+        // mutation or live-parent authority.
+        assert_eq!(
+            store.cancel_reserved(&reservation_id, &draft_binding),
+            Ok(4096)
+        );
+        assert_eq!(
+            store.cancel_reserved(&reservation_id, &"f".repeat(64)),
+            Err(RepairVaultStoreError::ReservationConflict)
+        );
+        drop(store);
+
+        let mut store = fixture
+            .vault
+            .open_repair_store()
+            .expect("rebuild cancel tombstone after restart");
+        assert_eq!(
+            store.cancel_reserved(&reservation_id, &draft_binding),
+            Ok(4096)
+        );
+        assert_eq!(
+            store.backup_status(&reservation_id, &draft_binding),
+            Ok(RepairBackupStatus::Absent)
+        );
+        assert_eq!(
+            store.backup_status(&reservation_id, &"f".repeat(64)),
+            Err(RepairVaultStoreError::ReservationConflict)
+        );
+    }
+
+    #[test]
+    fn durable_retire_requires_exact_status_and_recovers_after_unlink() {
+        let fixture = Fixture::new();
+        let bytes = b"durable retirement\n";
+        let (reservation_id, draft_binding, metadata) = {
+            let mut store = fixture
+                .vault
+                .open_repair_store()
+                .expect("open repair store");
+            let reserved = store
+                .reserve_backup(draft(bytes, 4096))
+                .expect("reserve backup");
+            let reservation_id = reserved.reservation_id().clone();
+            let draft_binding = reserved.reservation_binding_sha256().to_owned();
+            let durable = store
+                .persist_backup(reserved, binding(bytes), fixture.read_only_source(bytes))
+                .expect("persist backup");
+            (reservation_id, draft_binding, durable.metadata().clone())
+        };
+        {
+            let mut store = fixture
+                .vault
+                .open_repair_store()
+                .expect("reopen repair store");
+            let mut wrong = metadata.clone();
+            wrong.approval_sha256 = "f".repeat(64);
+            assert_eq!(
+                store.retire_backup(&wrong),
+                Err(RepairVaultStoreError::ReservationConflict)
+            );
+            store
+                .append_event(RepairEvent::RetireIntent {
+                    reservation_id: reservation_id.clone(),
+                })
+                .expect("append retire intent");
+            let (_, state) = store
+                .open_pending_backup_file(&reservation_id, OFlags::RDONLY)
+                .expect("open pending backup")
+                .expect("durable file exists");
+            store
+                .remove_pending_backup_file(&reservation_id, &state)
+                .expect("unlink before simulated crash");
+        }
+        let mut store = fixture
+            .vault
+            .open_repair_store()
+            .expect("complete retire after restart");
+        assert_eq!(
+            store.backup_status(&reservation_id, &draft_binding),
+            Ok(RepairBackupStatus::Absent)
+        );
+        assert!(!backup_path(&fixture, &reservation_id).exists());
+        assert_eq!(store.retire_backup(&metadata), Ok(4096));
+        let mut wrong = metadata.clone();
+        wrong.approval_sha256 = "f".repeat(64);
+        assert_eq!(
+            store.retire_backup(&wrong),
+            Err(RepairVaultStoreError::ReservationConflict)
+        );
+        assert_eq!(
+            store.cancel_reserved(&reservation_id, &draft_binding),
+            Err(RepairVaultStoreError::ReservationConflict)
+        );
+        assert!(store.reserve_backup(draft(b"slot reused\n", 4096)).is_ok());
+        drop(store);
+
+        let mut store = fixture
+            .vault
+            .open_repair_store()
+            .expect("rebuild retire tombstone after second restart");
+        assert_eq!(store.retire_backup(&metadata), Ok(4096));
     }
 }

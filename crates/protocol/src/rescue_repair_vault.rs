@@ -298,6 +298,53 @@ pub struct RepairBackupStatusPayload {
     resource_sha256: Option<Sha256>,
 }
 
+/// Path-free acknowledgement that one exact reservation and its physically
+/// allocated capacity were released. This is deliberately not a generic
+/// delete result: its identity fields are bound to the lifecycle request.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RepairBackupReleasePayload {
+    reservation_id: RepairReservationId,
+    draft_binding_sha256: Sha256,
+    released_bytes: u64,
+}
+
+impl RepairBackupReleasePayload {
+    pub fn new(
+        reservation_id: RepairReservationId,
+        draft_binding_sha256: Sha256,
+        released_bytes: u64,
+    ) -> Result<Self, ProtocolViolation> {
+        if !(1..=MAX_REPAIR_RESERVED_BYTES).contains(&released_bytes) {
+            return Err(ProtocolViolation::InvalidPayload);
+        }
+        Ok(Self {
+            reservation_id,
+            draft_binding_sha256,
+            released_bytes,
+        })
+    }
+
+    pub fn reservation_id(&self) -> &RepairReservationId {
+        &self.reservation_id
+    }
+
+    pub fn draft_binding_sha256(&self) -> &Sha256 {
+        &self.draft_binding_sha256
+    }
+
+    pub const fn released_bytes(&self) -> u64 {
+        self.released_bytes
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), ProtocolViolation> {
+        if !(1..=MAX_REPAIR_RESERVED_BYTES).contains(&self.released_bytes) {
+            return Err(ProtocolViolation::InvalidPayload);
+        }
+        Ok(())
+    }
+}
+
 impl RepairBackupStatusPayload {
     #[allow(clippy::too_many_arguments)]
     pub fn reserved(

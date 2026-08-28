@@ -66,14 +66,17 @@ holds the admission and both guards.
 
 The off-default `experimental-repair-store` implementation now provides a
 separate encrypted Repair Vault namespace and a closed
-Reserve/Persist/Status/Get daemon protocol for the exact backup capability. It
-reserves physical blocks, accepts bytes only through anonymous pipes, verifies
-exact size, EOF, SHA-256, allocation and named readback, journals crash
-boundaries, and keeps durable identity stable across reboot while treating the
-kernel physical-parent claim as live authority for reserve-to-persist. The
-default daemon ABI remains unchanged. No production RepairBroker UID is
-provisioned, so the route is not reachable in a shipping image. A production
-target capability resolver and mutation handler still do not exist.
+Reserve/Persist/Status/Get/Cancel/Retire daemon protocol for the exact backup
+capability. It reserves physical blocks, accepts bytes only through anonymous
+pipes, verifies exact size, EOF, SHA-256, allocation and named readback,
+journals crash boundaries, and keeps durable identity stable across reboot
+while treating the kernel physical-parent claim as live authority for
+reserve-to-persist. The default daemon ABI remains unchanged. The separate
+off-default target handoff resolves the selection twice and transfers one
+read-only block FD over a fixed root-owned `SOCK_SEQPACKET` endpoint to a
+strict Rust client. No production RepairBroker UID, socket/service activation
+or combined FD-and-lock resolver is provisioned, so either route remains
+unreachable in a shipping image. A mutation handler still does not exist.
 
 ## Backup boundary
 
@@ -95,6 +98,17 @@ authenticates the stable identity before it may reconcile an interrupted
 journal intent. Durable backups can therefore be verified after a reboot,
 while a stale reserved write capability cannot be resumed across a changed
 physical-parent epoch.
+
+Reserved capacity can be cancelled with the stable reservation ID plus its
+exact draft binding without re-minting live-parent write authority. Durable
+capacity can be retired only by presenting the complete returned durable
+status, including plan, approval and resource binding. Both release paths use
+intent/complete journal pairs and recover idempotently after interruption.
+Bounded authenticated release tombstones replay the same acknowledgement after
+a lost response and reject mismatched or cross-operation retries. The journal
+is bounded to 4096 events (at most 16 MiB of event payload); crash-safe
+compaction remains a promotion gate rather than being misrepresented as
+unbounded retention.
 
 ## Required transaction
 
@@ -128,8 +142,7 @@ Desk build, public
 Rescue image or default broker may enable it until all of these are true:
 
 - broker, Core, policy, vault backup and signed-report integration are complete;
-- stable-bound cancellation, bounded retention and crash-safe journal
-  compaction/retirement are complete;
+- bounded retention and crash-safe journal compaction are complete;
 - disposable two-disk QEMU tests cover stale targets, tampered backups,
   cancellation, process termination, automatic restore and reconciliation;
 - the exact image passes BIOS and UEFI repair/rollback qualification; and

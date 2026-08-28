@@ -40,7 +40,9 @@
         "repair.backup.reserve",
         "repair.backup.persist",
         "repair.backup.status",
-        "repair.backup.get"
+        "repair.backup.get",
+        "repair.backup.cancel",
+        "repair.backup.retire"
       ]
     },
     "payload": { "type": "object" }
@@ -49,16 +51,35 @@
     "repairBackupStatus": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["state", "reservationId", "draftBindingSha256", "locator", "vaultId", "vaultIdentityFingerprint", "physicalParentFingerprint", "reservedBytes", "backupSize", "expectedBackupSha256", "metadataSha256"],
+      "required": [
+        "state",
+        "reservationId",
+        "draftBindingSha256",
+        "locator",
+        "vaultId",
+        "vaultIdentityFingerprint",
+        "physicalParentFingerprint",
+        "reservedBytes",
+        "backupSize",
+        "expectedBackupSha256",
+        "metadataSha256"
+      ],
       "properties": {
         "state": { "enum": ["reserved", "durable"] },
         "reservationId": { "$ref": "#/$defs/reservationId" },
         "draftBindingSha256": { "$ref": "#/$defs/sha256" },
-        "locator": { "type": "string", "pattern": "^vault://repair/B-[0-9a-f]{32}$" },
+        "locator": {
+          "type": "string",
+          "pattern": "^vault://repair/B-[0-9a-f]{32}$"
+        },
         "vaultId": { "type": "string", "pattern": "^V-[0-9a-f]{32}$" },
         "vaultIdentityFingerprint": { "$ref": "#/$defs/sha256" },
         "physicalParentFingerprint": { "$ref": "#/$defs/sha256" },
-        "reservedBytes": { "type": "integer", "minimum": 1, "maximum": 16777216 },
+        "reservedBytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16777216
+        },
         "backupSize": { "type": "integer", "minimum": 1, "maximum": 16777216 },
         "expectedBackupSha256": { "$ref": "#/$defs/sha256" },
         "metadataSha256": { "$ref": "#/$defs/sha256" },
@@ -68,7 +89,39 @@
         "approvalSha256": { "$ref": "#/$defs/sha256" },
         "resourceId": { "$ref": "#/$defs/resourceId" },
         "resourceSha256": { "$ref": "#/$defs/sha256" }
-      }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "state": { "const": "reserved" },
+            "planId": false,
+            "planSha256": false,
+            "approvalId": false,
+            "approvalSha256": false,
+            "resourceId": false,
+            "resourceSha256": false
+          }
+        },
+        {
+          "properties": {
+            "state": { "const": "durable" },
+            "planId": {},
+            "planSha256": {},
+            "approvalId": {},
+            "approvalSha256": {},
+            "resourceId": {},
+            "resourceSha256": {}
+          },
+          "required": [
+            "planId",
+            "planSha256",
+            "approvalId",
+            "approvalSha256",
+            "resourceId",
+            "resourceSha256"
+          ]
+        }
+      ]
     },
     "repairFileMetadataV1": {
       "type": "object",
@@ -190,10 +243,7 @@
       "maxLength": 128,
       "pattern": "^[A-Za-z0-9_.:/-]+$",
       "not": {
-        "anyOf": [
-          { "pattern": "^/" },
-          { "pattern": "\\.\\." }
-        ]
+        "anyOf": [{ "pattern": "^/" }, { "pattern": "\\.\\." }]
       }
     },
     "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
@@ -452,6 +502,52 @@
             "required": ["expected"],
             "properties": {
               "expected": { "$ref": "#/$defs/repairBackupStatus" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "operation": { "const": "repair.backup.retire" } },
+        "required": ["operation"]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["expected"],
+            "properties": {
+              "expected": {
+                "allOf": [
+                  { "$ref": "#/$defs/repairBackupStatus" },
+                  {
+                    "type": "object",
+                    "properties": { "state": { "const": "durable" } },
+                    "required": ["state"]
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "operation": { "const": "repair.backup.cancel" } },
+        "required": ["operation"]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["reservationId", "draftBindingSha256"],
+            "properties": {
+              "reservationId": { "$ref": "#/$defs/reservationId" },
+              "draftBindingSha256": { "$ref": "#/$defs/sha256" }
             }
           }
         }

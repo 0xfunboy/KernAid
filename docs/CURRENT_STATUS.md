@@ -45,7 +45,7 @@ WinPE Companion and Fleet management remain later milestones.
 | Rescue provider plumbing | Feature-gated OpenAI executor and loopback relay are implemented, but live TLS and a real-account lifecycle are not yet qualified |
 | Virtual testing | Disposable QEMU fixtures, byte-level mutation checks, BIOS/UEFI boot and two-boot USB/vault coverage |
 | Repair experiment | Linux-only feature-gated Desk lab for one typed R2 repair and separately approved rollback on an internal temporary fixture. It now traverses the standard `SessionDriver`, Agent Gateway, explicit Core transaction states and typed broker; it remains absent from normal/Rescue builds and disconnected from production targets |
-| Disabled Rescue repair candidate | A typed ext4-only contract, read-only preview, immutable target/Vault reservation/evidence-bound transaction plan and separate Core/policy approval boundary exist for disabling one `fstab` entry whose UUID is proven missing. The off-default Repair Vault now physically reserves capacity and durably stores, reads back and authenticates the exact `fstab` bytes and metadata through path-free Reserve/Persist/Status/Get daemon operations. Stable Vault identity and live physical-parent attestation survive the intended reboot boundary. No production repair-broker account, target capability resolver, mutation/verification handler or retention path is installed, so normal Rescue builds still cannot mutate a target. |
+| Disabled Rescue repair candidate | A typed ext4-only contract, read-only preview, immutable target/Vault reservation/evidence-bound transaction plan and separate Core/policy approval boundary exist for disabling one `fstab` entry whose UUID is proven missing. The off-default Repair Vault now physically reserves capacity and durably stores, reads back and authenticates the exact `fstab` bytes and metadata through path-free Reserve/Persist/Status/Get/Cancel/Retire daemon operations. A separate off-default handoff resolves the selected target twice and transfers one read-only block FD to a strict Rust client. Stable Vault identity and live physical-parent attestation survive the intended reboot boundary. No production repair-broker account, activated target service, guard-integrated resolver, mutation/verification handler or automatic retention path is installed, so normal Rescue builds still cannot mutate a target. |
 | Rescue first boot | The promoted image provisions an all-zero p3 into the canonical LUKS2/ext4 Vault, seeds its identity and Codex home, closes it and verifies the locked profile; the exact flow passed two-boot BIOS/UEFI QEMU qualification |
 | Release channel | Canonical Release Channel v1, anti-rollback links, strict verification and an immutable internal prerelease are active through sequence 2; this is not an automatic updater or signed production channel |
 
@@ -59,11 +59,13 @@ treated as a newer release.
 - There are no production mutation handlers and no real customer-machine
   repair path.
 - The disabled Rescue `fstab` candidate has a feature-gated durable Vault
-  backup store and daemon transport, but no production repair-broker identity,
-  target capability resolver or execution/verification/rollback handler.
-- Repair Vault cancellation after a boot-local parent epoch changes, durable
-  backup retirement and journal compaction remain explicit promotion gates;
-  the current bounded experimental store is not a customer retention system.
+  backup store, daemon transport and read-only target-capability handshake, but
+  no production repair-broker identity, activated service, guard-integrated
+  resolver or execution/verification/rollback handler.
+- Automatic Repair Vault retention and crash-safe journal compaction remain
+  explicit promotion gates; stable cancellation and exact durable retirement
+  are implemented, but the bounded experimental store is not yet a customer
+  retention system.
 - Rescue zero-p3 first boot has exact-image BIOS/UEFI QEMU evidence, but no
   physical USB or firmware qualification evidence yet.
 - The fixture lab's exported webview artifact is deliberately marked volatile
