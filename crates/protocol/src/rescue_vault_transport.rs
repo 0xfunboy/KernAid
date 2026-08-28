@@ -19,7 +19,7 @@ use crate::rescue_repair_vault::{
     RepairBackupState, RepairBackupStatusPayload, RepairExecutionIntentV1, RepairFileMetadataV1,
     RepairReservationId, RepairTransactionResolution, RepairTransactionStatusPayload,
     RepairTransactionStatusResultPayload, RepairTransactionStatusSelector,
-    RepairVaultLiveIdentityPayload,
+    RepairVaultLiveIdentityPayload, RepairWriteLeasePayload,
 };
 use crate::rescue_vault::{
     API_VERSION, AuditEventType, AuditOutcome, DescriptorDeclaration, DescriptorType, ErrorToken,
@@ -564,6 +564,10 @@ pub enum ClientRequestPayload {
         resolution: RepairTransactionResolution,
     },
     #[cfg(feature = "experimental-repair-store")]
+    RepairTransactionWriteLeaseConsume {
+        selector: RepairTransactionStatusSelector,
+    },
+    #[cfg(feature = "experimental-repair-store")]
     RepairVaultLiveParent,
 }
 
@@ -601,6 +605,10 @@ impl ClientRequestPayload {
             Self::RepairTransactionResolve { .. } => Operation::RepairTransactionResolve,
             #[cfg(feature = "experimental-repair-store")]
             Self::RepairVaultLiveParent => Operation::RepairVaultLiveParent,
+            #[cfg(feature = "experimental-repair-store")]
+            Self::RepairTransactionWriteLeaseConsume { .. } => {
+                Operation::RepairTransactionWriteLeaseConsume
+            }
         }
     }
 
@@ -640,7 +648,8 @@ impl ClientRequestPayload {
             | Self::RepairBackupRetire { .. }
             | Self::RepairTransactionStatus { .. }
             | Self::RepairTransactionResolve { .. }
-            | Self::RepairVaultLiveParent => None,
+            | Self::RepairVaultLiveParent
+            | Self::RepairTransactionWriteLeaseConsume { .. } => None,
         }
     }
 }
@@ -766,6 +775,11 @@ fn valid_client_payload(payload: &ClientRequestPayload) -> bool {
         }
         #[cfg(feature = "experimental-repair-store")]
         ClientRequestPayload::RepairVaultLiveParent => true,
+        #[cfg(feature = "experimental-repair-store")]
+        ClientRequestPayload::RepairTransactionWriteLeaseConsume { selector } => {
+            matches!(selector, RepairTransactionStatusSelector::Exact { .. })
+                && selector.validate().is_ok()
+        }
     }
 }
 
@@ -1018,6 +1032,13 @@ pub fn encode_client_request(
         ),
         #[cfg(feature = "experimental-repair-store")]
         ClientRequestPayload::RepairTransactionStatus { selector } => {
+            encode_client_request_payload(
+                request,
+                RepairTransactionStatusRequestPayload { selector },
+            )
+        }
+        #[cfg(feature = "experimental-repair-store")]
+        ClientRequestPayload::RepairTransactionWriteLeaseConsume { selector } => {
             encode_client_request_payload(
                 request,
                 RepairTransactionStatusRequestPayload { selector },
@@ -1389,6 +1410,7 @@ fn validate_success_state_version(
             | ClientRequestPayload::RepairBackupCancel { .. }
             | ClientRequestPayload::RepairBackupRetire { .. }
             | ClientRequestPayload::RepairTransactionResolve { .. }
+            | ClientRequestPayload::RepairTransactionWriteLeaseConsume { .. }
     );
     #[cfg(not(feature = "experimental-repair-store"))]
     let repair_mutation = false;
@@ -1685,6 +1707,25 @@ fn decode_success_payload(
                 return Err(ClientResponseDecodeError::InvalidPayload);
             }
             Ok(SuccessPayload::RepairVaultLiveIdentity(identity))
+        }
+        #[cfg(feature = "experimental-repair-store")]
+        ClientRequestPayload::RepairTransactionWriteLeaseConsume { selector } => {
+            require_no_descriptors(descriptors)?;
+            let lease: RepairWriteLeasePayload = decode_payload(raw)?;
+            if lease.validate().is_err()
+                || !matches!(
+                    selector,
+                    RepairTransactionStatusSelector::Exact {
+                        reservation_id,
+                        transaction_binding_sha256,
+                    } if lease.transaction().backup().reservation_id() == reservation_id
+                        && lease.transaction().transaction_binding_sha256()
+                            == transaction_binding_sha256
+                )
+            {
+                return Err(ClientResponseDecodeError::InvalidPayload);
+            }
+            Ok(SuccessPayload::RepairWriteLeaseConsumed(Box::new(lease)))
         }
     }
 }

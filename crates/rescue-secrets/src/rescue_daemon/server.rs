@@ -34,10 +34,10 @@ use rand_core::{OsRng, RngCore};
 use rustix::{
     event::{PollFd, PollFlags, Timespec, poll},
     fd::{AsFd, BorrowedFd, OwnedFd},
-    fs::{self as rfs, FileType, OFlags},
+    fs::{self as rfs, FileType, Mode, OFlags},
     net::{
         AddressFamily, RecvFlags, SendFlags, SocketAddrUnix, SocketFlags, SocketType, accept_with,
-        recv, sendto, socket_with, socketpair,
+        bind, listen, recv, sendto, socket_with, socketpair,
     },
     pipe::{PipeFlags, pipe_with},
     process::{Signal as ProcessSignal, pidfd_send_signal},
@@ -59,9 +59,6 @@ use std::{
 };
 use zeroize::Zeroizing;
 
-#[cfg(test)]
-use rustix::fs::Mode;
-
 const CONNECTION_LIMIT: usize = 16;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(3);
 const ACCEPT_POLL_SLICE: Duration = Duration::from_millis(200);
@@ -77,6 +74,13 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(110);
 const READINESS_NOTIFICATION_TIMEOUT: Duration = Duration::from_secs(3);
 const UNLOCK_RATE_LIMIT: Duration = Duration::from_secs(2);
 const CONTROL_SOCKET_PATH: &str = "/run/kernaid-rescue-vault.sock";
+#[cfg(feature = "experimental-repair-store")]
+const REPAIR_TARGET_HELPER_SOCKET_PATH: &str =
+    "/run/kernaid-rescue-vault/repair-target-helper-v1.sock";
+#[cfg(feature = "experimental-repair-store")]
+const REPAIR_TARGET_HELPER_SOCKET_NAME: &str = "repair-target-helper-v1.sock";
+#[cfg(feature = "experimental-repair-store")]
+const RESCUE_VAULT_RUNTIME_DIRECTORY: &str = "/run/kernaid-rescue-vault";
 const NOTIFY_SOCKET_ENV: &str = "NOTIFY_SOCKET";
 const READY_NOTIFICATION: &[u8] = b"READY=1";
 const STARTUP_STATUS_PREFIX: &str = "STATUS=KERNAID_RESCUE_VAULT_STARTUP_V1 stage=";
@@ -365,6 +369,15 @@ trait WorkerBoundary: Send + Sync {
         Err(RescueVaultDaemonError::ProtocolFailure)
     }
     #[cfg(feature = "experimental-repair-store")]
+    fn repair_write_lease_consume(
+        &self,
+        selector: &RepairTransactionStatusSelector,
+        deadline: Instant,
+    ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
+        let _ = (selector, deadline);
+        Err(RescueVaultDaemonError::ProtocolFailure)
+    }
+    #[cfg(feature = "experimental-repair-store")]
     fn repair_transaction_resolve(
         &self,
         expected: &RepairTransactionStatusPayload,
@@ -513,6 +526,15 @@ impl WorkerBoundary for WorkerHandle {
         deadline: Instant,
     ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
         WorkerHandle::repair_vault_live_identity(self, deadline)
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    fn repair_write_lease_consume(
+        &self,
+        selector: &RepairTransactionStatusSelector,
+        deadline: Instant,
+    ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
+        WorkerHandle::repair_write_lease_consume(self, selector, deadline)
     }
 
     #[cfg(feature = "experimental-repair-store")]
@@ -857,6 +879,8 @@ pub(super) fn run(companion_uid: u32) -> Result<(), RescueVaultDaemonError> {
     let listener = take_listener()?;
     notifier.note_startup_stage(StartupStage::Runtime);
     let (mut daemon_runtime, disposition) = DaemonRuntime::open()?;
+    #[cfg(feature = "experimental-repair-store")]
+    let repair_target_helper_listener = create_repair_target_helper_listener()?;
     notifier.note_startup_stage(StartupStage::Rng);
     let seed = state_version_seed()?;
     let mut parent_capabilities_narrowed = false;
@@ -984,7 +1008,14 @@ pub(super) fn run(companion_uid: u32) -> Result<(), RescueVaultDaemonError> {
         }
     }
 
-    let serve_result = serve_connections(listener, allowlist, Arc::clone(&supervisor), &stop);
+    let serve_result = serve_connections(
+        listener,
+        #[cfg(feature = "experimental-repair-store")]
+        repair_target_helper_listener,
+        allowlist,
+        Arc::clone(&supervisor),
+        &stop,
+    );
     stop.requested.store(true, Ordering::Release);
     match serve_result {
         Ok(deadline) => supervisor.shutdown(deadline),
@@ -1196,6 +1227,182 @@ fn validate_listener(
         || !unconnected
         || rustix::net::sockopt::socket_passcred(listener)
             .map_err(|_| RescueVaultDaemonError::InvalidListener)?
+    {
+        return Err(RescueVaultDaemonError::InvalidListener);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "experimental-repair-store")]
+struct RepairTargetHelperListener {
+    descriptor: OwnedFd,
+    directory: OwnedFd,
+    named_device: u64,
+    named_inode: u64,
+}
+
+#[cfg(feature = "experimental-repair-store")]
+impl Drop for RepairTargetHelperListener {
+    fn drop(&mut self) {
+        let Ok(named) = rfs::statat(
+            &self.directory,
+            REPAIR_TARGET_HELPER_SOCKET_NAME,
+            rfs::AtFlags::SYMLINK_NOFOLLOW,
+        ) else {
+            return;
+        };
+        if named.st_dev == self.named_device
+            && named.st_ino == self.named_inode
+            && FileType::from_raw_mode(named.st_mode).is_socket()
+            && named.st_uid == 0
+            && named.st_gid == 0
+        {
+            let _ = rfs::unlinkat(
+                &self.directory,
+                REPAIR_TARGET_HELPER_SOCKET_NAME,
+                rfs::AtFlags::empty(),
+            );
+        }
+    }
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn create_repair_target_helper_listener()
+-> Result<RepairTargetHelperListener, RescueVaultDaemonError> {
+    let directory = rfs::openat2(
+        rfs::CWD,
+        RESCUE_VAULT_RUNTIME_DIRECTORY,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+        rfs::ResolveFlags::NO_SYMLINKS | rfs::ResolveFlags::NO_MAGICLINKS,
+    )
+    .map_err(|_| RescueVaultDaemonError::InvalidListener)?;
+    let directory_stat =
+        rfs::fstat(&directory).map_err(|_| RescueVaultDaemonError::InvalidListener)?;
+    if !FileType::from_raw_mode(directory_stat.st_mode).is_dir()
+        || directory_stat.st_uid != 0
+        || directory_stat.st_gid != 0
+        || directory_stat.st_nlink < 2
+        || directory_stat.st_mode & 0o7777 != 0o700
+    {
+        return Err(RescueVaultDaemonError::InvalidListener);
+    }
+    match rfs::statat(
+        &directory,
+        REPAIR_TARGET_HELPER_SOCKET_NAME,
+        rfs::AtFlags::SYMLINK_NOFOLLOW,
+    ) {
+        Ok(named)
+            if FileType::from_raw_mode(named.st_mode).is_socket()
+                && named.st_uid == 0
+                && named.st_gid == 0
+                && named.st_nlink == 1
+                && named.st_mode & 0o077 == 0
+                && named.st_dev == directory_stat.st_dev =>
+        {
+            rfs::unlinkat(
+                &directory,
+                REPAIR_TARGET_HELPER_SOCKET_NAME,
+                rfs::AtFlags::empty(),
+            )
+            .map_err(|_| RescueVaultDaemonError::InvalidListener)?;
+        }
+        Ok(_) => return Err(RescueVaultDaemonError::InvalidListener),
+        Err(error) if error == rustix::io::Errno::NOENT => {}
+        Err(_) => return Err(RescueVaultDaemonError::InvalidListener),
+    }
+    let descriptor = socket_with(
+        AddressFamily::UNIX,
+        SocketType::SEQPACKET,
+        SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+        None,
+    )
+    .map_err(|_| RescueVaultDaemonError::InvalidListener)?;
+    let address = SocketAddrUnix::new(Path::new(REPAIR_TARGET_HELPER_SOCKET_PATH))
+        .map_err(|_| RescueVaultDaemonError::InvalidListener)?;
+    if bind(&descriptor, &address).is_err() {
+        return Err(RescueVaultDaemonError::InvalidListener);
+    }
+    let configured = rfs::chmodat(
+        &directory,
+        REPAIR_TARGET_HELPER_SOCKET_NAME,
+        Mode::RUSR | Mode::WUSR,
+        rfs::AtFlags::empty(),
+    )
+    .and_then(|()| listen(&descriptor, 1));
+    if configured.is_err() {
+        let _ = rfs::unlinkat(
+            &directory,
+            REPAIR_TARGET_HELPER_SOCKET_NAME,
+            rfs::AtFlags::empty(),
+        );
+        return Err(RescueVaultDaemonError::InvalidListener);
+    }
+    let named = rfs::statat(
+        &directory,
+        REPAIR_TARGET_HELPER_SOCKET_NAME,
+        rfs::AtFlags::SYMLINK_NOFOLLOW,
+    )
+    .map_err(|_| RescueVaultDaemonError::InvalidListener)?;
+    let listener = RepairTargetHelperListener {
+        descriptor,
+        directory,
+        named_device: named.st_dev,
+        named_inode: named.st_ino,
+    };
+    validate_repair_target_helper_listener(&listener, &directory_stat)?;
+    Ok(listener)
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn validate_repair_target_helper_listener(
+    listener: &RepairTargetHelperListener,
+    directory: &rfs::Stat,
+) -> Result<(), RescueVaultDaemonError> {
+    let descriptor = listener.descriptor.as_fd();
+    let descriptor_flags =
+        rustix::io::fcntl_getfd(descriptor).map_err(|_| RescueVaultDaemonError::InvalidListener)?;
+    let status_flags =
+        rfs::fcntl_getfl(descriptor).map_err(|_| RescueVaultDaemonError::InvalidListener)?;
+    let socket = rfs::fstat(descriptor).map_err(|_| RescueVaultDaemonError::InvalidListener)?;
+    let named = rfs::statat(
+        &listener.directory,
+        REPAIR_TARGET_HELPER_SOCKET_NAME,
+        rfs::AtFlags::SYMLINK_NOFOLLOW,
+    )
+    .map_err(|_| RescueVaultDaemonError::InvalidListener)?;
+    let address: SocketAddrUnix = rustix::net::getsockname(descriptor)
+        .map_err(|_| RescueVaultDaemonError::InvalidListener)?
+        .try_into()
+        .map_err(|_| RescueVaultDaemonError::InvalidListener)?;
+    let unconnected = matches!(
+        rustix::net::getpeername(descriptor),
+        Err(error) if error == rustix::io::Errno::NOTCONN
+    );
+    if !descriptor_flags.contains(rustix::io::FdFlags::CLOEXEC)
+        || !status_flags.contains(OFlags::NONBLOCK)
+        || !FileType::from_raw_mode(socket.st_mode).is_socket()
+        || socket.st_uid != 0
+        || !FileType::from_raw_mode(named.st_mode).is_socket()
+        || named.st_uid != 0
+        || named.st_gid != 0
+        || named.st_nlink != 1
+        || named.st_mode & 0o7777 != 0o600
+        || named.st_dev != directory.st_dev
+        || named.st_dev != listener.named_device
+        || named.st_ino != listener.named_inode
+        || rustix::net::sockopt::socket_domain(descriptor)
+            .map_err(|_| RescueVaultDaemonError::InvalidListener)?
+            != AddressFamily::UNIX
+        || rustix::net::sockopt::socket_type(descriptor)
+            .map_err(|_| RescueVaultDaemonError::InvalidListener)?
+            != SocketType::SEQPACKET
+        || !rustix::net::sockopt::socket_acceptconn(descriptor)
+            .map_err(|_| RescueVaultDaemonError::InvalidListener)?
+        || rustix::net::sockopt::socket_passcred(descriptor)
+            .map_err(|_| RescueVaultDaemonError::InvalidListener)?
+        || !unconnected
+        || address.path_bytes() != Some(REPAIR_TARGET_HELPER_SOCKET_PATH.as_bytes())
     {
         return Err(RescueVaultDaemonError::InvalidListener);
     }
@@ -1643,6 +1850,8 @@ fn wait_notification_writable(
 
 fn serve_connections(
     listener: OwnedFd,
+    #[cfg(feature = "experimental-repair-store")]
+    repair_target_helper_listener: RepairTargetHelperListener,
     allowlist: PeerAllowlist,
     supervisor: Arc<Supervisor>,
     stop: &StopControl,
@@ -1670,22 +1879,56 @@ fn serve_connections(
                 }
             }
         }
-        if let Err(error) = wait_listener(listener.as_fd()) {
+        if let Err(error) = wait_listeners(
+            listener.as_fd(),
+            #[cfg(feature = "experimental-repair-store")]
+            repair_target_helper_listener.descriptor.as_fd(),
+        ) {
             terminal_error = Some(error);
             break;
         }
+        let mut accepted = 0_usize;
         loop {
             if stop.requested.load(Ordering::Acquire) {
                 break;
             }
+            if accepted == CONNECTION_LIMIT {
+                break;
+            }
             match accept_with(&listener, SocketFlags::CLOEXEC | SocketFlags::NONBLOCK) {
                 Ok(connection) if handlers.len() < CONNECTION_LIMIT => {
+                    accepted += 1;
                     let supervisor = Arc::clone(&supervisor);
                     handlers.push(thread::spawn(move || {
                         handle_connection(connection, allowlist, supervisor);
                     }));
                 }
-                Ok(_) => {}
+                Ok(_) => accepted += 1,
+                Err(error) if error == rustix::io::Errno::AGAIN => break,
+                Err(error) if error == rustix::io::Errno::INTR => continue,
+                Err(_) => {
+                    terminal_error = Some(RescueVaultDaemonError::InvalidListener);
+                    break 'serving;
+                }
+            }
+        }
+        #[cfg(feature = "experimental-repair-store")]
+        loop {
+            if stop.requested.load(Ordering::Acquire) {
+                break;
+            }
+            match accept_with(
+                &repair_target_helper_listener.descriptor,
+                SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+            ) {
+                Ok(connection) if handlers.len() < CONNECTION_LIMIT + 1 => {
+                    let supervisor = Arc::clone(&supervisor);
+                    handlers.push(thread::spawn(move || {
+                        handle_repair_target_helper_connection(connection, supervisor);
+                    }));
+                    break;
+                }
+                Ok(_) => break,
                 Err(error) if error == rustix::io::Errno::AGAIN => break,
                 Err(error) if error == rustix::io::Errno::INTR => continue,
                 Err(_) => {
@@ -1697,6 +1940,8 @@ fn serve_connections(
     }
     stop.request();
     drop(listener);
+    #[cfg(feature = "experimental-repair-store")]
+    drop(repair_target_helper_listener);
     let deadline = stop.deadline_or(Instant::now() + SHUTDOWN_TIMEOUT);
     let revoke_deadline = Instant::now()
         .checked_add(LEASE_REVOCATION_TIMEOUT)
@@ -1744,11 +1989,42 @@ fn reap_handlers(handlers: &mut Vec<JoinHandle<()>>, supervisor: &Supervisor) {
     }
 }
 
-fn wait_listener(listener: BorrowedFd<'_>) -> Result<(), RescueVaultDaemonError> {
+#[cfg(not(feature = "experimental-repair-store"))]
+fn wait_listeners(listener: BorrowedFd<'_>) -> Result<(), RescueVaultDaemonError> {
     let mut descriptor = [PollFd::from_borrowed_fd(listener, PollFlags::IN)];
     let timeout = duration_to_timespec(ACCEPT_POLL_SLICE);
     match poll(&mut descriptor, Some(&timeout)) {
-        Ok(_) if descriptor[0].revents().contains(PollFlags::NVAL) => {
+        Ok(_)
+            if descriptor[0]
+                .revents()
+                .intersects(PollFlags::ERR | PollFlags::HUP | PollFlags::NVAL) =>
+        {
+            Err(RescueVaultDaemonError::InvalidListener)
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error == rustix::io::Errno::INTR => Ok(()),
+        Err(_) => Err(RescueVaultDaemonError::InvalidListener),
+    }
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn wait_listeners(
+    listener: BorrowedFd<'_>,
+    repair_target_helper_listener: BorrowedFd<'_>,
+) -> Result<(), RescueVaultDaemonError> {
+    let mut descriptors = [
+        PollFd::from_borrowed_fd(listener, PollFlags::IN),
+        PollFd::from_borrowed_fd(repair_target_helper_listener, PollFlags::IN),
+    ];
+    let timeout = duration_to_timespec(ACCEPT_POLL_SLICE);
+    match poll(&mut descriptors, Some(&timeout)) {
+        Ok(_)
+            if descriptors.iter().any(|descriptor| {
+                descriptor
+                    .revents()
+                    .intersects(PollFlags::ERR | PollFlags::HUP | PollFlags::NVAL)
+            }) =>
+        {
             Err(RescueVaultDaemonError::InvalidListener)
         }
         Ok(_) => Ok(()),
@@ -1761,16 +2037,42 @@ fn handle_connection(connection: OwnedFd, allowlist: PeerAllowlist, supervisor: 
     handle_connection_by(connection, allowlist, supervisor, true);
 }
 
+#[cfg(feature = "experimental-repair-store")]
+fn handle_repair_target_helper_connection(connection: OwnedFd, supervisor: Arc<Supervisor>) {
+    handle_connection_at(
+        connection,
+        PeerAllowlist::repair_target_helper_root_only(),
+        supervisor,
+        Some(REPAIR_TARGET_HELPER_SOCKET_PATH),
+    );
+}
+
 fn handle_connection_by(
     connection: OwnedFd,
     allowlist: PeerAllowlist,
     supervisor: Arc<Supervisor>,
     validate_production_socket: bool,
 ) {
+    handle_connection_at(
+        connection,
+        allowlist,
+        supervisor,
+        validate_production_socket.then_some(CONTROL_SOCKET_PATH),
+    );
+}
+
+fn handle_connection_at(
+    connection: OwnedFd,
+    allowlist: PeerAllowlist,
+    supervisor: Arc<Supervisor>,
+    expected_socket_path: Option<&str>,
+) {
     if supervisor.stopping.load(Ordering::Acquire) {
         return;
     }
-    if validate_production_socket && validate_accepted_connection(connection.as_fd()).is_err() {
+    if expected_socket_path
+        .is_some_and(|path| validate_accepted_connection_at(connection.as_fd(), path).is_err())
+    {
         return;
     }
     let peer = match authenticate_seqpacket_peer(connection.as_fd(), allowlist) {
@@ -1805,6 +2107,7 @@ fn handle_connection_by(
                 | Operation::RepairBackupCancel
                 | Operation::RepairBackupRetire
                 | Operation::RepairTransactionResolve
+                | Operation::RepairTransactionWriteLeaseConsume
         );
     let started = Instant::now();
     let (version, result) = supervisor.handle_connected_request(
@@ -1915,6 +2218,13 @@ fn handle_connection_by(
 }
 
 fn validate_accepted_connection(connection: BorrowedFd<'_>) -> Result<(), RescueVaultDaemonError> {
+    validate_accepted_connection_at(connection, CONTROL_SOCKET_PATH)
+}
+
+fn validate_accepted_connection_at(
+    connection: BorrowedFd<'_>,
+    expected_socket_path: &str,
+) -> Result<(), RescueVaultDaemonError> {
     let descriptor =
         rustix::io::fcntl_getfd(connection).map_err(|_| RescueVaultDaemonError::ProtocolFailure)?;
     let status =
@@ -1934,7 +2244,7 @@ fn validate_accepted_connection(connection: BorrowedFd<'_>) -> Result<(), Rescue
         || rustix::net::sockopt::socket_acceptconn(connection)
             .map_err(|_| RescueVaultDaemonError::ProtocolFailure)?
         || rustix::net::getpeername(connection).is_err()
-        || address.path_bytes() != Some(CONTROL_SOCKET_PATH.as_bytes())
+        || address.path_bytes() != Some(expected_socket_path.as_bytes())
         || rustix::net::sockopt::socket_passcred(connection)
             .map_err(|_| RescueVaultDaemonError::ProtocolFailure)?
     {
@@ -2394,6 +2704,10 @@ impl Supervisor {
             #[cfg(feature = "experimental-repair-store")]
             Operation::RepairTransactionResolve => {
                 self.handle_repair_transaction_resolve(request, started, &connection)
+            }
+            #[cfg(feature = "experimental-repair-store")]
+            Operation::RepairTransactionWriteLeaseConsume => {
+                self.handle_repair_write_lease_consume(request, started, &connection)
             }
             #[cfg(not(feature = "experimental-codex-home-lease"))]
             Operation::ProviderCodexHomeLease => {
@@ -3357,6 +3671,72 @@ impl Supervisor {
                 }
             }
             Ok(response) => self.finish_repair_error(request, response.code, false, deadline),
+            Err(_) => self.repair_worker_fault(request, deadline),
+        }
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    fn handle_repair_write_lease_consume(
+        self: &Arc<Self>,
+        request: ValidatedRequest,
+        started: Instant,
+        connection: &ClientConnection<'_>,
+    ) -> (u64, HandlerResult) {
+        let deadline = started
+            .checked_add(WORKER_OPERATION_TIMEOUT)
+            .unwrap_or(started);
+        let selector = match request.payload() {
+            RequestPayload::RepairTransactionWriteLeaseConsume { selector }
+                if matches!(selector, RepairTransactionStatusSelector::Exact { .. }) =>
+            {
+                selector.clone()
+            }
+            _ => {
+                let version = self.snapshot().version;
+                return (version, HandlerResult::Error(request, ErrorToken::IoFailed));
+            }
+        };
+        if let Err((version, error)) = self.prepare_application_operation(
+            request.expected_state_version(),
+            true,
+            connection,
+            deadline,
+        ) {
+            return (version, HandlerResult::Error(request, error));
+        }
+        let Some(worker) = self.worker.as_ref() else {
+            self.mark_fault_by(deadline);
+            return (
+                self.snapshot().version,
+                HandlerResult::Error(request, ErrorToken::RebootRequired),
+            );
+        };
+        match worker.repair_write_lease_consume(&selector, deadline) {
+            Ok(response)
+                if response.code == internal_wire::WorkerResultCode::RepairWriteLeaseConsumed =>
+            {
+                let lease = response.repair_write_lease.map(|value| *value);
+                match lease.filter(|lease| {
+                    lease.validate().is_ok()
+                        && matches!(
+                            &selector,
+                            RepairTransactionStatusSelector::Exact {
+                                reservation_id,
+                                transaction_binding_sha256,
+                            } if lease.transaction().backup().reservation_id() == reservation_id
+                                && lease.transaction().transaction_binding_sha256()
+                                    == transaction_binding_sha256
+                        )
+                }) {
+                    Some(lease) => self.finish_application_mutation(
+                        request,
+                        Ok(SuccessPayload::RepairWriteLeaseConsumed(Box::new(lease))),
+                        deadline,
+                    ),
+                    None => self.repair_worker_fault(request, deadline),
+                }
+            }
+            Ok(response) => self.finish_repair_error(request, response.code, true, deadline),
             Err(_) => self.repair_worker_fault(request, deadline),
         }
     }
@@ -5813,6 +6193,10 @@ fn external_operation_is_enabled(
                 | Operation::RepairTransactionResolve
                 | Operation::RepairVaultLiveParent
         ),
+        #[cfg(feature = "experimental-repair-store")]
+        kernaid_protocol::rescue_vault::PeerRole::RepairTargetHelper => {
+            matches!(operation, Operation::RepairTransactionWriteLeaseConsume)
+        }
     }
 }
 
@@ -5861,6 +6245,8 @@ fn provider_process_scope(role: kernaid_protocol::rescue_vault::PeerRole) -> Pro
         }
         #[cfg(feature = "experimental-repair-store")]
         kernaid_protocol::rescue_vault::PeerRole::RepairBroker => ProcessScope::DirectPeer,
+        #[cfg(feature = "experimental-repair-store")]
+        kernaid_protocol::rescue_vault::PeerRole::RepairTargetHelper => ProcessScope::DirectPeer,
     }
 }
 
@@ -7049,6 +7435,10 @@ mod tests {
             PeerRole::Agent(agent_role) => PeerAllowlist::builder(other_uid).agent(agent_role, uid),
             #[cfg(feature = "experimental-repair-store")]
             PeerRole::RepairBroker => PeerAllowlist::builder(other_uid).repair_broker(uid),
+            #[cfg(feature = "experimental-repair-store")]
+            PeerRole::RepairTargetHelper => {
+                panic!("root-only helper role cannot use an unprivileged socketpair fixture")
+            }
         }
         .expect("test peer role mapping")
         .build()
@@ -8449,7 +8839,7 @@ mod tests {
 
     #[cfg(feature = "experimental-repair-store")]
     #[test]
-    fn repair_broker_has_only_the_eight_repair_operations() {
+    fn repair_roles_have_disjoint_closed_operations() {
         let repair_operations = [
             Operation::RepairBackupReserve,
             Operation::RepairBackupPersist,
@@ -8459,6 +8849,7 @@ mod tests {
             Operation::RepairBackupRetire,
             Operation::RepairTransactionStatus,
             Operation::RepairTransactionResolve,
+            Operation::RepairVaultLiveParent,
         ];
         for operation in repair_operations {
             assert!(external_operation_is_enabled(
@@ -8470,6 +8861,7 @@ mod tests {
                 PeerRole::Agent(AgentRole::OpenAi),
                 PeerRole::Agent(AgentRole::Codex),
                 PeerRole::Agent(AgentRole::Application),
+                PeerRole::RepairTargetHelper,
             ] {
                 assert!(!external_operation_is_enabled(operation, role));
             }
@@ -8489,6 +8881,26 @@ mod tests {
         }
         assert_eq!(
             provider_process_scope(PeerRole::RepairBroker),
+            ProcessScope::DirectPeer
+        );
+        assert!(external_operation_is_enabled(
+            Operation::RepairTransactionWriteLeaseConsume,
+            PeerRole::RepairTargetHelper,
+        ));
+        for role in [
+            PeerRole::RepairBroker,
+            PeerRole::Companion,
+            PeerRole::Agent(AgentRole::OpenAi),
+            PeerRole::Agent(AgentRole::Codex),
+            PeerRole::Agent(AgentRole::Application),
+        ] {
+            assert!(!external_operation_is_enabled(
+                Operation::RepairTransactionWriteLeaseConsume,
+                role,
+            ));
+        }
+        assert_eq!(
+            provider_process_scope(PeerRole::RepairTargetHelper),
             ProcessScope::DirectPeer
         );
     }

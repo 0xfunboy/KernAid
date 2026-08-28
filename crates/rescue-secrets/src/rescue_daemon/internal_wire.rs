@@ -14,7 +14,7 @@ use kernaid_protocol::rescue_repair_vault::{
     RepairBackupStatusPayload, RepairExecutionIntentV1, RepairFileMetadataV1, RepairReservationId,
     RepairTransactionPhase, RepairTransactionResolution, RepairTransactionResolutionOutcome,
     RepairTransactionStatusPayload, RepairTransactionStatusSelector, RepairTransactionTargetState,
-    RepairVaultLiveIdentityPayload,
+    RepairVaultLiveIdentityPayload, RepairWriteLeasePayload,
 };
 use kernaid_protocol::rescue_vault::{
     AuditEventType, AuditOutcome, ErrorToken, MAX_AUDIT_SEQUENCE, MAX_OPENAI_KEY_BYTES,
@@ -41,11 +41,11 @@ use std::{
 use std::os::fd::AsFd;
 
 #[cfg(feature = "experimental-repair-store")]
-const COMMAND_MAGIC: &[u8; 8] = b"KRVWC006";
+const COMMAND_MAGIC: &[u8; 8] = b"KRVWC007";
 #[cfg(not(feature = "experimental-repair-store"))]
 const COMMAND_MAGIC: &[u8; 8] = b"KRVWC003";
 #[cfg(feature = "experimental-repair-store")]
-const RESPONSE_MAGIC: &[u8; 8] = b"KRVWR006";
+const RESPONSE_MAGIC: &[u8; 8] = b"KRVWR007";
 #[cfg(not(feature = "experimental-repair-store"))]
 const RESPONSE_MAGIC: &[u8; 8] = b"KRVWR003";
 // Repair capabilities intentionally remain one canonical fixed-size binary
@@ -390,6 +390,9 @@ pub(super) enum WorkerRepairCommand {
         expected: Box<RepairTransactionStatusPayload>,
         resolution: RepairTransactionResolution,
     },
+    WriteLeaseConsume {
+        selector: RepairTransactionStatusSelector,
+    },
     VaultLiveParent,
 }
 
@@ -405,6 +408,7 @@ impl WorkerRepairCommand {
             Self::Retire { .. } => WorkerCommandKind::RepairBackupRetire,
             Self::TransactionStatus { .. } => WorkerCommandKind::RepairTransactionStatus,
             Self::TransactionResolve { .. } => WorkerCommandKind::RepairTransactionResolve,
+            Self::WriteLeaseConsume { .. } => WorkerCommandKind::RepairTransactionWriteLeaseConsume,
             Self::VaultLiveParent => WorkerCommandKind::RepairVaultLiveParent,
         }
     }
@@ -468,6 +472,13 @@ impl WorkerRepairCommand {
                         .execution_intent()
                         .ok_or(InternalWireError::InvalidFrame)?,
                 )
+            }
+            Self::WriteLeaseConsume { selector } => {
+                validate_repair_transaction_selector(selector)?;
+                if !matches!(selector, RepairTransactionStatusSelector::Exact { .. }) {
+                    return Err(InternalWireError::InvalidFrame);
+                }
+                Ok(())
             }
             Self::VaultLiveParent => Ok(()),
         }
@@ -546,6 +557,8 @@ pub(super) enum WorkerCommandKind {
     RepairTransactionResolve,
     #[cfg(feature = "experimental-repair-store")]
     RepairVaultLiveParent,
+    #[cfg(feature = "experimental-repair-store")]
+    RepairTransactionWriteLeaseConsume,
     AttestQuiescent,
     Shutdown,
 }
@@ -727,6 +740,7 @@ impl WorkerCommand {
                         | WorkerCommandKind::RepairTransactionStatus
                         | WorkerCommandKind::RepairTransactionResolve
                         | WorkerCommandKind::RepairVaultLiveParent
+                        | WorkerCommandKind::RepairTransactionWriteLeaseConsume
                 ))
         {
             return Err(InternalWireError::InvalidFrame);
@@ -790,6 +804,8 @@ impl WorkerCommand {
             WorkerCommandKind::RepairTransactionResolve => 23,
             #[cfg(feature = "experimental-repair-store")]
             WorkerCommandKind::RepairVaultLiveParent => 24,
+            #[cfg(feature = "experimental-repair-store")]
+            WorkerCommandKind::RepairTransactionWriteLeaseConsume => 25,
         };
         bytes[12..20].copy_from_slice(&self.request_id.to_be_bytes());
         if let Some(application) = &self.application {
@@ -910,6 +926,8 @@ impl WorkerCommand {
             23 => WorkerCommandKind::RepairTransactionResolve,
             #[cfg(feature = "experimental-repair-store")]
             24 => WorkerCommandKind::RepairVaultLiveParent,
+            #[cfg(feature = "experimental-repair-store")]
+            25 => WorkerCommandKind::RepairTransactionWriteLeaseConsume,
             _ => return Err(InternalWireError::InvalidFrame),
         };
         let application = match kind {
@@ -975,7 +993,10 @@ impl WorkerCommand {
             | WorkerCommandKind::RepairBackupRetire
             | WorkerCommandKind::RepairTransactionStatus
             | WorkerCommandKind::RepairTransactionResolve
-            | WorkerCommandKind::RepairVaultLiveParent => Some(decode_repair_command(bytes, kind)?),
+            | WorkerCommandKind::RepairVaultLiveParent
+            | WorkerCommandKind::RepairTransactionWriteLeaseConsume => {
+                Some(decode_repair_command(bytes, kind)?)
+            }
             _ => None,
         };
         #[cfg(feature = "experimental-repair-store")]
@@ -1031,6 +1052,9 @@ fn encode_repair_command(
             writer.hash(*draft_binding_sha256)?;
         }
         WorkerRepairCommand::TransactionStatus { selector } => {
+            encode_repair_transaction_selector(&mut writer, selector)?;
+        }
+        WorkerRepairCommand::WriteLeaseConsume { selector } => {
             encode_repair_transaction_selector(&mut writer, selector)?;
         }
         WorkerRepairCommand::TransactionResolve {
@@ -1092,6 +1116,11 @@ fn decode_repair_command(
         WorkerCommandKind::RepairTransactionStatus => WorkerRepairCommand::TransactionStatus {
             selector: decode_repair_transaction_selector(&mut reader)?,
         },
+        WorkerCommandKind::RepairTransactionWriteLeaseConsume => {
+            WorkerRepairCommand::WriteLeaseConsume {
+                selector: decode_repair_transaction_selector(&mut reader)?,
+            }
+        }
         WorkerCommandKind::RepairTransactionResolve => {
             let expected = decode_repair_transaction_status(&mut reader)?;
             let resolution = decode_repair_transaction_resolution(
@@ -1975,6 +2004,8 @@ pub(super) enum WorkerResultCode {
     RepairTransactionResolved,
     #[cfg(feature = "experimental-repair-store")]
     RepairVaultLiveIdentityReady,
+    #[cfg(feature = "experimental-repair-store")]
+    RepairWriteLeaseConsumed,
 }
 
 impl WorkerResultCode {
@@ -2070,6 +2101,8 @@ impl WorkerResultCode {
             Self::RepairTransactionResolved => 73,
             #[cfg(feature = "experimental-repair-store")]
             Self::RepairVaultLiveIdentityReady => 74,
+            #[cfg(feature = "experimental-repair-store")]
+            Self::RepairWriteLeaseConsumed => 75,
         }
     }
 
@@ -2165,6 +2198,8 @@ impl WorkerResultCode {
             73 => Ok(Self::RepairTransactionResolved),
             #[cfg(feature = "experimental-repair-store")]
             74 => Ok(Self::RepairVaultLiveIdentityReady),
+            #[cfg(feature = "experimental-repair-store")]
+            75 => Ok(Self::RepairWriteLeaseConsumed),
             _ => Err(InternalWireError::InvalidFrame),
         }
     }
@@ -2222,6 +2257,8 @@ pub(super) struct WorkerResponse {
     pub(super) repair_transaction_status: Option<Box<RepairTransactionStatusPayload>>,
     #[cfg(feature = "experimental-repair-store")]
     pub(super) repair_vault_live_identity: Option<WorkerRepairVaultLiveIdentity>,
+    #[cfg(feature = "experimental-repair-store")]
+    pub(super) repair_write_lease: Option<Box<RepairWriteLeasePayload>>,
 }
 
 impl WorkerResponse {
@@ -2243,6 +2280,8 @@ impl WorkerResponse {
             repair_transaction_status: None,
             #[cfg(feature = "experimental-repair-store")]
             repair_vault_live_identity: None,
+            #[cfg(feature = "experimental-repair-store")]
+            repair_write_lease: None,
         }
     }
 
@@ -2264,6 +2303,8 @@ impl WorkerResponse {
             repair_transaction_status: None,
             #[cfg(feature = "experimental-repair-store")]
             repair_vault_live_identity: None,
+            #[cfg(feature = "experimental-repair-store")]
+            repair_write_lease: None,
         }
     }
 
@@ -2285,6 +2326,8 @@ impl WorkerResponse {
             repair_transaction_status: None,
             #[cfg(feature = "experimental-repair-store")]
             repair_vault_live_identity: None,
+            #[cfg(feature = "experimental-repair-store")]
+            repair_write_lease: None,
         }
     }
 
@@ -2366,6 +2409,16 @@ impl WorkerResponse {
         response
     }
 
+    #[cfg(feature = "experimental-repair-store")]
+    pub(super) fn repair_write_lease_consumed(
+        request_id: u64,
+        lease: RepairWriteLeasePayload,
+    ) -> Self {
+        let mut response = Self::new(request_id, WorkerResultCode::RepairWriteLeaseConsumed);
+        response.repair_write_lease = Some(Box::new(lease));
+        response
+    }
+
     #[cfg(feature = "experimental-codex-home-lease")]
     pub(super) fn provider_codex_home_ready(request_id: u64) -> Self {
         Self::new(request_id, WorkerResultCode::ProviderCodexHomeReady)
@@ -2401,10 +2454,13 @@ impl WorkerResponse {
         let repair_vault_live_identity_metadata =
             self.code == WorkerResultCode::RepairVaultLiveIdentityReady;
         #[cfg(feature = "experimental-repair-store")]
+        let repair_write_lease_metadata = self.code == WorkerResultCode::RepairWriteLeaseConsumed;
+        #[cfg(feature = "experimental-repair-store")]
         if repair_metadata != self.repair_status.is_some()
             || repair_release_metadata != self.repair_released_bytes.is_some()
             || (!repair_transaction_metadata && self.repair_transaction_status.is_some())
             || repair_vault_live_identity_metadata != self.repair_vault_live_identity.is_some()
+            || repair_write_lease_metadata != self.repair_write_lease.is_some()
             || (self.code == WorkerResultCode::RepairTransactionResolved
                 && self.repair_transaction_status.is_none())
             || self
@@ -2427,6 +2483,10 @@ impl WorkerResponse {
                 .repair_vault_live_identity
                 .as_ref()
                 .is_some_and(|identity| identity.validate().is_err())
+            || self
+                .repair_write_lease
+                .as_ref()
+                .is_some_and(|lease| lease.validate().is_err())
         {
             return Err(InternalWireError::InvalidFrame);
         }
@@ -2524,6 +2584,11 @@ impl WorkerResponse {
             writer.string(&identity.vault_id, MAX_REPAIR_ID_BYTES)?;
             writer.hash(identity.vault_identity_fingerprint)?;
             writer.hash(identity.physical_parent_fingerprint)?;
+        } else if let Some(lease) = self.repair_write_lease.as_ref() {
+            let mut writer = ClosedFrameWriter::new(&mut bytes[REPAIR_PAYLOAD_OFFSET..]);
+            encode_repair_transaction_status(&mut writer, lease.transaction())?;
+            writer.hash(lease.boot_epoch_sha256().bytes())?;
+            writer.hash(lease.lease_binding_sha256().bytes())?;
         }
         Ok(bytes)
     }
@@ -2556,8 +2621,12 @@ impl WorkerResponse {
         let repair_vault_live_identity_metadata =
             code == WorkerResultCode::RepairVaultLiveIdentityReady;
         #[cfg(feature = "experimental-repair-store")]
-        let repair_wire =
-            repair_metadata || repair_transaction_metadata || repair_vault_live_identity_metadata;
+        let repair_write_lease_metadata = code == WorkerResultCode::RepairWriteLeaseConsumed;
+        #[cfg(feature = "experimental-repair-store")]
+        let repair_wire = repair_metadata
+            || repair_transaction_metadata
+            || repair_vault_live_identity_metadata
+            || repair_write_lease_metadata;
         #[cfg(not(feature = "experimental-repair-store"))]
         let repair_wire = false;
         let device_len = usize::from(bytes[9]);
@@ -2674,6 +2743,27 @@ impl WorkerResponse {
         } else {
             None
         };
+        #[cfg(feature = "experimental-repair-store")]
+        let repair_write_lease = if repair_write_lease_metadata {
+            let mut reader = ClosedFrameReader::new(
+                bytes
+                    .get(REPAIR_PAYLOAD_OFFSET..)
+                    .ok_or(InternalWireError::InvalidFrame)?,
+            );
+            let transaction = decode_repair_transaction_status(&mut reader)?;
+            let boot_epoch = protocol_sha256(reader.hash()?)?;
+            let encoded_binding = reader.hash()?;
+            let lease = RepairWriteLeasePayload::consumed(transaction, boot_epoch)
+                .map_err(|_| InternalWireError::InvalidFrame)?;
+            if lease.lease_binding_sha256().bytes() != encoded_binding
+                || !reader.remaining_is_zero()
+            {
+                return Err(InternalWireError::InvalidFrame);
+            }
+            Some(Box::new(lease))
+        } else {
+            None
+        };
         let response = Self {
             request_id,
             code,
@@ -2697,6 +2787,8 @@ impl WorkerResponse {
             repair_transaction_status,
             #[cfg(feature = "experimental-repair-store")]
             repair_vault_live_identity,
+            #[cfg(feature = "experimental-repair-store")]
+            repair_write_lease,
         };
         if response.encode()?.as_slice() != bytes {
             return Err(InternalWireError::InvalidFrame);
@@ -3107,6 +3199,7 @@ mod tests {
             metadata_sha256: metadata.canonical_sha256().bytes(),
             binding: None,
         };
+        let recovery_fingerprint = format!("recovery:{}", "8".repeat(64));
         let binding = WorkerRepairBinding {
             plan_id: "P-plan".to_owned(),
             plan_sha256: [0x55; 32],
@@ -3121,8 +3214,10 @@ mod tests {
                 format!("scan:{}", "7".repeat(64)),
                 protocol_sha256([0x77; 32]).expect("target fingerprint"),
                 protocol_sha256([0x88; 32]).expect("target physical parent"),
-                format!("recovery:{}", "8".repeat(64)),
-                format!("lock:{}", "9".repeat(64)),
+                recovery_fingerprint.clone(),
+                kernaid_protocol::rescue_repair_vault::canonical_repair_lock_identity(
+                    &recovery_fingerprint,
+                ),
                 protocol_sha256(expected_hash).expect("before hash"),
                 protocol_sha256([0xaa; 32]).expect("after hash"),
                 protocol_sha256([0xbb; 32]).expect("diff hash"),
@@ -3142,7 +3237,7 @@ mod tests {
         );
         let encoded = persist.encode().expect("repair persist frame");
         assert_eq!(encoded.len(), 2048);
-        assert_eq!(&encoded[..8], b"KRVWC006");
+        assert_eq!(&encoded[..8], b"KRVWC007");
         assert_eq!(WorkerCommand::decode(&encoded), Ok(persist));
 
         let mut noncanonical = encoded;
@@ -3159,7 +3254,7 @@ mod tests {
             WorkerResponse::repair(41, WorkerResultCode::RepairBackupDurable, durable.clone());
         let encoded = response.encode().expect("repair response frame");
         assert_eq!(encoded.len(), 2048);
-        assert_eq!(&encoded[..8], b"KRVWR006");
+        assert_eq!(&encoded[..8], b"KRVWR007");
         assert_eq!(WorkerResponse::decode(&encoded), Ok(response));
 
         let durable_protocol = durable.to_protocol().expect("durable protocol status");
@@ -3173,6 +3268,14 @@ mod tests {
         );
         let encoded = status_command.encode().expect("transaction status frame");
         assert_eq!(WorkerCommand::decode(&encoded), Ok(status_command));
+        let write_lease_command = WorkerCommand::repair(
+            51,
+            WorkerRepairCommand::WriteLeaseConsume {
+                selector: RepairTransactionStatusSelector::for_status(&pending),
+            },
+        );
+        let encoded = write_lease_command.encode().expect("write lease frame");
+        assert_eq!(WorkerCommand::decode(&encoded), Ok(write_lease_command));
 
         let intent = pending
             .backup()
@@ -3207,11 +3310,17 @@ mod tests {
             vault_identity_fingerprint: [0xdd; 32],
             physical_parent_fingerprint: [0xee; 32],
         };
+        let write_lease = RepairWriteLeasePayload::consumed(
+            pending.clone(),
+            protocol_sha256([0xff; 32]).expect("boot epoch"),
+        )
+        .expect("write lease receipt");
         for response in [
             WorkerResponse::repair_transaction_status(47, None),
-            WorkerResponse::repair_transaction_status(48, Some(pending)),
+            WorkerResponse::repair_transaction_status(48, Some(pending.clone())),
             WorkerResponse::repair_transaction_resolved(49, resolved),
             WorkerResponse::repair_vault_live_identity(50, live_identity),
+            WorkerResponse::repair_write_lease_consumed(51, write_lease),
         ] {
             let encoded = response.encode().expect("transaction response frame");
             assert_eq!(WorkerResponse::decode(&encoded), Ok(response));

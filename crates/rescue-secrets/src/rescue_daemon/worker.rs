@@ -18,7 +18,7 @@ use crate::{
 #[cfg(feature = "experimental-repair-store")]
 use kernaid_protocol::rescue_repair_vault::{
     RepairTransactionResolution, RepairTransactionStatusPayload,
-    RepairTransactionStatusResultPayload, RepairTransactionStatusSelector,
+    RepairTransactionStatusResultPayload, RepairTransactionStatusSelector, RepairWriteLeasePayload,
 };
 use kernaid_protocol::rescue_vault::{
     AuditEventType, AuditOutcome, ErrorToken, MAX_OPENAI_KEY_BYTES, MAX_SESSION_REPORT_JSON_BYTES,
@@ -793,6 +793,39 @@ fn handle_command(
             (response, false)
         }
         #[cfg(feature = "experimental-repair-store")]
+        Command::RepairTransactionWriteLeaseConsume => {
+            if descriptor.is_some() {
+                return (
+                    internal_wire::WorkerResponse::new(request_id, Result::RepairInvalidRequest),
+                    false,
+                );
+            }
+            let Some(internal_wire::WorkerRepairCommand::WriteLeaseConsume { selector }) =
+                command.repair.as_ref()
+            else {
+                return (
+                    internal_wire::WorkerResponse::new(request_id, Result::RepairInvalidRequest),
+                    false,
+                );
+            };
+            let consumed = match state {
+                WorkerVaultState::Locked => Err(Result::Busy),
+                WorkerVaultState::Unlocked(_) if validate_no_active_swap().is_err() => {
+                    Err(Result::CleanupFailed)
+                }
+                WorkerVaultState::Unlocked(mounted) => {
+                    consume_repair_write_lease(mounted, selector)
+                }
+            };
+            let response = match consumed {
+                Ok(lease) => {
+                    internal_wire::WorkerResponse::repair_write_lease_consumed(request_id, lease)
+                }
+                Err(code) => internal_wire::WorkerResponse::new(request_id, code),
+            };
+            (response, false)
+        }
+        #[cfg(feature = "experimental-repair-store")]
         Command::RepairTransactionResolve => {
             if descriptor.is_some() {
                 return (
@@ -1473,6 +1506,19 @@ fn repair_vault_live_identity(
 }
 
 #[cfg(feature = "experimental-repair-store")]
+fn consume_repair_write_lease(
+    mounted: &MountedRescueVault,
+    selector: &RepairTransactionStatusSelector,
+) -> Result<RepairWriteLeasePayload, internal_wire::WorkerResultCode> {
+    mounted
+        .secrets()
+        .open_repair_store()
+        .map_err(map_repair_store_error)?
+        .consume_write_lease(selector)
+        .map_err(map_repair_store_error)
+}
+
+#[cfg(feature = "experimental-repair-store")]
 fn resolve_repair_transaction(
     mounted: &MountedRescueVault,
     expected: &RepairTransactionStatusPayload,
@@ -1566,6 +1612,7 @@ fn map_repair_store_error(error: RepairVaultStoreError) -> internal_wire::Worker
         RepairVaultStoreError::ReservationConflict
         | RepairVaultStoreError::ReservationNotReady
         | RepairVaultStoreError::ConcurrentWrite => Result::RepairConflict,
+        RepairVaultStoreError::WriteLeaseConsumed => Result::Busy,
         RepairVaultStoreError::ReconciliationRequired => Result::RepairReconciliationRequired,
         RepairVaultStoreError::InsufficientCapacity
         | RepairVaultStoreError::PhysicalParentUnavailable

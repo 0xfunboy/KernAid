@@ -18,7 +18,7 @@ use kernaid_protocol::{
         RepairFileMetadataV1, RepairReservationId as ProtocolRepairReservationId,
         RepairTransactionPhase, RepairTransactionResolution, RepairTransactionResolutionOutcome,
         RepairTransactionStatusPayload, RepairTransactionStatusResultPayload,
-        RepairTransactionStatusSelector,
+        RepairTransactionStatusSelector, RepairWriteLeasePayload, canonical_repair_lock_identity,
     },
     rescue_vault::Sha256 as ProtocolSha256,
 };
@@ -97,7 +97,10 @@ const SECRET_PREFIX: &[u8] = b"KERNAID-REPAIR-STORE-SECRET-V1\0";
 const RESERVATION_BINDING_DOMAIN: &[u8] = b"KERNAID-REPAIR-RESERVATION-V1\0";
 const VAULT_IDENTITY_DOMAIN: &[u8] = b"KERNAID-REPAIR-VAULT-IDENTITY-V1\0";
 const STABLE_VAULT_ID_DOMAIN: &[u8] = b"KERNAID-REPAIR-STABLE-VAULT-ID-V1\0";
+const WRITE_LEASE_BOOT_EPOCH_DOMAIN: &[u8] = b"KERNAID-REPAIR-WRITE-LEASE-BOOT-EPOCH-V1\0";
 const FSTAB_RESOURCE_ID: &str = "rescue:selected-linux-root:etc/fstab";
+const BOOT_ID_PATH: &str = "/proc/sys/kernel/random/boot_id";
+const PROC_SUPER_MAGIC: u64 = 0x0000_9fa0;
 
 /// Sanitized Repair Vault failures. No variant carries an OS path, raw backup
 /// bytes or an operating-system error string.
@@ -109,6 +112,7 @@ pub enum RepairVaultStoreError {
     ReservationNotFound,
     ReservationConflict,
     ReservationNotReady,
+    WriteLeaseConsumed,
     ReconciliationRequired,
     UnsafeSource,
     SourceHashMismatch,
@@ -130,6 +134,7 @@ impl fmt::Display for RepairVaultStoreError {
             Self::ReservationNotFound => "repair backup reservation was not found",
             Self::ReservationConflict => "repair backup reservation conflicts with durable state",
             Self::ReservationNotReady => "repair backup reservation is not ready",
+            Self::WriteLeaseConsumed => "repair write lease was already consumed in this boot",
             Self::ReconciliationRequired => "Repair Vault reconciliation is required",
             Self::UnsafeSource => "repair backup source descriptor is unsafe",
             Self::SourceHashMismatch => "repair backup source hash does not match",
@@ -752,6 +757,17 @@ enum RepairEvent {
         #[serde(rename = "transactionBindingSha256")]
         transaction_binding_sha256: String,
     },
+    #[serde(rename = "repair.transaction.write-lease.consume")]
+    TransactionWriteLeaseConsume {
+        #[serde(rename = "reservationId")]
+        reservation_id: ReservationId,
+        #[serde(rename = "transactionBindingSha256")]
+        transaction_binding_sha256: String,
+        #[serde(rename = "bootEpochSha256")]
+        boot_epoch_sha256: String,
+        #[serde(rename = "leaseBindingSha256")]
+        lease_binding_sha256: String,
+    },
     #[serde(rename = "repair.backup.cancel.intent")]
     CancelIntent {
         #[serde(rename = "reservationId")]
@@ -811,6 +827,7 @@ enum ReservationPhase {
 struct RepairTransactionRecord {
     resolution: Option<RepairTransactionResolution>,
     pending_resolution: Option<PendingTransactionResolution>,
+    write_lease: Option<ConsumedWriteLease>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -818,6 +835,12 @@ struct PendingTransactionResolution {
     transaction_binding_sha256: String,
     expected_phase: RepairTransactionPhase,
     resolution: RepairTransactionResolution,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct ConsumedWriteLease {
+    boot_epoch_sha256: String,
+    lease_binding_sha256: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -948,6 +971,7 @@ pub struct RepairVaultStore<'vault> {
     vault_id: String,
     vault_identity_fingerprint: String,
     physical_parent_fingerprint: String,
+    boot_epoch_sha256: ProtocolSha256,
     event_count: u64,
     checked_out: BTreeSet<ReservationId>,
     healthy: bool,
@@ -966,6 +990,7 @@ impl<'vault> RepairVaultStore<'vault> {
         // cannot prove the physical parent of the boot Vault.
         let (vault_id, vault_identity_fingerprint, physical_parent_fingerprint) =
             vault_fingerprints(inner)?;
+        let boot_epoch_sha256 = current_boot_epoch_sha256()?;
         let (namespace_fd, namespace_state, backups_fd, backups_state, lock_fd) =
             initialize_namespace(inner)?;
         cleanup_repair_secret_orphan(
@@ -990,6 +1015,7 @@ impl<'vault> RepairVaultStore<'vault> {
             vault_id,
             vault_identity_fingerprint,
             physical_parent_fingerprint,
+            boot_epoch_sha256,
             event_count,
             checked_out: BTreeSet::new(),
             healthy: true,
@@ -1393,6 +1419,74 @@ impl<'vault> RepairVaultStore<'vault> {
             }
             _ => Ok(RepairTransactionStatusResultPayload::found(status)),
         }
+    }
+
+    /// Atomically consume the sole write-mount lease for one exact Pending
+    /// transaction in the current boot. The returned value is a receipt, not
+    /// a reusable bearer capability.
+    pub fn consume_write_lease(
+        &mut self,
+        selector: &RepairTransactionStatusSelector,
+    ) -> Result<RepairWriteLeasePayload, RepairVaultStoreError> {
+        self.require_mutable()?;
+        let RepairTransactionStatusSelector::Exact {
+            reservation_id,
+            transaction_binding_sha256,
+        } = selector
+        else {
+            return Err(RepairVaultStoreError::InvalidBinding);
+        };
+        let reservation_id = ReservationId::parse(reservation_id.as_str())?;
+        let status = self.transaction_status_for_id(&reservation_id)?;
+        if status.phase() != RepairTransactionPhase::Pending
+            || status.transaction_binding_sha256() != transaction_binding_sha256
+        {
+            return Err(RepairVaultStoreError::ReservationConflict);
+        }
+        let reservation = self
+            .state
+            .reservations
+            .get(&reservation_id)
+            .ok_or(RepairVaultStoreError::ReservationNotFound)?;
+        let ReservationPhase::Durable(binding) = &reservation.phase else {
+            return Err(RepairVaultStoreError::ReservationNotReady);
+        };
+        binding.validate_for_record(reservation)?;
+        let intent = &binding.execution_intent;
+        if intent.lock_identity()
+            != canonical_repair_lock_identity(intent.target_recovery_fingerprint())
+        {
+            return Err(RepairVaultStoreError::InvalidBinding);
+        }
+        let transaction = self
+            .state
+            .transactions
+            .get(&reservation_id)
+            .ok_or(RepairVaultStoreError::CorruptJournal)?;
+        if transaction.pending_resolution.is_some() || transaction.resolution.is_some() {
+            return Err(RepairVaultStoreError::ReservationConflict);
+        }
+        if transaction
+            .write_lease
+            .as_ref()
+            .is_some_and(|lease| lease.boot_epoch_sha256 == self.boot_epoch_sha256.as_str())
+        {
+            return Err(RepairVaultStoreError::WriteLeaseConsumed);
+        }
+        let lease = RepairWriteLeasePayload::consumed(status, self.boot_epoch_sha256.clone())
+            .map_err(|_| RepairVaultStoreError::InvalidBinding)?;
+        self.require_event_capacity(1)?;
+        self.append_event(RepairEvent::TransactionWriteLeaseConsume {
+            reservation_id,
+            transaction_binding_sha256: lease
+                .transaction()
+                .transaction_binding_sha256()
+                .as_str()
+                .to_owned(),
+            boot_epoch_sha256: lease.boot_epoch_sha256().as_str().to_owned(),
+            lease_binding_sha256: lease.lease_binding_sha256().as_str().to_owned(),
+        })?;
+        Ok(lease)
     }
 
     /// Return freshly attested, current-boot Vault parent evidence without
@@ -2657,6 +2751,9 @@ fn transactions_are_consistent(state: &RecoveredState) -> bool {
                 if transaction.pending_resolution.is_some() {
                     return false;
                 }
+                if !write_lease_is_consistent(reservation_id, record, transaction) {
+                    return false;
+                }
                 if protocol_transaction_status_from_record(reservation_id, record, transaction)
                     .is_err()
                 {
@@ -2680,6 +2777,28 @@ fn transactions_are_consistent(state: &RecoveredState) -> bool {
         }
     }
     durable_count == state.transactions.len() && unresolved == state.unresolved_transaction.as_ref()
+}
+
+fn write_lease_is_consistent(
+    reservation_id: &ReservationId,
+    reservation: &ReservationRecord,
+    transaction: &RepairTransactionRecord,
+) -> bool {
+    let Some(consumed) = transaction.write_lease.as_ref() else {
+        return true;
+    };
+    let pending = RepairTransactionRecord {
+        resolution: None,
+        pending_resolution: None,
+        write_lease: None,
+    };
+    protocol_transaction_status_from_record(reservation_id, reservation, &pending)
+        .and_then(|status| {
+            let boot_epoch = protocol_sha256_str(&consumed.boot_epoch_sha256)?;
+            RepairWriteLeasePayload::consumed(status, boot_epoch)
+                .map_err(|_| RepairVaultStoreError::CorruptJournal)
+        })
+        .is_ok_and(|lease| lease.lease_binding_sha256().as_str() == consumed.lease_binding_sha256)
 }
 
 fn retained_release_tombstones(
@@ -2829,18 +2948,27 @@ fn append_transaction_snapshot(
     record: &ReservationRecord,
     transaction: &RepairTransactionRecord,
 ) -> Result<(), RepairVaultStoreError> {
-    let Some(resolution) = transaction.resolution.as_ref() else {
-        return Ok(());
-    };
     let pending = protocol_transaction_status_from_record(
         reservation_id,
         record,
         &RepairTransactionRecord {
             resolution: None,
             pending_resolution: None,
+            write_lease: None,
         },
     )?;
     let transaction_binding_sha256 = pending.transaction_binding_sha256().as_str().to_owned();
+    if let Some(lease) = transaction.write_lease.as_ref() {
+        events.push(RepairEvent::TransactionWriteLeaseConsume {
+            reservation_id: reservation_id.clone(),
+            transaction_binding_sha256: transaction_binding_sha256.clone(),
+            boot_epoch_sha256: lease.boot_epoch_sha256.clone(),
+            lease_binding_sha256: lease.lease_binding_sha256.clone(),
+        });
+    }
+    let Some(resolution) = transaction.resolution.as_ref() else {
+        return Ok(());
+    };
     events.push(RepairEvent::TransactionResolveIntent {
         reservation_id: reservation_id.clone(),
         transaction_binding_sha256: transaction_binding_sha256.clone(),
@@ -2884,6 +3012,7 @@ fn append_release_snapshot(
                 &RepairTransactionRecord {
                     resolution: Some(resolution.clone()),
                     pending_resolution: None,
+                    write_lease: None,
                 },
             )?;
             events.push(RepairEvent::RetireIntent {
@@ -3151,6 +3280,7 @@ fn apply_repair_event(
                     RepairTransactionRecord {
                         resolution: None,
                         pending_resolution: None,
+                        write_lease: None,
                     },
                 )
                 .is_some()
@@ -3174,6 +3304,74 @@ fn apply_repair_event(
             }
             record.phase = ReservationPhase::Reserved;
             state.pending = None;
+        }
+        RepairEvent::TransactionWriteLeaseConsume {
+            reservation_id,
+            transaction_binding_sha256,
+            boot_epoch_sha256,
+            lease_binding_sha256,
+        } => {
+            if state.pending.is_some()
+                || state.unresolved_transaction.as_ref() != Some(&reservation_id)
+                || !valid_sha256(&transaction_binding_sha256)
+                || !valid_sha256(&boot_epoch_sha256)
+                || !valid_sha256(&lease_binding_sha256)
+            {
+                return Err(RepairVaultStoreError::CorruptJournal);
+            }
+            let reservation = state
+                .reservations
+                .get(&reservation_id)
+                .ok_or(RepairVaultStoreError::CorruptJournal)?;
+            let ReservationPhase::Durable(binding) = &reservation.phase else {
+                return Err(RepairVaultStoreError::CorruptJournal);
+            };
+            binding
+                .validate_for_record(reservation)
+                .map_err(|_| RepairVaultStoreError::CorruptJournal)?;
+            if binding.execution_intent.lock_identity()
+                != canonical_repair_lock_identity(
+                    binding.execution_intent.target_recovery_fingerprint(),
+                )
+            {
+                return Err(RepairVaultStoreError::CorruptJournal);
+            }
+            let transaction = state
+                .transactions
+                .get(&reservation_id)
+                .ok_or(RepairVaultStoreError::CorruptJournal)?;
+            if transaction.resolution.is_some()
+                || transaction.pending_resolution.is_some()
+                || transaction
+                    .write_lease
+                    .as_ref()
+                    .is_some_and(|lease| lease.boot_epoch_sha256 == boot_epoch_sha256)
+            {
+                return Err(RepairVaultStoreError::CorruptJournal);
+            }
+            let status =
+                protocol_transaction_status_from_record(&reservation_id, reservation, transaction)
+                    .map_err(|_| RepairVaultStoreError::CorruptJournal)?;
+            if status.phase() != RepairTransactionPhase::Pending
+                || status.transaction_binding_sha256().as_str() != transaction_binding_sha256
+            {
+                return Err(RepairVaultStoreError::CorruptJournal);
+            }
+            let boot_epoch = protocol_sha256_str(&boot_epoch_sha256)
+                .map_err(|_| RepairVaultStoreError::CorruptJournal)?;
+            let lease = RepairWriteLeasePayload::consumed(status, boot_epoch)
+                .map_err(|_| RepairVaultStoreError::CorruptJournal)?;
+            if lease.lease_binding_sha256().as_str() != lease_binding_sha256 {
+                return Err(RepairVaultStoreError::CorruptJournal);
+            }
+            state
+                .transactions
+                .get_mut(&reservation_id)
+                .ok_or(RepairVaultStoreError::CorruptJournal)?
+                .write_lease = Some(ConsumedWriteLease {
+                boot_epoch_sha256,
+                lease_binding_sha256,
+            });
         }
         RepairEvent::TransactionResolveIntent {
             reservation_id,
@@ -5141,6 +5339,80 @@ fn vault_fingerprints(
     Ok((vault_id, vault_identity, physical_parent))
 }
 
+fn current_boot_epoch_sha256() -> Result<ProtocolSha256, RepairVaultStoreError> {
+    let descriptor = rfs::openat2(
+        rfs::CWD,
+        BOOT_ID_PATH,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+    )
+    .map_err(|_| RepairVaultStoreError::StorageUnavailable)?;
+    let before = rfs::fstat(&descriptor).map_err(|_| RepairVaultStoreError::StorageUnavailable)?;
+    let named = rfs::statat(rfs::CWD, BOOT_ID_PATH, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|_| RepairVaultStoreError::StorageUnavailable)?;
+    let filesystem =
+        rfs::fstatfs(&descriptor).map_err(|_| RepairVaultStoreError::StorageUnavailable)?;
+    let status =
+        rfs::fcntl_getfl(&descriptor).map_err(|_| RepairVaultStoreError::StorageUnavailable)?;
+    let descriptor_flags = rustix::io::fcntl_getfd(&descriptor)
+        .map_err(|_| RepairVaultStoreError::StorageUnavailable)?;
+    if status & OFlags::ACCMODE != OFlags::RDONLY
+        || !status.contains(OFlags::NONBLOCK)
+        || !descriptor_flags.contains(rustix::io::FdFlags::CLOEXEC)
+        || !FileType::from_raw_mode(before.st_mode).is_file()
+        || before.st_uid != 0
+        || before.st_gid != 0
+        || before.st_nlink != 1
+        || before.st_mode & 0o022 != 0
+        || (before.st_dev, before.st_ino) != (named.st_dev, named.st_ino)
+        || u64::try_from(filesystem.f_type).ok() != Some(PROC_SUPER_MAGIC)
+    {
+        return Err(RepairVaultStoreError::CorruptStore);
+    }
+    let mut file = File::from(descriptor);
+    let mut bytes = Vec::with_capacity(37);
+    Read::by_ref(&mut file)
+        .take(38)
+        .read_to_end(&mut bytes)
+        .map_err(|_| RepairVaultStoreError::StorageUnavailable)?;
+    let after = rfs::fstat(&file).map_err(|_| RepairVaultStoreError::StorageUnavailable)?;
+    let named_after = rfs::statat(rfs::CWD, BOOT_ID_PATH, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|_| RepairVaultStoreError::StorageUnavailable)?;
+    if bytes.len() != 37
+        || bytes[36] != b'\n'
+        || !canonical_boot_uuid(&bytes[..36])
+        || (
+            before.st_dev,
+            before.st_ino,
+            before.st_mode,
+            before.st_uid,
+            before.st_gid,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_mode,
+            after.st_uid,
+            after.st_gid,
+        )
+        || (after.st_dev, after.st_ino) != (named_after.st_dev, named_after.st_ino)
+    {
+        return Err(RepairVaultStoreError::CorruptStore);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(WRITE_LEASE_BOOT_EPOCH_DOMAIN);
+    hash_field(&mut hasher, &bytes[..36]);
+    protocol_sha256_str(&encode_hex(&hasher.finalize()))
+}
+
+fn canonical_boot_uuid(value: &[u8]) -> bool {
+    value.len() == 36
+        && value.iter().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => *byte == b'-',
+            _ => byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'),
+        })
+}
+
 /// Durable Vault identity deliberately excludes mount IDs, device-mapper
 /// numbers and other boot-local kernel allocation.  Those values remain part
 /// of the live mount attestation, while journal recovery and rollback bind to
@@ -5357,6 +5629,7 @@ mod tests {
     fn binding(bytes: &[u8]) -> RepairBinding {
         let before_sha256 = ProtocolSha256::parse(&encode_hex(&Sha256::digest(bytes)))
             .expect("protocol before digest");
+        let recovery_fingerprint = format!("recovery:{}", "6".repeat(64));
         let execution_intent = RepairExecutionIntentV1::new(
             "S-repair-test",
             1,
@@ -5364,8 +5637,8 @@ mod tests {
             format!("scan:{}", "1".repeat(64)),
             ProtocolSha256::parse(&encode_hex(&[7; 32])).expect("target digest"),
             ProtocolSha256::parse(&"d".repeat(64)).expect("target parent digest"),
-            format!("recovery:{}", "6".repeat(64)),
-            format!("lock:{}", "2".repeat(64)),
+            recovery_fingerprint.clone(),
+            canonical_repair_lock_identity(&recovery_fingerprint),
             before_sha256,
             ProtocolSha256::parse(&"3".repeat(64)).expect("after digest"),
             ProtocolSha256::parse(&"4".repeat(64)).expect("diff digest"),
@@ -5792,6 +6065,207 @@ mod tests {
                 .transaction()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn write_lease_is_journaled_once_per_boot_and_replayed_exactly() {
+        let fixture = Fixture::new();
+        let bytes = b"write lease transaction backup\n";
+        let (selector, receipt, event_count) = {
+            let mut store = fixture
+                .vault
+                .open_repair_store()
+                .expect("open repair store");
+            let reserved = store
+                .reserve_backup(draft(bytes, 4096))
+                .expect("reserve backup");
+            store
+                .persist_backup(reserved, binding(bytes), fixture.read_only_source(bytes))
+                .expect("persist durable backup");
+            let pending = store
+                .transaction_status(&RepairTransactionStatusSelector::pending_singleton())
+                .expect("pending status")
+                .transaction()
+                .expect("pending transaction")
+                .clone();
+            let selector = RepairTransactionStatusSelector::for_status(&pending);
+            let before = store.event_count;
+            let receipt = store
+                .consume_write_lease(&selector)
+                .expect("consume current-boot write lease");
+            assert_eq!(receipt.transaction(), &pending);
+            assert_eq!(store.event_count, before + 1);
+            assert_eq!(
+                store.consume_write_lease(&selector),
+                Err(RepairVaultStoreError::WriteLeaseConsumed)
+            );
+            assert_eq!(store.event_count, before + 1);
+            (selector, receipt, store.event_count)
+        };
+
+        let mut store = fixture
+            .vault
+            .open_repair_store()
+            .expect("reopen journaled write lease");
+        assert_eq!(store.event_count, event_count);
+        assert_eq!(
+            store.consume_write_lease(&selector),
+            Err(RepairVaultStoreError::WriteLeaseConsumed)
+        );
+        assert_eq!(store.event_count, event_count);
+        let consumed = store
+            .state
+            .transactions
+            .values()
+            .next()
+            .and_then(|transaction| transaction.write_lease.as_ref())
+            .expect("replayed consumed lease");
+        assert_eq!(
+            consumed.lease_binding_sha256,
+            receipt.lease_binding_sha256().as_str()
+        );
+
+        store.boot_epoch_sha256 =
+            ProtocolSha256::parse(&"f".repeat(64)).expect("different boot epoch");
+        if store.boot_epoch_sha256 == *receipt.boot_epoch_sha256() {
+            store.boot_epoch_sha256 =
+                ProtocolSha256::parse(&"e".repeat(64)).expect("alternate boot epoch");
+        }
+        let next_boot = store
+            .consume_write_lease(&selector)
+            .expect("new boot consumes a fresh single-use lease");
+        assert_ne!(next_boot.boot_epoch_sha256(), receipt.boot_epoch_sha256());
+        assert_ne!(
+            next_boot.lease_binding_sha256(),
+            receipt.lease_binding_sha256()
+        );
+        assert_eq!(store.event_count, event_count + 1);
+    }
+
+    #[test]
+    fn write_lease_requires_the_durable_backup_bytes_and_canonical_lock() {
+        let fixture = Fixture::new();
+        let bytes = b"durability proof for write lease\n";
+        let mut store = fixture
+            .vault
+            .open_repair_store()
+            .expect("open repair store");
+        let reserved = store
+            .reserve_backup(draft(bytes, 4096))
+            .expect("reserve backup");
+        let reservation_id = reserved.reservation_id().clone();
+        store
+            .persist_backup(reserved, binding(bytes), fixture.read_only_source(bytes))
+            .expect("persist durable backup");
+        let pending = store
+            .transaction_status(&RepairTransactionStatusSelector::pending_singleton())
+            .expect("pending status")
+            .transaction()
+            .expect("pending transaction")
+            .clone();
+        let selector = RepairTransactionStatusSelector::for_status(&pending);
+
+        store
+            .state
+            .reservations
+            .get_mut(&reservation_id)
+            .and_then(|record| match &mut record.phase {
+                ReservationPhase::Durable(binding) => Some(binding),
+                _ => None,
+            })
+            .expect("durable binding")
+            .execution_intent = RepairExecutionIntentV1::new(
+            "S-repair-test",
+            1,
+            "target-test",
+            format!("scan:{}", "1".repeat(64)),
+            ProtocolSha256::parse(&encode_hex(&[7; 32])).expect("target digest"),
+            ProtocolSha256::parse(&"d".repeat(64)).expect("parent digest"),
+            format!("recovery:{}", "6".repeat(64)),
+            format!("lock:{}", "2".repeat(64)),
+            ProtocolSha256::parse(&encode_hex(&Sha256::digest(bytes))).expect("before digest"),
+            ProtocolSha256::parse(&"3".repeat(64)).expect("after digest"),
+            ProtocolSha256::parse(&"4".repeat(64)).expect("diff digest"),
+            ProtocolSha256::parse(&"5".repeat(64)).expect("UUID digest"),
+            RepairFileMetadataV1::new(0o644, 0, 0).expect("metadata"),
+        )
+        .expect("shape-valid noncanonical lock intent");
+        let noncanonical = store
+            .transaction_status(&RepairTransactionStatusSelector::pending_singleton())
+            .expect("noncanonical pending status remains representable")
+            .transaction()
+            .expect("pending transaction")
+            .clone();
+        let noncanonical_selector = RepairTransactionStatusSelector::for_status(&noncanonical);
+        assert_eq!(
+            store.consume_write_lease(&noncanonical_selector),
+            Err(RepairVaultStoreError::InvalidBinding)
+        );
+
+        store
+            .state
+            .reservations
+            .get_mut(&reservation_id)
+            .and_then(|record| match &mut record.phase {
+                ReservationPhase::Durable(binding) => Some(binding),
+                _ => None,
+            })
+            .expect("durable binding")
+            .execution_intent = binding(bytes).execution_intent;
+        fs::remove_file(backup_path(&fixture, &reservation_id)).expect("remove durable bytes");
+        assert!(store.consume_write_lease(&selector).is_err());
+    }
+
+    #[test]
+    fn write_lease_survives_compaction_and_does_not_block_resolution() {
+        let fixture = Fixture::new();
+        let bytes = b"compacted write lease transaction\n";
+        let (pending, selector, lease_binding) = {
+            let mut store = fixture
+                .vault
+                .open_repair_store()
+                .expect("open repair store");
+            let reserved = store
+                .reserve_backup(draft(bytes, 4096))
+                .expect("reserve backup");
+            store
+                .persist_backup(reserved, binding(bytes), fixture.read_only_source(bytes))
+                .expect("persist durable backup");
+            let pending = store
+                .transaction_status(&RepairTransactionStatusSelector::pending_singleton())
+                .expect("pending status")
+                .transaction()
+                .expect("pending transaction")
+                .clone();
+            let selector = RepairTransactionStatusSelector::for_status(&pending);
+            let lease = store
+                .consume_write_lease(&selector)
+                .expect("consume write lease");
+            let lease_binding = lease.lease_binding_sha256().clone();
+            store.compact_journal().expect("compact consumed lease");
+            (pending, selector, lease_binding)
+        };
+
+        let mut store = fixture
+            .vault
+            .open_repair_store()
+            .expect("reopen compacted lease");
+        assert_eq!(
+            store.consume_write_lease(&selector),
+            Err(RepairVaultStoreError::WriteLeaseConsumed)
+        );
+        let consumed = store
+            .state
+            .transactions
+            .values()
+            .next()
+            .and_then(|transaction| transaction.write_lease.as_ref())
+            .expect("compacted lease replayed");
+        assert_eq!(consumed.lease_binding_sha256, lease_binding.as_str());
+        let resolved = store
+            .resolve_transaction(&pending, committed_resolution(&pending))
+            .expect("resolve after consumed lease");
+        assert_eq!(resolved.phase(), RepairTransactionPhase::Resolved);
     }
 
     #[test]

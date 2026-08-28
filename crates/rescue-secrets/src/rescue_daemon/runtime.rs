@@ -2841,6 +2841,20 @@ impl WorkerHandle {
     }
 
     #[cfg(feature = "experimental-repair-store")]
+    pub(super) fn repair_write_lease_consume(
+        &self,
+        selector: &RepairTransactionStatusSelector,
+        deadline: Instant,
+    ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
+        self.transact_repair_without_descriptor(
+            internal_wire::WorkerRepairCommand::WriteLeaseConsume {
+                selector: selector.clone(),
+            },
+            deadline,
+        )
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
     pub(super) fn repair_transaction_resolve(
         &self,
         expected: &RepairTransactionStatusPayload,
@@ -3867,6 +3881,18 @@ fn response_matches(
             response.code,
             Result::RepairVaultLiveIdentityReady
                 | Result::RepairInvalidRequest
+                | Result::RepairReconciliationRequired
+                | Result::RepairStorageUnavailable
+                | Result::CleanupFailed
+                | Result::Busy
+        ),
+        #[cfg(feature = "experimental-repair-store")]
+        Command::RepairTransactionWriteLeaseConsume => matches!(
+            response.code,
+            Result::RepairWriteLeaseConsumed
+                | Result::RepairBackupNotFound
+                | Result::RepairInvalidRequest
+                | Result::RepairConflict
                 | Result::RepairReconciliationRequired
                 | Result::RepairStorageUnavailable
                 | Result::CleanupFailed

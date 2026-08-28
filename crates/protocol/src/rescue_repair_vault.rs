@@ -18,12 +18,16 @@ pub const REPAIR_BACKUP_LOCATOR_PREFIX: &str = "vault://repair/";
 pub const REPAIR_EXECUTION_ACTION_ID: &str = "linux.fstab.disable-missing-uuid.v1";
 /// The only resource this first transaction protocol can mutate.
 pub const REPAIR_EXECUTION_RESOURCE_ID: &str = "rescue:selected-linux-root:etc/fstab";
+/// The sole root-helper capability that a consumed V1 lease can authorize.
+pub const REPAIR_WRITE_LEASE_CAPABILITY: &str = "fstab-direct-leaf-rw-v1";
 
 const MAX_OPAQUE_ID_BYTES: usize = 128;
 const RESERVATION_BINDING_DOMAIN: &[u8] = b"KERNAID-REPAIR-RESERVATION-V1\0";
 const FILE_METADATA_DOMAIN: &[u8] = b"KERNAID-REPAIR-FILE-METADATA-V1\0";
 const EXECUTION_INTENT_BINDING_DOMAIN: &[u8] = b"KERNAID-REPAIR-EXECUTION-INTENT-V1\0";
 const TRANSACTION_BINDING_DOMAIN: &[u8] = b"KERNAID-REPAIR-TRANSACTION-V1\0";
+const WRITE_LEASE_BINDING_DOMAIN: &[u8] = b"KERNAID-REPAIR-WRITE-LEASE-V1\0";
+const LOCK_ID_DOMAIN: &[u8] = b"kernaid:rescue-fstab:target-lock:v2\0";
 const MAX_PERMISSION_MODE: u32 = 0o7777;
 const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
 
@@ -369,6 +373,18 @@ pub fn canonical_repair_execution_intent_sha256(intent: &RepairExecutionIntentV1
         &intent.before_metadata.canonical_sha256().bytes(),
     );
     Sha256::parse(&encode_hex(&hasher.finalize())).expect("SHA-256 digest is canonical")
+}
+
+/// Derives the only canonical lock identity accepted for the V1 fstab
+/// resource. Keeping this derivation beside the durable intent lets the Vault
+/// independently reject a syntactically valid but target-unbound lock.
+pub fn canonical_repair_lock_identity(target_recovery_fingerprint: &str) -> String {
+    let mut hasher = Sha256Hasher::new();
+    hasher.update(LOCK_ID_DOMAIN);
+    for value in [target_recovery_fingerprint, REPAIR_EXECUTION_RESOURCE_ID] {
+        hash_field(&mut hasher, value.as_bytes());
+    }
+    format!("lock:{}", encode_hex(&hasher.finalize()))
 }
 
 /// Final authorization binding supplied only when backup bytes are persisted.
@@ -1205,6 +1221,107 @@ impl RepairTransactionStatusResultPayload {
     }
 }
 
+/// Receipt for one write-mount lease that the Vault has already consumed.
+///
+/// This is closed audit evidence returned only to the root target helper; it
+/// is not a transferable bearer token. The helper must derive its target from
+/// the embedded Pending transaction and may hand off at most one descriptor.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RepairWriteLeasePayload {
+    capability: String,
+    boot_epoch_sha256: Sha256,
+    lease_binding_sha256: Sha256,
+    transaction: Box<RepairTransactionStatusPayload>,
+}
+
+impl RepairWriteLeasePayload {
+    pub fn consumed(
+        transaction: RepairTransactionStatusPayload,
+        boot_epoch_sha256: Sha256,
+    ) -> Result<Self, ProtocolViolation> {
+        let lease_binding_sha256 =
+            canonical_repair_write_lease_sha256(&transaction, &boot_epoch_sha256)?;
+        let value = Self {
+            capability: REPAIR_WRITE_LEASE_CAPABILITY.to_owned(),
+            boot_epoch_sha256,
+            lease_binding_sha256,
+            transaction: Box::new(transaction),
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn capability(&self) -> &str {
+        &self.capability
+    }
+
+    pub fn boot_epoch_sha256(&self) -> &Sha256 {
+        &self.boot_epoch_sha256
+    }
+
+    pub fn lease_binding_sha256(&self) -> &Sha256 {
+        &self.lease_binding_sha256
+    }
+
+    pub fn transaction(&self) -> &RepairTransactionStatusPayload {
+        &self.transaction
+    }
+
+    pub fn validate(&self) -> Result<(), ProtocolViolation> {
+        self.transaction.validate()?;
+        let Some(intent) = self.transaction.backup().execution_intent() else {
+            return Err(ProtocolViolation::InvalidPayload);
+        };
+        if self.capability != REPAIR_WRITE_LEASE_CAPABILITY
+            || self.transaction.phase() != RepairTransactionPhase::Pending
+            || self.transaction.backup().state() != RepairBackupState::Durable
+            || self.boot_epoch_sha256.bytes().iter().all(|byte| *byte == 0)
+            || intent.action_id() != REPAIR_EXECUTION_ACTION_ID
+            || self.transaction.backup().resource_id() != Some(REPAIR_EXECUTION_RESOURCE_ID)
+            || intent.lock_identity()
+                != canonical_repair_lock_identity(intent.target_recovery_fingerprint())
+            || self.lease_binding_sha256
+                != canonical_repair_write_lease_sha256(&self.transaction, &self.boot_epoch_sha256)?
+        {
+            return Err(ProtocolViolation::InvalidPayload);
+        }
+        Ok(())
+    }
+}
+
+/// Binds a consumed lease to one exact Pending transaction and boot epoch.
+pub fn canonical_repair_write_lease_sha256(
+    transaction: &RepairTransactionStatusPayload,
+    boot_epoch_sha256: &Sha256,
+) -> Result<Sha256, ProtocolViolation> {
+    transaction.validate()?;
+    if transaction.phase() != RepairTransactionPhase::Pending
+        || boot_epoch_sha256.bytes().iter().all(|byte| *byte == 0)
+    {
+        return Err(ProtocolViolation::InvalidPayload);
+    }
+    let Some(intent) = transaction.backup().execution_intent() else {
+        return Err(ProtocolViolation::InvalidPayload);
+    };
+    if intent.lock_identity()
+        != canonical_repair_lock_identity(intent.target_recovery_fingerprint())
+    {
+        return Err(ProtocolViolation::InvalidPayload);
+    }
+    let mut hasher = Sha256Hasher::new();
+    hasher.update(WRITE_LEASE_BINDING_DOMAIN);
+    hash_field(&mut hasher, REPAIR_WRITE_LEASE_CAPABILITY.as_bytes());
+    hash_field(
+        &mut hasher,
+        &transaction.transaction_binding_sha256().bytes(),
+    );
+    hash_field(&mut hasher, &boot_epoch_sha256.bytes());
+    hash_field(&mut hasher, intent.target_recovery_fingerprint().as_bytes());
+    hash_field(&mut hasher, intent.lock_identity().as_bytes());
+    Ok(Sha256::parse(&encode_hex(&hasher.finalize())).expect("SHA-256 digest is canonical"))
+}
+
 pub fn repair_backup_input(size: u64) -> Result<DescriptorDeclaration, ProtocolViolation> {
     if !(1..=MAX_REPAIR_BACKUP_BYTES).contains(&size) {
         return Err(ProtocolViolation::InvalidPayload);
@@ -1319,6 +1436,7 @@ mod tests {
         before_sha256: Sha256,
         before_metadata: RepairFileMetadataV1,
     ) -> RepairExecutionIntentV1 {
+        let recovery_fingerprint = format!("recovery:{}", "8".repeat(64));
         RepairExecutionIntentV1::new(
             "S-session-1",
             7,
@@ -1326,8 +1444,8 @@ mod tests {
             format!("scan:{}", "1".repeat(64)),
             hash('2'),
             hash('9'),
-            format!("recovery:{}", "8".repeat(64)),
-            format!("lock:{}", "a".repeat(64)),
+            recovery_fingerprint.clone(),
+            canonical_repair_lock_identity(&recovery_fingerprint),
             before_sha256,
             hash('b'),
             hash('c'),
@@ -1478,6 +1596,37 @@ mod tests {
             invalid_intent.validate(),
             Err(ProtocolViolation::InvalidPayload)
         );
+    }
+
+    #[test]
+    fn write_lease_is_exact_pending_boot_scoped_and_tamper_evident() {
+        let pending =
+            RepairTransactionStatusPayload::pending(durable_status()).expect("pending transaction");
+        let lease = RepairWriteLeasePayload::consumed(pending.clone(), hash('e'))
+            .expect("consumed write lease receipt");
+        assert_eq!(lease.capability(), REPAIR_WRITE_LEASE_CAPABILITY);
+        assert_eq!(lease.transaction(), &pending);
+        assert_eq!(lease.boot_epoch_sha256(), &hash('e'));
+        assert!(lease.validate().is_ok());
+
+        let mut tampered = serde_json::to_value(&lease).expect("lease JSON");
+        tampered["bootEpochSha256"] = serde_json::Value::String("f".repeat(64));
+        let tampered: RepairWriteLeasePayload =
+            serde_json::from_value(tampered).expect("closed wire shape");
+        assert_eq!(tampered.validate(), Err(ProtocolViolation::InvalidPayload));
+
+        let resolved_intent = pending.backup().execution_intent().expect("durable intent");
+        let resolution = RepairTransactionResolution::new(
+            RepairTransactionResolutionOutcome::CommittedAfter,
+            resolved_intent.after_sha256().clone(),
+            resolved_intent.before_metadata().canonical_sha256(),
+            true,
+            resolved_intent,
+        )
+        .expect("resolution");
+        let resolved = RepairTransactionStatusPayload::resolved(durable_status(), resolution)
+            .expect("resolved transaction");
+        assert!(RepairWriteLeasePayload::consumed(resolved, hash('e')).is_err());
     }
 
     #[test]

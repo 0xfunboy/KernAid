@@ -11,7 +11,7 @@ use crate::rescue_repair_vault::{
     RepairBackupState, RepairBackupStatusPayload, RepairExecutionIntentV1, RepairFileMetadataV1,
     RepairReservationId, RepairTransactionResolution, RepairTransactionStatusPayload,
     RepairTransactionStatusResultPayload, RepairTransactionStatusSelector,
-    RepairVaultLiveIdentityPayload,
+    RepairVaultLiveIdentityPayload, RepairWriteLeasePayload,
 };
 use crate::rescue_vault_transport::{
     SeqpacketSocketIdentity, SeqpacketTransportError, ensure_deadline, recv_seqpacket,
@@ -70,6 +70,8 @@ pub struct PeerAllowlist {
     codex_uid: Option<u32>,
     #[cfg(feature = "experimental-repair-store")]
     repair_broker_uid: Option<u32>,
+    #[cfg(feature = "experimental-repair-store")]
+    repair_target_helper_root_only: bool,
 }
 
 impl fmt::Debug for PeerAllowlist {
@@ -81,10 +83,15 @@ impl fmt::Debug for PeerAllowlist {
             .field("openai_configured", &self.openai_uid.is_some())
             .field("codex_configured", &self.codex_uid.is_some());
         #[cfg(feature = "experimental-repair-store")]
-        debug.field(
-            "repair_broker_configured",
-            &self.repair_broker_uid.is_some(),
-        );
+        debug
+            .field(
+                "repair_broker_configured",
+                &self.repair_broker_uid.is_some(),
+            )
+            .field(
+                "repair_target_helper_root_only",
+                &self.repair_target_helper_root_only,
+            );
         debug.finish()
     }
 }
@@ -110,7 +117,29 @@ impl PeerAllowlist {
         Self::builder(companion_uid).build()
     }
 
+    /// Constructs the dedicated root-only allowlist for the private target
+    /// helper listener. It cannot authenticate a companion, Agent or broker.
+    #[cfg(feature = "experimental-repair-store")]
+    pub const fn repair_target_helper_root_only() -> Self {
+        Self {
+            companion_uid: 0,
+            application_uid: None,
+            openai_uid: None,
+            codex_uid: None,
+            repair_broker_uid: None,
+            repair_target_helper_root_only: true,
+        }
+    }
+
     fn role_for(self, peer_uid: u32) -> Result<PeerRole, ProtocolViolation> {
+        #[cfg(feature = "experimental-repair-store")]
+        if self.repair_target_helper_root_only {
+            return if peer_uid == 0 {
+                Ok(PeerRole::RepairTargetHelper)
+            } else {
+                Err(ProtocolViolation::NotAuthorized)
+            };
+        }
         if peer_uid == self.companion_uid {
             Ok(PeerRole::Companion)
         } else if self.application_uid == Some(peer_uid) {
@@ -230,6 +259,8 @@ impl PeerAllowlistBuilder {
             codex_uid: self.codex_uid,
             #[cfg(feature = "experimental-repair-store")]
             repair_broker_uid: self.repair_broker_uid,
+            #[cfg(feature = "experimental-repair-store")]
+            repair_target_helper_root_only: false,
         })
     }
 
@@ -295,6 +326,8 @@ pub enum PeerRole {
     Agent(AgentRole),
     #[cfg(feature = "experimental-repair-store")]
     RepairBroker,
+    #[cfg(feature = "experimental-repair-store")]
+    RepairTargetHelper,
 }
 
 /// An authenticated server-side connection to one allowlisted peer.
@@ -517,6 +550,9 @@ pub enum Operation {
     #[cfg(feature = "experimental-repair-store")]
     #[serde(rename = "repair.vault.live-parent")]
     RepairVaultLiveParent,
+    #[cfg(feature = "experimental-repair-store")]
+    #[serde(rename = "repair.transaction.write-lease.consume")]
+    RepairTransactionWriteLeaseConsume,
 }
 
 impl Operation {
@@ -562,6 +598,10 @@ impl Operation {
                     | Self::RepairTransactionResolve
                     | Self::RepairVaultLiveParent
             ),
+            #[cfg(feature = "experimental-repair-store")]
+            PeerRole::RepairTargetHelper => {
+                matches!(self, Self::RepairTransactionWriteLeaseConsume)
+            }
         }
     }
 }
@@ -805,6 +845,10 @@ pub enum RequestPayload {
     RepairTransactionResolve {
         expected: Box<RepairTransactionStatusPayload>,
         resolution: RepairTransactionResolution,
+    },
+    #[cfg(feature = "experimental-repair-store")]
+    RepairTransactionWriteLeaseConsume {
+        selector: RepairTransactionStatusSelector,
     },
 }
 
@@ -1496,6 +1540,21 @@ fn parse_payload(
                 resolution: payload.resolution,
             })
         }
+        #[cfg(feature = "experimental-repair-store")]
+        Operation::RepairTransactionWriteLeaseConsume => {
+            let payload = serde_json::from_str::<RepairTransactionStatusRequestPayload>(raw.get())
+                .map_err(|_| ProtocolViolation::InvalidPayload)?;
+            payload.selector.validate()?;
+            if !matches!(
+                payload.selector,
+                RepairTransactionStatusSelector::Exact { .. }
+            ) {
+                return Err(ProtocolViolation::InvalidPayload);
+            }
+            Ok(RequestPayload::RepairTransactionWriteLeaseConsume {
+                selector: payload.selector,
+            })
+        }
     }
 }
 
@@ -1568,7 +1627,8 @@ fn payload_descriptor(payload: &RequestPayload) -> Option<&DescriptorDeclaration
         | RequestPayload::RepairBackupCancel { .. }
         | RequestPayload::RepairBackupRetire { .. }
         | RequestPayload::RepairTransactionStatus { .. }
-        | RequestPayload::RepairTransactionResolve { .. } => None,
+        | RequestPayload::RepairTransactionResolve { .. }
+        | RequestPayload::RepairTransactionWriteLeaseConsume { .. } => None,
     }
 }
 
@@ -1887,6 +1947,8 @@ pub enum SuccessPayload {
     RepairTransactionResolved(Box<RepairTransactionStatusPayload>),
     #[cfg(feature = "experimental-repair-store")]
     RepairVaultLiveIdentity(RepairVaultLiveIdentityPayload),
+    #[cfg(feature = "experimental-repair-store")]
+    RepairWriteLeaseConsumed(Box<RepairWriteLeasePayload>),
 }
 
 #[derive(Serialize)]
@@ -2073,6 +2135,15 @@ fn encode_success(
             operation,
             outcome: "ok",
             payload: identity,
+        }),
+        #[cfg(feature = "experimental-repair-store")]
+        SuccessPayload::RepairWriteLeaseConsumed(lease) => serde_json::to_vec(&SuccessWire {
+            api_version: API_VERSION,
+            request_id,
+            state_version,
+            operation,
+            outcome: "ok",
+            payload: lease,
         }),
     }
     .map_err(|_| ProtocolViolation::InvalidPayload)?;
@@ -2353,6 +2424,24 @@ fn validate_success(
             RequestPayload::Empty,
             SuccessPayload::RepairVaultLiveIdentity(identity),
         ) if identity.validate().is_ok() => None,
+        #[cfg(feature = "experimental-repair-store")]
+        (
+            Operation::RepairTransactionWriteLeaseConsume,
+            RequestPayload::RepairTransactionWriteLeaseConsume { selector },
+            SuccessPayload::RepairWriteLeaseConsumed(lease),
+        ) if lease.validate().is_ok()
+            && matches!(
+                selector,
+                RepairTransactionStatusSelector::Exact {
+                    reservation_id,
+                    transaction_binding_sha256,
+                } if lease.transaction().backup().reservation_id() == reservation_id
+                    && lease.transaction().transaction_binding_sha256()
+                        == transaction_binding_sha256
+            ) =>
+        {
+            None
+        }
         _ => return Err(ProtocolViolation::InvalidPayload),
     };
 
@@ -2497,6 +2586,21 @@ mod tests {
             connection_identity: SeqpacketSocketIdentity {
                 device: 7,
                 inode: 12,
+            },
+            connection_token: Arc::new(()),
+        }
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    fn repair_target_helper_peer() -> PeerIdentity {
+        let allowlist = PeerAllowlist::repair_target_helper_root_only();
+        PeerIdentity {
+            pid: 4244,
+            uid: 0,
+            role: allowlist.role_for(0).expect("root helper UID"),
+            connection_identity: SeqpacketSocketIdentity {
+                device: 7,
+                inode: 13,
             },
             connection_token: Arc::new(()),
         }
@@ -2869,13 +2973,30 @@ mod tests {
 
     #[cfg(feature = "experimental-repair-store")]
     #[test]
-    fn repair_broker_role_and_eight_operations_are_closed_and_path_free() {
+    fn target_helper_allowlist_is_root_only_and_has_one_operation() {
+        let allowlist = PeerAllowlist::repair_target_helper_root_only();
+        assert_eq!(allowlist.role_for(0), Ok(PeerRole::RepairTargetHelper));
+        assert_eq!(
+            allowlist.role_for(REPAIR_UID),
+            Err(ProtocolViolation::NotAuthorized)
+        );
+        assert!(
+            Operation::RepairTransactionWriteLeaseConsume.permits(PeerRole::RepairTargetHelper)
+        );
+        assert!(!Operation::RepairTransactionStatus.permits(PeerRole::RepairTargetHelper));
+        assert!(!Operation::RepairTransactionWriteLeaseConsume.permits(PeerRole::RepairBroker));
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    #[test]
+    fn repair_roles_and_operations_are_closed_and_path_free() {
         use crate::rescue_repair_vault::{
             RepairBackupBinding, RepairBackupReleasePayload, RepairBackupStatusPayload,
             RepairExecutionIntentV1, RepairFileMetadataV1, RepairReservationId,
             RepairTransactionResolution, RepairTransactionResolutionOutcome,
             RepairTransactionStatusPayload, RepairTransactionStatusResultPayload,
-            repair_backup_output,
+            RepairTransactionStatusSelector, RepairWriteLeasePayload,
+            canonical_repair_lock_identity, repair_backup_output,
         };
 
         let repair_allowlist = PeerAllowlist::builder(COMPANION_UID)
@@ -2973,6 +3094,7 @@ mod tests {
             ),
             Err(ProtocolViolation::InvalidPayload)
         );
+        let recovery_fingerprint = format!("recovery:{}", hash('8'));
         let execution_intent = RepairExecutionIntentV1::new(
             "S-session-1",
             7,
@@ -2980,8 +3102,8 @@ mod tests {
             format!("scan:{}", hash('a')),
             Sha256::parse(&hash('1')).expect("hash"),
             Sha256::parse(&hash('7')).expect("hash"),
-            format!("recovery:{}", hash('8')),
-            format!("lock:{}", hash('b')),
+            recovery_fingerprint.clone(),
+            canonical_repair_lock_identity(&recovery_fingerprint),
             Sha256::parse(&hash('2')).expect("hash"),
             Sha256::parse(&hash('c')).expect("hash"),
             Sha256::parse(&hash('d')).expect("hash"),
@@ -3142,6 +3264,36 @@ mod tests {
                 &SuccessPayload::RepairTransactionStatus(Box::new(
                     RepairTransactionStatusResultPayload::found(pending.clone()),
                 )),
+                &[],
+            )
+            .is_ok()
+        );
+
+        let write_lease_selector = RepairTransactionStatusSelector::for_status(&pending);
+        let write_lease = request(
+            "repair.transaction.write-lease.consume",
+            &serde_json::json!({"selector": write_lease_selector}).to_string(),
+        );
+        assert_eq!(
+            decode_request(&write_lease, repair_peer(), Vec::new()).err(),
+            Some(ProtocolViolation::NotAuthorized)
+        );
+        let write_lease = decode_request(&write_lease, repair_target_helper_peer(), Vec::new())
+            .expect("root helper consumes exact write lease");
+        assert!(matches!(
+            write_lease.payload(),
+            RequestPayload::RepairTransactionWriteLeaseConsume { .. }
+        ));
+        let write_lease_receipt = RepairWriteLeasePayload::consumed(
+            pending.clone(),
+            Sha256::parse(&hash('f')).expect("boot epoch"),
+        )
+        .expect("write lease receipt");
+        assert!(
+            encode_success(
+                &write_lease,
+                15,
+                &SuccessPayload::RepairWriteLeaseConsumed(Box::new(write_lease_receipt)),
                 &[],
             )
             .is_ok()
