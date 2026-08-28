@@ -75,15 +75,18 @@ reserve-to-persist. The default daemon ABI remains unchanged. The separate
 off-default target handoff resolves the selection twice and transfers one
 read-only block FD over a fixed root-owned `SOCK_SEQPACKET` endpoint to a
 strict Rust client. A dedicated system account and hardened static unit files
-are packaged for qualification, but Vault does not allowlist that UID and no
-socket, broker process or combined FD-and-lock resolver is enabled. Both routes
-therefore remain unreachable in the shipping image. A mutation handler still
-does not exist.
+are packaged for qualification. The feature-gated Vault daemon resolves and
+allowlists only that exact private account, and the Rust broker now retains the
+leaf and physical-parent descriptors in one revalidating non-cloneable guard.
+No socket, broker process or mounted-filesystem observer is enabled, so both
+routes remain unreachable in the shipping image. A mutation handler still does
+not exist.
 
 Vault and broker candidate builds now share one pure, feature-gated V1 formula
 for the physical-parent digest, including raw and `sha256:` renderings. Kernel
 observation remains Linux-specific and is not supplied by the wire: the broker
-must still derive and cross-check the target parent from held descriptors.
+derives it from bounded sysfs observations plus retained read-only leaf and
+parent descriptors, and revalidates all three before use.
 
 ## Backup boundary
 

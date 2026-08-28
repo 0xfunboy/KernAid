@@ -260,11 +260,11 @@ reservation ID and draft binding; retire requires the full durable
 plan/approval/resource-bound status. The authenticated journal remains bounded
 to 4096 events (at most 16 MiB of event payload); bounded authenticated release
 tombstones make an exact retry deterministic after a lost response. The feature
-is not reachable in the shipping image: the dedicated account and hardened
-target-capability units are packaged but dormant, Vault does not allowlist the
-account, and no broker, guard-integrated resolver or mutation handler is
-installed. Automatic bounded retention and crash-safe journal compaction remain
-promotion gates.
+is not reachable in the shipping image: the feature-gated daemon now
+allowlists only the dynamically validated dedicated Repair Broker identity,
+but that account and the hardened target-capability units remain dormant and
+no broker, filesystem observer or mutation handler is installed. Automatic
+bounded retention and crash-safe journal compaction remain promotion gates.
 
 ## Provisioning and disposable probe
 
