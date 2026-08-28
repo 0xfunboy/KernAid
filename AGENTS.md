@@ -14,4 +14,24 @@
     home; KernAid never reads, copies, serializes, or logs the CLI credential
     store.
 
-These rules apply to the whole repository. Phase 0 is diagnosis-only: no production mutation handlers.
+These rules apply to the whole repository.
+
+Phase 0 remains the default and shipping diagnosis-only path. Phase 1
+development authorizes exactly one off-by-default production candidate:
+`linux.fstab.disable-missing-uuid.v1`, compiled only behind
+`rescue-fstab-production-candidate`. No other production mutation handler is
+authorized.
+
+The Phase 1 candidate may mutate a target only after all of these fail-closed
+conditions hold in the same retained transaction:
+
+- deterministic read-only diagnosis and fresh target/physical-parent identity;
+- a distinct authenticated Vault physical parent;
+- durable, verified pre-change bytes and metadata plus a Pending transaction;
+- an exact single-use local approval bound to the complete plan;
+- private descriptor-rooted mounting, bounded locking and atomic replacement;
+- exact post-write verification, automatic restore on failure and durable
+  recovery that never overwrites a third state.
+
+The feature must remain absent from default Desk and Rescue builds until its
+QEMU, power-loss, physical USB and release qualification gates are recorded.
