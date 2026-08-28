@@ -18,6 +18,7 @@ const VAULT_LOCATOR_PREFIX: &str = "vault://repair/";
 /// Sanitized fail-closed failures. No variant carries caller-controlled text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RescueRepairProtocolError {
+    InvalidRequestId,
     InvalidSessionId,
     InvalidPlanId,
     InvalidHash,
@@ -42,6 +43,7 @@ pub enum RescueRepairProtocolError {
 impl fmt::Display for RescueRepairProtocolError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
+            Self::InvalidRequestId => "invalid Rescue repair request identifier",
             Self::InvalidSessionId => "invalid Rescue repair session identifier",
             Self::InvalidPlanId => "invalid Rescue repair plan identifier",
             Self::InvalidHash => "invalid Rescue repair hash",
@@ -64,6 +66,85 @@ impl fmt::Display for RescueRepairProtocolError {
             Self::InvalidLockIdentity => "invalid Rescue repair lock identity",
             Self::InvalidOutcome => "invalid Rescue repair preflight outcome",
         })
+    }
+}
+
+/// Closed client request for the sole production-candidate preparation flow.
+///
+/// These are the only values the untrusted UI may select.  In particular the
+/// request contains no action, resource, path, bytes, snapshot hash, evidence
+/// identifier or evidence hash: the broker derives all of those while holding
+/// the root-issued read-only target capability.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RescueFstabPrepareRequest {
+    request_id: String,
+    session_id: String,
+    plan_id: String,
+    scan_fingerprint: String,
+    target_id: String,
+    target_fingerprint: String,
+}
+
+impl RescueFstabPrepareRequest {
+    pub fn new(
+        request_id: impl Into<String>,
+        session_id: impl Into<String>,
+        plan_id: impl Into<String>,
+        scan_fingerprint: impl Into<String>,
+        target_id: impl Into<String>,
+        target_fingerprint: impl Into<String>,
+    ) -> Result<Self, RescueRepairProtocolError> {
+        let request = Self {
+            request_id: request_id.into(),
+            session_id: session_id.into(),
+            plan_id: plan_id.into(),
+            scan_fingerprint: scan_fingerprint.into(),
+            target_id: target_id.into(),
+            target_fingerprint: target_fingerprint.into(),
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    fn validate(&self) -> Result<(), RescueRepairProtocolError> {
+        if !valid_request_id(&self.request_id) {
+            return Err(RescueRepairProtocolError::InvalidRequestId);
+        }
+        if !valid_prefixed_id(&self.session_id, "S-") {
+            return Err(RescueRepairProtocolError::InvalidSessionId);
+        }
+        if !valid_prefixed_id(&self.plan_id, "P-") {
+            return Err(RescueRepairProtocolError::InvalidPlanId);
+        }
+        if !valid_scan_fingerprint(&self.scan_fingerprint) {
+            return Err(RescueRepairProtocolError::InvalidScanFingerprint);
+        }
+        if !valid_target_id(&self.target_id) {
+            return Err(RescueRepairProtocolError::InvalidTargetId);
+        }
+        if !valid_sha256(&self.target_fingerprint) {
+            return Err(RescueRepairProtocolError::InvalidHash);
+        }
+        Ok(())
+    }
+
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+    pub fn plan_id(&self) -> &str {
+        &self.plan_id
+    }
+    pub fn scan_fingerprint(&self) -> &str {
+        &self.scan_fingerprint
+    }
+    pub fn target_id(&self) -> &str {
+        &self.target_id
+    }
+    pub fn target_fingerprint(&self) -> &str {
+        &self.target_fingerprint
     }
 }
 
@@ -391,6 +472,23 @@ fn valid_scan_fingerprint(value: &str) -> bool {
     value.strip_prefix("scan:").is_some_and(valid_lower_hex_64)
 }
 
+fn valid_target_id(value: &str) -> bool {
+    value
+        .strip_prefix("target:")
+        .is_some_and(valid_lower_hex_64)
+}
+
+fn valid_request_id(value: &str) -> bool {
+    let Some(uuid) = value.strip_prefix("R-") else {
+        return false;
+    };
+    uuid.len() == 36
+        && uuid.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte),
+        })
+}
+
 fn valid_recovery_fingerprint(value: &str) -> bool {
     value
         .strip_prefix("recovery:")
@@ -439,6 +537,51 @@ mod tests {
 
     fn scan(character: char) -> String {
         format!("scan:{}", character.to_string().repeat(64))
+    }
+
+    fn target(character: char) -> String {
+        format!("target:{}", character.to_string().repeat(64))
+    }
+
+    #[test]
+    fn prepare_request_contains_only_closed_selection_claims() {
+        let request = RescueFstabPrepareRequest::new(
+            "R-01234567-89ab-cdef-0123-456789abcdef",
+            "S-rescue",
+            "P-fstab",
+            scan('6'),
+            target('7'),
+            hash('2'),
+        )
+        .expect("closed prepare request");
+        assert_eq!(request.session_id(), "S-rescue");
+        assert_eq!(request.plan_id(), "P-fstab");
+        assert_eq!(request.scan_fingerprint(), scan('6'));
+        assert_eq!(request.target_id(), target('7'));
+        assert_eq!(request.target_fingerprint(), hash('2'));
+
+        assert_eq!(
+            RescueFstabPrepareRequest::new(
+                "R-NOT-A-UUID",
+                "S-rescue",
+                "P-fstab",
+                scan('6'),
+                target('7'),
+                hash('2'),
+            ),
+            Err(RescueRepairProtocolError::InvalidRequestId)
+        );
+        assert_eq!(
+            RescueFstabPrepareRequest::new(
+                "R-01234567-89ab-cdef-0123-456789abcdef",
+                "S-rescue",
+                "P-fstab",
+                scan('6'),
+                "/dev/sda2",
+                hash('2'),
+            ),
+            Err(RescueRepairProtocolError::InvalidTargetId)
+        );
     }
 
     fn evidence() -> [RescueFstabEvidenceBinding; 2] {

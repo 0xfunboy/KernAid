@@ -26,6 +26,12 @@ pub const FIXTURE_FSTAB_ROLLBACK_ID: &str = "linux.fstab.restore";
 /// The only R2 action admitted by the disabled Rescue production candidate.
 #[cfg(feature = "rescue-fstab-production-candidate")]
 pub const RESCUE_FSTAB_ACTION_ID: &str = "linux.fstab.disable-missing-uuid.v1";
+/// The sole diagnosis finding allowed to justify the production candidate.
+#[cfg(feature = "rescue-fstab-production-candidate")]
+pub const RESCUE_FSTAB_FINDING_ID: &str = "KA-LNX-P0-003";
+/// Version of the sole diagnosis finding allowed by the candidate.
+#[cfg(feature = "rescue-fstab-production-candidate")]
+pub const RESCUE_FSTAB_FINDING_VERSION: u16 = 2;
 /// The opaque resource selected by the Rescue target resolver.
 #[cfg(feature = "rescue-fstab-production-candidate")]
 pub const RESCUE_FSTAB_RESOURCE_ID: &str = "rescue:selected-linux-root:etc/fstab";

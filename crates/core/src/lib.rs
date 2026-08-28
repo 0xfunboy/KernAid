@@ -11,7 +11,8 @@ use kernaid_policy::validate_fixture_repair_lab_plan as validate_fixture_repair_
 use kernaid_policy::{PolicyError, validate_phase_zero};
 #[cfg(feature = "rescue-fstab-production-candidate")]
 use kernaid_policy::{
-    RESCUE_FSTAB_RESOURCE_ID,
+    RESCUE_FSTAB_ACTION_ID, RESCUE_FSTAB_EVIDENCE_IDS, RESCUE_FSTAB_FINDING_ID,
+    RESCUE_FSTAB_FINDING_VERSION, RESCUE_FSTAB_RESOURCE_ID,
     validate_rescue_fstab_production_candidate_plan as validate_rescue_fstab_candidate_policy,
 };
 use kernaid_protocol::ValidatedPlan;
@@ -462,6 +463,108 @@ pub const RESCUE_FSTAB_TYPED_CONFIRMATION: &str = "DISABILITA VOCE FSTAB";
 const RESCUE_FSTAB_APPROVAL_HASH_DOMAIN: &[u8] =
     b"kernaid:linux.fstab.disable-missing-uuid.v1:approval:v1\0";
 
+/// Exact observation and contract binding produced by the candidate broker.
+///
+/// This is the feature-gated alternative to fabricating a general
+/// `LinuxNormalizedSnapshot` for the narrowly scoped offline candidate.  Its
+/// constructor admits only the one action/finding/resource/evidence set, and
+/// the later `Session` transition still validates the canonical policy plan,
+/// session target and complete plan binding before entering `Plan`.
+#[cfg(feature = "rescue-fstab-production-candidate")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RescueFstabBrokerDerivedEvidence {
+    session_id: String,
+    plan_id: String,
+    plan_hash: String,
+    target_fingerprint: String,
+    target_snapshot: String,
+    action_id: String,
+    finding_id: String,
+    finding_version: u16,
+    resource_id: String,
+    evidence: [(String, String); 2],
+}
+
+#[cfg(feature = "rescue-fstab-production-candidate")]
+impl RescueFstabBrokerDerivedEvidence {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        session_id: impl Into<String>,
+        plan_id: impl Into<String>,
+        plan_hash: impl Into<String>,
+        target_fingerprint: impl Into<String>,
+        target_snapshot: impl Into<String>,
+        action_id: impl Into<String>,
+        finding_id: impl Into<String>,
+        finding_version: u16,
+        resource_id: impl Into<String>,
+        evidence: [(String, String); 2],
+    ) -> Result<Self, RescueFstabCandidateAdmissionError> {
+        let binding = Self {
+            session_id: session_id.into(),
+            plan_id: plan_id.into(),
+            plan_hash: plan_hash.into(),
+            target_fingerprint: target_fingerprint.into(),
+            target_snapshot: target_snapshot.into(),
+            action_id: action_id.into(),
+            finding_id: finding_id.into(),
+            finding_version,
+            resource_id: resource_id.into(),
+            evidence,
+        };
+        if !valid_rescue_candidate_id(&binding.session_id, "S-")
+            || !valid_rescue_candidate_id(&binding.plan_id, "P-")
+            || !valid_rescue_candidate_sha256(&binding.plan_hash)
+            || !valid_rescue_candidate_sha256(&binding.target_fingerprint)
+            || !valid_rescue_candidate_sha256(&binding.target_snapshot)
+            || binding.action_id != RESCUE_FSTAB_ACTION_ID
+            || binding.finding_id != RESCUE_FSTAB_FINDING_ID
+            || binding.finding_version != RESCUE_FSTAB_FINDING_VERSION
+            || binding.resource_id != RESCUE_FSTAB_RESOURCE_ID
+            || binding.evidence[0].0 != RESCUE_FSTAB_EVIDENCE_IDS[0]
+            || binding.evidence[1].0 != RESCUE_FSTAB_EVIDENCE_IDS[1]
+            || binding
+                .evidence
+                .iter()
+                .any(|(_, hash)| !valid_rescue_candidate_sha256(hash))
+        {
+            return Err(RescueFstabCandidateAdmissionError::InvalidBrokerEvidence);
+        }
+        Ok(binding)
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+    pub fn plan_id(&self) -> &str {
+        &self.plan_id
+    }
+    pub fn plan_hash(&self) -> &str {
+        &self.plan_hash
+    }
+    pub fn target_fingerprint(&self) -> &str {
+        &self.target_fingerprint
+    }
+    pub fn target_snapshot(&self) -> &str {
+        &self.target_snapshot
+    }
+    pub fn action_id(&self) -> &str {
+        &self.action_id
+    }
+    pub fn finding_id(&self) -> &str {
+        &self.finding_id
+    }
+    pub const fn finding_version(&self) -> u16 {
+        self.finding_version
+    }
+    pub fn resource_id(&self) -> &str {
+        &self.resource_id
+    }
+    pub fn evidence(&self) -> &[(String, String); 2] {
+        &self.evidence
+    }
+}
+
 /// Immutable material admitted for the candidate approval transition.
 #[cfg(feature = "rescue-fstab-production-candidate")]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -708,6 +811,7 @@ pub enum RescueFstabCandidateAdmissionError {
     PolicyRejected(PolicyError),
     InvalidBinding,
     InvalidApproval,
+    InvalidBrokerEvidence,
     BindingMismatch,
     NonMonotonicApproval,
     TypedConfirmationMismatch,
@@ -724,6 +828,7 @@ impl fmt::Display for RescueFstabCandidateAdmissionError {
             Self::PolicyRejected(_) => "Rescue fstab candidate policy rejected the plan",
             Self::InvalidBinding => "Rescue fstab candidate binding is invalid",
             Self::InvalidApproval => "Rescue fstab candidate approval is invalid",
+            Self::InvalidBrokerEvidence => "Rescue fstab candidate broker evidence is invalid",
             Self::BindingMismatch => "Rescue fstab candidate approval binding does not match",
             Self::NonMonotonicApproval => "Rescue fstab approval sequence is not next",
             Self::TypedConfirmationMismatch => {
@@ -1046,6 +1151,55 @@ impl Session {
         self.state = State::Plan;
         Ok(admission)
     }
+
+    /// Admit the sole Rescue candidate directly from exact broker-derived
+    /// evidence, without manufacturing a general Linux snapshot envelope.
+    ///
+    /// This transition exists only for the production-candidate feature and
+    /// only from a fresh `LinuxRescue` session.  It is not a generic
+    /// evidence-complete shortcut: all action, finding, resource, evidence,
+    /// target and plan bindings are closed and checked before `Plan`.
+    #[cfg(feature = "rescue-fstab-production-candidate")]
+    pub fn stage_rescue_fstab_broker_candidate(
+        &mut self,
+        plan: &ValidatedPlan,
+        evidence: &RescueFstabBrokerDerivedEvidence,
+        last_approval_sequence: u64,
+    ) -> Result<RescueFstabCandidateAdmission, RescueFstabCandidateAdmissionError> {
+        if self.state != State::Observe || self.linux_snapshot.is_some() {
+            return Err(RescueFstabCandidateAdmissionError::InvalidSessionState);
+        }
+        if self.mode != SessionMode::LinuxRescue {
+            return Err(RescueFstabCandidateAdmissionError::WrongSessionMode);
+        }
+        validate_rescue_fstab_production_candidate_plan(plan, &self.fingerprint)
+            .map_err(RescueFstabCandidateAdmissionError::PolicyRejected)?;
+        let [step] = plan.steps.as_slice() else {
+            return Err(RescueFstabCandidateAdmissionError::InvalidBrokerEvidence);
+        };
+        if evidence.plan_id != plan.plan_id
+            || evidence.target_fingerprint != self.fingerprint
+            || evidence.target_fingerprint != plan.target_fingerprint
+            || evidence.action_id != step.action
+            || evidence.resource_id != RESCUE_FSTAB_RESOURCE_ID
+            || evidence.finding_id != RESCUE_FSTAB_FINDING_ID
+            || evidence.finding_version != RESCUE_FSTAB_FINDING_VERSION
+            || evidence.evidence[0].0 != step.evidence_ids[0]
+            || evidence.evidence[1].0 != step.evidence_ids[1]
+        {
+            return Err(RescueFstabCandidateAdmissionError::InvalidBrokerEvidence);
+        }
+        let binding = RescueFstabCandidateBinding::new(
+            evidence.session_id.clone(),
+            evidence.plan_id.clone(),
+            evidence.plan_hash.clone(),
+            evidence.target_fingerprint.clone(),
+            evidence.target_snapshot.clone(),
+        )?;
+        let admission = RescueFstabCandidateAdmission::stage(binding, last_approval_sequence)?;
+        self.state = State::Plan;
+        Ok(admission)
+    }
 }
 
 pub const LINUX_RESIDENT_P0_COLLECTORS: [&str; 9] = [
@@ -1230,6 +1384,34 @@ mod tests {
                 rollback: Some(RESCUE_FSTAB_ROLLBACK_ID.to_owned()),
             }],
         }
+    }
+
+    #[cfg(feature = "rescue-fstab-production-candidate")]
+    fn rescue_candidate_broker_evidence(plan_id: &str) -> RescueFstabBrokerDerivedEvidence {
+        RescueFstabBrokerDerivedEvidence::new(
+            "S-rescue-1",
+            plan_id,
+            RESCUE_CANDIDATE_PLAN_HASH,
+            RESCUE_CANDIDATE_TARGET,
+            RESCUE_CANDIDATE_TARGET_SNAPSHOT,
+            RESCUE_FSTAB_ACTION_ID,
+            RESCUE_FSTAB_FINDING_ID,
+            RESCUE_FSTAB_FINDING_VERSION,
+            RESCUE_FSTAB_RESOURCE_ID,
+            [
+                (
+                    RESCUE_FSTAB_EVIDENCE_IDS[0].to_owned(),
+                    "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                        .to_owned(),
+                ),
+                (
+                    RESCUE_FSTAB_EVIDENCE_IDS[1].to_owned(),
+                    "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                        .to_owned(),
+                ),
+            ],
+        )
+        .expect("closed broker evidence")
     }
 
     #[cfg(feature = "rescue-fstab-production-candidate")]
@@ -1544,6 +1726,69 @@ mod tests {
             RESCUE_CANDIDATE_TARGET_SNAPSHOT
         );
         assert_eq!(admission.binding().resource_id(), RESCUE_FSTAB_RESOURCE_ID);
+    }
+
+    #[cfg(feature = "rescue-fstab-production-candidate")]
+    #[test]
+    fn broker_evidence_is_the_only_direct_rescue_observe_to_plan_path() {
+        let plan = rescue_candidate_plan();
+        let evidence = rescue_candidate_broker_evidence(&plan.plan_id);
+        let mut rescue = Session::new(RESCUE_CANDIDATE_TARGET, SessionMode::LinuxRescue);
+        let admission = rescue
+            .stage_rescue_fstab_broker_candidate(&plan, &evidence, 6)
+            .expect("closed broker admission");
+        assert_eq!(rescue.state(), &State::Plan);
+        assert_eq!(admission.binding().session_id(), "S-rescue-1");
+        assert_eq!(admission.binding().plan_hash(), RESCUE_CANDIDATE_PLAN_HASH);
+        assert_eq!(
+            admission.binding().target_snapshot(),
+            RESCUE_CANDIDATE_TARGET_SNAPSHOT
+        );
+
+        let mut non_rescue = Session::new(RESCUE_CANDIDATE_TARGET, SessionMode::NonLinux);
+        assert_eq!(
+            non_rescue.stage_rescue_fstab_broker_candidate(&plan, &evidence, 6),
+            Err(RescueFstabCandidateAdmissionError::WrongSessionMode)
+        );
+        assert_eq!(non_rescue.state(), &State::Observe);
+    }
+
+    #[cfg(feature = "rescue-fstab-production-candidate")]
+    #[test]
+    fn broker_evidence_rejects_open_contracts_and_cross_plan_binding() {
+        assert_eq!(
+            RescueFstabBrokerDerivedEvidence::new(
+                "S-rescue-1",
+                "P-rescue-fstab-candidate",
+                RESCUE_CANDIDATE_PLAN_HASH,
+                RESCUE_CANDIDATE_TARGET,
+                RESCUE_CANDIDATE_TARGET_SNAPSHOT,
+                "linux.anything.execute",
+                RESCUE_FSTAB_FINDING_ID,
+                RESCUE_FSTAB_FINDING_VERSION,
+                RESCUE_FSTAB_RESOURCE_ID,
+                [
+                    (
+                        RESCUE_FSTAB_EVIDENCE_IDS[0].to_owned(),
+                        RESCUE_CANDIDATE_PLAN_HASH.to_owned()
+                    ),
+                    (
+                        RESCUE_FSTAB_EVIDENCE_IDS[1].to_owned(),
+                        RESCUE_CANDIDATE_TARGET_SNAPSHOT.to_owned()
+                    ),
+                ],
+            ),
+            Err(RescueFstabCandidateAdmissionError::InvalidBrokerEvidence)
+        );
+
+        let plan = rescue_candidate_plan();
+        let evidence = rescue_candidate_broker_evidence("P-other-plan");
+        let mut session = Session::new(RESCUE_CANDIDATE_TARGET, SessionMode::LinuxRescue);
+        assert_eq!(
+            session.stage_rescue_fstab_broker_candidate(&plan, &evidence, 6),
+            Err(RescueFstabCandidateAdmissionError::InvalidBrokerEvidence)
+        );
+        assert_eq!(session.state(), &State::Observe);
     }
 
     #[cfg(feature = "rescue-fstab-production-candidate")]

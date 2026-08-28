@@ -24,7 +24,7 @@ use kernaid_linux_pack::{
     rescue_fstab_transaction_candidate::{BootVaultBackupCapability, CandidateTransactionError},
 };
 use kernaid_protocol::{
-    rescue_repair::RescueFstabPreflightIntent,
+    rescue_repair::{RescueFstabPreflightIntent, RescueFstabPrepareRequest},
     rescue_repair_vault::{
         RepairBackupDraft, RepairBackupState, RepairBackupStatusPayload, RepairExecutionIntentV1,
     },
@@ -212,16 +212,17 @@ impl RescueFstabPreflightCapabilityResolver for ProductionRescueFstabPreflightRe
 
     fn acquire_target_guard(
         &mut self,
-        intent: &RescueFstabPreflightIntent,
+        request: &RescueFstabPrepareRequest,
         deadline: Instant,
     ) -> Result<Self::TargetGuard, RescueFstabCapabilityResolutionError> {
         ensure_deadline(deadline)?;
-        let request_id = fresh_request_id()?;
+        let request_id = RequestId::parse(request.request_id())
+            .map_err(|_| RescueFstabCapabilityResolutionError::Unavailable)?;
         let capability = acquire_rescue_target_capability(
             &request_id,
-            intent.scan_fingerprint(),
-            intent.target_fingerprint(),
-            intent.target_id(),
+            request.scan_fingerprint(),
+            request.target_fingerprint(),
+            request.target_id(),
             deadline,
         )
         .map_err(map_target_client_error)?;
@@ -229,7 +230,7 @@ impl RescueFstabPreflightCapabilityResolver for ProductionRescueFstabPreflightRe
             .bind_physical_parent()
             .map_err(map_physical_parent_error)?;
         ensure_deadline(deadline)?;
-        validate_target_binding(intent, target.target_claims())?;
+        validate_target_selection(request, target.target_claims())?;
         target.revalidate().map_err(map_physical_parent_error)?;
         ensure_deadline(deadline)?;
         let lock_identity = lock_identity(target.target_claims());
@@ -241,12 +242,12 @@ impl RescueFstabPreflightCapabilityResolver for ProductionRescueFstabPreflightRe
 
     fn observe_under_target_guard(
         &mut self,
-        intent: &RescueFstabPreflightIntent,
+        request: &RescueFstabPrepareRequest,
         target_guard: &Self::TargetGuard,
         deadline: Instant,
     ) -> Result<TrustedRescueFstabObservation, RescueFstabCapabilityResolutionError> {
         ensure_deadline(deadline)?;
-        validate_target_binding(intent, target_guard.target.target_claims())?;
+        validate_target_selection(request, target_guard.target.target_claims())?;
         target_guard
             .target
             .revalidate()
@@ -385,6 +386,20 @@ fn validate_target_binding(
     if claims.scan_fingerprint() != intent.scan_fingerprint()
         || claims.target_fingerprint() != intent.target_fingerprint()
         || claims.target_id() != intent.target_id()
+    {
+        return Err(RescueFstabCapabilityResolutionError::IdentityChanged);
+    }
+    Ok(())
+}
+
+fn validate_target_selection(
+    request: &RescueFstabPrepareRequest,
+    claims: &RescueTargetCapabilityClaims,
+) -> Result<(), RescueFstabCapabilityResolutionError> {
+    if claims.scan_fingerprint() != request.scan_fingerprint()
+        || claims.target_fingerprint() != request.target_fingerprint()
+        || claims.target_id() != request.target_id()
+        || claims.request_id() != request.request_id()
     {
         return Err(RescueFstabCapabilityResolutionError::IdentityChanged);
     }
