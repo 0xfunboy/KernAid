@@ -85,6 +85,42 @@
       </section>
     </section>
 
+    <section class="release-card repair-candidate-card" aria-labelledby="repair-candidate-title">
+      <div class="release-heading">
+        <div>
+          <p class="card-kicker">{{repairCandidateChannel}}</p>
+          <h2 id="repair-candidate-title">{{repairCandidateName}}</h2>
+        </div>
+        <span class="release-status {{repairCandidateStateClass}}"><i></i>{{repairCandidateArtifactState}}</span>
+      </div>
+
+      <div class="danger-note" role="alert">
+        <strong>Canale sperimentale separato</strong>
+        <p>{{repairCandidateWarning}}</p>
+      </div>
+
+      <dl class="release-meta">
+        <div><dt>File candidate</dt><dd><code>{{repairCandidateDownloadName}}</code></dd></div>
+        <div><dt>Versione artefatto</dt><dd><code>{{repairCandidateArtifactVersion}}</code></dd></div>
+        <div><dt>Commit sorgente</dt><dd><code>{{repairCandidateSourceCommit}}</code></dd></div>
+        <div><dt>Workflow run</dt><dd><code>{{repairCandidateWorkflowRunId}}</code></dd></div>
+        <div><dt>Dimensione</dt><dd>{{repairCandidateSize}}</dd></div>
+        <div><dt>Modificato</dt><dd>{{repairCandidateModified}}</dd></div>
+        <div><dt>SHA-256</dt><dd><code class="full-hash">{{repairCandidateHash}}</code></dd></div>
+      </dl>
+
+      <div class="qualification-note">
+        <span>Confine di utilizzo</span>
+        <p>{{repairCandidateQualification}}</p>
+        <a href="{{repairCandidateWorkflowUrl}}" target="_blank" rel="noreferrer">Apri il workflow candidate ↗</a>
+      </div>
+
+      <div class="release-actions">
+        <a class="button ghost" href="/private/downloads/repair-candidate">Scarica ISO repair candidate</a>
+        <a class="button ghost" href="/private/downloads/repair-candidate-checksum">Scarica SHA-256 candidate</a>
+      </div>
+    </section>
+
     <section class="verify-card" aria-labelledby="verify-title">
       <div>
         <p class="card-kicker">Integrità</p>
@@ -94,6 +130,7 @@
         <p>Windows PowerShell — immagine retail</p><code>Get-FileHash .\{{downloadName}} -Algorithm SHA256</code>
         <p>Linux — immagine retail</p><code>sha256sum -c {{checksumName}}</code>
         <p>Linux — ISO tecnica</p><code>sha256sum -c {{isoChecksumName}}</code>
+        <p>Linux — ISO repair candidate</p><code>sha256sum -c {{repairCandidateChecksumName}}</code>
       </div>
     </section>
   </main>

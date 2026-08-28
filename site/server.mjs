@@ -15,6 +15,8 @@ const isoPath = process.env.KAID_ISO_PATH || "";
 const isoSha256Path = process.env.KAID_ISO_SHA256_PATH || (isoPath ? `${isoPath}.sha256` : "");
 const retailPath = process.env.KAID_RETAIL_PATH || "";
 const retailSha256Path = process.env.KAID_RETAIL_SHA256_PATH || (retailPath ? `${retailPath}.sha256` : "");
+const repairCandidatePath = process.env.KAID_REPAIR_CANDIDATE_PATH || "";
+const repairCandidateSha256Path = process.env.KAID_REPAIR_CANDIDATE_SHA256_PATH || (repairCandidatePath ? `${repairCandidatePath}.sha256` : "");
 const sessionLifetimeMs = 12 * 60 * 60 * 1000;
 const maxBodyBytes = 8 * 1024;
 const maxSessions = 256;
@@ -25,6 +27,11 @@ const password = readSecret(authFile);
 const configuredArtifacts = Object.freeze({
   iso: loadArtifactSnapshot(isoPath, isoSha256Path, "ISO"),
   retail: loadArtifactSnapshot(retailPath, retailSha256Path, "retail image"),
+  repairCandidate: loadArtifactSnapshot(
+    repairCandidatePath,
+    repairCandidateSha256Path,
+    "repair candidate ISO",
+  ),
 });
 const publicFiles = new Map([
   ["/", loadPublicFile("index.html", "text/html; charset=utf-8")],
@@ -84,7 +91,7 @@ function assertOwnerOnlyDirectory(directoryPath) {
 
 function loadContent(filePath) {
   const parsed = JSON.parse(fs.readFileSync(filePath, "utf8"));
-  if (parsed?.schema !== "dev.kernaid.site-content.v1" || !parsed.release) {
+  if (parsed?.schema !== "dev.kernaid.site-content.v1" || !parsed.release || !parsed.repairCandidate) {
     throw new Error("content.json does not match dev.kernaid.site-content.v1");
   }
   for (const key of ["name", "channel", "sourceCommit", "artifactVersion", "workflowUrl", "downloadName", "checksumName", "retailDownloadName", "retailChecksumName", "qualification", "warning"]) {
@@ -97,14 +104,34 @@ function loadContent(filePath) {
       throw new Error(`content.json release.${key} is not a safe filename`);
     }
   }
-  let workflowUrl;
-  try {
-    workflowUrl = new URL(parsed.release.workflowUrl);
-  } catch {
-    throw new Error("content.json release.workflowUrl must be an absolute URL");
+  for (const key of ["name", "channel", "sourceCommit", "artifactVersion", "workflowUrl", "downloadName", "checksumName", "qualification", "warning"]) {
+    if (typeof parsed.repairCandidate[key] !== "string" || !parsed.repairCandidate[key].trim()) {
+      throw new Error(`content.json repairCandidate.${key} must be a non-empty string`);
+    }
   }
-  if (workflowUrl.protocol !== "https:") {
-    throw new Error("content.json release.workflowUrl must use HTTPS");
+  for (const key of ["downloadName", "checksumName"]) {
+    if (!/^[A-Za-z0-9._-]+$/.test(parsed.repairCandidate[key])) {
+      throw new Error(`content.json repairCandidate.${key} is not a safe filename`);
+    }
+  }
+  for (const [label, section] of [["release", parsed.release], ["repairCandidate", parsed.repairCandidate]]) {
+    let workflowUrl;
+    try {
+      workflowUrl = new URL(section.workflowUrl);
+    } catch {
+      throw new Error(`content.json ${label}.workflowUrl must be an absolute URL`);
+    }
+    if (workflowUrl.protocol !== "https:") {
+      throw new Error(`content.json ${label}.workflowUrl must use HTTPS`);
+    }
+  }
+  if (
+    !Number.isSafeInteger(parsed.repairCandidate.workflowRunId) ||
+    parsed.repairCandidate.workflowRunId < 1
+  ) {
+    throw new Error(
+      "content.json repairCandidate.workflowRunId must be a positive safe integer",
+    );
   }
   return Object.freeze(parsed);
 }
@@ -364,7 +391,9 @@ function artifactView(snapshot) {
 function renderPrivate() {
   const retail = artifactView(configuredArtifacts.retail);
   const iso = artifactView(configuredArtifacts.iso);
+  const repairCandidate = artifactView(configuredArtifacts.repairCandidate);
   const release = content.release;
+  const candidate = content.repairCandidate;
   return render(privateTemplate, {
     artifactName: escapeHtml(release.name),
     artifactState: retail.state,
@@ -382,6 +411,21 @@ function renderPrivate() {
     isoStateClass: iso.stateClass,
     modified: escapeHtml(retail.modified),
     qualification: escapeHtml(release.qualification),
+    repairCandidateArtifactState: repairCandidate.state,
+    repairCandidateArtifactVersion: escapeHtml(candidate.artifactVersion),
+    repairCandidateChannel: escapeHtml(candidate.channel),
+    repairCandidateChecksumName: escapeHtml(candidate.checksumName),
+    repairCandidateDownloadName: escapeHtml(candidate.downloadName),
+    repairCandidateHash: escapeHtml(repairCandidate.hash),
+    repairCandidateModified: escapeHtml(repairCandidate.modified),
+    repairCandidateName: escapeHtml(candidate.name),
+    repairCandidateQualification: escapeHtml(candidate.qualification),
+    repairCandidateSize: escapeHtml(repairCandidate.size),
+    repairCandidateSourceCommit: escapeHtml(candidate.sourceCommit),
+    repairCandidateStateClass: repairCandidate.stateClass,
+    repairCandidateWarning: escapeHtml(candidate.warning),
+    repairCandidateWorkflowRunId: escapeHtml(candidate.workflowRunId),
+    repairCandidateWorkflowUrl: escapeHtml(candidate.workflowUrl),
     size: escapeHtml(retail.size),
     sourceCommit: escapeHtml(release.sourceCommit),
     stateClass: retail.stateClass,
@@ -594,6 +638,25 @@ async function handleRequest(req, res) {
   }
   if (url.pathname === "/private/downloads/retail-checksum") {
     serveChecksum(req, res, configuredArtifacts.retail, content.release.retailDownloadName, content.release.retailChecksumName);
+    return;
+  }
+  if (url.pathname === "/private/downloads/repair-candidate") {
+    serveArtifact(
+      req,
+      res,
+      configuredArtifacts.repairCandidate,
+      content.repairCandidate.downloadName,
+    );
+    return;
+  }
+  if (url.pathname === "/private/downloads/repair-candidate-checksum") {
+    serveChecksum(
+      req,
+      res,
+      configuredArtifacts.repairCandidate,
+      content.repairCandidate.downloadName,
+      content.repairCandidate.checksumName,
+    );
     return;
   }
   send(req, res, 404, "Non trovato.\n", { "Content-Type": "text/plain; charset=utf-8" }, { isPrivate: true });

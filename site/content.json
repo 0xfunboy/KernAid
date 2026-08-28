@@ -12,5 +12,17 @@
     "retailChecksumName": "KernAid-Rescue-0.1.0-internal.2-x86_64-retail.img.xz.sha256",
     "qualification": "Build, ABI, SBOM, boot e USB-style two-boot QEMU BIOS/UEFI superati. I lifecycle privilegiati hanno provisionato da zero, riaperto e verificato lo stesso Vault LUKS2/ext4, inclusi identità, report firmati e home Codex persistente. Manifest canonico e attestazioni Sigstore sono stati riverificati dalla release interna 0.1.0-internal.2.",
     "warning": "Candidata interna qualificata virtualmente e unica immagine autorizzata dal catalogo trusted v2 revision 4. USB fisica, firmware, Secure Boot, login Codex con account reale/TLS live e riparazioni restano non qualificati; usare solo una chiavetta nuova o sacrificabile da almeno 32 GB e hardware non cliente."
+  },
+  "repairCandidate": {
+    "name": "KernAid Rescue Repair Candidate AMD64",
+    "channel": "Phase 1 engineering candidate · non qualificata",
+    "sourceCommit": "81e175f76247cd788ef78e64d46f03bc20f3d968",
+    "workflowRunId": 33176185992,
+    "artifactVersion": "ci-33176185992-1",
+    "workflowUrl": "https://github.com/0xfunboy/KernAid/actions/runs/33176185992",
+    "downloadName": "KernAid-Rescue-amd64-repair-candidate.iso",
+    "checksumName": "KernAid-Rescue-amd64-repair-candidate.iso.sha256",
+    "qualification": "Artefatto sperimentale prodotto dal workflow Rescue Repair Candidate per sviluppo e verifica interna della sola azione linux.fstab.disable-missing-uuid.v1. Non appartiene al catalogo trusted, al canale retail o a una release qualificata.",
+    "warning": "ATTENZIONE: IMMAGINE NON QUALIFICATA E NON PROMOSSA. Può eseguire una riparazione sperimentale con scrittura sul target. Usare esclusivamente in laboratorio, su hardware non cliente e con dati sacrificabili; non distribuirla e non sostituirla alla ISO stabile o all'immagine retail."
   }
 }
