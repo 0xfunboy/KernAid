@@ -45,7 +45,7 @@
       </div>
 
       <dl class="release-meta">
-        <div><dt>File</dt><dd><code>{{downloadName}}</code></dd></div>
+        <div><dt>File per Windows / Rufus</dt><dd><code>{{downloadName}}</code></dd></div>
         <div><dt>Versione artefatto</dt><dd><code>{{artifactVersion}}</code></dd></div>
         <div><dt>Commit sorgente</dt><dd><code>{{sourceCommit}}</code></dd></div>
         <div><dt>Dimensione</dt><dd>{{size}}</dd></div>
@@ -60,9 +60,29 @@
       </div>
 
       <div class="release-actions">
-        <a class="button primary" href="/private/downloads/iso">Scarica candidato ISO</a>
-        <a class="button ghost" href="/private/downloads/checksum">Scarica SHA-256</a>
+        <a class="button primary" href="/private/downloads/retail">Scarica immagine Windows / Rufus</a>
+        <a class="button ghost" href="/private/downloads/retail-checksum">Scarica SHA-256 retail</a>
       </div>
+
+      <section class="secondary-artifact" aria-labelledby="iso-title">
+        <div class="secondary-artifact-heading">
+          <div>
+            <p class="card-kicker">Formato tecnico secondario</p>
+            <h3 id="iso-title">ISO per VM e workflow Linux</h3>
+          </div>
+          <span class="release-status {{isoStateClass}}"><i></i>{{isoArtifactState}}</span>
+        </div>
+        <dl class="release-meta secondary-meta">
+          <div><dt>File ISO</dt><dd><code>{{isoDownloadName}}</code></dd></div>
+          <div><dt>Dimensione</dt><dd>{{isoSize}}</dd></div>
+          <div><dt>Modificato</dt><dd>{{isoModified}}</dd></div>
+          <div><dt>SHA-256</dt><dd><code class="full-hash">{{isoHash}}</code></dd></div>
+        </dl>
+        <div class="release-actions">
+          <a class="button ghost" href="/private/downloads/iso">Scarica ISO tecnica</a>
+          <a class="button ghost" href="/private/downloads/checksum">Scarica SHA-256 ISO</a>
+        </div>
+      </section>
     </section>
 
     <section class="verify-card" aria-labelledby="verify-title">
@@ -71,8 +91,9 @@
         <h2 id="verify-title">Verifica sempre prima dell'uso in laboratorio.</h2>
       </div>
       <div class="verify-commands">
-        <p>Linux</p><code>sha256sum -c {{checksumName}}</code>
-        <p>Windows PowerShell</p><code>Get-FileHash .\{{downloadName}} -Algorithm SHA256</code>
+        <p>Windows PowerShell — immagine retail</p><code>Get-FileHash .\{{downloadName}} -Algorithm SHA256</code>
+        <p>Linux — immagine retail</p><code>sha256sum -c {{checksumName}}</code>
+        <p>Linux — ISO tecnica</p><code>sha256sum -c {{isoChecksumName}}</code>
       </div>
     </section>
   </main>

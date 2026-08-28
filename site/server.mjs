@@ -13,6 +13,8 @@ const username = process.env.KAID_USERNAME || "funboy";
 const authFile = process.env.KAID_AUTH_FILE || path.join(os.homedir(), ".config", "kaid-site", "password");
 const isoPath = process.env.KAID_ISO_PATH || "";
 const isoSha256Path = process.env.KAID_ISO_SHA256_PATH || (isoPath ? `${isoPath}.sha256` : "");
+const retailPath = process.env.KAID_RETAIL_PATH || "";
+const retailSha256Path = process.env.KAID_RETAIL_SHA256_PATH || (retailPath ? `${retailPath}.sha256` : "");
 const sessionLifetimeMs = 12 * 60 * 60 * 1000;
 const maxBodyBytes = 8 * 1024;
 const maxSessions = 256;
@@ -20,7 +22,10 @@ const maxFailedLoginKeys = 2048;
 
 const content = loadContent(path.join(root, "content.json"));
 const password = readSecret(authFile);
-const configuredArtifact = loadArtifactSnapshot();
+const configuredArtifacts = Object.freeze({
+  iso: loadArtifactSnapshot(isoPath, isoSha256Path, "ISO"),
+  retail: loadArtifactSnapshot(retailPath, retailSha256Path, "retail image"),
+});
 const publicFiles = new Map([
   ["/", loadPublicFile("index.html", "text/html; charset=utf-8")],
   ["/index.html", loadPublicFile("index.html", "text/html; charset=utf-8")],
@@ -82,12 +87,12 @@ function loadContent(filePath) {
   if (parsed?.schema !== "dev.kernaid.site-content.v1" || !parsed.release) {
     throw new Error("content.json does not match dev.kernaid.site-content.v1");
   }
-  for (const key of ["name", "channel", "sourceCommit", "artifactVersion", "workflowUrl", "downloadName", "checksumName", "qualification", "warning"]) {
+  for (const key of ["name", "channel", "sourceCommit", "artifactVersion", "workflowUrl", "downloadName", "checksumName", "retailDownloadName", "retailChecksumName", "qualification", "warning"]) {
     if (typeof parsed.release[key] !== "string" || !parsed.release[key].trim()) {
       throw new Error(`content.json release.${key} must be a non-empty string`);
     }
   }
-  for (const key of ["downloadName", "checksumName"]) {
+  for (const key of ["downloadName", "checksumName", "retailDownloadName", "retailChecksumName"]) {
     if (!/^[A-Za-z0-9._-]+$/.test(parsed.release[key])) {
       throw new Error(`content.json release.${key} is not a safe filename`);
     }
@@ -271,36 +276,36 @@ function renderLogin(error = "") {
   });
 }
 
-function loadArtifactSnapshot() {
-  if (!isoPath || !isoSha256Path) {
-    return { artifact: null, error: new Error("KAID_ISO_PATH is not configured") };
+function loadArtifactSnapshot(filePath, checksumPath, label) {
+  if (!filePath || !checksumPath) {
+    return { artifact: null, error: new Error(`KernAid ${label} path is not configured`) };
   }
   let fd;
   try {
-    assertOwnerOnlyDirectory(path.dirname(isoPath));
-    assertOwnerOnlyFile(isoSha256Path, fs.lstatSync(isoSha256Path));
-    const checksumText = fs.readFileSync(isoSha256Path, "utf8");
+    assertOwnerOnlyDirectory(path.dirname(filePath));
+    assertOwnerOnlyFile(checksumPath, fs.lstatSync(checksumPath));
+    const checksumText = fs.readFileSync(checksumPath, "utf8");
     const match = /^([a-fA-F0-9]{64})(?:\s+[*]?.+)?$/m.exec(checksumText);
-    if (!match) throw new Error("Configured checksum file does not contain a SHA-256 value");
+    if (!match) throw new Error(`Configured ${label} checksum file does not contain a SHA-256 value`);
 
-    fd = fs.openSync(isoPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    fd = fs.openSync(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
     const stat = fs.fstatSync(fd);
-    assertOwnerOnlyFile(isoPath, stat);
-    if (stat.size < 1) throw new Error("Configured ISO is empty");
+    assertOwnerOnlyFile(filePath, stat);
+    if (stat.size < 1) throw new Error(`Configured ${label} is empty`);
 
     const hash = crypto.createHash("sha256");
     const buffer = Buffer.allocUnsafe(4 * 1024 * 1024);
     let position = 0;
     while (position < stat.size) {
       const bytesRead = fs.readSync(fd, buffer, 0, Math.min(buffer.length, stat.size - position), position);
-      if (bytesRead < 1) throw new Error("Configured ISO ended before its declared size");
+      if (bytesRead < 1) throw new Error(`Configured ${label} ended before its declared size`);
       hash.update(buffer.subarray(0, bytesRead));
       position += bytesRead;
     }
     const actualHash = hash.digest("hex");
     const expectedHash = match[1].toLowerCase();
     if (!safeEqual(actualHash, expectedHash)) {
-      throw new Error("Configured ISO does not match its SHA-256 sidecar");
+      throw new Error(`Configured ${label} does not match its SHA-256 sidecar`);
     }
     return {
       artifact: Object.freeze({
@@ -308,19 +313,20 @@ function loadArtifactSnapshot() {
         fd,
         hash: actualHash,
         modified: stat.mtime.toISOString(),
+        path: filePath,
       }),
       error: null,
     };
   } catch (error) {
     if (fd !== undefined) fs.closeSync(fd);
-    console.error(`KernAid artifact unavailable: ${error.message}`);
+    console.error(`KernAid ${label} unavailable: ${error.message}`);
     return { artifact: null, error };
   }
 }
 
-function readArtifact() {
-  if (!configuredArtifact.artifact) throw configuredArtifact.error;
-  return configuredArtifact.artifact;
+function readArtifact(snapshot) {
+  if (!snapshot.artifact) throw snapshot.error;
+  return snapshot.artifact;
 }
 
 function formatBytes(bytes) {
@@ -334,31 +340,51 @@ function formatDate(isoDate) {
   }).format(new Date(isoDate));
 }
 
-function renderPrivate() {
-  let artifact;
-  let artifactState = "File scaricabile";
-  let stateClass = "status-ready";
+function artifactView(snapshot) {
   try {
-    artifact = readArtifact();
+    const artifact = readArtifact(snapshot);
+    return {
+      hash: artifact.hash,
+      modified: formatDate(artifact.modified),
+      size: formatBytes(artifact.bytes),
+      state: "File scaricabile",
+      stateClass: "status-ready",
+    };
   } catch {
-    artifactState = "Non disponibile";
-    stateClass = "status-unavailable";
-    artifact = { bytes: 0, hash: "Non disponibile", modified: new Date(0).toISOString() };
+    return {
+      hash: "Non disponibile",
+      modified: "Non disponibile",
+      size: "Non disponibile",
+      state: "Non disponibile",
+      stateClass: "status-unavailable",
+    };
   }
+}
+
+function renderPrivate() {
+  const retail = artifactView(configuredArtifacts.retail);
+  const iso = artifactView(configuredArtifacts.iso);
   const release = content.release;
   return render(privateTemplate, {
     artifactName: escapeHtml(release.name),
-    artifactState,
+    artifactState: retail.state,
     artifactVersion: escapeHtml(release.artifactVersion),
     channel: escapeHtml(release.channel),
-    checksumName: escapeHtml(release.checksumName),
-    downloadName: escapeHtml(release.downloadName),
-    hash: escapeHtml(artifact.hash),
-    modified: artifact.bytes ? escapeHtml(formatDate(artifact.modified)) : "Non disponibile",
+    checksumName: escapeHtml(release.retailChecksumName),
+    downloadName: escapeHtml(release.retailDownloadName),
+    hash: escapeHtml(retail.hash),
+    isoArtifactState: iso.state,
+    isoChecksumName: escapeHtml(release.checksumName),
+    isoDownloadName: escapeHtml(release.downloadName),
+    isoHash: escapeHtml(iso.hash),
+    isoModified: escapeHtml(iso.modified),
+    isoSize: escapeHtml(iso.size),
+    isoStateClass: iso.stateClass,
+    modified: escapeHtml(retail.modified),
     qualification: escapeHtml(release.qualification),
-    size: artifact.bytes ? formatBytes(artifact.bytes) : "Non disponibile",
+    size: escapeHtml(retail.size),
     sourceCommit: escapeHtml(release.sourceCommit),
-    stateClass,
+    stateClass: retail.stateClass,
     warning: escapeHtml(release.warning),
     workflowUrl: escapeHtml(release.workflowUrl),
   });
@@ -384,18 +410,17 @@ function parseRange(value, size) {
   return { start, end: Math.min(end, size - 1) };
 }
 
-function serveIso(req, res) {
+function serveArtifact(req, res, snapshot, downloadName) {
   let artifact;
   try {
-    artifact = readArtifact();
+    artifact = readArtifact(snapshot);
   } catch {
     send(req, res, 503, "Artefatto temporaneamente non disponibile.\n", { "Content-Type": "text/plain; charset=utf-8" }, { isPrivate: true });
     return;
   }
-  const release = content.release;
   const base = {
     "Accept-Ranges": "bytes",
-    "Content-Disposition": `attachment; filename="${release.downloadName}"`,
+    "Content-Disposition": `attachment; filename="${downloadName}"`,
     "Content-Type": "application/octet-stream",
     ETag: `"${artifact.hash}"`,
     "Last-Modified": new Date(artifact.modified).toUTCString(),
@@ -424,7 +449,7 @@ function serveIso(req, res) {
     res.end();
     return;
   }
-  const stream = fs.createReadStream(isoPath, {
+  const stream = fs.createReadStream(artifact.path, {
     autoClose: false,
     fd: artifact.fd,
     start,
@@ -434,17 +459,16 @@ function serveIso(req, res) {
   stream.pipe(res);
 }
 
-function serveChecksum(req, res) {
+function serveChecksum(req, res, snapshot, downloadName, checksumName) {
   let artifact;
   try {
-    artifact = readArtifact();
+    artifact = readArtifact(snapshot);
   } catch {
     send(req, res, 503, "Checksum temporaneamente non disponibile.\n", { "Content-Type": "text/plain; charset=utf-8" }, { isPrivate: true });
     return;
   }
-  const release = content.release;
-  send(req, res, 200, `${artifact.hash}  ${release.downloadName}\n`, {
-    "Content-Disposition": `attachment; filename="${release.checksumName}"`,
+  send(req, res, 200, `${artifact.hash}  ${downloadName}\n`, {
+    "Content-Disposition": `attachment; filename="${checksumName}"`,
     "Content-Type": "text/plain; charset=utf-8",
   }, { isPrivate: true });
 }
@@ -557,11 +581,19 @@ async function handleRequest(req, res) {
     return;
   }
   if (url.pathname === "/private/downloads/iso") {
-    serveIso(req, res);
+    serveArtifact(req, res, configuredArtifacts.iso, content.release.downloadName);
     return;
   }
   if (url.pathname === "/private/downloads/checksum") {
-    serveChecksum(req, res);
+    serveChecksum(req, res, configuredArtifacts.iso, content.release.downloadName, content.release.checksumName);
+    return;
+  }
+  if (url.pathname === "/private/downloads/retail") {
+    serveArtifact(req, res, configuredArtifacts.retail, content.release.retailDownloadName);
+    return;
+  }
+  if (url.pathname === "/private/downloads/retail-checksum") {
+    serveChecksum(req, res, configuredArtifacts.retail, content.release.retailDownloadName, content.release.retailChecksumName);
     return;
   }
   send(req, res, 404, "Non trovato.\n", { "Content-Type": "text/plain; charset=utf-8" }, { isPrivate: true });
@@ -580,7 +612,9 @@ const server = http.createServer((req, res) => {
 server.listen(port, host, () => console.log(`KernAid project site listening on http://${host}:${port}`));
 for (const signal of ["SIGINT", "SIGTERM"]) {
   process.on(signal, () => server.close(() => {
-    if (configuredArtifact.artifact) fs.closeSync(configuredArtifact.artifact.fd);
+    for (const snapshot of Object.values(configuredArtifacts)) {
+      if (snapshot.artifact) fs.closeSync(snapshot.artifact.fd);
+    }
     process.exit(0);
   }));
 }

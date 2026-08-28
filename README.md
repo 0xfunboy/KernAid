@@ -40,9 +40,15 @@ The CI workflows are configured to produce engineering-preview desktop installer
   [Current status](docs/CURRENT_STATUS.md) only for first physical-boot
   qualification. Verify its checksum and, on Windows, write it with Rufus in
   DD mode to a factory-new or disposable USB of at least 32 GB. The trusted v2
-  catalog revision 3 authorizes only this exact ISO, so the Linux writer can
-  verify, copy and provision its encrypted vault. The manual Windows path does
-  not perform that trusted vault provisioning.
+  catalog revision 4 authorizes only this exact ISO, so the Linux writer can
+  verify, copy and provision its encrypted vault. Rufus only writes the
+  qualified zero-state retail image; first live boot provisions the Vault after
+  local passphrase confirmation.
+  The promoted internal release is `0.1.0-internal.2`: artifact
+  `ci-33150274347-1`, built from commit
+  `0d61eac1a5e4819dedb8b2243f53599de69eba32` by Rescue run `33150274347`.
+  Its exact ISO is `1,223,540,736` bytes with SHA-256
+  `ca152712c7f7002024868efc707c71c32b7c1bd648cd42ed20bb245be8d90312`.
   Physical USB boot and firmware remain unqualified. On a successful boot,
   select the
   installed-system candidate in the left rail, and keep Secure Boot disabled
@@ -57,8 +63,9 @@ The CI workflows are configured to produce engineering-preview desktop installer
   mount at or below `/etc` (including `/etc/machine-id`), `/boot` (including
   `/boot/efi`), `/efi`, `/usr`, or `/var`, KernAid marks the corpus unsupported
   and blocks diagnosis; multi-mount parity is not claimed.
-  The signed persistent-report path requires a writer-provisioned Vault:
-  unlock it from the native TTY before Desk initializes. After diagnosis, use
+  The signed persistent-report path requires a Vault provisioned by the Linux
+  v2 writer or retail first boot: unlock it from the native TTY before Desk
+  initializes. After diagnosis, use
   `kernaid-rescue-vaultctl report-list` and
   `kernaid-rescue-vaultctl report-export RP-...` to place a verified envelope
   at `/home/kernaid/KernAid-Reports/<id>.signed.json`. The exact current private
@@ -113,7 +120,7 @@ See [Current status](docs/CURRENT_STATUS.md), the [operator guide](docs/operator
   qualified only after the full Rescue workflow passes, including both
   privileged BIOS and UEFI lifecycle jobs. The
   v2 writer can provision that vault only for an exact catalog-authorized image
-  on factory-new controlled-lab media; revision 3 authorizes the exact current
+  on factory-new controlled-lab media; revision 4 authorizes the exact current
   internally qualified candidate.
   The Rescue report relay is loopback/internal-only; the exact current image
   passed its signed-report shipping lifecycle under virtual BIOS and UEFI.

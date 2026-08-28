@@ -21,9 +21,11 @@ authorize it.
 | `/styles.css` | Public asset | Isolated styling for login and authenticated distribution |
 | `/healthz` | Public | Minimal process health response |
 | `/private/login` | Public | Form login, without browser Basic Auth |
-| `/private/` | Authenticated | Candidate provenance, qualification and checksum |
+| `/private/` | Authenticated | Candidate provenance, retail-first downloads, qualification and checksums |
+| `/private/downloads/retail` | Authenticated | Range-capable compressed Windows/Rufus image download |
+| `/private/downloads/retail-checksum` | Authenticated | SHA-256 sidecar generated for the retail image |
 | `/private/downloads/iso` | Authenticated | Range-capable ISO download |
-| `/private/downloads/checksum` | Authenticated | SHA-256 sidecar generated from the configured checksum |
+| `/private/downloads/checksum` | Authenticated | SHA-256 sidecar generated for the ISO |
 | `/private/logout` | Authenticated | Session revocation |
 
 Successful login creates a random, in-memory session with a 12-hour lifetime.
@@ -41,6 +43,8 @@ The server requires Node.js 24 or newer and has no package dependencies.
 | `KAID_PORT` | No | `3210` |
 | `KAID_USERNAME` | No | `funboy` |
 | `KAID_AUTH_FILE` | No | `~/.config/kaid-site/password` |
+| `KAID_RETAIL_PATH` | Yes for the primary Windows/Rufus download | No default |
+| `KAID_RETAIL_SHA256_PATH` | No | `${KAID_RETAIL_PATH}.sha256` |
 | `KAID_ISO_PATH` | Yes for downloads | No default |
 | `KAID_ISO_SHA256_PATH` | No | `${KAID_ISO_PATH}.sha256` |
 
@@ -48,11 +52,12 @@ The authentication file must contain one non-empty password. Keep it and any
 Cloudflare tunnel credentials outside the repository with owner-only
 permissions. The server reads the password once at startup and never logs it.
 
-The ISO is not loaded into memory. At process start the server opens it without
-following a final symlink, verifies owner-only permissions, hashes every byte
-against the configured sidecar and keeps that exact file descriptor pinned for
-downloads. A mismatch leaves the artifact unavailable. Operators and users
-must still verify the downloaded file using the sidecar.
+Neither artifact is loaded into memory. At process start the server opens the
+retail image and ISO without following a final symlink, verifies owner-only
+permissions, hashes every byte against its configured sidecar and keeps those
+exact file descriptors pinned for downloads. A mismatch leaves only that
+artifact unavailable. Operators and users must still verify each downloaded
+file using its sidecar.
 
 Keep the private artifact directory owner-only (`0700`) and the ISO, checksum
 and metadata files owner-readable only (`0600`). Web authentication is not a
@@ -65,24 +70,28 @@ candidate changes, update together:
 
 1. source commit and CI artifact version;
 2. workflow URL;
-3. qualification statement and warning;
-4. configured ISO and matching checksum sidecar.
+3. both download and checksum presentation names;
+4. qualification statement and warning;
+5. configured retail image and ISO with their matching checksum sidecars.
 
-`content.json` and the verified artifact snapshot are loaded once at process
+`content.json` and both verified artifact snapshots are loaded once at process
 start, so restart `kaid-site.service` after changing release metadata or the
 configured artifact path.
 
 Do not soften the warning based only on the existence of a workflow artifact.
-For the current `015ee8f` candidate, the hybrid ISO, ordinary BIOS/UEFI QEMU
-smoke, USB-style two-boot and both privileged persistent-vault lifecycle jobs
-passed on the same exact artifact. Its locally re-derived entry matched the CI
-artifact and trusted catalog v2 revision 3 now authorizes only that image. The
-same lifecycle proved signed-report persistence, retrieval and fixed-path
-export under both virtual firmware modes. It is still not a production release:
-private availability is limited to
-controlled first-boot qualification on factory-new or disposable USB and
-non-customer hardware until physical USB, Secure Boot and real-account/TLS
-gates are recorded.
+The exact candidate named in `content.json` must have passed hybrid ISO build,
+ordinary BIOS/UEFI smoke, zero-state first boot, USB-style two-boot and both
+privileged persistent-vault lifecycle jobs on the same bytes. Its release
+manifest and attestations must then be independently verified before the
+retail image and ISO are staged together. It remains an internal engineering
+candidate: private availability is limited to controlled physical qualification
+on factory-new or disposable USB and non-customer hardware until physical USB,
+Secure Boot and real-account/TLS gates are recorded.
+
+Each download remains independently fail-closed with `503` until its exact
+qualified file, matching sidecar and environment path are all present. This
+allows the ISO to remain available for technical workflows without weakening a
+missing or invalid retail-image boundary, and vice versa.
 
 ## Local validation
 
@@ -97,6 +106,7 @@ Start a local instance with the operator-owned files already provisioned:
 ```bash
 KAID_PORT=3211 \
 KAID_AUTH_FILE=/path/to/password \
+KAID_RETAIL_PATH=/path/to/KernAid-Rescue-amd64-retail.img.xz \
 KAID_ISO_PATH=/path/to/KernAid-Rescue-amd64.iso \
 node site/server.mjs
 ```
@@ -108,6 +118,7 @@ GET  /                                  200
 GET  /private/ without a session        303 -> /private/login
 POST /private/login with valid data      303 + Secure session cookie
 GET  /private/ with the session          200
+GET  /private/downloads/retail Range 0-0 206, one byte
 GET  /private/downloads/iso Range 0-0    206, one byte
 POST /private/logout                     303 + expired session cookie
 ```

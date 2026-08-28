@@ -464,6 +464,17 @@ code { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
 .qualification-note p { margin: 10px 0; color: #c2ccc7; line-height: 1.55; }
 .qualification-note a { color: var(--cyan); font-size: 13px; text-decoration: none; }
 
+.secondary-artifact {
+  margin-top: 36px;
+  padding: 24px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: rgba(0,0,0,.14);
+}
+.secondary-artifact-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; }
+.secondary-artifact-heading h3 { margin: 10px 0 0; font-size: clamp(23px, 3vw, 30px); letter-spacing: -.035em; }
+.secondary-meta { margin-top: 22px; }
+
 .verify-card {
   display: grid;
   grid-template-columns: .9fr 1.1fr;
@@ -501,6 +512,7 @@ code { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
   .private-badge { display: none; }
   .private-hero { padding-top: 65px; }
   .release-heading { flex-direction: column; }
+  .secondary-artifact-heading { flex-direction: column; }
   .release-meta > div { grid-template-columns: 1fr; gap: 7px; }
   .release-actions { align-items: stretch; flex-direction: column; }
   .release-actions .button { width: 100%; }

@@ -7,17 +7,18 @@ unattended repair until those release gates are completed.
 ## Create the Rescue USB
 
 There is currently no physically qualified release. The private project area
-exposes one exact internally qualified candidate from commit `015ee8f` to
-collect the first physical-boot evidence. Its exact version, size, workflow
-and SHA-256 are recorded in `CURRENT_STATUS.md`; do not substitute another
+exposes one exact internally and virtually qualified candidate to collect the
+first physical-boot evidence. Its commit, release sequence, sizes, workflow and
+SHA-256 values are recorded in `CURRENT_STATUS.md`; do not substitute another
 Actions artifact or an image from a mirror.
 
-Trusted catalog v2 revision 3 authorizes only this exact ISO after its complete
-virtual BIOS/UEFI workflow passed. The Linux v2 writer can therefore verify,
-copy and provision its encrypted vault. The Windows procedure below remains a
-raw physical boot test. The currently promoted `015ee8f` candidate predates the
-in-guest first-boot provisioner; do not expect that older image to create a
-Vault after Rufus writes it.
+The trusted catalog authorizes only that exact candidate after its complete
+virtual BIOS/UEFI workflow passes. The Linux v2 writer can therefore verify,
+copy and provision the catalog-bound image. On Windows, use the separately
+qualified retail `.img.xz`: it contains the same boot image plus the exact
+all-zero p3 region that the in-guest first-boot provisioner turns into the
+encrypted Vault. The Windows procedure below remains a raw physical boot test,
+not a supported repair deployment.
 
 The Rescue build target is amd64 legacy BIOS and UEFI. Its boot evidence is
 QEMU-only; physical PCs, firmware and USB media are unqualified. It
@@ -117,14 +118,14 @@ encrypted Vault, closes it, verifies the locked state, and then lets normal
 boot continue. An existing valid Vault or an optical boot does not prompt;
 mixed/non-zero or failed media records a fail-closed error and still allows the
 recovery UI to start. This path has no device selector and cannot be aimed at a
-customer disk. It remains an engineering feature until the exact image passes
-zero-p3 QEMU and physical USB qualification and is promoted in
-`CURRENT_STATUS.md`.
+customer disk. The exact promoted image passed zero-p3 BIOS/UEFI QEMU
+qualification; the path remains an engineering feature until physical USB and
+firmware qualification are recorded in `CURRENT_STATUS.md`.
 
 ## Diagnose from Rescue
 
-Before Desk initializes, open a native TTY and unlock the writer-provisioned
-Vault locally:
+Before Desk initializes, open a native TTY and unlock the provisioned Vault
+locally:
 
 ```text
 kernaid-rescue-vaultctl status
@@ -282,7 +283,7 @@ The supported workshop procedure in this section is Resident-only. Rescue
 contains feature-gated persistent-vault OpenAI plumbing and a loopback
 UI-server relay. The current exact candidate passed the full virtual workflow,
 including both privileged BIOS and UEFI lifecycle jobs, and trusted catalog v2
-revision 3 authorizes that ISO. Physical media and live provider TLS with a
+revision 4 authorizes that ISO. Physical media and live provider TLS with a
 real account are still not qualified. Do not present Rescue OpenAI as supported
 on customer media yet. The Resident credential companion
 is not included in the desktop installer and is not added to `PATH`. From the
