@@ -56,6 +56,7 @@ const NONCANONICAL_METADATA_DOMAIN: &[u8] =
 const SAFETY_CLEANUP_BUDGET: Duration = Duration::from_secs(30);
 const RESOLUTION_BUDGET: Duration = Duration::from_secs(10);
 const LOCK_POLL: Duration = Duration::from_millis(5);
+const VAULT_RECOVERY_POLL: Duration = Duration::from_millis(250);
 
 static PROCESS_EXECUTOR_LOCK: Mutex<()> = Mutex::new(());
 
@@ -261,12 +262,22 @@ pub fn recover_pending_rescue_fstab(
     let operation_deadline = reserve_cleanup_window(deadline)?;
     let safety_deadline = reserve_resolution_window(deadline)?;
     let mut vault_client = RepairVaultClient::new();
-    let result = vault_client
-        .transaction_status(
+    let result = loop {
+        match vault_client.transaction_status(
             &RepairTransactionStatusSelector::pending_singleton(),
             operation_deadline,
-        )
-        .map_err(map_vault_error)?;
+        ) {
+            Ok(result) => break result,
+            Err(error) if recovery_status_retryable(error) => {
+                ensure_deadline(operation_deadline)?;
+                thread::sleep(
+                    VAULT_RECOVERY_POLL
+                        .min(operation_deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+            Err(error) => return Err(map_vault_error(error)),
+        }
+    };
     let Some(pending) = result.transaction().cloned() else {
         return Ok(None);
     };
@@ -509,6 +520,13 @@ fn map_vault_error(error: RepairVaultClientError) -> RescueFstabExecutionError {
         }
         _ => RescueFstabExecutionError::VaultUnavailable,
     }
+}
+
+fn recovery_status_retryable(error: RepairVaultClientError) -> bool {
+    matches!(
+        error,
+        RepairVaultClientError::Remote(ErrorToken::Locked | ErrorToken::Busy)
+    )
 }
 
 fn map_capability_error(error: RescueFstabCapabilityResolutionError) -> RescueFstabExecutionError {
@@ -1362,6 +1380,22 @@ mod tests {
         b"UUID=aaaa / ext4 defaults 0 1\nUUID=dead-beef /srv/archive ext4 defaults 0 2\n";
     const AFTER: &[u8] = b"UUID=aaaa / ext4 defaults 0 1\n# KernAid Rescue disabled missing UUID: UUID=dead-beef /srv/archive ext4 defaults 0 2\n";
     const RESERVATION: &str = "B-0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn startup_retries_only_transient_vault_states() {
+        assert!(recovery_status_retryable(RepairVaultClientError::Remote(
+            ErrorToken::Locked
+        )));
+        assert!(recovery_status_retryable(RepairVaultClientError::Remote(
+            ErrorToken::Busy
+        )));
+        assert!(!recovery_status_retryable(
+            RepairVaultClientError::Unavailable
+        ));
+        assert!(!recovery_status_retryable(RepairVaultClientError::Remote(
+            ErrorToken::StaleState
+        )));
+    }
 
     struct DisposableTree(PathBuf);
 
