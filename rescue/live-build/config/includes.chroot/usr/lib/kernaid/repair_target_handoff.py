@@ -1,10 +1,9 @@
 #!/usr/bin/python3
-"""Disabled-by-default root handoff for one selected Rescue repair target.
+"""Disabled-by-default root handoff for one Rescue repair target capability.
 
-The caller supplies only boot-ephemeral opaque identifiers.  The helper loads
-the fixed Rescue target resolver, resolves the selection twice, and returns a
-single read-only block-device descriptor.  Its account and systemd units are
-packaged for qualification, but the socket remains disabled in shipping.
+The normal operation accepts boot-ephemeral opaque identifiers. The recovery
+operation accepts only a reboot-stable opaque digest. Both rescan twice and
+return fresh path-free claims plus one read-only block-device descriptor.
 """
 
 from __future__ import annotations
@@ -24,7 +23,10 @@ import types
 
 
 API_VERSION = "kernaid.dev/rescue-target-capability/v1alpha1"
-OPERATION = "target.readonly.acquire"
+ACQUIRE_OPERATION = "target.readonly.acquire"
+RECOVERY_OPERATION = "target.recovery.readonly.acquire"
+# Kept as the existing operation alias for callers which only use acquisition.
+OPERATION = ACQUIRE_OPERATION
 SOCKET_PATH = "/run/kernaid-rescue-target-capability.sock"
 TARGET_MODULE_PATH = "/usr/lib/kernaid/rescue_server.py"
 PASSWD_PATH = "/etc/passwd"
@@ -45,6 +47,7 @@ _EPHEMERAL_ID = {
     for prefix in ("scan", "target")
 }
 _TARGET_FINGERPRINT = re.compile(r"^sha256:[0-9a-f]{64}$")
+_RECOVERY_FINGERPRINT = re.compile(r"^recovery:[0-9a-f]{64}$")
 _MAJOR_MINOR = re.compile(r"^(0|[1-9][0-9]{0,9}):(0|[1-9][0-9]{0,9})$")
 _SAFE_DEVNAME = re.compile(r"^[A-Za-z0-9._+-]{1,128}$")
 _ERRORS = {
@@ -58,12 +61,18 @@ _ERRORS = {
 
 
 class HandoffFailure(Exception):
-    def __init__(self, token: str, request_id: str | None = None) -> None:
+    def __init__(
+        self,
+        token: str,
+        request_id: str | None = None,
+        operation: str | None = None,
+    ) -> None:
         if token not in _ERRORS:
             raise ValueError("unknown handoff failure")
         super().__init__(token)
         self.token = token
         self.request_id = request_id
+        self.operation = operation
 
 
 def _reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -87,22 +96,36 @@ def _decode_request(payload: bytes) -> dict[str, str]:
     if not isinstance(value, dict):
         raise HandoffFailure("INVALID_REQUEST")
     request_id = value.get("requestId")
+    operation = value.get("operation")
     if (
         not isinstance(request_id, str)
         or _REQUEST_ID.fullmatch(request_id) is None
         or value.get("apiVersion") != API_VERSION
-        or value.get("operation") != OPERATION
+        or operation not in {ACQUIRE_OPERATION, RECOVERY_OPERATION}
     ):
         raise HandoffFailure("INVALID_REQUEST")
-    if set(value) != {
-        "apiVersion",
+    common = {"apiVersion", "requestId", "operation"}
+    if operation == RECOVERY_OPERATION:
+        if set(value) != common | {"recoveryFingerprint"}:
+            raise HandoffFailure("INVALID_REQUEST", request_id, operation)
+        recovery_fingerprint = value.get("recoveryFingerprint")
+        if (
+            not isinstance(recovery_fingerprint, str)
+            or _RECOVERY_FINGERPRINT.fullmatch(recovery_fingerprint) is None
+        ):
+            raise HandoffFailure("INVALID_REQUEST", request_id, operation)
+        return {
+            "apiVersion": API_VERSION,
+            "requestId": request_id,
+            "operation": operation,
+            "recoveryFingerprint": recovery_fingerprint,
+        }
+    if set(value) != common | {
         "scanFingerprint",
         "targetFingerprint",
         "targetId",
-        "requestId",
-        "operation",
     }:
-        raise HandoffFailure("INVALID_REQUEST", request_id)
+        raise HandoffFailure("INVALID_REQUEST", request_id, operation)
     scan = value.get("scanFingerprint")
     target_fingerprint = value.get("targetFingerprint")
     target = value.get("targetId")
@@ -114,11 +137,11 @@ def _decode_request(payload: bytes) -> dict[str, str]:
         or not isinstance(target, str)
         or _EPHEMERAL_ID["target"].fullmatch(target) is None
     ):
-        raise HandoffFailure("INVALID_REQUEST", request_id)
+        raise HandoffFailure("INVALID_REQUEST", request_id, operation)
     return {
         "apiVersion": API_VERSION,
         "requestId": request_id,
-        "operation": OPERATION,
+        "operation": operation,
         "scanFingerprint": scan,
         "targetFingerprint": target_fingerprint,
         "targetId": target,
@@ -343,27 +366,39 @@ def _qualify(
     request: dict[str, str],
     selection: object,
     resolution: object,
-) -> tuple[str, int, int]:
+    *,
+    expected_recovery_fingerprint: str | None = None,
+) -> tuple[str, str, int, int]:
     request_id = request["requestId"]
     if not isinstance(selection, dict) or not isinstance(resolution, dict):
         raise HandoffFailure("TARGET_UNSUPPORTED", request_id)
+    selected_target = selection.get("target")
+    scan_fingerprint = selection.get("scanFingerprint")
+    target_id = (
+        selected_target.get("targetId")
+        if isinstance(selected_target, dict)
+        else None
+    )
+    reference = {
+        "scanFingerprint": scan_fingerprint,
+        "targetId": target_id,
+    }
     try:
-        selected_candidate = targets.validate_target_selection(
-            selection,
-            {
-                "scanFingerprint": request["scanFingerprint"],
-                "targetId": request["targetId"],
-            },
-        )
+        selected_candidate = targets.validate_target_selection(selection, reference)
     except Exception as error:
         raise HandoffFailure("TARGET_UNSUPPORTED", request_id) from error
     candidate = resolution.get("candidate")
     identity = resolution.get("deviceIdentity")
     major_minor = resolution.get("majorMinor")
+    recovery_fingerprint = resolution.get("recoveryFingerprint")
+    ephemeral_request = request.get("operation") == ACQUIRE_OPERATION
     if (
-        selection.get("scanFingerprint") != request["scanFingerprint"]
-        or not isinstance(selection.get("target"), dict)
-        or selection["target"].get("targetId") != request["targetId"]
+        not isinstance(scan_fingerprint, str)
+        or _EPHEMERAL_ID["scan"].fullmatch(scan_fingerprint) is None
+        or not isinstance(target_id, str)
+        or _EPHEMERAL_ID["target"].fullmatch(target_id) is None
+        or (ephemeral_request and scan_fingerprint != request.get("scanFingerprint"))
+        or (ephemeral_request and target_id != request.get("targetId"))
         or not isinstance(candidate, dict)
         or candidate != selected_candidate
         or candidate.get("osFamilyHint") != "linux"
@@ -380,6 +415,13 @@ def _qualify(
         or identity.get("ro") is not False
         or not isinstance(identity.get("mountpoints"), list)
         or any(bool(item) for item in identity["mountpoints"])
+        or not isinstance(recovery_fingerprint, str)
+        or _RECOVERY_FINGERPRINT.fullmatch(recovery_fingerprint) is None
+        or resolution.get("recoveryUnique") is not True
+        or (
+            expected_recovery_fingerprint is not None
+            and recovery_fingerprint != expected_recovery_fingerprint
+        )
     ):
         raise HandoffFailure("TARGET_UNSUPPORTED", request_id)
     try:
@@ -387,7 +429,7 @@ def _qualify(
     except HandoffFailure as error:
         error.request_id = request_id
         raise
-    return str(major_minor), major, minor
+    return recovery_fingerprint, str(major_minor), major, minor
 
 
 def _mountinfo_has_device(major_minor: str) -> bool:
@@ -539,6 +581,13 @@ class RepairTargetHandoff:
         self.targets = _load_target_module() if targets is None else targets
 
     def acquire(self, request: dict[str, str]) -> tuple[dict[str, object], int]:
+        if request.get("operation") == RECOVERY_OPERATION:
+            return self._recover(request)
+        return self._acquire_selected(request)
+
+    def _acquire_selected(
+        self, request: dict[str, str]
+    ) -> tuple[dict[str, object], int]:
         request_id = request["requestId"]
         reference = {
             "scanFingerprint": request["scanFingerprint"],
@@ -549,7 +598,7 @@ class RepairTargetHandoff:
             selection_a, resolution_a = self.targets.resolve_installed_target(
                 reference, deadline=deadline
             )
-            major_minor, major, minor = _qualify(
+            recovery_fingerprint_a, major_minor, major, minor = _qualify(
                 self.targets, request, selection_a, resolution_a
             )
             if _mountinfo_has_device(major_minor):
@@ -562,11 +611,14 @@ class RepairTargetHandoff:
                 selection_b, resolution_b = self.targets.resolve_installed_target(
                     reference, deadline=deadline
                 )
-                _qualify(self.targets, request, selection_b, resolution_b)
+                recovery_fingerprint_b, _major_minor_b, _major_b, _minor_b = _qualify(
+                    self.targets, request, selection_b, resolution_b
+                )
                 if (
                     self.targets.canonical_target_selection(selection_a)
                     != self.targets.canonical_target_selection(selection_b)
                     or _canonical(resolution_a) != _canonical(resolution_b)
+                    or recovery_fingerprint_a != recovery_fingerprint_b
                 ):
                     raise HandoffFailure("TARGET_CHANGED", request_id)
                 candidate_a = resolution_a.get("candidate")
@@ -622,10 +674,135 @@ class RepairTargetHandoff:
             {
                 "apiVersion": API_VERSION,
                 "requestId": request_id,
-                "operation": OPERATION,
+                "operation": ACQUIRE_OPERATION,
                 "scanFingerprint": request["scanFingerprint"],
                 "targetFingerprint": fingerprint_a,
                 "targetId": request["targetId"],
+                "recoveryFingerprint": recovery_fingerprint_a,
+                "outcome": "ok",
+                "capability": "linux-ext4-direct-leaf-readonly-block-v1",
+                "descriptor": {
+                    "type": "selected-target-block-readonly",
+                    "count": 1,
+                },
+            },
+            descriptor,
+        )
+
+    def _recover(self, request: dict[str, str]) -> tuple[dict[str, object], int]:
+        request_id = request["requestId"]
+        recovery_fingerprint = request["recoveryFingerprint"]
+        reference = {"recoveryFingerprint": recovery_fingerprint}
+        deadline = time.monotonic() + IO_TIMEOUT_SECONDS
+        try:
+            selection_a, resolution_a = self.targets.resolve_recovery_target(
+                reference, deadline=deadline
+            )
+            (
+                recovery_fingerprint_a,
+                major_minor,
+                major,
+                minor,
+            ) = _qualify(
+                self.targets,
+                request,
+                selection_a,
+                resolution_a,
+                expected_recovery_fingerprint=recovery_fingerprint,
+            )
+            if _mountinfo_has_device(major_minor):
+                raise HandoffFailure("TARGET_UNSUPPORTED", request_id)
+            descriptor = _open_bound_block_device(major_minor, major, minor)
+            try:
+                runtime_fingerprint = _observed_inventory_fingerprint(
+                    self.targets, deadline, request_id
+                )
+                try:
+                    selection_b, resolution_b = self.targets.resolve_recovery_target(
+                        reference, deadline=deadline
+                    )
+                    (
+                        recovery_fingerprint_b,
+                        _major_minor_b,
+                        _major_b,
+                        _minor_b,
+                    ) = _qualify(
+                        self.targets,
+                        request,
+                        selection_b,
+                        resolution_b,
+                        expected_recovery_fingerprint=recovery_fingerprint,
+                    )
+                except Exception as error:
+                    raise HandoffFailure("TARGET_CHANGED", request_id) from error
+                if (
+                    self.targets.canonical_target_selection(selection_a)
+                    != self.targets.canonical_target_selection(selection_b)
+                    or _canonical(resolution_a) != _canonical(resolution_b)
+                    or recovery_fingerprint_a != recovery_fingerprint_b
+                ):
+                    raise HandoffFailure("TARGET_CHANGED", request_id)
+                candidate_a = resolution_a.get("candidate")
+                candidate_b = resolution_b.get("candidate")
+                if not isinstance(candidate_a, dict) or not isinstance(
+                    candidate_b, dict
+                ):
+                    raise HandoffFailure("INTERNAL", request_id)
+                scan_fingerprint = selection_a.get("scanFingerprint")
+                target_id = candidate_a.get("targetId")
+                if not isinstance(scan_fingerprint, str) or not isinstance(
+                    target_id, str
+                ):
+                    raise HandoffFailure("INTERNAL", request_id)
+                fingerprint_a = _recompute_target_fingerprint(
+                    self.targets,
+                    runtime_fingerprint,
+                    scan_fingerprint,
+                    candidate_a,
+                    request_id,
+                )
+                fingerprint_b = _recompute_target_fingerprint(
+                    self.targets,
+                    runtime_fingerprint,
+                    scan_fingerprint,
+                    candidate_b,
+                    request_id,
+                )
+                if fingerprint_a != fingerprint_b:
+                    raise HandoffFailure("TARGET_CHANGED", request_id)
+                _assert_block_fd(descriptor, major, minor)
+                if _mountinfo_has_device(major_minor):
+                    raise HandoffFailure("TARGET_CHANGED", request_id)
+            except Exception:
+                os.close(descriptor)
+                raise
+        except HandoffFailure as error:
+            if error.request_id is None:
+                error.request_id = request_id
+            raise
+        except Exception as error:
+            target_errors = tuple(
+                error_type
+                for error_type in (
+                    getattr(self.targets, "InventoryBusy", None),
+                    getattr(self.targets, "TargetScanBusy", None),
+                    getattr(self.targets, "TargetScanError", None),
+                    getattr(self.targets, "TargetSelectionError", None),
+                    TimeoutError,
+                )
+                if isinstance(error_type, type)
+            )
+            token = "TARGET_UNAVAILABLE" if isinstance(error, target_errors) else "INTERNAL"
+            raise HandoffFailure(token, request_id) from error
+        return (
+            {
+                "apiVersion": API_VERSION,
+                "requestId": request_id,
+                "operation": RECOVERY_OPERATION,
+                "scanFingerprint": scan_fingerprint,
+                "targetFingerprint": fingerprint_a,
+                "targetId": target_id,
+                "recoveryFingerprint": recovery_fingerprint_a,
                 "outcome": "ok",
                 "capability": "linux-ext4-direct-leaf-readonly-block-v1",
                 "descriptor": {
@@ -703,10 +880,17 @@ def serve_connection(
     except HandoffFailure as error:
         if error.request_id is None:
             return
+        operation = (
+            error.operation
+            if error.operation in {ACQUIRE_OPERATION, RECOVERY_OPERATION}
+            else request.get("operation") if request is not None else None
+        )
+        if operation not in {ACQUIRE_OPERATION, RECOVERY_OPERATION}:
+            operation = ACQUIRE_OPERATION
         response: dict[str, object] = {
             "apiVersion": API_VERSION,
             "requestId": error.request_id,
-            "operation": OPERATION,
+            "operation": operation,
             "outcome": "error",
             "error": error.token,
         }
@@ -723,7 +907,7 @@ def serve_connection(
                 {
                     "apiVersion": API_VERSION,
                     "requestId": request["requestId"],
-                    "operation": OPERATION,
+                    "operation": request["operation"],
                     "outcome": "error",
                     "error": "INTERNAL",
                 },

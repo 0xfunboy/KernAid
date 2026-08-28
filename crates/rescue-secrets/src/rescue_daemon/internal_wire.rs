@@ -14,6 +14,7 @@ use kernaid_protocol::rescue_repair_vault::{
     RepairBackupStatusPayload, RepairExecutionIntentV1, RepairFileMetadataV1, RepairReservationId,
     RepairTransactionPhase, RepairTransactionResolution, RepairTransactionResolutionOutcome,
     RepairTransactionStatusPayload, RepairTransactionStatusSelector, RepairTransactionTargetState,
+    RepairVaultLiveIdentityPayload,
 };
 use kernaid_protocol::rescue_vault::{
     AuditEventType, AuditOutcome, ErrorToken, MAX_AUDIT_SEQUENCE, MAX_OPENAI_KEY_BYTES,
@@ -40,11 +41,11 @@ use std::{
 use std::os::fd::AsFd;
 
 #[cfg(feature = "experimental-repair-store")]
-const COMMAND_MAGIC: &[u8; 8] = b"KRVWC005";
+const COMMAND_MAGIC: &[u8; 8] = b"KRVWC006";
 #[cfg(not(feature = "experimental-repair-store"))]
 const COMMAND_MAGIC: &[u8; 8] = b"KRVWC003";
 #[cfg(feature = "experimental-repair-store")]
-const RESPONSE_MAGIC: &[u8; 8] = b"KRVWR005";
+const RESPONSE_MAGIC: &[u8; 8] = b"KRVWR006";
 #[cfg(not(feature = "experimental-repair-store"))]
 const RESPONSE_MAGIC: &[u8; 8] = b"KRVWR003";
 // Repair capabilities intentionally remain one canonical fixed-size binary
@@ -95,6 +96,7 @@ pub(super) struct WorkerRepairDraft {
     pub(super) session_id: String,
     pub(super) target_id: String,
     pub(super) target_fingerprint: [u8; 32],
+    pub(super) target_recovery_fingerprint: String,
     pub(super) expected_backup_sha256: [u8; 32],
     pub(super) metadata_sha256: [u8; 32],
     pub(super) backup_size: u64,
@@ -108,6 +110,7 @@ impl WorkerRepairDraft {
             session_id: value.session_id().to_owned(),
             target_id: value.target_id().to_owned(),
             target_fingerprint: value.target_fingerprint().bytes(),
+            target_recovery_fingerprint: value.target_recovery_fingerprint().to_owned(),
             expected_backup_sha256: value.expected_backup_sha256().bytes(),
             metadata_sha256: value.metadata_sha256().bytes(),
             backup_size: value.backup_size(),
@@ -120,6 +123,7 @@ impl WorkerRepairDraft {
             self.session_id.clone(),
             self.target_id.clone(),
             protocol_sha256(self.target_fingerprint)?,
+            self.target_recovery_fingerprint.clone(),
             protocol_sha256(self.expected_backup_sha256)?,
             protocol_sha256(self.metadata_sha256)?,
             self.backup_size,
@@ -127,6 +131,30 @@ impl WorkerRepairDraft {
         )
         .map(|_| ())
         .map_err(|_| InternalWireError::InvalidFrame)
+    }
+}
+
+#[cfg(feature = "experimental-repair-store")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct WorkerRepairVaultLiveIdentity {
+    pub(super) vault_id: String,
+    pub(super) vault_identity_fingerprint: [u8; 32],
+    pub(super) physical_parent_fingerprint: [u8; 32],
+}
+
+#[cfg(feature = "experimental-repair-store")]
+impl WorkerRepairVaultLiveIdentity {
+    pub(super) fn to_protocol(&self) -> Result<RepairVaultLiveIdentityPayload, InternalWireError> {
+        RepairVaultLiveIdentityPayload::new(
+            self.vault_id.clone(),
+            protocol_sha256(self.vault_identity_fingerprint)?,
+            protocol_sha256(self.physical_parent_fingerprint)?,
+        )
+        .map_err(|_| InternalWireError::InvalidFrame)
+    }
+
+    fn validate(&self) -> Result<(), InternalWireError> {
+        self.to_protocol().map(|_| ())
     }
 }
 
@@ -362,6 +390,7 @@ pub(super) enum WorkerRepairCommand {
         expected: Box<RepairTransactionStatusPayload>,
         resolution: RepairTransactionResolution,
     },
+    VaultLiveParent,
 }
 
 #[cfg(feature = "experimental-repair-store")]
@@ -376,6 +405,7 @@ impl WorkerRepairCommand {
             Self::Retire { .. } => WorkerCommandKind::RepairBackupRetire,
             Self::TransactionStatus { .. } => WorkerCommandKind::RepairTransactionStatus,
             Self::TransactionResolve { .. } => WorkerCommandKind::RepairTransactionResolve,
+            Self::VaultLiveParent => WorkerCommandKind::RepairVaultLiveParent,
         }
     }
 
@@ -439,6 +469,7 @@ impl WorkerRepairCommand {
                         .ok_or(InternalWireError::InvalidFrame)?,
                 )
             }
+            Self::VaultLiveParent => Ok(()),
         }
     }
 }
@@ -513,6 +544,8 @@ pub(super) enum WorkerCommandKind {
     RepairTransactionStatus,
     #[cfg(feature = "experimental-repair-store")]
     RepairTransactionResolve,
+    #[cfg(feature = "experimental-repair-store")]
+    RepairVaultLiveParent,
     AttestQuiescent,
     Shutdown,
 }
@@ -693,6 +726,7 @@ impl WorkerCommand {
                         | WorkerCommandKind::RepairBackupRetire
                         | WorkerCommandKind::RepairTransactionStatus
                         | WorkerCommandKind::RepairTransactionResolve
+                        | WorkerCommandKind::RepairVaultLiveParent
                 ))
         {
             return Err(InternalWireError::InvalidFrame);
@@ -754,6 +788,8 @@ impl WorkerCommand {
             WorkerCommandKind::RepairTransactionStatus => 22,
             #[cfg(feature = "experimental-repair-store")]
             WorkerCommandKind::RepairTransactionResolve => 23,
+            #[cfg(feature = "experimental-repair-store")]
+            WorkerCommandKind::RepairVaultLiveParent => 24,
         };
         bytes[12..20].copy_from_slice(&self.request_id.to_be_bytes());
         if let Some(application) = &self.application {
@@ -872,6 +908,8 @@ impl WorkerCommand {
             22 => WorkerCommandKind::RepairTransactionStatus,
             #[cfg(feature = "experimental-repair-store")]
             23 => WorkerCommandKind::RepairTransactionResolve,
+            #[cfg(feature = "experimental-repair-store")]
+            24 => WorkerCommandKind::RepairVaultLiveParent,
             _ => return Err(InternalWireError::InvalidFrame),
         };
         let application = match kind {
@@ -936,9 +974,8 @@ impl WorkerCommand {
             | WorkerCommandKind::RepairBackupCancel
             | WorkerCommandKind::RepairBackupRetire
             | WorkerCommandKind::RepairTransactionStatus
-            | WorkerCommandKind::RepairTransactionResolve => {
-                Some(decode_repair_command(bytes, kind)?)
-            }
+            | WorkerCommandKind::RepairTransactionResolve
+            | WorkerCommandKind::RepairVaultLiveParent => Some(decode_repair_command(bytes, kind)?),
             _ => None,
         };
         #[cfg(feature = "experimental-repair-store")]
@@ -1010,6 +1047,7 @@ fn encode_repair_command(
                     .ok_or(InternalWireError::InvalidFrame)?,
             )?;
         }
+        WorkerRepairCommand::VaultLiveParent => {}
     }
     Ok(())
 }
@@ -1068,6 +1106,7 @@ fn decode_repair_command(
                 resolution,
             }
         }
+        WorkerCommandKind::RepairVaultLiveParent => WorkerRepairCommand::VaultLiveParent,
         _ => return Err(InternalWireError::InvalidFrame),
     };
     if !reader.remaining_is_zero() {
@@ -1086,6 +1125,7 @@ fn encode_repair_draft(
     writer.string(&draft.session_id, MAX_REPAIR_ID_BYTES)?;
     writer.string(&draft.target_id, MAX_REPAIR_ID_BYTES)?;
     writer.hash(draft.target_fingerprint)?;
+    writer.string(&draft.target_recovery_fingerprint, MAX_REPAIR_ID_BYTES)?;
     writer.hash(draft.expected_backup_sha256)?;
     writer.hash(draft.metadata_sha256)?;
     writer.u64(draft.backup_size)?;
@@ -1100,6 +1140,7 @@ fn decode_repair_draft(
         session_id: reader.string(MAX_REPAIR_ID_BYTES)?,
         target_id: reader.string(MAX_REPAIR_ID_BYTES)?,
         target_fingerprint: reader.hash()?,
+        target_recovery_fingerprint: reader.string(MAX_REPAIR_ID_BYTES)?,
         expected_backup_sha256: reader.hash()?,
         metadata_sha256: reader.hash()?,
         backup_size: reader.u64()?,
@@ -1153,6 +1194,7 @@ fn encode_repair_execution_intent(
     writer.string(intent.scan_fingerprint(), MAX_REPAIR_ID_BYTES)?;
     writer.hash(intent.target_fingerprint().bytes())?;
     writer.hash(intent.target_physical_parent_fingerprint().bytes())?;
+    writer.string(intent.target_recovery_fingerprint(), MAX_REPAIR_ID_BYTES)?;
     writer.string(intent.lock_identity(), MAX_REPAIR_ID_BYTES)?;
     writer.hash(intent.before_sha256().bytes())?;
     writer.hash(intent.after_sha256().bytes())?;
@@ -1172,6 +1214,7 @@ fn decode_repair_execution_intent(
     let scan_fingerprint = reader.string(MAX_REPAIR_ID_BYTES)?;
     let target_fingerprint = protocol_sha256(reader.hash()?)?;
     let target_physical_parent_fingerprint = protocol_sha256(reader.hash()?)?;
+    let target_recovery_fingerprint = reader.string(MAX_REPAIR_ID_BYTES)?;
     let lock_identity = reader.string(MAX_REPAIR_ID_BYTES)?;
     let before_sha256 = protocol_sha256(reader.hash()?)?;
     let after_sha256 = protocol_sha256(reader.hash()?)?;
@@ -1185,6 +1228,7 @@ fn decode_repair_execution_intent(
         scan_fingerprint,
         target_fingerprint,
         target_physical_parent_fingerprint,
+        target_recovery_fingerprint,
         lock_identity,
         before_sha256,
         after_sha256,
@@ -1929,6 +1973,8 @@ pub(super) enum WorkerResultCode {
     RepairTransactionStatusReady,
     #[cfg(feature = "experimental-repair-store")]
     RepairTransactionResolved,
+    #[cfg(feature = "experimental-repair-store")]
+    RepairVaultLiveIdentityReady,
 }
 
 impl WorkerResultCode {
@@ -2022,6 +2068,8 @@ impl WorkerResultCode {
             Self::RepairTransactionStatusReady => 72,
             #[cfg(feature = "experimental-repair-store")]
             Self::RepairTransactionResolved => 73,
+            #[cfg(feature = "experimental-repair-store")]
+            Self::RepairVaultLiveIdentityReady => 74,
         }
     }
 
@@ -2115,6 +2163,8 @@ impl WorkerResultCode {
             72 => Ok(Self::RepairTransactionStatusReady),
             #[cfg(feature = "experimental-repair-store")]
             73 => Ok(Self::RepairTransactionResolved),
+            #[cfg(feature = "experimental-repair-store")]
+            74 => Ok(Self::RepairVaultLiveIdentityReady),
             _ => Err(InternalWireError::InvalidFrame),
         }
     }
@@ -2170,6 +2220,8 @@ pub(super) struct WorkerResponse {
     pub(super) repair_released_bytes: Option<u64>,
     #[cfg(feature = "experimental-repair-store")]
     pub(super) repair_transaction_status: Option<Box<RepairTransactionStatusPayload>>,
+    #[cfg(feature = "experimental-repair-store")]
+    pub(super) repair_vault_live_identity: Option<WorkerRepairVaultLiveIdentity>,
 }
 
 impl WorkerResponse {
@@ -2189,6 +2241,8 @@ impl WorkerResponse {
             repair_released_bytes: None,
             #[cfg(feature = "experimental-repair-store")]
             repair_transaction_status: None,
+            #[cfg(feature = "experimental-repair-store")]
+            repair_vault_live_identity: None,
         }
     }
 
@@ -2208,6 +2262,8 @@ impl WorkerResponse {
             repair_released_bytes: None,
             #[cfg(feature = "experimental-repair-store")]
             repair_transaction_status: None,
+            #[cfg(feature = "experimental-repair-store")]
+            repair_vault_live_identity: None,
         }
     }
 
@@ -2227,6 +2283,8 @@ impl WorkerResponse {
             repair_released_bytes: None,
             #[cfg(feature = "experimental-repair-store")]
             repair_transaction_status: None,
+            #[cfg(feature = "experimental-repair-store")]
+            repair_vault_live_identity: None,
         }
     }
 
@@ -2298,6 +2356,16 @@ impl WorkerResponse {
         response
     }
 
+    #[cfg(feature = "experimental-repair-store")]
+    pub(super) fn repair_vault_live_identity(
+        request_id: u64,
+        identity: WorkerRepairVaultLiveIdentity,
+    ) -> Self {
+        let mut response = Self::new(request_id, WorkerResultCode::RepairVaultLiveIdentityReady);
+        response.repair_vault_live_identity = Some(identity);
+        response
+    }
+
     #[cfg(feature = "experimental-codex-home-lease")]
     pub(super) fn provider_codex_home_ready(request_id: u64) -> Self {
         Self::new(request_id, WorkerResultCode::ProviderCodexHomeReady)
@@ -2330,9 +2398,13 @@ impl WorkerResponse {
                 | WorkerResultCode::RepairTransactionResolved
         );
         #[cfg(feature = "experimental-repair-store")]
+        let repair_vault_live_identity_metadata =
+            self.code == WorkerResultCode::RepairVaultLiveIdentityReady;
+        #[cfg(feature = "experimental-repair-store")]
         if repair_metadata != self.repair_status.is_some()
             || repair_release_metadata != self.repair_released_bytes.is_some()
             || (!repair_transaction_metadata && self.repair_transaction_status.is_some())
+            || repair_vault_live_identity_metadata != self.repair_vault_live_identity.is_some()
             || (self.code == WorkerResultCode::RepairTransactionResolved
                 && self.repair_transaction_status.is_none())
             || self
@@ -2351,6 +2423,10 @@ impl WorkerResponse {
                 .repair_transaction_status
                 .as_deref()
                 .is_some_and(|status| validate_repair_transaction_status(status).is_err())
+            || self
+                .repair_vault_live_identity
+                .as_ref()
+                .is_some_and(|identity| identity.validate().is_err())
         {
             return Err(InternalWireError::InvalidFrame);
         }
@@ -2443,6 +2519,11 @@ impl WorkerResponse {
                 }
                 None => writer.u8(0)?,
             }
+        } else if let Some(identity) = self.repair_vault_live_identity.as_ref() {
+            let mut writer = ClosedFrameWriter::new(&mut bytes[REPAIR_PAYLOAD_OFFSET..]);
+            writer.string(&identity.vault_id, MAX_REPAIR_ID_BYTES)?;
+            writer.hash(identity.vault_identity_fingerprint)?;
+            writer.hash(identity.physical_parent_fingerprint)?;
         }
         Ok(bytes)
     }
@@ -2472,7 +2553,11 @@ impl WorkerResponse {
                 | WorkerResultCode::RepairTransactionResolved
         );
         #[cfg(feature = "experimental-repair-store")]
-        let repair_wire = repair_metadata || repair_transaction_metadata;
+        let repair_vault_live_identity_metadata =
+            code == WorkerResultCode::RepairVaultLiveIdentityReady;
+        #[cfg(feature = "experimental-repair-store")]
+        let repair_wire =
+            repair_metadata || repair_transaction_metadata || repair_vault_live_identity_metadata;
         #[cfg(not(feature = "experimental-repair-store"))]
         let repair_wire = false;
         let device_len = usize::from(bytes[9]);
@@ -2569,6 +2654,26 @@ impl WorkerResponse {
         } else {
             None
         };
+        #[cfg(feature = "experimental-repair-store")]
+        let repair_vault_live_identity = if repair_vault_live_identity_metadata {
+            let mut reader = ClosedFrameReader::new(
+                bytes
+                    .get(REPAIR_PAYLOAD_OFFSET..)
+                    .ok_or(InternalWireError::InvalidFrame)?,
+            );
+            let identity = WorkerRepairVaultLiveIdentity {
+                vault_id: reader.string(MAX_REPAIR_ID_BYTES)?,
+                vault_identity_fingerprint: reader.hash()?,
+                physical_parent_fingerprint: reader.hash()?,
+            };
+            identity.validate()?;
+            if !reader.remaining_is_zero() {
+                return Err(InternalWireError::InvalidFrame);
+            }
+            Some(identity)
+        } else {
+            None
+        };
         let response = Self {
             request_id,
             code,
@@ -2590,6 +2695,8 @@ impl WorkerResponse {
             repair_released_bytes: repair_release_metadata.then_some(value),
             #[cfg(feature = "experimental-repair-store")]
             repair_transaction_status,
+            #[cfg(feature = "experimental-repair-store")]
+            repair_vault_live_identity,
         };
         if response.encode()?.as_slice() != bytes {
             return Err(InternalWireError::InvalidFrame);
@@ -3014,6 +3121,7 @@ mod tests {
                 format!("scan:{}", "7".repeat(64)),
                 protocol_sha256([0x77; 32]).expect("target fingerprint"),
                 protocol_sha256([0x88; 32]).expect("target physical parent"),
+                format!("recovery:{}", "8".repeat(64)),
                 format!("lock:{}", "9".repeat(64)),
                 protocol_sha256(expected_hash).expect("before hash"),
                 protocol_sha256([0xaa; 32]).expect("after hash"),
@@ -3034,7 +3142,7 @@ mod tests {
         );
         let encoded = persist.encode().expect("repair persist frame");
         assert_eq!(encoded.len(), 2048);
-        assert_eq!(&encoded[..8], b"KRVWC005");
+        assert_eq!(&encoded[..8], b"KRVWC006");
         assert_eq!(WorkerCommand::decode(&encoded), Ok(persist));
 
         let mut noncanonical = encoded;
@@ -3051,7 +3159,7 @@ mod tests {
             WorkerResponse::repair(41, WorkerResultCode::RepairBackupDurable, durable.clone());
         let encoded = response.encode().expect("repair response frame");
         assert_eq!(encoded.len(), 2048);
-        assert_eq!(&encoded[..8], b"KRVWR005");
+        assert_eq!(&encoded[..8], b"KRVWR006");
         assert_eq!(WorkerResponse::decode(&encoded), Ok(response));
 
         let durable_protocol = durable.to_protocol().expect("durable protocol status");
@@ -3091,10 +3199,19 @@ mod tests {
         let resolved =
             RepairTransactionStatusPayload::resolved(pending.backup().clone(), resolution)
                 .expect("resolved transaction");
+        let live_command = WorkerCommand::repair(50, WorkerRepairCommand::VaultLiveParent);
+        let encoded = live_command.encode().expect("live Vault parent command");
+        assert_eq!(WorkerCommand::decode(&encoded), Ok(live_command));
+        let live_identity = WorkerRepairVaultLiveIdentity {
+            vault_id: format!("V-{}", "d".repeat(32)),
+            vault_identity_fingerprint: [0xdd; 32],
+            physical_parent_fingerprint: [0xee; 32],
+        };
         for response in [
             WorkerResponse::repair_transaction_status(47, None),
             WorkerResponse::repair_transaction_status(48, Some(pending)),
             WorkerResponse::repair_transaction_resolved(49, resolved),
+            WorkerResponse::repair_vault_live_identity(50, live_identity),
         ] {
             let encoded = response.encode().expect("transaction response frame");
             assert_eq!(WorkerResponse::decode(&encoded), Ok(response));

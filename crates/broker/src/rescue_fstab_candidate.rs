@@ -47,6 +47,7 @@ impl RescueTargetPhysicalParentGuard {
         SelectedTargetCapability::new(
             self.target_claims().target_id(),
             self.target_claims().scan_fingerprint(),
+            self.target_claims().recovery_fingerprint(),
             self.physical_parent_fingerprint(),
         )
     }
@@ -100,6 +101,10 @@ impl TrustedRescueFstabObservation {
 
     pub const fn metadata(&self) -> &RepairFileMetadataV1 {
         &self.metadata
+    }
+
+    pub(crate) fn target_recovery_fingerprint(&self) -> &str {
+        self.target.recovery_fingerprint()
     }
 }
 
@@ -281,6 +286,19 @@ pub struct ApprovedRescueFstabTransaction<TargetGuard, Reservation> {
     reservation: Reservation,
 }
 
+/// Crate-private one-shot material consumed by the closed production
+/// executor. Keeping this transfer private prevents callers from separating
+/// approval, target authority, backup bytes, and the live Vault reservation.
+pub(crate) struct ApprovedRescueFstabExecutionParts<TargetGuard, Reservation> {
+    pub(crate) plan: FstabCandidateTransactionPlan,
+    pub(crate) preview: DisableMissingUuidPreview,
+    pub(crate) backup_bytes: Zeroizing<Vec<u8>>,
+    pub(crate) metadata: RepairFileMetadataV1,
+    pub(crate) admission: RescueFstabCandidateAdmission,
+    pub(crate) target_guard: TargetGuard,
+    pub(crate) reservation: Reservation,
+}
+
 impl<TargetGuard, Reservation> ApprovedRescueFstabTransaction<TargetGuard, Reservation> {
     pub fn receipt(&self) -> &RescueFstabPreparedPlanReceipt {
         &self.receipt
@@ -326,6 +344,30 @@ impl<TargetGuard, Reservation> ApprovedRescueFstabTransaction<TargetGuard, Reser
 
     pub const fn reservation(&self) -> &Reservation {
         &self.reservation
+    }
+
+    pub(crate) fn into_execution_parts(
+        self,
+    ) -> ApprovedRescueFstabExecutionParts<TargetGuard, Reservation> {
+        let Self {
+            receipt: _,
+            plan,
+            preview,
+            backup_bytes,
+            metadata,
+            admission,
+            target_guard,
+            reservation,
+        } = self;
+        ApprovedRescueFstabExecutionParts {
+            plan,
+            preview,
+            backup_bytes,
+            metadata,
+            admission,
+            target_guard,
+            reservation,
+        }
     }
 }
 
@@ -460,6 +502,7 @@ where
         plan.vault().reservation_binding_sha256(),
         plan.vault().backup_locator(),
         plan.vault().vault_identity_fingerprint(),
+        plan.target().recovery_fingerprint(),
         plan.target().physical_parent_fingerprint(),
         plan.vault().physical_parent_fingerprint(),
         plan.vault().required_capacity_bytes(),
@@ -546,6 +589,7 @@ fn validate_approved_admission(
         || plan.diff_sha256() != receipt.diff_sha256()
         || plan.target().target_id() != intent.target_id()
         || plan.target().scan_fingerprint() != intent.scan_fingerprint()
+        || receipt.target_recovery_fingerprint() != plan.target().recovery_fingerprint()
     {
         return Err(RescueFstabPreflightError::AdmissionBindingMismatch);
     }
@@ -639,12 +683,16 @@ mod tests {
         format!("scan:{}", character.to_string().repeat(64))
     }
 
+    fn recovery(character: char) -> String {
+        format!("recovery:{}", character.to_string().repeat(64))
+    }
+
     fn observed() -> BTreeSet<String> {
         BTreeSet::from(["aaaa-bbbb".to_owned()])
     }
 
     fn target(parent: char) -> SelectedTargetCapability {
-        SelectedTargetCapability::new("target-01", scan('1'), hash(parent))
+        SelectedTargetCapability::new("target-01", scan('1'), recovery('7'), hash(parent))
             .expect("target capability")
     }
 

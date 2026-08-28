@@ -127,6 +127,12 @@ MAX_TARGET_FIELD_BYTES = 4 * 1024
 MAX_TARGET_RESPONSE_BYTES = 64 * 1024
 TARGET_SCAN_API_VERSION = "kernaid.dev/rescue-targets/v1alpha1"
 RESCUE_TARGET_FINGERPRINT_DOMAIN = "kernaid-rescue-observe-target-v1"
+RECOVERY_TARGET_FINGERPRINT_DOMAIN = b"kernaid-rescue-ext4-recovery-target-v1"
+RECOVERY_UUID = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+RECOVERY_DISK_ID = re.compile(r"^[A-Za-z0-9._:+-]{1,128}$")
 ALLOWED_HOSTS = {"127.0.0.1:4173", "localhost:4173"}
 ALLOWED_ORIGINS = {"http://127.0.0.1:4173", "http://localhost:4173"}
 CONTENT_SECURITY_POLICY = (
@@ -1360,6 +1366,89 @@ def _canonical_target_device(device: dict[str, object]) -> dict[str, object]:
     return {"identity": device["identity"], "children": canonical_children}
 
 
+def _stable_disk_identity(value: object, *, casefold: bool = False) -> str | None:
+    """Return one strict internal identity value without ever publishing it."""
+    if (
+        not isinstance(value, str)
+        or RECOVERY_DISK_ID.fullmatch(value) is None
+        or len(value.encode("ascii")) > 128
+    ):
+        return None
+    return value.casefold() if casefold else value
+
+
+def _stable_uuid(value: object) -> str | None:
+    if not isinstance(value, str) or RECOVERY_UUID.fullmatch(value) is None:
+        return None
+    return value.casefold()
+
+
+def _recovery_target_fingerprint(
+    disk: dict[str, object], candidate: dict[str, object]
+) -> str | None:
+    """Derive a reboot-stable digest from strong, non-public block claims.
+
+    Boot-local names, major/minor numbers and keyed target identifiers are
+    deliberately excluded. A partition additionally requires GPT and a
+    PARTUUID; every target requires an ext4 UUID and a disk WWN or serial.
+    """
+    disk_identity = disk.get("identity")
+    leaf_identity = candidate.get("identity")
+    if not isinstance(disk_identity, dict) or not isinstance(leaf_identity, dict):
+        return None
+    leaf_kind = candidate.get("kind")
+    disk_size = disk.get("size")
+    leaf_size = candidate.get("size")
+    filesystem_uuid = _stable_uuid(leaf_identity.get("uuid"))
+    disk_wwn = _stable_disk_identity(disk_identity.get("wwn"), casefold=True)
+    disk_serial = _stable_disk_identity(disk_identity.get("serial"))
+    if (
+        disk.get("kind") != "disk"
+        or leaf_kind not in {"disk", "part"}
+        or candidate.get("filesystem") != "ext4"
+        or not isinstance(disk_size, int)
+        or isinstance(disk_size, bool)
+        or disk_size <= 0
+        or not isinstance(leaf_size, int)
+        or isinstance(leaf_size, bool)
+        or leaf_size <= 0
+        or leaf_size > disk_size
+        or filesystem_uuid is None
+        or (disk_wwn is None and disk_serial is None)
+    ):
+        return None
+    partition_uuid: str | None = None
+    if leaf_kind == "part":
+        partition_uuid = _stable_uuid(leaf_identity.get("partuuid"))
+        if disk.get("partition_table") != "gpt" or partition_uuid is None:
+            return None
+    elif candidate is not disk:
+        return None
+
+    # Prefer the globally scoped WWN. The serial is a strict fallback only,
+    # which keeps the identity stable when both fields are available.
+    anchor_kind = "wwn" if disk_wwn is not None else "serial"
+    anchor_value = disk_wwn if disk_wwn is not None else disk_serial
+    claims = {
+        "diskAnchorKind": anchor_kind,
+        "diskAnchorValue": anchor_value,
+        "diskSizeBytes": disk_size,
+        "diskType": "disk",
+        "filesystem": "ext4",
+        "filesystemUuid": filesystem_uuid,
+        "leafSizeBytes": leaf_size,
+        "leafType": leaf_kind,
+        "partitionUuid": partition_uuid,
+    }
+    canonical = json.dumps(
+        claims, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    ).encode("ascii")
+    digest = hashlib.sha256(
+        RECOVERY_TARGET_FINGERPRINT_DOMAIN + b"\0" + canonical
+    ).hexdigest()
+    return f"recovery:{digest}"
+
+
 def _walk_target_devices(device: dict[str, object]) -> list[dict[str, object]]:
     children = device["children"]
     if not isinstance(children, list):
@@ -1732,6 +1821,12 @@ def _normalize_installed_targets_with_resolutions(
             ):
                 raise TargetScanError("Topologia normalizzata non valida.")
             direct_child = any(child is candidate for child in disk_children)
+            recovery_fingerprint = (
+                _recovery_target_fingerprint(disk, candidate)
+                if not candidate_children
+                and (candidate is disk or direct_child)
+                else None
+            )
             topology_kinds = sorted(
                 {
                     str(node["kind"])
@@ -1753,12 +1848,28 @@ def _normalize_installed_targets_with_resolutions(
                 "kernelKind": candidate["kind"],
                 "leaf": not candidate_children,
                 "directOnDisk": candidate is disk or direct_child,
+                "recoveryFingerprint": recovery_fingerprint,
+                "recoveryUnique": False,
                 "topologyKinds": topology_kinds,
                 "topologyFilesystems": topology_filesystems,
                 "associatedEfiSystemPartition": _associated_efi_system_partition(
                     disk, candidate
                 ),
             }
+
+    recovery_counts: dict[str, int] = {}
+    for resolution in resolutions.values():
+        recovery_fingerprint = resolution.get("recoveryFingerprint")
+        if isinstance(recovery_fingerprint, str):
+            recovery_counts[recovery_fingerprint] = (
+                recovery_counts.get(recovery_fingerprint, 0) + 1
+            )
+    for resolution in resolutions.values():
+        recovery_fingerprint = resolution.get("recoveryFingerprint")
+        resolution["recoveryUnique"] = (
+            isinstance(recovery_fingerprint, str)
+            and recovery_counts.get(recovery_fingerprint) == 1
+        )
 
     snapshot: dict[str, object] = {
         "apiVersion": TARGET_SCAN_API_VERSION,
@@ -1870,6 +1981,69 @@ def resolve_installed_target(
         raise TargetSelectionError(
             "Il target non è più disponibile in modalità Observe; ripetere la selezione."
         )
+    candidate = resolution.get("candidate")
+    canonical_target_candidate(candidate)
+    selection = {
+        "apiVersion": TARGET_SCAN_API_VERSION,
+        "status": "observe-target-validated",
+        "scanFingerprint": snapshot["scanFingerprint"],
+        "target": candidate,
+        "claims": {
+            "installedOsConfirmed": False,
+            "filesystemContentInspected": False,
+            "mountOperationPerformed": False,
+            "mutationPerformed": False,
+        },
+    }
+    return selection, resolution
+
+
+def valid_recovery_target_fingerprint(value: object) -> bool:
+    if not isinstance(value, str) or not value.startswith("recovery:"):
+        return False
+    digest = value.removeprefix("recovery:")
+    return len(digest) == 64 and all(
+        character in "0123456789abcdef" for character in digest
+    )
+
+
+def resolve_recovery_target(
+    request: dict[str, object], deadline: float | None = None
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Reacquire exactly one target from a reboot-stable opaque digest.
+
+    The digest is the only caller-provided target selector. Fresh boot-local
+    claims are returned internally with the resolution; raw stable claims and
+    device paths never cross this boundary.
+    """
+    _check_deadline(deadline)
+    if set(request) != {"recoveryFingerprint"} or not valid_recovery_target_fingerprint(
+        request.get("recoveryFingerprint")
+    ):
+        raise TargetSelectionError(
+            "Richiesta di recupero del target non valida.", status=400
+        )
+    requested = request["recoveryFingerprint"]
+    if not TARGET_SCAN_LOCK.acquire(blocking=False):
+        raise TargetScanBusy("Scansione dei target già in corso; riprovare.")
+    try:
+        snapshot, resolutions = _normalize_installed_targets_with_resolutions(
+            _target_scan_output(deadline)
+        )
+    finally:
+        TARGET_SCAN_LOCK.release()
+    _check_deadline(deadline)
+    matches = [
+        resolution
+        for resolution in resolutions.values()
+        if resolution.get("recoveryFingerprint") == requested
+        and resolution.get("recoveryUnique") is True
+    ]
+    if len(matches) != 1:
+        raise TargetSelectionError(
+            "Il target di recupero non è disponibile in modo univoco."
+        )
+    resolution = matches[0]
     candidate = resolution.get("candidate")
     canonical_target_candidate(candidate)
     selection = {

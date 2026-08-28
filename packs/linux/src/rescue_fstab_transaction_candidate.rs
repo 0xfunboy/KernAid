@@ -17,7 +17,7 @@ use crate::{
 use sha2::{Digest, Sha256};
 
 const PLAN_HASH_DOMAIN: &[u8] =
-    b"kernaid:linux.fstab.disable-missing-uuid.v1:transaction-plan:v3\0";
+    b"kernaid:linux.fstab.disable-missing-uuid.v1:transaction-plan:v4\0";
 const MAX_ID_BYTES: usize = 128;
 const MAX_OPAQUE_BYTES: usize = 96;
 
@@ -46,6 +46,7 @@ pub enum CandidateTransactionError {
 pub struct SelectedTargetCapability {
     target_id: String,
     scan_fingerprint: String,
+    recovery_fingerprint: String,
     physical_parent_fingerprint: String,
 }
 
@@ -53,11 +54,13 @@ impl SelectedTargetCapability {
     pub fn new(
         target_id: impl Into<String>,
         scan_fingerprint: impl Into<String>,
+        recovery_fingerprint: impl Into<String>,
         physical_parent_fingerprint: impl Into<String>,
     ) -> Result<Self, CandidateTransactionError> {
         let value = Self {
             target_id: target_id.into(),
             scan_fingerprint: scan_fingerprint.into(),
+            recovery_fingerprint: recovery_fingerprint.into(),
             physical_parent_fingerprint: physical_parent_fingerprint.into(),
         };
         if !valid_opaque_id(&value.target_id) {
@@ -65,6 +68,9 @@ impl SelectedTargetCapability {
         }
         if !valid_scan_fingerprint(&value.scan_fingerprint) {
             return Err(CandidateTransactionError::InvalidScanFingerprint);
+        }
+        if !valid_recovery_fingerprint(&value.recovery_fingerprint) {
+            return Err(CandidateTransactionError::InvalidFingerprint);
         }
         if !valid_sha256(&value.physical_parent_fingerprint) {
             return Err(CandidateTransactionError::InvalidFingerprint);
@@ -77,6 +83,9 @@ impl SelectedTargetCapability {
     }
     pub fn scan_fingerprint(&self) -> &str {
         &self.scan_fingerprint
+    }
+    pub fn recovery_fingerprint(&self) -> &str {
+        &self.recovery_fingerprint
     }
     pub fn physical_parent_fingerprint(&self) -> &str {
         &self.physical_parent_fingerprint
@@ -447,6 +456,7 @@ impl FstabCandidateTransactionPlan {
         for value in [
             self.target.target_id.as_str(),
             self.target.scan_fingerprint.as_str(),
+            self.target.recovery_fingerprint.as_str(),
             self.target.physical_parent_fingerprint.as_str(),
             self.vault.vault_id.as_str(),
             self.vault.reservation_id.as_str(),
@@ -519,6 +529,12 @@ fn valid_scan_fingerprint(value: &str) -> bool {
     value.strip_prefix("scan:").is_some_and(valid_lower_hex_64)
 }
 
+fn valid_recovery_fingerprint(value: &str) -> bool {
+    value
+        .strip_prefix("recovery:")
+        .is_some_and(valid_lower_hex_64)
+}
+
 fn valid_lower_hex_64(value: &str) -> bool {
     value.len() == 64
         && value
@@ -577,6 +593,9 @@ mod tests {
     fn scan(c: char) -> String {
         format!("scan:{}", c.to_string().repeat(64))
     }
+    fn recovery(c: char) -> String {
+        format!("recovery:{}", c.to_string().repeat(64))
+    }
     fn preview() -> DisableMissingUuidPreview {
         preview_disable_missing_uuid(
             b"UUID=AAAA-BBBB / ext4 defaults 0 1\nUUID=DEAD-BEEF /srv/archive ext4 defaults 0 2\n",
@@ -610,7 +629,8 @@ mod tests {
         CandidatePlanClaims::admit(input()).expect("claims")
     }
     fn target(scan_hash: char, parent: char) -> SelectedTargetCapability {
-        SelectedTargetCapability::new("target-01", scan(scan_hash), hash(parent)).expect("target")
+        SelectedTargetCapability::new("target-01", scan(scan_hash), recovery('7'), hash(parent))
+            .expect("target")
     }
     fn vault(
         locator: &str,
@@ -689,6 +709,7 @@ mod tests {
         assert_eq!(plan.claims().redaction_policy_id(), REDACTION_POLICY_ID);
         assert_eq!(plan.target().target_id(), "target-01");
         assert_eq!(plan.target().scan_fingerprint(), scan('1'));
+        assert_eq!(plan.target().recovery_fingerprint(), recovery('7'));
         assert_eq!(plan.target().physical_parent_fingerprint(), hash('a'));
         assert_eq!(plan.vault().vault_id(), "vault-01");
         assert_eq!(plan.vault().reservation_id(), "B-before");
@@ -732,13 +753,17 @@ mod tests {
         }
         for bad in [hash('1'), "scan:abcd".into(), scan('A'), scan('g')] {
             assert_eq!(
-                SelectedTargetCapability::new("target", bad, hash('a')),
+                SelectedTargetCapability::new("target", bad, recovery('7'), hash('a')),
                 Err(CandidateTransactionError::InvalidScanFingerprint)
             );
         }
         assert_eq!(
-            SelectedTargetCapability::new("/dev/sda2", scan('1'), hash('a')),
+            SelectedTargetCapability::new("/dev/sda2", scan('1'), recovery('7'), hash('a'),),
             Err(CandidateTransactionError::InvalidCapability)
+        );
+        assert_eq!(
+            SelectedTargetCapability::new("target", scan('1'), "recovery:abcd", hash('a')),
+            Err(CandidateTransactionError::InvalidFingerprint)
         );
     }
 
@@ -989,6 +1014,17 @@ mod tests {
                     .expect("drift plan");
             assert_ne!(base.plan_sha256(), changed.plan_sha256());
         }
+
+        let recovery_changed = FstabCandidateTransactionPlan::stage(
+            &preview(),
+            claims(),
+            SelectedTargetCapability::new("target-01", scan('1'), recovery('8'), hash('a'))
+                .expect("changed recovery target"),
+            vault("vault://repair/B-before", '2', 'b', 4096, 8192),
+            evidence('3', '4'),
+        )
+        .expect("recovery drift plan");
+        assert_ne!(base.plan_sha256(), recovery_changed.plan_sha256());
 
         let mut changed_reservation = base.clone();
         changed_reservation.vault.reservation_id = "B-other".into();

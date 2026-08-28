@@ -223,6 +223,7 @@ pub struct RescueFstabPreparedPlanReceipt {
     reservation_binding_sha256: String,
     backup_locator: String,
     vault_identity_fingerprint: String,
+    target_recovery_fingerprint: String,
     target_physical_parent_fingerprint: String,
     vault_physical_parent_fingerprint: String,
     required_capacity_bytes: u64,
@@ -243,6 +244,7 @@ impl RescueFstabPreparedPlanReceipt {
         reservation_binding_sha256: impl Into<String>,
         backup_locator: impl Into<String>,
         vault_identity_fingerprint: impl Into<String>,
+        target_recovery_fingerprint: impl Into<String>,
         target_physical_parent_fingerprint: impl Into<String>,
         vault_physical_parent_fingerprint: impl Into<String>,
         required_capacity_bytes: u64,
@@ -261,6 +263,7 @@ impl RescueFstabPreparedPlanReceipt {
             reservation_binding_sha256: reservation_binding_sha256.into(),
             backup_locator: backup_locator.into(),
             vault_identity_fingerprint: vault_identity_fingerprint.into(),
+            target_recovery_fingerprint: target_recovery_fingerprint.into(),
             target_physical_parent_fingerprint: target_physical_parent_fingerprint.into(),
             vault_physical_parent_fingerprint: vault_physical_parent_fingerprint.into(),
             required_capacity_bytes,
@@ -298,6 +301,9 @@ impl RescueFstabPreparedPlanReceipt {
         }
         if !valid_sha256(&self.vault_identity_fingerprint) {
             return Err(RescueRepairProtocolError::InvalidVaultIdentity);
+        }
+        if !valid_recovery_fingerprint(&self.target_recovery_fingerprint) {
+            return Err(RescueRepairProtocolError::InvalidTargetId);
         }
         if !valid_sha256(&self.target_physical_parent_fingerprint)
             || !valid_sha256(&self.vault_physical_parent_fingerprint)
@@ -352,6 +358,9 @@ impl RescueFstabPreparedPlanReceipt {
     pub fn vault_identity_fingerprint(&self) -> &str {
         &self.vault_identity_fingerprint
     }
+    pub fn target_recovery_fingerprint(&self) -> &str {
+        &self.target_recovery_fingerprint
+    }
     pub fn target_physical_parent_fingerprint(&self) -> &str {
         &self.target_physical_parent_fingerprint
     }
@@ -380,6 +389,12 @@ fn valid_sha256(value: &str) -> bool {
 
 fn valid_scan_fingerprint(value: &str) -> bool {
     value.strip_prefix("scan:").is_some_and(valid_lower_hex_64)
+}
+
+fn valid_recovery_fingerprint(value: &str) -> bool {
+    value
+        .strip_prefix("recovery:")
+        .is_some_and(valid_lower_hex_64)
 }
 
 fn valid_lower_hex_64(value: &str) -> bool {
@@ -462,6 +477,7 @@ mod tests {
             hash('6'),
             "vault://repair/B-backup-01",
             hash('7'),
+            format!("recovery:{}", "a".repeat(64)),
             hash('8'),
             hash('9'),
             4096,
@@ -478,6 +494,10 @@ mod tests {
         assert_eq!(receipt.diff_sha256(), hash('b'));
         assert_eq!(receipt.reservation_id(), "B-backup-01");
         assert_eq!(receipt.backup_locator(), "vault://repair/B-backup-01");
+        assert_eq!(
+            receipt.target_recovery_fingerprint(),
+            format!("recovery:{}", "a".repeat(64))
+        );
         assert_eq!(receipt.outcome(), RESCUE_FSTAB_READY_OUTCOME);
 
         assert_eq!(
@@ -491,6 +511,7 @@ mod tests {
                 hash('6'),
                 "vault://repair/B-backup-01",
                 hash('7'),
+                format!("recovery:{}", "a".repeat(64)),
                 hash('8'),
                 hash('9'),
                 4096,

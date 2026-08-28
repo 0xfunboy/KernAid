@@ -357,6 +357,14 @@ trait WorkerBoundary: Send + Sync {
         Err(RescueVaultDaemonError::ProtocolFailure)
     }
     #[cfg(feature = "experimental-repair-store")]
+    fn repair_vault_live_identity(
+        &self,
+        deadline: Instant,
+    ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
+        let _ = deadline;
+        Err(RescueVaultDaemonError::ProtocolFailure)
+    }
+    #[cfg(feature = "experimental-repair-store")]
     fn repair_transaction_resolve(
         &self,
         expected: &RepairTransactionStatusPayload,
@@ -497,6 +505,14 @@ impl WorkerBoundary for WorkerHandle {
         deadline: Instant,
     ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
         WorkerHandle::repair_transaction_status(self, selector, deadline)
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    fn repair_vault_live_identity(
+        &self,
+        deadline: Instant,
+    ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
+        WorkerHandle::repair_vault_live_identity(self, deadline)
     }
 
     #[cfg(feature = "experimental-repair-store")]
@@ -2372,6 +2388,10 @@ impl Supervisor {
                 self.handle_repair_transaction_status(request, started, &connection)
             }
             #[cfg(feature = "experimental-repair-store")]
+            Operation::RepairVaultLiveParent => {
+                self.handle_repair_vault_live_identity(request, started, &connection)
+            }
+            #[cfg(feature = "experimental-repair-store")]
             Operation::RepairTransactionResolve => {
                 self.handle_repair_transaction_resolve(request, started, &connection)
             }
@@ -3283,6 +3303,58 @@ impl Supervisor {
                     && matches!(selector, RepairTransactionStatusSelector::Exact { .. }) =>
             {
                 self.finish_application_read(request, Err(ErrorToken::Absent), deadline)
+            }
+            Ok(response) => self.finish_repair_error(request, response.code, false, deadline),
+            Err(_) => self.repair_worker_fault(request, deadline),
+        }
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    fn handle_repair_vault_live_identity(
+        self: &Arc<Self>,
+        request: ValidatedRequest,
+        started: Instant,
+        connection: &ClientConnection<'_>,
+    ) -> (u64, HandlerResult) {
+        let deadline = started
+            .checked_add(WORKER_OPERATION_TIMEOUT)
+            .unwrap_or(started);
+        if !matches!(request.payload(), RequestPayload::Empty) {
+            let version = self.snapshot().version;
+            return (version, HandlerResult::Error(request, ErrorToken::IoFailed));
+        }
+        if let Err((version, error)) = self.prepare_application_operation(
+            request.expected_state_version(),
+            false,
+            connection,
+            deadline,
+        ) {
+            return (version, HandlerResult::Error(request, error));
+        }
+        let Some(worker) = self.worker.as_ref() else {
+            self.mark_fault_by(deadline);
+            return (
+                self.snapshot().version,
+                HandlerResult::Error(request, ErrorToken::RebootRequired),
+            );
+        };
+        match worker.repair_vault_live_identity(deadline) {
+            Ok(response)
+                if response.code
+                    == internal_wire::WorkerResultCode::RepairVaultLiveIdentityReady =>
+            {
+                let Some(identity) = response.repair_vault_live_identity else {
+                    return self.repair_worker_fault(request, deadline);
+                };
+                let identity = identity.to_protocol();
+                match identity {
+                    Ok(identity) => self.finish_application_read(
+                        request,
+                        Ok(SuccessPayload::RepairVaultLiveIdentity(identity)),
+                        deadline,
+                    ),
+                    Err(_) => self.repair_worker_fault(request, deadline),
+                }
             }
             Ok(response) => self.finish_repair_error(request, response.code, false, deadline),
             Err(_) => self.repair_worker_fault(request, deadline),
@@ -5739,6 +5811,7 @@ fn external_operation_is_enabled(
                 | Operation::RepairBackupRetire
                 | Operation::RepairTransactionStatus
                 | Operation::RepairTransactionResolve
+                | Operation::RepairVaultLiveParent
         ),
     }
 }

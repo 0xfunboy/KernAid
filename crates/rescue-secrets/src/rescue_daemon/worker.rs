@@ -761,6 +761,38 @@ fn handle_command(
             (response, false)
         }
         #[cfg(feature = "experimental-repair-store")]
+        Command::RepairVaultLiveParent => {
+            if descriptor.is_some() {
+                return (
+                    internal_wire::WorkerResponse::new(request_id, Result::RepairInvalidRequest),
+                    false,
+                );
+            }
+            if !matches!(
+                command.repair.as_ref(),
+                Some(internal_wire::WorkerRepairCommand::VaultLiveParent)
+            ) {
+                return (
+                    internal_wire::WorkerResponse::new(request_id, Result::RepairInvalidRequest),
+                    false,
+                );
+            }
+            let identity = match state {
+                WorkerVaultState::Locked => Err(Result::Busy),
+                WorkerVaultState::Unlocked(_) if validate_no_active_swap().is_err() => {
+                    Err(Result::CleanupFailed)
+                }
+                WorkerVaultState::Unlocked(mounted) => repair_vault_live_identity(mounted),
+            };
+            let response = match identity {
+                Ok(identity) => {
+                    internal_wire::WorkerResponse::repair_vault_live_identity(request_id, identity)
+                }
+                Err(code) => internal_wire::WorkerResponse::new(request_id, code),
+            };
+            (response, false)
+        }
+        #[cfg(feature = "experimental-repair-store")]
         Command::RepairTransactionResolve => {
             if descriptor.is_some() {
                 return (
@@ -1195,6 +1227,7 @@ fn reserve_repair_backup(
         draft.session_id.clone(),
         draft.target_id.clone(),
         draft.target_fingerprint,
+        draft.target_recovery_fingerprint.clone(),
         draft.expected_backup_sha256,
         draft.metadata_sha256,
         draft.backup_size,
@@ -1418,6 +1451,25 @@ fn repair_transaction_status(
         .map_err(map_repair_store_error)?
         .transaction_status(selector)
         .map_err(map_repair_store_error)
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn repair_vault_live_identity(
+    mounted: &MountedRescueVault,
+) -> Result<internal_wire::WorkerRepairVaultLiveIdentity, internal_wire::WorkerResultCode> {
+    let store = mounted
+        .secrets()
+        .open_repair_store()
+        .map_err(map_repair_store_error)?;
+    let identity = store.live_identity().map_err(map_repair_store_error)?;
+    let wire = internal_wire::WorkerRepairVaultLiveIdentity {
+        vault_id: identity.vault_id().to_owned(),
+        vault_identity_fingerprint: parse_store_sha256(identity.vault_identity_fingerprint())?,
+        physical_parent_fingerprint: parse_store_sha256(identity.physical_parent_fingerprint())?,
+    };
+    wire.to_protocol()
+        .map_err(|_| internal_wire::WorkerResultCode::RepairStorageUnavailable)?;
+    Ok(wire)
 }
 
 #[cfg(feature = "experimental-repair-store")]

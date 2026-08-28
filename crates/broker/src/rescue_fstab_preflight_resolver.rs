@@ -13,7 +13,8 @@ use crate::{
     },
     rescue_fstab_observer::{RescueFstabObservationError, observe_rescue_fstab},
     target_capability_client::{
-        RescueTargetCapabilityClaims, TargetCapabilityClientError, acquire_rescue_target_capability,
+        RescueTargetCapabilityClaims, TargetCapabilityClientError,
+        acquire_rescue_target_capability, reacquire_rescue_target_capability,
     },
     target_physical_parent::{RescueTargetPhysicalParentGuard, TargetPhysicalParentError},
 };
@@ -24,7 +25,9 @@ use kernaid_linux_pack::{
 };
 use kernaid_protocol::{
     rescue_repair::RescueFstabPreflightIntent,
-    rescue_repair_vault::{RepairBackupDraft, RepairBackupState, RepairBackupStatusPayload},
+    rescue_repair_vault::{
+        RepairBackupDraft, RepairBackupState, RepairBackupStatusPayload, RepairExecutionIntentV1,
+    },
     rescue_vault::{RequestId, Sha256},
 };
 use rustix::rand::{GetRandomFlags, getrandom};
@@ -39,7 +42,7 @@ const REPAIR_BACKUP_CAPACITY_BYTES: u64 = 4096;
 // retains a bounded window in which the persistent reservation can be
 // cancelled using the caller's original deadline.
 const RESERVATION_CLEANUP_BUDGET: Duration = Duration::from_secs(2);
-const LOCK_ID_DOMAIN: &[u8] = b"kernaid:rescue-fstab:target-lock:v1\0";
+const LOCK_ID_DOMAIN: &[u8] = b"kernaid:rescue-fstab:target-lock:v2\0";
 
 /// Stateful production resolver. The Repair Vault client remains here until a
 /// reserve succeeds, so an ambiguous reserve response retains the exact
@@ -108,6 +111,40 @@ impl fmt::Debug for ProductionRescueFstabTargetGuard {
             .field("lock_identity", &"[opaque domain-separated digest]")
             .finish()
     }
+}
+
+/// Reacquires a target after reboot exclusively through its approval-bound
+/// stable recovery fingerprint. Every boot-local claim is accepted only as a
+/// fresh claim from the root-owned handoff and is never compared with stale
+/// IDs from the prior boot.
+pub(crate) fn reacquire_target_for_recovery(
+    intent: &RepairExecutionIntentV1,
+    deadline: Instant,
+) -> Result<ProductionRescueFstabTargetGuard, RescueFstabCapabilityResolutionError> {
+    ensure_deadline(deadline)?;
+    let request_id = fresh_request_id()?;
+    let capability = reacquire_rescue_target_capability(
+        &request_id,
+        intent.target_recovery_fingerprint(),
+        deadline,
+    )
+    .map_err(map_target_client_error)?;
+    let target = capability
+        .bind_physical_parent()
+        .map_err(map_physical_parent_error)?;
+    ensure_deadline(deadline)?;
+    target.revalidate().map_err(map_physical_parent_error)?;
+    let claims = target.target_claims();
+    let lock_identity = lock_identity(claims);
+    if claims.recovery_fingerprint() != intent.target_recovery_fingerprint()
+        || lock_identity != intent.lock_identity()
+    {
+        return Err(RescueFstabCapabilityResolutionError::IdentityChanged);
+    }
+    Ok(ProductionRescueFstabTargetGuard {
+        target,
+        lock_identity,
+    })
 }
 
 /// Non-cloneable live Repair Vault reservation. It retains both the stateful
@@ -195,8 +232,7 @@ impl RescueFstabPreflightCapabilityResolver for ProductionRescueFstabPreflightRe
         validate_target_binding(intent, target.target_claims())?;
         target.revalidate().map_err(map_physical_parent_error)?;
         ensure_deadline(deadline)?;
-        let lock_identity =
-            lock_identity(target.target_claims(), target.physical_parent_fingerprint());
+        let lock_identity = lock_identity(target.target_claims());
         Ok(ProductionRescueFstabTargetGuard {
             target,
             lock_identity,
@@ -306,6 +342,7 @@ fn repair_backup_draft(
         intent.session_id(),
         intent.target_id(),
         target_fingerprint,
+        observation.target_recovery_fingerprint(),
         raw_digest(observation.fstab_bytes()),
         observation.metadata().canonical_sha256(),
         backup_size,
@@ -382,46 +419,19 @@ fn parse_prefixed_sha256(value: &str) -> Result<Sha256, RescueFstabCapabilityRes
         })
 }
 
-fn lock_identity(claims: &RescueTargetCapabilityClaims, parent_fingerprint: &str) -> String {
-    lock_identity_from_fields(
-        claims.target_id(),
-        claims.target_fingerprint(),
-        claims.scan_fingerprint(),
-        parent_fingerprint,
-    )
+fn lock_identity(claims: &RescueTargetCapabilityClaims) -> String {
+    lock_identity_for_resource(claims.recovery_fingerprint(), RESOURCE_ID)
 }
 
-fn lock_identity_from_fields(
-    target_id: &str,
-    target_fingerprint: &str,
-    scan_fingerprint: &str,
-    parent_fingerprint: &str,
-) -> String {
-    lock_identity_for_resource(
-        target_id,
-        target_fingerprint,
-        scan_fingerprint,
-        parent_fingerprint,
-        RESOURCE_ID,
-    )
+#[cfg(test)]
+fn lock_identity_from_recovery_fingerprint(recovery_fingerprint: &str) -> String {
+    lock_identity_for_resource(recovery_fingerprint, RESOURCE_ID)
 }
 
-fn lock_identity_for_resource(
-    target_id: &str,
-    target_fingerprint: &str,
-    scan_fingerprint: &str,
-    parent_fingerprint: &str,
-    resource_id: &str,
-) -> String {
+fn lock_identity_for_resource(recovery_fingerprint: &str, resource_id: &str) -> String {
     let mut hasher = Sha256Hasher::new();
     hasher.update(LOCK_ID_DOMAIN);
-    for value in [
-        target_id,
-        target_fingerprint,
-        scan_fingerprint,
-        parent_fingerprint,
-        resource_id,
-    ] {
+    for value in [recovery_fingerprint, resource_id] {
         hasher.update((value.len() as u64).to_be_bytes());
         hasher.update(value.as_bytes());
     }
@@ -606,6 +616,7 @@ mod tests {
             SelectedTargetCapability::new(
                 format!("target:{}", "2".repeat(64)),
                 format!("scan:{}", "3".repeat(64)),
+                format!("recovery:{}", "7".repeat(64)),
                 hash('6'),
             )
             .expect("target"),
@@ -693,39 +704,20 @@ mod tests {
             "R-abababab-abab-abab-abab-abababababab"
         );
 
-        let target_id = format!("target:{}", "3".repeat(64));
-        let target_fingerprint = hash('2');
-        let scan_fingerprint = format!("scan:{}", "1".repeat(64));
-        let parent_fingerprint = hash('4');
-        let first = lock_identity_from_fields(
-            &target_id,
-            &target_fingerprint,
-            &scan_fingerprint,
-            &parent_fingerprint,
-        );
-        let same_target_new_request = lock_identity_from_fields(
-            &target_id,
-            &target_fingerprint,
-            &scan_fingerprint,
-            &parent_fingerprint,
-        );
-        let changed_parent = lock_identity_from_fields(
-            &target_id,
-            &target_fingerprint,
-            &scan_fingerprint,
-            &hash('5'),
-        );
+        let recovery_fingerprint = format!("recovery:{}", "7".repeat(64));
+        let first = lock_identity_from_recovery_fingerprint(&recovery_fingerprint);
+        let same_target_new_request =
+            lock_identity_from_recovery_fingerprint(&recovery_fingerprint);
+        let changed_recovery =
+            lock_identity_from_recovery_fingerprint(&format!("recovery:{}", "8".repeat(64)));
         let changed_resource = lock_identity_for_resource(
-            &target_id,
-            &target_fingerprint,
-            &scan_fingerprint,
-            &parent_fingerprint,
+            &recovery_fingerprint,
             "rescue:selected-linux-root:other-resource",
         );
         assert_eq!(first.len(), 69);
         assert!(first.starts_with("lock:"));
         assert_eq!(first, same_target_new_request);
-        assert_ne!(first, changed_parent);
+        assert_ne!(first, changed_recovery);
         assert_ne!(first, changed_resource);
         assert!(!first.contains('/'));
         assert!(

@@ -129,6 +129,7 @@ pub struct RepairBackupDraft {
     session_id: String,
     target_id: String,
     target_fingerprint: Sha256,
+    target_recovery_fingerprint: String,
     expected_backup_sha256: Sha256,
     metadata_sha256: Sha256,
     backup_size: u64,
@@ -141,6 +142,7 @@ impl RepairBackupDraft {
         session_id: impl Into<String>,
         target_id: impl Into<String>,
         target_fingerprint: Sha256,
+        target_recovery_fingerprint: impl Into<String>,
         expected_backup_sha256: Sha256,
         metadata_sha256: Sha256,
         backup_size: u64,
@@ -150,6 +152,7 @@ impl RepairBackupDraft {
             session_id: session_id.into(),
             target_id: target_id.into(),
             target_fingerprint,
+            target_recovery_fingerprint: target_recovery_fingerprint.into(),
             expected_backup_sha256,
             metadata_sha256,
             backup_size,
@@ -157,6 +160,7 @@ impl RepairBackupDraft {
         };
         if !valid_prefixed_id(&value.session_id, "S-")
             || !valid_opaque_id(&value.target_id)
+            || !valid_digest_id(&value.target_recovery_fingerprint, "recovery:")
             || !(1..=MAX_REPAIR_BACKUP_BYTES).contains(&value.backup_size)
             || !(value.backup_size..=MAX_REPAIR_RESERVED_BYTES)
                 .contains(&value.required_capacity_bytes)
@@ -174,6 +178,9 @@ impl RepairBackupDraft {
     }
     pub fn target_fingerprint(&self) -> &Sha256 {
         &self.target_fingerprint
+    }
+    pub fn target_recovery_fingerprint(&self) -> &str {
+        &self.target_recovery_fingerprint
     }
     pub fn expected_backup_sha256(&self) -> &Sha256 {
         &self.expected_backup_sha256
@@ -202,6 +209,7 @@ pub fn canonical_repair_draft_binding_sha256(draft: &RepairBackupDraft) -> Sha25
     hash_field(&mut hasher, draft.session_id.as_bytes());
     hash_field(&mut hasher, draft.target_id.as_bytes());
     hash_field(&mut hasher, &draft.target_fingerprint.bytes());
+    hash_field(&mut hasher, draft.target_recovery_fingerprint.as_bytes());
     hash_field(&mut hasher, &draft.expected_backup_sha256.bytes());
     hash_field(&mut hasher, &draft.metadata_sha256.bytes());
     hash_field(&mut hasher, &draft.backup_size.to_be_bytes());
@@ -225,6 +233,7 @@ pub struct RepairExecutionIntentV1 {
     scan_fingerprint: String,
     target_fingerprint: Sha256,
     target_physical_parent_fingerprint: Sha256,
+    target_recovery_fingerprint: String,
     lock_identity: String,
     before_sha256: Sha256,
     after_sha256: Sha256,
@@ -242,6 +251,7 @@ impl RepairExecutionIntentV1 {
         scan_fingerprint: impl Into<String>,
         target_fingerprint: Sha256,
         target_physical_parent_fingerprint: Sha256,
+        target_recovery_fingerprint: impl Into<String>,
         lock_identity: impl Into<String>,
         before_sha256: Sha256,
         after_sha256: Sha256,
@@ -257,6 +267,7 @@ impl RepairExecutionIntentV1 {
             scan_fingerprint: scan_fingerprint.into(),
             target_fingerprint,
             target_physical_parent_fingerprint,
+            target_recovery_fingerprint: target_recovery_fingerprint.into(),
             lock_identity: lock_identity.into(),
             before_sha256,
             after_sha256,
@@ -289,6 +300,9 @@ impl RepairExecutionIntentV1 {
     pub fn target_physical_parent_fingerprint(&self) -> &Sha256 {
         &self.target_physical_parent_fingerprint
     }
+    pub fn target_recovery_fingerprint(&self) -> &str {
+        &self.target_recovery_fingerprint
+    }
     pub fn lock_identity(&self) -> &str {
         &self.lock_identity
     }
@@ -319,6 +333,7 @@ impl RepairExecutionIntentV1 {
             || !(1..=MAX_SAFE_JSON_INTEGER).contains(&self.approval_sequence)
             || !valid_opaque_id(&self.target_id)
             || !valid_digest_id(&self.scan_fingerprint, "scan:")
+            || !valid_digest_id(&self.target_recovery_fingerprint, "recovery:")
             || !valid_digest_id(&self.lock_identity, "lock:")
             || self.before_sha256 == self.after_sha256
             || self.before_metadata.validate().is_err()
@@ -343,6 +358,7 @@ pub fn canonical_repair_execution_intent_sha256(intent: &RepairExecutionIntentV1
         &mut hasher,
         &intent.target_physical_parent_fingerprint.bytes(),
     );
+    hash_field(&mut hasher, intent.target_recovery_fingerprint.as_bytes());
     hash_field(&mut hasher, intent.lock_identity.as_bytes());
     hash_field(&mut hasher, &intent.before_sha256.bytes());
     hash_field(&mut hasher, &intent.after_sha256.bytes());
@@ -425,6 +441,57 @@ impl RepairBackupBinding {
 pub enum RepairBackupState {
     Reserved,
     Durable,
+}
+
+/// Transient, path-free identity of the Vault mounted in the current boot.
+///
+/// Unlike [`RepairBackupStatusPayload`], this value is deliberately excluded
+/// from durable transaction bindings. Recovery uses it to compare the fresh
+/// current-boot physical parent with a freshly reacquired target capability.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RepairVaultLiveIdentityPayload {
+    vault_id: String,
+    vault_identity_fingerprint: Sha256,
+    physical_parent_fingerprint: Sha256,
+}
+
+impl RepairVaultLiveIdentityPayload {
+    pub fn new(
+        vault_id: impl Into<String>,
+        vault_identity_fingerprint: Sha256,
+        physical_parent_fingerprint: Sha256,
+    ) -> Result<Self, ProtocolViolation> {
+        let value = Self {
+            vault_id: vault_id.into(),
+            vault_identity_fingerprint,
+            physical_parent_fingerprint,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn vault_id(&self) -> &str {
+        &self.vault_id
+    }
+
+    pub fn vault_identity_fingerprint(&self) -> &Sha256 {
+        &self.vault_identity_fingerprint
+    }
+
+    pub fn physical_parent_fingerprint(&self) -> &Sha256 {
+        &self.physical_parent_fingerprint
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), ProtocolViolation> {
+        if !valid_vault_id(&self.vault_id)
+            || self.vault_identity_fingerprint.bytes() == [0; 32]
+            || self.physical_parent_fingerprint.bytes() == [0; 32]
+        {
+            return Err(ProtocolViolation::InvalidPayload);
+        }
+        Ok(())
+    }
 }
 
 /// Closed status returned by reserve, persist, status and get.
@@ -1228,6 +1295,26 @@ mod tests {
         RepairFileMetadataV1::new(0o644, 0, 0).expect("metadata")
     }
 
+    #[test]
+    fn live_vault_identity_is_closed_and_rejects_zero_hashes() {
+        let identity = RepairVaultLiveIdentityPayload::new(
+            "V-0123456789abcdef0123456789abcdef",
+            hash('1'),
+            hash('2'),
+        )
+        .expect("live Vault identity");
+        assert_eq!(identity.vault_identity_fingerprint(), &hash('1'));
+        assert_eq!(identity.physical_parent_fingerprint(), &hash('2'));
+        assert!(
+            RepairVaultLiveIdentityPayload::new(
+                "V-0123456789abcdef0123456789abcdef",
+                hash('0'),
+                hash('2'),
+            )
+            .is_err()
+        );
+    }
+
     fn execution_intent(
         before_sha256: Sha256,
         before_metadata: RepairFileMetadataV1,
@@ -1239,6 +1326,7 @@ mod tests {
             format!("scan:{}", "1".repeat(64)),
             hash('2'),
             hash('9'),
+            format!("recovery:{}", "8".repeat(64)),
             format!("lock:{}", "a".repeat(64)),
             before_sha256,
             hash('b'),
@@ -1370,6 +1458,7 @@ mod tests {
         );
         assert!(pending.is_unresolved());
         let encoded = serde_json::to_string(&pending).expect("transaction JSON");
+        assert!(encoded.contains("\"targetRecoveryFingerprint\":\"recovery:"));
         assert!(!encoded.contains("/dev/"));
         assert!(!encoded.contains("/mnt/"));
         assert!(!encoded.contains("command"));
@@ -1377,6 +1466,18 @@ mod tests {
         let mut unknown: serde_json::Value = serde_json::from_str(&encoded).expect("JSON value");
         unknown["hostPath"] = serde_json::Value::String("/etc/fstab".to_owned());
         assert!(serde_json::from_value::<RepairTransactionStatusPayload>(unknown).is_err());
+
+        let durable = durable_status();
+        let mut invalid_intent =
+            serde_json::to_value(durable.execution_intent().expect("intent")).expect("intent JSON");
+        invalid_intent["targetRecoveryFingerprint"] =
+            serde_json::Value::String("recovery:UPPERCASE".to_owned());
+        let invalid_intent: RepairExecutionIntentV1 =
+            serde_json::from_value(invalid_intent).expect("closed wire shape");
+        assert_eq!(
+            invalid_intent.validate(),
+            Err(ProtocolViolation::InvalidPayload)
+        );
     }
 
     #[test]
@@ -1426,6 +1527,7 @@ mod tests {
                 "S-session",
                 "target-1",
                 hash('1'),
+                format!("recovery:{}", "4".repeat(64)),
                 hash('2'),
                 hash('3'),
                 4096,
@@ -1438,6 +1540,7 @@ mod tests {
                 "S-session",
                 "/dev/sda2",
                 hash('1'),
+                format!("recovery:{}", "4".repeat(64)),
                 hash('2'),
                 hash('3'),
                 4096,
@@ -1455,6 +1558,7 @@ mod tests {
             "S-session-1",
             "target-1",
             hash('1'),
+            format!("recovery:{}", "4".repeat(64)),
             hash('2'),
             hash('3'),
             4096,
@@ -1463,13 +1567,14 @@ mod tests {
         .expect("canonical draft");
         assert_eq!(
             canonical_repair_draft_binding_sha256(&draft).as_str(),
-            "d542b029fcb511754445d421195ad99f720a24c5db572e8bbd198b2a0e150bdc"
+            "a17c24df89d841805937201849843e7562bfcb11be03b81d1cdc06d5e8954179"
         );
         assert!(
             RepairBackupDraft::new(
                 "S-session-1",
                 "target-1",
                 hash('1'),
+                format!("recovery:{}", "4".repeat(64)),
                 hash('2'),
                 hash('3'),
                 8192,

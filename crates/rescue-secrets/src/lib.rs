@@ -228,8 +228,8 @@ pub use mount_manager::{
 #[cfg(all(target_os = "linux", feature = "experimental-repair-store"))]
 pub use repair_store::{
     DurableRepairBackup, RepairBackupDraft, RepairBackupStatus, RepairBackupSummary, RepairBinding,
-    RepairVaultStore, RepairVaultStoreError, ReservationId, ReservedRepairBackup,
-    VerifiedBackupMetadata, canonical_fstab_metadata_sha256,
+    RepairVaultLiveIdentity, RepairVaultStore, RepairVaultStoreError, ReservationId,
+    ReservedRepairBackup, VerifiedBackupMetadata, canonical_fstab_metadata_sha256,
 };
 #[cfg(all(target_os = "linux", feature = "experimental-vault-manager"))]
 pub use rescue_daemon::{

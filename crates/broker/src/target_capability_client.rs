@@ -1,8 +1,9 @@
 //! Strict client for the root-owned Rescue target capability endpoint.
 //!
-//! The wire request contains only boot-ephemeral opaque identifiers. A
+//! The normal wire request contains only boot-ephemeral opaque identifiers;
+//! the recovery request contains only one reboot-stable opaque digest. A
 //! successful response carries exactly one read-only block descriptor and
-//! path-free identity claims. This module never mounts or writes the target.
+//! fresh path-free identity claims. This module never mounts or writes.
 
 use kernaid_protocol::{
     rescue_vault::RequestId, rescue_vault_transport::authenticate_root_seqpacket_server,
@@ -28,6 +29,7 @@ use std::{
 const TARGET_CAPABILITY_SOCKET: &str = "/run/kernaid-rescue-target-capability.sock";
 const API_VERSION: &str = "kernaid.dev/rescue-target-capability/v1alpha1";
 const ACQUIRE_OPERATION: &str = "target.readonly.acquire";
+const RECOVERY_OPERATION: &str = "target.recovery.readonly.acquire";
 const CAPABILITY_TYPE: &str = "linux-ext4-direct-leaf-readonly-block-v1";
 const DESCRIPTOR_TYPE: &str = "selected-target-block-readonly";
 const MAX_FRAME_BYTES: usize = 1_024;
@@ -110,6 +112,7 @@ pub struct RescueTargetCapabilityClaims {
     scan_fingerprint: String,
     target_fingerprint: String,
     target_id: String,
+    recovery_fingerprint: String,
 }
 
 impl RescueTargetCapabilityClaims {
@@ -128,6 +131,10 @@ impl RescueTargetCapabilityClaims {
     pub fn target_id(&self) -> &str {
         &self.target_id
     }
+
+    pub fn recovery_fingerprint(&self) -> &str {
+        &self.recovery_fingerprint
+    }
 }
 
 impl fmt::Debug for RescueTargetCapabilityClaims {
@@ -138,6 +145,7 @@ impl fmt::Debug for RescueTargetCapabilityClaims {
             .field("scan_fingerprint", &"[opaque]")
             .field("target_fingerprint", &"[opaque]")
             .field("target_id", &"[opaque]")
+            .field("recovery_fingerprint", &"[opaque stable digest]")
             .finish()
     }
 }
@@ -176,13 +184,22 @@ impl fmt::Debug for RescueTargetReadOnlyCapability {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct CapabilityRequestWire<'a> {
+struct SelectedCapabilityRequestWire<'a> {
     api_version: &'static str,
     request_id: &'a str,
     operation: &'static str,
     scan_fingerprint: &'a str,
     target_fingerprint: &'a str,
     target_id: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RecoveryCapabilityRequestWire<'a> {
+    api_version: &'static str,
+    request_id: &'a str,
+    operation: &'static str,
+    recovery_fingerprint: &'a str,
 }
 
 #[derive(Deserialize)]
@@ -217,6 +234,7 @@ struct SuccessResponseWire {
     scan_fingerprint: String,
     target_fingerprint: String,
     target_id: String,
+    recovery_fingerprint: String,
     capability: String,
     descriptor: DescriptorWire,
 }
@@ -249,6 +267,26 @@ struct ReceivedFrame {
     descriptors: Vec<OwnedFd>,
 }
 
+enum ExpectedClaims<'a> {
+    Selected {
+        scan_fingerprint: &'a str,
+        target_fingerprint: &'a str,
+        target_id: &'a str,
+    },
+    Recovery {
+        recovery_fingerprint: &'a str,
+    },
+}
+
+impl ExpectedClaims<'_> {
+    fn operation(&self) -> &'static str {
+        match self {
+            Self::Selected { .. } => ACQUIRE_OPERATION,
+            Self::Recovery { .. } => RECOVERY_OPERATION,
+        }
+    }
+}
+
 /// Acquires one target capability from the fixed root-owned endpoint.
 ///
 /// The caller chooses a total monotonic deadline. The endpoint path is fixed
@@ -270,7 +308,7 @@ pub fn acquire_rescue_target_capability(
         _ => TargetCapabilityClientError::InvalidTransport,
     })?;
 
-    let request = CapabilityRequestWire {
+    let request = SelectedCapabilityRequestWire {
         api_version: API_VERSION,
         request_id: request_id.as_str(),
         operation: ACQUIRE_OPERATION,
@@ -288,9 +326,52 @@ pub fn acquire_rescue_target_capability(
     decode_response(
         received,
         request_id.as_str(),
-        scan_fingerprint,
-        target_fingerprint,
-        target_id,
+        ExpectedClaims::Selected {
+            scan_fingerprint,
+            target_fingerprint,
+            target_id,
+        },
+    )
+}
+
+/// Reacquires one target after reboot using only its durable opaque digest.
+///
+/// Every boot-local claim in the result is freshly produced by the root-owned
+/// resolver. No stale scan, target, parent claim, path or device number is
+/// accepted from the caller.
+pub fn reacquire_rescue_target_capability(
+    request_id: &RequestId,
+    recovery_fingerprint: &str,
+    deadline: Instant,
+) -> Result<RescueTargetReadOnlyCapability, TargetCapabilityClientError> {
+    validate_recovery_fingerprint(recovery_fingerprint)?;
+    ensure_before(deadline)?;
+    let connection = connect_fixed_endpoint(deadline)?;
+    authenticate_root_seqpacket_server(connection.as_fd()).map_err(|error| match error {
+        kernaid_protocol::rescue_vault_transport::SeqpacketTransportError::ServerNotRoot => {
+            TargetCapabilityClientError::ServerNotRoot
+        }
+        _ => TargetCapabilityClientError::InvalidTransport,
+    })?;
+    let request = RecoveryCapabilityRequestWire {
+        api_version: API_VERSION,
+        request_id: request_id.as_str(),
+        operation: RECOVERY_OPERATION,
+        recovery_fingerprint,
+    };
+    let encoded =
+        serde_json::to_vec(&request).map_err(|_| TargetCapabilityClientError::InvalidRequest)?;
+    if encoded.is_empty() || encoded.len() > MAX_FRAME_BYTES {
+        return Err(TargetCapabilityClientError::InvalidRequest);
+    }
+    send_frame(connection.as_fd(), &encoded, deadline)?;
+    let received = receive_frame(connection.as_fd(), deadline)?;
+    decode_response(
+        received,
+        request_id.as_str(),
+        ExpectedClaims::Recovery {
+            recovery_fingerprint,
+        },
     )
 }
 
@@ -326,6 +407,17 @@ fn validate_request_fields(
         || !valid_prefixed_hash(target_fingerprint, "sha256:")
         || !valid_prefixed_hash(target_id, "target:")
         || target_id.len() > MAX_OPAQUE_ID_BYTES
+    {
+        return Err(TargetCapabilityClientError::InvalidRequest);
+    }
+    Ok(())
+}
+
+fn validate_recovery_fingerprint(
+    recovery_fingerprint: &str,
+) -> Result<(), TargetCapabilityClientError> {
+    if !valid_prefixed_hash(recovery_fingerprint, "recovery:")
+        || recovery_fingerprint.len() > MAX_OPAQUE_ID_BYTES
     {
         return Err(TargetCapabilityClientError::InvalidRequest);
     }
@@ -430,9 +522,7 @@ fn receive_frame(
 fn decode_response(
     received: ReceivedFrame,
     request_id: &str,
-    scan_fingerprint: &str,
-    target_fingerprint: &str,
-    target_id: &str,
+    expected: ExpectedClaims<'_>,
 ) -> Result<RescueTargetReadOnlyCapability, TargetCapabilityClientError> {
     let probe: OutcomeProbe = serde_json::from_slice(&received.bytes)
         .map_err(|_| TargetCapabilityClientError::InvalidFrame)?;
@@ -442,13 +532,31 @@ fn decode_response(
                 .map_err(|_| TargetCapabilityClientError::InvalidFrame)?;
             if response.api_version != API_VERSION
                 || response.request_id != request_id
-                || response.operation != ACQUIRE_OPERATION
+                || response.operation != expected.operation()
             {
                 return Err(TargetCapabilityClientError::CorrelationMismatch);
             }
-            if response.scan_fingerprint != scan_fingerprint
-                || response.target_fingerprint != target_fingerprint
-                || response.target_id != target_id
+            let claims_match = match expected {
+                ExpectedClaims::Selected {
+                    scan_fingerprint,
+                    target_fingerprint,
+                    target_id,
+                } => {
+                    response.scan_fingerprint == scan_fingerprint
+                        && response.target_fingerprint == target_fingerprint
+                        && response.target_id == target_id
+                        && valid_prefixed_hash(&response.recovery_fingerprint, "recovery:")
+                }
+                ExpectedClaims::Recovery {
+                    recovery_fingerprint,
+                } => {
+                    response.recovery_fingerprint == recovery_fingerprint
+                        && valid_prefixed_hash(&response.scan_fingerprint, "scan:")
+                        && valid_prefixed_hash(&response.target_fingerprint, "sha256:")
+                        && valid_prefixed_hash(&response.target_id, "target:")
+                }
+            };
+            if !claims_match
                 || response.capability != CAPABILITY_TYPE
                 || response.descriptor.descriptor_type != DESCRIPTOR_TYPE
                 || response.descriptor.count != 1
@@ -471,6 +579,7 @@ fn decode_response(
                     scan_fingerprint: response.scan_fingerprint,
                     target_fingerprint: response.target_fingerprint,
                     target_id: response.target_id,
+                    recovery_fingerprint: response.recovery_fingerprint,
                 },
             })
         }
@@ -479,7 +588,7 @@ fn decode_response(
                 .map_err(|_| TargetCapabilityClientError::InvalidFrame)?;
             if response.api_version != API_VERSION
                 || response.request_id != request_id
-                || response.operation != ACQUIRE_OPERATION
+                || response.operation != expected.operation()
             {
                 return Err(TargetCapabilityClientError::CorrelationMismatch);
             }
@@ -591,6 +700,10 @@ mod tests {
         format!("sha256:{}", character.to_string().repeat(64))
     }
 
+    fn recovery(character: char) -> String {
+        format!("recovery:{}", character.to_string().repeat(64))
+    }
+
     fn pair() -> (OwnedFd, OwnedFd) {
         socketpair(
             AddressFamily::UNIX,
@@ -630,9 +743,15 @@ mod tests {
         );
     }
 
-    fn success_frame(scan_fingerprint: &str, target_fingerprint: &str, target_id: &str) -> Vec<u8> {
+    fn success_frame(
+        operation: &str,
+        scan_fingerprint: &str,
+        target_fingerprint: &str,
+        target_id: &str,
+        recovery_fingerprint: &str,
+    ) -> Vec<u8> {
         format!(
-            "{{\"apiVersion\":\"{API_VERSION}\",\"requestId\":\"{REQUEST_ID}\",\"operation\":\"{ACQUIRE_OPERATION}\",\"outcome\":\"ok\",\"scanFingerprint\":\"{scan_fingerprint}\",\"targetFingerprint\":\"{target_fingerprint}\",\"targetId\":\"{target_id}\",\"capability\":\"{CAPABILITY_TYPE}\",\"descriptor\":{{\"type\":\"{DESCRIPTOR_TYPE}\",\"count\":1}}}}",
+            "{{\"apiVersion\":\"{API_VERSION}\",\"requestId\":\"{REQUEST_ID}\",\"operation\":\"{operation}\",\"outcome\":\"ok\",\"scanFingerprint\":\"{scan_fingerprint}\",\"targetFingerprint\":\"{target_fingerprint}\",\"targetId\":\"{target_id}\",\"recoveryFingerprint\":\"{recovery_fingerprint}\",\"capability\":\"{CAPABILITY_TYPE}\",\"descriptor\":{{\"type\":\"{DESCRIPTOR_TYPE}\",\"count\":1}}}}",
         )
         .into_bytes()
     }
@@ -642,7 +761,7 @@ mod tests {
         let scan = scan('a');
         let fingerprint = fingerprint_value('c');
         let target = target('b');
-        let request = CapabilityRequestWire {
+        let request = SelectedCapabilityRequestWire {
             api_version: API_VERSION,
             request_id: REQUEST_ID,
             operation: ACQUIRE_OPERATION,
@@ -683,6 +802,28 @@ mod tests {
             Some(target.as_str())
         );
         assert!(!encoded.windows(5).any(|window| window == b"/dev/"));
+
+        let recovery = recovery('d');
+        let request = RecoveryCapabilityRequestWire {
+            api_version: API_VERSION,
+            request_id: REQUEST_ID,
+            operation: RECOVERY_OPERATION,
+            recovery_fingerprint: &recovery,
+        };
+        let encoded = serde_json::to_vec(&request).expect("encode recovery request");
+        let object = serde_json::from_slice::<serde_json::Value>(&encoded)
+            .expect("recovery JSON")
+            .as_object()
+            .expect("recovery object")
+            .clone();
+        assert_eq!(object.len(), 4);
+        assert_eq!(
+            object
+                .get("recoveryFingerprint")
+                .and_then(|value| value.as_str()),
+            Some(recovery.as_str())
+        );
+        assert!(!encoded.windows(5).any(|window| window == b"/dev/"));
     }
 
     #[test]
@@ -690,26 +831,51 @@ mod tests {
         let scan = scan('a');
         let fingerprint = fingerprint_value('c');
         let target = target('b');
-        let response = success_frame(&scan, &fingerprint, &target);
+        let recovery = recovery('d');
+        let response = success_frame(ACQUIRE_OPERATION, &scan, &fingerprint, &target, &recovery);
         let received = ReceivedFrame {
             bytes: response,
             descriptors: Vec::new(),
         };
         assert_eq!(
-            decode_response(received, REQUEST_ID, &scan, &fingerprint, &target).err(),
+            decode_response(
+                received,
+                REQUEST_ID,
+                ExpectedClaims::Selected {
+                    scan_fingerprint: &scan,
+                    target_fingerprint: &fingerprint,
+                    target_id: &target,
+                },
+            )
+            .err(),
             Some(TargetCapabilityClientError::DescriptorRequired)
         );
 
         let received = ReceivedFrame {
-            bytes: success_frame(&scan, &fingerprint_value('d'), &target),
+            bytes: success_frame(
+                ACQUIRE_OPERATION,
+                &scan,
+                &fingerprint_value('e'),
+                &target,
+                &recovery,
+            ),
             descriptors: Vec::new(),
         };
         assert_eq!(
-            decode_response(received, REQUEST_ID, &scan, &fingerprint, &target).err(),
+            decode_response(
+                received,
+                REQUEST_ID,
+                ExpectedClaims::Selected {
+                    scan_fingerprint: &scan,
+                    target_fingerprint: &fingerprint,
+                    target_id: &target,
+                },
+            )
+            .err(),
             Some(TargetCapabilityClientError::ClaimsMismatch)
         );
 
-        let mut unknown = success_frame(&scan, &fingerprint, &target);
+        let mut unknown = success_frame(ACQUIRE_OPERATION, &scan, &fingerprint, &target, &recovery);
         let suffix = b",\"path\":\"/dev/sda\"}";
         unknown.pop();
         unknown.extend_from_slice(suffix);
@@ -718,7 +884,16 @@ mod tests {
             descriptors: Vec::new(),
         };
         assert_eq!(
-            decode_response(received, REQUEST_ID, &scan, &fingerprint, &target).err(),
+            decode_response(
+                received,
+                REQUEST_ID,
+                ExpectedClaims::Selected {
+                    scan_fingerprint: &scan,
+                    target_fingerprint: &fingerprint,
+                    target_id: &target,
+                },
+            )
+            .err(),
             Some(TargetCapabilityClientError::InvalidFrame)
         );
     }
@@ -767,9 +942,11 @@ mod tests {
             decode_response(
                 received,
                 REQUEST_ID,
-                &scan('a'),
-                &fingerprint_value('c'),
-                &target('b'),
+                ExpectedClaims::Selected {
+                    scan_fingerprint: &scan('a'),
+                    target_fingerprint: &fingerprint_value('c'),
+                    target_id: &target('b'),
+                },
             )
             .err(),
             Some(TargetCapabilityClientError::DescriptorForbidden)
@@ -826,6 +1003,66 @@ mod tests {
         assert_eq!(
             validate_request_fields(&scan('a'), &fingerprint_value('c'), "/dev/sda"),
             Err(TargetCapabilityClientError::InvalidRequest)
+        );
+        assert!(validate_recovery_fingerprint(&recovery('d')).is_ok());
+        assert_eq!(
+            validate_recovery_fingerprint("recovery:AA"),
+            Err(TargetCapabilityClientError::InvalidRequest)
+        );
+        assert_eq!(
+            validate_recovery_fingerprint("/dev/sda2"),
+            Err(TargetCapabilityClientError::InvalidRequest)
+        );
+    }
+
+    #[test]
+    fn recovery_response_requires_matching_digest_and_fresh_boot_claims() {
+        let scan = scan('a');
+        let fingerprint = fingerprint_value('b');
+        let target = target('c');
+        let expected_recovery = recovery('d');
+        let received = ReceivedFrame {
+            bytes: success_frame(
+                RECOVERY_OPERATION,
+                &scan,
+                &fingerprint,
+                &target,
+                &recovery('e'),
+            ),
+            descriptors: Vec::new(),
+        };
+        assert_eq!(
+            decode_response(
+                received,
+                REQUEST_ID,
+                ExpectedClaims::Recovery {
+                    recovery_fingerprint: &expected_recovery,
+                },
+            )
+            .err(),
+            Some(TargetCapabilityClientError::ClaimsMismatch)
+        );
+
+        let received = ReceivedFrame {
+            bytes: success_frame(
+                RECOVERY_OPERATION,
+                "scan:AA",
+                &fingerprint,
+                &target,
+                &expected_recovery,
+            ),
+            descriptors: Vec::new(),
+        };
+        assert_eq!(
+            decode_response(
+                received,
+                REQUEST_ID,
+                ExpectedClaims::Recovery {
+                    recovery_fingerprint: &expected_recovery,
+                },
+            )
+            .err(),
+            Some(TargetCapabilityClientError::ClaimsMismatch)
         );
     }
 }

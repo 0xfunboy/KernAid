@@ -19,6 +19,7 @@ use crate::rescue_repair_vault::{
     RepairBackupState, RepairBackupStatusPayload, RepairExecutionIntentV1, RepairFileMetadataV1,
     RepairReservationId, RepairTransactionResolution, RepairTransactionStatusPayload,
     RepairTransactionStatusResultPayload, RepairTransactionStatusSelector,
+    RepairVaultLiveIdentityPayload,
 };
 use crate::rescue_vault::{
     API_VERSION, AuditEventType, AuditOutcome, DescriptorDeclaration, DescriptorType, ErrorToken,
@@ -562,6 +563,8 @@ pub enum ClientRequestPayload {
         expected: Box<RepairTransactionStatusPayload>,
         resolution: RepairTransactionResolution,
     },
+    #[cfg(feature = "experimental-repair-store")]
+    RepairVaultLiveParent,
 }
 
 impl ClientRequestPayload {
@@ -596,6 +599,8 @@ impl ClientRequestPayload {
             Self::RepairTransactionStatus { .. } => Operation::RepairTransactionStatus,
             #[cfg(feature = "experimental-repair-store")]
             Self::RepairTransactionResolve { .. } => Operation::RepairTransactionResolve,
+            #[cfg(feature = "experimental-repair-store")]
+            Self::RepairVaultLiveParent => Operation::RepairVaultLiveParent,
         }
     }
 
@@ -634,7 +639,8 @@ impl ClientRequestPayload {
             | Self::RepairBackupCancel { .. }
             | Self::RepairBackupRetire { .. }
             | Self::RepairTransactionStatus { .. }
-            | Self::RepairTransactionResolve { .. } => None,
+            | Self::RepairTransactionResolve { .. }
+            | Self::RepairVaultLiveParent => None,
         }
     }
 }
@@ -758,6 +764,8 @@ fn valid_client_payload(payload: &ClientRequestPayload) -> bool {
                     .execution_intent()
                     .is_some_and(|intent| resolution.validate_against(intent).is_ok())
         }
+        #[cfg(feature = "experimental-repair-store")]
+        ClientRequestPayload::RepairVaultLiveParent => true,
     }
 }
 
@@ -822,6 +830,7 @@ struct RepairBackupReserveRequestPayload<'a> {
     session_id: &'a str,
     target_id: &'a str,
     target_fingerprint: &'a Sha256,
+    target_recovery_fingerprint: &'a str,
     expected_backup_sha256: &'a Sha256,
     metadata_sha256: &'a Sha256,
     backup_size: u64,
@@ -890,6 +899,10 @@ pub fn encode_client_request(
         | ClientRequestPayload::ReportList => {
             encode_client_request_payload(request, EmptyRequestPayload {})
         }
+        #[cfg(feature = "experimental-repair-store")]
+        ClientRequestPayload::RepairVaultLiveParent => {
+            encode_client_request_payload(request, EmptyRequestPayload {})
+        }
         ClientRequestPayload::VaultUnlock { .. }
         | ClientRequestPayload::ProviderOpenAiConfigure { .. } => encode_client_request_payload(
             request,
@@ -956,6 +969,7 @@ pub fn encode_client_request(
                 session_id: draft.session_id(),
                 target_id: draft.target_id(),
                 target_fingerprint: draft.target_fingerprint(),
+                target_recovery_fingerprint: draft.target_recovery_fingerprint(),
                 expected_backup_sha256: draft.expected_backup_sha256(),
                 metadata_sha256: draft.metadata_sha256(),
                 backup_size: draft.backup_size(),
@@ -1662,6 +1676,15 @@ fn decode_success_payload(
                 return Err(ClientResponseDecodeError::InvalidPayload);
             }
             Ok(SuccessPayload::RepairTransactionResolved(Box::new(status)))
+        }
+        #[cfg(feature = "experimental-repair-store")]
+        ClientRequestPayload::RepairVaultLiveParent => {
+            require_no_descriptors(descriptors)?;
+            let identity: RepairVaultLiveIdentityPayload = decode_payload(raw)?;
+            if identity.validate().is_err() {
+                return Err(ClientResponseDecodeError::InvalidPayload);
+            }
+            Ok(SuccessPayload::RepairVaultLiveIdentity(identity))
         }
     }
 }
@@ -2475,7 +2498,7 @@ mod tests {
             RepairExecutionIntentV1, RepairFileMetadataV1, RepairReservationId,
             RepairTransactionResolution, RepairTransactionResolutionOutcome,
             RepairTransactionStatusPayload, RepairTransactionStatusResultPayload,
-            RepairTransactionStatusSelector,
+            RepairTransactionStatusSelector, RepairVaultLiveIdentityPayload,
         };
 
         let hash = |byte: char| Sha256::parse(&byte.to_string().repeat(64)).expect("test SHA-256");
@@ -2484,6 +2507,7 @@ mod tests {
             "S-session-1",
             "target-1",
             hash('1'),
+            format!("recovery:{}", "4".repeat(64)),
             hash('2'),
             metadata.canonical_sha256(),
             4096,
@@ -2555,6 +2579,7 @@ mod tests {
             format!("scan:{}", "a".repeat(64)),
             hash('1'),
             hash('4'),
+            format!("recovery:{}", "5".repeat(64)),
             format!("lock:{}", "b".repeat(64)),
             hash('2'),
             hash('c'),
@@ -2721,6 +2746,27 @@ mod tests {
             &serde_json::to_string(&resolved).expect("resolved JSON"),
         );
         assert!(decode_client_response(&resolved_response, Vec::new(), &resolve).is_ok());
+
+        let live = request(ClientRequestPayload::RepairVaultLiveParent);
+        let live_json = encode_client_request(&live, &[]).expect("live Vault parent request");
+        assert!(
+            String::from_utf8(live_json)
+                .expect("UTF-8 live identity")
+                .contains("repair.vault.live-parent")
+        );
+        let live_identity = RepairVaultLiveIdentityPayload::new(
+            "V-0123456789abcdef0123456789abcdef",
+            hash('c'),
+            hash('d'),
+        )
+        .expect("live Vault identity");
+        let live_response = success_response(
+            REQUEST_ID,
+            9,
+            "repair.vault.live-parent",
+            &serde_json::to_string(&live_identity).expect("live identity JSON"),
+        );
+        assert!(decode_client_response(&live_response, Vec::new(), &live).is_ok());
     }
 
     #[test]

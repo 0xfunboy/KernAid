@@ -192,6 +192,7 @@ pub struct RepairBackupDraft {
     session_id: String,
     target_id: String,
     target_fingerprint: [u8; 32],
+    target_recovery_fingerprint: String,
     expected_backup_sha256: [u8; 32],
     metadata_sha256: [u8; 32],
     backup_size_bytes: u64,
@@ -204,6 +205,7 @@ impl RepairBackupDraft {
         session_id: impl Into<String>,
         target_id: impl Into<String>,
         target_fingerprint: [u8; 32],
+        target_recovery_fingerprint: impl Into<String>,
         expected_backup_sha256: [u8; 32],
         metadata_sha256: [u8; 32],
         backup_size_bytes: u64,
@@ -213,6 +215,7 @@ impl RepairBackupDraft {
             session_id: session_id.into(),
             target_id: target_id.into(),
             target_fingerprint,
+            target_recovery_fingerprint: target_recovery_fingerprint.into(),
             expected_backup_sha256,
             metadata_sha256,
             backup_size_bytes,
@@ -226,6 +229,7 @@ impl RepairBackupDraft {
         if !valid_prefixed_id(&self.session_id, "S-")
             || !valid_opaque_id(&self.target_id)
             || self.target_fingerprint == [0; 32]
+            || !valid_recovery_fingerprint(&self.target_recovery_fingerprint)
             || self.expected_backup_sha256 == [0; 32]
             || self.metadata_sha256 != canonical_fstab_metadata_sha256()
             || self.backup_size_bytes == 0
@@ -250,6 +254,11 @@ impl RepairBackupDraft {
     #[must_use]
     pub const fn target_fingerprint(&self) -> &[u8; 32] {
         &self.target_fingerprint
+    }
+
+    #[must_use]
+    pub fn target_recovery_fingerprint(&self) -> &str {
+        &self.target_recovery_fingerprint
     }
 
     #[must_use]
@@ -346,6 +355,7 @@ impl RepairBinding {
         if intent.session_id() != record.draft.session_id
             || intent.target_id() != record.draft.target_id
             || intent.target_fingerprint().bytes() != record.draft.target_fingerprint
+            || intent.target_recovery_fingerprint() != record.draft.target_recovery_fingerprint
             || intent.before_sha256().bytes() != record.draft.expected_backup_sha256
             || intent.before_metadata().canonical_sha256().bytes() != record.draft.metadata_sha256
             || intent.target_physical_parent_fingerprint().as_str()
@@ -898,6 +908,33 @@ impl FilesystemState {
     }
 }
 
+/// Path-free identity of the currently mounted Vault and its current-boot
+/// physical parent. This transient evidence is never persisted into a repair
+/// transaction binding.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepairVaultLiveIdentity {
+    vault_id: String,
+    vault_identity_fingerprint: String,
+    physical_parent_fingerprint: String,
+}
+
+impl RepairVaultLiveIdentity {
+    #[must_use]
+    pub fn vault_id(&self) -> &str {
+        &self.vault_id
+    }
+
+    #[must_use]
+    pub fn vault_identity_fingerprint(&self) -> &str {
+        &self.vault_identity_fingerprint
+    }
+
+    #[must_use]
+    pub fn physical_parent_fingerprint(&self) -> &str {
+        &self.physical_parent_fingerprint
+    }
+}
+
 /// Exclusive handle for the isolated Repair Vault namespace.
 pub struct RepairVaultStore<'vault> {
     inner: &'vault VaultInner,
@@ -1356,6 +1393,34 @@ impl<'vault> RepairVaultStore<'vault> {
             }
             _ => Ok(RepairTransactionStatusResultPayload::found(status)),
         }
+    }
+
+    /// Return freshly attested, current-boot Vault parent evidence without
+    /// exposing a device path or any underlying hardware identifier.
+    pub fn live_identity(&self) -> Result<RepairVaultLiveIdentity, RepairVaultStoreError> {
+        if !self.healthy || self.state.pending.is_some() {
+            return Err(RepairVaultStoreError::ReconciliationRequired);
+        }
+        self.validate_store_boundary()?;
+        if !valid_vault_id(&self.vault_id)
+            || !valid_sha256(&self.vault_identity_fingerprint)
+            || !valid_sha256(&self.physical_parent_fingerprint)
+            || self
+                .vault_identity_fingerprint
+                .bytes()
+                .all(|byte| byte == b'0')
+            || self
+                .physical_parent_fingerprint
+                .bytes()
+                .all(|byte| byte == b'0')
+        {
+            return Err(RepairVaultStoreError::CorruptStore);
+        }
+        Ok(RepairVaultLiveIdentity {
+            vault_id: self.vault_id.clone(),
+            vault_identity_fingerprint: self.vault_identity_fingerprint.clone(),
+            physical_parent_fingerprint: self.physical_parent_fingerprint.clone(),
+        })
     }
 
     /// Append one exact transaction resolution. Replaying a response-lost
@@ -2036,6 +2101,7 @@ impl<'vault> RepairVaultStore<'vault> {
                 session_id: "S-verification".to_owned(),
                 target_id: "verification".to_owned(),
                 target_fingerprint: [1; 32],
+                target_recovery_fingerprint: format!("recovery:{}", "1".repeat(64)),
                 expected_backup_sha256: expected_sha256,
                 metadata_sha256: [1; 32],
                 backup_size_bytes: expected_size,
@@ -4657,6 +4723,7 @@ fn verify_zero_filled(file: &mut File, capacity: u64) -> Result<(), RepairVaultS
             session_id: "S-verification".to_owned(),
             target_id: "verification".to_owned(),
             target_fingerprint: [1; 32],
+            target_recovery_fingerprint: format!("recovery:{}", "1".repeat(64)),
             expected_backup_sha256: [1; 32],
             metadata_sha256: [1; 32],
             backup_size_bytes: 1,
@@ -5023,6 +5090,7 @@ fn reservation_binding(draft: &RepairBackupDraft) -> String {
     hash_field(&mut hasher, draft.session_id.as_bytes());
     hash_field(&mut hasher, draft.target_id.as_bytes());
     hash_field(&mut hasher, &draft.target_fingerprint);
+    hash_field(&mut hasher, draft.target_recovery_fingerprint.as_bytes());
     hash_field(&mut hasher, &draft.expected_backup_sha256);
     hash_field(&mut hasher, &draft.metadata_sha256);
     hash_field(&mut hasher, &draft.backup_size_bytes.to_be_bytes());
@@ -5146,6 +5214,12 @@ fn valid_sha256(value: &str) -> bool {
     valid_lower_hex(value, 64)
 }
 
+fn valid_recovery_fingerprint(value: &str) -> bool {
+    value
+        .strip_prefix("recovery:")
+        .is_some_and(|digest| valid_lower_hex(digest, 64))
+}
+
 fn valid_execution_intent(intent: &RepairExecutionIntentV1) -> bool {
     RepairExecutionIntentV1::new(
         intent.session_id(),
@@ -5154,6 +5228,7 @@ fn valid_execution_intent(intent: &RepairExecutionIntentV1) -> bool {
         intent.scan_fingerprint(),
         intent.target_fingerprint().clone(),
         intent.target_physical_parent_fingerprint().clone(),
+        intent.target_recovery_fingerprint(),
         intent.lock_identity(),
         intent.before_sha256().clone(),
         intent.after_sha256().clone(),
@@ -5270,6 +5345,7 @@ mod tests {
             "S-repair-test",
             "target-test",
             [7; 32],
+            format!("recovery:{}", "6".repeat(64)),
             Sha256::digest(bytes).into(),
             canonical_fstab_metadata_sha256(),
             bytes.len() as u64,
@@ -5288,6 +5364,7 @@ mod tests {
             format!("scan:{}", "1".repeat(64)),
             ProtocolSha256::parse(&encode_hex(&[7; 32])).expect("target digest"),
             ProtocolSha256::parse(&"d".repeat(64)).expect("target parent digest"),
+            format!("recovery:{}", "6".repeat(64)),
             format!("lock:{}", "2".repeat(64)),
             before_sha256,
             ProtocolSha256::parse(&"3".repeat(64)).expect("after digest"),
@@ -6335,7 +6412,16 @@ mod tests {
             Err(RepairVaultStoreError::InvalidReservationId)
         );
         assert_eq!(
-            RepairBackupDraft::new("S-ok", "/dev/sda", [1; 32], [2; 32], [3; 32], 1, 1),
+            RepairBackupDraft::new(
+                "S-ok",
+                "/dev/sda",
+                [1; 32],
+                format!("recovery:{}", "4".repeat(64)),
+                [2; 32],
+                [3; 32],
+                1,
+                1,
+            ),
             Err(RepairVaultStoreError::InvalidDraft)
         );
         let valid = binding(b"resource binding\n");

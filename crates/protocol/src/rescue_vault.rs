@@ -11,6 +11,7 @@ use crate::rescue_repair_vault::{
     RepairBackupState, RepairBackupStatusPayload, RepairExecutionIntentV1, RepairFileMetadataV1,
     RepairReservationId, RepairTransactionResolution, RepairTransactionStatusPayload,
     RepairTransactionStatusResultPayload, RepairTransactionStatusSelector,
+    RepairVaultLiveIdentityPayload,
 };
 use crate::rescue_vault_transport::{
     SeqpacketSocketIdentity, SeqpacketTransportError, ensure_deadline, recv_seqpacket,
@@ -513,6 +514,9 @@ pub enum Operation {
     #[cfg(feature = "experimental-repair-store")]
     #[serde(rename = "repair.transaction.resolve")]
     RepairTransactionResolve,
+    #[cfg(feature = "experimental-repair-store")]
+    #[serde(rename = "repair.vault.live-parent")]
+    RepairVaultLiveParent,
 }
 
 impl Operation {
@@ -556,6 +560,7 @@ impl Operation {
                     | Self::RepairBackupRetire
                     | Self::RepairTransactionStatus
                     | Self::RepairTransactionResolve
+                    | Self::RepairVaultLiveParent
             ),
         }
     }
@@ -1105,6 +1110,7 @@ struct RepairBackupReservePayload {
     session_id: String,
     target_id: String,
     target_fingerprint: String,
+    target_recovery_fingerprint: String,
     expected_backup_sha256: String,
     metadata_sha256: String,
     backup_size: u64,
@@ -1278,6 +1284,12 @@ fn parse_payload(
                 .map_err(|_| ProtocolViolation::InvalidPayload)?;
             Ok(RequestPayload::Empty)
         }
+        #[cfg(feature = "experimental-repair-store")]
+        Operation::RepairVaultLiveParent => {
+            serde_json::from_str::<EmptyPayload>(raw.get())
+                .map_err(|_| ProtocolViolation::InvalidPayload)?;
+            Ok(RequestPayload::Empty)
+        }
         Operation::VaultUnlock => {
             let payload = serde_json::from_str::<DescriptorPayload>(raw.get())
                 .map_err(|_| ProtocolViolation::InvalidPayload)?;
@@ -1373,6 +1385,7 @@ fn parse_payload(
                     payload.session_id,
                     payload.target_id,
                     Sha256::parse(&payload.target_fingerprint)?,
+                    payload.target_recovery_fingerprint,
                     Sha256::parse(&payload.expected_backup_sha256)?,
                     Sha256::parse(&payload.metadata_sha256)?,
                     payload.backup_size,
@@ -1872,6 +1885,8 @@ pub enum SuccessPayload {
     RepairTransactionStatus(Box<RepairTransactionStatusResultPayload>),
     #[cfg(feature = "experimental-repair-store")]
     RepairTransactionResolved(Box<RepairTransactionStatusPayload>),
+    #[cfg(feature = "experimental-repair-store")]
+    RepairVaultLiveIdentity(RepairVaultLiveIdentityPayload),
 }
 
 #[derive(Serialize)]
@@ -2049,6 +2064,15 @@ fn encode_success(
             operation,
             outcome: "ok",
             payload: status,
+        }),
+        #[cfg(feature = "experimental-repair-store")]
+        SuccessPayload::RepairVaultLiveIdentity(identity) => serde_json::to_vec(&SuccessWire {
+            api_version: API_VERSION,
+            request_id,
+            state_version,
+            operation,
+            outcome: "ok",
+            payload: identity,
         }),
     }
     .map_err(|_| ProtocolViolation::InvalidPayload)?;
@@ -2323,6 +2347,12 @@ fn validate_success(
         {
             None
         }
+        #[cfg(feature = "experimental-repair-store")]
+        (
+            Operation::RepairVaultLiveParent,
+            RequestPayload::Empty,
+            SuccessPayload::RepairVaultLiveIdentity(identity),
+        ) if identity.validate().is_ok() => None,
         _ => return Err(ProtocolViolation::InvalidPayload),
     };
 
@@ -2874,8 +2904,9 @@ mod tests {
         let reserve = request(
             "repair.backup.reserve",
             &format!(
-                "{{\"sessionId\":\"S-session-1\",\"targetId\":\"target-1\",\"targetFingerprint\":\"{}\",\"expectedBackupSha256\":\"{}\",\"metadataSha256\":\"{}\",\"backupSize\":4096,\"requiredCapacityBytes\":8192}}",
+                "{{\"sessionId\":\"S-session-1\",\"targetId\":\"target-1\",\"targetFingerprint\":\"{}\",\"targetRecoveryFingerprint\":\"recovery:{}\",\"expectedBackupSha256\":\"{}\",\"metadataSha256\":\"{}\",\"backupSize\":4096,\"requiredCapacityBytes\":8192}}",
                 hash('1'),
+                hash('4'),
                 hash('2'),
                 metadata_sha256.as_str()
             ),
@@ -2949,6 +2980,7 @@ mod tests {
             format!("scan:{}", hash('a')),
             Sha256::parse(&hash('1')).expect("hash"),
             Sha256::parse(&hash('7')).expect("hash"),
+            format!("recovery:{}", hash('8')),
             format!("lock:{}", hash('b')),
             Sha256::parse(&hash('2')).expect("hash"),
             Sha256::parse(&hash('c')).expect("hash"),

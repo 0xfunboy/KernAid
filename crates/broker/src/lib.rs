@@ -12,6 +12,11 @@ pub mod fixture_repair;
 #[cfg(all(target_os = "linux", feature = "rescue-fstab-production-candidate"))]
 pub mod rescue_fstab_candidate;
 
+/// Closed, off-default same-boot executor and durable reboot recovery for the
+/// sole authorized Phase 1 Rescue mutation.
+#[cfg(all(target_os = "linux", feature = "rescue-fstab-production-candidate"))]
+pub mod rescue_fstab_executor;
+
 /// Descriptor-only, detached read-only ext4 observation for the Rescue
 /// `fstab` candidate. The module is absent from default broker builds.
 #[cfg(all(target_os = "linux", feature = "rescue-fstab-production-candidate"))]

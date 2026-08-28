@@ -2830,6 +2830,17 @@ impl WorkerHandle {
     }
 
     #[cfg(feature = "experimental-repair-store")]
+    pub(super) fn repair_vault_live_identity(
+        &self,
+        deadline: Instant,
+    ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
+        self.transact_repair_without_descriptor(
+            internal_wire::WorkerRepairCommand::VaultLiveParent,
+            deadline,
+        )
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
     pub(super) fn repair_transaction_resolve(
         &self,
         expected: &RepairTransactionStatusPayload,
@@ -3846,6 +3857,16 @@ fn response_matches(
                 | Result::RepairBackupNotFound
                 | Result::RepairInvalidRequest
                 | Result::RepairConflict
+                | Result::RepairReconciliationRequired
+                | Result::RepairStorageUnavailable
+                | Result::CleanupFailed
+                | Result::Busy
+        ),
+        #[cfg(feature = "experimental-repair-store")]
+        Command::RepairVaultLiveParent => matches!(
+            response.code,
+            Result::RepairVaultLiveIdentityReady
+                | Result::RepairInvalidRequest
                 | Result::RepairReconciliationRequired
                 | Result::RepairStorageUnavailable
                 | Result::CleanupFailed

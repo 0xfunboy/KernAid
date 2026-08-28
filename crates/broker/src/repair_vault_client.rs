@@ -10,6 +10,7 @@ use kernaid_protocol::{
         RepairBackupStatusPayload, RepairFileMetadataV1, RepairReservationId,
         RepairTransactionResolution, RepairTransactionStatusPayload,
         RepairTransactionStatusResultPayload, RepairTransactionStatusSelector,
+        RepairVaultLiveIdentityPayload,
     },
     rescue_vault::{ErrorToken, RequestId, Sha256, SuccessPayload},
     rescue_vault_transport::{
@@ -508,6 +509,29 @@ impl RepairVaultClient {
         )
     }
 
+    /// Reads freshly attested current-boot Vault parent evidence. A reboot
+    /// recovery caller first bootstraps this client's state with the singleton
+    /// transaction lookup, then compares this transient identity with the
+    /// immutable backup identity and the freshly reacquired target parent.
+    pub fn live_identity(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<RepairVaultLiveIdentityPayload, RepairVaultClientError> {
+        let response =
+            self.read_exchange(|| ClientRequestPayload::RepairVaultLiveParent, deadline)?;
+        let state_version = response.state_version();
+        match live_identity_result(&response) {
+            Ok(identity) => {
+                self.observe_completed_read(state_version);
+                Ok(identity)
+            }
+            Err(error) => {
+                self.guard.observe_read_version(state_version);
+                Err(error)
+            }
+        }
+    }
+
     fn transaction_status_with_exchange<T, F>(
         &mut self,
         selector: &RepairTransactionStatusSelector,
@@ -736,6 +760,18 @@ fn transaction_status_result(
     match response.outcome() {
         ClientResponseOutcome::Success(SuccessPayload::RepairTransactionStatus(result)) => {
             Ok((**result).clone())
+        }
+        ClientResponseOutcome::Error(error) => Err(RepairVaultClientError::Remote(*error)),
+        ClientResponseOutcome::Success(_) => Err(RepairVaultClientError::Protocol),
+    }
+}
+
+fn live_identity_result(
+    response: &ClientResponse,
+) -> Result<RepairVaultLiveIdentityPayload, RepairVaultClientError> {
+    match response.outcome() {
+        ClientResponseOutcome::Success(SuccessPayload::RepairVaultLiveIdentity(identity)) => {
+            Ok(identity.clone())
         }
         ClientResponseOutcome::Error(error) => Err(RepairVaultClientError::Remote(*error)),
         ClientResponseOutcome::Success(_) => Err(RepairVaultClientError::Protocol),
@@ -1002,6 +1038,7 @@ mod tests {
             "S-test-session",
             "selected-linux-root",
             hash('1'),
+            format!("recovery:{}", "4".repeat(64)),
             hash('2'),
             metadata.canonical_sha256(),
             4,
@@ -1016,6 +1053,7 @@ mod tests {
             "S-different-session",
             "selected-linux-root",
             hash('1'),
+            format!("recovery:{}", "4".repeat(64)),
             hash('3'),
             metadata.canonical_sha256(),
             4,

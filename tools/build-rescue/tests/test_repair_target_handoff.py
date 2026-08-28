@@ -36,6 +36,13 @@ REQUEST = {
     "requestId": "R-12345678-1234-1234-1234-123456789abc",
     "operation": "target.readonly.acquire",
 }
+RECOVERY_FINGERPRINT = "recovery:" + "4" * 64
+RECOVERY_REQUEST = {
+    "apiVersion": REQUEST["apiVersion"],
+    "requestId": REQUEST["requestId"],
+    "operation": "target.recovery.readonly.acquire",
+    "recoveryFingerprint": RECOVERY_FINGERPRINT,
+}
 
 IDENTITY_OBSERVATIONS: list[dict[str, object]] = [
     {
@@ -99,8 +106,8 @@ def _resolution(candidate: dict[str, object], filesystem: str = "ext4") -> dict[
             "fstype": filesystem,
             "fsver": "1.0",
             "mountpoints": [None],
-            "uuid": "fixture",
-            "partuuid": "fixture-part",
+            "uuid": "11111111-2222-3333-4444-555555555555",
+            "partuuid": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
             "ptuuid": "fixture-table",
             "pttype": "gpt",
             "parttype": None,
@@ -112,6 +119,8 @@ def _resolution(candidate: dict[str, object], filesystem: str = "ext4") -> dict[
         "kernelKind": "part",
         "leaf": True,
         "directOnDisk": True,
+        "recoveryFingerprint": RECOVERY_FINGERPRINT,
+        "recoveryUnique": True,
         "topologyKinds": ["disk", "part"],
         "topologyFilesystems": [filesystem],
         "associatedEfiSystemPartition": {"state": "not-present"},
@@ -158,6 +167,15 @@ class FakeTargets:
             "targetId": REQUEST["targetId"],
         } or deadline <= 0:
             raise AssertionError("unexpected canonical resolver request")
+        return self.selection, self.resolution
+
+    def resolve_recovery_target(
+        self, request: dict[str, object], *, deadline: float
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        self.calls += 1
+        self.events.append("recover")
+        if request != {"recoveryFingerprint": RECOVERY_FINGERPRINT} or deadline <= 0:
+            raise AssertionError("unexpected recovery resolver request")
         return self.selection, self.resolution
 
     def inventory(self, *, deadline: float) -> list[dict[str, object]]:
@@ -411,6 +429,9 @@ class RepairTargetHandoffTests(unittest.TestCase):
                 response["targetFingerprint"], REQUEST["targetFingerprint"]
             )
             self.assertEqual(
+                response["recoveryFingerprint"], RECOVERY_FINGERPRINT
+            )
+            self.assertEqual(
                 response["capability"],
                 "linux-ext4-direct-leaf-readonly-block-v1",
             )
@@ -428,6 +449,7 @@ class RepairTargetHandoffTests(unittest.TestCase):
                     "scanFingerprint",
                     "targetFingerprint",
                     "targetId",
+                    "recoveryFingerprint",
                     "capability",
                     "descriptor",
                 },
@@ -440,11 +462,88 @@ class RepairTargetHandoffTests(unittest.TestCase):
                 "8:2",
                 "majorMinor",
                 "physicalParent",
+                "11111111-2222-3333-4444-555555555555",
+                "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
             ):
                 self.assertNotIn(forbidden, serialized)
         finally:
             for descriptor in descriptors:
                 os.close(descriptor)
+
+    def test_recovery_rescans_twice_and_returns_only_fresh_opaque_claims(
+        self,
+    ) -> None:
+        targets = FakeTargets()
+        service = handoff.RepairTargetHandoff(targets)
+        read_descriptor, write_descriptor = os.pipe()
+        os.close(write_descriptor)
+        with (
+            patch.object(handoff, "_mountinfo_has_device", return_value=False),
+            patch.object(
+                handoff, "_open_bound_block_device", return_value=read_descriptor
+            ),
+            patch.object(handoff, "_assert_block_fd", return_value=None),
+        ):
+            response, descriptors = self._exchange(service, RECOVERY_REQUEST)
+        try:
+            self.assertEqual(targets.events, ["recover", "inventory", "recover"])
+            self.assertEqual(response["outcome"], "ok")
+            self.assertEqual(response["operation"], RECOVERY_REQUEST["operation"])
+            self.assertEqual(
+                response["recoveryFingerprint"], RECOVERY_FINGERPRINT
+            )
+            self.assertEqual(response["scanFingerprint"], REQUEST["scanFingerprint"])
+            self.assertEqual(response["targetId"], REQUEST["targetId"])
+            self.assertEqual(
+                response["targetFingerprint"], REQUEST["targetFingerprint"]
+            )
+            self.assertEqual(len(descriptors), 1)
+            serialized = json.dumps(response, separators=(",", ":"))
+            for forbidden in (
+                "/dev/",
+                "sda2",
+                "8:2",
+                "majorMinor",
+                "11111111-2222-3333-4444-555555555555",
+                "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            ):
+                self.assertNotIn(forbidden, serialized)
+        finally:
+            for descriptor in descriptors:
+                os.close(descriptor)
+
+    def test_recovery_rejects_identity_drift_or_ambiguity_without_rights(self) -> None:
+        class DriftTargets(FakeTargets):
+            def resolve_recovery_target(
+                self, request: dict[str, object], *, deadline: float
+            ) -> tuple[dict[str, object], dict[str, object]]:
+                selection, resolution = super().resolve_recovery_target(
+                    request, deadline=deadline
+                )
+                if self.calls == 2:
+                    changed = dict(resolution)
+                    changed["recoveryUnique"] = False
+                    return selection, changed
+                return selection, resolution
+
+        targets = DriftTargets()
+        service = handoff.RepairTargetHandoff(targets)
+        read_descriptor, write_descriptor = os.pipe()
+        os.close(write_descriptor)
+        with (
+            patch.object(handoff, "_mountinfo_has_device", return_value=False),
+            patch.object(
+                handoff, "_open_bound_block_device", return_value=read_descriptor
+            ),
+            patch.object(handoff, "_assert_block_fd", return_value=None),
+        ):
+            response, descriptors = self._exchange(service, RECOVERY_REQUEST)
+        self.assertEqual(response["outcome"], "error")
+        self.assertEqual(response["operation"], RECOVERY_REQUEST["operation"])
+        self.assertEqual(response["error"], "TARGET_CHANGED")
+        self.assertEqual(descriptors, [])
+        with self.assertRaises(OSError):
+            os.fstat(read_descriptor)
 
     def test_target_fingerprint_is_recomputed_and_mismatch_sends_no_rights(
         self,

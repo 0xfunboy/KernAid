@@ -1842,6 +1842,97 @@ class InstalledTargetTests(unittest.TestCase):
             {"state": "unsupported"},
         )
 
+    def test_recovery_target_digest_is_strong_unique_and_never_public(self) -> None:
+        filesystem_uuid = "11111111-2222-3333-4444-555555555555"
+        partition_uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+        def fixture(*, duplicate: bool = False, serial: str = "SERIAL-001") -> str:
+            disks = [
+                block_device(
+                    "sda",
+                    "disk",
+                    size=8_000_000_000,
+                    serial=serial,
+                    wwn="0x5000c500aabbccdd",
+                    pttype="gpt",
+                    children=[
+                        block_device(
+                            "sda1",
+                            "part",
+                            size=7_000_000_000,
+                            filesystem="ext4",
+                            uuid=filesystem_uuid,
+                            partuuid=partition_uuid,
+                        )
+                    ],
+                )
+            ]
+            if duplicate:
+                clone = json.loads(json.dumps(disks[0]))
+                clone["name"] = "sdb"
+                clone["maj:min"] = "8:16"
+                clone["children"][0]["name"] = "sdb1"
+                clone["children"][0]["maj:min"] = "8:17"
+                disks.append(clone)
+            return json.dumps({"blockdevices": disks})
+
+        snapshot, resolutions = rescue_server._normalize_installed_targets_with_resolutions(
+            fixture()
+        )
+        candidate = snapshot["candidates"][0]
+        resolution = resolutions[candidate["targetId"]]
+        recovery = resolution["recoveryFingerprint"]
+        self.assertRegex(recovery, r"^recovery:[0-9a-f]{64}$")
+        self.assertTrue(resolution["recoveryUnique"])
+        serialized = json.dumps(snapshot, separators=(",", ":"))
+        self.assertNotIn("recoveryFingerprint", serialized)
+        self.assertNotIn(filesystem_uuid, serialized)
+        self.assertNotIn(partition_uuid, serialized)
+        self.assertNotIn("0x5000c500aabbccdd", serialized)
+
+        with patch.object(rescue_server, "_target_scan_output", return_value=fixture()):
+            selection, recovered = rescue_server.resolve_recovery_target(
+                {"recoveryFingerprint": recovery}, deadline=time.monotonic() + 1
+            )
+        self.assertEqual(selection["target"]["targetId"], candidate["targetId"])
+        self.assertEqual(recovered["recoveryFingerprint"], recovery)
+
+        duplicate_snapshot, duplicate_resolutions = (
+            rescue_server._normalize_installed_targets_with_resolutions(
+                fixture(duplicate=True)
+            )
+        )
+        self.assertEqual(len(duplicate_snapshot["candidates"]), 2)
+        self.assertTrue(
+            all(
+                value["recoveryFingerprint"] == recovery
+                and value["recoveryUnique"] is False
+                for value in duplicate_resolutions.values()
+            )
+        )
+        with patch.object(
+            rescue_server,
+            "_target_scan_output",
+            return_value=fixture(duplicate=True),
+        ), self.assertRaises(rescue_server.TargetSelectionError):
+            rescue_server.resolve_recovery_target(
+                {"recoveryFingerprint": recovery}, deadline=time.monotonic() + 1
+            )
+
+        malformed_snapshot, malformed_resolutions = (
+            rescue_server._normalize_installed_targets_with_resolutions(
+                fixture(serial="serial with spaces")
+            )
+        )
+        malformed_candidate = malformed_snapshot["candidates"][0]
+        # WWN remains the preferred strong anchor, so a weak serial cannot
+        # weaken an otherwise qualified identity.
+        self.assertIsNotNone(
+            malformed_resolutions[malformed_candidate["targetId"]][
+                "recoveryFingerprint"
+            ]
+        )
+
     def test_nested_candidate_does_not_abort_efi_sibling_resolution(self) -> None:
         fixture = json.dumps(
             {
