@@ -27,7 +27,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             build-essential cryptsetup dosfstools e2fsprogs gdisk mtools ntfs-3g \
-            ovmf pkg-config qemu-system-x86 shellcheck udev util-linux \
+            ovmf pkg-config qemu-system-x86 shellcheck squashfs-tools udev util-linux xorriso \
             libdbus-1-dev libwebkit2gtk-4.1-dev \
             libayatana-appindicator3-dev librsvg2-dev procps
 
@@ -86,9 +86,12 @@ jobs:
         run: |
           python3 -m unittest \
             tools/build-rescue/tests/test_repair_candidate_packaging.py \
+            tools/build-rescue/tests/test_qemu_repair_candidate_smoke.py \
             tools/build-rescue/tests/test_live_image_vault_packaging.py -v
-          bash -n tools/build-rescue/build.sh tools/build-rescue/qemu-smoke.sh
-          shellcheck tools/build-rescue/build.sh tools/build-rescue/qemu-smoke.sh
+          bash -n tools/build-rescue/build.sh tools/build-rescue/qemu-smoke.sh \
+            tools/build-rescue/qemu-repair-candidate-smoke.sh
+          shellcheck tools/build-rescue/build.sh tools/build-rescue/qemu-smoke.sh \
+            tools/build-rescue/qemu-repair-candidate-smoke.sh
           pnpm exec prettier --check \
             .github/workflows/rescue-repair-candidate.yml
 
@@ -181,6 +184,11 @@ jobs:
         run: |
           KERNAID_SMOKE_LOG=rescue-repair-candidate-uefi.log \
             ./tools/build-rescue/qemu-smoke.sh uefi \
+            "$PWD/KernAid-Rescue-amd64-repair-candidate.iso"
+
+      - name: QEMU BIOS repair candidate apply qualification
+        run: |
+          ./tools/build-rescue/qemu-repair-candidate-smoke.sh \
             "$PWD/KernAid-Rescue-amd64-repair-candidate.iso"
 
       - name: Upload repair candidate ISO

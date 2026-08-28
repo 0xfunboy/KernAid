@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+"""Bounded PTY controller for the disposable Rescue repair qualification."""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import os
+import re
+import signal
+import sys
+import textwrap
+import time
+from pathlib import Path
+from typing import Sequence
+
+
+TOOLS = Path(__file__).resolve().parent
+LIFECYCLE_PATH = TOOLS / "qemu-vault-lifecycle-pty.py"
+SPEC = importlib.util.spec_from_file_location("kernaid_qemu_lifecycle", LIFECYCLE_PATH)
+if SPEC is None or SPEC.loader is None:
+    raise SystemExit(2)
+LIFECYCLE = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = LIFECYCLE
+SPEC.loader.exec_module(LIFECYCLE)
+
+FAILURE_PREFIX = "KERNAID_QEMU_REPAIR_CANDIDATE_FAILURE_V1"
+ATTESTATION_PREFIX = "KERNAID_QEMU_REPAIR_CANDIDATE_GUEST_V1"
+
+
+class ClosedParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        del message
+        raise LIFECYCLE.ClosedFailure("arguments", "invalid")
+
+
+def parser() -> ClosedParser:
+    value = ClosedParser(add_help=False, allow_abbrev=False)
+    value.add_argument("--qemu", required=True)
+    value.add_argument("--qmp-socket", type=Path, required=True)
+    value.add_argument("--vault-key-fd", type=int, required=True)
+    value.add_argument("--login-credential-fd", type=int, required=True)
+    value.add_argument("--before-sha256", required=True)
+    value.add_argument("--after-sha256", required=True)
+    value.add_argument("--timeout", type=float, default=900.0)
+    value.add_argument("qemu_args", nargs=argparse.REMAINDER)
+    return value
+
+
+def repair_source(before_sha256: str, after_sha256: str) -> bytes:
+    # This source is fixed by the qualification controller. It supplies only
+    # opaque target claims and the exact typed approval accepted by production.
+    source = f'''import hashlib,http.client,json,secrets,sys,time
+HOST="127.0.0.1:4173"
+ORIGIN="http://127.0.0.1:4173"
+API="kernaid.dev/rescue-repair-service/v1alpha1"
+BEFORE={before_sha256!r}
+AFTER={after_sha256!r}
+counter=0
+def request_id():
+    global counter
+    counter+=1
+    return "R-00000000-0000-0000-0000-"+format(counter,"012x")
+def call(path,body=None,timeout=25):
+    encoded=None if body is None else json.dumps(body,ensure_ascii=True,separators=(",",":")).encode("ascii")
+    headers={{"Host":HOST}}
+    if encoded is not None:
+        headers.update({{"Origin":ORIGIN,"Content-Type":"application/json"}})
+    connection=http.client.HTTPConnection("127.0.0.1",4173,timeout=timeout)
+    connection.request("GET" if encoded is None else "POST",path,body=encoded,headers=headers)
+    response=connection.getresponse()
+    payload=response.read(65537)
+    status=response.status
+    connection.close()
+    if len(payload)>65536:
+        raise RuntimeError()
+    return status,json.loads(payload)
+def repair(body):
+    status,value=call("/api/rescue/repair",body)
+    if status!=200 or value.get("outcome")!="ok":
+        raise RuntimeError()
+    return value
+def status_until(states,deadline):
+    while time.monotonic()<deadline:
+        value=repair({{"apiVersion":API,"requestId":request_id(),"operation":"repair.status"}})
+        if value.get("state") in states:
+            return value
+        time.sleep(.2)
+    raise RuntimeError()
+try:
+    deadline=time.monotonic()+240
+    while True:
+        try:
+            initial=repair({{"apiVersion":API,"requestId":request_id(),"operation":"repair.status"}})
+            if initial.get("state")=="idle":
+                break
+        except BaseException:
+            pass
+        if time.monotonic()>=deadline:
+            raise RuntimeError()
+        time.sleep(.5)
+    while True:
+        try:
+            code,inventory=call("/api/inventory")
+            code2,scan=call("/api/rescue/installed-targets")
+            if code==200 and code2==200:
+                break
+        except BaseException:
+            pass
+        if time.monotonic()>=deadline:
+            raise RuntimeError()
+        time.sleep(.5)
+    candidates=[item for item in scan["candidates"] if item.get("osFamilyHint")=="linux" and item.get("requiresUnlock") is False]
+    if len(candidates)!=1:
+        raise RuntimeError()
+    candidate=candidates[0]
+    selection_body={{"scanFingerprint":scan["scanFingerprint"],"targetId":candidate["targetId"]}}
+    selected_code,selected=call("/api/rescue/select-installed-target",selection_body)
+    inspected_code,inspected=call("/api/rescue/inspect-installed-target",selection_body)
+    if selected_code!=200 or selected.get("target")!=candidate or inspected_code!=200 or inspected.get("status")!="installed-os-content-inspected" or inspected.get("target",{{}}).get("filesystem")!="ext4":
+        raise RuntimeError()
+    identity=[item for item in inventory if "hostname" in item.get("collector","") or "block.inventory" in item.get("collector","") or item.get("collector","").endswith((".disks",".system",".storage.identity"))]
+    if not identity or any(item.get("success") is not True or item.get("truncated") is True for item in identity):
+        raise RuntimeError()
+    canonical="\\0".join(item["collector"]+"\\0"+item["output"] for item in identity)
+    runtime="sha256:"+hashlib.sha256(canonical.encode()).hexdigest()
+    candidate_json=json.dumps(candidate,ensure_ascii=True,sort_keys=True,separators=(",",":"))
+    material="\\0".join(("kernaid-rescue-observe-target-v1",runtime,scan["scanFingerprint"],candidate["targetId"],candidate_json))
+    target_fingerprint="sha256:"+hashlib.sha256(material.encode()).hexdigest()
+    prepare=repair({{"apiVersion":API,"requestId":request_id(),"operation":"repair.fstab.prepare","target":{{"scanFingerprint":scan["scanFingerprint"],"targetFingerprint":target_fingerprint,"targetId":candidate["targetId"]}}}})
+    if prepare.get("state") not in ("preparing","prepared"):
+        raise RuntimeError()
+    prepared=prepare if prepare.get("state")=="prepared" else status_until({{"prepared","failed","restored","manual-reconciliation-required"}},deadline)
+    detail=prepared.get("detail",{{}})
+    if prepared.get("state")!="prepared" or detail.get("actionId")!="linux.fstab.disable-missing-uuid.v1" or detail.get("beforeSha256")!=BEFORE or detail.get("afterSha256")!=AFTER or detail.get("backup")!={{"state":"reserved","vaultDistinct":True}} or detail.get("confirmationRequired")!="DISABILITA VOCE FSTAB":
+        raise RuntimeError()
+    approved=repair({{"apiVersion":API,"requestId":request_id(),"operation":"repair.fstab.approve","preparedId":detail["preparedId"],"sessionId":detail["sessionId"],"planId":detail["planId"],"planHash":detail["planHash"],"approvalId":"A-"+secrets.token_hex(16),"approvalSequence":detail["nextApprovalSequence"],"typedConfirmation":"DISABILITA VOCE FSTAB"}})
+    if approved.get("state") not in ("executing","succeeded"):
+        raise RuntimeError()
+    terminal=approved if approved.get("state")=="succeeded" else status_until({{"succeeded","restored","failed","manual-reconciliation-required"}},deadline)
+    terminal_detail=terminal.get("detail",{{}})
+    if terminal.get("state")!="succeeded" or terminal_detail.get("terminalOutcome")!="committed" or not isinstance(terminal_detail.get("reservationId"),str) or not isinstance(terminal_detail.get("transactionBindingSha256"),str):
+        raise RuntimeError()
+except BaseException:
+    sys.exit(40)
+sys.stdout.write("KERNAID_QEMU_PROVIDER_PROOF_V1 stage=repair-apply result=true\\n")
+'''
+    return textwrap.dedent(source).encode("ascii")
+
+
+def main(arguments: Sequence[str]) -> int:
+    if arguments[:1] == ["--extract-live-credential"]:
+        extract = ClosedParser(add_help=False, allow_abbrev=False)
+        extract.add_argument("--source-fd", type=int, required=True)
+        extract.add_argument("--credential-fd", type=int, required=True)
+        try:
+            parsed = extract.parse_args(arguments[1:])
+            LIFECYCLE.extract_live_credential(
+                parsed.source_fd,
+                parsed.credential_fd,
+                expected_uid=os.geteuid(),
+                expected_gid=os.getegid(),
+            )
+            return 0
+        except BaseException:
+            print(f"{FAILURE_PREFIX} stage=credential code=invalid", file=sys.stderr)
+            return 1
+
+    key = bytearray()
+    login = bytearray()
+    harness = None
+    failure = None
+    prior_handlers = {}
+    prior_mask = None
+    try:
+        parsed = parser().parse_args(arguments)
+        if parsed.qemu_args[:1] != ["--"]:
+            raise LIFECYCLE.ClosedFailure("arguments", "invalid")
+        for digest in (parsed.before_sha256, parsed.after_sha256):
+            if re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
+                raise LIFECYCLE.ClosedFailure("arguments", "digest-invalid")
+        if parsed.before_sha256 == parsed.after_sha256 or not 300 <= parsed.timeout <= 1200:
+            raise LIFECYCLE.ClosedFailure("arguments", "invalid")
+        prior_handlers, prior_mask = LIFECYCLE.install_signal_guard()
+        key = LIFECYCLE.read_secret_fd(parsed.vault_key_fd, expected_uid=os.geteuid())
+        login = LIFECYCLE.read_login_credential_fd(
+            parsed.login_credential_fd, expected_uid=os.geteuid()
+        )
+        aggregate = time.monotonic() + parsed.timeout
+        harness = LIFECYCLE.QemuHarness(
+            parsed.qemu,
+            parsed.qemu_args[1:],
+            parsed.qmp_socket,
+            [key],
+            [key, login],
+        )
+        console, qmp = harness.start(LIFECYCLE._deadline(aggregate, 15.0))
+        console.wait_regex(
+            re.compile(rb"KERNAID_RESCUE_FIRSTBOOT_PROMPT_READY_V1 step=passphrase"),
+            start=0,
+            deadline=LIFECYCLE._deadline(aggregate, 600.0),
+            stage="firstboot-start",
+        )
+        qmp.set_deadline(LIFECYCLE._deadline(aggregate, 10.0))
+        qmp.send_hex_line(key)
+        confirmation = console.wait_regex(
+            re.compile(rb"KERNAID_RESCUE_FIRSTBOOT_PROMPT_READY_V1 step=confirmation"),
+            start=0,
+            deadline=LIFECYCLE._deadline(aggregate, 600.0),
+            stage="firstboot-confirmation",
+        )
+        qmp.set_deadline(LIFECYCLE._deadline(aggregate, 10.0))
+        qmp.send_hex_line(key)
+        LIFECYCLE.wait_firstboot_attestation(
+            console, confirmation.end(), LIFECYCLE._deadline(aggregate, 600.0)
+        )
+        cursor = LIFECYCLE.establish_live_session(console, aggregate, login)
+        unlocked, cursor = LIFECYCLE.run_companion(
+            console, "unlock", "repair-unlock", cursor, aggregate, key
+        )
+        if unlocked.vault_state != "unlocked" or unlocked.device_id is None:
+            raise LIFECYCLE.ClosedFailure("vault", "unlock-invalid")
+        LIFECYCLE.run_guest_proof(
+            console,
+            "repair-apply",
+            repair_source(parsed.before_sha256, parsed.after_sha256),
+            cursor,
+            aggregate,
+            timeout=300.0,
+        )
+        qmp.set_deadline(LIFECYCLE._deadline(aggregate, 10.0))
+        qmp.system_powerdown()
+        harness.wait_for_shutdown(LIFECYCLE._deadline(aggregate, 180.0))
+    except LIFECYCLE.ClosedFailure as error:
+        failure = error
+    except (LIFECYCLE.ControllerSignal, KeyboardInterrupt, SystemExit):
+        failure = LIFECYCLE.ClosedFailure("controller", "interrupted")
+    except BaseException:
+        failure = LIFECYCLE.ClosedFailure("controller", "unexpected")
+    finally:
+        LIFECYCLE.enter_signal_safe_cleanup(prior_handlers)
+        if harness is not None:
+            try:
+                harness.cleanup()
+            except BaseException:
+                failure = LIFECYCLE.ClosedFailure("cleanup", "qemu-residue")
+        LIFECYCLE.wipe(key)
+        LIFECYCLE.wipe(login)
+        LIFECYCLE.restore_signal_guard(prior_handlers, prior_mask)
+    if failure is not None:
+        print(
+            f"{FAILURE_PREFIX} stage={failure.stage} code={failure.code}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 1
+    print(
+        f"{ATTESTATION_PREFIX} action=linux.fstab.disable-missing-uuid.v1 "
+        f"before_sha256={parsed.before_sha256} after_sha256={parsed.after_sha256} "
+        "vault_distinct=true terminal=committed approval=typed-single-use ready=true",
+        flush=True,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
