@@ -11,7 +11,9 @@
 #[cfg(feature = "experimental-repair-store")]
 use kernaid_protocol::rescue_repair_vault::{
     MAX_REPAIR_BACKUP_BYTES, RepairBackupBinding, RepairBackupDraft, RepairBackupState,
-    RepairBackupStatusPayload, RepairFileMetadataV1, RepairReservationId,
+    RepairBackupStatusPayload, RepairExecutionIntentV1, RepairFileMetadataV1, RepairReservationId,
+    RepairTransactionPhase, RepairTransactionResolution, RepairTransactionResolutionOutcome,
+    RepairTransactionStatusPayload, RepairTransactionStatusSelector, RepairTransactionTargetState,
 };
 use kernaid_protocol::rescue_vault::{
     AuditEventType, AuditOutcome, ErrorToken, MAX_AUDIT_SEQUENCE, MAX_OPENAI_KEY_BYTES,
@@ -38,11 +40,11 @@ use std::{
 use std::os::fd::AsFd;
 
 #[cfg(feature = "experimental-repair-store")]
-const COMMAND_MAGIC: &[u8; 8] = b"KRVWC004";
+const COMMAND_MAGIC: &[u8; 8] = b"KRVWC005";
 #[cfg(not(feature = "experimental-repair-store"))]
 const COMMAND_MAGIC: &[u8; 8] = b"KRVWC003";
 #[cfg(feature = "experimental-repair-store")]
-const RESPONSE_MAGIC: &[u8; 8] = b"KRVWR004";
+const RESPONSE_MAGIC: &[u8; 8] = b"KRVWR005";
 #[cfg(not(feature = "experimental-repair-store"))]
 const RESPONSE_MAGIC: &[u8; 8] = b"KRVWR003";
 // Repair capabilities intentionally remain one canonical fixed-size binary
@@ -137,6 +139,7 @@ pub(super) struct WorkerRepairBinding {
     pub(super) approval_sha256: [u8; 32],
     pub(super) resource_id: String,
     pub(super) resource_sha256: [u8; 32],
+    pub(super) execution_intent: RepairExecutionIntentV1,
 }
 
 #[cfg(feature = "experimental-repair-store")]
@@ -177,6 +180,7 @@ impl WorkerRepairBinding {
             approval_sha256: value.approval_sha256().bytes(),
             resource_id: value.resource_id().to_owned(),
             resource_sha256: value.resource_sha256().bytes(),
+            execution_intent: value.execution_intent().clone(),
         }
     }
 
@@ -188,6 +192,7 @@ impl WorkerRepairBinding {
             protocol_sha256(self.approval_sha256)?,
             self.resource_id.clone(),
             protocol_sha256(self.resource_sha256)?,
+            self.execution_intent.clone(),
         )
         .map_err(|_| InternalWireError::InvalidFrame)
     }
@@ -242,6 +247,10 @@ impl WorkerRepairStatus {
                     .resource_sha256()
                     .ok_or(InternalWireError::InvalidFrame)?
                     .bytes(),
+                execution_intent: value
+                    .execution_intent()
+                    .ok_or(InternalWireError::InvalidFrame)?
+                    .clone(),
             }),
         };
         let status = Self {
@@ -329,7 +338,7 @@ pub(super) enum WorkerRepairCommand {
     },
     Persist {
         expected: Box<WorkerRepairStatus>,
-        binding: WorkerRepairBinding,
+        binding: Box<WorkerRepairBinding>,
         metadata: WorkerRepairFileMetadata,
         input_size: u64,
     },
@@ -346,6 +355,13 @@ pub(super) enum WorkerRepairCommand {
     Retire {
         expected: Box<WorkerRepairStatus>,
     },
+    TransactionStatus {
+        selector: RepairTransactionStatusSelector,
+    },
+    TransactionResolve {
+        expected: Box<RepairTransactionStatusPayload>,
+        resolution: RepairTransactionResolution,
+    },
 }
 
 #[cfg(feature = "experimental-repair-store")]
@@ -358,6 +374,8 @@ impl WorkerRepairCommand {
             Self::Get { .. } => WorkerCommandKind::RepairBackupGet,
             Self::Cancel { .. } => WorkerCommandKind::RepairBackupCancel,
             Self::Retire { .. } => WorkerCommandKind::RepairBackupRetire,
+            Self::TransactionStatus { .. } => WorkerCommandKind::RepairTransactionStatus,
+            Self::TransactionResolve { .. } => WorkerCommandKind::RepairTransactionResolve,
         }
     }
 
@@ -406,6 +424,20 @@ impl WorkerRepairCommand {
                     return Err(InternalWireError::InvalidFrame);
                 }
                 Ok(())
+            }
+            Self::TransactionStatus { selector } => validate_repair_transaction_selector(selector),
+            Self::TransactionResolve {
+                expected,
+                resolution,
+            } => {
+                validate_repair_transaction_status(expected)?;
+                validate_repair_transaction_resolution(
+                    resolution,
+                    expected
+                        .backup()
+                        .execution_intent()
+                        .ok_or(InternalWireError::InvalidFrame)?,
+                )
             }
         }
     }
@@ -477,6 +509,10 @@ pub(super) enum WorkerCommandKind {
     RepairBackupCancel,
     #[cfg(feature = "experimental-repair-store")]
     RepairBackupRetire,
+    #[cfg(feature = "experimental-repair-store")]
+    RepairTransactionStatus,
+    #[cfg(feature = "experimental-repair-store")]
+    RepairTransactionResolve,
     AttestQuiescent,
     Shutdown,
 }
@@ -655,6 +691,8 @@ impl WorkerCommand {
                         | WorkerCommandKind::RepairBackupGet
                         | WorkerCommandKind::RepairBackupCancel
                         | WorkerCommandKind::RepairBackupRetire
+                        | WorkerCommandKind::RepairTransactionStatus
+                        | WorkerCommandKind::RepairTransactionResolve
                 ))
         {
             return Err(InternalWireError::InvalidFrame);
@@ -712,6 +750,10 @@ impl WorkerCommand {
             WorkerCommandKind::RepairBackupCancel => 20,
             #[cfg(feature = "experimental-repair-store")]
             WorkerCommandKind::RepairBackupRetire => 21,
+            #[cfg(feature = "experimental-repair-store")]
+            WorkerCommandKind::RepairTransactionStatus => 22,
+            #[cfg(feature = "experimental-repair-store")]
+            WorkerCommandKind::RepairTransactionResolve => 23,
         };
         bytes[12..20].copy_from_slice(&self.request_id.to_be_bytes());
         if let Some(application) = &self.application {
@@ -826,6 +868,10 @@ impl WorkerCommand {
             20 => WorkerCommandKind::RepairBackupCancel,
             #[cfg(feature = "experimental-repair-store")]
             21 => WorkerCommandKind::RepairBackupRetire,
+            #[cfg(feature = "experimental-repair-store")]
+            22 => WorkerCommandKind::RepairTransactionStatus,
+            #[cfg(feature = "experimental-repair-store")]
+            23 => WorkerCommandKind::RepairTransactionResolve,
             _ => return Err(InternalWireError::InvalidFrame),
         };
         let application = match kind {
@@ -888,7 +934,11 @@ impl WorkerCommand {
             | WorkerCommandKind::RepairBackupStatus
             | WorkerCommandKind::RepairBackupGet
             | WorkerCommandKind::RepairBackupCancel
-            | WorkerCommandKind::RepairBackupRetire => Some(decode_repair_command(bytes, kind)?),
+            | WorkerCommandKind::RepairBackupRetire
+            | WorkerCommandKind::RepairTransactionStatus
+            | WorkerCommandKind::RepairTransactionResolve => {
+                Some(decode_repair_command(bytes, kind)?)
+            }
             _ => None,
         };
         #[cfg(feature = "experimental-repair-store")]
@@ -943,6 +993,23 @@ fn encode_repair_command(
             writer.string(reservation_id, MAX_REPAIR_ID_BYTES)?;
             writer.hash(*draft_binding_sha256)?;
         }
+        WorkerRepairCommand::TransactionStatus { selector } => {
+            encode_repair_transaction_selector(&mut writer, selector)?;
+        }
+        WorkerRepairCommand::TransactionResolve {
+            expected,
+            resolution,
+        } => {
+            encode_repair_transaction_status(&mut writer, expected)?;
+            encode_repair_transaction_resolution(
+                &mut writer,
+                resolution,
+                expected
+                    .backup()
+                    .execution_intent()
+                    .ok_or(InternalWireError::InvalidFrame)?,
+            )?;
+        }
     }
     Ok(())
 }
@@ -963,7 +1030,7 @@ fn decode_repair_command(
         },
         WorkerCommandKind::RepairBackupPersist => WorkerRepairCommand::Persist {
             expected: Box::new(decode_repair_status(&mut reader)?),
-            binding: decode_repair_binding(&mut reader)?,
+            binding: Box::new(decode_repair_binding(&mut reader)?),
             metadata: WorkerRepairFileMetadata {
                 mode: reader.u32()?,
                 uid: reader.u32()?,
@@ -984,6 +1051,23 @@ fn decode_repair_command(
         WorkerCommandKind::RepairBackupRetire => WorkerRepairCommand::Retire {
             expected: Box::new(decode_repair_status(&mut reader)?),
         },
+        WorkerCommandKind::RepairTransactionStatus => WorkerRepairCommand::TransactionStatus {
+            selector: decode_repair_transaction_selector(&mut reader)?,
+        },
+        WorkerCommandKind::RepairTransactionResolve => {
+            let expected = decode_repair_transaction_status(&mut reader)?;
+            let resolution = decode_repair_transaction_resolution(
+                &mut reader,
+                expected
+                    .backup()
+                    .execution_intent()
+                    .ok_or(InternalWireError::InvalidFrame)?,
+            )?;
+            WorkerRepairCommand::TransactionResolve {
+                expected: Box::new(expected),
+                resolution,
+            }
+        }
         _ => return Err(InternalWireError::InvalidFrame),
     };
     if !reader.remaining_is_zero() {
@@ -1036,7 +1120,8 @@ fn encode_repair_binding(
     writer.string(&binding.approval_id, MAX_REPAIR_ID_BYTES)?;
     writer.hash(binding.approval_sha256)?;
     writer.string(&binding.resource_id, MAX_REPAIR_ID_BYTES)?;
-    writer.hash(binding.resource_sha256)
+    writer.hash(binding.resource_sha256)?;
+    encode_repair_execution_intent(writer, &binding.execution_intent)
 }
 
 #[cfg(feature = "experimental-repair-store")]
@@ -1050,9 +1135,86 @@ fn decode_repair_binding(
         approval_sha256: reader.hash()?,
         resource_id: reader.string(MAX_REPAIR_ID_BYTES)?,
         resource_sha256: reader.hash()?,
+        execution_intent: decode_repair_execution_intent(reader)?,
     };
     binding.to_protocol()?;
     Ok(binding)
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn encode_repair_execution_intent(
+    writer: &mut ClosedFrameWriter<'_>,
+    intent: &RepairExecutionIntentV1,
+) -> Result<(), InternalWireError> {
+    writer.string(intent.action_id(), MAX_REPAIR_ID_BYTES)?;
+    writer.string(intent.session_id(), MAX_REPAIR_ID_BYTES)?;
+    writer.u64(intent.approval_sequence())?;
+    writer.string(intent.target_id(), MAX_REPAIR_ID_BYTES)?;
+    writer.string(intent.scan_fingerprint(), MAX_REPAIR_ID_BYTES)?;
+    writer.hash(intent.target_fingerprint().bytes())?;
+    writer.hash(intent.target_physical_parent_fingerprint().bytes())?;
+    writer.string(intent.lock_identity(), MAX_REPAIR_ID_BYTES)?;
+    writer.hash(intent.before_sha256().bytes())?;
+    writer.hash(intent.after_sha256().bytes())?;
+    writer.hash(intent.diff_sha256().bytes())?;
+    writer.hash(intent.observed_uuid_set_sha256().bytes())?;
+    encode_repair_file_metadata(writer, intent.before_metadata())
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn decode_repair_execution_intent(
+    reader: &mut ClosedFrameReader<'_>,
+) -> Result<RepairExecutionIntentV1, InternalWireError> {
+    let action_id = reader.string(MAX_REPAIR_ID_BYTES)?;
+    let session_id = reader.string(MAX_REPAIR_ID_BYTES)?;
+    let approval_sequence = reader.u64()?;
+    let target_id = reader.string(MAX_REPAIR_ID_BYTES)?;
+    let scan_fingerprint = reader.string(MAX_REPAIR_ID_BYTES)?;
+    let target_fingerprint = protocol_sha256(reader.hash()?)?;
+    let target_physical_parent_fingerprint = protocol_sha256(reader.hash()?)?;
+    let lock_identity = reader.string(MAX_REPAIR_ID_BYTES)?;
+    let before_sha256 = protocol_sha256(reader.hash()?)?;
+    let after_sha256 = protocol_sha256(reader.hash()?)?;
+    let diff_sha256 = protocol_sha256(reader.hash()?)?;
+    let observed_uuid_set_sha256 = protocol_sha256(reader.hash()?)?;
+    let before_metadata = decode_repair_file_metadata(reader)?;
+    let intent = RepairExecutionIntentV1::new(
+        session_id,
+        approval_sequence,
+        target_id,
+        scan_fingerprint,
+        target_fingerprint,
+        target_physical_parent_fingerprint,
+        lock_identity,
+        before_sha256,
+        after_sha256,
+        diff_sha256,
+        observed_uuid_set_sha256,
+        before_metadata,
+    )
+    .map_err(|_| InternalWireError::InvalidFrame)?;
+    if intent.action_id() != action_id {
+        return Err(InternalWireError::InvalidFrame);
+    }
+    Ok(intent)
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn encode_repair_file_metadata(
+    writer: &mut ClosedFrameWriter<'_>,
+    metadata: &RepairFileMetadataV1,
+) -> Result<(), InternalWireError> {
+    writer.u32(metadata.mode())?;
+    writer.u32(metadata.uid())?;
+    writer.u32(metadata.gid())
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn decode_repair_file_metadata(
+    reader: &mut ClosedFrameReader<'_>,
+) -> Result<RepairFileMetadataV1, InternalWireError> {
+    RepairFileMetadataV1::new(reader.u32()?, reader.u32()?, reader.u32()?)
+        .map_err(|_| InternalWireError::InvalidFrame)
 }
 
 #[cfg(feature = "experimental-repair-store")]
@@ -1110,6 +1272,220 @@ fn decode_repair_status(
     };
     status.validate()?;
     Ok(status)
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn encode_repair_transaction_selector(
+    writer: &mut ClosedFrameWriter<'_>,
+    selector: &RepairTransactionStatusSelector,
+) -> Result<(), InternalWireError> {
+    validate_repair_transaction_selector(selector)?;
+    match selector {
+        RepairTransactionStatusSelector::PendingSingleton => writer.u8(1),
+        RepairTransactionStatusSelector::Exact {
+            reservation_id,
+            transaction_binding_sha256,
+        } => {
+            writer.u8(2)?;
+            writer.string(reservation_id.as_str(), MAX_REPAIR_ID_BYTES)?;
+            writer.hash(transaction_binding_sha256.bytes())
+        }
+    }
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn decode_repair_transaction_selector(
+    reader: &mut ClosedFrameReader<'_>,
+) -> Result<RepairTransactionStatusSelector, InternalWireError> {
+    let selector = match reader.u8()? {
+        1 => RepairTransactionStatusSelector::pending_singleton(),
+        2 => RepairTransactionStatusSelector::exact(
+            RepairReservationId::parse(&reader.string(MAX_REPAIR_ID_BYTES)?)
+                .map_err(|_| InternalWireError::InvalidFrame)?,
+            protocol_sha256(reader.hash()?)?,
+        ),
+        _ => return Err(InternalWireError::InvalidFrame),
+    };
+    validate_repair_transaction_selector(&selector)?;
+    Ok(selector)
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn validate_repair_transaction_selector(
+    selector: &RepairTransactionStatusSelector,
+) -> Result<(), InternalWireError> {
+    match selector {
+        RepairTransactionStatusSelector::PendingSingleton => Ok(()),
+        RepairTransactionStatusSelector::Exact {
+            reservation_id,
+            transaction_binding_sha256,
+        } => {
+            RepairReservationId::parse(reservation_id.as_str())
+                .map_err(|_| InternalWireError::InvalidFrame)?;
+            protocol_sha256(transaction_binding_sha256.bytes()).map(|_| ())
+        }
+    }
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn encode_repair_transaction_status(
+    writer: &mut ClosedFrameWriter<'_>,
+    status: &RepairTransactionStatusPayload,
+) -> Result<(), InternalWireError> {
+    validate_repair_transaction_status(status)?;
+    writer.u8(match status.phase() {
+        RepairTransactionPhase::Pending => 1,
+        RepairTransactionPhase::Resolved => 2,
+        RepairTransactionPhase::ManualReconciliationRequired => 3,
+    })?;
+    writer.hash(status.transaction_binding_sha256().bytes())?;
+    encode_repair_status(writer, &WorkerRepairStatus::from_protocol(status.backup())?)?;
+    match status.resolution() {
+        None => writer.u8(0),
+        Some(resolution) => {
+            writer.u8(1)?;
+            encode_repair_transaction_resolution(
+                writer,
+                resolution,
+                status
+                    .backup()
+                    .execution_intent()
+                    .ok_or(InternalWireError::InvalidFrame)?,
+            )
+        }
+    }
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn decode_repair_transaction_status(
+    reader: &mut ClosedFrameReader<'_>,
+) -> Result<RepairTransactionStatusPayload, InternalWireError> {
+    let encoded_phase = match reader.u8()? {
+        1 => RepairTransactionPhase::Pending,
+        2 => RepairTransactionPhase::Resolved,
+        3 => RepairTransactionPhase::ManualReconciliationRequired,
+        _ => return Err(InternalWireError::InvalidFrame),
+    };
+    let encoded_binding = reader.hash()?;
+    let backup = decode_repair_status(reader)?.to_protocol()?;
+    let intent = backup
+        .execution_intent()
+        .ok_or(InternalWireError::InvalidFrame)?;
+    let resolution = match reader.u8()? {
+        0 => None,
+        1 => Some(decode_repair_transaction_resolution(reader, intent)?),
+        _ => return Err(InternalWireError::InvalidFrame),
+    };
+    let status = match resolution {
+        None => RepairTransactionStatusPayload::pending(backup),
+        Some(resolution) => RepairTransactionStatusPayload::resolved(backup, resolution),
+    }
+    .map_err(|_| InternalWireError::InvalidFrame)?;
+    if status.phase() != encoded_phase
+        || status.transaction_binding_sha256().bytes() != encoded_binding
+    {
+        return Err(InternalWireError::InvalidFrame);
+    }
+    validate_repair_transaction_status(&status)?;
+    Ok(status)
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn validate_repair_transaction_status(
+    status: &RepairTransactionStatusPayload,
+) -> Result<(), InternalWireError> {
+    let canonical = match status.resolution() {
+        None => RepairTransactionStatusPayload::pending(status.backup().clone()),
+        Some(resolution) => {
+            RepairTransactionStatusPayload::resolved(status.backup().clone(), resolution.clone())
+        }
+    }
+    .map_err(|_| InternalWireError::InvalidFrame)?;
+    if &canonical != status {
+        return Err(InternalWireError::InvalidFrame);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn encode_repair_transaction_resolution(
+    writer: &mut ClosedFrameWriter<'_>,
+    resolution: &RepairTransactionResolution,
+    intent: &RepairExecutionIntentV1,
+) -> Result<(), InternalWireError> {
+    validate_repair_transaction_resolution(resolution, intent)?;
+    writer.u8(match resolution.outcome() {
+        RepairTransactionResolutionOutcome::CommittedAfter => 1,
+        RepairTransactionResolutionOutcome::ClosedBeforeUnchanged => 2,
+        RepairTransactionResolutionOutcome::ClosedBeforeRestored => 3,
+        RepairTransactionResolutionOutcome::ManualReconciliationRequired => 4,
+    })?;
+    writer.u8(match resolution.target_state() {
+        RepairTransactionTargetState::Before => 1,
+        RepairTransactionTargetState::After => 2,
+        RepairTransactionTargetState::Third => 3,
+    })?;
+    writer.hash(resolution.observed_resource_sha256().bytes())?;
+    writer.hash(resolution.observed_metadata_sha256().bytes())?;
+    writer.u8(u8::from(resolution.mount_cleanup_verified()))
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn decode_repair_transaction_resolution(
+    reader: &mut ClosedFrameReader<'_>,
+    intent: &RepairExecutionIntentV1,
+) -> Result<RepairTransactionResolution, InternalWireError> {
+    let outcome = match reader.u8()? {
+        1 => RepairTransactionResolutionOutcome::CommittedAfter,
+        2 => RepairTransactionResolutionOutcome::ClosedBeforeUnchanged,
+        3 => RepairTransactionResolutionOutcome::ClosedBeforeRestored,
+        4 => RepairTransactionResolutionOutcome::ManualReconciliationRequired,
+        _ => return Err(InternalWireError::InvalidFrame),
+    };
+    let encoded_target_state = match reader.u8()? {
+        1 => RepairTransactionTargetState::Before,
+        2 => RepairTransactionTargetState::After,
+        3 => RepairTransactionTargetState::Third,
+        _ => return Err(InternalWireError::InvalidFrame),
+    };
+    let observed_resource_sha256 = protocol_sha256(reader.hash()?)?;
+    let observed_metadata_sha256 = protocol_sha256(reader.hash()?)?;
+    let mount_cleanup_verified = match reader.u8()? {
+        0 => false,
+        1 => true,
+        _ => return Err(InternalWireError::InvalidFrame),
+    };
+    let resolution = RepairTransactionResolution::new(
+        outcome,
+        observed_resource_sha256,
+        observed_metadata_sha256,
+        mount_cleanup_verified,
+        intent,
+    )
+    .map_err(|_| InternalWireError::InvalidFrame)?;
+    if resolution.target_state() != encoded_target_state {
+        return Err(InternalWireError::InvalidFrame);
+    }
+    Ok(resolution)
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn validate_repair_transaction_resolution(
+    resolution: &RepairTransactionResolution,
+    intent: &RepairExecutionIntentV1,
+) -> Result<(), InternalWireError> {
+    let canonical = RepairTransactionResolution::new(
+        resolution.outcome(),
+        resolution.observed_resource_sha256().clone(),
+        resolution.observed_metadata_sha256().clone(),
+        resolution.mount_cleanup_verified(),
+        intent,
+    )
+    .map_err(|_| InternalWireError::InvalidFrame)?;
+    if &canonical != resolution {
+        return Err(InternalWireError::InvalidFrame);
+    }
+    Ok(())
 }
 
 #[cfg(feature = "experimental-repair-store")]
@@ -1549,6 +1925,10 @@ pub(super) enum WorkerResultCode {
     RepairBackupCancelled,
     #[cfg(feature = "experimental-repair-store")]
     RepairBackupRetired,
+    #[cfg(feature = "experimental-repair-store")]
+    RepairTransactionStatusReady,
+    #[cfg(feature = "experimental-repair-store")]
+    RepairTransactionResolved,
 }
 
 impl WorkerResultCode {
@@ -1638,6 +2018,10 @@ impl WorkerResultCode {
             Self::RepairBackupCancelled => 70,
             #[cfg(feature = "experimental-repair-store")]
             Self::RepairBackupRetired => 71,
+            #[cfg(feature = "experimental-repair-store")]
+            Self::RepairTransactionStatusReady => 72,
+            #[cfg(feature = "experimental-repair-store")]
+            Self::RepairTransactionResolved => 73,
         }
     }
 
@@ -1727,6 +2111,10 @@ impl WorkerResultCode {
             70 => Ok(Self::RepairBackupCancelled),
             #[cfg(feature = "experimental-repair-store")]
             71 => Ok(Self::RepairBackupRetired),
+            #[cfg(feature = "experimental-repair-store")]
+            72 => Ok(Self::RepairTransactionStatusReady),
+            #[cfg(feature = "experimental-repair-store")]
+            73 => Ok(Self::RepairTransactionResolved),
             _ => Err(InternalWireError::InvalidFrame),
         }
     }
@@ -1780,6 +2168,8 @@ pub(super) struct WorkerResponse {
     pub(super) repair_status: Option<Box<WorkerRepairStatus>>,
     #[cfg(feature = "experimental-repair-store")]
     pub(super) repair_released_bytes: Option<u64>,
+    #[cfg(feature = "experimental-repair-store")]
+    pub(super) repair_transaction_status: Option<Box<RepairTransactionStatusPayload>>,
 }
 
 impl WorkerResponse {
@@ -1797,6 +2187,8 @@ impl WorkerResponse {
             repair_status: None,
             #[cfg(feature = "experimental-repair-store")]
             repair_released_bytes: None,
+            #[cfg(feature = "experimental-repair-store")]
+            repair_transaction_status: None,
         }
     }
 
@@ -1814,6 +2206,8 @@ impl WorkerResponse {
             repair_status: None,
             #[cfg(feature = "experimental-repair-store")]
             repair_released_bytes: None,
+            #[cfg(feature = "experimental-repair-store")]
+            repair_transaction_status: None,
         }
     }
 
@@ -1831,6 +2225,8 @@ impl WorkerResponse {
             repair_status: None,
             #[cfg(feature = "experimental-repair-store")]
             repair_released_bytes: None,
+            #[cfg(feature = "experimental-repair-store")]
+            repair_transaction_status: None,
         }
     }
 
@@ -1882,6 +2278,26 @@ impl WorkerResponse {
         response
     }
 
+    #[cfg(feature = "experimental-repair-store")]
+    pub(super) fn repair_transaction_status(
+        request_id: u64,
+        status: Option<RepairTransactionStatusPayload>,
+    ) -> Self {
+        let mut response = Self::new(request_id, WorkerResultCode::RepairTransactionStatusReady);
+        response.repair_transaction_status = status.map(Box::new);
+        response
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    pub(super) fn repair_transaction_resolved(
+        request_id: u64,
+        status: RepairTransactionStatusPayload,
+    ) -> Self {
+        let mut response = Self::new(request_id, WorkerResultCode::RepairTransactionResolved);
+        response.repair_transaction_status = Some(Box::new(status));
+        response
+    }
+
     #[cfg(feature = "experimental-codex-home-lease")]
     pub(super) fn provider_codex_home_ready(request_id: u64) -> Self {
         Self::new(request_id, WorkerResultCode::ProviderCodexHomeReady)
@@ -1908,8 +2324,17 @@ impl WorkerResponse {
             WorkerResultCode::RepairBackupCancelled | WorkerResultCode::RepairBackupRetired
         );
         #[cfg(feature = "experimental-repair-store")]
+        let repair_transaction_metadata = matches!(
+            self.code,
+            WorkerResultCode::RepairTransactionStatusReady
+                | WorkerResultCode::RepairTransactionResolved
+        );
+        #[cfg(feature = "experimental-repair-store")]
         if repair_metadata != self.repair_status.is_some()
             || repair_release_metadata != self.repair_released_bytes.is_some()
+            || (!repair_transaction_metadata && self.repair_transaction_status.is_some())
+            || (self.code == WorkerResultCode::RepairTransactionResolved
+                && self.repair_transaction_status.is_none())
             || self
                 .repair_released_bytes
                 .is_some_and(|bytes| !(1..=MAX_REPAIR_BACKUP_BYTES).contains(&bytes))
@@ -1922,6 +2347,10 @@ impl WorkerResponse {
                         WorkerResultCode::RepairBackupDurable | WorkerResultCode::RepairBackupReady
                     ) && status.state != WorkerRepairState::Durable
             })
+            || self
+                .repair_transaction_status
+                .as_deref()
+                .is_some_and(|status| validate_repair_transaction_status(status).is_err())
         {
             return Err(InternalWireError::InvalidFrame);
         }
@@ -2005,6 +2434,15 @@ impl WorkerResponse {
         if let Some(status) = self.repair_status.as_ref() {
             let mut writer = ClosedFrameWriter::new(&mut bytes[REPAIR_PAYLOAD_OFFSET..]);
             encode_repair_status(&mut writer, status)?;
+        } else if repair_transaction_metadata {
+            let mut writer = ClosedFrameWriter::new(&mut bytes[REPAIR_PAYLOAD_OFFSET..]);
+            match self.repair_transaction_status.as_deref() {
+                Some(status) => {
+                    writer.u8(1)?;
+                    encode_repair_transaction_status(&mut writer, status)?;
+                }
+                None => writer.u8(0)?,
+            }
         }
         Ok(bytes)
     }
@@ -2028,7 +2466,13 @@ impl WorkerResponse {
             WorkerResultCode::RepairBackupCancelled | WorkerResultCode::RepairBackupRetired
         );
         #[cfg(feature = "experimental-repair-store")]
-        let repair_wire = repair_metadata;
+        let repair_transaction_metadata = matches!(
+            code,
+            WorkerResultCode::RepairTransactionStatusReady
+                | WorkerResultCode::RepairTransactionResolved
+        );
+        #[cfg(feature = "experimental-repair-store")]
+        let repair_wire = repair_metadata || repair_transaction_metadata;
         #[cfg(not(feature = "experimental-repair-store"))]
         let repair_wire = false;
         let device_len = usize::from(bytes[9]);
@@ -2106,6 +2550,25 @@ impl WorkerResponse {
         } else {
             None
         };
+        #[cfg(feature = "experimental-repair-store")]
+        let repair_transaction_status = if repair_transaction_metadata {
+            let mut reader = ClosedFrameReader::new(
+                bytes
+                    .get(REPAIR_PAYLOAD_OFFSET..)
+                    .ok_or(InternalWireError::InvalidFrame)?,
+            );
+            let status = match reader.u8()? {
+                0 => None,
+                1 => Some(Box::new(decode_repair_transaction_status(&mut reader)?)),
+                _ => return Err(InternalWireError::InvalidFrame),
+            };
+            if !reader.remaining_is_zero() {
+                return Err(InternalWireError::InvalidFrame);
+            }
+            status
+        } else {
+            None
+        };
         let response = Self {
             request_id,
             code,
@@ -2125,6 +2588,8 @@ impl WorkerResponse {
             repair_status,
             #[cfg(feature = "experimental-repair-store")]
             repair_released_bytes: repair_release_metadata.then_some(value),
+            #[cfg(feature = "experimental-repair-store")]
+            repair_transaction_status,
         };
         if response.encode()?.as_slice() != bytes {
             return Err(InternalWireError::InvalidFrame);
@@ -2540,21 +3005,36 @@ mod tests {
             plan_sha256: [0x55; 32],
             approval_id: "A-approval".to_owned(),
             approval_sha256: [0x66; 32],
-            resource_id: "repair-image".to_owned(),
+            resource_id: "rescue:selected-linux-root:etc/fstab".to_owned(),
             resource_sha256: expected_hash,
+            execution_intent: RepairExecutionIntentV1::new(
+                "S-session",
+                1,
+                "target-root",
+                format!("scan:{}", "7".repeat(64)),
+                protocol_sha256([0x77; 32]).expect("target fingerprint"),
+                protocol_sha256([0x88; 32]).expect("target physical parent"),
+                format!("lock:{}", "9".repeat(64)),
+                protocol_sha256(expected_hash).expect("before hash"),
+                protocol_sha256([0xaa; 32]).expect("after hash"),
+                protocol_sha256([0xbb; 32]).expect("diff hash"),
+                protocol_sha256([0xcc; 32]).expect("UUID set hash"),
+                metadata.clone(),
+            )
+            .expect("execution intent"),
         };
         let persist = WorkerCommand::repair(
             41,
             WorkerRepairCommand::Persist {
                 expected: Box::new(reserved.clone()),
-                binding: binding.clone(),
+                binding: Box::new(binding.clone()),
                 metadata: WorkerRepairFileMetadata::from_protocol(&metadata),
                 input_size: 4096,
             },
         );
         let encoded = persist.encode().expect("repair persist frame");
         assert_eq!(encoded.len(), 2048);
-        assert_eq!(&encoded[..8], b"KRVWC004");
+        assert_eq!(&encoded[..8], b"KRVWC005");
         assert_eq!(WorkerCommand::decode(&encoded), Ok(persist));
 
         let mut noncanonical = encoded;
@@ -2571,8 +3051,54 @@ mod tests {
             WorkerResponse::repair(41, WorkerResultCode::RepairBackupDurable, durable.clone());
         let encoded = response.encode().expect("repair response frame");
         assert_eq!(encoded.len(), 2048);
-        assert_eq!(&encoded[..8], b"KRVWR004");
+        assert_eq!(&encoded[..8], b"KRVWR005");
         assert_eq!(WorkerResponse::decode(&encoded), Ok(response));
+
+        let durable_protocol = durable.to_protocol().expect("durable protocol status");
+        let pending =
+            RepairTransactionStatusPayload::pending(durable_protocol).expect("pending transaction");
+        let status_command = WorkerCommand::repair(
+            45,
+            WorkerRepairCommand::TransactionStatus {
+                selector: RepairTransactionStatusSelector::pending_singleton(),
+            },
+        );
+        let encoded = status_command.encode().expect("transaction status frame");
+        assert_eq!(WorkerCommand::decode(&encoded), Ok(status_command));
+
+        let intent = pending
+            .backup()
+            .execution_intent()
+            .expect("durable execution intent");
+        let resolution = RepairTransactionResolution::new(
+            RepairTransactionResolutionOutcome::CommittedAfter,
+            intent.after_sha256().clone(),
+            intent.before_metadata().canonical_sha256(),
+            true,
+            intent,
+        )
+        .expect("committed resolution");
+        let resolve_command = WorkerCommand::repair(
+            46,
+            WorkerRepairCommand::TransactionResolve {
+                expected: Box::new(pending.clone()),
+                resolution: resolution.clone(),
+            },
+        );
+        let encoded = resolve_command.encode().expect("transaction resolve frame");
+        assert_eq!(WorkerCommand::decode(&encoded), Ok(resolve_command));
+
+        let resolved =
+            RepairTransactionStatusPayload::resolved(pending.backup().clone(), resolution)
+                .expect("resolved transaction");
+        for response in [
+            WorkerResponse::repair_transaction_status(47, None),
+            WorkerResponse::repair_transaction_status(48, Some(pending)),
+            WorkerResponse::repair_transaction_resolved(49, resolved),
+        ] {
+            let encoded = response.encode().expect("transaction response frame");
+            assert_eq!(WorkerResponse::decode(&encoded), Ok(response));
+        }
 
         for command in [
             WorkerCommand::repair(
@@ -2585,7 +3111,7 @@ mod tests {
             WorkerCommand::repair(
                 43,
                 WorkerRepairCommand::Retire {
-                    expected: Box::new(durable),
+                    expected: Box::new(durable.clone()),
                 },
             ),
         ] {

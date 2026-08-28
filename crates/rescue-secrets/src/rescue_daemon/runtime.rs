@@ -4,7 +4,8 @@ use super::{RescueVaultDaemonError, internal_wire};
 #[cfg(feature = "experimental-repair-store")]
 use kernaid_protocol::rescue_repair_vault::{
     MAX_REPAIR_BACKUP_BYTES, RepairBackupBinding, RepairBackupDraft, RepairBackupStatusPayload,
-    RepairFileMetadataV1, RepairReservationId,
+    RepairFileMetadataV1, RepairReservationId, RepairTransactionResolution,
+    RepairTransactionStatusPayload, RepairTransactionStatusSelector,
 };
 use kernaid_protocol::rescue_vault::{
     MAX_SIGNED_REPORT_ENVELOPE_BYTES, ReportId, ReportSummary, Sha256, ValidatedRequest,
@@ -2720,7 +2721,7 @@ impl WorkerHandle {
         )?;
         let repair = internal_wire::WorkerRepairCommand::Persist {
             expected: Box::new(expected),
-            binding: internal_wire::WorkerRepairBinding::from_protocol(binding),
+            binding: Box::new(internal_wire::WorkerRepairBinding::from_protocol(binding)),
             metadata,
             input_size,
         };
@@ -2809,6 +2810,36 @@ impl WorkerHandle {
                     internal_wire::WorkerRepairStatus::from_protocol(expected)
                         .map_err(|_| RescueVaultDaemonError::ProtocolFailure)?,
                 ),
+            },
+            deadline,
+        )
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    pub(super) fn repair_transaction_status(
+        &self,
+        selector: &RepairTransactionStatusSelector,
+        deadline: Instant,
+    ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
+        self.transact_repair_without_descriptor(
+            internal_wire::WorkerRepairCommand::TransactionStatus {
+                selector: selector.clone(),
+            },
+            deadline,
+        )
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    pub(super) fn repair_transaction_resolve(
+        &self,
+        expected: &RepairTransactionStatusPayload,
+        resolution: &RepairTransactionResolution,
+        deadline: Instant,
+    ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
+        self.transact_repair_without_descriptor(
+            internal_wire::WorkerRepairCommand::TransactionResolve {
+                expected: Box::new(expected.clone()),
+                resolution: resolution.clone(),
             },
             deadline,
         )
@@ -3800,6 +3831,30 @@ fn response_matches(
         Command::RepairBackupRetire => matches!(
             response.code,
             Result::RepairBackupRetired
+                | Result::RepairBackupNotFound
+                | Result::RepairInvalidRequest
+                | Result::RepairConflict
+                | Result::RepairReconciliationRequired
+                | Result::RepairStorageUnavailable
+                | Result::CleanupFailed
+                | Result::Busy
+        ),
+        #[cfg(feature = "experimental-repair-store")]
+        Command::RepairTransactionStatus => matches!(
+            response.code,
+            Result::RepairTransactionStatusReady
+                | Result::RepairBackupNotFound
+                | Result::RepairInvalidRequest
+                | Result::RepairConflict
+                | Result::RepairReconciliationRequired
+                | Result::RepairStorageUnavailable
+                | Result::CleanupFailed
+                | Result::Busy
+        ),
+        #[cfg(feature = "experimental-repair-store")]
+        Command::RepairTransactionResolve => matches!(
+            response.code,
+            Result::RepairTransactionResolved
                 | Result::RepairBackupNotFound
                 | Result::RepairInvalidRequest
                 | Result::RepairConflict

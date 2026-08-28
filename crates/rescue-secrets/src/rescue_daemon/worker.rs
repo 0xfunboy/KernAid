@@ -15,6 +15,11 @@ use crate::{
     RepairVaultStoreError, ReservationId as StoreReservationId,
     VerifiedBackupMetadata as StoreVerifiedBackupMetadata,
 };
+#[cfg(feature = "experimental-repair-store")]
+use kernaid_protocol::rescue_repair_vault::{
+    RepairTransactionResolution, RepairTransactionStatusPayload,
+    RepairTransactionStatusResultPayload, RepairTransactionStatusSelector,
+};
 use kernaid_protocol::rescue_vault::{
     AuditEventType, AuditOutcome, ErrorToken, MAX_OPENAI_KEY_BYTES, MAX_SESSION_REPORT_JSON_BYTES,
     MAX_SIGNED_REPORT_ENVELOPE_BYTES, ReportId, RequestId, validate_openai_api_key_bytes,
@@ -711,6 +716,85 @@ fn handle_command(
             };
             (response, false)
         }
+        #[cfg(feature = "experimental-repair-store")]
+        Command::RepairTransactionStatus => {
+            if descriptor.is_some() {
+                return (
+                    internal_wire::WorkerResponse::new(request_id, Result::RepairInvalidRequest),
+                    false,
+                );
+            }
+            let Some(internal_wire::WorkerRepairCommand::TransactionStatus { selector }) =
+                command.repair.as_ref()
+            else {
+                return (
+                    internal_wire::WorkerResponse::new(request_id, Result::RepairInvalidRequest),
+                    false,
+                );
+            };
+            let transaction = match state {
+                WorkerVaultState::Locked => Err(Result::Busy),
+                WorkerVaultState::Unlocked(_) if validate_no_active_swap().is_err() => {
+                    Err(Result::CleanupFailed)
+                }
+                WorkerVaultState::Unlocked(mounted) => repair_transaction_status(mounted, selector),
+            };
+            let response = match transaction {
+                Ok(result) => match result.transaction() {
+                    Some(status) => internal_wire::WorkerResponse::repair_transaction_status(
+                        request_id,
+                        Some(status.clone()),
+                    ),
+                    None if matches!(
+                        selector,
+                        RepairTransactionStatusSelector::PendingSingleton
+                    ) =>
+                    {
+                        internal_wire::WorkerResponse::repair_transaction_status(request_id, None)
+                    }
+                    None => {
+                        internal_wire::WorkerResponse::new(request_id, Result::RepairBackupNotFound)
+                    }
+                },
+                Err(code) => internal_wire::WorkerResponse::new(request_id, code),
+            };
+            (response, false)
+        }
+        #[cfg(feature = "experimental-repair-store")]
+        Command::RepairTransactionResolve => {
+            if descriptor.is_some() {
+                return (
+                    internal_wire::WorkerResponse::new(request_id, Result::RepairInvalidRequest),
+                    false,
+                );
+            }
+            let Some(internal_wire::WorkerRepairCommand::TransactionResolve {
+                expected,
+                resolution,
+            }) = command.repair.as_ref()
+            else {
+                return (
+                    internal_wire::WorkerResponse::new(request_id, Result::RepairInvalidRequest),
+                    false,
+                );
+            };
+            let resolved = match state {
+                WorkerVaultState::Locked => Err(Result::Busy),
+                WorkerVaultState::Unlocked(_) if validate_no_active_swap().is_err() => {
+                    Err(Result::CleanupFailed)
+                }
+                WorkerVaultState::Unlocked(mounted) => {
+                    resolve_repair_transaction(mounted, expected, resolution.clone())
+                }
+            };
+            let response = match resolved {
+                Ok(status) => {
+                    internal_wire::WorkerResponse::repair_transaction_resolved(request_id, status)
+                }
+                Err(code) => internal_wire::WorkerResponse::new(request_id, code),
+            };
+            (response, false)
+        }
         #[cfg(feature = "experimental-codex-home-lease")]
         Command::ProviderCodexHomeLease => {
             if descriptor.is_some() || response_descriptor.is_some() {
@@ -1166,6 +1250,7 @@ fn persist_repair_backup(
         binding.approval_sha256,
         binding.resource_id.clone(),
         binding.resource_sha256,
+        binding.execution_intent.clone(),
     )
     .map_err(map_repair_store_error)?;
     let source_deadline = Instant::now()
@@ -1323,6 +1408,33 @@ fn retire_repair_backup(
 }
 
 #[cfg(feature = "experimental-repair-store")]
+fn repair_transaction_status(
+    mounted: &MountedRescueVault,
+    selector: &RepairTransactionStatusSelector,
+) -> Result<RepairTransactionStatusResultPayload, internal_wire::WorkerResultCode> {
+    mounted
+        .secrets()
+        .open_repair_store()
+        .map_err(map_repair_store_error)?
+        .transaction_status(selector)
+        .map_err(map_repair_store_error)
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn resolve_repair_transaction(
+    mounted: &MountedRescueVault,
+    expected: &RepairTransactionStatusPayload,
+    resolution: RepairTransactionResolution,
+) -> Result<RepairTransactionStatusPayload, internal_wire::WorkerResultCode> {
+    mounted
+        .secrets()
+        .open_repair_store()
+        .map_err(map_repair_store_error)?
+        .resolve_transaction(expected, resolution)
+        .map_err(map_repair_store_error)
+}
+
+#[cfg(feature = "experimental-repair-store")]
 fn repair_reserved_status(
     summary: &StoreRepairBackupSummary,
 ) -> Result<internal_wire::WorkerRepairStatus, internal_wire::WorkerResultCode> {
@@ -1365,6 +1477,7 @@ fn repair_durable_status(
             approval_sha256: parse_store_sha256(metadata.approval_sha256())?,
             resource_id: metadata.resource_id().to_owned(),
             resource_sha256: parse_store_sha256(metadata.resource_sha256())?,
+            execution_intent: metadata.execution_intent().clone(),
         }),
     })
 }
