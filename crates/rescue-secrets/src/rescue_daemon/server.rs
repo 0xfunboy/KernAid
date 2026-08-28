@@ -7431,18 +7431,25 @@ mod tests {
         assert_ne!(uid, 0, "handler tests require an unprivileged peer");
         let other_uid = if uid == 1 { 2 } else { 1 };
         let allowlist = match role {
-            PeerRole::Companion => PeerAllowlist::builder(uid).agent(AgentRole::OpenAi, other_uid),
-            PeerRole::Agent(agent_role) => PeerAllowlist::builder(other_uid).agent(agent_role, uid),
+            PeerRole::Companion => PeerAllowlist::builder(uid)
+                .agent(AgentRole::OpenAi, other_uid)
+                .expect("test peer role mapping")
+                .build()
+                .expect("test allowlist"),
+            PeerRole::Agent(agent_role) => PeerAllowlist::builder(other_uid)
+                .agent(agent_role, uid)
+                .expect("test peer role mapping")
+                .build()
+                .expect("test allowlist"),
             #[cfg(feature = "experimental-repair-store")]
-            PeerRole::RepairBroker => PeerAllowlist::builder(other_uid).repair_broker(uid),
+            PeerRole::RepairBroker => PeerAllowlist::builder(other_uid)
+                .repair_broker(uid)
+                .expect("test peer role mapping")
+                .build()
+                .expect("test allowlist"),
             #[cfg(feature = "experimental-repair-store")]
-            PeerRole::RepairTargetHelper => {
-                panic!("root-only helper role cannot use an unprivileged socketpair fixture")
-            }
-        }
-        .expect("test peer role mapping")
-        .build()
-        .expect("test allowlist");
+            PeerRole::RepairTargetHelper => PeerAllowlist::repair_target_helper_root_only(),
+        };
         let peer = authenticate_seqpacket_peer(server.as_fd(), allowlist)
             .expect("authenticated test peer");
         let request_id = format!(
