@@ -1,0 +1,172 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kernaid.dev/schemas/release-channel.v1.json",
+  "title": "KernAid release channel v1",
+  "$comment": "release_channel.py additionally enforces canonical JSON, immediate previous-sequence chaining, canonical artifact order, identity/filename/URL uniqueness, component/platform/kind coupling, exactly one primary per release group, and exact local artifact bytes.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "artifacts",
+    "channel",
+    "previous",
+    "publishedAt",
+    "schema",
+    "sequence",
+    "source"
+  ],
+  "properties": {
+    "artifacts": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "items": { "$ref": "#/$defs/artifact" }
+    },
+    "channel": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{0,31}$"
+    },
+    "previous": {
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "#/$defs/previous" }
+      ]
+    },
+    "publishedAt": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "schema": { "const": "dev.kernaid.release-channel.v1" },
+    "sequence": { "type": "integer", "minimum": 1 },
+    "source": { "$ref": "#/$defs/source" }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "sequence": { "const": 1 } },
+        "required": ["sequence"]
+      },
+      "then": { "properties": { "previous": { "type": "null" } } },
+      "else": { "properties": { "previous": { "$ref": "#/$defs/previous" } } }
+    }
+  ],
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["commit", "repository"],
+      "properties": {
+        "commit": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "repository": { "const": "0xfunboy/KernAid" }
+      }
+    },
+    "previous": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sequence", "sha256"],
+      "properties": {
+        "sequence": { "type": "integer", "minimum": 1 },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "architecture",
+        "bytes",
+        "component",
+        "filename",
+        "kind",
+        "mediaType",
+        "platform",
+        "provenance",
+        "sha256",
+        "url",
+        "variant",
+        "version"
+      ],
+      "properties": {
+        "architecture": {
+          "enum": ["x86_64", "aarch64"]
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 34359738368
+        },
+        "component": {
+          "enum": ["desk", "rescue"]
+        },
+        "filename": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._+\\-]{0,159}$"
+        },
+        "kind": {
+          "enum": [
+            "package",
+            "image",
+            "checksum",
+            "qualification",
+            "sbom",
+            "signature"
+          ]
+        },
+        "mediaType": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 129,
+          "pattern": "^[A-Za-z0-9!#$&^_.+\\-]+/[A-Za-z0-9!#$&^_.+\\-]+$"
+        },
+        "platform": {
+          "enum": ["linux", "windows", "macos", "rescue"]
+        },
+        "provenance": { "$ref": "#/$defs/provenance" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "url": {
+          "type": "string",
+          "maxLength": 4096,
+          "pattern": "^https://[^/?#]+/[^?#]+$"
+        },
+        "variant": {
+          "enum": [
+            "appimage",
+            "deb",
+            "rpm",
+            "msi",
+            "nsis",
+            "app",
+            "dmg",
+            "qualified-zip"
+          ]
+        },
+        "version": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._+\\-]{0,63}$"
+        }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runAttempt", "runId", "workflow"],
+      "properties": {
+        "runAttempt": { "type": "integer", "minimum": 1 },
+        "runId": { "type": "integer", "minimum": 1 },
+        "workflow": {
+          "enum": [
+            ".github/workflows/desktop.yml",
+            ".github/workflows/rescue.yml"
+          ]
+        }
+      }
+    }
+  }
+}

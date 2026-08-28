@@ -58,3 +58,7 @@ qemu-secureboot:
 
 verify-release:
     ./tools/verify-release/verify.sh
+
+verify-release-channel:
+    python3 -m json.tool tools/release/release-channel.v1.schema.json >/dev/null
+    python3 -I -B -m unittest discover -s tools/release/tests -p 'test_*.py'

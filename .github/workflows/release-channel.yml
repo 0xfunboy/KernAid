@@ -1,0 +1,574 @@
+name: release-channel
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Internal product version (for example 0.1.0-internal.1)
+        required: true
+        type: string
+      source_commit:
+        description: Exact commit shared by the successful Desk and qualified Rescue runs
+        required: true
+        type: string
+      desktop_run_id:
+        description: Successful desktop workflow run ID
+        required: true
+        type: string
+      rescue_run_id:
+        description: Successful Rescue workflow run ID
+        required: true
+        type: string
+      sequence:
+        description: Monotonic internal-channel sequence
+        required: true
+        default: "1"
+        type: string
+      previous_release_tag:
+        description: Required for sequence > 1
+        required: false
+        type: string
+      previous_manifest_sha256:
+        description: Required for sequence > 1
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  actions: read
+  id-token: write
+  attestations: write
+  artifact-metadata: write
+
+concurrency:
+  group: kernaid-internal-release-channel
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.repository == '0xfunboy/KernAid'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CHANNEL: internal
+      VERSION: ${{ inputs.version }}
+      SOURCE_COMMIT: ${{ inputs.source_commit }}
+      DESKTOP_RUN_ID: ${{ inputs.desktop_run_id }}
+      RESCUE_RUN_ID: ${{ inputs.rescue_run_id }}
+      CHANNEL_SEQUENCE: ${{ inputs.sequence }}
+      PREVIOUS_RELEASE_TAG: ${{ inputs.previous_release_tag }}
+      PREVIOUS_MANIFEST_SHA256: ${{ inputs.previous_manifest_sha256 }}
+      MANIFEST_FILENAME: KernAid-release-channel-internal-v1.json
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate immutable dispatch inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -I -B - <<'PY'
+          import os
+          import re
+
+          version = os.environ["VERSION"]
+          commit = os.environ["SOURCE_COMMIT"]
+          sequence = os.environ["CHANNEL_SEQUENCE"]
+          previous_tag = os.environ.get("PREVIOUS_RELEASE_TAG", "")
+          previous_sha256 = os.environ.get("PREVIOUS_MANIFEST_SHA256", "")
+          run_ids = (os.environ["DESKTOP_RUN_ID"], os.environ["RESCUE_RUN_ID"])
+
+          if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,63}", version) is None:
+              raise SystemExit("invalid release version")
+          if re.fullmatch(r"[0-9a-f]{40}", commit) is None:
+              raise SystemExit("source commit must be a full lowercase SHA")
+          if any(re.fullmatch(r"[1-9][0-9]{0,19}", value) is None for value in run_ids):
+              raise SystemExit("workflow run IDs must be positive decimal integers")
+          if re.fullmatch(r"[1-9][0-9]{0,9}", sequence) is None:
+              raise SystemExit("channel sequence must be a positive bounded integer")
+          if int(sequence) == 1:
+              if previous_tag or previous_sha256:
+                  raise SystemExit("sequence 1 cannot name a previous release")
+          else:
+              if re.fullmatch(r"kernaid-internal-v[A-Za-z0-9][A-Za-z0-9._+-]{0,63}", previous_tag) is None:
+                  raise SystemExit("previous release tag is invalid")
+              if re.fullmatch(r"[0-9a-f]{64}", previous_sha256) is None:
+                  raise SystemExit("previous manifest SHA-256 is invalid")
+          PY
+
+      - name: Resolve and verify source workflow runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          metadata="$RUNNER_TEMP/kernaid-channel-metadata"
+          install -d -m 0700 -- "$metadata"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$DESKTOP_RUN_ID" \
+            >"$metadata/desktop-run.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RESCUE_RUN_ID" \
+            >"$metadata/rescue-run.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$DESKTOP_RUN_ID/artifacts?per_page=100" \
+            >"$metadata/desktop-artifacts.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RESCUE_RUN_ID/artifacts?per_page=100" \
+            >"$metadata/rescue-artifacts.json"
+          python3 -I -B - "$metadata" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import sys
+
+          root = Path(sys.argv[1])
+          commit = os.environ["SOURCE_COMMIT"]
+          expected = (
+              ("desktop", int(os.environ["DESKTOP_RUN_ID"]), ".github/workflows/desktop.yml"),
+              ("rescue", int(os.environ["RESCUE_RUN_ID"]), ".github/workflows/rescue.yml"),
+          )
+          for name, run_id, workflow in expected:
+              document = json.loads((root / f"{name}-run.json").read_text(encoding="utf-8"))
+              exact = {
+                  "id": run_id,
+                  "head_sha": commit,
+                  "path": workflow,
+                  "status": "completed",
+                  "conclusion": "success",
+              }
+              if any(document.get(field) != value for field, value in exact.items()):
+                  raise SystemExit(f"{name} run is not the exact successful source run")
+              attempt = document.get("run_attempt")
+              if attempt != 1:
+                  raise SystemExit(
+                      f"{name} must be a first-attempt run because the artifact API "
+                      "does not attribute each archive to a rerun attempt"
+                  )
+
+              artifacts = json.loads(
+                  (root / f"{name}-artifacts.json").read_text(encoding="utf-8")
+              )
+              if not isinstance(artifacts, dict) or not isinstance(artifacts.get("artifacts"), list):
+                  raise SystemExit(f"{name} artifact inventory is invalid")
+          PY
+
+      - name: Verify the unique published channel head
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          releases="$RUNNER_TEMP/kernaid-internal-releases.jsonl"
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | @base64' >"$releases"
+          python3 -I -B - "$releases" <<'PY'
+          import base64
+          import json
+          import os
+          from pathlib import Path
+          import sys
+
+          published = []
+          for line in Path(sys.argv[1]).read_text(encoding="ascii").splitlines():
+              document = json.loads(base64.b64decode(line, validate=True))
+              tag = document.get("tag_name")
+              if (
+                  document.get("draft") is False
+                  and isinstance(tag, str)
+                  and tag.startswith("kernaid-internal-v")
+              ):
+                  published_at = document.get("published_at")
+                  release_id = document.get("id")
+                  if not isinstance(published_at, str) or not isinstance(release_id, int):
+                      raise SystemExit("published internal release metadata is invalid")
+                  published.append((published_at, release_id, tag))
+
+          sequence = int(os.environ["CHANNEL_SEQUENCE"])
+          if sequence == 1:
+              if published:
+                  raise SystemExit("sequence 1 cannot restart an existing channel")
+          else:
+              if not published:
+                  raise SystemExit("the previous published channel release is absent")
+              head = max(published)[2]
+              if head != os.environ["PREVIOUS_RELEASE_TAG"]:
+                  raise SystemExit("previous release tag is not the published channel head")
+          PY
+
+      - name: Verify previous anti-rollback link
+        if: inputs.sequence != '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          previous="$RUNNER_TEMP/kernaid-previous-channel"
+          install -d -m 0700 -- "$previous"
+          gh release download "$PREVIOUS_RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "$MANIFEST_FILENAME" \
+            --dir "$previous"
+          python3 -I -B - "$previous/$MANIFEST_FILENAME" <<'PY'
+          import hashlib
+          import importlib.util
+          import json
+          import os
+          from pathlib import Path
+          import sys
+
+          path = Path(sys.argv[1])
+          payload = path.read_bytes()
+          expected = os.environ["PREVIOUS_MANIFEST_SHA256"]
+          if hashlib.sha256(payload).hexdigest() != expected:
+              raise SystemExit("previous manifest digest does not match")
+          module_path = Path("tools/release/release_channel.py").resolve()
+          spec = importlib.util.spec_from_file_location("kernaid_release_channel", module_path)
+          if spec is None or spec.loader is None:
+              raise SystemExit("release-channel verifier is unavailable")
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          document = json.loads(payload.decode("ascii"))
+          validated = module.validate_manifest(document)
+          if module.canonical_bytes(validated) != payload:
+              raise SystemExit("previous manifest is not canonical")
+          if validated["channel"] != os.environ["CHANNEL"]:
+              raise SystemExit("previous manifest belongs to another channel")
+          if validated["sequence"] != int(os.environ["CHANNEL_SEQUENCE"]) - 1:
+              raise SystemExit("previous manifest sequence is not contiguous")
+          PY
+
+      - name: Download exact immutable workflow artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          metadata="$RUNNER_TEMP/kernaid-channel-metadata"
+          staging="$RUNNER_TEMP/kernaid-channel-assets"
+          install -d -m 0755 -- "$staging"
+
+          artifact_id() {
+            local inventory="$1"
+            local expected_name="$2"
+            python3 -I -B - "$inventory" "$expected_name" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          document = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          matches = [
+              item for item in document["artifacts"]
+              if item.get("name") == sys.argv[2] and item.get("expired") is False
+          ]
+          if len(matches) != 1 or not isinstance(matches[0].get("id"), int):
+              raise SystemExit("required immutable artifact is absent or ambiguous")
+          print(matches[0]["id"])
+          PY
+          }
+
+          download_zip() {
+            local run_inventory="$1"
+            local artifact_name="$2"
+            local output_name="$3"
+            local id
+            local temporary
+            id="$(artifact_id "$run_inventory" "$artifact_name")"
+            temporary="$staging/.${output_name}.partial"
+            gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" >"$temporary"
+            python3 -I -B - "$temporary" <<'PY'
+          import os
+          from pathlib import Path
+          import stat
+          import sys
+
+          path = Path(sys.argv[1])
+          details = path.lstat()
+          if (
+              not stat.S_ISREG(details.st_mode)
+              or details.st_nlink != 1
+              or not 0 < details.st_size <= 32 * 1024 * 1024 * 1024
+          ):
+              raise SystemExit("downloaded artifact archive is unsafe")
+          with path.open("rb") as stream:
+              if stream.read(4) != b"PK\x03\x04":
+                  raise SystemExit("downloaded artifact is not a ZIP archive")
+          PY
+            chmod 0644 "$temporary"
+            mv -fT -- "$temporary" "$staging/$output_name"
+          }
+
+          desktop="$metadata/desktop-artifacts.json"
+          download_zip "$desktop" kernaid-desk-linux-amd64-appimage \
+            "KernAid-Desk-${VERSION}-linux-x86_64-appimage.zip"
+          download_zip "$desktop" kernaid-desk-linux-amd64-deb \
+            "KernAid-Desk-${VERSION}-linux-x86_64-deb.zip"
+          download_zip "$desktop" kernaid-desk-linux-x86_64-rpm \
+            "KernAid-Desk-${VERSION}-linux-x86_64-rpm.zip"
+          download_zip "$desktop" kernaid-desk-windows-x64-msi \
+            "KernAid-Desk-${VERSION}-windows-x86_64-msi.zip"
+          download_zip "$desktop" kernaid-desk-windows-x64-nsis \
+            "KernAid-Desk-${VERSION}-windows-x86_64-nsis.zip"
+          download_zip "$desktop" kernaid-desk-darwin-aarch64-app \
+            "KernAid-Desk-${VERSION}-macos-aarch64-app.zip"
+          download_zip "$desktop" kernaid-desk-darwin-aarch64-dmg \
+            "KernAid-Desk-${VERSION}-macos-aarch64-dmg.zip"
+          download_zip "$desktop" kernaid-desk-darwin-x64-app \
+            "KernAid-Desk-${VERSION}-macos-x86_64-app.zip"
+          download_zip "$desktop" kernaid-desk-darwin-x64-dmg \
+            "KernAid-Desk-${VERSION}-macos-x86_64-dmg.zip"
+          download_zip "$metadata/rescue-artifacts.json" KernAid-Rescue-amd64-qualified \
+            "KernAid-Rescue-${VERSION}-x86_64-qualified.zip"
+
+      - name: Reverify the qualified Rescue payload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/kernaid-channel-assets/KernAid-Rescue-${VERSION}-x86_64-qualified.zip"
+          qualified="$RUNNER_TEMP/kernaid-channel-qualified-rescue"
+          install -d -m 0700 -- "$qualified"
+          python3 -I -B - "$archive" "$qualified" <<'PY'
+          import os
+          from pathlib import Path, PurePosixPath
+          import shutil
+          import stat
+          import sys
+          import zipfile
+
+          archive = Path(sys.argv[1])
+          destination = Path(sys.argv[2])
+          expected = {
+              "KernAid-Rescue-amd64.catalog-entry-v2.json",
+              "KernAid-Rescue-amd64.codex.cdx.json",
+              "KernAid-Rescue-amd64.iso",
+              "KernAid-Rescue-amd64.iso.sha256",
+              "KernAid-Rescue-amd64.provenance.sigstore.json",
+              "KernAid-Rescue-amd64.qualification.sigstore.json",
+              "KernAid-Rescue-amd64.qualified.json",
+              "kernaid-linux-snapshot-e2e.sanitized.log",
+              "kernaid-vault-lifecycle-bios.sanitized.log",
+              "kernaid-vault-lifecycle-uefi.sanitized.log",
+              "rescue-usb-smoke-bios.log",
+              "rescue-usb-smoke-uefi.log",
+          }
+          with zipfile.ZipFile(archive) as bundle:
+              members = bundle.infolist()
+              if {member.filename for member in members} != expected:
+                  raise SystemExit("qualified Rescue archive members are not exact")
+              if sum(member.file_size for member in members) > 16 * 1024 * 1024 * 1024:
+                  raise SystemExit("qualified Rescue archive expands beyond its bound")
+              for member in members:
+                  name = PurePosixPath(member.filename)
+                  mode = member.external_attr >> 16
+                  if (
+                      len(name.parts) != 1
+                      or name.name not in expected
+                      or member.is_dir()
+                      or (mode and not stat.S_ISREG(mode))
+                  ):
+                      raise SystemExit("qualified Rescue archive contains an unsafe member")
+                  output = destination / name.name
+                  with bundle.open(member) as source, output.open("xb") as target:
+                      shutil.copyfileobj(source, target, 4 * 1024 * 1024)
+                      target.flush()
+                      os.fsync(target.fileno())
+                  output.chmod(0o600)
+          PY
+          attempt="$(python3 -I -B -c 'import json,sys; print(json.load(open(sys.argv[1]))["run_attempt"])' \
+            "$RUNNER_TEMP/kernaid-channel-metadata/rescue-run.json")"
+          run_url="https://github.com/$GITHUB_REPOSITORY/actions/runs/$RESCUE_RUN_ID"
+          manifest_args=(
+            --repository "$GITHUB_REPOSITORY"
+            --commit "$SOURCE_COMMIT"
+            --run-id "$RESCUE_RUN_ID"
+            --run-attempt "$attempt"
+            --run-url "$run_url"
+            --artifact-version "ci-${RESCUE_RUN_ID}-${attempt}"
+            --iso "$qualified/KernAid-Rescue-amd64.iso"
+            --checksum "$qualified/KernAid-Rescue-amd64.iso.sha256"
+            --catalog "$qualified/KernAid-Rescue-amd64.catalog-entry-v2.json"
+            --sbom "$qualified/KernAid-Rescue-amd64.codex.cdx.json"
+            --snapshot-evidence "$qualified/kernaid-linux-snapshot-e2e.sanitized.log"
+            --usb-bios-evidence "$qualified/rescue-usb-smoke-bios.log"
+            --usb-uefi-evidence "$qualified/rescue-usb-smoke-uefi.log"
+            --lifecycle-bios-evidence "$qualified/kernaid-vault-lifecycle-bios.sanitized.log"
+            --lifecycle-uefi-evidence "$qualified/kernaid-vault-lifecycle-uefi.sanitized.log"
+          )
+          python3 -I -B tools/build-rescue/qualification-manifest.py verify \
+            "${manifest_args[@]}" \
+            --manifest "$qualified/KernAid-Rescue-amd64.qualified.json"
+          gh attestation verify "$qualified/KernAid-Rescue-amd64.iso" \
+            -R "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/rescue.yml" \
+            --source-digest "$SOURCE_COMMIT" \
+            --source-ref refs/heads/main
+          gh attestation verify "$qualified/KernAid-Rescue-amd64.iso" \
+            -R "$GITHUB_REPOSITORY" \
+            --bundle "$qualified/KernAid-Rescue-amd64.qualification.sigstore.json" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/rescue.yml" \
+            --source-digest "$SOURCE_COMMIT" \
+            --source-ref refs/heads/main \
+            --predicate-type \
+            'https://github.com/0xfunboy/KernAid/blob/main/docs/operator-guide.md#rescue-qualification-manifest-v1'
+
+      - name: Build and verify the canonical channel manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          metadata="$RUNNER_TEMP/kernaid-channel-metadata"
+          staging="$RUNNER_TEMP/kernaid-channel-assets"
+          descriptor="$RUNNER_TEMP/kernaid-channel-descriptor.json"
+          output="$staging/$MANIFEST_FILENAME"
+          current_run="$RUNNER_TEMP/kernaid-current-channel-run.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" >"$current_run"
+          export KERNAID_CHANNEL_PUBLISHED_AT
+          KERNAID_CHANNEL_PUBLISHED_AT="$(python3 -I -B -c 'import json,sys; print(json.load(open(sys.argv[1]))["created_at"])' "$current_run")"
+          export KERNAID_DESKTOP_RUN_ATTEMPT KERNAID_RESCUE_RUN_ATTEMPT
+          KERNAID_DESKTOP_RUN_ATTEMPT="$(python3 -I -B -c 'import json,sys; print(json.load(open(sys.argv[1]))["run_attempt"])' "$metadata/desktop-run.json")"
+          KERNAID_RESCUE_RUN_ATTEMPT="$(python3 -I -B -c 'import json,sys; print(json.load(open(sys.argv[1]))["run_attempt"])' "$metadata/rescue-run.json")"
+          export KERNAID_CHANNEL_STAGING="$staging"
+          export KERNAID_CHANNEL_RELEASE_TAG="kernaid-internal-v${VERSION}"
+          python3 -I -B - "$descriptor" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import sys
+
+          staging = Path(os.environ["KERNAID_CHANNEL_STAGING"])
+          version = os.environ["VERSION"]
+          tag = os.environ["KERNAID_CHANNEL_RELEASE_TAG"]
+          base = f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/releases/download/{tag}"
+          desk_run = int(os.environ["DESKTOP_RUN_ID"])
+          desk_attempt = int(os.environ["KERNAID_DESKTOP_RUN_ATTEMPT"])
+          rescue_run = int(os.environ["RESCUE_RUN_ID"])
+          rescue_attempt = int(os.environ["KERNAID_RESCUE_RUN_ATTEMPT"])
+          desk = (
+              ("linux", "x86_64", "appimage"),
+              ("linux", "x86_64", "deb"),
+              ("linux", "x86_64", "rpm"),
+              ("windows", "x86_64", "msi"),
+              ("windows", "x86_64", "nsis"),
+              ("macos", "aarch64", "app"),
+              ("macos", "aarch64", "dmg"),
+              ("macos", "x86_64", "app"),
+              ("macos", "x86_64", "dmg"),
+          )
+          artifacts = []
+          for platform, architecture, variant in desk:
+              filename = f"KernAid-Desk-{version}-{platform}-{architecture}-{variant}.zip"
+              artifacts.append({
+                  "architecture": architecture,
+                  "component": "desk",
+                  "kind": "package",
+                  "mediaType": "application/zip",
+                  "path": str((staging / filename).resolve()),
+                  "platform": platform,
+                  "provenance": {
+                      "runAttempt": desk_attempt,
+                      "runId": desk_run,
+                      "workflow": ".github/workflows/desktop.yml",
+                  },
+                  "url": f"{base}/{filename}",
+                  "variant": variant,
+                  "version": version,
+              })
+          filename = f"KernAid-Rescue-{version}-x86_64-qualified.zip"
+          artifacts.append({
+              "architecture": "x86_64",
+              "component": "rescue",
+              "kind": "image",
+              "mediaType": "application/zip",
+              "path": str((staging / filename).resolve()),
+              "platform": "rescue",
+              "provenance": {
+                  "runAttempt": rescue_attempt,
+                  "runId": rescue_run,
+                  "workflow": ".github/workflows/rescue.yml",
+              },
+              "url": f"{base}/{filename}",
+              "variant": "qualified-zip",
+              "version": version,
+          })
+          sequence = int(os.environ["CHANNEL_SEQUENCE"])
+          previous = None if sequence == 1 else {
+              "sequence": sequence - 1,
+              "sha256": os.environ["PREVIOUS_MANIFEST_SHA256"],
+          }
+          descriptor = {
+              "artifacts": artifacts,
+              "channel": os.environ["CHANNEL"],
+              "previous": previous,
+              "publishedAt": os.environ["KERNAID_CHANNEL_PUBLISHED_AT"],
+              "schema": "dev.kernaid.release-channel-input.v1",
+              "sequence": sequence,
+              "source": {
+                  "commit": os.environ["SOURCE_COMMIT"],
+                  "repository": os.environ["GITHUB_REPOSITORY"],
+              },
+          }
+          Path(sys.argv[1]).write_text(
+              json.dumps(descriptor, sort_keys=True, separators=(",", ":")) + "\n",
+              encoding="ascii",
+          )
+          PY
+          python3 -I -B tools/release/release_channel.py create \
+            --descriptor "$descriptor" \
+            --output "$output"
+          python3 -I -B tools/release/release_channel.py verify \
+            --manifest "$output" \
+            --artifact-root "$staging"
+
+      - name: Attest the complete internal channel
+        id: attest_channel
+        uses: actions/attest@v4
+        with:
+          subject-path: ${{ runner.temp }}/kernaid-channel-assets/*
+
+      - name: Add the channel attestation bundle
+        shell: bash
+        run: |
+          install -m 0644 -- \
+            "${{ steps.attest_channel.outputs.bundle-path }}" \
+            "$RUNNER_TEMP/kernaid-channel-assets/KernAid-release-channel-internal-v1.sigstore.json"
+
+      - name: Publish a non-overwriting internal prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="kernaid-internal-v${VERSION}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release already exists: $tag" >&2
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "Tag already exists without the expected release: $tag" >&2
+            exit 1
+          fi
+          notes="$RUNNER_TEMP/kernaid-release-notes.md"
+          printf '%s\n' \
+            "Internal KernAid candidate channel sequence ${CHANNEL_SEQUENCE}." \
+            "" \
+            "Source commit: ${SOURCE_COMMIT}" \
+            "Desktop run: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${DESKTOP_RUN_ID}" \
+            "Rescue run: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${RESCUE_RUN_ID}" \
+            "" \
+            "These are unsigned engineering installers and a virtually qualified Rescue candidate." \
+            "This prerelease does not claim Secure Boot, physical hardware qualification, or production support." \
+            >"$notes"
+          gh release create "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$SOURCE_COMMIT" \
+            --title "KernAid ${VERSION} — internal candidate" \
+            --notes-file "$notes" \
+            --prerelease \
+            "$RUNNER_TEMP"/kernaid-channel-assets/*
+
+      - name: Retain the exact published channel as workflow evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: KernAid-release-channel-internal-${{ inputs.version }}
+          path: ${{ runner.temp }}/kernaid-channel-assets
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0

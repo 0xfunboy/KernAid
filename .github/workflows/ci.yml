@@ -18,6 +18,12 @@ jobs:
         run: cargo clippy --locked -p kernaid-linux-pack --all-targets --features fixture-repair-lab -- -D warnings
       - name: Test fixture repair Linux pack feature
         run: cargo test --locked -p kernaid-linux-pack --features fixture-repair-lab
+      - name: Check the disabled Rescue fstab production candidate
+        run: |
+          cargo clippy --locked -p kernaid-linux-pack --all-targets \
+            --features rescue-fstab-production-candidate -- -D warnings
+          cargo test --locked -p kernaid-linux-pack \
+            --features rescue-fstab-production-candidate
       - name: Clippy fixture repair broker feature
         run: cargo clippy --locked -p kernaid-broker --all-targets --features fixture-repair-lab -- -D warnings
       - name: Test fixture repair broker feature
@@ -35,6 +41,8 @@ jobs:
         run: ./tests/integration/run-linux-snapshot-resident-ipc-ci.sh
       - name: Test Rescue authorization boundary
         run: python3 -m unittest discover -s tests/rescue -p 'test_*.py'
+      - name: Test release-channel canonicalization and tamper rejection
+        run: python3 -I -B -m unittest discover -s tools/release/tests -p 'test_*.py'
   typescript:
     runs-on: ubuntu-latest
     steps:
