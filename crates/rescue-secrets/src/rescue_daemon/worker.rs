@@ -1200,6 +1200,10 @@ fn map_manager_error(error: VaultMountManagerError) -> internal_wire::WorkerResu
         VaultMountManagerError::InvalidMapperName => Result::UnlockIoInvalidMapperName,
         VaultMountManagerError::ClassifierUnavailable => Result::UnlockIoClassifierUnavailable,
         VaultMountManagerError::PassphraseUnavailable => Result::UnlockIoPassphraseUnavailable,
+        VaultMountManagerError::ProvisioningFormatFailed
+        | VaultMountManagerError::ProvisioningInitializationFailed => {
+            Result::UnlockIoSecureStateUnavailable
+        }
         VaultMountManagerError::UnsupportedFilesystem => Result::UnlockIoUnsupportedFilesystem,
         VaultMountManagerError::UnsafeMountRoot => Result::UnlockIoUnsafeMountRoot,
         VaultMountManagerError::MountFailed => Result::UnlockIoMountFailed,

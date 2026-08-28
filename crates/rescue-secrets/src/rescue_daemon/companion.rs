@@ -1474,13 +1474,16 @@ fn read_openai_api_key_from_tty(
 #[derive(Clone, Copy)]
 enum HiddenSecretKind {
     VaultPassphrase,
+    FirstBootPassphraseConfirmation,
     OpenAiApiKey,
 }
 
 impl HiddenSecretKind {
     const fn maximum(self) -> usize {
         match self {
-            Self::VaultPassphrase => MAX_PASSPHRASE_BYTES as usize,
+            Self::VaultPassphrase | Self::FirstBootPassphraseConfirmation => {
+                MAX_PASSPHRASE_BYTES as usize
+            }
             Self::OpenAiApiKey => MAX_OPENAI_KEY_BYTES as usize,
         }
     }
@@ -1488,13 +1491,14 @@ impl HiddenSecretKind {
     const fn prompt(self) -> &'static [u8] {
         match self {
             Self::VaultPassphrase => b"READY\nVault passphrase: ",
+            Self::FirstBootPassphraseConfirmation => b"Repeat vault passphrase: ",
             Self::OpenAiApiKey => b"READY\nOpenAI API key: ",
         }
     }
 
     fn validate(self, value: &[u8]) -> bool {
         match self {
-            Self::VaultPassphrase => {
+            Self::VaultPassphrase | Self::FirstBootPassphraseConfirmation => {
                 (MIN_PASSPHRASE_BYTES as usize..=MAX_PASSPHRASE_BYTES as usize)
                     .contains(&value.len())
                     && !value.contains(&0)
@@ -1502,6 +1506,35 @@ impl HiddenSecretKind {
             Self::OpenAiApiKey => validate_openai_api_key_bytes(value).is_ok(),
         }
     }
+}
+
+#[cfg(feature = "experimental-firstboot-provisioner")]
+type FirstBootPassphrasePair = (Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>);
+
+#[cfg(feature = "experimental-firstboot-provisioner")]
+pub(crate) fn read_firstboot_passphrase_pair()
+-> Result<FirstBootPassphrasePair, RescueVaultCompanionError> {
+    validate_no_active_swap().map_err(|()| RescueVaultCompanionError::TransportUnavailable)?;
+    let tty = open_tty()?;
+    let interrupted = install_signal_waiter()?;
+    write_tty(
+        tty.as_fd(),
+        b"KernAid will provision the empty encrypted vault on this exact Rescue USB.\n\
+Press Ctrl+C to skip and continue without a persistent Vault.\n",
+    )?;
+    let first = read_hidden_secret_after_privacy_with_foreground_check(
+        tty.as_fd(),
+        &interrupted,
+        ensure_foreground_tty,
+        HiddenSecretKind::VaultPassphrase,
+    )?;
+    let confirmation = read_hidden_secret_after_privacy_with_foreground_check(
+        tty.as_fd(),
+        &interrupted,
+        ensure_foreground_tty,
+        HiddenSecretKind::FirstBootPassphraseConfirmation,
+    )?;
+    Ok((first, confirmation))
 }
 
 fn read_hidden_secret_after_privacy_with_foreground_check(

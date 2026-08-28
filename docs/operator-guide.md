@@ -15,7 +15,9 @@ Actions artifact or an image from a mirror.
 Trusted catalog v2 revision 3 authorizes only this exact ISO after its complete
 virtual BIOS/UEFI workflow passed. The Linux v2 writer can therefore verify,
 copy and provision its encrypted vault. The Windows procedure below remains a
-raw physical boot test and does not perform trusted vault provisioning.
+raw physical boot test. The currently promoted `015ee8f` candidate predates the
+in-guest first-boot provisioner; do not expect that older image to create a
+Vault after Rufus writes it.
 
 The Rescue build target is amd64 legacy BIOS and UEFI. Its boot evidence is
 QEMU-only; physical PCs, firmware and USB media are unqualified. It
@@ -86,6 +88,19 @@ catalog and does not create or qualify the encrypted persistent vault.
 Rufus is preferred over balenaEtcher for this Windows qualification procedure
 because it exposes the target and DD-mode choice clearly. The Linux v2 writer
 is the catalog-bound vault-provisioning path for this exact promoted image.
+
+Newer Rescue builds that explicitly include the first-boot gate behave
+differently. When a raw-written USB still has the exact boot medium's complete
+8 GiB p3 in the all-zero state, boot pauses on tty1 before the graphical UI and
+asks for a new Vault passphrase twice. Use at least 12 bytes and retain it: the
+passphrase is not recoverable by KernAid. A matching entry provisions the
+canonical encrypted Vault, closes it, verifies the locked state, and then lets
+normal boot continue. An existing valid Vault or an optical boot does not
+prompt; mixed/non-zero or failed media records a fail-closed error and still
+allows the recovery UI to start. This path has no device selector and cannot
+be aimed at a customer disk. It remains an engineering feature until an exact
+new ISO passes zero-p3 QEMU and physical USB qualification and is promoted in
+`CURRENT_STATUS.md`.
 
 ## Diagnose from Rescue
 

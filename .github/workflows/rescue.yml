@@ -173,9 +173,11 @@ jobs:
           cargo clippy --locked -p kernaid-linux-nsfs --all-targets -- -D warnings
           cargo test --locked -p kernaid-linux-nsfs
           cargo clippy --locked -p kernaid-rescue-secrets --all-targets \
-            --features experimental-codex-home-lease -- -D warnings
+            --features experimental-codex-home-lease,experimental-firstboot-provisioner \
+            -- -D warnings
           cargo test --locked -p kernaid-rescue-secrets \
-            --features experimental-codex-home-lease -- --test-threads=1
+            --features experimental-codex-home-lease,experimental-firstboot-provisioner \
+            -- --test-threads=1
           cargo fmt -p kernaid-rescue-openai-executor -- --check
           cargo clippy --locked -p kernaid-rescue-openai-executor --all-targets -- -D warnings
           cargo test --locked -p kernaid-rescue-openai-executor
@@ -183,10 +185,11 @@ jobs:
           cargo clippy --locked -p kernaid-rescue-codex-bridge --all-targets -- -D warnings
           cargo test --locked -p kernaid-rescue-codex-bridge
           cargo build --locked --release -p kernaid-rescue-secrets \
-            --features experimental-codex-home-lease \
+            --features experimental-codex-home-lease,experimental-firstboot-provisioner \
             --bin kernaid-rescue-vaultd \
             --bin kernaid-rescue-vaultctl \
-            --bin kernaid-rescue-codex-mounter
+            --bin kernaid-rescue-codex-mounter \
+            --bin kernaid-rescue-firstboot
           cargo build --locked --release -p kernaid-rescue-openai-executor \
             --bin kernaid-rescue-openai-executor
           cargo build --locked --release -p kernaid-linux-pack \
@@ -206,6 +209,7 @@ jobs:
           preflight_dir="$(sudo /usr/bin/mktemp -d /root/kernaid-rescue-shipping-preflight.XXXXXXXX)"
           cleanup_preflight() {
             sudo unlink -- "$preflight_dir/kernaid-rescue-vaultd" 2>/dev/null || true
+            sudo unlink -- "$preflight_dir/kernaid-rescue-firstboot" 2>/dev/null || true
             sudo unlink -- "$preflight_dir/kernaid-rescue-codex-mounter" 2>/dev/null || true
             sudo unlink -- "$preflight_dir/kernaid-rescue-vaultctl" 2>/dev/null || true
             sudo unlink -- "$preflight_dir/kernaid-rescue-openai-executor" 2>/dev/null || true
@@ -223,6 +227,9 @@ jobs:
           sudo install -o root -g root -m 0755 \
             target/release/kernaid-rescue-vaultd \
             "$preflight_dir/kernaid-rescue-vaultd"
+          sudo install -o root -g root -m 0755 \
+            target/release/kernaid-rescue-firstboot \
+            "$preflight_dir/kernaid-rescue-firstboot"
           sudo install -o root -g root -m 0755 \
             target/release/kernaid-rescue-codex-mounter \
             "$preflight_dir/kernaid-rescue-codex-mounter"
@@ -247,6 +254,8 @@ jobs:
           sudo /usr/bin/python3 -I tools/build-rescue/verify-shipping-binary.py \
             "$preflight_dir/kernaid-rescue-vaultd"
           sudo /usr/bin/python3 -I tools/build-rescue/verify-shipping-binary.py \
+            "$preflight_dir/kernaid-rescue-firstboot"
+          sudo /usr/bin/python3 -I tools/build-rescue/verify-shipping-binary.py \
             "$preflight_dir/kernaid-rescue-codex-mounter"
           sudo /usr/bin/python3 -I tools/build-rescue/verify-shipping-binary.py \
             "$preflight_dir/kernaid-rescue-vaultctl"
@@ -265,6 +274,7 @@ jobs:
           docker run --rm --privileged \
             -e KERNAID_DESK_PREBUILT=1 \
             -e KERNAID_RESCUE_VAULTD_BINARY=/workspace/target/release/kernaid-rescue-vaultd \
+            -e KERNAID_RESCUE_FIRSTBOOT_BINARY=/workspace/target/release/kernaid-rescue-firstboot \
             -e KERNAID_RESCUE_CODEX_MOUNTER_BINARY=/workspace/target/release/kernaid-rescue-codex-mounter \
             -e KERNAID_RESCUE_VAULTCTL_BINARY=/workspace/target/release/kernaid-rescue-vaultctl \
             -e KERNAID_RESCUE_OPENAI_EXECUTOR_BINARY=/workspace/target/release/kernaid-rescue-openai-executor \
@@ -976,6 +986,7 @@ jobs:
       contents: read
       id-token: write
       attestations: write
+      artifact-metadata: write
     steps:
       - uses: actions/checkout@v4
       - name: Download the same-run Rescue image inputs

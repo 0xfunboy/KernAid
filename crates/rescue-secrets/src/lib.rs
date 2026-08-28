@@ -153,6 +153,9 @@ mod profile_classifier;
 #[cfg(all(target_os = "linux", feature = "experimental-vault-manager"))]
 mod mount_manager;
 
+#[cfg(all(target_os = "linux", feature = "experimental-firstboot-provisioner"))]
+mod firstboot;
+
 #[cfg(all(target_os = "linux", feature = "experimental-vault-manager"))]
 mod rescue_daemon;
 
@@ -168,6 +171,13 @@ pub use device_locator::{
 };
 #[cfg(all(target_os = "linux", feature = "experimental-vault-manager"))]
 pub use device_locator::{LocatedVaultClassification, LocatedVaultClassificationError};
+#[cfg(all(target_os = "linux", feature = "experimental-firstboot-provisioner"))]
+pub use firstboot::{
+    CanonicalProvisioningCommand, ConfirmedFirstBoot, ConfirmedPassphrase, FirstBootBoundaryError,
+    FirstBootPreflight, FirstBootProvisioningEvidence, ProvisioningCommandTarget,
+    ProvisioningState, UnprovisionedFirstBoot, run_rescue_firstboot,
+    run_rescue_firstboot_preflight,
+};
 #[cfg(target_os = "linux")]
 pub use linux::RescueVaultSecrets;
 #[cfg(all(target_os = "linux", feature = "privileged-probe"))]

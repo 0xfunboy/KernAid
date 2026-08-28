@@ -1,6 +1,6 @@
 # KernAid current status
 
-Last updated: 27 August 2026
+Last updated: 28 August 2026
 
 This page separates the product vision from what the repository can safely do
 today. The short version is: **the default KernAid Phase 0 product path is a
@@ -45,6 +45,9 @@ WinPE Companion and Fleet management remain later milestones.
 | Rescue provider plumbing | Feature-gated OpenAI executor and loopback relay are implemented, but live TLS and a real-account lifecycle are not yet qualified |
 | Virtual testing | Disposable QEMU fixtures, byte-level mutation checks, BIOS/UEFI boot and two-boot USB/vault coverage |
 | Repair experiment | Linux-only feature-gated Desk lab for one typed R2 repair and separately approved rollback on an internal temporary fixture. It now traverses the standard `SessionDriver`, Agent Gateway, explicit Core transaction states and typed broker; it remains absent from normal/Rescue builds and disconnected from production targets |
+| Disabled Rescue repair candidate | A typed contract and read-only preview exist for disabling one `fstab` entry whose UUID is proven missing. There is no broker handler, so it cannot mutate a Rescue target |
+| Rescue first boot | The zero-p3 provisioner is integrated into newer Rescue source and packaging behind its dedicated crate feature; no ISO containing it has passed zero-p3 QEMU or physical qualification yet |
+| Release channel | Canonical Release Channel v1 manifest, strict local verifier and manual internal publisher are implemented. The first internal sequence is currently being published; this is not an automatic updater or signed production channel |
 
 The canonical repository is
 [`0xfunboy/KernAid`](https://github.com/0xfunboy/KernAid), branch `main`.
@@ -55,6 +58,10 @@ treated as a newer release.
 
 - There are no production mutation handlers and no real customer-machine
   repair path.
+- The disabled Rescue `fstab` candidate stops at a typed contract and read-only
+  preview; no broker execution handler exists.
+- Rescue zero-p3 first boot is implemented and shipping-reachable in newer
+  source, but has no exact-image QEMU or physical qualification evidence yet.
 - The fixture lab's exported webview artifact is deliberately marked volatile
   and unsigned because the closed native bridge does not expose its signed
   broker envelope. It is development evidence, not a release receipt.
@@ -127,7 +134,8 @@ passed; signing, notarization and physical-machine qualification remain open.
    action with typed preconditions, a backup on a separate physical device,
    exact approval, verification and rollback; keep it disabled until the
    complete safety case passes.
-5. Add a repeatable release channel for Desk and Rescue artifacts.
+5. Complete and verify the first manual internal Release Channel v1 sequence,
+   then add the signed consumer/update path.
 
 ## Where to look
 

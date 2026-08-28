@@ -235,14 +235,52 @@ descriptor-bound SQLite VFS or private privileged daemon boundary replaces it.
 
 ## Provisioning and disposable probe
 
-The Rust production surface contains no format, erase, raw-write, LUKS repair,
-keyslot mutation, marker creation, permission repair, forced-unmount, or
-arbitrary-command API. Provisioning is a separate administrative operation.
+The default Rust production surface contains no format, erase, raw-write, LUKS
+repair, keyslot mutation, marker creation, permission repair, forced-unmount,
+or arbitrary-command API. Provisioning remains a separate administrative
+operation.
 
-`tests/privileged-luks.sh` is the only provisioning path in this crate. It is
-restricted to a newly allocated disposable loop image, creates the LUKS2/ext4
-filesystem with the same pinned profile-v1 arguments as the USB smoke test and
-the required marker/layout outside the Rust manager, and then runs:
+An initial first-boot boundary is compiled only with
+`experimental-firstboot-provisioner`, which is off by default. The
+`kernaid-rescue-firstboot` binary accepts no arguments and uses only
+`locate_boot_vault()` to retain p3 of the exact USB medium mounted at
+`/run/live/medium`. It verifies canonical profile v1 and accepts only a full
+all-zero classification. Optical boot, locked media, mixed/non-zero media,
+identity drift, timeout and cleanup ambiguity fail closed.
+
+The feature-gated binary now runs the complete root-only terminal lifecycle in
+a new private mount namespace. It reads and confirms the passphrase twice from
+`/dev/tty` with the existing foreground/no-echo/no-swap companion boundary.
+The library also exposes an opaque two-descriptor confirmation API for a
+future trusted launcher: both inputs must be CLOEXEC raw bytes followed by
+EOF; mismatches and invalid values are zeroized and rejected without entering
+an error or debug value.
+
+The same module pins the exact cryptsetup, mkfs.ext4 and tune2fs paths and
+canonical v1 arguments as descriptor-targeted command blueprints, plus a typed
+lifecycle from zero classification through final locked reclassification. The
+executor generates RFC 4122 v4 LUKS/filesystem UUIDs, passes the confirmed
+byte length explicitly to cryptsetup, binds every tool to a child-only
+descriptor, verifies mapping and ext4 identity, mounts privately, creates the
+root-owned marker/lock/state skeleton, initializes the device identity and
+authenticated journal binding, then verifies unmount, mapping removal and the
+final locked profile. It emits a success attestation only after all those
+checks pass. Failure output never claims that mutation did not occur: a tool
+failure after `luksFormat` may leave an incomplete but fail-closed vault.
+
+The default crate feature set still excludes this boundary, and neither the
+Rescue desktop identity nor a provider can invoke it. The Rescue image build
+now enables the feature, packages the binary under `/usr/lib/kernaid`, and
+runs its root-only systemd service on tty1 before the vault daemon and display
+manager. The currently promoted Rescue candidate predates that integration.
+Zero-p3 QEMU qualification and a physical USB check remain mandatory before a
+new image containing the service can replace it.
+
+`tests/privileged-luks.sh` remains the only qualified disposable provisioning
+path in this crate. It is restricted to a newly allocated loop image and
+creates the LUKS2/ext4 filesystem with the same pinned profile-v1 arguments as
+the USB smoke test and the required marker/layout outside the Rust manager,
+and then runs:
 
 ```text
 kernaid-rescue-vault-probe --device /dev/loopN \

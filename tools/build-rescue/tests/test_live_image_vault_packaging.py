@@ -11,6 +11,7 @@ from pathlib import Path
 REPO_DIR = Path(__file__).resolve().parents[3]
 LIVE_ROOT = REPO_DIR / "rescue/live-build/config/includes.chroot"
 SYSTEMD = LIVE_ROOT / "etc/systemd/system"
+FIRSTBOOT_SERVICE = SYSTEMD / "kernaid-rescue-firstboot.service"
 VAULT_SERVICE = SYSTEMD / "kernaid-rescue-vaultd.service"
 VAULT_SOCKET = SYSTEMD / "kernaid-rescue-vaultd.socket"
 READY_SERVICE = SYSTEMD / "kernaid-ready.service"
@@ -90,6 +91,39 @@ def active_lines(path: Path) -> list[str]:
 
 
 class VaultSystemdPackagingTests(unittest.TestCase):
+    def test_firstboot_gate_is_exact_root_tty1_and_precedes_consumers(self) -> None:
+        sections = unit_sections(FIRSTBOOT_SERVICE)
+        unit = sections["Unit"]
+        service = sections["Service"]
+        self.assertEqual(unit["Requires"], "live-config.service")
+        self.assertIn("live-config.service", unit["After"].split())
+        self.assertIn("systemd-tmpfiles-setup.service", unit["After"].split())
+        self.assertEqual(
+            set(unit["Before"].split()),
+            {
+                "kernaid-rescue-vaultd.service",
+                "display-manager.service",
+                "getty@tty1.service",
+                "graphical.target",
+            },
+        )
+        self.assertEqual(unit["ConditionKernelCommandLine"], "boot=live")
+        self.assertEqual(unit["ConditionPathIsDirectory"], "/run/live/medium")
+        self.assertEqual(
+            service["ExecStart"],
+            "-/usr/lib/kernaid/kernaid-rescue-firstboot",
+        )
+        self.assertEqual(service["StandardInput"], "tty-force")
+        self.assertEqual(service["TTYPath"], "/dev/tty1")
+        self.assertEqual(service["User"], "root")
+        self.assertEqual(service["Group"], "root")
+        self.assertEqual(service["PrivateDevices"], "no")
+        self.assertEqual(service["ProtectSystem"], "strict")
+        self.assertEqual(service["CapabilityBoundingSet"], "CAP_SYS_ADMIN")
+        self.assertNotIn("Environment", service)
+        self.assertNotIn("RestrictSUIDSGID", service)
+        self.assertEqual(sections["Install"], {"WantedBy": "multi-user.target"})
+
     def test_seqpacket_listener_is_systemd_257_compatible_and_ancillary_safe(self) -> None:
         sections = unit_sections(VAULT_SOCKET)
         socket = sections["Socket"]
@@ -145,6 +179,8 @@ class VaultSystemdPackagingTests(unittest.TestCase):
         self.assertIn("live-config.service", unit["After"].split())
         self.assertIn("systemd-sysusers.service", unit["After"].split())
         self.assertIn("systemd-sysctl.service", unit["After"].split())
+        self.assertEqual(unit["Wants"], "kernaid-rescue-firstboot.service")
+        self.assertIn("kernaid-rescue-firstboot.service", unit["After"].split())
         self.assertEqual(unit["Before"], "kernaid-ready.service")
         self.assertEqual(unit["ConditionKernelCommandLine"], "boot=live")
         self.assertEqual(unit["ConditionPathIsDirectory"], "/run/live/medium")
@@ -500,6 +536,7 @@ class VaultLivePolicyTests(unittest.TestCase):
 
         hook = SAFETY_HOOK.read_text(encoding="utf-8")
         self.assertIn("/usr/lib/kernaid/kernaid-rescue-vaultd", hook)
+        self.assertIn("/usr/lib/kernaid/kernaid-rescue-firstboot", hook)
         self.assertIn("/usr/bin/kernaid-rescue-vaultctl", hook)
         self.assertIn("/etc/systemd/system/kernaid-rescue-vaultd.service", hook)
         self.assertIn("/usr/lib/tmpfiles.d/kernaid.conf", hook)
@@ -511,6 +548,7 @@ class VaultLivePolicyTests(unittest.TestCase):
         self.assertIn("systemctl mask swap.target", hook)
         self.assertIn("systemctl enable kernaid-rescue-vaultd.socket", hook)
         self.assertIn("systemctl enable kernaid-rescue-vaultd.service", hook)
+        self.assertIn("systemctl enable kernaid-rescue-firstboot.service", hook)
 
         ready = READY_CHECK.read_text(encoding="utf-8")
         self.assertIn('id -u kernaid 2>/dev/null)" = "1000"', ready)
@@ -523,10 +561,14 @@ class VaultLivePolicyTests(unittest.TestCase):
     def test_build_stages_only_release_rescue_binaries_as_root_0755(self) -> None:
         build = BUILD_SCRIPT.read_text(encoding="utf-8")
         self.assertIn("KERNAID_RESCUE_VAULTD_BINARY", build)
+        self.assertIn("KERNAID_RESCUE_FIRSTBOOT_BINARY", build)
         self.assertIn("KERNAID_RESCUE_VAULTCTL_BINARY", build)
         self.assertIn("KERNAID_LINUX_HARDWARE_INVENTORY_BINARY", build)
         self.assertIn(
             "config/includes.chroot/usr/lib/kernaid/kernaid-rescue-vaultd", build
+        )
+        self.assertIn(
+            "config/includes.chroot/usr/lib/kernaid/kernaid-rescue-firstboot", build
         )
         self.assertIn(
             "config/includes.chroot/usr/bin/kernaid-rescue-vaultctl", build
@@ -547,7 +589,7 @@ class VaultLivePolicyTests(unittest.TestCase):
         self.assertGreaterEqual(build.count("install -o root -g root -m 0755"), 2)
         self.assertIn("trap cleanup_staged_binaries EXIT", build)
         self.assertIn('rmdir -- "$vaultctl_destination_dir"', build)
-        self.assertEqual(build.count("verify-shipping-binary.py"), 8)
+        self.assertEqual(build.count("verify-shipping-binary.py"), 9)
         self.assertIn("--profile tauri-webkit", build)
         self.assertNotIn("cargo build", build)
 
@@ -578,6 +620,7 @@ class VaultLivePolicyTests(unittest.TestCase):
         workflow = WORKFLOW.read_text(encoding="utf-8")
         self.assertIn('- "crates/protocol/**"', workflow)
         self.assertIn("--bin kernaid-rescue-vaultd", workflow)
+        self.assertIn("--bin kernaid-rescue-firstboot", workflow)
         self.assertIn("--bin kernaid-rescue-vaultctl", workflow)
         self.assertIn("--bin kernaid-rescue-codex-mounter", workflow)
         self.assertIn("--bin kernaid-rescue-openai-executor", workflow)
@@ -586,6 +629,10 @@ class VaultLivePolicyTests(unittest.TestCase):
         self.assertIn("-p kernaid-rescue-desk-shell", workflow)
         self.assertIn(
             "KERNAID_RESCUE_VAULTD_BINARY=/workspace/target/release/kernaid-rescue-vaultd",
+            workflow,
+        )
+        self.assertIn(
+            "KERNAID_RESCUE_FIRSTBOOT_BINARY=/workspace/target/release/kernaid-rescue-firstboot",
             workflow,
         )
         self.assertIn(
@@ -612,7 +659,7 @@ class VaultLivePolicyTests(unittest.TestCase):
         )
         self.assertNotIn("$RUNNER_TEMP/kernaid-rescue-shipping-preflight", workflow)
         self.assertIn("sudo install -o root -g root -m 0755", workflow)
-        self.assertEqual(workflow.count("verify-shipping-binary.py"), 8)
+        self.assertEqual(workflow.count("verify-shipping-binary.py"), 9)
         self.assertIn("--profile tauri-webkit", workflow)
         self.assertIn("qemu-vault-lifecycle-smoke.sh", workflow)
 

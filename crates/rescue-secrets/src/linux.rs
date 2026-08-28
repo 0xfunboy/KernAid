@@ -81,24 +81,38 @@ impl RescueVaultSecrets {
 
     /// Build a journal secret-store sharing this vault's exclusive lock.
     #[must_use]
-    #[cfg(feature = "privileged-probe")]
+    #[cfg(any(
+        feature = "privileged-probe",
+        feature = "experimental-firstboot-provisioner"
+    ))]
     pub fn journal_store(&self) -> RescueJournalSecretStore<'_> {
         RescueJournalSecretStore { inner: &self.inner }
     }
 
-    #[cfg(all(test, not(feature = "privileged-probe")))]
+    #[cfg(all(
+        test,
+        not(feature = "privileged-probe"),
+        not(feature = "experimental-firstboot-provisioner")
+    ))]
     pub(crate) fn journal_store(&self) -> RescueJournalSecretStore<'_> {
         RescueJournalSecretStore { inner: &self.inner }
     }
 
     /// Build a device-identity store sharing this vault's exclusive lock.
     #[must_use]
-    #[cfg(feature = "privileged-probe")]
+    #[cfg(any(
+        feature = "privileged-probe",
+        feature = "experimental-firstboot-provisioner"
+    ))]
     pub fn device_identity_store(&self) -> RescueDeviceIdentityStore<'_> {
         RescueDeviceIdentityStore { inner: &self.inner }
     }
 
-    #[cfg(all(test, not(feature = "privileged-probe")))]
+    #[cfg(all(
+        test,
+        not(feature = "privileged-probe"),
+        not(feature = "experimental-firstboot-provisioner")
+    ))]
     pub(crate) fn device_identity_store(&self) -> RescueDeviceIdentityStore<'_> {
         RescueDeviceIdentityStore { inner: &self.inner }
     }
@@ -106,14 +120,21 @@ impl RescueVaultSecrets {
     /// Explicitly open or initialize the encrypted audit journal. Unlike
     /// [`Self::open`], this is a state-mutating application operation and must
     /// only be called after the pre-provisioned vault boundary is accepted.
-    #[cfg(feature = "privileged-probe")]
+    #[cfg(any(
+        feature = "privileged-probe",
+        feature = "experimental-firstboot-provisioner"
+    ))]
     pub fn open_journal(
         &self,
     ) -> Result<SecureJournal<RescueJournalSecretStore<'_>>, JournalError> {
         self.inner.open_application_journal()
     }
 
-    #[cfg(all(test, not(feature = "privileged-probe")))]
+    #[cfg(all(
+        test,
+        not(feature = "privileged-probe"),
+        not(feature = "experimental-firstboot-provisioner")
+    ))]
     pub(crate) fn open_journal(
         &self,
     ) -> Result<SecureJournal<RescueJournalSecretStore<'_>>, JournalError> {
@@ -383,7 +404,11 @@ impl RescueDeviceIdentityStore<'_> {
     }
 
     /// Persist a caller-created identity only if no identity file exists.
-    #[cfg(any(test, feature = "privileged-probe"))]
+    #[cfg(any(
+        test,
+        feature = "privileged-probe",
+        feature = "experimental-firstboot-provisioner"
+    ))]
     pub fn store_new_device_identity(
         &mut self,
         identity: &DeviceIdentity,
@@ -405,7 +430,11 @@ impl RescueDeviceIdentityStore<'_> {
 
     /// Generate and persist an identity as an explicit first-run action.
     /// There is intentionally no load-or-create API.
-    #[cfg(any(test, feature = "privileged-probe"))]
+    #[cfg(any(
+        test,
+        feature = "privileged-probe",
+        feature = "experimental-firstboot-provisioner"
+    ))]
     pub fn create_device_identity(&mut self) -> Result<DeviceIdentity, RescueSecretError> {
         if self.load_device_identity()?.is_some() {
             return Err(RescueSecretError::IdentityAlreadyExists);

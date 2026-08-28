@@ -38,6 +38,7 @@ chown root:root \
     /usr/lib/kernaid/kernaid-rescue-codex-mounter \
     /usr/bin/kernaid-rescue-desk-shell \
     /usr/lib/kernaid/kernaid-rescue-openai-executor \
+    /usr/lib/kernaid/kernaid-rescue-firstboot \
     /usr/lib/kernaid/kernaid-rescue-vaultd \
     /usr/bin/kernaid-codex-auth \
     /usr/bin/kernaid-rescue-vaultctl
@@ -51,6 +52,7 @@ chmod 0755 \
     /usr/lib/kernaid/kernaid-rescue-codex-mounter \
     /usr/bin/kernaid-rescue-desk-shell \
     /usr/lib/kernaid/kernaid-rescue-openai-executor \
+    /usr/lib/kernaid/kernaid-rescue-firstboot \
     /usr/lib/kernaid/kernaid-rescue-vaultd \
     /usr/bin/kernaid-codex-auth \
     /usr/bin/kernaid-rescue-vaultctl
@@ -81,6 +83,7 @@ chown root:root \
     /etc/systemd/system/kernaid-rescue-codex-mounter@.service \
     /etc/systemd/system/kernaid-rescue-desk-shell.service \
     /etc/systemd/system/kernaid-rescue-ui-session-ready.service \
+    /etc/systemd/system/kernaid-rescue-firstboot.service \
     /etc/systemd/system/kernaid-rescue-vaultd.service \
     /etc/systemd/system/kernaid-rescue-vaultd.socket \
     /etc/systemd/system/kernaid-ready.service \
@@ -118,6 +121,7 @@ chmod 0644 \
     /etc/systemd/system/kernaid-rescue-codex-mounter@.service \
     /etc/systemd/system/kernaid-rescue-desk-shell.service \
     /etc/systemd/system/kernaid-rescue-ui-session-ready.service \
+    /etc/systemd/system/kernaid-rescue-firstboot.service \
     /etc/systemd/system/kernaid-rescue-vaultd.service \
     /etc/systemd/system/kernaid-rescue-vaultd.socket \
     /etc/systemd/system/kernaid-ready.service \
@@ -154,6 +158,7 @@ systemctl enable kernaid-rescue-openai-executor.socket
 systemctl enable kernaid-rescue-application.socket
 systemctl enable kernaid-rescue-codex.socket
 systemctl enable kernaid-rescue-codex-mounter.socket
+systemctl enable kernaid-rescue-firstboot.service
 systemctl enable kernaid-rescue-vaultd.socket
 systemctl enable kernaid-rescue-vaultd.service
 systemctl mask swap.target

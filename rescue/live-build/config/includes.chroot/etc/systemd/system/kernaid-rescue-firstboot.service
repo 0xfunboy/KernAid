@@ -1,0 +1,56 @@
+[Unit]
+Description=KernAid Rescue first-boot vault provisioning gate
+Requires=live-config.service
+After=live-config.service systemd-sysusers.service systemd-sysctl.service systemd-tmpfiles-setup.service
+Before=kernaid-rescue-vaultd.service display-manager.service getty@tty1.service graphical.target
+ConditionKernelCommandLine=boot=live
+ConditionPathIsDirectory=/run/live/medium
+
+[Service]
+Type=oneshot
+# The binary itself accepts no arguments, discovers only p3 of the exact live
+# medium, and prompts only after a complete all-zero classification. Optical,
+# already-provisioned and fail-closed states are recorded but must not make a
+# recovery image unbootable.
+ExecStart=-/usr/lib/kernaid/kernaid-rescue-firstboot
+RemainAfterExit=yes
+TimeoutStartSec=0
+StandardInput=tty-force
+StandardOutput=journal+console
+StandardError=journal+console
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=no
+User=root
+Group=root
+UMask=0077
+LimitCORE=0
+LimitNOFILE=128
+TasksMax=32
+NoNewPrivileges=yes
+PrivateMounts=yes
+PrivateNetwork=yes
+PrivateTmp=yes
+PrivateDevices=no
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectControlGroups=yes
+ReadWritePaths=-/run/kernaid /run/lock -/run/cryptsetup
+CapabilityBoundingSet=CAP_SYS_ADMIN
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+KillMode=mixed
+SendSIGKILL=yes
+
+[Install]
+WantedBy=multi-user.target

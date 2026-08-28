@@ -4,7 +4,10 @@
 //! in the current mount namespace; it is not a production claim of atomic
 //! ownership against another privileged actor.
 
-use super::{RescueSecretError, RescueVaultSecrets, VaultMountAttestation};
+use super::{
+    RescueSecretError, RescueVaultSecrets, VAULT_MARKER_NAME, VAULT_MARKER_V1,
+    VaultMountAttestation,
+};
 use crate::{
     bounded_process,
     device_locator::{
@@ -20,11 +23,13 @@ use crate::{
         qualify_ext4_mapper, revalidate_mounted_ext4_mapper,
     },
 };
+#[cfg(feature = "experimental-firstboot-provisioner")]
+use rand_core::{OsRng, RngCore};
 use rustix::{
     fd::{AsFd, OwnedFd},
     fs::{
-        self as rfs, AtFlags, CWD, FileType, FlockOperation, Mode, OFlags, ResolveFlags, Stat,
-        StatxFlags,
+        self as rfs, AtFlags, CWD, FileType, FlockOperation, Mode, OFlags, RawDir, ResolveFlags,
+        Stat, StatxFlags,
     },
     mount::{MountFlags, UnmountFlags},
 };
@@ -32,6 +37,7 @@ use std::{
     error::Error,
     ffi::OsStr,
     fs::{self, File},
+    mem::MaybeUninit,
     os::fd::AsRawFd,
     os::unix::ffi::OsStrExt,
     path::{Component, Path, PathBuf},
@@ -52,11 +58,23 @@ const MAPPER_SUFFIX_BYTES: usize = 16;
 const MAPPER_NAME_BYTES: usize = MAPPER_PREFIX.len() + MAPPER_SUFFIX_BYTES;
 const COMMAND_OUTPUT_LIMIT: usize = 4096;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(feature = "experimental-firstboot-provisioner")]
+const PROVISIONING_COMMAND_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const DEFERRED_REMOVE_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFERRED_REMOVE_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const SECURE_DIRECTORY_MODE: u32 = 0o700;
 const SECURE_FILE_MODE: u32 = 0o600;
 const TMPFS_MAGIC: u64 = 0x0102_1994;
+#[cfg(feature = "experimental-firstboot-provisioner")]
+const MKFS_EXT4_PATH: &str = "/usr/sbin/mkfs.ext4";
+#[cfg(feature = "experimental-firstboot-provisioner")]
+const TUNE2FS_PATH: &str = "/usr/sbin/tune2fs";
+#[cfg(feature = "experimental-firstboot-provisioner")]
+const STATE_DIRECTORY_NAME: &str = ".kernaid-secure-state-v1";
+#[cfg(feature = "experimental-firstboot-provisioner")]
+const VAULT_LOCK_NAME: &str = ".kernaid-rescue-secrets.lock";
+#[cfg(feature = "experimental-firstboot-provisioner")]
+const FIRSTBOOT_SCAN_BUFFER_BYTES: usize = 8192;
 
 /// A mapper name in KernAid's single accepted grammar:
 /// `kernaid-vault-` followed by exactly sixteen lowercase hexadecimal bytes.
@@ -156,6 +174,8 @@ pub enum VaultMountManagerError {
     WrongVaultLabel,
     MapperConflict,
     PassphraseUnavailable,
+    ProvisioningFormatFailed,
+    ProvisioningInitializationFailed,
     UnlockFailed,
     MappingVerificationFailed,
     UnsupportedFilesystem,
@@ -185,6 +205,10 @@ impl std::fmt::Display for VaultMountManagerError {
             Self::WrongVaultLabel => "the selected device is not labelled as a KernAid vault",
             Self::MapperConflict => "the selected Rescue mapper is already in use",
             Self::PassphraseUnavailable => "the Rescue vault passphrase descriptor is unavailable",
+            Self::ProvisioningFormatFailed => "the Rescue vault canonical format operation failed",
+            Self::ProvisioningInitializationFailed => {
+                "the Rescue vault first-boot initialization failed"
+            }
             Self::UnlockFailed => "the Rescue vault could not be unlocked",
             Self::MappingVerificationFailed => "the Rescue vault mapping could not be verified",
             Self::UnsupportedFilesystem => "the Rescue vault filesystem is not supported",
@@ -218,6 +242,8 @@ impl VaultMountManagerError {
             Self::WrongVaultLabel => "wrong-vault-label",
             Self::MapperConflict => "mapper-conflict",
             Self::PassphraseUnavailable => "passphrase-unavailable",
+            Self::ProvisioningFormatFailed => "provisioning-format-failed",
+            Self::ProvisioningInitializationFailed => "provisioning-initialization-failed",
             Self::UnlockFailed => "unlock-failed",
             Self::MappingVerificationFailed => "mapping-verification-failed",
             Self::UnsupportedFilesystem => "unsupported-filesystem",
@@ -290,6 +316,101 @@ impl RescueVaultMountManager {
             }
         }
     }
+
+    /// Provision the already-located all-zero p3 capability as canonical
+    /// profile v1. This entrypoint is crate-private and feature-gated: callers
+    /// cannot select a pathname, mapper, UUID or command argument.
+    #[cfg(feature = "experimental-firstboot-provisioner")]
+    pub(crate) fn provision_firstboot(
+        self,
+        located: LocatedVaultPartition,
+        passphrase: &[u8],
+    ) -> Result<FirstBootProvisioningEvidence, VaultMountManagerError> {
+        if !(kernaid_protocol::rescue_vault::MIN_PASSPHRASE_BYTES as usize
+            ..=kernaid_protocol::rescue_vault::MAX_PASSPHRASE_BYTES as usize)
+            .contains(&passphrase.len())
+            || passphrase.contains(&0)
+        {
+            return Err(VaultMountManagerError::PassphraseUnavailable);
+        }
+        let mapper = random_firstboot_mapper()?;
+        let request = ResolvedRequest::resolve(VaultUnlockRequest::from_located(located, mapper))?;
+        let mut ops = SystemOps;
+        ops.ensure_device_unused(&request.device)?;
+        ops.ensure_mapper_absent(&request.mapper, &request.mapper_path)?;
+        require_unprovisioned(&request.device)?;
+
+        let luks_uuid = random_uuid_v4()?;
+        let filesystem_uuid = random_uuid_v4()?;
+        let format_result = format_luks_profile_v1(&request.device, passphrase, luks_uuid);
+        if let Err(primary) = format_result {
+            if SystemOps::verify_mapping_absence(
+                &request.device,
+                &request.mapper,
+                &request.mapper_path,
+            )
+            .is_err()
+            {
+                return Err(VaultMountManagerError::CleanupFailed);
+            }
+            return Err(primary);
+        }
+        request.device.revalidate()?;
+        let outer = ops.classify_outer_profile(&request.device)?;
+        if outer.uuid() != luks_uuid {
+            return Err(VaultMountManagerError::ProfileMismatch);
+        }
+
+        let passphrase_read = secret_pipe(passphrase)?;
+        let mut activation = Activation::start_for_provisioning(
+            SystemOps,
+            self.lock,
+            request,
+            passphrase_read,
+            passphrase.len(),
+            filesystem_uuid,
+        )?;
+        let operation = initialize_firstboot_secure_state(&mut activation, filesystem_uuid);
+        let evidence = match operation {
+            Ok(evidence) => evidence,
+            Err(primary) => {
+                return if activation.cleanup().is_err() {
+                    Err(VaultMountManagerError::CleanupFailed)
+                } else {
+                    Err(primary)
+                };
+            }
+        };
+        activation.cleanup()?;
+        let final_profile = activation
+            .ops
+            .classify_outer_profile(&activation.request.device)?;
+        if final_profile.uuid() != luks_uuid {
+            return Err(VaultMountManagerError::ProfileMismatch);
+        }
+        Ok(FirstBootProvisioningEvidence {
+            luks_uuid,
+            filesystem_uuid,
+            device_id: evidence.device_id,
+            identity_public_key: evidence.identity_public_key,
+        })
+    }
+}
+
+/// Non-secret evidence emitted only after layout initialization, verified
+/// cleanup and final locked reclassification all succeed.
+#[cfg(feature = "experimental-firstboot-provisioner")]
+pub(crate) struct FirstBootProvisioningEvidence {
+    pub(crate) luks_uuid: [u8; 36],
+    pub(crate) filesystem_uuid: [u8; 36],
+    pub(crate) device_id: String,
+    pub(crate) identity_public_key: [u8; 32],
+}
+
+#[cfg(feature = "experimental-firstboot-provisioner")]
+struct InitializedSecureStateEvidence {
+    device_id: String,
+    identity_public_key: [u8; 32],
 }
 
 /// Owns the unlocked mapping, the restrictive ext4 mount, and the
@@ -640,14 +761,55 @@ struct Activation<R: VaultOps> {
     mounted: bool,
     mutator_invoked: bool,
     cleanup_attempted: bool,
+    #[cfg(feature = "experimental-firstboot-provisioner")]
+    provisioning_filesystem_uuid: Option<[u8; 36]>,
+    #[cfg(feature = "experimental-firstboot-provisioner")]
+    provisioning_key_size: Option<usize>,
 }
 
 impl<R: VaultOps> Activation<R> {
     fn start(
+        ops: R,
+        manager_lock: OwnedFd,
+        request: ResolvedRequest,
+        passphrase: impl AsFd,
+    ) -> Result<Self, VaultMountManagerError> {
+        Self::start_with_filesystem(ops, manager_lock, request, passphrase, None, None)
+    }
+
+    #[cfg(feature = "experimental-firstboot-provisioner")]
+    fn start_for_provisioning(
+        ops: R,
+        manager_lock: OwnedFd,
+        request: ResolvedRequest,
+        passphrase: impl AsFd,
+        key_size: usize,
+        filesystem_uuid: [u8; 36],
+    ) -> Result<Self, VaultMountManagerError> {
+        Self::start_with_filesystem(
+            ops,
+            manager_lock,
+            request,
+            passphrase,
+            Some(key_size),
+            Some(filesystem_uuid),
+        )
+    }
+
+    fn start_with_filesystem(
         mut ops: R,
         manager_lock: OwnedFd,
         request: ResolvedRequest,
         passphrase: impl AsFd,
+        #[cfg(feature = "experimental-firstboot-provisioner")] provisioning_key_size: Option<usize>,
+        #[cfg(not(feature = "experimental-firstboot-provisioner"))] _provisioning_key_size: Option<
+            usize,
+        >,
+        #[cfg(feature = "experimental-firstboot-provisioner")] provisioning_filesystem_uuid: Option<
+            [u8; 36],
+        >,
+        #[cfg(not(feature = "experimental-firstboot-provisioner"))]
+        _provisioning_filesystem_uuid: Option<[u8; 36]>,
     ) -> Result<Self, VaultMountManagerError> {
         ops.ensure_device_unused(&request.device)?;
         ops.ensure_mapper_absent(&request.mapper, &request.mapper_path)?;
@@ -669,6 +831,10 @@ impl<R: VaultOps> Activation<R> {
             mounted: false,
             mutator_invoked: false,
             cleanup_attempted: false,
+            #[cfg(feature = "experimental-firstboot-provisioner")]
+            provisioning_filesystem_uuid,
+            #[cfg(feature = "experimental-firstboot-provisioner")]
+            provisioning_key_size,
         };
 
         let result = activation.continue_start(passphrase);
@@ -695,6 +861,22 @@ impl<R: VaultOps> Activation<R> {
         let cryptsetup_passphrase = rustix::io::fcntl_dupfd_cloexec(&passphrase, 3)
             .map_err(|_| VaultMountManagerError::PassphraseUnavailable)?;
         self.mutator_invoked = true;
+        #[cfg(feature = "experimental-firstboot-provisioner")]
+        let open_result = if let Some(key_size) = self.provisioning_key_size.take() {
+            self.ops.open_luks2_sized(
+                &self.request.device,
+                &self.request.mapper,
+                cryptsetup_passphrase,
+                key_size,
+            )
+        } else {
+            self.ops.open_luks2(
+                &self.request.device,
+                &self.request.mapper,
+                cryptsetup_passphrase,
+            )
+        };
+        #[cfg(not(feature = "experimental-firstboot-provisioner"))]
         let open_result = self.ops.open_luks2(
             &self.request.device,
             &self.request.mapper,
@@ -784,6 +966,16 @@ impl<R: VaultOps> Activation<R> {
             .mapping
             .as_ref()
             .ok_or(VaultMountManagerError::MappingVerificationFailed)?;
+        #[cfg(feature = "experimental-firstboot-provisioner")]
+        if let Some(filesystem_uuid) = self.provisioning_filesystem_uuid.take() {
+            self.ops.format_filesystem(
+                &self.request.device,
+                &self.request.mapper,
+                mapping,
+                self.header,
+                filesystem_uuid,
+            )?;
+        }
         let filesystem_profile = self.ops.inspect_filesystem(
             &self.request.device,
             &self.request.mapper,
@@ -930,6 +1122,16 @@ trait VaultOps {
         mapper: &MapperName,
         passphrase: OwnedFd,
     ) -> Result<(), VaultMountManagerError>;
+    #[cfg(feature = "experimental-firstboot-provisioner")]
+    fn open_luks2_sized(
+        &mut self,
+        device: &BlockDevice,
+        mapper: &MapperName,
+        passphrase: OwnedFd,
+        _key_size: usize,
+    ) -> Result<(), VaultMountManagerError> {
+        self.open_luks2(device, mapper, passphrase)
+    }
     fn inspect_mapping(
         &mut self,
         device: &BlockDevice,
@@ -966,6 +1168,17 @@ trait VaultOps {
         mapper: &MapperName,
         mapper_path: &Path,
     ) -> Result<(), VaultMountManagerError>;
+    #[cfg(feature = "experimental-firstboot-provisioner")]
+    fn format_filesystem(
+        &mut self,
+        _device: &BlockDevice,
+        _mapper: &MapperName,
+        _mapping: &MappingIdentity,
+        _header: HeaderIdentity,
+        _filesystem_uuid: [u8; 36],
+    ) -> Result<(), VaultMountManagerError> {
+        Err(VaultMountManagerError::ProvisioningInitializationFailed)
+    }
     fn inspect_filesystem(
         &mut self,
         device: &BlockDevice,
@@ -1200,6 +1413,36 @@ impl VaultOps for SystemOps {
         Ok(())
     }
 
+    #[cfg(feature = "experimental-firstboot-provisioner")]
+    fn open_luks2_sized(
+        &mut self,
+        device: &BlockDevice,
+        mapper: &MapperName,
+        passphrase: OwnedFd,
+        key_size: usize,
+    ) -> Result<(), VaultMountManagerError> {
+        let inherited = bounded_process::InheritedChildDescriptor::duplicate(&device.descriptor)
+            .map_err(map_bounded_process_error)?;
+        let mut command =
+            cryptsetup_open_sized_command(inherited.path(), mapper, &key_size.to_string());
+        command
+            .env_clear()
+            .env("LC_ALL", "C")
+            .stdin(Stdio::from(File::from(passphrase)))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let status = bounded_process::wait_with_descriptor(
+            &mut command,
+            PROVISIONING_COMMAND_TIMEOUT,
+            inherited,
+        )
+        .map_err(map_bounded_process_error)?;
+        if !status.success() {
+            return Err(VaultMountManagerError::UnlockFailed);
+        }
+        Ok(())
+    }
+
     fn inspect_mapping(
         &mut self,
         device: &BlockDevice,
@@ -1312,6 +1555,18 @@ impl VaultOps for SystemOps {
         mapper_path: &Path,
     ) -> Result<(), VaultMountManagerError> {
         Self::wait_for_mapping_absence(device, mapper, mapper_path)
+    }
+
+    #[cfg(feature = "experimental-firstboot-provisioner")]
+    fn format_filesystem(
+        &mut self,
+        device: &BlockDevice,
+        mapper: &MapperName,
+        mapping: &MappingIdentity,
+        header: HeaderIdentity,
+        filesystem_uuid: [u8; 36],
+    ) -> Result<(), VaultMountManagerError> {
+        format_ext4_profile_v1(device, mapper, mapping, header, filesystem_uuid)
     }
 
     fn inspect_filesystem(
@@ -1510,6 +1765,522 @@ impl VaultOps for SystemOps {
     }
 }
 
+#[cfg(feature = "experimental-firstboot-provisioner")]
+fn require_unprovisioned(device: &BlockDevice) -> Result<(), VaultMountManagerError> {
+    device.revalidate()?;
+    let profile = classify_partition(&device.descriptor, || {
+        device.revalidate_profile_capability()
+    })
+    .map_err(map_profile_classifier_error)?;
+    device.revalidate()?;
+    match profile {
+        VaultPartitionProfile::Unprovisioned => Ok(()),
+        VaultPartitionProfile::Locked(_) | VaultPartitionProfile::ProfileMismatch => {
+            Err(VaultMountManagerError::ProfileMismatch)
+        }
+    }
+}
+
+#[cfg(feature = "experimental-firstboot-provisioner")]
+fn format_luks_profile_v1(
+    device: &BlockDevice,
+    passphrase: &[u8],
+    luks_uuid: [u8; 36],
+) -> Result<(), VaultMountManagerError> {
+    device.revalidate()?;
+    let inherited = bounded_process::InheritedChildDescriptor::duplicate(&device.descriptor)
+        .map_err(map_bounded_process_error)?;
+    let key = secret_pipe(passphrase)?;
+    let key_size = passphrase.len().to_string();
+    let mut command =
+        cryptsetup_format_command(inherited.path(), OsStr::from_bytes(&luks_uuid), &key_size);
+    command
+        .env_clear()
+        .env("LC_ALL", "C")
+        .stdin(Stdio::from(File::from(key)))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let status = bounded_process::wait_with_descriptor(
+        &mut command,
+        PROVISIONING_COMMAND_TIMEOUT,
+        inherited,
+    )
+    .map_err(map_bounded_process_error)?;
+    if !status.success() {
+        return Err(VaultMountManagerError::ProvisioningFormatFailed);
+    }
+    rfs::fsync(&device.descriptor).map_err(|_| VaultMountManagerError::ProvisioningFormatFailed)?;
+    device.revalidate()
+}
+
+#[cfg(feature = "experimental-firstboot-provisioner")]
+fn format_ext4_profile_v1(
+    device: &BlockDevice,
+    mapper: &MapperName,
+    mapping: &MappingIdentity,
+    header: HeaderIdentity,
+    filesystem_uuid: [u8; 36],
+) -> Result<(), VaultMountManagerError> {
+    mapping.revalidate(device, mapper, header)?;
+    let inherited = bounded_process::InheritedChildDescriptor::duplicate(&mapping.descriptor)
+        .map_err(map_bounded_process_error)?;
+    let mut mkfs = mkfs_ext4_command(inherited.path(), OsStr::from_bytes(&filesystem_uuid));
+    mkfs.env_clear()
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let status =
+        bounded_process::wait_with_descriptor(&mut mkfs, PROVISIONING_COMMAND_TIMEOUT, inherited)
+            .map_err(map_bounded_process_error)?;
+    if !status.success() {
+        return Err(VaultMountManagerError::ProvisioningFormatFailed);
+    }
+    mapping.revalidate(device, mapper, header)?;
+    let inherited = bounded_process::InheritedChildDescriptor::duplicate(&mapping.descriptor)
+        .map_err(map_bounded_process_error)?;
+    let mut tune = tune2fs_command(inherited.path());
+    tune.env_clear()
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let status =
+        bounded_process::wait_with_descriptor(&mut tune, PROVISIONING_COMMAND_TIMEOUT, inherited)
+            .map_err(map_bounded_process_error)?;
+    if !status.success() {
+        return Err(VaultMountManagerError::ProvisioningFormatFailed);
+    }
+    rfs::fsync(&mapping.descriptor)
+        .map_err(|_| VaultMountManagerError::ProvisioningFormatFailed)?;
+    mapping.revalidate(device, mapper, header)
+}
+
+#[cfg(feature = "experimental-firstboot-provisioner")]
+fn initialize_firstboot_secure_state(
+    activation: &mut Activation<SystemOps>,
+    filesystem_uuid: [u8; 36],
+) -> Result<InitializedSecureStateEvidence, VaultMountManagerError> {
+    let mapping = activation
+        .mapping
+        .as_ref()
+        .ok_or(VaultMountManagerError::MappingVerificationFailed)?;
+    mapping.revalidate(
+        &activation.request.device,
+        &activation.request.mapper,
+        activation.header,
+    )?;
+    let observed_filesystem = activation.ops.inspect_filesystem(
+        &activation.request.device,
+        &activation.request.mapper,
+        mapping,
+        activation.header,
+    )?;
+    if observed_filesystem.uuid_ascii() != filesystem_uuid {
+        return Err(VaultMountManagerError::ProfileMismatch);
+    }
+    let attestation = activation
+        .attestation
+        .as_ref()
+        .ok_or(VaultMountManagerError::MountVerificationFailed)?;
+    create_firstboot_vault_skeleton(&activation.request.mount_root, mapping)?;
+    activation.ops.verify_mounted_filesystem(
+        &activation.request.device,
+        &activation.request.mapper,
+        mapping,
+        activation.header,
+        observed_filesystem,
+    )?;
+
+    let secrets = RescueVaultSecrets::open(&activation.request.mount_root, attestation)
+        .map_err(|_| VaultMountManagerError::ProvisioningInitializationFailed)?;
+    let mut journal = secrets
+        .open_journal()
+        .map_err(|_| VaultMountManagerError::ProvisioningInitializationFailed)?;
+    if !journal
+        .entries()
+        .map_err(|_| VaultMountManagerError::ProvisioningInitializationFailed)?
+        .is_empty()
+    {
+        return Err(VaultMountManagerError::ProvisioningInitializationFailed);
+    }
+    drop(journal);
+    let mut identities = secrets.device_identity_store();
+    if identities
+        .load_device_identity()
+        .map_err(|_| VaultMountManagerError::ProvisioningInitializationFailed)?
+        .is_some()
+    {
+        return Err(VaultMountManagerError::ProvisioningInitializationFailed);
+    }
+    let identity = identities
+        .create_device_identity()
+        .map_err(|_| VaultMountManagerError::ProvisioningInitializationFailed)?;
+    let application = secrets
+        .open_application_store()
+        .map_err(|_| VaultMountManagerError::ProvisioningInitializationFailed)?;
+    let device_id = identity.device_id();
+    if application.device_id() != device_id {
+        return Err(VaultMountManagerError::ProvisioningInitializationFailed);
+    }
+    let identity_public_key = identity.public_key();
+    drop(application);
+    drop(secrets);
+    mapping.revalidate(
+        &activation.request.device,
+        &activation.request.mapper,
+        activation.header,
+    )?;
+    Ok(InitializedSecureStateEvidence {
+        device_id,
+        identity_public_key,
+    })
+}
+
+#[cfg(feature = "experimental-firstboot-provisioner")]
+fn create_firstboot_vault_skeleton(
+    root: &Path,
+    mapping: &MappingIdentity,
+) -> Result<(), VaultMountManagerError> {
+    let root_fd = rfs::openat2(
+        CWD,
+        root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+    )
+    .map_err(|_| VaultMountManagerError::ProvisioningInitializationFailed)?;
+    rfs::fchmod(&root_fd, Mode::from_raw_mode(SECURE_DIRECTORY_MODE))
+        .map_err(|_| VaultMountManagerError::ProvisioningInitializationFailed)?;
+    validate_firstboot_directory(&root_fd, mapping, SECURE_DIRECTORY_MODE)?;
+    require_fresh_ext4_root(&root_fd, mapping)?;
+
+    rfs::mkdirat(
+        &root_fd,
+        STATE_DIRECTORY_NAME,
+        Mode::from_raw_mode(SECURE_DIRECTORY_MODE),
+    )
+    .map_err(|_| VaultMountManagerError::ProvisioningInitializationFailed)?;
+    let state = open_firstboot_child_directory(&root_fd, STATE_DIRECTORY_NAME)?;
+    validate_firstboot_directory(&state, mapping, SECURE_DIRECTORY_MODE)?;
+    rfs::fsync(&state).map_err(|_| VaultMountManagerError::ProvisioningInitializationFailed)?;
+    create_firstboot_file(&root_fd, VAULT_LOCK_NAME, b"", mapping)?;
+    // The marker is installed last and is the completion sentinel for the
+    // structural skeleton. Identity/journal creation remains a later typed
+    // transaction and is verified before this lifecycle may report success.
+    create_firstboot_file(&root_fd, VAULT_MARKER_NAME, VAULT_MARKER_V1, mapping)?;
+    rfs::fsync(&root_fd).map_err(|_| VaultMountManagerError::ProvisioningInitializationFailed)?;
+    validate_firstboot_directory(&root_fd, mapping, SECURE_DIRECTORY_MODE)
+}
+
+#[cfg(feature = "experimental-firstboot-provisioner")]
+fn require_fresh_ext4_root(
+    root: &OwnedFd,
+    mapping: &MappingIdentity,
+) -> Result<(), VaultMountManagerError> {
+    let scan = rfs::openat2(
+        root,
+        ".",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::BENEATH
+            | ResolveFlags::NO_SYMLINKS
+            | ResolveFlags::NO_MAGICLINKS
+            | ResolveFlags::NO_XDEV,
+    )
+    .map_err(|_| VaultMountManagerError::ProvisioningInitializationFailed)?;
+    let mut buffer = [MaybeUninit::<u8>::uninit(); FIRSTBOOT_SCAN_BUFFER_BYTES];
+    let mut entries = RawDir::new(&scan, &mut buffer);
+    let mut saw_lost_found = false;
+    while let Some(entry) = entries.next() {
+        let entry = entry.map_err(|_| VaultMountManagerError::ProvisioningInitializationFailed)?;
+        let name = entry.file_name().to_bytes();
+        if name == b"." || name == b".." {
+            continue;
+        }
+        if name != b"lost+found" || saw_lost_found {
+            return Err(VaultMountManagerError::ProvisioningInitializationFailed);
+        }
+        saw_lost_found = true;
+        let lost = rfs::statat(root, "lost+found", AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|_| VaultMountManagerError::ProvisioningInitializationFailed)?;
+        if !FileType::from_raw_mode(lost.st_mode).is_dir()
+            || lost.st_uid != 0
+            || lost.st_gid != 0
+            || lost.st_dev != rfs::makedev(mapping.major, mapping.minor)
+        {
+            return Err(VaultMountManagerError::ProvisioningInitializationFailed);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "experimental-firstboot-provisioner")]
+fn open_firstboot_child_directory(
+    root: &OwnedFd,
+    name: &str,
+) -> Result<OwnedFd, VaultMountManagerError> {
+    rfs::openat2(
+        root,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::BENEATH
+            | ResolveFlags::NO_SYMLINKS
+            | ResolveFlags::NO_MAGICLINKS
+            | ResolveFlags::NO_XDEV,
+    )
+    .map_err(|_| VaultMountManagerError::ProvisioningInitializationFailed)
+}
+
+#[cfg(feature = "experimental-firstboot-provisioner")]
+fn validate_firstboot_directory(
+    descriptor: &OwnedFd,
+    mapping: &MappingIdentity,
+    mode: u32,
+) -> Result<(), VaultMountManagerError> {
+    let stat = rfs::fstat(descriptor)
+        .map_err(|_| VaultMountManagerError::ProvisioningInitializationFailed)?;
+    let flags = rustix::io::fcntl_getfd(descriptor)
+        .map_err(|_| VaultMountManagerError::ProvisioningInitializationFailed)?;
+    if !FileType::from_raw_mode(stat.st_mode).is_dir()
+        || stat.st_dev != rfs::makedev(mapping.major, mapping.minor)
+        || stat.st_uid != 0
+        || stat.st_gid != 0
+        || stat.st_mode & 0o7777 != mode
+        || !flags.contains(rustix::io::FdFlags::CLOEXEC)
+    {
+        return Err(VaultMountManagerError::ProvisioningInitializationFailed);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "experimental-firstboot-provisioner")]
+fn create_firstboot_file(
+    root: &OwnedFd,
+    name: &str,
+    bytes: &[u8],
+    mapping: &MappingIdentity,
+) -> Result<(), VaultMountManagerError> {
+    let file = rfs::openat2(
+        root,
+        name,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(SECURE_FILE_MODE),
+        ResolveFlags::BENEATH
+            | ResolveFlags::NO_SYMLINKS
+            | ResolveFlags::NO_MAGICLINKS
+            | ResolveFlags::NO_XDEV,
+    )
+    .map_err(|_| VaultMountManagerError::ProvisioningInitializationFailed)?;
+    rfs::fchmod(&file, Mode::from_raw_mode(SECURE_FILE_MODE))
+        .map_err(|_| VaultMountManagerError::ProvisioningInitializationFailed)?;
+    let mut written = 0;
+    while written < bytes.len() {
+        let count = rustix::io::write(&file, &bytes[written..])
+            .map_err(|_| VaultMountManagerError::ProvisioningInitializationFailed)?;
+        if count == 0 {
+            return Err(VaultMountManagerError::ProvisioningInitializationFailed);
+        }
+        written += count;
+    }
+    rfs::fsync(&file).map_err(|_| VaultMountManagerError::ProvisioningInitializationFailed)?;
+    let opened =
+        rfs::fstat(&file).map_err(|_| VaultMountManagerError::ProvisioningInitializationFailed)?;
+    let named = rfs::statat(root, name, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|_| VaultMountManagerError::ProvisioningInitializationFailed)?;
+    if !FileType::from_raw_mode(opened.st_mode).is_file()
+        || opened.st_dev != rfs::makedev(mapping.major, mapping.minor)
+        || opened.st_uid != 0
+        || opened.st_gid != 0
+        || opened.st_nlink != 1
+        || opened.st_mode & 0o7777 != SECURE_FILE_MODE
+        || opened.st_size != bytes.len() as i64
+        || opened.st_dev != named.st_dev
+        || opened.st_ino != named.st_ino
+        || opened.st_mode != named.st_mode
+        || opened.st_uid != named.st_uid
+        || opened.st_gid != named.st_gid
+        || opened.st_nlink != named.st_nlink
+        || opened.st_size != named.st_size
+    {
+        return Err(VaultMountManagerError::ProvisioningInitializationFailed);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "experimental-firstboot-provisioner")]
+fn secret_pipe(secret: &[u8]) -> Result<OwnedFd, VaultMountManagerError> {
+    let (read, write) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)
+        .map_err(|_| VaultMountManagerError::PassphraseUnavailable)?;
+    let mut written = 0;
+    while written < secret.len() {
+        let count = rustix::io::write(&write, &secret[written..])
+            .map_err(|_| VaultMountManagerError::PassphraseUnavailable)?;
+        if count == 0 {
+            return Err(VaultMountManagerError::PassphraseUnavailable);
+        }
+        written += count;
+    }
+    drop(write);
+    Ok(read)
+}
+
+#[cfg(feature = "experimental-firstboot-provisioner")]
+fn random_uuid_v4() -> Result<[u8; 36], VaultMountManagerError> {
+    let mut bytes = [0_u8; 16];
+    OsRng
+        .try_fill_bytes(&mut bytes)
+        .map_err(|_| VaultMountManagerError::ProvisioningInitializationFailed)?;
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Ok(render_uuid(bytes))
+}
+
+#[cfg(feature = "experimental-firstboot-provisioner")]
+fn render_uuid(bytes: [u8; 16]) -> [u8; 36] {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut rendered = [0_u8; 36];
+    let mut input = 0;
+    for (output, byte) in rendered.iter_mut().enumerate() {
+        if matches!(output, 8 | 13 | 18 | 23) {
+            *byte = b'-';
+        } else {
+            let value = bytes[input / 2];
+            *byte = HEX[usize::from(if input % 2 == 0 {
+                value >> 4
+            } else {
+                value & 0x0f
+            })];
+            input += 1;
+        }
+    }
+    rendered
+}
+
+#[cfg(feature = "experimental-firstboot-provisioner")]
+fn random_firstboot_mapper() -> Result<MapperName, VaultMountManagerError> {
+    let mut random = [0_u8; 8];
+    OsRng
+        .try_fill_bytes(&mut random)
+        .map_err(|_| VaultMountManagerError::ProvisioningInitializationFailed)?;
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut name = [0_u8; MAPPER_NAME_BYTES];
+    name[..MAPPER_PREFIX.len()].copy_from_slice(MAPPER_PREFIX.as_bytes());
+    for (index, value) in random.iter().copied().enumerate() {
+        name[MAPPER_PREFIX.len() + index * 2] = HEX[usize::from(value >> 4)];
+        name[MAPPER_PREFIX.len() + index * 2 + 1] = HEX[usize::from(value & 0x0f)];
+    }
+    Ok(MapperName { bytes: name })
+}
+
+#[cfg(feature = "experimental-firstboot-provisioner")]
+fn cryptsetup_format_command(device: &Path, luks_uuid: &OsStr, key_size: &str) -> Command {
+    let mut command = Command::new(CRYPTSETUP_PATH);
+    command
+        .arg("luksFormat")
+        .arg("--type")
+        .arg("luks2")
+        .arg("--batch-mode")
+        .arg("--label")
+        .arg("KERNAID_VAULT")
+        .arg("--uuid")
+        .arg(luks_uuid)
+        .arg("--cipher")
+        .arg("aes-xts-plain64")
+        .arg("--key-size")
+        .arg("512")
+        .arg("--hash")
+        .arg("sha256")
+        .arg("--sector-size")
+        .arg("512")
+        .arg("--pbkdf")
+        .arg("argon2id")
+        .arg("--pbkdf-force-iterations")
+        .arg("4")
+        .arg("--pbkdf-memory")
+        .arg("65536")
+        .arg("--pbkdf-parallel")
+        .arg("1")
+        .arg("--key-slot")
+        .arg("0")
+        .arg("--keyslot-cipher")
+        .arg("aes-xts-plain64")
+        .arg("--keyslot-key-size")
+        .arg("512")
+        .arg("--luks2-metadata-size")
+        .arg("16384")
+        .arg("--luks2-keyslots-size")
+        .arg("16744448")
+        .arg("--use-urandom")
+        .arg("--key-file")
+        .arg("-")
+        .arg("--keyfile-size")
+        .arg(key_size)
+        .arg(device);
+    command
+}
+
+#[cfg(feature = "experimental-firstboot-provisioner")]
+fn mkfs_ext4_command(device: &Path, filesystem_uuid: &OsStr) -> Command {
+    let mut command = Command::new(MKFS_EXT4_PATH);
+    command
+        .arg("-q")
+        .arg("-F")
+        .arg("-t")
+        .arg("ext4")
+        .arg("-b")
+        .arg("4096")
+        .arg("-I")
+        .arg("256")
+        .arg("-i")
+        .arg("16384")
+        .arg("-g")
+        .arg("32768")
+        .arg("-G")
+        .arg("16")
+        .arg("-m")
+        .arg("0")
+        .arg("-o")
+        .arg("linux")
+        .arg("-e")
+        .arg("remount-ro")
+        .arg("-J")
+        .arg("size=128")
+        .arg("-E")
+        .arg("lazy_itable_init=0,lazy_journal_init=0")
+        .arg("-O")
+        .arg("none,has_journal,ext_attr,resize_inode,dir_index,filetype,extent,64bit,flex_bg,sparse_super,large_file,huge_file,dir_nlink,extra_isize,metadata_csum")
+        .arg("-L")
+        .arg("KERNAID_VAULT")
+        .arg("-U")
+        .arg(filesystem_uuid)
+        .arg("-M")
+        .arg("/")
+        .arg(device);
+    command
+}
+
+#[cfg(feature = "experimental-firstboot-provisioner")]
+fn tune2fs_command(device: &Path) -> Command {
+    let mut command = Command::new(TUNE2FS_PATH);
+    command
+        .arg("-c")
+        .arg("0")
+        .arg("-i")
+        .arg("0")
+        .arg("-e")
+        .arg("remount-ro")
+        .arg("-m")
+        .arg("0")
+        .arg("-o")
+        .arg("^acl,^user_xattr")
+        .arg("-M")
+        .arg("/")
+        .arg(device);
+    command
+}
+
 fn cryptsetup_open_command(device: &Path, mapper: &MapperName) -> Command {
     let mut command = Command::new(CRYPTSETUP_PATH);
     command
@@ -1522,6 +2293,26 @@ fn cryptsetup_open_command(device: &Path, mapper: &MapperName) -> Command {
         .arg("--disable-external-tokens")
         .arg("--key-file")
         .arg("-")
+        .arg(device)
+        .arg(mapper.as_os_str());
+    command
+}
+
+#[cfg(feature = "experimental-firstboot-provisioner")]
+fn cryptsetup_open_sized_command(device: &Path, mapper: &MapperName, key_size: &str) -> Command {
+    let mut command = Command::new(CRYPTSETUP_PATH);
+    command
+        .arg("open")
+        .arg("--type")
+        .arg("luks2")
+        .arg("--batch-mode")
+        .arg("--tries")
+        .arg("1")
+        .arg("--disable-external-tokens")
+        .arg("--key-file")
+        .arg("-")
+        .arg("--keyfile-size")
+        .arg(key_size)
         .arg(device)
         .arg(mapper.as_os_str());
     command
@@ -2208,6 +2999,7 @@ mod tests {
         FailedOpenAbsent,
         ArmDeferred,
         VerifyDeferred,
+        FormatFilesystem,
         Filesystem,
         Prepare,
         Mount,
@@ -2403,6 +3195,18 @@ mod tests {
             }
         }
 
+        #[cfg(feature = "experimental-firstboot-provisioner")]
+        fn format_filesystem(
+            &mut self,
+            _device: &BlockDevice,
+            _mapper: &MapperName,
+            _mapping: &MappingIdentity,
+            _header: HeaderIdentity,
+            _filesystem_uuid: [u8; 36],
+        ) -> Result<(), VaultMountManagerError> {
+            self.step(Step::FormatFilesystem)
+        }
+
         fn inspect_filesystem(
             &mut self,
             _device: &BlockDevice,
@@ -2563,6 +3367,20 @@ mod tests {
         state: Arc<Mutex<FakeState>>,
     ) -> Result<Activation<FakeOps>, VaultMountManagerError> {
         Activation::start(FakeOps(state), dummy_fd(), fake_request(), dummy_fd())
+    }
+
+    #[cfg(feature = "experimental-firstboot-provisioner")]
+    fn start_fake_firstboot(
+        state: Arc<Mutex<FakeState>>,
+    ) -> Result<Activation<FakeOps>, VaultMountManagerError> {
+        Activation::start_for_provisioning(
+            FakeOps(state),
+            dummy_fd(),
+            fake_request(),
+            dummy_fd(),
+            32,
+            *b"22222222-2222-4222-8222-222222222222",
+        )
     }
 
     #[test]
@@ -3637,5 +4455,135 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[cfg(feature = "experimental-firstboot-provisioner")]
+    #[test]
+    fn firstboot_commands_match_canonical_v1_with_dynamic_bindings() {
+        let luks_uuid = OsStr::new("11111111-1111-4111-8111-111111111111");
+        let filesystem_uuid = OsStr::new("22222222-2222-4222-8222-222222222222");
+        let mapper = MapperName::parse("kernaid-vault-0123456789abcdef").expect("mapper");
+
+        let format = cryptsetup_format_command(Path::new("/proc/self/fd/7"), luks_uuid, "37");
+        assert_eq!(format.get_program(), CRYPTSETUP_PATH);
+        let format_args: Vec<_> = format.get_args().collect();
+        assert_eq!(format_args[0], "luksFormat");
+        assert_eq!(
+            format_args
+                .windows(2)
+                .find(|pair| pair[0] == "--uuid")
+                .map(|pair| pair[1]),
+            Some(luks_uuid)
+        );
+        assert_eq!(
+            format_args
+                .windows(2)
+                .find(|pair| pair[0] == "--keyfile-size")
+                .map(|pair| pair[1]),
+            Some(OsStr::new("37"))
+        );
+        assert_eq!(
+            format_args.last().copied(),
+            Some(OsStr::new("/proc/self/fd/7"))
+        );
+
+        let open = cryptsetup_open_sized_command(Path::new("/proc/self/fd/8"), &mapper, "37");
+        let open_args: Vec<_> = open.get_args().collect();
+        assert_eq!(open_args[0], "open");
+        assert_eq!(
+            &open_args[open_args.len() - 3..],
+            [
+                OsStr::new("37"),
+                OsStr::new("/proc/self/fd/8"),
+                OsStr::new("kernaid-vault-0123456789abcdef"),
+            ]
+        );
+
+        let mkfs = mkfs_ext4_command(Path::new("/proc/self/fd/9"), filesystem_uuid);
+        assert_eq!(mkfs.get_program(), MKFS_EXT4_PATH);
+        let mkfs_args: Vec<_> = mkfs.get_args().collect();
+        assert_eq!(
+            mkfs_args
+                .windows(2)
+                .find(|pair| pair[0] == "-U")
+                .map(|pair| pair[1]),
+            Some(filesystem_uuid)
+        );
+        assert_eq!(
+            mkfs_args.last().copied(),
+            Some(OsStr::new("/proc/self/fd/9"))
+        );
+
+        let tune = tune2fs_command(Path::new("/proc/self/fd/10"));
+        assert_eq!(tune.get_program(), TUNE2FS_PATH);
+        assert_eq!(tune.get_args().last(), Some(OsStr::new("/proc/self/fd/10")));
+    }
+
+    #[cfg(feature = "experimental-firstboot-provisioner")]
+    #[test]
+    fn firstboot_uuid_and_mapper_generators_have_closed_grammars() {
+        for _ in 0..16 {
+            let uuid = random_uuid_v4().expect("uuid");
+            assert_eq!(uuid.len(), 36);
+            assert_eq!(uuid[14], b'4');
+            assert!(matches!(uuid[19], b'8' | b'9' | b'a' | b'b'));
+            assert!(uuid.iter().enumerate().all(|(index, byte)| {
+                if matches!(index, 8 | 13 | 18 | 23) {
+                    *byte == b'-'
+                } else {
+                    byte.is_ascii_digit() || (b'a'..=b'f').contains(byte)
+                }
+            }));
+            let mapper = random_firstboot_mapper().expect("mapper");
+            assert!(
+                MapperName::parse(std::str::from_utf8(&mapper.bytes).expect("mapper ascii"))
+                    .is_ok()
+            );
+        }
+    }
+
+    #[cfg(feature = "experimental-firstboot-provisioner")]
+    #[test]
+    fn firstboot_formats_once_after_mapper_ownership_and_before_inspection() {
+        let state = Arc::new(Mutex::new(FakeState::default()));
+        let mut activation =
+            start_fake_firstboot(Arc::clone(&state)).expect("firstboot activation");
+        activation.cleanup().expect("verified cleanup");
+        let steps = &state.lock().expect("state").steps;
+        let position = |needle| {
+            steps
+                .iter()
+                .position(|step| *step == needle)
+                .expect("required lifecycle step")
+        };
+        assert!(position(Step::VerifyDeferred) < position(Step::FormatFilesystem));
+        assert!(position(Step::FormatFilesystem) < position(Step::Filesystem));
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|step| **step == Step::FormatFilesystem)
+                .count(),
+            1
+        );
+        assert!(position(Step::Unmount) < position(Step::WaitDeferredAbsent));
+    }
+
+    #[cfg(feature = "experimental-firstboot-provisioner")]
+    #[test]
+    fn firstboot_format_failure_runs_verified_mapper_cleanup_without_mounting() {
+        let state = Arc::new(Mutex::new(FakeState {
+            fail_at: Some(Step::FormatFilesystem),
+            ..FakeState::default()
+        }));
+        assert_eq!(
+            start_fake_firstboot(Arc::clone(&state)).err(),
+            Some(VaultMountManagerError::MountVerificationFailed)
+        );
+        let steps = &state.lock().expect("state").steps;
+        assert!(steps.contains(&Step::FormatFilesystem));
+        assert!(!steps.contains(&Step::Filesystem));
+        assert!(!steps.contains(&Step::Mount));
+        assert!(steps.contains(&Step::VerifyMapping));
+        assert!(steps.contains(&Step::WaitDeferredAbsent));
     }
 }

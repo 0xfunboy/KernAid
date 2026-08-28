@@ -19,6 +19,9 @@ mod worker;
 #[cfg(feature = "experimental-codex-home-lease")]
 pub use codex_mounter::run_rescue_codex_mounter;
 
+#[cfg(feature = "experimental-firstboot-provisioner")]
+pub(crate) use companion::read_firstboot_passphrase_pair;
+
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, ResolveFlags};
 use std::{error::Error, ffi::OsString, fmt};
 
