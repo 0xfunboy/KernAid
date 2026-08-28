@@ -245,22 +245,24 @@ class RepairCandidatePackagingTests(unittest.TestCase):
         dropin = unit_directives(
             CANDIDATE / "50-kernaid-repair-candidate.conf"
         )
+        self.assertNotIn("Requires", dropin["Unit"])
         self.assertEqual(
-            dropin["Unit"]["Requires"], ["kernaid-rescue-repaird.service"]
+            dropin["Unit"]["Wants"], ["kernaid-rescue-repaird.socket"]
         )
         self.assertEqual(
-            dropin["Unit"]["After"], ["kernaid-rescue-repaird.service"]
+            dropin["Unit"]["After"], ["kernaid-rescue-repaird.socket"]
         )
         self.assertEqual(dropin["Service"]["Group"], ["kernaid-repair-client"])
         self.assertNotIn("SupplementaryGroups", dropin["Service"])
         ready_dropin = unit_directives(
             CANDIDATE / "50-kernaid-repair-candidate-ready.conf"
         )["Unit"]
+        self.assertNotIn("Requires", ready_dropin)
         self.assertEqual(
-            ready_dropin["Requires"], ["kernaid-rescue-repaird.service"]
+            ready_dropin["Wants"], ["kernaid-rescue-repaird.socket"]
         )
         self.assertEqual(
-            ready_dropin["After"], ["kernaid-rescue-repaird.service"]
+            ready_dropin["After"], ["kernaid-rescue-repaird.socket"]
         )
         tauri = (
             LIVE / "etc/systemd/system/kernaid-rescue-desk-shell.service"
