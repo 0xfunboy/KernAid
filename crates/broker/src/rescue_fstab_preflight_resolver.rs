@@ -771,7 +771,7 @@ mod tests {
                     2 => Err(RepairVaultClientError::Remote(ErrorToken::StaleState)),
                     3 => Err(RepairVaultClientError::Remote(ErrorToken::Busy)),
                     4 => Ok(7_u8),
-                    _ => panic!("unexpected reserve attempt"),
+                    _ => Err(RepairVaultClientError::StateUnavailable),
                 }
             },
             |duration| pauses.push(duration),
@@ -804,6 +804,7 @@ mod tests {
         let draft = repair_backup_draft(&intent, &observation).expect("draft");
         let now = Instant::now();
         let mut attempts = 0;
+        let mut pauses = 0;
         let result: Result<(), _> = reserve_with_exact_reconciliation(
             &draft,
             now + Duration::from_secs(1),
@@ -812,7 +813,7 @@ mod tests {
                 attempts += 1;
                 Err(RepairVaultClientError::Remote(ErrorToken::Locked))
             },
-            |_| panic!("definitive failure must not pause"),
+            |_| pauses += 1,
         );
 
         assert_eq!(
@@ -820,6 +821,7 @@ mod tests {
             Err(RepairVaultClientError::Remote(ErrorToken::Locked))
         );
         assert_eq!(attempts, 1);
+        assert_eq!(pauses, 0);
     }
 
     #[test]
@@ -910,6 +912,7 @@ mod tests {
         let mut resolver = ProductionRescueFstabPreflightResolver::default();
         let expired = Instant::now();
         let mut attempts = 0;
+        let mut pauses = 0;
         let result = take_client_after_success::<()>(&mut resolver.vault_client, |_client| {
             reserve_with_exact_reconciliation(
                 &draft,
@@ -920,7 +923,7 @@ mod tests {
                     attempts += 1;
                     Err(RepairVaultClientError::ReconciliationRequired)
                 },
-                |_| panic!("expired reconciliation must not pause"),
+                |_| pauses += 1,
             )
         });
 
@@ -929,6 +932,7 @@ mod tests {
             Some(RepairVaultClientError::ReconciliationRequired)
         );
         assert_eq!(attempts, 1);
+        assert_eq!(pauses, 0);
         assert!(resolver.vault_client.is_some());
     }
 }
