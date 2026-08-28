@@ -50,13 +50,28 @@ def parser() -> ClosedParser:
 def repair_source(before_sha256: str, after_sha256: str) -> bytes:
     # This source is fixed by the qualification controller. It supplies only
     # opaque target claims and the exact typed approval accepted by production.
+    failures = "\n".join(
+        f"    {checkpoint!r}: "
+        f"{'KERNAID_QEMU_PROVIDER_PROOF_FAILURE_V1 stage=repair-apply ' f'checkpoint={checkpoint}\n'!r},"
+        for checkpoint in LIFECYCLE.PROVIDER_PROOF_REPAIR_CHECKPOINTS
+    )
     source = f'''import hashlib,http.client,json,secrets,sys,time
 HOST="127.0.0.1:4173"
 ORIGIN="http://127.0.0.1:4173"
 API="kernaid.dev/rescue-repair-service/v1alpha1"
 BEFORE={before_sha256!r}
 AFTER={after_sha256!r}
+FAILURES={{
+{failures}
+}}
 counter=0
+checkpoint="service-ready"
+def fail(value):
+    marker=FAILURES.get(value)
+    if marker is None:
+        sys.exit(46)
+    sys.stdout.write(marker)
+    sys.exit(45)
 def request_id():
     global counter
     counter+=1
@@ -99,6 +114,7 @@ try:
         if time.monotonic()>=deadline:
             raise RuntimeError()
         time.sleep(.5)
+    checkpoint="inventory-ready"
     while True:
         try:
             code,inventory=call("/api/inventory")
@@ -110,15 +126,18 @@ try:
         if time.monotonic()>=deadline:
             raise RuntimeError()
         time.sleep(.5)
+    checkpoint="target-count"
     candidates=[item for item in scan["candidates"] if item.get("osFamilyHint")=="linux" and item.get("requiresUnlock") is False]
     if len(candidates)!=1:
         raise RuntimeError()
     candidate=candidates[0]
+    checkpoint="target-selection"
     selection_body={{"scanFingerprint":scan["scanFingerprint"],"targetId":candidate["targetId"]}}
     selected_code,selected=call("/api/rescue/select-installed-target",selection_body)
     inspected_code,inspected=call("/api/rescue/inspect-installed-target",selection_body)
     if selected_code!=200 or selected.get("target")!=candidate or inspected_code!=200 or inspected.get("status")!="installed-os-content-inspected" or inspected.get("target",{{}}).get("filesystem")!="ext4":
         raise RuntimeError()
+    checkpoint="target-identity"
     identity=[item for item in inventory if "hostname" in item.get("collector","") or "block.inventory" in item.get("collector","") or item.get("collector","").endswith((".disks",".system",".storage.identity"))]
     if not identity or any(item.get("success") is not True or item.get("truncated") is True for item in identity):
         raise RuntimeError()
@@ -127,22 +146,28 @@ try:
     candidate_json=json.dumps(candidate,ensure_ascii=True,sort_keys=True,separators=(",",":"))
     material="\\0".join(("kernaid-rescue-observe-target-v1",runtime,scan["scanFingerprint"],candidate["targetId"],candidate_json))
     target_fingerprint="sha256:"+hashlib.sha256(material.encode()).hexdigest()
+    checkpoint="prepare-submit"
     prepare=repair({{"apiVersion":API,"requestId":request_id(),"operation":"repair.fstab.prepare","target":{{"scanFingerprint":scan["scanFingerprint"],"targetFingerprint":target_fingerprint,"targetId":candidate["targetId"]}}}})
     if prepare.get("state") not in ("preparing","prepared"):
         raise RuntimeError()
+    checkpoint="prepare-terminal"
     prepared=prepare if prepare.get("state")=="prepared" else status_until({{"prepared","failed","restored","manual-reconciliation-required"}},deadline)
+    checkpoint="prepare-contract"
     detail=prepared.get("detail",{{}})
     if prepared.get("state")!="prepared" or detail.get("actionId")!="linux.fstab.disable-missing-uuid.v1" or detail.get("beforeSha256")!=BEFORE or detail.get("afterSha256")!=AFTER or detail.get("backup")!={{"state":"reserved","vaultDistinct":True}} or detail.get("confirmationRequired")!="DISABILITA VOCE FSTAB":
         raise RuntimeError()
+    checkpoint="approve-submit"
     approved=repair({{"apiVersion":API,"requestId":request_id(),"operation":"repair.fstab.approve","preparedId":detail["preparedId"],"sessionId":detail["sessionId"],"planId":detail["planId"],"planHash":detail["planHash"],"approvalId":"A-"+secrets.token_hex(16),"approvalSequence":detail["nextApprovalSequence"],"typedConfirmation":"DISABILITA VOCE FSTAB"}})
     if approved.get("state") not in ("executing","succeeded"):
         raise RuntimeError()
+    checkpoint="execute-terminal"
     terminal=approved if approved.get("state")=="succeeded" else status_until({{"succeeded","restored","failed","manual-reconciliation-required"}},deadline)
+    checkpoint="execute-contract"
     terminal_detail=terminal.get("detail",{{}})
     if terminal.get("state")!="succeeded" or terminal_detail.get("terminalOutcome")!="committed" or not isinstance(terminal_detail.get("reservationId"),str) or not isinstance(terminal_detail.get("transactionBindingSha256"),str):
         raise RuntimeError()
 except BaseException:
-    sys.exit(40)
+    fail(checkpoint)
 sys.stdout.write("KERNAID_QEMU_PROVIDER_PROOF_V1 stage=repair-apply result=true\\n")
 '''
     return textwrap.dedent(source).encode("ascii")

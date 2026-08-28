@@ -125,6 +125,7 @@ PROVIDER_PROOF_CLOSED_STAGES = PROVIDER_PROOF_UI_STAGES + (
     "signed-report",
     "hold-kill",
     "post-fault",
+    "repair-apply",
 )
 PROVIDER_PROOF_UI_CHECKPOINTS = (
     "ui-identity",
@@ -181,6 +182,19 @@ PROVIDER_PROOF_CODEX_REMOTE_ERRORS = (
     "timed-out",
     "unsafe-home",
     "unsafe-executable",
+)
+PROVIDER_PROOF_REPAIR_CHECKPOINTS = (
+    "service-ready",
+    "inventory-ready",
+    "target-count",
+    "target-selection",
+    "target-identity",
+    "prepare-submit",
+    "prepare-terminal",
+    "prepare-contract",
+    "approve-submit",
+    "execute-terminal",
+    "execute-contract",
 )
 PROVIDER_PROOF_UI_ERROR_CHECKPOINTS = (
     ("busy", "outcome-busy"),
@@ -2664,6 +2678,9 @@ def run_guest_proof(
     ) or (
         failure_stage == "codex-status"
         and failure_checkpoint in PROVIDER_PROOF_CODEX_CHECKPOINTS
+    ) or (
+        failure_stage == "repair-apply"
+        and failure_checkpoint in PROVIDER_PROOF_REPAIR_CHECKPOINTS
     )
     if failure_stage != stage or not closed_checkpoint:
         raise ClosedFailure("provider-proof", "marker-invalid")

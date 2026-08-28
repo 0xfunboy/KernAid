@@ -15,8 +15,10 @@ Type=notify
 NotifyAccess=main
 Sockets=kernaid-rescue-repaird.socket
 ExecStart=/usr/lib/kernaid/kernaid-rescue-repaird
-Restart=on-failure
-RestartSec=2s
+# The UI probes this socket before the operator unlocks the Vault. A failed
+# recovery barrier must therefore return control to socket activation instead
+# of entering an eager restart loop and exhausting systemd's start limit.
+Restart=no
 TimeoutStartSec=180s
 TimeoutStopSec=45s
 KillMode=control-group
@@ -61,6 +63,3 @@ MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 KeyringMode=private
 RemoveIPC=yes
-
-[Install]
-WantedBy=multi-user.target

@@ -233,7 +233,6 @@ systemctl enable kernaid-rescue-vaultd.socket
 systemctl enable kernaid-rescue-vaultd.service
 if [ "$repair_candidate_enabled" = "1" ]; then
     systemctl enable kernaid-rescue-repaird.socket
-    systemctl enable kernaid-rescue-repaird.service
 fi
 systemctl mask swap.target
 mkdir -p /etc/polkit-1/rules.d

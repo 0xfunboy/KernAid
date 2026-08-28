@@ -169,6 +169,8 @@ class RepairCandidatePackagingTests(unittest.TestCase):
             service_config["ExecStart"],
             ["/usr/lib/kernaid/kernaid-rescue-repaird"],
         )
+        self.assertEqual(service_config["Restart"], ["no"])
+        self.assertNotIn("Install", service)
         self.assertEqual(service_config["StandardInput"], ["null"])
         self.assertNotIn("socket", service_config["StandardInput"])
         self.assertEqual(service_config["User"], ["kernaid-repair"])
@@ -293,7 +295,7 @@ class RepairCandidatePackagingTests(unittest.TestCase):
             hook.count("systemctl enable kernaid-rescue-repaird.socket"), 1
         )
         self.assertEqual(
-            hook.count("systemctl enable kernaid-rescue-repaird.service"), 1
+            hook.count("systemctl enable kernaid-rescue-repaird.service"), 0
         )
         self.assertLess(
             hook.index('if [ "$repair_candidate_enabled" = "1" ]; then'),
