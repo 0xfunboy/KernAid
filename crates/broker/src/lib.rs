@@ -15,8 +15,13 @@ pub mod rescue_fstab_candidate;
 /// Linux-only client for the root-owned, fixed Rescue target-capability
 /// endpoint. It transfers a read-only block descriptor and path-free claims;
 /// no normal broker build contains this transport.
-#[cfg(all(target_os = "linux", feature = "rescue-fstab-production-candidate"))]
+#[cfg(all(target_os = "linux", feature = "rescue-target-physical-parent"))]
 pub mod target_capability_client;
+
+/// Linux-only, descriptor-bound physical-parent resolver. It is deliberately
+/// separate from the default broker and exposes no device pathname.
+#[cfg(all(target_os = "linux", feature = "rescue-target-physical-parent"))]
+pub mod target_physical_parent;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum BrokerError {

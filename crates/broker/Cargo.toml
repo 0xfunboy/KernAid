@@ -16,14 +16,19 @@ fixture-repair-lab = [
     "kernaid-linux-pack/fixture-repair-lab",
 ]
 rescue-fstab-production-candidate = [
+    "rescue-target-physical-parent",
     "dep:kernaid-core",
     "dep:kernaid-linux-pack",
+    "dep:serde",
+    "dep:serde_json",
+    "kernaid-core/rescue-fstab-production-candidate",
+    "kernaid-linux-pack/rescue-fstab-production-candidate",
+]
+rescue-target-physical-parent = [
     "dep:rustix",
     "dep:serde",
     "dep:serde_json",
     "kernaid-protocol/experimental-physical-parent-fingerprint",
-    "kernaid-core/rescue-fstab-production-candidate",
-    "kernaid-linux-pack/rescue-fstab-production-candidate",
 ]
 [dependencies]
 kernaid-protocol = { path = "../protocol" }
