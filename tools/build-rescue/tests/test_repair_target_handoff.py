@@ -479,6 +479,8 @@ class RepairTargetHandoffTests(unittest.TestCase):
         write_socket = (systemd / "kernaid-rescue-target-write-capability.socket").read_text()
         write_service = (systemd / "kernaid-rescue-target-write-capability@.service").read_text()
         self.assertIn("KERNAID_TARGET_HANDOFF_PROFILE=readonly", readonly)
+        self.assertIn("LimitNOFILE=64", readonly)
+        self.assertIn("TasksMax=64", readonly)
         self.assertIn("ListenSequentialPacket=/run/kernaid-rescue-target-write-capability.sock", write_socket)
         self.assertIn("SocketMode=0660", write_socket)
         self.assertIn("SocketGroup=kernaid-repair", write_socket)

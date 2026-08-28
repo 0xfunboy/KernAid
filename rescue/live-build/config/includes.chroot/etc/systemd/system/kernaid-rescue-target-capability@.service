@@ -24,8 +24,11 @@ Group=root
 SupplementaryGroups=
 UMask=0077
 LimitCORE=0
-LimitNOFILE=16
-TasksMax=8
+# One bounded inventory fans out to nine fixed collectors. Each collector owns
+# one child and two pipe-drain threads; 64 leaves headroom without making either
+# the process or descriptor budget unbounded.
+LimitNOFILE=64
+TasksMax=64
 NoNewPrivileges=yes
 PrivateMounts=yes
 PrivateNetwork=yes
