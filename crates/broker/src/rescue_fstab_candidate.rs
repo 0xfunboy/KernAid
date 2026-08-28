@@ -32,6 +32,7 @@ use kernaid_protocol::{
     rescue_repair_vault::RepairFileMetadataV1,
 };
 use std::{collections::BTreeSet, fmt, time::Instant};
+use zeroize::Zeroizing;
 
 use crate::target_physical_parent::RescueTargetPhysicalParentGuard;
 
@@ -66,7 +67,7 @@ pub enum RescueFstabCapabilityResolutionError {
 /// UUIDs, and capability identities.
 pub struct TrustedRescueFstabObservation {
     resolved_target_fingerprint: String,
-    fstab_bytes: Vec<u8>,
+    fstab_bytes: Zeroizing<Vec<u8>>,
     metadata: RepairFileMetadataV1,
     observed_uuids: BTreeSet<String>,
     target: SelectedTargetCapability,
@@ -85,7 +86,7 @@ impl TrustedRescueFstabObservation {
     ) -> Self {
         Self {
             resolved_target_fingerprint: resolved_target_fingerprint.into(),
-            fstab_bytes,
+            fstab_bytes: Zeroizing::new(fstab_bytes),
             metadata,
             observed_uuids,
             target,
@@ -176,7 +177,7 @@ pub struct PreparedRescueFstabPlan<TargetGuard, Reservation> {
     receipt: RescueFstabPreparedPlanReceipt,
     plan: FstabCandidateTransactionPlan,
     preview: DisableMissingUuidPreview,
-    backup_bytes: Vec<u8>,
+    backup_bytes: Zeroizing<Vec<u8>>,
     metadata: RepairFileMetadataV1,
     target_guard: TargetGuard,
     reservation: Reservation,
@@ -273,7 +274,7 @@ pub struct ApprovedRescueFstabTransaction<TargetGuard, Reservation> {
     receipt: RescueFstabPreparedPlanReceipt,
     plan: FstabCandidateTransactionPlan,
     preview: DisableMissingUuidPreview,
-    backup_bytes: Vec<u8>,
+    backup_bytes: Zeroizing<Vec<u8>>,
     metadata: RepairFileMetadataV1,
     admission: RescueFstabCandidateAdmission,
     target_guard: TargetGuard,
