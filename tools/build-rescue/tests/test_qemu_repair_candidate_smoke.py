@@ -51,6 +51,10 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
             'detail.get("afterSha256")!=AFTER',
             '"vaultDistinct":True',
             'terminal_detail.get("terminalOutcome")!="committed"',
+            '"target-capability":"prepare-target-capability"',
+            '"observation-preview":"prepare-observation-preview"',
+            '"vault-reserve":"prepare-vault-reserve"',
+            '"admission-internal":"prepare-admission-internal"',
         ):
             self.assertIn(required, source)
         self.assertNotIn("mock", source.lower())
@@ -61,6 +65,38 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
             workflow.count("./tools/build-rescue/qemu-repair-candidate-smoke.sh"),
             1,
         )
+
+    def test_workflow_always_retains_private_forensics_without_promoting_failure(
+        self,
+    ) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        gate = workflow.index(
+            "      - name: QEMU BIOS repair candidate apply qualification\n"
+        )
+        forensic_start = workflow.index(
+            "      - name: Upload private repair candidate forensics\n"
+        )
+        promotable_start = workflow.index("      - name: Upload repair candidate ISO\n")
+        self.assertLess(gate, forensic_start)
+        self.assertLess(forensic_start, promotable_start)
+
+        forensic = workflow[forensic_start:promotable_start]
+        promotable = workflow[promotable_start:]
+        expected_paths = (
+            "            KernAid-Rescue-amd64-repair-candidate.iso\n"
+            "            KernAid-Rescue-amd64-repair-candidate.iso.sha256\n"
+        )
+        self.assertIn("        if: ${{ always() }}\n", forensic)
+        self.assertIn("          name: repair-candidate-forensics\n", forensic)
+        self.assertIn(expected_paths, forensic)
+        self.assertIn("          retention-days: 1\n", forensic)
+
+        self.assertNotIn("        if: ${{ always() }}\n", promotable)
+        self.assertIn(
+            "          name: KernAid-Rescue-amd64-repair-candidate\n", promotable
+        )
+        self.assertIn(expected_paths, promotable)
+        self.assertIn("          retention-days: 7\n", promotable)
 
 
 if __name__ == "__main__":

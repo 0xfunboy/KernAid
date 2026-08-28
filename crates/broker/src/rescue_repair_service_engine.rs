@@ -6,7 +6,8 @@
 
 use crate::{
     rescue_fstab_candidate::{
-        ApprovedRescueFstabTransaction, PreparedRescueFstabPlan, prepare_rescue_fstab_candidate,
+        ApprovedRescueFstabTransaction, PreparedRescueFstabPlan, RescueFstabPreflightError,
+        prepare_rescue_fstab_candidate,
     },
     rescue_fstab_executor::{
         RescueFstabExecutionOutcome, RescueFstabExecutionReceipt, execute_approved_rescue_fstab,
@@ -18,7 +19,8 @@ use crate::{
     },
     rescue_repair_service::{
         BoundRepairApproval, BrokerOwnedPrepareCommand, PreparedRepairDescriptor,
-        RepairEngineFailure, RepairPreparationEngine, RepairTerminalOutcome, RepairTerminalReceipt,
+        RepairEngineFailure, RepairPreparationEngine, RepairPrepareFailureStage,
+        RepairTerminalOutcome, RepairTerminalReceipt,
     },
 };
 use kernaid_core::{
@@ -83,19 +85,31 @@ impl RepairPreparationEngine for ProductionRepairEngine {
             command.target().target_id(),
             command.target().target_fingerprint(),
         )
-        .map_err(|_| RepairEngineFailure::PrepareFailed)?;
+        .map_err(|_| {
+            RepairEngineFailure::PrepareFailed(RepairPrepareFailureStage::AdmissionInternal)
+        })?;
         let mut resolver = ProductionRescueFstabPreflightResolver::new();
         let prepared = prepare_rescue_fstab_candidate(request, &mut resolver, deadline)
-            .map_err(|_| RepairEngineFailure::PrepareFailed)?;
+            .map_err(map_preflight_failure)?;
         if prepared.request_id() != command.request_id() {
-            return cancel_failed_prepare(prepared, deadline);
+            return cancel_failed_prepare(
+                prepared,
+                deadline,
+                RepairPrepareFailureStage::AdmissionInternal,
+            );
         }
 
         let target_fingerprint = prepared.receipt().intent().target_fingerprint().to_owned();
         let mut session = Session::new(&target_fingerprint, SessionMode::LinuxRescue);
         let admission = match prepared.stage_core_admission(&mut session, 0) {
             Ok(admission) => admission,
-            Err(_) => return cancel_failed_prepare(prepared, deadline),
+            Err(_) => {
+                return cancel_failed_prepare(
+                    prepared,
+                    deadline,
+                    RepairPrepareFailureStage::AdmissionInternal,
+                );
+            }
         };
         let descriptor = match PreparedRepairDescriptor::new(
             prepared.receipt().intent().session_id(),
@@ -111,7 +125,13 @@ impl RepairPreparationEngine for ProductionRepairEngine {
                 != prepared.receipt().vault_physical_parent_fingerprint(),
         ) {
             Ok(descriptor) => descriptor,
-            Err(_) => return cancel_failed_prepare(prepared, deadline),
+            Err(_) => {
+                return cancel_failed_prepare(
+                    prepared,
+                    deadline,
+                    RepairPrepareFailureStage::AdmissionInternal,
+                );
+            }
         };
         Ok((
             ProductionPreparedRepair {
@@ -196,11 +216,40 @@ impl RepairPreparationEngine for ProductionRepairEngine {
 fn cancel_failed_prepare<T>(
     prepared: ProductionPreparedPlan,
     deadline: Instant,
+    stage: RepairPrepareFailureStage,
 ) -> Result<T, RepairEngineFailure> {
     prepared
         .cancel(deadline)
         .map_err(|_| RepairEngineFailure::CancelFailed)?;
-    Err(RepairEngineFailure::PrepareFailed)
+    Err(RepairEngineFailure::PrepareFailed(stage))
+}
+
+fn map_preflight_failure(error: RescueFstabPreflightError) -> RepairEngineFailure {
+    let stage = match error {
+        RescueFstabPreflightError::TargetCapability(_) => {
+            RepairPrepareFailureStage::TargetCapability
+        }
+        RescueFstabPreflightError::Observation(_)
+        | RescueFstabPreflightError::TargetIdentityMismatch
+        | RescueFstabPreflightError::EvidenceBindingMismatch
+        | RescueFstabPreflightError::TargetSnapshotMismatch
+        | RescueFstabPreflightError::PreviewRejected(_) => {
+            RepairPrepareFailureStage::ObservationPreview
+        }
+        RescueFstabPreflightError::VaultReserve(_)
+        | RescueFstabPreflightError::ReservationBindingMismatch => {
+            RepairPrepareFailureStage::VaultReserve
+        }
+        RescueFstabPreflightError::ApprovalRequired
+        | RescueFstabPreflightError::AdmissionBindingMismatch
+        | RescueFstabPreflightError::ApprovalBindingMismatch
+        | RescueFstabPreflightError::TransactionRejected(_)
+        | RescueFstabPreflightError::ReceiptRejected
+        | RescueFstabPreflightError::CancellationFailed => {
+            RepairPrepareFailureStage::AdmissionInternal
+        }
+    };
+    RepairEngineFailure::PrepareFailed(stage)
 }
 
 fn terminal_receipt(
@@ -223,4 +272,43 @@ fn terminal_receipt(
         Some(receipt.reservation_id().to_owned()),
         Some(receipt.transaction_binding_sha256().to_owned()),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rescue_fstab_candidate::RescueFstabCapabilityResolutionError;
+
+    #[test]
+    fn preflight_failures_map_to_closed_public_stages() {
+        for (error, expected) in [
+            (
+                RescueFstabPreflightError::TargetCapability(
+                    RescueFstabCapabilityResolutionError::Unavailable,
+                ),
+                RepairPrepareFailureStage::TargetCapability,
+            ),
+            (
+                RescueFstabPreflightError::Observation(
+                    RescueFstabCapabilityResolutionError::TimedOut,
+                ),
+                RepairPrepareFailureStage::ObservationPreview,
+            ),
+            (
+                RescueFstabPreflightError::VaultReserve(
+                    RescueFstabCapabilityResolutionError::IdentityChanged,
+                ),
+                RepairPrepareFailureStage::VaultReserve,
+            ),
+            (
+                RescueFstabPreflightError::ReceiptRejected,
+                RepairPrepareFailureStage::AdmissionInternal,
+            ),
+        ] {
+            assert_eq!(
+                map_preflight_failure(error),
+                RepairEngineFailure::PrepareFailed(expected)
+            );
+        }
+    }
 }

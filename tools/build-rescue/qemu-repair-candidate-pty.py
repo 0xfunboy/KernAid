@@ -154,6 +154,12 @@ try:
     prepared=prepare if prepare.get("state")=="prepared" else status_until({{"prepared","failed","restored","manual-reconciliation-required"}},deadline)
     checkpoint="prepare-state"
     if prepared.get("state")!="prepared":
+        checkpoint={{
+            "target-capability":"prepare-target-capability",
+            "observation-preview":"prepare-observation-preview",
+            "vault-reserve":"prepare-vault-reserve",
+            "admission-internal":"prepare-admission-internal",
+        }}.get(prepared.get("detail",{{}}).get("prepareFailureStage"),checkpoint)
         raise RuntimeError()
     checkpoint="prepare-contract"
     detail=prepared.get("detail",{{}})

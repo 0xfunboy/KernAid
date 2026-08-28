@@ -1341,9 +1341,36 @@ class RepairRelayTests(unittest.TestCase):
                 "reservationId": "B-exact-backup",
                 "transactionBindingSha256": "sha256:" + "9" * 64,
                 "rebootRequired": False,
+                "prepareFailureStage": None,
             },
         }
         rescue_server._validate_repair_response(terminal, self.STATUS)
+        failed_prepare = {
+            **terminal,
+            "state": "failed",
+            "detail": {
+                "kind": "terminal",
+                "terminalOutcome": "failed",
+                "reservationId": None,
+                "transactionBindingSha256": None,
+                "rebootRequired": False,
+                "prepareFailureStage": "target-capability",
+            },
+        }
+        rescue_server._validate_repair_response(failed_prepare, self.STATUS)
+        with self.assertRaisesRegex(
+            rescue_server.RepairRelayError, "invalid-response"
+        ):
+            rescue_server._validate_repair_response(
+                {
+                    **failed_prepare,
+                    "detail": {
+                        **failed_prepare["detail"],
+                        "prepareFailureStage": "/dev/sda",
+                    },
+                },
+                self.STATUS,
+            )
         with self.assertRaisesRegex(
             rescue_server.RepairRelayError, "invalid-response"
         ):

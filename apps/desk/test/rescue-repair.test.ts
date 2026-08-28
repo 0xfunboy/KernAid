@@ -217,6 +217,7 @@ test("closed service errors never become an implied success", async () => {
             reservationId: `B-${"b".repeat(32)}`,
             transactionBindingSha256: `sha256:${"c".repeat(64)}`,
             rebootRequired: true,
+            prepareFailureStage: null,
           },
           error: "recovery-unavailable",
         },
@@ -262,6 +263,41 @@ test("polling and terminal presentation follow authenticated state versions", ()
   assert.match(
     operationErrorMessage(new RescueRepairUnavailableError()),
     /stato è sconosciuto/u,
+  );
+});
+
+test("prepare failure stage accepts only the closed public taxonomy", () => {
+  const failed = {
+    apiVersion: RESCUE_REPAIR_API_VERSION,
+    requestId: REQUEST,
+    operation: "repair.status",
+    outcome: "ok",
+    stateVersion: 4,
+    state: "failed",
+    detail: {
+      kind: "terminal",
+      terminalOutcome: "failed",
+      reservationId: null,
+      transactionBindingSha256: null,
+      rebootRequired: false,
+      prepareFailureStage: "vault-reserve",
+    },
+  };
+  const parsed = parseRescueRepairResponse(failed, REQUEST, "repair.status");
+  assert.equal(parsed.detail?.kind, "terminal");
+  if (parsed.detail?.kind === "terminal")
+    assert.equal(parsed.detail.prepareFailureStage, "vault-reserve");
+  assert.throws(
+    () =>
+      parseRescueRepairResponse(
+        {
+          ...failed,
+          detail: { ...failed.detail, prepareFailureStage: "/dev/sda" },
+        },
+        REQUEST,
+        "repair.status",
+      ),
+    /non valido/u,
   );
 });
 
@@ -329,6 +365,7 @@ function terminalEnvelope(
       reservationId: manual ? `B-${"b".repeat(32)}` : null,
       transactionBindingSha256: manual ? `sha256:${"c".repeat(64)}` : null,
       rebootRequired: manual,
+      prepareFailureStage: null,
     },
   };
 }

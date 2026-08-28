@@ -28,12 +28,13 @@ use kernaid_protocol::{
     rescue_repair_vault::{
         RepairBackupDraft, RepairBackupState, RepairBackupStatusPayload, RepairExecutionIntentV1,
     },
-    rescue_vault::{RequestId, Sha256},
+    rescue_vault::{ErrorToken, RequestId, Sha256},
 };
 use rustix::rand::{GetRandomFlags, getrandom};
 use sha2::{Digest, Sha256 as Sha256Hasher};
 use std::{
     fmt::{self, Write as _},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -42,6 +43,7 @@ const REPAIR_BACKUP_CAPACITY_BYTES: u64 = 4096;
 // retains a bounded window in which the persistent reservation can be
 // cancelled using the caller's original deadline.
 const RESERVATION_CLEANUP_BUDGET: Duration = Duration::from_secs(2);
+const RESERVATION_RECONCILIATION_POLL: Duration = Duration::from_millis(250);
 const LOCK_ID_DOMAIN: &[u8] = b"kernaid:rescue-fstab:target-lock:v2\0";
 
 /// Stateful production resolver. The Repair Vault client remains here until a
@@ -301,9 +303,16 @@ impl RescueFstabPreflightCapabilityResolver for ProductionRescueFstabPreflightRe
             return Err(RescueFstabCapabilityResolutionError::IdentityChanged);
         }
         let draft = repair_backup_draft(intent, observation)?;
-        let reserve_deadline = reservation_operation_deadline(deadline)?;
+        let (initial_reserve_deadline, reconciliation_deadline) =
+            reservation_operation_deadlines(deadline, Instant::now())?;
         let (client, status) = take_client_after_success(&mut self.vault_client, |client| {
-            client.reserve(&draft, reserve_deadline)
+            reserve_with_exact_reconciliation(
+                &draft,
+                initial_reserve_deadline,
+                reconciliation_deadline,
+                |draft, attempt_deadline| client.reserve(draft, attempt_deadline),
+                thread::sleep,
+            )
         })
         .map_err(map_vault_error)?;
         let reservation = ProductionRescueFstabVaultReservation::new(client, status);
@@ -475,6 +484,50 @@ fn take_client_after_success<T>(
     }
 }
 
+/// A lost reserve response is the only condition that enables retries here.
+/// Every retry presents the exact immutable draft through the same stateful
+/// client, so the Vault can return the already-minted reservation rather than
+/// allocate unrelated capacity. Busy and repeated stale responses are bounded
+/// by the reconciliation half of the reserve window.
+fn reserve_with_exact_reconciliation<T>(
+    draft: &RepairBackupDraft,
+    initial_deadline: Instant,
+    reconciliation_deadline: Instant,
+    mut attempt: impl FnMut(&RepairBackupDraft, Instant) -> Result<T, RepairVaultClientError>,
+    mut pause: impl FnMut(Duration),
+) -> Result<T, RepairVaultClientError> {
+    match attempt(draft, initial_deadline) {
+        Err(RepairVaultClientError::ReconciliationRequired) => {}
+        result => return result,
+    }
+
+    loop {
+        reconciliation_deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(RepairVaultClientError::ReconciliationRequired)?;
+        match attempt(draft, reconciliation_deadline) {
+            Ok(value) => return Ok(value),
+            Err(error) if retryable_ambiguous_reserve_error(error) => {
+                let remaining = reconciliation_deadline
+                    .checked_duration_since(Instant::now())
+                    .filter(|remaining| !remaining.is_zero())
+                    .ok_or(RepairVaultClientError::ReconciliationRequired)?;
+                pause(RESERVATION_RECONCILIATION_POLL.min(remaining));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn retryable_ambiguous_reserve_error(error: RepairVaultClientError) -> bool {
+    matches!(
+        error,
+        RepairVaultClientError::ReconciliationRequired
+            | RepairVaultClientError::Remote(ErrorToken::Busy | ErrorToken::StaleState)
+    )
+}
+
 fn fail_after_reservation<T>(
     reservation: ProductionRescueFstabVaultReservation,
     deadline: Instant,
@@ -521,14 +574,25 @@ fn ensure_deadline(deadline: Instant) -> Result<(), RescueFstabCapabilityResolut
         .ok_or(RescueFstabCapabilityResolutionError::TimedOut)
 }
 
-fn reservation_operation_deadline(
+fn reservation_operation_deadlines(
     deadline: Instant,
-) -> Result<Instant, RescueFstabCapabilityResolutionError> {
-    let reserve_deadline = deadline
+    now: Instant,
+) -> Result<(Instant, Instant), RescueFstabCapabilityResolutionError> {
+    let reconciliation_deadline = deadline
         .checked_sub(RESERVATION_CLEANUP_BUDGET)
         .ok_or(RescueFstabCapabilityResolutionError::TimedOut)?;
-    ensure_deadline(reserve_deadline)?;
-    Ok(reserve_deadline)
+    let remaining = reconciliation_deadline
+        .checked_duration_since(now)
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or(RescueFstabCapabilityResolutionError::TimedOut)?;
+    let initial_window = remaining / 2;
+    if initial_window.is_zero() {
+        return Err(RescueFstabCapabilityResolutionError::TimedOut);
+    }
+    let initial_deadline = now
+        .checked_add(initial_window)
+        .ok_or(RescueFstabCapabilityResolutionError::TimedOut)?;
+    Ok((initial_deadline, reconciliation_deadline))
 }
 
 fn map_target_client_error(
@@ -666,6 +730,96 @@ mod tests {
     }
 
     #[test]
+    fn reservation_deadlines_preserve_cleanup_and_split_reserve_window() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(102);
+        let (initial_deadline, reconciliation_deadline) =
+            reservation_operation_deadlines(deadline, now).expect("reservation deadlines");
+
+        assert_eq!(reconciliation_deadline, now + Duration::from_secs(100));
+        assert_eq!(initial_deadline, now + Duration::from_secs(50));
+        assert_eq!(
+            deadline.duration_since(reconciliation_deadline),
+            RESERVATION_CLEANUP_BUDGET
+        );
+    }
+
+    #[test]
+    fn ambiguous_reserve_retries_same_draft_through_busy_and_stale() {
+        let bytes = b"original fstab\n";
+        let observation = observation(bytes);
+        let intent = intent(prefixed_digest(bytes));
+        let draft = repair_backup_draft(&intent, &observation).expect("draft");
+        let now = Instant::now();
+        let initial_deadline = now + Duration::from_secs(1);
+        let reconciliation_deadline = now + Duration::from_secs(5);
+        let mut attempts = Vec::new();
+        let mut pauses = Vec::new();
+
+        let result = reserve_with_exact_reconciliation(
+            &draft,
+            initial_deadline,
+            reconciliation_deadline,
+            |observed_draft, attempt_deadline| {
+                assert!(std::ptr::eq(observed_draft, &draft));
+                attempts.push(attempt_deadline);
+                match attempts.len() {
+                    1 => Err(RepairVaultClientError::ReconciliationRequired),
+                    2 => Err(RepairVaultClientError::Remote(ErrorToken::StaleState)),
+                    3 => Err(RepairVaultClientError::Remote(ErrorToken::Busy)),
+                    4 => Ok(7_u8),
+                    _ => panic!("unexpected reserve attempt"),
+                }
+            },
+            |duration| pauses.push(duration),
+        );
+
+        assert_eq!(result, Ok(7));
+        assert_eq!(
+            attempts,
+            [
+                initial_deadline,
+                reconciliation_deadline,
+                reconciliation_deadline,
+                reconciliation_deadline,
+            ]
+        );
+        assert_eq!(
+            pauses,
+            [
+                RESERVATION_RECONCILIATION_POLL,
+                RESERVATION_RECONCILIATION_POLL,
+            ]
+        );
+    }
+
+    #[test]
+    fn definitive_initial_reserve_error_is_not_retried() {
+        let bytes = b"original fstab\n";
+        let observation = observation(bytes);
+        let intent = intent(prefixed_digest(bytes));
+        let draft = repair_backup_draft(&intent, &observation).expect("draft");
+        let now = Instant::now();
+        let mut attempts = 0;
+        let result: Result<(), _> = reserve_with_exact_reconciliation(
+            &draft,
+            now + Duration::from_secs(1),
+            now + Duration::from_secs(2),
+            |_, _| {
+                attempts += 1;
+                Err(RepairVaultClientError::Remote(ErrorToken::Locked))
+            },
+            |_| panic!("definitive failure must not pause"),
+        );
+
+        assert_eq!(
+            result,
+            Err(RepairVaultClientError::Remote(ErrorToken::Locked))
+        );
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
     fn reserved_status_maps_to_path_free_plan_capability() {
         let bytes = b"original fstab\n";
         let observation = observation(bytes);
@@ -745,16 +899,33 @@ mod tests {
     }
 
     #[test]
-    fn reserve_error_keeps_client_slot_for_reconciliation() {
+    fn expired_reconciliation_keeps_client_slot_ambiguous() {
+        let bytes = b"original fstab\n";
+        let observation = observation(bytes);
+        let intent = intent(prefixed_digest(bytes));
+        let draft = repair_backup_draft(&intent, &observation).expect("draft");
         let mut resolver = ProductionRescueFstabPreflightResolver::default();
+        let expired = Instant::now();
+        let mut attempts = 0;
         let result = take_client_after_success::<()>(&mut resolver.vault_client, |_client| {
-            Err(RepairVaultClientError::ReconciliationRequired)
+            reserve_with_exact_reconciliation(
+                &draft,
+                expired,
+                expired,
+                |observed_draft, _| {
+                    assert!(std::ptr::eq(observed_draft, &draft));
+                    attempts += 1;
+                    Err(RepairVaultClientError::ReconciliationRequired)
+                },
+                |_| panic!("expired reconciliation must not pause"),
+            )
         });
 
         assert_eq!(
             result.err(),
             Some(RepairVaultClientError::ReconciliationRequired)
         );
+        assert_eq!(attempts, 1);
         assert!(resolver.vault_client.is_some());
     }
 }

@@ -112,6 +112,12 @@ REPAIR_ERROR_TOKENS = {
     "recovery-unavailable",
     "internal",
 }
+REPAIR_PREPARE_FAILURE_STAGES = {
+    "target-capability",
+    "observation-preview",
+    "vault-reserve",
+    "admission-internal",
+}
 REPAIR_RELAY_LOCK = threading.Lock()
 APPLICATION_HTTP_API_VERSION = "kernaid.dev/rescue-application-http/v1alpha1"
 APPLICATION_RELAY_API_VERSION = "kernaid.dev/rescue-application-relay/v1alpha1"
@@ -1102,6 +1108,7 @@ def _validate_repair_terminal_detail(value: object, state: str) -> bool:
         "reservationId",
         "transactionBindingSha256",
         "rebootRequired",
+        "prepareFailureStage",
     }:
         return False
     outcome = value.get("terminalOutcome")
@@ -1114,6 +1121,7 @@ def _validate_repair_terminal_detail(value: object, state: str) -> bool:
     }
     reservation = value.get("reservationId")
     binding = value.get("transactionBindingSha256")
+    prepare_failure_stage = value.get("prepareFailureStage")
     return (
         value.get("kind") == "terminal"
         and isinstance(outcome, str)
@@ -1129,6 +1137,12 @@ def _validate_repair_terminal_detail(value: object, state: str) -> bool:
             and REPAIR_SHA256.fullmatch(binding) is not None
         )
         and isinstance(value.get("rebootRequired"), bool)
+        and (
+            prepare_failure_stage is None
+            or state == "failed"
+            and isinstance(prepare_failure_stage, str)
+            and prepare_failure_stage in REPAIR_PREPARE_FAILURE_STAGES
+        )
         and (
             state != "manual-reconciliation-required"
             or value.get("rebootRequired") is True

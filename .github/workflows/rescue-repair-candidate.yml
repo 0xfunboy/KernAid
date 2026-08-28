@@ -191,6 +191,17 @@ jobs:
           ./tools/build-rescue/qemu-repair-candidate-smoke.sh \
             "$PWD/KernAid-Rescue-amd64-repair-candidate.iso"
 
+      - name: Upload private repair candidate forensics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: repair-candidate-forensics
+          path: |
+            KernAid-Rescue-amd64-repair-candidate.iso
+            KernAid-Rescue-amd64-repair-candidate.iso.sha256
+          if-no-files-found: error
+          retention-days: 1
+
       - name: Upload repair candidate ISO
         uses: actions/upload-artifact@v4
         with:

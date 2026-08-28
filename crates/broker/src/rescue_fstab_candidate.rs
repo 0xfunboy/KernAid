@@ -450,7 +450,9 @@ pub enum RescueFstabPreflightError {
     TargetIdentityMismatch,
     EvidenceBindingMismatch,
     TargetSnapshotMismatch,
-    Resolver(RescueFstabCapabilityResolutionError),
+    TargetCapability(RescueFstabCapabilityResolutionError),
+    Observation(RescueFstabCapabilityResolutionError),
+    VaultReserve(RescueFstabCapabilityResolutionError),
     PreviewRejected(PreviewError),
     TransactionRejected(CandidateTransactionError),
     ReservationBindingMismatch,
@@ -478,10 +480,10 @@ where
 {
     let target_guard = resolver
         .acquire_target_guard(&request, deadline)
-        .map_err(RescueFstabPreflightError::Resolver)?;
+        .map_err(RescueFstabPreflightError::TargetCapability)?;
     let observation = resolver
         .observe_under_target_guard(&request, &target_guard, deadline)
-        .map_err(RescueFstabPreflightError::Resolver)?;
+        .map_err(RescueFstabPreflightError::Observation)?;
 
     validate_observation(&request, &observation)?;
     let preview =
@@ -493,7 +495,7 @@ where
         canonical_claims(&intent).map_err(RescueFstabPreflightError::TransactionRejected)?;
     let (reservation, vault) = resolver
         .reserve_vault(&intent, &target_guard, &observation, &preview, deadline)
-        .map_err(RescueFstabPreflightError::Resolver)?;
+        .map_err(RescueFstabPreflightError::VaultReserve)?;
 
     if reservation.reservation_id() != vault.reservation_id()
         || reservation.reservation_binding_sha256() != vault.reservation_binding_sha256()

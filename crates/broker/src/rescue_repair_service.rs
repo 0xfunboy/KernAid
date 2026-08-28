@@ -265,9 +265,18 @@ impl BoundRepairApproval {
 
 /// Sanitized engine failure classes. No implementation error text crosses the
 /// local API boundary.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum RepairPrepareFailureStage {
+    TargetCapability,
+    ObservationPreview,
+    VaultReserve,
+    AdmissionInternal,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RepairEngineFailure {
-    PrepareFailed,
+    PrepareFailed(RepairPrepareFailureStage),
     ApprovalRejected,
     CancelFailed,
     ExecutionFailed,
@@ -281,6 +290,7 @@ pub struct RepairTerminalReceipt {
     outcome: RepairTerminalOutcome,
     reservation_id: Option<String>,
     transaction_binding_sha256: Option<String>,
+    prepare_failure_stage: Option<RepairPrepareFailureStage>,
 }
 
 impl RepairTerminalReceipt {
@@ -318,6 +328,7 @@ impl RepairTerminalReceipt {
             outcome,
             reservation_id,
             transaction_binding_sha256,
+            prepare_failure_stage: None,
         })
     }
 }
@@ -492,6 +503,7 @@ pub struct TerminalRepairDetail {
     reservation_id: Option<String>,
     transaction_binding_sha256: Option<String>,
     reboot_required: bool,
+    prepare_failure_stage: Option<RepairPrepareFailureStage>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -949,10 +961,14 @@ impl<Engine: RepairPreparationEngine> RescueRepairService<Engine> {
                     }
                     Ok((authority, _)) => {
                         let _ = Engine::cancel_prepared(authority, Instant::now() + CANCEL_TIMEOUT);
-                        self.state.phase = InternalState::Terminal(failed_receipt());
+                        self.state.phase = InternalState::Terminal(prepare_failed_receipt(
+                            RepairPrepareFailureStage::AdmissionInternal,
+                        ));
                     }
-                    Err(_) => {
-                        self.state.phase = InternalState::Terminal(failed_receipt());
+                    Err(error) => {
+                        self.state.phase = InternalState::Terminal(prepare_failed_receipt(
+                            prepare_failure_stage(error),
+                        ));
                     }
                 }
                 let _ = self.bump_version();
@@ -1151,6 +1167,18 @@ fn terminal_detail(receipt: &RepairTerminalReceipt) -> TerminalRepairDetail {
         reservation_id: receipt.reservation_id.clone(),
         transaction_binding_sha256: receipt.transaction_binding_sha256.clone(),
         reboot_required: receipt.outcome == RepairTerminalOutcome::ManualReconciliationRequired,
+        prepare_failure_stage: receipt.prepare_failure_stage,
+    }
+}
+
+fn prepare_failure_stage(error: RepairEngineFailure) -> RepairPrepareFailureStage {
+    match error {
+        RepairEngineFailure::PrepareFailed(stage) => stage,
+        RepairEngineFailure::ApprovalRejected
+        | RepairEngineFailure::CancelFailed
+        | RepairEngineFailure::ExecutionFailed
+        | RepairEngineFailure::RecoveryUnavailable
+        | RepairEngineFailure::Internal => RepairPrepareFailureStage::AdmissionInternal,
     }
 }
 
@@ -1159,6 +1187,7 @@ fn cancelled_receipt() -> RepairTerminalReceipt {
         outcome: RepairTerminalOutcome::Cancelled,
         reservation_id: None,
         transaction_binding_sha256: None,
+        prepare_failure_stage: None,
     }
 }
 
@@ -1167,6 +1196,16 @@ fn failed_receipt() -> RepairTerminalReceipt {
         outcome: RepairTerminalOutcome::Failed,
         reservation_id: None,
         transaction_binding_sha256: None,
+        prepare_failure_stage: None,
+    }
+}
+
+fn prepare_failed_receipt(stage: RepairPrepareFailureStage) -> RepairTerminalReceipt {
+    RepairTerminalReceipt {
+        outcome: RepairTerminalOutcome::Failed,
+        reservation_id: None,
+        transaction_binding_sha256: None,
+        prepare_failure_stage: Some(stage),
     }
 }
 
@@ -1271,7 +1310,7 @@ fn correlation_probe(frame: &[u8]) -> CorrelationProbe {
 
 fn encode_bounded(value: &impl Serialize) -> Vec<u8> {
     let encoded = serde_json::to_vec(value).unwrap_or_else(|_| {
-        br#"{"apiVersion":"kernaid.dev/rescue-repair-service/v1alpha1","requestId":"R-00000000-0000-0000-0000-000000000000","operation":"repair.status","outcome":"error","stateVersion":0,"state":"failed","detail":{"kind":"terminal","terminalOutcome":"failed","reservationId":null,"transactionBindingSha256":null,"rebootRequired":false},"error":"internal"}"#.to_vec()
+        br#"{"apiVersion":"kernaid.dev/rescue-repair-service/v1alpha1","requestId":"R-00000000-0000-0000-0000-000000000000","operation":"repair.status","outcome":"error","stateVersion":0,"state":"failed","detail":{"kind":"terminal","terminalOutcome":"failed","reservationId":null,"transactionBindingSha256":null,"rebootRequired":false,"prepareFailureStage":null},"error":"internal"}"#.to_vec()
     });
     debug_assert!(encoded.len() <= REPAIR_SERVICE_MAX_FRAME_BYTES);
     encoded
@@ -1509,6 +1548,33 @@ mod tests {
             service.public_state(),
             RepairPublicState::ManualReconciliationRequired
         );
+    }
+
+    #[test]
+    fn prepare_failure_detail_exposes_only_the_closed_stage_token() {
+        for (stage, expected) in [
+            (
+                RepairPrepareFailureStage::TargetCapability,
+                "target-capability",
+            ),
+            (
+                RepairPrepareFailureStage::ObservationPreview,
+                "observation-preview",
+            ),
+            (RepairPrepareFailureStage::VaultReserve, "vault-reserve"),
+            (
+                RepairPrepareFailureStage::AdmissionInternal,
+                "admission-internal",
+            ),
+        ] {
+            let detail = serde_json::to_value(terminal_detail(&prepare_failed_receipt(stage)))
+                .expect("terminal detail");
+            assert_eq!(detail["prepareFailureStage"], expected);
+            assert_eq!(detail["terminalOutcome"], "failed");
+            assert_eq!(detail["reservationId"], Value::Null);
+            assert_eq!(detail["transactionBindingSha256"], Value::Null);
+            assert!(!detail.to_string().contains('/'));
+        }
     }
 
     fn hash(character: char) -> String {

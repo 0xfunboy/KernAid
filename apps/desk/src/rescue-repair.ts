@@ -44,6 +44,12 @@ export type RescueRepairTerminalOutcome =
   | "manual-reconciliation-required"
   | "failed";
 
+export type RescueRepairPrepareFailureStage =
+  | "target-capability"
+  | "observation-preview"
+  | "vault-reserve"
+  | "admission-internal";
+
 export type RescueRepairErrorToken =
   | "invalid-request"
   | "unauthorized"
@@ -89,6 +95,7 @@ export interface RescueRepairTerminalDetail {
   readonly reservationId: string | null;
   readonly transactionBindingSha256: string | null;
   readonly rebootRequired: boolean;
+  readonly prepareFailureStage: RescueRepairPrepareFailureStage | null;
 }
 
 export type RescueRepairDetail =
@@ -534,6 +541,7 @@ function parseTerminalDetail(
     "reservationId",
     "transactionBindingSha256",
     "rebootRequired",
+    "prepareFailureStage",
   ]);
   const outcomes: readonly RescueRepairTerminalOutcome[] = [
     "committed",
@@ -542,6 +550,12 @@ function parseTerminalDetail(
     "cancelled",
     "manual-reconciliation-required",
     "failed",
+  ];
+  const prepareFailureStages: readonly RescueRepairPrepareFailureStage[] = [
+    "target-capability",
+    "observation-preview",
+    "vault-reserve",
+    "admission-internal",
   ];
   if (
     item.kind !== "terminal" ||
@@ -554,6 +568,11 @@ function parseTerminalDetail(
         !SHA256.test(item.transactionBindingSha256))) ||
     typeof item.rebootRequired !== "boolean" ||
     item.rebootRequired !== (state === "manual-reconciliation-required") ||
+    (item.prepareFailureStage !== null &&
+      (state !== "failed" ||
+        !prepareFailureStages.includes(
+          item.prepareFailureStage as RescueRepairPrepareFailureStage,
+        ))) ||
     !terminalOutcomeMatchesState(
       item.terminalOutcome as RescueRepairTerminalOutcome,
       state,
