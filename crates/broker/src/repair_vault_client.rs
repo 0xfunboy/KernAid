@@ -8,6 +8,8 @@ use kernaid_protocol::{
     rescue_repair_vault::{
         RepairBackupBinding, RepairBackupDraft, RepairBackupReleasePayload,
         RepairBackupStatusPayload, RepairFileMetadataV1, RepairReservationId,
+        RepairTransactionResolution, RepairTransactionStatusPayload,
+        RepairTransactionStatusResultPayload, RepairTransactionStatusSelector,
     },
     rescue_vault::{ErrorToken, RequestId, Sha256, SuccessPayload},
     rescue_vault_transport::{
@@ -184,19 +186,25 @@ impl fmt::Debug for RetrievedRepairBackup {
     }
 }
 
-/// Stateful client for the six operations allowed to the repair-broker role.
+/// Stateful client for the eight operations allowed to the repair-broker role.
 ///
-/// A new client has no trusted state version. Its first `reserve` uses
-/// `expectedStateVersion = 0`; an authenticated `STALE_STATE` supplies the
-/// version for one fresh, newly correlated retry. If a reserve response is
-/// lost, only the exact same draft may use the retained last version to
-/// reconcile it. No other mutation retries.
+/// A new client has no trusted state version. Its first `reserve` or reboot
+/// `PendingSingleton` transaction lookup uses `expectedStateVersion = 0`; an
+/// authenticated `STALE_STATE` supplies the version for one fresh, newly
+/// correlated retry. If a reserve response is lost, only the exact same draft
+/// may use the retained last version to reconcile it. No other mutation
+/// retries.
 pub struct RepairVaultClient {
     guard: VersionGuard,
     ambiguous_reserve: Option<RepairBackupDraft>,
 }
 
 struct ReserveAttempt<T> {
+    state_version: u64,
+    outcome: Result<T, RepairVaultClientError>,
+}
+
+struct TransactionAttempt<T> {
     state_version: u64,
     outcome: Result<T, RepairVaultClientError>,
 }
@@ -467,6 +475,147 @@ impl RepairVaultClient {
         })
     }
 
+    /// Looks up the singleton unresolved transaction after restart, or one
+    /// exact transaction while reconciling a lost mutation response.
+    ///
+    /// `PendingSingleton` is the only read that can bootstrap a new client at
+    /// state version zero. `Exact` requires an already observed version. Both
+    /// accept at most one authenticated stale-state response and retry with a
+    /// fresh request correlation. A definitive result reconciles a lost
+    /// non-reserve mutation, but never clears an ambiguous reserve.
+    pub fn transaction_status(
+        &mut self,
+        selector: &RepairTransactionStatusSelector,
+        deadline: Instant,
+    ) -> Result<RepairTransactionStatusResultPayload, RepairVaultClientError> {
+        self.transaction_status_with_exchange(
+            selector,
+            deadline,
+            |expected_state_version, selector, deadline| {
+                let response = exchange_once(
+                    expected_state_version,
+                    ClientRequestPayload::RepairTransactionStatus {
+                        selector: selector.clone(),
+                    },
+                    &[],
+                    deadline,
+                )?;
+                Ok(TransactionAttempt {
+                    state_version: response.state_version(),
+                    outcome: transaction_status_result(&response),
+                })
+            },
+        )
+    }
+
+    fn transaction_status_with_exchange<T, F>(
+        &mut self,
+        selector: &RepairTransactionStatusSelector,
+        deadline: Instant,
+        mut exchange: F,
+    ) -> Result<T, RepairVaultClientError>
+    where
+        F: FnMut(
+            u64,
+            &RepairTransactionStatusSelector,
+            Instant,
+        ) -> Result<TransactionAttempt<T>, ExchangeFailure>,
+    {
+        let pending_bootstrap =
+            matches!(selector, RepairTransactionStatusSelector::PendingSingleton);
+        let mut expected_state_version = if pending_bootstrap {
+            match self.guard {
+                VersionGuard::Uninitialized => 0,
+                VersionGuard::Ready(state_version)
+                | VersionGuard::ReconciliationRequired(state_version) => state_version,
+            }
+        } else {
+            self.guard.read_version()?
+        };
+
+        for attempt in 0..=1 {
+            let response = exchange(expected_state_version, selector, deadline)
+                .map_err(|failure| failure.error)?;
+            match response.outcome {
+                Err(RepairVaultClientError::Remote(ErrorToken::StaleState)) if attempt == 0 => {
+                    if response.state_version == expected_state_version {
+                        return Err(RepairVaultClientError::Protocol);
+                    }
+                    expected_state_version = response.state_version;
+                    if matches!(self.guard, VersionGuard::Uninitialized) {
+                        debug_assert!(pending_bootstrap);
+                        self.guard.reconcile(response.state_version);
+                    } else {
+                        self.guard.observe_read_version(response.state_version);
+                    }
+                }
+                Ok(result) => {
+                    self.observe_completed_read(response.state_version);
+                    return Ok(result);
+                }
+                Err(RepairVaultClientError::Remote(ErrorToken::Absent)) => {
+                    self.observe_completed_read(response.state_version);
+                    return Err(RepairVaultClientError::Remote(ErrorToken::Absent));
+                }
+                Err(error) => {
+                    self.guard.observe_read_version(response.state_version);
+                    return Err(error);
+                }
+            }
+        }
+        unreachable!("bounded transaction-status retry loop always returns")
+    }
+
+    /// Records one closed recovery outcome for an exact unresolved
+    /// transaction. This mutation is never repeated automatically. If the
+    /// correlated response is lost, the caller must use `transaction_status`
+    /// with `RepairTransactionStatusSelector::for_status(expected)`.
+    pub fn resolve_transaction(
+        &mut self,
+        expected: &RepairTransactionStatusPayload,
+        resolution: &RepairTransactionResolution,
+        deadline: Instant,
+    ) -> Result<RepairTransactionStatusPayload, RepairVaultClientError> {
+        self.resolve_transaction_with_exchange(|expected_state_version| {
+            let response = exchange_once(
+                expected_state_version,
+                ClientRequestPayload::RepairTransactionResolve {
+                    expected: Box::new(expected.clone()),
+                    resolution: resolution.clone(),
+                },
+                &[],
+                deadline,
+            )?;
+            Ok(TransactionAttempt {
+                state_version: response.state_version(),
+                outcome: transaction_resolve_result(&response),
+            })
+        })
+    }
+
+    fn resolve_transaction_with_exchange<T, F>(
+        &mut self,
+        exchange: F,
+    ) -> Result<T, RepairVaultClientError>
+    where
+        F: FnOnce(u64) -> Result<TransactionAttempt<T>, ExchangeFailure>,
+    {
+        let expected_state_version = self.guard.mutation_version()?;
+        match exchange(expected_state_version) {
+            Ok(response) => {
+                self.guard.reconcile(response.state_version);
+                self.ambiguous_reserve = None;
+                response.outcome
+            }
+            Err(failure) if failure.request_may_have_been_sent => {
+                self.guard.mark_ambiguous(expected_state_version);
+                self.ambiguous_reserve = None;
+                Err(RepairVaultClientError::ReconciliationRequired)
+            }
+            Err(failure) => Err(failure.error),
+        }
+    }
+
     pub fn cancel(
         &mut self,
         reservation_id: &RepairReservationId,
@@ -575,6 +724,30 @@ fn release_result(
     match response.outcome() {
         ClientResponseOutcome::Success(SuccessPayload::RepairBackupReleased(released)) => {
             Ok(released.clone())
+        }
+        ClientResponseOutcome::Error(error) => Err(RepairVaultClientError::Remote(*error)),
+        ClientResponseOutcome::Success(_) => Err(RepairVaultClientError::Protocol),
+    }
+}
+
+fn transaction_status_result(
+    response: &ClientResponse,
+) -> Result<RepairTransactionStatusResultPayload, RepairVaultClientError> {
+    match response.outcome() {
+        ClientResponseOutcome::Success(SuccessPayload::RepairTransactionStatus(result)) => {
+            Ok((**result).clone())
+        }
+        ClientResponseOutcome::Error(error) => Err(RepairVaultClientError::Remote(*error)),
+        ClientResponseOutcome::Success(_) => Err(RepairVaultClientError::Protocol),
+    }
+}
+
+fn transaction_resolve_result(
+    response: &ClientResponse,
+) -> Result<RepairTransactionStatusPayload, RepairVaultClientError> {
+    match response.outcome() {
+        ClientResponseOutcome::Success(SuccessPayload::RepairTransactionResolved(status)) => {
+            Ok((**status).clone())
         }
         ClientResponseOutcome::Error(error) => Err(RepairVaultClientError::Remote(*error)),
         ClientResponseOutcome::Success(_) => Err(RepairVaultClientError::Protocol),
@@ -858,6 +1031,14 @@ mod tests {
         client
     }
 
+    fn exact_transaction_selector() -> RepairTransactionStatusSelector {
+        RepairTransactionStatusSelector::exact(
+            RepairReservationId::parse("B-0123456789abcdef0123456789abcdef")
+                .expect("reservation ID"),
+            hash('9'),
+        )
+    }
+
     #[test]
     fn request_codec_remains_typed_and_path_free() {
         let request = ClientRequest::new(
@@ -905,6 +1086,128 @@ mod tests {
         assert_eq!(
             guard.public(),
             RepairVaultClientState::Ready { state_version: 21 }
+        );
+    }
+
+    #[test]
+    fn pending_transaction_status_bootstraps_at_zero_and_retries_one_stale() {
+        let mut client = RepairVaultClient::new();
+        let selector = RepairTransactionStatusSelector::pending_singleton();
+        let mut versions = Vec::new();
+        let result = client.transaction_status_with_exchange(
+            &selector,
+            Instant::now() + Duration::from_secs(1),
+            |expected_state_version, observed_selector, _| {
+                assert_eq!(observed_selector, &selector);
+                versions.push(expected_state_version);
+                if versions.len() == 1 {
+                    Ok(TransactionAttempt {
+                        state_version: 19,
+                        outcome: Err(RepairVaultClientError::Remote(ErrorToken::StaleState)),
+                    })
+                } else {
+                    Ok(TransactionAttempt {
+                        state_version: 19,
+                        outcome: Ok(7_u8),
+                    })
+                }
+            },
+        );
+
+        assert_eq!(result, Ok(7));
+        assert_eq!(versions, [0, 19]);
+        assert_eq!(
+            client.state(),
+            RepairVaultClientState::Ready { state_version: 19 }
+        );
+    }
+
+    #[test]
+    fn exact_transaction_status_cannot_bootstrap_an_uninitialized_client() {
+        let mut client = RepairVaultClient::new();
+        let mut exchanged = false;
+        let result: Result<u8, _> = client.transaction_status_with_exchange(
+            &exact_transaction_selector(),
+            Instant::now() + Duration::from_secs(1),
+            |_, _, _| {
+                exchanged = true;
+                Err(definite_failure(RepairVaultClientError::Protocol))
+            },
+        );
+
+        assert_eq!(result, Err(RepairVaultClientError::StateUnavailable));
+        assert!(!exchanged);
+    }
+
+    #[test]
+    fn lost_resolve_response_is_reconciled_only_by_definitive_exact_status() {
+        let mut client = RepairVaultClient {
+            guard: VersionGuard::Ready(17),
+            ambiguous_reserve: None,
+        };
+        let mut resolve_attempts = 0;
+        let resolve: Result<u8, _> =
+            client.resolve_transaction_with_exchange(|expected_state_version| {
+                resolve_attempts += 1;
+                assert_eq!(expected_state_version, 17);
+                Err(ExchangeFailure {
+                    error: RepairVaultClientError::TimedOut,
+                    request_may_have_been_sent: true,
+                })
+            });
+        assert_eq!(resolve, Err(RepairVaultClientError::ReconciliationRequired));
+        assert_eq!(resolve_attempts, 1);
+        assert_eq!(
+            client.state(),
+            RepairVaultClientState::ReconciliationRequired {
+                last_state_version: 17
+            }
+        );
+
+        let selector = exact_transaction_selector();
+        let status = client.transaction_status_with_exchange(
+            &selector,
+            Instant::now() + Duration::from_secs(1),
+            |expected_state_version, observed_selector, _| {
+                assert_eq!(expected_state_version, 17);
+                assert_eq!(observed_selector, &selector);
+                Ok(TransactionAttempt {
+                    state_version: 18,
+                    outcome: Ok(11_u8),
+                })
+            },
+        );
+        assert_eq!(status, Ok(11));
+        assert_eq!(
+            client.state(),
+            RepairVaultClientState::Ready { state_version: 18 }
+        );
+    }
+
+    #[test]
+    fn transaction_status_never_clears_an_unknown_reserve() {
+        let original = draft();
+        let mut client = ambiguous_reserve_client(&original);
+        let selector = exact_transaction_selector();
+        let status = client.transaction_status_with_exchange(
+            &selector,
+            Instant::now() + Duration::from_secs(1),
+            |expected_state_version, _, _| {
+                assert_eq!(expected_state_version, 17);
+                Ok(TransactionAttempt {
+                    state_version: 23,
+                    outcome: Ok(5_u8),
+                })
+            },
+        );
+
+        assert_eq!(status, Ok(5));
+        assert_eq!(client.ambiguous_reserve.as_ref(), Some(&original));
+        assert_eq!(
+            client.state(),
+            RepairVaultClientState::ReconciliationRequired {
+                last_state_version: 23
+            }
         );
     }
 
