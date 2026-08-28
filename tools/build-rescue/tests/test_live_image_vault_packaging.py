@@ -119,7 +119,11 @@ class VaultSystemdPackagingTests(unittest.TestCase):
         self.assertEqual(service["Group"], "root")
         self.assertEqual(service["PrivateDevices"], "no")
         self.assertEqual(service["ProtectSystem"], "strict")
-        self.assertEqual(service["CapabilityBoundingSet"], "CAP_SYS_ADMIN")
+        self.assertEqual(
+            service["CapabilityBoundingSet"], "CAP_CHOWN CAP_SYS_ADMIN"
+        )
+        self.assertNotIn("CAP_DAC_OVERRIDE", service["CapabilityBoundingSet"])
+        self.assertNotIn("CAP_FOWNER", service["CapabilityBoundingSet"])
         self.assertNotIn("Environment", service)
         self.assertNotIn("RestrictSUIDSGID", service)
         self.assertEqual(sections["Install"], {"WantedBy": "multi-user.target"})

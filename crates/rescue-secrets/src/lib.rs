@@ -50,12 +50,34 @@ pub const VAULT_MARKER_V1: &[u8] = b"KERNAID-RESCUE-VAULT-V1\n";
 /// Marker filename at the root of the mounted LUKS2 filesystem.
 pub const VAULT_MARKER_NAME: &str = ".kernaid-rescue-vault";
 
-#[cfg(all(target_os = "linux", feature = "experimental-codex-home-lease"))]
+#[cfg(all(
+    target_os = "linux",
+    any(
+        feature = "experimental-codex-home-lease",
+        feature = "experimental-firstboot-provisioner"
+    )
+))]
 pub(crate) const CODEX_AGENT_UID: u32 = 973;
-#[cfg(all(target_os = "linux", feature = "experimental-codex-home-lease"))]
+#[cfg(all(
+    target_os = "linux",
+    any(
+        feature = "experimental-codex-home-lease",
+        feature = "experimental-firstboot-provisioner"
+    )
+))]
 pub(crate) const CODEX_AGENT_GID: u32 = 973;
-#[cfg(all(target_os = "linux", feature = "experimental-codex-home-lease"))]
+#[cfg(all(
+    target_os = "linux",
+    any(
+        feature = "experimental-codex-home-lease",
+        feature = "experimental-firstboot-provisioner"
+    )
+))]
 pub(crate) const CODEX_HOME_NAME: &str = ".kernaid-codex-home-v1";
+#[cfg(all(target_os = "linux", feature = "experimental-firstboot-provisioner"))]
+pub(crate) const CODEX_CONFIG_NAME: &str = "config.toml";
+#[cfg(all(target_os = "linux", feature = "experimental-firstboot-provisioner"))]
+pub(crate) const CODEX_CONFIG_V1: &[u8] = b"cli_auth_credentials_store = \"file\"\n";
 
 #[cfg(all(target_os = "linux", feature = "experimental-codex-home-lease"))]
 pub(crate) fn codex_home_status_flags_are_exact(flags: rustix::fs::OFlags) -> bool {

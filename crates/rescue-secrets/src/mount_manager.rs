@@ -1989,12 +1989,80 @@ fn create_firstboot_vault_skeleton(
     validate_firstboot_directory(&state, mapping, SECURE_DIRECTORY_MODE)?;
     rfs::fsync(&state).map_err(|_| VaultMountManagerError::ProvisioningInitializationFailed)?;
     create_firstboot_file(&root_fd, VAULT_LOCK_NAME, b"", mapping)?;
+    create_firstboot_codex_home(&root_fd, mapping)?;
     // The marker is installed last and is the completion sentinel for the
-    // structural skeleton. Identity/journal creation remains a later typed
-    // transaction and is verified before this lifecycle may report success.
+    // complete structural skeleton. Identity/journal creation remains a later
+    // typed transaction and is verified before this lifecycle may report
+    // success.
     create_firstboot_file(&root_fd, VAULT_MARKER_NAME, VAULT_MARKER_V1, mapping)?;
     rfs::fsync(&root_fd).map_err(|_| VaultMountManagerError::ProvisioningInitializationFailed)?;
     validate_firstboot_directory(&root_fd, mapping, SECURE_DIRECTORY_MODE)
+}
+
+#[cfg(feature = "experimental-firstboot-provisioner")]
+fn create_firstboot_codex_home(
+    root: &OwnedFd,
+    mapping: &MappingIdentity,
+) -> Result<(), VaultMountManagerError> {
+    create_firstboot_codex_home_for(
+        root,
+        mapping,
+        crate::CODEX_AGENT_UID,
+        crate::CODEX_AGENT_GID,
+    )
+}
+
+#[cfg(feature = "experimental-firstboot-provisioner")]
+fn create_firstboot_codex_home_for(
+    root: &OwnedFd,
+    mapping: &MappingIdentity,
+    owner: u32,
+    group: u32,
+) -> Result<(), VaultMountManagerError> {
+    rfs::mkdirat(
+        root,
+        crate::CODEX_HOME_NAME,
+        Mode::from_raw_mode(SECURE_DIRECTORY_MODE),
+    )
+    .map_err(|_| VaultMountManagerError::ProvisioningInitializationFailed)?;
+    let home = open_firstboot_child_directory(root, crate::CODEX_HOME_NAME)?;
+    rfs::fchmod(&home, Mode::from_raw_mode(SECURE_DIRECTORY_MODE))
+        .map_err(|_| VaultMountManagerError::ProvisioningInitializationFailed)?;
+
+    // Keep the new directory root-owned while its sole file is created. The
+    // shipping service intentionally has CAP_CHOWN but not CAP_DAC_OVERRIDE or
+    // CAP_FOWNER, so ownership of the 0700 directory is transferred last.
+    create_firstboot_owned_file(
+        &home,
+        crate::CODEX_CONFIG_NAME,
+        crate::CODEX_CONFIG_V1,
+        mapping,
+        owner,
+        group,
+    )?;
+    rfs::fsync(&home).map_err(|_| VaultMountManagerError::ProvisioningInitializationFailed)?;
+    rfs::fchown(
+        &home,
+        Some(rustix::fs::Uid::from_raw(owner)),
+        Some(rustix::fs::Gid::from_raw(group)),
+    )
+    .map_err(|_| VaultMountManagerError::ProvisioningInitializationFailed)?;
+    rfs::fsync(&home).map_err(|_| VaultMountManagerError::ProvisioningInitializationFailed)?;
+
+    validate_firstboot_directory_owner(&home, mapping, SECURE_DIRECTORY_MODE, owner, group)?;
+    let named = rfs::statat(root, crate::CODEX_HOME_NAME, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|_| VaultMountManagerError::ProvisioningInitializationFailed)?;
+    let opened =
+        rfs::fstat(&home).map_err(|_| VaultMountManagerError::ProvisioningInitializationFailed)?;
+    if opened.st_dev != named.st_dev
+        || opened.st_ino != named.st_ino
+        || opened.st_mode != named.st_mode
+        || opened.st_uid != named.st_uid
+        || opened.st_gid != named.st_gid
+    {
+        return Err(VaultMountManagerError::ProvisioningInitializationFailed);
+    }
+    Ok(())
 }
 
 #[cfg(feature = "experimental-firstboot-provisioner")]
@@ -2063,14 +2131,25 @@ fn validate_firstboot_directory(
     mapping: &MappingIdentity,
     mode: u32,
 ) -> Result<(), VaultMountManagerError> {
+    validate_firstboot_directory_owner(descriptor, mapping, mode, 0, 0)
+}
+
+#[cfg(feature = "experimental-firstboot-provisioner")]
+fn validate_firstboot_directory_owner(
+    descriptor: &OwnedFd,
+    mapping: &MappingIdentity,
+    mode: u32,
+    owner: u32,
+    group: u32,
+) -> Result<(), VaultMountManagerError> {
     let stat = rfs::fstat(descriptor)
         .map_err(|_| VaultMountManagerError::ProvisioningInitializationFailed)?;
     let flags = rustix::io::fcntl_getfd(descriptor)
         .map_err(|_| VaultMountManagerError::ProvisioningInitializationFailed)?;
     if !FileType::from_raw_mode(stat.st_mode).is_dir()
         || stat.st_dev != rfs::makedev(mapping.major, mapping.minor)
-        || stat.st_uid != 0
-        || stat.st_gid != 0
+        || stat.st_uid != owner
+        || stat.st_gid != group
         || stat.st_mode & 0o7777 != mode
         || !flags.contains(rustix::io::FdFlags::CLOEXEC)
     {
@@ -2085,6 +2164,18 @@ fn create_firstboot_file(
     name: &str,
     bytes: &[u8],
     mapping: &MappingIdentity,
+) -> Result<(), VaultMountManagerError> {
+    create_firstboot_owned_file(root, name, bytes, mapping, 0, 0)
+}
+
+#[cfg(feature = "experimental-firstboot-provisioner")]
+fn create_firstboot_owned_file(
+    root: &OwnedFd,
+    name: &str,
+    bytes: &[u8],
+    mapping: &MappingIdentity,
+    owner: u32,
+    group: u32,
 ) -> Result<(), VaultMountManagerError> {
     let file = rfs::openat2(
         root,
@@ -2108,6 +2199,16 @@ fn create_firstboot_file(
         }
         written += count;
     }
+    let created =
+        rfs::fstat(&file).map_err(|_| VaultMountManagerError::ProvisioningInitializationFailed)?;
+    if created.st_uid != owner || created.st_gid != group {
+        rfs::fchown(
+            &file,
+            Some(rustix::fs::Uid::from_raw(owner)),
+            Some(rustix::fs::Gid::from_raw(group)),
+        )
+        .map_err(|_| VaultMountManagerError::ProvisioningInitializationFailed)?;
+    }
     rfs::fsync(&file).map_err(|_| VaultMountManagerError::ProvisioningInitializationFailed)?;
     let opened =
         rfs::fstat(&file).map_err(|_| VaultMountManagerError::ProvisioningInitializationFailed)?;
@@ -2115,8 +2216,8 @@ fn create_firstboot_file(
         .map_err(|_| VaultMountManagerError::ProvisioningInitializationFailed)?;
     if !FileType::from_raw_mode(opened.st_mode).is_file()
         || opened.st_dev != rfs::makedev(mapping.major, mapping.minor)
-        || opened.st_uid != 0
-        || opened.st_gid != 0
+        || opened.st_uid != owner
+        || opened.st_gid != group
         || opened.st_nlink != 1
         || opened.st_mode & 0o7777 != SECURE_FILE_MODE
         || opened.st_size != bytes.len() as i64
@@ -4570,6 +4671,76 @@ mod tests {
                     .is_ok()
             );
         }
+    }
+
+    #[cfg(feature = "experimental-firstboot-provisioner")]
+    #[test]
+    fn firstboot_codex_home_has_the_exact_shipping_baseline() {
+        let fixture = tempfile::tempdir().expect("temporary Codex-home fixture");
+        let root = rfs::openat2(
+            CWD,
+            fixture.path(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+        )
+        .expect("open fixture root");
+        let root_stat = rfs::fstat(&root).expect("fixture root stat");
+        let mapping = MappingIdentity {
+            descriptor: dummy_fd(),
+            checkpoint_procfd: PathBuf::from("/proc/1/fd/9"),
+            device: root_stat.st_dev,
+            inode: root_stat.st_ino,
+            rdev: root_stat.st_dev,
+            major: rfs::major(root_stat.st_dev),
+            minor: rfs::minor(root_stat.st_dev),
+            backing_major: 7,
+            backing_minor: 8,
+            capacity_sectors: VAULT_PAYLOAD_BYTES / 512,
+            logical_sector_bytes: LOGICAL_SECTOR_BYTES,
+        };
+        let owner = rustix::process::geteuid().as_raw();
+        let group = rustix::process::getegid().as_raw();
+
+        create_firstboot_codex_home_for(&root, &mapping, owner, group)
+            .expect("create exact Codex home");
+
+        let home = rfs::statat(&root, crate::CODEX_HOME_NAME, AtFlags::SYMLINK_NOFOLLOW)
+            .expect("Codex home stat");
+        assert!(FileType::from_raw_mode(home.st_mode).is_dir());
+        assert_eq!((home.st_uid, home.st_gid), (owner, group));
+        assert_eq!(home.st_mode & 0o7777, SECURE_DIRECTORY_MODE);
+
+        let home_fd = open_firstboot_child_directory(&root, crate::CODEX_HOME_NAME)
+            .expect("open exact Codex home");
+        let config = rfs::statat(
+            &home_fd,
+            crate::CODEX_CONFIG_NAME,
+            AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .expect("Codex config stat");
+        assert!(FileType::from_raw_mode(config.st_mode).is_file());
+        assert_eq!((config.st_uid, config.st_gid), (owner, group));
+        assert_eq!(config.st_mode & 0o7777, SECURE_FILE_MODE);
+        assert_eq!(config.st_nlink, 1);
+        assert_eq!(config.st_size, crate::CODEX_CONFIG_V1.len() as i64);
+        assert_eq!(
+            fs::read(
+                fixture
+                    .path()
+                    .join(crate::CODEX_HOME_NAME)
+                    .join(crate::CODEX_CONFIG_NAME)
+            )
+            .expect("read Codex config"),
+            crate::CODEX_CONFIG_V1
+        );
+        assert_eq!(
+            fs::read_dir(fixture.path().join(crate::CODEX_HOME_NAME))
+                .expect("scan Codex home")
+                .count(),
+            1
+        );
+        assert!(create_firstboot_codex_home_for(&root, &mapping, owner, group).is_err());
     }
 
     #[cfg(feature = "experimental-firstboot-provisioner")]
