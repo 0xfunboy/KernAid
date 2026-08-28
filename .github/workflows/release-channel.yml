@@ -154,17 +154,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          immutable="$RUNNER_TEMP/kernaid-immutable-releases.json"
-          gh api "repos/$GITHUB_REPOSITORY/immutable-releases" >"$immutable"
-          python3 -I -B - "$immutable" <<'PY'
-          import json
-          from pathlib import Path
-          import sys
-
-          document = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-          if document.get("enabled") is not True:
-              raise SystemExit("repository release immutability is not enabled")
-          PY
+          # GitHub's installation-scoped Actions token cannot read the
+          # repository immutable-releases setting. The publisher instead
+          # proves the property on the exact release after its one-way publish.
           releases="$RUNNER_TEMP/kernaid-internal-releases.jsonl"
           gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
             --jq '.[] | @base64' >"$releases"
