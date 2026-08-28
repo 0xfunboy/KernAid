@@ -364,6 +364,199 @@ article {
   background: #241516;
   font-size: 12px;
 }
+.rescue-repair {
+  display: grid;
+  gap: 14px;
+  margin-top: 22px;
+  padding: 22px;
+  border: 1px solid #3d6459;
+  border-radius: 12px;
+  background:
+    radial-gradient(circle at 96% 0, rgb(199 255 61 / 9%), transparent 36%),
+    linear-gradient(145deg, #101814, #0d1210 66%);
+  box-shadow: 0 18px 55px rgb(0 0 0 / 22%);
+}
+.rescue-repair-manual-reconciliation-required,
+.rescue-repair-failed {
+  border-color: #8b4542;
+  background:
+    radial-gradient(circle at 96% 0, rgb(255 123 114 / 10%), transparent 38%),
+    #171110;
+}
+.rescue-repair-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+.rescue-repair-heading h2 {
+  margin: 5px 0 0;
+  font-size: 20px;
+}
+.rescue-repair-heading > span {
+  flex: none;
+  padding: 5px 8px;
+  color: #c7ff3d;
+  border: 1px solid #4e6825;
+  border-radius: 999px;
+  background: #172011;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+}
+.rescue-repair-state {
+  margin: 0;
+  color: #c7d4cd;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.rescue-repair-card {
+  display: grid;
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid #293b34;
+  border-radius: 9px;
+  background: #0b100e;
+}
+.rescue-repair-card > p {
+  margin: 0;
+  color: #aabbb2;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.rescue-repair-row {
+  display: grid;
+  grid-template-columns: 150px minmax(0, 1fr);
+  gap: 12px;
+  align-items: baseline;
+  padding-top: 9px;
+  border-top: 1px solid #222d28;
+  font-size: 11px;
+}
+.rescue-repair-row:first-child {
+  padding-top: 0;
+  border-top: 0;
+}
+.rescue-repair-row > span {
+  color: #849089;
+}
+.rescue-repair-row > code {
+  overflow: hidden;
+  color: #c5d3cc;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rescue-repair-diff {
+  display: grid;
+  gap: 5px;
+  padding: 12px;
+  border: 1px solid #2d4138;
+  border-radius: 7px;
+  background: #080c0a;
+}
+.rescue-repair-diff > div {
+  display: grid;
+  grid-template-columns: 70px minmax(0, 1fr);
+  gap: 10px;
+  color: #adbbb4;
+  font-size: 11px;
+}
+.rescue-repair-diff > div:first-child span {
+  color: #ff9a93;
+}
+.rescue-repair-diff > div:last-child span {
+  color: #c7ff3d;
+}
+.rescue-repair-backup {
+  display: grid;
+  gap: 5px;
+  padding: 12px;
+  color: #d9f3e4;
+  border: 1px solid #35675b;
+  border-radius: 7px;
+  background: #10221d;
+}
+.rescue-repair-backup small {
+  color: #82baaa;
+  letter-spacing: 0;
+}
+.rescue-repair-confirmation {
+  display: grid;
+  gap: 7px;
+  padding-top: 4px;
+  color: #aabbb2;
+  font-size: 12px;
+}
+.rescue-repair-confirmation > code {
+  color: #50d8e8;
+  font-weight: 800;
+}
+.rescue-repair-confirmation input {
+  width: 100%;
+  padding: 10px 11px;
+  color: #edf3ed;
+  border: 1px solid #3b4842;
+  border-radius: 6px;
+  background: #080b0a;
+  font: inherit;
+}
+.rescue-repair-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 9px;
+}
+.rescue-repair-actions button,
+.rescue-repair-primary {
+  padding: 10px 14px;
+  color: #c9d7d0;
+  border: 1px solid #46534d;
+  border-radius: 6px;
+  background: #151b18;
+  font-weight: 750;
+}
+.rescue-repair .rescue-repair-primary {
+  justify-self: end;
+  color: #0d1110;
+  border-color: #c7ff3d;
+  background: #c7ff3d;
+}
+.rescue-repair button:disabled,
+.rescue-repair input:disabled {
+  opacity: 0.42;
+}
+.rescue-repair-alert {
+  margin: 0;
+  padding: 10px 12px;
+  color: #ffb0aa;
+  border: 1px solid #8b4542;
+  border-radius: 7px;
+  background: #241516;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.rescue-repair-wait {
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+}
+.rescue-repair-spinner {
+  width: 18px;
+  height: 18px;
+  border: 2px solid #365049;
+  border-top-color: #50d8e8;
+  border-radius: 50%;
+  animation: rescue-repair-spin 800ms linear infinite;
+}
+@keyframes rescue-repair-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .rescue-repair-spinner {
+    animation: none;
+    border-color: #50d8e8;
+  }
+}
 h1 {
   font-size: 32px;
 }
@@ -462,5 +655,18 @@ footer {
   .fixture-lab-row {
     grid-template-columns: 1fr;
     gap: 3px;
+  }
+  .rescue-repair-heading,
+  .rescue-repair-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .rescue-repair-heading > span {
+    align-self: flex-start;
+  }
+  .rescue-repair-row,
+  .rescue-repair-diff > div {
+    grid-template-columns: 1fr;
+    gap: 4px;
   }
 }

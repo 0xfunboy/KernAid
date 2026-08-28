@@ -1,0 +1,701 @@
+import type { RescueTargetSelection } from "./native";
+
+export const RESCUE_REPAIR_API_VERSION =
+  "kernaid.dev/rescue-repair-service/v1alpha1";
+export const RESCUE_REPAIR_ENDPOINT = "/api/rescue/repair";
+export const RESCUE_FSTAB_FINDING_ID = "KA-LNX-P0-003";
+export const RESCUE_FSTAB_ACTION_ID = "linux.fstab.disable-missing-uuid.v1";
+export const RESCUE_FSTAB_CONFIRMATION = "DISABILITA VOCE FSTAB";
+
+const MAX_RESPONSE_BYTES = 4096;
+const REQUEST_ID =
+  /^R-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+const PREPARED_ID = /^Q-[a-f0-9]{32}$/u;
+const SESSION_ID = /^S-[a-f0-9]{32}$/u;
+const PLAN_ID = /^P-[a-f0-9]{32}$/u;
+const APPROVAL_ID = /^A-[a-f0-9]{32}$/u;
+const RESERVATION_ID = /^B-[A-Za-z0-9-]{1,126}$/u;
+const SCAN_FINGERPRINT = /^scan:[a-f0-9]{64}$/u;
+const TARGET_ID = /^target:[a-f0-9]{64}$/u;
+const SHA256 = /^sha256:[a-f0-9]{64}$/u;
+
+export type RescueRepairOperation =
+  | "repair.status"
+  | "repair.fstab.prepare"
+  | "repair.fstab.approve"
+  | "repair.fstab.cancel";
+
+export type RescueRepairState =
+  | "idle"
+  | "preparing"
+  | "prepared"
+  | "executing"
+  | "succeeded"
+  | "restored"
+  | "cancelled"
+  | "manual-reconciliation-required"
+  | "failed";
+
+export type RescueRepairTerminalOutcome =
+  | "committed"
+  | "closed-before-unchanged"
+  | "closed-before-restored"
+  | "cancelled"
+  | "manual-reconciliation-required"
+  | "failed";
+
+export type RescueRepairErrorToken =
+  | "invalid-request"
+  | "unauthorized"
+  | "busy"
+  | "state-conflict"
+  | "binding-mismatch"
+  | "approval-rejected"
+  | "prepare-failed"
+  | "cancel-failed"
+  | "execution-failed"
+  | "recovery-unavailable"
+  | "internal";
+
+export interface RescueRepairTargetClaims {
+  readonly scanFingerprint: string;
+  readonly targetFingerprint: string;
+  readonly targetId: string;
+}
+
+export interface RescueRepairPreparedDetail {
+  readonly kind: "fstab-prepared";
+  readonly preparedId: string;
+  readonly sessionId: string;
+  readonly planId: string;
+  readonly planHash: string;
+  readonly targetFingerprint: string;
+  readonly beforeSha256: string;
+  readonly afterSha256: string;
+  readonly diffSha256: string;
+  readonly actionId: typeof RESCUE_FSTAB_ACTION_ID;
+  readonly risk: "R2";
+  readonly backup: {
+    readonly state: "reserved";
+    readonly vaultDistinct: true;
+  };
+  readonly nextApprovalSequence: number;
+  readonly confirmationRequired: typeof RESCUE_FSTAB_CONFIRMATION;
+}
+
+export interface RescueRepairTerminalDetail {
+  readonly kind: "terminal";
+  readonly terminalOutcome: RescueRepairTerminalOutcome;
+  readonly reservationId: string | null;
+  readonly transactionBindingSha256: string | null;
+  readonly rebootRequired: boolean;
+}
+
+export type RescueRepairDetail =
+  null | RescueRepairPreparedDetail | RescueRepairTerminalDetail;
+
+export interface RescueRepairSnapshot {
+  readonly requestId: string;
+  readonly operation: RescueRepairOperation;
+  readonly stateVersion: number;
+  readonly state: RescueRepairState;
+  readonly detail: RescueRepairDetail;
+}
+
+type FetchLike = (
+  input: RequestInfo | URL,
+  init?: RequestInit,
+) => Promise<Response>;
+
+type RequestIdFactory = () => string;
+type ApprovalIdFactory = () => string;
+
+export class RescueRepairUnavailableError extends Error {
+  constructor() {
+    super("Il servizio di riparazione Rescue non è disponibile.");
+    this.name = "RescueRepairUnavailableError";
+  }
+}
+
+export class RescueRepairServiceError extends Error {
+  readonly token: RescueRepairErrorToken;
+  readonly stateVersion: number;
+  readonly state: RescueRepairState;
+  readonly detail: RescueRepairDetail;
+
+  constructor(
+    token: RescueRepairErrorToken,
+    stateVersion: number,
+    state: RescueRepairState,
+    detail: RescueRepairDetail,
+  ) {
+    super(rescueRepairErrorMessage(token));
+    this.name = "RescueRepairServiceError";
+    this.token = token;
+    this.stateVersion = stateVersion;
+    this.state = state;
+    this.detail = detail;
+  }
+}
+
+export class RescueRepairClient {
+  readonly #fetch: FetchLike;
+  readonly #requestId: RequestIdFactory;
+  readonly #approvalId: ApprovalIdFactory;
+
+  constructor(
+    fetcher: FetchLike = fetch,
+    requestIdFactory: RequestIdFactory = createRescueRepairRequestId,
+    approvalIdFactory: ApprovalIdFactory = createRescueRepairApprovalId,
+  ) {
+    this.#fetch = fetcher;
+    this.#requestId = requestIdFactory;
+    this.#approvalId = approvalIdFactory;
+  }
+
+  async status(signal?: AbortSignal): Promise<RescueRepairSnapshot> {
+    const requestId = this.#nextRequestId();
+    return await this.#post(
+      {
+        apiVersion: RESCUE_REPAIR_API_VERSION,
+        requestId,
+        operation: "repair.status",
+      },
+      requestId,
+      "repair.status",
+      signal,
+    );
+  }
+
+  async prepare(
+    target: RescueRepairTargetClaims,
+    signal?: AbortSignal,
+  ): Promise<RescueRepairSnapshot> {
+    const claims = parseRescueRepairTargetClaims(target);
+    const requestId = this.#nextRequestId();
+    return await this.#post(
+      {
+        apiVersion: RESCUE_REPAIR_API_VERSION,
+        requestId,
+        operation: "repair.fstab.prepare",
+        target: claims,
+      },
+      requestId,
+      "repair.fstab.prepare",
+      signal,
+    );
+  }
+
+  async approve(
+    prepared: RescueRepairPreparedDetail,
+    typedConfirmation: string,
+    signal?: AbortSignal,
+  ): Promise<RescueRepairSnapshot> {
+    const exactPrepared = parsePreparedDetail(prepared);
+    if (typedConfirmation !== RESCUE_FSTAB_CONFIRMATION)
+      throw new Error("La frase di conferma non corrisponde.");
+    const requestId = this.#nextRequestId();
+    const approvalId = this.#approvalId();
+    if (!APPROVAL_ID.test(approvalId))
+      throw new Error("Identificatore di approvazione locale non valido.");
+    return await this.#post(
+      {
+        apiVersion: RESCUE_REPAIR_API_VERSION,
+        requestId,
+        operation: "repair.fstab.approve",
+        preparedId: exactPrepared.preparedId,
+        sessionId: exactPrepared.sessionId,
+        planId: exactPrepared.planId,
+        planHash: exactPrepared.planHash,
+        approvalId,
+        approvalSequence: exactPrepared.nextApprovalSequence,
+        typedConfirmation: RESCUE_FSTAB_CONFIRMATION,
+      },
+      requestId,
+      "repair.fstab.approve",
+      signal,
+    );
+  }
+
+  async cancel(
+    prepared: RescueRepairPreparedDetail,
+    signal?: AbortSignal,
+  ): Promise<RescueRepairSnapshot> {
+    const exactPrepared = parsePreparedDetail(prepared);
+    const requestId = this.#nextRequestId();
+    return await this.#post(
+      {
+        apiVersion: RESCUE_REPAIR_API_VERSION,
+        requestId,
+        operation: "repair.fstab.cancel",
+        preparedId: exactPrepared.preparedId,
+        planHash: exactPrepared.planHash,
+      },
+      requestId,
+      "repair.fstab.cancel",
+      signal,
+    );
+  }
+
+  #nextRequestId(): string {
+    const requestId = this.#requestId();
+    if (!REQUEST_ID.test(requestId))
+      throw new Error("Identificatore richiesta locale non valido.");
+    return requestId;
+  }
+
+  async #post(
+    body: Record<string, unknown>,
+    requestId: string,
+    operation: RescueRepairOperation,
+    callerSignal?: AbortSignal,
+  ): Promise<RescueRepairSnapshot> {
+    const encoded = JSON.stringify(body);
+    if (new TextEncoder().encode(encoded).byteLength > MAX_RESPONSE_BYTES)
+      throw new Error("Richiesta di riparazione oltre il limite locale.");
+    let response: Response;
+    try {
+      response = await this.#fetch(RESCUE_REPAIR_ENDPOINT, {
+        method: "POST",
+        cache: "no-store",
+        headers: { "Content-Type": "application/json" },
+        body: encoded,
+        signal: callerSignal ?? AbortSignal.timeout(20_000),
+      });
+    } catch {
+      throw new RescueRepairUnavailableError();
+    }
+    if (
+      operation === "repair.status" &&
+      (response.status === 404 || response.status === 503)
+    )
+      throw new RescueRepairUnavailableError();
+    if (!isJsonResponse(response)) throw new RescueRepairUnavailableError();
+    const payload = await readBoundedJson(response, MAX_RESPONSE_BYTES).catch(
+      () => {
+        throw new RescueRepairUnavailableError();
+      },
+    );
+    const parsed = parseRescueRepairResponse(payload, requestId, operation);
+    if (!response.ok) throw new RescueRepairUnavailableError();
+    return parsed;
+  }
+}
+
+export function rescueRepairTargetClaims(
+  selection: RescueTargetSelection,
+  targetFingerprint: string,
+): RescueRepairTargetClaims {
+  return parseRescueRepairTargetClaims({
+    scanFingerprint: selection.scanFingerprint,
+    targetFingerprint,
+    targetId: selection.target.targetId,
+  });
+}
+
+export function parseRescueRepairTargetClaims(
+  value: unknown,
+): RescueRepairTargetClaims {
+  const item = exactRecord(value, [
+    "scanFingerprint",
+    "targetFingerprint",
+    "targetId",
+  ]);
+  if (
+    typeof item.scanFingerprint !== "string" ||
+    !SCAN_FINGERPRINT.test(item.scanFingerprint) ||
+    typeof item.targetFingerprint !== "string" ||
+    !SHA256.test(item.targetFingerprint) ||
+    typeof item.targetId !== "string" ||
+    !TARGET_ID.test(item.targetId)
+  )
+    throw new Error("Binding del target Rescue non valido.");
+  return structuredClone(item) as unknown as RescueRepairTargetClaims;
+}
+
+export function parseRescueRepairResponse(
+  value: unknown,
+  expectedRequestId: string,
+  expectedOperation: RescueRepairOperation,
+): RescueRepairSnapshot {
+  if (!REQUEST_ID.test(expectedRequestId))
+    throw new Error("Correlazione riparazione non valida.");
+  const record = objectRecord(value);
+  if (record.outcome === "error") {
+    const error = exactRecord(value, [
+      "apiVersion",
+      "requestId",
+      "operation",
+      "outcome",
+      "stateVersion",
+      "state",
+      "detail",
+      "error",
+    ]);
+    assertEnvelope(error, expectedRequestId, expectedOperation);
+    const state = parseState(error.state);
+    const stateVersion = parseStateVersion(error.stateVersion);
+    const token = parseErrorToken(error.error);
+    const detail = parseDetail(error.detail, state);
+    throw new RescueRepairServiceError(token, stateVersion, state, detail);
+  }
+  const response = exactRecord(value, [
+    "apiVersion",
+    "requestId",
+    "operation",
+    "outcome",
+    "stateVersion",
+    "state",
+    "detail",
+  ]);
+  assertEnvelope(response, expectedRequestId, expectedOperation);
+  if (response.outcome !== "ok")
+    throw new Error("Risposta del servizio di riparazione non valida.");
+  const state = parseState(response.state);
+  const detail = parseDetail(response.detail, state);
+  return Object.freeze({
+    requestId: expectedRequestId,
+    operation: expectedOperation,
+    stateVersion: parseStateVersion(response.stateVersion),
+    state,
+    detail,
+  });
+}
+
+export function preparedRepairDetail(
+  snapshot: RescueRepairSnapshot | undefined,
+): RescueRepairPreparedDetail | undefined {
+  return snapshot?.state === "prepared" &&
+    snapshot.detail?.kind === "fstab-prepared"
+    ? snapshot.detail
+    : undefined;
+}
+
+export function rescueRepairNeedsPolling(
+  snapshot: RescueRepairSnapshot | undefined,
+): boolean {
+  return snapshot?.state === "preparing" || snapshot?.state === "executing";
+}
+
+export function rescueRepairIsTerminal(
+  snapshot: RescueRepairSnapshot | undefined,
+): boolean {
+  return (
+    snapshot !== undefined &&
+    [
+      "succeeded",
+      "restored",
+      "cancelled",
+      "manual-reconciliation-required",
+      "failed",
+    ].includes(snapshot.state)
+  );
+}
+
+export function rescueRepairStateMessage(
+  snapshot: RescueRepairSnapshot,
+): string {
+  switch (snapshot.state) {
+    case "idle":
+      return "Pronto a preparare una verifica senza modifiche.";
+    case "preparing":
+      return "Verifica del finding e preparazione del backup in corso…";
+    case "prepared":
+      return "Piano preparato. Nessuna modifica è stata ancora eseguita.";
+    case "executing":
+      return "Riparazione in corso. Non spegnere il computer e non rimuovere i dispositivi.";
+    case "succeeded":
+      return "Riparazione completata e verificata.";
+    case "restored":
+      return "La modifica non è stata confermata: KernAid ha ripristinato i dati originali.";
+    case "cancelled":
+      return "Piano annullato. Nessuna modifica è stata eseguita.";
+    case "manual-reconciliation-required":
+      return "Stato non riconciliabile automaticamente. Non avviare il sistema installato: riavvia KernAid Rescue e richiedi assistenza.";
+    case "failed":
+      return "Riparazione non completata. Lo stato terminale non dichiara alcun successo.";
+  }
+}
+
+export function rescueRepairErrorMessage(
+  token: RescueRepairErrorToken,
+): string {
+  switch (token) {
+    case "busy":
+      return "Un'altra operazione Rescue è già in corso.";
+    case "state-conflict":
+    case "binding-mismatch":
+      return "Lo stato o il target non corrisponde più. Aggiorna lo stato prima di continuare.";
+    case "approval-rejected":
+      return "Approvazione rifiutata: controlla il piano e la frase di conferma.";
+    case "recovery-unavailable":
+      return "Recupero automatico non disponibile. Riavvia KernAid Rescue e richiedi assistenza.";
+    case "unauthorized":
+      return "Il pannello non è autorizzato a usare il servizio di riparazione.";
+    case "prepare-failed":
+      return "Il finding non è riparabile in sicurezza su questo target.";
+    case "cancel-failed":
+      return "Annullamento non confermato. Aggiorna lo stato prima di continuare.";
+    case "execution-failed":
+      return "Esecuzione non completata. Attendi lo stato terminale senza assumere il successo.";
+    case "invalid-request":
+    case "internal":
+      return "Il servizio di riparazione ha rifiutato l'operazione.";
+  }
+}
+
+export function createRescueRepairRequestId(): string {
+  return `R-${crypto.randomUUID()}`;
+}
+
+export function createRescueRepairApprovalId(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  return `A-${Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
+}
+
+function parseDetail(
+  value: unknown,
+  state: RescueRepairState,
+): RescueRepairDetail {
+  if (state === "prepared") return parsePreparedDetail(value);
+  if (
+    state === "succeeded" ||
+    state === "restored" ||
+    state === "cancelled" ||
+    state === "manual-reconciliation-required" ||
+    state === "failed"
+  )
+    return parseTerminalDetail(value, state);
+  if (value !== null)
+    throw new Error("Dettaglio dello stato riparazione non valido.");
+  return null;
+}
+
+function parsePreparedDetail(value: unknown): RescueRepairPreparedDetail {
+  const item = exactRecord(value, [
+    "kind",
+    "preparedId",
+    "sessionId",
+    "planId",
+    "planHash",
+    "targetFingerprint",
+    "beforeSha256",
+    "afterSha256",
+    "diffSha256",
+    "actionId",
+    "risk",
+    "backup",
+    "nextApprovalSequence",
+    "confirmationRequired",
+  ]);
+  const backup = exactRecord(item.backup, ["state", "vaultDistinct"]);
+  if (
+    item.kind !== "fstab-prepared" ||
+    typeof item.preparedId !== "string" ||
+    !PREPARED_ID.test(item.preparedId) ||
+    typeof item.sessionId !== "string" ||
+    !SESSION_ID.test(item.sessionId) ||
+    typeof item.planId !== "string" ||
+    !PLAN_ID.test(item.planId) ||
+    typeof item.planHash !== "string" ||
+    !SHA256.test(item.planHash) ||
+    typeof item.targetFingerprint !== "string" ||
+    !SHA256.test(item.targetFingerprint) ||
+    typeof item.beforeSha256 !== "string" ||
+    !SHA256.test(item.beforeSha256) ||
+    typeof item.afterSha256 !== "string" ||
+    !SHA256.test(item.afterSha256) ||
+    typeof item.diffSha256 !== "string" ||
+    !SHA256.test(item.diffSha256) ||
+    item.beforeSha256 === item.afterSha256 ||
+    item.actionId !== RESCUE_FSTAB_ACTION_ID ||
+    item.risk !== "R2" ||
+    backup.state !== "reserved" ||
+    backup.vaultDistinct !== true ||
+    !Number.isSafeInteger(item.nextApprovalSequence) ||
+    Number(item.nextApprovalSequence) < 1 ||
+    Number(item.nextApprovalSequence) > 1_000_000 ||
+    item.confirmationRequired !== RESCUE_FSTAB_CONFIRMATION
+  )
+    throw new Error("Piano fstab preparato non valido.");
+  return structuredClone({
+    ...item,
+    backup,
+  }) as unknown as RescueRepairPreparedDetail;
+}
+
+function parseTerminalDetail(
+  value: unknown,
+  state: RescueRepairState,
+): RescueRepairTerminalDetail {
+  const item = exactRecord(value, [
+    "kind",
+    "terminalOutcome",
+    "reservationId",
+    "transactionBindingSha256",
+    "rebootRequired",
+  ]);
+  const outcomes: readonly RescueRepairTerminalOutcome[] = [
+    "committed",
+    "closed-before-unchanged",
+    "closed-before-restored",
+    "cancelled",
+    "manual-reconciliation-required",
+    "failed",
+  ];
+  if (
+    item.kind !== "terminal" ||
+    !outcomes.includes(item.terminalOutcome as RescueRepairTerminalOutcome) ||
+    (item.reservationId !== null &&
+      (typeof item.reservationId !== "string" ||
+        !RESERVATION_ID.test(item.reservationId))) ||
+    (item.transactionBindingSha256 !== null &&
+      (typeof item.transactionBindingSha256 !== "string" ||
+        !SHA256.test(item.transactionBindingSha256))) ||
+    typeof item.rebootRequired !== "boolean" ||
+    item.rebootRequired !== (state === "manual-reconciliation-required") ||
+    !terminalOutcomeMatchesState(
+      item.terminalOutcome as RescueRepairTerminalOutcome,
+      state,
+    )
+  )
+    throw new Error("Esito terminale della riparazione non valido.");
+  return structuredClone(item) as unknown as RescueRepairTerminalDetail;
+}
+
+function terminalOutcomeMatchesState(
+  outcome: RescueRepairTerminalOutcome,
+  state: RescueRepairState,
+): boolean {
+  if (state === "succeeded") return outcome === "committed";
+  if (state === "restored")
+    return (
+      outcome === "closed-before-unchanged" ||
+      outcome === "closed-before-restored"
+    );
+  if (state === "cancelled") return outcome === "cancelled";
+  if (state === "manual-reconciliation-required")
+    return outcome === "manual-reconciliation-required";
+  return state === "failed" && outcome === "failed";
+}
+
+function assertEnvelope(
+  item: Record<string, unknown>,
+  expectedRequestId: string,
+  expectedOperation: RescueRepairOperation,
+): void {
+  if (
+    item.apiVersion !== RESCUE_REPAIR_API_VERSION ||
+    item.requestId !== expectedRequestId ||
+    item.operation !== expectedOperation
+  )
+    throw new Error("Correlazione della risposta riparazione non valida.");
+}
+
+function parseState(value: unknown): RescueRepairState {
+  const states: readonly RescueRepairState[] = [
+    "idle",
+    "preparing",
+    "prepared",
+    "executing",
+    "succeeded",
+    "restored",
+    "cancelled",
+    "manual-reconciliation-required",
+    "failed",
+  ];
+  if (!states.includes(value as RescueRepairState))
+    throw new Error("Stato riparazione non valido.");
+  return value as RescueRepairState;
+}
+
+function parseStateVersion(value: unknown): number {
+  if (!Number.isSafeInteger(value) || Number(value) < 1)
+    throw new Error("Versione stato riparazione non valida.");
+  return Number(value);
+}
+
+function parseErrorToken(value: unknown): RescueRepairErrorToken {
+  const tokens: readonly RescueRepairErrorToken[] = [
+    "invalid-request",
+    "unauthorized",
+    "busy",
+    "state-conflict",
+    "binding-mismatch",
+    "approval-rejected",
+    "prepare-failed",
+    "cancel-failed",
+    "execution-failed",
+    "recovery-unavailable",
+    "internal",
+  ];
+  if (!tokens.includes(value as RescueRepairErrorToken))
+    throw new Error("Errore riparazione non valido.");
+  return value as RescueRepairErrorToken;
+}
+
+function exactRecord(
+  value: unknown,
+  keys: readonly string[],
+  optional: ReadonlySet<string> = new Set(),
+): Record<string, unknown> {
+  const item = objectRecord(value);
+  const allowed = new Set(keys);
+  if (
+    keys.some((key) => !optional.has(key) && !Object.hasOwn(item, key)) ||
+    Object.keys(item).some((key) => !allowed.has(key))
+  )
+    throw new Error("Risposta del servizio di riparazione non valida.");
+  return item;
+}
+
+function objectRecord(value: unknown): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value))
+    throw new Error("Risposta del servizio di riparazione non valida.");
+  return value as Record<string, unknown>;
+}
+
+function isJsonResponse(response: Response): boolean {
+  return /^application\/json(?:\s*;|$)/iu.test(
+    response.headers.get("Content-Type") ?? "",
+  );
+}
+
+async function readBoundedJson(
+  response: Response,
+  maximumBytes: number,
+): Promise<unknown> {
+  const declared = response.headers.get("Content-Length");
+  if (
+    declared !== null &&
+    (!/^\d+$/u.test(declared) || Number(declared) > maximumBytes)
+  )
+    throw new Error("Risposta locale oltre il limite.");
+  if (response.body === null) throw new Error("Risposta locale vuota.");
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const result = await reader.read();
+      if (result.done) break;
+      total += result.value.byteLength;
+      if (total > maximumBytes) {
+        await reader.cancel();
+        throw new Error("Risposta locale oltre il limite.");
+      }
+      chunks.push(result.value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return JSON.parse(
+    new TextDecoder("utf-8", { fatal: true }).decode(bytes),
+  ) as unknown;
+}
