@@ -1202,6 +1202,181 @@ class ObserveBrokerTests(unittest.TestCase):
                 rescue_server.BROKERS.clear()
 
 
+class RepairRelayTests(unittest.TestCase):
+    REQUEST_ID = "R-11111111-1111-1111-1111-111111111111"
+    STATUS = {
+        "apiVersion": rescue_server.REPAIR_API_VERSION,
+        "requestId": REQUEST_ID,
+        "operation": "repair.status",
+    }
+    IDLE = {
+        **STATUS,
+        "outcome": "ok",
+        "stateVersion": 1,
+        "state": "idle",
+        "detail": None,
+    }
+
+    class FakeRepairSocket:
+        family = socket.AF_UNIX
+
+        def __init__(self, response: dict[str, object]) -> None:
+            self.response = json.dumps(
+                response, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+            ).encode("ascii")
+            self.connected: list[str] = []
+            self.sent: list[bytes] = []
+            self.timeouts: list[float] = []
+            self.closed = False
+
+        def settimeout(self, value: float) -> None:
+            self.timeouts.append(value)
+
+        def connect(self, path: str) -> None:
+            self.connected.append(path)
+
+        def send(self, value: bytes) -> int:
+            self.sent.append(value)
+            return len(value)
+
+        def recvmsg(
+            self, _maximum: int, _ancillary_size: int
+        ) -> tuple[bytes, list[tuple[int, int, bytes]], int, None]:
+            return self.response, [], 0, None
+
+        def getpeername(self) -> str:
+            return rescue_server.REPAIR_SOCKET
+
+        def getsockopt(
+            self, level: int, option: int, _size: int | None = None
+        ) -> int | bytes:
+            if level != socket.SOL_SOCKET:
+                raise OSError
+            if option == socket.SO_TYPE:
+                return socket.SOCK_SEQPACKET
+            if option == socket.SO_PEERCRED:
+                return rescue_server.struct.pack("3i", 1, 0, 0)
+            raise OSError
+
+        def close(self) -> None:
+            self.closed = True
+
+    def test_closed_request_contract_rejects_client_selected_material(self) -> None:
+        target = {
+            "scanFingerprint": "scan:" + "1" * 64,
+            "targetFingerprint": "sha256:" + "2" * 64,
+            "targetId": "target:" + "3" * 64,
+        }
+        prepare = {
+            **self.STATUS,
+            "operation": "repair.fstab.prepare",
+            "target": target,
+        }
+        approve = {
+            **self.STATUS,
+            "operation": "repair.fstab.approve",
+            "preparedId": "Q-" + "4" * 32,
+            "sessionId": "S-" + "5" * 32,
+            "planId": "P-" + "6" * 32,
+            "planHash": "sha256:" + "7" * 64,
+            "approvalId": "A-" + "8" * 32,
+            "approvalSequence": 1,
+            "typedConfirmation": "DISABILITA VOCE FSTAB",
+        }
+        cancel = {
+            **self.STATUS,
+            "operation": "repair.fstab.cancel",
+            "preparedId": approve["preparedId"],
+            "planHash": approve["planHash"],
+        }
+        for request in (self.STATUS, prepare, approve, cancel):
+            rescue_server._validate_repair_request(request)
+
+        for malformed in (
+            {**prepare, "path": "/etc/fstab"},
+            {**prepare, "bytes": "replacement"},
+            {**approve, "typedConfirmation": "disabilita voce fstab"},
+            {**approve, "approvalSequence": True},
+        ):
+            with self.assertRaisesRegex(
+                rescue_server.RepairRelayError, "invalid-request"
+            ):
+                rescue_server._validate_repair_request(malformed)
+
+    def test_response_contract_accepts_only_bounded_prepared_and_terminal_data(
+        self,
+    ) -> None:
+        rescue_server._validate_repair_response(self.IDLE, self.STATUS)
+        prepared = {
+            **self.STATUS,
+            "outcome": "ok",
+            "stateVersion": 2,
+            "state": "prepared",
+            "detail": {
+                "kind": "fstab-prepared",
+                "preparedId": "Q-" + "1" * 32,
+                "sessionId": "S-" + "2" * 32,
+                "planId": "P-" + "3" * 32,
+                "planHash": "sha256:" + "4" * 64,
+                "targetFingerprint": "sha256:" + "5" * 64,
+                "beforeSha256": "sha256:" + "6" * 64,
+                "afterSha256": "sha256:" + "7" * 64,
+                "diffSha256": "sha256:" + "8" * 64,
+                "actionId": "linux.fstab.disable-missing-uuid.v1",
+                "risk": "R2",
+                "backup": {"state": "reserved", "vaultDistinct": True},
+                "nextApprovalSequence": 1,
+                "confirmationRequired": "DISABILITA VOCE FSTAB",
+            },
+        }
+        rescue_server._validate_repair_response(prepared, self.STATUS)
+        terminal = {
+            **self.STATUS,
+            "outcome": "ok",
+            "stateVersion": 3,
+            "state": "restored",
+            "detail": {
+                "kind": "terminal",
+                "terminalOutcome": "closed-before-restored",
+                "reservationId": "B-exact-backup",
+                "transactionBindingSha256": "sha256:" + "9" * 64,
+                "rebootRequired": False,
+            },
+        }
+        rescue_server._validate_repair_response(terminal, self.STATUS)
+        with self.assertRaisesRegex(
+            rescue_server.RepairRelayError, "invalid-response"
+        ):
+            rescue_server._validate_repair_response(
+                {**prepared, "detail": {**prepared["detail"], "path": "/dev/sda"}},
+                self.STATUS,
+            )
+
+    def test_relay_authenticates_systemd_socket_and_releases_its_lock(self) -> None:
+        repair_socket = self.FakeRepairSocket(self.IDLE)
+        with (
+            patch.object(rescue_server.socket, "socket", return_value=repair_socket),
+            patch.object(rescue_server.time, "monotonic", return_value=100.0),
+        ):
+            response = rescue_server.relay_repair_request(self.STATUS, 108.0)
+        self.assertEqual(response, self.IDLE)
+        self.assertEqual(repair_socket.connected, [rescue_server.REPAIR_SOCKET])
+        self.assertEqual(
+            repair_socket.sent,
+            [
+                json.dumps(
+                    self.STATUS,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("ascii")
+            ],
+        )
+        self.assertTrue(repair_socket.closed)
+        self.assertTrue(rescue_server.REPAIR_RELAY_LOCK.acquire(blocking=False))
+        rescue_server.REPAIR_RELAY_LOCK.release()
+
+
 class ProviderRelayTests(unittest.TestCase):
     REQUEST = (
         b'{"apiVersion":"kernaid.dev/rescue-openai/v1alpha1",'

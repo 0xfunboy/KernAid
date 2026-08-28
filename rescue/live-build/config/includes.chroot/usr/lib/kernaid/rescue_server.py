@@ -68,6 +68,51 @@ PROVIDER_SOCKET_TIMEOUT_SECONDS = 140
 PROVIDER_SOCKET = "/run/kernaid-rescue-openai.sock"
 MAX_PROVIDER_REQUEST_FRAME_BYTES = 96 * 1024
 MAX_PROVIDER_RESPONSE_FRAME_BYTES = 64 * 1024
+REPAIR_API_VERSION = "kernaid.dev/rescue-repair-service/v1alpha1"
+REPAIR_SOCKET = "/run/kernaid-rescue-repair.sock"
+REPAIR_CANDIDATE_MARKER = "/usr/lib/kernaid/repair-candidate-image-v1"
+MAX_REPAIR_FRAME_BYTES = 4 * 1024
+REPAIR_REQUEST_DEADLINE_SECONDS = 8
+REPAIR_REQUEST_ID = re.compile(
+    r"^R-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+    r"[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+REPAIR_OPAQUE_ID = re.compile(r"^[QSPA]-[0-9a-f]{32}$")
+REPAIR_SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
+REPAIR_SCAN_FINGERPRINT = re.compile(r"^scan:[0-9a-f]{64}$")
+REPAIR_TARGET_ID = re.compile(r"^target:[0-9a-f]{64}$")
+REPAIR_RESERVATION_ID = re.compile(r"^B-[A-Za-z0-9-]{1,126}$")
+REPAIR_OPERATIONS = {
+    "repair.status",
+    "repair.fstab.prepare",
+    "repair.fstab.approve",
+    "repair.fstab.cancel",
+}
+REPAIR_STATES = {
+    "idle",
+    "preparing",
+    "prepared",
+    "executing",
+    "succeeded",
+    "restored",
+    "cancelled",
+    "manual-reconciliation-required",
+    "failed",
+}
+REPAIR_ERROR_TOKENS = {
+    "invalid-request",
+    "unauthorized",
+    "busy",
+    "state-conflict",
+    "binding-mismatch",
+    "approval-rejected",
+    "prepare-failed",
+    "cancel-failed",
+    "execution-failed",
+    "recovery-unavailable",
+    "internal",
+}
+REPAIR_RELAY_LOCK = threading.Lock()
 APPLICATION_HTTP_API_VERSION = "kernaid.dev/rescue-application-http/v1alpha1"
 APPLICATION_RELAY_API_VERSION = "kernaid.dev/rescue-application-relay/v1alpha1"
 APPLICATION_RELAY_SOCKET = "/run/kernaid-rescue-application.sock"
@@ -320,6 +365,15 @@ class PrivilegedHelperError(Exception):
 
 class ProviderRelayError(Exception):
     """A closed local-provider transport failure without peer detail."""
+
+    def __init__(self, code: str, status: int) -> None:
+        super().__init__(code)
+        self.code = code
+        self.status = status
+
+
+class RepairRelayError(Exception):
+    """A fixed candidate-repair relay failure safe for the local UI."""
 
     def __init__(self, code: str, status: int) -> None:
         super().__init__(code)
@@ -892,6 +946,322 @@ def relay_openai_provider(frame: bytes, deadline: float) -> bytes:
                     pass
         finally:
             PROVIDER_RELAY_LOCK.release()
+
+
+def _repair_candidate_available() -> bool:
+    try:
+        marker = os.stat(REPAIR_CANDIDATE_MARKER, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise RepairRelayError("relay-unavailable", 503) from error
+    if (
+        not stat.S_ISREG(marker.st_mode)
+        or marker.st_uid != 0
+        or marker.st_gid != 0
+        or marker.st_nlink != 1
+        or marker.st_mode & 0o022 != 0
+    ):
+        raise RepairRelayError("relay-unavailable", 503)
+    return True
+
+
+def _repair_id(value: object, prefix: str) -> bool:
+    return (
+        isinstance(value, str)
+        and value.startswith(f"{prefix}-")
+        and REPAIR_OPAQUE_ID.fullmatch(value) is not None
+    )
+
+
+def _validate_repair_request(value: dict[str, object]) -> None:
+    operation = value.get("operation")
+    if (
+        value.get("apiVersion") != REPAIR_API_VERSION
+        or not isinstance(value.get("requestId"), str)
+        or REPAIR_REQUEST_ID.fullmatch(str(value["requestId"])) is None
+        or not isinstance(operation, str)
+        or operation not in REPAIR_OPERATIONS
+    ):
+        raise RepairRelayError("invalid-request", 400)
+    if operation == "repair.status":
+        if set(value) != {"apiVersion", "requestId", "operation"}:
+            raise RepairRelayError("invalid-request", 400)
+        return
+    if operation == "repair.fstab.prepare":
+        if set(value) != {"apiVersion", "requestId", "operation", "target"}:
+            raise RepairRelayError("invalid-request", 400)
+        target = value.get("target")
+        if (
+            not isinstance(target, dict)
+            or set(target)
+            != {"scanFingerprint", "targetFingerprint", "targetId"}
+            or not isinstance(target.get("scanFingerprint"), str)
+            or REPAIR_SCAN_FINGERPRINT.fullmatch(
+                str(target["scanFingerprint"])
+            )
+            is None
+            or not isinstance(target.get("targetFingerprint"), str)
+            or REPAIR_SHA256.fullmatch(str(target["targetFingerprint"])) is None
+            or not isinstance(target.get("targetId"), str)
+            or REPAIR_TARGET_ID.fullmatch(str(target["targetId"])) is None
+        ):
+            raise RepairRelayError("invalid-request", 400)
+        return
+    if operation == "repair.fstab.cancel":
+        if (
+            set(value)
+            != {"apiVersion", "requestId", "operation", "preparedId", "planHash"}
+            or not _repair_id(value.get("preparedId"), "Q")
+            or not isinstance(value.get("planHash"), str)
+            or REPAIR_SHA256.fullmatch(str(value["planHash"])) is None
+        ):
+            raise RepairRelayError("invalid-request", 400)
+        return
+    if (
+        set(value)
+        != {
+            "apiVersion",
+            "requestId",
+            "operation",
+            "preparedId",
+            "sessionId",
+            "planId",
+            "planHash",
+            "approvalId",
+            "approvalSequence",
+            "typedConfirmation",
+        }
+        or not _repair_id(value.get("preparedId"), "Q")
+        or not _repair_id(value.get("sessionId"), "S")
+        or not _repair_id(value.get("planId"), "P")
+        or not _repair_id(value.get("approvalId"), "A")
+        or not isinstance(value.get("planHash"), str)
+        or REPAIR_SHA256.fullmatch(str(value["planHash"])) is None
+        or not isinstance(value.get("approvalSequence"), int)
+        or isinstance(value.get("approvalSequence"), bool)
+        or not 1 <= int(value["approvalSequence"]) <= MAX_AUDIT_SEQUENCE
+        or value.get("typedConfirmation") != "DISABILITA VOCE FSTAB"
+    ):
+        raise RepairRelayError("invalid-request", 400)
+
+
+def _validate_repair_prepared_detail(value: object) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+        "kind",
+        "preparedId",
+        "sessionId",
+        "planId",
+        "planHash",
+        "targetFingerprint",
+        "beforeSha256",
+        "afterSha256",
+        "diffSha256",
+        "actionId",
+        "risk",
+        "backup",
+        "nextApprovalSequence",
+        "confirmationRequired",
+    }:
+        return False
+    backup = value.get("backup")
+    return (
+        value.get("kind") == "fstab-prepared"
+        and _repair_id(value.get("preparedId"), "Q")
+        and _repair_id(value.get("sessionId"), "S")
+        and _repair_id(value.get("planId"), "P")
+        and all(
+            isinstance(value.get(field), str)
+            and REPAIR_SHA256.fullmatch(str(value[field])) is not None
+            for field in (
+                "planHash",
+                "targetFingerprint",
+                "beforeSha256",
+                "afterSha256",
+                "diffSha256",
+            )
+        )
+        and value.get("beforeSha256") != value.get("afterSha256")
+        and value.get("actionId") == "linux.fstab.disable-missing-uuid.v1"
+        and value.get("risk") == "R2"
+        and isinstance(backup, dict)
+        and set(backup) == {"state", "vaultDistinct"}
+        and backup.get("state") == "reserved"
+        and backup.get("vaultDistinct") is True
+        and isinstance(value.get("nextApprovalSequence"), int)
+        and not isinstance(value.get("nextApprovalSequence"), bool)
+        and 1 <= int(value["nextApprovalSequence"]) <= MAX_AUDIT_SEQUENCE
+        and value.get("confirmationRequired") == "DISABILITA VOCE FSTAB"
+    )
+
+
+def _validate_repair_terminal_detail(value: object, state: str) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+        "kind",
+        "terminalOutcome",
+        "reservationId",
+        "transactionBindingSha256",
+        "rebootRequired",
+    }:
+        return False
+    outcome = value.get("terminalOutcome")
+    expected: dict[str, set[str]] = {
+        "succeeded": {"committed"},
+        "restored": {"closed-before-unchanged", "closed-before-restored"},
+        "cancelled": {"cancelled"},
+        "manual-reconciliation-required": {"manual-reconciliation-required"},
+        "failed": {"failed"},
+    }
+    reservation = value.get("reservationId")
+    binding = value.get("transactionBindingSha256")
+    return (
+        value.get("kind") == "terminal"
+        and isinstance(outcome, str)
+        and outcome in expected.get(state, set())
+        and (
+            reservation is None
+            or isinstance(reservation, str)
+            and REPAIR_RESERVATION_ID.fullmatch(reservation) is not None
+        )
+        and (
+            binding is None
+            or isinstance(binding, str)
+            and REPAIR_SHA256.fullmatch(binding) is not None
+        )
+        and isinstance(value.get("rebootRequired"), bool)
+        and (
+            state != "manual-reconciliation-required"
+            or value.get("rebootRequired") is True
+        )
+    )
+
+
+def _validate_repair_response(
+    value: dict[str, object], request: dict[str, object]
+) -> None:
+    outcome = value.get("outcome")
+    state = value.get("state")
+    expected_fields = {
+        "apiVersion",
+        "requestId",
+        "operation",
+        "outcome",
+        "stateVersion",
+        "state",
+        "detail",
+    }
+    if outcome == "error":
+        expected_fields.add("error")
+    if (
+        set(value) != expected_fields
+        or value.get("apiVersion") != REPAIR_API_VERSION
+        or value.get("requestId") != request.get("requestId")
+        or value.get("operation") != request.get("operation")
+        or outcome not in {"ok", "error"}
+        or not isinstance(value.get("stateVersion"), int)
+        or isinstance(value.get("stateVersion"), bool)
+        or not 1 <= int(value["stateVersion"]) <= MAX_STATE_VERSION
+        or not isinstance(state, str)
+        or state not in REPAIR_STATES
+        or (
+            outcome == "error"
+            and (
+                not isinstance(value.get("error"), str)
+                or value.get("error") not in REPAIR_ERROR_TOKENS
+            )
+        )
+    ):
+        raise RepairRelayError("invalid-response", 502)
+    detail = value.get("detail")
+    if state == "prepared":
+        valid_detail = _validate_repair_prepared_detail(detail)
+    elif state in {
+        "succeeded",
+        "restored",
+        "cancelled",
+        "manual-reconciliation-required",
+        "failed",
+    }:
+        valid_detail = _validate_repair_terminal_detail(detail, state)
+    else:
+        valid_detail = detail is None
+    if not valid_detail:
+        raise RepairRelayError("invalid-response", 502)
+
+
+def _validate_root_repair_peer(connection: socket.socket) -> None:
+    try:
+        peer = connection.getpeername()
+        socket_type = connection.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE)
+        credentials = connection.getsockopt(
+            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
+        )
+        pid, uid, gid = struct.unpack("3i", credentials)
+    except (OSError, struct.error) as error:
+        raise RepairRelayError("relay-unavailable", 503) from error
+    if (
+        connection.family != socket.AF_UNIX
+        or socket_type != socket.SOCK_SEQPACKET
+        or peer != REPAIR_SOCKET
+        or pid != 1
+        or uid != 0
+        or gid != 0
+    ):
+        raise RepairRelayError("relay-unavailable", 503)
+
+
+def relay_repair_request(
+    request: dict[str, object], deadline: float
+) -> dict[str, object]:
+    _validate_repair_request(request)
+    frame = json.dumps(
+        request, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    ).encode("ascii")
+    if len(frame) > MAX_REPAIR_FRAME_BYTES:
+        raise RepairRelayError("invalid-request", 413)
+    if not REPAIR_RELAY_LOCK.acquire(blocking=False):
+        raise RepairRelayError("busy", 429)
+    connection: socket.socket | None = None
+    try:
+        connection = socket.socket(
+            socket.AF_UNIX, socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC
+        )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RepairRelayError("timeout", 504)
+        connection.settimeout(remaining)
+        connection.connect(REPAIR_SOCKET)
+        _validate_root_repair_peer(connection)
+        if connection.send(frame) != len(frame):
+            raise RepairRelayError("relay-unavailable", 503)
+        response_bytes, ancillary, flags, _address = connection.recvmsg(
+            MAX_REPAIR_FRAME_BYTES + 1, 0
+        )
+        if (
+            ancillary
+            or not response_bytes
+            or len(response_bytes) > MAX_REPAIR_FRAME_BYTES
+            or flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC)
+        ):
+            raise RepairRelayError("invalid-response", 502)
+        try:
+            response = _strict_json_object(
+                response_bytes, MAX_REPAIR_FRAME_BYTES
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+            raise RepairRelayError("invalid-response", 502) from error
+        _validate_repair_response(response, request)
+        return response
+    except socket.timeout as error:
+        raise RepairRelayError("timeout", 504) from error
+    except RepairRelayError:
+        raise
+    except OSError as error:
+        raise RepairRelayError("relay-unavailable", 503) from error
+    finally:
+        if connection is not None:
+            connection.close()
+        REPAIR_RELAY_LOCK.release()
 
 
 def _remaining_seconds(deadline: float | None) -> float | None:
@@ -2524,6 +2894,126 @@ class RescueHandler(SimpleHTTPRequestHandler):
         }
         self._send_application_json(error.status, body)
 
+    def _send_repair_json(self, status: int, value: dict[str, object]) -> None:
+        body = json.dumps(
+            value, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+        ).encode("ascii")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        if status == 429:
+            self.send_header("Retry-After", "1")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_repair_failure(self, error: RepairRelayError) -> None:
+        self._send_repair_json(
+            error.status,
+            {
+                "apiVersion": REPAIR_API_VERSION,
+                "outcome": "error",
+                "error": error.code,
+            },
+        )
+
+    def _repair_post_headers(self) -> bool:
+        hosts = self.headers.get_all("Host", [])
+        origins = self.headers.get_all("Origin", [])
+        fetch_sites = self.headers.get_all("Sec-Fetch-Site", [])
+        if len(hosts) != 1 or hosts[0] not in ALLOWED_HOSTS:
+            self.send_error(421)
+            return False
+        if (
+            len(origins) != 1
+            or origins[0] not in ALLOWED_ORIGINS
+            or origins[0] != f"http://{hosts[0]}"
+        ):
+            self.send_error(403)
+            return False
+        if len(fetch_sites) > 1 or (
+            fetch_sites and fetch_sites[0] not in {"none", "same-origin"}
+        ):
+            self.send_error(403)
+            return False
+        if self.headers.get_all("Transfer-Encoding") or self.headers.get_all(
+            "Content-Encoding"
+        ):
+            self._send_repair_failure(
+                RepairRelayError("invalid-request", 400)
+            )
+            return False
+        if self.headers.get_all("Content-Type", []) != ["application/json"]:
+            self._send_repair_failure(
+                RepairRelayError("invalid-request", 415)
+            )
+            return False
+        return True
+
+    def _repair_post_body(self) -> dict[str, object]:
+        lengths = self.headers.get_all("Content-Length", [])
+        if (
+            len(lengths) != 1
+            or not lengths[0].isascii()
+            or not lengths[0].isdigit()
+        ):
+            raise RepairRelayError("invalid-request", 400)
+        length = int(lengths[0])
+        if not 2 <= length <= MAX_REPAIR_FRAME_BYTES:
+            raise RepairRelayError(
+                "invalid-request", 413 if length > MAX_REPAIR_FRAME_BYTES else 400
+            )
+        encoded = self.rfile.read(length)
+        if len(encoded) != length:
+            raise RepairRelayError("invalid-request", 400)
+        try:
+            return _strict_json_object(encoded, MAX_REPAIR_FRAME_BYTES)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+            raise RepairRelayError("invalid-request", 400) from error
+
+    def _handle_repair_post(self) -> bool:
+        if self.path != "/api/rescue/repair":
+            return False
+        if not self.local_authority():
+            self.send_error(421)
+            return True
+        try:
+            if not _repair_candidate_available():
+                self.send_error(404)
+                return True
+        except RepairRelayError as error:
+            self._send_repair_failure(error)
+            return True
+        if not self._repair_post_headers():
+            return True
+        try:
+            request = self._repair_post_body()
+            response = relay_repair_request(
+                request,
+                time.monotonic() + REPAIR_REQUEST_DEADLINE_SECONDS,
+            )
+            status = 200
+            if response.get("outcome") == "error":
+                error = response.get("error")
+                if error == "invalid-request":
+                    status = 400
+                elif error == "unauthorized":
+                    status = 403
+                elif error == "busy":
+                    status = 429
+                elif error in {
+                    "state-conflict",
+                    "binding-mismatch",
+                    "approval-rejected",
+                }:
+                    status = 409
+                else:
+                    status = 503
+            self._send_repair_json(status, response)
+        except RepairRelayError as error:
+            self._send_repair_failure(error)
+        return True
+
     def _application_post_headers(self) -> bool:
         hosts = self.headers.get_all("Host", [])
         origins = self.headers.get_all("Origin", [])
@@ -2886,6 +3376,8 @@ class RescueHandler(SimpleHTTPRequestHandler):
 
     def do_POST(self) -> None:
         if self._handle_application_post():
+            return
+        if self._handle_repair_post():
             return
         authorization_deadline = (
             self.authorization_deadline
