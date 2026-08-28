@@ -8,7 +8,9 @@
 #[cfg(feature = "experimental-repair-store")]
 use crate::rescue_repair_vault::{
     MAX_REPAIR_BACKUP_BYTES, RepairBackupBinding, RepairBackupDraft, RepairBackupReleasePayload,
-    RepairBackupState, RepairBackupStatusPayload, RepairFileMetadataV1, RepairReservationId,
+    RepairBackupState, RepairBackupStatusPayload, RepairExecutionIntentV1, RepairFileMetadataV1,
+    RepairReservationId, RepairTransactionResolution, RepairTransactionStatusPayload,
+    RepairTransactionStatusResultPayload, RepairTransactionStatusSelector,
 };
 use crate::rescue_vault_transport::{
     SeqpacketSocketIdentity, SeqpacketTransportError, ensure_deadline, recv_seqpacket,
@@ -505,6 +507,12 @@ pub enum Operation {
     #[cfg(feature = "experimental-repair-store")]
     #[serde(rename = "repair.backup.retire")]
     RepairBackupRetire,
+    #[cfg(feature = "experimental-repair-store")]
+    #[serde(rename = "repair.transaction.status")]
+    RepairTransactionStatus,
+    #[cfg(feature = "experimental-repair-store")]
+    #[serde(rename = "repair.transaction.resolve")]
+    RepairTransactionResolve,
 }
 
 impl Operation {
@@ -546,6 +554,8 @@ impl Operation {
                     | Self::RepairBackupGet
                     | Self::RepairBackupCancel
                     | Self::RepairBackupRetire
+                    | Self::RepairTransactionStatus
+                    | Self::RepairTransactionResolve
             ),
         }
     }
@@ -781,6 +791,15 @@ pub enum RequestPayload {
     #[cfg(feature = "experimental-repair-store")]
     RepairBackupRetire {
         expected: Box<RepairBackupStatusPayload>,
+    },
+    #[cfg(feature = "experimental-repair-store")]
+    RepairTransactionStatus {
+        selector: RepairTransactionStatusSelector,
+    },
+    #[cfg(feature = "experimental-repair-store")]
+    RepairTransactionResolve {
+        expected: Box<RepairTransactionStatusPayload>,
+        resolution: RepairTransactionResolution,
     },
 }
 
@@ -1104,6 +1123,7 @@ struct RepairBackupPersistPayload {
     approval_sha256: String,
     resource_id: String,
     resource_sha256: String,
+    execution_intent: RepairExecutionIntentV1,
     input: DescriptorDeclaration,
 }
 
@@ -1120,6 +1140,21 @@ struct RepairBackupReferencePayload {
 struct RepairBackupCancelPayload {
     reservation_id: String,
     draft_binding_sha256: String,
+}
+
+#[cfg(feature = "experimental-repair-store")]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RepairTransactionStatusRequestPayload {
+    selector: RepairTransactionStatusSelector,
+}
+
+#[cfg(feature = "experimental-repair-store")]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RepairTransactionResolveRequestPayload {
+    expected: RepairTransactionStatusPayload,
+    resolution: RepairTransactionResolution,
 }
 
 /// Decodes and authorizes one complete request packet for an already-bound
@@ -1351,8 +1386,16 @@ fn parse_payload(
                 .map_err(|_| ProtocolViolation::InvalidPayload)?;
             payload.expected.validate()?;
             payload.metadata.validate()?;
+            payload.execution_intent.validate()?;
             if payload.expected.state() != RepairBackupState::Reserved
                 || payload.metadata.canonical_sha256() != *payload.expected.metadata_sha256()
+                || payload.execution_intent.before_sha256()
+                    != payload.expected.expected_backup_sha256()
+                || payload.execution_intent.before_metadata() != &payload.metadata
+                || payload
+                    .execution_intent
+                    .target_physical_parent_fingerprint()
+                    == payload.expected.physical_parent_fingerprint()
             {
                 return Err(ProtocolViolation::InvalidPayload);
             }
@@ -1371,6 +1414,7 @@ fn parse_payload(
                     Sha256::parse(&payload.approval_sha256)?,
                     payload.resource_id,
                     Sha256::parse(&payload.resource_sha256)?,
+                    payload.execution_intent,
                 )?,
                 metadata: payload.metadata,
                 input: payload.input,
@@ -1411,6 +1455,32 @@ fn parse_payload(
             Ok(RequestPayload::RepairBackupCancel {
                 reservation_id: RepairReservationId::parse(&payload.reservation_id)?,
                 draft_binding_sha256: Sha256::parse(&payload.draft_binding_sha256)?,
+            })
+        }
+        #[cfg(feature = "experimental-repair-store")]
+        Operation::RepairTransactionStatus => {
+            let payload = serde_json::from_str::<RepairTransactionStatusRequestPayload>(raw.get())
+                .map_err(|_| ProtocolViolation::InvalidPayload)?;
+            payload.selector.validate()?;
+            Ok(RequestPayload::RepairTransactionStatus {
+                selector: payload.selector,
+            })
+        }
+        #[cfg(feature = "experimental-repair-store")]
+        Operation::RepairTransactionResolve => {
+            let payload = serde_json::from_str::<RepairTransactionResolveRequestPayload>(raw.get())
+                .map_err(|_| ProtocolViolation::InvalidPayload)?;
+            payload.expected.validate()?;
+            let Some(intent) = payload.expected.backup().execution_intent() else {
+                return Err(ProtocolViolation::InvalidPayload);
+            };
+            payload.resolution.validate_against(intent)?;
+            if !payload.expected.is_unresolved() {
+                return Err(ProtocolViolation::InvalidPayload);
+            }
+            Ok(RequestPayload::RepairTransactionResolve {
+                expected: Box::new(payload.expected),
+                resolution: payload.resolution,
             })
         }
     }
@@ -1483,7 +1553,9 @@ fn payload_descriptor(payload: &RequestPayload) -> Option<&DescriptorDeclaration
         | RequestPayload::RepairBackupStatus { .. }
         | RequestPayload::RepairBackupGet { .. }
         | RequestPayload::RepairBackupCancel { .. }
-        | RequestPayload::RepairBackupRetire { .. } => None,
+        | RequestPayload::RepairBackupRetire { .. }
+        | RequestPayload::RepairTransactionStatus { .. }
+        | RequestPayload::RepairTransactionResolve { .. } => None,
     }
 }
 
@@ -1796,6 +1868,10 @@ pub enum SuccessPayload {
     RepairBackup(Box<RepairBackupStatusPayload>, DescriptorDeclaration),
     #[cfg(feature = "experimental-repair-store")]
     RepairBackupReleased(RepairBackupReleasePayload),
+    #[cfg(feature = "experimental-repair-store")]
+    RepairTransactionStatus(Box<RepairTransactionStatusResultPayload>),
+    #[cfg(feature = "experimental-repair-store")]
+    RepairTransactionResolved(Box<RepairTransactionStatusPayload>),
 }
 
 #[derive(Serialize)]
@@ -1955,6 +2031,24 @@ fn encode_success(
             operation,
             outcome: "ok",
             payload: released,
+        }),
+        #[cfg(feature = "experimental-repair-store")]
+        SuccessPayload::RepairTransactionStatus(status) => serde_json::to_vec(&SuccessWire {
+            api_version: API_VERSION,
+            request_id,
+            state_version,
+            operation,
+            outcome: "ok",
+            payload: status,
+        }),
+        #[cfg(feature = "experimental-repair-store")]
+        SuccessPayload::RepairTransactionResolved(status) => serde_json::to_vec(&SuccessWire {
+            api_version: API_VERSION,
+            request_id,
+            state_version,
+            operation,
+            outcome: "ok",
+            payload: status,
         }),
     }
     .map_err(|_| ProtocolViolation::InvalidPayload)?;
@@ -2153,7 +2247,8 @@ fn validate_success(
             && status.approval_id() == Some(binding.approval_id())
             && status.approval_sha256() == Some(binding.approval_sha256())
             && status.resource_id() == Some(binding.resource_id())
-            && status.resource_sha256() == Some(binding.resource_sha256()) =>
+            && status.resource_sha256() == Some(binding.resource_sha256())
+            && status.execution_intent() == Some(binding.execution_intent()) =>
         {
             None
         }
@@ -2205,6 +2300,26 @@ fn validate_success(
             && released.reservation_id() == expected.reservation_id()
             && released.draft_binding_sha256() == expected.draft_binding_sha256()
             && released.released_bytes() == expected.reserved_bytes() =>
+        {
+            None
+        }
+        #[cfg(feature = "experimental-repair-store")]
+        (
+            Operation::RepairTransactionStatus,
+            RequestPayload::RepairTransactionStatus { selector },
+            SuccessPayload::RepairTransactionStatus(result),
+        ) if selector.matches_result(result) => None,
+        #[cfg(feature = "experimental-repair-store")]
+        (
+            Operation::RepairTransactionResolve,
+            RequestPayload::RepairTransactionResolve {
+                expected,
+                resolution,
+            },
+            SuccessPayload::RepairTransactionResolved(status),
+        ) if status.validate().is_ok()
+            && status.same_transaction(expected)
+            && status.resolves_with(resolution) =>
         {
             None
         }
@@ -2724,10 +2839,13 @@ mod tests {
 
     #[cfg(feature = "experimental-repair-store")]
     #[test]
-    fn repair_broker_role_and_six_operations_are_closed_and_path_free() {
+    fn repair_broker_role_and_eight_operations_are_closed_and_path_free() {
         use crate::rescue_repair_vault::{
             RepairBackupBinding, RepairBackupReleasePayload, RepairBackupStatusPayload,
-            RepairFileMetadataV1, RepairReservationId, repair_backup_output,
+            RepairExecutionIntentV1, RepairFileMetadataV1, RepairReservationId,
+            RepairTransactionResolution, RepairTransactionResolutionOutcome,
+            RepairTransactionStatusPayload, RepairTransactionStatusResultPayload,
+            repair_backup_output,
         };
 
         let repair_allowlist = PeerAllowlist::builder(COMPANION_UID)
@@ -2824,13 +2942,29 @@ mod tests {
             ),
             Err(ProtocolViolation::InvalidPayload)
         );
+        let execution_intent = RepairExecutionIntentV1::new(
+            "S-session-1",
+            7,
+            "target-1",
+            format!("scan:{}", hash('a')),
+            Sha256::parse(&hash('1')).expect("hash"),
+            Sha256::parse(&hash('7')).expect("hash"),
+            format!("lock:{}", hash('b')),
+            Sha256::parse(&hash('2')).expect("hash"),
+            Sha256::parse(&hash('c')).expect("hash"),
+            Sha256::parse(&hash('d')).expect("hash"),
+            Sha256::parse(&hash('e')).expect("hash"),
+            metadata.clone(),
+        )
+        .expect("execution intent");
         let binding = RepairBackupBinding::new(
             "P-plan-1",
             Sha256::parse(&hash('4')).expect("hash"),
             "A-approval-1",
             Sha256::parse(&hash('5')).expect("hash"),
             "rescue:selected-linux-root:etc/fstab",
-            Sha256::parse(&hash('6')).expect("hash"),
+            Sha256::parse(&hash('2')).expect("hash"),
+            execution_intent.clone(),
         )
         .expect("binding");
         let durable = RepairBackupStatusPayload::durable(
@@ -2851,12 +2985,13 @@ mod tests {
         let persist = request(
             "repair.backup.persist",
             &format!(
-                "{{\"expected\":{},\"metadata\":{},\"planId\":\"P-plan-1\",\"planSha256\":\"{}\",\"approvalId\":\"A-approval-1\",\"approvalSha256\":\"{}\",\"resourceId\":\"rescue:selected-linux-root:etc/fstab\",\"resourceSha256\":\"{}\",\"input\":{{\"type\":\"repair-backup-input-pipe\",\"size\":4096}}}}",
+                "{{\"expected\":{},\"metadata\":{},\"planId\":\"P-plan-1\",\"planSha256\":\"{}\",\"approvalId\":\"A-approval-1\",\"approvalSha256\":\"{}\",\"resourceId\":\"rescue:selected-linux-root:etc/fstab\",\"resourceSha256\":\"{}\",\"executionIntent\":{},\"input\":{{\"type\":\"repair-backup-input-pipe\",\"size\":4096}}}}",
                 serde_json::to_string(&reserved).expect("reserved JSON"),
                 serde_json::to_string(&metadata).expect("metadata JSON"),
                 hash('4'),
                 hash('5'),
-                hash('6')
+                hash('2'),
+                serde_json::to_string(&execution_intent).expect("intent JSON")
             ),
         );
         let input = read_pipe();
@@ -2950,6 +3085,61 @@ mod tests {
                 &retire,
                 13,
                 &SuccessPayload::RepairBackupReleased(released),
+                &[],
+            )
+            .is_ok()
+        );
+
+        let pending =
+            RepairTransactionStatusPayload::pending(durable.clone()).expect("pending transaction");
+        let transaction_status_bytes = request(
+            "repair.transaction.status",
+            "{\"selector\":{\"kind\":\"pending-singleton\"}}",
+        );
+        assert_eq!(
+            decode_request(&transaction_status_bytes, peer(COMPANION_UID), Vec::new(),).err(),
+            Some(ProtocolViolation::NotAuthorized)
+        );
+        let transaction_status =
+            decode_request(&transaction_status_bytes, repair_peer(), Vec::new())
+                .expect("pending transaction lookup");
+        assert!(
+            encode_success(
+                &transaction_status,
+                13,
+                &SuccessPayload::RepairTransactionStatus(Box::new(
+                    RepairTransactionStatusResultPayload::found(pending.clone()),
+                )),
+                &[],
+            )
+            .is_ok()
+        );
+
+        let resolution = RepairTransactionResolution::new(
+            RepairTransactionResolutionOutcome::CommittedAfter,
+            execution_intent.after_sha256().clone(),
+            metadata.canonical_sha256(),
+            true,
+            &execution_intent,
+        )
+        .expect("committed resolution");
+        let resolve = request(
+            "repair.transaction.resolve",
+            &serde_json::json!({
+                "expected": pending,
+                "resolution": resolution,
+            })
+            .to_string(),
+        );
+        let resolve = decode_request(&resolve, repair_peer(), Vec::new())
+            .expect("transaction resolution request");
+        let resolved = RepairTransactionStatusPayload::resolved(durable, resolution)
+            .expect("resolved transaction");
+        assert!(
+            encode_success(
+                &resolve,
+                15,
+                &SuccessPayload::RepairTransactionResolved(Box::new(resolved)),
                 &[],
             )
             .is_ok()

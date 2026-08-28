@@ -16,7 +16,9 @@
 #[cfg(feature = "experimental-repair-store")]
 use crate::rescue_repair_vault::{
     MAX_REPAIR_BACKUP_BYTES, RepairBackupBinding, RepairBackupDraft, RepairBackupReleasePayload,
-    RepairBackupState, RepairBackupStatusPayload, RepairFileMetadataV1, RepairReservationId,
+    RepairBackupState, RepairBackupStatusPayload, RepairExecutionIntentV1, RepairFileMetadataV1,
+    RepairReservationId, RepairTransactionResolution, RepairTransactionStatusPayload,
+    RepairTransactionStatusResultPayload, RepairTransactionStatusSelector,
 };
 use crate::rescue_vault::{
     API_VERSION, AuditEventType, AuditOutcome, DescriptorDeclaration, DescriptorType, ErrorToken,
@@ -551,6 +553,15 @@ pub enum ClientRequestPayload {
     RepairBackupRetire {
         expected: Box<RepairBackupStatusPayload>,
     },
+    #[cfg(feature = "experimental-repair-store")]
+    RepairTransactionStatus {
+        selector: RepairTransactionStatusSelector,
+    },
+    #[cfg(feature = "experimental-repair-store")]
+    RepairTransactionResolve {
+        expected: Box<RepairTransactionStatusPayload>,
+        resolution: RepairTransactionResolution,
+    },
 }
 
 impl ClientRequestPayload {
@@ -581,6 +592,10 @@ impl ClientRequestPayload {
             Self::RepairBackupCancel { .. } => Operation::RepairBackupCancel,
             #[cfg(feature = "experimental-repair-store")]
             Self::RepairBackupRetire { .. } => Operation::RepairBackupRetire,
+            #[cfg(feature = "experimental-repair-store")]
+            Self::RepairTransactionStatus { .. } => Operation::RepairTransactionStatus,
+            #[cfg(feature = "experimental-repair-store")]
+            Self::RepairTransactionResolve { .. } => Operation::RepairTransactionResolve,
         }
     }
 
@@ -617,7 +632,9 @@ impl ClientRequestPayload {
             | Self::RepairBackupStatus { .. }
             | Self::RepairBackupGet { .. }
             | Self::RepairBackupCancel { .. }
-            | Self::RepairBackupRetire { .. } => None,
+            | Self::RepairBackupRetire { .. }
+            | Self::RepairTransactionStatus { .. }
+            | Self::RepairTransactionResolve { .. } => None,
         }
     }
 }
@@ -688,15 +705,21 @@ fn valid_client_payload(payload: &ClientRequestPayload) -> bool {
         #[cfg(feature = "experimental-repair-store")]
         ClientRequestPayload::RepairBackupPersist {
             expected,
+            binding,
             metadata,
             input_size,
-            ..
         } => {
             expected.validate().is_ok()
                 && expected.state() == RepairBackupState::Reserved
                 && expected.backup_size() == *input_size
                 && metadata.validate().is_ok()
                 && metadata.canonical_sha256() == *expected.metadata_sha256()
+                && binding.execution_intent().before_sha256() == expected.expected_backup_sha256()
+                && binding.execution_intent().before_metadata() == metadata
+                && binding
+                    .execution_intent()
+                    .target_physical_parent_fingerprint()
+                    != expected.physical_parent_fingerprint()
                 && (1..=MAX_REPAIR_BACKUP_BYTES).contains(input_size)
         }
         ClientRequestPayload::VaultStatus
@@ -720,6 +743,20 @@ fn valid_client_payload(payload: &ClientRequestPayload) -> bool {
         #[cfg(feature = "experimental-repair-store")]
         ClientRequestPayload::RepairBackupRetire { expected } => {
             expected.validate().is_ok() && expected.state() == RepairBackupState::Durable
+        }
+        #[cfg(feature = "experimental-repair-store")]
+        ClientRequestPayload::RepairTransactionStatus { selector } => selector.validate().is_ok(),
+        #[cfg(feature = "experimental-repair-store")]
+        ClientRequestPayload::RepairTransactionResolve {
+            expected,
+            resolution,
+        } => {
+            expected.validate().is_ok()
+                && expected.is_unresolved()
+                && expected
+                    .backup()
+                    .execution_intent()
+                    .is_some_and(|intent| resolution.validate_against(intent).is_ok())
         }
     }
 }
@@ -803,6 +840,7 @@ struct RepairBackupPersistRequestPayload<'a> {
     approval_sha256: &'a Sha256,
     resource_id: &'a str,
     resource_sha256: &'a Sha256,
+    execution_intent: &'a RepairExecutionIntentV1,
     input: &'a DescriptorDeclaration,
 }
 
@@ -819,6 +857,21 @@ struct RepairBackupReferenceRequestPayload<'a> {
 struct RepairBackupCancelRequestPayload<'a> {
     reservation_id: &'a RepairReservationId,
     draft_binding_sha256: &'a Sha256,
+}
+
+#[cfg(feature = "experimental-repair-store")]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RepairTransactionStatusRequestPayload<'a> {
+    selector: &'a RepairTransactionStatusSelector,
+}
+
+#[cfg(feature = "experimental-repair-store")]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RepairTransactionResolveRequestPayload<'a> {
+    expected: &'a RepairTransactionStatusPayload,
+    resolution: &'a RepairTransactionResolution,
 }
 
 /// Encodes a typed client request and validates the exact outgoing descriptor
@@ -926,6 +979,7 @@ pub fn encode_client_request(
                 approval_sha256: binding.approval_sha256(),
                 resource_id: binding.resource_id(),
                 resource_sha256: binding.resource_sha256(),
+                execution_intent: binding.execution_intent(),
                 input: declaration
                     .as_ref()
                     .ok_or(ProtocolViolation::InvalidPayload)?,
@@ -946,6 +1000,24 @@ pub fn encode_client_request(
             RepairBackupCancelRequestPayload {
                 reservation_id,
                 draft_binding_sha256,
+            },
+        ),
+        #[cfg(feature = "experimental-repair-store")]
+        ClientRequestPayload::RepairTransactionStatus { selector } => {
+            encode_client_request_payload(
+                request,
+                RepairTransactionStatusRequestPayload { selector },
+            )
+        }
+        #[cfg(feature = "experimental-repair-store")]
+        ClientRequestPayload::RepairTransactionResolve {
+            expected,
+            resolution,
+        } => encode_client_request_payload(
+            request,
+            RepairTransactionResolveRequestPayload {
+                expected,
+                resolution,
             },
         ),
     }?;
@@ -1302,6 +1374,7 @@ fn validate_success_state_version(
             | ClientRequestPayload::RepairBackupPersist { .. }
             | ClientRequestPayload::RepairBackupCancel { .. }
             | ClientRequestPayload::RepairBackupRetire { .. }
+            | ClientRequestPayload::RepairTransactionResolve { .. }
     );
     #[cfg(not(feature = "experimental-repair-store"))]
     let repair_mutation = false;
@@ -1506,6 +1579,7 @@ fn decode_success_payload(
                 || status.approval_sha256() != Some(binding.approval_sha256())
                 || status.resource_id() != Some(binding.resource_id())
                 || status.resource_sha256() != Some(binding.resource_sha256())
+                || status.execution_intent() != Some(binding.execution_intent())
             {
                 return Err(ClientResponseDecodeError::InvalidPayload);
             }
@@ -1564,6 +1638,30 @@ fn decode_success_payload(
                 return Err(ClientResponseDecodeError::InvalidPayload);
             }
             Ok(SuccessPayload::RepairBackupReleased(released))
+        }
+        #[cfg(feature = "experimental-repair-store")]
+        ClientRequestPayload::RepairTransactionStatus { selector } => {
+            require_no_descriptors(descriptors)?;
+            let result: RepairTransactionStatusResultPayload = decode_payload(raw)?;
+            if !selector.matches_result(&result) {
+                return Err(ClientResponseDecodeError::InvalidPayload);
+            }
+            Ok(SuccessPayload::RepairTransactionStatus(Box::new(result)))
+        }
+        #[cfg(feature = "experimental-repair-store")]
+        ClientRequestPayload::RepairTransactionResolve {
+            expected,
+            resolution,
+        } => {
+            require_no_descriptors(descriptors)?;
+            let status: RepairTransactionStatusPayload = decode_payload(raw)?;
+            if status.validate().is_err()
+                || !status.same_transaction(expected)
+                || !status.resolves_with(resolution)
+            {
+                return Err(ClientResponseDecodeError::InvalidPayload);
+            }
+            Ok(SuccessPayload::RepairTransactionResolved(Box::new(status)))
         }
     }
 }
@@ -2374,7 +2472,10 @@ mod tests {
     fn repair_backup_client_codec_binds_mutations_and_descriptor_direction() {
         use crate::rescue_repair_vault::{
             RepairBackupBinding, RepairBackupDraft, RepairBackupStatusPayload,
-            RepairFileMetadataV1, RepairReservationId,
+            RepairExecutionIntentV1, RepairFileMetadataV1, RepairReservationId,
+            RepairTransactionResolution, RepairTransactionResolutionOutcome,
+            RepairTransactionStatusPayload, RepairTransactionStatusResultPayload,
+            RepairTransactionStatusSelector,
         };
 
         let hash = |byte: char| Sha256::parse(&byte.to_string().repeat(64)).expect("test SHA-256");
@@ -2447,13 +2548,29 @@ mod tests {
             Some(ClientResponseDecodeError::InvalidStateVersion)
         );
 
+        let execution_intent = RepairExecutionIntentV1::new(
+            "S-session-1",
+            7,
+            "target-1",
+            format!("scan:{}", "a".repeat(64)),
+            hash('1'),
+            hash('4'),
+            format!("lock:{}", "b".repeat(64)),
+            hash('2'),
+            hash('c'),
+            hash('d'),
+            hash('e'),
+            metadata.clone(),
+        )
+        .expect("execution intent");
         let binding = RepairBackupBinding::new(
             "P-plan-1",
             hash('7'),
             "A-approval-1",
             hash('8'),
             "rescue:selected-linux-root:etc/fstab",
-            hash('9'),
+            hash('2'),
+            execution_intent.clone(),
         )
         .expect("repair binding");
         let persist = request(ClientRequestPayload::RepairBackupPersist {
@@ -2550,11 +2667,60 @@ mod tests {
         assert!(decode_client_response(&zero_response, Vec::new(), &cancel).is_err());
 
         let retire = request(ClientRequestPayload::RepairBackupRetire {
-            expected: Box::new(durable),
+            expected: Box::new(durable.clone()),
         });
         let retire_response =
             success_response(REQUEST_ID, 9, "repair.backup.retire", &release_json);
         assert!(decode_client_response(&retire_response, Vec::new(), &retire).is_ok());
+
+        let pending =
+            RepairTransactionStatusPayload::pending(durable.clone()).expect("pending transaction");
+        let transaction_status = request(ClientRequestPayload::RepairTransactionStatus {
+            selector: RepairTransactionStatusSelector::pending_singleton(),
+        });
+        let status_json =
+            encode_client_request(&transaction_status, &[]).expect("transaction status request");
+        assert!(
+            String::from_utf8(status_json)
+                .expect("UTF-8 transaction status")
+                .contains("repair.transaction.status")
+        );
+        let status_result = RepairTransactionStatusResultPayload::found(pending.clone());
+        let status_response = success_response(
+            REQUEST_ID,
+            9,
+            "repair.transaction.status",
+            &serde_json::to_string(&status_result).expect("transaction result JSON"),
+        );
+        assert!(decode_client_response(&status_response, Vec::new(), &transaction_status).is_ok());
+
+        let resolution = RepairTransactionResolution::new(
+            RepairTransactionResolutionOutcome::CommittedAfter,
+            execution_intent.after_sha256().clone(),
+            metadata.canonical_sha256(),
+            true,
+            &execution_intent,
+        )
+        .expect("committed resolution");
+        let resolve = request(ClientRequestPayload::RepairTransactionResolve {
+            expected: Box::new(pending),
+            resolution: resolution.clone(),
+        });
+        let resolve_json = encode_client_request(&resolve, &[]).expect("resolve request");
+        assert!(
+            String::from_utf8(resolve_json)
+                .expect("UTF-8 resolve")
+                .contains("repair.transaction.resolve")
+        );
+        let resolved = RepairTransactionStatusPayload::resolved(durable, resolution)
+            .expect("resolved transaction");
+        let resolved_response = success_response(
+            REQUEST_ID,
+            9,
+            "repair.transaction.resolve",
+            &serde_json::to_string(&resolved).expect("resolved JSON"),
+        );
+        assert!(decode_client_response(&resolved_response, Vec::new(), &resolve).is_ok());
     }
 
     #[test]
