@@ -1,16 +1,13 @@
-//! Read-only root-broker preflight for the disabled Rescue `fstab` candidate.
+//! Two-phase, read-only preparation for the disabled Rescue `fstab` candidate.
 //!
-//! The broker accepts only a Core admission that has already consumed the
-//! exact local R2 approval and a closed, path-free protocol request. A trusted
-//! resolver supplies observations and opaque capabilities while the selected
-//! resource is held under a read-only lock. This module reconstructs the pure
-//! preview and complete transaction plan; it performs no filesystem access,
-//! mount, command execution, write, backup, validation or rollback.
+//! Discovery starts from an intent that contains neither a final plan hash nor
+//! approval. The broker retains the selected target guard, observes the exact
+//! resource, creates a preview, and only then obtains a real Vault reservation.
+//! That reservation becomes part of the immutable plan and audit-only receipt.
+//! A later Core approval must consume the prepared authority before an approved
+//! transaction can exist. This module contains no mutation implementation.
 
-use kernaid_core::{
-    RESCUE_FSTAB_TYPED_CONFIRMATION as CORE_TYPED_CONFIRMATION, RescueFstabCandidateAdmission,
-    RescueFstabCandidateAdmissionState,
-};
+use kernaid_core::{RescueFstabCandidateAdmission, RescueFstabCandidateAdmissionState};
 use kernaid_linux_pack::{
     production_candidate_contract::{
         ACTION_ID, BACKUP_PHYSICAL_PARENT_POLICY, BACKUP_POLICY_ID, BACKUP_RESERVATION_POLICY_ID,
@@ -27,19 +24,20 @@ use kernaid_linux_pack::{
         SelectedTargetCapability,
     },
 };
-use kernaid_protocol::rescue_repair::{
-    RESCUE_FSTAB_EVIDENCE_IDS, RESCUE_FSTAB_READY_OUTCOME, RESCUE_FSTAB_RESOURCE_ID,
-    RESCUE_FSTAB_TYPED_CONFIRMATION, RescueFstabPreflightReceipt, RescueFstabPreflightRequest,
+use kernaid_protocol::{
+    rescue_repair::{
+        RESCUE_FSTAB_EVIDENCE_IDS, RESCUE_FSTAB_READY_OUTCOME, RESCUE_FSTAB_RESOURCE_ID,
+        RescueFstabPreflightIntent, RescueFstabPreparedPlanReceipt,
+    },
+    rescue_repair_vault::RepairFileMetadataV1,
 };
-use std::{collections::BTreeSet, fmt};
+use std::{collections::BTreeSet, fmt, time::Instant};
 
 use crate::target_physical_parent::RescueTargetPhysicalParentGuard;
 
 impl RescueTargetPhysicalParentGuard {
-    /// Rebuilds the existing pure transaction claim from the authenticated,
-    /// fd-backed target authority and a physical-parent fingerprint derived
-    /// locally from the retained leaf and parent descriptors. The wire
-    /// response and caller never supply physical ancestry.
+    /// Rebuilds the path-free transaction claim from the retained leaf and
+    /// physical-parent descriptors. No caller supplies physical ancestry.
     pub fn selected_target_claims(
         &self,
     ) -> Result<SelectedTargetCapability, CandidateTransactionError> {
@@ -53,129 +51,143 @@ impl RescueTargetPhysicalParentGuard {
     }
 }
 
-/// Sanitized failures returned by a trusted target/Vault capability resolver.
-/// No variant can carry a path, command, raw observation or provider text.
+/// Sanitized failures at the target/Vault resolver boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RescueFstabCapabilityResolutionError {
     Unavailable,
     IdentityChanged,
     LockUnavailable,
+    TimedOut,
 }
 
-/// Trusted observations resolved under an opaque read-only lock.
+/// Exact observations collected while the target guard is retained.
 ///
-/// This type is intentionally neither serializable nor cloneable. Its custom
-/// `Debug` implementation never reveals `fstab` or UUID observation bytes.
-pub struct TrustedRescueFstabPreflightMaterial {
+/// This value is neither serializable nor cloneable. `Debug` redacts bytes,
+/// UUIDs, and capability identities.
+pub struct TrustedRescueFstabObservation {
     resolved_target_fingerprint: String,
     fstab_bytes: Vec<u8>,
+    metadata: RepairFileMetadataV1,
     observed_uuids: BTreeSet<String>,
     target: SelectedTargetCapability,
-    vault: BootVaultBackupCapability,
     evidence: [CandidateEvidenceBinding; 2],
 }
 
-impl TrustedRescueFstabPreflightMaterial {
+impl TrustedRescueFstabObservation {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         resolved_target_fingerprint: impl Into<String>,
         fstab_bytes: Vec<u8>,
+        metadata: RepairFileMetadataV1,
         observed_uuids: BTreeSet<String>,
         target: SelectedTargetCapability,
-        vault: BootVaultBackupCapability,
         evidence: [CandidateEvidenceBinding; 2],
     ) -> Self {
         Self {
             resolved_target_fingerprint: resolved_target_fingerprint.into(),
             fstab_bytes,
+            metadata,
             observed_uuids,
             target,
-            vault,
             evidence,
         }
     }
+
+    pub fn fstab_bytes(&self) -> &[u8] {
+        &self.fstab_bytes
+    }
+
+    pub const fn metadata(&self) -> &RepairFileMetadataV1 {
+        &self.metadata
+    }
 }
 
-impl fmt::Debug for TrustedRescueFstabPreflightMaterial {
+impl fmt::Debug for TrustedRescueFstabObservation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("TrustedRescueFstabPreflightMaterial")
+            .debug_struct("TrustedRescueFstabObservation")
             .field("resolved_target_fingerprint", &"[opaque fingerprint]")
             .field("fstab_bytes", &"[redacted]")
+            .field("metadata", &self.metadata)
             .field("observed_uuid_count", &self.observed_uuids.len())
             .field("target", &"[opaque capability]")
-            .field("vault", &"[opaque capability]")
             .field("evidence", &"[opaque hashes]")
             .finish()
     }
 }
 
-/// Trusted local resolver boundary. Implementations may resolve target/Vault
-/// capabilities, but this broker only ever passes the closed path-free
-/// request and an opaque lock guard. Observations must be collected while the
-/// returned guard is held.
-pub trait RescueFstabPreflightCapabilityResolver {
-    /// Opaque, non-cloneable guard that keeps the selected target/resource
-    /// locked read-only for the lifetime of the prepared preflight.
-    type ReadOnlyLock;
-
-    /// Opaque, non-cloneable guard that keeps the exact Boot Vault capacity
-    /// reservation alive for the lifetime of the prepared preflight.
-    type VaultReservation;
-
-    fn acquire_read_only_lock(
-        &mut self,
-        request: &RescueFstabPreflightRequest,
-    ) -> Result<Self::ReadOnlyLock, RescueFstabCapabilityResolutionError>;
-
-    fn resolve_under_read_only_lock(
-        &mut self,
-        request: &RescueFstabPreflightRequest,
-        lock: &Self::ReadOnlyLock,
-    ) -> Result<TrustedRescueFstabPreflightMaterial, RescueFstabCapabilityResolutionError>;
-
-    /// Retain the exact reservation described by the trusted material. The
-    /// implementation must fail unless it still owns that reservation.
-    fn retain_vault_reservation(
-        &mut self,
-        request: &RescueFstabPreflightRequest,
-        lock: &Self::ReadOnlyLock,
-        material: &TrustedRescueFstabPreflightMaterial,
-    ) -> Result<Self::VaultReservation, RescueFstabCapabilityResolutionError>;
-
-    fn reservation_id<'reservation>(
-        &self,
-        reservation: &'reservation Self::VaultReservation,
-    ) -> &'reservation str;
-
-    fn reservation_binding_sha256<'reservation>(
-        &self,
-        reservation: &'reservation Self::VaultReservation,
-    ) -> &'reservation str;
-
-    /// Stable opaque identity of the held guard. It is copied into the
-    /// receipt; no OS handle, device name or path crosses the protocol.
-    fn lock_identity<'lock>(&self, lock: &'lock Self::ReadOnlyLock) -> &'lock str;
+/// A live reservation must be able to prove its binding and cancel itself.
+///
+/// Cancellation consumes the guard and receives the caller's one absolute
+/// deadline. Implementations must never treat dropping a local descriptor as
+/// equivalent to a successful persistent Vault cancellation.
+pub trait RescueFstabVaultReservation {
+    fn reservation_id(&self) -> &str;
+    fn reservation_binding_sha256(&self) -> &str;
+    fn cancel(self, deadline: Instant) -> Result<(), RescueFstabCapabilityResolutionError>;
 }
 
-/// A successful point-in-time preflight that retains all execution authority.
-///
-/// It is deliberately not `Clone`: dropping this value drops the Core
-/// admission, trusted target lock and exact Vault reservation. A future
-/// executor must consume this value. The receipt is evidence only and must
-/// never be accepted as execution authority.
-pub struct PreparedRescueFstabPreflight<Lock, Reservation> {
-    receipt: RescueFstabPreflightReceipt,
+/// Trusted two-phase resolver boundary: target observation first, Vault
+/// reservation second. Every method that may perform I/O receives the same
+/// caller-supplied absolute deadline.
+pub trait RescueFstabPreflightCapabilityResolver {
+    /// Opaque, non-cloneable guard retaining the selected target read-only.
+    type TargetGuard;
+    /// Opaque, non-cloneable live Vault reservation.
+    type VaultReservation: RescueFstabVaultReservation;
+
+    fn acquire_target_guard(
+        &mut self,
+        intent: &RescueFstabPreflightIntent,
+        deadline: Instant,
+    ) -> Result<Self::TargetGuard, RescueFstabCapabilityResolutionError>;
+
+    fn observe_under_target_guard(
+        &mut self,
+        intent: &RescueFstabPreflightIntent,
+        target_guard: &Self::TargetGuard,
+        deadline: Instant,
+    ) -> Result<TrustedRescueFstabObservation, RescueFstabCapabilityResolutionError>;
+
+    /// Creates a real reservation only after identity, evidence, snapshot and
+    /// preview validation. An error return must not leave a live reservation.
+    fn reserve_vault(
+        &mut self,
+        intent: &RescueFstabPreflightIntent,
+        target_guard: &Self::TargetGuard,
+        observation: &TrustedRescueFstabObservation,
+        preview: &DisableMissingUuidPreview,
+        deadline: Instant,
+    ) -> Result<
+        (Self::VaultReservation, BootVaultBackupCapability),
+        RescueFstabCapabilityResolutionError,
+    >;
+
+    /// Stable opaque identity of the already-held target guard. This accessor
+    /// must perform no I/O.
+    fn target_guard_identity<'guard>(&self, target_guard: &'guard Self::TargetGuard)
+    -> &'guard str;
+}
+
+/// Broker-owned authority after observation, preview and Vault reservation,
+/// but before Core approval. The receipt alone grants no authority.
+#[must_use = "authorize this prepared plan or cancel its Vault reservation explicitly"]
+pub struct PreparedRescueFstabPlan<TargetGuard, Reservation> {
+    receipt: RescueFstabPreparedPlanReceipt,
     plan: FstabCandidateTransactionPlan,
     preview: DisableMissingUuidPreview,
-    _admission: RescueFstabCandidateAdmission,
-    _lock: Lock,
-    _reservation: Reservation,
+    backup_bytes: Vec<u8>,
+    metadata: RepairFileMetadataV1,
+    target_guard: TargetGuard,
+    reservation: Reservation,
 }
 
-impl<Lock, Reservation> PreparedRescueFstabPreflight<Lock, Reservation> {
-    /// Audit evidence only. Possession of this receipt grants no authority.
-    pub fn receipt(&self) -> &RescueFstabPreflightReceipt {
+impl<TargetGuard, Reservation> PreparedRescueFstabPlan<TargetGuard, Reservation>
+where
+    Reservation: RescueFstabVaultReservation,
+{
+    /// Audit evidence only. It is cloneable but cannot authorize execution.
+    pub fn receipt(&self) -> &RescueFstabPreparedPlanReceipt {
         &self.receipt
     }
 
@@ -194,18 +206,144 @@ impl<Lock, Reservation> PreparedRescueFstabPreflight<Lock, Reservation> {
     pub fn diff_sha256(&self) -> &str {
         self.preview.diff_sha256()
     }
+
+    /// Consumes this prepared authority and its approved Core admission.
+    /// Rejection explicitly cancels the persistent reservation; therefore an
+    /// absolute deadline is required even though the successful path is pure.
+    pub fn authorize(
+        self,
+        approved: RescueFstabCandidateAdmission,
+        cancellation_deadline: Instant,
+    ) -> Result<ApprovedRescueFstabTransaction<TargetGuard, Reservation>, RescueFstabPreflightError>
+    {
+        if let Err(error) = validate_approved_admission(&approved, &self.receipt, &self.plan) {
+            let Self { reservation, .. } = self;
+            return fail_after_reservation(reservation, cancellation_deadline, error);
+        }
+        let Self {
+            receipt,
+            plan,
+            preview,
+            backup_bytes,
+            metadata,
+            target_guard,
+            reservation,
+        } = self;
+        Ok(ApprovedRescueFstabTransaction {
+            receipt,
+            plan,
+            preview,
+            backup_bytes,
+            metadata,
+            admission: approved,
+            target_guard,
+            reservation,
+        })
+    }
+
+    /// Explicitly releases a prepared plan that will not be approved.
+    pub fn cancel(self, deadline: Instant) -> Result<(), RescueFstabPreflightError> {
+        let Self { reservation, .. } = self;
+        reservation
+            .cancel(deadline)
+            .map_err(|_| RescueFstabPreflightError::CancellationFailed)
+    }
 }
 
-impl<Lock, Reservation> fmt::Debug for PreparedRescueFstabPreflight<Lock, Reservation> {
+impl<TargetGuard, Reservation> fmt::Debug for PreparedRescueFstabPlan<TargetGuard, Reservation> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("PreparedRescueFstabPreflight")
+            .debug_struct("PreparedRescueFstabPlan")
             .field("receipt", &self.receipt)
             .field("plan_hash", &self.plan.plan_sha256())
             .field("before_sha256", &self.preview.before_sha256())
             .field("after_sha256", &self.preview.after_sha256())
-            .field("preview_bytes", &"[redacted]")
-            .field("lock", &"[opaque guard]")
+            .field("backup_bytes", &"[redacted]")
+            .field("metadata", &self.metadata)
+            .field("target_guard", &"[opaque guard]")
+            .field("reservation", &"[opaque guard]")
+            .finish()
+    }
+}
+
+/// Fully bound, non-cloneable authority after the exact Core approval.
+/// No executor or mutation method is exposed in this phase.
+#[must_use]
+pub struct ApprovedRescueFstabTransaction<TargetGuard, Reservation> {
+    receipt: RescueFstabPreparedPlanReceipt,
+    plan: FstabCandidateTransactionPlan,
+    preview: DisableMissingUuidPreview,
+    backup_bytes: Vec<u8>,
+    metadata: RepairFileMetadataV1,
+    admission: RescueFstabCandidateAdmission,
+    target_guard: TargetGuard,
+    reservation: Reservation,
+}
+
+impl<TargetGuard, Reservation> ApprovedRescueFstabTransaction<TargetGuard, Reservation> {
+    pub fn receipt(&self) -> &RescueFstabPreparedPlanReceipt {
+        &self.receipt
+    }
+
+    pub fn plan(&self) -> &FstabCandidateTransactionPlan {
+        &self.plan
+    }
+
+    pub fn backup_bytes(&self) -> &[u8] {
+        &self.backup_bytes
+    }
+
+    pub const fn metadata(&self) -> &RepairFileMetadataV1 {
+        &self.metadata
+    }
+
+    pub fn proposed_fstab(&self) -> &[u8] {
+        self.preview.proposed_fstab()
+    }
+
+    pub fn approval_id(&self) -> &str {
+        self.admission
+            .approval_id()
+            .expect("Approved admission always has an approval ID")
+    }
+
+    pub const fn target_guard(&self) -> &TargetGuard {
+        &self.target_guard
+    }
+
+    pub const fn reservation(&self) -> &Reservation {
+        &self.reservation
+    }
+}
+
+impl<TargetGuard, Reservation> ApprovedRescueFstabTransaction<TargetGuard, Reservation>
+where
+    Reservation: RescueFstabVaultReservation,
+{
+    /// Explicitly aborts an approved transaction before any executor consumes
+    /// it. The retained target guard and all byte material are dropped only
+    /// after the persistent Vault reservation has been asked to cancel.
+    pub fn cancel(self, deadline: Instant) -> Result<(), RescueFstabPreflightError> {
+        let Self { reservation, .. } = self;
+        reservation
+            .cancel(deadline)
+            .map_err(|_| RescueFstabPreflightError::CancellationFailed)
+    }
+}
+
+impl<TargetGuard, Reservation> fmt::Debug
+    for ApprovedRescueFstabTransaction<TargetGuard, Reservation>
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ApprovedRescueFstabTransaction")
+            .field("receipt", &self.receipt)
+            .field("plan_hash", &self.plan.plan_sha256())
+            .field("backup_bytes", &"[redacted]")
+            .field("proposed_fstab_bytes", &"[redacted]")
+            .field("metadata", &self.metadata)
+            .field("approval", &"[bound Core admission]")
+            .field("target_guard", &"[opaque guard]")
             .field("reservation", &"[opaque guard]")
             .finish()
     }
@@ -219,89 +357,91 @@ pub enum RescueFstabPreflightError {
     TargetIdentityMismatch,
     EvidenceBindingMismatch,
     TargetSnapshotMismatch,
-    PlanHashMismatch,
     Resolver(RescueFstabCapabilityResolutionError),
     PreviewRejected(PreviewError),
     TransactionRejected(CandidateTransactionError),
-    InvalidLockIdentity,
     ReservationBindingMismatch,
     ReceiptRejected,
+    CancellationFailed,
 }
 
-/// Reconstruct and verify the complete candidate preflight while retaining
-/// the trusted read-only lock. Nothing in this function can perform or expose
-/// a target mutation.
-pub fn prepare_rescue_fstab_preflight<Resolver>(
-    admission: RescueFstabCandidateAdmission,
-    request: RescueFstabPreflightRequest,
+/// Observes and prepares a plan before approval exists.
+///
+/// All resolver I/O shares `deadline`. Every failure after `reserve_vault`
+/// explicitly consumes and cancels the returned reservation. If cancellation
+/// itself fails, the only result is `CancellationFailed`.
+pub fn prepare_rescue_fstab_plan<Resolver>(
+    intent: RescueFstabPreflightIntent,
     resolver: &mut Resolver,
+    deadline: Instant,
 ) -> Result<
-    PreparedRescueFstabPreflight<Resolver::ReadOnlyLock, Resolver::VaultReservation>,
+    PreparedRescueFstabPlan<Resolver::TargetGuard, Resolver::VaultReservation>,
     RescueFstabPreflightError,
 >
 where
     Resolver: RescueFstabPreflightCapabilityResolver,
 {
-    validate_admission_and_request(&admission, &request)?;
-
-    let lock = resolver
-        .acquire_read_only_lock(&request)
+    validate_intent(&intent)?;
+    let target_guard = resolver
+        .acquire_target_guard(&intent, deadline)
         .map_err(RescueFstabPreflightError::Resolver)?;
-    let material = resolver
-        .resolve_under_read_only_lock(&request, &lock)
+    let observation = resolver
+        .observe_under_target_guard(&intent, &target_guard, deadline)
         .map_err(RescueFstabPreflightError::Resolver)?;
 
-    if material.resolved_target_fingerprint != request.target_fingerprint()
-        || material.target.target_id() != request.target_id()
-        || material.target.scan_fingerprint() != request.scan_fingerprint()
-    {
-        return Err(RescueFstabPreflightError::TargetIdentityMismatch);
-    }
-
-    for (request_binding, resolved_binding) in request.evidence().iter().zip(&material.evidence) {
-        if request_binding.evidence_id() != resolved_binding.evidence_id()
-            || request_binding.sha256() != resolved_binding.sha256()
-        {
-            return Err(RescueFstabPreflightError::EvidenceBindingMismatch);
-        }
-    }
-
-    let preview = preview_disable_missing_uuid(&material.fstab_bytes, &material.observed_uuids)
-        .map_err(RescueFstabPreflightError::PreviewRejected)?;
-    if preview.before_sha256() != request.target_snapshot() {
+    validate_observation(&intent, &observation)?;
+    let preview =
+        preview_disable_missing_uuid(&observation.fstab_bytes, &observation.observed_uuids)
+            .map_err(RescueFstabPreflightError::PreviewRejected)?;
+    if preview.before_sha256() != intent.target_snapshot() {
         return Err(RescueFstabPreflightError::TargetSnapshotMismatch);
     }
 
-    let reservation = resolver
-        .retain_vault_reservation(&request, &lock, &material)
+    let claims =
+        canonical_claims(&intent).map_err(RescueFstabPreflightError::TransactionRejected)?;
+    let (reservation, vault) = resolver
+        .reserve_vault(&intent, &target_guard, &observation, &preview, deadline)
         .map_err(RescueFstabPreflightError::Resolver)?;
-    if resolver.reservation_id(&reservation) != material.vault.reservation_id()
-        || resolver.reservation_binding_sha256(&reservation)
-            != material.vault.reservation_binding_sha256()
+
+    if reservation.reservation_id() != vault.reservation_id()
+        || reservation.reservation_binding_sha256() != vault.reservation_binding_sha256()
     {
-        return Err(RescueFstabPreflightError::ReservationBindingMismatch);
+        return fail_after_reservation(
+            reservation,
+            deadline,
+            RescueFstabPreflightError::ReservationBindingMismatch,
+        );
     }
 
-    let claims =
-        canonical_claims(&request).map_err(RescueFstabPreflightError::TransactionRejected)?;
-    let plan = FstabCandidateTransactionPlan::stage(
+    let TrustedRescueFstabObservation {
+        fstab_bytes,
+        metadata,
+        target,
+        evidence,
+        ..
+    } = observation;
+    let plan = match FstabCandidateTransactionPlan::stage(
         &preview,
         claims,
-        material.target,
-        material.vault,
-        material.evidence.into(),
-    )
-    .map_err(RescueFstabPreflightError::TransactionRejected)?;
-    if plan.plan_sha256() != request.plan_hash() {
-        return Err(RescueFstabPreflightError::PlanHashMismatch);
-    }
+        target,
+        vault,
+        evidence.into(),
+    ) {
+        Ok(plan) => plan,
+        Err(error) => {
+            return fail_after_reservation(
+                reservation,
+                deadline,
+                RescueFstabPreflightError::TransactionRejected(error),
+            );
+        }
+    };
 
-    let lock_identity = resolver.lock_identity(&lock);
-    if !valid_opaque_lock_identity(lock_identity) {
-        return Err(RescueFstabPreflightError::InvalidLockIdentity);
-    }
-    let receipt = RescueFstabPreflightReceipt::new(
-        request,
+    let receipt = match RescueFstabPreparedPlanReceipt::new(
+        intent,
+        plan.plan_sha256(),
+        plan.after_sha256(),
+        plan.diff_sha256(),
         plan.vault().vault_id(),
         plan.vault().reservation_id(),
         plan.vault().reservation_binding_sha256(),
@@ -311,49 +451,35 @@ where
         plan.vault().physical_parent_fingerprint(),
         plan.vault().required_capacity_bytes(),
         plan.vault().reserved_capacity_bytes(),
-        lock_identity,
+        resolver.target_guard_identity(&target_guard),
         RESCUE_FSTAB_READY_OUTCOME,
-    )
-    .map_err(|_| RescueFstabPreflightError::ReceiptRejected)?;
+    ) {
+        Ok(receipt) => receipt,
+        Err(_) => {
+            return fail_after_reservation(
+                reservation,
+                deadline,
+                RescueFstabPreflightError::ReceiptRejected,
+            );
+        }
+    };
 
-    Ok(PreparedRescueFstabPreflight {
+    Ok(PreparedRescueFstabPlan {
         receipt,
         plan,
         preview,
-        _admission: admission,
-        _lock: lock,
-        _reservation: reservation,
+        backup_bytes: fstab_bytes,
+        metadata,
+        target_guard,
+        reservation,
     })
 }
 
-fn validate_admission_and_request(
-    admission: &RescueFstabCandidateAdmission,
-    request: &RescueFstabPreflightRequest,
-) -> Result<(), RescueFstabPreflightError> {
-    if admission.state() != RescueFstabCandidateAdmissionState::Approved {
-        return Err(RescueFstabPreflightError::ApprovalRequired);
-    }
-    let binding = admission.binding();
-    if request.session_id() != binding.session_id()
-        || request.plan_id() != binding.plan_id()
-        || request.plan_hash() != binding.plan_hash()
-        || request.target_fingerprint() != binding.target_fingerprint()
-        || request.target_snapshot() != binding.target_snapshot()
-        || request.resource_id() != binding.resource_id()
-        || request.resource_id() != RESCUE_FSTAB_RESOURCE_ID
-        || request.resource_id() != RESOURCE_ID
-    {
+fn validate_intent(intent: &RescueFstabPreflightIntent) -> Result<(), RescueFstabPreflightError> {
+    if intent.resource_id() != RESCUE_FSTAB_RESOURCE_ID || intent.resource_id() != RESOURCE_ID {
         return Err(RescueFstabPreflightError::AdmissionBindingMismatch);
     }
-    if admission.approval_id() != Some(request.approval_id())
-        || admission.approval_sequence() != Some(request.approval_sequence())
-        || admission.next_approval_sequence() != request.approval_sequence()
-        || request.typed_confirmation() != RESCUE_FSTAB_TYPED_CONFIRMATION
-        || request.typed_confirmation() != CORE_TYPED_CONFIRMATION
-    {
-        return Err(RescueFstabPreflightError::ApprovalBindingMismatch);
-    }
-    for (binding, expected_id) in request.evidence().iter().zip(RESCUE_FSTAB_EVIDENCE_IDS) {
+    for (binding, expected_id) in intent.evidence().iter().zip(RESCUE_FSTAB_EVIDENCE_IDS) {
         if binding.evidence_id() != expected_id {
             return Err(RescueFstabPreflightError::EvidenceBindingMismatch);
         }
@@ -361,12 +487,84 @@ fn validate_admission_and_request(
     Ok(())
 }
 
+fn validate_observation(
+    intent: &RescueFstabPreflightIntent,
+    observation: &TrustedRescueFstabObservation,
+) -> Result<(), RescueFstabPreflightError> {
+    if observation.resolved_target_fingerprint != intent.target_fingerprint()
+        || observation.target.target_id() != intent.target_id()
+        || observation.target.scan_fingerprint() != intent.scan_fingerprint()
+    {
+        return Err(RescueFstabPreflightError::TargetIdentityMismatch);
+    }
+    for (requested, observed) in intent.evidence().iter().zip(&observation.evidence) {
+        if requested.evidence_id() != observed.evidence_id()
+            || requested.sha256() != observed.sha256()
+        {
+            return Err(RescueFstabPreflightError::EvidenceBindingMismatch);
+        }
+    }
+    Ok(())
+}
+
+fn validate_approved_admission(
+    admission: &RescueFstabCandidateAdmission,
+    receipt: &RescueFstabPreparedPlanReceipt,
+    plan: &FstabCandidateTransactionPlan,
+) -> Result<(), RescueFstabPreflightError> {
+    if admission.state() != RescueFstabCandidateAdmissionState::Approved {
+        return Err(RescueFstabPreflightError::ApprovalRequired);
+    }
+    let intent = receipt.intent();
+    let binding = admission.binding();
+    if binding.session_id() != intent.session_id()
+        || binding.plan_id() != intent.plan_id()
+        || binding.plan_hash() != receipt.plan_hash()
+        || binding.plan_hash() != plan.plan_sha256()
+        || binding.target_fingerprint() != intent.target_fingerprint()
+        || binding.target_snapshot() != intent.target_snapshot()
+        || binding.target_snapshot() != receipt.before_sha256()
+        || binding.resource_id() != intent.resource_id()
+        || plan.claims().session_id() != intent.session_id()
+        || plan.claims().plan_id() != intent.plan_id()
+        || plan.claims().resource_id() != intent.resource_id()
+        || plan.before_sha256() != intent.target_snapshot()
+        || plan.after_sha256() != receipt.after_sha256()
+        || plan.diff_sha256() != receipt.diff_sha256()
+        || plan.target().target_id() != intent.target_id()
+        || plan.target().scan_fingerprint() != intent.scan_fingerprint()
+    {
+        return Err(RescueFstabPreflightError::AdmissionBindingMismatch);
+    }
+    if admission.approval_id().is_none()
+        || admission.approval_sequence().is_none()
+        || admission.approval_sequence() != Some(admission.next_approval_sequence())
+    {
+        return Err(RescueFstabPreflightError::ApprovalBindingMismatch);
+    }
+    Ok(())
+}
+
+fn fail_after_reservation<T, Reservation>(
+    reservation: Reservation,
+    deadline: Instant,
+    error: RescueFstabPreflightError,
+) -> Result<T, RescueFstabPreflightError>
+where
+    Reservation: RescueFstabVaultReservation,
+{
+    reservation
+        .cancel(deadline)
+        .map_err(|_| RescueFstabPreflightError::CancellationFailed)?;
+    Err(error)
+}
+
 fn canonical_claims(
-    request: &RescueFstabPreflightRequest,
+    intent: &RescueFstabPreflightIntent,
 ) -> Result<CandidatePlanClaims, CandidateTransactionError> {
     CandidatePlanClaims::admit(CandidatePlanClaimsInput {
-        session_id: request.session_id(),
-        plan_id: request.plan_id(),
+        session_id: intent.session_id(),
+        plan_id: intent.plan_id(),
         action_id: ACTION_ID,
         resource_id: RESOURCE_ID,
         finding_id: FINDING_ID,
@@ -386,19 +584,12 @@ fn canonical_claims(
     })
 }
 
-fn valid_opaque_lock_identity(value: &str) -> bool {
-    (1..=96).contains(&value.len())
-        && !value.contains("..")
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':' | b'.'))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use kernaid_core::{
-        RESCUE_FSTAB_TYPED_CONFIRMATION, RescueFstabCandidateApproval, Session, SessionMode,
+        RESCUE_FSTAB_TYPED_CONFIRMATION, RescueFstabCandidateAdmissionError,
+        RescueFstabCandidateApproval, Session, SessionMode,
     };
     use kernaid_evidence::{
         Evidence,
@@ -415,9 +606,10 @@ mod tests {
     };
     use sha2::{Digest, Sha256};
     use std::sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     };
+    use std::time::Duration;
 
     const SESSION_ID: &str = "S-rescue-preflight";
     const PLAN_ID: &str = "P-rescue-fstab";
@@ -425,6 +617,7 @@ mod tests {
     const APPROVAL_SEQUENCE: u64 = 7;
     const FSTAB: &[u8] =
         b"UUID=AAAA-BBBB / ext4 defaults 0 1\nUUID=DEAD-BEEF /srv/archive ext4 defaults 0 2\n";
+
     fn hash(character: char) -> String {
         format!("sha256:{}", character.to_string().repeat(64))
     }
@@ -437,12 +630,12 @@ mod tests {
         BTreeSet::from(["aaaa-bbbb".to_owned()])
     }
 
-    fn target(scan_character: char, parent: char) -> SelectedTargetCapability {
-        SelectedTargetCapability::new("target-01", scan(scan_character), hash(parent))
+    fn target(parent: char) -> SelectedTargetCapability {
+        SelectedTargetCapability::new("target-01", scan('1'), hash(parent))
             .expect("target capability")
     }
 
-    fn vault(parent: char, required: u64, reserved: u64) -> BootVaultBackupCapability {
+    fn vault(parent: char) -> BootVaultBackupCapability {
         BootVaultBackupCapability::new(
             "vault-01",
             "B-preflight",
@@ -451,103 +644,196 @@ mod tests {
             hash('c'),
             hash(parent),
             true,
-            required,
-            reserved,
+            4096,
+            8192,
         )
         .expect("Vault capability")
     }
 
-    fn transaction_evidence(first_hash: char, second_hash: char) -> [CandidateEvidenceBinding; 2] {
+    fn transaction_evidence(first: char, second: char) -> [CandidateEvidenceBinding; 2] {
         [
-            CandidateEvidenceBinding::new(RESCUE_FSTAB_EVIDENCE_IDS[0], hash(first_hash))
+            CandidateEvidenceBinding::new(RESCUE_FSTAB_EVIDENCE_IDS[0], hash(first))
                 .expect("fstab evidence"),
-            CandidateEvidenceBinding::new(RESCUE_FSTAB_EVIDENCE_IDS[1], hash(second_hash))
+            CandidateEvidenceBinding::new(RESCUE_FSTAB_EVIDENCE_IDS[1], hash(second))
                 .expect("lsblk evidence"),
         ]
     }
 
-    fn protocol_evidence(first_hash: char, second_hash: char) -> [RescueFstabEvidenceBinding; 2] {
+    fn protocol_evidence(first: char, second: char) -> [RescueFstabEvidenceBinding; 2] {
         [
-            RescueFstabEvidenceBinding::new(RESCUE_FSTAB_EVIDENCE_IDS[0], hash(first_hash))
+            RescueFstabEvidenceBinding::new(RESCUE_FSTAB_EVIDENCE_IDS[0], hash(first))
                 .expect("protocol fstab evidence"),
-            RescueFstabEvidenceBinding::new(RESCUE_FSTAB_EVIDENCE_IDS[1], hash(second_hash))
+            RescueFstabEvidenceBinding::new(RESCUE_FSTAB_EVIDENCE_IDS[1], hash(second))
                 .expect("protocol lsblk evidence"),
         ]
     }
 
-    fn exact_plan() -> FstabCandidateTransactionPlan {
+    fn exact_intent() -> RescueFstabPreflightIntent {
         let preview = preview_disable_missing_uuid(FSTAB, &observed()).expect("preview");
-        let claims = CandidatePlanClaims::admit(CandidatePlanClaimsInput {
-            session_id: SESSION_ID,
-            plan_id: PLAN_ID,
-            action_id: ACTION_ID,
-            resource_id: RESOURCE_ID,
-            finding_id: FINDING_ID,
-            finding_version: FINDING_VERSION,
-            risk: "R2",
-            supported_filesystem: SUPPORTED_FILESYSTEM,
-            preflight_id: PREFLIGHT_ID,
-            backup_policy_id: BACKUP_POLICY_ID,
-            backup_reservation_policy_id: BACKUP_RESERVATION_POLICY_ID,
-            backup_physical_parent_policy: BACKUP_PHYSICAL_PARENT_POLICY,
-            validation_id: VALIDATE_ID,
-            rollback_id: ROLLBACK_ID,
-            timeout_milliseconds: TRANSACTION_TIMEOUT_MILLISECONDS,
-            cancellation_policy_id: CANCELLATION_POLICY_ID,
-            idempotency_policy_id: IDEMPOTENCY_POLICY_ID,
-            redaction_policy_id: REDACTION_POLICY_ID,
-        })
-        .expect("claims");
-        FstabCandidateTransactionPlan::stage(
-            &preview,
-            claims,
-            target('1', 'a'),
-            vault('b', 4096, 8192),
-            transaction_evidence('d', 'e').into(),
-        )
-        .expect("transaction plan")
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn request(
-        session_id: &str,
-        plan_hash: &str,
-        target_snapshot: &str,
-        target_id: &str,
-        scan_fingerprint: &str,
-        approval_id: &str,
-        approval_sequence: u64,
-        evidence: [RescueFstabEvidenceBinding; 2],
-    ) -> RescueFstabPreflightRequest {
-        RescueFstabPreflightRequest::new(
-            session_id,
-            PLAN_ID,
-            plan_hash,
-            hash('f'),
-            target_snapshot,
-            RESOURCE_ID,
-            target_id,
-            scan_fingerprint,
-            approval_id,
-            approval_sequence,
-            RESCUE_FSTAB_TYPED_CONFIRMATION,
-            evidence,
-        )
-        .expect("request")
-    }
-
-    fn exact_request() -> RescueFstabPreflightRequest {
-        let plan = exact_plan();
-        request(
+        RescueFstabPreflightIntent::new(
             SESSION_ID,
-            plan.plan_sha256(),
-            plan.before_sha256(),
-            plan.target().target_id(),
-            plan.target().scan_fingerprint(),
-            APPROVAL_ID,
-            APPROVAL_SEQUENCE,
+            PLAN_ID,
+            hash('f'),
+            preview.before_sha256(),
+            RESOURCE_ID,
+            "target-01",
+            scan('1'),
             protocol_evidence('d', 'e'),
         )
+        .expect("intent")
+    }
+
+    fn exact_observation() -> TrustedRescueFstabObservation {
+        TrustedRescueFstabObservation::new(
+            hash('f'),
+            FSTAB.to_vec(),
+            RepairFileMetadataV1::new(0o644, 0, 0).expect("metadata"),
+            observed(),
+            target('a'),
+            transaction_evidence('d', 'e'),
+        )
+    }
+
+    struct TestTargetGuard {
+        identity: String,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Drop for TestTargetGuard {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    struct TestReservation {
+        reservation_id: String,
+        binding: String,
+        calls: Arc<Mutex<Vec<&'static str>>>,
+        dropped: Arc<AtomicBool>,
+        cancel_fails: bool,
+        expected_deadline: Instant,
+    }
+
+    impl Drop for TestReservation {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl RescueFstabVaultReservation for TestReservation {
+        fn reservation_id(&self) -> &str {
+            &self.reservation_id
+        }
+
+        fn reservation_binding_sha256(&self) -> &str {
+            &self.binding
+        }
+
+        fn cancel(self, deadline: Instant) -> Result<(), RescueFstabCapabilityResolutionError> {
+            assert_eq!(deadline, self.expected_deadline);
+            self.calls.lock().expect("calls lock").push("cancel");
+            if self.cancel_fails {
+                Err(RescueFstabCapabilityResolutionError::Unavailable)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    struct TestResolver {
+        observation: Option<TrustedRescueFstabObservation>,
+        vault: BootVaultBackupCapability,
+        lock_identity: String,
+        calls: Arc<Mutex<Vec<&'static str>>>,
+        target_dropped: Arc<AtomicBool>,
+        reservation_dropped: Arc<AtomicBool>,
+        cancel_fails: bool,
+        expected_deadline: Instant,
+    }
+
+    impl TestResolver {
+        fn new(observation: TrustedRescueFstabObservation, deadline: Instant) -> Self {
+            Self {
+                observation: Some(observation),
+                vault: vault('b'),
+                lock_identity: format!("lock:{}", "9".repeat(64)),
+                calls: Arc::new(Mutex::new(Vec::new())),
+                target_dropped: Arc::new(AtomicBool::new(false)),
+                reservation_dropped: Arc::new(AtomicBool::new(false)),
+                cancel_fails: false,
+                expected_deadline: deadline,
+            }
+        }
+
+        fn record(&self, operation: &'static str, deadline: Instant) {
+            assert_eq!(deadline, self.expected_deadline);
+            self.calls.lock().expect("calls lock").push(operation);
+        }
+
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.lock().expect("calls lock").clone()
+        }
+    }
+
+    impl RescueFstabPreflightCapabilityResolver for TestResolver {
+        type TargetGuard = TestTargetGuard;
+        type VaultReservation = TestReservation;
+
+        fn acquire_target_guard(
+            &mut self,
+            _intent: &RescueFstabPreflightIntent,
+            deadline: Instant,
+        ) -> Result<Self::TargetGuard, RescueFstabCapabilityResolutionError> {
+            self.record("acquire", deadline);
+            Ok(TestTargetGuard {
+                identity: self.lock_identity.clone(),
+                dropped: Arc::clone(&self.target_dropped),
+            })
+        }
+
+        fn observe_under_target_guard(
+            &mut self,
+            _intent: &RescueFstabPreflightIntent,
+            _target_guard: &Self::TargetGuard,
+            deadline: Instant,
+        ) -> Result<TrustedRescueFstabObservation, RescueFstabCapabilityResolutionError> {
+            self.record("observe", deadline);
+            self.observation
+                .take()
+                .ok_or(RescueFstabCapabilityResolutionError::Unavailable)
+        }
+
+        fn reserve_vault(
+            &mut self,
+            _intent: &RescueFstabPreflightIntent,
+            _target_guard: &Self::TargetGuard,
+            _observation: &TrustedRescueFstabObservation,
+            _preview: &DisableMissingUuidPreview,
+            deadline: Instant,
+        ) -> Result<
+            (Self::VaultReservation, BootVaultBackupCapability),
+            RescueFstabCapabilityResolutionError,
+        > {
+            self.record("reserve", deadline);
+            Ok((
+                TestReservation {
+                    reservation_id: self.vault.reservation_id().to_owned(),
+                    binding: self.vault.reservation_binding_sha256().to_owned(),
+                    calls: Arc::clone(&self.calls),
+                    dropped: Arc::clone(&self.reservation_dropped),
+                    cancel_fails: self.cancel_fails,
+                    expected_deadline: self.expected_deadline,
+                },
+                self.vault.clone(),
+            ))
+        }
+
+        fn target_guard_identity<'guard>(
+            &self,
+            target_guard: &'guard Self::TargetGuard,
+        ) -> &'guard str {
+            &target_guard.identity
+        }
     }
 
     fn candidate_core_plan() -> ValidatedPlan {
@@ -638,10 +924,10 @@ mod tests {
         (evidence, bytes)
     }
 
-    fn admission(
+    fn staged_admission(
+        session_id: &str,
         plan_hash: &str,
         target_snapshot: &str,
-        approved: bool,
     ) -> RescueFstabCandidateAdmission {
         let (snapshot, bytes) = rescue_snapshot();
         let mut session = Session::new(hash('f'), SessionMode::LinuxRescue);
@@ -651,347 +937,226 @@ mod tests {
         session
             .linux_evidence_complete(std::slice::from_ref(&snapshot))
             .expect("diagnosis boundary");
-        let mut admission = session
+        session
             .stage_rescue_fstab_production_candidate(
                 &candidate_core_plan(),
-                SESSION_ID,
+                session_id,
                 plan_hash,
                 target_snapshot,
                 APPROVAL_SEQUENCE - 1,
             )
-            .expect("stage candidate");
-        if approved {
-            let approval = RescueFstabCandidateApproval::new(
-                admission.binding().clone(),
-                APPROVAL_ID,
-                APPROVAL_SEQUENCE,
-                RESCUE_FSTAB_TYPED_CONFIRMATION,
-            )
-            .expect("approval");
-            admission.approve(&approval).expect("approve candidate");
-        }
-        admission
+            .expect("stage admission")
     }
 
-    fn exact_material() -> TrustedRescueFstabPreflightMaterial {
-        TrustedRescueFstabPreflightMaterial::new(
-            hash('f'),
-            FSTAB.to_vec(),
-            observed(),
-            target('1', 'a'),
-            vault('b', 4096, 8192),
-            transaction_evidence('d', 'e'),
+    fn approve(admission: &mut RescueFstabCandidateAdmission) -> RescueFstabCandidateApproval {
+        let approval = RescueFstabCandidateApproval::new(
+            admission.binding().clone(),
+            APPROVAL_ID,
+            APPROVAL_SEQUENCE,
+            RESCUE_FSTAB_TYPED_CONFIRMATION,
         )
+        .expect("approval");
+        admission.approve(&approval).expect("approve admission");
+        approval
     }
 
-    struct TestLock {
-        identity: String,
-        dropped: Arc<AtomicBool>,
-    }
-
-    impl Drop for TestLock {
-        fn drop(&mut self) {
-            self.dropped.store(true, Ordering::SeqCst);
-        }
-    }
-
-    struct TestReservation {
-        reservation_id: String,
-        binding_sha256: String,
-        dropped: Arc<AtomicBool>,
-    }
-
-    impl Drop for TestReservation {
-        fn drop(&mut self) {
-            self.dropped.store(true, Ordering::SeqCst);
-        }
-    }
-
-    struct TestResolver {
-        material: Option<TrustedRescueFstabPreflightMaterial>,
-        lock_identity: String,
-        reservation_id: String,
-        reservation_binding_sha256: String,
-        lock_acquired: bool,
-        resolved_under_lock: bool,
-        reservation_retained: bool,
-        lock_dropped: Arc<AtomicBool>,
-        reservation_dropped: Arc<AtomicBool>,
-    }
-
-    impl TestResolver {
-        fn new(material: TrustedRescueFstabPreflightMaterial) -> Self {
-            let reservation_id = material.vault.reservation_id().to_owned();
-            let reservation_binding_sha256 = material.vault.reservation_binding_sha256().to_owned();
-            Self {
-                material: Some(material),
-                lock_identity: format!("lock:{}", "9".repeat(64)),
-                reservation_id,
-                reservation_binding_sha256,
-                lock_acquired: false,
-                resolved_under_lock: false,
-                reservation_retained: false,
-                lock_dropped: Arc::new(AtomicBool::new(false)),
-                reservation_dropped: Arc::new(AtomicBool::new(false)),
-            }
-        }
-    }
-
-    impl RescueFstabPreflightCapabilityResolver for TestResolver {
-        type ReadOnlyLock = TestLock;
-        type VaultReservation = TestReservation;
-
-        fn acquire_read_only_lock(
-            &mut self,
-            _request: &RescueFstabPreflightRequest,
-        ) -> Result<Self::ReadOnlyLock, RescueFstabCapabilityResolutionError> {
-            self.lock_acquired = true;
-            Ok(TestLock {
-                identity: self.lock_identity.clone(),
-                dropped: Arc::clone(&self.lock_dropped),
-            })
-        }
-
-        fn resolve_under_read_only_lock(
-            &mut self,
-            _request: &RescueFstabPreflightRequest,
-            _lock: &Self::ReadOnlyLock,
-        ) -> Result<TrustedRescueFstabPreflightMaterial, RescueFstabCapabilityResolutionError>
-        {
-            if !self.lock_acquired {
-                return Err(RescueFstabCapabilityResolutionError::LockUnavailable);
-            }
-            self.resolved_under_lock = true;
-            self.material
-                .take()
-                .ok_or(RescueFstabCapabilityResolutionError::Unavailable)
-        }
-
-        fn retain_vault_reservation(
-            &mut self,
-            _request: &RescueFstabPreflightRequest,
-            _lock: &Self::ReadOnlyLock,
-            _material: &TrustedRescueFstabPreflightMaterial,
-        ) -> Result<Self::VaultReservation, RescueFstabCapabilityResolutionError> {
-            if !self.resolved_under_lock {
-                return Err(RescueFstabCapabilityResolutionError::LockUnavailable);
-            }
-            self.reservation_retained = true;
-            Ok(TestReservation {
-                reservation_id: self.reservation_id.clone(),
-                binding_sha256: self.reservation_binding_sha256.clone(),
-                dropped: Arc::clone(&self.reservation_dropped),
-            })
-        }
-
-        fn reservation_id<'reservation>(
-            &self,
-            reservation: &'reservation Self::VaultReservation,
-        ) -> &'reservation str {
-            &reservation.reservation_id
-        }
-
-        fn reservation_binding_sha256<'reservation>(
-            &self,
-            reservation: &'reservation Self::VaultReservation,
-        ) -> &'reservation str {
-            &reservation.binding_sha256
-        }
-
-        fn lock_identity<'lock>(&self, lock: &'lock Self::ReadOnlyLock) -> &'lock str {
-            &lock.identity
-        }
+    fn deadline() -> Instant {
+        Instant::now() + Duration::from_secs(2)
     }
 
     #[test]
-    fn approved_exact_request_returns_ready_receipt_and_retains_lock() {
-        let request = exact_request();
-        let admission = admission(request.plan_hash(), request.target_snapshot(), true);
-        let mut resolver = TestResolver::new(exact_material());
-        let dropped = Arc::clone(&resolver.lock_dropped);
+    fn observation_precedes_reservation_and_approval_consumes_prepared_authority() {
+        let deadline = deadline();
+        let mut resolver = TestResolver::new(exact_observation(), deadline);
+        let target_dropped = Arc::clone(&resolver.target_dropped);
         let reservation_dropped = Arc::clone(&resolver.reservation_dropped);
-        let expected_lock_identity = resolver.lock_identity.clone();
+        let prepared = prepare_rescue_fstab_plan(exact_intent(), &mut resolver, deadline)
+            .expect("prepare before approval");
 
-        let prepared = prepare_rescue_fstab_preflight(admission, request, &mut resolver)
-            .expect("read-only preflight");
-        assert!(resolver.lock_acquired);
-        assert!(resolver.resolved_under_lock);
-        assert!(resolver.reservation_retained);
-        assert!(!dropped.load(Ordering::SeqCst));
-        assert!(!reservation_dropped.load(Ordering::SeqCst));
-        assert_eq!(prepared.receipt().outcome(), RESCUE_FSTAB_READY_OUTCOME);
+        assert_eq!(resolver.calls(), ["acquire", "observe", "reserve"]);
         assert_eq!(
             prepared.receipt().plan_hash(),
             prepared.plan().plan_sha256()
         );
+        assert_eq!(prepared.receipt().before_sha256(), prepared.before_sha256());
+        assert_eq!(prepared.receipt().after_sha256(), prepared.after_sha256());
+        assert_eq!(prepared.receipt().diff_sha256(), prepared.diff_sha256());
         assert_eq!(
-            prepared.receipt().target_snapshot(),
-            prepared.before_sha256()
+            prepared.receipt().backup_locator(),
+            "vault://repair/B-preflight"
         );
-        assert_eq!(prepared.receipt().lock_identity(), expected_lock_identity);
+        assert!(!target_dropped.load(Ordering::SeqCst));
+        assert!(!reservation_dropped.load(Ordering::SeqCst));
         let debug = format!("{prepared:?}");
         assert!(!debug.contains("DEAD-BEEF"));
-        drop(prepared);
-        assert!(dropped.load(Ordering::SeqCst));
+        assert!(!debug.contains("/srv/archive"));
+
+        let mut admission = staged_admission(
+            prepared.receipt().intent().session_id(),
+            prepared.receipt().plan_hash(),
+            prepared.receipt().before_sha256(),
+        );
+        approve(&mut admission);
+        let approved = prepared
+            .authorize(admission, deadline)
+            .expect("exact later approval");
+        assert_eq!(approved.approval_id(), APPROVAL_ID);
+        assert_eq!(approved.backup_bytes(), FSTAB);
+        assert_eq!(approved.metadata().mode(), 0o644);
+        assert_ne!(approved.proposed_fstab(), FSTAB);
+        assert_eq!(resolver.calls(), ["acquire", "observe", "reserve"]);
+        drop(approved);
+        assert!(target_dropped.load(Ordering::SeqCst));
         assert!(reservation_dropped.load(Ordering::SeqCst));
     }
 
     #[test]
-    fn recomputation_rejects_target_snapshot_plan_and_evidence_drift() {
-        let exact = exact_request();
-
-        let staged = admission(exact.plan_hash(), exact.target_snapshot(), false);
-        let mut resolver = TestResolver::new(exact_material());
-        assert_eq!(
-            prepare_rescue_fstab_preflight(staged, exact.clone(), &mut resolver)
-                .expect_err("approval is mandatory"),
-            RescueFstabPreflightError::ApprovalRequired
-        );
-        assert!(!resolver.lock_acquired);
-
-        let approved = admission(exact.plan_hash(), exact.target_snapshot(), true);
-        let sequence_drift = request(
+    fn approval_replay_is_rejected_and_binding_drift_cancels() {
+        let deadline = deadline();
+        let mut resolver = TestResolver::new(exact_observation(), deadline);
+        let prepared = prepare_rescue_fstab_plan(exact_intent(), &mut resolver, deadline)
+            .expect("prepared plan");
+        let mut admission = staged_admission(
             SESSION_ID,
-            exact.plan_hash(),
-            exact.target_snapshot(),
-            exact.target_id(),
-            exact.scan_fingerprint(),
-            APPROVAL_ID,
-            APPROVAL_SEQUENCE + 1,
-            protocol_evidence('d', 'e'),
+            prepared.receipt().plan_hash(),
+            prepared.receipt().before_sha256(),
         );
-        let mut resolver = TestResolver::new(exact_material());
+        let approval = approve(&mut admission);
         assert_eq!(
-            prepare_rescue_fstab_preflight(approved, sequence_drift, &mut resolver)
-                .expect_err("approval sequence drift"),
-            RescueFstabPreflightError::ApprovalBindingMismatch
+            admission.approve(&approval),
+            Err(RescueFstabCandidateAdmissionError::ApprovalReplay)
         );
-        assert!(!resolver.lock_acquired);
-
-        let stale_snapshot = hash('8');
-        let stale_request = request(
-            SESSION_ID,
-            exact.plan_hash(),
-            &stale_snapshot,
-            exact.target_id(),
-            exact.scan_fingerprint(),
-            APPROVAL_ID,
-            APPROVAL_SEQUENCE,
-            protocol_evidence('d', 'e'),
-        );
-        let stale_admission = admission(stale_request.plan_hash(), &stale_snapshot, true);
-        let mut resolver = TestResolver::new(exact_material());
+        let approved = prepared
+            .authorize(admission, deadline)
+            .expect("first exact approval remains valid");
+        approved.cancel(deadline).expect("approved abort cleanup");
         assert_eq!(
-            prepare_rescue_fstab_preflight(stale_admission, stale_request, &mut resolver)
-                .expect_err("target snapshot drift"),
-            RescueFstabPreflightError::TargetSnapshotMismatch
+            resolver.calls(),
+            ["acquire", "observe", "reserve", "cancel"]
         );
 
-        let foreign_plan_hash = hash('7');
-        let drifted_plan_request = request(
-            SESSION_ID,
-            &foreign_plan_hash,
-            exact.target_snapshot(),
-            exact.target_id(),
-            exact.scan_fingerprint(),
-            APPROVAL_ID,
-            APPROVAL_SEQUENCE,
-            protocol_evidence('d', 'e'),
-        );
-        let drifted_plan_admission = admission(&foreign_plan_hash, exact.target_snapshot(), true);
-        let mut resolver = TestResolver::new(exact_material());
+        let mut resolver = TestResolver::new(exact_observation(), deadline);
+        let calls = Arc::clone(&resolver.calls);
+        let prepared = prepare_rescue_fstab_plan(exact_intent(), &mut resolver, deadline)
+            .expect("prepared plan");
+        let mut drifted = staged_admission(SESSION_ID, &hash('7'), prepared.before_sha256());
+        approve(&mut drifted);
         assert_eq!(
-            prepare_rescue_fstab_preflight(
-                drifted_plan_admission,
-                drifted_plan_request,
-                &mut resolver,
-            )
-            .expect_err("plan hash drift"),
-            RescueFstabPreflightError::PlanHashMismatch
+            prepared
+                .authorize(drifted, deadline)
+                .expect_err("plan drift"),
+            RescueFstabPreflightError::AdmissionBindingMismatch
         );
-
-        let mut material = exact_material();
-        material.evidence = transaction_evidence('6', 'e');
-        let approved = admission(exact.plan_hash(), exact.target_snapshot(), true);
-        let mut resolver = TestResolver::new(material);
         assert_eq!(
-            prepare_rescue_fstab_preflight(approved, exact, &mut resolver)
-                .expect_err("evidence drift"),
-            RescueFstabPreflightError::EvidenceBindingMismatch
+            *calls.lock().expect("calls lock"),
+            ["acquire", "observe", "reserve", "cancel"]
         );
     }
 
     #[test]
-    fn fails_closed_on_identity_vault_and_lock_capability_drift() {
-        let exact = exact_request();
-        let mut identity_drift = exact_material();
-        identity_drift.resolved_target_fingerprint = hash('6');
-        let mut resolver = TestResolver::new(identity_drift);
+    fn staged_approval_and_observation_drift_fail_closed() {
+        let deadline = deadline();
+        let mut resolver = TestResolver::new(exact_observation(), deadline);
+        let prepared = prepare_rescue_fstab_plan(exact_intent(), &mut resolver, deadline)
+            .expect("prepared plan");
+        let staged = staged_admission(
+            SESSION_ID,
+            prepared.receipt().plan_hash(),
+            prepared.before_sha256(),
+        );
         assert_eq!(
-            prepare_rescue_fstab_preflight(
-                admission(exact.plan_hash(), exact.target_snapshot(), true),
-                exact.clone(),
-                &mut resolver,
-            )
-            .expect_err("target identity drift"),
-            RescueFstabPreflightError::TargetIdentityMismatch
+            prepared
+                .authorize(staged, deadline)
+                .expect_err("not approved"),
+            RescueFstabPreflightError::ApprovalRequired
+        );
+        assert_eq!(
+            resolver.calls(),
+            ["acquire", "observe", "reserve", "cancel"]
         );
 
-        let mut same_device = exact_material();
-        same_device.vault = vault('a', 4096, 8192);
-        let mut resolver = TestResolver::new(same_device);
+        let mut identity_drift = exact_observation();
+        identity_drift.resolved_target_fingerprint = hash('8');
+        let mut resolver = TestResolver::new(identity_drift, deadline);
         assert_eq!(
-            prepare_rescue_fstab_preflight(
-                admission(exact.plan_hash(), exact.target_snapshot(), true),
-                exact.clone(),
-                &mut resolver,
-            )
-            .expect_err("same-device Vault"),
+            prepare_rescue_fstab_plan(exact_intent(), &mut resolver, deadline)
+                .expect_err("target drift"),
+            RescueFstabPreflightError::TargetIdentityMismatch
+        );
+        assert_eq!(resolver.calls(), ["acquire", "observe"]);
+
+        let mut evidence_drift = exact_observation();
+        evidence_drift.evidence = transaction_evidence('8', 'e');
+        let mut resolver = TestResolver::new(evidence_drift, deadline);
+        assert_eq!(
+            prepare_rescue_fstab_plan(exact_intent(), &mut resolver, deadline)
+                .expect_err("evidence drift"),
+            RescueFstabPreflightError::EvidenceBindingMismatch
+        );
+        assert_eq!(resolver.calls(), ["acquire", "observe"]);
+
+        let preview = preview_disable_missing_uuid(FSTAB, &observed()).expect("preview");
+        let stale_intent = RescueFstabPreflightIntent::new(
+            SESSION_ID,
+            PLAN_ID,
+            hash('f'),
+            hash('8'),
+            RESOURCE_ID,
+            "target-01",
+            scan('1'),
+            protocol_evidence('d', 'e'),
+        )
+        .expect("stale intent");
+        assert_ne!(stale_intent.target_snapshot(), preview.before_sha256());
+        let mut resolver = TestResolver::new(exact_observation(), deadline);
+        assert_eq!(
+            prepare_rescue_fstab_plan(stale_intent, &mut resolver, deadline)
+                .expect_err("snapshot drift"),
+            RescueFstabPreflightError::TargetSnapshotMismatch
+        );
+        assert_eq!(resolver.calls(), ["acquire", "observe"]);
+    }
+
+    #[test]
+    fn plan_and_receipt_failures_cancel_and_cancel_failure_dominates() {
+        let deadline = deadline();
+        let mut resolver = TestResolver::new(exact_observation(), deadline);
+        resolver.vault = vault('a');
+        assert_eq!(
+            prepare_rescue_fstab_plan(exact_intent(), &mut resolver, deadline)
+                .expect_err("same physical parent"),
             RescueFstabPreflightError::TransactionRejected(
                 CandidateTransactionError::PhysicalDeviceNotDistinct
             )
         );
-
-        let mut insufficient_reservation = exact_material();
-        insufficient_reservation.vault = vault('b', 1, 8192);
-        let mut resolver = TestResolver::new(insufficient_reservation);
         assert_eq!(
-            prepare_rescue_fstab_preflight(
-                admission(exact.plan_hash(), exact.target_snapshot(), true),
-                exact.clone(),
-                &mut resolver,
-            )
-            .expect_err("insufficient reservation"),
-            RescueFstabPreflightError::TransactionRejected(
-                CandidateTransactionError::InvalidVaultCapacity
-            )
+            resolver.calls(),
+            ["acquire", "observe", "reserve", "cancel"]
         );
 
-        let mut resolver = TestResolver::new(exact_material());
-        resolver.reservation_binding_sha256 = hash('8');
-        let reservation_dropped = Arc::clone(&resolver.reservation_dropped);
+        let mut resolver = TestResolver::new(exact_observation(), deadline);
+        resolver.lock_identity = "../../path-like-lock".to_owned();
         assert_eq!(
-            prepare_rescue_fstab_preflight(
-                admission(exact.plan_hash(), exact.target_snapshot(), true),
-                exact.clone(),
-                &mut resolver,
-            )
-            .expect_err("reservation binding drift"),
-            RescueFstabPreflightError::ReservationBindingMismatch
+            prepare_rescue_fstab_plan(exact_intent(), &mut resolver, deadline)
+                .expect_err("receipt rejection"),
+            RescueFstabPreflightError::ReceiptRejected
         );
-        assert!(reservation_dropped.load(Ordering::SeqCst));
+        assert_eq!(
+            resolver.calls(),
+            ["acquire", "observe", "reserve", "cancel"]
+        );
 
-        let mut resolver = TestResolver::new(exact_material());
-        resolver.lock_identity = "../../target-lock".to_owned();
+        let mut resolver = TestResolver::new(exact_observation(), deadline);
+        resolver.vault = vault('a');
+        resolver.cancel_fails = true;
         assert_eq!(
-            prepare_rescue_fstab_preflight(
-                admission(exact.plan_hash(), exact.target_snapshot(), true),
-                exact,
-                &mut resolver,
-            )
-            .expect_err("path-like lock identity"),
-            RescueFstabPreflightError::InvalidLockIdentity
+            prepare_rescue_fstab_plan(exact_intent(), &mut resolver, deadline)
+                .expect_err("cancellation failure"),
+            RescueFstabPreflightError::CancellationFailed
         );
-        assert!(resolver.lock_dropped.load(Ordering::SeqCst));
+        assert_eq!(
+            resolver.calls(),
+            ["acquire", "observe", "reserve", "cancel"]
+        );
     }
 }
