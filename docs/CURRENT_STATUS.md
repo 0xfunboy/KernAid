@@ -45,7 +45,7 @@ WinPE Companion and Fleet management remain later milestones.
 | Rescue provider plumbing | Feature-gated OpenAI executor and loopback relay are implemented, but live TLS and a real-account lifecycle are not yet qualified |
 | Virtual testing | Disposable QEMU fixtures, byte-level mutation checks, BIOS/UEFI boot and two-boot USB/vault coverage |
 | Repair experiment | Linux-only feature-gated Desk lab for one typed R2 repair and separately approved rollback on an internal temporary fixture. It now traverses the standard `SessionDriver`, Agent Gateway, explicit Core transaction states and typed broker; it remains absent from normal/Rescue builds and disconnected from production targets |
-| Disabled Rescue repair candidate | A typed ext4-only contract, read-only preview, immutable target/Vault reservation/evidence-bound transaction plan and separate Core/policy approval boundary exist for disabling one `fstab` entry whose UUID is proven missing. The off-default Repair Vault now physically reserves capacity and durably stores, reads back and authenticates the exact `fstab` bytes and metadata through path-free Reserve/Persist/Status/Get/Cancel/Retire daemon operations. A separate off-default handoff resolves the selected target twice, binds its current target fingerprint and transfers one read-only block FD to a strict Rust client. The client retains the leaf and physical-parent descriptors in a revalidating guard, while the Vault feature resolves and allowlists only the dedicated Repair Broker account. The account and hardened target-capability units remain deliberately dormant. No broker service, mounted-filesystem resolver, mutation/verification handler or automatic retention path is enabled, so normal Rescue builds still cannot mutate a target. |
+| Feature-gated Rescue repair candidate | The off-default candidate now implements one complete ext4-only path for disabling a non-critical `fstab` entry whose UUID is freshly proven missing: closed repair daemon and UI, broker-owned observation/plan preparation, distinct-device Vault backup, exact Core approval, bounded atomic replacement, verification, automatic restore and crash/reboot reconciliation. `Before`, `After` and unknown third states fail closed, and a third state is never overwritten. None of this is present in the default/stable Rescue image, which remains diagnosis-only. The end-to-end implementation exists but is not isolation-qualified, physically qualified or promoted. |
 | Rescue first boot | The promoted image provisions an all-zero p3 into the canonical LUKS2/ext4 Vault, seeds its identity and Codex home, closes it and verifies the locked profile; the exact flow passed two-boot BIOS/UEFI QEMU qualification |
 | Release channel | Canonical Release Channel v1, anti-rollback links, strict verification and an immutable internal prerelease are active through sequence 2; this is not an automatic updater or signed production channel |
 
@@ -56,18 +56,17 @@ treated as a newer release.
 
 ## What does not work yet
 
-- There are no production mutation handlers and no real customer-machine
-  repair path.
-- The disabled Rescue `fstab` candidate has a feature-gated durable Vault
-  backup store, daemon transport and read-only target-capability handshake, but
-  its dedicated account and units are dormant: the narrow Vault allowlist and
-  descriptor-bound target-parent guard exist, but there is no broker process,
-  activated service, mounted-filesystem resolver or
-  execution/verification/rollback handler.
-- Automatic Repair Vault retention and crash-safe journal compaction remain
-  explicit promotion gates; stable cancellation and exact durable retirement
-  are implemented, but the bounded experimental store is not yet a customer
-  retention system.
+- There is no mutation handler in the default/stable product and no supported
+  customer-machine repair path. The only real handler is the explicitly
+  feature-gated `fstab` candidate.
+- The candidate build profile wires its dedicated repair account, socket-activated
+  control plane, UI, executor and startup recovery barrier. It is not promoted:
+  its current service sandbox still needs `PrivateDevices=no` plus broad
+  `DeviceAllow=block-* rw` because physical-parent resolution and writable
+  acquisition are not yet fully delegated to the root capability helper.
+- Repair Vault retention, crash-safe compaction and pending-transaction
+  reconciliation are implemented; customer retention policy and destructive
+  power-loss qualification remain promotion gates.
 - Rescue zero-p3 first boot has exact-image BIOS/UEFI QEMU evidence, but no
   physical USB or firmware qualification evidence yet.
 - The fixture lab's exported webview artifact is deliberately marked volatile
@@ -144,11 +143,14 @@ passed; signing, notarization and physical-machine qualification remain open.
 2. Finish the real-account Rescue provider/vault lifecycle without exposing or
    copying the CLI credential store.
 3. Qualify Secure Boot and signed release delivery.
-4. Connect the feature-gated Rescue broker preflight to production target and
-   Vault resolvers; then add separate-device backup, execution, verification
-   and rollback. Keep mutation disabled until the complete safety case passes.
+4. Replace the candidate daemon's broad block-device access with exact
+   descriptor handoff from the root helper, then re-enable a private device
+   namespace and narrow `DeviceAllow` before promotion.
 5. Add and qualify the signed consumer/update path on top of the verified
    internal Release Channel v1 sequence.
+6. Qualify the exact repair-candidate image on disposable two-device hardware,
+   including unplug/reboot/power-loss recovery. Keep it unpromoted until the
+   physical USB and Secure Boot matrices pass.
 
 ## Where to look
 
