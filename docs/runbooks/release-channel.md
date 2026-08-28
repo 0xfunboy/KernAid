@@ -126,9 +126,12 @@ the same full commit. Before publication it:
 For sequence 2 and later the operator must name the current published channel
 head and its manifest SHA-256. The workflow downloads and validates that
 manifest, requires the immediately preceding sequence, and rejects a fork or
-a second sequence 1 before publishing. It refuses every existing release and
-accepts an existing tag only when it is a lightweight ref resolving to the
-exact qualified source commit; it never replaces assets or moves a ref.
+a second sequence 1 before publishing. It refuses every published release. An
+unpublished draft can be resumed only when its identity and complete asset
+size/digest inventory exactly match the newly verified staging set; partial or
+different drafts fail closed. It accepts an existing tag only when it is a
+lightweight ref resolving to the exact qualified source commit, and never
+replaces assets or moves a ref.
 
 GitHub's installation-scoped Actions token cannot create a tag at a historical
 commit containing workflow-file changes. The first channel bootstrap may

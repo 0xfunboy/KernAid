@@ -540,9 +540,9 @@ jobs:
         run: |
           set -euo pipefail
           tag="kernaid-internal-v${VERSION}"
+          release_exists=0
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "Release already exists: $tag" >&2
-            exit 1
+            release_exists=1
           fi
           notes="$RUNNER_TEMP/kernaid-release-notes.md"
           printf '%s\n' \
@@ -574,20 +574,40 @@ jobs:
             echo "Release tag is not the exact lightweight source ref" >&2
             exit 1
           fi
-          gh release create "$tag" \
-            --repo "$GITHUB_REPOSITORY" \
-            --verify-tag \
-            --title "KernAid ${VERSION} — internal candidate" \
-            --notes-file "$notes" \
-            --draft \
-            --prerelease \
-            "$RUNNER_TEMP"/kernaid-channel-assets/*
+          if [[ "$release_exists" == 0 ]]; then
+            gh release create "$tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --title "KernAid ${VERSION} — internal candidate" \
+              --notes-file "$notes" \
+              --draft \
+              --prerelease \
+              "$RUNNER_TEMP"/kernaid-channel-assets/*
+          fi
 
           draft="$RUNNER_TEMP/kernaid-channel-draft.json"
-          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" >"$draft"
+          draft_inventory="$RUNNER_TEMP/kernaid-channel-draft-inventory.jsonl"
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | @base64' >"$draft_inventory"
+          python3 -I -B - "$draft_inventory" "$tag" >"$draft" <<'PY'
+          import base64
+          import json
+          from pathlib import Path
+          import sys
+
+          matches = []
+          for line in Path(sys.argv[1]).read_text(encoding="ascii").splitlines():
+              document = json.loads(base64.b64decode(line, validate=True))
+              if document.get("tag_name") == sys.argv[2]:
+                  matches.append(document)
+          if len(matches) != 1:
+              raise SystemExit("release draft is absent or ambiguous")
+          sys.stdout.write(json.dumps(matches[0], sort_keys=True, separators=(",", ":")))
+          PY
           python3 -I -B - "$draft" "$RUNNER_TEMP/kernaid-channel-assets" "$tag" <<'PY'
           import hashlib
           import json
+          import os
           from pathlib import Path
           import stat
           import sys
@@ -598,6 +618,8 @@ jobs:
               document.get("tag_name") != sys.argv[3]
               or document.get("draft") is not True
               or document.get("prerelease") is not True
+              or document.get("name")
+              != f"KernAid {os.environ['VERSION']} — internal candidate"
           ):
               raise SystemExit("release draft identity is invalid")
           expected = {}
