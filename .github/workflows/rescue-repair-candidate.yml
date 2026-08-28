@@ -31,6 +31,57 @@ jobs:
             libdbus-1-dev libwebkit2gtk-4.1-dev \
             libayatana-appindicator3-dev librsvg2-dev procps
 
+      - name: Harden OVMF firmware ancestry
+        run: |
+          sudo /usr/bin/python3 -I -B - <<'PY'
+          import os
+          import stat
+
+          directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+          opened = []
+
+          def validate_trusted(descriptor):
+              current = os.fstat(descriptor)
+              if (
+                  not stat.S_ISDIR(current.st_mode)
+                  or current.st_uid != 0
+                  or current.st_gid != 0
+                  or stat.S_IMODE(current.st_mode) & 0o022
+              ):
+                  raise RuntimeError("OVMF ancestry entry is not trusted")
+
+          def harden(descriptor):
+              before = os.fstat(descriptor)
+              if not stat.S_ISDIR(before.st_mode):
+                  raise RuntimeError("OVMF ancestry entry is not a directory")
+              os.fchown(descriptor, 0, 0)
+              os.fchmod(descriptor, stat.S_IMODE(before.st_mode) & ~0o022)
+              validate_trusted(descriptor)
+
+          def open_child(parent, name, *, required):
+              try:
+                  descriptor = os.open(name, directory_flags, dir_fd=parent)
+              except FileNotFoundError:
+                  if required:
+                      raise
+                  return None
+              opened.append(descriptor)
+              harden(descriptor)
+              return descriptor
+
+          try:
+              root = os.open("/", directory_flags)
+              opened.append(root)
+              validate_trusted(root)
+              usr = open_child(root, "usr", required=True)
+              share = open_child(usr, "share", required=True)
+              open_child(share, "OVMF", required=True)
+              open_child(share, "edk2", required=False)
+          finally:
+              for descriptor in reversed(opened):
+                  os.close(descriptor)
+          PY
+
       - name: Validate candidate packaging and shell syntax
         run: |
           python3 -m unittest \
