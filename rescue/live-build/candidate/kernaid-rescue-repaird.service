@@ -1,0 +1,70 @@
+[Unit]
+Description=KernAid Rescue fstab repair candidate broker
+Requires=kernaid-rescue-repaird.socket kernaid-rescue-vaultd.socket kernaid-rescue-vaultd.service kernaid-rescue-target-capability.socket systemd-sysusers.service systemd-tmpfiles-setup.service
+BindsTo=kernaid-rescue-vaultd.service
+After=kernaid-rescue-repaird.socket kernaid-rescue-vaultd.socket kernaid-rescue-vaultd.service kernaid-rescue-target-capability.socket systemd-sysusers.service systemd-tmpfiles-setup.service
+Before=kernaid-ui.service kernaid-ready.service
+ConditionKernelCommandLine=boot=live
+ConditionKernelCommandLine=kernaid.repair=fstab-v1
+ConditionPathExists=/usr/lib/kernaid/repair-candidate-image-v1
+ConditionFileIsExecutable=/usr/lib/kernaid/kernaid-rescue-repaird
+ConditionPathIsDirectory=/run/lock/kernaid-repair
+
+[Service]
+Type=notify
+NotifyAccess=main
+Sockets=kernaid-rescue-repaird.socket
+ExecStart=/usr/lib/kernaid/kernaid-rescue-repaird
+Restart=on-failure
+RestartSec=2s
+TimeoutStartSec=180s
+TimeoutStopSec=45s
+KillMode=control-group
+SendSIGKILL=yes
+StandardInput=null
+StandardOutput=journal
+StandardError=journal
+User=kernaid-repair
+Group=kernaid-repair
+SupplementaryGroups=kernaid-vault
+UMask=0077
+LimitCORE=0
+LimitNOFILE=64
+TasksMax=16
+NoNewPrivileges=yes
+PrivateMounts=yes
+PrivateNetwork=yes
+PrivateTmp=yes
+# Candidate promotion blocker: the broker still resolves the exact physical
+# parent through /dev. DevicePolicy limits access, but PrivateDevices cannot be
+# enabled until the target helper transfers the retained parent/RW descriptor.
+PrivateDevices=no
+PrivateIPC=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+ReadWritePaths=/run/lock/kernaid-repair
+DevicePolicy=closed
+# Candidate-wide block access is still required while the broker resolves the
+# physical parent through /dev; remove it when the root helper passes that FD.
+DeviceAllow=block-* rw
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_OVERRIDE CAP_FOWNER CAP_CHOWN
+AmbientCapabilities=CAP_SYS_ADMIN CAP_DAC_OVERRIDE CAP_FOWNER CAP_CHOWN
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+KeyringMode=private
+RemoveIPC=yes
+
+[Install]
+WantedBy=multi-user.target

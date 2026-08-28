@@ -23,9 +23,39 @@ codex_client_destination="$build_dir/config/includes.chroot/usr/bin/kernaid-code
 codex_cli_destination="$build_dir/config/includes.chroot/usr/lib/kernaid/codex"
 desk_shell_binary="${KERNAID_RESCUE_DESK_SHELL_BINARY:-$repo_dir/target/release/kernaid-rescue-desk-shell}"
 desk_shell_destination="$build_dir/config/includes.chroot/usr/bin/kernaid-rescue-desk-shell"
+repair_candidate="${KERNAID_REPAIR_CANDIDATE-0}"
+repaird_binary="${KERNAID_RESCUE_REPAIRD_BINARY:-$repo_dir/target/release/kernaid-rescue-repaird}"
+repaird_destination="$build_dir/config/includes.chroot/usr/lib/kernaid/kernaid-rescue-repaird"
+repair_candidate_source="$build_dir/candidate"
+repair_candidate_marker_source="$repair_candidate_source/repair-candidate-image-v1"
+repair_candidate_marker_destination="$build_dir/config/includes.chroot/usr/lib/kernaid/repair-candidate-image-v1"
+repair_service_source="$repair_candidate_source/kernaid-rescue-repaird.service"
+repair_service_destination="$build_dir/config/includes.chroot/etc/systemd/system/kernaid-rescue-repaird.service"
+repair_socket_source="$repair_candidate_source/kernaid-rescue-repaird.socket"
+repair_socket_destination="$build_dir/config/includes.chroot/etc/systemd/system/kernaid-rescue-repaird.socket"
+repair_sysusers_source="$repair_candidate_source/kernaid-repair-candidate.conf"
+repair_sysusers_destination="$build_dir/config/includes.chroot/etc/sysusers.d/kernaid-repair-candidate.conf"
+repair_tmpfiles_source="$repair_candidate_source/kernaid-repair-candidate.tmpfiles.conf"
+repair_tmpfiles_destination="$build_dir/config/includes.chroot/usr/lib/tmpfiles.d/kernaid-repair-candidate.conf"
+repair_ui_dropin_source="$repair_candidate_source/50-kernaid-repair-candidate.conf"
+repair_ui_dropin_dir="$build_dir/config/includes.chroot/etc/systemd/system/kernaid-ui.service.d"
+repair_ui_dropin_destination="$repair_ui_dropin_dir/50-kernaid-repair-candidate.conf"
+repair_ready_dropin_source="$repair_candidate_source/50-kernaid-repair-candidate-ready.conf"
+repair_ready_dropin_dir="$build_dir/config/includes.chroot/etc/systemd/system/kernaid-ready.service.d"
+repair_ready_dropin_destination="$repair_ready_dropin_dir/50-kernaid-repair-candidate.conf"
 vaultd_destination_dir="$(dirname "$vaultd_destination")"
 vaultctl_destination_dir="$(dirname "$vaultctl_destination")"
 vaultctl_destination_dir_created=0
+repair_ui_dropin_dir_created=0
+repair_ready_dropin_dir_created=0
+
+case "$repair_candidate" in
+  0|1) ;;
+  *)
+    echo "KERNAID_REPAIR_CANDIDATE must be exactly 0 or 1" >&2
+    exit 2
+    ;;
+esac
 
 for command in lb python3; do
   command -v "$command" >/dev/null || { echo "Missing required command: $command" >&2; exit 2; }
@@ -66,6 +96,25 @@ validate_amd64_elf "$hardware_inventory_binary" "Linux hardware inventory collec
 validate_amd64_elf "$codex_bridge_binary" "Rescue Codex bridge"
 validate_amd64_elf "$codex_client_binary" "Rescue Codex client"
 validate_amd64_elf "$desk_shell_binary" "Rescue Tauri Desk shell"
+if [[ "$repair_candidate" = "1" ]]; then
+  validate_amd64_elf "$repaird_binary" "Rescue fstab repair candidate broker"
+fi
+
+if [[ "$repair_candidate" = "1" ]]; then
+  for candidate_source in \
+    "$repair_candidate_marker_source" \
+    "$repair_service_source" \
+    "$repair_socket_source" \
+    "$repair_sysusers_source" \
+    "$repair_tmpfiles_source" \
+    "$repair_ui_dropin_source" \
+    "$repair_ready_dropin_source"; do
+    [[ -f "$candidate_source" && ! -L "$candidate_source" ]] || {
+      echo "Rescue repair candidate packaging source is missing or unsafe: $candidate_source" >&2
+      exit 2
+    }
+  done
+fi
 
 python3 -I - "$repo_dir/tools/build-rescue/verify-codex-cli.py" \
   "$repo_dir/rescue/codex/codex-cli.lock.json" "$codex_cli_binary" <<'PY'
@@ -98,12 +147,52 @@ for destination in \
   "$codex_bridge_destination" \
   "$codex_client_destination" \
   "$codex_cli_destination" \
-  "$desk_shell_destination"; do
+  "$desk_shell_destination" \
+  "$repaird_destination" \
+  "$repair_candidate_marker_destination" \
+  "$repair_service_destination" \
+  "$repair_socket_destination" \
+  "$repair_sysusers_destination" \
+  "$repair_tmpfiles_destination" \
+  "$repair_ui_dropin_destination" \
+  "$repair_ready_dropin_destination"; do
   if [[ -e "$destination" || -L "$destination" ]]; then
     echo "Refusing to overwrite a pre-existing staged Rescue binary: $destination" >&2
     exit 2
   fi
 done
+
+cleanup_staged_binaries() {
+  rm -f -- \
+    "$vaultd_destination" \
+    "$firstboot_destination" \
+    "$codex_mounter_destination" \
+    "$vaultctl_destination" \
+    "$openai_executor_destination" \
+    "$hardware_inventory_destination" \
+    "$codex_bridge_destination" \
+    "$codex_client_destination" \
+    "$codex_cli_destination" \
+    "$desk_shell_destination" \
+    "$repaird_destination" \
+    "$repair_candidate_marker_destination" \
+    "$repair_service_destination" \
+    "$repair_socket_destination" \
+    "$repair_sysusers_destination" \
+    "$repair_tmpfiles_destination" \
+    "$repair_ui_dropin_destination" \
+    "$repair_ready_dropin_destination"
+  if [[ "$vaultctl_destination_dir_created" = "1" ]]; then
+    rmdir -- "$vaultctl_destination_dir"
+  fi
+  if [[ "$repair_ui_dropin_dir_created" = "1" ]]; then
+    rmdir -- "$repair_ui_dropin_dir"
+  fi
+  if [[ "$repair_ready_dropin_dir_created" = "1" ]]; then
+    rmdir -- "$repair_ready_dropin_dir"
+  fi
+}
+trap cleanup_staged_binaries EXIT
 
 [[ -d "$vaultd_destination_dir" && ! -L "$vaultd_destination_dir" ]] || {
   echo "Rescue daemon staging directory is missing or unsafe" >&2
@@ -118,24 +207,26 @@ else
   install -d -m 0755 "$vaultctl_destination_dir"
   vaultctl_destination_dir_created=1
 fi
-
-cleanup_staged_binaries() {
-  rm -f -- \
-    "$vaultd_destination" \
-    "$firstboot_destination" \
-    "$codex_mounter_destination" \
-    "$vaultctl_destination" \
-    "$openai_executor_destination" \
-    "$hardware_inventory_destination" \
-    "$codex_bridge_destination" \
-    "$codex_client_destination" \
-    "$codex_cli_destination" \
-    "$desk_shell_destination"
-  if [[ "$vaultctl_destination_dir_created" = "1" ]]; then
-    rmdir -- "$vaultctl_destination_dir"
+if [[ "$repair_candidate" = "1" ]]; then
+  if [[ -e "$repair_ui_dropin_dir" || -L "$repair_ui_dropin_dir" ]]; then
+    [[ -d "$repair_ui_dropin_dir" && ! -L "$repair_ui_dropin_dir" ]] || {
+      echo "Rescue repair UI drop-in staging directory is unsafe" >&2
+      exit 2
+    }
+  else
+    install -d -m 0755 "$repair_ui_dropin_dir"
+    repair_ui_dropin_dir_created=1
   fi
-}
-trap cleanup_staged_binaries EXIT
+  if [[ -e "$repair_ready_dropin_dir" || -L "$repair_ready_dropin_dir" ]]; then
+    [[ -d "$repair_ready_dropin_dir" && ! -L "$repair_ready_dropin_dir" ]] || {
+      echo "Rescue repair readiness drop-in staging directory is unsafe" >&2
+      exit 2
+    }
+  else
+    install -d -m 0755 "$repair_ready_dropin_dir"
+    repair_ready_dropin_dir_created=1
+  fi
+fi
 
 install -o root -g root -m 0755 "$vaultd_binary" "$vaultd_destination"
 install -o root -g root -m 0755 "$firstboot_binary" "$firstboot_destination"
@@ -147,6 +238,23 @@ install -o root -g root -m 0755 "$codex_bridge_binary" "$codex_bridge_destinatio
 install -o root -g root -m 0755 "$codex_client_binary" "$codex_client_destination"
 install -o root -g root -m 0755 "$codex_cli_binary" "$codex_cli_destination"
 install -o root -g root -m 0755 "$desk_shell_binary" "$desk_shell_destination"
+if [[ "$repair_candidate" = "1" ]]; then
+  install -o root -g root -m 0755 "$repaird_binary" "$repaird_destination"
+  install -o root -g root -m 0644 \
+    "$repair_candidate_marker_source" "$repair_candidate_marker_destination"
+  install -o root -g root -m 0644 \
+    "$repair_service_source" "$repair_service_destination"
+  install -o root -g root -m 0644 \
+    "$repair_socket_source" "$repair_socket_destination"
+  install -o root -g root -m 0644 \
+    "$repair_sysusers_source" "$repair_sysusers_destination"
+  install -o root -g root -m 0644 \
+    "$repair_tmpfiles_source" "$repair_tmpfiles_destination"
+  install -o root -g root -m 0644 \
+    "$repair_ui_dropin_source" "$repair_ui_dropin_destination"
+  install -o root -g root -m 0644 \
+    "$repair_ready_dropin_source" "$repair_ready_dropin_destination"
+fi
 for destination in \
   "$vaultd_destination" \
   "$firstboot_destination" \
@@ -190,6 +298,21 @@ finally:
 PY
 python3 -I "$repo_dir/tools/build-rescue/verify-shipping-binary.py" \
   --profile tauri-webkit "$desk_shell_destination"
+if [[ "$repair_candidate" = "1" ]]; then
+  test "$(stat -c '%u:%g:%a' "$repaird_destination")" = "0:0:755"
+  for candidate_configuration in \
+    "$repair_candidate_marker_destination" \
+    "$repair_service_destination" \
+    "$repair_socket_destination" \
+    "$repair_sysusers_destination" \
+    "$repair_tmpfiles_destination" \
+    "$repair_ui_dropin_destination" \
+    "$repair_ready_dropin_destination"; do
+    test "$(stat -c '%u:%g:%a' "$candidate_configuration")" = "0:0:644"
+  done
+  python3 -I "$repo_dir/tools/build-rescue/verify-shipping-binary.py" \
+    "$repaird_destination"
+fi
 
 cd "$repo_dir"
 if [[ "${KERNAID_DESK_PREBUILT:-0}" != "1" ]]; then
@@ -207,6 +330,12 @@ cd "$build_dir"
 lb clean || true
 # Keep Debian live-config from rewriting LightDM's pinned isolated autologin
 # identity to the regular live user from username=kernaid.
+repair_bootappend_suffix=""
+iso_basename="KernAid-Rescue-amd64.iso"
+if [[ "$repair_candidate" = "1" ]]; then
+  repair_bootappend_suffix=" kernaid.repair=fstab-v1"
+  iso_basename="KernAid-Rescue-amd64-repair-candidate.iso"
+fi
 lb config \
   --mode debian \
   --distribution trixie \
@@ -215,7 +344,7 @@ lb config \
   --archive-areas "main contrib non-free-firmware" \
   --debian-installer none \
   --apt-recommends false \
-  --bootappend-live "boot=live components noroot username=kernaid hostname=kernaid-rescue live-config.nox11autologin live-config.user-default-groups=audio,cdrom,dip,floppy,video,plugdev,netdev,powerdev,scanner,bluetooth,kernaid-vault,kernaid-codex-client systemd.swap=0 quiet loglevel=5 console=tty0 console=ttyS0,115200n8"
+  --bootappend-live "boot=live components noroot username=kernaid hostname=kernaid-rescue live-config.nox11autologin live-config.user-default-groups=audio,cdrom,dip,floppy,video,plugdev,netdev,powerdev,scanner,bluetooth,kernaid-vault,kernaid-codex-client systemd.swap=0 quiet loglevel=5 console=tty0 console=ttyS0,115200n8${repair_bootappend_suffix}"
 lb build
 
 iso="$(find . -maxdepth 1 -name 'live-image-amd64*.hybrid.iso' -o -name 'live-image-amd64*.iso' | head -n 1)"
@@ -223,6 +352,6 @@ test -n "$iso"
 python3 -I "$repo_dir/tools/build-rescue/finalize-device-layout.py" finalize \
   --manifest "$repo_dir/rescue/image-layout/device-layout.v1.json" \
   --image "$iso"
-mv "$iso" "$repo_dir/KernAid-Rescue-amd64.iso"
+mv "$iso" "$repo_dir/$iso_basename"
 cd "$repo_dir"
-sha256sum KernAid-Rescue-amd64.iso > KernAid-Rescue-amd64.iso.sha256
+sha256sum "$iso_basename" > "$iso_basename.sha256"
