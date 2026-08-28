@@ -17,6 +17,11 @@ pub mod rescue_fstab_candidate;
 #[cfg(all(target_os = "linux", feature = "rescue-fstab-production-candidate"))]
 pub mod rescue_fstab_observer;
 
+/// Real, off-default composition of target acquisition, read-only `fstab`
+/// observation and Repair Vault reservation for the candidate preflight.
+#[cfg(all(target_os = "linux", feature = "rescue-fstab-production-candidate"))]
+pub mod rescue_fstab_preflight_resolver;
+
 /// Linux-only client for the fixed, root-authenticated Rescue repair-vault
 /// endpoint. It is opt-in and exposes only the closed repair lifecycle.
 #[cfg(all(target_os = "linux", feature = "repair-vault-client"))]
