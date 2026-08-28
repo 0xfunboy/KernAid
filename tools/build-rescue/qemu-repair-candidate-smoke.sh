@@ -88,7 +88,15 @@ dd if="$iso" of="$rescue_media" bs=4M conv=notrunc status=none
 iso_sha256="$(sha256sum "$iso" | awk '{print $1}')"
 
 xorriso -osirrox on -indev "$iso" \
+  -return_with FAILURE 32 \
   -extract /live/filesystem.squashfs "$squashfs" >/dev/null 2>&1
+# The finalized hybrid image deliberately advertises its future Vault p3 beyond
+# the current ISO EOF. xorriso reports that known layout as SORRY, while the
+# stricter FAILURE threshold still rejects extraction or image-read failures.
+[[ -f "$squashfs" && ! -L "$squashfs" ]] || exit 1
+squashfs_bytes="$(stat -c '%s' -- "$squashfs")"
+[[ "$squashfs_bytes" =~ ^[1-9][0-9]*$ && "$squashfs_bytes" -le 8589934592 ]] \
+  || exit 1
 : >"$login_credential"
 chmod 600 -- "$login_credential"
 set +e

@@ -22,6 +22,8 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
         )
         self.assertEqual(source.count("serial=KERNAID-REPAIR-V1"), 1)
         self.assertIn("mkfs.ext4", source)
+        self.assertIn("-return_with FAILURE 32", source)
+        self.assertIn('[[ -f "$squashfs" && ! -L "$squashfs" ]]', source)
         for required in (
             'set_inode_field /etc uid 0',
             'set_inode_field /etc gid 0',
