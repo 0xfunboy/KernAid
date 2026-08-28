@@ -27,6 +27,11 @@ ISO_NAME: Final = "KernAid-Rescue-amd64.iso"
 CHECKSUM_NAME: Final = f"{ISO_NAME}.sha256"
 CATALOG_NAME: Final = "KernAid-Rescue-amd64.catalog-entry-v2.json"
 SBOM_NAME: Final = "KernAid-Rescue-amd64.codex.cdx.json"
+RETAIL_IMAGE_NAME: Final = "KernAid-Rescue-amd64-retail.img.xz"
+RETAIL_CHECKSUM_NAME: Final = f"{RETAIL_IMAGE_NAME}.sha256"
+RETAIL_METADATA_NAME: Final = "KernAid-Rescue-amd64-retail.json"
+P3_ZERO_SHA256: Final = "ebfb4ef19ae410f190327b5ebd312711263bc7579970e87d9c1e2d84e06b3c25"
+MAX_RETAIL_COMPRESSED_BYTES: Final = 1_999_999_998
 SNAPSHOT_EVIDENCE_NAME: Final = "kernaid-linux-snapshot-e2e.sanitized.log"
 USB_EVIDENCE_NAMES: Final = {
     "bios": "rescue-usb-smoke-bios.log",
@@ -42,6 +47,7 @@ REQUIRED_JOBS: Final = (
     "vault-lifecycle-uefi",
 )
 COMMIT_RE: Final = re.compile(r"[0-9a-f]{40}\Z")
+SHA256_RE: Final = re.compile(r"[0-9a-f]{64}\Z")
 CHUNK_BYTES: Final = 4 * 1024 * 1024
 MAX_ISO_BYTES: Final = 16 * 1024 * 1024 * 1024
 MAX_JSON_BYTES: Final = 16 * 1024 * 1024
@@ -190,6 +196,18 @@ def _validate_checksum(path: Path, iso: Mapping[str, Any]) -> dict[str, Any]:
     return {"bytes": size, "name": CHECKSUM_NAME, "sha256": digest}
 
 
+def _validate_named_checksum(
+    path: Path, expected_name: str, artifact: Mapping[str, Any], artifact_name: str
+) -> dict[str, Any]:
+    size, digest, content = _regular_file(path, "retail checksum", 1024, capture=True)
+    assert content is not None
+    if path.name != expected_name or not hmac.compare_digest(
+        content, f"{artifact['sha256']}  {artifact_name}\n".encode("ascii")
+    ):
+        raise QualificationError("retail checksum does not bind the exact compressed image")
+    return {"bytes": size, "name": expected_name, "sha256": digest}
+
+
 def _validate_catalog(
     catalog: Mapping[str, Any],
     *,
@@ -296,6 +314,42 @@ def build_manifest(arguments: argparse.Namespace) -> dict[str, Any]:
     )
     iso = _metadata(arguments.iso, ISO_NAME, "Rescue ISO", MAX_ISO_BYTES)
     checksum = _validate_checksum(arguments.checksum, iso)
+    retail_image = _metadata(
+        arguments.retail_image,
+        RETAIL_IMAGE_NAME,
+        "compressed retail image",
+        MAX_RETAIL_COMPRESSED_BYTES,
+    )
+    retail_checksum = _validate_named_checksum(
+        arguments.retail_checksum, RETAIL_CHECKSUM_NAME, retail_image, RETAIL_IMAGE_NAME
+    )
+    retail_document, retail_metadata = _json_document(
+        arguments.retail_metadata, RETAIL_METADATA_NAME, "retail image metadata"
+    )
+    retail_root = _exact_mapping(
+        retail_document,
+        {"compressed", "isoPrefix", "p3", "raw", "schema", "tailZero"},
+        "retail image metadata",
+    )
+    retail_raw = _exact_mapping(retail_root.get("raw"), {"bytes", "name", "sha256"}, "retail raw")
+    retail_p3 = _exact_mapping(
+        retail_root.get("p3"), {"bytes", "sha256", "startBytes", "zero"}, "retail p3"
+    )
+    if (
+        retail_root.get("schema") != "dev.kernaid.rescue-retail-image.v1"
+        or retail_root.get("compressed") != retail_image
+        or retail_root.get("isoPrefix") != {"bytes": iso["bytes"], "sha256": iso["sha256"]}
+        or retail_raw.get("bytes") != 32_000_000_000
+        or retail_raw.get("name") != "KernAid-Rescue-amd64-retail.img"
+        or not isinstance(retail_raw.get("sha256"), str)
+        or SHA256_RE.fullmatch(retail_raw["sha256"]) is None
+        or retail_p3.get("startBytes") != 17_179_869_184
+        or retail_p3.get("bytes") != 8_589_934_592
+        or retail_p3.get("zero") is not True
+        or retail_p3.get("sha256") != P3_ZERO_SHA256
+        or retail_root.get("tailZero") is not True
+    ):
+        raise QualificationError("retail metadata does not bind the exact fixed image layout")
 
     usb_evidence: dict[str, dict[str, Any]] = {}
     for firmware in ("bios", "uefi"):
@@ -363,6 +417,12 @@ def build_manifest(arguments: argparse.Namespace) -> dict[str, Any]:
             "catalogV2Entry": catalog_metadata,
             "codexSbomTranche": sbom_metadata,
             "iso": {**iso, "checksum": checksum},
+            "retailImage": {
+                **retail_image,
+                "checksum": retail_checksum,
+                "layout": retail_document,
+                "metadata": retail_metadata,
+            },
         },
         "evidence": {
             "linuxSnapshotE2e": snapshot_metadata,
@@ -442,6 +502,9 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--artifact-version", required=True)
     parser.add_argument("--iso", required=True, type=Path)
     parser.add_argument("--checksum", required=True, type=Path)
+    parser.add_argument("--retail-image", required=True, type=Path)
+    parser.add_argument("--retail-checksum", required=True, type=Path)
+    parser.add_argument("--retail-metadata", required=True, type=Path)
     parser.add_argument("--catalog", required=True, type=Path)
     parser.add_argument("--sbom", required=True, type=Path)
     parser.add_argument("--snapshot-evidence", required=True, type=Path)

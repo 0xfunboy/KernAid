@@ -28,17 +28,20 @@ physical validation item.
 
 On the protected `main` branch, the `rescue` workflow publishes
 `KernAid-Rescue-amd64-qualified` only after the image build/smoke job and both
-isolated BIOS and UEFI two-boot Vault lifecycle jobs succeed. The bundle
-contains the exact ISO, checksum, catalog-v2 entry,
-pinned-Codex SBOM tranche and the evidence files. Its canonical
+isolated BIOS and UEFI two-boot Vault lifecycle jobs succeed. The core bundle
+contains the exact ISO, checksum, catalog-v2 entry, retail checksum/layout and
+attestation metadata, pinned-Codex SBOM tranche and the evidence files. The
+compressed 32,000,000,000-byte Windows retail raw image is published as the
+separate `KernAid-Rescue-amd64-qualified-retail` artifact. Its canonical
 `KernAid-Rescue-amd64.qualified.json` binds the source commit, workflow run and
-attempt, artifact version, ISO byte size and SHA-256, and the SHA-256 of every
+attempt, artifact version, ISO and retail-image sizes and SHA-256 values, the
+raw-image and zero-p3 binding, and the SHA-256 of every
 catalog, SBOM and evidence input. This is virtual qualification only; it does
 not satisfy the physical-machine or Secure Boot gates.
 
-GitHub signs both standard build provenance and a custom Sigstore attestation
-whose subject is the ISO and whose predicate is that exact manifest. The
-downloaded artifact contains both returned bundles under deterministic names.
+GitHub signs standard ISO build provenance and custom Sigstore attestations for
+both the ISO and retail image whose predicate is that exact manifest. The core
+artifact contains the returned bundles under deterministic names.
 With a current GitHub CLI that supports `gh attestation`, verify the repository
 and signing workflow before trusting the files. The custom qualification
 predicate contains a URL fragment, so verify its downloaded bundle directly
@@ -57,6 +60,14 @@ gh attestation verify KernAid-Rescue-amd64.iso \
   --source-ref refs/heads/main \
   --predicate-type \
   'https://github.com/0xfunboy/KernAid/blob/main/docs/operator-guide.md#rescue-qualification-manifest-v1'
+
+gh attestation verify KernAid-Rescue-amd64-retail.img.xz \
+  -R 0xfunboy/KernAid \
+  --bundle KernAid-Rescue-amd64-retail.qualification.sigstore.json \
+  --signer-workflow 0xfunboy/KernAid/.github/workflows/rescue.yml \
+  --source-ref refs/heads/main \
+  --predicate-type \
+  'https://github.com/0xfunboy/KernAid/blob/main/docs/operator-guide.md#rescue-qualification-manifest-v1'
 ```
 
 Then compare `KernAid-Rescue-amd64.iso` with its `.sha256` file. A build-only
@@ -65,41 +76,49 @@ release bundle.
 
 ### Windows: physical boot qualification only
 
+For workflow releases whose qualification manifest contains `retailImage`, use
+`KernAid-Rescue-amd64-retail.img.xz` directly with a current Rufus in raw/DD
+mode and verify its adjacent checksum first. The compressed image expands to
+exactly 32,000,000,000 bytes and carries an all-zero p3 for first-boot Vault
+provisioning; its manifest records the compressed, expanded and p3 digests.
+
 Use only the exact private candidate identified in `docs/CURRENT_STATUS.md`.
-This checks whether that image boots on real hardware; it bypasses the trust
-catalog and does not create or qualify the encrypted persistent vault.
+This checks the candidate on real hardware; it does not promote the release.
+Completing first boot creates a local encrypted Vault on that disposable USB,
+but one successful device does not qualify every USB or firmware combination.
 
 1. Use a factory-new or disposable USB drive of at least 32 GB. Rufus overwrites
-   the image-sized bootable prefix, but residual tail data may remain
-   recoverable; this procedure is not media sanitization.
-2. Verify the downloaded ISO in PowerShell with
-   `Get-FileHash .\KernAid-Rescue-amd64-015ee8f-internal.iso -Algorithm SHA256`
-   and compare the complete digest with the downloaded `.sha256` file and the
-   exact value in `CURRENT_STATUS.md`.
-3. Write that exact ISO with Rufus. If Rufus asks between ISO and DD modes,
-   choose **DD mode**. Double-check the selected USB before starting.
+   the first 32,000,000,000 bytes, but a larger device may retain data beyond
+   that boundary; this procedure is not whole-media sanitization.
+2. Verify the downloaded `.img.xz` in PowerShell with
+   `Get-FileHash .\KernAid-Rescue-amd64-retail.img.xz -Algorithm SHA256` and
+   compare the complete digest with its adjacent `.sha256` file and the exact
+   value in the qualification manifest.
+3. Write that exact `.img.xz` with Rufus. If Rufus offers a mode choice, choose
+   raw/DD mode. Double-check the selected USB before starting.
 4. For this engineering preview, disable Secure Boot. Disconnect customer,
    irreplaceable and unrelated data drives whenever practical, then use the
    firmware one-time boot menu rather than changing the permanent boot order.
-5. Confirm that the KernAid UI opens, record machine/firmware/network results,
-   and stop if the UI or expected read-only state is missing. Do not perform
-   customer repairs from this qualification medium.
+5. On `tty1`, enter the new Vault passphrase twice, then confirm that the
+   KernAid UI opens. Reboot the same USB once and verify that the same Vault
+   identity persists. Record machine/firmware/network results and stop if the
+   UI or expected read-only state is missing. Do not perform customer repairs
+   from this qualification medium.
 
 Rufus is preferred over balenaEtcher for this Windows qualification procedure
 because it exposes the target and DD-mode choice clearly. The Linux v2 writer
 is the catalog-bound vault-provisioning path for this exact promoted image.
 
-Newer Rescue builds that explicitly include the first-boot gate behave
-differently. When a raw-written USB still has the exact boot medium's complete
-8 GiB p3 in the all-zero state, boot pauses on tty1 before the graphical UI and
-asks for a new Vault passphrase twice. Use at least 12 bytes and retain it: the
-passphrase is not recoverable by KernAid. A matching entry provisions the
-canonical encrypted Vault, closes it, verifies the locked state, and then lets
-normal boot continue. An existing valid Vault or an optical boot does not
-prompt; mixed/non-zero or failed media records a fail-closed error and still
-allows the recovery UI to start. This path has no device selector and cannot
-be aimed at a customer disk. It remains an engineering feature until an exact
-new ISO passes zero-p3 QEMU and physical USB qualification and is promoted in
+The retail image guarantees that the boot medium's complete 8 GiB p3 starts in
+the all-zero state. Boot pauses on tty1 before the graphical UI and asks for a
+new Vault passphrase twice. Use at least 12 bytes and retain it: the passphrase
+is not recoverable by KernAid. A matching entry provisions the canonical
+encrypted Vault, closes it, verifies the locked state, and then lets normal
+boot continue. An existing valid Vault or an optical boot does not prompt;
+mixed/non-zero or failed media records a fail-closed error and still allows the
+recovery UI to start. This path has no device selector and cannot be aimed at a
+customer disk. It remains an engineering feature until the exact image passes
+zero-p3 QEMU and physical USB qualification and is promoted in
 `CURRENT_STATUS.md`.
 
 ## Diagnose from Rescue

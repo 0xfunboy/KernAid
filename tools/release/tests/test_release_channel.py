@@ -12,6 +12,7 @@ import unittest
 REPO_DIR = Path(__file__).resolve().parents[3]
 SCRIPT = REPO_DIR / "tools/release/release_channel.py"
 SCHEMA = REPO_DIR / "tools/release/release-channel.v1.schema.json"
+WORKFLOW = REPO_DIR / ".github/workflows/release-channel.yml"
 COMMIT = "0123456789abcdef0123456789abcdef01234567"
 
 
@@ -23,9 +24,11 @@ class ReleaseChannelTests(unittest.TestCase):
         self.desk = self.root / "KernAid-Desk-linux-x86_64.AppImage"
         self.rescue = self.root / "KernAid-Rescue-amd64-qualified.zip"
         self.qualification = self.root / "KernAid-Rescue-amd64.qualified.json"
+        self.retail = self.root / "KernAid-Rescue-amd64-retail.img.xz"
         self.desk.write_bytes(b"desk-package-v1\0" * 31)
         self.rescue.write_bytes(b"rescue-image-v1\0" * 37)
         self.qualification.write_bytes(b'{"qualified":true}\n')
+        self.retail.write_bytes(b"compressed-retail-image-v1\0" * 29)
         self.descriptor = self.root / "descriptor.json"
         self.manifest = self.root / "channel.json"
 
@@ -71,6 +74,14 @@ class ReleaseChannelTests(unittest.TestCase):
                     path=self.qualification,
                     media_type="application/json",
                     variant="qualified-zip",
+                ),
+                self.artifact(
+                    component="rescue",
+                    platform="rescue",
+                    kind="image",
+                    path=self.retail,
+                    media_type="application/x-xz",
+                    variant="retail-img-xz",
                 ),
                 self.artifact(
                     component="desk",
@@ -154,7 +165,7 @@ class ReleaseChannelTests(unittest.TestCase):
         )
         self.assertEqual(
             [artifact["component"] for artifact in document["artifacts"]],
-            ["desk", "rescue", "rescue"],
+            ["desk", "rescue", "rescue", "rescue"],
         )
         rescue = next(
             artifact
@@ -165,6 +176,12 @@ class ReleaseChannelTests(unittest.TestCase):
             rescue["sha256"], hashlib.sha256(self.rescue.read_bytes()).hexdigest()
         )
         self.assertEqual(rescue["provenance"]["runId"], 33000000002)
+        retail = next(
+            artifact
+            for artifact in document["artifacts"]
+            if artifact["variant"] == "retail-img-xz"
+        )
+        self.assertEqual(retail["filename"], self.retail.name)
         verified = self.run_verify()
         self.assertEqual(verified.returncode, 0, verified.stderr)
         self.assertEqual(created.stdout, verified.stdout)
@@ -257,6 +274,24 @@ class ReleaseChannelTests(unittest.TestCase):
             "dev.kernaid.release-channel.v1",
         )
         self.assertFalse(schema["$defs"]["artifact"]["additionalProperties"])
+        self.assertEqual(schema["$defs"]["artifact"]["properties"]["bytes"]["maximum"], 1_999_999_998)
+        self.assertIn(
+            "retail-img-xz", schema["$defs"]["artifact"]["properties"]["variant"]["enum"]
+        )
+
+    def test_publisher_splits_and_reverifies_the_retail_asset(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("KernAid-Rescue-amd64-qualified-retail", workflow)
+        self.assertIn("KernAid-Rescue-amd64-retail.qualification.sigstore.json", workflow)
+        self.assertIn('"variant": "retail-img-xz"', workflow)
+        self.assertGreaterEqual(workflow.count("1_999_999_999"), 3)
+        rename = workflow.index("os.rename(source, destination)")
+        attest = workflow.index('gh attestation verify "$qualified/KernAid-Rescue-amd64-retail.img.xz"')
+        manifest = workflow.index("qualification-manifest.py verify")
+        self.assertLess(manifest, attest)
+        self.assertLess(attest, rename)
+        self.assertNotIn("os.link(qualified_output, release_output)", workflow)
+        self.assertIn("moved.st_nlink != 1", workflow)
 
 
 if __name__ == "__main__":

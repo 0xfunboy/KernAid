@@ -317,6 +317,8 @@ jobs:
             "KernAid-Desk-${VERSION}-macos-x86_64-dmg.zip"
           download_zip "$metadata/rescue-artifacts.json" KernAid-Rescue-amd64-qualified \
             "KernAid-Rescue-${VERSION}-x86_64-qualified.zip"
+          download_zip "$metadata/rescue-artifacts.json" KernAid-Rescue-amd64-qualified-retail \
+            ".KernAid-Rescue-${VERSION}-x86_64-retail-actions.zip"
 
       - name: Reverify the qualified Rescue payload
         env:
@@ -345,6 +347,9 @@ jobs:
               "KernAid-Rescue-amd64.provenance.sigstore.json",
               "KernAid-Rescue-amd64.qualification.sigstore.json",
               "KernAid-Rescue-amd64.qualified.json",
+              "KernAid-Rescue-amd64-retail.img.xz.sha256",
+              "KernAid-Rescue-amd64-retail.json",
+              "KernAid-Rescue-amd64-retail.qualification.sigstore.json",
               "kernaid-linux-snapshot-e2e.sanitized.log",
               "kernaid-vault-lifecycle-bios.sanitized.log",
               "kernaid-vault-lifecycle-uefi.sanitized.log",
@@ -374,6 +379,34 @@ jobs:
                       os.fsync(target.fileno())
                   output.chmod(0o600)
           PY
+          retail_actions="$RUNNER_TEMP/kernaid-channel-assets/.KernAid-Rescue-${VERSION}-x86_64-retail-actions.zip"
+          retail_release="$RUNNER_TEMP/kernaid-channel-assets/KernAid-Rescue-${VERSION}-x86_64-retail.img.xz"
+          python3 -I -B - "$retail_actions" "$qualified/KernAid-Rescue-amd64-retail.img.xz" <<'PY'
+          import os
+          from pathlib import Path
+          import shutil
+          import stat
+          import sys
+          import zipfile
+
+          archive, qualified_output = map(Path, sys.argv[1:])
+          expected = "KernAid-Rescue-amd64-retail.img.xz"
+          with zipfile.ZipFile(archive) as bundle:
+              members = bundle.infolist()
+              if len(members) != 1 or members[0].filename != expected:
+                  raise SystemExit("retail Actions artifact members are not exact")
+              member = members[0]
+              mode = member.external_attr >> 16
+              if member.is_dir() or (mode and not stat.S_ISREG(mode)):
+                  raise SystemExit("retail Actions artifact member is unsafe")
+              if not 0 < member.file_size < 1_999_999_999:
+                  raise SystemExit("retail release asset exceeds the GitHub asset bound")
+              with bundle.open(member) as source, qualified_output.open("xb") as target:
+                  shutil.copyfileobj(source, target, 4 * 1024 * 1024)
+                  target.flush()
+                  os.fsync(target.fileno())
+          archive.unlink()
+          PY
           attempt="$(python3 -I -B -c 'import json,sys; print(json.load(open(sys.argv[1]))["run_attempt"])' \
             "$RUNNER_TEMP/kernaid-channel-metadata/rescue-run.json")"
           run_url="https://github.com/$GITHUB_REPOSITORY/actions/runs/$RESCUE_RUN_ID"
@@ -386,6 +419,9 @@ jobs:
             --artifact-version "ci-${RESCUE_RUN_ID}-${attempt}"
             --iso "$qualified/KernAid-Rescue-amd64.iso"
             --checksum "$qualified/KernAid-Rescue-amd64.iso.sha256"
+            --retail-image "$qualified/KernAid-Rescue-amd64-retail.img.xz"
+            --retail-checksum "$qualified/KernAid-Rescue-amd64-retail.img.xz.sha256"
+            --retail-metadata "$qualified/KernAid-Rescue-amd64-retail.json"
             --catalog "$qualified/KernAid-Rescue-amd64.catalog-entry-v2.json"
             --sbom "$qualified/KernAid-Rescue-amd64.codex.cdx.json"
             --snapshot-evidence "$qualified/kernaid-linux-snapshot-e2e.sanitized.log"
@@ -410,6 +446,44 @@ jobs:
             --source-ref refs/heads/main \
             --predicate-type \
             'https://github.com/0xfunboy/KernAid/blob/main/docs/operator-guide.md#rescue-qualification-manifest-v1'
+          gh attestation verify "$qualified/KernAid-Rescue-amd64-retail.img.xz" \
+            -R "$GITHUB_REPOSITORY" \
+            --bundle "$qualified/KernAid-Rescue-amd64-retail.qualification.sigstore.json" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/rescue.yml" \
+            --source-digest "$SOURCE_COMMIT" \
+            --source-ref refs/heads/main \
+            --predicate-type \
+            'https://github.com/0xfunboy/KernAid/blob/main/docs/operator-guide.md#rescue-qualification-manifest-v1'
+          python3 -I -B - \
+            "$qualified/KernAid-Rescue-amd64-retail.img.xz" "$retail_release" <<'PY'
+          import os
+          from pathlib import Path
+          import stat
+          import sys
+
+          source, destination = map(Path, sys.argv[1:])
+          details = source.lstat()
+          if not stat.S_ISREG(details.st_mode) or details.st_nlink != 1:
+              raise SystemExit("verified retail source identity is unsafe")
+          try:
+              destination.lstat()
+          except FileNotFoundError:
+              pass
+          else:
+              raise SystemExit("retail release destination already exists")
+          if destination.parent.stat().st_dev != details.st_dev:
+              raise SystemExit("retail release rename would cross filesystems")
+          os.rename(source, destination)
+          moved = destination.lstat()
+          if (
+              not stat.S_ISREG(moved.st_mode)
+              or moved.st_nlink != 1
+              or (moved.st_dev, moved.st_ino, moved.st_size)
+              != (details.st_dev, details.st_ino, details.st_size)
+              or source.exists()
+          ):
+              raise SystemExit("retail release atomic rename did not preserve identity")
+          PY
 
       - name: Build and verify the canonical channel manifest
         env:
@@ -489,6 +563,23 @@ jobs:
               },
               "url": f"{base}/{filename}",
               "variant": "qualified-zip",
+              "version": version,
+          })
+          retail_filename = f"KernAid-Rescue-{version}-x86_64-retail.img.xz"
+          artifacts.append({
+              "architecture": "x86_64",
+              "component": "rescue",
+              "kind": "image",
+              "mediaType": "application/x-xz",
+              "path": str((staging / retail_filename).resolve()),
+              "platform": "rescue",
+              "provenance": {
+                  "runAttempt": rescue_attempt,
+                  "runId": rescue_run,
+                  "workflow": ".github/workflows/rescue.yml",
+              },
+              "url": f"{base}/{retail_filename}",
+              "variant": "retail-img-xz",
               "version": version,
           })
           sequence = int(os.environ["CHANNEL_SEQUENCE"])
@@ -575,6 +666,14 @@ jobs:
             exit 1
           fi
           if [[ "$release_exists" == 0 ]]; then
+            python3 -I -B - "$RUNNER_TEMP/kernaid-channel-assets" <<'PY'
+          from pathlib import Path
+          import sys
+          root = Path(sys.argv[1])
+          oversized = [path.name for path in root.iterdir() if path.stat().st_size >= 1_999_999_999]
+          if oversized:
+              raise SystemExit(f"release assets exceed the 2 GB bound: {oversized}")
+          PY
             gh release create "$tag" \
               --repo "$GITHUB_REPOSITORY" \
               --verify-tag \
@@ -625,7 +724,11 @@ jobs:
           expected = {}
           for path in root.iterdir():
               details = path.lstat()
-              if not stat.S_ISREG(details.st_mode) or details.st_nlink != 1:
+              if (
+                  not stat.S_ISREG(details.st_mode)
+                  or details.st_nlink != 1
+                  or not 0 < details.st_size < 1_999_999_999
+              ):
                   raise SystemExit("staged release asset is unsafe")
               digest = hashlib.sha256()
               with path.open("rb") as stream:

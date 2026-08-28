@@ -72,7 +72,11 @@ exactly one `package`; every Rescue group requires exactly one `image`.
 Therefore Linux can publish AppImage, DEB and RPM together, Windows MSI and
 NSIS together, and macOS app bundle and DMG together without colliding. The
 accepted variants are `appimage`, `deb`, `rpm`, `msi`, `nsis`, `app`, `dmg`,
-and Rescue `qualified-zip`; each is valid only on its matching platform.
+and Rescue `qualified-zip` or `retail-img-xz`; each is valid only on its
+matching platform. The compressed Windows retail image is a separate
+`retail-img-xz` image record and release asset, never a member of the qualified
+ZIP. The publisher rejects every individual GitHub Release asset at or above
+1,999,999,999 bytes.
 Additional records may be `checksum`, `qualification`, `sbom`, or `signature`.
 All files in one variant group must identify the same run. Desk uses
 `desktop.yml`; Rescue uses `rescue.yml`.
@@ -114,8 +118,8 @@ successful Desk run and one exact virtually qualified Rescue run built from
 the same full commit. Before publication it:
 
 - verifies both first-attempt run identities, workflow paths and artifact names;
-- re-runs the Rescue qualification-manifest verifier and both GitHub/Sigstore
-  checks on the extracted ISO;
+- re-runs the Rescue qualification-manifest verifier and GitHub/Sigstore checks
+  on both the extracted ISO and separately downloaded retail image;
 - wraps each immutable Actions artifact under a versioned filename, builds
   and re-verifies the canonical manifest;
 - attests the complete staged channel with GitHub OIDC; and

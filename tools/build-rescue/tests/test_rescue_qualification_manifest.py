@@ -31,6 +31,23 @@ class RescueQualificationManifestTests(unittest.TestCase):
             f"{self.iso_digest}  KernAid-Rescue-amd64.iso\n",
             encoding="ascii",
         )
+        self.retail = self.root / "KernAid-Rescue-amd64-retail.img.xz"
+        self.retail.write_bytes(b"fixture-compressed-retail")
+        self.retail_digest = hashlib.sha256(self.retail.read_bytes()).hexdigest()
+        self.retail_checksum = self.root / "KernAid-Rescue-amd64-retail.img.xz.sha256"
+        self.retail_checksum.write_text(
+            f"{self.retail_digest}  {self.retail.name}\n", encoding="ascii"
+        )
+        self.retail_metadata = self.root / "KernAid-Rescue-amd64-retail.json"
+        self.retail_metadata.write_text(
+            json.dumps({
+                "compressed": {"bytes": self.retail.stat().st_size, "name": self.retail.name, "sha256": self.retail_digest},
+                "isoPrefix": {"bytes": self.iso.stat().st_size, "sha256": self.iso_digest},
+                "p3": {"bytes": 8_589_934_592, "sha256": "ebfb4ef19ae410f190327b5ebd312711263bc7579970e87d9c1e2d84e06b3c25", "startBytes": 17_179_869_184, "zero": True},
+                "raw": {"bytes": 32_000_000_000, "name": "KernAid-Rescue-amd64-retail.img", "sha256": "1" * 64},
+                "schema": "dev.kernaid.rescue-retail-image.v1", "tailZero": True,
+            }), encoding="ascii"
+        )
 
         self.usb: dict[str, Path] = {}
         self.usb_digests: dict[str, str] = {}
@@ -128,6 +145,12 @@ class RescueQualificationManifestTests(unittest.TestCase):
             str(self.iso),
             "--checksum",
             str(self.checksum),
+            "--retail-image",
+            str(self.retail),
+            "--retail-checksum",
+            str(self.retail_checksum),
+            "--retail-metadata",
+            str(self.retail_metadata),
             "--catalog",
             str(self.catalog),
             "--sbom",
@@ -211,6 +234,16 @@ class RescueQualificationManifestTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 3)
         self.assertIn("not bound to this run attempt", result.stderr)
+
+    def test_create_refuses_claimed_zero_p3_with_wrong_digest(self) -> None:
+        metadata = json.loads(self.retail_metadata.read_text(encoding="ascii"))
+        metadata["p3"]["sha256"] = "0" * 64
+        self.retail_metadata.write_text(json.dumps(metadata), encoding="ascii")
+        result = self.run_command(
+            "create", self.root / "KernAid-Rescue-amd64.qualified.json"
+        )
+        self.assertEqual(result.returncode, 3)
+        self.assertIn("fixed image layout", result.stderr)
 
 
 if __name__ == "__main__":

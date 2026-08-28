@@ -1039,6 +1039,21 @@ jobs:
             "$input/lifecycle-bios/kernaid-vault-lifecycle-bios.sanitized.log" \
             "$input/lifecycle-uefi/kernaid-vault-lifecycle-uefi.sanitized.log" \
             "$qualified/"
+          retail_raw="$RUNNER_TEMP/KernAid-Rescue-amd64-retail.img"
+          truncate -s 32000000000 -- "$retail_raw"
+          dd if="$qualified/KernAid-Rescue-amd64.iso" of="$retail_raw" \
+            bs=4M conv=notrunc,sparse status=none
+          env -u XZ_OPT -u XZ_DEFAULTS xz --format=xz --threads=1 \
+            --check=sha256 --lzma2=preset=6 \
+            --keep --stdout -- "$retail_raw" \
+            >"$qualified/KernAid-Rescue-amd64-retail.img.xz"
+          rm -f -- "$retail_raw"
+          python3 -I -B tools/build-rescue/verify-retail-image.py \
+            --iso "$qualified/KernAid-Rescue-amd64.iso" \
+            --archive "$qualified/KernAid-Rescue-amd64-retail.img.xz" \
+            --output "$qualified/KernAid-Rescue-amd64-retail.json"
+          (cd "$qualified" && sha256sum KernAid-Rescue-amd64-retail.img.xz \
+            >KernAid-Rescue-amd64-retail.img.xz.sha256)
           manifest_args=(
             --repository "$GITHUB_REPOSITORY"
             --commit "$GITHUB_SHA"
@@ -1048,6 +1063,9 @@ jobs:
             --artifact-version "$KERNAID_ARTIFACT_VERSION"
             --iso "$qualified/KernAid-Rescue-amd64.iso"
             --checksum "$qualified/KernAid-Rescue-amd64.iso.sha256"
+            --retail-image "$qualified/KernAid-Rescue-amd64-retail.img.xz"
+            --retail-checksum "$qualified/KernAid-Rescue-amd64-retail.img.xz.sha256"
+            --retail-metadata "$qualified/KernAid-Rescue-amd64-retail.json"
             --catalog "$qualified/KernAid-Rescue-amd64.catalog-entry-v2.json"
             --sbom "$qualified/KernAid-Rescue-amd64.codex.cdx.json"
             --snapshot-evidence "$qualified/kernaid-linux-snapshot-e2e.sanitized.log"
@@ -1074,6 +1092,13 @@ jobs:
           subject-path: ${{ runner.temp }}/kernaid-rescue-qualified/KernAid-Rescue-amd64.iso
           predicate-type: https://github.com/0xfunboy/KernAid/blob/main/docs/operator-guide.md#rescue-qualification-manifest-v1
           predicate-path: ${{ runner.temp }}/kernaid-rescue-qualified/KernAid-Rescue-amd64.qualified.json
+      - name: Attest the retail image with the qualification manifest
+        id: attest_retail_qualification
+        uses: actions/attest@v4
+        with:
+          subject-path: ${{ runner.temp }}/kernaid-rescue-qualified/KernAid-Rescue-amd64-retail.img.xz
+          predicate-type: https://github.com/0xfunboy/KernAid/blob/main/docs/operator-guide.md#rescue-qualification-manifest-v1
+          predicate-path: ${{ runner.temp }}/kernaid-rescue-qualified/KernAid-Rescue-amd64.qualified.json
       - name: Include the GitHub Sigstore bundles
         run: |
           install -m 0644 -- \
@@ -1082,11 +1107,24 @@ jobs:
           install -m 0644 -- \
             "${{ steps.attest_qualification.outputs.bundle-path }}" \
             "$RUNNER_TEMP/kernaid-rescue-qualified/KernAid-Rescue-amd64.qualification.sigstore.json"
+          install -m 0644 -- \
+            "${{ steps.attest_retail_qualification.outputs.bundle-path }}" \
+            "$RUNNER_TEMP/kernaid-rescue-qualified/KernAid-Rescue-amd64-retail.qualification.sigstore.json"
       - name: Publish the qualified Rescue release
         uses: actions/upload-artifact@v4
         with:
           name: KernAid-Rescue-amd64-qualified
-          path: ${{ runner.temp }}/kernaid-rescue-qualified
+          path: |
+            ${{ runner.temp }}/kernaid-rescue-qualified
+            !${{ runner.temp }}/kernaid-rescue-qualified/KernAid-Rescue-amd64-retail.img.xz
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+      - name: Publish the qualified retail image separately
+        uses: actions/upload-artifact@v4
+        with:
+          name: KernAid-Rescue-amd64-qualified-retail
+          path: ${{ runner.temp }}/kernaid-rescue-qualified/KernAid-Rescue-amd64-retail.img.xz
           if-no-files-found: error
           retention-days: 30
           compression-level: 0

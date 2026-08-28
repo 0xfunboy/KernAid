@@ -321,9 +321,16 @@ class RescueLifecycleWorkflowTests(unittest.TestCase):
         self.assertIn("predicate-type:", attestation)
         self.assertIn("predicate-path:", attestation)
 
+        retail_attestation = named_step(
+            qualified, "Attest the retail image with the qualification manifest"
+        )
+        self.assertIn("KernAid-Rescue-amd64-retail.img.xz", retail_attestation)
+        self.assertIn("predicate-path:", retail_attestation)
+
         bundles = named_step(qualified, "Include the GitHub Sigstore bundles")
         self.assertIn("attest_provenance.outputs.bundle-path", bundles)
         self.assertIn("attest_qualification.outputs.bundle-path", bundles)
+        self.assertIn("attest_retail_qualification.outputs.bundle-path", bundles)
         self.assertIn("KernAid-Rescue-amd64.provenance.sigstore.json", bundles)
         self.assertIn("KernAid-Rescue-amd64.qualification.sigstore.json", bundles)
 
@@ -331,7 +338,7 @@ class RescueLifecycleWorkflowTests(unittest.TestCase):
         self.assertIn("uses: actions/upload-artifact@v4", publication)
         self.assertIn("name: KernAid-Rescue-amd64-qualified", publication)
         self.assertIn("if-no-files-found: error", publication)
-        self.assertEqual(qualified.count("uses: actions/attest@v4"), 2)
+        self.assertEqual(qualified.count("uses: actions/attest@v4"), 3)
         self.assertLess(qualified.rindex("uses: actions/attest@v4"), qualified.index(publication))
 
     def test_workflow_and_harness_freeze_the_two_boot_contract(self) -> None:

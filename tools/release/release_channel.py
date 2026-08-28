@@ -26,7 +26,7 @@ SCHEMA: Final = "dev.kernaid.release-channel.v1"
 INPUT_SCHEMA: Final = "dev.kernaid.release-channel-input.v1"
 REPOSITORY: Final = "0xfunboy/KernAid"
 MAX_JSON_BYTES: Final = 2 * 1024 * 1024
-MAX_ARTIFACT_BYTES: Final = 32 * 1024 * 1024 * 1024
+MAX_ARTIFACT_BYTES: Final = 1_999_999_998
 CHUNK_BYTES: Final = 4 * 1024 * 1024
 COMMIT_RE: Final = re.compile(r"[0-9a-f]{40}\Z")
 SHA256_RE: Final = re.compile(r"[0-9a-f]{64}\Z")
@@ -43,7 +43,7 @@ VARIANTS_BY_PLATFORM: Final = {
     "linux": frozenset(("appimage", "deb", "rpm")),
     "windows": frozenset(("msi", "nsis")),
     "macos": frozenset(("app", "dmg")),
-    "rescue": frozenset(("qualified-zip",)),
+    "rescue": frozenset(("qualified-zip", "retail-img-xz")),
 }
 KINDS: Final = frozenset(
     ("package", "image", "checksum", "qualification", "sbom", "signature")
