@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kernaid.dev/schemas/linux.fstab.disable-missing-uuid.v1.json",
+  "title": "KernAid Rescue missing fstab UUID repair candidate input",
+  "type": "object",
+  "additionalProperties": false,
+  "x-kernaid-action-id": "linux.fstab.disable-missing-uuid.v1",
+  "x-kernaid-production-candidate-only": true,
+  "x-kernaid-enabled-by-default": false,
+  "required": [
+    "resourceId",
+    "findingId",
+    "findingVersion",
+    "expectedBeforeSha256",
+    "observedUuidSetSha256",
+    "expectedAfterSha256"
+  ],
+  "properties": {
+    "resourceId": {
+      "const": "rescue:selected-linux-root:etc/fstab"
+    },
+    "findingId": {
+      "const": "KA-LNX-P0-003"
+    },
+    "findingVersion": {
+      "const": 2
+    },
+    "expectedBeforeSha256": {
+      "type": "string",
+      "minLength": 71,
+      "maxLength": 71,
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "observedUuidSetSha256": {
+      "type": "string",
+      "minLength": 71,
+      "maxLength": 71,
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "expectedAfterSha256": {
+      "type": "string",
+      "minLength": 71,
+      "maxLength": 71,
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    }
+  }
+}

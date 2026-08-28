@@ -1,0 +1,21 @@
+apiVersion: kernaid.dev/v1alpha1
+kind: ActionPack
+metadata:
+  name: linux-fstab-production-candidate
+  version: 0.1.0
+spec:
+  productionCandidateOnly: true
+  enabledByDefault: false
+  platforms: [linux-rescue]
+  actions:
+    - id: linux.fstab.disable-missing-uuid.v1
+      productionCandidateOnly: true
+      enabledByDefault: false
+      risk: R2
+      reversible: true
+      requiresBackup: true
+      handler: kernaid-action-linux-rescue
+      inputSchema: schemas/linux.fstab.disable-missing-uuid.v1.json
+      preflight: linux.fstab.preflight
+      validate: linux.boot.validate-fstab
+      rollback: linux.fstab.restore
