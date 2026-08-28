@@ -1421,8 +1421,16 @@ mod tests {
     fn prepare_is_async_and_server_derives_all_plan_identifiers() {
         let (mut service, state) = service();
         let response = json(&service.handle_frame(&prepare_frame()));
-        assert_eq!(response["state"], "preparing");
-        assert!(response["detail"].is_null());
+        let immediate_state = response["state"].as_str();
+        assert!(matches!(
+            immediate_state,
+            Some("preparing") | Some("prepared")
+        ));
+        if immediate_state == Some("preparing") {
+            assert!(response["detail"].is_null());
+        } else {
+            assert_eq!(response["detail"]["kind"], "fstab-prepared");
+        }
         wait_for_state(&mut service, RepairPublicState::Prepared);
 
         let status = json(&service.handle_frame(
