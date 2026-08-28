@@ -2,7 +2,7 @@
 
 KernAid is an evidence-first machine diagnosis and repair platform. This repository implements the Phase 0 feasibility spike described in the [masterplan](docs/MASTERPLAN.md). For the concise, date-stamped distinction between what works now and what remains unqualified, start with [Current status](docs/CURRENT_STATUS.md). For a compact map of the product, repository, build host and release flow, see the [Project map](docs/PROJECT_MAP.md).
 
-The current Phase 0 engineering vertical slice is deliberately safe: start a session, collect a normalized read-only host snapshot, run deterministic offline diagnostic rules, validate an R0 plan through Core, and produce a hashed JSON report. Resident Desk can download that report directly. In Rescue, when the encrypted Vault is unlocked before Desk starts, the report and its audit sequence are persisted as a signed envelope and can be exported later from the native TTY companion. Production target mutation is not implemented. On Linux, a separate opt-in `fixture-repair-lab` Desk build sends one complete, explicitly approved repair and separately approved rollback through the standard SessionDriver, Agent Gateway, Core transaction states and typed broker against an internally created disposable fixture. It is absent from normal builds and Rescue and cannot select a host path, disk or production target.
+The current Phase 0 engineering vertical slice is deliberately safe: start a session, collect a normalized read-only host snapshot, run deterministic offline diagnostic rules, validate an R0 plan through Core, and produce a hashed JSON report. Resident Desk can download that report directly. In Rescue, when the encrypted Vault is unlocked before Desk starts, the report and its audit sequence are persisted as a signed envelope and can be exported later from the native TTY companion. The default/stable product has no production mutation handler. A separate private, feature-gated Rescue repair candidate exists for controlled qualification, but it is neither qualified nor promoted; see [Current status](docs/CURRENT_STATUS.md). On Linux, a separate opt-in `fixture-repair-lab` Desk build sends one complete, explicitly approved repair and separately approved rollback through the standard SessionDriver, Agent Gateway, Core transaction states and typed broker against an internally created disposable fixture. It is absent from normal builds and Rescue and cannot select a host path, disk or production target.
 
 ## Quick start
 
@@ -36,7 +36,7 @@ The CI workflows are configured to produce engineering-preview desktop installer
 ## Use in the workshop
 
 - **PC that does not boot (controlled engineering preview):** the private area
-  exposes the exact Rescue candidate identified in
+  exposes the exact stable retail Rescue candidate identified in
   [Current status](docs/CURRENT_STATUS.md) only for first physical-boot
   qualification. Verify its checksum and, on Windows, write it with Rufus in
   DD mode to a factory-new or disposable USB of at least 32 GB. The trusted v2
@@ -72,6 +72,9 @@ The CI workflows are configured to produce engineering-preview desktop installer
   ISO passed persistence, retrieval and fixed-path signed-envelope export on
   that same artifact under virtual BIOS and UEFI. Physical USB behavior remains
   a separate qualification gate.
+  A separately listed repair-candidate ISO is private, unqualified and
+  unpromoted; it does not replace this stable retail image and must be used
+  only for controlled repair qualification.
 - **Windows, Linux or macOS that does boot:** download that operating system's desktop artifact, install it, and launch KernAid like a normal application. Windows and macOS startup collect only a fast, derived target identity; the deeper P0 collection starts once when **Diagnostica** is selected. macOS queries only the current-user `launchd` table and safe-boot integer, and explicitly reports system `launchd`, software-update availability, system-event analysis, and login/background-item counts as unqualified instead of inventing results. The fixed commands do not request repairs, although native Windows tools such as DISM may still update their own operating-system logs.
 - **Linux machine inventory:** Resident and Rescue use the same bounded Rust
   collector for CPU count/model, total RAM, firmware boot mode, selected public

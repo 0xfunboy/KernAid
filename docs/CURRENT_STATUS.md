@@ -45,7 +45,7 @@ WinPE Companion and Fleet management remain later milestones.
 | Rescue provider plumbing | Feature-gated OpenAI executor and loopback relay are implemented, but live TLS and a real-account lifecycle are not yet qualified |
 | Virtual testing | Disposable QEMU fixtures, byte-level mutation checks, BIOS/UEFI boot and two-boot USB/vault coverage |
 | Repair experiment | Linux-only feature-gated Desk lab for one typed R2 repair and separately approved rollback on an internal temporary fixture. It now traverses the standard `SessionDriver`, Agent Gateway, explicit Core transaction states and typed broker; it remains absent from normal/Rescue builds and disconnected from production targets |
-| Feature-gated Rescue repair candidate | The off-default candidate now implements one complete ext4-only path for disabling a non-critical `fstab` entry whose UUID is freshly proven missing: closed repair daemon and UI, broker-owned observation/plan preparation, distinct-device Vault backup, exact Core approval, bounded atomic replacement, verification, automatic restore and crash/reboot reconciliation. `Before`, `After` and unknown third states fail closed, and a third state is never overwritten. None of this is present in the default/stable Rescue image, which remains diagnosis-only. The end-to-end implementation exists but is not isolation-qualified, physically qualified or promoted. |
+| Feature-gated Rescue repair candidate | The off-default candidate implements one ext4-only path for disabling a non-critical `fstab` entry whose UUID is freshly proven missing: closed repair daemon and UI, broker-owned observation/plan preparation, distinct-device Vault backup, exact Core approval, bounded atomic replacement, verification, automatic restore and crash/reboot reconciliation. Its root helper v1alpha2 hands off a read-only leaf, an `O_PATH` physical-parent identity, a sealed UUID-inventory memfd and a detached read-only mount; the observer and parent guard no longer open `/dev` or `/sys`. The Vault also has a boot-scoped, single-consumption write lease. None of this is present in the default/stable Rescue image, which remains diagnosis-only. The candidate is not isolation-qualified, physically qualified or promoted. |
 | Rescue first boot | The promoted image provisions an all-zero p3 into the canonical LUKS2/ext4 Vault, seeds its identity and Codex home, closes it and verifies the locked profile; the exact flow passed two-boot BIOS/UEFI QEMU qualification |
 | Release channel | Canonical Release Channel v1, anti-rollback links, strict verification and an immutable internal prerelease are active through sequence 2; this is not an automatic updater or signed production channel |
 
@@ -60,10 +60,10 @@ treated as a newer release.
   customer-machine repair path. The only real handler is the explicitly
   feature-gated `fstab` candidate.
 - The candidate build profile wires its dedicated repair account, socket-activated
-  control plane, UI, executor and startup recovery barrier. It is not promoted:
-  its current service sandbox still needs `PrivateDevices=no` plus broad
-  `DeviceAllow=block-* rw` because physical-parent resolution and writable
-  acquisition are not yet fully delegated to the root capability helper.
+  control plane, UI, executor and startup recovery barrier. Read-only discovery
+  and observation now use the root helper's narrow descriptor bundle, but the
+  read-write mount/executor path has not yet been migrated to that helper. The
+  repair daemon sandbox therefore remains broader than the promotion target.
 - Repair Vault retention, crash-safe compaction and pending-transaction
   reconciliation are implemented; customer retention policy and destructive
   power-loss qualification remain promotion gates.
@@ -123,13 +123,33 @@ then have their manifest, checksum and attestations independently verified.
 No newer workflow artifact replaces the candidate listed above until another
 explicit catalog and private-site promotion is completed.
 
-The candidate is exposed privately only to unblock the first physical boot
-test. On Windows, verify the retail `.img.xz` checksum and select that compressed
-image directly in Rufus; if prompted, use DD mode on a factory-new or
-disposable USB of at least 32 GB. Keep Secure Boot disabled and use non-customer
-hardware. Rufus only writes the qualified zero-state image; the first live boot
-asks for a new passphrase and provisions the encrypted Vault in place. This is
-still not a supported repair medium.
+### Private repair candidate
+
+A separate, private repair candidate was built from
+[`fcb81ab98d7fcadbda208654ba4eb667a8f323de`](https://github.com/0xfunboy/KernAid/commit/fcb81ab98d7fcadbda208654ba4eb667a8f323de).
+It does **not** replace the stable retail image or the promoted internal release
+above.
+
+| Field | Exact value |
+| --- | --- |
+| Workflow | [Repair candidate run 33179291646](https://github.com/0xfunboy/KernAid/actions/runs/33179291646) |
+| ISO | `KernAid-Rescue-amd64-repair-candidate.iso` |
+| ISO size | `1,223,540,736` bytes |
+| ISO SHA-256 | `a1eaa88fe127815e117cc127f225c8ebf79c5dd0f3aa3e00466ad928617efbf3` |
+| Virtual smoke | BIOS pass; UEFI pass |
+| Channel | Private, unqualified and unpromoted |
+
+This artifact is available only for controlled repair qualification. Passing
+the two boot smoke tests is not physical USB, power-loss, hardware, firmware or
+Secure Boot qualification.
+
+The stable retail candidate above is exposed privately only to unblock the
+first physical boot test. On Windows, verify the retail `.img.xz` checksum and
+select that compressed image directly in Rufus; if prompted, use DD mode on a
+factory-new or disposable USB of at least 32 GB. Keep Secure Boot disabled and
+use non-customer hardware. Rufus only writes the qualified zero-state image;
+the first live boot asks for a new passphrase and provisions the encrypted
+Vault in place. This is still not a supported repair medium.
 
 The latest complete unsigned Desk packaging matrix was built from the same
 commit in [Desktop run 33145692864](https://github.com/0xfunboy/KernAid/actions/runs/33145692864).
@@ -143,9 +163,8 @@ passed; signing, notarization and physical-machine qualification remain open.
 2. Finish the real-account Rescue provider/vault lifecycle without exposing or
    copying the CLI credential store.
 3. Qualify Secure Boot and signed release delivery.
-4. Replace the candidate daemon's broad block-device access with exact
-   descriptor handoff from the root helper, then re-enable a private device
-   namespace and narrow `DeviceAllow` before promotion.
+4. Migrate the read-write mount/executor to a narrow root-helper capability,
+   then finish tightening the repair daemon sandbox before promotion.
 5. Add and qualify the signed consumer/update path on top of the verified
    internal Release Channel v1 sequence.
 6. Qualify the exact repair-candidate image on disposable two-device hardware,

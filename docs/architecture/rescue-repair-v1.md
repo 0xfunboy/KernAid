@@ -83,14 +83,15 @@ pipes, verifies exact size, EOF, SHA-256, allocation and named readback,
 journals crash boundaries, and keeps durable identity stable across reboot
 while treating the kernel physical-parent claim as live authority for
 reserve-to-persist. The default daemon ABI remains unchanged. The separate
-off-default target handoff resolves the selection twice and transfers one
-read-only block FD over a fixed root-owned `SOCK_SEQPACKET` endpoint to a
-strict Rust client. A dedicated system account and hardened static unit files
-are packaged for qualification. The feature-gated Vault daemon resolves and
-allowlists only that exact private account, and the Rust broker now retains the
-leaf and physical-parent descriptors in one revalidating non-cloneable guard.
-The feature-gated observer creates only an unattached `ro,noload` ext4 mount
-and reads the exact `fstab`. The candidate image now adds a persistent
+off-default v1alpha2 target handoff performs three matching fresh resolutions and transfers
+a read-only leaf FD, an `O_PATH` physical-parent identity FD, a sealed bounded
+UUID-inventory memfd and an unattached `ro,noload` ext4 mount over a fixed
+root-owned `SOCK_SEQPACKET` endpoint. A strict Rust client validates the complete
+bundle. The observer and physical-parent guard consume those capabilities and
+do not open `/dev` or `/sys`. A dedicated system account and hardened static
+unit files are packaged for qualification. The feature-gated Vault daemon
+resolves and allowlists only that exact private account. The candidate image
+now adds a persistent
 unprivileged repair daemon, strict local `SOCK_SEQPACKET` control plane, bounded
 single-authority state machine and dedicated UI group. Its executor persists
 and reads back the Vault backup before acquiring write authority, mounts only
@@ -131,6 +132,10 @@ authenticates the stable identity before it may reconcile an interrupted
 journal intent. Durable backups can therefore be verified after a reboot,
 while a stale reserved write capability cannot be resumed across a changed
 physical-parent epoch.
+
+The Vault now atomically consumes one transaction-bound repair write lease per
+boot epoch. The lease is boot-scoped and single-use; it does not make a durable
+reservation or backup into reusable write authority after reboot.
 
 Reserved capacity can be cancelled with the stable reservation ID plus its
 exact draft binding without re-minting live-parent write authority. Durable
@@ -186,9 +191,9 @@ Rescue image or default broker may enable it until all of these are true:
 - the exact image passes BIOS and UEFI repair/rollback qualification; and
 - physical USB testing proves separate-device backup and power-loss recovery
   on the supported hardware matrix;
-- the repair daemon no longer requires `PrivateDevices=no` and broad
-  `DeviceAllow=block-* rw`: exact parent and writable capabilities must come
-  from the root helper through narrowly typed descriptor handoff; and
+- the read-write mount/executor no longer acquires its target directly and is
+  migrated to a narrowly typed root-helper capability; only then can the
+  repair daemon's still-broad block-device sandbox be closed; and
 - Secure Boot is qualified for the exact promoted image.
 
 In particular, Phase 0 remains diagnosis-only under `AGENTS.md`. A production
