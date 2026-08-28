@@ -237,6 +237,31 @@ id -nG kernaid 2>/dev/null | tr ' ' '\n' | grep -Fxq kernaid-codex-client \
 if id -nG kernaid 2>/dev/null | tr ' ' '\n' | grep -Fxq kernaid-codex; then
     fail "live user unexpectedly has the Codex executor identity"
 fi
+repair_identity="$(getent passwd | awk -F: '$1 == "kernaid-repair" { count += 1; if (NF == 7 && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ && $3 == $4 && $3 != 0 && $3 != 1000 && $5 == "KernAid Rescue repair broker" && $6 == "/nonexistent" && $7 == "/usr/sbin/nologin") identity = $3 ":" $4 } END { if (count == 1 && identity != "") print identity }')"
+test -n "$repair_identity" || fail "repair broker identity is missing or unsafe"
+repair_group_id="${repair_identity#*:}"
+getent passwd | awk -F: -v id="$repair_group_id" '$3 == id || $4 == id { count += 1; if ($1 != "kernaid-repair" || $3 != id || $4 != id) bad = 1 } END { exit !(count == 1 && !bad) }' \
+    || fail "repair broker numeric identity collides with another account"
+getent group | awk -F: -v gid="$repair_group_id" '$1 == "kernaid-repair" || $3 == gid { count += 1; if (NF != 4 || $1 != "kernaid-repair" || $3 != gid || $4 != "") bad = 1 } END { exit !(count == 1 && !bad) }' \
+    || fail "repair broker group is missing, colliding, or has static members"
+repair_groups="$(id -nG kernaid-repair 2>/dev/null)" \
+    || fail "repair broker group membership is unavailable"
+test "$repair_groups" = "kernaid-repair" \
+    || fail "repair broker has a persistent supplementary group membership"
+for repair_forbidden_member in \
+    kernaid \
+    kernaid-rescue-ui \
+    kernaid-openai \
+    kernaid-openai-egress \
+    kernaid-application \
+    kernaid-codex
+do
+    repair_forbidden_groups="$(id -nG "$repair_forbidden_member" 2>/dev/null)" \
+        || fail "repair broker isolation peer identity is unavailable"
+    if printf '%s\n' "$repair_forbidden_groups" | tr ' ' '\n' | grep -Fxq kernaid-repair; then
+        fail "live, UI, or provider identity unexpectedly has repair broker access"
+    fi
+done
 codex_identity="$(getent passwd kernaid-codex | awk -F: 'NF == 7 && $1 == "kernaid-codex" && $3 == 973 && $4 == 973 && $6 == "/nonexistent" && $7 == "/usr/sbin/nologin" { print $3 ":" $4 }')"
 test "$codex_identity" = "973:973" || fail "Codex Agent identity is missing or unsafe"
 getent group kernaid-codex | awk -F: 'NF == 4 && $1 == "kernaid-codex" && $3 == 973 && $4 == "" { found = 1 } END { exit !found }' \

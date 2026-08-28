@@ -86,6 +86,8 @@ chown root:root \
     /etc/systemd/system/kernaid-rescue-desk-shell.service \
     /etc/systemd/system/kernaid-rescue-ui-session-ready.service \
     /etc/systemd/system/kernaid-rescue-firstboot.service \
+    /etc/systemd/system/kernaid-rescue-target-capability.socket \
+    /etc/systemd/system/kernaid-rescue-target-capability@.service \
     /etc/systemd/system/kernaid-rescue-vaultd.service \
     /etc/systemd/system/kernaid-rescue-vaultd.socket \
     /etc/systemd/system/kernaid-ready.service \
@@ -124,6 +126,8 @@ chmod 0644 \
     /etc/systemd/system/kernaid-rescue-desk-shell.service \
     /etc/systemd/system/kernaid-rescue-ui-session-ready.service \
     /etc/systemd/system/kernaid-rescue-firstboot.service \
+    /etc/systemd/system/kernaid-rescue-target-capability.socket \
+    /etc/systemd/system/kernaid-rescue-target-capability@.service \
     /etc/systemd/system/kernaid-rescue-vaultd.service \
     /etc/systemd/system/kernaid-rescue-vaultd.socket \
     /etc/systemd/system/kernaid-ready.service \

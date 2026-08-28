@@ -74,9 +74,11 @@ while treating the kernel physical-parent claim as live authority for
 reserve-to-persist. The default daemon ABI remains unchanged. The separate
 off-default target handoff resolves the selection twice and transfers one
 read-only block FD over a fixed root-owned `SOCK_SEQPACKET` endpoint to a
-strict Rust client. No production RepairBroker UID, socket/service activation
-or combined FD-and-lock resolver is provisioned, so either route remains
-unreachable in a shipping image. A mutation handler still does not exist.
+strict Rust client. A dedicated system account and hardened static unit files
+are packaged for qualification, but Vault does not allowlist that UID and no
+socket, broker process or combined FD-and-lock resolver is enabled. Both routes
+therefore remain unreachable in the shipping image. A mutation handler still
+does not exist.
 
 ## Backup boundary
 

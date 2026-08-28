@@ -158,26 +158,149 @@ def _receive(connection: socket.socket) -> tuple[dict[str, object], list[int]]:
 
 class RepairTargetHandoffTests(unittest.TestCase):
     def test_candidate_is_packaged_but_not_activated(self) -> None:
+        systemd = (
+            REPO_DIR
+            / "rescue/live-build/config/includes.chroot/etc/systemd/system"
+        )
         safety_hook = (
             REPO_DIR
             / "rescue/live-build/config/hooks/live/0100-kernaid-safety.hook.chroot"
         ).read_text(encoding="utf-8")
         helper = "/usr/lib/kernaid/repair_target_handoff.py"
         self.assertEqual(safety_hook.count(helper), 2)
-        self.assertNotIn("systemctl enable kernaid-rescue-target", safety_hook)
-        self.assertFalse(
-            list(
-                (
-                    REPO_DIR
-                    / "rescue/live-build/config/includes.chroot/etc/systemd/system"
-                ).glob("*target-capability*")
-            )
+        socket_path = systemd / "kernaid-rescue-target-capability.socket"
+        service_path = systemd / "kernaid-rescue-target-capability@.service"
+        self.assertTrue(socket_path.is_file())
+        self.assertTrue(service_path.is_file())
+        self.assertEqual(
+            safety_hook.count(
+                "/etc/systemd/system/kernaid-rescue-target-capability.socket"
+            ),
+            2,
         )
+        self.assertEqual(
+            safety_hook.count(
+                "/etc/systemd/system/kernaid-rescue-target-capability@.service"
+            ),
+            2,
+        )
+        self.assertNotIn("systemctl enable kernaid-rescue-target", safety_hook)
+
+        socket_unit = socket_path.read_text(encoding="utf-8")
+        service_unit = service_path.read_text(encoding="utf-8")
+        self.assertNotIn("[Install]", socket_unit)
+        self.assertIn(
+            "ListenSequentialPacket=/run/kernaid-rescue-target-capability.sock",
+            socket_unit,
+        )
+        self.assertIn("Accept=yes", socket_unit)
+        self.assertIn("FileDescriptorName=target-capability", socket_unit)
+        self.assertIn("SocketMode=0660", socket_unit)
+        self.assertIn("SocketUser=root", socket_unit)
+        self.assertIn("SocketGroup=kernaid-repair", socket_unit)
+        self.assertIn("kernaid-offline-inspector-key.service", socket_unit)
+        self.assertIn("systemd-sysusers.service", socket_unit)
+
+        self.assertIn(
+            "ExecStart=/usr/bin/python3 -I -B "
+            "/usr/lib/kernaid/repair_target_handoff.py",
+            service_unit,
+        )
+        self.assertIn(
+            "Environment=KERNAID_TARGET_ID_KEY_FILE="
+            "/run/kernaid-offline-inspector/target-id.key",
+            service_unit,
+        )
+        self.assertNotIn("KERNAID_REPAIR_BROKER_UID", service_unit)
+        self.assertIn("User=root", service_unit)
+        self.assertIn("Group=root", service_unit)
+        self.assertIn("NoNewPrivileges=yes", service_unit)
+        self.assertIn("PrivateMounts=yes", service_unit)
+        self.assertIn("PrivateNetwork=yes", service_unit)
+        self.assertIn("ProtectSystem=strict", service_unit)
+        self.assertIn("ReadOnlyPaths=/run", service_unit)
+        self.assertIn("DevicePolicy=closed", service_unit)
+        self.assertIn("DeviceAllow=block-* r", service_unit)
+        self.assertIn("CapabilityBoundingSet=\n", service_unit)
+        self.assertIn("RestrictAddressFamilies=AF_UNIX", service_unit)
+        self.assertIn("RestrictNamespaces=yes", service_unit)
+        self.assertIn("kernaid-offline-inspector-key.service", service_unit)
+        self.assertIn("systemd-sysusers.service", service_unit)
+
         accounts = (
             REPO_DIR
             / "rescue/live-build/config/includes.chroot/etc/sysusers.d/kernaid.conf"
         ).read_text(encoding="utf-8")
-        self.assertNotIn("kernaid-repair", accounts)
+        self.assertIn(
+            'u kernaid-repair - "KernAid Rescue repair broker" '
+            "/nonexistent /usr/sbin/nologin",
+            accounts,
+        )
+        self.assertNotIn("m kernaid-repair ", accounts)
+        self.assertNotRegex(accounts, r"(?m)^m\s+\S+\s+kernaid-repair$")
+
+        ready = (LIVE_LIB / "ready-check").read_text(encoding="utf-8")
+        self.assertIn('$1 == "kernaid-repair"', ready)
+        self.assertIn('$3 == $4 && $3 != 0 && $3 != 1000', ready)
+        self.assertIn('$5 == "KernAid Rescue repair broker"', ready)
+        self.assertIn('$6 == "/nonexistent"', ready)
+        self.assertIn('$7 == "/usr/sbin/nologin"', ready)
+        self.assertIn("count == 1", ready)
+        self.assertIn('$4 != ""', ready)
+        self.assertIn(
+            'test "$repair_groups" = "kernaid-repair"',
+            ready,
+        )
+        self.assertIn(
+            "for repair_forbidden_member in \\",
+            ready,
+        )
+        for identity in (
+            "kernaid",
+            "kernaid-rescue-ui",
+            "kernaid-openai",
+            "kernaid-openai-egress",
+            "kernaid-application",
+            "kernaid-codex",
+        ):
+            self.assertIn(f"    {identity}", ready)
+        self.assertNotIn("systemctl start kernaid-rescue-target-capability", ready)
+        self.assertNotIn(
+            "systemctl show --property=ActiveState --value "
+            "kernaid-rescue-target-capability.socket",
+            ready,
+        )
+
+    def test_repair_broker_account_parser_is_closed(self) -> None:
+        valid = (
+            b"root:x:0:0:root:/root:/bin/bash\n"
+            b"kernaid:x:1000:1000:KernAid live user:/home/kernaid:/bin/bash\n"
+            b"kernaid-repair:!:992:992:KernAid Rescue repair broker:"
+            b"/nonexistent:/usr/sbin/nologin\n"
+        )
+        self.assertEqual(handoff._repair_broker_uid_from_passwd(valid), 992)
+        invalid = (
+            valid.replace(b"992:992", b"992:991", 1),
+            valid.replace(b"KernAid Rescue repair broker", b"repair", 1),
+            valid.replace(b"/nonexistent", b"/home/repair", 1),
+            valid.replace(b"/usr/sbin/nologin", b"/bin/sh", 1),
+            valid.replace(b"992:992", b"0:0", 1),
+            valid.replace(b"992:992", b"1000:1000", 1),
+            valid.replace(b":992:992:", b":0992:992:", 1),
+            valid + b"duplicate:x:992:991::/nonexistent:/usr/sbin/nologin\n",
+            valid + b"duplicate:x:991:992::/nonexistent:/usr/sbin/nologin\n",
+            valid
+            + b"kernaid-repair:!:991:991:KernAid Rescue repair broker:"
+            b"/nonexistent:/usr/sbin/nologin\n",
+            valid.rstrip(b"\n"),
+            valid + b"\n",
+        )
+        for payload in invalid:
+            with self.subTest(payload=payload[-96:]):
+                with self.assertRaises(RuntimeError):
+                    handoff._repair_broker_uid_from_passwd(payload)
+        with self.assertRaises(RuntimeError):
+            handoff._read_root_owned_passwd("/tmp/passwd")
 
     def _exchange(
         self,

@@ -3,8 +3,8 @@
 
 The caller supplies only boot-ephemeral opaque identifiers.  The helper loads
 the fixed Rescue target resolver, resolves the selection twice, and returns a
-single read-only block-device descriptor.  No unit or account enables this
-candidate in the shipping image yet.
+single read-only block-device descriptor.  Its account and systemd units are
+packaged for qualification, but the socket remains disabled in shipping.
 """
 
 from __future__ import annotations
@@ -27,9 +27,12 @@ API_VERSION = "kernaid.dev/rescue-target-capability/v1alpha1"
 OPERATION = "target.readonly.acquire"
 SOCKET_PATH = "/run/kernaid-rescue-target-capability.sock"
 TARGET_MODULE_PATH = "/usr/lib/kernaid/rescue_server.py"
-PEER_UID_ENV = "KERNAID_REPAIR_BROKER_UID"
-# Candidate-only test seam.  Future packaging must resolve the exact dedicated
-# account in its root-owned launcher/unit; it must not ship a hard-coded UID.
+PASSWD_PATH = "/etc/passwd"
+REPAIR_BROKER_NAME = b"kernaid-repair"
+REPAIR_BROKER_GECOS = b"KernAid Rescue repair broker"
+ISOLATED_HOME = b"/nonexistent"
+ISOLATED_SHELL = b"/usr/sbin/nologin"
+MAX_PASSWD_BYTES = 256 * 1024
 MAX_REQUEST_BYTES = 1024
 MAX_RESPONSE_BYTES = 1024
 IO_TIMEOUT_SECONDS = 8
@@ -161,14 +164,129 @@ def _load_target_module(path: str = TARGET_MODULE_PATH) -> object:
     return module
 
 
-def _peer_uid_from_environment() -> int:
-    value = os.environ.get(PEER_UID_ENV, "")
-    if not value.isascii() or not value.isdecimal() or value != str(int(value)):
-        raise RuntimeError("dedicated repair broker UID is not configured")
-    uid = int(value)
-    if uid <= 0 or uid > 4_294_967_294:
-        raise RuntimeError("dedicated repair broker UID is invalid")
-    return uid
+def _canonical_id(value: bytes) -> int:
+    if (
+        not value
+        or not value.isascii()
+        or not value.isdigit()
+        or (len(value) > 1 and value.startswith(b"0"))
+    ):
+        raise RuntimeError("invalid system account database")
+    identifier = int(value)
+    if identifier > 4_294_967_294:
+        raise RuntimeError("invalid system account database")
+    return identifier
+
+
+def _repair_broker_uid_from_passwd(payload: bytes) -> int:
+    if (
+        not payload
+        or len(payload) > MAX_PASSWD_BYTES
+        or not payload.endswith(b"\n")
+        or b"\0" in payload
+        or b"\r" in payload
+    ):
+        raise RuntimeError("invalid system account database")
+
+    entries: list[tuple[bytes, int, int]] = []
+    repair: tuple[int, int] | None = None
+    for line in payload[:-1].split(b"\n"):
+        if not line or len(line) > 4096:
+            raise RuntimeError("invalid system account database")
+        fields = line.split(b":")
+        if len(fields) != 7 or not fields[0]:
+            raise RuntimeError("invalid system account database")
+        uid = _canonical_id(fields[2])
+        gid = _canonical_id(fields[3])
+        entries.append((fields[0], uid, gid))
+        if fields[0] == REPAIR_BROKER_NAME:
+            if (
+                repair is not None
+                or uid == 0
+                or uid == 1000
+                or gid != uid
+                or fields[4] != REPAIR_BROKER_GECOS
+                or fields[5] != ISOLATED_HOME
+                or fields[6] != ISOLATED_SHELL
+            ):
+                raise RuntimeError("invalid dedicated repair broker account")
+            repair = (uid, gid)
+
+    if repair is None:
+        raise RuntimeError("dedicated repair broker account is unavailable")
+    repair_uid, repair_gid = repair
+    if (
+        sum(name == REPAIR_BROKER_NAME for name, _uid, _gid in entries) != 1
+        or sum(uid == repair_uid for _name, uid, _gid in entries) != 1
+        or sum(gid == repair_gid for _name, _uid, gid in entries) != 1
+    ):
+        raise RuntimeError("dedicated repair broker identity collides")
+    return repair_uid
+
+
+def _read_root_owned_passwd(path: str = PASSWD_PATH) -> bytes:
+    if path != PASSWD_PATH:
+        raise RuntimeError("system account database path is not allowed")
+    descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        before = os.fstat(descriptor)
+        named_before = os.stat(path, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or stat.S_ISLNK(named_before.st_mode)
+            or before.st_uid != 0
+            or before.st_gid != 0
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) & 0o022
+            or before.st_size <= 0
+            or before.st_size > MAX_PASSWD_BYTES
+            or (named_before.st_dev, named_before.st_ino)
+            != (before.st_dev, before.st_ino)
+        ):
+            raise RuntimeError("system account database is not trusted")
+        payload = bytearray()
+        while len(payload) < before.st_size:
+            chunk = os.read(
+                descriptor, min(16 * 1024, before.st_size - len(payload))
+            )
+            if not chunk:
+                raise RuntimeError("system account database ended early")
+            payload.extend(chunk)
+        if os.read(descriptor, 1):
+            raise RuntimeError("system account database grew while reading")
+        after = os.fstat(descriptor)
+        named_after = os.stat(path, follow_symlinks=False)
+        identity = (
+            before.st_dev,
+            before.st_ino,
+            before.st_mode,
+            before.st_uid,
+            before.st_gid,
+            before.st_nlink,
+            before.st_size,
+            before.st_mtime_ns,
+        )
+        if identity != (
+            after.st_dev,
+            after.st_ino,
+            after.st_mode,
+            after.st_uid,
+            after.st_gid,
+            after.st_nlink,
+            after.st_size,
+            after.st_mtime_ns,
+        ) or (named_after.st_dev, named_after.st_ino) != (
+            after.st_dev,
+            after.st_ino,
+        ):
+            raise RuntimeError("system account database changed while reading")
+        return bytes(payload)
+    finally:
+        os.close(descriptor)
+
+
+def _repair_broker_uid() -> int:
+    return _repair_broker_uid_from_passwd(_read_root_owned_passwd())
 
 
 def _validate_peer(
@@ -554,7 +672,7 @@ def main() -> int:
     if os.geteuid() != 0 or sys.argv != [sys.argv[0]]:
         return 1
     try:
-        expected_uid = _peer_uid_from_environment()
+        expected_uid = _repair_broker_uid()
         connection = _systemd_connection()
     except (RuntimeError, OSError):
         return 1

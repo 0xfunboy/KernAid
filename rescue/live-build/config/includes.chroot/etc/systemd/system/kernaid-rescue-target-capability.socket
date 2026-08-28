@@ -1,0 +1,23 @@
+[Unit]
+Description=KernAid dormant Rescue target capability socket
+Requires=kernaid-offline-inspector-key.service systemd-sysusers.service
+After=kernaid-offline-inspector-key.service systemd-sysusers.service
+ConditionKernelCommandLine=boot=live
+
+[Socket]
+ListenSequentialPacket=/run/kernaid-rescue-target-capability.sock
+Accept=yes
+MaxConnections=1
+Backlog=1
+FileDescriptorName=target-capability
+SocketMode=0660
+SocketUser=root
+SocketGroup=kernaid-repair
+RemoveOnStop=yes
+PassCredentials=no
+PassSecurity=no
+PassPacketInfo=no
+Timestamping=off
+
+# Deliberately not installable. Phase 0 packages this qualification boundary
+# but does not enable or start it in the shipping Rescue image.
