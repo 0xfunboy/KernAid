@@ -907,12 +907,17 @@ impl<'vault> RepairVaultStore<'vault> {
     ) -> Result<ReservedRepairBackup, RepairVaultStoreError> {
         draft.validate()?;
         self.require_mutable()?;
+        let reservation_binding_sha256 = reservation_binding(&draft);
+        if let Some(reserved) =
+            self.reconcile_reserved_retry(&draft, &reservation_binding_sha256)?
+        {
+            return Ok(reserved);
+        }
         self.require_event_capacity(2)?;
         if self.state.reservations.len() >= MAX_RESERVATIONS {
             return Err(RepairVaultStoreError::InsufficientCapacity);
         }
         let reservation_id = self.generate_unused_reservation_id()?;
-        let reservation_binding_sha256 = reservation_binding(&draft);
         let reserved_capacity_bytes = draft.required_capacity_bytes;
         self.append_event(RepairEvent::ReserveIntent {
             reservation_id: reservation_id.clone(),
@@ -931,6 +936,38 @@ impl<'vault> RepairVaultStore<'vault> {
             reservation_id: reservation_id.clone(),
         })?;
         self.reserved_capability(&reservation_id)
+    }
+
+    fn reconcile_reserved_retry(
+        &mut self,
+        draft: &RepairBackupDraft,
+        reservation_binding_sha256: &str,
+    ) -> Result<Option<ReservedRepairBackup>, RepairVaultStoreError> {
+        let mut matching_reservation_id = None;
+        for (reservation_id, record) in &self.state.reservations {
+            if record.reservation_binding_sha256 != reservation_binding_sha256 {
+                continue;
+            }
+            if matching_reservation_id.is_some()
+                || !matches!(record.phase, ReservationPhase::Reserved)
+                || record.draft != *draft
+                || record.reserved_capacity_bytes != draft.required_capacity_bytes
+                || reservation_binding(&record.draft) != reservation_binding_sha256
+            {
+                return Err(RepairVaultStoreError::ReservationConflict);
+            }
+            self.verify_record_live_parent(record)?;
+            self.verify_reserved_file(reservation_id, record)?;
+            matching_reservation_id = Some(reservation_id.clone());
+        }
+        if self.state.released.values().any(|released| {
+            released.record.reservation_binding_sha256 == reservation_binding_sha256
+        }) {
+            return Err(RepairVaultStoreError::ReservationConflict);
+        }
+        matching_reservation_id
+            .map(|reservation_id| self.reserved_capability(&reservation_id))
+            .transpose()
     }
 
     /// Persist an exact read-only source descriptor into an existing physical
@@ -4542,7 +4579,7 @@ mod tests {
     use rustix::pipe::{PipeFlags, pipe_with};
     use std::{
         fs::{self, OpenOptions},
-        os::unix::fs::OpenOptionsExt,
+        os::unix::fs::{MetadataExt, OpenOptionsExt},
         path::PathBuf,
     };
     use tempfile::TempDir;
@@ -4661,6 +4698,135 @@ mod tests {
             (vault_id, fingerprint),
             stable_vault_identity(b"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", &[0x41; 32])
         );
+    }
+
+    #[test]
+    fn lost_reserve_response_reuses_exact_reserved_capability_after_reopen() {
+        let fixture = Fixture::new();
+        let bytes = b"lost reserve response\n";
+        let backup_draft = draft(bytes, 4096);
+        let (reservation_id, draft_binding, event_count) = {
+            let mut store = fixture
+                .vault
+                .open_repair_store()
+                .expect("open repair store");
+            let reserved = store
+                .reserve_backup(backup_draft.clone())
+                .expect("reserve backup");
+            (
+                reserved.reservation_id().clone(),
+                reserved.reservation_binding_sha256().to_owned(),
+                store.event_count,
+            )
+        };
+        let path = backup_path(&fixture, &reservation_id);
+        let before = fs::metadata(&path).expect("reserved file metadata");
+
+        let mut store = fixture
+            .vault
+            .open_repair_store()
+            .expect("reopen after lost response");
+        assert_eq!(store.event_count, event_count);
+        let retried = store
+            .reserve_backup(backup_draft)
+            .expect("reconcile exact reserve retry");
+        assert_eq!(retried.reservation_id(), &reservation_id);
+        assert_eq!(retried.reservation_binding_sha256(), draft_binding);
+        assert_eq!(store.event_count, event_count);
+        let after = fs::metadata(&path).expect("retried reserved file metadata");
+        assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+
+        let distinct = store
+            .reserve_backup(draft(b"new canonical draft\n", 4096))
+            .expect("reserve distinct draft");
+        assert_ne!(distinct.reservation_id(), &reservation_id);
+        assert_eq!(store.event_count, event_count + 2);
+    }
+
+    #[test]
+    fn reserve_retry_fails_closed_on_matching_record_mismatch_or_ambiguity() {
+        let fixture = Fixture::new();
+        let bytes = b"matching draft\n";
+        let backup_draft = draft(bytes, 4096);
+        let mut store = fixture
+            .vault
+            .open_repair_store()
+            .expect("open repair store");
+        let reserved = store
+            .reserve_backup(backup_draft.clone())
+            .expect("reserve backup");
+        let original_id = reserved.reservation_id().clone();
+        let event_count = store.event_count;
+        store.checked_out.clear();
+
+        store
+            .state
+            .reservations
+            .get_mut(&original_id)
+            .expect("reservation record")
+            .reserved_capacity_bytes += 1;
+        assert_eq!(
+            store.reserve_backup(backup_draft.clone()).err(),
+            Some(RepairVaultStoreError::ReservationConflict)
+        );
+        assert_eq!(store.event_count, event_count);
+
+        let record = store
+            .state
+            .reservations
+            .get_mut(&original_id)
+            .expect("reservation record");
+        record.reserved_capacity_bytes = backup_draft.required_capacity_bytes;
+        let duplicate = record.clone();
+        let duplicate_id = reservation_id('f');
+        assert_ne!(duplicate_id, original_id);
+        store.state.reservations.insert(duplicate_id, duplicate);
+        assert_eq!(
+            store.reserve_backup(backup_draft).err(),
+            Some(RepairVaultStoreError::ReservationConflict)
+        );
+        assert_eq!(store.event_count, event_count);
+    }
+
+    #[test]
+    fn reserve_retry_never_reuses_durable_or_released_records() {
+        let fixture = Fixture::new();
+        let durable_bytes = b"already durable\n";
+        let released_bytes = b"already released\n";
+        let durable_draft = draft(durable_bytes, 4096);
+        let released_draft = draft(released_bytes, 4096);
+        let mut store = fixture
+            .vault
+            .open_repair_store()
+            .expect("open repair store");
+
+        let durable = store
+            .reserve_backup(durable_draft.clone())
+            .expect("reserve durable backup");
+        store
+            .persist_backup(
+                durable,
+                binding(durable_bytes),
+                fixture.read_only_source(durable_bytes),
+            )
+            .expect("persist durable backup");
+        let released = store
+            .reserve_backup(released_draft.clone())
+            .expect("reserve released backup");
+        store
+            .cancel_reservation(released)
+            .expect("release reserved backup");
+        let event_count = store.event_count;
+
+        assert_eq!(
+            store.reserve_backup(durable_draft).err(),
+            Some(RepairVaultStoreError::ReservationConflict)
+        );
+        assert_eq!(
+            store.reserve_backup(released_draft).err(),
+            Some(RepairVaultStoreError::ReservationConflict)
+        );
+        assert_eq!(store.event_count, event_count);
     }
 
     #[test]
