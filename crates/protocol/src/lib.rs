@@ -2,6 +2,9 @@
 
 pub mod rescue_repair;
 
+#[cfg(feature = "experimental-physical-parent-fingerprint")]
+pub mod rescue_physical_parent;
+
 #[cfg(all(target_os = "linux", feature = "experimental-repair-store"))]
 pub mod rescue_repair_vault;
 

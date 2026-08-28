@@ -8,7 +8,12 @@ use crate::{
     VaultOwner,
     linux::{RescueDeviceIdentityStore, VaultInner},
 };
-use kernaid_protocol::rescue_repair_vault::RepairFileMetadataV1;
+use kernaid_protocol::{
+    rescue_physical_parent::{
+        PhysicalParentClaims, canonical_physical_parent_digest, render_physical_parent_raw,
+    },
+    rescue_repair_vault::RepairFileMetadataV1,
+};
 use kernaid_storage::{
     JOURNAL_KEY_BYTES, JournalAnchor, JournalEntryRef, JournalKey, JournalReplayLimits,
     JournalSecretStore, SecretStoreError, SecureJournal,
@@ -69,7 +74,6 @@ const SECRET_PREFIX: &[u8] = b"KERNAID-REPAIR-STORE-SECRET-V1\0";
 const RESERVATION_BINDING_DOMAIN: &[u8] = b"KERNAID-REPAIR-RESERVATION-V1\0";
 const VAULT_IDENTITY_DOMAIN: &[u8] = b"KERNAID-REPAIR-VAULT-IDENTITY-V1\0";
 const STABLE_VAULT_ID_DOMAIN: &[u8] = b"KERNAID-REPAIR-STABLE-VAULT-ID-V1\0";
-const PHYSICAL_PARENT_DOMAIN: &[u8] = b"KERNAID-REPAIR-PHYSICAL-PARENT-V1\0";
 const FSTAB_RESOURCE_ID: &str = "rescue:selected-linux-root:etc/fstab";
 
 /// Sanitized Repair Vault failures. No variant carries an OS path, raw backup
@@ -3212,14 +3216,15 @@ fn vault_fingerprints(
         logical_sector_bytes: 512,
     }));
     let parent_claims = parent_claims.ok_or(RepairVaultStoreError::PhysicalParentUnavailable)?;
-    let mut parent = Sha256::new();
-    parent.update(PHYSICAL_PARENT_DOMAIN);
-    parent.update(parent_claims.parent_major.to_be_bytes());
-    parent.update(parent_claims.parent_minor.to_be_bytes());
-    parent.update(parent_claims.disk_sequence.to_be_bytes());
-    parent.update(parent_claims.media_sector_count.to_be_bytes());
-    parent.update(parent_claims.logical_sector_bytes.to_be_bytes());
-    let physical_parent = encode_hex(&parent.finalize());
+    let parent_claims = PhysicalParentClaims::new(
+        parent_claims.parent_major,
+        parent_claims.parent_minor,
+        parent_claims.disk_sequence,
+        parent_claims.media_sector_count,
+        parent_claims.logical_sector_bytes,
+    );
+    let physical_parent =
+        render_physical_parent_raw(&canonical_physical_parent_digest(&parent_claims));
     Ok((vault_id, vault_identity, physical_parent))
 }
 

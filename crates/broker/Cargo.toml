@@ -21,6 +21,7 @@ rescue-fstab-production-candidate = [
     "dep:rustix",
     "dep:serde",
     "dep:serde_json",
+    "kernaid-protocol/experimental-physical-parent-fingerprint",
     "kernaid-core/rescue-fstab-production-candidate",
     "kernaid-linux-pack/rescue-fstab-production-candidate",
 ]

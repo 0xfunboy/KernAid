@@ -80,6 +80,11 @@ socket, broker process or combined FD-and-lock resolver is enabled. Both routes
 therefore remain unreachable in the shipping image. A mutation handler still
 does not exist.
 
+Vault and broker candidate builds now share one pure, feature-gated V1 formula
+for the physical-parent digest, including raw and `sha256:` renderings. Kernel
+observation remains Linux-specific and is not supplied by the wire: the broker
+must still derive and cross-check the target parent from held descriptors.
+
 ## Backup boundary
 
 The pre-change `fstab` bytes and supported metadata must be written to the
