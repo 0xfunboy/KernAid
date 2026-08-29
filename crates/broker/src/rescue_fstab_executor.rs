@@ -947,7 +947,7 @@ fn close_after_failed_mutation(
 }
 
 fn apply_exact_replacement(
-    mount: &OwnedFd,
+    _mount: &OwnedFd,
     etc: &OwnedFd,
     backup: &[u8],
     proposed: &[u8],
@@ -975,7 +975,10 @@ fn apply_exact_replacement(
     rfs::renameat_with(etc, &stage_name, etc, FSTAB_RESOURCE, RenameFlags::EXCHANGE)
         .map_err(|_| RescueFstabExecutionError::MutationFailed)?;
     rfs::fsync(etc).map_err(|_| RescueFstabExecutionError::MutationFailed)?;
-    rfs::syncfs(mount).map_err(|_| RescueFstabExecutionError::MutationFailed)?;
+    // `fsmount` returns an O_PATH descriptor, which syncfs rejects with
+    // EBADF. The open directory is on the same filesystem and is a valid
+    // persistence barrier descriptor.
+    rfs::syncfs(etc).map_err(|_| RescueFstabExecutionError::MutationFailed)?;
 
     let installed = snapshot_fstab(etc)?;
     let displaced = snapshot_named(etc, &stage_name)?;
@@ -987,7 +990,7 @@ fn apply_exact_replacement(
     remove_name_if_identity(etc, &stage_name, displaced.identity)?;
     stage_guard.disarm();
     rfs::fsync(etc).map_err(|_| RescueFstabExecutionError::MutationFailed)?;
-    rfs::syncfs(mount).map_err(|_| RescueFstabExecutionError::MutationFailed)?;
+    rfs::syncfs(etc).map_err(|_| RescueFstabExecutionError::MutationFailed)?;
     let final_state = snapshot_fstab(etc)?;
     ensure_snapshot_exact(
         &final_state,
@@ -998,7 +1001,7 @@ fn apply_exact_replacement(
 }
 
 fn restore_exact_backup(
-    mount: &OwnedFd,
+    _mount: &OwnedFd,
     etc: &OwnedFd,
     backup: &[u8],
     intent: &RepairExecutionIntentV1,
@@ -1035,7 +1038,7 @@ fn restore_exact_backup(
     )
     .map_err(|_| RescueFstabExecutionError::MutationFailed)?;
     rfs::fsync(etc).map_err(|_| RescueFstabExecutionError::MutationFailed)?;
-    rfs::syncfs(mount).map_err(|_| RescueFstabExecutionError::MutationFailed)?;
+    rfs::syncfs(etc).map_err(|_| RescueFstabExecutionError::MutationFailed)?;
     let restored = snapshot_fstab(etc)?;
     let displaced = snapshot_named(etc, &restore_name)?;
     ensure_snapshot_exact(&restored, intent.before_sha256(), intent.before_metadata())?;
@@ -1052,7 +1055,7 @@ fn restore_exact_backup(
         intent.before_metadata(),
     );
     rfs::fsync(etc).map_err(|_| RescueFstabExecutionError::MutationFailed)?;
-    rfs::syncfs(mount).map_err(|_| RescueFstabExecutionError::MutationFailed)?;
+    rfs::syncfs(etc).map_err(|_| RescueFstabExecutionError::MutationFailed)?;
     let final_state = snapshot_fstab(etc)?;
     ensure_snapshot_exact(
         &final_state,
