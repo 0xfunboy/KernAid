@@ -276,12 +276,26 @@ pub enum RepairPrepareFailureStage {
     AdmissionInternal,
 }
 
+/// Closed, path-free diagnostic retained only for the local systemd status
+/// channel. This type is deliberately not serialized into the repair API.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepairExecutionFailureStage {
+    Authority,
+    Target,
+    Lock,
+    Timeout,
+    Vault,
+    Write,
+    Mutation,
+    Recovery,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RepairEngineFailure {
     PrepareFailed(RepairPrepareFailureStage),
     ApprovalRejected,
     CancelFailed,
-    ExecutionFailed,
+    ExecutionFailed(RepairExecutionFailureStage),
     RecoveryUnavailable,
     Internal,
 }
@@ -652,6 +666,7 @@ pub struct RescueRepairService<Engine: RepairPreparationEngine> {
     state: ServiceState<Engine::Prepared>,
     jobs: SyncSender<WorkerJob<Engine::Prepared>>,
     results: Receiver<WorkerResult<Engine::Prepared>>,
+    execution_failure_diagnostic: Option<RepairExecutionFailureStage>,
 }
 
 impl<Engine: RepairPreparationEngine> RescueRepairService<Engine> {
@@ -677,6 +692,7 @@ impl<Engine: RepairPreparationEngine> RescueRepairService<Engine> {
             },
             jobs: job_tx,
             results: result_rx,
+            execution_failure_diagnostic: None,
         })
     }
 
@@ -724,6 +740,15 @@ impl<Engine: RepairPreparationEngine> RescueRepairService<Engine> {
     pub fn state_version(&mut self) -> u64 {
         self.drain_results();
         self.state.version
+    }
+
+    /// Drains at most one path-free execution diagnostic. The transport calls
+    /// this from the process main thread immediately after handling a frame.
+    pub(crate) fn take_execution_failure_diagnostic(
+        &mut self,
+    ) -> Option<RepairExecutionFailureStage> {
+        self.drain_results();
+        self.execution_failure_diagnostic.take()
     }
 
     fn dispatch(&mut self, request: RepairServiceRequest) -> Result<(), RepairServiceErrorToken> {
@@ -987,8 +1012,17 @@ impl<Engine: RepairPreparationEngine> RescueRepairService<Engine> {
                 ) {
                     return;
                 }
-                self.state.phase =
-                    InternalState::Terminal(result.unwrap_or_else(|_| failed_receipt()));
+                let receipt = match result {
+                    Ok(receipt) => receipt,
+                    Err(RepairEngineFailure::ExecutionFailed(stage)) => {
+                        if self.execution_failure_diagnostic.is_none() {
+                            self.execution_failure_diagnostic = Some(stage);
+                        }
+                        failed_receipt()
+                    }
+                    Err(_) => failed_receipt(),
+                };
+                self.state.phase = InternalState::Terminal(receipt);
                 let _ = self.bump_version();
             }
             WorkerResult::Cancelled {
@@ -1178,7 +1212,7 @@ fn prepare_failure_stage(error: RepairEngineFailure) -> RepairPrepareFailureStag
         RepairEngineFailure::PrepareFailed(stage) => stage,
         RepairEngineFailure::ApprovalRejected
         | RepairEngineFailure::CancelFailed
-        | RepairEngineFailure::ExecutionFailed
+        | RepairEngineFailure::ExecutionFailed(_)
         | RepairEngineFailure::RecoveryUnavailable
         | RepairEngineFailure::Internal => RepairPrepareFailureStage::AdmissionInternal,
     }
@@ -1550,6 +1584,35 @@ mod tests {
             service.public_state(),
             RepairPublicState::ManualReconciliationRequired
         );
+    }
+
+    #[test]
+    fn execution_failure_diagnostic_is_one_shot_and_absent_from_wire() {
+        let (mut service, _) = service();
+        service.state.phase = InternalState::Executing { operation_id: 7 };
+        service.apply_worker_result(WorkerResult::Executed {
+            operation_id: 7,
+            result: Err(RepairEngineFailure::ExecutionFailed(
+                RepairExecutionFailureStage::Authority,
+            )),
+        });
+
+        let response = json(&service.handle_frame(
+            format!(
+                r#"{{"apiVersion":"{REPAIR_SERVICE_API_VERSION}","requestId":"R-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","operation":"repair.status"}}"#
+            )
+            .as_bytes(),
+        ));
+        assert_eq!(response["state"], "failed");
+        assert_eq!(response["detail"]["terminalOutcome"], "failed");
+        assert!(response["detail"].get("executionFailureStage").is_none());
+        assert!(!response.to_string().contains("authority"));
+
+        assert_eq!(
+            service.take_execution_failure_diagnostic(),
+            Some(RepairExecutionFailureStage::Authority)
+        );
+        assert_eq!(service.take_execution_failure_diagnostic(), None);
     }
 
     #[test]

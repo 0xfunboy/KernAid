@@ -11,8 +11,8 @@ use crate::{
         prepare_rescue_fstab_candidate,
     },
     rescue_fstab_executor::{
-        RescueFstabExecutionOutcome, RescueFstabExecutionReceipt, execute_approved_rescue_fstab,
-        recover_pending_rescue_fstab,
+        RescueFstabExecutionError, RescueFstabExecutionOutcome, RescueFstabExecutionReceipt,
+        execute_approved_rescue_fstab, recover_pending_rescue_fstab,
     },
     rescue_fstab_preflight_resolver::{
         ProductionRescueFstabPreflightResolver, ProductionRescueFstabTargetGuard,
@@ -20,10 +20,9 @@ use crate::{
     },
     rescue_repair_service::{
         BoundRepairApproval, BrokerOwnedPrepareCommand, PreparedRepairDescriptor,
-        RepairEngineFailure, RepairPreparationEngine, RepairPrepareFailureStage,
-        RepairTerminalOutcome, RepairTerminalReceipt,
+        RepairEngineFailure, RepairExecutionFailureStage, RepairPreparationEngine,
+        RepairPrepareFailureStage, RepairTerminalOutcome, RepairTerminalReceipt,
     },
-    rescue_repair_service_transport::notify_execution_failure,
 };
 use kernaid_core::{
     RescueFstabCandidateAdmission, RescueFstabCandidateApproval, Session, SessionMode,
@@ -194,13 +193,9 @@ impl RepairPreparationEngine for ProductionRepairEngine {
             Ok(receipt) => terminal_receipt(receipt),
             Err(error) => match recover_pending_rescue_fstab(deadline) {
                 Ok(Some(receipt)) => terminal_receipt(receipt),
-                Ok(None) => {
-                    // Recovery has proved that no Pending transaction remains,
-                    // so this best-effort diagnostic cannot delay a safety
-                    // reconciliation path or expose implementation text.
-                    let _ = notify_execution_failure(error);
-                    Err(RepairEngineFailure::ExecutionFailed)
-                }
+                Ok(None) => Err(RepairEngineFailure::ExecutionFailed(map_execution_failure(
+                    error,
+                ))),
                 Err(_) => RepairTerminalReceipt::new(
                     RepairTerminalOutcome::ManualReconciliationRequired,
                     None,
@@ -218,6 +213,25 @@ impl RepairPreparationEngine for ProductionRepairEngine {
             .plan
             .cancel(deadline)
             .map_err(|_| RepairEngineFailure::CancelFailed)
+    }
+}
+
+fn map_execution_failure(error: RescueFstabExecutionError) -> RepairExecutionFailureStage {
+    match error {
+        RescueFstabExecutionError::InvalidAuthority => RepairExecutionFailureStage::Authority,
+        RescueFstabExecutionError::TargetChanged | RescueFstabExecutionError::UnsafeTarget => {
+            RepairExecutionFailureStage::Target
+        }
+        RescueFstabExecutionError::LockUnavailable => RepairExecutionFailureStage::Lock,
+        RescueFstabExecutionError::TimedOut => RepairExecutionFailureStage::Timeout,
+        RescueFstabExecutionError::VaultUnavailable
+        | RescueFstabExecutionError::VaultReconciliationRequired => {
+            RepairExecutionFailureStage::Vault
+        }
+        RescueFstabExecutionError::DetachedMountUnavailable
+        | RescueFstabExecutionError::RecoveryRequired => RepairExecutionFailureStage::Write,
+        RescueFstabExecutionError::MutationFailed => RepairExecutionFailureStage::Mutation,
+        RescueFstabExecutionError::RecoveryUnavailable => RepairExecutionFailureStage::Recovery,
     }
 }
 
@@ -336,6 +350,58 @@ mod tests {
                 map_preflight_failure(error),
                 RepairEngineFailure::PrepareFailed(expected)
             );
+        }
+    }
+
+    #[test]
+    fn execution_failures_map_to_closed_internal_stages() {
+        for (error, expected) in [
+            (
+                RescueFstabExecutionError::InvalidAuthority,
+                RepairExecutionFailureStage::Authority,
+            ),
+            (
+                RescueFstabExecutionError::TargetChanged,
+                RepairExecutionFailureStage::Target,
+            ),
+            (
+                RescueFstabExecutionError::UnsafeTarget,
+                RepairExecutionFailureStage::Target,
+            ),
+            (
+                RescueFstabExecutionError::LockUnavailable,
+                RepairExecutionFailureStage::Lock,
+            ),
+            (
+                RescueFstabExecutionError::TimedOut,
+                RepairExecutionFailureStage::Timeout,
+            ),
+            (
+                RescueFstabExecutionError::VaultUnavailable,
+                RepairExecutionFailureStage::Vault,
+            ),
+            (
+                RescueFstabExecutionError::VaultReconciliationRequired,
+                RepairExecutionFailureStage::Vault,
+            ),
+            (
+                RescueFstabExecutionError::DetachedMountUnavailable,
+                RepairExecutionFailureStage::Write,
+            ),
+            (
+                RescueFstabExecutionError::RecoveryRequired,
+                RepairExecutionFailureStage::Write,
+            ),
+            (
+                RescueFstabExecutionError::MutationFailed,
+                RepairExecutionFailureStage::Mutation,
+            ),
+            (
+                RescueFstabExecutionError::RecoveryUnavailable,
+                RepairExecutionFailureStage::Recovery,
+            ),
+        ] {
+            assert_eq!(map_execution_failure(error), expected);
         }
     }
 }
