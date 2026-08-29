@@ -15,14 +15,14 @@
   },
   "repairCandidate": {
     "name": "KernAid Rescue Repair Candidate AMD64",
-    "channel": "Phase 1 engineering candidate · non qualificata",
-    "sourceCommit": "fcb81ab98d7fcadbda208654ba4eb667a8f323de",
-    "workflowRunId": 33179291646,
-    "artifactVersion": "ci-33179291646-1",
-    "workflowUrl": "https://github.com/0xfunboy/KernAid/actions/runs/33179291646",
+    "channel": "Phase 1 engineering candidate · QEMU BIOS apply superato · non promossa",
+    "sourceCommit": "c281670b5323b6da223209686fe55662d1074b8c",
+    "workflowRunId": 33237233044,
+    "artifactVersion": "ci-33237233044-1",
+    "workflowUrl": "https://github.com/0xfunboy/KernAid/actions/runs/33237233044",
     "downloadName": "KernAid-Rescue-amd64-repair-candidate.iso",
     "checksumName": "KernAid-Rescue-amd64-repair-candidate.iso.sha256",
-    "qualification": "Artefatto sperimentale prodotto dal workflow Rescue Repair Candidate per sviluppo e verifica interna della sola azione linux.fstab.disable-missing-uuid.v1. Non appartiene al catalogo trusted, al canale retail o a una release qualificata.",
-    "warning": "ATTENZIONE: IMMAGINE NON QUALIFICATA E NON PROMOSSA. Può eseguire una riparazione sperimentale con scrittura sul target. Usare esclusivamente in laboratorio, su hardware non cliente e con dati sacrificabili; non distribuirla e non sostituirla alla ISO stabile o all'immagine retail."
+    "qualification": "La stessa ISO ibrida ha superato verifica SHA-256, avvio e ispezione offline read-only QEMU BIOS/UEFI. In QEMU BIOS ha inoltre eseguito linux.fstab.disable-missing-uuid.v1 su una fixture ext4 distinta dal Vault LUKS2/ext4, con approvazione tipizzata single-use, byte finali esatti, terminale committed e prefisso ISO immutato. Resta una candidata engineering privata: non appartiene al catalogo trusted, al canale retail o a una release qualificata.",
+    "warning": "ATTENZIONE: CANDIDATA PRIVATA, NON PROMOSSA E NON QUALIFICATA PER PRODUZIONE. La scrittura di riparazione è stata verificata solo in QEMU BIOS su una fixture sacrificabile; apply UEFI, USB fisica, hardware e filesystem reali, Secure Boot, interruzioni e dati cliente restano non qualificati. Non distribuirla e non sostituirla alla ISO stabile o all'immagine retail."
   }
 }

@@ -1,6 +1,6 @@
 # KernAid current status
 
-Last updated: 28 August 2026
+Last updated: 29 August 2026
 
 This page separates the product vision from what the repository can safely do
 today. The short version is: **the default KernAid Phase 0 product path is a
@@ -43,9 +43,9 @@ WinPE Companion and Fleet management remain later milestones.
 | Reporting | Resident Desk downloads a hashed JSON report; Rescue can persist the exact report plus audit sequence as a signed Vault envelope and export it through the native TTY companion |
 | Rescue credential boundary | Isolated credential vault and fail-closed Codex login/status/logout bridge; it does not run prompts or diagnoses |
 | Rescue provider plumbing | Feature-gated OpenAI executor and loopback relay are implemented, but live TLS and a real-account lifecycle are not yet qualified |
-| Virtual testing | Disposable QEMU fixtures, byte-level mutation checks, BIOS/UEFI boot and two-boot USB/vault coverage |
+| Virtual testing | Disposable QEMU fixtures, byte-level mutation checks, BIOS/UEFI boot and two-boot USB/vault coverage; the private repair ISO also has one exact-image BIOS happy-path apply qualification |
 | Repair experiment | Linux-only feature-gated Desk lab for one typed R2 repair and separately approved rollback on an internal temporary fixture. It now traverses the standard `SessionDriver`, Agent Gateway, explicit Core transaction states and typed broker; it remains absent from normal/Rescue builds and disconnected from production targets |
-| Feature-gated Rescue repair candidate | The off-default candidate implements one ext4-only path for disabling a non-critical `fstab` entry whose UUID is freshly proven missing: closed repair daemon and UI, broker-owned observation/plan preparation, distinct-device Vault backup, exact Core approval, bounded atomic replacement, verification, automatic restore and crash/reboot reconciliation. Its v1alpha2 read-only root helper transfers an exact four-FD bundle: a read-only leaf, an `O_PATH` physical-parent identity, a sealed UUID-inventory memfd and a detached `ro,noload` ext4 mount. After the transaction is durable Pending, a separate write-helper socket consumes the Vault's boot-scoped, single-use write lease, resolves the stable recovery fingerprint three times against fresh current-boot claims and transfers only one detached read-write mount; raw block FDs stay inside the root helper. `repaird` now has `PrivateDevices=yes`, no `DeviceAllow` and no `CAP_SYS_ADMIN`; its observer and parent guard do not open `/dev` or `/sys`. None of this is present in the default/stable Rescue image, which remains diagnosis-only. The candidate is not exact-image repair-qualified, physically qualified or promoted. |
+| Feature-gated Rescue repair candidate | The off-default candidate implements one ext4-only path for disabling a non-critical `fstab` entry whose UUID is freshly proven missing: closed repair daemon and UI, broker-owned observation/plan preparation, distinct-device Vault backup, exact Core approval, bounded atomic replacement, verification, automatic restore and crash/reboot reconciliation. Its v1alpha2 read-only root helper transfers an exact four-FD bundle: a read-only leaf, an `O_PATH` physical-parent identity, a sealed UUID-inventory memfd and a detached `ro,noload` ext4 mount. After the transaction is durable Pending, a separate write-helper socket consumes the Vault's boot-scoped, single-use write lease, resolves the stable recovery fingerprint three times against fresh current-boot claims and transfers only one detached read-write mount; raw block FDs stay inside the root helper. `repaird` has `PrivateDevices=yes`, no `DeviceAllow` and no `CAP_SYS_ADMIN`; its observer and parent guard do not open `/dev` or `/sys`. None of this is present in the default/stable Rescue image, which remains diagnosis-only. The exact private ISO is BIOS QEMU happy-path apply-qualified only for this one action; UEFI apply, failure/recovery, physical hardware, production use and promotion remain unqualified. |
 | Rescue first boot | The promoted image provisions an all-zero p3 into the canonical LUKS2/ext4 Vault, seeds its identity and Codex home, closes it and verifies the locked profile; the exact flow passed two-boot BIOS/UEFI QEMU qualification |
 | Release channel | Canonical Release Channel v1, anti-rollback links, strict verification and an immutable internal prerelease are active through sequence 2; this is not an automatic updater or signed production channel |
 
@@ -59,12 +59,11 @@ treated as a newer release.
 - There is no mutation handler in the default/stable product and no supported
   customer-machine repair path. The only real handler is the explicitly
   feature-gated `fstab` candidate.
-- The source candidate wires its dedicated repair account, socket-activated
-  control plane, UI, executor and startup recovery barrier. Both read-only
-  observation and post-lease read-write mounting now cross narrowly typed root
-  helper sockets, and the repair daemon's device and mount privileges have been
-  removed. This newer isolation is not yet present in the private artifact
-  listed below and remains unqualified until an exact new build is tested.
+- The private repair artifact includes the dedicated repair account,
+  socket-activated control plane, UI, executor, startup recovery barrier,
+  separate read-only and write helpers, and tightened `repaird` sandbox. Its
+  exact-image evidence covers only BIOS/UEFI boot and one BIOS happy-path
+  apply; UEFI apply and all failure/recovery paths remain unqualified.
 - Repair Vault retention, crash-safe compaction and pending-transaction
   reconciliation are implemented; customer retention policy and destructive
   power-loss qualification remain promotion gates.
@@ -127,30 +126,28 @@ explicit catalog and private-site promotion is completed.
 ### Private repair candidate
 
 A separate, private repair candidate was built from
-[`fcb81ab98d7fcadbda208654ba4eb667a8f323de`](https://github.com/0xfunboy/KernAid/commit/fcb81ab98d7fcadbda208654ba4eb667a8f323de).
+[`c281670b5323b6da223209686fe55662d1074b8c`](https://github.com/0xfunboy/KernAid/commit/c281670b5323b6da223209686fe55662d1074b8c).
 It does **not** replace the stable retail image or the promoted internal release
 above.
 
-The newer source isolation landed in
-[`bf7beca257ea19273b546a3b49a3dbc8728036d0`](https://github.com/0xfunboy/KernAid/commit/bf7beca257ea19273b546a3b49a3dbc8728036d0),
-after this ISO was built. The `fcb81ab` artifact therefore does **not** contain
-the separate write-helper socket, post-lease write-mount handoff or tightened
-`repaird` device sandbox. It remains the private candidate listed here until a
-new build completes and its exact checksum and evidence replace this entry; do
-not attribute the newer isolation to the ISO below.
-
 | Field | Exact value |
 | --- | --- |
-| Workflow | [Repair candidate run 33179291646](https://github.com/0xfunboy/KernAid/actions/runs/33179291646) |
+| Workflow | [Repair candidate run 33237233044, attempt 1](https://github.com/0xfunboy/KernAid/actions/runs/33237233044) |
+| Artifact version | `ci-33237233044-1` |
 | ISO | `KernAid-Rescue-amd64-repair-candidate.iso` |
-| ISO size | `1,223,540,736` bytes |
-| ISO SHA-256 | `a1eaa88fe127815e117cc127f225c8ebf79c5dd0f3aa3e00466ad928617efbf3` |
-| Virtual smoke | BIOS pass; UEFI pass |
-| Channel | Private, unqualified and unpromoted |
+| ISO size | `1,224,736,768` bytes |
+| ISO SHA-256 | `9b9b386de86c970f6c6a54448b42a588824e47a2edc07973c3bc8ffdcd9d749c` |
+| Virtual boot smoke | BIOS pass; UEFI pass |
+| Virtual repair | BIOS QEMU happy-path pass for `linux.fstab.disable-missing-uuid.v1`; exact bytes; terminal `committed` |
+| Channel | Private engineering candidate; not promoted |
 
-This artifact is available only for controlled repair qualification. Passing
-the two boot smoke tests is not physical USB, power-loss, hardware, firmware or
-Secure Boot qualification.
+The workflow used a disposable direct-leaf ext4 target and a distinct
+LUKS2/ext4 Vault, retained typed single-use approval, verified the exact final
+`fstab` bytes, left the unrelated sentinel unchanged and proved the ISO prefix
+immutable. This is a narrow exact-image BIOS happy-path qualification, not
+UEFI apply, automatic-restore, fault-injection, process-termination, reboot,
+destructive power-loss, physical USB, hardware, firmware, Secure Boot,
+customer-data or production qualification.
 
 The stable retail candidate above is exposed privately only to unblock the
 first physical boot test. On Windows, verify the retail `.img.xz` checksum and
@@ -160,8 +157,8 @@ use non-customer hardware. Rufus only writes the qualified zero-state image;
 the first live boot asks for a new passphrase and provisions the encrypted
 Vault in place. This is still not a supported repair medium.
 
-The latest complete unsigned Desk packaging matrix was built from the same
-commit in [Desktop run 33145692864](https://github.com/0xfunboy/KernAid/actions/runs/33145692864).
+The latest complete unsigned Desk packaging matrix was built from the repair
+candidate commit in [Desktop run 33237227730](https://github.com/0xfunboy/KernAid/actions/runs/33237227730).
 Linux x86-64, Windows x86-64, Intel macOS and Apple-silicon macOS packaging all
 passed; signing, notarization and physical-machine qualification remain open.
 
@@ -171,15 +168,17 @@ passed; signing, notarization and physical-machine qualification remain open.
    record firmware, storage, network and UI evidence.
 2. Finish the real-account Rescue provider/vault lifecycle without exposing or
    copying the CLI credential store.
-3. Qualify Secure Boot and signed release delivery.
-4. Build a new exact repair candidate from `bf7beca` or later and qualify it in
-   disposable two-disk BIOS/UEFI QEMU for repair, rollback, interrupted-process
-   and reboot reconciliation, and destructive power-loss recovery.
-5. Add and qualify the signed consumer/update path on top of the verified
+3. Qualify the exact repair candidate for UEFI apply, automatic restore,
+   injected faults, interrupted processes, reboot reconciliation and
+   destructive power-loss recovery on disposable targets.
+4. Qualify the repair candidate on disposable two-device physical hardware,
+   including unplug/reboot/power-loss recovery.
+5. Qualify Secure Boot and signed release delivery.
+6. Add and qualify the signed consumer/update path on top of the verified
    internal Release Channel v1 sequence.
-6. Qualify the exact repair-candidate image on disposable two-device hardware,
-   including unplug/reboot/power-loss recovery. Keep it unpromoted until the
-   physical USB and Secure Boot matrices pass.
+
+Keep the repair candidate unpromoted until the virtual failure/recovery,
+physical USB and Secure Boot matrices pass.
 
 ## Where to look
 

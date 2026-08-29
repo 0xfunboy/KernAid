@@ -1,17 +1,16 @@
 # Rescue Linux repair v1
 
-Status: **implemented, off-default production candidate; not promoted**. The
-default/stable image remains diagnosis-only. This document describes the gated
-candidate implementation, not a claim that a shipping image can repair a
-customer filesystem.
+Status: **implemented, off-default private candidate; one exact-image BIOS
+happy path qualified in QEMU; not promoted**. The default/stable image remains
+diagnosis-only. This document describes the gated candidate implementation,
+not a claim that a shipping image can repair a customer filesystem.
 
-The source-level write isolation described here landed in
-[`bf7beca257ea19273b546a3b49a3dbc8728036d0`](https://github.com/0xfunboy/KernAid/commit/bf7beca257ea19273b546a3b49a3dbc8728036d0).
-The currently listed private repair ISO was built earlier, from
-[`fcb81ab98d7fcadbda208654ba4eb667a8f323de`](https://github.com/0xfunboy/KernAid/commit/fcb81ab98d7fcadbda208654ba4eb667a8f323de),
-and does **not** contain the separate write helper or tightened `repaird`
-sandbox. It remains the listed artifact until a newer build completes and is
-recorded with exact-image evidence.
+The currently listed private repair ISO was built from
+[`c281670b5323b6da223209686fe55662d1074b8c`](https://github.com/0xfunboy/KernAid/commit/c281670b5323b6da223209686fe55662d1074b8c)
+by [repair run 33237233044](https://github.com/0xfunboy/KernAid/actions/runs/33237233044).
+It contains the separate read/write helpers, state-version refresh after the
+write helper consumes the single-use Vault lease, and tightened `repaird`
+sandbox described below.
 
 ## First supported action
 
@@ -26,6 +25,21 @@ mounts, swap, bind and network entries, optional `nofail`/`noauto` entries and
 other filesystem types or every mount point outside that data-only allowlist.
 Provider output cannot
 select the entry, path, command or replacement bytes.
+
+## Exact-image evidence
+
+The private ISO is `1,224,736,768` bytes with SHA-256
+`9b9b386de86c970f6c6a54448b42a588824e47a2edc07973c3bc8ffdcd9d749c`.
+The same bytes passed ordinary QEMU boot smoke under BIOS and UEFI. Under BIOS
+they also completed `linux.fstab.disable-missing-uuid.v1` on one disposable
+direct-leaf ext4 fixture with a distinct LUKS2/ext4 Vault, typed single-use
+approval, exact expected-after bytes, terminal `committed`, unchanged unrelated
+sentinel and immutable ISO prefix.
+
+This evidence does not cover UEFI apply or rollback, injected faults,
+automatic restore, process interruption, reboot reconciliation, destructive
+power loss, physical media/hardware/firmware, Secure Boot, customer data or
+production use.
 
 ## Trust boundaries
 
@@ -224,7 +238,8 @@ Rescue image or default broker may enable it until all of these are true:
 
 - disposable two-disk QEMU tests cover stale targets, tampered backups,
   cancellation, process termination, automatic restore and reconciliation;
-- the exact image passes BIOS and UEFI repair/rollback qualification; and
+- the exact image extends its current BIOS happy-path evidence to UEFI apply
+  and BIOS/UEFI repair/rollback and failure-path qualification; and
 - physical USB testing proves separate-device backup and power-loss recovery
   on the supported hardware matrix;
 - Secure Boot is qualified for the exact promoted image.
