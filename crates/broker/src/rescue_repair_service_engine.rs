@@ -198,7 +198,7 @@ impl RepairPreparationEngine for ProductionRepairEngine {
         match execute_approved_rescue_fstab(approved.0, deadline) {
             Ok(receipt) => terminal_receipt(receipt),
             Err(error) => match recover_pending_rescue_fstab(deadline) {
-                Ok(Some(receipt)) => terminal_receipt(receipt),
+                Ok(Some(receipt)) => terminal_receipt(receipt.with_initial_failure(error)),
                 Ok(None) => Err(RepairEngineFailure::ExecutionFailed(map_execution_failure(
                     error,
                 ))),
@@ -298,6 +298,7 @@ fn map_preflight_failure(error: RescueFstabPreflightError) -> RepairEngineFailur
 fn terminal_receipt(
     receipt: RescueFstabExecutionReceipt,
 ) -> Result<RepairTerminalReceipt, RepairEngineFailure> {
+    let execution_failure_stage = receipt.initial_failure().map(map_execution_failure);
     let outcome = match receipt.outcome() {
         RescueFstabExecutionOutcome::Committed => RepairTerminalOutcome::Committed,
         RescueFstabExecutionOutcome::ClosedBeforeUnchanged => {
@@ -314,7 +315,8 @@ fn terminal_receipt(
         outcome,
         receipt.reservation_id(),
         receipt.transaction_binding_sha256(),
-    )
+    )?
+    .with_execution_failure_stage(execution_failure_stage)
 }
 
 fn terminal_receipt_from_executor_parts(

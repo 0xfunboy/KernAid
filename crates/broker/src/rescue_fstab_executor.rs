@@ -75,6 +75,7 @@ pub struct RescueFstabExecutionReceipt {
     outcome: RescueFstabExecutionOutcome,
     reservation_id: String,
     transaction_binding_sha256: String,
+    initial_failure: Option<RescueFstabExecutionError>,
 }
 
 impl RescueFstabExecutionReceipt {
@@ -88,6 +89,21 @@ impl RescueFstabExecutionReceipt {
 
     pub fn transaction_binding_sha256(&self) -> &str {
         &self.transaction_binding_sha256
+    }
+
+    pub const fn initial_failure(&self) -> Option<RescueFstabExecutionError> {
+        self.initial_failure
+    }
+
+    pub(crate) fn with_initial_failure(mut self, failure: RescueFstabExecutionError) -> Self {
+        if matches!(
+            self.outcome,
+            RescueFstabExecutionOutcome::ClosedBeforeUnchanged
+                | RescueFstabExecutionOutcome::ClosedBeforeRestored
+        ) {
+            self.initial_failure = Some(failure);
+        }
+        self
     }
 }
 
@@ -239,6 +255,7 @@ pub fn execute_approved_rescue_fstab(
         pending.backup().reservation_id().as_str(),
         operation_deadline,
     )?;
+    let initial_failure = target_closure.initial_failure;
 
     let resolution = RepairTransactionResolution::new(
         target_closure.outcome,
@@ -247,9 +264,20 @@ pub fn execute_approved_rescue_fstab(
         target_closure.cleanup_verified,
         &intent,
     )
-    .map_err(|_| RescueFstabExecutionError::RecoveryUnavailable)?;
-    let resolved = resolve_pending(&mut vault_client, &pending, &resolution, deadline)?;
-    receipt_from_status(&resolved)
+    .map_err(|_| {
+        prefer_initial_failure(
+            initial_failure,
+            RescueFstabExecutionError::RecoveryUnavailable,
+        )
+    })?;
+    let resolved = resolve_pending(&mut vault_client, &pending, &resolution, deadline)
+        .map_err(|error| prefer_initial_failure(initial_failure, error))?;
+    let receipt = receipt_from_status(&resolved)
+        .map_err(|error| prefer_initial_failure(initial_failure, error))?;
+    Ok(match initial_failure {
+        Some(failure) => receipt.with_initial_failure(failure),
+        None => receipt,
+    })
 }
 
 /// Reconciles the sole unresolved transaction after a process restart or
@@ -337,6 +365,7 @@ pub fn recover_pending_rescue_fstab(
         before_outcome,
         safety_deadline,
     )?;
+    let initial_failure = target_closure.initial_failure;
 
     if pending.phase() == RepairTransactionPhase::ManualReconciliationRequired
         && target_closure.outcome
@@ -351,9 +380,20 @@ pub fn recover_pending_rescue_fstab(
         target_closure.cleanup_verified,
         &intent,
     )
-    .map_err(|_| RescueFstabExecutionError::RecoveryUnavailable)?;
-    let resolved = resolve_pending(&mut vault_client, &pending, &resolution, deadline)?;
-    receipt_from_status(&resolved).map(Some)
+    .map_err(|_| {
+        prefer_initial_failure(
+            initial_failure,
+            RescueFstabExecutionError::RecoveryUnavailable,
+        )
+    })?;
+    let resolved = resolve_pending(&mut vault_client, &pending, &resolution, deadline)
+        .map_err(|error| prefer_initial_failure(initial_failure, error))?;
+    let receipt = receipt_from_status(&resolved)
+        .map_err(|error| prefer_initial_failure(initial_failure, error))?;
+    Ok(Some(match initial_failure {
+        Some(failure) => receipt.with_initial_failure(failure),
+        None => receipt,
+    }))
 }
 
 fn execution_intent(
@@ -508,6 +548,7 @@ fn receipt_from_status(
         outcome,
         reservation_id: status.backup().reservation_id().as_str().to_owned(),
         transaction_binding_sha256: status.transaction_binding_sha256().as_str().to_owned(),
+        initial_failure: None,
     })
 }
 
@@ -653,6 +694,7 @@ struct TargetClosure {
     outcome: RepairTransactionResolutionOutcome,
     observation: ClosedObservation,
     cleanup_verified: bool,
+    initial_failure: Option<RescueFstabExecutionError>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -693,17 +735,35 @@ fn execute_same_boot_target(
                 outcome: RepairTransactionResolutionOutcome::CommittedAfter,
                 observation,
                 cleanup_verified: false,
+                initial_failure: None,
             }),
-            Err(_) => {
-                close_after_failed_mutation(mount, &etc, backup, intent, reservation_id, deadline)
-            }
+            Err(error) => match close_after_failed_mutation(
+                mount,
+                &etc,
+                backup,
+                intent,
+                reservation_id,
+                deadline,
+            ) {
+                Ok(mut closure) => {
+                    if matches!(
+                        closure.outcome,
+                        RepairTransactionResolutionOutcome::ClosedBeforeUnchanged
+                            | RepairTransactionResolutionOutcome::ClosedBeforeRestored
+                    ) {
+                        closure.initial_failure = Some(error);
+                    }
+                    Ok(closure)
+                }
+                Err(_) => Err(error),
+            },
         };
         drop(etc);
         result
     }?;
-    write_mount
-        .revalidate()
-        .map_err(map_write_capability_error)?;
+    if let Err(error) = write_mount.revalidate().map_err(map_write_capability_error) {
+        return Err(prefer_initial_failure(result.initial_failure, error));
+    }
     drop(write_mount);
     Ok(TargetClosure {
         cleanup_verified: true,
@@ -731,17 +791,20 @@ fn recover_same_boot_target(
             outcome: before_outcome,
             observation: read_observation.1,
             cleanup_verified: true,
+            initial_failure: None,
         }),
         ExactTargetState::Third => Ok(TargetClosure {
             outcome: RepairTransactionResolutionOutcome::ManualReconciliationRequired,
             observation: read_observation.1,
             cleanup_verified: true,
+            initial_failure: None,
         }),
         ExactTargetState::After if pending.phase() != RepairTransactionPhase::Pending => {
             Ok(TargetClosure {
                 outcome: RepairTransactionResolutionOutcome::ManualReconciliationRequired,
                 observation: read_observation.1,
                 cleanup_verified: true,
+                initial_failure: None,
             })
         }
         ExactTargetState::After => {
@@ -796,8 +859,9 @@ fn restore_recovery_target(
                     outcome: RepairTransactionResolutionOutcome::ClosedBeforeRestored,
                     observation,
                     cleanup_verified: false,
+                    initial_failure: None,
                 },
-                Err(_) => {
+                Err(error) => {
                     let snapshot = snapshot_fstab(&etc)?;
                     TargetClosure {
                         outcome: if exact_state(&snapshot, intent) == ExactTargetState::Before {
@@ -807,6 +871,7 @@ fn restore_recovery_target(
                         },
                         observation: snapshot.observation(),
                         cleanup_verified: false,
+                        initial_failure: Some(error),
                     }
                 }
             };
@@ -859,6 +924,7 @@ fn close_after_failed_mutation(
                 outcome: RepairTransactionResolutionOutcome::ClosedBeforeUnchanged,
                 observation: snapshot.observation(),
                 cleanup_verified: false,
+                initial_failure: None,
             })
         }
         ExactTargetState::After => {
@@ -867,6 +933,7 @@ fn close_after_failed_mutation(
                     outcome: RepairTransactionResolutionOutcome::ClosedBeforeRestored,
                     observation,
                     cleanup_verified: false,
+                    initial_failure: None,
                 },
             )
         }
@@ -874,6 +941,7 @@ fn close_after_failed_mutation(
             outcome: RepairTransactionResolutionOutcome::ManualReconciliationRequired,
             observation: snapshot.observation(),
             cleanup_verified: false,
+            initial_failure: None,
         }),
     }
 }
@@ -1366,6 +1434,13 @@ fn ensure_deadline(deadline: Instant) -> Result<(), RescueFstabExecutionError> {
     }
 }
 
+fn prefer_initial_failure(
+    initial: Option<RescueFstabExecutionError>,
+    secondary: RescueFstabExecutionError,
+) -> RescueFstabExecutionError {
+    initial.unwrap_or(secondary)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1395,6 +1470,43 @@ mod tests {
         assert!(!recovery_status_retryable(RepairVaultClientError::Remote(
             ErrorToken::StaleState
         )));
+    }
+
+    #[test]
+    fn execution_receipt_retains_failure_only_for_safe_closed_outcome() {
+        let receipt = |outcome| RescueFstabExecutionReceipt {
+            outcome,
+            reservation_id: RESERVATION.to_owned(),
+            transaction_binding_sha256: "8".repeat(64),
+            initial_failure: None,
+        };
+        assert_eq!(
+            receipt(RescueFstabExecutionOutcome::ClosedBeforeUnchanged)
+                .with_initial_failure(RescueFstabExecutionError::MutationFailed)
+                .initial_failure(),
+            Some(RescueFstabExecutionError::MutationFailed)
+        );
+        assert_eq!(
+            receipt(RescueFstabExecutionOutcome::Committed)
+                .with_initial_failure(RescueFstabExecutionError::MutationFailed)
+                .initial_failure(),
+            None
+        );
+    }
+
+    #[test]
+    fn initial_apply_failure_precedes_later_closure_failure() {
+        assert_eq!(
+            prefer_initial_failure(
+                Some(RescueFstabExecutionError::MutationFailed),
+                RescueFstabExecutionError::VaultUnavailable,
+            ),
+            RescueFstabExecutionError::MutationFailed
+        );
+        assert_eq!(
+            prefer_initial_failure(None, RescueFstabExecutionError::VaultUnavailable),
+            RescueFstabExecutionError::VaultUnavailable
+        );
     }
 
     struct DisposableTree(PathBuf);

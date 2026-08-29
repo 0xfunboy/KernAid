@@ -312,6 +312,7 @@ pub struct RepairTerminalReceipt {
     reservation_id: Option<String>,
     transaction_binding_sha256: Option<String>,
     prepare_failure_stage: Option<RepairPrepareFailureStage>,
+    execution_failure_stage: Option<RepairExecutionFailureStage>,
 }
 
 impl RepairTerminalReceipt {
@@ -350,7 +351,29 @@ impl RepairTerminalReceipt {
             reservation_id,
             transaction_binding_sha256,
             prepare_failure_stage: None,
+            execution_failure_stage: None,
         })
+    }
+
+    pub(crate) fn with_execution_failure_stage(
+        mut self,
+        stage: Option<RepairExecutionFailureStage>,
+    ) -> Result<Self, RepairEngineFailure> {
+        if stage.is_some()
+            && !matches!(
+                self.outcome,
+                RepairTerminalOutcome::ClosedBeforeUnchanged
+                    | RepairTerminalOutcome::ClosedBeforeRestored
+            )
+        {
+            return Err(RepairEngineFailure::Internal);
+        }
+        self.execution_failure_stage = stage;
+        Ok(self)
+    }
+
+    const fn execution_failure_stage(&self) -> Option<RepairExecutionFailureStage> {
+        self.execution_failure_stage
     }
 }
 
@@ -682,6 +705,9 @@ impl<Engine: RepairPreparationEngine> RescueRepairService<Engine> {
         let recovered = engine
             .recover_pending(recovery_deadline)
             .map_err(|_| RepairServiceStartError::RecoveryUnavailable)?;
+        let recovery_failure_diagnostic = recovered
+            .as_ref()
+            .and_then(RepairTerminalReceipt::execution_failure_stage);
         let initial_phase = recovered.map_or(InternalState::Idle, InternalState::Terminal);
         let (job_tx, job_rx) = mpsc::sync_channel(1);
         let (result_tx, result_rx) = mpsc::sync_channel(1);
@@ -697,7 +723,7 @@ impl<Engine: RepairPreparationEngine> RescueRepairService<Engine> {
             },
             jobs: job_tx,
             results: result_rx,
-            execution_failure_diagnostic: None,
+            execution_failure_diagnostic: recovery_failure_diagnostic,
         })
     }
 
@@ -1018,7 +1044,12 @@ impl<Engine: RepairPreparationEngine> RescueRepairService<Engine> {
                     return;
                 }
                 let receipt = match result {
-                    Ok(receipt) => receipt,
+                    Ok(receipt) => {
+                        if self.execution_failure_diagnostic.is_none() {
+                            self.execution_failure_diagnostic = receipt.execution_failure_stage();
+                        }
+                        receipt
+                    }
                     Err(RepairEngineFailure::ApprovalRejected(stage)) => {
                         if self.execution_failure_diagnostic.is_none() {
                             self.execution_failure_diagnostic = Some(stage);
@@ -1242,6 +1273,7 @@ fn cancelled_receipt() -> RepairTerminalReceipt {
         reservation_id: None,
         transaction_binding_sha256: None,
         prepare_failure_stage: None,
+        execution_failure_stage: None,
     }
 }
 
@@ -1251,6 +1283,7 @@ fn failed_receipt() -> RepairTerminalReceipt {
         reservation_id: None,
         transaction_binding_sha256: None,
         prepare_failure_stage: None,
+        execution_failure_stage: None,
     }
 }
 
@@ -1260,6 +1293,7 @@ fn prepare_failed_receipt(stage: RepairPrepareFailureStage) -> RepairTerminalRec
         reservation_id: None,
         transaction_binding_sha256: None,
         prepare_failure_stage: Some(stage),
+        execution_failure_stage: None,
     }
 }
 
@@ -1605,6 +1639,33 @@ mod tests {
     }
 
     #[test]
+    fn startup_safe_closure_retains_one_shot_execution_diagnostic() {
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let recovery = RepairTerminalReceipt::new(
+            RepairTerminalOutcome::ClosedBeforeRestored,
+            Some("B-0123456789abcdef0123456789abcdef".to_owned()),
+            Some(hash('7')),
+        )
+        .expect("restored receipt")
+        .with_execution_failure_stage(Some(RepairExecutionFailureStage::Mutation))
+        .expect("restored diagnostic");
+        let mut service = RescueRepairService::start(
+            MockEngine {
+                state,
+                recovery: Some(recovery),
+            },
+            Instant::now() + Duration::from_secs(1),
+        )
+        .expect("service");
+        assert_eq!(service.public_state(), RepairPublicState::Restored);
+        assert_eq!(
+            service.take_execution_failure_diagnostic(),
+            Some(RepairExecutionFailureStage::Mutation)
+        );
+        assert_eq!(service.take_execution_failure_diagnostic(), None);
+    }
+
+    #[test]
     fn execution_failure_diagnostic_is_one_shot_and_absent_from_wire() {
         let (mut service, _) = service();
         service.state.phase = InternalState::Executing { operation_id: 7 };
@@ -1629,6 +1690,43 @@ mod tests {
         assert_eq!(
             service.take_execution_failure_diagnostic(),
             Some(RepairExecutionFailureStage::Authority)
+        );
+        assert_eq!(service.take_execution_failure_diagnostic(), None);
+    }
+
+    #[test]
+    fn safely_closed_execution_diagnostic_is_one_shot_and_absent_from_wire() {
+        let (mut service, _) = service();
+        service.state.phase = InternalState::Executing { operation_id: 8 };
+        let receipt = RepairTerminalReceipt::new(
+            RepairTerminalOutcome::ClosedBeforeUnchanged,
+            Some("B-0123456789abcdef0123456789abcdef".to_owned()),
+            Some(hash('8')),
+        )
+        .expect("closed receipt")
+        .with_execution_failure_stage(Some(RepairExecutionFailureStage::Mutation))
+        .expect("closed diagnostic");
+        service.apply_worker_result(WorkerResult::Executed {
+            operation_id: 8,
+            result: Ok(receipt),
+        });
+
+        let response = json(&service.handle_frame(
+            format!(
+                r#"{{"apiVersion":"{REPAIR_SERVICE_API_VERSION}","requestId":"R-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","operation":"repair.status"}}"#
+            )
+            .as_bytes(),
+        ));
+        assert_eq!(response["state"], "restored");
+        assert_eq!(
+            response["detail"]["terminalOutcome"],
+            "closed-before-unchanged"
+        );
+        assert!(response["detail"].get("executionFailureStage").is_none());
+        assert!(!response.to_string().contains("mutation"));
+        assert_eq!(
+            service.take_execution_failure_diagnostic(),
+            Some(RepairExecutionFailureStage::Mutation)
         );
         assert_eq!(service.take_execution_failure_diagnostic(), None);
     }

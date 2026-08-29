@@ -79,6 +79,9 @@ pub fn run_activated_repair_service<Engine: RepairPreparationEngine>(
     let mut service = RescueRepairService::start(engine, recovery_deadline)
         .map_err(|_| RepairServiceRuntimeError::RecoveryUnavailable)?;
     notify_ready()?;
+    if let Some(stage) = service.take_execution_failure_diagnostic() {
+        let _ = notify_execution_failure(stage);
+    }
 
     loop {
         wait_ready(listener.as_fd(), PollFlags::IN, None)?;
