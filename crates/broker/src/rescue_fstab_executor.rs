@@ -247,6 +247,7 @@ pub fn execute_approved_rescue_fstab(
     drop(target_guard);
     let write_mount = acquire_pending_target_write_mount(&pending, operation_deadline)
         .map_err(map_write_capability_error)?;
+    refresh_pending_after_write_lease(&mut vault_client, &pending, operation_deadline)?;
     let target_closure = execute_same_boot_target(
         write_mount,
         &backup_bytes,
@@ -522,6 +523,30 @@ fn resolve_pending(
         }
         Err(error) => Err(map_vault_error(error)),
     }
+}
+
+/// The root write helper consumes the transaction's single-use Vault lease
+/// through a separate authenticated connection. Refresh the exact transaction
+/// before touching the target so this client's state-version guard observes
+/// that expected mutation. If the transaction itself changed, the detached
+/// write mount is dropped without writing and startup reconciliation can close
+/// the still-Before target.
+fn refresh_pending_after_write_lease(
+    client: &mut RepairVaultClient,
+    pending: &RepairTransactionStatusPayload,
+    deadline: Instant,
+) -> Result<(), RescueFstabExecutionError> {
+    let selector = RepairTransactionStatusSelector::for_status(pending);
+    let result = client
+        .transaction_status(&selector, deadline)
+        .map_err(map_vault_error)?;
+    let refreshed = result
+        .transaction()
+        .ok_or(RescueFstabExecutionError::VaultReconciliationRequired)?;
+    if refreshed != pending {
+        return Err(RescueFstabExecutionError::VaultReconciliationRequired);
+    }
+    Ok(())
 }
 
 fn receipt_from_status(

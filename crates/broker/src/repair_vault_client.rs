@@ -1223,6 +1223,55 @@ mod tests {
     }
 
     #[test]
+    fn exact_status_refreshes_an_expected_external_mutation_before_resolve() {
+        let mut client = RepairVaultClient {
+            guard: VersionGuard::Ready(17),
+            ambiguous_reserve: None,
+        };
+        let selector = exact_transaction_selector();
+        let mut status_versions = Vec::new();
+        let status = client.transaction_status_with_exchange(
+            &selector,
+            Instant::now() + Duration::from_secs(1),
+            |expected_state_version, observed_selector, _| {
+                assert_eq!(observed_selector, &selector);
+                status_versions.push(expected_state_version);
+                if status_versions.len() == 1 {
+                    Ok(TransactionAttempt {
+                        state_version: 19,
+                        outcome: Err(RepairVaultClientError::Remote(ErrorToken::StaleState)),
+                    })
+                } else {
+                    Ok(TransactionAttempt {
+                        state_version: 19,
+                        outcome: Ok(11_u8),
+                    })
+                }
+            },
+        );
+
+        assert_eq!(status, Ok(11));
+        assert_eq!(status_versions, [17, 19]);
+        assert_eq!(
+            client.state(),
+            RepairVaultClientState::Ready { state_version: 19 }
+        );
+
+        let resolved = client.resolve_transaction_with_exchange(|expected_state_version| {
+            assert_eq!(expected_state_version, 19);
+            Ok(TransactionAttempt {
+                state_version: 20,
+                outcome: Ok(12_u8),
+            })
+        });
+        assert_eq!(resolved, Ok(12));
+        assert_eq!(
+            client.state(),
+            RepairVaultClientState::Ready { state_version: 20 }
+        );
+    }
+
+    #[test]
     fn transaction_status_never_clears_an_unknown_reserve() {
         let original = draft();
         let mut client = ambiguous_reserve_client(&original);
