@@ -1,5 +1,6 @@
 //! Validated systemd-activated SOCK_SEQPACKET runtime for repaird.
 
+use crate::rescue_fstab_executor::RescueFstabExecutionError;
 use crate::rescue_repair_service::{
     REPAIR_SERVICE_MAX_FRAME_BYTES, RepairPreparationEngine, RescueRepairService,
 };
@@ -331,6 +332,50 @@ fn lookup_authorized_gid() -> Result<u32, RepairServiceRuntimeError> {
 }
 
 fn notify_ready() -> Result<(), RepairServiceRuntimeError> {
+    notify_systemd(READY_PAYLOAD)
+}
+
+pub(crate) fn notify_execution_failure(
+    error: RescueFstabExecutionError,
+) -> Result<(), RepairServiceRuntimeError> {
+    notify_systemd(execution_failure_payload(error))
+}
+
+fn execution_failure_payload(error: RescueFstabExecutionError) -> &'static [u8] {
+    match error {
+        RescueFstabExecutionError::InvalidAuthority => {
+            b"STATUS=KERNAID_RESCUE_REPAIR_EXECUTION_FAILURE_V1 stage=authority"
+        }
+        RescueFstabExecutionError::TargetChanged | RescueFstabExecutionError::UnsafeTarget => {
+            b"STATUS=KERNAID_RESCUE_REPAIR_EXECUTION_FAILURE_V1 stage=target"
+        }
+        RescueFstabExecutionError::LockUnavailable => {
+            b"STATUS=KERNAID_RESCUE_REPAIR_EXECUTION_FAILURE_V1 stage=lock"
+        }
+        RescueFstabExecutionError::TimedOut => {
+            b"STATUS=KERNAID_RESCUE_REPAIR_EXECUTION_FAILURE_V1 stage=timeout"
+        }
+        RescueFstabExecutionError::VaultUnavailable
+        | RescueFstabExecutionError::VaultReconciliationRequired => {
+            b"STATUS=KERNAID_RESCUE_REPAIR_EXECUTION_FAILURE_V1 stage=vault"
+        }
+        RescueFstabExecutionError::DetachedMountUnavailable
+        | RescueFstabExecutionError::RecoveryRequired => {
+            b"STATUS=KERNAID_RESCUE_REPAIR_EXECUTION_FAILURE_V1 stage=write"
+        }
+        RescueFstabExecutionError::MutationFailed => {
+            b"STATUS=KERNAID_RESCUE_REPAIR_EXECUTION_FAILURE_V1 stage=mutation"
+        }
+        RescueFstabExecutionError::RecoveryUnavailable => {
+            b"STATUS=KERNAID_RESCUE_REPAIR_EXECUTION_FAILURE_V1 stage=recovery"
+        }
+    }
+}
+
+fn notify_systemd(payload: &[u8]) -> Result<(), RepairServiceRuntimeError> {
+    if payload.is_empty() || payload.len() > 192 || payload.contains(&0) {
+        return Err(RepairServiceRuntimeError::ReadinessUnavailable);
+    }
     let value =
         env::var_os("NOTIFY_SOCKET").ok_or(RepairServiceRuntimeError::ReadinessUnavailable)?;
     let bytes = value.as_bytes();
@@ -354,17 +399,64 @@ fn notify_ready() -> Result<(), RepairServiceRuntimeError> {
     loop {
         match sendto(
             &socket,
-            READY_PAYLOAD,
+            payload,
             SendFlags::DONTWAIT | SendFlags::NOSIGNAL,
             &address,
         ) {
-            Ok(sent) if sent == READY_PAYLOAD.len() => return Ok(()),
+            Ok(sent) if sent == payload.len() => return Ok(()),
             Ok(_) => return Err(RepairServiceRuntimeError::ReadinessUnavailable),
             Err(error) if error == rustix::io::Errno::INTR => continue,
             Err(error) if error == rustix::io::Errno::AGAIN => {
                 wait_ready(socket.as_fd(), PollFlags::OUT, Some(deadline))?;
             }
             Err(_) => return Err(RepairServiceRuntimeError::ReadinessUnavailable),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RescueFstabExecutionError, execution_failure_payload};
+
+    #[test]
+    fn execution_failure_status_is_a_closed_token() {
+        let cases = [
+            (
+                RescueFstabExecutionError::InvalidAuthority,
+                b"authority".as_slice(),
+            ),
+            (
+                RescueFstabExecutionError::TargetChanged,
+                b"target".as_slice(),
+            ),
+            (
+                RescueFstabExecutionError::LockUnavailable,
+                b"lock".as_slice(),
+            ),
+            (RescueFstabExecutionError::TimedOut, b"timeout".as_slice()),
+            (
+                RescueFstabExecutionError::VaultUnavailable,
+                b"vault".as_slice(),
+            ),
+            (
+                RescueFstabExecutionError::RecoveryRequired,
+                b"write".as_slice(),
+            ),
+            (
+                RescueFstabExecutionError::MutationFailed,
+                b"mutation".as_slice(),
+            ),
+            (
+                RescueFstabExecutionError::RecoveryUnavailable,
+                b"recovery".as_slice(),
+            ),
+        ];
+        for (error, suffix) in cases {
+            let payload = execution_failure_payload(error);
+            assert!(
+                payload.starts_with(b"STATUS=KERNAID_RESCUE_REPAIR_EXECUTION_FAILURE_V1 stage=")
+            );
+            assert!(payload.ends_with(suffix));
         }
     }
 }

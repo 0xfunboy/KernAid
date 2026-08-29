@@ -27,6 +27,35 @@ SPEC.loader.exec_module(LIFECYCLE)
 FAILURE_PREFIX = "KERNAID_QEMU_REPAIR_CANDIDATE_FAILURE_V1"
 ATTESTATION_PREFIX = "KERNAID_QEMU_REPAIR_CANDIDATE_GUEST_V1"
 
+EXECUTE_STATE_CLASSIFIER_SOURCE = r'''
+def execute_state_checkpoint(value):
+    fallback="execute-state"
+    if not isinstance(value,dict):
+        return fallback
+    detail=value.get("detail")
+    required={"kind","terminalOutcome","reservationId","transactionBindingSha256","rebootRequired","prepareFailureStage"}
+    if not isinstance(detail,dict) or set(detail)!=required or detail.get("kind")!="terminal" or detail.get("prepareFailureStage") is not None:
+        return fallback
+    reservation=detail.get("reservationId")
+    binding=detail.get("transactionBindingSha256")
+    valid_reservation=isinstance(reservation,str) and reservation.startswith("B-") and len(reservation)==34 and all(character in "0123456789abcdef" for character in reservation[2:])
+    valid_binding=isinstance(binding,str) and binding.startswith("sha256:") and len(binding)==71 and all(character in "0123456789abcdef" for character in binding[7:])
+    has_transaction=valid_reservation and valid_binding
+    no_transaction=reservation is None and binding is None
+    state=value.get("state")
+    outcome=detail.get("terminalOutcome")
+    reboot=detail.get("rebootRequired")
+    if state=="restored" and outcome=="closed-before-unchanged" and reboot is False and has_transaction:
+        return "execute-state-closed-before-unchanged"
+    if state=="restored" and outcome=="closed-before-restored" and reboot is False and has_transaction:
+        return "execute-state-closed-before-restored"
+    if state=="manual-reconciliation-required" and outcome=="manual-reconciliation-required" and reboot is True and (has_transaction or no_transaction):
+        return "execute-state-manual-reconciliation-required"
+    if state=="failed" and outcome=="failed" and reboot is False and no_transaction:
+        return "execute-state-failed"
+    return fallback
+'''
+
 
 class ClosedParser(argparse.ArgumentParser):
     def error(self, message: str) -> None:
@@ -64,6 +93,7 @@ AFTER={after_sha256!r}
 FAILURES={{
 {failures}
 }}
+{EXECUTE_STATE_CLASSIFIER_SOURCE}
 counter=0
 checkpoint="service-ready"
 def capability_unit_checkpoint():
@@ -89,6 +119,20 @@ def capability_unit_checkpoint():
         return "prepare-target-capability-unavailable-unit-other"
     except BaseException:
         return "prepare-target-capability-unavailable-unit-other"
+def execution_error_checkpoint():
+    prefix="KERNAID_RESCUE_REPAIR_EXECUTION_FAILURE_V1 stage="
+    stages={{prefix+stage for stage in ("authority","target","lock","timeout","vault","write","mutation","recovery")}}
+    deadline=time.monotonic()+2
+    while time.monotonic()<deadline:
+        try:
+            result=subprocess.run(["systemctl","show","--property=StatusText","--value","kernaid-rescue-repaird.service"],stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=1,check=False)
+            status=result.stdout.decode("ascii").strip()
+            if result.returncode==0 and len(result.stdout)<=192 and status in stages:
+                return "execute-error-"+status[len(prefix):]
+        except BaseException:
+            pass
+        time.sleep(.1)
+    return "execute-state-failed"
 def fail(value):
     if value=="prepare-target-capability-unavailable":
         value=capability_unit_checkpoint()
@@ -194,12 +238,15 @@ try:
         raise RuntimeError()
     checkpoint="approve-submit"
     approved=repair({{"apiVersion":API,"requestId":request_id(),"operation":"repair.fstab.approve","preparedId":detail["preparedId"],"sessionId":detail["sessionId"],"planId":detail["planId"],"planHash":detail["planHash"],"approvalId":"A-"+secrets.token_hex(16),"approvalSequence":detail["nextApprovalSequence"],"typedConfirmation":"DISABILITA VOCE FSTAB"}})
-    if approved.get("state") not in ("executing","succeeded"):
+    if approved.get("state") not in ("executing","succeeded","restored","failed","manual-reconciliation-required","cancelled"):
         raise RuntimeError()
     checkpoint="execute-terminal"
-    terminal=approved if approved.get("state")=="succeeded" else status_until({{"succeeded","restored","failed","manual-reconciliation-required"}},deadline)
+    terminal=approved if approved.get("state")!="executing" else status_until({{"succeeded","restored","failed","manual-reconciliation-required","cancelled"}},deadline)
     checkpoint="execute-state"
     if terminal.get("state")!="succeeded":
+        checkpoint=execute_state_checkpoint(terminal)
+        if checkpoint=="execute-state-failed":
+            checkpoint=execution_error_checkpoint()
         raise RuntimeError()
     checkpoint="execute-contract"
     terminal_detail=terminal.get("detail",{{}})

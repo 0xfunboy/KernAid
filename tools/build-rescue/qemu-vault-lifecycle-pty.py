@@ -206,6 +206,18 @@ PROVIDER_PROOF_REPAIR_CHECKPOINTS = (
     "approve-submit",
     "execute-terminal",
     "execute-state",
+    "execute-state-closed-before-unchanged",
+    "execute-state-closed-before-restored",
+    "execute-state-manual-reconciliation-required",
+    "execute-state-failed",
+    "execute-error-authority",
+    "execute-error-target",
+    "execute-error-lock",
+    "execute-error-timeout",
+    "execute-error-vault",
+    "execute-error-write",
+    "execute-error-mutation",
+    "execute-error-recovery",
     "execute-contract",
 )
 PROVIDER_PROOF_UI_ERROR_CHECKPOINTS = (

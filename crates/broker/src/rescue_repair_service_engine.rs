@@ -23,6 +23,7 @@ use crate::{
         RepairEngineFailure, RepairPreparationEngine, RepairPrepareFailureStage,
         RepairTerminalOutcome, RepairTerminalReceipt,
     },
+    rescue_repair_service_transport::notify_execution_failure,
 };
 use kernaid_core::{
     RescueFstabCandidateAdmission, RescueFstabCandidateApproval, Session, SessionMode,
@@ -191,9 +192,15 @@ impl RepairPreparationEngine for ProductionRepairEngine {
     ) -> Result<RepairTerminalReceipt, RepairEngineFailure> {
         match execute_approved_rescue_fstab(approved.0, deadline) {
             Ok(receipt) => terminal_receipt(receipt),
-            Err(_) => match recover_pending_rescue_fstab(deadline) {
+            Err(error) => match recover_pending_rescue_fstab(deadline) {
                 Ok(Some(receipt)) => terminal_receipt(receipt),
-                Ok(None) => Err(RepairEngineFailure::ExecutionFailed),
+                Ok(None) => {
+                    // Recovery has proved that no Pending transaction remains,
+                    // so this best-effort diagnostic cannot delay a safety
+                    // reconciliation path or expose implementation text.
+                    let _ = notify_execution_failure(error);
+                    Err(RepairEngineFailure::ExecutionFailed)
+                }
                 Err(_) => RepairTerminalReceipt::new(
                     RepairTerminalOutcome::ManualReconciliationRequired,
                     None,

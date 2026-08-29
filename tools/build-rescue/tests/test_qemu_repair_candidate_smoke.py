@@ -1,11 +1,20 @@
-from pathlib import Path
+import importlib.util
+import sys
 import unittest
+from pathlib import Path
 
 
 REPO = Path(__file__).resolve().parents[3]
 SCRIPT = REPO / "tools/build-rescue/qemu-repair-candidate-smoke.sh"
 CONTROLLER = REPO / "tools/build-rescue/qemu-repair-candidate-pty.py"
 WORKFLOW = REPO / ".github/workflows/rescue-repair-candidate.yml"
+
+SPEC = importlib.util.spec_from_file_location("qemu_repair_candidate", CONTROLLER)
+if SPEC is None or SPEC.loader is None:
+    raise RuntimeError("unable to load repair candidate controller")
+controller = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = controller
+SPEC.loader.exec_module(controller)
 
 
 class QemuRepairCandidateSmokeTests(unittest.TestCase):
@@ -61,9 +70,66 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
             '"observation-preview":"prepare-observation-preview"',
             '"vault-reserve":"prepare-vault-reserve"',
             '"admission-internal":"prepare-admission-internal"',
+            '"--property=StatusText"',
         ):
             self.assertIn(required, source)
+        self.assertTrue(
+            {
+                "execute-error-authority",
+                "execute-error-target",
+                "execute-error-lock",
+                "execute-error-timeout",
+                "execute-error-vault",
+                "execute-error-write",
+                "execute-error-mutation",
+                "execute-error-recovery",
+            }.issubset(controller.LIFECYCLE.PROVIDER_PROOF_REPAIR_CHECKPOINTS)
+        )
         self.assertNotIn("mock", source.lower())
+
+    def test_execute_failure_classifier_is_closed(self) -> None:
+        namespace: dict[str, object] = {}
+        exec(controller.EXECUTE_STATE_CLASSIFIER_SOURCE, namespace)
+        classify = namespace["execute_state_checkpoint"]
+
+        def terminal(state: str, outcome: str) -> dict[str, object]:
+            return {
+                "state": state,
+                "detail": {
+                    "kind": "terminal",
+                    "terminalOutcome": outcome,
+                    "reservationId": "B-" + "a" * 32,
+                    "transactionBindingSha256": "sha256:" + "b" * 64,
+                    "rebootRequired": state == "manual-reconciliation-required",
+                    "prepareFailureStage": None,
+                },
+            }
+
+        expected = {
+            ("restored", "closed-before-unchanged"): "execute-state-closed-before-unchanged",
+            ("restored", "closed-before-restored"): "execute-state-closed-before-restored",
+            (
+                "manual-reconciliation-required",
+                "manual-reconciliation-required",
+            ): "execute-state-manual-reconciliation-required",
+        }
+        for (state, outcome), checkpoint in expected.items():
+            with self.subTest(checkpoint=checkpoint):
+                self.assertEqual(classify(terminal(state, outcome)), checkpoint)
+
+        failed = terminal("failed", "failed")
+        failed["detail"]["reservationId"] = None
+        failed["detail"]["transactionBindingSha256"] = None
+        failed["detail"]["rebootRequired"] = False
+        self.assertEqual(classify(failed), "execute-state-failed")
+
+        invalid = terminal("restored", "closed-before-restored")
+        invalid["detail"]["reservationId"] = "/dev/sda\nfuture-checkpoint"
+        self.assertEqual(classify(invalid), "execute-state")
+        self.assertNotIn("/dev/sda", classify(invalid))
+
+        for checkpoint in set(expected.values()) | {"execute-state-failed"}:
+            self.assertIn(checkpoint, controller.LIFECYCLE.PROVIDER_PROOF_REPAIR_CHECKPOINTS)
 
     def test_manual_candidate_workflow_runs_one_mutating_gate(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
