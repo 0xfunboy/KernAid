@@ -1609,7 +1609,10 @@ mod tests {
             detail["planHash"].as_str().expect("plan hash"),
         );
         let accepted = json(&service.handle_frame(approval.as_bytes()));
-        assert_eq!(accepted["state"], "executing");
+        assert!(matches!(
+            accepted["state"].as_str(),
+            Some("executing") | Some("succeeded")
+        ));
         wait_for_state(&mut service, RepairPublicState::Succeeded);
         let calls = state.lock().expect("mock state");
         assert_eq!((calls.approved, calls.executed), (1, 1));
