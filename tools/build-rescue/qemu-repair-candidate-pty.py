@@ -79,9 +79,8 @@ def parser() -> ClosedParser:
 def repair_source(before_sha256: str, after_sha256: str) -> bytes:
     # This source is fixed by the qualification controller. It supplies only
     # opaque target claims and the exact typed approval accepted by production.
-    failures = "\n".join(
-        f"    {checkpoint!r}: "
-        f"{'KERNAID_QEMU_PROVIDER_PROOF_FAILURE_V1 stage=repair-apply ' f'checkpoint={checkpoint}\n'!r},"
+    checkpoints = ",".join(
+        repr(checkpoint)
         for checkpoint in LIFECYCLE.PROVIDER_PROOF_REPAIR_CHECKPOINTS
     )
     source = f'''import hashlib,http.client,json,secrets,subprocess,sys,time
@@ -90,9 +89,7 @@ ORIGIN="http://127.0.0.1:4173"
 API="kernaid.dev/rescue-repair-service/v1alpha1"
 BEFORE={before_sha256!r}
 AFTER={after_sha256!r}
-FAILURES={{
-{failures}
-}}
+CHECKPOINTS=({checkpoints},)
 {EXECUTE_STATE_CLASSIFIER_SOURCE}
 counter=0
 checkpoint="service-ready"
@@ -121,7 +118,7 @@ def capability_unit_checkpoint():
         return "prepare-target-capability-unavailable-unit-other"
 def execution_error_checkpoint():
     prefix="KERNAID_RESCUE_REPAIR_EXECUTION_FAILURE_V1 stage="
-    stages={{prefix+stage for stage in ("authority","target","lock","timeout","vault","write","mutation","recovery")}}
+    stages={{prefix+stage for stage in ("approval-proof","approval-binding","approval-admission","approval-authorize","approval-cancel","authority","target","lock","timeout","vault","write","mutation","recovery")}}
     deadline=time.monotonic()+2
     while time.monotonic()<deadline:
         try:
@@ -136,10 +133,9 @@ def execution_error_checkpoint():
 def fail(value):
     if value=="prepare-target-capability-unavailable":
         value=capability_unit_checkpoint()
-    marker=FAILURES.get(value)
-    if marker is None:
+    if value not in CHECKPOINTS:
         sys.exit(46)
-    sys.stdout.write(marker)
+    sys.stdout.write("KERNAID_QEMU_PROVIDER_PROOF_FAILURE_V1 stage=repair-apply checkpoint="+value+"\\n")
     sys.exit(45)
 def request_id():
     global counter

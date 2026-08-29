@@ -71,10 +71,17 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
             '"vault-reserve":"prepare-vault-reserve"',
             '"admission-internal":"prepare-admission-internal"',
             '"--property=StatusText"',
+            '"approval-proof","approval-binding","approval-admission",'
+            '"approval-authorize","approval-cancel"',
         ):
             self.assertIn(required, source)
         self.assertTrue(
             {
+                "execute-error-approval-proof",
+                "execute-error-approval-binding",
+                "execute-error-approval-admission",
+                "execute-error-approval-authorize",
+                "execute-error-approval-cancel",
                 "execute-error-authority",
                 "execute-error-target",
                 "execute-error-lock",
@@ -85,6 +92,10 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
                 "execute-error-recovery",
             }.issubset(controller.LIFECYCLE.PROVIDER_PROOF_REPAIR_CHECKPOINTS)
         )
+        generated = controller.repair_source(
+            "sha256:" + "a" * 64, "sha256:" + "b" * 64
+        )
+        self.assertLessEqual(len(generated), 16 * 1024)
         self.assertNotIn("mock", source.lower())
 
     def test_execute_failure_classifier_is_closed(self) -> None:

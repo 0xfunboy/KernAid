@@ -163,7 +163,9 @@ impl RepairPreparationEngine for ProductionRepairEngine {
             Err(_) => {
                 plan.cancel(deadline)
                     .map_err(|_| RepairEngineFailure::CancelFailed)?;
-                return Err(RepairEngineFailure::ApprovalRejected);
+                return Err(RepairEngineFailure::ApprovalRejected(
+                    RepairExecutionFailureStage::ApprovalProof,
+                ));
             }
         };
         if proof.session_id() != approval.session_id()
@@ -172,16 +174,20 @@ impl RepairPreparationEngine for ProductionRepairEngine {
         {
             plan.cancel(deadline)
                 .map_err(|_| RepairEngineFailure::CancelFailed)?;
-            return Err(RepairEngineFailure::ApprovalRejected);
+            return Err(RepairEngineFailure::ApprovalRejected(
+                RepairExecutionFailureStage::ApprovalBinding,
+            ));
         }
         if admission.approve(&proof).is_err() {
             plan.cancel(deadline)
                 .map_err(|_| RepairEngineFailure::CancelFailed)?;
-            return Err(RepairEngineFailure::ApprovalRejected);
+            return Err(RepairEngineFailure::ApprovalRejected(
+                RepairExecutionFailureStage::ApprovalAdmission,
+            ));
         }
         plan.authorize(admission, deadline)
             .map(ProductionApprovedRepair)
-            .map_err(|_| RepairEngineFailure::ApprovalRejected)
+            .map_err(map_approval_authorize_failure)
     }
 
     fn execute(
@@ -232,6 +238,14 @@ fn map_execution_failure(error: RescueFstabExecutionError) -> RepairExecutionFai
         | RescueFstabExecutionError::RecoveryRequired => RepairExecutionFailureStage::Write,
         RescueFstabExecutionError::MutationFailed => RepairExecutionFailureStage::Mutation,
         RescueFstabExecutionError::RecoveryUnavailable => RepairExecutionFailureStage::Recovery,
+    }
+}
+
+fn map_approval_authorize_failure(error: RescueFstabPreflightError) -> RepairEngineFailure {
+    if error == RescueFstabPreflightError::CancellationFailed {
+        RepairEngineFailure::CancelFailed
+    } else {
+        RepairEngineFailure::ApprovalRejected(RepairExecutionFailureStage::ApprovalAuthorize)
     }
 }
 
@@ -403,5 +417,17 @@ mod tests {
         ] {
             assert_eq!(map_execution_failure(error), expected);
         }
+    }
+
+    #[test]
+    fn authorize_distinguishes_rejection_from_cancellation_failure() {
+        assert_eq!(
+            map_approval_authorize_failure(RescueFstabPreflightError::ApprovalBindingMismatch),
+            RepairEngineFailure::ApprovalRejected(RepairExecutionFailureStage::ApprovalAuthorize)
+        );
+        assert_eq!(
+            map_approval_authorize_failure(RescueFstabPreflightError::CancellationFailed),
+            RepairEngineFailure::CancelFailed
+        );
     }
 }

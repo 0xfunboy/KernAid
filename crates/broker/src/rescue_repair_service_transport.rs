@@ -346,6 +346,21 @@ pub(crate) fn notify_execution_failure(
 
 fn execution_failure_payload(stage: RepairExecutionFailureStage) -> &'static [u8] {
     match stage {
+        RepairExecutionFailureStage::ApprovalProof => {
+            b"STATUS=KERNAID_RESCUE_REPAIR_EXECUTION_FAILURE_V1 stage=approval-proof"
+        }
+        RepairExecutionFailureStage::ApprovalBinding => {
+            b"STATUS=KERNAID_RESCUE_REPAIR_EXECUTION_FAILURE_V1 stage=approval-binding"
+        }
+        RepairExecutionFailureStage::ApprovalAdmission => {
+            b"STATUS=KERNAID_RESCUE_REPAIR_EXECUTION_FAILURE_V1 stage=approval-admission"
+        }
+        RepairExecutionFailureStage::ApprovalAuthorize => {
+            b"STATUS=KERNAID_RESCUE_REPAIR_EXECUTION_FAILURE_V1 stage=approval-authorize"
+        }
+        RepairExecutionFailureStage::ApprovalCancel => {
+            b"STATUS=KERNAID_RESCUE_REPAIR_EXECUTION_FAILURE_V1 stage=approval-cancel"
+        }
         RepairExecutionFailureStage::Authority => {
             b"STATUS=KERNAID_RESCUE_REPAIR_EXECUTION_FAILURE_V1 stage=authority"
         }
@@ -422,6 +437,26 @@ mod tests {
     #[test]
     fn execution_failure_status_is_a_closed_token() {
         let cases = [
+            (
+                RepairExecutionFailureStage::ApprovalProof,
+                b"approval-proof".as_slice(),
+            ),
+            (
+                RepairExecutionFailureStage::ApprovalBinding,
+                b"approval-binding".as_slice(),
+            ),
+            (
+                RepairExecutionFailureStage::ApprovalAdmission,
+                b"approval-admission".as_slice(),
+            ),
+            (
+                RepairExecutionFailureStage::ApprovalAuthorize,
+                b"approval-authorize".as_slice(),
+            ),
+            (
+                RepairExecutionFailureStage::ApprovalCancel,
+                b"approval-cancel".as_slice(),
+            ),
             (
                 RepairExecutionFailureStage::Authority,
                 b"authority".as_slice(),

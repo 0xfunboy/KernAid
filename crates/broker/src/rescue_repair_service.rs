@@ -280,6 +280,11 @@ pub enum RepairPrepareFailureStage {
 /// channel. This type is deliberately not serialized into the repair API.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RepairExecutionFailureStage {
+    ApprovalProof,
+    ApprovalBinding,
+    ApprovalAdmission,
+    ApprovalAuthorize,
+    ApprovalCancel,
     Authority,
     Target,
     Lock,
@@ -293,7 +298,7 @@ pub enum RepairExecutionFailureStage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RepairEngineFailure {
     PrepareFailed(RepairPrepareFailureStage),
-    ApprovalRejected,
+    ApprovalRejected(RepairExecutionFailureStage),
     CancelFailed,
     ExecutionFailed(RepairExecutionFailureStage),
     RecoveryUnavailable,
@@ -1014,6 +1019,19 @@ impl<Engine: RepairPreparationEngine> RescueRepairService<Engine> {
                 }
                 let receipt = match result {
                     Ok(receipt) => receipt,
+                    Err(RepairEngineFailure::ApprovalRejected(stage)) => {
+                        if self.execution_failure_diagnostic.is_none() {
+                            self.execution_failure_diagnostic = Some(stage);
+                        }
+                        failed_receipt()
+                    }
+                    Err(RepairEngineFailure::CancelFailed) => {
+                        if self.execution_failure_diagnostic.is_none() {
+                            self.execution_failure_diagnostic =
+                                Some(RepairExecutionFailureStage::ApprovalCancel);
+                        }
+                        failed_receipt()
+                    }
                     Err(RepairEngineFailure::ExecutionFailed(stage)) => {
                         if self.execution_failure_diagnostic.is_none() {
                             self.execution_failure_diagnostic = Some(stage);
@@ -1210,7 +1228,7 @@ fn terminal_detail(receipt: &RepairTerminalReceipt) -> TerminalRepairDetail {
 fn prepare_failure_stage(error: RepairEngineFailure) -> RepairPrepareFailureStage {
     match error {
         RepairEngineFailure::PrepareFailed(stage) => stage,
-        RepairEngineFailure::ApprovalRejected
+        RepairEngineFailure::ApprovalRejected(_)
         | RepairEngineFailure::CancelFailed
         | RepairEngineFailure::ExecutionFailed(_)
         | RepairEngineFailure::RecoveryUnavailable
@@ -1613,6 +1631,59 @@ mod tests {
             Some(RepairExecutionFailureStage::Authority)
         );
         assert_eq!(service.take_execution_failure_diagnostic(), None);
+    }
+
+    #[test]
+    fn approval_failure_diagnostics_are_one_shot_and_absent_from_wire() {
+        for (failure, expected, hidden) in [
+            (
+                RepairEngineFailure::ApprovalRejected(RepairExecutionFailureStage::ApprovalProof),
+                RepairExecutionFailureStage::ApprovalProof,
+                "approval-proof",
+            ),
+            (
+                RepairEngineFailure::ApprovalRejected(RepairExecutionFailureStage::ApprovalBinding),
+                RepairExecutionFailureStage::ApprovalBinding,
+                "approval-binding",
+            ),
+            (
+                RepairEngineFailure::ApprovalRejected(
+                    RepairExecutionFailureStage::ApprovalAdmission,
+                ),
+                RepairExecutionFailureStage::ApprovalAdmission,
+                "approval-admission",
+            ),
+            (
+                RepairEngineFailure::ApprovalRejected(
+                    RepairExecutionFailureStage::ApprovalAuthorize,
+                ),
+                RepairExecutionFailureStage::ApprovalAuthorize,
+                "approval-authorize",
+            ),
+            (
+                RepairEngineFailure::CancelFailed,
+                RepairExecutionFailureStage::ApprovalCancel,
+                "approval-cancel",
+            ),
+        ] {
+            let (mut service, _) = service();
+            service.state.phase = InternalState::Executing { operation_id: 7 };
+            service.apply_worker_result(WorkerResult::Executed {
+                operation_id: 7,
+                result: Err(failure),
+            });
+
+            let response = json(&service.handle_frame(
+                format!(
+                    r#"{{"apiVersion":"{REPAIR_SERVICE_API_VERSION}","requestId":"R-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","operation":"repair.status"}}"#
+                )
+                .as_bytes(),
+            ));
+            assert_eq!(response["state"], "failed");
+            assert!(!response.to_string().contains(hidden));
+            assert_eq!(service.take_execution_failure_diagnostic(), Some(expected));
+            assert_eq!(service.take_execution_failure_diagnostic(), None);
+        }
     }
 
     #[test]
