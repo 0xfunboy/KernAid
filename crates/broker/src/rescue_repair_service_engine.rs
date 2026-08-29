@@ -310,10 +310,22 @@ fn terminal_receipt(
             RepairTerminalOutcome::ManualReconciliationRequired
         }
     };
+    terminal_receipt_from_executor_parts(
+        outcome,
+        receipt.reservation_id(),
+        receipt.transaction_binding_sha256(),
+    )
+}
+
+fn terminal_receipt_from_executor_parts(
+    outcome: RepairTerminalOutcome,
+    reservation_id: &str,
+    transaction_binding_sha256: &str,
+) -> Result<RepairTerminalReceipt, RepairEngineFailure> {
     RepairTerminalReceipt::new(
         outcome,
-        Some(receipt.reservation_id().to_owned()),
-        Some(receipt.transaction_binding_sha256().to_owned()),
+        Some(reservation_id.to_owned()),
+        Some(format!("sha256:{transaction_binding_sha256}")),
     )
 }
 
@@ -321,6 +333,18 @@ fn terminal_receipt(
 mod tests {
     use super::*;
     use crate::rescue_fstab_candidate::RescueFstabCapabilityResolutionError;
+
+    #[test]
+    fn executor_digest_is_rendered_in_public_sha256_grammar() {
+        assert!(
+            terminal_receipt_from_executor_parts(
+                RepairTerminalOutcome::Committed,
+                "B-0123456789abcdef0123456789abcdef",
+                &"5".repeat(64),
+            )
+            .is_ok()
+        );
+    }
 
     #[test]
     fn preflight_failures_map_to_closed_public_stages() {
