@@ -34,13 +34,18 @@ use rand_core::{OsRng, RngCore};
 use rustix::{
     event::{PollFd, PollFlags, Timespec, poll},
     fd::{AsFd, BorrowedFd, OwnedFd},
-    fs::{self as rfs, FileType, Mode, OFlags},
+    fs::{self as rfs, FileType, OFlags},
     net::{
         AddressFamily, RecvFlags, SendFlags, SocketAddrUnix, SocketFlags, SocketType, accept_with,
-        bind, listen, recv, sendto, socket_with, socketpair,
+        recv, sendto, socket_with, socketpair,
     },
     pipe::{PipeFlags, pipe_with},
     process::{Signal as ProcessSignal, pidfd_send_signal},
+};
+#[cfg(feature = "experimental-repair-store")]
+use rustix::{
+    fs::Mode,
+    net::{bind, listen},
 };
 #[cfg(feature = "experimental-repair-store")]
 use sha2::Digest;
@@ -7470,7 +7475,7 @@ mod tests {
                 rfs::open(
                     "/",
                     OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                    Mode::empty(),
+                    rfs::Mode::empty(),
                 )
                 .expect("mount root")
             });
