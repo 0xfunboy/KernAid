@@ -582,6 +582,12 @@ class RepairTargetHandoffTests(unittest.TestCase):
                 handoff._consume_write_lease(reservation, binding, handoff.time.monotonic() + 1)
         self.assertEqual(mocked.call_count, 1)
 
+    def test_vault_exchange_rejects_expired_deadline_before_socket_access(self) -> None:
+        with self.assertRaises(handoff.HandoffFailure) as failure:
+            handoff._vault_exchange({}, handoff.time.monotonic() - 1)
+        self.assertEqual(failure.exception.token, "TARGET_TIMED_OUT")
+        self.assertIsNone(failure.exception.request_id)
+
     def test_success_transfers_the_exact_ordered_read_only_bundle_v2(
         self,
     ) -> None:

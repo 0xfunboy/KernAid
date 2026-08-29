@@ -1304,7 +1304,7 @@ def _fresh_request_id() -> str:
 
 
 def _vault_exchange(request: dict[str, object], deadline: float) -> dict[str, object]:
-    _ensure_deadline(deadline)
+    _ensure_deadline(deadline, None)
     endpoint = os.stat(VAULT_HELPER_SOCKET_PATH, follow_symlinks=False)
     if (not stat.S_ISSOCK(endpoint.st_mode) or endpoint.st_uid != 0
             or stat.S_IMODE(endpoint.st_mode) != 0o600):
@@ -1431,7 +1431,7 @@ def _recompute_target_fingerprint(
     return fingerprint
 
 
-def _ensure_deadline(deadline: float, request_id: str) -> None:
+def _ensure_deadline(deadline: float, request_id: str | None) -> None:
     if time.monotonic() >= deadline:
         raise HandoffFailure("TARGET_TIMED_OUT", request_id)
 
