@@ -879,6 +879,7 @@ class RescueTauriBoundaryTests(unittest.TestCase):
         self.assertIn("WEBKIT_DMABUF_RENDERER_DISABLE_GBM=1", service)
         self.assertIn("WEBKIT_SKIA_ENABLE_CPU_RENDERING=1", service)
         self.assertIn("LIBGL_ALWAYS_SOFTWARE=1", service)
+        self.assertIn("MESA_SHADER_CACHE_DISABLE=true", service)
         self.assertNotIn("WEBKIT_DISABLE_DMABUF_RENDERER=1", service)
         self.assertNotIn("ExecStartPre=", service)
         self.assertNotIn("chromium", service.lower())

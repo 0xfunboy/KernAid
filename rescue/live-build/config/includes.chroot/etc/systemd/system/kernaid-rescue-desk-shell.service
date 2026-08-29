@@ -34,6 +34,9 @@ Environment=WEBKIT_DMABUF_RENDERER_FORCE_SHM=1
 Environment=WEBKIT_DMABUF_RENDERER_DISABLE_GBM=1
 Environment=WEBKIT_SKIA_ENABLE_CPU_RENDERING=1
 Environment=LIBGL_ALWAYS_SOFTWARE=1
+# The live UI is ephemeral; prevent llvmpipe from filling the attested runtime
+# directory with an on-disk shader cache.
+Environment=MESA_SHADER_CACHE_DISABLE=true
 RuntimeDirectory=kernaid-rescue-desk-shell
 RuntimeDirectoryMode=0700
 UMask=0077
