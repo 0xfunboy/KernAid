@@ -586,14 +586,18 @@ class VaultLivePolicyTests(unittest.TestCase):
             build,
         )
         self.assertIn("KERNAID_RESCUE_DESK_SHELL_BINARY", build)
+        self.assertIn("KERNAID_BLOCKFD_PROBE_BINARY", build)
         self.assertIn(
             "config/includes.chroot/usr/bin/kernaid-rescue-desk-shell", build
+        )
+        self.assertIn(
+            "config/includes.chroot/usr/lib/kernaid/kernaid-blockfd-probe", build
         )
         self.assertIn("validate_amd64_elf", build)
         self.assertGreaterEqual(build.count("install -o root -g root -m 0755"), 2)
         self.assertIn("trap cleanup_staged_binaries EXIT", build)
         self.assertIn('rmdir -- "$vaultctl_destination_dir"', build)
-        self.assertEqual(build.count("verify-shipping-binary.py"), 10)
+        self.assertEqual(build.count("verify-shipping-binary.py"), 11)
         self.assertIn("--profile tauri-webkit", build)
         self.assertNotIn("cargo build", build)
 
