@@ -26,6 +26,8 @@ desk_shell_destination="$build_dir/config/includes.chroot/usr/bin/kernaid-rescue
 repair_candidate="${KERNAID_REPAIR_CANDIDATE-0}"
 repaird_binary="${KERNAID_RESCUE_REPAIRD_BINARY:-$repo_dir/target/release/kernaid-rescue-repaird}"
 repaird_destination="$build_dir/config/includes.chroot/usr/lib/kernaid/kernaid-rescue-repaird"
+blockfd_probe_binary="${KERNAID_BLOCKFD_PROBE_BINARY:-$repo_dir/target/release/kernaid-blockfd-probe}"
+blockfd_probe_destination="$build_dir/config/includes.chroot/usr/lib/kernaid/kernaid-blockfd-probe"
 repair_candidate_source="$build_dir/candidate"
 repair_candidate_marker_source="$repair_candidate_source/repair-candidate-image-v1"
 repair_candidate_marker_destination="$build_dir/config/includes.chroot/usr/lib/kernaid/repair-candidate-image-v1"
@@ -98,6 +100,7 @@ validate_amd64_elf "$codex_client_binary" "Rescue Codex client"
 validate_amd64_elf "$desk_shell_binary" "Rescue Tauri Desk shell"
 if [[ "$repair_candidate" = "1" ]]; then
   validate_amd64_elf "$repaird_binary" "Rescue fstab repair candidate broker"
+  validate_amd64_elf "$blockfd_probe_binary" "Rescue block descriptor probe"
 fi
 
 if [[ "$repair_candidate" = "1" ]]; then
@@ -149,6 +152,7 @@ for destination in \
   "$codex_cli_destination" \
   "$desk_shell_destination" \
   "$repaird_destination" \
+  "$blockfd_probe_destination" \
   "$repair_candidate_marker_destination" \
   "$repair_service_destination" \
   "$repair_socket_destination" \
@@ -175,6 +179,7 @@ cleanup_staged_binaries() {
     "$codex_cli_destination" \
     "$desk_shell_destination" \
     "$repaird_destination" \
+    "$blockfd_probe_destination" \
     "$repair_candidate_marker_destination" \
     "$repair_service_destination" \
     "$repair_socket_destination" \
@@ -240,6 +245,8 @@ install -o root -g root -m 0755 "$codex_cli_binary" "$codex_cli_destination"
 install -o root -g root -m 0755 "$desk_shell_binary" "$desk_shell_destination"
 if [[ "$repair_candidate" = "1" ]]; then
   install -o root -g root -m 0755 "$repaird_binary" "$repaird_destination"
+  install -o root -g root -m 0755 \
+    "$blockfd_probe_binary" "$blockfd_probe_destination"
   install -o root -g root -m 0644 \
     "$repair_candidate_marker_source" "$repair_candidate_marker_destination"
   install -o root -g root -m 0644 \
@@ -300,6 +307,7 @@ python3 -I "$repo_dir/tools/build-rescue/verify-shipping-binary.py" \
   --profile tauri-webkit "$desk_shell_destination"
 if [[ "$repair_candidate" = "1" ]]; then
   test "$(stat -c '%u:%g:%a' "$repaird_destination")" = "0:0:755"
+  test "$(stat -c '%u:%g:%a' "$blockfd_probe_destination")" = "0:0:755"
   for candidate_configuration in \
     "$repair_candidate_marker_destination" \
     "$repair_service_destination" \
@@ -312,6 +320,8 @@ if [[ "$repair_candidate" = "1" ]]; then
   done
   python3 -I "$repo_dir/tools/build-rescue/verify-shipping-binary.py" \
     "$repaird_destination"
+  python3 -I "$repo_dir/tools/build-rescue/verify-shipping-binary.py" \
+    "$blockfd_probe_destination"
 fi
 
 cd "$repo_dir"

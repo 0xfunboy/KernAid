@@ -1,0 +1,21 @@
+[package]
+name = "kernaid-linux-blockfd"
+version = "0.1.0"
+edition = "2024"
+license-file = "../../LICENSE"
+
+[[bin]]
+name = "kernaid-blockfd-probe"
+path = "src/bin/kernaid-blockfd-probe.rs"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2.189"
+linux-raw-sys = { version = "0.12.1", default-features = false, features = ["ioctl"] }
+rustix = { version = "1.1.4", features = ["fs"] }
+
+[lints.clippy]
+unwrap_used = "deny"
+panic = "deny"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"

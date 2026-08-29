@@ -55,7 +55,7 @@ def repair_source(before_sha256: str, after_sha256: str) -> bytes:
         f"{'KERNAID_QEMU_PROVIDER_PROOF_FAILURE_V1 stage=repair-apply ' f'checkpoint={checkpoint}\n'!r},"
         for checkpoint in LIFECYCLE.PROVIDER_PROOF_REPAIR_CHECKPOINTS
     )
-    source = f'''import hashlib,http.client,json,secrets,sys,time
+    source = f'''import hashlib,http.client,json,secrets,subprocess,sys,time
 HOST="127.0.0.1:4173"
 ORIGIN="http://127.0.0.1:4173"
 API="kernaid.dev/rescue-repair-service/v1alpha1"
@@ -66,7 +66,32 @@ FAILURES={{
 }}
 counter=0
 checkpoint="service-ready"
+def capability_unit_checkpoint():
+    try:
+        result=subprocess.run(["systemctl","show","--all","--property=Id,Result,ActiveState,SubState,ExecMainCode,ExecMainStatus","kernaid-rescue-target-capability@*.service"],stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=5,check=False)
+        if result.returncode!=0 or len(result.stdout)>8192:
+            return "prepare-target-capability-unavailable-unit-other"
+        blocks=[block for block in result.stdout.decode("ascii").strip().split("\\n\\n") if block]
+        if not blocks:
+            return "prepare-target-capability-unavailable-unit-collected"
+        if len(blocks)!=1:
+            return "prepare-target-capability-unavailable-unit-other"
+        values={{}}
+        for line in blocks[0].splitlines():
+            key,separator,value=line.partition("=")
+            if not separator or key in values:
+                return "prepare-target-capability-unavailable-unit-other"
+            values[key]=value
+        if values.get("Result")=="timeout":
+            return "prepare-target-capability-unavailable-unit-runtime-max"
+        if values.get("ActiveState")=="failed":
+            return "prepare-target-capability-unavailable-unit-failed"
+        return "prepare-target-capability-unavailable-unit-other"
+    except BaseException:
+        return "prepare-target-capability-unavailable-unit-other"
 def fail(value):
+    if value=="prepare-target-capability-unavailable":
+        value=capability_unit_checkpoint()
     marker=FAILURES.get(value)
     if marker is None:
         sys.exit(46)

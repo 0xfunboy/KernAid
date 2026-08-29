@@ -27,11 +27,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-const BLOCKDEV: &str = "/usr/sbin/blockdev";
-const CHILD_BLOCK_DESCRIPTOR: &str = "/proc/self/fd/0";
+const BLOCKFD_PROBE: &str = "/usr/lib/kernaid/kernaid-blockfd-probe";
 const KERNEL_SECTOR_BYTES: u64 = 512;
-const MAX_BLOCKDEV_OUTPUT_BYTES: usize = 128;
-const BLOCKDEV_DEADLINE: Duration = Duration::from_secs(2);
+const MAX_PROBE_OUTPUT_BYTES: usize = 128;
+const PROBE_DEADLINE: Duration = Duration::from_secs(2);
 const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const CHILD_KILL_GRACE: Duration = Duration::from_secs(1);
 
@@ -270,19 +269,11 @@ fn validate_leaf_probe(
 fn query_descriptor(
     descriptor: BorrowedFd<'_>,
 ) -> Result<DescriptorProbe, TargetPhysicalParentError> {
-    let logical_sector_bytes = u64::from(
-        rfs::ioctl_blksszget(descriptor)
-            .map_err(|_| TargetPhysicalParentError::IdentityProbeFailed)?,
-    );
     let duplicate = rustix::io::fcntl_dupfd_cloexec(descriptor, 3)
         .map_err(|_| TargetPhysicalParentError::IdentityProbeFailed)?;
     let executable_before = executable_snapshot()?;
-    let mut command = Command::new(BLOCKDEV);
+    let mut command = Command::new(BLOCKFD_PROBE);
     command
-        .arg("--getdiskseq")
-        .arg("--getsize64")
-        .arg("--getss")
-        .arg(CHILD_BLOCK_DESCRIPTOR)
         .env_clear()
         .env("LC_ALL", "C")
         .stdin(Stdio::from(File::from(duplicate)))
@@ -292,11 +283,7 @@ fn query_descriptor(
     if executable_snapshot()? != executable_before {
         return Err(TargetPhysicalParentError::IdentityProbeFailed);
     }
-    let values = parse_blockdev_output(&output)?;
-    if values.logical_sector_bytes != logical_sector_bytes {
-        return Err(TargetPhysicalParentError::IdentityProbeFailed);
-    }
-    Ok(values)
+    parse_blockfd_probe_output(&output)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -309,7 +296,7 @@ struct ExecutableSnapshot {
 }
 
 fn executable_snapshot() -> Result<ExecutableSnapshot, TargetPhysicalParentError> {
-    let stat = rfs::statat(CWD, BLOCKDEV, AtFlags::SYMLINK_NOFOLLOW)
+    let stat = rfs::statat(CWD, BLOCKFD_PROBE, AtFlags::SYMLINK_NOFOLLOW)
         .map_err(|_| TargetPhysicalParentError::IdentityProbeFailed)?;
     if !FileType::from_raw_mode(stat.st_mode).is_file()
         || stat.st_uid != 0
@@ -332,7 +319,7 @@ fn bounded_child_output(command: &mut Command) -> Result<Vec<u8>, TargetPhysical
         .spawn()
         .map_err(|_| TargetPhysicalParentError::IdentityProbeFailed)?;
     let deadline = Instant::now()
-        .checked_add(BLOCKDEV_DEADLINE)
+        .checked_add(PROBE_DEADLINE)
         .ok_or(TargetPhysicalParentError::IdentityProbeFailed)?;
     loop {
         match child.try_wait() {
@@ -346,12 +333,10 @@ fn bounded_child_output(command: &mut Command) -> Result<Vec<u8>, TargetPhysical
                     .ok_or(TargetPhysicalParentError::IdentityProbeFailed)?;
                 let mut output = Vec::with_capacity(64);
                 Read::by_ref(&mut stdout)
-                    .take((MAX_BLOCKDEV_OUTPUT_BYTES + 1) as u64)
+                    .take((MAX_PROBE_OUTPUT_BYTES + 1) as u64)
                     .read_to_end(&mut output)
                     .map_err(|_| TargetPhysicalParentError::IdentityProbeFailed)?;
-                if output.is_empty()
-                    || output.len() > MAX_BLOCKDEV_OUTPUT_BYTES
-                    || output.contains(&0)
+                if output.is_empty() || output.len() > MAX_PROBE_OUTPUT_BYTES || output.contains(&0)
                 {
                     return Err(TargetPhysicalParentError::IdentityProbeFailed);
                 }
@@ -381,7 +366,7 @@ fn terminate_child(child: &mut Child) {
     }
 }
 
-fn parse_blockdev_output(bytes: &[u8]) -> Result<DescriptorProbe, TargetPhysicalParentError> {
+fn parse_blockfd_probe_output(bytes: &[u8]) -> Result<DescriptorProbe, TargetPhysicalParentError> {
     if !bytes.ends_with(b"\n") {
         return Err(TargetPhysicalParentError::IdentityProbeFailed);
     }
@@ -396,7 +381,9 @@ fn parse_blockdev_output(bytes: &[u8]) -> Result<DescriptorProbe, TargetPhysical
     if *disk_sequence == 0
         || *size_bytes == 0
         || *size_bytes % KERNEL_SECTOR_BYTES != 0
-        || *logical_sector_bytes == 0
+        || !(KERNEL_SECTOR_BYTES..=65_536).contains(logical_sector_bytes)
+        || !logical_sector_bytes.is_power_of_two()
+        || *size_bytes % *logical_sector_bytes != 0
     {
         return Err(TargetPhysicalParentError::IdentityProbeFailed);
     }
@@ -479,7 +466,7 @@ mod tests {
             Err(TargetPhysicalParentError::IdentityChanged)
         );
         assert_eq!(
-            parse_blockdev_output(b"77\n32000000000\n512\nextra\n"),
+            parse_blockfd_probe_output(b"77\n32000000000\n512\nextra\n"),
             Err(TargetPhysicalParentError::IdentityProbeFailed)
         );
     }

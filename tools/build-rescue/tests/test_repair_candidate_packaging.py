@@ -11,6 +11,7 @@ CANDIDATE = REPO / "rescue/live-build/candidate"
 BUILD = REPO / "tools/build-rescue/build.sh"
 HOOK = REPO / "rescue/live-build/config/hooks/live/0100-kernaid-safety.hook.chroot"
 WORKFLOW = REPO / ".github/workflows/rescue-repair-candidate.yml"
+PHYSICAL_PARENT = REPO / "crates/broker/src/target_physical_parent.rs"
 
 
 def unit_directives(path: Path) -> dict[str, dict[str, list[str]]]:
@@ -38,6 +39,8 @@ class RepairCandidatePackagingTests(unittest.TestCase):
         self.assertIn("node-version: 24.18.0", workflow)
         self.assertIn("KERNAID_REPAIR_CANDIDATE=1", workflow)
         self.assertIn("--features rescue-fstab-production-candidate", workflow)
+        self.assertIn("-p kernaid-linux-blockfd", workflow)
+        self.assertIn("KERNAID_BLOCKFD_PROBE_BINARY=", workflow)
         self.assertEqual(workflow.count("./tools/build-rescue/qemu-smoke.sh"), 2)
         self.assertIn("name: KernAid-Rescue-amd64-repair-candidate", workflow)
         for forbidden in ("catalog-entry", "qualified-release", "deploy-pages"):
@@ -46,6 +49,7 @@ class RepairCandidatePackagingTests(unittest.TestCase):
     def test_default_profile_contains_no_candidate_artifact_or_client_group(self) -> None:
         absent = (
             LIVE / "usr/lib/kernaid/kernaid-rescue-repaird",
+            LIVE / "usr/lib/kernaid/kernaid-blockfd-probe",
             LIVE / "usr/lib/kernaid/repair-candidate-image-v1",
             LIVE / "etc/systemd/system/kernaid-rescue-repaird.service",
             LIVE / "etc/systemd/system/kernaid-rescue-repaird.socket",
@@ -81,6 +85,11 @@ class RepairCandidatePackagingTests(unittest.TestCase):
             source,
         )
         self.assertIn(
+            'blockfd_probe_binary="${KERNAID_BLOCKFD_PROBE_BINARY:-'
+            '$repo_dir/target/release/kernaid-blockfd-probe}"',
+            source,
+        )
+        self.assertIn(
             'KERNAID_REPAIR_CANDIDATE must be exactly 0 or 1', source
         )
         self.assertIn(
@@ -92,6 +101,9 @@ class RepairCandidatePackagingTests(unittest.TestCase):
             'install -o root -g root -m 0755 '
             '"$repaird_binary" "$repaird_destination"',
             source,
+        )
+        self.assertIn(
+            '"$blockfd_probe_binary" "$blockfd_probe_destination"', source
         )
         self.assertIn(
             'python3 -I "$repo_dir/tools/build-rescue/verify-shipping-binary.py" '
@@ -145,7 +157,10 @@ class RepairCandidatePackagingTests(unittest.TestCase):
         )
         self.assertEqual(
             service_unit["ConditionFileIsExecutable"],
-            ["/usr/lib/kernaid/kernaid-rescue-repaird"],
+            [
+                "/usr/lib/kernaid/kernaid-rescue-repaird",
+                "/usr/lib/kernaid/kernaid-blockfd-probe",
+            ],
         )
         self.assertEqual(
             service_unit["ConditionPathIsDirectory"],
@@ -229,6 +244,10 @@ class RepairCandidatePackagingTests(unittest.TestCase):
         self.assertNotIn("CAP_DAC_READ_SEARCH", caps)
         self.assertNotIn("CAP_MKNOD", caps)
         self.assertNotIn("CAP_SYS_ADMIN", caps)
+        physical_parent = PHYSICAL_PARENT.read_text(encoding="utf-8")
+        self.assertIn("/usr/lib/kernaid/kernaid-blockfd-probe", physical_parent)
+        self.assertNotIn("/usr/sbin/blockdev", physical_parent)
+        self.assertNotIn("/proc/self/fd/0", physical_parent)
         unit_source = (
             CANDIDATE / "kernaid-rescue-repaird.service"
         ).read_text(encoding="utf-8")
@@ -303,6 +322,7 @@ class RepairCandidatePackagingTests(unittest.TestCase):
         )
         for token in (
             '"$repair_candidate_binary"',
+            '"$repair_candidate_blockfd_probe"',
             '"$repair_candidate_service"',
             '"$repair_candidate_socket"',
             '"$repair_candidate_sysusers"',

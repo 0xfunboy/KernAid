@@ -2330,6 +2330,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "kernaid-linux-blockfd"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "linux-raw-sys",
+ "rustix",
+]
+
+[[package]]
 name = "kernaid-linux-nsfs"
 version = "0.1.0"
 dependencies = [

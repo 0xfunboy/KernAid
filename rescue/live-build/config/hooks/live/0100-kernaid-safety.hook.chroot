@@ -2,6 +2,7 @@
 set -eu
 repair_candidate_marker=/usr/lib/kernaid/repair-candidate-image-v1
 repair_candidate_binary=/usr/lib/kernaid/kernaid-rescue-repaird
+repair_candidate_blockfd_probe=/usr/lib/kernaid/kernaid-blockfd-probe
 repair_candidate_service=/etc/systemd/system/kernaid-rescue-repaird.service
 repair_candidate_socket=/etc/systemd/system/kernaid-rescue-repaird.socket
 repair_candidate_sysusers=/etc/sysusers.d/kernaid-repair-candidate.conf
@@ -76,6 +77,7 @@ if [ -e "$repair_candidate_marker" ] || [ -L "$repair_candidate_marker" ]; then
     for candidate_file in \
         "$repair_candidate_marker" \
         "$repair_candidate_binary" \
+        "$repair_candidate_blockfd_probe" \
         "$repair_candidate_service" \
         "$repair_candidate_socket" \
         "$repair_candidate_sysusers" \
@@ -86,10 +88,12 @@ if [ -e "$repair_candidate_marker" ] || [ -L "$repair_candidate_marker" ]; then
         test ! -L "$candidate_file"
     done
     test -x "$repair_candidate_binary"
+    test -x "$repair_candidate_blockfd_probe"
     grep -Fxq 'kernaid.repair=fstab-v1' "$repair_candidate_marker"
     chown root:root \
         "$repair_candidate_marker" \
         "$repair_candidate_binary" \
+        "$repair_candidate_blockfd_probe" \
         "$repair_candidate_service" \
         "$repair_candidate_socket" \
         "$repair_candidate_sysusers" \
@@ -100,6 +104,7 @@ if [ -e "$repair_candidate_marker" ] || [ -L "$repair_candidate_marker" ]; then
         /etc/systemd/system/kernaid-ready.service.d
     chmod 0755 \
         "$repair_candidate_binary" \
+        "$repair_candidate_blockfd_probe" \
         /etc/systemd/system/kernaid-ui.service.d \
         /etc/systemd/system/kernaid-ready.service.d
     chmod 0644 \
@@ -114,6 +119,7 @@ if [ -e "$repair_candidate_marker" ] || [ -L "$repair_candidate_marker" ]; then
 else
     for candidate_file in \
         "$repair_candidate_binary" \
+        "$repair_candidate_blockfd_probe" \
         "$repair_candidate_service" \
         "$repair_candidate_socket" \
         "$repair_candidate_sysusers" \

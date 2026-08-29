@@ -115,6 +115,8 @@ jobs:
           cargo build --locked --release -p kernaid-broker \
             --features rescue-fstab-production-candidate \
             --bin kernaid-rescue-repaird
+          cargo build --locked --release -p kernaid-linux-blockfd \
+            --bin kernaid-blockfd-probe
 
       - name: Build isolated repair candidate ISO
         run: |
@@ -122,6 +124,7 @@ jobs:
             -e KERNAID_DESK_PREBUILT=1 \
             -e KERNAID_REPAIR_CANDIDATE=1 \
             -e KERNAID_RESCUE_REPAIRD_BINARY=/workspace/target/release/kernaid-rescue-repaird \
+            -e KERNAID_BLOCKFD_PROBE_BINARY=/workspace/target/release/kernaid-blockfd-probe \
             -e KERNAID_RESCUE_VAULTD_BINARY=/workspace/target/release/kernaid-rescue-vaultd \
             -e KERNAID_RESCUE_FIRSTBOOT_BINARY=/workspace/target/release/kernaid-rescue-firstboot \
             -e KERNAID_RESCUE_CODEX_MOUNTER_BINARY=/workspace/target/release/kernaid-rescue-codex-mounter \
