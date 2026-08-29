@@ -513,7 +513,7 @@ class VaultLivePolicyTests(unittest.TestCase):
     def test_exact_live_uid_group_and_subordinate_id_policy_is_wired(self) -> None:
         self.assertIn("g kernaid-vault - -", active_lines(SYSUSERS))
         build = BUILD_SCRIPT.read_text(encoding="utf-8")
-        match = re.search(r'--bootappend-live "([^"]+)"', build)
+        match = re.search(r'^bootappend_live="([^"]+)"$', build, re.MULTILINE)
         self.assertIsNotNone(match)
         bootappend = match.group(1) if match else ""
         self.assertEqual(
@@ -537,6 +537,12 @@ class VaultLivePolicyTests(unittest.TestCase):
             )
         )
         self.assertNotIn("swap=true", bootappend.split())
+        self.assertIn('--bootappend-live "$bootappend_live"', build)
+        self.assertIn('--bootappend-live-failsafe "$bootappend_compat"', build)
+        self.assertIn('bootappend_compat="$bootappend_live nomodeset kernaid.graphics=compat"', build)
+        self.assertIn('--iso-application "KernAid Rescue"', build)
+        self.assertIn('--iso-publisher "KernAid"', build)
+        self.assertIn('--iso-volume "KERNAID_RESCUE"', build)
 
         hook = SAFETY_HOOK.read_text(encoding="utf-8")
         self.assertIn("/usr/lib/kernaid/kernaid-rescue-vaultd", hook)

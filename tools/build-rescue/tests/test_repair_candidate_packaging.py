@@ -130,6 +130,11 @@ class RepairCandidatePackagingTests(unittest.TestCase):
         self.assertIn(
             'console=ttyS0,115200n8${repair_bootappend_suffix}"', source
         )
+        self.assertIn(
+            'bootappend_compat="$bootappend_live nomodeset kernaid.graphics=compat"',
+            source,
+        )
+        self.assertIn('--bootappend-live-failsafe "$bootappend_compat"', source)
         self.assertIn('"$repaird_destination" \\', source)
         self.assertIn('"$repair_candidate_marker_destination" \\', source)
 

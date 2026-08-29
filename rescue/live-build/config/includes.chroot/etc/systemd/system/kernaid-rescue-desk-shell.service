@@ -27,8 +27,13 @@ Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/kernaid-rescue-desk-shell/no
 Environment=DBUS_SYSTEM_BUS_ADDRESS=unix:path=/run/kernaid-rescue-desk-shell/no-system-bus
 Environment=GDK_BACKEND=x11
 Environment=NO_AT_BRIDGE=1
+# WebKitGTK 2.52 must retain a valid shared-memory backing-store transport.
+# WEBKIT_DISABLE_DMABUF_RENDERER is intentionally forbidden here.
 Environment=WEBKIT_DISABLE_COMPOSITING_MODE=1
-Environment=WEBKIT_DISABLE_DMABUF_RENDERER=1
+Environment=WEBKIT_DMABUF_RENDERER_FORCE_SHM=1
+Environment=WEBKIT_DMABUF_RENDERER_DISABLE_GBM=1
+Environment=WEBKIT_SKIA_ENABLE_CPU_RENDERING=1
+Environment=LIBGL_ALWAYS_SOFTWARE=1
 RuntimeDirectory=kernaid-rescue-desk-shell
 RuntimeDirectoryMode=0700
 UMask=0077

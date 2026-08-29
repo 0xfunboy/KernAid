@@ -72,9 +72,18 @@ treated as a newer release.
 - The fixture lab's exported webview artifact is deliberately marked volatile
   and unsigned because the closed native bridge does not expose its signed
   broker envelope. It is development evidence, not a release receipt.
-- Physical USB boot has not been qualified. The current private candidate may
-  be used only for a controlled first-boot test on a factory-new or disposable
-  USB and non-customer hardware.
+- Physical USB boot has not been qualified. There is no active physical-test
+  recommendation until the corrected replacement candidate completes its
+  virtual gates; any later retest remains limited to a factory-new or
+  disposable USB and non-customer hardware.
+- The first reported physical boot of the previous diagnosis-only RC on an
+  Intel Core i5-6200-class PC reached Xorg/Matchbox but showed only a black
+  desktop and movable pointer. That is a failed physical qualification, not a
+  pass. The image used WebKitGTK 2.52.6 together with the obsolete
+  `WEBKIT_DISABLE_DMABUF_RENDERER=1` path; the next candidate replaces it with
+  shared-memory transport and CPU rasterization, adds a compatibility-graphics
+  boot entry and replaces Debian boot artwork. Physical retest is still
+  required before any promotion.
 - Secure Boot is not qualified.
 - Desktop installers are unsigned engineering previews.
 - Rescue provider login with a real account, live TLS and physical encrypted
@@ -103,6 +112,12 @@ candidate built from commit
 | Retail `.img.xz` SHA-256 | `831afc42cea102274242f76c82b30dda7c1476870a7cf90b8813668d4729574c` |
 | Qualification manifest SHA-256 | `b5ccabaedb2805b231c4ef83314793680cc1371decbf9526d715ef97c35f468e` |
 | Workflow | [Rescue run 33150274347](https://github.com/0xfunboy/KernAid/actions/runs/33150274347) |
+
+This exact image is retained as virtual qualification evidence but is no
+longer the physical-test recommendation: the first reported Intel physical
+boot exposed the black-WebKit-frame failure recorded above. Do not promote or
+redistribute it as a working hardware release. A replacement must complete the
+normal virtual gates and then pass the same USB test on the affected PC.
 
 That run successfully built the hybrid ISO, validated shipping binaries and
 SBOM, passed ordinary BIOS/UEFI QEMU smoke, and passed the BIOS/UEFI two-boot

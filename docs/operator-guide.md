@@ -83,8 +83,11 @@ mode and verify its adjacent checksum first. The compressed image expands to
 exactly 32,000,000,000 bytes and carries an all-zero p3 for first-boot Vault
 provisioning; its manifest records the compressed, expanded and p3 digests.
 
-Use only the exact private candidate identified in `docs/CURRENT_STATUS.md`.
-This checks the candidate on real hardware; it does not promote the release.
+Use only a replacement physical-test candidate explicitly identified as active
+in `docs/CURRENT_STATUS.md`. The previous `0d61eac` diagnosis-only candidate
+reached Xorg on an Intel physical PC but failed to paint the KernAid UI, so it
+must not be reused as evidence of a successful boot. A physical check never
+promotes the release by itself.
 Completing first boot creates a local encrypted Vault on that disposable USB,
 but one successful device does not qualify every USB or firmware combination.
 
@@ -105,6 +108,11 @@ but one successful device does not qualify every USB or firmware combination.
    identity persists. Record machine/firmware/network results and stop if the
    UI or expected read-only state is missing. Do not perform customer repairs
    from this qualification medium.
+
+The branded boot menu starts KernAid normally after five seconds. If the
+normal entry cannot establish a usable display, reboot and select **KernAid
+Rescue - Compatibility graphics**; it preserves the same product and safety
+arguments while adding `nomodeset`.
 
 Rufus is preferred over balenaEtcher for this Windows qualification procedure
 because it exposes the target and DD-mode choice clearly. The Linux v2 writer

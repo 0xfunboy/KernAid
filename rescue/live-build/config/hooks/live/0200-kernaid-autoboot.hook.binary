@@ -2,6 +2,25 @@
 set -eu
 build_dir="$(CDPATH= cd -- "$(dirname "$0")/../../.." && pwd)"
 cd "$build_dir"
+branding_dir="$build_dir/branding"
+
+# Replace live-build's Debian artwork after both bootloader trees have been
+# generated. Keep pre-rendered assets because neither the BIOS nor UEFI boot
+# path may depend on an SVG renderer being present at image-build time.
+test -f "$branding_dir/kernaid-boot-bios.png"
+test -f "$branding_dir/kernaid-boot-uefi.png"
+install -m 0644 "$branding_dir/kernaid-boot-bios.png" binary/isolinux/splash.png
+install -m 0644 "$branding_dir/kernaid-boot-uefi.png" binary/boot/grub/splash.png
+
+# Product copy stays in English and the compatibility entry is the generated
+# failsafe entry whose kernel arguments are configured in build.sh.
+sed -i 's/^menu title Boot menu.*$/menu title KernAid Rescue/' binary/isolinux/menu.cfg
+sed -i 's/menu label \^Live system (amd64)$/menu label ^Start KernAid Rescue/' binary/isolinux/live.cfg
+sed -i 's/menu label Live system (amd64 fail-safe mode)$/menu label KernAid Rescue - Compatibility graphics/' binary/isolinux/live.cfg
+sed -i 's/menuentry "Live system (amd64)"/menuentry "Start KernAid Rescue"/' binary/boot/grub/grub.cfg
+sed -i 's/menuentry "Live system (amd64 fail-safe mode)"/menuentry "KernAid Rescue - Compatibility graphics"/' binary/boot/grub/grub.cfg
+
+printf '%s\n' 'KernAid Rescue amd64' > binary/.disk/info
 
 # Debian Live defaults to an infinite boot-menu wait. The workshop image must
 # boot unattended while still leaving a five-second window for diagnostics.
@@ -18,4 +37,11 @@ for config in binary/boot/grub/grub.cfg binary/EFI/BOOT/grub.cfg; do
 done
 
 grep -q '^timeout 50$' binary/isolinux/isolinux.cfg
-echo "KernAid unattended boot timeout installed"
+grep -q '^menu title KernAid Rescue$' binary/isolinux/menu.cfg
+grep -q 'menu label \^Start KernAid Rescue$' binary/isolinux/live.cfg
+grep -q 'menu label KernAid Rescue - Compatibility graphics$' binary/isolinux/live.cfg
+grep -q 'menuentry "Start KernAid Rescue"' binary/boot/grub/grub.cfg
+grep -q 'menuentry "KernAid Rescue - Compatibility graphics"' binary/boot/grub/grub.cfg
+grep -q 'nomodeset kernaid.graphics=compat' binary/isolinux/live.cfg
+grep -q 'nomodeset kernaid.graphics=compat' binary/boot/grub/grub.cfg
+echo "KernAid branded unattended boot menu installed"
