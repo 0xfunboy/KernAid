@@ -96,6 +96,11 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
             "sha256:" + "a" * 64, "sha256:" + "b" * 64
         )
         self.assertLessEqual(len(generated), 16 * 1024)
+        self.assertIn(
+            b'checkpoint in (\n            "execute-state-closed-before-unchanged",',
+            generated,
+        )
+        self.assertIn(b'diagnostic.startswith("execute-error-")', generated)
         self.assertNotIn("mock", source.lower())
 
     def test_execute_failure_classifier_is_closed(self) -> None:

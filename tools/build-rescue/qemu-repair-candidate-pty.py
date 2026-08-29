@@ -241,8 +241,13 @@ try:
     checkpoint="execute-state"
     if terminal.get("state")!="succeeded":
         checkpoint=execute_state_checkpoint(terminal)
-        if checkpoint=="execute-state-failed":
-            checkpoint=execution_error_checkpoint()
+        if checkpoint=="execute-state-failed" or checkpoint in (
+            "execute-state-closed-before-unchanged",
+            "execute-state-closed-before-restored",
+        ):
+            diagnostic=execution_error_checkpoint()
+            if diagnostic.startswith("execute-error-") or checkpoint=="execute-state-failed":
+                checkpoint=diagnostic
         raise RuntimeError()
     checkpoint="execute-contract"
     terminal_detail=terminal.get("detail",{{}})
