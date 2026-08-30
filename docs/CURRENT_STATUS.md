@@ -40,7 +40,7 @@ WinPE Companion and Fleet management remain later milestones.
 | Evidence | Normalized Linux snapshots, bounded hardware inventory and provenance framing |
 | Diagnosis | Deterministic offline rules plus a bounded optional Resident OpenAI reasoning adapter |
 | Planning | Typed R0 no-write plan validated by Core |
-| Reporting | Resident Desk downloads a hashed JSON report; Rescue can persist the exact report plus audit sequence as a signed Vault envelope and export it through the native TTY companion |
+| Reporting | Resident Desk exposes authoritative machine-readable JSON: a signed envelope when secure audit is active, otherwise an explicitly unsigned hashed JSON artifact. It also derives an always-unsigned human-readable Markdown copy that does not replace the JSON. Rescue can persist the exact signed JSON report plus audit sequence in the Vault and export it through the native TTY companion |
 | Rescue credential boundary | Isolated credential vault and fail-closed Codex login/status/logout bridge; it does not run prompts or diagnoses |
 | Rescue provider plumbing | Feature-gated OpenAI executor and loopback relay are implemented, but live TLS and a real-account lifecycle are not yet qualified |
 | Virtual testing | Disposable QEMU fixtures, byte-level mutation checks, BIOS/UEFI boot and two-boot USB/vault coverage; the private repair ISO also has one exact-image BIOS happy-path apply qualification |
@@ -87,6 +87,16 @@ treated as a newer release.
   before claiming physical hardware qualification.
 - Secure Boot is not qualified.
 - Desktop installers are unsigned engineering previews.
+- In the current source, the Resident credential companion is a separate Cargo
+  package and separate workflow artifact. The Desktop workflow now inspects
+  DEB, RPM, AppImage, macOS APP/DMG and Windows MSI/NSIS output and fails if the
+  companion appears inside an installer. This post-change gate has not yet been
+  promoted as a new immutable release; do not infer it passed from the older
+  Desktop run cited below.
+- The human-readable Markdown report is always unsigned. Its displayed hash
+  protects local integrity only; authenticity, when available, belongs to the
+  signed machine-readable JSON envelope. An unsigned JSON report likewise does
+  not prove signer identity.
 - Rescue provider login with a real account, live TLS and physical encrypted
   persistence are incomplete release gates.
 - The signed Rescue report HTTP relay remains internal loopback plumbing, not a

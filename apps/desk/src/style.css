@@ -433,6 +433,19 @@ textarea {
   padding-top: 20px;
   color: #50d8e8;
 }
+.report p {
+  margin: 0 0 8px;
+}
+.report-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 18px;
+}
+.report small {
+  display: block;
+  margin-top: 8px;
+  color: #9ca9a2;
+}
 .plan {
   display: grid;
   gap: 6px;

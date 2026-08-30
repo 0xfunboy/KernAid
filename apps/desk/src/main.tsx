@@ -61,6 +61,13 @@ import {
 } from "./rescue-openai";
 import { createRescueAuditSink, type RescueAuditSink } from "./rescue-audit";
 import {
+  createUnsignedMarkdownReport,
+  jsonReportDownloadLabel,
+  jsonReportDownloadName,
+  UNSIGNED_MARKDOWN_DOWNLOAD_LABEL,
+  type MarkdownReportExport,
+} from "./report-export";
+import {
   formatBytes,
   finishRescueInspection,
   observationStatus,
@@ -103,6 +110,8 @@ function App() {
   const [proposal, setProposal] = useState<DiagnosisProposal>();
   const [plan, setPlan] = useState<ValidatedPlan>();
   const [report, setReport] = useState<ArtifactRef>();
+  const [markdownReport, setMarkdownReport] = useState<MarkdownReportExport>();
+  const [markdownReportError, setMarkdownReportError] = useState(false);
   const [nativeEvidence, setNativeEvidence] = useState<NativeObservation[]>([]);
   const [inventoryReady, setInventoryReady] = useState(!hasLocalCollector());
   const [inventoryError, setInventoryError] = useState<string>();
@@ -277,6 +286,23 @@ function App() {
       .finally(() => setInventoryReady(true));
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+    setMarkdownReport(undefined);
+    setMarkdownReportError(false);
+    if (report === undefined || sessionId === undefined) return;
+    createUnsignedMarkdownReport(report, sessionId)
+      .then((next) => {
+        if (!cancelled) setMarkdownReport(next);
+      })
+      .catch(() => {
+        if (!cancelled) setMarkdownReportError(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [report, sessionId]);
+
   function invalidateSession() {
     if (isRescueRuntime())
       rescueProviderBinding.current.clearSessionAndPreparation();
@@ -284,6 +310,8 @@ function App() {
     setProposal(undefined);
     setPlan(undefined);
     setReport(undefined);
+    setMarkdownReport(undefined);
+    setMarkdownReportError(false);
     setSessionId(undefined);
     setTargetFingerprint(undefined);
     setSessionDriver(undefined);
@@ -1374,29 +1402,53 @@ function App() {
               Verifica piano R0
             </button>
           )}
-        {report && (
-          <p className="report">
-            {isRescueRuntime() ? (
-              report.auditStatus.signed ? (
-                <>Report firmato e persistito nel Vault Rescue</>
-              ) : (
-                <>Report temporaneo: sblocca il Vault e ripeti la diagnosi</>
-              )
-            ) : (
+        {report && sessionId && (
+          <div className="report">
+            <p>
+              {isRescueRuntime()
+                ? report.auditStatus.signed
+                  ? "Il JSON firmato è persistito anche nel Vault Rescue."
+                  : "Report temporaneo: sblocca il Vault e ripeti la diagnosi. JSON e Markdown non sono firmati."
+                : report.auditStatus.signed
+                  ? "Il JSON è il bundle firmato autorevole."
+                  : "Audit sicuro non disponibile: JSON e Markdown non sono firmati."}
+            </p>
+            <div className="report-actions">
               <a
                 href={report.uri}
-                download={
-                  report.auditStatus.signed
-                    ? "KernAid-signed-report.json"
-                    : "KernAid-report.json"
-                }
+                download={jsonReportDownloadName(report, sessionId)}
               >
-                Scarica{" "}
-                {report.auditStatus.signed ? "report firmato" : "report JSON"}
+                {jsonReportDownloadLabel(report)}
               </a>
-            )}{" "}
-            · SHA-256 <code>{report.sha256.slice(0, 12)}…</code>
-          </p>
+              {markdownReport && (
+                <a
+                  href={markdownReport.uri}
+                  download={markdownReport.downloadName}
+                >
+                  {UNSIGNED_MARKDOWN_DOWNLOAD_LABEL}
+                </a>
+              )}
+            </div>
+            <small>
+              JSON SHA-256 <code>{report.sha256.slice(0, 12)}…</code>
+              {markdownReport && (
+                <>
+                  {" "}
+                  · Markdown SHA-256{" "}
+                  <code>{markdownReport.sha256.slice(0, 12)}…</code>
+                </>
+              )}
+            </small>
+            {!markdownReport && !markdownReportError && (
+              <small>Preparazione della copia Markdown non firmata…</small>
+            )}
+            {markdownReportError && (
+              <small>
+                Markdown non disponibile: il JSON non ha superato la validazione
+                locale.
+              </small>
+            )}
+          </div>
         )}
       </section>
       <aside className="right">

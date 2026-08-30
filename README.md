@@ -2,7 +2,7 @@
 
 KernAid is an evidence-first machine diagnosis and repair platform. This repository implements the Phase 0 feasibility spike described in the [masterplan](docs/MASTERPLAN.md). For the concise, date-stamped distinction between what works now and what remains unqualified, start with [Current status](docs/CURRENT_STATUS.md). For a compact map of the product, repository, build host and release flow, see the [Project map](docs/PROJECT_MAP.md).
 
-The current Phase 0 engineering vertical slice is deliberately safe: start a session, collect a normalized read-only host snapshot, run deterministic offline diagnostic rules, validate an R0 plan through Core, and produce a hashed JSON report. Resident Desk can download that report directly. In Rescue, when the encrypted Vault is unlocked before Desk starts, the report and its audit sequence are persisted as a signed envelope and can be exported later from the native TTY companion. The default/stable product has no production mutation handler. A separate private, feature-gated Rescue repair candidate has exact-image QEMU boot evidence under BIOS/UEFI and BIOS happy-path apply evidence for one narrowly bounded action; it is not production-qualified or promoted. See [Current status](docs/CURRENT_STATUS.md). On Linux, a separate opt-in `fixture-repair-lab` Desk build sends one complete, explicitly approved repair and separately approved rollback through the standard SessionDriver, Agent Gateway, Core transaction states and typed broker against an internally created disposable fixture. It is absent from normal builds and Rescue and cannot select a host path, disk or production target.
+The current Phase 0 engineering vertical slice is deliberately safe: start a session, collect a normalized read-only host snapshot, run deterministic offline diagnostic rules, validate an R0 plan through Core, and produce a hashed JSON report. Resident Desk exposes that machine-readable JSON as the authoritative session artifact: it is a signed envelope when secure audit is active and an explicitly unsigned JSON artifact otherwise. Desk also derives a human-readable Markdown copy, always labeled unsigned; it is for reading and does not replace the JSON artifact or prove authenticity. In Rescue, when the encrypted Vault is unlocked before Desk starts, the JSON report and its audit sequence are persisted as a signed envelope and can be exported later from the native TTY companion. The default/stable product has no production mutation handler. A separate private, feature-gated Rescue repair candidate has exact-image QEMU boot evidence under BIOS/UEFI and BIOS happy-path apply evidence for one narrowly bounded action; it is not production-qualified or promoted. See [Current status](docs/CURRENT_STATUS.md). On Linux, a separate opt-in `fixture-repair-lab` Desk build sends one complete, explicitly approved repair and separately approved rollback through the standard SessionDriver, Agent Gateway, Core transaction states and typed broker against an internally created disposable fixture. It is absent from normal builds and Rescue and cannot select a host path, disk or production target.
 
 ## Quick start
 
@@ -86,7 +86,7 @@ The CI workflows are configured to produce engineering-preview desktop installer
   exact image passed BIOS/UEFI boot smoke and one BIOS QEMU happy-path repair,
   but it does not replace this stable retail image and remains restricted to
   controlled repair qualification on disposable targets.
-- **Windows, Linux or macOS that does boot:** download that operating system's desktop artifact, install it, and launch KernAid like a normal application. Windows and macOS startup collect only a fast, derived target identity; the deeper P0 collection starts once when **Diagnostica** is selected. macOS queries only the current-user `launchd` table and safe-boot integer, and explicitly reports system `launchd`, software-update availability, system-event analysis, and login/background-item counts as unqualified instead of inventing results. The fixed commands do not request repairs, although native Windows tools such as DISM may still update their own operating-system logs.
+- **Windows, Linux or macOS that does boot:** download that operating system's desktop artifact from a post-change workflow run whose package-inspection gate passed, install it, and launch KernAid like a normal application. That gate rejects Desk packages containing the separately distributed credential companion. Windows and macOS startup collect only a fast, derived target identity; the deeper P0 collection starts once when **Diagnostica** is selected. macOS queries only the current-user `launchd` table and safe-boot integer, and explicitly reports system `launchd`, software-update availability, system-event analysis, and login/background-item counts as unqualified instead of inventing results. The fixed commands do not request repairs, although native Windows tools such as DISM may still update their own operating-system logs. After diagnosis, retain the JSON as the authoritative machine-readable artifact; the additional Markdown download is an explicitly unsigned reading copy.
 - **Linux machine inventory:** Resident and Rescue use the same bounded Rust
   collector for CPU count/model, total RAM, firmware boot mode, selected public
   DMI model fields, and normalized PCI/USB class/vendor/product IDs. It excludes
@@ -96,9 +96,11 @@ The CI workflows are configured to produce engineering-preview desktop installer
 - **Optional Resident OpenAI reasoning:** configure the public
   `resident-default` profile from the hidden native TTY prompts of
   `kernaid-provider-key configure`, then explicitly select OpenAI in Desk. The
-  companion is a separate, platform-matched workflow artifact and is not yet
-  included in the desktop installer or added to `PATH`; extract it and run it
-  from its download directory as described in the operator guide.
+  companion is a separate, platform-matched workflow artifact. Current source
+  builds it from a package outside the Tauri crate, and the Desktop workflow
+  fails if package inspection finds it inside a Desk installer. Use only a
+  post-change run where that gate passed; extract the companion and run it from
+  its download directory as described in the operator guide.
   The key stays in the OS credential store/backend; the webview receives only
   presence status and can request idempotent logout. Strict local packs reduce
   the complete OS corpus to a provider-neutral proposal before the bounded

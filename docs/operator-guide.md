@@ -249,13 +249,29 @@ path and do not create an account session.
 
 ## Diagnose a running operating system
 
-Download the matching artifact from a successful `desktop` run:
+Download the matching artifact from a post-change `desktop` run in which the
+platform package-inspection step passed:
 
 - Windows x86-64: NSIS `.exe` or `.msi`;
 - Linux x86-64: AppImage, `.deb` or `.rpm`;
 - macOS: `.dmg` for Apple silicon (`aarch64`) or Intel (`x64`).
 
 These engineering installers are not code-signed. Operating-system warnings are therefore expected, and production/customer distribution must wait for signed artifacts. Launch KernAid normally; the header says `Resident · Offline rules` and inventory is collected through a fixed native command allowlist.
+
+The current workflow builds the credential companion from a Cargo package that
+is separate from the Tauri application and inspects every produced package
+format. The run must fail if `kernaid-provider-key` appears inside a Desk DEB,
+RPM, AppImage, macOS APP/DMG or Windows MSI/NSIS installer. This is a source and
+workflow property until a post-change run completes; the older packaging run
+cited in the status document does not prove this new gate.
+
+After diagnosis, Desk offers two downloads. Keep the machine-readable JSON as
+the authoritative session artifact. With secure audit active it is a signed
+envelope; without secure audit it is explicitly unsigned and its SHA-256 does
+not establish signer identity. Desk also derives a human-readable Markdown copy
+from the validated JSON payload and displays its SHA-256. The Markdown filename
+and UI label always say that it is unsigned: use it for review, never as a
+signature receipt or a replacement for the JSON artifact.
 
 On Linux, the Hardware observation is produced by the same no-argument Rust
 collector shipped in Rescue. CPU and RAM come from bounded `/proc` reads;
@@ -303,10 +319,10 @@ UI-server relay. The current exact candidate passed the full virtual workflow,
 including both privileged BIOS and UEFI lifecycle jobs, and trusted catalog v2
 revision 6 authorizes that ISO. Physical media and live provider TLS with a
 real account are still not qualified. Do not present Rescue OpenAI as supported
-on customer media yet. The Resident credential companion
-is not included in the desktop installer and is not added to `PATH`. From the
-same successful Desktop workflow run, download and extract
-the outer GitHub artifact matching the installed Desk build:
+on customer media yet. The Resident credential companion is distributed as a
+separate platform-matched artifact. Use a post-change run whose package gate
+proved that it is absent from the Desk installer, then download and extract the
+companion artifact from that same Desktop workflow run:
 
 - `kernaid-provider-key-windows-x86_64` contains
   `kernaid-provider-key.exe`;
