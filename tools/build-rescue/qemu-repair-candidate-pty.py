@@ -802,7 +802,7 @@ def main(arguments: Sequence[str]) -> int:
         initial, cursor = LIFECYCLE.run_companion(
             console, "status", "repair-initial-status", cursor, aggregate
         )
-        if initial.vault_state != "locked" or initial.device_id is None:
+        if initial.vault_state != "locked" or initial.device_id is not None:
             raise LIFECYCLE.ClosedFailure("vault", "initial-status-invalid")
         unlocked, cursor = LIFECYCLE.run_companion(
             console, "unlock", "repair-unlock", cursor, aggregate, key
@@ -879,7 +879,7 @@ def main(arguments: Sequence[str]) -> int:
             )
             if (
                 recovery_initial.vault_state != "locked"
-                or recovery_initial.device_id is None
+                or recovery_initial.device_id is not None
             ):
                 raise LIFECYCLE.ClosedFailure(
                     "vault", "recovery-initial-status-invalid"

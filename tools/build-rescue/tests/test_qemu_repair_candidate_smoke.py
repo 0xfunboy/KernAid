@@ -65,11 +65,15 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
         source = CONTROLLER.read_text(encoding="utf-8")
         self.assertIn('console, "repair-initial", cursor, aggregate', source)
         self.assertIn('"status", "repair-initial-status", cursor, aggregate', source)
-        self.assertIn('initial.vault_state != "locked"', source)
+        self.assertIn(
+            'initial.vault_state != "locked" or initial.device_id is not None',
+            source,
+        )
         self.assertIn(
             'console, "repair-recovery-initial", cursor, aggregate', source
         )
         self.assertIn('"repair-recovery-initial-status"', source)
+        self.assertIn("recovery_initial.device_id is not None", source)
         for required in (
             '"operation":"repair.fstab.prepare"',
             '"operation":"repair.fstab.approve"',
