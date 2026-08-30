@@ -1998,6 +1998,7 @@ class InstalledTargetTests(unittest.TestCase):
         self.assertIn(
             'grep -q "KERNAID_RESCUE_READY" "$log" \\\n'
             "    && hardware_inventory_ready_observed \\\n"
+            "    && secure_boot_ready_observed \\\n"
             '    && grep -q "KERNAID_RESCUE_TARGET_SELECTION_READY" "$log"',
             qemu_smoke,
         )

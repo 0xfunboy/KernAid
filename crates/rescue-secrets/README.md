@@ -117,11 +117,23 @@ one direct backing slave, cryptsetup status, and that this mapper is the
 backing device's only holder. Before mount, the inner filesystem must match the
 complete ext4 profile, including superblock and group-descriptor checksums,
 feature/geometry policy, RFC 4122 v4 UUID, inode 8's initialized 128 MiB
-journal extent and the JBD2 superblock. It is mounted with
-`rw,nosuid,nodev,noexec,nosymfollow,relatime,errors=remount-ro` and then checked
-again through the retained mapper descriptor, `/proc/self/mountinfo` and
-sysfs. Mutable ext4 fields are accepted after mount only where the profile
-explicitly permits them; immutable profile evidence must remain identical.
+journal extent and the JBD2 superblock. Its runtime fields must be exactly one
+of two closed profiles: cleanly unmounted (`s_state=EXT4_VALID_FS`, the pinned
+incompatibility bits, and `s_last_orphan=0`) or pending journal recovery (the
+same values plus only `INCOMPAT_RECOVER`). Error state, an orphan head, missing
+profile bits, or any other added incompatibility bit is rejected. A recovery
+journal must independently have exactly the 64-bit and checksum-v3 features,
+CRC32C type and checksum, a non-zero sequence, a live-log start within its
+pinned bounds, and a head that is either zero or within those bounds;
+fast-commit or any other feature, error, padding or out-of-range field fails
+closed. It is mounted with
+`rw,nosuid,nodev,noexec,nosymfollow,relatime,errors=remount-ro`, allowing the
+kernel to replay an accepted pending journal. While the filesystem is mounted
+read-write, ext4 re-arms `INCOMPAT_RECOVER`; the immediate post-mount check
+therefore requires exactly that mounted runtime profile, zero orphan head,
+identical immutable profile evidence, the retained mapper descriptor,
+`/proc/self/mountinfo` and sysfs. No filesystem repair tool or permissive mount
+fallback participates in this transition.
 
 Linux omits an `errors=` mountinfo token when the requested policy equals the
 ext4 superblock default. The manager therefore accepts either an explicit

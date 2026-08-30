@@ -29,6 +29,7 @@ SPEC.loader.exec_module(LIFECYCLE)
 FAILURE_PREFIX = "KERNAID_QEMU_REPAIR_CANDIDATE_FAILURE_V1"
 ATTESTATION_PREFIX = "KERNAID_QEMU_REPAIR_CANDIDATE_GUEST_V1"
 TARGET_NODE = "kernaid_repair_target"
+TARGET_QDEV = "/machine/peripheral/kernaid_repair_target_device/virtio-backend"
 FAULT_CREDENTIAL = "kernaid-repair-fault"
 FAULT_TERMINATE_AFTER_PENDING = "terminate-after-pending-v1"
 FAULT_FAIL_AFTER_INSTALLED = "fail-after-installed-v1"
@@ -1255,23 +1256,42 @@ def unlock_repair_vault(
 
 
 def target_write_bytes(qmp: object) -> int:
-    """Return the completed write-byte counter for the exact target node."""
+    """Return completed guest writes for the exact target BlockBackend."""
 
-    result = qmp.execute_result("query-blockstats", {"query-nodes": True})
+    result = qmp.execute_result("query-blockstats")
     if not isinstance(result, list) or len(result) > 64:
         raise LIFECYCLE.ClosedFailure("interruption", "blockstats-invalid")
     matches = [
         item
         for item in result
-        if isinstance(item, dict) and item.get("node-name") == TARGET_NODE
+        if (
+            isinstance(item, dict)
+            and item.get("device") == ""
+            and item.get("node-name") == TARGET_NODE
+            and item.get("qdev") == TARGET_QDEV
+        )
     ]
     if len(matches) != 1:
-        raise LIFECYCLE.ClosedFailure("interruption", "target-node-invalid")
+        raise LIFECYCLE.ClosedFailure("interruption", "target-backend-invalid")
     stats = matches[0].get("stats")
     if not isinstance(stats, dict):
         raise LIFECYCLE.ClosedFailure("interruption", "blockstats-invalid")
-    writes = stats.get("wr_bytes")
-    if isinstance(writes, bool) or not isinstance(writes, int) or writes < 0:
+    counters = [
+        stats.get(name)
+        for name in (
+            "wr_bytes",
+            "wr_operations",
+            "failed_wr_operations",
+            "invalid_wr_operations",
+        )
+    ]
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in counters
+    ):
+        raise LIFECYCLE.ClosedFailure("interruption", "write-counter-invalid")
+    writes, operations, failed, invalid = counters
+    if failed != 0 or invalid != 0 or (writes == 0) != (operations == 0):
         raise LIFECYCLE.ClosedFailure("interruption", "write-counter-invalid")
     return writes
 
@@ -1295,22 +1315,24 @@ def hard_power_cut(harness: object, deadline: float) -> None:
 def interrupt_after_first_target_write(
     harness: object, qmp: object, aggregate: float
 ) -> None:
-    # The shipping write-capability helper can expose this node only after the
-    # exact Pending record has passed its durable persist-and-readback barrier.
-    # Thus the first completed target write is an external witness that the cut
-    # occurs after Pending, without adding a fault hook to the guest image.
+    # The shipping write-capability helper can write through this device only
+    # after the exact Pending record has passed its durable persist-and-readback
+    # barrier. Thus the first completed BlockBackend write is an external
+    # witness that the cut occurs after Pending, without adding a guest hook.
+    # Named-node statistics do not account writes in this QEMU topology.
     qmp.set_deadline(LIFECYCLE._deadline(aggregate, 10.0))
     if target_write_bytes(qmp) != 0:
         raise LIFECYCLE.ClosedFailure("interruption", "target-wrote-before-approval")
     witness_deadline = LIFECYCLE._deadline(aggregate, 180.0)
     while time.monotonic() < witness_deadline:
         # Keep the guest running while polling one correlated, completed-write
-        # counter.  The prior stop/cont loop advanced a two-second guest arm
-        # delay in 5 ms slices, flooding QMP with hundreds of commands on slow
-        # UEFI runners.  A completed write remains the fail-closed witness; an
-        # already-resolved commit is rejected by boot-two reconciliation.
-        time.sleep(0.01)
-        qmp.set_deadline(LIFECYCLE._deadline(witness_deadline, 15.0))
+        # counter at no more than ten queries per second. A completed write
+        # remains the fail-closed witness; an already-resolved commit is
+        # rejected by boot-two reconciliation.
+        time.sleep(0.1)
+        if time.monotonic() >= witness_deadline:
+            break
+        qmp.set_deadline(LIFECYCLE._deadline(aggregate, 15.0))
         if target_write_bytes(qmp) > 0:
             hard_power_cut(harness, LIFECYCLE._deadline(aggregate, 10.0))
             return

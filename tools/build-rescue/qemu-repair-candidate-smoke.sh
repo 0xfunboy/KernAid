@@ -256,7 +256,7 @@ qemu_args=(
   -device "usb-storage,bus=kernaid_xhci.0,drive=kernaid_rescue_usb,bootindex=1"
   -blockdev "driver=file,node-name=kernaid_repair_target_file,filename=$target_image,cache.direct=on,cache.no-flush=off,aio=threads"
   -blockdev driver=raw,node-name=kernaid_repair_target,file=kernaid_repair_target_file
-  -device virtio-blk-pci,drive=kernaid_repair_target,serial=KERNAID-REPAIR-V1
+  -device virtio-blk-pci,id=kernaid_repair_target_device,drive=kernaid_repair_target,serial=KERNAID-REPAIR-V1
   -fw_cfg name=opt/kernaid-tauri-sandbox-probe,string=v1
 )
 

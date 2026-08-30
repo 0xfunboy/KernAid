@@ -203,10 +203,12 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
             source,
         )
         self.assertIn(
-            "virtio-blk-pci,drive=kernaid_repair_target,"
+            "virtio-blk-pci,id=kernaid_repair_target_device,"
+            "drive=kernaid_repair_target,"
             "serial=KERNAID-REPAIR-V1",
             source,
         )
+        self.assertEqual(source.count("id=kernaid_repair_target_device"), 1)
         self.assertEqual(source.count("serial=KERNAID-REPAIR-V1"), 1)
         self.assertIn("mkfs.ext4", source)
         self.assertIn('"$seed/usr"', source)
@@ -467,7 +469,9 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
     def test_interruption_witness_and_reconciliation_are_fail_closed(self) -> None:
         source = CONTROLLER.read_text(encoding="utf-8")
         for required in (
-            '"query-blockstats", {"query-nodes": True}',
+            'qmp.execute_result("query-blockstats")',
+            'TARGET_NODE = "kernaid_repair_target"',
+            'TARGET_QDEV = "/machine/peripheral/kernaid_repair_target_device/virtio-backend"',
             "process.kill()",
             "process.poll() != -signal.SIGKILL",
             '"execute-state-closed-before-unchanged"',
@@ -489,8 +493,14 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
         class Qmp:
             def __init__(self, result: object) -> None:
                 self.result = result
+                self.deadlines: list[float] = []
 
-            def execute_result(self, command: str, arguments: object) -> object:
+            def set_deadline(self, deadline: float) -> None:
+                self.deadlines.append(deadline)
+
+            def execute_result(
+                self, command: str, arguments: object = None
+            ) -> object:
                 self.command = command
                 self.arguments = arguments
                 return self.result
@@ -498,31 +508,78 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
         qmp = Qmp(
             [
                 {
+                    "device": "",
                     "node-name": controller.TARGET_NODE,
-                    "stats": {"wr_bytes": 4096},
-                }
+                    "qdev": controller.TARGET_QDEV,
+                    "stats": {
+                        "wr_bytes": 4096,
+                        "wr_operations": 1,
+                        "failed_wr_operations": 0,
+                        "invalid_wr_operations": 0,
+                    },
+                    "parent": {
+                        "node-name": "kernaid_repair_target_file",
+                        "stats": {"wr_bytes": 0, "wr_operations": 0},
+                    },
+                },
             ]
         )
         self.assertEqual(controller.target_write_bytes(qmp), 4096)
         self.assertEqual(qmp.command, "query-blockstats")
-        self.assertEqual(qmp.arguments, {"query-nodes": True})
+        self.assertIsNone(qmp.arguments)
 
         for invalid in (
             [],
             [
                 {
+                    "device": "",
                     "node-name": controller.TARGET_NODE,
-                    "stats": {"wr_bytes": True},
-                }
+                    "qdev": "wrong",
+                    "stats": {
+                        "wr_bytes": 1,
+                        "wr_operations": 1,
+                        "failed_wr_operations": 0,
+                        "invalid_wr_operations": 0,
+                    },
+                },
             ],
             [
                 {
+                    "device": "",
                     "node-name": controller.TARGET_NODE,
-                    "stats": {"wr_bytes": 1},
+                    "qdev": controller.TARGET_QDEV,
+                    "stats": {
+                        "wr_bytes": True,
+                        "wr_operations": 1,
+                        "failed_wr_operations": 0,
+                        "invalid_wr_operations": 0,
+                    },
                 },
+            ],
+            [
                 {
+                    "device": "",
                     "node-name": controller.TARGET_NODE,
-                    "stats": {"wr_bytes": 2},
+                    "qdev": controller.TARGET_QDEV,
+                    "stats": {
+                        "wr_bytes": 1,
+                        "wr_operations": 0,
+                        "failed_wr_operations": 0,
+                        "invalid_wr_operations": 0,
+                    },
+                },
+            ],
+            [
+                {
+                    "device": "",
+                    "node-name": controller.TARGET_NODE,
+                    "qdev": controller.TARGET_QDEV,
+                    "stats": {
+                        "wr_bytes": 1,
+                        "wr_operations": 1,
+                        "failed_wr_operations": 1,
+                        "invalid_wr_operations": 0,
+                    },
                 },
             ],
         ):
@@ -543,6 +600,42 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
         harness = type("Harness", (), {"process": process})()
         controller.hard_power_cut(harness, time.monotonic() + 1.0)
         self.assertEqual(process.returncode, -signal.SIGKILL)
+
+        clock = [0.0]
+        sleeps: list[float] = []
+        zero = Qmp(
+            [
+                {
+                    "device": "",
+                    "node-name": controller.TARGET_NODE,
+                    "qdev": controller.TARGET_QDEV,
+                    "stats": {
+                        "wr_bytes": 0,
+                        "wr_operations": 0,
+                        "failed_wr_operations": 0,
+                        "invalid_wr_operations": 0,
+                    },
+                },
+            ]
+        )
+
+        def cross_witness_deadline(seconds: float) -> None:
+            sleeps.append(seconds)
+            clock[0] = 180.0
+
+        with mock.patch.object(
+            controller.time, "monotonic", side_effect=lambda: clock[0]
+        ), mock.patch.object(
+            controller.time, "sleep", side_effect=cross_witness_deadline
+        ):
+            with self.assertRaises(controller.LIFECYCLE.ClosedFailure) as observed:
+                controller.interrupt_after_first_target_write(
+                    mock.Mock(), zero, 1000.0
+                )
+        self.assertEqual(observed.exception.stage, "interruption")
+        self.assertEqual(observed.exception.code, "target-write-timeout")
+        self.assertEqual(sleeps, [0.1])
+        self.assertEqual(zero.deadlines, [10.0])
 
     def test_failure_path_suite_reuses_one_provisioned_base_and_is_closed(self) -> None:
         shell = SCRIPT.read_text(encoding="utf-8")

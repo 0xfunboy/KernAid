@@ -55,6 +55,8 @@ const EXT4_BLOCKS_PER_GROUP: u64 = 32_768;
 const EXT4_BYTES_PER_INODE: u64 = 16_384;
 const EXT4_COMPAT_FEATURES: u32 = 0x0000_003c;
 const EXT4_INCOMPAT_FEATURES: u32 = 0x0000_02c2;
+const EXT4_INCOMPAT_RECOVER: u32 = 0x0000_0004;
+const EXT4_INCOMPAT_FEATURES_WITH_RECOVERY: u32 = EXT4_INCOMPAT_FEATURES | EXT4_INCOMPAT_RECOVER;
 const EXT4_RO_COMPAT_FEATURES: u32 = 0x0000_046b;
 const EXT4_FLEX_GROUP_SIZE: u64 = 16;
 const EXT4_FLEX_GROUP_LOG: u8 = 4;
@@ -815,6 +817,28 @@ enum Ext4CheckPhase {
     Mounted,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ext4RuntimeProfile {
+    CleanUnmounted,
+    JournalRecovery,
+}
+
+fn classify_ext4_runtime_profile(
+    state: Option<u16>,
+    incompat: Option<u32>,
+    last_orphan: Option<u32>,
+) -> Option<Ext4RuntimeProfile> {
+    match (state, incompat, last_orphan) {
+        (Some(1), Some(EXT4_INCOMPAT_FEATURES), Some(0)) => {
+            Some(Ext4RuntimeProfile::CleanUnmounted)
+        }
+        (Some(1), Some(EXT4_INCOMPAT_FEATURES_WITH_RECOVERY), Some(0)) => {
+            Some(Ext4RuntimeProfile::JournalRecovery)
+        }
+        _ => None,
+    }
+}
+
 fn parse_ext4_profile(
     file: &File,
     revalidate: &mut impl FnMut() -> Result<(), ProfileClassifierError>,
@@ -848,17 +872,13 @@ fn parse_ext4_profile(
     let state = le_u16(&superblock, 0x3a);
     let incompat = le_u32(&superblock, 0x60);
     let last_orphan = le_u32(&superblock, 0xe8);
+    let runtime_profile = classify_ext4_runtime_profile(state, incompat, last_orphan);
     let runtime_fields_valid = match phase {
-        Ext4CheckPhase::PreMount => {
-            state == Some(1) && incompat == Some(EXT4_INCOMPAT_FEATURES) && last_orphan == Some(0)
-        }
-        Ext4CheckPhase::Mounted => {
-            matches!(state, Some(0 | 1))
-                && incompat.is_some_and(|value| {
-                    value == EXT4_INCOMPAT_FEATURES
-                        || value == (EXT4_INCOMPAT_FEATURES | 0x0000_0004)
-                })
-        }
+        Ext4CheckPhase::PreMount => matches!(
+            runtime_profile,
+            Some(Ext4RuntimeProfile::CleanUnmounted) | Some(Ext4RuntimeProfile::JournalRecovery)
+        ),
+        Ext4CheckPhase::Mounted => runtime_profile == Some(Ext4RuntimeProfile::JournalRecovery),
     };
     if !runtime_fields_valid
         || le_u16(&superblock, 0x38) != Some(0xef53)
@@ -992,13 +1012,16 @@ fn parse_ext4_profile(
     }
 
     if matches!(phase, Ext4CheckPhase::PreMount) {
+        let Some(runtime_profile) = runtime_profile else {
+            return Ok(None);
+        };
         let journal_offset = extent_start
             .checked_mul(EXT4_BLOCK_BYTES)
             .ok_or(ProfileClassifierError::InvalidDescriptor)?;
         let mut journal_superblock = [0_u8; JBD2_SUPERBLOCK_BYTES];
         read_exact_at(file, &mut journal_superblock, journal_offset)?;
         revalidate()?;
-        if !verify_jbd2_superblock(&journal_superblock, &filesystem_uuid) {
+        if !verify_jbd2_superblock(&journal_superblock, &filesystem_uuid, runtime_profile) {
             return Ok(None);
         }
     }
@@ -1011,8 +1034,18 @@ fn parse_ext4_profile(
 fn verify_jbd2_superblock(
     superblock: &[u8; JBD2_SUPERBLOCK_BYTES],
     filesystem_uuid: &[u8; 16],
+    runtime_profile: Ext4RuntimeProfile,
 ) -> bool {
+    let Some(maxlen) = be_u32(superblock, 0x10) else {
+        return false;
+    };
+    let Some(first) = be_u32(superblock, 0x14) else {
+        return false;
+    };
     let Some(sequence) = be_u32(superblock, 0x18) else {
+        return false;
+    };
+    let Some(start) = be_u32(superblock, 0x1c) else {
         return false;
     };
     let Some(incompat_features) = be_u32(superblock, 0x28) else {
@@ -1029,10 +1062,9 @@ fn verify_jbd2_superblock(
         || be_u32(superblock, 0x04) != Some(4)
         || be_u32(superblock, 0x08) != Some(0)
         || be_u32(superblock, 0x0c) != Some(EXT4_BLOCK_BYTES as u32)
-        || be_u32(superblock, 0x10) != Some(EXT4_JOURNAL_BLOCKS as u32)
-        || be_u32(superblock, 0x14) != Some(1)
+        || maxlen != EXT4_JOURNAL_BLOCKS as u32
+        || first != 1
         || sequence == 0
-        || be_u32(superblock, 0x1c) != Some(0)
         || be_u32(superblock, 0x20) != Some(0)
         || be_u32(superblock, 0x24) != Some(0)
         || be_u32(superblock, 0x2c) != Some(0)
@@ -1051,17 +1083,32 @@ fn verify_jbd2_superblock(
         return false;
     }
 
-    match incompat_features {
-        0 => sequence == 1 && superblock[0x50] == 0 && head == 0 && stored_checksum == 0,
-        JBD2_FEATURE_INCOMPAT_64BIT_CSUM_V3 => {
-            if superblock[0x50] != JBD2_CRC32C_CHECKSUM_TYPE
-                || !(1..EXT4_JOURNAL_BLOCKS as u32).contains(&head)
-            {
-                return false;
-            }
-            let mut checksum_input = *superblock;
-            checksum_input[JBD2_CHECKSUM_OFFSET..JBD2_CHECKSUM_OFFSET + 4].fill(0);
-            stored_checksum == crc32c(!0, &checksum_input)
+    let checksum_v3_valid = || {
+        if superblock[0x50] != JBD2_CRC32C_CHECKSUM_TYPE {
+            return false;
+        }
+        let mut checksum_input = *superblock;
+        checksum_input[JBD2_CHECKSUM_OFFSET..JBD2_CHECKSUM_OFFSET + 4].fill(0);
+        stored_checksum == crc32c(!0, &checksum_input)
+    };
+
+    match (runtime_profile, incompat_features) {
+        (Ext4RuntimeProfile::CleanUnmounted, 0) => {
+            sequence == 1
+                && start == 0
+                && superblock[0x50] == 0
+                && head == 0
+                && stored_checksum == 0
+        }
+        (Ext4RuntimeProfile::CleanUnmounted, JBD2_FEATURE_INCOMPAT_64BIT_CSUM_V3) => {
+            start == 0 && (first..maxlen).contains(&head) && checksum_v3_valid()
+        }
+        (Ext4RuntimeProfile::JournalRecovery, JBD2_FEATURE_INCOMPAT_64BIT_CSUM_V3) => {
+            // JBD2 defines s_head as authoritative only while clean. A dirty
+            // journal may persist zero or a prior head, but never out of range.
+            (first..maxlen).contains(&start)
+                && (head == 0 || (first..maxlen).contains(&head))
+                && checksum_v3_valid()
         }
         _ => false,
     }
@@ -1286,18 +1333,47 @@ mod tests {
         file
     }
 
-    fn set_jbd2_checksum_v3(file: &File) {
+    fn update_jbd2_superblock(file: &File, update: impl FnOnce(&mut [u8; JBD2_SUPERBLOCK_BYTES])) {
         let journal_offset = 557_056 * EXT4_BLOCK_BYTES;
         let mut journal = [0_u8; JBD2_SUPERBLOCK_BYTES];
         read_exact_at(file, &mut journal, journal_offset).expect("read jbd2 fixture");
-        put_be32(&mut journal, 0x28, JBD2_FEATURE_INCOMPAT_64BIT_CSUM_V3);
-        journal[0x50] = JBD2_CRC32C_CHECKSUM_TYPE;
-        put_be32(&mut journal, 0x58, 9);
+        update(&mut journal);
         put_be32(&mut journal, JBD2_CHECKSUM_OFFSET, 0);
         let checksum = crc32c(!0, &journal);
         put_be32(&mut journal, JBD2_CHECKSUM_OFFSET, checksum);
         file.write_all_at(&journal, journal_offset)
-            .expect("write checksum-v3 jbd2 fixture");
+            .expect("write checksummed jbd2 fixture");
+    }
+
+    fn set_jbd2_checksum_v3(file: &File) {
+        update_jbd2_superblock(file, |journal| {
+            put_be32(journal, 0x28, JBD2_FEATURE_INCOMPAT_64BIT_CSUM_V3);
+            journal[0x50] = JBD2_CRC32C_CHECKSUM_TYPE;
+            put_be32(journal, 0x58, 9);
+        });
+    }
+
+    fn set_jbd2_recovery_checksum_v3(file: &File) {
+        update_jbd2_superblock(file, |journal| {
+            put_be32(journal, 0x18, 2);
+            put_be32(journal, 0x1c, 1);
+            put_be32(journal, 0x28, JBD2_FEATURE_INCOMPAT_64BIT_CSUM_V3);
+            journal[0x50] = JBD2_CRC32C_CHECKSUM_TYPE;
+            put_be32(journal, 0x58, 0);
+        });
+    }
+
+    fn set_ext4_runtime_fields(file: &File, state: u16, incompat: u32, last_orphan: u32) {
+        let mut superblock = [0_u8; EXT4_SUPERBLOCK_BYTES];
+        read_exact_at(file, &mut superblock, EXT4_SUPERBLOCK_OFFSET)
+            .expect("read ext4 runtime fields fixture");
+        put_le16(&mut superblock, 0x3a, state);
+        put_le32(&mut superblock, 0x60, incompat);
+        put_le32(&mut superblock, 0xe8, last_orphan);
+        let checksum = crc32c(!0, &superblock[..0x3fc]);
+        put_le32(&mut superblock, 0x3fc, checksum);
+        file.write_all_at(&superblock, EXT4_SUPERBLOCK_OFFSET)
+            .expect("write ext4 runtime fields fixture");
     }
 
     #[test]
@@ -1543,6 +1619,127 @@ mod tests {
         assert!(
             parse_ext4_profile(&file, &mut || Ok(()), Ext4CheckPhase::PreMount)
                 .expect("tampered journal read")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn ext4_runtime_profiles_are_exact_for_each_mount_phase() {
+        let clean = ext4_file(EXT4_JOURNAL_BLOCKS as u16);
+        let clean_evidence = parse_ext4_profile(&clean, &mut || Ok(()), Ext4CheckPhase::PreMount)
+            .expect("clean pre-mount ext4 read")
+            .expect("clean pre-mount ext4 profile");
+        assert!(
+            parse_ext4_profile(&clean, &mut || Ok(()), Ext4CheckPhase::Mounted)
+                .expect("clean mounted ext4 read")
+                .is_none(),
+            "an active rw mount must carry the journal-recovery incompatibility bit"
+        );
+
+        let recovering = ext4_file(EXT4_JOURNAL_BLOCKS as u16);
+        set_jbd2_recovery_checksum_v3(&recovering);
+        set_ext4_runtime_fields(
+            &recovering,
+            1,
+            EXT4_INCOMPAT_FEATURES | EXT4_INCOMPAT_RECOVER,
+            0,
+        );
+        let recovering_pre_mount =
+            parse_ext4_profile(&recovering, &mut || Ok(()), Ext4CheckPhase::PreMount)
+                .expect("recovery pre-mount ext4 read")
+                .expect("canonical recovery pre-mount ext4 profile");
+        let recovering_mounted =
+            parse_ext4_profile(&recovering, &mut || Ok(()), Ext4CheckPhase::Mounted)
+                .expect("recovery mounted ext4 read")
+                .expect("canonical mounted ext4 profile");
+        assert_eq!(recovering_pre_mount, clean_evidence);
+        assert_eq!(recovering_mounted, clean_evidence);
+    }
+
+    #[test]
+    fn ext4_recovery_jbd2_profile_is_exact_and_bounded() {
+        let exact = ext4_file(EXT4_JOURNAL_BLOCKS as u16);
+        set_ext4_runtime_fields(&exact, 1, EXT4_INCOMPAT_FEATURES_WITH_RECOVERY, 0);
+        set_jbd2_recovery_checksum_v3(&exact);
+        assert!(
+            parse_ext4_profile(&exact, &mut || Ok(()), Ext4CheckPhase::PreMount)
+                .expect("exact recovery journal read")
+                .is_some()
+        );
+
+        for (offset, value, description) in [
+            (0x1c, 0, "zero start"),
+            (0x1c, EXT4_JOURNAL_BLOCKS as u32, "out-of-range start"),
+            (
+                0x28,
+                JBD2_FEATURE_INCOMPAT_64BIT_CSUM_V3 | 0x20,
+                "fast-commit feature",
+            ),
+            (0x58, EXT4_JOURNAL_BLOCKS as u32, "out-of-range head"),
+        ] {
+            let file = ext4_file(EXT4_JOURNAL_BLOCKS as u16);
+            set_ext4_runtime_fields(&file, 1, EXT4_INCOMPAT_FEATURES_WITH_RECOVERY, 0);
+            set_jbd2_recovery_checksum_v3(&file);
+            update_jbd2_superblock(&file, |journal| put_be32(journal, offset, value));
+            assert!(
+                parse_ext4_profile(&file, &mut || Ok(()), Ext4CheckPhase::PreMount)
+                    .expect("noncanonical recovery journal read")
+                    .is_none(),
+                "accepted recovery journal with {description}"
+            );
+        }
+
+        let bad_checksum = ext4_file(EXT4_JOURNAL_BLOCKS as u16);
+        set_ext4_runtime_fields(&bad_checksum, 1, EXT4_INCOMPAT_FEATURES_WITH_RECOVERY, 0);
+        set_jbd2_recovery_checksum_v3(&bad_checksum);
+        let checksum_offset = 557_056 * EXT4_BLOCK_BYTES + JBD2_CHECKSUM_OFFSET as u64;
+        let mut checksum_byte = [0_u8; 1];
+        read_exact_at(&bad_checksum, &mut checksum_byte, checksum_offset)
+            .expect("read recovery journal checksum byte");
+        checksum_byte[0] ^= 1;
+        bad_checksum
+            .write_all_at(&checksum_byte, checksum_offset)
+            .expect("tamper recovery journal checksum");
+        assert!(
+            parse_ext4_profile(&bad_checksum, &mut || Ok(()), Ext4CheckPhase::PreMount,)
+                .expect("bad-checksum recovery journal read")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn ext4_runtime_profiles_reject_every_noncanonical_combination() {
+        for (state, incompat, last_orphan) in [
+            (0, EXT4_INCOMPAT_FEATURES | EXT4_INCOMPAT_RECOVER, 0),
+            (3, EXT4_INCOMPAT_FEATURES | EXT4_INCOMPAT_RECOVER, 0),
+            (1, EXT4_INCOMPAT_FEATURES | EXT4_INCOMPAT_RECOVER, 1),
+            (1, EXT4_INCOMPAT_FEATURES | EXT4_INCOMPAT_RECOVER | 1, 0),
+            (1, EXT4_INCOMPAT_FEATURES & !2, 0),
+        ] {
+            for phase in [Ext4CheckPhase::PreMount, Ext4CheckPhase::Mounted] {
+                let file = ext4_file(EXT4_JOURNAL_BLOCKS as u16);
+                set_ext4_runtime_fields(&file, state, incompat, last_orphan);
+                assert!(
+                    parse_ext4_profile(&file, &mut || Ok(()), phase)
+                        .expect("noncanonical ext4 read")
+                        .is_none(),
+                    "accepted state={state:#x} incompat={incompat:#x} last_orphan={last_orphan}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ext4_recovery_runtime_fields_require_a_fresh_superblock_checksum() {
+        let file = ext4_file(EXT4_JOURNAL_BLOCKS as u16);
+        file.write_all_at(
+            &(EXT4_INCOMPAT_FEATURES | EXT4_INCOMPAT_RECOVER).to_le_bytes(),
+            EXT4_SUPERBLOCK_OFFSET + 0x60,
+        )
+        .expect("write recovery bit without refreshing superblock checksum");
+        assert!(
+            parse_ext4_profile(&file, &mut || Ok(()), Ext4CheckPhase::PreMount)
+                .expect("stale-checksum recovery ext4 read")
                 .is_none()
         );
     }
