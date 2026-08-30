@@ -20,6 +20,10 @@ pub const REPAIR_EXECUTION_ACTION_ID: &str = "linux.fstab.disable-missing-uuid.v
 pub const REPAIR_EXECUTION_RESOURCE_ID: &str = "rescue:selected-linux-root:etc/fstab";
 /// The sole root-helper capability that a consumed V1 lease can authorize.
 pub const REPAIR_WRITE_LEASE_CAPABILITY: &str = "fstab-direct-leaf-rw-v1";
+/// The sole post-commit rollback action represented by this protocol.
+pub const REPAIR_ROLLBACK_ACTION_ID: &str = "linux.fstab.restore";
+/// The sole root-helper capability represented by a consumed rollback lease.
+pub const REPAIR_ROLLBACK_WRITE_LEASE_CAPABILITY: &str = "fstab-rollback-direct-leaf-rw-v1";
 
 const MAX_OPAQUE_ID_BYTES: usize = 128;
 const RESERVATION_BINDING_DOMAIN: &[u8] = b"KERNAID-REPAIR-RESERVATION-V1\0";
@@ -27,6 +31,8 @@ const FILE_METADATA_DOMAIN: &[u8] = b"KERNAID-REPAIR-FILE-METADATA-V1\0";
 const EXECUTION_INTENT_BINDING_DOMAIN: &[u8] = b"KERNAID-REPAIR-EXECUTION-INTENT-V1\0";
 const TRANSACTION_BINDING_DOMAIN: &[u8] = b"KERNAID-REPAIR-TRANSACTION-V1\0";
 const WRITE_LEASE_BINDING_DOMAIN: &[u8] = b"KERNAID-REPAIR-WRITE-LEASE-V1\0";
+const ROLLBACK_TRANSACTION_BINDING_DOMAIN: &[u8] = b"KERNAID-REPAIR-ROLLBACK-TRANSACTION-V1\0";
+const ROLLBACK_WRITE_LEASE_BINDING_DOMAIN: &[u8] = b"KERNAID-REPAIR-ROLLBACK-WRITE-LEASE-V1\0";
 const LOCK_ID_DOMAIN: &[u8] = b"kernaid:rescue-fstab:target-lock:v2\0";
 const MAX_PERMISSION_MODE: u32 = 0o7777;
 const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
@@ -1322,6 +1328,613 @@ pub fn canonical_repair_write_lease_sha256(
     Ok(Sha256::parse(&encode_hex(&hasher.finalize())).expect("SHA-256 digest is canonical"))
 }
 
+/// Opaque identity of one child rollback transaction. It carries no storage
+/// locator and is never accepted without the complete source and binding.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub struct RepairRollbackId(String);
+
+impl<'de> Deserialize<'de> for RepairRollbackId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+impl RepairRollbackId {
+    pub fn parse(value: &str) -> Result<Self, ProtocolViolation> {
+        let Some(suffix) = value.strip_prefix("RB-") else {
+            return Err(ProtocolViolation::InvalidPayload);
+        };
+        if suffix.len() != 32 || !suffix.bytes().all(is_lower_hex) {
+            return Err(ProtocolViolation::InvalidPayload);
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Fresh plan and approval material for a child rollback transaction.
+///
+/// The immutable target, resource, backup and installed/restored hashes are
+/// inherited only through the exact source transaction. The approval must be
+/// the strict next sequence and must differ from the source repair approval.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RepairRollbackBindingV1 {
+    action_id: String,
+    plan_id: String,
+    plan_sha256: Sha256,
+    approval_id: String,
+    approval_sha256: Sha256,
+    approval_sequence: u64,
+}
+
+impl RepairRollbackBindingV1 {
+    pub fn new(
+        source: &RepairTransactionStatusPayload,
+        plan_id: impl Into<String>,
+        plan_sha256: Sha256,
+        approval_id: impl Into<String>,
+        approval_sha256: Sha256,
+        approval_sequence: u64,
+    ) -> Result<Self, ProtocolViolation> {
+        let value = Self {
+            action_id: REPAIR_ROLLBACK_ACTION_ID.to_owned(),
+            plan_id: plan_id.into(),
+            plan_sha256,
+            approval_id: approval_id.into(),
+            approval_sha256,
+            approval_sequence,
+        };
+        value.validate_against(source)?;
+        Ok(value)
+    }
+
+    pub fn action_id(&self) -> &str {
+        &self.action_id
+    }
+
+    pub fn plan_id(&self) -> &str {
+        &self.plan_id
+    }
+
+    pub fn plan_sha256(&self) -> &Sha256 {
+        &self.plan_sha256
+    }
+
+    pub fn approval_id(&self) -> &str {
+        &self.approval_id
+    }
+
+    pub fn approval_sha256(&self) -> &Sha256 {
+        &self.approval_sha256
+    }
+
+    pub const fn approval_sequence(&self) -> u64 {
+        self.approval_sequence
+    }
+
+    pub fn validate_against(
+        &self,
+        source: &RepairTransactionStatusPayload,
+    ) -> Result<(), ProtocolViolation> {
+        validate_committed_rollback_source(source)?;
+        let source_approval_id = source
+            .backup()
+            .approval_id()
+            .ok_or(ProtocolViolation::InvalidPayload)?;
+        let source_approval_sha256 = source
+            .backup()
+            .approval_sha256()
+            .ok_or(ProtocolViolation::InvalidPayload)?;
+        let source_intent = source
+            .backup()
+            .execution_intent()
+            .ok_or(ProtocolViolation::InvalidPayload)?;
+        let next_sequence = source_intent
+            .approval_sequence()
+            .checked_add(1)
+            .filter(|value| *value <= MAX_SAFE_JSON_INTEGER)
+            .ok_or(ProtocolViolation::InvalidPayload)?;
+        if self.action_id != REPAIR_ROLLBACK_ACTION_ID
+            || !valid_prefixed_id(&self.plan_id, "P-")
+            || !valid_prefixed_id(&self.approval_id, "A-")
+            || self.plan_sha256.bytes() == [0; 32]
+            || self.approval_sha256.bytes() == [0; 32]
+            || self.approval_id == source_approval_id
+            || &self.approval_sha256 == source_approval_sha256
+            || self.approval_sequence != next_sequence
+        {
+            return Err(ProtocolViolation::InvalidPayload);
+        }
+        Ok(())
+    }
+}
+
+/// Closed result vocabulary for a user-approved post-commit rollback.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RepairRollbackResolutionOutcome {
+    RolledBackBefore,
+    ManualReconciliationRequired,
+}
+
+/// Exact observation used to resolve a child rollback transaction.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RepairRollbackResolution {
+    outcome: RepairRollbackResolutionOutcome,
+    target_state: RepairTransactionTargetState,
+    observed_resource_sha256: Sha256,
+    observed_metadata_sha256: Sha256,
+    mount_cleanup_verified: bool,
+}
+
+impl RepairRollbackResolution {
+    pub fn new(
+        outcome: RepairRollbackResolutionOutcome,
+        observed_resource_sha256: Sha256,
+        observed_metadata_sha256: Sha256,
+        mount_cleanup_verified: bool,
+        source: &RepairTransactionStatusPayload,
+    ) -> Result<Self, ProtocolViolation> {
+        validate_committed_rollback_source(source)?;
+        let intent = source
+            .backup()
+            .execution_intent()
+            .ok_or(ProtocolViolation::InvalidPayload)?;
+        let value = Self {
+            outcome,
+            target_state: classify_target_state(&observed_resource_sha256, intent),
+            observed_resource_sha256,
+            observed_metadata_sha256,
+            mount_cleanup_verified,
+        };
+        value.validate_against(source)?;
+        Ok(value)
+    }
+
+    pub const fn outcome(&self) -> RepairRollbackResolutionOutcome {
+        self.outcome
+    }
+
+    pub const fn target_state(&self) -> RepairTransactionTargetState {
+        self.target_state
+    }
+
+    pub fn observed_resource_sha256(&self) -> &Sha256 {
+        &self.observed_resource_sha256
+    }
+
+    pub fn observed_metadata_sha256(&self) -> &Sha256 {
+        &self.observed_metadata_sha256
+    }
+
+    pub const fn mount_cleanup_verified(&self) -> bool {
+        self.mount_cleanup_verified
+    }
+
+    pub fn validate_against(
+        &self,
+        source: &RepairTransactionStatusPayload,
+    ) -> Result<(), ProtocolViolation> {
+        validate_committed_rollback_source(source)?;
+        let intent = source
+            .backup()
+            .execution_intent()
+            .ok_or(ProtocolViolation::InvalidPayload)?;
+        if self.target_state != classify_target_state(&self.observed_resource_sha256, intent) {
+            return Err(ProtocolViolation::InvalidPayload);
+        }
+        let metadata_matches =
+            self.observed_metadata_sha256 == intent.before_metadata().canonical_sha256();
+        let exact_closed_state = match self.outcome {
+            RepairRollbackResolutionOutcome::RolledBackBefore => {
+                self.target_state == RepairTransactionTargetState::Before
+                    && metadata_matches
+                    && self.mount_cleanup_verified
+            }
+            RepairRollbackResolutionOutcome::ManualReconciliationRequired => true,
+        };
+        if !exact_closed_state {
+            return Err(ProtocolViolation::InvalidPayload);
+        }
+        Ok(())
+    }
+
+    const fn phase(&self) -> RepairTransactionPhase {
+        match self.outcome {
+            RepairRollbackResolutionOutcome::RolledBackBefore => RepairTransactionPhase::Resolved,
+            RepairRollbackResolutionOutcome::ManualReconciliationRequired => {
+                RepairTransactionPhase::ManualReconciliationRequired
+            }
+        }
+    }
+}
+
+/// Durable, path-free status of one rollback child linked to an immutable
+/// committed source transaction.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RepairRollbackTransactionStatusPayload {
+    phase: RepairTransactionPhase,
+    rollback_id: RepairRollbackId,
+    rollback_transaction_binding_sha256: Sha256,
+    source: Box<RepairTransactionStatusPayload>,
+    binding: RepairRollbackBindingV1,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resolution: Option<RepairRollbackResolution>,
+}
+
+impl RepairRollbackTransactionStatusPayload {
+    pub fn pending(
+        rollback_id: RepairRollbackId,
+        source: RepairTransactionStatusPayload,
+        binding: RepairRollbackBindingV1,
+    ) -> Result<Self, ProtocolViolation> {
+        Self::new(
+            RepairTransactionPhase::Pending,
+            rollback_id,
+            source,
+            binding,
+            None,
+        )
+    }
+
+    pub fn resolved(
+        rollback_id: RepairRollbackId,
+        source: RepairTransactionStatusPayload,
+        binding: RepairRollbackBindingV1,
+        resolution: RepairRollbackResolution,
+    ) -> Result<Self, ProtocolViolation> {
+        Self::new(
+            resolution.phase(),
+            rollback_id,
+            source,
+            binding,
+            Some(resolution),
+        )
+    }
+
+    fn new(
+        phase: RepairTransactionPhase,
+        rollback_id: RepairRollbackId,
+        source: RepairTransactionStatusPayload,
+        binding: RepairRollbackBindingV1,
+        resolution: Option<RepairRollbackResolution>,
+    ) -> Result<Self, ProtocolViolation> {
+        binding.validate_against(&source)?;
+        let rollback_transaction_binding_sha256 =
+            canonical_repair_rollback_transaction_binding_sha256(&rollback_id, &source, &binding)?;
+        let value = Self {
+            phase,
+            rollback_id,
+            rollback_transaction_binding_sha256,
+            source: Box::new(source),
+            binding,
+            resolution,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub const fn phase(&self) -> RepairTransactionPhase {
+        self.phase
+    }
+
+    pub fn rollback_id(&self) -> &RepairRollbackId {
+        &self.rollback_id
+    }
+
+    pub fn rollback_transaction_binding_sha256(&self) -> &Sha256 {
+        &self.rollback_transaction_binding_sha256
+    }
+
+    pub fn source(&self) -> &RepairTransactionStatusPayload {
+        &self.source
+    }
+
+    pub fn binding(&self) -> &RepairRollbackBindingV1 {
+        &self.binding
+    }
+
+    pub fn resolution(&self) -> Option<&RepairRollbackResolution> {
+        self.resolution.as_ref()
+    }
+
+    pub const fn is_unresolved(&self) -> bool {
+        matches!(
+            self.phase,
+            RepairTransactionPhase::Pending | RepairTransactionPhase::ManualReconciliationRequired
+        )
+    }
+
+    pub fn validate(&self) -> Result<(), ProtocolViolation> {
+        self.binding.validate_against(&self.source)?;
+        if self.rollback_transaction_binding_sha256
+            != canonical_repair_rollback_transaction_binding_sha256(
+                &self.rollback_id,
+                &self.source,
+                &self.binding,
+            )?
+        {
+            return Err(ProtocolViolation::InvalidPayload);
+        }
+        match (&self.phase, &self.resolution) {
+            (RepairTransactionPhase::Pending, None) => Ok(()),
+            (RepairTransactionPhase::Resolved, Some(resolution))
+                if resolution.phase() == RepairTransactionPhase::Resolved =>
+            {
+                resolution.validate_against(&self.source)
+            }
+            (RepairTransactionPhase::ManualReconciliationRequired, Some(resolution))
+                if resolution.phase() == RepairTransactionPhase::ManualReconciliationRequired =>
+            {
+                resolution.validate_against(&self.source)
+            }
+            _ => Err(ProtocolViolation::InvalidPayload),
+        }
+    }
+
+    pub fn same_transaction(&self, other: &Self) -> bool {
+        self.rollback_id == other.rollback_id
+            && self.rollback_transaction_binding_sha256 == other.rollback_transaction_binding_sha256
+            && self.source == other.source
+            && self.binding == other.binding
+    }
+
+    pub fn resolves_with(&self, resolution: &RepairRollbackResolution) -> bool {
+        self.resolution.as_ref() == Some(resolution) && self.phase == resolution.phase()
+    }
+}
+
+/// Computes the child identity from the exact source plus fresh rollback
+/// plan/approval. The source receipt alone can never mint this binding.
+pub fn canonical_repair_rollback_transaction_binding_sha256(
+    rollback_id: &RepairRollbackId,
+    source: &RepairTransactionStatusPayload,
+    binding: &RepairRollbackBindingV1,
+) -> Result<Sha256, ProtocolViolation> {
+    binding.validate_against(source)?;
+    let mut hasher = Sha256Hasher::new();
+    hasher.update(ROLLBACK_TRANSACTION_BINDING_DOMAIN);
+    hash_field(&mut hasher, rollback_id.as_str().as_bytes());
+    hash_field(
+        &mut hasher,
+        source.backup().reservation_id().as_str().as_bytes(),
+    );
+    hash_field(&mut hasher, &source.transaction_binding_sha256().bytes());
+    hash_field(&mut hasher, binding.action_id().as_bytes());
+    hash_field(&mut hasher, binding.plan_id().as_bytes());
+    hash_field(&mut hasher, &binding.plan_sha256().bytes());
+    hash_field(&mut hasher, binding.approval_id().as_bytes());
+    hash_field(&mut hasher, &binding.approval_sha256().bytes());
+    hash_field(&mut hasher, &binding.approval_sequence().to_be_bytes());
+    Ok(Sha256::parse(&encode_hex(&hasher.finalize())).expect("SHA-256 digest is canonical"))
+}
+
+/// Closed lookup for rollback children. The singleton is the reboot recovery
+/// bootstrap and never enumerates resolved history.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum RepairRollbackStatusSelector {
+    PendingSingleton,
+    Exact {
+        #[serde(rename = "rollbackId")]
+        rollback_id: RepairRollbackId,
+        #[serde(rename = "rollbackTransactionBindingSha256")]
+        rollback_transaction_binding_sha256: Sha256,
+    },
+}
+
+impl RepairRollbackStatusSelector {
+    pub const fn pending_singleton() -> Self {
+        Self::PendingSingleton
+    }
+
+    pub fn exact(
+        rollback_id: RepairRollbackId,
+        rollback_transaction_binding_sha256: Sha256,
+    ) -> Self {
+        Self::Exact {
+            rollback_id,
+            rollback_transaction_binding_sha256,
+        }
+    }
+
+    pub fn for_status(status: &RepairRollbackTransactionStatusPayload) -> Self {
+        Self::exact(
+            status.rollback_id.clone(),
+            status.rollback_transaction_binding_sha256.clone(),
+        )
+    }
+
+    pub fn validate(&self) -> Result<(), ProtocolViolation> {
+        match self {
+            Self::PendingSingleton | Self::Exact { .. } => Ok(()),
+        }
+    }
+
+    pub fn matches_result(&self, result: &RepairRollbackStatusResultPayload) -> bool {
+        if result.validate().is_err() {
+            return false;
+        }
+        match (self, result.transaction()) {
+            (Self::PendingSingleton, None) => true,
+            (Self::PendingSingleton, Some(status)) => status.is_unresolved(),
+            (
+                Self::Exact {
+                    rollback_id,
+                    rollback_transaction_binding_sha256,
+                },
+                Some(status),
+            ) => {
+                status.rollback_id() == rollback_id
+                    && status.rollback_transaction_binding_sha256()
+                        == rollback_transaction_binding_sha256
+            }
+            (Self::Exact { .. }, None) => false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RepairRollbackStatusResultPayload {
+    transaction: Option<Box<RepairRollbackTransactionStatusPayload>>,
+}
+
+impl RepairRollbackStatusResultPayload {
+    pub const fn absent() -> Self {
+        Self { transaction: None }
+    }
+
+    pub fn found(transaction: RepairRollbackTransactionStatusPayload) -> Self {
+        Self {
+            transaction: Some(Box::new(transaction)),
+        }
+    }
+
+    pub fn transaction(&self) -> Option<&RepairRollbackTransactionStatusPayload> {
+        self.transaction.as_deref()
+    }
+
+    pub fn validate(&self) -> Result<(), ProtocolViolation> {
+        if let Some(transaction) = &self.transaction {
+            transaction.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// Receipt for a consumed rollback write lease. It is audit evidence for the
+/// root helper, not a transferable bearer capability.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RepairRollbackWriteLeasePayload {
+    capability: String,
+    boot_epoch_sha256: Sha256,
+    lease_binding_sha256: Sha256,
+    transaction: Box<RepairRollbackTransactionStatusPayload>,
+}
+
+impl RepairRollbackWriteLeasePayload {
+    pub fn consumed(
+        transaction: RepairRollbackTransactionStatusPayload,
+        boot_epoch_sha256: Sha256,
+    ) -> Result<Self, ProtocolViolation> {
+        let lease_binding_sha256 =
+            canonical_repair_rollback_write_lease_sha256(&transaction, &boot_epoch_sha256)?;
+        let value = Self {
+            capability: REPAIR_ROLLBACK_WRITE_LEASE_CAPABILITY.to_owned(),
+            boot_epoch_sha256,
+            lease_binding_sha256,
+            transaction: Box::new(transaction),
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn capability(&self) -> &str {
+        &self.capability
+    }
+
+    pub fn boot_epoch_sha256(&self) -> &Sha256 {
+        &self.boot_epoch_sha256
+    }
+
+    pub fn lease_binding_sha256(&self) -> &Sha256 {
+        &self.lease_binding_sha256
+    }
+
+    pub fn transaction(&self) -> &RepairRollbackTransactionStatusPayload {
+        &self.transaction
+    }
+
+    pub fn validate(&self) -> Result<(), ProtocolViolation> {
+        self.transaction.validate()?;
+        let source_intent = self
+            .transaction
+            .source()
+            .backup()
+            .execution_intent()
+            .ok_or(ProtocolViolation::InvalidPayload)?;
+        if self.capability != REPAIR_ROLLBACK_WRITE_LEASE_CAPABILITY
+            || self.transaction.phase() != RepairTransactionPhase::Pending
+            || self.transaction.binding().action_id() != REPAIR_ROLLBACK_ACTION_ID
+            || self.boot_epoch_sha256.bytes() == [0; 32]
+            || source_intent.lock_identity()
+                != canonical_repair_lock_identity(source_intent.target_recovery_fingerprint())
+            || self.lease_binding_sha256
+                != canonical_repair_rollback_write_lease_sha256(
+                    &self.transaction,
+                    &self.boot_epoch_sha256,
+                )?
+        {
+            return Err(ProtocolViolation::InvalidPayload);
+        }
+        Ok(())
+    }
+}
+
+pub fn canonical_repair_rollback_write_lease_sha256(
+    transaction: &RepairRollbackTransactionStatusPayload,
+    boot_epoch_sha256: &Sha256,
+) -> Result<Sha256, ProtocolViolation> {
+    transaction.validate()?;
+    if transaction.phase() != RepairTransactionPhase::Pending
+        || boot_epoch_sha256.bytes() == [0; 32]
+    {
+        return Err(ProtocolViolation::InvalidPayload);
+    }
+    let intent = transaction
+        .source()
+        .backup()
+        .execution_intent()
+        .ok_or(ProtocolViolation::InvalidPayload)?;
+    if intent.lock_identity()
+        != canonical_repair_lock_identity(intent.target_recovery_fingerprint())
+    {
+        return Err(ProtocolViolation::InvalidPayload);
+    }
+    let mut hasher = Sha256Hasher::new();
+    hasher.update(ROLLBACK_WRITE_LEASE_BINDING_DOMAIN);
+    hash_field(
+        &mut hasher,
+        REPAIR_ROLLBACK_WRITE_LEASE_CAPABILITY.as_bytes(),
+    );
+    hash_field(
+        &mut hasher,
+        &transaction.rollback_transaction_binding_sha256().bytes(),
+    );
+    hash_field(&mut hasher, &boot_epoch_sha256.bytes());
+    hash_field(&mut hasher, intent.target_recovery_fingerprint().as_bytes());
+    hash_field(&mut hasher, intent.lock_identity().as_bytes());
+    Ok(Sha256::parse(&encode_hex(&hasher.finalize())).expect("SHA-256 digest is canonical"))
+}
+
+fn validate_committed_rollback_source(
+    source: &RepairTransactionStatusPayload,
+) -> Result<(), ProtocolViolation> {
+    source.validate()?;
+    if source.phase() != RepairTransactionPhase::Resolved
+        || source
+            .resolution()
+            .map(RepairTransactionResolution::outcome)
+            != Some(RepairTransactionResolutionOutcome::CommittedAfter)
+    {
+        return Err(ProtocolViolation::InvalidPayload);
+    }
+    Ok(())
+}
+
 pub fn repair_backup_input(size: u64) -> Result<DescriptorDeclaration, ProtocolViolation> {
     if !(1..=MAX_REPAIR_BACKUP_BYTES).contains(&size) {
         return Err(ProtocolViolation::InvalidPayload);
@@ -1484,6 +2097,33 @@ mod tests {
         .expect("durable status")
     }
 
+    fn committed_status() -> RepairTransactionStatusPayload {
+        let durable = durable_status();
+        let intent = durable.execution_intent().expect("execution intent");
+        let resolution = RepairTransactionResolution::new(
+            RepairTransactionResolutionOutcome::CommittedAfter,
+            intent.after_sha256().clone(),
+            intent.before_metadata().canonical_sha256(),
+            true,
+            intent,
+        )
+        .expect("committed resolution");
+        RepairTransactionStatusPayload::resolved(durable, resolution)
+            .expect("committed source transaction")
+    }
+
+    fn rollback_binding(source: &RepairTransactionStatusPayload) -> RepairRollbackBindingV1 {
+        RepairRollbackBindingV1::new(
+            source,
+            "P-rollback-1",
+            hash('8'),
+            "A-rollback-1",
+            hash('9'),
+            8,
+        )
+        .expect("rollback binding")
+    }
+
     #[test]
     fn reservation_and_status_are_exact_and_path_free() {
         let reserved = RepairBackupStatusPayload::reserved(
@@ -1627,6 +2267,106 @@ mod tests {
         let resolved = RepairTransactionStatusPayload::resolved(durable_status(), resolution)
             .expect("resolved transaction");
         assert!(RepairWriteLeasePayload::consumed(resolved, hash('e')).is_err());
+    }
+
+    #[test]
+    fn rollback_child_requires_committed_source_and_fresh_next_approval() {
+        let source = committed_status();
+        let binding = rollback_binding(&source);
+        let pending = RepairRollbackTransactionStatusPayload::pending(
+            RepairRollbackId::parse("RB-0123456789abcdef0123456789abcdef").expect("rollback ID"),
+            source.clone(),
+            binding,
+        )
+        .expect("pending rollback child");
+        assert_eq!(pending.phase(), RepairTransactionPhase::Pending);
+        assert_ne!(
+            pending.rollback_transaction_binding_sha256(),
+            source.transaction_binding_sha256()
+        );
+        let encoded = serde_json::to_string(&pending).expect("rollback JSON");
+        assert!(!encoded.contains("/dev/"));
+        assert!(!encoded.contains("/mnt/"));
+        assert!(!encoded.contains("command"));
+
+        assert!(
+            RepairRollbackBindingV1::new(
+                &source,
+                "P-rollback-1",
+                hash('8'),
+                source.backup().approval_id().expect("source approval"),
+                hash('9'),
+                8,
+            )
+            .is_err()
+        );
+        assert!(
+            RepairRollbackBindingV1::new(
+                &source,
+                "P-rollback-1",
+                hash('8'),
+                "A-rollback-1",
+                hash('9'),
+                7,
+            )
+            .is_err()
+        );
+        let unresolved =
+            RepairTransactionStatusPayload::pending(durable_status()).expect("pending source");
+        assert!(
+            RepairRollbackBindingV1::new(
+                &unresolved,
+                "P-rollback-1",
+                hash('8'),
+                "A-rollback-1",
+                hash('9'),
+                8,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rollback_lease_is_domain_separated_pending_and_boot_scoped() {
+        let source = committed_status();
+        let pending = RepairRollbackTransactionStatusPayload::pending(
+            RepairRollbackId::parse("RB-fedcba9876543210fedcba9876543210").expect("rollback ID"),
+            source.clone(),
+            rollback_binding(&source),
+        )
+        .expect("pending rollback");
+        let lease = RepairRollbackWriteLeasePayload::consumed(pending.clone(), hash('e'))
+            .expect("rollback lease");
+        assert_eq!(lease.capability(), REPAIR_ROLLBACK_WRITE_LEASE_CAPABILITY);
+        assert_eq!(lease.transaction(), &pending);
+        assert!(lease.validate().is_ok());
+
+        let resolution = RepairRollbackResolution::new(
+            RepairRollbackResolutionOutcome::RolledBackBefore,
+            source
+                .backup()
+                .execution_intent()
+                .expect("intent")
+                .before_sha256()
+                .clone(),
+            source
+                .backup()
+                .execution_intent()
+                .expect("intent")
+                .before_metadata()
+                .canonical_sha256(),
+            true,
+            &source,
+        )
+        .expect("rollback resolution");
+        let resolved = RepairRollbackTransactionStatusPayload::resolved(
+            pending.rollback_id().clone(),
+            source.clone(),
+            rollback_binding(&source),
+            resolution,
+        )
+        .expect("resolved rollback");
+        assert!(RepairRollbackWriteLeasePayload::consumed(resolved, hash('e')).is_err());
     }
 
     #[test]

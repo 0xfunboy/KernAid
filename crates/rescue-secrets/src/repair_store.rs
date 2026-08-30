@@ -16,9 +16,13 @@ use kernaid_protocol::{
         RepairBackupBinding as ProtocolRepairBackupBinding,
         RepairBackupStatusPayload as ProtocolRepairBackupStatusPayload, RepairExecutionIntentV1,
         RepairFileMetadataV1, RepairReservationId as ProtocolRepairReservationId,
-        RepairTransactionPhase, RepairTransactionResolution, RepairTransactionResolutionOutcome,
-        RepairTransactionStatusPayload, RepairTransactionStatusResultPayload,
-        RepairTransactionStatusSelector, RepairWriteLeasePayload, canonical_repair_lock_identity,
+        RepairRollbackBindingV1, RepairRollbackId, RepairRollbackResolution,
+        RepairRollbackResolutionOutcome, RepairRollbackStatusResultPayload,
+        RepairRollbackStatusSelector, RepairRollbackTransactionStatusPayload,
+        RepairRollbackWriteLeasePayload, RepairTransactionPhase, RepairTransactionResolution,
+        RepairTransactionResolutionOutcome, RepairTransactionStatusPayload,
+        RepairTransactionStatusResultPayload, RepairTransactionStatusSelector,
+        RepairWriteLeasePayload, canonical_repair_lock_identity,
     },
     rescue_vault::Sha256 as ProtocolSha256,
 };
@@ -768,6 +772,52 @@ enum RepairEvent {
         #[serde(rename = "leaseBindingSha256")]
         lease_binding_sha256: String,
     },
+    #[serde(rename = "repair.rollback.begin")]
+    RollbackBegin {
+        #[serde(rename = "sourceReservationId")]
+        source_reservation_id: ReservationId,
+        #[serde(rename = "sourceTransactionBindingSha256")]
+        source_transaction_binding_sha256: String,
+        #[serde(rename = "rollbackId")]
+        rollback_id: RepairRollbackId,
+        #[serde(rename = "rollbackTransactionBindingSha256")]
+        rollback_transaction_binding_sha256: String,
+        binding: RepairRollbackBindingV1,
+    },
+    #[serde(rename = "repair.rollback.write-lease.consume")]
+    RollbackWriteLeaseConsume {
+        #[serde(rename = "sourceReservationId")]
+        source_reservation_id: ReservationId,
+        #[serde(rename = "rollbackId")]
+        rollback_id: RepairRollbackId,
+        #[serde(rename = "rollbackTransactionBindingSha256")]
+        rollback_transaction_binding_sha256: String,
+        #[serde(rename = "bootEpochSha256")]
+        boot_epoch_sha256: String,
+        #[serde(rename = "leaseBindingSha256")]
+        lease_binding_sha256: String,
+    },
+    #[serde(rename = "repair.rollback.resolve.intent")]
+    RollbackResolveIntent {
+        #[serde(rename = "sourceReservationId")]
+        source_reservation_id: ReservationId,
+        #[serde(rename = "rollbackId")]
+        rollback_id: RepairRollbackId,
+        #[serde(rename = "rollbackTransactionBindingSha256")]
+        rollback_transaction_binding_sha256: String,
+        #[serde(rename = "expectedPhase")]
+        expected_phase: RepairTransactionPhase,
+        resolution: RepairRollbackResolution,
+    },
+    #[serde(rename = "repair.rollback.resolve.complete")]
+    RollbackResolveComplete {
+        #[serde(rename = "sourceReservationId")]
+        source_reservation_id: ReservationId,
+        #[serde(rename = "rollbackId")]
+        rollback_id: RepairRollbackId,
+        #[serde(rename = "rollbackTransactionBindingSha256")]
+        rollback_transaction_binding_sha256: String,
+    },
     #[serde(rename = "repair.backup.cancel.intent")]
     CancelIntent {
         #[serde(rename = "reservationId")]
@@ -828,6 +878,23 @@ struct RepairTransactionRecord {
     resolution: Option<RepairTransactionResolution>,
     pending_resolution: Option<PendingTransactionResolution>,
     write_lease: Option<ConsumedWriteLease>,
+    rollback: Option<RepairRollbackTransactionRecord>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct RepairRollbackTransactionRecord {
+    rollback_id: RepairRollbackId,
+    binding: RepairRollbackBindingV1,
+    resolution: Option<RepairRollbackResolution>,
+    pending_resolution: Option<PendingRollbackResolution>,
+    write_lease: Option<ConsumedWriteLease>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct PendingRollbackResolution {
+    rollback_transaction_binding_sha256: String,
+    expected_phase: RepairTransactionPhase,
+    resolution: RepairRollbackResolution,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -882,6 +949,7 @@ struct RecoveredState {
     pending: Option<ReservationId>,
     transactions: BTreeMap<ReservationId, RepairTransactionRecord>,
     unresolved_transaction: Option<ReservationId>,
+    unresolved_rollback: Option<ReservationId>,
     logical_event_clock: u64,
     compaction_generation: u64,
     previous_compaction_anchor: Option<JournalAnchor>,
@@ -1048,7 +1116,7 @@ impl<'vault> RepairVaultStore<'vault> {
         {
             return Ok(reserved);
         }
-        if self.state.unresolved_transaction.is_some() {
+        if self.state.unresolved_transaction.is_some() || self.state.unresolved_rollback.is_some() {
             return Err(RepairVaultStoreError::ReconciliationRequired);
         }
         self.require_event_capacity(2)?;
@@ -1135,7 +1203,7 @@ impl<'vault> RepairVaultStore<'vault> {
         binding.validate()?;
         self.require_mutable()?;
         self.consume_checkout(reservation.reservation_id())?;
-        if self.state.unresolved_transaction.is_some() {
+        if self.state.unresolved_transaction.is_some() || self.state.unresolved_rollback.is_some() {
             return Err(RepairVaultStoreError::ReconciliationRequired);
         }
         self.require_event_capacity(2)?;
@@ -1287,7 +1355,11 @@ impl<'vault> RepairVaultStore<'vault> {
             .transactions
             .get(expected.reservation_id())
             .ok_or(RepairVaultStoreError::CorruptJournal)?;
-        if transaction_phase(transaction) != RepairTransactionPhase::Resolved {
+        if transaction_phase(transaction) != RepairTransactionPhase::Resolved
+            || transaction.rollback.as_ref().is_some_and(|rollback| {
+                rollback_transaction_phase(rollback) != RepairTransactionPhase::Resolved
+            })
+        {
             return Err(RepairVaultStoreError::ReconciliationRequired);
         }
         self.verify_durable_file(expected.reservation_id(), record)?;
@@ -1419,6 +1491,246 @@ impl<'vault> RepairVaultStore<'vault> {
             }
             _ => Ok(RepairTransactionStatusResultPayload::found(status)),
         }
+    }
+
+    /// Create, or reconcile a lost response for, one child rollback bound to
+    /// an exact committed source. This journal-only mutation does not mint
+    /// target write authority and does not expose the backup body.
+    pub fn begin_rollback_transaction(
+        &mut self,
+        source: &RepairTransactionStatusPayload,
+        binding: RepairRollbackBindingV1,
+    ) -> Result<RepairRollbackTransactionStatusPayload, RepairVaultStoreError> {
+        self.require_mutable()?;
+        validate_protocol_transaction_status(source)?;
+        binding
+            .validate_against(source)
+            .map_err(|_| RepairVaultStoreError::InvalidBinding)?;
+        let source_reservation_id =
+            ReservationId::parse(source.backup().reservation_id().as_str())?;
+        let current_source = self.transaction_status_for_id(&source_reservation_id)?;
+        if &current_source != source {
+            return Err(RepairVaultStoreError::ReservationConflict);
+        }
+        let source_record = self
+            .state
+            .reservations
+            .get(&source_reservation_id)
+            .ok_or(RepairVaultStoreError::ReservationNotFound)?;
+        self.verify_record_vault_identity(source_record)?;
+        self.verify_durable_file(&source_reservation_id, source_record)?;
+
+        let transaction = self
+            .state
+            .transactions
+            .get(&source_reservation_id)
+            .ok_or(RepairVaultStoreError::CorruptJournal)?;
+        if let Some(existing) = transaction.rollback.as_ref() {
+            let status = protocol_rollback_status_from_record(
+                &source_reservation_id,
+                source_record,
+                transaction,
+                existing,
+            )?;
+            if status.source() == source && status.binding() == &binding {
+                return Ok(status);
+            }
+            return Err(RepairVaultStoreError::ReservationConflict);
+        }
+        if self.state.unresolved_transaction.is_some() || self.state.unresolved_rollback.is_some() {
+            return Err(RepairVaultStoreError::ReconciliationRequired);
+        }
+
+        let rollback_id = self.generate_unused_rollback_id()?;
+        let pending = RepairRollbackTransactionStatusPayload::pending(
+            rollback_id.clone(),
+            source.clone(),
+            binding.clone(),
+        )
+        .map_err(|_| RepairVaultStoreError::InvalidBinding)?;
+        self.require_event_capacity(1)?;
+        self.append_event(RepairEvent::RollbackBegin {
+            source_reservation_id,
+            source_transaction_binding_sha256: source
+                .transaction_binding_sha256()
+                .as_str()
+                .to_owned(),
+            rollback_id,
+            rollback_transaction_binding_sha256: pending
+                .rollback_transaction_binding_sha256()
+                .as_str()
+                .to_owned(),
+            binding,
+        })?;
+        Ok(pending)
+    }
+
+    /// Look up one rollback child without enumerating resolved history.
+    pub fn rollback_transaction_status(
+        &self,
+        selector: &RepairRollbackStatusSelector,
+    ) -> Result<RepairRollbackStatusResultPayload, RepairVaultStoreError> {
+        selector
+            .validate()
+            .map_err(|_| RepairVaultStoreError::InvalidBinding)?;
+        self.validate_store_boundary()?;
+        if self.state.pending.is_some() {
+            return Err(RepairVaultStoreError::ReconciliationRequired);
+        }
+        let source_reservation_id = match selector {
+            RepairRollbackStatusSelector::PendingSingleton => {
+                let Some(source_reservation_id) = self.state.unresolved_rollback.as_ref() else {
+                    return Ok(RepairRollbackStatusResultPayload::absent());
+                };
+                source_reservation_id.clone()
+            }
+            RepairRollbackStatusSelector::Exact { rollback_id, .. } => self
+                .state
+                .transactions
+                .iter()
+                .find_map(|(reservation_id, transaction)| {
+                    transaction
+                        .rollback
+                        .as_ref()
+                        .filter(|rollback| &rollback.rollback_id == rollback_id)
+                        .map(|_| reservation_id.clone())
+                })
+                .ok_or(RepairVaultStoreError::ReservationNotFound)?,
+        };
+        let status = self.rollback_status_for_source(&source_reservation_id)?;
+        match selector {
+            RepairRollbackStatusSelector::PendingSingleton if !status.is_unresolved() => {
+                Err(RepairVaultStoreError::CorruptJournal)
+            }
+            RepairRollbackStatusSelector::Exact {
+                rollback_transaction_binding_sha256,
+                ..
+            } if status.rollback_transaction_binding_sha256()
+                != rollback_transaction_binding_sha256 =>
+            {
+                Err(RepairVaultStoreError::ReservationConflict)
+            }
+            _ => Ok(RepairRollbackStatusResultPayload::found(status)),
+        }
+    }
+
+    /// Atomically consume the current boot's one-shot lease for one exact
+    /// Pending rollback child. It is distinct from the source repair lease.
+    pub fn consume_rollback_write_lease(
+        &mut self,
+        selector: &RepairRollbackStatusSelector,
+    ) -> Result<RepairRollbackWriteLeasePayload, RepairVaultStoreError> {
+        self.require_mutable()?;
+        let RepairRollbackStatusSelector::Exact { rollback_id, .. } = selector else {
+            return Err(RepairVaultStoreError::InvalidBinding);
+        };
+        let source_reservation_id = self
+            .state
+            .transactions
+            .iter()
+            .find_map(|(reservation_id, transaction)| {
+                transaction
+                    .rollback
+                    .as_ref()
+                    .filter(|rollback| &rollback.rollback_id == rollback_id)
+                    .map(|_| reservation_id.clone())
+            })
+            .ok_or(RepairVaultStoreError::ReservationNotFound)?;
+        let status = self.rollback_status_for_source(&source_reservation_id)?;
+        if !selector.matches_result(&RepairRollbackStatusResultPayload::found(status.clone()))
+            || status.phase() != RepairTransactionPhase::Pending
+        {
+            return Err(RepairVaultStoreError::ReservationConflict);
+        }
+        let source_record = self
+            .state
+            .reservations
+            .get(&source_reservation_id)
+            .ok_or(RepairVaultStoreError::ReservationNotFound)?;
+        self.verify_durable_file(&source_reservation_id, source_record)?;
+        let rollback = self
+            .state
+            .transactions
+            .get(&source_reservation_id)
+            .and_then(|transaction| transaction.rollback.as_ref())
+            .ok_or(RepairVaultStoreError::CorruptJournal)?;
+        if rollback.pending_resolution.is_some() || rollback.resolution.is_some() {
+            return Err(RepairVaultStoreError::ReservationConflict);
+        }
+        if rollback
+            .write_lease
+            .as_ref()
+            .is_some_and(|lease| lease.boot_epoch_sha256 == self.boot_epoch_sha256.as_str())
+        {
+            return Err(RepairVaultStoreError::WriteLeaseConsumed);
+        }
+        let lease =
+            RepairRollbackWriteLeasePayload::consumed(status, self.boot_epoch_sha256.clone())
+                .map_err(|_| RepairVaultStoreError::InvalidBinding)?;
+        self.require_event_capacity(1)?;
+        self.append_event(RepairEvent::RollbackWriteLeaseConsume {
+            source_reservation_id,
+            rollback_id: lease.transaction().rollback_id().clone(),
+            rollback_transaction_binding_sha256: lease
+                .transaction()
+                .rollback_transaction_binding_sha256()
+                .as_str()
+                .to_owned(),
+            boot_epoch_sha256: lease.boot_epoch_sha256().as_str().to_owned(),
+            lease_binding_sha256: lease.lease_binding_sha256().as_str().to_owned(),
+        })?;
+        Ok(lease)
+    }
+
+    /// Resolve one child rollback after exact target classification. A lost
+    /// response is reconciled by presenting the same expected child and
+    /// resolution; no write operation is repeated.
+    pub fn resolve_rollback_transaction(
+        &mut self,
+        expected: &RepairRollbackTransactionStatusPayload,
+        resolution: RepairRollbackResolution,
+    ) -> Result<RepairRollbackTransactionStatusPayload, RepairVaultStoreError> {
+        self.require_mutable()?;
+        expected
+            .validate()
+            .map_err(|_| RepairVaultStoreError::InvalidBinding)?;
+        resolution
+            .validate_against(expected.source())
+            .map_err(|_| RepairVaultStoreError::InvalidBinding)?;
+        let source_reservation_id =
+            ReservationId::parse(expected.source().backup().reservation_id().as_str())?;
+        let current = self.rollback_status_for_source(&source_reservation_id)?;
+        if &current != expected {
+            if current.same_transaction(expected) && current.resolves_with(&resolution) {
+                return Ok(current);
+            }
+            return Err(RepairVaultStoreError::ReservationConflict);
+        }
+        if current.phase() == RepairTransactionPhase::Resolved {
+            return Err(RepairVaultStoreError::ReservationConflict);
+        }
+        self.require_event_capacity(2)?;
+        self.append_event(RepairEvent::RollbackResolveIntent {
+            source_reservation_id: source_reservation_id.clone(),
+            rollback_id: expected.rollback_id().clone(),
+            rollback_transaction_binding_sha256: expected
+                .rollback_transaction_binding_sha256()
+                .as_str()
+                .to_owned(),
+            expected_phase: expected.phase(),
+            resolution,
+        })?;
+        self.append_event(RepairEvent::RollbackResolveComplete {
+            source_reservation_id,
+            rollback_id: expected.rollback_id().clone(),
+            rollback_transaction_binding_sha256: expected
+                .rollback_transaction_binding_sha256()
+                .as_str()
+                .to_owned(),
+        })?;
+        self.rollback_status_for_source(&ReservationId::parse(
+            expected.source().backup().reservation_id().as_str(),
+        )?)
     }
 
     /// Atomically consume the sole write-mount lease for one exact Pending
@@ -1663,6 +1975,37 @@ impl<'vault> RepairVaultStore<'vault> {
         protocol_transaction_status_from_record(reservation_id, reservation, transaction)
     }
 
+    fn rollback_status_for_source(
+        &self,
+        source_reservation_id: &ReservationId,
+    ) -> Result<RepairRollbackTransactionStatusPayload, RepairVaultStoreError> {
+        let reservation = self
+            .state
+            .reservations
+            .get(source_reservation_id)
+            .ok_or(RepairVaultStoreError::ReservationNotFound)?;
+        self.verify_record_vault_identity(reservation)?;
+        if !matches!(reservation.phase, ReservationPhase::Durable(_)) {
+            return Err(RepairVaultStoreError::ReservationNotReady);
+        }
+        self.verify_durable_file(source_reservation_id, reservation)?;
+        let transaction = self
+            .state
+            .transactions
+            .get(source_reservation_id)
+            .ok_or(RepairVaultStoreError::CorruptJournal)?;
+        let rollback = transaction
+            .rollback
+            .as_ref()
+            .ok_or(RepairVaultStoreError::ReservationNotFound)?;
+        protocol_rollback_status_from_record(
+            source_reservation_id,
+            reservation,
+            transaction,
+            rollback,
+        )
+    }
+
     fn require_event_capacity(&mut self, required: u64) -> Result<(), RepairVaultStoreError> {
         if self.compaction_due(required) {
             self.compact_journal()?;
@@ -1831,6 +2174,7 @@ impl<'vault> RepairVaultStore<'vault> {
         let expected_releases = retained_release_tombstones(&self.state);
         let expected_transactions = self.state.transactions.clone();
         let expected_unresolved_transaction = self.state.unresolved_transaction.clone();
+        let expected_unresolved_rollback = self.state.unresolved_rollback.clone();
         let expected_clock = self.state.logical_event_clock;
         let expected_generation = self
             .state
@@ -1881,6 +2225,7 @@ impl<'vault> RepairVaultStore<'vault> {
             &expected_releases,
             &expected_transactions,
             expected_unresolved_transaction.as_ref(),
+            expected_unresolved_rollback.as_ref(),
             expected_clock,
             expected_generation,
             previous_anchor,
@@ -1951,6 +2296,7 @@ impl<'vault> RepairVaultStore<'vault> {
             &expected_releases,
             &expected_transactions,
             expected_unresolved_transaction.as_ref(),
+            expected_unresolved_rollback.as_ref(),
             expected_clock,
             expected_generation,
             previous_anchor,
@@ -2007,6 +2353,24 @@ impl<'vault> RepairVaultStore<'vault> {
                 )?
                 .is_none()
             {
+                return Ok(candidate);
+            }
+        }
+        Err(RepairVaultStoreError::StorageUnavailable)
+    }
+
+    fn generate_unused_rollback_id(&self) -> Result<RepairRollbackId, RepairVaultStoreError> {
+        for _ in 0..16 {
+            let mut random = [0_u8; 16];
+            OsRng.fill_bytes(&mut random);
+            let candidate = RepairRollbackId::parse(&format!("RB-{}", encode_hex(&random)))
+                .map_err(|_| RepairVaultStoreError::CorruptStore)?;
+            if self.state.transactions.values().all(|transaction| {
+                transaction
+                    .rollback
+                    .as_ref()
+                    .is_none_or(|rollback| rollback.rollback_id != candidate)
+            }) {
                 return Ok(candidate);
             }
         }
@@ -2296,6 +2660,26 @@ impl<'vault> RepairVaultStore<'vault> {
             return self.append_event(RepairEvent::TransactionResolveComplete {
                 reservation_id,
                 transaction_binding_sha256,
+            });
+        }
+        if let Some((rollback_id, rollback_transaction_binding_sha256)) = self
+            .state
+            .transactions
+            .get(&reservation_id)
+            .and_then(|transaction| transaction.rollback.as_ref())
+            .and_then(|rollback| {
+                rollback.pending_resolution.as_ref().map(|pending| {
+                    (
+                        rollback.rollback_id.clone(),
+                        pending.rollback_transaction_binding_sha256.clone(),
+                    )
+                })
+            })
+        {
+            return self.append_event(RepairEvent::RollbackResolveComplete {
+                source_reservation_id: reservation_id,
+                rollback_id,
+                rollback_transaction_binding_sha256,
             });
         }
         let record = self
@@ -2675,6 +3059,49 @@ fn protocol_transaction_status_from_record(
     .map_err(|_| RepairVaultStoreError::CorruptStore)
 }
 
+fn protocol_rollback_status_from_record(
+    source_reservation_id: &ReservationId,
+    reservation: &ReservationRecord,
+    transaction: &RepairTransactionRecord,
+    rollback: &RepairRollbackTransactionRecord,
+) -> Result<RepairRollbackTransactionStatusPayload, RepairVaultStoreError> {
+    if transaction.pending_resolution.is_some() {
+        return Err(RepairVaultStoreError::ReconciliationRequired);
+    }
+    let source =
+        protocol_transaction_status_from_record(source_reservation_id, reservation, transaction)?;
+    match &rollback.resolution {
+        Some(resolution) => RepairRollbackTransactionStatusPayload::resolved(
+            rollback.rollback_id.clone(),
+            source,
+            rollback.binding.clone(),
+            resolution.clone(),
+        ),
+        None => RepairRollbackTransactionStatusPayload::pending(
+            rollback.rollback_id.clone(),
+            source,
+            rollback.binding.clone(),
+        ),
+    }
+    .map_err(|_| RepairVaultStoreError::CorruptStore)
+}
+
+fn rollback_transaction_phase(
+    rollback: &RepairRollbackTransactionRecord,
+) -> RepairTransactionPhase {
+    match rollback
+        .resolution
+        .as_ref()
+        .map(RepairRollbackResolution::outcome)
+    {
+        None => RepairTransactionPhase::Pending,
+        Some(RepairRollbackResolutionOutcome::ManualReconciliationRequired) => {
+            RepairTransactionPhase::ManualReconciliationRequired
+        }
+        Some(RepairRollbackResolutionOutcome::RolledBackBefore) => RepairTransactionPhase::Resolved,
+    }
+}
+
 fn protocol_sha256_bytes(bytes: [u8; 32]) -> Result<ProtocolSha256, RepairVaultStoreError> {
     protocol_sha256_str(&encode_hex(&bytes))
 }
@@ -2737,6 +3164,7 @@ fn validate_protocol_transaction_status(
 
 fn transactions_are_consistent(state: &RecoveredState) -> bool {
     let mut unresolved = None;
+    let mut unresolved_rollback = None;
     let mut durable_count = 0_usize;
     for (reservation_id, record) in &state.reservations {
         match &record.phase {
@@ -2759,6 +3187,36 @@ fn transactions_are_consistent(state: &RecoveredState) -> bool {
                 {
                     return false;
                 }
+                if let Some(rollback) = transaction.rollback.as_ref() {
+                    if transaction_phase(transaction) != RepairTransactionPhase::Resolved
+                        || transaction
+                            .resolution
+                            .as_ref()
+                            .map(RepairTransactionResolution::outcome)
+                            != Some(RepairTransactionResolutionOutcome::CommittedAfter)
+                        || rollback.pending_resolution.is_some()
+                        || protocol_rollback_status_from_record(
+                            reservation_id,
+                            record,
+                            transaction,
+                            rollback,
+                        )
+                        .is_err()
+                        || !rollback_write_lease_is_consistent(
+                            reservation_id,
+                            record,
+                            transaction,
+                            rollback,
+                        )
+                    {
+                        return false;
+                    }
+                    if rollback_transaction_phase(rollback) != RepairTransactionPhase::Resolved
+                        && unresolved_rollback.replace(reservation_id).is_some()
+                    {
+                        return false;
+                    }
+                }
                 if transaction_phase(transaction) != RepairTransactionPhase::Resolved
                     && unresolved.replace(reservation_id).is_some()
                 {
@@ -2776,7 +3234,10 @@ fn transactions_are_consistent(state: &RecoveredState) -> bool {
             | ReservationPhase::RetirePending(..) => return false,
         }
     }
-    durable_count == state.transactions.len() && unresolved == state.unresolved_transaction.as_ref()
+    durable_count == state.transactions.len()
+        && unresolved == state.unresolved_transaction.as_ref()
+        && unresolved_rollback == state.unresolved_rollback.as_ref()
+        && !(state.unresolved_transaction.is_some() && state.unresolved_rollback.is_some())
 }
 
 fn write_lease_is_consistent(
@@ -2791,11 +3252,37 @@ fn write_lease_is_consistent(
         resolution: None,
         pending_resolution: None,
         write_lease: None,
+        rollback: None,
     };
     protocol_transaction_status_from_record(reservation_id, reservation, &pending)
         .and_then(|status| {
             let boot_epoch = protocol_sha256_str(&consumed.boot_epoch_sha256)?;
             RepairWriteLeasePayload::consumed(status, boot_epoch)
+                .map_err(|_| RepairVaultStoreError::CorruptJournal)
+        })
+        .is_ok_and(|lease| lease.lease_binding_sha256().as_str() == consumed.lease_binding_sha256)
+}
+
+fn rollback_write_lease_is_consistent(
+    reservation_id: &ReservationId,
+    reservation: &ReservationRecord,
+    transaction: &RepairTransactionRecord,
+    rollback: &RepairRollbackTransactionRecord,
+) -> bool {
+    let Some(consumed) = rollback.write_lease.as_ref() else {
+        return true;
+    };
+    let pending = RepairRollbackTransactionRecord {
+        rollback_id: rollback.rollback_id.clone(),
+        binding: rollback.binding.clone(),
+        resolution: None,
+        pending_resolution: None,
+        write_lease: None,
+    };
+    protocol_rollback_status_from_record(reservation_id, reservation, transaction, &pending)
+        .and_then(|status| {
+            let boot_epoch = protocol_sha256_str(&consumed.boot_epoch_sha256)?;
+            RepairRollbackWriteLeasePayload::consumed(status, boot_epoch)
                 .map_err(|_| RepairVaultStoreError::CorruptJournal)
         })
         .is_ok_and(|lease| lease.lease_binding_sha256().as_str() == consumed.lease_binding_sha256)
@@ -2851,8 +3338,11 @@ fn compaction_events(
     let unresolved_id = transactions
         .iter()
         .find_map(|(reservation_id, transaction)| {
-            (transaction_phase(transaction) != RepairTransactionPhase::Resolved)
-                .then_some(reservation_id)
+            (transaction_phase(transaction) != RepairTransactionPhase::Resolved
+                || transaction.rollback.as_ref().is_some_and(|rollback| {
+                    rollback_transaction_phase(rollback) != RepairTransactionPhase::Resolved
+                }))
+            .then_some(reservation_id)
         });
     for (reservation_id, record) in reservations
         .iter()
@@ -2955,6 +3445,7 @@ fn append_transaction_snapshot(
             resolution: None,
             pending_resolution: None,
             write_lease: None,
+            rollback: None,
         },
     )?;
     let transaction_binding_sha256 = pending.transaction_binding_sha256().as_str().to_owned();
@@ -2966,19 +3457,81 @@ fn append_transaction_snapshot(
             lease_binding_sha256: lease.lease_binding_sha256.clone(),
         });
     }
-    let Some(resolution) = transaction.resolution.as_ref() else {
-        return Ok(());
-    };
-    events.push(RepairEvent::TransactionResolveIntent {
-        reservation_id: reservation_id.clone(),
-        transaction_binding_sha256: transaction_binding_sha256.clone(),
-        expected_phase: RepairTransactionPhase::Pending,
-        resolution: resolution.clone(),
+    if let Some(resolution) = transaction.resolution.as_ref() {
+        events.push(RepairEvent::TransactionResolveIntent {
+            reservation_id: reservation_id.clone(),
+            transaction_binding_sha256: transaction_binding_sha256.clone(),
+            expected_phase: RepairTransactionPhase::Pending,
+            resolution: resolution.clone(),
+        });
+        events.push(RepairEvent::TransactionResolveComplete {
+            reservation_id: reservation_id.clone(),
+            transaction_binding_sha256,
+        });
+    }
+    if let Some(rollback) = transaction.rollback.as_ref() {
+        append_rollback_snapshot(events, reservation_id, record, transaction, rollback)?;
+    }
+    Ok(())
+}
+
+fn append_rollback_snapshot(
+    events: &mut Vec<RepairEvent>,
+    source_reservation_id: &ReservationId,
+    record: &ReservationRecord,
+    transaction: &RepairTransactionRecord,
+    rollback: &RepairRollbackTransactionRecord,
+) -> Result<(), RepairVaultStoreError> {
+    let source =
+        protocol_transaction_status_from_record(source_reservation_id, record, transaction)?;
+    let pending = RepairRollbackTransactionStatusPayload::pending(
+        rollback.rollback_id.clone(),
+        source.clone(),
+        rollback.binding.clone(),
+    )
+    .map_err(|_| RepairVaultStoreError::CorruptJournal)?;
+    events.push(RepairEvent::RollbackBegin {
+        source_reservation_id: source_reservation_id.clone(),
+        source_transaction_binding_sha256: source.transaction_binding_sha256().as_str().to_owned(),
+        rollback_id: rollback.rollback_id.clone(),
+        rollback_transaction_binding_sha256: pending
+            .rollback_transaction_binding_sha256()
+            .as_str()
+            .to_owned(),
+        binding: rollback.binding.clone(),
     });
-    events.push(RepairEvent::TransactionResolveComplete {
-        reservation_id: reservation_id.clone(),
-        transaction_binding_sha256,
-    });
+    if let Some(lease) = rollback.write_lease.as_ref() {
+        events.push(RepairEvent::RollbackWriteLeaseConsume {
+            source_reservation_id: source_reservation_id.clone(),
+            rollback_id: rollback.rollback_id.clone(),
+            rollback_transaction_binding_sha256: pending
+                .rollback_transaction_binding_sha256()
+                .as_str()
+                .to_owned(),
+            boot_epoch_sha256: lease.boot_epoch_sha256.clone(),
+            lease_binding_sha256: lease.lease_binding_sha256.clone(),
+        });
+    }
+    if let Some(resolution) = rollback.resolution.as_ref() {
+        events.push(RepairEvent::RollbackResolveIntent {
+            source_reservation_id: source_reservation_id.clone(),
+            rollback_id: rollback.rollback_id.clone(),
+            rollback_transaction_binding_sha256: pending
+                .rollback_transaction_binding_sha256()
+                .as_str()
+                .to_owned(),
+            expected_phase: RepairTransactionPhase::Pending,
+            resolution: resolution.clone(),
+        });
+        events.push(RepairEvent::RollbackResolveComplete {
+            source_reservation_id: source_reservation_id.clone(),
+            rollback_id: rollback.rollback_id.clone(),
+            rollback_transaction_binding_sha256: pending
+                .rollback_transaction_binding_sha256()
+                .as_str()
+                .to_owned(),
+        });
+    }
     Ok(())
 }
 
@@ -3013,6 +3566,7 @@ fn append_release_snapshot(
                     resolution: Some(resolution.clone()),
                     pending_resolution: None,
                     write_lease: None,
+                    rollback: None,
                 },
             )?;
             events.push(RepairEvent::RetireIntent {
@@ -3035,6 +3589,7 @@ fn validate_compacted_state(
     releases: &BTreeMap<ReservationId, ReleaseTombstone>,
     transactions: &BTreeMap<ReservationId, RepairTransactionRecord>,
     unresolved_transaction: Option<&ReservationId>,
+    unresolved_rollback: Option<&ReservationId>,
     logical_event_clock: u64,
     generation: u64,
     previous_anchor: JournalAnchor,
@@ -3048,6 +3603,7 @@ fn validate_compacted_state(
         || &state.released != releases
         || &state.transactions != transactions
         || state.unresolved_transaction.as_ref() != unresolved_transaction
+        || state.unresolved_rollback.as_ref() != unresolved_rollback
         || state.seen_reservation_ids != expected_seen
         || state.pending.is_some()
         || state.logical_event_clock != logical_event_clock
@@ -3114,6 +3670,7 @@ fn apply_repair_event(
                 || state.pending.is_some()
                 || !state.transactions.is_empty()
                 || state.unresolved_transaction.is_some()
+                || state.unresolved_rollback.is_some()
                 || state.logical_event_clock != 0
                 || state.compaction_generation != 0
                 || state.previous_compaction_anchor.is_some()
@@ -3171,6 +3728,7 @@ fn apply_repair_event(
                 || reserved_capacity_bytes != draft.required_capacity_bytes
                 || state.pending.is_some()
                 || state.unresolved_transaction.is_some()
+                || state.unresolved_rollback.is_some()
                 || state.reservations.len() >= MAX_RESERVATIONS
                 || state.reservations.contains_key(&reservation_id)
                 || state.released.contains_key(&reservation_id)
@@ -3230,7 +3788,10 @@ fn apply_repair_event(
             binding,
         } => {
             binding.validate()?;
-            if state.pending.is_some() || state.unresolved_transaction.is_some() {
+            if state.pending.is_some()
+                || state.unresolved_transaction.is_some()
+                || state.unresolved_rollback.is_some()
+            {
                 return Err(RepairVaultStoreError::CorruptJournal);
             }
             let existing = state
@@ -3281,6 +3842,7 @@ fn apply_repair_event(
                         resolution: None,
                         pending_resolution: None,
                         write_lease: None,
+                        rollback: None,
                     },
                 )
                 .is_some()
@@ -3463,6 +4025,249 @@ fn apply_repair_event(
             }
             state.pending = None;
         }
+        RepairEvent::RollbackBegin {
+            source_reservation_id,
+            source_transaction_binding_sha256,
+            rollback_id,
+            rollback_transaction_binding_sha256,
+            binding,
+        } => {
+            if state.pending.is_some()
+                || state.unresolved_transaction.is_some()
+                || state.unresolved_rollback.is_some()
+                || !valid_sha256(&source_transaction_binding_sha256)
+                || !valid_sha256(&rollback_transaction_binding_sha256)
+            {
+                return Err(RepairVaultStoreError::CorruptJournal);
+            }
+            let reservation = state
+                .reservations
+                .get(&source_reservation_id)
+                .ok_or(RepairVaultStoreError::CorruptJournal)?;
+            if !matches!(reservation.phase, ReservationPhase::Durable(_)) {
+                return Err(RepairVaultStoreError::CorruptJournal);
+            }
+            let transaction = state
+                .transactions
+                .get(&source_reservation_id)
+                .ok_or(RepairVaultStoreError::CorruptJournal)?;
+            if transaction.pending_resolution.is_some() || transaction.rollback.is_some() {
+                return Err(RepairVaultStoreError::CorruptJournal);
+            }
+            let source = protocol_transaction_status_from_record(
+                &source_reservation_id,
+                reservation,
+                transaction,
+            )
+            .map_err(|_| RepairVaultStoreError::CorruptJournal)?;
+            binding
+                .validate_against(&source)
+                .map_err(|_| RepairVaultStoreError::CorruptJournal)?;
+            let pending = RepairRollbackTransactionStatusPayload::pending(
+                rollback_id.clone(),
+                source.clone(),
+                binding.clone(),
+            )
+            .map_err(|_| RepairVaultStoreError::CorruptJournal)?;
+            if source.transaction_binding_sha256().as_str() != source_transaction_binding_sha256
+                || pending.rollback_transaction_binding_sha256().as_str()
+                    != rollback_transaction_binding_sha256
+            {
+                return Err(RepairVaultStoreError::CorruptJournal);
+            }
+            state
+                .transactions
+                .get_mut(&source_reservation_id)
+                .ok_or(RepairVaultStoreError::CorruptJournal)?
+                .rollback = Some(RepairRollbackTransactionRecord {
+                rollback_id,
+                binding,
+                resolution: None,
+                pending_resolution: None,
+                write_lease: None,
+            });
+            state.unresolved_rollback = Some(source_reservation_id);
+        }
+        RepairEvent::RollbackWriteLeaseConsume {
+            source_reservation_id,
+            rollback_id,
+            rollback_transaction_binding_sha256,
+            boot_epoch_sha256,
+            lease_binding_sha256,
+        } => {
+            if state.pending.is_some()
+                || state.unresolved_rollback.as_ref() != Some(&source_reservation_id)
+                || !valid_sha256(&rollback_transaction_binding_sha256)
+                || !valid_sha256(&boot_epoch_sha256)
+                || !valid_sha256(&lease_binding_sha256)
+            {
+                return Err(RepairVaultStoreError::CorruptJournal);
+            }
+            let reservation = state
+                .reservations
+                .get(&source_reservation_id)
+                .ok_or(RepairVaultStoreError::CorruptJournal)?;
+            let transaction = state
+                .transactions
+                .get(&source_reservation_id)
+                .ok_or(RepairVaultStoreError::CorruptJournal)?;
+            let rollback = transaction
+                .rollback
+                .as_ref()
+                .ok_or(RepairVaultStoreError::CorruptJournal)?;
+            if rollback.rollback_id != rollback_id
+                || rollback.resolution.is_some()
+                || rollback.pending_resolution.is_some()
+                || rollback
+                    .write_lease
+                    .as_ref()
+                    .is_some_and(|lease| lease.boot_epoch_sha256 == boot_epoch_sha256)
+            {
+                return Err(RepairVaultStoreError::CorruptJournal);
+            }
+            let status = protocol_rollback_status_from_record(
+                &source_reservation_id,
+                reservation,
+                transaction,
+                rollback,
+            )
+            .map_err(|_| RepairVaultStoreError::CorruptJournal)?;
+            if status.phase() != RepairTransactionPhase::Pending
+                || status.rollback_transaction_binding_sha256().as_str()
+                    != rollback_transaction_binding_sha256
+            {
+                return Err(RepairVaultStoreError::CorruptJournal);
+            }
+            let boot_epoch = protocol_sha256_str(&boot_epoch_sha256)
+                .map_err(|_| RepairVaultStoreError::CorruptJournal)?;
+            let lease = RepairRollbackWriteLeasePayload::consumed(status, boot_epoch)
+                .map_err(|_| RepairVaultStoreError::CorruptJournal)?;
+            if lease.lease_binding_sha256().as_str() != lease_binding_sha256 {
+                return Err(RepairVaultStoreError::CorruptJournal);
+            }
+            state
+                .transactions
+                .get_mut(&source_reservation_id)
+                .and_then(|transaction| transaction.rollback.as_mut())
+                .ok_or(RepairVaultStoreError::CorruptJournal)?
+                .write_lease = Some(ConsumedWriteLease {
+                boot_epoch_sha256,
+                lease_binding_sha256,
+            });
+        }
+        RepairEvent::RollbackResolveIntent {
+            source_reservation_id,
+            rollback_id,
+            rollback_transaction_binding_sha256,
+            expected_phase,
+            resolution,
+        } => {
+            if state.pending.is_some()
+                || state.unresolved_rollback.as_ref() != Some(&source_reservation_id)
+                || !valid_sha256(&rollback_transaction_binding_sha256)
+            {
+                return Err(RepairVaultStoreError::CorruptJournal);
+            }
+            let reservation = state
+                .reservations
+                .get(&source_reservation_id)
+                .ok_or(RepairVaultStoreError::CorruptJournal)?;
+            let transaction = state
+                .transactions
+                .get(&source_reservation_id)
+                .ok_or(RepairVaultStoreError::CorruptJournal)?;
+            let rollback = transaction
+                .rollback
+                .as_ref()
+                .ok_or(RepairVaultStoreError::CorruptJournal)?;
+            let status = protocol_rollback_status_from_record(
+                &source_reservation_id,
+                reservation,
+                transaction,
+                rollback,
+            )
+            .map_err(|_| RepairVaultStoreError::CorruptJournal)?;
+            if rollback.rollback_id != rollback_id
+                || status.rollback_transaction_binding_sha256().as_str()
+                    != rollback_transaction_binding_sha256
+                || status.phase() != expected_phase
+                || expected_phase == RepairTransactionPhase::Resolved
+                || rollback.resolution.as_ref() == Some(&resolution)
+                || rollback.pending_resolution.is_some()
+            {
+                return Err(RepairVaultStoreError::CorruptJournal);
+            }
+            resolution
+                .validate_against(status.source())
+                .map_err(|_| RepairVaultStoreError::CorruptJournal)?;
+            state
+                .transactions
+                .get_mut(&source_reservation_id)
+                .and_then(|transaction| transaction.rollback.as_mut())
+                .ok_or(RepairVaultStoreError::CorruptJournal)?
+                .pending_resolution = Some(PendingRollbackResolution {
+                rollback_transaction_binding_sha256,
+                expected_phase,
+                resolution,
+            });
+            state.pending = Some(source_reservation_id);
+        }
+        RepairEvent::RollbackResolveComplete {
+            source_reservation_id,
+            rollback_id,
+            rollback_transaction_binding_sha256,
+        } => {
+            if state.pending.as_ref() != Some(&source_reservation_id)
+                || state.unresolved_rollback.as_ref() != Some(&source_reservation_id)
+                || !valid_sha256(&rollback_transaction_binding_sha256)
+            {
+                return Err(RepairVaultStoreError::CorruptJournal);
+            }
+            let reservation = state
+                .reservations
+                .get(&source_reservation_id)
+                .ok_or(RepairVaultStoreError::CorruptJournal)?;
+            let transaction = state
+                .transactions
+                .get(&source_reservation_id)
+                .ok_or(RepairVaultStoreError::CorruptJournal)?;
+            let rollback = transaction
+                .rollback
+                .as_ref()
+                .ok_or(RepairVaultStoreError::CorruptJournal)?;
+            let pending = rollback
+                .pending_resolution
+                .as_ref()
+                .ok_or(RepairVaultStoreError::CorruptJournal)?;
+            let status = protocol_rollback_status_from_record(
+                &source_reservation_id,
+                reservation,
+                transaction,
+                rollback,
+            )
+            .map_err(|_| RepairVaultStoreError::CorruptJournal)?;
+            if rollback.rollback_id != rollback_id
+                || pending.rollback_transaction_binding_sha256
+                    != rollback_transaction_binding_sha256
+                || status.rollback_transaction_binding_sha256().as_str()
+                    != rollback_transaction_binding_sha256
+                || status.phase() != pending.expected_phase
+            {
+                return Err(RepairVaultStoreError::CorruptJournal);
+            }
+            let resolution = pending.resolution.clone();
+            let rollback = state
+                .transactions
+                .get_mut(&source_reservation_id)
+                .and_then(|transaction| transaction.rollback.as_mut())
+                .ok_or(RepairVaultStoreError::CorruptJournal)?;
+            rollback.pending_resolution = None;
+            rollback.resolution = Some(resolution);
+            if rollback_transaction_phase(rollback) == RepairTransactionPhase::Resolved {
+                state.unresolved_rollback = None;
+            }
+            state.pending = None;
+        }
         RepairEvent::CancelIntent { reservation_id } => {
             if state.pending.is_some()
                 || !matches!(
@@ -3549,6 +4354,10 @@ fn apply_repair_event(
                 .ok_or(RepairVaultStoreError::CorruptJournal)?;
             if transaction_phase(transaction) != RepairTransactionPhase::Resolved
                 || state.unresolved_transaction.as_ref() == Some(&reservation_id)
+                || transaction.rollback.as_ref().is_some_and(|rollback| {
+                    rollback_transaction_phase(rollback) != RepairTransactionPhase::Resolved
+                })
+                || state.unresolved_rollback.as_ref() == Some(&reservation_id)
             {
                 return Err(RepairVaultStoreError::CorruptJournal);
             }
@@ -3597,6 +4406,10 @@ fn apply_repair_event(
                 .ok_or(RepairVaultStoreError::CorruptJournal)?;
             if transaction_phase(&transaction) != RepairTransactionPhase::Resolved
                 || state.unresolved_transaction.as_ref() == Some(&reservation_id)
+                || transaction.rollback.as_ref().is_some_and(|rollback| {
+                    rollback_transaction_phase(rollback) != RepairTransactionPhase::Resolved
+                })
+                || state.unresolved_rollback.as_ref() == Some(&reservation_id)
             {
                 return Err(RepairVaultStoreError::CorruptJournal);
             }
@@ -5705,6 +6518,33 @@ mod tests {
         .expect("manual resolution")
     }
 
+    fn rollback_binding(source: &RepairTransactionStatusPayload) -> RepairRollbackBindingV1 {
+        RepairRollbackBindingV1::new(
+            source,
+            "P-rollback-test",
+            ProtocolSha256::parse(&"8".repeat(64)).expect("rollback plan digest"),
+            "A-rollback-test",
+            ProtocolSha256::parse(&"9".repeat(64)).expect("rollback approval digest"),
+            2,
+        )
+        .expect("rollback binding")
+    }
+
+    fn rolled_back_resolution(source: &RepairTransactionStatusPayload) -> RepairRollbackResolution {
+        let intent = source
+            .backup()
+            .execution_intent()
+            .expect("committed source intent");
+        RepairRollbackResolution::new(
+            RepairRollbackResolutionOutcome::RolledBackBefore,
+            intent.before_sha256().clone(),
+            intent.before_metadata().canonical_sha256(),
+            true,
+            source,
+        )
+        .expect("verified rollback resolution")
+    }
+
     fn reservation_id(hex_digit: char) -> ReservationId {
         ReservationId::parse(format!("B-{}", hex_digit.to_string().repeat(32)))
             .expect("valid fixed reservation id")
@@ -6064,6 +6904,150 @@ mod tests {
                 .expect("second pending singleton")
                 .transaction()
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn repair_rollback_is_pinned_compacted_boot_scoped_and_recoverable() {
+        let fixture = Fixture::new();
+        let bytes = b"rollback child backup\n";
+        let (pending, selector, metadata, first_lease) = {
+            let mut store = fixture
+                .vault
+                .open_repair_store()
+                .expect("open repair store");
+            let reserved = store
+                .reserve_backup(draft(bytes, 4096))
+                .expect("reserve rollback backup");
+            let durable = store
+                .persist_backup(reserved, binding(bytes), fixture.read_only_source(bytes))
+                .expect("persist rollback backup");
+            let metadata = durable.metadata().clone();
+            let source_pending = store
+                .transaction_status(&RepairTransactionStatusSelector::pending_singleton())
+                .expect("source pending status")
+                .transaction()
+                .expect("source pending transaction")
+                .clone();
+            let source = store
+                .resolve_transaction(&source_pending, committed_resolution(&source_pending))
+                .expect("commit source transaction");
+            let before_begin = store.event_count;
+            let pending = store
+                .begin_rollback_transaction(&source, rollback_binding(&source))
+                .expect("begin rollback child");
+            assert_eq!(pending.phase(), RepairTransactionPhase::Pending);
+            assert_eq!(store.event_count, before_begin + 1);
+            assert_eq!(
+                store
+                    .begin_rollback_transaction(&source, rollback_binding(&source))
+                    .expect("reconcile lost begin response"),
+                pending
+            );
+            assert_eq!(store.event_count, before_begin + 1);
+            assert_eq!(
+                store.retire_backup(&metadata),
+                Err(RepairVaultStoreError::ReconciliationRequired)
+            );
+            let selector = RepairRollbackStatusSelector::for_status(&pending);
+            let first_lease = store
+                .consume_rollback_write_lease(&selector)
+                .expect("consume rollback lease");
+            assert_eq!(first_lease.transaction(), &pending);
+            assert_eq!(
+                store.consume_rollback_write_lease(&selector),
+                Err(RepairVaultStoreError::WriteLeaseConsumed)
+            );
+            store.compact_journal().expect("compact rollback child");
+            (pending, selector, metadata, first_lease)
+        };
+
+        let mut store = fixture
+            .vault
+            .open_repair_store()
+            .expect("reopen compacted rollback child");
+        assert_eq!(
+            store
+                .rollback_transaction_status(&RepairRollbackStatusSelector::pending_singleton())
+                .expect("recovered rollback singleton")
+                .transaction(),
+            Some(&pending)
+        );
+        assert_eq!(
+            store.consume_rollback_write_lease(&selector),
+            Err(RepairVaultStoreError::WriteLeaseConsumed)
+        );
+        store.boot_epoch_sha256 =
+            ProtocolSha256::parse(&"f".repeat(64)).expect("different boot epoch");
+        if store.boot_epoch_sha256 == *first_lease.boot_epoch_sha256() {
+            store.boot_epoch_sha256 =
+                ProtocolSha256::parse(&"e".repeat(64)).expect("alternate boot epoch");
+        }
+        let retry_lease = store
+            .consume_rollback_write_lease(&selector)
+            .expect("consume fresh boot rollback lease");
+        assert_ne!(
+            retry_lease.lease_binding_sha256(),
+            first_lease.lease_binding_sha256()
+        );
+        let resolved = store
+            .resolve_rollback_transaction(&pending, rolled_back_resolution(pending.source()))
+            .expect("resolve verified rollback");
+        assert_eq!(resolved.phase(), RepairTransactionPhase::Resolved);
+        assert!(
+            store
+                .rollback_transaction_status(&RepairRollbackStatusSelector::pending_singleton())
+                .expect("no unresolved rollback")
+                .transaction()
+                .is_none()
+        );
+        store
+            .retire_backup(&metadata)
+            .expect("retire backup only after verified rollback");
+    }
+
+    #[test]
+    fn repair_rollback_rejects_uncommitted_source_and_wrong_selector() {
+        let fixture = Fixture::new();
+        let bytes = b"rollback rejection backup\n";
+        let mut store = fixture
+            .vault
+            .open_repair_store()
+            .expect("open repair store");
+        let reserved = store
+            .reserve_backup(draft(bytes, 4096))
+            .expect("reserve rollback backup");
+        store
+            .persist_backup(reserved, binding(bytes), fixture.read_only_source(bytes))
+            .expect("persist rollback backup");
+        let source_pending = store
+            .transaction_status(&RepairTransactionStatusSelector::pending_singleton())
+            .expect("source pending status")
+            .transaction()
+            .expect("source pending transaction")
+            .clone();
+        let source = store
+            .resolve_transaction(&source_pending, committed_resolution(&source_pending))
+            .expect("commit source transaction");
+        let rollback_binding = rollback_binding(&source);
+        assert_eq!(
+            store.begin_rollback_transaction(&source_pending, rollback_binding.clone()),
+            Err(RepairVaultStoreError::InvalidBinding)
+        );
+        let pending = store
+            .begin_rollback_transaction(&source, rollback_binding)
+            .expect("begin rollback child");
+        let wrong_binding = RepairRollbackStatusSelector::exact(
+            pending.rollback_id().clone(),
+            ProtocolSha256::parse(&"f".repeat(64)).expect("wrong binding digest"),
+        );
+        assert_eq!(
+            store.rollback_transaction_status(&wrong_binding),
+            Err(RepairVaultStoreError::ReservationConflict)
+        );
+        assert_eq!(
+            store.consume_rollback_write_lease(&RepairRollbackStatusSelector::pending_singleton()),
+            Err(RepairVaultStoreError::InvalidBinding)
         );
     }
 
