@@ -1811,7 +1811,12 @@ enum QualifiedFirstLaunchProbeError {
 }
 
 fn create_qualified_first_launch_directory() -> Result<PathBuf, QualifiedFirstLaunchProbeError> {
-    let base = std::env::temp_dir();
+    // macOS commonly exposes its temporary directory through `/var`, which is
+    // a symlink to `/private/var`. SQLite's NOFOLLOW open correctly rejects a
+    // database path containing that symlink, so resolve only the existing base
+    // before atomically creating the private probe directory beneath it.
+    let base = fs::canonicalize(std::env::temp_dir())
+        .map_err(|_| QualifiedFirstLaunchProbeError::PrivateDirectory)?;
     let process_id = process::id();
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
