@@ -43,7 +43,7 @@ VARIANTS_BY_PLATFORM: Final = {
     "linux": frozenset(("appimage", "deb", "rpm")),
     "windows": frozenset(("msi", "nsis")),
     "macos": frozenset(("app", "dmg")),
-    "rescue": frozenset(("qualified-zip", "retail-img-xz")),
+    "rescue": frozenset(("qualified-iso", "qualified-zip", "retail-img-xz")),
 }
 KINDS: Final = frozenset(
     ("package", "image", "checksum", "qualification", "sbom", "signature")

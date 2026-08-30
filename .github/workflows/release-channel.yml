@@ -484,6 +484,65 @@ jobs:
           ):
               raise SystemExit("retail release atomic rename did not preserve identity")
           PY
+          retail_checksum_release="$RUNNER_TEMP/kernaid-channel-assets/KernAid-Rescue-${VERSION}-x86_64-retail.img.xz.sha256"
+          python3 -I -B - \
+            "$qualified/KernAid-Rescue-amd64-retail.img.xz.sha256" \
+            "$retail_release" "$retail_checksum_release" <<'PY'
+          import hashlib
+          from pathlib import Path
+          import re
+          import sys
+
+          source_checksum, image, output = map(Path, sys.argv[1:])
+          match = re.fullmatch(
+              rb"([0-9a-f]{64})  KernAid-Rescue-amd64-retail\.img\.xz\n",
+              source_checksum.read_bytes(),
+          )
+          if match is None:
+              raise SystemExit("qualified retail checksum is not canonical")
+          expected = match.group(1).decode("ascii")
+          digest = hashlib.sha256()
+          with image.open("rb") as stream:
+              for chunk in iter(lambda: stream.read(4 * 1024 * 1024), b""):
+                  digest.update(chunk)
+          if digest.hexdigest() != expected:
+              raise SystemExit("versioned retail image does not match its qualified checksum")
+          output.write_text(f"{expected}  {image.name}\n", encoding="ascii")
+          output.chmod(0o644)
+          PY
+          iso_release="$RUNNER_TEMP/kernaid-channel-assets/KernAid-Rescue-${VERSION}-x86_64.iso"
+          iso_checksum_release="${iso_release}.sha256"
+          python3 -I -B - \
+            "$qualified/KernAid-Rescue-amd64.iso.sha256" \
+            "$qualified/KernAid-Rescue-amd64.iso" \
+            "$iso_release" "$iso_checksum_release" <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+          import re
+          import sys
+
+          source_checksum, source, image, checksum = map(Path, sys.argv[1:])
+          match = re.fullmatch(
+              rb"([0-9a-f]{64})  KernAid-Rescue-amd64\.iso\n",
+              source_checksum.read_bytes(),
+          )
+          if match is None:
+              raise SystemExit("qualified ISO checksum is not canonical")
+          expected = match.group(1).decode("ascii")
+          digest = hashlib.sha256()
+          with source.open("rb") as input_stream, image.open("xb") as output_stream:
+              for chunk in iter(lambda: input_stream.read(4 * 1024 * 1024), b""):
+                  digest.update(chunk)
+                  output_stream.write(chunk)
+              output_stream.flush()
+              os.fsync(output_stream.fileno())
+          if digest.hexdigest() != expected:
+              raise SystemExit("versioned ISO does not match its qualified checksum")
+          image.chmod(0o644)
+          checksum.write_text(f"{expected}  {image.name}\n", encoding="ascii")
+          checksum.chmod(0o644)
+          PY
 
       - name: Build and verify the canonical channel manifest
         env:
@@ -565,6 +624,27 @@ jobs:
               "variant": "qualified-zip",
               "version": version,
           })
+          iso_filename = f"KernAid-Rescue-{version}-x86_64.iso"
+          for kind, filename, media_type in (
+              ("image", iso_filename, "application/octet-stream"),
+              ("checksum", f"{iso_filename}.sha256", "text/plain"),
+          ):
+              artifacts.append({
+                  "architecture": "x86_64",
+                  "component": "rescue",
+                  "kind": kind,
+                  "mediaType": media_type,
+                  "path": str((staging / filename).resolve()),
+                  "platform": "rescue",
+                  "provenance": {
+                      "runAttempt": rescue_attempt,
+                      "runId": rescue_run,
+                      "workflow": ".github/workflows/rescue.yml",
+                  },
+                  "url": f"{base}/{filename}",
+                  "variant": "qualified-iso",
+                  "version": version,
+              })
           retail_filename = f"KernAid-Rescue-{version}-x86_64-retail.img.xz"
           artifacts.append({
               "architecture": "x86_64",
@@ -579,6 +659,23 @@ jobs:
                   "workflow": ".github/workflows/rescue.yml",
               },
               "url": f"{base}/{retail_filename}",
+              "variant": "retail-img-xz",
+              "version": version,
+          })
+          retail_checksum_filename = f"{retail_filename}.sha256"
+          artifacts.append({
+              "architecture": "x86_64",
+              "component": "rescue",
+              "kind": "checksum",
+              "mediaType": "text/plain",
+              "path": str((staging / retail_checksum_filename).resolve()),
+              "platform": "rescue",
+              "provenance": {
+                  "runAttempt": rescue_attempt,
+                  "runId": rescue_run,
+                  "workflow": ".github/workflows/rescue.yml",
+              },
+              "url": f"{base}/{retail_checksum_filename}",
               "variant": "retail-img-xz",
               "version": version,
           })
