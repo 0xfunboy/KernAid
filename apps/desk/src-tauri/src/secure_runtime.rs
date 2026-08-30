@@ -835,7 +835,7 @@ fn open_qualified_first_launch_audit_state(path: &Path) -> AuditRuntimeState {
             #[cfg(test)]
             eprintln!(
                 "KERNAID_QUALIFIED_FIRST_LAUNCH_JOURNAL_FAILURE_V1:{}",
-                qualified_first_launch_journal_error_class(&error)
+                qualified_first_launch_journal_error_class("open", &error)
             );
             return AuditRuntimeState::Blocked;
         }
@@ -845,14 +845,21 @@ fn open_qualified_first_launch_audit_state(path: &Path) -> AuditRuntimeState {
             journal: Box::new(journal),
             head,
         },
-        Err(_) => AuditRuntimeState::Blocked,
+        Err(error) => {
+            #[cfg(test)]
+            eprintln!(
+                "KERNAID_QUALIFIED_FIRST_LAUNCH_JOURNAL_FAILURE_V1:{}",
+                qualified_first_launch_journal_error_class("head", &error)
+            );
+            AuditRuntimeState::Blocked
+        }
     }
 }
 
 #[cfg(test)]
-fn qualified_first_launch_journal_error_class(error: &JournalError) -> &'static str {
-    match error {
-        JournalError::Database(_) => "database",
+fn qualified_first_launch_journal_error_class(stage: &'static str, error: &JournalError) -> String {
+    let class = match error {
+        JournalError::Database(message) => qualified_first_launch_database_error_class(message),
         JournalError::SecretStore(_) => "secret-store",
         JournalError::InvalidPath => "invalid-path",
         JournalError::SymlinkRejected => "symlink",
@@ -870,6 +877,29 @@ fn qualified_first_launch_journal_error_class(error: &JournalError) -> &'static 
         JournalError::ReadLimitExceeded => "read-limit",
         JournalError::UnexpectedHead { .. } => "unexpected-head",
         JournalError::Poisoned => "poisoned",
+    };
+    format!("{stage}:{class}")
+}
+
+#[cfg(test)]
+fn qualified_first_launch_database_error_class(message: &str) -> &'static str {
+    let message = message.to_ascii_lowercase();
+    if message.contains("not authorized") {
+        "database-not-authorized"
+    } else if message.contains("unable to open") || message.contains("cannot open") {
+        "database-open"
+    } else if message.contains("disk i/o") || message.contains("disk io") {
+        "database-io"
+    } else if message.contains("locked") || message.contains("busy") {
+        "database-locked"
+    } else if message.contains("readonly") || message.contains("read-only") {
+        "database-readonly"
+    } else if message.contains("misuse") {
+        "database-misuse"
+    } else if message.contains("unsupported") {
+        "database-unsupported"
+    } else {
+        "database-other"
     }
 }
 
