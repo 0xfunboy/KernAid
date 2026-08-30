@@ -20,7 +20,7 @@ jobs:
         run: |
           test "$(node --version)" = "v24.18.0"
           pnpm install --frozen-lockfile
-          pnpm --filter @kernaid/desk build
+          KERNAID_REPAIR_CANDIDATE=1 pnpm --filter @kernaid/desk build
 
       - name: Install build and VM tooling
         run: |
@@ -84,8 +84,9 @@ jobs:
 
       - name: Validate candidate packaging and shell syntax
         run: |
-          python3 -m unittest \
+          python3 -B -m unittest \
             tools/build-rescue/tests/test_repair_candidate_packaging.py \
+            tools/build-rescue/tests/test_repair_surface_separation.py \
             tools/build-rescue/tests/test_qemu_repair_candidate_smoke.py \
             tools/build-rescue/tests/test_live_image_vault_packaging.py -v
           bash -n tools/build-rescue/build.sh tools/build-rescue/qemu-smoke.sh \
@@ -145,6 +146,7 @@ jobs:
           test -f KernAid-Rescue-amd64-repair-candidate.iso.sha256
           sha256sum --check --strict \
             KernAid-Rescue-amd64-repair-candidate.iso.sha256
+          python3 -I -B tools/build-rescue/verify-repair-surface.py --mode candidate --iso KernAid-Rescue-amd64-repair-candidate.iso
 
       - name: Bind smoke tests to the shared snapshot fixture
         shell: bash

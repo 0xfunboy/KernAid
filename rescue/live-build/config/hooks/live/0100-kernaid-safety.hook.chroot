@@ -9,7 +9,17 @@ repair_candidate_sysusers=/etc/sysusers.d/kernaid-repair-candidate.conf
 repair_candidate_tmpfiles=/usr/lib/tmpfiles.d/kernaid-repair-candidate.conf
 repair_candidate_ui_dropin=/etc/systemd/system/kernaid-ui.service.d/50-kernaid-repair-candidate.conf
 repair_candidate_ready_dropin=/etc/systemd/system/kernaid-ready.service.d/50-kernaid-repair-candidate.conf
+rescue_server=/usr/lib/kernaid/rescue_server.py
+rescue_server_renderer=/usr/lib/kernaid/render_rescue_server.py
+repair_target_handoff=/usr/lib/kernaid/repair_target_handoff.py
+repair_write_socket=/etc/systemd/system/kernaid-rescue-target-write-capability.socket
+repair_write_service=/etc/systemd/system/kernaid-rescue-target-write-capability@.service
 repair_candidate_enabled=0
+
+find /usr/lib/kernaid -xdev -type d -name __pycache__ -prune \
+    -exec rm -rf -- {} +
+find /usr/lib/kernaid -xdev -type f \( -name '*.pyc' -o -name '*.pyo' \) \
+    -delete
 
 chown root:root \
     /etc/systemd/coredump.conf.d \
@@ -29,8 +39,9 @@ chown root:root \
     /usr/lib/kernaid/offline_inspector.py \
     /usr/lib/kernaid/ready-check \
     /usr/lib/kernaid/rescue_application_relay.py \
-    /usr/lib/kernaid/repair_target_handoff.py \
-    /usr/lib/kernaid/rescue_server.py \
+    "$repair_target_handoff" \
+    "$rescue_server" \
+    "$rescue_server_renderer" \
     /usr/lib/kernaid/rescue_ui_session_ready.py \
     /usr/lib/kernaid/matchbox-kbdconfig \
     /usr/lib/kernaid/tauri_network_probe.py \
@@ -39,8 +50,9 @@ chmod 0644 \
     /usr/lib/kernaid/offline_inspector.py \
     /usr/lib/kernaid/ready-check \
     /usr/lib/kernaid/rescue_application_relay.py \
-    /usr/lib/kernaid/repair_target_handoff.py \
-    /usr/lib/kernaid/rescue_server.py \
+    "$repair_target_handoff" \
+    "$rescue_server" \
+    "$rescue_server_renderer" \
     /usr/lib/kernaid/rescue_ui_session_ready.py \
     /usr/lib/kernaid/matchbox-kbdconfig \
     /usr/lib/kernaid/tauri_network_probe.py \
@@ -130,6 +142,83 @@ else
         test ! -L "$candidate_file"
     done
 fi
+
+if [ "$repair_candidate_enabled" = "1" ]; then
+    for write_capability_unit in "$repair_write_socket" "$repair_write_service"; do
+        test -f "$write_capability_unit"
+        test ! -L "$write_capability_unit"
+        chown root:root "$write_capability_unit"
+        chmod 0644 "$write_capability_unit"
+    done
+else
+    rm -f -- "$repair_write_socket" "$repair_write_service"
+    test ! -e "$repair_write_socket"
+    test ! -e "$repair_write_service"
+fi
+
+test -f "$rescue_server"
+test ! -L "$rescue_server"
+test -f "$rescue_server_renderer"
+test ! -L "$rescue_server_renderer"
+rescue_server_mode=stable
+if [ "$repair_candidate_enabled" = "1" ]; then
+    rescue_server_mode=candidate
+fi
+rendered_rescue_server="$(mktemp /usr/lib/kernaid/.rescue_server.py.XXXXXX)"
+trap 'rm -f -- "$rendered_rescue_server"' EXIT HUP INT TERM
+python3 -I -B "$rescue_server_renderer" \
+    --mode "$rescue_server_mode" \
+    --input "$rescue_server" >"$rendered_rescue_server"
+chown root:root "$rendered_rescue_server"
+chmod 0644 "$rendered_rescue_server"
+mv -f "$rendered_rescue_server" "$rescue_server"
+rendered_rescue_server=
+rendered_repair_target_handoff="$(mktemp /usr/lib/kernaid/.repair_target_handoff.py.XXXXXX)"
+trap 'rm -f -- "$rendered_rescue_server" "$rendered_repair_target_handoff"' EXIT HUP INT TERM
+python3 -I -B "$rescue_server_renderer" \
+    --mode "$rescue_server_mode" \
+    --expected-blocks 21 \
+    --input "$repair_target_handoff" >"$rendered_repair_target_handoff"
+chown root:root "$rendered_repair_target_handoff"
+chmod 0644 "$rendered_repair_target_handoff"
+mv -f "$rendered_repair_target_handoff" "$repair_target_handoff"
+rendered_repair_target_handoff=
+rm -f -- "$rescue_server_renderer"
+python3 -I -B -c \
+    'from pathlib import Path; p=Path("/usr/lib/kernaid/rescue_server.py"); compile(p.read_bytes(), str(p), "exec", dont_inherit=True)'
+if [ "$repair_candidate_enabled" = "1" ]; then
+    grep -Fq '/api/rescue/repair' "$rescue_server"
+    grep -Fq 'kernaid.dev/rescue-repair-service/v1alpha1' "$rescue_server"
+    grep -Fq 'repair.fstab.rollback.prepare' "$rescue_server"
+else
+    ! grep -Fq '/api/rescue/repair' "$rescue_server"
+    ! grep -Fq 'kernaid.dev/rescue-repair-service/' "$rescue_server"
+    ! grep -Fq 'repair.fstab.' "$rescue_server"
+fi
+grep -Fq '/api/inventory' "$rescue_server"
+grep -Fq '/api/rescue/inspect-installed-target' "$rescue_server"
+grep -Fq '/api/authorize-observe' "$rescue_server"
+grep -Fq '/api/rescue/provider/openai' "$rescue_server"
+python3 -I -B -c \
+    'from pathlib import Path; p=Path("/usr/lib/kernaid/repair_target_handoff.py"); compile(p.read_bytes(), str(p), "exec", dont_inherit=True)'
+grep -Fq 'target.readonly.acquire' "$repair_target_handoff"
+grep -Fq 'target.recovery.readonly.acquire' "$repair_target_handoff"
+if [ "$repair_candidate_enabled" = "1" ]; then
+    grep -Fq 'target.pending.readwrite.acquire' "$repair_target_handoff"
+    grep -Fq 'target.rollback.pending.readwrite.acquire' "$repair_target_handoff"
+    grep -Fq '/run/kernaid-rescue-target-write-capability.sock' "$repair_target_handoff"
+else
+    ! grep -Fq 'target.pending.readwrite.acquire' "$repair_target_handoff"
+    ! grep -Fq 'target.rollback.pending.readwrite.acquire' "$repair_target_handoff"
+    ! grep -Fq '/run/kernaid-rescue-target-write-capability.sock' "$repair_target_handoff"
+fi
+if find /usr/lib/kernaid -xdev \
+    \( -type d -name __pycache__ -o -type f \( -name '*.pyc' -o -name '*.pyo' \) \) \
+    -print -quit | grep -q .; then
+    echo "Python bytecode leaked into the Rescue payload" >&2
+    exit 1
+fi
+trap - EXIT HUP INT TERM
 
 chown root:root \
     /etc/lightdm/lightdm.conf.d/99-kernaid-rescue-ui.conf \

@@ -56,13 +56,13 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: 24.18.0, cache: pnpm }
       - run: pnpm install --frozen-lockfile
-      - run: pnpm --filter @kernaid/desk build
+      - run: KERNAID_REPAIR_CANDIDATE=0 pnpm --filter @kernaid/desk build
       - name: Install VM tooling
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             build-essential cryptsetup dosfstools e2fsprogs gdisk mtools ntfs-3g \
-            ovmf qemu-system-x86 shellcheck udev util-linux
+            ovmf qemu-system-x86 shellcheck squashfs-tools udev util-linux xorriso
       - name: Harden OVMF firmware ancestry
         run: |
           sudo /usr/bin/python3 -I -B - <<'PY'
@@ -120,7 +120,7 @@ jobs:
             libayatana-appindicator3-dev librsvg2-dev procps
       - name: Validate Rescue image-layout tooling
         run: |
-          python3 -m unittest discover -s tools/build-rescue/tests -p 'test_*.py' -v
+          python3 -B -m unittest discover -s tools/build-rescue/tests -p 'test_*.py' -v
           bash -n tools/build-rescue/build.sh \
             tools/build-rescue/qemu-smoke.sh \
             tools/build-rescue/qemu-with-resident-snapshot.sh \
@@ -286,6 +286,8 @@ jobs:
             -v "$PWD:/workspace" -w /workspace \
             debian:trixie-slim \
             sh -c 'apt-get update && apt-get install -y binutils live-build ca-certificates openssl python3 && install -d -o root -g root -m 0755 /opt/kernaid-codex-root/usr/lib/kernaid && python3 -I tools/build-rescue/fetch-codex-cli.py --lock rescue/codex/codex-cli.lock.json --root /opt/kernaid-codex-root && ./tools/build-rescue/build.sh'
+      - name: Verify stable image excludes repair surfaces
+        run: python3 -I -B tools/build-rescue/verify-repair-surface.py --mode stable --iso KernAid-Rescue-amd64.iso
       - name: Generate the pinned Codex SBOM tranche
         run: |
           python3 -I tools/build-rescue/generate-rescue-sbom.py \

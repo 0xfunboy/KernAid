@@ -19,7 +19,9 @@ import json
 import os
 from pathlib import Path
 import re
+# KERNAID_REPAIR_CANDIDATE_BEGIN
 import secrets
+# KERNAID_REPAIR_CANDIDATE_END
 import socket
 import stat
 import struct
@@ -34,9 +36,9 @@ RECOVERY_OPERATION = "target.recovery.readonly.acquire"
 # Kept as the existing operation alias for callers which only use acquisition.
 OPERATION = ACQUIRE_OPERATION
 SOCKET_PATH = "/run/kernaid-rescue-target-capability.sock"
+# KERNAID_REPAIR_CANDIDATE_BEGIN
 WRITE_SOCKET_PATH = "/run/kernaid-rescue-target-write-capability.sock"
 VAULT_HELPER_SOCKET_PATH = "/run/kernaid-rescue-vault/repair-target-helper-v1.sock"
-PROFILE_READONLY = "readonly"
 PROFILE_WRITE = "write"
 WRITE_OPERATION = "target.pending.readwrite.acquire"
 ROLLBACK_WRITE_OPERATION = "target.rollback.pending.readwrite.acquire"
@@ -44,6 +46,8 @@ VAULT_API_VERSION = "kernaid.dev/rescue-vault/v1alpha1"
 VAULT_ROLLBACK_API_VERSION = "kernaid.dev/rescue-vault/v1alpha2"
 VAULT_WRITE_OPERATION = "repair.transaction.write-lease.consume"
 VAULT_ROLLBACK_WRITE_OPERATION = "repair.rollback.write-lease.consume"
+# KERNAID_REPAIR_CANDIDATE_END
+PROFILE_READONLY = "readonly"
 TARGET_MODULE_PATH = "/usr/lib/kernaid/rescue_server.py"
 PASSWD_PATH = "/etc/passwd"
 REPAIR_BROKER_NAME = b"kernaid-repair"
@@ -68,6 +72,7 @@ BUNDLE_DESCRIPTOR_TYPES = (
     "uuid-inventory-memfd-sealed",
     "selected-target-ext4-mount-readonly-detached",
 )
+# KERNAID_REPAIR_CANDIDATE_BEGIN
 WRITE_CAPABILITY = "linux-ext4-direct-leaf-readwrite-mount-v1"
 ROLLBACK_WRITE_CAPABILITY = "fstab-rollback-direct-leaf-rw-v1"
 WRITE_DESCRIPTOR_TYPE = "selected-target-ext4-mount-readwrite-detached"
@@ -76,6 +81,7 @@ VAULT_ROLLBACK_WRITE_CAPABILITY = "fstab-rollback-direct-leaf-rw-v1"
 REPAIR_ACTION = "linux.fstab.disable-missing-uuid.v1"
 ROLLBACK_ACTION = "linux.fstab.restore"
 REPAIR_RESOURCE = "rescue:selected-linux-root:etc/fstab"
+# KERNAID_REPAIR_CANDIDATE_END
 BLOCK_INVENTORY_COLLECTOR = "linux.block.inventory"
 
 # Linux UAPI values from linux/memfd.h, linux/fcntl.h and linux/mount.h.  The
@@ -104,7 +110,9 @@ MOUNT_ATTR_NOEXEC = 0x00000008
 REQUIRED_MOUNT_ATTRIBUTES = (
     MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV | MOUNT_ATTR_NOEXEC
 )
+# KERNAID_REPAIR_CANDIDATE_BEGIN
 REQUIRED_WRITE_MOUNT_ATTRIBUTES = MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV | MOUNT_ATTR_NOEXEC
+# KERNAID_REPAIR_CANDIDATE_END
 EXT4_SUPER_MAGIC = 0xEF53
 BLKSSZGET = 0x1268
 BLKGETSIZE64 = 0x80081272
@@ -120,12 +128,14 @@ _EPHEMERAL_ID = {
 }
 _TARGET_FINGERPRINT = re.compile(r"^sha256:[0-9a-f]{64}$")
 _RECOVERY_FINGERPRINT = re.compile(r"^recovery:[0-9a-f]{64}$")
+# KERNAID_REPAIR_CANDIDATE_BEGIN
 _RESERVATION_ID = re.compile(r"^B-[0-9a-f]{32}$")
 _ROLLBACK_ID = re.compile(r"^RB-[0-9a-f]{32}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _OPAQUE_ID = re.compile(r"^[A-Za-z0-9_:.\-]{1,128}$")
 _PREFIXED_ID = re.compile(r"^[SPA]-[A-Za-z0-9\-]{1,126}$")
 _VAULT_ID = re.compile(r"^V-[0-9a-f]{32}$")
+# KERNAID_REPAIR_CANDIDATE_END
 _MAJOR_MINOR = re.compile(r"^(0|[1-9][0-9]{0,9}):(0|[1-9][0-9]{0,9})$")
 _SAFE_DEVNAME = re.compile(r"^[A-Za-z0-9._+-]{1,128}$")
 _UUID = re.compile(r"^[0-9a-f-]{1,128}$")
@@ -164,6 +174,7 @@ def _reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return result
 
 
+# KERNAID_REPAIR_CANDIDATE_BEGIN
 def _profile() -> str:
     value = os.environ.get("KERNAID_TARGET_HANDOFF_PROFILE", PROFILE_READONLY)
     if value not in {PROFILE_READONLY, PROFILE_WRITE}:
@@ -171,6 +182,7 @@ def _profile() -> str:
     return value
 
 
+# KERNAID_REPAIR_CANDIDATE_END
 def _decode_request(payload: bytes, profile: str = PROFILE_READONLY) -> dict[str, str]:
     try:
         value = json.loads(
@@ -191,12 +203,15 @@ def _decode_request(payload: bytes, profile: str = PROFILE_READONLY) -> dict[str
         or operation not in {
             ACQUIRE_OPERATION,
             RECOVERY_OPERATION,
+            # KERNAID_REPAIR_CANDIDATE_BEGIN
             WRITE_OPERATION,
             ROLLBACK_WRITE_OPERATION,
+            # KERNAID_REPAIR_CANDIDATE_END
         }
     ):
         raise HandoffFailure("INVALID_REQUEST")
     common = {"apiVersion", "requestId", "operation"}
+    # KERNAID_REPAIR_CANDIDATE_BEGIN
     if operation in {WRITE_OPERATION, ROLLBACK_WRITE_OPERATION}:
         required = (
             {"reservationId", "transactionBindingSha256"}
@@ -230,6 +245,7 @@ def _decode_request(payload: bytes, profile: str = PROFILE_READONLY) -> dict[str
         return {"apiVersion": API_VERSION, "requestId": request_id,
                 "operation": operation, "reservationId": reservation,
                 "transactionBindingSha256": binding}
+    # KERNAID_REPAIR_CANDIDATE_END
     if profile != PROFILE_READONLY:
         raise HandoffFailure("INVALID_REQUEST", request_id, operation)
     if operation == RECOVERY_OPERATION:
@@ -638,11 +654,16 @@ def _assert_block_fd(
     metadata = os.fstat(descriptor)
     flags = fcntl.fcntl(descriptor, fcntl.F_GETFL)
     fd_flags = fcntl.fcntl(descriptor, fcntl.F_GETFD)
+    expected_access = os.O_RDONLY
+    # KERNAID_REPAIR_CANDIDATE_BEGIN
+    if writable:
+        expected_access = os.O_RDWR
+    # KERNAID_REPAIR_CANDIDATE_END
     if (
         not stat.S_ISBLK(metadata.st_mode)
         or os.major(metadata.st_rdev) != major
         or os.minor(metadata.st_rdev) != minor
-        or flags & os.O_ACCMODE != (os.O_RDWR if writable else os.O_RDONLY)
+        or flags & os.O_ACCMODE != expected_access
         or not flags & os.O_NONBLOCK
         or not fd_flags & fcntl.FD_CLOEXEC
     ):
@@ -789,10 +810,14 @@ def _open_bound_block_device(
                     matches.append(entry.name)
         if len(matches) != 1:
             raise HandoffFailure("DEVICE_UNAVAILABLE")
+        access_mode = os.O_RDONLY
+        # KERNAID_REPAIR_CANDIDATE_BEGIN
+        if writable:
+            access_mode = os.O_RDWR
+        # KERNAID_REPAIR_CANDIDATE_END
         descriptor = os.open(
             matches[0],
-            (os.O_RDWR if writable else os.O_RDONLY)
-            | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+            access_mode | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
             dir_fd=dev_fd,
         )
         try:
@@ -1133,6 +1158,7 @@ def _create_detached_ext4_mount(
     return descriptor
 
 
+# KERNAID_REPAIR_CANDIDATE_BEGIN
 def _configured_ext4_write_context(api: _GlibcMountApi, leaf_descriptor: int) -> int:
     context = _checked_mount_call(api.fsopen, b"ext4", FSOPEN_CLOEXEC)
     try:
@@ -1509,6 +1535,8 @@ def _validate_rollback_write_lease(
     }
 
 
+# KERNAID_REPAIR_CANDIDATE_END
+# KERNAID_REPAIR_CANDIDATE_BEGIN
 def _fresh_request_id() -> str:
     raw = secrets.token_hex(16)
     return f"R-{raw[:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:]}"
@@ -1635,6 +1663,7 @@ def _consume_rollback_write_lease(
     raise HandoffFailure("INTERNAL")
 
 
+# KERNAID_REPAIR_CANDIDATE_END
 def _close_descriptors(descriptors: list[int]) -> None:
     while descriptors:
         descriptor = descriptors.pop()
@@ -1853,12 +1882,15 @@ class RepairTargetHandoff:
         self.targets = _load_target_module() if targets is None else targets
 
     def acquire(self, request: dict[str, str]) -> tuple[dict[str, object], list[int]]:
+        # KERNAID_REPAIR_CANDIDATE_BEGIN
         if request.get("operation") in {WRITE_OPERATION, ROLLBACK_WRITE_OPERATION}:
             return self._acquire_write(request)
+        # KERNAID_REPAIR_CANDIDATE_END
         if request.get("operation") == RECOVERY_OPERATION:
             return self._recover(request)
         return self._acquire_selected(request)
 
+    # KERNAID_REPAIR_CANDIDATE_BEGIN
     def _acquire_write(
         self, request: dict[str, str]
     ) -> tuple[dict[str, object], list[int]]:
@@ -1985,6 +2017,7 @@ class RepairTargetHandoff:
             )
         return response, descriptors
 
+    # KERNAID_REPAIR_CANDIDATE_END
     def _acquire_selected(
         self, request: dict[str, str]
     ) -> tuple[dict[str, object], list[int]]:
@@ -2373,6 +2406,7 @@ def _send_record(
         )
     success = response.get("outcome") == "ok"
     if success:
+        # KERNAID_REPAIR_CANDIDATE_BEGIN
         if response.get("capability") in {
             WRITE_CAPABILITY,
             ROLLBACK_WRITE_CAPABILITY,
@@ -2381,6 +2415,7 @@ def _send_record(
                     or len(descriptors) != 1):
                 raise HandoffFailure("INTERNAL", response.get("requestId"))
             return _send_encoded_record(connection, encoded, descriptors)
+        # KERNAID_REPAIR_CANDIDATE_END
         claims = _validate_physical_parent_claims_wire(
             response.get("physicalParentClaims")
         )
@@ -2451,18 +2486,26 @@ def serve_connection(
             in {
                 ACQUIRE_OPERATION,
                 RECOVERY_OPERATION,
+                # KERNAID_REPAIR_CANDIDATE_BEGIN
                 WRITE_OPERATION,
                 ROLLBACK_WRITE_OPERATION,
+                # KERNAID_REPAIR_CANDIDATE_END
             }
             else request.get("operation") if request is not None else None
         )
         if operation not in {
             ACQUIRE_OPERATION,
             RECOVERY_OPERATION,
+            # KERNAID_REPAIR_CANDIDATE_BEGIN
             WRITE_OPERATION,
             ROLLBACK_WRITE_OPERATION,
+            # KERNAID_REPAIR_CANDIDATE_END
         }:
-            operation = WRITE_OPERATION if profile == PROFILE_WRITE else ACQUIRE_OPERATION
+            operation = ACQUIRE_OPERATION
+            # KERNAID_REPAIR_CANDIDATE_BEGIN
+            if profile == PROFILE_WRITE:
+                operation = WRITE_OPERATION
+            # KERNAID_REPAIR_CANDIDATE_END
         response: dict[str, object] = {
             "apiVersion": API_VERSION,
             "requestId": error.request_id,
@@ -2496,8 +2539,13 @@ def serve_connection(
 
 
 def _systemd_connection(profile: str) -> socket.socket:
-    expected_name = "target-write-capability" if profile == PROFILE_WRITE else "target-capability"
-    expected_path = WRITE_SOCKET_PATH if profile == PROFILE_WRITE else SOCKET_PATH
+    expected_name = "target-capability"
+    expected_path = SOCKET_PATH
+    # KERNAID_REPAIR_CANDIDATE_BEGIN
+    if profile == PROFILE_WRITE:
+        expected_name = "target-write-capability"
+        expected_path = WRITE_SOCKET_PATH
+    # KERNAID_REPAIR_CANDIDATE_END
     if (
         os.environ.get("LISTEN_PID") != str(os.getpid())
         or os.environ.get("LISTEN_FDS") != "1"
@@ -2522,16 +2570,23 @@ def main() -> int:
     if os.geteuid() != 0 or sys.argv != [sys.argv[0]]:
         return 1
     try:
+        profile = PROFILE_READONLY
+        # KERNAID_REPAIR_CANDIDATE_BEGIN
         profile = _profile()
+        # KERNAID_REPAIR_CANDIDATE_END
         expected_uid = _repair_broker_uid()
         connection = _systemd_connection(profile)
     except (RuntimeError, OSError):
         return 1
     with connection:
         connection.settimeout(IO_TIMEOUT_SECONDS)
+        expected_local = SOCKET_PATH
+        # KERNAID_REPAIR_CANDIDATE_BEGIN
+        if profile == PROFILE_WRITE:
+            expected_local = WRITE_SOCKET_PATH
+        # KERNAID_REPAIR_CANDIDATE_END
         serve_connection(connection, expected_uid,
-                         expected_local=(WRITE_SOCKET_PATH if profile == PROFILE_WRITE else SOCKET_PATH),
-                         profile=profile)
+                         expected_local=expected_local, profile=profile)
     return 0
 
 

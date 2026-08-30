@@ -78,7 +78,7 @@ import {
   type InventoryCategory,
 } from "./rescue-ui";
 import { FixtureRepairLabPanel } from "./fixture-repair-lab-panel";
-import { RescueRepairPanel } from "./rescue-repair-panel";
+import { RescueRepairPanel } from "./rescue-repair-entry";
 import "./style.css";
 
 type Workflow = "Observe" | "Diagnose" | "Plan" | "Verify";

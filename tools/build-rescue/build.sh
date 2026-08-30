@@ -58,6 +58,10 @@ case "$repair_candidate" in
     exit 2
     ;;
 esac
+repair_surface_mode=stable
+if [[ "$repair_candidate" = "1" ]]; then
+  repair_surface_mode=candidate
+fi
 
 for command in lb python3; do
   command -v "$command" >/dev/null || { echo "Missing required command: $command" >&2; exit 2; }
@@ -330,6 +334,9 @@ if [[ "${KERNAID_DESK_PREBUILT:-0}" != "1" ]]; then
   pnpm --filter @kernaid/desk build
 fi
 test -f apps/desk/dist/index.html || { echo "Desk production bundle is missing" >&2; exit 2; }
+python3 -I -B "$repo_dir/tools/build-rescue/verify-repair-surface.py" \
+  --mode "$repair_surface_mode" \
+  --desk-root "$repo_dir/apps/desk/dist"
 
 install -d "$build_dir/config/includes.chroot/opt/kernaid/desk"
 rm -rf "$build_dir/config/includes.chroot/opt/kernaid/desk/assets"

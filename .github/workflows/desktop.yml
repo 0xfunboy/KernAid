@@ -27,6 +27,8 @@ on:
 permissions: { contents: read }
 jobs:
   build:
+    env:
+      KERNAID_REPAIR_CANDIDATE: "0"
     strategy:
       fail-fast: false
       matrix:
@@ -238,3 +240,5 @@ jobs:
           args: ${{ matrix.args }}
           uploadWorkflowArtifacts: true
           workflowArtifactNamePattern: kernaid-desk-[platform]-[arch]-[bundle]
+      - name: Verify the packaged Desk excludes repair UI
+        run: node apps/desk/scripts/verify-stable-dist.mjs

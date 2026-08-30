@@ -68,6 +68,7 @@ PROVIDER_SOCKET_TIMEOUT_SECONDS = 140
 PROVIDER_SOCKET = "/run/kernaid-rescue-openai.sock"
 MAX_PROVIDER_REQUEST_FRAME_BYTES = 96 * 1024
 MAX_PROVIDER_RESPONSE_FRAME_BYTES = 64 * 1024
+# KERNAID_REPAIR_CANDIDATE_BEGIN
 REPAIR_API_VERSION = "kernaid.dev/rescue-repair-service/v1alpha1"
 ROLLBACK_API_VERSION = "kernaid.dev/rescue-repair-service/v1alpha2"
 REPAIR_SOCKET = "/run/kernaid-rescue-repair.sock"
@@ -131,6 +132,7 @@ REPAIR_PREPARE_FAILURE_STAGES = {
     "admission-internal",
 }
 REPAIR_RELAY_LOCK = threading.Lock()
+# KERNAID_REPAIR_CANDIDATE_END
 APPLICATION_HTTP_API_VERSION = "kernaid.dev/rescue-application-http/v1alpha1"
 APPLICATION_RELAY_API_VERSION = "kernaid.dev/rescue-application-relay/v1alpha1"
 APPLICATION_RELAY_SOCKET = "/run/kernaid-rescue-application.sock"
@@ -390,6 +392,7 @@ class ProviderRelayError(Exception):
         self.status = status
 
 
+# KERNAID_REPAIR_CANDIDATE_BEGIN
 class RepairRelayError(Exception):
     """A fixed candidate-repair relay failure safe for the local UI."""
 
@@ -399,6 +402,7 @@ class RepairRelayError(Exception):
         self.status = status
 
 
+# KERNAID_REPAIR_CANDIDATE_END
 class ApplicationRelayError(Exception):
     """A closed Application/vault error safe for the local HTTP response."""
 
@@ -966,6 +970,7 @@ def relay_openai_provider(frame: bytes, deadline: float) -> bytes:
             PROVIDER_RELAY_LOCK.release()
 
 
+# KERNAID_REPAIR_CANDIDATE_BEGIN
 def _repair_candidate_available() -> bool:
     try:
         marker = os.stat(REPAIR_CANDIDATE_MARKER, follow_symlinks=False)
@@ -1437,6 +1442,7 @@ def relay_repair_request(
         REPAIR_RELAY_LOCK.release()
 
 
+# KERNAID_REPAIR_CANDIDATE_END
 def _remaining_seconds(deadline: float | None) -> float | None:
     """Return the remaining monotonic budget, or fail once it is exhausted."""
     if deadline is None:
@@ -3077,6 +3083,7 @@ class RescueHandler(SimpleHTTPRequestHandler):
         }
         self._send_application_json(error.status, body)
 
+    # KERNAID_REPAIR_CANDIDATE_BEGIN
     def _send_repair_json(self, status: int, value: dict[str, object]) -> None:
         body = json.dumps(
             value, ensure_ascii=True, sort_keys=True, separators=(",", ":")
@@ -3197,6 +3204,7 @@ class RescueHandler(SimpleHTTPRequestHandler):
             self._send_repair_failure(error)
         return True
 
+    # KERNAID_REPAIR_CANDIDATE_END
     def _application_post_headers(self) -> bool:
         hosts = self.headers.get_all("Host", [])
         origins = self.headers.get_all("Origin", [])
@@ -3560,8 +3568,10 @@ class RescueHandler(SimpleHTTPRequestHandler):
     def do_POST(self) -> None:
         if self._handle_application_post():
             return
+        # KERNAID_REPAIR_CANDIDATE_BEGIN
         if self._handle_repair_post():
             return
+        # KERNAID_REPAIR_CANDIDATE_END
         authorization_deadline = (
             self.authorization_deadline
             if self.path == "/api/authorize-observe"
