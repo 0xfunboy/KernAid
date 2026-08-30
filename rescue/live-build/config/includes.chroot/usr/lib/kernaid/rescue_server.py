@@ -69,6 +69,7 @@ PROVIDER_SOCKET = "/run/kernaid-rescue-openai.sock"
 MAX_PROVIDER_REQUEST_FRAME_BYTES = 96 * 1024
 MAX_PROVIDER_RESPONSE_FRAME_BYTES = 64 * 1024
 REPAIR_API_VERSION = "kernaid.dev/rescue-repair-service/v1alpha1"
+ROLLBACK_API_VERSION = "kernaid.dev/rescue-repair-service/v1alpha2"
 REPAIR_SOCKET = "/run/kernaid-rescue-repair.sock"
 REPAIR_CANDIDATE_MARKER = "/usr/lib/kernaid/repair-candidate-image-v1"
 MAX_REPAIR_FRAME_BYTES = 4 * 1024
@@ -83,11 +84,18 @@ REPAIR_SCAN_FINGERPRINT = re.compile(r"^scan:[0-9a-f]{64}$")
 REPAIR_TARGET_ID = re.compile(r"^target:[0-9a-f]{64}$")
 REPAIR_RESERVATION_ID = re.compile(r"^B-[A-Za-z0-9-]{1,126}$")
 REPAIR_BACKUP_LOCATOR = re.compile(r"^vault://repair/B-[0-9a-f]{32}$")
+REPAIR_ROLLBACK_ID = re.compile(r"^RB-[0-9a-f]{32}$")
 REPAIR_OPERATIONS = {
     "repair.status",
     "repair.fstab.prepare",
     "repair.fstab.approve",
     "repair.fstab.cancel",
+}
+ROLLBACK_OPERATIONS = {
+    "repair.fstab.rollback.status",
+    "repair.fstab.rollback.prepare",
+    "repair.fstab.rollback.approve",
+    "repair.fstab.rollback.cancel",
 }
 REPAIR_STATES = {
     "idle",
@@ -111,6 +119,7 @@ REPAIR_ERROR_TOKENS = {
     "cancel-failed",
     "execution-failed",
     "recovery-unavailable",
+    "rollback-unavailable",
     "internal",
 }
 REPAIR_PREPARE_FAILURE_STAGES = {
@@ -983,18 +992,99 @@ def _repair_id(value: object, prefix: str) -> bool:
     )
 
 
+def _rollback_source(value: object) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == {"reservationId", "transactionBindingSha256"}
+        and isinstance(value.get("reservationId"), str)
+        and REPAIR_BACKUP_LOCATOR.fullmatch(
+            f"vault://repair/{value['reservationId']}"
+        )
+        is not None
+        and isinstance(value.get("transactionBindingSha256"), str)
+        and REPAIR_SHA256.fullmatch(str(value["transactionBindingSha256"]))
+        is not None
+    )
+
+
 def _validate_repair_request(value: dict[str, object]) -> None:
     operation = value.get("operation")
+    version = value.get("apiVersion")
     if (
-        value.get("apiVersion") != REPAIR_API_VERSION
-        or not isinstance(value.get("requestId"), str)
+        not isinstance(value.get("requestId"), str)
         or REPAIR_REQUEST_ID.fullmatch(str(value["requestId"])) is None
         or not isinstance(operation, str)
-        or operation not in REPAIR_OPERATIONS
+        or not (
+            version == REPAIR_API_VERSION
+            and operation in REPAIR_OPERATIONS
+            or version == ROLLBACK_API_VERSION
+            and operation in ROLLBACK_OPERATIONS
+        )
     ):
         raise RepairRelayError("invalid-request", 400)
-    if operation == "repair.status":
+    if operation in {"repair.status", "repair.fstab.rollback.status"}:
         if set(value) != {"apiVersion", "requestId", "operation"}:
+            raise RepairRelayError("invalid-request", 400)
+        return
+    if operation == "repair.fstab.rollback.prepare":
+        if (
+            set(value) != {"apiVersion", "requestId", "operation", "source"}
+            or not _rollback_source(value.get("source"))
+        ):
+            raise RepairRelayError("invalid-request", 400)
+        return
+    if operation == "repair.fstab.rollback.cancel":
+        if (
+            set(value)
+            != {
+                "apiVersion",
+                "requestId",
+                "operation",
+                "preparedId",
+                "rollbackId",
+                "planHash",
+                "source",
+            }
+            or not _repair_id(value.get("preparedId"), "Q")
+            or not isinstance(value.get("rollbackId"), str)
+            or REPAIR_ROLLBACK_ID.fullmatch(str(value["rollbackId"])) is None
+            or not isinstance(value.get("planHash"), str)
+            or REPAIR_SHA256.fullmatch(str(value["planHash"])) is None
+            or not _rollback_source(value.get("source"))
+        ):
+            raise RepairRelayError("invalid-request", 400)
+        return
+    if operation == "repair.fstab.rollback.approve":
+        if (
+            set(value)
+            != {
+                "apiVersion",
+                "requestId",
+                "operation",
+                "preparedId",
+                "rollbackId",
+                "sessionId",
+                "planId",
+                "planHash",
+                "source",
+                "approvalId",
+                "approvalSequence",
+                "typedConfirmation",
+            }
+            or not _repair_id(value.get("preparedId"), "Q")
+            or not isinstance(value.get("rollbackId"), str)
+            or REPAIR_ROLLBACK_ID.fullmatch(str(value["rollbackId"])) is None
+            or not _repair_id(value.get("sessionId"), "S")
+            or not _repair_id(value.get("planId"), "P")
+            or not _repair_id(value.get("approvalId"), "A")
+            or not isinstance(value.get("planHash"), str)
+            or REPAIR_SHA256.fullmatch(str(value["planHash"])) is None
+            or not _rollback_source(value.get("source"))
+            or not isinstance(value.get("approvalSequence"), int)
+            or isinstance(value.get("approvalSequence"), bool)
+            or not 2 <= int(value["approvalSequence"]) <= MAX_AUDIT_SEQUENCE
+            or value.get("typedConfirmation") != "RIPRISTINA FSTAB ORIGINALE"
+        ):
             raise RepairRelayError("invalid-request", 400)
         return
     if operation == "repair.fstab.prepare":
@@ -1109,7 +1199,55 @@ def _validate_repair_prepared_detail(value: object) -> bool:
     )
 
 
-def _validate_repair_terminal_detail(value: object, state: str) -> bool:
+def _validate_rollback_prepared_detail(value: object) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+        "kind",
+        "preparedId",
+        "rollbackId",
+        "sessionId",
+        "planId",
+        "planHash",
+        "targetFingerprint",
+        "source",
+        "resourceId",
+        "backupLocator",
+        "actionId",
+        "risk",
+        "nextApprovalSequence",
+        "confirmationRequired",
+    }:
+        return False
+    source = value.get("source")
+    return (
+        value.get("kind") == "fstab-rollback-prepared"
+        and _repair_id(value.get("preparedId"), "Q")
+        and isinstance(value.get("rollbackId"), str)
+        and REPAIR_ROLLBACK_ID.fullmatch(str(value["rollbackId"])) is not None
+        and _repair_id(value.get("sessionId"), "S")
+        and _repair_id(value.get("planId"), "P")
+        and all(
+            isinstance(value.get(field), str)
+            and REPAIR_SHA256.fullmatch(str(value[field])) is not None
+            for field in ("planHash", "targetFingerprint")
+        )
+        and _rollback_source(source)
+        and value.get("resourceId") == "rescue:selected-linux-root:etc/fstab"
+        and isinstance(value.get("backupLocator"), str)
+        and isinstance(source, dict)
+        and value.get("backupLocator")
+        == f"vault://repair/{source.get('reservationId')}"
+        and value.get("actionId") == "linux.fstab.restore"
+        and value.get("risk") == "R2"
+        and isinstance(value.get("nextApprovalSequence"), int)
+        and not isinstance(value.get("nextApprovalSequence"), bool)
+        and 2 <= int(value["nextApprovalSequence"]) <= MAX_AUDIT_SEQUENCE
+        and value.get("confirmationRequired") == "RIPRISTINA FSTAB ORIGINALE"
+    )
+
+
+def _validate_repair_terminal_detail(
+    value: object, state: str, rollback_api: bool = False
+) -> bool:
     if not isinstance(value, dict) or set(value) != {
         "kind",
         "terminalOutcome",
@@ -1122,7 +1260,10 @@ def _validate_repair_terminal_detail(value: object, state: str) -> bool:
     outcome = value.get("terminalOutcome")
     expected: dict[str, set[str]] = {
         "succeeded": {"committed"},
-        "restored": {"closed-before-unchanged", "closed-before-restored"},
+        "restored": {
+            "closed-before-unchanged",
+            "closed-before-restored",
+        },
         "cancelled": {"cancelled"},
         "manual-reconciliation-required": {"manual-reconciliation-required"},
         "failed": {"failed"},
@@ -1130,6 +1271,8 @@ def _validate_repair_terminal_detail(value: object, state: str) -> bool:
     reservation = value.get("reservationId")
     binding = value.get("transactionBindingSha256")
     prepare_failure_stage = value.get("prepareFailureStage")
+    if rollback_api:
+        expected["restored"].add("rolled-back-original")
     return (
         value.get("kind") == "terminal"
         and isinstance(outcome, str)
@@ -1176,7 +1319,7 @@ def _validate_repair_response(
         expected_fields.add("error")
     if (
         set(value) != expected_fields
-        or value.get("apiVersion") != REPAIR_API_VERSION
+        or value.get("apiVersion") != request.get("apiVersion")
         or value.get("requestId") != request.get("requestId")
         or value.get("operation") != request.get("operation")
         or outcome not in {"ok", "error"}
@@ -1196,7 +1339,11 @@ def _validate_repair_response(
         raise RepairRelayError("invalid-response", 502)
     detail = value.get("detail")
     if state == "prepared":
-        valid_detail = _validate_repair_prepared_detail(detail)
+        valid_detail = (
+            _validate_rollback_prepared_detail(detail)
+            if request.get("apiVersion") == ROLLBACK_API_VERSION
+            else _validate_repair_prepared_detail(detail)
+        )
     elif state in {
         "succeeded",
         "restored",
@@ -1204,7 +1351,11 @@ def _validate_repair_response(
         "manual-reconciliation-required",
         "failed",
     }:
-        valid_detail = _validate_repair_terminal_detail(detail, state)
+        valid_detail = _validate_repair_terminal_detail(
+            detail,
+            state,
+            request.get("apiVersion") == ROLLBACK_API_VERSION,
+        )
     else:
         valid_detail = detail is None
     if not valid_detail:

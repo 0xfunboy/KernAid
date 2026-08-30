@@ -47,6 +47,15 @@ pub const RESCUE_FSTAB_VALIDATION_ID: &str = "linux.boot.validate-fstab";
 /// The only rollback declaration accepted for the candidate.
 #[cfg(feature = "rescue-fstab-production-candidate")]
 pub const RESCUE_FSTAB_ROLLBACK_ID: &str = "linux.fstab.restore";
+/// The source receipt is the sole evidence admitted by the post-commit rollback.
+#[cfg(feature = "rescue-fstab-production-candidate")]
+pub const RESCUE_FSTAB_ROLLBACK_EVIDENCE_ID: &str = "E-RESCUE-FSTAB-SOURCE-RECEIPT";
+/// A rollback may start only from an authenticated committed source receipt.
+#[cfg(feature = "rescue-fstab-production-candidate")]
+pub const RESCUE_FSTAB_ROLLBACK_PREFLIGHT_ID: &str = "linux.fstab.rollback-source.committed";
+/// The rollback consumes the source transaction's already durable Vault backup.
+#[cfg(feature = "rescue-fstab-production-candidate")]
+pub const RESCUE_FSTAB_ROLLBACK_BACKUP: &str = "source-vault-backup";
 /// Canonical evidence order bound into the one-step candidate plan.
 #[cfg(feature = "rescue-fstab-production-candidate")]
 pub const RESCUE_FSTAB_EVIDENCE_IDS: [&str; 2] = ["E-LINUX-FSTAB", "E-LINUX-LSBLK"];
@@ -199,6 +208,50 @@ pub fn validate_rescue_fstab_production_candidate_plan(
         return Err(PolicyError::InvalidRescueFstabValidation);
     }
     if step.rollback.as_deref() != Some(RESCUE_FSTAB_ROLLBACK_ID) {
+        return Err(PolicyError::InvalidRescueFstabRollback);
+    }
+    Ok(())
+}
+
+/// Admit the separate post-commit rollback plan for the sole Rescue candidate.
+///
+/// The plan is intentionally not a repair plan with a changed action ID. It has
+/// its own evidence and preflight contract, consumes the committed source
+/// transaction's backup, and cannot declare a recursive rollback.
+#[cfg(feature = "rescue-fstab-production-candidate")]
+pub fn validate_rescue_fstab_rollback_plan(
+    plan: &ValidatedPlan,
+    session_target_fingerprint: &str,
+) -> Result<(), PolicyError> {
+    if !valid_sha256_fingerprint(session_target_fingerprint)
+        || plan.target_fingerprint != session_target_fingerprint
+    {
+        return Err(PolicyError::IncoherentRescueTargetFingerprint);
+    }
+    let [step] = plan.steps.as_slice() else {
+        return Err(PolicyError::InvalidRescueFstabPlan);
+    };
+    if step.action != RESCUE_FSTAB_ROLLBACK_ID || step.risk != Risk::R2 {
+        return Err(PolicyError::MutationDisabled);
+    }
+    if step.target_fingerprint != plan.target_fingerprint
+        || !valid_sha256_fingerprint(&step.target_fingerprint)
+    {
+        return Err(PolicyError::IncoherentRescueTargetFingerprint);
+    }
+    if step.evidence_ids.as_slice() != [RESCUE_FSTAB_ROLLBACK_EVIDENCE_ID] {
+        return Err(PolicyError::InvalidRescueFstabEvidence);
+    }
+    if step.preconditions.as_slice() != [RESCUE_FSTAB_ROLLBACK_PREFLIGHT_ID] {
+        return Err(PolicyError::InvalidRescueFstabPrecondition);
+    }
+    if step.backup.as_deref() != Some(RESCUE_FSTAB_ROLLBACK_BACKUP) {
+        return Err(PolicyError::InvalidRescueFstabBackup);
+    }
+    if step.validation != RESCUE_FSTAB_VALIDATION_ID {
+        return Err(PolicyError::InvalidRescueFstabValidation);
+    }
+    if step.rollback.is_some() {
         return Err(PolicyError::InvalidRescueFstabRollback);
     }
     Ok(())
@@ -419,6 +472,45 @@ mod tests {
             rollback.steps[0].rollback = None;
             assert_eq!(
                 validate_rescue_fstab_production_candidate_plan(&rollback, TARGET),
+                Err(PolicyError::InvalidRescueFstabRollback)
+            );
+        }
+
+        fn rollback_plan() -> ValidatedPlan {
+            ValidatedPlan {
+                plan_id: "P-rescue-fstab-rollback".into(),
+                target_fingerprint: TARGET.into(),
+                steps: vec![ActionStep {
+                    action: RESCUE_FSTAB_ROLLBACK_ID.into(),
+                    risk: Risk::R2,
+                    target_fingerprint: TARGET.into(),
+                    evidence_ids: vec![RESCUE_FSTAB_ROLLBACK_EVIDENCE_ID.into()],
+                    preconditions: vec![RESCUE_FSTAB_ROLLBACK_PREFLIGHT_ID.into()],
+                    backup: Some(RESCUE_FSTAB_ROLLBACK_BACKUP.into()),
+                    validation: RESCUE_FSTAB_VALIDATION_ID.into(),
+                    rollback: None,
+                }],
+            }
+        }
+
+        #[test]
+        fn rollback_is_a_separate_closed_r2_plan() {
+            assert_eq!(
+                validate_rescue_fstab_rollback_plan(&rollback_plan(), TARGET),
+                Ok(())
+            );
+
+            let mut repair_shape = rollback_plan();
+            repair_shape.steps[0].action = RESCUE_FSTAB_ACTION_ID.into();
+            assert_eq!(
+                validate_rescue_fstab_rollback_plan(&repair_shape, TARGET),
+                Err(PolicyError::MutationDisabled)
+            );
+
+            let mut recursive = rollback_plan();
+            recursive.steps[0].rollback = Some(RESCUE_FSTAB_ROLLBACK_ID.into());
+            assert_eq!(
+                validate_rescue_fstab_rollback_plan(&recursive, TARGET),
                 Err(PolicyError::InvalidRescueFstabRollback)
             );
         }

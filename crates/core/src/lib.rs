@@ -12,8 +12,11 @@ use kernaid_policy::{PolicyError, validate_phase_zero};
 #[cfg(feature = "rescue-fstab-production-candidate")]
 use kernaid_policy::{
     RESCUE_FSTAB_ACTION_ID, RESCUE_FSTAB_EVIDENCE_IDS, RESCUE_FSTAB_FINDING_ID,
-    RESCUE_FSTAB_FINDING_VERSION, RESCUE_FSTAB_RESOURCE_ID,
+    RESCUE_FSTAB_FINDING_VERSION, RESCUE_FSTAB_RESOURCE_ID, RESCUE_FSTAB_ROLLBACK_BACKUP,
+    RESCUE_FSTAB_ROLLBACK_EVIDENCE_ID, RESCUE_FSTAB_ROLLBACK_ID,
+    RESCUE_FSTAB_ROLLBACK_PREFLIGHT_ID, RESCUE_FSTAB_VALIDATION_ID,
     validate_rescue_fstab_production_candidate_plan as validate_rescue_fstab_candidate_policy,
+    validate_rescue_fstab_rollback_plan as validate_rescue_fstab_rollback_policy,
 };
 use kernaid_protocol::ValidatedPlan;
 use sha2::{Digest, Sha256};
@@ -38,6 +41,16 @@ pub fn validate_rescue_fstab_production_candidate_plan(
     target_fingerprint: &str,
 ) -> Result<(), PolicyError> {
     validate_rescue_fstab_candidate_policy(plan, target_fingerprint)
+}
+
+/// Apply Core's admission boundary to the separately approved post-commit
+/// rollback. This validates bindings only and grants no write authority.
+#[cfg(feature = "rescue-fstab-production-candidate")]
+pub fn validate_rescue_fstab_rollback_plan(
+    plan: &ValidatedPlan,
+    target_fingerprint: &str,
+) -> Result<(), PolicyError> {
+    validate_rescue_fstab_rollback_policy(plan, target_fingerprint)
 }
 
 /// Immutable broker-derived bindings for one fixture-only R2 mutation.
@@ -459,9 +472,79 @@ fn valid_fixture_identifier(value: &str) -> bool {
 #[cfg(feature = "rescue-fstab-production-candidate")]
 pub const RESCUE_FSTAB_TYPED_CONFIRMATION: &str = "DISABILITA VOCE FSTAB";
 
+/// Exact confirmation for the separate post-commit rollback approval.
+#[cfg(feature = "rescue-fstab-production-candidate")]
+pub const RESCUE_FSTAB_ROLLBACK_TYPED_CONFIRMATION: &str = "RIPRISTINA FSTAB ORIGINALE";
+
 #[cfg(feature = "rescue-fstab-production-candidate")]
 const RESCUE_FSTAB_APPROVAL_HASH_DOMAIN: &[u8] =
     b"kernaid:linux.fstab.disable-missing-uuid.v1:approval:v1\0";
+
+#[cfg(feature = "rescue-fstab-production-candidate")]
+const RESCUE_FSTAB_ROLLBACK_APPROVAL_HASH_DOMAIN: &[u8] =
+    b"kernaid:linux.fstab.restore:approval:v1\0";
+
+#[cfg(feature = "rescue-fstab-production-candidate")]
+const RESCUE_FSTAB_ROLLBACK_PLAN_HASH_DOMAIN: &[u8] = b"kernaid:linux.fstab.restore:plan:v1\0";
+
+/// Reconstruct the sole rollback policy plan and its deterministic hash from
+/// broker-owned IDs plus the authenticated source receipt selector. The hash
+/// binds every plan field, the rollback child ID, and the exact source receipt.
+#[cfg(feature = "rescue-fstab-production-candidate")]
+pub fn canonical_rescue_fstab_rollback_plan(
+    plan_id: &str,
+    rollback_id: &str,
+    target_fingerprint: &str,
+    reservation_id: &str,
+    transaction_binding_sha256: &str,
+) -> Result<(ValidatedPlan, String), RescueFstabRollbackAdmissionError> {
+    if !valid_rescue_candidate_id(plan_id, "P-")
+        || !valid_rescue_candidate_id(rollback_id, "RB-")
+        || !valid_rescue_candidate_sha256(target_fingerprint)
+        || !valid_rescue_candidate_id(reservation_id, "B-")
+        || !valid_rescue_candidate_sha256(transaction_binding_sha256)
+    {
+        return Err(RescueFstabRollbackAdmissionError::InvalidBinding);
+    }
+    let plan = ValidatedPlan {
+        plan_id: plan_id.to_owned(),
+        target_fingerprint: target_fingerprint.to_owned(),
+        steps: vec![kernaid_protocol::ActionStep {
+            action: RESCUE_FSTAB_ROLLBACK_ID.to_owned(),
+            risk: kernaid_protocol::Risk::R2,
+            target_fingerprint: target_fingerprint.to_owned(),
+            evidence_ids: vec![RESCUE_FSTAB_ROLLBACK_EVIDENCE_ID.to_owned()],
+            preconditions: vec![RESCUE_FSTAB_ROLLBACK_PREFLIGHT_ID.to_owned()],
+            backup: Some(RESCUE_FSTAB_ROLLBACK_BACKUP.to_owned()),
+            validation: RESCUE_FSTAB_VALIDATION_ID.to_owned(),
+            rollback: None,
+        }],
+    };
+    validate_rescue_fstab_rollback_policy(&plan, target_fingerprint)
+        .map_err(RescueFstabRollbackAdmissionError::PolicyRejected)?;
+
+    let mut digest = Sha256::new();
+    digest.update(RESCUE_FSTAB_ROLLBACK_PLAN_HASH_DOMAIN);
+    for value in [
+        plan.plan_id.as_str(),
+        plan.target_fingerprint.as_str(),
+        RESCUE_FSTAB_ROLLBACK_ID,
+        "R2",
+        target_fingerprint,
+        RESCUE_FSTAB_ROLLBACK_EVIDENCE_ID,
+        RESCUE_FSTAB_ROLLBACK_PREFLIGHT_ID,
+        RESCUE_FSTAB_ROLLBACK_BACKUP,
+        RESCUE_FSTAB_VALIDATION_ID,
+        "rollback:none",
+        rollback_id,
+        reservation_id,
+        transaction_binding_sha256,
+    ] {
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value.as_bytes());
+    }
+    Ok((plan, format!("sha256:{:x}", digest.finalize())))
+}
 
 /// Exact observation and contract binding produced by the candidate broker.
 ///
@@ -802,6 +885,346 @@ fn rescue_fstab_approval_sha256(approval: &RescueFstabCandidateApproval) -> Stri
     digest.update(approval.typed_confirmation.as_bytes());
     format!("sha256:{:x}", digest.finalize())
 }
+
+/// Authenticated committed repair receipt retained as the source of one
+/// rollback plan. It contains identifiers and hashes only, never a path,
+/// descriptor, byte buffer, mount handle, or write capability.
+#[cfg(feature = "rescue-fstab-production-candidate")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RescueFstabRollbackSourceBinding {
+    source_plan_id: String,
+    source_plan_hash: String,
+    source_approval_id: String,
+    source_approval_sequence: u64,
+    reservation_id: String,
+    transaction_binding_sha256: String,
+    backup_locator: String,
+}
+
+#[cfg(feature = "rescue-fstab-production-candidate")]
+impl RescueFstabRollbackSourceBinding {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        source_plan_id: impl Into<String>,
+        source_plan_hash: impl Into<String>,
+        source_approval_id: impl Into<String>,
+        source_approval_sequence: u64,
+        reservation_id: impl Into<String>,
+        transaction_binding_sha256: impl Into<String>,
+        backup_locator: impl Into<String>,
+    ) -> Result<Self, RescueFstabRollbackAdmissionError> {
+        let value = Self {
+            source_plan_id: source_plan_id.into(),
+            source_plan_hash: source_plan_hash.into(),
+            source_approval_id: source_approval_id.into(),
+            source_approval_sequence,
+            reservation_id: reservation_id.into(),
+            transaction_binding_sha256: transaction_binding_sha256.into(),
+            backup_locator: backup_locator.into(),
+        };
+        if !valid_rescue_candidate_id(&value.source_plan_id, "P-")
+            || !valid_rescue_candidate_sha256(&value.source_plan_hash)
+            || !valid_rescue_candidate_id(&value.source_approval_id, "A-")
+            || value.source_approval_sequence == 0
+            || !valid_rescue_candidate_id(&value.reservation_id, "B-")
+            || !valid_rescue_candidate_sha256(&value.transaction_binding_sha256)
+            || value.backup_locator.strip_prefix("vault://repair/")
+                != Some(value.reservation_id.as_str())
+        {
+            return Err(RescueFstabRollbackAdmissionError::InvalidSourceReceipt);
+        }
+        Ok(value)
+    }
+
+    pub fn source_plan_id(&self) -> &str {
+        &self.source_plan_id
+    }
+    pub fn source_plan_hash(&self) -> &str {
+        &self.source_plan_hash
+    }
+    pub fn source_approval_id(&self) -> &str {
+        &self.source_approval_id
+    }
+    pub const fn source_approval_sequence(&self) -> u64 {
+        self.source_approval_sequence
+    }
+    pub fn reservation_id(&self) -> &str {
+        &self.reservation_id
+    }
+    pub fn transaction_binding_sha256(&self) -> &str {
+        &self.transaction_binding_sha256
+    }
+    pub fn backup_locator(&self) -> &str {
+        &self.backup_locator
+    }
+}
+
+/// Immutable binding of one rollback plan to one committed source receipt.
+#[cfg(feature = "rescue-fstab-production-candidate")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RescueFstabRollbackBinding {
+    session_id: String,
+    rollback_id: String,
+    plan_id: String,
+    plan_hash: String,
+    target_fingerprint: String,
+    source: RescueFstabRollbackSourceBinding,
+}
+
+#[cfg(feature = "rescue-fstab-production-candidate")]
+impl RescueFstabRollbackBinding {
+    pub fn new(
+        session_id: impl Into<String>,
+        rollback_id: impl Into<String>,
+        plan_id: impl Into<String>,
+        plan_hash: impl Into<String>,
+        target_fingerprint: impl Into<String>,
+        source: RescueFstabRollbackSourceBinding,
+    ) -> Result<Self, RescueFstabRollbackAdmissionError> {
+        let value = Self {
+            session_id: session_id.into(),
+            rollback_id: rollback_id.into(),
+            plan_id: plan_id.into(),
+            plan_hash: plan_hash.into(),
+            target_fingerprint: target_fingerprint.into(),
+            source,
+        };
+        if !valid_rescue_candidate_id(&value.session_id, "S-")
+            || !valid_rescue_candidate_id(&value.rollback_id, "RB-")
+            || !valid_rescue_candidate_id(&value.plan_id, "P-")
+            || !valid_rescue_candidate_sha256(&value.plan_hash)
+            || !valid_rescue_candidate_sha256(&value.target_fingerprint)
+            || value.plan_id == value.source.source_plan_id
+            || value.plan_hash == value.source.source_plan_hash
+        {
+            return Err(RescueFstabRollbackAdmissionError::InvalidBinding);
+        }
+        Ok(value)
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+    pub fn rollback_id(&self) -> &str {
+        &self.rollback_id
+    }
+    pub fn plan_id(&self) -> &str {
+        &self.plan_id
+    }
+    pub fn plan_hash(&self) -> &str {
+        &self.plan_hash
+    }
+    pub fn target_fingerprint(&self) -> &str {
+        &self.target_fingerprint
+    }
+    pub const fn resource_id(&self) -> &'static str {
+        RESCUE_FSTAB_RESOURCE_ID
+    }
+    pub const fn source(&self) -> &RescueFstabRollbackSourceBinding {
+        &self.source
+    }
+}
+
+/// Fresh approval proof for one exact rollback binding.
+#[cfg(feature = "rescue-fstab-production-candidate")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RescueFstabRollbackApproval {
+    binding: RescueFstabRollbackBinding,
+    approval_id: String,
+    approval_sequence: u64,
+    typed_confirmation: String,
+}
+
+#[cfg(feature = "rescue-fstab-production-candidate")]
+impl RescueFstabRollbackApproval {
+    pub fn new(
+        binding: RescueFstabRollbackBinding,
+        approval_id: impl Into<String>,
+        approval_sequence: u64,
+        typed_confirmation: impl Into<String>,
+    ) -> Result<Self, RescueFstabRollbackAdmissionError> {
+        let value = Self {
+            binding,
+            approval_id: approval_id.into(),
+            approval_sequence,
+            typed_confirmation: typed_confirmation.into(),
+        };
+        if !valid_rescue_candidate_id(&value.approval_id, "A-") || value.approval_sequence == 0 {
+            return Err(RescueFstabRollbackAdmissionError::InvalidApproval);
+        }
+        Ok(value)
+    }
+
+    pub const fn binding(&self) -> &RescueFstabRollbackBinding {
+        &self.binding
+    }
+    pub fn approval_id(&self) -> &str {
+        &self.approval_id
+    }
+    pub const fn approval_sequence(&self) -> u64 {
+        self.approval_sequence
+    }
+    pub fn typed_confirmation(&self) -> &str {
+        &self.typed_confirmation
+    }
+}
+
+#[cfg(feature = "rescue-fstab-production-candidate")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RescueFstabRollbackAdmissionState {
+    Staged,
+    Approved,
+}
+
+/// Approval-only Core state for post-commit rollback. Execution remains in a
+/// broker backend and cannot be reached from this type.
+#[cfg(feature = "rescue-fstab-production-candidate")]
+#[derive(Debug, PartialEq, Eq)]
+pub struct RescueFstabRollbackAdmission {
+    binding: RescueFstabRollbackBinding,
+    state: RescueFstabRollbackAdmissionState,
+    next_approval_sequence: u64,
+    approval_id: Option<String>,
+    approval_sha256: Option<String>,
+}
+
+#[cfg(feature = "rescue-fstab-production-candidate")]
+impl RescueFstabRollbackAdmission {
+    fn stage(
+        binding: RescueFstabRollbackBinding,
+    ) -> Result<Self, RescueFstabRollbackAdmissionError> {
+        let next_approval_sequence = binding
+            .source
+            .source_approval_sequence
+            .checked_add(1)
+            .ok_or(RescueFstabRollbackAdmissionError::SequenceExhausted)?;
+        Ok(Self {
+            binding,
+            state: RescueFstabRollbackAdmissionState::Staged,
+            next_approval_sequence,
+            approval_id: None,
+            approval_sha256: None,
+        })
+    }
+
+    pub const fn binding(&self) -> &RescueFstabRollbackBinding {
+        &self.binding
+    }
+    pub const fn state(&self) -> RescueFstabRollbackAdmissionState {
+        self.state
+    }
+    pub const fn next_approval_sequence(&self) -> u64 {
+        self.next_approval_sequence
+    }
+    pub fn approval_id(&self) -> Option<&str> {
+        self.approval_id.as_deref()
+    }
+    pub fn approval_sha256(&self) -> Option<&str> {
+        self.approval_sha256.as_deref()
+    }
+
+    pub fn approve(
+        &mut self,
+        approval: &RescueFstabRollbackApproval,
+    ) -> Result<(), RescueFstabRollbackAdmissionError> {
+        if self.state != RescueFstabRollbackAdmissionState::Staged {
+            return Err(RescueFstabRollbackAdmissionError::ApprovalReplay);
+        }
+        if approval.binding != self.binding {
+            return Err(RescueFstabRollbackAdmissionError::BindingMismatch);
+        }
+        if approval.approval_id == self.binding.source.source_approval_id {
+            return Err(RescueFstabRollbackAdmissionError::ApprovalNotFresh);
+        }
+        if approval.approval_sequence != self.next_approval_sequence {
+            return Err(RescueFstabRollbackAdmissionError::NonMonotonicApproval);
+        }
+        if approval.typed_confirmation != RESCUE_FSTAB_ROLLBACK_TYPED_CONFIRMATION {
+            return Err(RescueFstabRollbackAdmissionError::TypedConfirmationMismatch);
+        }
+        self.approval_sha256 = Some(rescue_fstab_rollback_approval_sha256(approval));
+        self.approval_id = Some(approval.approval_id.clone());
+        self.state = RescueFstabRollbackAdmissionState::Approved;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "rescue-fstab-production-candidate")]
+fn rescue_fstab_rollback_approval_sha256(approval: &RescueFstabRollbackApproval) -> String {
+    let mut digest = Sha256::new();
+    digest.update(RESCUE_FSTAB_ROLLBACK_APPROVAL_HASH_DOMAIN);
+    for value in [
+        approval.binding.session_id.as_str(),
+        approval.binding.rollback_id.as_str(),
+        approval.binding.plan_id.as_str(),
+        approval.binding.plan_hash.as_str(),
+        approval.binding.target_fingerprint.as_str(),
+        RESCUE_FSTAB_RESOURCE_ID,
+        approval.binding.source.source_plan_id.as_str(),
+        approval.binding.source.source_plan_hash.as_str(),
+        approval.binding.source.source_approval_id.as_str(),
+        approval.binding.source.reservation_id.as_str(),
+        approval.binding.source.transaction_binding_sha256.as_str(),
+        approval.binding.source.backup_locator.as_str(),
+        approval.approval_id.as_str(),
+    ] {
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value.as_bytes());
+    }
+    digest.update(
+        approval
+            .binding
+            .source
+            .source_approval_sequence
+            .to_be_bytes(),
+    );
+    digest.update(approval.approval_sequence.to_be_bytes());
+    digest.update((approval.typed_confirmation.len() as u64).to_be_bytes());
+    digest.update(approval.typed_confirmation.as_bytes());
+    format!("sha256:{:x}", digest.finalize())
+}
+
+#[cfg(feature = "rescue-fstab-production-candidate")]
+#[derive(Debug, PartialEq, Eq)]
+pub enum RescueFstabRollbackAdmissionError {
+    InvalidSessionState,
+    WrongSessionMode,
+    PolicyRejected(PolicyError),
+    InvalidSourceReceipt,
+    InvalidBinding,
+    InvalidApproval,
+    BindingMismatch,
+    ApprovalNotFresh,
+    NonMonotonicApproval,
+    TypedConfirmationMismatch,
+    ApprovalReplay,
+    SequenceExhausted,
+}
+
+#[cfg(feature = "rescue-fstab-production-candidate")]
+impl fmt::Display for RescueFstabRollbackAdmissionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidSessionState => "Rescue fstab rollback is outside a fresh session",
+            Self::WrongSessionMode => "Rescue fstab rollback requires LinuxRescue mode",
+            Self::PolicyRejected(_) => "Rescue fstab rollback policy rejected the plan",
+            Self::InvalidSourceReceipt => "Rescue fstab rollback source receipt is invalid",
+            Self::InvalidBinding => "Rescue fstab rollback binding is invalid",
+            Self::InvalidApproval => "Rescue fstab rollback approval is invalid",
+            Self::BindingMismatch => "Rescue fstab rollback approval binding does not match",
+            Self::ApprovalNotFresh => "Rescue fstab rollback requires a fresh approval",
+            Self::NonMonotonicApproval => "Rescue fstab rollback approval sequence is not next",
+            Self::TypedConfirmationMismatch => {
+                "Rescue fstab rollback requires the exact typed confirmation"
+            }
+            Self::ApprovalReplay => "Rescue fstab rollback approval was already consumed",
+            Self::SequenceExhausted => "Rescue fstab rollback approval sequence is exhausted",
+        })
+    }
+}
+
+#[cfg(feature = "rescue-fstab-production-candidate")]
+impl Error for RescueFstabRollbackAdmissionError {}
 
 #[cfg(feature = "rescue-fstab-production-candidate")]
 #[derive(Debug, PartialEq, Eq)]
@@ -1200,6 +1623,33 @@ impl Session {
         self.state = State::Plan;
         Ok(admission)
     }
+
+    /// Stage a separate post-commit rollback against one authenticated source
+    /// receipt. The returned state can accept an approval but cannot execute.
+    #[cfg(feature = "rescue-fstab-production-candidate")]
+    pub fn stage_rescue_fstab_rollback(
+        &mut self,
+        plan: &ValidatedPlan,
+        binding: RescueFstabRollbackBinding,
+    ) -> Result<RescueFstabRollbackAdmission, RescueFstabRollbackAdmissionError> {
+        if self.state != State::Observe || self.linux_snapshot.is_some() {
+            return Err(RescueFstabRollbackAdmissionError::InvalidSessionState);
+        }
+        if self.mode != SessionMode::LinuxRescue {
+            return Err(RescueFstabRollbackAdmissionError::WrongSessionMode);
+        }
+        validate_rescue_fstab_rollback_policy(plan, &self.fingerprint)
+            .map_err(RescueFstabRollbackAdmissionError::PolicyRejected)?;
+        if binding.plan_id != plan.plan_id
+            || binding.target_fingerprint != plan.target_fingerprint
+            || binding.target_fingerprint != self.fingerprint
+        {
+            return Err(RescueFstabRollbackAdmissionError::BindingMismatch);
+        }
+        let admission = RescueFstabRollbackAdmission::stage(binding)?;
+        self.state = State::Plan;
+        Ok(admission)
+    }
 }
 
 pub const LINUX_RESIDENT_P0_COLLECTORS: [&str; 9] = [
@@ -1382,6 +1832,30 @@ mod tests {
                 backup: Some(RESCUE_FSTAB_BACKUP.to_owned()),
                 validation: RESCUE_FSTAB_VALIDATION_ID.to_owned(),
                 rollback: Some(RESCUE_FSTAB_ROLLBACK_ID.to_owned()),
+            }],
+        }
+    }
+
+    #[cfg(feature = "rescue-fstab-production-candidate")]
+    fn rescue_rollback_plan() -> ValidatedPlan {
+        use kernaid_policy::{
+            RESCUE_FSTAB_ROLLBACK_BACKUP, RESCUE_FSTAB_ROLLBACK_EVIDENCE_ID,
+            RESCUE_FSTAB_ROLLBACK_ID, RESCUE_FSTAB_ROLLBACK_PREFLIGHT_ID,
+            RESCUE_FSTAB_VALIDATION_ID,
+        };
+
+        ValidatedPlan {
+            plan_id: "P-rescue-fstab-rollback".to_owned(),
+            target_fingerprint: RESCUE_CANDIDATE_TARGET.to_owned(),
+            steps: vec![ActionStep {
+                action: RESCUE_FSTAB_ROLLBACK_ID.to_owned(),
+                risk: Risk::R2,
+                target_fingerprint: RESCUE_CANDIDATE_TARGET.to_owned(),
+                evidence_ids: vec![RESCUE_FSTAB_ROLLBACK_EVIDENCE_ID.to_owned()],
+                preconditions: vec![RESCUE_FSTAB_ROLLBACK_PREFLIGHT_ID.to_owned()],
+                backup: Some(RESCUE_FSTAB_ROLLBACK_BACKUP.to_owned()),
+                validation: RESCUE_FSTAB_VALIDATION_ID.to_owned(),
+                rollback: None,
             }],
         }
     }
@@ -1963,6 +2437,112 @@ mod tests {
         assert_eq!(
             admission.approve(&approval),
             Err(RescueFstabCandidateAdmissionError::ApprovalReplay)
+        );
+    }
+
+    #[cfg(feature = "rescue-fstab-production-candidate")]
+    #[test]
+    fn rollback_plan_hash_is_canonical_and_binds_the_source_and_child_id() {
+        let transaction = format!("sha256:{}", "d".repeat(64));
+        let (plan, first) = canonical_rescue_fstab_rollback_plan(
+            "P-rescue-fstab-rollback",
+            "RB-rescue-rollback",
+            RESCUE_CANDIDATE_TARGET,
+            "B-source-backup",
+            &transaction,
+        )
+        .expect("canonical rollback plan");
+        let (_, repeated) = canonical_rescue_fstab_rollback_plan(
+            "P-rescue-fstab-rollback",
+            "RB-rescue-rollback",
+            RESCUE_CANDIDATE_TARGET,
+            "B-source-backup",
+            &transaction,
+        )
+        .expect("same canonical rollback plan");
+        let (_, different_child) = canonical_rescue_fstab_rollback_plan(
+            "P-rescue-fstab-rollback",
+            "RB-other-rollback",
+            RESCUE_CANDIDATE_TARGET,
+            "B-source-backup",
+            &transaction,
+        )
+        .expect("different child rollback plan");
+        assert_eq!(plan, rescue_rollback_plan());
+        assert_eq!(first, repeated);
+        assert_ne!(first, different_child);
+        assert!(valid_rescue_candidate_sha256(&first));
+    }
+
+    #[cfg(feature = "rescue-fstab-production-candidate")]
+    #[test]
+    fn rescue_rollback_has_a_distinct_source_bound_fresh_approval() {
+        let plan = rescue_rollback_plan();
+        let source = RescueFstabRollbackSourceBinding::new(
+            "P-rescue-fstab-candidate",
+            RESCUE_CANDIDATE_PLAN_HASH,
+            "A-source-repair",
+            7,
+            "B-source-backup",
+            format!("sha256:{}", "d".repeat(64)),
+            "vault://repair/B-source-backup",
+        )
+        .expect("committed source receipt");
+        let binding = RescueFstabRollbackBinding::new(
+            "S-rescue-rollback",
+            "RB-rescue-rollback",
+            plan.plan_id.clone(),
+            format!("sha256:{}", "e".repeat(64)),
+            RESCUE_CANDIDATE_TARGET,
+            source,
+        )
+        .expect("rollback binding");
+        let mut session = Session::new(RESCUE_CANDIDATE_TARGET, SessionMode::LinuxRescue);
+        let mut admission = session
+            .stage_rescue_fstab_rollback(&plan, binding.clone())
+            .expect("stage rollback");
+        assert_eq!(admission.next_approval_sequence(), 8);
+
+        let reused = RescueFstabRollbackApproval::new(
+            binding.clone(),
+            "A-source-repair",
+            8,
+            RESCUE_FSTAB_ROLLBACK_TYPED_CONFIRMATION,
+        )
+        .expect("syntactically valid reused proof");
+        assert_eq!(
+            admission.approve(&reused),
+            Err(RescueFstabRollbackAdmissionError::ApprovalNotFresh)
+        );
+
+        let wrong_phrase = RescueFstabRollbackApproval::new(
+            binding.clone(),
+            "A-fresh-rollback",
+            8,
+            RESCUE_FSTAB_TYPED_CONFIRMATION,
+        )
+        .expect("syntactically valid wrong phrase");
+        assert_eq!(
+            admission.approve(&wrong_phrase),
+            Err(RescueFstabRollbackAdmissionError::TypedConfirmationMismatch)
+        );
+
+        let fresh = RescueFstabRollbackApproval::new(
+            binding,
+            "A-fresh-rollback",
+            8,
+            RESCUE_FSTAB_ROLLBACK_TYPED_CONFIRMATION,
+        )
+        .expect("fresh rollback proof");
+        admission.approve(&fresh).expect("approve rollback");
+        assert_eq!(
+            admission.state(),
+            RescueFstabRollbackAdmissionState::Approved
+        );
+        assert!(
+            admission
+                .approval_sha256()
+                .is_some_and(valid_rescue_candidate_sha256)
         );
     }
 

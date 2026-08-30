@@ -3,12 +3,15 @@ import test from "node:test";
 import {
   RESCUE_FSTAB_CONFIRMATION,
   RESCUE_FSTAB_RESOURCE_ID,
+  RESCUE_FSTAB_ROLLBACK_CONFIRMATION,
   RESCUE_REPAIR_API_VERSION,
+  RESCUE_ROLLBACK_API_VERSION,
   RescueRepairClient,
   RescueRepairServiceError,
   RescueRepairUnavailableError,
   parseRescueRepairResponse,
   preparedRepairDetail,
+  preparedRollbackDetail,
   rescueRepairIsTerminal,
   rescueRepairNeedsPolling,
   rescueRepairStateMessage,
@@ -85,6 +88,123 @@ test("prepared response is exact, correlated, and contains no repair bytes", () 
       ),
     /Correlazione/u,
   );
+});
+
+test("rollback v2 is exact, source-bound, and rejects cross-version aliases", async () => {
+  const operation = "repair.fstab.rollback.prepare" as const;
+  const parsed = parseRescueRepairResponse(
+    rollbackPreparedEnvelope(REQUEST, operation),
+    REQUEST,
+    operation,
+  );
+  const detail = preparedRollbackDetail(parsed);
+  assert.ok(detail);
+  assert.equal(detail.actionId, "linux.fstab.restore");
+  assert.equal(detail.confirmationRequired, RESCUE_FSTAB_ROLLBACK_CONFIRMATION);
+  assert.equal(
+    detail.backupLocator,
+    `vault://repair/${detail.source.reservationId}`,
+  );
+  assert.doesNotMatch(JSON.stringify(detail), /\/run\/|\/dev\/|\/etc\//u);
+
+  assert.throws(
+    () =>
+      parseRescueRepairResponse(
+        {
+          ...rollbackPreparedEnvelope(REQUEST, operation),
+          apiVersion: RESCUE_REPAIR_API_VERSION,
+        },
+        REQUEST,
+        operation,
+      ),
+    /Correlazione/u,
+  );
+  assert.throws(
+    () =>
+      parseRescueRepairResponse(
+        {
+          ...preparedEnvelope(REQUEST, "repair.fstab.prepare"),
+          apiVersion: RESCUE_ROLLBACK_API_VERSION,
+        },
+        REQUEST,
+        "repair.fstab.prepare",
+      ),
+    /Correlazione/u,
+  );
+  assert.throws(
+    () =>
+      parseRescueRepairResponse(
+        {
+          apiVersion: RESCUE_REPAIR_API_VERSION,
+          requestId: REQUEST,
+          operation: "repair.status",
+          outcome: "ok",
+          stateVersion: 5,
+          state: "restored",
+          detail: {
+            kind: "terminal",
+            terminalOutcome: "rolled-back-original",
+            reservationId: `B-${"9".repeat(32)}`,
+            transactionBindingSha256: `sha256:${"8".repeat(64)}`,
+            rebootRequired: false,
+            prepareFailureStage: null,
+          },
+        },
+        REQUEST,
+        "repair.status",
+      ),
+    /terminale/u,
+  );
+
+  const bodies: Array<Record<string, unknown>> = [];
+  const requestIds = [REQUEST, NEXT_REQUEST];
+  const client = new RescueRepairClient(
+    async (_input, init) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      bodies.push(body);
+      return frame(
+        body.operation === "repair.fstab.rollback.prepare"
+          ? rollbackPreparedEnvelope(String(body.requestId), operation)
+          : {
+              apiVersion: RESCUE_ROLLBACK_API_VERSION,
+              requestId: body.requestId,
+              operation: body.operation,
+              outcome: "ok",
+              stateVersion: 5,
+              state: "restored",
+              detail: {
+                kind: "terminal",
+                terminalOutcome: "rolled-back-original",
+                reservationId: `B-${"9".repeat(32)}`,
+                transactionBindingSha256: `sha256:${"8".repeat(64)}`,
+                rebootRequired: false,
+                prepareFailureStage: null,
+              },
+            },
+      );
+    },
+    () => requestIds.shift()!,
+    () => `A-${"e".repeat(32)}`,
+  );
+  const source = {
+    reservationId: `B-${"9".repeat(32)}`,
+    transactionBindingSha256: `sha256:${"8".repeat(64)}`,
+  } as const;
+  const staged = await client.prepareRollback(source);
+  const stagedDetail = preparedRollbackDetail(staged);
+  assert.ok(stagedDetail);
+  await client.approveRollback(
+    stagedDetail,
+    RESCUE_FSTAB_ROLLBACK_CONFIRMATION,
+  );
+  assert.equal(bodies[0]?.apiVersion, RESCUE_ROLLBACK_API_VERSION);
+  assert.deepEqual(bodies[0]?.source, source);
+  assert.equal(bodies[1]?.approvalSequence, 2);
+  assert.equal(
+    bodies[1]?.typedConfirmation,
+    RESCUE_FSTAB_ROLLBACK_CONFIRMATION,
+  );
+  assert.doesNotMatch(JSON.stringify(bodies), /path|device|bytes|authority/iu);
 });
 
 test("client sends only closed target claims and echoes only prepared bindings", async () => {
@@ -355,6 +475,39 @@ function preparedEnvelope(
       backup: { state: "reserved", vaultDistinct: true },
       nextApprovalSequence: 1,
       confirmationRequired: RESCUE_FSTAB_CONFIRMATION,
+    },
+  };
+}
+
+function rollbackPreparedEnvelope(
+  requestId: string,
+  operation: RescueRepairOperation,
+): Record<string, unknown> {
+  return {
+    apiVersion: RESCUE_ROLLBACK_API_VERSION,
+    requestId,
+    operation,
+    outcome: "ok",
+    stateVersion: 4,
+    state: "prepared",
+    detail: {
+      kind: "fstab-rollback-prepared",
+      preparedId: `Q-${"a".repeat(32)}`,
+      rollbackId: `RB-${"b".repeat(32)}`,
+      sessionId: `S-${"c".repeat(32)}`,
+      planId: `P-${"d".repeat(32)}`,
+      planHash: `sha256:${"6".repeat(64)}`,
+      targetFingerprint: TARGET,
+      source: {
+        reservationId: `B-${"9".repeat(32)}`,
+        transactionBindingSha256: `sha256:${"8".repeat(64)}`,
+      },
+      resourceId: RESCUE_FSTAB_RESOURCE_ID,
+      backupLocator: `vault://repair/B-${"9".repeat(32)}`,
+      actionId: "linux.fstab.restore",
+      risk: "R2",
+      nextApprovalSequence: 2,
+      confirmationRequired: RESCUE_FSTAB_ROLLBACK_CONFIRMATION,
     },
   };
 }

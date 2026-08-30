@@ -3,10 +3,13 @@ import type { RescueOfflineInspection, RescueTargetSelection } from "./native";
 import {
   RESCUE_FSTAB_CONFIRMATION,
   RESCUE_FSTAB_FINDING_ID,
+  RESCUE_FSTAB_ROLLBACK_CONFIRMATION,
   RescueRepairClient,
   RescueRepairServiceError,
   RescueRepairUnavailableError,
   preparedRepairDetail,
+  preparedRollbackDetail,
+  rollbackSourceReceipt,
   rescueRepairNeedsPolling,
   rescueRepairStateMessage,
   rescueRepairTargetClaims,
@@ -42,6 +45,8 @@ export function RescueRepairPanel({
     inspection.target.scanFingerprint === selection.scanFingerprint &&
     inspection.target.targetId === selection.target.targetId;
   const prepared = preparedRepairDetail(snapshot);
+  const rollbackPrepared = preparedRollbackDetail(snapshot);
+  const committedSource = rollbackSourceReceipt(snapshot);
   const preparedTargetCurrent =
     prepared !== undefined &&
     qualifiedTarget &&
@@ -82,7 +87,16 @@ export function RescueRepairPanel({
     };
     const poll = async () => {
       try {
-        const next = await repairClient.status(controller.signal);
+        let next = snapshot?.operation.startsWith("repair.fstab.rollback.")
+          ? await repairClient.rollbackStatus(controller.signal)
+          : await repairClient.status(controller.signal);
+        if (next.operation === "repair.status" && next.state === "executing") {
+          try {
+            next = await repairClient.rollbackStatus(controller.signal);
+          } catch {
+            // v1 remains authoritative when the v2 rollback surface is absent.
+          }
+        }
         if (stopped || !mounted.current) return;
         setSnapshot((current) => newestSnapshot(current, next));
         setMessage(undefined);
@@ -169,9 +183,69 @@ export function RescueRepairPanel({
     }
   }
 
+  async function prepareRollback(): Promise<void> {
+    if (committedSource === undefined || busy) return;
+    setBusy(true);
+    setMessage(undefined);
+    setConfirmation("");
+    try {
+      const next = await repairClient.prepareRollback(committedSource);
+      if (mounted.current)
+        setSnapshot((current) => newestSnapshot(current, next));
+    } catch (error) {
+      if (mounted.current) setMessage(operationErrorMessage(error));
+    } finally {
+      if (mounted.current) setBusy(false);
+    }
+  }
+
+  async function approveRollback(): Promise<void> {
+    if (
+      rollbackPrepared === undefined ||
+      confirmation !== RESCUE_FSTAB_ROLLBACK_CONFIRMATION ||
+      busy
+    )
+      return;
+    setBusy(true);
+    setMessage(undefined);
+    try {
+      const next = await repairClient.approveRollback(
+        rollbackPrepared,
+        confirmation,
+      );
+      if (mounted.current) {
+        setSnapshot((current) => newestSnapshot(current, next));
+        setConfirmation("");
+      }
+    } catch (error) {
+      if (mounted.current) setMessage(operationErrorMessage(error));
+    } finally {
+      if (mounted.current) setBusy(false);
+    }
+  }
+
+  async function cancelRollback(): Promise<void> {
+    if (rollbackPrepared === undefined || busy) return;
+    setBusy(true);
+    setMessage(undefined);
+    try {
+      const next = await repairClient.cancelRollback(rollbackPrepared);
+      if (mounted.current) {
+        setSnapshot((current) => newestSnapshot(current, next));
+        setConfirmation("");
+      }
+    } catch (error) {
+      if (mounted.current) setMessage(operationErrorMessage(error));
+    } finally {
+      if (mounted.current) setBusy(false);
+    }
+  }
+
   async function refreshAfterError(): Promise<void> {
     try {
-      const current = await repairClient.status();
+      const current = snapshot?.operation.startsWith("repair.fstab.rollback.")
+        ? await repairClient.rollbackStatus()
+        : await repairClient.status();
       if (mounted.current)
         setSnapshot((previous) => newestSnapshot(previous, current));
     } catch {
@@ -190,14 +264,18 @@ export function RescueRepairPanel({
       <div className="rescue-repair-heading">
         <div>
           <small>
-            {prepared === undefined
+            {prepared === undefined && rollbackPrepared === undefined
               ? "VERIFICA RESCUE CANDIDATE"
-              : "RIPARAZIONE RESCUE CANDIDATE"}
+              : rollbackPrepared !== undefined
+                ? "ROLLBACK RESCUE CANDIDATE"
+                : "RIPARAZIONE RESCUE CANDIDATE"}
           </small>
           <h2>
-            {prepared === undefined
+            {prepared === undefined && rollbackPrepared === undefined
               ? "Controllo sicuro della configurazione di avvio"
-              : "Avvio Linux bloccato da una voce disco"}
+              : rollbackPrepared !== undefined
+                ? "Ripristino della configurazione originale"
+                : "Avvio Linux bloccato da una voce disco"}
           </h2>
         </div>
         <span>
@@ -321,6 +399,65 @@ export function RescueRepairPanel({
         </div>
       )}
 
+      {rollbackPrepared !== undefined && (
+        <div className="rescue-repair-card">
+          <p>
+            Questo è un nuovo piano R2, separato dalla riparazione già
+            completata. Ripristinerà esclusivamente la risorsa indicata usando
+            il backup della ricevuta sorgente autenticata.
+          </p>
+          <div className="rescue-repair-row">
+            <span>Risorsa esatta</span>
+            <code title={rollbackPrepared.resourceId}>
+              {rollbackPrepared.resourceId}
+            </code>
+          </div>
+          <div className="rescue-repair-row">
+            <span>Backup sorgente</span>
+            <code title={rollbackPrepared.backupLocator}>
+              {rollbackPrepared.backupLocator}
+            </code>
+          </div>
+          <div className="rescue-repair-row">
+            <span>Binding ricevuta sorgente</span>
+            <code title={rollbackPrepared.source.transactionBindingSha256}>
+              {rollbackPrepared.source.transactionBindingSha256}
+            </code>
+          </div>
+          <div className="rescue-repair-row">
+            <span>Nuovo piano rollback</span>
+            <code title={rollbackPrepared.planHash}>
+              {rollbackPrepared.planHash}
+            </code>
+          </div>
+          <label className="rescue-repair-confirmation">
+            Per approvare il rollback, scrivi esattamente
+            <code>{RESCUE_FSTAB_ROLLBACK_CONFIRMATION}</code>
+            <input
+              autoComplete="off"
+              disabled={busy}
+              spellCheck={false}
+              value={confirmation}
+              onChange={(event) => setConfirmation(event.target.value)}
+            />
+          </label>
+          <div className="rescue-repair-actions">
+            <button disabled={busy} onClick={() => void cancelRollback()}>
+              {busy ? "Attendi…" : "Annulla rollback"}
+            </button>
+            <button
+              className="rescue-repair-primary"
+              disabled={
+                busy || confirmation !== RESCUE_FSTAB_ROLLBACK_CONFIRMATION
+              }
+              onClick={() => void approveRollback()}
+            >
+              Approva e ripristina
+            </button>
+          </div>
+        </div>
+      )}
+
       {snapshot.state === "executing" && (
         <div className="rescue-repair-card rescue-repair-wait">
           <span className="rescue-repair-spinner" aria-hidden="true" />
@@ -334,17 +471,24 @@ export function RescueRepairPanel({
       {snapshot.detail?.kind === "terminal" && (
         <div className="rescue-repair-card rescue-repair-terminal">
           {snapshot.state === "succeeded" && (
-            <p>
-              La voce non valida è stata disabilitata e il risultato è stato
-              verificato. Puoi spegnere KernAid Rescue e provare ad avviare il
-              sistema installato.
-            </p>
+            <>
+              <p>
+                La voce non valida è stata disabilitata e il risultato è stato
+                verificato. Puoi spegnere KernAid Rescue e provare ad avviare il
+                sistema installato.
+              </p>
+              {committedSource !== undefined && (
+                <button disabled={busy} onClick={() => void prepareRollback()}>
+                  {busy ? "Preparazione…" : "Prepara ripristino originale"}
+                </button>
+              )}
+            </>
           )}
           {snapshot.state === "restored" && (
             <p>
-              La verifica non ha qualificato il risultato. KernAid ha
-              ripristinato esattamente il backup originale; nessun successo
-              viene dichiarato.
+              {snapshot.detail.terminalOutcome === "rolled-back-original"
+                ? "Rollback completato e verificato: la configurazione originale è stata ripristinata."
+                : "La verifica non ha qualificato il risultato. KernAid ha ripristinato esattamente il backup originale; nessun successo viene dichiarato."}
             </p>
           )}
           {snapshot.state === "cancelled" && (

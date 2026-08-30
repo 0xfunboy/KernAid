@@ -2,11 +2,15 @@ import type { RescueTargetSelection } from "./native";
 
 export const RESCUE_REPAIR_API_VERSION =
   "kernaid.dev/rescue-repair-service/v1alpha1";
+export const RESCUE_ROLLBACK_API_VERSION =
+  "kernaid.dev/rescue-repair-service/v1alpha2";
 export const RESCUE_REPAIR_ENDPOINT = "/api/rescue/repair";
 export const RESCUE_FSTAB_FINDING_ID = "KA-LNX-P0-003";
 export const RESCUE_FSTAB_ACTION_ID = "linux.fstab.disable-missing-uuid.v1";
 export const RESCUE_FSTAB_RESOURCE_ID = "rescue:selected-linux-root:etc/fstab";
 export const RESCUE_FSTAB_CONFIRMATION = "DISABILITA VOCE FSTAB";
+export const RESCUE_FSTAB_ROLLBACK_ACTION_ID = "linux.fstab.restore";
+export const RESCUE_FSTAB_ROLLBACK_CONFIRMATION = "RIPRISTINA FSTAB ORIGINALE";
 
 const MAX_RESPONSE_BYTES = 4096;
 const REQUEST_ID =
@@ -15,6 +19,7 @@ const PREPARED_ID = /^Q-[a-f0-9]{32}$/u;
 const SESSION_ID = /^S-[a-f0-9]{32}$/u;
 const PLAN_ID = /^P-[a-f0-9]{32}$/u;
 const APPROVAL_ID = /^A-[a-f0-9]{32}$/u;
+const ROLLBACK_ID = /^RB-[a-f0-9]{32}$/u;
 const RESERVATION_ID = /^B-[A-Za-z0-9-]{1,126}$/u;
 const SCAN_FINGERPRINT = /^scan:[a-f0-9]{64}$/u;
 const TARGET_ID = /^target:[a-f0-9]{64}$/u;
@@ -25,7 +30,11 @@ export type RescueRepairOperation =
   | "repair.status"
   | "repair.fstab.prepare"
   | "repair.fstab.approve"
-  | "repair.fstab.cancel";
+  | "repair.fstab.cancel"
+  | "repair.fstab.rollback.status"
+  | "repair.fstab.rollback.prepare"
+  | "repair.fstab.rollback.approve"
+  | "repair.fstab.rollback.cancel";
 
 export type RescueRepairState =
   | "idle"
@@ -42,6 +51,7 @@ export type RescueRepairTerminalOutcome =
   | "committed"
   | "closed-before-unchanged"
   | "closed-before-restored"
+  | "rolled-back-original"
   | "cancelled"
   | "manual-reconciliation-required"
   | "failed";
@@ -65,6 +75,7 @@ export type RescueRepairErrorToken =
   | "cancel-failed"
   | "execution-failed"
   | "recovery-unavailable"
+  | "rollback-unavailable"
   | "internal";
 
 export interface RescueRepairTargetClaims {
@@ -95,6 +106,28 @@ export interface RescueRepairPreparedDetail {
   readonly confirmationRequired: typeof RESCUE_FSTAB_CONFIRMATION;
 }
 
+export interface RescueRollbackSourceReceipt {
+  readonly reservationId: string;
+  readonly transactionBindingSha256: string;
+}
+
+export interface RescueRollbackPreparedDetail {
+  readonly kind: "fstab-rollback-prepared";
+  readonly preparedId: string;
+  readonly rollbackId: string;
+  readonly sessionId: string;
+  readonly planId: string;
+  readonly planHash: string;
+  readonly targetFingerprint: string;
+  readonly source: RescueRollbackSourceReceipt;
+  readonly resourceId: typeof RESCUE_FSTAB_RESOURCE_ID;
+  readonly backupLocator: string;
+  readonly actionId: typeof RESCUE_FSTAB_ROLLBACK_ACTION_ID;
+  readonly risk: "R2";
+  readonly nextApprovalSequence: number;
+  readonly confirmationRequired: typeof RESCUE_FSTAB_ROLLBACK_CONFIRMATION;
+}
+
 export interface RescueRepairTerminalDetail {
   readonly kind: "terminal";
   readonly terminalOutcome: RescueRepairTerminalOutcome;
@@ -105,7 +138,10 @@ export interface RescueRepairTerminalDetail {
 }
 
 export type RescueRepairDetail =
-  null | RescueRepairPreparedDetail | RescueRepairTerminalDetail;
+  | null
+  | RescueRepairPreparedDetail
+  | RescueRollbackPreparedDetail
+  | RescueRepairTerminalDetail;
 
 export interface RescueRepairSnapshot {
   readonly requestId: string;
@@ -250,6 +286,94 @@ export class RescueRepairClient {
     );
   }
 
+  async rollbackStatus(signal?: AbortSignal): Promise<RescueRepairSnapshot> {
+    const requestId = this.#nextRequestId();
+    return await this.#post(
+      {
+        apiVersion: RESCUE_ROLLBACK_API_VERSION,
+        requestId,
+        operation: "repair.fstab.rollback.status",
+      },
+      requestId,
+      "repair.fstab.rollback.status",
+      signal,
+    );
+  }
+
+  async prepareRollback(
+    source: RescueRollbackSourceReceipt,
+    signal?: AbortSignal,
+  ): Promise<RescueRepairSnapshot> {
+    const exactSource = parseRollbackSourceReceipt(source);
+    const requestId = this.#nextRequestId();
+    return await this.#post(
+      {
+        apiVersion: RESCUE_ROLLBACK_API_VERSION,
+        requestId,
+        operation: "repair.fstab.rollback.prepare",
+        source: exactSource,
+      },
+      requestId,
+      "repair.fstab.rollback.prepare",
+      signal,
+    );
+  }
+
+  async approveRollback(
+    prepared: RescueRollbackPreparedDetail,
+    typedConfirmation: string,
+    signal?: AbortSignal,
+  ): Promise<RescueRepairSnapshot> {
+    const exactPrepared = parseRollbackPreparedDetail(prepared);
+    if (typedConfirmation !== RESCUE_FSTAB_ROLLBACK_CONFIRMATION)
+      throw new Error("La frase di conferma rollback non corrisponde.");
+    const requestId = this.#nextRequestId();
+    const approvalId = this.#approvalId();
+    if (!APPROVAL_ID.test(approvalId))
+      throw new Error("Identificatore di approvazione locale non valido.");
+    return await this.#post(
+      {
+        apiVersion: RESCUE_ROLLBACK_API_VERSION,
+        requestId,
+        operation: "repair.fstab.rollback.approve",
+        preparedId: exactPrepared.preparedId,
+        rollbackId: exactPrepared.rollbackId,
+        sessionId: exactPrepared.sessionId,
+        planId: exactPrepared.planId,
+        planHash: exactPrepared.planHash,
+        source: exactPrepared.source,
+        approvalId,
+        approvalSequence: exactPrepared.nextApprovalSequence,
+        typedConfirmation: RESCUE_FSTAB_ROLLBACK_CONFIRMATION,
+      },
+      requestId,
+      "repair.fstab.rollback.approve",
+      signal,
+    );
+  }
+
+  async cancelRollback(
+    prepared: RescueRollbackPreparedDetail,
+    signal?: AbortSignal,
+  ): Promise<RescueRepairSnapshot> {
+    const exactPrepared = parseRollbackPreparedDetail(prepared);
+    const requestId = this.#nextRequestId();
+    return await this.#post(
+      {
+        apiVersion: RESCUE_ROLLBACK_API_VERSION,
+        requestId,
+        operation: "repair.fstab.rollback.cancel",
+        preparedId: exactPrepared.preparedId,
+        rollbackId: exactPrepared.rollbackId,
+        planHash: exactPrepared.planHash,
+        source: exactPrepared.source,
+      },
+      requestId,
+      "repair.fstab.rollback.cancel",
+      signal,
+    );
+  }
+
   #nextRequestId(): string {
     const requestId = this.#requestId();
     if (!REQUEST_ID.test(requestId))
@@ -279,7 +403,8 @@ export class RescueRepairClient {
       throw new RescueRepairUnavailableError();
     }
     if (
-      operation === "repair.status" &&
+      (operation === "repair.status" ||
+        operation === "repair.fstab.rollback.status") &&
       (response.status === 404 || response.status === 503)
     )
       throw new RescueRepairUnavailableError();
@@ -349,7 +474,7 @@ export function parseRescueRepairResponse(
     const state = parseState(error.state);
     const stateVersion = parseStateVersion(error.stateVersion);
     const token = parseErrorToken(error.error);
-    const detail = parseDetail(error.detail, state);
+    const detail = parseDetail(error.detail, state, expectedOperation);
     throw new RescueRepairServiceError(token, stateVersion, state, detail);
   }
   const response = exactRecord(value, [
@@ -365,7 +490,7 @@ export function parseRescueRepairResponse(
   if (response.outcome !== "ok")
     throw new Error("Risposta del servizio di riparazione non valida.");
   const state = parseState(response.state);
-  const detail = parseDetail(response.detail, state);
+  const detail = parseDetail(response.detail, state, expectedOperation);
   return Object.freeze({
     requestId: expectedRequestId,
     operation: expectedOperation,
@@ -382,6 +507,32 @@ export function preparedRepairDetail(
     snapshot.detail?.kind === "fstab-prepared"
     ? snapshot.detail
     : undefined;
+}
+
+export function preparedRollbackDetail(
+  snapshot: RescueRepairSnapshot | undefined,
+): RescueRollbackPreparedDetail | undefined {
+  return snapshot?.state === "prepared" &&
+    snapshot.detail?.kind === "fstab-rollback-prepared"
+    ? snapshot.detail
+    : undefined;
+}
+
+export function rollbackSourceReceipt(
+  snapshot: RescueRepairSnapshot | undefined,
+): RescueRollbackSourceReceipt | undefined {
+  if (
+    snapshot?.state !== "succeeded" ||
+    snapshot.detail?.kind !== "terminal" ||
+    snapshot.detail.terminalOutcome !== "committed" ||
+    snapshot.detail.reservationId === null ||
+    snapshot.detail.transactionBindingSha256 === null
+  )
+    return undefined;
+  return parseRollbackSourceReceipt({
+    reservationId: snapshot.detail.reservationId,
+    transactionBindingSha256: snapshot.detail.transactionBindingSha256,
+  });
 }
 
 export function rescueRepairNeedsPolling(
@@ -443,6 +594,8 @@ export function rescueRepairErrorMessage(
       return "Approvazione rifiutata: controlla il piano e la frase di conferma.";
     case "recovery-unavailable":
       return "Recupero automatico non disponibile. Riavvia KernAid Rescue e richiedi assistenza.";
+    case "rollback-unavailable":
+      return "Il rollback verificato non è disponibile in questa build Rescue.";
     case "unauthorized":
       return "Il pannello non è autorizzato a usare il servizio di riparazione.";
     case "prepare-failed":
@@ -469,8 +622,12 @@ export function createRescueRepairApprovalId(): string {
 function parseDetail(
   value: unknown,
   state: RescueRepairState,
+  operation: RescueRepairOperation,
 ): RescueRepairDetail {
-  if (state === "prepared") return parsePreparedDetail(value);
+  if (state === "prepared")
+    return operation.startsWith("repair.fstab.rollback.")
+      ? parseRollbackPreparedDetail(value)
+      : parsePreparedDetail(value);
   if (
     state === "succeeded" ||
     state === "restored" ||
@@ -478,7 +635,7 @@ function parseDetail(
     state === "manual-reconciliation-required" ||
     state === "failed"
   )
-    return parseTerminalDetail(value, state);
+    return parseTerminalDetail(value, state, operation);
   if (value !== null)
     throw new Error("Dettaglio dello stato riparazione non valido.");
   return null;
@@ -542,9 +699,79 @@ function parsePreparedDetail(value: unknown): RescueRepairPreparedDetail {
   }) as unknown as RescueRepairPreparedDetail;
 }
 
+function parseRollbackSourceReceipt(
+  value: unknown,
+): RescueRollbackSourceReceipt {
+  const item = exactRecord(value, [
+    "reservationId",
+    "transactionBindingSha256",
+  ]);
+  if (
+    typeof item.reservationId !== "string" ||
+    !/^B-[a-f0-9]{32}$/u.test(item.reservationId) ||
+    typeof item.transactionBindingSha256 !== "string" ||
+    !SHA256.test(item.transactionBindingSha256)
+  )
+    throw new Error("Receipt sorgente rollback non valida.");
+  return structuredClone(item) as unknown as RescueRollbackSourceReceipt;
+}
+
+function parseRollbackPreparedDetail(
+  value: unknown,
+): RescueRollbackPreparedDetail {
+  const item = exactRecord(value, [
+    "kind",
+    "preparedId",
+    "rollbackId",
+    "sessionId",
+    "planId",
+    "planHash",
+    "targetFingerprint",
+    "source",
+    "resourceId",
+    "backupLocator",
+    "actionId",
+    "risk",
+    "nextApprovalSequence",
+    "confirmationRequired",
+  ]);
+  const source = parseRollbackSourceReceipt(item.source);
+  if (
+    item.kind !== "fstab-rollback-prepared" ||
+    typeof item.preparedId !== "string" ||
+    !PREPARED_ID.test(item.preparedId) ||
+    typeof item.rollbackId !== "string" ||
+    !ROLLBACK_ID.test(item.rollbackId) ||
+    typeof item.sessionId !== "string" ||
+    !SESSION_ID.test(item.sessionId) ||
+    typeof item.planId !== "string" ||
+    !PLAN_ID.test(item.planId) ||
+    typeof item.planHash !== "string" ||
+    !SHA256.test(item.planHash) ||
+    typeof item.targetFingerprint !== "string" ||
+    !SHA256.test(item.targetFingerprint) ||
+    item.resourceId !== RESCUE_FSTAB_RESOURCE_ID ||
+    typeof item.backupLocator !== "string" ||
+    !BACKUP_LOCATOR.test(item.backupLocator) ||
+    item.backupLocator !== `vault://repair/${source.reservationId}` ||
+    item.actionId !== RESCUE_FSTAB_ROLLBACK_ACTION_ID ||
+    item.risk !== "R2" ||
+    !Number.isSafeInteger(item.nextApprovalSequence) ||
+    Number(item.nextApprovalSequence) < 2 ||
+    Number(item.nextApprovalSequence) > 1_000_000 ||
+    item.confirmationRequired !== RESCUE_FSTAB_ROLLBACK_CONFIRMATION
+  )
+    throw new Error("Piano rollback fstab non valido.");
+  return structuredClone({
+    ...item,
+    source,
+  }) as unknown as RescueRollbackPreparedDetail;
+}
+
 function parseTerminalDetail(
   value: unknown,
   state: RescueRepairState,
+  operation: RescueRepairOperation,
 ): RescueRepairTerminalDetail {
   const item = exactRecord(value, [
     "kind",
@@ -558,6 +785,7 @@ function parseTerminalDetail(
     "committed",
     "closed-before-unchanged",
     "closed-before-restored",
+    "rolled-back-original",
     "cancelled",
     "manual-reconciliation-required",
     "failed",
@@ -589,6 +817,7 @@ function parseTerminalDetail(
     !terminalOutcomeMatchesState(
       item.terminalOutcome as RescueRepairTerminalOutcome,
       state,
+      operation,
     )
   )
     throw new Error("Esito terminale della riparazione non valido.");
@@ -598,12 +827,15 @@ function parseTerminalDetail(
 function terminalOutcomeMatchesState(
   outcome: RescueRepairTerminalOutcome,
   state: RescueRepairState,
+  operation: RescueRepairOperation,
 ): boolean {
   if (state === "succeeded") return outcome === "committed";
   if (state === "restored")
     return (
       outcome === "closed-before-unchanged" ||
-      outcome === "closed-before-restored"
+      outcome === "closed-before-restored" ||
+      (operation.startsWith("repair.fstab.rollback.") &&
+        outcome === "rolled-back-original")
     );
   if (state === "cancelled") return outcome === "cancelled";
   if (state === "manual-reconciliation-required")
@@ -617,11 +849,19 @@ function assertEnvelope(
   expectedOperation: RescueRepairOperation,
 ): void {
   if (
-    item.apiVersion !== RESCUE_REPAIR_API_VERSION ||
+    item.apiVersion !== apiVersionForOperation(expectedOperation) ||
     item.requestId !== expectedRequestId ||
     item.operation !== expectedOperation
   )
     throw new Error("Correlazione della risposta riparazione non valida.");
+}
+
+function apiVersionForOperation(
+  operation: RescueRepairOperation,
+): typeof RESCUE_REPAIR_API_VERSION | typeof RESCUE_ROLLBACK_API_VERSION {
+  return operation.startsWith("repair.fstab.rollback.")
+    ? RESCUE_ROLLBACK_API_VERSION
+    : RESCUE_REPAIR_API_VERSION;
 }
 
 function parseState(value: unknown): RescueRepairState {
@@ -659,6 +899,7 @@ function parseErrorToken(value: unknown): RescueRepairErrorToken {
     "cancel-failed",
     "execution-failed",
     "recovery-unavailable",
+    "rollback-unavailable",
     "internal",
   ];
   if (!tokens.includes(value as RescueRepairErrorToken))

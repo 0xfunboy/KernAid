@@ -1292,6 +1292,58 @@ class RepairRelayTests(unittest.TestCase):
         for request in (self.STATUS, prepare, approve, cancel):
             rescue_server._validate_repair_request(request)
 
+        source = {
+            "reservationId": "B-" + "9" * 32,
+            "transactionBindingSha256": "sha256:" + "8" * 64,
+        }
+        rollback_status = {
+            "apiVersion": rescue_server.ROLLBACK_API_VERSION,
+            "requestId": self.STATUS["requestId"],
+            "operation": "repair.fstab.rollback.status",
+        }
+        rollback_prepare = {
+            **rollback_status,
+            "operation": "repair.fstab.rollback.prepare",
+            "source": source,
+        }
+        rollback_approve = {
+            **rollback_status,
+            "operation": "repair.fstab.rollback.approve",
+            "preparedId": "Q-" + "1" * 32,
+            "rollbackId": "RB-" + "2" * 32,
+            "sessionId": "S-" + "3" * 32,
+            "planId": "P-" + "4" * 32,
+            "planHash": "sha256:" + "5" * 64,
+            "source": source,
+            "approvalId": "A-" + "6" * 32,
+            "approvalSequence": 2,
+            "typedConfirmation": "RIPRISTINA FSTAB ORIGINALE",
+        }
+        rollback_cancel = {
+            **rollback_status,
+            "operation": "repair.fstab.rollback.cancel",
+            "preparedId": rollback_approve["preparedId"],
+            "rollbackId": rollback_approve["rollbackId"],
+            "planHash": rollback_approve["planHash"],
+            "source": source,
+        }
+        for request in (
+            rollback_status,
+            rollback_prepare,
+            rollback_approve,
+            rollback_cancel,
+        ):
+            rescue_server._validate_repair_request(request)
+
+        for cross_version in (
+            {**rollback_prepare, "apiVersion": rescue_server.REPAIR_API_VERSION},
+            {**prepare, "apiVersion": rescue_server.ROLLBACK_API_VERSION},
+        ):
+            with self.assertRaisesRegex(
+                rescue_server.RepairRelayError, "invalid-request"
+            ):
+                rescue_server._validate_repair_request(cross_version)
+
         for malformed in (
             {**prepare, "path": "/etc/fstab"},
             {**prepare, "bytes": "replacement"},
@@ -1344,6 +1396,52 @@ class RepairRelayTests(unittest.TestCase):
                     {**prepared, "detail": {**prepared["detail"], **invalid}},
                     self.STATUS,
                 )
+        rollback_request = {
+            "apiVersion": rescue_server.ROLLBACK_API_VERSION,
+            "requestId": self.STATUS["requestId"],
+            "operation": "repair.fstab.rollback.prepare",
+            "source": {
+                "reservationId": "B-" + "9" * 32,
+                "transactionBindingSha256": "sha256:" + "8" * 64,
+            },
+        }
+        rollback_prepared = {
+            **prepared,
+            "apiVersion": rescue_server.ROLLBACK_API_VERSION,
+            "operation": rollback_request["operation"],
+            "detail": {
+                "kind": "fstab-rollback-prepared",
+                "preparedId": "Q-" + "1" * 32,
+                "rollbackId": "RB-" + "2" * 32,
+                "sessionId": "S-" + "3" * 32,
+                "planId": "P-" + "4" * 32,
+                "planHash": "sha256:" + "5" * 64,
+                "targetFingerprint": "sha256:" + "6" * 64,
+                "source": rollback_request["source"],
+                "resourceId": "rescue:selected-linux-root:etc/fstab",
+                "backupLocator": "vault://repair/B-" + "9" * 32,
+                "actionId": "linux.fstab.restore",
+                "risk": "R2",
+                "nextApprovalSequence": 2,
+                "confirmationRequired": "RIPRISTINA FSTAB ORIGINALE",
+            },
+        }
+        rescue_server._validate_repair_response(
+            rollback_prepared, rollback_request
+        )
+        with self.assertRaisesRegex(
+            rescue_server.RepairRelayError, "invalid-response"
+        ):
+            rescue_server._validate_repair_response(
+                {
+                    **rollback_prepared,
+                    "detail": {
+                        **rollback_prepared["detail"],
+                        "backupLocator": "/run/kernaid-vault/original",
+                    },
+                },
+                rollback_request,
+            )
         terminal = {
             **self.STATUS,
             "outcome": "ok",
@@ -1359,6 +1457,31 @@ class RepairRelayTests(unittest.TestCase):
             },
         }
         rescue_server._validate_repair_response(terminal, self.STATUS)
+        rollback_terminal = {
+            **terminal,
+            "apiVersion": rescue_server.ROLLBACK_API_VERSION,
+            "operation": "repair.fstab.rollback.status",
+            "detail": {
+                **terminal["detail"],
+                "terminalOutcome": "rolled-back-original",
+                "reservationId": "B-" + "9" * 32,
+            },
+        }
+        rescue_server._validate_repair_response(
+            rollback_terminal,
+            {
+                **self.STATUS,
+                "apiVersion": rescue_server.ROLLBACK_API_VERSION,
+                "operation": "repair.fstab.rollback.status",
+            },
+        )
+        with self.assertRaisesRegex(
+            rescue_server.RepairRelayError, "invalid-response"
+        ):
+            rescue_server._validate_repair_response(
+                {**terminal, "detail": rollback_terminal["detail"]},
+                self.STATUS,
+            )
         failed_prepare = {
             **terminal,
             "state": "failed",

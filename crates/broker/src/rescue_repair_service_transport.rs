@@ -4,6 +4,7 @@ use crate::rescue_repair_service::{
     REPAIR_SERVICE_MAX_FRAME_BYTES, RepairExecutionFailureStage, RepairPreparationEngine,
     RescueRepairService,
 };
+use crate::rescue_repair_service_engine::RescueFstabRollbackBackend;
 use rustix::{
     event::{PollFd, PollFlags, Timespec, poll},
     fd::{AsFd, BorrowedFd, OwnedFd},
@@ -58,7 +59,9 @@ impl std::error::Error for RepairServiceRuntimeError {}
 
 /// Runs the persistent Accept=no service. The caller must pass the sole FD 3
 /// obtained from the systemd activation ownership wrapper.
-pub fn run_activated_repair_service<Engine: RepairPreparationEngine>(
+pub fn run_activated_repair_service<
+    Engine: RepairPreparationEngine + RescueFstabRollbackBackend,
+>(
     listener: OwnedFd,
     engine: Engine,
 ) -> Result<(), RepairServiceRuntimeError> {

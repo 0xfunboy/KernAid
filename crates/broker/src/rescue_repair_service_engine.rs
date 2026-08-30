@@ -19,7 +19,8 @@ use crate::{
         ProductionRescueFstabVaultReservation,
     },
     rescue_repair_service::{
-        BoundRepairApproval, BrokerOwnedPrepareCommand, PreparedRepairDescriptor,
+        BoundRepairApproval, BoundRollbackApproval, BrokerOwnedPrepareCommand,
+        BrokerOwnedRollbackPrepareCommand, PreparedRepairDescriptor, PreparedRollbackDescriptor,
         RepairEngineFailure, RepairExecutionFailureStage, RepairPreparationEngine,
         RepairPrepareFailureStage, RepairTerminalOutcome, RepairTerminalReceipt,
     },
@@ -29,6 +30,43 @@ use kernaid_core::{
 };
 use kernaid_protocol::rescue_repair::RescueFstabPrepareRequest;
 use std::time::Instant;
+
+/// Closed seam for the post-commit rollback public layer. Implementations must
+/// retain all Vault/root authority in the associated types; commands and
+/// descriptors are path-free audit material only. The production Vault/root
+/// implementation is intentionally not part of this layer.
+pub trait RescueFstabRollbackBackend: Send + 'static {
+    type PreparedRollback: Send + 'static;
+    type ApprovedRollback: Send + 'static;
+
+    fn prepare_rollback(
+        &mut self,
+        command: &BrokerOwnedRollbackPrepareCommand,
+        deadline: Instant,
+    ) -> Result<(Self::PreparedRollback, PreparedRollbackDescriptor), RepairEngineFailure>;
+
+    fn approve_rollback(
+        &mut self,
+        prepared: Self::PreparedRollback,
+        approval: &BoundRollbackApproval,
+        deadline: Instant,
+    ) -> Result<Self::ApprovedRollback, RepairEngineFailure>;
+
+    fn execute_rollback(
+        &mut self,
+        approved: Self::ApprovedRollback,
+        deadline: Instant,
+    ) -> Result<RepairTerminalReceipt, RepairEngineFailure>;
+
+    fn cancel_prepared_rollback(
+        prepared: Self::PreparedRollback,
+        deadline: Instant,
+    ) -> Result<(), RepairEngineFailure>;
+}
+
+/// Uninhabited until the dedicated Vault/root rollback executor is wired.
+pub enum ProductionPreparedRollback {}
+pub enum ProductionApprovedRollback {}
 
 type ProductionPreparedPlan = PreparedRescueFstabPlan<
     ProductionRescueFstabTargetGuard,
@@ -221,6 +259,43 @@ impl RepairPreparationEngine for ProductionRepairEngine {
             .plan
             .cancel(deadline)
             .map_err(|_| RepairEngineFailure::CancelFailed)
+    }
+}
+
+impl RescueFstabRollbackBackend for ProductionRepairEngine {
+    type PreparedRollback = ProductionPreparedRollback;
+    type ApprovedRollback = ProductionApprovedRollback;
+
+    fn prepare_rollback(
+        &mut self,
+        _command: &BrokerOwnedRollbackPrepareCommand,
+        _deadline: Instant,
+    ) -> Result<(Self::PreparedRollback, PreparedRollbackDescriptor), RepairEngineFailure> {
+        Err(RepairEngineFailure::RollbackUnavailable)
+    }
+
+    fn approve_rollback(
+        &mut self,
+        prepared: Self::PreparedRollback,
+        _approval: &BoundRollbackApproval,
+        _deadline: Instant,
+    ) -> Result<Self::ApprovedRollback, RepairEngineFailure> {
+        match prepared {}
+    }
+
+    fn execute_rollback(
+        &mut self,
+        approved: Self::ApprovedRollback,
+        _deadline: Instant,
+    ) -> Result<RepairTerminalReceipt, RepairEngineFailure> {
+        match approved {}
+    }
+
+    fn cancel_prepared_rollback(
+        prepared: Self::PreparedRollback,
+        _deadline: Instant,
+    ) -> Result<(), RepairEngineFailure> {
+        match prepared {}
     }
 }
 

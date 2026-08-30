@@ -5,6 +5,7 @@
 //! discovered boot-local target and can never submit a pathname, device name,
 //! action identifier, command, observed bytes, or replacement bytes.
 
+use crate::rescue_repair_service_engine::RescueFstabRollbackBackend;
 use kernaid_core::RESCUE_FSTAB_TYPED_CONFIRMATION;
 use kernaid_linux_pack::production_candidate_contract::{ACTION_ID, RESOURCE_ID};
 use kernaid_protocol::rescue_vault::RequestId;
@@ -18,6 +19,7 @@ use std::{
 };
 
 pub const REPAIR_SERVICE_API_VERSION: &str = "kernaid.dev/rescue-repair-service/v1alpha1";
+pub const ROLLBACK_SERVICE_API_VERSION: &str = "kernaid.dev/rescue-repair-service/v1alpha2";
 pub const REPAIR_SERVICE_MAX_FRAME_BYTES: usize = 4096;
 
 // Preparation includes the repeated root-owned target observation plus the
@@ -27,6 +29,50 @@ const PREPARE_TIMEOUT: Duration = Duration::from_secs(150);
 const EXECUTE_TIMEOUT: Duration = Duration::from_secs(150);
 const CANCEL_TIMEOUT: Duration = Duration::from_secs(15);
 const RISK_ID: &str = "R2";
+const ROLLBACK_ACTION_ID: &str = "linux.fstab.restore";
+const ROLLBACK_CONFIRMATION: &str = "RIPRISTINA FSTAB ORIGINALE";
+
+/// Path-free public identity of the committed source transaction. This value
+/// can select a source receipt but carries no Vault or filesystem authority.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RollbackSourceReceipt {
+    reservation_id: String,
+    transaction_binding_sha256: String,
+}
+
+impl RollbackSourceReceipt {
+    pub fn new(
+        reservation_id: impl Into<String>,
+        transaction_binding_sha256: impl Into<String>,
+    ) -> Result<Self, RepairEngineFailure> {
+        let value = Self {
+            reservation_id: reservation_id.into(),
+            transaction_binding_sha256: transaction_binding_sha256.into(),
+        };
+        value
+            .validate()
+            .map_err(|_| RepairEngineFailure::Internal)?;
+        Ok(value)
+    }
+
+    pub fn reservation_id(&self) -> &str {
+        &self.reservation_id
+    }
+
+    pub fn transaction_binding_sha256(&self) -> &str {
+        &self.transaction_binding_sha256
+    }
+
+    fn validate(&self) -> Result<(), RepairServiceErrorToken> {
+        if !valid_reservation_id(&self.reservation_id)
+            || !valid_prefixed_hash(&self.transaction_binding_sha256, "sha256:")
+        {
+            return Err(RepairServiceErrorToken::InvalidRequest);
+        }
+        Ok(())
+    }
+}
 
 /// Boot-local, path-free selector accepted by `repair.fstab.prepare`.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -112,6 +158,59 @@ pub enum RepairServiceRequest {
         #[serde(rename = "planHash")]
         plan_hash: String,
     },
+    #[serde(rename = "repair.fstab.rollback.status")]
+    RollbackStatus {
+        #[serde(rename = "apiVersion")]
+        api_version: String,
+        #[serde(rename = "requestId")]
+        request_id: String,
+    },
+    #[serde(rename = "repair.fstab.rollback.prepare")]
+    RollbackPrepare {
+        #[serde(rename = "apiVersion")]
+        api_version: String,
+        #[serde(rename = "requestId")]
+        request_id: String,
+        source: RollbackSourceReceipt,
+    },
+    #[serde(rename = "repair.fstab.rollback.approve")]
+    RollbackApprove {
+        #[serde(rename = "apiVersion")]
+        api_version: String,
+        #[serde(rename = "requestId")]
+        request_id: String,
+        #[serde(rename = "preparedId")]
+        prepared_id: String,
+        #[serde(rename = "rollbackId")]
+        rollback_id: String,
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        #[serde(rename = "planId")]
+        plan_id: String,
+        #[serde(rename = "planHash")]
+        plan_hash: String,
+        source: RollbackSourceReceipt,
+        #[serde(rename = "approvalId")]
+        approval_id: String,
+        #[serde(rename = "approvalSequence")]
+        approval_sequence: u64,
+        #[serde(rename = "typedConfirmation")]
+        typed_confirmation: String,
+    },
+    #[serde(rename = "repair.fstab.rollback.cancel")]
+    RollbackCancel {
+        #[serde(rename = "apiVersion")]
+        api_version: String,
+        #[serde(rename = "requestId")]
+        request_id: String,
+        #[serde(rename = "preparedId")]
+        prepared_id: String,
+        #[serde(rename = "rollbackId")]
+        rollback_id: String,
+        #[serde(rename = "planHash")]
+        plan_hash: String,
+        source: RollbackSourceReceipt,
+    },
 }
 
 impl RepairServiceRequest {
@@ -121,6 +220,10 @@ impl RepairServiceRequest {
             Self::Prepare { .. } => "repair.fstab.prepare",
             Self::Approve { .. } => "repair.fstab.approve",
             Self::Cancel { .. } => "repair.fstab.cancel",
+            Self::RollbackStatus { .. } => "repair.fstab.rollback.status",
+            Self::RollbackPrepare { .. } => "repair.fstab.rollback.prepare",
+            Self::RollbackApprove { .. } => "repair.fstab.rollback.approve",
+            Self::RollbackCancel { .. } => "repair.fstab.rollback.cancel",
         }
     }
 
@@ -129,7 +232,11 @@ impl RepairServiceRequest {
             Self::Status { api_version, .. }
             | Self::Prepare { api_version, .. }
             | Self::Approve { api_version, .. }
-            | Self::Cancel { api_version, .. } => api_version,
+            | Self::Cancel { api_version, .. }
+            | Self::RollbackStatus { api_version, .. }
+            | Self::RollbackPrepare { api_version, .. }
+            | Self::RollbackApprove { api_version, .. }
+            | Self::RollbackCancel { api_version, .. } => api_version,
         }
     }
 
@@ -138,14 +245,26 @@ impl RepairServiceRequest {
             Self::Status { request_id, .. }
             | Self::Prepare { request_id, .. }
             | Self::Approve { request_id, .. }
-            | Self::Cancel { request_id, .. } => request_id,
+            | Self::Cancel { request_id, .. }
+            | Self::RollbackStatus { request_id, .. }
+            | Self::RollbackPrepare { request_id, .. }
+            | Self::RollbackApprove { request_id, .. }
+            | Self::RollbackCancel { request_id, .. } => request_id,
         }
     }
 
     fn validate_envelope(&self) -> Result<(), RepairServiceErrorToken> {
-        if self.api_version() != REPAIR_SERVICE_API_VERSION
-            || RequestId::parse(self.request_id()).is_err()
-        {
+        let expected_version = match self {
+            Self::Status { .. }
+            | Self::Prepare { .. }
+            | Self::Approve { .. }
+            | Self::Cancel { .. } => REPAIR_SERVICE_API_VERSION,
+            Self::RollbackStatus { .. }
+            | Self::RollbackPrepare { .. }
+            | Self::RollbackApprove { .. }
+            | Self::RollbackCancel { .. } => ROLLBACK_SERVICE_API_VERSION,
+        };
+        if self.api_version() != expected_version || RequestId::parse(self.request_id()).is_err() {
             return Err(RepairServiceErrorToken::InvalidRequest);
         }
         match self {
@@ -179,6 +298,50 @@ impl RepairServiceRequest {
                 ..
             } => {
                 if !valid_fixed_id(prepared_id, "Q-") || !valid_prefixed_hash(plan_hash, "sha256:")
+                {
+                    return Err(RepairServiceErrorToken::InvalidRequest);
+                }
+                Ok(())
+            }
+            Self::RollbackStatus { .. } => Ok(()),
+            Self::RollbackPrepare { source, .. } => source.validate(),
+            Self::RollbackApprove {
+                prepared_id,
+                rollback_id,
+                session_id,
+                plan_id,
+                plan_hash,
+                source,
+                approval_id,
+                approval_sequence,
+                typed_confirmation,
+                ..
+            } => {
+                source.validate()?;
+                if !valid_fixed_id(prepared_id, "Q-")
+                    || !valid_fixed_id(rollback_id, "RB-")
+                    || !valid_fixed_id(session_id, "S-")
+                    || !valid_fixed_id(plan_id, "P-")
+                    || !valid_prefixed_hash(plan_hash, "sha256:")
+                    || !valid_fixed_id(approval_id, "A-")
+                    || *approval_sequence == 0
+                    || typed_confirmation != ROLLBACK_CONFIRMATION
+                {
+                    return Err(RepairServiceErrorToken::InvalidRequest);
+                }
+                Ok(())
+            }
+            Self::RollbackCancel {
+                prepared_id,
+                rollback_id,
+                plan_hash,
+                source,
+                ..
+            } => {
+                source.validate()?;
+                if !valid_fixed_id(prepared_id, "Q-")
+                    || !valid_fixed_id(rollback_id, "RB-")
+                    || !valid_prefixed_hash(plan_hash, "sha256:")
                 {
                     return Err(RepairServiceErrorToken::InvalidRequest);
                 }
@@ -263,6 +426,84 @@ impl BoundRepairApproval {
     }
 }
 
+/// Broker-owned rollback preparation input. It identifies one committed source
+/// receipt and fresh plan IDs, but contains no path or write capability.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BrokerOwnedRollbackPrepareCommand {
+    request_id: String,
+    session_id: String,
+    rollback_id: String,
+    plan_id: String,
+    source: RollbackSourceReceipt,
+}
+
+impl BrokerOwnedRollbackPrepareCommand {
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+    pub fn rollback_id(&self) -> &str {
+        &self.rollback_id
+    }
+    pub fn plan_id(&self) -> &str {
+        &self.plan_id
+    }
+    pub const fn source(&self) -> &RollbackSourceReceipt {
+        &self.source
+    }
+}
+
+/// Exact rollback approval echo. The backend must submit it to the separate
+/// Core rollback admission before it may construct executable authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoundRollbackApproval {
+    request_id: String,
+    prepared_id: String,
+    rollback_id: String,
+    session_id: String,
+    plan_id: String,
+    plan_hash: String,
+    source: RollbackSourceReceipt,
+    approval_id: String,
+    approval_sequence: u64,
+    typed_confirmation: String,
+}
+
+impl BoundRollbackApproval {
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+    pub fn prepared_id(&self) -> &str {
+        &self.prepared_id
+    }
+    pub fn rollback_id(&self) -> &str {
+        &self.rollback_id
+    }
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+    pub fn plan_id(&self) -> &str {
+        &self.plan_id
+    }
+    pub fn plan_hash(&self) -> &str {
+        &self.plan_hash
+    }
+    pub const fn source(&self) -> &RollbackSourceReceipt {
+        &self.source
+    }
+    pub fn approval_id(&self) -> &str {
+        &self.approval_id
+    }
+    pub const fn approval_sequence(&self) -> u64 {
+        self.approval_sequence
+    }
+    pub fn typed_confirmation(&self) -> &str {
+        &self.typed_confirmation
+    }
+}
+
 /// Sanitized engine failure classes. No implementation error text crosses the
 /// local API boundary.
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
@@ -302,6 +543,7 @@ pub enum RepairEngineFailure {
     CancelFailed,
     ExecutionFailed(RepairExecutionFailureStage),
     RecoveryUnavailable,
+    RollbackUnavailable,
     Internal,
 }
 
@@ -342,6 +584,7 @@ impl RepairTerminalReceipt {
             RepairTerminalOutcome::Committed
                 | RepairTerminalOutcome::ClosedBeforeUnchanged
                 | RepairTerminalOutcome::ClosedBeforeRestored
+                | RepairTerminalOutcome::RolledBackOriginal
         ) && !has_transaction
         {
             return Err(RepairEngineFailure::Internal);
@@ -382,6 +625,7 @@ pub enum RepairTerminalOutcome {
     Committed,
     ClosedBeforeUnchanged,
     ClosedBeforeRestored,
+    RolledBackOriginal,
     Cancelled,
     ManualReconciliationRequired,
     Failed,
@@ -454,6 +698,67 @@ impl PreparedRepairDescriptor {
     }
 }
 
+/// Trusted, path-free rollback plan summary returned beside a non-cloneable
+/// backend authority. The hidden source approval ID proves freshness but is
+/// never serialized to the client.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedRollbackDescriptor {
+    session_id: String,
+    rollback_id: String,
+    plan_id: String,
+    plan_hash: String,
+    target_fingerprint: String,
+    source: RollbackSourceReceipt,
+    source_approval_id: String,
+    resource_id: String,
+    backup_locator: String,
+    next_approval_sequence: u64,
+}
+
+impl PreparedRollbackDescriptor {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        session_id: impl Into<String>,
+        rollback_id: impl Into<String>,
+        plan_id: impl Into<String>,
+        plan_hash: impl Into<String>,
+        target_fingerprint: impl Into<String>,
+        source: RollbackSourceReceipt,
+        source_approval_id: impl Into<String>,
+        resource_id: impl Into<String>,
+        backup_locator: impl Into<String>,
+        next_approval_sequence: u64,
+    ) -> Result<Self, RepairEngineFailure> {
+        let value = Self {
+            session_id: session_id.into(),
+            rollback_id: rollback_id.into(),
+            plan_id: plan_id.into(),
+            plan_hash: plan_hash.into(),
+            target_fingerprint: target_fingerprint.into(),
+            source,
+            source_approval_id: source_approval_id.into(),
+            resource_id: resource_id.into(),
+            backup_locator: backup_locator.into(),
+            next_approval_sequence,
+        };
+        if !valid_fixed_id(&value.session_id, "S-")
+            || !valid_fixed_id(&value.rollback_id, "RB-")
+            || !valid_fixed_id(&value.plan_id, "P-")
+            || !valid_prefixed_hash(&value.plan_hash, "sha256:")
+            || !valid_prefixed_hash(&value.target_fingerprint, "sha256:")
+            || value.source.validate().is_err()
+            || !valid_fixed_id(&value.source_approval_id, "A-")
+            || value.resource_id != RESOURCE_ID
+            || !valid_backup_locator(&value.backup_locator)
+            || value.backup_locator != format!("vault://repair/{}", value.source.reservation_id)
+            || value.next_approval_sequence < 2
+        {
+            return Err(RepairEngineFailure::Internal);
+        }
+        Ok(value)
+    }
+}
+
 /// Seam implemented by the broker-owned preparation/Core/executor adapter.
 /// `Prepared` and `Approved` are deliberately non-Clone associated types.
 pub trait RepairPreparationEngine: Send + 'static {
@@ -504,6 +809,7 @@ pub enum RepairServiceErrorToken {
     CancelFailed,
     ExecutionFailed,
     RecoveryUnavailable,
+    RollbackUnavailable,
     Internal,
 }
 
@@ -544,6 +850,25 @@ pub struct PreparedRepairDetail {
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct PreparedRollbackDetail {
+    kind: &'static str,
+    prepared_id: String,
+    rollback_id: String,
+    session_id: String,
+    plan_id: String,
+    plan_hash: String,
+    target_fingerprint: String,
+    source: RollbackSourceReceipt,
+    resource_id: String,
+    backup_locator: String,
+    action_id: &'static str,
+    risk: &'static str,
+    next_approval_sequence: u64,
+    confirmation_required: &'static str,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 struct PreparedBackupDetail {
     state: &'static str,
     vault_distinct: bool,
@@ -563,7 +888,8 @@ pub struct TerminalRepairDetail {
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum RepairResponseDetail {
-    Prepared(PreparedRepairDetail),
+    Prepared(Box<PreparedRepairDetail>),
+    RollbackPrepared(Box<PreparedRollbackDetail>),
     Terminal(TerminalRepairDetail),
 }
 
@@ -599,6 +925,34 @@ struct PreparedSummary {
     descriptor: PreparedRepairDescriptor,
 }
 
+#[derive(Clone, Debug)]
+struct PreparedRollbackSummary {
+    prepare_request_id: String,
+    prepared_id: String,
+    descriptor: PreparedRollbackDescriptor,
+}
+
+impl PreparedRollbackSummary {
+    fn detail(&self) -> PreparedRollbackDetail {
+        PreparedRollbackDetail {
+            kind: "fstab-rollback-prepared",
+            prepared_id: self.prepared_id.clone(),
+            rollback_id: self.descriptor.rollback_id.clone(),
+            session_id: self.descriptor.session_id.clone(),
+            plan_id: self.descriptor.plan_id.clone(),
+            plan_hash: self.descriptor.plan_hash.clone(),
+            target_fingerprint: self.descriptor.target_fingerprint.clone(),
+            source: self.descriptor.source.clone(),
+            resource_id: self.descriptor.resource_id.clone(),
+            backup_locator: self.descriptor.backup_locator.clone(),
+            action_id: ROLLBACK_ACTION_ID,
+            risk: RISK_ID,
+            next_approval_sequence: self.descriptor.next_approval_sequence,
+            confirmation_required: ROLLBACK_CONFIRMATION,
+        }
+    }
+}
+
 impl PreparedSummary {
     fn detail(&self) -> PreparedRepairDetail {
         PreparedRepairDetail {
@@ -625,7 +979,7 @@ impl PreparedSummary {
     }
 }
 
-enum InternalState<Prepared> {
+enum InternalState<Prepared, PreparedRollback> {
     Idle,
     Preparing {
         operation_id: u64,
@@ -639,16 +993,34 @@ enum InternalState<Prepared> {
     Executing {
         operation_id: u64,
     },
+    RollbackPreparing {
+        operation_id: u64,
+        command: BrokerOwnedRollbackPrepareCommand,
+        prepared_id: String,
+        source_terminal: Option<RepairTerminalReceipt>,
+    },
+    RollbackPrepared {
+        authority: PreparedRollback,
+        summary: PreparedRollbackSummary,
+        source_terminal: RepairTerminalReceipt,
+    },
+    RollbackExecuting {
+        operation_id: u64,
+    },
+    RollbackCancelling {
+        operation_id: u64,
+        source_terminal: RepairTerminalReceipt,
+    },
     Terminal(RepairTerminalReceipt),
 }
 
-struct ServiceState<Prepared> {
+struct ServiceState<Prepared, PreparedRollback> {
     version: u64,
     next_operation_id: u64,
-    phase: InternalState<Prepared>,
+    phase: InternalState<Prepared, PreparedRollback>,
 }
 
-enum WorkerJob<Prepared> {
+enum WorkerJob<Prepared, PreparedRollback> {
     Prepare {
         operation_id: u64,
         command: BrokerOwnedPrepareCommand,
@@ -665,9 +1037,25 @@ enum WorkerJob<Prepared> {
         prepared: Prepared,
         deadline: Instant,
     },
+    RollbackPrepare {
+        operation_id: u64,
+        command: BrokerOwnedRollbackPrepareCommand,
+        deadline: Instant,
+    },
+    RollbackApproveAndExecute {
+        operation_id: u64,
+        prepared: PreparedRollback,
+        approval: BoundRollbackApproval,
+        deadline: Instant,
+    },
+    RollbackCancel {
+        operation_id: u64,
+        prepared: PreparedRollback,
+        deadline: Instant,
+    },
 }
 
-enum WorkerResult<Prepared> {
+enum WorkerResult<Prepared, PreparedRollback> {
     Prepared {
         operation_id: u64,
         result: Result<(Prepared, PreparedRepairDescriptor), RepairEngineFailure>,
@@ -677,6 +1065,18 @@ enum WorkerResult<Prepared> {
         result: Result<RepairTerminalReceipt, RepairEngineFailure>,
     },
     Cancelled {
+        operation_id: u64,
+        result: Result<(), RepairEngineFailure>,
+    },
+    RollbackPrepared {
+        operation_id: u64,
+        result: Result<(PreparedRollback, PreparedRollbackDescriptor), RepairEngineFailure>,
+    },
+    RollbackExecuted {
+        operation_id: u64,
+        result: Result<RepairTerminalReceipt, RepairEngineFailure>,
+    },
+    RollbackCancelled {
         operation_id: u64,
         result: Result<(), RepairEngineFailure>,
     },
@@ -702,14 +1102,14 @@ impl std::error::Error for RepairServiceStartError {}
 /// Single non-cloneable service state machine. Startup performs the durable
 /// PendingSingleton recovery barrier before the worker is created or any
 /// readiness notification can be emitted by the caller.
-pub struct RescueRepairService<Engine: RepairPreparationEngine> {
-    state: ServiceState<Engine::Prepared>,
-    jobs: SyncSender<WorkerJob<Engine::Prepared>>,
-    results: Receiver<WorkerResult<Engine::Prepared>>,
+pub struct RescueRepairService<Engine: RepairPreparationEngine + RescueFstabRollbackBackend> {
+    state: ServiceState<Engine::Prepared, Engine::PreparedRollback>,
+    jobs: SyncSender<WorkerJob<Engine::Prepared, Engine::PreparedRollback>>,
+    results: Receiver<WorkerResult<Engine::Prepared, Engine::PreparedRollback>>,
     execution_failure_diagnostic: Option<RepairExecutionFailureStage>,
 }
 
-impl<Engine: RepairPreparationEngine> RescueRepairService<Engine> {
+impl<Engine: RepairPreparationEngine + RescueFstabRollbackBackend> RescueRepairService<Engine> {
     pub fn start(
         mut engine: Engine,
         recovery_deadline: Instant,
@@ -796,7 +1196,9 @@ impl<Engine: RepairPreparationEngine> RescueRepairService<Engine> {
 
     fn dispatch(&mut self, request: RepairServiceRequest) -> Result<(), RepairServiceErrorToken> {
         match request {
-            RepairServiceRequest::Status { .. } => Ok(()),
+            RepairServiceRequest::Status { .. } | RepairServiceRequest::RollbackStatus { .. } => {
+                Ok(())
+            }
             RepairServiceRequest::Prepare {
                 request_id, target, ..
             } => self.begin_prepare(request_id, target),
@@ -826,6 +1228,47 @@ impl<Engine: RepairPreparationEngine> RescueRepairService<Engine> {
                 plan_hash,
                 ..
             } => self.begin_cancel(&request_id, &prepared_id, &plan_hash),
+            RepairServiceRequest::RollbackPrepare {
+                request_id, source, ..
+            } => self.begin_rollback_prepare(request_id, source),
+            RepairServiceRequest::RollbackApprove {
+                request_id,
+                prepared_id,
+                rollback_id,
+                session_id,
+                plan_id,
+                plan_hash,
+                source,
+                approval_id,
+                approval_sequence,
+                typed_confirmation,
+                ..
+            } => self.begin_rollback_approval(BoundRollbackApproval {
+                request_id,
+                prepared_id,
+                rollback_id,
+                session_id,
+                plan_id,
+                plan_hash,
+                source,
+                approval_id,
+                approval_sequence,
+                typed_confirmation,
+            }),
+            RepairServiceRequest::RollbackCancel {
+                request_id,
+                prepared_id,
+                rollback_id,
+                plan_hash,
+                source,
+                ..
+            } => self.begin_rollback_cancel(
+                &request_id,
+                &prepared_id,
+                &rollback_id,
+                &plan_hash,
+                &source,
+            ),
         }
     }
 
@@ -836,10 +1279,16 @@ impl<Engine: RepairPreparationEngine> RescueRepairService<Engine> {
     ) -> Result<(), RepairServiceErrorToken> {
         match self.state.phase {
             InternalState::Idle => {}
-            InternalState::Preparing { .. } | InternalState::Executing { .. } => {
+            InternalState::Preparing { .. }
+            | InternalState::Executing { .. }
+            | InternalState::RollbackPreparing { .. }
+            | InternalState::RollbackExecuting { .. }
+            | InternalState::RollbackCancelling { .. } => {
                 return Err(RepairServiceErrorToken::Busy);
             }
-            InternalState::Prepared { .. } | InternalState::Terminal(_) => {
+            InternalState::Prepared { .. }
+            | InternalState::RollbackPrepared { .. }
+            | InternalState::Terminal(_) => {
                 return Err(RepairServiceErrorToken::StateConflict);
             }
         }
@@ -876,10 +1325,16 @@ impl<Engine: RepairPreparationEngine> RescueRepairService<Engine> {
         approval: BoundRepairApproval,
     ) -> Result<(), RepairServiceErrorToken> {
         match &self.state.phase {
-            InternalState::Preparing { .. } | InternalState::Executing { .. } => {
+            InternalState::Preparing { .. }
+            | InternalState::Executing { .. }
+            | InternalState::RollbackPreparing { .. }
+            | InternalState::RollbackExecuting { .. }
+            | InternalState::RollbackCancelling { .. } => {
                 return Err(RepairServiceErrorToken::Busy);
             }
-            InternalState::Idle | InternalState::Terminal(_) => {
+            InternalState::Idle
+            | InternalState::Terminal(_)
+            | InternalState::RollbackPrepared { .. } => {
                 return Err(RepairServiceErrorToken::StateConflict);
             }
             InternalState::Prepared { summary, .. } => {
@@ -919,7 +1374,11 @@ impl<Engine: RepairPreparationEngine> RescueRepairService<Engine> {
             };
             let recovered = match rejected {
                 WorkerJob::ApproveAndExecute { prepared, .. } => prepared,
-                WorkerJob::Prepare { .. } | WorkerJob::Cancel { .. } => {
+                WorkerJob::Prepare { .. }
+                | WorkerJob::Cancel { .. }
+                | WorkerJob::RollbackPrepare { .. }
+                | WorkerJob::RollbackApproveAndExecute { .. }
+                | WorkerJob::RollbackCancel { .. } => {
                     return Err(RepairServiceErrorToken::Internal);
                 }
             };
@@ -939,10 +1398,16 @@ impl<Engine: RepairPreparationEngine> RescueRepairService<Engine> {
         plan_hash: &str,
     ) -> Result<(), RepairServiceErrorToken> {
         match &self.state.phase {
-            InternalState::Preparing { .. } | InternalState::Executing { .. } => {
+            InternalState::Preparing { .. }
+            | InternalState::Executing { .. }
+            | InternalState::RollbackPreparing { .. }
+            | InternalState::RollbackExecuting { .. }
+            | InternalState::RollbackCancelling { .. } => {
                 return Err(RepairServiceErrorToken::Busy);
             }
-            InternalState::Idle | InternalState::Terminal(_) => {
+            InternalState::Idle
+            | InternalState::Terminal(_)
+            | InternalState::RollbackPrepared { .. } => {
                 return Err(RepairServiceErrorToken::StateConflict);
             }
             InternalState::Prepared { summary, .. } => {
@@ -978,7 +1443,11 @@ impl<Engine: RepairPreparationEngine> RescueRepairService<Engine> {
             };
             let recovered = match rejected {
                 WorkerJob::Cancel { prepared, .. } => prepared,
-                WorkerJob::Prepare { .. } | WorkerJob::ApproveAndExecute { .. } => {
+                WorkerJob::Prepare { .. }
+                | WorkerJob::ApproveAndExecute { .. }
+                | WorkerJob::RollbackPrepare { .. }
+                | WorkerJob::RollbackApproveAndExecute { .. }
+                | WorkerJob::RollbackCancel { .. } => {
                     return Err(RepairServiceErrorToken::Internal);
                 }
             };
@@ -991,13 +1460,202 @@ impl<Engine: RepairPreparationEngine> RescueRepairService<Engine> {
         Ok(())
     }
 
+    fn begin_rollback_prepare(
+        &mut self,
+        request_id: String,
+        source: RollbackSourceReceipt,
+    ) -> Result<(), RepairServiceErrorToken> {
+        let source_terminal = match &self.state.phase {
+            InternalState::Idle => None,
+            InternalState::Terminal(receipt) if source_matches_terminal(&source, receipt) => {
+                Some(receipt.clone())
+            }
+            InternalState::Preparing { .. }
+            | InternalState::Executing { .. }
+            | InternalState::RollbackPreparing { .. }
+            | InternalState::RollbackExecuting { .. }
+            | InternalState::RollbackCancelling { .. } => {
+                return Err(RepairServiceErrorToken::Busy);
+            }
+            InternalState::Prepared { .. }
+            | InternalState::RollbackPrepared { .. }
+            | InternalState::Terminal(_) => {
+                return Err(RepairServiceErrorToken::BindingMismatch);
+            }
+        };
+        let session_id = session_id_from_request(&request_id)?;
+        let rollback_id = fresh_fixed_id("RB-")?;
+        let plan_id = fresh_fixed_id("P-")?;
+        let prepared_id = fresh_fixed_id("Q-")?;
+        let operation_id = self.take_operation_id()?;
+        let command = BrokerOwnedRollbackPrepareCommand {
+            request_id,
+            session_id,
+            rollback_id,
+            plan_id,
+            source,
+        };
+        let deadline = absolute_deadline(PREPARE_TIMEOUT)?;
+        self.jobs
+            .try_send(WorkerJob::RollbackPrepare {
+                operation_id,
+                command: command.clone(),
+                deadline,
+            })
+            .map_err(|_| RepairServiceErrorToken::Internal)?;
+        self.state.phase = InternalState::RollbackPreparing {
+            operation_id,
+            command,
+            prepared_id,
+            source_terminal,
+        };
+        self.bump_version()?;
+        Ok(())
+    }
+
+    fn begin_rollback_approval(
+        &mut self,
+        approval: BoundRollbackApproval,
+    ) -> Result<(), RepairServiceErrorToken> {
+        match &self.state.phase {
+            InternalState::RollbackPrepared { summary, .. } => {
+                if approval.request_id == summary.prepare_request_id
+                    || approval.prepared_id != summary.prepared_id
+                    || approval.rollback_id != summary.descriptor.rollback_id
+                    || approval.session_id != summary.descriptor.session_id
+                    || approval.plan_id != summary.descriptor.plan_id
+                    || approval.plan_hash != summary.descriptor.plan_hash
+                    || approval.source != summary.descriptor.source
+                    || approval.approval_id == summary.descriptor.source_approval_id
+                    || approval.approval_sequence != summary.descriptor.next_approval_sequence
+                {
+                    return Err(RepairServiceErrorToken::BindingMismatch);
+                }
+            }
+            InternalState::Preparing { .. }
+            | InternalState::Executing { .. }
+            | InternalState::RollbackPreparing { .. }
+            | InternalState::RollbackExecuting { .. }
+            | InternalState::RollbackCancelling { .. } => {
+                return Err(RepairServiceErrorToken::Busy);
+            }
+            InternalState::Idle | InternalState::Prepared { .. } | InternalState::Terminal(_) => {
+                return Err(RepairServiceErrorToken::StateConflict);
+            }
+        }
+        let operation_id = self.take_operation_id()?;
+        let deadline = absolute_deadline(EXECUTE_TIMEOUT)?;
+        let previous = std::mem::replace(
+            &mut self.state.phase,
+            InternalState::RollbackExecuting { operation_id },
+        );
+        let InternalState::RollbackPrepared {
+            authority,
+            source_terminal,
+            ..
+        } = previous
+        else {
+            return Err(RepairServiceErrorToken::Internal);
+        };
+        let job = WorkerJob::RollbackApproveAndExecute {
+            operation_id,
+            prepared: authority,
+            approval,
+            deadline,
+        };
+        if let Err(error) = self.jobs.try_send(job) {
+            let rejected = match error {
+                TrySendError::Full(job) | TrySendError::Disconnected(job) => job,
+            };
+            if let WorkerJob::RollbackApproveAndExecute { prepared, .. } = rejected {
+                let _ = Engine::cancel_prepared_rollback(prepared, Instant::now() + CANCEL_TIMEOUT);
+            }
+            self.state.phase = InternalState::Terminal(source_terminal);
+            self.bump_version()?;
+            return Err(RepairServiceErrorToken::Internal);
+        }
+        self.bump_version()?;
+        Ok(())
+    }
+
+    fn begin_rollback_cancel(
+        &mut self,
+        request_id: &str,
+        prepared_id: &str,
+        rollback_id: &str,
+        plan_hash: &str,
+        source: &RollbackSourceReceipt,
+    ) -> Result<(), RepairServiceErrorToken> {
+        match &self.state.phase {
+            InternalState::RollbackPrepared { summary, .. } => {
+                if request_id == summary.prepare_request_id
+                    || prepared_id != summary.prepared_id
+                    || rollback_id != summary.descriptor.rollback_id
+                    || plan_hash != summary.descriptor.plan_hash
+                    || source != &summary.descriptor.source
+                {
+                    return Err(RepairServiceErrorToken::BindingMismatch);
+                }
+            }
+            InternalState::Preparing { .. }
+            | InternalState::Executing { .. }
+            | InternalState::RollbackPreparing { .. }
+            | InternalState::RollbackExecuting { .. }
+            | InternalState::RollbackCancelling { .. } => {
+                return Err(RepairServiceErrorToken::Busy);
+            }
+            InternalState::Idle | InternalState::Prepared { .. } | InternalState::Terminal(_) => {
+                return Err(RepairServiceErrorToken::StateConflict);
+            }
+        }
+        let operation_id = self.take_operation_id()?;
+        let deadline = absolute_deadline(CANCEL_TIMEOUT)?;
+        let previous = std::mem::replace(
+            &mut self.state.phase,
+            InternalState::RollbackExecuting { operation_id },
+        );
+        let InternalState::RollbackPrepared {
+            authority,
+            source_terminal,
+            ..
+        } = previous
+        else {
+            return Err(RepairServiceErrorToken::Internal);
+        };
+        let job = WorkerJob::RollbackCancel {
+            operation_id,
+            prepared: authority,
+            deadline,
+        };
+        if let Err(error) = self.jobs.try_send(job) {
+            let rejected = match error {
+                TrySendError::Full(job) | TrySendError::Disconnected(job) => job,
+            };
+            if let WorkerJob::RollbackCancel { prepared, .. } = rejected {
+                let _ = Engine::cancel_prepared_rollback(prepared, Instant::now() + CANCEL_TIMEOUT);
+            }
+            self.state.phase = InternalState::Terminal(source_terminal);
+            self.bump_version()?;
+            return Err(RepairServiceErrorToken::Internal);
+        }
+        self.state.phase = InternalState::RollbackCancelling {
+            operation_id,
+            source_terminal,
+        };
+        self.bump_version()?;
+        Ok(())
+    }
+
     fn drain_results(&mut self) {
         while let Ok(result) = self.results.try_recv() {
             self.apply_worker_result(result);
         }
     }
 
-    fn apply_worker_result(&mut self, result: WorkerResult<Engine::Prepared>) {
+    fn apply_worker_result(
+        &mut self,
+        result: WorkerResult<Engine::Prepared, Engine::PreparedRollback>,
+    ) {
         match result {
             WorkerResult::Prepared {
                 operation_id,
@@ -1105,18 +1763,129 @@ impl<Engine: RepairPreparationEngine> RescueRepairService<Engine> {
                 });
                 let _ = self.bump_version();
             }
+            WorkerResult::RollbackPrepared {
+                operation_id,
+                result,
+            } => {
+                let InternalState::RollbackPreparing {
+                    operation_id: expected,
+                    command,
+                    prepared_id,
+                    source_terminal,
+                } = &self.state.phase
+                else {
+                    if let Ok((prepared, _)) = result {
+                        let _ = Engine::cancel_prepared_rollback(
+                            prepared,
+                            Instant::now() + CANCEL_TIMEOUT,
+                        );
+                    }
+                    return;
+                };
+                if operation_id != *expected {
+                    if let Ok((prepared, _)) = result {
+                        let _ = Engine::cancel_prepared_rollback(
+                            prepared,
+                            Instant::now() + CANCEL_TIMEOUT,
+                        );
+                    }
+                    return;
+                }
+                let fallback = source_terminal.clone();
+                match result {
+                    Ok((authority, descriptor))
+                        if rollback_descriptor_matches(command, &descriptor) =>
+                    {
+                        let authenticated_source = committed_source_receipt(&descriptor.source);
+                        self.state.phase = InternalState::RollbackPrepared {
+                            authority,
+                            summary: PreparedRollbackSummary {
+                                prepare_request_id: command.request_id.clone(),
+                                prepared_id: prepared_id.clone(),
+                                descriptor,
+                            },
+                            source_terminal: authenticated_source,
+                        };
+                    }
+                    Ok((authority, _)) => {
+                        let _ = Engine::cancel_prepared_rollback(
+                            authority,
+                            Instant::now() + CANCEL_TIMEOUT,
+                        );
+                        self.state.phase =
+                            fallback.map_or(InternalState::Idle, InternalState::Terminal);
+                    }
+                    Err(_) => {
+                        self.state.phase =
+                            fallback.map_or(InternalState::Idle, InternalState::Terminal);
+                    }
+                }
+                let _ = self.bump_version();
+            }
+            WorkerResult::RollbackExecuted {
+                operation_id,
+                result,
+            } => {
+                if !matches!(
+                    self.state.phase,
+                    InternalState::RollbackExecuting {
+                        operation_id: expected
+                    } if expected == operation_id
+                ) {
+                    return;
+                }
+                self.state.phase = InternalState::Terminal(match result {
+                    Ok(receipt) if receipt.outcome == RepairTerminalOutcome::RolledBackOriginal => {
+                        receipt
+                    }
+                    Ok(_) | Err(_) => failed_receipt(),
+                });
+                let _ = self.bump_version();
+            }
+            WorkerResult::RollbackCancelled {
+                operation_id,
+                result,
+            } => {
+                let InternalState::RollbackCancelling {
+                    operation_id: expected,
+                    source_terminal,
+                } = &self.state.phase
+                else {
+                    return;
+                };
+                if *expected != operation_id {
+                    return;
+                }
+                if result.is_err() && self.execution_failure_diagnostic.is_none() {
+                    self.execution_failure_diagnostic =
+                        Some(RepairExecutionFailureStage::ApprovalCancel);
+                }
+                self.state.phase = InternalState::Terminal(source_terminal.clone());
+                let _ = self.bump_version();
+            }
         }
     }
 
     fn snapshot(&self) -> (RepairPublicState, Option<RepairResponseDetail>) {
         match &self.state.phase {
             InternalState::Idle => (RepairPublicState::Idle, None),
-            InternalState::Preparing { .. } => (RepairPublicState::Preparing, None),
+            InternalState::Preparing { .. } | InternalState::RollbackPreparing { .. } => {
+                (RepairPublicState::Preparing, None)
+            }
             InternalState::Prepared { summary, .. } => (
                 RepairPublicState::Prepared,
-                Some(RepairResponseDetail::Prepared(summary.detail())),
+                Some(RepairResponseDetail::Prepared(Box::new(summary.detail()))),
             ),
             InternalState::Executing { .. } => (RepairPublicState::Executing, None),
+            InternalState::RollbackPrepared { summary, .. } => (
+                RepairPublicState::Prepared,
+                Some(RepairResponseDetail::RollbackPrepared(Box::new(
+                    summary.detail(),
+                ))),
+            ),
+            InternalState::RollbackExecuting { .. } | InternalState::RollbackCancelling { .. } => {
+                (RepairPublicState::Executing, None)
+            }
             InternalState::Terminal(receipt) => (
                 public_terminal_state(receipt.outcome),
                 Some(RepairResponseDetail::Terminal(terminal_detail(receipt))),
@@ -1124,10 +1893,43 @@ impl<Engine: RepairPreparationEngine> RescueRepairService<Engine> {
         }
     }
 
+    fn snapshot_for_operation(
+        &self,
+        operation: &str,
+    ) -> (RepairPublicState, Option<RepairResponseDetail>) {
+        let rollback_api = operation.starts_with("repair.fstab.rollback.");
+        match (&self.state.phase, rollback_api) {
+            (
+                InternalState::Preparing { .. }
+                | InternalState::Prepared { .. }
+                | InternalState::Executing { .. },
+                true,
+            )
+            | (
+                InternalState::RollbackPreparing { .. }
+                | InternalState::RollbackPrepared { .. }
+                | InternalState::RollbackExecuting { .. }
+                | InternalState::RollbackCancelling { .. },
+                false,
+            ) => (RepairPublicState::Executing, None),
+            (InternalState::Terminal(receipt), false)
+                if receipt.outcome == RepairTerminalOutcome::RolledBackOriginal =>
+            {
+                let mut legacy = receipt.clone();
+                legacy.outcome = RepairTerminalOutcome::ClosedBeforeRestored;
+                (
+                    RepairPublicState::Restored,
+                    Some(RepairResponseDetail::Terminal(terminal_detail(&legacy))),
+                )
+            }
+            _ => self.snapshot(),
+        }
+    }
+
     fn encode_success(&self, request_id: &str, operation: &str) -> Vec<u8> {
-        let (state, detail) = self.snapshot();
+        let (state, detail) = self.snapshot_for_operation(operation);
         encode_bounded(&SuccessResponse {
-            api_version: REPAIR_SERVICE_API_VERSION,
+            api_version: api_version_for_operation(operation),
             request_id,
             operation,
             outcome: "ok",
@@ -1143,9 +1945,9 @@ impl<Engine: RepairPreparationEngine> RescueRepairService<Engine> {
         operation: &str,
         error: RepairServiceErrorToken,
     ) -> Vec<u8> {
-        let (state, detail) = self.snapshot();
+        let (state, detail) = self.snapshot_for_operation(operation);
         encode_bounded(&ErrorResponse {
-            api_version: REPAIR_SERVICE_API_VERSION,
+            api_version: api_version_for_operation(operation),
             request_id,
             operation,
             outcome: "error",
@@ -1174,10 +1976,10 @@ impl<Engine: RepairPreparationEngine> RescueRepairService<Engine> {
     }
 }
 
-fn run_worker<Engine: RepairPreparationEngine>(
+fn run_worker<Engine: RepairPreparationEngine + RescueFstabRollbackBackend>(
     mut engine: Engine,
-    jobs: Receiver<WorkerJob<Engine::Prepared>>,
-    results: SyncSender<WorkerResult<Engine::Prepared>>,
+    jobs: Receiver<WorkerJob<Engine::Prepared, Engine::PreparedRollback>>,
+    results: SyncSender<WorkerResult<Engine::Prepared, Engine::PreparedRollback>>,
 ) {
     while let Ok(job) = jobs.recv() {
         let result = match job {
@@ -1211,14 +2013,58 @@ fn run_worker<Engine: RepairPreparationEngine>(
                 operation_id,
                 result: Engine::cancel_prepared(prepared, deadline),
             },
+            WorkerJob::RollbackPrepare {
+                operation_id,
+                command,
+                deadline,
+            } => WorkerResult::RollbackPrepared {
+                operation_id,
+                result: engine.prepare_rollback(&command, deadline),
+            },
+            WorkerJob::RollbackApproveAndExecute {
+                operation_id,
+                prepared,
+                approval,
+                deadline,
+            } => {
+                let result = engine
+                    .approve_rollback(prepared, &approval, deadline)
+                    .and_then(|approved| engine.execute_rollback(approved, deadline));
+                WorkerResult::RollbackExecuted {
+                    operation_id,
+                    result,
+                }
+            }
+            WorkerJob::RollbackCancel {
+                operation_id,
+                prepared,
+                deadline,
+            } => WorkerResult::RollbackCancelled {
+                operation_id,
+                result: Engine::cancel_prepared_rollback(prepared, deadline),
+            },
         };
         if let Err(error) = results.send(result) {
-            if let WorkerResult::Prepared {
-                result: Ok((prepared, _)),
-                ..
-            } = error.0
-            {
-                let _ = Engine::cancel_prepared(prepared, Instant::now() + CANCEL_TIMEOUT);
+            match error.0 {
+                WorkerResult::Prepared {
+                    result: Ok((prepared, _)),
+                    ..
+                } => {
+                    let _ = Engine::cancel_prepared(prepared, Instant::now() + CANCEL_TIMEOUT);
+                }
+                WorkerResult::RollbackPrepared {
+                    result: Ok((prepared, _)),
+                    ..
+                } => {
+                    let _ =
+                        Engine::cancel_prepared_rollback(prepared, Instant::now() + CANCEL_TIMEOUT);
+                }
+                WorkerResult::Prepared { .. }
+                | WorkerResult::Executed { .. }
+                | WorkerResult::Cancelled { .. }
+                | WorkerResult::RollbackPrepared { .. }
+                | WorkerResult::RollbackExecuted { .. }
+                | WorkerResult::RollbackCancelled { .. } => {}
             }
             break;
         }
@@ -1236,11 +2082,53 @@ fn descriptor_matches(
         && descriptor.vault_distinct
 }
 
+fn rollback_descriptor_matches(
+    command: &BrokerOwnedRollbackPrepareCommand,
+    descriptor: &PreparedRollbackDescriptor,
+) -> bool {
+    let canonical_hash = kernaid_core::canonical_rescue_fstab_rollback_plan(
+        command.plan_id(),
+        command.rollback_id(),
+        &descriptor.target_fingerprint,
+        command.source().reservation_id(),
+        command.source().transaction_binding_sha256(),
+    )
+    .ok()
+    .map(|(_, hash)| hash);
+    descriptor.session_id == command.session_id
+        && descriptor.rollback_id == command.rollback_id
+        && descriptor.plan_id == command.plan_id
+        && canonical_hash.as_deref() == Some(descriptor.plan_hash.as_str())
+        && descriptor.source == command.source
+        && descriptor.backup_locator == format!("vault://repair/{}", command.source.reservation_id)
+}
+
+fn committed_source_receipt(source: &RollbackSourceReceipt) -> RepairTerminalReceipt {
+    RepairTerminalReceipt {
+        outcome: RepairTerminalOutcome::Committed,
+        reservation_id: Some(source.reservation_id.clone()),
+        transaction_binding_sha256: Some(source.transaction_binding_sha256.clone()),
+        prepare_failure_stage: None,
+        execution_failure_stage: None,
+    }
+}
+
+fn source_matches_terminal(
+    source: &RollbackSourceReceipt,
+    terminal: &RepairTerminalReceipt,
+) -> bool {
+    terminal.outcome == RepairTerminalOutcome::Committed
+        && terminal.reservation_id.as_deref() == Some(source.reservation_id())
+        && terminal.transaction_binding_sha256.as_deref()
+            == Some(source.transaction_binding_sha256())
+}
+
 fn public_terminal_state(outcome: RepairTerminalOutcome) -> RepairPublicState {
     match outcome {
         RepairTerminalOutcome::Committed => RepairPublicState::Succeeded,
         RepairTerminalOutcome::ClosedBeforeUnchanged
         | RepairTerminalOutcome::ClosedBeforeRestored => RepairPublicState::Restored,
+        RepairTerminalOutcome::RolledBackOriginal => RepairPublicState::Restored,
         RepairTerminalOutcome::Cancelled => RepairPublicState::Cancelled,
         RepairTerminalOutcome::ManualReconciliationRequired => {
             RepairPublicState::ManualReconciliationRequired
@@ -1254,6 +2142,7 @@ fn terminal_detail(receipt: &RepairTerminalReceipt) -> TerminalRepairDetail {
         RepairTerminalOutcome::Committed => "committed",
         RepairTerminalOutcome::ClosedBeforeUnchanged => "closed-before-unchanged",
         RepairTerminalOutcome::ClosedBeforeRestored => "closed-before-restored",
+        RepairTerminalOutcome::RolledBackOriginal => "rolled-back-original",
         RepairTerminalOutcome::Cancelled => "cancelled",
         RepairTerminalOutcome::ManualReconciliationRequired => "manual-reconciliation-required",
         RepairTerminalOutcome::Failed => "failed",
@@ -1275,6 +2164,7 @@ fn prepare_failure_stage(error: RepairEngineFailure) -> RepairPrepareFailureStag
         | RepairEngineFailure::CancelFailed
         | RepairEngineFailure::ExecutionFailed(_)
         | RepairEngineFailure::RecoveryUnavailable
+        | RepairEngineFailure::RollbackUnavailable
         | RepairEngineFailure::Internal => RepairPrepareFailureStage::AdmissionInternal,
     }
 }
@@ -1376,6 +2266,14 @@ fn lower_hex(bytes: &[u8]) -> bool {
         .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
 }
 
+fn api_version_for_operation(operation: &str) -> &'static str {
+    if operation.starts_with("repair.fstab.rollback.") {
+        ROLLBACK_SERVICE_API_VERSION
+    } else {
+        REPAIR_SERVICE_API_VERSION
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CorrelationProbe {
@@ -1401,6 +2299,10 @@ impl CorrelationProbe {
                         | "repair.fstab.prepare"
                         | "repair.fstab.approve"
                         | "repair.fstab.cancel"
+                        | "repair.fstab.rollback.status"
+                        | "repair.fstab.rollback.prepare"
+                        | "repair.fstab.rollback.approve"
+                        | "repair.fstab.rollback.cancel"
                 )
             })
             .unwrap_or("repair.status")
@@ -1435,12 +2337,17 @@ mod tests {
 
     struct PreparedAuthority;
     struct ApprovedAuthority;
+    struct PreparedRollbackAuthority;
+    struct ApprovedRollbackAuthority;
 
     #[derive(Default)]
     struct MockState {
         prepared: usize,
         approved: usize,
         executed: usize,
+        rollback_prepared: usize,
+        rollback_approved: usize,
+        rollback_executed: usize,
     }
 
     struct MockEngine {
@@ -1509,6 +2416,73 @@ mod tests {
 
         fn cancel_prepared(
             _prepared: Self::Prepared,
+            _deadline: Instant,
+        ) -> Result<(), RepairEngineFailure> {
+            Ok(())
+        }
+    }
+
+    impl RescueFstabRollbackBackend for MockEngine {
+        type PreparedRollback = PreparedRollbackAuthority;
+        type ApprovedRollback = ApprovedRollbackAuthority;
+
+        fn prepare_rollback(
+            &mut self,
+            command: &BrokerOwnedRollbackPrepareCommand,
+            _deadline: Instant,
+        ) -> Result<(Self::PreparedRollback, PreparedRollbackDescriptor), RepairEngineFailure>
+        {
+            self.state.lock().expect("mock state").rollback_prepared += 1;
+            let (_, plan_hash) = kernaid_core::canonical_rescue_fstab_rollback_plan(
+                command.plan_id(),
+                command.rollback_id(),
+                &hash('2'),
+                command.source().reservation_id(),
+                command.source().transaction_binding_sha256(),
+            )
+            .map_err(|_| RepairEngineFailure::Internal)?;
+            Ok((
+                PreparedRollbackAuthority,
+                PreparedRollbackDescriptor::new(
+                    command.session_id(),
+                    command.rollback_id(),
+                    command.plan_id(),
+                    plan_hash,
+                    hash('2'),
+                    command.source().clone(),
+                    "A-11111111111111111111111111111111",
+                    RESOURCE_ID,
+                    format!("vault://repair/{}", command.source().reservation_id()),
+                    2,
+                )?,
+            ))
+        }
+
+        fn approve_rollback(
+            &mut self,
+            _prepared: Self::PreparedRollback,
+            _approval: &BoundRollbackApproval,
+            _deadline: Instant,
+        ) -> Result<Self::ApprovedRollback, RepairEngineFailure> {
+            self.state.lock().expect("mock state").rollback_approved += 1;
+            Ok(ApprovedRollbackAuthority)
+        }
+
+        fn execute_rollback(
+            &mut self,
+            _approved: Self::ApprovedRollback,
+            _deadline: Instant,
+        ) -> Result<RepairTerminalReceipt, RepairEngineFailure> {
+            self.state.lock().expect("mock state").rollback_executed += 1;
+            RepairTerminalReceipt::new(
+                RepairTerminalOutcome::RolledBackOriginal,
+                Some("B-0123456789abcdef0123456789abcdef".to_owned()),
+                Some(hash('5')),
+            )
+        }
+
+        fn cancel_prepared_rollback(
+            _prepared: Self::PreparedRollback,
             _deadline: Instant,
         ) -> Result<(), RepairEngineFailure> {
             Ok(())
@@ -1641,6 +2615,170 @@ mod tests {
         wait_for_state(&mut service, RepairPublicState::Succeeded);
         let calls = state.lock().expect("mock state");
         assert_eq!((calls.approved, calls.executed), (1, 1));
+    }
+
+    #[test]
+    fn rollback_prepare_reauthenticates_a_source_receipt_after_service_restart() {
+        let (mut service, state) = service();
+        let source = format!(
+            r#""source":{{"reservationId":"B-0123456789abcdef0123456789abcdef","transactionBindingSha256":"{}"}}"#,
+            hash('5')
+        );
+        let response = json(&service.handle_frame(
+            format!(
+                r#"{{"apiVersion":"{ROLLBACK_SERVICE_API_VERSION}","requestId":"R-20000000-0000-0000-0000-000000000001","operation":"repair.fstab.rollback.prepare",{source}}}"#
+            )
+            .as_bytes(),
+        ));
+        assert!(matches!(
+            response["state"].as_str(),
+            Some("preparing") | Some("prepared")
+        ));
+        wait_for_state(&mut service, RepairPublicState::Prepared);
+        let status = json(&service.handle_frame(
+            format!(
+                r#"{{"apiVersion":"{ROLLBACK_SERVICE_API_VERSION}","requestId":"R-20000000-0000-0000-0000-000000000002","operation":"repair.fstab.rollback.status"}}"#
+            )
+            .as_bytes(),
+        ));
+        assert_eq!(status["detail"]["kind"], "fstab-rollback-prepared");
+        assert!(
+            status["detail"]["rollbackId"]
+                .as_str()
+                .is_some_and(|value| valid_fixed_id(value, "RB-"))
+        );
+        assert_eq!(
+            status["detail"]["source"]["transactionBindingSha256"],
+            hash('5')
+        );
+        assert_eq!(state.lock().expect("mock state").rollback_prepared, 1);
+    }
+
+    #[test]
+    fn rollback_v2_is_source_bound_and_requires_a_fresh_approval() {
+        let (mut service, state) = service();
+        let _ = service.handle_frame(&prepare_frame());
+        wait_for_state(&mut service, RepairPublicState::Prepared);
+        let prepared = json(&service.handle_frame(
+            format!(
+                r#"{{"apiVersion":"{REPAIR_SERVICE_API_VERSION}","requestId":"R-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","operation":"repair.status"}}"#
+            )
+            .as_bytes(),
+        ));
+        let detail = &prepared["detail"];
+        let repair_approval = format!(
+            r#"{{"apiVersion":"{REPAIR_SERVICE_API_VERSION}","requestId":"R-fedcba98-7654-3210-fedc-ba9876543210","operation":"repair.fstab.approve","preparedId":"{}","sessionId":"{}","planId":"{}","planHash":"{}","approvalId":"A-11111111111111111111111111111111","approvalSequence":1,"typedConfirmation":"{RESCUE_FSTAB_TYPED_CONFIRMATION}"}}"#,
+            detail["preparedId"].as_str().expect("prepared ID"),
+            detail["sessionId"].as_str().expect("session ID"),
+            detail["planId"].as_str().expect("plan ID"),
+            detail["planHash"].as_str().expect("plan hash"),
+        );
+        let _ = service.handle_frame(repair_approval.as_bytes());
+        wait_for_state(&mut service, RepairPublicState::Succeeded);
+
+        let source = format!(
+            r#""source":{{"reservationId":"B-0123456789abcdef0123456789abcdef","transactionBindingSha256":"{}"}}"#,
+            hash('5')
+        );
+        let wrong_version = json(&service.handle_frame(
+            format!(
+                r#"{{"apiVersion":"{REPAIR_SERVICE_API_VERSION}","requestId":"R-10000000-0000-0000-0000-000000000001","operation":"repair.fstab.rollback.prepare",{source}}}"#
+            )
+            .as_bytes(),
+        ));
+        assert_eq!(wrong_version["outcome"], "error");
+        assert_eq!(wrong_version["error"], "invalid-request");
+        assert_eq!(wrong_version["apiVersion"], ROLLBACK_SERVICE_API_VERSION);
+
+        let wrong_alias = json(&service.handle_frame(
+            format!(
+                r#"{{"apiVersion":"{ROLLBACK_SERVICE_API_VERSION}","requestId":"R-10000000-0000-0000-0000-000000000002","operation":"repair.status"}}"#
+            )
+            .as_bytes(),
+        ));
+        assert_eq!(wrong_alias["outcome"], "error");
+        assert_eq!(wrong_alias["apiVersion"], REPAIR_SERVICE_API_VERSION);
+
+        let rollback_prepare = json(&service.handle_frame(
+            format!(
+                r#"{{"apiVersion":"{ROLLBACK_SERVICE_API_VERSION}","requestId":"R-10000000-0000-0000-0000-000000000003","operation":"repair.fstab.rollback.prepare",{source}}}"#
+            )
+            .as_bytes(),
+        ));
+        assert_eq!(rollback_prepare["apiVersion"], ROLLBACK_SERVICE_API_VERSION);
+        wait_for_state(&mut service, RepairPublicState::Prepared);
+        let status = json(&service.handle_frame(
+            format!(
+                r#"{{"apiVersion":"{ROLLBACK_SERVICE_API_VERSION}","requestId":"R-10000000-0000-0000-0000-000000000004","operation":"repair.fstab.rollback.status"}}"#
+            )
+            .as_bytes(),
+        ));
+        let rollback = &status["detail"];
+        assert_eq!(rollback["kind"], "fstab-rollback-prepared");
+        assert_eq!(rollback["actionId"], ROLLBACK_ACTION_ID);
+        assert_eq!(rollback["source"]["transactionBindingSha256"], hash('5'));
+        assert_eq!(rollback["confirmationRequired"], ROLLBACK_CONFIRMATION);
+        assert!(!status.to_string().contains("/dev/"));
+
+        let approval_frame = |approval_id: &str, request_id: &str| {
+            format!(
+                r#"{{"apiVersion":"{ROLLBACK_SERVICE_API_VERSION}","requestId":"{request_id}","operation":"repair.fstab.rollback.approve","preparedId":"{}","rollbackId":"{}","sessionId":"{}","planId":"{}","planHash":"{}",{source},"approvalId":"{approval_id}","approvalSequence":2,"typedConfirmation":"{ROLLBACK_CONFIRMATION}"}}"#,
+                rollback["preparedId"].as_str().expect("prepared ID"),
+                rollback["rollbackId"].as_str().expect("rollback ID"),
+                rollback["sessionId"].as_str().expect("session ID"),
+                rollback["planId"].as_str().expect("plan ID"),
+                rollback["planHash"].as_str().expect("plan hash"),
+            )
+        };
+        let reused = json(
+            &service.handle_frame(
+                approval_frame(
+                    "A-11111111111111111111111111111111",
+                    "R-10000000-0000-0000-0000-000000000005",
+                )
+                .as_bytes(),
+            ),
+        );
+        assert_eq!(reused["error"], "binding-mismatch");
+
+        let _ = service.handle_frame(
+            approval_frame(
+                "A-22222222222222222222222222222222",
+                "R-10000000-0000-0000-0000-000000000006",
+            )
+            .as_bytes(),
+        );
+        wait_for_state(&mut service, RepairPublicState::Restored);
+        let rollback_terminal = json(&service.handle_frame(
+            format!(
+                r#"{{"apiVersion":"{ROLLBACK_SERVICE_API_VERSION}","requestId":"R-10000000-0000-0000-0000-000000000007","operation":"repair.fstab.rollback.status"}}"#
+            )
+            .as_bytes(),
+        ));
+        assert_eq!(
+            rollback_terminal["detail"]["terminalOutcome"],
+            "rolled-back-original"
+        );
+        let legacy_terminal = json(&service.handle_frame(
+            format!(
+                r#"{{"apiVersion":"{REPAIR_SERVICE_API_VERSION}","requestId":"R-10000000-0000-0000-0000-000000000008","operation":"repair.status"}}"#
+            )
+            .as_bytes(),
+        ));
+        assert_eq!(legacy_terminal["apiVersion"], REPAIR_SERVICE_API_VERSION);
+        assert_eq!(
+            legacy_terminal["detail"]["terminalOutcome"],
+            "closed-before-restored"
+        );
+        let calls = state.lock().expect("mock state");
+        assert_eq!(
+            (
+                calls.rollback_prepared,
+                calls.rollback_approved,
+                calls.rollback_executed,
+            ),
+            (1, 1, 1)
+        );
     }
 
     #[test]
