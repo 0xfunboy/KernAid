@@ -16,15 +16,20 @@ The separate `action-pack.production-candidate-v1.yaml` describes the first
 Rescue-only production candidate, `linux.fstab.disable-missing-uuid.v1`. It is
 explicitly `productionCandidateOnly`, disabled by default, and its Rust code is
 compiled only with the off-by-default `rescue-fstab-production-candidate`
-feature. It currently consists of the action contract, a pure preview,
-an immutable transaction plan and a separate Core/policy approval boundary.
-The broker crate can rebuild these bindings behind the same feature while
-consuming the non-cloneable approval admission and retaining both an opaque
-read-only target lock and the exact Vault reservation guard. Its receipt is
-audit evidence, never execution authority. There is no filesystem I/O,
-production resolver/IPC/UI route, backup
-implementation, or production mutation handler, so it does **not** make the
-repair available to users yet.
+feature. That private feature now has a real end-to-end handler: broker-owned
+read-only target resolution and observation, an immutable transaction plan,
+separate Core/policy approval, encrypted Vault backup, a closed daemon/UI
+route, atomic mutation and validation, explicit rollback, and startup
+reconciliation. The broker retains the non-cloneable approval authority,
+opaque target capabilities and exact Vault reservation guard; receipts remain
+audit evidence and never become execution authority.
+
+None of that handler is compiled into the default/stable Rescue image, which
+remains diagnosis-only. The repair candidate is still private,
+feature-gated/off-default, unpromoted and unavailable through the product site
+or Release Channel. It is therefore not a shipping or user-supported repair
+path. The manifest's `productionCandidateOnly` label names the qualification
+track; it does not itself authorize production use.
 
 The candidate can propose commenting only one active, mandatory UUID entry
 that is absent from a caller-supplied observed UUID set and mounts below
@@ -55,8 +60,10 @@ exact risk/preflight/backup/validation/rollback declarations, timeout,
 cancellation, idempotency and redaction policy. A mutable free-space snapshot
 is deliberately not treated as a capability. The
 target and Vault must have distinct physical parents. These values are still
-admission material supplied to pure code; a future trusted broker must derive
-and recheck them before any write is possible.
+admission material supplied to pure code. In the private candidate, the
+feature-gated trusted broker derives and rechecks them from retained
+kernel-backed capabilities before any write is possible; neither the UI nor a
+provider may supply a host path, device path, command, or replacement bytes.
 
 `action-pack.fixture-v1.yaml` and its JSON input schema pin the single
 `linux.fstab.repair-entry.fixture-v1` contract at compile time. That manifest

@@ -831,11 +831,11 @@ fn open_qualified_first_launch_audit_state(path: &Path) -> AuditRuntimeState {
     );
     let mut journal = match SecureJournal::open(path, store) {
         Ok(journal) => journal,
-        Err(error) => {
+        Err(_error) => {
             #[cfg(test)]
             eprintln!(
                 "KERNAID_QUALIFIED_FIRST_LAUNCH_JOURNAL_FAILURE_V1:{}",
-                qualified_first_launch_journal_error_class("open", &error)
+                qualified_first_launch_journal_error_class("open", &_error)
             );
             return AuditRuntimeState::Blocked;
         }
@@ -845,11 +845,11 @@ fn open_qualified_first_launch_audit_state(path: &Path) -> AuditRuntimeState {
             journal: Box::new(journal),
             head,
         },
-        Err(error) => {
+        Err(_error) => {
             #[cfg(test)]
             eprintln!(
                 "KERNAID_QUALIFIED_FIRST_LAUNCH_JOURNAL_FAILURE_V1:{}",
-                qualified_first_launch_journal_error_class("head", &error)
+                qualified_first_launch_journal_error_class("head", &_error)
             );
             AuditRuntimeState::Blocked
         }
