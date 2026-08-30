@@ -1,6 +1,18 @@
 name: desktop
 on:
   workflow_dispatch:
+    inputs:
+      platform:
+        description: Native package target to build
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - linux-x86_64
+          - windows-x86_64
+          - macos-aarch64
+          - macos-x86_64
   push:
     branches: [main]
     paths:
@@ -32,6 +44,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        name: ${{ fromJSON((github.event_name == 'workflow_dispatch' && inputs.platform != 'all') && format('["{0}"]', inputs.platform) || '["linux-x86_64","windows-x86_64","macos-aarch64","macos-x86_64"]') }}
         include:
           - platform: ubuntu-24.04
             name: linux-x86_64

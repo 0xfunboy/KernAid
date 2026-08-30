@@ -18,23 +18,19 @@ companion_pattern='kernaid-provider-key'
 main_executable='kernaid-desk-shell'
 probe_flag='--qualified-first-launch-probe'
 probe_marker='KERNAID_QUALIFIED_FIRST_LAUNCH_PROBE_OK_V1'
-temporary_directories=()
 private_directory=''
 
 cleanup() {
-  local directory
-  for directory in "${temporary_directories[@]}"; do
-    if [[ -d "$directory" && ! -L "$directory" ]]; then
-      rm -rf -- "$directory"
-    fi
-  done
+  if [[ -n "$private_directory" && -d "$private_directory" && ! -L "$private_directory" ]]; then
+    rm -rf -- "$private_directory"
+  fi
 }
 trap cleanup EXIT
 
 private_temporary_directory() {
   local directory mode
   directory="$(mktemp -d)"
-  temporary_directories+=("$directory")
+  private_directory="$directory"
   chmod 0700 "$directory"
   if [[ ! -d "$directory" || -L "$directory" || ! -O "$directory" ]]; then
     printf 'could not establish a private package extraction directory\n' >&2
@@ -131,6 +127,7 @@ case "$(uname -s)" in
         dpkg-deb --extract "$package" "$extract_root"
         run_main_probe "$extract_root" DEB
         rm -rf -- "$extract_parent"
+        private_directory=''
       fi
     done
     for package in "${rpms[@]}"; do
@@ -186,6 +183,7 @@ PY
         fi
         run_main_probe "$extract_root" AppImage
         rm -rf -- "$extract_parent"
+        private_directory=''
       fi
     done
     ;;
