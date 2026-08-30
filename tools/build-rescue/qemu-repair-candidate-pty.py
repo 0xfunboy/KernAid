@@ -917,8 +917,14 @@ def main(arguments: Sequence[str]) -> int:
         LIFECYCLE.wipe(login)
         LIFECYCLE.restore_signal_guard(prior_handlers, prior_mask)
     if failure is not None:
+        evidence = ""
+        if isinstance(failure, LIFECYCLE.ResponseShapeFailure):
+            evidence = (
+                f" bytes={failure.block_bytes} lines={failure.block_lines}"
+                f" sha256={failure.block_sha256} first={failure.first_class}"
+            )
         print(
-            f"{FAILURE_PREFIX} stage={failure.stage} code={failure.code}",
+            f"{FAILURE_PREFIX} stage={failure.stage} code={failure.code}{evidence}",
             file=sys.stderr,
             flush=True,
         )

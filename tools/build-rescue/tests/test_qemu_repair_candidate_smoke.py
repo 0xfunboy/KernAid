@@ -63,6 +63,9 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
 
     def test_controller_drives_real_candidate_and_exact_typed_approval(self) -> None:
         source = CONTROLLER.read_text(encoding="utf-8")
+        self.assertIn("LIFECYCLE.ResponseShapeFailure", source)
+        self.assertIn("sha256={failure.block_sha256}", source)
+        self.assertNotIn("failure.block=", source)
         self.assertIn('console, "repair-initial", cursor, aggregate', source)
         self.assertIn('"status", "repair-initial-status", cursor, aggregate', source)
         self.assertIn(

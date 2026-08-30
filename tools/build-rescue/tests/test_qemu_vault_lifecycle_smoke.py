@@ -1211,6 +1211,11 @@ class ResponseParserTests(unittest.TestCase):
             )
         self.assertEqual(observed.exception.stage, stage)
         self.assertEqual(observed.exception.code, "response-version-invalid")
+        self.assertIsInstance(observed.exception, controller.ResponseShapeFailure)
+        self.assertGreater(observed.exception.block_bytes, 0)
+        self.assertEqual(observed.exception.block_lines, 2)
+        self.assertRegex(observed.exception.block_sha256, r"^[0-9a-f]{64}$")
+        self.assertEqual(observed.exception.first_class, "kernel-timestamp")
 
         remote = ScriptedConsole(
             transcript.replace(

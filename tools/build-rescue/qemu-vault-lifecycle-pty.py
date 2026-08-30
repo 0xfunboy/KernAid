@@ -14,6 +14,7 @@ import ctypes
 import dataclasses
 import errno
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -327,6 +328,31 @@ class ClosedFailure(Exception):
         self.stage = stage
         self.code = code
         super().__init__(f"{stage}:{code}")
+
+
+class ResponseShapeFailure(ClosedFailure):
+    """Closed response-shape evidence without reproducing response bytes."""
+
+    def __init__(self, code: str, block: bytes) -> None:
+        lines = _normalize(block)
+        first = lines[0] if lines else b""
+        if not first:
+            first_class = "empty"
+        elif re.fullmatch(rb"stateVersion: .*", first):
+            first_class = "state-version-malformed"
+        elif re.fullmatch(rb"\[[ 0-9.]+\] .*", first):
+            first_class = "kernel-timestamp"
+        elif b"@kernaid-rescue" in first:
+            first_class = "shell-prompt"
+        elif all(32 <= byte <= 126 for byte in first):
+            first_class = "printable-other"
+        else:
+            first_class = "binary-or-control"
+        self.block_bytes = len(block)
+        self.block_lines = len(lines)
+        self.block_sha256 = hashlib.sha256(block).hexdigest()
+        self.first_class = first_class
+        super().__init__("response", code)
 
 
 class UnlockRemoteFailure(ClosedFailure):
@@ -991,7 +1017,7 @@ def parse_companion_response(
         raise ClosedFailure("response", "command-invalid")
 
     if not lines or re.fullmatch(rb"stateVersion: (0|[1-9][0-9]*)", lines[0]) is None:
-        raise ClosedFailure("response", "version-invalid")
+        raise ResponseShapeFailure("version-invalid", b"\n".join(lines))
     version = int(lines.pop(0).split(b": ", 1)[1])
 
     state: str | None = None
@@ -2565,6 +2591,10 @@ def run_companion(
         raise ClosedFailure(stage, f"response-{error.code}") from error
     except ClosedFailure as error:
         if error.stage == "response":
+            if isinstance(error, ResponseShapeFailure):
+                error.stage = stage
+                error.code = f"response-{error.code}"
+                raise
             raise ClosedFailure(stage, f"response-{error.code}") from error
         raise
     return response, end_match.end()
