@@ -7,6 +7,8 @@ use kernaid_device_identity::{
 use kernaid_native_secrets::{
     NativeDeviceIdentityStore, NativeJournalSecretStore, NativeJournalState, NativeSecretError,
 };
+#[cfg(test)]
+use kernaid_storage::JournalError;
 use kernaid_storage::{
     JOURNAL_KEY_BYTES, JournalAnchor, JournalKey, JournalSecretStore, SecretStoreError,
     SecureJournal,
@@ -829,7 +831,14 @@ fn open_qualified_first_launch_audit_state(path: &Path) -> AuditRuntimeState {
     );
     let mut journal = match SecureJournal::open(path, store) {
         Ok(journal) => journal,
-        Err(_) => return AuditRuntimeState::Blocked,
+        Err(error) => {
+            #[cfg(test)]
+            eprintln!(
+                "KERNAID_QUALIFIED_FIRST_LAUNCH_JOURNAL_FAILURE_V1:{}",
+                qualified_first_launch_journal_error_class(&error)
+            );
+            return AuditRuntimeState::Blocked;
+        }
     };
     match journal.head() {
         Ok(head) => AuditRuntimeState::Secure {
@@ -837,6 +846,30 @@ fn open_qualified_first_launch_audit_state(path: &Path) -> AuditRuntimeState {
             head,
         },
         Err(_) => AuditRuntimeState::Blocked,
+    }
+}
+
+#[cfg(test)]
+fn qualified_first_launch_journal_error_class(error: &JournalError) -> &'static str {
+    match error {
+        JournalError::Database(_) => "database",
+        JournalError::SecretStore(_) => "secret-store",
+        JournalError::InvalidPath => "invalid-path",
+        JournalError::SymlinkRejected => "symlink",
+        JournalError::UnsupportedFormat => "unsupported-format",
+        JournalError::MissingKey => "missing-key",
+        JournalError::MissingAnchor => "missing-anchor",
+        JournalError::SecretStateConflict => "secret-state-conflict",
+        JournalError::AuthenticationFailed => "authentication",
+        JournalError::CorruptChain => "corrupt-chain",
+        JournalError::RollbackDetected => "rollback",
+        JournalError::EventTooLarge => "event-too-large",
+        JournalError::JournalTooLarge => "journal-too-large",
+        JournalError::SequenceOverflow => "sequence-overflow",
+        JournalError::EncryptionFailed => "encryption",
+        JournalError::ReadLimitExceeded => "read-limit",
+        JournalError::UnexpectedHead { .. } => "unexpected-head",
+        JournalError::Poisoned => "poisoned",
     }
 }
 
