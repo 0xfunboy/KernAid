@@ -2081,6 +2081,7 @@ mod tests {
         rfs::fcntl_setfl(&pty.master, master_flags | OFlags::NONBLOCK).expect("nonblocking master");
         let before = tcgetattr(&pty.slave).expect("before");
         let mut readiness_called = false;
+        let mut prompt_read_failed = false;
         let result = read_hidden_secret_after_privacy_with_ready(
             pty.slave.as_fd(),
             &AtomicBool::new(false),
@@ -2103,7 +2104,10 @@ mod tests {
                         Ok(read) => output.extend_from_slice(&buffer[..read]),
                         Err(error) if error == rustix::io::Errno::AGAIN => break,
                         Err(error) if error == rustix::io::Errno::INTR => {}
-                        Err(error) => panic!("prompt read failed: {error}"),
+                        Err(_) => {
+                            prompt_read_failed = true;
+                            break;
+                        }
                     }
                 }
                 assert!(
@@ -2115,6 +2119,7 @@ mod tests {
             },
         );
         assert!(readiness_called);
+        assert!(!prompt_read_failed);
         assert_eq!(result, Err(RescueVaultCompanionError::TransportUnavailable));
         assert_eq!(
             before.local_modes,
