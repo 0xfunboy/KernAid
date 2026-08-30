@@ -1644,6 +1644,13 @@ class QmpClient:
     def execute(
         self, command: str, arguments: dict[str, object] | None = None
     ) -> None:
+        result = self.execute_result(command, arguments)
+        if result != {}:
+            raise ClosedFailure("qmp", "command-failed")
+
+    def execute_result(
+        self, command: str, arguments: dict[str, object] | None = None
+    ) -> object:
         request_id = self._next_id
         self._next_id += 1
         request: dict[str, object] = {"execute": command, "id": request_id}
@@ -1676,9 +1683,9 @@ class QmpClient:
                 if "event" in response:
                     continue
                 raise ClosedFailure("qmp", "correlation-invalid")
-            if "error" in response or response.get("return") != {}:
+            if "error" in response or "return" not in response:
                 raise ClosedFailure("qmp", "command-failed")
-            return
+            return response["return"]
 
     def system_powerdown(self) -> None:
         self.execute("system_powerdown")

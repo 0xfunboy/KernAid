@@ -1,5 +1,6 @@
 import importlib.util
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -23,7 +24,16 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
         self.assertIn('rescue_media="$work_dir/rescue-usb.raw"', source)
         self.assertIn('target_image="$work_dir/repair-target.raw"', source)
         self.assertIn("id=kernaid_rescue_usb,file=$rescue_media", source)
-        self.assertIn("id=kernaid_repair_target,file=$target_image", source)
+        self.assertIn(
+            "driver=file,node-name=kernaid_repair_target_file,"
+            "filename=$target_image",
+            source,
+        )
+        self.assertIn(
+            "driver=raw,node-name=kernaid_repair_target,"
+            "file=kernaid_repair_target_file",
+            source,
+        )
         self.assertIn(
             "virtio-blk-pci,drive=kernaid_repair_target,"
             "serial=KERNAID-REPAIR-V1",
@@ -96,11 +106,20 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
             "sha256:" + "a" * 64, "sha256:" + "b" * 64
         )
         self.assertLessEqual(len(generated), 16 * 1024)
-        self.assertIn(
-            b'checkpoint in (\n            "execute-state-closed-before-unchanged",',
-            generated,
-        )
+        self.assertIn(b'"execute-state-closed-before-unchanged",', generated)
+        self.assertIn(b'"execute-state-closed-before-restored",', generated)
         self.assertIn(b'diagnostic.startswith("execute-error-")', generated)
+        armed = controller.repair_source(
+            "sha256:" + "a" * 64,
+            "sha256:" + "b" * 64,
+            interrupt_arm=True,
+        )
+        self.assertLessEqual(len(armed), 16 * 1024)
+        self.assertIn(b"child=os.fork()", armed)
+        self.assertIn(
+            b"KERNAID_QEMU_PROVIDER_PROOF_V1 stage=\"+STAGE+\" result=true",
+            armed,
+        )
         self.assertNotIn("mock", source.lower())
 
     def test_execute_failure_classifier_is_closed(self) -> None:
@@ -147,24 +166,125 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
         for checkpoint in set(expected.values()) | {"execute-state-failed"}:
             self.assertIn(checkpoint, controller.LIFECYCLE.PROVIDER_PROOF_REPAIR_CHECKPOINTS)
 
-    def test_manual_candidate_workflow_runs_one_mutating_gate(self) -> None:
+    def test_manual_candidate_workflow_runs_closed_firmware_matrix(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
         self.assertEqual(
             workflow.count("./tools/build-rescue/qemu-repair-candidate-smoke.sh"),
-            1,
+            3,
         )
+        self.assertIn("qemu-repair-candidate-smoke.sh bios apply", workflow)
+        self.assertIn("qemu-repair-candidate-smoke.sh uefi apply", workflow)
+        self.assertIn("uefi interrupt-reconcile", workflow)
         source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('firmware="${1:-bios}"', source)
+        self.assertIn('scenario="${2:-apply}"', source)
+        self.assertIn("controller_timeout=1800", source)
         self.assertIn('readonly qemu_smp="${KERNAID_QEMU_SMP:-2}"', source)
         self.assertIn('1|2|4|8)', source)
         self.assertIn('-smp "$qemu_smp"', source)
         self.assertIn("KERNAID_QEMU_SMP=4", workflow)
+
+    def test_interruption_witness_and_reconciliation_are_fail_closed(self) -> None:
+        source = CONTROLLER.read_text(encoding="utf-8")
+        for required in (
+            '"query-blockstats", {"query-nodes": True}',
+            'qmp.execute("stop")',
+            'qmp.execute("cont")',
+            "qmp.quit()",
+            '"execute-state-closed-before-unchanged"',
+            '"execute-state-closed-before-restored"',
+            '"manual-reconciliation-required"',
+            'scenario == "interrupt-reconcile" and parsed.firmware != "uefi"',
+            "OVMF_VARS.repair-boot-{boot}.fd",
+        ):
+            self.assertIn(required, source)
+        recovery = controller.reconcile_source()
+        self.assertLessEqual(len(recovery), 16 * 1024)
+        self.assertIn(b'candidate.get("state") in ("restored","succeeded"', recovery)
+        self.assertIn(b"execute-state-closed-before-unchanged", recovery)
+        self.assertIn(b"execute-state-closed-before-restored", recovery)
+
+        class Qmp:
+            def __init__(self, result: object) -> None:
+                self.result = result
+
+            def execute_result(self, command: str, arguments: object) -> object:
+                self.command = command
+                self.arguments = arguments
+                return self.result
+
+        qmp = Qmp(
+            [
+                {
+                    "node-name": controller.TARGET_NODE,
+                    "stats": {"wr_bytes": 4096},
+                }
+            ]
+        )
+        self.assertEqual(controller.target_write_bytes(qmp), 4096)
+        self.assertEqual(qmp.command, "query-blockstats")
+        self.assertEqual(qmp.arguments, {"query-nodes": True})
+
+        for invalid in (
+            [],
+            [
+                {
+                    "node-name": controller.TARGET_NODE,
+                    "stats": {"wr_bytes": True},
+                }
+            ],
+            [
+                {
+                    "node-name": controller.TARGET_NODE,
+                    "stats": {"wr_bytes": 1},
+                },
+                {
+                    "node-name": controller.TARGET_NODE,
+                    "stats": {"wr_bytes": 2},
+                },
+            ],
+        ):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(controller.LIFECYCLE.ClosedFailure):
+                    controller.target_write_bytes(Qmp(invalid))
+
+    def test_uefi_uses_a_fresh_private_vars_store_per_boot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            template = root / "template.fd"
+            template.write_bytes(b"OVMF-VARS")
+            qmp_socket = root / "qmp.sock"
+            first = controller.qemu_args_for_boot(
+                ("-machine", "accel=tcg"),
+                "uefi",
+                1,
+                qmp_socket,
+                Path("/firmware/code.fd"),
+                template,
+            )
+            second = controller.qemu_args_for_boot(
+                ("-machine", "accel=tcg"),
+                "uefi",
+                2,
+                qmp_socket,
+                Path("/firmware/code.fd"),
+                template,
+            )
+            first_vars = root / "OVMF_VARS.repair-boot-1.fd"
+            second_vars = root / "OVMF_VARS.repair-boot-2.fd"
+            self.assertEqual(first_vars.read_bytes(), b"OVMF-VARS")
+            self.assertEqual(second_vars.read_bytes(), b"OVMF-VARS")
+            self.assertTrue(any(f"file={first_vars}" in item for item in first))
+            self.assertTrue(any(f"file={second_vars}" in item for item in second))
+            self.assertNotEqual(first_vars, second_vars)
 
     def test_workflow_always_retains_private_forensics_without_promoting_failure(
         self,
     ) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
         gate = workflow.index(
-            "      - name: QEMU BIOS repair candidate apply qualification\n"
+            "      - name: QEMU UEFI repair candidate restart reconciliation "
+            "qualification\n"
         )
         forensic_start = workflow.index(
             "      - name: Upload private repair candidate forensics\n"

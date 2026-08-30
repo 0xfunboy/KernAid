@@ -3,11 +3,30 @@ set -Eeuo pipefail
 umask 077
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-iso="${1:-$repo_dir/KernAid-Rescue-amd64-repair-candidate.iso}"
+firmware="${1:-bios}"
+scenario="${2:-apply}"
+iso="${3:-$repo_dir/KernAid-Rescue-amd64-repair-candidate.iso}"
 controller="$repo_dir/tools/build-rescue/qemu-repair-candidate-pty.py"
 readonly media_bytes=32000000000
 readonly p3_start_bytes=17179869184
+controller_timeout=900
 readonly qemu_smp="${KERNAID_QEMU_SMP:-2}"
+
+if [[ "$firmware" != bios && "$firmware" != uefi ]]; then
+  echo "Usage: $0 [bios|uefi] [apply|interrupt-reconcile] [iso]" >&2
+  exit 2
+fi
+if [[ "$scenario" != apply && "$scenario" != interrupt-reconcile ]]; then
+  echo "Usage: $0 [bios|uefi] [apply|interrupt-reconcile] [iso]" >&2
+  exit 2
+fi
+if [[ "$scenario" == interrupt-reconcile ]]; then
+  [[ "$firmware" == uefi ]] || {
+    echo "interrupt-reconcile is qualified only with UEFI" >&2
+    exit 2
+  }
+  controller_timeout=1800
+fi
 
 case "$qemu_smp" in
   1|2|4|8) ;;
@@ -53,6 +72,8 @@ expected_after="$work_dir/expected-after"
 controller_output="$work_dir/controller.out"
 controller_error="$work_dir/controller.err"
 qmp_socket="$work_dir/qmp.sock"
+ovmf_code=""
+ovmf_vars_template=""
 
 mkdir -p -- \
   "$seed/etc" \
@@ -124,6 +145,24 @@ od -An -N32 -tx1 /dev/urandom | tr -d '[:space:]' >"$vault_key"
 chmod 600 -- "$vault_key"
 [[ "$(stat -c '%s' -- "$vault_key")" == 64 ]] || exit 1
 
+if [[ "$firmware" == uefi ]]; then
+  for pair in \
+    /usr/share/OVMF/OVMF_CODE_4M.fd:/usr/share/OVMF/OVMF_VARS_4M.fd \
+    /usr/share/OVMF/OVMF_CODE.fd:/usr/share/OVMF/OVMF_VARS.fd; do
+    candidate_code="${pair%%:*}"
+    candidate_vars="${pair#*:}"
+    if [[ -f "$candidate_code" && -f "$candidate_vars" ]]; then
+      ovmf_code="$candidate_code"
+      ovmf_vars_template="$candidate_vars"
+      break
+    fi
+  done
+  [[ -n "$ovmf_code" && -n "$ovmf_vars_template" ]] || {
+    echo "A matching OVMF CODE/VARS firmware pair was not found" >&2
+    exit 2
+  }
+fi
+
 # QEMU's drive and device specifications are intentionally comma-delimited.
 # shellcheck disable=SC2054
 qemu_args=(
@@ -134,18 +173,30 @@ qemu_args=(
   -device qemu-xhci,id=kernaid_xhci
   -drive "if=none,id=kernaid_rescue_usb,file=$rescue_media,format=raw,cache=none,aio=threads"
   -device "usb-storage,bus=kernaid_xhci.0,drive=kernaid_rescue_usb,bootindex=1"
-  -drive "if=none,id=kernaid_repair_target,file=$target_image,format=raw,cache=none,aio=threads"
+  -blockdev "driver=file,node-name=kernaid_repair_target_file,filename=$target_image,cache.direct=on,cache.no-flush=off,aio=threads"
+  -blockdev driver=raw,node-name=kernaid_repair_target,file=kernaid_repair_target_file
   -device virtio-blk-pci,drive=kernaid_repair_target,serial=KERNAID-REPAIR-V1
   -fw_cfg name=opt/kernaid-tauri-sandbox-probe,string=v1
 )
 
 set +e
+controller_args=(
+  --qemu "$(command -v qemu-system-x86_64)"
+  --qmp-socket "$qmp_socket"
+  --firmware "$firmware"
+  --scenario "$scenario"
+  --vault-key-fd 3 --login-credential-fd 4
+  --before-sha256 "$before_sha256" --after-sha256 "$after_sha256"
+  --timeout "$controller_timeout"
+)
+if [[ "$firmware" == uefi ]]; then
+  controller_args+=(
+    --ovmf-code "$ovmf_code"
+    --ovmf-vars-template "$ovmf_vars_template"
+  )
+fi
 python3 -I -B "$controller" \
-  --qemu "$(command -v qemu-system-x86_64)" \
-  --qmp-socket "$qmp_socket" \
-  --vault-key-fd 3 --login-credential-fd 4 \
-  --before-sha256 "$before_sha256" --after-sha256 "$after_sha256" \
-  --timeout 900 -- "${qemu_args[@]}" \
+  "${controller_args[@]}" -- "${qemu_args[@]}" \
   3<"$vault_key" 4<"$login_credential" \
   >"$controller_output" 2>"$controller_error"
 controller_status=$?
@@ -155,19 +206,29 @@ if [[ "$controller_status" -ne 0 ]]; then
   exit "$controller_status"
 fi
 [[ ! -s "$controller_error" ]] || { cat "$controller_error" >&2; exit 1; }
-expected_guest="KERNAID_QEMU_REPAIR_CANDIDATE_GUEST_V1 action=linux.fstab.disable-missing-uuid.v1 before_sha256=$before_sha256 after_sha256=$after_sha256 vault_distinct=true terminal=committed approval=typed-single-use ready=true"
+if [[ "$scenario" == apply ]]; then
+  expected_guest="KERNAID_QEMU_REPAIR_CANDIDATE_GUEST_V1 action=linux.fstab.disable-missing-uuid.v1 firmware=$firmware scenario=apply before_sha256=$before_sha256 after_sha256=$after_sha256 vault_distinct=true terminal=committed approval=typed-single-use ready=true"
+  expected_fstab="$expected_after"
+  expected_terminal=committed
+else
+  expected_guest="KERNAID_QEMU_REPAIR_CANDIDATE_GUEST_V1 action=linux.fstab.disable-missing-uuid.v1 firmware=$firmware scenario=interrupt-reconcile before_sha256=$before_sha256 after_sha256=$after_sha256 vault_distinct=true terminal=restored interruption=qmp-after-target-write recovery=closed ready=true"
+  expected_fstab="$seed/etc/fstab"
+  expected_terminal=restored
+fi
 [[ "$(cat "$controller_output")" == "$expected_guest" ]] || exit 1
 
 debugfs -R "dump -p /etc/fstab $observed_fstab" "$target_image" >/dev/null 2>&1
 debugfs -R "dump -p /boot/vmlinuz-kernaid-repair $observed_sentinel" \
   "$target_image" >/dev/null 2>&1
-cmp -s -- "$expected_after" "$observed_fstab"
+cmp -s -- "$expected_fstab" "$observed_fstab"
 [[ "$(cat "$observed_sentinel")" == KERNAID_REPAIR_TARGET_SENTINEL ]]
 target_after_sha256="$(sha256sum "$target_image" | awk '{print $1}')"
-[[ "$target_after_sha256" != "$target_before_sha256" ]]
+if [[ "$scenario" == apply ]]; then
+  [[ "$target_after_sha256" != "$target_before_sha256" ]]
+fi
 prefix_after_sha256="$(dd if="$rescue_media" bs=4M iflag=count_bytes \
   count="$iso_bytes" status=none | sha256sum | awk '{print $1}')"
 [[ "$prefix_after_sha256" == "$iso_sha256" ]]
 
 printf '%s\n' \
-  "KERNAID_QEMU_REPAIR_CANDIDATE_ATTESTATION_V1 action=linux.fstab.disable-missing-uuid.v1 firmware=bios drives=rescue-usb,target-ext4 physical_parents=distinct vault=luks2-ext4 before_sha256=$before_sha256 after_sha256=$after_sha256 exact_bytes=true terminal=committed iso_prefix_immutable=true host_physical_devices=false ready=true"
+  "KERNAID_QEMU_REPAIR_CANDIDATE_ATTESTATION_V1 action=linux.fstab.disable-missing-uuid.v1 firmware=$firmware scenario=$scenario drives=rescue-usb,target-ext4 physical_parents=distinct vault=luks2-ext4 before_sha256=$before_sha256 after_sha256=$after_sha256 exact_bytes=true terminal=$expected_terminal iso_prefix_immutable=true host_physical_devices=false ready=true"

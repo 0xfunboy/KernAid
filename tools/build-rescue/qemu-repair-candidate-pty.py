@@ -8,6 +8,7 @@ import importlib.util
 import os
 import re
 import signal
+import stat
 import sys
 import textwrap
 import time
@@ -26,6 +27,8 @@ SPEC.loader.exec_module(LIFECYCLE)
 
 FAILURE_PREFIX = "KERNAID_QEMU_REPAIR_CANDIDATE_FAILURE_V1"
 ATTESTATION_PREFIX = "KERNAID_QEMU_REPAIR_CANDIDATE_GUEST_V1"
+TARGET_NODE = "kernaid_repair_target"
+OVMF_ROOTS = (Path("/usr/share/OVMF"), Path("/usr/share/edk2"))
 
 EXECUTE_STATE_CLASSIFIER_SOURCE = r'''
 def execute_state_checkpoint(value):
@@ -67,6 +70,12 @@ def parser() -> ClosedParser:
     value = ClosedParser(add_help=False, allow_abbrev=False)
     value.add_argument("--qemu", required=True)
     value.add_argument("--qmp-socket", type=Path, required=True)
+    value.add_argument("--firmware", choices=("bios", "uefi"), required=True)
+    value.add_argument(
+        "--scenario", choices=("apply", "interrupt-reconcile"), required=True
+    )
+    value.add_argument("--ovmf-code", type=Path)
+    value.add_argument("--ovmf-vars-template", type=Path)
     value.add_argument("--vault-key-fd", type=int, required=True)
     value.add_argument("--login-credential-fd", type=int, required=True)
     value.add_argument("--before-sha256", required=True)
@@ -76,19 +85,151 @@ def parser() -> ClosedParser:
     return value
 
 
-def repair_source(before_sha256: str, after_sha256: str) -> bytes:
+def trusted_firmware_file(path: Path) -> Path:
+    """Resolve one immutable, root-owned system firmware file."""
+
+    try:
+        resolved = path.resolve(strict=True)
+        metadata = resolved.stat()
+    except OSError as error:
+        raise LIFECYCLE.ClosedFailure("firmware", "file-invalid") from error
+    if not any(resolved.is_relative_to(root) for root in OVMF_ROOTS):
+        raise LIFECYCLE.ClosedFailure("firmware", "path-invalid")
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or metadata.st_mode & 0o022
+    ):
+        raise LIFECYCLE.ClosedFailure("firmware", "file-untrusted")
+    current = resolved.parent
+    while True:
+        try:
+            parent = current.stat()
+        except OSError as error:
+            raise LIFECYCLE.ClosedFailure("firmware", "parent-invalid") from error
+        if (
+            not stat.S_ISDIR(parent.st_mode)
+            or parent.st_uid != 0
+            or parent.st_gid != 0
+            or parent.st_mode & 0o022
+        ):
+            raise LIFECYCLE.ClosedFailure("firmware", "parent-untrusted")
+        if current == Path("/"):
+            break
+        current = current.parent
+    return resolved
+
+
+def copy_fresh_ovmf_vars(source: Path, destination: Path) -> None:
+    """Create one private VARS store without following a destination link."""
+
+    if os.path.lexists(destination):
+        raise LIFECYCLE.ClosedFailure("firmware", "vars-reuse")
+    source_fd = destination_fd = -1
+    try:
+        source_fd = os.open(source, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        before = os.fstat(source_fd)
+        destination_fd = os.open(
+            destination,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | os.O_CLOEXEC
+            | os.O_NOFOLLOW,
+            0o600,
+        )
+        copied = 0
+        while True:
+            chunk = os.read(source_fd, 1024 * 1024)
+            if not chunk:
+                break
+            view = memoryview(chunk)
+            offset = 0
+            try:
+                while offset < len(view):
+                    written = os.write(destination_fd, view[offset:])
+                    if written <= 0:
+                        raise OSError()
+                    offset += written
+            finally:
+                view.release()
+            copied += len(chunk)
+        os.fsync(destination_fd)
+        after = os.fstat(source_fd)
+        copied_metadata = os.fstat(destination_fd)
+        if (
+            (before.st_dev, before.st_ino, before.st_size)
+            != (after.st_dev, after.st_ino, after.st_size)
+            or copied != before.st_size
+            or copied_metadata.st_size != before.st_size
+            or stat.S_IMODE(copied_metadata.st_mode) != 0o600
+            or copied_metadata.st_uid != os.geteuid()
+        ):
+            raise LIFECYCLE.ClosedFailure("firmware", "vars-copy-invalid")
+    except LIFECYCLE.ClosedFailure:
+        raise
+    except OSError as error:
+        raise LIFECYCLE.ClosedFailure("firmware", "vars-copy-failed") from error
+    finally:
+        for descriptor in (destination_fd, source_fd):
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+
+def qemu_args_for_boot(
+    base: Sequence[str],
+    firmware: str,
+    boot: int,
+    qmp_socket: Path,
+    ovmf_code: Path | None,
+    ovmf_vars_template: Path | None,
+) -> list[str]:
+    if any(
+        argument in {"-bios", "-pflash"} or "if=pflash" in argument
+        for argument in base
+    ):
+        raise LIFECYCLE.ClosedFailure("arguments", "firmware-conflict")
+    result = list(base)
+    if firmware == "uefi":
+        if ovmf_code is None or ovmf_vars_template is None:
+            raise LIFECYCLE.ClosedFailure("firmware", "pair-missing")
+        destination = qmp_socket.parent / f"OVMF_VARS.repair-boot-{boot}.fd"
+        copy_fresh_ovmf_vars(ovmf_vars_template, destination)
+        result.extend(
+            (
+                "-drive",
+                f"if=pflash,format=raw,readonly=on,unit=0,file={ovmf_code}",
+                "-drive",
+                f"if=pflash,format=raw,unit=1,file={destination}",
+            )
+        )
+    elif ovmf_code is not None or ovmf_vars_template is not None:
+        raise LIFECYCLE.ClosedFailure("firmware", "pair-forbidden")
+    return result
+
+
+def repair_source(
+    before_sha256: str, after_sha256: str, *, interrupt_arm: bool = False
+) -> bytes:
     # This source is fixed by the qualification controller. It supplies only
     # opaque target claims and the exact typed approval accepted by production.
     checkpoints = ",".join(
         repr(checkpoint)
         for checkpoint in LIFECYCLE.PROVIDER_PROOF_REPAIR_CHECKPOINTS
     )
-    source = f'''import hashlib,http.client,json,secrets,subprocess,sys,time
+    stage = "repair-interrupt-arm" if interrupt_arm else "repair-apply"
+    source = f'''import hashlib,http.client,json,os,secrets,subprocess,sys,time
 HOST="127.0.0.1:4173"
 ORIGIN="http://127.0.0.1:4173"
 API="kernaid.dev/rescue-repair-service/v1alpha1"
 BEFORE={before_sha256!r}
 AFTER={after_sha256!r}
+INTERRUPT_ARM={interrupt_arm!r}
+STAGE={stage!r}
 CHECKPOINTS=({checkpoints},)
 {EXECUTE_STATE_CLASSIFIER_SOURCE}
 counter=0
@@ -135,7 +276,7 @@ def fail(value):
         value=capability_unit_checkpoint()
     if value not in CHECKPOINTS:
         sys.exit(46)
-    sys.stdout.write("KERNAID_QEMU_PROVIDER_PROOF_FAILURE_V1 stage=repair-apply checkpoint="+value+"\\n")
+    sys.stdout.write("KERNAID_QEMU_PROVIDER_PROOF_FAILURE_V1 stage="+STAGE+" checkpoint="+value+"\\n")
     sys.exit(45)
 def request_id():
     global counter
@@ -232,32 +373,159 @@ try:
     detail=prepared.get("detail",{{}})
     if detail.get("actionId")!="linux.fstab.disable-missing-uuid.v1" or detail.get("beforeSha256")!=BEFORE or detail.get("afterSha256")!=AFTER or detail.get("backup")!={{"state":"reserved","vaultDistinct":True}} or detail.get("confirmationRequired")!="DISABILITA VOCE FSTAB":
         raise RuntimeError()
+    approval={{"apiVersion":API,"requestId":request_id(),"operation":"repair.fstab.approve","preparedId":detail["preparedId"],"sessionId":detail["sessionId"],"planId":detail["planId"],"planHash":detail["planHash"],"approvalId":"A-"+secrets.token_hex(16),"approvalSequence":detail["nextApprovalSequence"],"typedConfirmation":"DISABILITA VOCE FSTAB"}}
     checkpoint="approve-submit"
-    approved=repair({{"apiVersion":API,"requestId":request_id(),"operation":"repair.fstab.approve","preparedId":detail["preparedId"],"sessionId":detail["sessionId"],"planId":detail["planId"],"planHash":detail["planHash"],"approvalId":"A-"+secrets.token_hex(16),"approvalSequence":detail["nextApprovalSequence"],"typedConfirmation":"DISABILITA VOCE FSTAB"}})
-    if approved.get("state") not in ("executing","succeeded","restored","failed","manual-reconciliation-required","cancelled"):
-        raise RuntimeError()
-    checkpoint="execute-terminal"
-    terminal=approved if approved.get("state")!="executing" else status_until({{"succeeded","restored","failed","manual-reconciliation-required","cancelled"}},deadline)
-    checkpoint="execute-state"
-    if terminal.get("state")!="succeeded":
-        checkpoint=execute_state_checkpoint(terminal)
-        if checkpoint=="execute-state-failed" or checkpoint in (
-            "execute-state-closed-before-unchanged",
-            "execute-state-closed-before-restored",
-        ):
-            diagnostic=execution_error_checkpoint()
-            if diagnostic.startswith("execute-error-") or checkpoint=="execute-state-failed":
-                checkpoint=diagnostic
-        raise RuntimeError()
-    checkpoint="execute-contract"
-    terminal_detail=terminal.get("detail",{{}})
-    if terminal_detail.get("terminalOutcome")!="committed" or not isinstance(terminal_detail.get("reservationId"),str) or not isinstance(terminal_detail.get("transactionBindingSha256"),str):
-        raise RuntimeError()
+    if INTERRUPT_ARM:
+        child=os.fork()
+        if child==0:
+            try:
+                os.setsid()
+                null=os.open("/dev/null",os.O_RDWR|os.O_CLOEXEC)
+                for descriptor in (0,1,2):
+                    os.dup2(null,descriptor)
+                if null>2:
+                    os.close(null)
+                time.sleep(2)
+                approved=repair(approval)
+                if approved.get("state") not in ("executing","succeeded","restored","failed","manual-reconciliation-required","cancelled"):
+                    os._exit(47)
+                os._exit(0)
+            except BaseException:
+                os._exit(47)
+    else:
+        approved=repair(approval)
+        if approved.get("state") not in ("executing","succeeded","restored","failed","manual-reconciliation-required","cancelled"):
+            raise RuntimeError()
+        checkpoint="execute-terminal"
+        terminal=approved if approved.get("state")!="executing" else status_until({{"succeeded","restored","failed","manual-reconciliation-required","cancelled"}},deadline)
+        checkpoint="execute-state"
+        if terminal.get("state")!="succeeded":
+            checkpoint=execute_state_checkpoint(terminal)
+            if checkpoint=="execute-state-failed" or checkpoint in (
+                "execute-state-closed-before-unchanged",
+                "execute-state-closed-before-restored",
+            ):
+                diagnostic=execution_error_checkpoint()
+                if diagnostic.startswith("execute-error-") or checkpoint=="execute-state-failed":
+                    checkpoint=diagnostic
+            raise RuntimeError()
+        checkpoint="execute-contract"
+        terminal_detail=terminal.get("detail",{{}})
+        if terminal_detail.get("terminalOutcome")!="committed" or not isinstance(terminal_detail.get("reservationId"),str) or not isinstance(terminal_detail.get("transactionBindingSha256"),str):
+            raise RuntimeError()
 except BaseException:
     fail(checkpoint)
-sys.stdout.write("KERNAID_QEMU_PROVIDER_PROOF_V1 stage=repair-apply result=true\\n")
+sys.stdout.write("KERNAID_QEMU_PROVIDER_PROOF_V1 stage="+STAGE+" result=true\\n")
 '''
     return textwrap.dedent(source).encode("ascii")
+
+
+def reconcile_source() -> bytes:
+    """Return a source-fixed boot-two proof for the recovery barrier."""
+
+    source = f'''import http.client,json,sys,time
+HOST="127.0.0.1:4173"
+ORIGIN="http://127.0.0.1:4173"
+API="kernaid.dev/rescue-repair-service/v1alpha1"
+{EXECUTE_STATE_CLASSIFIER_SOURCE}
+counter=0
+def request_id():
+    global counter
+    counter+=1
+    return "R-10000000-0000-0000-0000-"+format(counter,"012x")
+def status():
+    body={{"apiVersion":API,"requestId":request_id(),"operation":"repair.status"}}
+    encoded=json.dumps(body,ensure_ascii=True,separators=(",",":")).encode("ascii")
+    connection=http.client.HTTPConnection("127.0.0.1",4173,timeout=25)
+    connection.request("POST","/api/rescue/repair",body=encoded,headers={{"Host":HOST,"Origin":ORIGIN,"Content-Type":"application/json"}})
+    response=connection.getresponse()
+    payload=response.read(65537)
+    code=response.status
+    connection.close()
+    if code!=200 or len(payload)>65536:
+        raise RuntimeError()
+    value=json.loads(payload)
+    if not isinstance(value,dict) or value.get("outcome")!="ok":
+        raise RuntimeError()
+    return value
+deadline=time.monotonic()+420
+terminal=None
+while time.monotonic()<deadline:
+    try:
+        candidate=status()
+        if candidate.get("state") in ("restored","succeeded","failed","manual-reconciliation-required","cancelled","idle"):
+            terminal=candidate
+            break
+    except BaseException:
+        pass
+    time.sleep(.25)
+if terminal is None or execute_state_checkpoint(terminal) not in (
+    "execute-state-closed-before-unchanged",
+    "execute-state-closed-before-restored",
+):
+    sys.exit(46)
+sys.stdout.write("KERNAID_QEMU_PROVIDER_PROOF_V1 stage=repair-reconcile result=true\\n")
+'''
+    return textwrap.dedent(source).encode("ascii")
+
+
+def target_write_bytes(qmp: object) -> int:
+    """Return the completed write-byte counter for the exact target node."""
+
+    result = qmp.execute_result("query-blockstats", {"query-nodes": True})
+    if not isinstance(result, list) or len(result) > 64:
+        raise LIFECYCLE.ClosedFailure("interruption", "blockstats-invalid")
+    matches = [
+        item
+        for item in result
+        if isinstance(item, dict) and item.get("node-name") == TARGET_NODE
+    ]
+    if len(matches) != 1:
+        raise LIFECYCLE.ClosedFailure("interruption", "target-node-invalid")
+    stats = matches[0].get("stats")
+    if not isinstance(stats, dict):
+        raise LIFECYCLE.ClosedFailure("interruption", "blockstats-invalid")
+    writes = stats.get("wr_bytes")
+    if isinstance(writes, bool) or not isinstance(writes, int) or writes < 0:
+        raise LIFECYCLE.ClosedFailure("interruption", "write-counter-invalid")
+    return writes
+
+
+def pause_vm(qmp: object, deadline: float) -> None:
+    qmp.set_deadline(LIFECYCLE._deadline(deadline, 10.0))
+    qmp.execute("stop")
+    status_value = qmp.execute_result("query-status")
+    if (
+        not isinstance(status_value, dict)
+        or status_value.get("running") is not False
+        or status_value.get("status") != "paused"
+    ):
+        raise LIFECYCLE.ClosedFailure("interruption", "pause-invalid")
+
+
+def interrupt_after_first_target_write(
+    harness: object, qmp: object, aggregate: float
+) -> None:
+    # The shipping write-capability helper can expose this node only after the
+    # exact Pending record has passed its durable persist-and-readback barrier.
+    # Thus the first completed target write is an external witness that the cut
+    # occurs after Pending, without adding a fault hook to the guest image.
+    qmp.set_deadline(LIFECYCLE._deadline(aggregate, 10.0))
+    if target_write_bytes(qmp) != 0:
+        raise LIFECYCLE.ClosedFailure("interruption", "target-wrote-before-approval")
+    pause_vm(qmp, aggregate)
+    witness_deadline = LIFECYCLE._deadline(aggregate, 180.0)
+    while time.monotonic() < witness_deadline:
+        qmp.set_deadline(LIFECYCLE._deadline(witness_deadline, 10.0))
+        qmp.execute("cont")
+        time.sleep(0.005)
+        pause_vm(qmp, witness_deadline)
+        if target_write_bytes(qmp) > 0:
+            qmp.set_deadline(LIFECYCLE._deadline(aggregate, 10.0))
+            qmp.quit()
+            harness.wait_for_shutdown(LIFECYCLE._deadline(aggregate, 30.0))
+            return
+    raise LIFECYCLE.ClosedFailure("interruption", "target-write-timeout")
 
 
 def main(arguments: Sequence[str]) -> int:
@@ -288,20 +556,51 @@ def main(arguments: Sequence[str]) -> int:
         parsed = parser().parse_args(arguments)
         if parsed.qemu_args[:1] != ["--"]:
             raise LIFECYCLE.ClosedFailure("arguments", "invalid")
+        if parsed.scenario == "interrupt-reconcile" and parsed.firmware != "uefi":
+            raise LIFECYCLE.ClosedFailure("arguments", "scenario-firmware-invalid")
         for digest in (parsed.before_sha256, parsed.after_sha256):
             if re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
                 raise LIFECYCLE.ClosedFailure("arguments", "digest-invalid")
-        if parsed.before_sha256 == parsed.after_sha256 or not 300 <= parsed.timeout <= 1200:
+        timeout_maximum = 1800 if parsed.scenario == "interrupt-reconcile" else 1200
+        if (
+            parsed.before_sha256 == parsed.after_sha256
+            or not 300 <= parsed.timeout <= timeout_maximum
+        ):
             raise LIFECYCLE.ClosedFailure("arguments", "invalid")
+        if parsed.firmware == "uefi":
+            if parsed.ovmf_code is None or parsed.ovmf_vars_template is None:
+                raise LIFECYCLE.ClosedFailure("firmware", "pair-missing")
+            ovmf_code = trusted_firmware_file(parsed.ovmf_code)
+            ovmf_vars_template = trusted_firmware_file(parsed.ovmf_vars_template)
+            code_metadata = ovmf_code.stat()
+            vars_metadata = ovmf_vars_template.stat()
+            if (code_metadata.st_dev, code_metadata.st_ino) == (
+                vars_metadata.st_dev,
+                vars_metadata.st_ino,
+            ):
+                raise LIFECYCLE.ClosedFailure("firmware", "pair-invalid")
+        else:
+            if parsed.ovmf_code is not None or parsed.ovmf_vars_template is not None:
+                raise LIFECYCLE.ClosedFailure("firmware", "pair-forbidden")
+            ovmf_code = None
+            ovmf_vars_template = None
         prior_handlers, prior_mask = LIFECYCLE.install_signal_guard()
         key = LIFECYCLE.read_secret_fd(parsed.vault_key_fd, expected_uid=os.geteuid())
         login = LIFECYCLE.read_login_credential_fd(
             parsed.login_credential_fd, expected_uid=os.geteuid()
         )
         aggregate = time.monotonic() + parsed.timeout
+        first_boot_arguments = qemu_args_for_boot(
+            parsed.qemu_args[1:],
+            parsed.firmware,
+            1,
+            parsed.qmp_socket,
+            ovmf_code,
+            ovmf_vars_template,
+        )
         harness = LIFECYCLE.QemuHarness(
             parsed.qemu,
-            parsed.qemu_args[1:],
+            first_boot_arguments,
             parsed.qmp_socket,
             [key],
             [key, login],
@@ -332,17 +631,68 @@ def main(arguments: Sequence[str]) -> int:
         )
         if unlocked.vault_state != "unlocked" or unlocked.device_id is None:
             raise LIFECYCLE.ClosedFailure("vault", "unlock-invalid")
-        LIFECYCLE.run_guest_proof(
-            console,
-            "repair-apply",
-            repair_source(parsed.before_sha256, parsed.after_sha256),
-            cursor,
-            aggregate,
-            timeout=420.0,
-        )
-        qmp.set_deadline(LIFECYCLE._deadline(aggregate, 10.0))
-        qmp.system_powerdown()
-        harness.wait_for_shutdown(LIFECYCLE._deadline(aggregate, 180.0))
+        if parsed.scenario == "apply":
+            LIFECYCLE.run_guest_proof(
+                console,
+                "repair-apply",
+                repair_source(parsed.before_sha256, parsed.after_sha256),
+                cursor,
+                aggregate,
+                timeout=420.0,
+            )
+            qmp.set_deadline(LIFECYCLE._deadline(aggregate, 10.0))
+            qmp.system_powerdown()
+            harness.wait_for_shutdown(LIFECYCLE._deadline(aggregate, 180.0))
+        else:
+            LIFECYCLE.run_guest_proof(
+                console,
+                "repair-interrupt-arm",
+                repair_source(
+                    parsed.before_sha256,
+                    parsed.after_sha256,
+                    interrupt_arm=True,
+                ),
+                cursor,
+                aggregate,
+                timeout=420.0,
+            )
+            interrupt_after_first_target_write(harness, qmp, aggregate)
+            harness.cleanup()
+            harness = None
+
+            second_boot_arguments = qemu_args_for_boot(
+                parsed.qemu_args[1:],
+                parsed.firmware,
+                2,
+                parsed.qmp_socket,
+                ovmf_code,
+                ovmf_vars_template,
+            )
+            harness = LIFECYCLE.QemuHarness(
+                parsed.qemu,
+                second_boot_arguments,
+                parsed.qmp_socket,
+                [key],
+                [key, login],
+            )
+            console, qmp = harness.start(LIFECYCLE._deadline(aggregate, 15.0))
+            cursor = LIFECYCLE.establish_live_session(console, aggregate, login)
+            unlocked, cursor = LIFECYCLE.run_companion(
+                console, "unlock", "repair-recovery-unlock", cursor, aggregate, key
+            )
+            if unlocked.vault_state != "unlocked" or unlocked.device_id is None:
+                raise LIFECYCLE.ClosedFailure("vault", "recovery-unlock-invalid")
+            LIFECYCLE.run_guest_proof(
+                console,
+                "repair-reconcile",
+                reconcile_source(),
+                cursor,
+                aggregate,
+                timeout=440.0,
+            )
+            qmp.set_deadline(LIFECYCLE._deadline(aggregate, 10.0))
+            qmp.system_powerdown()
+            harness.wait_for_shutdown(LIFECYCLE._deadline(aggregate, 180.0))
     except LIFECYCLE.ClosedFailure as error:
         failure = error
     except (LIFECYCLE.ControllerSignal, KeyboardInterrupt, SystemExit):
@@ -366,10 +716,17 @@ def main(arguments: Sequence[str]) -> int:
             flush=True,
         )
         return 1
+    if parsed.scenario == "apply":
+        suffix = "terminal=committed approval=typed-single-use"
+    else:
+        suffix = (
+            "terminal=restored interruption=qmp-after-target-write recovery=closed"
+        )
     print(
         f"{ATTESTATION_PREFIX} action=linux.fstab.disable-missing-uuid.v1 "
+        f"firmware={parsed.firmware} scenario={parsed.scenario} "
         f"before_sha256={parsed.before_sha256} after_sha256={parsed.after_sha256} "
-        "vault_distinct=true terminal=committed approval=typed-single-use ready=true",
+        f"vault_distinct=true {suffix} ready=true",
         flush=True,
     )
     return 0

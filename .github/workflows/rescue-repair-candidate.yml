@@ -192,7 +192,20 @@ jobs:
       - name: QEMU BIOS repair candidate apply qualification
         run: |
           KERNAID_QEMU_SMP=4 \
+            ./tools/build-rescue/qemu-repair-candidate-smoke.sh bios apply \
+            "$PWD/KernAid-Rescue-amd64-repair-candidate.iso"
+
+      - name: QEMU UEFI repair candidate apply qualification
+        run: |
+          KERNAID_QEMU_SMP=4 \
+            ./tools/build-rescue/qemu-repair-candidate-smoke.sh uefi apply \
+            "$PWD/KernAid-Rescue-amd64-repair-candidate.iso"
+
+      - name: QEMU UEFI repair candidate restart reconciliation qualification
+        run: |
+          KERNAID_QEMU_SMP=4 \
             ./tools/build-rescue/qemu-repair-candidate-smoke.sh \
+            uefi interrupt-reconcile \
             "$PWD/KernAid-Rescue-amd64-repair-candidate.iso"
 
       - name: Upload private repair candidate forensics
