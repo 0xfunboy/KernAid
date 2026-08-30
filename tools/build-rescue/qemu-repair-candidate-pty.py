@@ -1070,7 +1070,11 @@ def run_receipt_guest_proof(
     )
     end_match = console.wait_regex(
         LIFECYCLE._return_code_line_pattern(end),
-        start=receipt.end(),
+        # The return-code matcher consumes its leading line boundary.  The
+        # receipt matcher has already consumed that newline, so reopen only
+        # its final validated LF; starting at receipt.end() makes an adjacent
+        # END marker impossible to match.
+        start=receipt.end() - 1,
         deadline=started + 445.0,
         stage="receipt-finish",
     )

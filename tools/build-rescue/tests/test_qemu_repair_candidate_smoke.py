@@ -34,6 +34,78 @@ TAMPER_SPEC.loader.exec_module(tamper)
 
 
 class QemuRepairCandidateSmokeTests(unittest.TestCase):
+    @staticmethod
+    def _receipt_transcript_console(return_code: int) -> object:
+        begin = b"KERNAID_PROVIDER_PROOF_BEGIN_V1_repair-backup-tamper-apply"
+        receipt = (
+            b"KERNAID_QEMU_REPAIR_RECEIPT_V1 "
+            b"reservation_id=B-" + b"a" * 32 + b" "
+            b"binding=sha256:" + b"b" * 64
+        )
+        end = b"KERNAID_PROVIDER_PROOF_END_V1_repair-backup-tamper-apply"
+        capture = controller.LIFECYCLE.BoundedCapture(4096, [])
+        capture.append(
+            begin
+            + b"\r\n"
+            + receipt
+            + b"\r\n"
+            + end
+            + b" rc="
+            + str(return_code).encode("ascii")
+            + b"\r\n"
+        )
+
+        class TranscriptConsole:
+            def __init__(self) -> None:
+                self.capture = capture
+
+            def send(self, value: bytes, *, deadline: float) -> None:
+                del value, deadline
+
+            def wait_regex(
+                self,
+                pattern: object,
+                *,
+                start: int,
+                deadline: float,
+                stage: str,
+            ) -> object:
+                del deadline
+                match = pattern.search(self.capture.snapshot(), start)
+                if match is None:
+                    raise controller.LIFECYCLE.ClosedFailure(stage, "timeout")
+                return match
+
+        return TranscriptConsole()
+
+    def test_receipt_end_marker_is_adjacent_and_exact(self) -> None:
+        console = self._receipt_transcript_console(0)
+
+        reservation_id, binding, cursor = controller.run_receipt_guest_proof(
+            console,
+            b"print('unused')",
+            0,
+            time.monotonic() + 456.0,
+        )
+
+        self.assertEqual(reservation_id, "B-" + "a" * 32)
+        self.assertEqual(binding, "sha256:" + "b" * 64)
+        self.assertEqual(cursor, len(console.capture.snapshot()))
+
+    def test_receipt_end_marker_nonzero_return_code_fails_closed(self) -> None:
+        console = self._receipt_transcript_console(1)
+
+        with self.assertRaises(controller.LIFECYCLE.ClosedFailure) as observed:
+            controller.run_receipt_guest_proof(
+                console,
+                b"print('unused')",
+                0,
+                time.monotonic() + 456.0,
+            )
+
+        self.assertEqual(observed.exception.stage, "receipt")
+        self.assertEqual(observed.exception.code, "command-failed")
+
     def test_repair_unlock_recovers_only_via_fresh_exact_status(self) -> None:
         key = bytearray(b"0" * 64)
         capture = controller.LIFECYCLE.BoundedCapture(4096, [])
