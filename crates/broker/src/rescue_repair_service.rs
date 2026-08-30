@@ -6,7 +6,7 @@
 //! action identifier, command, observed bytes, or replacement bytes.
 
 use kernaid_core::RESCUE_FSTAB_TYPED_CONFIRMATION;
-use kernaid_linux_pack::production_candidate_contract::ACTION_ID;
+use kernaid_linux_pack::production_candidate_contract::{ACTION_ID, RESOURCE_ID};
 use kernaid_protocol::rescue_vault::RequestId;
 use rustix::rand::{GetRandomFlags, getrandom};
 use serde::{Deserialize, Serialize};
@@ -398,6 +398,8 @@ pub struct PreparedRepairDescriptor {
     before_sha256: String,
     after_sha256: String,
     diff_sha256: String,
+    resource_id: String,
+    backup_locator: String,
     next_approval_sequence: u64,
     backup_reserved: bool,
     vault_distinct: bool,
@@ -413,6 +415,8 @@ impl PreparedRepairDescriptor {
         before_sha256: impl Into<String>,
         after_sha256: impl Into<String>,
         diff_sha256: impl Into<String>,
+        resource_id: impl Into<String>,
+        backup_locator: impl Into<String>,
         next_approval_sequence: u64,
         backup_reserved: bool,
         vault_distinct: bool,
@@ -425,6 +429,8 @@ impl PreparedRepairDescriptor {
             before_sha256: before_sha256.into(),
             after_sha256: after_sha256.into(),
             diff_sha256: diff_sha256.into(),
+            resource_id: resource_id.into(),
+            backup_locator: backup_locator.into(),
             next_approval_sequence,
             backup_reserved,
             vault_distinct,
@@ -436,6 +442,8 @@ impl PreparedRepairDescriptor {
             || !valid_prefixed_hash(&value.before_sha256, "sha256:")
             || !valid_prefixed_hash(&value.after_sha256, "sha256:")
             || !valid_prefixed_hash(&value.diff_sha256, "sha256:")
+            || value.resource_id != RESOURCE_ID
+            || !valid_backup_locator(&value.backup_locator)
             || value.next_approval_sequence == 0
             || !value.backup_reserved
             || !value.vault_distinct
@@ -525,6 +533,8 @@ pub struct PreparedRepairDetail {
     before_sha256: String,
     after_sha256: String,
     diff_sha256: String,
+    resource_id: String,
+    backup_locator: String,
     action_id: &'static str,
     risk: &'static str,
     backup: PreparedBackupDetail,
@@ -601,6 +611,8 @@ impl PreparedSummary {
             before_sha256: self.descriptor.before_sha256.clone(),
             after_sha256: self.descriptor.after_sha256.clone(),
             diff_sha256: self.descriptor.diff_sha256.clone(),
+            resource_id: self.descriptor.resource_id.clone(),
+            backup_locator: self.descriptor.backup_locator.clone(),
             action_id: ACTION_ID,
             risk: RISK_ID,
             backup: PreparedBackupDetail {
@@ -1352,6 +1364,12 @@ fn valid_reservation_id(value: &str) -> bool {
     valid_fixed_id(value, "B-")
 }
 
+fn valid_backup_locator(value: &str) -> bool {
+    value
+        .strip_prefix("vault://repair/")
+        .is_some_and(valid_reservation_id)
+}
+
 fn lower_hex(bytes: &[u8]) -> bool {
     bytes
         .iter()
@@ -1457,6 +1475,8 @@ mod tests {
                     hash('2'),
                     hash('3'),
                     hash('4'),
+                    RESOURCE_ID,
+                    "vault://repair/B-0123456789abcdef0123456789abcdef",
                     1,
                     true,
                     true,
@@ -1572,6 +1592,11 @@ mod tests {
         let detail = &status["detail"];
         assert_eq!(detail["kind"], "fstab-prepared");
         assert_eq!(detail["sessionId"], "S-0123456789abcdef0123456789abcdef");
+        assert_eq!(detail["resourceId"], RESOURCE_ID);
+        assert_eq!(
+            detail["backupLocator"],
+            "vault://repair/B-0123456789abcdef0123456789abcdef"
+        );
         assert!(
             detail["planId"]
                 .as_str()

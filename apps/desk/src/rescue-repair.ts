@@ -5,6 +5,7 @@ export const RESCUE_REPAIR_API_VERSION =
 export const RESCUE_REPAIR_ENDPOINT = "/api/rescue/repair";
 export const RESCUE_FSTAB_FINDING_ID = "KA-LNX-P0-003";
 export const RESCUE_FSTAB_ACTION_ID = "linux.fstab.disable-missing-uuid.v1";
+export const RESCUE_FSTAB_RESOURCE_ID = "rescue:selected-linux-root:etc/fstab";
 export const RESCUE_FSTAB_CONFIRMATION = "DISABILITA VOCE FSTAB";
 
 const MAX_RESPONSE_BYTES = 4096;
@@ -18,6 +19,7 @@ const RESERVATION_ID = /^B-[A-Za-z0-9-]{1,126}$/u;
 const SCAN_FINGERPRINT = /^scan:[a-f0-9]{64}$/u;
 const TARGET_ID = /^target:[a-f0-9]{64}$/u;
 const SHA256 = /^sha256:[a-f0-9]{64}$/u;
+const BACKUP_LOCATOR = /^vault:\/\/repair\/B-[a-f0-9]{32}$/u;
 
 export type RescueRepairOperation =
   | "repair.status"
@@ -81,6 +83,8 @@ export interface RescueRepairPreparedDetail {
   readonly beforeSha256: string;
   readonly afterSha256: string;
   readonly diffSha256: string;
+  readonly resourceId: typeof RESCUE_FSTAB_RESOURCE_ID;
+  readonly backupLocator: string;
   readonly actionId: typeof RESCUE_FSTAB_ACTION_ID;
   readonly risk: "R2";
   readonly backup: {
@@ -491,6 +495,8 @@ function parsePreparedDetail(value: unknown): RescueRepairPreparedDetail {
     "beforeSha256",
     "afterSha256",
     "diffSha256",
+    "resourceId",
+    "backupLocator",
     "actionId",
     "risk",
     "backup",
@@ -517,6 +523,9 @@ function parsePreparedDetail(value: unknown): RescueRepairPreparedDetail {
     typeof item.diffSha256 !== "string" ||
     !SHA256.test(item.diffSha256) ||
     item.beforeSha256 === item.afterSha256 ||
+    item.resourceId !== RESCUE_FSTAB_RESOURCE_ID ||
+    typeof item.backupLocator !== "string" ||
+    !BACKUP_LOCATOR.test(item.backupLocator) ||
     item.actionId !== RESCUE_FSTAB_ACTION_ID ||
     item.risk !== "R2" ||
     backup.state !== "reserved" ||

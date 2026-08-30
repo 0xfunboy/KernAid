@@ -82,6 +82,7 @@ REPAIR_SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 REPAIR_SCAN_FINGERPRINT = re.compile(r"^scan:[0-9a-f]{64}$")
 REPAIR_TARGET_ID = re.compile(r"^target:[0-9a-f]{64}$")
 REPAIR_RESERVATION_ID = re.compile(r"^B-[A-Za-z0-9-]{1,126}$")
+REPAIR_BACKUP_LOCATOR = re.compile(r"^vault://repair/B-[0-9a-f]{32}$")
 REPAIR_OPERATIONS = {
     "repair.status",
     "repair.fstab.prepare",
@@ -1065,6 +1066,8 @@ def _validate_repair_prepared_detail(value: object) -> bool:
         "beforeSha256",
         "afterSha256",
         "diffSha256",
+        "resourceId",
+        "backupLocator",
         "actionId",
         "risk",
         "backup",
@@ -1090,6 +1093,9 @@ def _validate_repair_prepared_detail(value: object) -> bool:
             )
         )
         and value.get("beforeSha256") != value.get("afterSha256")
+        and value.get("resourceId") == "rescue:selected-linux-root:etc/fstab"
+        and isinstance(value.get("backupLocator"), str)
+        and REPAIR_BACKUP_LOCATOR.fullmatch(str(value["backupLocator"])) is not None
         and value.get("actionId") == "linux.fstab.disable-missing-uuid.v1"
         and value.get("risk") == "R2"
         and isinstance(backup, dict)

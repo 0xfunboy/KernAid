@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   RESCUE_FSTAB_CONFIRMATION,
+  RESCUE_FSTAB_RESOURCE_ID,
   RESCUE_REPAIR_API_VERSION,
   RescueRepairClient,
   RescueRepairServiceError,
@@ -35,8 +36,33 @@ test("prepared response is exact, correlated, and contains no repair bytes", () 
   assert.ok(detail);
   assert.equal(detail.actionId, "linux.fstab.disable-missing-uuid.v1");
   assert.equal(detail.backup.vaultDistinct, true);
+  assert.equal(detail.resourceId, RESCUE_FSTAB_RESOURCE_ID);
+  assert.equal(detail.backupLocator, `vault://repair/B-${"9".repeat(32)}`);
   assert.equal(detail.confirmationRequired, RESCUE_FSTAB_CONFIRMATION);
   assert.doesNotMatch(JSON.stringify(detail), /\/etc\/|\/dev\/|UUID=/u);
+
+  for (const invalid of [
+    { resourceId: "rescue:selected-linux-root:etc/shadow" },
+    { backupLocator: "/run/kernaid-vault/backups/original" },
+    { backupLocator: "vault://repair/B-../../host-path" },
+  ]) {
+    const envelope = preparedEnvelope(REQUEST, "repair.fstab.prepare");
+    assert.throws(
+      () =>
+        parseRescueRepairResponse(
+          {
+            ...envelope,
+            detail: {
+              ...(envelope.detail as Record<string, unknown>),
+              ...invalid,
+            },
+          },
+          REQUEST,
+          "repair.fstab.prepare",
+        ),
+      /non valido/u,
+    );
+  }
 
   assert.throws(
     () =>
@@ -322,6 +348,8 @@ function preparedEnvelope(
       beforeSha256: `sha256:${"3".repeat(64)}`,
       afterSha256: `sha256:${"4".repeat(64)}`,
       diffSha256: `sha256:${"5".repeat(64)}`,
+      resourceId: RESCUE_FSTAB_RESOURCE_ID,
+      backupLocator: `vault://repair/B-${"9".repeat(32)}`,
       actionId: "linux.fstab.disable-missing-uuid.v1",
       risk: "R2",
       backup: { state: "reserved", vaultDistinct: true },

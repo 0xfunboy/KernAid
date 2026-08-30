@@ -1322,6 +1322,8 @@ class RepairRelayTests(unittest.TestCase):
                 "beforeSha256": "sha256:" + "6" * 64,
                 "afterSha256": "sha256:" + "7" * 64,
                 "diffSha256": "sha256:" + "8" * 64,
+                "resourceId": "rescue:selected-linux-root:etc/fstab",
+                "backupLocator": "vault://repair/B-" + "9" * 32,
                 "actionId": "linux.fstab.disable-missing-uuid.v1",
                 "risk": "R2",
                 "backup": {"state": "reserved", "vaultDistinct": True},
@@ -1330,6 +1332,18 @@ class RepairRelayTests(unittest.TestCase):
             },
         }
         rescue_server._validate_repair_response(prepared, self.STATUS)
+        for invalid in (
+            {"resourceId": "rescue:selected-linux-root:etc/shadow"},
+            {"backupLocator": "/run/kernaid-vault/backups/original"},
+            {"backupLocator": "vault://repair/B-../../host-path"},
+        ):
+            with self.assertRaisesRegex(
+                rescue_server.RepairRelayError, "invalid-response"
+            ):
+                rescue_server._validate_repair_response(
+                    {**prepared, "detail": {**prepared["detail"], **invalid}},
+                    self.STATUS,
+                )
         terminal = {
             **self.STATUS,
             "outcome": "ok",

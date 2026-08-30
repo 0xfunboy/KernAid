@@ -120,6 +120,8 @@ impl RepairPreparationEngine for ProductionRepairEngine {
             prepared.before_sha256(),
             prepared.after_sha256(),
             prepared.diff_sha256(),
+            prepared.receipt().intent().resource_id(),
+            prepared.receipt().backup_locator(),
             admission.next_approval_sequence(),
             true,
             prepared.receipt().target_physical_parent_fingerprint()

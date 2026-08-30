@@ -276,6 +276,14 @@ export function RescueRepairPanel({
             <span>Binding piano</span>
             <code title={prepared.planHash}>{prepared.planHash}</code>
           </div>
+          <div className="rescue-repair-row">
+            <span>Risorsa esatta</span>
+            <code title={prepared.resourceId}>{prepared.resourceId}</code>
+          </div>
+          <div className="rescue-repair-row">
+            <span>Destinazione backup</span>
+            <code title={prepared.backupLocator}>{prepared.backupLocator}</code>
+          </div>
           <div className="rescue-repair-backup">
             <b>Backup pronto su dispositivo distinto</b>
             <small>
