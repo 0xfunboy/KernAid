@@ -1269,6 +1269,10 @@ function App() {
         {isRescueRuntime() ? (
           <RescueDiagnosisWizard
             vaultStatusReady={openAiStatusReady}
+            vaultUnlockEligible={
+              openAiStatus?.profile === "rescue-default" &&
+              openAiStatus.vault === "locked"
+            }
             vaultLabel={rescueVaultLabel(openAiStatus)}
             vaultGuidance={rescueOpenAiGuidance(openAiStatus)}
             persistentAuditReady={rescueAuditSink !== undefined}

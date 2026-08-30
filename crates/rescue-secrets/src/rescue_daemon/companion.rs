@@ -19,7 +19,10 @@ use rustix::{
     event::{PollFd, PollFlags, Timespec, poll},
     fd::{AsFd, BorrowedFd, OwnedFd},
     fs::{self as rfs, AtFlags, FileType, Mode, OFlags, RenameFlags, ResolveFlags},
-    net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType, connect, socket_with},
+    net::{
+        AddressFamily, SendFlags, SocketAddrUnix, SocketFlags, SocketType, connect, sendto,
+        socket_with,
+    },
     pipe::{PipeFlags, pipe_with},
     termios::{
         LocalModes, OptionalActions, QueueSelector, Termios, tcflush, tcgetattr, tcgetpgrp,
@@ -28,7 +31,10 @@ use rustix::{
 };
 use sha2::{Digest, Sha256 as Sha256Hasher};
 use std::{
-    ffi::OsString,
+    env,
+    ffi::{OsStr, OsString},
+    os::unix::ffi::OsStrExt,
+    path::Path,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -53,6 +59,11 @@ const REPORT_DIRECTORY_NAME: &str = "KernAid-Reports";
 const REPORT_FILE_SUFFIX: &str = ".signed.json";
 const REPORT_TEMP_RANDOM_BYTES: usize = 16;
 const REPORT_TEMP_CREATE_ATTEMPTS: usize = 4;
+const NOTIFY_SOCKET_ENV: &str = "NOTIFY_SOCKET";
+const PROMPT_READY_NOTIFICATION: &[u8] = b"READY=1";
+const MAX_NOTIFY_SOCKET_BYTES: usize = 108;
+const NATIVE_PROMPT_TTY_MAJOR: u32 = 4;
+const NATIVE_PROMPT_TTY_MINOR: u32 = 8;
 
 #[derive(Clone, Copy)]
 struct ReportOwner {
@@ -77,6 +88,75 @@ enum Command {
     ReportExport(ReportId),
 }
 
+enum PromptReadyNotifier {
+    Disabled,
+    Enabled(SocketAddrUnix),
+}
+
+impl PromptReadyNotifier {
+    fn from_environment(command: &Command) -> Result<Self, RescueVaultCompanionError> {
+        let stdin = std::io::stdin();
+        let metadata = rfs::fstat(stdin.as_fd())
+            .map_err(|_| RescueVaultCompanionError::TransportUnavailable)?;
+        let native_prompt_tty = FileType::from_raw_mode(metadata.st_mode).is_char_device()
+            && rfs::major(metadata.st_rdev) == NATIVE_PROMPT_TTY_MAJOR
+            && rfs::minor(metadata.st_rdev) == NATIVE_PROMPT_TTY_MINOR;
+        Self::from_value(
+            command,
+            native_prompt_tty,
+            env::var_os(NOTIFY_SOCKET_ENV).as_deref(),
+        )
+    }
+
+    fn from_value(
+        command: &Command,
+        native_prompt_tty: bool,
+        value: Option<&OsStr>,
+    ) -> Result<Self, RescueVaultCompanionError> {
+        if !matches!(command, Command::Unlock) || !native_prompt_tty {
+            return if value.is_none() {
+                Ok(Self::Disabled)
+            } else {
+                Err(RescueVaultCompanionError::TransportUnavailable)
+            };
+        }
+        let value = value.ok_or(RescueVaultCompanionError::TransportUnavailable)?;
+        let bytes = value.as_bytes();
+        if bytes.is_empty() || bytes.len() > MAX_NOTIFY_SOCKET_BYTES || bytes.contains(&0) {
+            return Err(RescueVaultCompanionError::TransportUnavailable);
+        }
+        let address = match bytes[0] {
+            b'/' => SocketAddrUnix::new(Path::new(value)),
+            b'@' if bytes.len() > 1 => SocketAddrUnix::new_abstract_name(&bytes[1..]),
+            _ => return Err(RescueVaultCompanionError::TransportUnavailable),
+        }
+        .map_err(|_| RescueVaultCompanionError::TransportUnavailable)?;
+        Ok(Self::Enabled(address))
+    }
+
+    fn notify(&self) -> Result<(), RescueVaultCompanionError> {
+        let Self::Enabled(address) = self else {
+            return Ok(());
+        };
+        let socket = socket_with(
+            AddressFamily::UNIX,
+            SocketType::DGRAM,
+            SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+            None,
+        )
+        .map_err(|_| RescueVaultCompanionError::TransportUnavailable)?;
+        match sendto(
+            &socket,
+            PROMPT_READY_NOTIFICATION,
+            SendFlags::DONTWAIT | SendFlags::NOSIGNAL,
+            address,
+        ) {
+            Ok(sent) if sent == PROMPT_READY_NOTIFICATION.len() => Ok(()),
+            Ok(_) | Err(_) => Err(RescueVaultCompanionError::TransportUnavailable),
+        }
+    }
+}
+
 pub(super) fn run<I>(arguments: I) -> Result<(), RescueVaultCompanionError>
 where
     I: IntoIterator<Item = OsString>,
@@ -85,8 +165,9 @@ where
     validate_shipping_identity(COMPANION_UID)?;
     let command = parse_command(arguments)?;
     let tty = open_tty()?;
+    let prompt_ready = PromptReadyNotifier::from_environment(&command)?;
     let interrupted = install_signal_waiter()?;
-    let result = execute(command, tty.as_fd(), &interrupted);
+    let result = execute(command, tty.as_fd(), &interrupted, &prompt_ready);
     if let Err(error) = result {
         let _ = write_tty_error(tty.as_fd(), error);
         return Err(error);
@@ -205,6 +286,7 @@ fn execute(
     command: Command,
     tty: BorrowedFd<'_>,
     interrupted: &AtomicBool,
+    prompt_ready: &PromptReadyNotifier,
 ) -> Result<(), RescueVaultCompanionError> {
     let status = exchange(
         ClientRequestPayload::VaultStatus,
@@ -232,7 +314,7 @@ fn execute(
     }
     let response = match command {
         Command::Unlock => {
-            let secret = read_secret_from_tty(tty, interrupted)?;
+            let secret = read_secret_from_tty(tty, interrupted, prompt_ready)?;
             let (read, write) = pipe_with(PipeFlags::CLOEXEC)
                 .map_err(|_| RescueVaultCompanionError::TransportUnavailable)?;
             write_pipe_secret(write.as_fd(), &secret)
@@ -1433,18 +1515,20 @@ impl Drop for EchoGuard<'_> {
 fn read_secret_from_tty(
     tty: BorrowedFd<'_>,
     interrupted: &AtomicBool,
+    prompt_ready: &PromptReadyNotifier,
 ) -> Result<Zeroizing<Vec<u8>>, RescueVaultCompanionError> {
     validate_no_active_swap().map_err(|()| RescueVaultCompanionError::TransportUnavailable)?;
-    read_secret_from_tty_after_privacy_check(tty, interrupted)
+    read_hidden_secret_after_privacy_with_ready(
+        tty,
+        interrupted,
+        ensure_foreground_tty,
+        HiddenSecretKind::VaultPassphrase,
+        None,
+        || prompt_ready.notify(),
+    )
 }
 
-fn read_secret_from_tty_after_privacy_check(
-    tty: BorrowedFd<'_>,
-    interrupted: &AtomicBool,
-) -> Result<Zeroizing<Vec<u8>>, RescueVaultCompanionError> {
-    read_secret_after_privacy_with_foreground_check(tty, interrupted, ensure_foreground_tty)
-}
-
+#[cfg(test)]
 fn read_secret_after_privacy_with_foreground_check(
     tty: BorrowedFd<'_>,
     interrupted: &AtomicBool,
@@ -1556,6 +1640,24 @@ fn read_hidden_secret_after_privacy_with_foreground_check(
     kind: HiddenSecretKind,
     ready_marker: Option<&'static [u8]>,
 ) -> Result<Zeroizing<Vec<u8>>, RescueVaultCompanionError> {
+    read_hidden_secret_after_privacy_with_ready(
+        tty,
+        interrupted,
+        foreground_check,
+        kind,
+        ready_marker,
+        || Ok(()),
+    )
+}
+
+fn read_hidden_secret_after_privacy_with_ready(
+    tty: BorrowedFd<'_>,
+    interrupted: &AtomicBool,
+    foreground_check: fn(BorrowedFd<'_>) -> Result<(), RescueVaultCompanionError>,
+    kind: HiddenSecretKind,
+    ready_marker: Option<&'static [u8]>,
+    notify_ready: impl FnOnce() -> Result<(), RescueVaultCompanionError>,
+) -> Result<Zeroizing<Vec<u8>>, RescueVaultCompanionError> {
     // Allocate before echo is disabled so allocator failure cannot strand the
     // controlling terminal in the hidden state.
     let value = Zeroizing::new(Vec::with_capacity(kind.maximum()));
@@ -1571,6 +1673,9 @@ fn read_hidden_secret_after_privacy_with_foreground_check(
         {
             return Err(guard.abort_after_hide(RescueVaultCompanionError::TtyUnavailable));
         }
+    }
+    if let Err(error) = notify_ready() {
+        return Err(guard.abort_after_hide(error));
     }
     let result = read_hidden_secret_line(tty, interrupted, value, kind);
     guard.cleanup_after_hide()?;
@@ -1910,7 +2015,9 @@ mod tests {
     };
     use nix::pty::openpty;
     use rustix::net::{RecvFlags, SendFlags, recv, send, socketpair};
-    use std::{cell::Cell, collections::VecDeque, sync::atomic::AtomicUsize};
+    use std::{
+        cell::Cell, collections::VecDeque, os::unix::net::UnixDatagram, sync::atomic::AtomicUsize,
+    };
 
     fn assume_foreground(_tty: BorrowedFd<'_>) -> Result<(), RescueVaultCompanionError> {
         Ok(())
@@ -1921,6 +2028,98 @@ mod tests {
         let flags = rfs::fcntl_getfl(&pty.slave).expect("pty flags");
         rfs::fcntl_setfl(&pty.slave, flags | OFlags::NONBLOCK).expect("nonblocking slave");
         pty
+    }
+
+    #[test]
+    fn native_prompt_notification_is_tty8_unlock_only_and_exact() {
+        assert!(matches!(
+            PromptReadyNotifier::from_value(&Command::Unlock, false, None),
+            Ok(PromptReadyNotifier::Disabled)
+        ));
+        assert_eq!(
+            PromptReadyNotifier::from_value(&Command::Unlock, true, None).err(),
+            Some(RescueVaultCompanionError::TransportUnavailable)
+        );
+        assert_eq!(
+            PromptReadyNotifier::from_value(
+                &Command::Status,
+                true,
+                Some(OsStr::new("/run/systemd/notify")),
+            )
+            .err(),
+            Some(RescueVaultCompanionError::TransportUnavailable)
+        );
+        assert_eq!(
+            PromptReadyNotifier::from_value(
+                &Command::Unlock,
+                true,
+                Some(OsStr::new("relative-notify.sock")),
+            )
+            .err(),
+            Some(RescueVaultCompanionError::TransportUnavailable)
+        );
+
+        let directory = tempfile::tempdir().expect("notification directory");
+        let path = directory.path().join("notify.sock");
+        let receiver = UnixDatagram::bind(&path).expect("notification receiver");
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("notification timeout");
+        let notifier =
+            PromptReadyNotifier::from_value(&Command::Unlock, true, Some(path.as_os_str()))
+                .expect("native prompt notifier");
+        notifier.notify().expect("native prompt READY");
+        let mut payload = [0_u8; 32];
+        let received = receiver.recv(&mut payload).expect("READY datagram");
+        assert_eq!(&payload[..received], PROMPT_READY_NOTIFICATION);
+    }
+
+    #[test]
+    fn native_prompt_ready_follows_echo_hide_and_prompt_and_failure_aborts_read() {
+        let pty = nonblocking_pty();
+        let master_flags = rfs::fcntl_getfl(&pty.master).expect("master flags");
+        rfs::fcntl_setfl(&pty.master, master_flags | OFlags::NONBLOCK).expect("nonblocking master");
+        let before = tcgetattr(&pty.slave).expect("before");
+        let mut readiness_called = false;
+        let result = read_hidden_secret_after_privacy_with_ready(
+            pty.slave.as_fd(),
+            &AtomicBool::new(false),
+            assume_foreground,
+            HiddenSecretKind::VaultPassphrase,
+            None,
+            || {
+                readiness_called = true;
+                let hidden = tcgetattr(&pty.slave).expect("hidden termios");
+                assert!(
+                    !hidden
+                        .local_modes
+                        .intersects(LocalModes::ECHO | LocalModes::ECHONL)
+                );
+                let mut output = Vec::new();
+                let mut buffer = [0_u8; 256];
+                loop {
+                    match rustix::io::read(&pty.master, &mut buffer) {
+                        Ok(0) => break,
+                        Ok(read) => output.extend_from_slice(&buffer[..read]),
+                        Err(error) if error == rustix::io::Errno::AGAIN => break,
+                        Err(error) if error == rustix::io::Errno::INTR => {}
+                        Err(error) => panic!("prompt read failed: {error}"),
+                    }
+                }
+                assert!(
+                    output
+                        .windows(b"Vault passphrase: ".len())
+                        .any(|window| window == b"Vault passphrase: ")
+                );
+                Err(RescueVaultCompanionError::TransportUnavailable)
+            },
+        );
+        assert!(readiness_called);
+        assert_eq!(result, Err(RescueVaultCompanionError::TransportUnavailable));
+        assert_eq!(
+            before.local_modes,
+            tcgetattr(&pty.slave).expect("restored").local_modes
+        );
     }
 
     fn delayed_master_write(master: OwnedFd, bytes: Vec<u8>) -> thread::JoinHandle<()> {

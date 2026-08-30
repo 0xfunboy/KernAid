@@ -43,7 +43,7 @@ MAX_TOOL_BYTES = 4 * 1024
 MAX_SEEN_REQUESTS = 1024
 SO_PEERPIDFD = 77
 TOOL_TIMEOUT_SECONDS = 4
-START_TIMEOUT_SECONDS = 4
+START_TIMEOUT_SECONDS = 8
 MONITOR_INTERVAL_SECONDS = 0.25
 REQUEST_ID = re.compile(
     r"^N-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
@@ -536,8 +536,8 @@ class PromptController:
             _prompt_backend_ready()
             if self._active:
                 try:
-                    state, _substate, _result = _unit_state()
-                    if state in {"active", "activating"}:
+                    state, substate, result = _unit_state()
+                    if (state, substate, result) == ("active", "running", "success"):
                         _switch_vt(PROMPT_VT)
                         return "focused"
                 except BrokerFailure:
@@ -556,12 +556,15 @@ class PromptController:
                     raise BrokerFailure
                 deadline = time.monotonic() + START_TIMEOUT_SECONDS
                 while time.monotonic() < deadline:
-                    state, _substate, result = _unit_state()
-                    if state in {"active", "activating"}:
+                    state, substate, result = _unit_state()
+                    if (state, substate, result) == ("active", "running", "success"):
                         break
+                    if state == "activating":
+                        time.sleep(0.05)
+                        continue
                     if state in {"failed", "inactive"} and result not in {"", "success"}:
                         raise BrokerFailure
-                    time.sleep(0.05)
+                    raise BrokerFailure
                 else:
                     raise BrokerFailure
                 _switch_vt(PROMPT_VT)

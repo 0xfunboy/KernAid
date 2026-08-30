@@ -37,6 +37,7 @@ chmod 0755 \
     /usr/lib/tmpfiles.d
 chown root:root \
     /usr/lib/kernaid/offline_inspector.py \
+    /usr/lib/kernaid/qemu_native_prompt_journal_probe.py \
     /usr/lib/kernaid/ready-check \
     /usr/lib/kernaid/rescue_application_relay.py \
     /usr/lib/kernaid/rescue_native_prompt_broker.py \
@@ -50,6 +51,7 @@ chown root:root \
     /usr/lib/kernaid/tauri_ui_ready_check.py
 chmod 0644 \
     /usr/lib/kernaid/offline_inspector.py \
+    /usr/lib/kernaid/qemu_native_prompt_journal_probe.py \
     /usr/lib/kernaid/ready-check \
     /usr/lib/kernaid/rescue_application_relay.py \
     /usr/lib/kernaid/rescue_native_prompt_broker.py \
@@ -209,6 +211,8 @@ python3 -I -B -c \
     'from pathlib import Path; p=Path("/usr/lib/kernaid/repair_target_handoff.py"); compile(p.read_bytes(), str(p), "exec", dont_inherit=True)'
 python3 -I -B -c \
     'from pathlib import Path; p=Path("/usr/lib/kernaid/rescue_native_prompt_broker.py"); compile(p.read_bytes(), str(p), "exec", dont_inherit=True)'
+python3 -I -B -c \
+    'from pathlib import Path; p=Path("/usr/lib/kernaid/qemu_native_prompt_journal_probe.py"); compile(p.read_bytes(), str(p), "exec", dont_inherit=True)'
 grep -Fq 'target.readonly.acquire' "$repair_target_handoff"
 grep -Fq 'target.recovery.readonly.acquire' "$repair_target_handoff"
 if [ "$repair_candidate_enabled" = "1" ]; then
@@ -240,6 +244,7 @@ chown root:root \
     /etc/systemd/system/kernaid-provider-lease-kill-vaultd@.service \
     /etc/systemd/system/kernaid-provider-lease-probe.socket \
     /etc/systemd/system/kernaid-provider-lease-probe@.service \
+    /etc/systemd/system/kernaid-qemu-native-prompt-journal-proof@.service \
     /etc/systemd/system/kernaid-rescue-openai-egress.service \
     /etc/systemd/system/kernaid-rescue-openai-egress.socket \
     /etc/systemd/system/kernaid-rescue-openai-executor.socket \
@@ -283,6 +288,7 @@ chmod 0644 \
     /etc/systemd/system/kernaid-provider-lease-kill-vaultd@.service \
     /etc/systemd/system/kernaid-provider-lease-probe.socket \
     /etc/systemd/system/kernaid-provider-lease-probe@.service \
+    /etc/systemd/system/kernaid-qemu-native-prompt-journal-proof@.service \
     /etc/systemd/system/kernaid-rescue-openai-egress.service \
     /etc/systemd/system/kernaid-rescue-openai-egress.socket \
     /etc/systemd/system/kernaid-rescue-openai-executor.socket \

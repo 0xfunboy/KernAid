@@ -36,8 +36,12 @@ a physical-test candidate, not a supported repair medium.
 ### Rescue qualification manifest v1
 
 On the protected `main` branch, the `rescue` workflow publishes
-`KernAid-Rescue-amd64-qualified` only after the image build/smoke job and both
-isolated BIOS and UEFI two-boot Vault lifecycle jobs succeed. The core bundle
+`KernAid-Rescue-amd64-qualified` only after the image build/smoke job, both
+isolated BIOS and UEFI two-boot Vault lifecycle jobs, and the single-BIOS
+native-VT Vault prompt job succeed. The VT job reuses the same ISO artifact:
+it copies it into a private raw target and pins its SHA-256 and filesystem
+identity before extracting and booting from that immutable copy. There is no
+second ISO build or firmware matrix. The core bundle
 contains the exact ISO, checksum, catalog-v2 entry, retail checksum/layout and
 attestation metadata, pinned-Codex SBOM tranche and the evidence files. The
 compressed 32,000,000,000-byte Windows retail raw image is published as the
@@ -47,6 +51,14 @@ attempt, artifact version, ISO and retail-image sizes and SHA-256 values, the
 raw-image and zero-p3 binding, and the SHA-256 of every
 catalog, SBOM and evidence input. This is virtual qualification only; it does
 not satisfy the physical-machine or Secure Boot gates.
+
+The native-prompt job and strict manifest validation are implemented in the
+workflow source, but remain **pending CI qualification** until a protected
+`main` run produces passing evidence. Sanitized VT evidence is retained for 30
+days. Its attestation records the exact ISO SHA-256; the manifest requires that
+digest to equal the qualified ISO and lists `native-vault-prompt-bios` in
+`requiredJobs`. Source or an intermediate artifact without that evidence is
+not a qualified native-prompt release.
 
 GitHub signs standard ISO build provenance and custom Sigstore attestations for
 both the ISO and retail image whose predicate is that exact manifest. The core
@@ -155,6 +167,22 @@ locally:
 kernaid-rescue-vaultctl status
 kernaid-rescue-vaultctl unlock
 ```
+
+For the experimental gated journey, boot with
+`kernaid.native-prompt=vt-v1` and activate **Unlock Vault** in Desk (Alt+U).
+The broker starts the companion on tty8 and returns to the recorded graphical
+VT after it exits. The companion service is `Type=notify`: `READY=1` is emitted
+only after echo is disabled, termios is rechecked and the prompt is written,
+immediately before input. The broker accepts only `active/running/success`,
+never `activating`; notification failure is fail-closed.
+
+The one-BIOS QEMU gate provisions on boot one, then performs the real UI action,
+tty8 input, Vault unlock and graphical-VT return on boot two. A bounded
+root-only helper scans the full current-boot journal, receives only a secret
+digest and publishes only a fixed atomic marker after coverage and absence
+checks. It exposes no root shell, socket or broader journal permission. This is
+virtual evidence, not physical qualification or a trusted graphical-prompt
+claim.
 
 The passphrase is read only from the controlling TTY. If Desk has already
 initialized while the Vault was locked, unlock the Vault and reload Desk before

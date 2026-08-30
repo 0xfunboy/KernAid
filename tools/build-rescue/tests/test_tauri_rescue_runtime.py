@@ -1431,6 +1431,32 @@ class TauriShippingAbiTests(unittest.TestCase):
         self.assertEqual(switch.call_args_list, [mock.call(8), mock.call(8)])
         monitor.start.assert_called_once_with()
 
+    def test_native_prompt_open_waits_for_notify_ready_before_switching_vt(self) -> None:
+        controller = native_prompt.PromptController()
+        monitor = mock.Mock()
+        with (
+            mock.patch.object(native_prompt, "_prompt_backend_ready"),
+            mock.patch.object(native_prompt, "_active_vt", return_value=7),
+            mock.patch.object(native_prompt, "_write_return_vt"),
+            mock.patch.object(native_prompt, "_tool", return_value=(0, b"")),
+            mock.patch.object(
+                native_prompt,
+                "_unit_state",
+                side_effect=(
+                    ("activating", "start", "success"),
+                    ("active", "running", "success"),
+                ),
+            ) as unit_state,
+            mock.patch.object(native_prompt, "_switch_vt") as switch,
+            mock.patch.object(native_prompt.time, "sleep") as sleep,
+            mock.patch.object(native_prompt.threading, "Thread", return_value=monitor),
+        ):
+            self.assertEqual(controller.open_or_focus(), "opened")
+        self.assertEqual(unit_state.call_count, 2)
+        sleep.assert_called_once_with(0.05)
+        switch.assert_called_once_with(8)
+        monitor.start.assert_called_once_with()
+
     def test_native_prompt_units_keep_secrets_on_the_fixed_uid1000_tty(self) -> None:
         units = REPO_DIR / "rescue/live-build/config/includes.chroot/etc/systemd/system"
         broker = (units / "kernaid-rescue-native-prompt.service").read_text()
@@ -1451,6 +1477,8 @@ class TauriShippingAbiTests(unittest.TestCase):
         self.assertIn("SocketGroup=kernaid-rescue-ui", control)
         self.assertIn("User=kernaid", prompt)
         self.assertIn("SupplementaryGroups=kernaid-vault", prompt)
+        self.assertIn("Type=notify", prompt)
+        self.assertIn("NotifyAccess=main", prompt)
         self.assertIn("TTYPath=/dev/tty8", prompt)
         self.assertIn("StandardInput=tty-force", prompt)
         self.assertIn("RuntimeMaxSec=620s", prompt)
@@ -1469,6 +1497,15 @@ class TauriShippingAbiTests(unittest.TestCase):
         self.assertIn("SO_PEERPIDFD = 77", broker_source)
         self.assertIn("getsockopt(socket.SOL_SOCKET, SO_PEERPIDFD)", broker_source)
         self.assertNotIn("pidfd_open", broker_source)
+
+        wizard_source = (
+            REPO_DIR / "apps/desk/src/rescue-diagnosis-wizard.tsx"
+        ).read_text()
+        main_source = (REPO_DIR / "apps/desk/src/main.tsx").read_text()
+        self.assertIn('accessKey="u"', wizard_source)
+        self.assertIn('aria-keyshortcuts="Alt+U"', wizard_source)
+        self.assertIn("vaultUnlockEligible &&", wizard_source)
+        self.assertIn('openAiStatus.vault === "locked"', main_source)
 
 
 if __name__ == "__main__":

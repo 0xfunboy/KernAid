@@ -31,7 +31,7 @@ it cannot select a host path, disk or customer target.
 | Surface | Purpose | Current boundary |
 | --- | --- | --- |
 | KernAid Desk | Diagnose a running Windows, Linux or macOS installation | Unsigned engineering builds; read-only production collectors |
-| KernAid Rescue | Boot an amd64 PC that cannot start its installed OS | Hybrid BIOS/UEFI image; virtual qualification only until physical USB evidence exists |
+| KernAid Rescue | Boot an amd64 PC that cannot start its installed OS | Hybrid BIOS/UEFI image; gated VT-unlock E2E is implemented but pending CI, and qualification remains virtual until physical USB evidence exists |
 | USB writer v2 | Verify an authorized ISO, write it and provision its encrypted Vault | Linux operator path; accepts only the exact trusted-catalog image |
 | Project site | Explain the project publicly and distribute controlled artifacts privately | Public `/`; authenticated `/private/`; no public ISO route |
 
@@ -73,15 +73,27 @@ logout and reboot.
 2. The Rescue workflow builds one exact ISO and proves BIOS/UEFI boot,
    USB-style two-boot persistence, byte-identical disposable targets and the
    privileged Vault lifecycle on that same artifact.
-3. A final job binds the ISO, retail image, checksums, catalog entry, SBOM and
+3. One BIOS-only job reuses that ISO through a private, identity-checked and
+   SHA-256-pinned raw copy. It provisions on boot one and drives the gated
+   native Vault prompt on boot two, including `Type=notify` readiness, real UI
+   activation, tty8 unlock, graphical-VT return and a root full-current-boot
+   journal proof.
+4. A final job binds the ISO, retail image, checksums, catalog entry, SBOM and
    lifecycle evidence into a canonical manifest, emits ISO build provenance
-   and emits qualification attestations for both the ISO and retail image.
-4. The ISO, retail image, checksums, qualification manifest, attestations and
+   and emits qualification attestations for both the ISO and retail image. The
+   manifest requires the VT job and binds its sanitized 30-day evidence to the
+   qualified ISO's exact SHA-256.
+5. The ISO, retail image, checksums, qualification manifest, attestations and
    workflow identity are downloaded and verified locally.
-5. Promotion is an explicit repository change: a new trusted-catalog revision
+6. Promotion is an explicit repository change: a new trusted-catalog revision
    authorizes one exact name, size, digest, layout and evidence set.
-6. Only then are the private site metadata and pinned local artifact changed
+7. Only then are the private site metadata and pinned local artifact changed
    together and the service restarted.
+
+The VT job, root proof channel and strict manifest binding are implemented in
+the repository but are **pending CI qualification** until a protected run
+publishes passing digest-bound evidence. Implemented source alone does not
+qualify or promote the feature.
 
 The existence of a GitHub Actions artifact alone never promotes it. Physical
 USB, Secure Boot, real-account provider TLS, signed installers and production

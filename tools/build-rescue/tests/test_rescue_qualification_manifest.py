@@ -122,6 +122,21 @@ class RescueQualificationManifestTests(unittest.TestCase):
                 encoding="ascii",
             )
             self.lifecycle[firmware] = path
+        self.native_prompt = self.root / "kernaid-native-vault-prompt.sanitized.log"
+        self.native_prompt.write_text(
+            "KERNAID_QEMU_NATIVE_VAULT_PROMPT_ATTESTATION_V1 "
+            "firmware=bios image=exact-usb boot1=provisioned "
+            "boot2=direct-kernel-same-iso gate=vt-v1 socket=available "
+            "broker=tauri-authenticated request=webview-tauri-enum-nonce "
+            "prompt=tty8-ready-notify qmp-secret-input=true "
+            "captured-secret-exposure=false journald-secret-exposure=false "
+            "journald-scope=root-full-current-boot "
+            "vault=unlocked device_id=KA-0123456789abcdef01234567 "
+            f"iso_sha256={self.iso_digest} return=graphical-ui "
+            "width=1024 height=768 iso-prefix-immutable=true "
+            "acpi-shutdowns=2 ready=true\n",
+            encoding="ascii",
+        )
 
     def command(self, operation: str, destination: Path) -> list[str]:
         result = [
@@ -165,6 +180,8 @@ class RescueQualificationManifestTests(unittest.TestCase):
             str(self.lifecycle["bios"]),
             "--lifecycle-uefi-evidence",
             str(self.lifecycle["uefi"]),
+            "--native-prompt-evidence",
+            str(self.native_prompt),
         ]
         result.extend(("--output" if operation == "create" else "--manifest", str(destination)))
         return result
@@ -189,6 +206,19 @@ class RescueQualificationManifestTests(unittest.TestCase):
             (json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n").encode(
                 "ascii"
             ),
+        )
+        self.assertEqual(
+            document["evidence"]["nativeVaultPrompt"]["subjectIsoSha256"],
+            self.iso_digest,
+        )
+        self.assertEqual(
+            document["requiredJobs"],
+            [
+                "build-and-smoke-test",
+                "native-vault-prompt-bios",
+                "vault-lifecycle-bios",
+                "vault-lifecycle-uefi",
+            ],
         )
         self.assertEqual(document["source"]["commit"], COMMIT)
         self.assertEqual(document["artifacts"]["iso"]["sha256"], self.iso_digest)
@@ -234,6 +264,17 @@ class RescueQualificationManifestTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 3)
         self.assertIn("not bound to this run attempt", result.stderr)
+
+    def test_create_refuses_native_prompt_evidence_for_another_iso(self) -> None:
+        payload = self.native_prompt.read_text(encoding="ascii").replace(
+            self.iso_digest, "f" * 64
+        )
+        self.native_prompt.write_text(payload, encoding="ascii")
+        result = self.run_command(
+            "create", self.root / "KernAid-Rescue-amd64.qualified.json"
+        )
+        self.assertEqual(result.returncode, 3)
+        self.assertIn("does not bind the exact Rescue ISO", result.stderr)
 
     def test_create_refuses_claimed_zero_p3_with_wrong_digest(self) -> None:
         metadata = json.loads(self.retail_metadata.read_text(encoding="ascii"))

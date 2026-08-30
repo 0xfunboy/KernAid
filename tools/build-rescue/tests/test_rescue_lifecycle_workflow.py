@@ -271,6 +271,7 @@ class RescueLifecycleWorkflowTests(unittest.TestCase):
         self.assertIn("    if: github.ref == 'refs/heads/main'\n", qualified)
         for dependency in (
             "build-and-smoke-test",
+            "native-vault-prompt-bios",
             "vault-lifecycle-bios",
             "vault-lifecycle-uefi",
         ):
@@ -286,6 +287,7 @@ class RescueLifecycleWorkflowTests(unittest.TestCase):
             "KernAid-Linux-snapshot-e2e-evidence",
             "KernAid-Rescue-vault-lifecycle-bios-evidence",
             "KernAid-Rescue-vault-lifecycle-uefi-evidence",
+            "KernAid-Rescue-native-vault-prompt-bios-evidence",
         }
         self.assertEqual(
             set(re.findall(r"^          name: (KernAid-[^\n]+)$", qualified, re.MULTILINE))
@@ -300,6 +302,8 @@ class RescueLifecycleWorkflowTests(unittest.TestCase):
         self.assertIn("qualification-manifest.py", assembly)
         self.assertIn('create "${manifest_args[@]}"', assembly)
         self.assertIn('verify "${manifest_args[@]}"', assembly)
+        self.assertIn("--native-prompt-evidence", assembly)
+        self.assertIn("kernaid-native-vault-prompt.sanitized.log", assembly)
         for identity in (
             "$GITHUB_REPOSITORY",
             "$GITHUB_SHA",

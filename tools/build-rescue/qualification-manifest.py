@@ -41,8 +41,10 @@ LIFECYCLE_EVIDENCE_NAMES: Final = {
     "bios": "kernaid-vault-lifecycle-bios.sanitized.log",
     "uefi": "kernaid-vault-lifecycle-uefi.sanitized.log",
 }
+NATIVE_PROMPT_EVIDENCE_NAME: Final = "kernaid-native-vault-prompt.sanitized.log"
 REQUIRED_JOBS: Final = (
     "build-and-smoke-test",
+    "native-vault-prompt-bios",
     "vault-lifecycle-bios",
     "vault-lifecycle-uefi",
 )
@@ -303,6 +305,27 @@ def _validate_lifecycle_evidence(content: bytes, firmware: str) -> None:
         raise QualificationError(f"{firmware} lifecycle evidence framing is not passing")
 
 
+def _validate_native_prompt_evidence(content: bytes, iso_sha256: str) -> None:
+    pattern = re.compile(
+        rb"KERNAID_QEMU_NATIVE_VAULT_PROMPT_ATTESTATION_V1 "
+        rb"firmware=bios image=exact-usb boot1=provisioned "
+        rb"boot2=direct-kernel-same-iso gate=vt-v1 socket=available "
+        rb"broker=tauri-authenticated request=webview-tauri-enum-nonce "
+        rb"prompt=tty8-ready-notify qmp-secret-input=true "
+        rb"captured-secret-exposure=false journald-secret-exposure=false "
+        rb"journald-scope=root-full-current-boot "
+        rb"vault=unlocked device_id=KA-[0-9a-f]{24} "
+        rb"iso_sha256=([0-9a-f]{64}) return=graphical-ui "
+        rb"width=[1-9][0-9]{2,3} height=[1-9][0-9]{2,3} "
+        rb"iso-prefix-immutable=true acpi-shutdowns=2 ready=true\n\Z"
+    )
+    match = pattern.fullmatch(content)
+    if match is None or match.group(1).decode("ascii") != iso_sha256:
+        raise QualificationError(
+            "native Vault prompt evidence does not bind the exact Rescue ISO"
+        )
+
+
 def build_manifest(arguments: argparse.Namespace) -> dict[str, Any]:
     _validate_source(
         arguments.repository,
@@ -411,6 +434,24 @@ def build_manifest(arguments: argparse.Namespace) -> dict[str, Any]:
             "sha256": digest,
         }
 
+    native_path = arguments.native_prompt_evidence
+    if native_path.name != NATIVE_PROMPT_EVIDENCE_NAME:
+        raise QualificationError("native Vault prompt evidence filename is not exact")
+    native_size, native_digest, native_content = _regular_file(
+        native_path,
+        "native Vault prompt evidence",
+        MAX_SMALL_EVIDENCE_BYTES,
+        capture=True,
+    )
+    assert native_content is not None
+    _validate_native_prompt_evidence(native_content, iso["sha256"])
+    native_metadata = {
+        "bytes": native_size,
+        "name": NATIVE_PROMPT_EVIDENCE_NAME,
+        "sha256": native_digest,
+        "subjectIsoSha256": iso["sha256"],
+    }
+
     return {
         "artifactVersion": arguments.artifact_version,
         "artifacts": {
@@ -426,6 +467,7 @@ def build_manifest(arguments: argparse.Namespace) -> dict[str, Any]:
         },
         "evidence": {
             "linuxSnapshotE2e": snapshot_metadata,
+            "nativeVaultPrompt": native_metadata,
             "qemuUsbBoot": usb_evidence,
             "vaultLifecycle": lifecycle_evidence,
         },
@@ -512,6 +554,7 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--usb-uefi-evidence", required=True, type=Path)
     parser.add_argument("--lifecycle-bios-evidence", required=True, type=Path)
     parser.add_argument("--lifecycle-uefi-evidence", required=True, type=Path)
+    parser.add_argument("--native-prompt-evidence", required=True, type=Path)
 
 
 def parser() -> argparse.ArgumentParser:

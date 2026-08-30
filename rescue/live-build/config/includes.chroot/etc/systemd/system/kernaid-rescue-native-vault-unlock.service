@@ -1,5 +1,6 @@
 [Unit]
 Description=KernAid Rescue trusted VT Vault unlock
+OnSuccess=kernaid-qemu-native-prompt-journal-proof@boot2.service
 Requires=kernaid-rescue-vaultd.service live-config.service
 After=kernaid-rescue-vaultd.service live-config.service
 Conflicts=getty@tty8.service
@@ -7,7 +8,8 @@ ConditionKernelCommandLine=boot=live
 ConditionKernelCommandLine=kernaid.native-prompt=vt-v1
 
 [Service]
-Type=exec
+Type=notify
+NotifyAccess=main
 ExecStart=/usr/lib/kernaid/rescue-native-vault-unlock
 User=kernaid
 Group=kernaid

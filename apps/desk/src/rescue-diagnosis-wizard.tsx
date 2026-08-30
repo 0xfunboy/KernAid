@@ -40,6 +40,7 @@ const STEP_LABELS = {
 
 export interface RescueDiagnosisWizardProps {
   readonly vaultStatusReady: boolean;
+  readonly vaultUnlockEligible: boolean;
   readonly vaultLabel: string;
   readonly vaultGuidance: string;
   readonly persistentAuditReady: boolean;
@@ -86,6 +87,7 @@ export interface RescueDiagnosisWizardProps {
 
 export function RescueDiagnosisWizard({
   vaultStatusReady,
+  vaultUnlockEligible,
   vaultLabel,
   vaultGuidance,
   persistentAuditReady,
@@ -265,9 +267,12 @@ export function RescueDiagnosisWizard({
               </small>
             </div>
             {!persistentAuditReady && <p>{vaultGuidance}</p>}
-            {!persistentAuditReady &&
+            {vaultUnlockEligible &&
+              !persistentAuditReady &&
               nativePromptStatus?.availability === "available" && (
                 <button
+                  accessKey="u"
+                  aria-keyshortcuts="Alt+U"
                   className="rescue-wizard-secondary"
                   disabled={nativePromptBusy}
                   onClick={() => void openNativeVaultPrompt()}

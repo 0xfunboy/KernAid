@@ -3,6 +3,8 @@
 Status: the first VT-backed `vault-unlock` slice is implemented behind the
 off-by-default boot gate `kernaid.native-prompt=vt-v1`. It remains an interim
 TTY flow, not a trusted graphical prompt and not a default product claim.
+Its single-BIOS same-ISO QEMU qualification path is implemented in source but
+is pending a passing protected CI run, so it is not yet qualified evidence.
 
 ## Current boundary
 
@@ -39,6 +41,10 @@ starts a fixed UID-1000 service with
 `/dev/tty8` as its controlling terminal. That service executes only
 `kernaid-rescue-vaultctl unlock`; the broker records the current graphical VT,
 focuses tty8, and returns to the recorded VT when the companion exits. The
+service uses `Type=notify`: the companion sends `READY=1` only after echo is
+disabled, termios is verified and the prompt is written, immediately before
+its read. Notification failure aborts fail-closed with echo restoration. The
+broker treats only `active/running/success` as ready, never `activating`. The
 passphrase never enters the WebView, IPC JSON, broker, argv, environment or
 journal. A 620-second runtime ceiling plus verified, bounded VT-return retries
 prevent a stale prompt from trapping the user on tty8. The UI account receives
@@ -52,6 +58,30 @@ the enum/nonce request. Desk polls that same closed status while tty8 owns the
 prompt and reloads the authoritative Vault state after the broker returns to
 the graphical VT. This remains a branded TTY journey, not a terminal-free
 product claim.
+
+### Implemented virtual qualification boundary
+
+The minimal E2E gate has one BIOS path and reuses the build's exact ISO. The
+harness first creates a private raw target, copies and SHA-256-pins the ISO,
+then checks device, inode, size, modification time and digest invariants around
+every extraction and use. Boot one provisions the Vault. Boot two uses the
+kernel, initrd, live filesystem and configuration extracted from that same copy
+with the exact native-prompt flag; a real Alt+U UI action opens the enum-and-
+nonce request, QMP types into tty8, and the gate verifies unlock and return to
+the graphical UI.
+
+Secret-log evidence does not rely on an unprivileged empty journal. A QEMU-only
+root noninteractive oneshot receives only a passphrase digest through fw_cfg,
+asserts root identity, boundedly scans the full current-boot journal, requires
+nonempty entries and expected-unit coverage, and atomically publishes only a
+fixed root-owned marker. It adds no root shell, group or journal permission.
+Sanitized evidence is retained for 30 days; its attestation includes the exact
+ISO SHA-256, and the strict qualification manifest binds that digest to the
+qualified ISO and requires the native-prompt BIOS job.
+
+These mechanisms are implemented but remain **pending CI qualification** until
+the protected job passes. They do not claim UEFI-specific native-prompt
+coverage, physical hardware support or a trusted graphical input surface.
 
 The non-secret status surfaces already exist and should remain authoritative:
 

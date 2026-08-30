@@ -1,5 +1,6 @@
 [Unit]
 Description=KernAid Rescue first-boot vault provisioning gate
+OnSuccess=kernaid-qemu-native-prompt-journal-proof@boot1.service
 Requires=live-config.service
 After=live-config.service systemd-sysusers.service systemd-sysctl.service systemd-tmpfiles-setup.service
 Before=kernaid-rescue-vaultd.service display-manager.service getty@tty1.service graphical.target
