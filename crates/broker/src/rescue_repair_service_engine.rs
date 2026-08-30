@@ -49,6 +49,14 @@ const TERMINATE_AFTER_PENDING_TOKEN: &[u8] = b"terminate-after-pending-v1";
 const FAIL_AFTER_INSTALLED_TOKEN: &[u8] = b"fail-after-installed-v1";
 const MAX_QUALIFICATION_CREDENTIAL_BYTES: u64 = 64;
 
+fn qualification_credential_mode_is_read_only(mode: u32) -> bool {
+    // systemd keeps service credentials owner-read-only. For a non-root
+    // service it may add a read ACL for the service UID; the ACL mask is
+    // represented by the group-read bit even though no group can modify the
+    // credential. Accept only those two read-only representations.
+    matches!(mode & 0o777, 0o400 | 0o440)
+}
+
 /// Closed seam for the post-commit rollback public layer. Implementations must
 /// retain all Vault/root authority in the associated types; commands and
 /// descriptors are path-free audit material only. The production Vault/root
@@ -167,7 +175,7 @@ impl ProductionRepairEngine {
         if !before.file_type().is_file()
             || before.len() == 0
             || before.len() > MAX_QUALIFICATION_CREDENTIAL_BYTES
-            || before.mode() & 0o777 != 0o400
+            || !qualification_credential_mode_is_read_only(before.mode())
             || before.nlink() != 1
         {
             return Err(RepairQualificationConfigurationError::InvalidCredential);
@@ -861,6 +869,18 @@ mod tests {
                 parse_qualification_fault(rejected),
                 Err(RepairQualificationConfigurationError::InvalidCredential)
             );
+        }
+    }
+
+    #[test]
+    fn qualification_credential_mode_accepts_only_systemd_read_acl_forms() {
+        for accepted in [0o100400, 0o100440] {
+            assert!(qualification_credential_mode_is_read_only(accepted));
+        }
+        for rejected in [
+            0o100000, 0o100040, 0o100404, 0o100444, 0o100600, 0o100640, 0o100660,
+        ] {
+            assert!(!qualification_credential_mode_is_read_only(rejected));
         }
     }
 
