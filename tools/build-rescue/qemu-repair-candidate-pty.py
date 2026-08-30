@@ -437,7 +437,7 @@ APPLY_CONFIRMATION="DISABILITA VOCE FSTAB"
 ROLLBACK_CONFIRMATION="RIPRISTINA FSTAB ORIGINALE"
 counter=0
 checkpoint="service-ready"
-CHECKPOINTS=("service-ready","service-ready-transport","service-ready-http","service-ready-response-invalid","service-ready-non-idle","inventory-ready","target-selection","target-identity","apply-prepare","apply-prepare-terminal","apply-contract","apply-approve","apply-terminal","apply-terminal-contract","rollback-status","rollback-prepare","rollback-prepare-terminal","rollback-contract","rollback-approve","rollback-terminal","rollback-terminal-contract")
+CHECKPOINTS=("service-ready","service-ready-internal","service-ready-transport","service-ready-http","service-ready-response-invalid","service-ready-non-idle","inventory-ready","target-selection","target-identity","apply-prepare","apply-prepare-terminal","apply-contract","apply-approve","apply-terminal","apply-terminal-contract","rollback-status","rollback-prepare","rollback-prepare-terminal","rollback-contract","rollback-approve","rollback-terminal","rollback-terminal-contract")
 STATES=("idle","preparing","prepared","executing","succeeded","restored","cancelled","manual-reconciliation-required","failed")
 def request_id():
     global counter
@@ -465,7 +465,7 @@ def decode(payload):
     if len(payload)>65536:
         raise RuntimeError()
     return json.loads(payload)
-def http(path,body=None,timeout=25):
+def call(path,body=None,timeout=25):
     status,payload=exchange(path,body,timeout)
     return status,decode(payload)
 def valid_response(value,api,operation,request):
@@ -474,11 +474,16 @@ def repair(api,operation,extra=None):
     request={"apiVersion":api,"requestId":request_id(),"operation":operation}
     if extra is not None:
         request.update(extra)
-    status,value=http("/api/rescue/repair",request)
+    status,value=call("/api/rescue/repair",request)
     if status!=200 or not valid_response(value,api,operation,request):
         raise RuntimeError()
     return value
 def service_ready():
+    try:
+        return service_ready_inner()
+    except BaseException:
+        return "service-ready-internal"
+def service_ready_inner():
     request={"apiVersion":APPLY_API,"requestId":request_id(),"operation":"repair.status"}
     try:
         status,payload=exchange("/api/rescue/repair",request)
@@ -512,18 +517,19 @@ def fail(value):
 try:
     deadline=time.monotonic()+840
     while True:
+        checkpoint="service-ready-internal"
         service_ready_checkpoint=service_ready()
         if service_ready_checkpoint is None:
             break
+        checkpoint=service_ready_checkpoint
         if time.monotonic()>=deadline:
-            checkpoint=service_ready_checkpoint
             raise RuntimeError()
         time.sleep(.5)
     checkpoint="inventory-ready"
     while True:
         try:
-            inventory_code,inventory=http("/api/inventory")
-            scan_code,scan=http("/api/rescue/installed-targets")
+            inventory_code,inventory=call("/api/inventory")
+            scan_code,scan=call("/api/rescue/installed-targets")
             if inventory_code==200 and scan_code==200:
                 break
         except BaseException:

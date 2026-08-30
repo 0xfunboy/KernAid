@@ -213,12 +213,15 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
         )
         self.assertLessEqual(len(generated), 16 * 1024)
         compile(generated, "<rollback-source>", "exec")
+        self.assertNotIn(b"def http(", generated)
+        self.assertIn(b"def call(path,body=None,timeout=25):", generated)
         self.assertIn(b"deadline=time.monotonic()+840", generated)
         self.assertIn(
             b"KERNAID_QEMU_PROVIDER_PROOF_FAILURE_V1 stage=repair-rollback checkpoint=",
             generated,
         )
         service_ready_checkpoints = {
+            "service-ready-internal",
             "service-ready-transport",
             "service-ready-http",
             "service-ready-response-invalid",
@@ -232,6 +235,10 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
         for checkpoint in controller.LIFECYCLE.PROVIDER_PROOF_ROLLBACK_CHECKPOINTS:
             self.assertIn(checkpoint.encode("ascii"), generated)
         self.assertIn(
+            b'except BaseException:\n        return "service-ready-internal"',
+            generated,
+        )
+        self.assertIn(
             b'except (OSError,http.client.HTTPException):\n        return "service-ready-transport"',
             generated,
         )
@@ -244,7 +251,14 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
             b'if value["state"]=="idle":\n        return None\n    return "service-ready-non-idle"',
             generated,
         )
-        self.assertIn(b"checkpoint=service_ready_checkpoint", generated)
+        self.assertIn(
+            b'checkpoint="service-ready-internal"\n        service_ready_checkpoint=service_ready()',
+            generated,
+        )
+        self.assertIn(
+            b"checkpoint=service_ready_checkpoint\n        if time.monotonic()>=deadline:",
+            generated,
+        )
         self.assertIn("timeout=900.0", CONTROLLER.read_text(encoding="utf-8"))
 
         for required in (
