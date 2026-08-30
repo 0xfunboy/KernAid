@@ -1499,6 +1499,7 @@ impl<'vault> RepairVaultStore<'vault> {
     pub fn begin_rollback_transaction(
         &mut self,
         source: &RepairTransactionStatusPayload,
+        rollback_id: RepairRollbackId,
         binding: RepairRollbackBindingV1,
     ) -> Result<RepairRollbackTransactionStatusPayload, RepairVaultStoreError> {
         self.require_mutable()?;
@@ -1532,7 +1533,10 @@ impl<'vault> RepairVaultStore<'vault> {
                 transaction,
                 existing,
             )?;
-            if status.source() == source && status.binding() == &binding {
+            if status.rollback_id() == &rollback_id
+                && status.source() == source
+                && status.binding() == &binding
+            {
                 return Ok(status);
             }
             return Err(RepairVaultStoreError::ReservationConflict);
@@ -1540,8 +1544,15 @@ impl<'vault> RepairVaultStore<'vault> {
         if self.state.unresolved_transaction.is_some() || self.state.unresolved_rollback.is_some() {
             return Err(RepairVaultStoreError::ReconciliationRequired);
         }
+        if self.state.transactions.values().any(|transaction| {
+            transaction
+                .rollback
+                .as_ref()
+                .is_some_and(|rollback| rollback.rollback_id == rollback_id)
+        }) {
+            return Err(RepairVaultStoreError::ReservationConflict);
+        }
 
-        let rollback_id = self.generate_unused_rollback_id()?;
         let pending = RepairRollbackTransactionStatusPayload::pending(
             rollback_id.clone(),
             source.clone(),
@@ -2353,24 +2364,6 @@ impl<'vault> RepairVaultStore<'vault> {
                 )?
                 .is_none()
             {
-                return Ok(candidate);
-            }
-        }
-        Err(RepairVaultStoreError::StorageUnavailable)
-    }
-
-    fn generate_unused_rollback_id(&self) -> Result<RepairRollbackId, RepairVaultStoreError> {
-        for _ in 0..16 {
-            let mut random = [0_u8; 16];
-            OsRng.fill_bytes(&mut random);
-            let candidate = RepairRollbackId::parse(&format!("RB-{}", encode_hex(&random)))
-                .map_err(|_| RepairVaultStoreError::CorruptStore)?;
-            if self.state.transactions.values().all(|transaction| {
-                transaction
-                    .rollback
-                    .as_ref()
-                    .is_none_or(|rollback| rollback.rollback_id != candidate)
-            }) {
                 return Ok(candidate);
             }
         }
@@ -4035,6 +4028,12 @@ fn apply_repair_event(
             if state.pending.is_some()
                 || state.unresolved_transaction.is_some()
                 || state.unresolved_rollback.is_some()
+                || state.transactions.values().any(|transaction| {
+                    transaction
+                        .rollback
+                        .as_ref()
+                        .is_some_and(|rollback| rollback.rollback_id == rollback_id)
+                })
                 || !valid_sha256(&source_transaction_binding_sha256)
                 || !valid_sha256(&rollback_transaction_binding_sha256)
             {
@@ -6530,6 +6529,11 @@ mod tests {
         .expect("rollback binding")
     }
 
+    fn rollback_id(hex_digit: char) -> RepairRollbackId {
+        RepairRollbackId::parse(&format!("RB-{}", hex_digit.to_string().repeat(32)))
+            .expect("valid fixed rollback ID")
+    }
+
     fn rolled_back_resolution(source: &RepairTransactionStatusPayload) -> RepairRollbackResolution {
         let intent = source
             .backup()
@@ -6933,16 +6937,34 @@ mod tests {
                 .resolve_transaction(&source_pending, committed_resolution(&source_pending))
                 .expect("commit source transaction");
             let before_begin = store.event_count;
+            let chosen_rollback_id = rollback_id('1');
             let pending = store
-                .begin_rollback_transaction(&source, rollback_binding(&source))
+                .begin_rollback_transaction(
+                    &source,
+                    chosen_rollback_id.clone(),
+                    rollback_binding(&source),
+                )
                 .expect("begin rollback child");
             assert_eq!(pending.phase(), RepairTransactionPhase::Pending);
             assert_eq!(store.event_count, before_begin + 1);
             assert_eq!(
                 store
-                    .begin_rollback_transaction(&source, rollback_binding(&source))
+                    .begin_rollback_transaction(
+                        &source,
+                        chosen_rollback_id,
+                        rollback_binding(&source),
+                    )
                     .expect("reconcile lost begin response"),
                 pending
+            );
+            assert_eq!(store.event_count, before_begin + 1);
+            assert_eq!(
+                store.begin_rollback_transaction(
+                    &source,
+                    rollback_id('3'),
+                    rollback_binding(&source),
+                ),
+                Err(RepairVaultStoreError::ReservationConflict)
             );
             assert_eq!(store.event_count, before_begin + 1);
             assert_eq!(
@@ -7031,11 +7053,15 @@ mod tests {
             .expect("commit source transaction");
         let rollback_binding = rollback_binding(&source);
         assert_eq!(
-            store.begin_rollback_transaction(&source_pending, rollback_binding.clone()),
+            store.begin_rollback_transaction(
+                &source_pending,
+                rollback_id('2'),
+                rollback_binding.clone(),
+            ),
             Err(RepairVaultStoreError::InvalidBinding)
         );
         let pending = store
-            .begin_rollback_transaction(&source, rollback_binding)
+            .begin_rollback_transaction(&source, rollback_id('2'), rollback_binding)
             .expect("begin rollback child");
         let wrong_binding = RepairRollbackStatusSelector::exact(
             pending.rollback_id().clone(),

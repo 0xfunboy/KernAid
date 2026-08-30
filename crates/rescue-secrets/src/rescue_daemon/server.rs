@@ -18,8 +18,11 @@ use super::{group_has_exact_repair_broker, passwd_repair_broker_uid};
 use kernaid_protocol::rescue_repair_vault::{
     MAX_REPAIR_BACKUP_BYTES, RepairBackupBinding, RepairBackupDraft, RepairBackupReleasePayload,
     RepairBackupState, RepairBackupStatusPayload, RepairFileMetadataV1, RepairReservationId,
-    RepairTransactionPhase, RepairTransactionResolution, RepairTransactionStatusPayload,
-    RepairTransactionStatusResultPayload, RepairTransactionStatusSelector,
+    RepairRollbackBindingV1, RepairRollbackId, RepairRollbackResolution,
+    RepairRollbackStatusResultPayload, RepairRollbackStatusSelector,
+    RepairRollbackTransactionStatusPayload, RepairTransactionPhase, RepairTransactionResolution,
+    RepairTransactionStatusPayload, RepairTransactionStatusResultPayload,
+    RepairTransactionStatusSelector,
 };
 use kernaid_protocol::rescue_vault::{
     AgentRole, DescriptorDeclaration, DescriptorType, ErrorToken, MAX_INITIAL_STATE_VERSION,
@@ -392,6 +395,45 @@ trait WorkerBoundary: Send + Sync {
         let _ = (expected, resolution, deadline);
         Err(RescueVaultDaemonError::ProtocolFailure)
     }
+    #[cfg(feature = "experimental-repair-store")]
+    fn repair_rollback_begin(
+        &self,
+        source: &RepairTransactionStatusPayload,
+        rollback_id: &RepairRollbackId,
+        binding: &RepairRollbackBindingV1,
+        deadline: Instant,
+    ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
+        let _ = (source, rollback_id, binding, deadline);
+        Err(RescueVaultDaemonError::ProtocolFailure)
+    }
+    #[cfg(feature = "experimental-repair-store")]
+    fn repair_rollback_status(
+        &self,
+        selector: &RepairRollbackStatusSelector,
+        deadline: Instant,
+    ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
+        let _ = (selector, deadline);
+        Err(RescueVaultDaemonError::ProtocolFailure)
+    }
+    #[cfg(feature = "experimental-repair-store")]
+    fn repair_rollback_write_lease_consume(
+        &self,
+        selector: &RepairRollbackStatusSelector,
+        deadline: Instant,
+    ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
+        let _ = (selector, deadline);
+        Err(RescueVaultDaemonError::ProtocolFailure)
+    }
+    #[cfg(feature = "experimental-repair-store")]
+    fn repair_rollback_resolve(
+        &self,
+        expected: &RepairRollbackTransactionStatusPayload,
+        resolution: &RepairRollbackResolution,
+        deadline: Instant,
+    ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
+        let _ = (expected, resolution, deadline);
+        Err(RescueVaultDaemonError::ProtocolFailure)
+    }
     fn verify_healthy(&self) -> Result<(), RescueVaultDaemonError>;
     fn exited(&self) -> Result<bool, RescueVaultDaemonError>;
     fn fault_and_terminate(&self, deadline: Instant) -> Result<(), RescueVaultDaemonError>;
@@ -550,6 +592,45 @@ impl WorkerBoundary for WorkerHandle {
         deadline: Instant,
     ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
         WorkerHandle::repair_transaction_resolve(self, expected, resolution, deadline)
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    fn repair_rollback_begin(
+        &self,
+        source: &RepairTransactionStatusPayload,
+        rollback_id: &RepairRollbackId,
+        binding: &RepairRollbackBindingV1,
+        deadline: Instant,
+    ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
+        WorkerHandle::repair_rollback_begin(self, source, rollback_id, binding, deadline)
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    fn repair_rollback_status(
+        &self,
+        selector: &RepairRollbackStatusSelector,
+        deadline: Instant,
+    ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
+        WorkerHandle::repair_rollback_status(self, selector, deadline)
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    fn repair_rollback_write_lease_consume(
+        &self,
+        selector: &RepairRollbackStatusSelector,
+        deadline: Instant,
+    ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
+        WorkerHandle::repair_rollback_write_lease_consume(self, selector, deadline)
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    fn repair_rollback_resolve(
+        &self,
+        expected: &RepairRollbackTransactionStatusPayload,
+        resolution: &RepairRollbackResolution,
+        deadline: Instant,
+    ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
+        WorkerHandle::repair_rollback_resolve(self, expected, resolution, deadline)
     }
 
     fn verify_healthy(&self) -> Result<(), RescueVaultDaemonError> {
@@ -2113,6 +2194,9 @@ fn handle_connection_at(
                 | Operation::RepairBackupRetire
                 | Operation::RepairTransactionResolve
                 | Operation::RepairTransactionWriteLeaseConsume
+                | Operation::RepairRollbackBegin
+                | Operation::RepairRollbackResolve
+                | Operation::RepairRollbackWriteLeaseConsume
         );
     let started = Instant::now();
     let (version, result) = supervisor.handle_connected_request(
@@ -2713,6 +2797,22 @@ impl Supervisor {
             #[cfg(feature = "experimental-repair-store")]
             Operation::RepairTransactionWriteLeaseConsume => {
                 self.handle_repair_write_lease_consume(request, started, &connection)
+            }
+            #[cfg(feature = "experimental-repair-store")]
+            Operation::RepairRollbackBegin => {
+                self.handle_repair_rollback_begin(request, started, &connection)
+            }
+            #[cfg(feature = "experimental-repair-store")]
+            Operation::RepairRollbackStatus => {
+                self.handle_repair_rollback_status(request, started, &connection)
+            }
+            #[cfg(feature = "experimental-repair-store")]
+            Operation::RepairRollbackResolve => {
+                self.handle_repair_rollback_resolve(request, started, &connection)
+            }
+            #[cfg(feature = "experimental-repair-store")]
+            Operation::RepairRollbackWriteLeaseConsume => {
+                self.handle_repair_rollback_write_lease_consume(request, started, &connection)
             }
             #[cfg(not(feature = "experimental-codex-home-lease"))]
             Operation::ProviderCodexHomeLease => {
@@ -3801,6 +3901,276 @@ impl Supervisor {
                     Some(status) => self.finish_application_mutation(
                         request,
                         Ok(SuccessPayload::RepairTransactionResolved(Box::new(status))),
+                        deadline,
+                    ),
+                    None => self.repair_worker_fault(request, deadline),
+                }
+            }
+            Ok(response) => self.finish_repair_error(request, response.code, true, deadline),
+            Err(_) => self.repair_worker_fault(request, deadline),
+        }
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    fn handle_repair_rollback_begin(
+        self: &Arc<Self>,
+        request: ValidatedRequest,
+        started: Instant,
+        connection: &ClientConnection<'_>,
+    ) -> (u64, HandlerResult) {
+        let deadline = started
+            .checked_add(WORKER_OPERATION_TIMEOUT)
+            .unwrap_or(started);
+        let (source, rollback_id, binding) = match request.payload() {
+            RequestPayload::RepairRollbackBegin {
+                source,
+                rollback_id,
+                binding,
+            } => ((**source).clone(), rollback_id.clone(), binding.clone()),
+            _ => {
+                let version = self.snapshot().version;
+                return (version, HandlerResult::Error(request, ErrorToken::IoFailed));
+            }
+        };
+        if !repair_transaction_status_is_canonical(&source)
+            || binding.validate_against(&source).is_err()
+        {
+            let version = self.snapshot().version;
+            return (version, HandlerResult::Error(request, ErrorToken::IoFailed));
+        }
+        if let Err((version, error)) = self.prepare_application_operation(
+            request.expected_state_version(),
+            true,
+            connection,
+            deadline,
+        ) {
+            return (version, HandlerResult::Error(request, error));
+        }
+        let Some(worker) = self.worker.as_ref() else {
+            self.mark_fault_by(deadline);
+            return (
+                self.snapshot().version,
+                HandlerResult::Error(request, ErrorToken::RebootRequired),
+            );
+        };
+        match worker.repair_rollback_begin(&source, &rollback_id, &binding, deadline) {
+            Ok(response)
+                if response.code == internal_wire::WorkerResultCode::RepairRollbackBegun =>
+            {
+                match response
+                    .repair_rollback_status
+                    .map(|value| *value)
+                    .filter(|status| {
+                        status.validate().is_ok()
+                            && status.rollback_id() == &rollback_id
+                            && status.source() == &source
+                            && status.binding() == &binding
+                    }) {
+                    Some(status) => self.finish_application_mutation(
+                        request,
+                        Ok(SuccessPayload::RepairRollbackBegun(Box::new(status))),
+                        deadline,
+                    ),
+                    None => self.repair_worker_fault(request, deadline),
+                }
+            }
+            Ok(response) => self.finish_repair_error(request, response.code, true, deadline),
+            Err(_) => self.repair_worker_fault(request, deadline),
+        }
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    fn handle_repair_rollback_status(
+        self: &Arc<Self>,
+        request: ValidatedRequest,
+        started: Instant,
+        connection: &ClientConnection<'_>,
+    ) -> (u64, HandlerResult) {
+        let deadline = started
+            .checked_add(WORKER_OPERATION_TIMEOUT)
+            .unwrap_or(started);
+        let selector = match request.payload() {
+            RequestPayload::RepairRollbackStatus { selector } => selector.clone(),
+            _ => {
+                let version = self.snapshot().version;
+                return (version, HandlerResult::Error(request, ErrorToken::IoFailed));
+            }
+        };
+        if let Err((version, error)) = self.prepare_application_operation(
+            request.expected_state_version(),
+            false,
+            connection,
+            deadline,
+        ) {
+            return (version, HandlerResult::Error(request, error));
+        }
+        let Some(worker) = self.worker.as_ref() else {
+            self.mark_fault_by(deadline);
+            return (
+                self.snapshot().version,
+                HandlerResult::Error(request, ErrorToken::RebootRequired),
+            );
+        };
+        match worker.repair_rollback_status(&selector, deadline) {
+            Ok(response)
+                if response.code == internal_wire::WorkerResultCode::RepairRollbackStatusReady =>
+            {
+                let status = response.repair_rollback_status.map(|value| *value);
+                if !selector.matches_result(&status.clone().map_or_else(
+                    RepairRollbackStatusResultPayload::absent,
+                    RepairRollbackStatusResultPayload::found,
+                )) {
+                    return self.repair_worker_fault(request, deadline);
+                }
+                let result = status.map_or_else(
+                    RepairRollbackStatusResultPayload::absent,
+                    RepairRollbackStatusResultPayload::found,
+                );
+                self.finish_application_read(
+                    request,
+                    Ok(SuccessPayload::RepairRollbackStatus(Box::new(result))),
+                    deadline,
+                )
+            }
+            Ok(response)
+                if response.code == internal_wire::WorkerResultCode::RepairBackupNotFound
+                    && matches!(selector, RepairRollbackStatusSelector::Exact { .. }) =>
+            {
+                self.finish_application_read(request, Err(ErrorToken::Absent), deadline)
+            }
+            Ok(response) => self.finish_repair_error(request, response.code, false, deadline),
+            Err(_) => self.repair_worker_fault(request, deadline),
+        }
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    fn handle_repair_rollback_write_lease_consume(
+        self: &Arc<Self>,
+        request: ValidatedRequest,
+        started: Instant,
+        connection: &ClientConnection<'_>,
+    ) -> (u64, HandlerResult) {
+        let deadline = started
+            .checked_add(WORKER_OPERATION_TIMEOUT)
+            .unwrap_or(started);
+        let selector = match request.payload() {
+            RequestPayload::RepairRollbackWriteLeaseConsume { selector }
+                if matches!(selector, RepairRollbackStatusSelector::Exact { .. }) =>
+            {
+                selector.clone()
+            }
+            _ => {
+                let version = self.snapshot().version;
+                return (version, HandlerResult::Error(request, ErrorToken::IoFailed));
+            }
+        };
+        if let Err((version, error)) = self.prepare_application_operation(
+            request.expected_state_version(),
+            true,
+            connection,
+            deadline,
+        ) {
+            return (version, HandlerResult::Error(request, error));
+        }
+        let Some(worker) = self.worker.as_ref() else {
+            self.mark_fault_by(deadline);
+            return (
+                self.snapshot().version,
+                HandlerResult::Error(request, ErrorToken::RebootRequired),
+            );
+        };
+        match worker.repair_rollback_write_lease_consume(&selector, deadline) {
+            Ok(response)
+                if response.code
+                    == internal_wire::WorkerResultCode::RepairRollbackWriteLeaseConsumed =>
+            {
+                match response
+                    .repair_rollback_write_lease
+                    .map(|value| *value)
+                    .filter(|lease| {
+                        lease.validate().is_ok()
+                            && matches!(
+                                &selector,
+                                RepairRollbackStatusSelector::Exact {
+                                    rollback_id,
+                                    rollback_transaction_binding_sha256,
+                                } if lease.transaction().rollback_id() == rollback_id
+                                    && lease.transaction().rollback_transaction_binding_sha256()
+                                        == rollback_transaction_binding_sha256
+                            )
+                    }) {
+                    Some(lease) => self.finish_application_mutation(
+                        request,
+                        Ok(SuccessPayload::RepairRollbackWriteLeaseConsumed(Box::new(
+                            lease,
+                        ))),
+                        deadline,
+                    ),
+                    None => self.repair_worker_fault(request, deadline),
+                }
+            }
+            Ok(response) => self.finish_repair_error(request, response.code, true, deadline),
+            Err(_) => self.repair_worker_fault(request, deadline),
+        }
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    fn handle_repair_rollback_resolve(
+        self: &Arc<Self>,
+        request: ValidatedRequest,
+        started: Instant,
+        connection: &ClientConnection<'_>,
+    ) -> (u64, HandlerResult) {
+        let deadline = started
+            .checked_add(WORKER_OPERATION_TIMEOUT)
+            .unwrap_or(started);
+        let (expected, resolution) = match request.payload() {
+            RequestPayload::RepairRollbackResolve {
+                expected,
+                resolution,
+            } => ((**expected).clone(), resolution.clone()),
+            _ => {
+                let version = self.snapshot().version;
+                return (version, HandlerResult::Error(request, ErrorToken::IoFailed));
+            }
+        };
+        if expected.validate().is_err()
+            || resolution.validate_against(expected.source()).is_err()
+            || !expected.is_unresolved()
+        {
+            let version = self.snapshot().version;
+            return (version, HandlerResult::Error(request, ErrorToken::IoFailed));
+        }
+        if let Err((version, error)) = self.prepare_application_operation(
+            request.expected_state_version(),
+            true,
+            connection,
+            deadline,
+        ) {
+            return (version, HandlerResult::Error(request, error));
+        }
+        let Some(worker) = self.worker.as_ref() else {
+            self.mark_fault_by(deadline);
+            return (
+                self.snapshot().version,
+                HandlerResult::Error(request, ErrorToken::RebootRequired),
+            );
+        };
+        match worker.repair_rollback_resolve(&expected, &resolution, deadline) {
+            Ok(response)
+                if response.code == internal_wire::WorkerResultCode::RepairRollbackResolved =>
+            {
+                match response
+                    .repair_rollback_status
+                    .map(|value| *value)
+                    .filter(|status| {
+                        status.validate().is_ok()
+                            && status.same_transaction(&expected)
+                            && status.resolves_with(&resolution)
+                    }) {
+                    Some(status) => self.finish_application_mutation(
+                        request,
+                        Ok(SuccessPayload::RepairRollbackResolved(Box::new(status))),
                         deadline,
                     ),
                     None => self.repair_worker_fault(request, deadline),
@@ -6196,11 +6566,18 @@ fn external_operation_is_enabled(
                 | Operation::RepairBackupRetire
                 | Operation::RepairTransactionStatus
                 | Operation::RepairTransactionResolve
+                | Operation::RepairRollbackBegin
+                | Operation::RepairRollbackStatus
+                | Operation::RepairRollbackResolve
                 | Operation::RepairVaultLiveParent
         ),
         #[cfg(feature = "experimental-repair-store")]
         kernaid_protocol::rescue_vault::PeerRole::RepairTargetHelper => {
-            matches!(operation, Operation::RepairTransactionWriteLeaseConsume)
+            matches!(
+                operation,
+                Operation::RepairTransactionWriteLeaseConsume
+                    | Operation::RepairRollbackWriteLeaseConsume
+            )
         }
     }
 }

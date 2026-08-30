@@ -4,8 +4,9 @@ use super::{RescueVaultDaemonError, internal_wire};
 #[cfg(feature = "experimental-repair-store")]
 use kernaid_protocol::rescue_repair_vault::{
     MAX_REPAIR_BACKUP_BYTES, RepairBackupBinding, RepairBackupDraft, RepairBackupStatusPayload,
-    RepairFileMetadataV1, RepairReservationId, RepairTransactionResolution,
-    RepairTransactionStatusPayload, RepairTransactionStatusSelector,
+    RepairFileMetadataV1, RepairReservationId, RepairRollbackBindingV1, RepairRollbackId,
+    RepairRollbackResolution, RepairRollbackStatusSelector, RepairRollbackTransactionStatusPayload,
+    RepairTransactionResolution, RepairTransactionStatusPayload, RepairTransactionStatusSelector,
 };
 use kernaid_protocol::rescue_vault::{
     MAX_SIGNED_REPORT_ENVELOPE_BYTES, ReportId, ReportSummary, Sha256, ValidatedRequest,
@@ -2871,6 +2872,68 @@ impl WorkerHandle {
     }
 
     #[cfg(feature = "experimental-repair-store")]
+    pub(super) fn repair_rollback_begin(
+        &self,
+        source: &RepairTransactionStatusPayload,
+        rollback_id: &RepairRollbackId,
+        binding: &RepairRollbackBindingV1,
+        deadline: Instant,
+    ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
+        self.transact_repair_without_descriptor(
+            internal_wire::WorkerRepairCommand::RollbackBegin {
+                source: Box::new(source.clone()),
+                rollback_id: rollback_id.clone(),
+                binding: binding.clone(),
+            },
+            deadline,
+        )
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    pub(super) fn repair_rollback_status(
+        &self,
+        selector: &RepairRollbackStatusSelector,
+        deadline: Instant,
+    ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
+        self.transact_repair_without_descriptor(
+            internal_wire::WorkerRepairCommand::RollbackStatus {
+                selector: selector.clone(),
+            },
+            deadline,
+        )
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    pub(super) fn repair_rollback_write_lease_consume(
+        &self,
+        selector: &RepairRollbackStatusSelector,
+        deadline: Instant,
+    ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
+        self.transact_repair_without_descriptor(
+            internal_wire::WorkerRepairCommand::RollbackWriteLeaseConsume {
+                selector: selector.clone(),
+            },
+            deadline,
+        )
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    pub(super) fn repair_rollback_resolve(
+        &self,
+        expected: &RepairRollbackTransactionStatusPayload,
+        resolution: &RepairRollbackResolution,
+        deadline: Instant,
+    ) -> Result<internal_wire::WorkerResponse, RescueVaultDaemonError> {
+        self.transact_repair_without_descriptor(
+            internal_wire::WorkerRepairCommand::RollbackResolve {
+                expected: Box::new(expected.clone()),
+                resolution: resolution.clone(),
+            },
+            deadline,
+        )
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
     fn transact_repair_without_descriptor(
         &self,
         repair: internal_wire::WorkerRepairCommand,
@@ -3902,6 +3965,54 @@ fn response_matches(
         Command::RepairTransactionResolve => matches!(
             response.code,
             Result::RepairTransactionResolved
+                | Result::RepairBackupNotFound
+                | Result::RepairInvalidRequest
+                | Result::RepairConflict
+                | Result::RepairReconciliationRequired
+                | Result::RepairStorageUnavailable
+                | Result::CleanupFailed
+                | Result::Busy
+        ),
+        #[cfg(feature = "experimental-repair-store")]
+        Command::RepairRollbackBegin => matches!(
+            response.code,
+            Result::RepairRollbackBegun
+                | Result::RepairBackupNotFound
+                | Result::RepairInvalidRequest
+                | Result::RepairConflict
+                | Result::RepairReconciliationRequired
+                | Result::RepairStorageUnavailable
+                | Result::CleanupFailed
+                | Result::Busy
+        ),
+        #[cfg(feature = "experimental-repair-store")]
+        Command::RepairRollbackStatus => matches!(
+            response.code,
+            Result::RepairRollbackStatusReady
+                | Result::RepairBackupNotFound
+                | Result::RepairInvalidRequest
+                | Result::RepairConflict
+                | Result::RepairReconciliationRequired
+                | Result::RepairStorageUnavailable
+                | Result::CleanupFailed
+                | Result::Busy
+        ),
+        #[cfg(feature = "experimental-repair-store")]
+        Command::RepairRollbackWriteLeaseConsume => matches!(
+            response.code,
+            Result::RepairRollbackWriteLeaseConsumed
+                | Result::RepairBackupNotFound
+                | Result::RepairInvalidRequest
+                | Result::RepairConflict
+                | Result::RepairReconciliationRequired
+                | Result::RepairStorageUnavailable
+                | Result::CleanupFailed
+                | Result::Busy
+        ),
+        #[cfg(feature = "experimental-repair-store")]
+        Command::RepairRollbackResolve => matches!(
+            response.code,
+            Result::RepairRollbackResolved
                 | Result::RepairBackupNotFound
                 | Result::RepairInvalidRequest
                 | Result::RepairConflict

@@ -8,9 +8,11 @@ use kernaid_protocol::{
     rescue_repair_vault::{
         RepairBackupBinding, RepairBackupDraft, RepairBackupReleasePayload,
         RepairBackupStatusPayload, RepairFileMetadataV1, RepairReservationId,
-        RepairTransactionResolution, RepairTransactionStatusPayload,
-        RepairTransactionStatusResultPayload, RepairTransactionStatusSelector,
-        RepairVaultLiveIdentityPayload,
+        RepairRollbackBindingV1, RepairRollbackId, RepairRollbackResolution,
+        RepairRollbackStatusResultPayload, RepairRollbackStatusSelector,
+        RepairRollbackTransactionStatusPayload, RepairTransactionResolution,
+        RepairTransactionStatusPayload, RepairTransactionStatusResultPayload,
+        RepairTransactionStatusSelector, RepairVaultLiveIdentityPayload,
     },
     rescue_vault::{ErrorToken, RequestId, Sha256, SuccessPayload},
     rescue_vault_transport::{
@@ -187,7 +189,7 @@ impl fmt::Debug for RetrievedRepairBackup {
     }
 }
 
-/// Stateful client for the eight operations allowed to the repair-broker role.
+/// Stateful client for the operations allowed to the repair-broker role.
 ///
 /// A new client has no trusted state version. Its first `reserve` or reboot
 /// `PendingSingleton` transaction lookup uses `expectedStateVersion = 0`; an
@@ -509,6 +511,61 @@ impl RepairVaultClient {
         )
     }
 
+    /// Begins one child rollback using fresh plan/approval material. The
+    /// mutation is never retried automatically; an ambiguous send must be
+    /// reconciled with `rollback_transaction_status`.
+    pub fn begin_rollback_transaction(
+        &mut self,
+        source: &RepairTransactionStatusPayload,
+        rollback_id: &RepairRollbackId,
+        binding: &RepairRollbackBindingV1,
+        deadline: Instant,
+    ) -> Result<RepairRollbackTransactionStatusPayload, RepairVaultClientError> {
+        self.resolve_transaction_with_exchange(|expected_state_version| {
+            let response = exchange_once(
+                expected_state_version,
+                ClientRequestPayload::RepairRollbackBegin {
+                    source: Box::new(source.clone()),
+                    rollback_id: rollback_id.clone(),
+                    binding: binding.clone(),
+                },
+                &[],
+                deadline,
+            )?;
+            Ok(TransactionAttempt {
+                state_version: response.state_version(),
+                outcome: rollback_begin_result(&response),
+            })
+        })
+    }
+
+    /// Looks up the singleton unresolved rollback after restart, or one exact
+    /// child while reconciling a lost begin/resolve response.
+    pub fn rollback_transaction_status(
+        &mut self,
+        selector: &RepairRollbackStatusSelector,
+        deadline: Instant,
+    ) -> Result<RepairRollbackStatusResultPayload, RepairVaultClientError> {
+        self.rollback_transaction_status_with_exchange(
+            selector,
+            deadline,
+            |expected_state_version, selector, deadline| {
+                let response = exchange_once(
+                    expected_state_version,
+                    ClientRequestPayload::RepairRollbackStatus {
+                        selector: selector.clone(),
+                    },
+                    &[],
+                    deadline,
+                )?;
+                Ok(TransactionAttempt {
+                    state_version: response.state_version(),
+                    outcome: rollback_status_result(&response),
+                })
+            },
+        )
+    }
+
     /// Reads freshly attested current-boot Vault parent evidence. A reboot
     /// recovery caller first bootstraps this client's state with the singleton
     /// transaction lookup, then compares this transient identity with the
@@ -590,6 +647,63 @@ impl RepairVaultClient {
         unreachable!("bounded transaction-status retry loop always returns")
     }
 
+    fn rollback_transaction_status_with_exchange<T, F>(
+        &mut self,
+        selector: &RepairRollbackStatusSelector,
+        deadline: Instant,
+        mut exchange: F,
+    ) -> Result<T, RepairVaultClientError>
+    where
+        F: FnMut(
+            u64,
+            &RepairRollbackStatusSelector,
+            Instant,
+        ) -> Result<TransactionAttempt<T>, ExchangeFailure>,
+    {
+        let pending_bootstrap = matches!(selector, RepairRollbackStatusSelector::PendingSingleton);
+        let mut expected_state_version = if pending_bootstrap {
+            match self.guard {
+                VersionGuard::Uninitialized => 0,
+                VersionGuard::Ready(state_version)
+                | VersionGuard::ReconciliationRequired(state_version) => state_version,
+            }
+        } else {
+            self.guard.read_version()?
+        };
+
+        for attempt in 0..=1 {
+            let response = exchange(expected_state_version, selector, deadline)
+                .map_err(|failure| failure.error)?;
+            match response.outcome {
+                Err(RepairVaultClientError::Remote(ErrorToken::StaleState)) if attempt == 0 => {
+                    if response.state_version == expected_state_version {
+                        return Err(RepairVaultClientError::Protocol);
+                    }
+                    expected_state_version = response.state_version;
+                    if matches!(self.guard, VersionGuard::Uninitialized) {
+                        debug_assert!(pending_bootstrap);
+                        self.guard.reconcile(response.state_version);
+                    } else {
+                        self.guard.observe_read_version(response.state_version);
+                    }
+                }
+                Ok(result) => {
+                    self.observe_completed_read(response.state_version);
+                    return Ok(result);
+                }
+                Err(RepairVaultClientError::Remote(ErrorToken::Absent)) => {
+                    self.observe_completed_read(response.state_version);
+                    return Err(RepairVaultClientError::Remote(ErrorToken::Absent));
+                }
+                Err(error) => {
+                    self.guard.observe_read_version(response.state_version);
+                    return Err(error);
+                }
+            }
+        }
+        unreachable!("bounded rollback-status retry loop always returns")
+    }
+
     /// Records one closed recovery outcome for an exact unresolved
     /// transaction. This mutation is never repeated automatically. If the
     /// correlated response is lost, the caller must use `transaction_status`
@@ -613,6 +727,32 @@ impl RepairVaultClient {
             Ok(TransactionAttempt {
                 state_version: response.state_version(),
                 outcome: transaction_resolve_result(&response),
+            })
+        })
+    }
+
+    /// Records one closed outcome for an exact unresolved rollback child.
+    /// This mutation is one-shot and requires exact status reconciliation if
+    /// its correlated response is lost.
+    pub fn resolve_rollback_transaction(
+        &mut self,
+        expected: &RepairRollbackTransactionStatusPayload,
+        resolution: &RepairRollbackResolution,
+        deadline: Instant,
+    ) -> Result<RepairRollbackTransactionStatusPayload, RepairVaultClientError> {
+        self.resolve_transaction_with_exchange(|expected_state_version| {
+            let response = exchange_once(
+                expected_state_version,
+                ClientRequestPayload::RepairRollbackResolve {
+                    expected: Box::new(expected.clone()),
+                    resolution: resolution.clone(),
+                },
+                &[],
+                deadline,
+            )?;
+            Ok(TransactionAttempt {
+                state_version: response.state_version(),
+                outcome: rollback_resolve_result(&response),
             })
         })
     }
@@ -766,6 +906,30 @@ fn transaction_status_result(
     }
 }
 
+fn rollback_begin_result(
+    response: &ClientResponse,
+) -> Result<RepairRollbackTransactionStatusPayload, RepairVaultClientError> {
+    match response.outcome() {
+        ClientResponseOutcome::Success(SuccessPayload::RepairRollbackBegun(status)) => {
+            Ok((**status).clone())
+        }
+        ClientResponseOutcome::Error(error) => Err(RepairVaultClientError::Remote(*error)),
+        ClientResponseOutcome::Success(_) => Err(RepairVaultClientError::Protocol),
+    }
+}
+
+fn rollback_status_result(
+    response: &ClientResponse,
+) -> Result<RepairRollbackStatusResultPayload, RepairVaultClientError> {
+    match response.outcome() {
+        ClientResponseOutcome::Success(SuccessPayload::RepairRollbackStatus(result)) => {
+            Ok((**result).clone())
+        }
+        ClientResponseOutcome::Error(error) => Err(RepairVaultClientError::Remote(*error)),
+        ClientResponseOutcome::Success(_) => Err(RepairVaultClientError::Protocol),
+    }
+}
+
 fn live_identity_result(
     response: &ClientResponse,
 ) -> Result<RepairVaultLiveIdentityPayload, RepairVaultClientError> {
@@ -783,6 +947,18 @@ fn transaction_resolve_result(
 ) -> Result<RepairTransactionStatusPayload, RepairVaultClientError> {
     match response.outcome() {
         ClientResponseOutcome::Success(SuccessPayload::RepairTransactionResolved(status)) => {
+            Ok((**status).clone())
+        }
+        ClientResponseOutcome::Error(error) => Err(RepairVaultClientError::Remote(*error)),
+        ClientResponseOutcome::Success(_) => Err(RepairVaultClientError::Protocol),
+    }
+}
+
+fn rollback_resolve_result(
+    response: &ClientResponse,
+) -> Result<RepairRollbackTransactionStatusPayload, RepairVaultClientError> {
+    match response.outcome() {
+        ClientResponseOutcome::Success(SuccessPayload::RepairRollbackResolved(status)) => {
             Ok((**status).clone())
         }
         ClientResponseOutcome::Error(error) => Err(RepairVaultClientError::Remote(*error)),
@@ -1077,6 +1253,13 @@ mod tests {
         )
     }
 
+    fn exact_rollback_selector() -> RepairRollbackStatusSelector {
+        RepairRollbackStatusSelector::exact(
+            RepairRollbackId::parse("RB-0123456789abcdef0123456789abcdef").expect("rollback ID"),
+            hash('8'),
+        )
+    }
+
     #[test]
     fn request_codec_remains_typed_and_path_free() {
         let request = ClientRequest::new(
@@ -1166,6 +1349,56 @@ mod tests {
         let mut exchanged = false;
         let result: Result<u8, _> = client.transaction_status_with_exchange(
             &exact_transaction_selector(),
+            Instant::now() + Duration::from_secs(1),
+            |_, _, _| {
+                exchanged = true;
+                Err(definite_failure(RepairVaultClientError::Protocol))
+            },
+        );
+
+        assert_eq!(result, Err(RepairVaultClientError::StateUnavailable));
+        assert!(!exchanged);
+    }
+
+    #[test]
+    fn pending_rollback_status_bootstraps_at_zero_and_retries_one_stale() {
+        let mut client = RepairVaultClient::new();
+        let selector = RepairRollbackStatusSelector::pending_singleton();
+        let mut versions = Vec::new();
+        let result = client.rollback_transaction_status_with_exchange(
+            &selector,
+            Instant::now() + Duration::from_secs(1),
+            |expected_state_version, observed_selector, _| {
+                assert_eq!(observed_selector, &selector);
+                versions.push(expected_state_version);
+                if versions.len() == 1 {
+                    Ok(TransactionAttempt {
+                        state_version: 29,
+                        outcome: Err(RepairVaultClientError::Remote(ErrorToken::StaleState)),
+                    })
+                } else {
+                    Ok(TransactionAttempt {
+                        state_version: 29,
+                        outcome: Ok(17_u8),
+                    })
+                }
+            },
+        );
+
+        assert_eq!(result, Ok(17));
+        assert_eq!(versions, [0, 29]);
+        assert_eq!(
+            client.state(),
+            RepairVaultClientState::Ready { state_version: 29 }
+        );
+    }
+
+    #[test]
+    fn exact_rollback_status_cannot_bootstrap_an_uninitialized_client() {
+        let mut client = RepairVaultClient::new();
+        let mut exchanged = false;
+        let result: Result<u8, _> = client.rollback_transaction_status_with_exchange(
+            &exact_rollback_selector(),
             Instant::now() + Duration::from_secs(1),
             |_, _, _| {
                 exchanged = true;

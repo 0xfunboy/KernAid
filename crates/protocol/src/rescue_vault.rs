@@ -9,7 +9,10 @@
 use crate::rescue_repair_vault::{
     MAX_REPAIR_BACKUP_BYTES, RepairBackupBinding, RepairBackupDraft, RepairBackupReleasePayload,
     RepairBackupState, RepairBackupStatusPayload, RepairExecutionIntentV1, RepairFileMetadataV1,
-    RepairReservationId, RepairTransactionResolution, RepairTransactionStatusPayload,
+    RepairReservationId, RepairRollbackBindingV1, RepairRollbackId, RepairRollbackResolution,
+    RepairRollbackStatusResultPayload, RepairRollbackStatusSelector,
+    RepairRollbackTransactionStatusPayload, RepairRollbackWriteLeasePayload,
+    RepairTransactionResolution, RepairTransactionStatusPayload,
     RepairTransactionStatusResultPayload, RepairTransactionStatusSelector,
     RepairVaultLiveIdentityPayload, RepairWriteLeasePayload,
 };
@@ -29,6 +32,9 @@ use std::{
 
 /// Exact version accepted on the Rescue vault socket.
 pub const API_VERSION: &str = "kernaid.dev/rescue-vault/v1alpha1";
+/// Isolated version for the post-commit rollback operations. Legacy operations
+/// remain byte-for-byte bound to [`API_VERSION`].
+pub const ROLLBACK_API_VERSION: &str = "kernaid.dev/rescue-vault/v1alpha2";
 /// Maximum size of one complete seqpacket datagram.
 pub const MAX_DATAGRAM_BYTES: usize = 64 * 1024;
 /// Highest integer that every JSON/TypeScript implementation represents
@@ -553,9 +559,32 @@ pub enum Operation {
     #[cfg(feature = "experimental-repair-store")]
     #[serde(rename = "repair.transaction.write-lease.consume")]
     RepairTransactionWriteLeaseConsume,
+    #[cfg(feature = "experimental-repair-store")]
+    #[serde(rename = "repair.rollback.begin")]
+    RepairRollbackBegin,
+    #[cfg(feature = "experimental-repair-store")]
+    #[serde(rename = "repair.rollback.status")]
+    RepairRollbackStatus,
+    #[cfg(feature = "experimental-repair-store")]
+    #[serde(rename = "repair.rollback.resolve")]
+    RepairRollbackResolve,
+    #[cfg(feature = "experimental-repair-store")]
+    #[serde(rename = "repair.rollback.write-lease.consume")]
+    RepairRollbackWriteLeaseConsume,
 }
 
 impl Operation {
+    pub const fn api_version(self) -> &'static str {
+        match self {
+            #[cfg(feature = "experimental-repair-store")]
+            Self::RepairRollbackBegin
+            | Self::RepairRollbackStatus
+            | Self::RepairRollbackResolve
+            | Self::RepairRollbackWriteLeaseConsume => ROLLBACK_API_VERSION,
+            _ => API_VERSION,
+        }
+    }
+
     fn permits(self, role: PeerRole) -> bool {
         match role {
             PeerRole::Companion => matches!(
@@ -596,11 +625,18 @@ impl Operation {
                     | Self::RepairBackupRetire
                     | Self::RepairTransactionStatus
                     | Self::RepairTransactionResolve
+                    | Self::RepairRollbackBegin
+                    | Self::RepairRollbackStatus
+                    | Self::RepairRollbackResolve
                     | Self::RepairVaultLiveParent
             ),
             #[cfg(feature = "experimental-repair-store")]
             PeerRole::RepairTargetHelper => {
-                matches!(self, Self::RepairTransactionWriteLeaseConsume)
+                matches!(
+                    self,
+                    Self::RepairTransactionWriteLeaseConsume
+                        | Self::RepairRollbackWriteLeaseConsume
+                )
             }
         }
     }
@@ -849,6 +885,25 @@ pub enum RequestPayload {
     #[cfg(feature = "experimental-repair-store")]
     RepairTransactionWriteLeaseConsume {
         selector: RepairTransactionStatusSelector,
+    },
+    #[cfg(feature = "experimental-repair-store")]
+    RepairRollbackBegin {
+        source: Box<RepairTransactionStatusPayload>,
+        rollback_id: RepairRollbackId,
+        binding: RepairRollbackBindingV1,
+    },
+    #[cfg(feature = "experimental-repair-store")]
+    RepairRollbackStatus {
+        selector: RepairRollbackStatusSelector,
+    },
+    #[cfg(feature = "experimental-repair-store")]
+    RepairRollbackResolve {
+        expected: Box<RepairRollbackTransactionStatusPayload>,
+        resolution: RepairRollbackResolution,
+    },
+    #[cfg(feature = "experimental-repair-store")]
+    RepairRollbackWriteLeaseConsume {
+        selector: RepairRollbackStatusSelector,
     },
 }
 
@@ -1207,6 +1262,30 @@ struct RepairTransactionResolveRequestPayload {
     resolution: RepairTransactionResolution,
 }
 
+#[cfg(feature = "experimental-repair-store")]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RepairRollbackBeginRequestPayload {
+    source: RepairTransactionStatusPayload,
+    rollback_id: RepairRollbackId,
+    binding: RepairRollbackBindingV1,
+}
+
+#[cfg(feature = "experimental-repair-store")]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RepairRollbackStatusRequestPayload {
+    selector: RepairRollbackStatusSelector,
+}
+
+#[cfg(feature = "experimental-repair-store")]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RepairRollbackResolveRequestPayload {
+    expected: RepairRollbackTransactionStatusPayload,
+    resolution: RepairRollbackResolution,
+}
+
 /// Decodes and authorizes one complete request packet for an already-bound
 /// peer identity. The public entry point is [`AuthenticatedPeer::receive_request`].
 ///
@@ -1227,7 +1306,7 @@ fn decode_request(
     }
     let wire: WireRequest<'_> = serde_json::from_slice(datagram)
         .map_err(|_| RequestDecodeError::Close(ProtocolViolation::InvalidJson))?;
-    if wire.api_version != API_VERSION {
+    if wire.api_version != wire.operation.api_version() {
         return Err(RequestDecodeError::Close(
             ProtocolViolation::UnsupportedVersion,
         ));
@@ -1555,6 +1634,55 @@ fn parse_payload(
                 selector: payload.selector,
             })
         }
+        #[cfg(feature = "experimental-repair-store")]
+        Operation::RepairRollbackBegin => {
+            let payload = serde_json::from_str::<RepairRollbackBeginRequestPayload>(raw.get())
+                .map_err(|_| ProtocolViolation::InvalidPayload)?;
+            payload.source.validate()?;
+            payload.binding.validate_against(&payload.source)?;
+            Ok(RequestPayload::RepairRollbackBegin {
+                source: Box::new(payload.source),
+                rollback_id: payload.rollback_id,
+                binding: payload.binding,
+            })
+        }
+        #[cfg(feature = "experimental-repair-store")]
+        Operation::RepairRollbackStatus => {
+            let payload = serde_json::from_str::<RepairRollbackStatusRequestPayload>(raw.get())
+                .map_err(|_| ProtocolViolation::InvalidPayload)?;
+            payload.selector.validate()?;
+            Ok(RequestPayload::RepairRollbackStatus {
+                selector: payload.selector,
+            })
+        }
+        #[cfg(feature = "experimental-repair-store")]
+        Operation::RepairRollbackResolve => {
+            let payload = serde_json::from_str::<RepairRollbackResolveRequestPayload>(raw.get())
+                .map_err(|_| ProtocolViolation::InvalidPayload)?;
+            payload.expected.validate()?;
+            payload
+                .resolution
+                .validate_against(payload.expected.source())?;
+            if !payload.expected.is_unresolved() {
+                return Err(ProtocolViolation::InvalidPayload);
+            }
+            Ok(RequestPayload::RepairRollbackResolve {
+                expected: Box::new(payload.expected),
+                resolution: payload.resolution,
+            })
+        }
+        #[cfg(feature = "experimental-repair-store")]
+        Operation::RepairRollbackWriteLeaseConsume => {
+            let payload = serde_json::from_str::<RepairRollbackStatusRequestPayload>(raw.get())
+                .map_err(|_| ProtocolViolation::InvalidPayload)?;
+            payload.selector.validate()?;
+            if !matches!(payload.selector, RepairRollbackStatusSelector::Exact { .. }) {
+                return Err(ProtocolViolation::InvalidPayload);
+            }
+            Ok(RequestPayload::RepairRollbackWriteLeaseConsume {
+                selector: payload.selector,
+            })
+        }
     }
 }
 
@@ -1628,7 +1756,11 @@ fn payload_descriptor(payload: &RequestPayload) -> Option<&DescriptorDeclaration
         | RequestPayload::RepairBackupRetire { .. }
         | RequestPayload::RepairTransactionStatus { .. }
         | RequestPayload::RepairTransactionResolve { .. }
-        | RequestPayload::RepairTransactionWriteLeaseConsume { .. } => None,
+        | RequestPayload::RepairTransactionWriteLeaseConsume { .. }
+        | RequestPayload::RepairRollbackBegin { .. }
+        | RequestPayload::RepairRollbackStatus { .. }
+        | RequestPayload::RepairRollbackResolve { .. }
+        | RequestPayload::RepairRollbackWriteLeaseConsume { .. } => None,
     }
 }
 
@@ -1949,6 +2081,14 @@ pub enum SuccessPayload {
     RepairVaultLiveIdentity(RepairVaultLiveIdentityPayload),
     #[cfg(feature = "experimental-repair-store")]
     RepairWriteLeaseConsumed(Box<RepairWriteLeasePayload>),
+    #[cfg(feature = "experimental-repair-store")]
+    RepairRollbackBegun(Box<RepairRollbackTransactionStatusPayload>),
+    #[cfg(feature = "experimental-repair-store")]
+    RepairRollbackStatus(Box<RepairRollbackStatusResultPayload>),
+    #[cfg(feature = "experimental-repair-store")]
+    RepairRollbackResolved(Box<RepairRollbackTransactionStatusPayload>),
+    #[cfg(feature = "experimental-repair-store")]
+    RepairRollbackWriteLeaseConsumed(Box<RepairRollbackWriteLeasePayload>),
 }
 
 #[derive(Serialize)]
@@ -2145,6 +2285,44 @@ fn encode_success(
             outcome: "ok",
             payload: lease,
         }),
+        #[cfg(feature = "experimental-repair-store")]
+        SuccessPayload::RepairRollbackBegun(status) => serde_json::to_vec(&SuccessWire {
+            api_version: ROLLBACK_API_VERSION,
+            request_id,
+            state_version,
+            operation,
+            outcome: "ok",
+            payload: status,
+        }),
+        #[cfg(feature = "experimental-repair-store")]
+        SuccessPayload::RepairRollbackStatus(result) => serde_json::to_vec(&SuccessWire {
+            api_version: ROLLBACK_API_VERSION,
+            request_id,
+            state_version,
+            operation,
+            outcome: "ok",
+            payload: result,
+        }),
+        #[cfg(feature = "experimental-repair-store")]
+        SuccessPayload::RepairRollbackResolved(status) => serde_json::to_vec(&SuccessWire {
+            api_version: ROLLBACK_API_VERSION,
+            request_id,
+            state_version,
+            operation,
+            outcome: "ok",
+            payload: status,
+        }),
+        #[cfg(feature = "experimental-repair-store")]
+        SuccessPayload::RepairRollbackWriteLeaseConsumed(lease) => {
+            serde_json::to_vec(&SuccessWire {
+                api_version: ROLLBACK_API_VERSION,
+                request_id,
+                state_version,
+                operation,
+                outcome: "ok",
+                payload: lease,
+            })
+        }
     }
     .map_err(|_| ProtocolViolation::InvalidPayload)?;
     if bytes.len() > MAX_DATAGRAM_BYTES {
@@ -2167,7 +2345,7 @@ fn encode_error(
         return Err(ProtocolViolation::FdForbidden);
     }
     let bytes = serde_json::to_vec(&ErrorWire {
-        api_version: API_VERSION,
+        api_version: request.operation.api_version(),
         request_id: request.request_id.as_str(),
         state_version,
         operation: request.operation,
@@ -2192,7 +2370,7 @@ fn encode_rejection(
         return Err(ProtocolViolation::InvalidPayload);
     }
     let bytes = serde_json::to_vec(&ErrorWire {
-        api_version: API_VERSION,
+        api_version: rejected.operation.api_version(),
         request_id: rejected.request_id.as_str(),
         state_version,
         operation: rejected.operation,
@@ -2442,6 +2620,60 @@ fn validate_success(
         {
             None
         }
+        #[cfg(feature = "experimental-repair-store")]
+        (
+            Operation::RepairRollbackBegin,
+            RequestPayload::RepairRollbackBegin {
+                source,
+                rollback_id,
+                binding,
+            },
+            SuccessPayload::RepairRollbackBegun(status),
+        ) if status.validate().is_ok()
+            && status.rollback_id() == rollback_id
+            && status.source() == source.as_ref()
+            && status.binding() == binding =>
+        {
+            None
+        }
+        #[cfg(feature = "experimental-repair-store")]
+        (
+            Operation::RepairRollbackStatus,
+            RequestPayload::RepairRollbackStatus { selector },
+            SuccessPayload::RepairRollbackStatus(result),
+        ) if selector.matches_result(result) => None,
+        #[cfg(feature = "experimental-repair-store")]
+        (
+            Operation::RepairRollbackResolve,
+            RequestPayload::RepairRollbackResolve {
+                expected,
+                resolution,
+            },
+            SuccessPayload::RepairRollbackResolved(status),
+        ) if status.validate().is_ok()
+            && status.same_transaction(expected)
+            && status.resolves_with(resolution) =>
+        {
+            None
+        }
+        #[cfg(feature = "experimental-repair-store")]
+        (
+            Operation::RepairRollbackWriteLeaseConsume,
+            RequestPayload::RepairRollbackWriteLeaseConsume { selector },
+            SuccessPayload::RepairRollbackWriteLeaseConsumed(lease),
+        ) if lease.validate().is_ok()
+            && matches!(
+                selector,
+                RepairRollbackStatusSelector::Exact {
+                    rollback_id,
+                    rollback_transaction_binding_sha256,
+                } if lease.transaction().rollback_id() == rollback_id
+                    && lease.transaction().rollback_transaction_binding_sha256()
+                        == rollback_transaction_binding_sha256
+            ) =>
+        {
+            None
+        }
         _ => return Err(ProtocolViolation::InvalidPayload),
     };
 
@@ -2615,8 +2847,12 @@ mod tests {
     }
 
     fn request(operation: &str, payload: &str) -> Vec<u8> {
+        request_with_version(API_VERSION, operation, payload)
+    }
+
+    fn request_with_version(version: &str, operation: &str, payload: &str) -> Vec<u8> {
         format!(
-            "{{\"apiVersion\":\"{API_VERSION}\",\"requestId\":\"{REQUEST_ID}\",\"expectedStateVersion\":7,\"operation\":\"{operation}\",\"payload\":{payload}}}"
+            "{{\"apiVersion\":\"{version}\",\"requestId\":\"{REQUEST_ID}\",\"expectedStateVersion\":7,\"operation\":\"{operation}\",\"payload\":{payload}}}"
         )
         .into_bytes()
     }
@@ -2973,7 +3209,74 @@ mod tests {
 
     #[cfg(feature = "experimental-repair-store")]
     #[test]
-    fn target_helper_allowlist_is_root_only_and_has_one_operation() {
+    fn rollback_operations_are_isolated_to_v1alpha2() {
+        for operation in [
+            Operation::RepairRollbackBegin,
+            Operation::RepairRollbackStatus,
+            Operation::RepairRollbackResolve,
+        ] {
+            assert_eq!(operation.api_version(), ROLLBACK_API_VERSION);
+            assert!(operation.permits(PeerRole::RepairBroker));
+            assert!(!operation.permits(PeerRole::RepairTargetHelper));
+        }
+        assert_eq!(
+            Operation::RepairRollbackWriteLeaseConsume.api_version(),
+            ROLLBACK_API_VERSION
+        );
+        assert!(Operation::RepairRollbackWriteLeaseConsume.permits(PeerRole::RepairTargetHelper));
+        assert!(!Operation::RepairRollbackWriteLeaseConsume.permits(PeerRole::RepairBroker));
+        assert_eq!(
+            Operation::RepairTransactionStatus.api_version(),
+            API_VERSION
+        );
+
+        let rollback_v1 = request(
+            "repair.rollback.status",
+            "{\"selector\":{\"kind\":\"pending-singleton\"}}",
+        );
+        assert_eq!(
+            decode_request(&rollback_v1, repair_peer(), Vec::new()).err(),
+            Some(ProtocolViolation::UnsupportedVersion)
+        );
+
+        let legacy_v2 = request_with_version(ROLLBACK_API_VERSION, "vault.status", "{}");
+        assert_eq!(
+            decode_request(&legacy_v2, peer(COMPANION_UID), Vec::new()).err(),
+            Some(ProtocolViolation::UnsupportedVersion)
+        );
+
+        let rollback_v2 = request_with_version(
+            ROLLBACK_API_VERSION,
+            "repair.rollback.status",
+            "{\"selector\":{\"kind\":\"pending-singleton\"}}",
+        );
+        let request = decode_request(&rollback_v2, repair_peer(), Vec::new())
+            .expect("v1alpha2 rollback lookup");
+        assert!(matches!(
+            request.payload(),
+            RequestPayload::RepairRollbackStatus {
+                selector: RepairRollbackStatusSelector::PendingSingleton
+            }
+        ));
+        let response = encode_success(
+            &request,
+            7,
+            &SuccessPayload::RepairRollbackStatus(Box::new(
+                RepairRollbackStatusResultPayload::absent(),
+            )),
+            &[],
+        )
+        .expect("v1alpha2 correlated response");
+        assert!(
+            String::from_utf8(response)
+                .expect("UTF-8 response")
+                .contains(ROLLBACK_API_VERSION)
+        );
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    #[test]
+    fn target_helper_allowlist_is_root_only_and_has_only_consume_operations() {
         let allowlist = PeerAllowlist::repair_target_helper_root_only();
         assert_eq!(allowlist.role_for(0), Ok(PeerRole::RepairTargetHelper));
         assert_eq!(
@@ -2983,8 +3286,10 @@ mod tests {
         assert!(
             Operation::RepairTransactionWriteLeaseConsume.permits(PeerRole::RepairTargetHelper)
         );
+        assert!(Operation::RepairRollbackWriteLeaseConsume.permits(PeerRole::RepairTargetHelper));
         assert!(!Operation::RepairTransactionStatus.permits(PeerRole::RepairTargetHelper));
         assert!(!Operation::RepairTransactionWriteLeaseConsume.permits(PeerRole::RepairBroker));
+        assert!(!Operation::RepairRollbackWriteLeaseConsume.permits(PeerRole::RepairBroker));
     }
 
     #[cfg(feature = "experimental-repair-store")]

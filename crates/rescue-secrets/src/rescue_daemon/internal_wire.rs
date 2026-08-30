@@ -12,6 +12,9 @@
 use kernaid_protocol::rescue_repair_vault::{
     MAX_REPAIR_BACKUP_BYTES, RepairBackupBinding, RepairBackupDraft, RepairBackupState,
     RepairBackupStatusPayload, RepairExecutionIntentV1, RepairFileMetadataV1, RepairReservationId,
+    RepairRollbackBindingV1, RepairRollbackId, RepairRollbackResolution,
+    RepairRollbackResolutionOutcome, RepairRollbackStatusSelector,
+    RepairRollbackTransactionStatusPayload, RepairRollbackWriteLeasePayload,
     RepairTransactionPhase, RepairTransactionResolution, RepairTransactionResolutionOutcome,
     RepairTransactionStatusPayload, RepairTransactionStatusSelector, RepairTransactionTargetState,
     RepairVaultLiveIdentityPayload, RepairWriteLeasePayload,
@@ -41,22 +44,23 @@ use std::{
 use std::os::fd::AsFd;
 
 #[cfg(feature = "experimental-repair-store")]
-const COMMAND_MAGIC: &[u8; 8] = b"KRVWC007";
+const COMMAND_MAGIC: &[u8; 8] = b"KRVWC008";
 #[cfg(not(feature = "experimental-repair-store"))]
 const COMMAND_MAGIC: &[u8; 8] = b"KRVWC003";
 #[cfg(feature = "experimental-repair-store")]
-const RESPONSE_MAGIC: &[u8; 8] = b"KRVWR007";
+const RESPONSE_MAGIC: &[u8; 8] = b"KRVWR008";
 #[cfg(not(feature = "experimental-repair-store"))]
 const RESPONSE_MAGIC: &[u8; 8] = b"KRVWR003";
 // Repair capabilities intentionally remain one canonical fixed-size binary
-// record. 2048 bytes covers the closed set of bounded (<=128 byte) opaque IDs
-// and hashes without introducing JSON, paths, or a second framing language.
+// record. Rollback status embeds the complete committed source transaction;
+// 4096 bytes covers its closed set of bounded (<=128 byte) opaque IDs and
+// hashes without introducing JSON, paths, or a second framing language.
 #[cfg(feature = "experimental-repair-store")]
-const COMMAND_BYTES: usize = 2048;
+const COMMAND_BYTES: usize = 4096;
 #[cfg(not(feature = "experimental-repair-store"))]
 const COMMAND_BYTES: usize = 128;
 #[cfg(feature = "experimental-repair-store")]
-const RESPONSE_BYTES: usize = 2048;
+const RESPONSE_BYTES: usize = 4096;
 #[cfg(not(feature = "experimental-repair-store"))]
 const RESPONSE_BYTES: usize = 128;
 const MAX_RECORD_BYTES: usize = if COMMAND_BYTES > RESPONSE_BYTES {
@@ -393,6 +397,21 @@ pub(super) enum WorkerRepairCommand {
     WriteLeaseConsume {
         selector: RepairTransactionStatusSelector,
     },
+    RollbackBegin {
+        source: Box<RepairTransactionStatusPayload>,
+        rollback_id: RepairRollbackId,
+        binding: RepairRollbackBindingV1,
+    },
+    RollbackStatus {
+        selector: RepairRollbackStatusSelector,
+    },
+    RollbackResolve {
+        expected: Box<RepairRollbackTransactionStatusPayload>,
+        resolution: RepairRollbackResolution,
+    },
+    RollbackWriteLeaseConsume {
+        selector: RepairRollbackStatusSelector,
+    },
     VaultLiveParent,
 }
 
@@ -409,6 +428,12 @@ impl WorkerRepairCommand {
             Self::TransactionStatus { .. } => WorkerCommandKind::RepairTransactionStatus,
             Self::TransactionResolve { .. } => WorkerCommandKind::RepairTransactionResolve,
             Self::WriteLeaseConsume { .. } => WorkerCommandKind::RepairTransactionWriteLeaseConsume,
+            Self::RollbackBegin { .. } => WorkerCommandKind::RepairRollbackBegin,
+            Self::RollbackStatus { .. } => WorkerCommandKind::RepairRollbackStatus,
+            Self::RollbackResolve { .. } => WorkerCommandKind::RepairRollbackResolve,
+            Self::RollbackWriteLeaseConsume { .. } => {
+                WorkerCommandKind::RepairRollbackWriteLeaseConsume
+            }
             Self::VaultLiveParent => WorkerCommandKind::RepairVaultLiveParent,
         }
     }
@@ -476,6 +501,35 @@ impl WorkerRepairCommand {
             Self::WriteLeaseConsume { selector } => {
                 validate_repair_transaction_selector(selector)?;
                 if !matches!(selector, RepairTransactionStatusSelector::Exact { .. }) {
+                    return Err(InternalWireError::InvalidFrame);
+                }
+                Ok(())
+            }
+            Self::RollbackBegin {
+                source, binding, ..
+            } => {
+                validate_repair_transaction_status(source)?;
+                binding
+                    .validate_against(source)
+                    .map_err(|_| InternalWireError::InvalidFrame)
+            }
+            Self::RollbackStatus { selector } => validate_repair_rollback_selector(selector),
+            Self::RollbackResolve {
+                expected,
+                resolution,
+            } => {
+                validate_repair_rollback_status(expected)?;
+                resolution
+                    .validate_against(expected.source())
+                    .map_err(|_| InternalWireError::InvalidFrame)?;
+                if !expected.is_unresolved() {
+                    return Err(InternalWireError::InvalidFrame);
+                }
+                Ok(())
+            }
+            Self::RollbackWriteLeaseConsume { selector } => {
+                validate_repair_rollback_selector(selector)?;
+                if !matches!(selector, RepairRollbackStatusSelector::Exact { .. }) {
                     return Err(InternalWireError::InvalidFrame);
                 }
                 Ok(())
@@ -559,6 +613,14 @@ pub(super) enum WorkerCommandKind {
     RepairVaultLiveParent,
     #[cfg(feature = "experimental-repair-store")]
     RepairTransactionWriteLeaseConsume,
+    #[cfg(feature = "experimental-repair-store")]
+    RepairRollbackBegin,
+    #[cfg(feature = "experimental-repair-store")]
+    RepairRollbackStatus,
+    #[cfg(feature = "experimental-repair-store")]
+    RepairRollbackResolve,
+    #[cfg(feature = "experimental-repair-store")]
+    RepairRollbackWriteLeaseConsume,
     AttestQuiescent,
     Shutdown,
 }
@@ -741,6 +803,10 @@ impl WorkerCommand {
                         | WorkerCommandKind::RepairTransactionResolve
                         | WorkerCommandKind::RepairVaultLiveParent
                         | WorkerCommandKind::RepairTransactionWriteLeaseConsume
+                        | WorkerCommandKind::RepairRollbackBegin
+                        | WorkerCommandKind::RepairRollbackStatus
+                        | WorkerCommandKind::RepairRollbackResolve
+                        | WorkerCommandKind::RepairRollbackWriteLeaseConsume
                 ))
         {
             return Err(InternalWireError::InvalidFrame);
@@ -806,6 +872,14 @@ impl WorkerCommand {
             WorkerCommandKind::RepairVaultLiveParent => 24,
             #[cfg(feature = "experimental-repair-store")]
             WorkerCommandKind::RepairTransactionWriteLeaseConsume => 25,
+            #[cfg(feature = "experimental-repair-store")]
+            WorkerCommandKind::RepairRollbackBegin => 26,
+            #[cfg(feature = "experimental-repair-store")]
+            WorkerCommandKind::RepairRollbackStatus => 27,
+            #[cfg(feature = "experimental-repair-store")]
+            WorkerCommandKind::RepairRollbackResolve => 28,
+            #[cfg(feature = "experimental-repair-store")]
+            WorkerCommandKind::RepairRollbackWriteLeaseConsume => 29,
         };
         bytes[12..20].copy_from_slice(&self.request_id.to_be_bytes());
         if let Some(application) = &self.application {
@@ -928,6 +1002,14 @@ impl WorkerCommand {
             24 => WorkerCommandKind::RepairVaultLiveParent,
             #[cfg(feature = "experimental-repair-store")]
             25 => WorkerCommandKind::RepairTransactionWriteLeaseConsume,
+            #[cfg(feature = "experimental-repair-store")]
+            26 => WorkerCommandKind::RepairRollbackBegin,
+            #[cfg(feature = "experimental-repair-store")]
+            27 => WorkerCommandKind::RepairRollbackStatus,
+            #[cfg(feature = "experimental-repair-store")]
+            28 => WorkerCommandKind::RepairRollbackResolve,
+            #[cfg(feature = "experimental-repair-store")]
+            29 => WorkerCommandKind::RepairRollbackWriteLeaseConsume,
             _ => return Err(InternalWireError::InvalidFrame),
         };
         let application = match kind {
@@ -994,7 +1076,11 @@ impl WorkerCommand {
             | WorkerCommandKind::RepairTransactionStatus
             | WorkerCommandKind::RepairTransactionResolve
             | WorkerCommandKind::RepairVaultLiveParent
-            | WorkerCommandKind::RepairTransactionWriteLeaseConsume => {
+            | WorkerCommandKind::RepairTransactionWriteLeaseConsume
+            | WorkerCommandKind::RepairRollbackBegin
+            | WorkerCommandKind::RepairRollbackStatus
+            | WorkerCommandKind::RepairRollbackResolve
+            | WorkerCommandKind::RepairRollbackWriteLeaseConsume => {
                 Some(decode_repair_command(bytes, kind)?)
             }
             _ => None,
@@ -1071,6 +1157,26 @@ fn encode_repair_command(
                     .ok_or(InternalWireError::InvalidFrame)?,
             )?;
         }
+        WorkerRepairCommand::RollbackBegin {
+            source,
+            rollback_id,
+            binding,
+        } => {
+            encode_repair_transaction_status(&mut writer, source)?;
+            writer.string(rollback_id.as_str(), MAX_REPAIR_ID_BYTES)?;
+            encode_repair_rollback_binding(&mut writer, binding, source)?;
+        }
+        WorkerRepairCommand::RollbackStatus { selector }
+        | WorkerRepairCommand::RollbackWriteLeaseConsume { selector } => {
+            encode_repair_rollback_selector(&mut writer, selector)?;
+        }
+        WorkerRepairCommand::RollbackResolve {
+            expected,
+            resolution,
+        } => {
+            encode_repair_rollback_status(&mut writer, expected)?;
+            encode_repair_rollback_resolution(&mut writer, resolution, expected.source())?;
+        }
         WorkerRepairCommand::VaultLiveParent => {}
     }
     Ok(())
@@ -1131,6 +1237,33 @@ fn decode_repair_command(
                     .ok_or(InternalWireError::InvalidFrame)?,
             )?;
             WorkerRepairCommand::TransactionResolve {
+                expected: Box::new(expected),
+                resolution,
+            }
+        }
+        WorkerCommandKind::RepairRollbackBegin => {
+            let source = decode_repair_transaction_status(&mut reader)?;
+            let rollback_id = RepairRollbackId::parse(&reader.string(MAX_REPAIR_ID_BYTES)?)
+                .map_err(|_| InternalWireError::InvalidFrame)?;
+            let binding = decode_repair_rollback_binding(&mut reader, &source)?;
+            WorkerRepairCommand::RollbackBegin {
+                source: Box::new(source),
+                rollback_id,
+                binding,
+            }
+        }
+        WorkerCommandKind::RepairRollbackStatus => WorkerRepairCommand::RollbackStatus {
+            selector: decode_repair_rollback_selector(&mut reader)?,
+        },
+        WorkerCommandKind::RepairRollbackWriteLeaseConsume => {
+            WorkerRepairCommand::RollbackWriteLeaseConsume {
+                selector: decode_repair_rollback_selector(&mut reader)?,
+            }
+        }
+        WorkerCommandKind::RepairRollbackResolve => {
+            let expected = decode_repair_rollback_status(&mut reader)?;
+            let resolution = decode_repair_rollback_resolution(&mut reader, expected.source())?;
+            WorkerRepairCommand::RollbackResolve {
                 expected: Box::new(expected),
                 resolution,
             }
@@ -1559,6 +1692,212 @@ fn validate_repair_transaction_resolution(
         return Err(InternalWireError::InvalidFrame);
     }
     Ok(())
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn encode_repair_rollback_binding(
+    writer: &mut ClosedFrameWriter<'_>,
+    binding: &RepairRollbackBindingV1,
+    source: &RepairTransactionStatusPayload,
+) -> Result<(), InternalWireError> {
+    binding
+        .validate_against(source)
+        .map_err(|_| InternalWireError::InvalidFrame)?;
+    writer.string(binding.plan_id(), MAX_REPAIR_ID_BYTES)?;
+    writer.hash(binding.plan_sha256().bytes())?;
+    writer.string(binding.approval_id(), MAX_REPAIR_ID_BYTES)?;
+    writer.hash(binding.approval_sha256().bytes())?;
+    writer.u64(binding.approval_sequence())
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn decode_repair_rollback_binding(
+    reader: &mut ClosedFrameReader<'_>,
+    source: &RepairTransactionStatusPayload,
+) -> Result<RepairRollbackBindingV1, InternalWireError> {
+    RepairRollbackBindingV1::new(
+        source,
+        reader.string(MAX_REPAIR_ID_BYTES)?,
+        protocol_sha256(reader.hash()?)?,
+        reader.string(MAX_REPAIR_ID_BYTES)?,
+        protocol_sha256(reader.hash()?)?,
+        reader.u64()?,
+    )
+    .map_err(|_| InternalWireError::InvalidFrame)
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn encode_repair_rollback_selector(
+    writer: &mut ClosedFrameWriter<'_>,
+    selector: &RepairRollbackStatusSelector,
+) -> Result<(), InternalWireError> {
+    validate_repair_rollback_selector(selector)?;
+    match selector {
+        RepairRollbackStatusSelector::PendingSingleton => writer.u8(1),
+        RepairRollbackStatusSelector::Exact {
+            rollback_id,
+            rollback_transaction_binding_sha256,
+        } => {
+            writer.u8(2)?;
+            writer.string(rollback_id.as_str(), MAX_REPAIR_ID_BYTES)?;
+            writer.hash(rollback_transaction_binding_sha256.bytes())
+        }
+    }
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn decode_repair_rollback_selector(
+    reader: &mut ClosedFrameReader<'_>,
+) -> Result<RepairRollbackStatusSelector, InternalWireError> {
+    let selector = match reader.u8()? {
+        1 => RepairRollbackStatusSelector::pending_singleton(),
+        2 => RepairRollbackStatusSelector::exact(
+            RepairRollbackId::parse(&reader.string(MAX_REPAIR_ID_BYTES)?)
+                .map_err(|_| InternalWireError::InvalidFrame)?,
+            protocol_sha256(reader.hash()?)?,
+        ),
+        _ => return Err(InternalWireError::InvalidFrame),
+    };
+    validate_repair_rollback_selector(&selector)?;
+    Ok(selector)
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn validate_repair_rollback_selector(
+    selector: &RepairRollbackStatusSelector,
+) -> Result<(), InternalWireError> {
+    selector
+        .validate()
+        .map_err(|_| InternalWireError::InvalidFrame)
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn encode_repair_rollback_status(
+    writer: &mut ClosedFrameWriter<'_>,
+    status: &RepairRollbackTransactionStatusPayload,
+) -> Result<(), InternalWireError> {
+    validate_repair_rollback_status(status)?;
+    writer.u8(match status.phase() {
+        RepairTransactionPhase::Pending => 1,
+        RepairTransactionPhase::Resolved => 2,
+        RepairTransactionPhase::ManualReconciliationRequired => 3,
+    })?;
+    writer.string(status.rollback_id().as_str(), MAX_REPAIR_ID_BYTES)?;
+    writer.hash(status.rollback_transaction_binding_sha256().bytes())?;
+    encode_repair_transaction_status(writer, status.source())?;
+    encode_repair_rollback_binding(writer, status.binding(), status.source())?;
+    match status.resolution() {
+        None => writer.u8(0),
+        Some(resolution) => {
+            writer.u8(1)?;
+            encode_repair_rollback_resolution(writer, resolution, status.source())
+        }
+    }
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn decode_repair_rollback_status(
+    reader: &mut ClosedFrameReader<'_>,
+) -> Result<RepairRollbackTransactionStatusPayload, InternalWireError> {
+    let encoded_phase = match reader.u8()? {
+        1 => RepairTransactionPhase::Pending,
+        2 => RepairTransactionPhase::Resolved,
+        3 => RepairTransactionPhase::ManualReconciliationRequired,
+        _ => return Err(InternalWireError::InvalidFrame),
+    };
+    let rollback_id = RepairRollbackId::parse(&reader.string(MAX_REPAIR_ID_BYTES)?)
+        .map_err(|_| InternalWireError::InvalidFrame)?;
+    let encoded_binding = reader.hash()?;
+    let source = decode_repair_transaction_status(reader)?;
+    let binding = decode_repair_rollback_binding(reader, &source)?;
+    let resolution = match reader.u8()? {
+        0 => None,
+        1 => Some(decode_repair_rollback_resolution(reader, &source)?),
+        _ => return Err(InternalWireError::InvalidFrame),
+    };
+    let status = match resolution {
+        None => RepairRollbackTransactionStatusPayload::pending(rollback_id, source, binding),
+        Some(resolution) => RepairRollbackTransactionStatusPayload::resolved(
+            rollback_id,
+            source,
+            binding,
+            resolution,
+        ),
+    }
+    .map_err(|_| InternalWireError::InvalidFrame)?;
+    if status.phase() != encoded_phase
+        || status.rollback_transaction_binding_sha256().bytes() != encoded_binding
+    {
+        return Err(InternalWireError::InvalidFrame);
+    }
+    validate_repair_rollback_status(&status)?;
+    Ok(status)
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn validate_repair_rollback_status(
+    status: &RepairRollbackTransactionStatusPayload,
+) -> Result<(), InternalWireError> {
+    status
+        .validate()
+        .map_err(|_| InternalWireError::InvalidFrame)
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn encode_repair_rollback_resolution(
+    writer: &mut ClosedFrameWriter<'_>,
+    resolution: &RepairRollbackResolution,
+    source: &RepairTransactionStatusPayload,
+) -> Result<(), InternalWireError> {
+    resolution
+        .validate_against(source)
+        .map_err(|_| InternalWireError::InvalidFrame)?;
+    writer.u8(match resolution.outcome() {
+        RepairRollbackResolutionOutcome::RolledBackBefore => 1,
+        RepairRollbackResolutionOutcome::ManualReconciliationRequired => 2,
+    })?;
+    writer.u8(match resolution.target_state() {
+        RepairTransactionTargetState::Before => 1,
+        RepairTransactionTargetState::After => 2,
+        RepairTransactionTargetState::Third => 3,
+    })?;
+    writer.hash(resolution.observed_resource_sha256().bytes())?;
+    writer.hash(resolution.observed_metadata_sha256().bytes())?;
+    writer.u8(u8::from(resolution.mount_cleanup_verified()))
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn decode_repair_rollback_resolution(
+    reader: &mut ClosedFrameReader<'_>,
+    source: &RepairTransactionStatusPayload,
+) -> Result<RepairRollbackResolution, InternalWireError> {
+    let outcome = match reader.u8()? {
+        1 => RepairRollbackResolutionOutcome::RolledBackBefore,
+        2 => RepairRollbackResolutionOutcome::ManualReconciliationRequired,
+        _ => return Err(InternalWireError::InvalidFrame),
+    };
+    let encoded_target_state = match reader.u8()? {
+        1 => RepairTransactionTargetState::Before,
+        2 => RepairTransactionTargetState::After,
+        3 => RepairTransactionTargetState::Third,
+        _ => return Err(InternalWireError::InvalidFrame),
+    };
+    let resolution = RepairRollbackResolution::new(
+        outcome,
+        protocol_sha256(reader.hash()?)?,
+        protocol_sha256(reader.hash()?)?,
+        match reader.u8()? {
+            0 => false,
+            1 => true,
+            _ => return Err(InternalWireError::InvalidFrame),
+        },
+        source,
+    )
+    .map_err(|_| InternalWireError::InvalidFrame)?;
+    if resolution.target_state() != encoded_target_state {
+        return Err(InternalWireError::InvalidFrame);
+    }
+    Ok(resolution)
 }
 
 #[cfg(feature = "experimental-repair-store")]
@@ -2006,6 +2345,14 @@ pub(super) enum WorkerResultCode {
     RepairVaultLiveIdentityReady,
     #[cfg(feature = "experimental-repair-store")]
     RepairWriteLeaseConsumed,
+    #[cfg(feature = "experimental-repair-store")]
+    RepairRollbackBegun,
+    #[cfg(feature = "experimental-repair-store")]
+    RepairRollbackStatusReady,
+    #[cfg(feature = "experimental-repair-store")]
+    RepairRollbackResolved,
+    #[cfg(feature = "experimental-repair-store")]
+    RepairRollbackWriteLeaseConsumed,
 }
 
 impl WorkerResultCode {
@@ -2103,6 +2450,14 @@ impl WorkerResultCode {
             Self::RepairVaultLiveIdentityReady => 74,
             #[cfg(feature = "experimental-repair-store")]
             Self::RepairWriteLeaseConsumed => 75,
+            #[cfg(feature = "experimental-repair-store")]
+            Self::RepairRollbackBegun => 76,
+            #[cfg(feature = "experimental-repair-store")]
+            Self::RepairRollbackStatusReady => 77,
+            #[cfg(feature = "experimental-repair-store")]
+            Self::RepairRollbackResolved => 78,
+            #[cfg(feature = "experimental-repair-store")]
+            Self::RepairRollbackWriteLeaseConsumed => 79,
         }
     }
 
@@ -2200,6 +2555,14 @@ impl WorkerResultCode {
             74 => Ok(Self::RepairVaultLiveIdentityReady),
             #[cfg(feature = "experimental-repair-store")]
             75 => Ok(Self::RepairWriteLeaseConsumed),
+            #[cfg(feature = "experimental-repair-store")]
+            76 => Ok(Self::RepairRollbackBegun),
+            #[cfg(feature = "experimental-repair-store")]
+            77 => Ok(Self::RepairRollbackStatusReady),
+            #[cfg(feature = "experimental-repair-store")]
+            78 => Ok(Self::RepairRollbackResolved),
+            #[cfg(feature = "experimental-repair-store")]
+            79 => Ok(Self::RepairRollbackWriteLeaseConsumed),
             _ => Err(InternalWireError::InvalidFrame),
         }
     }
@@ -2259,6 +2622,10 @@ pub(super) struct WorkerResponse {
     pub(super) repair_vault_live_identity: Option<WorkerRepairVaultLiveIdentity>,
     #[cfg(feature = "experimental-repair-store")]
     pub(super) repair_write_lease: Option<Box<RepairWriteLeasePayload>>,
+    #[cfg(feature = "experimental-repair-store")]
+    pub(super) repair_rollback_status: Option<Box<RepairRollbackTransactionStatusPayload>>,
+    #[cfg(feature = "experimental-repair-store")]
+    pub(super) repair_rollback_write_lease: Option<Box<RepairRollbackWriteLeasePayload>>,
 }
 
 impl WorkerResponse {
@@ -2282,6 +2649,10 @@ impl WorkerResponse {
             repair_vault_live_identity: None,
             #[cfg(feature = "experimental-repair-store")]
             repair_write_lease: None,
+            #[cfg(feature = "experimental-repair-store")]
+            repair_rollback_status: None,
+            #[cfg(feature = "experimental-repair-store")]
+            repair_rollback_write_lease: None,
         }
     }
 
@@ -2305,6 +2676,10 @@ impl WorkerResponse {
             repair_vault_live_identity: None,
             #[cfg(feature = "experimental-repair-store")]
             repair_write_lease: None,
+            #[cfg(feature = "experimental-repair-store")]
+            repair_rollback_status: None,
+            #[cfg(feature = "experimental-repair-store")]
+            repair_rollback_write_lease: None,
         }
     }
 
@@ -2328,6 +2703,10 @@ impl WorkerResponse {
             repair_vault_live_identity: None,
             #[cfg(feature = "experimental-repair-store")]
             repair_write_lease: None,
+            #[cfg(feature = "experimental-repair-store")]
+            repair_rollback_status: None,
+            #[cfg(feature = "experimental-repair-store")]
+            repair_rollback_write_lease: None,
         }
     }
 
@@ -2419,6 +2798,49 @@ impl WorkerResponse {
         response
     }
 
+    #[cfg(feature = "experimental-repair-store")]
+    pub(super) fn repair_rollback_begun(
+        request_id: u64,
+        status: RepairRollbackTransactionStatusPayload,
+    ) -> Self {
+        let mut response = Self::new(request_id, WorkerResultCode::RepairRollbackBegun);
+        response.repair_rollback_status = Some(Box::new(status));
+        response
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    pub(super) fn repair_rollback_status(
+        request_id: u64,
+        status: Option<RepairRollbackTransactionStatusPayload>,
+    ) -> Self {
+        let mut response = Self::new(request_id, WorkerResultCode::RepairRollbackStatusReady);
+        response.repair_rollback_status = status.map(Box::new);
+        response
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    pub(super) fn repair_rollback_resolved(
+        request_id: u64,
+        status: RepairRollbackTransactionStatusPayload,
+    ) -> Self {
+        let mut response = Self::new(request_id, WorkerResultCode::RepairRollbackResolved);
+        response.repair_rollback_status = Some(Box::new(status));
+        response
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    pub(super) fn repair_rollback_write_lease_consumed(
+        request_id: u64,
+        lease: RepairRollbackWriteLeasePayload,
+    ) -> Self {
+        let mut response = Self::new(
+            request_id,
+            WorkerResultCode::RepairRollbackWriteLeaseConsumed,
+        );
+        response.repair_rollback_write_lease = Some(Box::new(lease));
+        response
+    }
+
     #[cfg(feature = "experimental-codex-home-lease")]
     pub(super) fn provider_codex_home_ready(request_id: u64) -> Self {
         Self::new(request_id, WorkerResultCode::ProviderCodexHomeReady)
@@ -2456,13 +2878,29 @@ impl WorkerResponse {
         #[cfg(feature = "experimental-repair-store")]
         let repair_write_lease_metadata = self.code == WorkerResultCode::RepairWriteLeaseConsumed;
         #[cfg(feature = "experimental-repair-store")]
+        let repair_rollback_metadata = matches!(
+            self.code,
+            WorkerResultCode::RepairRollbackBegun
+                | WorkerResultCode::RepairRollbackStatusReady
+                | WorkerResultCode::RepairRollbackResolved
+        );
+        #[cfg(feature = "experimental-repair-store")]
+        let repair_rollback_write_lease_metadata =
+            self.code == WorkerResultCode::RepairRollbackWriteLeaseConsumed;
+        #[cfg(feature = "experimental-repair-store")]
         if repair_metadata != self.repair_status.is_some()
             || repair_release_metadata != self.repair_released_bytes.is_some()
             || (!repair_transaction_metadata && self.repair_transaction_status.is_some())
             || repair_vault_live_identity_metadata != self.repair_vault_live_identity.is_some()
             || repair_write_lease_metadata != self.repair_write_lease.is_some()
+            || (!repair_rollback_metadata && self.repair_rollback_status.is_some())
+            || repair_rollback_write_lease_metadata != self.repair_rollback_write_lease.is_some()
             || (self.code == WorkerResultCode::RepairTransactionResolved
                 && self.repair_transaction_status.is_none())
+            || matches!(
+                self.code,
+                WorkerResultCode::RepairRollbackBegun | WorkerResultCode::RepairRollbackResolved
+            ) && self.repair_rollback_status.is_none()
             || self
                 .repair_released_bytes
                 .is_some_and(|bytes| !(1..=MAX_REPAIR_BACKUP_BYTES).contains(&bytes))
@@ -2485,6 +2923,14 @@ impl WorkerResponse {
                 .is_some_and(|identity| identity.validate().is_err())
             || self
                 .repair_write_lease
+                .as_ref()
+                .is_some_and(|lease| lease.validate().is_err())
+            || self
+                .repair_rollback_status
+                .as_deref()
+                .is_some_and(|status| validate_repair_rollback_status(status).is_err())
+            || self
+                .repair_rollback_write_lease
                 .as_ref()
                 .is_some_and(|lease| lease.validate().is_err())
         {
@@ -2589,6 +3035,20 @@ impl WorkerResponse {
             encode_repair_transaction_status(&mut writer, lease.transaction())?;
             writer.hash(lease.boot_epoch_sha256().bytes())?;
             writer.hash(lease.lease_binding_sha256().bytes())?;
+        } else if repair_rollback_metadata {
+            let mut writer = ClosedFrameWriter::new(&mut bytes[REPAIR_PAYLOAD_OFFSET..]);
+            match self.repair_rollback_status.as_deref() {
+                Some(status) => {
+                    writer.u8(1)?;
+                    encode_repair_rollback_status(&mut writer, status)?;
+                }
+                None => writer.u8(0)?,
+            }
+        } else if let Some(lease) = self.repair_rollback_write_lease.as_ref() {
+            let mut writer = ClosedFrameWriter::new(&mut bytes[REPAIR_PAYLOAD_OFFSET..]);
+            encode_repair_rollback_status(&mut writer, lease.transaction())?;
+            writer.hash(lease.boot_epoch_sha256().bytes())?;
+            writer.hash(lease.lease_binding_sha256().bytes())?;
         }
         Ok(bytes)
     }
@@ -2623,10 +3083,22 @@ impl WorkerResponse {
         #[cfg(feature = "experimental-repair-store")]
         let repair_write_lease_metadata = code == WorkerResultCode::RepairWriteLeaseConsumed;
         #[cfg(feature = "experimental-repair-store")]
+        let repair_rollback_metadata = matches!(
+            code,
+            WorkerResultCode::RepairRollbackBegun
+                | WorkerResultCode::RepairRollbackStatusReady
+                | WorkerResultCode::RepairRollbackResolved
+        );
+        #[cfg(feature = "experimental-repair-store")]
+        let repair_rollback_write_lease_metadata =
+            code == WorkerResultCode::RepairRollbackWriteLeaseConsumed;
+        #[cfg(feature = "experimental-repair-store")]
         let repair_wire = repair_metadata
             || repair_transaction_metadata
             || repair_vault_live_identity_metadata
-            || repair_write_lease_metadata;
+            || repair_write_lease_metadata
+            || repair_rollback_metadata
+            || repair_rollback_write_lease_metadata;
         #[cfg(not(feature = "experimental-repair-store"))]
         let repair_wire = false;
         let device_len = usize::from(bytes[9]);
@@ -2764,6 +3236,46 @@ impl WorkerResponse {
         } else {
             None
         };
+        #[cfg(feature = "experimental-repair-store")]
+        let repair_rollback_status = if repair_rollback_metadata {
+            let mut reader = ClosedFrameReader::new(
+                bytes
+                    .get(REPAIR_PAYLOAD_OFFSET..)
+                    .ok_or(InternalWireError::InvalidFrame)?,
+            );
+            let status = match reader.u8()? {
+                0 => None,
+                1 => Some(Box::new(decode_repair_rollback_status(&mut reader)?)),
+                _ => return Err(InternalWireError::InvalidFrame),
+            };
+            if !reader.remaining_is_zero() {
+                return Err(InternalWireError::InvalidFrame);
+            }
+            status
+        } else {
+            None
+        };
+        #[cfg(feature = "experimental-repair-store")]
+        let repair_rollback_write_lease = if repair_rollback_write_lease_metadata {
+            let mut reader = ClosedFrameReader::new(
+                bytes
+                    .get(REPAIR_PAYLOAD_OFFSET..)
+                    .ok_or(InternalWireError::InvalidFrame)?,
+            );
+            let transaction = decode_repair_rollback_status(&mut reader)?;
+            let boot_epoch = protocol_sha256(reader.hash()?)?;
+            let encoded_binding = reader.hash()?;
+            let lease = RepairRollbackWriteLeasePayload::consumed(transaction, boot_epoch)
+                .map_err(|_| InternalWireError::InvalidFrame)?;
+            if lease.lease_binding_sha256().bytes() != encoded_binding
+                || !reader.remaining_is_zero()
+            {
+                return Err(InternalWireError::InvalidFrame);
+            }
+            Some(Box::new(lease))
+        } else {
+            None
+        };
         let response = Self {
             request_id,
             code,
@@ -2789,6 +3301,10 @@ impl WorkerResponse {
             repair_vault_live_identity,
             #[cfg(feature = "experimental-repair-store")]
             repair_write_lease,
+            #[cfg(feature = "experimental-repair-store")]
+            repair_rollback_status,
+            #[cfg(feature = "experimental-repair-store")]
+            repair_rollback_write_lease,
         };
         if response.encode()?.as_slice() != bytes {
             return Err(InternalWireError::InvalidFrame);
@@ -3201,16 +3717,16 @@ mod tests {
         };
         let recovery_fingerprint = format!("recovery:{}", "8".repeat(64));
         let binding = WorkerRepairBinding {
-            plan_id: "P-plan".to_owned(),
+            plan_id: format!("P-{}", "p".repeat(126)),
             plan_sha256: [0x55; 32],
-            approval_id: "A-approval".to_owned(),
+            approval_id: format!("A-{}", "a".repeat(126)),
             approval_sha256: [0x66; 32],
             resource_id: "rescue:selected-linux-root:etc/fstab".to_owned(),
             resource_sha256: expected_hash,
             execution_intent: RepairExecutionIntentV1::new(
-                "S-session",
+                format!("S-{}", "s".repeat(126)),
                 1,
-                "target-root",
+                format!("target-{}", "t".repeat(121)),
                 format!("scan:{}", "7".repeat(64)),
                 protocol_sha256([0x77; 32]).expect("target fingerprint"),
                 protocol_sha256([0x88; 32]).expect("target physical parent"),
@@ -3236,8 +3752,8 @@ mod tests {
             },
         );
         let encoded = persist.encode().expect("repair persist frame");
-        assert_eq!(encoded.len(), 2048);
-        assert_eq!(&encoded[..8], b"KRVWC007");
+        assert_eq!(encoded.len(), 4096);
+        assert_eq!(&encoded[..8], b"KRVWC008");
         assert_eq!(WorkerCommand::decode(&encoded), Ok(persist));
 
         let mut noncanonical = encoded;
@@ -3253,8 +3769,8 @@ mod tests {
         let response =
             WorkerResponse::repair(41, WorkerResultCode::RepairBackupDurable, durable.clone());
         let encoded = response.encode().expect("repair response frame");
-        assert_eq!(encoded.len(), 2048);
-        assert_eq!(&encoded[..8], b"KRVWR007");
+        assert_eq!(encoded.len(), 4096);
+        assert_eq!(&encoded[..8], b"KRVWR008");
         assert_eq!(WorkerResponse::decode(&encoded), Ok(response));
 
         let durable_protocol = durable.to_protocol().expect("durable protocol status");
@@ -3302,6 +3818,119 @@ mod tests {
         let resolved =
             RepairTransactionStatusPayload::resolved(pending.backup().clone(), resolution)
                 .expect("resolved transaction");
+        let rollback_binding = RepairRollbackBindingV1::new(
+            &resolved,
+            format!("P-{}", "r".repeat(126)),
+            protocol_sha256([0x31; 32]).expect("rollback plan hash"),
+            format!("A-{}", "b".repeat(126)),
+            protocol_sha256([0x32; 32]).expect("rollback approval hash"),
+            2,
+        )
+        .expect("fresh rollback binding");
+        let rollback_begin = WorkerCommand::repair(
+            52,
+            WorkerRepairCommand::RollbackBegin {
+                source: Box::new(resolved.clone()),
+                rollback_id: RepairRollbackId::parse("RB-0123456789abcdef0123456789abcdef")
+                    .expect("rollback ID"),
+                binding: rollback_binding.clone(),
+            },
+        );
+        let encoded = rollback_begin
+            .encode()
+            .expect("maximal nested rollback begin frame");
+        assert_eq!(encoded.len(), 4096);
+        assert_eq!(&encoded[..8], b"KRVWC008");
+        assert_eq!(WorkerCommand::decode(&encoded), Ok(rollback_begin));
+
+        let rollback_pending = RepairRollbackTransactionStatusPayload::pending(
+            RepairRollbackId::parse("RB-0123456789abcdef0123456789abcdef").expect("rollback ID"),
+            resolved.clone(),
+            rollback_binding,
+        )
+        .expect("pending rollback");
+        let rollback_selector = RepairRollbackStatusSelector::for_status(&rollback_pending);
+        for command in [
+            WorkerCommand::repair(
+                53,
+                WorkerRepairCommand::RollbackStatus {
+                    selector: RepairRollbackStatusSelector::pending_singleton(),
+                },
+            ),
+            WorkerCommand::repair(
+                54,
+                WorkerRepairCommand::RollbackStatus {
+                    selector: rollback_selector.clone(),
+                },
+            ),
+            WorkerCommand::repair(
+                55,
+                WorkerRepairCommand::RollbackWriteLeaseConsume {
+                    selector: rollback_selector,
+                },
+            ),
+        ] {
+            let encoded = command.encode().expect("rollback lookup/lease frame");
+            assert_eq!(WorkerCommand::decode(&encoded), Ok(command));
+        }
+        assert_eq!(
+            WorkerCommand::repair(
+                57,
+                WorkerRepairCommand::RollbackWriteLeaseConsume {
+                    selector: RepairRollbackStatusSelector::pending_singleton(),
+                },
+            )
+            .encode(),
+            Err(InternalWireError::InvalidFrame)
+        );
+
+        let source_intent = resolved
+            .backup()
+            .execution_intent()
+            .expect("source execution intent");
+        let rollback_resolution = RepairRollbackResolution::new(
+            RepairRollbackResolutionOutcome::RolledBackBefore,
+            source_intent.before_sha256().clone(),
+            source_intent.before_metadata().canonical_sha256(),
+            true,
+            &resolved,
+        )
+        .expect("rollback resolution");
+        let rollback_resolve = WorkerCommand::repair(
+            56,
+            WorkerRepairCommand::RollbackResolve {
+                expected: Box::new(rollback_pending.clone()),
+                resolution: rollback_resolution.clone(),
+            },
+        );
+        let encoded = rollback_resolve.encode().expect("rollback resolve frame");
+        assert_eq!(WorkerCommand::decode(&encoded), Ok(rollback_resolve));
+
+        let rollback_resolved = RepairRollbackTransactionStatusPayload::resolved(
+            rollback_pending.rollback_id().clone(),
+            resolved.clone(),
+            rollback_pending.binding().clone(),
+            rollback_resolution,
+        )
+        .expect("resolved rollback");
+        let rollback_lease = RepairRollbackWriteLeasePayload::consumed(
+            rollback_pending.clone(),
+            protocol_sha256([0x33; 32]).expect("rollback boot epoch"),
+        )
+        .expect("rollback lease receipt");
+        for response in [
+            WorkerResponse::repair_rollback_begun(52, rollback_pending.clone()),
+            WorkerResponse::repair_rollback_status(53, None),
+            WorkerResponse::repair_rollback_status(54, Some(rollback_pending)),
+            WorkerResponse::repair_rollback_resolved(56, rollback_resolved),
+            WorkerResponse::repair_rollback_write_lease_consumed(55, rollback_lease),
+        ] {
+            let encoded = response.encode().expect("rollback response frame");
+            assert_eq!(encoded.len(), 4096);
+            assert_eq!(&encoded[..8], b"KRVWR008");
+            assert_eq!(WorkerResponse::decode(&encoded), Ok(response));
+        }
+
         let live_command = WorkerCommand::repair(50, WorkerRepairCommand::VaultLiveParent);
         let encoded = live_command.encode().expect("live Vault parent command");
         assert_eq!(WorkerCommand::decode(&encoded), Ok(live_command));

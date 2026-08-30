@@ -1426,6 +1426,14 @@ impl RepairRollbackBindingV1 {
         source: &RepairTransactionStatusPayload,
     ) -> Result<(), ProtocolViolation> {
         validate_committed_rollback_source(source)?;
+        let source_plan_id = source
+            .backup()
+            .plan_id()
+            .ok_or(ProtocolViolation::InvalidPayload)?;
+        let source_plan_sha256 = source
+            .backup()
+            .plan_sha256()
+            .ok_or(ProtocolViolation::InvalidPayload)?;
         let source_approval_id = source
             .backup()
             .approval_id()
@@ -1448,6 +1456,8 @@ impl RepairRollbackBindingV1 {
             || !valid_prefixed_id(&self.approval_id, "A-")
             || self.plan_sha256.bytes() == [0; 32]
             || self.approval_sha256.bytes() == [0; 32]
+            || self.plan_id == source_plan_id
+            || &self.plan_sha256 == source_plan_sha256
             || self.approval_id == source_approval_id
             || &self.approval_sha256 == source_approval_sha256
             || self.approval_sequence != next_sequence
@@ -2270,7 +2280,7 @@ mod tests {
     }
 
     #[test]
-    fn rollback_child_requires_committed_source_and_fresh_next_approval() {
+    fn rollback_child_requires_committed_source_and_fresh_plan_and_next_approval() {
         let source = committed_status();
         let binding = rollback_binding(&source);
         let pending = RepairRollbackTransactionStatusPayload::pending(
@@ -2289,6 +2299,32 @@ mod tests {
         assert!(!encoded.contains("/mnt/"));
         assert!(!encoded.contains("command"));
 
+        assert!(
+            RepairRollbackBindingV1::new(
+                &source,
+                source.backup().plan_id().expect("source plan"),
+                hash('8'),
+                "A-rollback-1",
+                hash('9'),
+                8,
+            )
+            .is_err()
+        );
+        assert!(
+            RepairRollbackBindingV1::new(
+                &source,
+                "P-rollback-1",
+                source
+                    .backup()
+                    .plan_sha256()
+                    .expect("source plan hash")
+                    .clone(),
+                "A-rollback-1",
+                hash('9'),
+                8,
+            )
+            .is_err()
+        );
         assert!(
             RepairRollbackBindingV1::new(
                 &source,

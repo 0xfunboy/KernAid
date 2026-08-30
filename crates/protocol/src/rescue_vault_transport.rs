@@ -17,12 +17,15 @@
 use crate::rescue_repair_vault::{
     MAX_REPAIR_BACKUP_BYTES, RepairBackupBinding, RepairBackupDraft, RepairBackupReleasePayload,
     RepairBackupState, RepairBackupStatusPayload, RepairExecutionIntentV1, RepairFileMetadataV1,
-    RepairReservationId, RepairTransactionResolution, RepairTransactionStatusPayload,
+    RepairReservationId, RepairRollbackBindingV1, RepairRollbackId, RepairRollbackResolution,
+    RepairRollbackStatusResultPayload, RepairRollbackStatusSelector,
+    RepairRollbackTransactionStatusPayload, RepairRollbackWriteLeasePayload,
+    RepairTransactionResolution, RepairTransactionStatusPayload,
     RepairTransactionStatusResultPayload, RepairTransactionStatusSelector,
     RepairVaultLiveIdentityPayload, RepairWriteLeasePayload,
 };
 use crate::rescue_vault::{
-    API_VERSION, AuditEventType, AuditOutcome, DescriptorDeclaration, DescriptorType, ErrorToken,
+    AuditEventType, AuditOutcome, DescriptorDeclaration, DescriptorType, ErrorToken,
     MAX_AUDIT_SEQUENCE, MAX_DATAGRAM_BYTES, MAX_OPENAI_KEY_BYTES, MAX_PASSPHRASE_BYTES,
     MAX_REPORTS_PER_RESPONSE, MAX_SAFE_JSON_INTEGER, MAX_SESSION_REPORT_JSON_BYTES,
     MAX_SIGNED_REPORT_ENVELOPE_BYTES, MIN_PASSPHRASE_BYTES, Operation, ProtocolViolation, Provider,
@@ -568,6 +571,25 @@ pub enum ClientRequestPayload {
         selector: RepairTransactionStatusSelector,
     },
     #[cfg(feature = "experimental-repair-store")]
+    RepairRollbackBegin {
+        source: Box<RepairTransactionStatusPayload>,
+        rollback_id: RepairRollbackId,
+        binding: RepairRollbackBindingV1,
+    },
+    #[cfg(feature = "experimental-repair-store")]
+    RepairRollbackStatus {
+        selector: RepairRollbackStatusSelector,
+    },
+    #[cfg(feature = "experimental-repair-store")]
+    RepairRollbackResolve {
+        expected: Box<RepairRollbackTransactionStatusPayload>,
+        resolution: RepairRollbackResolution,
+    },
+    #[cfg(feature = "experimental-repair-store")]
+    RepairRollbackWriteLeaseConsume {
+        selector: RepairRollbackStatusSelector,
+    },
+    #[cfg(feature = "experimental-repair-store")]
     RepairVaultLiveParent,
 }
 
@@ -609,6 +631,16 @@ impl ClientRequestPayload {
             Self::RepairTransactionWriteLeaseConsume { .. } => {
                 Operation::RepairTransactionWriteLeaseConsume
             }
+            #[cfg(feature = "experimental-repair-store")]
+            Self::RepairRollbackBegin { .. } => Operation::RepairRollbackBegin,
+            #[cfg(feature = "experimental-repair-store")]
+            Self::RepairRollbackStatus { .. } => Operation::RepairRollbackStatus,
+            #[cfg(feature = "experimental-repair-store")]
+            Self::RepairRollbackResolve { .. } => Operation::RepairRollbackResolve,
+            #[cfg(feature = "experimental-repair-store")]
+            Self::RepairRollbackWriteLeaseConsume { .. } => {
+                Operation::RepairRollbackWriteLeaseConsume
+            }
         }
     }
 
@@ -649,7 +681,11 @@ impl ClientRequestPayload {
             | Self::RepairTransactionStatus { .. }
             | Self::RepairTransactionResolve { .. }
             | Self::RepairVaultLiveParent
-            | Self::RepairTransactionWriteLeaseConsume { .. } => None,
+            | Self::RepairTransactionWriteLeaseConsume { .. }
+            | Self::RepairRollbackBegin { .. }
+            | Self::RepairRollbackStatus { .. }
+            | Self::RepairRollbackResolve { .. }
+            | Self::RepairRollbackWriteLeaseConsume { .. } => None,
         }
     }
 }
@@ -780,6 +816,26 @@ fn valid_client_payload(payload: &ClientRequestPayload) -> bool {
             matches!(selector, RepairTransactionStatusSelector::Exact { .. })
                 && selector.validate().is_ok()
         }
+        #[cfg(feature = "experimental-repair-store")]
+        ClientRequestPayload::RepairRollbackBegin {
+            source, binding, ..
+        } => source.validate().is_ok() && binding.validate_against(source).is_ok(),
+        #[cfg(feature = "experimental-repair-store")]
+        ClientRequestPayload::RepairRollbackStatus { selector } => selector.validate().is_ok(),
+        #[cfg(feature = "experimental-repair-store")]
+        ClientRequestPayload::RepairRollbackResolve {
+            expected,
+            resolution,
+        } => {
+            expected.validate().is_ok()
+                && expected.is_unresolved()
+                && resolution.validate_against(expected.source()).is_ok()
+        }
+        #[cfg(feature = "experimental-repair-store")]
+        ClientRequestPayload::RepairRollbackWriteLeaseConsume { selector } => {
+            matches!(selector, RepairRollbackStatusSelector::Exact { .. })
+                && selector.validate().is_ok()
+        }
     }
 }
 
@@ -895,6 +951,30 @@ struct RepairTransactionStatusRequestPayload<'a> {
 struct RepairTransactionResolveRequestPayload<'a> {
     expected: &'a RepairTransactionStatusPayload,
     resolution: &'a RepairTransactionResolution,
+}
+
+#[cfg(feature = "experimental-repair-store")]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RepairRollbackBeginRequestPayload<'a> {
+    source: &'a RepairTransactionStatusPayload,
+    rollback_id: &'a RepairRollbackId,
+    binding: &'a RepairRollbackBindingV1,
+}
+
+#[cfg(feature = "experimental-repair-store")]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RepairRollbackStatusRequestPayload<'a> {
+    selector: &'a RepairRollbackStatusSelector,
+}
+
+#[cfg(feature = "experimental-repair-store")]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RepairRollbackResolveRequestPayload<'a> {
+    expected: &'a RepairRollbackTransactionStatusPayload,
+    resolution: &'a RepairRollbackResolution,
 }
 
 /// Encodes a typed client request and validates the exact outgoing descriptor
@@ -1055,6 +1135,35 @@ pub fn encode_client_request(
                 resolution,
             },
         ),
+        #[cfg(feature = "experimental-repair-store")]
+        ClientRequestPayload::RepairRollbackBegin {
+            source,
+            rollback_id,
+            binding,
+        } => encode_client_request_payload(
+            request,
+            RepairRollbackBeginRequestPayload {
+                source,
+                rollback_id,
+                binding,
+            },
+        ),
+        #[cfg(feature = "experimental-repair-store")]
+        ClientRequestPayload::RepairRollbackStatus { selector }
+        | ClientRequestPayload::RepairRollbackWriteLeaseConsume { selector } => {
+            encode_client_request_payload(request, RepairRollbackStatusRequestPayload { selector })
+        }
+        #[cfg(feature = "experimental-repair-store")]
+        ClientRequestPayload::RepairRollbackResolve {
+            expected,
+            resolution,
+        } => encode_client_request_payload(
+            request,
+            RepairRollbackResolveRequestPayload {
+                expected,
+                resolution,
+            },
+        ),
     }?;
     if bytes.len() > MAX_DATAGRAM_BYTES {
         return Err(ProtocolViolation::DatagramTooLarge);
@@ -1067,7 +1176,7 @@ fn encode_client_request_payload<T: Serialize>(
     payload: T,
 ) -> Result<Vec<u8>, ProtocolViolation> {
     serde_json::to_vec(&ClientRequestWire {
-        api_version: API_VERSION,
+        api_version: request.operation().api_version(),
         request_id: request.request_id.as_str(),
         expected_state_version: request.expected_state_version,
         operation: request.operation(),
@@ -1376,7 +1485,7 @@ fn validate_response_correlation(
     operation: Operation,
     request: &ClientRequest,
 ) -> Result<(), ClientResponseDecodeError> {
-    if api_version != API_VERSION {
+    if api_version != request.operation().api_version() {
         return Err(ClientResponseDecodeError::UnsupportedVersion);
     }
     if RequestId::parse(request_id).is_err()
@@ -1727,6 +1836,68 @@ fn decode_success_payload(
             }
             Ok(SuccessPayload::RepairWriteLeaseConsumed(Box::new(lease)))
         }
+        #[cfg(feature = "experimental-repair-store")]
+        ClientRequestPayload::RepairRollbackBegin {
+            source,
+            rollback_id,
+            binding,
+        } => {
+            require_no_descriptors(descriptors)?;
+            let status: RepairRollbackTransactionStatusPayload = decode_payload(raw)?;
+            if status.validate().is_err()
+                || status.rollback_id() != rollback_id
+                || status.source() != source.as_ref()
+                || status.binding() != binding
+            {
+                return Err(ClientResponseDecodeError::InvalidPayload);
+            }
+            Ok(SuccessPayload::RepairRollbackBegun(Box::new(status)))
+        }
+        #[cfg(feature = "experimental-repair-store")]
+        ClientRequestPayload::RepairRollbackStatus { selector } => {
+            require_no_descriptors(descriptors)?;
+            let result: RepairRollbackStatusResultPayload = decode_payload(raw)?;
+            if !selector.matches_result(&result) {
+                return Err(ClientResponseDecodeError::InvalidPayload);
+            }
+            Ok(SuccessPayload::RepairRollbackStatus(Box::new(result)))
+        }
+        #[cfg(feature = "experimental-repair-store")]
+        ClientRequestPayload::RepairRollbackResolve {
+            expected,
+            resolution,
+        } => {
+            require_no_descriptors(descriptors)?;
+            let status: RepairRollbackTransactionStatusPayload = decode_payload(raw)?;
+            if status.validate().is_err()
+                || !status.same_transaction(expected)
+                || !status.resolves_with(resolution)
+            {
+                return Err(ClientResponseDecodeError::InvalidPayload);
+            }
+            Ok(SuccessPayload::RepairRollbackResolved(Box::new(status)))
+        }
+        #[cfg(feature = "experimental-repair-store")]
+        ClientRequestPayload::RepairRollbackWriteLeaseConsume { selector } => {
+            require_no_descriptors(descriptors)?;
+            let lease: RepairRollbackWriteLeasePayload = decode_payload(raw)?;
+            if lease.validate().is_err()
+                || !matches!(
+                    selector,
+                    RepairRollbackStatusSelector::Exact {
+                        rollback_id,
+                        rollback_transaction_binding_sha256,
+                    } if lease.transaction().rollback_id() == rollback_id
+                        && lease.transaction().rollback_transaction_binding_sha256()
+                            == rollback_transaction_binding_sha256
+                )
+            {
+                return Err(ClientResponseDecodeError::InvalidPayload);
+            }
+            Ok(SuccessPayload::RepairRollbackWriteLeaseConsumed(Box::new(
+                lease,
+            )))
+        }
     }
 }
 
@@ -1825,6 +1996,9 @@ fn validate_one_descriptor(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rescue_vault::API_VERSION;
+    #[cfg(feature = "experimental-repair-store")]
+    use crate::rescue_vault::ROLLBACK_API_VERSION;
     use rustix::{
         fs::{CWD, Mode, OFlags},
         net::{AddressFamily, SocketFlags, SocketType, socketpair},
@@ -1900,8 +2074,18 @@ mod tests {
         operation: &str,
         payload: &str,
     ) -> Vec<u8> {
+        success_response_with_version(API_VERSION, request_id, state_version, operation, payload)
+    }
+
+    fn success_response_with_version(
+        api_version: &str,
+        request_id: &str,
+        state_version: u64,
+        operation: &str,
+        payload: &str,
+    ) -> Vec<u8> {
         format!(
-            "{{\"apiVersion\":\"{API_VERSION}\",\"requestId\":\"{request_id}\",\"stateVersion\":{state_version},\"operation\":\"{operation}\",\"outcome\":\"ok\",\"payload\":{payload}}}"
+            "{{\"apiVersion\":\"{api_version}\",\"requestId\":\"{request_id}\",\"stateVersion\":{state_version},\"operation\":\"{operation}\",\"outcome\":\"ok\",\"payload\":{payload}}}"
         )
         .into_bytes()
     }
@@ -2528,6 +2712,37 @@ mod tests {
                 ClientRequestPayload::VaultStatus,
             ),
             Err(ProtocolViolation::InvalidPayload)
+        );
+    }
+
+    #[cfg(feature = "experimental-repair-store")]
+    #[test]
+    fn rollback_client_codec_correlates_v1alpha2_end_to_end() {
+        let request = request(ClientRequestPayload::RepairRollbackStatus {
+            selector: RepairRollbackStatusSelector::pending_singleton(),
+        });
+        let encoded = String::from_utf8(
+            encode_client_request(&request, &[]).expect("rollback status request"),
+        )
+        .expect("UTF-8 request");
+        assert!(encoded.contains(ROLLBACK_API_VERSION));
+        assert!(!encoded.contains(API_VERSION));
+
+        let payload = serde_json::to_string(&RepairRollbackStatusResultPayload::absent())
+            .expect("rollback absent JSON");
+        let v2 = success_response_with_version(
+            ROLLBACK_API_VERSION,
+            REQUEST_ID,
+            8,
+            "repair.rollback.status",
+            &payload,
+        );
+        assert!(decode_client_response(&v2, Vec::new(), &request).is_ok());
+
+        let v1 = success_response(REQUEST_ID, 8, "repair.rollback.status", &payload);
+        assert_eq!(
+            decode_client_response(&v1, Vec::new(), &request).err(),
+            Some(ClientResponseDecodeError::UnsupportedVersion)
         );
     }
 

@@ -17,6 +17,9 @@ use crate::{
 };
 #[cfg(feature = "experimental-repair-store")]
 use kernaid_protocol::rescue_repair_vault::{
+    RepairRollbackBindingV1, RepairRollbackId, RepairRollbackResolution,
+    RepairRollbackStatusResultPayload, RepairRollbackStatusSelector,
+    RepairRollbackTransactionStatusPayload, RepairRollbackWriteLeasePayload,
     RepairTransactionResolution, RepairTransactionStatusPayload,
     RepairTransactionStatusResultPayload, RepairTransactionStatusSelector, RepairWriteLeasePayload,
 };
@@ -860,6 +863,150 @@ fn handle_command(
             };
             (response, false)
         }
+        #[cfg(feature = "experimental-repair-store")]
+        Command::RepairRollbackBegin => {
+            if descriptor.is_some() {
+                return (
+                    internal_wire::WorkerResponse::new(request_id, Result::RepairInvalidRequest),
+                    false,
+                );
+            }
+            let Some(internal_wire::WorkerRepairCommand::RollbackBegin {
+                source,
+                rollback_id,
+                binding,
+            }) = command.repair.as_ref()
+            else {
+                return (
+                    internal_wire::WorkerResponse::new(request_id, Result::RepairInvalidRequest),
+                    false,
+                );
+            };
+            let begun = match state {
+                WorkerVaultState::Locked => Err(Result::Busy),
+                WorkerVaultState::Unlocked(_) if validate_no_active_swap().is_err() => {
+                    Err(Result::CleanupFailed)
+                }
+                WorkerVaultState::Unlocked(mounted) => {
+                    begin_repair_rollback(mounted, source, rollback_id.clone(), binding.clone())
+                }
+            };
+            let response = match begun {
+                Ok(status) => {
+                    internal_wire::WorkerResponse::repair_rollback_begun(request_id, status)
+                }
+                Err(code) => internal_wire::WorkerResponse::new(request_id, code),
+            };
+            (response, false)
+        }
+        #[cfg(feature = "experimental-repair-store")]
+        Command::RepairRollbackStatus => {
+            if descriptor.is_some() {
+                return (
+                    internal_wire::WorkerResponse::new(request_id, Result::RepairInvalidRequest),
+                    false,
+                );
+            }
+            let Some(internal_wire::WorkerRepairCommand::RollbackStatus { selector }) =
+                command.repair.as_ref()
+            else {
+                return (
+                    internal_wire::WorkerResponse::new(request_id, Result::RepairInvalidRequest),
+                    false,
+                );
+            };
+            let result = match state {
+                WorkerVaultState::Locked => Err(Result::Busy),
+                WorkerVaultState::Unlocked(_) if validate_no_active_swap().is_err() => {
+                    Err(Result::CleanupFailed)
+                }
+                WorkerVaultState::Unlocked(mounted) => repair_rollback_status(mounted, selector),
+            };
+            let response = match result {
+                Ok(result) => match result.transaction() {
+                    Some(status) => internal_wire::WorkerResponse::repair_rollback_status(
+                        request_id,
+                        Some(status.clone()),
+                    ),
+                    None if matches!(selector, RepairRollbackStatusSelector::PendingSingleton) => {
+                        internal_wire::WorkerResponse::repair_rollback_status(request_id, None)
+                    }
+                    None => {
+                        internal_wire::WorkerResponse::new(request_id, Result::RepairBackupNotFound)
+                    }
+                },
+                Err(code) => internal_wire::WorkerResponse::new(request_id, code),
+            };
+            (response, false)
+        }
+        #[cfg(feature = "experimental-repair-store")]
+        Command::RepairRollbackWriteLeaseConsume => {
+            if descriptor.is_some() {
+                return (
+                    internal_wire::WorkerResponse::new(request_id, Result::RepairInvalidRequest),
+                    false,
+                );
+            }
+            let Some(internal_wire::WorkerRepairCommand::RollbackWriteLeaseConsume { selector }) =
+                command.repair.as_ref()
+            else {
+                return (
+                    internal_wire::WorkerResponse::new(request_id, Result::RepairInvalidRequest),
+                    false,
+                );
+            };
+            let consumed = match state {
+                WorkerVaultState::Locked => Err(Result::Busy),
+                WorkerVaultState::Unlocked(_) if validate_no_active_swap().is_err() => {
+                    Err(Result::CleanupFailed)
+                }
+                WorkerVaultState::Unlocked(mounted) => {
+                    consume_repair_rollback_write_lease(mounted, selector)
+                }
+            };
+            let response = match consumed {
+                Ok(lease) => internal_wire::WorkerResponse::repair_rollback_write_lease_consumed(
+                    request_id, lease,
+                ),
+                Err(code) => internal_wire::WorkerResponse::new(request_id, code),
+            };
+            (response, false)
+        }
+        #[cfg(feature = "experimental-repair-store")]
+        Command::RepairRollbackResolve => {
+            if descriptor.is_some() {
+                return (
+                    internal_wire::WorkerResponse::new(request_id, Result::RepairInvalidRequest),
+                    false,
+                );
+            }
+            let Some(internal_wire::WorkerRepairCommand::RollbackResolve {
+                expected,
+                resolution,
+            }) = command.repair.as_ref()
+            else {
+                return (
+                    internal_wire::WorkerResponse::new(request_id, Result::RepairInvalidRequest),
+                    false,
+                );
+            };
+            let resolved = match state {
+                WorkerVaultState::Locked => Err(Result::Busy),
+                WorkerVaultState::Unlocked(_) if validate_no_active_swap().is_err() => {
+                    Err(Result::CleanupFailed)
+                }
+                WorkerVaultState::Unlocked(mounted) => {
+                    resolve_repair_rollback(mounted, expected, resolution.clone())
+                }
+            };
+            let response = match resolved {
+                Ok(status) => {
+                    internal_wire::WorkerResponse::repair_rollback_resolved(request_id, status)
+                }
+                Err(code) => internal_wire::WorkerResponse::new(request_id, code),
+            };
+            (response, false)
+        }
         #[cfg(feature = "experimental-codex-home-lease")]
         Command::ProviderCodexHomeLease => {
             if descriptor.is_some() || response_descriptor.is_some() {
@@ -1529,6 +1676,61 @@ fn resolve_repair_transaction(
         .open_repair_store()
         .map_err(map_repair_store_error)?
         .resolve_transaction(expected, resolution)
+        .map_err(map_repair_store_error)
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn begin_repair_rollback(
+    mounted: &MountedRescueVault,
+    source: &RepairTransactionStatusPayload,
+    rollback_id: RepairRollbackId,
+    binding: RepairRollbackBindingV1,
+) -> Result<RepairRollbackTransactionStatusPayload, internal_wire::WorkerResultCode> {
+    mounted
+        .secrets()
+        .open_repair_store()
+        .map_err(map_repair_store_error)?
+        .begin_rollback_transaction(source, rollback_id, binding)
+        .map_err(map_repair_store_error)
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn repair_rollback_status(
+    mounted: &MountedRescueVault,
+    selector: &RepairRollbackStatusSelector,
+) -> Result<RepairRollbackStatusResultPayload, internal_wire::WorkerResultCode> {
+    mounted
+        .secrets()
+        .open_repair_store()
+        .map_err(map_repair_store_error)?
+        .rollback_transaction_status(selector)
+        .map_err(map_repair_store_error)
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn consume_repair_rollback_write_lease(
+    mounted: &MountedRescueVault,
+    selector: &RepairRollbackStatusSelector,
+) -> Result<RepairRollbackWriteLeasePayload, internal_wire::WorkerResultCode> {
+    mounted
+        .secrets()
+        .open_repair_store()
+        .map_err(map_repair_store_error)?
+        .consume_rollback_write_lease(selector)
+        .map_err(map_repair_store_error)
+}
+
+#[cfg(feature = "experimental-repair-store")]
+fn resolve_repair_rollback(
+    mounted: &MountedRescueVault,
+    expected: &RepairRollbackTransactionStatusPayload,
+    resolution: RepairRollbackResolution,
+) -> Result<RepairRollbackTransactionStatusPayload, internal_wire::WorkerResultCode> {
+    mounted
+        .secrets()
+        .open_repair_store()
+        .map_err(map_repair_store_error)?
+        .resolve_rollback_transaction(expected, resolution)
         .map_err(map_repair_store_error)
 }
 
