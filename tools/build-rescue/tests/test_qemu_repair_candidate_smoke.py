@@ -723,6 +723,9 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
         self.assertIn(
             "KERNAID_QEMU_REPAIR_FAILURE_PATHS_ATTESTATION_V1", shell
         )
+        self.assertIn(
+            "KERNAID_QEMU_REPAIR_FAILURE_CASE_V1 scenario=%s", shell
+        )
         self.assertIn("isolated_sparse_copies=true", shell)
         self.assertIn("iso_sha256=$iso_sha256", shell)
         self.assertIn("target_raw_immutable=true", shell)

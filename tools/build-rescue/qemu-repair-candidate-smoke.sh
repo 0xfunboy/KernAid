@@ -330,6 +330,8 @@ if [[ "$scenario" == failure-paths ]]; then
     auto-restore
   )
   for failure_case in "${failure_cases[@]}"; do
+    printf 'KERNAID_QEMU_REPAIR_FAILURE_CASE_V1 scenario=%s\n' \
+      "$failure_case" >&2
     case_output="$(
       KERNAID_REPAIR_PROVISIONED_BASE="$rescue_media" \
       KERNAID_REPAIR_PROVISIONED_KEY="$vault_key" \

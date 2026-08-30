@@ -100,6 +100,52 @@ NOT_READY_PREFIX_PATTERN = re.compile(
     rb"(?:^|\r?\n)" + re.escape(NOT_READY_LINE_PREFIX)
 )
 NOT_READY_SCAN_OVERLAP = len(NOT_READY_LINE_PREFIX) + 2
+TAURI_GUEST_FAILURE_STAGES = (
+    b"http",
+    b"x11",
+    b"http-x11",
+    b"socket-offline-inspector",
+    b"socket-application-relay",
+    b"socket-vault",
+    b"socket-openai-executor",
+    b"socket-openai-egress",
+    b"socket-codex",
+    b"socket-native-prompt",
+    b"system-bus",
+    b"probe-mode",
+    b"baseline",
+    b"nonloopback",
+    b"identity",
+    b"pidns",
+    b"session-bus",
+    b"notify",
+    b"window-startup",
+    b"service",
+    b"process-tree",
+    b"process-count",
+    b"process-forbidden",
+    b"process-executable",
+    b"process-ancestry",
+    b"process-metadata-access",
+    b"process-metadata-format",
+    b"process-environ-access",
+    b"process-environ-format",
+    b"renderer",
+    b"window",
+    b"display",
+    b"xauthority",
+    b"run-view",
+    b"devices",
+    b"device-fds",
+    b"proc-alias",
+    b"endpoint-post",
+)
+TAURI_NOT_READY_CONTEXT_PATTERN = re.compile(
+    rb"(?:^|\r?\n)KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=("
+    + rb"|".join(re.escape(stage) for stage in TAURI_GUEST_FAILURE_STAGES)
+    + rb")\r?\n(?:\r?\n)?"
+    + re.escape(NOT_READY_LINE_PREFIX)
+)
 READY_RESULT_PATTERN = re.compile(
     rb"(?:^|\r?\n)(?:"
     + re.escape(READY_LINE)
@@ -2134,7 +2180,12 @@ class SerialConsole:
         raise failure
 
     def _raise_if_not_ready(self, snapshot: bytes) -> None:
-        if NOT_READY_PREFIX_PATTERN.search(snapshot, self._not_ready_scan_start) is not None:
+        not_ready = NOT_READY_PREFIX_PATTERN.search(snapshot, self._not_ready_scan_start)
+        if not_ready is not None:
+            diagnostic = TAURI_NOT_READY_CONTEXT_PATTERN.search(snapshot)
+            if diagnostic is not None and diagnostic.end() == not_ready.end():
+                stage = diagnostic.group(1).decode("ascii")
+                raise ClosedFailure("readiness", f"not-ready-tauri-{stage}")
             raise ClosedFailure("readiness", "not-ready")
         self._not_ready_scan_start = max(0, len(snapshot) - NOT_READY_SCAN_OVERLAP)
 

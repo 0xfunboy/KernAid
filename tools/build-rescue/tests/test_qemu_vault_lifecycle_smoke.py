@@ -34,6 +34,10 @@ VAULT_SERVICE = (
     / "rescue/live-build/config/includes.chroot/etc/systemd/system"
     / "kernaid-rescue-vaultd.service"
 )
+READY_CHECK = (
+    REPO_DIR
+    / "rescue/live-build/config/includes.chroot/usr/lib/kernaid/ready-check"
+)
 
 
 def load_controller() -> object:
@@ -552,6 +556,68 @@ exec /bin/bash --noprofile --norc -i
             os.close(master)
             controller.wipe(credential)
             capture.wipe()
+
+    def test_not_ready_exposes_only_a_contextual_allowlisted_tauri_stage(self) -> None:
+        declared_stages = set(
+            re.findall(
+                rb"KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=([a-z0-9-]+)",
+                READY_CHECK.read_bytes(),
+            )
+        )
+        self.assertEqual(set(controller.TAURI_GUEST_FAILURE_STAGES), declared_stages)
+        private_reason = b"private-reason=must-not-escape"
+        cases = (
+            (
+                b"\r\nKERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=renderer\r\n\r\n",
+                "not-ready-tauri-renderer",
+            ),
+            (
+                b"midline KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=renderer\r\n\r\n",
+                "not-ready",
+            ),
+            (
+                b"\r\nKERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=private-stage\r\n\r\n",
+                "not-ready",
+            ),
+            (
+                b"\r\nKERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage=renderer\r\n"
+                b"unrelated line\r\n",
+                "not-ready",
+            ),
+        )
+        for prefix, expected_code in cases:
+            with self.subTest(expected_code=expected_code, prefix=prefix):
+                master, slave = os.openpty()
+                tty.setraw(slave)
+                capture = controller.BoundedCapture(4096, [])
+                console = controller.SerialConsole(slave, capture, lambda: None)
+                try:
+                    os.write(
+                        master,
+                        prefix
+                        + controller.NOT_READY_LINE_PREFIX
+                        + b" "
+                        + private_reason
+                        + b"\r\n",
+                    )
+                    with self.assertRaises(controller.ClosedFailure) as failure:
+                        console.wait_line(
+                            b"KERNAID_TEST_NEVER_READY",
+                            start=0,
+                            deadline=time.monotonic() + 1.0,
+                            stage="requested",
+                        )
+                    self.assertEqual(
+                        (failure.exception.stage, failure.exception.code),
+                        ("readiness", expected_code),
+                    )
+                    self.assertNotIn(
+                        private_reason.decode("ascii"), str(failure.exception)
+                    )
+                finally:
+                    console.close()
+                    os.close(master)
+                    capture.wipe()
 
     def test_real_pty_ready_then_not_ready_aborts_a_completable_login(self) -> None:
         import select
