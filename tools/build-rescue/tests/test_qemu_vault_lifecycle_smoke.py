@@ -1261,6 +1261,7 @@ class ResponseParserTests(unittest.TestCase):
         self.assertEqual(observed.exception.block_lines, 2)
         self.assertRegex(observed.exception.block_sha256, r"^[0-9a-f]{64}$")
         self.assertEqual(observed.exception.first_class, "kernel-timestamp")
+        self.assertEqual(observed.exception.return_code, 1)
 
         remote = ScriptedConsole(
             transcript.replace(

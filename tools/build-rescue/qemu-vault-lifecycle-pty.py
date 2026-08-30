@@ -346,7 +346,7 @@ class ClosedFailure(Exception):
 class ResponseShapeFailure(ClosedFailure):
     """Closed response-shape evidence without reproducing response bytes."""
 
-    def __init__(self, code: str, block: bytes) -> None:
+    def __init__(self, code: str, block: bytes, return_code: int) -> None:
         lines = _normalize(block)
         first = lines[0] if lines else b""
         if not first:
@@ -365,6 +365,7 @@ class ResponseShapeFailure(ClosedFailure):
         self.block_lines = len(lines)
         self.block_sha256 = hashlib.sha256(block).hexdigest()
         self.first_class = first_class
+        self.return_code = return_code
         super().__init__("response", code)
 
 
@@ -1030,7 +1031,9 @@ def parse_companion_response(
         raise ClosedFailure("response", "command-invalid")
 
     if not lines or re.fullmatch(rb"stateVersion: (0|[1-9][0-9]*)", lines[0]) is None:
-        raise ResponseShapeFailure("version-invalid", b"\n".join(lines))
+        raise ResponseShapeFailure(
+            "version-invalid", b"\n".join(lines), return_code
+        )
     version = int(lines.pop(0).split(b": ", 1)[1])
 
     state: str | None = None

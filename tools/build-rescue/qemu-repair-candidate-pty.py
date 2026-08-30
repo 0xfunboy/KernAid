@@ -1177,6 +1177,53 @@ def provision_firstboot(
     )
 
 
+def run_repair_unlock_companion(
+    console: object,
+    stage: str,
+    cursor: int,
+    aggregate: float,
+    key: bytearray,
+) -> tuple[object, int]:
+    """Recover one known serial-noise shape through a fresh exact status."""
+
+    unlock_stage = f"{stage}-unlock"
+    try:
+        return LIFECYCLE.run_companion(
+            console, "unlock", unlock_stage, cursor, aggregate, key
+        )
+    except LIFECYCLE.ResponseShapeFailure as failure:
+        if not (
+            failure.stage == unlock_stage
+            and failure.code == "response-version-invalid"
+            and type(failure.return_code) is int
+            and failure.return_code == 0
+            and failure.first_class == "kernel-timestamp"
+            and failure.block_lines == 4
+            and 0 < failure.block_bytes <= 512
+        ):
+            raise
+
+    # Do not parse, filter, or trust the contaminated unlock response. Start a
+    # separate framed transaction after everything captured so far and accept
+    # only the production companion's exact unlocked status contract.
+    recovery_cursor = len(console.capture)
+    recovered, recovery_cursor = LIFECYCLE.run_companion(
+        console,
+        "status",
+        f"{unlock_stage}-recovery-status",
+        recovery_cursor,
+        aggregate,
+    )
+    if (
+        recovered.vault_state != "unlocked"
+        or recovered.device_id is None
+        or recovered.error is not None
+        or recovered.return_code != 0
+    ):
+        raise LIFECYCLE.ClosedFailure(unlock_stage, "noise-recovery-invalid")
+    return recovered, recovery_cursor
+
+
 def unlock_repair_vault(
     console: object,
     aggregate: float,
@@ -1194,10 +1241,15 @@ def unlock_repair_vault(
     )
     if initial.vault_state != "locked" or initial.device_id is not None:
         raise LIFECYCLE.ClosedFailure("vault", "initial-status-invalid")
-    unlocked, cursor = LIFECYCLE.run_companion(
-        console, "unlock", f"{stage}-unlock", cursor, aggregate, key
+    unlocked, cursor = run_repair_unlock_companion(
+        console, stage, cursor, aggregate, key
     )
-    if unlocked.vault_state != "unlocked" or unlocked.device_id is None:
+    if (
+        unlocked.state_version != initial.state_version + 2
+        or unlocked.vault_state != "unlocked"
+        or unlocked.device_id is None
+        or LIFECYCLE.DEVICE_ID_RE.fullmatch(unlocked.device_id) is None
+    ):
         raise LIFECYCLE.ClosedFailure("vault", "unlock-invalid")
     return cursor
 

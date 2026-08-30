@@ -34,6 +34,159 @@ TAMPER_SPEC.loader.exec_module(tamper)
 
 
 class QemuRepairCandidateSmokeTests(unittest.TestCase):
+    def test_repair_unlock_recovers_only_via_fresh_exact_status(self) -> None:
+        key = bytearray(b"0" * 64)
+        capture = controller.LIFECYCLE.BoundedCapture(4096, [])
+        capture.append(b"contaminated unlock transaction")
+        console = mock.Mock(capture=capture)
+        noise = controller.LIFECYCLE.ResponseShapeFailure(
+            "version-invalid",
+            b"[  12.000000] kernel notice\n"
+            b"stateVersion: 12\n"
+            b"vaultState: unlocked\n"
+            b"deviceId: KA-0123456789abcdef01234567",
+            0,
+        )
+        noise.stage = "repair-unlock"
+        noise.code = "response-version-invalid"
+        recovered = controller.LIFECYCLE.CompanionResponse(
+            state_version=12,
+            vault_state="unlocked",
+            device_id="KA-0123456789abcdef01234567",
+            error=None,
+            return_code=0,
+        )
+
+        with mock.patch.object(
+            controller.LIFECYCLE,
+            "run_companion",
+            side_effect=[noise, (recovered, 91)],
+        ) as run:
+            observed, cursor = controller.run_repair_unlock_companion(
+                console, "repair", 7, time.monotonic() + 10, key
+            )
+
+        self.assertEqual(observed, recovered)
+        self.assertEqual(cursor, 91)
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(
+            run.call_args_list[0].args[1:4],
+            ("unlock", "repair-unlock", 7),
+        )
+        self.assertEqual(
+            run.call_args_list[1].args[1:4],
+            ("status", "repair-unlock-recovery-status", len(capture)),
+        )
+
+    def test_repair_unlock_noise_recovery_remains_fail_closed(self) -> None:
+        key = bytearray(b"0" * 64)
+        capture = controller.LIFECYCLE.BoundedCapture(4096, [])
+        capture.append(b"contaminated unlock transaction")
+        console = mock.Mock(capture=capture)
+        noise = controller.LIFECYCLE.ResponseShapeFailure(
+            "version-invalid",
+            b"[  12.000000] kernel notice\n"
+            b"stateVersion: 12\n"
+            b"vaultState: unlocked\n"
+            b"deviceId: KA-0123456789abcdef01234567",
+            0,
+        )
+        noise.stage = "repair-unlock"
+        noise.code = "response-version-invalid"
+        still_locked = controller.LIFECYCLE.CompanionResponse(
+            state_version=10,
+            vault_state="locked",
+            device_id=None,
+            error=None,
+            return_code=0,
+        )
+
+        with mock.patch.object(
+            controller.LIFECYCLE,
+            "run_companion",
+            side_effect=[noise, (still_locked, 91)],
+        ):
+            with self.assertRaises(controller.LIFECYCLE.ClosedFailure) as observed:
+                controller.run_repair_unlock_companion(
+                    console, "repair", 7, time.monotonic() + 10, key
+                )
+
+        self.assertEqual(observed.exception.stage, "repair-unlock")
+        self.assertEqual(observed.exception.code, "noise-recovery-invalid")
+
+        noise.return_code = 1
+        with mock.patch.object(
+            controller.LIFECYCLE,
+            "run_companion",
+            side_effect=noise,
+        ) as run:
+            with self.assertRaises(controller.LIFECYCLE.ResponseShapeFailure):
+                controller.run_repair_unlock_companion(
+                    console, "repair", 7, time.monotonic() + 10, key
+                )
+        self.assertEqual(run.call_count, 1)
+
+    def test_repair_unlock_requires_exact_state_transition(self) -> None:
+        key = bytearray(b"0" * 64)
+        console = mock.Mock()
+        initial = controller.LIFECYCLE.CompanionResponse(
+            state_version=10,
+            vault_state="locked",
+            device_id=None,
+            error=None,
+            return_code=0,
+        )
+
+        for version, succeeds in ((12, True), (11, False)):
+            unlocked = controller.LIFECYCLE.CompanionResponse(
+                state_version=version,
+                vault_state="unlocked",
+                device_id="KA-0123456789abcdef01234567",
+                error=None,
+                return_code=0,
+            )
+            with self.subTest(version=version), mock.patch.object(
+                controller.LIFECYCLE,
+                "establish_live_session",
+                return_value=3,
+            ), mock.patch.object(
+                controller.LIFECYCLE,
+                "collect_runtime",
+                return_value=(mock.Mock(), 5),
+            ), mock.patch.object(
+                controller.LIFECYCLE,
+                "run_companion",
+                return_value=(initial, 7),
+            ), mock.patch.object(
+                controller,
+                "run_repair_unlock_companion",
+                return_value=(unlocked, 9),
+            ):
+                if succeeds:
+                    self.assertEqual(
+                        controller.unlock_repair_vault(
+                            console,
+                            time.monotonic() + 10,
+                            bytearray(b"login"),
+                            key,
+                            stage="repair",
+                        ),
+                        9,
+                    )
+                else:
+                    with self.assertRaises(
+                        controller.LIFECYCLE.ClosedFailure
+                    ) as observed:
+                        controller.unlock_repair_vault(
+                            console,
+                            time.monotonic() + 10,
+                            bytearray(b"login"),
+                            key,
+                            stage="repair",
+                        )
+                    self.assertEqual(observed.exception.stage, "vault")
+                    self.assertEqual(observed.exception.code, "unlock-invalid")
+
     def test_gate_uses_only_two_explicit_disposable_qemu_backing_files(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")
         self.assertIn('rescue_media="$work_dir/rescue-usb.raw"', source)
