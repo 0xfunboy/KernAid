@@ -1442,6 +1442,19 @@ def relay_repair_request(
         REPAIR_RELAY_LOCK.release()
 
 
+def require_unlocked_repair_vault(deadline: float) -> None:
+    """Keep a locked Vault from activating repaird's recovery barrier."""
+
+    try:
+        status = _application_status(deadline)
+    except ApplicationRelayError as error:
+        if error.code == "TIMEOUT" and error.status == 504:
+            raise RepairRelayError("timeout", 504) from error
+        raise RepairRelayError("relay-unavailable", 503) from error
+    if status["payload"]["vaultState"] != "unlocked":
+        raise RepairRelayError("relay-unavailable", 503)
+
+
 # KERNAID_REPAIR_CANDIDATE_END
 def _remaining_seconds(deadline: float | None) -> float | None:
     """Return the remaining monotonic budget, or fail once it is exhausted."""
@@ -3178,9 +3191,11 @@ class RescueHandler(SimpleHTTPRequestHandler):
             return True
         try:
             request = self._repair_post_body()
+            deadline = time.monotonic() + REPAIR_REQUEST_DEADLINE_SECONDS
+            require_unlocked_repair_vault(deadline)
             response = relay_repair_request(
                 request,
-                time.monotonic() + REPAIR_REQUEST_DEADLINE_SECONDS,
+                deadline,
             )
             status = 200
             if response.get("outcome") == "error":

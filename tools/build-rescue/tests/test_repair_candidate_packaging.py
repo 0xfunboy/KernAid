@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import importlib.util
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 
 REPO = Path(__file__).resolve().parents[3]
@@ -12,6 +14,21 @@ BUILD = REPO / "tools/build-rescue/build.sh"
 HOOK = REPO / "rescue/live-build/config/hooks/live/0100-kernaid-safety.hook.chroot"
 WORKFLOW = REPO / ".github/workflows/rescue-repair-candidate.yml"
 PHYSICAL_PARENT = REPO / "crates/broker/src/target_physical_parent.rs"
+RESCUE_SERVER = (
+    LIVE / "usr/lib/kernaid/rescue_server.py"
+)
+
+
+def load_module(name: str, path: Path):
+    specification = importlib.util.spec_from_file_location(name, path)
+    if specification is None or specification.loader is None:
+        raise AssertionError(f"cannot load {path}")
+    module = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(module)
+    return module
+
+
+rescue_server = load_module("kernaid_repair_candidate_packaging", RESCUE_SERVER)
 
 
 def unit_directives(path: Path) -> dict[str, dict[str, list[str]]]:
@@ -32,6 +49,44 @@ def unit_directives(path: Path) -> dict[str, dict[str, list[str]]]:
 
 
 class RepairCandidatePackagingTests(unittest.TestCase):
+    def test_vault_gate_preserves_timeout_and_closes_other_failures(self) -> None:
+        cases = (
+            ("TIMEOUT", 504, "timeout", 504),
+            ("UNAVAILABLE", 503, "relay-unavailable", 503),
+        )
+        for source_code, source_status, expected_code, expected_status in cases:
+            with self.subTest(source_code=source_code):
+                failure = rescue_server.ApplicationRelayError(
+                    source_code, source_status
+                )
+                with patch.object(
+                    rescue_server, "_application_status", side_effect=failure
+                ):
+                    with self.assertRaises(
+                        rescue_server.RepairRelayError
+                    ) as raised:
+                        rescue_server.require_unlocked_repair_vault(1.0)
+                self.assertEqual(raised.exception.code, expected_code)
+                self.assertEqual(raised.exception.status, expected_status)
+
+    def test_locked_vault_cannot_activate_the_repair_recovery_barrier(self) -> None:
+        source = RESCUE_SERVER.read_text(encoding="utf-8")
+        gate = source.index("def require_unlocked_repair_vault(")
+        handler = source.index("def _handle_repair_post(")
+        status_call = source.index("status = _application_status(deadline)", gate)
+        locked_check = source.index(
+            'status["payload"]["vaultState"] != "unlocked"', gate
+        )
+        require = source.index("require_unlocked_repair_vault(deadline)", handler)
+        relay = source.index("response = relay_repair_request(", handler)
+        self.assertLess(gate, handler)
+        self.assertLess(status_call, locked_check)
+        self.assertLess(require, relay)
+        self.assertIn(
+            'raise RepairRelayError("relay-unavailable", 503)',
+            source[gate:handler],
+        )
+
     def test_candidate_workflow_is_manual_isolated_and_publishes_only_iso(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("on:\n  workflow_dispatch:\n", workflow)

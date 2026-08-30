@@ -437,7 +437,8 @@ APPLY_CONFIRMATION="DISABILITA VOCE FSTAB"
 ROLLBACK_CONFIRMATION="RIPRISTINA FSTAB ORIGINALE"
 counter=0
 checkpoint="service-ready"
-CHECKPOINTS=("service-ready","inventory-ready","target-selection","target-identity","apply-prepare","apply-prepare-terminal","apply-contract","apply-approve","apply-terminal","apply-terminal-contract","rollback-status","rollback-prepare","rollback-prepare-terminal","rollback-contract","rollback-approve","rollback-terminal","rollback-terminal-contract")
+CHECKPOINTS=("service-ready","service-ready-transport","service-ready-http","service-ready-response-invalid","service-ready-non-idle","inventory-ready","target-selection","target-identity","apply-prepare","apply-prepare-terminal","apply-contract","apply-approve","apply-terminal","apply-terminal-contract","rollback-status","rollback-prepare","rollback-prepare-terminal","rollback-contract","rollback-approve","rollback-terminal","rollback-terminal-contract")
+STATES=("idle","preparing","prepared","executing","succeeded","restored","cancelled","manual-reconciliation-required","failed")
 def request_id():
     global counter
     counter+=1
@@ -446,28 +447,56 @@ def valid_hex(value,prefix):
     return isinstance(value,str) and value.startswith(prefix) and len(value)==len(prefix)+32 and all(character in "0123456789abcdef" for character in value[len(prefix):])
 def valid_hash(value):
     return isinstance(value,str) and value.startswith("sha256:") and len(value)==71 and all(character in "0123456789abcdef" for character in value[7:])
-def http(path,body=None,timeout=25):
+def exchange(path,body=None,timeout=25):
     encoded=None if body is None else json.dumps(body,ensure_ascii=True,separators=(",",":")).encode("ascii")
     headers={"Host":HOST}
     if encoded is not None:
         headers.update({"Origin":ORIGIN,"Content-Type":"application/json"})
     connection=http.client.HTTPConnection("127.0.0.1",4173,timeout=timeout)
-    connection.request("GET" if encoded is None else "POST",path,body=encoded,headers=headers)
-    response=connection.getresponse()
-    payload=response.read(65537)
-    status=response.status
-    connection.close()
+    try:
+        connection.request("GET" if encoded is None else "POST",path,body=encoded,headers=headers)
+        response=connection.getresponse()
+        payload=response.read(65537)
+        status=response.status
+    finally:
+        connection.close()
+    return status,payload
+def decode(payload):
     if len(payload)>65536:
         raise RuntimeError()
-    return status,json.loads(payload)
+    return json.loads(payload)
+def http(path,body=None,timeout=25):
+    status,payload=exchange(path,body,timeout)
+    return status,decode(payload)
+def valid_response(value,api,operation,request):
+    return isinstance(value,dict) and set(value)=={"apiVersion","requestId","operation","outcome","stateVersion","state","detail"} and value.get("apiVersion")==api and value.get("requestId")==request["requestId"] and value.get("operation")==operation and value.get("outcome")=="ok" and type(value.get("stateVersion")) is int and value.get("stateVersion")>=1 and value.get("state") in STATES and (value.get("detail") is None or isinstance(value.get("detail"),dict))
 def repair(api,operation,extra=None):
     request={"apiVersion":api,"requestId":request_id(),"operation":operation}
     if extra is not None:
         request.update(extra)
     status,value=http("/api/rescue/repair",request)
-    if status!=200 or not isinstance(value,dict) or set(value)!={"apiVersion","requestId","operation","outcome","stateVersion","state","detail"} or value.get("apiVersion")!=api or value.get("requestId")!=request["requestId"] or value.get("operation")!=operation or value.get("outcome")!="ok" or isinstance(value.get("stateVersion"),bool) or not isinstance(value.get("stateVersion"),int):
+    if status!=200 or not valid_response(value,api,operation,request):
         raise RuntimeError()
     return value
+def service_ready():
+    request={"apiVersion":APPLY_API,"requestId":request_id(),"operation":"repair.status"}
+    try:
+        status,payload=exchange("/api/rescue/repair",request)
+    except (OSError,http.client.HTTPException):
+        return "service-ready-transport"
+    except BaseException:
+        return "service-ready-response-invalid"
+    if status!=200:
+        return "service-ready-http"
+    try:
+        value=decode(payload)
+    except BaseException:
+        return "service-ready-response-invalid"
+    if not valid_response(value,APPLY_API,"repair.status",request):
+        return "service-ready-response-invalid"
+    if value["state"]=="idle":
+        return None
+    return "service-ready-non-idle"
 def wait(api,operation,states,deadline):
     while time.monotonic()<deadline:
         value=repair(api,operation)
@@ -483,12 +512,11 @@ def fail(value):
 try:
     deadline=time.monotonic()+840
     while True:
-        try:
-            if repair(APPLY_API,"repair.status").get("state")=="idle":
-                break
-        except BaseException:
-            pass
+        service_ready_checkpoint=service_ready()
+        if service_ready_checkpoint is None:
+            break
         if time.monotonic()>=deadline:
+            checkpoint=service_ready_checkpoint
             raise RuntimeError()
         time.sleep(.5)
     checkpoint="inventory-ready"

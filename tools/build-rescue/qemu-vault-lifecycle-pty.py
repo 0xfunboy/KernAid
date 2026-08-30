@@ -228,6 +228,10 @@ PROVIDER_PROOF_REPAIR_CHECKPOINTS = (
 )
 PROVIDER_PROOF_ROLLBACK_CHECKPOINTS = (
     "service-ready",
+    "service-ready-transport",
+    "service-ready-http",
+    "service-ready-response-invalid",
+    "service-ready-non-idle",
     "inventory-ready",
     "target-selection",
     "target-identity",

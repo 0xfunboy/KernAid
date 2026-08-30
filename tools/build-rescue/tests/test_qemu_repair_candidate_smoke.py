@@ -218,8 +218,33 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
             b"KERNAID_QEMU_PROVIDER_PROOF_FAILURE_V1 stage=repair-rollback checkpoint=",
             generated,
         )
+        service_ready_checkpoints = {
+            "service-ready-transport",
+            "service-ready-http",
+            "service-ready-response-invalid",
+            "service-ready-non-idle",
+        }
+        self.assertTrue(
+            service_ready_checkpoints.issubset(
+                controller.LIFECYCLE.PROVIDER_PROOF_ROLLBACK_CHECKPOINTS
+            )
+        )
         for checkpoint in controller.LIFECYCLE.PROVIDER_PROOF_ROLLBACK_CHECKPOINTS:
             self.assertIn(checkpoint.encode("ascii"), generated)
+        self.assertIn(
+            b'except (OSError,http.client.HTTPException):\n        return "service-ready-transport"',
+            generated,
+        )
+        self.assertIn(b'if status!=200:\n        return "service-ready-http"', generated)
+        self.assertIn(
+            b'if not valid_response(value,APPLY_API,"repair.status",request):\n        return "service-ready-response-invalid"',
+            generated,
+        )
+        self.assertIn(
+            b'if value["state"]=="idle":\n        return None\n    return "service-ready-non-idle"',
+            generated,
+        )
+        self.assertIn(b"checkpoint=service_ready_checkpoint", generated)
         self.assertIn("timeout=900.0", CONTROLLER.read_text(encoding="utf-8"))
 
         for required in (
