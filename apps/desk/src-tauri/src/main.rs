@@ -23,26 +23,28 @@ use secure_runtime::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::fs;
 #[cfg(target_os = "linux")]
 use std::fs::File;
 #[cfg(unix)]
-use std::os::unix::process::CommandExt;
+use std::os::unix::{fs::DirBuilderExt, process::CommandExt};
 #[cfg(unix)]
 use std::process::Child;
 #[cfg(target_os = "linux")]
-use std::sync::atomic::{AtomicU8, Ordering};
-#[cfg(target_os = "macos")]
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::AtomicU8;
 use std::{
     collections::HashMap,
+    ffi::{OsStr, OsString},
     io::{self, Read},
-    process::{ChildStderr, ChildStdout, Command, ExitStatus, Stdio},
+    path::PathBuf,
+    process::{self, ChildStderr, ChildStdout, Command, ExitStatus, Stdio},
     sync::{
         Mutex, MutexGuard,
+        atomic::{AtomicU64, Ordering},
         mpsc::{self, Receiver},
     },
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::{Manager, State};
 
@@ -53,6 +55,10 @@ const QUALIFIED_WINDOWS_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 #[cfg(any(target_os = "macos", test))]
 const QUALIFIED_MACOS_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_BROKER_SESSIONS: usize = 1_024;
+const QUALIFIED_FIRST_LAUNCH_PROBE_FLAG: &str = "--qualified-first-launch-probe";
+const QUALIFIED_FIRST_LAUNCH_OK: &str = "KERNAID_QUALIFIED_FIRST_LAUNCH_PROBE_OK_V1";
+const QUALIFIED_FIRST_LAUNCH_FAILED: &str = "KERNAID_QUALIFIED_FIRST_LAUNCH_PROBE_FAILED_V1";
+static QUALIFIED_FIRST_LAUNCH_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "linux")]
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 #[cfg(target_os = "linux")]
@@ -1780,7 +1786,77 @@ macro_rules! active_invoke_handler {
     };
 }
 
-fn main() {
+fn qualified_first_launch_probe_requested(
+    arguments: impl IntoIterator<Item = OsString>,
+) -> Result<bool, ()> {
+    let arguments = arguments.into_iter().collect::<Vec<_>>();
+    let flag = OsStr::new(QUALIFIED_FIRST_LAUNCH_PROBE_FLAG);
+    if arguments.len() == 1 && arguments[0] == flag {
+        return Ok(true);
+    }
+    if arguments.iter().any(|argument| argument == flag) {
+        return Err(());
+    }
+    Ok(false)
+}
+
+fn create_qualified_first_launch_directory() -> Result<PathBuf, ()> {
+    let base = std::env::temp_dir();
+    let process_id = process::id();
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| ())?
+        .as_nanos();
+    let sequence = QUALIFIED_FIRST_LAUNCH_DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    for attempt in 0_u8..32 {
+        let mut hasher = Sha256::new();
+        hasher.update(b"KERNAID_QUALIFIED_FIRST_LAUNCH_DIRECTORY_V1\0");
+        hasher.update(process_id.to_le_bytes());
+        hasher.update(timestamp.to_le_bytes());
+        hasher.update(sequence.to_le_bytes());
+        hasher.update([attempt]);
+        let suffix = format!("{:x}", hasher.finalize());
+        let path = base.join(format!(".kernaid-qualified-first-launch-{}", &suffix[..32]));
+        #[cfg(unix)]
+        let created = fs::DirBuilder::new().mode(0o700).create(&path);
+        #[cfg(not(unix))]
+        let created = fs::create_dir(&path);
+        match created {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return Err(()),
+        }
+    }
+    Err(())
+}
+
+fn stable_repair_surface_is_absent() -> bool {
+    !cfg!(feature = "fixture-repair-lab")
+}
+
+fn run_qualified_first_launch_probe() -> Result<(), ()> {
+    if !stable_repair_surface_is_absent() {
+        return Err(());
+    }
+    let directory = create_qualified_first_launch_directory()?;
+    let result = (|| {
+        let runtime =
+            SecureRuntime::open_qualified_first_launch_probe(&directory).map_err(|_| ())?;
+        let status = runtime.qualified_first_launch_status().map_err(|_| ())?;
+        if !status.is_readable_for_qualified_first_launch() {
+            return Err(());
+        }
+        drop(runtime);
+        Ok(())
+    })();
+    let cleaned = fs::remove_dir_all(&directory).is_ok();
+    if result.is_err() || !cleaned {
+        return Err(());
+    }
+    Ok(())
+}
+
+fn run_gui() {
     tauri::Builder::default()
         .manage(ObserveBrokers::default())
         .setup(|app| {
@@ -1797,6 +1873,23 @@ fn main() {
         .expect("failed to run KernAid Desk");
 }
 
+fn main() {
+    match qualified_first_launch_probe_requested(std::env::args_os().skip(1)) {
+        Ok(false) => run_gui(),
+        Ok(true) => match run_qualified_first_launch_probe() {
+            Ok(()) => println!("{QUALIFIED_FIRST_LAUNCH_OK}"),
+            Err(()) => {
+                eprintln!("{QUALIFIED_FIRST_LAUNCH_FAILED}");
+                process::exit(1);
+            }
+        },
+        Err(()) => {
+            eprintln!("{QUALIFIED_FIRST_LAUNCH_FAILED}");
+            process::exit(2);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1805,6 +1898,68 @@ mod tests {
     const LINUX_SNAPSHOT_GOLDEN: &[u8] = include_bytes!(
         "../../../../tests/fixtures/linux-normalized-snapshot/expected/snapshot.v1.json"
     );
+
+    #[test]
+    fn qualified_first_launch_flag_is_exact_and_standalone() {
+        assert_eq!(
+            qualified_first_launch_probe_requested(Vec::<OsString>::new()),
+            Ok(false)
+        );
+        assert_eq!(
+            qualified_first_launch_probe_requested([OsString::from(
+                QUALIFIED_FIRST_LAUNCH_PROBE_FLAG,
+            )]),
+            Ok(true)
+        );
+        assert_eq!(
+            qualified_first_launch_probe_requested([
+                OsString::from(QUALIFIED_FIRST_LAUNCH_PROBE_FLAG),
+                OsString::from("unexpected"),
+            ]),
+            Err(())
+        );
+        assert_eq!(
+            qualified_first_launch_probe_requested([
+                OsString::from("unexpected"),
+                OsString::from(QUALIFIED_FIRST_LAUNCH_PROBE_FLAG),
+            ]),
+            Err(())
+        );
+        assert_eq!(
+            qualified_first_launch_probe_requested([OsString::from("--other")]),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn qualified_first_launch_directory_is_private_and_disposable() {
+        let path = create_qualified_first_launch_directory().expect("private probe directory");
+        let metadata = fs::symlink_metadata(&path).expect("probe directory metadata");
+        assert!(metadata.is_dir());
+        assert!(!metadata.file_type().is_symlink());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            assert_eq!(metadata.permissions().mode() & 0o7777, 0o700);
+        }
+        fs::remove_dir(&path).expect("remove empty probe directory");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn qualified_first_launch_probe_rejects_repair_feature_builds() {
+        assert_eq!(
+            stable_repair_surface_is_absent(),
+            !cfg!(feature = "fixture-repair-lab")
+        );
+    }
+
+    #[cfg(not(feature = "fixture-repair-lab"))]
+    #[test]
+    fn qualified_first_launch_probe_initializes_and_cleans_ephemeral_runtime() {
+        assert_eq!(run_qualified_first_launch_probe(), Ok(()));
+    }
 
     #[cfg(target_os = "linux")]
     fn linux_snapshot_ipc_request(

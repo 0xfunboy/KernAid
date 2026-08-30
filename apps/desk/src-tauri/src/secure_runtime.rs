@@ -7,7 +7,10 @@ use kernaid_device_identity::{
 use kernaid_native_secrets::{
     NativeDeviceIdentityStore, NativeJournalSecretStore, NativeJournalState, NativeSecretError,
 };
-use kernaid_storage::{JournalAnchor, SecureJournal};
+use kernaid_storage::{
+    JOURNAL_KEY_BYTES, JournalAnchor, JournalKey, JournalSecretStore, SecretStoreError,
+    SecureJournal,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -21,6 +24,7 @@ use std::{
     sync::{Mutex, MutexGuard},
 };
 use tauri::State;
+use zeroize::Zeroizing;
 
 #[cfg(unix)]
 use rustix::{
@@ -73,7 +77,63 @@ impl fmt::Display for RuntimeInitError {
 
 impl Error for RuntimeInitError {}
 
-type ResidentJournal = SecureJournal<NativeJournalSecretStore>;
+type ResidentJournal = SecureJournal<ResidentJournalSecretStore>;
+
+enum ResidentJournalSecretStore {
+    Native(NativeJournalSecretStore),
+    QualifiedFirstLaunch(QualifiedFirstLaunchSecretStore),
+}
+
+#[derive(Default)]
+struct QualifiedFirstLaunchSecretStore {
+    key: Option<Zeroizing<[u8; JOURNAL_KEY_BYTES]>>,
+    anchor: Option<JournalAnchor>,
+}
+
+impl JournalSecretStore for ResidentJournalSecretStore {
+    fn load_key(&mut self) -> Result<Option<JournalKey>, SecretStoreError> {
+        match self {
+            Self::Native(store) => store.load_key(),
+            Self::QualifiedFirstLaunch(store) => Ok(store
+                .key
+                .as_ref()
+                .map(|key| JournalKey::from_zeroizing(Zeroizing::new(**key)))),
+        }
+    }
+
+    fn store_key(&mut self, key: &JournalKey) -> Result<(), SecretStoreError> {
+        match self {
+            Self::Native(store) => store.store_key(key),
+            Self::QualifiedFirstLaunch(store) => {
+                store.key = Some(Zeroizing::new(*key.expose_secret()));
+                Ok(())
+            }
+        }
+    }
+
+    fn load_anchor(&mut self) -> Result<Option<JournalAnchor>, SecretStoreError> {
+        match self {
+            Self::Native(store) => store.load_anchor(),
+            Self::QualifiedFirstLaunch(store) => Ok(store.anchor),
+        }
+    }
+
+    fn store_anchor(&mut self, anchor: &JournalAnchor) -> Result<(), SecretStoreError> {
+        match self {
+            Self::Native(store) => store.store_anchor(anchor),
+            Self::QualifiedFirstLaunch(store) => {
+                store.anchor = Some(*anchor);
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SecureRuntimeOpenMode {
+    Resident,
+    QualifiedFirstLaunchProbe,
+}
 
 enum AuditRuntimeState {
     Secure {
@@ -264,12 +324,36 @@ enum ValidatedRecordKind {
 
 impl SecureRuntime {
     pub fn open(app_data_directory: &Path) -> Result<Self, RuntimeInitError> {
+        Self::open_with_mode(app_data_directory, SecureRuntimeOpenMode::Resident)
+    }
+
+    pub(crate) fn open_qualified_first_launch_probe(
+        app_data_directory: &Path,
+    ) -> Result<Self, RuntimeInitError> {
+        Self::open_with_mode(
+            app_data_directory,
+            SecureRuntimeOpenMode::QualifiedFirstLaunchProbe,
+        )
+    }
+
+    fn open_with_mode(
+        app_data_directory: &Path,
+        mode: SecureRuntimeOpenMode,
+    ) -> Result<Self, RuntimeInitError> {
         ensure_secure_directory(app_data_directory)?;
         let instance_lock = open_instance_lock(&app_data_directory.join(INSTANCE_LOCK_FILE_NAME))?;
         let journal_path = app_data_directory.join(JOURNAL_FILE_NAME);
         let journal_file_seen = fs::symlink_metadata(&journal_path).is_ok();
-        let mut audit = open_audit_state(&journal_path);
-        let mut identity = open_identity_state();
+        let mut audit = match mode {
+            SecureRuntimeOpenMode::Resident => open_audit_state(&journal_path),
+            SecureRuntimeOpenMode::QualifiedFirstLaunchProbe => {
+                open_qualified_first_launch_audit_state(&journal_path)
+            }
+        };
+        let mut identity = match mode {
+            SecureRuntimeOpenMode::Resident => open_identity_state(),
+            SecureRuntimeOpenMode::QualifiedFirstLaunchProbe => IdentityRuntimeState::Unavailable,
+        };
         let mut persistent_audit_started = matches!(
             &audit,
             AuditRuntimeState::Secure { head, .. } if head.sequence > 0
@@ -292,6 +376,20 @@ impl SecureRuntime {
             }),
             _instance_lock: instance_lock,
         })
+    }
+
+    pub(crate) fn qualified_first_launch_status(&self) -> Result<SecureRuntimeStatus, String> {
+        let inner = lock_runtime(self)?;
+        Ok(runtime_status(&inner))
+    }
+}
+
+impl SecureRuntimeStatus {
+    pub(crate) fn is_readable_for_qualified_first_launch(&self) -> bool {
+        self.schema_version == AUDIT_SCHEMA_VERSION
+            && matches!(self.audit, "secure" | "unavailable")
+            && matches!(self.signing, "ready" | "uninitialized" | "unavailable")
+            && (self.signing == "ready") == self.device_id.is_some()
     }
 }
 
@@ -712,6 +810,23 @@ fn open_audit_state(path: &Path) -> AuditRuntimeState {
             Err(_) => return AuditRuntimeState::Blocked,
         }
     }
+    let mut journal = match SecureJournal::open(path, ResidentJournalSecretStore::Native(store)) {
+        Ok(journal) => journal,
+        Err(_) => return AuditRuntimeState::Blocked,
+    };
+    match journal.head() {
+        Ok(head) => AuditRuntimeState::Secure {
+            journal: Box::new(journal),
+            head,
+        },
+        Err(_) => AuditRuntimeState::Blocked,
+    }
+}
+
+fn open_qualified_first_launch_audit_state(path: &Path) -> AuditRuntimeState {
+    let store = ResidentJournalSecretStore::QualifiedFirstLaunch(
+        QualifiedFirstLaunchSecretStore::default(),
+    );
     let mut journal = match SecureJournal::open(path, store) {
         Ok(journal) => journal,
         Err(_) => return AuditRuntimeState::Blocked,
@@ -1772,6 +1887,32 @@ mod tests {
     };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn qualified_first_launch_status_accepts_only_readable_non_blocked_states() {
+        let status = |audit, signing, device_id| SecureRuntimeStatus {
+            schema_version: AUDIT_SCHEMA_VERSION,
+            audit,
+            signing,
+            persistent_audit_started: false,
+            device_id,
+        };
+        assert!(status("secure", "uninitialized", None).is_readable_for_qualified_first_launch());
+        assert!(
+            status("unavailable", "unavailable", None).is_readable_for_qualified_first_launch()
+        );
+        assert!(
+            status(
+                "secure",
+                "ready",
+                Some("KA-0123456789abcdef01234567".to_owned())
+            )
+            .is_readable_for_qualified_first_launch()
+        );
+        assert!(!status("blocked", "unavailable", None).is_readable_for_qualified_first_launch());
+        assert!(!status("secure", "blocked", None).is_readable_for_qualified_first_launch());
+        assert!(!status("secure", "ready", None).is_readable_for_qualified_first_launch());
+    }
 
     struct TestDirectory(PathBuf);
 

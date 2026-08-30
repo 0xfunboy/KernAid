@@ -2294,7 +2294,6 @@ dependencies = [
  "process-wrap",
  "regex",
  "reqwest",
- "rpassword",
  "rustix",
  "rustls",
  "serde",
@@ -2405,6 +2404,15 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+]
+
+[[package]]
+name = "kernaid-provider-key"
+version = "0.1.0"
+dependencies = [
+ "kernaid-desk-shell",
+ "rpassword",
+ "zeroize",
 ]
 
 [[package]]

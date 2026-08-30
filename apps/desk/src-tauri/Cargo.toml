@@ -23,7 +23,6 @@ fs2 = "0.4.3"
 dirs = "6.0.0"
 regex = "1.13"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls-no-provider"] }
-rpassword = "7.4"
 rustls = { version = "0.23.43", default-features = false, features = ["ring", "std"] }
 tokio = { version = "1.53", features = ["macros", "sync", "time"] }
 zeroize = "1.8"

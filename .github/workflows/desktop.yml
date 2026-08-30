@@ -37,24 +37,28 @@ jobs:
             name: linux-x86_64
             args: ""
             targets: ""
+            bundle_root: target/release/bundle
             companion: target/release/kernaid-provider-key
             companion_upload: kernaid-provider-key-linux-x86_64.tar.gz
           - platform: windows-latest
             name: windows-x86_64
             args: ""
             targets: ""
+            bundle_root: target/release/bundle
             companion: target/release/kernaid-provider-key.exe
             companion_upload: target/release/kernaid-provider-key.exe
           - platform: macos-latest
             name: macos-aarch64
             args: --target aarch64-apple-darwin
             targets: aarch64-apple-darwin
+            bundle_root: target/aarch64-apple-darwin/release/bundle
             companion: target/aarch64-apple-darwin/release/kernaid-provider-key
             companion_upload: kernaid-provider-key-macos-aarch64.tar.gz
           - platform: macos-latest
             name: macos-x86_64
             args: --target x86_64-apple-darwin
             targets: x86_64-apple-darwin
+            bundle_root: target/x86_64-apple-darwin/release/bundle
             companion: target/x86_64-apple-darwin/release/kernaid-provider-key
             companion_upload: kernaid-provider-key-macos-x86_64.tar.gz
     runs-on: ${{ matrix.platform }}
@@ -70,7 +74,7 @@ jobs:
           targets: ${{ matrix.targets }}
       - name: Install Linux prerequisites
         if: matrix.platform == 'ubuntu-24.04'
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libdbus-1-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf procps util-linux
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libdbus-1-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf procps rpm squashfs-tools util-linux
       - run: pnpm install --frozen-lockfile
       - name: Generate platform icons
         run: pnpm --filter @kernaid/desk tauri icon icon.svg
@@ -78,19 +82,20 @@ jobs:
         if: matrix.name == 'linux-x86_64'
         shell: bash
         run: ./tests/integration/run-linux-snapshot-resident-ipc-ci.sh
-      - name: Test Resident OpenAI and credential companion boundaries
+      - name: Test packaged bootstrap, Resident OpenAI and credential companion boundaries
         if: matrix.name != 'macos-x86_64'
         shell: bash
         run: |
+          cargo test --locked -p kernaid-desk-shell qualified_first_launch -- --nocapture
           cargo test --locked -p kernaid-desk-shell resident_openai -- --nocapture
-          cargo test --locked -p kernaid-desk-shell --bin kernaid-provider-key -- --nocapture
+          cargo test --locked -p kernaid-provider-key -- --nocapture
       - name: Probe native macOS P0 sources
         if: matrix.name == 'macos-aarch64'
         run: |
           pnpm --filter @kernaid/desk build
           cargo test --locked -p kernaid-desk-shell resident_macos_native_runtime_probe -- --nocapture
       - name: Build native provider credential companion
-        run: cargo build --locked --release -p kernaid-desk-shell --bin kernaid-provider-key ${{ matrix.args }}
+        run: cargo build --locked --release -p kernaid-provider-key ${{ matrix.args }}
       - name: Package executable native provider credential companion
         if: runner.os != 'Windows'
         shell: bash
@@ -240,5 +245,22 @@ jobs:
           args: ${{ matrix.args }}
           uploadWorkflowArtifacts: true
           workflowArtifactNamePattern: kernaid-desk-[platform]-[arch]-[bundle]
+      - name: Verify Linux packages and native bootstrap
+        if: runner.os == 'Linux'
+        shell: bash
+        run: bash apps/desk/scripts/verify-packaged-companion-absence.sh '${{ matrix.bundle_root }}' --qualified-first-launch-probe
+      - name: Verify macOS packages and native bootstrap
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          probe=()
+          if [[ '${{ matrix.name }}' == 'macos-aarch64' ]]; then
+            probe+=(--qualified-first-launch-probe)
+          fi
+          bash apps/desk/scripts/verify-packaged-companion-absence.sh '${{ matrix.bundle_root }}' "${probe[@]}"
+      - name: Verify Windows installers and native bootstrap
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./apps/desk/scripts/verify-packaged-companion-absence.ps1 -BundleRoot '${{ matrix.bundle_root }}' -QualifiedFirstLaunchProbe
       - name: Verify the packaged Desk excludes repair UI
         run: node apps/desk/scripts/verify-stable-dist.mjs

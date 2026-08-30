@@ -123,6 +123,13 @@ class RepairSurfaceSeparationTests(unittest.TestCase):
         )
         self.assertIn('KERNAID_REPAIR_CANDIDATE: "0"', desktop_workflow)
         self.assertIn("verify-stable-dist.mjs", desktop_workflow)
+        self.assertIn("verify-packaged-companion-absence.sh", desktop_workflow)
+        self.assertIn("verify-packaged-companion-absence.ps1", desktop_workflow)
+        self.assertIn("cargo build --locked --release -p kernaid-provider-key", desktop_workflow)
+        self.assertFalse(
+            (REPO / "apps/desk/src-tauri/src/bin/kernaid-provider-key.rs").exists()
+        )
+        self.assertTrue((REPO / "apps/desk/provider-key/src/main.rs").is_file())
         self.assertIn("python3 -B -m unittest", stable_workflow)
         self.assertIn("python3 -B -m unittest", candidate_workflow)
         self.assertIn("--mode stable --iso KernAid-Rescue-amd64.iso", stable_workflow)

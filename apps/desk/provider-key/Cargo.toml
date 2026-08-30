@@ -1,0 +1,12 @@
+[package]
+name = "kernaid-provider-key"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+kernaid-desk-shell = { path = "../src-tauri" }
+rpassword = "7.4"
+zeroize = "1.8"
+
+[lints]
+workspace = true
