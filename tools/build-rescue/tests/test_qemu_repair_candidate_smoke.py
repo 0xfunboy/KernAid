@@ -928,6 +928,24 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
         self.assertFalse(tamper.huge_device_matches((253 << 32) | 17, device))
         self.assertEqual(tamper.LOOP_INFO64.size, 232)
 
+    def test_backup_tamper_parses_canonical_debugfs_inode_sizes(self) -> None:
+        ubuntu_2404 = (
+            b"Inode: 15   Type: regular    Mode:  0644\n"
+            b"User:     0   Group:     0   Project:     0   Size: 4096\n"
+            b"Fragment:  Address: 0    Number: 0    Size: 0\n"
+        )
+        legacy = b"Inode: 15   Type: regular\nSize: 1\nFile ACL: 0\n"
+        self.assertEqual(tamper.parse_debugfs_inode_size(ubuntu_2404), 4096)
+        self.assertEqual(tamper.parse_debugfs_inode_size(legacy), 1)
+
+    def test_backup_tamper_rejects_ambiguous_debugfs_inode_sizes(self) -> None:
+        fragment_only = b"Fragment: Address: 0 Number: 0 Size: 4096\n"
+        conflicting = b"Size: 4096\nSize: 1\n"
+        for output in (fragment_only, conflicting, b"Size: 1 trailing\n"):
+            with self.subTest(output=output):
+                with self.assertRaises(tamper.ClosedFailure):
+                    tamper.parse_debugfs_inode_size(output)
+
     def test_backup_tamper_waits_past_loop_autoclear(self) -> None:
         loop = "/dev/loop7"
         with (

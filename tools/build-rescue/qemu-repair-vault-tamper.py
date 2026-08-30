@@ -31,6 +31,13 @@ BACKUP_DIRECTORY = (
     "/.kernaid-secure-state-v1/.kernaid-repair-store-v1/backups"
 )
 BACKUP_NAME = re.compile(r"backup-B-[0-9a-f]{32}")
+DEBUGFS_INODE_SIZE = re.compile(
+    rb"(?:^|\n)(?:"
+    rb"Size:[ \t]+|"
+    rb"User:[ \t]+[0-9]+[ \t]+Group:[ \t]+[0-9]+"
+    rb"(?:[ \t]+Project:[ \t]+[0-9]+)?[ \t]+Size:[ \t]+"
+    rb")([0-9]+)[ \t]*(?=\n|$)"
+)
 WORK_DIRECTORY = re.compile(r"kernaid-qemu-repair-candidate\.[A-Za-z0-9]{8}")
 MEDIA_NAME = "rescue-usb.raw"
 KEY_NAME = "vault-key"
@@ -410,6 +417,15 @@ def mapper_exists(mapper: str, mapper_path: str) -> bool:
     return os.path.lexists(mapper_path) or mapper in kernel_mapper_names()
 
 
+def parse_debugfs_inode_size(output: bytes) -> int:
+    """Parse exactly one canonical inode-size field, never a fragment size."""
+
+    matches = DEBUGFS_INODE_SIZE.findall(output)
+    if len(matches) != 1:
+        raise ClosedFailure("backup-invalid")
+    return int(matches[0])
+
+
 def close_mapper_bounded(mapper: str, mapper_path: str, deadline: float) -> bool:
     for _attempt in range(3):
         if not mapper_exists(mapper, mapper_path):
@@ -467,8 +483,7 @@ def discover_backup(mapper_path: str, reservation_id: str) -> str:
         raise ClosedFailure("backup-invalid")
     path = f"{BACKUP_DIRECTORY}/{expected}"
     before = run([command("debugfs"), "-R", f"stat {path}", mapper_path])
-    match = re.search(rb"(?:^|\n)Size:\s+([0-9]+)(?:\s|$)", before)
-    if match is None or int(match.group(1)) <= 1:
+    if parse_debugfs_inode_size(before) <= 1:
         raise ClosedFailure("backup-invalid")
     return path
 
@@ -584,7 +599,7 @@ def main() -> int:
         run([command("debugfs"), "-w", "-R", f"set_inode_field {backup} size 1", mapper_path])
         run([command("blockdev"), "--flushbufs", mapper_path])
         after = run([command("debugfs"), "-R", f"stat {backup}", mapper_path])
-        if re.search(rb"(?:^|\n)Size:\s+1(?:\s|$)", after) is None:
+        if parse_debugfs_inode_size(after) != 1:
             raise ClosedFailure("tamper-unverified")
     except BaseException as error:
         failure = error
