@@ -1,23 +1,26 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
-bootstrap:
+check-node:
+    ./tools/check-node-version.sh
+
+bootstrap: check-node
     corepack enable
     pnpm install
 
-format:
+format: check-node
     cargo fmt --all --check
     pnpm format
 
-lint:
+lint: check-node
     cargo clippy --workspace --all-targets -- -D warnings
     pnpm lint
 
-check:
+check: check-node
     cargo check --workspace
     pnpm check
     ./tools/verify-release/validate-schemas.sh
 
-test:
+test: check-node
     cargo test --workspace
     pnpm test
     python3 -m unittest discover -s tests/rescue -p 'test_*.py'
@@ -30,20 +33,20 @@ test-observe:
 test-snapshot-parity:
     bash ./tests/integration/linux-snapshot-parity.sh
 
-test-provider-contracts:
+test-provider-contracts: check-node
     pnpm --filter @kernaid/agent-gateway test
 
 test-vault:
     @echo "Runs destructive storage commands only against an internally-created disposable loop image."
     sudo ./tools/test-vault/luks-roundtrip.sh
 
-run-desk:
+run-desk: check-node
     pnpm run run:desk
 
-run-desk-fixture:
+run-desk-fixture: check-node
     pnpm --filter @kernaid/desk tauri dev --features fixture-repair-lab
 
-build-rescue:
+build-rescue: check-node
     ./tools/build-rescue/build.sh
 
 qemu-bios:

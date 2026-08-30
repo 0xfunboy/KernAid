@@ -14,8 +14,15 @@ on:
       - "tests/integration/linux-snapshot-resident-ipc.sh"
       - "tests/integration/run-linux-snapshot-resident-ipc-ci.sh"
       - "tools/test-linux-snapshot/**"
+      - "tools/check-node-version.sh"
+      - ".node-version"
+      - "Cargo.toml"
       - "Cargo.lock"
+      - "package.json"
+      - "pnpm-workspace.yaml"
       - "pnpm-lock.yaml"
+      - "rust-toolchain.toml"
+      - "justfile"
       - ".github/workflows/desktop.yml"
 permissions: { contents: read }
 jobs:
