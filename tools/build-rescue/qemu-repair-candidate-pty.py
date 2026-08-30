@@ -796,6 +796,14 @@ def main(arguments: Sequence[str]) -> int:
             console, confirmation.end(), LIFECYCLE._deadline(aggregate, 600.0)
         )
         cursor = LIFECYCLE.establish_live_session(console, aggregate, login)
+        _, cursor = LIFECYCLE.collect_runtime(
+            console, "repair-initial", cursor, aggregate
+        )
+        initial, cursor = LIFECYCLE.run_companion(
+            console, "status", "repair-initial-status", cursor, aggregate
+        )
+        if initial.vault_state != "locked" or initial.device_id is None:
+            raise LIFECYCLE.ClosedFailure("vault", "initial-status-invalid")
         unlocked, cursor = LIFECYCLE.run_companion(
             console, "unlock", "repair-unlock", cursor, aggregate, key
         )
@@ -859,6 +867,23 @@ def main(arguments: Sequence[str]) -> int:
             )
             console, qmp = harness.start(LIFECYCLE._deadline(aggregate, 15.0))
             cursor = LIFECYCLE.establish_live_session(console, aggregate, login)
+            _, cursor = LIFECYCLE.collect_runtime(
+                console, "repair-recovery-initial", cursor, aggregate
+            )
+            recovery_initial, cursor = LIFECYCLE.run_companion(
+                console,
+                "status",
+                "repair-recovery-initial-status",
+                cursor,
+                aggregate,
+            )
+            if (
+                recovery_initial.vault_state != "locked"
+                or recovery_initial.device_id is None
+            ):
+                raise LIFECYCLE.ClosedFailure(
+                    "vault", "recovery-initial-status-invalid"
+                )
             unlocked, cursor = LIFECYCLE.run_companion(
                 console, "unlock", "repair-recovery-unlock", cursor, aggregate, key
             )
