@@ -23,6 +23,26 @@
       "properties": {
         "apiVersion": { "const": "kernaid.dev/rescue-openai/v1alpha1" },
         "requestId": { "$ref": "#/$defs/requestId" },
+        "operation": { "const": "provider.openai.context-preview" },
+        "ok": { "const": true },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["context", "contextSha256"],
+          "properties": {
+            "context": { "$ref": "#/$defs/projectedContext" },
+            "contextSha256": { "$ref": "#/$defs/contextSha256" }
+          }
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["apiVersion", "requestId", "operation", "ok", "payload"],
+      "properties": {
+        "apiVersion": { "const": "kernaid.dev/rescue-openai/v1alpha1" },
+        "requestId": { "$ref": "#/$defs/requestId" },
         "operation": { "const": "provider.openai.diagnose" },
         "ok": { "const": true },
         "payload": {
@@ -43,7 +63,11 @@
         "apiVersion": { "const": "kernaid.dev/rescue-openai/v1alpha1" },
         "requestId": { "$ref": "#/$defs/requestId" },
         "operation": {
-          "enum": ["provider.status", "provider.openai.diagnose"]
+          "enum": [
+            "provider.status",
+            "provider.openai.context-preview",
+            "provider.openai.diagnose"
+          ]
         },
         "ok": { "const": false },
         "error": {
@@ -73,6 +97,47 @@
     "requestId": {
       "type": "string",
       "pattern": "^O-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "contextSha256": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "projectedContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["objective", "deterministicProposal", "observations"],
+      "properties": {
+        "objective": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 8192
+        },
+        "deterministicProposal": { "$ref": "#/$defs/diagnosisProposal" },
+        "observations": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "collector", "trust"],
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^E-[A-Za-z0-9-]+$",
+                "maxLength": 128
+              },
+              "collector": {
+                "enum": [
+                  "linux.normalized-snapshot.v1",
+                  "rescue.installed-target.filesystem-content.read-only.v1"
+                ]
+              },
+              "trust": { "const": "observed-untrusted" }
+            }
+          }
+        }
+      }
     },
     "status": {
       "type": "object",

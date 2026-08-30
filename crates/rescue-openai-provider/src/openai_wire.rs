@@ -213,10 +213,12 @@ struct ResponseReasoning {
 pub fn prepare_openai_exchange(
     request: &ProviderRequest,
 ) -> Result<PreparedOpenAiExchange, OpenAiWireError> {
-    let context = match request {
-        ProviderRequest::Status { .. } => return Err(OpenAiWireError::UnsupportedOperation),
-        ProviderRequest::Diagnose { context, .. } => context,
-    };
+    if request.operation() != ProviderOperation::Diagnose {
+        return Err(OpenAiWireError::UnsupportedOperation);
+    }
+    let context = request
+        .context()
+        .ok_or(OpenAiWireError::UnsupportedOperation)?;
     let [observation] = context.observations() else {
         return Err(OpenAiWireError::RequestEncoding);
     };

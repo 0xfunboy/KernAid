@@ -5,6 +5,7 @@ export { ProviderError } from "@kernaid/provider-types";
 export type {
   ObservedEvidence,
   Provider,
+  ProviderContextPreview,
   ProviderRequestOptions,
 } from "@kernaid/provider-types";
 

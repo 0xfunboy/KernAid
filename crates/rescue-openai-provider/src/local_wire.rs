@@ -1,5 +1,6 @@
 use crate::rescue_corpus::{
-    DiagnosisProposal, ProjectedProviderContext, WireEvidence, project_diagnosis, valid_evidence_id,
+    DiagnosisProposal, ProjectedProviderContext, ProviderContextPreview, WireEvidence,
+    valid_evidence_id,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::value::RawValue;
@@ -37,6 +38,7 @@ impl std::error::Error for FrameError {}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProviderOperation {
     Status,
+    ContextPreview,
     Diagnose,
 }
 
@@ -44,6 +46,7 @@ impl ProviderOperation {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Status => "provider.status",
+            Self::ContextPreview => "provider.openai.context-preview",
             Self::Diagnose => "provider.openai.diagnose",
         }
     }
@@ -51,6 +54,7 @@ impl ProviderOperation {
     fn parse(value: &str) -> Result<Self, FrameError> {
         match value {
             "provider.status" => Ok(Self::Status),
+            "provider.openai.context-preview" => Ok(Self::ContextPreview),
             "provider.openai.diagnose" => Ok(Self::Diagnose),
             _ => Err(FrameError::InvalidRequest),
         }
@@ -62,30 +66,52 @@ pub enum ProviderRequest {
     Status {
         request_id: String,
     },
+    ContextPreview {
+        request_id: String,
+        preview: ProviderContextPreview,
+    },
     Diagnose {
         request_id: String,
-        context: ProjectedProviderContext,
+        preview: ProviderContextPreview,
+    },
+    DiagnoseBindingMismatch {
+        request_id: String,
     },
 }
 
 impl ProviderRequest {
     pub fn request_id(&self) -> &str {
         match self {
-            Self::Status { request_id } | Self::Diagnose { request_id, .. } => request_id,
+            Self::Status { request_id }
+            | Self::ContextPreview { request_id, .. }
+            | Self::Diagnose { request_id, .. }
+            | Self::DiagnoseBindingMismatch { request_id } => request_id,
         }
     }
 
     pub const fn operation(&self) -> ProviderOperation {
         match self {
             Self::Status { .. } => ProviderOperation::Status,
-            Self::Diagnose { .. } => ProviderOperation::Diagnose,
+            Self::ContextPreview { .. } => ProviderOperation::ContextPreview,
+            Self::Diagnose { .. } | Self::DiagnoseBindingMismatch { .. } => {
+                ProviderOperation::Diagnose
+            }
         }
     }
 
     pub fn context(&self) -> Option<&ProjectedProviderContext> {
         match self {
-            Self::Status { .. } => None,
-            Self::Diagnose { context, .. } => Some(context),
+            Self::Status { .. } | Self::DiagnoseBindingMismatch { .. } => None,
+            Self::ContextPreview { preview, .. } | Self::Diagnose { preview, .. } => {
+                Some(preview.context())
+            }
+        }
+    }
+
+    pub fn context_preview(&self) -> Option<&ProviderContextPreview> {
+        match self {
+            Self::Status { .. } | Self::DiagnoseBindingMismatch { .. } => None,
+            Self::ContextPreview { preview, .. } | Self::Diagnose { preview, .. } => Some(preview),
         }
     }
 }
@@ -150,6 +176,7 @@ impl ProviderStatus {
 #[derive(Clone, Debug, PartialEq)]
 enum ProviderResponseKind {
     Status(ProviderStatus),
+    ContextPreview(ProviderContextPreview),
     Diagnosis(DiagnosisProposal),
     Error {
         operation: ProviderOperation,
@@ -190,6 +217,17 @@ impl ProviderResponse {
         })
     }
 
+    pub fn context_preview(
+        request_id: &str,
+        preview: ProviderContextPreview,
+    ) -> Result<Self, FrameError> {
+        validate_request_id(request_id)?;
+        Ok(Self {
+            request_id: request_id.to_owned(),
+            kind: ProviderResponseKind::ContextPreview(preview),
+        })
+    }
+
     pub fn error(
         request_id: &str,
         operation: ProviderOperation,
@@ -209,6 +247,7 @@ impl ProviderResponse {
     pub fn operation(&self) -> ProviderOperation {
         match &self.kind {
             ProviderResponseKind::Status(_) => ProviderOperation::Status,
+            ProviderResponseKind::ContextPreview(_) => ProviderOperation::ContextPreview,
             ProviderResponseKind::Diagnosis(_) => ProviderOperation::Diagnose,
             ProviderResponseKind::Error { operation, .. } => *operation,
         }
@@ -217,21 +256,36 @@ impl ProviderResponse {
     pub fn status_payload(&self) -> Option<&ProviderStatus> {
         match &self.kind {
             ProviderResponseKind::Status(status) => Some(status),
-            ProviderResponseKind::Diagnosis(_) | ProviderResponseKind::Error { .. } => None,
+            ProviderResponseKind::ContextPreview(_)
+            | ProviderResponseKind::Diagnosis(_)
+            | ProviderResponseKind::Error { .. } => None,
+        }
+    }
+
+    pub fn context_preview_payload(&self) -> Option<&ProviderContextPreview> {
+        match &self.kind {
+            ProviderResponseKind::ContextPreview(preview) => Some(preview),
+            ProviderResponseKind::Status(_)
+            | ProviderResponseKind::Diagnosis(_)
+            | ProviderResponseKind::Error { .. } => None,
         }
     }
 
     pub fn diagnosis_payload(&self) -> Option<&DiagnosisProposal> {
         match &self.kind {
             ProviderResponseKind::Diagnosis(proposal) => Some(proposal),
-            ProviderResponseKind::Status(_) | ProviderResponseKind::Error { .. } => None,
+            ProviderResponseKind::Status(_)
+            | ProviderResponseKind::ContextPreview(_)
+            | ProviderResponseKind::Error { .. } => None,
         }
     }
 
     pub fn error_code(&self) -> Option<ProviderErrorCode> {
         match &self.kind {
             ProviderResponseKind::Error { code, .. } => Some(*code),
-            ProviderResponseKind::Status(_) | ProviderResponseKind::Diagnosis(_) => None,
+            ProviderResponseKind::Status(_)
+            | ProviderResponseKind::ContextPreview(_)
+            | ProviderResponseKind::Diagnosis(_) => None,
         }
     }
 }
@@ -251,9 +305,17 @@ struct WireStatusRequest {}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WireContextRequest {
+    objective: String,
+    evidence: Vec<WireEvidence>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct WireDiagnoseRequest {
     objective: String,
     evidence: Vec<WireEvidence>,
+    context_sha256: String,
 }
 
 pub fn parse_request_frame(frame: &[u8]) -> Result<ProviderRequest, FrameError> {
@@ -271,14 +333,32 @@ pub fn parse_request_frame(frame: &[u8]) -> Result<ProviderRequest, FrameError> 
                 request_id: envelope.request_id,
             })
         }
+        ProviderOperation::ContextPreview => {
+            let payload: WireContextRequest = parse_exact(envelope.payload.get().as_bytes())
+                .map_err(|_| FrameError::InvalidRequest)?;
+            let preview = ProviderContextPreview::project(&payload.objective, &payload.evidence)
+                .map_err(|_| FrameError::InvalidRequest)?;
+            Ok(ProviderRequest::ContextPreview {
+                request_id: envelope.request_id,
+                preview,
+            })
+        }
         ProviderOperation::Diagnose => {
             let payload: WireDiagnoseRequest = parse_exact(envelope.payload.get().as_bytes())
                 .map_err(|_| FrameError::InvalidRequest)?;
-            let context = project_diagnosis(&payload.objective, &payload.evidence)
+            let preview = ProviderContextPreview::project(&payload.objective, &payload.evidence)
                 .map_err(|_| FrameError::InvalidRequest)?;
+            if !valid_context_sha256(&payload.context_sha256) {
+                return Err(FrameError::InvalidRequest);
+            }
+            if preview.context_sha256() != payload.context_sha256 {
+                return Ok(ProviderRequest::DiagnoseBindingMismatch {
+                    request_id: envelope.request_id,
+                });
+            }
             Ok(ProviderRequest::Diagnose {
                 request_id: envelope.request_id,
-                context,
+                preview,
             })
         }
     }
@@ -342,6 +422,13 @@ struct WireDiagnosisResponse {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WireContextPreviewResponse {
+    context: ProjectedProviderContext,
+    context_sha256: String,
+}
+
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WireErrorResponse {
     code: ProviderErrorCode,
@@ -382,6 +469,17 @@ pub fn parse_response_frame(
                     ProviderStatus::new(wire.vault, wire.credential)?,
                 )
             }
+            ProviderOperation::ContextPreview => {
+                let wire: WireContextPreviewResponse = parse_exact(payload.get().as_bytes())
+                    .map_err(|_| FrameError::InvalidResponse)?;
+                let expected = request
+                    .context_preview()
+                    .ok_or(FrameError::InvalidResponse)?;
+                if !expected.matches(&wire.context, &wire.context_sha256) {
+                    return Err(FrameError::InvalidResponse);
+                }
+                ProviderResponse::context_preview(&envelope.request_id, expected.clone())
+            }
             ProviderOperation::Diagnose => {
                 let wire: WireDiagnosisResponse = parse_exact(payload.get().as_bytes())
                     .map_err(|_| FrameError::InvalidResponse)?;
@@ -419,6 +517,16 @@ pub fn encode_response_frame(response: &ProviderResponse) -> Result<Vec<u8>, Fra
                 profile: PROVIDER_PROFILE.to_owned(),
                 vault: status.vault,
                 credential: status.credential,
+            },
+        }),
+        ProviderResponseKind::ContextPreview(preview) => serde_json::json!({
+            "apiVersion": API_VERSION,
+            "requestId": response.request_id.as_str(),
+            "operation": ProviderOperation::ContextPreview.as_str(),
+            "ok": true,
+            "payload": WireContextPreviewResponse {
+                context: preview.context().clone(),
+                context_sha256: preview.context_sha256().to_owned(),
             },
         }),
         ProviderResponseKind::Diagnosis(proposal) => serde_json::json!({
@@ -481,6 +589,15 @@ fn validate_request_id(value: &str) -> Result<(), FrameError> {
         return Err(FrameError::InvalidRequest);
     }
     Ok(())
+}
+
+fn valid_context_sha256(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    })
 }
 
 #[cfg(test)]
@@ -550,6 +667,36 @@ mod tests {
         frame
     }
 
+    fn context_preview_value(mut value: Value) -> Value {
+        value["operation"] = Value::String(ProviderOperation::ContextPreview.as_str().to_owned());
+        if let Some(payload) = value["payload"].as_object_mut() {
+            payload.remove("contextSha256");
+        }
+        value
+    }
+
+    #[test]
+    fn diagnosis_fixtures_echo_the_authoritative_preview_digest() {
+        let manifest = golden_manifest();
+        for golden in manifest
+            .valid_cases
+            .into_iter()
+            .filter(|case| case.name != "status")
+        {
+            let bytes = read_fixture(&golden.request);
+            let diagnosis = parse_request_frame(&bytes).expect("digest-bound diagnosis request");
+            let value: Value = serde_json::from_slice(&bytes).expect("fixture JSON");
+            let value = context_preview_value(value);
+            let preview = parse_request_frame(&frame_from_value(&value)).expect("preview request");
+            assert_eq!(
+                diagnosis.context_preview(),
+                preview.context_preview(),
+                "{}",
+                golden.name
+            );
+        }
+    }
+
     #[test]
     fn status_frames_are_exact_and_round_trip() {
         let request = parse_request_frame(STATUS_REQUEST).expect("valid status fixture");
@@ -570,7 +717,7 @@ mod tests {
     fn shared_valid_fixtures_match_every_deterministic_rescue_branch() {
         let manifest = golden_manifest();
         assert_eq!(manifest.schema_version, 1);
-        assert_eq!(manifest.valid_cases.len(), 9);
+        assert_eq!(manifest.valid_cases.len(), 10);
         for golden in manifest.valid_cases {
             let request_bytes = read_fixture(&golden.request);
             let response_bytes = read_fixture(&golden.response);
@@ -584,14 +731,24 @@ mod tests {
                 golden.name
             );
             assert_eq!(request.operation(), response.operation(), "{}", golden.name);
-            match request.context() {
-                Some(context) => assert_eq!(
-                    Some(context.deterministic_proposal()),
+            match request.operation() {
+                ProviderOperation::Status => {
+                    assert!(response.status_payload().is_some(), "{}", golden.name)
+                }
+                ProviderOperation::ContextPreview => assert_eq!(
+                    request.context_preview(),
+                    response.context_preview_payload(),
+                    "{}",
+                    golden.name
+                ),
+                ProviderOperation::Diagnose => assert_eq!(
+                    request
+                        .context()
+                        .map(ProjectedProviderContext::deterministic_proposal),
                     response.diagnosis_payload(),
                     "{}",
                     golden.name
                 ),
-                None => assert!(response.status_payload().is_some(), "{}", golden.name),
             }
         }
     }
@@ -661,7 +818,7 @@ mod tests {
         let bytes = read_fixture("valid/windows-generic.request.raw");
         let parsed: Result<Value, _> = serde_json::from_slice(&bytes);
         assert!(parsed.is_ok());
-        let mut value = parsed.unwrap_or(Value::Null);
+        let mut value = context_preview_value(parsed.unwrap_or(Value::Null));
         value["payload"]["objective"] = Value::String("x".repeat(crate::MAX_OBJECTIVE_BYTES));
         assert!(parse_request_frame(&frame_from_value(&value)).is_ok());
         value["payload"]["objective"] = Value::String("x".repeat(crate::MAX_OBJECTIVE_BYTES + 1));
@@ -672,7 +829,7 @@ mod tests {
 
         let parsed: Result<Value, _> = serde_json::from_slice(&bytes);
         assert!(parsed.is_ok());
-        let mut value = parsed.unwrap_or(Value::Null);
+        let mut value = context_preview_value(parsed.unwrap_or(Value::Null));
         let content = value["payload"]["evidence"][0]["content"]
             .as_str()
             .unwrap_or("")
@@ -705,7 +862,7 @@ mod tests {
         let bytes = read_fixture("valid/windows-generic.request.raw");
         let parsed: Result<Value, _> = serde_json::from_slice(&bytes);
         assert!(parsed.is_ok());
-        let mut value = parsed.unwrap_or(Value::Null);
+        let mut value = context_preview_value(parsed.unwrap_or(Value::Null));
         let evidence = value["payload"]["evidence"][0].clone();
         value["payload"]["evidence"] = Value::Array(vec![evidence.clone(), evidence]);
         assert_eq!(
@@ -923,6 +1080,7 @@ mod tests {
             assert!(!request_text.contains(prohibited), "{prohibited}");
         }
         assert!(request_text.contains(ProviderOperation::Status.as_str()));
+        assert!(request_text.contains(ProviderOperation::ContextPreview.as_str()));
         assert!(request_text.contains(ProviderOperation::Diagnose.as_str()));
         assert_eq!(
             response["$defs"]["diagnosisProposal"]["properties"]["evidenceIds"]["maxItems"],

@@ -1,5 +1,6 @@
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{collections::HashSet, sync::LazyLock};
 
 use kernaid_evidence::linux_snapshot::{
@@ -12,6 +13,7 @@ pub const RESCUE_EVIDENCE_COLLECTOR: &str =
 pub const RESCUE_EVIDENCE_TARGET: &str = "selected-installed-target";
 pub const MAX_OBJECTIVE_BYTES: usize = 8 * 1024;
 pub const MAX_EVIDENCE_CONTENT_BYTES: usize = 48 * 1024;
+pub const PROVIDER_CONTEXT_HASH_DOMAIN: &[u8] = b"KERNAID_RESCUE_OPENAI_PROJECTED_CONTEXT_V1\0";
 const MAX_EVIDENCE_SUMMARY_BYTES: usize = 256;
 const MAX_DIAGNOSIS_BYTES: usize = 16 * 1024;
 const MAX_REQUESTED_EVIDENCE_BYTES: usize = 256;
@@ -118,12 +120,12 @@ impl DiagnosisProposal {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProjectedObservation {
     id: String,
-    collector: &'static str,
-    trust: &'static str,
+    collector: String,
+    trust: String,
 }
 
 impl ProjectedObservation {
@@ -131,21 +133,57 @@ impl ProjectedObservation {
         &self.id
     }
 
-    pub const fn collector(&self) -> &'static str {
-        self.collector
+    pub fn collector(&self) -> &str {
+        &self.collector
     }
 
-    pub const fn trust(&self) -> &'static str {
-        self.trust
+    pub fn trust(&self) -> &str {
+        &self.trust
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProjectedProviderContext {
     objective: String,
     deterministic_proposal: DiagnosisProposal,
     observations: Vec<ProjectedObservation>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProviderContextPreview {
+    context: ProjectedProviderContext,
+    context_sha256: String,
+}
+
+impl ProviderContextPreview {
+    pub(crate) fn project(objective: &str, evidence: &[WireEvidence]) -> Result<Self, CorpusError> {
+        let context = project_diagnosis(objective, evidence)?;
+        Self::from_context(context)
+    }
+
+    pub(crate) fn from_context(context: ProjectedProviderContext) -> Result<Self, CorpusError> {
+        let canonical = serde_json::to_vec(&context).map_err(|_| CorpusError::Invalid)?;
+        let mut digest = Sha256::new();
+        digest.update(PROVIDER_CONTEXT_HASH_DOMAIN);
+        digest.update(&canonical);
+        Ok(Self {
+            context,
+            context_sha256: format!("sha256:{:x}", digest.finalize()),
+        })
+    }
+
+    pub fn context(&self) -> &ProjectedProviderContext {
+        &self.context
+    }
+
+    pub fn context_sha256(&self) -> &str {
+        &self.context_sha256
+    }
+
+    pub(crate) fn matches(&self, context: &ProjectedProviderContext, digest: &str) -> bool {
+        self.context == *context && self.context_sha256 == digest
+    }
 }
 
 impl ProjectedProviderContext {
@@ -237,8 +275,8 @@ pub(crate) fn project_diagnosis(
         deterministic_proposal,
         observations: vec![ProjectedObservation {
             id: item.id.clone(),
-            collector: observation_collector,
-            trust: "observed-untrusted",
+            collector: observation_collector.to_owned(),
+            trust: "observed-untrusted".to_owned(),
         }],
     })
 }

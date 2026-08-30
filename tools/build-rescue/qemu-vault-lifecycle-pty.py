@@ -3440,7 +3440,7 @@ try:
         return accepted,egress_enter
     if OPERATION=="provider.openai.diagnose":
         corpus={{"family":"windows","installationConfirmed":False,"installationMarkers":{{"windowsDirectoryPresent":False,"system32DirectoryPresent":False,"kernelPresent":False,"systemHivePresent":False,"softwareHivePresent":False,"usersDirectoryPresent":False}},"boot":{{"bootManagerPresent":False,"bcdPresent":False,"efiSystemPartition":{{"state":"not-present","microsoftBootManagerPresent":None,"bcdPresent":None,"fallbackBootloaderPresent":None}}}},"servicing":{{"pendingXmlPresent":False,"rebootPendingMarkerPresent":False}}}}
-        payload={{"objective":"Qualifica il relay Rescue in sola lettura","evidence":[{{"schemaVersion":"1.0","id":"E-QEMU-RELAY","collector":"rescue.installed-target.filesystem-content.read-only.v1","target":"selected-installed-target","contentType":"application/json","trust":"observed-untrusted","summary":"Corpus statico windows acquisito read-only; installazione non confermata","content":json.dumps(corpus,ensure_ascii=True,separators=(",",":"))}}]}}
+        payload={{"objective":"Qualifica il relay Rescue in sola lettura","evidence":[{{"schemaVersion":"1.0","id":"E-QEMU-RELAY","collector":"rescue.installed-target.filesystem-content.read-only.v1","target":"selected-installed-target","contentType":"application/json","trust":"observed-untrusted","summary":"Corpus statico windows acquisito read-only; installazione non confermata","content":json.dumps(corpus,ensure_ascii=True,separators=(",",":"))}}],"contextSha256":"sha256:422dbebc0f179cff9223cd1be89d41e8facce32145ca86ef8b4a59db779a04fb"}}
     else:
         payload={{}}
     request={{"apiVersion":API,"requestId":REQUEST_ID,"operation":OPERATION,"payload":payload}}

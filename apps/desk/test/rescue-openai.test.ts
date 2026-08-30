@@ -10,6 +10,8 @@ import {
 } from "../src/rescue-openai.js";
 
 const API_VERSION = "kernaid.dev/rescue-openai/v1alpha1";
+const CONTEXT_SHA256 = `sha256:${"a".repeat(64)}`;
+const CONTEXT_BINDING = Object.freeze({ contextSha256: CONTEXT_SHA256 });
 
 test("target scan and selection keep provider epochs stable for cleanup", () => {
   for (const operation of ["scan", "selection"] as const) {
@@ -204,6 +206,59 @@ test("Rescue status is presence-only, correlated, and exact", async () => {
   );
 });
 
+test("Rescue context preview returns only the authoritative redacted projection", async () => {
+  const fetch = async (
+    _input: RequestInfo | URL,
+    init?: RequestInit,
+  ): Promise<Response> => {
+    const request = requestFrom(init);
+    assert.equal(request.operation, "provider.openai.context-preview");
+    const payload = request.payload as Record<string, unknown>;
+    assert.deepEqual(Object.keys(payload), ["objective", "evidence"]);
+    return frame({
+      apiVersion: API_VERSION,
+      requestId: request.requestId,
+      operation: "provider.openai.context-preview",
+      ok: true,
+      payload: {
+        context: {
+          objective: "Diagnosi [REDACTED]",
+          deterministicProposal: {
+            schemaVersion: "1.0",
+            diagnosis: "Verifica read-only richiesta.",
+            confidence: 0.7,
+            evidenceIds: ["E-RESCUE-CORPUS"],
+            requestedEvidence: [],
+          },
+          observations: [
+            {
+              id: "E-RESCUE-CORPUS",
+              collector:
+                "rescue.installed-target.filesystem-content.read-only.v1",
+              trust: "observed-untrusted",
+            },
+          ],
+        },
+        contextSha256: CONTEXT_SHA256,
+      },
+    });
+  };
+  const preview = await new RescueOpenAiProvider(fetch).previewContext(
+    "Diagnosi sk-not-returned-12345678",
+    [rescueEvidence()],
+  );
+  assert.equal(preview.contextSha256, CONTEXT_SHA256);
+  assert.equal(preview.context.objective, "Diagnosi [REDACTED]");
+  assert.deepEqual(preview.context.observations, [
+    {
+      id: "E-RESCUE-CORPUS",
+      collector: "rescue.installed-target.filesystem-content.read-only.v1",
+      trust: "observed-untrusted",
+    },
+  ]);
+  assert.doesNotMatch(JSON.stringify(preview), /sk-not-returned/u);
+});
+
 test("Rescue diagnosis sends exactly one eight-field evidence projection", async () => {
   const fetch = async (
     _input: RequestInfo | URL,
@@ -214,9 +269,11 @@ test("Rescue diagnosis sends exactly one eight-field evidence projection", async
     const payload = request.payload as {
       objective: string;
       evidence: Array<Record<string, unknown>>;
+      contextSha256: string;
     };
     assert.equal(payload.objective, "Diagnosi read-only");
     assert.equal(payload.evidence.length, 1);
+    assert.equal(payload.contextSha256, CONTEXT_SHA256);
     assert.deepEqual(Object.keys(payload.evidence[0] ?? {}), [
       "schemaVersion",
       "id",
@@ -251,6 +308,7 @@ test("Rescue diagnosis sends exactly one eight-field evidence projection", async
   const proposal = await new RescueOpenAiProvider(fetch).diagnose(
     "Diagnosi read-only",
     [rescueEvidence()],
+    CONTEXT_BINDING,
   );
   assert.equal(proposal.diagnosis, "Verifica read-only richiesta.");
 });
@@ -272,7 +330,11 @@ test("Rescue diagnosis is one-shot and maps closed executor errors", async () =>
     });
   };
   await assert.rejects(
-    new RescueOpenAiProvider(fetch).diagnose("Diagnosi", [rescueEvidence()]),
+    new RescueOpenAiProvider(fetch).diagnose(
+      "Diagnosi",
+      [rescueEvidence()],
+      CONTEXT_BINDING,
+    ),
     (error: unknown) => {
       assert.equal((error as { code?: unknown }).code, "upstream");
       assert.doesNotMatch(String(error), /backend|credential|response body/iu);
@@ -369,9 +431,11 @@ test("Rescue response rejects escaped duplicate keys and correlation drift", asy
     });
   };
   await assert.rejects(
-    new RescueOpenAiProvider(wrongEvidence).diagnose("Diagnosi", [
-      rescueEvidence(),
-    ]),
+    new RescueOpenAiProvider(wrongEvidence).diagnose(
+      "Diagnosi",
+      [rescueEvidence()],
+      CONTEXT_BINDING,
+    ),
     { code: "invalid_response" },
   );
 });
@@ -458,24 +522,31 @@ test("Rescue provider enforces UTF-8 byte bounds and preflight cancellation", as
     throw new Error("must not run");
   };
   const provider = new RescueOpenAiProvider(fetch);
+  await assert.rejects(provider.diagnose("Diagnosi", [rescueEvidence()]), {
+    code: "invalid_request",
+  });
   await assert.rejects(
-    provider.diagnose("é".repeat(4_097), [rescueEvidence()]),
+    provider.diagnose("é".repeat(4_097), [rescueEvidence()], CONTEXT_BINDING),
     {
       code: "invalid_request",
     },
   );
-  await assert.rejects(provider.diagnose("Diagnosi", []), {
+  await assert.rejects(provider.diagnose("Diagnosi", [], CONTEXT_BINDING), {
     code: "invalid_request",
   });
   const oversized = rescueEvidence();
   oversized.content = "é".repeat(24_577);
-  await assert.rejects(provider.diagnose("Diagnosi", [oversized]), {
-    code: "invalid_request",
-  });
+  await assert.rejects(
+    provider.diagnose("Diagnosi", [oversized], CONTEXT_BINDING),
+    {
+      code: "invalid_request",
+    },
+  );
   const controller = new AbortController();
   controller.abort();
   await assert.rejects(
     provider.diagnose("Diagnosi", [rescueEvidence()], {
+      contextSha256: CONTEXT_SHA256,
       signal: controller.signal,
     }),
     { code: "cancelled" },
@@ -514,7 +585,11 @@ test("Rescue proposal enforces the executor UTF-8 byte bounds", async () => {
       });
     };
     await assert.rejects(
-      new RescueOpenAiProvider(fetch).diagnose("Diagnosi", [rescueEvidence()]),
+      new RescueOpenAiProvider(fetch).diagnose(
+        "Diagnosi",
+        [rescueEvidence()],
+        CONTEXT_BINDING,
+      ),
       { code: "invalid_response" },
     );
   }

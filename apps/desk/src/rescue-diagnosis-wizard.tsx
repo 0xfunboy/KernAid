@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React from "react";
 import type { ArtifactRef } from "@kernaid/session-driver";
 import type { DiagnosisProposal, Evidence } from "@kernaid/schemas";
 import type {
@@ -8,7 +8,10 @@ import type {
   RescueTargetScan,
   RescueTargetSelection,
 } from "./native";
-import type { RescueProviderMode } from "./rescue-openai";
+import type {
+  RescueOpenAiContextPreview,
+  RescueProviderMode,
+} from "./rescue-openai";
 import {
   jsonReportDownloadLabel,
   jsonReportDownloadName,
@@ -21,7 +24,6 @@ import {
   rescueDiagnosisWizardProgress,
   rescueInspectionErrorPresentation,
   rescueInspectionPresentation,
-  rescueOpenAiPreviewAcknowledgementKey,
   targetFamilyLabel,
 } from "./rescue-ui";
 
@@ -54,6 +56,10 @@ export interface RescueDiagnosisWizardProps {
   readonly inspectDisabled: boolean;
   readonly objective: string;
   readonly evidence: readonly Evidence[];
+  readonly openAiContextPreview?: RescueOpenAiContextPreview;
+  readonly openAiAcceptedContextSha256?: string;
+  readonly openAiPreviewBusy: boolean;
+  readonly openAiPreviewError?: string;
   readonly proposal?: DiagnosisProposal;
   readonly status: string;
   readonly busy: boolean;
@@ -70,6 +76,8 @@ export interface RescueDiagnosisWizardProps {
   readonly onChooseProvider: (mode: RescueProviderMode) => void;
   readonly onInspectTarget: () => void | Promise<void>;
   readonly onObjectiveChange: (value: string) => void;
+  readonly onPreviewOpenAiContext: () => void | Promise<void>;
+  readonly onAcceptOpenAiContext: (contextSha256: string) => void;
   readonly onDiagnose: () => void | Promise<void>;
 }
 
@@ -94,6 +102,10 @@ export function RescueDiagnosisWizard({
   inspectDisabled,
   objective,
   evidence,
+  openAiContextPreview,
+  openAiAcceptedContextSha256,
+  openAiPreviewBusy,
+  openAiPreviewError,
   proposal,
   status,
   busy,
@@ -108,6 +120,8 @@ export function RescueDiagnosisWizard({
   onChooseProvider,
   onInspectTarget,
   onObjectiveChange,
+  onPreviewOpenAiContext,
+  onAcceptOpenAiContext,
   onDiagnose,
 }: RescueDiagnosisWizardProps) {
   const reportReady = report !== undefined && sessionId !== undefined;
@@ -117,11 +131,10 @@ export function RescueDiagnosisWizard({
     inspectionReady: inspectionCurrent,
     reportReady,
   });
-  const previewKey = rescueOpenAiPreviewAcknowledgementKey(objective, evidence);
-  const [acceptedPreviewKey, setAcceptedPreviewKey] = useState<string>();
   const previewAccepted =
     providerMode !== "openai" ||
-    (evidence.length > 0 && acceptedPreviewKey === previewKey);
+    (openAiContextPreview !== undefined &&
+      openAiAcceptedContextSha256 === openAiContextPreview.contextSha256);
   const inspectionView =
     inspectionCurrent && inspection !== undefined
       ? rescueInspectionPresentation(inspection)
@@ -392,43 +405,85 @@ export function RescueDiagnosisWizard({
               >
                 <div>
                   <small>ANTEPRIMA PRIMA DELL’INVIO</small>
-                  <b>Contesto noto al WebView</b>
+                  <b>Contesto redatto prodotto da KernAid</b>
                 </div>
-                <dl>
-                  <dt>Obiettivo</dt>
-                  <dd>{objective || "Non ancora inserito"}</dd>
-                  <dt>Metadati evidenze</dt>
-                  <dd>
-                    {evidence.length
-                      ? evidence.map((item) => (
-                          <code key={item.id}>
-                            {item.id} · {item.collector}
-                          </code>
-                        ))
-                      : "Non ancora disponibili"}
-                  </dd>
-                  <dt>Corpus grezzo</dt>
-                  <dd>Resta locale sul computer</dd>
-                  <dt>Payload esatto</dt>
-                  <dd>
-                    Non disponibile: questa versione non espone un’API di
-                    proiezione. KernAid non dichiara questa lista come payload
-                    esatto.
-                  </dd>
-                </dl>
                 <button
                   className="rescue-wizard-secondary"
-                  disabled={!objective.trim() || evidence.length === 0}
-                  onClick={() => setAcceptedPreviewKey(previewKey)}
+                  disabled={
+                    openAiPreviewBusy ||
+                    !objective.trim() ||
+                    evidence.length !== 1
+                  }
+                  onClick={() => void onPreviewOpenAiContext()}
                 >
-                  {previewAccepted
-                    ? "Anteprima confermata"
-                    : "Conferma questa anteprima"}
+                  {openAiPreviewBusy
+                    ? "Preparazione anteprima…"
+                    : openAiContextPreview
+                      ? "Rigenera anteprima"
+                      : "Prepara anteprima sicura"}
                 </button>
+                {openAiPreviewError && (
+                  <p className="rescue-wizard-alert" role="alert">
+                    {openAiPreviewError}
+                  </p>
+                )}
+                {openAiContextPreview && (
+                  <>
+                    <dl>
+                      <dt>Obiettivo redatto</dt>
+                      <dd>{openAiContextPreview.context.objective}</dd>
+                      <dt>Valutazione deterministica locale</dt>
+                      <dd>
+                        {
+                          openAiContextPreview.context.deterministicProposal
+                            .diagnosis
+                        }
+                      </dd>
+                      <dt>Osservazioni inviate</dt>
+                      <dd>
+                        {openAiContextPreview.context.observations.map(
+                          (item) => (
+                            <code key={item.id}>
+                              {item.id} · {item.collector} · {item.trust}
+                            </code>
+                          ),
+                        )}
+                      </dd>
+                      <dt>Corpus grezzo</dt>
+                      <dd>Non viene inviato a OpenAI</dd>
+                      <dt>Binding</dt>
+                      <dd>
+                        <code>{openAiContextPreview.contextSha256}</code>
+                      </dd>
+                      <dt>Contesto completo</dt>
+                      <dd>
+                        <pre>
+                          {JSON.stringify(
+                            openAiContextPreview.context,
+                            undefined,
+                            2,
+                          )}
+                        </pre>
+                      </dd>
+                    </dl>
+                    <button
+                      className="rescue-wizard-secondary"
+                      onClick={() =>
+                        onAcceptOpenAiContext(
+                          openAiContextPreview.contextSha256,
+                        )
+                      }
+                    >
+                      {previewAccepted
+                        ? "Anteprima confermata"
+                        : "Conferma questo contesto"}
+                    </button>
+                  </>
+                )}
                 <small>
-                  La conferma vale solo per questo obiettivo e questi ID; una
-                  modifica la annulla automaticamente. Nessuna credenziale è
-                  mostrata o trasmessa dal browser.
+                  La diagnosi reinvia questo digest e Rust ricalcola la stessa
+                  proiezione prima di usare la credenziale o aprire la rete. Una
+                  modifica annulla automaticamente la conferma.
                 </small>
               </div>
             )}

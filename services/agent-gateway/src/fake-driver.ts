@@ -37,7 +37,11 @@ import {
   type SessionReport,
   type ValidatedPlan,
 } from "@kernaid/schemas";
-import { OfflineRulesProvider, type Provider } from "./fake-provider.js";
+import {
+  OfflineRulesProvider,
+  type Provider,
+  type ProviderContextPreview,
+} from "./fake-provider.js";
 import { InMemoryAuditSink } from "./audit-sink.js";
 import {
   redactForProvider,
@@ -53,6 +57,7 @@ const MAX_PROMPT_LENGTH = 8 * 1024;
 const MAX_PROPOSALS_PER_SESSION = 128;
 const MAX_APPROVALS_PER_SESSION = 128;
 const MAX_EVENTS_PER_SESSION = 1_024;
+const CONTEXT_SHA256 = /^sha256:[a-f0-9]{64}$/u;
 const LINUX_HARDWARE_INVENTORY_COLLECTOR = "linux.hardware.inventory";
 const LINUX_P0_COLLECTORS = [
   "linux.block.inventory",
@@ -133,6 +138,10 @@ interface SessionRecord {
   decisions: Approval[];
   events: ExecutionEvent[];
   linuxSnapshot?: LinuxSnapshotAdmission;
+  providerContextPreview?: {
+    binding: string;
+    preview: ProviderContextPreview;
+  };
 }
 
 interface LinuxSnapshotAdmission {
@@ -197,6 +206,41 @@ export class LocalSessionDriver implements SessionDriver {
     };
   }
 
+  async previewProviderContext(
+    sessionId: string,
+    prompt: string,
+  ): Promise<ProviderContextPreview> {
+    const session = this.session(sessionId);
+    return this.withSessionOperation(session, async () => {
+      this.ensureAuditHealthy(session);
+      if (session.state !== "observe" && session.state !== "diagnose")
+        throw new Error("session is not accepting provider previews");
+      if (!prompt.trim() || prompt.length > MAX_PROMPT_LENGTH)
+        throw new Error("objective is required and must be bounded");
+      if (session.evidence.length === 0)
+        throw new Error("evidence is required");
+      this.assertLinuxSnapshotAdmission(session);
+      if (this.provider.previewContext === undefined)
+        throw new Error("provider context preview is unavailable");
+      const objective = redactForProvider(prompt);
+      const records = this.providerRecords(session);
+      const preview = await this.provider.previewContext(objective, records);
+      if (
+        typeof preview.context !== "object" ||
+        preview.context === null ||
+        Array.isArray(preview.context) ||
+        !CONTEXT_SHA256.test(preview.contextSha256)
+      )
+        throw new Error("provider context preview is invalid");
+      const retained = structuredClone(preview);
+      session.providerContextPreview = {
+        binding: providerContextBinding(objective, session.evidence),
+        preview: retained,
+      };
+      return structuredClone(retained);
+    });
+  }
+
   async *sendUserPrompt(
     sessionId: string,
     prompt: string,
@@ -225,12 +269,16 @@ export class LocalSessionDriver implements SessionDriver {
           type: "status",
           message: "Analisi deterministica delle evidenze locali",
         });
-        const records = session.evidence.map((evidence) => ({
-          evidence: structuredClone(evidence),
-          content: this.content.get(evidence.id) ?? "",
-        }));
+        const objective = redactForProvider(prompt);
+        const records = this.providerRecords(session);
+        const preview = session.providerContextPreview;
+        const contextSha256 =
+          preview?.binding ===
+          providerContextBinding(objective, session.evidence)
+            ? preview.preview.contextSha256
+            : undefined;
         const providerProposal = parseDiagnosisProposal(
-          await this.provider.diagnose(redactForProvider(prompt), records),
+          await this.provider.diagnose(objective, records, { contextSha256 }),
         );
         const proposal = parseDiagnosisProposal({
           ...providerProposal,
@@ -329,6 +377,7 @@ export class LocalSessionDriver implements SessionDriver {
       );
       session.evidence.push(item);
       this.content.set(item.id, providerContent);
+      session.providerContextPreview = undefined;
       if (linuxSnapshot !== undefined) session.linuxSnapshot = linuxSnapshot;
       return [structuredClone(item)];
     });
@@ -709,6 +758,13 @@ export class LocalSessionDriver implements SessionDriver {
       throw new Error("proposal references evidence outside this session");
   }
 
+  private providerRecords(session: SessionRecord) {
+    return session.evidence.map((evidence) => ({
+      evidence: structuredClone(evidence),
+      content: this.content.get(evidence.id) ?? "",
+    }));
+  }
+
   private assertLinuxSnapshotAdmission(session: SessionRecord): void {
     const collectorCounts = new Map<string, number>();
     for (const evidence of session.evidence)
@@ -849,6 +905,16 @@ function arraysEqual(
     left.length === right.length &&
     left.every((value, index) => value === right[index])
   );
+}
+
+function providerContextBinding(
+  objective: string,
+  evidence: readonly Evidence[],
+): string {
+  return JSON.stringify({
+    objective,
+    evidence: evidence.map(({ id, sha256 }) => ({ id, sha256 })),
+  });
 }
 
 async function sha256(value: string): Promise<string> {

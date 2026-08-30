@@ -19,6 +19,13 @@ export interface ObservedEvidence {
 
 export interface ProviderRequestOptions {
   signal?: AbortSignal;
+  /** Opaque digest returned by an authoritative provider context preview. */
+  contextSha256?: string;
+}
+
+export interface ProviderContextPreview {
+  readonly context: unknown;
+  readonly contextSha256: string;
 }
 
 export type ProviderSecretSupplier = () =>
@@ -31,6 +38,11 @@ export interface Provider {
     evidence: readonly ObservedEvidence[],
     options?: ProviderRequestOptions,
   ): Promise<DiagnosisProposal>;
+  previewContext?(
+    objective: string,
+    evidence: readonly ObservedEvidence[],
+    options?: Omit<ProviderRequestOptions, "contextSha256">,
+  ): Promise<ProviderContextPreview>;
 }
 
 export type ProviderErrorCode =

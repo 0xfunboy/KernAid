@@ -255,7 +255,7 @@ test("Rescue OpenAI golden frames agree with the closed published schemas", () =
     readFileSync(new URL("manifest.json", root), "utf8"),
   ) as GoldenManifest;
   assert.equal(manifest.schemaVersion, 1);
-  assert.equal(manifest.validCases.length, 9);
+  assert.equal(manifest.validCases.length, 10);
   for (const golden of manifest.validCases) {
     assert.equal(
       validateRequest(

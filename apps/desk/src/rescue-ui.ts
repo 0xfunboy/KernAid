@@ -62,11 +62,6 @@ export type RescueDiagnosisWizardProgress = Record<
   RescueDiagnosisWizardStepState
 >;
 
-export interface RescueOpenAiPreviewEvidenceMetadata {
-  readonly id: string;
-  readonly collector: string;
-}
-
 export function rescueDiagnosisWizardProgress({
   vaultStatusReady,
   targetSelected,
@@ -93,21 +88,6 @@ export function rescueDiagnosisWizardProgress({
           : "pending",
     ]),
   ) as RescueDiagnosisWizardProgress;
-}
-
-/**
- * Binds a WebView-only acknowledgement to exactly the metadata displayed by
- * the Rescue preview. This is deliberately not a provider payload projection:
- * raw evidence content and credentials never enter this value.
- */
-export function rescueOpenAiPreviewAcknowledgementKey(
-  objective: string,
-  evidence: readonly RescueOpenAiPreviewEvidenceMetadata[],
-): string {
-  return JSON.stringify({
-    objective,
-    evidence: evidence.map(({ id, collector }) => ({ id, collector })),
-  });
 }
 
 export function tryStartRescueInspection(

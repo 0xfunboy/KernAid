@@ -13,7 +13,6 @@ import {
   rescueInspectionPresentation,
   rescueInspectionRequiresRestart,
   rescueInspectionResponseCurrent,
-  rescueOpenAiPreviewAcknowledgementKey,
   sameRescueInspection,
   sameRescueSelection,
   tryStartRescueInspection,
@@ -58,27 +57,6 @@ test("Rescue diagnosis wizard advances only through established state", () => {
       reportReady: true,
     }).report,
     "current",
-  );
-});
-
-test("OpenAI preview acknowledgement is bound only to visible metadata", () => {
-  const evidence = [{ id: "E-observed", collector: "rescue.read-only" }];
-  const first = rescueOpenAiPreviewAcknowledgementKey(
-    "Il PC non si avvia",
-    evidence,
-  );
-  assert.match(first, /Il PC non si avvia/u);
-  assert.match(first, /E-observed/u);
-  assert.doesNotMatch(first, /raw|token|passphrase/u);
-  assert.notEqual(
-    first,
-    rescueOpenAiPreviewAcknowledgementKey("Il PC si blocca", evidence),
-  );
-  assert.notEqual(
-    first,
-    rescueOpenAiPreviewAcknowledgementKey("Il PC non si avvia", [
-      { id: "E-new", collector: "rescue.read-only" },
-    ]),
   );
 });
 

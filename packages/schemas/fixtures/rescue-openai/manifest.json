@@ -7,6 +7,11 @@
       "response": "valid/status.response.raw"
     },
     {
+      "name": "windows-generic-context-preview",
+      "request": "valid/windows-generic-context-preview.request.raw",
+      "response": "valid/windows-generic-context-preview.response.raw"
+    },
+    {
       "name": "linux-malformed-fstab",
       "request": "valid/linux-malformed-fstab.request.raw",
       "response": "valid/linux-malformed-fstab.response.raw"

@@ -1510,7 +1510,8 @@ test("Rescue OpenAI golden requests preserve deterministic TypeScript parity", a
   ) as GoldenManifest;
   assert.equal(manifest.schemaVersion, 1);
   const diagnoseCases = manifest.validCases.filter(
-    ({ name }) => name !== "status",
+    ({ name }) =>
+      name !== "status" && name !== "windows-generic-context-preview",
   );
   assert.equal(diagnoseCases.length, 8);
   const provider = new PlatformOfflineRulesProvider();

@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { DiagnosisProposal } from "@kernaid/schemas";
 import { LocalSessionDriver, type ActionExecutor } from "../src/fake-driver.js";
-import type { ObservedEvidence, Provider } from "../src/fake-provider.js";
+import type {
+  ObservedEvidence,
+  Provider,
+  ProviderRequestOptions,
+} from "../src/fake-provider.js";
 import {
   redactForProvider,
   redactSecretsForLocalEvidence,
@@ -197,6 +201,56 @@ test("redacts provider credentials from prompts and evidence", async () => {
     observedContent: "Authorization: Bearer secret-token-value",
   });
   await drain(driver.sendUserPrompt(session.id, "key sk-test-supersecret"));
+});
+
+test("echoes only the authoritative preview digest into the bound diagnosis", async () => {
+  const contextSha256 = `sha256:${"c".repeat(64)}`;
+  class PreviewProvider implements Provider {
+    readonly capabilities = Object.freeze({
+      streaming: false,
+      structuredOutput: true,
+      toolRequests: false,
+      local: false,
+    });
+
+    async previewContext(
+      objective: string,
+      evidence: readonly ObservedEvidence[],
+    ) {
+      return {
+        context: { objective, evidenceId: evidence[0]?.evidence.id },
+        contextSha256,
+      };
+    }
+
+    async diagnose(
+      _objective: string,
+      evidence: readonly ObservedEvidence[],
+      options?: ProviderRequestOptions,
+    ): Promise<DiagnosisProposal> {
+      assert.equal(options?.contextSha256, contextSha256);
+      return {
+        schemaVersion: "1.0",
+        diagnosis: "Digest bound",
+        confidence: 0.7,
+        evidenceIds: evidence.map((item) => item.evidence.id),
+        requestedEvidence: [],
+      };
+    }
+  }
+  const driver = new LocalSessionDriver(new PreviewProvider());
+  const session = await driver.startSession({
+    targetFingerprint: fingerprint,
+    mode: "resident",
+  });
+  await driver.requestEvidence(session.id, {
+    collector: "test",
+    target: "fixture",
+    observedContent: "read-only evidence",
+  });
+  const preview = await driver.previewProviderContext(session.id, "diagnose");
+  assert.equal(preview.contextSha256, contextSha256);
+  await drain(driver.sendUserPrompt(session.id, "diagnose"));
 });
 
 test("hashes exactly the secret-redacted evidence retained at the local boundary", async () => {

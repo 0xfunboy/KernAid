@@ -3208,6 +3208,10 @@ class StaticContractTests(unittest.TestCase):
         self.assertIn("OPERATION='provider.openai.diagnose'", diagnose)
         self.assertIn("TIMEOUT=130.0", diagnose)
         self.assertIn("BUDGET=140.0", diagnose)
+        self.assertIn(
+            '"contextSha256":"sha256:422dbebc0f179cff9223cd1be89d41e8facce32145ca86ef8b4a59db779a04fb"',
+            diagnose,
+        )
         self.assertIn('error["code"]!="credential_unavailable"', diagnose)
         self.assertIn("OPERATION='provider.status'", status)
         self.assertIn("TIMEOUT=5.0", status)

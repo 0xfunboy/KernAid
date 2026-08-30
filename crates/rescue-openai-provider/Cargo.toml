@@ -8,6 +8,7 @@ kernaid-evidence = { path = "../evidence" }
 regex = "1.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
+sha2 = "0.10"
 
 [lints]
 workspace = true

@@ -919,6 +919,15 @@ fn serve_one(
             Ok(status) => ProviderResponse::status(request_id, status),
             Err(error) => ProviderResponse::error(request_id, ProviderOperation::Status, error),
         },
+        ProviderRequest::ContextPreview {
+            request_id,
+            preview,
+        } => ProviderResponse::context_preview(request_id, preview.clone()),
+        ProviderRequest::DiagnoseBindingMismatch { request_id } => ProviderResponse::error(
+            request_id,
+            ProviderOperation::Diagnose,
+            ProviderErrorCode::InvalidRequest,
+        ),
         ProviderRequest::Diagnose { request_id, .. } => {
             let prepared = match prepare_openai_exchange(&request) {
                 Ok(prepared) => prepared,
@@ -1149,6 +1158,9 @@ mod tests {
         include_bytes!("../../../packages/schemas/fixtures/rescue-openai/valid/status.request.raw");
     const DIAGNOSE_REQUEST: &[u8] = include_bytes!(
         "../../../packages/schemas/fixtures/rescue-openai/valid/linux-generic-canary.request.raw"
+    );
+    const CONTEXT_PREVIEW_REQUEST: &[u8] = include_bytes!(
+        "../../../packages/schemas/fixtures/rescue-openai/valid/windows-generic-context-preview.request.raw"
     );
     const OPENAI_RESPONSE: &[u8] = include_bytes!(
         "../../rescue-openai-provider/testdata/openai-responses-v1/linux-generic-canary.response.json"
@@ -1428,6 +1440,39 @@ mod tests {
         assert_eq!(vault.calls.get(), 0);
         assert_eq!(vault.borrow_calls.get(), 1);
         assert_eq!(openai.calls.get(), 1);
+    }
+
+    #[test]
+    fn context_preview_borrows_no_credential_and_performs_no_egress() {
+        let vault = FakeVault::configured();
+        let openai = FakeOpenAi::default();
+        let (_, response) = execute(CONTEXT_PREVIEW_REQUEST, &vault, &openai);
+        assert_eq!(response.operation(), ProviderOperation::ContextPreview);
+        assert!(response.context_preview_payload().is_some());
+        assert_eq!(vault.calls.get(), 0);
+        assert_eq!(vault.borrow_calls.get(), 0);
+        assert_eq!(openai.calls.get(), 0);
+    }
+
+    #[test]
+    fn context_digest_mismatch_fails_before_credential_or_egress() {
+        let vault = FakeVault::configured();
+        let openai = FakeOpenAi::default();
+        let valid = String::from_utf8(DIAGNOSE_REQUEST.to_vec()).expect("UTF-8 fixture");
+        let invalid = valid.replace(
+            "sha256:f2812750246df0fa9872fc8d5af373636edf5ae79121fdec380bc7dfc22a5b78",
+            "sha256:02812750246df0fa9872fc8d5af373636edf5ae79121fdec380bc7dfc22a5b78",
+        );
+        assert_ne!(valid, invalid);
+        let (_, response) = execute(invalid.as_bytes(), &vault, &openai);
+        assert_eq!(response.operation(), ProviderOperation::Diagnose);
+        assert_eq!(
+            response.error_code(),
+            Some(ProviderErrorCode::InvalidRequest)
+        );
+        assert_eq!(vault.calls.get(), 0);
+        assert_eq!(vault.borrow_calls.get(), 0);
+        assert_eq!(openai.calls.get(), 0);
     }
 
     #[test]

@@ -2,6 +2,7 @@ import {
   ProviderError,
   type ObservedEvidence,
   type Provider,
+  type ProviderContextPreview,
   type ProviderRequestOptions,
 } from "@kernaid/agent-gateway";
 import {
@@ -16,6 +17,7 @@ import {
 const API_VERSION = "kernaid.dev/rescue-openai/v1alpha1";
 const ENDPOINT = "/api/rescue/provider/openai";
 const STATUS_OPERATION = "provider.status";
+const CONTEXT_PREVIEW_OPERATION = "provider.openai.context-preview";
 const DIAGNOSE_OPERATION = "provider.openai.diagnose";
 const RESCUE_COLLECTOR =
   "rescue.installed-target.filesystem-content.read-only.v1";
@@ -32,6 +34,7 @@ const DIAGNOSE_TIMEOUT_MILLISECONDS = 143_000;
 const REQUEST_ID =
   /^O-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 const EVIDENCE_ID = /^E-[A-Za-z0-9-]+$/u;
+const CONTEXT_SHA256 = /^sha256:[a-f0-9]{64}$/u;
 const UTF8_ENCODER = new TextEncoder();
 const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
 
@@ -40,7 +43,10 @@ type Fetch = (
   init?: RequestInit,
 ) => Promise<Response>;
 
-type Operation = typeof STATUS_OPERATION | typeof DIAGNOSE_OPERATION;
+type Operation =
+  | typeof STATUS_OPERATION
+  | typeof CONTEXT_PREVIEW_OPERATION
+  | typeof DIAGNOSE_OPERATION;
 
 type RescueOpenAiErrorCode =
   | "busy"
@@ -65,6 +71,24 @@ export interface RescueOpenAiStatus {
     | "locking"
     | "faulted-reboot-required";
   credential: "unavailable" | "absent" | "configured";
+}
+
+export interface RescueOpenAiProjectedObservation {
+  readonly id: string;
+  readonly collector:
+    typeof RESCUE_COLLECTOR | typeof LINUX_NORMALIZED_SNAPSHOT_COLLECTOR;
+  readonly trust: "observed-untrusted";
+}
+
+export interface RescueOpenAiProjectedContext {
+  readonly objective: string;
+  readonly deterministicProposal: DiagnosisProposal;
+  readonly observations: readonly RescueOpenAiProjectedObservation[];
+}
+
+export interface RescueOpenAiContextPreview extends ProviderContextPreview {
+  readonly context: RescueOpenAiProjectedContext;
+  readonly contextSha256: string;
 }
 
 export type RescueProviderMode = "offline" | "openai";
@@ -232,6 +256,40 @@ export class RescueOpenAiProvider implements Provider {
     this.#fetch = fetchRequest;
   }
 
+  async previewContext(
+    objective: string,
+    evidence: readonly ObservedEvidence[],
+    options: Omit<ProviderRequestOptions, "contextSha256"> = {},
+  ): Promise<RescueOpenAiContextPreview> {
+    if (options.signal?.aborted)
+      throw new ProviderError("cancelled", "Anteprima OpenAI annullata.");
+    const rescueEvidence = await prepareEvidence(objective, evidence);
+    const requestId = newRequestId();
+    const response = await exchange(
+      this.#fetch,
+      requestId,
+      CONTEXT_PREVIEW_OPERATION,
+      {
+        apiVersion: API_VERSION,
+        requestId,
+        operation: CONTEXT_PREVIEW_OPERATION,
+        payload: {
+          objective,
+          evidence: [rescueEvidence],
+        },
+      },
+      STATUS_TIMEOUT_MILLISECONDS,
+    );
+    const preview = parseRescueOpenAiContextPreview(response);
+    const [observation] = preview.context.observations;
+    if (
+      observation?.id !== rescueEvidence.id ||
+      observation.collector !== rescueEvidence.collector
+    )
+      throw providerError("invalid_response");
+    return preview;
+  }
+
   async diagnose(
     objective: string,
     evidence: readonly ObservedEvidence[],
@@ -239,6 +297,11 @@ export class RescueOpenAiProvider implements Provider {
   ): Promise<DiagnosisProposal> {
     if (options.signal?.aborted)
       throw new ProviderError("cancelled", "Richiesta OpenAI annullata.");
+    if (
+      options.contextSha256 === undefined ||
+      !CONTEXT_SHA256.test(options.contextSha256)
+    )
+      throw providerError("invalid_request");
     const rescueEvidence = await prepareEvidence(objective, evidence);
     const requestId = newRequestId();
     const response = await exchange(
@@ -252,6 +315,7 @@ export class RescueOpenAiProvider implements Provider {
         payload: {
           objective,
           evidence: [rescueEvidence],
+          contextSha256: options.contextSha256,
         },
       },
       DIAGNOSE_TIMEOUT_MILLISECONDS,
@@ -274,6 +338,77 @@ export class RescueOpenAiProvider implements Provider {
       throw providerError("invalid_response");
     return proposal;
   }
+}
+
+export function parseRescueOpenAiContextPreview(
+  value: ProviderContextPreview | Record<string, unknown>,
+): RescueOpenAiContextPreview {
+  const payload = exactRecord(value, ["context", "contextSha256"]);
+  if (
+    typeof payload.contextSha256 !== "string" ||
+    !CONTEXT_SHA256.test(payload.contextSha256)
+  )
+    throw providerError("invalid_response");
+  const context = exactRecord(payload.context, [
+    "objective",
+    "deterministicProposal",
+    "observations",
+  ]);
+  if (
+    typeof context.objective !== "string" ||
+    !boundedNonemptyUtf8(context.objective, MAX_OBJECTIVE_BYTES)
+  )
+    throw providerError("invalid_response");
+  let deterministicProposal: DiagnosisProposal;
+  try {
+    deterministicProposal = parseDiagnosisProposal(
+      context.deterministicProposal,
+    );
+  } catch {
+    throw providerError("invalid_response");
+  }
+  if (
+    deterministicProposal.evidenceIds.length !== 1 ||
+    !boundedNonemptyUtf8(
+      deterministicProposal.diagnosis,
+      MAX_DIAGNOSIS_BYTES,
+    ) ||
+    deterministicProposal.requestedEvidence.some(
+      (item) => !boundedNonemptyUtf8(item, MAX_REQUESTED_EVIDENCE_BYTES),
+    ) ||
+    !Array.isArray(context.observations) ||
+    context.observations.length !== 1
+  )
+    throw providerError("invalid_response");
+  const observation = exactRecord(context.observations[0], [
+    "id",
+    "collector",
+    "trust",
+  ]);
+  if (
+    typeof observation.id !== "string" ||
+    !EVIDENCE_ID.test(observation.id) ||
+    utf8Length(observation.id) > 128 ||
+    (observation.collector !== RESCUE_COLLECTOR &&
+      observation.collector !== LINUX_NORMALIZED_SNAPSHOT_COLLECTOR) ||
+    deterministicProposal.evidenceIds[0] !== observation.id ||
+    observation.trust !== "observed-untrusted"
+  )
+    throw providerError("invalid_response");
+  return Object.freeze({
+    context: Object.freeze({
+      objective: context.objective,
+      deterministicProposal,
+      observations: Object.freeze([
+        Object.freeze({
+          id: observation.id,
+          collector: observation.collector,
+          trust: "observed-untrusted" as const,
+        }),
+      ]),
+    }),
+    contextSha256: payload.contextSha256,
+  });
 }
 
 async function prepareEvidence(

@@ -25,6 +25,7 @@ pub use openai_wire::{
     decode_openai_response, prepare_openai_exchange,
 };
 pub use rescue_corpus::{
-    DiagnosisProposal, MAX_EVIDENCE_CONTENT_BYTES, MAX_OBJECTIVE_BYTES, ProjectedObservation,
-    ProjectedProviderContext, RESCUE_EVIDENCE_COLLECTOR, RESCUE_EVIDENCE_TARGET,
+    DiagnosisProposal, MAX_EVIDENCE_CONTENT_BYTES, MAX_OBJECTIVE_BYTES,
+    PROVIDER_CONTEXT_HASH_DOMAIN, ProjectedObservation, ProjectedProviderContext,
+    ProviderContextPreview, RESCUE_EVIDENCE_COLLECTOR, RESCUE_EVIDENCE_TARGET,
 };

@@ -517,6 +517,18 @@ div.rescue-wizard-alert small {
   color: #50d8e8;
   font-size: 10px;
 }
+.rescue-wizard-preview pre {
+  max-height: 220px;
+  margin: 0;
+  padding: 10px;
+  overflow: auto;
+  color: #bde8d2;
+  border: 1px solid #314139;
+  border-radius: 6px;
+  background: #101612;
+  font-size: 10px;
+  white-space: pre-wrap;
+}
 .rescue-wizard-preview > small {
   color: #91a097;
   letter-spacing: 0;

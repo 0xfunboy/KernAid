@@ -51,10 +51,12 @@ import {
 } from "./native";
 import {
   getRescueOpenAiStatus,
+  parseRescueOpenAiContextPreview,
   rescueOpenAiReady,
   RescueOpenAiProvider,
   RescueProviderSessionBinding,
   transitionRescueProviderMode,
+  type RescueOpenAiContextPreview,
   type RescueOpenAiStatus,
   type RescueProviderMode,
   type RescueProviderPreparation,
@@ -103,6 +105,16 @@ function App() {
   const [providerLogoutBusy, setProviderLogoutBusy] = useState(false);
   const providerLogoutInFlight = useRef(false);
   const [objective, setObjective] = useState("");
+  const [rescueOpenAiContextPreview, setRescueOpenAiContextPreview] =
+    useState<RescueOpenAiContextPreview>();
+  const [
+    rescueOpenAiAcceptedContextSha256,
+    setRescueOpenAiAcceptedContextSha256,
+  ] = useState<string>();
+  const [rescueOpenAiPreviewBusy, setRescueOpenAiPreviewBusy] = useState(false);
+  const [rescueOpenAiPreviewError, setRescueOpenAiPreviewError] =
+    useState<string>();
+  const rescueOpenAiPreviewEpoch = useRef(0);
   const [workflow, setWorkflow] = useState<Workflow>("Observe");
   const [status, setStatus] = useState("Pronto per una diagnosi sicura.");
   const [busy, setBusy] = useState(false);
@@ -310,6 +322,7 @@ function App() {
     if (isRescueRuntime())
       rescueProviderBinding.current.clearSessionAndPreparation();
     setEvidence([]);
+    clearRescueOpenAiPreview();
     setProposal(undefined);
     setPlan(undefined);
     setReport(undefined);
@@ -320,6 +333,64 @@ function App() {
     setSessionDriver(undefined);
     setSessionRescueTarget(undefined);
     setWorkflow("Observe");
+  }
+
+  function clearRescueOpenAiPreview() {
+    rescueOpenAiPreviewEpoch.current += 1;
+    setRescueOpenAiContextPreview(undefined);
+    setRescueOpenAiAcceptedContextSha256(undefined);
+    setRescueOpenAiPreviewError(undefined);
+    setRescueOpenAiPreviewBusy(false);
+  }
+
+  function changeObjective(value: string) {
+    setObjective(value);
+    clearRescueOpenAiPreview();
+  }
+
+  function acceptRescueOpenAiContext(contextSha256: string) {
+    if (rescueOpenAiContextPreview?.contextSha256 !== contextSha256) return;
+    setRescueOpenAiAcceptedContextSha256(contextSha256);
+  }
+
+  async function previewRescueOpenAiContext() {
+    if (
+      providerMode !== "openai" ||
+      !objective.trim() ||
+      sessionId === undefined ||
+      sessionDriver === undefined ||
+      evidence.length !== 1 ||
+      rescueOpenAiPreviewBusy ||
+      busy ||
+      !rescueProviderBinding.current.sessionMatches("openai")
+    )
+      return;
+    const epoch = rescueOpenAiPreviewEpoch.current + 1;
+    rescueOpenAiPreviewEpoch.current = epoch;
+    const activeDriver = sessionDriver;
+    const activeSessionId = sessionId;
+    const activeObjective = objective;
+    setRescueOpenAiPreviewBusy(true);
+    setRescueOpenAiAcceptedContextSha256(undefined);
+    setRescueOpenAiPreviewError(undefined);
+    try {
+      const preview = await activeDriver.previewProviderContext(
+        activeSessionId,
+        activeObjective,
+      );
+      if (rescueOpenAiPreviewEpoch.current !== epoch) return;
+      setRescueOpenAiContextPreview(parseRescueOpenAiContextPreview(preview));
+    } catch {
+      if (rescueOpenAiPreviewEpoch.current !== epoch) return;
+      setRescueOpenAiContextPreview(undefined);
+      setRescueOpenAiAcceptedContextSha256(undefined);
+      setRescueOpenAiPreviewError(
+        "Anteprima non disponibile: riprova senza inserire dati personali.",
+      );
+    } finally {
+      if (rescueOpenAiPreviewEpoch.current === epoch)
+        setRescueOpenAiPreviewBusy(false);
+    }
   }
 
   function invalidateRescuePreparedState() {
@@ -338,6 +409,10 @@ function App() {
       !sameRescueInspection(selectedRescueTarget, rescueInspection) ||
       sessionId === undefined ||
       sessionDriver === undefined ||
+      (providerMode === "openai" &&
+        (rescueOpenAiContextPreview === undefined ||
+          rescueOpenAiAcceptedContextSha256 !==
+            rescueOpenAiContextPreview.contextSha256)) ||
       !rescueProviderBinding.current.sessionMatches(providerMode)
     )
       return;
@@ -1228,6 +1303,10 @@ function App() {
             }
             objective={objective}
             evidence={evidence}
+            openAiContextPreview={rescueOpenAiContextPreview}
+            openAiAcceptedContextSha256={rescueOpenAiAcceptedContextSha256}
+            openAiPreviewBusy={rescueOpenAiPreviewBusy}
+            openAiPreviewError={rescueOpenAiPreviewError}
             proposal={proposal}
             status={status}
             busy={busy}
@@ -1262,7 +1341,9 @@ function App() {
             onSelectTarget={chooseRescueTarget}
             onChooseProvider={chooseProvider}
             onInspectTarget={inspectSelectedRescueTarget}
-            onObjectiveChange={setObjective}
+            onObjectiveChange={changeObjective}
+            onPreviewOpenAiContext={previewRescueOpenAiContext}
+            onAcceptOpenAiContext={acceptRescueOpenAiContext}
             onDiagnose={diagnose}
           />
         ) : (
