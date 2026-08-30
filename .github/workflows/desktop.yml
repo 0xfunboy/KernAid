@@ -38,42 +38,43 @@ on:
       - ".github/workflows/desktop.yml"
 permissions: { contents: read }
 jobs:
+  prepare_matrix:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
+    steps:
+      - id: select
+        name: Select native package targets
+        env:
+          PLATFORM_FILTER: ${{ github.event_name == 'workflow_dispatch' && inputs.platform || 'all' }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+
+          targets = [
+              {"platform": "ubuntu-24.04", "name": "linux-x86_64", "args": "", "targets": "", "bundle_root": "target/release/bundle", "companion": "target/release/kernaid-provider-key", "companion_upload": "kernaid-provider-key-linux-x86_64.tar.gz"},
+              {"platform": "windows-latest", "name": "windows-x86_64", "args": "", "targets": "", "bundle_root": "target/release/bundle", "companion": "target/release/kernaid-provider-key.exe", "companion_upload": "target/release/kernaid-provider-key.exe"},
+              {"platform": "macos-latest", "name": "macos-aarch64", "args": "--target aarch64-apple-darwin", "targets": "aarch64-apple-darwin", "bundle_root": "target/aarch64-apple-darwin/release/bundle", "companion": "target/aarch64-apple-darwin/release/kernaid-provider-key", "companion_upload": "kernaid-provider-key-macos-aarch64.tar.gz"},
+              {"platform": "macos-latest", "name": "macos-x86_64", "args": "--target x86_64-apple-darwin", "targets": "x86_64-apple-darwin", "bundle_root": "target/x86_64-apple-darwin/release/bundle", "companion": "target/x86_64-apple-darwin/release/kernaid-provider-key", "companion_upload": "kernaid-provider-key-macos-x86_64.tar.gz"},
+          ]
+          selected = os.environ["PLATFORM_FILTER"]
+          if selected != "all":
+              targets = [target for target in targets if target["name"] == selected]
+              if len(targets) != 1:
+                  raise SystemExit("unsupported desktop platform filter")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write("matrix=" + json.dumps({"include": targets}, separators=(",", ":")) + "\n")
+          PY
+
   build:
+    needs: prepare_matrix
     env:
       KERNAID_REPAIR_CANDIDATE: "0"
     strategy:
       fail-fast: false
-      matrix:
-        name: ${{ fromJSON((github.event_name == 'workflow_dispatch' && inputs.platform != 'all') && format('["{0}"]', inputs.platform) || '["linux-x86_64","windows-x86_64","macos-aarch64","macos-x86_64"]') }}
-        include:
-          - platform: ubuntu-24.04
-            name: linux-x86_64
-            args: ""
-            targets: ""
-            bundle_root: target/release/bundle
-            companion: target/release/kernaid-provider-key
-            companion_upload: kernaid-provider-key-linux-x86_64.tar.gz
-          - platform: windows-latest
-            name: windows-x86_64
-            args: ""
-            targets: ""
-            bundle_root: target/release/bundle
-            companion: target/release/kernaid-provider-key.exe
-            companion_upload: target/release/kernaid-provider-key.exe
-          - platform: macos-latest
-            name: macos-aarch64
-            args: --target aarch64-apple-darwin
-            targets: aarch64-apple-darwin
-            bundle_root: target/aarch64-apple-darwin/release/bundle
-            companion: target/aarch64-apple-darwin/release/kernaid-provider-key
-            companion_upload: kernaid-provider-key-macos-aarch64.tar.gz
-          - platform: macos-latest
-            name: macos-x86_64
-            args: --target x86_64-apple-darwin
-            targets: x86_64-apple-darwin
-            bundle_root: target/x86_64-apple-darwin/release/bundle
-            companion: target/x86_64-apple-darwin/release/kernaid-provider-key
-            companion_upload: kernaid-provider-key-macos-x86_64.tar.gz
+      matrix: ${{ fromJSON(needs.prepare_matrix.outputs.matrix) }}
     runs-on: ${{ matrix.platform }}
     timeout-minutes: 60
     steps:
