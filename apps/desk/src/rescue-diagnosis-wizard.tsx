@@ -1,0 +1,549 @@
+import React, { useState } from "react";
+import type { ArtifactRef } from "@kernaid/session-driver";
+import type { DiagnosisProposal, Evidence } from "@kernaid/schemas";
+import type {
+  RescueOfflineInspection,
+  RescueOfflineInspectionError,
+  RescueTargetCandidate,
+  RescueTargetScan,
+  RescueTargetSelection,
+} from "./native";
+import type { RescueProviderMode } from "./rescue-openai";
+import {
+  jsonReportDownloadLabel,
+  jsonReportDownloadName,
+  UNSIGNED_MARKDOWN_DOWNLOAD_LABEL,
+  type MarkdownReportExport,
+} from "./report-export";
+import {
+  RESCUE_DIAGNOSIS_WIZARD_STEPS,
+  rescueCandidatePresentation,
+  rescueDiagnosisWizardProgress,
+  rescueInspectionErrorPresentation,
+  rescueInspectionPresentation,
+  rescueOpenAiPreviewAcknowledgementKey,
+  targetFamilyLabel,
+} from "./rescue-ui";
+
+const STEP_LABELS = {
+  vault: "Vault",
+  target: "Target",
+  provider: "Provider",
+  diagnosis: "Diagnosi",
+  report: "Report",
+} as const;
+
+export interface RescueDiagnosisWizardProps {
+  readonly vaultStatusReady: boolean;
+  readonly vaultLabel: string;
+  readonly vaultGuidance: string;
+  readonly persistentAuditReady: boolean;
+  readonly targetScan?: RescueTargetScan;
+  readonly selectedTarget?: RescueTargetSelection;
+  readonly targetReady: boolean;
+  readonly targetBusy: boolean;
+  readonly targetError?: string;
+  readonly inspection?: RescueOfflineInspection;
+  readonly inspectionError?: RescueOfflineInspectionError;
+  readonly inspectionCurrent: boolean;
+  readonly inspectionBusy: boolean;
+  readonly inspectionBlocked: boolean;
+  readonly providerMode: RescueProviderMode;
+  readonly openAiReady: boolean;
+  readonly providerSelectionDisabled: boolean;
+  readonly inspectDisabled: boolean;
+  readonly objective: string;
+  readonly evidence: readonly Evidence[];
+  readonly proposal?: DiagnosisProposal;
+  readonly status: string;
+  readonly busy: boolean;
+  readonly diagnosisDisabled: boolean;
+  readonly diagnosisButtonLabel: string;
+  readonly report?: ArtifactRef;
+  readonly sessionId?: string;
+  readonly markdownReport?: MarkdownReportExport;
+  readonly markdownReportError: boolean;
+  readonly onRefreshTargets: () => void | Promise<void>;
+  readonly onSelectTarget: (
+    candidate: RescueTargetCandidate,
+  ) => void | Promise<void>;
+  readonly onChooseProvider: (mode: RescueProviderMode) => void;
+  readonly onInspectTarget: () => void | Promise<void>;
+  readonly onObjectiveChange: (value: string) => void;
+  readonly onDiagnose: () => void | Promise<void>;
+}
+
+export function RescueDiagnosisWizard({
+  vaultStatusReady,
+  vaultLabel,
+  vaultGuidance,
+  persistentAuditReady,
+  targetScan,
+  selectedTarget,
+  targetReady,
+  targetBusy,
+  targetError,
+  inspection,
+  inspectionError,
+  inspectionCurrent,
+  inspectionBusy,
+  inspectionBlocked,
+  providerMode,
+  openAiReady,
+  providerSelectionDisabled,
+  inspectDisabled,
+  objective,
+  evidence,
+  proposal,
+  status,
+  busy,
+  diagnosisDisabled,
+  diagnosisButtonLabel,
+  report,
+  sessionId,
+  markdownReport,
+  markdownReportError,
+  onRefreshTargets,
+  onSelectTarget,
+  onChooseProvider,
+  onInspectTarget,
+  onObjectiveChange,
+  onDiagnose,
+}: RescueDiagnosisWizardProps) {
+  const reportReady = report !== undefined && sessionId !== undefined;
+  const progress = rescueDiagnosisWizardProgress({
+    vaultStatusReady,
+    targetSelected: selectedTarget !== undefined,
+    inspectionReady: inspectionCurrent,
+    reportReady,
+  });
+  const previewKey = rescueOpenAiPreviewAcknowledgementKey(objective, evidence);
+  const [acceptedPreviewKey, setAcceptedPreviewKey] = useState<string>();
+  const previewAccepted =
+    providerMode !== "openai" ||
+    (evidence.length > 0 && acceptedPreviewKey === previewKey);
+  const inspectionView =
+    inspectionCurrent && inspection !== undefined
+      ? rescueInspectionPresentation(inspection)
+      : undefined;
+  const inspectionErrorView =
+    inspectionError === undefined
+      ? undefined
+      : rescueInspectionErrorPresentation(inspectionError);
+
+  return (
+    <div className="rescue-wizard" aria-label="Diagnosi guidata Rescue">
+      <div className="rescue-wizard-heading">
+        <div>
+          <small>KERNAID RESCUE · GUIDED MODE</small>
+          <h1>Controlliamo il PC senza modificarlo.</h1>
+          <p>
+            Segui i cinque passaggi. La modalità iniziale è offline e ogni
+            osservazione del disco resta in sola lettura.
+          </p>
+        </div>
+        <span className="rescue-wizard-safety">DIAGNOSIS ONLY</span>
+      </div>
+
+      <ol className="rescue-wizard-progress" aria-label="Avanzamento">
+        {RESCUE_DIAGNOSIS_WIZARD_STEPS.map((step, index) => (
+          <li
+            className={progress[step]}
+            aria-current={progress[step] === "current" ? "step" : undefined}
+            key={step}
+          >
+            <span>{index + 1}</span>
+            <b>{STEP_LABELS[step]}</b>
+          </li>
+        ))}
+      </ol>
+
+      <div
+        className={`rescue-wizard-card ${progress.vault}`}
+        aria-current={progress.vault === "current" ? "step" : undefined}
+      >
+        <WizardCardTitle
+          number="01"
+          title="Vault e salvataggio"
+          state={progress.vault}
+        />
+        {!vaultStatusReady ? (
+          <p role="status">Verifica dello stato del Vault…</p>
+        ) : (
+          <div className="rescue-wizard-summary">
+            <div>
+              <b>{vaultLabel}</b>
+              <small>
+                {persistentAuditReady
+                  ? "Report persistente disponibile."
+                  : "Puoi continuare offline; il report resterà temporaneo."}
+              </small>
+            </div>
+            {!persistentAuditReady && <p>{vaultGuidance}</p>}
+            <small>
+              Passphrase e credenziali si gestiscono fuori da Desk: questa
+              pagina non le richiede, non le riceve e non le memorizza.
+            </small>
+          </div>
+        )}
+      </div>
+
+      <div
+        className={`rescue-wizard-card ${progress.target}`}
+        aria-current={progress.target === "current" ? "step" : undefined}
+      >
+        <WizardCardTitle
+          number="02"
+          title="Scegli il sistema da controllare"
+          state={progress.target}
+        />
+        {progress.target === "pending" && (
+          <p>Attendi il controllo iniziale del Vault.</p>
+        )}
+        {progress.target === "current" && (
+          <div className="rescue-wizard-targets">
+            <p>
+              KernAid mostra solo candidati identificati dai metadati. Il
+              contenuto non viene aperto durante questa scelta.
+            </p>
+            <button
+              className="rescue-wizard-secondary"
+              disabled={targetBusy || inspectionBusy || busy}
+              onClick={() => void onRefreshTargets()}
+            >
+              {targetBusy ? "Scansione…" : "Ripeti scansione"}
+            </button>
+            <div className="rescue-wizard-target-grid">
+              {targetScan?.candidates.map((candidate, index) => {
+                const item = rescueCandidatePresentation(
+                  targetScan,
+                  candidate,
+                  index,
+                );
+                return (
+                  <button
+                    className={
+                      selectedTarget?.target.targetId === candidate.targetId
+                        ? "selected"
+                        : ""
+                    }
+                    disabled={targetBusy || inspectionBusy || busy}
+                    key={candidate.targetId}
+                    onClick={() => void onSelectTarget(candidate)}
+                  >
+                    <b>{item.title}</b>
+                    <small>{item.detail}</small>
+                  </button>
+                );
+              })}
+            </div>
+            {targetReady && targetScan?.candidates.length === 0 && (
+              <p className="rescue-wizard-alert">
+                Nessun sistema selezionabile in modo sicuro.
+              </p>
+            )}
+            {targetScan?.disks
+              .filter((disk) => !disk.selectionEligible)
+              .map((disk) => (
+                <small key={disk.id}>
+                  Escluso {disk.ref}: {disk.exclusionReasons.join(", ")}
+                </small>
+              ))}
+            {targetError && (
+              <p className="rescue-wizard-alert" role="alert">
+                {targetError}
+              </p>
+            )}
+          </div>
+        )}
+        {progress.target === "complete" && selectedTarget && (
+          <div className="rescue-wizard-summary">
+            <b>
+              {targetFamilyLabel(selectedTarget.target.osFamilyHint)} ·{" "}
+              {selectedTarget.target.sourceRef}
+            </b>
+            <small>Identità metadata-only rivalidata.</small>
+          </div>
+        )}
+      </div>
+
+      <div
+        className={`rescue-wizard-card ${progress.provider}`}
+        aria-current={progress.provider === "current" ? "step" : undefined}
+      >
+        <WizardCardTitle
+          number="03"
+          title="Scegli come analizzare"
+          state={progress.provider}
+          optional
+        />
+        {progress.provider === "pending" && (
+          <p>Prima seleziona il sistema installato.</p>
+        )}
+        {progress.provider === "current" && (
+          <div className="rescue-wizard-provider">
+            <div className="rescue-wizard-choice-grid">
+              <button
+                aria-pressed={providerMode === "offline"}
+                disabled={providerSelectionDisabled}
+                onClick={() => onChooseProvider("offline")}
+              >
+                <b>Offline</b>
+                <small>
+                  Predefinito · nessun dato inviato · funziona senza Internet
+                </small>
+              </button>
+              <button
+                aria-pressed={providerMode === "openai"}
+                disabled={providerSelectionDisabled || !openAiReady}
+                onClick={() => onChooseProvider("openai")}
+              >
+                <b>OpenAI</b>
+                <small>
+                  Facoltativo · richiede Vault pronto e conferma anteprima
+                </small>
+              </button>
+            </div>
+            {!openAiReady && (
+              <p className="rescue-wizard-note">{vaultGuidance}</p>
+            )}
+            {inspectionErrorView && (
+              <div
+                className={`rescue-wizard-alert ${inspectionErrorView.severity}`}
+                role="alert"
+              >
+                <b>{inspectionErrorView.title}</b>
+                <small>{inspectionErrorView.detail}</small>
+                <small>{inspectionErrorView.action}</small>
+              </div>
+            )}
+            <button
+              className="rescue-wizard-primary"
+              disabled={inspectDisabled}
+              onClick={() => void onInspectTarget()}
+            >
+              {inspectionBlocked
+                ? "Riavvio Rescue richiesto"
+                : inspectionBusy
+                  ? "Ispezione read-only…"
+                  : `Continua con ${providerMode === "openai" ? "OpenAI" : "Offline"}`}
+            </button>
+            <small>
+              Il target sarà aperto temporaneamente in sola lettura con cleanup
+              verificato. Nessun path, comando o segreto proviene dal WebView.
+            </small>
+          </div>
+        )}
+        {progress.provider === "complete" && (
+          <div className="rescue-wizard-summary">
+            <b>{providerMode === "openai" ? "OpenAI" : "Offline rules"}</b>
+            <small>
+              Provider vincolato alla sessione e al target corrente.
+            </small>
+          </div>
+        )}
+      </div>
+
+      <div
+        className={`rescue-wizard-card ${progress.diagnosis}`}
+        aria-current={progress.diagnosis === "current" ? "step" : undefined}
+      >
+        <WizardCardTitle
+          number="04"
+          title="Descrivi il problema"
+          state={progress.diagnosis}
+        />
+        {progress.diagnosis === "pending" && (
+          <p>Completa la preparazione read-only del target.</p>
+        )}
+        {(progress.diagnosis === "current" || reportReady) && (
+          <div className="rescue-wizard-diagnosis">
+            {inspectionView && (
+              <div className="rescue-wizard-inspection" role="status">
+                <b>{inspectionView.title}</b>
+                <small>{inspectionView.detail}</small>
+                {inspectionView.facts.map((fact) => (
+                  <small key={fact}>{fact}</small>
+                ))}
+              </div>
+            )}
+            {!reportReady && (
+              <>
+                <label htmlFor="rescue-objective">
+                  Cosa non funziona?
+                  <small>
+                    Non inserire password, token, email o altri dati personali.
+                  </small>
+                </label>
+                <textarea
+                  id="rescue-objective"
+                  value={objective}
+                  onChange={(event) => onObjectiveChange(event.target.value)}
+                  placeholder="Esempio: Windows non si avvia dopo un aggiornamento…"
+                />
+              </>
+            )}
+
+            {providerMode === "openai" && !reportReady && (
+              <div
+                className="rescue-wizard-preview"
+                role="region"
+                aria-label="Anteprima OpenAI"
+              >
+                <div>
+                  <small>ANTEPRIMA PRIMA DELL’INVIO</small>
+                  <b>Contesto noto al WebView</b>
+                </div>
+                <dl>
+                  <dt>Obiettivo</dt>
+                  <dd>{objective || "Non ancora inserito"}</dd>
+                  <dt>Metadati evidenze</dt>
+                  <dd>
+                    {evidence.length
+                      ? evidence.map((item) => (
+                          <code key={item.id}>
+                            {item.id} · {item.collector}
+                          </code>
+                        ))
+                      : "Non ancora disponibili"}
+                  </dd>
+                  <dt>Corpus grezzo</dt>
+                  <dd>Resta locale sul computer</dd>
+                  <dt>Payload esatto</dt>
+                  <dd>
+                    Non disponibile: questa versione non espone un’API di
+                    proiezione. KernAid non dichiara questa lista come payload
+                    esatto.
+                  </dd>
+                </dl>
+                <button
+                  className="rescue-wizard-secondary"
+                  disabled={!objective.trim() || evidence.length === 0}
+                  onClick={() => setAcceptedPreviewKey(previewKey)}
+                >
+                  {previewAccepted
+                    ? "Anteprima confermata"
+                    : "Conferma questa anteprima"}
+                </button>
+                <small>
+                  La conferma vale solo per questo obiettivo e questi ID; una
+                  modifica la annulla automaticamente. Nessuna credenziale è
+                  mostrata o trasmessa dal browser.
+                </small>
+              </div>
+            )}
+
+            {!reportReady && (
+              <button
+                className="rescue-wizard-primary"
+                disabled={diagnosisDisabled || !previewAccepted}
+                onClick={() => void onDiagnose()}
+              >
+                {busy ? "Analisi…" : diagnosisButtonLabel}
+              </button>
+            )}
+            <p className="rescue-wizard-live-status" role="status">
+              {status}
+            </p>
+            {proposal && (
+              <div className="rescue-wizard-result">
+                <small>RISULTATO DIAGNOSTICO</small>
+                <h2>{proposal.diagnosis}</h2>
+                <p>
+                  Confidenza {Math.round(proposal.confidence * 100)}% ·{" "}
+                  {proposal.evidenceIds.length} evidenze collegate
+                </p>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      <div
+        className={`rescue-wizard-card ${progress.report}`}
+        aria-current={progress.report === "current" ? "step" : undefined}
+      >
+        <WizardCardTitle
+          number="05"
+          title="Salva il report"
+          state={progress.report}
+        />
+        {!reportReady ? (
+          <p>Il report sarà disponibile al termine della diagnosi.</p>
+        ) : (
+          <div className="rescue-wizard-report">
+            <p>
+              {report.auditStatus.signed
+                ? "Il JSON firmato è persistito anche nel Vault Rescue."
+                : "Report temporaneo: JSON e Markdown non sono firmati."}
+            </p>
+            <div className="report-actions">
+              <a
+                href={report.uri}
+                download={jsonReportDownloadName(report, sessionId)}
+              >
+                {jsonReportDownloadLabel(report)}
+              </a>
+              {markdownReport && (
+                <a
+                  href={markdownReport.uri}
+                  download={markdownReport.downloadName}
+                >
+                  {UNSIGNED_MARKDOWN_DOWNLOAD_LABEL}
+                </a>
+              )}
+            </div>
+            <small>
+              JSON SHA-256 <code>{report.sha256.slice(0, 12)}…</code>
+              {markdownReport && (
+                <>
+                  {" "}
+                  · Markdown SHA-256{" "}
+                  <code>{markdownReport.sha256.slice(0, 12)}…</code>
+                </>
+              )}
+            </small>
+            {!markdownReport && !markdownReportError && (
+              <small>Preparazione della copia Markdown non firmata…</small>
+            )}
+            {markdownReportError && (
+              <small>
+                Markdown non disponibile: il JSON non ha superato la validazione
+                locale.
+              </small>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function WizardCardTitle({
+  number,
+  title,
+  state,
+  optional = false,
+}: {
+  readonly number: string;
+  readonly title: string;
+  readonly state: "complete" | "current" | "pending";
+  readonly optional?: boolean;
+}) {
+  return (
+    <div className="rescue-wizard-card-title">
+      <span>{number}</span>
+      <div>
+        <b>{title}</b>
+        {optional && <small>FACOLTATIVO · OFFLINE È PREDEFINITO</small>}
+      </div>
+      <small>
+        {state === "complete"
+          ? "VERIFICATO"
+          : state === "current"
+            ? "ORA"
+            : "DOPO"}
+      </small>
+    </div>
+  );
+}

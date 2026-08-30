@@ -68,10 +68,8 @@ import {
   type MarkdownReportExport,
 } from "./report-export";
 import {
-  formatBytes,
   finishRescueInspection,
   observationStatus,
-  rescueCandidatePresentation,
   rescueInspectionErrorPresentation,
   rescueInspectionFailureDisposition,
   rescueInspectionNeedsRescan,
@@ -85,6 +83,7 @@ import {
   type InventoryCategory,
 } from "./rescue-ui";
 import { FixtureRepairLabPanel } from "./fixture-repair-lab-panel";
+import { RescueDiagnosisWizard } from "./rescue-diagnosis-wizard";
 import { RescueRepairPanel } from "./rescue-repair-entry";
 import "./style.css";
 
@@ -100,6 +99,7 @@ function App() {
   const [openAiStatus, setOpenAiStatus] = useState<
     ResidentOpenAiStatus | RescueOpenAiStatus
   >();
+  const [openAiStatusReady, setOpenAiStatusReady] = useState(false);
   const [providerLogoutBusy, setProviderLogoutBusy] = useState(false);
   const providerLogoutInFlight = useRef(false);
   const [objective, setObjective] = useState("");
@@ -225,6 +225,9 @@ function App() {
       })
       .catch(() => {
         if (!cancelled) setOpenAiStatus(undefined);
+      })
+      .finally(() => {
+        if (!cancelled) setOpenAiStatusReady(true);
       });
     return () => {
       cancelled = true;
@@ -1043,10 +1046,6 @@ function App() {
     rescueInspection === undefined
       ? undefined
       : rescueInspectionPresentation(rescueInspection);
-  const rescueInspectionErrorView =
-    rescueInspectionError === undefined
-      ? undefined
-      : rescueInspectionErrorPresentation(rescueInspectionError);
   const categories: InventoryCategory[] = [
     "Hardware",
     "Storage",
@@ -1059,7 +1058,7 @@ function App() {
       <header>
         <strong>KernAid</strong>
         <div className="runtime-summary">
-          {(isNative() || isRescueRuntime()) && (
+          {isNative() && (
             <div className="provider-switch" aria-label="Provider diagnostico">
               <button
                 aria-pressed={providerMode === "offline"}
@@ -1115,9 +1114,6 @@ function App() {
               <code>configure</code> il companion nativo estratto
             </small>
           )}
-          {isRescueRuntime() && !openAiReady && (
-            <small>{rescueOpenAiGuidance(openAiStatus)}</small>
-          )}
         </div>
       </header>
       <aside>
@@ -1136,108 +1132,20 @@ function App() {
               : "Linux fixture"}
         </h2>
         {isRescueRuntime() && (
-          <div className="target-picker">
+          <div className="target-overview">
+            <small>
+              {rescueInspectionCurrent
+                ? "Ispezione read-only completata"
+                : selectedRescueTarget
+                  ? "Metadati target selezionati"
+                  : rescueTargetBusy
+                    ? "Scansione target in corso"
+                    : "Usa il percorso guidato al centro"}
+            </small>
             <p>
-              La scansione usa soli metadati. Dopo la selezione puoi avviare
-              un'ispezione temporanea read-only con cleanup verificato.
+              Il runtime live e il sistema installato restano due contesti
+              separati.
             </p>
-            <button
-              disabled={
-                rescueTargetBusy ||
-                rescueInspectionBusy ||
-                rescueInspectionBlocked ||
-                busy
-              }
-              onClick={refreshRescueTargets}
-            >
-              {rescueTargetBusy ? "Scansione…" : "Ripeti scansione target"}
-            </button>
-            {rescueTargetScan?.candidates.map((candidate, index) => {
-              const presentation = rescueCandidatePresentation(
-                rescueTargetScan,
-                candidate,
-                index,
-              );
-              return (
-                <button
-                  className={
-                    selectedRescueTarget?.target.targetId === candidate.targetId
-                      ? "selected-target"
-                      : ""
-                  }
-                  disabled={
-                    rescueTargetBusy ||
-                    rescueInspectionBusy ||
-                    rescueInspectionBlocked ||
-                    busy
-                  }
-                  key={candidate.targetId}
-                  onClick={() => chooseRescueTarget(candidate)}
-                >
-                  <b>{presentation.title}</b>
-                  <small>{presentation.detail}</small>
-                </button>
-              );
-            })}
-            {selectedRescueTarget &&
-              !rescueInspectionCurrent &&
-              (rescueInspectionError === undefined ||
-                rescueInspectionError.retryable) && (
-                <button
-                  className="inspect-target"
-                  disabled={
-                    rescueTargetBusy ||
-                    rescueInspectionBusy ||
-                    rescueInspectionBlocked ||
-                    busy
-                  }
-                  onClick={inspectSelectedRescueTarget}
-                >
-                  <b>
-                    {rescueInspectionBusy
-                      ? "Ispezione read-only…"
-                      : "Ispeziona target in sola lettura"}
-                  </b>
-                  <small>
-                    Nessun comando, path, opzione mount o credenziale viene
-                    inviato dal browser.
-                  </small>
-                </button>
-              )}
-            {rescueInspectionView && rescueInspectionCurrent && (
-              <div className="inspection-result" role="status">
-                <b>{rescueInspectionView.title}</b>
-                <small>{rescueInspectionView.detail}</small>
-                {rescueInspectionView.facts.map((fact) => (
-                  <small key={fact}>{fact}</small>
-                ))}
-                <small>
-                  Contenuto osservato non attendibile · non istruzioni
-                </small>
-              </div>
-            )}
-            {rescueInspectionErrorView && (
-              <div
-                className={`inspection-error ${rescueInspectionErrorView.severity}`}
-                role="alert"
-              >
-                <b>{rescueInspectionErrorView.title}</b>
-                <small>{rescueInspectionErrorView.detail}</small>
-                <small>{rescueInspectionErrorView.action}</small>
-              </div>
-            )}
-            {rescueTargetScan?.disks
-              .filter((disk) => !disk.selectionEligible)
-              .map((disk) => (
-                <small key={disk.id}>
-                  Escluso {disk.ref} · {formatBytes(disk.sizeBytes)} ·{" "}
-                  {disk.exclusionReasons.join(", ")}
-                </small>
-              ))}
-            {rescueTargetReady && rescueTargetScan?.candidates.length === 0 && (
-              <small>Nessun candidato selezionabile.</small>
-            )}
-            {rescueTargetError && <small>{rescueTargetError}</small>}
           </div>
         )}
         {isRescueRuntime() && (
@@ -1283,30 +1191,108 @@ function App() {
         ))}
       </aside>
       <section>
-        <div className="steps">
-          {(["Observe", "Diagnose", "Plan", "Repair", "Verify"] as const).map(
-            (step) => (
-              <span className={step === workflow ? "active" : ""} key={step}>
-                {step}
-              </span>
-            ),
-          )}
-        </div>
-        <article>
-          <small>
-            {evidence.length
-              ? `${evidence[0].id} · observed-untrusted`
-              : "SESSION NOT STARTED"}
-          </small>
-          <h1>{proposal?.diagnosis ?? "Evidence before action."}</h1>
-          <p>{status}</p>
-          {proposal && (
-            <p>
-              Confidenza: {Math.round(proposal.confidence * 100)}% · Evidenze:{" "}
-              {proposal.evidenceIds.join(", ")}
-            </p>
-          )}
-        </article>
+        {isRescueRuntime() ? (
+          <RescueDiagnosisWizard
+            vaultStatusReady={openAiStatusReady}
+            vaultLabel={rescueVaultLabel(openAiStatus)}
+            vaultGuidance={rescueOpenAiGuidance(openAiStatus)}
+            persistentAuditReady={rescueAuditSink !== undefined}
+            targetScan={rescueTargetScan}
+            selectedTarget={selectedRescueTarget}
+            targetReady={rescueTargetReady}
+            targetBusy={rescueTargetBusy}
+            targetError={rescueTargetError}
+            inspection={rescueInspection}
+            inspectionError={rescueInspectionError}
+            inspectionCurrent={rescueInspectionCurrent}
+            inspectionBusy={rescueInspectionBusy}
+            inspectionBlocked={rescueInspectionBlocked}
+            providerMode={providerMode}
+            openAiReady={openAiReady}
+            providerSelectionDisabled={
+              busy ||
+              rescueTargetBusy ||
+              rescueInspectionBusy ||
+              rescueInspectionInFlight.current ||
+              sessionId !== undefined ||
+              driver === undefined
+            }
+            inspectDisabled={
+              selectedRescueTarget === undefined ||
+              rescueTargetScan === undefined ||
+              rescueTargetBusy ||
+              rescueInspectionBusy ||
+              rescueInspectionBlocked ||
+              busy ||
+              driver === undefined
+            }
+            objective={objective}
+            evidence={evidence}
+            proposal={proposal}
+            status={status}
+            busy={busy}
+            diagnosisDisabled={
+              !objective.trim() ||
+              busy ||
+              rescueInspectionBusy ||
+              !inventoryReady ||
+              !rescueTargetReady ||
+              selectedRescueTarget === undefined ||
+              !rescueInspectionCurrent ||
+              sessionId === undefined ||
+              sessionDriver === undefined ||
+              !rescueProviderBinding.current.sessionMatches(providerMode) ||
+              rescueInspectionBlocked ||
+              !runtimeReady ||
+              !driver ||
+              securityBlocked
+            }
+            diagnosisButtonLabel={
+              !inventoryReady || !runtimeReady || !rescueTargetReady
+                ? "Avvio sicuro…"
+                : inventoryError
+                  ? "Riprova inventario"
+                  : "Avvia diagnosi"
+            }
+            report={report}
+            sessionId={sessionId}
+            markdownReport={markdownReport}
+            markdownReportError={markdownReportError}
+            onRefreshTargets={refreshRescueTargets}
+            onSelectTarget={chooseRescueTarget}
+            onChooseProvider={chooseProvider}
+            onInspectTarget={inspectSelectedRescueTarget}
+            onObjectiveChange={setObjective}
+            onDiagnose={diagnose}
+          />
+        ) : (
+          <>
+            <div className="steps">
+              {(
+                ["Observe", "Diagnose", "Plan", "Repair", "Verify"] as const
+              ).map((step) => (
+                <span className={step === workflow ? "active" : ""} key={step}>
+                  {step}
+                </span>
+              ))}
+            </div>
+            <article>
+              <small>
+                {evidence.length
+                  ? `${evidence[0].id} · observed-untrusted`
+                  : "SESSION NOT STARTED"}
+              </small>
+              <h1>{proposal?.diagnosis ?? "Evidence before action."}</h1>
+              <p>{status}</p>
+              {proposal && (
+                <p>
+                  Confidenza: {Math.round(proposal.confidence * 100)}% ·
+                  Evidenze: {proposal.evidenceIds.join(", ")}
+                </p>
+              )}
+            </article>
+          </>
+        )}
         {isRescueRuntime() && (
           <RescueRepairPanel
             selection={selectedRescueTarget}
@@ -1341,7 +1327,7 @@ function App() {
             )}
           </div>
         )}
-        {providerMode === "openai" && (
+        {!isRescueRuntime() && providerMode === "openai" && (
           <p className="provider-context-notice" role="note">
             A OpenAI invieremo l’obiettivo dopo filtri conservativi per token,
             email, IP e percorsi comuni, più la proposta diagnostica locale e
@@ -1350,47 +1336,38 @@ function App() {
             questa versione non offre ancora un’anteprima del contesto.
           </p>
         )}
-        <textarea
-          aria-label="Problem description"
-          value={objective}
-          onChange={(event) => setObjective(event.target.value)}
-          placeholder="Descrivi il problema del computer…"
-        />
-        <button
-          className="primary"
-          disabled={
-            !objective.trim() ||
-            busy ||
-            rescueInspectionBusy ||
-            !inventoryReady ||
-            !rescueTargetReady ||
-            (isRescueRuntime() &&
-              (selectedRescueTarget === undefined ||
-                !rescueInspectionCurrent ||
-                sessionId === undefined ||
-                sessionDriver === undefined ||
-                !rescueProviderBinding.current.sessionMatches(providerMode) ||
-                rescueInspectionBlocked)) ||
-            !runtimeReady ||
-            !driver ||
-            securityBlocked
-          }
-          onClick={diagnose}
-        >
-          {!inventoryReady || !runtimeReady || !rescueTargetReady
-            ? "Avvio sicuro…"
-            : busy
-              ? "Analisi…"
-              : isRescueRuntime() && selectedRescueTarget === undefined
-                ? "Seleziona un target"
-                : isRescueRuntime() && !rescueInspectionCurrent
-                  ? rescueInspectionBlocked
-                    ? "Riavvio Rescue richiesto"
-                    : "Ispeziona prima il target"
+        {!isRescueRuntime() && (
+          <>
+            <textarea
+              aria-label="Problem description"
+              value={objective}
+              onChange={(event) => setObjective(event.target.value)}
+              placeholder="Descrivi il problema del computer…"
+            />
+            <button
+              className="primary"
+              disabled={
+                !objective.trim() ||
+                busy ||
+                rescueInspectionBusy ||
+                !inventoryReady ||
+                !rescueTargetReady ||
+                !runtimeReady ||
+                !driver ||
+                securityBlocked
+              }
+              onClick={diagnose}
+            >
+              {!inventoryReady || !runtimeReady || !rescueTargetReady
+                ? "Avvio sicuro…"
+                : busy
+                  ? "Analisi…"
                   : inventoryError
                     ? "Riprova inventario"
                     : "Diagnostica"}
-        </button>
+            </button>
+          </>
+        )}
         {plan &&
           workflow !== "Verify" &&
           rescueSessionCurrent &&
@@ -1402,7 +1379,7 @@ function App() {
               Verifica piano R0
             </button>
           )}
-        {report && sessionId && (
+        {!isRescueRuntime() && report && sessionId && (
           <div className="report">
             <p>
               {isRescueRuntime()
@@ -1546,9 +1523,11 @@ function rescueOpenAiGuidance(
     case "faulted-reboot-required":
       return "Il Vault richiede un riavvio Rescue; OpenAI resta disabilitato.";
     case "unlocked":
-      return status.credential === "absent"
-        ? "Vault sbloccato. Configura OpenAI esclusivamente dal TTY con “kernaid-rescue-vaultctl openai-configure”, poi ricarica Desk."
-        : "Credenziale non disponibile. Verifica dal TTY con “kernaid-rescue-vaultctl provider-status”, poi ricarica Desk.";
+      return status.credential === "configured"
+        ? "Vault sbloccato: audit persistente e OpenAI sono disponibili."
+        : status.credential === "absent"
+          ? "Vault sbloccato. Configura OpenAI esclusivamente dal TTY con “kernaid-rescue-vaultctl openai-configure”, poi ricarica Desk."
+          : "Credenziale non disponibile. Verifica dal TTY con “kernaid-rescue-vaultctl provider-status”, poi ricarica Desk.";
   }
 }
 

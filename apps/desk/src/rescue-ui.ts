@@ -38,6 +38,78 @@ export interface RescueInspectionFailureDisposition {
   requiresRestart: boolean;
 }
 
+export const RESCUE_DIAGNOSIS_WIZARD_STEPS = [
+  "vault",
+  "target",
+  "provider",
+  "diagnosis",
+  "report",
+] as const;
+
+export type RescueDiagnosisWizardStep =
+  (typeof RESCUE_DIAGNOSIS_WIZARD_STEPS)[number];
+export type RescueDiagnosisWizardStepState = "complete" | "current" | "pending";
+
+export interface RescueDiagnosisWizardInput {
+  vaultStatusReady: boolean;
+  targetSelected: boolean;
+  inspectionReady: boolean;
+  reportReady: boolean;
+}
+
+export type RescueDiagnosisWizardProgress = Record<
+  RescueDiagnosisWizardStep,
+  RescueDiagnosisWizardStepState
+>;
+
+export interface RescueOpenAiPreviewEvidenceMetadata {
+  readonly id: string;
+  readonly collector: string;
+}
+
+export function rescueDiagnosisWizardProgress({
+  vaultStatusReady,
+  targetSelected,
+  inspectionReady,
+  reportReady,
+}: RescueDiagnosisWizardInput): RescueDiagnosisWizardProgress {
+  const current: RescueDiagnosisWizardStep = !vaultStatusReady
+    ? "vault"
+    : !targetSelected
+      ? "target"
+      : !inspectionReady
+        ? "provider"
+        : !reportReady
+          ? "diagnosis"
+          : "report";
+  const currentIndex = RESCUE_DIAGNOSIS_WIZARD_STEPS.indexOf(current);
+  return Object.fromEntries(
+    RESCUE_DIAGNOSIS_WIZARD_STEPS.map((step, index) => [
+      step,
+      index < currentIndex
+        ? "complete"
+        : index === currentIndex
+          ? "current"
+          : "pending",
+    ]),
+  ) as RescueDiagnosisWizardProgress;
+}
+
+/**
+ * Binds a WebView-only acknowledgement to exactly the metadata displayed by
+ * the Rescue preview. This is deliberately not a provider payload projection:
+ * raw evidence content and credentials never enter this value.
+ */
+export function rescueOpenAiPreviewAcknowledgementKey(
+  objective: string,
+  evidence: readonly RescueOpenAiPreviewEvidenceMetadata[],
+): string {
+  return JSON.stringify({
+    objective,
+    evidence: evidence.map(({ id, collector }) => ({ id, collector })),
+  });
+}
+
 export function tryStartRescueInspection(
   latch: RescueInspectionLatch,
 ): boolean {

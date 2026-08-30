@@ -6,16 +6,81 @@ import {
   formatBytes,
   observationStatus,
   rescueCandidatePresentation,
+  rescueDiagnosisWizardProgress,
   rescueInspectionErrorPresentation,
   rescueInspectionFailureDisposition,
   rescueInspectionNeedsRescan,
   rescueInspectionPresentation,
   rescueInspectionRequiresRestart,
   rescueInspectionResponseCurrent,
+  rescueOpenAiPreviewAcknowledgementKey,
   sameRescueInspection,
   sameRescueSelection,
   tryStartRescueInspection,
 } from "../src/rescue-ui.js";
+
+test("Rescue diagnosis wizard advances only through established state", () => {
+  assert.deepEqual(
+    rescueDiagnosisWizardProgress({
+      vaultStatusReady: false,
+      targetSelected: false,
+      inspectionReady: false,
+      reportReady: false,
+    }),
+    {
+      vault: "current",
+      target: "pending",
+      provider: "pending",
+      diagnosis: "pending",
+      report: "pending",
+    },
+  );
+  assert.deepEqual(
+    rescueDiagnosisWizardProgress({
+      vaultStatusReady: true,
+      targetSelected: true,
+      inspectionReady: true,
+      reportReady: false,
+    }),
+    {
+      vault: "complete",
+      target: "complete",
+      provider: "complete",
+      diagnosis: "current",
+      report: "pending",
+    },
+  );
+  assert.equal(
+    rescueDiagnosisWizardProgress({
+      vaultStatusReady: true,
+      targetSelected: true,
+      inspectionReady: true,
+      reportReady: true,
+    }).report,
+    "current",
+  );
+});
+
+test("OpenAI preview acknowledgement is bound only to visible metadata", () => {
+  const evidence = [{ id: "E-observed", collector: "rescue.read-only" }];
+  const first = rescueOpenAiPreviewAcknowledgementKey(
+    "Il PC non si avvia",
+    evidence,
+  );
+  assert.match(first, /Il PC non si avvia/u);
+  assert.match(first, /E-observed/u);
+  assert.doesNotMatch(first, /raw|token|passphrase/u);
+  assert.notEqual(
+    first,
+    rescueOpenAiPreviewAcknowledgementKey("Il PC si blocca", evidence),
+  );
+  assert.notEqual(
+    first,
+    rescueOpenAiPreviewAcknowledgementKey("Il PC non si avvia", [
+      { id: "E-new", collector: "rescue.read-only" },
+    ]),
+  );
+});
 
 test("same-family Rescue candidates remain visibly distinguishable", () => {
   const scan = targetScanFixture();

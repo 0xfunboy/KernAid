@@ -189,6 +189,371 @@ section {
   padding: 28px;
   max-width: 900px;
 }
+.target-overview {
+  margin: 14px 0 20px;
+  padding: 12px;
+  color: #aebbb4;
+  border: 1px solid #29312d;
+  border-radius: 8px;
+  background: #101513;
+}
+.target-overview p {
+  margin: 7px 0 0;
+  font-size: 12px;
+  line-height: 1.45;
+}
+.rescue-wizard {
+  display: grid;
+  gap: 12px;
+  width: min(100%, 980px);
+  margin: 0 auto;
+}
+.rescue-wizard-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 22px;
+  padding: 5px 2px 18px;
+}
+.rescue-wizard-heading h1 {
+  max-width: 690px;
+  margin: 7px 0 8px;
+  font-size: clamp(27px, 3vw, 42px);
+  line-height: 1.08;
+  letter-spacing: -0.035em;
+}
+.rescue-wizard-heading p {
+  max-width: 650px;
+  margin: 0;
+  color: #9aaba2;
+  line-height: 1.55;
+}
+.rescue-wizard-safety {
+  flex: none;
+  padding: 7px 10px;
+  color: #c7ff3d;
+  border: 1px solid #526c2b;
+  border-radius: 999px;
+  background: #151e10;
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0.12em;
+}
+.rescue-wizard-progress {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 7px;
+  margin: 0 0 8px;
+  padding: 0;
+  list-style: none;
+}
+.rescue-wizard-progress li {
+  display: flex;
+  gap: 7px;
+  align-items: center;
+  min-width: 0;
+  padding: 8px 9px;
+  color: #718078;
+  border: 1px solid #252c28;
+  border-radius: 7px;
+  background: #101412;
+  font-size: 11px;
+}
+.rescue-wizard-progress li > span {
+  display: grid;
+  flex: none;
+  width: 21px;
+  height: 21px;
+  place-items: center;
+  border: 1px solid currentColor;
+  border-radius: 50%;
+  font-size: 9px;
+}
+.rescue-wizard-progress li.complete {
+  color: #a8ca54;
+  border-color: #35451f;
+}
+.rescue-wizard-progress li.current {
+  color: #0d1110;
+  border-color: #c7ff3d;
+  background: #c7ff3d;
+}
+.rescue-wizard-card {
+  overflow: hidden;
+  border: 1px solid #29312d;
+  border-radius: 11px;
+  background: #111614;
+  box-shadow: 0 15px 40px rgb(0 0 0 / 12%);
+}
+.rescue-wizard-card.current {
+  border-color: #6f8c32;
+  background:
+    radial-gradient(circle at 100% 0, rgb(199 255 61 / 6%), transparent 38%),
+    #131916;
+  box-shadow: 0 18px 50px rgb(0 0 0 / 22%);
+}
+.rescue-wizard-card.pending {
+  background: #0f1311;
+}
+.rescue-wizard-card > p,
+.rescue-wizard-card > .rescue-wizard-summary,
+.rescue-wizard-targets,
+.rescue-wizard-provider,
+.rescue-wizard-diagnosis,
+.rescue-wizard-report {
+  margin: 0;
+  padding: 2px 18px 18px 65px;
+}
+.rescue-wizard-card > p {
+  color: #77837d;
+  font-size: 12px;
+}
+.rescue-wizard-card-title {
+  display: grid;
+  grid-template-columns: 36px minmax(0, 1fr) auto;
+  gap: 11px;
+  align-items: center;
+  padding: 15px 18px 13px;
+}
+.rescue-wizard-card-title > span {
+  color: #50d8e8;
+  font: 800 11px/1 monospace;
+  letter-spacing: 0.08em;
+}
+.rescue-wizard-card-title > div > b,
+.rescue-wizard-card-title > div > small {
+  display: block;
+}
+.rescue-wizard-card-title > div > b {
+  font-size: 15px;
+}
+.rescue-wizard-card-title > div > small {
+  margin-top: 3px;
+  color: #819087;
+  letter-spacing: 0.07em;
+}
+.rescue-wizard-card-title > small {
+  color: #77837d;
+  font-weight: 800;
+}
+.rescue-wizard-card.current .rescue-wizard-card-title > small {
+  color: #c7ff3d;
+}
+.rescue-wizard-summary {
+  display: grid;
+  gap: 6px;
+}
+.rescue-wizard-summary > div {
+  display: grid;
+  gap: 5px;
+}
+.rescue-wizard-summary p,
+.rescue-wizard-targets > p,
+.rescue-wizard-provider > p,
+.rescue-wizard-report > p {
+  margin: 0;
+  color: #9aaba2;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.rescue-wizard-summary small {
+  color: #8e9b94;
+  letter-spacing: 0;
+  line-height: 1.45;
+}
+.rescue-wizard-targets,
+.rescue-wizard-provider,
+.rescue-wizard-diagnosis,
+.rescue-wizard-report {
+  display: grid;
+  gap: 12px;
+}
+.rescue-wizard button {
+  font: inherit;
+  cursor: pointer;
+}
+.rescue-wizard button:disabled {
+  cursor: not-allowed;
+  opacity: 0.42;
+}
+.rescue-wizard-secondary,
+.rescue-wizard-primary {
+  justify-self: start;
+  padding: 10px 14px;
+  border-radius: 7px;
+  font-size: 12px;
+  font-weight: 800;
+}
+.rescue-wizard-secondary {
+  color: #d7f5f8;
+  border: 1px solid #31717a;
+  background: #102024;
+}
+.rescue-wizard-primary {
+  color: #0d1110;
+  border: 1px solid #c7ff3d;
+  background: #c7ff3d;
+}
+.rescue-wizard-target-grid,
+.rescue-wizard-choice-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 9px;
+}
+.rescue-wizard-target-grid > button,
+.rescue-wizard-choice-grid > button {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  padding: 13px;
+  color: #dce7e1;
+  text-align: left;
+  border: 1px solid #344039;
+  border-radius: 8px;
+  background: #0d1210;
+}
+.rescue-wizard-target-grid > button small,
+.rescue-wizard-choice-grid > button small {
+  color: #91a097;
+  letter-spacing: 0;
+  line-height: 1.4;
+}
+.rescue-wizard-target-grid > button.selected,
+.rescue-wizard-choice-grid > button[aria-pressed="true"] {
+  color: #0d1110;
+  border-color: #c7ff3d;
+  background: #c7ff3d;
+}
+.rescue-wizard-target-grid > button.selected small,
+.rescue-wizard-choice-grid > button[aria-pressed="true"] small {
+  color: #2e3a1d;
+}
+.rescue-wizard-note,
+.rescue-wizard-alert {
+  padding: 10px 12px;
+  border: 1px solid #6f6236;
+  border-radius: 7px;
+  background: #211d12;
+}
+.rescue-wizard-alert {
+  color: #e9d790 !important;
+}
+div.rescue-wizard-alert {
+  display: grid;
+  gap: 5px;
+}
+div.rescue-wizard-alert small {
+  color: inherit;
+  letter-spacing: 0;
+}
+.rescue-wizard-alert.blocked {
+  color: #ffb0aa !important;
+  border-color: #8b4542;
+  background: #241516;
+}
+.rescue-wizard-inspection {
+  display: grid;
+  gap: 5px;
+  padding: 12px;
+  border: 1px solid #315b60;
+  border-radius: 8px;
+  background: #102024;
+}
+.rescue-wizard-inspection small {
+  color: #a7bbb0;
+  letter-spacing: 0;
+  line-height: 1.4;
+}
+.rescue-wizard-diagnosis label {
+  display: grid;
+  gap: 5px;
+  font-size: 13px;
+  font-weight: 800;
+}
+.rescue-wizard-diagnosis label small {
+  color: #849089;
+  font-weight: 400;
+  letter-spacing: 0;
+}
+.rescue-wizard-diagnosis textarea {
+  height: 112px;
+  margin: 0;
+  resize: vertical;
+}
+.rescue-wizard-preview {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid #50645a;
+  border-radius: 9px;
+  background: #171f1b;
+}
+.rescue-wizard-preview > div > b,
+.rescue-wizard-preview > div > small {
+  display: block;
+}
+.rescue-wizard-preview > div > b {
+  margin-top: 5px;
+}
+.rescue-wizard-preview dl {
+  display: grid;
+  grid-template-columns: 125px minmax(0, 1fr);
+  gap: 8px 12px;
+  margin: 0;
+  font-size: 11px;
+}
+.rescue-wizard-preview dt {
+  color: #7f8e86;
+}
+.rescue-wizard-preview dd {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  margin: 0;
+  color: #d4ded8;
+  overflow-wrap: anywhere;
+}
+.rescue-wizard-preview code {
+  color: #50d8e8;
+  font-size: 10px;
+}
+.rescue-wizard-preview > small {
+  color: #91a097;
+  letter-spacing: 0;
+  line-height: 1.45;
+}
+.rescue-wizard-live-status {
+  margin: 0;
+  color: #aab8b0;
+  font-size: 12px;
+}
+.rescue-wizard-result {
+  padding-top: 13px;
+  border-top: 1px solid #29312d;
+}
+.rescue-wizard-result h2 {
+  margin: 6px 0;
+  font-size: 21px;
+}
+.rescue-wizard-result p {
+  margin: 0;
+  color: #9aaba2;
+  font-size: 12px;
+}
+.rescue-wizard-report .report-actions a {
+  padding: 9px 12px;
+  color: #0d1110;
+  border-radius: 6px;
+  background: #c7ff3d;
+  font-size: 12px;
+  font-weight: 800;
+  text-decoration: none;
+}
+.rescue-wizard-report > small {
+  color: #9ca9a2;
+  letter-spacing: 0;
+  line-height: 1.4;
+}
 .steps {
   display: flex;
   gap: 12px;
@@ -475,5 +840,30 @@ footer {
   .fixture-lab-row {
     grid-template-columns: 1fr;
     gap: 3px;
+  }
+  .rescue-wizard-heading {
+    display: grid;
+  }
+  .rescue-wizard-safety {
+    justify-self: start;
+  }
+  .rescue-wizard-progress {
+    grid-template-columns: 1fr;
+  }
+  .rescue-wizard-target-grid,
+  .rescue-wizard-choice-grid {
+    grid-template-columns: 1fr;
+  }
+  .rescue-wizard-card > p,
+  .rescue-wizard-card > .rescue-wizard-summary,
+  .rescue-wizard-targets,
+  .rescue-wizard-provider,
+  .rescue-wizard-diagnosis,
+  .rescue-wizard-report {
+    padding-left: 18px;
+  }
+  .rescue-wizard-preview dl {
+    grid-template-columns: 1fr;
+    gap: 4px;
   }
 }
