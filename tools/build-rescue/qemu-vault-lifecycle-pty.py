@@ -29,7 +29,7 @@ import threading
 import time
 import tty
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Callable, NoReturn, Sequence
 
 
 SERIAL_LIMIT = 2 * 1024 * 1024
@@ -40,6 +40,7 @@ LOGIN_SECRET_LIMIT = 128
 LIVE_CONFIG_LIMIT = 64 * 1024
 RATE_LIMIT_WAIT_SECONDS = 2.25
 QEMU_START_TIMEOUT_SECONDS = 15.0
+SERIAL_CLOSE_RECHECK_SECONDS = 0.05
 READINESS_TIMEOUT_SECONDS = 1200.0
 CONTROLLER_TIMEOUT_SECONDS = 1800
 QMP_KEY_SETTLE_SECONDS = 0.02
@@ -2094,16 +2095,33 @@ class SerialConsole:
                 return
             except OSError as error:
                 if error.errno == errno.EIO:
-                    raise ClosedFailure("serial", "closed") from error
+                    self._raise_after_close_recheck(error)
                 raise ClosedFailure("serial", "read-failed") from error
             if not chunk:
-                raise ClosedFailure("serial", "closed")
+                self._raise_after_close_recheck()
             try:
                 self.capture.append(chunk)
             except SecretExposureError as error:
                 raise ClosedFailure("serial", "secret-exposure") from error
             except CaptureLimitError as error:
                 raise ClosedFailure("serial", "oversized") from error
+
+    def _raise_after_close_recheck(
+        self, cause: OSError | None = None
+    ) -> NoReturn:
+        """Give a just-exited QEMU a bounded window to publish its status."""
+
+        deadline = time.monotonic() + SERIAL_CLOSE_RECHECK_SECONDS
+        while True:
+            self._health()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(remaining, 0.005))
+        failure = ClosedFailure("serial", "closed")
+        if cause is not None:
+            raise failure from cause
+        raise failure
 
     def _raise_if_not_ready(self, snapshot: bytes) -> None:
         if NOT_READY_PREFIX_PATTERN.search(snapshot, self._not_ready_scan_start) is not None:
@@ -2262,8 +2280,11 @@ class QemuHarness:
     def check_health(self) -> None:
         if self.output_drainer is not None:
             self.output_drainer.check()
-        if self.process is not None and self.process.poll() is not None:
-            raise ClosedFailure("qemu", "exited-early")
+        if self.process is not None:
+            return_code = self.process.poll()
+            if return_code is not None:
+                code = "exited-signal" if return_code < 0 else "exited-early"
+                raise ClosedFailure("qemu", code)
 
     def wait_for_shutdown(self, deadline: float) -> None:
         if self.process is None:

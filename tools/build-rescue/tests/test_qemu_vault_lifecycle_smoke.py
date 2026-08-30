@@ -172,6 +172,51 @@ class CaptureTests(unittest.TestCase):
             os.close(master)
             capture.wipe()
 
+    def test_serial_close_rechecks_and_reports_a_sanitized_qemu_signal(self) -> None:
+        read_fd, write_fd = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+        capture = controller.BoundedCapture(1024, [])
+        checks = 0
+
+        def health() -> None:
+            nonlocal checks
+            checks += 1
+            if checks >= 2:
+                raise controller.ClosedFailure("qemu", "exited-signal")
+
+        console = controller.SerialConsole(read_fd, capture, health)
+        os.close(write_fd)
+        try:
+            with self.assertRaises(controller.ClosedFailure) as failure:
+                console._drain_immediately_available()
+            self.assertEqual(
+                (failure.exception.stage, failure.exception.code),
+                ("qemu", "exited-signal"),
+            )
+            self.assertEqual(str(failure.exception), "qemu:exited-signal")
+            self.assertGreaterEqual(checks, 2)
+            self.assertEqual(capture.snapshot(), b"")
+        finally:
+            console.close()
+            capture.wipe()
+
+    def test_serial_close_stays_generic_when_qemu_remains_live(self) -> None:
+        read_fd, write_fd = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+        capture = controller.BoundedCapture(1024, [])
+        console = controller.SerialConsole(read_fd, capture, lambda: None)
+        os.close(write_fd)
+        started = time.monotonic()
+        try:
+            with self.assertRaises(controller.ClosedFailure) as failure:
+                console._drain_immediately_available()
+            self.assertEqual(
+                (failure.exception.stage, failure.exception.code),
+                ("serial", "closed"),
+            )
+            self.assertLess(time.monotonic() - started, 0.25)
+        finally:
+            console.close()
+            capture.wipe()
+
 
 class SecretDescriptorTests(unittest.TestCase):
     def test_secret_fd_requires_exact_file_and_alphabet(self) -> None:
@@ -2110,6 +2155,28 @@ class QmpTests(unittest.TestCase):
                 harness.cleanup()
                 os.close(slave)
                 os.close(master)
+
+    def test_qemu_health_classifies_signal_without_exposing_its_number(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            harness = controller.QemuHarness(
+                "/bin/true", [], Path(directory) / "qmp.sock", []
+            )
+            process = mock.Mock()
+            harness.process = process
+            for return_code, expected in (
+                (-signal.SIGKILL, "exited-signal"),
+                (1, "exited-early"),
+                (0, "exited-early"),
+            ):
+                with self.subTest(return_code=return_code):
+                    process.poll.return_value = return_code
+                    with self.assertRaises(controller.ClosedFailure) as failure:
+                        harness.check_health()
+                    self.assertEqual(
+                        (failure.exception.stage, failure.exception.code),
+                        ("qemu", expected),
+                    )
+                    self.assertNotIn(str(abs(return_code)), str(failure.exception))
 
     def test_qemu_harness_output_failures_are_closed_and_bounded(self) -> None:
         secret = bytearray(os.urandom(32).hex().encode("ascii"))
