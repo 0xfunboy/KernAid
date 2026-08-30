@@ -1,19 +1,25 @@
 # Rescue Linux repair v1
 
-Status: **implemented, off-default private candidate; exact-image BIOS/UEFI
-boot and apply passed in QEMU, but the UEFI post-commit rollback gate failed;
-unavailable through the product site/Release Channel and not promoted**. The
-default/stable image remains diagnosis-only.
+Status: **implemented, off-default private candidate; unavailable through the
+product site/Release Channel, unqualified and not promoted**. The last
+documented terminal exact-image run passed BIOS/UEFI boot and apply in QEMU,
+but failed the UEFI post-commit rollback gate. A later requalification run is
+tracked separately and creates no qualification claim until its complete
+terminal evidence is reviewed. The default/stable image remains diagnosis-only.
 This document describes the gated candidate implementation, not a claim that a
 shipping image can repair a customer filesystem.
 
-The latest candidate was built from
+The last documented terminal candidate was built from
 [`64db3bcf4050df01e96e1b55e08750b6957df801`](https://github.com/0xfunboy/KernAid/commit/64db3bcf4050df01e96e1b55e08750b6957df801)
 by [repair run 33306646523, attempt 1](https://github.com/0xfunboy/KernAid/actions/runs/33306646523).
 That run is terminal failure: the formal candidate ISO publish step was
 skipped, while a one-day Actions forensics artifact retained ISO and checksum
 only for CI investigation. Nothing was promoted to the product site or Release
-Channel. The same source's immutable `0.1.0-internal.5` stable Rescue release
+Channel. Requalification [run 33334118587](https://github.com/0xfunboy/KernAid/actions/runs/33334118587)
+is separate; this document intentionally makes no claim about its outcome
+until its terminal evidence is reviewed. The current immutable
+`0.1.0-internal.6` stable Rescue release comes from commit
+[`5db47001fad2a3814d90837bcdcea545b2da0fa9`](https://github.com/0xfunboy/KernAid/commit/5db47001fad2a3814d90837bcdcea545b2da0fa9),
 was built with repair disabled and remains diagnosis-only.
 
 ## First supported action

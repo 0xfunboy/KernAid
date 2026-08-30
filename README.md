@@ -2,7 +2,7 @@
 
 KernAid is an evidence-first machine diagnosis and repair platform. This repository implements the Phase 0 feasibility spike described in the [masterplan](docs/MASTERPLAN.md). For the concise, date-stamped distinction between what works now and what remains unqualified, start with [Current status](docs/CURRENT_STATUS.md). For a compact map of the product, repository, build host and release flow, see the [Project map](docs/PROJECT_MAP.md).
 
-The current Phase 0 engineering vertical slice is deliberately safe: start a session, collect a normalized read-only host snapshot, run deterministic offline diagnostic rules, validate an R0 plan through Core, and produce a hashed JSON report. Resident Desk exposes that machine-readable JSON as the authoritative session artifact: it is a signed envelope when secure audit is active and an explicitly unsigned JSON artifact otherwise. Desk also derives a human-readable Markdown copy, always labeled unsigned; it is for reading and does not replace the JSON artifact or prove authenticity. In Rescue, when the encrypted Vault is unlocked before Desk starts, the JSON report and its audit sequence are persisted as a signed envelope and can be exported later from the native TTY companion. The default/stable product has no production mutation handler. A separate private, feature-gated Rescue repair candidate passed exact-image QEMU boot and apply under BIOS and UEFI for one narrowly bounded action, but its latest run failed the UEFI post-commit rollback gate; it remains unavailable through the product site and Release Channel, unqualified and unpromoted. A short-lived Actions forensics artifact retained that failed run's ISO and checksum only for CI investigation. See [Current status](docs/CURRENT_STATUS.md). On Linux, a separate opt-in `fixture-repair-lab` Desk build sends one complete, explicitly approved repair and separately approved rollback through the standard SessionDriver, Agent Gateway, Core transaction states and typed broker against an internally created disposable fixture. It is absent from normal builds and Rescue and cannot select a host path, disk or production target.
+The current Phase 0 engineering vertical slice is deliberately safe: start a session, collect a normalized read-only host snapshot, run deterministic offline diagnostic rules, validate an R0 plan through Core, and produce a hashed JSON report. Resident Desk exposes that machine-readable JSON as the authoritative session artifact: it is a signed envelope when secure audit is active and an explicitly unsigned JSON artifact otherwise. Desk also derives a human-readable Markdown copy, always labeled unsigned; it is for reading and does not replace the JSON artifact or prove authenticity. In Rescue, when the encrypted Vault is unlocked before Desk starts, the JSON report and its audit sequence are persisted as a signed envelope and can be exported later from the native TTY companion. The default/stable product has no production mutation handler. A separate private, feature-gated Rescue repair candidate remains unavailable through the product site and Release Channel, unqualified and unpromoted. Its last documented terminal run passed exact-image QEMU boot and apply under BIOS and UEFI for one narrowly bounded action, then failed the UEFI post-commit rollback gate; a later requalification run is evaluated independently and creates no support claim until its terminal evidence is reviewed. See [Current status](docs/CURRENT_STATUS.md). On Linux, a separate opt-in `fixture-repair-lab` Desk build sends one complete, explicitly approved repair and separately approved rollback through the standard SessionDriver, Agent Gateway, Core transaction states and typed broker against an internally created disposable fixture. It is absent from normal builds and Rescue and cannot select a host path, disk or production target.
 
 ## Quick start
 
@@ -40,20 +40,20 @@ The CI workflows are configured to produce engineering-preview desktop installer
   [Current status](docs/CURRENT_STATUS.md) only for first physical-boot
   qualification. Verify its checksum and, on Windows, write it with Rufus in
   DD mode to a factory-new or disposable USB of at least 32 GB. The trusted v2
-  catalog revision 7 authorizes only this exact ISO, so the Linux writer can
+  catalog revision 8 authorizes only this exact ISO, so the Linux writer can
   verify, copy and provision its encrypted vault. Rufus only writes the
   qualified zero-state retail image; first live boot provisions the Vault after
   local passphrase confirmation.
-  The promoted immutable internal release is `0.1.0-internal.5`: artifact
-  `ci-33307231489-1`, built from commit
-  `64db3bcf4050df01e96e1b55e08750b6957df801` by Rescue run `33307231489`
+  The promoted immutable internal release is `0.1.0-internal.6`: artifact
+  `ci-33330139973-1`, built from commit
+  `5db47001fad2a3814d90837bcdcea545b2da0fa9` by Rescue run `33330139973`
   attempt 1.
   Its exact ISO is `1,223,540,736` bytes with SHA-256
-  `7eb61dc111c00a7fc925371fa7af01eb44d64b840db80bb8476be75c4039c396`;
-  the compressed retail image is `1,191,686,132` bytes with SHA-256
-  `90a9832a59a20246649289a18f42bf47d5ab7612fb9371fced38439254d510ae`.
-  Release Channel v1 sequence 5 binds those files in a canonical manifest with
-  SHA-256 `cf00d0bc8958c0188f96a4fe275c1686eacea700fe6ee02c4f7f1a888bad540a`.
+  `fe8d54d8e154f6a4712c65855b5dffdcb31dddeac0d3a03c299d606f87a16000`;
+  the compressed retail image is `1,191,669,060` bytes with SHA-256
+  `efc5d4d0c428d0f7a992eb21154c4243c5566d7c85d6481e174c43cac909aa9b`.
+  Release Channel v1 sequence 6 binds those files in a canonical manifest with
+  SHA-256 `11d15af0ef07b78760f468f3302cd398255c072dba0920b868c967f53206e674`.
   The stable build compiled with repair disabled and passed the shipping-image
   gate proving that repair UI, handlers, units and write surfaces are absent.
   It replaces the retired `0d61eac` physical-test candidate, which reached
@@ -84,12 +84,14 @@ The CI workflows are configured to produce engineering-preview desktop installer
   that same artifact under virtual BIOS and UEFI. Physical USB behavior remains
   a separate qualification gate.
   The separately gated repair candidate is private and unavailable through the
-  product site or Release Channel. Run
-  `33306646523` passed BIOS/UEFI boot and apply, then failed the UEFI
+  product site or Release Channel. The last documented terminal run,
+  `33306646523`, passed BIOS/UEFI boot and apply, then failed the UEFI
   post-commit rollback gate at marker `repair-rollback-service-ready`; restart
   reconciliation was therefore skipped. It does not replace this stable
-  diagnosis-only retail image, and rollback/restart are not qualified.
-- **Windows, Linux or macOS that does boot:** use the matching unsigned artifact from immutable release `0.1.0-internal.5`, built by Desktop run `33306689037` attempt 1 from the same exact source as Rescue. All four platform jobs and their package-inspection gates passed. Install it and launch KernAid like a normal application; CI packaging is not physical installation or complete GUI qualification. The gate rejects Desk packages containing the separately distributed credential companion. Windows and macOS startup collect only a fast, derived target identity; the deeper P0 collection starts once when **Diagnostica** is selected. macOS queries only the current-user `launchd` table and safe-boot integer, and explicitly reports system `launchd`, software-update availability, system-event analysis, and login/background-item counts as unqualified instead of inventing results. The fixed commands do not request repairs, although native Windows tools such as DISM may still update their own operating-system logs. After diagnosis, retain the JSON as the authoritative machine-readable artifact; the additional Markdown download is an explicitly unsigned reading copy.
+  diagnosis-only retail image, and rollback/restart are not qualified. Repair
+  requalification run `33334118587` is separate; this document makes no claim
+  about its outcome until the complete terminal evidence has been reviewed.
+- **Windows, Linux or macOS that does boot:** use the matching unsigned artifact from immutable release `0.1.0-internal.6`, built by Desktop run `33330140025` attempt 1 from the same exact source as Rescue. All four platform jobs and their package-inspection gates passed. Install it and launch KernAid like a normal application; CI packaging is not physical installation or complete GUI qualification. The gate rejects Desk packages containing the separately distributed credential companion. Windows and macOS startup collect only a fast, derived target identity; the deeper P0 collection starts once when **Diagnostica** is selected. macOS queries only the current-user `launchd` table and safe-boot integer, and explicitly reports system `launchd`, software-update availability, system-event analysis, and login/background-item counts as unqualified instead of inventing results. The fixed commands do not request repairs, although native Windows tools such as DISM may still update their own operating-system logs. After diagnosis, retain the JSON as the authoritative machine-readable artifact; the additional Markdown download is an explicitly unsigned reading copy.
 - **Linux machine inventory:** Resident and Rescue use the same bounded Rust
   collector for CPU count/model, total RAM, firmware boot mode, selected public
   DMI model fields, and normalized PCI/USB class/vendor/product IDs. It excludes
@@ -125,15 +127,17 @@ current workflow and downloadable-artifact status is tracked in
 [Current status](docs/CURRENT_STATUS.md); do not infer that every `main` commit
 has produced a publishable ISO.
 
-The private repair candidate has a separate, narrower workflow. Its latest
-exact-source run passed ordinary BIOS/UEFI boot smoke and the single
-`linux.fstab.disable-missing-uuid.v1` apply path under both BIOS and UEFI on a
+The private repair candidate has a separate, narrower workflow. Its last
+documented terminal exact-source run passed ordinary BIOS/UEFI boot smoke and
+the single `linux.fstab.disable-missing-uuid.v1` apply path under both BIOS and UEFI on a
 disposable ext4 target with a distinct LUKS2/ext4 Vault. The workflow then
 failed the UEFI post-commit rollback service-readiness gate, so the formal
 candidate publish step was skipped and restart reconciliation did not run. A
-short-lived forensics artifact retained the ISO only for CI investigation.
-Rollback/fault/restart/
-power-loss, physical USB, hardware, firmware, Secure Boot and customer-data
+short-lived forensics artifact retained the ISO only for CI investigation. A
+later requalification run (`33334118587`) remains separate from the stable
+release and is not a qualification claim until its terminal evidence is
+reviewed. Rollback, fault, restart, power-loss, physical USB, hardware,
+firmware, Secure Boot and customer-data
 qualification remain open.
 
 ## Trust boundaries
@@ -150,7 +154,7 @@ See [Current status](docs/CURRENT_STATUS.md), the [operator guide](docs/operator
   qualified only after the full Rescue workflow passes, including both
   privileged BIOS and UEFI lifecycle jobs. The
   v2 writer can provision that vault only for an exact catalog-authorized image
-  on factory-new controlled-lab media; revision 7 authorizes the exact current
+  on factory-new controlled-lab media; revision 8 authorizes the exact current
   internally qualified candidate.
   The Rescue report relay is loopback/internal-only; the exact current image
   passed its signed-report shipping lifecycle under virtual BIOS and UEFI.
