@@ -40,17 +40,21 @@ The CI workflows are configured to produce engineering-preview desktop installer
   [Current status](docs/CURRENT_STATUS.md) only for first physical-boot
   qualification. Verify its checksum and, on Windows, write it with Rufus in
   DD mode to a factory-new or disposable USB of at least 32 GB. The trusted v2
-  catalog revision 5 authorizes only this exact ISO, so the Linux writer can
+  catalog revision 6 authorizes only this exact ISO, so the Linux writer can
   verify, copy and provision its encrypted vault. Rufus only writes the
   qualified zero-state retail image; first live boot provisions the Vault after
   local passphrase confirmation.
-  The promoted internal release is `0.1.0-internal.3`: artifact
-  `ci-33259104331-1`, built from commit
-  `29830e853650753e2efdfa0027c51eea68827af3` by Rescue run `33259104331`.
+  The promoted internal release is `0.1.0-internal.4`: artifact
+  `ci-33299917079-1`, built from commit
+  `93b5ed370cc11a50301b0fc4b17846afaa54f8c7` by Rescue run `33299917079`.
   Its exact ISO is `1,223,540,736` bytes with SHA-256
-  `3df9a44f0c8b992f583b887fb10636a41fa7fae7bc4a2dc6284aa34ffcfc0c28`;
-  the compressed retail image is `1,191,700,928` bytes with SHA-256
-  `541d429b998d9b63b0eb2f7f4a9f7ae52f900cca6aaa10e51e8cdaed1ed8f9a5`.
+  `327df21ecd9e833f61fc462deb3a4c919fb37517a2124891d79388965713d5ab`;
+  the compressed retail image is `1,191,676,044` bytes with SHA-256
+  `b1db6b12a3298db064b7c8ddfa77d581b9e1349d0a9039bc1bd4a2d66572a4e8`.
+  Release Channel v1 sequence 4 binds those files in a canonical manifest with
+  SHA-256 `217646e6d64ae9b91496400c34f2a8aec4d54a9650265a93b3ad3d0a96c663e3`.
+  The stable build compiled with repair disabled and passed the shipping-image
+  gate proving that repair UI, handlers, units and write surfaces are absent.
   It replaces the retired `0d61eac` physical-test candidate, which reached
   Xorg on an Intel PC but painted only a black frame and movable pointer. Start
   with the normal branded boot entry; if it cannot establish a usable display,
@@ -137,7 +141,7 @@ See [Current status](docs/CURRENT_STATUS.md), the [operator guide](docs/operator
   qualified only after the full Rescue workflow passes, including both
   privileged BIOS and UEFI lifecycle jobs. The
   v2 writer can provision that vault only for an exact catalog-authorized image
-  on factory-new controlled-lab media; revision 5 authorizes the exact current
+  on factory-new controlled-lab media; revision 6 authorizes the exact current
   internally qualified candidate.
   The Rescue report relay is loopback/internal-only; the exact current image
   passed its signed-report shipping lifecycle under virtual BIOS and UEFI.

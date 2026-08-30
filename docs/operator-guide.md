@@ -25,6 +25,12 @@ QEMU-only; physical PCs, firmware and USB media are unqualified. It
 is not an Apple-silicon boot image, and Intel Mac external boot remains a
 physical validation item.
 
+The current stable candidate is release `0.1.0-internal.4`, source commit
+`93b5ed370cc11a50301b0fc4b17846afaa54f8c7`, Rescue run `33299917079`.
+It was built with repair disabled and passed the fail-closed packaging gate
+that proves repair UI, handlers, units and write surfaces are absent. It remains
+a physical-test candidate, not a supported repair medium.
+
 ### Rescue qualification manifest v1
 
 On the protected `main` branch, the `rescue` workflow publishes
@@ -78,7 +84,7 @@ release bundle.
 ### Windows: physical boot qualification only
 
 For workflow releases whose qualification manifest contains `retailImage`, use
-`KernAid-Rescue-0.1.0-internal.3-x86_64-retail.img.xz` directly with a current
+`KernAid-Rescue-0.1.0-internal.4-x86_64-retail.img.xz` directly with a current
 Rufus in raw/DD mode and verify its adjacent checksum first. The compressed
 image expands to exactly 32,000,000,000 bytes and carries an all-zero p3 for
 first-boot Vault provisioning; its manifest records the compressed, expanded
@@ -98,7 +104,7 @@ but one successful device does not qualify every USB or firmware combination.
    first 32,000,000,000 bytes, but a larger device may retain data beyond that
    boundary; this procedure is not whole-media sanitization.
 2. Verify the downloaded `.img.xz` in PowerShell with
-   `Get-FileHash .\KernAid-Rescue-0.1.0-internal.3-x86_64-retail.img.xz -Algorithm SHA256`
+   `Get-FileHash .\KernAid-Rescue-0.1.0-internal.4-x86_64-retail.img.xz -Algorithm SHA256`
    and compare the complete digest with its adjacent `.sha256` file and the
    exact value in the qualification manifest.
 3. Write that exact `.img.xz` with Rufus. If Rufus offers a mode choice, choose
@@ -295,7 +301,7 @@ The supported workshop procedure in this section is Resident-only. Rescue
 contains feature-gated persistent-vault OpenAI plumbing and a loopback
 UI-server relay. The current exact candidate passed the full virtual workflow,
 including both privileged BIOS and UEFI lifecycle jobs, and trusted catalog v2
-revision 5 authorizes that ISO. Physical media and live provider TLS with a
+revision 6 authorizes that ISO. Physical media and live provider TLS with a
 real account are still not qualified. Do not present Rescue OpenAI as supported
 on customer media yet. The Resident credential companion
 is not included in the desktop installer and is not added to `PATH`. From the

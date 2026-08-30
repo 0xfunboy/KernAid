@@ -47,7 +47,7 @@ WinPE Companion and Fleet management remain later milestones.
 | Repair experiment | Linux-only feature-gated Desk lab for one typed R2 repair and separately approved rollback on an internal temporary fixture. It now traverses the standard `SessionDriver`, Agent Gateway, explicit Core transaction states and typed broker; it remains absent from normal/Rescue builds and disconnected from production targets |
 | Feature-gated Rescue repair candidate | The off-default candidate implements one ext4-only path for disabling a non-critical `fstab` entry whose UUID is freshly proven missing: closed repair daemon and UI, broker-owned observation/plan preparation, distinct-device Vault backup, exact Core approval, bounded atomic replacement, verification, automatic restore and crash/reboot reconciliation. Its v1alpha2 read-only root helper transfers an exact four-FD bundle: a read-only leaf, an `O_PATH` physical-parent identity, a sealed UUID-inventory memfd and a detached `ro,noload` ext4 mount. After the transaction is durable Pending, a separate write-helper socket consumes the Vault's boot-scoped, single-use write lease, resolves the stable recovery fingerprint three times against fresh current-boot claims and transfers only one detached read-write mount; raw block FDs stay inside the root helper. `repaird` has `PrivateDevices=yes`, no `DeviceAllow` and no `CAP_SYS_ADMIN`; its observer and parent guard do not open `/dev` or `/sys`. None of this is present in the default/stable Rescue image, which remains diagnosis-only. The exact private ISO is BIOS QEMU happy-path apply-qualified only for this one action; UEFI apply, failure/recovery, physical hardware, production use and promotion remain unqualified. |
 | Rescue first boot | The promoted image provisions an all-zero p3 into the canonical LUKS2/ext4 Vault, seeds its identity and Codex home, closes it and verifies the locked profile; the exact flow passed two-boot BIOS/UEFI QEMU qualification |
-| Release channel | Canonical Release Channel v1, anti-rollback links, strict verification and an immutable internal prerelease are active through sequence 3; this is not an automatic updater or signed production channel |
+| Release channel | Canonical Release Channel v1, anti-rollback links, strict verification and an immutable internal prerelease are active through sequence 4; this is not an automatic updater or signed production channel |
 
 The canonical repository is
 [`0xfunboy/KernAid`](https://github.com/0xfunboy/KernAid), branch `main`.
@@ -72,9 +72,9 @@ treated as a newer release.
 - The fixture lab's exported webview artifact is deliberately marked volatile
   and unsigned because the closed native bridge does not expose its signed
   broker envelope. It is development evidence, not a release receipt.
-- Physical USB boot has not been qualified. The corrected replacement from
-  commit `29830e8` completed every normal virtual gate in Rescue run
-  `33259104331` and is the active candidate for a controlled physical retest on
+- Physical USB boot has not been qualified. The diagnosis-only stable image from
+  commit `93b5ed3` completed every normal virtual gate in Rescue run
+  `33299917079` and is the active candidate for a controlled physical retest on
   a factory-new or disposable USB and non-customer hardware.
 - The first reported physical boot of the previous diagnosis-only RC on an
   Intel Core i5-6200-class PC reached Xorg/Matchbox but showed only a black
@@ -93,7 +93,7 @@ treated as a newer release.
   public API. Its virtual shipping-image gate has passed, but physical USB and
   recovery behavior are not yet qualified.
 - The v2 USB writer can copy, verify and provision an exact catalog-authorized
-  image. Catalog revision 5 authorizes only the exact internally qualified
+  image. Catalog revision 6 authorizes only the exact internally qualified
   candidate documented below; this is not physical-hardware qualification.
 - Hardware and firmware support claims still require physical test evidence.
 
@@ -101,18 +101,20 @@ treated as a newer release.
 
 The private project area serves one controlled physical-qualification
 candidate built from commit
-[`29830e853650753e2efdfa0027c51eea68827af3`](https://github.com/0xfunboy/KernAid/commit/29830e853650753e2efdfa0027c51eea68827af3):
+[`93b5ed370cc11a50301b0fc4b17846afaa54f8c7`](https://github.com/0xfunboy/KernAid/commit/93b5ed370cc11a50301b0fc4b17846afaa54f8c7):
 
 | Field | Exact value |
 | --- | --- |
-| Internal release | [`0.1.0-internal.3`](https://github.com/0xfunboy/KernAid/releases/tag/kernaid-internal-v0.1.0-internal.3), sequence 3 |
-| Artifact version | `ci-33259104331-1` |
+| Internal release | [`0.1.0-internal.4`](https://github.com/0xfunboy/KernAid/releases/tag/kernaid-internal-v0.1.0-internal.4), sequence 4 |
+| Artifact version | `ci-33299917079-1` |
 | ISO size | `1,223,540,736` bytes |
-| ISO SHA-256 | `3df9a44f0c8b992f583b887fb10636a41fa7fae7bc4a2dc6284aa34ffcfc0c28` |
-| Retail `.img.xz` size | `1,191,700,928` bytes; expands to `32,000,000,000` bytes |
-| Retail `.img.xz` SHA-256 | `541d429b998d9b63b0eb2f7f4a9f7ae52f900cca6aaa10e51e8cdaed1ed8f9a5` |
-| Qualification manifest SHA-256 | `31db1275def39aa95fb23f86193f02b2a1372e74fef394df9ef0a9314e200054` |
-| Workflow | [Rescue run 33259104331](https://github.com/0xfunboy/KernAid/actions/runs/33259104331) |
+| ISO SHA-256 | `327df21ecd9e833f61fc462deb3a4c919fb37517a2124891d79388965713d5ab` |
+| Retail `.img.xz` size | `1,191,676,044` bytes; expands to `32,000,000,000` bytes |
+| Retail `.img.xz` SHA-256 | `b1db6b12a3298db064b7c8ddfa77d581b9e1349d0a9039bc1bd4a2d66572a4e8` |
+| Release Channel v1 manifest SHA-256 | `217646e6d64ae9b91496400c34f2a8aec4d54a9650265a93b3ad3d0a96c663e3` |
+| Rescue workflow | [Run 33299917079](https://github.com/0xfunboy/KernAid/actions/runs/33299917079): [build/smoke 99225988215](https://github.com/0xfunboy/KernAid/actions/runs/33299917079/job/99225988215), [BIOS lifecycle 99230840205](https://github.com/0xfunboy/KernAid/actions/runs/33299917079/job/99230840205), [UEFI lifecycle 99230840207](https://github.com/0xfunboy/KernAid/actions/runs/33299917079/job/99230840207), [qualified release 99232781425](https://github.com/0xfunboy/KernAid/actions/runs/33299917079/job/99232781425) |
+| Desk workflow | [Run 33300434959](https://github.com/0xfunboy/KernAid/actions/runs/33300434959), all four diagnosis-only packages built from the same source commit |
+| Immutable publisher | [Release Channel run 33303321583, job 99235334267](https://github.com/0xfunboy/KernAid/actions/runs/33303321583/job/99235334267) |
 
 That run successfully built the hybrid ISO, validated shipping binaries and
 SBOM, passed ordinary BIOS/UEFI QEMU smoke with the shipping WebKit process,
@@ -123,7 +125,9 @@ provisioned the zero-state Vault, verified stable identity across boot, passed
 the bounded Codex offline signed-out path using its persistent Vault home, and
 passed the signed-report persist, list, get, cross-boot signer and fixed-path
 export path on the same artifact. The exact locally verified catalog entry is
-now the sole image authorized by trusted catalog v2 revision 5. The final
+now the sole image authorized by trusted catalog v2 revision 6. The stable ISO
+also passed the explicit packaging gate that rejects repair UI, handlers,
+write-capable units and other repair surfaces. The final
 qualification job also bound the ISO, checksum, retail image, catalog entry,
 SBOM and lifecycle evidence into one canonical manifest and attested both the
 ISO and retail image. Its GitHub/Sigstore ISO build-provenance and ISO/retail
@@ -184,14 +188,14 @@ use non-customer hardware. Rufus only writes the qualified zero-state image;
 the first live boot asks for a new passphrase and provisions the encrypted
 Vault in place. This is still not a supported repair medium.
 
-The latest complete unsigned Desk packaging matrix was built from the repair
-candidate commit in [Desktop run 33237227730](https://github.com/0xfunboy/KernAid/actions/runs/33237227730).
+The latest complete unsigned Desk packaging matrix was built from the stable
+source commit in [Desktop run 33300434959](https://github.com/0xfunboy/KernAid/actions/runs/33300434959).
 Linux x86-64, Windows x86-64, Intel macOS and Apple-silicon macOS packaging all
 passed; signing, notarization and physical-machine qualification remain open.
 
 ## Immediate next gates
 
-1. Boot the exact `29830e8` image from physical USB on a small hardware matrix and
+1. Boot the exact `93b5ed3` image from physical USB on a small hardware matrix and
    record firmware, storage, network and UI evidence.
 2. Finish the real-account Rescue provider/vault lifecycle without exposing or
    copying the CLI credential store.
