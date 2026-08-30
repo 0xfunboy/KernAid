@@ -40,15 +40,21 @@ The CI workflows are configured to produce engineering-preview desktop installer
   [Current status](docs/CURRENT_STATUS.md) only for first physical-boot
   qualification. Verify its checksum and, on Windows, write it with Rufus in
   DD mode to a factory-new or disposable USB of at least 32 GB. The trusted v2
-  catalog revision 4 authorizes only this exact ISO, so the Linux writer can
+  catalog revision 5 authorizes only this exact ISO, so the Linux writer can
   verify, copy and provision its encrypted vault. Rufus only writes the
   qualified zero-state retail image; first live boot provisions the Vault after
   local passphrase confirmation.
-  The promoted internal release is `0.1.0-internal.2`: artifact
-  `ci-33150274347-1`, built from commit
-  `0d61eac1a5e4819dedb8b2243f53599de69eba32` by Rescue run `33150274347`.
+  The promoted internal release is `0.1.0-internal.3`: artifact
+  `ci-33259104331-1`, built from commit
+  `29830e853650753e2efdfa0027c51eea68827af3` by Rescue run `33259104331`.
   Its exact ISO is `1,223,540,736` bytes with SHA-256
-  `ca152712c7f7002024868efc707c71c32b7c1bd648cd42ed20bb245be8d90312`.
+  `3df9a44f0c8b992f583b887fb10636a41fa7fae7bc4a2dc6284aa34ffcfc0c28`;
+  the compressed retail image is `1,191,700,928` bytes with SHA-256
+  `541d429b998d9b63b0eb2f7f4a9f7ae52f900cca6aaa10e51e8cdaed1ed8f9a5`.
+  It replaces the retired `0d61eac` physical-test candidate, which reached
+  Xorg on an Intel PC but painted only a black frame and movable pointer. Start
+  with the normal branded boot entry; if it cannot establish a usable display,
+  reboot and select **KernAid Rescue - Compatibility graphics**.
   Physical USB boot and firmware remain unqualified. On a successful boot,
   select the
   installed-system candidate in the left rail, and keep Secure Boot disabled
@@ -131,7 +137,7 @@ See [Current status](docs/CURRENT_STATUS.md), the [operator guide](docs/operator
   qualified only after the full Rescue workflow passes, including both
   privileged BIOS and UEFI lifecycle jobs. The
   v2 writer can provision that vault only for an exact catalog-authorized image
-  on factory-new controlled-lab media; revision 4 authorizes the exact current
+  on factory-new controlled-lab media; revision 5 authorizes the exact current
   internally qualified candidate.
   The Rescue report relay is loopback/internal-only; the exact current image
   passed its signed-report shipping lifecycle under virtual BIOS and UEFI.

@@ -1,6 +1,6 @@
 # KernAid project map
 
-Last updated: 26 August 2026
+Last updated: 30 August 2026
 
 This is the short operational map of the product, repository, build artifacts
 and internal delivery channel. For exact qualification evidence, use
@@ -73,11 +73,11 @@ logout and reboot.
 2. The Rescue workflow builds one exact ISO and proves BIOS/UEFI boot,
    USB-style two-boot persistence, byte-identical disposable targets and the
    privileged Vault lifecycle on that same artifact.
-3. A final job binds the ISO, checksum, catalog entry, SBOM and lifecycle
-   evidence into a canonical manifest and emits provenance and qualification
-   attestations for the ISO.
-4. The ISO, checksums, qualification manifest, attestations and workflow
-   identity are downloaded and verified locally.
+3. A final job binds the ISO, retail image, checksums, catalog entry, SBOM and
+   lifecycle evidence into a canonical manifest, emits ISO build provenance
+   and emits qualification attestations for both the ISO and retail image.
+4. The ISO, retail image, checksums, qualification manifest, attestations and
+   workflow identity are downloaded and verified locally.
 5. Promotion is an explicit repository change: a new trusted-catalog revision
    authorizes one exact name, size, digest, layout and evidence set.
 6. Only then are the private site metadata and pinned local artifact changed
@@ -96,6 +96,9 @@ repairs remain separate release gates.
 - Keep the exact artifact referenced by `site/content.json` and the trusted
   catalog. Old failed evidence and superseded unserved builds may be removed
   after their replacement is verified.
+- The retired `0d61eac` image may be retained as immutable audit evidence, but
+  it must not remain configured as a private-site download or trusted-catalog
+  entry after the `29830e8` cutover.
 - Never treat `/home/funboy/KernAid-dist` as source code or commit secrets from
   `~/.config/kaid-site/`.
 

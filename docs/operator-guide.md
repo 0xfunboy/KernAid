@@ -291,7 +291,7 @@ The supported workshop procedure in this section is Resident-only. Rescue
 contains feature-gated persistent-vault OpenAI plumbing and a loopback
 UI-server relay. The current exact candidate passed the full virtual workflow,
 including both privileged BIOS and UEFI lifecycle jobs, and trusted catalog v2
-revision 4 authorizes that ISO. Physical media and live provider TLS with a
+revision 5 authorizes that ISO. Physical media and live provider TLS with a
 real account are still not qualified. Do not present Rescue OpenAI as supported
 on customer media yet. The Resident credential companion
 is not included in the desktop installer and is not added to `PATH`. From the

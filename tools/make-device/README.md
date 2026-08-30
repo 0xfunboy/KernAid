@@ -4,7 +4,7 @@
 autorizzata dal catalogo v2. Verifica la copia e provisiona il vault cifrato su
 un supporto USB factory-new selezionato esplicitamente. **Il prefisso lungo
 quanto la ISO e la partizione vault vengono sovrascritti.** Non è uno strumento
-di sanitizzazione dell'intero supporto. Il catalogo v2 distribuito, revisione 4,
+di sanitizzazione dell'intero supporto. Il catalogo v2 distribuito, revisione 5,
 autorizza una sola ISO internamente e virtualmente qualificata; ogni immagine
 diversa viene rifiutata prima di aprire il target in scrittura. Questa
 autorizzazione non costituisce qualifica di supporti o hardware fisici.
@@ -20,13 +20,13 @@ immagine viene rifiutata fail-closed; non basta fornire un SHA-256 arbitrario
 dalla riga di comando.
 
 La voce v1 è storica e l'artefatto del workflow collegato non è più
-scaricabile. Il catalogo v2 ha `catalogRevision: 4` e autorizza esclusivamente
-`KernAid-Rescue-amd64.iso`, versione artefatto `ci-33150274347-1`, di
+scaricabile. Il catalogo v2 ha `catalogRevision: 5` e autorizza esclusivamente
+`KernAid-Rescue-amd64.iso`, versione artefatto `ci-33259104331-1`, di
 `1,223,540,736` byte e SHA-256
-`ca152712c7f7002024868efc707c71c32b7c1bd648cd42ed20bb245be8d90312`,
-costruita dal commit `0d61eac1a5e4819dedb8b2243f53599de69eba32` nel run
-GitHub Actions `33150274347` e promossa nella release interna
-`0.1.0-internal.2`. Lo stesso artefatto ha superato le prove QEMU
+`3df9a44f0c8b992f583b887fb10636a41fa7fae7bc4a2dc6284aa34ffcfc0c28`,
+costruita dal commit `29830e853650753e2efdfa0027c51eea68827af3` nel run
+GitHub Actions `33259104331` e selezionata per la release interna
+`0.1.0-internal.3`. Lo stesso artefatto ha superato le prove QEMU
 BIOS/UEFI, USB two-boot, vault e lifecycle richieste, inclusa la persistenza e
 l'export del report firmato, ed è l'unica voce v2 promossa. È una candidata
 **internamente e virtualmente qualificata**, non una release di produzione né
@@ -52,7 +52,7 @@ directory devono essere posseduti da `root` e non scrivibili da gruppo/altri.
 Il writer v1 resta disponibile soltanto per verificabilità storica e non
 provisiona la persistenza. `make-device-v2.py` non consulta mai il catalogo v1,
 non effettua downgrade e, con il trust anchor corrente, accetta soltanto
-l'esatta ISO autorizzata dalla revisione 4; ogni altra immagine viene rifiutata
+l'esatta ISO autorizzata dalla revisione 5; ogni altra immagine viene rifiutata
 prima di aprire il target in scrittura.
 
 `trusted-rescue-images.v2.schema.json`, `catalog_v2.py` e
@@ -97,7 +97,7 @@ L'interprete è fissato a `/usr/bin/python3 -I`; non usare una copia del tool da
 una checkout scrivibile dall'utente.
 
 Questa procedura è abilitata soltanto per l'esatta ISO autorizzata dalla
-revisione 4 e resta limitata alla prima qualifica fisica controllata descritta
+revisione 5 e resta limitata alla prima qualifica fisica controllata descritta
 in `docs/CURRENT_STATUS.md`. Installare il bundle root-owned descritto nella
 sezione **Writer USB v2 e vault cifrato** e usare esclusivamente l'immagine che
 corrisponde per nome, dimensione, SHA-256 e layout al trust anchor installato.
@@ -142,7 +142,7 @@ lo dichiara. Questo non è uno strumento di sanitizzazione.
 Il report v1 dichiara anche che il vault persistente **non viene creato**: il
 writer v1 non provisiona intenzionalmente la p3. Il writer v2 e il relativo
 lifecycle sono implementati e il trust v2 è attivo soltanto per l'esatta
-candidata della revisione 4; recovery autenticata e rollback restano gate
+candidata della revisione 5; recovery autenticata e rollback restano gate
 separati. Il report contiene la prova udev
 verificata, incluso `ID_PATH`, ma dichiara esplicitamente di essere JSON locale
 **non firmato e non autenticato**: non è una ricevuta crittografica.
@@ -151,7 +151,7 @@ Questa dichiarazione riguarda esclusivamente `make-device.py` v1. Il percorso
 v2 crea e verifica il vault soltanto per un'immagine autorizzata dal catalogo
 v2 distribuito.
 
-## Writer USB v2 e vault cifrato (implementato, catalogo revisione 4)
+## Writer USB v2 e vault cifrato (implementato, catalogo revisione 5)
 
 Il catalogo distribuito contiene una sola voce promossa. Il launcher v2 accetta
 quell'immagine soltanto su un supporto che espone almeno `32000000000` byte.
@@ -253,7 +253,7 @@ sudo install -o root -g root -m 0644 \
 ```
 
 Il launcher verifica ownership e mode del bundle **prima** di importare il
-core. Con la revisione 4 il comando seguente accetta soltanto l'ISO esatta
+core. Con la revisione 5 il comando seguente accetta soltanto l'ISO esatta
 presente nel catalogo installato; nome, dimensione o SHA-256 differenti
 falliscono chiuso prima di aprire il target:
 
