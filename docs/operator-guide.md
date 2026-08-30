@@ -78,10 +78,11 @@ release bundle.
 ### Windows: physical boot qualification only
 
 For workflow releases whose qualification manifest contains `retailImage`, use
-`KernAid-Rescue-amd64-retail.img.xz` directly with a current Rufus in raw/DD
-mode and verify its adjacent checksum first. The compressed image expands to
-exactly 32,000,000,000 bytes and carries an all-zero p3 for first-boot Vault
-provisioning; its manifest records the compressed, expanded and p3 digests.
+`KernAid-Rescue-0.1.0-internal.3-x86_64-retail.img.xz` directly with a current
+Rufus in raw/DD mode and verify its adjacent checksum first. The compressed
+image expands to exactly 32,000,000,000 bytes and carries an all-zero p3 for
+first-boot Vault provisioning; its manifest records the compressed, expanded
+and p3 digests.
 
 Use only a replacement physical-test candidate explicitly identified as active
 in `docs/CURRENT_STATUS.md`. The previous `0d61eac` diagnosis-only candidate
@@ -91,13 +92,15 @@ promotes the release by itself.
 Completing first boot creates a local encrypted Vault on that disposable USB,
 but one successful device does not qualify every USB or firmware combination.
 
-1. Use a factory-new or disposable USB drive of at least 32 GB. Rufus overwrites
-   the first 32,000,000,000 bytes, but a larger device may retain data beyond
-   that boundary; this procedure is not whole-media sanitization.
+1. Use a factory-new or disposable USB drive. A nominal 64 GB drive is
+   recommended: the expanded image is exactly 32,000,000,000 bytes, which can
+   exceed the usable capacity of media sold as 32 GB. Rufus overwrites those
+   first 32,000,000,000 bytes, but a larger device may retain data beyond that
+   boundary; this procedure is not whole-media sanitization.
 2. Verify the downloaded `.img.xz` in PowerShell with
-   `Get-FileHash .\KernAid-Rescue-amd64-retail.img.xz -Algorithm SHA256` and
-   compare the complete digest with its adjacent `.sha256` file and the exact
-   value in the qualification manifest.
+   `Get-FileHash .\KernAid-Rescue-0.1.0-internal.3-x86_64-retail.img.xz -Algorithm SHA256`
+   and compare the complete digest with its adjacent `.sha256` file and the
+   exact value in the qualification manifest.
 3. Write that exact `.img.xz` with Rufus. If Rufus offers a mode choice, choose
    raw/DD mode. Double-check the selected USB before starting.
 4. For this engineering preview, disable Secure Boot. Disconnect customer,
@@ -114,9 +117,10 @@ normal entry cannot establish a usable display, reboot and select **KernAid
 Rescue - Compatibility graphics**; it preserves the same product and safety
 arguments while adding `nomodeset`.
 
-Rufus is preferred over balenaEtcher for this Windows qualification procedure
-because it exposes the target and DD-mode choice clearly. The Linux v2 writer
-is the catalog-bound vault-provisioning path for this exact promoted image.
+Rufus is the designated Windows writer for this qualification procedure because
+it exposes the target and DD-mode choice clearly. balenaEtcher is not qualified
+for this candidate. The Linux v2 writer is the catalog-bound
+vault-provisioning path for this exact promoted image.
 
 The retail image guarantees that the boot medium's complete 8 GiB p3 starts in
 the all-zero state. Boot pauses on tty1 before the graphical UI and asks for a

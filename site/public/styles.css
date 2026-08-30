@@ -465,6 +465,27 @@ code { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
 .qualification-note p { margin: 10px 0; color: #c2ccc7; line-height: 1.55; }
 .qualification-note a { color: var(--cyan); font-size: 13px; text-decoration: none; }
 
+.windows-guide {
+  margin-top: 36px;
+  padding: clamp(22px, 4vw, 32px);
+  border: 1px solid rgba(80,216,232,.28);
+  border-radius: 16px;
+  background: linear-gradient(145deg, rgba(80,216,232,.065), rgba(0,0,0,.16));
+}
+.windows-guide-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; }
+.windows-guide-heading h3 { margin: 10px 0 0; font-size: clamp(25px, 3.5vw, 34px); letter-spacing: -.04em; }
+.guide-chip { flex: 0 0 auto; padding: 8px 11px; color: var(--cyan); border: 1px solid rgba(80,216,232,.28); border-radius: 999px; font-size: 11px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+.windows-guide-lede { max-width: 760px; margin: 18px 0 0; color: #c8d3ce; line-height: 1.6; }
+.windows-guide ol { display: grid; gap: 0; margin: 28px 0 0; padding: 0; list-style: none; }
+.windows-guide li { display: grid; grid-template-columns: 38px minmax(0, 1fr); gap: 14px; padding: 18px 0; border-top: 1px solid var(--line); }
+.windows-guide li > span { color: var(--cyan); font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; font-size: 12px; font-weight: 800; }
+.windows-guide li strong { color: #edf7f2; }
+.windows-guide li p { margin: 6px 0 0; color: var(--muted); line-height: 1.55; }
+.windows-guide li code { color: #cef7d9; overflow-wrap: anywhere; }
+.guide-warning { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; padding: 16px 18px; color: #e2c4bd; border: 1px solid rgba(255,141,116,.35); border-radius: 12px; background: rgba(255,141,116,.07); line-height: 1.5; }
+.guide-warning strong { color: #ffd1c7; }
+.guide-link { display: inline-block; margin-top: 18px; color: var(--cyan); font-size: 13px; text-decoration: none; }
+
 .secondary-artifact {
   margin-top: 36px;
   padding: 24px;
@@ -513,6 +534,7 @@ code { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
   .private-badge { display: none; }
   .private-hero { padding-top: 65px; }
   .release-heading { flex-direction: column; }
+  .windows-guide-heading { flex-direction: column; }
   .secondary-artifact-heading { flex-direction: column; }
   .release-meta > div { grid-template-columns: 1fr; gap: 7px; }
   .release-actions { align-items: stretch; flex-direction: column; }

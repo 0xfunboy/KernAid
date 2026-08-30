@@ -60,8 +60,11 @@ No artifact is loaded into memory. At process start the server opens the retail
 image, stable ISO and separately configured repair-candidate ISO without
 following a final symlink, verifies owner-only permissions, hashes every byte
 against its configured sidecar and keeps those exact file descriptors pinned
-for downloads. A missing path or mismatch leaves only that artifact unavailable.
-Operators and users must still verify each downloaded file using its sidecar.
+for downloads. The stable retail image and ISO must also match the reviewed
+byte size and SHA-256 recorded in `content.json`; a sidecar alone cannot switch
+the served release. A missing path or mismatch leaves only that artifact
+unavailable. Operators and users must still verify each downloaded file using
+its sidecar.
 
 Keep the private artifact directory owner-only (`0700`) and the ISO, checksum
 and metadata files owner-readable only (`0600`). Web authentication is not a
@@ -75,9 +78,10 @@ candidate changes, update together:
 1. source commit and CI artifact version;
 2. workflow URL;
 3. both download and checksum presentation names;
-4. qualification statement and warning;
-5. configured retail image and ISO with their matching checksum sidecars;
-6. repair-candidate metadata and files separately, without changing the stable
+4. exact reviewed byte sizes and SHA-256 values for the retail image and ISO;
+5. qualification statement and warning;
+6. configured retail image and ISO with their matching checksum sidecars;
+7. repair-candidate metadata and files separately, without changing the stable
    release paths or promoting the candidate.
 
 `content.json` and all verified artifact snapshots are loaded once at process
@@ -95,10 +99,12 @@ on factory-new or disposable USB and non-customer hardware until physical USB,
 Secure Boot and real-account/TLS gates are recorded.
 
 Each download remains independently fail-closed with `503` until its exact file,
-matching sidecar and environment path are all present. This allows the stable
-ISO and retail image to remain available when the repair candidate is absent,
-without weakening any artifact boundary. Candidate availability never changes
-its explicit non-qualified, non-promoted status.
+matching sidecar and environment path are all present. Stable retail and ISO
+downloads additionally require exact equality with their reviewed size and
+digest in `content.json`. This allows the stable ISO and retail image to remain
+available when the repair candidate is absent, without weakening any artifact
+boundary. Candidate availability never changes its explicit non-qualified,
+non-promoted status.
 
 ## Local validation
 

@@ -25,8 +25,14 @@ const maxFailedLoginKeys = 2048;
 const content = loadContent(path.join(root, "content.json"));
 const password = readSecret(authFile);
 const configuredArtifacts = Object.freeze({
-  iso: loadArtifactSnapshot(isoPath, isoSha256Path, "ISO"),
-  retail: loadArtifactSnapshot(retailPath, retailSha256Path, "retail image"),
+  iso: loadArtifactSnapshot(isoPath, isoSha256Path, "ISO", {
+    bytes: content.release.isoBytes,
+    sha256: content.release.isoSha256,
+  }),
+  retail: loadArtifactSnapshot(retailPath, retailSha256Path, "retail image", {
+    bytes: content.release.retailBytes,
+    sha256: content.release.retailSha256,
+  }),
   repairCandidate: loadArtifactSnapshot(
     repairCandidatePath,
     repairCandidateSha256Path,
@@ -91,8 +97,8 @@ function assertOwnerOnlyDirectory(directoryPath) {
 
 function loadContent(filePath) {
   const parsed = JSON.parse(fs.readFileSync(filePath, "utf8"));
-  if (parsed?.schema !== "dev.kernaid.site-content.v1" || !parsed.release || !parsed.repairCandidate) {
-    throw new Error("content.json does not match dev.kernaid.site-content.v1");
+  if (parsed?.schema !== "dev.kernaid.site-content.v2" || !parsed.release || !parsed.repairCandidate) {
+    throw new Error("content.json does not match dev.kernaid.site-content.v2");
   }
   for (const key of ["name", "channel", "sourceCommit", "artifactVersion", "workflowUrl", "downloadName", "checksumName", "retailDownloadName", "retailChecksumName", "qualification", "warning"]) {
     if (typeof parsed.release[key] !== "string" || !parsed.release[key].trim()) {
@@ -102,6 +108,19 @@ function loadContent(filePath) {
   for (const key of ["downloadName", "checksumName", "retailDownloadName", "retailChecksumName"]) {
     if (!/^[A-Za-z0-9._-]+$/.test(parsed.release[key])) {
       throw new Error(`content.json release.${key} is not a safe filename`);
+    }
+  }
+  for (const key of ["isoBytes", "retailBytes", "retailExpandedBytes"]) {
+    if (!Number.isSafeInteger(parsed.release[key]) || parsed.release[key] < 1) {
+      throw new Error(`content.json release.${key} must be a positive safe integer`);
+    }
+  }
+  if (parsed.release.retailExpandedBytes < parsed.release.retailBytes) {
+    throw new Error("content.json release.retailExpandedBytes cannot be smaller than retailBytes");
+  }
+  for (const key of ["isoSha256", "retailSha256"]) {
+    if (!/^[a-f0-9]{64}$/.test(parsed.release[key])) {
+      throw new Error(`content.json release.${key} must be a lowercase SHA-256 digest`);
     }
   }
   for (const key of ["name", "channel", "sourceCommit", "artifactVersion", "workflowUrl", "downloadName", "checksumName", "qualification", "warning"]) {
@@ -303,7 +322,7 @@ function renderLogin(error = "") {
   });
 }
 
-function loadArtifactSnapshot(filePath, checksumPath, label) {
+function loadArtifactSnapshot(filePath, checksumPath, label, reviewedArtifact = null) {
   if (!filePath || !checksumPath) {
     return { artifact: null, error: new Error(`KernAid ${label} path is not configured`) };
   }
@@ -314,11 +333,22 @@ function loadArtifactSnapshot(filePath, checksumPath, label) {
     const checksumText = fs.readFileSync(checksumPath, "utf8");
     const match = /^([a-fA-F0-9]{64})(?:\s+[*]?.+)?$/m.exec(checksumText);
     if (!match) throw new Error(`Configured ${label} checksum file does not contain a SHA-256 value`);
+    const expectedHash = match[1].toLowerCase();
+    if (reviewedArtifact && !safeEqual(expectedHash, reviewedArtifact.sha256)) {
+      throw new Error(
+        `Configured ${label} checksum sidecar does not match the reviewed SHA-256 in content.json`,
+      );
+    }
 
     fd = fs.openSync(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
     const stat = fs.fstatSync(fd);
     assertOwnerOnlyFile(filePath, stat);
     if (stat.size < 1) throw new Error(`Configured ${label} is empty`);
+    if (reviewedArtifact && stat.size !== reviewedArtifact.bytes) {
+      throw new Error(
+        `Configured ${label} does not match the reviewed byte size in content.json`,
+      );
+    }
 
     const hash = crypto.createHash("sha256");
     const buffer = Buffer.allocUnsafe(4 * 1024 * 1024);
@@ -330,9 +360,11 @@ function loadArtifactSnapshot(filePath, checksumPath, label) {
       position += bytesRead;
     }
     const actualHash = hash.digest("hex");
-    const expectedHash = match[1].toLowerCase();
     if (!safeEqual(actualHash, expectedHash)) {
       throw new Error(`Configured ${label} does not match its SHA-256 sidecar`);
+    }
+    if (reviewedArtifact && !safeEqual(actualHash, reviewedArtifact.sha256)) {
+      throw new Error(`Configured ${label} does not match the reviewed SHA-256 in content.json`);
     }
     return {
       artifact: Object.freeze({
@@ -365,6 +397,10 @@ function formatDate(isoDate) {
     dateStyle: "long",
     timeZone: "UTC",
   }).format(new Date(isoDate));
+}
+
+function formatInteger(value) {
+  return new Intl.NumberFormat("en-US", { useGrouping: true }).format(value);
 }
 
 function artifactView(snapshot) {
@@ -401,6 +437,7 @@ function renderPrivate() {
     channel: escapeHtml(release.channel),
     checksumName: escapeHtml(release.retailChecksumName),
     downloadName: escapeHtml(release.retailDownloadName),
+    expandedBytes: escapeHtml(formatInteger(release.retailExpandedBytes)),
     hash: escapeHtml(retail.hash),
     isoArtifactState: iso.state,
     isoChecksumName: escapeHtml(release.checksumName),

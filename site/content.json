@@ -1,5 +1,5 @@
 {
-  "schema": "dev.kernaid.site-content.v1",
+  "schema": "dev.kernaid.site-content.v2",
   "release": {
     "name": "KernAid Rescue AMD64",
     "channel": "Internal 0.1.0-internal.3 · virtual-qualified · physical-test candidate",
@@ -10,8 +10,13 @@
     "checksumName": "KernAid-Rescue-0.1.0-internal.3-x86_64.iso.sha256",
     "retailDownloadName": "KernAid-Rescue-0.1.0-internal.3-x86_64-retail.img.xz",
     "retailChecksumName": "KernAid-Rescue-0.1.0-internal.3-x86_64-retail.img.xz.sha256",
+    "isoBytes": 1223540736,
+    "isoSha256": "3df9a44f0c8b992f583b887fb10636a41fa7fae7bc4a2dc6284aa34ffcfc0c28",
+    "retailBytes": 1191700928,
+    "retailSha256": "541d429b998d9b63b0eb2f7f4a9f7ae52f900cca6aaa10e51e8cdaed1ed8f9a5",
+    "retailExpandedBytes": 32000000000,
     "qualification": "Build, ABI, SBOM, framebuffer visibile, input da tastiera, boot e USB-style two-boot QEMU BIOS/UEFI superati. I lifecycle privilegiati hanno provisionato da zero, riaperto e verificato lo stesso Vault LUKS2/ext4, inclusi identità, report firmati e home Codex persistente. Questa build sostituisce la candidata 0d61eac ritirata: usa trasporto WebKit shared-memory e rasterizzazione CPU, disabilita la cache shader effimera e include branding KernAid con modalità Compatibility graphics. Manifest canonico e attestazioni Sigstore sono stati riverificati dalla release interna 0.1.0-internal.3.",
-    "warning": "Candidata interna qualificata soltanto virtualmente e unica immagine autorizzata dal catalogo trusted v2 revision 5. È la candidata attiva per il test fisico controllato; la precedente 0d61eac è ritirata e non deve essere riutilizzata. USB fisica, firmware, Secure Boot, login Codex con account reale/TLS live e riparazioni restano non qualificati; usare solo una chiavetta nuova o sacrificabile da almeno 32 GB e hardware non cliente."
+    "warning": "Candidata interna qualificata soltanto virtualmente e unica immagine autorizzata dal catalogo trusted v2 revision 5. È la candidata attiva per il test fisico controllato; la precedente 0d61eac è ritirata e non deve essere riutilizzata. USB fisica, firmware, Secure Boot, login Codex con account reale/TLS live e riparazioni restano non qualificati; usare hardware non cliente e una chiavetta nuova o sacrificabile da 64 GB consigliati, mai con capacità reale inferiore ai 32.000.000.000 byte dell'immagine espansa."
   },
   "repairCandidate": {
     "name": "KernAid Rescue Repair Candidate AMD64",

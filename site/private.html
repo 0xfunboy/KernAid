@@ -64,6 +64,27 @@
         <a class="button ghost" href="/private/downloads/retail-checksum">Scarica SHA-256 retail</a>
       </div>
 
+      <section class="windows-guide" aria-labelledby="windows-guide-title">
+        <div class="windows-guide-heading">
+          <div>
+            <p class="card-kicker">Windows · test fisico controllato</p>
+            <h3 id="windows-guide-title">Dalla cartella Download alla chiavetta.</h3>
+          </div>
+          <span class="guide-chip">Rufus · DD</span>
+        </div>
+        <p class="windows-guide-lede">Questa procedura distrugge il contenuto della USB selezionata. Usare solo hardware non cliente e una chiavetta nuova o sacrificabile.</p>
+        <ol>
+          <li><span>01</span><div><strong>Scarica e verifica</strong><p>Scarica <code>{{downloadName}}</code> e il relativo SHA-256. In PowerShell esegui <code>Get-FileHash .\{{downloadName}} -Algorithm SHA256</code> e confronta l'intero digest.</p></div></li>
+          <li><span>02</span><div><strong>Prepara il supporto corretto</strong><p>Usa una USB da 64 GB consigliati. L'immagine espansa occupa esattamente <code>{{expandedBytes}}</code> byte: molte unità vendute come 32 GB non sono abbastanza capienti.</p></div></li>
+          <li><span>03</span><div><strong>Scrivi con Rufus</strong><p>Seleziona direttamente il file compresso <code>.img.xz</code>, controlla due volte la lettera dell'unità e, se richiesto, scegli <strong>modalità immagine DD</strong>.</p></div></li>
+          <li><span>04</span><div><strong>Avvia una sola volta dalla USB</strong><p>Disabilita Secure Boot per questa engineering preview e scegli la chiavetta dal boot menu temporaneo del firmware, senza cambiare l'ordine permanente.</p></div></li>
+          <li><span>05</span><div><strong>Crea il Vault locale</strong><p>Al primo avvio <code>tty1</code> chiede la nuova passphrase due volte. Conservala: KernAid non può recuperarla.</p></div></li>
+          <li><span>06</span><div><strong>Se lo schermo non è utilizzabile</strong><p>Riavvia e scegli <strong>KernAid Rescue - Compatibility graphics</strong> dal menu di boot.</p></div></li>
+        </ol>
+        <div class="guide-warning"><strong>balenaEtcher non è qualificato per questa candidata.</strong><span>Per il test Windows documentato usa Rufus e il file <code>.img.xz</code> senza decomprimerlo.</span></div>
+        <a class="guide-link" href="https://github.com/0xfunboy/KernAid/blob/main/docs/operator-guide.md#windows-physical-boot-qualification-only" target="_blank" rel="noreferrer">Apri la guida operatore completa ↗</a>
+      </section>
+
       <section class="secondary-artifact" aria-labelledby="iso-title">
         <div class="secondary-artifact-heading">
           <div>
