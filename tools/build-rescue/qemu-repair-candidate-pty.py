@@ -72,7 +72,9 @@ def parser() -> ClosedParser:
     value.add_argument("--qmp-socket", type=Path, required=True)
     value.add_argument("--firmware", choices=("bios", "uefi"), required=True)
     value.add_argument(
-        "--scenario", choices=("apply", "interrupt-reconcile"), required=True
+        "--scenario",
+        choices=("apply", "rollback", "interrupt-reconcile"),
+        required=True,
     )
     value.add_argument("--ovmf-code", type=Path)
     value.add_argument("--ovmf-vars-template", type=Path)
@@ -420,6 +422,145 @@ sys.stdout.write("KERNAID_QEMU_PROVIDER_PROOF_V1 stage="+STAGE+" result=true\\n"
     return textwrap.dedent(source).encode("ascii")
 
 
+def rollback_source(before_sha256: str, after_sha256: str) -> bytes:
+    """Return a source-fixed one-boot proof of committed repair and rollback."""
+
+    source = r'''import hashlib,http.client,json,secrets,sys,time
+HOST="127.0.0.1:4173"
+ORIGIN="http://127.0.0.1:4173"
+APPLY_API="kernaid.dev/rescue-repair-service/v1alpha1"
+ROLLBACK_API="kernaid.dev/rescue-repair-service/v1alpha2"
+BEFORE=__BEFORE__
+AFTER=__AFTER__
+RESOURCE="rescue:selected-linux-root:etc/fstab"
+APPLY_CONFIRMATION="DISABILITA VOCE FSTAB"
+ROLLBACK_CONFIRMATION="RIPRISTINA FSTAB ORIGINALE"
+counter=0
+def request_id():
+    global counter
+    counter+=1
+    return "R-20000000-0000-0000-0000-"+format(counter,"012x")
+def valid_hex(value,prefix):
+    return isinstance(value,str) and value.startswith(prefix) and len(value)==len(prefix)+32 and all(character in "0123456789abcdef" for character in value[len(prefix):])
+def valid_hash(value):
+    return isinstance(value,str) and value.startswith("sha256:") and len(value)==71 and all(character in "0123456789abcdef" for character in value[7:])
+def http(path,body=None,timeout=25):
+    encoded=None if body is None else json.dumps(body,ensure_ascii=True,separators=(",",":")).encode("ascii")
+    headers={"Host":HOST}
+    if encoded is not None:
+        headers.update({"Origin":ORIGIN,"Content-Type":"application/json"})
+    connection=http.client.HTTPConnection("127.0.0.1",4173,timeout=timeout)
+    connection.request("GET" if encoded is None else "POST",path,body=encoded,headers=headers)
+    response=connection.getresponse()
+    payload=response.read(65537)
+    status=response.status
+    connection.close()
+    if len(payload)>65536:
+        raise RuntimeError()
+    return status,json.loads(payload)
+def repair(api,operation,extra=None):
+    request={"apiVersion":api,"requestId":request_id(),"operation":operation}
+    if extra is not None:
+        request.update(extra)
+    status,value=http("/api/rescue/repair",request)
+    if status!=200 or not isinstance(value,dict) or set(value)!={"apiVersion","requestId","operation","outcome","stateVersion","state","detail"} or value.get("apiVersion")!=api or value.get("requestId")!=request["requestId"] or value.get("operation")!=operation or value.get("outcome")!="ok" or isinstance(value.get("stateVersion"),bool) or not isinstance(value.get("stateVersion"),int):
+        raise RuntimeError()
+    return value
+def wait(api,operation,states,deadline):
+    while time.monotonic()<deadline:
+        value=repair(api,operation)
+        if value.get("state") in states:
+            return value
+        time.sleep(.2)
+    raise RuntimeError()
+try:
+    deadline=time.monotonic()+720
+    while True:
+        try:
+            if repair(APPLY_API,"repair.status").get("state")=="idle":
+                break
+        except BaseException:
+            pass
+        if time.monotonic()>=deadline:
+            raise RuntimeError()
+        time.sleep(.5)
+    while True:
+        try:
+            inventory_code,inventory=http("/api/inventory")
+            scan_code,scan=http("/api/rescue/installed-targets")
+            if inventory_code==200 and scan_code==200:
+                break
+        except BaseException:
+            pass
+        if time.monotonic()>=deadline:
+            raise RuntimeError()
+        time.sleep(.5)
+    candidates=[item for item in scan["candidates"] if item.get("osFamilyHint")=="linux" and item.get("requiresUnlock") is False]
+    if len(candidates)!=1:
+        raise RuntimeError()
+    candidate=candidates[0]
+    selection={"scanFingerprint":scan["scanFingerprint"],"targetId":candidate["targetId"]}
+    selected_code,selected=http("/api/rescue/select-installed-target",selection)
+    inspected_code,inspected=http("/api/rescue/inspect-installed-target",selection)
+    if selected_code!=200 or selected.get("target")!=candidate or inspected_code!=200 or inspected.get("status")!="installed-os-content-inspected" or inspected.get("target",{}).get("filesystem")!="ext4":
+        raise RuntimeError()
+    identity=[item for item in inventory if "hostname" in item.get("collector","") or "block.inventory" in item.get("collector","") or item.get("collector","").endswith((".disks",".system",".storage.identity"))]
+    if not identity or any(item.get("success") is not True or item.get("truncated") is True for item in identity):
+        raise RuntimeError()
+    canonical="\0".join(item["collector"]+"\0"+item["output"] for item in identity)
+    runtime="sha256:"+hashlib.sha256(canonical.encode()).hexdigest()
+    candidate_json=json.dumps(candidate,ensure_ascii=True,sort_keys=True,separators=(",",":"))
+    material="\0".join(("kernaid-rescue-observe-target-v1",runtime,scan["scanFingerprint"],candidate["targetId"],candidate_json))
+    target_fingerprint="sha256:"+hashlib.sha256(material.encode()).hexdigest()
+    prepared=repair(APPLY_API,"repair.fstab.prepare",{"target":{"scanFingerprint":scan["scanFingerprint"],"targetFingerprint":target_fingerprint,"targetId":candidate["targetId"]}})
+    if prepared.get("state")=="preparing":
+        prepared=wait(APPLY_API,"repair.status",{"prepared","failed","restored","manual-reconciliation-required"},deadline)
+    detail=prepared.get("detail")
+    apply_keys={"kind","preparedId","sessionId","planId","planHash","targetFingerprint","beforeSha256","afterSha256","diffSha256","resourceId","backupLocator","actionId","risk","backup","nextApprovalSequence","confirmationRequired"}
+    if prepared.get("state")!="prepared" or not isinstance(detail,dict) or set(detail)!=apply_keys or detail.get("kind")!="fstab-prepared" or detail.get("actionId")!="linux.fstab.disable-missing-uuid.v1" or detail.get("targetFingerprint")!=target_fingerprint or detail.get("beforeSha256")!=BEFORE or detail.get("afterSha256")!=AFTER or detail.get("resourceId")!=RESOURCE or detail.get("risk")!="R2" or detail.get("backup")!={"state":"reserved","vaultDistinct":True} or detail.get("confirmationRequired")!=APPLY_CONFIRMATION or not valid_hash(detail.get("planHash")) or not valid_hash(detail.get("diffSha256")) or not valid_hex(detail.get("preparedId"),"Q-") or not valid_hex(detail.get("sessionId"),"S-") or not valid_hex(detail.get("planId"),"P-") or isinstance(detail.get("nextApprovalSequence"),bool) or not isinstance(detail.get("nextApprovalSequence"),int) or detail.get("nextApprovalSequence")<1:
+        raise RuntimeError()
+    locator=detail.get("backupLocator")
+    source_reservation=locator[len("vault://repair/"):] if isinstance(locator,str) and locator.startswith("vault://repair/") else None
+    if not valid_hex(source_reservation,"B-"):
+        raise RuntimeError()
+    apply_sequence=detail["nextApprovalSequence"]
+    apply_approval_id="A-"+secrets.token_hex(16)
+    approved=repair(APPLY_API,"repair.fstab.approve",{"preparedId":detail["preparedId"],"sessionId":detail["sessionId"],"planId":detail["planId"],"planHash":detail["planHash"],"approvalId":apply_approval_id,"approvalSequence":apply_sequence,"typedConfirmation":APPLY_CONFIRMATION})
+    if approved.get("state")=="executing":
+        approved=wait(APPLY_API,"repair.status",{"succeeded","restored","failed","manual-reconciliation-required","cancelled"},deadline)
+    source_detail=approved.get("detail")
+    terminal_keys={"kind","terminalOutcome","reservationId","transactionBindingSha256","rebootRequired","prepareFailureStage"}
+    if approved.get("state")!="succeeded" or not isinstance(source_detail,dict) or set(source_detail)!=terminal_keys or source_detail.get("kind")!="terminal" or source_detail.get("terminalOutcome")!="committed" or source_detail.get("reservationId")!=source_reservation or not valid_hash(source_detail.get("transactionBindingSha256")) or source_detail.get("rebootRequired") is not False or source_detail.get("prepareFailureStage") is not None:
+        raise RuntimeError()
+    source_receipt={"reservationId":source_detail["reservationId"],"transactionBindingSha256":source_detail["transactionBindingSha256"]}
+    rollback_status=repair(ROLLBACK_API,"repair.fstab.rollback.status")
+    if rollback_status.get("state")!="succeeded" or rollback_status.get("detail")!=source_detail:
+        raise RuntimeError()
+    rollback_prepared=repair(ROLLBACK_API,"repair.fstab.rollback.prepare",{"source":source_receipt})
+    if rollback_prepared.get("state")=="preparing":
+        rollback_prepared=wait(ROLLBACK_API,"repair.fstab.rollback.status",{"prepared","failed","restored","manual-reconciliation-required"},deadline)
+    rollback=rollback_prepared.get("detail")
+    rollback_keys={"kind","preparedId","rollbackId","sessionId","planId","planHash","targetFingerprint","source","resourceId","backupLocator","actionId","risk","nextApprovalSequence","confirmationRequired"}
+    if rollback_prepared.get("state")!="prepared" or not isinstance(rollback,dict) or set(rollback)!=rollback_keys or rollback.get("kind")!="fstab-rollback-prepared" or not valid_hex(rollback.get("preparedId"),"Q-") or not valid_hex(rollback.get("rollbackId"),"RB-") or not valid_hex(rollback.get("sessionId"),"S-") or not valid_hex(rollback.get("planId"),"P-") or not valid_hash(rollback.get("planHash")) or rollback.get("targetFingerprint")!=target_fingerprint or rollback.get("source")!=source_receipt or rollback.get("resourceId")!=RESOURCE or rollback.get("backupLocator")!="vault://repair/"+source_receipt["reservationId"] or rollback.get("actionId")!="linux.fstab.restore" or rollback.get("risk")!="R2" or rollback.get("nextApprovalSequence")!=apply_sequence+1 or rollback.get("confirmationRequired")!=ROLLBACK_CONFIRMATION:
+        raise RuntimeError()
+    rollback_approval_id="A-"+secrets.token_hex(16)
+    while rollback_approval_id==apply_approval_id:
+        rollback_approval_id="A-"+secrets.token_hex(16)
+    rolled_back=repair(ROLLBACK_API,"repair.fstab.rollback.approve",{"preparedId":rollback["preparedId"],"rollbackId":rollback["rollbackId"],"sessionId":rollback["sessionId"],"planId":rollback["planId"],"planHash":rollback["planHash"],"source":source_receipt,"approvalId":rollback_approval_id,"approvalSequence":rollback["nextApprovalSequence"],"typedConfirmation":ROLLBACK_CONFIRMATION})
+    if rolled_back.get("state")=="executing":
+        rolled_back=wait(ROLLBACK_API,"repair.fstab.rollback.status",{"restored","failed","manual-reconciliation-required","cancelled"},deadline)
+    result=rolled_back.get("detail")
+    if rolled_back.get("state")!="restored" or not isinstance(result,dict) or set(result)!=terminal_keys or result.get("kind")!="terminal" or result.get("terminalOutcome")!="rolled-back-original" or result.get("reservationId")!=source_receipt["reservationId"] or result.get("transactionBindingSha256")!=source_receipt["transactionBindingSha256"] or result.get("rebootRequired") is not False or result.get("prepareFailureStage") is not None:
+        raise RuntimeError()
+except BaseException:
+    sys.exit(46)
+sys.stdout.write("KERNAID_QEMU_PROVIDER_PROOF_V1 stage=repair-rollback result=true\n")
+'''
+    return textwrap.dedent(source).replace(
+        "__BEFORE__", repr(before_sha256)
+    ).replace("__AFTER__", repr(after_sha256)).encode("ascii")
+
+
 def reconcile_source() -> bytes:
     """Return a source-fixed boot-two proof for the recovery barrier."""
 
@@ -556,12 +697,14 @@ def main(arguments: Sequence[str]) -> int:
         parsed = parser().parse_args(arguments)
         if parsed.qemu_args[:1] != ["--"]:
             raise LIFECYCLE.ClosedFailure("arguments", "invalid")
-        if parsed.scenario == "interrupt-reconcile" and parsed.firmware != "uefi":
+        if parsed.scenario in {"rollback", "interrupt-reconcile"} and parsed.firmware != "uefi":
             raise LIFECYCLE.ClosedFailure("arguments", "scenario-firmware-invalid")
         for digest in (parsed.before_sha256, parsed.after_sha256):
             if re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
                 raise LIFECYCLE.ClosedFailure("arguments", "digest-invalid")
-        timeout_maximum = 1800 if parsed.scenario == "interrupt-reconcile" else 1200
+        timeout_maximum = (
+            1800 if parsed.scenario in {"rollback", "interrupt-reconcile"} else 1200
+        )
         if (
             parsed.before_sha256 == parsed.after_sha256
             or not 300 <= parsed.timeout <= timeout_maximum
@@ -643,6 +786,18 @@ def main(arguments: Sequence[str]) -> int:
             qmp.set_deadline(LIFECYCLE._deadline(aggregate, 10.0))
             qmp.system_powerdown()
             harness.wait_for_shutdown(LIFECYCLE._deadline(aggregate, 180.0))
+        elif parsed.scenario == "rollback":
+            LIFECYCLE.run_guest_proof(
+                console,
+                "repair-rollback",
+                rollback_source(parsed.before_sha256, parsed.after_sha256),
+                cursor,
+                aggregate,
+                timeout=720.0,
+            )
+            qmp.set_deadline(LIFECYCLE._deadline(aggregate, 10.0))
+            qmp.system_powerdown()
+            harness.wait_for_shutdown(LIFECYCLE._deadline(aggregate, 180.0))
         else:
             LIFECYCLE.run_guest_proof(
                 console,
@@ -717,13 +872,21 @@ def main(arguments: Sequence[str]) -> int:
         )
         return 1
     if parsed.scenario == "apply":
+        action = "linux.fstab.disable-missing-uuid.v1"
         suffix = "terminal=committed approval=typed-single-use"
+    elif parsed.scenario == "rollback":
+        action = "linux.fstab.restore"
+        suffix = (
+            "source_terminal=committed terminal=rolled-back-original "
+            "state=restored approval=fresh-typed-single-use"
+        )
     else:
+        action = "linux.fstab.disable-missing-uuid.v1"
         suffix = (
             "terminal=restored interruption=qmp-after-target-write recovery=closed"
         )
     print(
-        f"{ATTESTATION_PREFIX} action=linux.fstab.disable-missing-uuid.v1 "
+        f"{ATTESTATION_PREFIX} action={action} "
         f"firmware={parsed.firmware} scenario={parsed.scenario} "
         f"before_sha256={parsed.before_sha256} after_sha256={parsed.after_sha256} "
         f"vault_distinct=true {suffix} ready=true",

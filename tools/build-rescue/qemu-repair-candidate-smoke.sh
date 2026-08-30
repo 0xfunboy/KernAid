@@ -13,18 +13,23 @@ controller_timeout=900
 readonly qemu_smp="${KERNAID_QEMU_SMP:-2}"
 
 if [[ "$firmware" != bios && "$firmware" != uefi ]]; then
-  echo "Usage: $0 [bios|uefi] [apply|interrupt-reconcile] [iso]" >&2
+  echo "Usage: $0 [bios|uefi] [apply|rollback|interrupt-reconcile] [iso]" >&2
   exit 2
 fi
-if [[ "$scenario" != apply && "$scenario" != interrupt-reconcile ]]; then
-  echo "Usage: $0 [bios|uefi] [apply|interrupt-reconcile] [iso]" >&2
+if [[ "$scenario" != apply && "$scenario" != rollback \
+  && "$scenario" != interrupt-reconcile ]]; then
+  echo "Usage: $0 [bios|uefi] [apply|rollback|interrupt-reconcile] [iso]" >&2
   exit 2
 fi
-if [[ "$scenario" == interrupt-reconcile ]]; then
+if [[ "$scenario" == rollback || "$scenario" == interrupt-reconcile ]]; then
   [[ "$firmware" == uefi ]] || {
-    echo "interrupt-reconcile is qualified only with UEFI" >&2
+    echo "$scenario is qualified only with UEFI" >&2
     exit 2
   }
+fi
+if [[ "$scenario" == rollback ]]; then
+  controller_timeout=1500
+elif [[ "$scenario" == interrupt-reconcile ]]; then
   controller_timeout=1800
 fi
 
@@ -210,6 +215,10 @@ if [[ "$scenario" == apply ]]; then
   expected_guest="KERNAID_QEMU_REPAIR_CANDIDATE_GUEST_V1 action=linux.fstab.disable-missing-uuid.v1 firmware=$firmware scenario=apply before_sha256=$before_sha256 after_sha256=$after_sha256 vault_distinct=true terminal=committed approval=typed-single-use ready=true"
   expected_fstab="$expected_after"
   expected_terminal=committed
+elif [[ "$scenario" == rollback ]]; then
+  expected_guest="KERNAID_QEMU_REPAIR_CANDIDATE_GUEST_V1 action=linux.fstab.restore firmware=$firmware scenario=rollback before_sha256=$before_sha256 after_sha256=$after_sha256 vault_distinct=true source_terminal=committed terminal=rolled-back-original state=restored approval=fresh-typed-single-use ready=true"
+  expected_fstab="$seed/etc/fstab"
+  expected_terminal=rolled-back-original
 else
   expected_guest="KERNAID_QEMU_REPAIR_CANDIDATE_GUEST_V1 action=linux.fstab.disable-missing-uuid.v1 firmware=$firmware scenario=interrupt-reconcile before_sha256=$before_sha256 after_sha256=$after_sha256 vault_distinct=true terminal=restored interruption=qmp-after-target-write recovery=closed ready=true"
   expected_fstab="$seed/etc/fstab"
@@ -230,5 +239,10 @@ prefix_after_sha256="$(dd if="$rescue_media" bs=4M iflag=count_bytes \
   count="$iso_bytes" status=none | sha256sum | awk '{print $1}')"
 [[ "$prefix_after_sha256" == "$iso_sha256" ]]
 
+if [[ "$scenario" == rollback ]]; then
+  attested_action=linux.fstab.restore
+else
+  attested_action=linux.fstab.disable-missing-uuid.v1
+fi
 printf '%s\n' \
-  "KERNAID_QEMU_REPAIR_CANDIDATE_ATTESTATION_V1 action=linux.fstab.disable-missing-uuid.v1 firmware=$firmware scenario=$scenario drives=rescue-usb,target-ext4 physical_parents=distinct vault=luks2-ext4 before_sha256=$before_sha256 after_sha256=$after_sha256 exact_bytes=true terminal=$expected_terminal iso_prefix_immutable=true host_physical_devices=false ready=true"
+  "KERNAID_QEMU_REPAIR_CANDIDATE_ATTESTATION_V1 action=$attested_action firmware=$firmware scenario=$scenario drives=rescue-usb,target-ext4 physical_parents=distinct vault=luks2-ext4 before_sha256=$before_sha256 after_sha256=$after_sha256 exact_bytes=true terminal=$expected_terminal iso_prefix_immutable=true host_physical_devices=false ready=true"

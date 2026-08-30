@@ -170,19 +170,62 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
         workflow = WORKFLOW.read_text(encoding="utf-8")
         self.assertEqual(
             workflow.count("./tools/build-rescue/qemu-repair-candidate-smoke.sh"),
-            3,
+            4,
         )
         self.assertIn("qemu-repair-candidate-smoke.sh bios apply", workflow)
         self.assertIn("qemu-repair-candidate-smoke.sh uefi apply", workflow)
+        self.assertIn("qemu-repair-candidate-smoke.sh uefi rollback", workflow)
         self.assertIn("uefi interrupt-reconcile", workflow)
         source = SCRIPT.read_text(encoding="utf-8")
         self.assertIn('firmware="${1:-bios}"', source)
         self.assertIn('scenario="${2:-apply}"', source)
+        self.assertIn("controller_timeout=1500", source)
         self.assertIn("controller_timeout=1800", source)
         self.assertIn('readonly qemu_smp="${KERNAID_QEMU_SMP:-2}"', source)
         self.assertIn('1|2|4|8)', source)
         self.assertIn('-smp "$qemu_smp"', source)
         self.assertIn("KERNAID_QEMU_SMP=4", workflow)
+
+    def test_uefi_post_commit_rollback_uses_public_v2_and_restores_before(
+        self,
+    ) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        shell = SCRIPT.read_text(encoding="utf-8")
+        source = CONTROLLER.read_text(encoding="utf-8")
+        generated = controller.rollback_source(
+            "sha256:" + "a" * 64, "sha256:" + "b" * 64
+        )
+        self.assertLessEqual(len(generated), 16 * 1024)
+        compile(generated, "<rollback-source>", "exec")
+
+        for required in (
+            'ROLLBACK_API="kernaid.dev/rescue-repair-service/v1alpha2"',
+            'repair(ROLLBACK_API,"repair.fstab.rollback.status")',
+            'repair(ROLLBACK_API,"repair.fstab.rollback.prepare",',
+            'repair(ROLLBACK_API,"repair.fstab.rollback.approve",',
+            'rollback.get("source")!=source_receipt',
+            'rollback.get("resourceId")!=RESOURCE',
+            'rollback.get("backupLocator")!="vault://repair/"+source_receipt',
+            'rollback.get("risk")!="R2"',
+            'rollback.get("confirmationRequired")!=ROLLBACK_CONFIRMATION',
+            'rollback.get("nextApprovalSequence")!=apply_sequence+1',
+            'while rollback_approval_id==apply_approval_id:',
+            '"rollbackId":rollback["rollbackId"]',
+            'result.get("terminalOutcome")!="rolled-back-original"',
+            'rolled_back.get("state")!="restored"',
+        ):
+            self.assertIn(required.encode("ascii"), generated)
+
+        self.assertIn(
+            'parsed.scenario in {"rollback", "interrupt-reconcile"} '
+            'and parsed.firmware != "uefi"',
+            source,
+        )
+        self.assertIn('expected_fstab="$seed/etc/fstab"', shell)
+        self.assertIn('cmp -s -- "$expected_fstab" "$observed_fstab"', shell)
+        self.assertIn("KERNAID_REPAIR_TARGET_SENTINEL", shell)
+        self.assertIn('[[ "$prefix_after_sha256" == "$iso_sha256" ]]', shell)
+        self.assertEqual(workflow.count("uefi rollback"), 1)
 
     def test_interruption_witness_and_reconciliation_are_fail_closed(self) -> None:
         source = CONTROLLER.read_text(encoding="utf-8")
@@ -194,7 +237,8 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
             '"execute-state-closed-before-unchanged"',
             '"execute-state-closed-before-restored"',
             '"manual-reconciliation-required"',
-            'scenario == "interrupt-reconcile" and parsed.firmware != "uefi"',
+            'parsed.scenario in {"rollback", "interrupt-reconcile"} '
+            'and parsed.firmware != "uefi"',
             "OVMF_VARS.repair-boot-{boot}.fd",
         ):
             self.assertIn(required, source)

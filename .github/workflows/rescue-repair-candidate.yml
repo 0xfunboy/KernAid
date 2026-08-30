@@ -201,6 +201,12 @@ jobs:
             ./tools/build-rescue/qemu-repair-candidate-smoke.sh uefi apply \
             "$PWD/KernAid-Rescue-amd64-repair-candidate.iso"
 
+      - name: QEMU UEFI post-commit rollback qualification
+        run: |
+          KERNAID_QEMU_SMP=4 \
+            ./tools/build-rescue/qemu-repair-candidate-smoke.sh uefi rollback \
+            "$PWD/KernAid-Rescue-amd64-repair-candidate.iso"
+
       - name: QEMU UEFI repair candidate restart reconciliation qualification
         run: |
           KERNAID_QEMU_SMP=4 \
