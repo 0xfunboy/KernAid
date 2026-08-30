@@ -451,6 +451,22 @@ type NativeInvoke = <T>(
   args?: Record<string, unknown>,
 ) => Promise<T>;
 
+const RESCUE_NATIVE_PROMPT_API_VERSION =
+  "kernaid.dev/rescue-native-prompt/v1alpha1";
+
+export interface RescueNativePromptStatus {
+  readonly apiVersion: typeof RESCUE_NATIVE_PROMPT_API_VERSION;
+  readonly kind: "vault-unlock";
+  readonly availability: "available" | "unavailable" | "failed";
+  readonly promptState: "idle" | "active" | "unavailable" | "failed";
+}
+
+export interface RescueNativePromptResult {
+  readonly apiVersion: typeof RESCUE_NATIVE_PROMPT_API_VERSION;
+  readonly requestId: string;
+  readonly outcome: "opened" | "focused" | "busy" | "unavailable" | "failed";
+}
+
 interface NativeSignedArtifact {
   mediaType: typeof SIGNED_REPORT_MEDIA_TYPE;
   payloadMediaType: "application/json" | "text/markdown";
@@ -482,9 +498,9 @@ export function hasLocalCollector(): boolean {
 
 /**
  * A Rescue web bundle can run inside the minimal Tauri/WebKit shell, but its
- * loopback HTTP origin must never inherit Resident IPC.  The shipping Rescue
- * shell registers no commands and configures no remote capability; this
- * runtime probe makes an accidental future widening fail closed in the UI.
+ * loopback HTTP origin must never inherit Resident IPC. The shipping Rescue
+ * shell exposes only the closed native-prompt status/open pair; this runtime
+ * probe makes an accidental Resident widening fail closed in the UI.
  */
 export async function verifyRescueTauriIpcIsolation(
   nativeInvoke: NativeInvoke = invoke,
@@ -501,6 +517,82 @@ export async function verifyRescueTauriIpcIsolation(
     throw new Error(
       "Il confine IPC Rescue non e sicuro; il runtime resta bloccato.",
     );
+}
+
+export async function getRescueNativePromptStatus(
+  nativeInvoke: NativeInvoke = invoke,
+): Promise<RescueNativePromptStatus> {
+  if (nativeInvoke === invoke && (!hasTauriBridge() || !isRescueHttpOrigin()))
+    throw new Error("Prompt nativo Rescue non disponibile.");
+  return parseRescueNativePromptStatus(
+    await nativeInvoke("rescue_native_prompt_status"),
+  );
+}
+
+export async function openRescueNativeVaultPrompt(
+  nativeInvoke: NativeInvoke = invoke,
+): Promise<RescueNativePromptResult> {
+  if (nativeInvoke === invoke && (!hasTauriBridge() || !isRescueHttpOrigin()))
+    throw new Error("Prompt nativo Rescue non disponibile.");
+  const requestId = `N-${crypto.randomUUID()}`;
+  const result = parseRescueNativePromptResult(
+    await nativeInvoke("open_rescue_native_prompt", {
+      request: {
+        apiVersion: RESCUE_NATIVE_PROMPT_API_VERSION,
+        requestId,
+        operation: "prompt.open-or-focus",
+        kind: "vault-unlock",
+      },
+    }),
+  );
+  if (result.requestId !== requestId)
+    throw new Error("Risposta prompt nativo Rescue non correlata.");
+  return result;
+}
+
+export function parseRescueNativePromptStatus(
+  value: unknown,
+): RescueNativePromptStatus {
+  const item = exactRecord(value, [
+    "apiVersion",
+    "kind",
+    "availability",
+    "promptState",
+  ]);
+  const availability = item.availability;
+  const promptState = item.promptState;
+  if (
+    item.apiVersion !== RESCUE_NATIVE_PROMPT_API_VERSION ||
+    item.kind !== "vault-unlock" ||
+    (availability !== "available" &&
+      availability !== "unavailable" &&
+      availability !== "failed") ||
+    (availability === "available"
+      ? promptState !== "idle" && promptState !== "active"
+      : promptState !== availability)
+  )
+    throw new Error("Stato prompt nativo Rescue non valido.");
+  return item as unknown as RescueNativePromptStatus;
+}
+
+export function parseRescueNativePromptResult(
+  value: unknown,
+): RescueNativePromptResult {
+  const item = exactRecord(value, ["apiVersion", "requestId", "outcome"]);
+  if (
+    item.apiVersion !== RESCUE_NATIVE_PROMPT_API_VERSION ||
+    typeof item.requestId !== "string" ||
+    !/^N-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(
+      item.requestId,
+    ) ||
+    (item.outcome !== "opened" &&
+      item.outcome !== "focused" &&
+      item.outcome !== "busy" &&
+      item.outcome !== "unavailable" &&
+      item.outcome !== "failed")
+  )
+    throw new Error("Risposta prompt nativo Rescue non valida.");
+  return item as unknown as RescueNativePromptResult;
 }
 
 export async function collectLocalInventory(): Promise<NativeObservation[]> {

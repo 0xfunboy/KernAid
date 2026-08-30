@@ -17,6 +17,7 @@ python3-minimal
 ca-certificates
 curl
 util-linux
+kbd
 parted
 gdisk
 lvm2

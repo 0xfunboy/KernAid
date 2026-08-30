@@ -57,6 +57,12 @@ network_probe = load_module(
     / "rescue/live-build/config/includes.chroot/usr/lib/kernaid"
     / "tauri_network_probe.py",
 )
+native_prompt = load_module(
+    "kernaid_rescue_native_prompt",
+    REPO_DIR
+    / "rescue/live-build/config/includes.chroot/usr/lib/kernaid"
+    / "rescue_native_prompt_broker.py",
+)
 binary_verifier = load_module(
     "kernaid_shipping_binary_profiles",
     TOOLS_DIR / "verify-shipping-binary.py",
@@ -725,7 +731,7 @@ class RescueTauriBoundaryTests(unittest.TestCase):
                 guest_ui._visible_window(431, ui, "/run/pinned-xauthority")
             )
 
-    def test_rescue_config_has_no_remote_or_local_tauri_permissions(self) -> None:
+    def test_rescue_config_grants_only_closed_prompt_status_and_open(self) -> None:
         config = json.loads(
             (
                 REPO_DIR / "apps/desk/src-tauri-rescue/tauri.conf.json"
@@ -735,15 +741,26 @@ class RescueTauriBoundaryTests(unittest.TestCase):
         capabilities = config["app"]["security"]["capabilities"]
         self.assertEqual(len(capabilities), 1)
         self.assertIs(capabilities[0]["local"], False)
-        self.assertEqual(capabilities[0]["permissions"], [])
-        self.assertNotIn("remote", capabilities[0])
+        self.assertEqual(
+            capabilities[0]["permissions"],
+            [
+                "allow-rescue-native-prompt-status",
+                "allow-open-rescue-native-prompt",
+            ],
+        )
+        self.assertEqual(
+            capabilities[0]["remote"]["urls"],
+            ["http://127.0.0.1:4173/*"],
+        )
 
         source = (
             REPO_DIR
             / "apps/desk/src-tauri-rescue/src/main.rs"
         ).read_text(encoding="utf-8")
-        self.assertNotIn("invoke_handler(", source)
-        self.assertNotIn("generate_handler!", source)
+        self.assertEqual(source.count(".invoke_handler("), 1)
+        self.assertEqual(source.count("rescue_native_prompt_status,"), 1)
+        self.assertEqual(source.count("open_rescue_native_prompt\n"), 1)
+        self.assertNotIn("Command::new", source)
         self.assertIn("tauri::generate_context!()", source)
         self.assertLess(
             source.index("let status = attest_rescue_sandbox()"),
@@ -865,6 +882,7 @@ class RescueTauriBoundaryTests(unittest.TestCase):
             {
                 "/run/lightdm/kernaid-rescue-ui/xauthority",
                 "-/run/kernaid-tauri-network-probe/baseline-v1",
+                "-/run/kernaid-rescue-native-prompt.sock",
                 "/tmp/.X11-unix/X0",
             }
             <= unit_values["BindReadOnlyPaths"]
@@ -888,6 +906,7 @@ class RescueTauriBoundaryTests(unittest.TestCase):
         self.assertIn("libwebkit2gtk-4.1-0", packages)
         self.assertIn("xdotool", packages)
         self.assertIn("matchbox-window-manager", packages)
+        self.assertIn("kbd", packages)
         self.assertNotIn("xfwm4", packages)
         self.assertIn("xserver-xorg", packages)
         self.assertNotIn("xorg", packages)
@@ -895,6 +914,9 @@ class RescueTauriBoundaryTests(unittest.TestCase):
         self.assertNotIn("xfce4-terminal", packages)
         self.assertNotIn("dbus-user-session", packages)
         self.assertNotIn("chromium", packages)
+        self.assertIn(
+            "systemctl enable kernaid-rescue-native-prompt.socket", safety_hook
+        )
 
         baseline_service = (
             REPO_DIR
@@ -1281,6 +1303,172 @@ class TauriShippingAbiTests(unittest.TestCase):
         )
         with self.assertRaises(binary_verifier.VerificationError):
             binary_verifier.parse_readelf_output(unexpected, "tauri-webkit")
+
+
+    def test_native_prompt_wire_is_closed_and_duplicate_safe(self) -> None:
+        request_id = "N-01234567-89ab-cdef-0123-456789abcdef"
+        request = native_prompt._strict_request(
+            json.dumps(
+                {
+                    "apiVersion": native_prompt.API_VERSION,
+                    "requestId": request_id,
+                    "operation": "prompt.open-or-focus",
+                    "kind": "vault-unlock",
+                },
+                separators=(",", ":"),
+            ).encode("ascii")
+        )
+        self.assertEqual(request["requestId"], request_id)
+        response = json.loads(native_prompt._response(request_id, "opened"))
+        self.assertEqual(
+            response,
+            {
+                "apiVersion": native_prompt.API_VERSION,
+                "requestId": request_id,
+                "outcome": "opened",
+            },
+        )
+        self.assertEqual(
+            json.loads(native_prompt._status_response("idle")),
+            {
+                "apiVersion": native_prompt.API_VERSION,
+                "kind": "vault-unlock",
+                "availability": "available",
+                "promptState": "idle",
+            },
+        )
+        with self.assertRaises(native_prompt.BrokerFailure):
+            native_prompt._status_response("unlocking")
+        for invalid in (
+            b'{"apiVersion":"kernaid.dev/rescue-native-prompt/v1alpha1",'
+            b'"requestId":"N-01234567-89ab-cdef-0123-456789abcdef",'
+            b'"operation":"prompt.open-or-focus","kind":"vault-unlock",'
+            b'"path":"/dev/sda"}',
+            b'{"apiVersion":"kernaid.dev/rescue-native-prompt/v1alpha1",'
+            b'"requestId":"N-01234567-89ab-cdef-0123-456789abcdef",'
+            b'"requestId":"N-01234567-89ab-cdef-0123-456789abcdef",'
+            b'"operation":"prompt.open-or-focus","kind":"vault-unlock"}',
+            b'{"apiVersion":"kernaid.dev/rescue-native-prompt/v1alpha1",'
+            b'"requestId":"N-01234567-89ab-cdef-0123-456789abcdef",'
+            b'"operation":"shell","kind":"vault-unlock"}',
+        ):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(native_prompt.BrokerFailure):
+                    native_prompt._strict_request(invalid)
+
+    def test_native_prompt_gate_and_vt_grammar_are_exact(self) -> None:
+        self.assertFalse(guest_ui._native_prompt_enabled(b"boot=live quiet\n"))
+        self.assertTrue(
+            guest_ui._native_prompt_enabled(
+                b"boot=live kernaid.native-prompt=vt-v1 quiet\n"
+            )
+        )
+        for invalid in (
+            b"boot=live kernaid.native-prompt=vt-v2\n",
+            b"boot=live kernaid.native-prompt=vt-v1 kernaid.native-prompt=vt-v1\n",
+        ):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(guest_ui.SandboxFailure):
+                    guest_ui._native_prompt_enabled(invalid)
+                with self.assertRaises(native_prompt.BrokerFailure):
+                    native_prompt._native_prompt_gate(invalid)
+        native_prompt._native_prompt_gate(
+            b"boot=live kernaid.native-prompt=vt-v1 quiet\n"
+        )
+        with self.assertRaises(native_prompt.BrokerFailure):
+            native_prompt._native_prompt_gate(
+                b"kernaid.native-prompt=vt-v1 quiet\n"
+            )
+        self.assertEqual(native_prompt._active_vt(b"tty7\n"), 7)
+        for invalid in (b"tty0\n", b"tty64\n", b"tty7 extra\n"):
+            with self.assertRaises(native_prompt.BrokerFailure):
+                native_prompt._active_vt(invalid)
+
+    def test_native_prompt_empty_authenticated_frame_is_status_only(self) -> None:
+        controller = mock.Mock()
+        controller.status.return_value = "idle"
+        broker = native_prompt.Broker(controller)
+        connection = mock.Mock()
+        with (
+            mock.patch.object(native_prompt, "_peer_identity", return_value=91),
+            mock.patch.object(native_prompt, "_receive", return_value=b""),
+            mock.patch.object(native_prompt.os, "close") as close,
+        ):
+            broker.handle(connection)
+        controller.open_or_focus.assert_not_called()
+        connection.sendall.assert_called_once_with(
+            native_prompt._status_response("idle")
+        )
+        close.assert_called_once_with(91)
+
+    def test_native_prompt_controller_opens_then_focuses_only_tty8(self) -> None:
+        controller = native_prompt.PromptController()
+        monitor = mock.Mock()
+        with (
+            mock.patch.object(native_prompt, "_prompt_backend_ready"),
+            mock.patch.object(native_prompt, "_active_vt", return_value=7),
+            mock.patch.object(native_prompt, "_write_return_vt") as write_state,
+            mock.patch.object(native_prompt, "_tool", return_value=(0, b"")) as tool,
+            mock.patch.object(
+                native_prompt, "_unit_state", return_value=("active", "running", "success")
+            ),
+            mock.patch.object(native_prompt, "_switch_vt") as switch,
+            mock.patch.object(native_prompt.threading, "Thread", return_value=monitor),
+        ):
+            self.assertEqual(controller.status(), "idle")
+            self.assertEqual(controller.open_or_focus(), "opened")
+            self.assertEqual(controller.status(), "active")
+            self.assertEqual(controller.open_or_focus(), "focused")
+        write_state.assert_called_once_with(7)
+        tool.assert_called_once_with(
+            (
+                "/usr/bin/systemctl",
+                "start",
+                "--no-block",
+                native_prompt.PROMPT_UNIT,
+            )
+        )
+        self.assertEqual(switch.call_args_list, [mock.call(8), mock.call(8)])
+        monitor.start.assert_called_once_with()
+
+    def test_native_prompt_units_keep_secrets_on_the_fixed_uid1000_tty(self) -> None:
+        units = REPO_DIR / "rescue/live-build/config/includes.chroot/etc/systemd/system"
+        broker = (units / "kernaid-rescue-native-prompt.service").read_text()
+        control = (units / "kernaid-rescue-native-prompt.socket").read_text()
+        prompt = (units / "kernaid-rescue-native-vault-unlock.service").read_text()
+        adapter = (
+            REPO_DIR
+            / "rescue/live-build/config/includes.chroot/usr/lib/kernaid"
+            / "rescue-native-vault-unlock"
+        ).read_text()
+        for unit in (broker, control, prompt):
+            self.assertIn("ConditionKernelCommandLine=kernaid.native-prompt=vt-v1", unit)
+        self.assertIn("User=root", broker)
+        self.assertIn("StandardOutput=null", broker)
+        self.assertIn("CapabilityBoundingSet=CAP_SYS_TTY_CONFIG", broker)
+        self.assertNotIn("CAP_SYS_PTRACE", broker)
+        self.assertIn("SocketMode=0660", control)
+        self.assertIn("SocketGroup=kernaid-rescue-ui", control)
+        self.assertIn("User=kernaid", prompt)
+        self.assertIn("SupplementaryGroups=kernaid-vault", prompt)
+        self.assertIn("TTYPath=/dev/tty8", prompt)
+        self.assertIn("StandardInput=tty-force", prompt)
+        self.assertIn("RuntimeMaxSec=620s", prompt)
+        self.assertIn("ProcSubset=all", prompt)
+        self.assertNotIn("RestrictSUIDSGID=yes", prompt)
+        self.assertIn("CapabilityBoundingSet=\n", prompt)
+        self.assertIn("exec /usr/bin/kernaid-rescue-vaultctl unlock", adapter)
+        self.assertIn("kernaid.native-prompt=vt-v1", adapter)
+        self.assertNotIn("$1", adapter)
+        self.assertNotIn("eval", adapter)
+        broker_source = (
+            REPO_DIR
+            / "rescue/live-build/config/includes.chroot/usr/lib/kernaid"
+            / "rescue_native_prompt_broker.py"
+        ).read_text()
+        self.assertIn("SO_PEERPIDFD = 77", broker_source)
+        self.assertIn("getsockopt(socket.SOL_SOCKET, SO_PEERPIDFD)", broker_source)
+        self.assertNotIn("pidfd_open", broker_source)
 
 
 if __name__ == "__main__":

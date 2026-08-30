@@ -57,6 +57,9 @@ SANDBOX_STATUS_NORMAL = (
     "http=loopback x11=connected privileged-fs-sockets=absent "
     "nonloopback=systemd-policy"
 )
+NATIVE_PROMPT_FLAG = "kernaid.native-prompt=vt-v1"
+NATIVE_PROMPT_SOCKET = "/run/kernaid-rescue-native-prompt.sock"
+NATIVE_PROMPT_SOCKET_UNIT = "kernaid-rescue-native-prompt.socket"
 SANDBOX_FAILURE_PREFIX = "KERNAID_RESCUE_TAURI_SANDBOX_FAILURE_V1 stage="
 SHELL_FAILURE_STAGES = {
     "http",
@@ -68,6 +71,7 @@ SHELL_FAILURE_STAGES = {
     "socket-openai-executor",
     "socket-openai-egress",
     "socket-codex",
+    "socket-native-prompt",
     "system-bus",
     "probe-mode",
     "baseline",
@@ -772,6 +776,22 @@ def _qemu_probe_mode(path: str = QEMU_PROBE_MARKER_PATH) -> bool:
     return True
 
 
+def _native_prompt_enabled(payload: bytes | None = None) -> bool:
+    encoded = _bounded_file("/proc/cmdline") if payload is None else payload
+    try:
+        tokens = encoded.rstrip(b"\n").decode("ascii").split()
+    except UnicodeDecodeError as error:
+        raise SandboxFailure("socket-native-prompt") from error
+    prompt_tokens = [
+        token for token in tokens if token.startswith("kernaid.native-prompt=")
+    ]
+    if not prompt_tokens:
+        return False
+    if prompt_tokens != [NATIVE_PROMPT_FLAG]:
+        raise SandboxFailure("socket-native-prompt")
+    return True
+
+
 def _qemu_endpoint_post_ready() -> bool:
     try:
         connection = socket.create_connection((QEMU_PROBE_ADDRESS, QEMU_PROBE_PORT), 2)
@@ -849,6 +869,36 @@ def _host_privileged_sockets_ready() -> None:
             or stat.S_IMODE(metadata.st_mode) != mode
         ):
             raise SandboxFailure(failure_stage)
+
+
+def _host_native_prompt_ready(enabled: bool) -> None:
+    try:
+        metadata = os.lstat(NATIVE_PROMPT_SOCKET)
+    except FileNotFoundError:
+        if enabled:
+            raise SandboxFailure("socket-native-prompt")
+        return
+    except OSError as error:
+        raise SandboxFailure("socket-native-prompt") from error
+    if not enabled:
+        raise SandboxFailure("socket-native-prompt")
+    values = _systemctl_show(
+        NATIVE_PROMPT_SOCKET_UNIT, ("ActiveState", "SubState", "Result")
+    )
+    try:
+        prompt_gid = grp.getgrnam(UI_ACCOUNT).gr_gid
+    except KeyError as error:
+        raise SandboxFailure("socket-native-prompt") from error
+    if (
+        values
+        != {"ActiveState": "active", "SubState": "listening", "Result": "success"}
+        or not stat.S_ISSOCK(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_gid != prompt_gid
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) != 0o660
+    ):
+        raise SandboxFailure("socket-native-prompt")
 
 
 def _shell_service_ready(_qemu_probe: bool) -> int:
@@ -1236,9 +1286,14 @@ def _proc_aliases_absent(
         return False
 
 
-def _private_run_ready(shell_pid: int, ui: pwd.struct_passwd, qemu_probe: bool) -> bool:
+def _private_run_ready(
+    shell_pid: int,
+    ui: pwd.struct_passwd,
+    qemu_probe: bool,
+    native_prompt: bool = False,
+) -> bool:
     root = f"/proc/{shell_pid}/root"
-    required_socket_paths: set[str] = set()
+    required_socket_paths = {NATIVE_PROMPT_SOCKET} if native_prompt else set()
     observed_sockets: set[str] = set()
     entries_seen = 0
     try:
@@ -1255,6 +1310,16 @@ def _private_run_ready(shell_pid: int, ui: pwd.struct_passwd, qemu_probe: bool) 
                     observed_sockets.add(candidate.removeprefix(root))
         if observed_sockets != required_socket_paths:
             return False
+        if native_prompt:
+            prompt = os.lstat(f"{root}{NATIVE_PROMPT_SOCKET}")
+            if (
+                not stat.S_ISSOCK(prompt.st_mode)
+                or prompt.st_uid != 0
+                or prompt.st_gid != ui.pw_gid
+                or prompt.st_nlink != 1
+                or stat.S_IMODE(prompt.st_mode) != 0o660
+            ):
+                return False
         forbidden = (
             "/run/user/{uid}",
             "/run/user/{uid}/bus",
@@ -1368,7 +1433,7 @@ def _private_devices_ready(shell_pid: int, ui: pwd.struct_passwd) -> bool:
         return False
 
 
-def attest() -> tuple[int, int, bool]:
+def attest() -> tuple[int, int, bool, bool]:
     shell_metadata = os.lstat(SHELL_PATH)
     if (
         not stat.S_ISREG(shell_metadata.st_mode)
@@ -1386,6 +1451,7 @@ def attest() -> tuple[int, int, bool]:
     if not polkit_ready:
         raise SandboxFailure("system-bus")
     qemu_probe = _qemu_probe_mode()
+    native_prompt = _native_prompt_enabled()
     last_stage = "service"
     unstable_process_snapshots = 0
     unstable_device_snapshots = 0
@@ -1397,6 +1463,7 @@ def attest() -> tuple[int, int, bool]:
             time.sleep(0.5)
             continue
         _host_privileged_sockets_ready()
+        _host_native_prompt_ready(native_prompt)
         try:
             xauthority_payload = _trusted_xauthority(ui)
         except FileNotFoundError:
@@ -1448,7 +1515,7 @@ def attest() -> tuple[int, int, bool]:
             raise SandboxFailure("pidns")
         if not _proc_aliases_absent(shell_pid, aliases, ui):
             raise SandboxFailure("proc-alias")
-        if not _private_run_ready(shell_pid, ui, qemu_probe):
+        if not _private_run_ready(shell_pid, ui, qemu_probe, native_prompt):
             raise SandboxFailure("run-view")
         if not _private_tmp_ready(shell_pid):
             raise SandboxFailure("run-view")
@@ -1470,13 +1537,13 @@ def attest() -> tuple[int, int, bool]:
             last_stage = "endpoint-post"
             time.sleep(0.5)
             continue
-        return *window, qemu_probe
+        return *window, qemu_probe, native_prompt
     raise SandboxFailure(last_stage)
 
 
 def main() -> int:
     try:
-        width, height, qemu_probe = attest()
+        width, height, qemu_probe, native_prompt = attest()
     except SandboxFailure as error:
         print(f"KERNAID_RESCUE_TAURI_GUEST_FAILURE_V1 stage={error.stage}")
         return 1
@@ -1491,7 +1558,7 @@ def main() -> int:
         "devices=private device-fds=no-privileged "
         "shell=shipping renderer=webkit2gtk-4.1 window=visible "
         "display=active-xorg http=loopback x11=connected "
-        "privileged-fs-sockets=absent "
+        f"privileged-fs-sockets={'native-prompt-vt' if native_prompt else 'absent'} "
         f"nonloopback={'denied' if qemu_probe else 'systemd-policy'} "
         f"width={width} height={height}"
     )

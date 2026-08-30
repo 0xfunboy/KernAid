@@ -1,0 +1,25 @@
+[Unit]
+Description=KernAid Rescue closed native-prompt control socket
+Requires=systemd-sysusers.service
+After=systemd-sysusers.service
+Before=kernaid-rescue-desk-shell.service
+ConditionKernelCommandLine=boot=live
+ConditionKernelCommandLine=kernaid.native-prompt=vt-v1
+
+[Socket]
+ListenStream=/run/kernaid-rescue-native-prompt.sock
+FileDescriptorName=native-prompt
+SocketMode=0660
+SocketUser=root
+SocketGroup=kernaid-rescue-ui
+Backlog=8
+Accept=no
+Service=kernaid-rescue-native-prompt.service
+RemoveOnStop=yes
+PassCredentials=no
+PassSecurity=no
+PassPacketInfo=no
+Timestamping=off
+
+[Install]
+WantedBy=sockets.target

@@ -2,17 +2,19 @@
 
 use nix::{
     libc,
+    sys::socket::{SockType, getsockopt, sockopt},
     unistd::{Group, User, getegid, geteuid, getgid, getgroups, getuid},
 };
+use serde::{Deserialize, Serialize};
 use std::{
     env,
     ffi::OsStr,
     fs::{self, OpenOptions},
     io::{self, Read, Write},
-    net::{SocketAddr, TcpStream},
+    net::{Shutdown, SocketAddr, TcpStream},
     os::unix::{
         ffi::OsStrExt,
-        fs::{MetadataExt, OpenOptionsExt},
+        fs::{FileTypeExt, MetadataExt, OpenOptionsExt},
         net::UnixStream,
     },
     path::Path,
@@ -42,11 +44,17 @@ const FAKE_SESSION_BUS: &str = "unix:path=/run/kernaid-rescue-desk-shell/no-sess
 const FAKE_SYSTEM_BUS: &str = "unix:path=/run/kernaid-rescue-desk-shell/no-system-bus";
 const SANDBOX_STATUS_QEMU: &str = "KERNAID_RESCUE_TAURI_SANDBOX_V1 identity=isolated pidns=private shell-bus=mount-masked session-bus=env-disabled-polkit-denied http=loopback x11=connected privileged-fs-sockets=absent nonloopback=denied";
 const SANDBOX_STATUS_NORMAL: &str = "KERNAID_RESCUE_TAURI_SANDBOX_V1 identity=isolated pidns=private shell-bus=mount-masked session-bus=env-disabled-polkit-denied http=loopback x11=connected privileged-fs-sockets=absent nonloopback=systemd-policy";
+const SANDBOX_STATUS_QEMU_NATIVE_PROMPT: &str = "KERNAID_RESCUE_TAURI_SANDBOX_V1 identity=isolated pidns=private shell-bus=mount-masked session-bus=env-disabled-polkit-denied http=loopback x11=connected privileged-fs-sockets=native-prompt-vt nonloopback=denied";
+const SANDBOX_STATUS_NORMAL_NATIVE_PROMPT: &str = "KERNAID_RESCUE_TAURI_SANDBOX_V1 identity=isolated pidns=private shell-bus=mount-masked session-bus=env-disabled-polkit-denied http=loopback x11=connected privileged-fs-sockets=native-prompt-vt nonloopback=systemd-policy";
 const WINDOW_STARTUP_STATUS: &str = "KERNAID_RESCUE_TAURI_STARTUP_V1 stage=window";
 const QEMU_BASELINE_MARKER_PATH: &str = "/run/kernaid-tauri-network-probe/baseline-v1";
 const QEMU_BASELINE_MARKER: &[u8] = b"KERNAID_RESCUE_TAURI_NETWORK_BASELINE_V1 connected=true\n";
 const QEMU_NON_LOOPBACK_ADDRESS: [u8; 4] = [192, 0, 2, 1];
 const QEMU_NON_LOOPBACK_PORT: u16 = 41_917;
+const NATIVE_PROMPT_API_VERSION: &str = "kernaid.dev/rescue-native-prompt/v1alpha1";
+const NATIVE_PROMPT_SOCKET_PATH: &str = "/run/kernaid-rescue-native-prompt.sock";
+const NATIVE_PROMPT_MAX_FRAME_BYTES: usize = 512;
+const NATIVE_PROMPT_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SandboxProbeFailure {
@@ -58,6 +66,7 @@ enum SandboxProbeFailure {
     OpenAiExecutor,
     OpenAiEgress,
     Codex,
+    NativePrompt,
     ProbeMode,
     Baseline,
     NonLoopback,
@@ -85,6 +94,9 @@ impl SandboxProbeFailure {
                 "KERNAID_RESCUE_TAURI_SANDBOX_FAILURE_V1 stage=socket-openai-egress"
             }
             Self::Codex => "KERNAID_RESCUE_TAURI_SANDBOX_FAILURE_V1 stage=socket-codex",
+            Self::NativePrompt => {
+                "KERNAID_RESCUE_TAURI_SANDBOX_FAILURE_V1 stage=socket-native-prompt"
+            }
             Self::ProbeMode => "KERNAID_RESCUE_TAURI_SANDBOX_FAILURE_V1 stage=probe-mode",
             Self::Baseline => "KERNAID_RESCUE_TAURI_SANDBOX_FAILURE_V1 stage=baseline",
             Self::NonLoopback => "KERNAID_RESCUE_TAURI_SANDBOX_FAILURE_V1 stage=nonloopback",
@@ -117,6 +129,246 @@ const PRIVILEGED_SOCKETS: [(&str, SandboxProbeFailure); 6] = [
         SandboxProbeFailure::SystemBus,
     ),
 ];
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum NativePromptKind {
+    VaultUnlock,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+enum NativePromptOperation {
+    #[serde(rename = "prompt.open-or-focus")]
+    OpenOrFocus,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NativePromptRequest {
+    api_version: String,
+    request_id: String,
+    operation: NativePromptOperation,
+    kind: NativePromptKind,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum NativePromptOutcome {
+    Opened,
+    Focused,
+    Busy,
+    Unavailable,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum NativePromptAvailability {
+    Available,
+    Unavailable,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum NativePromptState {
+    Idle,
+    Active,
+    Unavailable,
+    Failed,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NativePromptResponse {
+    api_version: String,
+    request_id: String,
+    outcome: NativePromptOutcome,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NativePromptStatus {
+    api_version: String,
+    kind: NativePromptKind,
+    availability: NativePromptAvailability,
+    prompt_state: NativePromptState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativePromptTransportError {
+    Unavailable,
+    Failed,
+}
+
+fn valid_native_prompt_request_id(value: &str) -> bool {
+    if value.len() != 38 || !value.starts_with("N-") {
+        return false;
+    }
+    value.as_bytes().iter().enumerate().all(|(index, byte)| {
+        if matches!(index, 10 | 15 | 20 | 25) {
+            *byte == b'-'
+        } else if index < 2 {
+            true
+        } else {
+            byte.is_ascii_digit() || (b'a'..=b'f').contains(byte)
+        }
+    })
+}
+
+fn native_prompt_socket_metadata() -> Result<(), NativePromptTransportError> {
+    let metadata = fs::symlink_metadata(NATIVE_PROMPT_SOCKET_PATH).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            NativePromptTransportError::Unavailable
+        } else {
+            NativePromptTransportError::Failed
+        }
+    })?;
+    if !metadata.file_type().is_socket()
+        || metadata.uid() != 0
+        || metadata.gid() != getgid().as_raw()
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o7777 != 0o660
+    {
+        return Err(NativePromptTransportError::Failed);
+    }
+    Ok(())
+}
+
+fn connect_native_prompt() -> Result<UnixStream, NativePromptTransportError> {
+    native_prompt_socket_metadata()?;
+    let stream = UnixStream::connect(NATIVE_PROMPT_SOCKET_PATH).map_err(|error| {
+        if matches!(
+            error.kind(),
+            io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+        ) {
+            NativePromptTransportError::Unavailable
+        } else {
+            NativePromptTransportError::Failed
+        }
+    })?;
+    stream
+        .set_read_timeout(Some(NATIVE_PROMPT_TIMEOUT))
+        .map_err(|_| NativePromptTransportError::Failed)?;
+    stream
+        .set_write_timeout(Some(NATIVE_PROMPT_TIMEOUT))
+        .map_err(|_| NativePromptTransportError::Failed)?;
+    let socket_type =
+        getsockopt(&stream, sockopt::SockType).map_err(|_| NativePromptTransportError::Failed)?;
+    let peer = getsockopt(&stream, sockopt::PeerCredentials)
+        .map_err(|_| NativePromptTransportError::Failed)?;
+    if socket_type != SockType::Stream || peer.pid() <= 0 || peer.uid() != 0 || peer.gid() != 0 {
+        return Err(NativePromptTransportError::Failed);
+    }
+    Ok(stream)
+}
+
+fn read_native_prompt_frame(
+    stream: &mut UnixStream,
+) -> Result<Vec<u8>, NativePromptTransportError> {
+    let mut response = Vec::with_capacity(192);
+    stream
+        .take(NATIVE_PROMPT_MAX_FRAME_BYTES as u64 + 1)
+        .read_to_end(&mut response)
+        .map_err(|_| NativePromptTransportError::Failed)?;
+    if response.is_empty() || response.len() > NATIVE_PROMPT_MAX_FRAME_BYTES {
+        return Err(NativePromptTransportError::Failed);
+    }
+    Ok(response)
+}
+
+fn relay_native_prompt(
+    request: &NativePromptRequest,
+) -> Result<NativePromptResponse, NativePromptTransportError> {
+    let mut stream = connect_native_prompt()?;
+    let encoded = serde_json::to_vec(request).map_err(|_| NativePromptTransportError::Failed)?;
+    if encoded.len() > NATIVE_PROMPT_MAX_FRAME_BYTES {
+        return Err(NativePromptTransportError::Failed);
+    }
+    stream
+        .write_all(&encoded)
+        .map_err(|_| NativePromptTransportError::Failed)?;
+    stream
+        .shutdown(Shutdown::Write)
+        .map_err(|_| NativePromptTransportError::Failed)?;
+    let response = read_native_prompt_frame(&mut stream)?;
+    let response: NativePromptResponse =
+        serde_json::from_slice(&response).map_err(|_| NativePromptTransportError::Failed)?;
+    if response.api_version != NATIVE_PROMPT_API_VERSION
+        || response.request_id != request.request_id
+    {
+        return Err(NativePromptTransportError::Failed);
+    }
+    Ok(response)
+}
+
+fn relay_native_prompt_status() -> Result<NativePromptStatus, NativePromptTransportError> {
+    let mut stream = connect_native_prompt()?;
+    // An authenticated empty frame is the broker's fixed, read-only status
+    // query. No WebView value or operation crosses this connection.
+    stream
+        .shutdown(Shutdown::Write)
+        .map_err(|_| NativePromptTransportError::Failed)?;
+    let response = read_native_prompt_frame(&mut stream)?;
+    let response: NativePromptStatus =
+        serde_json::from_slice(&response).map_err(|_| NativePromptTransportError::Failed)?;
+    if response.api_version != NATIVE_PROMPT_API_VERSION
+        || response.kind != NativePromptKind::VaultUnlock
+        || response.availability != NativePromptAvailability::Available
+        || !matches!(
+            response.prompt_state,
+            NativePromptState::Idle | NativePromptState::Active
+        )
+    {
+        return Err(NativePromptTransportError::Failed);
+    }
+    Ok(response)
+}
+
+#[tauri::command]
+fn rescue_native_prompt_status() -> NativePromptStatus {
+    match relay_native_prompt_status() {
+        Ok(status) => status,
+        Err(NativePromptTransportError::Unavailable) => NativePromptStatus {
+            api_version: NATIVE_PROMPT_API_VERSION.to_owned(),
+            kind: NativePromptKind::VaultUnlock,
+            availability: NativePromptAvailability::Unavailable,
+            prompt_state: NativePromptState::Unavailable,
+        },
+        Err(NativePromptTransportError::Failed) => NativePromptStatus {
+            api_version: NATIVE_PROMPT_API_VERSION.to_owned(),
+            kind: NativePromptKind::VaultUnlock,
+            availability: NativePromptAvailability::Failed,
+            prompt_state: NativePromptState::Failed,
+        },
+    }
+}
+
+#[tauri::command]
+fn open_rescue_native_prompt(
+    request: NativePromptRequest,
+) -> Result<NativePromptResponse, &'static str> {
+    if request.api_version != NATIVE_PROMPT_API_VERSION
+        || request.operation != NativePromptOperation::OpenOrFocus
+        || request.kind != NativePromptKind::VaultUnlock
+        || !valid_native_prompt_request_id(&request.request_id)
+    {
+        return Err("invalid-request");
+    }
+    match relay_native_prompt(&request) {
+        Ok(response) => Ok(response),
+        Err(NativePromptTransportError::Unavailable) => Ok(NativePromptResponse {
+            api_version: NATIVE_PROMPT_API_VERSION.to_owned(),
+            request_id: request.request_id,
+            outcome: NativePromptOutcome::Unavailable,
+        }),
+        Err(NativePromptTransportError::Failed) => Ok(NativePromptResponse {
+            api_version: NATIVE_PROMPT_API_VERSION.to_owned(),
+            request_id: request.request_id,
+            outcome: NativePromptOutcome::Failed,
+        }),
+    }
+}
 
 fn allowed_rescue_navigation(url: &Url) -> bool {
     url.scheme() == "http"
@@ -229,6 +481,42 @@ fn privileged_sockets_absent() -> Result<(), SandboxProbeFailure> {
         }
     }
     Ok(())
+}
+
+fn native_prompt_socket_present() -> Result<bool, SandboxProbeFailure> {
+    let mut identity: Option<(u64, u64)> = None;
+    let mut observed_presence: Option<bool> = None;
+    for root_alias in ["", "/proc/1/root", "/proc/self/root"] {
+        let candidate = format!("{root_alias}{NATIVE_PROMPT_SOCKET_PATH}");
+        match fs::symlink_metadata(candidate) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if observed_presence == Some(true) {
+                    return Err(SandboxProbeFailure::NativePrompt);
+                }
+                observed_presence = Some(false);
+            }
+            Err(_) => return Err(SandboxProbeFailure::NativePrompt),
+            Ok(metadata) => {
+                if !metadata.file_type().is_socket()
+                    || metadata.uid() != 0
+                    || metadata.gid() != getgid().as_raw()
+                    || metadata.nlink() != 1
+                    || metadata.mode() & 0o7777 != 0o660
+                {
+                    return Err(SandboxProbeFailure::NativePrompt);
+                }
+                let observed = (metadata.dev(), metadata.ino());
+                if observed_presence == Some(false)
+                    || identity.is_some_and(|expected| expected != observed)
+                {
+                    return Err(SandboxProbeFailure::NativePrompt);
+                }
+                identity = Some(observed);
+                observed_presence = Some(true);
+            }
+        }
+    }
+    Ok(observed_presence == Some(true))
 }
 
 fn denied_non_loopback_error(kind: io::ErrorKind) -> bool {
@@ -414,6 +702,7 @@ fn attest_rescue_sandbox() -> Result<&'static str, SandboxProbeFailure> {
     }
     wait_for_rescue_channels()?;
     privileged_sockets_absent()?;
+    let native_prompt = native_prompt_socket_present()?;
     let qemu_probe = qemu_probe_mode()?;
     if qemu_probe {
         if !qemu_baseline_ready() {
@@ -423,10 +712,11 @@ fn attest_rescue_sandbox() -> Result<&'static str, SandboxProbeFailure> {
             return Err(SandboxProbeFailure::NonLoopback);
         }
     }
-    Ok(if qemu_probe {
-        SANDBOX_STATUS_QEMU
-    } else {
-        SANDBOX_STATUS_NORMAL
+    Ok(match (qemu_probe, native_prompt) {
+        (true, false) => SANDBOX_STATUS_QEMU,
+        (false, false) => SANDBOX_STATUS_NORMAL,
+        (true, true) => SANDBOX_STATUS_QEMU_NATIVE_PROMPT,
+        (false, true) => SANDBOX_STATUS_NORMAL_NATIVE_PROMPT,
     })
 }
 
@@ -452,6 +742,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let window_created = Arc::new(AtomicBool::new(false));
     let setup_window_created = Arc::clone(&window_created);
     let app = tauri::Builder::default()
+        .invoke_handler(tauri::generate_handler![
+            rescue_native_prompt_status,
+            open_rescue_native_prompt
+        ])
         .setup(move |app| {
             WebviewWindowBuilder::new(app, "main", WebviewUrl::External(rescue_url))
                 .title("KernAid Rescue")
@@ -473,9 +767,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             setup_window_created.store(true, Ordering::Release);
             Ok(())
         })
-        // This binary intentionally registers no invoke handler.  Together
-        // with the no-permission capability above, the remote loopback origin
-        // cannot dispatch Resident or plugin commands.
+        // The exact loopback origin receives only the closed native-prompt
+        // command above. It cannot dispatch Resident, shell or plugin commands.
         .build(tauri::generate_context!())?;
     app.run(move |_, event| {
         if let RunEvent::ExitRequested { api, .. } = event {
@@ -577,6 +870,7 @@ X-Content-Type-Options: nosniff\r\n\
             SandboxProbeFailure::OpenAiExecutor,
             SandboxProbeFailure::OpenAiEgress,
             SandboxProbeFailure::Codex,
+            SandboxProbeFailure::NativePrompt,
             SandboxProbeFailure::ProbeMode,
             SandboxProbeFailure::Baseline,
             SandboxProbeFailure::NonLoopback,
@@ -595,5 +889,58 @@ X-Content-Type-Options: nosniff\r\n\
                     .any(|byte| matches!(byte, b'/' | b'\n' | b'\r' | 0))
             );
         }
+    }
+
+    #[test]
+    fn native_prompt_request_id_is_exact_and_lowercase() {
+        assert!(valid_native_prompt_request_id(
+            "N-01234567-89ab-cdef-0123-456789abcdef"
+        ));
+        for denied in [
+            "01234567-89ab-cdef-0123-456789abcdef",
+            "N-01234567-89AB-cdef-0123-456789abcdef",
+            "N-01234567-89ab-cdef-0123-456789abcdeg",
+            "N-01234567-89ab-cdef-0123-456789abcdef0",
+        ] {
+            assert!(!valid_native_prompt_request_id(denied));
+        }
+    }
+
+    #[test]
+    fn native_prompt_wire_grammar_has_no_free_form_field() {
+        let request = NativePromptRequest {
+            api_version: NATIVE_PROMPT_API_VERSION.to_owned(),
+            request_id: "N-01234567-89ab-cdef-0123-456789abcdef".to_owned(),
+            operation: NativePromptOperation::OpenOrFocus,
+            kind: NativePromptKind::VaultUnlock,
+        };
+        assert_eq!(
+            serde_json::to_string(&request).expect("serialize fixed request"),
+            concat!(
+                "{\"apiVersion\":\"kernaid.dev/rescue-native-prompt/v1alpha1\",",
+                "\"requestId\":\"N-01234567-89ab-cdef-0123-456789abcdef\",",
+                "\"operation\":\"prompt.open-or-focus\",\"kind\":\"vault-unlock\"}"
+            )
+        );
+        assert!(
+            serde_json::from_str::<NativePromptRequest>(
+                r#"{"apiVersion":"kernaid.dev/rescue-native-prompt/v1alpha1","requestId":"N-01234567-89ab-cdef-0123-456789abcdef","operation":"prompt.open-or-focus","kind":"vault-unlock","path":"/dev/sda"}"#
+            )
+            .is_err()
+        );
+        let status = NativePromptStatus {
+            api_version: NATIVE_PROMPT_API_VERSION.to_owned(),
+            kind: NativePromptKind::VaultUnlock,
+            availability: NativePromptAvailability::Available,
+            prompt_state: NativePromptState::Idle,
+        };
+        assert_eq!(
+            serde_json::to_string(&status).expect("serialize fixed status"),
+            concat!(
+                "{\"apiVersion\":\"kernaid.dev/rescue-native-prompt/v1alpha1\",",
+                "\"kind\":\"vault-unlock\",\"availability\":\"available\",",
+                "\"promptState\":\"idle\"}"
+            )
+        );
     }
 }

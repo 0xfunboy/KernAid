@@ -13,11 +13,13 @@ import {
   collectLocalInventory,
   fingerprintNativeTarget,
   fingerprintRescueTarget,
+  getRescueNativePromptStatus,
   inspectRescueInstalledTarget,
   linuxNormalizedSnapshotEvidenceSummary,
   linuxNormalizedSnapshotFromRescue,
   nativeObservationContentType,
   nativeObservationSummary,
+  openRescueNativeVaultPrompt,
   parseNativeObservations,
   parseLinuxHardwareInventory,
   parseRescueOfflineCorpus,
@@ -25,6 +27,7 @@ import {
   parseRescueTargetScan,
   parseRescueTargetSelection,
   parseNativeSignedArtifact,
+  parseRescueNativePromptStatus,
   parseResidentOpenAiStatus,
   parseSecureRuntimeStatus,
   scanRescueInstalledTargets,
@@ -42,6 +45,55 @@ import {
   RESCUE_OFFLINE_EVIDENCE_TARGET,
   RescueOfflineInspectionError,
 } from "../src/native.js";
+
+test("Rescue native prompt exposes only closed status and enum-plus-nonce open", async () => {
+  const status = await getRescueNativePromptStatus(async (command, args) => {
+    assert.equal(command, "rescue_native_prompt_status");
+    assert.equal(args, undefined);
+    return {
+      apiVersion: "kernaid.dev/rescue-native-prompt/v1alpha1",
+      kind: "vault-unlock",
+      availability: "available",
+      promptState: "idle",
+    } as never;
+  });
+  assert.equal(status.availability, "available");
+
+  const result = await openRescueNativeVaultPrompt(async (command, args) => {
+    assert.equal(command, "open_rescue_native_prompt");
+    assert.deepEqual(Object.keys(args ?? {}), ["request"]);
+    const request = (args as { request: Record<string, unknown> }).request;
+    assert.deepEqual(Object.keys(request), [
+      "apiVersion",
+      "requestId",
+      "operation",
+      "kind",
+    ]);
+    assert.equal(request.operation, "prompt.open-or-focus");
+    assert.equal(request.kind, "vault-unlock");
+    return {
+      apiVersion: request.apiVersion,
+      requestId: request.requestId,
+      outcome: "opened",
+    } as never;
+  });
+  assert.equal(result.outcome, "opened");
+  assert.match(result.requestId, /^N-[0-9a-f-]{36}$/u);
+
+  for (const invalid of [
+    {
+      ...status,
+      availability: "available",
+      promptState: "failed",
+    },
+    { ...status, path: "/dev/sda" },
+    { ...status, kind: "shell" },
+  ])
+    assert.throws(
+      () => parseRescueNativePromptStatus(invalid),
+      /Stato prompt nativo Rescue non valido|Risposta nativa non valida/u,
+    );
+});
 
 test("native inventory requires explicit bounded truncation state", () => {
   const valid = {

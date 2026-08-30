@@ -2445,6 +2445,8 @@ name = "kernaid-rescue-desk-shell"
 version = "0.1.0"
 dependencies = [
  "nix",
+ "serde",
+ "serde_json",
  "tauri",
  "tauri-build",
 ]

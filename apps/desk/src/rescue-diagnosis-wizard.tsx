@@ -1,12 +1,15 @@
-import React from "react";
+import React, { useEffect, useRef, useState } from "react";
 import type { ArtifactRef } from "@kernaid/session-driver";
 import type { DiagnosisProposal, Evidence } from "@kernaid/schemas";
-import type {
-  RescueOfflineInspection,
-  RescueOfflineInspectionError,
-  RescueTargetCandidate,
-  RescueTargetScan,
-  RescueTargetSelection,
+import {
+  getRescueNativePromptStatus,
+  openRescueNativeVaultPrompt,
+  type RescueOfflineInspection,
+  type RescueOfflineInspectionError,
+  type RescueNativePromptStatus,
+  type RescueTargetCandidate,
+  type RescueTargetScan,
+  type RescueTargetSelection,
 } from "./native";
 import type {
   RescueOpenAiContextPreview,
@@ -124,6 +127,11 @@ export function RescueDiagnosisWizard({
   onAcceptOpenAiContext,
   onDiagnose,
 }: RescueDiagnosisWizardProps) {
+  const [nativePromptStatus, setNativePromptStatus] =
+    useState<RescueNativePromptStatus>();
+  const [nativePromptBusy, setNativePromptBusy] = useState(false);
+  const [nativePromptMessage, setNativePromptMessage] = useState<string>();
+  const nativePromptEpoch = useRef(0);
   const reportReady = report !== undefined && sessionId !== undefined;
   const progress = rescueDiagnosisWizardProgress({
     vaultStatusReady,
@@ -143,6 +151,70 @@ export function RescueDiagnosisWizard({
     inspectionError === undefined
       ? undefined
       : rescueInspectionErrorPresentation(inspectionError);
+
+  useEffect(() => {
+    const epoch = nativePromptEpoch.current + 1;
+    nativePromptEpoch.current = epoch;
+    getRescueNativePromptStatus()
+      .then((next) => {
+        if (nativePromptEpoch.current === epoch) setNativePromptStatus(next);
+      })
+      .catch(() => {
+        if (nativePromptEpoch.current === epoch)
+          setNativePromptStatus(undefined);
+    });
+    return () => {
+      nativePromptEpoch.current += 1;
+    };
+  }, []);
+
+  async function openNativeVaultPrompt() {
+    if (nativePromptBusy || nativePromptStatus?.availability !== "available")
+      return;
+    const epoch = nativePromptEpoch.current + 1;
+    nativePromptEpoch.current = epoch;
+    setNativePromptBusy(true);
+    setNativePromptMessage(undefined);
+    try {
+      const result = await openRescueNativeVaultPrompt();
+      if (nativePromptEpoch.current !== epoch) return;
+      if (result.outcome !== "opened" && result.outcome !== "focused") {
+        setNativePromptMessage(
+          result.outcome === "busy"
+            ? "Un altro prompt sicuro è già attivo."
+            : "Prompt sicuro non disponibile.",
+        );
+        const next = await getRescueNativePromptStatus();
+        if (nativePromptEpoch.current === epoch) setNativePromptStatus(next);
+        return;
+      }
+      setNativePromptMessage(
+        "Prompt sicuro aperto sul terminale dedicato. Desk tornerà aggiornato alla chiusura.",
+      );
+      const deadline = Date.now() + 620_000;
+      while (nativePromptEpoch.current === epoch && Date.now() < deadline) {
+        await new Promise((resolve) => globalThis.setTimeout(resolve, 500));
+        const next = await getRescueNativePromptStatus();
+        if (nativePromptEpoch.current !== epoch) return;
+        setNativePromptStatus(next);
+        if (next.availability !== "available" || next.promptState === "idle") {
+          globalThis.location.reload();
+          return;
+        }
+      }
+      if (nativePromptEpoch.current === epoch)
+        setNativePromptMessage(
+          "Tempo del prompt terminato. Ricarica Desk per verificare il Vault.",
+        );
+    } catch {
+      if (nativePromptEpoch.current === epoch) {
+        setNativePromptStatus(undefined);
+        setNativePromptMessage("Prompt sicuro non disponibile.");
+      }
+    } finally {
+      if (nativePromptEpoch.current === epoch) setNativePromptBusy(false);
+    }
+  }
 
   return (
     <div className="rescue-wizard" aria-label="Diagnosi guidata Rescue">
@@ -193,6 +265,23 @@ export function RescueDiagnosisWizard({
               </small>
             </div>
             {!persistentAuditReady && <p>{vaultGuidance}</p>}
+            {!persistentAuditReady &&
+              nativePromptStatus?.availability === "available" && (
+                <button
+                  className="rescue-wizard-secondary"
+                  disabled={nativePromptBusy}
+                  onClick={() => void openNativeVaultPrompt()}
+                >
+                  {nativePromptBusy
+                    ? "Prompt sicuro attivo…"
+                    : nativePromptStatus.promptState === "active"
+                      ? "Torna al prompt sicuro"
+                      : "Sblocca il Vault in modalità sicura"}
+                </button>
+              )}
+            {nativePromptMessage && (
+              <small role="status">{nativePromptMessage}</small>
+            )}
             <small>
               Passphrase e credenziali si gestiscono fuori da Desk: questa
               pagina non le richiede, non le riceve e non le memorizza.

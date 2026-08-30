@@ -1,0 +1,64 @@
+[Unit]
+Description=KernAid Rescue trusted VT Vault unlock
+Requires=kernaid-rescue-vaultd.service live-config.service
+After=kernaid-rescue-vaultd.service live-config.service
+Conflicts=getty@tty8.service
+ConditionKernelCommandLine=boot=live
+ConditionKernelCommandLine=kernaid.native-prompt=vt-v1
+
+[Service]
+Type=exec
+ExecStart=/usr/lib/kernaid/rescue-native-vault-unlock
+User=kernaid
+Group=kernaid
+SupplementaryGroups=kernaid-vault
+Environment=TERM=linux
+StandardInput=tty-force
+StandardOutput=tty
+StandardError=tty
+TTYPath=/dev/tty8
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+TimeoutStartSec=620s
+RuntimeMaxSec=620s
+TimeoutStopSec=8s
+KillMode=mixed
+SendSIGKILL=yes
+UMask=0077
+LimitCORE=0
+LimitNOFILE=32
+TasksMax=8
+NoNewPrivileges=yes
+PrivateMounts=yes
+PrivateNetwork=yes
+PrivateTmp=yes
+PrivateIPC=yes
+PrivateDevices=no
+ProtectSystem=strict
+ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=all
+DevicePolicy=closed
+DeviceAllow=/dev/tty rw
+DeviceAllow=/dev/tty8 rw
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+# systemd 257 implements RestrictSUIDSGID by denying every openat2 call.
+# vaultctl uses descriptor-bound openat2 for procfs policy attestation before
+# reading the passphrase; UID 1000, no capabilities and NoNewPrivileges retain
+# the privilege boundary without this incompatible filter.
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+KeyringMode=private
+RemoveIPC=yes

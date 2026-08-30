@@ -13,11 +13,17 @@
       "csp": null,
       "capabilities": [
         {
-          "identifier": "rescue-shell-no-ipc",
-          "description": "The loopback Rescue UI receives no Tauri command permissions.",
+          "identifier": "rescue-shell-native-prompt-only",
+          "description": "The exact loopback Rescue UI may request only the closed, feature-gated native Vault prompt.",
           "local": false,
+          "remote": {
+            "urls": ["http://127.0.0.1:4173/*"]
+          },
           "windows": ["main"],
-          "permissions": []
+          "permissions": [
+            "allow-rescue-native-prompt-status",
+            "allow-open-rescue-native-prompt"
+          ]
         }
       ]
     }

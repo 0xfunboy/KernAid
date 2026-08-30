@@ -1,7 +1,8 @@
 # Rescue trusted prompt and provider-context boundary
 
-Status: design gate. This document records the smallest safe backend contract;
-it does not claim that a trusted graphical prompt is implemented.
+Status: the first VT-backed `vault-unlock` slice is implemented behind the
+off-by-default boot gate `kernaid.native-prompt=vt-v1`. It remains an interim
+TTY flow, not a trusted graphical prompt and not a default product claim.
 
 ## Current boundary
 
@@ -12,8 +13,8 @@ Codex, or report companions:
   has no supplementary groups, uses `PrivateDevices=yes`, receives fake D-Bus
   addresses, and has no privileged AF_UNIX sockets in its mount namespace;
 - shell startup explicitly attests that the Vault, provider, Codex, inspector,
-  and system-bus sockets are absent, and the Tauri builder registers no invoke
-  handler;
+  and system-bus sockets are absent; its only invoke surface is the closed
+  native-prompt availability/open pair described below;
 - `kernaid-rescue-vaultctl` admits exactly UID 1000 and requires a foreground
   controlling `/dev/tty`; `kernaid-codex-auth` is likewise a live-user client;
 - the kiosk intentionally contains no terminal, panel, launcher, or user
@@ -23,6 +24,34 @@ Consequently, adding a Tauri `Command::new`, granting the UI account the Vault
 group, passing a secret through an HTTP/Tauri payload, or spawning the existing
 companion from the shell would weaken an enforced security boundary and still
 would not produce a valid controlling terminal. None is an acceptable bridge.
+
+The experimental VT slice preserves that boundary. The exact loopback origin
+may query one ACL-scoped, input-free closed availability surface and invoke one
+ACL-scoped Tauri command carrying only the version, a bounded nonce,
+`prompt.open-or-focus`, and `vault-unlock`. The isolated shell connects to one
+root-owned control socket that is absent unless the boot gate is set. The
+broker and UID-1000 adapter also reject missing, duplicated or conflicting
+gate tokens. The broker atomically pins the peer with `SO_PEERPIDFD`, then
+re-authenticates the shell's exact UID and systemd MainPID/cgroup from kernel
+credentials and root-owned unit state. It retains only `CAP_SYS_TTY_CONFIG`,
+so it cannot ptrace the companion while the passphrase is in memory. It then
+starts a fixed UID-1000 service with
+`/dev/tty8` as its controlling terminal. That service executes only
+`kernaid-rescue-vaultctl unlock`; the broker records the current graphical VT,
+focuses tty8, and returns to the recorded VT when the companion exits. The
+passphrase never enters the WebView, IPC JSON, broker, argv, environment or
+journal. A 620-second runtime ceiling plus verified, bounded VT-return retries
+prevent a stale prompt from trapping the user on tty8. The UI account receives
+no Vault group or device access.
+
+The shipped default still has no prompt socket: availability is closed
+`unavailable` and the wizard shows no button. With the gate enabled, an
+authenticated empty broker frame returns only `available` plus `idle` or
+`active`; only then does the wizard show the Vault button. Opening sends only
+the enum/nonce request. Desk polls that same closed status while tty8 owns the
+prompt and reloads the authoritative Vault state after the broker returns to
+the graphical VT. This remains a branded TTY journey, not a terminal-free
+product claim.
 
 The non-secret status surfaces already exist and should remain authoritative:
 

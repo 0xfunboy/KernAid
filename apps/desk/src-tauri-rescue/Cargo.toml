@@ -9,6 +9,8 @@ tauri-build = { version = "2.2", features = [] }
 
 [dependencies]
 nix = { version = "0.31.3", features = ["socket", "user"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tauri = { version = "2.5", features = [] }
 
 [lints]

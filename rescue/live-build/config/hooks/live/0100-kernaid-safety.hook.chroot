@@ -39,6 +39,7 @@ chown root:root \
     /usr/lib/kernaid/offline_inspector.py \
     /usr/lib/kernaid/ready-check \
     /usr/lib/kernaid/rescue_application_relay.py \
+    /usr/lib/kernaid/rescue_native_prompt_broker.py \
     "$repair_target_handoff" \
     "$rescue_server" \
     "$rescue_server_renderer" \
@@ -51,6 +52,7 @@ chmod 0644 \
     /usr/lib/kernaid/offline_inspector.py \
     /usr/lib/kernaid/ready-check \
     /usr/lib/kernaid/rescue_application_relay.py \
+    /usr/lib/kernaid/rescue_native_prompt_broker.py \
     "$repair_target_handoff" \
     "$rescue_server" \
     "$rescue_server_renderer" \
@@ -69,6 +71,7 @@ chown root:root \
     /usr/lib/kernaid/kernaid-rescue-vaultd \
     /usr/bin/kernaid-codex-auth \
     /usr/bin/kernaid-rescue-vaultctl
+chown root:root /usr/lib/kernaid/rescue-native-vault-unlock
 chown root:root \
     /usr/lib/kernaid/rescue-ui-session \
     /usr/lib/kernaid/rescue-ui-session-wrapper
@@ -83,6 +86,7 @@ chmod 0755 \
     /usr/lib/kernaid/kernaid-rescue-vaultd \
     /usr/bin/kernaid-codex-auth \
     /usr/bin/kernaid-rescue-vaultctl
+chmod 0755 /usr/lib/kernaid/rescue-native-vault-unlock
 chmod 0755 \
     /usr/lib/kernaid/rescue-ui-session \
     /usr/lib/kernaid/rescue-ui-session-wrapper
@@ -203,6 +207,8 @@ grep -Fq '/api/authorize-observe' "$rescue_server"
 grep -Fq '/api/rescue/provider/openai' "$rescue_server"
 python3 -I -B -c \
     'from pathlib import Path; p=Path("/usr/lib/kernaid/repair_target_handoff.py"); compile(p.read_bytes(), str(p), "exec", dont_inherit=True)'
+python3 -I -B -c \
+    'from pathlib import Path; p=Path("/usr/lib/kernaid/rescue_native_prompt_broker.py"); compile(p.read_bytes(), str(p), "exec", dont_inherit=True)'
 grep -Fq 'target.readonly.acquire' "$repair_target_handoff"
 grep -Fq 'target.recovery.readonly.acquire' "$repair_target_handoff"
 if [ "$repair_candidate_enabled" = "1" ]; then
@@ -247,6 +253,9 @@ chown root:root \
     /etc/systemd/system/kernaid-rescue-desk-shell.service \
     /etc/systemd/system/kernaid-rescue-ui-session-ready.service \
     /etc/systemd/system/kernaid-rescue-firstboot.service \
+    /etc/systemd/system/kernaid-rescue-native-prompt.service \
+    /etc/systemd/system/kernaid-rescue-native-prompt.socket \
+    /etc/systemd/system/kernaid-rescue-native-vault-unlock.service \
     /etc/systemd/system/kernaid-rescue-target-capability.socket \
     /etc/systemd/system/kernaid-rescue-target-capability@.service \
     /etc/systemd/system/kernaid-rescue-vaultd.service \
@@ -287,6 +296,9 @@ chmod 0644 \
     /etc/systemd/system/kernaid-rescue-desk-shell.service \
     /etc/systemd/system/kernaid-rescue-ui-session-ready.service \
     /etc/systemd/system/kernaid-rescue-firstboot.service \
+    /etc/systemd/system/kernaid-rescue-native-prompt.service \
+    /etc/systemd/system/kernaid-rescue-native-prompt.socket \
+    /etc/systemd/system/kernaid-rescue-native-vault-unlock.service \
     /etc/systemd/system/kernaid-rescue-target-capability.socket \
     /etc/systemd/system/kernaid-rescue-target-capability@.service \
     /etc/systemd/system/kernaid-rescue-vaultd.service \
@@ -326,6 +338,7 @@ systemctl enable kernaid-rescue-application.socket
 systemctl enable kernaid-rescue-codex.socket
 systemctl enable kernaid-rescue-codex-mounter.socket
 systemctl enable kernaid-rescue-firstboot.service
+systemctl enable kernaid-rescue-native-prompt.socket
 systemctl enable kernaid-rescue-vaultd.socket
 systemctl enable kernaid-rescue-vaultd.service
 if [ "$repair_candidate_enabled" = "1" ]; then

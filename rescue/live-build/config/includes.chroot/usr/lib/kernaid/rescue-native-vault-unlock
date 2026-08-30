@@ -1,0 +1,30 @@
+#!/bin/sh
+set -eu
+
+test "$#" -eq 0
+test "$(id -u)" = 1000
+test "$(readlink /proc/self/fd/0)" = /dev/tty8
+test "$(readlink /proc/self/fd/1)" = /dev/tty8
+test "$(readlink /proc/self/fd/2)" = /dev/tty8
+
+prompt_gate_count=0
+set -f
+for token in $(/bin/cat /proc/cmdline); do
+    case "$token" in
+        kernaid.native-prompt=vt-v1)
+            prompt_gate_count=$((prompt_gate_count + 1))
+            ;;
+        kernaid.native-prompt|kernaid.native-prompt=*)
+            exit 1
+            ;;
+    esac
+done
+test "$prompt_gate_count" -eq 1
+
+printf '\033c\033[2J\033[H'
+printf 'KernAid Rescue\n'
+printf 'Secure Vault unlock\n\n'
+printf 'Your passphrase stays on this trusted local console.\n'
+printf 'It is never sent to the desktop, logs, arguments, or environment.\n\n'
+
+exec /usr/bin/kernaid-rescue-vaultctl unlock
