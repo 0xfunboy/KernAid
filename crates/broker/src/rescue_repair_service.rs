@@ -543,7 +543,7 @@ pub enum RepairEngineFailure {
     CancelFailed,
     ExecutionFailed(RepairExecutionFailureStage),
     RecoveryUnavailable,
-    RollbackUnavailable,
+    RollbackUnavailable(RepairExecutionFailureStage),
     Internal,
 }
 
@@ -1834,6 +1834,13 @@ impl<Engine: RepairPreparationEngine + RescueFstabRollbackBackend> RescueRepairS
                         self.state.phase =
                             fallback.map_or(InternalState::Idle, InternalState::Terminal);
                     }
+                    Err(RepairEngineFailure::RollbackUnavailable(stage)) => {
+                        if self.execution_failure_diagnostic.is_none() {
+                            self.execution_failure_diagnostic = Some(stage);
+                        }
+                        self.state.phase =
+                            fallback.map_or(InternalState::Idle, InternalState::Terminal);
+                    }
                     Err(_) => {
                         self.state.phase =
                             fallback.map_or(InternalState::Idle, InternalState::Terminal);
@@ -2204,7 +2211,7 @@ fn prepare_failure_stage(error: RepairEngineFailure) -> RepairPrepareFailureStag
         | RepairEngineFailure::CancelFailed
         | RepairEngineFailure::ExecutionFailed(_)
         | RepairEngineFailure::RecoveryUnavailable
-        | RepairEngineFailure::RollbackUnavailable
+        | RepairEngineFailure::RollbackUnavailable(_)
         | RepairEngineFailure::Internal => RepairPrepareFailureStage::AdmissionInternal,
     }
 }
@@ -2898,6 +2905,57 @@ mod tests {
             Some(RepairExecutionFailureStage::Authority)
         );
         assert_eq!(service.take_execution_failure_diagnostic(), None);
+    }
+
+    #[test]
+    fn rollback_prepare_failure_diagnostic_is_one_shot_and_absent_from_wire() {
+        for (stage, hidden) in [
+            (RepairExecutionFailureStage::Authority, "authority"),
+            (RepairExecutionFailureStage::Target, "target"),
+            (RepairExecutionFailureStage::Lock, "lock"),
+            (RepairExecutionFailureStage::Timeout, "timeout"),
+            (RepairExecutionFailureStage::Vault, "vault"),
+            (RepairExecutionFailureStage::Recovery, "recovery"),
+        ] {
+            let (mut service, _) = service();
+            let source =
+                RollbackSourceReceipt::new("B-0123456789abcdef0123456789abcdef", hash('5'))
+                    .expect("source receipt");
+            let source_terminal = RepairTerminalReceipt::new(
+                RepairTerminalOutcome::Committed,
+                Some(source.reservation_id().to_owned()),
+                Some(source.transaction_binding_sha256().to_owned()),
+            )
+            .expect("source terminal");
+            service.state.phase = InternalState::RollbackPreparing {
+                operation_id: 9,
+                command: BrokerOwnedRollbackPrepareCommand {
+                    request_id: "R-20000000-0000-0000-0000-000000000001".to_owned(),
+                    session_id: "S-20000000000000000000000000000001".to_owned(),
+                    rollback_id: "RB-2000000000000000000000000000001".to_owned(),
+                    plan_id: "P-20000000000000000000000000000001".to_owned(),
+                    source,
+                },
+                prepared_id: "Q-20000000000000000000000000000001".to_owned(),
+                source_terminal: Some(source_terminal),
+            };
+            service.apply_worker_result(WorkerResult::RollbackPrepared {
+                operation_id: 9,
+                result: Err(RepairEngineFailure::RollbackUnavailable(stage)),
+            });
+
+            let response = json(&service.handle_frame(
+                format!(
+                    r#"{{"apiVersion":"{ROLLBACK_SERVICE_API_VERSION}","requestId":"R-20000000-0000-0000-0000-000000000002","operation":"repair.fstab.rollback.status"}}"#
+                )
+                .as_bytes(),
+            ));
+            assert_eq!(response["state"], "succeeded");
+            assert!(!response.to_string().contains("executionFailureStage"));
+            assert!(!response.to_string().contains(hidden));
+            assert_eq!(service.take_execution_failure_diagnostic(), Some(stage));
+            assert_eq!(service.take_execution_failure_diagnostic(), None);
+        }
     }
 
     #[test]

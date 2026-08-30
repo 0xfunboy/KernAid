@@ -760,7 +760,7 @@ sys.stdout.write("KERNAID_QEMU_PROVIDER_PROOF_V1 stage=repair-backup-tamper resu
 def rollback_source(before_sha256: str, after_sha256: str) -> bytes:
     """Return a source-fixed one-boot proof of committed repair and rollback."""
 
-    source = r'''import hashlib,http.client,json,secrets,sys,time
+    source = r'''import hashlib,http.client,json,secrets,subprocess,sys,time
 HOST="127.0.0.1:4173"
 ORIGIN="http://127.0.0.1:4173"
 APPLY_API="kernaid.dev/rescue-repair-service/v1alpha1"
@@ -772,7 +772,8 @@ APPLY_CONFIRMATION="DISABILITA VOCE FSTAB"
 ROLLBACK_CONFIRMATION="RIPRISTINA FSTAB ORIGINALE"
 counter=0
 checkpoint="service-ready"
-CHECKPOINTS=("service-ready","service-ready-internal","service-ready-transport","service-ready-http","service-ready-response-invalid","service-ready-non-idle","inventory-ready","target-selection","target-identity","apply-prepare","apply-prepare-terminal","apply-contract","apply-approve","apply-terminal","apply-terminal-contract","rollback-status","rollback-prepare","rollback-prepare-terminal","rollback-contract","rollback-approve","rollback-terminal","rollback-terminal-contract")
+CHECKPOINTS=("service-ready","service-ready-internal","service-ready-transport","service-ready-http","service-ready-response-invalid","service-ready-non-idle","inventory-ready","target-selection","target-identity","apply-prepare","apply-prepare-terminal","apply-contract","apply-approve","apply-terminal","apply-terminal-contract","rollback-status","rollback-prepare","rollback-prepare-terminal","rollback-prepare-error-authority","rollback-prepare-error-target","rollback-prepare-error-lock","rollback-prepare-error-timeout","rollback-prepare-error-vault","rollback-prepare-error-recovery","rollback-prepare-error-unavailable","rollback-contract","rollback-approve","rollback-terminal","rollback-terminal-contract")
+ROLLBACK_FAILURE_STAGES=("authority","target","lock","timeout","vault","recovery")
 STATES=("idle","preparing","prepared","executing","succeeded","restored","cancelled","manual-reconciliation-required","failed")
 def request_id():
     global counter
@@ -844,6 +845,24 @@ def wait(api,operation,states,deadline):
             return value
         time.sleep(.2)
     raise RuntimeError()
+def rollback_prepare_failure_checkpoint():
+    try:
+        result=subprocess.run(["/usr/bin/systemctl","show","--property=StatusText","--value","kernaid-rescue-repaird.service"],stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=5,check=False)
+    except BaseException:
+        return "rollback-prepare-error-unavailable"
+    if result.returncode!=0 or len(result.stdout)>256:
+        return "rollback-prepare-error-unavailable"
+    prefix=b"KERNAID_RESCUE_REPAIR_EXECUTION_FAILURE_V1 stage="
+    value=result.stdout.strip()
+    if not value.startswith(prefix):
+        return "rollback-prepare-error-unavailable"
+    try:
+        stage=value[len(prefix):].decode("ascii")
+    except BaseException:
+        return "rollback-prepare-error-unavailable"
+    if stage not in ROLLBACK_FAILURE_STAGES or value!=prefix+stage.encode("ascii"):
+        return "rollback-prepare-error-unavailable"
+    return "rollback-prepare-error-"+stage
 def fail(value):
     if value not in CHECKPOINTS:
         sys.exit(46)
@@ -926,7 +945,10 @@ try:
     rollback_prepared=repair(ROLLBACK_API,"repair.fstab.rollback.prepare",{"source":source_receipt})
     checkpoint="rollback-prepare-terminal"
     if rollback_prepared.get("state")=="preparing":
-        rollback_prepared=wait(ROLLBACK_API,"repair.fstab.rollback.status",{"prepared","failed","restored","manual-reconciliation-required"},deadline)
+        rollback_prepared=wait(ROLLBACK_API,"repair.fstab.rollback.status",{"prepared","succeeded","failed","restored","manual-reconciliation-required"},deadline)
+    if rollback_prepared.get("state")=="succeeded":
+        checkpoint=rollback_prepare_failure_checkpoint()
+        raise RuntimeError()
     checkpoint="rollback-contract"
     rollback=rollback_prepared.get("detail")
     rollback_keys={"kind","preparedId","rollbackId","sessionId","planId","planHash","targetFingerprint","source","resourceId","backupLocator","actionId","risk","nextApprovalSequence","confirmationRequired"}

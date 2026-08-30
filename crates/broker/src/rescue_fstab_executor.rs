@@ -22,6 +22,7 @@ use crate::{
         acquire_pending_target_write_mount,
     },
 };
+use kernaid_linux_pack::production_candidate_contract::RESOURCE_ID as FSTAB_RESOURCE_ID;
 use kernaid_protocol::{
     rescue_repair_vault::{
         RepairBackupBinding, RepairBackupState, RepairBackupStatusPayload, RepairExecutionIntentV1,
@@ -1068,7 +1069,7 @@ fn validate_committed_rollback_source(
             .map(kernaid_protocol::rescue_repair_vault::RepairTransactionResolution::outcome)
             != Some(RepairTransactionResolutionOutcome::CommittedAfter)
         || source.backup().state() != RepairBackupState::Durable
-        || source.backup().resource_id() != Some(FSTAB_RESOURCE)
+        || !valid_rollback_source_resource_id(source.backup().resource_id())
         || source.backup().resource_sha256() != Some(intent.before_sha256())
         || source.backup().locator()
             != format!(
@@ -1079,6 +1080,10 @@ fn validate_committed_rollback_source(
         return Err(RescueFstabExecutionError::InvalidAuthority);
     }
     Ok(())
+}
+
+fn valid_rollback_source_resource_id(resource_id: Option<&str>) -> bool {
+    resource_id == Some(FSTAB_RESOURCE_ID)
 }
 
 fn validate_live_vault(
@@ -2223,6 +2228,13 @@ mod tests {
         assert!(!recovery_status_retryable(RepairVaultClientError::Remote(
             ErrorToken::StaleState
         )));
+    }
+
+    #[test]
+    fn rollback_source_uses_the_protocol_resource_id_not_the_leaf_filename() {
+        assert!(valid_rollback_source_resource_id(Some(FSTAB_RESOURCE_ID)));
+        assert!(!valid_rollback_source_resource_id(Some(FSTAB_RESOURCE)));
+        assert!(!valid_rollback_source_resource_id(None));
     }
 
     #[test]

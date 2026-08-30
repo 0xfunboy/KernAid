@@ -413,23 +413,17 @@ impl RescueFstabRollbackBackend for ProductionRepairEngine {
             command.source().transaction_binding_sha256(),
             deadline,
         )
-        .map_err(|_| RepairEngineFailure::RollbackUnavailable)?;
+        .map_err(|error| {
+            RepairEngineFailure::RollbackUnavailable(map_rollback_prepare_failure(error))
+        })?;
+        let invalid_source =
+            || RepairEngineFailure::RollbackUnavailable(RepairExecutionFailureStage::Authority);
         let source = authority.source();
         let backup = source.backup();
-        let intent = backup
-            .execution_intent()
-            .ok_or(RepairEngineFailure::RollbackUnavailable)?;
-        let source_plan_id = backup
-            .plan_id()
-            .ok_or(RepairEngineFailure::RollbackUnavailable)?;
-        let source_plan_hash = prefixed_sha256(
-            backup
-                .plan_sha256()
-                .ok_or(RepairEngineFailure::RollbackUnavailable)?,
-        );
-        let source_approval_id = backup
-            .approval_id()
-            .ok_or(RepairEngineFailure::RollbackUnavailable)?;
+        let intent = backup.execution_intent().ok_or_else(invalid_source)?;
+        let source_plan_id = backup.plan_id().ok_or_else(invalid_source)?;
+        let source_plan_hash = prefixed_sha256(backup.plan_sha256().ok_or_else(invalid_source)?);
+        let source_approval_id = backup.approval_id().ok_or_else(invalid_source)?;
         let source_binding = RescueFstabRollbackSourceBinding::new(
             source_plan_id,
             &source_plan_hash,
@@ -439,7 +433,7 @@ impl RescueFstabRollbackBackend for ProductionRepairEngine {
             prefixed_sha256(source.transaction_binding_sha256()),
             backup.locator(),
         )
-        .map_err(|_| RepairEngineFailure::RollbackUnavailable)?;
+        .map_err(|_| invalid_source())?;
         let (plan, plan_hash) = canonical_rescue_fstab_rollback_plan(
             command.plan_id(),
             command.rollback_id(),
@@ -447,7 +441,7 @@ impl RescueFstabRollbackBackend for ProductionRepairEngine {
             command.source().reservation_id(),
             command.source().transaction_binding_sha256(),
         )
-        .map_err(|_| RepairEngineFailure::RollbackUnavailable)?;
+        .map_err(|_| invalid_source())?;
         let binding = RescueFstabRollbackBinding::new(
             command.session_id(),
             command.rollback_id(),
@@ -456,11 +450,11 @@ impl RescueFstabRollbackBackend for ProductionRepairEngine {
             authority.target_fingerprint(),
             source_binding,
         )
-        .map_err(|_| RepairEngineFailure::RollbackUnavailable)?;
+        .map_err(|_| invalid_source())?;
         let mut session = Session::new(authority.target_fingerprint(), SessionMode::LinuxRescue);
         let admission = session
             .stage_rescue_fstab_rollback(&plan, binding)
-            .map_err(|_| RepairEngineFailure::RollbackUnavailable)?;
+            .map_err(|_| invalid_source())?;
         let descriptor = PreparedRollbackDescriptor::new(
             command.session_id(),
             command.rollback_id(),
@@ -469,12 +463,11 @@ impl RescueFstabRollbackBackend for ProductionRepairEngine {
             authority.target_fingerprint(),
             command.source().clone(),
             source_approval_id,
-            backup
-                .resource_id()
-                .ok_or(RepairEngineFailure::RollbackUnavailable)?,
+            backup.resource_id().ok_or_else(invalid_source)?,
             backup.locator(),
             admission.next_approval_sequence(),
-        )?;
+        )
+        .map_err(|_| invalid_source())?;
         Ok((
             ProductionPreparedRollback {
                 authority,
@@ -597,6 +590,27 @@ fn map_execution_failure(error: RescueFstabExecutionError) -> RepairExecutionFai
         | RescueFstabExecutionError::RecoveryRequired => RepairExecutionFailureStage::Write,
         RescueFstabExecutionError::MutationFailed => RepairExecutionFailureStage::Mutation,
         RescueFstabExecutionError::RecoveryUnavailable => RepairExecutionFailureStage::Recovery,
+    }
+}
+
+fn map_rollback_prepare_failure(error: RescueFstabExecutionError) -> RepairExecutionFailureStage {
+    match error {
+        RescueFstabExecutionError::InvalidAuthority
+        | RescueFstabExecutionError::AuthorizationNotPersisted => {
+            RepairExecutionFailureStage::Authority
+        }
+        RescueFstabExecutionError::DetachedMountUnavailable
+        | RescueFstabExecutionError::TargetChanged
+        | RescueFstabExecutionError::UnsafeTarget => RepairExecutionFailureStage::Target,
+        RescueFstabExecutionError::LockUnavailable => RepairExecutionFailureStage::Lock,
+        RescueFstabExecutionError::TimedOut => RepairExecutionFailureStage::Timeout,
+        RescueFstabExecutionError::VaultUnavailable
+        | RescueFstabExecutionError::VaultReconciliationRequired => {
+            RepairExecutionFailureStage::Vault
+        }
+        RescueFstabExecutionError::MutationFailed
+        | RescueFstabExecutionError::RecoveryUnavailable
+        | RescueFstabExecutionError::RecoveryRequired => RepairExecutionFailureStage::Recovery,
     }
 }
 
@@ -789,6 +803,10 @@ mod tests {
                 RepairExecutionFailureStage::Authority,
             ),
             (
+                RescueFstabExecutionError::AuthorizationNotPersisted,
+                RepairExecutionFailureStage::ApprovalAuthorize,
+            ),
+            (
                 RescueFstabExecutionError::TargetChanged,
                 RepairExecutionFailureStage::Target,
             ),
@@ -830,6 +848,62 @@ mod tests {
             ),
         ] {
             assert_eq!(map_execution_failure(error), expected);
+        }
+    }
+
+    #[test]
+    fn rollback_prepare_failures_map_to_actionable_closed_stages() {
+        for (error, expected) in [
+            (
+                RescueFstabExecutionError::InvalidAuthority,
+                RepairExecutionFailureStage::Authority,
+            ),
+            (
+                RescueFstabExecutionError::AuthorizationNotPersisted,
+                RepairExecutionFailureStage::Authority,
+            ),
+            (
+                RescueFstabExecutionError::TargetChanged,
+                RepairExecutionFailureStage::Target,
+            ),
+            (
+                RescueFstabExecutionError::DetachedMountUnavailable,
+                RepairExecutionFailureStage::Target,
+            ),
+            (
+                RescueFstabExecutionError::UnsafeTarget,
+                RepairExecutionFailureStage::Target,
+            ),
+            (
+                RescueFstabExecutionError::LockUnavailable,
+                RepairExecutionFailureStage::Lock,
+            ),
+            (
+                RescueFstabExecutionError::TimedOut,
+                RepairExecutionFailureStage::Timeout,
+            ),
+            (
+                RescueFstabExecutionError::VaultUnavailable,
+                RepairExecutionFailureStage::Vault,
+            ),
+            (
+                RescueFstabExecutionError::VaultReconciliationRequired,
+                RepairExecutionFailureStage::Vault,
+            ),
+            (
+                RescueFstabExecutionError::MutationFailed,
+                RepairExecutionFailureStage::Recovery,
+            ),
+            (
+                RescueFstabExecutionError::RecoveryRequired,
+                RepairExecutionFailureStage::Recovery,
+            ),
+            (
+                RescueFstabExecutionError::RecoveryUnavailable,
+                RepairExecutionFailureStage::Recovery,
+            ),
+        ] {
+            assert_eq!(map_rollback_prepare_failure(error), expected);
         }
     }
 
