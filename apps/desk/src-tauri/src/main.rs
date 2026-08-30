@@ -1800,12 +1800,22 @@ fn qualified_first_launch_probe_requested(
     Ok(false)
 }
 
-fn create_qualified_first_launch_directory() -> Result<PathBuf, ()> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QualifiedFirstLaunchProbeError {
+    RepairSurfacePresent,
+    PrivateDirectory,
+    RuntimeOpen,
+    RuntimeStatus,
+    RuntimeBlocked,
+    Cleanup,
+}
+
+fn create_qualified_first_launch_directory() -> Result<PathBuf, QualifiedFirstLaunchProbeError> {
     let base = std::env::temp_dir();
     let process_id = process::id();
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|_| ())?
+        .map_err(|_| QualifiedFirstLaunchProbeError::PrivateDirectory)?
         .as_nanos();
     let sequence = QUALIFIED_FIRST_LAUNCH_DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     for attempt in 0_u8..32 {
@@ -1824,36 +1834,38 @@ fn create_qualified_first_launch_directory() -> Result<PathBuf, ()> {
         match created {
             Ok(()) => return Ok(path),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(_) => return Err(()),
+            Err(_) => return Err(QualifiedFirstLaunchProbeError::PrivateDirectory),
         }
     }
-    Err(())
+    Err(QualifiedFirstLaunchProbeError::PrivateDirectory)
 }
 
 fn stable_repair_surface_is_absent() -> bool {
     !cfg!(feature = "fixture-repair-lab")
 }
 
-fn run_qualified_first_launch_probe() -> Result<(), ()> {
+fn run_qualified_first_launch_probe() -> Result<(), QualifiedFirstLaunchProbeError> {
     if !stable_repair_surface_is_absent() {
-        return Err(());
+        return Err(QualifiedFirstLaunchProbeError::RepairSurfacePresent);
     }
     let directory = create_qualified_first_launch_directory()?;
     let result = (|| {
-        let runtime =
-            SecureRuntime::open_qualified_first_launch_probe(&directory).map_err(|_| ())?;
-        let status = runtime.qualified_first_launch_status().map_err(|_| ())?;
+        let runtime = SecureRuntime::open_qualified_first_launch_probe(&directory)
+            .map_err(|_| QualifiedFirstLaunchProbeError::RuntimeOpen)?;
+        let status = runtime
+            .qualified_first_launch_status()
+            .map_err(|_| QualifiedFirstLaunchProbeError::RuntimeStatus)?;
         if !status.is_readable_for_qualified_first_launch() {
-            return Err(());
+            return Err(QualifiedFirstLaunchProbeError::RuntimeBlocked);
         }
         drop(runtime);
         Ok(())
     })();
     let cleaned = fs::remove_dir_all(&directory).is_ok();
-    if result.is_err() || !cleaned {
-        return Err(());
-    }
-    Ok(())
+    result?;
+    cleaned
+        .then_some(())
+        .ok_or(QualifiedFirstLaunchProbeError::Cleanup)
 }
 
 fn run_gui() {
@@ -1878,7 +1890,7 @@ fn main() {
         Ok(false) => run_gui(),
         Ok(true) => match run_qualified_first_launch_probe() {
             Ok(()) => println!("{QUALIFIED_FIRST_LAUNCH_OK}"),
-            Err(()) => {
+            Err(_) => {
                 eprintln!("{QUALIFIED_FIRST_LAUNCH_FAILED}");
                 process::exit(1);
             }
@@ -1958,7 +1970,7 @@ mod tests {
     #[cfg(not(feature = "fixture-repair-lab"))]
     #[test]
     fn qualified_first_launch_probe_initializes_and_cleans_ephemeral_runtime() {
-        assert_eq!(run_qualified_first_launch_probe(), Ok(()));
+        run_qualified_first_launch_probe().expect("packaged bootstrap must initialize");
     }
 
     #[cfg(target_os = "linux")]
