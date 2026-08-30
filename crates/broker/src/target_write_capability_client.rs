@@ -84,7 +84,6 @@ pub struct RescueTargetWriteMountCapability {
 /// Non-cloneable authority for the writable mount of one exact durable
 /// post-commit rollback. It is deliberately distinct from repair authority so
 /// a source transaction lease can never be replayed as a rollback lease.
-#[allow(dead_code)] // consumed only by the separately gated rollback executor
 pub struct RescueTargetRollbackWriteMountCapability {
     mount: OwnedFd,
     rollback_id: String,
@@ -95,7 +94,6 @@ pub struct RescueTargetRollbackWriteMountCapability {
     lease_binding_sha256: String,
 }
 
-#[allow(dead_code)] // the executor integration is intentionally a separate slice
 impl RescueTargetRollbackWriteMountCapability {
     pub(crate) fn mount(&self) -> &OwnedFd {
         &self.mount

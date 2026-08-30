@@ -7,7 +7,7 @@
 //! single-use detached writable ext4 mount capability.
 
 use crate::{
-    repair_vault_client::{RepairVaultClient, RepairVaultClientError},
+    repair_vault_client::{RepairBackupBytes, RepairVaultClient, RepairVaultClientError},
     rescue_fstab_candidate::{
         ApprovedRescueFstabExecutionParts, ApprovedRescueFstabTransaction,
         RescueFstabCapabilityResolutionError, RescueFstabVaultReservation,
@@ -17,16 +17,20 @@ use crate::{
         reacquire_target_for_recovery,
     },
     target_write_capability_client::{
-        RescueTargetWriteMountCapability, TargetWriteCapabilityClientError,
+        RescueTargetRollbackWriteMountCapability, RescueTargetWriteMountCapability,
+        TargetWriteCapabilityClientError, acquire_pending_rollback_target_write_mount,
         acquire_pending_target_write_mount,
     },
 };
 use kernaid_protocol::{
     rescue_repair_vault::{
         RepairBackupBinding, RepairBackupState, RepairBackupStatusPayload, RepairExecutionIntentV1,
-        RepairFileMetadataV1, RepairTransactionPhase, RepairTransactionResolution,
-        RepairTransactionResolutionOutcome, RepairTransactionStatusPayload,
-        RepairTransactionStatusSelector,
+        RepairFileMetadataV1, RepairReservationId, RepairRollbackBindingV1, RepairRollbackId,
+        RepairRollbackResolution, RepairRollbackResolutionOutcome, RepairRollbackStatusSelector,
+        RepairRollbackTransactionStatusPayload, RepairTransactionPhase,
+        RepairTransactionResolution, RepairTransactionResolutionOutcome,
+        RepairTransactionStatusPayload, RepairTransactionStatusSelector,
+        RepairVaultLiveIdentityPayload,
     },
     rescue_vault::{ErrorToken, Sha256},
 };
@@ -112,6 +116,8 @@ impl RescueFstabExecutionReceipt {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RescueFstabExecutionError {
     InvalidAuthority,
+    /// Rollback approval was not persisted and no child transaction exists.
+    AuthorizationNotPersisted,
     TargetChanged,
     LockUnavailable,
     TimedOut,
@@ -128,6 +134,7 @@ impl std::fmt::Display for RescueFstabExecutionError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
             Self::InvalidAuthority => "invalid approved repair authority",
+            Self::AuthorizationNotPersisted => "rollback approval was not persisted",
             Self::TargetChanged => "repair target identity changed",
             Self::LockUnavailable => "repair target is already locked",
             Self::TimedOut => "repair transaction deadline expired",
@@ -143,6 +150,434 @@ impl std::fmt::Display for RescueFstabExecutionError {
 }
 
 impl std::error::Error for RescueFstabExecutionError {}
+
+/// Broker-owned rollback preparation authority. The source receipt and backup
+/// have been reread from the authenticated Vault, while `target` retains the
+/// freshly reacquired read-only mount used to prove the exact installed After
+/// state before approval.
+pub struct PreparedRescueFstabRollback {
+    vault_client: RepairVaultClient,
+    source: RepairTransactionStatusPayload,
+    backup: RepairBackupBytes,
+    target: ProductionRescueFstabTargetGuard,
+    live_vault: RepairVaultLiveIdentityPayload,
+    target_fingerprint: String,
+}
+
+impl PreparedRescueFstabRollback {
+    pub fn source(&self) -> &RepairTransactionStatusPayload {
+        &self.source
+    }
+
+    pub fn target_fingerprint(&self) -> &str {
+        &self.target_fingerprint
+    }
+}
+
+/// Approved rollback authority after Core approval and durable child creation.
+/// It is non-cloneable and can be consumed only by the closed executor below.
+pub struct ApprovedRescueFstabRollback {
+    vault_client: RepairVaultClient,
+    pending: RepairRollbackTransactionStatusPayload,
+    backup: RepairBackupBytes,
+    target: ProductionRescueFstabTargetGuard,
+    live_vault: RepairVaultLiveIdentityPayload,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RescueFstabRollbackExecutionOutcome {
+    RolledBackOriginal,
+    ManualReconciliationRequired,
+}
+
+/// Path-free terminal receipt for the durable rollback child.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RescueFstabRollbackExecutionReceipt {
+    outcome: RescueFstabRollbackExecutionOutcome,
+    rollback_id: String,
+    rollback_transaction_binding_sha256: String,
+    source_reservation_id: String,
+    source_transaction_binding_sha256: String,
+}
+
+impl RescueFstabRollbackExecutionReceipt {
+    pub const fn outcome(&self) -> RescueFstabRollbackExecutionOutcome {
+        self.outcome
+    }
+
+    pub fn rollback_id(&self) -> &str {
+        &self.rollback_id
+    }
+
+    pub fn rollback_transaction_binding_sha256(&self) -> &str {
+        &self.rollback_transaction_binding_sha256
+    }
+
+    pub fn source_reservation_id(&self) -> &str {
+        &self.source_reservation_id
+    }
+
+    pub fn source_transaction_binding_sha256(&self) -> &str {
+        &self.source_transaction_binding_sha256
+    }
+}
+
+/// Authenticates one exact committed repair receipt, rereads its backup, and
+/// retains a freshly reacquired read-only target proven to still be in the
+/// installed `After` state. No rollback child or write authority exists yet.
+pub fn prepare_rescue_fstab_rollback(
+    source_reservation_id: &str,
+    source_transaction_binding_sha256: &str,
+    deadline: Instant,
+) -> Result<PreparedRescueFstabRollback, RescueFstabExecutionError> {
+    ensure_deadline(deadline)?;
+    let reservation_id = RepairReservationId::parse(source_reservation_id)
+        .map_err(|_| RescueFstabExecutionError::InvalidAuthority)?;
+    let transaction_binding_sha256 = parse_prefixed_sha256(source_transaction_binding_sha256)?;
+    let mut vault_client = RepairVaultClient::new();
+
+    let unresolved = vault_client
+        .rollback_transaction_status(&RepairRollbackStatusSelector::pending_singleton(), deadline)
+        .map_err(map_vault_error)?;
+    if unresolved.transaction().is_some() {
+        return Err(RescueFstabExecutionError::RecoveryRequired);
+    }
+
+    let source_selector =
+        RepairTransactionStatusSelector::exact(reservation_id, transaction_binding_sha256);
+    let source_result = vault_client
+        .transaction_status(&source_selector, deadline)
+        .map_err(map_vault_error)?;
+    let source = source_result
+        .transaction()
+        .cloned()
+        .ok_or(RescueFstabExecutionError::InvalidAuthority)?;
+    validate_committed_rollback_source(&source)?;
+
+    let retrieved = vault_client
+        .get(source.backup(), deadline)
+        .map_err(map_vault_error)?;
+    if retrieved.status() != source.backup() {
+        return Err(RescueFstabExecutionError::VaultReconciliationRequired);
+    }
+    let intent = source_intent(&source)?;
+    ensure_exact_bytes(retrieved.bytes(), intent.before_sha256())?;
+
+    let live_vault = vault_client
+        .live_identity(deadline)
+        .map_err(map_vault_error)?;
+    validate_live_vault(&source, &live_vault)?;
+    let target = reacquire_target_for_recovery(intent, deadline).map_err(map_capability_error)?;
+    validate_target_vault_separation(&target, &live_vault)?;
+
+    let _process_lock = acquire_process_lock(deadline)?;
+    let _target_lock = acquire_target_lock(&target, deadline)?;
+    target
+        .inner()
+        .revalidate()
+        .map_err(|_| RescueFstabExecutionError::TargetChanged)?;
+    let locked_live_vault = vault_client
+        .live_identity(deadline)
+        .map_err(map_vault_error)?;
+    if locked_live_vault != live_vault {
+        return Err(RescueFstabExecutionError::VaultReconciliationRequired);
+    }
+    validate_target_vault_separation(&target, &locked_live_vault)?;
+    let (state, _) = classify_with_retained_read_mount(&target, intent)?;
+    if state != ExactTargetState::After {
+        return Err(RescueFstabExecutionError::TargetChanged);
+    }
+
+    let target_fingerprint = target
+        .inner()
+        .target_claims()
+        .target_fingerprint()
+        .to_owned();
+    Ok(PreparedRescueFstabRollback {
+        vault_client,
+        source,
+        backup: retrieved.into_bytes(),
+        target,
+        live_vault,
+        target_fingerprint,
+    })
+}
+
+/// Consumes a fresh Core-approved rollback binding and durably creates the
+/// child transaction. A lost begin response is reconciled by exact child ID;
+/// the begin mutation itself is never repeated.
+pub fn authorize_prepared_rescue_fstab_rollback(
+    mut prepared: PreparedRescueFstabRollback,
+    rollback_id: &str,
+    binding: RepairRollbackBindingV1,
+    deadline: Instant,
+) -> Result<ApprovedRescueFstabRollback, RescueFstabExecutionError> {
+    ensure_deadline(deadline).map_err(authorization_not_persisted)?;
+    let rollback_id = RepairRollbackId::parse(rollback_id)
+        .map_err(|_| RescueFstabExecutionError::AuthorizationNotPersisted)?;
+    binding
+        .validate_against(&prepared.source)
+        .map_err(|_| RescueFstabExecutionError::AuthorizationNotPersisted)?;
+    let expected = RepairRollbackTransactionStatusPayload::pending(
+        rollback_id.clone(),
+        prepared.source.clone(),
+        binding.clone(),
+    )
+    .map_err(|_| RescueFstabExecutionError::AuthorizationNotPersisted)?;
+
+    let _process_lock = acquire_process_lock(deadline).map_err(authorization_not_persisted)?;
+    let _target_lock =
+        acquire_target_lock(&prepared.target, deadline).map_err(authorization_not_persisted)?;
+    prepared
+        .target
+        .inner()
+        .revalidate()
+        .map_err(|_| RescueFstabExecutionError::AuthorizationNotPersisted)?;
+    let current_source =
+        lookup_exact_source(&mut prepared.vault_client, &prepared.source, deadline)
+            .map_err(authorization_not_persisted)?;
+    if current_source != prepared.source {
+        return Err(RescueFstabExecutionError::AuthorizationNotPersisted);
+    }
+    let locked_live_vault = prepared
+        .vault_client
+        .live_identity(deadline)
+        .map_err(map_vault_error)
+        .map_err(authorization_not_persisted)?;
+    if locked_live_vault != prepared.live_vault {
+        return Err(RescueFstabExecutionError::AuthorizationNotPersisted);
+    }
+    validate_target_vault_separation(&prepared.target, &locked_live_vault)
+        .map_err(authorization_not_persisted)?;
+    let intent = source_intent(&prepared.source).map_err(authorization_not_persisted)?;
+    let (state, _) = classify_with_retained_read_mount(&prepared.target, intent)
+        .map_err(authorization_not_persisted)?;
+    if state != ExactTargetState::After {
+        return Err(RescueFstabExecutionError::AuthorizationNotPersisted);
+    }
+
+    let pending = match prepared.vault_client.begin_rollback_transaction(
+        &prepared.source,
+        &rollback_id,
+        &binding,
+        deadline,
+    ) {
+        Ok(status) => status,
+        Err(RepairVaultClientError::ReconciliationRequired) => {
+            let result = prepared
+                .vault_client
+                .rollback_transaction_status(
+                    &RepairRollbackStatusSelector::for_status(&expected),
+                    deadline,
+                )
+                .map_err(map_vault_error)?;
+            result
+                .transaction()
+                .cloned()
+                .ok_or(RescueFstabExecutionError::VaultReconciliationRequired)?
+        }
+        Err(error) => return Err(map_vault_error(error)),
+    };
+    if pending != expected || pending.phase() != RepairTransactionPhase::Pending {
+        return Err(RescueFstabExecutionError::VaultReconciliationRequired);
+    }
+    Ok(ApprovedRescueFstabRollback {
+        vault_client: prepared.vault_client,
+        pending,
+        backup: prepared.backup,
+        target: prepared.target,
+        live_vault: prepared.live_vault,
+    })
+}
+
+/// Executes one already durable rollback child. The only writable mount is
+/// acquired for an exact `After` state; exact `Before` closes without a write,
+/// while any third state is durably blocked for manual reconciliation.
+pub fn execute_approved_rescue_fstab_rollback(
+    approved: ApprovedRescueFstabRollback,
+    deadline: Instant,
+) -> Result<RescueFstabRollbackExecutionReceipt, RescueFstabExecutionError> {
+    let operation_deadline = reserve_cleanup_window(deadline)?;
+    reconcile_pending_rescue_fstab_rollback(
+        approved.vault_client,
+        approved.pending,
+        approved.backup,
+        approved.target,
+        approved.live_vault,
+        operation_deadline,
+        deadline,
+    )
+}
+
+/// Reconciles the sole unresolved rollback before ordinary repair recovery.
+/// `None` means there is no rollback child and the caller may then inspect the
+/// legacy repair Pending singleton.
+pub fn recover_pending_rescue_fstab_rollback(
+    deadline: Instant,
+) -> Result<Option<RescueFstabRollbackExecutionReceipt>, RescueFstabExecutionError> {
+    let operation_deadline = reserve_cleanup_window(deadline)?;
+    let mut vault_client = RepairVaultClient::new();
+    let result = loop {
+        match vault_client.rollback_transaction_status(
+            &RepairRollbackStatusSelector::pending_singleton(),
+            operation_deadline,
+        ) {
+            Ok(result) => break result,
+            Err(error) if recovery_status_retryable(error) => {
+                ensure_deadline(operation_deadline)?;
+                thread::sleep(
+                    VAULT_RECOVERY_POLL
+                        .min(operation_deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+            Err(error) => return Err(map_vault_error(error)),
+        }
+    };
+    let Some(pending) = result.transaction().cloned() else {
+        return Ok(None);
+    };
+    if !matches!(
+        pending.phase(),
+        RepairTransactionPhase::Pending | RepairTransactionPhase::ManualReconciliationRequired
+    ) {
+        return Err(RescueFstabExecutionError::VaultReconciliationRequired);
+    }
+    let source = pending.source().clone();
+    validate_committed_rollback_source(&source)?;
+    let retrieved = vault_client
+        .get(source.backup(), operation_deadline)
+        .map_err(map_vault_error)?;
+    if retrieved.status() != source.backup() {
+        return Err(RescueFstabExecutionError::VaultReconciliationRequired);
+    }
+    ensure_exact_bytes(retrieved.bytes(), source_intent(&source)?.before_sha256())?;
+    let live_vault = vault_client
+        .live_identity(operation_deadline)
+        .map_err(map_vault_error)?;
+    validate_live_vault(&source, &live_vault)?;
+    let target = reacquire_target_for_recovery(source_intent(&source)?, operation_deadline)
+        .map_err(map_capability_error)?;
+    validate_target_vault_separation(&target, &live_vault)?;
+
+    reconcile_pending_rescue_fstab_rollback(
+        vault_client,
+        pending,
+        retrieved.into_bytes(),
+        target,
+        live_vault,
+        operation_deadline,
+        deadline,
+    )
+    .map(Some)
+}
+
+fn reconcile_pending_rescue_fstab_rollback(
+    mut vault_client: RepairVaultClient,
+    pending: RepairRollbackTransactionStatusPayload,
+    backup: RepairBackupBytes,
+    target: ProductionRescueFstabTargetGuard,
+    live_vault: RepairVaultLiveIdentityPayload,
+    operation_deadline: Instant,
+    resolution_deadline: Instant,
+) -> Result<RescueFstabRollbackExecutionReceipt, RescueFstabExecutionError> {
+    if !matches!(
+        pending.phase(),
+        RepairTransactionPhase::Pending | RepairTransactionPhase::ManualReconciliationRequired
+    ) {
+        return rollback_receipt_from_status(&pending);
+    }
+    validate_committed_rollback_source(pending.source())?;
+    let intent = source_intent(pending.source())?;
+    ensure_exact_bytes(backup.as_slice(), intent.before_sha256())?;
+
+    let _process_lock = acquire_process_lock(operation_deadline)?;
+    let _target_lock = acquire_target_lock(&target, operation_deadline)?;
+    target
+        .inner()
+        .revalidate()
+        .map_err(|_| RescueFstabExecutionError::TargetChanged)?;
+    let current = vault_client
+        .rollback_transaction_status(
+            &RepairRollbackStatusSelector::for_status(&pending),
+            operation_deadline,
+        )
+        .map_err(map_vault_error)?;
+    let current = current
+        .transaction()
+        .cloned()
+        .ok_or(RescueFstabExecutionError::VaultReconciliationRequired)?;
+    if current != pending {
+        return if current.same_transaction(&pending) && current.resolution().is_some() {
+            rollback_receipt_from_status(&current)
+        } else {
+            Err(RescueFstabExecutionError::VaultReconciliationRequired)
+        };
+    }
+    let locked_live_vault = vault_client
+        .live_identity(operation_deadline)
+        .map_err(map_vault_error)?;
+    if locked_live_vault != live_vault {
+        return Err(RescueFstabExecutionError::VaultReconciliationRequired);
+    }
+    validate_target_vault_separation(&target, &locked_live_vault)?;
+
+    let (state, observation) = classify_with_retained_read_mount(&target, intent)?;
+    let closure = match state {
+        ExactTargetState::Before => RollbackTargetClosure {
+            outcome: RepairRollbackResolutionOutcome::RolledBackBefore,
+            observation,
+            cleanup_verified: true,
+        },
+        ExactTargetState::Third
+            if pending.phase() == RepairTransactionPhase::ManualReconciliationRequired =>
+        {
+            return rollback_receipt_from_status(&pending);
+        }
+        ExactTargetState::Third => RollbackTargetClosure {
+            outcome: RepairRollbackResolutionOutcome::ManualReconciliationRequired,
+            observation,
+            cleanup_verified: true,
+        },
+        ExactTargetState::After
+            if pending.phase() == RepairTransactionPhase::ManualReconciliationRequired =>
+        {
+            return rollback_receipt_from_status(&pending);
+        }
+        ExactTargetState::After => {
+            drop(target);
+            let write_mount =
+                acquire_pending_rollback_target_write_mount(&pending, operation_deadline)
+                    .map_err(map_write_capability_error)?;
+            refresh_pending_after_rollback_write_lease(
+                &mut vault_client,
+                &pending,
+                operation_deadline,
+            )?;
+            restore_rollback_target(
+                write_mount,
+                backup.as_slice(),
+                intent,
+                &pending,
+                operation_deadline,
+            )?
+        }
+    };
+    let resolution = RepairRollbackResolution::new(
+        closure.outcome,
+        closure.observation.resource_sha256,
+        closure.observation.metadata_sha256,
+        closure.cleanup_verified,
+        pending.source(),
+    )
+    .map_err(|_| RescueFstabExecutionError::RecoveryUnavailable)?;
+    let resolved = resolve_pending_rollback(
+        &mut vault_client,
+        &pending,
+        &resolution,
+        resolution_deadline,
+    )?;
+    rollback_receipt_from_status(&resolved)
+}
 
 /// Consumes one exact approved candidate. Backup durability and a Pending
 /// transaction are established before this function can create a writable
@@ -577,6 +1012,160 @@ fn receipt_from_status(
     })
 }
 
+fn source_intent(
+    source: &RepairTransactionStatusPayload,
+) -> Result<&RepairExecutionIntentV1, RescueFstabExecutionError> {
+    source
+        .backup()
+        .execution_intent()
+        .ok_or(RescueFstabExecutionError::InvalidAuthority)
+}
+
+fn validate_committed_rollback_source(
+    source: &RepairTransactionStatusPayload,
+) -> Result<(), RescueFstabExecutionError> {
+    let intent = source_intent(source)?;
+    if source.phase() != RepairTransactionPhase::Resolved
+        || source
+            .resolution()
+            .map(kernaid_protocol::rescue_repair_vault::RepairTransactionResolution::outcome)
+            != Some(RepairTransactionResolutionOutcome::CommittedAfter)
+        || source.backup().state() != RepairBackupState::Durable
+        || source.backup().resource_id() != Some(FSTAB_RESOURCE)
+        || source.backup().resource_sha256() != Some(intent.before_sha256())
+        || source.backup().locator()
+            != format!(
+                "vault://repair/{}",
+                source.backup().reservation_id().as_str()
+            )
+    {
+        return Err(RescueFstabExecutionError::InvalidAuthority);
+    }
+    Ok(())
+}
+
+fn validate_live_vault(
+    source: &RepairTransactionStatusPayload,
+    live_vault: &RepairVaultLiveIdentityPayload,
+) -> Result<(), RescueFstabExecutionError> {
+    if live_vault.vault_id() != source.backup().vault_id()
+        || live_vault.vault_identity_fingerprint() != source.backup().vault_identity_fingerprint()
+    {
+        return Err(RescueFstabExecutionError::VaultReconciliationRequired);
+    }
+    Ok(())
+}
+
+fn validate_target_vault_separation(
+    target: &ProductionRescueFstabTargetGuard,
+    live_vault: &RepairVaultLiveIdentityPayload,
+) -> Result<(), RescueFstabExecutionError> {
+    let target_parent = parse_prefixed_sha256(target.inner().physical_parent_fingerprint())?;
+    if &target_parent == live_vault.physical_parent_fingerprint() {
+        return Err(RescueFstabExecutionError::RecoveryUnavailable);
+    }
+    Ok(())
+}
+
+fn lookup_exact_source(
+    client: &mut RepairVaultClient,
+    source: &RepairTransactionStatusPayload,
+    deadline: Instant,
+) -> Result<RepairTransactionStatusPayload, RescueFstabExecutionError> {
+    let result = client
+        .transaction_status(
+            &RepairTransactionStatusSelector::for_status(source),
+            deadline,
+        )
+        .map_err(map_vault_error)?;
+    let current = result
+        .transaction()
+        .cloned()
+        .ok_or(RescueFstabExecutionError::VaultReconciliationRequired)?;
+    validate_committed_rollback_source(&current)?;
+    Ok(current)
+}
+
+fn resolve_pending_rollback(
+    client: &mut RepairVaultClient,
+    pending: &RepairRollbackTransactionStatusPayload,
+    resolution: &RepairRollbackResolution,
+    deadline: Instant,
+) -> Result<RepairRollbackTransactionStatusPayload, RescueFstabExecutionError> {
+    match client.resolve_rollback_transaction(pending, resolution, deadline) {
+        Ok(status) => Ok(status),
+        Err(RepairVaultClientError::ReconciliationRequired) => {
+            let result = client
+                .rollback_transaction_status(
+                    &RepairRollbackStatusSelector::for_status(pending),
+                    deadline,
+                )
+                .map_err(map_vault_error)?;
+            let status = result
+                .transaction()
+                .ok_or(RescueFstabExecutionError::VaultReconciliationRequired)?;
+            if status.same_transaction(pending) && status.resolves_with(resolution) {
+                Ok(status.clone())
+            } else {
+                Err(RescueFstabExecutionError::VaultReconciliationRequired)
+            }
+        }
+        Err(error) => Err(map_vault_error(error)),
+    }
+}
+
+fn refresh_pending_after_rollback_write_lease(
+    client: &mut RepairVaultClient,
+    pending: &RepairRollbackTransactionStatusPayload,
+    deadline: Instant,
+) -> Result<(), RescueFstabExecutionError> {
+    let result = client
+        .rollback_transaction_status(&RepairRollbackStatusSelector::for_status(pending), deadline)
+        .map_err(map_vault_error)?;
+    let refreshed = result
+        .transaction()
+        .ok_or(RescueFstabExecutionError::VaultReconciliationRequired)?;
+    if refreshed != pending {
+        return Err(RescueFstabExecutionError::VaultReconciliationRequired);
+    }
+    Ok(())
+}
+
+fn rollback_receipt_from_status(
+    status: &RepairRollbackTransactionStatusPayload,
+) -> Result<RescueFstabRollbackExecutionReceipt, RescueFstabExecutionError> {
+    let resolution = status
+        .resolution()
+        .ok_or(RescueFstabExecutionError::VaultReconciliationRequired)?;
+    let outcome = match resolution.outcome() {
+        RepairRollbackResolutionOutcome::RolledBackBefore => {
+            RescueFstabRollbackExecutionOutcome::RolledBackOriginal
+        }
+        RepairRollbackResolutionOutcome::ManualReconciliationRequired => {
+            RescueFstabRollbackExecutionOutcome::ManualReconciliationRequired
+        }
+    };
+    Ok(RescueFstabRollbackExecutionReceipt {
+        outcome,
+        rollback_id: status.rollback_id().as_str().to_owned(),
+        rollback_transaction_binding_sha256: status
+            .rollback_transaction_binding_sha256()
+            .as_str()
+            .to_owned(),
+        source_reservation_id: status
+            .source()
+            .backup()
+            .reservation_id()
+            .as_str()
+            .to_owned(),
+        source_transaction_binding_sha256: status
+            .source()
+            .transaction_binding_sha256()
+            .as_str()
+            .to_owned(),
+    })
+}
+
 fn map_vault_error(error: RepairVaultClientError) -> RescueFstabExecutionError {
     match error {
         RepairVaultClientError::TimedOut => RescueFstabExecutionError::TimedOut,
@@ -720,6 +1309,12 @@ struct TargetClosure {
     observation: ClosedObservation,
     cleanup_verified: bool,
     initial_failure: Option<RescueFstabExecutionError>,
+}
+
+struct RollbackTargetClosure {
+    outcome: RepairRollbackResolutionOutcome,
+    observation: ClosedObservation,
+    cleanup_verified: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -913,6 +1508,65 @@ fn restore_recovery_target(
     })
 }
 
+fn restore_rollback_target(
+    write_mount: RescueTargetRollbackWriteMountCapability,
+    backup: &[u8],
+    intent: &RepairExecutionIntentV1,
+    pending: &RepairRollbackTransactionStatusPayload,
+    deadline: Instant,
+) -> Result<RollbackTargetClosure, RescueFstabExecutionError> {
+    validate_rollback_write_capability(&write_mount, pending)?;
+    write_mount
+        .revalidate()
+        .map_err(map_write_capability_error)?;
+    let closure = {
+        let mount = write_mount.mount();
+        let etc = open_etc_directory(mount.as_fd())?;
+        let closure = match restore_exact_backup(
+            mount,
+            &etc,
+            backup,
+            intent,
+            pending.source().backup().reservation_id().as_str(),
+            deadline,
+        ) {
+            Ok(observation) => RollbackTargetClosure {
+                outcome: RepairRollbackResolutionOutcome::RolledBackBefore,
+                observation,
+                cleanup_verified: false,
+            },
+            Err(error) => {
+                let snapshot = snapshot_fstab(&etc)?;
+                match exact_state(&snapshot, intent) {
+                    ExactTargetState::Before => RollbackTargetClosure {
+                        outcome: RepairRollbackResolutionOutcome::RolledBackBefore,
+                        observation: snapshot.observation(),
+                        cleanup_verified: false,
+                    },
+                    ExactTargetState::Third => RollbackTargetClosure {
+                        outcome: RepairRollbackResolutionOutcome::ManualReconciliationRequired,
+                        observation: snapshot.observation(),
+                        cleanup_verified: false,
+                    },
+                    // Leave the durable child Pending. A later boot receives a
+                    // fresh boot-scoped lease and can safely retry from After.
+                    ExactTargetState::After => return Err(error),
+                }
+            }
+        };
+        drop(etc);
+        closure
+    };
+    write_mount
+        .revalidate()
+        .map_err(map_write_capability_error)?;
+    drop(write_mount);
+    Ok(RollbackTargetClosure {
+        cleanup_verified: true,
+        ..closure
+    })
+}
+
 fn validate_write_capability(
     capability: &RescueTargetWriteMountCapability,
     intent: &RepairExecutionIntentV1,
@@ -921,6 +1575,26 @@ fn validate_write_capability(
     if capability.reservation_id() != reservation_id
         || capability.target_recovery_fingerprint() != intent.target_recovery_fingerprint()
         || capability.transaction_binding_sha256().is_empty()
+        || capability.lease_binding_sha256().is_empty()
+    {
+        return Err(RescueFstabExecutionError::RecoveryRequired);
+    }
+    Ok(())
+}
+
+fn validate_rollback_write_capability(
+    capability: &RescueTargetRollbackWriteMountCapability,
+    pending: &RepairRollbackTransactionStatusPayload,
+) -> Result<(), RescueFstabExecutionError> {
+    let source = pending.source();
+    let intent = source_intent(source)?;
+    if capability.rollback_id() != pending.rollback_id().as_str()
+        || capability.rollback_transaction_binding_sha256()
+            != pending.rollback_transaction_binding_sha256().as_str()
+        || capability.source_reservation_id() != source.backup().reservation_id().as_str()
+        || capability.source_transaction_binding_sha256()
+            != source.transaction_binding_sha256().as_str()
+        || capability.target_recovery_fingerprint() != intent.target_recovery_fingerprint()
         || capability.lease_binding_sha256().is_empty()
     {
         return Err(RescueFstabExecutionError::RecoveryRequired);
@@ -1460,6 +2134,10 @@ fn ensure_deadline(deadline: Instant) -> Result<(), RescueFstabExecutionError> {
     } else {
         Ok(())
     }
+}
+
+fn authorization_not_persisted(_error: RescueFstabExecutionError) -> RescueFstabExecutionError {
+    RescueFstabExecutionError::AuthorizationNotPersisted
 }
 
 fn prefer_initial_failure(

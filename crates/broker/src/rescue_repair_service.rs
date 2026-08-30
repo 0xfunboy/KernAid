@@ -1006,6 +1006,7 @@ enum InternalState<Prepared, PreparedRollback> {
     },
     RollbackExecuting {
         operation_id: u64,
+        source_terminal: RepairTerminalReceipt,
     },
     RollbackCancelling {
         operation_id: u64,
@@ -1543,11 +1544,20 @@ impl<Engine: RepairPreparationEngine + RescueFstabRollbackBackend> RescueRepairS
                 return Err(RepairServiceErrorToken::StateConflict);
             }
         }
+        let executing_source = match &self.state.phase {
+            InternalState::RollbackPrepared {
+                source_terminal, ..
+            } => source_terminal.clone(),
+            _ => return Err(RepairServiceErrorToken::Internal),
+        };
         let operation_id = self.take_operation_id()?;
         let deadline = absolute_deadline(EXECUTE_TIMEOUT)?;
         let previous = std::mem::replace(
             &mut self.state.phase,
-            InternalState::RollbackExecuting { operation_id },
+            InternalState::RollbackExecuting {
+                operation_id,
+                source_terminal: executing_source,
+            },
         );
         let InternalState::RollbackPrepared {
             authority,
@@ -1608,11 +1618,20 @@ impl<Engine: RepairPreparationEngine + RescueFstabRollbackBackend> RescueRepairS
                 return Err(RepairServiceErrorToken::StateConflict);
             }
         }
+        let cancelling_source = match &self.state.phase {
+            InternalState::RollbackPrepared {
+                source_terminal, ..
+            } => source_terminal.clone(),
+            _ => return Err(RepairServiceErrorToken::Internal),
+        };
         let operation_id = self.take_operation_id()?;
         let deadline = absolute_deadline(CANCEL_TIMEOUT)?;
         let previous = std::mem::replace(
             &mut self.state.phase,
-            InternalState::RollbackExecuting { operation_id },
+            InternalState::RollbackExecuting {
+                operation_id,
+                source_terminal: cancelling_source,
+            },
         );
         let InternalState::RollbackPrepared {
             authority,
@@ -1826,17 +1845,38 @@ impl<Engine: RepairPreparationEngine + RescueFstabRollbackBackend> RescueRepairS
                 operation_id,
                 result,
             } => {
-                if !matches!(
-                    self.state.phase,
-                    InternalState::RollbackExecuting {
-                        operation_id: expected
-                    } if expected == operation_id
-                ) {
+                let InternalState::RollbackExecuting {
+                    operation_id: expected,
+                    source_terminal,
+                } = &self.state.phase
+                else {
+                    return;
+                };
+                if *expected != operation_id {
                     return;
                 }
+                let source_terminal = source_terminal.clone();
                 self.state.phase = InternalState::Terminal(match result {
-                    Ok(receipt) if receipt.outcome == RepairTerminalOutcome::RolledBackOriginal => {
+                    Ok(receipt)
+                        if matches!(
+                            receipt.outcome,
+                            RepairTerminalOutcome::RolledBackOriginal
+                                | RepairTerminalOutcome::ManualReconciliationRequired
+                        ) =>
+                    {
                         receipt
+                    }
+                    Err(RepairEngineFailure::ApprovalRejected(stage)) => {
+                        if self.execution_failure_diagnostic.is_none() {
+                            self.execution_failure_diagnostic = Some(stage);
+                        }
+                        source_terminal
+                    }
+                    Err(RepairEngineFailure::ExecutionFailed(stage)) => {
+                        if self.execution_failure_diagnostic.is_none() {
+                            self.execution_failure_diagnostic = Some(stage);
+                        }
+                        failed_receipt()
                     }
                     Ok(_) | Err(_) => failed_receipt(),
                 });

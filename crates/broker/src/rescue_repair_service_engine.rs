@@ -11,8 +11,12 @@ use crate::{
         prepare_rescue_fstab_candidate,
     },
     rescue_fstab_executor::{
-        RescueFstabExecutionError, RescueFstabExecutionOutcome, RescueFstabExecutionReceipt,
-        execute_approved_rescue_fstab, recover_pending_rescue_fstab,
+        ApprovedRescueFstabRollback, PreparedRescueFstabRollback, RescueFstabExecutionError,
+        RescueFstabExecutionOutcome, RescueFstabExecutionReceipt,
+        RescueFstabRollbackExecutionOutcome, RescueFstabRollbackExecutionReceipt,
+        authorize_prepared_rescue_fstab_rollback, execute_approved_rescue_fstab,
+        execute_approved_rescue_fstab_rollback, prepare_rescue_fstab_rollback,
+        recover_pending_rescue_fstab, recover_pending_rescue_fstab_rollback,
     },
     rescue_fstab_preflight_resolver::{
         ProductionRescueFstabPreflightResolver, ProductionRescueFstabTargetGuard,
@@ -26,9 +30,14 @@ use crate::{
     },
 };
 use kernaid_core::{
-    RescueFstabCandidateAdmission, RescueFstabCandidateApproval, Session, SessionMode,
+    RescueFstabCandidateAdmission, RescueFstabCandidateApproval, RescueFstabRollbackAdmission,
+    RescueFstabRollbackApproval, RescueFstabRollbackBinding, RescueFstabRollbackSourceBinding,
+    Session, SessionMode, canonical_rescue_fstab_rollback_plan,
 };
-use kernaid_protocol::rescue_repair::RescueFstabPrepareRequest;
+use kernaid_protocol::{
+    rescue_repair::RescueFstabPrepareRequest, rescue_repair_vault::RepairRollbackBindingV1,
+    rescue_vault::Sha256,
+};
 use std::time::Instant;
 
 /// Closed seam for the post-commit rollback public layer. Implementations must
@@ -64,9 +73,15 @@ pub trait RescueFstabRollbackBackend: Send + 'static {
     ) -> Result<(), RepairEngineFailure>;
 }
 
-/// Uninhabited until the dedicated Vault/root rollback executor is wired.
-pub enum ProductionPreparedRollback {}
-pub enum ProductionApprovedRollback {}
+/// Non-cloneable read-only target/Vault authority plus its staged rollback
+/// admission. No child transaction or writable mount exists at this point.
+pub struct ProductionPreparedRollback {
+    authority: PreparedRescueFstabRollback,
+    admission: RescueFstabRollbackAdmission,
+}
+
+/// Core-approved and durably persisted child authority consumed by execution.
+pub struct ProductionApprovedRollback(ApprovedRescueFstabRollback);
 
 type ProductionPreparedPlan = PreparedRescueFstabPlan<
     ProductionRescueFstabTargetGuard,
@@ -105,6 +120,11 @@ impl RepairPreparationEngine for ProductionRepairEngine {
         &mut self,
         deadline: Instant,
     ) -> Result<Option<RepairTerminalReceipt>, RepairEngineFailure> {
+        if let Some(receipt) = recover_pending_rescue_fstab_rollback(deadline)
+            .map_err(|_| RepairEngineFailure::RecoveryUnavailable)?
+        {
+            return rollback_terminal_receipt(receipt).map(Some);
+        }
         recover_pending_rescue_fstab(deadline)
             .map_err(|_| RepairEngineFailure::RecoveryUnavailable)?
             .map(terminal_receipt)
@@ -268,40 +288,185 @@ impl RescueFstabRollbackBackend for ProductionRepairEngine {
 
     fn prepare_rollback(
         &mut self,
-        _command: &BrokerOwnedRollbackPrepareCommand,
-        _deadline: Instant,
+        command: &BrokerOwnedRollbackPrepareCommand,
+        deadline: Instant,
     ) -> Result<(Self::PreparedRollback, PreparedRollbackDescriptor), RepairEngineFailure> {
-        Err(RepairEngineFailure::RollbackUnavailable)
+        let authority = prepare_rescue_fstab_rollback(
+            command.source().reservation_id(),
+            command.source().transaction_binding_sha256(),
+            deadline,
+        )
+        .map_err(|_| RepairEngineFailure::RollbackUnavailable)?;
+        let source = authority.source();
+        let backup = source.backup();
+        let intent = backup
+            .execution_intent()
+            .ok_or(RepairEngineFailure::RollbackUnavailable)?;
+        let source_plan_id = backup
+            .plan_id()
+            .ok_or(RepairEngineFailure::RollbackUnavailable)?;
+        let source_plan_hash = prefixed_sha256(
+            backup
+                .plan_sha256()
+                .ok_or(RepairEngineFailure::RollbackUnavailable)?,
+        );
+        let source_approval_id = backup
+            .approval_id()
+            .ok_or(RepairEngineFailure::RollbackUnavailable)?;
+        let source_binding = RescueFstabRollbackSourceBinding::new(
+            source_plan_id,
+            &source_plan_hash,
+            source_approval_id,
+            intent.approval_sequence(),
+            backup.reservation_id().as_str(),
+            prefixed_sha256(source.transaction_binding_sha256()),
+            backup.locator(),
+        )
+        .map_err(|_| RepairEngineFailure::RollbackUnavailable)?;
+        let (plan, plan_hash) = canonical_rescue_fstab_rollback_plan(
+            command.plan_id(),
+            command.rollback_id(),
+            authority.target_fingerprint(),
+            command.source().reservation_id(),
+            command.source().transaction_binding_sha256(),
+        )
+        .map_err(|_| RepairEngineFailure::RollbackUnavailable)?;
+        let binding = RescueFstabRollbackBinding::new(
+            command.session_id(),
+            command.rollback_id(),
+            command.plan_id(),
+            &plan_hash,
+            authority.target_fingerprint(),
+            source_binding,
+        )
+        .map_err(|_| RepairEngineFailure::RollbackUnavailable)?;
+        let mut session = Session::new(authority.target_fingerprint(), SessionMode::LinuxRescue);
+        let admission = session
+            .stage_rescue_fstab_rollback(&plan, binding)
+            .map_err(|_| RepairEngineFailure::RollbackUnavailable)?;
+        let descriptor = PreparedRollbackDescriptor::new(
+            command.session_id(),
+            command.rollback_id(),
+            command.plan_id(),
+            &plan_hash,
+            authority.target_fingerprint(),
+            command.source().clone(),
+            source_approval_id,
+            backup
+                .resource_id()
+                .ok_or(RepairEngineFailure::RollbackUnavailable)?,
+            backup.locator(),
+            admission.next_approval_sequence(),
+        )?;
+        Ok((
+            ProductionPreparedRollback {
+                authority,
+                admission,
+            },
+            descriptor,
+        ))
     }
 
     fn approve_rollback(
         &mut self,
         prepared: Self::PreparedRollback,
-        _approval: &BoundRollbackApproval,
-        _deadline: Instant,
+        approval: &BoundRollbackApproval,
+        deadline: Instant,
     ) -> Result<Self::ApprovedRollback, RepairEngineFailure> {
-        match prepared {}
+        let ProductionPreparedRollback {
+            authority,
+            mut admission,
+        } = prepared;
+        let proof = RescueFstabRollbackApproval::new(
+            admission.binding().clone(),
+            approval.approval_id(),
+            approval.approval_sequence(),
+            approval.typed_confirmation(),
+        )
+        .map_err(|_| {
+            RepairEngineFailure::ApprovalRejected(RepairExecutionFailureStage::ApprovalProof)
+        })?;
+        if proof.binding().session_id() != approval.session_id()
+            || proof.binding().rollback_id() != approval.rollback_id()
+            || proof.binding().plan_id() != approval.plan_id()
+            || proof.binding().plan_hash() != approval.plan_hash()
+            || proof.binding().source().reservation_id() != approval.source().reservation_id()
+            || proof.binding().source().transaction_binding_sha256()
+                != approval.source().transaction_binding_sha256()
+        {
+            return Err(RepairEngineFailure::ApprovalRejected(
+                RepairExecutionFailureStage::ApprovalBinding,
+            ));
+        }
+        admission.approve(&proof).map_err(|_| {
+            RepairEngineFailure::ApprovalRejected(RepairExecutionFailureStage::ApprovalAdmission)
+        })?;
+        let binding = RepairRollbackBindingV1::new(
+            authority.source(),
+            admission.binding().plan_id(),
+            parse_prefixed_sha256(admission.binding().plan_hash())?,
+            admission
+                .approval_id()
+                .ok_or(RepairEngineFailure::Internal)?,
+            parse_prefixed_sha256(
+                admission
+                    .approval_sha256()
+                    .ok_or(RepairEngineFailure::Internal)?,
+            )?,
+            admission.next_approval_sequence(),
+        )
+        .map_err(|_| {
+            RepairEngineFailure::ApprovalRejected(RepairExecutionFailureStage::ApprovalAuthorize)
+        })?;
+        match authorize_prepared_rescue_fstab_rollback(
+            authority,
+            approval.rollback_id(),
+            binding,
+            deadline,
+        ) {
+            Ok(approved) => Ok(ProductionApprovedRollback(approved)),
+            Err(RescueFstabExecutionError::AuthorizationNotPersisted) => {
+                Err(RepairEngineFailure::ApprovalRejected(
+                    RepairExecutionFailureStage::ApprovalAuthorize,
+                ))
+            }
+            Err(error) => Err(RepairEngineFailure::ExecutionFailed(map_execution_failure(
+                error,
+            ))),
+        }
     }
 
     fn execute_rollback(
         &mut self,
         approved: Self::ApprovedRollback,
-        _deadline: Instant,
+        deadline: Instant,
     ) -> Result<RepairTerminalReceipt, RepairEngineFailure> {
-        match approved {}
+        match execute_approved_rescue_fstab_rollback(approved.0, deadline) {
+            Ok(receipt) => rollback_terminal_receipt(receipt),
+            Err(error) => match recover_pending_rescue_fstab_rollback(deadline) {
+                Ok(Some(receipt)) => rollback_terminal_receipt(receipt),
+                Ok(None) | Err(_) => Err(RepairEngineFailure::ExecutionFailed(
+                    map_execution_failure(error),
+                )),
+            },
+        }
     }
 
     fn cancel_prepared_rollback(
         prepared: Self::PreparedRollback,
         _deadline: Instant,
     ) -> Result<(), RepairEngineFailure> {
-        match prepared {}
+        drop(prepared);
+        Ok(())
     }
 }
 
 fn map_execution_failure(error: RescueFstabExecutionError) -> RepairExecutionFailureStage {
     match error {
         RescueFstabExecutionError::InvalidAuthority => RepairExecutionFailureStage::Authority,
+        RescueFstabExecutionError::AuthorizationNotPersisted => {
+            RepairExecutionFailureStage::ApprovalAuthorize
+        }
         RescueFstabExecutionError::TargetChanged | RescueFstabExecutionError::UnsafeTarget => {
             RepairExecutionFailureStage::Target
         }
@@ -394,6 +559,35 @@ fn terminal_receipt(
         receipt.transaction_binding_sha256(),
     )?
     .with_execution_failure_stage(execution_failure_stage)
+}
+
+fn rollback_terminal_receipt(
+    receipt: RescueFstabRollbackExecutionReceipt,
+) -> Result<RepairTerminalReceipt, RepairEngineFailure> {
+    let outcome = match receipt.outcome() {
+        RescueFstabRollbackExecutionOutcome::RolledBackOriginal => {
+            RepairTerminalOutcome::RolledBackOriginal
+        }
+        RescueFstabRollbackExecutionOutcome::ManualReconciliationRequired => {
+            RepairTerminalOutcome::ManualReconciliationRequired
+        }
+    };
+    terminal_receipt_from_executor_parts(
+        outcome,
+        receipt.source_reservation_id(),
+        receipt.source_transaction_binding_sha256(),
+    )
+}
+
+fn prefixed_sha256(value: &Sha256) -> String {
+    format!("sha256:{}", value.as_str())
+}
+
+fn parse_prefixed_sha256(value: &str) -> Result<Sha256, RepairEngineFailure> {
+    value
+        .strip_prefix("sha256:")
+        .ok_or(RepairEngineFailure::Internal)
+        .and_then(|digest| Sha256::parse(digest).map_err(|_| RepairEngineFailure::Internal))
 }
 
 fn terminal_receipt_from_executor_parts(
