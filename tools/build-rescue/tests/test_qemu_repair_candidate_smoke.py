@@ -199,6 +199,14 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
         )
         self.assertLessEqual(len(generated), 16 * 1024)
         compile(generated, "<rollback-source>", "exec")
+        self.assertIn(b"deadline=time.monotonic()+840", generated)
+        self.assertIn(
+            b"KERNAID_QEMU_PROVIDER_PROOF_FAILURE_V1 stage=repair-rollback checkpoint=",
+            generated,
+        )
+        for checkpoint in controller.LIFECYCLE.PROVIDER_PROOF_ROLLBACK_CHECKPOINTS:
+            self.assertIn(checkpoint.encode("ascii"), generated)
+        self.assertIn("timeout=900.0", CONTROLLER.read_text(encoding="utf-8"))
 
         for required in (
             'ROLLBACK_API="kernaid.dev/rescue-repair-service/v1alpha2"',

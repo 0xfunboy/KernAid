@@ -225,6 +225,25 @@ PROVIDER_PROOF_REPAIR_CHECKPOINTS = (
     "execute-error-recovery",
     "execute-contract",
 )
+PROVIDER_PROOF_ROLLBACK_CHECKPOINTS = (
+    "service-ready",
+    "inventory-ready",
+    "target-selection",
+    "target-identity",
+    "apply-prepare",
+    "apply-prepare-terminal",
+    "apply-contract",
+    "apply-approve",
+    "apply-terminal",
+    "apply-terminal-contract",
+    "rollback-status",
+    "rollback-prepare",
+    "rollback-prepare-terminal",
+    "rollback-contract",
+    "rollback-approve",
+    "rollback-terminal",
+    "rollback-terminal-contract",
+)
 PROVIDER_PROOF_UI_ERROR_CHECKPOINTS = (
     ("busy", "outcome-busy"),
     ("invalid_request", "outcome-invalid-request"),
@@ -2717,6 +2736,9 @@ def run_guest_proof(
     ) or (
         failure_stage == "repair-apply"
         and failure_checkpoint in PROVIDER_PROOF_REPAIR_CHECKPOINTS
+    ) or (
+        failure_stage == "repair-rollback"
+        and failure_checkpoint in PROVIDER_PROOF_ROLLBACK_CHECKPOINTS
     )
     if failure_stage != stage or not closed_checkpoint:
         raise ClosedFailure("provider-proof", "marker-invalid")
