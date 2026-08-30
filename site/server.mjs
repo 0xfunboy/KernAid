@@ -34,9 +34,15 @@ const configuredArtifacts = Object.freeze({
     sha256: content.release.retailSha256,
   }),
   repairCandidate: loadArtifactSnapshot(
-    repairCandidatePath,
-    repairCandidateSha256Path,
+    content.repairCandidate.available ? repairCandidatePath : "",
+    content.repairCandidate.available ? repairCandidateSha256Path : "",
     "repair candidate ISO",
+    content.repairCandidate.available
+      ? {
+          bytes: content.repairCandidate.bytes,
+          sha256: content.repairCandidate.sha256,
+        }
+      : null,
   ),
 });
 const publicFiles = new Map([
@@ -126,6 +132,24 @@ function loadContent(filePath) {
   for (const key of ["name", "channel", "sourceCommit", "artifactVersion", "workflowUrl", "downloadName", "checksumName", "qualification", "warning"]) {
     if (typeof parsed.repairCandidate[key] !== "string" || !parsed.repairCandidate[key].trim()) {
       throw new Error(`content.json repairCandidate.${key} must be a non-empty string`);
+    }
+  }
+  if (typeof parsed.repairCandidate.available !== "boolean") {
+    throw new Error("content.json repairCandidate.available must be boolean");
+  }
+  if (parsed.repairCandidate.available) {
+    if (
+      !Number.isSafeInteger(parsed.repairCandidate.bytes) ||
+      parsed.repairCandidate.bytes < 1
+    ) {
+      throw new Error(
+        "content.json repairCandidate.bytes must be a positive safe integer when available",
+      );
+    }
+    if (!/^[a-f0-9]{64}$/.test(parsed.repairCandidate.sha256)) {
+      throw new Error(
+        "content.json repairCandidate.sha256 must be a lowercase digest when available",
+      );
     }
   }
   for (const key of ["downloadName", "checksumName"]) {
@@ -428,6 +452,9 @@ function renderPrivate() {
   const retail = artifactView(configuredArtifacts.retail);
   const iso = artifactView(configuredArtifacts.iso);
   const repairCandidate = artifactView(configuredArtifacts.repairCandidate);
+  const repairCandidateReady =
+    content.repairCandidate.available &&
+    configuredArtifacts.repairCandidate.artifact !== null;
   const release = content.release;
   const candidate = content.repairCandidate;
   return render(privateTemplate, {
@@ -449,6 +476,9 @@ function renderPrivate() {
     modified: escapeHtml(retail.modified),
     qualification: escapeHtml(release.qualification),
     repairCandidateArtifactState: repairCandidate.state,
+    repairCandidateActions: repairCandidateReady
+      ? '<a class="button ghost" href="/private/downloads/repair-candidate">Scarica ISO repair candidate</a><a class="button ghost" href="/private/downloads/repair-candidate-checksum">Scarica SHA-256 candidate</a>'
+      : '<span class="release-status status-unavailable"><i></i>Download disabilitato finché il gate non è verde</span>',
     repairCandidateArtifactVersion: escapeHtml(candidate.artifactVersion),
     repairCandidateChannel: escapeHtml(candidate.channel),
     repairCandidateChecksumName: escapeHtml(candidate.checksumName),
@@ -463,6 +493,9 @@ function renderPrivate() {
     repairCandidateWarning: escapeHtml(candidate.warning),
     repairCandidateWorkflowRunId: escapeHtml(candidate.workflowRunId),
     repairCandidateWorkflowUrl: escapeHtml(candidate.workflowUrl),
+    repairCandidateVerify: repairCandidateReady
+      ? `<p>Linux — ISO repair candidate</p><code>sha256sum -c ${escapeHtml(candidate.checksumName)}</code>`
+      : '<p>Repair candidate — verifica non disponibile: artefatto non qualificato.</p>',
     size: escapeHtml(retail.size),
     sourceCommit: escapeHtml(release.sourceCommit),
     stateClass: retail.stateClass,
@@ -678,6 +711,10 @@ async function handleRequest(req, res) {
     return;
   }
   if (url.pathname === "/private/downloads/repair-candidate") {
+    if (!content.repairCandidate.available) {
+      send(req, res, 404, "Candidate non disponibile.\n", { "Content-Type": "text/plain; charset=utf-8" }, { isPrivate: true });
+      return;
+    }
     serveArtifact(
       req,
       res,
@@ -687,6 +724,10 @@ async function handleRequest(req, res) {
     return;
   }
   if (url.pathname === "/private/downloads/repair-candidate-checksum") {
+    if (!content.repairCandidate.available) {
+      send(req, res, 404, "Candidate non disponibile.\n", { "Content-Type": "text/plain; charset=utf-8" }, { isPrivate: true });
+      return;
+    }
     serveChecksum(
       req,
       res,

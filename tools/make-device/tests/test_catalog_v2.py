@@ -198,16 +198,33 @@ class CatalogV2Tests(unittest.TestCase):
         Draft202012Validator(schema).validate(catalog_document)
 
         catalog = catalog_v2.parse_trust_catalog_v2(catalog_raw)
-        self.assertEqual(catalog.revision, 6)
+        self.assertEqual(catalog.revision, 7)
         self.assertEqual(len(catalog.images), 1)
         image = catalog.images[0]
         self.assertEqual(image.artifact_name, "KernAid-Rescue-amd64.iso")
-        self.assertEqual(image.artifact_version, "ci-33299917079-1")
+        self.assertEqual(image.artifact_version, "ci-33307231489-1")
         self.assertEqual(
             image.sha256,
-            "327df21ecd9e833f61fc462deb3a4c919fb37517a2124891d79388965713d5ab",
+            "7eb61dc111c00a7fc925371fa7af01eb44d64b840db80bb8476be75c4039c396",
         )
         self.assertEqual(image.size, 1_223_540_736)
+        run_url = "https://github.com/0xfunboy/KernAid/actions/runs/33307231489"
+        self.assertEqual(image.bios_usb_boot.workflow_run_id, 33_307_231_489)
+        self.assertEqual(image.bios_usb_boot.workflow_run_url, run_url)
+        self.assertEqual(
+            image.bios_usb_boot.log_sha256,
+            "b5bbcacc1f502891bfd0e8edaa3bf765def7c6ca5801f9d347316ca915ce1144",
+        )
+        self.assertEqual(image.uefi_usb_boot.workflow_run_id, 33_307_231_489)
+        self.assertEqual(image.uefi_usb_boot.workflow_run_url, run_url)
+        self.assertEqual(
+            image.uefi_usb_boot.log_sha256,
+            "3ab47b33356b49724a979c40ea60137f8d91d788f13f5495e3bb36eab93fab4f",
+        )
+        self.assertEqual(image.bios_vault.workflow_run_id, 33_307_231_489)
+        self.assertEqual(image.bios_vault.log_sha256, image.bios_usb_boot.log_sha256)
+        self.assertEqual(image.uefi_vault.workflow_run_id, 33_307_231_489)
+        self.assertEqual(image.uefi_vault.log_sha256, image.uefi_usb_boot.log_sha256)
         layout = catalog_v2.load_device_layout(MANIFEST_PATH)
         self.assertEqual(
             catalog.authorize(

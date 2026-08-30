@@ -25,8 +25,10 @@ QEMU-only; physical PCs, firmware and USB media are unqualified. It
 is not an Apple-silicon boot image, and Intel Mac external boot remains a
 physical validation item.
 
-The current stable candidate is release `0.1.0-internal.4`, source commit
-`93b5ed370cc11a50301b0fc4b17846afaa54f8c7`, Rescue run `33299917079`.
+The current stable candidate is immutable release `0.1.0-internal.5`, source
+commit `64db3bcf4050df01e96e1b55e08750b6957df801`, Rescue run `33307231489`
+attempt 1. Release Channel run `33310633658` published it as sequence 5, and
+trusted catalog v2 revision 7 authorizes only this exact image.
 It was built with repair disabled and passed the fail-closed packaging gate
 that proves repair UI, handlers, units and write surfaces are absent. It remains
 a physical-test candidate, not a supported repair medium.
@@ -84,11 +86,15 @@ release bundle.
 ### Windows: physical boot qualification only
 
 For workflow releases whose qualification manifest contains `retailImage`, use
-`KernAid-Rescue-0.1.0-internal.4-x86_64-retail.img.xz` directly with a current
+`KernAid-Rescue-0.1.0-internal.5-x86_64-retail.img.xz` directly with a current
 Rufus in raw/DD mode and verify its adjacent checksum first. The compressed
 image expands to exactly 32,000,000,000 bytes and carries an all-zero p3 for
 first-boot Vault provisioning; its manifest records the compressed, expanded
-and p3 digests.
+and p3 digests. The compressed file is `1,191,686,132` bytes with SHA-256
+`90a9832a59a20246649289a18f42bf47d5ab7612fb9371fced38439254d510ae`.
+The matching ISO is `1,223,540,736` bytes with SHA-256
+`7eb61dc111c00a7fc925371fa7af01eb44d64b840db80bb8476be75c4039c396`;
+do not substitute the ISO when following the Rufus retail-image procedure.
 
 Use only a replacement physical-test candidate explicitly identified as active
 in `docs/CURRENT_STATUS.md`. The previous `0d61eac` diagnosis-only candidate
@@ -104,7 +110,7 @@ but one successful device does not qualify every USB or firmware combination.
    first 32,000,000,000 bytes, but a larger device may retain data beyond that
    boundary; this procedure is not whole-media sanitization.
 2. Verify the downloaded `.img.xz` in PowerShell with
-   `Get-FileHash .\KernAid-Rescue-0.1.0-internal.4-x86_64-retail.img.xz -Algorithm SHA256`
+   `Get-FileHash .\KernAid-Rescue-0.1.0-internal.5-x86_64-retail.img.xz -Algorithm SHA256`
    and compare the complete digest with its adjacent `.sha256` file and the
    exact value in the qualification manifest.
 3. Write that exact `.img.xz` with Rufus. If Rufus offers a mode choice, choose
@@ -261,9 +267,10 @@ These engineering installers are not code-signed. Operating-system warnings are 
 The current workflow builds the credential companion from a Cargo package that
 is separate from the Tauri application and inspects every produced package
 format. The run must fail if `kernaid-provider-key` appears inside a Desk DEB,
-RPM, AppImage, macOS APP/DMG or Windows MSI/NSIS installer. This is a source and
-workflow property until a post-change run completes; the older packaging run
-cited in the status document does not prove this new gate.
+RPM, AppImage, macOS APP/DMG or Windows MSI/NSIS installer. Desktop run
+`33306689037` attempt 1 passed all four platform jobs and these package gates
+from the same exact source used by immutable release `0.1.0-internal.5`. This
+still does not qualify installation or the complete GUI on physical machines.
 
 After diagnosis, Desk offers two downloads. Keep the machine-readable JSON as
 the authoritative session artifact. With secure audit active it is a signed
@@ -317,7 +324,7 @@ The supported workshop procedure in this section is Resident-only. Rescue
 contains feature-gated persistent-vault OpenAI plumbing and a loopback
 UI-server relay. The current exact candidate passed the full virtual workflow,
 including both privileged BIOS and UEFI lifecycle jobs, and trusted catalog v2
-revision 6 authorizes that ISO. Physical media and live provider TLS with a
+revision 7 authorizes that ISO. Physical media and live provider TLS with a
 real account are still not qualified. Do not present Rescue OpenAI as supported
 on customer media yet. The Resident credential companion is distributed as a
 separate platform-matched artifact. Use a post-change run whose package gate

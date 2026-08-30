@@ -1,16 +1,20 @@
 # Rescue Linux repair v1
 
-Status: **implemented, off-default private candidate; one exact-image BIOS
-happy path qualified in QEMU; not promoted**. The default/stable image remains
-diagnosis-only. This document describes the gated candidate implementation,
-not a claim that a shipping image can repair a customer filesystem.
+Status: **implemented, off-default private candidate; exact-image BIOS/UEFI
+boot and apply passed in QEMU, but the UEFI post-commit rollback gate failed;
+unavailable through the product site/Release Channel and not promoted**. The
+default/stable image remains diagnosis-only.
+This document describes the gated candidate implementation, not a claim that a
+shipping image can repair a customer filesystem.
 
-The currently listed private repair ISO was built from
-[`c281670b5323b6da223209686fe55662d1074b8c`](https://github.com/0xfunboy/KernAid/commit/c281670b5323b6da223209686fe55662d1074b8c)
-by [repair run 33237233044](https://github.com/0xfunboy/KernAid/actions/runs/33237233044).
-It contains the separate read/write helpers, state-version refresh after the
-write helper consumes the single-use Vault lease, and tightened `repaird`
-sandbox described below.
+The latest candidate was built from
+[`64db3bcf4050df01e96e1b55e08750b6957df801`](https://github.com/0xfunboy/KernAid/commit/64db3bcf4050df01e96e1b55e08750b6957df801)
+by [repair run 33306646523, attempt 1](https://github.com/0xfunboy/KernAid/actions/runs/33306646523).
+That run is terminal failure: the formal candidate ISO publish step was
+skipped, while a one-day Actions forensics artifact retained ISO and checksum
+only for CI investigation. Nothing was promoted to the product site or Release
+Channel. The same source's immutable `0.1.0-internal.5` stable Rescue release
+was built with repair disabled and remains diagnosis-only.
 
 ## First supported action
 
@@ -28,18 +32,21 @@ select the entry, path, command or replacement bytes.
 
 ## Exact-image evidence
 
-The private ISO is `1,224,736,768` bytes with SHA-256
-`9b9b386de86c970f6c6a54448b42a588824e47a2edc07973c3bc8ffdcd9d749c`.
-The same bytes passed ordinary QEMU boot smoke under BIOS and UEFI. Under BIOS
-they also completed `linux.fstab.disable-missing-uuid.v1` on one disposable
-direct-leaf ext4 fixture with a distinct LUKS2/ext4 Vault, typed single-use
-approval, exact expected-after bytes, terminal `committed`, unchanged unrelated
-sentinel and immutable ISO prefix.
+Run `33306646523` built and checksum-verified one private image, then passed
+ordinary QEMU boot smoke under BIOS and UEFI. The same run passed
+`linux.fstab.disable-missing-uuid.v1` apply under both BIOS and UEFI on
+disposable direct-leaf ext4 fixtures with a distinct LUKS2/ext4 Vault. It
+verified the exact expected-after bytes, terminal `committed`, unchanged
+unrelated sentinel and immutable ISO prefix.
 
-This evidence does not cover UEFI apply or rollback, injected faults,
-automatic restore, process interruption, reboot reconciliation, destructive
-power loss, physical media/hardware/firmware, Secure Boot, customer data or
-production use.
+The next gate, UEFI post-commit rollback, failed at the fixed sanitized marker
+`repair-rollback-service-ready`. The subsequent restart-reconciliation gate was
+skipped. Because the workflow failed, its formal ISO publish step was skipped;
+only a temporary Actions forensics artifact retained ISO and checksum. There is
+no promoted product download or release digest to trust. The successful
+boot/apply steps do not qualify rollback, restart reconciliation, injected
+faults, automatic restore, process interruption, destructive power loss,
+physical media/hardware/firmware, Secure Boot, customer data or production use.
 
 ## Trust boundaries
 
@@ -238,14 +245,14 @@ Rescue image or default broker may enable it until all of these are true:
 
 - disposable two-disk QEMU tests cover stale targets, tampered backups,
   cancellation, process termination, automatic restore and reconciliation;
-- the exact image extends its current BIOS happy-path evidence to UEFI apply
-  and BIOS/UEFI repair/rollback and failure-path qualification; and
+- an exact image passes BIOS/UEFI repair plus rollback, restart reconciliation
+  and failure-path qualification in one complete run; and
 - physical USB testing proves separate-device backup and power-loss recovery
   on the supported hardware matrix;
 - Secure Boot is qualified for the exact promoted image.
 
 In particular, Phase 0 remains diagnosis-only under `AGENTS.md`. A production
 handler cannot become shipping merely by enabling this candidate feature.
-Promotion requires the remaining QEMU repair, destructive power-loss, physical
-and Secure Boot qualification gates, an explicit policy/release decision and
-an exact candidate-image promotion.
+Promotion requires the remaining QEMU rollback/restart/failure-path,
+destructive power-loss, physical and Secure Boot qualification gates, an
+explicit policy/release decision and an exact candidate-image promotion.
