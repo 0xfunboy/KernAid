@@ -301,6 +301,196 @@ def _pipe_capability(payload: bytes) -> int:
     return read_descriptor
 
 
+def _valid_rollback_write_lease() -> tuple[dict[str, object], str, str]:
+    reservation = "B-" + "1" * 32
+    rollback_id = "RB-" + "2" * 32
+    source_plan_id = "P-source-plan-1"
+    source_plan_sha256 = "3" * 64
+    source_approval_id = "A-source-approval-1"
+    source_approval_sha256 = "4" * 64
+    rollback_plan_id = "P-rollback-plan-1"
+    rollback_plan_sha256 = "5" * 64
+    rollback_approval_id = "A-rollback-approval-1"
+    rollback_approval_sha256 = "6" * 64
+    before_sha256 = "7" * 64
+    after_sha256 = "8" * 64
+    boot_epoch_sha256 = "9" * 64
+    target_recovery_fingerprint = "recovery:" + "a" * 64
+    metadata = {
+        "mode": 0o644,
+        "uid": 0,
+        "gid": 0,
+        "xattrs": "none",
+        "posixAcl": "none",
+    }
+    metadata_sha256 = handoff._hash_fields(
+        b"KERNAID-REPAIR-FILE-METADATA-V1\0",
+        [
+            metadata["mode"].to_bytes(4, "big"),
+            metadata["uid"].to_bytes(4, "big"),
+            metadata["gid"].to_bytes(4, "big"),
+            b"\0",
+            b"\0",
+        ],
+    )
+    lock_identity = "lock:" + handoff._hash_fields(
+        b"kernaid:rescue-fstab:target-lock:v2\0",
+        [target_recovery_fingerprint.encode(), handoff.REPAIR_RESOURCE.encode()],
+    )
+    intent = {
+        "actionId": handoff.REPAIR_ACTION,
+        "sessionId": "S-source-session-1",
+        "approvalSequence": 1,
+        "targetId": "target:fixture-1",
+        "scanFingerprint": "scan:" + "b" * 64,
+        "targetFingerprint": "c" * 64,
+        "targetPhysicalParentFingerprint": "d" * 64,
+        "targetRecoveryFingerprint": target_recovery_fingerprint,
+        "lockIdentity": lock_identity,
+        "beforeSha256": before_sha256,
+        "afterSha256": after_sha256,
+        "diffSha256": "e" * 64,
+        "observedUuidSetSha256": "f" * 64,
+        "beforeMetadata": metadata,
+    }
+    source_physical_parent_sha256 = "0" * 63 + "1"
+    expected_backup_size = 512
+    reserved_bytes = 4096
+    draft_binding_sha256 = handoff._hash_fields(
+        b"KERNAID-REPAIR-RESERVATION-V1\0",
+        [
+            intent["sessionId"].encode(),
+            intent["targetId"].encode(),
+            bytes.fromhex(intent["targetFingerprint"]),
+            target_recovery_fingerprint.encode(),
+            bytes.fromhex(before_sha256),
+            bytes.fromhex(metadata_sha256),
+            expected_backup_size.to_bytes(8, "big"),
+            reserved_bytes.to_bytes(8, "big"),
+        ],
+    )
+    intent_binding_sha256 = handoff._hash_fields(
+        b"KERNAID-REPAIR-EXECUTION-INTENT-V1\0",
+        [
+            intent["actionId"].encode(),
+            intent["sessionId"].encode(),
+            intent["approvalSequence"].to_bytes(8, "big"),
+            intent["targetId"].encode(),
+            intent["scanFingerprint"].encode(),
+            bytes.fromhex(intent["targetFingerprint"]),
+            bytes.fromhex(intent["targetPhysicalParentFingerprint"]),
+            target_recovery_fingerprint.encode(),
+            lock_identity.encode(),
+            bytes.fromhex(before_sha256),
+            bytes.fromhex(after_sha256),
+            bytes.fromhex(intent["diffSha256"]),
+            bytes.fromhex(intent["observedUuidSetSha256"]),
+            bytes.fromhex(metadata_sha256),
+        ],
+    )
+    backup = {
+        "state": "durable",
+        "reservationId": reservation,
+        "draftBindingSha256": draft_binding_sha256,
+        "locator": "vault://repair/" + reservation,
+        "vaultId": "V-" + "1" * 32,
+        "vaultIdentityFingerprint": "2" * 64,
+        "physicalParentFingerprint": source_physical_parent_sha256,
+        "reservedBytes": reserved_bytes,
+        "backupSize": expected_backup_size,
+        "expectedBackupSha256": before_sha256,
+        "metadataSha256": metadata_sha256,
+        "planId": source_plan_id,
+        "planSha256": source_plan_sha256,
+        "approvalId": source_approval_id,
+        "approvalSha256": source_approval_sha256,
+        "resourceId": handoff.REPAIR_RESOURCE,
+        "resourceSha256": before_sha256,
+        "executionIntent": intent,
+    }
+    source_binding_sha256 = handoff._hash_fields(
+        b"KERNAID-REPAIR-TRANSACTION-V1\0",
+        [
+            reservation.encode(),
+            bytes.fromhex(draft_binding_sha256),
+            backup["locator"].encode(),
+            backup["vaultId"].encode(),
+            bytes.fromhex(backup["vaultIdentityFingerprint"]),
+            bytes.fromhex(source_physical_parent_sha256),
+            reserved_bytes.to_bytes(8, "big"),
+            expected_backup_size.to_bytes(8, "big"),
+            bytes.fromhex(before_sha256),
+            bytes.fromhex(metadata_sha256),
+            source_plan_id.encode(),
+            bytes.fromhex(source_plan_sha256),
+            source_approval_id.encode(),
+            bytes.fromhex(source_approval_sha256),
+            handoff.REPAIR_RESOURCE.encode(),
+            bytes.fromhex(before_sha256),
+            bytes.fromhex(intent_binding_sha256),
+        ],
+    )
+    rollback_binding = {
+        "actionId": handoff.ROLLBACK_ACTION,
+        "planId": rollback_plan_id,
+        "planSha256": rollback_plan_sha256,
+        "approvalId": rollback_approval_id,
+        "approvalSha256": rollback_approval_sha256,
+        "approvalSequence": 2,
+    }
+    rollback_transaction_binding_sha256 = handoff._hash_fields(
+        b"KERNAID-REPAIR-ROLLBACK-TRANSACTION-V1\0",
+        [
+            rollback_id.encode(),
+            reservation.encode(),
+            bytes.fromhex(source_binding_sha256),
+            handoff.ROLLBACK_ACTION.encode(),
+            rollback_plan_id.encode(),
+            bytes.fromhex(rollback_plan_sha256),
+            rollback_approval_id.encode(),
+            bytes.fromhex(rollback_approval_sha256),
+            (2).to_bytes(8, "big"),
+        ],
+    )
+    lease_binding_sha256 = handoff._hash_fields(
+        b"KERNAID-REPAIR-ROLLBACK-WRITE-LEASE-V1\0",
+        [
+            handoff.VAULT_ROLLBACK_WRITE_CAPABILITY.encode(),
+            bytes.fromhex(rollback_transaction_binding_sha256),
+            bytes.fromhex(boot_epoch_sha256),
+            target_recovery_fingerprint.encode(),
+            lock_identity.encode(),
+        ],
+    )
+    return (
+        {
+            "capability": handoff.VAULT_ROLLBACK_WRITE_CAPABILITY,
+            "bootEpochSha256": boot_epoch_sha256,
+            "leaseBindingSha256": lease_binding_sha256,
+            "transaction": {
+                "phase": "pending",
+                "rollbackId": rollback_id,
+                "rollbackTransactionBindingSha256": rollback_transaction_binding_sha256,
+                "source": {
+                    "phase": "resolved",
+                    "transactionBindingSha256": source_binding_sha256,
+                    "backup": backup,
+                    "resolution": {
+                        "outcome": "committed-after",
+                        "targetState": "after",
+                        "observedResourceSha256": after_sha256,
+                        "observedMetadataSha256": metadata_sha256,
+                        "mountCleanupVerified": True,
+                    },
+                },
+                "binding": rollback_binding,
+            },
+        },
+        rollback_id,
+        rollback_transaction_binding_sha256,
+    )
+
+
 class RepairTargetHandoffTests(unittest.TestCase):
     def test_candidate_is_packaged_but_not_activated(self) -> None:
         systemd = (
@@ -506,8 +696,21 @@ class RepairTargetHandoffTests(unittest.TestCase):
                          "reservationId": "B-" + "a" * 32,
                          "transactionBindingSha256": "b" * 64}
         self.assertEqual(handoff._decode_request(handoff._canonical(write_request), "write"), write_request)
+        rollback_request = {
+            "apiVersion": handoff.API_VERSION,
+            "requestId": REQUEST["requestId"],
+            "operation": handoff.ROLLBACK_WRITE_OPERATION,
+            "rollbackId": "RB-" + "c" * 32,
+            "rollbackTransactionBindingSha256": "d" * 64,
+        }
+        self.assertEqual(
+            handoff._decode_request(handoff._canonical(rollback_request), "write"),
+            rollback_request,
+        )
         with self.assertRaises(handoff.HandoffFailure):
             handoff._decode_request(handoff._canonical(write_request), "readonly")
+        with self.assertRaises(handoff.HandoffFailure):
+            handoff._decode_request(handoff._canonical(rollback_request), "readonly")
         with self.assertRaises(handoff.HandoffFailure):
             handoff._decode_request(handoff._canonical(REQUEST), "write")
 
@@ -581,6 +784,177 @@ class RepairTargetHandoffTests(unittest.TestCase):
             with self.assertRaises(handoff.HandoffFailure):
                 handoff._consume_write_lease(reservation, binding, handoff.time.monotonic() + 1)
         self.assertEqual(mocked.call_count, 1)
+
+    def test_rollback_write_lease_fixture_validates_complete_nested_authority(
+        self,
+    ) -> None:
+        payload, rollback_id, rollback_binding = _valid_rollback_write_lease()
+        source = payload["transaction"]["source"]
+        result = handoff._validate_rollback_write_lease(
+            payload, rollback_id, rollback_binding
+        )
+        self.assertEqual(
+            result,
+            {
+                "recoveryFingerprint": "recovery:" + "a" * 64,
+                "leaseBindingSha256": payload["leaseBindingSha256"],
+                "sourceReservationId": source["backup"]["reservationId"],
+                "sourceTransactionBindingSha256": source[
+                    "transactionBindingSha256"
+                ],
+            },
+        )
+
+        for mutate in (
+            lambda value: value["transaction"]["source"]["resolution"].update(
+                {"outcome": "closed-before-restored"}
+            ),
+            lambda value: value["transaction"]["binding"].update(
+                {"planSha256": "0" * 64}
+            ),
+            lambda value: value["transaction"]["binding"].update(
+                {"planId": value["transaction"]["source"]["backup"]["planId"]}
+            ),
+            lambda value: value["transaction"]["binding"].update(
+                {
+                    "planSha256": value["transaction"]["source"]["backup"][
+                        "planSha256"
+                    ]
+                }
+            ),
+            lambda value: value["transaction"].update(
+                {"sourceTransactionBindingSha256": "f" * 64}
+            ),
+        ):
+            tampered = json.loads(json.dumps(payload))
+            mutate(tampered)
+            with self.subTest(tampered=tampered["transaction"].keys()):
+                with self.assertRaises(handoff.HandoffFailure):
+                    handoff._validate_rollback_write_lease(
+                        tampered, rollback_id, rollback_binding
+                    )
+
+    def test_rollback_vault_consume_allows_exactly_one_authenticated_stale(
+        self,
+    ) -> None:
+        payload, rollback_id, rollback_binding = _valid_rollback_write_lease()
+        replies = [
+            {
+                "apiVersion": handoff.VAULT_ROLLBACK_API_VERSION,
+                "requestId": "placeholder",
+                "stateVersion": 17,
+                "operation": handoff.VAULT_ROLLBACK_WRITE_OPERATION,
+                "outcome": "error",
+                "error": "STALE_STATE",
+            },
+            {
+                "apiVersion": handoff.VAULT_ROLLBACK_API_VERSION,
+                "requestId": "placeholder",
+                "stateVersion": 18,
+                "operation": handoff.VAULT_ROLLBACK_WRITE_OPERATION,
+                "outcome": "ok",
+                "payload": payload,
+            },
+        ]
+        requests: list[dict[str, object]] = []
+
+        def exchange(request, _deadline):
+            requests.append(request)
+            response = replies.pop(0)
+            return dict(response, requestId=request["requestId"])
+
+        with (
+            patch.object(handoff, "_vault_exchange", side_effect=exchange),
+            patch.object(handoff, "_consume_write_lease") as repair_consume,
+        ):
+            result = handoff._consume_rollback_write_lease(
+                rollback_id, rollback_binding, handoff.time.monotonic() + 1
+            )
+        repair_consume.assert_not_called()
+        self.assertEqual([item["expectedStateVersion"] for item in requests], [0, 17])
+        self.assertNotEqual(requests[0]["requestId"], requests[1]["requestId"])
+        for request in requests:
+            self.assertEqual(request["apiVersion"], handoff.VAULT_ROLLBACK_API_VERSION)
+            self.assertEqual(request["operation"], handoff.VAULT_ROLLBACK_WRITE_OPERATION)
+            self.assertEqual(
+                request["payload"],
+                {
+                    "selector": {
+                        "kind": "exact",
+                        "rollbackId": rollback_id,
+                        "rollbackTransactionBindingSha256": rollback_binding,
+                    }
+                },
+            )
+        self.assertEqual(result["leaseBindingSha256"], payload["leaseBindingSha256"])
+
+    def test_rollback_acquire_consumes_only_rollback_lease(self) -> None:
+        targets = FakeTargets()
+        service = handoff.RepairTargetHandoff(targets)
+        request = {
+            "apiVersion": handoff.API_VERSION,
+            "requestId": REQUEST["requestId"],
+            "operation": handoff.ROLLBACK_WRITE_OPERATION,
+            "rollbackId": "RB-" + "a" * 32,
+            "rollbackTransactionBindingSha256": "b" * 64,
+        }
+        claims = {
+            "parentMajor": 8,
+            "parentMinor": 0,
+            "diskSequence": 77,
+            "mediaSectorCount": 4096,
+            "logicalSectorBytes": 512,
+            "leafSectorCount": 2048,
+        }
+        lease = {
+            "recoveryFingerprint": RECOVERY_FINGERPRINT,
+            "leaseBindingSha256": "c" * 64,
+            "sourceReservationId": "B-" + "d" * 32,
+            "sourceTransactionBindingSha256": "e" * 64,
+        }
+        leaf, parent, mount = (
+            _pipe_capability(b"L"),
+            _pipe_capability(b"P"),
+            _pipe_capability(b"M"),
+        )
+        with (
+            patch.object(
+                handoff, "_consume_rollback_write_lease", return_value=lease
+            ) as consume,
+            patch.object(handoff, "_consume_write_lease") as original_consume,
+            patch.object(handoff, "_mountinfo_has_device", return_value=False),
+            patch.object(
+                handoff,
+                "_open_bound_block_device",
+                side_effect=[leaf, parent],
+            ),
+            patch.object(
+                handoff, "_probe_physical_parent_claims", return_value=claims
+            ),
+            patch.object(handoff, "_revalidate_block_pair", return_value=None),
+            patch.object(
+                handoff, "_create_detached_ext4_write_mount", return_value=mount
+            ),
+            patch.object(
+                handoff, "_assert_detached_ext4_write_mount_fd", return_value=None
+            ),
+        ):
+            response, descriptors = self._exchange(service, request, profile="write")
+        try:
+            consume.assert_called_once()
+            original_consume.assert_not_called()
+            self.assertEqual(response["capability"], handoff.ROLLBACK_WRITE_CAPABILITY)
+            self.assertEqual(response["rollbackId"], request["rollbackId"])
+            self.assertEqual(
+                response["rollbackTransactionBindingSha256"],
+                request["rollbackTransactionBindingSha256"],
+            )
+            self.assertEqual(response["sourceReservationId"], lease["sourceReservationId"])
+            self.assertEqual(len(descriptors), 1)
+            self.assertEqual(os.read(descriptors[0], 1), b"M")
+        finally:
+            for descriptor in descriptors:
+                os.close(descriptor)
 
     def test_vault_exchange_rejects_expired_deadline_before_socket_access(self) -> None:
         with self.assertRaises(handoff.HandoffFailure) as failure:

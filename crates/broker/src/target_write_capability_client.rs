@@ -8,7 +8,8 @@
 
 use kernaid_protocol::{
     rescue_repair_vault::{
-        RepairBackupState, RepairTransactionPhase, RepairTransactionStatusPayload,
+        REPAIR_ROLLBACK_ACTION_ID, RepairBackupState, RepairRollbackTransactionStatusPayload,
+        RepairTransactionPhase, RepairTransactionResolutionOutcome, RepairTransactionStatusPayload,
     },
     rescue_vault::RequestId,
     rescue_vault_transport::{SeqpacketTransportError, authenticate_root_seqpacket_server},
@@ -35,7 +36,9 @@ use std::{
 const TARGET_WRITE_CAPABILITY_SOCKET: &str = "/run/kernaid-rescue-target-write-capability.sock";
 const API_VERSION: &str = "kernaid.dev/rescue-target-capability/v1alpha2";
 const ACQUIRE_OPERATION: &str = "target.pending.readwrite.acquire";
+const ACQUIRE_ROLLBACK_OPERATION: &str = "target.rollback.pending.readwrite.acquire";
 const CAPABILITY_TYPE: &str = "linux-ext4-direct-leaf-readwrite-mount-v1";
+const ROLLBACK_CAPABILITY_TYPE: &str = "fstab-rollback-direct-leaf-rw-v1";
 const DESCRIPTOR_TYPE: &str = "selected-target-ext4-mount-readwrite-detached";
 const EXT_SUPER_MAGIC: u64 = 0xef53;
 const MAX_REQUEST_FRAME_BYTES: usize = 1_024;
@@ -76,6 +79,71 @@ pub struct RescueTargetWriteMountCapability {
     transaction_binding_sha256: String,
     target_recovery_fingerprint: String,
     lease_binding_sha256: String,
+}
+
+/// Non-cloneable authority for the writable mount of one exact durable
+/// post-commit rollback. It is deliberately distinct from repair authority so
+/// a source transaction lease can never be replayed as a rollback lease.
+#[allow(dead_code)] // consumed only by the separately gated rollback executor
+pub struct RescueTargetRollbackWriteMountCapability {
+    mount: OwnedFd,
+    rollback_id: String,
+    rollback_transaction_binding_sha256: String,
+    source_reservation_id: String,
+    source_transaction_binding_sha256: String,
+    target_recovery_fingerprint: String,
+    lease_binding_sha256: String,
+}
+
+#[allow(dead_code)] // the executor integration is intentionally a separate slice
+impl RescueTargetRollbackWriteMountCapability {
+    pub(crate) fn mount(&self) -> &OwnedFd {
+        &self.mount
+    }
+
+    pub(crate) fn revalidate(&self) -> Result<(), TargetWriteCapabilityClientError> {
+        validate_write_mount(self.mount.as_fd())
+            .map_err(|_| TargetWriteCapabilityClientError::ReconciliationRequired)
+    }
+
+    pub fn rollback_id(&self) -> &str {
+        &self.rollback_id
+    }
+
+    pub fn rollback_transaction_binding_sha256(&self) -> &str {
+        &self.rollback_transaction_binding_sha256
+    }
+
+    pub fn source_reservation_id(&self) -> &str {
+        &self.source_reservation_id
+    }
+
+    pub fn source_transaction_binding_sha256(&self) -> &str {
+        &self.source_transaction_binding_sha256
+    }
+
+    pub fn target_recovery_fingerprint(&self) -> &str {
+        &self.target_recovery_fingerprint
+    }
+
+    pub fn lease_binding_sha256(&self) -> &str {
+        &self.lease_binding_sha256
+    }
+}
+
+impl fmt::Debug for RescueTargetRollbackWriteMountCapability {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RescueTargetRollbackWriteMountCapability")
+            .field("mount", &"[owned detached writable ext4 mount]")
+            .field("rollback_id", &"[opaque]")
+            .field("rollback_transaction_binding_sha256", &"[opaque hash]")
+            .field("source_reservation_id", &"[opaque]")
+            .field("source_transaction_binding_sha256", &"[opaque hash]")
+            .field("target_recovery_fingerprint", &"[opaque stable digest]")
+            .field("lease_binding_sha256", &"[opaque hash]")
+            .finish()
+    }
 }
 
 impl RescueTargetWriteMountCapability {
@@ -128,6 +196,16 @@ struct AcquireRequestWire<'a> {
     transaction_binding_sha256: &'a str,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AcquireRollbackRequestWire<'a> {
+    api_version: &'static str,
+    request_id: &'a str,
+    operation: &'static str,
+    rollback_id: &'a str,
+    rollback_transaction_binding_sha256: &'a str,
+}
+
 #[derive(Deserialize)]
 struct OutcomeProbe {
     outcome: Outcome,
@@ -159,6 +237,24 @@ struct SuccessResponseWire {
     _outcome: SuccessOutcome,
     reservation_id: String,
     transaction_binding_sha256: String,
+    target_recovery_fingerprint: String,
+    lease_binding_sha256: String,
+    capability: String,
+    descriptor: DescriptorWire,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RollbackSuccessResponseWire {
+    api_version: String,
+    request_id: String,
+    operation: String,
+    #[serde(rename = "outcome")]
+    _outcome: SuccessOutcome,
+    rollback_id: String,
+    rollback_transaction_binding_sha256: String,
+    source_reservation_id: String,
+    source_transaction_binding_sha256: String,
     target_recovery_fingerprint: String,
     lease_binding_sha256: String,
     capability: String,
@@ -254,6 +350,59 @@ pub fn acquire_pending_target_write_mount(
         intent.target_recovery_fingerprint(),
     )
     .map_err(|_| TargetWriteCapabilityClientError::ReconciliationRequired)
+}
+
+/// Consumes the root-helper RPC opportunity for one exact durable rollback.
+/// As with repair acquisition, any failure after transmission is ambiguous
+/// with lease consumption and therefore permits reconciliation only.
+pub fn acquire_pending_rollback_target_write_mount(
+    pending: &RepairRollbackTransactionStatusPayload,
+    deadline: Instant,
+) -> Result<RescueTargetRollbackWriteMountCapability, TargetWriteCapabilityClientError> {
+    let source = pending.source();
+    let intent = source
+        .backup()
+        .execution_intent()
+        .ok_or(TargetWriteCapabilityClientError::InvalidPending)?;
+    if pending.validate().is_err()
+        || pending.phase() != RepairTransactionPhase::Pending
+        || pending.binding().action_id() != REPAIR_ROLLBACK_ACTION_ID
+        || source.phase() != RepairTransactionPhase::Resolved
+        || source.backup().state() != RepairBackupState::Durable
+        || source.resolution().map(|resolution| resolution.outcome())
+            != Some(RepairTransactionResolutionOutcome::CommittedAfter)
+        || !valid_recovery_fingerprint(intent.target_recovery_fingerprint())
+    {
+        return Err(TargetWriteCapabilityClientError::InvalidPending);
+    }
+    let rollback_id = pending.rollback_id().as_str();
+    let rollback_binding = pending.rollback_transaction_binding_sha256().as_str();
+    let request_id = fresh_request_id()?;
+    let request = AcquireRollbackRequestWire {
+        api_version: API_VERSION,
+        request_id: request_id.as_str(),
+        operation: ACQUIRE_ROLLBACK_OPERATION,
+        rollback_id,
+        rollback_transaction_binding_sha256: rollback_binding,
+    };
+    let encoded = serde_json::to_vec(&request)
+        .map_err(|_| TargetWriteCapabilityClientError::InvalidPending)?;
+    if encoded.is_empty() || encoded.len() > MAX_REQUEST_FRAME_BYTES {
+        return Err(TargetWriteCapabilityClientError::InvalidPending);
+    }
+
+    ensure_before(deadline)?;
+    let socket = connect_fixed_endpoint(deadline)?;
+    authenticate_root_seqpacket_server(socket.as_fd()).map_err(|error| match error {
+        SeqpacketTransportError::ServerNotRoot => TargetWriteCapabilityClientError::ServerNotRoot,
+        _ => TargetWriteCapabilityClientError::InvalidTransport,
+    })?;
+    send_frame(socket.as_fd(), &encoded, deadline)
+        .map_err(|_| TargetWriteCapabilityClientError::ReconciliationRequired)?;
+    let received = receive_frame(socket.as_fd(), deadline)
+        .map_err(|_| TargetWriteCapabilityClientError::ReconciliationRequired)?;
+    decode_rollback_response(received, request_id.as_str(), pending)
+        .map_err(|_| TargetWriteCapabilityClientError::ReconciliationRequired)
 }
 
 fn connect_fixed_endpoint(deadline: Instant) -> Result<OwnedFd, TargetWriteCapabilityClientError> {
@@ -419,6 +568,79 @@ fn decode_response(
             if response.api_version != API_VERSION
                 || response.request_id != request_id
                 || response.operation != ACQUIRE_OPERATION
+                || response.error.is_empty()
+                || response.error.len() > 64
+                || !response
+                    .error
+                    .bytes()
+                    .all(|byte| byte.is_ascii_uppercase() || byte == b'_')
+                || !received.descriptors.is_empty()
+            {
+                return Err(PostSendError::Invalid);
+            }
+            Err(PostSendError::Invalid)
+        }
+    }
+}
+
+fn decode_rollback_response(
+    received: ReceivedFrame,
+    request_id: &str,
+    pending: &RepairRollbackTransactionStatusPayload,
+) -> Result<RescueTargetRollbackWriteMountCapability, PostSendError> {
+    let probe: OutcomeProbe =
+        serde_json::from_slice(&received.bytes).map_err(|_| PostSendError::Invalid)?;
+    match probe.outcome {
+        Outcome::Ok => {
+            let response: RollbackSuccessResponseWire =
+                serde_json::from_slice(&received.bytes).map_err(|_| PostSendError::Invalid)?;
+            let source = pending.source();
+            let intent = source
+                .backup()
+                .execution_intent()
+                .ok_or(PostSendError::Invalid)?;
+            if response.api_version != API_VERSION
+                || response.request_id != request_id
+                || response.operation != ACQUIRE_ROLLBACK_OPERATION
+                || response.rollback_id != pending.rollback_id().as_str()
+                || response.rollback_transaction_binding_sha256
+                    != pending.rollback_transaction_binding_sha256().as_str()
+                || response.source_reservation_id != source.backup().reservation_id().as_str()
+                || response.source_transaction_binding_sha256
+                    != source.transaction_binding_sha256().as_str()
+                || response.target_recovery_fingerprint != intent.target_recovery_fingerprint()
+                || response.capability != ROLLBACK_CAPABILITY_TYPE
+                || response.descriptor.descriptor_type != DESCRIPTOR_TYPE
+                || response.descriptor.count != 1
+                || !valid_raw_sha256(&response.lease_binding_sha256)
+                || response
+                    .lease_binding_sha256
+                    .bytes()
+                    .all(|byte| byte == b'0')
+            {
+                return Err(PostSendError::Invalid);
+            }
+            let [mount]: [OwnedFd; 1] = received
+                .descriptors
+                .try_into()
+                .map_err(|_| PostSendError::Invalid)?;
+            validate_write_mount(mount.as_fd())?;
+            Ok(RescueTargetRollbackWriteMountCapability {
+                mount,
+                rollback_id: response.rollback_id,
+                rollback_transaction_binding_sha256: response.rollback_transaction_binding_sha256,
+                source_reservation_id: response.source_reservation_id,
+                source_transaction_binding_sha256: response.source_transaction_binding_sha256,
+                target_recovery_fingerprint: response.target_recovery_fingerprint,
+                lease_binding_sha256: response.lease_binding_sha256,
+            })
+        }
+        Outcome::Error => {
+            let response: ErrorResponseWire =
+                serde_json::from_slice(&received.bytes).map_err(|_| PostSendError::Invalid)?;
+            if response.api_version != API_VERSION
+                || response.request_id != request_id
+                || response.operation != ACQUIRE_ROLLBACK_OPERATION
                 || response.error.is_empty()
                 || response.error.len() > 64
                 || !response
@@ -636,6 +858,27 @@ mod tests {
         assert_eq!(object["transactionBindingSha256"], binding);
         assert!(!object.contains_key("targetPath"));
         assert!(!object.contains_key("mountOptions"));
+    }
+
+    #[test]
+    fn rollback_request_codec_contains_only_child_selector() {
+        let binding = raw_hash('d');
+        let request = AcquireRollbackRequestWire {
+            api_version: API_VERSION,
+            request_id: REQUEST_ID,
+            operation: ACQUIRE_ROLLBACK_OPERATION,
+            rollback_id: "RB-0123456789abcdef0123456789abcdef",
+            rollback_transaction_binding_sha256: &binding,
+        };
+        let encoded = serde_json::to_vec(&request).expect("encode rollback request");
+        let value: serde_json::Value =
+            serde_json::from_slice(&encoded).expect("rollback request JSON");
+        let object = value.as_object().expect("rollback request object");
+        assert_eq!(object.len(), 5);
+        assert_eq!(object["rollbackId"], "RB-0123456789abcdef0123456789abcdef");
+        assert_eq!(object["rollbackTransactionBindingSha256"], binding);
+        assert!(!object.contains_key("reservationId"));
+        assert!(!object.contains_key("targetPath"));
     }
 
     #[test]

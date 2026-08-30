@@ -39,8 +39,11 @@ VAULT_HELPER_SOCKET_PATH = "/run/kernaid-rescue-vault/repair-target-helper-v1.so
 PROFILE_READONLY = "readonly"
 PROFILE_WRITE = "write"
 WRITE_OPERATION = "target.pending.readwrite.acquire"
+ROLLBACK_WRITE_OPERATION = "target.rollback.pending.readwrite.acquire"
 VAULT_API_VERSION = "kernaid.dev/rescue-vault/v1alpha1"
+VAULT_ROLLBACK_API_VERSION = "kernaid.dev/rescue-vault/v1alpha2"
 VAULT_WRITE_OPERATION = "repair.transaction.write-lease.consume"
+VAULT_ROLLBACK_WRITE_OPERATION = "repair.rollback.write-lease.consume"
 TARGET_MODULE_PATH = "/usr/lib/kernaid/rescue_server.py"
 PASSWD_PATH = "/etc/passwd"
 REPAIR_BROKER_NAME = b"kernaid-repair"
@@ -66,9 +69,12 @@ BUNDLE_DESCRIPTOR_TYPES = (
     "selected-target-ext4-mount-readonly-detached",
 )
 WRITE_CAPABILITY = "linux-ext4-direct-leaf-readwrite-mount-v1"
+ROLLBACK_WRITE_CAPABILITY = "fstab-rollback-direct-leaf-rw-v1"
 WRITE_DESCRIPTOR_TYPE = "selected-target-ext4-mount-readwrite-detached"
 VAULT_WRITE_CAPABILITY = "fstab-direct-leaf-rw-v1"
+VAULT_ROLLBACK_WRITE_CAPABILITY = "fstab-rollback-direct-leaf-rw-v1"
 REPAIR_ACTION = "linux.fstab.disable-missing-uuid.v1"
+ROLLBACK_ACTION = "linux.fstab.restore"
 REPAIR_RESOURCE = "rescue:selected-linux-root:etc/fstab"
 BLOCK_INVENTORY_COLLECTOR = "linux.block.inventory"
 
@@ -115,6 +121,7 @@ _EPHEMERAL_ID = {
 _TARGET_FINGERPRINT = re.compile(r"^sha256:[0-9a-f]{64}$")
 _RECOVERY_FINGERPRINT = re.compile(r"^recovery:[0-9a-f]{64}$")
 _RESERVATION_ID = re.compile(r"^B-[0-9a-f]{32}$")
+_ROLLBACK_ID = re.compile(r"^RB-[0-9a-f]{32}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _OPAQUE_ID = re.compile(r"^[A-Za-z0-9_:.\-]{1,128}$")
 _PREFIXED_ID = re.compile(r"^[SPA]-[A-Za-z0-9\-]{1,126}$")
@@ -181,15 +188,40 @@ def _decode_request(payload: bytes, profile: str = PROFILE_READONLY) -> dict[str
         not isinstance(request_id, str)
         or _REQUEST_ID.fullmatch(request_id) is None
         or value.get("apiVersion") != API_VERSION
-        or operation not in {ACQUIRE_OPERATION, RECOVERY_OPERATION, WRITE_OPERATION}
+        or operation not in {
+            ACQUIRE_OPERATION,
+            RECOVERY_OPERATION,
+            WRITE_OPERATION,
+            ROLLBACK_WRITE_OPERATION,
+        }
     ):
         raise HandoffFailure("INVALID_REQUEST")
     common = {"apiVersion", "requestId", "operation"}
-    if operation == WRITE_OPERATION:
-        if profile != PROFILE_WRITE or set(value) != common | {
-            "reservationId", "transactionBindingSha256"
-        }:
+    if operation in {WRITE_OPERATION, ROLLBACK_WRITE_OPERATION}:
+        required = (
+            {"reservationId", "transactionBindingSha256"}
+            if operation == WRITE_OPERATION
+            else {"rollbackId", "rollbackTransactionBindingSha256"}
+        )
+        if profile != PROFILE_WRITE or set(value) != common | required:
             raise HandoffFailure("INVALID_REQUEST", request_id, operation)
+        if operation == ROLLBACK_WRITE_OPERATION:
+            rollback_id = value.get("rollbackId")
+            rollback_binding = value.get("rollbackTransactionBindingSha256")
+            if (
+                not isinstance(rollback_id, str)
+                or _ROLLBACK_ID.fullmatch(rollback_id) is None
+                or not isinstance(rollback_binding, str)
+                or _SHA256.fullmatch(rollback_binding) is None
+            ):
+                raise HandoffFailure("INVALID_REQUEST", request_id, operation)
+            return {
+                "apiVersion": API_VERSION,
+                "requestId": request_id,
+                "operation": operation,
+                "rollbackId": rollback_id,
+                "rollbackTransactionBindingSha256": rollback_binding,
+            }
         reservation = value.get("reservationId")
         binding = value.get("transactionBindingSha256")
         if (not isinstance(reservation, str) or _RESERVATION_ID.fullmatch(reservation) is None
@@ -1298,6 +1330,185 @@ def _validate_write_lease(payload: object, reservation: str, binding: str) -> di
             "leaseBindingSha256": expected_lease}
 
 
+def _validate_rollback_write_lease(
+    payload: object, rollback_id: str, rollback_binding: str
+) -> dict[str, str]:
+    lease = _strict_object(
+        payload,
+        {
+            "capability",
+            "bootEpochSha256",
+            "leaseBindingSha256",
+            "transaction",
+        },
+    )
+    transaction = _strict_object(
+        lease["transaction"],
+        {
+            "phase",
+            "rollbackId",
+            "rollbackTransactionBindingSha256",
+            "source",
+            "binding",
+        },
+    )
+    source = _strict_object(
+        transaction["source"],
+        {"phase", "transactionBindingSha256", "backup", "resolution"},
+    )
+    binding = _strict_object(
+        transaction["binding"],
+        {
+            "actionId",
+            "planId",
+            "planSha256",
+            "approvalId",
+            "approvalSha256",
+            "approvalSequence",
+        },
+    )
+    resolution = _strict_object(
+        source["resolution"],
+        {
+            "outcome",
+            "targetState",
+            "observedResourceSha256",
+            "observedMetadataSha256",
+            "mountCleanupVerified",
+        },
+    )
+    backup = source.get("backup")
+    if not isinstance(backup, dict):
+        raise HandoffFailure("INTERNAL")
+    intent = backup.get("executionIntent")
+    if not isinstance(intent, dict):
+        raise HandoffFailure("INTERNAL")
+    source_reservation = backup.get("reservationId")
+    source_binding = source.get("transactionBindingSha256")
+    source_plan_id = backup.get("planId")
+    source_plan_sha256 = backup.get("planSha256")
+    source_approval_id = backup.get("approvalId")
+    source_approval_sha256 = backup.get("approvalSha256")
+    source_sequence = intent.get("approvalSequence")
+    recovery = intent.get("targetRecoveryFingerprint")
+    lock_identity = intent.get("lockIdentity")
+    boot = _digest(lease["bootEpochSha256"])
+    if (
+        lease["capability"] != VAULT_ROLLBACK_WRITE_CAPABILITY
+        or _ROLLBACK_ID.fullmatch(rollback_id) is None
+        or _SHA256.fullmatch(rollback_binding) is None
+        or transaction["phase"] != "pending"
+        or transaction["rollbackId"] != rollback_id
+        or transaction["rollbackTransactionBindingSha256"] != rollback_binding
+        or source["phase"] != "resolved"
+        or not isinstance(source_reservation, str)
+        or _RESERVATION_ID.fullmatch(source_reservation) is None
+        or not isinstance(source_binding, str)
+        or _SHA256.fullmatch(source_binding) is None
+        or not isinstance(recovery, str)
+        or _RECOVERY_FINGERPRINT.fullmatch(recovery) is None
+        or not isinstance(lock_identity, str)
+        or not isinstance(source_sequence, int)
+        or isinstance(source_sequence, bool)
+        or not 1 <= source_sequence < 9_007_199_254_740_991
+        or not isinstance(source_approval_id, str)
+        or _PREFIXED_ID.fullmatch(source_approval_id) is None
+        or not source_approval_id.startswith("A-")
+        or not isinstance(source_approval_sha256, str)
+        or _SHA256.fullmatch(source_approval_sha256) is None
+        or binding["actionId"] != ROLLBACK_ACTION
+        or not isinstance(binding["planId"], str)
+        or _PREFIXED_ID.fullmatch(binding["planId"]) is None
+        or not str(binding["planId"]).startswith("P-")
+        or binding["planId"] == source_plan_id
+        or not isinstance(binding["approvalId"], str)
+        or _PREFIXED_ID.fullmatch(binding["approvalId"]) is None
+        or not str(binding["approvalId"]).startswith("A-")
+        or binding["approvalId"] == source_approval_id
+        or not isinstance(binding["approvalSequence"], int)
+        or isinstance(binding["approvalSequence"], bool)
+        or binding["approvalSequence"] != source_sequence + 1
+        or not isinstance(binding["planSha256"], str)
+        or _SHA256.fullmatch(binding["planSha256"]) is None
+        or not any(_digest(binding["planSha256"]))
+        or binding["planSha256"] == source_plan_sha256
+        or not isinstance(binding["approvalSha256"], str)
+        or _SHA256.fullmatch(binding["approvalSha256"]) is None
+        or not any(_digest(binding["approvalSha256"]))
+        or binding["approvalSha256"] == source_approval_sha256
+        or resolution["outcome"] != "committed-after"
+        or resolution["targetState"] != "after"
+        or resolution["observedResourceSha256"] != intent.get("afterSha256")
+        or resolution["observedMetadataSha256"] != backup.get("metadataSha256")
+        or resolution["mountCleanupVerified"] is not True
+        or not any(boot)
+    ):
+        raise HandoffFailure("INTERNAL")
+
+    # Reuse the complete source transaction validator by presenting the same
+    # immutable source binding as its pre-resolution Pending form. This checks
+    # every backup, target, metadata, plan and original-approval field without
+    # granting or consuming an original repair lease.
+    expected_source_lease = _hash_fields(
+        b"KERNAID-REPAIR-WRITE-LEASE-V1\0",
+        [
+            VAULT_WRITE_CAPABILITY.encode(),
+            _digest(source_binding),
+            boot,
+            recovery.encode(),
+            lock_identity.encode(),
+        ],
+    )
+    source_authority = _validate_write_lease(
+        {
+            "capability": VAULT_WRITE_CAPABILITY,
+            "bootEpochSha256": lease["bootEpochSha256"],
+            "leaseBindingSha256": expected_source_lease,
+            "transaction": {
+                "phase": "pending",
+                "transactionBindingSha256": source_binding,
+                "backup": backup,
+            },
+        },
+        source_reservation,
+        source_binding,
+    )
+    expected_rollback_binding = _hash_fields(
+        b"KERNAID-REPAIR-ROLLBACK-TRANSACTION-V1\0",
+        [
+            rollback_id.encode(),
+            source_reservation.encode(),
+            _digest(source_binding),
+            ROLLBACK_ACTION.encode(),
+            str(binding["planId"]).encode(),
+            _digest(binding["planSha256"]),
+            str(binding["approvalId"]).encode(),
+            _digest(binding["approvalSha256"]),
+            int(binding["approvalSequence"]).to_bytes(8, "big"),
+        ],
+    )
+    if expected_rollback_binding != rollback_binding:
+        raise HandoffFailure("INTERNAL")
+    expected_lease = _hash_fields(
+        b"KERNAID-REPAIR-ROLLBACK-WRITE-LEASE-V1\0",
+        [
+            VAULT_ROLLBACK_WRITE_CAPABILITY.encode(),
+            _digest(rollback_binding),
+            boot,
+            recovery.encode(),
+            lock_identity.encode(),
+        ],
+    )
+    if lease["leaseBindingSha256"] != expected_lease:
+        raise HandoffFailure("INTERNAL")
+    return {
+        "recoveryFingerprint": source_authority["recoveryFingerprint"],
+        "leaseBindingSha256": expected_lease,
+        "sourceReservationId": source_reservation,
+        "sourceTransactionBindingSha256": source_binding,
+    }
+
+
 def _fresh_request_id() -> str:
     raw = secrets.token_hex(16)
     return f"R-{raw[:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:]}"
@@ -1366,6 +1577,61 @@ def _consume_write_lease(reservation: str, binding: str, deadline: float) -> dic
         if response.get("outcome") != "ok" or set(response) != common | {"payload"}:
             raise HandoffFailure("INTERNAL")
         return _validate_write_lease(response["payload"], reservation, binding)
+    raise HandoffFailure("INTERNAL")
+
+
+def _consume_rollback_write_lease(
+    rollback_id: str, rollback_binding: str, deadline: float
+) -> dict[str, str]:
+    state_version = 0
+    for attempt in range(2):
+        request_id = _fresh_request_id()
+        request = {
+            "apiVersion": VAULT_ROLLBACK_API_VERSION,
+            "requestId": request_id,
+            "expectedStateVersion": state_version,
+            "operation": VAULT_ROLLBACK_WRITE_OPERATION,
+            "payload": {
+                "selector": {
+                    "kind": "exact",
+                    "rollbackId": rollback_id,
+                    "rollbackTransactionBindingSha256": rollback_binding,
+                }
+            },
+        }
+        response = _vault_exchange(request, deadline)
+        common = {
+            "apiVersion",
+            "requestId",
+            "stateVersion",
+            "operation",
+            "outcome",
+        }
+        if (
+            not isinstance(response, dict)
+            or response.get("apiVersion") != VAULT_ROLLBACK_API_VERSION
+            or response.get("requestId") != request_id
+            or response.get("operation") != VAULT_ROLLBACK_WRITE_OPERATION
+            or not isinstance(response.get("stateVersion"), int)
+            or isinstance(response.get("stateVersion"), bool)
+            or not 0 <= response["stateVersion"] <= 9_007_199_254_740_991
+        ):
+            raise HandoffFailure("INTERNAL")
+        if response.get("outcome") == "error":
+            if (
+                set(response) == common | {"error"}
+                and attempt == 0
+                and response.get("error") == "STALE_STATE"
+                and response["stateVersion"] != state_version
+            ):
+                state_version = response["stateVersion"]
+                continue
+            raise HandoffFailure("INTERNAL")
+        if response.get("outcome") != "ok" or set(response) != common | {"payload"}:
+            raise HandoffFailure("INTERNAL")
+        return _validate_rollback_write_lease(
+            response["payload"], rollback_id, rollback_binding
+        )
     raise HandoffFailure("INTERNAL")
 
 
@@ -1587,7 +1853,7 @@ class RepairTargetHandoff:
         self.targets = _load_target_module() if targets is None else targets
 
     def acquire(self, request: dict[str, str]) -> tuple[dict[str, object], list[int]]:
-        if request.get("operation") == WRITE_OPERATION:
+        if request.get("operation") in {WRITE_OPERATION, ROLLBACK_WRITE_OPERATION}:
             return self._acquire_write(request)
         if request.get("operation") == RECOVERY_OPERATION:
             return self._recover(request)
@@ -1599,11 +1865,22 @@ class RepairTargetHandoff:
         request_id = request["requestId"]
         deadline = time.monotonic() + IO_TIMEOUT_SECONDS
         descriptors: list[int] = []
+        is_rollback = request["operation"] == ROLLBACK_WRITE_OPERATION
         try:
             # Consumption is deliberately first and is never retried except for
             # one explicit authenticated stale-state response.
-            lease = _consume_write_lease(request["reservationId"],
-                                         request["transactionBindingSha256"], deadline)
+            if is_rollback:
+                lease = _consume_rollback_write_lease(
+                    request["rollbackId"],
+                    request["rollbackTransactionBindingSha256"],
+                    deadline,
+                )
+            else:
+                lease = _consume_write_lease(
+                    request["reservationId"],
+                    request["transactionBindingSha256"],
+                    deadline,
+                )
             recovery = lease["recoveryFingerprint"]
             reference = {"recoveryFingerprint": recovery}
             selection_a, resolution_a = self.targets.resolve_recovery_target(
@@ -1672,14 +1949,41 @@ class RepairTargetHandoff:
         except Exception as error:
             _close_descriptors(descriptors)
             raise HandoffFailure("INTERNAL", request_id) from error
-        return ({"apiVersion": API_VERSION, "requestId": request_id,
-                 "operation": WRITE_OPERATION, "outcome": "ok",
-                 "capability": WRITE_CAPABILITY,
-                 "reservationId": request["reservationId"],
-                 "transactionBindingSha256": request["transactionBindingSha256"],
-                 "targetRecoveryFingerprint": recovery,
-                 "leaseBindingSha256": lease["leaseBindingSha256"],
-                 "descriptor": {"type": WRITE_DESCRIPTOR_TYPE, "count": 1}}, descriptors)
+        response: dict[str, object] = {
+            "apiVersion": API_VERSION,
+            "requestId": request_id,
+            "operation": request["operation"],
+            "outcome": "ok",
+            "capability": (
+                ROLLBACK_WRITE_CAPABILITY if is_rollback else WRITE_CAPABILITY
+            ),
+            "targetRecoveryFingerprint": recovery,
+            "leaseBindingSha256": lease["leaseBindingSha256"],
+            "descriptor": {"type": WRITE_DESCRIPTOR_TYPE, "count": 1},
+        }
+        if is_rollback:
+            response.update(
+                {
+                    "rollbackId": request["rollbackId"],
+                    "rollbackTransactionBindingSha256": request[
+                        "rollbackTransactionBindingSha256"
+                    ],
+                    "sourceReservationId": lease["sourceReservationId"],
+                    "sourceTransactionBindingSha256": lease[
+                        "sourceTransactionBindingSha256"
+                    ],
+                }
+            )
+        else:
+            response.update(
+                {
+                    "reservationId": request["reservationId"],
+                    "transactionBindingSha256": request[
+                        "transactionBindingSha256"
+                    ],
+                }
+            )
+        return response, descriptors
 
     def _acquire_selected(
         self, request: dict[str, str]
@@ -2069,7 +2373,10 @@ def _send_record(
         )
     success = response.get("outcome") == "ok"
     if success:
-        if response.get("capability") == WRITE_CAPABILITY:
+        if response.get("capability") in {
+            WRITE_CAPABILITY,
+            ROLLBACK_WRITE_CAPABILITY,
+        }:
             if (response.get("descriptor") != {"type": WRITE_DESCRIPTOR_TYPE, "count": 1}
                     or len(descriptors) != 1):
                 raise HandoffFailure("INTERNAL", response.get("requestId"))
@@ -2140,10 +2447,21 @@ def serve_connection(
             return
         operation = (
             error.operation
-            if error.operation in {ACQUIRE_OPERATION, RECOVERY_OPERATION, WRITE_OPERATION}
+            if error.operation
+            in {
+                ACQUIRE_OPERATION,
+                RECOVERY_OPERATION,
+                WRITE_OPERATION,
+                ROLLBACK_WRITE_OPERATION,
+            }
             else request.get("operation") if request is not None else None
         )
-        if operation not in {ACQUIRE_OPERATION, RECOVERY_OPERATION, WRITE_OPERATION}:
+        if operation not in {
+            ACQUIRE_OPERATION,
+            RECOVERY_OPERATION,
+            WRITE_OPERATION,
+            ROLLBACK_WRITE_OPERATION,
+        }:
             operation = WRITE_OPERATION if profile == PROFILE_WRITE else ACQUIRE_OPERATION
         response: dict[str, object] = {
             "apiVersion": API_VERSION,
