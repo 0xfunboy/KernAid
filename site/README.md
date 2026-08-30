@@ -88,23 +88,34 @@ candidate changes, update together:
 start, so restart the site process after changing release metadata or a
 configured artifact path.
 
-Do not soften the warning based only on the existence of a workflow artifact.
-The exact candidate named in `content.json` must have passed hybrid ISO build,
-ordinary BIOS/UEFI smoke, zero-state first boot, USB-style two-boot and both
-privileged persistent-vault lifecycle jobs on the same bytes. Its release
-manifest and attestations must then be independently verified before the
-retail image and ISO are staged together. It remains an internal engineering
-candidate: private availability is limited to controlled physical qualification
-on factory-new or disposable USB and non-customer hardware until physical USB,
-Secure Boot and real-account/TLS gates are recorded.
+Do not soften the stable-release warning based only on the existence of a
+workflow artifact. The exact diagnosis-only release named in `content.json`
+must have passed hybrid ISO build, ordinary BIOS/UEFI smoke, zero-state first
+boot, USB-style two-boot and both privileged persistent-vault lifecycle jobs on
+the same bytes. Its release manifest and attestations must then be independently
+verified before the retail image and ISO are staged together. It remains an
+internal engineering candidate: private availability is limited to controlled
+physical qualification on factory-new or disposable USB and non-customer
+hardware until physical USB, Secure Boot and real-account/TLS gates are
+recorded.
 
-Each download remains independently fail-closed with `503` until its exact file,
-matching sidecar and environment path are all present. Stable retail and ISO
-downloads additionally require exact equality with their reviewed size and
-digest in `content.json`. This allows the stable ISO and retail image to remain
-available when the repair candidate is absent, without weakening any artifact
-boundary. Candidate availability never changes its explicit non-qualified,
-non-promoted status.
+The repair candidate has an independent, stricter boundary. It may be exposed
+only in the authenticated lab area after one exact image passes every virtual
+boot, apply, rollback and restart-reconciliation step in its dedicated workflow.
+That private download is hardware-qualification input, not stable promotion:
+the repair image remains outside the trusted stable catalog, Release Channel
+and public product until the remaining fault, physical power-loss, Secure Boot
+and explicit release-policy gates are recorded.
+
+Each enabled download remains independently fail-closed with `503` until its
+exact file, matching sidecar and environment path are all present. Stable retail
+and ISO downloads additionally require exact equality with their reviewed size
+and digest in `content.json`. A repair candidate explicitly disabled in
+`content.json` returns `404`; enabling it also requires exact reviewed size and
+digest equality before the route can serve bytes. This allows the stable ISO
+and retail image to remain available when the repair candidate is absent,
+without weakening any artifact boundary. Candidate availability never changes
+its explicit non-qualified, non-promoted status.
 
 ## Local validation
 
@@ -135,7 +146,8 @@ GET  /private/ with the session          200
 GET  /private/downloads/retail Range 0-0 206, one byte
 GET  /private/downloads/iso Range 0-0    206, one byte
 GET  /private/downloads/repair-candidate Range 0-0
-                                              206, one byte when configured; 503 otherwise
+                                              404 when disabled; 503 if enabled but invalid;
+                                              206, one byte when enabled and exact
 POST /private/logout                     303 + expired session cookie
 ```
 
