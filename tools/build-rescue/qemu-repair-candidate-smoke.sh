@@ -11,17 +11,24 @@ readonly media_bytes=32000000000
 readonly p3_start_bytes=17179869184
 controller_timeout=900
 readonly qemu_smp="${KERNAID_QEMU_SMP:-2}"
+readonly provisioned_base="${KERNAID_REPAIR_PROVISIONED_BASE:-}"
+readonly provisioned_key="${KERNAID_REPAIR_PROVISIONED_KEY:-}"
+readonly provisioned_target="${KERNAID_REPAIR_TARGET_BASE:-}"
+readonly tamper_helper="$repo_dir/tools/build-rescue/qemu-repair-vault-tamper.py"
 
 if [[ "$firmware" != bios && "$firmware" != uefi ]]; then
-  echo "Usage: $0 [bios|uefi] [apply|rollback|interrupt-reconcile] [iso]" >&2
+  echo "Usage: $0 [bios|uefi] [apply|rollback|interrupt-reconcile|failure-paths] [iso]" >&2
   exit 2
 fi
 if [[ "$scenario" != apply && "$scenario" != rollback \
-  && "$scenario" != interrupt-reconcile ]]; then
-  echo "Usage: $0 [bios|uefi] [apply|rollback|interrupt-reconcile] [iso]" >&2
+  && "$scenario" != interrupt-reconcile && "$scenario" != failure-paths \
+  && "$scenario" != stale-target && "$scenario" != cancel \
+  && "$scenario" != backup-tamper && "$scenario" != repaird-termination \
+  && "$scenario" != auto-restore ]]; then
+  echo "Usage: $0 [bios|uefi] [apply|rollback|interrupt-reconcile|failure-paths] [iso]" >&2
   exit 2
 fi
-if [[ "$scenario" == rollback || "$scenario" == interrupt-reconcile ]]; then
+if [[ "$scenario" != apply ]]; then
   [[ "$firmware" == uefi ]] || {
     echo "$scenario is qualified only with UEFI" >&2
     exit 2
@@ -29,8 +36,20 @@ if [[ "$scenario" == rollback || "$scenario" == interrupt-reconcile ]]; then
 fi
 if [[ "$scenario" == rollback ]]; then
   controller_timeout=1500
-elif [[ "$scenario" == interrupt-reconcile ]]; then
+elif [[ "$scenario" == interrupt-reconcile || "$scenario" == backup-tamper ]]; then
   controller_timeout=1800
+elif [[ "$scenario" == failure-paths ]]; then
+  controller_timeout=1200
+fi
+
+if [[ -n "$provisioned_base" || -n "$provisioned_key" \
+  || -n "$provisioned_target" ]]; then
+  [[ -n "$provisioned_base" && -n "$provisioned_key" \
+    && -n "$provisioned_target" \
+    && "$scenario" != failure-paths ]] || {
+    echo "Invalid internal provisioned-base handoff" >&2
+    exit 2
+  }
 fi
 
 case "$qemu_smp" in
@@ -45,12 +64,22 @@ if [[ "$EUID" -eq 0 ]]; then
   echo "qemu-repair-candidate-smoke.sh must run as an unprivileged user" >&2
   exit 2
 fi
-for command in debugfs dd mkfs.ext4 mktemp od python3 qemu-system-x86_64 \
-  sha256sum stat truncate unsquashfs xorriso; do
+required_commands=(
+  debugfs dd mkfs.ext4 mktemp od python3 qemu-system-x86_64
+  realpath sha256sum stat truncate unsquashfs xorriso
+)
+if [[ "$scenario" == failure-paths || "$scenario" == backup-tamper ]]; then
+  required_commands+=(blockdev cryptsetup losetup sudo)
+fi
+for command in "${required_commands[@]}"; do
   command -v "$command" >/dev/null \
     || { echo "Missing required command: $command" >&2; exit 2; }
 done
 [[ -f "$iso" && ! -L "$iso" ]] || { echo "Candidate ISO not found" >&2; exit 2; }
+if [[ "$scenario" == failure-paths || "$scenario" == backup-tamper ]]; then
+  [[ -f "$tamper_helper" && ! -L "$tamper_helper" ]] \
+    || { echo "Vault tamper helper not found" >&2; exit 2; }
+fi
 
 work_dir="$(mktemp -d /tmp/kernaid-qemu-repair-candidate.XXXXXXXX)"
 cleanup() {
@@ -73,6 +102,8 @@ login_credential="$work_dir/login"
 vault_key="$work_dir/vault-key"
 observed_fstab="$work_dir/observed-fstab"
 observed_sentinel="$work_dir/observed-sentinel"
+observed_fstab_stat="$work_dir/observed-fstab.stat"
+observed_etc_listing="$work_dir/observed-etc.list"
 expected_after="$work_dir/expected-after"
 controller_output="$work_dir/controller.out"
 controller_error="$work_dir/controller.err"
@@ -150,6 +181,51 @@ od -An -N32 -tx1 /dev/urandom | tr -d '[:space:]' >"$vault_key"
 chmod 600 -- "$vault_key"
 [[ "$(stat -c '%s' -- "$vault_key")" == 64 ]] || exit 1
 
+already_provisioned=false
+if [[ -n "$provisioned_base" ]]; then
+  expected_handoffs=(
+    "$provisioned_base:rescue-usb.raw"
+    "$provisioned_key:vault-key"
+    "$provisioned_target:repair-target.raw"
+  )
+  provisioned_parent=""
+  for handoff_spec in "${expected_handoffs[@]}"; do
+    handoff="${handoff_spec%%:*}"
+    expected_name="${handoff_spec#*:}"
+    resolved_handoff="$(realpath -e -- "$handoff")" || exit 2
+    handoff_parent="$(dirname -- "$resolved_handoff")"
+    [[ "$resolved_handoff" == "$handoff" \
+      && "$(basename -- "$resolved_handoff")" == "$expected_name" \
+      && "$(basename -- "$handoff_parent")" =~ ^kernaid-qemu-repair-candidate\.[A-Za-z0-9]{8}$ \
+      && "$(dirname -- "$handoff_parent")" == /tmp \
+      && -f "$resolved_handoff" && ! -L "$resolved_handoff" \
+      && "$(stat -c '%u:%a' -- "$resolved_handoff")" == "$EUID:600" \
+      && "$(stat -c '%h' -- "$resolved_handoff")" == 1 \
+      && "$(stat -c '%u:%a' -- "$handoff_parent")" == "$EUID:700" ]] || {
+      echo "Invalid internal provisioned-base file" >&2
+      exit 2
+    }
+    if [[ -n "$provisioned_parent" && "$handoff_parent" != "$provisioned_parent" ]]; then
+      echo "Invalid internal provisioned-base parent" >&2
+      exit 2
+    fi
+    provisioned_parent="$handoff_parent"
+  done
+  [[ "$(stat -c '%s' -- "$provisioned_base")" == "$media_bytes" \
+    && "$(stat -c '%s' -- "$provisioned_key")" == 64 \
+    && "$(stat -c '%s' -- "$provisioned_target")" == 268435456 \
+    && "$(tr -d '0-9a-f' <"$provisioned_key")" == "" ]] || {
+    echo "Invalid internal provisioned-base content" >&2
+    exit 2
+  }
+  cp --reflink=auto --sparse=always -- "$provisioned_base" "$rescue_media"
+  cp --reflink=auto --sparse=always -- "$provisioned_target" "$target_image"
+  cp -- "$provisioned_key" "$vault_key"
+  chmod 600 -- "$rescue_media" "$target_image" "$vault_key"
+  target_before_sha256="$(sha256sum "$target_image" | awk '{print $1}')"
+  already_provisioned=true
+fi
+
 if [[ "$firmware" == uefi ]]; then
   for pair in \
     /usr/share/OVMF/OVMF_CODE_4M.fd:/usr/share/OVMF/OVMF_VARS_4M.fd \
@@ -184,21 +260,98 @@ qemu_args=(
   -fw_cfg name=opt/kernaid-tauri-sandbox-probe,string=v1
 )
 
+qualification_fault=""
+if [[ "$scenario" == repaird-termination || "$scenario" == auto-restore ]]; then
+  qualification_fault="$work_dir/qualification-fault"
+  if [[ "$scenario" == repaird-termination ]]; then
+    printf %s terminate-after-pending-v1 >"$qualification_fault"
+  else
+    printf %s fail-after-installed-v1 >"$qualification_fault"
+  fi
+  chmod 600 -- "$qualification_fault"
+  qemu_args+=(
+    -fw_cfg
+    "name=opt/io.systemd.credentials/kernaid-repair-fault,file=$qualification_fault"
+  )
+fi
+
 set +e
+controller_scenario="$scenario"
+if [[ "$scenario" == failure-paths ]]; then
+  controller_scenario=provision-base
+fi
 controller_args=(
   --qemu "$(command -v qemu-system-x86_64)"
   --qmp-socket "$qmp_socket"
   --firmware "$firmware"
-  --scenario "$scenario"
+  --scenario "$controller_scenario"
   --vault-key-fd 3 --login-credential-fd 4
   --before-sha256 "$before_sha256" --after-sha256 "$after_sha256"
   --timeout "$controller_timeout"
 )
+if [[ "$already_provisioned" == true ]]; then
+  controller_args+=(--already-provisioned)
+fi
+if [[ "$scenario" == backup-tamper ]]; then
+  controller_args+=(
+    --media-path "$rescue_media"
+    --vault-key-path "$vault_key"
+    --tamper-helper "$tamper_helper"
+  )
+fi
 if [[ "$firmware" == uefi ]]; then
   controller_args+=(
     --ovmf-code "$ovmf_code"
     --ovmf-vars-template "$ovmf_vars_template"
   )
+fi
+if [[ "$scenario" == failure-paths ]]; then
+  python3 -I -B "$controller" \
+    "${controller_args[@]}" -- "${qemu_args[@]}" \
+    3<"$vault_key" 4<"$login_credential" \
+    >"$controller_output" 2>"$controller_error"
+  controller_status=$?
+  set -e
+  if [[ "$controller_status" -ne 0 ]]; then
+    cat "$controller_error" >&2
+    exit "$controller_status"
+  fi
+  [[ ! -s "$controller_error" ]] || { cat "$controller_error" >&2; exit 1; }
+  expected_base="KERNAID_QEMU_REPAIR_CANDIDATE_GUEST_V1 action=none firmware=uefi scenario=provision-base before_sha256=$before_sha256 after_sha256=$after_sha256 vault_distinct=true terminal=provisioned reusable_base=true ready=true"
+  [[ "$(cat "$controller_output")" == "$expected_base" ]] || exit 1
+  [[ "$(sha256sum "$target_image" | awk '{print $1}')" == "$target_before_sha256" ]] \
+    || exit 1
+
+  failure_cases=(
+    stale-target
+    cancel
+    backup-tamper
+    repaird-termination
+    auto-restore
+  )
+  for failure_case in "${failure_cases[@]}"; do
+    case_output="$(
+      KERNAID_REPAIR_PROVISIONED_BASE="$rescue_media" \
+      KERNAID_REPAIR_PROVISIONED_KEY="$vault_key" \
+      KERNAID_REPAIR_TARGET_BASE="$target_image" \
+      KERNAID_QEMU_SMP="$qemu_smp" \
+        "$repo_dir/tools/build-rescue/qemu-repair-candidate-smoke.sh" \
+        uefi "$failure_case" "$iso"
+    )"
+    case_pattern="^KERNAID_QEMU_REPAIR_CANDIDATE_ATTESTATION_V1 .* scenario=$failure_case .* iso_sha256=$iso_sha256 .* ready=true$"
+    [[ "$case_output" != *$'\n'* \
+      && "$case_output" =~ $case_pattern ]] \
+      || exit 1
+  done
+  [[ "$(sha256sum "$target_image" | awk '{print $1}')" == "$target_before_sha256" \
+    && "$(stat -c '%s' -- "$vault_key")" == 64 \
+    && "$(tr -d '0-9a-f' <"$vault_key")" == "" ]] || exit 1
+  prefix_after_sha256="$(dd if="$rescue_media" bs=4M iflag=count_bytes \
+    count="$iso_bytes" status=none | sha256sum | awk '{print $1}')"
+  [[ "$prefix_after_sha256" == "$iso_sha256" ]] || exit 1
+  printf '%s\n' \
+    "KERNAID_QEMU_REPAIR_FAILURE_PATHS_ATTESTATION_V1 firmware=uefi scenarios=stale-target,cancel,backup-tamper,repaird-termination,auto-restore provisioning=shared isolated_sparse_copies=true stale_target=rejected cancellation=closed backup_tamper=rejected repaird_restart=closed automatic_restore=closed-before-restored iso_sha256=$iso_sha256 iso_prefix_immutable=true host_physical_devices=false ready=true"
+  exit 0
 fi
 python3 -I -B "$controller" \
   "${controller_args[@]}" -- "${qemu_args[@]}" \
@@ -219,8 +372,28 @@ elif [[ "$scenario" == rollback ]]; then
   expected_guest="KERNAID_QEMU_REPAIR_CANDIDATE_GUEST_V1 action=linux.fstab.restore firmware=$firmware scenario=rollback before_sha256=$before_sha256 after_sha256=$after_sha256 vault_distinct=true source_terminal=committed terminal=rolled-back-original state=restored approval=fresh-typed-single-use ready=true"
   expected_fstab="$seed/etc/fstab"
   expected_terminal=rolled-back-original
-else
+elif [[ "$scenario" == interrupt-reconcile ]]; then
   expected_guest="KERNAID_QEMU_REPAIR_CANDIDATE_GUEST_V1 action=linux.fstab.disable-missing-uuid.v1 firmware=$firmware scenario=interrupt-reconcile before_sha256=$before_sha256 after_sha256=$after_sha256 vault_distinct=true terminal=restored interruption=qmp-after-target-write recovery=closed ready=true"
+  expected_fstab="$seed/etc/fstab"
+  expected_terminal=restored
+elif [[ "$scenario" == stale-target ]]; then
+  expected_guest="KERNAID_QEMU_REPAIR_CANDIDATE_GUEST_V1 action=linux.fstab.disable-missing-uuid.v1 firmware=uefi scenario=stale-target before_sha256=$before_sha256 after_sha256=$after_sha256 vault_distinct=true terminal=failed stale_target=rejected target_writes=zero ready=true"
+  expected_fstab="$seed/etc/fstab"
+  expected_terminal=failed
+elif [[ "$scenario" == cancel ]]; then
+  expected_guest="KERNAID_QEMU_REPAIR_CANDIDATE_GUEST_V1 action=linux.fstab.disable-missing-uuid.v1 firmware=uefi scenario=cancel before_sha256=$before_sha256 after_sha256=$after_sha256 vault_distinct=true terminal=cancelled authority=released target_writes=zero ready=true"
+  expected_fstab="$seed/etc/fstab"
+  expected_terminal=cancelled
+elif [[ "$scenario" == backup-tamper ]]; then
+  expected_guest="KERNAID_QEMU_REPAIR_CANDIDATE_GUEST_V1 action=linux.fstab.restore firmware=uefi scenario=backup-tamper before_sha256=$before_sha256 after_sha256=$after_sha256 vault_distinct=true terminal=rejected backup_tamper=authenticated target_writes_second_boot=zero ready=true"
+  expected_fstab="$expected_after"
+  expected_terminal=rejected
+elif [[ "$scenario" == repaird-termination ]]; then
+  expected_guest="KERNAID_QEMU_REPAIR_CANDIDATE_GUEST_V1 action=linux.fstab.disable-missing-uuid.v1 firmware=uefi scenario=repaird-termination before_sha256=$before_sha256 after_sha256=$after_sha256 vault_distinct=true terminal=restored process=repaird-only recovery=closed-before-unchanged target_writes=zero ready=true"
+  expected_fstab="$seed/etc/fstab"
+  expected_terminal=restored
+else
+  expected_guest="KERNAID_QEMU_REPAIR_CANDIDATE_GUEST_V1 action=linux.fstab.disable-missing-uuid.v1 firmware=uefi scenario=auto-restore before_sha256=$before_sha256 after_sha256=$after_sha256 vault_distinct=true terminal=restored fault=after-installed recovery=closed-before-restored target_writes=positive ready=true"
   expected_fstab="$seed/etc/fstab"
   expected_terminal=restored
 fi
@@ -229,20 +402,52 @@ fi
 debugfs -R "dump -p /etc/fstab $observed_fstab" "$target_image" >/dev/null 2>&1
 debugfs -R "dump -p /boot/vmlinuz-kernaid-repair $observed_sentinel" \
   "$target_image" >/dev/null 2>&1
+debugfs -R "stat /etc/fstab" "$target_image" >"$observed_fstab_stat" 2>/dev/null
+debugfs -R "ls -p /etc" "$target_image" >"$observed_etc_listing" 2>/dev/null
 cmp -s -- "$expected_fstab" "$observed_fstab"
 [[ "$(cat "$observed_sentinel")" == KERNAID_REPAIR_TARGET_SENTINEL ]]
+grep -Eq '^Inode: [0-9]+[[:space:]]+Type: regular[[:space:]]+Mode:[[:space:]]+0644' \
+  "$observed_fstab_stat"
+grep -Eq '^User:[[:space:]]+0[[:space:]]+Group:[[:space:]]+0([[:space:]]|$)' \
+  "$observed_fstab_stat"
+grep -Eq '^File ACL:[[:space:]]+0([[:space:]]|$)' "$observed_fstab_stat"
+if grep -Eq '^Extended attributes:' "$observed_fstab_stat"; then
+  exit 1
+fi
+if grep -Eq 'kernaid-fstab-(stage|restore)-v1' "$observed_etc_listing"; then
+  exit 1
+fi
 target_after_sha256="$(sha256sum "$target_image" | awk '{print $1}')"
 if [[ "$scenario" == apply ]]; then
+  [[ "$target_after_sha256" != "$target_before_sha256" ]]
+elif [[ "$scenario" == stale-target || "$scenario" == cancel \
+  || "$scenario" == repaird-termination ]]; then
+  [[ "$target_after_sha256" == "$target_before_sha256" ]]
+elif [[ "$scenario" == backup-tamper || "$scenario" == auto-restore ]]; then
   [[ "$target_after_sha256" != "$target_before_sha256" ]]
 fi
 prefix_after_sha256="$(dd if="$rescue_media" bs=4M iflag=count_bytes \
   count="$iso_bytes" status=none | sha256sum | awk '{print $1}')"
 [[ "$prefix_after_sha256" == "$iso_sha256" ]]
 
-if [[ "$scenario" == rollback ]]; then
+if [[ "$scenario" == rollback || "$scenario" == backup-tamper ]]; then
   attested_action=linux.fstab.restore
 else
   attested_action=linux.fstab.disable-missing-uuid.v1
 fi
+case "$scenario" in
+  stale-target|cancel|repaird-termination)
+    failure_attestation=" target_writes=zero target_raw_immutable=true"
+    ;;
+  backup-tamper)
+    failure_attestation=" target_writes_second_boot=zero final_state=after"
+    ;;
+  auto-restore)
+    failure_attestation=" target_writes=positive final_state=before recovery=closed-before-restored"
+    ;;
+  *)
+    failure_attestation=""
+    ;;
+esac
 printf '%s\n' \
-  "KERNAID_QEMU_REPAIR_CANDIDATE_ATTESTATION_V1 action=$attested_action firmware=$firmware scenario=$scenario drives=rescue-usb,target-ext4 physical_parents=distinct vault=luks2-ext4 before_sha256=$before_sha256 after_sha256=$after_sha256 exact_bytes=true terminal=$expected_terminal iso_prefix_immutable=true host_physical_devices=false ready=true"
+  "KERNAID_QEMU_REPAIR_CANDIDATE_ATTESTATION_V1 action=$attested_action firmware=$firmware scenario=$scenario drives=rescue-usb,target-ext4 physical_parents=distinct vault=luks2-ext4 before_sha256=$before_sha256 after_sha256=$after_sha256 exact_bytes=true metadata=mode-uid-gid-no-xattrs stage_cleanup=true terminal=$expected_terminal iso_sha256=$iso_sha256 iso_prefix_immutable=true host_physical_devices=false${failure_attestation} ready=true"

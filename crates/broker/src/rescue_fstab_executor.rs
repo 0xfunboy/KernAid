@@ -64,6 +64,19 @@ const VAULT_RECOVERY_POLL: Duration = Duration::from_millis(250);
 
 static PROCESS_EXECUTOR_LOCK: Mutex<()> = Mutex::new(());
 
+/// Closed QEMU qualification seam for the production candidate. The only
+/// accepted modes are compiled into the candidate and enter at durability
+/// boundaries that the exact-image gate must exercise. Ordinary candidate
+/// boots always use `None`; default/stable broker builds do not compile this
+/// module at all.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum RescueFstabQualificationFault {
+    #[default]
+    None,
+    TerminateAfterPending,
+    FailAfterInstalled,
+}
+
 /// Closed result of a transaction which reached a durable terminal record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RescueFstabExecutionOutcome {
@@ -590,6 +603,21 @@ pub fn execute_approved_rescue_fstab(
     >,
     deadline: Instant,
 ) -> Result<RescueFstabExecutionReceipt, RescueFstabExecutionError> {
+    execute_approved_rescue_fstab_with_qualification_fault(
+        approved,
+        deadline,
+        RescueFstabQualificationFault::None,
+    )
+}
+
+pub(crate) fn execute_approved_rescue_fstab_with_qualification_fault(
+    approved: ApprovedRescueFstabTransaction<
+        ProductionRescueFstabTargetGuard,
+        ProductionRescueFstabVaultReservation,
+    >,
+    deadline: Instant,
+    qualification_fault: RescueFstabQualificationFault,
+) -> Result<RescueFstabExecutionReceipt, RescueFstabExecutionError> {
     let operation_deadline = match reserve_cleanup_window(deadline) {
         Ok(operation) => operation,
         Err(error) => {
@@ -676,6 +704,14 @@ pub fn execute_approved_rescue_fstab(
     let pending = RepairTransactionStatusPayload::pending(durable)
         .map_err(|_| RescueFstabExecutionError::InvalidAuthority)?;
 
+    if qualification_fault == RescueFstabQualificationFault::TerminateAfterPending {
+        // The exact-image gate must prove that socket activation starts a new
+        // repaird and reconciles this durable Pending record. `abort` is
+        // deliberately process-local: QEMU, Vault and the target helpers stay
+        // alive, while LimitCORE=0 prevents a credential-bearing core file.
+        std::process::abort();
+    }
+
     // The read-only detached mount must be gone before the root helper creates
     // the exclusive writable superblock. From here the durable Pending record,
     // not any boot-local descriptor retained by this process, is authority.
@@ -690,6 +726,7 @@ pub fn execute_approved_rescue_fstab(
         &intent,
         pending.backup().reservation_id().as_str(),
         operation_deadline,
+        qualification_fault,
     )?;
     let initial_failure = target_closure.initial_failure;
 
@@ -1298,7 +1335,7 @@ fn acquire_target_lock(
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct ClosedObservation {
     resource_sha256: Sha256,
     metadata_sha256: Sha256,
@@ -1331,6 +1368,7 @@ fn execute_same_boot_target(
     intent: &RepairExecutionIntentV1,
     reservation_id: &str,
     deadline: Instant,
+    qualification_fault: RescueFstabQualificationFault,
 ) -> Result<TargetClosure, RescueFstabExecutionError> {
     ensure_exact_bytes(backup, intent.before_sha256())?;
     ensure_exact_bytes(proposed, intent.after_sha256())?;
@@ -1350,6 +1388,7 @@ fn execute_same_boot_target(
             intent,
             reservation_id,
             deadline,
+            qualification_fault,
         ) {
             Ok(observation) => Ok(TargetClosure {
                 outcome: RepairTransactionResolutionOutcome::CommittedAfter,
@@ -1645,6 +1684,7 @@ fn close_after_failed_mutation(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_exact_replacement(
     _mount: &OwnedFd,
     etc: &OwnedFd,
@@ -1653,6 +1693,7 @@ fn apply_exact_replacement(
     intent: &RepairExecutionIntentV1,
     reservation_id: &str,
     deadline: Instant,
+    qualification_fault: RescueFstabQualificationFault,
 ) -> Result<ClosedObservation, RescueFstabExecutionError> {
     ensure_deadline(deadline)?;
     let before = snapshot_fstab(etc)?;
@@ -1696,6 +1737,12 @@ fn apply_exact_replacement(
         intent.after_sha256(),
         intent.before_metadata(),
     )?;
+    if qualification_fault == RescueFstabQualificationFault::FailAfterInstalled {
+        // At this point `After` is exact and durable. Returning the ordinary
+        // closed mutation error forces the real same-boot recovery path to
+        // classify it and restore the authenticated backup.
+        return Err(RescueFstabExecutionError::MutationFailed);
+    }
     Ok(final_state.observation())
 }
 
@@ -2283,6 +2330,7 @@ mod tests {
             &intent,
             RESERVATION,
             Instant::now() + Duration::from_secs(5),
+            RescueFstabQualificationFault::None,
         )
         .expect("apply exact replacement");
         assert_eq!(observation.resource_sha256, *intent.after_sha256());
@@ -2320,6 +2368,7 @@ mod tests {
             &intent,
             RESERVATION,
             Instant::now() + Duration::from_secs(5),
+            RescueFstabQualificationFault::None,
         )
         .expect("apply exact replacement");
         let third = b"# independently edited\n";
@@ -2338,6 +2387,46 @@ mod tests {
         assert_eq!(
             fs::read(tree.path().join(FSTAB_RESOURCE)).expect("read independently edited fstab"),
             third
+        );
+    }
+
+    #[test]
+    fn qualification_failure_after_exact_install_uses_real_automatic_restore() {
+        let (tree, directory, intent) = setup();
+        let error = apply_exact_replacement(
+            &directory,
+            &directory,
+            BEFORE,
+            AFTER,
+            &intent,
+            RESERVATION,
+            Instant::now() + Duration::from_secs(5),
+            RescueFstabQualificationFault::FailAfterInstalled,
+        )
+        .expect_err("qualification hook must fail after durable install");
+        assert_eq!(error, RescueFstabExecutionError::MutationFailed);
+        assert_eq!(
+            fs::read(tree.path().join(FSTAB_RESOURCE)).expect("read installed fstab"),
+            AFTER
+        );
+
+        let closure = close_after_failed_mutation(
+            &directory,
+            &directory,
+            BEFORE,
+            &intent,
+            RESERVATION,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .expect("automatic restore");
+        assert_eq!(
+            closure.outcome,
+            RepairTransactionResolutionOutcome::ClosedBeforeRestored
+        );
+        assert_eq!(closure.observation.resource_sha256, *intent.before_sha256());
+        assert_eq!(
+            fs::read(tree.path().join(FSTAB_RESOURCE)).expect("read restored fstab"),
+            BEFORE
         );
     }
 }

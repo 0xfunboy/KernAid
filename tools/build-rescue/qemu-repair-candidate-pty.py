@@ -9,6 +9,7 @@ import os
 import re
 import signal
 import stat
+import subprocess
 import sys
 import textwrap
 import time
@@ -28,6 +29,16 @@ SPEC.loader.exec_module(LIFECYCLE)
 FAILURE_PREFIX = "KERNAID_QEMU_REPAIR_CANDIDATE_FAILURE_V1"
 ATTESTATION_PREFIX = "KERNAID_QEMU_REPAIR_CANDIDATE_GUEST_V1"
 TARGET_NODE = "kernaid_repair_target"
+FAULT_CREDENTIAL = "kernaid-repair-fault"
+FAULT_TERMINATE_AFTER_PENDING = "terminate-after-pending-v1"
+FAULT_FAIL_AFTER_INSTALLED = "fail-after-installed-v1"
+FAILURE_SCENARIOS = (
+    "stale-target",
+    "cancel",
+    "backup-tamper",
+    "repaird-termination",
+    "auto-restore",
+)
 OVMF_ROOTS = (Path("/usr/share/OVMF"), Path("/usr/share/edk2"))
 
 EXECUTE_STATE_CLASSIFIER_SOURCE = r'''
@@ -73,15 +84,25 @@ def parser() -> ClosedParser:
     value.add_argument("--firmware", choices=("bios", "uefi"), required=True)
     value.add_argument(
         "--scenario",
-        choices=("apply", "rollback", "interrupt-reconcile"),
+        choices=(
+            "apply",
+            "rollback",
+            "interrupt-reconcile",
+            "provision-base",
+            *FAILURE_SCENARIOS,
+        ),
         required=True,
     )
+    value.add_argument("--already-provisioned", action="store_true")
     value.add_argument("--ovmf-code", type=Path)
     value.add_argument("--ovmf-vars-template", type=Path)
     value.add_argument("--vault-key-fd", type=int, required=True)
     value.add_argument("--login-credential-fd", type=int, required=True)
     value.add_argument("--before-sha256", required=True)
     value.add_argument("--after-sha256", required=True)
+    value.add_argument("--media-path", type=Path)
+    value.add_argument("--vault-key-path", type=Path)
+    value.add_argument("--tamper-helper", type=Path)
     value.add_argument("--timeout", type=float, default=900.0)
     value.add_argument("qemu_args", nargs=argparse.REMAINDER)
     return value
@@ -214,8 +235,73 @@ def qemu_args_for_boot(
     return result
 
 
+def qualification_fault(base: Sequence[str], work_directory: Path) -> str | None:
+    """Read the one closed QEMU credential token, if supplied."""
+
+    needle = f"opt/io.systemd.credentials/{FAULT_CREDENTIAL}"
+    prefix = f"name=opt/io.systemd.credentials/{FAULT_CREDENTIAL},file="
+    related = [argument for argument in base if needle in argument]
+    if not related:
+        return None
+    if len(related) != 1 or not related[0].startswith(prefix):
+        raise LIFECYCLE.ClosedFailure("arguments", "fault-credential-invalid")
+    path = Path(related[0][len(prefix) :])
+    descriptor = -1
+    try:
+        resolved = path.resolve(strict=True)
+        expected = (work_directory / "qualification-fault").resolve(strict=True)
+        if path != resolved or resolved != expected:
+            raise LIFECYCLE.ClosedFailure("arguments", "fault-credential-invalid")
+        parent = resolved.parent.stat()
+        descriptor = os.open(
+            resolved, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+        )
+        before = os.fstat(descriptor)
+        value = os.read(descriptor, 65)
+        trailing = os.read(descriptor, 1)
+        after = os.fstat(descriptor)
+    except OSError as error:
+        raise LIFECYCLE.ClosedFailure("arguments", "fault-credential-invalid") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    identity = lambda metadata: (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+    if (
+        not stat.S_ISDIR(parent.st_mode)
+        or parent.st_uid != os.geteuid()
+        or stat.S_IMODE(parent.st_mode) != 0o700
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_uid != os.geteuid()
+        or stat.S_IMODE(before.st_mode) != 0o600
+        or before.st_nlink != 1
+        or identity(before) != identity(after)
+        or trailing
+        or len(value) != before.st_size
+        or value not in {
+            FAULT_TERMINATE_AFTER_PENDING.encode("ascii"),
+            FAULT_FAIL_AFTER_INSTALLED.encode("ascii"),
+        }
+    ):
+        raise LIFECYCLE.ClosedFailure("arguments", "fault-credential-invalid")
+    return value.decode("ascii")
+
+
 def repair_source(
-    before_sha256: str, after_sha256: str, *, interrupt_arm: bool = False
+    before_sha256: str,
+    after_sha256: str,
+    *,
+    interrupt_arm: bool = False,
+    emit_receipt: bool = False,
 ) -> bytes:
     # This source is fixed by the qualification controller. It supplies only
     # opaque target claims and the exact typed approval accepted by production.
@@ -231,6 +317,7 @@ API="kernaid.dev/rescue-repair-service/v1alpha1"
 BEFORE={before_sha256!r}
 AFTER={after_sha256!r}
 INTERRUPT_ARM={interrupt_arm!r}
+EMIT_RECEIPT={emit_receipt!r}
 STAGE={stage!r}
 CHECKPOINTS=({checkpoints},)
 {EXECUTE_STATE_CLASSIFIER_SOURCE}
@@ -417,9 +504,257 @@ try:
             raise RuntimeError()
 except BaseException:
     fail(checkpoint)
-sys.stdout.write("KERNAID_QEMU_PROVIDER_PROOF_V1 stage="+STAGE+" result=true\\n")
+if EMIT_RECEIPT:
+    sys.stdout.write("KERNAID_QEMU_REPAIR_RECEIPT_V1 reservation_id="+terminal_detail["reservationId"]+" binding="+terminal_detail["transactionBindingSha256"]+"\\n")
+else:
+    sys.stdout.write("KERNAID_QEMU_PROVIDER_PROOF_V1 stage="+STAGE+" result=true\\n")
 '''
     return textwrap.dedent(source).encode("ascii")
+
+
+def failure_path_source(mode: str, before_sha256: str, after_sha256: str) -> bytes:
+    """Return one source-fixed proof for a no-write or injected failure path."""
+
+    if mode not in {
+        "stale-target",
+        "cancel",
+        "repaird-termination",
+        "auto-restore",
+    }:
+        raise ValueError("unsupported failure mode")
+    source = r'''import hashlib,http.client,json,secrets,subprocess,sys,time
+HOST="127.0.0.1:4173"
+ORIGIN="http://127.0.0.1:4173"
+API="kernaid.dev/rescue-repair-service/v1alpha1"
+MODE=__MODE__
+BEFORE=__BEFORE__
+AFTER=__AFTER__
+counter=0
+def request_id():
+    global counter
+    counter+=1
+    return "R-30000000-0000-0000-0000-"+format(counter,"012x")
+def valid_id(value,prefix):
+    return isinstance(value,str) and value.startswith(prefix) and len(value)==len(prefix)+32 and all(character in "0123456789abcdef" for character in value[len(prefix):])
+def valid_hash(value):
+    return isinstance(value,str) and value.startswith("sha256:") and len(value)==71 and all(character in "0123456789abcdef" for character in value[7:])
+def exchange(path,body=None,timeout=25):
+    encoded=None if body is None else json.dumps(body,ensure_ascii=True,separators=(",",":")).encode("ascii")
+    headers={"Host":HOST}
+    if encoded is not None:
+        headers.update({"Origin":ORIGIN,"Content-Type":"application/json"})
+    connection=http.client.HTTPConnection("127.0.0.1",4173,timeout=timeout)
+    try:
+        connection.request("GET" if encoded is None else "POST",path,body=encoded,headers=headers)
+        response=connection.getresponse()
+        payload=response.read(65537)
+        status=response.status
+    finally:
+        connection.close()
+    if len(payload)>65536:
+        raise RuntimeError()
+    return status,json.loads(payload)
+def repair(operation,extra=None):
+    request={"apiVersion":API,"requestId":request_id(),"operation":operation}
+    if extra is not None:
+        request.update(extra)
+    status,value=exchange("/api/rescue/repair",request)
+    if status!=200 or not isinstance(value,dict) or value.get("outcome")!="ok" or value.get("operation")!=operation or value.get("requestId")!=request["requestId"]:
+        raise RuntimeError()
+    return value
+def wait(states,deadline):
+    while time.monotonic()<deadline:
+        try:
+            value=repair("repair.status")
+            if value.get("state") in states:
+                return value
+        except BaseException:
+            pass
+        time.sleep(.2)
+    raise RuntimeError()
+def terminal(value,state,outcome,transaction,prepare_stage=None):
+    detail=value.get("detail")
+    keys={"kind","terminalOutcome","reservationId","transactionBindingSha256","rebootRequired","prepareFailureStage"}
+    if value.get("state")!=state or not isinstance(detail,dict) or set(detail)!=keys or detail.get("kind")!="terminal" or detail.get("terminalOutcome")!=outcome or detail.get("rebootRequired") is not False or detail.get("prepareFailureStage")!=prepare_stage:
+        return False
+    has_transaction=valid_id(detail.get("reservationId"),"B-") and valid_hash(detail.get("transactionBindingSha256"))
+    no_transaction=detail.get("reservationId") is None and detail.get("transactionBindingSha256") is None
+    return has_transaction if transaction else no_transaction
+def repaird_pid():
+    result=subprocess.run(["systemctl","show","--property=MainPID","--value","kernaid-rescue-repaird.service"],stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=5,check=False)
+    text=result.stdout.decode("ascii").strip()
+    if result.returncode!=0 or not text.isdigit() or int(text)<=1:
+        raise RuntimeError()
+    return int(text)
+def mutation_diagnostic(deadline):
+    expected="KERNAID_RESCUE_REPAIR_EXECUTION_FAILURE_V1 stage=mutation"
+    while time.monotonic()<deadline:
+        result=subprocess.run(["systemctl","show","--property=StatusText","--value","kernaid-rescue-repaird.service"],stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=5,check=False)
+        if result.returncode==0 and len(result.stdout)<=192 and result.stdout.decode("ascii").strip()==expected:
+            return True
+        time.sleep(.1)
+    return False
+deadline=time.monotonic()+420
+try:
+    while True:
+        try:
+            initial=repair("repair.status")
+            if initial.get("state")=="idle":
+                break
+        except BaseException:
+            pass
+        if time.monotonic()>=deadline:
+            raise RuntimeError()
+        time.sleep(.25)
+    while True:
+        try:
+            inventory_code,inventory=exchange("/api/inventory")
+            scan_code,scan=exchange("/api/rescue/installed-targets")
+            if inventory_code==200 and scan_code==200:
+                break
+        except BaseException:
+            pass
+        if time.monotonic()>=deadline:
+            raise RuntimeError()
+        time.sleep(.25)
+    candidates=[item for item in scan["candidates"] if item.get("osFamilyHint")=="linux" and item.get("requiresUnlock") is False]
+    if len(candidates)!=1:
+        raise RuntimeError()
+    candidate=candidates[0]
+    selection={"scanFingerprint":scan["scanFingerprint"],"targetId":candidate["targetId"]}
+    selected_code,selected=exchange("/api/rescue/select-installed-target",selection)
+    inspected_code,inspected=exchange("/api/rescue/inspect-installed-target",selection)
+    if selected_code!=200 or selected.get("target")!=candidate or inspected_code!=200 or inspected.get("status")!="installed-os-content-inspected" or inspected.get("target",{}).get("filesystem")!="ext4":
+        raise RuntimeError()
+    identity=[item for item in inventory if "hostname" in item.get("collector","") or "block.inventory" in item.get("collector","") or item.get("collector","").endswith((".disks",".system",".storage.identity"))]
+    if not identity or any(item.get("success") is not True or item.get("truncated") is True for item in identity):
+        raise RuntimeError()
+    canonical="\0".join(item["collector"]+"\0"+item["output"] for item in identity)
+    runtime="sha256:"+hashlib.sha256(canonical.encode()).hexdigest()
+    candidate_json=json.dumps(candidate,ensure_ascii=True,sort_keys=True,separators=(",",":"))
+    material="\0".join(("kernaid-rescue-observe-target-v1",runtime,scan["scanFingerprint"],candidate["targetId"],candidate_json))
+    target_fingerprint="sha256:"+hashlib.sha256(material.encode()).hexdigest()
+    if MODE=="stale-target":
+        target_fingerprint=target_fingerprint[:-1]+("0" if target_fingerprint[-1]!="0" else "1")
+    prepared=repair("repair.fstab.prepare",{"target":{"scanFingerprint":scan["scanFingerprint"],"targetFingerprint":target_fingerprint,"targetId":candidate["targetId"]}})
+    if MODE=="stale-target":
+        if prepared.get("state")=="preparing":
+            prepared=wait({"failed","restored","manual-reconciliation-required"},deadline)
+        if not terminal(prepared,"failed","failed",False,"target-capability-identity-changed"):
+            raise RuntimeError()
+    else:
+        if prepared.get("state")=="preparing":
+            prepared=wait({"prepared","failed","restored","manual-reconciliation-required"},deadline)
+        detail=prepared.get("detail")
+        keys={"kind","preparedId","sessionId","planId","planHash","targetFingerprint","beforeSha256","afterSha256","diffSha256","resourceId","backupLocator","actionId","risk","backup","nextApprovalSequence","confirmationRequired"}
+        if prepared.get("state")!="prepared" or not isinstance(detail,dict) or set(detail)!=keys or detail.get("kind")!="fstab-prepared" or detail.get("targetFingerprint")!=target_fingerprint or detail.get("beforeSha256")!=BEFORE or detail.get("afterSha256")!=AFTER or detail.get("backup")!={"state":"reserved","vaultDistinct":True} or detail.get("confirmationRequired")!="DISABILITA VOCE FSTAB" or not valid_id(detail.get("preparedId"),"Q-") or not valid_hash(detail.get("planHash")):
+            raise RuntimeError()
+        if MODE=="cancel":
+            cancelled=repair("repair.fstab.cancel",{"preparedId":detail["preparedId"],"planHash":detail["planHash"]})
+            if cancelled.get("state")=="executing":
+                cancelled=wait({"cancelled","failed","restored","manual-reconciliation-required"},deadline)
+            if not terminal(cancelled,"cancelled","cancelled",False):
+                raise RuntimeError()
+        else:
+            old_pid=repaird_pid() if MODE=="repaird-termination" else None
+            approval={"preparedId":detail["preparedId"],"sessionId":detail["sessionId"],"planId":detail["planId"],"planHash":detail["planHash"],"approvalId":"A-"+secrets.token_hex(16),"approvalSequence":detail["nextApprovalSequence"],"typedConfirmation":"DISABILITA VOCE FSTAB"}
+            approved=None
+            try:
+                approved=repair("repair.fstab.approve",approval)
+            except BaseException:
+                if MODE!="repaird-termination":
+                    raise
+            if MODE=="repaird-termination":
+                approved=wait({"restored","failed","manual-reconciliation-required"},deadline)
+                new_pid=repaird_pid()
+                if new_pid==old_pid or not terminal(approved,"restored","closed-before-unchanged",True):
+                    raise RuntimeError()
+            else:
+                if approved.get("state")=="executing":
+                    approved=wait({"succeeded","restored","failed","manual-reconciliation-required"},deadline)
+                if not terminal(approved,"restored","closed-before-restored",True) or not mutation_diagnostic(deadline):
+                    raise RuntimeError()
+except BaseException:
+    sys.exit(46)
+sys.stdout.write("KERNAID_QEMU_PROVIDER_PROOF_V1 stage=repair-"+MODE+" result=true\n")
+'''
+    generated = (
+        textwrap.dedent(source)
+        .replace("__MODE__", repr(mode))
+        .replace("__BEFORE__", repr(before_sha256))
+        .replace("__AFTER__", repr(after_sha256))
+        .encode("ascii")
+    )
+    if len(generated) > 16 * 1024:
+        raise ValueError("failure proof exceeds guest source limit")
+    return generated
+
+
+def tampered_backup_source(reservation_id: str, binding: str) -> bytes:
+    """Return a source-fixed proof that an authenticated backup tamper closes."""
+
+    source = r'''import http.client,json,sys,time
+HOST="127.0.0.1:4173"
+ORIGIN="http://127.0.0.1:4173"
+API="kernaid.dev/rescue-repair-service/v1alpha2"
+SOURCE={"reservationId":__RESERVATION__,"transactionBindingSha256":__BINDING__}
+counter=0
+def request_id():
+    global counter
+    counter+=1
+    return "R-40000000-0000-0000-0000-"+format(counter,"012x")
+def valid_id(value):
+    return isinstance(value,str) and value.startswith("B-") and len(value)==34 and all(character in "0123456789abcdef" for character in value[2:])
+def valid_hash(value):
+    return isinstance(value,str) and value.startswith("sha256:") and len(value)==71 and all(character in "0123456789abcdef" for character in value[7:])
+def repair(operation,extra=None):
+    request={"apiVersion":API,"requestId":request_id(),"operation":operation}
+    if extra is not None:
+        request.update(extra)
+    encoded=json.dumps(request,ensure_ascii=True,separators=(",",":")).encode("ascii")
+    connection=http.client.HTTPConnection("127.0.0.1",4173,timeout=25)
+    try:
+        connection.request("POST","/api/rescue/repair",body=encoded,headers={"Host":HOST,"Origin":ORIGIN,"Content-Type":"application/json"})
+        response=connection.getresponse()
+        payload=response.read(65537)
+        status=response.status
+    finally:
+        connection.close()
+    if status!=200 or len(payload)>65536:
+        raise RuntimeError()
+    value=json.loads(payload)
+    if value.get("outcome")!="ok" or value.get("operation")!=operation or value.get("requestId")!=request["requestId"]:
+        raise RuntimeError()
+    return value
+def committed(value):
+    detail=value.get("detail")
+    keys={"kind","terminalOutcome","reservationId","transactionBindingSha256","rebootRequired","prepareFailureStage"}
+    return value.get("state")=="succeeded" and isinstance(detail,dict) and set(detail)==keys and detail.get("kind")=="terminal" and detail.get("terminalOutcome")=="committed" and valid_id(detail.get("reservationId")) and valid_hash(detail.get("transactionBindingSha256")) and detail.get("rebootRequired") is False and detail.get("prepareFailureStage") is None
+deadline=time.monotonic()+420
+try:
+    if not valid_id(SOURCE["reservationId"]) or not valid_hash(SOURCE["transactionBindingSha256"]):
+        raise RuntimeError()
+    initial=repair("repair.fstab.rollback.status")
+    if initial.get("state")!="idle" or initial.get("detail") is not None:
+        raise RuntimeError()
+    result=repair("repair.fstab.rollback.prepare",{"source":SOURCE})
+    if result.get("state")=="prepared":
+        raise RuntimeError()
+    while result.get("state")=="preparing" and time.monotonic()<deadline:
+        time.sleep(.2)
+        result=repair("repair.fstab.rollback.status")
+    if result.get("state")!="idle" or result.get("detail") is not None:
+        raise RuntimeError()
+except BaseException:
+    sys.exit(46)
+sys.stdout.write("KERNAID_QEMU_PROVIDER_PROOF_V1 stage=repair-backup-tamper result=true\n")
+'''
+    return (
+        textwrap.dedent(source)
+        .replace("__RESERVATION__", repr(reservation_id))
+        .replace("__BINDING__", repr(binding))
+        .encode("ascii")
+    )
 
 
 def rollback_source(before_sha256: str, after_sha256: str) -> bytes:
@@ -543,8 +878,8 @@ try:
         raise RuntimeError()
     candidate=candidates[0]
     selection={"scanFingerprint":scan["scanFingerprint"],"targetId":candidate["targetId"]}
-    selected_code,selected=http("/api/rescue/select-installed-target",selection)
-    inspected_code,inspected=http("/api/rescue/inspect-installed-target",selection)
+    selected_code,selected=call("/api/rescue/select-installed-target",selection)
+    inspected_code,inspected=call("/api/rescue/inspect-installed-target",selection)
     if selected_code!=200 or selected.get("target")!=candidate or inspected_code!=200 or inspected.get("status")!="installed-os-content-inspected" or inspected.get("target",{}).get("filesystem")!="ext4":
         raise RuntimeError()
     checkpoint="target-identity"
@@ -667,6 +1002,184 @@ sys.stdout.write("KERNAID_QEMU_PROVIDER_PROOF_V1 stage=repair-reconcile result=t
     return textwrap.dedent(source).encode("ascii")
 
 
+def run_receipt_guest_proof(
+    console: object,
+    source: bytes,
+    cursor: int,
+    aggregate: float,
+) -> tuple[str, str, int]:
+    """Run the committed apply and retain its bounded receipt only in memory."""
+
+    if not source or b"\x00" in source or len(source) > 16 * 1024:
+        raise LIFECYCLE.ClosedFailure("receipt", "source-invalid")
+    begin = b"KERNAID_PROVIDER_PROOF_BEGIN_V1_repair-backup-tamper-apply"
+    end = b"KERNAID_PROVIDER_PROOF_END_V1_repair-backup-tamper-apply"
+    started = time.monotonic()
+    if aggregate - started < 455.0:
+        raise LIFECYCLE.ClosedFailure("receipt", "aggregate-budget")
+    shell = (
+        b"printf '%s\\n' '"
+        + begin
+        + b"'; /usr/bin/python3 -I -B -c "
+        + LIFECYCLE._shell_single_quote(source)
+        + b"; rc=$?; printf '%s rc=%s\\n' '"
+        + end
+        + b"' \"$rc\"\n"
+    )
+    console.send(shell, deadline=started + 5.0)
+    begin_match = console.wait_regex(
+        LIFECYCLE._trusted_shell_line_pattern(begin),
+        start=cursor,
+        deadline=started + 15.0,
+        stage="receipt-start",
+    )
+    receipt_pattern = re.compile(
+        rb"(?:\A|(?<=\n))(?:\x1b\[\?2004l\r)?"
+        rb"(KERNAID_QEMU_REPAIR_RECEIPT_V1 "
+        rb"reservation_id=(B-[0-9a-f]{32}) "
+        rb"binding=(sha256:[0-9a-f]{64}))\r?\n"
+    )
+    receipt = console.wait_regex(
+        receipt_pattern,
+        start=begin_match.end(),
+        deadline=started + 435.0,
+        stage="receipt",
+    )
+    end_match = console.wait_regex(
+        LIFECYCLE._return_code_line_pattern(end),
+        start=receipt.end(),
+        deadline=started + 445.0,
+        stage="receipt-finish",
+    )
+    if LIFECYCLE._canonical_return_code(end_match.group(1)) != 0:
+        raise LIFECYCLE.ClosedFailure("receipt", "command-failed")
+    block = console.capture.snapshot()[begin_match.end() : end_match.start()]
+    marker = receipt.group(1)
+    if LIFECYCLE._normalize(block) != [marker]:
+        raise LIFECYCLE.ClosedFailure("receipt", "output-invalid")
+    return (
+        receipt.group(2).decode("ascii"),
+        receipt.group(3).decode("ascii"),
+        end_match.end(),
+    )
+
+
+def invoke_vault_tamper(
+    helper: Path,
+    media: Path,
+    key_file: Path,
+    reservation_id: str,
+    aggregate: float,
+) -> None:
+    """Run the root-only, no-mount disposable Vault tamper helper."""
+
+    try:
+        resolved = helper.resolve(strict=True)
+        metadata = resolved.stat()
+    except OSError as error:
+        raise LIFECYCLE.ClosedFailure("tamper", "helper-invalid") from error
+    if (
+        resolved != TOOLS / "qemu-repair-vault-tamper.py"
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_mode & 0o022
+    ):
+        raise LIFECYCLE.ClosedFailure("tamper", "helper-invalid")
+    remaining = aggregate - time.monotonic()
+    if remaining < 185.0:
+        raise LIFECYCLE.ClosedFailure("tamper", "deadline")
+    timeout = min(180.0, remaining - 5.0)
+    try:
+        result = subprocess.run(
+            [
+                "/usr/bin/sudo",
+                "-n",
+                "--",
+                "/usr/bin/python3",
+                "-I",
+                "-B",
+                os.fspath(resolved),
+                "--media",
+                os.fspath(media),
+                "--key-file",
+                os.fspath(key_file),
+                "--reservation-id",
+                reservation_id,
+                "--p3-offset",
+                "17179869184",
+                "--p3-bytes",
+                "8589934592",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            close_fds=True,
+            env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C", "LC_ALL": "C"},
+            check=False,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise LIFECYCLE.ClosedFailure("tamper", "helper-failed") from error
+    expected = (
+        b"KERNAID_QEMU_REPAIR_VAULT_TAMPER_ATTESTATION_V1 "
+        b"object=single-authenticated-backup mutation=inode-size-one "
+        b"mount=false cleanup=complete ready=true\n"
+    )
+    if result.returncode != 0 or result.stdout != expected or result.stderr:
+        raise LIFECYCLE.ClosedFailure("tamper", "helper-failed")
+
+
+def provision_firstboot(
+    console: object, qmp: object, key: bytearray, aggregate: float
+) -> None:
+    """Provision exactly one zero-p3 disposable Rescue medium."""
+
+    console.wait_regex(
+        re.compile(rb"KERNAID_RESCUE_FIRSTBOOT_PROMPT_READY_V1 step=passphrase"),
+        start=0,
+        deadline=LIFECYCLE._deadline(aggregate, 600.0),
+        stage="firstboot-start",
+    )
+    qmp.set_deadline(LIFECYCLE._deadline(aggregate, 10.0))
+    qmp.send_hex_line(key)
+    confirmation = console.wait_regex(
+        re.compile(rb"KERNAID_RESCUE_FIRSTBOOT_PROMPT_READY_V1 step=confirmation"),
+        start=0,
+        deadline=LIFECYCLE._deadline(aggregate, 600.0),
+        stage="firstboot-confirmation",
+    )
+    qmp.set_deadline(LIFECYCLE._deadline(aggregate, 10.0))
+    qmp.send_hex_line(key)
+    LIFECYCLE.wait_firstboot_attestation(
+        console, confirmation.end(), LIFECYCLE._deadline(aggregate, 600.0)
+    )
+
+
+def unlock_repair_vault(
+    console: object,
+    aggregate: float,
+    login: bytearray,
+    key: bytearray,
+    *,
+    stage: str,
+) -> int:
+    """Enter the live session and require a locked-to-unlocked transition."""
+
+    cursor = LIFECYCLE.establish_live_session(console, aggregate, login)
+    _, cursor = LIFECYCLE.collect_runtime(console, f"{stage}-initial", cursor, aggregate)
+    initial, cursor = LIFECYCLE.run_companion(
+        console, "status", f"{stage}-initial-status", cursor, aggregate
+    )
+    if initial.vault_state != "locked" or initial.device_id is not None:
+        raise LIFECYCLE.ClosedFailure("vault", "initial-status-invalid")
+    unlocked, cursor = LIFECYCLE.run_companion(
+        console, "unlock", f"{stage}-unlock", cursor, aggregate, key
+    )
+    if unlocked.vault_state != "unlocked" or unlocked.device_id is None:
+        raise LIFECYCLE.ClosedFailure("vault", "unlock-invalid")
+    return cursor
+
+
 def target_write_bytes(qmp: object) -> int:
     """Return the completed write-byte counter for the exact target node."""
 
@@ -758,14 +1271,21 @@ def main(arguments: Sequence[str]) -> int:
         parsed = parser().parse_args(arguments)
         if parsed.qemu_args[:1] != ["--"]:
             raise LIFECYCLE.ClosedFailure("arguments", "invalid")
-        if parsed.scenario in {"rollback", "interrupt-reconcile"} and parsed.firmware != "uefi":
+        if (
+            parsed.scenario in {"rollback", "interrupt-reconcile", *FAILURE_SCENARIOS}
+            and parsed.firmware != "uefi"
+        ):
             raise LIFECYCLE.ClosedFailure("arguments", "scenario-firmware-invalid")
+        if parsed.scenario == "provision-base" and parsed.already_provisioned:
+            raise LIFECYCLE.ClosedFailure("arguments", "provision-state-invalid")
         for digest in (parsed.before_sha256, parsed.after_sha256):
             if re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
                 raise LIFECYCLE.ClosedFailure("arguments", "digest-invalid")
-        timeout_maximum = (
-            1800 if parsed.scenario in {"rollback", "interrupt-reconcile"} else 1200
-        )
+        timeout_maximum = 1800 if parsed.scenario in {
+            "rollback",
+            "interrupt-reconcile",
+            "backup-tamper",
+        } else 1200
         if (
             parsed.before_sha256 == parsed.after_sha256
             or not 300 <= parsed.timeout <= timeout_maximum
@@ -788,6 +1308,23 @@ def main(arguments: Sequence[str]) -> int:
                 raise LIFECYCLE.ClosedFailure("firmware", "pair-forbidden")
             ovmf_code = None
             ovmf_vars_template = None
+        fault = qualification_fault(parsed.qemu_args[1:], parsed.qmp_socket.parent)
+        expected_fault = {
+            "repaird-termination": FAULT_TERMINATE_AFTER_PENDING,
+            "auto-restore": FAULT_FAIL_AFTER_INSTALLED,
+        }.get(parsed.scenario)
+        if fault != expected_fault:
+            raise LIFECYCLE.ClosedFailure("arguments", "fault-credential-mismatch")
+        tamper_arguments = (
+            parsed.media_path,
+            parsed.vault_key_path,
+            parsed.tamper_helper,
+        )
+        if parsed.scenario == "backup-tamper":
+            if any(value is None for value in tamper_arguments):
+                raise LIFECYCLE.ClosedFailure("arguments", "tamper-input-missing")
+        elif any(value is not None for value in tamper_arguments):
+            raise LIFECYCLE.ClosedFailure("arguments", "tamper-input-forbidden")
         prior_handlers, prior_mask = LIFECYCLE.install_signal_guard()
         key = LIFECYCLE.read_secret_fd(parsed.vault_key_fd, expected_uid=os.geteuid())
         login = LIFECYCLE.read_login_credential_fd(
@@ -810,39 +1347,16 @@ def main(arguments: Sequence[str]) -> int:
             [key, login],
         )
         console, qmp = harness.start(LIFECYCLE._deadline(aggregate, 15.0))
-        console.wait_regex(
-            re.compile(rb"KERNAID_RESCUE_FIRSTBOOT_PROMPT_READY_V1 step=passphrase"),
-            start=0,
-            deadline=LIFECYCLE._deadline(aggregate, 600.0),
-            stage="firstboot-start",
-        )
-        qmp.set_deadline(LIFECYCLE._deadline(aggregate, 10.0))
-        qmp.send_hex_line(key)
-        confirmation = console.wait_regex(
-            re.compile(rb"KERNAID_RESCUE_FIRSTBOOT_PROMPT_READY_V1 step=confirmation"),
-            start=0,
-            deadline=LIFECYCLE._deadline(aggregate, 600.0),
-            stage="firstboot-confirmation",
-        )
-        qmp.set_deadline(LIFECYCLE._deadline(aggregate, 10.0))
-        qmp.send_hex_line(key)
-        LIFECYCLE.wait_firstboot_attestation(
-            console, confirmation.end(), LIFECYCLE._deadline(aggregate, 600.0)
-        )
-        cursor = LIFECYCLE.establish_live_session(console, aggregate, login)
-        _, cursor = LIFECYCLE.collect_runtime(
-            console, "repair-initial", cursor, aggregate
-        )
-        initial, cursor = LIFECYCLE.run_companion(
-            console, "status", "repair-initial-status", cursor, aggregate
-        )
-        if initial.vault_state != "locked" or initial.device_id is not None:
-            raise LIFECYCLE.ClosedFailure("vault", "initial-status-invalid")
-        unlocked, cursor = LIFECYCLE.run_companion(
-            console, "unlock", "repair-unlock", cursor, aggregate, key
-        )
-        if unlocked.vault_state != "unlocked" or unlocked.device_id is None:
-            raise LIFECYCLE.ClosedFailure("vault", "unlock-invalid")
+        if not parsed.already_provisioned:
+            provision_firstboot(console, qmp, key, aggregate)
+        if parsed.scenario == "provision-base":
+            qmp.set_deadline(LIFECYCLE._deadline(aggregate, 10.0))
+            qmp.system_powerdown()
+            harness.wait_for_shutdown(LIFECYCLE._deadline(aggregate, 180.0))
+        else:
+            cursor = unlock_repair_vault(
+                console, aggregate, login, key, stage="repair"
+            )
         if parsed.scenario == "apply":
             LIFECYCLE.run_guest_proof(
                 console,
@@ -867,7 +1381,98 @@ def main(arguments: Sequence[str]) -> int:
             qmp.set_deadline(LIFECYCLE._deadline(aggregate, 10.0))
             qmp.system_powerdown()
             harness.wait_for_shutdown(LIFECYCLE._deadline(aggregate, 180.0))
-        else:
+        elif parsed.scenario in {
+            "stale-target",
+            "cancel",
+            "repaird-termination",
+            "auto-restore",
+        }:
+            LIFECYCLE.run_guest_proof(
+                console,
+                f"repair-{parsed.scenario}",
+                failure_path_source(
+                    parsed.scenario,
+                    parsed.before_sha256,
+                    parsed.after_sha256,
+                ),
+                cursor,
+                aggregate,
+                timeout=440.0,
+            )
+            qmp.set_deadline(LIFECYCLE._deadline(aggregate, 10.0))
+            writes = target_write_bytes(qmp)
+            if parsed.scenario == "auto-restore":
+                if writes <= 0:
+                    raise LIFECYCLE.ClosedFailure("failure-path", "write-witness-missing")
+            elif writes != 0:
+                raise LIFECYCLE.ClosedFailure("failure-path", "unexpected-target-write")
+            qmp.system_powerdown()
+            harness.wait_for_shutdown(LIFECYCLE._deadline(aggregate, 180.0))
+        elif parsed.scenario == "backup-tamper":
+            reservation_id, binding, cursor = run_receipt_guest_proof(
+                console,
+                repair_source(
+                    parsed.before_sha256,
+                    parsed.after_sha256,
+                    emit_receipt=True,
+                ),
+                cursor,
+                aggregate,
+            )
+            qmp.set_deadline(LIFECYCLE._deadline(aggregate, 10.0))
+            if target_write_bytes(qmp) <= 0:
+                raise LIFECYCLE.ClosedFailure("tamper", "apply-write-witness-missing")
+            qmp.system_powerdown()
+            harness.wait_for_shutdown(LIFECYCLE._deadline(aggregate, 180.0))
+            harness.cleanup()
+            harness = None
+
+            media_path = parsed.media_path
+            vault_key_path = parsed.vault_key_path
+            tamper_helper = parsed.tamper_helper
+            if media_path is None or vault_key_path is None or tamper_helper is None:
+                raise LIFECYCLE.ClosedFailure("tamper", "input-missing")
+            invoke_vault_tamper(
+                tamper_helper,
+                media_path,
+                vault_key_path,
+                reservation_id,
+                aggregate,
+            )
+
+            second_boot_arguments = qemu_args_for_boot(
+                parsed.qemu_args[1:],
+                parsed.firmware,
+                2,
+                parsed.qmp_socket,
+                ovmf_code,
+                ovmf_vars_template,
+            )
+            harness = LIFECYCLE.QemuHarness(
+                parsed.qemu,
+                second_boot_arguments,
+                parsed.qmp_socket,
+                [key],
+                [key, login],
+            )
+            console, qmp = harness.start(LIFECYCLE._deadline(aggregate, 15.0))
+            cursor = unlock_repair_vault(
+                console, aggregate, login, key, stage="repair-tamper-recovery"
+            )
+            LIFECYCLE.run_guest_proof(
+                console,
+                "repair-backup-tamper",
+                tampered_backup_source(reservation_id, binding),
+                cursor,
+                aggregate,
+                timeout=440.0,
+            )
+            qmp.set_deadline(LIFECYCLE._deadline(aggregate, 10.0))
+            if target_write_bytes(qmp) != 0:
+                raise LIFECYCLE.ClosedFailure("tamper", "unexpected-target-write")
+            qmp.system_powerdown()
+            harness.wait_for_shutdown(LIFECYCLE._deadline(aggregate, 180.0))
+        elif parsed.scenario == "interrupt-reconcile":
             LIFECYCLE.run_guest_proof(
                 console,
                 "repair-interrupt-arm",
@@ -900,29 +1505,9 @@ def main(arguments: Sequence[str]) -> int:
                 [key, login],
             )
             console, qmp = harness.start(LIFECYCLE._deadline(aggregate, 15.0))
-            cursor = LIFECYCLE.establish_live_session(console, aggregate, login)
-            _, cursor = LIFECYCLE.collect_runtime(
-                console, "repair-recovery-initial", cursor, aggregate
+            cursor = unlock_repair_vault(
+                console, aggregate, login, key, stage="repair-recovery"
             )
-            recovery_initial, cursor = LIFECYCLE.run_companion(
-                console,
-                "status",
-                "repair-recovery-initial-status",
-                cursor,
-                aggregate,
-            )
-            if (
-                recovery_initial.vault_state != "locked"
-                or recovery_initial.device_id is not None
-            ):
-                raise LIFECYCLE.ClosedFailure(
-                    "vault", "recovery-initial-status-invalid"
-                )
-            unlocked, cursor = LIFECYCLE.run_companion(
-                console, "unlock", "repair-recovery-unlock", cursor, aggregate, key
-            )
-            if unlocked.vault_state != "unlocked" or unlocked.device_id is None:
-                raise LIFECYCLE.ClosedFailure("vault", "recovery-unlock-invalid")
             LIFECYCLE.run_guest_proof(
                 console,
                 "repair-reconcile",
@@ -934,6 +1519,8 @@ def main(arguments: Sequence[str]) -> int:
             qmp.set_deadline(LIFECYCLE._deadline(aggregate, 10.0))
             qmp.system_powerdown()
             harness.wait_for_shutdown(LIFECYCLE._deadline(aggregate, 180.0))
+        elif parsed.scenario != "provision-base":
+            raise LIFECYCLE.ClosedFailure("arguments", "scenario-invalid")
     except LIFECYCLE.ClosedFailure as error:
         failure = error
     except (LIFECYCLE.ControllerSignal, KeyboardInterrupt, SystemExit):
@@ -972,11 +1559,29 @@ def main(arguments: Sequence[str]) -> int:
             "source_terminal=committed terminal=rolled-back-original "
             "state=restored approval=fresh-typed-single-use"
         )
-    else:
+    elif parsed.scenario == "interrupt-reconcile":
         action = "linux.fstab.disable-missing-uuid.v1"
         suffix = (
             "terminal=restored interruption=qmp-after-target-write recovery=closed"
         )
+    elif parsed.scenario == "provision-base":
+        action = "none"
+        suffix = "terminal=provisioned reusable_base=true"
+    elif parsed.scenario == "stale-target":
+        action = "linux.fstab.disable-missing-uuid.v1"
+        suffix = "terminal=failed stale_target=rejected target_writes=zero"
+    elif parsed.scenario == "cancel":
+        action = "linux.fstab.disable-missing-uuid.v1"
+        suffix = "terminal=cancelled authority=released target_writes=zero"
+    elif parsed.scenario == "backup-tamper":
+        action = "linux.fstab.restore"
+        suffix = "terminal=rejected backup_tamper=authenticated target_writes_second_boot=zero"
+    elif parsed.scenario == "repaird-termination":
+        action = "linux.fstab.disable-missing-uuid.v1"
+        suffix = "terminal=restored process=repaird-only recovery=closed-before-unchanged target_writes=zero"
+    else:
+        action = "linux.fstab.disable-missing-uuid.v1"
+        suffix = "terminal=restored fault=after-installed recovery=closed-before-restored target_writes=positive"
     print(
         f"{ATTESTATION_PREFIX} action={action} "
         f"firmware={parsed.firmware} scenario={parsed.scenario} "

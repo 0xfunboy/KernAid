@@ -14,6 +14,7 @@ BUILD = REPO / "tools/build-rescue/build.sh"
 HOOK = REPO / "rescue/live-build/config/hooks/live/0100-kernaid-safety.hook.chroot"
 WORKFLOW = REPO / ".github/workflows/rescue-repair-candidate.yml"
 PHYSICAL_PARENT = REPO / "crates/broker/src/target_physical_parent.rs"
+REPAIR_ENGINE = REPO / "crates/broker/src/rescue_repair_service_engine.rs"
 RESCUE_SERVER = (
     LIVE / "usr/lib/kernaid/rescue_server.py"
 )
@@ -97,6 +98,9 @@ class RepairCandidatePackagingTests(unittest.TestCase):
         self.assertIn("-p kernaid-linux-blockfd", workflow)
         self.assertIn("KERNAID_BLOCKFD_PROBE_BINARY=", workflow)
         self.assertEqual(workflow.count("./tools/build-rescue/qemu-smoke.sh"), 2)
+        self.assertIn("QEMU UEFI Secure Boot candidate smoke test", workflow)
+        self.assertIn("./tools/build-rescue/qemu-smoke.sh secureboot", workflow)
+        self.assertNotIn("./tools/build-rescue/qemu-smoke.sh uefi", workflow)
         self.assertIn("name: KernAid-Rescue-amd64-repair-candidate", workflow)
         for forbidden in ("catalog-entry", "qualified-release", "deploy-pages"):
             self.assertNotIn(forbidden, workflow)
@@ -244,6 +248,18 @@ class RepairCandidatePackagingTests(unittest.TestCase):
             service_config["ExecStart"],
             ["/usr/lib/kernaid/kernaid-rescue-repaird"],
         )
+        self.assertEqual(
+            service_config["LoadCredential"],
+            [
+                "kernaid-repair-fault:"
+                "/sys/firmware/qemu_fw_cfg/by_name/opt/io.systemd.credentials/"
+                "kernaid-repair-fault/raw"
+            ],
+        )
+        self.assertEqual(
+            service_config["SetCredential"],
+            ["kernaid-repair-fault:none-v1"],
+        )
         self.assertEqual(service_config["Restart"], ["no"])
         self.assertNotIn("Install", service)
         self.assertEqual(service_config["StandardInput"], ["null"])
@@ -272,6 +288,30 @@ class RepairCandidatePackagingTests(unittest.TestCase):
         )
         after = set(service_unit["After"][0].split())
         self.assertIn("kernaid-rescue-target-write-capability.socket", after)
+
+    def test_fault_credential_surface_is_candidate_only(self) -> None:
+        stable_text = "\n".join(
+            path.read_text(encoding="utf-8", errors="ignore")
+            for path in LIVE.rglob("*")
+            if path.is_file() and not path.is_symlink()
+        )
+        for forbidden in (
+            "kernaid-repair-fault",
+            "terminate-after-pending-v1",
+            "fail-after-installed-v1",
+        ):
+            self.assertNotIn(forbidden, stable_text)
+
+        candidate_service = (
+            CANDIDATE / "kernaid-rescue-repaird.service"
+        ).read_text(encoding="utf-8")
+        engine = REPAIR_ENGINE.read_text(encoding="utf-8")
+        self.assertIn(
+            "LoadCredential wins only when that exact sysfs file exists",
+            candidate_service,
+        )
+        self.assertIn("OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW", engine)
+        self.assertNotIn("File::open(&path)", engine)
 
     def test_candidate_caps_mount_and_device_surface_are_minimal_and_private(self) -> None:
         service = unit_directives(

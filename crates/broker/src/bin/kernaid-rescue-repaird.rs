@@ -23,7 +23,14 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
-    match run_activated_repair_service(listener, ProductionRepairEngine::new()) {
+    let engine = match ProductionRepairEngine::from_systemd_qualification_credential() {
+        Ok(engine) => engine,
+        Err(_) => {
+            eprintln!("kernaid-rescue-repaird: invalid configuration");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    match run_activated_repair_service(listener, engine) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("kernaid-rescue-repaird: {error}");

@@ -8,7 +8,7 @@ permissions: { contents: read }
 jobs:
   build-and-smoke-test:
     runs-on: ubuntu-24.04
-    timeout-minutes: 100
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88.0
@@ -89,6 +89,7 @@ jobs:
             tools/build-rescue/tests/test_repair_surface_separation.py \
             tools/build-rescue/tests/test_qemu_repair_candidate_smoke.py \
             tools/build-rescue/tests/test_live_image_vault_packaging.py -v
+          python3 -I -B -c 'from pathlib import Path; path = Path("tools/build-rescue/qemu-repair-vault-tamper.py"); compile(path.read_bytes(), str(path), "exec", dont_inherit=True)'
           bash -n tools/build-rescue/build.sh tools/build-rescue/qemu-smoke.sh \
             tools/build-rescue/qemu-repair-candidate-smoke.sh
           shellcheck tools/build-rescue/build.sh tools/build-rescue/qemu-smoke.sh \
@@ -185,10 +186,10 @@ jobs:
             ./tools/build-rescue/qemu-smoke.sh bios \
             "$PWD/KernAid-Rescue-amd64-repair-candidate.iso"
 
-      - name: QEMU UEFI candidate smoke test
+      - name: QEMU UEFI Secure Boot candidate smoke test
         run: |
           KERNAID_SMOKE_LOG=rescue-repair-candidate-uefi.log \
-            ./tools/build-rescue/qemu-smoke.sh uefi \
+            ./tools/build-rescue/qemu-smoke.sh secureboot \
             "$PWD/KernAid-Rescue-amd64-repair-candidate.iso"
 
       - name: QEMU BIOS repair candidate apply qualification
@@ -214,6 +215,13 @@ jobs:
           KERNAID_QEMU_SMP=4 \
             ./tools/build-rescue/qemu-repair-candidate-smoke.sh \
             uefi interrupt-reconcile \
+            "$PWD/KernAid-Rescue-amd64-repair-candidate.iso"
+
+      - name: QEMU UEFI exact-image repair failure-path qualification
+        run: |
+          KERNAID_QEMU_SMP=4 \
+            ./tools/build-rescue/qemu-repair-candidate-smoke.sh \
+            uefi failure-paths \
             "$PWD/KernAid-Rescue-amd64-repair-candidate.iso"
 
       - name: Upload private repair candidate forensics

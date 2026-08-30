@@ -15,6 +15,11 @@ ConditionPathIsDirectory=/run/lock/kernaid-repair
 Type=notify
 NotifyAccess=main
 Sockets=kernaid-rescue-repaird.socket
+# Candidate-only and closed: PID 1 reads the root-only QEMU fw_cfg node. The
+# fixed non-fault default makes a missing node non-fatal on ordinary boots;
+# LoadCredential wins only when that exact sysfs file exists.
+LoadCredential=kernaid-repair-fault:/sys/firmware/qemu_fw_cfg/by_name/opt/io.systemd.credentials/kernaid-repair-fault/raw
+SetCredential=kernaid-repair-fault:none-v1
 ExecStart=/usr/lib/kernaid/kernaid-rescue-repaird
 # The HTTP relay verifies an unlocked Vault before it can activate this socket.
 # A genuine recovery-barrier failure must return control to socket activation

@@ -251,6 +251,32 @@ Rescue image or default broker may enable it until all of these are true:
   on the supported hardware matrix;
 - Secure Boot is qualified for the exact promoted image.
 
+The exact-image failure-path gate is one UEFI suite over disposable Rescue and
+target images derived from one freshly provisioned base. It must independently
+prove all of the following before emitting its single ISO-bound attestation:
+
+- a stale target claim fails before a transaction or target write exists;
+- cancelling the exact prepared plan releases its reservation and performs no
+  target write;
+- changing the authenticated backup offline makes rollback preparation fail
+  closed while the committed target remains byte- and metadata-exact `After`;
+- terminating only `kernaid-rescue-repaird` after durable `Pending`, with QEMU
+  and the helpers still running, starts a different daemon PID and reconciles
+  to `closed-before-unchanged` without a target write; and
+- an injected failure after durable, exact `After` traverses the production
+  automatic-restore path and ends specifically at `closed-before-restored`,
+  with exact `Before` bytes and metadata.
+
+The two injected boundaries accept only fixed tokens from the candidate-only
+`kernaid-repair-fault` systemd credential. PID 1 loads it only
+from the fixed root-only QEMU fw_cfg sysfs node, otherwise supplying the fixed
+non-fault default; the daemon rejects unknown credentials and has no
+environment, HTTP or command-controlled fault mode.
+The stable image contains neither the candidate daemon nor this credential
+surface. The existing whole-VM power-cut test remains a separate reconciliation
+gate and cannot substitute for process-only termination or deterministic
+automatic restore.
+
 In particular, Phase 0 remains diagnosis-only under `AGENTS.md`. A production
 handler cannot become shipping merely by enabling this candidate feature.
 Promotion requires the remaining QEMU rollback/restart/failure-path,

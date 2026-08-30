@@ -12,10 +12,11 @@ use crate::{
     },
     rescue_fstab_executor::{
         ApprovedRescueFstabRollback, PreparedRescueFstabRollback, RescueFstabExecutionError,
-        RescueFstabExecutionOutcome, RescueFstabExecutionReceipt,
+        RescueFstabExecutionOutcome, RescueFstabExecutionReceipt, RescueFstabQualificationFault,
         RescueFstabRollbackExecutionOutcome, RescueFstabRollbackExecutionReceipt,
         authorize_prepared_rescue_fstab_rollback, execute_approved_rescue_fstab,
-        execute_approved_rescue_fstab_rollback, prepare_rescue_fstab_rollback,
+        execute_approved_rescue_fstab_rollback,
+        execute_approved_rescue_fstab_with_qualification_fault, prepare_rescue_fstab_rollback,
         recover_pending_rescue_fstab, recover_pending_rescue_fstab_rollback,
     },
     rescue_fstab_preflight_resolver::{
@@ -38,7 +39,15 @@ use kernaid_protocol::{
     rescue_repair::RescueFstabPrepareRequest, rescue_repair_vault::RepairRollbackBindingV1,
     rescue_vault::Sha256,
 };
-use std::time::Instant;
+use rustix::fs::{self as rfs, Mode, OFlags};
+use std::{fs::File, io::Read, os::unix::fs::MetadataExt, path::Path, time::Instant};
+
+const QUALIFICATION_CREDENTIAL_NAME: &str = "kernaid-repair-fault";
+const QUALIFICATION_CREDENTIAL_DIRECTORY: &str = "/run/credentials/kernaid-rescue-repaird.service";
+const NO_QUALIFICATION_FAULT_TOKEN: &[u8] = b"none-v1";
+const TERMINATE_AFTER_PENDING_TOKEN: &[u8] = b"terminate-after-pending-v1";
+const FAIL_AFTER_INSTALLED_TOKEN: &[u8] = b"fail-after-installed-v1";
+const MAX_QUALIFICATION_CREDENTIAL_BYTES: u64 = 64;
 
 /// Closed seam for the post-commit rollback public layer. Implementations must
 /// retain all Vault/root authority in the associated types; commands and
@@ -103,12 +112,103 @@ pub struct ProductionPreparedRepair {
 /// authority and can only be consumed by the closed executor.
 pub struct ProductionApprovedRepair(ProductionApprovedTransaction);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepairQualificationConfigurationError {
+    InvalidCredential,
+}
+
+impl std::fmt::Display for RepairQualificationConfigurationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("invalid closed repair qualification credential")
+    }
+}
+
+impl std::error::Error for RepairQualificationConfigurationError {}
+
 #[derive(Default)]
-pub struct ProductionRepairEngine;
+pub struct ProductionRepairEngine {
+    qualification_fault: RescueFstabQualificationFault,
+}
 
 impl ProductionRepairEngine {
     pub const fn new() -> Self {
-        Self
+        Self {
+            qualification_fault: RescueFstabQualificationFault::None,
+        }
+    }
+
+    /// Loads the sole optional QEMU qualification credential propagated by
+    /// systemd. The directory and filename are fixed, the file must be the
+    /// read-only regular credential created for this exact unit, and only two
+    /// compiled tokens are accepted. An absent credential is the normal
+    /// production-candidate configuration.
+    pub fn from_systemd_qualification_credential()
+    -> Result<Self, RepairQualificationConfigurationError> {
+        let Some(directory) = std::env::var_os("CREDENTIALS_DIRECTORY") else {
+            return Ok(Self::new());
+        };
+        if Path::new(&directory) != Path::new(QUALIFICATION_CREDENTIAL_DIRECTORY) {
+            return Err(RepairQualificationConfigurationError::InvalidCredential);
+        }
+        let path = Path::new(&directory).join(QUALIFICATION_CREDENTIAL_NAME);
+        let descriptor = match rfs::open(
+            &path,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        ) {
+            Ok(descriptor) => descriptor,
+            Err(error) if error == rustix::io::Errno::NOENT => return Ok(Self::new()),
+            Err(_) => return Err(RepairQualificationConfigurationError::InvalidCredential),
+        };
+        let mut credential = File::from(descriptor);
+        let before = credential
+            .metadata()
+            .map_err(|_| RepairQualificationConfigurationError::InvalidCredential)?;
+        if !before.file_type().is_file()
+            || before.len() == 0
+            || before.len() > MAX_QUALIFICATION_CREDENTIAL_BYTES
+            || before.mode() & 0o777 != 0o400
+            || before.nlink() != 1
+        {
+            return Err(RepairQualificationConfigurationError::InvalidCredential);
+        }
+        let mut bytes = Vec::with_capacity(MAX_QUALIFICATION_CREDENTIAL_BYTES as usize);
+        (&mut credential)
+            .take(MAX_QUALIFICATION_CREDENTIAL_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| RepairQualificationConfigurationError::InvalidCredential)?;
+        let after = credential
+            .metadata()
+            .map_err(|_| RepairQualificationConfigurationError::InvalidCredential)?;
+        if bytes.len() as u64 != before.len()
+            || after.dev() != before.dev()
+            || after.ino() != before.ino()
+            || after.len() != before.len()
+            || after.mode() != before.mode()
+            || after.nlink() != before.nlink()
+            || after.mtime() != before.mtime()
+            || after.mtime_nsec() != before.mtime_nsec()
+            || after.ctime() != before.ctime()
+            || after.ctime_nsec() != before.ctime_nsec()
+        {
+            return Err(RepairQualificationConfigurationError::InvalidCredential);
+        }
+
+        let qualification_fault = parse_qualification_fault(&bytes)?;
+        Ok(Self {
+            qualification_fault,
+        })
+    }
+}
+
+fn parse_qualification_fault(
+    bytes: &[u8],
+) -> Result<RescueFstabQualificationFault, RepairQualificationConfigurationError> {
+    match bytes {
+        NO_QUALIFICATION_FAULT_TOKEN => Ok(RescueFstabQualificationFault::None),
+        TERMINATE_AFTER_PENDING_TOKEN => Ok(RescueFstabQualificationFault::TerminateAfterPending),
+        FAIL_AFTER_INSTALLED_TOKEN => Ok(RescueFstabQualificationFault::FailAfterInstalled),
+        _ => Err(RepairQualificationConfigurationError::InvalidCredential),
     }
 }
 
@@ -255,7 +355,16 @@ impl RepairPreparationEngine for ProductionRepairEngine {
         approved: Self::Approved,
         deadline: Instant,
     ) -> Result<RepairTerminalReceipt, RepairEngineFailure> {
-        match execute_approved_rescue_fstab(approved.0, deadline) {
+        let result = if self.qualification_fault == RescueFstabQualificationFault::None {
+            execute_approved_rescue_fstab(approved.0, deadline)
+        } else {
+            execute_approved_rescue_fstab_with_qualification_fault(
+                approved.0,
+                deadline,
+                self.qualification_fault,
+            )
+        };
+        match result {
             Ok(receipt) => terminal_receipt(receipt),
             Err(error) => match recover_pending_rescue_fstab(deadline) {
                 Ok(Some(receipt)) => terminal_receipt(receipt.with_initial_failure(error)),
@@ -725,6 +834,41 @@ mod tests {
         assert_eq!(
             map_approval_authorize_failure(RescueFstabPreflightError::CancellationFailed),
             RepairEngineFailure::CancelFailed
+        );
+    }
+
+    #[test]
+    fn qualification_fault_parser_accepts_only_default_or_two_fixed_faults() {
+        assert_eq!(
+            parse_qualification_fault(NO_QUALIFICATION_FAULT_TOKEN),
+            Ok(RescueFstabQualificationFault::None)
+        );
+        assert_eq!(
+            parse_qualification_fault(TERMINATE_AFTER_PENDING_TOKEN),
+            Ok(RescueFstabQualificationFault::TerminateAfterPending)
+        );
+        assert_eq!(
+            parse_qualification_fault(FAIL_AFTER_INSTALLED_TOKEN),
+            Ok(RescueFstabQualificationFault::FailAfterInstalled)
+        );
+        for rejected in [
+            b"".as_slice(),
+            b"terminate-after-pending-v1\n".as_slice(),
+            b"fail-after-installed-v2".as_slice(),
+            b"shell.exec".as_slice(),
+        ] {
+            assert_eq!(
+                parse_qualification_fault(rejected),
+                Err(RepairQualificationConfigurationError::InvalidCredential)
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_candidate_engine_has_no_qualification_fault() {
+        assert_eq!(
+            ProductionRepairEngine::new().qualification_fault,
+            RescueFstabQualificationFault::None
         );
     }
 }
