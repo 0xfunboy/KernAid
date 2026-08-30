@@ -2,7 +2,13 @@
 set -euo pipefail
 umask 077
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-firmware="${1:-bios}"
+firmware_mode="${1:-bios}"
+firmware="$firmware_mode"
+secure_boot=0
+if [[ "$firmware_mode" == "secureboot" ]]; then
+  firmware="uefi"
+  secure_boot=1
+fi
 iso="${2:-$repo_dir/KernAid-Rescue-amd64.iso}"
 snapshot_fixture="$repo_dir/tests/fixtures/linux-normalized-snapshot/healthy/root"
 snapshot_golden="$repo_dir/tests/fixtures/linux-normalized-snapshot/expected/snapshot.v1.json"
@@ -163,8 +169,9 @@ done
 mktemp_resolved="$($readlink_command -f -- "$mktemp_command")"
 [[ -n "$mktemp_resolved" ]] || { echo "Missing fixed system tool: $mktemp_command" >&2; exit 2; }
 trusted_privileged_tool "$mktemp_resolved" || exit 2
-if [[ "$firmware" != "bios" && "$firmware" != "uefi" ]]; then
-  echo "Usage: $0 [bios|uefi] [iso]" >&2
+if [[ "$firmware_mode" != "bios" && "$firmware_mode" != "uefi" \
+  && "$firmware_mode" != "secureboot" ]]; then
+  echo "Usage: $0 [bios|uefi|secureboot] [iso]" >&2
   exit 2
 fi
 test -f "$iso" || { echo "ISO not found: $iso" >&2; exit 2; }
@@ -629,6 +636,28 @@ hardware_inventory_ready_observed() {
     | grep -aE '^KERNAID_RESCUE_HARDWARE_INVENTORY_READY$' >/dev/null
 }
 
+secure_boot_ready_observed() {
+  if [[ "$secure_boot" != "1" ]]; then
+    return 0
+  fi
+  LC_ALL=C tr -d '\r' <"$log" \
+    | grep -aE '^KERNAID_RESCUE_SECURE_BOOT_V1 ' >/dev/null
+}
+
+secure_boot_marker_exact_and_unique() {
+  local expected_marker
+  local -a observed_markers
+  if [[ "$secure_boot" != "1" ]]; then
+    return 0
+  fi
+  expected_marker='KERNAID_RESCUE_SECURE_BOOT_V1 firmware=uefi secure_boot=enabled setup_mode=disabled shim_validation=enabled ready=true'
+  mapfile -t observed_markers \
+    < <(LC_ALL=C tr -d '\r' <"$log" \
+      | grep -aE '^KERNAID_RESCUE_SECURE_BOOT_V1 ' || true)
+  [[ "${#observed_markers[@]}" -eq 1 \
+    && "${observed_markers[0]}" == "$expected_marker" ]]
+}
+
 # shellcheck disable=SC2317,SC2329  # Invoked indirectly by the EXIT cleanup trap.
 cleanup_ui_smoke_directory() {
   local path file_type owner_uid owner_gid hard_links
@@ -828,7 +857,11 @@ dd if="$windows_target_image" of="$windows_gpt_target_image" bs=512 \
   seek=133120 count=262144 conv=notrunc status=none
 windows_gpt_target_hash_before="$(sha256sum "$windows_gpt_target_image" | awk '{print $1}')"
 
-qemu_args=(-machine accel=tcg -m 2048 -smp 2 -cdrom "$iso" \
+qemu_machine="accel=tcg"
+if [[ "$secure_boot" == "1" ]]; then
+  qemu_machine="q35,smm=on,accel=tcg"
+fi
+qemu_args=(-machine "$qemu_machine" -m 2048 -smp 2 -cdrom "$iso" \
   -drive "file=$target_image,if=virtio,format=raw,cache=none" \
   -drive "file=$windows_gpt_target_image,if=virtio,format=raw,cache=none" \
   -drive "file=$altered_windows_target_image,if=virtio,format=raw,cache=none" \
@@ -837,31 +870,42 @@ qemu_args=(-machine accel=tcg -m 2048 -smp 2 -cdrom "$iso" \
   -qmp "unix:$qmp_socket,server=on,wait=off" \
   -boot d -vga std -display none -serial stdio -nic none -no-reboot)
 if [[ "$firmware" == "uefi" ]]; then
-  ovmf_code_4m="$ovmf_directory/OVMF_CODE_4M.fd"
-  ovmf_vars_4m="$ovmf_directory/OVMF_VARS_4M.fd"
-  ovmf_code_legacy="$ovmf_directory/OVMF_CODE.fd"
-  ovmf_vars_legacy="$ovmf_directory/OVMF_VARS.fd"
   ovmf_code=""
   ovmf_vars_template=""
-  if [[ -e "$ovmf_code_4m" || -L "$ovmf_code_4m" \
-    || -e "$ovmf_vars_4m" || -L "$ovmf_vars_4m" ]]; then
-    if [[ ! -f "$ovmf_code_4m" || ! -f "$ovmf_vars_4m" ]]; then
-      echo "OVMF 4M CODE/VARS firmware pair is incomplete" >&2
+  if [[ "$secure_boot" == "1" ]]; then
+    ovmf_code_ms="$ovmf_directory/OVMF_CODE_4M.ms.fd"
+    ovmf_vars_ms="$ovmf_directory/OVMF_VARS_4M.ms.fd"
+    if [[ ! -f "$ovmf_code_ms" || ! -f "$ovmf_vars_ms" ]]; then
+      echo "OVMF Microsoft-enrolled Secure Boot CODE/VARS pair is missing or incomplete" >&2
       exit 2
     fi
-    ovmf_code="$ovmf_code_4m"
-    ovmf_vars_template="$ovmf_vars_4m"
-  elif [[ -e "$ovmf_code_legacy" || -L "$ovmf_code_legacy" \
-    || -e "$ovmf_vars_legacy" || -L "$ovmf_vars_legacy" ]]; then
-    if [[ ! -f "$ovmf_code_legacy" || ! -f "$ovmf_vars_legacy" ]]; then
-      echo "OVMF legacy CODE/VARS firmware pair is incomplete" >&2
-      exit 2
-    fi
-    ovmf_code="$ovmf_code_legacy"
-    ovmf_vars_template="$ovmf_vars_legacy"
+    ovmf_code="$ovmf_code_ms"
+    ovmf_vars_template="$ovmf_vars_ms"
   else
-    echo "OVMF CODE/VARS firmware pair not found" >&2
-    exit 2
+    ovmf_code_4m="$ovmf_directory/OVMF_CODE_4M.fd"
+    ovmf_vars_4m="$ovmf_directory/OVMF_VARS_4M.fd"
+    ovmf_code_legacy="$ovmf_directory/OVMF_CODE.fd"
+    ovmf_vars_legacy="$ovmf_directory/OVMF_VARS.fd"
+    if [[ -e "$ovmf_code_4m" || -L "$ovmf_code_4m" \
+      || -e "$ovmf_vars_4m" || -L "$ovmf_vars_4m" ]]; then
+      if [[ ! -f "$ovmf_code_4m" || ! -f "$ovmf_vars_4m" ]]; then
+        echo "OVMF 4M CODE/VARS firmware pair is incomplete" >&2
+        exit 2
+      fi
+      ovmf_code="$ovmf_code_4m"
+      ovmf_vars_template="$ovmf_vars_4m"
+    elif [[ -e "$ovmf_code_legacy" || -L "$ovmf_code_legacy" \
+      || -e "$ovmf_vars_legacy" || -L "$ovmf_vars_legacy" ]]; then
+      if [[ ! -f "$ovmf_code_legacy" || ! -f "$ovmf_vars_legacy" ]]; then
+        echo "OVMF legacy CODE/VARS firmware pair is incomplete" >&2
+        exit 2
+      fi
+      ovmf_code="$ovmf_code_legacy"
+      ovmf_vars_template="$ovmf_vars_legacy"
+    else
+      echo "OVMF CODE/VARS firmware pair not found" >&2
+      exit 2
+    fi
   fi
   ovmf_code_resolved="$(resolve_trusted_firmware_file "$ovmf_code")" || exit 2
   ovmf_vars_template_resolved="$(resolve_trusted_firmware_file "$ovmf_vars_template")" \
@@ -896,6 +940,12 @@ if [[ "$firmware" == "uefi" ]]; then
     -drive "if=pflash,format=raw,readonly=on,unit=0,file=$ovmf_code_resolved"
     -drive "if=pflash,format=raw,unit=1,file=$ovmf_vars"
   )
+  if [[ "$secure_boot" == "1" ]]; then
+    qemu_args+=(
+      -global "driver=cfi.pflash01,property=secure,value=on"
+      -fw_cfg "name=opt/kernaid-secure-boot-probe,string=v1"
+    )
+  fi
 fi
 
 coproc QEMU_PROCESS {
@@ -937,6 +987,7 @@ while ((SECONDS < qemu_deadline)); do
   fi
   if grep -q "KERNAID_RESCUE_READY" "$log" \
     && hardware_inventory_ready_observed \
+    && secure_boot_ready_observed \
     && grep -q "KERNAID_RESCUE_TARGET_SELECTION_READY" "$log" \
     && grep -q "KERNAID_RESCUE_OFFLINE_INSPECTION_READY" "$log" \
     && grep -q '^KERNAID_RESCUE_TAURI_GUEST_V1 identity=isolated pidns=private shell-bus=mount-masked session-bus=env-disabled-polkit-denied fs-sockets=allowlisted abstract-unix=not-attested devices=private device-fds=no-privileged shell=shipping renderer=webkit2gtk-4[.]1 window=visible display=active-xorg http=loopback x11=connected privileged-fs-sockets=absent nonloopback=denied ' "$log" \
@@ -968,6 +1019,12 @@ while ((SECONDS < qemu_deadline)); do
     if [[ "${#hardware_inventory_ready_markers[@]}" -ne 1 ]]; then
       echo "Rescue hardware inventory marker was not unique" >&2
       exit 1
+    fi
+    if [[ "$secure_boot" == "1" ]]; then
+      if ! secure_boot_marker_exact_and_unique; then
+        echo "Rescue Secure Boot marker was not exact and unique" >&2
+        exit 1
+      fi
     fi
     target_hash_after="$(sha256sum "$target_image" | awk '{print $1}')"
     if [[ "$target_hash_after" != "$target_hash_before" ]]; then
@@ -1007,10 +1064,15 @@ while ((SECONDS < qemu_deadline)); do
     printf '%s\n' \
       "KERNAID_QEMU_ATTESTATION_V1 firmware=$firmware iso_sha256=$iso_hash_after target_before_sha256=$target_hash_before target_after_sha256=$target_hash_after ready=true" \
       | tee -a "$log"
+    if [[ "$secure_boot" == "1" ]]; then
+      printf '%s\n' \
+        "KERNAID_QEMU_SECURE_BOOT_ATTESTATION_V1 firmware=uefi machine=q35 ovmf_profile=ms-enrolled secure_boot=enabled setup_mode=disabled shim_validation=enabled iso_sha256=$iso_hash_after ready=true" \
+        | tee -a "$log"
+    fi
     printf '%s\n' \
       "KERNAID_QEMU_OFFLINE_INSPECTION_ATTESTATION_V1 firmware=$firmware linux_before_sha256=$target_hash_before linux_after_sha256=$target_hash_after windows_gpt_before_sha256=$windows_gpt_target_hash_before windows_gpt_after_sha256=$windows_gpt_target_hash_after windows_altered_before_sha256=$altered_windows_target_hash_before windows_altered_after_sha256=$altered_windows_target_hash_after ready=true" \
       | tee -a "$log"
-    echo "PASS: KernAid Rescue booted its Tauri/WebKit UI with rendered keyboard interaction under $firmware firmware, inspected Linux ext4, a same-disk GPT Windows NTFS plus ESP fixture, and an altered NTFS fixture read-only with zero target-image writes"
+    echo "PASS: KernAid Rescue booted its Tauri/WebKit UI with rendered keyboard interaction under $firmware_mode firmware, inspected Linux ext4, a same-disk GPT Windows NTFS plus ESP fixture, and an altered NTFS fixture read-only with zero target-image writes"
     exit 0
   fi
   qemu_runtime_status="$(qemu_process_status)"

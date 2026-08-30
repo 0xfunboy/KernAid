@@ -424,6 +424,10 @@ class LinuxSnapshotEndToEndTests(unittest.TestCase):
             "./tools/build-rescue/qemu-with-resident-snapshot.sh uefi",
             recipes,
         )
+        self.assertIn(
+            "./tools/build-rescue/qemu-with-resident-snapshot.sh secureboot",
+            recipes,
+        )
         self.assertNotIn("./tools/build-rescue/qemu-smoke.sh bios", recipes)
         self.assertNotIn("./tools/build-rescue/qemu-smoke.sh uefi", recipes)
 

@@ -331,6 +331,12 @@ class MockToolchain:
         self.ovmf.mkdir()
         (self.ovmf / "OVMF_CODE_4M.fd").write_bytes(b"mock OVMF 4M code")
         (self.ovmf / "OVMF_VARS_4M.fd").write_bytes(b"mock OVMF 4M vars")
+        (self.ovmf / "OVMF_CODE_4M.ms.fd").write_bytes(
+            b"mock OVMF Microsoft-enrolled code"
+        )
+        (self.ovmf / "OVMF_VARS_4M.ms.fd").write_bytes(
+            b"mock OVMF Microsoft-enrolled vars"
+        )
         executable(
             self.qmp_helper,
             """
@@ -505,7 +511,7 @@ class MockToolchain:
                   exit 0
                 fi
                 ;;
-              OVMF_CODE_4M.fd|OVMF_VARS_4M.fd|OVMF_CODE.fd|OVMF_VARS.fd)
+              OVMF_CODE_4M.fd|OVMF_VARS_4M.fd|OVMF_CODE_4M.ms.fd|OVMF_VARS_4M.ms.fd|OVMF_CODE.fd|OVMF_VARS.fd)
                 if [[ " $* " == *" %F:%u:%g:%a "* ]]; then
                   printf 'regular file:0:0:%s\n' "${KERNAID_MOCK_OVMF_MODE:-644}"
                   exit 0
@@ -535,6 +541,7 @@ class MockToolchain:
             printf '%s\n' "$EUID" >"$KERNAID_MOCK_STATE_DIR/qemu-euid"
             printf '%s\n' "$$" >"$KERNAID_MOCK_STATE_DIR/qemu-pid"
             printf '%s\n' "$*" >"$KERNAID_MOCK_STATE_DIR/qemu-args"
+            secure_boot_probe=0
             for argument in "$@"; do
               case "$argument" in
                 if=pflash,format=raw,unit=1,file=*)
@@ -547,8 +554,12 @@ class MockToolchain:
                     : >"$KERNAID_MOCK_STATE_DIR/qemu-ovmf-vars-match"
                   fi
                   ;;
+                name=opt/kernaid-secure-boot-probe,string=v1)
+                  secure_boot_probe=1
+                  ;;
               esac
             done
+            export KERNAID_MOCK_SECURE_BOOT_PROBE="$secure_boot_probe"
             if [[ "${KERNAID_MOCK_QEMU_IGNORE_TERM:-0}" == "1" \
               || "${KERNAID_MOCK_QEMU_NOT_READY:-0}" == "1" ]]; then
               exec /usr/bin/python3 -c '
@@ -574,6 +585,15 @@ sys.stdout.flush()
 print("KERNAID_RESCUE_TARGET_SELECTION_READY", flush=True)
 print("KERNAID_RESCUE_OFFLINE_INSPECTION_READY", flush=True)
 print("KERNAID_RESCUE_TAURI_GUEST_V1 identity=isolated pidns=private shell-bus=mount-masked session-bus=env-disabled-polkit-denied fs-sockets=allowlisted abstract-unix=not-attested devices=private device-fds=no-privileged shell=shipping renderer=webkit2gtk-4.1 window=visible display=active-xorg http=loopback x11=connected privileged-fs-sockets=absent nonloopback=denied width=1024 height=768", flush=True)
+if os.environ.get("KERNAID_MOCK_SECURE_BOOT_PROBE") == "1" and os.environ.get("KERNAID_MOCK_SECURE_BOOT_MARKER") != "missing":
+    secure_boot_marker = "KERNAID_RESCUE_SECURE_BOOT_V1 firmware=uefi secure_boot=enabled setup_mode=disabled shim_validation=enabled ready=true"
+    if os.environ.get("KERNAID_MOCK_SECURE_BOOT_MARKER") == "invalid":
+        secure_boot_marker = "KERNAID_RESCUE_SECURE_BOOT_V1 firmware=uefi secure_boot=disabled setup_mode=disabled shim_validation=enabled ready=true"
+    print(secure_boot_marker, flush=True)
+    if os.environ.get("KERNAID_MOCK_SECURE_BOOT_MARKER") == "valid-invalid":
+        print("KERNAID_RESCUE_SECURE_BOOT_V1 firmware=uefi secure_boot=disabled setup_mode=disabled shim_validation=enabled ready=true", flush=True)
+    if os.environ.get("KERNAID_MOCK_DUPLICATE_SECURE_BOOT_MARKER") == "1":
+        print(secure_boot_marker, flush=True)
 snapshot_marker = "KERNAID_RESCUE_LINUX_SNAPSHOT_E2E_V1 semantic_sha256=" + os.environ["KERNAID_MOCK_SNAPSHOT_DIGEST"]
 sys.stdout.write("serial-prefix-without-line-feed")
 print("\n" + snapshot_marker, flush=True)
@@ -590,12 +610,29 @@ time.sleep(30)
             printf 'KERNAID_RESCUE_TARGET_SELECTION_READY\n'
             printf 'KERNAID_RESCUE_OFFLINE_INSPECTION_READY\n'
             printf 'KERNAID_RESCUE_TAURI_GUEST_V1 identity=isolated pidns=private shell-bus=mount-masked session-bus=env-disabled-polkit-denied fs-sockets=allowlisted abstract-unix=not-attested devices=private device-fds=no-privileged shell=shipping renderer=webkit2gtk-4.1 window=visible display=active-xorg http=loopback x11=connected privileged-fs-sockets=absent nonloopback=denied width=1024 height=768\n'
+            if [[ "$secure_boot_probe" == "1" \
+              && "${KERNAID_MOCK_SECURE_BOOT_MARKER:-valid}" != "missing" ]]; then
+              secure_boot_marker='KERNAID_RESCUE_SECURE_BOOT_V1 firmware=uefi secure_boot=enabled setup_mode=disabled shim_validation=enabled ready=true'
+              if [[ "${KERNAID_MOCK_SECURE_BOOT_MARKER:-valid}" == "invalid" ]]; then
+                secure_boot_marker='KERNAID_RESCUE_SECURE_BOOT_V1 firmware=uefi secure_boot=disabled setup_mode=disabled shim_validation=enabled ready=true'
+              fi
+              printf '%s\n' "$secure_boot_marker"
+              if [[ "${KERNAID_MOCK_SECURE_BOOT_MARKER:-valid}" == "valid-invalid" ]]; then
+                printf '%s\n' 'KERNAID_RESCUE_SECURE_BOOT_V1 firmware=uefi secure_boot=disabled setup_mode=disabled shim_validation=enabled ready=true'
+              fi
+              if [[ "${KERNAID_MOCK_DUPLICATE_SECURE_BOOT_MARKER:-0}" == "1" ]]; then
+                printf '%s\n' "$secure_boot_marker"
+              fi
+            fi
             printf 'serial-prefix-without-line-feed'
             printf '\nKERNAID_RESCUE_LINUX_SNAPSHOT_E2E_V1 semantic_sha256=%s\n' \
               "$KERNAID_MOCK_SNAPSHOT_DIGEST"
             if [[ "${KERNAID_MOCK_DUPLICATE_SNAPSHOT_MARKER:-0}" == "1" ]]; then
               printf 'KERNAID_RESCUE_LINUX_SNAPSHOT_E2E_V1 semantic_sha256=%s\n' \
                 "$KERNAID_MOCK_SNAPSHOT_DIGEST"
+            fi
+            if [[ "${KERNAID_MOCK_SECURE_BOOT_MARKER:-valid}" == "missing" ]]; then
+              exit 0
             fi
             exec /usr/bin/sleep 30
             """,
@@ -720,6 +757,8 @@ class QemuSmokeFixturePrivilegeTests(unittest.TestCase):
         snapshot_digest: str = SNAPSHOT_DIGEST,
         duplicate_hardware_marker: bool = False,
         duplicate_snapshot_marker: bool = False,
+        secure_boot_marker: str = "valid",
+        duplicate_secure_boot_marker: bool = False,
         resident_snapshot_digest: str | None = SNAPSHOT_DIGEST,
     ) -> tuple[
         subprocess.CompletedProcess[str], Path, Path, tempfile.TemporaryDirectory[str]
@@ -745,6 +784,9 @@ class QemuSmokeFixturePrivilegeTests(unittest.TestCase):
         elif ovmf_layout == "legacy":
             code_4m.rename(mocks.ovmf / "OVMF_CODE.fd")
             vars_4m.rename(mocks.ovmf / "OVMF_VARS.fd")
+        elif ovmf_layout == "secure-missing":
+            (mocks.ovmf / "OVMF_CODE_4M.ms.fd").unlink()
+            (mocks.ovmf / "OVMF_VARS_4M.ms.fd").unlink()
         elif ovmf_layout != "4m":
             raise AssertionError(f"unsupported OVMF test layout: {ovmf_layout}")
         script = self.materialize_test_script(directory, mocks)
@@ -777,12 +819,20 @@ class QemuSmokeFixturePrivilegeTests(unittest.TestCase):
                 "KERNAID_MOCK_DUPLICATE_SNAPSHOT_MARKER": (
                     "1" if duplicate_snapshot_marker else "0"
                 ),
+                "KERNAID_MOCK_SECURE_BOOT_MARKER": secure_boot_marker,
+                "KERNAID_MOCK_DUPLICATE_SECURE_BOOT_MARKER": (
+                    "1" if duplicate_secure_boot_marker else "0"
+                ),
                 "KERNAID_MOCK_OVMF_VARS_TEMPLATE": str(
                     mocks.ovmf
                     / (
-                        "OVMF_VARS.fd"
-                        if ovmf_layout == "legacy"
-                        else "OVMF_VARS_4M.fd"
+                        "OVMF_VARS_4M.ms.fd"
+                        if firmware == "secureboot"
+                        else (
+                            "OVMF_VARS.fd"
+                            if ovmf_layout == "legacy"
+                            else "OVMF_VARS_4M.fd"
+                        )
                     )
                 ),
                 "KERNAID_SMOKE_LOG": str(log),
@@ -952,6 +1002,86 @@ class QemuSmokeFixturePrivilegeTests(unittest.TestCase):
         for target_drive in target_drives:
             self.assertNotIn("readonly=on", target_drive)
             self.assertNotIn("snapshot=", target_drive)
+
+    def test_secureboot_uses_only_ms_enrolled_firmware_and_guest_state(self) -> None:
+        result, log, state, temporary = self.run_smoke(firmware="secureboot")
+        self.addCleanup(temporary.cleanup)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        arguments = (state / "qemu-args").read_text(encoding="utf-8").split()
+        self.assertEqual(
+            arguments[arguments.index("-machine") + 1],
+            "q35,smm=on,accel=tcg",
+        )
+        self.assertIn("driver=cfi.pflash01,property=secure,value=on", arguments)
+        self.assertIn("name=opt/kernaid-secure-boot-probe,string=v1", arguments)
+        pflash_drives = [
+            argument for argument in arguments if argument.startswith("if=pflash,")
+        ]
+        self.assertEqual(len(pflash_drives), 2)
+        self.assertTrue(pflash_drives[0].endswith("/OVMF_CODE_4M.ms.fd"))
+        self.assertTrue((state / "qemu-ovmf-vars-match").exists())
+        evidence = log.read_text(encoding="utf-8")
+        self.assertEqual(evidence.count("KERNAID_RESCUE_SECURE_BOOT_V1 "), 1)
+        self.assertEqual(
+            evidence.count("KERNAID_QEMU_SECURE_BOOT_ATTESTATION_V1 "), 1
+        )
+        self.assertIn("KERNAID_QEMU_ATTESTATION_V1 firmware=uefi ", evidence)
+
+    def test_secureboot_fails_closed_on_firmware_or_marker_mismatch(self) -> None:
+        missing, _log, state, temporary = self.run_smoke(
+            firmware="secureboot", ovmf_layout="secure-missing"
+        )
+        self.addCleanup(temporary.cleanup)
+        self.assertEqual(missing.returncode, 2, missing.stderr)
+        self.assertIn("Microsoft-enrolled Secure Boot", missing.stderr)
+        self.assertFalse((state / "qemu-euid").exists())
+
+        duplicate, log, _state, temporary = self.run_smoke(
+            firmware="secureboot", duplicate_secure_boot_marker=True
+        )
+        self.addCleanup(temporary.cleanup)
+        self.assertEqual(duplicate.returncode, 1, duplicate.stderr)
+        self.assertIn("Secure Boot marker was not exact and unique", duplicate.stderr)
+        self.assertNotIn(
+            "KERNAID_QEMU_SECURE_BOOT_ATTESTATION_V1",
+            log.read_text(encoding="utf-8"),
+        )
+
+        for marker in ("missing", "invalid", "valid-invalid"):
+            with self.subTest(marker=marker):
+                rejected, log, _state, temporary = self.run_smoke(
+                    firmware="secureboot", secure_boot_marker=marker
+                )
+                self.addCleanup(temporary.cleanup)
+                self.assertEqual(rejected.returncode, 1, rejected.stderr)
+                self.assertNotIn(
+                    "KERNAID_QEMU_SECURE_BOOT_ATTESTATION_V1",
+                    log.read_text(encoding="utf-8"),
+                )
+
+    def test_secureboot_replaces_only_the_classic_uefi_ci_smoke(self) -> None:
+        build = (TOOLS_DIR / "build.sh").read_text(encoding="utf-8")
+        workflow = RESCUE_WORKFLOW.read_text(encoding="utf-8")
+        recipes = (REPO_DIR / "justfile").read_text(encoding="utf-8")
+
+        self.assertEqual(build.count("--uefi-secure-boot enable"), 1)
+        self.assertIn("QEMU UEFI Secure Boot smoke test", workflow)
+        self.assertIn(
+            "KERNAID_SMOKE_LOG=rescue-smoke-uefi.log "
+            "./tools/build-rescue/qemu-smoke.sh secureboot",
+            workflow,
+        )
+        self.assertNotIn("./tools/build-rescue/qemu-smoke.sh uefi", workflow)
+        self.assertIn("qemu-usb-smoke.sh\" uefi", workflow)
+        self.assertIn(
+            "qemu-vault-lifecycle-smoke.sh",
+            workflow,
+        )
+        self.assertIn(
+            "./tools/build-rescue/qemu-with-resident-snapshot.sh secureboot",
+            recipes,
+        )
 
     def test_firmware_directory_chain_is_root_owned_and_not_writable(self) -> None:
         trusted, _log, state, temporary = self.run_smoke(

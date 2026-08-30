@@ -295,8 +295,8 @@ jobs:
             --output KernAid-Rescue-amd64.codex.cdx.json
       - name: QEMU BIOS smoke test
         run: KERNAID_SMOKE_LOG=rescue-smoke-bios.log ./tools/build-rescue/qemu-smoke.sh bios
-      - name: QEMU UEFI smoke test
-        run: KERNAID_SMOKE_LOG=rescue-smoke-uefi.log ./tools/build-rescue/qemu-smoke.sh uefi
+      - name: QEMU UEFI Secure Boot smoke test
+        run: KERNAID_SMOKE_LOG=rescue-smoke-uefi.log ./tools/build-rescue/qemu-smoke.sh secureboot
       - name: Publish only allowlisted Resident and Rescue snapshot digests
         run: |
           python3 -I -B tools/test-linux-snapshot/sanitize_e2e.py \

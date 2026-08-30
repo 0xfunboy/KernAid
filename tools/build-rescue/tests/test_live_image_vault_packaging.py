@@ -20,6 +20,7 @@ TMPFILES = LIVE_ROOT / "usr/lib/tmpfiles.d/kernaid.conf"
 SYSCTL = LIVE_ROOT / "etc/sysctl.d/99-kernaid-rescue-core.conf"
 COREDUMP = LIVE_ROOT / "etc/systemd/coredump.conf.d/99-kernaid-rescue.conf"
 READY_CHECK = LIVE_ROOT / "usr/lib/kernaid/ready-check"
+SECURE_BOOT_STATE = LIVE_ROOT / "usr/lib/kernaid/secure_boot_state.py"
 SAFETY_HOOK = (
     REPO_DIR / "rescue/live-build/config/hooks/live/0100-kernaid-safety.hook.chroot"
 )
@@ -547,6 +548,10 @@ class VaultLivePolicyTests(unittest.TestCase):
         hook = SAFETY_HOOK.read_text(encoding="utf-8")
         self.assertIn("/usr/lib/kernaid/kernaid-rescue-vaultd", hook)
         self.assertIn("/usr/lib/kernaid/kernaid-rescue-firstboot", hook)
+        self.assertTrue(SECURE_BOOT_STATE.is_file())
+        self.assertEqual(
+            hook.count("/usr/lib/kernaid/secure_boot_state.py"), 2
+        )
         self.assertIn("/usr/bin/kernaid-rescue-vaultctl", hook)
         self.assertIn("/etc/systemd/system/kernaid-rescue-vaultd.service", hook)
         self.assertIn("/usr/lib/tmpfiles.d/kernaid.conf", hook)

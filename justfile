@@ -56,8 +56,7 @@ qemu-uefi:
     ./tools/build-rescue/qemu-with-resident-snapshot.sh uefi
 
 qemu-secureboot:
-    @echo "Secure Boot is an open release gate; no shipping signed boot chain exists yet."
-    @exit 2
+    ./tools/build-rescue/qemu-with-resident-snapshot.sh secureboot
 
 verify-release:
     ./tools/verify-release/verify.sh

@@ -6,13 +6,14 @@ readonly resident_harness="$repo_dir/tests/integration/linux-snapshot-resident-i
 readonly qemu_smoke="$repo_dir/tools/build-rescue/qemu-smoke.sh"
 
 if (( $# < 1 || $# > 2 )); then
-  echo "Usage: $0 [bios|uefi] [iso]" >&2
+  echo "Usage: $0 [bios|uefi|secureboot] [iso]" >&2
   exit 2
 fi
 readonly firmware="$1"
 readonly iso="${2:-$repo_dir/KernAid-Rescue-amd64.iso}"
-if [[ "$firmware" != "bios" && "$firmware" != "uefi" ]]; then
-  echo "Usage: $0 [bios|uefi] [iso]" >&2
+if [[ "$firmware" != "bios" && "$firmware" != "uefi" \
+  && "$firmware" != "secureboot" ]]; then
+  echo "Usage: $0 [bios|uefi|secureboot] [iso]" >&2
   exit 2
 fi
 

@@ -363,6 +363,7 @@ lb config \
   --archive-areas "main contrib non-free-firmware" \
   --debian-installer none \
   --apt-recommends false \
+  --uefi-secure-boot enable \
   --bootappend-live "$bootappend_live" \
   --bootappend-live-failsafe "$bootappend_compat" \
   --iso-application "KernAid Rescue" \
