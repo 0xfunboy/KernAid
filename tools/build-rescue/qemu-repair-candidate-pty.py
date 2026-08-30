@@ -632,16 +632,20 @@ def target_write_bytes(qmp: object) -> int:
     return writes
 
 
-def pause_vm(qmp: object, deadline: float) -> None:
-    qmp.set_deadline(LIFECYCLE._deadline(deadline, 10.0))
-    qmp.execute("stop")
-    status_value = qmp.execute_result("query-status")
-    if (
-        not isinstance(status_value, dict)
-        or status_value.get("running") is not False
-        or status_value.get("status") != "paused"
-    ):
-        raise LIFECYCLE.ClosedFailure("interruption", "pause-invalid")
+def hard_power_cut(harness: object, deadline: float) -> None:
+    """Kill the exact QEMU process and require a bounded SIGKILL reap."""
+
+    process = getattr(harness, "process", None)
+    if process is None or process.poll() is not None:
+        raise LIFECYCLE.ClosedFailure("interruption", "qemu-not-running")
+    try:
+        process.kill()
+    except OSError as error:
+        raise LIFECYCLE.ClosedFailure("interruption", "power-cut-failed") from error
+    while process.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    if process.poll() != -signal.SIGKILL:
+        raise LIFECYCLE.ClosedFailure("interruption", "power-cut-invalid")
 
 
 def interrupt_after_first_target_write(
@@ -654,17 +658,17 @@ def interrupt_after_first_target_write(
     qmp.set_deadline(LIFECYCLE._deadline(aggregate, 10.0))
     if target_write_bytes(qmp) != 0:
         raise LIFECYCLE.ClosedFailure("interruption", "target-wrote-before-approval")
-    pause_vm(qmp, aggregate)
     witness_deadline = LIFECYCLE._deadline(aggregate, 180.0)
     while time.monotonic() < witness_deadline:
-        qmp.set_deadline(LIFECYCLE._deadline(witness_deadline, 10.0))
-        qmp.execute("cont")
-        time.sleep(0.005)
-        pause_vm(qmp, witness_deadline)
+        # Keep the guest running while polling one correlated, completed-write
+        # counter.  The prior stop/cont loop advanced a two-second guest arm
+        # delay in 5 ms slices, flooding QMP with hundreds of commands on slow
+        # UEFI runners.  A completed write remains the fail-closed witness; an
+        # already-resolved commit is rejected by boot-two reconciliation.
+        time.sleep(0.01)
+        qmp.set_deadline(LIFECYCLE._deadline(witness_deadline, 15.0))
         if target_write_bytes(qmp) > 0:
-            qmp.set_deadline(LIFECYCLE._deadline(aggregate, 10.0))
-            qmp.quit()
-            harness.wait_for_shutdown(LIFECYCLE._deadline(aggregate, 30.0))
+            hard_power_cut(harness, LIFECYCLE._deadline(aggregate, 10.0))
             return
     raise LIFECYCLE.ClosedFailure("interruption", "target-write-timeout")
 

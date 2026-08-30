@@ -1,6 +1,8 @@
 import importlib.util
+import signal
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -231,9 +233,8 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
         source = CONTROLLER.read_text(encoding="utf-8")
         for required in (
             '"query-blockstats", {"query-nodes": True}',
-            'qmp.execute("stop")',
-            'qmp.execute("cont")',
-            "qmp.quit()",
+            "process.kill()",
+            "process.poll() != -signal.SIGKILL",
             '"execute-state-closed-before-unchanged"',
             '"execute-state-closed-before-restored"',
             '"manual-reconciliation-required"',
@@ -242,6 +243,9 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
             "OVMF_VARS.repair-boot-{boot}.fd",
         ):
             self.assertIn(required, source)
+        self.assertNotIn('qmp.execute("stop")', source)
+        self.assertNotIn('qmp.execute("cont")', source)
+        self.assertNotIn("qmp.quit()", source)
         recovery = controller.reconcile_source()
         self.assertLessEqual(len(recovery), 16 * 1024)
         self.assertIn(b'candidate.get("state") in ("restored","succeeded"', recovery)
@@ -291,6 +295,20 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
             with self.subTest(invalid=invalid):
                 with self.assertRaises(controller.LIFECYCLE.ClosedFailure):
                     controller.target_write_bytes(Qmp(invalid))
+
+        class Process:
+            returncode: int | None = None
+
+            def poll(self) -> int | None:
+                return self.returncode
+
+            def kill(self) -> None:
+                self.returncode = -signal.SIGKILL
+
+        process = Process()
+        harness = type("Harness", (), {"process": process})()
+        controller.hard_power_cut(harness, time.monotonic() + 1.0)
+        self.assertEqual(process.returncode, -signal.SIGKILL)
 
     def test_uefi_uses_a_fresh_private_vars_store_per_boot(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
