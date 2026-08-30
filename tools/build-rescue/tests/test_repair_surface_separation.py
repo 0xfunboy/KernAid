@@ -132,6 +132,11 @@ class RepairSurfaceSeparationTests(unittest.TestCase):
             candidate_workflow,
         )
 
+    def test_xorriso_tolerates_sparse_vault_partition_before_opening_iso(self) -> None:
+        source = VERIFIER.read_text(encoding="utf-8")
+        command = source[source.index('                _tool("xorriso"),') :]
+        self.assertLess(command.index('"-return_with"'), command.index('"-indev"'))
+
 
 if __name__ == "__main__":
     unittest.main()
