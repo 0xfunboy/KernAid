@@ -14,6 +14,12 @@ export const tenantAccessActions = [
   "entitlement.list",
   "entitlement.publish",
   "entitlement_revocations.publish",
+  "incident_case.audit.list",
+  "incident_case.close",
+  "incident_case.create",
+  "incident_case.link_work_order",
+  "incident_case.list",
+  "incident_case.update",
   "policy.list",
   "policy.publish",
   "policy_trust_anchor.set",
@@ -29,7 +35,7 @@ export type TenantAccessAction = (typeof tenantAccessActions)[number];
 
 export type TenantAccessOutcome = "allowed" | "denied";
 export type TenantAccessTargetType =
-  "credential" | "device" | "tenant" | "work_order";
+  "credential" | "device" | "incident_case" | "tenant" | "work_order";
 
 export function tenantRoleAllows(
   actual: TenantRole,
@@ -53,5 +59,13 @@ export function validCredentialLabel(value: string): boolean {
     value.length >= 1 &&
     value.length <= 80 &&
     /^[A-Za-z0-9][A-Za-z0-9 ._@+-]*$/.test(value)
+  );
+}
+
+export function validIncidentAssigneeLabel(value: string): boolean {
+  return (
+    value.length >= 1 &&
+    value.length <= 64 &&
+    /^[A-Za-z0-9][A-Za-z0-9 ._+-]*$/.test(value)
   );
 }

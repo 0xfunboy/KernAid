@@ -13,6 +13,13 @@ no command, argument, path, script or raw-output fields. Policy, entitlement,
 lease, minimized result and digest-only transition audit state are visible in
 one view.
 
+The Incident cases view opens bounded records from an enrolled device or
+observed asset, links compatible typed work orders, tracks severity/status and
+an operational team/queue label, and closes a case with a canonical signed
+report. It never accepts raw evidence, personal notes, names, email addresses,
+commands or arguments. Closure is administrator-only; operators can create,
+update and link cases.
+
 Serve this directory at `/console/` and the control plane API at the same
 origin. To use another origin, set the `kernaid-api-base` meta value and apply a
 strict matching CORS policy server-side.
@@ -32,6 +39,8 @@ Expected routes:
 - `GET /v1/tenants/:tenantId/update-manifests`
 - `GET /v1/tenants/:tenantId/work-orders`
 - `GET /v1/tenants/:tenantId/work-order-events`
+- `GET /v1/tenants/:tenantId/incident-cases`
+- `GET /v1/tenants/:tenantId/incident-case-events`
 - `POST /v1/tenants/:tenantId/enrollment-tokens`
 - `POST /v1/tenants/:tenantId/devices/:deviceId/revoke`
 - `POST /v1/tenants/:tenantId/policies`
@@ -41,6 +50,14 @@ Expected routes:
 - `POST /v1/tenants/:tenantId/work-orders`
 - `POST /v1/tenants/:tenantId/work-orders/:workOrderId/approve`
 - `POST /v1/tenants/:tenantId/work-orders/:workOrderId/cancel`
+- `POST /v1/tenants/:tenantId/incident-cases`
+- `POST /v1/tenants/:tenantId/incident-cases/:caseId/update`
+- `POST /v1/tenants/:tenantId/incident-cases/:caseId/work-orders`
+- `POST /v1/tenants/:tenantId/incident-cases/:caseId/close`
+
+The downloaded incident report is the exact canonical JSON returned at
+closure. Its SHA-256 digest is bound to the displayed Ed25519 service receipt;
+the console does not modify or re-sign it.
 
 For write actions, tenant administrator approval authorizes delivery only. It
 does not replace the independent local Core approval bound to the actual plan,

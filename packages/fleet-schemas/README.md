@@ -100,6 +100,11 @@ Ed25519 signature byte-for-byte in TypeScript.
   cannot contain commands, arguments, paths or raw output. Results carry one
   outcome and a SHA-256 digest only. A repair lease always states that a fresh,
   independently bound Core approval is still required on the local machine.
+- `dev.kernaid.fleet.incident-report.v1` is canonical digest-only closure
+  material: source identifiers, bounded severity/outcome, a timeline digest and
+  typed work-order state/result digests. Raw evidence, notes, PII and arbitrary
+  execution fields are not representable. Its response digest is bound by an
+  `incident_case_close` service receipt.
 
 Device IDs have the canonical form
 `KA-<first 24 lowercase hex characters of SHA-256(raw Ed25519 public key)>`.

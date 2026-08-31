@@ -31,6 +31,10 @@ export function generateWorkOrderLeaseId(): string {
   return `lease_${randomBytes(16).toString("hex")}`;
 }
 
+export function generateIncidentCaseId(): string {
+  return `case_${randomBytes(16).toString("hex")}`;
+}
+
 export function hashSecret(
   kind: "admin" | "enrollment",
   secret: string,

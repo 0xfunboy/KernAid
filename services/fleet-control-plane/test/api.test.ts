@@ -24,6 +24,7 @@ import {
   FLEET_UPDATE_PULL_SCHEMA,
   FLEET_WORK_ORDER_CLAIM_SCHEMA,
   FLEET_WORK_ORDER_RESULT_SCHEMA,
+  FLEET_INCIDENT_REPORT_SCHEMA,
   UPDATE_MANIFEST_SCHEMA,
   auditSigningBytes,
   canonicalJson,
@@ -65,6 +66,7 @@ import {
   type WorkOrderResult,
   type WorkOrderResultUnsigned,
   parseServiceReceipt,
+  parseIncidentReport,
   serviceReceiptSigningBytes,
   type ServiceReceipt,
 } from "@kernaid/fleet-schemas";
@@ -1175,7 +1177,7 @@ test("tenant credentials and authorization audit survive restart", async () => {
   }
 });
 
-test("SQLite v6 migrates its tenant administrator through Fleet v8", async () => {
+test("SQLite v6 migrates its tenant administrator through Fleet v9", async () => {
   let harness = await createHarness();
   const directory = harness.directory;
   const now = harness.now;
@@ -1184,6 +1186,9 @@ test("SQLite v6 migrates its tenant administrator through Fleet v8", async () =>
     await destroyHarness(harness, false);
     const legacy = new DatabaseSync(harness.databasePath);
     legacy.exec(`
+      DROP TABLE incident_case_events;
+      DROP TABLE incident_case_work_orders;
+      DROP TABLE incident_cases;
       DROP TABLE work_order_events;
       DROP TABLE work_order_claims;
       DROP TABLE work_orders;
@@ -1210,7 +1215,7 @@ test("SQLite v6 migrates its tenant administrator through Fleet v8", async () =>
     const version = database.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    assert.equal(version.user_version, 8);
+    assert.equal(version.user_version, 9);
     database.close();
   } finally {
     await destroyHarness(harness);
@@ -2321,6 +2326,9 @@ test("policy anchor, bundle, and assignment survive SQLite restart", async () =>
 
     const legacy = new DatabaseSync(harness.databasePath);
     legacy.exec(`
+      DROP TABLE incident_case_events;
+      DROP TABLE incident_case_work_orders;
+      DROP TABLE incident_cases;
       DROP TABLE work_order_events;
       DROP TABLE work_order_claims;
       DROP TABLE work_orders;
@@ -2373,7 +2381,7 @@ test("policy anchor, bundle, and assignment survive SQLite restart", async () =>
     const version = database.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    assert.equal(version.user_version, 8);
+    assert.equal(version.user_version, 9);
     const nonce = database
       .prepare(
         `SELECT nonce_sha256 FROM policy_pull_nonces
@@ -2676,7 +2684,7 @@ test("signed entitlement pulls isolate assignments and reject replay, key mismat
   }
 });
 
-test("SQLite v3 migrates through v8 and entitlement checkpoints survive restart", async () => {
+test("SQLite v3 migrates through v9 and entitlement checkpoints survive restart", async () => {
   let harness = await createHarness();
   const directory = harness.directory;
   const now = harness.now;
@@ -2691,6 +2699,9 @@ test("SQLite v3 migrates through v8 and entitlement checkpoints survive restart"
 
     const legacy = new DatabaseSync(harness.databasePath);
     legacy.exec(`
+      DROP TABLE incident_case_events;
+      DROP TABLE incident_case_work_orders;
+      DROP TABLE incident_cases;
       DROP TABLE work_order_events;
       DROP TABLE work_order_claims;
       DROP TABLE work_orders;
@@ -2744,7 +2755,7 @@ test("SQLite v3 migrates through v8 and entitlement checkpoints survive restart"
     const version = database.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    assert.equal(version.user_version, 8);
+    assert.equal(version.user_version, 9);
     const document = database
       .prepare(
         `SELECT highest_sequence, envelope_sha256, canonical_json
@@ -2970,7 +2981,7 @@ test("signed update pulls bind target and ring, filter eligibility, and reject r
   }
 });
 
-test("SQLite v4 migrates through v8 and update checkpoints survive restart", async () => {
+test("SQLite v4 migrates through v9 and update checkpoints survive restart", async () => {
   let harness = await createHarness();
   const directory = harness.directory;
   const now = harness.now;
@@ -2981,6 +2992,9 @@ test("SQLite v4 migrates through v8 and update checkpoints survive restart", asy
 
     const legacy = new DatabaseSync(harness.databasePath);
     legacy.exec(`
+      DROP TABLE incident_case_events;
+      DROP TABLE incident_case_work_orders;
+      DROP TABLE incident_cases;
       DROP TABLE work_order_events;
       DROP TABLE work_order_claims;
       DROP TABLE work_orders;
@@ -3013,7 +3027,7 @@ test("SQLite v4 migrates through v8 and update checkpoints survive restart", asy
     const version = database.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    assert.equal(version.user_version, 8);
+    assert.equal(version.user_version, 9);
     const checkpoint = database
       .prepare(
         `SELECT highest_sequence, manifest_sha256
@@ -3624,8 +3638,317 @@ test("work-order cancellation, expiry, and audit survive restart", async () => {
     const version = database.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    assert.equal(version.user_version, 8);
+    assert.equal(version.user_version, 9);
     database.close();
+  } finally {
+    await destroyHarness(harness);
+  }
+});
+
+test("incident cases bind typed work orders and close with a canonical service-signed report", async () => {
+  let harness = await createHarness();
+  const directory = harness.directory;
+  const now = harness.now;
+  try {
+    const tenant = await createTenant(harness);
+    const operator = await createAccessCredential(
+      harness,
+      tenant,
+      "operator",
+      "Incident desk",
+    );
+    const device = await enroll(harness, tenant, "incident-device", "rescue");
+    const signer = makePolicySigner();
+    assert.equal((await setPolicyAnchor(harness, tenant, signer)).status, 201);
+    assert.equal(
+      (
+        await publishPolicy(
+          harness,
+          tenant,
+          signedPolicy(tenant, signer, {
+            policyId: "incident-policy",
+            revision: 1,
+            assignments: { deviceIds: [device.deviceId] },
+            allowedActionIds: ["linux.storage.health.v1"],
+          }),
+        )
+      ).status,
+      201,
+    );
+    assert.equal(
+      (
+        await publishEntitlement(
+          harness,
+          tenant,
+          signedEntitlement(tenant, [device.deviceId], {
+            entitlementId: "incident-entitlement",
+            sequence: 1,
+          }),
+        )
+      ).status,
+      201,
+    );
+    const workOrder = await api(
+      harness,
+      "POST",
+      `/v1/tenants/${tenant.tenantId}/work-orders`,
+      {
+        requestId: "incident-diagnostic",
+        targetDeviceId: device.deviceId,
+        actionId: "linux.storage.health.v1",
+        actionVersion: 1,
+        expiresAt: new Date(harness.now.value + 3_600_000).toISOString(),
+      },
+      operator.accessToken,
+    );
+    assert.equal(workOrder.status, 201);
+
+    const createBody = {
+      requestId: "incident-case-request",
+      source: { kind: "device", deviceId: device.deviceId },
+      severity: "high",
+      assigneeLabel: "storage-ops",
+    };
+    assert.equal(
+      (
+        await api(
+          harness,
+          "POST",
+          `/v1/tenants/${tenant.tenantId}/incident-cases`,
+          { ...createBody, rawEvidence: "forbidden" },
+          operator.accessToken,
+        )
+      ).status,
+      400,
+    );
+    const created = await api(
+      harness,
+      "POST",
+      `/v1/tenants/${tenant.tenantId}/incident-cases`,
+      createBody,
+      operator.accessToken,
+    );
+    assert.equal(created.status, 201);
+    const caseId = created.body.caseId as string;
+    const linked = await api(
+      harness,
+      "POST",
+      `/v1/tenants/${tenant.tenantId}/incident-cases/${caseId}/work-orders`,
+      { workOrderId: workOrder.body.workOrderId },
+      operator.accessToken,
+    );
+    assert.equal(linked.status, 201);
+    assert.equal(
+      (
+        await api(
+          harness,
+          "POST",
+          `/v1/tenants/${tenant.tenantId}/incident-cases/${caseId}/update`,
+          {
+            severity: "critical",
+            status: "investigating",
+            assigneeLabel: "platform-l2",
+          },
+          operator.accessToken,
+        )
+      ).status,
+      200,
+    );
+
+    const claimed = await api(
+      harness,
+      "POST",
+      "/v1/work-order-claims",
+      signedWorkOrderClaim(harness, tenant, device),
+    );
+    assert.equal(claimed.status, 200);
+    const leased = claimed.body.workOrder as Record<string, unknown>;
+    const resultEnvelope = signedWorkOrderResult(
+      harness,
+      tenant,
+      device,
+      leased,
+    );
+    assert.equal(
+      (
+        await canonicalApi(
+          harness,
+          "POST",
+          "/v1/work-order-results",
+          resultEnvelope,
+        )
+      ).status,
+      201,
+    );
+    const listed = await api(
+      harness,
+      "GET",
+      `/v1/tenants/${tenant.tenantId}/incident-cases`,
+      undefined,
+      operator.accessToken,
+    );
+    const listedCase = (listed.body.items as Array<Record<string, unknown>>)[0];
+    const linkedState = (
+      listedCase?.workOrders as Array<Record<string, unknown>>
+    )[0];
+    assert.equal(linkedState?.status, "succeeded");
+    assert.match(linkedState?.stateSha256 as string, /^[0-9a-f]{64}$/);
+    assert.equal(
+      (
+        await api(
+          harness,
+          "POST",
+          `/v1/tenants/${tenant.tenantId}/incident-cases/${caseId}/close`,
+          { caseId, outcome: "resolved" },
+          operator.accessToken,
+        )
+      ).status,
+      403,
+    );
+
+    const closeBody = { caseId, outcome: "resolved" };
+    const closed = await canonicalApi(
+      harness,
+      "POST",
+      `/v1/tenants/${tenant.tenantId}/incident-cases/${caseId}/close`,
+      closeBody,
+      tenant.adminToken,
+    );
+    assert.equal(closed.status, 200);
+    const report = parseIncidentReport(closed.body);
+    assert.equal(report.schema, FLEET_INCIDENT_REPORT_SCHEMA);
+    assert.equal(report.caseId, caseId);
+    assert.equal(report.workOrders[0]?.status, "succeeded");
+    assert.equal(closed.rawBody, canonicalJson(report));
+    const proof = verifiedServiceReceipt(closed, {
+      requestBody: canonicalJson(closeBody),
+      tenantId: tenant.tenantId,
+      deviceId: device.deviceId,
+      operation: "incident_case_close",
+    });
+    assert.equal(
+      proof.receipt.responseSha256,
+      createHash("sha256").update(closed.rawBody).digest("hex"),
+    );
+
+    await destroyHarness(harness, false);
+    harness = await createHarness({ directory, now });
+    const afterRestart = await api(
+      harness,
+      "GET",
+      `/v1/tenants/${tenant.tenantId}/incident-cases`,
+      undefined,
+      tenant.adminToken,
+    );
+    assert.equal(afterRestart.status, 200);
+    const retained = (
+      afterRestart.body.items as Array<Record<string, unknown>>
+    )[0];
+    assert.equal(retained?.status, "closed");
+    assert.equal(
+      (
+        (retained?.closure as Record<string, unknown>).serviceReceipt as Record<
+          string,
+          unknown
+        >
+      ).signature,
+      proof.receipt.signature,
+    );
+    const timeline = await api(
+      harness,
+      "GET",
+      `/v1/tenants/${tenant.tenantId}/incident-case-events`,
+      undefined,
+      tenant.adminToken,
+    );
+    assert.deepEqual(
+      new Set(
+        (timeline.body.items as Array<Record<string, unknown>>).map(
+          (event) => event.kind,
+        ),
+      ),
+      new Set([
+        "created",
+        "work_order_linked",
+        "updated",
+        "work_order_state",
+        "closed",
+      ]),
+    );
+  } finally {
+    await destroyHarness(harness);
+  }
+});
+
+test("incident asset sources, tenant isolation, and bounded labels fail closed", async () => {
+  const harness = await createHarness();
+  try {
+    const tenant = await createTenant(harness);
+    const other = await createTenant(harness);
+    const device = await enroll(harness, tenant, "incident-asset-device");
+    const inventory = signedInventory(
+      harness,
+      tenant,
+      device,
+      1,
+      asset("incident-asset", "attention"),
+    );
+    assert.equal(
+      (await canonicalApi(harness, "POST", "/v1/inventories", inventory))
+        .status,
+      201,
+    );
+    const path = `/v1/tenants/${tenant.tenantId}/incident-cases`;
+    assert.equal(
+      (
+        await api(
+          harness,
+          "POST",
+          path,
+          {
+            requestId: "asset-incident-invalid-label",
+            source: { kind: "asset", assetId: "incident-asset" },
+            severity: "medium",
+            assigneeLabel: "person@example.test",
+          },
+          tenant.adminToken,
+        )
+      ).status,
+      400,
+    );
+    const created = await api(
+      harness,
+      "POST",
+      path,
+      {
+        requestId: "asset-incident",
+        source: { kind: "asset", assetId: "incident-asset" },
+        severity: "medium",
+        assigneeLabel: null,
+      },
+      tenant.adminToken,
+    );
+    assert.equal(created.status, 201);
+    assert.deepEqual(created.body.source, {
+      deviceId: device.deviceId,
+      assetId: "incident-asset",
+    });
+    assert.equal(
+      (await api(harness, "GET", path, undefined, other.adminToken)).status,
+      401,
+    );
+    assert.equal(
+      (
+        await api(
+          harness,
+          "POST",
+          `${path}/${created.body.caseId as string}/update`,
+          { severity: "low", status: "closed", assigneeLabel: null },
+          tenant.adminToken,
+        )
+      ).status,
+      400,
+    );
   } finally {
     await destroyHarness(harness);
   }

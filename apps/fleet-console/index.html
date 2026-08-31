@@ -37,11 +37,14 @@
           <button class="nav-item" data-view="workorders">
             <span>05</span>Work orders
           </button>
+          <button class="nav-item" data-view="incidents">
+            <span>06</span>Incidents
+          </button>
           <button class="nav-item" data-view="governance">
-            <span>06</span>Governance
+            <span>07</span>Governance
           </button>
           <button class="nav-item" data-view="enrollment">
-            <span>07</span>Enrollment
+            <span>08</span>Enrollment
           </button>
         </nav>
         <div class="rail-foot">
@@ -371,6 +374,93 @@
               </div>
             </section>
 
+            <section class="panel incident-panel" data-panel="incidents">
+              <div class="panel-head work-order-head">
+                <div>
+                  <p class="eyebrow">Bounded operational record</p>
+                  <h2>Incident cases</h2>
+                </div>
+                <div class="table-tools">
+                  <label class="search"
+                    ><span class="sr-only">Filter incident cases</span
+                    ><input
+                      id="incident-filter"
+                      type="search"
+                      placeholder="Filter cases"
+                  /></label>
+                  <button
+                    class="button primary"
+                    id="open-incident"
+                    type="button"
+                  >
+                    New case
+                  </button>
+                </div>
+              </div>
+              <div class="incident-boundary">
+                <strong>Digest-only incident response</strong>
+                <p>
+                  Cases connect an observed device or asset to typed work-order
+                  state. No raw evidence, personal data, shell commands or
+                  arbitrary instructions cross this boundary.
+                </p>
+                <span>Closure produces canonical JSON + service signature</span>
+              </div>
+              <div class="work-order-metrics">
+                <div>
+                  <span>Open</span><strong id="incident-open">0</strong>
+                </div>
+                <div>
+                  <span>Investigating / monitoring</span
+                  ><strong id="incident-active">0</strong>
+                </div>
+                <div>
+                  <span>Critical open</span
+                  ><strong id="incident-critical">0</strong>
+                </div>
+                <div>
+                  <span>Signed closures</span
+                  ><strong id="incident-closed">0</strong>
+                </div>
+              </div>
+              <div
+                class="work-order-error"
+                id="incident-error"
+                role="alert"
+                hidden
+              ></div>
+              <div class="table-wrap incident-table">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Case / source</th>
+                      <th>Severity / state</th>
+                      <th>Assignment</th>
+                      <th>Work-order proofs</th>
+                      <th>Closure proof</th>
+                      <th><span class="sr-only">Actions</span></th>
+                    </tr>
+                  </thead>
+                  <tbody id="incident-rows"></tbody>
+                </table>
+                <div class="empty" id="incidents-empty">
+                  <strong>No incident cases</strong>
+                  <p>Open a bounded case from an enrolled device or asset.</p>
+                </div>
+              </div>
+              <div class="work-order-audit-head">
+                <div>
+                  <p class="eyebrow">Case chronology</p>
+                  <h2>Incident timeline</h2>
+                </div>
+                <span>Digest-only · newest first</span>
+              </div>
+              <div class="work-order-events" id="incident-events"></div>
+              <div class="empty compact" id="incident-events-empty">
+                <strong>No case events recorded</strong>
+              </div>
+            </section>
+
             <section class="panel assets-panel" data-panel="overview assets">
               <div class="panel-head">
                 <div>
@@ -558,6 +648,147 @@
           type="submit"
         >
           Queue typed work order
+        </button>
+      </form>
+    </dialog>
+
+    <dialog id="incident-dialog" class="modal" aria-labelledby="incident-title">
+      <form method="dialog" id="incident-form">
+        <button
+          class="modal-close"
+          id="incident-close"
+          type="button"
+          aria-label="Close"
+        >
+          ×
+        </button>
+        <p class="eyebrow">Bounded response record</p>
+        <h2 id="incident-title">Open an incident case</h2>
+        <p class="modal-copy">
+          Choose an observed source, severity and optional operational queue.
+          Evidence stays on the device; Fleet stores only signed state digests.
+        </p>
+        <label>Source<select id="incident-source" required></select></label>
+        <label>Severity<select id="incident-severity" required></select></label>
+        <label
+          >Assignee team or queue
+          <input
+            id="incident-assignee"
+            maxlength="64"
+            placeholder="e.g. EMEA-L2"
+            autocomplete="off"
+          />
+        </label>
+        <p class="field-hint">
+          Use an operational label, never a name or email address.
+        </p>
+        <p class="form-error" id="incident-form-error" role="alert"></p>
+        <button class="button primary wide" type="submit">Open case</button>
+      </form>
+    </dialog>
+
+    <dialog
+      id="incident-update-dialog"
+      class="modal"
+      aria-labelledby="incident-update-title"
+    >
+      <form method="dialog" id="incident-update-form">
+        <button
+          class="modal-close"
+          id="incident-update-close"
+          type="button"
+          aria-label="Close"
+        >
+          ×
+        </button>
+        <p class="eyebrow">Case workflow</p>
+        <h2 id="incident-update-title">Update incident</h2>
+        <p class="modal-copy">
+          Change only bounded workflow metadata. Final closure is a separate,
+          administrator-only signed operation.
+        </p>
+        <label
+          >Status<select id="incident-update-status" required></select
+        ></label>
+        <label
+          >Severity<select id="incident-update-severity" required></select
+        ></label>
+        <label
+          >Assignee team or queue
+          <input
+            id="incident-update-assignee"
+            maxlength="64"
+            autocomplete="off"
+          />
+        </label>
+        <p class="form-error" id="incident-update-error" role="alert"></p>
+        <button class="button primary wide" type="submit">
+          Save workflow state
+        </button>
+      </form>
+    </dialog>
+
+    <dialog
+      id="incident-link-dialog"
+      class="modal"
+      aria-labelledby="incident-link-title"
+    >
+      <form method="dialog" id="incident-link-form">
+        <button
+          class="modal-close"
+          id="incident-link-close"
+          type="button"
+          aria-label="Close"
+        >
+          ×
+        </button>
+        <p class="eyebrow">Digest-only relationship</p>
+        <h2 id="incident-link-title">Link a work order</h2>
+        <p class="modal-copy">
+          Only typed orders for the case's source device are eligible. The case
+          records state and result digests, never diagnostic evidence.
+        </p>
+        <label
+          >Compatible work order<select
+            id="incident-link-order"
+            required
+          ></select
+        ></label>
+        <p class="form-error" id="incident-link-error" role="alert"></p>
+        <button class="button primary wide" type="submit">
+          Link work order
+        </button>
+      </form>
+    </dialog>
+
+    <dialog
+      id="incident-close-dialog"
+      class="modal"
+      aria-labelledby="incident-close-title"
+    >
+      <form method="dialog" id="incident-close-form">
+        <button
+          class="modal-close"
+          id="incident-close-close"
+          type="button"
+          aria-label="Close"
+        >
+          ×
+        </button>
+        <p class="eyebrow">Administrator-only finalization</p>
+        <h2 id="incident-close-title">Close and seal case</h2>
+        <p class="modal-copy">
+          Fleet freezes linked work-order digests, creates canonical JSON and
+          signs its report digest with the external service receipt key.
+        </p>
+        <label>Outcome<select id="incident-outcome" required></select></label>
+        <div class="approval-warning">
+          <strong>Closure is immutable.</strong>
+          <span>Review the linked results before sealing this case.</span>
+        </div>
+        <p class="form-error" id="incident-close-error" role="alert"></p>
+        <button class="button primary wide" type="submit">
+          Close with signed report
         </button>
       </form>
     </dialog>

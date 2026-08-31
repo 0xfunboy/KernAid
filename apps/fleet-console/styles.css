@@ -342,7 +342,8 @@ h2 {
 .assets-panel,
 .audit-panel,
 .governance-panel,
-.work-order-panel {
+.work-order-panel,
+.incident-panel {
   grid-column: 1 / -1;
 }
 input,
@@ -688,6 +689,102 @@ textarea {
 }
 .work-order-modal {
   width: min(560px, calc(100vw - 40px));
+}
+.incident-boundary {
+  padding: 16px 22px;
+  display: grid;
+  grid-template-columns: auto minmax(300px, 1fr) auto;
+  gap: 18px;
+  align-items: center;
+  border-bottom: 1px solid var(--line);
+  background:
+    linear-gradient(90deg, rgba(91, 228, 213, 0.06), transparent 55%), #0a0f10;
+}
+.incident-boundary strong {
+  color: var(--cyan);
+  font-size: 11px;
+}
+.incident-boundary p,
+.incident-boundary span {
+  margin: 0;
+  color: #657174;
+  font-size: 10px;
+  line-height: 1.5;
+}
+.incident-boundary span {
+  font-family: ui-monospace, monospace;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.incident-table table {
+  min-width: 1180px;
+}
+.incident-table th:first-child {
+  width: 18%;
+}
+.incident-table th:nth-child(2) {
+  width: 12%;
+}
+.incident-table th:nth-child(3) {
+  width: 14%;
+}
+.incident-table th:nth-child(4) {
+  width: 24%;
+}
+.incident-table th:nth-child(5) {
+  width: 23%;
+}
+.incident-table th:last-child {
+  width: 9%;
+}
+.incident-links,
+.incident-closure {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+.incident-links strong,
+.incident-closure strong {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: capitalize;
+}
+.incident-links code,
+.incident-closure code {
+  color: #657174;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 9px;
+}
+.severity {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  text-transform: capitalize;
+}
+.severity::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--cyan);
+}
+.severity.high::before {
+  background: var(--amber);
+}
+.severity.critical::before {
+  background: var(--red);
+  box-shadow: 0 0 10px rgba(255, 111, 103, 0.55);
+}
+.row-action.download,
+.row-action.link,
+.row-action.update {
+  color: var(--cyan);
+}
+.field-hint {
+  margin: -5px 0 15px;
+  color: #657174;
+  font-size: 9px;
 }
 .work-order-preflight {
   margin: 18px 0;
@@ -1056,14 +1153,16 @@ td small {
   .assets-panel,
   .audit-panel,
   .governance-panel,
-  .work-order-panel {
+  .work-order-panel,
+  .incident-panel {
     grid-column: auto;
   }
   .governance-grid {
     grid-template-columns: 1fr;
   }
   .work-order-boundary,
-  .work-order-events {
+  .work-order-events,
+  .incident-boundary {
     grid-template-columns: 1fr;
   }
   .work-order-boundary p {

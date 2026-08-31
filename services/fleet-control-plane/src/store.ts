@@ -1,4 +1,5 @@
 import { chmodSync, lstatSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import type {
   AuditEnvelope,
@@ -12,6 +13,10 @@ import type {
   EntitlementEnvelope,
   EntitlementRevocationEnvelope,
   FleetServiceOperation,
+  IncidentCaseOutcome,
+  IncidentCaseSeverity,
+  IncidentCaseStatus,
+  IncidentReportWorkOrder,
   SignedUpdateManifest,
   WorkOrderActionId,
   WorkOrderKind,
@@ -21,12 +26,16 @@ import type {
 } from "@kernaid/fleet-schemas";
 import {
   canonicalJson,
+  incidentCaseOutcomes,
+  incidentCaseSeverities,
+  incidentCaseStatuses,
   isWorkOrderActionId,
   workOrderActionCatalog,
 } from "@kernaid/fleet-schemas";
 import {
   isTenantAccessAction,
   isTenantRole,
+  validIncidentAssigneeLabel,
   validCredentialLabel,
   type TenantAccessAction,
   type TenantAccessOutcome,
@@ -50,6 +59,11 @@ const MAX_LISTED_WORK_ORDERS = 256;
 const MAX_WORK_ORDER_EVENTS_PER_TENANT = 20_000;
 const MAX_LISTED_WORK_ORDER_EVENTS = 512;
 const MAX_RECENT_WORK_ORDER_CLAIMS_PER_DEVICE = 1024;
+const MAX_INCIDENT_CASES_PER_TENANT = 10_000;
+const MAX_LISTED_INCIDENT_CASES = 256;
+const MAX_INCIDENT_WORK_ORDERS_PER_CASE = 256;
+const MAX_INCIDENT_EVENTS_PER_TENANT = 20_000;
+const MAX_LISTED_INCIDENT_EVENTS = 512;
 
 export class StoreConflictError extends Error {}
 export class StoreAuthorizationError extends Error {}
@@ -69,6 +83,8 @@ export class StoreUpdatePullReplayError extends Error {}
 export class StoreServiceReceiptAnchorMismatchError extends Error {}
 export class StoreWorkOrderReplayError extends Error {}
 export class StoreWorkOrderStateError extends Error {}
+export class StoreIncidentCaseReplayError extends Error {}
+export class StoreIncidentCaseStateError extends Error {}
 
 interface EnrollmentTokenRow {
   tenant_id: string;
@@ -219,6 +235,57 @@ export interface WorkOrderMutationResult {
 export interface WorkOrderClaimResult {
   workOrder: StoredWorkOrder | null;
   idempotent: boolean;
+}
+
+export interface IncidentCaseWorkOrder extends IncidentReportWorkOrder {
+  linkedAt: string;
+  observedAt: string;
+}
+
+export interface StoredIncidentCase {
+  tenantId: string;
+  caseId: string;
+  requestId: string;
+  sourceDeviceId: string;
+  sourceAssetId: string | null;
+  severity: IncidentCaseSeverity;
+  status: IncidentCaseStatus;
+  assigneeLabel: string | null;
+  createdByCredentialId: string;
+  createdAt: string;
+  updatedAt: string;
+  outcome: IncidentCaseOutcome | null;
+  closedByCredentialId: string | null;
+  closedAt: string | null;
+  closeRequestSha256: string | null;
+  reportSha256: string | null;
+  reportJson: string | null;
+  receiptJson: string | null;
+  workOrders: IncidentCaseWorkOrder[];
+}
+
+export interface ListedIncidentCaseEvent {
+  tenantId: string;
+  sequence: number;
+  caseId: string;
+  occurredAt: string;
+  kind:
+    "created" | "updated" | "work_order_linked" | "work_order_state" | "closed";
+  actorType: "credential" | "system";
+  actorId: string;
+  status: IncidentCaseStatus;
+  detailSha256: string;
+}
+
+export interface IncidentCaseMutationResult {
+  incidentCase: StoredIncidentCase;
+  idempotent: boolean;
+}
+
+export interface IncidentCaseClosureMaterial {
+  reportJson: string;
+  reportSha256: string;
+  receiptJson: string;
 }
 
 interface ServicePullNonce {
@@ -1136,6 +1203,352 @@ export class FleetStore {
     return rows.map(mapWorkOrderEvent);
   }
 
+  createIncidentCase(input: {
+    tenantId: string;
+    caseId: string;
+    requestId: string;
+    requestSha256: string;
+    sourceDeviceId: string;
+    sourceAssetId: string | null;
+    severity: IncidentCaseSeverity;
+    assigneeLabel: string | null;
+    credentialId: string;
+    createdAt: string;
+  }): IncidentCaseMutationResult {
+    validateIncidentCaseCreate(input);
+    return this.#transaction(() => {
+      const existing = this.#database
+        .prepare(
+          `SELECT * FROM incident_cases
+           WHERE tenant_id = ? AND request_id = ?`,
+        )
+        .get(input.tenantId, input.requestId) as IncidentCaseRow | undefined;
+      if (existing !== undefined) {
+        if (existing.request_sha256 !== input.requestSha256) {
+          throw new StoreIncidentCaseReplayError(
+            "incident case request ID conflict",
+          );
+        }
+        return {
+          incidentCase: this.#mapIncidentCase(existing),
+          idempotent: true,
+        };
+      }
+      const active = this.#database
+        .prepare(
+          `SELECT COUNT(*) AS count FROM incident_cases
+           WHERE tenant_id = ? AND status <> 'closed'`,
+        )
+        .get(input.tenantId) as { count: number };
+      if (active.count >= MAX_INCIDENT_CASES_PER_TENANT) {
+        throw new StoreConflictError("active incident-case limit reached");
+      }
+      this.#database
+        .prepare(
+          `INSERT INTO incident_cases
+            (tenant_id, case_id, request_id, request_sha256, source_device_id,
+             source_asset_id, severity, status, assignee_label,
+             created_by_credential_id, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)`,
+        )
+        .run(
+          input.tenantId,
+          input.caseId,
+          input.requestId,
+          input.requestSha256,
+          input.sourceDeviceId,
+          input.sourceAssetId,
+          input.severity,
+          input.assigneeLabel,
+          input.credentialId,
+          input.createdAt,
+          input.createdAt,
+        );
+      this.#recordIncidentCaseEvent({
+        tenantId: input.tenantId,
+        caseId: input.caseId,
+        occurredAt: input.createdAt,
+        kind: "created",
+        actorType: "credential",
+        actorId: input.credentialId,
+        status: "open",
+        detailSha256: input.requestSha256,
+      });
+      return {
+        incidentCase: this.#requiredIncidentCase(input.tenantId, input.caseId),
+        idempotent: false,
+      };
+    });
+  }
+
+  listIncidentCases(
+    tenantId: string,
+    observedAt: string,
+  ): StoredIncidentCase[] {
+    if (!isPublicIdentifier(tenantId) || !isRfc3339(observedAt)) {
+      throw new Error("incident case list input is invalid");
+    }
+    this.#transaction(() =>
+      this.#syncIncidentCaseWorkOrders(tenantId, null, observedAt),
+    );
+    const rows = this.#database
+      .prepare(
+        `SELECT * FROM incident_cases WHERE tenant_id = ?
+         ORDER BY updated_at DESC, case_id DESC LIMIT ?`,
+      )
+      .all(tenantId, MAX_LISTED_INCIDENT_CASES) as unknown as IncidentCaseRow[];
+    return rows.map((row) => this.#mapIncidentCase(row));
+  }
+
+  updateIncidentCase(input: {
+    tenantId: string;
+    caseId: string;
+    severity: IncidentCaseSeverity;
+    status: Exclude<IncidentCaseStatus, "closed">;
+    assigneeLabel: string | null;
+    credentialId: string;
+    updatedAt: string;
+    detailSha256: string;
+  }): IncidentCaseMutationResult | undefined {
+    validateIncidentCaseUpdate(input);
+    return this.#transaction(() => {
+      const row = this.#incidentCase(input.tenantId, input.caseId);
+      if (row === undefined) return undefined;
+      if (row.status === "closed") {
+        throw new StoreIncidentCaseStateError("closed case is immutable");
+      }
+      if (
+        row.severity === input.severity &&
+        row.status === input.status &&
+        row.assignee_label === input.assigneeLabel
+      ) {
+        return { incidentCase: this.#mapIncidentCase(row), idempotent: true };
+      }
+      this.#database
+        .prepare(
+          `UPDATE incident_cases
+           SET severity = ?, status = ?, assignee_label = ?, updated_at = ?
+           WHERE tenant_id = ? AND case_id = ? AND status <> 'closed'`,
+        )
+        .run(
+          input.severity,
+          input.status,
+          input.assigneeLabel,
+          input.updatedAt,
+          input.tenantId,
+          input.caseId,
+        );
+      this.#recordIncidentCaseEvent({
+        tenantId: input.tenantId,
+        caseId: input.caseId,
+        occurredAt: input.updatedAt,
+        kind: "updated",
+        actorType: "credential",
+        actorId: input.credentialId,
+        status: input.status,
+        detailSha256: input.detailSha256,
+      });
+      return {
+        incidentCase: this.#requiredIncidentCase(input.tenantId, input.caseId),
+        idempotent: false,
+      };
+    });
+  }
+
+  linkIncidentWorkOrder(input: {
+    tenantId: string;
+    caseId: string;
+    workOrderId: string;
+    credentialId: string;
+    linkedAt: string;
+  }): IncidentCaseMutationResult | undefined {
+    validateIncidentCaseLink(input);
+    return this.#transaction(() => {
+      const incident = this.#incidentCase(input.tenantId, input.caseId);
+      if (incident === undefined) return undefined;
+      if (incident.status === "closed") {
+        throw new StoreIncidentCaseStateError("closed case is immutable");
+      }
+      const workOrder = this.#workOrder(input.tenantId, input.workOrderId);
+      if (workOrder === undefined) {
+        throw new StoreAuthorizationError("work order is unknown");
+      }
+      if (workOrder.target_device_id !== incident.source_device_id) {
+        throw new StoreAuthorizationError(
+          "work order belongs to another case source",
+        );
+      }
+      const existing = this.#database
+        .prepare(
+          `SELECT 1 AS present FROM incident_case_work_orders
+           WHERE tenant_id = ? AND case_id = ? AND work_order_id = ?`,
+        )
+        .get(input.tenantId, input.caseId, input.workOrderId) as
+        { present: number } | undefined;
+      if (existing !== undefined) {
+        return {
+          incidentCase: this.#requiredIncidentCase(
+            input.tenantId,
+            input.caseId,
+          ),
+          idempotent: true,
+        };
+      }
+      const count = this.#database
+        .prepare(
+          `SELECT COUNT(*) AS count FROM incident_case_work_orders
+           WHERE tenant_id = ? AND case_id = ?`,
+        )
+        .get(input.tenantId, input.caseId) as { count: number };
+      if (count.count >= MAX_INCIDENT_WORK_ORDERS_PER_CASE) {
+        throw new StoreConflictError("incident work-order limit reached");
+      }
+      const summary = incidentWorkOrderSummary(mapWorkOrder(workOrder));
+      this.#database
+        .prepare(
+          `INSERT INTO incident_case_work_orders
+            (tenant_id, case_id, work_order_id, action_id, action_version,
+             status, result_sha256, state_sha256, linked_at, observed_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          input.tenantId,
+          input.caseId,
+          input.workOrderId,
+          summary.actionId,
+          summary.actionVersion,
+          summary.status,
+          summary.resultSha256,
+          summary.stateSha256,
+          input.linkedAt,
+          input.linkedAt,
+        );
+      this.#database
+        .prepare(
+          `UPDATE incident_cases SET updated_at = ?
+           WHERE tenant_id = ? AND case_id = ?`,
+        )
+        .run(input.linkedAt, input.tenantId, input.caseId);
+      this.#recordIncidentCaseEvent({
+        tenantId: input.tenantId,
+        caseId: input.caseId,
+        occurredAt: input.linkedAt,
+        kind: "work_order_linked",
+        actorType: "credential",
+        actorId: input.credentialId,
+        status: incident.status as IncidentCaseStatus,
+        detailSha256: summary.stateSha256,
+      });
+      return {
+        incidentCase: this.#requiredIncidentCase(input.tenantId, input.caseId),
+        idempotent: false,
+      };
+    });
+  }
+
+  closeIncidentCase(
+    input: {
+      tenantId: string;
+      caseId: string;
+      outcome: IncidentCaseOutcome;
+      credentialId: string;
+      closedAt: string;
+      requestSha256: string;
+    },
+    buildMaterial: (
+      sequence: number,
+      incidentCase: StoredIncidentCase,
+      timeline: ListedIncidentCaseEvent[],
+    ) => IncidentCaseClosureMaterial,
+  ): IncidentCaseMutationResult | undefined {
+    validateIncidentCaseClose(input);
+    return this.#transaction(() => {
+      this.#syncIncidentCaseWorkOrders(
+        input.tenantId,
+        input.caseId,
+        input.closedAt,
+      );
+      const row = this.#incidentCase(input.tenantId, input.caseId);
+      if (row === undefined) return undefined;
+      if (row.status === "closed") {
+        if (row.close_request_sha256 !== input.requestSha256) {
+          throw new StoreIncidentCaseStateError(
+            "incident closure conflicts with retained report",
+          );
+        }
+        return { incidentCase: this.#mapIncidentCase(row), idempotent: true };
+      }
+      const checkpoint = this.#database
+        .prepare(
+          `SELECT last_sequence FROM service_receipt_checkpoints
+           WHERE tenant_id = ? AND device_id = ?`,
+        )
+        .get(input.tenantId, row.source_device_id) as
+        { last_sequence: number } | undefined;
+      const sequence = (checkpoint?.last_sequence ?? 0) + 1;
+      if (!Number.isSafeInteger(sequence) || sequence < 1) {
+        throw new StoreConflictError("service receipt sequence exhausted");
+      }
+      const current = this.#mapIncidentCase(row);
+      const timeline = this.#listIncidentCaseEvents(
+        input.tenantId,
+        input.caseId,
+        false,
+      );
+      const material = buildMaterial(sequence, current, timeline);
+      validateIncidentCaseClosureMaterial(material);
+      this.#database
+        .prepare(
+          `INSERT INTO service_receipt_checkpoints
+            (tenant_id, device_id, last_sequence, updated_at)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT (tenant_id, device_id) DO UPDATE SET
+             last_sequence = excluded.last_sequence,
+             updated_at = excluded.updated_at`,
+        )
+        .run(input.tenantId, row.source_device_id, sequence, input.closedAt);
+      this.#database
+        .prepare(
+          `UPDATE incident_cases SET status = 'closed', outcome = ?,
+             closed_by_credential_id = ?, closed_at = ?, updated_at = ?,
+             close_request_sha256 = ?, report_sha256 = ?, report_json = ?,
+             receipt_json = ?
+           WHERE tenant_id = ? AND case_id = ? AND status <> 'closed'`,
+        )
+        .run(
+          input.outcome,
+          input.credentialId,
+          input.closedAt,
+          input.closedAt,
+          input.requestSha256,
+          material.reportSha256,
+          material.reportJson,
+          material.receiptJson,
+          input.tenantId,
+          input.caseId,
+        );
+      this.#recordIncidentCaseEvent({
+        tenantId: input.tenantId,
+        caseId: input.caseId,
+        occurredAt: input.closedAt,
+        kind: "closed",
+        actorType: "credential",
+        actorId: input.credentialId,
+        status: "closed",
+        detailSha256: material.reportSha256,
+      });
+      return {
+        incidentCase: this.#requiredIncidentCase(input.tenantId, input.caseId),
+        idempotent: false,
+      };
+    });
+  }
+
+  listIncidentCaseEvents(tenantId: string): ListedIncidentCaseEvent[] {
+    if (!isPublicIdentifier(tenantId)) throw new Error("tenant ID is invalid");
+    return this.#listIncidentCaseEvents(tenantId, null, true);
+  }
+
   setPolicyTrustAnchor(
     tenantId: string,
     publicKeySpki: string,
@@ -2037,6 +2450,40 @@ export class FleetStore {
     }));
   }
 
+  getAsset(tenantId: string, assetId: string): ListedAsset | undefined {
+    if (!isPublicIdentifier(tenantId) || !isBoundedAssetId(assetId)) {
+      throw new Error("asset lookup is invalid");
+    }
+    const row = this.#database
+      .prepare(
+        `SELECT asset_id, reporting_device_id, target_fingerprint, platform,
+                architecture, os_release, health, critical_count, warning_count,
+                info_count, snapshot_sha256, sequence, observed_at, updated_at
+         FROM assets WHERE tenant_id = ? AND asset_id = ?`,
+      )
+      .get(tenantId, assetId) as AssetRow | undefined;
+    return row === undefined
+      ? undefined
+      : {
+          assetId: row.asset_id,
+          deviceId: row.reporting_device_id,
+          targetFingerprint: row.target_fingerprint,
+          platform: row.platform as ListedAsset["platform"],
+          architecture: row.architecture as ListedAsset["architecture"],
+          osRelease: row.os_release,
+          health: row.health as ListedAsset["health"],
+          findingCounts: {
+            critical: row.critical_count,
+            warning: row.warning_count,
+            info: row.info_count,
+          },
+          snapshotSha256: row.snapshot_sha256,
+          sequence: row.sequence,
+          observedAt: row.observed_at,
+          updatedAt: row.updated_at,
+        };
+  }
+
   listAuditEvents(tenantId: string): ListedAuditEvent[] {
     const rows = this.#database
       .prepare(
@@ -2101,6 +2548,202 @@ export class FleetStore {
         input.label,
         input.createdAt,
       );
+  }
+
+  #incidentCase(tenantId: string, caseId: string): IncidentCaseRow | undefined {
+    return this.#database
+      .prepare(
+        `SELECT * FROM incident_cases WHERE tenant_id = ? AND case_id = ?`,
+      )
+      .get(tenantId, caseId) as IncidentCaseRow | undefined;
+  }
+
+  #requiredIncidentCase(tenantId: string, caseId: string): StoredIncidentCase {
+    const row = this.#incidentCase(tenantId, caseId);
+    if (row === undefined) throw new Error("stored incident case disappeared");
+    return this.#mapIncidentCase(row);
+  }
+
+  #mapIncidentCase(row: IncidentCaseRow): StoredIncidentCase {
+    validateIncidentCaseRow(row);
+    const workOrders = this.#database
+      .prepare(
+        `SELECT * FROM incident_case_work_orders
+         WHERE tenant_id = ? AND case_id = ?
+         ORDER BY linked_at, work_order_id`,
+      )
+      .all(row.tenant_id, row.case_id) as unknown as IncidentCaseWorkOrderRow[];
+    return {
+      tenantId: row.tenant_id,
+      caseId: row.case_id,
+      requestId: row.request_id,
+      sourceDeviceId: row.source_device_id,
+      sourceAssetId: row.source_asset_id,
+      severity: row.severity as IncidentCaseSeverity,
+      status: row.status as IncidentCaseStatus,
+      assigneeLabel: row.assignee_label,
+      createdByCredentialId: row.created_by_credential_id,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      outcome: row.outcome as IncidentCaseOutcome | null,
+      closedByCredentialId: row.closed_by_credential_id,
+      closedAt: row.closed_at,
+      closeRequestSha256: row.close_request_sha256,
+      reportSha256: row.report_sha256,
+      reportJson: row.report_json,
+      receiptJson: row.receipt_json,
+      workOrders: workOrders.map(mapIncidentCaseWorkOrder),
+    };
+  }
+
+  #syncIncidentCaseWorkOrders(
+    tenantId: string,
+    caseId: string | null,
+    observedAt: string,
+  ): void {
+    const rows = (caseId === null
+      ? this.#database
+          .prepare(
+            `SELECT link.*, cases.status AS case_status,
+                    orders.action_id AS current_action_id,
+                    orders.action_version AS current_action_version,
+                    orders.status AS current_status,
+                    orders.result_sha256 AS current_result_sha256
+             FROM incident_case_work_orders AS link
+             JOIN incident_cases AS cases
+               ON cases.tenant_id = link.tenant_id
+              AND cases.case_id = link.case_id
+             JOIN work_orders AS orders
+               ON orders.tenant_id = link.tenant_id
+              AND orders.work_order_id = link.work_order_id
+             WHERE link.tenant_id = ? AND cases.status <> 'closed'`,
+          )
+          .all(tenantId)
+      : this.#database
+          .prepare(
+            `SELECT link.*, cases.status AS case_status,
+                    orders.action_id AS current_action_id,
+                    orders.action_version AS current_action_version,
+                    orders.status AS current_status,
+                    orders.result_sha256 AS current_result_sha256
+             FROM incident_case_work_orders AS link
+             JOIN incident_cases AS cases
+               ON cases.tenant_id = link.tenant_id
+              AND cases.case_id = link.case_id
+             JOIN work_orders AS orders
+               ON orders.tenant_id = link.tenant_id
+              AND orders.work_order_id = link.work_order_id
+             WHERE link.tenant_id = ? AND link.case_id = ?
+               AND cases.status <> 'closed'`,
+          )
+          .all(tenantId, caseId)) as unknown as IncidentCaseWorkOrderSyncRow[];
+    for (const row of rows) {
+      const summary = incidentWorkOrderSummary({
+        workOrderId: row.work_order_id,
+        actionId: row.current_action_id as WorkOrderActionId,
+        actionVersion: row.current_action_version,
+        status: row.current_status as WorkOrderStatus,
+        resultSha256: row.current_result_sha256,
+      });
+      if (summary.stateSha256 === row.state_sha256) continue;
+      this.#database
+        .prepare(
+          `UPDATE incident_case_work_orders SET status = ?, result_sha256 = ?,
+             state_sha256 = ?, observed_at = ?
+           WHERE tenant_id = ? AND case_id = ? AND work_order_id = ?`,
+        )
+        .run(
+          summary.status,
+          summary.resultSha256,
+          summary.stateSha256,
+          observedAt,
+          tenantId,
+          row.case_id,
+          row.work_order_id,
+        );
+      this.#database
+        .prepare(
+          `UPDATE incident_cases SET updated_at = ?
+           WHERE tenant_id = ? AND case_id = ?`,
+        )
+        .run(observedAt, tenantId, row.case_id);
+      this.#recordIncidentCaseEvent({
+        tenantId,
+        caseId: row.case_id,
+        occurredAt: observedAt,
+        kind: "work_order_state",
+        actorType: "system",
+        actorId: "fleet-control-plane",
+        status: row.case_status as IncidentCaseStatus,
+        detailSha256: summary.stateSha256,
+      });
+    }
+  }
+
+  #recordIncidentCaseEvent(
+    input: Omit<ListedIncidentCaseEvent, "sequence">,
+  ): void {
+    const current = this.#database
+      .prepare(
+        `SELECT COALESCE(MAX(sequence), 0) AS sequence
+         FROM incident_case_events WHERE tenant_id = ?`,
+      )
+      .get(input.tenantId) as { sequence: number };
+    const sequence = current.sequence + 1;
+    if (!Number.isSafeInteger(sequence) || sequence < 1) {
+      throw new StoreConflictError("incident event sequence exhausted");
+    }
+    this.#database
+      .prepare(
+        `INSERT INTO incident_case_events
+          (tenant_id, sequence, case_id, occurred_at, kind, actor_type,
+           actor_id, status, detail_sha256)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        input.tenantId,
+        sequence,
+        input.caseId,
+        input.occurredAt,
+        input.kind,
+        input.actorType,
+        input.actorId,
+        input.status,
+        input.detailSha256,
+      );
+    this.#database
+      .prepare(
+        `DELETE FROM incident_case_events
+         WHERE tenant_id = ? AND sequence <= ?`,
+      )
+      .run(input.tenantId, sequence - MAX_INCIDENT_EVENTS_PER_TENANT);
+  }
+
+  #listIncidentCaseEvents(
+    tenantId: string,
+    caseId: string | null,
+    descending: boolean,
+  ): ListedIncidentCaseEvent[] {
+    const order = descending ? "DESC" : "ASC";
+    const rows = (caseId === null
+      ? this.#database
+          .prepare(
+            `SELECT * FROM incident_case_events WHERE tenant_id = ?
+             ORDER BY sequence ${order} LIMIT ?`,
+          )
+          .all(tenantId, MAX_LISTED_INCIDENT_EVENTS)
+      : this.#database
+          .prepare(
+            `SELECT * FROM incident_case_events
+             WHERE tenant_id = ? AND case_id = ?
+             ORDER BY sequence ${order} LIMIT ?`,
+          )
+          .all(
+            tenantId,
+            caseId,
+            MAX_LISTED_INCIDENT_EVENTS,
+          )) as unknown as IncidentCaseEventRow[];
+    return rows.map(mapIncidentCaseEvent);
   }
 
   #workOrder(tenantId: string, workOrderId: string): WorkOrderRow | undefined {
@@ -2285,7 +2928,7 @@ export class FleetStore {
     const version = this.#database.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    if (version.user_version > 8) {
+    if (version.user_version > 9) {
       throw new Error(
         `unsupported Fleet database version ${version.user_version}`,
       );
@@ -2826,6 +3469,178 @@ export class FleetStore {
           PRAGMA user_version = 8;
         `);
       });
+      currentVersion = 8;
+    }
+
+    if (currentVersion === 8) {
+      this.#transaction(() => {
+        this.#database.exec(`
+          DROP INDEX tenant_access_audit_recent_idx;
+          ALTER TABLE tenant_access_audit RENAME TO tenant_access_audit_v8;
+          CREATE TABLE tenant_access_audit (
+            tenant_id TEXT NOT NULL REFERENCES tenants(tenant_id),
+            sequence INTEGER NOT NULL CHECK (sequence > 0),
+            occurred_at TEXT NOT NULL,
+            credential_id TEXT NOT NULL,
+            role TEXT NOT NULL CHECK (role IN ('admin', 'operator')),
+            action TEXT NOT NULL CHECK (action IN (
+              'access_audit.list', 'asset.list', 'credential.create',
+              'credential.list', 'credential.revoke', 'device.list',
+              'device.revoke', 'device_audit.list',
+              'enrollment_token.create', 'entitlement.list',
+              'entitlement.publish', 'entitlement_revocations.publish',
+              'incident_case.audit.list', 'incident_case.close',
+              'incident_case.create', 'incident_case.link_work_order',
+              'incident_case.list', 'incident_case.update', 'policy.list',
+              'policy.publish', 'policy_trust_anchor.set', 'update.list',
+              'update.publish', 'work_order.approve', 'work_order.cancel',
+              'work_order.create', 'work_order.list',
+              'work_order_audit.list'
+            )),
+            outcome TEXT NOT NULL CHECK (outcome IN ('allowed', 'denied')),
+            target_tenant_id TEXT NOT NULL,
+            target_type TEXT NOT NULL CHECK (target_type IN (
+              'credential', 'device', 'incident_case', 'tenant', 'work_order'
+            )),
+            target_id TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, sequence),
+            FOREIGN KEY (tenant_id, credential_id)
+              REFERENCES tenant_access_credentials(tenant_id, credential_id)
+          ) STRICT;
+          INSERT INTO tenant_access_audit SELECT * FROM tenant_access_audit_v8;
+          DROP TABLE tenant_access_audit_v8;
+          CREATE INDEX tenant_access_audit_recent_idx
+            ON tenant_access_audit(tenant_id, sequence DESC);
+
+          DROP INDEX service_receipts_request_idx;
+          ALTER TABLE service_receipts RENAME TO service_receipts_v8;
+          CREATE TABLE service_receipts (
+            tenant_id TEXT NOT NULL,
+            device_id TEXT NOT NULL,
+            operation TEXT NOT NULL CHECK (operation IN (
+              'inventory', 'audit', 'policy_pull', 'entitlement_pull',
+              'work_order_claim', 'work_order_result', 'incident_case_close'
+            )),
+            sequence INTEGER NOT NULL CHECK (sequence > 0),
+            request_sha256 TEXT NOT NULL,
+            response_sha256 TEXT NOT NULL,
+            status INTEGER NOT NULL CHECK (status IN (200, 201)),
+            response_body TEXT NOT NULL,
+            receipt_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, device_id, sequence),
+            FOREIGN KEY (tenant_id, device_id)
+              REFERENCES service_receipt_checkpoints(tenant_id, device_id)
+              ON DELETE CASCADE
+          ) STRICT;
+          INSERT INTO service_receipts SELECT * FROM service_receipts_v8;
+          DROP TABLE service_receipts_v8;
+          CREATE INDEX service_receipts_request_idx
+            ON service_receipts(
+              tenant_id, device_id, operation, request_sha256, sequence DESC
+            );
+
+          CREATE TABLE incident_cases (
+            tenant_id TEXT NOT NULL REFERENCES tenants(tenant_id),
+            case_id TEXT NOT NULL,
+            request_id TEXT NOT NULL,
+            request_sha256 TEXT NOT NULL CHECK (
+              length(request_sha256) = 64 AND
+              request_sha256 NOT GLOB '*[^0-9a-f]*'
+            ),
+            source_device_id TEXT NOT NULL,
+            source_asset_id TEXT,
+            severity TEXT NOT NULL CHECK (
+              severity IN ('low', 'medium', 'high', 'critical')
+            ),
+            status TEXT NOT NULL CHECK (
+              status IN ('open', 'investigating', 'monitoring', 'closed')
+            ),
+            assignee_label TEXT CHECK (length(assignee_label) BETWEEN 1 AND 64),
+            created_by_credential_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            outcome TEXT CHECK (
+              outcome IN ('resolved', 'mitigated', 'unresolved', 'false_positive')
+            ),
+            closed_by_credential_id TEXT,
+            closed_at TEXT,
+            close_request_sha256 TEXT,
+            report_sha256 TEXT,
+            report_json TEXT,
+            receipt_json TEXT,
+            CHECK (
+              (status <> 'closed' AND outcome IS NULL AND
+               closed_by_credential_id IS NULL AND closed_at IS NULL AND
+               close_request_sha256 IS NULL AND report_sha256 IS NULL AND
+               report_json IS NULL AND receipt_json IS NULL) OR
+              (status = 'closed' AND outcome IS NOT NULL AND
+               closed_by_credential_id IS NOT NULL AND closed_at IS NOT NULL AND
+               close_request_sha256 IS NOT NULL AND report_sha256 IS NOT NULL AND
+               report_json IS NOT NULL AND receipt_json IS NOT NULL)
+            ),
+            PRIMARY KEY (tenant_id, case_id),
+            UNIQUE (tenant_id, request_id),
+            FOREIGN KEY (tenant_id, source_device_id)
+              REFERENCES devices(tenant_id, device_id),
+            FOREIGN KEY (tenant_id, source_asset_id)
+              REFERENCES assets(tenant_id, asset_id),
+            FOREIGN KEY (tenant_id, created_by_credential_id)
+              REFERENCES tenant_access_credentials(tenant_id, credential_id),
+            FOREIGN KEY (tenant_id, closed_by_credential_id)
+              REFERENCES tenant_access_credentials(tenant_id, credential_id)
+          ) STRICT;
+          CREATE INDEX incident_cases_recent_idx
+            ON incident_cases(tenant_id, updated_at DESC, case_id DESC);
+
+          CREATE TABLE incident_case_work_orders (
+            tenant_id TEXT NOT NULL,
+            case_id TEXT NOT NULL,
+            work_order_id TEXT NOT NULL,
+            action_id TEXT NOT NULL,
+            action_version INTEGER NOT NULL CHECK (action_version > 0),
+            status TEXT NOT NULL CHECK (status IN (
+              'pending_approval', 'queued', 'leased', 'succeeded', 'failed',
+              'rejected', 'cancelled', 'expired'
+            )),
+            result_sha256 TEXT,
+            state_sha256 TEXT NOT NULL CHECK (length(state_sha256) = 64),
+            linked_at TEXT NOT NULL,
+            observed_at TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, case_id, work_order_id),
+            FOREIGN KEY (tenant_id, case_id)
+              REFERENCES incident_cases(tenant_id, case_id) ON DELETE CASCADE,
+            FOREIGN KEY (tenant_id, work_order_id)
+              REFERENCES work_orders(tenant_id, work_order_id)
+          ) STRICT;
+
+          CREATE TABLE incident_case_events (
+            tenant_id TEXT NOT NULL,
+            sequence INTEGER NOT NULL CHECK (sequence > 0),
+            case_id TEXT NOT NULL,
+            occurred_at TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK (kind IN (
+              'created', 'updated', 'work_order_linked',
+              'work_order_state', 'closed'
+            )),
+            actor_type TEXT NOT NULL CHECK (
+              actor_type IN ('credential', 'system')
+            ),
+            actor_id TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (
+              status IN ('open', 'investigating', 'monitoring', 'closed')
+            ),
+            detail_sha256 TEXT NOT NULL CHECK (length(detail_sha256) = 64),
+            PRIMARY KEY (tenant_id, sequence),
+            FOREIGN KEY (tenant_id, case_id)
+              REFERENCES incident_cases(tenant_id, case_id) ON DELETE CASCADE
+          ) STRICT;
+          CREATE INDEX incident_case_events_recent_idx
+            ON incident_case_events(tenant_id, sequence DESC);
+
+          PRAGMA user_version = 9;
+        `);
+      });
     }
   }
 }
@@ -2904,6 +3719,61 @@ interface WorkOrderEventRow {
   actor_id: string;
   status: string;
   detail_sha256: string | null;
+}
+
+interface IncidentCaseRow {
+  tenant_id: string;
+  case_id: string;
+  request_id: string;
+  request_sha256: string;
+  source_device_id: string;
+  source_asset_id: string | null;
+  severity: string;
+  status: string;
+  assignee_label: string | null;
+  created_by_credential_id: string;
+  created_at: string;
+  updated_at: string;
+  outcome: string | null;
+  closed_by_credential_id: string | null;
+  closed_at: string | null;
+  close_request_sha256: string | null;
+  report_sha256: string | null;
+  report_json: string | null;
+  receipt_json: string | null;
+}
+
+interface IncidentCaseWorkOrderRow {
+  tenant_id: string;
+  case_id: string;
+  work_order_id: string;
+  action_id: string;
+  action_version: number;
+  status: string;
+  result_sha256: string | null;
+  state_sha256: string;
+  linked_at: string;
+  observed_at: string;
+}
+
+interface IncidentCaseWorkOrderSyncRow extends IncidentCaseWorkOrderRow {
+  case_status: string;
+  current_action_id: string;
+  current_action_version: number;
+  current_status: string;
+  current_result_sha256: string | null;
+}
+
+interface IncidentCaseEventRow {
+  tenant_id: string;
+  sequence: number;
+  case_id: string;
+  occurred_at: string;
+  kind: string;
+  actor_type: string;
+  actor_id: string;
+  status: string;
+  detail_sha256: string;
 }
 
 interface AuditSessionRow {
@@ -3234,6 +4104,259 @@ function mapWorkOrderEvent(row: WorkOrderEventRow): ListedWorkOrderEvent {
   };
 }
 
+function incidentWorkOrderSummary(input: {
+  workOrderId: string;
+  actionId: WorkOrderActionId;
+  actionVersion: number;
+  status: WorkOrderStatus;
+  resultSha256: string | null;
+}): IncidentReportWorkOrder {
+  const state = {
+    workOrderId: input.workOrderId,
+    actionId: input.actionId,
+    actionVersion: input.actionVersion,
+    status: input.status,
+    resultSha256: input.resultSha256,
+  };
+  return { ...state, stateSha256: sha256(canonicalJson(state)) };
+}
+
+function mapIncidentCaseWorkOrder(
+  row: IncidentCaseWorkOrderRow,
+): IncidentCaseWorkOrder {
+  if (
+    !isPublicIdentifier(row.work_order_id) ||
+    !isWorkOrderActionId(row.action_id) ||
+    row.action_version !== workOrderActionCatalog[row.action_id].version ||
+    !isWorkOrderStatus(row.status) ||
+    (row.result_sha256 !== null && !isSha256(row.result_sha256)) ||
+    !isSha256(row.state_sha256) ||
+    !isRfc3339(row.linked_at) ||
+    !isRfc3339(row.observed_at)
+  ) {
+    throw new Error("stored incident work-order state is invalid");
+  }
+  const summary = incidentWorkOrderSummary({
+    workOrderId: row.work_order_id,
+    actionId: row.action_id,
+    actionVersion: row.action_version,
+    status: row.status,
+    resultSha256: row.result_sha256,
+  });
+  if (summary.stateSha256 !== row.state_sha256) {
+    throw new Error("stored incident work-order digest is invalid");
+  }
+  return {
+    ...summary,
+    linkedAt: row.linked_at,
+    observedAt: row.observed_at,
+  };
+}
+
+function mapIncidentCaseEvent(
+  row: IncidentCaseEventRow,
+): ListedIncidentCaseEvent {
+  if (
+    !isPublicIdentifier(row.tenant_id) ||
+    !Number.isSafeInteger(row.sequence) ||
+    row.sequence < 1 ||
+    !isPublicIdentifier(row.case_id) ||
+    !isRfc3339(row.occurred_at) ||
+    ![
+      "created",
+      "updated",
+      "work_order_linked",
+      "work_order_state",
+      "closed",
+    ].includes(row.kind) ||
+    !["credential", "system"].includes(row.actor_type) ||
+    !isPublicIdentifier(row.actor_id) ||
+    !isIncidentCaseStatus(row.status) ||
+    !isSha256(row.detail_sha256)
+  ) {
+    throw new Error("stored incident-case event is invalid");
+  }
+  return {
+    tenantId: row.tenant_id,
+    sequence: row.sequence,
+    caseId: row.case_id,
+    occurredAt: row.occurred_at,
+    kind: row.kind as ListedIncidentCaseEvent["kind"],
+    actorType: row.actor_type as ListedIncidentCaseEvent["actorType"],
+    actorId: row.actor_id,
+    status: row.status,
+    detailSha256: row.detail_sha256,
+  };
+}
+
+function validateIncidentCaseCreate(input: {
+  tenantId: string;
+  caseId: string;
+  requestId: string;
+  requestSha256: string;
+  sourceDeviceId: string;
+  sourceAssetId: string | null;
+  severity: IncidentCaseSeverity;
+  assigneeLabel: string | null;
+  credentialId: string;
+  createdAt: string;
+}): void {
+  if (
+    !isPublicIdentifier(input.tenantId) ||
+    !isPublicIdentifier(input.caseId) ||
+    !isPublicIdentifier(input.requestId) ||
+    !isSha256(input.requestSha256) ||
+    !/^KA-[0-9a-f]{24}$/.test(input.sourceDeviceId) ||
+    (input.sourceAssetId !== null && !isBoundedAssetId(input.sourceAssetId)) ||
+    !isIncidentCaseSeverity(input.severity) ||
+    (input.assigneeLabel !== null &&
+      !validIncidentAssigneeLabel(input.assigneeLabel)) ||
+    !isPublicIdentifier(input.credentialId) ||
+    !isRfc3339(input.createdAt)
+  ) {
+    throw new Error("incident case create input is invalid");
+  }
+}
+
+function validateIncidentCaseUpdate(input: {
+  tenantId: string;
+  caseId: string;
+  severity: IncidentCaseSeverity;
+  status: Exclude<IncidentCaseStatus, "closed">;
+  assigneeLabel: string | null;
+  credentialId: string;
+  updatedAt: string;
+  detailSha256: string;
+}): void {
+  if (
+    !isPublicIdentifier(input.tenantId) ||
+    !isPublicIdentifier(input.caseId) ||
+    !isIncidentCaseSeverity(input.severity) ||
+    !["open", "investigating", "monitoring"].includes(input.status) ||
+    (input.assigneeLabel !== null &&
+      !validIncidentAssigneeLabel(input.assigneeLabel)) ||
+    !isPublicIdentifier(input.credentialId) ||
+    !isRfc3339(input.updatedAt) ||
+    !isSha256(input.detailSha256)
+  ) {
+    throw new Error("incident case update input is invalid");
+  }
+}
+
+function validateIncidentCaseLink(input: {
+  tenantId: string;
+  caseId: string;
+  workOrderId: string;
+  credentialId: string;
+  linkedAt: string;
+}): void {
+  if (
+    !isPublicIdentifier(input.tenantId) ||
+    !isPublicIdentifier(input.caseId) ||
+    !isPublicIdentifier(input.workOrderId) ||
+    !isPublicIdentifier(input.credentialId) ||
+    !isRfc3339(input.linkedAt)
+  ) {
+    throw new Error("incident work-order link input is invalid");
+  }
+}
+
+function validateIncidentCaseClose(input: {
+  tenantId: string;
+  caseId: string;
+  outcome: IncidentCaseOutcome;
+  credentialId: string;
+  closedAt: string;
+  requestSha256: string;
+}): void {
+  if (
+    !isPublicIdentifier(input.tenantId) ||
+    !isPublicIdentifier(input.caseId) ||
+    !isIncidentCaseOutcome(input.outcome) ||
+    !isPublicIdentifier(input.credentialId) ||
+    !isRfc3339(input.closedAt) ||
+    !isSha256(input.requestSha256)
+  ) {
+    throw new Error("incident case close input is invalid");
+  }
+}
+
+function validateIncidentCaseClosureMaterial(
+  material: IncidentCaseClosureMaterial,
+): void {
+  if (
+    !isSha256(material.reportSha256) ||
+    sha256(material.reportJson) !== material.reportSha256 ||
+    Buffer.byteLength(material.reportJson, "utf8") === 0 ||
+    Buffer.byteLength(material.reportJson, "utf8") > 256 * 1024 ||
+    Buffer.byteLength(material.receiptJson, "utf8") === 0 ||
+    Buffer.byteLength(material.receiptJson, "utf8") > MAX_SERVICE_RECEIPT_BYTES
+  ) {
+    throw new Error("incident closure material is invalid");
+  }
+}
+
+function validateIncidentCaseRow(row: IncidentCaseRow): void {
+  const closed = row.status === "closed";
+  if (
+    !isPublicIdentifier(row.tenant_id) ||
+    !isPublicIdentifier(row.case_id) ||
+    !isPublicIdentifier(row.request_id) ||
+    !isSha256(row.request_sha256) ||
+    !/^KA-[0-9a-f]{24}$/.test(row.source_device_id) ||
+    (row.source_asset_id !== null && !isBoundedAssetId(row.source_asset_id)) ||
+    !isIncidentCaseSeverity(row.severity) ||
+    !isIncidentCaseStatus(row.status) ||
+    (row.assignee_label !== null &&
+      !validIncidentAssigneeLabel(row.assignee_label)) ||
+    !isPublicIdentifier(row.created_by_credential_id) ||
+    !isRfc3339(row.created_at) ||
+    !isRfc3339(row.updated_at) ||
+    (row.outcome !== null && !isIncidentCaseOutcome(row.outcome)) ||
+    !nullableIdentifier(row.closed_by_credential_id) ||
+    !nullableRfc3339(row.closed_at) ||
+    (row.close_request_sha256 !== null &&
+      !isSha256(row.close_request_sha256)) ||
+    (row.report_sha256 !== null && !isSha256(row.report_sha256)) ||
+    closed !== (row.outcome !== null) ||
+    closed !== (row.closed_by_credential_id !== null) ||
+    closed !== (row.closed_at !== null) ||
+    closed !== (row.close_request_sha256 !== null) ||
+    closed !== (row.report_sha256 !== null) ||
+    closed !== (row.report_json !== null) ||
+    closed !== (row.receipt_json !== null)
+  ) {
+    throw new Error("stored incident case is invalid");
+  }
+}
+
+function isIncidentCaseSeverity(value: string): value is IncidentCaseSeverity {
+  return (incidentCaseSeverities as readonly string[]).includes(value);
+}
+
+function isIncidentCaseStatus(value: string): value is IncidentCaseStatus {
+  return (incidentCaseStatuses as readonly string[]).includes(value);
+}
+
+function isIncidentCaseOutcome(value: string): value is IncidentCaseOutcome {
+  return (incidentCaseOutcomes as readonly string[]).includes(value);
+}
+
+function isBoundedAssetId(value: string): boolean {
+  return (
+    new TextEncoder().encode(value).length >= 1 &&
+    new TextEncoder().encode(value).length <= 256 &&
+    ![...value].some((character) => {
+      const point = character.codePointAt(0) ?? 0;
+      return point <= 0x1f || point === 0x7f;
+    })
+  );
+}
+
+function sha256(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
 function isWorkOrderKind(value: string): value is WorkOrderKind {
   return value === "diagnosis" || value === "repair";
 }
@@ -3345,7 +4468,7 @@ function validateTenantAccessAuditInput(input: {
     !isTenantAccessAction(input.action) ||
     !["allowed", "denied"].includes(input.outcome) ||
     !isPublicIdentifier(input.targetTenantId) ||
-    !["credential", "device", "tenant", "work_order"].includes(
+    !["credential", "device", "incident_case", "tenant", "work_order"].includes(
       input.targetType,
     ) ||
     !isPublicIdentifier(input.targetId)
@@ -3363,7 +4486,9 @@ function mapTenantAccessAudit(
     !isTenantRole(row.role) ||
     !isTenantAccessAction(row.action) ||
     !["allowed", "denied"].includes(row.outcome) ||
-    !["credential", "device", "tenant", "work_order"].includes(row.target_type)
+    !["credential", "device", "incident_case", "tenant", "work_order"].includes(
+      row.target_type,
+    )
   ) {
     throw new Error("stored tenant access audit event is invalid");
   }
@@ -3461,6 +4586,7 @@ function isServiceOperation(value: string): value is FleetServiceOperation {
     "entitlement_pull",
     "work_order_claim",
     "work_order_result",
+    "incident_case_close",
   ].includes(value);
 }
 
