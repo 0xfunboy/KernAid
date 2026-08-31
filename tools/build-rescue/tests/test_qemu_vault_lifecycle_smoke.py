@@ -2988,6 +2988,24 @@ class StaticContractTests(unittest.TestCase):
                         failure.exception.code, f"{stage}-{checkpoint}"
                     )
 
+    def test_native_pre_failure_checkpoints_are_closed_and_correlated(self) -> None:
+        self.assertEqual(controller.PROVIDER_PROOF_NATIVE_STAGES, ("native-pre",))
+        for stage in controller.PROVIDER_PROOF_NATIVE_STAGES:
+            for checkpoint in controller.PROVIDER_PROOF_NATIVE_CHECKPOINTS:
+                with self.subTest(stage=stage, checkpoint=checkpoint):
+                    transcript = (
+                        f"KERNAID_PROVIDER_PROOF_BEGIN_V1_{stage}\r\n"
+                        "KERNAID_QEMU_PROVIDER_PROOF_FAILURE_V1 "
+                        f"stage={stage} checkpoint={checkpoint}\r\n"
+                        f"KERNAID_PROVIDER_PROOF_END_V1_{stage} rc=45\r\n"
+                    ).encode()
+                    with self.assertRaises(controller.ClosedFailure) as failure:
+                        run_proof_transcript(stage, transcript)
+                    self.assertEqual(
+                        (failure.exception.stage, failure.exception.code),
+                        ("provider-proof", f"{stage}-{checkpoint}"),
+                    )
+
     def test_codex_status_failure_checkpoints_are_closed_and_correlated(self) -> None:
         self.assertEqual(
             controller.PROVIDER_PROOF_CODEX_CHECKPOINTS,

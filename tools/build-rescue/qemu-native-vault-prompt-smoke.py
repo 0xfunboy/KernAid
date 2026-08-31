@@ -76,7 +76,7 @@ PRE_PROOF = textwrap.dedent(
             values[key]=value
         return values if set(values)==set(names) else None
     def valid():
-        command=os.read(os.open("/proc/cmdline",os.O_RDONLY|os.O_CLOEXEC),4097)
+        with open("/proc/cmdline","rb",buffering=0) as stream: command=stream.read(4097)
         if len(command)>4096: return False
         tokens=command.decode("ascii").split()
         if tokens.count("boot=live")!=1 or tokens.count(FLAG)!=1: return False
@@ -95,7 +95,38 @@ PRE_PROOF = textwrap.dedent(
             if valid(): break
         except (OSError,UnicodeError,ValueError,subprocess.SubprocessError): pass
         time.sleep(0.1)
-    else: raise SystemExit(45)
+    else:
+        def checkpoint():
+            try:
+                with open("/proc/cmdline","rb",buffering=0) as stream: command=stream.read(4097)
+                if len(command)>4096:
+                    return "cmdline"
+                tokens=command.decode("ascii").split()
+                if tokens.count("boot=live")!=1 or tokens.count(FLAG)!=1:
+                    return "cmdline"
+                socket=show("kernaid-rescue-native-prompt.socket",("ActiveState","SubState","Result"))
+                if socket!={{"ActiveState":"active","SubState":"listening","Result":"success"}}:
+                    return "socket-unit"
+                broker=show("kernaid-rescue-native-prompt.service",("ActiveState","SubState","Result","MainPID"))
+                if broker is None or broker["ActiveState"]!="active" or broker["SubState"]!="running" or broker["Result"]!="success" or not broker["MainPID"].isdecimal() or int(broker["MainPID"])<=1:
+                    return "broker-unit"
+                prompt=show("kernaid-rescue-native-vault-unlock.service",("ActiveState","SubState","Result"))
+                if prompt is None or prompt["ActiveState"]!="inactive" or prompt["SubState"]!="dead" or prompt["Result"] not in ("","success"):
+                    return "prompt-unit"
+                desk=show("kernaid-rescue-desk-shell.service",("ActiveState","SubState","Result","MainPID"))
+                if desk is None or desk["ActiveState"]!="active" or desk["SubState"]!="running" or desk["Result"]!="success" or not desk["MainPID"].isdecimal() or int(desk["MainPID"])<=1:
+                    return "desk-unit"
+                endpoint=os.lstat("/run/kernaid-rescue-native-prompt.sock")
+                if not stat.S_ISSOCK(endpoint.st_mode) or endpoint.st_uid!=0 or endpoint.st_nlink!=1 or stat.S_IMODE(endpoint.st_mode)!=0o660:
+                    return "socket-node"
+                active=open("/sys/class/tty/tty0/active","rb",buffering=0).read(16)
+                if re.fullmatch(rb"tty([1-9]|[1-5][0-9]|6[0-3])\\n",active) is None or active==b"tty8\\n":
+                    return "active-vt"
+                return "unknown"
+            except (OSError,UnicodeError,ValueError,subprocess.SubprocessError):
+                return "observation"
+        print("KERNAID_QEMU_PROVIDER_PROOF_FAILURE_V1 stage=native-pre checkpoint="+checkpoint())
+        raise SystemExit(45)
     print("KERNAID_QEMU_PROVIDER_PROOF_V1 stage=native-pre result=true")
     """
 ).strip().encode("ascii")

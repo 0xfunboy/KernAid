@@ -166,6 +166,18 @@ PROVIDER_PROOF_UI_STAGES = (
     "ui-diagnose-unconfigured",
     "ui-status-configured",
 )
+PROVIDER_PROOF_NATIVE_STAGES = ("native-pre",)
+PROVIDER_PROOF_NATIVE_CHECKPOINTS = (
+    "cmdline",
+    "socket-unit",
+    "broker-unit",
+    "prompt-unit",
+    "desk-unit",
+    "socket-node",
+    "active-vt",
+    "observation",
+    "unknown",
+)
 PROVIDER_PROOF_CLOSED_STAGES = PROVIDER_PROOF_UI_STAGES + (
     "codex-status",
     "production-status",
@@ -2847,6 +2859,9 @@ def run_guest_proof(
     closed_checkpoint = (
         failure_stage in PROVIDER_PROOF_UI_STAGES
         and failure_checkpoint in PROVIDER_PROOF_UI_CHECKPOINTS
+    ) or (
+        failure_stage in PROVIDER_PROOF_NATIVE_STAGES
+        and failure_checkpoint in PROVIDER_PROOF_NATIVE_CHECKPOINTS
     ) or (
         failure_stage == "codex-status"
         and failure_checkpoint in PROVIDER_PROOF_CODEX_CHECKPOINTS
