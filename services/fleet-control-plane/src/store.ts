@@ -8,8 +8,12 @@ import type {
   EnrollmentPlatform,
   FleetInventoryAsset,
   InventoryEnvelope,
+  SignedPolicyBundle,
 } from "@kernaid/fleet-schemas";
 import { canonicalJson } from "@kernaid/fleet-schemas";
+
+const MAX_POLICY_STREAMS_PER_TENANT = 256;
+const MAX_RECENT_POLICY_PULL_NONCES_PER_DEVICE = 1024;
 
 export class StoreConflictError extends Error {}
 export class StoreAuthorizationError extends Error {}
@@ -17,6 +21,9 @@ export class StoreRevokedError extends Error {}
 export class StoreReplayError extends Error {}
 export class StoreSequenceGapError extends Error {}
 export class StoreChainForkError extends Error {}
+export class StorePolicyRollbackError extends Error {}
+export class StorePolicyConflictError extends Error {}
+export class StoreNonceReplayError extends Error {}
 
 interface EnrollmentTokenRow {
   tenant_id: string;
@@ -49,6 +56,11 @@ export interface InventoryRecordResult {
 
 export interface AuditRecordResult {
   idempotent: boolean;
+}
+
+export interface PolicyPublishResult {
+  idempotent: boolean;
+  publishedAt: string;
 }
 
 export interface ListedAuditEvent {
@@ -123,6 +135,178 @@ export class FleetStore {
         )
         .get(tenantId, adminTokenHash) !== undefined
     );
+  }
+
+  setPolicyTrustAnchor(
+    tenantId: string,
+    publicKeySpki: string,
+    setAt: string,
+  ): void {
+    try {
+      this.#database
+        .prepare(
+          `INSERT INTO tenant_policy_anchors
+            (tenant_id, public_key_spki, set_at)
+           VALUES (?, ?, ?)`,
+        )
+        .run(tenantId, publicKeySpki, setAt);
+    } catch (error) {
+      if (isSqliteConstraint(error)) {
+        throw new StoreConflictError("policy trust anchor is already set");
+      }
+      throw error;
+    }
+  }
+
+  getPolicyTrustAnchor(tenantId: string): string | undefined {
+    const row = this.#database
+      .prepare(
+        `SELECT public_key_spki FROM tenant_policy_anchors
+         WHERE tenant_id = ?`,
+      )
+      .get(tenantId) as { public_key_spki: string } | undefined;
+    return row?.public_key_spki;
+  }
+
+  publishPolicy(
+    bundle: SignedPolicyBundle,
+    bundleJson: string,
+    bundleSha256: string,
+    publishedAt: string,
+  ): PolicyPublishResult {
+    return this.#transaction(() => {
+      const current = this.#database
+        .prepare(
+          `SELECT revision, bundle_sha256, published_at FROM policy_bundles
+           WHERE tenant_id = ? AND policy_id = ?`,
+        )
+        .get(bundle.tenantId, bundle.policyId) as
+        | { revision: number; bundle_sha256: string; published_at: string }
+        | undefined;
+      if (current !== undefined) {
+        if (bundle.revision < current.revision) {
+          throw new StorePolicyRollbackError("policy revision rollback");
+        }
+        if (bundle.revision === current.revision) {
+          if (bundleSha256 === current.bundle_sha256) {
+            return { idempotent: true, publishedAt: current.published_at };
+          }
+          throw new StorePolicyConflictError("policy revision conflict");
+        }
+      }
+      if (current === undefined) {
+        const count = this.#database
+          .prepare(
+            `SELECT COUNT(*) AS count FROM policy_bundles
+             WHERE tenant_id = ?`,
+          )
+          .get(bundle.tenantId) as { count: number };
+        if (count.count >= MAX_POLICY_STREAMS_PER_TENANT) {
+          throw new StoreConflictError("tenant policy stream limit reached");
+        }
+      }
+
+      const appliesAll = "all" in bundle.assignments ? 1 : 0;
+      this.#database
+        .prepare(
+          `INSERT INTO policy_bundles
+            (tenant_id, policy_id, revision, bundle_sha256, bundle_json,
+             applies_all, published_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT (tenant_id, policy_id) DO UPDATE SET
+             revision = excluded.revision,
+             bundle_sha256 = excluded.bundle_sha256,
+             bundle_json = excluded.bundle_json,
+             applies_all = excluded.applies_all,
+             published_at = excluded.published_at`,
+        )
+        .run(
+          bundle.tenantId,
+          bundle.policyId,
+          bundle.revision,
+          bundleSha256,
+          bundleJson,
+          appliesAll,
+          publishedAt,
+        );
+      this.#database
+        .prepare(
+          `DELETE FROM policy_assignments
+           WHERE tenant_id = ? AND policy_id = ?`,
+        )
+        .run(bundle.tenantId, bundle.policyId);
+      if ("deviceIds" in bundle.assignments) {
+        const insert = this.#database.prepare(
+          `INSERT INTO policy_assignments
+            (tenant_id, policy_id, device_id) VALUES (?, ?, ?)`,
+        );
+        for (const deviceId of bundle.assignments.deviceIds) {
+          insert.run(bundle.tenantId, bundle.policyId, deviceId);
+        }
+      }
+      return { idempotent: false, publishedAt };
+    });
+  }
+
+  recordPolicyPullNonce(input: {
+    tenantId: string;
+    deviceId: string;
+    nonceSha256: string;
+    expiresAtMs: number;
+    nowMs: number;
+  }): void {
+    this.#transaction(() => {
+      this.#database
+        .prepare("DELETE FROM policy_pull_nonces WHERE expires_at_ms <= ?")
+        .run(input.nowMs);
+      const recent = this.#database
+        .prepare(
+          `SELECT COUNT(*) AS count FROM policy_pull_nonces
+           WHERE tenant_id = ? AND device_id = ?`,
+        )
+        .get(input.tenantId, input.deviceId) as { count: number };
+      if (recent.count >= MAX_RECENT_POLICY_PULL_NONCES_PER_DEVICE) {
+        throw new StoreConflictError("recent policy pull limit reached");
+      }
+      try {
+        this.#database
+          .prepare(
+            `INSERT INTO policy_pull_nonces
+              (tenant_id, device_id, nonce_sha256, expires_at_ms)
+             VALUES (?, ?, ?, ?)`,
+          )
+          .run(
+            input.tenantId,
+            input.deviceId,
+            input.nonceSha256,
+            input.expiresAtMs,
+          );
+      } catch (error) {
+        if (isSqliteConstraint(error)) {
+          throw new StoreNonceReplayError("policy pull nonce was reused");
+        }
+        throw error;
+      }
+    });
+  }
+
+  listApplicablePolicyJson(tenantId: string, deviceId: string): string[] {
+    const rows = this.#database
+      .prepare(
+        `SELECT policy.bundle_json
+         FROM policy_bundles AS policy
+         WHERE policy.tenant_id = ?
+           AND (policy.applies_all = 1 OR EXISTS (
+             SELECT 1 FROM policy_assignments AS assignment
+             WHERE assignment.tenant_id = policy.tenant_id
+               AND assignment.policy_id = policy.policy_id
+               AND assignment.device_id = ?
+           ))
+         ORDER BY policy.policy_id
+         LIMIT 256`,
+      )
+      .all(tenantId, deviceId) as unknown as { bundle_json: string }[];
+    return rows.map((row) => row.bundle_json);
   }
 
   createEnrollmentToken(input: {
@@ -588,7 +772,7 @@ export class FleetStore {
     const version = this.#database.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    if (version.user_version > 2) {
+    if (version.user_version > 3) {
       throw new Error(
         `unsupported Fleet database version ${version.user_version}`,
       );
@@ -712,6 +896,57 @@ export class FleetStore {
           PRAGMA user_version = 2;
         `);
       });
+      currentVersion = 2;
+    }
+
+    if (currentVersion === 2) {
+      this.#transaction(() => {
+        this.#database.exec(`
+          CREATE TABLE tenant_policy_anchors (
+            tenant_id TEXT PRIMARY KEY REFERENCES tenants(tenant_id),
+            public_key_spki TEXT NOT NULL,
+            set_at TEXT NOT NULL
+          ) STRICT;
+
+          CREATE TABLE policy_bundles (
+            tenant_id TEXT NOT NULL REFERENCES tenants(tenant_id),
+            policy_id TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            bundle_sha256 TEXT NOT NULL,
+            bundle_json TEXT NOT NULL,
+            applies_all INTEGER NOT NULL CHECK (applies_all IN (0, 1)),
+            published_at TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, policy_id)
+          ) STRICT;
+
+          CREATE TABLE policy_assignments (
+            tenant_id TEXT NOT NULL,
+            policy_id TEXT NOT NULL,
+            device_id TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, policy_id, device_id),
+            FOREIGN KEY (tenant_id, policy_id)
+              REFERENCES policy_bundles(tenant_id, policy_id)
+              ON DELETE CASCADE
+          ) STRICT;
+          CREATE INDEX policy_assignments_device_idx
+            ON policy_assignments(tenant_id, device_id, policy_id);
+
+          CREATE TABLE policy_pull_nonces (
+            tenant_id TEXT NOT NULL,
+            device_id TEXT NOT NULL,
+            nonce_sha256 TEXT NOT NULL,
+            expires_at_ms INTEGER NOT NULL,
+            PRIMARY KEY (tenant_id, device_id, nonce_sha256),
+            FOREIGN KEY (tenant_id, device_id)
+              REFERENCES devices(tenant_id, device_id)
+              ON DELETE CASCADE
+          ) STRICT;
+          CREATE INDEX policy_pull_nonces_expiry_idx
+            ON policy_pull_nonces(expires_at_ms);
+
+          PRAGMA user_version = 3;
+        `);
+      });
     }
   }
 }
@@ -809,9 +1044,9 @@ function mapDevice(row: DeviceRow): StoredDevice {
 function isSqliteConstraint(error: unknown): boolean {
   return (
     error instanceof Error &&
-    "code" in error &&
-    typeof error.code === "string" &&
-    error.code.startsWith("ERR_SQLITE_CONSTRAINT")
+    "errcode" in error &&
+    typeof error.errcode === "number" &&
+    (error.errcode & 0xff) === 19
   );
 }
 

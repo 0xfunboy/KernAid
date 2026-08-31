@@ -8,12 +8,18 @@ import {
   canonicalJson,
   enrollmentSigningBytes,
   inventorySigningBytes,
+  parsePolicyPullRequest,
+  parseSignedPolicyBundle,
+  policyBundleSigningBytes,
+  policyPullSigningBytes,
   parseEnrollmentRequest,
   parseAuditEnvelope,
   parseInventoryEnvelope,
   toUnsignedEnrollment,
   toUnsignedAudit,
   toUnsignedInventory,
+  toUnsignedPolicyBundle,
+  toUnsignedPolicyPull,
 } from "../src/index.js";
 
 const PUBLIC_KEY_SPKI =
@@ -32,6 +38,14 @@ const AUDIT_JSON =
   '{"actionId":null,"deviceId":"KA-b41fd894f96ec8adca19a85f","eventId":"event-0001","evidenceSha256":[],"kind":"diagnostic_started","occurredAt":"2026-08-31T14:15:16Z","outcome":"started","previousEventSha256":null,"reportSha256":null,"risk":"R0","schema":"dev.kernaid.fleet.audit-envelope.v1","sequence":1,"sessionId":"session-20260831-001","signature":"JiWRoJagnJva7Cwpcs6nZJPJQObhRzadTpduLvHfrV0mgKz3vc80Doe_Bd-SUehxgLzuLR1ZiPIgorcsZWRfBg","targetSha256":"34a04005bcaf206eec990bd9637d9fdb6725e0a0c0d4aebf003f17f4c956eb5c","tenantId":"tenant-europe-1"}';
 const AUDIT_SHA256 =
   "141786229c5b9b5e7b05ed50651931bdbcbebaeee9685135e2469cf07d2a4859";
+const POLICY_PULL_UNSIGNED =
+  '{"deviceId":"KA-3097e2dee2cb4a34b53840cd","issuedAt":"2026-08-31T12:30:45Z","nonce":"paWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaU","schema":"dev.kernaid.fleet.policy-pull-request.v1","tenantId":"tenant-europe-1"}';
+const POLICY_PULL_JSON =
+  '{"deviceId":"KA-3097e2dee2cb4a34b53840cd","issuedAt":"2026-08-31T12:30:45Z","nonce":"paWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaU","schema":"dev.kernaid.fleet.policy-pull-request.v1","signature":"7COdZ1ket_ukr-YZOcMHj3kdfeL6gSuM5U0ggUlAOXnsjdUw0duGkfyWh4BqBV0_nEcbXvbfmETKcuIdiM5JCA","tenantId":"tenant-europe-1"}';
+const POLICY_PUBLIC_KEY_SPKI =
+  "MCowBQYDK2VwAyEAIBLLkMpg6OXY2vZuInLSIz4EhtVX6MZhQe2JIBd9frc";
+const POLICY_BUNDLE_JSON =
+  '{"assignments":{"deviceIds":["KA-0123456789abcdef01234567"]},"expiresAtUnix":1800172800,"issuedAtUnix":1800000000,"notBeforeUnix":1800000100,"offlineAllowedUntilUnix":1800086400,"policyId":"repair-baseline","revision":7,"rules":{"allowEvidenceUpload":true,"allowedActionIds":["linux.fstab.disable-missing-uuid.v1","system.observe.noop"],"deniedActionIds":["windows.registry.unsafe.v1"],"emergencyRollbackAlwaysAllowed":true,"localApprovalFrom":"R1","maxRisk":"R2","providerModes":["enterprise","offline","openai_api"],"retentionDays":90,"updateRing":"stable"},"schema":"dev.kernaid.fleet.policy-bundle.v1","signature":"fqRlJ15i5Hyn_oec1PkbDWMIjyFxMLEOPnnyOshBjnZciwVgu-v_uW5vIAiHqyi7p3CfGucukV2U-7AaHDjjBg","tenantId":"tenant-europe-1"}';
 
 test("canonical JSON sorts object keys recursively and preserves array order", () => {
   assert.equal(
@@ -190,6 +204,72 @@ test("Rust and TypeScript audit framing and signature are byte-identical", () =>
   );
   assert.throws(
     () => parseAuditEnvelope({ ...envelope, rawLog: "forbidden" }),
+    FleetSchemaError,
+  );
+});
+
+test("Rust and TypeScript policy pull bytes are byte-identical", () => {
+  const request = parsePolicyPullRequest(JSON.parse(POLICY_PULL_JSON));
+  assert.equal(canonicalJson(request), POLICY_PULL_JSON);
+  assert.equal(
+    canonicalJson(toUnsignedPolicyPull(request)),
+    POLICY_PULL_UNSIGNED,
+  );
+  assert.equal(
+    Buffer.from(policyPullSigningBytes(request)).toString("utf8"),
+    `kernaid:fleet:policy-pull:v1\0${POLICY_PULL_UNSIGNED}`,
+  );
+  const key = createPublicKey({
+    key: Buffer.from(PUBLIC_KEY_SPKI, "base64url"),
+    format: "der",
+    type: "spki",
+  });
+  assert.equal(
+    verify(
+      null,
+      policyPullSigningBytes(request),
+      key,
+      Buffer.from(request.signature, "base64url"),
+    ),
+    true,
+  );
+  assert.throws(
+    () => parsePolicyPullRequest({ ...request, rawDiagnostics: [] }),
+    FleetSchemaError,
+  );
+});
+
+test("Rust and TypeScript signed policy bundle framing is byte-identical", () => {
+  const bundle = parseSignedPolicyBundle(JSON.parse(POLICY_BUNDLE_JSON));
+  assert.equal(canonicalJson(bundle), POLICY_BUNDLE_JSON);
+  const unsigned = canonicalJson(toUnsignedPolicyBundle(bundle));
+  const signingBytes = Buffer.from(policyBundleSigningBytes(bundle));
+  const domain = Buffer.from("kernaid:fleet:policy:v1\0", "utf8");
+  assert.equal(signingBytes.subarray(0, domain.length).equals(domain), true);
+  assert.equal(
+    signingBytes.readBigUInt64BE(domain.length),
+    BigInt(Buffer.byteLength(unsigned)),
+  );
+  assert.equal(signingBytes.subarray(domain.length + 8).toString(), unsigned);
+  const key = createPublicKey({
+    key: Buffer.from(POLICY_PUBLIC_KEY_SPKI, "base64url"),
+    format: "der",
+    type: "spki",
+  });
+  assert.equal(
+    verify(null, signingBytes, key, Buffer.from(bundle.signature, "base64url")),
+    true,
+  );
+  assert.throws(
+    () => parseSignedPolicyBundle({ ...bundle, repairCommand: "forbidden" }),
+    FleetSchemaError,
+  );
+  assert.throws(
+    () =>
+      parseSignedPolicyBundle({
+        ...bundle,
+        rules: { ...bundle.rules, emergencyRollbackAlwaysAllowed: false },
+      }),
     FleetSchemaError,
   );
 });

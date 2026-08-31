@@ -17,6 +17,7 @@ Signatures are Ed25519 over these bytes, with no length prefix:
 ```text
 kernaid:fleet:enrollment:v1\0 || canonical JSON(request without signature)
 kernaid:fleet:inventory:v1\0  || canonical JSON(envelope without signature)
+kernaid:fleet:policy-pull:v1\0 || canonical JSON(request without signature)
 ```
 
 The test suite includes fixed enrollment and inventory vectors produced by the
@@ -35,6 +36,16 @@ payload = kernaid:fleet:audit:v1\0 || u64be(canonical length) || canonical JSON(
 The fixed audit vector in `test/protocol.test.ts` was produced by the Rust
 `fleet-audit` crate and verifies the complete nested framing cross-language.
 
+Fleet policy bundles preserve the existing `kernaid-fleet-policy` framing:
+
+```text
+kernaid:fleet:policy:v1\0 || u64be(canonical unsigned length)
+                              || canonical JSON(unsigned bundle)
+```
+
+Fixed Rust vectors verify both the policy-pull direct framing and the policy
+bundle length framing byte-for-byte in Node.js.
+
 ## Closed payloads
 
 - `dev.kernaid.fleet.enrollment-request.v1` binds a one-time token, tenant,
@@ -47,6 +58,11 @@ The fixed audit vector in `test/protocol.test.ts` was produced by the Rust
   per-device, per-session digest chain. It accepts only identifiers, status,
   risk and target/report/evidence digests; raw logs, PII and arbitrary fields
   are not representable.
+- `dev.kernaid.fleet.policy-pull-request.v1` is a minimal freshness proof from
+  an enrolled device. Commands, diagnostics and repair authority cannot be
+  represented.
+- `dev.kernaid.fleet.policy-bundle.v1` mirrors the strict Rust policy format,
+  including sorted assignments/rules and mandatory rollback availability.
 
 Device IDs have the canonical form
 `KA-<first 24 lowercase hex characters of SHA-256(raw Ed25519 public key)>`.

@@ -32,11 +32,20 @@ upload or arbitrary metadata API.
   sequence is rejected.
 - Tenant admin lookup, device listing, asset listing and revocation are scoped
   by both the URL tenant ID and that tenant's token hash.
+- A tenant admin may set exactly one Ed25519 policy trust anchor. Only its
+  public SPKI is stored; the control plane has no signing endpoint and never
+  receives a seed or private key.
+- Policy publication accepts only canonical bundles already signed by that
+  anchor. Revision is monotonic per policy ID; exact replay is idempotent and
+  rollback or same-revision substitution is rejected transactionally.
+- Policy pulls are signed by the enrolled device key, time-bounded, and
+  nonce-replay protected with a short-lived hash. Revoked and cross-tenant
+  identities fail before lookup, and SQLite returns only matching assignments.
 
 ## API
 
 All POST bodies use `Content-Type: application/json`, reject unknown fields,
-and are limited to 64 KiB.
+and are limited to 64 KiB, except canonical policy publication at 1 MiB.
 
 | Method | Route                                            | Authorization          | Result                                       |
 | ------ | ------------------------------------------------ | ---------------------- | -------------------------------------------- |
@@ -46,6 +55,9 @@ and are limited to 64 KiB.
 | `POST` | `/v1/enrollments`                                | Signed public request  | Enroll a device                              |
 | `POST` | `/v1/inventories`                                | Signed device envelope | Insert or idempotently acknowledge inventory |
 | `POST` | `/v1/audit-events`                               | Signed device envelope | Append or idempotently acknowledge audit     |
+| `POST` | `/v1/policy-pulls`                               | Signed device request  | Return only applicable signed bundles        |
+| `POST` | `/v1/tenants/:tenantId/policy-trust-anchor`      | Tenant bearer          | Set tenant Ed25519 public anchor once        |
+| `POST` | `/v1/tenants/:tenantId/policies`                 | Tenant bearer          | Verify and publish a pre-signed bundle       |
 | `GET`  | `/v1/tenants/:tenantId/devices`                  | Tenant bearer          | `{ items: [...] }` device registry           |
 | `GET`  | `/v1/tenants/:tenantId/assets`                   | Tenant bearer          | `{ items: [...] }` latest aggregate assets   |
 | `GET`  | `/v1/tenants/:tenantId/audit-events`             | Tenant bearer          | Bounded `{ items: [...] }` digest-only audit |
@@ -64,6 +76,12 @@ accepts one signed envelope per asset so each asset retains independent signed
 provenance. Audit POST bodies must be byte-identical canonical JSON. List
 responses expose only protocol fields, aggregate counts and audit digests;
 they never expose public keys, token hashes, raw content or stored signatures.
+
+Policy publication requires byte-exact canonical JSON and is bounded to the
+same 1 MiB limit as the Rust policy crate. Pull responses contain
+`{schema,tenantId,deviceId,items}`; every item remains independently signed and
+must pass the device's durable `PolicyCheckpoint`. The server cannot turn a
+policy into execution authority.
 
 ## Run locally
 
@@ -112,6 +130,9 @@ see [`deploy/fleet`](../../deploy/fleet/README.md).
    its Ed25519 key and submits the signed enrollment request.
 4. Use the console or list APIs to monitor signed asset summaries and revoke a
    lost or retired identity.
+5. Generate the tenant policy key offline. Set its public SPKI once, sign each
+   canonical policy outside this service, then publish the signed bundle. Keep
+   the private key in the organization signing system.
 
 ## Verification
 
@@ -125,4 +146,5 @@ corepack pnpm --filter @kernaid/fleet-control-plane lint
 The focused API suite covers cross-tenant denial, token expiry/reuse, key-ID
 binding, signature tampering, replay/idempotency, multi-asset retention,
 revocation, audit gaps/forks, unknown/private field rejection, hash-only
-secrets, restart persistence, health and optional same-origin console serving.
+secrets, policy assignment isolation, policy rollback/conflict, restart
+persistence, health and optional same-origin console serving.

@@ -1,7 +1,7 @@
 # KernAid Fleet client E1
 
-`kernaid-fleet-client` is the offline-first device side of Fleet enrollment
-and inventory. It signs both protocols with the existing
+`kernaid-fleet-client` is the offline-first device side of Fleet enrollment,
+inventory, and policy-pull authentication. It signs every protocol with the existing
 `kernaid-device-identity::DeviceIdentity`; the Ed25519 seed is never copied
 into Fleet state or serialized.
 
@@ -57,6 +57,23 @@ Use `sign_inventory_batch` when a session observes several assets. It creates
 one independently signed envelope per asset with consecutive sequence values;
 it does not place multiple machines into an ambiguous shared signature.
 
+## Policy pull
+
+```rust,ignore
+let request = SignedPolicyPullRequest::sign(
+    &identity,
+    PolicyPullRequestInput::new(tenant_id, issued_at, fresh_nonce),
+)?;
+let canonical_body = request.export_offline()?;
+```
+
+The request contains only tenant ID, key-derived device ID, RFC3339 issuance
+time, nonce, schema, and signature. Its Ed25519 message is exactly
+`kernaid:fleet:policy-pull:v1\0 || canonical_unsigned_json`. The receiver must
+verify against the enrolled key and reject stale or replayed nonces. Bundle
+verification remains in `kernaid-fleet-policy` and uses the separately
+provisioned tenant policy trust anchor.
+
 ## Wire and privacy rules
 
 - Offline files are canonical JSON and imports reject whitespace, alternate
@@ -68,7 +85,7 @@ it does not place multiple machines into an ambiguous shared signature.
 - `Debug` output omits enrollment tokens, nonces, signatures, public keys,
   target fingerprints, and snapshot hashes.
 - Enrollment verification requires the expected tenant and one-time token.
-  Inventory verification requires the tenant, device ID, and enrolled public
+  Inventory and policy-pull verification require the tenant, device ID, and enrolled public
   key supplied by the caller; embedded fields are never treated as trust
   anchors.
 - There is deliberately no HTTP dependency. The same bytes can be moved by
