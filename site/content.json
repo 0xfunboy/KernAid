@@ -1,5 +1,5 @@
 {
-  "schema": "dev.kernaid.site-content.v2",
+  "schema": "dev.kernaid.site-content.v3",
   "release": {
     "name": "KernAid Rescue AMD64",
     "channel": "Internal 0.1.0-internal.6 · virtual-qualified · diagnosis-only · physical-test candidate",
@@ -17,6 +17,24 @@
     "retailExpandedBytes": 32000000000,
     "qualification": "Build, ABI, SBOM, framebuffer prodotto dal WebKit shipping in VM, input da tastiera, boot e USB-style two-boot QEMU BIOS/UEFI superati nel Rescue run 33330139973. Il Desktop run 33330140025 ha superato i gate CI di packaging nativo della matrice; installazione e GUI su hardware restano non qualificate. La build stabile esclude per gate fail-closed UI, handler, unit e superfici di scrittura repair. Release Channel v1 sequence 6, run 33334176867, e manifest SHA-256 11d15af0ef07b78760f468f3302cd398255c072dba0920b868c967f53206e674 riverificano gli asset della release immutabile con tag kernaid-internal-v0.1.0-internal.6.",
     "warning": "Candidata interna diagnosis-only qualificata soltanto virtualmente e unica immagine autorizzata dal catalogo trusted v2 revision 8. Include il nuovo percorso grafico shared-memory/CPU e il boot di compatibilità per il retest del precedente schermo nero; non contiene repair e non deve essere presentata come supporto di riparazione. USB, firmware e Secure Boot fisici, oltre al login Codex con account reale/TLS live, restano non qualificati; usare hardware non cliente e una chiavetta nuova o sacrificabile da 64 GB consigliati, mai con capacità reale inferiore ai 32.000.000.000 byte dell'immagine espansa."
+  },
+  "diagnosticCandidate": {
+    "available": true,
+    "retailAvailable": false,
+    "name": "KernAid Rescue Diagnostic Physical-Test Candidate AMD64",
+    "channel": "Run 33394757884 · diagnosis-only · physical-test candidate · NON QUALIFICATA",
+    "sourceCommit": "c875451b8f2ee1f7a8c651ef4db5aa25655bd7ff",
+    "workflowRunId": 33394757884,
+    "artifactVersion": "ci-33394757884-1",
+    "workflowUrl": "https://github.com/0xfunboy/KernAid/actions/runs/33394757884",
+    "downloadName": "KernAid-Rescue-c875451-diagnostic-physical-test-candidate-x86_64.iso",
+    "checksumName": "KernAid-Rescue-c875451-diagnostic-physical-test-candidate-x86_64.iso.sha256",
+    "bytes": 1224736768,
+    "sha256": "7496a3d737e04ecc079e40aa2732e59cec619222e08e7dcda7ad780d285e9295",
+    "retailDownloadName": "KernAid-Rescue-c875451-diagnostic-physical-test-candidate-x86_64-retail.img.xz",
+    "retailChecksumName": "KernAid-Rescue-c875451-diagnostic-physical-test-candidate-x86_64-retail.img.xz.sha256",
+    "qualification": "Sul medesimo ISO il run 33394757884 ha superato build e controlli shipping, QEMU BIOS, UEFI Secure Boot, USB-style two-boot BIOS/UEFI e lifecycle Vault persistente BIOS/UEFI. Il gate native-vault-prompt-bios è fallito e il job qualified-release è stato saltato: l'immagine non è qualificata, non sostituisce internal.6 e non entra nel catalogo trusted. Il run non ha prodotto un'immagine retail .img.xz.",
+    "warning": "ERRORE NOTO: il prompt nativo per creare o sbloccare il Vault non ha superato il test automatico BIOS. Scaricare soltanto per il test fisico controllato del boot e della UI diagnostica richiesto sul PC di laboratorio; non usarla come release stabile, non usarla su hardware cliente e non aspettarsi un flusso Vault affidabile. La stable internal.6 resta invariata."
   },
   "repairCandidate": {
     "available": false,

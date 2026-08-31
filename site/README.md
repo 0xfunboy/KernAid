@@ -26,6 +26,10 @@ authorize it.
 | `/private/downloads/retail-checksum` | Authenticated | SHA-256 sidecar generated for the retail image |
 | `/private/downloads/iso` | Authenticated | Range-capable ISO download |
 | `/private/downloads/checksum` | Authenticated | SHA-256 sidecar generated for the ISO |
+| `/private/downloads/diagnostic-candidate-iso` | Authenticated | Range-capable, separately pinned diagnosis-only physical-test candidate ISO |
+| `/private/downloads/diagnostic-candidate-iso-checksum` | Authenticated | SHA-256 sidecar generated for the diagnostic candidate ISO |
+| `/private/downloads/diagnostic-candidate-retail` | Authenticated | Optional range-capable retail image from the same diagnostic candidate run |
+| `/private/downloads/diagnostic-candidate-retail-checksum` | Authenticated | Optional SHA-256 sidecar for that retail image |
 | `/private/downloads/repair-candidate` | Authenticated | Range-capable, separately gated experimental repair-candidate ISO |
 | `/private/downloads/repair-candidate-checksum` | Authenticated | SHA-256 sidecar generated for the repair candidate |
 | `/private/logout` | Authenticated | Session revocation |
@@ -49,6 +53,10 @@ The server requires Node.js 24 or newer and has no package dependencies.
 | `KAID_RETAIL_SHA256_PATH` | No | `${KAID_RETAIL_PATH}.sha256` |
 | `KAID_ISO_PATH` | Yes for downloads | No default |
 | `KAID_ISO_SHA256_PATH` | No | `${KAID_ISO_PATH}.sha256` |
+| `KAID_DIAGNOSTIC_CANDIDATE_ISO_PATH` | No; required only to expose the diagnostic physical-test candidate | No default |
+| `KAID_DIAGNOSTIC_CANDIDATE_ISO_SHA256_PATH` | No | `${KAID_DIAGNOSTIC_CANDIDATE_ISO_PATH}.sha256` |
+| `KAID_DIAGNOSTIC_CANDIDATE_RETAIL_PATH` | No; only when the exact run produced a retail image | No default |
+| `KAID_DIAGNOSTIC_CANDIDATE_RETAIL_SHA256_PATH` | No | `${KAID_DIAGNOSTIC_CANDIDATE_RETAIL_PATH}.sha256` |
 | `KAID_REPAIR_CANDIDATE_PATH` | No; required only to expose the repair candidate | No default |
 | `KAID_REPAIR_CANDIDATE_SHA256_PATH` | No | `${KAID_REPAIR_CANDIDATE_PATH}.sha256` |
 
@@ -57,14 +65,15 @@ Cloudflare tunnel credentials outside the repository with owner-only
 permissions. The server reads the password once at startup and never logs it.
 
 No artifact is loaded into memory. At process start the server opens the retail
-image, stable ISO and separately configured repair-candidate ISO without
+image, stable ISO and separately configured diagnostic/repair candidates without
 following a final symlink, verifies owner-only permissions, hashes every byte
 against its configured sidecar and keeps those exact file descriptors pinned
-for downloads. The stable retail image and ISO must also match the reviewed
+for downloads. Every stable or candidate artifact must also match the reviewed
 byte size and SHA-256 recorded in `content.json`; a sidecar alone cannot switch
-the served release. A missing path or mismatch leaves only that artifact
-unavailable. Operators and users must still verify each downloaded file using
-its sidecar.
+the served artifact. A missing path or mismatch leaves only that artifact
+unavailable. Candidate environment variables are optional, so omitting them
+does not affect the stable internal.6 downloads. Operators and users must still
+verify each downloaded file using its sidecar.
 
 Keep the private artifact directory owner-only (`0700`) and the ISO, checksum
 and metadata files owner-readable only (`0600`). Web authentication is not a
@@ -81,7 +90,9 @@ candidate changes, update together:
 4. exact reviewed byte sizes and SHA-256 values for the retail image and ISO;
 5. qualification statement and warning;
 6. configured retail image and ISO with their matching checksum sidecars;
-7. repair-candidate metadata and files separately, without changing the stable
+7. diagnostic physical-test candidate metadata and files separately, including
+   its failed gate and exact passing coverage, without changing the stable paths;
+8. repair-candidate metadata and files separately, without changing the stable
    release paths or promoting the candidate.
 
 `content.json` and all verified artifact snapshots are loaded once at process
@@ -99,6 +110,13 @@ physical qualification on factory-new or disposable USB and non-customer
 hardware until physical USB, Secure Boot and real-account/TLS gates are
 recorded.
 
+The diagnostic physical-test candidate is independent from the stable release
+and trusted catalogs. Private availability means only that the exact ISO is
+offered for controlled physical investigation. Its card must name every known
+failed gate. A successful build plus BIOS, UEFI, two-boot and Vault lifecycle
+evidence does not erase a failed native Vault prompt gate and does not qualify
+or promote the candidate.
+
 The repair candidate has an independent, stricter boundary. It may be exposed
 only in the authenticated lab area after one exact image passes every virtual
 boot, apply, rollback and restart-reconciliation step in its dedicated workflow.
@@ -108,14 +126,13 @@ and public product until the remaining fault, physical power-loss, Secure Boot
 and explicit release-policy gates are recorded.
 
 Each enabled download remains independently fail-closed with `503` until its
-exact file, matching sidecar and environment path are all present. Stable retail
-and ISO downloads additionally require exact equality with their reviewed size
-and digest in `content.json`. A repair candidate explicitly disabled in
-`content.json` returns `404`; enabling it also requires exact reviewed size and
-digest equality before the route can serve bytes. This allows the stable ISO
-and retail image to remain available when the repair candidate is absent,
-without weakening any artifact boundary. Candidate availability never changes
-its explicit non-qualified, non-promoted status.
+exact file, matching sidecar and environment path are all present. Stable and
+candidate artifacts additionally require exact equality with their reviewed
+size and digest in `content.json`. A candidate explicitly disabled in
+`content.json` returns `404`; enabling it does not weaken this equality check.
+This allows the stable ISO and retail image to remain available when either
+candidate is absent. Candidate availability never changes its explicit
+non-qualified, non-promoted status.
 
 ## Local validation
 
@@ -132,6 +149,7 @@ KAID_PORT=3211 \
 KAID_AUTH_FILE=/path/to/password \
 KAID_RETAIL_PATH=/path/to/KernAid-Rescue-amd64-retail.img.xz \
 KAID_ISO_PATH=/path/to/KernAid-Rescue-amd64.iso \
+KAID_DIAGNOSTIC_CANDIDATE_ISO_PATH=/path/to/KernAid-Rescue-amd64-diagnostic-candidate.iso \
 KAID_REPAIR_CANDIDATE_PATH=/path/to/KernAid-Rescue-amd64-repair-candidate.iso \
 node site/server.mjs
 ```
@@ -145,6 +163,12 @@ POST /private/login with valid data      303 + Secure session cookie
 GET  /private/ with the session          200
 GET  /private/downloads/retail Range 0-0 206, one byte
 GET  /private/downloads/iso Range 0-0    206, one byte
+GET  /private/downloads/diagnostic-candidate-iso Range 0-0
+                                              503 when not configured;
+                                              206, one byte when exact
+GET  /private/downloads/diagnostic-candidate-retail Range 0-0
+                                              404 when not produced;
+                                              206, one byte when exact
 GET  /private/downloads/repair-candidate Range 0-0
                                               404 when disabled; 503 if enabled but invalid;
                                               206, one byte when enabled and exact

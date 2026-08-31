@@ -15,6 +15,10 @@ const isoPath = process.env.KAID_ISO_PATH || "";
 const isoSha256Path = process.env.KAID_ISO_SHA256_PATH || (isoPath ? `${isoPath}.sha256` : "");
 const retailPath = process.env.KAID_RETAIL_PATH || "";
 const retailSha256Path = process.env.KAID_RETAIL_SHA256_PATH || (retailPath ? `${retailPath}.sha256` : "");
+const diagnosticCandidateIsoPath = process.env.KAID_DIAGNOSTIC_CANDIDATE_ISO_PATH || "";
+const diagnosticCandidateIsoSha256Path = process.env.KAID_DIAGNOSTIC_CANDIDATE_ISO_SHA256_PATH || (diagnosticCandidateIsoPath ? `${diagnosticCandidateIsoPath}.sha256` : "");
+const diagnosticCandidateRetailPath = process.env.KAID_DIAGNOSTIC_CANDIDATE_RETAIL_PATH || "";
+const diagnosticCandidateRetailSha256Path = process.env.KAID_DIAGNOSTIC_CANDIDATE_RETAIL_SHA256_PATH || (diagnosticCandidateRetailPath ? `${diagnosticCandidateRetailPath}.sha256` : "");
 const repairCandidatePath = process.env.KAID_REPAIR_CANDIDATE_PATH || "";
 const repairCandidateSha256Path = process.env.KAID_REPAIR_CANDIDATE_SHA256_PATH || (repairCandidatePath ? `${repairCandidatePath}.sha256` : "");
 const sessionLifetimeMs = 12 * 60 * 60 * 1000;
@@ -33,6 +37,32 @@ const configuredArtifacts = Object.freeze({
     bytes: content.release.retailBytes,
     sha256: content.release.retailSha256,
   }),
+  diagnosticCandidateIso: loadArtifactSnapshot(
+    content.diagnosticCandidate.available ? diagnosticCandidateIsoPath : "",
+    content.diagnosticCandidate.available ? diagnosticCandidateIsoSha256Path : "",
+    "diagnostic physical-test candidate ISO",
+    content.diagnosticCandidate.available
+      ? {
+          bytes: content.diagnosticCandidate.bytes,
+          sha256: content.diagnosticCandidate.sha256,
+        }
+      : null,
+  ),
+  diagnosticCandidateRetail: loadArtifactSnapshot(
+    content.diagnosticCandidate.available && content.diagnosticCandidate.retailAvailable
+      ? diagnosticCandidateRetailPath
+      : "",
+    content.diagnosticCandidate.available && content.diagnosticCandidate.retailAvailable
+      ? diagnosticCandidateRetailSha256Path
+      : "",
+    "diagnostic physical-test candidate retail image",
+    content.diagnosticCandidate.available && content.diagnosticCandidate.retailAvailable
+      ? {
+          bytes: content.diagnosticCandidate.retailBytes,
+          sha256: content.diagnosticCandidate.retailSha256,
+        }
+      : null,
+  ),
   repairCandidate: loadArtifactSnapshot(
     content.repairCandidate.available ? repairCandidatePath : "",
     content.repairCandidate.available ? repairCandidateSha256Path : "",
@@ -103,8 +133,13 @@ function assertOwnerOnlyDirectory(directoryPath) {
 
 function loadContent(filePath) {
   const parsed = JSON.parse(fs.readFileSync(filePath, "utf8"));
-  if (parsed?.schema !== "dev.kernaid.site-content.v2" || !parsed.release || !parsed.repairCandidate) {
-    throw new Error("content.json does not match dev.kernaid.site-content.v2");
+  if (
+    parsed?.schema !== "dev.kernaid.site-content.v3" ||
+    !parsed.release ||
+    !parsed.diagnosticCandidate ||
+    !parsed.repairCandidate
+  ) {
+    throw new Error("content.json does not match dev.kernaid.site-content.v3");
   }
   for (const key of ["name", "channel", "sourceCommit", "artifactVersion", "workflowUrl", "downloadName", "checksumName", "retailDownloadName", "retailChecksumName", "qualification", "warning"]) {
     if (typeof parsed.release[key] !== "string" || !parsed.release[key].trim()) {
@@ -127,6 +162,41 @@ function loadContent(filePath) {
   for (const key of ["isoSha256", "retailSha256"]) {
     if (!/^[a-f0-9]{64}$/.test(parsed.release[key])) {
       throw new Error(`content.json release.${key} must be a lowercase SHA-256 digest`);
+    }
+  }
+  for (const key of ["name", "channel", "sourceCommit", "artifactVersion", "workflowUrl", "downloadName", "checksumName", "retailDownloadName", "retailChecksumName", "qualification", "warning"]) {
+    if (typeof parsed.diagnosticCandidate[key] !== "string" || !parsed.diagnosticCandidate[key].trim()) {
+      throw new Error(`content.json diagnosticCandidate.${key} must be a non-empty string`);
+    }
+  }
+  if (typeof parsed.diagnosticCandidate.available !== "boolean") {
+    throw new Error("content.json diagnosticCandidate.available must be boolean");
+  }
+  if (typeof parsed.diagnosticCandidate.retailAvailable !== "boolean") {
+    throw new Error("content.json diagnosticCandidate.retailAvailable must be boolean");
+  }
+  for (const key of ["downloadName", "checksumName", "retailDownloadName", "retailChecksumName"]) {
+    if (!/^[A-Za-z0-9._-]+$/.test(parsed.diagnosticCandidate[key])) {
+      throw new Error(`content.json diagnosticCandidate.${key} is not a safe filename`);
+    }
+  }
+  if (parsed.diagnosticCandidate.available) {
+    if (!Number.isSafeInteger(parsed.diagnosticCandidate.bytes) || parsed.diagnosticCandidate.bytes < 1) {
+      throw new Error("content.json diagnosticCandidate.bytes must be a positive safe integer when available");
+    }
+    if (!/^[a-f0-9]{64}$/.test(parsed.diagnosticCandidate.sha256)) {
+      throw new Error("content.json diagnosticCandidate.sha256 must be a lowercase digest when available");
+    }
+  }
+  if (parsed.diagnosticCandidate.retailAvailable) {
+    if (!parsed.diagnosticCandidate.available) {
+      throw new Error("content.json diagnosticCandidate.retailAvailable requires available");
+    }
+    if (!Number.isSafeInteger(parsed.diagnosticCandidate.retailBytes) || parsed.diagnosticCandidate.retailBytes < 1) {
+      throw new Error("content.json diagnosticCandidate.retailBytes must be a positive safe integer when available");
+    }
+    if (!/^[a-f0-9]{64}$/.test(parsed.diagnosticCandidate.retailSha256)) {
+      throw new Error("content.json diagnosticCandidate.retailSha256 must be a lowercase digest when available");
     }
   }
   for (const key of ["name", "channel", "sourceCommit", "artifactVersion", "workflowUrl", "downloadName", "checksumName", "qualification", "warning"]) {
@@ -157,7 +227,7 @@ function loadContent(filePath) {
       throw new Error(`content.json repairCandidate.${key} is not a safe filename`);
     }
   }
-  for (const [label, section] of [["release", parsed.release], ["repairCandidate", parsed.repairCandidate]]) {
+  for (const [label, section] of [["release", parsed.release], ["diagnosticCandidate", parsed.diagnosticCandidate], ["repairCandidate", parsed.repairCandidate]]) {
     let workflowUrl;
     try {
       workflowUrl = new URL(section.workflowUrl);
@@ -167,6 +237,14 @@ function loadContent(filePath) {
     if (workflowUrl.protocol !== "https:") {
       throw new Error(`content.json ${label}.workflowUrl must use HTTPS`);
     }
+  }
+  if (
+    !Number.isSafeInteger(parsed.diagnosticCandidate.workflowRunId) ||
+    parsed.diagnosticCandidate.workflowRunId < 1
+  ) {
+    throw new Error(
+      "content.json diagnosticCandidate.workflowRunId must be a positive safe integer",
+    );
   }
   if (
     !Number.isSafeInteger(parsed.repairCandidate.workflowRunId) ||
@@ -451,11 +529,21 @@ function artifactView(snapshot) {
 function renderPrivate() {
   const retail = artifactView(configuredArtifacts.retail);
   const iso = artifactView(configuredArtifacts.iso);
+  const diagnosticCandidateIso = artifactView(configuredArtifacts.diagnosticCandidateIso);
+  const diagnosticCandidateRetail = artifactView(configuredArtifacts.diagnosticCandidateRetail);
+  const diagnosticCandidateIsoReady =
+    content.diagnosticCandidate.available &&
+    configuredArtifacts.diagnosticCandidateIso.artifact !== null;
+  const diagnosticCandidateRetailReady =
+    content.diagnosticCandidate.available &&
+    content.diagnosticCandidate.retailAvailable &&
+    configuredArtifacts.diagnosticCandidateRetail.artifact !== null;
   const repairCandidate = artifactView(configuredArtifacts.repairCandidate);
   const repairCandidateReady =
     content.repairCandidate.available &&
     configuredArtifacts.repairCandidate.artifact !== null;
   const release = content.release;
+  const diagnosticCandidate = content.diagnosticCandidate;
   const candidate = content.repairCandidate;
   return render(privateTemplate, {
     artifactName: escapeHtml(release.name),
@@ -466,6 +554,37 @@ function renderPrivate() {
     downloadName: escapeHtml(release.retailDownloadName),
     expandedBytes: escapeHtml(formatInteger(release.retailExpandedBytes)),
     hash: escapeHtml(retail.hash),
+    diagnosticCandidateActions: diagnosticCandidateIsoReady
+      ? '<a class="button primary" href="/private/downloads/diagnostic-candidate-iso">Scarica ISO diagnostic candidate</a><a class="button ghost" href="/private/downloads/diagnostic-candidate-iso-checksum">Scarica SHA-256 candidate</a>'
+      : '<span class="release-status status-unavailable"><i></i>ISO non configurata sul server</span>',
+    diagnosticCandidateArtifactState: diagnosticCandidateIsoReady
+      ? "Download disponibile · NON qualificata"
+      : diagnosticCandidateIso.state,
+    diagnosticCandidateArtifactVersion: escapeHtml(diagnosticCandidate.artifactVersion),
+    diagnosticCandidateChannel: escapeHtml(diagnosticCandidate.channel),
+    diagnosticCandidateChecksumName: escapeHtml(diagnosticCandidate.checksumName),
+    diagnosticCandidateDownloadName: escapeHtml(diagnosticCandidate.downloadName),
+    diagnosticCandidateHash: escapeHtml(diagnosticCandidateIso.hash),
+    diagnosticCandidateModified: escapeHtml(diagnosticCandidateIso.modified),
+    diagnosticCandidateName: escapeHtml(diagnosticCandidate.name),
+    diagnosticCandidateQualification: escapeHtml(diagnosticCandidate.qualification),
+    diagnosticCandidateRetailActions: diagnosticCandidateRetailReady
+      ? '<a class="button ghost" href="/private/downloads/diagnostic-candidate-retail">Scarica immagine Rufus candidate</a><a class="button ghost" href="/private/downloads/diagnostic-candidate-retail-checksum">Scarica SHA-256 retail candidate</a>'
+      : '<span class="release-status status-unavailable"><i></i>Immagine Rufus non prodotta da questo run</span>',
+    diagnosticCandidateRetailDownloadName: escapeHtml(diagnosticCandidate.retailDownloadName),
+    diagnosticCandidateRetailHash: escapeHtml(diagnosticCandidateRetail.hash),
+    diagnosticCandidateRetailSize: escapeHtml(diagnosticCandidateRetail.size),
+    diagnosticCandidateSize: escapeHtml(diagnosticCandidateIso.size),
+    diagnosticCandidateSourceCommit: escapeHtml(diagnosticCandidate.sourceCommit),
+    diagnosticCandidateStateClass: diagnosticCandidateIsoReady
+      ? "status-warning"
+      : diagnosticCandidateIso.stateClass,
+    diagnosticCandidateVerify: diagnosticCandidateIsoReady
+      ? `<p>Linux — ISO diagnostic physical-test candidate</p><code>sha256sum -c ${escapeHtml(diagnosticCandidate.checksumName)}</code>`
+      : '<p>Diagnostic candidate — configura il file esatto del run prima del download.</p>',
+    diagnosticCandidateWarning: escapeHtml(diagnosticCandidate.warning),
+    diagnosticCandidateWorkflowRunId: escapeHtml(diagnosticCandidate.workflowRunId),
+    diagnosticCandidateWorkflowUrl: escapeHtml(diagnosticCandidate.workflowUrl),
     isoArtifactState: iso.state,
     isoChecksumName: escapeHtml(release.checksumName),
     isoDownloadName: escapeHtml(release.downloadName),
@@ -708,6 +827,60 @@ async function handleRequest(req, res) {
   }
   if (url.pathname === "/private/downloads/retail-checksum") {
     serveChecksum(req, res, configuredArtifacts.retail, content.release.retailDownloadName, content.release.retailChecksumName);
+    return;
+  }
+  if (url.pathname === "/private/downloads/diagnostic-candidate-iso") {
+    if (!content.diagnosticCandidate.available) {
+      send(req, res, 404, "Candidate non disponibile.\n", { "Content-Type": "text/plain; charset=utf-8" }, { isPrivate: true });
+      return;
+    }
+    serveArtifact(
+      req,
+      res,
+      configuredArtifacts.diagnosticCandidateIso,
+      content.diagnosticCandidate.downloadName,
+    );
+    return;
+  }
+  if (url.pathname === "/private/downloads/diagnostic-candidate-iso-checksum") {
+    if (!content.diagnosticCandidate.available) {
+      send(req, res, 404, "Candidate non disponibile.\n", { "Content-Type": "text/plain; charset=utf-8" }, { isPrivate: true });
+      return;
+    }
+    serveChecksum(
+      req,
+      res,
+      configuredArtifacts.diagnosticCandidateIso,
+      content.diagnosticCandidate.downloadName,
+      content.diagnosticCandidate.checksumName,
+    );
+    return;
+  }
+  if (url.pathname === "/private/downloads/diagnostic-candidate-retail") {
+    if (!content.diagnosticCandidate.available || !content.diagnosticCandidate.retailAvailable) {
+      send(req, res, 404, "Immagine retail candidate non disponibile.\n", { "Content-Type": "text/plain; charset=utf-8" }, { isPrivate: true });
+      return;
+    }
+    serveArtifact(
+      req,
+      res,
+      configuredArtifacts.diagnosticCandidateRetail,
+      content.diagnosticCandidate.retailDownloadName,
+    );
+    return;
+  }
+  if (url.pathname === "/private/downloads/diagnostic-candidate-retail-checksum") {
+    if (!content.diagnosticCandidate.available || !content.diagnosticCandidate.retailAvailable) {
+      send(req, res, 404, "Immagine retail candidate non disponibile.\n", { "Content-Type": "text/plain; charset=utf-8" }, { isPrivate: true });
+      return;
+    }
+    serveChecksum(
+      req,
+      res,
+      configuredArtifacts.diagnosticCandidateRetail,
+      content.diagnosticCandidate.retailDownloadName,
+      content.diagnosticCandidate.retailChecksumName,
+    );
     return;
   }
   if (url.pathname === "/private/downloads/repair-candidate") {
