@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 //! Linux read-only diagnostics and opt-in disposable fixture repair primitives.
 
+pub mod boot_critical_path;
 pub mod diagnostics;
 pub mod filesystem_health;
 pub mod hardware;

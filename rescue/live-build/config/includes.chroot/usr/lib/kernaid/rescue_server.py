@@ -47,6 +47,7 @@ COMMANDS = (
     ("linux.dpkg.audit", ("/usr/bin/dpkg", "--audit")),
 )
 STORAGE_HEALTH_BINARY = "/usr/lib/kernaid/kernaid-linux-storage-health"
+BOOT_CRITICAL_PATH_BINARY = "/usr/lib/kernaid/kernaid-linux-boot-critical-path"
 TARGET_SCAN_COMMAND = (
     "/usr/bin/lsblk",
     "--json",
@@ -1937,25 +1938,36 @@ def observe_storage_health(deadline: float | None = None) -> dict[str, object]:
         }
 
 
+def observe_boot_critical_path(deadline: float | None = None) -> dict[str, object]:
+    """Collect the normalized live-runtime boot path without exposing raw output."""
+    if deadline is None:
+        return observe("linux.boot-critical-path.v1", (BOOT_CRITICAL_PATH_BINARY,))
+    return observe(
+        "linux.boot-critical-path.v1", (BOOT_CRITICAL_PATH_BINARY,), deadline
+    )
+
+
 def inventory(deadline: float | None = None) -> list[dict[str, object]]:
     _check_deadline(deadline)
     if not INVENTORY_LOCK.acquire(blocking=False):
         raise InventoryBusy("Inventario locale già in corso; riprovare.")
     try:
         _check_deadline(deadline)
-        with ThreadPoolExecutor(max_workers=len(COMMANDS) + 1) as executor:
+        with ThreadPoolExecutor(max_workers=len(COMMANDS) + 2) as executor:
             if deadline is None:
                 futures = [
                     executor.submit(observe, collector, command)
                     for collector, command in COMMANDS
                 ]
                 futures.append(executor.submit(observe_storage_health))
+                futures.append(executor.submit(observe_boot_critical_path))
             else:
                 futures = [
                     executor.submit(observe, collector, command, deadline)
                     for collector, command in COMMANDS
                 ]
                 futures.append(executor.submit(observe_storage_health, deadline))
+                futures.append(executor.submit(observe_boot_critical_path, deadline))
             observations = [
                 future.result(timeout=_remaining_seconds(deadline))
                 if deadline is not None
