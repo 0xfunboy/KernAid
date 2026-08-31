@@ -1,0 +1,8 @@
+background.image = Image("kernaid-splash.png").Scale(
+  Window.GetWidth(),
+  Window.GetHeight()
+);
+background.sprite = Sprite(background.image);
+background.sprite.SetX(0);
+background.sprite.SetY(0);
+background.sprite.SetZ(-100);

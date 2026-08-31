@@ -27,10 +27,11 @@ use std::{
 };
 use tauri::{
     RunEvent, Url, WebviewUrl,
-    webview::{NewWindowResponse, WebviewWindowBuilder},
+    webview::{Color, NewWindowResponse, WebviewWindowBuilder},
 };
 
 const RESCUE_UI_URL: &str = "http://127.0.0.1:4173/";
+const RESCUE_UI_BUNDLE_MARKER: &str = r#"<meta name="kernaid-bundle" content="desk-v1" />"#;
 const STARTUP_DEADLINE: Duration = Duration::from_secs(90);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 const PROBE_INTERVAL: Duration = Duration::from_millis(250);
@@ -429,7 +430,7 @@ fn valid_rescue_ui_response(response: &[u8]) -> bool {
         && header_value("X-Content-Type-Options") == Some("nosniff")
         && body.contains("<script type=\"module\"")
         && body.contains("./assets/")
-        && body.contains("<div id=\"root\"></div>")
+        && body.contains(RESCUE_UI_BUNDLE_MARKER)
 }
 
 fn rescue_ui_ready_once() -> bool {
@@ -779,6 +780,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .setup(move |app| {
             WebviewWindowBuilder::new(app, "main", WebviewUrl::External(rescue_url))
                 .title("KernAid Rescue")
+                .background_color(Color(13, 17, 16, 255))
                 .fullscreen(true)
                 .decorations(false)
                 .focused(true)
@@ -863,18 +865,24 @@ Content-Type: text/html\r\n\
 X-Frame-Options: DENY\r\n\
 X-Content-Type-Options: nosniff\r\n\
 \r\n\
+<meta name=\"kernaid-bundle\" content=\"desk-v1\" />\
 <script type=\"module\" src=\"./assets/index.js\"></script>\
-<div id=\"root\"></div>";
+<div id=\"root\"><div class=\"boot-splash\">Preparing KernAid</div></div>";
         assert!(valid_rescue_ui_response(response));
+        let missing_marker = b"HTTP/1.0 200 OK\r\n\
+Content-Security-Policy: default-src 'none'; script-src 'self'\r\n\
+Content-Type: text/html\r\n\
+X-Frame-Options: DENY\r\n\
+X-Content-Type-Options: nosniff\r\n\
+\r\n\
+<script type=\"module\" src=\"./assets/index.js\"></script>\
+<div id=\"root\"><div class=\"boot-splash\">Preparing KernAid</div></div>";
         for invalid in [
             response
                 .as_slice()
                 .strip_prefix(b"HTTP/1.0 200 OK\r\n")
                 .expect("fixed response has the status line"),
-            response
-                .as_slice()
-                .strip_suffix(b"<div id=\"root\"></div>")
-                .expect("fixed response has the root element"),
+            missing_marker.as_slice(),
             &b"HTTP/1.0 200 OK\r\n\r\n<div id=\"root\"></div>"[..],
         ] {
             assert!(!valid_rescue_ui_response(invalid));

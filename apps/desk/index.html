@@ -1,1 +1,28 @@
-<div id="root"></div><script type="module" src="/src/main.tsx"></script>
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="kernaid-bundle" content="desk-v1" />
+    <title>KernAid</title>
+    <link rel="stylesheet" href="/src/boot-splash.css" />
+  </head>
+  <body>
+    <div id="root">
+      <div class="boot-splash" role="status" aria-live="polite">
+        <div class="boot-splash__brand">
+          <span class="boot-splash__mark" aria-hidden="true">K</span>
+          <div>
+            <strong>KERNAID</strong>
+            <span>SECURE SYSTEM WORKSPACE</span>
+          </div>
+        </div>
+        <p>Preparing KernAid&hellip;</p>
+        <span class="boot-splash__progress" aria-hidden="true"></span>
+        <small>READ-ONLY DIAGNOSIS BY DEFAULT</small>
+      </div>
+    </div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

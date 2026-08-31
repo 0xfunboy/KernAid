@@ -353,7 +353,7 @@ if [[ "$repair_candidate" = "1" ]]; then
   repair_bootappend_suffix=" kernaid.repair=fstab-v1"
   iso_basename="KernAid-Rescue-amd64-repair-candidate.iso"
 fi
-bootappend_live="boot=live components noroot username=kernaid hostname=kernaid-rescue live-config.nox11autologin live-config.user-default-groups=audio,cdrom,dip,floppy,video,plugdev,netdev,powerdev,scanner,bluetooth,kernaid-vault,kernaid-codex-client systemd.swap=0 quiet loglevel=5 console=tty0 console=ttyS0,115200n8${repair_bootappend_suffix}"
+bootappend_live="boot=live components noroot username=kernaid hostname=kernaid-rescue live-config.nox11autologin live-config.user-default-groups=audio,cdrom,dip,floppy,video,plugdev,netdev,powerdev,scanner,bluetooth,kernaid-vault,kernaid-codex-client systemd.swap=0 quiet splash plymouth.ignore-serial-consoles loglevel=5 console=tty0 console=ttyS0,115200n8${repair_bootappend_suffix}"
 bootappend_compat="$bootappend_live nomodeset kernaid.graphics=compat"
 lb config \
   --mode debian \

@@ -9,13 +9,22 @@
 use crate::{
     BootVaultLocation, LocatedVaultClassification, LocatedVaultClassificationError,
     LocatedVaultIdentity, LocatedVaultPartition, RescueVaultMountManager, VaultMountManagerError,
-    locate_boot_vault, profile_classifier::verify_embedded_profile,
+    bounded_process, locate_boot_vault, profile_classifier::verify_embedded_profile,
 };
 use kernaid_protocol::rescue_vault::{MAX_PASSPHRASE_BYTES, MIN_PASSPHRASE_BYTES};
-use std::{error::Error, fmt, os::fd::AsFd, time::Duration};
+use std::{
+    error::Error,
+    fmt,
+    os::fd::AsFd,
+    process::{Command, Stdio},
+    time::Duration,
+};
 use zeroize::Zeroizing;
 
 const CLASSIFICATION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const PLYMOUTH_QUIT_TIMEOUT: Duration = Duration::from_secs(3);
+const PLYMOUTH_PATH: &str = "/usr/bin/plymouth";
+const PLYMOUTH_QUIT_ARGUMENTS: &[&str] = &["quit"];
 const SECRET_READ_CHUNK_BYTES: usize = 256;
 
 /// Stable, redacted failures for the first-boot boundary.
@@ -37,6 +46,7 @@ pub enum FirstBootBoundaryError {
     SecretMismatch,
     ProcessPrivacyUnavailable,
     PrivateMountNamespaceUnavailable,
+    BootSplashDismissalFailed,
     TtyConfirmationUnavailable,
     ManagerUnavailable,
     ProvisioningFailed,
@@ -65,6 +75,7 @@ impl FirstBootBoundaryError {
             Self::SecretMismatch => "secret-mismatch",
             Self::ProcessPrivacyUnavailable => "process-privacy-unavailable",
             Self::PrivateMountNamespaceUnavailable => "private-mount-namespace-unavailable",
+            Self::BootSplashDismissalFailed => "boot-splash-dismissal-failed",
             Self::TtyConfirmationUnavailable => "tty-confirmation-unavailable",
             Self::ManagerUnavailable => "manager-unavailable",
             Self::ProvisioningFailed => "provisioning-failed",
@@ -518,6 +529,7 @@ pub fn run_rescue_firstboot() -> Result<FirstBootProvisioningEvidence, FirstBoot
         .map_err(|()| FirstBootBoundaryError::ProcessPrivacyUnavailable)?;
     enter_private_mount_namespace()?;
     let preflight = run_rescue_firstboot_preflight()?;
+    dismiss_boot_splash()?;
     let (first, confirmation) = crate::rescue_daemon::read_firstboot_passphrase_pair()
         .map_err(|_| FirstBootBoundaryError::TtyConfirmationUnavailable)?;
     let passphrase = ConfirmedPassphrase::confirm_values(first, confirmation)?;
@@ -525,6 +537,25 @@ pub fn run_rescue_firstboot() -> Result<FirstBootProvisioningEvidence, FirstBoot
         .into_unprovisioned()
         .bind_confirmation(passphrase)
         .provision_in_private_namespace()
+}
+
+/// Relinquish Plymouth only after the exact boot Vault has passed its complete
+/// read-only unprovisioned classification. The fixed child has no shell, no
+/// caller-controlled argument or inherited stdio, and is killed as a process
+/// group if it exceeds the bounded prompt-transition deadline.
+fn dismiss_boot_splash() -> Result<(), FirstBootBoundaryError> {
+    let mut command = Command::new(PLYMOUTH_PATH);
+    command
+        .args(PLYMOUTH_QUIT_ARGUMENTS)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let status = bounded_process::wait(&mut command, PLYMOUTH_QUIT_TIMEOUT)
+        .map_err(|_| FirstBootBoundaryError::BootSplashDismissalFailed)?;
+    if !status.success() {
+        return Err(FirstBootBoundaryError::BootSplashDismissalFailed);
+    }
+    Ok(())
 }
 
 fn enter_private_mount_namespace() -> Result<(), FirstBootBoundaryError> {
@@ -758,6 +789,13 @@ mod tests {
                 .iter()
                 .all(|command| !command.reads_confirmed_passphrase_from_stdin)
         );
+    }
+
+    #[test]
+    fn boot_splash_release_is_fixed_and_bounded() {
+        assert_eq!(PLYMOUTH_PATH, "/usr/bin/plymouth");
+        assert_eq!(PLYMOUTH_QUIT_ARGUMENTS, ["quit"]);
+        assert_eq!(PLYMOUTH_QUIT_TIMEOUT, Duration::from_secs(3));
     }
 
     #[test]
