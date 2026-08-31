@@ -20,6 +20,7 @@ kernaid:fleet:inventory:v1\0  || canonical JSON(envelope without signature)
 kernaid:fleet:policy-pull:v1\0 || canonical JSON(request without signature)
 kernaid:fleet:entitlement-pull:v1\0 || canonical JSON(request without signature)
 kernaid:fleet:update-pull:v1\0 || canonical JSON(request without signature)
+kernaid:fleet:service-receipt:v1\0 || canonical JSON(receipt without signature)
 kernaid:update:manifest:v1\0 || canonical JSON(manifest without signature)
 ```
 
@@ -88,6 +89,10 @@ Ed25519 signature byte-for-byte in TypeScript.
   artifact bytes or boot activation instruction.
 - `dev.kernaid.fleet.update-pull-request.v1` binds the enrolled device,
   platform, architecture and effective update ring to a fresh signed request.
+- `dev.kernaid.fleet.service-receipt.v1` binds one accepted device operation to
+  the exact request and response digests plus a durable, per-device sequence.
+  It acknowledges only inventory, audit, policy-pull and entitlement-pull; no
+  command or repair authority is representable.
 
 Device IDs have the canonical form
 `KA-<first 24 lowercase hex characters of SHA-256(raw Ed25519 public key)>`.

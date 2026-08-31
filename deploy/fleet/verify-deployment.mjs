@@ -33,6 +33,14 @@ assert.match(
 );
 assert.match(
   dockerfile,
+  /KERNAID_FLEET_SERVICE_RECEIPT_SIGNING_KEY_FILE=\/run\/secrets\/kernaid_fleet_service_receipt_signing_key/,
+);
+assert.match(
+  dockerfile,
+  /KERNAID_FLEET_SERVICE_RECEIPT_TRUST_ANCHOR_FILE=\/run\/configs\/kernaid_fleet_service_receipt_trust_anchor/,
+);
+assert.match(
+  dockerfile,
   /KERNAID_FLEET_ENTITLEMENT_TRUST_ANCHOR_FILE=\/run\/configs\/kernaid_entitlement_trust_anchor/,
 );
 assert.match(
@@ -54,11 +62,27 @@ assert.match(compose, /^\s+tmpfs:$/m);
 assert.match(compose, /^\s+KERNAID_FLEET_ROOT_TOKEN_FILE: \/run\/secrets\//m);
 assert.match(
   compose,
+  /^\s+KERNAID_FLEET_SERVICE_RECEIPT_SIGNING_KEY_FILE: \/run\/secrets\//m,
+);
+assert.match(
+  compose,
+  /^\s+KERNAID_FLEET_SERVICE_RECEIPT_TRUST_ANCHOR_FILE: \/run\/configs\//m,
+);
+assert.match(
+  compose,
   /^\s+KERNAID_FLEET_ENTITLEMENT_TRUST_ANCHOR_FILE: \/run\/configs\//m,
 );
 assert.match(
   compose,
   /^\s+KERNAID_FLEET_UPDATE_TRUST_ANCHOR_FILE: \/run\/configs\//m,
+);
+assert.match(
+  compose,
+  /^\s+file: "\$\{KERNAID_FLEET_SERVICE_RECEIPT_SIGNING_KEY_FILE:/m,
+);
+assert.match(
+  compose,
+  /^\s+file: "\$\{KERNAID_FLEET_SERVICE_RECEIPT_TRUST_ANCHOR_FILE:/m,
 );
 assert.match(
   compose,
@@ -72,6 +96,7 @@ assert.match(compose, /^\s+mode: 0400$/m);
 assert.match(compose, /^\s+internal: true$/m);
 assert.match(compose, /^\s+- ALL$/m);
 assert.doesNotMatch(compose, /^\s+KERNAID_FLEET_ROOT_TOKEN:\s/m);
+assert.doesNotMatch(compose, /SERVICE_RECEIPT_(?:SEED|PRIVATE_KEY)(?:\s|:|=)/i);
 assert.doesNotMatch(compose, /ENTITLEMENT_(?:PRIVATE|SEED|SIGNING)/i);
 assert.doesNotMatch(compose, /UPDATE_(?:PRIVATE|SEED|SIGNING)/i);
 

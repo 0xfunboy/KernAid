@@ -6,11 +6,15 @@ import {
   openSync,
   readFileSync,
 } from "node:fs";
+import type { KeyObject } from "node:crypto";
 import { dirname, resolve } from "node:path";
+import { importEd25519PrivatePkcs8 } from "./crypto.js";
 
 export interface FleetServiceConfig {
   databasePath: string;
   rootToken: string;
+  serviceReceiptSigningKey: KeyObject;
+  serviceReceiptTrustAnchor: string;
   entitlementTrustAnchor: string;
   updateTrustAnchor: string;
   host: string;
@@ -38,6 +42,14 @@ export function loadFleetServiceConfig(
   const updateTrustAnchorFile = requiredEnvironment(
     environment,
     "KERNAID_FLEET_UPDATE_TRUST_ANCHOR_FILE",
+  );
+  const serviceReceiptSigningKeyFile = requiredEnvironment(
+    environment,
+    "KERNAID_FLEET_SERVICE_RECEIPT_SIGNING_KEY_FILE",
+  );
+  const serviceReceiptTrustAnchorFile = requiredEnvironment(
+    environment,
+    "KERNAID_FLEET_SERVICE_RECEIPT_TRUST_ANCHOR_FILE",
   );
 
   const secretDescriptor = openSync(
@@ -77,11 +89,20 @@ export function loadFleetServiceConfig(
     updateTrustAnchorFile,
     "KERNAID_FLEET_UPDATE_TRUST_ANCHOR_FILE",
   );
+  const serviceReceiptSigningKey = readPrivateSigningKeyFile(
+    serviceReceiptSigningKeyFile,
+  );
+  const serviceReceiptTrustAnchor = readPublicKeyFile(
+    serviceReceiptTrustAnchorFile,
+    "KERNAID_FLEET_SERVICE_RECEIPT_TRUST_ANCHOR_FILE",
+  );
 
   const consoleDirectory = environment.FLEET_CONSOLE_DIR;
   return {
     databasePath,
     rootToken,
+    serviceReceiptSigningKey,
+    serviceReceiptTrustAnchor,
     entitlementTrustAnchor,
     updateTrustAnchor,
     host: environment.KERNAID_FLEET_HOST ?? "127.0.0.1",
@@ -101,6 +122,34 @@ export function loadFleetServiceConfig(
       ? {}
       : { consoleDirectory: resolve(consoleDirectory) }),
   };
+}
+
+function readPrivateSigningKeyFile(path: string): KeyObject {
+  const descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  let value: Buffer;
+  try {
+    const entry = fstatSync(descriptor);
+    if (!entry.isFile() || entry.size < 32 || entry.size > 256) {
+      throw new Error(
+        "KERNAID_FLEET_SERVICE_RECEIPT_SIGNING_KEY_FILE must be a bounded regular file",
+      );
+    }
+    if (process.platform !== "win32" && (entry.mode & 0o077) !== 0) {
+      throw new Error(
+        "Fleet service receipt signing key must not be accessible by group or other",
+      );
+    }
+    value = readFileSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
+  try {
+    return importEd25519PrivatePkcs8(value);
+  } catch {
+    throw new Error(
+      "KERNAID_FLEET_SERVICE_RECEIPT_SIGNING_KEY_FILE must contain canonical Ed25519 PKCS#8 DER",
+    );
+  }
 }
 
 function readPublicKeyFile(path: string, variable: string): string {

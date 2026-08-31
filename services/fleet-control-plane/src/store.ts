@@ -11,6 +11,7 @@ import type {
   SignedPolicyBundle,
   EntitlementEnvelope,
   EntitlementRevocationEnvelope,
+  FleetServiceOperation,
   SignedUpdateManifest,
 } from "@kernaid/fleet-schemas";
 import { canonicalJson } from "@kernaid/fleet-schemas";
@@ -20,6 +21,9 @@ const MAX_RECENT_POLICY_PULL_NONCES_PER_DEVICE = 1024;
 const MAX_ENTITLEMENT_STREAMS_PER_TENANT = 256;
 const MAX_RECENT_ENTITLEMENT_PULL_NONCES_PER_DEVICE = 1024;
 const MAX_RECENT_UPDATE_PULL_NONCES_PER_DEVICE = 1024;
+const MAX_SERVICE_RESPONSE_BYTES = 4 * 1024 * 1024;
+const MAX_SERVICE_RECEIPT_BYTES = 8 * 1024;
+const MAX_SERVICE_RECEIPTS_PER_OPERATION = 4;
 
 export class StoreConflictError extends Error {}
 export class StoreAuthorizationError extends Error {}
@@ -36,6 +40,7 @@ export class StoreEntitlementPullReplayError extends Error {}
 export class StoreUpdateRollbackError extends Error {}
 export class StoreUpdateConflictError extends Error {}
 export class StoreUpdatePullReplayError extends Error {}
+export class StoreServiceReceiptAnchorMismatchError extends Error {}
 
 interface EnrollmentTokenRow {
   tenant_id: string;
@@ -82,6 +87,36 @@ export interface EntitlementPublishResult {
 export interface UpdatePublishResult {
   idempotent: boolean;
   publishedAt: string;
+}
+
+export interface StoredServiceResponse {
+  tenantId: string;
+  deviceId: string;
+  operation: FleetServiceOperation;
+  sequence: number;
+  requestSha256: string;
+  responseSha256: string;
+  status: number;
+  responseBody: string;
+  receiptJson: string;
+}
+
+interface ServicePullNonce {
+  nonceSha256: string;
+  expiresAtMs: number;
+  nowMs: number;
+}
+
+interface CommitServiceResponseInput {
+  tenantId: string;
+  deviceId: string;
+  operation: FleetServiceOperation;
+  requestSha256: string;
+  responseSha256: string;
+  status: number;
+  responseBody: string;
+  createdAt: string;
+  pullNonce?: ServicePullNonce;
 }
 
 export interface ListedAuditEvent {
@@ -134,6 +169,154 @@ export class FleetStore {
 
   healthCheck(): void {
     this.#database.prepare("SELECT 1 AS healthy").get();
+  }
+
+  bindServiceReceiptAnchor(anchorSha256: string): void {
+    if (!isSha256(anchorSha256)) {
+      throw new Error("service receipt anchor digest is invalid");
+    }
+    this.#transaction(() => {
+      const current = this.#database
+        .prepare(
+          "SELECT anchor_sha256 FROM service_receipt_config WHERE singleton = 1",
+        )
+        .get() as { anchor_sha256: string } | undefined;
+      if (current === undefined) {
+        this.#database
+          .prepare(
+            "INSERT INTO service_receipt_config (singleton, anchor_sha256) VALUES (1, ?)",
+          )
+          .run(anchorSha256);
+      } else if (current.anchor_sha256 !== anchorSha256) {
+        throw new StoreServiceReceiptAnchorMismatchError(
+          "service receipt anchor does not match this database",
+        );
+      }
+    });
+  }
+
+  getServiceResponse(input: {
+    tenantId: string;
+    deviceId: string;
+    operation: FleetServiceOperation;
+    requestSha256: string;
+  }): StoredServiceResponse | undefined {
+    validateServiceResponseLookup(input);
+    const row = this.#database
+      .prepare(
+        `SELECT tenant_id, device_id, operation, sequence, request_sha256,
+                response_sha256, status, response_body, receipt_json
+         FROM service_receipts
+         WHERE tenant_id = ? AND device_id = ? AND operation = ?
+           AND request_sha256 = ?
+         ORDER BY sequence DESC LIMIT 1`,
+      )
+      .get(
+        input.tenantId,
+        input.deviceId,
+        input.operation,
+        input.requestSha256,
+      ) as ServiceResponseRow | undefined;
+    return row === undefined ? undefined : mapServiceResponse(row);
+  }
+
+  commitServiceResponse(
+    input: CommitServiceResponseInput,
+    signReceipt: (sequence: number) => string,
+  ): StoredServiceResponse {
+    validateServiceResponseCommit(input);
+    return this.#transaction(() => {
+      const existing = this.getServiceResponse(input);
+      if (existing !== undefined) return existing;
+
+      if (input.pullNonce !== undefined) {
+        this.#recordServicePullNonce(
+          input.operation,
+          input.tenantId,
+          input.deviceId,
+          input.pullNonce,
+        );
+      }
+
+      const checkpoint = this.#database
+        .prepare(
+          `SELECT last_sequence FROM service_receipt_checkpoints
+           WHERE tenant_id = ? AND device_id = ?`,
+        )
+        .get(input.tenantId, input.deviceId) as
+        { last_sequence: number } | undefined;
+      const sequence = (checkpoint?.last_sequence ?? 0) + 1;
+      if (!Number.isSafeInteger(sequence) || sequence < 1) {
+        throw new StoreConflictError("service receipt sequence exhausted");
+      }
+      const receiptJson = signReceipt(sequence);
+      if (
+        Buffer.byteLength(receiptJson, "utf8") === 0 ||
+        Buffer.byteLength(receiptJson, "utf8") > MAX_SERVICE_RECEIPT_BYTES
+      ) {
+        throw new Error("service receipt exceeds its bound");
+      }
+
+      this.#database
+        .prepare(
+          `INSERT INTO service_receipt_checkpoints
+            (tenant_id, device_id, last_sequence, updated_at)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT (tenant_id, device_id) DO UPDATE SET
+             last_sequence = excluded.last_sequence,
+             updated_at = excluded.updated_at`,
+        )
+        .run(input.tenantId, input.deviceId, sequence, input.createdAt);
+      this.#database
+        .prepare(
+          `INSERT INTO service_receipts
+            (tenant_id, device_id, operation, sequence, request_sha256,
+             response_sha256, status, response_body, receipt_json, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          input.tenantId,
+          input.deviceId,
+          input.operation,
+          sequence,
+          input.requestSha256,
+          input.responseSha256,
+          input.status,
+          input.responseBody,
+          receiptJson,
+          input.createdAt,
+        );
+      this.#database
+        .prepare(
+          `DELETE FROM service_receipts
+           WHERE tenant_id = ? AND device_id = ? AND operation = ?
+             AND sequence NOT IN (
+               SELECT sequence FROM service_receipts
+               WHERE tenant_id = ? AND device_id = ? AND operation = ?
+               ORDER BY sequence DESC LIMIT ?
+             )`,
+        )
+        .run(
+          input.tenantId,
+          input.deviceId,
+          input.operation,
+          input.tenantId,
+          input.deviceId,
+          input.operation,
+          MAX_SERVICE_RECEIPTS_PER_OPERATION,
+        );
+      return mapServiceResponse({
+        tenant_id: input.tenantId,
+        device_id: input.deviceId,
+        operation: input.operation,
+        sequence,
+        request_sha256: input.requestSha256,
+        response_sha256: input.responseSha256,
+        status: input.status,
+        response_body: input.responseBody,
+        receipt_json: receiptJson,
+      });
+    });
   }
 
   createTenant(
@@ -1101,6 +1284,55 @@ export class FleetStore {
     return result.changes === 1;
   }
 
+  #recordServicePullNonce(
+    operation: FleetServiceOperation,
+    tenantId: string,
+    deviceId: string,
+    nonce: ServicePullNonce,
+  ): void {
+    let table: "policy_pull_nonces" | "entitlement_pull_nonces";
+    let limit: number;
+    let replayError: new (message: string) => Error;
+    if (operation === "policy_pull") {
+      table = "policy_pull_nonces";
+      limit = MAX_RECENT_POLICY_PULL_NONCES_PER_DEVICE;
+      replayError = StoreNonceReplayError;
+    } else if (operation === "entitlement_pull") {
+      table = "entitlement_pull_nonces";
+      limit = MAX_RECENT_ENTITLEMENT_PULL_NONCES_PER_DEVICE;
+      replayError = StoreEntitlementPullReplayError;
+    } else {
+      throw new Error("service receipt pull nonce has an invalid operation");
+    }
+
+    this.#database
+      .prepare(`DELETE FROM ${table} WHERE expires_at_ms <= ?`)
+      .run(nonce.nowMs);
+    const recent = this.#database
+      .prepare(
+        `SELECT COUNT(*) AS count FROM ${table}
+         WHERE tenant_id = ? AND device_id = ?`,
+      )
+      .get(tenantId, deviceId) as { count: number };
+    if (recent.count >= limit) {
+      throw new StoreConflictError("recent service pull limit reached");
+    }
+    try {
+      this.#database
+        .prepare(
+          `INSERT INTO ${table}
+            (tenant_id, device_id, nonce_sha256, expires_at_ms)
+           VALUES (?, ?, ?, ?)`,
+        )
+        .run(tenantId, deviceId, nonce.nonceSha256, nonce.expiresAtMs);
+    } catch (error) {
+      if (isSqliteConstraint(error)) {
+        throw new replayError("service pull nonce was reused");
+      }
+      throw error;
+    }
+  }
+
   #transaction<T>(operation: () => T): T {
     this.#database.exec("BEGIN IMMEDIATE");
     try {
@@ -1117,7 +1349,7 @@ export class FleetStore {
     const version = this.#database.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    if (version.user_version > 5) {
+    if (version.user_version > 6) {
       throw new Error(
         `unsupported Fleet database version ${version.user_version}`,
       );
@@ -1371,8 +1603,68 @@ export class FleetStore {
           PRAGMA user_version = 5;
         `);
       });
+      currentVersion = 5;
+    }
+
+    if (currentVersion === 5) {
+      this.#transaction(() => {
+        this.#database.exec(`
+          CREATE TABLE service_receipt_config (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            anchor_sha256 TEXT NOT NULL
+          ) STRICT;
+
+          CREATE TABLE service_receipt_checkpoints (
+            tenant_id TEXT NOT NULL,
+            device_id TEXT NOT NULL,
+            last_sequence INTEGER NOT NULL CHECK (last_sequence > 0),
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, device_id),
+            FOREIGN KEY (tenant_id, device_id)
+              REFERENCES devices(tenant_id, device_id)
+              ON DELETE CASCADE
+          ) STRICT;
+
+          CREATE TABLE service_receipts (
+            tenant_id TEXT NOT NULL,
+            device_id TEXT NOT NULL,
+            operation TEXT NOT NULL CHECK (
+              operation IN ('inventory', 'audit', 'policy_pull', 'entitlement_pull')
+            ),
+            sequence INTEGER NOT NULL CHECK (sequence > 0),
+            request_sha256 TEXT NOT NULL,
+            response_sha256 TEXT NOT NULL,
+            status INTEGER NOT NULL CHECK (status IN (200, 201)),
+            response_body TEXT NOT NULL,
+            receipt_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, device_id, sequence),
+            FOREIGN KEY (tenant_id, device_id)
+              REFERENCES service_receipt_checkpoints(tenant_id, device_id)
+              ON DELETE CASCADE
+          ) STRICT;
+          CREATE INDEX service_receipts_request_idx
+            ON service_receipts(
+              tenant_id, device_id, operation, request_sha256, sequence DESC
+            );
+
+          PRAGMA user_version = 6;
+        `);
+      });
     }
   }
+}
+
+interface ServiceResponseRow {
+  tenant_id: string;
+  device_id: string;
+  operation: string;
+  sequence: number;
+  request_sha256: string;
+  response_sha256: string;
+  status: number;
+  response_body: string;
+  receipt_json: string;
 }
 
 interface AuditSessionRow {
@@ -1485,4 +1777,92 @@ function parseStoredEvidenceDigests(value: string): string[] {
     throw new Error("stored audit evidence digest list is invalid");
   }
   return parsed;
+}
+
+function validateServiceResponseLookup(input: {
+  tenantId: string;
+  deviceId: string;
+  operation: FleetServiceOperation;
+  requestSha256: string;
+}): void {
+  if (
+    !isPublicIdentifier(input.tenantId) ||
+    !/^KA-[0-9a-f]{24}$/.test(input.deviceId) ||
+    !isServiceOperation(input.operation) ||
+    !isSha256(input.requestSha256)
+  ) {
+    throw new Error("service response lookup is invalid");
+  }
+}
+
+function validateServiceResponseCommit(
+  input: CommitServiceResponseInput,
+): void {
+  validateServiceResponseLookup(input);
+  const isPull =
+    input.operation === "policy_pull" || input.operation === "entitlement_pull";
+  if (
+    !isSha256(input.responseSha256) ||
+    ![200, 201].includes(input.status) ||
+    Buffer.byteLength(input.responseBody, "utf8") === 0 ||
+    Buffer.byteLength(input.responseBody, "utf8") >
+      MAX_SERVICE_RESPONSE_BYTES ||
+    !Number.isFinite(Date.parse(input.createdAt)) ||
+    isPull !== (input.pullNonce !== undefined) ||
+    (input.pullNonce !== undefined &&
+      (!isSha256(input.pullNonce.nonceSha256) ||
+        !Number.isSafeInteger(input.pullNonce.expiresAtMs) ||
+        !Number.isSafeInteger(input.pullNonce.nowMs) ||
+        input.pullNonce.expiresAtMs <= input.pullNonce.nowMs))
+  ) {
+    throw new Error("service response commit is invalid");
+  }
+}
+
+function mapServiceResponse(row: ServiceResponseRow): StoredServiceResponse {
+  if (
+    !isPublicIdentifier(row.tenant_id) ||
+    !/^KA-[0-9a-f]{24}$/.test(row.device_id) ||
+    !isServiceOperation(row.operation) ||
+    !Number.isSafeInteger(row.sequence) ||
+    row.sequence < 1 ||
+    !isSha256(row.request_sha256) ||
+    !isSha256(row.response_sha256) ||
+    ![200, 201].includes(row.status) ||
+    Buffer.byteLength(row.response_body, "utf8") === 0 ||
+    Buffer.byteLength(row.response_body, "utf8") > MAX_SERVICE_RESPONSE_BYTES ||
+    Buffer.byteLength(row.receipt_json, "utf8") === 0 ||
+    Buffer.byteLength(row.receipt_json, "utf8") > MAX_SERVICE_RECEIPT_BYTES
+  ) {
+    throw new Error("stored service response is invalid");
+  }
+  return {
+    tenantId: row.tenant_id,
+    deviceId: row.device_id,
+    operation: row.operation,
+    sequence: row.sequence,
+    requestSha256: row.request_sha256,
+    responseSha256: row.response_sha256,
+    status: row.status,
+    responseBody: row.response_body,
+    receiptJson: row.receipt_json,
+  };
+}
+
+function isServiceOperation(value: string): value is FleetServiceOperation {
+  return ["inventory", "audit", "policy_pull", "entitlement_pull"].includes(
+    value,
+  );
+}
+
+function isSha256(value: string): boolean {
+  return /^[0-9a-f]{64}$/.test(value);
+}
+
+function isPublicIdentifier(value: string): boolean {
+  return (
+    value.length >= 1 &&
+    value.length <= 128 &&
+    /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(value)
+  );
 }
