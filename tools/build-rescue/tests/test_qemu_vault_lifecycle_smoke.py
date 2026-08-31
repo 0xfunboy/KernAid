@@ -2932,7 +2932,6 @@ class StaticContractTests(unittest.TestCase):
                 "hold-kill",
                 "post-fault",
                 "repair-apply",
-                "native-ready",
                 "native-post",
                 "native-journal-boot1",
                 "native-journal-boot2",
@@ -2992,8 +2991,11 @@ class StaticContractTests(unittest.TestCase):
                         failure.exception.code, f"{stage}-{checkpoint}"
                     )
 
-    def test_native_pre_failure_checkpoints_are_closed_and_correlated(self) -> None:
-        self.assertEqual(controller.PROVIDER_PROOF_NATIVE_STAGES, ("native-pre",))
+    def test_native_failure_checkpoints_are_closed_and_correlated(self) -> None:
+        self.assertEqual(
+            controller.PROVIDER_PROOF_NATIVE_STAGES,
+            ("native-pre", "native-ready"),
+        )
         for stage in controller.PROVIDER_PROOF_NATIVE_STAGES:
             for checkpoint in controller.PROVIDER_PROOF_NATIVE_CHECKPOINTS:
                 with self.subTest(stage=stage, checkpoint=checkpoint):

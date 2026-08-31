@@ -165,7 +165,29 @@ READY_PROOF = textwrap.dedent(
             if valid(): break
         except (OSError,UnicodeError,ValueError,subprocess.SubprocessError): pass
         time.sleep(0.05)
-    else: raise SystemExit(45)
+    else:
+        def checkpoint():
+            try:
+                command=open("/proc/cmdline","rb",buffering=0).read(4097)
+                if len(command)>4096:
+                    return "cmdline"
+                tokens=command.decode("ascii").split()
+                if tokens.count("boot=live")!=1 or tokens.count(FLAG)!=1:
+                    return "cmdline"
+                prompt=show("kernaid-rescue-native-vault-unlock.service",("ActiveState","SubState","Result","MainPID","Type","NotifyAccess","User","Group"))
+                if prompt is None or prompt["ActiveState"]!="active" or prompt["SubState"]!="running" or prompt["Result"]!="success" or prompt["Type"]!="notify" or prompt["NotifyAccess"]!="main" or prompt["User"]!="kernaid" or prompt["Group"]!="kernaid" or not prompt["MainPID"].isdecimal() or int(prompt["MainPID"])<=1:
+                    return "prompt-unit"
+                broker=show("kernaid-rescue-native-prompt.service",("ActiveState","SubState","Result"))
+                if broker!={{"ActiveState":"active","SubState":"running","Result":"success"}}:
+                    return "broker-unit"
+                active=open("/sys/class/tty/tty0/active","rb",buffering=0).read(16)
+                if active!=b"tty8\n":
+                    return "active-vt"
+                return "unknown"
+            except (OSError,UnicodeError,ValueError,subprocess.SubprocessError):
+                return "observation"
+        print("KERNAID_QEMU_PROVIDER_PROOF_FAILURE_V1 stage=native-ready checkpoint="+checkpoint())
+        raise SystemExit(45)
     print("KERNAID_QEMU_PROVIDER_PROOF_V1 stage=native-ready result=true")
     """
 ).strip().encode("ascii")

@@ -166,9 +166,8 @@ PROVIDER_PROOF_UI_STAGES = (
     "ui-diagnose-unconfigured",
     "ui-status-configured",
 )
-PROVIDER_PROOF_NATIVE_STAGES = ("native-pre",)
+PROVIDER_PROOF_NATIVE_STAGES = ("native-pre", "native-ready")
 PROVIDER_PROOF_NATIVE_COMMAND_STAGES = (
-    "native-ready",
     "native-post",
     "native-journal-boot1",
     "native-journal-boot2",
