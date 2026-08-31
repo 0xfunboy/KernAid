@@ -200,10 +200,11 @@ jobs:
             --bin kernaid-codex-auth
           cargo fmt -p kernaid-rescue-desk-shell -- --check
           cargo clippy --locked -p kernaid-rescue-desk-shell \
-            --all-targets -- -D warnings
+            --all-targets --features custom-protocol -- -D warnings
           cargo test --locked -p kernaid-rescue-desk-shell \
-            --all-targets
+            --all-targets --features custom-protocol
           cargo build --locked --release -p kernaid-rescue-desk-shell \
+            --features custom-protocol \
             --bin kernaid-rescue-desk-shell
       - name: Verify the in-guest Rescue binary ABI
         run: |

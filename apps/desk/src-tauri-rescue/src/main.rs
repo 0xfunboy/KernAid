@@ -824,6 +824,7 @@ fn main() {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "custom-protocol")]
     #[test]
     fn shipping_loopback_ui_is_not_classified_as_a_local_dev_origin() {
         assert!(!tauri::is_dev());
