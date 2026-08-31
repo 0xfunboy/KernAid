@@ -217,8 +217,10 @@ complete GUI qualification remain open.
 
 ## Immediate next gates
 
-1. Boot the exact `5db4700` image from physical USB on a small hardware matrix and
-   record firmware, storage, network and UI evidence.
+1. Boot the exact `5db4700` image from physical USB on a small hardware matrix
+   using the [physical USB qualification
+   runbook](runbooks/physical-usb-qualification.md), and record firmware,
+   storage, network and UI evidence.
 2. Finish the real-account Rescue provider/vault lifecycle without exposing or
    copying the CLI credential store.
 3. Fix and qualify one exact repair candidate through post-commit rollback,
@@ -238,6 +240,7 @@ physical USB and Secure Boot matrices pass.
 - [Repository overview](../README.md)
 - [Phase 0 architecture](architecture/phase-0.md)
 - [Operator guide](operator-guide.md)
+- [Physical USB qualification runbook](runbooks/physical-usb-qualification.md)
 - [Product and architecture masterplan](MASTERPLAN.md)
 - [Security policy](../SECURITY.md)
 - [Private/public project-site operations](../site/README.md)

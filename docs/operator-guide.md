@@ -97,6 +97,12 @@ release bundle.
 
 ### Windows: physical boot qualification only
 
+Use the concise [physical USB qualification
+runbook](runbooks/physical-usb-qualification.md) to record a reproducible
+machine-specific result and the bounded black-screen evidence. The release
+values below describe the candidate current at the time of this guide; the
+active candidate and its qualified manifest remain authoritative.
+
 For workflow releases whose qualification manifest contains `retailImage`, use
 `KernAid-Rescue-0.1.0-internal.6-x86_64-retail.img.xz` directly with a current
 Rufus in raw/DD mode and verify its adjacent checksum first. The compressed
