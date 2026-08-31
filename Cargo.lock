@@ -2392,6 +2392,7 @@ dependencies = [
  "kernaid-entitlements",
  "kernaid-fleet-audit",
  "kernaid-fleet-client",
+ "kernaid-fleet-policy",
  "rand_core 0.6.4",
  "rusqlite",
  "sha2",

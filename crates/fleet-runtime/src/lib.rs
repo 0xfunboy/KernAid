@@ -7,6 +7,7 @@
 //! against a caller-supplied public anchor; failures never close local safety
 //! paths such as diagnostics, report export, or rollback.
 
+use ed25519_dalek::VerifyingKey;
 use kernaid_device_identity::DeviceIdentity;
 use kernaid_entitlements::{
     EntitlementCheckpoint, EntitlementError, EntitlementState, LicensedCapabilities,
@@ -18,6 +19,10 @@ use kernaid_fleet_audit::{
     FleetAuditError, SignedAuditEnvelope, VerifiedAuditEnvelope,
 };
 use kernaid_fleet_client::{InventoryAsset, MAX_INVENTORY_BATCH_ASSETS, sign_inventory_batch};
+use kernaid_fleet_policy::{
+    CheckpointAdmission, FleetPolicyError, PolicyCheckpoint, SignedPolicyBundle, TransportState,
+    VerifiedPolicyBundle,
+};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use std::{
@@ -35,7 +40,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const IDENTITY_SCHEMA_VERSION: i64 = 1;
 const APPLICATION_ID: i64 = 0x4b41_464c; // "KAFL"
 const MAX_QUEUE_ITEMS: u64 = 100_000;
@@ -48,6 +53,9 @@ const MAX_ENTITLEMENT_DOCUMENT_BYTES: usize = 64 * 1024;
 const MAX_AUDIT_DOCUMENT_BYTES: usize = 64 * 1024;
 const MAX_AUDIT_CHECKPOINT_BYTES: usize = 4 * 1024;
 const MAX_AUDIT_EVENTS: u64 = 1_000_000;
+const MAX_POLICY_DOCUMENT_BYTES: usize = 1024 * 1024;
+const MAX_POLICY_CHECKPOINT_BYTES: usize = 4 * 1024;
+const MAX_POLICY_DOCUMENTS: u64 = 4_096;
 
 #[cfg(windows)]
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
@@ -184,6 +192,19 @@ pub struct EntitlementApplyResult {
     idempotent: bool,
 }
 
+/// Result of atomically applying one signed tenant policy stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PolicyApplyResult {
+    idempotent: bool,
+}
+
+impl PolicyApplyResult {
+    #[must_use]
+    pub const fn idempotent(self) -> bool {
+        self.idempotent
+    }
+}
+
 impl EntitlementApplyResult {
     #[must_use]
     pub const fn idempotent(self) -> bool {
@@ -315,6 +336,12 @@ pub enum FleetRuntimeError {
     Audit(FleetAuditError),
     TrustAnchorRequired,
     Entitlement(EntitlementError),
+    PolicyTrustAnchorRequired,
+    InvalidPolicyTrustAnchor,
+    PolicyDeviceNotAssigned,
+    PolicyReplayConflict,
+    PolicyStateCorrupt,
+    Policy(FleetPolicyError),
     Database(rusqlite::Error),
     Io(io::Error),
 }
@@ -341,6 +368,12 @@ impl fmt::Display for FleetRuntimeError {
             Self::Audit(_) => "Fleet audit operation failed",
             Self::TrustAnchorRequired => "Fleet entitlement trust anchor is required",
             Self::Entitlement(_) => "Fleet entitlement verification failed",
+            Self::PolicyTrustAnchorRequired => "Fleet policy trust anchor is required",
+            Self::InvalidPolicyTrustAnchor => "Fleet policy trust anchor is invalid",
+            Self::PolicyDeviceNotAssigned => "Fleet policy is not assigned to this device",
+            Self::PolicyReplayConflict => "Fleet policy replay is not byte-identical",
+            Self::PolicyStateCorrupt => "Fleet policy cache is corrupt",
+            Self::Policy(_) => "Fleet policy verification failed",
             Self::Database(_) => "Fleet runtime database operation failed",
             Self::Io(_) => "Fleet runtime filesystem operation failed",
         })
@@ -352,6 +385,7 @@ impl Error for FleetRuntimeError {
         match self {
             Self::Audit(error) => Some(error),
             Self::Entitlement(error) => Some(error),
+            Self::Policy(error) => Some(error),
             Self::Database(error) => Some(error),
             Self::Io(error) => Some(error),
             _ => None,
@@ -383,6 +417,12 @@ impl From<FleetAuditError> for FleetRuntimeError {
     }
 }
 
+impl From<FleetPolicyError> for FleetRuntimeError {
+    fn from(error: FleetPolicyError) -> Self {
+        Self::Policy(error)
+    }
+}
+
 /// SQLite-backed inventory queue bound to exactly one tenant and device.
 ///
 /// One product-level interprocess lock must cover each instance's lifetime.
@@ -393,6 +433,7 @@ pub struct FleetRuntime {
     device_id: String,
     device_public_key: [u8; 32],
     entitlement_trust_anchor: Option<[u8; 32]>,
+    policy_trust_anchor: Option<[u8; 32]>,
 }
 
 impl FleetRuntime {
@@ -402,7 +443,7 @@ impl FleetRuntime {
         tenant_id: &str,
         identity: &DeviceIdentity,
     ) -> Result<Self, FleetRuntimeError> {
-        Self::open_internal(path, tenant_id, identity, None)
+        Self::open_internal(path, tenant_id, identity, None, None)
     }
 
     /// Open state with an externally pinned vendor entitlement trust anchor.
@@ -413,7 +454,43 @@ impl FleetRuntime {
         identity: &DeviceIdentity,
         entitlement_trust_anchor: &[u8; 32],
     ) -> Result<Self, FleetRuntimeError> {
-        Self::open_internal(path, tenant_id, identity, Some(*entitlement_trust_anchor))
+        Self::open_internal(
+            path,
+            tenant_id,
+            identity,
+            Some(*entitlement_trust_anchor),
+            None,
+        )
+    }
+
+    /// Open state with an externally pinned tenant policy trust anchor. The
+    /// anchor remains process memory only. Every retained policy is reverified
+    /// before the runtime is returned.
+    pub fn open_with_policy_anchor(
+        path: &Path,
+        tenant_id: &str,
+        identity: &DeviceIdentity,
+        policy_trust_anchor: &[u8; 32],
+    ) -> Result<Self, FleetRuntimeError> {
+        Self::open_internal(path, tenant_id, identity, None, Some(*policy_trust_anchor))
+    }
+
+    /// Open state with both the vendor entitlement and tenant policy anchors.
+    /// Neither public anchor is serialized by this crate.
+    pub fn open_with_trust_anchors(
+        path: &Path,
+        tenant_id: &str,
+        identity: &DeviceIdentity,
+        entitlement_trust_anchor: &[u8; 32],
+        policy_trust_anchor: &[u8; 32],
+    ) -> Result<Self, FleetRuntimeError> {
+        Self::open_internal(
+            path,
+            tenant_id,
+            identity,
+            Some(*entitlement_trust_anchor),
+            Some(*policy_trust_anchor),
+        )
     }
 
     fn open_internal(
@@ -421,10 +498,15 @@ impl FleetRuntime {
         tenant_id: &str,
         identity: &DeviceIdentity,
         entitlement_trust_anchor: Option<[u8; 32]>,
+        policy_trust_anchor: Option<[u8; 32]>,
     ) -> Result<Self, FleetRuntimeError> {
         validate_public_identifier(tenant_id)?;
         let device_id = identity.device_id();
         let device_public_key = identity.public_key();
+        if let Some(anchor) = policy_trust_anchor {
+            VerifyingKey::from_bytes(&anchor)
+                .map_err(|_| FleetRuntimeError::InvalidPolicyTrustAnchor)?;
+        }
         prepare_database_path(path)?;
         let connection = Connection::open_with_flags(
             path,
@@ -436,14 +518,19 @@ impl FleetRuntime {
         harden_database_files(path)?;
         initialize_or_validate(&connection, tenant_id, &device_id)?;
         harden_database_files(path)?;
-        Ok(Self {
+        let runtime = Self {
             connection,
             path: path.to_path_buf(),
             tenant_id: tenant_id.to_owned(),
             device_id,
             device_public_key,
             entitlement_trust_anchor,
-        })
+            policy_trust_anchor,
+        };
+        if runtime.policy_trust_anchor.is_some() {
+            runtime.load_policies()?;
+        }
+        Ok(runtime)
     }
 
     #[must_use]
@@ -570,6 +657,97 @@ impl FleetRuntime {
             &trust_anchor,
             Some(&stored.checkpoint),
         )?))
+    }
+
+    /// Verify and atomically retain one canonical tenant policy bundle and its
+    /// per-policy monotonic checkpoint. A policy for another device is never
+    /// admitted to this device-bound database.
+    pub fn apply_policy(
+        &mut self,
+        document: &[u8],
+    ) -> Result<PolicyApplyResult, FleetRuntimeError> {
+        self.ensure_hardened()?;
+        let trust_anchor = policy_verifying_key(self.policy_trust_anchor)?;
+        let verified =
+            SignedPolicyBundle::import_and_verify(document, &trust_anchor, &self.tenant_id)?;
+        if !verified.applies_to_device(&self.device_id) {
+            return Err(FleetRuntimeError::PolicyDeviceNotAssigned);
+        }
+
+        let tenant_id = self.tenant_id.clone();
+        let device_id = self.device_id.clone();
+        let policy_id = verified.policy_id().to_owned();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let retained = read_policy_document(&transaction, &policy_id)?;
+        let (checkpoint, idempotent) = match retained.as_ref() {
+            Some(stored) => {
+                let (_, mut checkpoint) =
+                    verify_stored_policy(stored, &trust_anchor, &tenant_id, &device_id)?;
+                let admission = checkpoint.admit(&verified)?;
+                let idempotent = admission == CheckpointAdmission::IdempotentReplay;
+                if idempotent && stored.document != document {
+                    return Err(FleetRuntimeError::PolicyReplayConflict);
+                }
+                (checkpoint, idempotent)
+            }
+            None => (PolicyCheckpoint::from_verified(&verified), false),
+        };
+        let checkpoint_bytes = checkpoint.export_canonical()?;
+        transaction.execute(
+            "INSERT INTO fleet_policy_cache
+             (policy_id, revision, document, bundle_sha256, checkpoint)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(policy_id) DO UPDATE SET
+               revision = excluded.revision,
+               document = excluded.document,
+               bundle_sha256 = excluded.bundle_sha256,
+               checkpoint = excluded.checkpoint",
+            params![
+                policy_id,
+                verified.revision(),
+                document,
+                verified.digest().as_slice(),
+                checkpoint_bytes,
+            ],
+        )?;
+        transaction.commit()?;
+        self.ensure_hardened()?;
+        Ok(PolicyApplyResult { idempotent })
+    }
+
+    /// Load every retained policy, rechecking canonical bytes, signature,
+    /// tenant/device assignment, digest and checkpoint. One invalid row fails
+    /// the complete set closed so callers cannot accidentally relax policy.
+    pub fn load_policies(&self) -> Result<Vec<VerifiedPolicyBundle>, FleetRuntimeError> {
+        self.ensure_hardened()?;
+        let trust_anchor = policy_verifying_key(self.policy_trust_anchor)?;
+        read_policy_documents(&self.connection)?
+            .iter()
+            .map(|stored| {
+                verify_stored_policy(stored, &trust_anchor, &self.tenant_id, &self.device_id)
+                    .map(|(policy, _)| policy)
+            })
+            .collect()
+    }
+
+    /// Return the verified policy set currently applicable to new repairs.
+    /// Core/Broker must intersect every returned policy with its local floor;
+    /// absence from a later pull never removes a retained row.
+    pub fn applicable_policies(
+        &self,
+        now_unix: u64,
+        transport: TransportState,
+    ) -> Result<Vec<VerifiedPolicyBundle>, FleetRuntimeError> {
+        if now_unix == 0 || now_unix > kernaid_fleet_policy::MAX_SAFE_JSON_INTEGER {
+            return Err(FleetRuntimeError::InvalidClock);
+        }
+        Ok(self
+            .load_policies()?
+            .into_iter()
+            .filter(|policy| policy.is_applicable_to(&self.device_id, now_unix, transport))
+            .collect())
     }
 
     /// Resolve current capabilities without allowing licensing state to block
@@ -1326,6 +1504,16 @@ struct StoredRevocationDocument {
     checkpoint: RevocationCheckpoint,
 }
 
+struct StoredPolicyDocument {
+    policy_id: String,
+    revision: u64,
+    document: Vec<u8>,
+    bundle_sha256: [u8; SHA256_BYTES],
+    checkpoint: Vec<u8>,
+}
+
+type StoredPolicyRow = (String, u64, Vec<u8>, Vec<u8>, Vec<u8>);
+
 fn read_entitlement_checkpoint(
     connection: &Connection,
 ) -> Result<Option<EntitlementCheckpoint>, FleetRuntimeError> {
@@ -1414,6 +1602,110 @@ fn read_revocation_document(
     }))
 }
 
+fn policy_verifying_key(anchor: Option<[u8; 32]>) -> Result<VerifyingKey, FleetRuntimeError> {
+    VerifyingKey::from_bytes(&anchor.ok_or(FleetRuntimeError::PolicyTrustAnchorRequired)?)
+        .map_err(|_| FleetRuntimeError::InvalidPolicyTrustAnchor)
+}
+
+fn read_policy_document(
+    connection: &Connection,
+    policy_id: &str,
+) -> Result<Option<StoredPolicyDocument>, FleetRuntimeError> {
+    let stored: Option<StoredPolicyRow> = connection
+        .query_row(
+            "SELECT policy_id, revision, document, bundle_sha256, checkpoint
+             FROM fleet_policy_cache WHERE policy_id = ?1",
+            [policy_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    stored.map(stored_policy_document).transpose()
+}
+
+fn read_policy_documents(
+    connection: &Connection,
+) -> Result<Vec<StoredPolicyDocument>, FleetRuntimeError> {
+    let mut statement = connection.prepare(
+        "SELECT policy_id, revision, document, bundle_sha256, checkpoint
+         FROM fleet_policy_cache ORDER BY policy_id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+        ))
+    })?;
+    let mut policies = Vec::new();
+    for row in rows {
+        if policies.len() >= MAX_POLICY_DOCUMENTS as usize {
+            return Err(FleetRuntimeError::PolicyStateCorrupt);
+        }
+        policies.push(stored_policy_document(row?)?);
+    }
+    Ok(policies)
+}
+
+fn stored_policy_document(
+    (policy_id, revision, document, digest, checkpoint): StoredPolicyRow,
+) -> Result<StoredPolicyDocument, FleetRuntimeError> {
+    if !valid_policy_identifier(&policy_id)
+        || revision == 0
+        || revision > kernaid_fleet_policy::MAX_SAFE_JSON_INTEGER
+        || document.is_empty()
+        || document.len() > MAX_POLICY_DOCUMENT_BYTES
+        || checkpoint.is_empty()
+        || checkpoint.len() > MAX_POLICY_CHECKPOINT_BYTES
+    {
+        return Err(FleetRuntimeError::PolicyStateCorrupt);
+    }
+    let bundle_sha256 = digest
+        .try_into()
+        .map_err(|_| FleetRuntimeError::PolicyStateCorrupt)?;
+    Ok(StoredPolicyDocument {
+        policy_id,
+        revision,
+        document,
+        bundle_sha256,
+        checkpoint,
+    })
+}
+
+fn verify_stored_policy(
+    stored: &StoredPolicyDocument,
+    trust_anchor: &VerifyingKey,
+    tenant_id: &str,
+    device_id: &str,
+) -> Result<(VerifiedPolicyBundle, PolicyCheckpoint), FleetRuntimeError> {
+    let verified = SignedPolicyBundle::import_and_verify(&stored.document, trust_anchor, tenant_id)
+        .map_err(|_| FleetRuntimeError::PolicyStateCorrupt)?;
+    if verified.policy_id() != stored.policy_id
+        || verified.revision() != stored.revision
+        || verified.digest() != &stored.bundle_sha256
+        || !verified.applies_to_device(device_id)
+    {
+        return Err(FleetRuntimeError::PolicyStateCorrupt);
+    }
+    let mut checkpoint = PolicyCheckpoint::import_canonical(&stored.checkpoint)
+        .map_err(|_| FleetRuntimeError::PolicyStateCorrupt)?;
+    if checkpoint.revision() != stored.revision
+        || checkpoint.admit(&verified) != Ok(CheckpointAdmission::IdempotentReplay)
+    {
+        return Err(FleetRuntimeError::PolicyStateCorrupt);
+    }
+    Ok((verified, checkpoint))
+}
+
 fn validate_entitlement_binding(
     entitlement: &VerifiedEntitlement,
     tenant_id: &str,
@@ -1439,6 +1731,14 @@ fn valid_entitlement_identifier(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+}
+
+fn valid_policy_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 160
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/')
+        })
 }
 
 fn valid_sha256(value: &str) -> bool {
@@ -1557,6 +1857,21 @@ fn initialize_or_validate(
         )?;
         current_version = 3;
     }
+    if current_version == 3 {
+        connection.execute_batch(
+            "BEGIN IMMEDIATE;
+             CREATE TABLE fleet_policy_cache (
+               policy_id TEXT PRIMARY KEY NOT NULL CHECK(length(policy_id) BETWEEN 1 AND 160),
+               revision INTEGER NOT NULL CHECK(revision BETWEEN 1 AND 9007199254740991),
+               document BLOB NOT NULL CHECK(length(document) BETWEEN 1 AND 1048576),
+               bundle_sha256 BLOB NOT NULL CHECK(length(bundle_sha256) = 32),
+               checkpoint BLOB NOT NULL CHECK(length(checkpoint) BETWEEN 1 AND 4096)
+             ) STRICT;
+             PRAGMA user_version=4;
+             COMMIT;",
+        )?;
+        current_version = 4;
+    }
     if current_version != SCHEMA_VERSION {
         return Err(FleetRuntimeError::UnsupportedFormat);
     }
@@ -1617,12 +1932,17 @@ fn validate_schema_shape(connection: &Connection) -> Result<(), FleetRuntimeErro
         connection.query_row("SELECT COUNT(*) FROM fleet_audit_events", [], |row| {
             row.get(0)
         })?;
+    let policy_rows: u64 =
+        connection.query_row("SELECT COUNT(*) FROM fleet_policy_cache", [], |row| {
+            row.get(0)
+        })?;
     if identity_rows != 1
         || queue_rows > MAX_QUEUE_ITEMS
         || entitlement_rows > 1
         || revocation_rows > 1
         || audit_session_rows > audit_event_rows
         || audit_event_rows > MAX_AUDIT_EVENTS
+        || policy_rows > MAX_POLICY_DOCUMENTS
     {
         return Err(FleetRuntimeError::UnsupportedFormat);
     }
@@ -1741,6 +2061,10 @@ mod tests {
         REVOCATIONS_SCHEMA, RevocationClaims, sign_entitlement, sign_revocations,
     };
     use kernaid_fleet_client::{AssetArchitecture, AssetHealth, AssetPlatform, FindingCounts};
+    use kernaid_fleet_policy::{
+        Assignments, PolicyBundleContent, PolicyRules, ProviderMode, RiskLevel, SignedPolicyBundle,
+        UpdateRing,
+    };
     use rand_core::OsRng;
     use tempfile::tempdir;
 
@@ -1814,6 +2138,55 @@ mod tests {
             key,
         )
         .expect("sign revocation fixture")
+    }
+
+    fn policy_key() -> SigningKey {
+        SigningKey::generate(&mut OsRng)
+    }
+
+    fn policy_content(
+        tenant_id: &str,
+        policy_id: &str,
+        device_id: &str,
+        revision: u64,
+    ) -> PolicyBundleContent {
+        PolicyBundleContent {
+            tenant_id: tenant_id.to_owned(),
+            policy_id: policy_id.to_owned(),
+            revision,
+            issued_at_unix: 1_000,
+            not_before_unix: 1_100,
+            offline_allowed_until_unix: 2_000,
+            expires_at_unix: 3_000,
+            assignments: Assignments::device_ids(vec![device_id.to_owned()]),
+            rules: PolicyRules {
+                max_risk: RiskLevel::R2,
+                local_approval_from: RiskLevel::R1,
+                allowed_action_ids: vec!["linux.fstab.disable-missing-uuid.v1".to_owned()],
+                denied_action_ids: Vec::new(),
+                allow_evidence_upload: false,
+                retention_days: 30,
+                provider_modes: vec![ProviderMode::Offline],
+                update_ring: UpdateRing::Stable,
+                emergency_rollback_always_allowed: true,
+            },
+        }
+    }
+
+    fn policy_document(
+        key: &SigningKey,
+        tenant_id: &str,
+        policy_id: &str,
+        device_id: &str,
+        revision: u64,
+    ) -> Vec<u8> {
+        SignedPolicyBundle::sign(
+            policy_content(tenant_id, policy_id, device_id, revision),
+            key,
+        )
+        .expect("sign policy fixture")
+        .export_canonical()
+        .expect("export policy fixture")
     }
 
     fn assert_only_safety_capabilities(capabilities: FleetCapabilities) {
@@ -1937,7 +2310,8 @@ mod tests {
         let connection = Connection::open(&path).expect("open legacy fixture");
         connection
             .execute_batch(
-                "DROP TABLE fleet_audit_events;
+                "DROP TABLE fleet_policy_cache;
+                 DROP TABLE fleet_audit_events;
                  DROP TABLE fleet_audit_sessions;
                  DROP TABLE fleet_entitlement_state;
                  DROP TABLE fleet_revocation_state;
@@ -2188,7 +2562,8 @@ mod tests {
         let connection = Connection::open(&path).expect("open v2 fixture");
         connection
             .execute_batch(
-                "DROP TABLE fleet_audit_events;
+                "DROP TABLE fleet_policy_cache;
+                 DROP TABLE fleet_audit_events;
                  DROP TABLE fleet_audit_sessions;
                  PRAGMA user_version=2;",
             )
@@ -2370,6 +2745,231 @@ mod tests {
             )
             .expect("read unchanged chain state");
         assert_eq!(state, (1, 1));
+    }
+
+    #[test]
+    fn policy_cache_survives_restart_and_partial_updates_never_delete_other_streams() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("fleet.sqlite3");
+        let identity = DeviceIdentity::generate();
+        let key = policy_key();
+        let anchor = key.verifying_key().to_bytes();
+        let policy_a = policy_document(&key, "tenant-alpha", "policy-a", &identity.device_id(), 1);
+        let policy_b = policy_document(&key, "tenant-alpha", "policy-b", &identity.device_id(), 1);
+        let mut runtime =
+            FleetRuntime::open_with_policy_anchor(&path, "tenant-alpha", &identity, &anchor)
+                .expect("open policy runtime");
+        assert!(
+            !runtime
+                .apply_policy(&policy_a)
+                .expect("apply policy a")
+                .idempotent()
+        );
+        assert!(
+            runtime
+                .apply_policy(&policy_a)
+                .expect("replay policy a")
+                .idempotent()
+        );
+        runtime.apply_policy(&policy_b).expect("apply policy b");
+        drop(runtime);
+
+        let mut reopened =
+            FleetRuntime::open_with_policy_anchor(&path, "tenant-alpha", &identity, &anchor)
+                .expect("reopen and reverify policies");
+        let loaded = reopened.load_policies().expect("load policy set");
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].policy_id(), "policy-a");
+        assert_eq!(loaded[1].policy_id(), "policy-b");
+        assert_eq!(
+            reopened
+                .applicable_policies(1_500, TransportState::Offline)
+                .expect("offline policies")
+                .len(),
+            2
+        );
+        assert!(
+            reopened
+                .applicable_policies(2_500, TransportState::Offline)
+                .expect("expired offline window")
+                .is_empty()
+        );
+        assert_eq!(
+            reopened
+                .applicable_policies(2_500, TransportState::Online)
+                .expect("online policies")
+                .len(),
+            2
+        );
+
+        reopened
+            .apply_policy(&policy_document(
+                &key,
+                "tenant-alpha",
+                "policy-a",
+                &identity.device_id(),
+                2,
+            ))
+            .expect("advance only policy a");
+        let loaded = reopened.load_policies().expect("load retained policy set");
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].revision(), 2);
+        assert_eq!(loaded[1].revision(), 1);
+    }
+
+    #[test]
+    fn policy_cache_rejects_rollback_conflict_and_cross_binding() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("fleet.sqlite3");
+        let identity = DeviceIdentity::generate();
+        let other = DeviceIdentity::generate();
+        let key = policy_key();
+        let anchor = key.verifying_key().to_bytes();
+        let mut runtime =
+            FleetRuntime::open_with_policy_anchor(&path, "tenant-alpha", &identity, &anchor)
+                .expect("open runtime");
+        runtime
+            .apply_policy(&policy_document(
+                &key,
+                "tenant-alpha",
+                "policy-a",
+                &identity.device_id(),
+                2,
+            ))
+            .expect("apply revision two");
+        assert!(matches!(
+            runtime.apply_policy(&policy_document(
+                &key,
+                "tenant-alpha",
+                "policy-a",
+                &identity.device_id(),
+                1,
+            )),
+            Err(FleetRuntimeError::Policy(
+                FleetPolicyError::RevisionRollback
+            ))
+        ));
+
+        let mut conflict = policy_content("tenant-alpha", "policy-a", &identity.device_id(), 2);
+        conflict.rules.retention_days = 31;
+        let conflict = SignedPolicyBundle::sign(conflict, &key)
+            .expect("sign conflict")
+            .export_canonical()
+            .expect("export conflict");
+        assert!(matches!(
+            runtime.apply_policy(&conflict),
+            Err(FleetRuntimeError::Policy(
+                FleetPolicyError::RevisionConflict
+            ))
+        ));
+        assert!(matches!(
+            runtime.apply_policy(&policy_document(
+                &key,
+                "tenant-beta",
+                "policy-b",
+                &identity.device_id(),
+                1,
+            )),
+            Err(FleetRuntimeError::Policy(
+                FleetPolicyError::UnexpectedTenant
+            ))
+        ));
+        assert!(matches!(
+            runtime.apply_policy(&policy_document(
+                &key,
+                "tenant-alpha",
+                "policy-b",
+                &other.device_id(),
+                1,
+            )),
+            Err(FleetRuntimeError::PolicyDeviceNotAssigned)
+        ));
+        drop(runtime);
+
+        let wrong_anchor = policy_key().verifying_key().to_bytes();
+        assert!(matches!(
+            FleetRuntime::open_with_policy_anchor(&path, "tenant-alpha", &identity, &wrong_anchor,),
+            Err(FleetRuntimeError::PolicyStateCorrupt)
+        ));
+    }
+
+    #[test]
+    fn corrupt_policy_document_fails_closed_during_reopen() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("fleet.sqlite3");
+        let identity = DeviceIdentity::generate();
+        let key = policy_key();
+        let anchor = key.verifying_key().to_bytes();
+        let mut runtime =
+            FleetRuntime::open_with_policy_anchor(&path, "tenant-alpha", &identity, &anchor)
+                .expect("open runtime");
+        runtime
+            .apply_policy(&policy_document(
+                &key,
+                "tenant-alpha",
+                "policy-a",
+                &identity.device_id(),
+                1,
+            ))
+            .expect("apply policy");
+        drop(runtime);
+
+        let connection = Connection::open(&path).expect("open corruption fixture");
+        connection
+            .execute(
+                "UPDATE fleet_policy_cache SET document = ?1 WHERE policy_id = 'policy-a'",
+                [b"{}".as_slice()],
+            )
+            .expect("corrupt policy document");
+        drop(connection);
+        assert!(matches!(
+            FleetRuntime::open_with_policy_anchor(&path, "tenant-alpha", &identity, &anchor),
+            Err(FleetRuntimeError::PolicyStateCorrupt)
+        ));
+    }
+
+    #[test]
+    fn v3_audit_state_migrates_to_policy_cache_without_data_loss() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("fleet.sqlite3");
+        let identity = DeviceIdentity::generate();
+        let mut legacy =
+            FleetRuntime::open(&path, "tenant-alpha", &identity).expect("create runtime");
+        legacy
+            .enqueue_audit(
+                &identity,
+                audit_draft(
+                    "session-a",
+                    "event-1",
+                    AuditKind::DiagnosticStarted,
+                    AuditOutcome::Started,
+                ),
+            )
+            .expect("retain audit event");
+        drop(legacy);
+
+        let connection = Connection::open(&path).expect("open v3 fixture");
+        connection
+            .execute_batch("DROP TABLE fleet_policy_cache; PRAGMA user_version=3;")
+            .expect("restore v3 schema shape");
+        drop(connection);
+
+        let key = policy_key();
+        let anchor = key.verifying_key().to_bytes();
+        let mut migrated =
+            FleetRuntime::open_with_policy_anchor(&path, "tenant-alpha", &identity, &anchor)
+                .expect("migrate v3 runtime");
+        assert_eq!(migrated.pending_audit_count().expect("audit count"), 1);
+        migrated
+            .apply_policy(&policy_document(
+                &key,
+                "tenant-alpha",
+                "policy-a",
+                &identity.device_id(),
+                1,
+            ))
+            .expect("apply policy after migration");
+        assert_eq!(migrated.load_policies().expect("load policy").len(), 1);
     }
 
     #[cfg(unix)]
