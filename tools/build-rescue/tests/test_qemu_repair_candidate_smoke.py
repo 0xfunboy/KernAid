@@ -887,7 +887,14 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
             "input-invalid",
             "key-invalid",
             "loop-collision",
-            "loop-correlation-invalid",
+            "loop-correlation-backing-device",
+            "loop-correlation-backing-rdevice",
+            "loop-correlation-inode",
+            "loop-correlation-node",
+            "loop-correlation-number",
+            "loop-correlation-offset",
+            "loop-correlation-set",
+            "loop-correlation-size",
             "loop-discovery-failed",
             "loop-output-invalid",
             "loop-setup-failed",
@@ -1008,6 +1015,39 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
         self.assertTrue(tamper.huge_device_matches(huge_encoded, device))
         self.assertFalse(tamper.huge_device_matches((253 << 32) | 17, device))
         self.assertEqual(tamper.LOOP_INFO64.size, 232)
+
+    def test_backup_tamper_classifies_loop_correlation_fields(self) -> None:
+        media = mock.Mock(
+            st_dev=os.makedev(252, 17),
+            st_ino=12345,
+            st_rdev=os.makedev(0, 0),
+        )
+        encoded_device = (252 << 32) | 17
+        fields = [
+            encoded_device,
+            media.st_ino,
+            0,
+            tamper.P3_OFFSET,
+            tamper.P3_BYTES,
+            7,
+        ]
+        self.assertIsNone(tamper.loop_correlation_code(tuple(fields), media, 7))
+        cases = (
+            (0, 0, "loop-correlation-backing-device"),
+            (1, 0, "loop-correlation-inode"),
+            (2, 1, "loop-correlation-backing-rdevice"),
+            (3, 0, "loop-correlation-offset"),
+            (4, 0, "loop-correlation-size"),
+            (5, 8, "loop-correlation-number"),
+        )
+        for index, value, expected in cases:
+            changed = list(fields)
+            changed[index] = value
+            with self.subTest(expected=expected):
+                self.assertEqual(
+                    tamper.loop_correlation_code(tuple(changed), media, 7),
+                    expected,
+                )
 
     def test_backup_tamper_parses_canonical_debugfs_inode_sizes(self) -> None:
         ubuntu_2404 = (

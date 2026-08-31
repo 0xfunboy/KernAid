@@ -65,7 +65,14 @@ FAILURE_CODES = frozenset(
         "input-invalid",
         "key-invalid",
         "loop-collision",
-        "loop-correlation-invalid",
+        "loop-correlation-backing-device",
+        "loop-correlation-backing-rdevice",
+        "loop-correlation-inode",
+        "loop-correlation-node",
+        "loop-correlation-number",
+        "loop-correlation-offset",
+        "loop-correlation-set",
+        "loop-correlation-size",
         "loop-discovery-failed",
         "loop-output-invalid",
         "loop-setup-failed",
@@ -336,6 +343,68 @@ def huge_device_matches(encoded: int, device: int) -> bool:
     )
 
 
+def loop_correlation_code(
+    fields: tuple[object, ...], media: os.stat_result, expected_number: int
+) -> str | None:
+    """Classify one fixed loop_info64 mismatch without exposing its values."""
+
+    backing_device, backing_inode, backing_rdevice, offset, size_limit, number = (
+        fields[:6]
+    )
+    checks = (
+        (
+            huge_device_matches(int(backing_device), media.st_dev),
+            "loop-correlation-backing-device",
+        ),
+        (int(backing_inode) == media.st_ino, "loop-correlation-inode"),
+        (
+            huge_device_matches(int(backing_rdevice), media.st_rdev),
+            "loop-correlation-backing-rdevice",
+        ),
+        (int(offset) == P3_OFFSET, "loop-correlation-offset"),
+        (int(size_limit) == P3_BYTES, "loop-correlation-size"),
+        (int(number) == expected_number, "loop-correlation-number"),
+    )
+    for matched, code in checks:
+        if not matched:
+            return code
+    return None
+
+
+def exact_loop_correlation_failure(loop: str, media: os.stat_result) -> str:
+    """Inspect only the returned loop node and return one closed failure code."""
+
+    match = re.fullmatch(r"/dev/loop([0-9]+)", loop)
+    if match is None:
+        return "loop-correlation-node"
+    expected_number = int(match.group(1))
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            loop,
+            os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+        node = os.fstat(descriptor)
+        if (
+            not stat.S_ISBLK(node.st_mode)
+            or os.major(node.st_rdev) != 7
+            or os.minor(node.st_rdev) != expected_number
+        ):
+            return "loop-correlation-node"
+        encoded = bytearray(LOOP_INFO64.size)
+        fcntl.ioctl(descriptor, LOOP_GET_STATUS64, encoded, True)
+        fields = LOOP_INFO64.unpack(encoded)
+    except OSError:
+        return "loop-correlation-node"
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    return (
+        loop_correlation_code(fields, media, expected_number)
+        or "loop-correlation-set"
+    )
+
+
 def loop_devices(media: os.stat_result, *, require_pristine_shape: bool) -> set[str]:
     """Find only loops backed by the pinned inode and exact p3 geometry."""
 
@@ -367,25 +436,10 @@ def loop_devices(media: os.stat_result, *, require_pristine_shape: bool) -> set[
         finally:
             if descriptor >= 0:
                 os.close(descriptor)
-        (
-            backing_device,
-            backing_inode,
-            backing_rdevice,
-            offset,
-            size_limit,
-            loop_number,
-            encryption_type,
-            encryption_key_size,
-            loop_flags,
-            *_reserved,
-        ) = fields
+        encryption_type, encryption_key_size, loop_flags = fields[6:9]
         correlated = (
-            huge_device_matches(backing_device, media.st_dev)
-            and backing_inode == media.st_ino
-            and huge_device_matches(backing_rdevice, media.st_rdev)
-            and offset == P3_OFFSET
-            and size_limit == P3_BYTES
-            and loop_number == int(number_match.group(1))
+            loop_correlation_code(fields, media, int(number_match.group(1)))
+            is None
         )
         pristine = (
             encryption_type == 0
@@ -594,13 +648,13 @@ def main() -> int:
         try:
             loop = loop_output.decode("ascii").strip()
         except UnicodeDecodeError as error:
-            raise ClosedFailure("loop-invalid") from error
+            raise ClosedFailure("loop-output-invalid") from error
         if setup_failure is not None:
             raise ClosedFailure("loop-setup-failed") from setup_failure
         if re.fullmatch(r"/dev/loop[0-9]+", loop) is None:
             raise ClosedFailure("loop-output-invalid")
         if observed_loops != baseline_loops | {loop}:
-            raise ClosedFailure("loop-correlation-invalid")
+            raise ClosedFailure(exact_loop_correlation_failure(loop, media_metadata))
         if exact_loop_devices(media_metadata) != {loop}:
             raise ClosedFailure("loop-shape-invalid")
 

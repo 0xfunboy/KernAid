@@ -3,9 +3,17 @@ name: rescue repair forensic replay
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: Focused replay mode
+        required: true
+        default: backup-tamper
+        type: choice
+        options:
+          - backup-tamper
+          - loop-contract
       source_run_id:
         description: Failed repair-candidate run containing the forensic ISO
-        required: true
+        required: false
         type: string
 
 permissions:
@@ -27,6 +35,7 @@ jobs:
             squashfs-tools udev util-linux xorriso
 
       - name: Harden OVMF firmware ancestry
+        if: inputs.mode == 'backup-tamper'
         run: |
           sudo /usr/bin/python3 -I -B - <<'PY'
           import os
@@ -74,6 +83,7 @@ jobs:
           PY
 
       - name: Download exact failed candidate
+        if: inputs.mode == 'backup-tamper'
         uses: actions/download-artifact@v4
         with:
           github-token: ${{ github.token }}
@@ -83,6 +93,7 @@ jobs:
           path: forensics
 
       - name: Verify forensic ISO boundary
+        if: inputs.mode == 'backup-tamper'
         run: |
           iso="$PWD/forensics/KernAid-Rescue-amd64-repair-candidate.iso"
           checksum="$iso.sha256"
@@ -99,8 +110,33 @@ jobs:
             tools/build-rescue/tests/test_qemu_repair_candidate_smoke.py
 
       - name: Replay only authenticated backup tamper
+        if: inputs.mode == 'backup-tamper'
         run: |
           KERNAID_QEMU_SMP=4 \
             ./tools/build-rescue/qemu-repair-candidate-smoke.sh \
             uefi backup-tamper \
             "$PWD/forensics/KernAid-Rescue-amd64-repair-candidate.iso"
+
+      - name: Probe only the pinned loop contract
+        if: inputs.mode == 'loop-contract'
+        run: |
+          set -euo pipefail
+          work_dir="$(mktemp -d /tmp/kernaid-qemu-repair-candidate.XXXXXXXX)"
+          cleanup() {
+            status=$?
+            case "$work_dir" in
+              /tmp/kernaid-qemu-repair-candidate.*) rm -rf -- "$work_dir" ;;
+            esac
+            exit "$status"
+          }
+          trap cleanup EXIT INT TERM HUP
+          truncate -s 32000000000 "$work_dir/rescue-usb.raw"
+          printf '%064d' 0 >"$work_dir/vault-key"
+          chmod 600 "$work_dir/rescue-usb.raw" "$work_dir/vault-key"
+          sudo -n -- /usr/bin/python3 -I -B \
+            tools/build-rescue/qemu-repair-vault-tamper.py \
+            --media "$work_dir/rescue-usb.raw" \
+            --key-file "$work_dir/vault-key" \
+            --reservation-id B-00000000000000000000000000000000 \
+            --p3-offset 17179869184 \
+            --p3-bytes 8589934592
