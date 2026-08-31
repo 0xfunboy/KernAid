@@ -40,6 +40,7 @@ schema.
 | `crates/fleet-policy`          | Centrally signed, offline-capable restrictive policy bundle                                        | Can only narrow local permission; diagnostics and an already-started rollback remain available |
 | `crates/fleet-audit`           | Canonical signed audit events and tamper-evident chain checkpoints                                 | Digest-only device protocol with central signature, sequence and chain verification            |
 | `crates/entitlements`          | Signed offline entitlements and revocation checkpoints                                             | Paid capabilities degrade without disabling diagnostics, report export or rollback             |
+| `crates/update-client`         | Signed A/B release admission and boot-state planner                                                | External trust anchor, monotonic manifests, ring/rollout/time gates and failed-boot rollback   |
 
 The control plane binds every enrolled `KA-…` device ID to the raw Ed25519
 public key encoded in its canonical SPKI. Enrollment tokens are random,
@@ -121,8 +122,8 @@ The remaining RC work is:
 2. add authenticated signed policy distribution and persistent device policy
    checkpoints;
 3. connect entitlement verification to product feature gates and issuance;
-4. stage signed A/B updates with canary rings, revocation and automatic
-   rollback;
+4. connect the signed A/B planner to artifact download, inactive-slot writes,
+   bootloader integration and update-service rollout;
 5. add production Access/rate-limit policy and an automated retained backup
    schedule around the now-proven recovery path;
 6. qualify the actual repair packs on disposable virtual and physical targets.
