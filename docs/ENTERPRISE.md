@@ -37,7 +37,7 @@ schema.
 | `packages/fleet-schemas`       | Matching Node.js wire validation and canonical signing bytes                                       | Strict bounded v1 schemas                                                                      |
 | `services/fleet-control-plane` | Tenant registry, one-time enrollment, signed inventory/audit ingestion, revocation and tenant APIs | Loopback HTTP origin deployed behind a TLS Cloudflare Tunnel for internal engineering          |
 | `apps/fleet-console`           | Same-origin operator inventory and enrollment UI                                                   | Internal engineering console; tenant admin token remains in browser session storage only       |
-| `crates/fleet-policy`          | Centrally signed, offline-capable restrictive policy bundle                                        | Can only narrow local permission; diagnostics and an already-started rollback remain available |
+| `crates/fleet-policy`          | Offline policy issuer and signed, offline-capable restrictive bundle                                | Server receives no seed; policy can only narrow local permission                               |
 | `crates/fleet-audit`           | Canonical signed audit events and tamper-evident chain checkpoints                                 | Digest-only device protocol with central signature, sequence and chain verification            |
 | `crates/entitlements`          | Signed offline entitlements and revocation checkpoints                                             | Paid capabilities degrade without disabling diagnostics, report export or rollback             |
 | `crates/update-client`         | Signed A/B release admission, offline issuer and boot-state planner                                 | External trust anchor, monotonic manifests, ring/rollout/time gates and failed-boot rollback   |
@@ -114,10 +114,11 @@ tokens in source, images, command history, URLs or browser persistent storage.
 ## Remaining Enterprise RC gates
 
 The internal control plane is running at `https://fleet.funboy.eu.cc/` through
-a loopback-only origin and persistent user service. Its schema-2 migration,
-online SQLite backup, restore into a new database, process health and retained
-tenant authentication passed a recovery drill on 31 August 2026. Root and
-tenant credentials remain owner-only outside source control.
+a loopback-only origin and persistent user service. Its schema-3 migration now
+includes signed tenant policy distribution. Online SQLite backup, restore into
+a new database, process health and retained tenant authentication passed a
+recovery drill on 31 August 2026. Root and tenant credentials remain owner-only
+outside source control.
 
 The remaining RC work is:
 
