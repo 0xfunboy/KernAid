@@ -79,7 +79,7 @@ only. Point the service at that file and a protected state directory:
 
 ```bash
 install -d -m 700 "$HOME/.local/state/kernaid-fleet"
-openssl rand -base64 48 | tr -d '=+/\n' > "$HOME/.local/state/kernaid-fleet/root-token"
+openssl rand -hex 32 > "$HOME/.local/state/kernaid-fleet/root-token"
 chmod 600 "$HOME/.local/state/kernaid-fleet/root-token"
 
 KERNAID_FLEET_ROOT_TOKEN_FILE="$HOME/.local/state/kernaid-fleet/root-token" \
