@@ -30,7 +30,6 @@ import {
   inventorySigningBytes,
   incidentCaseOutcomes,
   incidentCaseSeverities,
-  incidentCaseStatuses,
   isWorkOrderActionId,
   entitlementAppliesTo,
   entitlementPullSigningBytes,
@@ -62,7 +61,6 @@ import {
   parseIncidentReport,
   type FleetServiceOperation,
   type IncidentCaseOutcome,
-  type IncidentCaseSeverity,
   type ServiceReceipt,
   type ServiceReceiptUnsigned,
   type WorkOrderActionId,
@@ -121,12 +119,25 @@ import {
   type TenantAccessTargetType,
   type TenantRole,
 } from "./access.js";
+import {
+  CONSOLE_CSRF_HEADER,
+  ConsoleSessionCapacityError,
+  ConsoleSessionRegistry,
+  FixedWindowRateLimiter,
+  clearedConsoleSessionCookie,
+  consoleSessionCookie,
+  consoleSessionId,
+  type ConsoleSession,
+} from "./console-session.js";
 
 const MAX_REQUEST_BYTES = 64 * 1024;
 const MAX_ENROLLMENT_TOKEN_SECONDS = 7 * 24 * 60 * 60;
 const MAX_SERVICE_RESPONSE_BYTES = 4 * 1024 * 1024;
 const SERVICE_RECEIPT_HEADER = "X-KernAid-Fleet-Receipt";
 const MAX_WORK_ORDER_LIFETIME_MS = 7 * 24 * 60 * 60 * 1000;
+const DEFAULT_CONSOLE_SESSION_TTL_MS = 15 * 60 * 1000;
+const CONSOLE_LOGIN_RATE_WINDOW_MS = 60 * 1000;
+const CONSOLE_LOGIN_RATE_MAXIMUM = 12;
 
 export interface FleetControlPlaneOptions {
   databasePath: string;
@@ -136,6 +147,7 @@ export interface FleetControlPlaneOptions {
   entitlementTrustAnchor: string;
   updateTrustAnchor: string;
   enrollmentClockSkewMs?: number;
+  consoleSessionTtlMs?: number;
   now?: () => Date;
   consoleDirectory?: string;
 }
@@ -169,6 +181,12 @@ export class FleetControlPlane {
   readonly #now: () => Date;
   readonly #server: Server;
   readonly #consoleDirectory: string | undefined;
+  readonly #consoleSessionTtlMs: number;
+  readonly #consoleSessions: ConsoleSessionRegistry;
+  readonly #consoleLoginRate = new FixedWindowRateLimiter(
+    CONSOLE_LOGIN_RATE_WINDOW_MS,
+    CONSOLE_LOGIN_RATE_MAXIMUM,
+  );
   #closed = false;
 
   constructor(options: FleetControlPlaneOptions) {
@@ -227,6 +245,11 @@ export class FleetControlPlane {
     this.#rootToken = options.rootToken;
     this.#clockSkewMs = options.enrollmentClockSkewMs ?? 300_000;
     this.#now = options.now ?? (() => new Date());
+    this.#consoleSessionTtlMs =
+      options.consoleSessionTtlMs ?? DEFAULT_CONSOLE_SESSION_TTL_MS;
+    this.#consoleSessions = new ConsoleSessionRegistry(
+      this.#consoleSessionTtlMs,
+    );
     this.#consoleDirectory = resolveConsoleDirectory(options.consoleDirectory);
     this.#server = createServer((request, response) => {
       void this.#handle(request, response);
@@ -260,6 +283,8 @@ export class FleetControlPlane {
       });
     }
     this.#store.close();
+    this.#consoleSessions.clear();
+    this.#consoleLoginRate.clear();
   }
 
   async #handle(
@@ -321,6 +346,8 @@ export class FleetControlPlane {
         writeJson(response, 409, { error: "incident_case_replay" });
       } else if (error instanceof StoreIncidentCaseStateError) {
         writeJson(response, 409, { error: "incident_case_state_conflict" });
+      } else if (error instanceof ConsoleSessionCapacityError) {
+        writeJson(response, 503, { error: "console_session_capacity" });
       } else {
         writeJson(response, 500, { error: "internal_error" });
       }
@@ -346,6 +373,71 @@ export class FleetControlPlane {
     if (method === "GET" && path === "/healthz") {
       this.#store.healthCheck();
       writeJson(response, 200, { status: "ok" });
+      return;
+    }
+
+    if (method === "POST" && path === "/v1/console-sessions") {
+      const now = this.#validNow();
+      const body = expectRecord(await readJson(request, 4 * 1024));
+      expectExactKeys(body, ["tenantId", "token"]);
+      const tenantId = expectIdentifier(body.tenantId, "tenantId");
+      const rateKey = `${request.socket.remoteAddress ?? "unknown"}\0${tenantId}`;
+      if (!this.#consoleLoginRate.consume(rateKey, now.getTime())) {
+        response.setHeader(
+          "Retry-After",
+          String(Math.ceil(CONSOLE_LOGIN_RATE_WINDOW_MS / 1_000)),
+        );
+        throw new HttpError(429, "console_login_rate_limited");
+      }
+      const token = tenantAccessToken(body.token);
+      const credential = this.#store.findTenantAccessCredential(
+        hashSecret("admin", token),
+      );
+      if (
+        credential === undefined ||
+        credential.tenantId !== tenantId ||
+        credential.revokedAt !== null
+      ) {
+        throw new HttpError(401, "not_authorized");
+      }
+      const session = this.#consoleSessions.create({
+        tenantId,
+        credentialId: credential.credentialId,
+        role: credential.role,
+        nowMs: now.getTime(),
+      });
+      this.#consoleLoginRate.reset(rateKey);
+      response.setHeader(
+        "Set-Cookie",
+        consoleSessionCookie(session.sessionId, this.#consoleSessionTtlMs),
+      );
+      writeJson(response, 201, consoleSessionResponse(session));
+      return;
+    }
+
+    if (method === "GET" && path === "/v1/console-session") {
+      const session = this.#activeConsoleSession(request);
+      if (session === undefined) {
+        response.setHeader("Set-Cookie", clearedConsoleSessionCookie());
+        throw new HttpError(401, "not_authorized");
+      }
+      writeJson(response, 200, consoleSessionResponse(session));
+      return;
+    }
+
+    if (method === "DELETE" && path === "/v1/console-session") {
+      const session = this.#activeConsoleSession(request);
+      if (session === undefined) {
+        response.setHeader("Set-Cookie", clearedConsoleSessionCookie());
+        throw new HttpError(401, "not_authorized");
+      }
+      this.#authorizeConsoleMutation(request, session);
+      this.#consoleSessions.revoke(session.sessionId);
+      response.setHeader("Set-Cookie", clearedConsoleSessionCookie());
+      writeJson(response, 200, {
+        schema: "dev.kernaid.fleet.console-session-closed.v1",
+        loggedOut: true,
+      });
       return;
     }
 
@@ -1943,15 +2035,29 @@ export class FleetControlPlane {
     action: TenantAccessAction,
     target: TenantAuthorizationTarget,
   ): TenantAccessCredential {
-    const token = bearerToken(request);
-    if (token === undefined) {
-      throw new HttpError(401, "not_authorized");
+    let credential: TenantAccessCredential | undefined;
+    let consoleSession: ConsoleSession | undefined;
+    if (request.headers.authorization !== undefined) {
+      const token = bearerToken(request);
+      if (token !== undefined) {
+        credential = this.#store.findTenantAccessCredential(
+          hashSecret("admin", token),
+        );
+      }
+    } else {
+      consoleSession = this.#activeConsoleSession(request);
+      if (consoleSession !== undefined) {
+        credential = this.#store.getTenantAccessCredential(
+          consoleSession.tenantId,
+          consoleSession.credentialId,
+        );
+      }
     }
-    const credential = this.#store.findTenantAccessCredential(
-      hashSecret("admin", token),
-    );
     if (credential === undefined) {
       throw new HttpError(401, "not_authorized");
+    }
+    if (consoleSession !== undefined && isMutationMethod(request.method)) {
+      this.#authorizeConsoleMutation(request, consoleSession);
     }
     const tenantMatches = credential.tenantId === tenantId;
     const active = credential.revokedAt === null;
@@ -1974,6 +2080,46 @@ export class FleetControlPlane {
       throw new HttpError(403, "insufficient_role");
     }
     return credential;
+  }
+
+  #activeConsoleSession(request: IncomingMessage): ConsoleSession | undefined {
+    const sessionId = consoleSessionId(request.headers.cookie);
+    if (sessionId === undefined) return undefined;
+    const session = this.#consoleSessions.get(
+      sessionId,
+      this.#validNow().getTime(),
+    );
+    if (session === undefined) return undefined;
+    const credential = this.#store.getTenantAccessCredential(
+      session.tenantId,
+      session.credentialId,
+    );
+    if (
+      credential === undefined ||
+      credential.revokedAt !== null ||
+      credential.role !== session.role
+    ) {
+      this.#consoleSessions.revoke(sessionId);
+      return undefined;
+    }
+    return session;
+  }
+
+  #authorizeConsoleMutation(
+    request: IncomingMessage,
+    session: ConsoleSession,
+  ): void {
+    const csrfHeader = request.headers[CONSOLE_CSRF_HEADER];
+    const csrfToken = typeof csrfHeader === "string" ? csrfHeader : undefined;
+    const result = this.#consoleSessions.authorizeMutation(
+      session,
+      csrfToken,
+      this.#validNow().getTime(),
+    );
+    if (result === "csrf") throw new HttpError(403, "csrf_required");
+    if (result === "rate_limited") {
+      throw new HttpError(429, "console_mutation_rate_limited");
+    }
   }
 
   #tenantIncidentCase(incident: StoredIncidentCase): Record<string, unknown> {
@@ -2552,14 +2698,47 @@ function bearerToken(request: IncomingMessage): string | undefined {
   return match?.[1];
 }
 
-async function readJson(request: IncomingMessage): Promise<unknown> {
-  return (await readJsonRequest(request)).value;
+function tenantAccessToken(value: unknown): string {
+  if (
+    typeof value !== "string" ||
+    value.length < 32 ||
+    value.length > 512 ||
+    !/^[A-Za-z0-9_-]+$/.test(value)
+  ) {
+    throw new HttpError(401, "not_authorized");
+  }
+  return value;
+}
+
+function isMutationMethod(method: string | undefined): boolean {
+  return !["GET", "HEAD", "OPTIONS"].includes(method ?? "GET");
+}
+
+function consoleSessionResponse(
+  session: ConsoleSession,
+): Record<string, unknown> {
+  return {
+    schema: "dev.kernaid.fleet.console-session.v1",
+    tenantId: session.tenantId,
+    credentialId: session.credentialId,
+    role: session.role,
+    expiresAt: new Date(session.expiresAtMs).toISOString(),
+    csrfToken: session.csrfToken,
+  };
+}
+
+async function readJson(
+  request: IncomingMessage,
+  maximumBytes = MAX_REQUEST_BYTES,
+): Promise<unknown> {
+  return (await readJsonRequest(request, maximumBytes)).value;
 }
 
 async function readJsonRequest(
   request: IncomingMessage,
+  maximumBytes = MAX_REQUEST_BYTES,
 ): Promise<{ value: unknown; bytes: Buffer }> {
-  const bytes = await readJsonBytes(request, MAX_REQUEST_BYTES);
+  const bytes = await readJsonBytes(request, maximumBytes);
   return { value: parseJsonBytes(bytes), bytes };
 }
 

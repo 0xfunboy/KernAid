@@ -549,6 +549,23 @@ export class FleetStore {
     return row === undefined ? undefined : mapTenantAccessCredential(row);
   }
 
+  getTenantAccessCredential(
+    tenantId: string,
+    credentialId: string,
+  ): TenantAccessCredential | undefined {
+    if (!isPublicIdentifier(tenantId) || !isPublicIdentifier(credentialId)) {
+      throw new Error("tenant credential identity is invalid");
+    }
+    const row = this.#database
+      .prepare(
+        `SELECT tenant_id, credential_id, role, label, created_at, revoked_at
+         FROM tenant_access_credentials
+         WHERE tenant_id = ? AND credential_id = ?`,
+      )
+      .get(tenantId, credentialId) as TenantAccessCredentialRow | undefined;
+    return row === undefined ? undefined : mapTenantAccessCredential(row);
+  }
+
   createTenantAccessCredential(input: {
     tenantId: string;
     credentialId: string;

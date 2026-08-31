@@ -18,6 +18,7 @@ services:
       NODE_ENV: production
       KERNAID_FLEET_HOST: 0.0.0.0
       KERNAID_FLEET_PORT: "7341"
+      KERNAID_FLEET_CONSOLE_SESSION_TTL_SECONDS: "${KERNAID_FLEET_CONSOLE_SESSION_TTL_SECONDS:-900}"
       KERNAID_FLEET_DB_PATH: /var/lib/kernaid-fleet/fleet.sqlite
       KERNAID_FLEET_ROOT_TOKEN_FILE: /run/secrets/kernaid_fleet_root_token
       KERNAID_FLEET_SERVICE_RECEIPT_SIGNING_KEY_FILE: /run/secrets/kernaid_fleet_service_receipt_signing_key

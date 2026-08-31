@@ -41,6 +41,22 @@ test("external receipt key and matching public anchor load from bounded files", 
     ed25519RawPublicKey(config.serviceReceiptSigningKey),
     publicAnchor,
   );
+  assert.equal(config.consoleSessionTtlMs, 900_000);
+  assert.equal(
+    loadFleetServiceConfig({
+      ...environment,
+      KERNAID_FLEET_CONSOLE_SESSION_TTL_SECONDS: "120",
+    }).consoleSessionTtlMs,
+    120_000,
+  );
+  assert.throws(
+    () =>
+      loadFleetServiceConfig({
+        ...environment,
+        KERNAID_FLEET_CONSOLE_SESSION_TTL_SECONDS: "59",
+      }),
+    /outside 60-3600/,
+  );
 
   chmodSync(signingKeyPath, 0o644);
   assert.throws(

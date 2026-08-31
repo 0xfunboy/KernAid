@@ -17,6 +17,12 @@ upload or arbitrary metadata API.
 - Tenant access credentials are hash-only, tenant-bound and carry exactly one
   role: `admin` or `operator`. Admins manage credentials and signed governance
   inputs; operators manage enrollment, visibility and device revocation.
+- The same-origin console exchanges a tenant credential once for a short-lived
+  session held only in service memory. Its opaque `__Host-` cookie is Secure,
+  HttpOnly, SameSite Strict and scoped to `/`; all console mutations require a
+  separate in-memory CSRF value. Logout, credential revocation, expiry and
+  restart fail closed. Login attempts and session mutations are bounded by
+  fixed-window limits with bounded memory.
 - Every request made with an identified tenant credential records a bounded,
   durable authorization decision containing only credential ID, role, action,
   target and outcome. Cross-tenant attempts and revoked/underprivileged
@@ -97,6 +103,9 @@ and is bounded to 64 KiB, matching the Rust verifier.
 | Method | Route                                                           | Authorization          | Result                                       |
 | ------ | --------------------------------------------------------------- | ---------------------- | -------------------------------------------- |
 | `GET`  | `/healthz`                                                      | Public                 | SQLite liveness                              |
+| `POST` | `/v1/console-sessions`                                          | Tenant token once      | Create short in-memory browser session       |
+| `GET`  | `/v1/console-session`                                           | Secure session cookie  | Recover role, expiry and CSRF state          |
+| `DELETE` | `/v1/console-session`                                         | Session cookie + CSRF  | Revoke current session and clear cookie      |
 | `POST` | `/v1/tenants`                                                   | Root bearer            | One-time `tenantId`, `adminToken`            |
 | `GET`  | `/v1/tenants/:tenantId/access-credentials`                      | Admin                  | List credential metadata, never tokens       |
 | `POST` | `/v1/tenants/:tenantId/access-credentials`                      | Admin                  | Create one-time-visible role token           |
@@ -248,16 +257,19 @@ Optional settings:
 
 - `KERNAID_FLEET_ENROLLMENT_CLOCK_SKEW_MS` defaults to `300000` and is bounded
   to 1 second through 1 hour.
+- `KERNAID_FLEET_CONSOLE_SESSION_TTL_SECONDS` defaults to `900` and is bounded
+  to 60–3600 seconds. Sessions are never written to SQLite and deliberately do
+  not survive service restart.
 - `FLEET_CONSOLE_DIR` mounts an existing static console directory at
   `/console/`. Files are resolved against the real directory, bounded to 10
   MiB and served with a restrictive CSP. Point it to `apps/fleet-console` when
   that workspace is installed.
 
-The default listener is loopback-only. Put it behind an authenticated TLS
-reverse proxy for any non-local deployment; do not expose plaintext HTTP or
-the root token to a browser. The SQLite file is forced to mode `0600`, while
-its state directory should remain `0700` because WAL files are created beside
-it.
+The default listener is loopback-only. Terminate TLS at the reverse proxy
+before using `/console/`: its `Secure` session cookie intentionally does not
+work over plaintext HTTP. Never expose the root token to a browser. The SQLite
+file is forced to mode `0600`, while its state directory should remain `0700`
+because WAL files are created beside it.
 
 For the hardened single-node container and loopback-only Compose deployment,
 see [`deploy/fleet`](../../deploy/fleet/README.md).
@@ -275,8 +287,9 @@ manual protocol is:
    returned admin token in the tenant secret store; it cannot be recovered.
 2. Retain the bootstrap admin for governance. Create separate `operator`
    credentials for routine enrollment, inventory, audit and revocation work.
-3. Open the console at `/console/`, enter the tenant ID and the appropriate
-   tenant token, then create a short-lived enrollment token.
+3. Open the console through its HTTPS origin at `/console/`, enter the tenant ID
+   and appropriate tenant token once, then create a short-lived enrollment
+   token. The browser retains only the short server-memory session cookie.
 4. Give that token and tenant ID to exactly one KernAid client. The client owns
    its Ed25519 key and submits the signed enrollment request.
 5. Use the console or list APIs to monitor signed asset summaries and revoke a

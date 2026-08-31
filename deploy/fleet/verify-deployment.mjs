@@ -10,6 +10,7 @@ const dockerfile = readFileSync(
   "utf8",
 );
 const compose = readFileSync(join(deploymentDirectory, "compose.yaml"), "utf8");
+const readme = readFileSync(join(deploymentDirectory, "README.md"), "utf8");
 const dockerignore = readFileSync(join(repository, ".dockerignore"), "utf8");
 const databaseLifecycle = readFileSync(
   join(deploymentDirectory, "database-lifecycle.mjs"),
@@ -70,6 +71,10 @@ assert.match(compose, /^\s+tmpfs:$/m);
 assert.match(compose, /^\s+KERNAID_FLEET_ROOT_TOKEN_FILE: \/run\/secrets\//m);
 assert.match(
   compose,
+  /^\s+KERNAID_FLEET_CONSOLE_SESSION_TTL_SECONDS: "\$\{KERNAID_FLEET_CONSOLE_SESSION_TTL_SECONDS:-900\}"$/m,
+);
+assert.match(
+  compose,
   /^\s+KERNAID_FLEET_SERVICE_RECEIPT_SIGNING_KEY_FILE: \/run\/secrets\//m,
 );
 assert.match(
@@ -107,6 +112,8 @@ assert.doesNotMatch(compose, /^\s+KERNAID_FLEET_ROOT_TOKEN:\s/m);
 assert.doesNotMatch(compose, /SERVICE_RECEIPT_(?:SEED|PRIVATE_KEY)(?:\s|:|=)/i);
 assert.doesNotMatch(compose, /ENTITLEMENT_(?:PRIVATE|SEED|SIGNING)/i);
 assert.doesNotMatch(compose, /UPDATE_(?:PRIVATE|SEED|SIGNING)/i);
+assert.match(readme, /Secure, HttpOnly, SameSite\s+Strict/);
+assert.match(readme, /Open the console only through its HTTPS hostname/);
 
 assert.match(dockerignore, /^\*\*$/m);
 assert.match(dockerignore, /^!services\/fleet-control-plane\/\*\*$/m);

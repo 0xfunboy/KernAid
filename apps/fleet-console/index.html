@@ -9,7 +9,6 @@
       http-equiv="Content-Security-Policy"
       content="default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; base-uri 'none'; form-action 'self'; object-src 'none'"
     />
-    <meta name="kernaid-api-base" content="" />
     <title>KernAid Fleet Console</title>
     <link rel="stylesheet" href="./styles.css" />
   </head>
@@ -63,6 +62,9 @@
             <h1 id="view-title">Fleet overview</h1>
           </div>
           <div class="top-actions">
+            <span class="session-role" id="session-role"
+              >No active session</span
+            >
             <span class="tenant-chip" id="tenant-chip">No tenant</span>
             <button class="button secondary" id="refresh-button" type="button">
               Refresh
@@ -71,7 +73,8 @@
               class="avatar"
               id="session-button"
               type="button"
-              aria-label="Open session menu"
+              aria-label="Sign out of Fleet Console"
+              title="Sign out"
             >
               OP
             </button>
@@ -560,9 +563,13 @@
         <p class="eyebrow">Authenticated operations</p>
         <h2 id="login-title">Connect to your organization</h2>
         <p class="modal-copy">
-          Use the tenant identifier and administrator token issued by the Fleet
-          control plane. The token stays in this browser tab only.
+          Use a tenant admin or operator token once. Fleet exchanges it for a
+          short, server-memory session and immediately clears the field.
         </p>
+        <div class="session-security" aria-label="Session security">
+          <span>HttpOnly</span><span>SameSite Strict</span
+          ><span>CSRF protected</span>
+        </div>
         <label
           >Tenant ID<input
             id="tenant-input"
@@ -572,12 +579,15 @@
             maxlength="128"
         /></label>
         <label
-          >Administrator token<input
+          >Admin or operator token<input
             id="token-input"
             name="token"
             type="password"
-            autocomplete="current-password"
+            autocomplete="off"
+            data-1p-ignore
             required
+            minlength="32"
+            maxlength="512"
         /></label>
         <p class="form-error" id="login-error" role="alert"></p>
         <button class="button primary wide" type="submit">

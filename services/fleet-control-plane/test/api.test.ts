@@ -138,6 +138,7 @@ async function createHarness(options?: {
   updateTrustAnchor?: string;
   serviceReceiptSigningKey?: KeyObject;
   serviceReceiptTrustAnchor?: string;
+  consoleSessionTtlMs?: number;
 }): Promise<Harness> {
   const directory =
     options?.directory ?? mkdtempSync(join(tmpdir(), "kernaid-fleet-test-"));
@@ -154,6 +155,7 @@ async function createHarness(options?: {
       options?.entitlementTrustAnchor ?? ENTITLEMENT_TRUST_ANCHOR,
     updateTrustAnchor: options?.updateTrustAnchor ?? UPDATE_TRUST_ANCHOR,
     now: () => new Date(now.value),
+    consoleSessionTtlMs: options?.consoleSessionTtlMs,
     consoleDirectory: options?.consoleDirectory,
   });
   const baseUrl = await service.listen();
@@ -212,6 +214,45 @@ async function canonicalApi(
     headers: response.headers,
     rawBody,
   };
+}
+
+async function consoleApi(
+  harness: Harness,
+  method: string,
+  path: string,
+  options?: {
+    body?: unknown;
+    cookie?: string;
+    csrfToken?: string;
+  },
+): Promise<HttpResult> {
+  const headers: Record<string, string> = {};
+  if (options?.body !== undefined) headers["content-type"] = "application/json";
+  if (options?.cookie !== undefined) headers.cookie = options.cookie;
+  if (options?.csrfToken !== undefined) {
+    headers["x-kernaid-csrf"] = options.csrfToken;
+  }
+  const response = await fetch(`${harness.baseUrl}${path}`, {
+    method,
+    headers,
+    ...(options?.body === undefined
+      ? {}
+      : { body: JSON.stringify(options.body) }),
+  });
+  const rawBody = await response.text();
+  return {
+    status: response.status,
+    body:
+      rawBody === "" ? {} : (JSON.parse(rawBody) as Record<string, unknown>),
+    headers: response.headers,
+    rawBody,
+  };
+}
+
+function sessionCookie(result: HttpResult): string {
+  const header = result.headers.get("set-cookie");
+  assert.notEqual(header, null);
+  return header?.split(";", 1)[0] ?? "";
 }
 
 function verifiedServiceReceipt(
@@ -1172,6 +1213,250 @@ test("tenant credentials and authorization audit survive restart", async () => {
       ),
       true,
     );
+  } finally {
+    await destroyHarness(harness);
+  }
+});
+
+test("console exchanges a tenant token for a secure CSRF-bound memory session", async () => {
+  const harness = await createHarness();
+  try {
+    const tenant = await createTenant(harness);
+    const login = await consoleApi(harness, "POST", "/v1/console-sessions", {
+      body: { tenantId: tenant.tenantId, token: tenant.adminToken },
+    });
+    assert.equal(login.status, 201);
+    assert.equal(login.body.schema, "dev.kernaid.fleet.console-session.v1");
+    assert.equal(login.body.tenantId, tenant.tenantId);
+    assert.equal(login.body.role, "admin");
+    assert.match(login.body.csrfToken as string, /^[A-Za-z0-9_-]{43}$/);
+    assert.equal(login.rawBody.includes(tenant.adminToken), false);
+    const setCookie = login.headers.get("set-cookie") ?? "";
+    assert.match(setCookie, /^__Host-kernaid_fleet_session=/);
+    assert.match(setCookie, /; Path=\//);
+    assert.match(setCookie, /; HttpOnly/);
+    assert.match(setCookie, /; Secure/);
+    assert.match(setCookie, /; SameSite=Strict/);
+    assert.doesNotMatch(setCookie, new RegExp(tenant.adminToken));
+    const cookie = sessionCookie(login);
+
+    const current = await consoleApi(harness, "GET", "/v1/console-session", {
+      cookie,
+    });
+    assert.equal(current.status, 200);
+    assert.equal(current.body.credentialId, "bootstrap-admin");
+    assert.equal(
+      (
+        await consoleApi(
+          harness,
+          "GET",
+          `/v1/tenants/${tenant.tenantId}/devices`,
+          { cookie },
+        )
+      ).status,
+      200,
+    );
+
+    for (const csrfToken of [undefined, "A".repeat(43)]) {
+      const denied = await consoleApi(
+        harness,
+        "POST",
+        `/v1/tenants/${tenant.tenantId}/enrollment-tokens`,
+        {
+          body: { expiresInSeconds: 300 },
+          cookie,
+          ...(csrfToken === undefined ? {} : { csrfToken }),
+        },
+      );
+      assert.equal(denied.status, 403);
+      assert.equal(denied.body.error, "csrf_required");
+    }
+    const mutation = await consoleApi(
+      harness,
+      "POST",
+      `/v1/tenants/${tenant.tenantId}/enrollment-tokens`,
+      {
+        body: { expiresInSeconds: 300 },
+        cookie,
+        csrfToken: login.body.csrfToken as string,
+      },
+    );
+    assert.equal(mutation.status, 201);
+
+    const logout = await consoleApi(harness, "DELETE", "/v1/console-session", {
+      cookie,
+      csrfToken: login.body.csrfToken as string,
+    });
+    assert.equal(logout.status, 200);
+    assert.match(logout.headers.get("set-cookie") ?? "", /Max-Age=0/);
+    assert.equal(
+      (await consoleApi(harness, "GET", "/v1/console-session", { cookie }))
+        .status,
+      401,
+    );
+
+    const bearerStillWorks = await api(
+      harness,
+      "POST",
+      `/v1/tenants/${tenant.tenantId}/enrollment-tokens`,
+      { expiresInSeconds: 300 },
+      tenant.adminToken,
+    );
+    assert.equal(bearerStillWorks.status, 201);
+  } finally {
+    await destroyHarness(harness);
+  }
+});
+
+test("console sessions expire, revoke with credentials, and vanish on restart", async () => {
+  let harness = await createHarness({ consoleSessionTtlMs: 60_000 });
+  const directory = harness.directory;
+  const now = harness.now;
+  try {
+    const tenant = await createTenant(harness);
+    const operator = await createAccessCredential(
+      harness,
+      tenant,
+      "operator",
+      "Console operator",
+    );
+    const login = await consoleApi(harness, "POST", "/v1/console-sessions", {
+      body: { tenantId: tenant.tenantId, token: operator.accessToken },
+    });
+    assert.equal(login.status, 201);
+    assert.equal(login.body.role, "operator");
+    const cookie = sessionCookie(login);
+    assert.equal(
+      (
+        await consoleApi(
+          harness,
+          "GET",
+          `/v1/tenants/${tenant.tenantId}/devices`,
+          { cookie },
+        )
+      ).status,
+      200,
+    );
+    assert.equal(
+      (
+        await consoleApi(
+          harness,
+          "GET",
+          `/v1/tenants/${tenant.tenantId}/access-credentials`,
+          { cookie },
+        )
+      ).status,
+      403,
+    );
+
+    const revoked = await api(
+      harness,
+      "POST",
+      `/v1/tenants/${tenant.tenantId}/access-credentials/${operator.credentialId}/revoke`,
+      {},
+      tenant.adminToken,
+    );
+    assert.equal(revoked.status, 200);
+    assert.equal(
+      (await consoleApi(harness, "GET", "/v1/console-session", { cookie }))
+        .status,
+      401,
+    );
+
+    const adminLogin = await consoleApi(
+      harness,
+      "POST",
+      "/v1/console-sessions",
+      {
+        body: { tenantId: tenant.tenantId, token: tenant.adminToken },
+      },
+    );
+    const adminCookie = sessionCookie(adminLogin);
+    now.value += 60_001;
+    assert.equal(
+      (
+        await consoleApi(harness, "GET", "/v1/console-session", {
+          cookie: adminCookie,
+        })
+      ).status,
+      401,
+    );
+
+    now.value += 60_001;
+    const restartLogin = await consoleApi(
+      harness,
+      "POST",
+      "/v1/console-sessions",
+      {
+        body: { tenantId: tenant.tenantId, token: tenant.adminToken },
+      },
+    );
+    const restartCookie = sessionCookie(restartLogin);
+    await destroyHarness(harness, false);
+    harness = await createHarness({
+      directory,
+      now,
+      consoleSessionTtlMs: 60_000,
+    });
+    const afterRestart = await consoleApi(
+      harness,
+      "GET",
+      "/v1/console-session",
+      { cookie: restartCookie },
+    );
+    assert.equal(afterRestart.status, 401);
+    assert.match(afterRestart.headers.get("set-cookie") ?? "", /Max-Age=0/);
+  } finally {
+    await destroyHarness(harness);
+  }
+});
+
+test("console login is exact, tenant-bound, and rate limited with bounded state", async () => {
+  const harness = await createHarness();
+  try {
+    const tenant = await createTenant(harness);
+    const other = await createTenant(harness);
+    const unknown = await consoleApi(harness, "POST", "/v1/console-sessions", {
+      body: {
+        tenantId: tenant.tenantId,
+        token: tenant.adminToken,
+        persist: true,
+      },
+    });
+    assert.equal(unknown.status, 400);
+    const crossTenant = await consoleApi(
+      harness,
+      "POST",
+      "/v1/console-sessions",
+      {
+        body: { tenantId: other.tenantId, token: tenant.adminToken },
+      },
+    );
+    assert.equal(crossTenant.status, 401);
+
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      const denied = await consoleApi(harness, "POST", "/v1/console-sessions", {
+        body: { tenantId: tenant.tenantId, token: "x".repeat(43) },
+      });
+      assert.equal(denied.status, 401);
+    }
+    const limited = await consoleApi(harness, "POST", "/v1/console-sessions", {
+      body: { tenantId: tenant.tenantId, token: tenant.adminToken },
+    });
+    assert.equal(limited.status, 429);
+    assert.equal(limited.body.error, "console_login_rate_limited");
+    assert.equal(limited.headers.get("retry-after"), "60");
+
+    harness.now.value += 60_001;
+    const recovered = await consoleApi(
+      harness,
+      "POST",
+      "/v1/console-sessions",
+      {
+        body: { tenantId: tenant.tenantId, token: tenant.adminToken },
+      },
+    );
+    assert.equal(recovered.status, 201);
   } finally {
     await destroyHarness(harness);
   }

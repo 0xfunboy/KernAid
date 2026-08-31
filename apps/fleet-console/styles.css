@@ -221,6 +221,14 @@ h2 {
     11px ui-monospace,
     monospace;
 }
+.session-role {
+  color: #71807c;
+  font:
+    9px ui-monospace,
+    monospace;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
 .avatar {
   width: 38px;
   height: 38px;
@@ -1024,6 +1032,25 @@ td small {
   font-size: 13px;
   line-height: 1.55;
   margin: 13px 0 25px;
+}
+.session-security {
+  margin: 16px 0;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+}
+.session-security span {
+  padding: 8px 6px;
+  border: 1px solid rgba(91, 228, 213, 0.18);
+  border-radius: 8px;
+  color: var(--cyan);
+  background: rgba(91, 228, 213, 0.035);
+  font:
+    8px ui-monospace,
+    monospace;
+  text-align: center;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
 }
 .modal label {
   display: grid;
