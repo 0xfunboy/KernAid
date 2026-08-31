@@ -9,6 +9,11 @@ use kernaid_evidence::{
 #[cfg(feature = "fixture-repair-lab")]
 use kernaid_policy::validate_fixture_repair_lab_plan as validate_fixture_repair_lab_policy;
 use kernaid_policy::{PolicyError, validate_phase_zero};
+#[cfg(feature = "rescue-crypttab-production-candidate")]
+use kernaid_policy::{
+    RESCUE_CRYPTTAB_ACTION_ID, RESCUE_CRYPTTAB_RESOURCE_ID,
+    validate_rescue_crypttab_production_candidate_plan as validate_rescue_crypttab_candidate_policy,
+};
 #[cfg(feature = "rescue-fstab-production-candidate")]
 use kernaid_policy::{
     RESCUE_FSTAB_ACTION_ID, RESCUE_FSTAB_EVIDENCE_IDS, RESCUE_FSTAB_FINDING_ID,
@@ -51,6 +56,204 @@ pub fn validate_rescue_fstab_rollback_plan(
     target_fingerprint: &str,
 ) -> Result<(), PolicyError> {
     validate_rescue_fstab_rollback_policy(plan, target_fingerprint)
+}
+
+#[cfg(feature = "rescue-crypttab-production-candidate")]
+pub const RESCUE_CRYPTTAB_TYPED_CONFIRMATION: &str = "DISABILITA VOCE CRYPTTAB";
+
+/// Apply Core's admission-only boundary to the off-default crypttab plan.
+#[cfg(feature = "rescue-crypttab-production-candidate")]
+pub fn validate_rescue_crypttab_production_candidate_plan(
+    plan: &ValidatedPlan,
+    target_fingerprint: &str,
+) -> Result<(), PolicyError> {
+    validate_rescue_crypttab_candidate_policy(plan, target_fingerprint)
+}
+
+/// Immutable broker-derived identity for one exact crypttab preview. Action
+/// and resource are compile-time pinned and cannot be supplied by a caller.
+#[cfg(feature = "rescue-crypttab-production-candidate")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RescueCrypttabCandidateBinding {
+    session_id: String,
+    plan_id: String,
+    plan_sha256: String,
+    target_fingerprint: String,
+    target_snapshot: String,
+}
+
+#[cfg(feature = "rescue-crypttab-production-candidate")]
+impl RescueCrypttabCandidateBinding {
+    pub fn new(
+        session_id: impl Into<String>,
+        plan_id: impl Into<String>,
+        plan_sha256: impl Into<String>,
+        target_fingerprint: impl Into<String>,
+        target_snapshot: impl Into<String>,
+    ) -> Result<Self, RescueCrypttabAdmissionError> {
+        let value = Self {
+            session_id: session_id.into(),
+            plan_id: plan_id.into(),
+            plan_sha256: plan_sha256.into(),
+            target_fingerprint: target_fingerprint.into(),
+            target_snapshot: target_snapshot.into(),
+        };
+        if !valid_crypttab_id(&value.session_id, "S-")
+            || !valid_crypttab_id(&value.plan_id, "P-")
+            || !valid_crypttab_hash(&value.plan_sha256)
+            || !valid_crypttab_hash(&value.target_fingerprint)
+            || !valid_crypttab_hash(&value.target_snapshot)
+        {
+            return Err(RescueCrypttabAdmissionError::InvalidBinding);
+        }
+        Ok(value)
+    }
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+    pub fn plan_id(&self) -> &str {
+        &self.plan_id
+    }
+    pub fn plan_sha256(&self) -> &str {
+        &self.plan_sha256
+    }
+    pub fn target_fingerprint(&self) -> &str {
+        &self.target_fingerprint
+    }
+    pub fn target_snapshot(&self) -> &str {
+        &self.target_snapshot
+    }
+    pub const fn action_id(&self) -> &'static str {
+        RESCUE_CRYPTTAB_ACTION_ID
+    }
+    pub const fn resource_id(&self) -> &'static str {
+        RESCUE_CRYPTTAB_RESOURCE_ID
+    }
+}
+
+#[cfg(feature = "rescue-crypttab-production-candidate")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RescueCrypttabCandidateApproval {
+    approval_id: String,
+    sequence: u64,
+    binding: RescueCrypttabCandidateBinding,
+    typed_confirmation: String,
+}
+
+#[cfg(feature = "rescue-crypttab-production-candidate")]
+impl RescueCrypttabCandidateApproval {
+    pub fn new(
+        approval_id: impl Into<String>,
+        sequence: u64,
+        binding: RescueCrypttabCandidateBinding,
+        typed_confirmation: impl Into<String>,
+    ) -> Result<Self, RescueCrypttabAdmissionError> {
+        let value = Self {
+            approval_id: approval_id.into(),
+            sequence,
+            binding,
+            typed_confirmation: typed_confirmation.into(),
+        };
+        if !valid_crypttab_id(&value.approval_id, "A-") || value.sequence == 0 {
+            return Err(RescueCrypttabAdmissionError::InvalidApproval);
+        }
+        Ok(value)
+    }
+}
+
+#[cfg(feature = "rescue-crypttab-production-candidate")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RescueCrypttabAdmissionState {
+    Staged,
+    Approved,
+}
+
+#[cfg(feature = "rescue-crypttab-production-candidate")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RescueCrypttabCandidateAdmission {
+    binding: RescueCrypttabCandidateBinding,
+    state: RescueCrypttabAdmissionState,
+    approval_id: Option<String>,
+}
+
+#[cfg(feature = "rescue-crypttab-production-candidate")]
+impl RescueCrypttabCandidateAdmission {
+    pub fn stage(
+        plan: &ValidatedPlan,
+        binding: RescueCrypttabCandidateBinding,
+    ) -> Result<Self, RescueCrypttabAdmissionError> {
+        validate_rescue_crypttab_candidate_policy(plan, binding.target_fingerprint())
+            .map_err(|_| RescueCrypttabAdmissionError::PolicyRejected)?;
+        if plan.plan_id != binding.plan_id || plan.target_fingerprint != binding.target_fingerprint
+        {
+            return Err(RescueCrypttabAdmissionError::BindingMismatch);
+        }
+        Ok(Self {
+            binding,
+            state: RescueCrypttabAdmissionState::Staged,
+            approval_id: None,
+        })
+    }
+
+    pub fn approve(
+        &mut self,
+        approval: RescueCrypttabCandidateApproval,
+    ) -> Result<(), RescueCrypttabAdmissionError> {
+        if self.state != RescueCrypttabAdmissionState::Staged || self.approval_id.is_some() {
+            return Err(RescueCrypttabAdmissionError::ApprovalReplay);
+        }
+        if approval.binding != self.binding || approval.sequence != 1 {
+            return Err(RescueCrypttabAdmissionError::BindingMismatch);
+        }
+        if approval.typed_confirmation != RESCUE_CRYPTTAB_TYPED_CONFIRMATION {
+            return Err(RescueCrypttabAdmissionError::WrongConfirmation);
+        }
+        self.approval_id = Some(approval.approval_id);
+        self.state = RescueCrypttabAdmissionState::Approved;
+        Ok(())
+    }
+
+    pub const fn state(&self) -> RescueCrypttabAdmissionState {
+        self.state
+    }
+    pub fn binding(&self) -> &RescueCrypttabCandidateBinding {
+        &self.binding
+    }
+    pub fn approval_id(&self) -> Option<&str> {
+        self.approval_id.as_deref()
+    }
+}
+
+#[cfg(feature = "rescue-crypttab-production-candidate")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RescueCrypttabAdmissionError {
+    InvalidBinding,
+    InvalidApproval,
+    PolicyRejected,
+    BindingMismatch,
+    WrongConfirmation,
+    ApprovalReplay,
+}
+
+#[cfg(feature = "rescue-crypttab-production-candidate")]
+fn valid_crypttab_id(value: &str, prefix: &str) -> bool {
+    value.strip_prefix(prefix).is_some_and(|suffix| {
+        !suffix.is_empty()
+            && value.len() <= 128
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    })
+}
+
+#[cfg(feature = "rescue-crypttab-production-candidate")]
+fn valid_crypttab_hash(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    })
 }
 
 /// Immutable broker-derived bindings for one fixture-only R2 mutation.

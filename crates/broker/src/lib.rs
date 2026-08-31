@@ -12,6 +12,17 @@ pub mod fixture_repair;
 #[cfg(all(target_os = "linux", feature = "rescue-fstab-production-candidate"))]
 pub mod rescue_fstab_candidate;
 
+/// Closed broker-owned preview and Core admission for the independent
+/// crypttab candidate. It deliberately exposes no execution dispatch until
+/// the existing Vault/write/reconciliation engine is shared safely.
+#[cfg(all(target_os = "linux", feature = "rescue-crypttab-production-candidate"))]
+pub mod rescue_crypttab_candidate;
+
+/// Descriptor-rooted, read-only observation of crypttab and its fstab
+/// consumer set through the existing target capability bundle.
+#[cfg(all(target_os = "linux", feature = "rescue-crypttab-production-candidate"))]
+pub mod rescue_crypttab_observer;
+
 /// Closed, off-default same-boot executor and durable reboot recovery for the
 /// sole authorized Phase 1 Rescue mutation.
 #[cfg(all(target_os = "linux", feature = "rescue-fstab-production-candidate"))]

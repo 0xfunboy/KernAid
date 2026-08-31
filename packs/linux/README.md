@@ -31,6 +31,24 @@ or Release Channel. It is therefore not a shipping or user-supported repair
 path. The manifest's `productionCandidateOnly` label names the qualification
 track; it does not itself authorize production use.
 
+`action-pack.crypttab-production-candidate-v1.yaml` defines a second and
+separately compiled preflight candidate,
+`linux.crypttab.disable-missing-uuid.v1`. Its pure pack can comment exactly one
+UUID-backed auxiliary mapping proven absent by the sealed UUID inventory. It
+rejects root/initramfs/resume/swap/keyscript/network mappings, external key
+files, malformed or ambiguous documents, and every active mandatory fstab
+consumer of the mapper name. Optional `nofail`/`noauto` consumers are allowed.
+The broker reads both files only through the retained detached read-only ext4
+mount, revalidates target identity around observation, binds three canonical
+evidence hashes and stages a single-use typed Core approval. Raw UUID, mapper,
+key and configuration data remain out of protocol, logs and `Debug`.
+
+This crypttab tranche deliberately has no execution method, repaird route or
+UI. It must reuse the fstab candidate's distinct-Vault reservation, single-use
+write lease, atomic regular-file replacement, automatic restore, explicit
+rollback and reboot reconciliation before it can be packaged. The manifest is
+a required contract, not evidence that those gates already exist.
+
 The candidate can propose commenting only one active, mandatory UUID entry
 that is absent from a caller-supplied observed UUID set and mounts below
 `/mnt/`, `/media/`, or `/srv/` on `ext4`. It fails closed for malformed input,

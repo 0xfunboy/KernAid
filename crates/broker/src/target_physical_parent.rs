@@ -5,7 +5,10 @@
 //! a mutable device namespace: it derives and revalidates all numeric claims
 //! from the retained readable leaf and non-readable parent identity handle.
 
-#[cfg(feature = "rescue-fstab-production-candidate")]
+#[cfg(any(
+    feature = "rescue-fstab-production-candidate",
+    feature = "rescue-crypttab-production-candidate"
+))]
 use crate::target_capability_client::RescueTargetCapabilityClaims;
 use crate::target_capability_client::{
     PhysicalParentNumericClaims, RescueTargetReadOnlyCapability,
@@ -128,7 +131,10 @@ impl RescueTargetPhysicalParentGuard {
         self.target.claims().scan_fingerprint()
     }
 
-    #[cfg(feature = "rescue-fstab-production-candidate")]
+    #[cfg(any(
+        feature = "rescue-fstab-production-candidate",
+        feature = "rescue-crypttab-production-candidate"
+    ))]
     pub(crate) fn target_claims(&self) -> &RescueTargetCapabilityClaims {
         self.target.claims()
     }

@@ -17,10 +17,12 @@
 These rules apply to the whole repository.
 
 Phase 0 remains the default and shipping diagnosis-only path. Phase 1
-development authorizes exactly one off-by-default production candidate:
+development authorizes exactly two off-by-default production candidates:
 `linux.fstab.disable-missing-uuid.v1`, compiled only behind
-`rescue-fstab-production-candidate`. No other production mutation handler is
-authorized.
+`rescue-fstab-production-candidate`, and
+`linux.crypttab.disable-missing-uuid.v1`, compiled only behind
+`rescue-crypttab-production-candidate`. No other production mutation handler
+is authorized.
 
 The Phase 1 candidate may mutate a target only after all of these fail-closed
 conditions hold in the same retained transaction:
@@ -35,3 +37,11 @@ conditions hold in the same retained transaction:
 
 The feature must remain absent from default Desk and Rescue builds until its
 QEMU, power-loss, physical USB and release qualification gates are recorded.
+
+The crypttab candidate is additionally limited to one auxiliary UUID-backed
+mapping on a directly selected ext4 root. It must reject initramfs, root,
+resume, swap, keyscript and network mappings, external key files, ambiguity,
+and every mandatory active fstab consumer of the mapper name. It may not gain
+an execution path by copying or weakening the fstab transaction engine: the
+Vault, approval, write lease, atomic replacement, validation, rollback and
+reconciliation boundary must be shared or equivalently closed first.
