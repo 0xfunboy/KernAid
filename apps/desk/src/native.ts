@@ -46,6 +46,13 @@ import {
   parseLinuxFilesystemHealth,
   type LinuxFilesystemHealthSnapshot,
 } from "./filesystem-health";
+import {
+  LINUX_BOOT_CRITICAL_PATH_COLLECTOR,
+  augmentDiagnosisWithBootCriticalPath,
+  bootCriticalPathEvidenceSummary,
+  parseLinuxBootCriticalPath,
+  type LinuxBootCriticalPathSnapshot,
+} from "./boot-critical-path";
 
 export {
   LINUX_STORAGE_HEALTH_COLLECTOR,
@@ -60,6 +67,12 @@ export {
   parseLinuxFilesystemHealth,
   type LinuxFilesystemHealthSnapshot,
 } from "./filesystem-health";
+export {
+  LINUX_BOOT_CRITICAL_PATH_COLLECTOR,
+  bootCriticalPathEvidenceSummary,
+  parseLinuxBootCriticalPath,
+  type LinuxBootCriticalPathSnapshot,
+} from "./boot-critical-path";
 
 const SIGNED_REPORT_SCHEMA =
   "https://schemas.kernaid.dev/v1/signed-report-envelope.json";
@@ -106,6 +119,7 @@ const LINUX_RESIDENT_CORPUS_COLLECTORS = [
   "system.hostname",
   LINUX_NORMALIZED_SNAPSHOT_COLLECTOR,
   LINUX_HARDWARE_COLLECTOR,
+  LINUX_BOOT_CRITICAL_PATH_COLLECTOR,
   ...LINUX_P0_COLLECTORS,
 ] as const;
 const WINDOWS_P0_COLLECTORS = [
@@ -1116,6 +1130,8 @@ export function parseNativeObservations(value: unknown): NativeObservation[] {
       parseLinuxStorageHealth(item.output);
     if (item.collector === LINUX_FILESYSTEM_HEALTH_COLLECTOR && item.success)
       parseLinuxFilesystemHealth(item.output);
+    if (item.collector === LINUX_BOOT_CRITICAL_PATH_COLLECTOR && item.success)
+      parseLinuxBootCriticalPath(item.output);
     return item as unknown as NativeObservation;
   });
 }
@@ -1366,7 +1382,8 @@ export function nativeObservationContentType(
     (observation.collector.startsWith("macos.") ||
       observation.collector === LINUX_HARDWARE_COLLECTOR ||
       observation.collector === LINUX_STORAGE_HEALTH_COLLECTOR ||
-      observation.collector === LINUX_FILESYSTEM_HEALTH_COLLECTOR)
+      observation.collector === LINUX_FILESYSTEM_HEALTH_COLLECTOR ||
+      observation.collector === LINUX_BOOT_CRITICAL_PATH_COLLECTOR)
     ? "application/json"
     : "text/plain";
 }
@@ -1384,6 +1401,10 @@ export function nativeObservationSummary(
   if (observation.collector === LINUX_FILESYSTEM_HEALTH_COLLECTOR)
     return filesystemHealthEvidenceSummary(
       parseLinuxFilesystemHealth(observation.output),
+    );
+  if (observation.collector === LINUX_BOOT_CRITICAL_PATH_COLLECTOR)
+    return bootCriticalPathEvidenceSummary(
+      parseLinuxBootCriticalPath(observation.output),
     );
   return "Comando di inventario completato";
 }
@@ -2229,12 +2250,16 @@ export class PlatformOfflineRulesProvider implements Provider {
     const filesystemHealthEvidence = evidence.filter(
       (item) => item.evidence.collector === LINUX_FILESYSTEM_HEALTH_COLLECTOR,
     );
+    const bootCriticalPathEvidence = evidence.filter(
+      (item) => item.evidence.collector === LINUX_BOOT_CRITICAL_PATH_COLLECTOR,
+    );
     const hasLinuxCorpus =
       linuxEvidence.length > 0 ||
       snapshotEvidence.length > 0 ||
       hardwareEvidence.length > 0 ||
       storageHealthEvidence.length > 0 ||
-      filesystemHealthEvidence.length > 0;
+      filesystemHealthEvidence.length > 0 ||
+      bootCriticalPathEvidence.length > 0;
     const windowsEvidence = evidence.filter((item) =>
       WINDOWS_P0_COLLECTORS.includes(
         item.evidence.collector as (typeof WINDOWS_P0_COLLECTORS)[number],
@@ -2386,6 +2411,27 @@ export class PlatformOfflineRulesProvider implements Provider {
       }
     }
 
+    let bootCriticalPath: LinuxBootCriticalPathSnapshot | undefined;
+    if (
+      bootCriticalPathEvidence.length === 1 &&
+      bootCriticalPathEvidence[0]?.evidence.target === "local-machine" &&
+      bootCriticalPathEvidence[0].evidence.contentType === "application/json" &&
+      bootCriticalPathEvidence[0].evidence.trust === "observed-untrusted"
+    ) {
+      try {
+        bootCriticalPath = parseLinuxBootCriticalPath(
+          bootCriticalPathEvidence[0].content,
+        );
+        if (
+          bootCriticalPathEvidence[0].evidence.summary !==
+          bootCriticalPathEvidenceSummary(bootCriticalPath)
+        )
+          bootCriticalPath = undefined;
+      } catch {
+        bootCriticalPath = undefined;
+      }
+    }
+
     let admittedSnapshot: LinuxNormalizedSnapshotEnvelope | undefined;
     if (
       snapshotEvidence.length === 1 &&
@@ -2418,6 +2464,7 @@ export class PlatformOfflineRulesProvider implements Provider {
               ...hardwareEvidence,
               ...storageHealthEvidence,
               ...filesystemHealthEvidence,
+              ...bootCriticalPathEvidence,
             ].map((item) => item.evidence.id),
           ),
         ),
@@ -2426,6 +2473,9 @@ export class PlatformOfflineRulesProvider implements Provider {
           ...(hardwareValid ? [] : [LINUX_HARDWARE_COLLECTOR]),
           ...(storageHealth === undefined
             ? [LINUX_STORAGE_HEALTH_COLLECTOR]
+            : []),
+          ...(bootCriticalPath === undefined
+            ? [LINUX_BOOT_CRITICAL_PATH_COLLECTOR]
             : []),
           ...LINUX_P0_COLLECTORS.filter(
             (collector) =>
@@ -2451,6 +2501,7 @@ export class PlatformOfflineRulesProvider implements Provider {
               ...hardwareEvidence,
               ...storageHealthEvidence,
               ...filesystemHealthEvidence,
+              ...bootCriticalPathEvidence,
             ].map((item) => item.evidence.id),
           ),
         ),
@@ -2489,6 +2540,7 @@ export class PlatformOfflineRulesProvider implements Provider {
     const complete =
       exactCorpus &&
       hardwareValid &&
+      bootCriticalPath !== undefined &&
       selected.every((item) => item !== undefined) &&
       LINUX_P0_COLLECTORS.every(
         (collector) =>
@@ -2527,6 +2579,8 @@ export class PlatformOfflineRulesProvider implements Provider {
       if (!hardwareValid) requestedEvidence.push(LINUX_HARDWARE_COLLECTOR);
       if (storageHealth === undefined)
         requestedEvidence.push(LINUX_STORAGE_HEALTH_COLLECTOR);
+      if (bootCriticalPath === undefined)
+        requestedEvidence.push(LINUX_BOOT_CRITICAL_PATH_COLLECTOR);
       if (!exactCorpus) requestedEvidence.push("linux.p0.corpus.exact.v1");
       return parseDiagnosisProposal({
         schemaVersion: "1.0",
@@ -2567,12 +2621,20 @@ export class PlatformOfflineRulesProvider implements Provider {
             storageHealth,
             storageHealthEvidence[0]!.evidence.id,
           );
-    return filesystemHealth === undefined
-      ? storageBound
-      : augmentDiagnosisWithFilesystemHealth(
-          storageBound,
-          filesystemHealth,
-          filesystemHealthEvidence[0]!.evidence.id,
+    const filesystemBound =
+      filesystemHealth === undefined
+        ? storageBound
+        : augmentDiagnosisWithFilesystemHealth(
+            storageBound,
+            filesystemHealth,
+            filesystemHealthEvidence[0]!.evidence.id,
+          );
+    return bootCriticalPath === undefined
+      ? filesystemBound
+      : augmentDiagnosisWithBootCriticalPath(
+          filesystemBound,
+          bootCriticalPath,
+          bootCriticalPathEvidence[0]!.evidence.id,
         );
   }
 }

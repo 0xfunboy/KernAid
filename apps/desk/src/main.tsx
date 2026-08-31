@@ -32,6 +32,7 @@ import {
   linuxNormalizedSnapshotEvidenceSummary,
   linuxNormalizedSnapshotFromRescue,
   parseLinuxFilesystemHealth,
+  parseLinuxBootCriticalPath,
   parseLinuxStorageHealth,
   projectLinuxStorageHealth,
   scanRescueInstalledTargets,
@@ -43,11 +44,13 @@ import {
   verifyRescueTauriIpcIsolation,
   LINUX_NORMALIZED_SNAPSHOT_COLLECTOR,
   LINUX_FILESYSTEM_HEALTH_COLLECTOR,
+  LINUX_BOOT_CRITICAL_PATH_COLLECTOR,
   LINUX_STORAGE_HEALTH_COLLECTOR,
   RESCUE_OFFLINE_EVIDENCE_COLLECTOR,
   RESCUE_OFFLINE_EVIDENCE_TARGET,
   type NativeObservation,
   type LinuxFilesystemHealthSnapshot,
+  type LinuxBootCriticalPathSnapshot,
   type LinuxStorageHealthSnapshot,
   type RescueOfflineInspection,
   RescueOfflineInspectionError,
@@ -1211,6 +1214,22 @@ function App() {
       storageHealth = undefined;
     }
   }
+  let bootCriticalPath: LinuxBootCriticalPathSnapshot | undefined;
+  const bootCriticalPathObservation = nativeEvidence.find(
+    (item) =>
+      item.collector === LINUX_BOOT_CRITICAL_PATH_COLLECTOR &&
+      item.success &&
+      !item.truncated,
+  );
+  if (bootCriticalPathObservation !== undefined) {
+    try {
+      bootCriticalPath = parseLinuxBootCriticalPath(
+        bootCriticalPathObservation.output,
+      );
+    } catch {
+      bootCriticalPath = undefined;
+    }
+  }
 
   return (
     <main>
@@ -1383,11 +1402,32 @@ function App() {
             </div>
           </div>
         )}
+        {bootCriticalPath !== undefined && (
+          <div
+            className={`storage-health boot-health ${bootCriticalPath.state}`}
+            aria-label="Boot critical path"
+          >
+            <p className="label">BOOT PATH · FIXED READ-ONLY CHECK</p>
+            <div className={`storage-health-disk ${bootCriticalPath.state}`}>
+              <strong>{bootCriticalPath.state.replace("-", " ")}</strong>
+              <span>
+                {bootCriticalPath.runtime.failedUnitCount} failed units ·{" "}
+                {bootCriticalPath.runtime.slowestActivationMillis === null
+                  ? "chain unavailable"
+                  : `${bootCriticalPath.runtime.slowestActivationMillis} ms slowest`}
+              </span>
+              {bootCriticalPath.findings[0] !== undefined && (
+                <p>{bootCriticalPath.findings[0].nextAction}</p>
+              )}
+            </div>
+          </div>
+        )}
         {nativeEvidence
           .filter(
             (item) =>
               item.collector !== LINUX_STORAGE_HEALTH_COLLECTOR &&
-              item.collector !== LINUX_FILESYSTEM_HEALTH_COLLECTOR,
+              item.collector !== LINUX_FILESYSTEM_HEALTH_COLLECTOR &&
+              item.collector !== LINUX_BOOT_CRITICAL_PATH_COLLECTOR,
           )
           .map((item) => (
             <details key={item.collector}>

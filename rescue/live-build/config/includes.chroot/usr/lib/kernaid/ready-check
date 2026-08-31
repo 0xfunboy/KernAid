@@ -553,6 +553,27 @@ def leaked(value):
 not leaked(data) or sys.exit("storage identity leaked")
 ' || fail "storage health evidence is missing"
 printf '\nKERNAID_RESCUE_STORAGE_HEALTH_READY\n' >/dev/ttyS0
+printf '%s' "$inventory" | python3 -c '
+import json,sys
+items=json.load(sys.stdin)
+matches=[item for item in items if item.get("collector") == "linux.boot-critical-path.v1"]
+len(matches) == 1 or sys.exit("boot critical path cardinality failed")
+item=matches[0]
+item.get("success") is True and item.get("truncated") is False or sys.exit("boot critical path collector failed")
+data=json.loads(item.get("output", ""))
+set(data) == {"schemaVersion","kind","scope","state","runtime","configuration","findings"} or sys.exit("boot critical path shape failed")
+data.get("schemaVersion") == "1.0" and data.get("kind") == "linux-boot-critical-path" and data.get("scope") == "local-root" or sys.exit("boot critical path version failed")
+data.get("state") in {"healthy","degraded","boot-risk","unsupported"} or sys.exit("boot critical path state failed")
+runtime=data.get("runtime", {})
+set(runtime) == {"failedUnitsStatus","failedUnitCount","criticalFailedUnitCount","criticalChainStatus","criticalChainUnitCount","slowestActivationMillis"} or sys.exit("boot runtime shape failed")
+configuration=data.get("configuration", {})
+set(configuration) == {"fstabStatus","fstabEntryCount","criticalMountEntryCount","initramfsStatus","initramfsImageCount","kernelImageCount","bootloaderStatus","bootloader"} or sys.exit("boot configuration shape failed")
+forbidden={"unit","path","version","raw","stdout","stderr","content","uuid"}
+def leaked(value):
+    return isinstance(value,dict) and (not forbidden.isdisjoint(key.lower() for key in value) or any(leaked(child) for child in value.values())) or isinstance(value,list) and any(leaked(child) for child in value)
+not leaked(data) or sys.exit("boot path private data leaked")
+' || fail "boot critical path evidence is missing"
+printf '\nKERNAID_RESCUE_BOOT_CRITICAL_PATH_READY\n' >/dev/ttyS0
 live_filesystem_health="$(/usr/bin/timeout --signal=KILL 35s /usr/lib/kernaid/kernaid-linux-filesystem-health)" || fail "filesystem health collector failed"
 printf '%s' "$live_filesystem_health" | python3 -c '
 import json,re,sys

@@ -35,6 +35,9 @@ path="src/bin/storage_health.rs"
 name="kernaid-linux-filesystem-health"
 path="src/bin/filesystem_health.rs"
 [[bin]]
+name="kernaid-linux-boot-critical-path"
+path="src/bin/boot_critical_path.rs"
+[[bin]]
 name="kernaid-linux-snapshot-fixture"
 path="src/bin/snapshot_fixture.rs"
 required-features=["fixture-snapshot-cli"]
