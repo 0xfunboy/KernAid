@@ -64,6 +64,11 @@ TAMPER_HELPER_FAILURE = re.compile(
     rb"KERNAID_QEMU_REPAIR_VAULT_TAMPER_FAILURE_V1 code=([a-z0-9-]+)\n"
 )
 OVMF_ROOTS = (Path("/usr/share/OVMF"), Path("/usr/share/edk2"))
+# The Rescue Vault may legitimately consume its 120-second stop budget while
+# systemd is also draining live-media and device jobs under TCG.  Keep clean
+# ACPI shutdown mandatory, but do not misclassify that bounded shutdown as a
+# repair failure merely because it exceeds the generic 180-second VM budget.
+REPAIR_ACPI_SHUTDOWN_SECONDS = 300.0
 
 EXECUTE_STATE_CLASSIFIER_SOURCE = r'''
 def execute_state_checkpoint(value):
@@ -1503,7 +1508,9 @@ def main(arguments: Sequence[str]) -> int:
         if parsed.scenario == "provision-base":
             qmp.set_deadline(LIFECYCLE._deadline(aggregate, 10.0))
             qmp.system_powerdown()
-            harness.wait_for_shutdown(LIFECYCLE._deadline(aggregate, 180.0))
+            harness.wait_for_shutdown(
+                LIFECYCLE._deadline(aggregate, REPAIR_ACPI_SHUTDOWN_SECONDS)
+            )
         else:
             cursor = unlock_repair_vault(
                 console, aggregate, login, key, stage="repair"
@@ -1519,7 +1526,9 @@ def main(arguments: Sequence[str]) -> int:
             )
             qmp.set_deadline(LIFECYCLE._deadline(aggregate, 10.0))
             qmp.system_powerdown()
-            harness.wait_for_shutdown(LIFECYCLE._deadline(aggregate, 180.0))
+            harness.wait_for_shutdown(
+                LIFECYCLE._deadline(aggregate, REPAIR_ACPI_SHUTDOWN_SECONDS)
+            )
         elif parsed.scenario == "rollback":
             LIFECYCLE.run_guest_proof(
                 console,
@@ -1531,7 +1540,9 @@ def main(arguments: Sequence[str]) -> int:
             )
             qmp.set_deadline(LIFECYCLE._deadline(aggregate, 10.0))
             qmp.system_powerdown()
-            harness.wait_for_shutdown(LIFECYCLE._deadline(aggregate, 180.0))
+            harness.wait_for_shutdown(
+                LIFECYCLE._deadline(aggregate, REPAIR_ACPI_SHUTDOWN_SECONDS)
+            )
         elif parsed.scenario in {
             "stale-target",
             "cancel",
@@ -1558,7 +1569,9 @@ def main(arguments: Sequence[str]) -> int:
             elif writes != 0:
                 raise LIFECYCLE.ClosedFailure("failure-path", "unexpected-target-write")
             qmp.system_powerdown()
-            harness.wait_for_shutdown(LIFECYCLE._deadline(aggregate, 180.0))
+            harness.wait_for_shutdown(
+                LIFECYCLE._deadline(aggregate, REPAIR_ACPI_SHUTDOWN_SECONDS)
+            )
         elif parsed.scenario == "backup-tamper":
             reservation_id, binding, cursor = run_receipt_guest_proof(
                 console,
@@ -1574,7 +1587,9 @@ def main(arguments: Sequence[str]) -> int:
             if target_write_bytes(qmp) <= 0:
                 raise LIFECYCLE.ClosedFailure("tamper", "apply-write-witness-missing")
             qmp.system_powerdown()
-            harness.wait_for_shutdown(LIFECYCLE._deadline(aggregate, 180.0))
+            harness.wait_for_shutdown(
+                LIFECYCLE._deadline(aggregate, REPAIR_ACPI_SHUTDOWN_SECONDS)
+            )
             harness.cleanup()
             harness = None
 
@@ -1622,7 +1637,9 @@ def main(arguments: Sequence[str]) -> int:
             if target_write_bytes(qmp) != 0:
                 raise LIFECYCLE.ClosedFailure("tamper", "unexpected-target-write")
             qmp.system_powerdown()
-            harness.wait_for_shutdown(LIFECYCLE._deadline(aggregate, 180.0))
+            harness.wait_for_shutdown(
+                LIFECYCLE._deadline(aggregate, REPAIR_ACPI_SHUTDOWN_SECONDS)
+            )
         elif parsed.scenario == "interrupt-reconcile":
             LIFECYCLE.run_guest_proof(
                 console,
@@ -1669,7 +1686,9 @@ def main(arguments: Sequence[str]) -> int:
             )
             qmp.set_deadline(LIFECYCLE._deadline(aggregate, 10.0))
             qmp.system_powerdown()
-            harness.wait_for_shutdown(LIFECYCLE._deadline(aggregate, 180.0))
+            harness.wait_for_shutdown(
+                LIFECYCLE._deadline(aggregate, REPAIR_ACPI_SHUTDOWN_SECONDS)
+            )
         elif parsed.scenario != "provision-base":
             raise LIFECYCLE.ClosedFailure("arguments", "scenario-invalid")
     except LIFECYCLE.ClosedFailure as error:

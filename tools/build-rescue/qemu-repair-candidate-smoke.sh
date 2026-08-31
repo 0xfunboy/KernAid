@@ -40,6 +40,10 @@ elif [[ "$scenario" == interrupt-reconcile || "$scenario" == backup-tamper ]]; t
   controller_timeout=1800
 elif [[ "$scenario" == failure-paths ]]; then
   controller_timeout=1200
+elif [[ "$scenario" == stale-target || "$scenario" == cancel \
+  || "$scenario" == repaird-termination || "$scenario" == auto-restore ]]; then
+  # Reserve the full bounded repair shutdown window after the guest proof.
+  controller_timeout=1200
 fi
 
 if [[ -n "$provisioned_base" || -n "$provisioned_key" \
