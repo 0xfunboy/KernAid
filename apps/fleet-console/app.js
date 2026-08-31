@@ -7,6 +7,8 @@ const state = {
   token: sessionStorage.getItem("kernaid.fleet.admin-token") ?? "",
   devices: [],
   assets: [],
+  auditEvents: [],
+  auditError: "",
   view: "overview",
 };
 
@@ -25,8 +27,13 @@ const elements = {
   copyToken: document.querySelector("#copy-token"),
   deviceRows: document.querySelector("#device-rows"),
   assetRows: document.querySelector("#asset-rows"),
+  auditRows: document.querySelector("#audit-rows"),
   deviceFilter: document.querySelector("#device-filter"),
   assetFilter: document.querySelector("#asset-filter"),
+  auditFilter: document.querySelector("#audit-filter"),
+  auditEmpty: document.querySelector("#audit-empty"),
+  auditError: document.querySelector("#audit-error"),
+  auditErrorMessage: document.querySelector("#audit-error-message"),
   toast: document.querySelector("#toast"),
 };
 
@@ -114,16 +121,62 @@ function items(payload) {
   return Array.isArray(payload?.items) ? payload.items : [];
 }
 
+function auditItems(payload) {
+  return items(payload)
+    .filter(
+      (event) =>
+        event !== null && typeof event === "object" && !Array.isArray(event),
+    )
+    .map((event) => ({
+      deviceId: event.deviceId,
+      sessionId: event.sessionId,
+      eventId: event.eventId,
+      sequence: event.sequence,
+      previousEventSha256: event.previousEventSha256,
+      eventSha256: event.eventSha256,
+      occurredAt: event.occurredAt,
+      receivedAt: event.receivedAt,
+      kind: event.kind,
+      outcome: event.outcome,
+      risk: event.risk,
+      actionId: event.actionId,
+    }));
+}
+
 async function loadFleet() {
-  if (!state.tenantId || !state.token) return;
+  if (!state.tenantId || !state.token) return false;
   const encodedTenant = encodeURIComponent(state.tenantId);
-  const [devices, assets] = await Promise.all([
+  const [devicesResult, assetsResult, auditResult] = await Promise.allSettled([
     request(`/v1/tenants/${encodedTenant}/devices`),
     request(`/v1/tenants/${encodedTenant}/assets`),
+    request(`/v1/tenants/${encodedTenant}/audit-events`),
   ]);
-  state.devices = items(devices);
-  state.assets = items(assets);
+  if (devicesResult.status === "rejected") throw devicesResult.reason;
+  if (assetsResult.status === "rejected") throw assetsResult.reason;
+  if (
+    auditResult.status === "rejected" &&
+    [401, 403].includes(auditResult.reason?.status)
+  ) {
+    throw auditResult.reason;
+  }
+
+  state.devices = items(devicesResult.value);
+  state.assets = items(assetsResult.value);
+  state.auditEvents =
+    auditResult.status === "fulfilled" ? auditItems(auditResult.value) : [];
+  state.auditError =
+    auditResult.status === "rejected"
+      ? auditErrorMessage(auditResult.reason)
+      : "";
   render();
+  return state.auditError === "";
+}
+
+function auditErrorMessage(error) {
+  if (error?.status === 404) {
+    return "This control plane does not expose the tenant audit endpoint yet.";
+  }
+  return "Signed audit events could not be loaded. Refresh to retry.";
 }
 
 function render() {
@@ -147,6 +200,7 @@ function render() {
     `${state.devices.length - revoked} active identities`;
   renderDevices();
   renderAssets();
+  renderAudit();
   applyView();
 }
 
@@ -241,11 +295,77 @@ function renderAssets() {
   elements.assetRows.closest("table").hidden = assets.length === 0;
 }
 
+function renderAudit() {
+  const query = elements.auditFilter.value.trim().toLowerCase();
+  const events = state.auditEvents.filter((event) =>
+    JSON.stringify([
+      event.eventId,
+      event.kind,
+      event.outcome,
+      event.risk,
+      event.actionId,
+      event.deviceId,
+      event.sessionId,
+    ])
+      .toLowerCase()
+      .includes(query),
+  );
+  elements.auditRows.replaceChildren();
+  for (const event of events) {
+    const row = document.createElement("tr");
+    row.append(
+      cell(
+        text("strong", date(event.occurredAt)),
+        text("small", `Received ${date(event.receivedAt)}`),
+      ),
+      cell(
+        text("strong", String(event.kind ?? "unknown").replaceAll("_", " ")),
+        text("small", short(event.eventId, 15)),
+      ),
+      cell(
+        text("strong", short(event.deviceId, 12)),
+        text("small", short(event.sessionId, 15)),
+      ),
+      cell(
+        text(
+          "span",
+          String(event.outcome ?? "unknown"),
+          `status audit-outcome ${event.outcome ?? "unknown"}`,
+        ),
+      ),
+      cell(
+        text("strong", event.risk ?? "No risk"),
+        text("small", event.actionId ? short(event.actionId, 15) : "No action"),
+      ),
+      cell(
+        text(
+          "strong",
+          `#${event.sequence ?? "—"} · ${short(event.eventSha256, 10)}`,
+        ),
+        text(
+          "small",
+          event.previousEventSha256
+            ? `Prev ${short(event.previousEventSha256, 10)}`
+            : "Chain origin",
+        ),
+      ),
+    );
+    elements.auditRows.append(row);
+  }
+
+  const failed = state.auditError !== "";
+  elements.auditError.hidden = !failed;
+  elements.auditErrorMessage.textContent = state.auditError;
+  elements.auditEmpty.hidden = failed || events.length !== 0;
+  elements.auditRows.closest("table").hidden = failed || events.length === 0;
+}
+
 function applyView() {
   const titles = {
     overview: "Fleet overview",
     devices: "Enrolled devices",
     assets: "Observed assets",
+    audit: "Tenant audit",
     enrollment: "Device enrollment",
   };
   document.querySelector("#view-title").textContent = titles[state.view];
@@ -291,6 +411,8 @@ function clearSession() {
   state.tenantId = "";
   state.devices = [];
   state.assets = [];
+  state.auditEvents = [];
+  state.auditError = "";
   sessionStorage.removeItem("kernaid.fleet.tenant");
   sessionStorage.removeItem("kernaid.fleet.admin-token");
   elements.tokenInput.value = "";
@@ -365,8 +487,13 @@ document
   .addEventListener("click", async (event) => {
     setBusy(event.currentTarget, true);
     try {
-      await loadFleet();
-      notify("Fleet data refreshed");
+      const complete = await loadFleet();
+      notify(
+        complete
+          ? "Fleet data refreshed"
+          : "Fleet refreshed; audit unavailable",
+        !complete,
+      );
     } catch (error) {
       if (error.status === 401 || error.status === 403) clearSession();
       else notify(error.message, true);
@@ -382,6 +509,7 @@ document
   .addEventListener("click", () => elements.enrollment.showModal());
 elements.deviceFilter.addEventListener("input", renderDevices);
 elements.assetFilter.addEventListener("input", renderAssets);
+elements.auditFilter.addEventListener("input", renderAudit);
 document.querySelectorAll(".nav-item").forEach((button) =>
   button.addEventListener("click", () => {
     state.view = button.dataset.view;

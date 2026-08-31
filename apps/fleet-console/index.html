@@ -31,8 +31,11 @@
           <button class="nav-item" data-view="assets">
             <span>03</span>Assets
           </button>
+          <button class="nav-item" data-view="audit">
+            <span>04</span>Audit
+          </button>
           <button class="nav-item" data-view="enrollment">
-            <span>04</span>Enrollment
+            <span>05</span>Enrollment
           </button>
         </nav>
         <div class="rail-foot">
@@ -210,6 +213,55 @@
                   <p>
                     Assets appear after an enrolled device uploads its first
                     envelope.
+                  </p>
+                </div>
+              </div>
+            </section>
+
+            <section class="panel audit-panel" data-panel="overview audit">
+              <div class="panel-head">
+                <div>
+                  <p class="eyebrow">Signed event chain</p>
+                  <h2>Tenant audit</h2>
+                </div>
+                <label class="search"
+                  ><span class="sr-only">Filter audit events</span
+                  ><input
+                    id="audit-filter"
+                    type="search"
+                    placeholder="Filter audit events"
+                /></label>
+              </div>
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Occurred</th>
+                      <th>Event</th>
+                      <th>Device / session</th>
+                      <th>Outcome</th>
+                      <th>Risk / action</th>
+                      <th>Chain proof</th>
+                    </tr>
+                  </thead>
+                  <tbody id="audit-rows"></tbody>
+                </table>
+                <div class="empty" id="audit-empty">
+                  <strong>No signed audit events</strong>
+                  <p>
+                    Diagnostic, repair and rollback events appear after a device
+                    starts a session.
+                  </p>
+                </div>
+                <div
+                  class="empty error-state"
+                  id="audit-error"
+                  role="alert"
+                  hidden
+                >
+                  <strong>Audit events unavailable</strong>
+                  <p id="audit-error-message">
+                    Refresh to retry the tenant audit request.
                   </p>
                 </div>
               </div>
