@@ -20,8 +20,10 @@ SQLite, a private root-token file and no remote-command surface.
 - `/console/` and the API share an origin, so no permissive CORS policy is
   needed.
 
-This is a production-like minimum, not a high-availability layout. Back up the
-SQLite volume and restore it only while the service is stopped.
+This is a production-like minimum, not a high-availability layout. The bundled
+database lifecycle tool uses SQLite's online backup API, validates integrity,
+foreign keys and the minimum Fleet schema, rejects symlinks and never
+overwrites an existing destination.
 
 ## First start
 
@@ -106,10 +108,38 @@ a volume snapshot, deploy the new digest, and require `/healthz` plus console
 loading before removing the previous image. Rollback uses the previous image
 digest and the compatible volume snapshot.
 
+## Backup and restore drill
+
+Create a consistent backup while the service is running. Both the source and
+the existing parent directory must be canonical, non-symlink paths; database
+files must be owner-only. The destination must not exist:
+
+```bash
+node deploy/fleet/database-lifecycle.mjs backup \
+  /absolute/state/fleet.sqlite /absolute/backups/fleet-2026-08-31.sqlite
+node deploy/fleet/database-lifecycle.mjs verify \
+  /absolute/backups/fleet-2026-08-31.sqlite
+```
+
+For a recovery drill, restore into a new file, never over the active database:
+
+```bash
+node deploy/fleet/database-lifecycle.mjs restore \
+  /absolute/backups/fleet-2026-08-31.sqlite \
+  /absolute/recovery/fleet-restored.sqlite
+```
+
+Stop Fleet, point `KERNAID_FLEET_DB_PATH` at the verified restored file, start
+Fleet and require `/healthz`, tenant authentication and inventory visibility.
+Keep the previous database untouched until that validation succeeds. The root
+token is intentionally outside SQLite and must be backed up through the
+deployment secret store, not copied into a database archive.
+
 ## Targeted verification
 
 ```bash
 node deploy/fleet/verify-deployment.mjs
+node deploy/fleet/database-lifecycle.mjs verify /absolute/state/fleet.sqlite
 pnpm --filter @kernaid/fleet-control-plane build
 pnpm --filter @kernaid/fleet-console check
 KERNAID_FLEET_ROOT_TOKEN_FILE=/absolute/private/fleet-secrets/root-token \

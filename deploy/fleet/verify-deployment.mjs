@@ -11,6 +11,10 @@ const dockerfile = readFileSync(
 );
 const compose = readFileSync(join(deploymentDirectory, "compose.yaml"), "utf8");
 const dockerignore = readFileSync(join(repository, ".dockerignore"), "utf8");
+const databaseLifecycle = readFileSync(
+  join(deploymentDirectory, "database-lifecycle.mjs"),
+  "utf8",
+);
 
 assert.equal(
   dockerfile.match(
@@ -44,5 +48,11 @@ assert.doesNotMatch(compose, /^\s+KERNAID_FLEET_ROOT_TOKEN:\s/m);
 assert.match(dockerignore, /^\*\*$/m);
 assert.match(dockerignore, /^!services\/fleet-control-plane\/\*\*$/m);
 assert.match(dockerignore, /^!apps\/fleet-console\/\*\*$/m);
+
+assert.match(databaseLifecycle, /from "node:sqlite"/);
+assert.match(databaseLifecycle, /PRAGMA quick_check/);
+assert.match(databaseLifecycle, /PRAGMA foreign_key_check/);
+assert.match(databaseLifecycle, /destination already exists/);
+assert.doesNotMatch(databaseLifecycle, /process\.env/);
 
 process.stdout.write("Fleet deployment invariants verified\n");
