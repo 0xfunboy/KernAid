@@ -21,6 +21,12 @@ upload or arbitrary metadata API.
   transaction inserts the device and consumes the token.
 - Every inventory envelope is verified against the enrolled tenant/device key.
   A revoked device is rejected before replay processing.
+- Every audit event is verified with the enrolled device key using the nested
+  Rust `DeviceIdentity::sign_report` framing. Revoked and cross-tenant devices
+  fail closed.
+- Audit sequence and previous-event digest are contiguous per device/session.
+  Exact retries are idempotent; gaps, forks and superseded replays are rejected
+  transactionally and the chain tail survives restart.
 - Sequence is monotonic per device. Retrying the current byte-identical signed
   envelope is idempotent; another envelope at that sequence or an older
   sequence is rejected.
@@ -39,8 +45,10 @@ and are limited to 64 KiB.
 | `POST` | `/v1/tenants/:tenantId/enrollment-tokens`        | Tenant bearer          | One-time `enrollmentToken`, `expiresAt`      |
 | `POST` | `/v1/enrollments`                                | Signed public request  | Enroll a device                              |
 | `POST` | `/v1/inventories`                                | Signed device envelope | Insert or idempotently acknowledge inventory |
+| `POST` | `/v1/audit-events`                               | Signed device envelope | Append or idempotently acknowledge audit     |
 | `GET`  | `/v1/tenants/:tenantId/devices`                  | Tenant bearer          | `{ items: [...] }` device registry           |
 | `GET`  | `/v1/tenants/:tenantId/assets`                   | Tenant bearer          | `{ items: [...] }` latest aggregate assets   |
+| `GET`  | `/v1/tenants/:tenantId/audit-events`             | Tenant bearer          | Bounded `{ items: [...] }` digest-only audit |
 | `POST` | `/v1/tenants/:tenantId/devices/:deviceId/revoke` | Tenant bearer          | Permanently revoke ingestion                 |
 
 Tenant creation takes an exact empty object. Enrollment-token creation takes:
@@ -49,11 +57,13 @@ Tenant creation takes an exact empty object. Enrollment-token creation takes:
 { "expiresInSeconds": 300 }
 ```
 
-The enrollment and inventory bodies are the exact signed structures described
-in [`@kernaid/fleet-schemas`](../../packages/fleet-schemas/README.md). Inventory
+The enrollment, inventory and audit bodies are the exact signed structures
+described in
+[`@kernaid/fleet-schemas`](../../packages/fleet-schemas/README.md). Inventory
 accepts one signed envelope per asset so each asset retains independent signed
-provenance. List responses expose only protocol fields and aggregate counts;
-they never expose public keys, token hashes or stored envelope signatures.
+provenance. Audit POST bodies must be byte-identical canonical JSON. List
+responses expose only protocol fields, aggregate counts and audit digests;
+they never expose public keys, token hashes, raw content or stored signatures.
 
 ## Run locally
 
@@ -114,5 +124,5 @@ corepack pnpm --filter @kernaid/fleet-control-plane lint
 
 The focused API suite covers cross-tenant denial, token expiry/reuse, key-ID
 binding, signature tampering, replay/idempotency, multi-asset retention,
-revocation, unknown/private field rejection, hash-only secrets, restart
-persistence, health and optional same-origin console serving.
+revocation, audit gaps/forks, unknown/private field rejection, hash-only
+secrets, restart persistence, health and optional same-origin console serving.

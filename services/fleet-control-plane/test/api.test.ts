@@ -12,10 +12,15 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import {
+  FLEET_AUDIT_SCHEMA,
   FLEET_ENROLLMENT_SCHEMA,
   FLEET_INVENTORY_SCHEMA,
+  auditSigningBytes,
+  canonicalJson,
   enrollmentSigningBytes,
   inventorySigningBytes,
+  type AuditEnvelope,
+  type AuditEnvelopeUnsigned,
   type EnrollmentRequest,
   type EnrollmentRequestUnsigned,
   type FleetInventoryAsset,
@@ -89,6 +94,28 @@ async function api(
     method,
     headers,
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  });
+  return {
+    status: response.status,
+    body: (await response.json()) as Record<string, unknown>,
+  };
+}
+
+async function canonicalApi(
+  harness: Harness,
+  method: string,
+  path: string,
+  body: unknown,
+  token?: string,
+): Promise<HttpResult> {
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+  };
+  if (token !== undefined) headers.authorization = `Bearer ${token}`;
+  const response = await fetch(`${harness.baseUrl}${path}`, {
+    method,
+    headers,
+    body: canonicalJson(body),
   });
   return {
     status: response.status,
@@ -225,6 +252,52 @@ function signedInventory(
       device.privateKey,
     ).toString("base64url"),
   };
+}
+
+function signedAudit(
+  harness: Harness,
+  tenant: TenantCredentials,
+  device: DeviceCredentials,
+  input: {
+    sessionId: string;
+    eventId: string;
+    sequence: number;
+    previousEventSha256: string | null;
+    kind?: AuditEnvelopeUnsigned["kind"];
+    outcome?: AuditEnvelopeUnsigned["outcome"];
+    risk?: AuditEnvelopeUnsigned["risk"];
+    actionId?: string | null;
+  },
+): AuditEnvelope {
+  const unsigned: AuditEnvelopeUnsigned = {
+    schema: FLEET_AUDIT_SCHEMA,
+    tenantId: tenant.tenantId,
+    deviceId: device.deviceId,
+    sessionId: input.sessionId,
+    eventId: input.eventId,
+    sequence: input.sequence,
+    previousEventSha256: input.previousEventSha256,
+    occurredAt: new Date(harness.now.value).toISOString(),
+    kind: input.kind ?? "diagnostic_started",
+    outcome: input.outcome ?? "started",
+    risk: input.risk ?? "R0",
+    actionId: input.actionId ?? null,
+    targetSha256: createHash("sha256").update("target").digest("hex"),
+    reportSha256: null,
+    evidenceSha256: [],
+  };
+  return {
+    ...unsigned,
+    signature: sign(
+      null,
+      auditSigningBytes(unsigned),
+      device.privateKey,
+    ).toString("base64url"),
+  };
+}
+
+function auditEventSha256(envelope: AuditEnvelope): string {
+  return createHash("sha256").update(canonicalJson(envelope)).digest("hex");
 }
 
 test("root and tenant administration are strictly isolated", async () => {
@@ -617,6 +690,276 @@ test("optional console files are served same-origin with a restrictive CSP", asy
       /default-src 'self'/,
     );
     assert.match(await response.text(), /<title>Fleet<\/title>/);
+  } finally {
+    await destroyHarness(harness);
+  }
+});
+
+test("signed audit events ingest once and expose only minimized tenant data", async () => {
+  const harness = await createHarness();
+  try {
+    const tenant = await createTenant(harness);
+    const device = await enroll(harness, tenant, "audit-device");
+    const event = signedAudit(harness, tenant, device, {
+      sessionId: "session-one",
+      eventId: "event-one",
+      sequence: 1,
+      previousEventSha256: null,
+    });
+
+    const accepted = await canonicalApi(
+      harness,
+      "POST",
+      "/v1/audit-events",
+      event,
+    );
+    assert.equal(accepted.status, 201);
+    assert.equal(accepted.body.idempotent, false);
+    const replay = await canonicalApi(
+      harness,
+      "POST",
+      "/v1/audit-events",
+      event,
+    );
+    assert.equal(replay.status, 200);
+    assert.equal(replay.body.idempotent, true);
+
+    const listed = await api(
+      harness,
+      "GET",
+      `/v1/tenants/${tenant.tenantId}/audit-events`,
+      undefined,
+      tenant.adminToken,
+    );
+    assert.equal(listed.status, 200);
+    const items = listed.body.items as Array<Record<string, unknown>>;
+    assert.equal(items.length, 1);
+    assert.equal(items[0]?.eventSha256, auditEventSha256(event));
+    assert.equal("signature" in (items[0] ?? {}), false);
+    assert.equal("envelope" in (items[0] ?? {}), false);
+    assert.equal("envelopeJson" in (items[0] ?? {}), false);
+  } finally {
+    await destroyHarness(harness);
+  }
+});
+
+test("audit sessions reject gaps and forks while accepting the contiguous chain", async () => {
+  const harness = await createHarness();
+  try {
+    const tenant = await createTenant(harness);
+    const device = await enroll(harness, tenant, "chain-device");
+    const first = signedAudit(harness, tenant, device, {
+      sessionId: "chain-session",
+      eventId: "chain-one",
+      sequence: 1,
+      previousEventSha256: null,
+    });
+    assert.equal(
+      (await canonicalApi(harness, "POST", "/v1/audit-events", first)).status,
+      201,
+    );
+
+    const gap = signedAudit(harness, tenant, device, {
+      sessionId: "chain-session",
+      eventId: "chain-three",
+      sequence: 3,
+      previousEventSha256: auditEventSha256(first),
+    });
+    const gapResult = await canonicalApi(
+      harness,
+      "POST",
+      "/v1/audit-events",
+      gap,
+    );
+    assert.equal(gapResult.status, 409);
+    assert.equal(gapResult.body.error, "sequence_gap");
+
+    const fork = signedAudit(harness, tenant, device, {
+      sessionId: "chain-session",
+      eventId: "chain-one-fork",
+      sequence: 1,
+      previousEventSha256: null,
+    });
+    const forkResult = await canonicalApi(
+      harness,
+      "POST",
+      "/v1/audit-events",
+      fork,
+    );
+    assert.equal(forkResult.status, 409);
+    assert.equal(forkResult.body.error, "chain_fork");
+
+    const second = signedAudit(harness, tenant, device, {
+      sessionId: "chain-session",
+      eventId: "chain-two",
+      sequence: 2,
+      previousEventSha256: auditEventSha256(first),
+      kind: "diagnostic_completed",
+      outcome: "succeeded",
+    });
+    assert.equal(
+      (await canonicalApi(harness, "POST", "/v1/audit-events", second)).status,
+      201,
+    );
+    const oldExactReplay = await canonicalApi(
+      harness,
+      "POST",
+      "/v1/audit-events",
+      first,
+    );
+    assert.equal(oldExactReplay.status, 200);
+    assert.equal(oldExactReplay.body.idempotent, true);
+  } finally {
+    await destroyHarness(harness);
+  }
+});
+
+test("audit ingestion fails closed for tampering, cross-tenant use, and revocation", async () => {
+  const harness = await createHarness();
+  try {
+    const tenant = await createTenant(harness);
+    const otherTenant = await createTenant(harness);
+    const device = await enroll(harness, tenant, "isolated-audit-device");
+    const valid = signedAudit(harness, tenant, device, {
+      sessionId: "isolation-session",
+      eventId: "isolation-one",
+      sequence: 1,
+      previousEventSha256: null,
+    });
+    const tampered = { ...valid, eventId: "tampered-event" };
+    assert.equal(
+      (await canonicalApi(harness, "POST", "/v1/audit-events", tampered))
+        .status,
+      401,
+    );
+
+    const crossTenant = signedAudit(harness, otherTenant, device, {
+      sessionId: "cross-session",
+      eventId: "cross-one",
+      sequence: 1,
+      previousEventSha256: null,
+    });
+    assert.equal(
+      (await canonicalApi(harness, "POST", "/v1/audit-events", crossTenant))
+        .status,
+      401,
+    );
+
+    assert.equal(
+      (
+        await api(
+          harness,
+          "POST",
+          `/v1/tenants/${tenant.tenantId}/devices/${device.deviceId}/revoke`,
+          {},
+          tenant.adminToken,
+        )
+      ).status,
+      200,
+    );
+    assert.equal(
+      (await canonicalApi(harness, "POST", "/v1/audit-events", valid)).status,
+      403,
+    );
+    assert.equal(
+      (
+        await api(
+          harness,
+          "GET",
+          `/v1/tenants/${tenant.tenantId}/audit-events`,
+          undefined,
+          otherTenant.adminToken,
+        )
+      ).status,
+      401,
+    );
+  } finally {
+    await destroyHarness(harness);
+  }
+});
+
+test("audit chain state and events survive a SQLite restart", async () => {
+  let harness = await createHarness();
+  const directory = harness.directory;
+  const now = harness.now;
+  try {
+    const tenant = await createTenant(harness);
+    const device = await enroll(harness, tenant, "restart-audit-device");
+    const first = signedAudit(harness, tenant, device, {
+      sessionId: "restart-session",
+      eventId: "restart-one",
+      sequence: 1,
+      previousEventSha256: null,
+    });
+    assert.equal(
+      (await canonicalApi(harness, "POST", "/v1/audit-events", first)).status,
+      201,
+    );
+    await destroyHarness(harness, false);
+
+    harness = await createHarness({ directory, now });
+    const second = signedAudit(harness, tenant, device, {
+      sessionId: "restart-session",
+      eventId: "restart-two",
+      sequence: 2,
+      previousEventSha256: auditEventSha256(first),
+      kind: "diagnostic_completed",
+      outcome: "succeeded",
+    });
+    assert.equal(
+      (await canonicalApi(harness, "POST", "/v1/audit-events", second)).status,
+      201,
+    );
+    const listed = await api(
+      harness,
+      "GET",
+      `/v1/tenants/${tenant.tenantId}/audit-events`,
+      undefined,
+      tenant.adminToken,
+    );
+    assert.equal((listed.body.items as unknown[]).length, 2);
+  } finally {
+    await destroyHarness(harness);
+  }
+});
+
+test("audit input rejects non-canonical or privacy-expanding content", async () => {
+  const harness = await createHarness();
+  try {
+    const tenant = await createTenant(harness);
+    const device = await enroll(harness, tenant, "privacy-audit-device");
+    const event = signedAudit(harness, tenant, device, {
+      sessionId: "privacy-session",
+      eventId: "privacy-one",
+      sequence: 1,
+      previousEventSha256: null,
+    });
+    assert.equal(
+      (await api(harness, "POST", "/v1/audit-events", event)).status,
+      400,
+    );
+    assert.equal(
+      (
+        await canonicalApi(harness, "POST", "/v1/audit-events", {
+          ...event,
+          rawLog: "PRIVATE_CANARY",
+        })
+      ).status,
+      400,
+    );
+    assert.equal(
+      (await canonicalApi(harness, "POST", "/v1/audit-events", event)).status,
+      201,
+    );
+
+    const database = new DatabaseSync(harness.databasePath, { readOnly: true });
+    const canary = database
+      .prepare(
+        "SELECT COUNT(*) AS count FROM audit_events WHERE instr(envelope_json, 'PRIVATE_CANARY') > 0",
+      )
+      .get() as { count: number };
+    assert.equal(canary.count, 0);
+    database.close();
   } finally {
     await destroyHarness(harness);
   }
