@@ -181,7 +181,7 @@ READY_PROOF = textwrap.dedent(
                 if broker!={{"ActiveState":"active","SubState":"running","Result":"success"}}:
                     return "broker-unit"
                 active=open("/sys/class/tty/tty0/active","rb",buffering=0).read(16)
-                if active!=b"tty8\n":
+                if active!=b"tty8\\n":
                     return "active-vt"
                 return "unknown"
             except (OSError,UnicodeError,ValueError,subprocess.SubprocessError):

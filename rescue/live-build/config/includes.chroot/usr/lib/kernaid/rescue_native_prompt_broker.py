@@ -253,7 +253,9 @@ def _receive(connection: socket.socket) -> bytes:
     return bytes(payload)
 
 
-def _tool(arguments: tuple[str, ...]) -> tuple[int, bytes]:
+def _tool(
+    arguments: tuple[str, ...], *, timeout: float = TOOL_TIMEOUT_SECONDS
+) -> tuple[int, bytes]:
     try:
         result = subprocess.run(
             arguments,
@@ -261,7 +263,7 @@ def _tool(arguments: tuple[str, ...]) -> tuple[int, bytes]:
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             check=False,
-            timeout=TOOL_TIMEOUT_SECONDS,
+            timeout=timeout,
             env={"LC_ALL": "C", "PATH": "/usr/bin:/bin", "SYSTEMD_COLORS": "0"},
             close_fds=True,
         )
@@ -549,31 +551,18 @@ class PromptController:
                 return "busy"
             _write_return_vt(return_vt)
             try:
+                # The prompt unit is Type=notify and emits READY only after
+                # its tty is foreground-safe, echo is disabled and the prompt
+                # has been rendered.  Let systemd complete that one bounded
+                # start job instead of racing asynchronous state snapshots.
                 code, output = _tool(
-                    ("/usr/bin/systemctl", "start", "--no-block", PROMPT_UNIT)
+                    ("/usr/bin/systemctl", "start", PROMPT_UNIT),
+                    timeout=START_TIMEOUT_SECONDS,
                 )
                 if code != 0 or output:
                     raise BrokerFailure
-                deadline = time.monotonic() + START_TIMEOUT_SECONDS
-                while time.monotonic() < deadline:
-                    state, substate, result = _unit_state()
-                    if (state, substate, result) == ("active", "running", "success"):
-                        break
-                    # `systemctl start --no-block` can return before systemd
-                    # publishes the queued job as `activating`.  During that
-                    # bounded hand-off the unit still reports its previous
-                    # clean inactive state.  Wait for the job instead of
-                    # cancelling it immediately; every other inactive or
-                    # failed state remains a closed failure.
-                    if state == "activating" or (
-                        state == "inactive"
-                        and substate == "dead"
-                        and result in {"", "success"}
-                    ):
-                        time.sleep(0.05)
-                        continue
-                    raise BrokerFailure
-                else:
+                state, substate, result = _unit_state()
+                if (state, substate, result) != ("active", "running", "success"):
                     raise BrokerFailure
                 _switch_vt(PROMPT_VT)
             except BrokerFailure:
