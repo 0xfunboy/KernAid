@@ -30,6 +30,11 @@ SQLite, a private root-token file and no remote-command surface.
   only in process memory. The browser cookie is Secure, HttpOnly, SameSite
   Strict and CSRF-bound; logout, expiry, credential revocation and restart
   invalidate it.
+- Every production backup is a private three-file bundle containing the
+  standalone SQLite image, a bounded canonical manifest and a detached
+  Ed25519 signature made with the already provisioned service-receipt key. The
+  signing key is read only from its owner-only PKCS#8 file; key material is
+  never accepted through arguments, environment variables or standard input.
 
 This is a production-like minimum, not a high-availability layout. The bundled
 database lifecycle tool uses SQLite's online backup API, validates integrity,
@@ -143,24 +148,48 @@ digest and the compatible volume snapshot.
 
 ## Backup and restore drill
 
-Create a consistent backup while the service is running. Both the source and
-the existing parent directory must be canonical, non-symlink paths; database
-files must be owner-only. The destination must not exist:
+Create a consistent signed bundle while the service is running. The bundle
+directory contains exactly `fleet.sqlite`, `manifest.json` and `manifest.sig`.
+The canonical manifest schema is
+`dev.kernaid.fleet.database-backup-manifest.v1`; it binds the exact database
+SHA-256 and byte count, SQLite `user_version`, complete sorted table inventory
+and RFC 3339 creation time. Its Ed25519 input is:
+
+```text
+kernaid:fleet:database-backup:v1\0 || canonical manifest JSON
+```
+
+All paths must be absolute, canonical and non-symlink. Database, private key,
+bundle and restored files must be owner-only; bundle/recovery parent
+directories must be mode `0700`. The public anchor may be world-readable but
+must not be writable by group or other. New destinations must not exist.
+Private key content is never a CLI argument: the final parameter below is only
+the path to the existing owner-only service key file.
 
 ```bash
 node deploy/fleet/database-lifecycle.mjs backup \
-  /absolute/state/fleet.sqlite /absolute/backups/fleet-2026-08-31.sqlite
+  /absolute/state/fleet.sqlite \
+  /absolute/backups/fleet-20260831T120000.000Z-manual.backup \
+  /absolute/private/fleet-secrets/receipt-signing-key.pk8
 node deploy/fleet/database-lifecycle.mjs verify \
-  /absolute/backups/fleet-2026-08-31.sqlite
+  /absolute/backups/fleet-20260831T120000.000Z-manual.backup \
+  /absolute/private/fleet-secrets/receipt.public
 ```
 
-For a recovery drill, restore into a new file, never over the active database:
+`verify` is fully offline and requires both the manifest signature and public
+trust anchor before hashing or accepting the database. For a recovery drill,
+restore exact attested bytes into a new file, never over the active database:
 
 ```bash
 node deploy/fleet/database-lifecycle.mjs restore \
-  /absolute/backups/fleet-2026-08-31.sqlite \
+  /absolute/backups/fleet-20260831T120000.000Z-manual.backup \
+  /absolute/private/fleet-secrets/receipt.public \
   /absolute/recovery/fleet-restored.sqlite
 ```
+
+`inspect <live-database>` remains available only for local SQLite health and
+schema inspection. It is explicitly not a signed backup verification mode;
+`verify` and `restore` never accept a bare legacy database.
 
 Stop Fleet, point `KERNAID_FLEET_DB_PATH` at the verified restored file, start
 Fleet and require `/healthz`, tenant authentication and inventory visibility.
@@ -168,26 +197,34 @@ Keep the previous database untouched until that validation succeeds. The root
 token is intentionally outside SQLite and must be backed up through the
 deployment secret store, not copied into a database archive.
 
-For a single-node deployment, `scheduled-backup.mjs` wraps the same verified
-online-backup boundary and retains only exact owner-only backup files. It
-creates and verifies the new backup before rotating an exact bounded set; a
-failed backup never removes an older copy:
+For a single-node deployment, `scheduled-backup.mjs` creates the signed bundle,
+then independently verifies it with the public anchor before considering
+rotation. Every retained bundle is reverified first. Rotation renames an
+obsolete directory out of the active namespace before deleting its three
+members, so DB/manifest/signature are treated as one logical unit. A failed,
+tampered or wrong-key new bundle is removed without deleting any previously
+verified backup:
 
 ```bash
 node deploy/fleet/scheduled-backup.mjs \
-  /absolute/state/fleet.sqlite /absolute/private/backups 14
+  /absolute/state/fleet.sqlite /absolute/private/backups 14 \
+  /absolute/private/fleet-secrets/receipt-signing-key.pk8 \
+  /absolute/private/fleet-secrets/receipt.public
 ```
 
 The example units in `deploy/fleet/systemd/` run that command daily with a
 persistent timer. Adapt only the absolute installation/state paths, keep the
 database read-only to the backup service and make its dedicated backup
-directory mode `0700`.
+directory mode `0700`. Install the service key mode `0400` and public anchor
+mode `0444` at the absolute paths shown in the unit, or adapt those paths
+without moving key material into environment variables.
 
 ## Targeted verification
 
 ```bash
 node deploy/fleet/verify-deployment.mjs
-node deploy/fleet/database-lifecycle.mjs verify /absolute/state/fleet.sqlite
+node --test deploy/fleet/backup-lifecycle.test.mjs
+node deploy/fleet/database-lifecycle.mjs inspect /absolute/state/fleet.sqlite
 pnpm --filter @kernaid/fleet-control-plane build
 pnpm --filter @kernaid/fleet-console check
 KERNAID_FLEET_ROOT_TOKEN_FILE=/absolute/private/fleet-secrets/root-token \

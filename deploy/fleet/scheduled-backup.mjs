@@ -6,34 +6,47 @@ import {
   openSync,
   readdirSync,
   realpathSync,
+  renameSync,
+  rmdirSync,
   unlinkSync,
 } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 process.umask(0o077);
 
-const BACKUP_NAME = /^fleet-(\d{8}T\d{6}\.\d{3}Z)-(\d+)\.sqlite$/u;
-const [sourceArgument, directoryArgument, retentionArgument] =
-  process.argv.slice(2);
+const BACKUP_NAME = /^fleet-(\d{8}T\d{6}\.\d{3}Z)-(\d+)\.backup$/u;
+const BUNDLE_FILES = ["fleet.sqlite", "manifest.json", "manifest.sig"].sort();
+const [
+  sourceArgument,
+  directoryArgument,
+  retentionArgument,
+  signingKeyArgument,
+  trustAnchorArgument,
+] = process.argv.slice(2);
 const retention = Number(retentionArgument);
 
 if (
   sourceArgument === undefined ||
   directoryArgument === undefined ||
   retentionArgument === undefined ||
+  signingKeyArgument === undefined ||
+  trustAnchorArgument === undefined ||
   !Number.isSafeInteger(retention) ||
   retention < 2 ||
   retention > 90
 ) {
   fail(
-    "usage: scheduled-backup.mjs <database> <backup-directory> <retention-count:2..90>",
+    "usage: scheduled-backup.mjs <database> <backup-directory> <retention-count:2..90> <owner-only-signing-key-file> <trust-anchor-file>",
   );
 }
 
 const source = canonicalAbsolute(sourceArgument, "database");
 const directory = canonicalAbsolute(directoryArgument, "backup directory");
+const signingKey = canonicalAbsolute(signingKeyArgument, "signing key");
+const trustAnchor = canonicalAbsolute(trustAnchorArgument, "trust anchor");
 assertPrivateDirectory(directory);
 if (dirname(source) === directory) {
   fail("backup directory must be separate from the live database directory");
@@ -43,7 +56,7 @@ const timestamp = new Date()
   .toISOString()
   .replaceAll("-", "")
   .replaceAll(":", "");
-const destinationName = `fleet-${timestamp}-${process.pid}.sqlite`;
+const destinationName = `fleet-${timestamp}-${process.pid}.backup`;
 if (!BACKUP_NAME.test(destinationName)) fail("could not derive backup name");
 const destination = join(directory, destinationName);
 
@@ -51,31 +64,45 @@ const lifecycle = resolve(
   dirname(fileURLToPath(import.meta.url)),
   "database-lifecycle.mjs",
 );
-const child = spawnSync(
-  process.execPath,
-  [lifecycle, "backup", source, destination],
-  {
-    encoding: "utf8",
-    env: {},
-    maxBuffer: 64 * 1024,
-    stdio: ["ignore", "pipe", "pipe"],
-    timeout: 15 * 60 * 1_000,
-  },
+const created = runLifecycle(
+  ["backup", source, destination, signingKey],
+  "backup",
 );
-if (child.error !== undefined || child.status !== 0 || child.signal !== null) {
-  fail("online Fleet backup failed");
+let newBundleVerified = false;
+try {
+  const verified = runLifecycle(["verify", destination, trustAnchor], "verify");
+  if (
+    created.databaseSha256 !== verified.databaseSha256 ||
+    created.sizeBytes !== verified.sizeBytes ||
+    created.userVersion !== verified.userVersion ||
+    created.tableCount !== verified.tableCount
+  ) {
+    fail("new backup verification receipt does not match creation receipt");
+  }
+  newBundleVerified = true;
+} finally {
+  if (!newBundleVerified) removeBundleAtomically(destination, directory);
 }
-if (child.stderr !== "")
-  fail("online Fleet backup emitted unexpected diagnostics");
-const result = parseLifecycleResult(child.stdout);
 
-const backups = readdirSync(directory)
-  .filter((name) => BACKUP_NAME.test(name))
+const backups = readdirSync(directory, { withFileTypes: true })
+  .filter((entry) => BACKUP_NAME.test(entry.name))
+  .map((entry) => {
+    if (!entry.isDirectory() || entry.isSymbolicLink()) {
+      fail("retained backup must be a regular bundle directory");
+    }
+    return entry.name;
+  })
   .sort();
-for (const name of backups) assertPrivateBackup(join(directory, name));
+
+for (const name of backups) {
+  assertPrivateBundle(join(directory, name));
+  runLifecycle(["verify", join(directory, name), trustAnchor], "verify");
+}
 
 const obsolete = backups.slice(0, Math.max(0, backups.length - retention));
-for (const name of obsolete) unlinkSync(join(directory, name));
+for (const name of obsolete) {
+  removeBundleAtomically(join(directory, name), directory);
+}
 syncDirectory(directory);
 
 process.stdout.write(
@@ -84,10 +111,75 @@ process.stdout.write(
     backup: destinationName,
     retained: backups.length - obsolete.length,
     removed: obsolete.length,
-    userVersion: result.userVersion,
-    tableCount: result.tableCount,
+    createdAt: created.createdAt,
+    databaseSha256: created.databaseSha256,
+    sizeBytes: created.sizeBytes,
+    userVersion: created.userVersion,
+    tableCount: created.tableCount,
   })}\n`,
 );
+
+function runLifecycle(arguments_, expectedOperation) {
+  const child = spawnSync(process.execPath, [lifecycle, ...arguments_], {
+    encoding: "utf8",
+    env: {},
+    maxBuffer: 64 * 1024,
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: 15 * 60 * 1_000,
+  });
+  if (
+    child.error !== undefined ||
+    child.status !== 0 ||
+    child.signal !== null
+  ) {
+    fail(`Fleet backup ${expectedOperation} failed`);
+  }
+  if (child.stderr !== "") {
+    fail(`Fleet backup ${expectedOperation} emitted unexpected diagnostics`);
+  }
+  return parseLifecycleResult(child.stdout, expectedOperation);
+}
+
+function parseLifecycleResult(output, expectedOperation) {
+  if (output.length === 0 || output.length > 4096 || !output.endsWith("\n")) {
+    fail("Fleet backup lifecycle returned an invalid receipt");
+  }
+  let value;
+  try {
+    value = JSON.parse(output);
+  } catch {
+    fail("Fleet backup lifecycle returned an invalid receipt");
+  }
+  const expectedKeys = [
+    "bundle",
+    "createdAt",
+    "databaseSha256",
+    "operation",
+    "sizeBytes",
+    "tableCount",
+    "userVersion",
+  ];
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    value.operation !== expectedOperation ||
+    !BACKUP_NAME.test(value.bundle ?? "") ||
+    typeof value.createdAt !== "string" ||
+    new Date(value.createdAt).toISOString() !== value.createdAt ||
+    !/^[0-9a-f]{64}$/.test(value.databaseSha256 ?? "") ||
+    !Number.isSafeInteger(value.sizeBytes) ||
+    value.sizeBytes < 1 ||
+    !Number.isSafeInteger(value.userVersion) ||
+    value.userVersion < 1 ||
+    !Number.isSafeInteger(value.tableCount) ||
+    value.tableCount < 1 ||
+    !sameArray(Object.keys(value).sort(), expectedKeys.sort())
+  ) {
+    fail("Fleet backup lifecycle returned an invalid receipt");
+  }
+  return value;
+}
 
 function canonicalAbsolute(argument, label) {
   if (!isAbsolute(argument)) fail(`${label} path must be absolute`);
@@ -106,40 +198,34 @@ function assertPrivateDirectory(path) {
   }
 }
 
-function assertPrivateBackup(path) {
-  const entry = lstatSync(path);
-  if (!entry.isFile() || entry.isSymbolicLink() || entry.size === 0) {
-    fail("retained backup must be a non-empty regular file");
+function assertPrivateBundle(path) {
+  assertPrivateDirectory(path);
+  const entries = readdirSync(path).sort();
+  if (!sameArray(entries, BUNDLE_FILES)) {
+    fail("retained bundle must contain exactly its three signed files");
   }
-  if (process.platform !== "win32" && (entry.mode & 0o077) !== 0) {
-    fail("retained backup permissions must deny group and other access");
+  for (const name of entries) {
+    const entry = lstatSync(join(path, name));
+    if (!entry.isFile() || entry.isSymbolicLink() || entry.size === 0) {
+      fail("retained bundle files must be non-empty regular files");
+    }
+    if (process.platform !== "win32" && (entry.mode & 0o077) !== 0) {
+      fail("retained bundle files must deny group and other access");
+    }
   }
 }
 
-function parseLifecycleResult(output) {
-  if (output.length === 0 || output.length > 4096 || !output.endsWith("\n")) {
-    fail("online Fleet backup returned an invalid receipt");
-  }
-  let value;
-  try {
-    value = JSON.parse(output);
-  } catch {
-    fail("online Fleet backup returned an invalid receipt");
-  }
-  if (
-    value === null ||
-    typeof value !== "object" ||
-    Array.isArray(value) ||
-    value.operation !== "backup" ||
-    !Number.isSafeInteger(value.userVersion) ||
-    value.userVersion < 1 ||
-    !Number.isSafeInteger(value.tableCount) ||
-    value.tableCount < 1 ||
-    Object.keys(value).sort().join(",") !== "operation,tableCount,userVersion"
-  ) {
-    fail("online Fleet backup returned an invalid receipt");
-  }
-  return value;
+function removeBundleAtomically(path, parent) {
+  assertPrivateBundle(path);
+  const tombstone = join(
+    parent,
+    `.delete-${process.pid}-${randomBytes(12).toString("hex")}`,
+  );
+  renameSync(path, tombstone);
+  syncDirectory(parent);
+  for (const name of BUNDLE_FILES) unlinkSync(join(tombstone, name));
+  rmdirSync(tombstone);
+  syncDirectory(parent);
 }
 
 function syncDirectory(path) {
@@ -149,6 +235,13 @@ function syncDirectory(path) {
   } finally {
     closeSync(descriptor);
   }
+}
+
+function sameArray(left, right) {
+  return (
+    left.length === right.length &&
+    left.every((item, index) => item === right[index])
+  );
 }
 
 function fail(message) {
