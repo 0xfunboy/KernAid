@@ -62,6 +62,15 @@ class FakeQmp:
 
 
 class NativeVaultPromptSmokeTests(unittest.TestCase):
+    def test_native_prompt_proofs_require_the_activated_socket_state(self) -> None:
+        for proof in (native_prompt_smoke.PRE_PROOF, native_prompt_smoke.POST_PROOF):
+            with self.subTest(proof=proof[:32]):
+                self.assertNotIn(b'"SubState":"listening"', proof)
+                self.assertIn(
+                    b'socket=={"ActiveState":"active","SubState":"running","Result":"success"}',
+                    proof,
+                )
+
     def test_frame_capture_refreshes_qmp_deadline_and_closes_with_safe_stage(self) -> None:
         class FrameQmp:
             def __init__(self, failure=None) -> None:

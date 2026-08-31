@@ -479,6 +479,64 @@ class RescueTauriBoundaryTests(unittest.TestCase):
             ):
                 guest_ui._host_privileged_sockets_ready()
 
+    def test_native_prompt_waits_for_activation_and_attests_the_broker(self) -> None:
+        metadata = mock.Mock(
+            st_mode=stat.S_IFSOCK | 0o660,
+            st_uid=0,
+            st_gid=77,
+            st_nlink=1,
+        )
+        socket_base = {"ActiveState": "active", "Result": "success"}
+        broker = {
+            "ActiveState": "active",
+            "SubState": "running",
+            "Result": "success",
+            "MainPID": "431",
+        }
+        with (
+            mock.patch.object(
+                guest_ui.grp, "getgrnam", return_value=mock.Mock(gr_gid=77)
+            ),
+            mock.patch.object(guest_ui.os, "lstat", return_value=metadata),
+            mock.patch.object(
+                guest_ui,
+                "_systemctl_show",
+                return_value=socket_base | {"SubState": "listening"},
+            ) as show,
+        ):
+            self.assertFalse(guest_ui._host_native_prompt_ready(True))
+            show.assert_called_once_with(
+                guest_ui.NATIVE_PROMPT_SOCKET_UNIT,
+                ("ActiveState", "SubState", "Result"),
+            )
+        with (
+            mock.patch.object(
+                guest_ui.grp, "getgrnam", return_value=mock.Mock(gr_gid=77)
+            ),
+            mock.patch.object(guest_ui.os, "lstat", return_value=metadata),
+            mock.patch.object(
+                guest_ui,
+                "_systemctl_show",
+                side_effect=[socket_base | {"SubState": "running"}, broker],
+            ),
+        ):
+            self.assertTrue(guest_ui._host_native_prompt_ready(True))
+        with (
+            mock.patch.object(
+                guest_ui.grp, "getgrnam", return_value=mock.Mock(gr_gid=77)
+            ),
+            mock.patch.object(guest_ui.os, "lstat", return_value=metadata),
+            mock.patch.object(
+                guest_ui,
+                "_systemctl_show",
+                side_effect=[
+                    socket_base | {"SubState": "running"},
+                    broker | {"MainPID": "0"},
+                ],
+            ),
+        ):
+            self.assertFalse(guest_ui._host_native_prompt_ready(True))
+
     def test_guest_requires_the_default_display_xorg_vt_to_be_active(self) -> None:
         self.assertEqual(guest_ui._active_vt_from_payload(b"tty7\n"), 7)
         self.assertEqual(

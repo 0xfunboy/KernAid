@@ -60,6 +60,7 @@ SANDBOX_STATUS_NORMAL = (
 NATIVE_PROMPT_FLAG = "kernaid.native-prompt=vt-v1"
 NATIVE_PROMPT_SOCKET = "/run/kernaid-rescue-native-prompt.sock"
 NATIVE_PROMPT_SOCKET_UNIT = "kernaid-rescue-native-prompt.socket"
+NATIVE_PROMPT_SERVICE_UNIT = "kernaid-rescue-native-prompt.service"
 SANDBOX_FAILURE_PREFIX = "KERNAID_RESCUE_TAURI_SANDBOX_FAILURE_V1 stage="
 SHELL_FAILURE_STAGES = {
     "http",
@@ -871,13 +872,13 @@ def _host_privileged_sockets_ready() -> None:
             raise SandboxFailure(failure_stage)
 
 
-def _host_native_prompt_ready(enabled: bool) -> None:
+def _host_native_prompt_ready(enabled: bool) -> bool:
     try:
         metadata = os.lstat(NATIVE_PROMPT_SOCKET)
     except FileNotFoundError:
         if enabled:
             raise SandboxFailure("socket-native-prompt")
-        return
+        return True
     except OSError as error:
         raise SandboxFailure("socket-native-prompt") from error
     if not enabled:
@@ -890,8 +891,10 @@ def _host_native_prompt_ready(enabled: bool) -> None:
     except KeyError as error:
         raise SandboxFailure("socket-native-prompt") from error
     if (
-        values
-        != {"ActiveState": "active", "SubState": "listening", "Result": "success"}
+        values is None
+        or values.get("ActiveState") != "active"
+        or values.get("Result") != "success"
+        or values.get("SubState") not in {"listening", "running"}
         or not stat.S_ISSOCK(metadata.st_mode)
         or metadata.st_uid != 0
         or metadata.st_gid != prompt_gid
@@ -899,6 +902,27 @@ def _host_native_prompt_ready(enabled: bool) -> None:
         or stat.S_IMODE(metadata.st_mode) != 0o660
     ):
         raise SandboxFailure("socket-native-prompt")
+    # Accept the lazy socket only as a bootstrap transition.  The Tauri shell
+    # must complete its authenticated status exchange before any WebKit window
+    # is accepted; for an Accept=no systemd socket that leaves the socket and
+    # its single broker in the running state.
+    if values["SubState"] == "listening":
+        return False
+    broker = _systemctl_show(
+        NATIVE_PROMPT_SERVICE_UNIT,
+        ("ActiveState", "SubState", "Result", "MainPID"),
+    )
+    if (
+        broker is None
+        or broker.get("Result") != "success"
+        or not broker.get("MainPID", "").isdecimal()
+    ):
+        raise SandboxFailure("socket-native-prompt")
+    return (
+        broker.get("ActiveState") == "active"
+        and broker.get("SubState") == "running"
+        and int(broker["MainPID"]) > 1
+    )
 
 
 def _shell_service_ready(_qemu_probe: bool) -> int:
@@ -1463,7 +1487,10 @@ def attest() -> tuple[int, int, bool, bool]:
             time.sleep(0.5)
             continue
         _host_privileged_sockets_ready()
-        _host_native_prompt_ready(native_prompt)
+        if not _host_native_prompt_ready(native_prompt):
+            last_stage = "socket-native-prompt"
+            time.sleep(0.1)
+            continue
         try:
             xauthority_payload = _trusted_xauthority(ui)
         except FileNotFoundError:

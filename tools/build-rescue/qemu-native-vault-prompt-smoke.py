@@ -88,7 +88,7 @@ PRE_PROOF = textwrap.dedent(
             endpoint=os.lstat("/run/kernaid-rescue-native-prompt.sock")
             active=open("/sys/class/tty/tty0/active","rb",buffering=0).read(16)
         except OSError: return False
-        return socket=={{"ActiveState":"active","SubState":"listening","Result":"success"}} and broker is not None and broker["ActiveState"]=="active" and broker["SubState"]=="running" and broker["Result"]=="success" and broker["MainPID"].isdecimal() and int(broker["MainPID"])>1 and prompt is not None and prompt["ActiveState"]=="inactive" and prompt["SubState"]=="dead" and prompt["Result"] in ("","success") and desk is not None and desk["ActiveState"]=="active" and desk["SubState"]=="running" and desk["Result"]=="success" and desk["MainPID"].isdecimal() and int(desk["MainPID"])>1 and stat.S_ISSOCK(endpoint.st_mode) and endpoint.st_uid==0 and endpoint.st_nlink==1 and stat.S_IMODE(endpoint.st_mode)==0o660 and re.fullmatch(rb"tty([1-9]|[1-5][0-9]|6[0-3])\\n",active) is not None and active!=b"tty8\\n"
+        return socket=={{"ActiveState":"active","SubState":"running","Result":"success"}} and broker is not None and broker["ActiveState"]=="active" and broker["SubState"]=="running" and broker["Result"]=="success" and broker["MainPID"].isdecimal() and int(broker["MainPID"])>1 and prompt is not None and prompt["ActiveState"]=="inactive" and prompt["SubState"]=="dead" and prompt["Result"] in ("","success") and desk is not None and desk["ActiveState"]=="active" and desk["SubState"]=="running" and desk["Result"]=="success" and desk["MainPID"].isdecimal() and int(desk["MainPID"])>1 and stat.S_ISSOCK(endpoint.st_mode) and endpoint.st_uid==0 and endpoint.st_nlink==1 and stat.S_IMODE(endpoint.st_mode)==0o660 and re.fullmatch(rb"tty([1-9]|[1-5][0-9]|6[0-3])\\n",active) is not None and active!=b"tty8\\n"
     deadline=time.monotonic()+45
     while time.monotonic()<deadline:
         try:
@@ -105,7 +105,7 @@ PRE_PROOF = textwrap.dedent(
                 if tokens.count("boot=live")!=1 or tokens.count(FLAG)!=1:
                     return "cmdline"
                 socket=show("kernaid-rescue-native-prompt.socket",("ActiveState","SubState","Result"))
-                if socket!={{"ActiveState":"active","SubState":"listening","Result":"success"}}:
+                if socket!={{"ActiveState":"active","SubState":"running","Result":"success"}}:
                     return "socket-unit"
                 broker=show("kernaid-rescue-native-prompt.service",("ActiveState","SubState","Result","MainPID"))
                 if broker is None or broker["ActiveState"]!="active" or broker["SubState"]!="running" or broker["Result"]!="success" or not broker["MainPID"].isdecimal() or int(broker["MainPID"])<=1:
@@ -190,7 +190,7 @@ POST_PROOF = textwrap.dedent(
         desk=show("kernaid-rescue-desk-shell.service",("ActiveState","SubState","Result"))
         try: active=open("/sys/class/tty/tty0/active","rb",buffering=0).read(16)
         except OSError: return False
-        return prompt=={"ActiveState":"inactive","SubState":"dead","Result":"success"} and socket=={"ActiveState":"active","SubState":"listening","Result":"success"} and broker=={"ActiveState":"active","SubState":"running","Result":"success"} and desk=={"ActiveState":"active","SubState":"running","Result":"success"} and re.fullmatch(rb"tty([1-9]|[1-5][0-9]|6[0-3])\\n",active) is not None and active!=b"tty8\\n"
+        return prompt=={"ActiveState":"inactive","SubState":"dead","Result":"success"} and socket=={"ActiveState":"active","SubState":"running","Result":"success"} and broker=={"ActiveState":"active","SubState":"running","Result":"success"} and desk=={"ActiveState":"active","SubState":"running","Result":"success"} and re.fullmatch(rb"tty([1-9]|[1-5][0-9]|6[0-3])\\n",active) is not None and active!=b"tty8\\n"
     deadline=time.monotonic()+630
     while time.monotonic()<deadline:
         try:
