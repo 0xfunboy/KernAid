@@ -12,6 +12,7 @@ export interface FleetServiceConfig {
   databasePath: string;
   rootToken: string;
   entitlementTrustAnchor: string;
+  updateTrustAnchor: string;
   host: string;
   port: number;
   enrollmentClockSkewMs: number;
@@ -33,6 +34,10 @@ export function loadFleetServiceConfig(
   const entitlementTrustAnchorFile = requiredEnvironment(
     environment,
     "KERNAID_FLEET_ENTITLEMENT_TRUST_ANCHOR_FILE",
+  );
+  const updateTrustAnchorFile = requiredEnvironment(
+    environment,
+    "KERNAID_FLEET_UPDATE_TRUST_ANCHOR_FILE",
   );
 
   const secretDescriptor = openSync(
@@ -64,13 +69,21 @@ export function loadFleetServiceConfig(
     );
   }
 
-  const entitlementTrustAnchor = readPublicKeyFile(entitlementTrustAnchorFile);
+  const entitlementTrustAnchor = readPublicKeyFile(
+    entitlementTrustAnchorFile,
+    "KERNAID_FLEET_ENTITLEMENT_TRUST_ANCHOR_FILE",
+  );
+  const updateTrustAnchor = readPublicKeyFile(
+    updateTrustAnchorFile,
+    "KERNAID_FLEET_UPDATE_TRUST_ANCHOR_FILE",
+  );
 
   const consoleDirectory = environment.FLEET_CONSOLE_DIR;
   return {
     databasePath,
     rootToken,
     entitlementTrustAnchor,
+    updateTrustAnchor,
     host: environment.KERNAID_FLEET_HOST ?? "127.0.0.1",
     port: parseIntegerEnvironment(
       environment.KERNAID_FLEET_PORT,
@@ -90,15 +103,13 @@ export function loadFleetServiceConfig(
   };
 }
 
-function readPublicKeyFile(path: string): string {
+function readPublicKeyFile(path: string, variable: string): string {
   const descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   let value: string;
   try {
     const entry = fstatSync(descriptor);
     if (!entry.isFile() || entry.size > 1024) {
-      throw new Error(
-        "KERNAID_FLEET_ENTITLEMENT_TRUST_ANCHOR_FILE must be a bounded regular file",
-      );
+      throw new Error(`${variable} must be a bounded regular file`);
     }
     value = readFileSync(descriptor, "utf8").trim();
   } finally {
@@ -106,14 +117,12 @@ function readPublicKeyFile(path: string): string {
   }
   if (!/^[A-Za-z0-9_-]{43}$/.test(value)) {
     throw new Error(
-      "Fleet entitlement trust anchor must be raw Ed25519 base64url",
+      `${variable} must contain a raw Ed25519 base64url public key`,
     );
   }
   const decoded = Buffer.from(value, "base64url");
   if (decoded.length !== 32 || decoded.toString("base64url") !== value) {
-    throw new Error(
-      "Fleet entitlement trust anchor must be canonical base64url",
-    );
+    throw new Error(`${variable} must contain canonical base64url`);
   }
   return value;
 }

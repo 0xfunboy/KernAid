@@ -6,6 +6,7 @@ const controlPlane = new FleetControlPlane({
   databasePath: config.databasePath,
   rootToken: config.rootToken,
   entitlementTrustAnchor: config.entitlementTrustAnchor,
+  updateTrustAnchor: config.updateTrustAnchor,
   enrollmentClockSkewMs: config.enrollmentClockSkewMs,
   consoleDirectory: config.consoleDirectory,
 });
