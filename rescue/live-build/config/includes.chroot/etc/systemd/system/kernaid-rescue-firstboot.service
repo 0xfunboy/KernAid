@@ -3,7 +3,10 @@ Description=KernAid Rescue first-boot vault provisioning gate
 Requires=live-config.service
 Wants=kernaid-qemu-native-prompt-journal-proof@boot1.service
 After=live-config.service systemd-sysusers.service systemd-sysctl.service systemd-tmpfiles-setup.service
-Before=plymouth-quit.service plymouth-quit-wait.service kernaid-qemu-native-prompt-journal-proof@boot1.service kernaid-rescue-vaultd.service display-manager.service getty@tty1.service graphical.target
+# Plymouth's quit units are also pulled into Debian's multi-user transaction.
+# Do not order this gate ahead of them: the binary already tolerates a
+# completed Plymouth shutdown before it claims tty1.
+Before=kernaid-qemu-native-prompt-journal-proof@boot1.service kernaid-rescue-vaultd.service display-manager.service getty@tty1.service graphical.target
 ConditionKernelCommandLine=boot=live
 ConditionPathIsDirectory=/run/live/medium
 

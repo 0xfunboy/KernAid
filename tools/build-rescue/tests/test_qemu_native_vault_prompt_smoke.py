@@ -342,7 +342,7 @@ label live-amd64-failsafe
         ]
         self.assertEqual(len(before_lines), 1)
         self.assertEqual(
-            before_lines[0].split().count(
+            before_lines[0].removeprefix("Before=").split().count(
                 "kernaid-qemu-native-prompt-journal-proof@boot1.service"
             ),
             1,

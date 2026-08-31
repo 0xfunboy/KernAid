@@ -112,7 +112,10 @@ class RescueBootBrandingTests(unittest.TestCase):
         unit = FIRSTBOOT.read_text(encoding="utf-8")
         self.assertNotIn("ExecStartPre=", unit)
         self.assertIn("TTYPath=/dev/tty1", unit)
-        self.assertIn("Before=plymouth-quit.service plymouth-quit-wait.service", unit)
+        before = next(line for line in unit.splitlines() if line.startswith("Before="))
+        before_targets = before.removeprefix("Before=").split()
+        self.assertNotIn("plymouth-quit.service", before_targets)
+        self.assertNotIn("plymouth-quit-wait.service", before_targets)
 
         firstboot = FIRSTBOOT_SOURCE.read_text(encoding="utf-8")
         preflight = "let preflight = run_rescue_firstboot_preflight()?;"
