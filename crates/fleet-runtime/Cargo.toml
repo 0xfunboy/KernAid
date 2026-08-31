@@ -1,0 +1,16 @@
+[package]
+name = "kernaid-fleet-runtime"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+kernaid-device-identity = { path = "../device-identity" }
+kernaid-fleet-client = { path = "../fleet-client" }
+rusqlite = { version = "0.32", features = ["bundled"] }
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
