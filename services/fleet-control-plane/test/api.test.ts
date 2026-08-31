@@ -15,10 +15,14 @@ import {
   FLEET_AUDIT_SCHEMA,
   FLEET_ENROLLMENT_SCHEMA,
   FLEET_INVENTORY_SCHEMA,
+  FLEET_POLICY_BUNDLE_SCHEMA,
+  FLEET_POLICY_PULL_SCHEMA,
   auditSigningBytes,
   canonicalJson,
   enrollmentSigningBytes,
   inventorySigningBytes,
+  policyBundleSigningBytes,
+  policyPullSigningBytes,
   type AuditEnvelope,
   type AuditEnvelopeUnsigned,
   type EnrollmentRequest,
@@ -26,6 +30,11 @@ import {
   type FleetInventoryAsset,
   type InventoryEnvelope,
   type InventoryEnvelopeUnsigned,
+  type PolicyAssignments,
+  type PolicyPullRequest,
+  type PolicyPullRequestUnsigned,
+  type SignedPolicyBundle,
+  type SignedPolicyBundleUnsigned,
 } from "@kernaid/fleet-schemas";
 import { FleetControlPlane } from "../src/server.js";
 
@@ -49,6 +58,11 @@ interface DeviceCredentials {
   privateKey: KeyObject;
   publicKeySpki: string;
   deviceId: string;
+}
+
+interface PolicySigner {
+  privateKey: KeyObject;
+  publicKeySpki: string;
 }
 
 interface HttpResult {
@@ -298,6 +312,113 @@ function signedAudit(
 
 function auditEventSha256(envelope: AuditEnvelope): string {
   return createHash("sha256").update(canonicalJson(envelope)).digest("hex");
+}
+
+function makePolicySigner(): PolicySigner {
+  const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+  return {
+    privateKey,
+    publicKeySpki: Buffer.from(
+      publicKey.export({ format: "der", type: "spki" }),
+    ).toString("base64url"),
+  };
+}
+
+async function setPolicyAnchor(
+  harness: Harness,
+  tenant: TenantCredentials,
+  signer: PolicySigner,
+): Promise<HttpResult> {
+  return api(
+    harness,
+    "POST",
+    `/v1/tenants/${tenant.tenantId}/policy-trust-anchor`,
+    { publicKeySpki: signer.publicKeySpki },
+    tenant.adminToken,
+  );
+}
+
+function signedPolicy(
+  tenant: TenantCredentials,
+  signer: PolicySigner,
+  input: {
+    policyId: string;
+    revision: number;
+    assignments: PolicyAssignments;
+    retentionDays?: number;
+  },
+): SignedPolicyBundle {
+  const nowSeconds = Math.floor(INITIAL_TIME / 1000);
+  const unsigned: SignedPolicyBundleUnsigned = {
+    schema: FLEET_POLICY_BUNDLE_SCHEMA,
+    tenantId: tenant.tenantId,
+    policyId: input.policyId,
+    revision: input.revision,
+    issuedAtUnix: nowSeconds,
+    notBeforeUnix: nowSeconds,
+    offlineAllowedUntilUnix: nowSeconds + 86_400,
+    expiresAtUnix: nowSeconds + 172_800,
+    assignments: input.assignments,
+    rules: {
+      maxRisk: "R2",
+      localApprovalFrom: "R1",
+      allowedActionIds: [
+        "linux.fstab.disable-missing-uuid.v1",
+        "system.observe.noop",
+      ],
+      deniedActionIds: ["windows.registry.unsafe.v1"],
+      allowEvidenceUpload: true,
+      retentionDays: input.retentionDays ?? 90,
+      providerModes: ["enterprise", "offline", "openai_api"],
+      updateRing: "stable",
+      emergencyRollbackAlwaysAllowed: true,
+    },
+  };
+  return {
+    ...unsigned,
+    signature: sign(
+      null,
+      policyBundleSigningBytes(unsigned),
+      signer.privateKey,
+    ).toString("base64url"),
+  };
+}
+
+function signedPolicyPull(
+  harness: Harness,
+  tenant: TenantCredentials,
+  device: DeviceCredentials,
+  nonce = randomBytes(32),
+): PolicyPullRequest {
+  const unsigned: PolicyPullRequestUnsigned = {
+    schema: FLEET_POLICY_PULL_SCHEMA,
+    tenantId: tenant.tenantId,
+    deviceId: device.deviceId,
+    issuedAt: new Date(harness.now.value).toISOString(),
+    nonce: nonce.toString("base64url"),
+  };
+  return {
+    ...unsigned,
+    signature: sign(
+      null,
+      policyPullSigningBytes(unsigned),
+      device.privateKey,
+    ).toString("base64url"),
+  };
+}
+
+async function publishPolicy(
+  harness: Harness,
+  tenant: TenantCredentials,
+  bundle: SignedPolicyBundle,
+): Promise<HttpResult> {
+  return canonicalApi(
+    harness,
+    "POST",
+    `/v1/tenants/${tenant.tenantId}/policies`,
+    bundle,
+    tenant.adminToken,
+  );
 }
 
 test("root and tenant administration are strictly isolated", async () => {
@@ -1007,6 +1128,280 @@ test("audit input rejects non-canonical or privacy-expanding content", async () 
       )
       .get() as { count: number };
     assert.equal(canary.count, 0);
+    database.close();
+  } finally {
+    await destroyHarness(harness);
+  }
+});
+
+test("policy anchor and signed publication are one-way, monotonic, and tenant-bound", async () => {
+  const harness = await createHarness();
+  try {
+    const tenant = await createTenant(harness);
+    const other = await createTenant(harness);
+    const signer = makePolicySigner();
+    const otherSigner = makePolicySigner();
+
+    assert.equal((await setPolicyAnchor(harness, tenant, signer)).status, 201);
+    assert.equal((await setPolicyAnchor(harness, tenant, signer)).status, 409);
+    assert.equal(
+      (await setPolicyAnchor(harness, other, otherSigner)).status,
+      201,
+    );
+
+    const second = signedPolicy(tenant, signer, {
+      policyId: "repair-baseline",
+      revision: 2,
+      assignments: { all: true },
+    });
+    const published = await publishPolicy(harness, tenant, second);
+    assert.equal(published.status, 201);
+    assert.equal(published.body.idempotent, false);
+    const replay = await publishPolicy(harness, tenant, second);
+    assert.equal(replay.status, 200);
+    assert.equal(replay.body.idempotent, true);
+
+    const rollback = signedPolicy(tenant, signer, {
+      policyId: "repair-baseline",
+      revision: 1,
+      assignments: { all: true },
+    });
+    const rollbackResult = await publishPolicy(harness, tenant, rollback);
+    assert.equal(rollbackResult.status, 409);
+    assert.equal(rollbackResult.body.error, "policy_revision_rollback");
+
+    const conflict = signedPolicy(tenant, signer, {
+      policyId: "repair-baseline",
+      revision: 2,
+      assignments: { all: true },
+      retentionDays: 30,
+    });
+    const conflictResult = await publishPolicy(harness, tenant, conflict);
+    assert.equal(conflictResult.status, 409);
+    assert.equal(conflictResult.body.error, "policy_revision_conflict");
+
+    const third = signedPolicy(tenant, signer, {
+      policyId: "repair-baseline",
+      revision: 3,
+      assignments: { all: true },
+    });
+    const tampered = {
+      ...third,
+      rules: { ...third.rules, retentionDays: 7 },
+    };
+    assert.equal((await publishPolicy(harness, tenant, tampered)).status, 401);
+
+    assert.equal(
+      (
+        await canonicalApi(
+          harness,
+          "POST",
+          `/v1/tenants/${other.tenantId}/policies`,
+          second,
+          other.adminToken,
+        )
+      ).status,
+      403,
+    );
+    assert.equal(
+      (
+        await canonicalApi(
+          harness,
+          "POST",
+          `/v1/tenants/${tenant.tenantId}/policies`,
+          { ...third, repairCommand: "forbidden" },
+          tenant.adminToken,
+        )
+      ).status,
+      400,
+    );
+  } finally {
+    await destroyHarness(harness);
+  }
+});
+
+test("signed policy pulls return only assignments for the enrolled active device", async () => {
+  const harness = await createHarness();
+  try {
+    const tenant = await createTenant(harness);
+    const otherTenant = await createTenant(harness);
+    const signer = makePolicySigner();
+    assert.equal((await setPolicyAnchor(harness, tenant, signer)).status, 201);
+    const first = await enroll(harness, tenant, "policy-device-one");
+    const second = await enroll(harness, tenant, "policy-device-two");
+
+    const bundles = [
+      signedPolicy(tenant, signer, {
+        policyId: "all-devices",
+        revision: 1,
+        assignments: { all: true },
+      }),
+      signedPolicy(tenant, signer, {
+        policyId: "first-only",
+        revision: 1,
+        assignments: { deviceIds: [first.deviceId] },
+      }),
+      signedPolicy(tenant, signer, {
+        policyId: "second-only",
+        revision: 1,
+        assignments: { deviceIds: [second.deviceId] },
+      }),
+    ];
+    for (const bundle of bundles) {
+      assert.equal((await publishPolicy(harness, tenant, bundle)).status, 201);
+    }
+
+    const firstPull = signedPolicyPull(harness, tenant, first);
+    const firstResult = await api(
+      harness,
+      "POST",
+      "/v1/policy-pulls",
+      firstPull,
+    );
+    assert.equal(firstResult.status, 200);
+    assert.deepEqual(
+      (firstResult.body.items as SignedPolicyBundle[]).map(
+        (bundle) => bundle.policyId,
+      ),
+      ["all-devices", "first-only"],
+    );
+    const replay = await api(harness, "POST", "/v1/policy-pulls", firstPull);
+    assert.equal(replay.status, 409);
+    assert.equal(replay.body.error, "policy_pull_replay");
+
+    const secondResult = await api(
+      harness,
+      "POST",
+      "/v1/policy-pulls",
+      signedPolicyPull(harness, tenant, second),
+    );
+    assert.deepEqual(
+      (secondResult.body.items as SignedPolicyBundle[]).map(
+        (bundle) => bundle.policyId,
+      ),
+      ["all-devices", "second-only"],
+    );
+
+    const tampered = signedPolicyPull(harness, tenant, first);
+    tampered.issuedAt = new Date(harness.now.value + 1_000).toISOString();
+    assert.equal(
+      (await api(harness, "POST", "/v1/policy-pulls", tampered)).status,
+      401,
+    );
+    assert.equal(
+      (
+        await api(harness, "POST", "/v1/policy-pulls", {
+          ...signedPolicyPull(harness, tenant, first),
+          rawDiagnostics: "forbidden",
+        })
+      ).status,
+      400,
+    );
+
+    const crossTenantUnsigned: PolicyPullRequestUnsigned = {
+      ...signedPolicyPull(harness, tenant, first),
+      tenantId: otherTenant.tenantId,
+    };
+    const crossTenant: PolicyPullRequest = {
+      ...crossTenantUnsigned,
+      signature: sign(
+        null,
+        policyPullSigningBytes(crossTenantUnsigned),
+        first.privateKey,
+      ).toString("base64url"),
+    };
+    assert.equal(
+      (await api(harness, "POST", "/v1/policy-pulls", crossTenant)).status,
+      401,
+    );
+
+    assert.equal(
+      (
+        await api(
+          harness,
+          "POST",
+          `/v1/tenants/${tenant.tenantId}/devices/${first.deviceId}/revoke`,
+          {},
+          tenant.adminToken,
+        )
+      ).status,
+      200,
+    );
+    assert.equal(
+      (
+        await api(
+          harness,
+          "POST",
+          "/v1/policy-pulls",
+          signedPolicyPull(harness, tenant, first),
+        )
+      ).status,
+      403,
+    );
+  } finally {
+    await destroyHarness(harness);
+  }
+});
+
+test("policy anchor, bundle, and assignment survive SQLite restart", async () => {
+  let harness = await createHarness();
+  const directory = harness.directory;
+  const now = harness.now;
+  try {
+    const tenant = await createTenant(harness);
+    const signer = makePolicySigner();
+    const device = await enroll(harness, tenant, "persistent-policy-device");
+    await destroyHarness(harness, false);
+
+    const legacy = new DatabaseSync(harness.databasePath);
+    legacy.exec(`
+      DROP TABLE policy_pull_nonces;
+      DROP TABLE policy_assignments;
+      DROP TABLE policy_bundles;
+      DROP TABLE tenant_policy_anchors;
+      PRAGMA user_version = 2;
+    `);
+    legacy.close();
+    harness = await createHarness({ directory, now });
+
+    assert.equal((await setPolicyAnchor(harness, tenant, signer)).status, 201);
+    const bundle = signedPolicy(tenant, signer, {
+      policyId: "persistent-policy",
+      revision: 1,
+      assignments: { deviceIds: [device.deviceId] },
+    });
+    assert.equal((await publishPolicy(harness, tenant, bundle)).status, 201);
+    await destroyHarness(harness, false);
+
+    harness = await createHarness({ directory, now });
+    const pull = signedPolicyPull(harness, tenant, device);
+    const result = await api(harness, "POST", "/v1/policy-pulls", pull);
+    assert.equal(result.status, 200);
+    const items = result.body.items as SignedPolicyBundle[];
+    assert.equal(items.length, 1);
+    assert.equal(items[0]?.policyId, "persistent-policy");
+    assert.equal(items[0]?.revision, 1);
+
+    const database = new DatabaseSync(harness.databasePath, { readOnly: true });
+    const privateColumns = database
+      .prepare(
+        `SELECT COUNT(*) AS count FROM pragma_table_info('tenant_policy_anchors')
+         WHERE lower(name) LIKE '%private%' OR lower(name) LIKE '%seed%'`,
+      )
+      .get() as { count: number };
+    assert.equal(privateColumns.count, 0);
+    const version = database.prepare("PRAGMA user_version").get() as {
+      user_version: number;
+    };
+    assert.equal(version.user_version, 3);
+    const nonce = database
+      .prepare(
+        `SELECT nonce_sha256 FROM policy_pull_nonces
+         WHERE tenant_id = ? AND device_id = ?`,
+      )
+      .get(tenant.tenantId, device.deviceId) as { nonce_sha256: string };
+    assert.match(nonce.nonce_sha256, /^[0-9a-f]{64}$/);
+    assert.notEqual(nonce.nonce_sha256, pull.nonce);
     database.close();
   } finally {
     await destroyHarness(harness);

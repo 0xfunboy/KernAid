@@ -18,6 +18,9 @@ use sha2::{Digest, Sha256};
 use std::{fmt, str};
 use zeroize::Zeroizing;
 
+mod policy_pull;
+pub use policy_pull::*;
+
 /// Enrollment wire schema.
 pub const ENROLLMENT_REQUEST_SCHEMA: &str = "dev.kernaid.fleet.enrollment-request.v1";
 /// Inventory wire schema.

@@ -9,6 +9,7 @@ import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import { extname, relative, resolve, sep } from "node:path";
 import {
   FleetSchemaError,
+  MAX_POLICY_BUNDLE_BYTES,
   auditSigningBytes,
   canonicalJson,
   enrollmentSigningBytes,
@@ -17,6 +18,10 @@ import {
   expectRecord,
   expectSafeInteger,
   inventorySigningBytes,
+  parsePolicyPullRequest,
+  parseSignedPolicyBundle,
+  policyBundleSigningBytes,
+  policyPullSigningBytes,
   parseEnrollmentRequest,
   parseAuditEnvelope,
   parseInventoryEnvelope,
@@ -26,6 +31,7 @@ import {
   generateTenantId,
   deviceIdForEd25519Spki,
   hashSecret,
+  decodeBase64UrlExact,
   importEd25519Spki,
   secureSecretEqual,
   sha256Hex,
@@ -39,6 +45,9 @@ import {
   StoreReplayError,
   StoreRevokedError,
   StoreSequenceGapError,
+  StoreNonceReplayError,
+  StorePolicyConflictError,
+  StorePolicyRollbackError,
 } from "./store.js";
 
 const MAX_REQUEST_BYTES = 64 * 1024;
@@ -143,6 +152,12 @@ export class FleetControlPlane {
         writeJson(response, 409, { error: "sequence_gap" });
       } else if (error instanceof StoreChainForkError) {
         writeJson(response, 409, { error: "chain_fork" });
+      } else if (error instanceof StorePolicyRollbackError) {
+        writeJson(response, 409, { error: "policy_revision_rollback" });
+      } else if (error instanceof StorePolicyConflictError) {
+        writeJson(response, 409, { error: "policy_revision_conflict" });
+      } else if (error instanceof StoreNonceReplayError) {
+        writeJson(response, 409, { error: "policy_pull_replay" });
       } else {
         writeJson(response, 500, { error: "internal_error" });
       }
@@ -219,6 +234,85 @@ export class FleetControlPlane {
         tenantId,
         enrollmentToken: token,
         expiresAt: new Date(expiresAtMs).toISOString(),
+      });
+      return;
+    }
+
+    const policyAnchorMatch =
+      /^\/v1\/tenants\/([^/]+)\/policy-trust-anchor$/.exec(path);
+    if (method === "POST" && policyAnchorMatch !== null) {
+      const tenantId = pathIdentifier(policyAnchorMatch[1], "tenantId");
+      this.#authorizeTenant(request, tenantId);
+      const body = expectRecord(await readJson(request));
+      expectExactKeys(body, ["publicKeySpki"]);
+      if (
+        typeof body.publicKeySpki !== "string" ||
+        body.publicKeySpki.length < 40 ||
+        body.publicKeySpki.length > 512
+      ) {
+        throw new HttpError(400, "invalid_public_key");
+      }
+      try {
+        importEd25519Spki(body.publicKeySpki);
+      } catch {
+        throw new HttpError(400, "invalid_public_key");
+      }
+      const setAt = this.#validNow().toISOString();
+      this.#store.setPolicyTrustAnchor(tenantId, body.publicKeySpki, setAt);
+      writeJson(response, 201, {
+        schema: "dev.kernaid.fleet.policy-trust-anchor-set.v1",
+        tenantId,
+        publicKeySha256: sha256Hex(decodeBase64UrlExact(body.publicKeySpki)),
+        setAt,
+      });
+      return;
+    }
+
+    const policiesMatch = /^\/v1\/tenants\/([^/]+)\/policies$/.exec(path);
+    if (method === "POST" && policiesMatch !== null) {
+      const tenantId = pathIdentifier(policiesMatch[1], "tenantId");
+      this.#authorizeTenant(request, tenantId);
+      const bundle = parseSignedPolicyBundle(
+        await readCanonicalJson(request, MAX_POLICY_BUNDLE_BYTES),
+      );
+      if (bundle.tenantId !== tenantId) {
+        throw new HttpError(403, "tenant_mismatch");
+      }
+      const anchorSpki = this.#store.getPolicyTrustAnchor(tenantId);
+      if (anchorSpki === undefined) {
+        throw new HttpError(409, "policy_trust_anchor_not_set");
+      }
+      let anchor;
+      try {
+        anchor = importEd25519Spki(anchorSpki);
+      } catch {
+        throw new HttpError(500, "invalid_stored_key");
+      }
+      if (
+        !verifyEd25519(
+          anchor,
+          policyBundleSigningBytes(bundle),
+          bundle.signature,
+        )
+      ) {
+        throw new HttpError(401, "invalid_signature");
+      }
+      const canonicalBundle = canonicalJson(bundle);
+      const publishedAt = this.#validNow().toISOString();
+      const result = this.#store.publishPolicy(
+        bundle,
+        canonicalBundle,
+        sha256Hex(canonicalBundle),
+        publishedAt,
+      );
+      writeJson(response, result.idempotent ? 200 : 201, {
+        schema: "dev.kernaid.fleet.policy-published.v1",
+        tenantId,
+        policyId: bundle.policyId,
+        revision: bundle.revision,
+        accepted: true,
+        idempotent: result.idempotent,
+        publishedAt: result.publishedAt,
       });
       return;
     }
@@ -372,6 +466,50 @@ export class FleetControlPlane {
         sequence: envelope.sequence,
         accepted: true,
         idempotent: result.idempotent,
+      });
+      return;
+    }
+
+    if (method === "POST" && path === "/v1/policy-pulls") {
+      const pull = parsePolicyPullRequest(await readJson(request));
+      const now = this.#validNow();
+      const issuedAtMs = Date.parse(pull.issuedAt);
+      if (Math.abs(now.getTime() - issuedAtMs) > this.#clockSkewMs) {
+        throw new HttpError(401, "policy_pull_timestamp_rejected");
+      }
+      const device = this.#store.getDevice(pull.tenantId, pull.deviceId);
+      if (device === undefined) throw new HttpError(401, "unknown_device");
+      if (device.revokedAt !== null) throw new HttpError(403, "device_revoked");
+      let publicKey;
+      try {
+        publicKey = importEd25519Spki(device.publicKeySpki);
+      } catch {
+        throw new HttpError(500, "invalid_stored_key");
+      }
+      if (
+        !verifyEd25519(publicKey, policyPullSigningBytes(pull), pull.signature)
+      ) {
+        throw new HttpError(401, "invalid_signature");
+      }
+      this.#store.recordPolicyPullNonce({
+        tenantId: pull.tenantId,
+        deviceId: pull.deviceId,
+        nonceSha256: sha256Hex(
+          `kernaid:fleet:policy-pull-nonce:v1\0${pull.nonce}`,
+        ),
+        expiresAtMs: issuedAtMs + this.#clockSkewMs + 1,
+        nowMs: now.getTime(),
+      });
+      const items = this.#store
+        .listApplicablePolicyJson(pull.tenantId, pull.deviceId)
+        .map((stored) =>
+          parseSignedPolicyBundle(JSON.parse(stored) as unknown),
+        );
+      writeJson(response, 200, {
+        schema: "dev.kernaid.fleet.policy-pull-response.v1",
+        tenantId: pull.tenantId,
+        deviceId: pull.deviceId,
+        items,
       });
       return;
     }
@@ -546,11 +684,14 @@ function bearerToken(request: IncomingMessage): string | undefined {
 }
 
 async function readJson(request: IncomingMessage): Promise<unknown> {
-  return parseJsonBytes(await readJsonBytes(request));
+  return parseJsonBytes(await readJsonBytes(request, MAX_REQUEST_BYTES));
 }
 
-async function readCanonicalJson(request: IncomingMessage): Promise<unknown> {
-  const bytes = await readJsonBytes(request);
+async function readCanonicalJson(
+  request: IncomingMessage,
+  maximumBytes = MAX_REQUEST_BYTES,
+): Promise<unknown> {
+  const bytes = await readJsonBytes(request, maximumBytes);
   const value = parseJsonBytes(bytes);
   const text = bytes.toString("utf8");
   try {
@@ -567,7 +708,10 @@ async function readCanonicalJson(request: IncomingMessage): Promise<unknown> {
   return value;
 }
 
-async function readJsonBytes(request: IncomingMessage): Promise<Buffer> {
+async function readJsonBytes(
+  request: IncomingMessage,
+  maximumBytes: number,
+): Promise<Buffer> {
   const contentType = request.headers["content-type"];
   if (
     contentType === undefined ||
@@ -579,11 +723,7 @@ async function readJsonBytes(request: IncomingMessage): Promise<Buffer> {
   const declaredLength = request.headers["content-length"];
   if (declaredLength !== undefined) {
     const length = Number(declaredLength);
-    if (
-      !Number.isSafeInteger(length) ||
-      length < 0 ||
-      length > MAX_REQUEST_BYTES
-    ) {
+    if (!Number.isSafeInteger(length) || length < 0 || length > maximumBytes) {
       throw new HttpError(413, "request_too_large");
     }
   }
@@ -593,8 +733,7 @@ async function readJsonBytes(request: IncomingMessage): Promise<Buffer> {
   for await (const chunk of request) {
     const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     total += bytes.length;
-    if (total > MAX_REQUEST_BYTES)
-      throw new HttpError(413, "request_too_large");
+    if (total > maximumBytes) throw new HttpError(413, "request_too_large");
     chunks.push(bytes);
   }
   return Buffer.concat(chunks);
