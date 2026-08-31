@@ -825,6 +825,11 @@ mod tests {
     use super::*;
 
     #[test]
+    fn shipping_loopback_ui_is_not_classified_as_a_local_dev_origin() {
+        assert!(!tauri::is_dev());
+    }
+
+    #[test]
     fn navigation_is_pinned_to_the_exact_loopback_origin() {
         for allowed in [
             "http://127.0.0.1:4173/",

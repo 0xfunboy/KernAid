@@ -10,6 +10,7 @@ import struct
 import sys
 import tempfile
 import threading
+import tomllib
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -795,6 +796,7 @@ class RescueTauriBoundaryTests(unittest.TestCase):
                 REPO_DIR / "apps/desk/src-tauri-rescue/tauri.conf.json"
             ).read_text(encoding="utf-8")
         )
+        self.assertNotIn("devUrl", config["build"])
         self.assertEqual(config["app"]["windows"], [])
         capabilities = config["app"]["security"]["capabilities"]
         self.assertEqual(len(capabilities), 1)
@@ -864,6 +866,16 @@ class RescueTauriBoundaryTests(unittest.TestCase):
         workspace = (REPO_DIR / "Cargo.toml").read_text(encoding="utf-8")
         self.assertIn('"apps/desk/src-tauri-rescue"', workspace)
         self.assertNotIn("tauri.rescue.conf.json", source)
+
+        manifest = tomllib.loads(
+            (
+                REPO_DIR / "apps/desk/src-tauri-rescue/Cargo.toml"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            manifest["dependencies"]["tauri"]["features"],
+            ["custom-protocol"],
+        )
 
     def test_live_image_has_one_unprivileged_supervised_shell(self) -> None:
         service = (
