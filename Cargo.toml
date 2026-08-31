@@ -4,7 +4,7 @@ members = [
   "crates/core", "crates/broker", "crates/evidence", "crates/policy",
   "crates/protocol", "crates/storage", "crates/redaction", "crates/device-identity",
   "crates/fleet-client", "crates/fleet-runtime", "crates/fleet-policy",
-  "crates/fleet-audit",
+  "crates/fleet-audit", "crates/fleet-coordinator",
   "crates/update-client",
   "crates/native-secrets", "crates/rescue-secrets", "crates/report-schema",
   "crates/entitlements",
