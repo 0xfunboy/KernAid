@@ -9,6 +9,7 @@ expected_schemas=(
   execution-event.schema.json
   linux-hardware-inventory.schema.json
   linux-normalized-snapshot.schema.json
+  linux-storage-health.schema.json
   rescue-fstab-repair-approval.schema.json
   rescue-openai-request.schema.json
   rescue-openai-response.schema.json
