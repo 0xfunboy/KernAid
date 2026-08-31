@@ -2375,6 +2375,8 @@ class SanitizedOutputTests(unittest.TestCase):
             qemu_args=["-m", "2048"],
         )
         login_credential = synthetic_login_credential()
+        prompt = mock.Mock()
+        prompt.end.return_value = 0
         stdout = io.StringIO()
         stderr = io.StringIO()
         with (
@@ -2394,6 +2396,9 @@ class SanitizedOutputTests(unittest.TestCase):
                 return_value=bytearray(login_credential),
             ),
             mock.patch.object(controller, "QemuHarness", return_value=fake_harness),
+            mock.patch.object(
+                controller, "wait_firstboot_prompt", return_value=prompt
+            ),
             mock.patch.object(controller, "wait_firstboot_attestation"),
             mock.patch.object(
                 controller,
@@ -2441,6 +2446,8 @@ class SanitizedOutputTests(unittest.TestCase):
             qemu_args=["-m", "2048"],
         )
         login_credential = synthetic_login_credential()
+        prompt = mock.Mock()
+        prompt.end.return_value = 0
         stdout = io.StringIO()
         stderr = io.StringIO()
         with (
@@ -2460,6 +2467,9 @@ class SanitizedOutputTests(unittest.TestCase):
                 return_value=bytearray(login_credential),
             ),
             mock.patch.object(controller, "QemuHarness", return_value=fake_harness),
+            mock.patch.object(
+                controller, "wait_firstboot_prompt", return_value=prompt
+            ),
             mock.patch.object(controller, "wait_firstboot_attestation"),
             mock.patch.object(
                 controller,
@@ -3794,12 +3804,8 @@ class StaticContractTests(unittest.TestCase):
         self.assertIn("p3_initially_zero=true", shell)
         self.assertIn("firstboot_tty1_qmp=true", shell)
         self.assertIn("qmp.send_hex_line(correct)", python)
-        self.assertIn(
-            "KERNAID_RESCUE_FIRSTBOOT_PROMPT_READY_V1 step=passphrase", python
-        )
-        self.assertIn(
-            "KERNAID_RESCUE_FIRSTBOOT_PROMPT_READY_V1 step=confirmation", python
-        )
+        self.assertIn("KERNAID_RESCUE_FIRSTBOOT_PROMPT_READY_V1 ", python)
+        self.assertIn("step=(passphrase|confirmation)", python)
         self.assertNotIn("cryptsetup luksFormat", shell)
         self.assertIn('"-serial",\n            "pty"', python)
         self.assertIn("qmp.system_powerdown()", python)
