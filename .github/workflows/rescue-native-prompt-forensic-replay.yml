@@ -1,0 +1,139 @@
+name: rescue native prompt forensic replay
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: Rescue run containing the exact tested ISO to replay
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  native-vault-prompt-bios:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install focused native prompt VM tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libcrypt1 python3 qemu-system-x86 squashfs-tools xorriso
+
+      - name: Download the exact tested Rescue image input
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_run_id }}
+          name: KernAid-Rescue-amd64
+          path: ${{ runner.temp }}/kernaid-native-vault-prompt/image
+
+      - name: Replay only the BIOS native Vault prompt proof
+        timeout-minutes: 65
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          iso_dir="$RUNNER_TEMP/kernaid-native-vault-prompt/image"
+          iso="$iso_dir/KernAid-Rescue-amd64.iso"
+          checksum="$iso_dir/KernAid-Rescue-amd64.iso.sha256"
+          raw_output="$RUNNER_TEMP/kernaid-native-vault-prompt.raw.log"
+          safe_output="$RUNNER_TEMP/kernaid-native-vault-prompt.sanitized.log"
+
+          for input in "$iso" "$checksum"; do
+            test -f "$input"
+            test ! -L "$input"
+            test "$(stat -c '%F:%h' -- "$input")" = "regular file:1"
+          done
+          test "$(stat -c '%s' -- "$iso")" -gt 0
+          (
+            cd "$iso_dir"
+            sha256sum --check --strict KernAid-Rescue-amd64.iso.sha256
+          )
+          install -m 0600 /dev/null "$raw_output"
+          install -m 0600 /dev/null "$safe_output"
+          printf '%s\n' \
+            'KERNAID_QEMU_NATIVE_VAULT_PROMPT_FAILURE_V1 stage=output code=invalid' \
+            >"$safe_output"
+
+          set +e
+          python3 -I -B \
+            "$GITHUB_WORKSPACE/tools/build-rescue/qemu-native-vault-prompt-smoke.py" \
+            --iso "$iso" --timeout 3600 >"$raw_output" 2>&1
+          harness_status=$?
+          set -e
+
+          set +e
+          python3 -I -B - "$raw_output" "$safe_output" "$harness_status" <<'PY'
+          import re
+          import stat
+          import sys
+          from pathlib import Path
+
+          raw_path = Path(sys.argv[1])
+          safe_path = Path(sys.argv[2])
+          status = int(sys.argv[3])
+          metadata = raw_path.lstat()
+          if (
+              not stat.S_ISREG(metadata.st_mode)
+              or metadata.st_nlink != 1
+              or metadata.st_size > 4096
+          ):
+              raise SystemExit(1)
+          payload = raw_path.read_bytes()
+          if (
+              not payload
+              or not payload.endswith(b"\n")
+              or payload.count(b"\n") != 1
+              or b"\r" in payload
+              or b"\0" in payload
+          ):
+              raise SystemExit(1)
+          try:
+              line = payload[:-1].decode("ascii")
+          except UnicodeDecodeError:
+              raise SystemExit(1) from None
+          success = re.fullmatch(
+              r"KERNAID_QEMU_NATIVE_VAULT_PROMPT_ATTESTATION_V1 "
+              r"firmware=bios image=exact-usb boot1=provisioned "
+              r"boot2=direct-kernel-same-iso gate=vt-v1 socket=available "
+              r"broker=tauri-authenticated request=webview-tauri-enum-nonce "
+              r"prompt=tty8-ready-notify qmp-secret-input=true "
+              r"captured-secret-exposure=false journald-secret-exposure=false "
+              r"journald-scope=root-full-current-boot "
+              r"vault=unlocked device_id=KA-[0-9a-f]{24} "
+              r"iso_sha256=[0-9a-f]{64} "
+              r"return=graphical-ui width=[1-9][0-9]{2,3} "
+              r"height=[1-9][0-9]{2,3} iso-prefix-immutable=true "
+              r"acpi-shutdowns=2 ready=true",
+              line,
+          )
+          failure = re.fullmatch(
+              r"KERNAID_QEMU_NATIVE_VAULT_PROMPT_FAILURE_V1 "
+              r"stage=[a-z0-9-]+ code=[a-z0-9-]+",
+              line,
+          )
+          if (status == 0 and success is None) or (status != 0 and failure is None):
+              raise SystemExit(1)
+          safe_path.write_bytes(payload)
+          PY
+          sanitizer_status=$?
+          set -e
+          if [[ "$sanitizer_status" -ne 0 ]]; then
+            exit 1
+          fi
+          exit "$harness_status"
+
+      - name: Publish sanitized native prompt replay evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: KernAid-Rescue-native-vault-prompt-forensic-replay-evidence
+          path: ${{ runner.temp }}/kernaid-native-vault-prompt.sanitized.log
+          if-no-files-found: error
+          retention-days: 30

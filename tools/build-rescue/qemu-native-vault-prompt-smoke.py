@@ -42,6 +42,10 @@ HEX_ALPHABET = b"0123456789abcdef"
 JOURNAL_MARKER_DIRECTORY = "/run/kernaid-qemu-native-prompt-journal-proof"
 JOURNAL_PROOF_STAGES = ("boot1", "boot2")
 JOURNAL_MARKER_PROOF_TIMEOUT_SECONDS = 45.0
+# A 64-byte passphrase plus Return is 65 separately correlated QMP requests.
+# Keep one absolute deadline for the complete line, but do not force those
+# requests through the generic 10-second single-command window.
+QMP_SECRET_LINE_TIMEOUT_SECONDS = 45.0
 
 
 def _load_module(name: str, path: Path) -> ModuleType:
@@ -217,6 +221,16 @@ def _new_passphrase() -> bytearray:
 
 def _deadline(aggregate: float, seconds: float) -> float:
     return min(aggregate, time.monotonic() + seconds)
+
+
+def _send_secret_line(qmp: object, secret: bytearray, aggregate: float) -> None:
+    """Send one fixed-size passphrase once within one absolute QMP deadline."""
+
+    if len(secret) != SECRET_BYTES:
+        raise ClosedFailure("secret", "length-invalid")
+    qmp.set_deadline(_deadline(aggregate, QMP_SECRET_LINE_TIMEOUT_SECONDS))
+    # Never retry here: a timeout can follow a partially delivered line.
+    qmp.send_hex_line(secret)
 
 
 def _tool(name: str) -> str:
@@ -746,16 +760,14 @@ def _run_firstboot(
             deadline=_deadline(aggregate, LIFECYCLE.READINESS_TIMEOUT_SECONDS),
             stage="firstboot-start",
         )
-        qmp.set_deadline(_deadline(aggregate, 10.0))
-        qmp.send_hex_line(secret)
+        _send_secret_line(qmp, secret, aggregate)
         confirmation = console.wait_regex(
             re.compile(rb"KERNAID_RESCUE_FIRSTBOOT_PROMPT_READY_V1 step=confirmation"),
             start=prompt.end(),
             deadline=_deadline(aggregate, LIFECYCLE.READINESS_TIMEOUT_SECONDS),
             stage="firstboot-confirmation",
         )
-        qmp.set_deadline(_deadline(aggregate, 10.0))
-        qmp.send_hex_line(secret)
+        _send_secret_line(qmp, secret, aggregate)
         LIFECYCLE.wait_firstboot_attestation(
             console,
             confirmation.end(),
@@ -845,8 +857,7 @@ def _run_prompt_boot(
             console, "native-ready", READY_PROOF, cursor, aggregate, timeout=75.0
         )
         _require_prompt_frame(qmp, work_directory, baseline, _deadline(aggregate, 15.0))
-        qmp.set_deadline(_deadline(aggregate, 10.0))
-        qmp.send_hex_line(secret)
+        _send_secret_line(qmp, secret, aggregate)
         cursor = LIFECYCLE.run_guest_proof(
             console, "native-post", POST_PROOF, cursor, aggregate, timeout=650.0
         )

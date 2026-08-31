@@ -62,6 +62,56 @@ class FakeQmp:
 
 
 class NativeVaultPromptSmokeTests(unittest.TestCase):
+    def test_secret_line_has_one_bounded_deadline_and_is_never_retried(self) -> None:
+        class SecretQmp:
+            def __init__(self, failure=None) -> None:
+                self.failure = failure
+                self.deadlines: list[float] = []
+                self.lines: list[bytearray] = []
+
+            def set_deadline(self, deadline: float) -> None:
+                self.deadlines.append(deadline)
+
+            def send_hex_line(self, secret: bytearray) -> None:
+                self.lines.append(secret)
+                if self.failure is not None:
+                    raise self.failure
+
+        secret = bytearray(b"0123456789abcdef" * 4)
+        try:
+            qmp = SecretQmp()
+            with mock.patch.object(native_prompt_smoke.time, "monotonic", return_value=100.0):
+                native_prompt_smoke._send_secret_line(qmp, secret, 120.0)
+            self.assertEqual(qmp.deadlines, [120.0])
+            self.assertEqual(qmp.lines, [secret])
+            self.assertEqual(native_prompt_smoke.SECRET_BYTES + 1, 65)
+            self.assertGreater(native_prompt_smoke.QMP_SECRET_LINE_TIMEOUT_SECONDS, 10.0)
+
+            closed = native_prompt_smoke.ClosedFailure("qmp", "send-timeout")
+            failing = SecretQmp(closed)
+            with (
+                mock.patch.object(native_prompt_smoke.time, "monotonic", return_value=100.0),
+                self.assertRaises(native_prompt_smoke.ClosedFailure) as failure,
+            ):
+                native_prompt_smoke._send_secret_line(failing, secret, 200.0)
+            self.assertIs(failure.exception, closed)
+            self.assertEqual(failing.deadlines, [145.0])
+            self.assertEqual(failing.lines, [secret])
+
+            invalid = SecretQmp()
+            with self.assertRaises(native_prompt_smoke.ClosedFailure) as failure:
+                native_prompt_smoke._send_secret_line(
+                    invalid, bytearray(b"0" * (native_prompt_smoke.SECRET_BYTES - 1)), 200.0
+                )
+            self.assertEqual(
+                (failure.exception.stage, failure.exception.code),
+                ("secret", "length-invalid"),
+            )
+            self.assertEqual(invalid.deadlines, [])
+            self.assertEqual(invalid.lines, [])
+        finally:
+            native_prompt_smoke.LIFECYCLE.wipe(secret)
+
     def test_each_boot_keeps_the_qualified_lifecycle_timeout(self) -> None:
         parsed = native_prompt_smoke._parse_arguments(
             ["--iso", "/tmp/KernAid.iso", "--timeout", "3600"]
