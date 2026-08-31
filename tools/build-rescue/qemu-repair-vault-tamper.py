@@ -65,8 +65,11 @@ FAILURE_CODES = frozenset(
         "input-invalid",
         "key-invalid",
         "loop-collision",
+        "loop-correlation-invalid",
         "loop-discovery-failed",
-        "loop-invalid",
+        "loop-output-invalid",
+        "loop-setup-failed",
+        "loop-shape-invalid",
         "mapper-collision",
         "mapper-discovery-failed",
         "mapper-open-failed",
@@ -592,13 +595,14 @@ def main() -> int:
             loop = loop_output.decode("ascii").strip()
         except UnicodeDecodeError as error:
             raise ClosedFailure("loop-invalid") from error
-        if (
-            setup_failure is not None
-            or re.fullmatch(r"/dev/loop[0-9]+", loop) is None
-            or observed_loops != baseline_loops | {loop}
-            or exact_loop_devices(media_metadata) != {loop}
-        ):
-            raise ClosedFailure("loop-invalid") from setup_failure
+        if setup_failure is not None:
+            raise ClosedFailure("loop-setup-failed") from setup_failure
+        if re.fullmatch(r"/dev/loop[0-9]+", loop) is None:
+            raise ClosedFailure("loop-output-invalid")
+        if observed_loops != baseline_loops | {loop}:
+            raise ClosedFailure("loop-correlation-invalid")
+        if exact_loop_devices(media_metadata) != {loop}:
+            raise ClosedFailure("loop-shape-invalid")
 
         open_failure: BaseException | None = None
         mapper_open_attempted = True
