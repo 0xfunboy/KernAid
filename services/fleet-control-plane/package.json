@@ -1,0 +1,36 @@
+{
+  "name": "@kernaid/fleet-control-plane",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "24.18.0"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "prebuild": "pnpm --filter @kernaid/fleet-schemas build",
+    "build": "tsc -p tsconfig.build.json",
+    "format": "prettier --check .",
+    "lint": "eslint src test",
+    "precheck": "pnpm --filter @kernaid/fleet-schemas build",
+    "check": "tsc --noEmit",
+    "pretest": "pnpm --filter @kernaid/fleet-schemas build",
+    "test": "tsx --test test/*.test.ts",
+    "start": "node dist/main.js"
+  },
+  "dependencies": {
+    "@kernaid/fleet-schemas": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.0",
+    "eslint": "^9.25.0",
+    "prettier": "^3.5.3",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.3"
+  }
+}
