@@ -209,9 +209,19 @@ label live-amd64-failsafe
             REPO_DIR
             / "rescue/live-build/config/includes.chroot/etc/systemd/system/kernaid-rescue-native-vault-unlock.service"
         ).read_text(encoding="utf-8")
+        self.assertNotIn(
+            "OnSuccess=kernaid-qemu-native-prompt-journal-proof@boot1.service",
+            firstboot_unit,
+        )
         self.assertEqual(
             firstboot_unit.count(
-                "OnSuccess=kernaid-qemu-native-prompt-journal-proof@boot1.service"
+                "Wants=kernaid-qemu-native-prompt-journal-proof@boot1.service"
+            ),
+            1,
+        )
+        self.assertEqual(
+            firstboot_unit.count(
+                "Before=kernaid-qemu-native-prompt-journal-proof@boot1.service "
             ),
             1,
         )
