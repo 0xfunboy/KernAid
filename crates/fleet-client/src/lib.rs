@@ -20,6 +20,8 @@ use zeroize::Zeroizing;
 
 mod policy_pull;
 pub use policy_pull::*;
+mod entitlement_pull;
+pub use entitlement_pull::*;
 
 /// Enrollment wire schema.
 pub const ENROLLMENT_REQUEST_SCHEMA: &str = "dev.kernaid.fleet.enrollment-request.v1";

@@ -15,11 +15,17 @@ import {
   FLEET_AUDIT_SCHEMA,
   FLEET_ENROLLMENT_SCHEMA,
   FLEET_INVENTORY_SCHEMA,
+  FLEET_ENTITLEMENT_PULL_SCHEMA,
+  ENTITLEMENT_SCHEMA,
+  ENTITLEMENT_REVOCATIONS_SCHEMA,
   FLEET_POLICY_BUNDLE_SCHEMA,
   FLEET_POLICY_PULL_SCHEMA,
   auditSigningBytes,
   canonicalJson,
   enrollmentSigningBytes,
+  entitlementPullSigningBytes,
+  entitlementRevocationSigningBytes,
+  entitlementSigningBytes,
   inventorySigningBytes,
   policyBundleSigningBytes,
   policyPullSigningBytes,
@@ -28,6 +34,12 @@ import {
   type EnrollmentRequest,
   type EnrollmentRequestUnsigned,
   type FleetInventoryAsset,
+  type EntitlementClaims,
+  type EntitlementEnvelope,
+  type EntitlementPullRequest,
+  type EntitlementPullRequestUnsigned,
+  type EntitlementRevocationClaims,
+  type EntitlementRevocationEnvelope,
   type InventoryEnvelope,
   type InventoryEnvelopeUnsigned,
   type PolicyAssignments,
@@ -40,6 +52,12 @@ import { FleetControlPlane } from "../src/server.js";
 
 const ROOT_TOKEN = "root_" + "r".repeat(40);
 const INITIAL_TIME = Date.parse("2026-08-31T12:00:00.000Z");
+const ENTITLEMENT_ISSUER = generateKeyPairSync("ed25519");
+const ENTITLEMENT_TRUST_ANCHOR = Buffer.from(
+  ENTITLEMENT_ISSUER.publicKey.export({ format: "der", type: "spki" }),
+)
+  .subarray(12)
+  .toString("base64url");
 
 interface Harness {
   directory: string;
@@ -74,6 +92,7 @@ async function createHarness(options?: {
   directory?: string;
   now?: { value: number };
   consoleDirectory?: string;
+  entitlementTrustAnchor?: string;
 }): Promise<Harness> {
   const directory =
     options?.directory ?? mkdtempSync(join(tmpdir(), "kernaid-fleet-test-"));
@@ -82,6 +101,8 @@ async function createHarness(options?: {
   const service = new FleetControlPlane({
     databasePath,
     rootToken: ROOT_TOKEN,
+    entitlementTrustAnchor:
+      options?.entitlementTrustAnchor ?? ENTITLEMENT_TRUST_ANCHOR,
     now: () => new Date(now.value),
     consoleDirectory: options?.consoleDirectory,
   });
@@ -405,6 +426,117 @@ function signedPolicyPull(
       device.privateKey,
     ).toString("base64url"),
   };
+}
+
+function signedEntitlement(
+  tenant: TenantCredentials,
+  deviceIds: string[],
+  input: {
+    entitlementId: string;
+    sequence: number;
+    maxToolDevices?: number;
+    graceUntilUnix?: number;
+  },
+): EntitlementEnvelope {
+  const nowSeconds = Math.floor(INITIAL_TIME / 1000);
+  const claims: EntitlementClaims = {
+    schema: ENTITLEMENT_SCHEMA,
+    entitlementId: input.entitlementId,
+    tenantId: tenant.tenantId,
+    sequence: input.sequence,
+    plan: "enterprise",
+    features: ["audit", "enterprise_repair", "fleet", "policy", "updates"],
+    deviceIds: [...deviceIds].sort(),
+    limits: {
+      maxToolDevices: input.maxToolDevices ?? Math.max(deviceIds.length, 1),
+      maxTechnicians: 10,
+      maxManagedAssets: 1000,
+    },
+    issuedAtUnix: nowSeconds,
+    notBeforeUnix: nowSeconds,
+    offlineLeaseUntilUnix: nowSeconds + 86_400,
+    expiresAtUnix: nowSeconds + 172_800,
+    graceUntilUnix: input.graceUntilUnix ?? nowSeconds + 259_200,
+  };
+  return {
+    claims,
+    signature: sign(
+      null,
+      entitlementSigningBytes(claims),
+      ENTITLEMENT_ISSUER.privateKey,
+    ).toString("base64url"),
+  };
+}
+
+function signedEntitlementRevocations(
+  sequence: number,
+  entitlementIds: string[],
+): EntitlementRevocationEnvelope {
+  const claims: EntitlementRevocationClaims = {
+    schema: ENTITLEMENT_REVOCATIONS_SCHEMA,
+    sequence,
+    issuedAtUnix: Math.floor(INITIAL_TIME / 1000),
+    revokedEntitlementIds: [...entitlementIds].sort(),
+  };
+  return {
+    claims,
+    signature: sign(
+      null,
+      entitlementRevocationSigningBytes(claims),
+      ENTITLEMENT_ISSUER.privateKey,
+    ).toString("base64url"),
+  };
+}
+
+function signedEntitlementPull(
+  harness: Harness,
+  tenant: TenantCredentials,
+  device: DeviceCredentials,
+  nonce = randomBytes(32),
+): EntitlementPullRequest {
+  const unsigned: EntitlementPullRequestUnsigned = {
+    schema: FLEET_ENTITLEMENT_PULL_SCHEMA,
+    tenantId: tenant.tenantId,
+    deviceId: device.deviceId,
+    issuedAt: new Date(harness.now.value).toISOString(),
+    nonce: nonce.toString("base64url"),
+  };
+  return {
+    ...unsigned,
+    signature: sign(
+      null,
+      entitlementPullSigningBytes(unsigned),
+      device.privateKey,
+    ).toString("base64url"),
+  };
+}
+
+async function publishEntitlement(
+  harness: Harness,
+  tenant: TenantCredentials,
+  envelope: EntitlementEnvelope,
+): Promise<HttpResult> {
+  return canonicalApi(
+    harness,
+    "POST",
+    `/v1/tenants/${tenant.tenantId}/entitlements`,
+    envelope,
+    tenant.adminToken,
+  );
+}
+
+async function publishEntitlementRevocations(
+  harness: Harness,
+  tenant: TenantCredentials,
+  envelope: EntitlementRevocationEnvelope,
+): Promise<HttpResult> {
+  return canonicalApi(
+    harness,
+    "POST",
+    `/v1/tenants/${tenant.tenantId}/entitlement-revocations`,
+    envelope,
+    tenant.adminToken,
+  );
 }
 
 async function publishPolicy(
@@ -1355,6 +1487,9 @@ test("policy anchor, bundle, and assignment survive SQLite restart", async () =>
 
     const legacy = new DatabaseSync(harness.databasePath);
     legacy.exec(`
+      DROP TABLE entitlement_pull_nonces;
+      DROP TABLE entitlement_revocations;
+      DROP TABLE entitlement_documents;
       DROP TABLE policy_pull_nonces;
       DROP TABLE policy_assignments;
       DROP TABLE policy_bundles;
@@ -1393,10 +1528,388 @@ test("policy anchor, bundle, and assignment survive SQLite restart", async () =>
     const version = database.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    assert.equal(version.user_version, 3);
+    assert.equal(version.user_version, 4);
     const nonce = database
       .prepare(
         `SELECT nonce_sha256 FROM policy_pull_nonces
+         WHERE tenant_id = ? AND device_id = ?`,
+      )
+      .get(tenant.tenantId, device.deviceId) as { nonce_sha256: string };
+    assert.match(nonce.nonce_sha256, /^[0-9a-f]{64}$/);
+    assert.notEqual(nonce.nonce_sha256, pull.nonce);
+    database.close();
+  } finally {
+    await destroyHarness(harness);
+  }
+});
+
+test("offline-signed entitlement publication is canonical, monotonic, and tenant-bound", async () => {
+  const harness = await createHarness();
+  try {
+    const tenant = await createTenant(harness);
+    const other = await createTenant(harness);
+    const device = await enroll(
+      harness,
+      tenant,
+      "entitlement-publisher-device",
+    );
+    const second = signedEntitlement(tenant, [device.deviceId], {
+      entitlementId: "enterprise_primary",
+      sequence: 2,
+    });
+    const published = await publishEntitlement(harness, tenant, second);
+    assert.equal(published.status, 201);
+    assert.equal(published.body.idempotent, false);
+    const replay = await publishEntitlement(harness, tenant, second);
+    assert.equal(replay.status, 200);
+    assert.equal(replay.body.idempotent, true);
+
+    const rollback = signedEntitlement(tenant, [device.deviceId], {
+      entitlementId: "enterprise_primary",
+      sequence: 1,
+    });
+    const rollbackResult = await publishEntitlement(harness, tenant, rollback);
+    assert.equal(rollbackResult.status, 409);
+    assert.equal(rollbackResult.body.error, "entitlement_sequence_rollback");
+
+    const conflict = signedEntitlement(tenant, [device.deviceId], {
+      entitlementId: "enterprise_primary",
+      sequence: 2,
+      graceUntilUnix: Math.floor(INITIAL_TIME / 1000) + 300_000,
+    });
+    const conflictResult = await publishEntitlement(harness, tenant, conflict);
+    assert.equal(conflictResult.status, 409);
+    assert.equal(conflictResult.body.error, "entitlement_sequence_conflict");
+
+    const third = signedEntitlement(tenant, [device.deviceId], {
+      entitlementId: "enterprise_primary",
+      sequence: 3,
+    });
+    const tampered = {
+      ...third,
+      claims: { ...third.claims, plan: "retail" as const },
+    };
+    assert.equal(
+      (await publishEntitlement(harness, tenant, tampered)).status,
+      401,
+    );
+    assert.equal(
+      (
+        await canonicalApi(
+          harness,
+          "POST",
+          `/v1/tenants/${other.tenantId}/entitlements`,
+          third,
+          other.adminToken,
+        )
+      ).status,
+      403,
+    );
+    assert.equal(
+      (
+        await canonicalApi(
+          harness,
+          "POST",
+          `/v1/tenants/${tenant.tenantId}/entitlements`,
+          third,
+          other.adminToken,
+        )
+      ).status,
+      401,
+    );
+    assert.equal(
+      (
+        await canonicalApi(
+          harness,
+          "POST",
+          `/v1/tenants/${tenant.tenantId}/entitlements`,
+          { ...third, privateNote: "forbidden" },
+          tenant.adminToken,
+        )
+      ).status,
+      400,
+    );
+
+    const revocations = signedEntitlementRevocations(2, ["enterprise_primary"]);
+    assert.equal(
+      (await publishEntitlementRevocations(harness, tenant, revocations))
+        .status,
+      201,
+    );
+    assert.equal(
+      (await publishEntitlementRevocations(harness, tenant, revocations))
+        .status,
+      200,
+    );
+    const olderRevocations = signedEntitlementRevocations(1, []);
+    assert.equal(
+      (await publishEntitlementRevocations(harness, tenant, olderRevocations))
+        .body.error,
+      "entitlement_sequence_rollback",
+    );
+    const conflictingRevocations = signedEntitlementRevocations(2, []);
+    assert.equal(
+      (
+        await publishEntitlementRevocations(
+          harness,
+          tenant,
+          conflictingRevocations,
+        )
+      ).body.error,
+      "entitlement_sequence_conflict",
+    );
+  } finally {
+    await destroyHarness(harness);
+  }
+});
+
+test("signed entitlement pulls isolate assignments and reject replay, key mismatch, and revoked devices", async () => {
+  const harness = await createHarness();
+  try {
+    const tenant = await createTenant(harness);
+    const otherTenant = await createTenant(harness);
+    const first = await enroll(harness, tenant, "entitlement-device-one");
+    const second = await enroll(harness, tenant, "entitlement-device-two");
+
+    assert.equal(
+      (
+        await publishEntitlement(
+          harness,
+          tenant,
+          signedEntitlement(tenant, [first.deviceId], {
+            entitlementId: "first_only",
+            sequence: 1,
+          }),
+        )
+      ).status,
+      201,
+    );
+    assert.equal(
+      (
+        await publishEntitlement(
+          harness,
+          tenant,
+          signedEntitlement(tenant, [first.deviceId, second.deviceId], {
+            entitlementId: "both_devices",
+            sequence: 1,
+          }),
+        )
+      ).status,
+      201,
+    );
+    assert.equal(
+      (
+        await publishEntitlementRevocations(
+          harness,
+          tenant,
+          signedEntitlementRevocations(1, ["retired_contract"]),
+        )
+      ).status,
+      201,
+    );
+
+    const firstPull = signedEntitlementPull(harness, tenant, first);
+    const firstResult = await api(
+      harness,
+      "POST",
+      "/v1/entitlement-pulls",
+      firstPull,
+    );
+    assert.equal(firstResult.status, 200);
+    assert.deepEqual(
+      (firstResult.body.entitlements as EntitlementEnvelope[]).map(
+        (item) => item.claims.entitlementId,
+      ),
+      ["both_devices", "first_only"],
+    );
+    assert.equal(
+      (firstResult.body.revocations as EntitlementRevocationEnvelope).claims
+        .sequence,
+      1,
+    );
+    const replay = await api(
+      harness,
+      "POST",
+      "/v1/entitlement-pulls",
+      firstPull,
+    );
+    assert.equal(replay.status, 409);
+    assert.equal(replay.body.error, "entitlement_pull_replay");
+
+    const secondResult = await api(
+      harness,
+      "POST",
+      "/v1/entitlement-pulls",
+      signedEntitlementPull(harness, tenant, second),
+    );
+    assert.deepEqual(
+      (secondResult.body.entitlements as EntitlementEnvelope[]).map(
+        (item) => item.claims.entitlementId,
+      ),
+      ["both_devices"],
+    );
+
+    const wrongKeyUnsigned: EntitlementPullRequestUnsigned = {
+      ...signedEntitlementPull(harness, tenant, first),
+      deviceId: second.deviceId,
+    };
+    const wrongKey: EntitlementPullRequest = {
+      ...wrongKeyUnsigned,
+      signature: sign(
+        null,
+        entitlementPullSigningBytes(wrongKeyUnsigned),
+        first.privateKey,
+      ).toString("base64url"),
+    };
+    assert.equal(
+      (await api(harness, "POST", "/v1/entitlement-pulls", wrongKey)).status,
+      401,
+    );
+
+    const crossTenantUnsigned: EntitlementPullRequestUnsigned = {
+      ...signedEntitlementPull(harness, tenant, first),
+      tenantId: otherTenant.tenantId,
+    };
+    const crossTenant: EntitlementPullRequest = {
+      ...crossTenantUnsigned,
+      signature: sign(
+        null,
+        entitlementPullSigningBytes(crossTenantUnsigned),
+        first.privateKey,
+      ).toString("base64url"),
+    };
+    assert.equal(
+      (await api(harness, "POST", "/v1/entitlement-pulls", crossTenant)).status,
+      401,
+    );
+
+    const tampered = signedEntitlementPull(harness, tenant, first);
+    tampered.issuedAt = new Date(harness.now.value + 1000).toISOString();
+    assert.equal(
+      (await api(harness, "POST", "/v1/entitlement-pulls", tampered)).status,
+      401,
+    );
+    assert.equal(
+      (
+        await api(harness, "POST", "/v1/entitlement-pulls", {
+          ...signedEntitlementPull(harness, tenant, first),
+          rawDiagnostics: "forbidden",
+        })
+      ).status,
+      400,
+    );
+
+    assert.equal(
+      (
+        await api(
+          harness,
+          "POST",
+          `/v1/tenants/${tenant.tenantId}/devices/${first.deviceId}/revoke`,
+          {},
+          tenant.adminToken,
+        )
+      ).status,
+      200,
+    );
+    assert.equal(
+      (
+        await api(
+          harness,
+          "POST",
+          "/v1/entitlement-pulls",
+          signedEntitlementPull(harness, tenant, first),
+        )
+      ).status,
+      403,
+    );
+  } finally {
+    await destroyHarness(harness);
+  }
+});
+
+test("SQLite v3 migrates to v4 and entitlement checkpoints survive restart", async () => {
+  let harness = await createHarness();
+  const directory = harness.directory;
+  const now = harness.now;
+  try {
+    const tenant = await createTenant(harness);
+    const device = await enroll(
+      harness,
+      tenant,
+      "persistent-entitlement-device",
+    );
+    await destroyHarness(harness, false);
+
+    const legacy = new DatabaseSync(harness.databasePath);
+    legacy.exec(`
+      DROP TABLE entitlement_pull_nonces;
+      DROP TABLE entitlement_revocations;
+      DROP TABLE entitlement_documents;
+      PRAGMA user_version = 3;
+    `);
+    legacy.close();
+    harness = await createHarness({ directory, now });
+
+    const entitlement = signedEntitlement(tenant, [device.deviceId], {
+      entitlementId: "persistent_entitlement",
+      sequence: 7,
+    });
+    const revocations = signedEntitlementRevocations(4, []);
+    assert.equal(
+      (await publishEntitlement(harness, tenant, entitlement)).status,
+      201,
+    );
+    assert.equal(
+      (await publishEntitlementRevocations(harness, tenant, revocations))
+        .status,
+      201,
+    );
+    await destroyHarness(harness, false);
+
+    harness = await createHarness({ directory, now });
+    const pull = signedEntitlementPull(harness, tenant, device);
+    const result = await api(harness, "POST", "/v1/entitlement-pulls", pull);
+    assert.equal(result.status, 200);
+    assert.equal(
+      (result.body.entitlements as EntitlementEnvelope[])[0]?.claims.sequence,
+      7,
+    );
+    assert.equal(
+      (result.body.revocations as EntitlementRevocationEnvelope).claims
+        .sequence,
+      4,
+    );
+
+    const database = new DatabaseSync(harness.databasePath, { readOnly: true });
+    const version = database.prepare("PRAGMA user_version").get() as {
+      user_version: number;
+    };
+    assert.equal(version.user_version, 4);
+    const document = database
+      .prepare(
+        `SELECT highest_sequence, envelope_sha256, canonical_json
+         FROM entitlement_documents
+         WHERE tenant_id = ? AND entitlement_id = ?`,
+      )
+      .get(tenant.tenantId, "persistent_entitlement") as {
+      highest_sequence: number;
+      envelope_sha256: string;
+      canonical_json: string;
+    };
+    assert.equal(document.highest_sequence, 7);
+    assert.match(document.envelope_sha256, /^[0-9a-f]{64}$/);
+    assert.equal(document.canonical_json, canonicalJson(entitlement));
+    const sensitiveColumns = database
+      .prepare(
+        `SELECT COUNT(*) AS count FROM pragma_table_info('entitlement_documents')
+         WHERE lower(name) LIKE '%private%' OR lower(name) LIKE '%seed%'
+           OR lower(name) LIKE '%anchor%'`,
+      )
+      .get() as { count: number };
+    assert.equal(sensitiveColumns.count, 0);
+    const nonce = database
+      .prepare(
+        `SELECT nonce_sha256 FROM entitlement_pull_nonces
          WHERE tenant_id = ? AND device_id = ?`,
       )
       .get(tenant.tenantId, device.deviceId) as { nonce_sha256: string };

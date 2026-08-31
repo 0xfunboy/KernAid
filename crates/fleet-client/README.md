@@ -1,7 +1,7 @@
 # KernAid Fleet client E1
 
 `kernaid-fleet-client` is the offline-first device side of Fleet enrollment,
-inventory, and policy-pull authentication. It signs every protocol with the existing
+inventory, policy-pull and entitlement-pull authentication. It signs every protocol with the existing
 `kernaid-device-identity::DeviceIdentity`; the Ed25519 seed is never copied
 into Fleet state or serialized.
 
@@ -74,6 +74,23 @@ verify against the enrolled key and reject stale or replayed nonces. Bundle
 verification remains in `kernaid-fleet-policy` and uses the separately
 provisioned tenant policy trust anchor.
 
+## Entitlement pull
+
+```rust,ignore
+let request = SignedEntitlementPullRequest::sign(
+    &identity,
+    EntitlementPullRequestInput::new(tenant_id, issued_at, fresh_nonce),
+)?;
+let canonical_body = request.export_offline()?;
+```
+
+The message is exactly
+`kernaid:fleet:entitlement-pull:v1\0 || canonical_unsigned_json`. The server
+binds it to the enrolled, non-revoked tenant/device key and rejects stale or
+replayed nonces. Returned entitlement and revocation documents remain signed
+by the separate offline issuer and are verified by `kernaid-entitlements`;
+the device request never grants signing or repair authority.
+
 ## Wire and privacy rules
 
 - Offline files are canonical JSON and imports reject whitespace, alternate
@@ -85,7 +102,7 @@ provisioned tenant policy trust anchor.
 - `Debug` output omits enrollment tokens, nonces, signatures, public keys,
   target fingerprints, and snapshot hashes.
 - Enrollment verification requires the expected tenant and one-time token.
-  Inventory and policy-pull verification require the tenant, device ID, and enrolled public
+  Inventory, policy-pull and entitlement-pull verification require the tenant, device ID, and enrolled public
   key supplied by the caller; embedded fields are never treated as trust
   anchors.
 - There is deliberately no HTTP dependency. The same bytes can be moved by

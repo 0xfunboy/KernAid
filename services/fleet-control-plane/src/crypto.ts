@@ -49,6 +49,16 @@ export function importEd25519Spki(encoded: string): KeyObject {
   return key;
 }
 
+export function importEd25519Raw(encoded: string): KeyObject {
+  const raw = decodeBase64UrlExact(encoded);
+  if (raw.length !== 32) {
+    throw new Error("public key must be a raw Ed25519 key");
+  }
+  return importEd25519Spki(
+    Buffer.concat([ED25519_SPKI_PREFIX, raw]).toString("base64url"),
+  );
+}
+
 export function deviceIdForEd25519Spki(encoded: string): string {
   const rawPublicKey = decodeEd25519Spki(encoded).subarray(
     ED25519_SPKI_PREFIX.length,

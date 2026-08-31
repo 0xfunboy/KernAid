@@ -9,11 +9,15 @@ import type {
   FleetInventoryAsset,
   InventoryEnvelope,
   SignedPolicyBundle,
+  EntitlementEnvelope,
+  EntitlementRevocationEnvelope,
 } from "@kernaid/fleet-schemas";
 import { canonicalJson } from "@kernaid/fleet-schemas";
 
 const MAX_POLICY_STREAMS_PER_TENANT = 256;
 const MAX_RECENT_POLICY_PULL_NONCES_PER_DEVICE = 1024;
+const MAX_ENTITLEMENT_STREAMS_PER_TENANT = 256;
+const MAX_RECENT_ENTITLEMENT_PULL_NONCES_PER_DEVICE = 1024;
 
 export class StoreConflictError extends Error {}
 export class StoreAuthorizationError extends Error {}
@@ -24,6 +28,9 @@ export class StoreChainForkError extends Error {}
 export class StorePolicyRollbackError extends Error {}
 export class StorePolicyConflictError extends Error {}
 export class StoreNonceReplayError extends Error {}
+export class StoreEntitlementRollbackError extends Error {}
+export class StoreEntitlementConflictError extends Error {}
+export class StoreEntitlementPullReplayError extends Error {}
 
 interface EnrollmentTokenRow {
   tenant_id: string;
@@ -61,6 +68,10 @@ export interface AuditRecordResult {
 export interface PolicyPublishResult {
   idempotent: boolean;
   publishedAt: string;
+}
+
+export interface EntitlementPublishResult {
+  idempotent: boolean;
 }
 
 export interface ListedAuditEvent {
@@ -307,6 +318,178 @@ export class FleetStore {
       )
       .all(tenantId, deviceId) as unknown as { bundle_json: string }[];
     return rows.map((row) => row.bundle_json);
+  }
+
+  publishEntitlement(
+    tenantId: string,
+    envelope: EntitlementEnvelope,
+    canonicalJson: string,
+    envelopeSha256: string,
+  ): EntitlementPublishResult {
+    return this.#transaction(() => {
+      const current = this.#database
+        .prepare(
+          `SELECT highest_sequence, envelope_sha256
+           FROM entitlement_documents
+           WHERE tenant_id = ? AND entitlement_id = ?`,
+        )
+        .get(tenantId, envelope.claims.entitlementId) as
+        { highest_sequence: number; envelope_sha256: string } | undefined;
+      if (current !== undefined) {
+        if (envelope.claims.sequence < current.highest_sequence) {
+          throw new StoreEntitlementRollbackError(
+            "entitlement sequence rollback",
+          );
+        }
+        if (envelope.claims.sequence === current.highest_sequence) {
+          if (envelopeSha256 === current.envelope_sha256) {
+            return { idempotent: true };
+          }
+          throw new StoreEntitlementConflictError(
+            "entitlement sequence conflict",
+          );
+        }
+      } else {
+        const count = this.#database
+          .prepare(
+            `SELECT COUNT(*) AS count FROM entitlement_documents
+             WHERE tenant_id = ?`,
+          )
+          .get(tenantId) as { count: number };
+        if (count.count >= MAX_ENTITLEMENT_STREAMS_PER_TENANT) {
+          throw new StoreConflictError(
+            "tenant entitlement stream limit reached",
+          );
+        }
+      }
+      this.#database
+        .prepare(
+          `INSERT INTO entitlement_documents
+            (tenant_id, entitlement_id, highest_sequence, envelope_sha256,
+             canonical_json)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT (tenant_id, entitlement_id) DO UPDATE SET
+             highest_sequence = excluded.highest_sequence,
+             envelope_sha256 = excluded.envelope_sha256,
+             canonical_json = excluded.canonical_json`,
+        )
+        .run(
+          tenantId,
+          envelope.claims.entitlementId,
+          envelope.claims.sequence,
+          envelopeSha256,
+          canonicalJson,
+        );
+      return { idempotent: false };
+    });
+  }
+
+  publishEntitlementRevocations(
+    tenantId: string,
+    envelope: EntitlementRevocationEnvelope,
+    canonicalJson: string,
+    envelopeSha256: string,
+  ): EntitlementPublishResult {
+    return this.#transaction(() => {
+      const current = this.#database
+        .prepare(
+          `SELECT highest_sequence, envelope_sha256
+           FROM entitlement_revocations WHERE tenant_id = ?`,
+        )
+        .get(tenantId) as
+        { highest_sequence: number; envelope_sha256: string } | undefined;
+      if (current !== undefined) {
+        if (envelope.claims.sequence < current.highest_sequence) {
+          throw new StoreEntitlementRollbackError(
+            "revocation sequence rollback",
+          );
+        }
+        if (envelope.claims.sequence === current.highest_sequence) {
+          if (envelopeSha256 === current.envelope_sha256) {
+            return { idempotent: true };
+          }
+          throw new StoreEntitlementConflictError(
+            "revocation sequence conflict",
+          );
+        }
+      }
+      this.#database
+        .prepare(
+          `INSERT INTO entitlement_revocations
+            (tenant_id, highest_sequence, envelope_sha256, canonical_json)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT (tenant_id) DO UPDATE SET
+             highest_sequence = excluded.highest_sequence,
+             envelope_sha256 = excluded.envelope_sha256,
+             canonical_json = excluded.canonical_json`,
+        )
+        .run(tenantId, envelope.claims.sequence, envelopeSha256, canonicalJson);
+      return { idempotent: false };
+    });
+  }
+
+  listEntitlementJson(tenantId: string): string[] {
+    const rows = this.#database
+      .prepare(
+        `SELECT canonical_json FROM entitlement_documents
+         WHERE tenant_id = ? ORDER BY entitlement_id LIMIT 256`,
+      )
+      .all(tenantId) as unknown as { canonical_json: string }[];
+    return rows.map((row) => row.canonical_json);
+  }
+
+  getEntitlementRevocationsJson(tenantId: string): string | undefined {
+    const row = this.#database
+      .prepare(
+        `SELECT canonical_json FROM entitlement_revocations
+         WHERE tenant_id = ?`,
+      )
+      .get(tenantId) as { canonical_json: string } | undefined;
+    return row?.canonical_json;
+  }
+
+  recordEntitlementPullNonce(input: {
+    tenantId: string;
+    deviceId: string;
+    nonceSha256: string;
+    expiresAtMs: number;
+    nowMs: number;
+  }): void {
+    this.#transaction(() => {
+      this.#database
+        .prepare("DELETE FROM entitlement_pull_nonces WHERE expires_at_ms <= ?")
+        .run(input.nowMs);
+      const recent = this.#database
+        .prepare(
+          `SELECT COUNT(*) AS count FROM entitlement_pull_nonces
+           WHERE tenant_id = ? AND device_id = ?`,
+        )
+        .get(input.tenantId, input.deviceId) as { count: number };
+      if (recent.count >= MAX_RECENT_ENTITLEMENT_PULL_NONCES_PER_DEVICE) {
+        throw new StoreConflictError("recent entitlement pull limit reached");
+      }
+      try {
+        this.#database
+          .prepare(
+            `INSERT INTO entitlement_pull_nonces
+              (tenant_id, device_id, nonce_sha256, expires_at_ms)
+             VALUES (?, ?, ?, ?)`,
+          )
+          .run(
+            input.tenantId,
+            input.deviceId,
+            input.nonceSha256,
+            input.expiresAtMs,
+          );
+      } catch (error) {
+        if (isSqliteConstraint(error)) {
+          throw new StoreEntitlementPullReplayError(
+            "entitlement pull nonce was reused",
+          );
+        }
+        throw error;
+      }
+    });
   }
 
   createEnrollmentToken(input: {
@@ -772,7 +955,7 @@ export class FleetStore {
     const version = this.#database.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    if (version.user_version > 3) {
+    if (version.user_version > 4) {
       throw new Error(
         `unsupported Fleet database version ${version.user_version}`,
       );
@@ -945,6 +1128,44 @@ export class FleetStore {
             ON policy_pull_nonces(expires_at_ms);
 
           PRAGMA user_version = 3;
+        `);
+      });
+      currentVersion = 3;
+    }
+
+    if (currentVersion === 3) {
+      this.#transaction(() => {
+        this.#database.exec(`
+          CREATE TABLE entitlement_documents (
+            tenant_id TEXT NOT NULL REFERENCES tenants(tenant_id),
+            entitlement_id TEXT NOT NULL,
+            highest_sequence INTEGER NOT NULL,
+            envelope_sha256 TEXT NOT NULL,
+            canonical_json TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, entitlement_id)
+          ) STRICT;
+
+          CREATE TABLE entitlement_revocations (
+            tenant_id TEXT PRIMARY KEY REFERENCES tenants(tenant_id),
+            highest_sequence INTEGER NOT NULL,
+            envelope_sha256 TEXT NOT NULL,
+            canonical_json TEXT NOT NULL
+          ) STRICT;
+
+          CREATE TABLE entitlement_pull_nonces (
+            tenant_id TEXT NOT NULL,
+            device_id TEXT NOT NULL,
+            nonce_sha256 TEXT NOT NULL,
+            expires_at_ms INTEGER NOT NULL,
+            PRIMARY KEY (tenant_id, device_id, nonce_sha256),
+            FOREIGN KEY (tenant_id, device_id)
+              REFERENCES devices(tenant_id, device_id)
+              ON DELETE CASCADE
+          ) STRICT;
+          CREATE INDEX entitlement_pull_nonces_expiry_idx
+            ON entitlement_pull_nonces(expires_at_ms);
+
+          PRAGMA user_version = 4;
         `);
       });
     }

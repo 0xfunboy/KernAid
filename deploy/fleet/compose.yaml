@@ -20,6 +20,7 @@ services:
       KERNAID_FLEET_PORT: "7341"
       KERNAID_FLEET_DB_PATH: /var/lib/kernaid-fleet/fleet.sqlite
       KERNAID_FLEET_ROOT_TOKEN_FILE: /run/secrets/kernaid_fleet_root_token
+      KERNAID_FLEET_ENTITLEMENT_TRUST_ANCHOR_FILE: /run/configs/kernaid_entitlement_trust_anchor
       FLEET_CONSOLE_DIR: /opt/kernaid/console
     secrets:
       - source: fleet-root-token
@@ -27,6 +28,12 @@ services:
         uid: "1000"
         gid: "1000"
         mode: 0400
+    configs:
+      - source: fleet-entitlement-trust-anchor
+        target: /run/configs/kernaid_entitlement_trust_anchor
+        uid: "1000"
+        gid: "1000"
+        mode: 0444
     volumes:
       - fleet-data:/var/lib/kernaid-fleet
     read_only: true
@@ -43,6 +50,10 @@ services:
 secrets:
   fleet-root-token:
     file: "${KERNAID_FLEET_ROOT_TOKEN_FILE:?set an absolute root-token file path}"
+
+configs:
+  fleet-entitlement-trust-anchor:
+    file: "${KERNAID_FLEET_ENTITLEMENT_TRUST_ANCHOR_FILE:?set an absolute public-anchor file path}"
 
 volumes:
   fleet-data:
