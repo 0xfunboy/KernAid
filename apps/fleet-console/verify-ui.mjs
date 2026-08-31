@@ -10,18 +10,31 @@ const publishBoundary = readFileSync(
   join(directory, "publish-document.js"),
   "utf8",
 );
+const workOrderBoundary = readFileSync(
+  join(directory, "work-order-ui.js"),
+  "utf8",
+);
 
 assert.match(html, /data-view="governance"/);
 assert.match(html, /id="publish-dialog"/);
 assert.match(html, /id="publish-document"[^>]+maxlength="1048576"/s);
 assert.match(html, /No signing happens in this console/);
 assert.match(html, /Content-Security-Policy/);
+assert.match(html, /data-view="workorders"/);
+assert.match(html, /id="work-order-dialog"/);
+assert.match(html, /id="work-order-events"/);
+assert.doesNotMatch(
+  html,
+  /<(?:input|textarea)[^>]+name="(?:command|arguments?|path|script|raw)/i,
+);
 
 for (const route of [
   "policies",
   "entitlements",
   "entitlement-revocations",
   "update-manifests",
+  "work-orders",
+  "work-order-events",
 ]) {
   assert.match(script, new RegExp(route));
 }
@@ -37,7 +50,15 @@ for (const schema of [
 assert.match(script, /sessionStorage\.setItem\("kernaid\.fleet\.admin-token"/);
 assert.doesNotMatch(script, /localStorage/);
 assert.doesNotMatch(script, /innerHTML|insertAdjacentHTML|document\.write/);
+assert.doesNotMatch(
+  workOrderBoundary,
+  /innerHTML|insertAdjacentHTML|document\.write/,
+);
 assert.doesNotMatch(script, /\/v1\/(?:commands|shell|execute|repairs)/i);
+assert.match(script, /decision: "approve"/);
+assert.match(script, /body: JSON\.stringify\(\{\}\)/);
+assert.match(workOrderBoundary, /linux\.fstab\.disable-missing-uuid\.v1/);
+assert.doesNotMatch(workOrderBoundary, /shell\.exec|arbitrary/);
 assert.match(script, /maximumBytes: 1024 \* 1024/);
 assert.match(script, /maximumBytes: 64 \* 1024/);
 assert.match(
