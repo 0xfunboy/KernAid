@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.kernaid.dev/v1/linux-storage-health.json",
+  "title": "KernAid minimized Linux storage health snapshot",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "kind",
+    "scope",
+    "enumerationStatus",
+    "disks",
+    "findings"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "1.0" },
+    "kind": { "const": "linux-storage-health" },
+    "scope": { "const": "local-physical-disks" },
+    "enumerationStatus": { "enum": ["complete", "unsupported"] },
+    "disks": {
+      "type": "array",
+      "maxItems": 32,
+      "items": { "$ref": "#/$defs/disk" }
+    },
+    "findings": {
+      "type": "array",
+      "maxItems": 32,
+      "items": { "$ref": "#/$defs/finding" }
+    }
+  },
+  "$defs": {
+    "diskRef": {
+      "type": "string",
+      "pattern": "^disk-([1-9]|[12][0-9]|3[0-2])$"
+    },
+    "nullablePercent": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "maximum": 255
+    },
+    "disk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "diskRef",
+        "state",
+        "overallPassed",
+        "criticalWarning",
+        "mediaErrors",
+        "temperatureCelsius",
+        "availableSparePercent",
+        "percentageUsed"
+      ],
+      "properties": {
+        "diskRef": { "$ref": "#/$defs/diskRef" },
+        "state": {
+          "enum": [
+            "healthy",
+            "degraded",
+            "failing",
+            "unsupported",
+            "permission-unavailable"
+          ]
+        },
+        "overallPassed": { "type": ["boolean", "null"] },
+        "criticalWarning": { "$ref": "#/$defs/nullablePercent" },
+        "mediaErrors": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "temperatureCelsius": {
+          "type": ["integer", "null"],
+          "minimum": -100,
+          "maximum": 300
+        },
+        "availableSparePercent": { "$ref": "#/$defs/nullablePercent" },
+        "percentageUsed": { "$ref": "#/$defs/nullablePercent" }
+      }
+    },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ruleId",
+        "ruleVersion",
+        "severity",
+        "diskRef",
+        "summary",
+        "nextAction"
+      ],
+      "properties": {
+        "ruleId": {
+          "enum": [
+            "KA-LNX-STORAGE-001",
+            "KA-LNX-STORAGE-002",
+            "KA-LNX-STORAGE-003",
+            "KA-LNX-STORAGE-004"
+          ]
+        },
+        "ruleVersion": { "const": 1 },
+        "severity": { "enum": ["low", "medium", "high", "critical"] },
+        "diskRef": { "$ref": "#/$defs/diskRef" },
+        "summary": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "nextAction": { "type": "string", "minLength": 1, "maxLength": 256 }
+      }
+    }
+  }
+}

@@ -185,6 +185,47 @@ pre {
   font-size: 10px;
   white-space: pre-wrap;
 }
+.storage-health {
+  display: grid;
+  gap: 8px;
+  margin: 16px 0;
+  padding: 12px;
+  border: 1px solid #29312d;
+  border-radius: 9px;
+  background: #0e1311;
+}
+.storage-health .label {
+  margin: 0 0 2px;
+}
+.storage-health-disk {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 3px 10px;
+  padding: 9px;
+  border-left: 3px solid #73837a;
+  border-radius: 5px;
+  background: #141a17;
+  font-size: 12px;
+}
+.storage-health-disk.healthy {
+  border-left-color: #7ecf6b;
+}
+.storage-health-disk.degraded {
+  border-left-color: #f2b84b;
+}
+.storage-health-disk.failing {
+  border-left-color: #ff655f;
+}
+.storage-health-disk > span {
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.storage-health-disk > p {
+  grid-column: 1 / -1;
+  margin: 5px 0 0;
+  color: #d8dedb;
+  line-height: 1.4;
+}
 section {
   padding: 28px;
   max-width: 900px;

@@ -46,6 +46,7 @@ COMMANDS = (
     ("linux.network.routes", ("/usr/sbin/ip", "-json", "route")),
     ("linux.dpkg.audit", ("/usr/bin/dpkg", "--audit")),
 )
+STORAGE_HEALTH_BINARY = "/usr/lib/kernaid/kernaid-linux-storage-health"
 TARGET_SCAN_COMMAND = (
     "/usr/bin/lsblk",
     "--json",
@@ -1599,7 +1600,7 @@ def _validate_helper_error(value: object) -> dict[str, object]:
 def _privileged_helper_call(
     operation: str, request: dict[str, object] | None = None
 ) -> object:
-    if operation not in {"inspect", "scan", "select"}:
+    if operation not in {"inspect", "scan", "select", "storage-health"}:
         raise BrokerError("Operazione dell'ispettore privilegiato non valida.")
     frame: dict[str, object] = {"operation": operation}
     if request is not None:
@@ -1869,23 +1870,54 @@ def observe(
         }
 
 
+def observe_storage_health(deadline: float | None = None) -> dict[str, object]:
+    """Collect only the normalized root-owned storage-health document."""
+    try:
+        _check_deadline(deadline)
+        if OFFLINE_HELPER_ENABLED:
+            result = _privileged_helper_call("storage-health")
+            encoded = json.dumps(result, ensure_ascii=True, separators=(",", ":"))
+            if len(encoded.encode("utf-8")) > MAX_OUTPUT_BYTES:
+                raise ValueError("storage health response too large")
+            return {
+                "collector": "linux.storage.health.v1",
+                "trust": "observed-untrusted",
+                "output": encoded,
+                "success": True,
+                "truncated": False,
+            }
+        if deadline is None:
+            return observe("linux.storage.health.v1", (STORAGE_HEALTH_BINARY,))
+        return observe("linux.storage.health.v1", (STORAGE_HEALTH_BINARY,), deadline)
+    except (OSError, TimeoutError, ValueError, PrivilegedHelperError):
+        return {
+            "collector": "linux.storage.health.v1",
+            "trust": "observed-untrusted",
+            "output": "",
+            "success": False,
+            "truncated": False,
+        }
+
+
 def inventory(deadline: float | None = None) -> list[dict[str, object]]:
     _check_deadline(deadline)
     if not INVENTORY_LOCK.acquire(blocking=False):
         raise InventoryBusy("Inventario locale già in corso; riprovare.")
     try:
         _check_deadline(deadline)
-        with ThreadPoolExecutor(max_workers=len(COMMANDS)) as executor:
+        with ThreadPoolExecutor(max_workers=len(COMMANDS) + 1) as executor:
             if deadline is None:
                 futures = [
                     executor.submit(observe, collector, command)
                     for collector, command in COMMANDS
                 ]
+                futures.append(executor.submit(observe_storage_health))
             else:
                 futures = [
                     executor.submit(observe, collector, command, deadline)
                     for collector, command in COMMANDS
                 ]
+                futures.append(executor.submit(observe_storage_health, deadline))
             observations = [
                 future.result(timeout=_remaining_seconds(deadline))
                 if deadline is not None

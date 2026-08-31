@@ -2,8 +2,14 @@
 
 `kernaid-linux-inventory` is restricted to directory fixtures and emits names,
 sizes, and readonly permission state. It does not read file contents or mutate
-the target. Host hardware collectors will be added as separate typed
-collectors after sandboxing and redaction tests exist.
+the target. The separate no-argument production binaries
+`kernaid-linux-hardware-inventory` and `kernaid-linux-storage-health` inspect
+only the running machine. Storage health invokes fixed, bounded `lsblk`,
+`smartctl` and `nvme` commands and returns only normalized `disk-N` references,
+health states and the documented SMART/NVMe indicators. Serial numbers, WWNs,
+kernel device names and raw tool JSON are never part of its output. Missing
+tools and unavailable permissions remain explicit unsupported states; they are
+never interpreted as healthy.
 
 The library contains a deliberately isolated R2 repair transaction for one
 known missing-device `fstab` entry. It is **fixture-only**: the exact

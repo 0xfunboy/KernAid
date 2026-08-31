@@ -1,0 +1,8 @@
+{
+  "critical_warning": 0,
+  "temperature": 307,
+  "avail_spare": 98,
+  "percent_used": 7,
+  "media_errors": 0,
+  "serial_number": "SECRET-NVME-SERIAL"
+}

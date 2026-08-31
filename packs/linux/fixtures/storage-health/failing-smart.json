@@ -1,0 +1,6 @@
+{
+  "json_format_version": [1, 0],
+  "serial_number": "SECRET-FAILED-SERIAL",
+  "smart_status": { "passed": false },
+  "temperature": { "current": 51 }
+}

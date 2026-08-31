@@ -32,6 +32,21 @@ import {
   type AuditSink,
   type AuditSinkStatus,
 } from "@kernaid/session-driver";
+import {
+  LINUX_STORAGE_HEALTH_COLLECTOR,
+  augmentDiagnosisWithStorageHealth,
+  parseLinuxStorageHealth,
+  storageHealthEvidenceSummary,
+  type LinuxStorageHealthSnapshot,
+} from "./storage-health";
+
+export {
+  LINUX_STORAGE_HEALTH_COLLECTOR,
+  parseLinuxStorageHealth,
+  projectLinuxStorageHealth,
+  storageHealthEvidenceSummary,
+  type LinuxStorageHealthSnapshot,
+} from "./storage-health";
 
 const SIGNED_REPORT_SCHEMA =
   "https://schemas.kernaid.dev/v1/signed-report-envelope.json";
@@ -1038,6 +1053,8 @@ export function parseNativeObservations(value: unknown): NativeObservation[] {
       throw new Error("Inventario nativo non valido.");
     if (item.collector === LINUX_HARDWARE_COLLECTOR && item.success)
       parseLinuxHardwareInventory(item.output);
+    if (item.collector === LINUX_STORAGE_HEALTH_COLLECTOR && item.success)
+      parseLinuxStorageHealth(item.output);
     return item as unknown as NativeObservation;
   });
 }
@@ -1286,7 +1303,8 @@ export function nativeObservationContentType(
 ): "application/json" | "text/plain" {
   return observation.success &&
     (observation.collector.startsWith("macos.") ||
-      observation.collector === LINUX_HARDWARE_COLLECTOR)
+      observation.collector === LINUX_HARDWARE_COLLECTOR ||
+      observation.collector === LINUX_STORAGE_HEALTH_COLLECTOR)
     ? "application/json"
     : "text/plain";
 }
@@ -2139,10 +2157,14 @@ export class PlatformOfflineRulesProvider implements Provider {
     const hardwareEvidence = evidence.filter(
       (item) => item.evidence.collector === LINUX_HARDWARE_COLLECTOR,
     );
+    const storageHealthEvidence = evidence.filter(
+      (item) => item.evidence.collector === LINUX_STORAGE_HEALTH_COLLECTOR,
+    );
     const hasLinuxCorpus =
       linuxEvidence.length > 0 ||
       snapshotEvidence.length > 0 ||
-      hardwareEvidence.length > 0;
+      hardwareEvidence.length > 0 ||
+      storageHealthEvidence.length > 0;
     const windowsEvidence = evidence.filter((item) =>
       WINDOWS_P0_COLLECTORS.includes(
         item.evidence.collector as (typeof WINDOWS_P0_COLLECTORS)[number],
@@ -2255,6 +2277,24 @@ export class PlatformOfflineRulesProvider implements Provider {
       }
     }
 
+    let storageHealth: LinuxStorageHealthSnapshot | undefined;
+    if (
+      storageHealthEvidence.length === 1 &&
+      storageHealthEvidence[0]?.evidence.target === "local-machine" &&
+      storageHealthEvidence[0].evidence.contentType === "application/json" &&
+      storageHealthEvidence[0].evidence.trust === "observed-untrusted" &&
+      storageHealthEvidence[0].evidence.summary ===
+        "Comando di inventario completato"
+    ) {
+      try {
+        storageHealth = parseLinuxStorageHealth(
+          storageHealthEvidence[0].content,
+        );
+      } catch {
+        storageHealth = undefined;
+      }
+    }
+
     let admittedSnapshot: LinuxNormalizedSnapshotEnvelope | undefined;
     if (
       snapshotEvidence.length === 1 &&
@@ -2281,14 +2321,20 @@ export class PlatformOfflineRulesProvider implements Provider {
         confidence: 0.1,
         evidenceIds: Array.from(
           new Set(
-            [...linuxEvidence, ...snapshotEvidence, ...hardwareEvidence].map(
-              (item) => item.evidence.id,
-            ),
+            [
+              ...linuxEvidence,
+              ...snapshotEvidence,
+              ...hardwareEvidence,
+              ...storageHealthEvidence,
+            ].map((item) => item.evidence.id),
           ),
         ),
         requestedEvidence: [
           LINUX_NORMALIZED_SNAPSHOT_COLLECTOR,
           ...(hardwareValid ? [] : [LINUX_HARDWARE_COLLECTOR]),
+          ...(storageHealth === undefined
+            ? [LINUX_STORAGE_HEALTH_COLLECTOR]
+            : []),
           ...LINUX_P0_COLLECTORS.filter(
             (collector) =>
               !linuxEvidence.some(
@@ -2307,9 +2353,12 @@ export class PlatformOfflineRulesProvider implements Provider {
         confidence: 0.1,
         evidenceIds: Array.from(
           new Set(
-            [...linuxEvidence, ...snapshotEvidence, ...hardwareEvidence].map(
-              (item) => item.evidence.id,
-            ),
+            [
+              ...linuxEvidence,
+              ...snapshotEvidence,
+              ...hardwareEvidence,
+              ...storageHealthEvidence,
+            ].map((item) => item.evidence.id),
           ),
         ),
         requestedEvidence: ["linux.topology.single-filesystem.v1"],
@@ -2326,15 +2375,18 @@ export class PlatformOfflineRulesProvider implements Provider {
         (collectorCounts.get(item.evidence.collector) ?? 0) + 1,
       );
     const exactCorpus =
-      evidence.length === LINUX_RESIDENT_CORPUS_COLLECTORS.length &&
+      evidence.length ===
+        LINUX_RESIDENT_CORPUS_COLLECTORS.length +
+          (storageHealthEvidence.length === 1 ? 1 : 0) &&
       new Set(evidence.map((item) => item.evidence.id)).size ===
         evidence.length &&
       evidence.every(
         (item) =>
           item.evidence.target === "local-machine" &&
-          LINUX_RESIDENT_CORPUS_COLLECTORS.some(
+          (LINUX_RESIDENT_CORPUS_COLLECTORS.some(
             (collector) => collector === item.evidence.collector,
-          ),
+          ) ||
+            item.evidence.collector === LINUX_STORAGE_HEALTH_COLLECTOR),
       ) &&
       LINUX_RESIDENT_CORPUS_COLLECTORS.every(
         (collector) => (collectorCounts.get(collector) ?? 0) === 1,
@@ -2378,6 +2430,8 @@ export class PlatformOfflineRulesProvider implements Provider {
       )
         requestedEvidence.unshift("system.hostname");
       if (!hardwareValid) requestedEvidence.push(LINUX_HARDWARE_COLLECTOR);
+      if (storageHealth === undefined)
+        requestedEvidence.push(LINUX_STORAGE_HEALTH_COLLECTOR);
       if (!exactCorpus) requestedEvidence.push("linux.p0.corpus.exact.v1");
       return parseDiagnosisProposal({
         schemaVersion: "1.0",
@@ -2400,7 +2454,7 @@ export class PlatformOfflineRulesProvider implements Provider {
       evidence: documents,
     });
     const proposal = parseDiagnosisProposal(response);
-    return parseDiagnosisProposal({
+    const boundProposal = parseDiagnosisProposal({
       ...proposal,
       evidenceIds: Array.from(
         new Set([
@@ -2410,6 +2464,13 @@ export class PlatformOfflineRulesProvider implements Provider {
         ]),
       ),
     });
+    return storageHealth === undefined
+      ? boundProposal
+      : augmentDiagnosisWithStorageHealth(
+          boundProposal,
+          storageHealth,
+          storageHealthEvidence[0]!.evidence.id,
+        );
   }
 }
 
@@ -2430,7 +2491,43 @@ async function diagnoseRescueOfflineCorpus(
       evidenceIds: evidence.map((item) => item.evidence.id),
       requestedEvidence: [requestedCollector],
     });
-  if (evidence.length !== 1 || matching.length !== 1) return invalid();
+  const storageMatches = evidence.filter(
+    (item) => item.evidence.collector === LINUX_STORAGE_HEALTH_COLLECTOR,
+  );
+  if (
+    matching.length !== 1 ||
+    storageMatches.length > 1 ||
+    evidence.length !== matching.length + storageMatches.length
+  )
+    return invalid();
+  let storageHealth: LinuxStorageHealthSnapshot | undefined;
+  if (storageMatches.length === 1) {
+    const storage = storageMatches[0]!;
+    if (
+      storage.evidence.target !== RESCUE_OFFLINE_EVIDENCE_TARGET ||
+      storage.evidence.contentType !== "application/json" ||
+      storage.evidence.trust !== "observed-untrusted"
+    )
+      return invalid();
+    try {
+      storageHealth = parseLinuxStorageHealth(storage.content);
+      if (
+        storage.evidence.summary !== storageHealthEvidenceSummary(storageHealth)
+      )
+        return invalid();
+    } catch {
+      return invalid();
+    }
+  }
+  const withStorage = (proposal: DiagnosisProposal): DiagnosisProposal => {
+    if (storageHealth !== undefined)
+      return augmentDiagnosisWithStorageHealth(
+        proposal,
+        storageHealth,
+        storageMatches[0]!.evidence.id,
+      );
+    return proposal;
+  };
   const selected = matching[0]!;
   if (
     selected.evidence.target !== RESCUE_OFFLINE_EVIDENCE_TARGET ||
@@ -2467,65 +2564,77 @@ async function diagnoseRescueOfflineCorpus(
   }
   const evidenceIds = [selected.evidence.id];
   if (corpus.family === "linux" && !corpus.topology.supported)
-    return parseDiagnosisProposal({
-      schemaVersion: "1.0",
-      diagnosis:
-        "Diagnosi Linux Rescue bloccata: il target dichiara filesystem separati sotto /etc, /boot (incluso /boot/efi), /efi, /usr o /var, non supportati dal profilo root-filesystem-only v1.",
-      confidence: 0.1,
-      evidenceIds,
-      requestedEvidence: ["linux.topology.single-filesystem.v1"],
-    });
+    return withStorage(
+      parseDiagnosisProposal({
+        schemaVersion: "1.0",
+        diagnosis:
+          "Diagnosi Linux Rescue bloccata: il target dichiara filesystem separati sotto /etc, /boot (incluso /boot/efi), /efi, /usr o /var, non supportati dal profilo root-filesystem-only v1.",
+        confidence: 0.1,
+        evidenceIds,
+        requestedEvidence: ["linux.topology.single-filesystem.v1"],
+      }),
+    );
   if (!corpus.installationConfirmed)
-    return parseDiagnosisProposal({
-      schemaVersion: "1.0",
-      diagnosis:
-        "Il contenuto statico del volume è stato ispezionato in sola lettura, ma i marker consentiti non confermano un'installazione completa. Non viene formulata una diagnosi del sistema.",
-      confidence: 0.2,
-      evidenceIds,
-      requestedEvidence: [
-        "rescue.installed-target.installation-confirmation.read-only.v1",
-      ],
-    });
+    return withStorage(
+      parseDiagnosisProposal({
+        schemaVersion: "1.0",
+        diagnosis:
+          "Il contenuto statico del volume è stato ispezionato in sola lettura, ma i marker consentiti non confermano un'installazione completa. Non viene formulata una diagnosi del sistema.",
+        confidence: 0.2,
+        evidenceIds,
+        requestedEvidence: [
+          "rescue.installed-target.installation-confirmation.read-only.v1",
+        ],
+      }),
+    );
   if (corpus.family === "linux") {
     if (corpus.configuration.fstab.malformedLineCount > 0)
-      return parseDiagnosisProposal({
-        schemaVersion: "1.0",
-        diagnosis:
-          "Il corpus Linux conferma l'installazione e segnala una o più righe fstab malformate. Verificare la configurazione di mount senza eseguire modifiche automatiche.",
-        confidence: 0.84,
-        evidenceIds,
-        requestedEvidence: ["rescue.linux.fstab.review.read-only.v1"],
-      });
+      return withStorage(
+        parseDiagnosisProposal({
+          schemaVersion: "1.0",
+          diagnosis:
+            "Il corpus Linux conferma l'installazione e segnala una o più righe fstab malformate. Verificare la configurazione di mount senza eseguire modifiche automatiche.",
+          confidence: 0.84,
+          evidenceIds,
+          requestedEvidence: ["rescue.linux.fstab.review.read-only.v1"],
+        }),
+      );
     if (corpus.boot.directoryPresent && corpus.boot.kernelArtifactCount === 0)
-      return parseDiagnosisProposal({
+      return withStorage(
+        parseDiagnosisProposal({
+          schemaVersion: "1.0",
+          diagnosis:
+            "L'installazione Linux è confermata, ma nel volume ispezionato non è stato osservato alcun artefatto kernel regolare. Il boot può dipendere da un altro volume: serve una verifica read-only della topologia di avvio.",
+          confidence: 0.68,
+          evidenceIds,
+          requestedEvidence: ["rescue.linux.boot-layout.read-only.v1"],
+        }),
+      );
+    return withStorage(
+      parseDiagnosisProposal({
         schemaVersion: "1.0",
         diagnosis:
-          "L'installazione Linux è confermata, ma nel volume ispezionato non è stato osservato alcun artefatto kernel regolare. Il boot può dipendere da un altro volume: serve una verifica read-only della topologia di avvio.",
-        confidence: 0.68,
+          "Installazione Linux confermata dal corpus statico read-only. Nei marker consentiti non emerge un'anomalia deterministica; servono controlli mirati prima di proporre modifiche.",
+        confidence: 0.58,
         evidenceIds,
-        requestedEvidence: ["rescue.linux.boot-layout.read-only.v1"],
-      });
-    return parseDiagnosisProposal({
-      schemaVersion: "1.0",
-      diagnosis:
-        "Installazione Linux confermata dal corpus statico read-only. Nei marker consentiti non emerge un'anomalia deterministica; servono controlli mirati prima di proporre modifiche.",
-      confidence: 0.58,
-      evidenceIds,
-      requestedEvidence: ["rescue.linux.targeted-health.read-only.v1"],
-    });
+        requestedEvidence: ["rescue.linux.targeted-health.read-only.v1"],
+      }),
+    );
   }
   if (
     corpus.servicing.pendingXmlPresent ||
     corpus.servicing.rebootPendingMarkerPresent
   )
-    return parseDiagnosisProposal({
-      schemaVersion: "1.0",
-      diagnosis:
-        "Il corpus Windows conferma l'installazione e mostra marker statici di servicing o riavvio pendente. La causa deve essere verificata con strumenti Windows nativi prima di qualsiasi riparazione.",
-      confidence: 0.8,
-      evidenceIds,
-      requestedEvidence: ["windows.update.state"],
-    });
+    return withStorage(
+      parseDiagnosisProposal({
+        schemaVersion: "1.0",
+        diagnosis:
+          "Il corpus Windows conferma l'installazione e mostra marker statici di servicing o riavvio pendente. La causa deve essere verificata con strumenti Windows nativi prima di qualsiasi riparazione.",
+        confidence: 0.8,
+        evidenceIds,
+        requestedEvidence: ["windows.update.state"],
+      }),
+    );
   const windowsRootBootMissing =
     !corpus.boot.bootManagerPresent && !corpus.boot.bcdPresent;
   const efi = corpus.boot.efiSystemPartition;
@@ -2536,31 +2645,37 @@ async function diagnoseRescueOfflineCorpus(
     !efi.bcdPresent &&
     !efi.fallbackBootloaderPresent
   )
-    return parseDiagnosisProposal({
-      schemaVersion: "1.0",
-      diagnosis:
-        "L'installazione Windows è confermata e l'unica partizione EFI associata è stata ispezionata in sola lettura, ma non contiene BCD, Windows Boot Manager o loader fallback x86-64. La catena di avvio richiede una verifica mirata prima di qualsiasi riparazione.",
-      confidence: 0.76,
-      evidenceIds,
-      requestedEvidence: ["rescue.windows.boot-chain.verify.read-only.v1"],
-    });
+    return withStorage(
+      parseDiagnosisProposal({
+        schemaVersion: "1.0",
+        diagnosis:
+          "L'installazione Windows è confermata e l'unica partizione EFI associata è stata ispezionata in sola lettura, ma non contiene BCD, Windows Boot Manager o loader fallback x86-64. La catena di avvio richiede una verifica mirata prima di qualsiasi riparazione.",
+        confidence: 0.76,
+        evidenceIds,
+        requestedEvidence: ["rescue.windows.boot-chain.verify.read-only.v1"],
+      }),
+    );
   if (windowsRootBootMissing && efi.state !== "inspected")
-    return parseDiagnosisProposal({
+    return withStorage(
+      parseDiagnosisProposal({
+        schemaVersion: "1.0",
+        diagnosis:
+          "L'installazione Windows è confermata, ma il volume ispezionato non contiene marker boot consentiti e la partizione EFI associata non è stata qualificata univocamente. Non viene dichiarato un guasto: serve una verifica read-only della topologia delle partizioni e del layout di avvio.",
+        confidence: 0.46,
+        evidenceIds,
+        requestedEvidence: ["rescue.windows.boot-topology.review.read-only.v1"],
+      }),
+    );
+  return withStorage(
+    parseDiagnosisProposal({
       schemaVersion: "1.0",
       diagnosis:
-        "L'installazione Windows è confermata, ma il volume ispezionato non contiene marker boot consentiti e la partizione EFI associata non è stata qualificata univocamente. Non viene dichiarato un guasto: serve una verifica read-only della topologia delle partizioni e del layout di avvio.",
-      confidence: 0.46,
+        "Installazione Windows confermata dal corpus statico read-only. Nei marker consentiti non emerge un'anomalia deterministica; servono controlli Windows mirati prima di proporre modifiche.",
+      confidence: 0.58,
       evidenceIds,
-      requestedEvidence: ["rescue.windows.boot-topology.review.read-only.v1"],
-    });
-  return parseDiagnosisProposal({
-    schemaVersion: "1.0",
-    diagnosis:
-      "Installazione Windows confermata dal corpus statico read-only. Nei marker consentiti non emerge un'anomalia deterministica; servono controlli Windows mirati prima di proporre modifiche.",
-    confidence: 0.58,
-    evidenceIds,
-    requestedEvidence: ["windows.offline.native-follow-up.v1"],
-  });
+      requestedEvidence: ["windows.offline.native-follow-up.v1"],
+    }),
+  );
 }
 
 function isSuccessfulWindowsEvidence(

@@ -1261,6 +1261,7 @@ fn collect_local_inventory_sync() -> Vec<Observation> {
     {
         observations.push(fixed_command("system.hostname", "/usr/bin/hostname", &[]));
         observations.push(collect_linux_hardware_inventory());
+        observations.push(collect_linux_storage_health());
         observations.push(fixed_command(
             "linux.block.inventory",
             "/usr/bin/lsblk",
@@ -1349,6 +1350,27 @@ fn collect_linux_hardware_inventory() -> Observation {
             trust: "observed-untrusted",
             output: "collector unavailable: normalized hardware inventory did not complete safely"
                 .to_owned(),
+            success: false,
+            truncated: false,
+        },
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn collect_linux_storage_health() -> Observation {
+    let snapshot = kernaid_linux_pack::storage_health::collect_current_machine();
+    match kernaid_linux_pack::storage_health::to_bounded_json(&snapshot) {
+        Ok(output) => Observation {
+            collector: kernaid_linux_pack::storage_health::COLLECTOR,
+            trust: "observed-untrusted",
+            output,
+            success: true,
+            truncated: false,
+        },
+        Err(_) => Observation {
+            collector: kernaid_linux_pack::storage_health::COLLECTOR,
+            trust: "observed-untrusted",
+            output: String::new(),
             success: false,
             truncated: false,
         },

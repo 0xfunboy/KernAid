@@ -17,6 +17,7 @@ from pathlib import Path
 import re
 import socket
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -33,6 +34,8 @@ MAX_PROTOCOL_REQUEST_BYTES = 8 * 1024
 MAX_PROTOCOL_RESPONSE_BYTES = 64 * 1024
 MAX_INSPECTION_RESPONSE_BYTES = 48 * 1024
 OPERATION_TIMEOUT_SECONDS = 18
+STORAGE_HEALTH_BINARY = "/usr/lib/kernaid/kernaid-linux-storage-health"
+MAX_STORAGE_HEALTH_BYTES = 64 * 1024
 MAX_TEXT_FILE_BYTES = 64 * 1024
 MAX_OS_RELEASE_BYTES = 16 * 1024
 MAX_DIRECTORY_ENTRIES = 512
@@ -1873,6 +1876,91 @@ class OfflineInspectionEngine:
         return response
 
 
+def collect_storage_health(deadline: float) -> dict[str, object]:
+    """Run the fixed Rust normalizer; never return raw SMART/NVMe output."""
+    _check_deadline(deadline)
+    timeout = max(0.1, min(15.0, deadline - time.monotonic()))
+    try:
+        completed = subprocess.run(
+            [STORAGE_HEALTH_BINARY],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=timeout,
+            cwd="/",
+            env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/sbin:/usr/bin:/sbin:/bin"},
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise InspectionError(
+            "storage-health-unavailable",
+            "La telemetria storage read-only non è disponibile.",
+            status=503,
+            retryable=True,
+        ) from error
+    _check_deadline(deadline)
+    if (
+        completed.returncode != 0
+        or not completed.stdout
+        or len(completed.stdout) > MAX_STORAGE_HEALTH_BYTES
+    ):
+        raise InspectionError(
+            "storage-health-unavailable",
+            "La telemetria storage read-only non è disponibile.",
+            status=503,
+            retryable=True,
+        )
+    try:
+        text = completed.stdout.decode("utf-8", errors="strict")
+        snapshot = json.loads(text)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise InspectionError(
+            "storage-health-invalid",
+            "La telemetria storage normalizzata non è valida.",
+            status=503,
+        ) from error
+    if (
+        not isinstance(snapshot, dict)
+        or set(snapshot)
+        != {
+            "schemaVersion",
+            "kind",
+            "scope",
+            "enumerationStatus",
+            "disks",
+            "findings",
+        }
+        or snapshot.get("schemaVersion") != "1.0"
+        or snapshot.get("kind") != "linux-storage-health"
+        or snapshot.get("scope") != "local-physical-disks"
+        or json.dumps(snapshot, ensure_ascii=True, separators=(",", ":")) != text
+    ):
+        raise InspectionError(
+            "storage-health-invalid",
+            "La telemetria storage normalizzata non è valida.",
+            status=503,
+        )
+    forbidden = {"serial", "serialNumber", "wwn", "device", "path", "raw"}
+
+    def contains_forbidden(value: object) -> bool:
+        if isinstance(value, dict):
+            return any(
+                key in forbidden or contains_forbidden(child)
+                for key, child in value.items()
+            )
+        if isinstance(value, list):
+            return any(contains_forbidden(child) for child in value)
+        return False
+
+    if contains_forbidden(snapshot):
+        raise InspectionError(
+            "storage-health-invalid",
+            "La telemetria storage normalizzata non è valida.",
+            status=503,
+        )
+    return snapshot
+
+
 class OfflineInspectorService:
     def __init__(self, target_module: object | None = None) -> None:
         self.targets = _load_target_module() if target_module is None else target_module
@@ -1893,6 +1981,8 @@ class OfflineInspectorService:
         operation = value.get("operation")
         if operation == "scan" and set(value) == {"operation"}:
             return self.targets.installed_targets(deadline=deadline)
+        if operation == "storage-health" and set(value) == {"operation"}:
+            return collect_storage_health(deadline)
         request = value.get("request")
         if not isinstance(request, dict) or set(request) != {
             "scanFingerprint",

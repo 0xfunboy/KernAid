@@ -1,0 +1,8 @@
+{
+  "json_format_version": [1, 0],
+  "device": { "name": "/dev/sda", "serial_number": "MUST-NOT-ESCAPE" },
+  "serial_number": "SECRET-SERIAL",
+  "wwn": { "naa": 5, "oui": 1234, "id": 5678 },
+  "smart_status": { "passed": true },
+  "temperature": { "current": 34 }
+}
