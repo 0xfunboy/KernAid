@@ -1,9 +1,17 @@
 #![forbid(unsafe_code)]
-//! Pure, fail-closed verification and A/B planning for KernAid device updates.
+//! Fail-closed verification, inactive-target staging, and A/B planning for
+//! KernAid device updates.
 //!
-//! This crate performs no network access, filesystem writes, bootloader changes,
-//! or block-device I/O. Callers provide a completed artifact digest and execute
-//! the returned plans in their separately reviewed platform integration.
+//! This crate performs no network access or bootloader changes. The optional
+//! stager writes only to a caller-preopened inactive destination and fixed
+//! metadata names under a caller-owned private state directory.
+
+mod staging;
+
+pub use staging::{
+    ArtifactStager, PreopenedInactiveTarget, StagingCheckpoint, StagingError, StagingReceipt,
+    StagingRecovery, plan_staged_update,
+};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};

@@ -1,8 +1,10 @@
 # KernAid signed A/B update client v1
 
 `kernaid-update-client` is the device-side verification and planning boundary
-for KernAid updates. It is deliberately a pure Rust library: it performs no
-HTTP requests, filesystem writes, bootloader changes, or block-device access.
+for KernAid updates. It performs no HTTP requests and never changes a
+bootloader. Its staging layer can write only to a destination already opened
+and identified as inactive by trusted platform code; manifests cannot supply a
+destination path or slot.
 
 ## Security contract
 
@@ -20,6 +22,13 @@ HTTP requests, filesystem writes, bootloader changes, or block-device access.
   signature, monotonic sequence, platform, architecture, or validity time.
 - Local rollback and diagnostics are invariant capabilities. No wire field or
   update state can disable either one.
+- `ArtifactStager` accepts only an `AdmittedUpdate`, requires the current
+  entitlement `Updates` capability, and re-evaluates the effective update ring
+  so Fleet `Hold` fails closed for ordinary releases.
+- Before changing destination bytes, the stager durably records a canonical
+  intent. It streams exactly the signed size, requires EOF, hashes SHA-256,
+  syncs the inactive destination, and atomically publishes a receipt. A crash
+  can therefore leave only an interrupted checkpoint, never boot authority.
 
 ## Integration order
 
@@ -27,15 +36,26 @@ HTTP requests, filesystem writes, bootloader changes, or block-device access.
 2. Call `SignedUpdateManifest::import_and_verify` with the provisioned key.
 3. Evaluate platform, architecture, time, ring, and deterministic rollout.
 4. Call `admit_update` and atomically persist its `next_checkpoint`.
-5. Download to ordinary temporary storage outside this crate. Hash the entire
-   artifact and provide `CompletedArtifactEvidence`.
-6. Call `UpdateState::plan_stage`. It selects only the inactive slot and refuses
-   a size or digest mismatch.
-7. The platform layer may execute the returned plan under its own reviewed,
-   privileged boundary. Re-hash the staged target before `confirm_staged`.
+5. Open the inactive destination in trusted platform code. Construct
+   `PreopenedInactiveTarget`; selecting the active slot is rejected and no
+   manifest field participates in destination selection.
+6. Call `ArtifactStager::stage` with the admitted update, effective
+   `UpdateContext`, current entitlement `Updates` boolean, and a streaming
+   reader supplied by transport code. No generic network client is included.
+7. Persist/use the returned `StagingReceipt` with `plan_staged_update`. It binds
+   release, manifest, artifact, active slot and inactive target, and repeats
+   entitlement/ring validation before producing the existing `StagePlan`.
 8. Persist every pure transition before changing boot selection. Arm pending
    boot, consume bounded attempts, then call `mark_good`; explicit failure or
    attempt exhaustion selects the known-good rollback slot.
+
+`ArtifactStager::recovery_status` returns `Interrupted` after a crash or failed
+stream. Regular-file test/image targets are truncated and synced on failure;
+non-truncatable inactive block targets remain unusable because no receipt is
+published. Only an exact retry may replace that residue. A completed receipt
+is retained until the boot planner has durably consumed it and calls
+`clear_completed`. Product integration must hold its per-device update lock
+while using the stager and keep its state directory private.
 
 The application must persist canonical checkpoint and state documents using an
 atomic replace/durable database transaction. An update executor must never be
