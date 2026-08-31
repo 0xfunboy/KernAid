@@ -3806,6 +3806,14 @@ class StaticContractTests(unittest.TestCase):
         self.assertIn("qmp.send_hex_line(correct)", python)
         self.assertIn("KERNAID_RESCUE_FIRSTBOOT_PROMPT_READY_V1 ", python)
         self.assertIn("step=(passphrase|confirmation)", python)
+        self.assertEqual(controller.FIRSTBOOT_PROMPT_TIMEOUT_SECONDS, 600.0)
+        self.assertGreaterEqual(controller.FIRSTBOOT_RESULT_TIMEOUT_SECONDS, 1200.0)
+        self.assertIn(
+            "KERNAID_RESCUE_FIRSTBOOT_PROGRESS_V1 stage=post-confirmation-zero-scan",
+            (REPO_DIR / "crates/rescue-secrets/src/firstboot.rs").read_text(
+                encoding="utf-8"
+            ),
+        )
         self.assertNotIn("cryptsetup luksFormat", shell)
         self.assertIn('"-serial",\n            "pty"', python)
         self.assertIn("qmp.system_powerdown()", python)

@@ -42,6 +42,8 @@ RATE_LIMIT_WAIT_SECONDS = 2.25
 QEMU_START_TIMEOUT_SECONDS = 15.0
 SERIAL_CLOSE_RECHECK_SECONDS = 0.05
 READINESS_TIMEOUT_SECONDS = 1200.0
+FIRSTBOOT_PROMPT_TIMEOUT_SECONDS = 600.0
+FIRSTBOOT_RESULT_TIMEOUT_SECONDS = 1200.0
 CONTROLLER_TIMEOUT_SECONDS = 1800
 QMP_KEY_SETTLE_SECONDS = 0.02
 ACPI_SHUTDOWN_SECONDS = 180.0
@@ -4264,7 +4266,7 @@ def main(arguments: Sequence[str]) -> int:
                 console,
                 "passphrase",
                 0,
-                _deadline(aggregate, READINESS_TIMEOUT_SECONDS),
+                _deadline(aggregate, FIRSTBOOT_PROMPT_TIMEOUT_SECONDS),
                 "firstboot-start",
             )
             qmp.set_deadline(_deadline(aggregate, 10.0))
@@ -4273,7 +4275,7 @@ def main(arguments: Sequence[str]) -> int:
                 console,
                 "confirmation",
                 0,
-                _deadline(aggregate, READINESS_TIMEOUT_SECONDS),
+                _deadline(aggregate, FIRSTBOOT_PROMPT_TIMEOUT_SECONDS),
                 "firstboot-confirmation",
             )
             qmp.set_deadline(_deadline(aggregate, 10.0))
@@ -4281,7 +4283,7 @@ def main(arguments: Sequence[str]) -> int:
             wait_firstboot_attestation(
                 console,
                 confirmation.end(),
-                _deadline(aggregate, READINESS_TIMEOUT_SECONDS),
+                _deadline(aggregate, FIRSTBOOT_RESULT_TIMEOUT_SECONDS),
             )
         initial_version, pre_terminal_version, terminal_epoch_version, device_id = (
             run_lifecycle(

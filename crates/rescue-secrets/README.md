@@ -295,8 +295,12 @@ An initial first-boot boundary is compiled only with
 `experimental-firstboot-provisioner`, which is off by default. The
 `kernaid-rescue-firstboot` binary accepts no arguments and uses only
 `locate_boot_vault()` to retain p3 of the exact USB medium mounted at
-`/run/live/medium`. It verifies canonical profile v1 and accepts only a full
-all-zero classification. Optical boot, locked media, mixed/non-zero media,
+`/run/live/medium`. It verifies canonical profile v1, reads only the complete
+32 KiB redundant-header area before prompting, and recognizes exact Locked
+media immediately. A zero header area is only a candidate: after confirmation,
+the manager performs exactly one complete 8 GiB scan with descriptor identity
+checkpoints, consumes its private proof immediately before `luksFormat`, and
+rejects a non-zero tail without writing. Optical boot, header mismatch,
 identity drift, timeout and cleanup ambiguity fail closed.
 
 The feature-gated binary now runs the complete root-only terminal lifecycle in
@@ -309,7 +313,8 @@ an error or debug value.
 
 The same module pins the exact cryptsetup, mkfs.ext4 and tune2fs paths and
 canonical v1 arguments as descriptor-targeted command blueprints, plus a typed
-lifecycle from zero classification through final locked reclassification. The
+lifecycle from potential-empty preflight through the post-confirmation full
+zero proof and final locked reclassification. The
 executor generates RFC 4122 v4 LUKS/filesystem UUIDs, passes the confirmed
 byte length explicitly to cryptsetup, binds every tool to a child-only
 descriptor, verifies mapping and ext4 identity, mounts privately, creates the

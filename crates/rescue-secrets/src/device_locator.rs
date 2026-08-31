@@ -7,6 +7,10 @@
 //! device or path parameter.
 
 use crate::bounded_process;
+#[cfg(feature = "experimental-firstboot-provisioner")]
+use crate::profile_classifier::{
+    FirstBootPreflightProfile, classify_firstboot_preflight_with_timeout,
+};
 #[cfg(feature = "experimental-vault-manager")]
 use crate::profile_classifier::{
     ProfileClassifierError, VaultPartitionProfile, classify_partition_with_timeout,
@@ -82,6 +86,16 @@ pub enum LocatedVaultClassification {
     /// Every byte in the fixed partition capability is zero.
     Unprovisioned,
     /// Both redundant LUKS2 headers match the pinned outer profile.
+    Locked,
+}
+
+/// Bounded first-boot prompt classification. Potential emptiness is not an
+/// authorization to write; the complete post-confirmation scan remains
+/// mandatory.
+#[cfg(feature = "experimental-firstboot-provisioner")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocatedVaultPreflightClassification {
+    PotentiallyUnprovisioned,
     Locked,
 }
 
@@ -185,6 +199,67 @@ impl LocatedVaultPartition {
             }
             Ok(VaultPartitionProfile::Locked(_)) => Ok(LocatedVaultClassification::Locked),
             Ok(VaultPartitionProfile::ProfileMismatch) => {
+                Err(LocatedVaultClassificationError::ProfileMismatch)
+            }
+            Err(ProfileClassifierError::InvalidCanonicalProfile) => {
+                Err(LocatedVaultClassificationError::ClassifierUnavailable)
+            }
+            Err(
+                ProfileClassifierError::InvalidDescriptor | ProfileClassifierError::MediaChanged,
+            ) => Err(LocatedVaultClassificationError::MediaChanged),
+            Err(ProfileClassifierError::OperationTimedOut) => {
+                Err(LocatedVaultClassificationError::OperationTimedOut)
+            }
+        }
+    }
+
+    /// Inspect only the complete redundant-header area for the first-boot
+    /// prompt gate. Exact Locked media and non-zero mismatches are resolved
+    /// immediately; a zero header area remains merely potential until the
+    /// full descriptor-bound scan after passphrase confirmation.
+    #[cfg(feature = "experimental-firstboot-provisioner")]
+    pub fn classify_firstboot_preflight(
+        &self,
+        timeout: Duration,
+    ) -> Result<LocatedVaultPreflightClassification, LocatedVaultClassificationError> {
+        let deadline = classification_deadline(timeout)?;
+        self.validate_classification_identity(deadline)?;
+        let scan_timeout = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(LocatedVaultClassificationError::OperationTimedOut)?;
+        let mut checkpoint_failure = None;
+        let result =
+            classify_firstboot_preflight_with_timeout(&self.descriptor, scan_timeout, || {
+                if Instant::now() >= deadline {
+                    checkpoint_failure = Some(LocatedVaultClassificationError::OperationTimedOut);
+                    return Err(ProfileClassifierError::OperationTimedOut);
+                }
+                if validate_block_descriptor(
+                    &self.descriptor,
+                    (self.identity.partition_major, self.identity.partition_minor),
+                )
+                .is_err()
+                {
+                    checkpoint_failure = Some(LocatedVaultClassificationError::MediaChanged);
+                    return Err(ProfileClassifierError::MediaChanged);
+                }
+                Ok(())
+            });
+        if let Some(error) = checkpoint_failure {
+            return Err(error);
+        }
+        if result != Err(ProfileClassifierError::OperationTimedOut) {
+            self.validate_classification_identity(deadline)?;
+        }
+        match result {
+            Ok(FirstBootPreflightProfile::PotentiallyUnprovisioned) => {
+                Ok(LocatedVaultPreflightClassification::PotentiallyUnprovisioned)
+            }
+            Ok(FirstBootPreflightProfile::Locked) => {
+                Ok(LocatedVaultPreflightClassification::Locked)
+            }
+            Ok(FirstBootPreflightProfile::ProfileMismatch) => {
                 Err(LocatedVaultClassificationError::ProfileMismatch)
             }
             Err(ProfileClassifierError::InvalidCanonicalProfile) => {
