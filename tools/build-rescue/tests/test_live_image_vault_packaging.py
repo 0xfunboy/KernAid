@@ -97,11 +97,16 @@ class VaultSystemdPackagingTests(unittest.TestCase):
         unit = sections["Unit"]
         service = sections["Service"]
         self.assertEqual(unit["Requires"], "live-config.service")
+        self.assertEqual(
+            unit["Wants"],
+            "kernaid-qemu-native-prompt-journal-proof@boot1.service",
+        )
         self.assertIn("live-config.service", unit["After"].split())
         self.assertIn("systemd-tmpfiles-setup.service", unit["After"].split())
         self.assertEqual(
             set(unit["Before"].split()),
             {
+                "kernaid-qemu-native-prompt-journal-proof@boot1.service",
                 "kernaid-rescue-vaultd.service",
                 "display-manager.service",
                 "getty@tty1.service",
