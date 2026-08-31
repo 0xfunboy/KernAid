@@ -393,6 +393,9 @@ impl DiagnosticCollector for SystemDiagnosticCollector {
             WorkOrderActionId::LinuxFstabDisableMissingUuidV1 => {
                 return Err(LocalHandoffErrorCode::StateMismatch);
             }
+            WorkOrderActionId::WindowsP0DiagnoseV1 => {
+                return Err(LocalHandoffErrorCode::StateMismatch);
+            }
         }
         .map_err(|_| LocalHandoffErrorCode::ExecutionFailed)?;
         if bytes.is_empty() || bytes.len() > MAX_DIAGNOSTIC_BYTES {
@@ -1064,6 +1067,7 @@ mod tests {
                 WorkOrderActionId::LinuxFstabDisableMissingUuidV1 => {
                     Err(LocalHandoffErrorCode::StateMismatch)
                 }
+                WorkOrderActionId::WindowsP0DiagnoseV1 => Err(LocalHandoffErrorCode::StateMismatch),
             }
         }
     }

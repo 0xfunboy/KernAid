@@ -54,6 +54,14 @@ export const workOrderActionCatalog = {
     platforms: ["rescue"],
     localApprovalRequired: true,
   },
+  "windows.p0.diagnose.v1": {
+    version: 1,
+    kind: "diagnosis",
+    risk: "R0",
+    requiredFeature: "fleet",
+    platforms: ["windows"],
+    localApprovalRequired: false,
+  },
 } as const;
 
 export type WorkOrderActionId = keyof typeof workOrderActionCatalog;

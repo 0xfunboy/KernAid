@@ -25,8 +25,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     error::Error,
-    fmt,
-    fs::{self, File, OpenOptions},
+    fmt, fs,
     io::{self, Write},
     path::{Path, PathBuf},
 };
@@ -34,9 +33,17 @@ use zeroize::Zeroizing;
 
 #[cfg(feature = "linux-service")]
 pub mod linux;
+#[cfg(all(feature = "windows-service", any(windows, test)))]
+pub mod windows;
 
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::{
+    fs::File,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+};
+
+#[cfg(not(windows))]
+use std::fs::OpenOptions;
 
 pub const JOURNAL_SCHEMA: &str = "dev.kernaid.fleet.resident-work-order-journal.v1";
 pub const SERVICE_RECEIPT_SCHEMA: &str = "dev.kernaid.fleet.service-receipt.v1";
@@ -223,6 +230,7 @@ pub trait ResidentWorkOrderTransport {
 pub enum ResidentPlatform {
     Linux,
     Rescue,
+    Windows,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1036,6 +1044,7 @@ const fn action_supported(action: WorkOrderActionId, platform: ResidentPlatform)
             matches!(platform, ResidentPlatform::Rescue)
                 && cfg!(any(test, feature = "rescue-fstab-handoff"))
         }
+        WorkOrderActionId::WindowsP0DiagnoseV1 => matches!(platform, ResidentPlatform::Windows),
     }
 }
 
@@ -1414,6 +1423,7 @@ fn cleanup_temporary(path: &Path) -> Result<(), ResidentWorkOrderError> {
     }
 }
 
+#[cfg(not(windows))]
 fn write_atomic(
     directory: &Path,
     name: &str,
@@ -1446,6 +1456,29 @@ fn write_atomic(
         let _ = fs::remove_file(temporary);
     }
     result
+}
+
+#[cfg(windows)]
+fn write_atomic(
+    directory: &Path,
+    name: &str,
+    _temporary_name: &str,
+    bytes: &[u8],
+) -> Result<(), ResidentWorkOrderError> {
+    use atomic_write_file::AtomicWriteFile;
+
+    if bytes.is_empty() || bytes.len() > MAX_JOURNAL_BYTES {
+        return Err(ResidentWorkOrderError::StateCorrupt);
+    }
+    let target = directory.join(name);
+    if let Ok(metadata) = fs::symlink_metadata(&target) {
+        inspect_private_file(&metadata)?;
+    }
+    let mut file = AtomicWriteFile::open(&target)?;
+    file.write_all(bytes)?;
+    file.flush()?;
+    file.commit()?;
+    inspect_private_file(&fs::symlink_metadata(target)?)
 }
 
 #[cfg(unix)]

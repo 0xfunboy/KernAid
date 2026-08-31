@@ -1,0 +1,44 @@
+name: fleet-resident-windows
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cross-build-windows-x86-64:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.18.0
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          targets: x86_64-pc-windows-gnu
+      - name: Install Windows GNU linker
+        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends gcc-mingw-w64-x86-64
+      - name: Targeted Rust and wire-schema checks
+        run: |
+          cargo test --locked -p kernaid-fleet-resident-work-orders --features windows-service --lib
+          pnpm install --frozen-lockfile
+          pnpm --filter @kernaid/fleet-schemas test
+      - name: Cross-build unsigned Windows service
+        run: >-
+          cargo build --locked --release
+          --target x86_64-pc-windows-gnu
+          -p kernaid-fleet-resident-work-orders
+          --features windows-service
+          --bin kernaid-fleet-resident-windows
+      - name: Upload explicitly unsigned development binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: KernAid-Fleet-Resident-windows-x86_64-UNSIGNED
+          path: target/x86_64-pc-windows-gnu/release/kernaid-fleet-resident-windows.exe
+          if-no-files-found: error
+          retention-days: 7

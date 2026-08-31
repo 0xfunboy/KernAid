@@ -5,3 +5,4 @@
 //! cannot execute commands, open host paths, or mutate Windows state.
 
 pub mod diagnostics;
+pub mod resident;

@@ -1,0 +1,16 @@
+{
+  "schema": "dev.kernaid.fleet.resident-windows-service-config.v1",
+  "endpoint": "https://fleet.example.invalid/",
+  "tenantId": "replace-tenant-id",
+  "stateDirectory": "C:\\ProgramData\\KernAid\\FleetResidentWindows",
+  "runtimeStateFile": "C:\\ProgramData\\KernAid\\Fleet\\fleet-runtime.sqlite3",
+  "serviceReceiptAnchorFile": "C:\\ProgramData\\KernAid\\Trust\\fleet-service-receipt.pub",
+  "entitlementAnchorFile": "C:\\ProgramData\\KernAid\\Trust\\fleet-entitlement.pub",
+  "policyAnchorFile": "C:\\ProgramData\\KernAid\\Trust\\fleet-policy.pub",
+  "intervalSeconds": 60,
+  "minimumBackoffSeconds": 2,
+  "maximumBackoffSeconds": 300,
+  "connectTimeoutSeconds": 5,
+  "requestTimeoutSeconds": 60,
+  "leaseSeconds": 300
+}
