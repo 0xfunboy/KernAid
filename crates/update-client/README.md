@@ -43,6 +43,27 @@ given general shell authority. Diagnostics continue from either slot, and
 `plan_local_rollback` remains available without network, entitlement, Fleet
 policy, or a new manifest.
 
+## Offline release issuance
+
+`kernaid-update-issuer` keeps the Ed25519 release seed outside Fleet and emits
+only canonical signed manifests. It refuses symlinked inputs, non-canonical
+content, existing outputs and signing seeds readable by group or other users.
+
+```sh
+cargo run -p kernaid-update-client --bin kernaid-update-issuer -- \
+  generate-key /private/update.seed /private/update.public
+
+cargo run -p kernaid-update-client --bin kernaid-update-issuer -- \
+  sign-manifest /private/update.seed manifest-content.canonical.json \
+  manifest.signed.json
+```
+
+The content document has the same fields as a signed manifest except
+`signature`; it must include schema `dev.kernaid.update.manifest.v1`. The
+public-key file is the unpadded base64url trust anchor provisioned to devices.
+The issuer creates private seeds as mode `0600`, never overwrites any output
+and does not contact the control plane or an artifact server.
+
 ## Focused verification
 
 ```sh
