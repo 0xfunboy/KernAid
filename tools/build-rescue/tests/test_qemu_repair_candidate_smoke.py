@@ -878,6 +878,81 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
         self.assertNotIn('command("mount")', helper)
         self.assertNotIn('command("umount")', helper)
 
+    def test_backup_tamper_failure_diagnostics_are_closed(self) -> None:
+        expected = {
+            "arguments-invalid",
+            "backup-invalid",
+            "caller-invalid",
+            "cleanup-failed",
+            "input-invalid",
+            "key-invalid",
+            "loop-collision",
+            "loop-discovery-failed",
+            "loop-invalid",
+            "mapper-collision",
+            "mapper-discovery-failed",
+            "mapper-open-failed",
+            "tamper-unverified",
+            "tool-failed",
+            "tool-missing",
+            "unexpected",
+        }
+        self.assertEqual(tamper.PUBLIC_FAILURE_CODES, expected)
+        self.assertEqual(controller.TAMPER_HELPER_FAILURE_CODES, expected)
+        for code in sorted(expected):
+            with self.subTest(code=code):
+                stderr = (
+                    "KERNAID_QEMU_REPAIR_VAULT_TAMPER_FAILURE_V1 "
+                    f"code={code}\n"
+                ).encode("ascii")
+                self.assertEqual(
+                    controller.tamper_helper_failure_code(1, b"", stderr),
+                    f"helper-failed-{code}",
+                )
+
+        primary = tamper.ClosedFailure("backup-invalid")
+        self.assertEqual(
+            tamper.public_failure_code(primary, cleanup_failed=False),
+            "backup-invalid",
+        )
+        self.assertEqual(
+            tamper.public_failure_code(primary, cleanup_failed=True),
+            "cleanup-failed",
+        )
+        self.assertEqual(
+            tamper.public_failure_code(RuntimeError("secret"), cleanup_failed=False),
+            "unexpected",
+        )
+
+    def test_backup_tamper_failure_diagnostics_reject_untrusted_bytes(self) -> None:
+        generic = "helper-failed"
+        valid = (
+            b"KERNAID_QEMU_REPAIR_VAULT_TAMPER_FAILURE_V1 "
+            b"code=backup-invalid\n"
+        )
+        rejected = (
+            (2, b"", valid),
+            (0, b"", valid),
+            (1, b"unexpected", valid),
+            (1, b"", valid.rstrip(b"\n")),
+            (1, b"", valid.replace(b"\n", b"\r\n")),
+            (1, b"", valid + b"secret\n"),
+            (
+                1,
+                b"",
+                b"KERNAID_QEMU_REPAIR_VAULT_TAMPER_FAILURE_V1 "
+                b"code=/tmp/secret\n",
+            ),
+        )
+        for returncode, stdout, stderr in rejected:
+            with self.subTest(returncode=returncode, stdout=stdout, stderr=stderr):
+                self.assertEqual(
+                    controller.tamper_helper_failure_code(
+                        returncode, stdout, stderr
+                    ),
+                    generic,
+                )
+
     def test_backup_tamper_inputs_are_descriptor_pinned(self) -> None:
         suffix = (os.getpid() ^ time.time_ns()) & 0xFFFFFFFF
         root = Path("/tmp") / f"kernaid-qemu-repair-candidate.{suffix:08x}"

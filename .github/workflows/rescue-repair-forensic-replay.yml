@@ -1,0 +1,61 @@
+name: rescue repair forensic replay
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: Failed repair-candidate run containing the forensic ISO
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  backup-tamper:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install focused VM tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cryptsetup e2fsprogs ovmf qemu-system-x86 \
+            squashfs-tools udev util-linux xorriso
+          sudo chown root:root /usr/share/OVMF
+          sudo chmod go-w /usr/share/OVMF
+
+      - name: Download exact failed candidate
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_run_id }}
+          name: repair-candidate-forensics
+          path: forensics
+
+      - name: Verify forensic ISO boundary
+        run: |
+          iso="$PWD/forensics/KernAid-Rescue-amd64-repair-candidate.iso"
+          checksum="$iso.sha256"
+          test -f "$iso" && test ! -L "$iso" && test "$(stat -c '%h' "$iso")" = 1
+          test -f "$checksum" && test ! -L "$checksum" && test "$(stat -c '%h' "$checksum")" = 1
+          test "$(stat -c '%s' "$iso")" -gt 0
+          cd "$PWD/forensics"
+          sha256sum -c KernAid-Rescue-amd64-repair-candidate.iso.sha256
+
+      - name: Validate focused replay tooling
+        run: |
+          bash -n tools/build-rescue/qemu-repair-candidate-smoke.sh
+          python3 -B -m unittest \
+            tools/build-rescue/tests/test_qemu_repair_candidate_smoke.py
+
+      - name: Replay only authenticated backup tamper
+        run: |
+          KERNAID_QEMU_SMP=4 \
+            ./tools/build-rescue/qemu-repair-candidate-smoke.sh \
+            uefi backup-tamper \
+            "$PWD/forensics/KernAid-Rescue-amd64-repair-candidate.iso"

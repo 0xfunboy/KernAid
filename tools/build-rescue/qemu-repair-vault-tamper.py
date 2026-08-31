@@ -57,10 +57,43 @@ ATTESTATION = (
     "object=single-authenticated-backup mutation=inode-size-one "
     "mount=false cleanup=complete ready=true"
 )
+FAILURE_CODES = frozenset(
+    {
+        "arguments-invalid",
+        "backup-invalid",
+        "caller-invalid",
+        "input-invalid",
+        "key-invalid",
+        "loop-collision",
+        "loop-discovery-failed",
+        "loop-invalid",
+        "mapper-collision",
+        "mapper-discovery-failed",
+        "mapper-open-failed",
+        "tamper-unverified",
+        "tool-failed",
+        "tool-missing",
+    }
+)
+PUBLIC_FAILURE_CODES = FAILURE_CODES | {"cleanup-failed", "unexpected"}
 
 
 class ClosedFailure(RuntimeError):
-    pass
+    def __init__(self, code: str) -> None:
+        self.code = code if code in FAILURE_CODES else "unexpected"
+        super().__init__(self.code)
+
+
+def public_failure_code(
+    failure: BaseException | None, *, cleanup_failed: bool
+) -> str:
+    """Return one allowlisted diagnostic without exposing exception content."""
+
+    if cleanup_failed:
+        return "cleanup-failed"
+    if isinstance(failure, ClosedFailure):
+        return failure.code
+    return "unexpected"
 
 
 def command(name: str) -> str:
@@ -644,7 +677,11 @@ def main() -> int:
                     cleanup_failed = True
 
     if failure is not None or cleanup_failed:
-        print("KERNAID_QEMU_REPAIR_VAULT_TAMPER_FAILURE_V1 code=closed", file=sys.stderr)
+        code = public_failure_code(failure, cleanup_failed=cleanup_failed)
+        print(
+            f"KERNAID_QEMU_REPAIR_VAULT_TAMPER_FAILURE_V1 code={code}",
+            file=sys.stderr,
+        )
         return 1
     print(ATTESTATION)
     return 0

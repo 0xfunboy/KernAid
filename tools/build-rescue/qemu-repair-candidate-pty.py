@@ -40,6 +40,29 @@ FAILURE_SCENARIOS = (
     "repaird-termination",
     "auto-restore",
 )
+TAMPER_HELPER_FAILURE_CODES = frozenset(
+    {
+        "arguments-invalid",
+        "backup-invalid",
+        "caller-invalid",
+        "cleanup-failed",
+        "input-invalid",
+        "key-invalid",
+        "loop-collision",
+        "loop-discovery-failed",
+        "loop-invalid",
+        "mapper-collision",
+        "mapper-discovery-failed",
+        "mapper-open-failed",
+        "tamper-unverified",
+        "tool-failed",
+        "tool-missing",
+        "unexpected",
+    }
+)
+TAMPER_HELPER_FAILURE = re.compile(
+    rb"KERNAID_QEMU_REPAIR_VAULT_TAMPER_FAILURE_V1 code=([a-z0-9-]+)\n"
+)
 OVMF_ROOTS = (Path("/usr/share/OVMF"), Path("/usr/share/edk2"))
 
 EXECUTE_STATE_CLASSIFIER_SOURCE = r'''
@@ -1153,7 +1176,28 @@ def invoke_vault_tamper(
         b"mount=false cleanup=complete ready=true\n"
     )
     if result.returncode != 0 or result.stdout != expected or result.stderr:
-        raise LIFECYCLE.ClosedFailure("tamper", "helper-failed")
+        raise LIFECYCLE.ClosedFailure(
+            "tamper",
+            tamper_helper_failure_code(
+                result.returncode, result.stdout, result.stderr
+            ),
+        )
+
+
+def tamper_helper_failure_code(
+    returncode: int, stdout: bytes, stderr: bytes
+) -> str:
+    """Preserve only an exact allowlisted helper diagnostic token."""
+
+    if returncode != 1 or stdout:
+        return "helper-failed"
+    match = TAMPER_HELPER_FAILURE.fullmatch(stderr)
+    if match is None:
+        return "helper-failed"
+    code = match.group(1).decode("ascii")
+    if code not in TAMPER_HELPER_FAILURE_CODES:
+        return "helper-failed"
+    return f"helper-failed-{code}"
 
 
 def provision_firstboot(
