@@ -41,7 +41,8 @@ failed logins from one client are temporarily throttled.
 
 ## Configuration
 
-The server requires Node.js 24 or newer and has no package dependencies.
+The server requires the repository-pinned Node.js 24.18.0 and has no package
+dependencies.
 
 | Variable | Required | Default |
 | --- | --- | --- |

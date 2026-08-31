@@ -38,6 +38,14 @@ export const workOrderActionCatalog = {
     platforms: ["linux", "rescue"],
     localApprovalRequired: false,
   },
+  "linux.boot-critical-path.v1": {
+    version: 1,
+    kind: "diagnosis",
+    risk: "R0",
+    requiredFeature: "fleet",
+    platforms: ["linux", "rescue"],
+    localApprovalRequired: false,
+  },
   "linux.fstab.disable-missing-uuid.v1": {
     version: 1,
     kind: "repair",

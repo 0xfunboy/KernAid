@@ -33,6 +33,14 @@ assert.match(
 );
 assert.match(
   dockerfile,
+  /apps\/fleet-console\/work-order-ui\.js[\s\S]+\/opt\/kernaid\/console\/work-order-ui\.js/,
+);
+assert.match(
+  dockerfile,
+  /apps\/fleet-console\/incident-case-ui\.js[\s\S]+\/opt\/kernaid\/console\/incident-case-ui\.js/,
+);
+assert.match(
+  dockerfile,
   /KERNAID_FLEET_SERVICE_RECEIPT_SIGNING_KEY_FILE=\/run\/secrets\/kernaid_fleet_service_receipt_signing_key/,
 );
 assert.match(

@@ -1177,7 +1177,7 @@ test("tenant credentials and authorization audit survive restart", async () => {
   }
 });
 
-test("SQLite v6 migrates its tenant administrator through Fleet v9", async () => {
+test("SQLite v6 migrates its tenant administrator through Fleet v10", async () => {
   let harness = await createHarness();
   const directory = harness.directory;
   const now = harness.now;
@@ -1215,7 +1215,7 @@ test("SQLite v6 migrates its tenant administrator through Fleet v9", async () =>
     const version = database.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    assert.equal(version.user_version, 9);
+    assert.equal(version.user_version, 10);
     database.close();
   } finally {
     await destroyHarness(harness);
@@ -2381,7 +2381,7 @@ test("policy anchor, bundle, and assignment survive SQLite restart", async () =>
     const version = database.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    assert.equal(version.user_version, 9);
+    assert.equal(version.user_version, 10);
     const nonce = database
       .prepare(
         `SELECT nonce_sha256 FROM policy_pull_nonces
@@ -2684,7 +2684,7 @@ test("signed entitlement pulls isolate assignments and reject replay, key mismat
   }
 });
 
-test("SQLite v3 migrates through v9 and entitlement checkpoints survive restart", async () => {
+test("SQLite v3 migrates through v10 and entitlement checkpoints survive restart", async () => {
   let harness = await createHarness();
   const directory = harness.directory;
   const now = harness.now;
@@ -2755,7 +2755,7 @@ test("SQLite v3 migrates through v9 and entitlement checkpoints survive restart"
     const version = database.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    assert.equal(version.user_version, 9);
+    assert.equal(version.user_version, 10);
     const document = database
       .prepare(
         `SELECT highest_sequence, envelope_sha256, canonical_json
@@ -2981,7 +2981,7 @@ test("signed update pulls bind target and ring, filter eligibility, and reject r
   }
 });
 
-test("SQLite v4 migrates through v9 and update checkpoints survive restart", async () => {
+test("SQLite v4 migrates through v10 and update checkpoints survive restart", async () => {
   let harness = await createHarness();
   const directory = harness.directory;
   const now = harness.now;
@@ -3027,7 +3027,7 @@ test("SQLite v4 migrates through v9 and update checkpoints survive restart", asy
     const version = database.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    assert.equal(version.user_version, 9);
+    assert.equal(version.user_version, 10);
     const checkpoint = database
       .prepare(
         `SELECT highest_sequence, manifest_sha256
@@ -3193,6 +3193,7 @@ test("typed work orders require governance and explicit write approval", async (
             revision: 1,
             assignments: { deviceIds: [device.deviceId] },
             allowedActionIds: [
+              "linux.boot-critical-path.v1",
               "linux.filesystem.health.v1",
               "linux.fstab.disable-missing-uuid.v1",
               "linux.storage.health.v1",
@@ -3638,7 +3639,7 @@ test("work-order cancellation, expiry, and audit survive restart", async () => {
     const version = database.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    assert.equal(version.user_version, 9);
+    assert.equal(version.user_version, 10);
     database.close();
   } finally {
     await destroyHarness(harness);

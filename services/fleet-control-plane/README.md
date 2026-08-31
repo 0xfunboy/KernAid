@@ -311,7 +311,7 @@ secrets, policy assignment isolation, policy rollback/conflict, restart
 persistence, entitlement assignment/replay/tamper/rollback/revocation, update
 target/ring filtering, update anti-rollback/replay, exact signed service
 receipts, receipt key/anchor mismatch, durable receipt sequence, SQLite
-v3-to-v9 migration, tenant role enforcement, credential revocation,
+v3-to-v10 migration, tenant role enforcement, credential revocation,
 work-order catalog/governance/approval/signature/replay/expiry/restart,
 incident RBAC/source isolation/linking/signed closure/restart, cross-tenant
 denial, authorization audit/restart and optional same-origin console serving.

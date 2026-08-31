@@ -49,7 +49,11 @@ test("work-order creation emits only the closed server payload", () => {
 test("readiness, actions, receipt labels, and minimized response are fail closed", () => {
   assert.deepEqual(
     workOrderActionsForPlatform("linux").map((action) => action.actionId),
-    ["linux.filesystem.health.v1", "linux.storage.health.v1"],
+    [
+      "linux.filesystem.health.v1",
+      "linux.storage.health.v1",
+      "linux.boot-critical-path.v1",
+    ],
   );
   assert.equal(
     workOrderReadiness({

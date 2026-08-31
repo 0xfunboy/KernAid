@@ -81,6 +81,7 @@ test("work-order claim and result use closed direct-domain signatures", () => {
 
 test("work-order schemas reject shell-shaped fields and unknown actions", () => {
   assert.deepEqual(Object.keys(workOrderActionCatalog).sort(), [
+    "linux.boot-critical-path.v1",
     "linux.filesystem.health.v1",
     "linux.fstab.disable-missing-uuid.v1",
     "linux.storage.health.v1",

@@ -65,7 +65,7 @@ On the internal build host used during this phase:
 | --------------------------- | ------------------------------------------------------------------------------------ |
 | `/home/funboy/kernaid`      | Only canonical checkout of `0xfunboy/KernAid`, branch `main`                         |
 | `/home/funboy/KernAid-dist` | Local staging for qualified/private artifacts; not another repository                |
-| `kaid-site.service`         | Node.js 24 site process on loopback                                                  |
+| `kaid-site.service`         | Node.js 24.18.0 site process on loopback                                             |
 | `kaid-cloudflared.service`  | Tunnel for `https://kaid.funboy.eu.cc`                                               |
 | `kernaid-fleet.service`     | Node.js 24.18.0 Fleet v8 origin on loopback, exposed at `https://fleet.funboy.eu.cc` |
 | `~/.config/kaid-site/`      | Operator-owned password and tunnel credentials; never committed                      |
