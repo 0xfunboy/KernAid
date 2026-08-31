@@ -152,6 +152,14 @@ class RepairCandidatePackagingTests(unittest.TestCase):
             "rescue-fstab-production-candidate,rescue-crypttab-production-candidate",
             workflow,
         )
+        self.assertEqual(
+            workflow.count(
+                "rescue-fstab-production-candidate,"
+                "rescue-crypttab-production-candidate,"
+                "rescue-ext4-fsck-production-candidate"
+            ),
+            2,
+        )
         self.assertEqual(workflow.count("--features custom-protocol"), 1)
         self.assertIn("-p kernaid-linux-blockfd", workflow)
         self.assertIn("KERNAID_BLOCKFD_PROBE_BINARY=", workflow)
