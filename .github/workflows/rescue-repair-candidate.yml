@@ -233,7 +233,7 @@ jobs:
           path: |
             KernAid-Rescue-amd64-repair-candidate.iso
             KernAid-Rescue-amd64-repair-candidate.iso.sha256
-          if-no-files-found: error
+          if-no-files-found: ignore
           retention-days: 1
 
       - name: Upload repair candidate ISO

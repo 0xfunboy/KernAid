@@ -106,6 +106,8 @@ class VaultSystemdPackagingTests(unittest.TestCase):
         self.assertEqual(
             set(unit["Before"].split()),
             {
+                "plymouth-quit.service",
+                "plymouth-quit-wait.service",
                 "kernaid-qemu-native-prompt-journal-proof@boot1.service",
                 "kernaid-rescue-vaultd.service",
                 "display-manager.service",
