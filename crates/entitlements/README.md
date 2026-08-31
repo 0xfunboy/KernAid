@@ -30,3 +30,27 @@ verified feature set and lease state.
 The crate does not store signing seeds, fetch licenses or grant broker access.
 Private vendor signing material belongs in the control plane or an offline
 release signer; the product receives only the pinned public trust anchor.
+
+## Offline issuance
+
+`kernaid-entitlement-issuer` is the offline release-side tool. It refuses
+symlinked inputs, existing outputs, broadly readable seed files and
+non-canonical claims. The control plane never needs the signing seed.
+
+```bash
+cargo run -p kernaid-entitlements --bin kernaid-entitlement-issuer -- \
+  generate-key /private/entitlement.seed /private/entitlement.public
+
+cargo run -p kernaid-entitlements --bin kernaid-entitlement-issuer -- \
+  sign-entitlement /private/entitlement.seed claims.canonical.json \
+  entitlement.signed.json
+
+cargo run -p kernaid-entitlements --bin kernaid-entitlement-issuer -- \
+  sign-revocations /private/entitlement.seed revocations.canonical.json \
+  revocations.signed.json
+```
+
+The public-key file contains the unpadded base64url Ed25519 trust anchor. Seed
+and signed outputs are created with owner-only permissions and are never
+overwritten. Claims must already be exact compact canonical JSON; this prevents
+an operator from signing a visually ambiguous or duplicate-key source.

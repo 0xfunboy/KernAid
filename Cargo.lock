@@ -2325,9 +2325,12 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
+ "rand_core 0.6.4",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
+ "zeroize",
 ]
 
 [[package]]
