@@ -1,0 +1,294 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="referrer" content="no-referrer" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; base-uri 'none'; form-action 'self'; object-src 'none'"
+    />
+    <meta name="kernaid-api-base" content="" />
+    <title>KernAid Fleet Console</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="noise" aria-hidden="true"></div>
+    <div class="shell">
+      <aside class="rail">
+        <a class="brand" href="/console/" aria-label="KernAid Fleet home">
+          <span class="brand-mark"><i></i><b>K</b></span>
+          <span><strong>KernAid</strong><small>Fleet Console</small></span>
+        </a>
+        <nav aria-label="Fleet sections">
+          <button class="nav-item active" data-view="overview">
+            <span>01</span>Overview
+          </button>
+          <button class="nav-item" data-view="devices">
+            <span>02</span>Devices
+          </button>
+          <button class="nav-item" data-view="assets">
+            <span>03</span>Assets
+          </button>
+          <button class="nav-item" data-view="enrollment">
+            <span>04</span>Enrollment
+          </button>
+        </nav>
+        <div class="rail-foot">
+          <span class="connection-dot" id="connection-dot"></span>
+          <div>
+            <small>Control plane</small
+            ><strong id="connection-label">Checking…</strong>
+          </div>
+        </div>
+      </aside>
+
+      <main>
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">Enterprise operations</p>
+            <h1 id="view-title">Fleet overview</h1>
+          </div>
+          <div class="top-actions">
+            <span class="tenant-chip" id="tenant-chip">No tenant</span>
+            <button class="button secondary" id="refresh-button" type="button">
+              Refresh
+            </button>
+            <button
+              class="avatar"
+              id="session-button"
+              type="button"
+              aria-label="Open session menu"
+            >
+              OP
+            </button>
+          </div>
+        </header>
+
+        <section class="workspace" id="workspace" aria-live="polite">
+          <div class="summary-grid">
+            <article class="metric signal">
+              <p>Enrolled tools</p>
+              <strong id="metric-devices">—</strong>
+              <small id="metric-devices-detail">Awaiting session</small>
+            </article>
+            <article class="metric">
+              <p>Observed assets</p>
+              <strong id="metric-assets">—</strong>
+              <small id="metric-assets-detail">Inventory registry</small>
+            </article>
+            <article class="metric">
+              <p>Needs attention</p>
+              <strong id="metric-attention">—</strong>
+              <small>Current signed snapshots</small>
+            </article>
+            <article class="metric">
+              <p>Revoked</p>
+              <strong id="metric-revoked">—</strong>
+              <small>Blocked from future upload</small>
+            </article>
+          </div>
+
+          <div class="content-grid">
+            <section class="panel fleet-panel" data-panel="overview devices">
+              <div class="panel-head">
+                <div>
+                  <p class="eyebrow">Identity registry</p>
+                  <h2>KernAid devices</h2>
+                </div>
+                <div class="table-tools">
+                  <label
+                    ><span class="sr-only">Filter devices</span
+                    ><input
+                      id="device-filter"
+                      type="search"
+                      placeholder="Filter devices"
+                  /></label>
+                  <button
+                    class="button primary"
+                    id="open-enrollment"
+                    type="button"
+                  >
+                    New enrollment
+                  </button>
+                </div>
+              </div>
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Device</th>
+                      <th>Runtime</th>
+                      <th>Sequence</th>
+                      <th>Last seen</th>
+                      <th>Status</th>
+                      <th><span class="sr-only">Actions</span></th>
+                    </tr>
+                  </thead>
+                  <tbody id="device-rows"></tbody>
+                </table>
+                <div class="empty" id="devices-empty">
+                  <strong>No enrolled devices</strong>
+                  <p>Create a one-time token, then enroll Desk or Rescue.</p>
+                </div>
+              </div>
+            </section>
+
+            <aside class="panel posture" data-panel="overview">
+              <div class="panel-head">
+                <div>
+                  <p class="eyebrow">Trust posture</p>
+                  <h2>Upload boundary</h2>
+                </div>
+                <span class="verified">Signed</span>
+              </div>
+              <ol>
+                <li>
+                  <i>1</i>
+                  <div>
+                    <strong>One-time enrollment</strong
+                    ><span>Expiring token, retained only as a hash.</span>
+                  </div>
+                </li>
+                <li>
+                  <i>2</i>
+                  <div>
+                    <strong>Device proof</strong
+                    ><span>Ed25519 identity is bound to its tenant.</span>
+                  </div>
+                </li>
+                <li>
+                  <i>3</i>
+                  <div>
+                    <strong>Replay resistance</strong
+                    ><span>Monotonic inventory sequences fail closed.</span>
+                  </div>
+                </li>
+                <li>
+                  <i>4</i>
+                  <div>
+                    <strong>Minimal inventory</strong
+                    ><span
+                      >No paths, IPs, emails, serials or raw diagnostics.</span
+                    >
+                  </div>
+                </li>
+              </ol>
+            </aside>
+
+            <section class="panel assets-panel" data-panel="overview assets">
+              <div class="panel-head">
+                <div>
+                  <p class="eyebrow">Observed machines</p>
+                  <h2>Asset health</h2>
+                </div>
+                <label class="search"
+                  ><span class="sr-only">Filter assets</span
+                  ><input
+                    id="asset-filter"
+                    type="search"
+                    placeholder="Filter assets"
+                /></label>
+              </div>
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Asset</th>
+                      <th>Platform</th>
+                      <th>Health</th>
+                      <th>Findings</th>
+                      <th>Observed</th>
+                      <th>Source</th>
+                    </tr>
+                  </thead>
+                  <tbody id="asset-rows"></tbody>
+                </table>
+                <div class="empty" id="assets-empty">
+                  <strong>No signed inventories</strong>
+                  <p>
+                    Assets appear after an enrolled device uploads its first
+                    envelope.
+                  </p>
+                </div>
+              </div>
+            </section>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <dialog id="login-dialog" class="modal" aria-labelledby="login-title">
+      <form method="dialog" id="login-form">
+        <div class="modal-mark">
+          <span class="brand-mark"><i></i><b>K</b></span>
+        </div>
+        <p class="eyebrow">Authenticated operations</p>
+        <h2 id="login-title">Connect to your organization</h2>
+        <p class="modal-copy">
+          Use the tenant identifier and administrator token issued by the Fleet
+          control plane. The token stays in this browser tab only.
+        </p>
+        <label
+          >Tenant ID<input
+            id="tenant-input"
+            name="tenant"
+            autocomplete="organization"
+            required
+            maxlength="128"
+        /></label>
+        <label
+          >Administrator token<input
+            id="token-input"
+            name="token"
+            type="password"
+            autocomplete="current-password"
+            required
+        /></label>
+        <p class="form-error" id="login-error" role="alert"></p>
+        <button class="button primary wide" type="submit">
+          Open Fleet Console
+        </button>
+      </form>
+    </dialog>
+
+    <dialog
+      id="enrollment-dialog"
+      class="modal"
+      aria-labelledby="enrollment-title"
+    >
+      <form method="dialog" id="enrollment-form">
+        <button class="modal-close" value="cancel" aria-label="Close">×</button>
+        <p class="eyebrow">Device onboarding</p>
+        <h2 id="enrollment-title">Create a one-time token</h2>
+        <p class="modal-copy">
+          The token authorizes one KernAid identity. It expires automatically
+          and cannot be used twice.
+        </p>
+        <label
+          >Expires in<select id="ttl-input" name="ttl">
+            <option value="900">15 minutes</option>
+            <option value="3600" selected>1 hour</option>
+            <option value="14400">4 hours</option>
+          </select></label
+        >
+        <button class="button primary wide" type="submit">
+          Generate token
+        </button>
+        <section class="token-result" id="token-result" hidden>
+          <span>Copy now — this value is shown once</span>
+          <code id="enrollment-token"></code>
+          <button class="button secondary wide" id="copy-token" type="button">
+            Copy token
+          </button>
+          <small id="token-expiry"></small>
+        </section>
+        <p class="form-error" id="enrollment-error" role="alert"></p>
+      </form>
+    </dialog>
+
+    <div class="toast" id="toast" role="status"></div>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
