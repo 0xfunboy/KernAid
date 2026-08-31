@@ -33,14 +33,14 @@ schema.
 | Path                           | Responsibility                                                                                     | Current boundary                                                                               |
 | ------------------------------ | -------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
 | `crates/fleet-client`          | Canonical Ed25519 enrollment and per-asset inventory envelopes                                     | Offline/transport-neutral; reuses the existing protected device identity                       |
-| `crates/fleet-runtime`         | Durable SQLite outbox and monotonic inventory sequencing                                           | Local protected state; no transport credential storage                                         |
+| `crates/fleet-runtime`         | Durable SQLite outbox, inventory sequencing and verified entitlement state                          | External vendor anchor; paid features fail closed while diagnosis/export/rollback stay available |
 | `packages/fleet-schemas`       | Matching Node.js wire validation and canonical signing bytes                                       | Strict bounded v1 schemas                                                                      |
 | `services/fleet-control-plane` | Tenant registry, one-time enrollment, signed inventory/audit ingestion, revocation and tenant APIs | Loopback HTTP origin deployed behind a TLS Cloudflare Tunnel for internal engineering          |
 | `apps/fleet-console`           | Same-origin operator inventory and enrollment UI                                                   | Internal engineering console; tenant admin token remains in browser session storage only       |
 | `crates/fleet-policy`          | Centrally signed, offline-capable restrictive policy bundle                                        | Can only narrow local permission; diagnostics and an already-started rollback remain available |
 | `crates/fleet-audit`           | Canonical signed audit events and tamper-evident chain checkpoints                                 | Digest-only device protocol with central signature, sequence and chain verification            |
 | `crates/entitlements`          | Signed offline entitlements and revocation checkpoints                                             | Paid capabilities degrade without disabling diagnostics, report export or rollback             |
-| `crates/update-client`         | Signed A/B release admission and boot-state planner                                                | External trust anchor, monotonic manifests, ring/rollout/time gates and failed-boot rollback   |
+| `crates/update-client`         | Signed A/B release admission, offline issuer and boot-state planner                                 | External trust anchor, monotonic manifests, ring/rollout/time gates and failed-boot rollback   |
 
 The control plane binds every enrolled `KA-…` device ID to the raw Ed25519
 public key encoded in its canonical SPKI. Enrollment tokens are random,
@@ -59,6 +59,9 @@ and contains no enrollment or administrator token in plaintext.
 | `POST /v1/enrollments`                                | Signed request plus one-time token                  | Bind the device identity to the tenant                      |
 | `POST /v1/inventories`                                | Enrolled-device Ed25519 signature                   | Submit one privacy-minimized asset envelope                 |
 | `POST /v1/audit-events`                               | Enrolled-device Ed25519 signature                   | Append one canonical digest-only chained event              |
+| `POST /v1/policy-pulls`                               | Enrolled-device Ed25519 signature                   | Return only signed policy bundles applicable to that device |
+| `POST /v1/tenants/:tenantId/policy-trust-anchor`      | Tenant admin bearer token                           | Set the tenant policy public key exactly once               |
+| `POST /v1/tenants/:tenantId/policies`                 | Tenant admin bearer token                           | Verify and publish an already-signed canonical policy       |
 | `GET /v1/tenants/:tenantId/devices`                   | Tenant admin bearer token                           | List tenant devices                                         |
 | `GET /v1/tenants/:tenantId/assets`                    | Tenant admin bearer token                           | List current tenant assets                                  |
 | `GET /v1/tenants/:tenantId/audit-events`              | Tenant admin bearer token                           | List bounded minimized audit events                         |
@@ -119,10 +122,11 @@ tenant credentials remain owner-only outside source control.
 The remaining RC work is:
 
 1. wire the device runtime into Desk and Rescue lifecycle services;
-2. add authenticated signed policy distribution and persistent device policy
-   checkpoints;
-3. connect entitlement verification to product feature gates and issuance;
-4. connect the signed A/B planner to artifact download, inactive-slot writes,
+2. persist pulled policy checkpoints in the Desk/Rescue device lifecycle;
+3. distribute already-signed entitlements through Fleet and bind the runtime
+   capability result to product feature gates;
+4. connect the signed A/B planner and offline release issuer to artifact
+   download, inactive-slot writes,
    bootloader integration and update-service rollout;
 5. add production Access/rate-limit policy and an automated retained backup
    schedule around the now-proven recovery path;
