@@ -173,6 +173,13 @@ see [`deploy/fleet`](../../deploy/fleet/README.md).
 
 ## Operator flow
 
+For the guided, off-default path, use the
+[Fleet onboarding wizard](../../tools/fleet-onboarding/README.md). It performs
+health/preflight, reads secrets only from owner-only files, creates the tenant
+and short-lived single-use device bundle, and retains the one-time-visible
+admin credential separately without printing either token. The equivalent
+manual protocol is:
+
 1. Read the root token locally and call `POST /v1/tenants` with `{}`. Retain the
    returned admin token in the tenant secret store; it cannot be recovered.
 2. Open the console at `/console/`, enter the tenant ID and admin token, then

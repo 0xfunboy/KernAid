@@ -41,6 +41,7 @@ schema.
 | `crates/fleet-audit`           | Canonical signed audit events and tamper-evident chain checkpoints                                 | Digest-only device protocol with central signature, sequence and chain verification              |
 | `crates/entitlements`          | Signed offline entitlements and revocation checkpoints                                             | Paid capabilities degrade without disabling diagnostics, report export or rollback               |
 | `crates/update-client`         | Signed A/B release admission, offline issuer and boot-state planner                                | External trust anchor, monotonic manifests, ring/rollout/time gates and failed-boot rollback     |
+| `tools/fleet-onboarding`       | Guided tenant creation and short-lived one-device provisioning bundle                              | Off-default CLI; owner-only files, no token output, shell, signing, or remote-command capability |
 
 The control plane binds every enrolled `KA-…` device ID to the raw Ed25519
 public key encoded in its canonical SPKI. Enrollment tokens are random,
@@ -100,6 +101,12 @@ corepack pnpm --filter @kernaid/fleet-control-plane start
 The default listener is `127.0.0.1:7341`. Keep it on loopback and terminate
 public TLS at the reviewed reverse proxy/tunnel. Do not put root or tenant
 tokens in source, images, command history, URLs or browser persistent storage.
+
+For tenant and first-device provisioning, use the off-default
+[Fleet onboarding wizard](../tools/fleet-onboarding/README.md). It checks
+`/healthz`, creates the tenant, stores its non-recoverable admin credential in
+a separate owner-only file, and emits a distinct short-lived single-use device
+bundle without printing any token value.
 
 ## Policy and entitlement invariants
 

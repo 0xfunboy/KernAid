@@ -1,0 +1,14 @@
+{
+  "name": "@kernaid/fleet-onboarding-wizard",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "24.18.0"
+  },
+  "scripts": {
+    "check": "node --check cli.mjs && node --check lib.mjs && node --check verify.mjs && node --check test/onboarding.test.mjs",
+    "lint": "node verify.mjs",
+    "test": "node --test test/onboarding.test.mjs && node verify.mjs"
+  }
+}
