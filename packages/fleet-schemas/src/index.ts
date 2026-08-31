@@ -3,6 +3,7 @@ export * from "./audit.js";
 export * from "./enrollment.js";
 export * from "./entitlement.js";
 export * from "./inventory.js";
+export * from "./incident-case.js";
 export * from "./policy.js";
 export * from "./service-receipt.js";
 export * from "./update.js";

@@ -82,6 +82,10 @@ upload or arbitrary metadata API.
   the existing signed service receipt. The delivered approval is organizational
   proof only: Core/broker still require a fresh local approval, backup,
   verification and rollback before any write.
+- Incident cases are tenant-scoped, device/asset bound and digest-only. They
+  link compatible work orders without copying diagnostics, evidence or PII.
+  Operators manage the open workflow; only an administrator can freeze it into
+  a canonical report acknowledged by an externally keyed service receipt.
 
 ## API
 
@@ -123,6 +127,12 @@ and is bounded to 64 KiB, matching the Rust verifier.
 | `POST` | `/v1/tenants/:tenantId/work-orders/:workOrderId/approve`        | Admin                  | Explicitly approve one write intent          |
 | `POST` | `/v1/tenants/:tenantId/work-orders/:workOrderId/cancel`         | Operator or admin      | Cancel an unleased order                     |
 | `GET`  | `/v1/tenants/:tenantId/work-order-events`                       | Operator or admin      | Digest-only transition audit                 |
+| `GET`  | `/v1/tenants/:tenantId/incident-cases`                          | Operator or admin      | Bounded cases and linked state digests       |
+| `POST` | `/v1/tenants/:tenantId/incident-cases`                          | Operator or admin      | Open a device/asset case                     |
+| `POST` | `/v1/tenants/:tenantId/incident-cases/:caseId/update`           | Operator or admin      | Update bounded open workflow metadata        |
+| `POST` | `/v1/tenants/:tenantId/incident-cases/:caseId/work-orders`      | Operator or admin      | Link a compatible typed work order           |
+| `POST` | `/v1/tenants/:tenantId/incident-cases/:caseId/close`            | Admin                  | Seal canonical report and signed receipt     |
+| `GET`  | `/v1/tenants/:tenantId/incident-case-events`                    | Operator or admin      | Digest-only case timeline                    |
 | `POST` | `/v1/tenants/:tenantId/devices/:deviceId/revoke`                | Operator or admin      | Permanently revoke ingestion                 |
 
 Tenant creation takes an exact empty object. Enrollment-token creation takes:
@@ -301,7 +311,7 @@ secrets, policy assignment isolation, policy rollback/conflict, restart
 persistence, entitlement assignment/replay/tamper/rollback/revocation, update
 target/ring filtering, update anti-rollback/replay, exact signed service
 receipts, receipt key/anchor mismatch, durable receipt sequence, SQLite
-v3-to-v8 migration, tenant role enforcement, credential revocation,
+v3-to-v9 migration, tenant role enforcement, credential revocation,
 work-order catalog/governance/approval/signature/replay/expiry/restart,
-cross-tenant denial, authorization audit/restart and optional same-origin
-console serving.
+incident RBAC/source isolation/linking/signed closure/restart, cross-tenant
+denial, authorization audit/restart and optional same-origin console serving.

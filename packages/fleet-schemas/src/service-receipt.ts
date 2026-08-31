@@ -23,6 +23,7 @@ export const fleetServiceOperations = [
   "entitlement_pull",
   "work_order_claim",
   "work_order_result",
+  "incident_case_close",
 ] as const;
 export type FleetServiceOperation = (typeof fleetServiceOperations)[number];
 

@@ -1,5 +1,16 @@
 import { boundedSignedDocument } from "./publish-document.js";
 import {
+  assertMinimizedIncidentCase,
+  canonicalIncidentReport,
+  closeIncidentPayload,
+  createIncidentPayload,
+  incidentOutcomes,
+  incidentSeverities,
+  incidentStatuses,
+  linkIncidentPayload,
+  updateIncidentPayload,
+} from "./incident-case-ui.js";
+import {
   assertMinimizedWorkOrder,
   createWorkOrderPayload,
   workOrderActions,
@@ -29,6 +40,10 @@ const state = {
   workOrders: [],
   workOrderEvents: [],
   workOrderError: "",
+  incidents: [],
+  incidentEvents: [],
+  incidentError: "",
+  activeIncident: null,
   view: "overview",
 };
 
@@ -109,6 +124,30 @@ const elements = {
   workOrderApprovalWarning: document.querySelector(
     "#work-order-approval-warning",
   ),
+  incidentRows: document.querySelector("#incident-rows"),
+  incidentEvents: document.querySelector("#incident-events"),
+  incidentFilter: document.querySelector("#incident-filter"),
+  incidentError: document.querySelector("#incident-error"),
+  incidentDialog: document.querySelector("#incident-dialog"),
+  incidentForm: document.querySelector("#incident-form"),
+  incidentFormError: document.querySelector("#incident-form-error"),
+  incidentSource: document.querySelector("#incident-source"),
+  incidentSeverity: document.querySelector("#incident-severity"),
+  incidentAssignee: document.querySelector("#incident-assignee"),
+  incidentUpdateDialog: document.querySelector("#incident-update-dialog"),
+  incidentUpdateForm: document.querySelector("#incident-update-form"),
+  incidentUpdateError: document.querySelector("#incident-update-error"),
+  incidentUpdateStatus: document.querySelector("#incident-update-status"),
+  incidentUpdateSeverity: document.querySelector("#incident-update-severity"),
+  incidentUpdateAssignee: document.querySelector("#incident-update-assignee"),
+  incidentLinkDialog: document.querySelector("#incident-link-dialog"),
+  incidentLinkForm: document.querySelector("#incident-link-form"),
+  incidentLinkError: document.querySelector("#incident-link-error"),
+  incidentLinkOrder: document.querySelector("#incident-link-order"),
+  incidentCloseDialog: document.querySelector("#incident-close-dialog"),
+  incidentCloseForm: document.querySelector("#incident-close-form"),
+  incidentCloseError: document.querySelector("#incident-close-error"),
+  incidentOutcome: document.querySelector("#incident-outcome"),
   publish: document.querySelector("#publish-dialog"),
   publishClose: document.querySelector("#publish-close"),
   publishForm: document.querySelector("#publish-form"),
@@ -225,6 +264,13 @@ function friendlyApiError(code, status) {
       "Signed policy or entitlement does not authorize this action for the selected device.",
     work_order_state_conflict:
       "The work order changed state. Refresh and try again.",
+    incident_case_replay:
+      "That request identifier already belongs to a different case.",
+    incident_case_state_conflict:
+      "The incident changed state. Refresh and try again.",
+    incident_case_source_not_found:
+      "The selected device or asset is no longer available.",
+    incident_case_mismatch: "The incident identifier does not match the path.",
     device_revoked: "The selected device has been revoked.",
   };
   if (code && messages[code]) return messages[code];
@@ -299,6 +345,36 @@ function workOrderEventItems(payload) {
     }));
 }
 
+function incidentItems(payload) {
+  return items(payload)
+    .filter(
+      (incident) =>
+        incident !== null &&
+        typeof incident === "object" &&
+        !Array.isArray(incident),
+    )
+    .map((incident) => assertMinimizedIncidentCase(incident));
+}
+
+function incidentEventItems(payload) {
+  return items(payload)
+    .filter(
+      (event) =>
+        event !== null && typeof event === "object" && !Array.isArray(event),
+    )
+    .map((event) => ({
+      tenantId: event.tenantId,
+      sequence: event.sequence,
+      caseId: event.caseId,
+      occurredAt: event.occurredAt,
+      kind: event.kind,
+      actorType: event.actorType,
+      actorId: event.actorId,
+      status: event.status,
+      detailSha256: event.detailSha256,
+    }));
+}
+
 async function loadFleet() {
   if (!state.tenantId || !state.token) return false;
   const encodedTenant = encodeURIComponent(state.tenantId);
@@ -311,6 +387,8 @@ async function loadFleet() {
     updatesResult,
     workOrdersResult,
     workOrderEventsResult,
+    incidentsResult,
+    incidentEventsResult,
   ] = await Promise.allSettled([
     request(`/v1/tenants/${encodedTenant}/devices`),
     request(`/v1/tenants/${encodedTenant}/assets`),
@@ -320,6 +398,8 @@ async function loadFleet() {
     request(`/v1/tenants/${encodedTenant}/update-manifests`),
     request(`/v1/tenants/${encodedTenant}/work-orders`),
     request(`/v1/tenants/${encodedTenant}/work-order-events`),
+    request(`/v1/tenants/${encodedTenant}/incident-cases`),
+    request(`/v1/tenants/${encodedTenant}/incident-case-events`),
   ]);
   if (devicesResult.status === "rejected") throw devicesResult.reason;
   if (assetsResult.status === "rejected") throw assetsResult.reason;
@@ -330,6 +410,8 @@ async function loadFleet() {
     updatesResult,
     workOrdersResult,
     workOrderEventsResult,
+    incidentsResult,
+    incidentEventsResult,
   ]) {
     if (
       result.status === "rejected" &&
@@ -381,6 +463,25 @@ async function loadFleet() {
     state.workOrderError =
       "Work-order data violated the minimized console boundary.";
   }
+  try {
+    state.incidents =
+      incidentsResult.status === "fulfilled"
+        ? incidentItems(incidentsResult.value)
+        : [];
+    state.incidentEvents =
+      incidentEventsResult.status === "fulfilled"
+        ? incidentEventItems(incidentEventsResult.value)
+        : [];
+    state.incidentError = incidentErrorMessage([
+      incidentsResult,
+      incidentEventsResult,
+    ]);
+  } catch {
+    state.incidents = [];
+    state.incidentEvents = [];
+    state.incidentError =
+      "Incident data violated the digest-only console boundary.";
+  }
   state.governanceError = governanceErrorMessage([
     policiesResult,
     entitlementsResult,
@@ -390,7 +491,8 @@ async function loadFleet() {
   return (
     state.auditError === "" &&
     state.governanceError === "" &&
-    state.workOrderError === ""
+    state.workOrderError === "" &&
+    state.incidentError === ""
   );
 }
 
@@ -419,6 +521,15 @@ function workOrderErrorMessage(results) {
   return "Work-order state could not be loaded. Refresh to retry.";
 }
 
+function incidentErrorMessage(results) {
+  const failed = results.filter((result) => result.status === "rejected");
+  if (failed.length === 0) return "";
+  if (failed.every((result) => result.reason?.status === 404)) {
+    return "Incident cases are unavailable on this control-plane version.";
+  }
+  return "Incident case state could not be loaded. Refresh to retry.";
+}
+
 function render() {
   document.querySelector("#tenant-chip").textContent =
     state.tenantId || "No tenant";
@@ -443,6 +554,7 @@ function render() {
   renderAudit();
   renderGovernance();
   renderWorkOrders();
+  renderIncidents();
   applyView();
 }
 
@@ -863,6 +975,188 @@ function renderWorkOrderEvents(query) {
     state.workOrderError !== "" || events.length !== 0;
 }
 
+function renderIncidents() {
+  const query = elements.incidentFilter.value.trim().toLowerCase();
+  const incidents = state.incidents.filter((incident) =>
+    JSON.stringify([
+      incident.caseId,
+      incident.source.deviceId,
+      incident.source.assetId,
+      incident.severity,
+      incident.status,
+      incident.assigneeLabel,
+      incident.closure?.outcome,
+    ])
+      .toLowerCase()
+      .includes(query),
+  );
+
+  elements.incidentError.hidden = state.incidentError === "";
+  elements.incidentError.textContent = state.incidentError;
+  for (const [selector, count] of [
+    [
+      "#incident-open",
+      state.incidents.filter((item) => item.status === "open"),
+    ],
+    [
+      "#incident-active",
+      state.incidents.filter((item) =>
+        ["investigating", "monitoring"].includes(item.status),
+      ),
+    ],
+    [
+      "#incident-critical",
+      state.incidents.filter(
+        (item) => item.severity === "critical" && item.status !== "closed",
+      ),
+    ],
+    [
+      "#incident-closed",
+      state.incidents.filter((item) => item.status === "closed"),
+    ],
+  ]) {
+    document.querySelector(selector).textContent = String(count.length);
+  }
+
+  elements.incidentRows.replaceChildren();
+  for (const incident of incidents) {
+    const row = document.createElement("tr");
+    const sourceId = incident.source.deviceId ?? incident.source.assetId;
+    const sourceKind = incident.source.deviceId ? "device" : "asset";
+    const linked = document.createElement("div");
+    linked.className = "incident-links";
+    if (incident.workOrders.length === 0) {
+      linked.append(text("small", "No linked work orders"));
+    } else {
+      for (const order of incident.workOrders.slice(0, 4)) {
+        linked.append(
+          text(
+            "strong",
+            `${workOrderActions[order.actionId]?.label ?? order.actionId} · ${String(order.status).replaceAll("_", " ")}`,
+          ),
+          text(
+            "code",
+            `state ${short(order.stateSha256, 13)}${order.resultSha256 ? ` · result ${short(order.resultSha256, 13)}` : ""}`,
+          ),
+        );
+      }
+    }
+
+    const closure = document.createElement("div");
+    closure.className = "incident-closure";
+    if (incident.closure) {
+      closure.append(
+        text("strong", incident.closure.outcome.replaceAll("_", " ")),
+        text("code", `report ${short(incident.closure.reportSha256, 14)}`),
+        text(
+          "code",
+          `receipt #${incident.closure.serviceReceipt.sequence} · ${short(incident.closure.serviceReceipt.signature, 14)}`,
+        ),
+      );
+      const download = workOrderActionButton(
+        "Download report",
+        "download",
+        () => downloadIncidentReport(incident),
+      );
+      closure.append(download);
+    } else {
+      closure.append(text("small", "Open — no final report"));
+    }
+
+    const actions = document.createElement("div");
+    actions.className = "work-order-actions";
+    if (incident.status !== "closed") {
+      actions.append(
+        workOrderActionButton("Update", "update", () =>
+          openIncidentUpdate(incident),
+        ),
+        workOrderActionButton("Link order", "link", () =>
+          openIncidentLink(incident),
+        ),
+        workOrderActionButton("Close", "approve", () =>
+          openIncidentClose(incident),
+        ),
+      );
+    } else {
+      actions.append(text("span", "Sealed", "work-order-locked"));
+    }
+
+    row.append(
+      cell(
+        text("strong", incident.caseId),
+        text("small", `${sourceKind} · ${short(sourceId, 18)}`),
+      ),
+      cell(
+        text("span", incident.severity, `severity ${incident.severity}`),
+        text(
+          "small",
+          String(incident.status).replaceAll("_", " "),
+          `status ${incident.status}`,
+        ),
+      ),
+      cell(
+        text("strong", incident.assigneeLabel ?? "Unassigned"),
+        text("small", `Updated ${date(incident.updatedAt)}`),
+      ),
+      cell(linked),
+      cell(closure),
+      cell(actions),
+    );
+    elements.incidentRows.append(row);
+  }
+
+  const failed = state.incidentError !== "";
+  document.querySelector("#incidents-empty").hidden =
+    failed || incidents.length !== 0;
+  elements.incidentRows.closest("table").hidden =
+    failed || incidents.length === 0;
+  renderIncidentEvents(query);
+}
+
+function renderIncidentEvents(query) {
+  const events = state.incidentEvents.filter((event) =>
+    JSON.stringify([
+      event.caseId,
+      event.kind,
+      event.actorType,
+      event.actorId,
+      event.status,
+    ])
+      .toLowerCase()
+      .includes(query),
+  );
+  elements.incidentEvents.replaceChildren();
+  for (const event of events.slice(0, 80)) {
+    const node = document.createElement("article");
+    node.className = "work-order-event incident-event";
+    node.append(
+      text("span", `#${event.sequence ?? "—"}`, "event-sequence"),
+      text("strong", String(event.kind ?? "unknown").replaceAll("_", " ")),
+      text(
+        "small",
+        `${short(event.caseId, 13)} · ${event.actorType ?? "unknown"} ${short(event.actorId, 10)}`,
+      ),
+      text("span", String(event.status ?? "unknown").replaceAll("_", " ")),
+      text("small", date(event.occurredAt)),
+      text("code", `detail ${short(event.detailSha256, 15)}`),
+    );
+    elements.incidentEvents.append(node);
+  }
+  document.querySelector("#incident-events-empty").hidden =
+    state.incidentError !== "" || events.length !== 0;
+}
+
+function downloadIncidentReport(incident) {
+  const canonical = canonicalIncidentReport(incident.closure.report);
+  const blob = new Blob([canonical], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = `${incident.caseId}.incident-report.json`;
+  anchor.click();
+  URL.revokeObjectURL(url);
+}
+
 function workOrderActionButton(label, kind, handler) {
   const button = document.createElement("button");
   button.type = "button";
@@ -909,6 +1203,7 @@ function applyView() {
     assets: "Observed assets",
     audit: "Tenant audit",
     workorders: "Diagnosis & repair work orders",
+    incidents: "Incident cases",
     governance: "Fleet governance",
     enrollment: "Device enrollment",
   };
@@ -922,6 +1217,87 @@ function applyView() {
       button.classList.toggle("active", button.dataset.view === state.view),
     );
   if (state.view === "enrollment") elements.enrollment.showModal();
+}
+
+function populateSelect(select, values, selected) {
+  select.replaceChildren();
+  for (const value of values) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = String(value).replaceAll("_", " ");
+    option.selected = value === selected;
+    select.append(option);
+  }
+}
+
+function openIncident() {
+  elements.incidentFormError.textContent = "";
+  elements.incidentSource.replaceChildren();
+  for (const device of state.devices.filter(
+    (candidate) => candidate.status !== "revoked",
+  )) {
+    const option = document.createElement("option");
+    option.value = `device:${device.deviceId}`;
+    option.textContent = `Device · ${device.displayName || short(device.deviceId, 18)}`;
+    elements.incidentSource.append(option);
+  }
+  for (const asset of state.assets) {
+    const option = document.createElement("option");
+    option.value = `asset:${asset.assetId}`;
+    option.textContent = `Asset · ${asset.assetId}`;
+    elements.incidentSource.append(option);
+  }
+  populateSelect(elements.incidentSeverity, incidentSeverities, "medium");
+  elements.incidentAssignee.value = "";
+  elements.incidentSource.disabled = elements.incidentSource.length === 0;
+  elements.incidentDialog.showModal();
+}
+
+function openIncidentUpdate(incident) {
+  state.activeIncident = incident;
+  elements.incidentUpdateError.textContent = "";
+  populateSelect(
+    elements.incidentUpdateStatus,
+    incidentStatuses,
+    incident.status,
+  );
+  populateSelect(
+    elements.incidentUpdateSeverity,
+    incidentSeverities,
+    incident.severity,
+  );
+  elements.incidentUpdateAssignee.value = incident.assigneeLabel ?? "";
+  elements.incidentUpdateDialog.showModal();
+}
+
+function openIncidentLink(incident) {
+  state.activeIncident = incident;
+  elements.incidentLinkError.textContent = "";
+  elements.incidentLinkOrder.replaceChildren();
+  const linkedIds = new Set(
+    incident.workOrders.map((workOrder) => workOrder.workOrderId),
+  );
+  const sourceDeviceId = incident.source.deviceId;
+  for (const order of state.workOrders.filter(
+    (candidate) =>
+      sourceDeviceId &&
+      candidate.targetDeviceId === sourceDeviceId &&
+      !linkedIds.has(candidate.workOrderId),
+  )) {
+    const option = document.createElement("option");
+    option.value = order.workOrderId;
+    option.textContent = `${workOrderActions[order.actionId]?.label ?? order.actionId} · ${String(order.status).replaceAll("_", " ")} · ${short(order.workOrderId, 13)}`;
+    elements.incidentLinkOrder.append(option);
+  }
+  elements.incidentLinkOrder.disabled = elements.incidentLinkOrder.length === 0;
+  elements.incidentLinkDialog.showModal();
+}
+
+function openIncidentClose(incident) {
+  state.activeIncident = incident;
+  elements.incidentCloseError.textContent = "";
+  populateSelect(elements.incidentOutcome, incidentOutcomes, "resolved");
+  elements.incidentCloseDialog.showModal();
 }
 
 function openWorkOrder() {
@@ -1074,6 +1450,10 @@ function clearSession() {
   state.workOrders = [];
   state.workOrderEvents = [];
   state.workOrderError = "";
+  state.incidents = [];
+  state.incidentEvents = [];
+  state.incidentError = "";
+  state.activeIncident = null;
   sessionStorage.removeItem("kernaid.fleet.tenant");
   sessionStorage.removeItem("kernaid.fleet.admin-token");
   elements.tokenInput.value = "";
@@ -1190,6 +1570,124 @@ elements.workOrderDialog.addEventListener("close", () => {
 elements.workOrderDevice.addEventListener("change", refreshWorkOrderActions);
 elements.workOrderAction.addEventListener("change", refreshWorkOrderPreflight);
 
+elements.incidentForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const button = elements.incidentForm.querySelector("button[type=submit]");
+  elements.incidentFormError.textContent = "";
+  setBusy(button, true);
+  try {
+    const body = createIncidentPayload({
+      requestId: `ui_case_${crypto.randomUUID().replaceAll("-", "")}`,
+      sourceValue: elements.incidentSource.value,
+      severity: elements.incidentSeverity.value,
+      assigneeLabel: elements.incidentAssignee.value,
+    });
+    const result = await request(
+      `/v1/tenants/${encodeURIComponent(state.tenantId)}/incident-cases`,
+      { method: "POST", body: JSON.stringify(body) },
+    );
+    elements.incidentDialog.close();
+    notify(result?.idempotent ? "Incident already exists" : "Incident opened");
+    await loadFleet();
+  } catch (error) {
+    elements.incidentFormError.textContent = error.message;
+  } finally {
+    setBusy(button, false);
+  }
+});
+
+elements.incidentUpdateForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const button = elements.incidentUpdateForm.querySelector(
+    "button[type=submit]",
+  );
+  elements.incidentUpdateError.textContent = "";
+  setBusy(button, true);
+  try {
+    const body = updateIncidentPayload({
+      status: elements.incidentUpdateStatus.value,
+      severity: elements.incidentUpdateSeverity.value,
+      assigneeLabel: elements.incidentUpdateAssignee.value,
+    });
+    await request(
+      `/v1/tenants/${encodeURIComponent(state.tenantId)}/incident-cases/${encodeURIComponent(state.activeIncident.caseId)}/update`,
+      { method: "POST", body: JSON.stringify(body) },
+    );
+    elements.incidentUpdateDialog.close();
+    notify("Incident updated");
+    await loadFleet();
+  } catch (error) {
+    elements.incidentUpdateError.textContent = error.message;
+  } finally {
+    setBusy(button, false);
+  }
+});
+
+elements.incidentLinkForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const button = elements.incidentLinkForm.querySelector("button[type=submit]");
+  elements.incidentLinkError.textContent = "";
+  setBusy(button, true);
+  try {
+    const body = linkIncidentPayload(elements.incidentLinkOrder.value);
+    await request(
+      `/v1/tenants/${encodeURIComponent(state.tenantId)}/incident-cases/${encodeURIComponent(state.activeIncident.caseId)}/work-orders`,
+      { method: "POST", body: JSON.stringify(body) },
+    );
+    elements.incidentLinkDialog.close();
+    notify("Work order linked");
+    await loadFleet();
+  } catch (error) {
+    elements.incidentLinkError.textContent = error.message;
+  } finally {
+    setBusy(button, false);
+  }
+});
+
+elements.incidentCloseForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const button = elements.incidentCloseForm.querySelector(
+    "button[type=submit]",
+  );
+  elements.incidentCloseError.textContent = "";
+  setBusy(button, true);
+  try {
+    const body = closeIncidentPayload(
+      state.activeIncident.caseId,
+      elements.incidentOutcome.value,
+    );
+    const result = await request(
+      `/v1/tenants/${encodeURIComponent(state.tenantId)}/incident-cases/${encodeURIComponent(state.activeIncident.caseId)}/close`,
+      { method: "POST", body: JSON.stringify(body) },
+    );
+    elements.incidentCloseDialog.close();
+    notify(
+      result?.idempotent
+        ? "Signed closure already sealed"
+        : "Incident closed with signed report",
+    );
+    await loadFleet();
+  } catch (error) {
+    elements.incidentCloseError.textContent = error.message;
+  } finally {
+    setBusy(button, false);
+  }
+});
+
+for (const [selector, dialog] of [
+  ["#incident-close", elements.incidentDialog],
+  ["#incident-update-close", elements.incidentUpdateDialog],
+  ["#incident-link-close", elements.incidentLinkDialog],
+  ["#incident-close-close", elements.incidentCloseDialog],
+]) {
+  document
+    .querySelector(selector)
+    .addEventListener("click", () => dialog.close());
+  dialog.addEventListener("close", () => {
+    state.activeIncident = null;
+  });
+}
+
 function openPublish(kind) {
   const configuration = publishKinds[kind];
   if (!configuration) return;
@@ -1273,10 +1771,14 @@ document
 document
   .querySelector("#open-work-order")
   .addEventListener("click", openWorkOrder);
+document
+  .querySelector("#open-incident")
+  .addEventListener("click", openIncident);
 elements.deviceFilter.addEventListener("input", renderDevices);
 elements.assetFilter.addEventListener("input", renderAssets);
 elements.auditFilter.addEventListener("input", renderAudit);
 elements.workOrderFilter.addEventListener("input", renderWorkOrders);
+elements.incidentFilter.addEventListener("input", renderIncidents);
 document
   .querySelectorAll(".publish-trigger")
   .forEach((button) =>

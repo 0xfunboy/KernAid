@@ -14,6 +14,10 @@ const workOrderBoundary = readFileSync(
   join(directory, "work-order-ui.js"),
   "utf8",
 );
+const incidentBoundary = readFileSync(
+  join(directory, "incident-case-ui.js"),
+  "utf8",
+);
 
 assert.match(html, /data-view="governance"/);
 assert.match(html, /id="publish-dialog"/);
@@ -23,6 +27,13 @@ assert.match(html, /Content-Security-Policy/);
 assert.match(html, /data-view="workorders"/);
 assert.match(html, /id="work-order-dialog"/);
 assert.match(html, /id="work-order-events"/);
+assert.match(html, /data-view="incidents"/);
+assert.match(html, /id="incident-dialog"/);
+assert.match(html, /id="incident-update-dialog"/);
+assert.match(html, /id="incident-link-dialog"/);
+assert.match(html, /id="incident-close-dialog"/);
+assert.match(html, /id="incident-events"/);
+assert.match(html, /No raw evidence, personal data, shell commands/);
 assert.doesNotMatch(
   html,
   /<(?:input|textarea)[^>]+name="(?:command|arguments?|path|script|raw)/i,
@@ -35,6 +46,8 @@ for (const route of [
   "update-manifests",
   "work-orders",
   "work-order-events",
+  "incident-cases",
+  "incident-case-events",
 ]) {
   assert.match(script, new RegExp(route));
 }
@@ -54,6 +67,14 @@ assert.doesNotMatch(
   workOrderBoundary,
   /innerHTML|insertAdjacentHTML|document\.write/,
 );
+assert.doesNotMatch(
+  incidentBoundary,
+  /innerHTML|insertAdjacentHTML|document\.write/,
+);
+assert.match(incidentBoundary, /canonicalIncidentReport/);
+assert.match(incidentBoundary, /Use a bounded team or queue label/);
+assert.match(script, /incident_case_close|serviceReceipt/);
+assert.match(script, /\.incident-report\.json/);
 assert.doesNotMatch(script, /\/v1\/(?:commands|shell|execute|repairs)/i);
 assert.match(script, /decision: "approve"/);
 assert.match(script, /body: JSON\.stringify\(\{\}\)/);

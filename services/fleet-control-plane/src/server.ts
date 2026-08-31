@@ -15,15 +15,22 @@ import {
   MAX_UPDATE_MANIFEST_BYTES,
   FLEET_UPDATE_PULL_RESPONSE_SCHEMA,
   FLEET_SERVICE_RECEIPT_SCHEMA,
+  FLEET_INCIDENT_REPORT_SCHEMA,
   auditSigningBytes,
   canonicalJson,
   enrollmentSigningBytes,
   expectExactKeys,
+  expectDeviceId,
+  expectEnum,
   expectIdentifier,
+  expectOpaqueAssetId,
   expectRecord,
   expectRfc3339,
   expectSafeInteger,
   inventorySigningBytes,
+  incidentCaseOutcomes,
+  incidentCaseSeverities,
+  incidentCaseStatuses,
   isWorkOrderActionId,
   entitlementAppliesTo,
   entitlementPullSigningBytes,
@@ -52,7 +59,10 @@ import {
   parseEnrollmentRequest,
   parseAuditEnvelope,
   parseInventoryEnvelope,
+  parseIncidentReport,
   type FleetServiceOperation,
+  type IncidentCaseOutcome,
+  type IncidentCaseSeverity,
   type ServiceReceipt,
   type ServiceReceiptUnsigned,
   type WorkOrderActionId,
@@ -63,6 +73,7 @@ import {
   generateCredentialId,
   generateWorkOrderId,
   generateWorkOrderLeaseId,
+  generateIncidentCaseId,
   deviceIdForEd25519Spki,
   hashSecret,
   decodeBase64UrlExact,
@@ -93,6 +104,10 @@ import {
   StoreUpdateRollbackError,
   StoreWorkOrderReplayError,
   StoreWorkOrderStateError,
+  StoreIncidentCaseReplayError,
+  StoreIncidentCaseStateError,
+  type ListedIncidentCaseEvent,
+  type StoredIncidentCase,
   type StoredServiceResponse,
   type StoredWorkOrder,
   type TenantAccessCredential,
@@ -101,6 +116,7 @@ import {
   isTenantRole,
   tenantRoleAllows,
   validCredentialLabel,
+  validIncidentAssigneeLabel,
   type TenantAccessAction,
   type TenantAccessTargetType,
   type TenantRole,
@@ -301,6 +317,10 @@ export class FleetControlPlane {
         writeJson(response, 409, { error: "work_order_replay" });
       } else if (error instanceof StoreWorkOrderStateError) {
         writeJson(response, 409, { error: "work_order_state_conflict" });
+      } else if (error instanceof StoreIncidentCaseReplayError) {
+        writeJson(response, 409, { error: "incident_case_replay" });
+      } else if (error instanceof StoreIncidentCaseStateError) {
+        writeJson(response, 409, { error: "incident_case_state_conflict" });
       } else {
         writeJson(response, 500, { error: "internal_error" });
       }
@@ -841,6 +861,244 @@ export class FleetControlPlane {
         idempotent: result.idempotent,
         publishedAt: result.publishedAt,
       });
+      return;
+    }
+
+    const incidentCasesMatch = /^\/v1\/tenants\/([^/]+)\/incident-cases$/.exec(
+      path,
+    );
+    if (method === "GET" && incidentCasesMatch !== null) {
+      const tenantId = pathIdentifier(incidentCasesMatch[1], "tenantId");
+      this.#authorizeTenant(
+        request,
+        tenantId,
+        "operator",
+        "incident_case.list",
+        tenantTarget(tenantId),
+      );
+      writeJson(response, 200, {
+        schema: "dev.kernaid.fleet.incident-case-list.v1",
+        tenantId,
+        items: this.#store
+          .listIncidentCases(tenantId, this.#validNow().toISOString())
+          .map((incident) => this.#tenantIncidentCase(incident)),
+      });
+      return;
+    }
+    if (method === "POST" && incidentCasesMatch !== null) {
+      const tenantId = pathIdentifier(incidentCasesMatch[1], "tenantId");
+      const actor = this.#authorizeTenant(
+        request,
+        tenantId,
+        "operator",
+        "incident_case.create",
+        tenantTarget(tenantId),
+      );
+      const body = expectRecord(await readJson(request));
+      expectExactKeys(body, [
+        "requestId",
+        "source",
+        "severity",
+        "assigneeLabel",
+      ]);
+      const requestId = expectIdentifier(body.requestId, "requestId");
+      const severity = expectEnum(
+        body.severity,
+        "severity",
+        incidentCaseSeverities,
+      );
+      const assigneeLabel = incidentAssigneeLabel(body.assigneeLabel);
+      const source = expectRecord(body.source, "source");
+      let sourceDeviceId: string;
+      let sourceAssetId: string | null;
+      if (source.kind === "device") {
+        expectExactKeys(source, ["kind", "deviceId"], "source");
+        sourceDeviceId = expectDeviceId(source.deviceId);
+        sourceAssetId = null;
+        if (this.#store.getDevice(tenantId, sourceDeviceId) === undefined) {
+          throw new HttpError(404, "source_not_found");
+        }
+      } else if (source.kind === "asset") {
+        expectExactKeys(source, ["kind", "assetId"], "source");
+        sourceAssetId = expectOpaqueAssetId(source.assetId);
+        const asset = this.#store.getAsset(tenantId, sourceAssetId);
+        if (asset === undefined) throw new HttpError(404, "source_not_found");
+        sourceDeviceId = asset.deviceId;
+      } else {
+        throw new HttpError(400, "invalid_request");
+      }
+      const normalized = {
+        requestId,
+        source:
+          sourceAssetId === null
+            ? { kind: "device", deviceId: sourceDeviceId }
+            : { kind: "asset", assetId: sourceAssetId },
+        severity,
+        assigneeLabel,
+      };
+      const createdAt = this.#validNow().toISOString();
+      const result = this.#store.createIncidentCase({
+        tenantId,
+        caseId: generateIncidentCaseId(),
+        requestId,
+        requestSha256: sha256Hex(canonicalJson(normalized)),
+        sourceDeviceId,
+        sourceAssetId,
+        severity,
+        assigneeLabel,
+        credentialId: actor.credentialId,
+        createdAt,
+      });
+      writeJson(response, result.idempotent ? 200 : 201, {
+        schema: "dev.kernaid.fleet.incident-case-created.v1",
+        ...this.#tenantIncidentCase(result.incidentCase),
+        idempotent: result.idempotent,
+      });
+      return;
+    }
+
+    const incidentEventsMatch =
+      /^\/v1\/tenants\/([^/]+)\/incident-case-events$/.exec(path);
+    if (method === "GET" && incidentEventsMatch !== null) {
+      const tenantId = pathIdentifier(incidentEventsMatch[1], "tenantId");
+      this.#authorizeTenant(
+        request,
+        tenantId,
+        "operator",
+        "incident_case.audit.list",
+        tenantTarget(tenantId),
+      );
+      writeJson(response, 200, {
+        schema: "dev.kernaid.fleet.incident-case-event-list.v1",
+        tenantId,
+        items: this.#store.listIncidentCaseEvents(tenantId),
+      });
+      return;
+    }
+
+    const incidentUpdateMatch =
+      /^\/v1\/tenants\/([^/]+)\/incident-cases\/([^/]+)\/update$/.exec(path);
+    if (method === "POST" && incidentUpdateMatch !== null) {
+      const tenantId = pathIdentifier(incidentUpdateMatch[1], "tenantId");
+      const caseId = pathIdentifier(incidentUpdateMatch[2], "caseId");
+      const actor = this.#authorizeTenant(
+        request,
+        tenantId,
+        "operator",
+        "incident_case.update",
+        { type: "incident_case", id: caseId },
+      );
+      const body = expectRecord(await readJson(request));
+      expectExactKeys(body, ["severity", "status", "assigneeLabel"]);
+      const normalized = {
+        severity: expectEnum(body.severity, "severity", incidentCaseSeverities),
+        status: expectEnum(body.status, "status", [
+          "open",
+          "investigating",
+          "monitoring",
+        ]),
+        assigneeLabel: incidentAssigneeLabel(body.assigneeLabel),
+      };
+      const result = this.#store.updateIncidentCase({
+        tenantId,
+        caseId,
+        ...normalized,
+        credentialId: actor.credentialId,
+        updatedAt: this.#validNow().toISOString(),
+        detailSha256: sha256Hex(canonicalJson(normalized)),
+      });
+      if (result === undefined) throw new HttpError(404, "not_found");
+      writeJson(response, 200, {
+        schema: "dev.kernaid.fleet.incident-case-updated.v1",
+        ...this.#tenantIncidentCase(result.incidentCase),
+        idempotent: result.idempotent,
+      });
+      return;
+    }
+
+    const incidentLinkMatch =
+      /^\/v1\/tenants\/([^/]+)\/incident-cases\/([^/]+)\/work-orders$/.exec(
+        path,
+      );
+    if (method === "POST" && incidentLinkMatch !== null) {
+      const tenantId = pathIdentifier(incidentLinkMatch[1], "tenantId");
+      const caseId = pathIdentifier(incidentLinkMatch[2], "caseId");
+      const actor = this.#authorizeTenant(
+        request,
+        tenantId,
+        "operator",
+        "incident_case.link_work_order",
+        { type: "incident_case", id: caseId },
+      );
+      const body = expectRecord(await readJson(request));
+      expectExactKeys(body, ["workOrderId"]);
+      const result = this.#store.linkIncidentWorkOrder({
+        tenantId,
+        caseId,
+        workOrderId: expectIdentifier(body.workOrderId, "workOrderId"),
+        credentialId: actor.credentialId,
+        linkedAt: this.#validNow().toISOString(),
+      });
+      if (result === undefined) throw new HttpError(404, "not_found");
+      writeJson(response, result.idempotent ? 200 : 201, {
+        schema: "dev.kernaid.fleet.incident-case-work-order-linked.v1",
+        ...this.#tenantIncidentCase(result.incidentCase),
+        idempotent: result.idempotent,
+      });
+      return;
+    }
+
+    const incidentCloseMatch =
+      /^\/v1\/tenants\/([^/]+)\/incident-cases\/([^/]+)\/close$/.exec(path);
+    if (method === "POST" && incidentCloseMatch !== null) {
+      const tenantId = pathIdentifier(incidentCloseMatch[1], "tenantId");
+      const caseId = pathIdentifier(incidentCloseMatch[2], "caseId");
+      const actor = this.#authorizeTenant(
+        request,
+        tenantId,
+        "admin",
+        "incident_case.close",
+        { type: "incident_case", id: caseId },
+      );
+      const body = expectRecord(await readJson(request));
+      expectExactKeys(body, ["caseId", "outcome"]);
+      if (expectIdentifier(body.caseId, "caseId") !== caseId) {
+        throw new HttpError(400, "case_mismatch");
+      }
+      const outcome = expectEnum(body.outcome, "outcome", incidentCaseOutcomes);
+      const requestSha256 = sha256Hex(canonicalJson({ caseId, outcome }));
+      const closedAt = this.#validNow().toISOString();
+      const result = this.#store.closeIncidentCase(
+        {
+          tenantId,
+          caseId,
+          outcome,
+          credentialId: actor.credentialId,
+          closedAt,
+          requestSha256,
+        },
+        (sequence, incident, timeline) =>
+          this.#buildIncidentClosure(
+            incident,
+            timeline,
+            outcome,
+            closedAt,
+            requestSha256,
+            sequence,
+          ),
+      );
+      if (result === undefined) throw new HttpError(404, "not_found");
+      const incident = result.incidentCase;
+      if (incident.reportJson === null || incident.receiptJson === null) {
+        throw new Error("closed incident report is missing");
+      }
+      this.#writeIncidentReport(
+        response,
+        incident,
+        requestSha256,
+        incident.reportJson,
+        incident.receiptJson,
+      );
       return;
     }
 
@@ -1718,6 +1976,177 @@ export class FleetControlPlane {
     return credential;
   }
 
+  #tenantIncidentCase(incident: StoredIncidentCase): Record<string, unknown> {
+    let closure: Record<string, unknown> | null = null;
+    if (incident.status === "closed") {
+      if (
+        incident.outcome === null ||
+        incident.closedAt === null ||
+        incident.closedByCredentialId === null ||
+        incident.closeRequestSha256 === null ||
+        incident.reportSha256 === null ||
+        incident.reportJson === null ||
+        incident.receiptJson === null
+      ) {
+        throw new Error("closed incident proof is incomplete");
+      }
+      const report = parseIncidentReport(
+        JSON.parse(incident.reportJson) as unknown,
+      );
+      const receipt = parseServiceReceipt(
+        JSON.parse(incident.receiptJson) as unknown,
+      );
+      if (
+        canonicalJson(report) !== incident.reportJson ||
+        canonicalJson(receipt) !== incident.receiptJson ||
+        incident.reportSha256 !== sha256Hex(incident.reportJson)
+      ) {
+        throw new Error("stored incident proof is not canonical");
+      }
+      this.#verifyServiceReceipt(
+        {
+          operation: "incident_case_close",
+          tenantId: incident.tenantId,
+          deviceId: incident.sourceDeviceId,
+          requestSha256: incident.closeRequestSha256,
+        },
+        incident.reportJson,
+        incident.receiptJson,
+        receipt.sequence,
+      );
+      closure = {
+        outcome: incident.outcome,
+        closedAt: incident.closedAt,
+        closedByCredentialId: incident.closedByCredentialId,
+        reportSha256: incident.reportSha256,
+        report,
+        serviceReceipt: receipt,
+      };
+    }
+    return {
+      tenantId: incident.tenantId,
+      caseId: incident.caseId,
+      requestId: incident.requestId,
+      source: {
+        deviceId: incident.sourceDeviceId,
+        assetId: incident.sourceAssetId,
+      },
+      severity: incident.severity,
+      status: incident.status,
+      assigneeLabel: incident.assigneeLabel,
+      createdByCredentialId: incident.createdByCredentialId,
+      createdAt: incident.createdAt,
+      updatedAt: incident.updatedAt,
+      workOrders: incident.workOrders,
+      closure,
+    };
+  }
+
+  #buildIncidentClosure(
+    incident: StoredIncidentCase,
+    timeline: ListedIncidentCaseEvent[],
+    outcome: IncidentCaseOutcome,
+    closedAt: string,
+    requestSha256: string,
+    sequence: number,
+  ): { reportJson: string; reportSha256: string; receiptJson: string } {
+    const timelineSha256 = sha256Hex(canonicalJson(timeline));
+    const report = parseIncidentReport({
+      schema: FLEET_INCIDENT_REPORT_SCHEMA,
+      tenantId: incident.tenantId,
+      caseId: incident.caseId,
+      sourceDeviceId: incident.sourceDeviceId,
+      sourceAssetId: incident.sourceAssetId,
+      severity: incident.severity,
+      outcome,
+      openedAt: incident.createdAt,
+      closedAt,
+      timelineSha256,
+      workOrders: incident.workOrders.map((workOrder) => ({
+        workOrderId: workOrder.workOrderId,
+        actionId: workOrder.actionId,
+        actionVersion: workOrder.actionVersion,
+        status: workOrder.status,
+        resultSha256: workOrder.resultSha256,
+        stateSha256: workOrder.stateSha256,
+      })),
+    });
+    const reportJson = canonicalJson(report);
+    const responseSha256 = sha256Hex(reportJson);
+    const unsigned: ServiceReceiptUnsigned = {
+      schema: FLEET_SERVICE_RECEIPT_SCHEMA,
+      tenantId: incident.tenantId,
+      deviceId: incident.sourceDeviceId,
+      operation: "incident_case_close",
+      sequence,
+      requestSha256,
+      responseSha256,
+      acceptedAt: closedAt,
+      outcome: "accepted",
+    };
+    const receipt: ServiceReceipt = {
+      ...unsigned,
+      signature: signEd25519(
+        this.#serviceReceiptSigningKey,
+        serviceReceiptSigningBytes(unsigned),
+      ),
+    };
+    const receiptJson = canonicalJson(receipt);
+    this.#verifyServiceReceipt(
+      {
+        operation: "incident_case_close",
+        tenantId: incident.tenantId,
+        deviceId: incident.sourceDeviceId,
+        requestSha256,
+      },
+      reportJson,
+      receiptJson,
+      sequence,
+    );
+    return { reportJson, reportSha256: responseSha256, receiptJson };
+  }
+
+  #writeIncidentReport(
+    response: ServerResponse,
+    incident: StoredIncidentCase,
+    requestSha256: string,
+    reportJson: string,
+    receiptJson: string,
+  ): void {
+    const report = parseIncidentReport(JSON.parse(reportJson) as unknown);
+    const receipt = parseServiceReceipt(JSON.parse(receiptJson) as unknown);
+    if (
+      canonicalJson(report) !== reportJson ||
+      canonicalJson(receipt) !== receiptJson ||
+      report.tenantId !== incident.tenantId ||
+      report.caseId !== incident.caseId ||
+      report.sourceDeviceId !== incident.sourceDeviceId ||
+      incident.reportSha256 !== sha256Hex(reportJson)
+    ) {
+      throw new Error("stored incident closure is invalid");
+    }
+    this.#verifyServiceReceipt(
+      {
+        operation: "incident_case_close",
+        tenantId: incident.tenantId,
+        deviceId: incident.sourceDeviceId,
+        requestSha256,
+      },
+      reportJson,
+      receiptJson,
+      receipt.sequence,
+    );
+    const body = Buffer.from(reportJson, "utf8");
+    response.statusCode = 200;
+    response.setHeader("Content-Type", "application/json; charset=utf-8");
+    response.setHeader("Content-Length", body.length);
+    response.setHeader(
+      SERVICE_RECEIPT_HEADER,
+      Buffer.from(receiptJson, "utf8").toString("base64url"),
+    );
+    response.end(body);
+  }
+
   #replayServiceResponse(
     response: ServerResponse,
     context: ServiceResponseContext,
@@ -2204,6 +2633,14 @@ function parseJsonBytes(bytes: Buffer): unknown {
 function expectEmptyObject(value: unknown): void {
   const object = expectRecord(value);
   expectExactKeys(object, []);
+}
+
+function incidentAssigneeLabel(value: unknown): string | null {
+  if (value === null) return null;
+  if (typeof value !== "string" || !validIncidentAssigneeLabel(value)) {
+    throw new HttpError(400, "invalid_request");
+  }
+  return value;
 }
 
 function pathIdentifier(value: string | undefined, field: string): string {
