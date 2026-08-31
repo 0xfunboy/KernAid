@@ -49,6 +49,26 @@ A checkpoint accepts a greater revision, treats the same revision and digest as
 an idempotent replay, and rejects lower revisions or same-revision substitutions.
 Persist `PolicyCheckpoint::export_canonical()` atomically with the cached bundle.
 
+## Offline tenant issuance
+
+`kernaid-policy-issuer` creates a tenant Ed25519 anchor and signs canonical
+policy content outside Fleet. The server receives only the public key and
+already-signed bundle; it never receives a signing seed.
+
+```sh
+cargo run -p kernaid-fleet-policy --bin kernaid-policy-issuer -- \
+  generate-key /private/policy.seed /private/policy.public
+
+cargo run -p kernaid-fleet-policy --bin kernaid-policy-issuer -- \
+  sign-policy /private/policy.seed policy-content.canonical.json \
+  policy.signed.json
+```
+
+The content file contains the bundle fields except `signature` and includes
+schema `dev.kernaid.fleet.policy-bundle.v1`. Inputs must be exact compact
+canonical JSON. Seeds are mode `0600`; symlinked inputs, broad seed permissions
+and existing outputs are rejected.
+
 ## Restrictive evaluation
 
 `VerifiedPolicyBundle::evaluate` requires the device's local safety floor for
