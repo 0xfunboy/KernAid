@@ -841,6 +841,8 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
         )
         self.assertLessEqual(len(tampered), 16 * 1024)
         compile(tampered, "<backup-tamper>", "exec")
+        self.assertIn(b'"error":"relay-unavailable"', tampered)
+        self.assertIn(b"allow_recovery_closed=True", tampered)
         self.assertIn(b'initial.get("state")!="idle"', tampered)
         self.assertIn(b'result.get("state")!="idle"', tampered)
         self.assertIn('"/usr/bin/sudo",', source)

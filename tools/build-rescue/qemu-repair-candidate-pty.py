@@ -722,6 +722,7 @@ HOST="127.0.0.1:4173"
 ORIGIN="http://127.0.0.1:4173"
 API="kernaid.dev/rescue-repair-service/v1alpha2"
 SOURCE={"reservationId":__RESERVATION__,"transactionBindingSha256":__BINDING__}
+CLOSED={"apiVersion":"kernaid.dev/rescue-repair-service/v1alpha1","outcome":"error","error":"relay-unavailable"}
 counter=0
 def request_id():
     global counter
@@ -731,7 +732,7 @@ def valid_id(value):
     return isinstance(value,str) and value.startswith("B-") and len(value)==34 and all(character in "0123456789abcdef" for character in value[2:])
 def valid_hash(value):
     return isinstance(value,str) and value.startswith("sha256:") and len(value)==71 and all(character in "0123456789abcdef" for character in value[7:])
-def repair(operation,extra=None):
+def repair(operation,extra=None,allow_recovery_closed=False):
     request={"apiVersion":API,"requestId":request_id(),"operation":operation}
     if extra is not None:
         request.update(extra)
@@ -745,7 +746,9 @@ def repair(operation,extra=None):
     finally:
         connection.close()
     if status!=200 or len(payload)>65536:
-        raise RuntimeError()
+        if not allow_recovery_closed or status!=503 or len(payload)>65536 or json.loads(payload)!=CLOSED:
+            raise RuntimeError()
+        return None
     value=json.loads(payload)
     if value.get("outcome")!="ok" or value.get("operation")!=operation or value.get("requestId")!=request["requestId"]:
         raise RuntimeError()
@@ -758,17 +761,21 @@ deadline=time.monotonic()+420
 try:
     if not valid_id(SOURCE["reservationId"]) or not valid_hash(SOURCE["transactionBindingSha256"]):
         raise RuntimeError()
-    initial=repair("repair.fstab.rollback.status")
-    if initial.get("state")!="idle" or initial.get("detail") is not None:
-        raise RuntimeError()
-    result=repair("repair.fstab.rollback.prepare",{"source":SOURCE})
-    if result.get("state")=="prepared":
-        raise RuntimeError()
-    while result.get("state")=="preparing" and time.monotonic()<deadline:
-        time.sleep(.2)
-        result=repair("repair.fstab.rollback.status")
-    if result.get("state")!="idle" or result.get("detail") is not None:
-        raise RuntimeError()
+    initial=repair("repair.fstab.rollback.status",allow_recovery_closed=True)
+    if initial is None:
+        if repair("repair.fstab.rollback.prepare",{"source":SOURCE},allow_recovery_closed=True) is not None:
+            raise RuntimeError()
+    else:
+        if initial.get("state")!="idle" or initial.get("detail") is not None:
+            raise RuntimeError()
+        result=repair("repair.fstab.rollback.prepare",{"source":SOURCE})
+        if result.get("state")=="prepared":
+            raise RuntimeError()
+        while result.get("state")=="preparing" and time.monotonic()<deadline:
+            time.sleep(.2)
+            result=repair("repair.fstab.rollback.status")
+        if result.get("state")!="idle" or result.get("detail") is not None:
+            raise RuntimeError()
 except BaseException:
     sys.exit(46)
 sys.stdout.write("KERNAID_QEMU_PROVIDER_PROOF_V1 stage=repair-backup-tamper result=true\n")
