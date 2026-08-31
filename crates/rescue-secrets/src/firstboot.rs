@@ -16,7 +16,7 @@ use std::{
     error::Error,
     fmt,
     os::fd::AsFd,
-    process::{Command, Stdio},
+    process::{Command, ExitStatus, Stdio},
     time::Duration,
 };
 use zeroize::Zeroizing;
@@ -25,6 +25,7 @@ const CLASSIFICATION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const PLYMOUTH_QUIT_TIMEOUT: Duration = Duration::from_secs(3);
 const PLYMOUTH_PATH: &str = "/usr/bin/plymouth";
 const PLYMOUTH_QUIT_ARGUMENTS: &[&str] = &["quit"];
+const PLYMOUTH_PING_ARGUMENTS: &[&str] = &["--ping"];
 const SECRET_READ_CHUNK_BYTES: usize = 256;
 
 /// Stable, redacted failures for the first-boot boundary.
@@ -540,22 +541,38 @@ pub fn run_rescue_firstboot() -> Result<FirstBootProvisioningEvidence, FirstBoot
 }
 
 /// Relinquish Plymouth only after the exact boot Vault has passed its complete
-/// read-only unprovisioned classification. The fixed child has no shell, no
-/// caller-controlled argument or inherited stdio, and is killed as a process
-/// group if it exceeds the bounded prompt-transition deadline.
+/// read-only unprovisioned classification. A distribution quit unit can have
+/// already stopped Plymouth by the time a manually started or degraded boot
+/// reaches this boundary. Normalize only that verified no-daemon state: if the
+/// quit command fails while Plymouth still answers, fail closed rather than
+/// displaying the secret prompt behind a live splash.
 fn dismiss_boot_splash() -> Result<(), FirstBootBoundaryError> {
-    let mut command = Command::new(PLYMOUTH_PATH);
-    command
-        .args(PLYMOUTH_QUIT_ARGUMENTS)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let status = bounded_process::wait(&mut command, PLYMOUTH_QUIT_TIMEOUT)
-        .map_err(|_| FirstBootBoundaryError::BootSplashDismissalFailed)?;
-    if !status.success() {
+    let quit_status = run_plymouth_command(PLYMOUTH_QUIT_ARGUMENTS)?;
+    if quit_status.success() {
+        return Ok(());
+    }
+
+    let ping_status = run_plymouth_command(PLYMOUTH_PING_ARGUMENTS)?;
+    if ping_status.success() {
         return Err(FirstBootBoundaryError::BootSplashDismissalFailed);
     }
     Ok(())
+}
+
+/// Run one fixed Plymouth operation without a shell, caller-controlled
+/// arguments or inherited stdio. Bounded-process failures remain hard errors;
+/// only `dismiss_boot_splash` may interpret a completed status.
+fn run_plymouth_command(
+    arguments: &'static [&'static str],
+) -> Result<ExitStatus, FirstBootBoundaryError> {
+    let mut command = Command::new(PLYMOUTH_PATH);
+    command
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    bounded_process::wait(&mut command, PLYMOUTH_QUIT_TIMEOUT)
+        .map_err(|_| FirstBootBoundaryError::BootSplashDismissalFailed)
 }
 
 fn enter_private_mount_namespace() -> Result<(), FirstBootBoundaryError> {
@@ -795,6 +812,7 @@ mod tests {
     fn boot_splash_release_is_fixed_and_bounded() {
         assert_eq!(PLYMOUTH_PATH, "/usr/bin/plymouth");
         assert_eq!(PLYMOUTH_QUIT_ARGUMENTS, ["quit"]);
+        assert_eq!(PLYMOUTH_PING_ARGUMENTS, ["--ping"]);
         assert_eq!(PLYMOUTH_QUIT_TIMEOUT, Duration::from_secs(3));
     }
 
