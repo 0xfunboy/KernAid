@@ -499,6 +499,54 @@ test("multiple assets are retained while superseded sequences are rejected", asy
   }
 });
 
+test("an older observation from another device cannot replace the current asset", async () => {
+  const harness = await createHarness();
+  try {
+    const tenant = await createTenant(harness);
+    const olderDevice = await enroll(harness, tenant, "older-device");
+    const newerDevice = await enroll(harness, tenant, "newer-device");
+    harness.now.value = INITIAL_TIME - 60_000;
+    const older = signedInventory(
+      harness,
+      tenant,
+      olderDevice,
+      1,
+      asset("shared-asset", "healthy"),
+    );
+    harness.now.value = INITIAL_TIME;
+    const newer = signedInventory(
+      harness,
+      tenant,
+      newerDevice,
+      1,
+      asset("shared-asset", "required_action"),
+    );
+
+    assert.equal(
+      (await api(harness, "POST", "/v1/inventories", newer)).status,
+      201,
+    );
+    assert.equal(
+      (await api(harness, "POST", "/v1/inventories", older)).status,
+      201,
+    );
+    const listed = await api(
+      harness,
+      "GET",
+      `/v1/tenants/${tenant.tenantId}/assets`,
+      undefined,
+      tenant.adminToken,
+    );
+    const items = listed.body.items as Array<Record<string, unknown>>;
+    assert.equal(items.length, 1);
+    assert.equal(items[0]?.health, "required_action");
+    assert.equal(items[0]?.deviceId, newerDevice.deviceId);
+    assert.equal(items[0]?.observedAt, newer.observedAt);
+  } finally {
+    await destroyHarness(harness);
+  }
+});
+
 test("device revocation is tenant-bound and immediately blocks inventory", async () => {
   const harness = await createHarness();
   try {

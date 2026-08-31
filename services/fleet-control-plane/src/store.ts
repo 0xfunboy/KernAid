@@ -281,9 +281,17 @@ export class FleetStore {
         );
 
       const asset = envelope.asset;
-      this.#database
+      const currentAsset = this.#database
         .prepare(
-          `INSERT INTO assets
+          `SELECT reporting_device_id, sequence, observed_at
+           FROM assets WHERE tenant_id = ? AND asset_id = ?`,
+        )
+        .get(envelope.tenantId, asset.assetId) as
+        CurrentAssetVersionRow | undefined;
+      if (shouldReplaceCurrentAsset(envelope, currentAsset)) {
+        this.#database
+          .prepare(
+            `INSERT INTO assets
             (tenant_id, asset_id, reporting_device_id, target_fingerprint,
              platform, architecture, os_release, health, critical_count,
              warning_count, info_count, snapshot_sha256, sequence, observed_at,
@@ -303,24 +311,25 @@ export class FleetStore {
              sequence = excluded.sequence,
              observed_at = excluded.observed_at,
              updated_at = excluded.updated_at`,
-        )
-        .run(
-          envelope.tenantId,
-          asset.assetId,
-          envelope.deviceId,
-          asset.targetFingerprint,
-          asset.platform,
-          asset.architecture,
-          asset.osRelease,
-          asset.health,
-          asset.findingCounts.critical,
-          asset.findingCounts.warning,
-          asset.findingCounts.info,
-          asset.snapshotSha256,
-          envelope.sequence,
-          envelope.observedAt,
-          receivedAt,
-        );
+          )
+          .run(
+            envelope.tenantId,
+            asset.assetId,
+            envelope.deviceId,
+            asset.targetFingerprint,
+            asset.platform,
+            asset.architecture,
+            asset.osRelease,
+            asset.health,
+            asset.findingCounts.critical,
+            asset.findingCounts.warning,
+            asset.findingCounts.info,
+            asset.snapshotSha256,
+            envelope.sequence,
+            envelope.observedAt,
+            receivedAt,
+          );
+      }
 
       this.#database
         .prepare(
@@ -758,6 +767,29 @@ interface AssetRow {
   sequence: number;
   observed_at: string;
   updated_at: string;
+}
+
+interface CurrentAssetVersionRow {
+  reporting_device_id: string;
+  sequence: number;
+  observed_at: string;
+}
+
+function shouldReplaceCurrentAsset(
+  envelope: InventoryEnvelope,
+  current: CurrentAssetVersionRow | undefined,
+): boolean {
+  if (current === undefined) return true;
+  const incomingTime = Date.parse(envelope.observedAt);
+  const currentTime = Date.parse(current.observed_at);
+  if (!Number.isFinite(incomingTime) || !Number.isFinite(currentTime)) {
+    throw new Error("Fleet asset observation timestamp is invalid");
+  }
+  if (incomingTime !== currentTime) return incomingTime > currentTime;
+  if (envelope.deviceId !== current.reporting_device_id) {
+    return envelope.deviceId > current.reporting_device_id;
+  }
+  return envelope.sequence > current.sequence;
 }
 
 function mapDevice(row: DeviceRow): StoredDevice {
