@@ -26,6 +26,10 @@ SQLite, a private root-token file and no remote-command surface.
 - Port 7341 is published only on host loopback. The Docker network is internal.
 - `/console/` and the API share an origin, so no permissive CORS policy is
   needed.
+- Console bearer credentials are exchanged once for a 15-minute session kept
+  only in process memory. The browser cookie is Secure, HttpOnly, SameSite
+  Strict and CSRF-bound; logout, expiry, credential revocation and restart
+  invalidate it.
 
 This is a production-like minimum, not a high-availability layout. The bundled
 database lifecycle tool uses SQLite's online backup API, validates integrity,
@@ -74,9 +78,15 @@ readable by UID 1000 rather than weakening its mode.
 To use another loopback port, set `KERNAID_FLEET_BIND_PORT`. Do not change the
 internal port because the image healthcheck intentionally probes 7341.
 
-The console is available at `http://127.0.0.1:7341/console/`. The root token is
-used only by a local operator request to create a tenant; the console takes the
-returned tenant ID and one-time admin token, never the root token.
+The loopback HTTP endpoint is suitable for health checks and the reverse-proxy
+upstream. Open the console only through its HTTPS hostname: its Secure cookie
+is intentionally unavailable at `http://127.0.0.1:7341/console/`. The root
+token is used only by a local operator request to create a tenant; the console
+takes the returned tenant ID and tenant admin/operator token once, never the
+root token.
+
+`KERNAID_FLEET_CONSOLE_SESSION_TTL_SECONDS` may override the 900-second default
+within the enforced 60–3600 second range.
 
 ## Cloudflare Tunnel
 

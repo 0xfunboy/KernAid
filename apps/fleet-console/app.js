@@ -20,13 +20,13 @@ import {
   workOrderReceiptState,
 } from "./work-order-ui.js";
 
-const apiBase =
-  document
-    .querySelector('meta[name="kernaid-api-base"]')
-    ?.content.replace(/\/$/, "") ?? "";
+const apiBase = "";
 const state = {
-  tenantId: sessionStorage.getItem("kernaid.fleet.tenant") ?? "",
-  token: sessionStorage.getItem("kernaid.fleet.admin-token") ?? "",
+  tenantId: "",
+  credentialId: "",
+  role: "",
+  expiresAt: "",
+  csrfToken: "",
   devices: [],
   assets: [],
   auditEvents: [],
@@ -157,6 +157,7 @@ const elements = {
   publishLimit: document.querySelector("#publish-limit"),
   publishError: document.querySelector("#publish-error"),
   toast: document.querySelector("#toast"),
+  sessionRole: document.querySelector("#session-role"),
 };
 
 function text(tag, value, className) {
@@ -199,7 +200,10 @@ async function request(path, options = {}) {
   const timer = setTimeout(() => controller.abort(), 12_000);
   const headers = new Headers(options.headers);
   headers.set("Accept", "application/json");
-  if (state.token) headers.set("Authorization", `Bearer ${state.token}`);
+  const method = options.method ?? "GET";
+  if (!["GET", "HEAD", "OPTIONS"].includes(method) && state.csrfToken) {
+    headers.set("X-KernAid-CSRF", state.csrfToken);
+  }
   if (options.body) headers.set("Content-Type", "application/json");
   try {
     const response = await fetch(`${apiBase}${path}`, {
@@ -272,6 +276,12 @@ function friendlyApiError(code, status) {
       "The selected device or asset is no longer available.",
     incident_case_mismatch: "The incident identifier does not match the path.",
     device_revoked: "The selected device has been revoked.",
+    csrf_required:
+      "This secure session is stale. Sign in again before changing Fleet state.",
+    console_login_rate_limited:
+      "Too many sign-in attempts. Wait one minute, then try again.",
+    console_mutation_rate_limited:
+      "This session reached its bounded change rate. Wait one minute.",
   };
   if (code && messages[code]) return messages[code];
   if (status === 401 || status === 403)
@@ -376,7 +386,7 @@ function incidentEventItems(payload) {
 }
 
 async function loadFleet() {
-  if (!state.tenantId || !state.token) return false;
+  if (!state.tenantId) return false;
   const encodedTenant = encodeURIComponent(state.tenantId);
   const [
     devicesResult,
@@ -549,6 +559,11 @@ function render() {
   document.querySelector("#metric-attention").textContent = String(attention);
   document.querySelector("#metric-devices-detail").textContent =
     `${state.devices.length - revoked} active identities`;
+  elements.sessionRole.textContent = state.role
+    ? `${state.role} · expires ${date(state.expiresAt)}`
+    : "No active session";
+  document.querySelector("#session-button").textContent =
+    state.role === "admin" ? "AD" : state.role === "operator" ? "OP" : "—";
   renderDevices();
   renderAssets();
   renderAudit();
@@ -1435,8 +1450,11 @@ function notify(message, failure = false) {
 }
 
 function clearSession() {
-  state.token = "";
   state.tenantId = "";
+  state.credentialId = "";
+  state.role = "";
+  state.expiresAt = "";
+  state.csrfToken = "";
   state.devices = [];
   state.assets = [];
   state.auditEvents = [];
@@ -1454,32 +1472,62 @@ function clearSession() {
   state.incidentEvents = [];
   state.incidentError = "";
   state.activeIncident = null;
-  sessionStorage.removeItem("kernaid.fleet.tenant");
-  sessionStorage.removeItem("kernaid.fleet.admin-token");
   elements.tokenInput.value = "";
   render();
-  elements.login.showModal();
+  if (!elements.login.open) elements.login.showModal();
+}
+
+function applyConsoleSession(payload) {
+  if (
+    payload?.schema !== "dev.kernaid.fleet.console-session.v1" ||
+    typeof payload.tenantId !== "string" ||
+    typeof payload.credentialId !== "string" ||
+    !["admin", "operator"].includes(payload.role) ||
+    typeof payload.expiresAt !== "string" ||
+    !/^[A-Za-z0-9_-]{43}$/.test(payload.csrfToken ?? "")
+  ) {
+    throw new Error("The control plane returned an invalid console session.");
+  }
+  state.tenantId = payload.tenantId;
+  state.credentialId = payload.credentialId;
+  state.role = payload.role;
+  state.expiresAt = payload.expiresAt;
+  state.csrfToken = payload.csrfToken;
+}
+
+async function logoutSession() {
+  try {
+    if (state.csrfToken) {
+      await request("/v1/console-session", { method: "DELETE" });
+    }
+  } catch {
+    // Local state is always discarded; server sessions also vanish on restart.
+  } finally {
+    clearSession();
+  }
 }
 
 elements.loginForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   const button = elements.loginForm.querySelector("button[type=submit]");
-  const previous = { tenantId: state.tenantId, token: state.token };
-  state.tenantId = elements.tenantInput.value.trim();
-  state.token = elements.tokenInput.value;
+  const tenantId = elements.tenantInput.value.trim();
+  const token = elements.tokenInput.value;
+  elements.tokenInput.value = "";
   elements.loginError.textContent = "";
   setBusy(button, true);
   try {
+    const session = await request("/v1/console-sessions", {
+      method: "POST",
+      body: JSON.stringify({ tenantId, token }),
+    });
+    applyConsoleSession(session);
     await loadFleet();
-    sessionStorage.setItem("kernaid.fleet.tenant", state.tenantId);
-    sessionStorage.setItem("kernaid.fleet.admin-token", state.token);
     elements.login.close();
   } catch (error) {
-    state.tenantId = previous.tenantId;
-    state.token = previous.token;
+    clearSession();
     elements.loginError.textContent =
       error.status === 401 || error.status === 403
-        ? "Tenant or administrator token is not valid."
+        ? "Tenant or admin/operator token is not valid."
         : error.message;
   } finally {
     setBusy(button, false);
@@ -1764,7 +1812,7 @@ document
   });
 document
   .querySelector("#session-button")
-  .addEventListener("click", clearSession);
+  .addEventListener("click", logoutSession);
 document
   .querySelector("#open-enrollment")
   .addEventListener("click", () => elements.enrollment.showModal());
@@ -1794,14 +1842,12 @@ document.querySelectorAll(".nav-item").forEach((button) =>
 );
 
 await health();
-if (state.tenantId && state.token) {
+try {
+  const session = await request("/v1/console-session");
+  applyConsoleSession(session);
   elements.tenantInput.value = state.tenantId;
-  try {
-    await loadFleet();
-  } catch {
-    clearSession();
-  }
-} else {
+  await loadFleet();
+} catch {
   render();
-  elements.login.showModal();
+  if (!elements.login.open) elements.login.showModal();
 }

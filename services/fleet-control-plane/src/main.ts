@@ -10,6 +10,7 @@ const controlPlane = new FleetControlPlane({
   entitlementTrustAnchor: config.entitlementTrustAnchor,
   updateTrustAnchor: config.updateTrustAnchor,
   enrollmentClockSkewMs: config.enrollmentClockSkewMs,
+  consoleSessionTtlMs: config.consoleSessionTtlMs,
   consoleDirectory: config.consoleDirectory,
 });
 

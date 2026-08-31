@@ -60,8 +60,17 @@ for (const schema of [
   assert.match(script, new RegExp(schema.replaceAll(".", "\\.")));
 }
 
-assert.match(script, /sessionStorage\.setItem\("kernaid\.fleet\.admin-token"/);
-assert.doesNotMatch(script, /localStorage/);
+assert.match(script, /\/v1\/console-sessions/);
+assert.match(script, /\/v1\/console-session/);
+assert.match(script, /X-KernAid-CSRF/);
+assert.match(script, /const apiBase = ""/);
+assert.doesNotMatch(html, /kernaid-api-base/);
+assert.doesNotMatch(script, /sessionStorage|localStorage/);
+assert.doesNotMatch(script, /Authorization|Bearer/);
+assert.doesNotMatch(script, /state\.token/);
+assert.match(html, /HttpOnly/);
+assert.match(html, /SameSite Strict/);
+assert.match(html, /autocomplete="off"/);
 assert.doesNotMatch(script, /innerHTML|insertAdjacentHTML|document\.write/);
 assert.doesNotMatch(
   workOrderBoundary,

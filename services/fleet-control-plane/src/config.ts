@@ -20,6 +20,7 @@ export interface FleetServiceConfig {
   host: string;
   port: number;
   enrollmentClockSkewMs: number;
+  consoleSessionTtlMs: number;
   consoleDirectory?: string;
 }
 
@@ -118,6 +119,13 @@ export function loadFleetServiceConfig(
       1_000,
       3_600_000,
     ),
+    consoleSessionTtlMs:
+      parseIntegerEnvironment(
+        environment.KERNAID_FLEET_CONSOLE_SESSION_TTL_SECONDS,
+        900,
+        60,
+        3_600,
+      ) * 1_000,
     ...(consoleDirectory === undefined
       ? {}
       : { consoleDirectory: resolve(consoleDirectory) }),

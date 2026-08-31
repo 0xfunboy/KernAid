@@ -20,17 +20,24 @@ report. It never accepts raw evidence, personal notes, names, email addresses,
 commands or arguments. Closure is administrator-only; operators can create,
 update and link cases.
 
-Serve this directory at `/console/` and the control plane API at the same
-origin. To use another origin, set the `kernaid-api-base` meta value and apply a
-strict matching CORS policy server-side.
+Serve this directory at `/console/` and the control plane API at the same HTTPS
+origin. The login accepts either tenant role token once and exchanges it for a
+15-minute in-memory server session. The raw token is immediately removed from
+the field and is never placed in Web Storage, a cookie, URL or log.
 
-The administrator token is retained in `sessionStorage`, never `localStorage`,
-and is not included in URLs or logs. Enrollment tokens are shown once and are
-never persisted by the console.
+The browser receives only a `Secure`, `HttpOnly`, `SameSite=Strict`, `Path=/`
+`__Host-` cookie. A separate CSRF value remains in JavaScript memory and is
+required on every tenant mutation and logout. Reload recovers that value from
+the same-origin session endpoint; logout, credential revocation, expiry and a
+service restart all invalidate the session. Enrollment tokens remain
+one-time-visible and are never persisted by the console.
 
 Expected routes:
 
 - `GET /healthz`
+- `POST /v1/console-sessions`
+- `GET /v1/console-session`
+- `DELETE /v1/console-session`
 - `GET /v1/tenants/:tenantId/devices`
 - `GET /v1/tenants/:tenantId/assets`
 - `GET /v1/tenants/:tenantId/audit-events`
