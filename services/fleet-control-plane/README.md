@@ -89,6 +89,9 @@ the root token to a browser. The SQLite file is forced to mode `0600`, while
 its state directory should remain `0700` because WAL files are created beside
 it.
 
+For the hardened single-node container and loopback-only Compose deployment,
+see [`deploy/fleet`](../../deploy/fleet/README.md).
+
 ## Operator flow
 
 1. Read the root token locally and call `POST /v1/tenants` with `{}`. Retain the

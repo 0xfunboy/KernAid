@@ -1,0 +1,16 @@
+**
+!package.json
+!pnpm-lock.yaml
+!pnpm-workspace.yaml
+!packages/
+!packages/fleet-schemas/
+!packages/fleet-schemas/**
+!services/
+!services/fleet-control-plane/
+!services/fleet-control-plane/**
+!apps/
+!apps/fleet-console/
+!apps/fleet-console/**
+**/node_modules/
+**/dist/
+**/.DS_Store
