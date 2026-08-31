@@ -2191,7 +2191,7 @@ fn close_after_failed_mutation(
 
 #[allow(clippy::too_many_arguments)]
 fn apply_exact_replacement(
-    mount: &OwnedFd,
+    _mount: &OwnedFd,
     etc: &OwnedFd,
     backup: &[u8],
     proposed: &[u8],
@@ -2203,7 +2203,7 @@ fn apply_exact_replacement(
     #[cfg(feature = "rescue-resolver-link-production-candidate")]
     if repair_resource_for_intent(intent)? == RepairResourceV1::ResolverLink {
         return apply_resolver_link_replacement(
-            mount,
+            _mount,
             etc,
             backup,
             proposed,
@@ -3055,6 +3055,7 @@ fn sha256(bytes: &[u8]) -> Sha256 {
         .expect("SHA-256 rendering is canonical")
 }
 
+#[cfg(feature = "rescue-resolver-link-production-candidate")]
 fn prefixed_bytes_sha256(bytes: &[u8]) -> String {
     format!("sha256:{}", sha256(bytes).as_str())
 }
