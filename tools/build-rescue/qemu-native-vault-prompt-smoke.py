@@ -41,6 +41,7 @@ SECRET_BYTES = 64
 HEX_ALPHABET = b"0123456789abcdef"
 JOURNAL_MARKER_DIRECTORY = "/run/kernaid-qemu-native-prompt-journal-proof"
 JOURNAL_PROOF_STAGES = ("boot1", "boot2")
+JOURNAL_MARKER_PROOF_TIMEOUT_SECONDS = 45.0
 
 
 def _load_module(name: str, path: Path) -> ModuleType:
@@ -772,7 +773,7 @@ def _run_firstboot(
             _journal_marker_proof("boot1"),
             cursor,
             aggregate,
-            timeout=20.0,
+            timeout=JOURNAL_MARKER_PROOF_TIMEOUT_SECONDS,
         )
         qmp.set_deadline(_deadline(aggregate, 10.0))
         qmp.system_powerdown()
@@ -861,7 +862,7 @@ def _run_prompt_boot(
             _journal_marker_proof("boot2"),
             cursor,
             aggregate,
-            timeout=20.0,
+            timeout=JOURNAL_MARKER_PROOF_TIMEOUT_SECONDS,
         )
         returned = _find_brand_frame(qmp, work_directory, _deadline(aggregate, 30.0))
         if returned[:2] != baseline[:2]:

@@ -233,6 +233,26 @@ label live-amd64-failsafe
         )
         self.assertIn("ConditionPathExists=/sys/firmware/qemu_fw_cfg/", service)
 
+        guest_match = re.search(
+            rb"deadline=time\.monotonic\(\)\+(\d+)",
+            native_prompt_smoke._journal_marker_proof("boot1"),
+        )
+        self.assertIsNotNone(guest_match)
+        assert guest_match is not None
+        unit_match = re.search(r"^TimeoutStartSec=(\d+)s$", service, re.MULTILINE)
+        self.assertIsNotNone(unit_match)
+        assert unit_match is not None
+        self.assertGreater(
+            native_prompt_smoke.JOURNAL_MARKER_PROOF_TIMEOUT_SECONDS,
+            max(float(guest_match.group(1)), float(unit_match.group(1))),
+        )
+        self.assertEqual(
+            SCRIPT.read_text(encoding="utf-8").count(
+                "timeout=JOURNAL_MARKER_PROOF_TIMEOUT_SECONDS"
+            ),
+            len(native_prompt_smoke.JOURNAL_PROOF_STAGES),
+        )
+
     def test_private_raw_is_digest_and_identity_pinned_before_extraction(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
