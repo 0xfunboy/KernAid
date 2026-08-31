@@ -209,6 +209,10 @@ pub(crate) fn acquire_crypttab_target_guard(
 /// Acquires the existing closed target bundle while selecting only a compiled
 /// repair lock domain. This is shared by crypttab and ext4; callers cannot
 /// supply a resource string or device pathname.
+#[cfg(any(
+    feature = "rescue-crypttab-production-candidate",
+    feature = "rescue-ext4-fsck-production-candidate"
+))]
 pub(crate) fn acquire_target_guard_for_resource(
     request_id: &str,
     scan_fingerprint: &str,
@@ -274,6 +278,10 @@ pub(crate) fn reserve_crypttab_backup(
 /// Reserves one authenticated, physically distinct, bounded evidence object.
 /// The target remains descriptor-bound and is revalidated before and after
 /// the Vault mutation.
+#[cfg(any(
+    feature = "rescue-crypttab-production-candidate",
+    feature = "rescue-ext4-fsck-production-candidate"
+))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn reserve_evidence_backup(
     session_id: &str,

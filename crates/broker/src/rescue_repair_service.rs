@@ -137,6 +137,8 @@ fn repair_risk(resource_id: &str) -> &'static str {
     if resource_id == EXT4_RESOURCE_ID {
         return EXT4_RISK_ID;
     }
+    #[cfg(not(feature = "rescue-ext4-fsck-production-candidate"))]
+    let _ = resource_id;
     RISK_ID
 }
 
