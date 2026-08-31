@@ -33,8 +33,8 @@
     "sha256": "fbd54a749691df4c4cd9bcd7b61c0ff3d515df063763896069a652a0c947400c",
     "retailDownloadName": "KernAid-Rescue-6e5303b-diagnostic-physical-test-candidate-x86_64-retail.img.xz",
     "retailChecksumName": "KernAid-Rescue-6e5303b-diagnostic-physical-test-candidate-x86_64-retail.img.xz.sha256",
-    "qualification": "L'ISO esatta del run 33447510598 ha superato build, ABI, controllo delle superfici shipping, SBOM, QEMU BIOS, UEFI Secure Boot, framebuffer WebKit, input da tastiera e USB-style two-boot BIOS/UEFI. I gate lunghi Vault lifecycle BIOS/UEFI e native prompt sono ancora in esecuzione: l'immagine resta una candidata diagnostica e non una release promossa.",
-    "warning": "CANDIDATA DIAGNOSTICA NON ANCORA QUALIFICATA: i gate core di avvio sono verdi, ma la qualifica Vault completa non è ancora terminata. Usare soltanto sul PC di laboratorio e su una chiavetta sacrificabile; non usare su hardware cliente. La stable internal.6 resta invariata finché tutti i gate non sono verdi."
+    "qualification": "L'ISO esatta del run 33447510598 ha superato build, ABI, controllo delle superfici shipping, SBOM, QEMU BIOS, UEFI Secure Boot, framebuffer WebKit, input da tastiera e USB-style two-boot BIOS/UEFI. I tre gate Vault hanno poi fallito in modo coerente su firstboot-confirmation: il prompt era pronto su tty1 ma la tastiera restava instradata al VT precedente. La correzione che attiva tty1 prima di pubblicare la readiness è nel commit b82710f e sarà verificata nella prossima ISO integrata; questa immagine non è promossa.",
+    "warning": "CANDIDATA DIAGNOSTICA NON QUALIFICATA: usare soltanto per verificare boot e UI sul PC di laboratorio con una chiavetta sacrificabile. Non affidarsi al provisioning Vault e non usare su hardware cliente. La stable internal.6 resta invariata finché la nuova ISO non supera tutti i gate."
   },
   "repairCandidate": {
     "available": false,
