@@ -76,6 +76,24 @@ importers:
         specifier: ^6.3.4
         version: 6.4.3(@types/node@24.13.3)(tsx@4.23.1)
 
+  packages/fleet-schemas:
+    devDependencies:
+      '@types/node':
+        specifier: ^24.10.0
+        version: 24.13.3
+      eslint:
+        specifier: ^9.25.0
+        version: 9.39.5
+      prettier:
+        specifier: ^3.5.3
+        version: 3.9.6
+      tsx:
+        specifier: ^4.19.3
+        version: 4.23.1
+      typescript:
+        specifier: ^5.8.3
+        version: 5.9.3
+
   packages/provider-types:
     dependencies:
       '@kernaid/schemas':
@@ -171,6 +189,28 @@ importers:
       '@kernaid/session-driver':
         specifier: workspace:*
         version: link:../../packages/session-driver
+    devDependencies:
+      '@types/node':
+        specifier: ^24.10.0
+        version: 24.13.3
+      eslint:
+        specifier: ^9.25.0
+        version: 9.39.5
+      prettier:
+        specifier: ^3.5.3
+        version: 3.9.6
+      tsx:
+        specifier: ^4.19.3
+        version: 4.23.1
+      typescript:
+        specifier: ^5.8.3
+        version: 5.9.3
+
+  services/fleet-control-plane:
+    dependencies:
+      '@kernaid/fleet-schemas':
+        specifier: workspace:*
+        version: link:../../packages/fleet-schemas
     devDependencies:
       '@types/node':
         specifier: ^24.10.0

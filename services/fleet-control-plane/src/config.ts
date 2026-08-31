@@ -1,0 +1,109 @@
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+} from "node:fs";
+import { dirname, resolve } from "node:path";
+
+export interface FleetServiceConfig {
+  databasePath: string;
+  rootToken: string;
+  host: string;
+  port: number;
+  enrollmentClockSkewMs: number;
+  consoleDirectory?: string;
+}
+
+export function loadFleetServiceConfig(
+  environment: NodeJS.ProcessEnv = process.env,
+): FleetServiceConfig {
+  const rootTokenFile = requiredEnvironment(
+    environment,
+    "KERNAID_FLEET_ROOT_TOKEN_FILE",
+  );
+  const databasePath = resolve(
+    requiredEnvironment(environment, "KERNAID_FLEET_DB_PATH"),
+  );
+  mkdirSync(dirname(databasePath), { recursive: true, mode: 0o700 });
+
+  const secretDescriptor = openSync(
+    rootTokenFile,
+    constants.O_RDONLY | constants.O_NOFOLLOW,
+  );
+  let rootToken: string;
+  try {
+    const secretEntry = fstatSync(secretDescriptor);
+    if (!secretEntry.isFile()) {
+      throw new Error("KERNAID_FLEET_ROOT_TOKEN_FILE must be a regular file");
+    }
+    if (process.platform !== "win32" && (secretEntry.mode & 0o077) !== 0) {
+      throw new Error(
+        "Fleet root token file must not be accessible by group or other",
+      );
+    }
+    rootToken = readFileSync(secretDescriptor, "utf8").trim();
+  } finally {
+    closeSync(secretDescriptor);
+  }
+  if (
+    rootToken.length < 32 ||
+    rootToken.length > 512 ||
+    !/^[A-Za-z0-9_-]+$/.test(rootToken)
+  ) {
+    throw new Error(
+      "Fleet root token must be 32-512 canonical base64url characters",
+    );
+  }
+
+  const consoleDirectory = environment.FLEET_CONSOLE_DIR;
+  return {
+    databasePath,
+    rootToken,
+    host: environment.KERNAID_FLEET_HOST ?? "127.0.0.1",
+    port: parseIntegerEnvironment(
+      environment.KERNAID_FLEET_PORT,
+      7341,
+      0,
+      65_535,
+    ),
+    enrollmentClockSkewMs: parseIntegerEnvironment(
+      environment.KERNAID_FLEET_ENROLLMENT_CLOCK_SKEW_MS,
+      300_000,
+      1_000,
+      3_600_000,
+    ),
+    ...(consoleDirectory === undefined
+      ? {}
+      : { consoleDirectory: resolve(consoleDirectory) }),
+  };
+}
+
+function requiredEnvironment(
+  environment: NodeJS.ProcessEnv,
+  name: string,
+): string {
+  const value = environment[name];
+  if (value === undefined || value.length === 0) {
+    throw new Error(`${name} is required`);
+  }
+  return value;
+}
+
+function parseIntegerEnvironment(
+  value: string | undefined,
+  fallback: number,
+  minimum: number,
+  maximum: number,
+): number {
+  if (value === undefined) return fallback;
+  if (!/^\d+$/.test(value))
+    throw new Error(`invalid integer environment: ${value}`);
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < minimum || parsed > maximum) {
+    throw new Error(`integer environment is outside ${minimum}-${maximum}`);
+  }
+  return parsed;
+}
