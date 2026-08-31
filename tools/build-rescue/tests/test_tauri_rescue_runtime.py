@@ -1537,6 +1537,33 @@ class TauriShippingAbiTests(unittest.TestCase):
         switch.assert_called_once_with(8)
         monitor.start.assert_called_once_with()
 
+    def test_native_prompt_open_waits_for_no_block_job_to_become_visible(self) -> None:
+        controller = native_prompt.PromptController()
+        monitor = mock.Mock()
+        with (
+            mock.patch.object(native_prompt, "_prompt_backend_ready"),
+            mock.patch.object(native_prompt, "_active_vt", return_value=7),
+            mock.patch.object(native_prompt, "_write_return_vt"),
+            mock.patch.object(native_prompt, "_tool", return_value=(0, b"")),
+            mock.patch.object(
+                native_prompt,
+                "_unit_state",
+                side_effect=(
+                    ("inactive", "dead", "success"),
+                    ("activating", "start", "success"),
+                    ("active", "running", "success"),
+                ),
+            ) as unit_state,
+            mock.patch.object(native_prompt, "_switch_vt") as switch,
+            mock.patch.object(native_prompt.time, "sleep") as sleep,
+            mock.patch.object(native_prompt.threading, "Thread", return_value=monitor),
+        ):
+            self.assertEqual(controller.open_or_focus(), "opened")
+        self.assertEqual(unit_state.call_count, 3)
+        self.assertEqual(sleep.call_args_list, [mock.call(0.05), mock.call(0.05)])
+        switch.assert_called_once_with(8)
+        monitor.start.assert_called_once_with()
+
     def test_native_prompt_units_keep_secrets_on_the_fixed_uid1000_tty(self) -> None:
         units = REPO_DIR / "rescue/live-build/config/includes.chroot/etc/systemd/system"
         broker = (units / "kernaid-rescue-native-prompt.service").read_text()
