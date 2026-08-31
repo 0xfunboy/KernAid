@@ -1,4 +1,4 @@
-//! Closed local control plane for the off-default Rescue `fstab` candidate.
+//! Closed local control plane for the off-default Rescue repair candidates.
 //!
 //! This module deliberately separates the socket/state-machine boundary from
 //! the production preparation adapter.  A client can select only one already
@@ -6,8 +6,14 @@
 //! action identifier, command, observed bytes, or replacement bytes.
 
 use crate::rescue_repair_service_engine::RescueFstabRollbackBackend;
+#[cfg(feature = "rescue-crypttab-production-candidate")]
+use kernaid_core::RESCUE_CRYPTTAB_TYPED_CONFIRMATION;
 use kernaid_core::RESCUE_FSTAB_TYPED_CONFIRMATION;
 use kernaid_linux_pack::production_candidate_contract::{ACTION_ID, RESOURCE_ID};
+#[cfg(feature = "rescue-crypttab-production-candidate")]
+use kernaid_protocol::rescue_crypttab_repair::{
+    ACTION_ID as CRYPTTAB_ACTION_ID, RESOURCE_ID as CRYPTTAB_RESOURCE_ID,
+};
 use kernaid_protocol::rescue_vault::RequestId;
 use rustix::rand::{GetRandomFlags, getrandom};
 use serde::{Deserialize, Serialize};
@@ -31,6 +37,36 @@ const CANCEL_TIMEOUT: Duration = Duration::from_secs(15);
 const RISK_ID: &str = "R2";
 const ROLLBACK_ACTION_ID: &str = "linux.fstab.restore";
 const ROLLBACK_CONFIRMATION: &str = "RIPRISTINA FSTAB ORIGINALE";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepairCandidateKind {
+    Fstab,
+    #[cfg(feature = "rescue-crypttab-production-candidate")]
+    Crypttab,
+}
+
+impl RepairCandidateKind {
+    const fn resource_id(self) -> &'static str {
+        match self {
+            Self::Fstab => RESOURCE_ID,
+            #[cfg(feature = "rescue-crypttab-production-candidate")]
+            Self::Crypttab => CRYPTTAB_RESOURCE_ID,
+        }
+    }
+}
+
+fn repair_contract(resource_id: &str) -> Option<(&'static str, &'static str, &'static str)> {
+    match resource_id {
+        RESOURCE_ID => Some(("fstab-prepared", ACTION_ID, RESCUE_FSTAB_TYPED_CONFIRMATION)),
+        #[cfg(feature = "rescue-crypttab-production-candidate")]
+        CRYPTTAB_RESOURCE_ID => Some((
+            "crypttab-prepared",
+            CRYPTTAB_ACTION_ID,
+            RESCUE_CRYPTTAB_TYPED_CONFIRMATION,
+        )),
+        _ => None,
+    }
+}
 
 /// Path-free public identity of the committed source transaction. This value
 /// can select a source receipt but carries no Vault or filesystem authority.
@@ -126,6 +162,15 @@ pub enum RepairServiceRequest {
         request_id: String,
         target: RepairTargetSelector,
     },
+    #[serde(rename = "repair.crypttab.prepare")]
+    #[cfg(feature = "rescue-crypttab-production-candidate")]
+    CrypttabPrepare {
+        #[serde(rename = "apiVersion")]
+        api_version: String,
+        #[serde(rename = "requestId")]
+        request_id: String,
+        target: RepairTargetSelector,
+    },
     #[serde(rename = "repair.fstab.approve")]
     Approve {
         #[serde(rename = "apiVersion")]
@@ -147,8 +192,42 @@ pub enum RepairServiceRequest {
         #[serde(rename = "typedConfirmation")]
         typed_confirmation: String,
     },
+    #[serde(rename = "repair.crypttab.approve")]
+    #[cfg(feature = "rescue-crypttab-production-candidate")]
+    CrypttabApprove {
+        #[serde(rename = "apiVersion")]
+        api_version: String,
+        #[serde(rename = "requestId")]
+        request_id: String,
+        #[serde(rename = "preparedId")]
+        prepared_id: String,
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        #[serde(rename = "planId")]
+        plan_id: String,
+        #[serde(rename = "planHash")]
+        plan_hash: String,
+        #[serde(rename = "approvalId")]
+        approval_id: String,
+        #[serde(rename = "approvalSequence")]
+        approval_sequence: u64,
+        #[serde(rename = "typedConfirmation")]
+        typed_confirmation: String,
+    },
     #[serde(rename = "repair.fstab.cancel")]
     Cancel {
+        #[serde(rename = "apiVersion")]
+        api_version: String,
+        #[serde(rename = "requestId")]
+        request_id: String,
+        #[serde(rename = "preparedId")]
+        prepared_id: String,
+        #[serde(rename = "planHash")]
+        plan_hash: String,
+    },
+    #[serde(rename = "repair.crypttab.cancel")]
+    #[cfg(feature = "rescue-crypttab-production-candidate")]
+    CrypttabCancel {
         #[serde(rename = "apiVersion")]
         api_version: String,
         #[serde(rename = "requestId")]
@@ -218,8 +297,14 @@ impl RepairServiceRequest {
         match self {
             Self::Status { .. } => "repair.status",
             Self::Prepare { .. } => "repair.fstab.prepare",
+            #[cfg(feature = "rescue-crypttab-production-candidate")]
+            Self::CrypttabPrepare { .. } => "repair.crypttab.prepare",
             Self::Approve { .. } => "repair.fstab.approve",
+            #[cfg(feature = "rescue-crypttab-production-candidate")]
+            Self::CrypttabApprove { .. } => "repair.crypttab.approve",
             Self::Cancel { .. } => "repair.fstab.cancel",
+            #[cfg(feature = "rescue-crypttab-production-candidate")]
+            Self::CrypttabCancel { .. } => "repair.crypttab.cancel",
             Self::RollbackStatus { .. } => "repair.fstab.rollback.status",
             Self::RollbackPrepare { .. } => "repair.fstab.rollback.prepare",
             Self::RollbackApprove { .. } => "repair.fstab.rollback.approve",
@@ -237,6 +322,10 @@ impl RepairServiceRequest {
             | Self::RollbackPrepare { api_version, .. }
             | Self::RollbackApprove { api_version, .. }
             | Self::RollbackCancel { api_version, .. } => api_version,
+            #[cfg(feature = "rescue-crypttab-production-candidate")]
+            Self::CrypttabPrepare { api_version, .. }
+            | Self::CrypttabApprove { api_version, .. }
+            | Self::CrypttabCancel { api_version, .. } => api_version,
         }
     }
 
@@ -250,6 +339,10 @@ impl RepairServiceRequest {
             | Self::RollbackPrepare { request_id, .. }
             | Self::RollbackApprove { request_id, .. }
             | Self::RollbackCancel { request_id, .. } => request_id,
+            #[cfg(feature = "rescue-crypttab-production-candidate")]
+            Self::CrypttabPrepare { request_id, .. }
+            | Self::CrypttabApprove { request_id, .. }
+            | Self::CrypttabCancel { request_id, .. } => request_id,
         }
     }
 
@@ -259,6 +352,10 @@ impl RepairServiceRequest {
             | Self::Prepare { .. }
             | Self::Approve { .. }
             | Self::Cancel { .. } => REPAIR_SERVICE_API_VERSION,
+            #[cfg(feature = "rescue-crypttab-production-candidate")]
+            Self::CrypttabPrepare { .. }
+            | Self::CrypttabApprove { .. }
+            | Self::CrypttabCancel { .. } => REPAIR_SERVICE_API_VERSION,
             Self::RollbackStatus { .. }
             | Self::RollbackPrepare { .. }
             | Self::RollbackApprove { .. }
@@ -270,6 +367,8 @@ impl RepairServiceRequest {
         match self {
             Self::Status { .. } => Ok(()),
             Self::Prepare { target, .. } => target.validate(),
+            #[cfg(feature = "rescue-crypttab-production-candidate")]
+            Self::CrypttabPrepare { target, .. } => target.validate(),
             Self::Approve {
                 prepared_id,
                 session_id,
@@ -292,7 +391,42 @@ impl RepairServiceRequest {
                 }
                 Ok(())
             }
+            #[cfg(feature = "rescue-crypttab-production-candidate")]
+            Self::CrypttabApprove {
+                prepared_id,
+                session_id,
+                plan_id,
+                plan_hash,
+                approval_id,
+                approval_sequence,
+                typed_confirmation,
+                ..
+            } => {
+                if !valid_fixed_id(prepared_id, "Q-")
+                    || !valid_fixed_id(session_id, "S-")
+                    || !valid_fixed_id(plan_id, "P-")
+                    || !valid_prefixed_hash(plan_hash, "sha256:")
+                    || !valid_fixed_id(approval_id, "A-")
+                    || *approval_sequence != 1
+                    || typed_confirmation != RESCUE_CRYPTTAB_TYPED_CONFIRMATION
+                {
+                    return Err(RepairServiceErrorToken::InvalidRequest);
+                }
+                Ok(())
+            }
             Self::Cancel {
+                prepared_id,
+                plan_hash,
+                ..
+            } => {
+                if !valid_fixed_id(prepared_id, "Q-") || !valid_prefixed_hash(plan_hash, "sha256:")
+                {
+                    return Err(RepairServiceErrorToken::InvalidRequest);
+                }
+                Ok(())
+            }
+            #[cfg(feature = "rescue-crypttab-production-candidate")]
+            Self::CrypttabCancel {
                 prepared_id,
                 plan_hash,
                 ..
@@ -358,6 +492,7 @@ pub struct BrokerOwnedPrepareCommand {
     session_id: String,
     plan_id: String,
     target: RepairTargetSelector,
+    candidate: RepairCandidateKind,
 }
 
 impl BrokerOwnedPrepareCommand {
@@ -375,6 +510,10 @@ impl BrokerOwnedPrepareCommand {
 
     pub const fn target(&self) -> &RepairTargetSelector {
         &self.target
+    }
+
+    pub const fn candidate(&self) -> RepairCandidateKind {
+        self.candidate
     }
 }
 
@@ -686,7 +825,7 @@ impl PreparedRepairDescriptor {
             || !valid_prefixed_hash(&value.before_sha256, "sha256:")
             || !valid_prefixed_hash(&value.after_sha256, "sha256:")
             || !valid_prefixed_hash(&value.diff_sha256, "sha256:")
-            || value.resource_id != RESOURCE_ID
+            || repair_contract(&value.resource_id).is_none()
             || !valid_backup_locator(&value.backup_locator)
             || value.next_approval_sequence == 0
             || !value.backup_reserved
@@ -955,8 +1094,14 @@ impl PreparedRollbackSummary {
 
 impl PreparedSummary {
     fn detail(&self) -> PreparedRepairDetail {
+        let (kind, action_id, confirmation_required) =
+            repair_contract(&self.descriptor.resource_id).unwrap_or((
+                "invalid-prepared",
+                ACTION_ID,
+                RESCUE_FSTAB_TYPED_CONFIRMATION,
+            ));
         PreparedRepairDetail {
-            kind: "fstab-prepared",
+            kind,
             prepared_id: self.prepared_id.clone(),
             session_id: self.descriptor.session_id.clone(),
             plan_id: self.descriptor.plan_id.clone(),
@@ -967,14 +1112,14 @@ impl PreparedSummary {
             diff_sha256: self.descriptor.diff_sha256.clone(),
             resource_id: self.descriptor.resource_id.clone(),
             backup_locator: self.descriptor.backup_locator.clone(),
-            action_id: ACTION_ID,
+            action_id,
             risk: RISK_ID,
             backup: PreparedBackupDetail {
                 state: "reserved",
                 vault_distinct: true,
             },
             next_approval_sequence: self.descriptor.next_approval_sequence,
-            confirmation_required: RESCUE_FSTAB_TYPED_CONFIRMATION,
+            confirmation_required,
         }
     }
 }
@@ -1202,7 +1347,11 @@ impl<Engine: RepairPreparationEngine + RescueFstabRollbackBackend> RescueRepairS
             }
             RepairServiceRequest::Prepare {
                 request_id, target, ..
-            } => self.begin_prepare(request_id, target),
+            } => self.begin_prepare(request_id, target, RepairCandidateKind::Fstab),
+            #[cfg(feature = "rescue-crypttab-production-candidate")]
+            RepairServiceRequest::CrypttabPrepare {
+                request_id, target, ..
+            } => self.begin_prepare(request_id, target, RepairCandidateKind::Crypttab),
             RepairServiceRequest::Approve {
                 request_id,
                 prepared_id,
@@ -1213,7 +1362,21 @@ impl<Engine: RepairPreparationEngine + RescueFstabRollbackBackend> RescueRepairS
                 approval_sequence,
                 typed_confirmation,
                 ..
-            } => self.begin_approval(BoundRepairApproval {
+            } => self.begin_approval(
+                BoundRepairApproval {
+                    request_id,
+                    prepared_id,
+                    session_id,
+                    plan_id,
+                    plan_hash,
+                    approval_id,
+                    approval_sequence,
+                    typed_confirmation,
+                },
+                RepairCandidateKind::Fstab,
+            ),
+            #[cfg(feature = "rescue-crypttab-production-candidate")]
+            RepairServiceRequest::CrypttabApprove {
                 request_id,
                 prepared_id,
                 session_id,
@@ -1222,13 +1385,43 @@ impl<Engine: RepairPreparationEngine + RescueFstabRollbackBackend> RescueRepairS
                 approval_id,
                 approval_sequence,
                 typed_confirmation,
-            }),
+                ..
+            } => self.begin_approval(
+                BoundRepairApproval {
+                    request_id,
+                    prepared_id,
+                    session_id,
+                    plan_id,
+                    plan_hash,
+                    approval_id,
+                    approval_sequence,
+                    typed_confirmation,
+                },
+                RepairCandidateKind::Crypttab,
+            ),
             RepairServiceRequest::Cancel {
                 request_id,
                 prepared_id,
                 plan_hash,
                 ..
-            } => self.begin_cancel(&request_id, &prepared_id, &plan_hash),
+            } => self.begin_cancel(
+                &request_id,
+                &prepared_id,
+                &plan_hash,
+                RepairCandidateKind::Fstab,
+            ),
+            #[cfg(feature = "rescue-crypttab-production-candidate")]
+            RepairServiceRequest::CrypttabCancel {
+                request_id,
+                prepared_id,
+                plan_hash,
+                ..
+            } => self.begin_cancel(
+                &request_id,
+                &prepared_id,
+                &plan_hash,
+                RepairCandidateKind::Crypttab,
+            ),
             RepairServiceRequest::RollbackPrepare {
                 request_id, source, ..
             } => self.begin_rollback_prepare(request_id, source),
@@ -1277,6 +1470,7 @@ impl<Engine: RepairPreparationEngine + RescueFstabRollbackBackend> RescueRepairS
         &mut self,
         request_id: String,
         target: RepairTargetSelector,
+        candidate: RepairCandidateKind,
     ) -> Result<(), RepairServiceErrorToken> {
         match self.state.phase {
             InternalState::Idle => {}
@@ -1302,6 +1496,7 @@ impl<Engine: RepairPreparationEngine + RescueFstabRollbackBackend> RescueRepairS
             session_id,
             plan_id,
             target,
+            candidate,
         };
         let deadline = absolute_deadline(PREPARE_TIMEOUT)?;
         let job = WorkerJob::Prepare {
@@ -1324,6 +1519,7 @@ impl<Engine: RepairPreparationEngine + RescueFstabRollbackBackend> RescueRepairS
     fn begin_approval(
         &mut self,
         approval: BoundRepairApproval,
+        candidate: RepairCandidateKind,
     ) -> Result<(), RepairServiceErrorToken> {
         match &self.state.phase {
             InternalState::Preparing { .. }
@@ -1345,6 +1541,7 @@ impl<Engine: RepairPreparationEngine + RescueFstabRollbackBackend> RescueRepairS
                     || approval.plan_id != summary.descriptor.plan_id
                     || approval.plan_hash != summary.descriptor.plan_hash
                     || approval.approval_sequence != summary.descriptor.next_approval_sequence
+                    || summary.descriptor.resource_id != candidate.resource_id()
                 {
                     return Err(RepairServiceErrorToken::BindingMismatch);
                 }
@@ -1397,6 +1594,7 @@ impl<Engine: RepairPreparationEngine + RescueFstabRollbackBackend> RescueRepairS
         request_id: &str,
         prepared_id: &str,
         plan_hash: &str,
+        candidate: RepairCandidateKind,
     ) -> Result<(), RepairServiceErrorToken> {
         match &self.state.phase {
             InternalState::Preparing { .. }
@@ -1415,6 +1613,7 @@ impl<Engine: RepairPreparationEngine + RescueFstabRollbackBackend> RescueRepairS
                 if request_id == summary.prepare_request_id
                     || prepared_id != summary.prepared_id
                     || plan_hash != summary.descriptor.plan_hash
+                    || summary.descriptor.resource_id != candidate.resource_id()
                 {
                     return Err(RepairServiceErrorToken::BindingMismatch);
                 }
@@ -2125,6 +2324,7 @@ fn descriptor_matches(
     descriptor.session_id == command.session_id
         && descriptor.plan_id == command.plan_id
         && descriptor.target_fingerprint == command.target.target_fingerprint
+        && descriptor.resource_id == command.candidate.resource_id()
         && descriptor.backup_reserved
         && descriptor.vault_distinct
 }
@@ -2429,7 +2629,7 @@ mod tests {
                     hash('2'),
                     hash('3'),
                     hash('4'),
-                    RESOURCE_ID,
+                    command.candidate().resource_id(),
                     "vault://repair/B-0123456789abcdef0123456789abcdef",
                     1,
                     true,
@@ -2559,6 +2759,17 @@ mod tests {
         .into_bytes()
     }
 
+    #[cfg(feature = "rescue-crypttab-production-candidate")]
+    fn crypttab_prepare_frame() -> Vec<u8> {
+        format!(
+            r#"{{"apiVersion":"{REPAIR_SERVICE_API_VERSION}","requestId":"{REQUEST}","operation":"repair.crypttab.prepare","target":{{"scanFingerprint":"scan:{}","targetFingerprint":"sha256:{}","targetId":"target:{}"}}}}"#,
+            "1".repeat(64),
+            "2".repeat(64),
+            "3".repeat(64)
+        )
+        .into_bytes()
+    }
+
     fn json(bytes: &[u8]) -> Value {
         serde_json::from_slice(bytes).expect("response JSON")
     }
@@ -2655,6 +2866,68 @@ mod tests {
             detail["planHash"].as_str().expect("plan hash"),
         );
         let accepted = json(&service.handle_frame(approval.as_bytes()));
+        assert!(matches!(
+            accepted["state"].as_str(),
+            Some("executing") | Some("succeeded")
+        ));
+        wait_for_state(&mut service, RepairPublicState::Succeeded);
+        let calls = state.lock().expect("mock state");
+        assert_eq!((calls.approved, calls.executed), (1, 1));
+    }
+
+    #[cfg(feature = "rescue-crypttab-production-candidate")]
+    #[test]
+    fn crypttab_contract_is_distinct_and_cross_action_approval_fails_closed() {
+        let (mut service, state) = service();
+        let _ = service.handle_frame(&crypttab_prepare_frame());
+        wait_for_state(&mut service, RepairPublicState::Prepared);
+        let status = json(&service.handle_frame(
+            format!(
+                r#"{{"apiVersion":"{REPAIR_SERVICE_API_VERSION}","requestId":"R-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","operation":"repair.status"}}"#
+            )
+            .as_bytes(),
+        ));
+        let detail = &status["detail"];
+        assert_eq!(detail["kind"], "crypttab-prepared");
+        assert_eq!(detail["resourceId"], CRYPTTAB_RESOURCE_ID);
+        assert_eq!(detail["actionId"], CRYPTTAB_ACTION_ID);
+        assert_eq!(
+            detail["confirmationRequired"],
+            RESCUE_CRYPTTAB_TYPED_CONFIRMATION
+        );
+
+        let approval = |operation: &str, confirmation: &str, request_id: &str| {
+            format!(
+                r#"{{"apiVersion":"{REPAIR_SERVICE_API_VERSION}","requestId":"{request_id}","operation":"{operation}","preparedId":"{}","sessionId":"{}","planId":"{}","planHash":"{}","approvalId":"A-11111111111111111111111111111111","approvalSequence":1,"typedConfirmation":"{confirmation}"}}"#,
+                detail["preparedId"].as_str().expect("prepared ID"),
+                detail["sessionId"].as_str().expect("session ID"),
+                detail["planId"].as_str().expect("plan ID"),
+                detail["planHash"].as_str().expect("plan hash"),
+            )
+        };
+        let cross_action = json(
+            &service.handle_frame(
+                approval(
+                    "repair.fstab.approve",
+                    RESCUE_FSTAB_TYPED_CONFIRMATION,
+                    "R-10000000-0000-0000-0000-000000000001",
+                )
+                .as_bytes(),
+            ),
+        );
+        assert_eq!(cross_action["error"], "binding-mismatch");
+        assert_eq!(service.public_state(), RepairPublicState::Prepared);
+
+        let accepted = json(
+            &service.handle_frame(
+                approval(
+                    "repair.crypttab.approve",
+                    RESCUE_CRYPTTAB_TYPED_CONFIRMATION,
+                    "R-10000000-0000-0000-0000-000000000002",
+                )
+                .as_bytes(),
+            ),
+        );
         assert!(matches!(
             accepted["state"].as_str(),
             Some("executing") | Some("succeeded")

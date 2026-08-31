@@ -9,6 +9,12 @@ export const RESCUE_FSTAB_FINDING_ID = "KA-LNX-P0-003";
 export const RESCUE_FSTAB_ACTION_ID = "linux.fstab.disable-missing-uuid.v1";
 export const RESCUE_FSTAB_RESOURCE_ID = "rescue:selected-linux-root:etc/fstab";
 export const RESCUE_FSTAB_CONFIRMATION = "DISABILITA VOCE FSTAB";
+export const RESCUE_CRYPTTAB_FINDING_ID = "KA-LNX-P0-012";
+export const RESCUE_CRYPTTAB_ACTION_ID =
+  "linux.crypttab.disable-missing-uuid.v1";
+export const RESCUE_CRYPTTAB_RESOURCE_ID =
+  "rescue:selected-linux-root:etc/crypttab";
+export const RESCUE_CRYPTTAB_CONFIRMATION = "DISABILITA VOCE CRYPTTAB";
 export const RESCUE_FSTAB_ROLLBACK_ACTION_ID = "linux.fstab.restore";
 export const RESCUE_FSTAB_ROLLBACK_CONFIRMATION = "RIPRISTINA FSTAB ORIGINALE";
 
@@ -31,6 +37,9 @@ export type RescueRepairOperation =
   | "repair.fstab.prepare"
   | "repair.fstab.approve"
   | "repair.fstab.cancel"
+  | "repair.crypttab.prepare"
+  | "repair.crypttab.approve"
+  | "repair.crypttab.cancel"
   | "repair.fstab.rollback.status"
   | "repair.fstab.rollback.prepare"
   | "repair.fstab.rollback.approve"
@@ -85,7 +94,7 @@ export interface RescueRepairTargetClaims {
 }
 
 export interface RescueRepairPreparedDetail {
-  readonly kind: "fstab-prepared";
+  readonly kind: "fstab-prepared" | "crypttab-prepared";
   readonly preparedId: string;
   readonly sessionId: string;
   readonly planId: string;
@@ -94,16 +103,19 @@ export interface RescueRepairPreparedDetail {
   readonly beforeSha256: string;
   readonly afterSha256: string;
   readonly diffSha256: string;
-  readonly resourceId: typeof RESCUE_FSTAB_RESOURCE_ID;
+  readonly resourceId:
+    typeof RESCUE_FSTAB_RESOURCE_ID | typeof RESCUE_CRYPTTAB_RESOURCE_ID;
   readonly backupLocator: string;
-  readonly actionId: typeof RESCUE_FSTAB_ACTION_ID;
+  readonly actionId:
+    typeof RESCUE_FSTAB_ACTION_ID | typeof RESCUE_CRYPTTAB_ACTION_ID;
   readonly risk: "R2";
   readonly backup: {
     readonly state: "reserved";
     readonly vaultDistinct: true;
   };
   readonly nextApprovalSequence: number;
-  readonly confirmationRequired: typeof RESCUE_FSTAB_CONFIRMATION;
+  readonly confirmationRequired:
+    typeof RESCUE_FSTAB_CONFIRMATION | typeof RESCUE_CRYPTTAB_CONFIRMATION;
 }
 
 export interface RescueRollbackSourceReceipt {
@@ -218,6 +230,7 @@ export class RescueRepairClient {
 
   async prepare(
     target: RescueRepairTargetClaims,
+    candidate: "fstab" | "crypttab" = "fstab",
     signal?: AbortSignal,
   ): Promise<RescueRepairSnapshot> {
     const claims = parseRescueRepairTargetClaims(target);
@@ -226,11 +239,11 @@ export class RescueRepairClient {
       {
         apiVersion: RESCUE_REPAIR_API_VERSION,
         requestId,
-        operation: "repair.fstab.prepare",
+        operation: `repair.${candidate}.prepare`,
         target: claims,
       },
       requestId,
-      "repair.fstab.prepare",
+      `repair.${candidate}.prepare`,
       signal,
     );
   }
@@ -241,7 +254,7 @@ export class RescueRepairClient {
     signal?: AbortSignal,
   ): Promise<RescueRepairSnapshot> {
     const exactPrepared = parsePreparedDetail(prepared);
-    if (typedConfirmation !== RESCUE_FSTAB_CONFIRMATION)
+    if (typedConfirmation !== exactPrepared.confirmationRequired)
       throw new Error("La frase di conferma non corrisponde.");
     const requestId = this.#nextRequestId();
     const approvalId = this.#approvalId();
@@ -251,17 +264,22 @@ export class RescueRepairClient {
       {
         apiVersion: RESCUE_REPAIR_API_VERSION,
         requestId,
-        operation: "repair.fstab.approve",
+        operation:
+          exactPrepared.kind === "crypttab-prepared"
+            ? "repair.crypttab.approve"
+            : "repair.fstab.approve",
         preparedId: exactPrepared.preparedId,
         sessionId: exactPrepared.sessionId,
         planId: exactPrepared.planId,
         planHash: exactPrepared.planHash,
         approvalId,
         approvalSequence: exactPrepared.nextApprovalSequence,
-        typedConfirmation: RESCUE_FSTAB_CONFIRMATION,
+        typedConfirmation: exactPrepared.confirmationRequired,
       },
       requestId,
-      "repair.fstab.approve",
+      exactPrepared.kind === "crypttab-prepared"
+        ? "repair.crypttab.approve"
+        : "repair.fstab.approve",
       signal,
     );
   }
@@ -276,12 +294,17 @@ export class RescueRepairClient {
       {
         apiVersion: RESCUE_REPAIR_API_VERSION,
         requestId,
-        operation: "repair.fstab.cancel",
+        operation:
+          exactPrepared.kind === "crypttab-prepared"
+            ? "repair.crypttab.cancel"
+            : "repair.fstab.cancel",
         preparedId: exactPrepared.preparedId,
         planHash: exactPrepared.planHash,
       },
       requestId,
-      "repair.fstab.cancel",
+      exactPrepared.kind === "crypttab-prepared"
+        ? "repair.crypttab.cancel"
+        : "repair.fstab.cancel",
       signal,
     );
   }
@@ -504,7 +527,8 @@ export function preparedRepairDetail(
   snapshot: RescueRepairSnapshot | undefined,
 ): RescueRepairPreparedDetail | undefined {
   return snapshot?.state === "prepared" &&
-    snapshot.detail?.kind === "fstab-prepared"
+    (snapshot.detail?.kind === "fstab-prepared" ||
+      snapshot.detail?.kind === "crypttab-prepared")
     ? snapshot.detail
     : undefined;
 }
@@ -520,8 +544,10 @@ export function preparedRollbackDetail(
 
 export function rollbackSourceReceipt(
   snapshot: RescueRepairSnapshot | undefined,
+  candidate: "fstab" | "crypttab" | undefined,
 ): RescueRollbackSourceReceipt | undefined {
   if (
+    candidate !== "fstab" ||
     snapshot?.state !== "succeeded" ||
     snapshot.detail?.kind !== "terminal" ||
     snapshot.detail.terminalOutcome !== "committed" ||
@@ -624,10 +650,19 @@ function parseDetail(
   state: RescueRepairState,
   operation: RescueRepairOperation,
 ): RescueRepairDetail {
-  if (state === "prepared")
-    return operation.startsWith("repair.fstab.rollback.")
-      ? parseRollbackPreparedDetail(value)
-      : parsePreparedDetail(value);
+  if (state === "prepared") {
+    if (operation.startsWith("repair.fstab.rollback."))
+      return parseRollbackPreparedDetail(value);
+    const prepared = parsePreparedDetail(value);
+    if (
+      (operation.startsWith("repair.crypttab.") &&
+        prepared.kind !== "crypttab-prepared") ||
+      (operation.startsWith("repair.fstab.") &&
+        prepared.kind !== "fstab-prepared")
+    )
+      throw new Error("Risorsa preparata non coerente con l'operazione.");
+    return prepared;
+  }
   if (
     state === "succeeded" ||
     state === "restored" ||
@@ -661,8 +696,9 @@ function parsePreparedDetail(value: unknown): RescueRepairPreparedDetail {
     "confirmationRequired",
   ]);
   const backup = exactRecord(item.backup, ["state", "vaultDistinct"]);
+  const crypttab = item.kind === "crypttab-prepared";
   if (
-    item.kind !== "fstab-prepared" ||
+    (item.kind !== "fstab-prepared" && !crypttab) ||
     typeof item.preparedId !== "string" ||
     !PREPARED_ID.test(item.preparedId) ||
     typeof item.sessionId !== "string" ||
@@ -680,19 +716,23 @@ function parsePreparedDetail(value: unknown): RescueRepairPreparedDetail {
     typeof item.diffSha256 !== "string" ||
     !SHA256.test(item.diffSha256) ||
     item.beforeSha256 === item.afterSha256 ||
-    item.resourceId !== RESCUE_FSTAB_RESOURCE_ID ||
+    item.resourceId !==
+      (crypttab ? RESCUE_CRYPTTAB_RESOURCE_ID : RESCUE_FSTAB_RESOURCE_ID) ||
     typeof item.backupLocator !== "string" ||
     !BACKUP_LOCATOR.test(item.backupLocator) ||
-    item.actionId !== RESCUE_FSTAB_ACTION_ID ||
+    item.actionId !==
+      (crypttab ? RESCUE_CRYPTTAB_ACTION_ID : RESCUE_FSTAB_ACTION_ID) ||
     item.risk !== "R2" ||
     backup.state !== "reserved" ||
     backup.vaultDistinct !== true ||
     !Number.isSafeInteger(item.nextApprovalSequence) ||
     Number(item.nextApprovalSequence) < 1 ||
     Number(item.nextApprovalSequence) > 1_000_000 ||
-    item.confirmationRequired !== RESCUE_FSTAB_CONFIRMATION
+    item.confirmationRequired !==
+      (crypttab ? RESCUE_CRYPTTAB_CONFIRMATION : RESCUE_FSTAB_CONFIRMATION) ||
+    (crypttab && item.nextApprovalSequence !== 1)
   )
-    throw new Error("Piano fstab preparato non valido.");
+    throw new Error("Piano Rescue preparato non valido.");
   return structuredClone({
     ...item,
     backup,

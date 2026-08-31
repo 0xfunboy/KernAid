@@ -91,6 +91,9 @@ REPAIR_OPERATIONS = {
     "repair.fstab.prepare",
     "repair.fstab.approve",
     "repair.fstab.cancel",
+    "repair.crypttab.prepare",
+    "repair.crypttab.approve",
+    "repair.crypttab.cancel",
 }
 ROLLBACK_OPERATIONS = {
     "repair.fstab.rollback.status",
@@ -1101,7 +1104,7 @@ def _validate_repair_request(value: dict[str, object]) -> None:
         ):
             raise RepairRelayError("invalid-request", 400)
         return
-    if operation == "repair.fstab.prepare":
+    if operation in {"repair.fstab.prepare", "repair.crypttab.prepare"}:
         if set(value) != {"apiVersion", "requestId", "operation", "target"}:
             raise RepairRelayError("invalid-request", 400)
         target = value.get("target")
@@ -1121,7 +1124,7 @@ def _validate_repair_request(value: dict[str, object]) -> None:
         ):
             raise RepairRelayError("invalid-request", 400)
         return
-    if operation == "repair.fstab.cancel":
+    if operation in {"repair.fstab.cancel", "repair.crypttab.cancel"}:
         if (
             set(value)
             != {"apiVersion", "requestId", "operation", "preparedId", "planHash"}
@@ -1154,7 +1157,16 @@ def _validate_repair_request(value: dict[str, object]) -> None:
         or not isinstance(value.get("approvalSequence"), int)
         or isinstance(value.get("approvalSequence"), bool)
         or not 1 <= int(value["approvalSequence"]) <= MAX_AUDIT_SEQUENCE
-        or value.get("typedConfirmation") != "DISABILITA VOCE FSTAB"
+        or value.get("typedConfirmation")
+        != (
+            "DISABILITA VOCE CRYPTTAB"
+            if operation == "repair.crypttab.approve"
+            else "DISABILITA VOCE FSTAB"
+        )
+        or (
+            operation == "repair.crypttab.approve"
+            and int(value["approvalSequence"]) != 1
+        )
     ):
         raise RepairRelayError("invalid-request", 400)
 
@@ -1180,8 +1192,9 @@ def _validate_repair_prepared_detail(value: object) -> bool:
     }:
         return False
     backup = value.get("backup")
+    crypttab = value.get("kind") == "crypttab-prepared"
     return (
-        value.get("kind") == "fstab-prepared"
+        value.get("kind") in {"fstab-prepared", "crypttab-prepared"}
         and _repair_id(value.get("preparedId"), "Q")
         and _repair_id(value.get("sessionId"), "S")
         and _repair_id(value.get("planId"), "P")
@@ -1197,10 +1210,20 @@ def _validate_repair_prepared_detail(value: object) -> bool:
             )
         )
         and value.get("beforeSha256") != value.get("afterSha256")
-        and value.get("resourceId") == "rescue:selected-linux-root:etc/fstab"
+        and value.get("resourceId")
+        == (
+            "rescue:selected-linux-root:etc/crypttab"
+            if crypttab
+            else "rescue:selected-linux-root:etc/fstab"
+        )
         and isinstance(value.get("backupLocator"), str)
         and REPAIR_BACKUP_LOCATOR.fullmatch(str(value["backupLocator"])) is not None
-        and value.get("actionId") == "linux.fstab.disable-missing-uuid.v1"
+        and value.get("actionId")
+        == (
+            "linux.crypttab.disable-missing-uuid.v1"
+            if crypttab
+            else "linux.fstab.disable-missing-uuid.v1"
+        )
         and value.get("risk") == "R2"
         and isinstance(backup, dict)
         and set(backup) == {"state", "vaultDistinct"}
@@ -1209,7 +1232,9 @@ def _validate_repair_prepared_detail(value: object) -> bool:
         and isinstance(value.get("nextApprovalSequence"), int)
         and not isinstance(value.get("nextApprovalSequence"), bool)
         and 1 <= int(value["nextApprovalSequence"]) <= MAX_AUDIT_SEQUENCE
-        and value.get("confirmationRequired") == "DISABILITA VOCE FSTAB"
+        and value.get("confirmationRequired")
+        == ("DISABILITA VOCE CRYPTTAB" if crypttab else "DISABILITA VOCE FSTAB")
+        and (not crypttab or value.get("nextApprovalSequence") == 1)
     )
 
 
@@ -1358,6 +1383,15 @@ def _validate_repair_response(
             if request.get("apiVersion") == ROLLBACK_API_VERSION
             else _validate_repair_prepared_detail(detail)
         )
+        operation = request.get("operation")
+        if valid_detail and isinstance(detail, dict):
+            if isinstance(operation, str) and operation.startswith("repair.crypttab."):
+                valid_detail = detail.get("kind") == "crypttab-prepared"
+            elif isinstance(operation, str) and operation.startswith("repair.fstab."):
+                valid_detail = (
+                    request.get("apiVersion") == ROLLBACK_API_VERSION
+                    or detail.get("kind") == "fstab-prepared"
+                )
     elif state in {
         "succeeded",
         "restored",

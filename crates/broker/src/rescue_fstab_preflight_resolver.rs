@@ -19,14 +19,18 @@ use crate::{
     target_physical_parent::{RescueTargetPhysicalParentGuard, TargetPhysicalParentError},
 };
 use kernaid_linux_pack::{
-    production_candidate_contract::RESOURCE_ID,
     rescue_fstab_candidate::DisableMissingUuidPreview,
     rescue_fstab_transaction_candidate::{BootVaultBackupCapability, CandidateTransactionError},
 };
+#[cfg(feature = "rescue-crypttab-production-candidate")]
+use kernaid_protocol::rescue_crypttab_repair::RescueCrypttabPrepareRequest;
+#[cfg(feature = "rescue-crypttab-production-candidate")]
+use kernaid_protocol::rescue_repair_vault::RepairFileMetadataV1;
 use kernaid_protocol::{
     rescue_repair::{RescueFstabPreflightIntent, RescueFstabPrepareRequest},
     rescue_repair_vault::{
         RepairBackupDraft, RepairBackupState, RepairBackupStatusPayload, RepairExecutionIntentV1,
+        RepairResourceV1, canonical_repair_lock_identity_for_resource,
     },
     rescue_vault::{ErrorToken, RequestId, Sha256},
 };
@@ -44,7 +48,6 @@ const REPAIR_BACKUP_CAPACITY_BYTES: u64 = 4096;
 // cancelled using the caller's original deadline.
 const RESERVATION_CLEANUP_BUDGET: Duration = Duration::from_secs(2);
 const RESERVATION_RECONCILIATION_POLL: Duration = Duration::from_millis(250);
-const LOCK_ID_DOMAIN: &[u8] = b"kernaid:rescue-fstab:target-lock:v2\0";
 
 /// Stateful production resolver. The Repair Vault client remains here until a
 /// reserve succeeds, so an ambiguous reserve response retains the exact
@@ -137,7 +140,9 @@ pub(crate) fn reacquire_target_for_recovery(
     ensure_deadline(deadline)?;
     target.revalidate().map_err(map_physical_parent_error)?;
     let claims = target.target_claims();
-    let lock_identity = lock_identity(claims);
+    let resource = repair_resource_for_intent(intent)?;
+    let lock_identity =
+        canonical_repair_lock_identity_for_resource(claims.recovery_fingerprint(), resource);
     if claims.recovery_fingerprint() != intent.target_recovery_fingerprint()
         || lock_identity != intent.lock_identity()
     {
@@ -158,7 +163,7 @@ pub struct ProductionRescueFstabVaultReservation {
 }
 
 impl ProductionRescueFstabVaultReservation {
-    fn new(client: RepairVaultClient, status: RepairBackupStatusPayload) -> Self {
+    pub(crate) fn new(client: RepairVaultClient, status: RepairBackupStatusPayload) -> Self {
         let reservation_binding_sha256 = prefixed_sha256(status.draft_binding_sha256());
         Self {
             client,
@@ -172,11 +177,129 @@ impl ProductionRescueFstabVaultReservation {
     }
 
     /// Transfers the authenticated client and exact Vault status together to
-    /// the future closed executor. No pathname or backup byte is introduced.
+    /// the shared closed executor. No pathname or caller-selected resource is
+    /// introduced.
     #[allow(dead_code)]
     pub(crate) fn into_parts(self) -> (RepairVaultClient, RepairBackupStatusPayload) {
         (self.client, self.status)
     }
+}
+
+/// Acquire the same retained target authority for the closed crypttab action.
+/// Only the lock domain differs; no caller-provided resource or pathname is
+/// accepted.
+#[cfg(feature = "rescue-crypttab-production-candidate")]
+pub(crate) fn acquire_crypttab_target_guard(
+    request: &RescueCrypttabPrepareRequest,
+    deadline: Instant,
+) -> Result<ProductionRescueFstabTargetGuard, RescueFstabCapabilityResolutionError> {
+    ensure_deadline(deadline)?;
+    let request_id = RequestId::parse(request.request_id())
+        .map_err(|_| RescueFstabCapabilityResolutionError::Unavailable)?;
+    let capability = acquire_rescue_target_capability(
+        &request_id,
+        request.scan_fingerprint(),
+        request.target_fingerprint(),
+        request.target_id(),
+        deadline,
+    )
+    .map_err(map_target_client_error)?;
+    let target = capability
+        .bind_physical_parent()
+        .map_err(map_physical_parent_error)?;
+    ensure_deadline(deadline)?;
+    let claims = target.target_claims();
+    if claims.scan_fingerprint() != request.scan_fingerprint()
+        || claims.target_fingerprint() != request.target_fingerprint()
+        || claims.target_id() != request.target_id()
+        || claims.request_id() != request.request_id()
+    {
+        return Err(RescueFstabCapabilityResolutionError::IdentityChanged);
+    }
+    target.revalidate().map_err(map_physical_parent_error)?;
+    let lock_identity = canonical_repair_lock_identity_for_resource(
+        claims.recovery_fingerprint(),
+        RepairResourceV1::Crypttab,
+    );
+    Ok(ProductionRescueFstabTargetGuard {
+        target,
+        lock_identity,
+    })
+}
+
+/// Reserve authenticated, physically distinct Vault capacity for exactly the
+/// observed crypttab bytes while retaining the target guard.
+#[cfg(feature = "rescue-crypttab-production-candidate")]
+pub(crate) fn reserve_crypttab_backup(
+    request: &RescueCrypttabPrepareRequest,
+    target_guard: &ProductionRescueFstabTargetGuard,
+    backup: &[u8],
+    metadata: &RepairFileMetadataV1,
+    deadline: Instant,
+) -> Result<ProductionRescueFstabVaultReservation, RescueFstabCapabilityResolutionError> {
+    ensure_deadline(deadline)?;
+    target_guard
+        .target
+        .revalidate()
+        .map_err(map_physical_parent_error)?;
+    let claims = target_guard.target.target_claims();
+    if claims.scan_fingerprint() != request.scan_fingerprint()
+        || claims.target_fingerprint() != request.target_fingerprint()
+        || claims.target_id() != request.target_id()
+        || backup.is_empty()
+    {
+        return Err(RescueFstabCapabilityResolutionError::IdentityChanged);
+    }
+    let backup_size = u64::try_from(backup.len())
+        .map_err(|_| RescueFstabCapabilityResolutionError::Unavailable)?;
+    let required_capacity =
+        bounded_capacity(backup_size).ok_or(RescueFstabCapabilityResolutionError::Unavailable)?;
+    let draft = RepairBackupDraft::new(
+        request.session_id(),
+        request.target_id(),
+        parse_prefixed_sha256(request.target_fingerprint())?,
+        claims.recovery_fingerprint(),
+        raw_digest(backup),
+        metadata.canonical_sha256(),
+        backup_size,
+        required_capacity,
+    )
+    .map_err(|_| RescueFstabCapabilityResolutionError::Unavailable)?;
+    let (initial_deadline, reconciliation_deadline) =
+        reservation_operation_deadlines(deadline, Instant::now())?;
+    let mut client = RepairVaultClient::new();
+    let status = reserve_with_exact_reconciliation(
+        &draft,
+        initial_deadline,
+        reconciliation_deadline,
+        |draft, attempt_deadline| client.reserve(draft, attempt_deadline),
+        thread::sleep,
+    )
+    .map_err(map_vault_error)?;
+    let invalid = status.state() != RepairBackupState::Reserved
+        || status.draft_binding_sha256() != &draft.draft_binding_sha256()
+        || status.backup_size() != backup_size
+        || status.expected_backup_sha256() != draft.expected_backup_sha256()
+        || status.metadata_sha256() != draft.metadata_sha256()
+        || status.reserved_bytes() < required_capacity
+        || prefixed_sha256(status.physical_parent_fingerprint())
+            == target_guard.physical_parent_fingerprint();
+    let reservation = ProductionRescueFstabVaultReservation::new(client, status);
+    if invalid {
+        return fail_after_reservation(
+            reservation,
+            deadline,
+            RescueFstabCapabilityResolutionError::IdentityChanged,
+        );
+    }
+    if let Err(error) = target_guard
+        .target
+        .revalidate()
+        .map_err(map_physical_parent_error)
+    {
+        return fail_after_reservation(reservation, deadline, error);
+    }
+    Ok(reservation)
 }
 
 impl fmt::Debug for ProductionRescueFstabVaultReservation {
@@ -444,22 +567,26 @@ fn parse_prefixed_sha256(value: &str) -> Result<Sha256, RescueFstabCapabilityRes
 }
 
 fn lock_identity(claims: &RescueTargetCapabilityClaims) -> String {
-    lock_identity_for_resource(claims.recovery_fingerprint(), RESOURCE_ID)
+    canonical_repair_lock_identity_for_resource(
+        claims.recovery_fingerprint(),
+        RepairResourceV1::Fstab,
+    )
 }
 
 #[cfg(test)]
 fn lock_identity_from_recovery_fingerprint(recovery_fingerprint: &str) -> String {
-    lock_identity_for_resource(recovery_fingerprint, RESOURCE_ID)
+    canonical_repair_lock_identity_for_resource(recovery_fingerprint, RepairResourceV1::Fstab)
 }
 
-fn lock_identity_for_resource(recovery_fingerprint: &str, resource_id: &str) -> String {
-    let mut hasher = Sha256Hasher::new();
-    hasher.update(LOCK_ID_DOMAIN);
-    for value in [recovery_fingerprint, resource_id] {
-        hasher.update((value.len() as u64).to_be_bytes());
-        hasher.update(value.as_bytes());
+fn repair_resource_for_intent(
+    intent: &RepairExecutionIntentV1,
+) -> Result<RepairResourceV1, RescueFstabCapabilityResolutionError> {
+    for resource in [RepairResourceV1::Fstab, RepairResourceV1::Crypttab] {
+        if intent.action_id() == resource.action_id() {
+            return Ok(resource);
+        }
     }
-    format!("lock:{:x}", hasher.finalize())
+    Err(RescueFstabCapabilityResolutionError::IdentityChanged)
 }
 
 /// Runs one reserve attempt without taking ownership first. Errors deliberately
@@ -884,9 +1011,9 @@ mod tests {
             lock_identity_from_recovery_fingerprint(&recovery_fingerprint);
         let changed_recovery =
             lock_identity_from_recovery_fingerprint(&format!("recovery:{}", "8".repeat(64)));
-        let changed_resource = lock_identity_for_resource(
+        let changed_resource = canonical_repair_lock_identity_for_resource(
             &recovery_fingerprint,
-            "rescue:selected-linux-root:other-resource",
+            RepairResourceV1::Crypttab,
         );
         assert_eq!(first.len(), 69);
         assert!(first.starts_with("lock:"));

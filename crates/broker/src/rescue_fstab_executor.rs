@@ -1,4 +1,4 @@
-//! Closed, off-default executor for the sole Phase 1 Rescue mutation.
+//! Closed, off-default transaction engine for the Phase 1 Rescue mutations.
 //!
 //! The public entrypoint accepts no pathname, device name, command, or raw
 //! replacement supplied by a client. It consumes the broker-owned approved
@@ -6,6 +6,10 @@
 //! durable in the Repair Vault, and only then consumes the root helper's
 //! single-use detached writable ext4 mount capability.
 
+#[cfg(feature = "rescue-crypttab-production-candidate")]
+use crate::rescue_crypttab_candidate::{
+    ApprovedRescueCrypttabExecutionParts, ApprovedRescueCrypttabTransaction,
+};
 use crate::{
     repair_vault_client::{RepairBackupBytes, RepairVaultClient, RepairVaultClientError},
     rescue_fstab_candidate::{
@@ -22,16 +26,15 @@ use crate::{
         acquire_pending_target_write_mount,
     },
 };
-use kernaid_linux_pack::production_candidate_contract::RESOURCE_ID as FSTAB_RESOURCE_ID;
 use kernaid_protocol::{
     rescue_repair_vault::{
         RepairBackupBinding, RepairBackupState, RepairBackupStatusPayload, RepairExecutionIntentV1,
-        RepairFileMetadataV1, RepairReservationId, RepairRollbackBindingV1, RepairRollbackId,
-        RepairRollbackResolution, RepairRollbackResolutionOutcome, RepairRollbackStatusSelector,
-        RepairRollbackTransactionStatusPayload, RepairTransactionPhase,
-        RepairTransactionResolution, RepairTransactionResolutionOutcome,
+        RepairFileMetadataV1, RepairReservationId, RepairResourceV1, RepairRollbackBindingV1,
+        RepairRollbackId, RepairRollbackResolution, RepairRollbackResolutionOutcome,
+        RepairRollbackStatusSelector, RepairRollbackTransactionStatusPayload,
+        RepairTransactionPhase, RepairTransactionResolution, RepairTransactionResolutionOutcome,
         RepairTransactionStatusPayload, RepairTransactionStatusSelector,
-        RepairVaultLiveIdentityPayload,
+        RepairVaultLiveIdentityPayload, repair_resource_from_transaction,
     },
     rescue_vault::{ErrorToken, Sha256},
 };
@@ -53,9 +56,10 @@ use std::{
 use zeroize::Zeroizing;
 
 const FSTAB_RESOURCE: &str = "fstab";
+const CRYPTTAB_RESOURCE: &str = "crypttab";
 const ETC_DIRECTORY: &str = "etc";
 const REPAIR_LOCK_DIRECTORY: &str = "/run/lock/kernaid-repair";
-const MAX_FSTAB_BYTES: usize = 1024 * 1024;
+const MAX_REPAIR_RESOURCE_BYTES: usize = 1024 * 1024;
 const NONCANONICAL_METADATA_DOMAIN: &[u8] =
     b"kernaid:rescue-fstab:observed-noncanonical-metadata:v1\0";
 const SAFETY_CLEANUP_BUDGET: Duration = Duration::from_secs(30);
@@ -754,6 +758,172 @@ pub(crate) fn execute_approved_rescue_fstab_with_qualification_fault(
     })
 }
 
+/// Executes the separately gated crypttab candidate through the same Vault,
+/// write-mount, atomic replacement and reconciliation engine used by fstab.
+/// The selected resource is a closed enum inferred from the approved action;
+/// no path or shell command enters this boundary.
+#[cfg(feature = "rescue-crypttab-production-candidate")]
+pub fn execute_approved_rescue_crypttab(
+    approved: ApprovedRescueCrypttabTransaction,
+    deadline: Instant,
+) -> Result<RescueFstabExecutionReceipt, RescueFstabExecutionError> {
+    let operation_deadline = match reserve_cleanup_window(deadline) {
+        Ok(operation) => operation,
+        Err(error) => {
+            approved
+                .cancel(deadline)
+                .map_err(|_| RescueFstabExecutionError::VaultReconciliationRequired)?;
+            return Err(error);
+        }
+    };
+    let ApprovedRescueCrypttabExecutionParts {
+        descriptor,
+        plan,
+        admission,
+        backup_bytes,
+        proposed_bytes,
+        metadata,
+        target_guard,
+        reservation,
+    } = approved.into_execution_parts();
+
+    let authority = (|| {
+        let binding = admission.binding();
+        let claims = target_guard.inner().target_claims();
+        let step = plan
+            .steps
+            .as_slice()
+            .first()
+            .filter(|_| plan.steps.len() == 1)
+            .ok_or(RescueFstabExecutionError::InvalidAuthority)?;
+        if plan.plan_id != descriptor.plan_id()
+            || plan.target_fingerprint != descriptor.target_fingerprint()
+            || step.action != RepairResourceV1::Crypttab.action_id()
+            || binding.session_id() != descriptor.session_id()
+            || binding.plan_id() != descriptor.plan_id()
+            || binding.plan_sha256() != descriptor.plan_sha256()
+            || binding.target_fingerprint() != descriptor.target_fingerprint()
+            || binding.target_snapshot() != descriptor.before_sha256()
+            || claims.target_id() != descriptor.target_id()
+            || claims.scan_fingerprint() != descriptor.scan_fingerprint()
+            || claims.target_fingerprint() != descriptor.target_fingerprint()
+        {
+            return Err(RescueFstabExecutionError::InvalidAuthority);
+        }
+        let intent = RepairExecutionIntentV1::new_for_resource(
+            RepairResourceV1::Crypttab,
+            descriptor.session_id(),
+            admission
+                .approval_sequence()
+                .ok_or(RescueFstabExecutionError::InvalidAuthority)?,
+            descriptor.target_id(),
+            descriptor.scan_fingerprint(),
+            parse_prefixed_sha256(claims.target_fingerprint())?,
+            parse_prefixed_sha256(target_guard.physical_parent_fingerprint())?,
+            claims.recovery_fingerprint(),
+            target_guard.lock_identity(),
+            parse_prefixed_sha256(descriptor.before_sha256())?,
+            parse_prefixed_sha256(descriptor.after_sha256())?,
+            parse_prefixed_sha256(descriptor.diff_sha256())?,
+            parse_prefixed_sha256(descriptor.observed_uuid_set_sha256())?,
+            metadata.clone(),
+        )
+        .map_err(|_| RescueFstabExecutionError::InvalidAuthority)?;
+        let vault_binding = RepairBackupBinding::new(
+            descriptor.plan_id(),
+            parse_prefixed_sha256(descriptor.plan_sha256())?,
+            admission
+                .approval_id()
+                .ok_or(RescueFstabExecutionError::InvalidAuthority)?,
+            parse_prefixed_sha256(
+                admission
+                    .approval_sha256()
+                    .ok_or(RescueFstabExecutionError::InvalidAuthority)?,
+            )?,
+            RepairResourceV1::Crypttab.resource_id(),
+            intent.before_sha256().clone(),
+            intent.clone(),
+        )
+        .map_err(|_| RescueFstabExecutionError::InvalidAuthority)?;
+        Ok::<_, RescueFstabExecutionError>((intent, vault_binding))
+    })();
+    let (intent, binding) = match authority {
+        Ok(value) => value,
+        Err(error) => {
+            reservation
+                .cancel(deadline)
+                .map_err(|_| RescueFstabExecutionError::VaultReconciliationRequired)?;
+            return Err(error);
+        }
+    };
+
+    let _process_lock = match acquire_process_lock(operation_deadline) {
+        Ok(lock) => lock,
+        Err(error) => {
+            reservation
+                .cancel(deadline)
+                .map_err(|_| RescueFstabExecutionError::VaultReconciliationRequired)?;
+            return Err(error);
+        }
+    };
+    let _target_lock = match acquire_target_lock(&target_guard, operation_deadline) {
+        Ok(lock) => lock,
+        Err(error) => {
+            reservation
+                .cancel(deadline)
+                .map_err(|_| RescueFstabExecutionError::VaultReconciliationRequired)?;
+            return Err(error);
+        }
+    };
+    if target_guard.inner().revalidate().is_err() {
+        reservation
+            .cancel(deadline)
+            .map_err(|_| RescueFstabExecutionError::VaultReconciliationRequired)?;
+        return Err(RescueFstabExecutionError::TargetChanged);
+    }
+    let (mut vault_client, reserved) = reservation.into_parts();
+    let durable = persist_pending(
+        &mut vault_client,
+        &reserved,
+        &binding,
+        &metadata,
+        &backup_bytes,
+        operation_deadline,
+    )?;
+    let pending = RepairTransactionStatusPayload::pending(durable)
+        .map_err(|_| RescueFstabExecutionError::InvalidAuthority)?;
+    drop(target_guard);
+    let write_mount = acquire_pending_target_write_mount(&pending, operation_deadline)
+        .map_err(map_write_capability_error)?;
+    refresh_pending_after_write_lease(&mut vault_client, &pending, operation_deadline)?;
+    let target_closure = execute_same_boot_target(
+        write_mount,
+        &backup_bytes,
+        &proposed_bytes,
+        &intent,
+        pending.backup().reservation_id().as_str(),
+        operation_deadline,
+        RescueFstabQualificationFault::None,
+    )?;
+    let initial_failure = target_closure.initial_failure;
+    let resolution = RepairTransactionResolution::new(
+        target_closure.outcome,
+        target_closure.observation.resource_sha256,
+        target_closure.observation.metadata_sha256,
+        target_closure.cleanup_verified,
+        &intent,
+    )
+    .map_err(|_| RescueFstabExecutionError::RecoveryUnavailable)?;
+    let resolved = resolve_pending(&mut vault_client, &pending, &resolution, deadline)
+        .map_err(|error| prefer_initial_failure(initial_failure, error))?;
+    let receipt = receipt_from_status(&resolved)
+        .map_err(|error| prefer_initial_failure(initial_failure, error))?;
+    Ok(match initial_failure {
+        Some(failure) => receipt.with_initial_failure(failure),
+        None => receipt,
+    })
+}
+
 /// Reconciles the sole unresolved transaction after a process restart or
 /// reboot. Target reacquisition uses only the approval-bound stable recovery
 /// fingerprint; every boot-local target claim is freshly authenticated.
@@ -1059,6 +1229,24 @@ fn source_intent(
         .ok_or(RescueFstabExecutionError::InvalidAuthority)
 }
 
+fn repair_resource_for_intent(
+    intent: &RepairExecutionIntentV1,
+) -> Result<RepairResourceV1, RescueFstabExecutionError> {
+    for resource in [RepairResourceV1::Fstab, RepairResourceV1::Crypttab] {
+        if intent.action_id() == resource.action_id() {
+            return Ok(resource);
+        }
+    }
+    Err(RescueFstabExecutionError::InvalidAuthority)
+}
+
+fn resource_leaf(resource: RepairResourceV1) -> &'static str {
+    match resource {
+        RepairResourceV1::Fstab => FSTAB_RESOURCE,
+        RepairResourceV1::Crypttab => CRYPTTAB_RESOURCE,
+    }
+}
+
 fn validate_committed_rollback_source(
     source: &RepairTransactionStatusPayload,
 ) -> Result<(), RescueFstabExecutionError> {
@@ -1069,7 +1257,7 @@ fn validate_committed_rollback_source(
             .map(kernaid_protocol::rescue_repair_vault::RepairTransactionResolution::outcome)
             != Some(RepairTransactionResolutionOutcome::CommittedAfter)
         || source.backup().state() != RepairBackupState::Durable
-        || !valid_rollback_source_resource_id(source.backup().resource_id())
+        || repair_resource_from_transaction(source) != Ok(RepairResourceV1::Fstab)
         || source.backup().resource_sha256() != Some(intent.before_sha256())
         || source.backup().locator()
             != format!(
@@ -1080,10 +1268,6 @@ fn validate_committed_rollback_source(
         return Err(RescueFstabExecutionError::InvalidAuthority);
     }
     Ok(())
-}
-
-fn valid_rollback_source_resource_id(resource_id: Option<&str>) -> bool {
-    resource_id == Some(FSTAB_RESOURCE_ID)
 }
 
 fn validate_live_vault(
@@ -1493,7 +1677,7 @@ fn classify_with_retained_read_mount(
         .map_err(|_| RescueFstabExecutionError::TargetChanged)?;
     let mount = target.inner().target_detached_mount_descriptor();
     let etc = open_etc_directory(mount)?;
-    let snapshot = snapshot_fstab(&etc)?;
+    let snapshot = snapshot_repair_resource(&etc, intent)?;
     let result = (exact_state(&snapshot, intent), snapshot.observation());
     drop(etc);
     target
@@ -1526,7 +1710,7 @@ fn restore_recovery_target(
                     initial_failure: None,
                 },
                 Err(error) => {
-                    let snapshot = snapshot_fstab(&etc)?;
+                    let snapshot = snapshot_repair_resource(&etc, intent)?;
                     TargetClosure {
                         outcome: if exact_state(&snapshot, intent) == ExactTargetState::Before {
                             RepairTransactionResolutionOutcome::ClosedBeforeRestored
@@ -1580,7 +1764,7 @@ fn restore_rollback_target(
                 cleanup_verified: false,
             },
             Err(error) => {
-                let snapshot = snapshot_fstab(&etc)?;
+                let snapshot = snapshot_repair_resource(&etc, intent)?;
                 match exact_state(&snapshot, intent) {
                     ExactTargetState::Before => RollbackTargetClosure {
                         outcome: RepairRollbackResolutionOutcome::RolledBackBefore,
@@ -1654,12 +1838,12 @@ fn close_after_failed_mutation(
     reservation_id: &str,
     deadline: Instant,
 ) -> Result<TargetClosure, RescueFstabExecutionError> {
-    let snapshot = snapshot_fstab(etc)?;
+    let snapshot = snapshot_repair_resource(etc, intent)?;
     match exact_state(&snapshot, intent) {
         ExactTargetState::Before => {
             cleanup_known_stage(
                 etc,
-                &execution_stage_name(reservation_id),
+                &execution_stage_name_for(repair_resource_for_intent(intent)?, reservation_id),
                 intent.after_sha256(),
                 intent.before_metadata(),
             );
@@ -1701,31 +1885,38 @@ fn apply_exact_replacement(
     qualification_fault: RescueFstabQualificationFault,
 ) -> Result<ClosedObservation, RescueFstabExecutionError> {
     ensure_deadline(deadline)?;
-    let before = snapshot_fstab(etc)?;
+    let resource = repair_resource_for_intent(intent)?;
+    let before = snapshot_repair_resource(etc, intent)?;
     ensure_snapshot_exact(&before, intent.before_sha256(), intent.before_metadata())?;
     if before.bytes.as_slice() != backup {
         return Err(RescueFstabExecutionError::TargetChanged);
     }
 
-    let stage_name = execution_stage_name(reservation_id);
+    let stage_name = execution_stage_name_for(resource, reservation_id);
     let (prepared, mut stage_guard) =
         create_prepared_file(etc, &stage_name, proposed, intent.before_metadata())?;
     ensure_snapshot_exact(&prepared, intent.after_sha256(), intent.before_metadata())?;
-    let current = snapshot_fstab(etc)?;
+    let current = snapshot_repair_resource(etc, intent)?;
     if !current.same_object_and_value(&before) {
         return Err(RescueFstabExecutionError::TargetChanged);
     }
     ensure_deadline(deadline)?;
 
-    rfs::renameat_with(etc, &stage_name, etc, FSTAB_RESOURCE, RenameFlags::EXCHANGE)
-        .map_err(|_| RescueFstabExecutionError::MutationFailed)?;
+    rfs::renameat_with(
+        etc,
+        &stage_name,
+        etc,
+        resource_leaf(resource),
+        RenameFlags::EXCHANGE,
+    )
+    .map_err(|_| RescueFstabExecutionError::MutationFailed)?;
     rfs::fsync(etc).map_err(|_| RescueFstabExecutionError::MutationFailed)?;
     // `fsmount` returns an O_PATH descriptor, which syncfs rejects with
     // EBADF. The open directory is on the same filesystem and is a valid
     // persistence barrier descriptor.
     rfs::syncfs(etc).map_err(|_| RescueFstabExecutionError::MutationFailed)?;
 
-    let installed = snapshot_fstab(etc)?;
+    let installed = snapshot_repair_resource(etc, intent)?;
     let displaced = snapshot_named(etc, &stage_name)?;
     ensure_snapshot_exact(&installed, intent.after_sha256(), intent.before_metadata())?;
     ensure_snapshot_exact(&displaced, intent.before_sha256(), intent.before_metadata())?;
@@ -1736,7 +1927,7 @@ fn apply_exact_replacement(
     stage_guard.disarm();
     rfs::fsync(etc).map_err(|_| RescueFstabExecutionError::MutationFailed)?;
     rfs::syncfs(etc).map_err(|_| RescueFstabExecutionError::MutationFailed)?;
-    let final_state = snapshot_fstab(etc)?;
+    let final_state = snapshot_repair_resource(etc, intent)?;
     ensure_snapshot_exact(
         &final_state,
         intent.after_sha256(),
@@ -1761,9 +1952,10 @@ fn restore_exact_backup(
 ) -> Result<ClosedObservation, RescueFstabExecutionError> {
     ensure_deadline(deadline)?;
     ensure_exact_bytes(backup, intent.before_sha256())?;
-    let current = snapshot_fstab(etc)?;
+    let resource = repair_resource_for_intent(intent)?;
+    let current = snapshot_repair_resource(etc, intent)?;
     ensure_snapshot_exact(&current, intent.after_sha256(), intent.before_metadata())?;
-    let restore_name = restore_stage_name(reservation_id);
+    let restore_name = restore_stage_name_for(resource, reservation_id);
     let (restore, mut restore_guard) =
         match create_prepared_file(etc, &restore_name, backup, intent.before_metadata()) {
             Ok(value) => value,
@@ -1775,7 +1967,7 @@ fn restore_exact_backup(
             }
             Err(error) => return Err(error),
         };
-    let recheck = snapshot_fstab(etc)?;
+    let recheck = snapshot_repair_resource(etc, intent)?;
     if !recheck.same_object_and_value(&current) {
         return Err(RescueFstabExecutionError::TargetChanged);
     }
@@ -1784,13 +1976,13 @@ fn restore_exact_backup(
         etc,
         &restore_name,
         etc,
-        FSTAB_RESOURCE,
+        resource_leaf(resource),
         RenameFlags::EXCHANGE,
     )
     .map_err(|_| RescueFstabExecutionError::MutationFailed)?;
     rfs::fsync(etc).map_err(|_| RescueFstabExecutionError::MutationFailed)?;
     rfs::syncfs(etc).map_err(|_| RescueFstabExecutionError::MutationFailed)?;
-    let restored = snapshot_fstab(etc)?;
+    let restored = snapshot_repair_resource(etc, intent)?;
     let displaced = snapshot_named(etc, &restore_name)?;
     ensure_snapshot_exact(&restored, intent.before_sha256(), intent.before_metadata())?;
     ensure_snapshot_exact(&displaced, intent.after_sha256(), intent.before_metadata())?;
@@ -1801,13 +1993,13 @@ fn restore_exact_backup(
     restore_guard.disarm();
     cleanup_known_stage(
         etc,
-        &execution_stage_name(reservation_id),
+        &execution_stage_name_for(resource, reservation_id),
         intent.before_sha256(),
         intent.before_metadata(),
     );
     rfs::fsync(etc).map_err(|_| RescueFstabExecutionError::MutationFailed)?;
     rfs::syncfs(etc).map_err(|_| RescueFstabExecutionError::MutationFailed)?;
-    let final_state = snapshot_fstab(etc)?;
+    let final_state = snapshot_repair_resource(etc, intent)?;
     ensure_snapshot_exact(
         &final_state,
         intent.before_sha256(),
@@ -1868,8 +2060,16 @@ impl FileSnapshot {
     }
 }
 
+#[cfg(test)]
 fn snapshot_fstab(etc: &OwnedFd) -> Result<FileSnapshot, RescueFstabExecutionError> {
     snapshot_named(etc, FSTAB_RESOURCE)
+}
+
+fn snapshot_repair_resource(
+    etc: &OwnedFd,
+    intent: &RepairExecutionIntentV1,
+) -> Result<FileSnapshot, RescueFstabExecutionError> {
+    snapshot_named(etc, resource_leaf(repair_resource_for_intent(intent)?))
 }
 
 fn snapshot_named(
@@ -1888,12 +2088,12 @@ fn snapshot_named(
     let before_xattr_size = validate_regular_file(&descriptor, &before)?;
     let size = usize::try_from(before.st_size)
         .ok()
-        .filter(|size| (1..=MAX_FSTAB_BYTES).contains(size))
+        .filter(|size| (1..=MAX_REPAIR_RESOURCE_BYTES).contains(size))
         .ok_or(RescueFstabExecutionError::UnsafeTarget)?;
     let mut file = File::from(descriptor);
     let mut bytes = Zeroizing::new(Vec::with_capacity(size));
     Read::by_ref(&mut file)
-        .take((MAX_FSTAB_BYTES + 1) as u64)
+        .take((MAX_REPAIR_RESOURCE_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
         .map_err(|_| RescueFstabExecutionError::UnsafeTarget)?;
     if bytes.len() != size || bytes.contains(&0) || std::str::from_utf8(&bytes).is_err() {
@@ -2013,7 +2213,7 @@ fn create_prepared_file<'directory>(
     bytes: &[u8],
     metadata: &RepairFileMetadataV1,
 ) -> Result<(FileSnapshot, NamedFileGuard<'directory>), RescueFstabExecutionError> {
-    if bytes.is_empty() || bytes.len() > MAX_FSTAB_BYTES {
+    if bytes.is_empty() || bytes.len() > MAX_REPAIR_RESOURCE_BYTES {
         return Err(RescueFstabExecutionError::InvalidAuthority);
     }
     let descriptor = rfs::openat(
@@ -2049,7 +2249,7 @@ fn create_prepared_file<'directory>(
         .map_err(|_| RescueFstabExecutionError::MutationFailed)?;
     let mut verified = Zeroizing::new(Vec::with_capacity(bytes.len()));
     Read::by_ref(&mut file)
-        .take((MAX_FSTAB_BYTES + 1) as u64)
+        .take((MAX_REPAIR_RESOURCE_BYTES + 1) as u64)
         .read_to_end(&mut verified)
         .map_err(|_| RescueFstabExecutionError::MutationFailed)?;
     if verified.as_slice() != bytes {
@@ -2101,16 +2301,28 @@ fn cleanup_known_stage(
     }
 }
 
+#[cfg(test)]
 fn execution_stage_name(reservation_id: &str) -> String {
+    execution_stage_name_for(RepairResourceV1::Fstab, reservation_id)
+}
+
+fn execution_stage_name_for(resource: RepairResourceV1, reservation_id: &str) -> String {
     format!(
-        ".kernaid-fstab-stage-v1-{}",
+        ".kernaid-{}-stage-v1-{}",
+        resource_leaf(resource),
         reservation_id.strip_prefix("B-").unwrap_or("invalid")
     )
 }
 
+#[cfg(test)]
 fn restore_stage_name(reservation_id: &str) -> String {
+    restore_stage_name_for(RepairResourceV1::Fstab, reservation_id)
+}
+
+fn restore_stage_name_for(resource: RepairResourceV1, reservation_id: &str) -> String {
     format!(
-        ".kernaid-fstab-restore-v1-{}",
+        ".kernaid-{}-restore-v1-{}",
+        resource_leaf(resource),
         reservation_id.strip_prefix("B-").unwrap_or("invalid")
     )
 }
@@ -2202,6 +2414,7 @@ fn prefer_initial_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use std::{
         fs,
         path::{Path, PathBuf},
@@ -2212,6 +2425,11 @@ mod tests {
     const BEFORE: &[u8] =
         b"UUID=aaaa / ext4 defaults 0 1\nUUID=dead-beef /srv/archive ext4 defaults 0 2\n";
     const AFTER: &[u8] = b"UUID=aaaa / ext4 defaults 0 1\n# KernAid Rescue disabled missing UUID: UUID=dead-beef /srv/archive ext4 defaults 0 2\n";
+    #[cfg(feature = "rescue-crypttab-production-candidate")]
+    const CRYPTTAB_BEFORE: &[u8] =
+        b"archive UUID=dead-beef none luks,nofail\nroot UUID=aaaa none luks\n";
+    #[cfg(feature = "rescue-crypttab-production-candidate")]
+    const CRYPTTAB_AFTER: &[u8] = b"# KernAid Rescue disabled missing UUID: archive UUID=dead-beef none luks,nofail\nroot UUID=aaaa none luks\n";
     const RESERVATION: &str = "B-0123456789abcdef0123456789abcdef";
 
     #[test]
@@ -2232,9 +2450,15 @@ mod tests {
 
     #[test]
     fn rollback_source_uses_the_protocol_resource_id_not_the_leaf_filename() {
-        assert!(valid_rollback_source_resource_id(Some(FSTAB_RESOURCE_ID)));
-        assert!(!valid_rollback_source_resource_id(Some(FSTAB_RESOURCE)));
-        assert!(!valid_rollback_source_resource_id(None));
+        assert_eq!(
+            RepairResourceV1::from_resource_id(RepairResourceV1::Fstab.resource_id()),
+            Ok(RepairResourceV1::Fstab)
+        );
+        assert_eq!(
+            RepairResourceV1::from_resource_id(RepairResourceV1::Crypttab.resource_id()),
+            Ok(RepairResourceV1::Crypttab)
+        );
+        assert!(RepairResourceV1::from_resource_id(FSTAB_RESOURCE).is_err());
     }
 
     #[test]
@@ -2304,7 +2528,10 @@ mod tests {
 
     fn setup() -> (DisposableTree, OwnedFd, RepairExecutionIntentV1) {
         let tree = DisposableTree::new();
-        fs::write(tree.path().join(FSTAB_RESOURCE), BEFORE).expect("write disposable fstab");
+        let resource_path = tree.path().join(FSTAB_RESOURCE);
+        fs::write(&resource_path, BEFORE).expect("write disposable fstab");
+        fs::set_permissions(&resource_path, fs::Permissions::from_mode(0o644))
+            .expect("set canonical fstab mode");
         let directory = rfs::open(
             tree.path(),
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
@@ -2328,6 +2555,41 @@ mod tests {
             snapshot.metadata,
         )
         .expect("execution intent");
+        (tree, directory, intent)
+    }
+
+    #[cfg(feature = "rescue-crypttab-production-candidate")]
+    fn crypttab_setup() -> (DisposableTree, OwnedFd, RepairExecutionIntentV1) {
+        let tree = DisposableTree::new();
+        let resource_path = tree.path().join(CRYPTTAB_RESOURCE);
+        fs::write(&resource_path, CRYPTTAB_BEFORE).expect("write disposable crypttab");
+        fs::set_permissions(&resource_path, fs::Permissions::from_mode(0o600))
+            .expect("set private crypttab mode");
+        let directory = rfs::open(
+            tree.path(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .expect("open disposable directory");
+        let snapshot =
+            snapshot_named(&directory, CRYPTTAB_RESOURCE).expect("snapshot disposable crypttab");
+        let intent = RepairExecutionIntentV1::new_for_resource(
+            RepairResourceV1::Crypttab,
+            "S-test",
+            1,
+            "target-test",
+            format!("scan:{}", "1".repeat(64)),
+            raw_hash('2'),
+            raw_hash('3'),
+            format!("recovery:{}", "4".repeat(64)),
+            format!("lock:{}", "5".repeat(64)),
+            sha256(CRYPTTAB_BEFORE),
+            sha256(CRYPTTAB_AFTER),
+            raw_hash('6'),
+            raw_hash('7'),
+            snapshot.metadata,
+        )
+        .expect("crypttab execution intent");
         (tree, directory, intent)
     }
 
@@ -2367,6 +2629,51 @@ mod tests {
             BEFORE
         );
         assert!(!tree.path().join(restore_stage_name(RESERVATION)).exists());
+    }
+
+    #[cfg(feature = "rescue-crypttab-production-candidate")]
+    #[test]
+    fn crypttab_uses_shared_atomic_exchange_restore_and_private_metadata() {
+        let (tree, directory, intent) = crypttab_setup();
+        let installed = apply_exact_replacement(
+            &directory,
+            &directory,
+            CRYPTTAB_BEFORE,
+            CRYPTTAB_AFTER,
+            &intent,
+            RESERVATION,
+            Instant::now() + Duration::from_secs(5),
+            RescueFstabQualificationFault::None,
+        )
+        .expect("apply exact crypttab replacement");
+        assert_eq!(installed.resource_sha256, *intent.after_sha256());
+        assert_eq!(
+            fs::read(tree.path().join(CRYPTTAB_RESOURCE)).expect("read replaced crypttab"),
+            CRYPTTAB_AFTER
+        );
+        assert_eq!(
+            fs::metadata(tree.path().join(CRYPTTAB_RESOURCE))
+                .expect("crypttab metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        let restored = restore_exact_backup(
+            &directory,
+            &directory,
+            CRYPTTAB_BEFORE,
+            &intent,
+            RESERVATION,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .expect("restore exact crypttab backup");
+        assert_eq!(restored.resource_sha256, *intent.before_sha256());
+        assert_eq!(
+            fs::read(tree.path().join(CRYPTTAB_RESOURCE)).expect("read restored crypttab"),
+            CRYPTTAB_BEFORE
+        );
     }
 
     #[test]

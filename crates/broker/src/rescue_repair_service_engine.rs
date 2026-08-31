@@ -4,6 +4,14 @@
 //! derives snapshot and evidence under the retained target capability. Core
 //! admission is staged before the authority can be exposed as Prepared.
 
+#[cfg(feature = "rescue-crypttab-production-candidate")]
+use crate::{
+    rescue_crypttab_candidate::{
+        ApprovedRescueCrypttabTransaction, PreparedRescueCrypttabTransaction,
+        RescueCrypttabPreflightError, prepare_rescue_crypttab_transaction,
+    },
+    rescue_fstab_executor::execute_approved_rescue_crypttab,
+};
 use crate::{
     rescue_fstab_candidate::{
         ApprovedRescueFstabTransaction, PreparedRescueFstabPlan,
@@ -26,8 +34,9 @@ use crate::{
     rescue_repair_service::{
         BoundRepairApproval, BoundRollbackApproval, BrokerOwnedPrepareCommand,
         BrokerOwnedRollbackPrepareCommand, PreparedRepairDescriptor, PreparedRollbackDescriptor,
-        RepairEngineFailure, RepairExecutionFailureStage, RepairPreparationEngine,
-        RepairPrepareFailureStage, RepairTerminalOutcome, RepairTerminalReceipt,
+        RepairCandidateKind, RepairEngineFailure, RepairExecutionFailureStage,
+        RepairPreparationEngine, RepairPrepareFailureStage, RepairTerminalOutcome,
+        RepairTerminalReceipt,
     },
 };
 use kernaid_core::{
@@ -35,6 +44,8 @@ use kernaid_core::{
     RescueFstabRollbackApproval, RescueFstabRollbackBinding, RescueFstabRollbackSourceBinding,
     Session, SessionMode, canonical_rescue_fstab_rollback_plan,
 };
+#[cfg(feature = "rescue-crypttab-production-candidate")]
+use kernaid_protocol::rescue_crypttab_repair::RescueCrypttabPrepareRequest;
 use kernaid_protocol::{
     rescue_repair::RescueFstabPrepareRequest, rescue_repair_vault::RepairRollbackBindingV1,
     rescue_vault::Sha256,
@@ -111,14 +122,22 @@ type ProductionApprovedTransaction = ApprovedRescueFstabTransaction<
 >;
 
 /// Non-cloneable retained prepare authority plus its exact staged Core state.
-pub struct ProductionPreparedRepair {
-    plan: ProductionPreparedPlan,
-    admission: RescueFstabCandidateAdmission,
+pub enum ProductionPreparedRepair {
+    Fstab {
+        plan: Box<ProductionPreparedPlan>,
+        admission: RescueFstabCandidateAdmission,
+    },
+    #[cfg(feature = "rescue-crypttab-production-candidate")]
+    Crypttab(Box<PreparedRescueCrypttabTransaction>),
 }
 
 /// The approved type remains the broker's inseparable target/backup/Core
 /// authority and can only be consumed by the closed executor.
-pub struct ProductionApprovedRepair(ProductionApprovedTransaction);
+pub enum ProductionApprovedRepair {
+    Fstab(Box<ProductionApprovedTransaction>),
+    #[cfg(feature = "rescue-crypttab-production-candidate")]
+    Crypttab(Box<ApprovedRescueCrypttabTransaction>),
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RepairQualificationConfigurationError {
@@ -244,71 +263,120 @@ impl RepairPreparationEngine for ProductionRepairEngine {
         command: &BrokerOwnedPrepareCommand,
         deadline: Instant,
     ) -> Result<(Self::Prepared, PreparedRepairDescriptor), RepairEngineFailure> {
-        let request = RescueFstabPrepareRequest::new(
-            command.request_id(),
-            command.session_id(),
-            command.plan_id(),
-            command.target().scan_fingerprint(),
-            command.target().target_id(),
-            command.target().target_fingerprint(),
-        )
-        .map_err(|_| {
-            RepairEngineFailure::PrepareFailed(RepairPrepareFailureStage::AdmissionInternal)
-        })?;
-        let mut resolver = ProductionRescueFstabPreflightResolver::new();
-        let prepared = prepare_rescue_fstab_candidate(request, &mut resolver, deadline)
-            .map_err(map_preflight_failure)?;
-        if prepared.request_id() != command.request_id() {
-            return cancel_failed_prepare(
-                prepared,
-                deadline,
-                RepairPrepareFailureStage::AdmissionInternal,
-            );
+        match command.candidate() {
+            RepairCandidateKind::Fstab => {
+                let request = RescueFstabPrepareRequest::new(
+                    command.request_id(),
+                    command.session_id(),
+                    command.plan_id(),
+                    command.target().scan_fingerprint(),
+                    command.target().target_id(),
+                    command.target().target_fingerprint(),
+                )
+                .map_err(|_| {
+                    RepairEngineFailure::PrepareFailed(RepairPrepareFailureStage::AdmissionInternal)
+                })?;
+                let mut resolver = ProductionRescueFstabPreflightResolver::new();
+                let prepared = prepare_rescue_fstab_candidate(request, &mut resolver, deadline)
+                    .map_err(map_preflight_failure)?;
+                if prepared.request_id() != command.request_id() {
+                    return cancel_failed_prepare(
+                        prepared,
+                        deadline,
+                        RepairPrepareFailureStage::AdmissionInternal,
+                    );
+                }
+                let target_fingerprint =
+                    prepared.receipt().intent().target_fingerprint().to_owned();
+                let mut session = Session::new(&target_fingerprint, SessionMode::LinuxRescue);
+                let admission = match prepared.stage_core_admission(&mut session, 0) {
+                    Ok(admission) => admission,
+                    Err(_) => {
+                        return cancel_failed_prepare(
+                            prepared,
+                            deadline,
+                            RepairPrepareFailureStage::AdmissionInternal,
+                        );
+                    }
+                };
+                let descriptor = match PreparedRepairDescriptor::new(
+                    prepared.receipt().intent().session_id(),
+                    prepared.receipt().intent().plan_id(),
+                    prepared.receipt().plan_hash(),
+                    &target_fingerprint,
+                    prepared.before_sha256(),
+                    prepared.after_sha256(),
+                    prepared.diff_sha256(),
+                    prepared.receipt().intent().resource_id(),
+                    prepared.receipt().backup_locator(),
+                    admission.next_approval_sequence(),
+                    true,
+                    prepared.receipt().target_physical_parent_fingerprint()
+                        != prepared.receipt().vault_physical_parent_fingerprint(),
+                ) {
+                    Ok(descriptor) => descriptor,
+                    Err(_) => {
+                        return cancel_failed_prepare(
+                            prepared,
+                            deadline,
+                            RepairPrepareFailureStage::AdmissionInternal,
+                        );
+                    }
+                };
+                Ok((
+                    ProductionPreparedRepair::Fstab {
+                        plan: Box::new(prepared),
+                        admission,
+                    },
+                    descriptor,
+                ))
+            }
+            #[cfg(feature = "rescue-crypttab-production-candidate")]
+            RepairCandidateKind::Crypttab => {
+                let request = RescueCrypttabPrepareRequest::new(
+                    command.request_id(),
+                    command.session_id(),
+                    command.plan_id(),
+                    command.target().scan_fingerprint(),
+                    command.target().target_id(),
+                    command.target().target_fingerprint(),
+                )
+                .map_err(|_| {
+                    RepairEngineFailure::PrepareFailed(RepairPrepareFailureStage::AdmissionInternal)
+                })?;
+                let prepared = prepare_rescue_crypttab_transaction(request, deadline)
+                    .map_err(map_crypttab_preflight_failure)?;
+                let audit = prepared.descriptor();
+                let descriptor = match PreparedRepairDescriptor::new(
+                    audit.session_id(),
+                    audit.plan_id(),
+                    audit.plan_sha256(),
+                    audit.target_fingerprint(),
+                    audit.before_sha256(),
+                    audit.after_sha256(),
+                    audit.diff_sha256(),
+                    audit.resource_id(),
+                    prepared.backup_locator(),
+                    1,
+                    true,
+                    true,
+                ) {
+                    Ok(descriptor) => descriptor,
+                    Err(_) => {
+                        prepared
+                            .cancel(deadline)
+                            .map_err(|_| RepairEngineFailure::CancelFailed)?;
+                        return Err(RepairEngineFailure::PrepareFailed(
+                            RepairPrepareFailureStage::AdmissionInternal,
+                        ));
+                    }
+                };
+                Ok((
+                    ProductionPreparedRepair::Crypttab(Box::new(prepared)),
+                    descriptor,
+                ))
+            }
         }
-
-        let target_fingerprint = prepared.receipt().intent().target_fingerprint().to_owned();
-        let mut session = Session::new(&target_fingerprint, SessionMode::LinuxRescue);
-        let admission = match prepared.stage_core_admission(&mut session, 0) {
-            Ok(admission) => admission,
-            Err(_) => {
-                return cancel_failed_prepare(
-                    prepared,
-                    deadline,
-                    RepairPrepareFailureStage::AdmissionInternal,
-                );
-            }
-        };
-        let descriptor = match PreparedRepairDescriptor::new(
-            prepared.receipt().intent().session_id(),
-            prepared.receipt().intent().plan_id(),
-            prepared.receipt().plan_hash(),
-            &target_fingerprint,
-            prepared.before_sha256(),
-            prepared.after_sha256(),
-            prepared.diff_sha256(),
-            prepared.receipt().intent().resource_id(),
-            prepared.receipt().backup_locator(),
-            admission.next_approval_sequence(),
-            true,
-            prepared.receipt().target_physical_parent_fingerprint()
-                != prepared.receipt().vault_physical_parent_fingerprint(),
-        ) {
-            Ok(descriptor) => descriptor,
-            Err(_) => {
-                return cancel_failed_prepare(
-                    prepared,
-                    deadline,
-                    RepairPrepareFailureStage::AdmissionInternal,
-                );
-            }
-        };
-        Ok((
-            ProductionPreparedRepair {
-                plan: prepared,
-                admission,
-            },
-            descriptor,
-        ))
     }
 
     fn approve(
@@ -317,45 +385,80 @@ impl RepairPreparationEngine for ProductionRepairEngine {
         approval: &BoundRepairApproval,
         deadline: Instant,
     ) -> Result<Self::Approved, RepairEngineFailure> {
-        let ProductionPreparedRepair {
-            plan,
-            mut admission,
-        } = prepared;
-        let proof = match RescueFstabCandidateApproval::new(
-            admission.binding().clone(),
-            approval.approval_id(),
-            approval.approval_sequence(),
-            approval.typed_confirmation(),
-        ) {
-            Ok(proof) => proof,
-            Err(_) => {
-                plan.cancel(deadline)
-                    .map_err(|_| RepairEngineFailure::CancelFailed)?;
-                return Err(RepairEngineFailure::ApprovalRejected(
-                    RepairExecutionFailureStage::ApprovalProof,
-                ));
+        match prepared {
+            ProductionPreparedRepair::Fstab {
+                plan,
+                mut admission,
+            } => {
+                let proof = match RescueFstabCandidateApproval::new(
+                    admission.binding().clone(),
+                    approval.approval_id(),
+                    approval.approval_sequence(),
+                    approval.typed_confirmation(),
+                ) {
+                    Ok(proof) => proof,
+                    Err(_) => {
+                        (*plan)
+                            .cancel(deadline)
+                            .map_err(|_| RepairEngineFailure::CancelFailed)?;
+                        return Err(RepairEngineFailure::ApprovalRejected(
+                            RepairExecutionFailureStage::ApprovalProof,
+                        ));
+                    }
+                };
+                if proof.session_id() != approval.session_id()
+                    || proof.binding().plan_id() != approval.plan_id()
+                    || proof.binding().plan_hash() != approval.plan_hash()
+                {
+                    (*plan)
+                        .cancel(deadline)
+                        .map_err(|_| RepairEngineFailure::CancelFailed)?;
+                    return Err(RepairEngineFailure::ApprovalRejected(
+                        RepairExecutionFailureStage::ApprovalBinding,
+                    ));
+                }
+                if admission.approve(&proof).is_err() {
+                    (*plan)
+                        .cancel(deadline)
+                        .map_err(|_| RepairEngineFailure::CancelFailed)?;
+                    return Err(RepairEngineFailure::ApprovalRejected(
+                        RepairExecutionFailureStage::ApprovalAdmission,
+                    ));
+                }
+                (*plan)
+                    .authorize(admission, deadline)
+                    .map(|approved| ProductionApprovedRepair::Fstab(Box::new(approved)))
+                    .map_err(map_approval_authorize_failure)
             }
-        };
-        if proof.session_id() != approval.session_id()
-            || proof.binding().plan_id() != approval.plan_id()
-            || proof.binding().plan_hash() != approval.plan_hash()
-        {
-            plan.cancel(deadline)
-                .map_err(|_| RepairEngineFailure::CancelFailed)?;
-            return Err(RepairEngineFailure::ApprovalRejected(
-                RepairExecutionFailureStage::ApprovalBinding,
-            ));
+            #[cfg(feature = "rescue-crypttab-production-candidate")]
+            ProductionPreparedRepair::Crypttab(prepared) => {
+                let audit = prepared.descriptor();
+                if audit.session_id() != approval.session_id()
+                    || audit.plan_id() != approval.plan_id()
+                    || audit.plan_sha256() != approval.plan_hash()
+                    || approval.approval_sequence() != 1
+                {
+                    (*prepared)
+                        .cancel(deadline)
+                        .map_err(|_| RepairEngineFailure::CancelFailed)?;
+                    return Err(RepairEngineFailure::ApprovalRejected(
+                        RepairExecutionFailureStage::ApprovalBinding,
+                    ));
+                }
+                (*prepared)
+                    .approve(
+                        approval.approval_id(),
+                        approval.typed_confirmation(),
+                        deadline,
+                    )
+                    .map(|approved| ProductionApprovedRepair::Crypttab(Box::new(approved)))
+                    .map_err(|_| {
+                        RepairEngineFailure::ApprovalRejected(
+                            RepairExecutionFailureStage::ApprovalAdmission,
+                        )
+                    })
+            }
         }
-        if admission.approve(&proof).is_err() {
-            plan.cancel(deadline)
-                .map_err(|_| RepairEngineFailure::CancelFailed)?;
-            return Err(RepairEngineFailure::ApprovalRejected(
-                RepairExecutionFailureStage::ApprovalAdmission,
-            ));
-        }
-        plan.authorize(admission, deadline)
-            .map(ProductionApprovedRepair)
-            .map_err(map_approval_authorize_failure)
     }
 
     fn execute(
@@ -363,14 +466,23 @@ impl RepairPreparationEngine for ProductionRepairEngine {
         approved: Self::Approved,
         deadline: Instant,
     ) -> Result<RepairTerminalReceipt, RepairEngineFailure> {
-        let result = if self.qualification_fault == RescueFstabQualificationFault::None {
-            execute_approved_rescue_fstab(approved.0, deadline)
-        } else {
-            execute_approved_rescue_fstab_with_qualification_fault(
-                approved.0,
-                deadline,
-                self.qualification_fault,
-            )
+        let result = match approved {
+            ProductionApprovedRepair::Fstab(approved)
+                if self.qualification_fault == RescueFstabQualificationFault::None =>
+            {
+                execute_approved_rescue_fstab(*approved, deadline)
+            }
+            ProductionApprovedRepair::Fstab(approved) => {
+                execute_approved_rescue_fstab_with_qualification_fault(
+                    *approved,
+                    deadline,
+                    self.qualification_fault,
+                )
+            }
+            #[cfg(feature = "rescue-crypttab-production-candidate")]
+            ProductionApprovedRepair::Crypttab(approved) => {
+                execute_approved_rescue_crypttab(*approved, deadline)
+            }
         };
         match result {
             Ok(receipt) => terminal_receipt(receipt),
@@ -392,10 +504,15 @@ impl RepairPreparationEngine for ProductionRepairEngine {
         prepared: Self::Prepared,
         deadline: Instant,
     ) -> Result<(), RepairEngineFailure> {
-        prepared
-            .plan
-            .cancel(deadline)
-            .map_err(|_| RepairEngineFailure::CancelFailed)
+        match prepared {
+            ProductionPreparedRepair::Fstab { plan, .. } => (*plan)
+                .cancel(deadline)
+                .map_err(|_| RepairEngineFailure::CancelFailed),
+            #[cfg(feature = "rescue-crypttab-production-candidate")]
+            ProductionPreparedRepair::Crypttab(prepared) => (*prepared)
+                .cancel(deadline)
+                .map_err(|_| RepairEngineFailure::CancelFailed),
+        }
     }
 }
 
@@ -662,6 +779,29 @@ fn map_preflight_failure(error: RescueFstabPreflightError) -> RepairEngineFailur
         | RescueFstabPreflightError::TransactionRejected(_)
         | RescueFstabPreflightError::ReceiptRejected
         | RescueFstabPreflightError::CancellationFailed => {
+            RepairPrepareFailureStage::AdmissionInternal
+        }
+    };
+    RepairEngineFailure::PrepareFailed(stage)
+}
+
+#[cfg(feature = "rescue-crypttab-production-candidate")]
+fn map_crypttab_preflight_failure(error: RescueCrypttabPreflightError) -> RepairEngineFailure {
+    let stage = match error {
+        RescueCrypttabPreflightError::TargetUnavailable => {
+            RepairPrepareFailureStage::TargetCapabilityUnavailable
+        }
+        RescueCrypttabPreflightError::VaultUnavailable => RepairPrepareFailureStage::VaultReserve,
+        RescueCrypttabPreflightError::Observation
+        | RescueCrypttabPreflightError::PreviewRejected(_)
+        | RescueCrypttabPreflightError::TargetIdentityMismatch
+        | RescueCrypttabPreflightError::UnsupportedTarget => {
+            RepairPrepareFailureStage::ObservationPreview
+        }
+        RescueCrypttabPreflightError::CancellationFailed
+        | RescueCrypttabPreflightError::InvalidBinding
+        | RescueCrypttabPreflightError::PolicyRejected
+        | RescueCrypttabPreflightError::ApprovalRejected => {
             RepairPrepareFailureStage::AdmissionInternal
         }
     };

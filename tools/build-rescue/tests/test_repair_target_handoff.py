@@ -492,6 +492,25 @@ def _valid_rollback_write_lease() -> tuple[dict[str, object], str, str]:
 
 
 class RepairTargetHandoffTests(unittest.TestCase):
+    def test_crypttab_contract_is_exact_and_cannot_cross_bind_fstab(self) -> None:
+        contract = handoff._repair_contract(
+            handoff.CRYPTTAB_REPAIR_RESOURCE, handoff.CRYPTTAB_REPAIR_ACTION
+        )
+        self.assertEqual(
+            contract["writeCapability"], handoff.CRYPTTAB_VAULT_WRITE_CAPABILITY
+        )
+        self.assertEqual(
+            contract["rollbackCapability"],
+            handoff.CRYPTTAB_VAULT_ROLLBACK_WRITE_CAPABILITY,
+        )
+        self.assertEqual(contract["safeModes"], {0o600, 0o644})
+        for resource, action in (
+            (handoff.CRYPTTAB_REPAIR_RESOURCE, handoff.REPAIR_ACTION),
+            (handoff.REPAIR_RESOURCE, handoff.CRYPTTAB_REPAIR_ACTION),
+        ):
+            with self.assertRaises(handoff.HandoffFailure):
+                handoff._repair_contract(resource, action)
+
     def test_candidate_is_packaged_but_not_activated(self) -> None:
         systemd = (
             REPO_DIR
@@ -802,6 +821,7 @@ class RepairTargetHandoffTests(unittest.TestCase):
                 "sourceTransactionBindingSha256": source[
                     "transactionBindingSha256"
                 ],
+                "responseCapability": handoff.ROLLBACK_WRITE_CAPABILITY,
             },
         )
 

@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  RESCUE_CRYPTTAB_ACTION_ID,
+  RESCUE_CRYPTTAB_CONFIRMATION,
+  RESCUE_CRYPTTAB_RESOURCE_ID,
   RESCUE_FSTAB_CONFIRMATION,
   RESCUE_FSTAB_RESOURCE_ID,
   RESCUE_FSTAB_ROLLBACK_CONFIRMATION,
@@ -12,6 +15,7 @@ import {
   parseRescueRepairResponse,
   preparedRepairDetail,
   preparedRollbackDetail,
+  rollbackSourceReceipt,
   rescueRepairIsTerminal,
   rescueRepairNeedsPolling,
   rescueRepairStateMessage,
@@ -88,6 +92,96 @@ test("prepared response is exact, correlated, and contains no repair bytes", () 
       ),
     /Correlazione/u,
   );
+});
+
+test("crypttab prepared contract is exact and dispatches only crypttab operations", async () => {
+  const operation = "repair.crypttab.prepare" as const;
+  const parsed = parseRescueRepairResponse(
+    crypttabPreparedEnvelope(REQUEST, operation),
+    REQUEST,
+    operation,
+  );
+  const detail = preparedRepairDetail(parsed);
+  assert.ok(detail);
+  assert.equal(detail.kind, "crypttab-prepared");
+  assert.equal(detail.resourceId, RESCUE_CRYPTTAB_RESOURCE_ID);
+  assert.equal(detail.actionId, RESCUE_CRYPTTAB_ACTION_ID);
+  assert.equal(detail.confirmationRequired, RESCUE_CRYPTTAB_CONFIRMATION);
+
+  const requestIds = [NEXT_REQUEST, THIRD_REQUEST, FOURTH_REQUEST];
+  const operations: unknown[] = [];
+  const client = new RescueRepairClient(
+    async (_input, init) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      operations.push(body.operation);
+      if (body.operation === "repair.crypttab.prepare")
+        return frame(
+          crypttabPreparedEnvelope(
+            String(body.requestId),
+            "repair.crypttab.prepare",
+          ),
+        );
+      return frame({
+        apiVersion: RESCUE_REPAIR_API_VERSION,
+        requestId: body.requestId,
+        operation: body.operation,
+        outcome: "ok",
+        stateVersion: 3,
+        state: "executing",
+        detail: null,
+      });
+    },
+    () => requestIds.shift()!,
+    () => `A-${"e".repeat(32)}`,
+  );
+  const prepared = await client.prepare(
+    {
+      scanFingerprint: `scan:${"a".repeat(64)}`,
+      targetFingerprint: TARGET,
+      targetId: `target:${"b".repeat(64)}`,
+    },
+    "crypttab",
+  );
+  const preparedDetail = preparedRepairDetail(prepared);
+  assert.ok(preparedDetail);
+  await client.approve(preparedDetail, RESCUE_CRYPTTAB_CONFIRMATION);
+  await client.cancel(preparedDetail);
+  assert.deepEqual(operations, [
+    "repair.crypttab.prepare",
+    "repair.crypttab.approve",
+    "repair.crypttab.cancel",
+  ]);
+
+  const crossed = crypttabPreparedEnvelope(REQUEST, operation);
+  (crossed.detail as Record<string, unknown>).actionId =
+    "linux.fstab.disable-missing-uuid.v1";
+  assert.throws(
+    () => parseRescueRepairResponse(crossed, REQUEST, operation),
+    /non valido/u,
+  );
+});
+
+test("post-commit rollback requires positive fstab candidate provenance", () => {
+  const committed: RescueRepairSnapshot = {
+    requestId: REQUEST,
+    operation: "repair.status",
+    stateVersion: 4,
+    state: "succeeded",
+    detail: {
+      kind: "terminal",
+      terminalOutcome: "committed",
+      reservationId: `B-${"9".repeat(32)}`,
+      transactionBindingSha256: `sha256:${"8".repeat(64)}`,
+      rebootRequired: false,
+      prepareFailureStage: null,
+    },
+  };
+  assert.equal(rollbackSourceReceipt(committed, "crypttab"), undefined);
+  assert.equal(rollbackSourceReceipt(committed, undefined), undefined);
+  assert.deepEqual(rollbackSourceReceipt(committed, "fstab"), {
+    reservationId: `B-${"9".repeat(32)}`,
+    transactionBindingSha256: `sha256:${"8".repeat(64)}`,
+  });
 });
 
 test("rollback v2 is exact, source-bound, and rejects cross-version aliases", async () => {
@@ -475,6 +569,23 @@ function preparedEnvelope(
       backup: { state: "reserved", vaultDistinct: true },
       nextApprovalSequence: 1,
       confirmationRequired: RESCUE_FSTAB_CONFIRMATION,
+    },
+  };
+}
+
+function crypttabPreparedEnvelope(
+  requestId: string,
+  operation: RescueRepairOperation,
+): Record<string, unknown> {
+  const envelope = preparedEnvelope(requestId, operation);
+  return {
+    ...envelope,
+    detail: {
+      ...(envelope.detail as Record<string, unknown>),
+      kind: "crypttab-prepared",
+      resourceId: RESCUE_CRYPTTAB_RESOURCE_ID,
+      actionId: RESCUE_CRYPTTAB_ACTION_ID,
+      confirmationRequired: RESCUE_CRYPTTAB_CONFIRMATION,
     },
   };
 }

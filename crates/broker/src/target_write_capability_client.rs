@@ -8,8 +8,9 @@
 
 use kernaid_protocol::{
     rescue_repair_vault::{
-        REPAIR_ROLLBACK_ACTION_ID, RepairBackupState, RepairRollbackTransactionStatusPayload,
-        RepairTransactionPhase, RepairTransactionResolutionOutcome, RepairTransactionStatusPayload,
+        RepairBackupState, RepairRollbackTransactionStatusPayload, RepairTransactionPhase,
+        RepairTransactionResolutionOutcome, RepairTransactionStatusPayload,
+        repair_resource_from_transaction,
     },
     rescue_vault::RequestId,
     rescue_vault_transport::{SeqpacketTransportError, authenticate_root_seqpacket_server},
@@ -38,7 +39,6 @@ const API_VERSION: &str = "kernaid.dev/rescue-target-capability/v1alpha2";
 const ACQUIRE_OPERATION: &str = "target.pending.readwrite.acquire";
 const ACQUIRE_ROLLBACK_OPERATION: &str = "target.rollback.pending.readwrite.acquire";
 const CAPABILITY_TYPE: &str = "linux-ext4-direct-leaf-readwrite-mount-v1";
-const ROLLBACK_CAPABILITY_TYPE: &str = "fstab-rollback-direct-leaf-rw-v1";
 const DESCRIPTOR_TYPE: &str = "selected-target-ext4-mount-readwrite-detached";
 const EXT_SUPER_MAGIC: u64 = 0xef53;
 const MAX_REQUEST_FRAME_BYTES: usize = 1_024;
@@ -362,9 +362,11 @@ pub fn acquire_pending_rollback_target_write_mount(
         .backup()
         .execution_intent()
         .ok_or(TargetWriteCapabilityClientError::InvalidPending)?;
+    let resource = repair_resource_from_transaction(source)
+        .map_err(|_| TargetWriteCapabilityClientError::InvalidPending)?;
     if pending.validate().is_err()
         || pending.phase() != RepairTransactionPhase::Pending
-        || pending.binding().action_id() != REPAIR_ROLLBACK_ACTION_ID
+        || pending.binding().action_id() != resource.rollback_action_id()
         || source.phase() != RepairTransactionPhase::Resolved
         || source.backup().state() != RepairBackupState::Durable
         || source.resolution().map(|resolution| resolution.outcome())
@@ -597,6 +599,8 @@ fn decode_rollback_response(
                 .backup()
                 .execution_intent()
                 .ok_or(PostSendError::Invalid)?;
+            let resource =
+                repair_resource_from_transaction(source).map_err(|_| PostSendError::Invalid)?;
             if response.api_version != API_VERSION
                 || response.request_id != request_id
                 || response.operation != ACQUIRE_ROLLBACK_OPERATION
@@ -607,7 +611,7 @@ fn decode_rollback_response(
                 || response.source_transaction_binding_sha256
                     != source.transaction_binding_sha256().as_str()
                 || response.target_recovery_fingerprint != intent.target_recovery_fingerprint()
-                || response.capability != ROLLBACK_CAPABILITY_TYPE
+                || response.capability != resource.rollback_write_lease_capability()
                 || response.descriptor.descriptor_type != DESCRIPTOR_TYPE
                 || response.descriptor.count != 1
                 || !valid_raw_sha256(&response.lease_binding_sha256)

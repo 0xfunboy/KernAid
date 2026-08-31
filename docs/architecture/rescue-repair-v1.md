@@ -9,6 +9,9 @@ terminal evidence is reviewed. The default/stable image remains diagnosis-only.
 This document describes the gated candidate implementation, not a claim that a
 shipping image can repair a customer filesystem.
 
+The separately gated crypttab action that reuses this transaction engine is
+documented in [Rescue crypttab repair v1](rescue-crypttab-repair-v1.md).
+
 The last documented terminal candidate was built from
 [`64db3bcf4050df01e96e1b55e08750b6957df801`](https://github.com/0xfunboy/KernAid/commit/64db3bcf4050df01e96e1b55e08750b6957df801)
 by [repair run 33306646523, attempt 1](https://github.com/0xfunboy/KernAid/actions/runs/33306646523).

@@ -134,6 +134,8 @@ pub struct RescueCrypttabPreparedDescriptor {
     session_id: String,
     plan_id: String,
     plan_sha256: String,
+    scan_fingerprint: String,
+    target_id: String,
     target_fingerprint: String,
     before_sha256: String,
     after_sha256: String,
@@ -160,6 +162,8 @@ impl RescueCrypttabPreparedDescriptor {
             session_id: request.session_id.clone(),
             plan_id: request.plan_id.clone(),
             plan_sha256: plan_sha256.into(),
+            scan_fingerprint: request.scan_fingerprint.clone(),
+            target_id: request.target_id.clone(),
             target_fingerprint: request.target_fingerprint.clone(),
             before_sha256: before_sha256.into(),
             after_sha256: after_sha256.into(),
@@ -179,6 +183,8 @@ impl RescueCrypttabPreparedDescriptor {
         ]
         .into_iter()
         .any(|hash| !valid_digest(hash, "sha256:"))
+            || !valid_digest(&value.scan_fingerprint, "scan:")
+            || !valid_digest(&value.target_id, "target:")
             || value.before_sha256 == value.after_sha256
             || value
                 .evidence
@@ -205,6 +211,12 @@ impl RescueCrypttabPreparedDescriptor {
     }
     pub fn target_fingerprint(&self) -> &str {
         &self.target_fingerprint
+    }
+    pub fn scan_fingerprint(&self) -> &str {
+        &self.scan_fingerprint
+    }
+    pub fn target_id(&self) -> &str {
+        &self.target_id
     }
     pub fn before_sha256(&self) -> &str {
         &self.before_sha256

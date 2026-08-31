@@ -32,7 +32,7 @@ rescue-fstab-production-candidate = [
     "kernaid-linux-pack/rescue-fstab-production-candidate",
 ]
 rescue-crypttab-production-candidate = [
-    "rescue-target-physical-parent",
+    "rescue-fstab-production-candidate",
     "dep:kernaid-core",
     "dep:kernaid-linux-pack",
     "dep:sha2",

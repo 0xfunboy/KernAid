@@ -1,44 +1,86 @@
 # Rescue crypttab repair v1
 
-Status: **off-default read-only preflight and Core approval implemented; no
-execution, packaging, UI or support claim**.
+Status: **implemented as an off-default private candidate; unqualified and not
+promoted**. This is an engineering contract for disposable qualification, not
+a claim that a public KernAid image can modify customer systems.
 
-The candidate action is `linux.crypttab.disable-missing-uuid.v1` (R2). It
-addresses one stale auxiliary encrypted-volume entry that can hold boot while
-its UUID is absent. The action remains a one-file transaction: if the mapper
-has any active mandatory fstab consumer, preflight fails closed rather than
-leaving the machine with a partially repaired boot configuration.
+## Closed action
 
-## Closed scope
+`linux.crypttab.disable-missing-uuid.v1` is the only crypttab mutation. It is
+an R2 Rescue action for `KA-LNX-P0-012` and comments exactly one auxiliary
+UUID-backed mapping whose UUID is absent from the fresh descriptor-bound block
+inventory. No client supplies a path, mapper name, action, command, backup, or
+replacement bytes.
 
-- directly selected, simple ext4 installed root only;
-- exactly one active `UUID=` crypttab entry proven absent by the sealed block
-  inventory;
-- key source absent, `none` or `-` only;
-- no `nofail` or `noauto` entry (already non-blocking);
-- no root, initramfs, resume, swap, keyscript, network, token/header or
-  externally keyed mapping;
-- no mandatory `/dev/mapper/<name>` or `dm-name-<name>` fstab consumer;
-- no path, action, mapper name, UUID, replacement bytes, key field or command
-  supplied by the UI/provider protocol.
+The candidate accepts only a directly selected ext4 root and a regular,
+root-owned `/etc/crypttab` with mode `0600` or `0644`, no xattrs or POSIX ACL,
+and one hard link. It rejects malformed or ambiguous input, root/cryptroot,
+swap, resume, initramfs, network and keyscript mappings, external key files,
+unsupported options, multiple eligible entries, and any mandatory active
+`fstab` consumer of the mapper name. That consumer check is mandatory and
+fails closed; the repair is never admitted merely because the crypttab UUID is
+missing.
 
-The pure pack derives exact before, after, diff, UUID-set and fstab-consumer
-hashes. The broker reads `etc/crypttab` and `etc/fstab` with descriptor-rooted
-`openat2`, no symlinks, bounded regular files, root-owned supported metadata
-and no xattrs. It uses the existing root-issued bundle containing the selected
-read-only leaf, physical-parent identity, sealed UUID inventory and detached
-read-only ext4 mount, and revalidates the bundle before and after observation.
-Policy admits only the exact one-step R2 plan. Core binds a one-use local
-approval to the complete plan hash, target fingerprint and before hash.
+## Transaction boundary
 
-## Remaining execution gate
+The action reuses the fstab repair transaction engine through a closed
+`RepairResourceV1` enum. The resource selects a compiled leaf name, action,
+Vault capability, lock domain, metadata policy, write lease, and rollback
+lease. A request cannot cross-bind fstab and crypttab contracts.
 
-No code in this feature can write. Before enabling packaging, the existing
-fstab transaction engine must be generalized without accepting a caller path
-or arbitrary action. The crypttab action then needs all of the same retained
-proofs: durable byte-exact backup on an authenticated distinct Vault physical
-parent, Pending journal state, consumed boot-local write lease, detached RW
-mount, atomic exchange of only `etc/crypttab`, exact parse/byte/metadata
-validation, automatic restore, fresh separately approved rollback and
-Before/After/Third-state reboot reconciliation. QEMU failure injection,
-power-loss and physical two-device qualification remain mandatory.
+The end-to-end sequence is:
+
+1. reacquire and revalidate the selected descriptor-only target capability;
+2. observe exact crypttab bytes and metadata, fstab bytes, and UUID inventory;
+3. derive the one-entry preview, hashes, evidence, and immutable Core plan;
+4. reserve authenticated Vault capacity on a distinct physical parent;
+5. expose only a path-free prepared descriptor and require the exact
+   `DISABILITA VOCE CRYPTTAB` single-use approval;
+6. persist and read back the byte-exact backup plus metadata and durable
+   `Pending` transaction before requesting write authority;
+7. consume the exact crypttab write lease through the fixed root helper;
+8. atomically exchange `/etc/crypttab`, preserve supported metadata, fsync,
+   reread, byte-verify, and record the terminal state;
+9. automatically restore the authenticated backup on a failed apply, or
+   reconcile an interrupted `Pending` transaction on daemon restart without
+   overwriting a third state.
+
+Crypttab backup and transaction records use their own action/resource and
+capability bindings. They share the authenticated Vault implementation and
+atomic/reconciliation code with fstab rather than creating a second mutation
+engine. Raw shell execution is not part of this path.
+
+## Product and build gate
+
+The slice compiles only with
+`rescue-crypttab-production-candidate`, which composes the existing fstab
+transaction engine. Default Desk, broker, Rescue, and stable release builds do
+not enable it. The private repair-candidate workflow enables both feature
+flags so the same isolated image can qualify both closed actions.
+
+The local repair service accepts only these additional operations:
+
+- `repair.crypttab.prepare`
+- `repair.crypttab.approve`
+- `repair.crypttab.cancel`
+
+The Desk repair panel can prepare either candidate and renders the exact
+action/resource/confirmation returned by the local service. It never receives
+target paths, configuration bytes, Vault authority, or a generic execution
+primitive.
+
+## Deliberate remaining gate
+
+Automatic restore during a failed apply and startup reconciliation are
+implemented. A separate user-initiated **post-commit crypttab rollback** is
+not exposed through Core, the local service, or Desk in this version. The
+protocol/Vault/root leaf already keep crypttab rollback authority distinct, but
+shipping that user flow requires its own Core admission, source-receipt API,
+UI confirmation, and exact-image rollback qualification. Desk therefore does
+not offer the existing fstab rollback action for a crypttab receipt.
+
+Before promotion, one exact image still must pass crypttab apply, automatic
+restore, daemon interruption/restart reconciliation, cross-contract rejection,
+BIOS/UEFI, and physical USB/power-loss qualification with the Vault on a
+different physical device. Until that evidence exists, the action remains a
+private off-default candidate.
