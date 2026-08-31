@@ -19,6 +19,10 @@ export function generateTenantId(): string {
   return `tenant_${randomBytes(16).toString("hex")}`;
 }
 
+export function generateCredentialId(): string {
+  return `cred_${randomBytes(16).toString("hex")}`;
+}
+
 export function hashSecret(
   kind: "admin" | "enrollment",
   secret: string,

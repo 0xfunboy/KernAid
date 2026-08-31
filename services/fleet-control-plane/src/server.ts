@@ -51,6 +51,7 @@ import {
 import {
   generateSecret,
   generateTenantId,
+  generateCredentialId,
   deviceIdForEd25519Spki,
   hashSecret,
   decodeBase64UrlExact,
@@ -80,7 +81,16 @@ import {
   StoreUpdatePullReplayError,
   StoreUpdateRollbackError,
   type StoredServiceResponse,
+  type TenantAccessCredential,
 } from "./store.js";
+import {
+  isTenantRole,
+  tenantRoleAllows,
+  validCredentialLabel,
+  type TenantAccessAction,
+  type TenantAccessTargetType,
+  type TenantRole,
+} from "./access.js";
 
 const MAX_REQUEST_BYTES = 64 * 1024;
 const MAX_ENROLLMENT_TOKEN_SECONDS = 7 * 24 * 60 * 60;
@@ -110,6 +120,11 @@ interface ServicePullNonce {
   nonceSha256: string;
   expiresAtMs: number;
   nowMs: number;
+}
+
+interface TenantAuthorizationTarget {
+  type: TenantAccessTargetType;
+  id: string;
 }
 
 export class FleetControlPlane {
@@ -315,10 +330,129 @@ export class FleetControlPlane {
       return;
     }
 
+    const accessCredentialsMatch =
+      /^\/v1\/tenants\/([^/]+)\/access-credentials$/.exec(path);
+    if (method === "GET" && accessCredentialsMatch !== null) {
+      const tenantId = pathIdentifier(accessCredentialsMatch[1], "tenantId");
+      this.#authorizeTenant(
+        request,
+        tenantId,
+        "admin",
+        "credential.list",
+        tenantTarget(tenantId),
+      );
+      writeJson(response, 200, {
+        schema: "dev.kernaid.fleet.access-credential-list.v1",
+        tenantId,
+        items: this.#store
+          .listTenantAccessCredentials(tenantId)
+          .map(publicTenantAccessCredential),
+      });
+      return;
+    }
+    if (method === "POST" && accessCredentialsMatch !== null) {
+      const tenantId = pathIdentifier(accessCredentialsMatch[1], "tenantId");
+      this.#authorizeTenant(
+        request,
+        tenantId,
+        "admin",
+        "credential.create",
+        tenantTarget(tenantId),
+      );
+      const body = expectRecord(await readJson(request));
+      expectExactKeys(body, ["label", "role"]);
+      if (
+        typeof body.role !== "string" ||
+        !isTenantRole(body.role) ||
+        typeof body.label !== "string" ||
+        !validCredentialLabel(body.label)
+      ) {
+        throw new HttpError(400, "invalid_request");
+      }
+      const accessToken = generateSecret();
+      const createdAt = this.#validNow().toISOString();
+      const credential = this.#store.createTenantAccessCredential({
+        tenantId,
+        credentialId: generateCredentialId(),
+        tokenHash: hashSecret("admin", accessToken),
+        role: body.role,
+        label: body.label,
+        createdAt,
+      });
+      writeJson(response, 201, {
+        schema: "dev.kernaid.fleet.access-credential-created.v1",
+        ...publicTenantAccessCredential(credential),
+        accessToken,
+      });
+      return;
+    }
+
+    const accessAuditMatch = /^\/v1\/tenants\/([^/]+)\/access-audit$/.exec(
+      path,
+    );
+    if (method === "GET" && accessAuditMatch !== null) {
+      const tenantId = pathIdentifier(accessAuditMatch[1], "tenantId");
+      this.#authorizeTenant(
+        request,
+        tenantId,
+        "admin",
+        "access_audit.list",
+        tenantTarget(tenantId),
+      );
+      writeJson(response, 200, {
+        schema: "dev.kernaid.fleet.access-audit-list.v1",
+        tenantId,
+        items: this.#store.listTenantAccessAudit(tenantId),
+      });
+      return;
+    }
+
+    const accessCredentialRevokeMatch =
+      /^\/v1\/tenants\/([^/]+)\/access-credentials\/([^/]+)\/revoke$/.exec(
+        path,
+      );
+    if (method === "POST" && accessCredentialRevokeMatch !== null) {
+      const tenantId = pathIdentifier(
+        accessCredentialRevokeMatch[1],
+        "tenantId",
+      );
+      const credentialId = pathIdentifier(
+        accessCredentialRevokeMatch[2],
+        "credentialId",
+      );
+      const actor = this.#authorizeTenant(
+        request,
+        tenantId,
+        "admin",
+        "credential.revoke",
+        { type: "credential", id: credentialId },
+      );
+      expectEmptyObject(await readJson(request));
+      const result = this.#store.revokeTenantAccessCredential({
+        tenantId,
+        credentialId,
+        actorCredentialId: actor.credentialId,
+        revokedAt: this.#validNow().toISOString(),
+      });
+      if (result === undefined) throw new HttpError(404, "not_found");
+      writeJson(response, 200, {
+        schema: "dev.kernaid.fleet.access-credential-revoked.v1",
+        ...publicTenantAccessCredential(result.credential),
+        idempotent: result.idempotent,
+      });
+      return;
+    }
+
     const tokenMatch = /^\/v1\/tenants\/([^/]+)\/enrollment-tokens$/.exec(path);
     if (method === "POST" && tokenMatch !== null) {
       const tenantId = pathIdentifier(tokenMatch[1], "tenantId");
-      this.#authorizeTenant(request, tenantId);
+      this.#authorizeTenant(
+        request,
+        tenantId,
+        "operator",
+        "enrollment_token.create",
+        tenantTarget(tenantId),
+      );
       const body = expectRecord(await readJson(request));
       expectExactKeys(body, ["expiresInSeconds"]);
       const expiresInSeconds = expectSafeInteger(
@@ -351,7 +485,13 @@ export class FleetControlPlane {
       /^\/v1\/tenants\/([^/]+)\/policy-trust-anchor$/.exec(path);
     if (method === "POST" && policyAnchorMatch !== null) {
       const tenantId = pathIdentifier(policyAnchorMatch[1], "tenantId");
-      this.#authorizeTenant(request, tenantId);
+      this.#authorizeTenant(
+        request,
+        tenantId,
+        "admin",
+        "policy_trust_anchor.set",
+        tenantTarget(tenantId),
+      );
       const body = expectRecord(await readJson(request));
       expectExactKeys(body, ["publicKeySpki"]);
       if (
@@ -380,7 +520,13 @@ export class FleetControlPlane {
     const policiesMatch = /^\/v1\/tenants\/([^/]+)\/policies$/.exec(path);
     if (method === "GET" && policiesMatch !== null) {
       const tenantId = pathIdentifier(policiesMatch[1], "tenantId");
-      this.#authorizeTenant(request, tenantId);
+      this.#authorizeTenant(
+        request,
+        tenantId,
+        "operator",
+        "policy.list",
+        tenantTarget(tenantId),
+      );
       const items = this.#store.listPolicyJson(tenantId).map((stored) => {
         const bundle = parseSignedPolicyBundle(JSON.parse(stored) as unknown);
         return {
@@ -411,7 +557,13 @@ export class FleetControlPlane {
     }
     if (method === "POST" && policiesMatch !== null) {
       const tenantId = pathIdentifier(policiesMatch[1], "tenantId");
-      this.#authorizeTenant(request, tenantId);
+      this.#authorizeTenant(
+        request,
+        tenantId,
+        "admin",
+        "policy.publish",
+        tenantTarget(tenantId),
+      );
       const bundle = parseSignedPolicyBundle(
         await readCanonicalJson(request, MAX_POLICY_BUNDLE_BYTES),
       );
@@ -462,7 +614,13 @@ export class FleetControlPlane {
     );
     if (method === "GET" && entitlementsMatch !== null) {
       const tenantId = pathIdentifier(entitlementsMatch[1], "tenantId");
-      this.#authorizeTenant(request, tenantId);
+      this.#authorizeTenant(
+        request,
+        tenantId,
+        "operator",
+        "entitlement.list",
+        tenantTarget(tenantId),
+      );
       const items = this.#store.listEntitlementJson(tenantId).map((stored) => {
         const envelope = parseEntitlementEnvelope(
           JSON.parse(stored) as unknown,
@@ -506,7 +664,13 @@ export class FleetControlPlane {
     }
     if (method === "POST" && entitlementsMatch !== null) {
       const tenantId = pathIdentifier(entitlementsMatch[1], "tenantId");
-      this.#authorizeTenant(request, tenantId);
+      this.#authorizeTenant(
+        request,
+        tenantId,
+        "admin",
+        "entitlement.publish",
+        tenantTarget(tenantId),
+      );
       const envelope = parseEntitlementEnvelope(
         await readCanonicalJson(request, MAX_ENTITLEMENT_DOCUMENT_BYTES),
       );
@@ -547,7 +711,13 @@ export class FleetControlPlane {
         entitlementRevocationsMatch[1],
         "tenantId",
       );
-      this.#authorizeTenant(request, tenantId);
+      this.#authorizeTenant(
+        request,
+        tenantId,
+        "admin",
+        "entitlement_revocations.publish",
+        tenantTarget(tenantId),
+      );
       const envelope = parseEntitlementRevocationEnvelope(
         await readCanonicalJson(request, MAX_ENTITLEMENT_DOCUMENT_BYTES),
       );
@@ -581,7 +751,13 @@ export class FleetControlPlane {
       /^\/v1\/tenants\/([^/]+)\/update-manifests$/.exec(path);
     if (method === "GET" && updateManifestsMatch !== null) {
       const tenantId = pathIdentifier(updateManifestsMatch[1], "tenantId");
-      this.#authorizeTenant(request, tenantId);
+      this.#authorizeTenant(
+        request,
+        tenantId,
+        "operator",
+        "update.list",
+        tenantTarget(tenantId),
+      );
       const items = this.#store
         .listAllUpdateManifestJson(tenantId)
         .map((stored) => {
@@ -610,7 +786,13 @@ export class FleetControlPlane {
     }
     if (method === "POST" && updateManifestsMatch !== null) {
       const tenantId = pathIdentifier(updateManifestsMatch[1], "tenantId");
-      this.#authorizeTenant(request, tenantId);
+      this.#authorizeTenant(
+        request,
+        tenantId,
+        "admin",
+        "update.publish",
+        tenantTarget(tenantId),
+      );
       const manifest = parseSignedUpdateManifest(
         await readCanonicalJson(request, MAX_UPDATE_MANIFEST_BYTES),
       );
@@ -1026,7 +1208,13 @@ export class FleetControlPlane {
     const devicesMatch = /^\/v1\/tenants\/([^/]+)\/devices$/.exec(path);
     if (method === "GET" && devicesMatch !== null) {
       const tenantId = pathIdentifier(devicesMatch[1], "tenantId");
-      this.#authorizeTenant(request, tenantId);
+      this.#authorizeTenant(
+        request,
+        tenantId,
+        "operator",
+        "device.list",
+        tenantTarget(tenantId),
+      );
       const devices = this.#store.listDevices(tenantId).map((device) => ({
         tenantId: device.tenantId,
         deviceId: device.deviceId,
@@ -1049,7 +1237,13 @@ export class FleetControlPlane {
     const assetsMatch = /^\/v1\/tenants\/([^/]+)\/assets$/.exec(path);
     if (method === "GET" && assetsMatch !== null) {
       const tenantId = pathIdentifier(assetsMatch[1], "tenantId");
-      this.#authorizeTenant(request, tenantId);
+      this.#authorizeTenant(
+        request,
+        tenantId,
+        "operator",
+        "asset.list",
+        tenantTarget(tenantId),
+      );
       writeJson(response, 200, {
         schema: "dev.kernaid.fleet.asset-list.v1",
         tenantId,
@@ -1063,7 +1257,13 @@ export class FleetControlPlane {
     );
     if (method === "GET" && auditEventsMatch !== null) {
       const tenantId = pathIdentifier(auditEventsMatch[1], "tenantId");
-      this.#authorizeTenant(request, tenantId);
+      this.#authorizeTenant(
+        request,
+        tenantId,
+        "operator",
+        "device_audit.list",
+        tenantTarget(tenantId),
+      );
       writeJson(response, 200, {
         schema: "dev.kernaid.fleet.audit-event-list.v1",
         tenantId,
@@ -1077,7 +1277,10 @@ export class FleetControlPlane {
     if (method === "POST" && revokeMatch !== null) {
       const tenantId = pathIdentifier(revokeMatch[1], "tenantId");
       const deviceId = pathIdentifier(revokeMatch[2], "deviceId");
-      this.#authorizeTenant(request, tenantId);
+      this.#authorizeTenant(request, tenantId, "operator", "device.revoke", {
+        type: "device",
+        id: deviceId,
+      });
       expectEmptyObject(await readJson(request));
       const revokedAt = this.#validNow().toISOString();
       if (!this.#store.revokeDevice(tenantId, deviceId, revokedAt)) {
@@ -1102,14 +1305,44 @@ export class FleetControlPlane {
     }
   }
 
-  #authorizeTenant(request: IncomingMessage, tenantId: string): void {
+  #authorizeTenant(
+    request: IncomingMessage,
+    tenantId: string,
+    requiredRole: TenantRole,
+    action: TenantAccessAction,
+    target: TenantAuthorizationTarget,
+  ): TenantAccessCredential {
     const token = bearerToken(request);
-    if (
-      token === undefined ||
-      !this.#store.authenticateTenant(tenantId, hashSecret("admin", token))
-    ) {
+    if (token === undefined) {
       throw new HttpError(401, "not_authorized");
     }
+    const credential = this.#store.findTenantAccessCredential(
+      hashSecret("admin", token),
+    );
+    if (credential === undefined) {
+      throw new HttpError(401, "not_authorized");
+    }
+    const tenantMatches = credential.tenantId === tenantId;
+    const active = credential.revokedAt === null;
+    const roleAllowed = tenantRoleAllows(credential.role, requiredRole);
+    this.#store.recordTenantAccessAudit({
+      tenantId: credential.tenantId,
+      occurredAt: this.#validNow().toISOString(),
+      credentialId: credential.credentialId,
+      role: credential.role,
+      action,
+      outcome: tenantMatches && active && roleAllowed ? "allowed" : "denied",
+      targetTenantId: tenantId,
+      targetType: target.type,
+      targetId: target.id,
+    });
+    if (!tenantMatches || !active) {
+      throw new HttpError(401, "not_authorized");
+    }
+    if (!roleAllowed) {
+      throw new HttpError(403, "insufficient_role");
+    }
+    return credential;
   }
 
   #replayServiceResponse(
@@ -1416,6 +1649,24 @@ function pathIdentifier(value: string | undefined, field: string): string {
     throw new HttpError(400, "invalid_request");
   }
   return expectIdentifier(decoded, field);
+}
+
+function tenantTarget(tenantId: string): TenantAuthorizationTarget {
+  return { type: "tenant", id: tenantId };
+}
+
+function publicTenantAccessCredential(
+  credential: TenantAccessCredential,
+): Record<string, unknown> {
+  return {
+    tenantId: credential.tenantId,
+    credentialId: credential.credentialId,
+    role: credential.role,
+    label: credential.label,
+    createdAt: credential.createdAt,
+    revokedAt: credential.revokedAt,
+    status: credential.revokedAt === null ? "active" : "revoked",
+  };
 }
 
 function serviceResponseContext(

@@ -96,6 +96,12 @@ interface TenantCredentials {
   adminToken: string;
 }
 
+interface AccessCredential {
+  credentialId: string;
+  role: "admin" | "operator";
+  accessToken: string;
+}
+
 interface DeviceCredentials {
   privateKey: KeyObject;
   publicKeySpki: string;
@@ -244,6 +250,30 @@ async function createTenant(harness: Harness): Promise<TenantCredentials> {
   return {
     tenantId: result.body.tenantId as string,
     adminToken: result.body.adminToken as string,
+  };
+}
+
+async function createAccessCredential(
+  harness: Harness,
+  tenant: TenantCredentials,
+  role: AccessCredential["role"],
+  label: string,
+): Promise<AccessCredential> {
+  const result = await api(
+    harness,
+    "POST",
+    `/v1/tenants/${tenant.tenantId}/access-credentials`,
+    { label, role },
+    tenant.adminToken,
+  );
+  assert.equal(result.status, 201);
+  assert.equal(typeof result.body.credentialId, "string");
+  assert.equal(typeof result.body.accessToken, "string");
+  assert.equal(result.body.role, role);
+  return {
+    credentialId: result.body.credentialId as string,
+    role,
+    accessToken: result.body.accessToken as string,
   };
 }
 
@@ -753,6 +783,364 @@ test("root and tenant administration are strictly isolated", async () => {
       ).status,
       401,
     );
+  } finally {
+    await destroyHarness(harness);
+  }
+});
+
+test("tenant admin and operator roles enforce least privilege with access audit", async () => {
+  const harness = await createHarness();
+  try {
+    const tenant = await createTenant(harness);
+    const other = await createTenant(harness);
+    const initial = await api(
+      harness,
+      "GET",
+      `/v1/tenants/${tenant.tenantId}/access-credentials`,
+      undefined,
+      tenant.adminToken,
+    );
+    assert.equal(initial.status, 200);
+    assert.deepEqual(
+      (initial.body.items as Array<Record<string, unknown>>).map((item) => [
+        item.credentialId,
+        item.role,
+        item.status,
+      ]),
+      [["bootstrap-admin", "admin", "active"]],
+    );
+    assert.equal(
+      JSON.stringify(initial.body).includes(tenant.adminToken),
+      false,
+    );
+    assert.equal(
+      (
+        await api(
+          harness,
+          "POST",
+          `/v1/tenants/${tenant.tenantId}/access-credentials`,
+          { label: "Unbounded role", role: "owner" },
+          tenant.adminToken,
+        )
+      ).status,
+      400,
+    );
+    assert.equal(
+      (
+        await api(
+          harness,
+          "POST",
+          `/v1/tenants/${tenant.tenantId}/access-credentials`,
+          { label: "Unknown field", permissions: ["*"], role: "operator" },
+          tenant.adminToken,
+        )
+      ).status,
+      400,
+    );
+
+    const operator = await createAccessCredential(
+      harness,
+      tenant,
+      "operator",
+      "Field operations",
+    );
+    const database = new DatabaseSync(harness.databasePath, { readOnly: true });
+    const storedCredential = database
+      .prepare(
+        `SELECT token_hash FROM tenant_access_credentials
+         WHERE tenant_id = ? AND credential_id = ?`,
+      )
+      .get(tenant.tenantId, operator.credentialId) as { token_hash: string };
+    assert.match(storedCredential.token_hash, /^[0-9a-f]{64}$/);
+    assert.notEqual(storedCredential.token_hash, operator.accessToken);
+    database.close();
+    assert.equal(
+      (
+        await api(
+          harness,
+          "GET",
+          `/v1/tenants/${tenant.tenantId}/devices`,
+          undefined,
+          operator.accessToken,
+        )
+      ).status,
+      200,
+    );
+    assert.equal(
+      (
+        await api(
+          harness,
+          "POST",
+          `/v1/tenants/${tenant.tenantId}/enrollment-tokens`,
+          { expiresInSeconds: 60 },
+          operator.accessToken,
+        )
+      ).status,
+      201,
+    );
+    assert.equal(
+      (
+        await api(
+          harness,
+          "GET",
+          `/v1/tenants/${tenant.tenantId}/policies`,
+          undefined,
+          operator.accessToken,
+        )
+      ).status,
+      200,
+    );
+    assert.equal(
+      (
+        await api(
+          harness,
+          "POST",
+          `/v1/tenants/${tenant.tenantId}/policy-trust-anchor`,
+          { publicKeySpki: "not-reached" },
+          operator.accessToken,
+        )
+      ).status,
+      403,
+    );
+    assert.equal(
+      (
+        await api(
+          harness,
+          "GET",
+          `/v1/tenants/${tenant.tenantId}/access-credentials`,
+          undefined,
+          operator.accessToken,
+        )
+      ).status,
+      403,
+    );
+    assert.equal(
+      (
+        await api(
+          harness,
+          "GET",
+          `/v1/tenants/${other.tenantId}/devices`,
+          undefined,
+          operator.accessToken,
+        )
+      ).status,
+      401,
+    );
+
+    const audit = await api(
+      harness,
+      "GET",
+      `/v1/tenants/${tenant.tenantId}/access-audit`,
+      undefined,
+      tenant.adminToken,
+    );
+    assert.equal(audit.status, 200);
+    const events = audit.body.items as Array<Record<string, unknown>>;
+    assert.equal(
+      events.some(
+        (event) =>
+          event.credentialId === operator.credentialId &&
+          event.action === "device.list" &&
+          event.outcome === "allowed" &&
+          event.targetTenantId === tenant.tenantId,
+      ),
+      true,
+    );
+    assert.equal(
+      events.some(
+        (event) =>
+          event.credentialId === operator.credentialId &&
+          event.action === "policy_trust_anchor.set" &&
+          event.outcome === "denied",
+      ),
+      true,
+    );
+    assert.equal(
+      events.some(
+        (event) =>
+          event.credentialId === operator.credentialId &&
+          event.action === "device.list" &&
+          event.outcome === "denied" &&
+          event.targetTenantId === other.tenantId,
+      ),
+      true,
+    );
+    assert.equal(JSON.stringify(events).includes(operator.accessToken), false);
+
+    const revoked = await api(
+      harness,
+      "POST",
+      `/v1/tenants/${tenant.tenantId}/access-credentials/${operator.credentialId}/revoke`,
+      {},
+      tenant.adminToken,
+    );
+    assert.equal(revoked.status, 200);
+    assert.equal(revoked.body.idempotent, false);
+    const replay = await api(
+      harness,
+      "POST",
+      `/v1/tenants/${tenant.tenantId}/access-credentials/${operator.credentialId}/revoke`,
+      {},
+      tenant.adminToken,
+    );
+    assert.equal(replay.status, 200);
+    assert.equal(replay.body.idempotent, true);
+    assert.equal(
+      (
+        await api(
+          harness,
+          "GET",
+          `/v1/tenants/${tenant.tenantId}/devices`,
+          undefined,
+          operator.accessToken,
+        )
+      ).status,
+      401,
+    );
+    const afterRevocationAudit = await api(
+      harness,
+      "GET",
+      `/v1/tenants/${tenant.tenantId}/access-audit`,
+      undefined,
+      tenant.adminToken,
+    );
+    assert.equal(afterRevocationAudit.status, 200);
+    assert.equal(
+      (afterRevocationAudit.body.items as Array<Record<string, unknown>>).some(
+        (event) =>
+          event.credentialId === operator.credentialId &&
+          event.action === "device.list" &&
+          event.outcome === "denied" &&
+          event.targetTenantId === tenant.tenantId,
+      ),
+      true,
+    );
+    assert.equal(
+      (
+        await api(
+          harness,
+          "POST",
+          `/v1/tenants/${tenant.tenantId}/access-credentials/bootstrap-admin/revoke`,
+          {},
+          tenant.adminToken,
+        )
+      ).status,
+      409,
+    );
+  } finally {
+    await destroyHarness(harness);
+  }
+});
+
+test("tenant credentials and authorization audit survive restart", async () => {
+  let harness = await createHarness();
+  const directory = harness.directory;
+  const now = harness.now;
+  try {
+    const tenant = await createTenant(harness);
+    const administrator = await createAccessCredential(
+      harness,
+      tenant,
+      "admin",
+      "Security administrator",
+    );
+    await destroyHarness(harness, false);
+    harness = await createHarness({ directory, now });
+
+    const listed = await api(
+      harness,
+      "GET",
+      `/v1/tenants/${tenant.tenantId}/access-credentials`,
+      undefined,
+      administrator.accessToken,
+    );
+    assert.equal(listed.status, 200);
+    assert.equal(
+      (listed.body.items as Array<Record<string, unknown>>).some(
+        (item) => item.credentialId === administrator.credentialId,
+      ),
+      true,
+    );
+    assert.equal(
+      (
+        await api(
+          harness,
+          "POST",
+          `/v1/tenants/${tenant.tenantId}/access-credentials/bootstrap-admin/revoke`,
+          {},
+          administrator.accessToken,
+        )
+      ).status,
+      200,
+    );
+    assert.equal(
+      (
+        await api(
+          harness,
+          "GET",
+          `/v1/tenants/${tenant.tenantId}/devices`,
+          undefined,
+          tenant.adminToken,
+        )
+      ).status,
+      401,
+    );
+    const audit = await api(
+      harness,
+      "GET",
+      `/v1/tenants/${tenant.tenantId}/access-audit`,
+      undefined,
+      administrator.accessToken,
+    );
+    assert.equal(audit.status, 200);
+    assert.equal(
+      (audit.body.items as Array<Record<string, unknown>>).some(
+        (event) =>
+          event.credentialId === administrator.credentialId &&
+          event.action === "credential.revoke" &&
+          event.outcome === "allowed",
+      ),
+      true,
+    );
+  } finally {
+    await destroyHarness(harness);
+  }
+});
+
+test("SQLite v6 migrates its tenant administrator into RBAC v7", async () => {
+  let harness = await createHarness();
+  const directory = harness.directory;
+  const now = harness.now;
+  try {
+    const tenant = await createTenant(harness);
+    await destroyHarness(harness, false);
+    const legacy = new DatabaseSync(harness.databasePath);
+    legacy.exec(`
+      DROP TABLE tenant_access_audit;
+      DROP TABLE tenant_access_credentials;
+      PRAGMA user_version = 6;
+    `);
+    legacy.close();
+
+    harness = await createHarness({ directory, now });
+    const listed = await api(
+      harness,
+      "GET",
+      `/v1/tenants/${tenant.tenantId}/access-credentials`,
+      undefined,
+      tenant.adminToken,
+    );
+    assert.equal(listed.status, 200);
+    assert.equal(
+      (listed.body.items as Array<Record<string, unknown>>)[0]?.credentialId,
+      "bootstrap-admin",
+    );
+    const database = new DatabaseSync(harness.databasePath, { readOnly: true });
+    const version = database.prepare("PRAGMA user_version").get() as {
+      user_version: number;
+    };
+    assert.equal(version.user_version, 7);
+    database.close();
   } finally {
     await destroyHarness(harness);
   }
@@ -1277,7 +1665,8 @@ test("unknown and raw diagnostic fields are rejected and secrets are hash-only",
     const rows = database
       .prepare(
         `SELECT admin_token_hash AS value FROM tenants
-         UNION ALL SELECT token_hash AS value FROM enrollment_tokens`,
+         UNION ALL SELECT token_hash AS value FROM enrollment_tokens
+         UNION ALL SELECT token_hash AS value FROM tenant_access_credentials`,
       )
       .all() as unknown as Array<{ value: string }>;
     assert.equal(
@@ -1861,6 +2250,8 @@ test("policy anchor, bundle, and assignment survive SQLite restart", async () =>
 
     const legacy = new DatabaseSync(harness.databasePath);
     legacy.exec(`
+      DROP TABLE tenant_access_audit;
+      DROP TABLE tenant_access_credentials;
       DROP TABLE service_receipts;
       DROP TABLE service_receipt_checkpoints;
       DROP TABLE service_receipt_config;
@@ -1908,7 +2299,7 @@ test("policy anchor, bundle, and assignment survive SQLite restart", async () =>
     const version = database.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    assert.equal(version.user_version, 6);
+    assert.equal(version.user_version, 7);
     const nonce = database
       .prepare(
         `SELECT nonce_sha256 FROM policy_pull_nonces
@@ -2211,7 +2602,7 @@ test("signed entitlement pulls isolate assignments and reject replay, key mismat
   }
 });
 
-test("SQLite v3 migrates through v6 and entitlement checkpoints survive restart", async () => {
+test("SQLite v3 migrates through v7 and entitlement checkpoints survive restart", async () => {
   let harness = await createHarness();
   const directory = harness.directory;
   const now = harness.now;
@@ -2226,6 +2617,8 @@ test("SQLite v3 migrates through v6 and entitlement checkpoints survive restart"
 
     const legacy = new DatabaseSync(harness.databasePath);
     legacy.exec(`
+      DROP TABLE tenant_access_audit;
+      DROP TABLE tenant_access_credentials;
       DROP TABLE service_receipts;
       DROP TABLE service_receipt_checkpoints;
       DROP TABLE service_receipt_config;
@@ -2274,7 +2667,7 @@ test("SQLite v3 migrates through v6 and entitlement checkpoints survive restart"
     const version = database.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    assert.equal(version.user_version, 6);
+    assert.equal(version.user_version, 7);
     const document = database
       .prepare(
         `SELECT highest_sequence, envelope_sha256, canonical_json
@@ -2500,7 +2893,7 @@ test("signed update pulls bind target and ring, filter eligibility, and reject r
   }
 });
 
-test("SQLite v4 migrates through v6 and update checkpoints survive restart", async () => {
+test("SQLite v4 migrates through v7 and update checkpoints survive restart", async () => {
   let harness = await createHarness();
   const directory = harness.directory;
   const now = harness.now;
@@ -2511,6 +2904,8 @@ test("SQLite v4 migrates through v6 and update checkpoints survive restart", asy
 
     const legacy = new DatabaseSync(harness.databasePath);
     legacy.exec(`
+      DROP TABLE tenant_access_audit;
+      DROP TABLE tenant_access_credentials;
       DROP TABLE service_receipts;
       DROP TABLE service_receipt_checkpoints;
       DROP TABLE service_receipt_config;
@@ -2538,7 +2933,7 @@ test("SQLite v4 migrates through v6 and update checkpoints survive restart", asy
     const version = database.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    assert.equal(version.user_version, 6);
+    assert.equal(version.user_version, 7);
     const checkpoint = database
       .prepare(
         `SELECT highest_sequence, manifest_sha256

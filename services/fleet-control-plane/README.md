@@ -14,8 +14,15 @@ upload or arbitrary metadata API.
   never stored in SQLite.
 - Tenant creation returns its admin token once. Only the domain-separated
   SHA-256 token hash is persisted.
-- A tenant admin creates short-lived, single-use enrollment tokens. Only their
-  hashes are persisted.
+- Tenant access credentials are hash-only, tenant-bound and carry exactly one
+  role: `admin` or `operator`. Admins manage credentials and signed governance
+  inputs; operators manage enrollment, visibility and device revocation.
+- Every request made with an identified tenant credential records a bounded,
+  durable authorization decision containing only credential ID, role, action,
+  target and outcome. Cross-tenant attempts and revoked/underprivileged
+  credentials fail closed without storing tokens, IP addresses or headers.
+- A tenant operator creates short-lived, single-use enrollment tokens. Only
+  their hashes are persisted.
 - Enrollment verifies expiry, tenant binding, clock window, canonical Ed25519
   SPKI, key-derived device ID and the domain-separated signature before one
   transaction inserts the device and consumes the token.
@@ -72,35 +79,49 @@ and are limited to 64 KiB, except canonical policy publication at 1 MiB.
 Entitlement and revocation publication must be exact compact canonical JSON
 and is bounded to 64 KiB, matching the Rust verifier.
 
-| Method | Route                                            | Authorization          | Result                                       |
-| ------ | ------------------------------------------------ | ---------------------- | -------------------------------------------- |
-| `GET`  | `/healthz`                                       | Public                 | SQLite liveness                              |
-| `POST` | `/v1/tenants`                                    | Root bearer            | One-time `tenantId`, `adminToken`            |
-| `POST` | `/v1/tenants/:tenantId/enrollment-tokens`        | Tenant bearer          | One-time `enrollmentToken`, `expiresAt`      |
-| `POST` | `/v1/enrollments`                                | Signed public request  | Enroll a device                              |
-| `POST` | `/v1/inventories`                                | Signed device envelope | Insert or idempotently acknowledge inventory |
-| `POST` | `/v1/audit-events`                               | Signed device envelope | Append or idempotently acknowledge audit     |
-| `POST` | `/v1/policy-pulls`                               | Signed device request  | Return only applicable signed bundles        |
-| `POST` | `/v1/entitlement-pulls`                          | Signed device request  | Return assigned signed entitlements          |
-| `POST` | `/v1/update-pulls`                               | Signed device request  | Return applicable vendor-signed manifests    |
-| `POST` | `/v1/tenants/:tenantId/policy-trust-anchor`      | Tenant bearer          | Set tenant Ed25519 public anchor once        |
-| `POST` | `/v1/tenants/:tenantId/policies`                 | Tenant bearer          | Verify and publish a pre-signed bundle       |
-| `POST` | `/v1/tenants/:tenantId/entitlements`             | Tenant bearer          | Verify/publish offline-signed entitlement    |
-| `POST` | `/v1/tenants/:tenantId/entitlement-revocations`  | Tenant bearer          | Publish signed revocation checkpoint         |
-| `POST` | `/v1/tenants/:tenantId/update-manifests`         | Tenant bearer          | Verify/publish vendor-signed manifest        |
-| `GET`  | `/v1/tenants/:tenantId/policies`                 | Tenant bearer          | Minimized policy status                      |
-| `GET`  | `/v1/tenants/:tenantId/entitlements`             | Tenant bearer          | Minimized entitlement/revocation status      |
-| `GET`  | `/v1/tenants/:tenantId/update-manifests`         | Tenant bearer          | Minimized update-channel status              |
-| `GET`  | `/v1/tenants/:tenantId/devices`                  | Tenant bearer          | `{ items: [...] }` device registry           |
-| `GET`  | `/v1/tenants/:tenantId/assets`                   | Tenant bearer          | `{ items: [...] }` latest aggregate assets   |
-| `GET`  | `/v1/tenants/:tenantId/audit-events`             | Tenant bearer          | Bounded `{ items: [...] }` digest-only audit |
-| `POST` | `/v1/tenants/:tenantId/devices/:deviceId/revoke` | Tenant bearer          | Permanently revoke ingestion                 |
+| Method | Route                                                           | Authorization          | Result                                       |
+| ------ | --------------------------------------------------------------- | ---------------------- | -------------------------------------------- |
+| `GET`  | `/healthz`                                                      | Public                 | SQLite liveness                              |
+| `POST` | `/v1/tenants`                                                   | Root bearer            | One-time `tenantId`, `adminToken`            |
+| `GET`  | `/v1/tenants/:tenantId/access-credentials`                      | Admin                  | List credential metadata, never tokens       |
+| `POST` | `/v1/tenants/:tenantId/access-credentials`                      | Admin                  | Create one-time-visible role token           |
+| `POST` | `/v1/tenants/:tenantId/access-credentials/:credentialId/revoke` | Admin                  | Revoke one credential                        |
+| `GET`  | `/v1/tenants/:tenantId/access-audit`                            | Admin                  | Last 256 authorization decisions             |
+| `POST` | `/v1/tenants/:tenantId/enrollment-tokens`                       | Operator or admin      | One-time `enrollmentToken`, `expiresAt`      |
+| `POST` | `/v1/enrollments`                                               | Signed public request  | Enroll a device                              |
+| `POST` | `/v1/inventories`                                               | Signed device envelope | Insert or idempotently acknowledge inventory |
+| `POST` | `/v1/audit-events`                                              | Signed device envelope | Append or idempotently acknowledge audit     |
+| `POST` | `/v1/policy-pulls`                                              | Signed device request  | Return only applicable signed bundles        |
+| `POST` | `/v1/entitlement-pulls`                                         | Signed device request  | Return assigned signed entitlements          |
+| `POST` | `/v1/update-pulls`                                              | Signed device request  | Return applicable vendor-signed manifests    |
+| `POST` | `/v1/tenants/:tenantId/policy-trust-anchor`                     | Admin                  | Set tenant Ed25519 public anchor once        |
+| `POST` | `/v1/tenants/:tenantId/policies`                                | Admin                  | Verify and publish a pre-signed bundle       |
+| `POST` | `/v1/tenants/:tenantId/entitlements`                            | Admin                  | Verify/publish offline-signed entitlement    |
+| `POST` | `/v1/tenants/:tenantId/entitlement-revocations`                 | Admin                  | Publish signed revocation checkpoint         |
+| `POST` | `/v1/tenants/:tenantId/update-manifests`                        | Admin                  | Verify/publish vendor-signed manifest        |
+| `GET`  | `/v1/tenants/:tenantId/policies`                                | Operator or admin      | Minimized policy status                      |
+| `GET`  | `/v1/tenants/:tenantId/entitlements`                            | Operator or admin      | Minimized entitlement/revocation status      |
+| `GET`  | `/v1/tenants/:tenantId/update-manifests`                        | Operator or admin      | Minimized update-channel status              |
+| `GET`  | `/v1/tenants/:tenantId/devices`                                 | Operator or admin      | `{ items: [...] }` device registry           |
+| `GET`  | `/v1/tenants/:tenantId/assets`                                  | Operator or admin      | `{ items: [...] }` latest aggregate assets   |
+| `GET`  | `/v1/tenants/:tenantId/audit-events`                            | Operator or admin      | Bounded `{ items: [...] }` digest-only audit |
+| `POST` | `/v1/tenants/:tenantId/devices/:deviceId/revoke`                | Operator or admin      | Permanently revoke ingestion                 |
 
 Tenant creation takes an exact empty object. Enrollment-token creation takes:
 
 ```json
 { "expiresInSeconds": 300 }
 ```
+
+An admin creates a delegated credential with an exact body such as:
+
+```json
+{ "label": "Field operations", "role": "operator" }
+```
+
+The `accessToken` appears only in the creation response. Lists and audit events
+contain its opaque credential ID, never the token or token hash. A credential
+cannot revoke itself, and the final active admin cannot be removed.
 
 The enrollment, inventory and audit bodies are the exact signed structures
 described in
@@ -203,22 +224,24 @@ manual protocol is:
 
 1. Read the root token locally and call `POST /v1/tenants` with `{}`. Retain the
    returned admin token in the tenant secret store; it cannot be recovered.
-2. Open the console at `/console/`, enter the tenant ID and admin token, then
-   create a short-lived enrollment token.
-3. Give that token and tenant ID to exactly one KernAid client. The client owns
+2. Retain the bootstrap admin for governance. Create separate `operator`
+   credentials for routine enrollment, inventory, audit and revocation work.
+3. Open the console at `/console/`, enter the tenant ID and the appropriate
+   tenant token, then create a short-lived enrollment token.
+4. Give that token and tenant ID to exactly one KernAid client. The client owns
    its Ed25519 key and submits the signed enrollment request.
-4. Use the console or list APIs to monitor signed asset summaries and revoke a
+5. Use the console or list APIs to monitor signed asset summaries and revoke a
    lost or retired identity.
-5. Generate the tenant policy key offline. Set its public SPKI once, sign each
+6. Generate the tenant policy key offline. Set its public SPKI once, sign each
    canonical policy outside this service, then publish the signed bundle. Keep
    the private key in the organization signing system.
-6. Provision the vendor entitlement issuer's raw public key through
+7. Provision the vendor entitlement issuer's raw public key through
    `KERNAID_FLEET_ENTITLEMENT_TRUST_ANCHOR_FILE`. A tenant admin may publish
    documents produced by that offline issuer, but cannot sign one here.
-7. Provision the vendor update issuer's raw public key through
+8. Provision the vendor update issuer's raw public key through
    `KERNAID_FLEET_UPDATE_TRUST_ANCHOR_FILE`. Publish only canonical manifests
    signed offline; devices independently verify and admit them before staging.
-8. Provision a dedicated Ed25519 receipt key pair. Keep its PKCS#8 private key
+9. Provision a dedicated Ed25519 receipt key pair. Keep its PKCS#8 private key
    readable only by Fleet and install the matching raw public anchor in each
    Resident. Back up the private key with the database: changing either side
    without an explicit migration makes synchronization fail closed.
@@ -239,4 +262,6 @@ secrets, policy assignment isolation, policy rollback/conflict, restart
 persistence, entitlement assignment/replay/tamper/rollback/revocation, update
 target/ring filtering, update anti-rollback/replay, exact signed service
 receipts, receipt key/anchor mismatch, durable receipt sequence, SQLite
-v3-to-v6 migration, health and optional same-origin console serving.
+v3-to-v7 migration, tenant role enforcement, credential revocation,
+cross-tenant denial, authorization audit/restart and optional same-origin
+console serving.
