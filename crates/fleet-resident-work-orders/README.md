@@ -41,9 +41,39 @@ approval delivered by Fleet and a separate fresh `BoundLocalApproval` bound to
 the work order, lease, action/version, execution, plan and target digests.
 
 `linux.fstab.disable-missing-uuid.v1` is compiled off by default. A Rescue
-integration must explicitly enable `rescue-fstab-handoff` and connect the typed
-handoff to the existing gated Core/Broker execution path. Enabling the feature
-does not bypass policy, entitlement, local approval or lease validation.
+integration must explicitly enable `rescue-fstab-handoff`. That feature exposes
+`RescueFleetRepairAdapter`, whose only broker output is the existing fixed
+`repair.status`, `repair.fstab.prepare`, `repair.fstab.approve` and
+`repair.fstab.cancel` protocol. The supplied `RescueRepairBroker` implementation
+must terminate at the authenticated local `kernaid-rescue-repaird` seqpacket
+service; it must not proxy a caller-selected endpoint. Core, Broker and Vault
+therefore remain the only write-authority path.
+
+The adapter persists an owner-only intent before any broker exchange. Desk can
+read the minimized `dev.kernaid.fleet.rescue-repair-intent.v1` view and submit
+only three canonical, unknown-field-rejecting operations:
+
+- `stage`: echoes the work-order binding and supplies the already validated,
+  path-free local Rescue target claims;
+- `approve`: echoes device, work order, lease, action/version, execution, plan,
+  target and evidence digests, plus a fresh local approval (maximum age 120
+  seconds) and the exact typed confirmation;
+- `reject`: echoes the same intent and evidence digest, cancels the local Vault
+  reservation, and makes the Fleet result terminally `rejected`.
+
+The candidate Desk surface is `/api/rescue/fleet-repair`: `GET` returns the
+canonical intent (or 204 when absent), and `POST` passes one of the canonical
+operations above to the adapter. The relay must retain its existing same-origin
+and peer-authentication controls. The shipping Desk remains unchanged because
+the candidate entry is still selected only by `KERNAID_REPAIR_CANDIDATE=1`.
+
+The adapter writes `execution pending` before repaird approval. On restart it
+queries repaird state before retrying, so an uncertain write is recovered and
+never blindly repeated. Its terminal receipt contains opaque IDs and digests
+only; exact replay returns the retained digest without another broker call.
+Enabling the feature never bypasses Fleet policy/entitlement, organizational
+approval, the fresh local Desk approval, Core admission, Broker validation or
+Vault backup reservation.
 
 The device identity is supplied in memory for signing and is never serialized
 to the journal. Results contain only an outcome and digest; raw output, logs,

@@ -10,6 +10,16 @@
     linear-gradient(145deg, #101814, #0d1210 66%);
   box-shadow: 0 18px 55px rgb(0 0 0 / 22%);
 }
+
+.fleet-rescue-intent {
+  border-color: color-mix(in srgb, #5de0c1 58%, transparent);
+  box-shadow: inset 3px 0 0 #5de0c1;
+}
+
+.fleet-rescue-intent .rescue-repair-heading > span {
+  background: color-mix(in srgb, #5de0c1 16%, transparent);
+  color: #8af0d8;
+}
 .rescue-repair-manual-reconciliation-required,
 .rescue-repair-failed {
   border-color: #8b4542;
