@@ -71,3 +71,29 @@ It persists only execution bindings and result digests for restart recovery.
 The Rescue fstab write action is not connected to this process: remote tenant
 approval can never substitute for a fresh local Vault approval or the
 Core/Broker policy and entitlement boundary.
+
+## Windows x86-64 service (off by default)
+
+Build the separate Windows executable explicitly:
+
+```sh
+cargo build --release --target x86_64-pc-windows-gnu \
+  -p kernaid-fleet-resident-work-orders --features windows-service \
+  --bin kernaid-fleet-resident-windows
+```
+
+It exposes native `install`, `start`, `stop` and `uninstall` service-control
+commands and installs with SCM start type `OnDemand`; installation never
+starts or auto-enables it. The service account is `LocalService`, with no
+password embedded in the binary, configuration or SCM arguments. Deployment
+files and the exact acceptance boundary are in
+`deploy/fleet-resident-windows/`.
+
+The only Windows action is `windows.p0.diagnose.v1@1` (diagnosis, R0). Its
+eleven collectors, programs, arguments, PowerShell bodies and time limits are
+compile-time constants shared with Desk through `kernaid-windows-pack`.
+Neither a work order nor configuration can select a command, argument, script,
+collector or target path. Raw collector output stays in memory; the durable
+execution state and signed Fleet result contain only a SHA-256 digest. A
+completed execution is replayed without recollection after restart, while an
+uncertain mismatched pending record fails closed.
