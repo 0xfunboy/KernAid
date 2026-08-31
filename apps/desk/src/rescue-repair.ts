@@ -327,7 +327,10 @@ export class RescueRepairClient {
     candidate: "fstab" | "crypttab" = "fstab",
   ): Promise<RescueRepairSnapshot> {
     const requestId = this.#nextRequestId();
-    const operation = `repair.${candidate}.rollback.status` as const;
+    const operation =
+      candidate === "crypttab"
+        ? "repair.crypttab.rollback.status"
+        : "repair.fstab.rollback.status";
     return await this.#post(
       {
         apiVersion: RESCUE_ROLLBACK_API_VERSION,
@@ -347,7 +350,10 @@ export class RescueRepairClient {
   ): Promise<RescueRepairSnapshot> {
     const exactSource = parseRollbackSourceReceipt(source);
     const requestId = this.#nextRequestId();
-    const operation = `repair.${candidate}.rollback.prepare` as const;
+    const operation =
+      candidate === "crypttab"
+        ? "repair.crypttab.rollback.prepare"
+        : "repair.fstab.rollback.prepare";
     return await this.#post(
       {
         apiVersion: RESCUE_ROLLBACK_API_VERSION,
