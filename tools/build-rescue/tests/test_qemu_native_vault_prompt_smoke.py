@@ -337,9 +337,13 @@ label live-amd64-failsafe
             ),
             1,
         )
+        before_lines = [
+            line for line in firstboot_unit.splitlines() if line.startswith("Before=")
+        ]
+        self.assertEqual(len(before_lines), 1)
         self.assertEqual(
-            firstboot_unit.count(
-                "Before=kernaid-qemu-native-prompt-journal-proof@boot1.service "
+            before_lines[0].split().count(
+                "kernaid-qemu-native-prompt-journal-proof@boot1.service"
             ),
             1,
         )
