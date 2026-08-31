@@ -16,6 +16,9 @@ SQLite, a private root-token file and no remote-command surface.
 - The root token is mounted as a Docker secret at
   `/run/secrets/kernaid_fleet_root_token`. Its value is never an environment
   variable, image layer, Compose value or console setting.
+- The Fleet service receipt key is mounted as a second Docker secret. Its
+  matching raw public anchor is a read-only config distributed to Resident
+  devices; startup rejects a mismatch or an anchor change for an existing DB.
 - The entitlement issuer's raw Ed25519 public key is mounted as a read-only
   config. Its offline private key/seed never enters this host or database.
 - The vendor update issuer's raw Ed25519 public key is mounted separately as a
@@ -42,8 +45,18 @@ install -m 444 /secure-export/entitlement.public \
   /absolute/private/fleet-secrets/entitlement.public
 install -m 444 /secure-export/update-vendor.public \
   /absolute/private/fleet-secrets/update-vendor.public
+openssl genpkey -algorithm Ed25519 -outform DER \
+  -out /absolute/private/fleet-secrets/receipt-signing-key.pk8
+chmod 400 /absolute/private/fleet-secrets/receipt-signing-key.pk8
+node --input-type=module -e \
+  'import{readFileSync,writeFileSync}from"node:fs";import{createPrivateKey,createPublicKey}from"node:crypto";const k=createPrivateKey({key:readFileSync(process.argv[1]),format:"der",type:"pkcs8"});const d=Buffer.from(createPublicKey(k).export({format:"der",type:"spki"}));writeFileSync(process.argv[2],d.subarray(-32).toString("base64url")+"\n")' \
+  /absolute/private/fleet-secrets/receipt-signing-key.pk8 \
+  /absolute/private/fleet-secrets/receipt.public
+chmod 444 /absolute/private/fleet-secrets/receipt.public
 
 export KERNAID_FLEET_ROOT_TOKEN_FILE=/absolute/private/fleet-secrets/root-token
+export KERNAID_FLEET_SERVICE_RECEIPT_SIGNING_KEY_FILE=/absolute/private/fleet-secrets/receipt-signing-key.pk8
+export KERNAID_FLEET_SERVICE_RECEIPT_TRUST_ANCHOR_FILE=/absolute/private/fleet-secrets/receipt.public
 export KERNAID_FLEET_ENTITLEMENT_TRUST_ANCHOR_FILE=/absolute/private/fleet-secrets/entitlement.public
 export KERNAID_FLEET_UPDATE_TRUST_ANCHOR_FILE=/absolute/private/fleet-secrets/update-vendor.public
 docker compose -f deploy/fleet/compose.yaml build --pull
@@ -168,6 +181,8 @@ node deploy/fleet/database-lifecycle.mjs verify /absolute/state/fleet.sqlite
 pnpm --filter @kernaid/fleet-control-plane build
 pnpm --filter @kernaid/fleet-console check
 KERNAID_FLEET_ROOT_TOKEN_FILE=/absolute/private/fleet-secrets/root-token \
+KERNAID_FLEET_SERVICE_RECEIPT_SIGNING_KEY_FILE=/absolute/private/fleet-secrets/receipt-signing-key.pk8 \
+KERNAID_FLEET_SERVICE_RECEIPT_TRUST_ANCHOR_FILE=/absolute/private/fleet-secrets/receipt.public \
 KERNAID_FLEET_ENTITLEMENT_TRUST_ANCHOR_FILE=/absolute/private/fleet-secrets/entitlement.public \
 KERNAID_FLEET_UPDATE_TRUST_ANCHOR_FILE=/absolute/private/fleet-secrets/update-vendor.public \
   docker compose -f deploy/fleet/compose.yaml config --quiet
@@ -175,5 +190,6 @@ docker build --file deploy/fleet/Dockerfile --tag kernaid/fleet-control-plane:lo
 ```
 
 `verify-deployment.mjs` checks the pin, non-root runtime, loopback bind,
-read-only filesystem, secret path, internal network, volume and console mount.
+read-only filesystem, root/receipt secret paths, receipt public anchor,
+internal network, volume and console mount.
 The last two commands require Docker and must run on the build/deployment host.

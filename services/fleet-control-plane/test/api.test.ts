@@ -4,6 +4,7 @@ import {
   generateKeyPairSync,
   randomBytes,
   sign,
+  verify,
   type KeyObject,
 } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -55,6 +56,9 @@ import {
   type SignedUpdateManifestUnsigned,
   type UpdatePullRequest,
   type UpdatePullRequestUnsigned,
+  parseServiceReceipt,
+  serviceReceiptSigningBytes,
+  type ServiceReceipt,
 } from "@kernaid/fleet-schemas";
 import { FleetControlPlane } from "../src/server.js";
 
@@ -69,6 +73,12 @@ const ENTITLEMENT_TRUST_ANCHOR = Buffer.from(
 const UPDATE_ISSUER = generateKeyPairSync("ed25519");
 const UPDATE_TRUST_ANCHOR = Buffer.from(
   UPDATE_ISSUER.publicKey.export({ format: "der", type: "spki" }),
+)
+  .subarray(12)
+  .toString("base64url");
+const SERVICE_RECEIPT_ISSUER = generateKeyPairSync("ed25519");
+const SERVICE_RECEIPT_TRUST_ANCHOR = Buffer.from(
+  SERVICE_RECEIPT_ISSUER.publicKey.export({ format: "der", type: "spki" }),
 )
   .subarray(12)
   .toString("base64url");
@@ -100,6 +110,8 @@ interface PolicySigner {
 interface HttpResult {
   status: number;
   body: Record<string, unknown>;
+  headers: Headers;
+  rawBody: string;
 }
 
 async function createHarness(options?: {
@@ -108,6 +120,8 @@ async function createHarness(options?: {
   consoleDirectory?: string;
   entitlementTrustAnchor?: string;
   updateTrustAnchor?: string;
+  serviceReceiptSigningKey?: KeyObject;
+  serviceReceiptTrustAnchor?: string;
 }): Promise<Harness> {
   const directory =
     options?.directory ?? mkdtempSync(join(tmpdir(), "kernaid-fleet-test-"));
@@ -116,6 +130,10 @@ async function createHarness(options?: {
   const service = new FleetControlPlane({
     databasePath,
     rootToken: ROOT_TOKEN,
+    serviceReceiptSigningKey:
+      options?.serviceReceiptSigningKey ?? SERVICE_RECEIPT_ISSUER.privateKey,
+    serviceReceiptTrustAnchor:
+      options?.serviceReceiptTrustAnchor ?? SERVICE_RECEIPT_TRUST_ANCHOR,
     entitlementTrustAnchor:
       options?.entitlementTrustAnchor ?? ENTITLEMENT_TRUST_ANCHOR,
     updateTrustAnchor: options?.updateTrustAnchor ?? UPDATE_TRUST_ANCHOR,
@@ -146,9 +164,12 @@ async function api(
     headers,
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
+  const rawBody = await response.text();
   return {
     status: response.status,
-    body: (await response.json()) as Record<string, unknown>,
+    body: JSON.parse(rawBody) as Record<string, unknown>,
+    headers: response.headers,
+    rawBody,
   };
 }
 
@@ -168,10 +189,51 @@ async function canonicalApi(
     headers,
     body: canonicalJson(body),
   });
+  const rawBody = await response.text();
   return {
     status: response.status,
-    body: (await response.json()) as Record<string, unknown>,
+    body: JSON.parse(rawBody) as Record<string, unknown>,
+    headers: response.headers,
+    rawBody,
   };
+}
+
+function verifiedServiceReceipt(
+  result: HttpResult,
+  expected: {
+    requestBody: string;
+    tenantId: string;
+    deviceId: string;
+    operation: ServiceReceipt["operation"];
+  },
+): { receipt: ServiceReceipt; canonical: string } {
+  const encoded = result.headers.get("x-kernaid-fleet-receipt");
+  assert.notEqual(encoded, null, "successful device response needs a receipt");
+  const canonical = Buffer.from(encoded ?? "", "base64url").toString("utf8");
+  assert.equal(Buffer.from(canonical).toString("base64url"), encoded);
+  const receipt = parseServiceReceipt(JSON.parse(canonical) as unknown);
+  assert.equal(canonicalJson(receipt), canonical);
+  assert.equal(receipt.tenantId, expected.tenantId);
+  assert.equal(receipt.deviceId, expected.deviceId);
+  assert.equal(receipt.operation, expected.operation);
+  assert.equal(
+    receipt.requestSha256,
+    createHash("sha256").update(expected.requestBody).digest("hex"),
+  );
+  assert.equal(
+    receipt.responseSha256,
+    createHash("sha256").update(result.rawBody).digest("hex"),
+  );
+  assert.equal(
+    verify(
+      null,
+      serviceReceiptSigningBytes(receipt),
+      SERVICE_RECEIPT_ISSUER.publicKey,
+      Buffer.from(receipt.signature, "base64url"),
+    ),
+    true,
+  );
+  return { receipt, canonical };
 }
 
 async function createTenant(harness: Harness): Promise<TenantCredentials> {
@@ -792,8 +854,8 @@ test("inventory signatures reject tampering and sequence handling is idempotent"
       201,
     );
     const replay = await api(harness, "POST", "/v1/inventories", first);
-    assert.equal(replay.status, 200);
-    assert.equal(replay.body.idempotent, true);
+    assert.equal(replay.status, 201);
+    assert.equal(replay.body.idempotent, false);
 
     const conflicting = signedInventory(
       harness,
@@ -808,6 +870,211 @@ test("inventory signatures reject tampering and sequence handling is idempotent"
     );
   } finally {
     await destroyHarness(harness);
+  }
+});
+
+test("service receipts bind exact Fleet traffic, replay, restart, tenant, and revocation", async () => {
+  let harness = await createHarness();
+  const directory = harness.directory;
+  const now = harness.now;
+  try {
+    const tenant = await createTenant(harness);
+    const other = await createTenant(harness);
+    const device = await enroll(harness, tenant, "receipt-device");
+
+    const inventory = signedInventory(
+      harness,
+      tenant,
+      device,
+      1,
+      asset("receipt-asset"),
+    );
+    const inventoryResult = await api(
+      harness,
+      "POST",
+      "/v1/inventories",
+      inventory,
+    );
+    assert.equal(
+      verifiedServiceReceipt(inventoryResult, {
+        requestBody: JSON.stringify(inventory),
+        tenantId: tenant.tenantId,
+        deviceId: device.deviceId,
+        operation: "inventory",
+      }).receipt.sequence,
+      1,
+    );
+
+    const audit = signedAudit(harness, tenant, device, {
+      sessionId: "receipt-session",
+      eventId: "receipt-event",
+      sequence: 1,
+      previousEventSha256: null,
+    });
+    const auditResult = await canonicalApi(
+      harness,
+      "POST",
+      "/v1/audit-events",
+      audit,
+    );
+    assert.equal(
+      verifiedServiceReceipt(auditResult, {
+        requestBody: canonicalJson(audit),
+        tenantId: tenant.tenantId,
+        deviceId: device.deviceId,
+        operation: "audit",
+      }).receipt.sequence,
+      2,
+    );
+
+    const policyPull = signedPolicyPull(harness, tenant, device);
+    const policyResult = await api(
+      harness,
+      "POST",
+      "/v1/policy-pulls",
+      policyPull,
+    );
+    assert.equal(
+      verifiedServiceReceipt(policyResult, {
+        requestBody: JSON.stringify(policyPull),
+        tenantId: tenant.tenantId,
+        deviceId: device.deviceId,
+        operation: "policy_pull",
+      }).receipt.sequence,
+      3,
+    );
+
+    const entitlementPull = signedEntitlementPull(harness, tenant, device);
+    const entitlementResult = await api(
+      harness,
+      "POST",
+      "/v1/entitlement-pulls",
+      entitlementPull,
+    );
+    assert.equal(
+      verifiedServiceReceipt(entitlementResult, {
+        requestBody: JSON.stringify(entitlementPull),
+        tenantId: tenant.tenantId,
+        deviceId: device.deviceId,
+        operation: "entitlement_pull",
+      }).receipt.sequence,
+      4,
+    );
+
+    const exactReplay = await api(
+      harness,
+      "POST",
+      "/v1/policy-pulls",
+      policyPull,
+    );
+    assert.equal(exactReplay.rawBody, policyResult.rawBody);
+    assert.equal(
+      exactReplay.headers.get("x-kernaid-fleet-receipt"),
+      policyResult.headers.get("x-kernaid-fleet-receipt"),
+    );
+
+    const crossTenantUnsigned: InventoryEnvelopeUnsigned = {
+      ...inventory,
+      tenantId: other.tenantId,
+      sequence: 2,
+    };
+    const crossTenant: InventoryEnvelope = {
+      ...crossTenantUnsigned,
+      signature: sign(
+        null,
+        inventorySigningBytes(crossTenantUnsigned),
+        device.privateKey,
+      ).toString("base64url"),
+    };
+    const denied = await api(harness, "POST", "/v1/inventories", crossTenant);
+    assert.equal(denied.status, 401);
+    assert.equal(denied.headers.get("x-kernaid-fleet-receipt"), null);
+
+    await destroyHarness(harness, false);
+    harness = await createHarness({ directory, now });
+    const secondInventory = signedInventory(
+      harness,
+      tenant,
+      device,
+      2,
+      asset("receipt-asset", "attention"),
+    );
+    const afterRestart = await api(
+      harness,
+      "POST",
+      "/v1/inventories",
+      secondInventory,
+    );
+    assert.equal(
+      verifiedServiceReceipt(afterRestart, {
+        requestBody: JSON.stringify(secondInventory),
+        tenantId: tenant.tenantId,
+        deviceId: device.deviceId,
+        operation: "inventory",
+      }).receipt.sequence,
+      5,
+    );
+
+    assert.equal(
+      (
+        await api(
+          harness,
+          "POST",
+          `/v1/tenants/${tenant.tenantId}/devices/${device.deviceId}/revoke`,
+          {},
+          tenant.adminToken,
+        )
+      ).status,
+      200,
+    );
+    const revokedReplay = await api(
+      harness,
+      "POST",
+      "/v1/inventories",
+      secondInventory,
+    );
+    assert.equal(revokedReplay.status, 403);
+    assert.equal(revokedReplay.headers.get("x-kernaid-fleet-receipt"), null);
+  } finally {
+    await destroyHarness(harness);
+  }
+});
+
+test("service receipt key mismatch and database anchor change fail at startup", async () => {
+  const mismatched = generateKeyPairSync("ed25519");
+  assert.throws(
+    () =>
+      new FleetControlPlane({
+        databasePath: ":memory:",
+        rootToken: ROOT_TOKEN,
+        serviceReceiptSigningKey: mismatched.privateKey,
+        serviceReceiptTrustAnchor: SERVICE_RECEIPT_TRUST_ANCHOR,
+        entitlementTrustAnchor: ENTITLEMENT_TRUST_ANCHOR,
+        updateTrustAnchor: UPDATE_TRUST_ANCHOR,
+      }),
+    /matching Ed25519 pair/,
+  );
+
+  const harness = await createHarness();
+  const directory = harness.directory;
+  try {
+    await destroyHarness(harness, false);
+    const replacement = generateKeyPairSync("ed25519");
+    const replacementAnchor = Buffer.from(
+      replacement.publicKey.export({ format: "der", type: "spki" }),
+    )
+      .subarray(12)
+      .toString("base64url");
+    await assert.rejects(
+      createHarness({
+        directory,
+        serviceReceiptSigningKey: replacement.privateKey,
+        serviceReceiptTrustAnchor: replacementAnchor,
+      }),
+      /anchor does not match this database/,
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
   }
 });
 
@@ -1125,8 +1392,8 @@ test("signed audit events ingest once and expose only minimized tenant data", as
       "/v1/audit-events",
       event,
     );
-    assert.equal(replay.status, 200);
-    assert.equal(replay.body.idempotent, true);
+    assert.equal(replay.status, 201);
+    assert.equal(replay.body.idempotent, false);
 
     const listed = await api(
       harness,
@@ -1211,8 +1478,8 @@ test("audit sessions reject gaps and forks while accepting the contiguous chain"
       "/v1/audit-events",
       first,
     );
-    assert.equal(oldExactReplay.status, 200);
-    assert.equal(oldExactReplay.body.idempotent, true);
+    assert.equal(oldExactReplay.status, 201);
+    assert.equal(oldExactReplay.body.idempotent, false);
   } finally {
     await destroyHarness(harness);
   }
@@ -1501,8 +1768,12 @@ test("signed policy pulls return only assignments for the enrolled active device
       ["all-devices", "first-only"],
     );
     const replay = await api(harness, "POST", "/v1/policy-pulls", firstPull);
-    assert.equal(replay.status, 409);
-    assert.equal(replay.body.error, "policy_pull_replay");
+    assert.equal(replay.status, 200);
+    assert.deepEqual(replay.body, firstResult.body);
+    assert.equal(
+      replay.headers.get("x-kernaid-fleet-receipt"),
+      firstResult.headers.get("x-kernaid-fleet-receipt"),
+    );
 
     const secondResult = await api(
       harness,
@@ -1590,6 +1861,9 @@ test("policy anchor, bundle, and assignment survive SQLite restart", async () =>
 
     const legacy = new DatabaseSync(harness.databasePath);
     legacy.exec(`
+      DROP TABLE service_receipts;
+      DROP TABLE service_receipt_checkpoints;
+      DROP TABLE service_receipt_config;
       DROP TABLE update_pull_nonces;
       DROP TABLE update_manifests;
       DROP TABLE tenant_update_checkpoints;
@@ -1634,7 +1908,7 @@ test("policy anchor, bundle, and assignment survive SQLite restart", async () =>
     const version = database.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    assert.equal(version.user_version, 5);
+    assert.equal(version.user_version, 6);
     const nonce = database
       .prepare(
         `SELECT nonce_sha256 FROM policy_pull_nonces
@@ -1839,8 +2113,12 @@ test("signed entitlement pulls isolate assignments and reject replay, key mismat
       "/v1/entitlement-pulls",
       firstPull,
     );
-    assert.equal(replay.status, 409);
-    assert.equal(replay.body.error, "entitlement_pull_replay");
+    assert.equal(replay.status, 200);
+    assert.deepEqual(replay.body, firstResult.body);
+    assert.equal(
+      replay.headers.get("x-kernaid-fleet-receipt"),
+      firstResult.headers.get("x-kernaid-fleet-receipt"),
+    );
 
     const secondResult = await api(
       harness,
@@ -1933,7 +2211,7 @@ test("signed entitlement pulls isolate assignments and reject replay, key mismat
   }
 });
 
-test("SQLite v3 migrates through v5 and entitlement checkpoints survive restart", async () => {
+test("SQLite v3 migrates through v6 and entitlement checkpoints survive restart", async () => {
   let harness = await createHarness();
   const directory = harness.directory;
   const now = harness.now;
@@ -1948,6 +2226,9 @@ test("SQLite v3 migrates through v5 and entitlement checkpoints survive restart"
 
     const legacy = new DatabaseSync(harness.databasePath);
     legacy.exec(`
+      DROP TABLE service_receipts;
+      DROP TABLE service_receipt_checkpoints;
+      DROP TABLE service_receipt_config;
       DROP TABLE update_pull_nonces;
       DROP TABLE update_manifests;
       DROP TABLE tenant_update_checkpoints;
@@ -1993,7 +2274,7 @@ test("SQLite v3 migrates through v5 and entitlement checkpoints survive restart"
     const version = database.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    assert.equal(version.user_version, 5);
+    assert.equal(version.user_version, 6);
     const document = database
       .prepare(
         `SELECT highest_sequence, envelope_sha256, canonical_json
@@ -2219,7 +2500,7 @@ test("signed update pulls bind target and ring, filter eligibility, and reject r
   }
 });
 
-test("SQLite v4 migrates to v5 and update checkpoints survive restart", async () => {
+test("SQLite v4 migrates through v6 and update checkpoints survive restart", async () => {
   let harness = await createHarness();
   const directory = harness.directory;
   const now = harness.now;
@@ -2230,6 +2511,9 @@ test("SQLite v4 migrates to v5 and update checkpoints survive restart", async ()
 
     const legacy = new DatabaseSync(harness.databasePath);
     legacy.exec(`
+      DROP TABLE service_receipts;
+      DROP TABLE service_receipt_checkpoints;
+      DROP TABLE service_receipt_config;
       DROP TABLE update_pull_nonces;
       DROP TABLE update_manifests;
       DROP TABLE tenant_update_checkpoints;
@@ -2254,7 +2538,7 @@ test("SQLite v4 migrates to v5 and update checkpoints survive restart", async ()
     const version = database.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    assert.equal(version.user_version, 5);
+    assert.equal(version.user_version, 6);
     const checkpoint = database
       .prepare(
         `SELECT highest_sequence, manifest_sha256

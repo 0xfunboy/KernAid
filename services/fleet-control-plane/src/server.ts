@@ -14,6 +14,7 @@ import {
   MAX_POLICY_BUNDLE_BYTES,
   MAX_UPDATE_MANIFEST_BYTES,
   FLEET_UPDATE_PULL_RESPONSE_SCHEMA,
+  FLEET_SERVICE_RECEIPT_SCHEMA,
   auditSigningBytes,
   canonicalJson,
   enrollmentSigningBytes,
@@ -32,15 +33,20 @@ import {
   parsePolicyPullRequest,
   parseSignedPolicyBundle,
   parseSignedUpdateManifest,
+  parseServiceReceipt,
   parseUpdatePullRequest,
   policyBundleSigningBytes,
   policyPullSigningBytes,
+  serviceReceiptSigningBytes,
   updateAppliesTo,
   updateManifestSigningBytes,
   updatePullSigningBytes,
   parseEnrollmentRequest,
   parseAuditEnvelope,
   parseInventoryEnvelope,
+  type FleetServiceOperation,
+  type ServiceReceipt,
+  type ServiceReceiptUnsigned,
 } from "@kernaid/fleet-schemas";
 import {
   generateSecret,
@@ -50,6 +56,8 @@ import {
   decodeBase64UrlExact,
   importEd25519Spki,
   importEd25519Raw,
+  ed25519RawPublicKey,
+  signEd25519,
   secureSecretEqual,
   sha256Hex,
   verifyEd25519,
@@ -71,14 +79,19 @@ import {
   StoreUpdateConflictError,
   StoreUpdatePullReplayError,
   StoreUpdateRollbackError,
+  type StoredServiceResponse,
 } from "./store.js";
 
 const MAX_REQUEST_BYTES = 64 * 1024;
 const MAX_ENROLLMENT_TOKEN_SECONDS = 7 * 24 * 60 * 60;
+const MAX_SERVICE_RESPONSE_BYTES = 4 * 1024 * 1024;
+const SERVICE_RECEIPT_HEADER = "X-KernAid-Fleet-Receipt";
 
 export interface FleetControlPlaneOptions {
   databasePath: string;
   rootToken: string;
+  serviceReceiptSigningKey: KeyObject;
+  serviceReceiptTrustAnchor: string;
   entitlementTrustAnchor: string;
   updateTrustAnchor: string;
   enrollmentClockSkewMs?: number;
@@ -86,9 +99,24 @@ export interface FleetControlPlaneOptions {
   consoleDirectory?: string;
 }
 
+interface ServiceResponseContext {
+  operation: FleetServiceOperation;
+  tenantId: string;
+  deviceId: string;
+  requestSha256: string;
+}
+
+interface ServicePullNonce {
+  nonceSha256: string;
+  expiresAtMs: number;
+  nowMs: number;
+}
+
 export class FleetControlPlane {
   readonly #store: FleetStore;
   readonly #rootToken: string;
+  readonly #serviceReceiptSigningKey: KeyObject;
+  readonly #serviceReceiptTrustAnchor: KeyObject;
   readonly #entitlementTrustAnchor: KeyObject;
   readonly #updateTrustAnchor: KeyObject;
   readonly #clockSkewMs: number;
@@ -117,6 +145,24 @@ export class FleetControlPlane {
       );
     }
     try {
+      this.#serviceReceiptTrustAnchor = importEd25519Raw(
+        options.serviceReceiptTrustAnchor,
+      );
+      if (
+        options.serviceReceiptSigningKey.type !== "private" ||
+        options.serviceReceiptSigningKey.asymmetricKeyType !== "ed25519" ||
+        ed25519RawPublicKey(options.serviceReceiptSigningKey) !==
+          options.serviceReceiptTrustAnchor
+      ) {
+        throw new Error("service receipt key mismatch");
+      }
+      this.#serviceReceiptSigningKey = options.serviceReceiptSigningKey;
+    } catch {
+      throw new Error(
+        "service receipt signing key and trust anchor must be a matching Ed25519 pair",
+      );
+    }
+    try {
       this.#updateTrustAnchor = importEd25519Raw(options.updateTrustAnchor);
     } catch {
       throw new Error(
@@ -124,6 +170,14 @@ export class FleetControlPlane {
       );
     }
     this.#store = new FleetStore(options.databasePath);
+    try {
+      this.#store.bindServiceReceiptAnchor(
+        sha256Hex(decodeBase64UrlExact(options.serviceReceiptTrustAnchor)),
+      );
+    } catch (error) {
+      this.#store.close();
+      throw error;
+    }
     this.#rootToken = options.rootToken;
     this.#clockSkewMs = options.enrollmentClockSkewMs ?? 300_000;
     this.#now = options.now ?? (() => new Date());
@@ -651,11 +705,8 @@ export class FleetControlPlane {
     }
 
     if (method === "POST" && path === "/v1/inventories") {
-      const envelope = parseInventoryEnvelope(await readJson(request));
-      const now = this.#validNow();
-      if (Date.parse(envelope.observedAt) > now.getTime() + this.#clockSkewMs) {
-        throw new HttpError(400, "inventory_timestamp_rejected");
-      }
+      const received = await readJsonRequest(request);
+      const envelope = parseInventoryEnvelope(received.value);
       const device = this.#store.getDevice(
         envelope.tenantId,
         envelope.deviceId,
@@ -678,29 +729,49 @@ export class FleetControlPlane {
       ) {
         throw new HttpError(401, "invalid_signature");
       }
+      const context = serviceResponseContext(
+        "inventory",
+        envelope.tenantId,
+        envelope.deviceId,
+        received.bytes,
+      );
+      if (
+        envelope.sequence === device.lastSequence &&
+        this.#replayServiceResponse(response, context)
+      ) {
+        return;
+      }
+
+      const now = this.#validNow();
+      if (Date.parse(envelope.observedAt) > now.getTime() + this.#clockSkewMs) {
+        throw new HttpError(400, "inventory_timestamp_rejected");
+      }
 
       const result = this.#store.recordInventory(
         envelope,
         sha256Hex(canonicalJson(envelope)),
         now.toISOString(),
       );
-      writeJson(response, result.idempotent ? 200 : 201, {
-        schema: "dev.kernaid.fleet.inventory-response.v1",
-        tenantId: envelope.tenantId,
-        deviceId: envelope.deviceId,
-        sequence: envelope.sequence,
-        accepted: true,
-        idempotent: result.idempotent,
-      });
+      this.#commitServiceResponse(
+        response,
+        context,
+        result.idempotent ? 200 : 201,
+        {
+          schema: "dev.kernaid.fleet.inventory-response.v1",
+          tenantId: envelope.tenantId,
+          deviceId: envelope.deviceId,
+          sequence: envelope.sequence,
+          accepted: true,
+          idempotent: result.idempotent,
+        },
+        now,
+      );
       return;
     }
 
     if (method === "POST" && path === "/v1/audit-events") {
-      const envelope = parseAuditEnvelope(await readCanonicalJson(request));
-      const now = this.#validNow();
-      if (Date.parse(envelope.occurredAt) > now.getTime() + this.#clockSkewMs) {
-        throw new HttpError(400, "audit_timestamp_rejected");
-      }
+      const received = await readCanonicalJsonRequest(request);
+      const envelope = parseAuditEnvelope(received.value);
       const device = this.#store.getDevice(
         envelope.tenantId,
         envelope.deviceId,
@@ -723,32 +794,46 @@ export class FleetControlPlane {
       ) {
         throw new HttpError(401, "invalid_signature");
       }
+      const context = serviceResponseContext(
+        "audit",
+        envelope.tenantId,
+        envelope.deviceId,
+        received.bytes,
+      );
+      if (this.#replayServiceResponse(response, context)) return;
+
+      const now = this.#validNow();
+      if (Date.parse(envelope.occurredAt) > now.getTime() + this.#clockSkewMs) {
+        throw new HttpError(400, "audit_timestamp_rejected");
+      }
 
       const result = this.#store.recordAuditEvent(
         envelope,
         sha256Hex(canonicalJson(envelope)),
         now.toISOString(),
       );
-      writeJson(response, result.idempotent ? 200 : 201, {
-        schema: "dev.kernaid.fleet.audit-response.v1",
-        tenantId: envelope.tenantId,
-        deviceId: envelope.deviceId,
-        sessionId: envelope.sessionId,
-        eventId: envelope.eventId,
-        sequence: envelope.sequence,
-        accepted: true,
-        idempotent: result.idempotent,
-      });
+      this.#commitServiceResponse(
+        response,
+        context,
+        result.idempotent ? 200 : 201,
+        {
+          schema: "dev.kernaid.fleet.audit-response.v1",
+          tenantId: envelope.tenantId,
+          deviceId: envelope.deviceId,
+          sessionId: envelope.sessionId,
+          eventId: envelope.eventId,
+          sequence: envelope.sequence,
+          accepted: true,
+          idempotent: result.idempotent,
+        },
+        now,
+      );
       return;
     }
 
     if (method === "POST" && path === "/v1/policy-pulls") {
-      const pull = parsePolicyPullRequest(await readJson(request));
-      const now = this.#validNow();
-      const issuedAtMs = Date.parse(pull.issuedAt);
-      if (Math.abs(now.getTime() - issuedAtMs) > this.#clockSkewMs) {
-        throw new HttpError(401, "policy_pull_timestamp_rejected");
-      }
+      const received = await readJsonRequest(request);
+      const pull = parsePolicyPullRequest(received.value);
       const device = this.#store.getDevice(pull.tenantId, pull.deviceId);
       if (device === undefined) throw new HttpError(401, "unknown_device");
       if (device.revokedAt !== null) throw new HttpError(403, "device_revoked");
@@ -763,36 +848,49 @@ export class FleetControlPlane {
       ) {
         throw new HttpError(401, "invalid_signature");
       }
-      this.#store.recordPolicyPullNonce({
-        tenantId: pull.tenantId,
-        deviceId: pull.deviceId,
-        nonceSha256: sha256Hex(
-          `kernaid:fleet:policy-pull-nonce:v1\0${pull.nonce}`,
-        ),
-        expiresAtMs: issuedAtMs + this.#clockSkewMs + 1,
-        nowMs: now.getTime(),
-      });
+      const context = serviceResponseContext(
+        "policy_pull",
+        pull.tenantId,
+        pull.deviceId,
+        received.bytes,
+      );
+      if (this.#replayServiceResponse(response, context)) return;
+
+      const now = this.#validNow();
+      const issuedAtMs = Date.parse(pull.issuedAt);
+      if (Math.abs(now.getTime() - issuedAtMs) > this.#clockSkewMs) {
+        throw new HttpError(401, "policy_pull_timestamp_rejected");
+      }
       const items = this.#store
         .listApplicablePolicyJson(pull.tenantId, pull.deviceId)
         .map((stored) =>
           parseSignedPolicyBundle(JSON.parse(stored) as unknown),
         );
-      writeJson(response, 200, {
-        schema: "dev.kernaid.fleet.policy-pull-response.v1",
-        tenantId: pull.tenantId,
-        deviceId: pull.deviceId,
-        items,
-      });
+      this.#commitServiceResponse(
+        response,
+        context,
+        200,
+        {
+          schema: "dev.kernaid.fleet.policy-pull-response.v1",
+          tenantId: pull.tenantId,
+          deviceId: pull.deviceId,
+          items,
+        },
+        now,
+        {
+          nonceSha256: sha256Hex(
+            `kernaid:fleet:policy-pull-nonce:v1\0${pull.nonce}`,
+          ),
+          expiresAtMs: issuedAtMs + this.#clockSkewMs + 1,
+          nowMs: now.getTime(),
+        },
+      );
       return;
     }
 
     if (method === "POST" && path === "/v1/entitlement-pulls") {
-      const pull = parseEntitlementPullRequest(await readJson(request));
-      const now = this.#validNow();
-      const issuedAtMs = Date.parse(pull.issuedAt);
-      if (Math.abs(now.getTime() - issuedAtMs) > this.#clockSkewMs) {
-        throw new HttpError(401, "entitlement_pull_timestamp_rejected");
-      }
+      const received = await readJsonRequest(request);
+      const pull = parseEntitlementPullRequest(received.value);
       const device = this.#store.getDevice(pull.tenantId, pull.deviceId);
       if (device === undefined) throw new HttpError(401, "unknown_device");
       if (device.revokedAt !== null) throw new HttpError(403, "device_revoked");
@@ -811,15 +909,19 @@ export class FleetControlPlane {
       ) {
         throw new HttpError(401, "invalid_signature");
       }
-      this.#store.recordEntitlementPullNonce({
-        tenantId: pull.tenantId,
-        deviceId: pull.deviceId,
-        nonceSha256: sha256Hex(
-          `kernaid:fleet:entitlement-pull-nonce:v1\0${pull.nonce}`,
-        ),
-        expiresAtMs: issuedAtMs + this.#clockSkewMs + 1,
-        nowMs: now.getTime(),
-      });
+      const context = serviceResponseContext(
+        "entitlement_pull",
+        pull.tenantId,
+        pull.deviceId,
+        received.bytes,
+      );
+      if (this.#replayServiceResponse(response, context)) return;
+
+      const now = this.#validNow();
+      const issuedAtMs = Date.parse(pull.issuedAt);
+      if (Math.abs(now.getTime() - issuedAtMs) > this.#clockSkewMs) {
+        throw new HttpError(401, "entitlement_pull_timestamp_rejected");
+      }
       const entitlements = this.#store
         .listEntitlementJson(pull.tenantId)
         .map((stored) =>
@@ -835,13 +937,26 @@ export class FleetControlPlane {
           : parseEntitlementRevocationEnvelope(
               JSON.parse(storedRevocations) as unknown,
             );
-      writeJson(response, 200, {
-        schema: "dev.kernaid.fleet.entitlement-pull-response.v1",
-        tenantId: pull.tenantId,
-        deviceId: pull.deviceId,
-        entitlements,
-        revocations,
-      });
+      this.#commitServiceResponse(
+        response,
+        context,
+        200,
+        {
+          schema: "dev.kernaid.fleet.entitlement-pull-response.v1",
+          tenantId: pull.tenantId,
+          deviceId: pull.deviceId,
+          entitlements,
+          revocations,
+        },
+        now,
+        {
+          nonceSha256: sha256Hex(
+            `kernaid:fleet:entitlement-pull-nonce:v1\0${pull.nonce}`,
+          ),
+          expiresAtMs: issuedAtMs + this.#clockSkewMs + 1,
+          nowMs: now.getTime(),
+        },
+      );
       return;
     }
 
@@ -997,6 +1112,138 @@ export class FleetControlPlane {
     }
   }
 
+  #replayServiceResponse(
+    response: ServerResponse,
+    context: ServiceResponseContext,
+  ): boolean {
+    const retained = this.#store.getServiceResponse(context);
+    if (retained === undefined) return false;
+    this.#writeServiceResponse(response, context, retained);
+    return true;
+  }
+
+  #commitServiceResponse(
+    response: ServerResponse,
+    context: ServiceResponseContext,
+    status: 200 | 201,
+    body: unknown,
+    acceptedAt: Date,
+    pullNonce?: ServicePullNonce,
+  ): void {
+    const responseBody = JSON.stringify(body);
+    if (
+      Buffer.byteLength(responseBody, "utf8") === 0 ||
+      Buffer.byteLength(responseBody, "utf8") > MAX_SERVICE_RESPONSE_BYTES
+    ) {
+      throw new Error("Fleet service response exceeds its bound");
+    }
+    const responseSha256 = sha256Hex(responseBody);
+    const acceptedAtText = acceptedAt.toISOString();
+    const retained = this.#store.commitServiceResponse(
+      {
+        ...context,
+        responseSha256,
+        status,
+        responseBody,
+        createdAt: acceptedAtText,
+        ...(pullNonce === undefined ? {} : { pullNonce }),
+      },
+      (sequence) => {
+        const unsigned: ServiceReceiptUnsigned = {
+          schema: FLEET_SERVICE_RECEIPT_SCHEMA,
+          tenantId: context.tenantId,
+          deviceId: context.deviceId,
+          operation: context.operation,
+          sequence,
+          requestSha256: context.requestSha256,
+          responseSha256,
+          acceptedAt: acceptedAtText,
+          outcome: "accepted",
+        };
+        const receipt: ServiceReceipt = {
+          ...unsigned,
+          signature: signEd25519(
+            this.#serviceReceiptSigningKey,
+            serviceReceiptSigningBytes(unsigned),
+          ),
+        };
+        const receiptJson = canonicalJson(receipt);
+        this.#verifyServiceReceipt(
+          context,
+          responseBody,
+          receiptJson,
+          sequence,
+        );
+        return receiptJson;
+      },
+    );
+    this.#writeServiceResponse(response, context, retained);
+  }
+
+  #writeServiceResponse(
+    response: ServerResponse,
+    context: ServiceResponseContext,
+    retained: StoredServiceResponse,
+  ): void {
+    this.#verifyServiceReceipt(
+      context,
+      retained.responseBody,
+      retained.receiptJson,
+      retained.sequence,
+    );
+    if (
+      retained.tenantId !== context.tenantId ||
+      retained.deviceId !== context.deviceId ||
+      retained.operation !== context.operation ||
+      retained.requestSha256 !== context.requestSha256 ||
+      retained.responseSha256 !== sha256Hex(retained.responseBody)
+    ) {
+      throw new Error("stored Fleet service response binding is invalid");
+    }
+    const body = Buffer.from(retained.responseBody, "utf8");
+    response.statusCode = retained.status;
+    response.setHeader("Content-Type", "application/json; charset=utf-8");
+    response.setHeader("Content-Length", body.length);
+    response.setHeader(
+      SERVICE_RECEIPT_HEADER,
+      Buffer.from(retained.receiptJson, "utf8").toString("base64url"),
+    );
+    response.end(body);
+  }
+
+  #verifyServiceReceipt(
+    context: ServiceResponseContext,
+    responseBody: string,
+    receiptJson: string,
+    sequence: number,
+  ): void {
+    let receipt: ServiceReceipt;
+    try {
+      const parsed = JSON.parse(receiptJson) as unknown;
+      receipt = parseServiceReceipt(parsed);
+      if (canonicalJson(receipt) !== receiptJson) {
+        throw new Error("receipt is not canonical");
+      }
+    } catch {
+      throw new Error("Fleet service receipt is invalid");
+    }
+    if (
+      receipt.tenantId !== context.tenantId ||
+      receipt.deviceId !== context.deviceId ||
+      receipt.operation !== context.operation ||
+      receipt.sequence !== sequence ||
+      receipt.requestSha256 !== context.requestSha256 ||
+      receipt.responseSha256 !== sha256Hex(responseBody) ||
+      !verifyEd25519(
+        this.#serviceReceiptTrustAnchor,
+        serviceReceiptSigningBytes(receipt),
+        receipt.signature,
+      )
+    ) {
+      throw new Error("Fleet service receipt verification failed");
+    }
+  }
+
   #validNow(): Date {
     const now = this.#now();
     if (!Number.isFinite(now.getTime()))
@@ -1078,13 +1325,27 @@ function bearerToken(request: IncomingMessage): string | undefined {
 }
 
 async function readJson(request: IncomingMessage): Promise<unknown> {
-  return parseJsonBytes(await readJsonBytes(request, MAX_REQUEST_BYTES));
+  return (await readJsonRequest(request)).value;
+}
+
+async function readJsonRequest(
+  request: IncomingMessage,
+): Promise<{ value: unknown; bytes: Buffer }> {
+  const bytes = await readJsonBytes(request, MAX_REQUEST_BYTES);
+  return { value: parseJsonBytes(bytes), bytes };
 }
 
 async function readCanonicalJson(
   request: IncomingMessage,
   maximumBytes = MAX_REQUEST_BYTES,
 ): Promise<unknown> {
+  return (await readCanonicalJsonRequest(request, maximumBytes)).value;
+}
+
+async function readCanonicalJsonRequest(
+  request: IncomingMessage,
+  maximumBytes = MAX_REQUEST_BYTES,
+): Promise<{ value: unknown; bytes: Buffer }> {
   const bytes = await readJsonBytes(request, maximumBytes);
   const value = parseJsonBytes(bytes);
   const text = bytes.toString("utf8");
@@ -1099,7 +1360,7 @@ async function readCanonicalJson(
     if (error instanceof HttpError) throw error;
     throw new HttpError(400, "invalid_json");
   }
-  return value;
+  return { value, bytes };
 }
 
 async function readJsonBytes(
@@ -1155,6 +1416,20 @@ function pathIdentifier(value: string | undefined, field: string): string {
     throw new HttpError(400, "invalid_request");
   }
   return expectIdentifier(decoded, field);
+}
+
+function serviceResponseContext(
+  operation: FleetServiceOperation,
+  tenantId: string,
+  deviceId: string,
+  requestBytes: Uint8Array,
+): ServiceResponseContext {
+  return {
+    operation,
+    tenantId,
+    deviceId,
+    requestSha256: sha256Hex(requestBytes),
+  };
 }
 
 function writeJson(

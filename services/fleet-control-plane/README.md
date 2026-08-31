@@ -55,6 +55,15 @@ upload or arbitrary metadata API.
 - Update pulls are signed and nonce-protected device requests. Results are
   filtered by platform, architecture, ring, time and deterministic rollout;
   every returned manifest remains independently verifiable on the device.
+- Successful inventory, audit, policy-pull and entitlement-pull responses carry
+  `X-KernAid-Fleet-Receipt`: canonical receipt JSON encoded as unpadded
+  base64url and signed by an externally provisioned Ed25519 service key. The
+  receipt binds tenant, device, operation, the exact request/response SHA-256
+  digests and a durable per-device sequence. Exact retries return the retained
+  response and receipt; revoked, cross-tenant or tampered requests never do.
+- The service receipt private key is loaded from an owner-only PKCS#8 DER file.
+  Its matching raw public anchor is loaded separately, verified at startup and
+  pinned in SQLite by digest. Key mismatch or unplanned rotation fails closed.
 
 ## API
 
@@ -144,9 +153,21 @@ install -m 644 /secure-export/entitlement.public \
 install -m 644 /secure-export/update-vendor.public \
   "$PWD/.local/fleet/update-vendor.public"
 
+# Create a Fleet service receipt key outside the repository. Distribute only
+# receipt.public to Resident devices as their receipt trust anchor.
+openssl genpkey -algorithm Ed25519 -outform DER \
+  -out "$PWD/.local/fleet/receipt-signing-key.pk8"
+chmod 600 "$PWD/.local/fleet/receipt-signing-key.pk8"
+node --input-type=module -e \
+  'import{readFileSync,writeFileSync}from"node:fs";import{createPrivateKey,createPublicKey}from"node:crypto";const k=createPrivateKey({key:readFileSync(process.argv[1]),format:"der",type:"pkcs8"});const d=Buffer.from(createPublicKey(k).export({format:"der",type:"spki"}));writeFileSync(process.argv[2],d.subarray(-32).toString("base64url")+"\n")' \
+  "$PWD/.local/fleet/receipt-signing-key.pk8" \
+  "$PWD/.local/fleet/receipt.public"
+
 export KERNAID_FLEET_ROOT_TOKEN_FILE="$PWD/.local/fleet/root-token"
 export KERNAID_FLEET_ENTITLEMENT_TRUST_ANCHOR_FILE="$PWD/.local/fleet/entitlement.public"
 export KERNAID_FLEET_UPDATE_TRUST_ANCHOR_FILE="$PWD/.local/fleet/update-vendor.public"
+export KERNAID_FLEET_SERVICE_RECEIPT_SIGNING_KEY_FILE="$PWD/.local/fleet/receipt-signing-key.pk8"
+export KERNAID_FLEET_SERVICE_RECEIPT_TRUST_ANCHOR_FILE="$PWD/.local/fleet/receipt.public"
 export KERNAID_FLEET_DB_PATH="$PWD/.local/fleet/fleet.sqlite"
 export KERNAID_FLEET_HOST="127.0.0.1"
 export KERNAID_FLEET_PORT="7341"
@@ -197,6 +218,10 @@ manual protocol is:
 7. Provision the vendor update issuer's raw public key through
    `KERNAID_FLEET_UPDATE_TRUST_ANCHOR_FILE`. Publish only canonical manifests
    signed offline; devices independently verify and admit them before staging.
+8. Provision a dedicated Ed25519 receipt key pair. Keep its PKCS#8 private key
+   readable only by Fleet and install the matching raw public anchor in each
+   Resident. Back up the private key with the database: changing either side
+   without an explicit migration makes synchronization fail closed.
 
 ## Verification
 
@@ -212,5 +237,6 @@ binding, signature tampering, replay/idempotency, multi-asset retention,
 revocation, audit gaps/forks, unknown/private field rejection, hash-only
 secrets, policy assignment isolation, policy rollback/conflict, restart
 persistence, entitlement assignment/replay/tamper/rollback/revocation, update
-target/ring filtering, update anti-rollback/replay, SQLite v3-to-v5 migration,
-health and optional same-origin console serving.
+target/ring filtering, update anti-rollback/replay, exact signed service
+receipts, receipt key/anchor mismatch, durable receipt sequence, SQLite
+v3-to-v6 migration, health and optional same-origin console serving.

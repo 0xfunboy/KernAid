@@ -20,6 +20,8 @@ services:
       KERNAID_FLEET_PORT: "7341"
       KERNAID_FLEET_DB_PATH: /var/lib/kernaid-fleet/fleet.sqlite
       KERNAID_FLEET_ROOT_TOKEN_FILE: /run/secrets/kernaid_fleet_root_token
+      KERNAID_FLEET_SERVICE_RECEIPT_SIGNING_KEY_FILE: /run/secrets/kernaid_fleet_service_receipt_signing_key
+      KERNAID_FLEET_SERVICE_RECEIPT_TRUST_ANCHOR_FILE: /run/configs/kernaid_fleet_service_receipt_trust_anchor
       KERNAID_FLEET_ENTITLEMENT_TRUST_ANCHOR_FILE: /run/configs/kernaid_entitlement_trust_anchor
       KERNAID_FLEET_UPDATE_TRUST_ANCHOR_FILE: /run/configs/kernaid_update_trust_anchor
       FLEET_CONSOLE_DIR: /opt/kernaid/console
@@ -29,7 +31,17 @@ services:
         uid: "1000"
         gid: "1000"
         mode: 0400
+      - source: fleet-service-receipt-signing-key
+        target: kernaid_fleet_service_receipt_signing_key
+        uid: "1000"
+        gid: "1000"
+        mode: 0400
     configs:
+      - source: fleet-service-receipt-trust-anchor
+        target: /run/configs/kernaid_fleet_service_receipt_trust_anchor
+        uid: "1000"
+        gid: "1000"
+        mode: 0444
       - source: fleet-entitlement-trust-anchor
         target: /run/configs/kernaid_entitlement_trust_anchor
         uid: "1000"
@@ -56,8 +68,12 @@ services:
 secrets:
   fleet-root-token:
     file: "${KERNAID_FLEET_ROOT_TOKEN_FILE:?set an absolute root-token file path}"
+  fleet-service-receipt-signing-key:
+    file: "${KERNAID_FLEET_SERVICE_RECEIPT_SIGNING_KEY_FILE:?set an absolute receipt PKCS8 file path}"
 
 configs:
+  fleet-service-receipt-trust-anchor:
+    file: "${KERNAID_FLEET_SERVICE_RECEIPT_TRUST_ANCHOR_FILE:?set an absolute receipt public-anchor file path}"
   fleet-entitlement-trust-anchor:
     file: "${KERNAID_FLEET_ENTITLEMENT_TRUST_ANCHOR_FILE:?set an absolute public-anchor file path}"
   fleet-update-trust-anchor:
