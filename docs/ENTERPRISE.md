@@ -30,17 +30,17 @@ schema.
 
 ## Implemented components
 
-| Path                           | Responsibility                                                                                     | Current boundary                                                                               |
-| ------------------------------ | -------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| `crates/fleet-client`          | Canonical Ed25519 enrollment and per-asset inventory envelopes                                     | Offline/transport-neutral; reuses the existing protected device identity                       |
-| `crates/fleet-runtime`         | Durable SQLite outbox, inventory sequencing and verified entitlement state                          | External vendor anchor; paid features fail closed while diagnosis/export/rollback stay available |
-| `packages/fleet-schemas`       | Matching Node.js wire validation and canonical signing bytes                                       | Strict bounded v1 schemas                                                                      |
-| `services/fleet-control-plane` | Tenant registry, one-time enrollment, signed inventory/audit ingestion, revocation and tenant APIs | Loopback HTTP origin deployed behind a TLS Cloudflare Tunnel for internal engineering          |
-| `apps/fleet-console`           | Same-origin operator inventory and enrollment UI                                                   | Internal engineering console; tenant admin token remains in browser session storage only       |
-| `crates/fleet-policy`          | Offline policy issuer and signed, offline-capable restrictive bundle                                | Server receives no seed; policy can only narrow local permission                               |
-| `crates/fleet-audit`           | Canonical signed audit events and tamper-evident chain checkpoints                                 | Digest-only device protocol with central signature, sequence and chain verification            |
-| `crates/entitlements`          | Signed offline entitlements and revocation checkpoints                                             | Paid capabilities degrade without disabling diagnostics, report export or rollback             |
-| `crates/update-client`         | Signed A/B release admission, offline issuer and boot-state planner                                 | External trust anchor, monotonic manifests, ring/rollout/time gates and failed-boot rollback   |
+| Path                           | Responsibility                                                                                     | Current boundary                                                                                 |
+| ------------------------------ | -------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| `crates/fleet-client`          | Canonical Ed25519 enrollment and per-asset inventory envelopes                                     | Offline/transport-neutral; reuses the existing protected device identity                         |
+| `crates/fleet-runtime`         | Durable SQLite outbox, inventory sequencing and verified entitlement state                         | External vendor anchor; paid features fail closed while diagnosis/export/rollback stay available |
+| `packages/fleet-schemas`       | Matching Node.js wire validation and canonical signing bytes                                       | Strict bounded v1 schemas                                                                        |
+| `services/fleet-control-plane` | Tenant registry, one-time enrollment, signed inventory/audit ingestion, revocation and tenant APIs | Loopback HTTP origin deployed behind a TLS Cloudflare Tunnel for internal engineering            |
+| `apps/fleet-console`           | Same-origin operator inventory and enrollment UI                                                   | Internal engineering console; tenant admin token remains in browser session storage only         |
+| `crates/fleet-policy`          | Offline policy issuer and signed, offline-capable restrictive bundle                               | Server receives no seed; policy can only narrow local permission                                 |
+| `crates/fleet-audit`           | Canonical signed audit events and tamper-evident chain checkpoints                                 | Digest-only device protocol with central signature, sequence and chain verification              |
+| `crates/entitlements`          | Signed offline entitlements and revocation checkpoints                                             | Paid capabilities degrade without disabling diagnostics, report export or rollback               |
+| `crates/update-client`         | Signed A/B release admission, offline issuer and boot-state planner                                | External trust anchor, monotonic manifests, ring/rollout/time gates and failed-boot rollback     |
 
 The control plane binds every enrolled `KA-…` device ID to the raw Ed25519
 public key encoded in its canonical SPKI. Enrollment tokens are random,
@@ -62,6 +62,9 @@ and contains no enrollment or administrator token in plaintext.
 | `POST /v1/policy-pulls`                               | Enrolled-device Ed25519 signature                   | Return only signed policy bundles applicable to that device |
 | `POST /v1/tenants/:tenantId/policy-trust-anchor`      | Tenant admin bearer token                           | Set the tenant policy public key exactly once               |
 | `POST /v1/tenants/:tenantId/policies`                 | Tenant admin bearer token                           | Verify and publish an already-signed canonical policy       |
+| `POST /v1/entitlement-pulls`                          | Enrolled-device Ed25519 signature                   | Return applicable vendor-signed entitlement state           |
+| `POST /v1/tenants/:tenantId/entitlements`             | Tenant admin bearer token                           | Verify and publish an offline vendor-signed entitlement     |
+| `POST /v1/tenants/:tenantId/entitlement-revocations`  | Tenant admin bearer token                           | Verify and publish the monotonic signed revocation list     |
 | `GET /v1/tenants/:tenantId/devices`                   | Tenant admin bearer token                           | List tenant devices                                         |
 | `GET /v1/tenants/:tenantId/assets`                    | Tenant admin bearer token                           | List current tenant assets                                  |
 | `GET /v1/tenants/:tenantId/audit-events`              | Tenant admin bearer token                           | List bounded minimized audit events                         |
@@ -114,24 +117,24 @@ tokens in source, images, command history, URLs or browser persistent storage.
 ## Remaining Enterprise RC gates
 
 The internal control plane is running at `https://fleet.funboy.eu.cc/` through
-a loopback-only origin and persistent user service. Its schema-3 migration now
-includes signed tenant policy distribution. Online SQLite backup, restore into
+a loopback-only origin and persistent user service. Its schema-4 migration now
+includes signed tenant policy and entitlement distribution. The live service
+receives only the vendor entitlement public anchor; the offline issuer seed is
+outside its filesystem view. Online SQLite backup, restore into
 a new database, process health and retained tenant authentication passed a
 recovery drill on 31 August 2026. Root and tenant credentials remain owner-only
 outside source control.
 
 The remaining RC work is:
 
-1. wire the device runtime into Desk and Rescue lifecycle services;
-2. persist pulled policy checkpoints in the Desk/Rescue device lifecycle;
-3. distribute already-signed entitlements through Fleet and bind the runtime
-   capability result to product feature gates;
-4. connect the signed A/B planner and offline release issuer to artifact
+1. wire the device runtime, its durable signed policy cache and entitlement
+   capability result into Desk and Rescue lifecycle services;
+2. connect the signed A/B planner and offline release issuer to artifact
    download, inactive-slot writes,
    bootloader integration and update-service rollout;
-5. add production Access/rate-limit policy and an automated retained backup
+3. add production Access/rate-limit policy and an automated retained backup
    schedule around the now-proven recovery path;
-6. qualify the actual repair packs on disposable virtual and physical targets.
+4. qualify the actual repair packs on disposable virtual and physical targets.
 
 Fleet enrollment or a green dashboard is not proof that a repair action is
 safe. Each action remains independently off-default until its exact executor,

@@ -140,6 +140,21 @@ Keep the previous database untouched until that validation succeeds. The root
 token is intentionally outside SQLite and must be backed up through the
 deployment secret store, not copied into a database archive.
 
+For a single-node deployment, `scheduled-backup.mjs` wraps the same verified
+online-backup boundary and retains only exact owner-only backup files. It
+creates and verifies the new backup before rotating an exact bounded set; a
+failed backup never removes an older copy:
+
+```bash
+node deploy/fleet/scheduled-backup.mjs \
+  /absolute/state/fleet.sqlite /absolute/private/backups 14
+```
+
+The example units in `deploy/fleet/systemd/` run that command daily with a
+persistent timer. Adapt only the absolute installation/state paths, keep the
+database read-only to the backup service and make its dedicated backup
+directory mode `0700`.
+
 ## Targeted verification
 
 ```bash

@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily KernAid Fleet retained backup
+
+[Timer]
+OnCalendar=*-*-* 02:20:00 UTC
+Persistent=true
+RandomizedDelaySec=20m
+Unit=kernaid-fleet-backup.service
+
+[Install]
+WantedBy=timers.target

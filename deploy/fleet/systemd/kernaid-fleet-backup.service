@@ -1,0 +1,17 @@
+[Unit]
+Description=KernAid Fleet verified online backup
+After=kernaid-fleet.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/node /opt/kernaid/deploy/fleet/scheduled-backup.mjs /var/lib/kernaid-fleet/fleet.sqlite3 /var/backups/kernaid-fleet 14
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/opt/kernaid /var/lib/kernaid-fleet
+ReadWritePaths=/var/backups/kernaid-fleet
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX
