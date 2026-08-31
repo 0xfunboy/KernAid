@@ -112,6 +112,7 @@ class RescueBootBrandingTests(unittest.TestCase):
         unit = FIRSTBOOT.read_text(encoding="utf-8")
         self.assertNotIn("ExecStartPre=", unit)
         self.assertIn("TTYPath=/dev/tty1", unit)
+        self.assertIn("Before=plymouth-quit.service plymouth-quit-wait.service", unit)
 
         firstboot = FIRSTBOOT_SOURCE.read_text(encoding="utf-8")
         preflight = "let preflight = run_rescue_firstboot_preflight()?;"
@@ -120,7 +121,12 @@ class RescueBootBrandingTests(unittest.TestCase):
         self.assertLess(firstboot.index(preflight), firstboot.index(dismiss))
         self.assertLess(firstboot.index(dismiss), firstboot.index(prompt))
         self.assertIn('const PLYMOUTH_PATH: &str = "/usr/bin/plymouth";', firstboot)
+        self.assertIn(
+            'const PLYMOUTH_PING_ARGUMENTS: &[&str] = &["--ping"];',
+            firstboot,
+        )
         self.assertIn("bounded_process::wait", firstboot)
+        self.assertIn("if ping_status.success()", firstboot)
         self.assertNotIn('Command::new("/bin/sh")', firstboot)
 
     def test_console_identification_is_english_kernaid_copy(self) -> None:

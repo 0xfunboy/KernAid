@@ -3,7 +3,7 @@ Description=KernAid Rescue first-boot vault provisioning gate
 Requires=live-config.service
 Wants=kernaid-qemu-native-prompt-journal-proof@boot1.service
 After=live-config.service systemd-sysusers.service systemd-sysctl.service systemd-tmpfiles-setup.service
-Before=kernaid-qemu-native-prompt-journal-proof@boot1.service kernaid-rescue-vaultd.service display-manager.service getty@tty1.service graphical.target
+Before=plymouth-quit.service plymouth-quit-wait.service kernaid-qemu-native-prompt-journal-proof@boot1.service kernaid-rescue-vaultd.service display-manager.service getty@tty1.service graphical.target
 ConditionKernelCommandLine=boot=live
 ConditionPathIsDirectory=/run/live/medium
 
