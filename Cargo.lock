@@ -1353,6 +1353,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "262590f4fe6afeb0bc83be1daa64e52657fe185690a958af7f3ad0e92085c5ae"
 dependencies = [
  "futures-core",
+ "futures-sink",
 ]
 
 [[package]]
@@ -2396,6 +2397,30 @@ dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
  "rand_core 0.6.4",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "zeroize",
+]
+
+[[package]]
+name = "kernaid-fleet-resident-sync"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "ed25519-dalek",
+ "fs2",
+ "kernaid-device-identity",
+ "kernaid-fleet-client",
+ "kernaid-fleet-coordinator",
+ "kernaid-fleet-policy",
+ "kernaid-native-secrets",
+ "rand_core 0.6.4",
+ "reqwest",
+ "rustix",
+ "rustls",
  "serde",
  "serde_json",
  "sha2",
@@ -3652,6 +3677,7 @@ checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
 dependencies = [
  "base64 0.22.1",
  "bytes",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "http",

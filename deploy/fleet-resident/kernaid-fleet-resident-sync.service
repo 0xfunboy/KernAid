@@ -1,0 +1,22 @@
+[Unit]
+Description=KernAid Fleet Resident sync
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/libexec/kernaid-fleet-resident-sync --config %h/.config/kernaid/fleet-resident.json
+Restart=on-failure
+RestartSec=30s
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/io.github.0xfunboy.KernAid/fleet
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,15 @@
+{
+  "schema": "dev.kernaid.fleet.resident-sync-config.v1",
+  "endpoint": "https://fleet.example.invalid",
+  "tenantId": "tenant-example",
+  "stateDirectory": "/home/example/.local/share/io.github.0xfunboy.KernAid/fleet",
+  "serviceReceiptAnchorFile": "/home/example/.config/kernaid/fleet-service.pub",
+  "entitlementAnchorFile": "/home/example/.config/kernaid/entitlement-issuer.pub",
+  "policyAnchorFile": "/home/example/.config/kernaid/policy-issuer.pub",
+  "enrollmentTokenFile": "/home/example/.config/kernaid/enrollment-token",
+  "intervalSeconds": 300,
+  "connectTimeoutSeconds": 10,
+  "requestTimeoutSeconds": 30,
+  "batchLimit": 32,
+  "retryDelaySeconds": 60
+}
