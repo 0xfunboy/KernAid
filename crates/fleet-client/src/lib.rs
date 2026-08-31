@@ -24,6 +24,8 @@ mod entitlement_pull;
 pub use entitlement_pull::*;
 mod update_pull;
 pub use update_pull::*;
+mod work_order;
+pub use work_order::*;
 
 /// Enrollment wire schema.
 pub const ENROLLMENT_REQUEST_SCHEMA: &str = "dev.kernaid.fleet.enrollment-request.v1";

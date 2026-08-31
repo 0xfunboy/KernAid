@@ -2456,6 +2456,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "kernaid-fleet-resident-work-orders"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "ed25519-dalek",
+ "kernaid-device-identity",
+ "kernaid-fleet-client",
+ "kernaid-fleet-policy",
+ "kernaid-fleet-runtime",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "zeroize",
+]
+
+[[package]]
 name = "kernaid-fleet-runtime"
 version = "0.1.0"
 dependencies = [
