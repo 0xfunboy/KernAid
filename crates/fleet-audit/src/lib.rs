@@ -251,6 +251,11 @@ impl SignedAuditEnvelope {
     }
 
     #[must_use]
+    pub fn previous_event_sha256(&self) -> Option<&str> {
+        self.previous_event_sha256.as_deref()
+    }
+
+    #[must_use]
     pub const fn kind(&self) -> AuditKind {
         self.kind
     }
@@ -448,6 +453,26 @@ impl AuditChainCheckpoint {
     #[must_use]
     pub const fn last_sequence(&self) -> u64 {
         self.last_sequence
+    }
+
+    #[must_use]
+    pub fn tenant_id(&self) -> &str {
+        &self.tenant_id
+    }
+
+    #[must_use]
+    pub fn device_id(&self) -> &str {
+        &self.device_id
+    }
+
+    #[must_use]
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    #[must_use]
+    pub fn last_event_sha256(&self) -> &str {
+        &self.last_event_sha256
     }
 
     fn validate(&self) -> Result<(), FleetAuditError> {

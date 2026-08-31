@@ -13,6 +13,10 @@ use kernaid_entitlements::{
     RevocationCheckpoint, VerifiedEntitlement, VerifiedRevocations,
     capabilities as licensed_capabilities, verify_entitlement, verify_revocations,
 };
+use kernaid_fleet_audit::{
+    AuditChainCheckpoint, AuditEventContent, AuditKind, AuditOutcome, AuditRisk, ChainAdmission,
+    FleetAuditError, SignedAuditEnvelope, VerifiedAuditEnvelope,
+};
 use kernaid_fleet_client::{InventoryAsset, MAX_INVENTORY_BATCH_ASSETS, sign_inventory_batch};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
@@ -31,7 +35,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const IDENTITY_SCHEMA_VERSION: i64 = 1;
 const APPLICATION_ID: i64 = 0x4b41_464c; // "KAFL"
 const MAX_QUEUE_ITEMS: u64 = 100_000;
@@ -41,6 +45,9 @@ const MAX_ATTEMPTS: u32 = 1_000_000;
 const SHA256_BYTES: usize = 32;
 const MAX_SIGNED_PAYLOAD_BYTES: usize = 32 * 1024;
 const MAX_ENTITLEMENT_DOCUMENT_BYTES: usize = 64 * 1024;
+const MAX_AUDIT_DOCUMENT_BYTES: usize = 64 * 1024;
+const MAX_AUDIT_CHECKPOINT_BYTES: usize = 4 * 1024;
+const MAX_AUDIT_EVENTS: u64 = 1_000_000;
 
 #[cfg(windows)]
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
@@ -53,6 +60,122 @@ pub struct PendingInventory {
     payload: Vec<u8>,
     payload_sha256: [u8; SHA256_BYTES],
     attempts: u32,
+}
+
+/// Privacy-bounded audit input. Tenant, device, sequence, previous digest and
+/// signature are assigned by the runtime inside the enqueue transaction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuditEventDraft {
+    pub session_id: String,
+    pub event_id: String,
+    pub occurred_at: String,
+    pub kind: AuditKind,
+    pub outcome: AuditOutcome,
+    pub risk: Option<AuditRisk>,
+    pub action_id: Option<String>,
+    pub target_sha256: Option<String>,
+    pub report_sha256: Option<String>,
+    pub evidence_sha256: Vec<String>,
+}
+
+/// One exact signed audit event awaiting delivery.
+#[derive(Clone, Eq, PartialEq)]
+pub struct PendingAuditEvent {
+    id: u64,
+    session_id: String,
+    event_id: String,
+    sequence: u64,
+    payload: Vec<u8>,
+    payload_sha256: [u8; SHA256_BYTES],
+}
+
+impl PendingAuditEvent {
+    #[must_use]
+    pub const fn id(&self) -> u64 {
+        self.id
+    }
+
+    #[must_use]
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    #[must_use]
+    pub fn event_id(&self) -> &str {
+        &self.event_id
+    }
+
+    #[must_use]
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    #[must_use]
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+
+    #[must_use]
+    pub const fn payload_sha256(&self) -> &[u8; SHA256_BYTES] {
+        &self.payload_sha256
+    }
+}
+
+impl fmt::Debug for PendingAuditEvent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PendingAuditEvent")
+            .field("id", &self.id)
+            .field("session_id", &self.session_id)
+            .field("event_id", &self.event_id)
+            .field("sequence", &self.sequence)
+            .field("payload_len", &self.payload.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Outcome of an enqueue attempt. Reusing an event ID is accepted only when
+/// the newly signed canonical bytes are identical to the retained event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AuditEnqueueResult {
+    id: u64,
+    sequence: u64,
+    payload_sha256: [u8; SHA256_BYTES],
+    idempotent: bool,
+    pending: bool,
+}
+
+impl AuditEnqueueResult {
+    #[must_use]
+    pub const fn id(self) -> u64 {
+        self.id
+    }
+
+    #[must_use]
+    pub const fn sequence(self) -> u64 {
+        self.sequence
+    }
+
+    #[must_use]
+    pub const fn payload_sha256(self) -> [u8; SHA256_BYTES] {
+        self.payload_sha256
+    }
+
+    #[must_use]
+    pub const fn idempotent(self) -> bool {
+        self.idempotent
+    }
+
+    #[must_use]
+    pub const fn pending(self) -> bool {
+        self.pending
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuditAcknowledgement {
+    Acknowledged,
+    AlreadyAcknowledged,
 }
 
 /// Result of atomically applying one signed licensing document.
@@ -185,6 +308,11 @@ pub enum FleetRuntimeError {
     StaleAcknowledgement,
     SequenceExhausted,
     Signing,
+    AuditQueueFull,
+    AuditReplayConflict,
+    AuditStateCorrupt,
+    StaleAuditAcknowledgement,
+    Audit(FleetAuditError),
     TrustAnchorRequired,
     Entitlement(EntitlementError),
     Database(rusqlite::Error),
@@ -206,6 +334,11 @@ impl fmt::Display for FleetRuntimeError {
             Self::StaleAcknowledgement => "Fleet runtime acknowledgement is stale",
             Self::SequenceExhausted => "Fleet inventory sequence is exhausted",
             Self::Signing => "Fleet inventory signing failed",
+            Self::AuditQueueFull => "Fleet audit queue is full",
+            Self::AuditReplayConflict => "Fleet audit event replay conflicts with retained state",
+            Self::AuditStateCorrupt => "Fleet audit state is corrupt",
+            Self::StaleAuditAcknowledgement => "Fleet audit acknowledgement is stale",
+            Self::Audit(_) => "Fleet audit operation failed",
             Self::TrustAnchorRequired => "Fleet entitlement trust anchor is required",
             Self::Entitlement(_) => "Fleet entitlement verification failed",
             Self::Database(_) => "Fleet runtime database operation failed",
@@ -217,6 +350,7 @@ impl fmt::Display for FleetRuntimeError {
 impl Error for FleetRuntimeError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::Audit(error) => Some(error),
             Self::Entitlement(error) => Some(error),
             Self::Database(error) => Some(error),
             Self::Io(error) => Some(error),
@@ -243,6 +377,12 @@ impl From<EntitlementError> for FleetRuntimeError {
     }
 }
 
+impl From<FleetAuditError> for FleetRuntimeError {
+    fn from(error: FleetAuditError) -> Self {
+        Self::Audit(error)
+    }
+}
+
 /// SQLite-backed inventory queue bound to exactly one tenant and device.
 ///
 /// One product-level interprocess lock must cover each instance's lifetime.
@@ -251,6 +391,7 @@ pub struct FleetRuntime {
     path: PathBuf,
     tenant_id: String,
     device_id: String,
+    device_public_key: [u8; 32],
     entitlement_trust_anchor: Option<[u8; 32]>,
 }
 
@@ -283,6 +424,7 @@ impl FleetRuntime {
     ) -> Result<Self, FleetRuntimeError> {
         validate_public_identifier(tenant_id)?;
         let device_id = identity.device_id();
+        let device_public_key = identity.public_key();
         prepare_database_path(path)?;
         let connection = Connection::open_with_flags(
             path,
@@ -299,6 +441,7 @@ impl FleetRuntime {
             path: path.to_path_buf(),
             tenant_id: tenant_id.to_owned(),
             device_id,
+            device_public_key,
             entitlement_trust_anchor,
         })
     }
@@ -462,6 +605,296 @@ impl FleetRuntime {
             &self.device_id,
             now_unix,
         ))
+    }
+
+    /// Allocate the next per-session sequence, sign the event with the
+    /// caller-owned identity, advance the hash-chain checkpoint, and retain
+    /// the exact payload for delivery in one SQLite transaction.
+    pub fn enqueue_audit(
+        &mut self,
+        identity: &DeviceIdentity,
+        draft: AuditEventDraft,
+    ) -> Result<AuditEnqueueResult, FleetRuntimeError> {
+        self.ensure_hardened()?;
+        if identity.public_key() != self.device_public_key {
+            return Err(FleetRuntimeError::IdentityMismatch);
+        }
+        let tenant_id = self.tenant_id.clone();
+        let device_id = self.device_id.clone();
+        let public_key = self.device_public_key;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        if let Some(existing) =
+            read_audit_event_by_key(&transaction, &draft.session_id, &draft.event_id)?
+        {
+            let retained = read_audit_checkpoint(
+                &transaction,
+                &tenant_id,
+                &device_id,
+                &public_key,
+                &draft.session_id,
+            )?
+            .ok_or(FleetRuntimeError::AuditStateCorrupt)?;
+            if existing.sequence > retained.checkpoint.last_sequence() {
+                return Err(FleetRuntimeError::AuditStateCorrupt);
+            }
+            verify_stored_audit_event(&existing, &tenant_id, &device_id, &public_key)?;
+            let candidate = sign_audit_draft(
+                identity,
+                &tenant_id,
+                &draft,
+                existing.sequence,
+                existing.previous_event_sha256.as_ref(),
+            )?;
+            let candidate_payload = candidate.export_offline()?;
+            if candidate_payload != existing.payload {
+                return Err(FleetRuntimeError::AuditReplayConflict);
+            }
+            let result = AuditEnqueueResult {
+                id: existing.id,
+                sequence: existing.sequence,
+                payload_sha256: existing.payload_sha256,
+                idempotent: true,
+                pending: !existing.acknowledged,
+            };
+            transaction.commit()?;
+            return Ok(result);
+        }
+
+        let event_count: u64 =
+            transaction.query_row("SELECT COUNT(*) FROM fleet_audit_events", [], |row| {
+                row.get(0)
+            })?;
+        let pending_count: u64 = transaction.query_row(
+            "SELECT COUNT(*) FROM fleet_audit_events WHERE acknowledged = 0",
+            [],
+            |row| row.get(0),
+        )?;
+        if event_count >= MAX_AUDIT_EVENTS || pending_count >= MAX_QUEUE_ITEMS {
+            return Err(FleetRuntimeError::AuditQueueFull);
+        }
+
+        let retained = read_audit_checkpoint(
+            &transaction,
+            &tenant_id,
+            &device_id,
+            &public_key,
+            &draft.session_id,
+        )?;
+        let (sequence, previous_event_sha256) = match retained.as_ref() {
+            Some(retained) => (
+                retained
+                    .checkpoint
+                    .last_sequence()
+                    .checked_add(1)
+                    .filter(|value| *value <= kernaid_fleet_audit::MAX_SAFE_JSON_INTEGER)
+                    .ok_or(FleetRuntimeError::SequenceExhausted)?,
+                Some(retained.last_event_sha256),
+            ),
+            None => (1, None),
+        };
+        let signed = sign_audit_draft(
+            identity,
+            &tenant_id,
+            &draft,
+            sequence,
+            previous_event_sha256.as_ref(),
+        )?;
+        let verified = signed.verify(&tenant_id, &device_id, &public_key)?;
+        let payload = verified.export_offline()?;
+        let payload_sha256 = *verified.digest();
+        let next_checkpoint = match retained.as_ref() {
+            Some(retained) => {
+                let mut checkpoint = retained.checkpoint.clone();
+                if checkpoint.admit(&verified)? != ChainAdmission::Advanced {
+                    return Err(FleetRuntimeError::AuditStateCorrupt);
+                }
+                checkpoint
+            }
+            None => AuditChainCheckpoint::start(&verified)?,
+        };
+        let checkpoint_bytes = next_checkpoint.export_canonical()?;
+        if payload.len() > MAX_AUDIT_DOCUMENT_BYTES
+            || checkpoint_bytes.len() > MAX_AUDIT_CHECKPOINT_BYTES
+        {
+            return Err(FleetRuntimeError::AuditStateCorrupt);
+        }
+
+        match retained.as_ref() {
+            Some(retained) => {
+                let changed = transaction.execute(
+                    "UPDATE fleet_audit_sessions
+                     SET last_sequence = ?2, last_event_sha256 = ?3, checkpoint = ?4
+                     WHERE session_id = ?1 AND last_sequence = ?5
+                       AND last_event_sha256 = ?6",
+                    params![
+                        draft.session_id,
+                        sequence,
+                        payload_sha256.as_slice(),
+                        checkpoint_bytes,
+                        retained.checkpoint.last_sequence(),
+                        retained.last_event_sha256.as_slice(),
+                    ],
+                )?;
+                if changed != 1 {
+                    return Err(FleetRuntimeError::AuditStateCorrupt);
+                }
+            }
+            None => {
+                transaction.execute(
+                    "INSERT INTO fleet_audit_sessions
+                     (session_id, last_sequence, last_event_sha256, checkpoint)
+                     VALUES (?1, 1, ?2, ?3)",
+                    params![
+                        draft.session_id,
+                        payload_sha256.as_slice(),
+                        checkpoint_bytes
+                    ],
+                )?;
+            }
+        }
+        transaction.execute(
+            "INSERT INTO fleet_audit_events
+             (session_id, event_id, sequence, previous_event_sha256, payload,
+              payload_sha256, acknowledged)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
+            params![
+                draft.session_id,
+                draft.event_id,
+                sequence,
+                previous_event_sha256
+                    .as_ref()
+                    .map(<[u8; SHA256_BYTES]>::as_slice),
+                payload,
+                payload_sha256.as_slice(),
+            ],
+        )?;
+        let id = u64::try_from(transaction.last_insert_rowid())
+            .map_err(|_| FleetRuntimeError::AuditStateCorrupt)?;
+        transaction.commit()?;
+        self.ensure_hardened()?;
+        Ok(AuditEnqueueResult {
+            id,
+            sequence,
+            payload_sha256,
+            idempotent: false,
+            pending: true,
+        })
+    }
+
+    /// Return a bounded, verified delivery batch without mutating outbox
+    /// state. One corrupt row fails the entire read closed.
+    pub fn pending_audit(&self, limit: usize) -> Result<Vec<PendingAuditEvent>, FleetRuntimeError> {
+        self.ensure_hardened()?;
+        if limit == 0 || limit > MAX_BATCH_ITEMS {
+            return Err(FleetRuntimeError::InvalidBatch);
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT id, session_id, event_id, sequence, previous_event_sha256,
+                    payload, payload_sha256, acknowledged
+             FROM fleet_audit_events
+             WHERE acknowledged = 0
+             ORDER BY id ASC
+             LIMIT ?1",
+        )?;
+        let rows = statement.query_map(
+            [u64::try_from(limit).map_err(|_| FleetRuntimeError::InvalidBatch)?],
+            decode_stored_audit_event,
+        )?;
+        let mut pending = Vec::with_capacity(limit);
+        for row in rows {
+            let stored = row?;
+            verify_stored_audit_event(
+                &stored,
+                &self.tenant_id,
+                &self.device_id,
+                &self.device_public_key,
+            )?;
+            let retained = read_audit_checkpoint(
+                &self.connection,
+                &self.tenant_id,
+                &self.device_id,
+                &self.device_public_key,
+                &stored.session_id,
+            )?
+            .ok_or(FleetRuntimeError::AuditStateCorrupt)?;
+            if stored.sequence > retained.checkpoint.last_sequence() {
+                return Err(FleetRuntimeError::AuditStateCorrupt);
+            }
+            if stored.acknowledged {
+                return Err(FleetRuntimeError::AuditStateCorrupt);
+            }
+            pending.push(PendingAuditEvent {
+                id: stored.id,
+                session_id: stored.session_id,
+                event_id: stored.event_id,
+                sequence: stored.sequence,
+                payload: stored.payload,
+                payload_sha256: stored.payload_sha256,
+            });
+        }
+        Ok(pending)
+    }
+
+    /// Acknowledge only the exact verified event. Repeating the same
+    /// acknowledgement is successful and explicitly reported as idempotent.
+    pub fn acknowledge_audit(
+        &mut self,
+        id: u64,
+        payload_sha256: &[u8; SHA256_BYTES],
+    ) -> Result<AuditAcknowledgement, FleetRuntimeError> {
+        self.ensure_hardened()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let stored = read_audit_event_by_id(&transaction, id)?
+            .ok_or(FleetRuntimeError::StaleAuditAcknowledgement)?;
+        verify_stored_audit_event(
+            &stored,
+            &self.tenant_id,
+            &self.device_id,
+            &self.device_public_key,
+        )?;
+        let retained = read_audit_checkpoint(
+            &transaction,
+            &self.tenant_id,
+            &self.device_id,
+            &self.device_public_key,
+            &stored.session_id,
+        )?
+        .ok_or(FleetRuntimeError::AuditStateCorrupt)?;
+        if stored.sequence > retained.checkpoint.last_sequence() {
+            return Err(FleetRuntimeError::AuditStateCorrupt);
+        }
+        if &stored.payload_sha256 != payload_sha256 {
+            return Err(FleetRuntimeError::StaleAuditAcknowledgement);
+        }
+        if stored.acknowledged {
+            transaction.commit()?;
+            return Ok(AuditAcknowledgement::AlreadyAcknowledged);
+        }
+        let changed = transaction.execute(
+            "UPDATE fleet_audit_events SET acknowledged = 1
+             WHERE id = ?1 AND payload_sha256 = ?2 AND acknowledged = 0",
+            params![id, payload_sha256.as_slice()],
+        )?;
+        if changed != 1 {
+            return Err(FleetRuntimeError::StaleAuditAcknowledgement);
+        }
+        transaction.commit()?;
+        self.ensure_hardened()?;
+        Ok(AuditAcknowledgement::Acknowledged)
+    }
+
+    pub fn pending_audit_count(&self) -> Result<u64, FleetRuntimeError> {
+        self.ensure_hardened()?;
+        Ok(self.connection.query_row(
+            "SELECT COUNT(*) FROM fleet_audit_events WHERE acknowledged = 0",
+            [],
+            |row| row.get(0),
+        )?)
     }
 
     /// Sign and durably queue one canonical envelope per asset in one SQLite
@@ -674,6 +1107,215 @@ fn decode_pending(row: &rusqlite::Row<'_>) -> rusqlite::Result<PendingInventory>
     })
 }
 
+struct StoredAuditEvent {
+    id: u64,
+    session_id: String,
+    event_id: String,
+    sequence: u64,
+    previous_event_sha256: Option<[u8; SHA256_BYTES]>,
+    payload: Vec<u8>,
+    payload_sha256: [u8; SHA256_BYTES],
+    acknowledged: bool,
+}
+
+struct StoredAuditCheckpoint {
+    checkpoint: AuditChainCheckpoint,
+    last_event_sha256: [u8; SHA256_BYTES],
+}
+
+fn sign_audit_draft(
+    identity: &DeviceIdentity,
+    tenant_id: &str,
+    draft: &AuditEventDraft,
+    sequence: u64,
+    previous_event_sha256: Option<&[u8; SHA256_BYTES]>,
+) -> Result<SignedAuditEnvelope, FleetRuntimeError> {
+    Ok(SignedAuditEnvelope::sign(
+        identity,
+        AuditEventContent {
+            tenant_id: tenant_id.to_owned(),
+            session_id: draft.session_id.clone(),
+            event_id: draft.event_id.clone(),
+            sequence,
+            previous_event_sha256: previous_event_sha256.map(hex_digest),
+            occurred_at: draft.occurred_at.clone(),
+            kind: draft.kind,
+            outcome: draft.outcome,
+            risk: draft.risk,
+            action_id: draft.action_id.clone(),
+            target_sha256: draft.target_sha256.clone(),
+            report_sha256: draft.report_sha256.clone(),
+            evidence_sha256: draft.evidence_sha256.clone(),
+        },
+    )?)
+}
+
+fn read_audit_event_by_key(
+    connection: &Connection,
+    session_id: &str,
+    event_id: &str,
+) -> Result<Option<StoredAuditEvent>, FleetRuntimeError> {
+    Ok(connection
+        .query_row(
+            "SELECT id, session_id, event_id, sequence, previous_event_sha256,
+                    payload, payload_sha256, acknowledged
+             FROM fleet_audit_events
+             WHERE session_id = ?1 AND event_id = ?2",
+            params![session_id, event_id],
+            decode_stored_audit_event,
+        )
+        .optional()?)
+}
+
+fn read_audit_event_by_id(
+    connection: &Connection,
+    id: u64,
+) -> Result<Option<StoredAuditEvent>, FleetRuntimeError> {
+    Ok(connection
+        .query_row(
+            "SELECT id, session_id, event_id, sequence, previous_event_sha256,
+                    payload, payload_sha256, acknowledged
+             FROM fleet_audit_events WHERE id = ?1",
+            [id],
+            decode_stored_audit_event,
+        )
+        .optional()?)
+}
+
+fn read_audit_event_by_sequence(
+    connection: &Connection,
+    session_id: &str,
+    sequence: u64,
+) -> Result<Option<StoredAuditEvent>, FleetRuntimeError> {
+    Ok(connection
+        .query_row(
+            "SELECT id, session_id, event_id, sequence, previous_event_sha256,
+                    payload, payload_sha256, acknowledged
+             FROM fleet_audit_events
+             WHERE session_id = ?1 AND sequence = ?2",
+            params![session_id, sequence],
+            decode_stored_audit_event,
+        )
+        .optional()?)
+}
+
+fn decode_stored_audit_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredAuditEvent> {
+    let id: u64 = row.get(0)?;
+    let session_id: String = row.get(1)?;
+    let event_id: String = row.get(2)?;
+    let sequence: u64 = row.get(3)?;
+    let previous: Option<Vec<u8>> = row.get(4)?;
+    let payload: Vec<u8> = row.get(5)?;
+    let digest: Vec<u8> = row.get(6)?;
+    let acknowledged: i64 = row.get(7)?;
+    let previous_event_sha256 = previous
+        .map(|value| value.try_into().map_err(|_| rusqlite::Error::InvalidQuery))
+        .transpose()?;
+    let payload_sha256 = digest
+        .try_into()
+        .map_err(|_| rusqlite::Error::InvalidQuery)?;
+    if id == 0
+        || sequence == 0
+        || sequence > kernaid_fleet_audit::MAX_SAFE_JSON_INTEGER
+        || (sequence == 1) != previous_event_sha256.is_none()
+        || payload.is_empty()
+        || payload.len() > MAX_AUDIT_DOCUMENT_BYTES
+        || !matches!(acknowledged, 0 | 1)
+    {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    Ok(StoredAuditEvent {
+        id,
+        session_id,
+        event_id,
+        sequence,
+        previous_event_sha256,
+        payload,
+        payload_sha256,
+        acknowledged: acknowledged == 1,
+    })
+}
+
+fn verify_stored_audit_event(
+    stored: &StoredAuditEvent,
+    tenant_id: &str,
+    device_id: &str,
+    public_key: &[u8; 32],
+) -> Result<VerifiedAuditEnvelope, FleetRuntimeError> {
+    let digest: [u8; SHA256_BYTES] = Sha256::digest(&stored.payload).into();
+    if digest != stored.payload_sha256 {
+        return Err(FleetRuntimeError::AuditStateCorrupt);
+    }
+    let verified =
+        SignedAuditEnvelope::import_offline(&stored.payload, tenant_id, device_id, public_key)
+            .map_err(|_| FleetRuntimeError::AuditStateCorrupt)?;
+    let envelope = verified.envelope();
+    let expected_previous = stored.previous_event_sha256.as_ref().map(hex_digest);
+    if envelope.session_id() != stored.session_id
+        || envelope.event_id() != stored.event_id
+        || envelope.sequence() != stored.sequence
+        || envelope.previous_event_sha256() != expected_previous.as_deref()
+        || verified.digest() != &stored.payload_sha256
+    {
+        return Err(FleetRuntimeError::AuditStateCorrupt);
+    }
+    Ok(verified)
+}
+
+fn read_audit_checkpoint(
+    connection: &Connection,
+    tenant_id: &str,
+    device_id: &str,
+    public_key: &[u8; 32],
+    session_id: &str,
+) -> Result<Option<StoredAuditCheckpoint>, FleetRuntimeError> {
+    let stored: Option<(u64, Vec<u8>, Vec<u8>)> = connection
+        .query_row(
+            "SELECT last_sequence, last_event_sha256, checkpoint
+             FROM fleet_audit_sessions WHERE session_id = ?1",
+            [session_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((last_sequence, last_digest, checkpoint_bytes)) = stored else {
+        return Ok(None);
+    };
+    let last_event_sha256: [u8; SHA256_BYTES] = last_digest
+        .try_into()
+        .map_err(|_| FleetRuntimeError::AuditStateCorrupt)?;
+    if last_sequence == 0
+        || last_sequence > kernaid_fleet_audit::MAX_SAFE_JSON_INTEGER
+        || checkpoint_bytes.is_empty()
+        || checkpoint_bytes.len() > MAX_AUDIT_CHECKPOINT_BYTES
+    {
+        return Err(FleetRuntimeError::AuditStateCorrupt);
+    }
+    let checkpoint = AuditChainCheckpoint::import_canonical(&checkpoint_bytes)
+        .map_err(|_| FleetRuntimeError::AuditStateCorrupt)?;
+    if checkpoint.tenant_id() != tenant_id
+        || checkpoint.device_id() != device_id
+        || checkpoint.session_id() != session_id
+        || checkpoint.last_sequence() != last_sequence
+        || checkpoint.last_event_sha256() != hex_digest(&last_event_sha256)
+    {
+        return Err(FleetRuntimeError::AuditStateCorrupt);
+    }
+    let tail = read_audit_event_by_sequence(connection, session_id, last_sequence)?
+        .ok_or(FleetRuntimeError::AuditStateCorrupt)?;
+    verify_stored_audit_event(&tail, tenant_id, device_id, public_key)?;
+    if tail.payload_sha256 != last_event_sha256 {
+        return Err(FleetRuntimeError::AuditStateCorrupt);
+    }
+    Ok(Some(StoredAuditCheckpoint {
+        checkpoint,
+        last_event_sha256,
+    }))
+}
+
+fn hex_digest(digest: &[u8; SHA256_BYTES]) -> String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 struct StoredEntitlementDocument {
     document: Vec<u8>,
     checkpoint: EntitlementCheckpoint,
@@ -814,6 +1456,7 @@ fn initialize_or_validate(
     let application_id: i64 =
         connection.query_row("PRAGMA application_id", [], |row| row.get(0))?;
     let user_version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let mut current_version = user_version;
     if application_id == 0 && user_version == 0 {
         let existing_objects: u64 = connection.query_row(
             "SELECT COUNT(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
@@ -858,9 +1501,11 @@ fn initialize_or_validate(
          );
          COMMIT;",
         )?;
+        current_version = 2;
     } else if application_id != APPLICATION_ID {
         return Err(FleetRuntimeError::UnsupportedFormat);
-    } else if user_version == 1 {
+    }
+    if current_version == 1 {
         connection.execute_batch(
             "BEGIN IMMEDIATE;
              CREATE TABLE fleet_entitlement_state (
@@ -880,7 +1525,39 @@ fn initialize_or_validate(
              PRAGMA user_version=2;
              COMMIT;",
         )?;
-    } else if user_version != SCHEMA_VERSION {
+        current_version = 2;
+    }
+    if current_version == 2 {
+        connection.execute_batch(
+            "BEGIN IMMEDIATE;
+             CREATE TABLE fleet_audit_sessions (
+               session_id TEXT PRIMARY KEY NOT NULL,
+               last_sequence INTEGER NOT NULL CHECK(last_sequence BETWEEN 1 AND 9007199254740991),
+               last_event_sha256 BLOB NOT NULL CHECK(length(last_event_sha256) = 32),
+               checkpoint BLOB NOT NULL CHECK(length(checkpoint) BETWEEN 1 AND 4096)
+             ) STRICT;
+             CREATE TABLE fleet_audit_events (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               session_id TEXT NOT NULL REFERENCES fleet_audit_sessions(session_id),
+               event_id TEXT NOT NULL,
+               sequence INTEGER NOT NULL CHECK(sequence BETWEEN 1 AND 9007199254740991),
+               previous_event_sha256 BLOB,
+               payload BLOB NOT NULL CHECK(length(payload) BETWEEN 1 AND 65536),
+               payload_sha256 BLOB NOT NULL UNIQUE CHECK(length(payload_sha256) = 32),
+               acknowledged INTEGER NOT NULL CHECK(acknowledged IN (0, 1)),
+               UNIQUE(session_id, event_id),
+               UNIQUE(session_id, sequence),
+               CHECK((sequence = 1 AND previous_event_sha256 IS NULL)
+                  OR (sequence > 1 AND length(previous_event_sha256) = 32))
+             ) STRICT;
+             CREATE INDEX fleet_audit_pending_idx
+               ON fleet_audit_events(acknowledged, id);
+             PRAGMA user_version=3;
+             COMMIT;",
+        )?;
+        current_version = 3;
+    }
+    if current_version != SCHEMA_VERSION {
         return Err(FleetRuntimeError::UnsupportedFormat);
     }
     let existing: Option<(i64, String, String)> = connection
@@ -932,10 +1609,20 @@ fn validate_schema_shape(connection: &Connection) -> Result<(), FleetRuntimeErro
         connection.query_row("SELECT COUNT(*) FROM fleet_revocation_state", [], |row| {
             row.get(0)
         })?;
+    let audit_session_rows: u64 =
+        connection.query_row("SELECT COUNT(*) FROM fleet_audit_sessions", [], |row| {
+            row.get(0)
+        })?;
+    let audit_event_rows: u64 =
+        connection.query_row("SELECT COUNT(*) FROM fleet_audit_events", [], |row| {
+            row.get(0)
+        })?;
     if identity_rows != 1
         || queue_rows > MAX_QUEUE_ITEMS
         || entitlement_rows > 1
         || revocation_rows > 1
+        || audit_session_rows > audit_event_rows
+        || audit_event_rows > MAX_AUDIT_EVENTS
     {
         return Err(FleetRuntimeError::UnsupportedFormat);
     }
@@ -1142,6 +1829,26 @@ mod tests {
         assert!(!capabilities.enterprise_providers);
     }
 
+    fn audit_draft(
+        session_id: &str,
+        event_id: &str,
+        kind: AuditKind,
+        outcome: AuditOutcome,
+    ) -> AuditEventDraft {
+        AuditEventDraft {
+            session_id: session_id.to_owned(),
+            event_id: event_id.to_owned(),
+            occurred_at: "2026-08-31T20:00:00Z".to_owned(),
+            kind,
+            outcome,
+            risk: Some(AuditRisk::R0),
+            action_id: None,
+            target_sha256: Some("ab".repeat(32)),
+            report_sha256: None,
+            evidence_sha256: Vec::new(),
+        }
+    }
+
     #[test]
     fn queue_survives_reopen_and_acknowledges_exact_payload() {
         let directory = tempdir().expect("temporary directory");
@@ -1230,7 +1937,9 @@ mod tests {
         let connection = Connection::open(&path).expect("open legacy fixture");
         connection
             .execute_batch(
-                "DROP TABLE fleet_entitlement_state;
+                "DROP TABLE fleet_audit_events;
+                 DROP TABLE fleet_audit_sessions;
+                 DROP TABLE fleet_entitlement_state;
                  DROP TABLE fleet_revocation_state;
                  PRAGMA user_version=1;",
             )
@@ -1464,6 +2173,203 @@ mod tests {
         assert_only_safety_capabilities(
             runtime.capabilities(kernaid_fleet_client::MAX_SAFE_JSON_INTEGER + 1),
         );
+    }
+
+    #[test]
+    fn v2_migrates_and_audit_chain_survives_restart() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("fleet.sqlite3");
+        let identity = DeviceIdentity::generate();
+        let mut v2 = FleetRuntime::open(&path, "tenant-alpha", &identity).expect("create runtime");
+        v2.queue_inventory(&identity, "2026-08-31T20:00:00Z", vec![asset("asset-a")])
+            .expect("retain inventory");
+        drop(v2);
+
+        let connection = Connection::open(&path).expect("open v2 fixture");
+        connection
+            .execute_batch(
+                "DROP TABLE fleet_audit_events;
+                 DROP TABLE fleet_audit_sessions;
+                 PRAGMA user_version=2;",
+            )
+            .expect("restore v2 schema shape");
+        drop(connection);
+
+        let mut runtime =
+            FleetRuntime::open(&path, "tenant-alpha", &identity).expect("migrate v2 runtime");
+        assert_eq!(runtime.pending_count().expect("inventory preserved"), 1);
+        let first = runtime
+            .enqueue_audit(
+                &identity,
+                audit_draft(
+                    "session-a",
+                    "event-1",
+                    AuditKind::DiagnosticStarted,
+                    AuditOutcome::Started,
+                ),
+            )
+            .expect("enqueue first audit event");
+        assert_eq!(first.sequence(), 1);
+        drop(runtime);
+
+        let mut reopened =
+            FleetRuntime::open(&path, "tenant-alpha", &identity).expect("reopen runtime");
+        let second = reopened
+            .enqueue_audit(
+                &identity,
+                audit_draft(
+                    "session-a",
+                    "event-2",
+                    AuditKind::DiagnosticCompleted,
+                    AuditOutcome::Succeeded,
+                ),
+            )
+            .expect("enqueue second audit event");
+        assert_eq!(second.sequence(), 2);
+        let pending = reopened.pending_audit(10).expect("load pending audit");
+        assert_eq!(pending.len(), 2);
+        let first_verified = SignedAuditEnvelope::import_offline(
+            pending[0].payload(),
+            "tenant-alpha",
+            &identity.device_id(),
+            &identity.public_key(),
+        )
+        .expect("verify first payload");
+        let second_verified = SignedAuditEnvelope::import_offline(
+            pending[1].payload(),
+            "tenant-alpha",
+            &identity.device_id(),
+            &identity.public_key(),
+        )
+        .expect("verify second payload");
+        assert_eq!(first_verified.envelope().sequence(), 1);
+        assert_eq!(second_verified.envelope().sequence(), 2);
+        assert_eq!(
+            second_verified.envelope().previous_event_sha256(),
+            Some(first_verified.event_sha256().as_str())
+        );
+    }
+
+    #[test]
+    fn audit_enqueue_replay_and_acknowledgement_are_idempotent() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("fleet.sqlite3");
+        let identity = DeviceIdentity::generate();
+        let other_identity = DeviceIdentity::generate();
+        let mut runtime =
+            FleetRuntime::open(&path, "tenant-alpha", &identity).expect("open runtime");
+        let draft = audit_draft(
+            "session-a",
+            "event-1",
+            AuditKind::DiagnosticStarted,
+            AuditOutcome::Started,
+        );
+        let first = runtime
+            .enqueue_audit(&identity, draft.clone())
+            .expect("enqueue event");
+        assert!(!first.idempotent());
+        assert!(first.pending());
+        let replay = runtime
+            .enqueue_audit(&identity, draft.clone())
+            .expect("replay exact event");
+        assert_eq!(replay.id(), first.id());
+        assert_eq!(replay.payload_sha256(), first.payload_sha256());
+        assert!(replay.idempotent() && replay.pending());
+
+        let mut conflict = draft.clone();
+        conflict.report_sha256 = Some("cd".repeat(32));
+        assert!(matches!(
+            runtime.enqueue_audit(&identity, conflict),
+            Err(FleetRuntimeError::AuditReplayConflict)
+        ));
+        assert!(matches!(
+            runtime.enqueue_audit(&other_identity, draft.clone()),
+            Err(FleetRuntimeError::IdentityMismatch)
+        ));
+        assert!(matches!(
+            runtime.acknowledge_audit(first.id(), &[0xff; SHA256_BYTES]),
+            Err(FleetRuntimeError::StaleAuditAcknowledgement)
+        ));
+        assert_eq!(runtime.pending_audit_count().expect("pending count"), 1);
+        assert_eq!(
+            runtime
+                .acknowledge_audit(first.id(), &first.payload_sha256())
+                .expect("ack event"),
+            AuditAcknowledgement::Acknowledged
+        );
+        assert_eq!(
+            runtime
+                .acknowledge_audit(first.id(), &first.payload_sha256())
+                .expect("repeat ack"),
+            AuditAcknowledgement::AlreadyAcknowledged
+        );
+        assert_eq!(runtime.pending_audit_count().expect("empty outbox"), 0);
+        let acknowledged_replay = runtime
+            .enqueue_audit(&identity, draft)
+            .expect("replay acknowledged event");
+        assert!(acknowledged_replay.idempotent());
+        assert!(!acknowledged_replay.pending());
+        assert_eq!(runtime.pending_audit_count().expect("still empty"), 0);
+    }
+
+    #[test]
+    fn corrupted_audit_payload_fails_closed_without_advancing_chain() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("fleet.sqlite3");
+        let identity = DeviceIdentity::generate();
+        let mut runtime =
+            FleetRuntime::open(&path, "tenant-alpha", &identity).expect("open runtime");
+        runtime
+            .enqueue_audit(
+                &identity,
+                audit_draft(
+                    "session-a",
+                    "event-1",
+                    AuditKind::DiagnosticStarted,
+                    AuditOutcome::Started,
+                ),
+            )
+            .expect("enqueue event");
+        drop(runtime);
+
+        let connection = Connection::open(&path).expect("open corruption fixture");
+        connection
+            .execute(
+                "UPDATE fleet_audit_events SET payload = ?1 WHERE event_id = 'event-1'",
+                [b"{}".as_slice()],
+            )
+            .expect("corrupt payload");
+        drop(connection);
+
+        let mut reopened =
+            FleetRuntime::open(&path, "tenant-alpha", &identity).expect("reopen runtime");
+        assert!(matches!(
+            reopened.pending_audit(10),
+            Err(FleetRuntimeError::AuditStateCorrupt)
+        ));
+        assert!(matches!(
+            reopened.enqueue_audit(
+                &identity,
+                audit_draft(
+                    "session-a",
+                    "event-2",
+                    AuditKind::DiagnosticCompleted,
+                    AuditOutcome::Succeeded,
+                ),
+            ),
+            Err(FleetRuntimeError::AuditStateCorrupt)
+        ));
+        let state: (u64, u64) = reopened
+            .connection
+            .query_row(
+                "SELECT
+                   (SELECT last_sequence FROM fleet_audit_sessions WHERE session_id = 'session-a'),
+                   (SELECT COUNT(*) FROM fleet_audit_events)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read unchanged chain state");
+        assert_eq!(state, (1, 1));
     }
 
     #[cfg(unix)]

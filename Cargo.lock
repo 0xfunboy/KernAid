@@ -2388,6 +2388,7 @@ dependencies = [
  "ed25519-dalek",
  "kernaid-device-identity",
  "kernaid-entitlements",
+ "kernaid-fleet-audit",
  "kernaid-fleet-client",
  "rand_core 0.6.4",
  "rusqlite",

@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 kernaid-device-identity = { path = "../device-identity" }
 kernaid-entitlements = { path = "../entitlements" }
+kernaid-fleet-audit = { path = "../fleet-audit" }
 kernaid-fleet-client = { path = "../fleet-client" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 sha2 = "0.10"
