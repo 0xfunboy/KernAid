@@ -43,6 +43,16 @@ pub const EXT4_REPAIR_EXECUTION_RESOURCE_ID: &str = "rescue:selected-linux-files
 pub const EXT4_REPAIR_WRITE_LEASE_CAPABILITY: &str = "ext4-block-rw-v1";
 pub const EXT4_REPAIR_ROLLBACK_ACTION_ID: &str = "linux.ext4.fsck-undo.same-boot.v1";
 pub const EXT4_REPAIR_ROLLBACK_WRITE_LEASE_CAPABILITY: &str = "ext4-block-rollback-rw-v1";
+/// Closed resolver-link repair. Public clients select this logical resource,
+/// never a filesystem path or link target.
+pub const RESOLVER_LINK_REPAIR_EXECUTION_ACTION_ID: &str = "linux.network.restore-resolver-link.v1";
+pub const RESOLVER_LINK_REPAIR_EXECUTION_RESOURCE_ID: &str =
+    "rescue:selected-linux-root:etc/resolver-link";
+pub const RESOLVER_LINK_REPAIR_WRITE_LEASE_CAPABILITY: &str = "resolver-link-direct-leaf-rw-v1";
+pub const RESOLVER_LINK_REPAIR_ROLLBACK_ACTION_ID: &str =
+    "linux.network.restore-resolver-link-state.v1";
+pub const RESOLVER_LINK_REPAIR_ROLLBACK_WRITE_LEASE_CAPABILITY: &str =
+    "resolver-link-rollback-direct-leaf-rw-v1";
 
 const MAX_OPAQUE_ID_BYTES: usize = 128;
 const RESERVATION_BINDING_DOMAIN: &[u8] = b"KERNAID-REPAIR-RESERVATION-V1\0";
@@ -55,6 +65,7 @@ const ROLLBACK_WRITE_LEASE_BINDING_DOMAIN: &[u8] = b"KERNAID-REPAIR-ROLLBACK-WRI
 const LOCK_ID_DOMAIN: &[u8] = b"kernaid:rescue-fstab:target-lock:v2\0";
 const CRYPTTAB_LOCK_ID_DOMAIN: &[u8] = b"kernaid:rescue-crypttab:target-lock:v1\0";
 const EXT4_LOCK_ID_DOMAIN: &[u8] = b"kernaid:rescue-ext4-fsck:target-lock:v1\0";
+const RESOLVER_LINK_LOCK_ID_DOMAIN: &[u8] = b"kernaid:rescue-resolver-link:target-lock:v1\0";
 const MAX_PERMISSION_MODE: u32 = 0o7777;
 const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
 
@@ -65,6 +76,7 @@ pub enum RepairResourceV1 {
     Fstab,
     Crypttab,
     Ext4Filesystem,
+    ResolverLink,
 }
 
 impl RepairResourceV1 {
@@ -73,6 +85,7 @@ impl RepairResourceV1 {
             Self::Fstab => REPAIR_EXECUTION_ACTION_ID,
             Self::Crypttab => CRYPTTAB_REPAIR_EXECUTION_ACTION_ID,
             Self::Ext4Filesystem => EXT4_REPAIR_EXECUTION_ACTION_ID,
+            Self::ResolverLink => RESOLVER_LINK_REPAIR_EXECUTION_ACTION_ID,
         }
     }
 
@@ -81,6 +94,7 @@ impl RepairResourceV1 {
             Self::Fstab => REPAIR_EXECUTION_RESOURCE_ID,
             Self::Crypttab => CRYPTTAB_REPAIR_EXECUTION_RESOURCE_ID,
             Self::Ext4Filesystem => EXT4_REPAIR_EXECUTION_RESOURCE_ID,
+            Self::ResolverLink => RESOLVER_LINK_REPAIR_EXECUTION_RESOURCE_ID,
         }
     }
 
@@ -89,6 +103,7 @@ impl RepairResourceV1 {
             Self::Fstab => REPAIR_WRITE_LEASE_CAPABILITY,
             Self::Crypttab => CRYPTTAB_REPAIR_WRITE_LEASE_CAPABILITY,
             Self::Ext4Filesystem => EXT4_REPAIR_WRITE_LEASE_CAPABILITY,
+            Self::ResolverLink => RESOLVER_LINK_REPAIR_WRITE_LEASE_CAPABILITY,
         }
     }
 
@@ -97,6 +112,7 @@ impl RepairResourceV1 {
             Self::Fstab => REPAIR_ROLLBACK_ACTION_ID,
             Self::Crypttab => CRYPTTAB_REPAIR_ROLLBACK_ACTION_ID,
             Self::Ext4Filesystem => EXT4_REPAIR_ROLLBACK_ACTION_ID,
+            Self::ResolverLink => RESOLVER_LINK_REPAIR_ROLLBACK_ACTION_ID,
         }
     }
 
@@ -105,6 +121,7 @@ impl RepairResourceV1 {
             Self::Fstab => REPAIR_ROLLBACK_WRITE_LEASE_CAPABILITY,
             Self::Crypttab => CRYPTTAB_REPAIR_ROLLBACK_WRITE_LEASE_CAPABILITY,
             Self::Ext4Filesystem => EXT4_REPAIR_ROLLBACK_WRITE_LEASE_CAPABILITY,
+            Self::ResolverLink => RESOLVER_LINK_REPAIR_ROLLBACK_WRITE_LEASE_CAPABILITY,
         }
     }
 
@@ -113,6 +130,7 @@ impl RepairResourceV1 {
             REPAIR_EXECUTION_RESOURCE_ID => Ok(Self::Fstab),
             CRYPTTAB_REPAIR_EXECUTION_RESOURCE_ID => Ok(Self::Crypttab),
             EXT4_REPAIR_EXECUTION_RESOURCE_ID => Ok(Self::Ext4Filesystem),
+            RESOLVER_LINK_REPAIR_EXECUTION_RESOURCE_ID => Ok(Self::ResolverLink),
             _ => Err(ProtocolViolation::InvalidPayload),
         }
     }
@@ -132,6 +150,10 @@ impl RepairResourceV1 {
             // This metadata binds the small normalized evidence object stored
             // in the Repair Vault, not target filesystem metadata.
             Self::Ext4Filesystem => metadata.mode == 0o600,
+            // Metadata describes the canonical backup-state envelope stored
+            // in the Vault. The target object itself is always a symlink or
+            // exact absence and has no caller-controlled metadata.
+            Self::ResolverLink => metadata.mode == 0o600,
         }
     }
 }
@@ -476,6 +498,7 @@ impl RepairExecutionIntentV1 {
             REPAIR_EXECUTION_ACTION_ID => RepairResourceV1::Fstab,
             CRYPTTAB_REPAIR_EXECUTION_ACTION_ID => RepairResourceV1::Crypttab,
             EXT4_REPAIR_EXECUTION_ACTION_ID => RepairResourceV1::Ext4Filesystem,
+            RESOLVER_LINK_REPAIR_EXECUTION_ACTION_ID => RepairResourceV1::ResolverLink,
             _ => return Err(ProtocolViolation::InvalidPayload),
         };
         if !valid_prefixed_id(&self.session_id, "S-")
@@ -540,6 +563,7 @@ pub fn canonical_repair_lock_identity_for_resource(
         RepairResourceV1::Fstab => LOCK_ID_DOMAIN,
         RepairResourceV1::Crypttab => CRYPTTAB_LOCK_ID_DOMAIN,
         RepairResourceV1::Ext4Filesystem => EXT4_LOCK_ID_DOMAIN,
+        RepairResourceV1::ResolverLink => RESOLVER_LINK_LOCK_ID_DOMAIN,
     });
     for value in [target_recovery_fingerprint, resource.resource_id()] {
         hash_field(&mut hasher, value.as_bytes());
@@ -2531,6 +2555,45 @@ mod tests {
         assert_eq!(
             rollback_lease.capability(),
             CRYPTTAB_REPAIR_ROLLBACK_WRITE_LEASE_CAPABILITY
+        );
+    }
+
+    #[test]
+    fn resolver_link_intent_is_resource_and_lock_domain_distinct() {
+        let recovery = format!("recovery:{}", "8".repeat(64));
+        let metadata = RepairFileMetadataV1::new(0o600, 0, 0).expect("closed state metadata");
+        let intent = RepairExecutionIntentV1::new_for_resource(
+            RepairResourceV1::ResolverLink,
+            "S-session-1",
+            1,
+            "target-1",
+            format!("scan:{}", "1".repeat(64)),
+            hash('2'),
+            hash('9'),
+            recovery.clone(),
+            canonical_repair_lock_identity_for_resource(&recovery, RepairResourceV1::ResolverLink),
+            hash('4'),
+            hash('b'),
+            hash('c'),
+            hash('d'),
+            metadata,
+        )
+        .expect("resolver-link intent");
+        assert_eq!(intent.action_id(), RESOLVER_LINK_REPAIR_EXECUTION_ACTION_ID);
+        assert_eq!(
+            RepairResourceV1::from_execution(
+                intent.action_id(),
+                RESOLVER_LINK_REPAIR_EXECUTION_RESOURCE_ID,
+            ),
+            Ok(RepairResourceV1::ResolverLink),
+        );
+        assert_ne!(
+            intent.lock_identity(),
+            canonical_repair_lock_identity(&recovery),
+        );
+        assert_ne!(
+            RepairResourceV1::ResolverLink.write_lease_capability(),
+            RepairResourceV1::Crypttab.write_lease_capability(),
         );
     }
 

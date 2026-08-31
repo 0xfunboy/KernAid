@@ -44,7 +44,7 @@ jobs:
             --features experimental-repair-store \
             crypttab_intent_lease_and_metadata_are_resource_distinct
           cargo test --locked -p kernaid-broker \
-            --features rescue-fstab-production-candidate,rescue-crypttab-production-candidate,rescue-ext4-fsck-production-candidate \
+            --features rescue-fstab-production-candidate,rescue-crypttab-production-candidate,rescue-ext4-fsck-production-candidate,rescue-resolver-link-production-candidate \
             crypttab_rollback_is_resource_bound_and_uses_a_fresh_typed_approval
 
       - name: Harden OVMF firmware ancestry
@@ -135,7 +135,7 @@ jobs:
             --features custom-protocol \
             --bin kernaid-rescue-desk-shell
           cargo build --locked --release -p kernaid-broker \
-            --features rescue-fstab-production-candidate,rescue-crypttab-production-candidate,rescue-ext4-fsck-production-candidate \
+            --features rescue-fstab-production-candidate,rescue-crypttab-production-candidate,rescue-ext4-fsck-production-candidate,rescue-resolver-link-production-candidate \
             --bin kernaid-rescue-repaird
           cargo build --locked --release -p kernaid-linux-blockfd \
             --bin kernaid-blockfd-probe

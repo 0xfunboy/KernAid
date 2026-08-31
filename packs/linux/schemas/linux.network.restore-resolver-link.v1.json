@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kernaid.dev/schemas/linux.network.restore-resolver-link.v1.json",
+  "title": "KernAid Rescue resolver-link repair candidate input",
+  "type": "object",
+  "additionalProperties": false,
+  "x-kernaid-action-id": "linux.network.restore-resolver-link.v1",
+  "x-kernaid-production-candidate-only": true,
+  "x-kernaid-enabled-by-default": false,
+  "required": [
+    "resourceId",
+    "findingId",
+    "findingVersion",
+    "resolver",
+    "expectedBeforeSha256",
+    "evidenceSha256",
+    "expectedAfterSha256"
+  ],
+  "properties": {
+    "resourceId": {
+      "const": "rescue:selected-linux-root:etc/resolver-link"
+    },
+    "findingId": {
+      "const": "KA-LNX-NET-001"
+    },
+    "findingVersion": {
+      "const": 1
+    },
+    "resolver": {
+      "enum": ["systemd-resolved", "network-manager"]
+    },
+    "expectedBeforeSha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "evidenceSha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "expectedAfterSha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    }
+  }
+}

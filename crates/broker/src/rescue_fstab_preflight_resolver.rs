@@ -26,7 +26,8 @@ use kernaid_linux_pack::{
 use kernaid_protocol::rescue_crypttab_repair::RescueCrypttabPrepareRequest;
 #[cfg(any(
     feature = "rescue-crypttab-production-candidate",
-    feature = "rescue-ext4-fsck-production-candidate"
+    feature = "rescue-ext4-fsck-production-candidate",
+    feature = "rescue-resolver-link-production-candidate"
 ))]
 use kernaid_protocol::rescue_repair_vault::RepairFileMetadataV1;
 use kernaid_protocol::{
@@ -637,7 +638,11 @@ fn lock_identity_from_recovery_fingerprint(recovery_fingerprint: &str) -> String
 fn repair_resource_for_intent(
     intent: &RepairExecutionIntentV1,
 ) -> Result<RepairResourceV1, RescueFstabCapabilityResolutionError> {
-    for resource in [RepairResourceV1::Fstab, RepairResourceV1::Crypttab] {
+    for resource in [
+        RepairResourceV1::Fstab,
+        RepairResourceV1::Crypttab,
+        RepairResourceV1::ResolverLink,
+    ] {
         if intent.action_id() == resource.action_id() {
             return Ok(resource);
         }

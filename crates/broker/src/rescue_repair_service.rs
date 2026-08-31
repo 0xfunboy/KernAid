@@ -11,6 +11,12 @@ use crate::rescue_ext4_fsck_candidate::{
     RESOURCE_ID as EXT4_RESOURCE_ID, TYPED_CONFIRMATION as EXT4_TYPED_CONFIRMATION,
 };
 use crate::rescue_repair_service_engine::RescueFstabRollbackBackend;
+#[cfg(feature = "rescue-resolver-link-production-candidate")]
+use crate::rescue_resolver_link_candidate::{
+    ACTION_ID as RESOLVER_LINK_ACTION_ID, PREPARED_KIND as RESOLVER_LINK_PREPARED_KIND,
+    RESOURCE_ID as RESOLVER_LINK_RESOURCE_ID,
+    TYPED_CONFIRMATION as RESOLVER_LINK_TYPED_CONFIRMATION,
+};
 use kernaid_core::RESCUE_FSTAB_TYPED_CONFIRMATION;
 #[cfg(feature = "rescue-crypttab-production-candidate")]
 use kernaid_core::{
@@ -58,6 +64,8 @@ pub enum RepairCandidateKind {
     Crypttab,
     #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
     Ext4Fsck,
+    #[cfg(feature = "rescue-resolver-link-production-candidate")]
+    ResolverLink,
 }
 
 impl RepairCandidateKind {
@@ -68,6 +76,8 @@ impl RepairCandidateKind {
             Self::Crypttab => CRYPTTAB_RESOURCE_ID,
             #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
             Self::Ext4Fsck => EXT4_RESOURCE_ID,
+            #[cfg(feature = "rescue-resolver-link-production-candidate")]
+            Self::ResolverLink => RESOLVER_LINK_RESOURCE_ID,
         }
     }
 
@@ -78,6 +88,8 @@ impl RepairCandidateKind {
             Self::Crypttab => RepairResourceV1::Crypttab,
             #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
             Self::Ext4Fsck => RepairResourceV1::Ext4Filesystem,
+            #[cfg(feature = "rescue-resolver-link-production-candidate")]
+            Self::ResolverLink => RepairResourceV1::ResolverLink,
         }
     }
 
@@ -88,6 +100,8 @@ impl RepairCandidateKind {
             Self::Crypttab => "crypttab-rollback-prepared",
             #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
             Self::Ext4Fsck => "ext4-fsck-rollback-unavailable",
+            #[cfg(feature = "rescue-resolver-link-production-candidate")]
+            Self::ResolverLink => "resolver-link-rollback-unavailable",
         }
     }
 
@@ -102,6 +116,8 @@ impl RepairCandidateKind {
             Self::Crypttab => RESCUE_CRYPTTAB_ROLLBACK_TYPED_CONFIRMATION,
             #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
             Self::Ext4Fsck => "EXT4 SAME-BOOT ROLLBACK IS NOT EXPOSED",
+            #[cfg(feature = "rescue-resolver-link-production-candidate")]
+            Self::ResolverLink => "RESOLVER LINK ROLLBACK IS AUTOMATIC ONLY",
         }
     }
 
@@ -112,6 +128,8 @@ impl RepairCandidateKind {
             CRYPTTAB_RESOURCE_ID => Some(Self::Crypttab),
             #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
             EXT4_RESOURCE_ID => Some(Self::Ext4Fsck),
+            #[cfg(feature = "rescue-resolver-link-production-candidate")]
+            RESOLVER_LINK_RESOURCE_ID => Some(Self::ResolverLink),
             _ => None,
         }
     }
@@ -128,6 +146,12 @@ fn repair_contract(resource_id: &str) -> Option<(&'static str, &'static str, &'s
         )),
         #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
         EXT4_RESOURCE_ID => Some((EXT4_PREPARED_KIND, EXT4_ACTION_ID, EXT4_TYPED_CONFIRMATION)),
+        #[cfg(feature = "rescue-resolver-link-production-candidate")]
+        RESOLVER_LINK_RESOURCE_ID => Some((
+            RESOLVER_LINK_PREPARED_KIND,
+            RESOLVER_LINK_ACTION_ID,
+            RESOLVER_LINK_TYPED_CONFIRMATION,
+        )),
         _ => None,
     }
 }
@@ -263,6 +287,15 @@ pub enum RepairServiceRequest {
         request_id: String,
         target: RepairTargetSelector,
     },
+    #[serde(rename = "repair.resolver-link.prepare")]
+    #[cfg(feature = "rescue-resolver-link-production-candidate")]
+    ResolverLinkPrepare {
+        #[serde(rename = "apiVersion")]
+        api_version: String,
+        #[serde(rename = "requestId")]
+        request_id: String,
+        target: RepairTargetSelector,
+    },
     #[serde(rename = "repair.fstab.approve")]
     Approve {
         #[serde(rename = "apiVersion")]
@@ -328,6 +361,28 @@ pub enum RepairServiceRequest {
         #[serde(rename = "typedConfirmation")]
         typed_confirmation: String,
     },
+    #[serde(rename = "repair.resolver-link.approve")]
+    #[cfg(feature = "rescue-resolver-link-production-candidate")]
+    ResolverLinkApprove {
+        #[serde(rename = "apiVersion")]
+        api_version: String,
+        #[serde(rename = "requestId")]
+        request_id: String,
+        #[serde(rename = "preparedId")]
+        prepared_id: String,
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        #[serde(rename = "planId")]
+        plan_id: String,
+        #[serde(rename = "planHash")]
+        plan_hash: String,
+        #[serde(rename = "approvalId")]
+        approval_id: String,
+        #[serde(rename = "approvalSequence")]
+        approval_sequence: u64,
+        #[serde(rename = "typedConfirmation")]
+        typed_confirmation: String,
+    },
     #[serde(rename = "repair.fstab.cancel")]
     Cancel {
         #[serde(rename = "apiVersion")]
@@ -354,6 +409,18 @@ pub enum RepairServiceRequest {
     #[serde(rename = "repair.ext4.cancel")]
     #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
     Ext4Cancel {
+        #[serde(rename = "apiVersion")]
+        api_version: String,
+        #[serde(rename = "requestId")]
+        request_id: String,
+        #[serde(rename = "preparedId")]
+        prepared_id: String,
+        #[serde(rename = "planHash")]
+        plan_hash: String,
+    },
+    #[serde(rename = "repair.resolver-link.cancel")]
+    #[cfg(feature = "rescue-resolver-link-production-candidate")]
+    ResolverLinkCancel {
         #[serde(rename = "apiVersion")]
         api_version: String,
         #[serde(rename = "requestId")]
@@ -484,16 +551,22 @@ impl RepairServiceRequest {
             Self::CrypttabPrepare { .. } => "repair.crypttab.prepare",
             #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
             Self::Ext4Prepare { .. } => "repair.ext4.prepare",
+            #[cfg(feature = "rescue-resolver-link-production-candidate")]
+            Self::ResolverLinkPrepare { .. } => "repair.resolver-link.prepare",
             Self::Approve { .. } => "repair.fstab.approve",
             #[cfg(feature = "rescue-crypttab-production-candidate")]
             Self::CrypttabApprove { .. } => "repair.crypttab.approve",
             #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
             Self::Ext4Approve { .. } => "repair.ext4.approve",
+            #[cfg(feature = "rescue-resolver-link-production-candidate")]
+            Self::ResolverLinkApprove { .. } => "repair.resolver-link.approve",
             Self::Cancel { .. } => "repair.fstab.cancel",
             #[cfg(feature = "rescue-crypttab-production-candidate")]
             Self::CrypttabCancel { .. } => "repair.crypttab.cancel",
             #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
             Self::Ext4Cancel { .. } => "repair.ext4.cancel",
+            #[cfg(feature = "rescue-resolver-link-production-candidate")]
+            Self::ResolverLinkCancel { .. } => "repair.resolver-link.cancel",
             Self::RollbackStatus { .. } => "repair.fstab.rollback.status",
             Self::RollbackPrepare { .. } => "repair.fstab.rollback.prepare",
             Self::RollbackApprove { .. } => "repair.fstab.rollback.approve",
@@ -531,6 +604,10 @@ impl RepairServiceRequest {
             Self::Ext4Prepare { api_version, .. }
             | Self::Ext4Approve { api_version, .. }
             | Self::Ext4Cancel { api_version, .. } => api_version,
+            #[cfg(feature = "rescue-resolver-link-production-candidate")]
+            Self::ResolverLinkPrepare { api_version, .. }
+            | Self::ResolverLinkApprove { api_version, .. }
+            | Self::ResolverLinkCancel { api_version, .. } => api_version,
         }
     }
 
@@ -556,6 +633,10 @@ impl RepairServiceRequest {
             Self::Ext4Prepare { request_id, .. }
             | Self::Ext4Approve { request_id, .. }
             | Self::Ext4Cancel { request_id, .. } => request_id,
+            #[cfg(feature = "rescue-resolver-link-production-candidate")]
+            Self::ResolverLinkPrepare { request_id, .. }
+            | Self::ResolverLinkApprove { request_id, .. }
+            | Self::ResolverLinkCancel { request_id, .. } => request_id,
         }
     }
 
@@ -573,6 +654,10 @@ impl RepairServiceRequest {
             Self::Ext4Prepare { .. } | Self::Ext4Approve { .. } | Self::Ext4Cancel { .. } => {
                 REPAIR_SERVICE_API_VERSION
             }
+            #[cfg(feature = "rescue-resolver-link-production-candidate")]
+            Self::ResolverLinkPrepare { .. }
+            | Self::ResolverLinkApprove { .. }
+            | Self::ResolverLinkCancel { .. } => REPAIR_SERVICE_API_VERSION,
             Self::RollbackStatus { .. }
             | Self::RollbackPrepare { .. }
             | Self::RollbackApprove { .. }
@@ -593,6 +678,8 @@ impl RepairServiceRequest {
             Self::CrypttabPrepare { target, .. } => target.validate(),
             #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
             Self::Ext4Prepare { target, .. } => target.validate(),
+            #[cfg(feature = "rescue-resolver-link-production-candidate")]
+            Self::ResolverLinkPrepare { target, .. } => target.validate(),
             Self::Approve {
                 prepared_id,
                 session_id,
@@ -661,6 +748,29 @@ impl RepairServiceRequest {
                 }
                 Ok(())
             }
+            #[cfg(feature = "rescue-resolver-link-production-candidate")]
+            Self::ResolverLinkApprove {
+                prepared_id,
+                session_id,
+                plan_id,
+                plan_hash,
+                approval_id,
+                approval_sequence,
+                typed_confirmation,
+                ..
+            } => {
+                if !valid_fixed_id(prepared_id, "Q-")
+                    || !valid_fixed_id(session_id, "S-")
+                    || !valid_fixed_id(plan_id, "P-")
+                    || !valid_prefixed_hash(plan_hash, "sha256:")
+                    || !valid_fixed_id(approval_id, "A-")
+                    || *approval_sequence != 1
+                    || typed_confirmation != RESOLVER_LINK_TYPED_CONFIRMATION
+                {
+                    return Err(RepairServiceErrorToken::InvalidRequest);
+                }
+                Ok(())
+            }
             Self::Cancel {
                 prepared_id,
                 plan_hash,
@@ -686,6 +796,18 @@ impl RepairServiceRequest {
             }
             #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
             Self::Ext4Cancel {
+                prepared_id,
+                plan_hash,
+                ..
+            } => {
+                if !valid_fixed_id(prepared_id, "Q-") || !valid_prefixed_hash(plan_hash, "sha256:")
+                {
+                    return Err(RepairServiceErrorToken::InvalidRequest);
+                }
+                Ok(())
+            }
+            #[cfg(feature = "rescue-resolver-link-production-candidate")]
+            Self::ResolverLinkCancel {
                 prepared_id,
                 plan_hash,
                 ..
@@ -1675,6 +1797,10 @@ impl<Engine: RepairPreparationEngine + RescueFstabRollbackBackend> RescueRepairS
             RepairServiceRequest::Ext4Prepare {
                 request_id, target, ..
             } => self.begin_prepare(request_id, target, RepairCandidateKind::Ext4Fsck),
+            #[cfg(feature = "rescue-resolver-link-production-candidate")]
+            RepairServiceRequest::ResolverLinkPrepare {
+                request_id, target, ..
+            } => self.begin_prepare(request_id, target, RepairCandidateKind::ResolverLink),
             RepairServiceRequest::Approve {
                 request_id,
                 prepared_id,
@@ -1746,6 +1872,30 @@ impl<Engine: RepairPreparationEngine + RescueFstabRollbackBackend> RescueRepairS
                 },
                 RepairCandidateKind::Ext4Fsck,
             ),
+            #[cfg(feature = "rescue-resolver-link-production-candidate")]
+            RepairServiceRequest::ResolverLinkApprove {
+                request_id,
+                prepared_id,
+                session_id,
+                plan_id,
+                plan_hash,
+                approval_id,
+                approval_sequence,
+                typed_confirmation,
+                ..
+            } => self.begin_approval(
+                BoundRepairApproval {
+                    request_id,
+                    prepared_id,
+                    session_id,
+                    plan_id,
+                    plan_hash,
+                    approval_id,
+                    approval_sequence,
+                    typed_confirmation,
+                },
+                RepairCandidateKind::ResolverLink,
+            ),
             RepairServiceRequest::Cancel {
                 request_id,
                 prepared_id,
@@ -1780,6 +1930,18 @@ impl<Engine: RepairPreparationEngine + RescueFstabRollbackBackend> RescueRepairS
                 &prepared_id,
                 &plan_hash,
                 RepairCandidateKind::Ext4Fsck,
+            ),
+            #[cfg(feature = "rescue-resolver-link-production-candidate")]
+            RepairServiceRequest::ResolverLinkCancel {
+                request_id,
+                prepared_id,
+                plan_hash,
+                ..
+            } => self.begin_cancel(
+                &request_id,
+                &prepared_id,
+                &plan_hash,
+                RepairCandidateKind::ResolverLink,
             ),
             RepairServiceRequest::RollbackPrepare {
                 request_id, source, ..
@@ -2763,6 +2925,8 @@ fn rollback_descriptor_matches(
         RepairCandidateKind::Crypttab => kernaid_core::RescueRepairRollbackResource::Crypttab,
         #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
         RepairCandidateKind::Ext4Fsck => return false,
+        #[cfg(feature = "rescue-resolver-link-production-candidate")]
+        RepairCandidateKind::ResolverLink => return false,
     };
     let canonical_hash = kernaid_core::canonical_rescue_repair_rollback_plan(
         resource,
@@ -3004,6 +3168,9 @@ impl CorrelationProbe {
                         | "repair.ext4.prepare"
                         | "repair.ext4.approve"
                         | "repair.ext4.cancel"
+                        | "repair.resolver-link.prepare"
+                        | "repair.resolver-link.approve"
+                        | "repair.resolver-link.cancel"
                 )
             })
             .unwrap_or("repair.status")
@@ -3142,6 +3309,12 @@ mod tests {
                 }
                 #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
                 RepairCandidateKind::Ext4Fsck => {
+                    return Err(RepairEngineFailure::RollbackUnavailable(
+                        RepairExecutionFailureStage::Authority,
+                    ));
+                }
+                #[cfg(feature = "rescue-resolver-link-production-candidate")]
+                RepairCandidateKind::ResolverLink => {
                     return Err(RepairEngineFailure::RollbackUnavailable(
                         RepairExecutionFailureStage::Authority,
                     ));

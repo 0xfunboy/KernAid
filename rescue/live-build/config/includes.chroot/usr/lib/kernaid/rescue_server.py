@@ -99,6 +99,9 @@ REPAIR_OPERATIONS = {
     "repair.ext4.prepare",
     "repair.ext4.approve",
     "repair.ext4.cancel",
+    "repair.resolver-link.prepare",
+    "repair.resolver-link.approve",
+    "repair.resolver-link.cancel",
 }
 ROLLBACK_OPERATIONS = {
     "repair.fstab.rollback.status",
@@ -1136,6 +1139,7 @@ def _validate_repair_request(value: dict[str, object]) -> None:
         "repair.fstab.prepare",
         "repair.crypttab.prepare",
         "repair.ext4.prepare",
+        "repair.resolver-link.prepare",
     }:
         if set(value) != {"apiVersion", "requestId", "operation", "target"}:
             raise RepairRelayError("invalid-request", 400)
@@ -1160,6 +1164,7 @@ def _validate_repair_request(value: dict[str, object]) -> None:
         "repair.fstab.cancel",
         "repair.crypttab.cancel",
         "repair.ext4.cancel",
+        "repair.resolver-link.cancel",
     }:
         if (
             set(value)
@@ -1199,10 +1204,16 @@ def _validate_repair_request(value: dict[str, object]) -> None:
             if operation == "repair.crypttab.approve"
             else "REPAIR EXT4 OFFLINE"
             if operation == "repair.ext4.approve"
+            else "RESTORE RESOLVER LINK"
+            if operation == "repair.resolver-link.approve"
             else "DISABILITA VOCE FSTAB"
         )
         or (
-            operation in {"repair.crypttab.approve", "repair.ext4.approve"}
+            operation in {
+                "repair.crypttab.approve",
+                "repair.ext4.approve",
+                "repair.resolver-link.approve",
+            }
             and int(value["approvalSequence"]) != 1
         )
     ):
@@ -1232,9 +1243,15 @@ def _validate_repair_prepared_detail(value: object) -> bool:
     backup = value.get("backup")
     crypttab = value.get("kind") == "crypttab-prepared"
     ext4 = value.get("kind") == "ext4-fsck-prepared"
+    resolver_link = value.get("kind") == "resolver-link-prepared"
     return (
         value.get("kind")
-        in {"fstab-prepared", "crypttab-prepared", "ext4-fsck-prepared"}
+        in {
+            "fstab-prepared",
+            "crypttab-prepared",
+            "ext4-fsck-prepared",
+            "resolver-link-prepared",
+        }
         and _repair_id(value.get("preparedId"), "Q")
         and _repair_id(value.get("sessionId"), "S")
         and _repair_id(value.get("planId"), "P")
@@ -1256,6 +1273,8 @@ def _validate_repair_prepared_detail(value: object) -> bool:
             if crypttab
             else "rescue:selected-linux-filesystem:ext4"
             if ext4
+            else "rescue:selected-linux-root:etc/resolver-link"
+            if resolver_link
             else "rescue:selected-linux-root:etc/fstab"
         )
         and isinstance(value.get("backupLocator"), str)
@@ -1266,6 +1285,8 @@ def _validate_repair_prepared_detail(value: object) -> bool:
             if crypttab
             else "linux.ext4.fsck-preen-with-undo.v1"
             if ext4
+            else "linux.network.restore-resolver-link.v1"
+            if resolver_link
             else "linux.fstab.disable-missing-uuid.v1"
         )
         and value.get("risk") == ("R3" if ext4 else "R2")
@@ -1282,9 +1303,14 @@ def _validate_repair_prepared_detail(value: object) -> bool:
             if crypttab
             else "REPAIR EXT4 OFFLINE"
             if ext4
+            else "RESTORE RESOLVER LINK"
+            if resolver_link
             else "DISABILITA VOCE FSTAB"
         )
-        and (not (crypttab or ext4) or value.get("nextApprovalSequence") == 1)
+        and (
+            not (crypttab or ext4 or resolver_link)
+            or value.get("nextApprovalSequence") == 1
+        )
     )
 
 
@@ -1469,6 +1495,12 @@ def _validate_repair_response(
                 )
             elif isinstance(operation, str) and operation.startswith("repair.ext4."):
                 valid_detail = not rollback_api and detail.get("kind") == "ext4-fsck-prepared"
+            elif isinstance(operation, str) and operation.startswith(
+                "repair.resolver-link."
+            ):
+                valid_detail = (
+                    not rollback_api and detail.get("kind") == "resolver-link-prepared"
+                )
     elif state in {
         "succeeded",
         "restored",

@@ -28,6 +28,11 @@ pub mod rescue_crypttab_observer;
 /// caller-selected command, option, path or block device.
 #[cfg(all(target_os = "linux", feature = "rescue-ext4-fsck-production-candidate"))]
 pub mod rescue_ext4_fsck_candidate;
+#[cfg(all(
+    target_os = "linux",
+    feature = "rescue-resolver-link-production-candidate"
+))]
+pub mod rescue_resolver_link_candidate;
 
 /// Closed, off-default same-boot transaction engine and durable reboot
 /// recovery for the authorized Phase 1 Rescue mutations.

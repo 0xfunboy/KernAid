@@ -1,0 +1,29 @@
+apiVersion: kernaid.dev/v1alpha1
+kind: ActionPack
+metadata:
+  name: linux-resolver-link-production-candidate
+  version: 0.1.0
+spec:
+  productionCandidateOnly: true
+  enabledByDefault: false
+  platforms: [linux-rescue]
+  actions:
+    - id: linux.network.restore-resolver-link.v1
+      productionCandidateOnly: true
+      enabledByDefault: false
+      risk: R2
+      reversible: true
+      requiresBackup: true
+      supportedFilesystems: [ext4]
+      backupPolicy: rescue.boot-vault.authenticated-closed-link-state-before-write.v1
+      backupReservationPolicy: rescue.boot-vault.durable-reservation-before-approval.v1
+      backupPhysicalParent: distinct
+      timeoutMilliseconds: 120000
+      cancellationPolicy: rescue.transaction.safe-boundaries-auto-restore.v1
+      idempotencyPolicy: rescue.resolver-link.converge-once.v1
+      redactionPolicy: rescue.transaction.opaque-identifiers-and-hashes-only.v1
+      handler: kernaid-action-linux-rescue
+      inputSchema: schemas/linux.network.restore-resolver-link.v1.json
+      preflight: linux.network.resolver-link.preflight
+      validate: linux.network.resolver-link.verify
+      rollback: linux.network.restore-resolver-link-state.v1

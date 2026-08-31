@@ -77,6 +77,7 @@ BUNDLE_DESCRIPTOR_TYPES = (
 WRITE_CAPABILITY = "linux-ext4-direct-leaf-readwrite-mount-v1"
 ROLLBACK_WRITE_CAPABILITY = "fstab-rollback-direct-leaf-rw-v1"
 CRYPTTAB_ROLLBACK_WRITE_CAPABILITY = "crypttab-rollback-direct-leaf-rw-v1"
+RESOLVER_LINK_ROLLBACK_WRITE_CAPABILITY = "resolver-link-rollback-direct-leaf-rw-v1"
 WRITE_DESCRIPTOR_TYPE = "selected-target-ext4-mount-readwrite-detached"
 EXT4_EXECUTION_CAPABILITY = "linux-ext4-fsck-bounded-result-v1"
 EXT4_EXECUTION_DESCRIPTOR_TYPE = "normalized-ext4-fsck-result"
@@ -105,6 +106,11 @@ EXT4_VAULT_ROLLBACK_WRITE_CAPABILITY = "ext4-block-rollback-rw-v1"
 EXT4_REPAIR_ACTION = "linux.ext4.fsck-preen-with-undo.v1"
 EXT4_ROLLBACK_ACTION = "linux.ext4.fsck-undo.same-boot.v1"
 EXT4_REPAIR_RESOURCE = "rescue:selected-linux-filesystem:ext4"
+RESOLVER_LINK_VAULT_WRITE_CAPABILITY = "resolver-link-direct-leaf-rw-v1"
+RESOLVER_LINK_VAULT_ROLLBACK_WRITE_CAPABILITY = "resolver-link-rollback-direct-leaf-rw-v1"
+RESOLVER_LINK_REPAIR_ACTION = "linux.network.restore-resolver-link.v1"
+RESOLVER_LINK_ROLLBACK_ACTION = "linux.network.restore-resolver-link-state.v1"
+RESOLVER_LINK_REPAIR_RESOURCE = "rescue:selected-linux-root:etc/resolver-link"
 # KERNAID_REPAIR_CANDIDATE_END
 BLOCK_INVENTORY_COLLECTOR = "linux.block.inventory"
 
@@ -1304,6 +1310,17 @@ def _repair_contract(resource: object, action: object) -> dict[str, object]:
             "safeModes": {0o600},
             "responseCapability": EXT4_EXECUTION_CAPABILITY,
             "descriptorType": EXT4_EXECUTION_DESCRIPTOR_TYPE,
+        }
+    if resource == RESOLVER_LINK_REPAIR_RESOURCE and action == RESOLVER_LINK_REPAIR_ACTION:
+        return {
+            "writeCapability": RESOLVER_LINK_VAULT_WRITE_CAPABILITY,
+            "rollbackCapability": RESOLVER_LINK_VAULT_ROLLBACK_WRITE_CAPABILITY,
+            "rollbackAction": RESOLVER_LINK_ROLLBACK_ACTION,
+            "rollbackResponseCapability": RESOLVER_LINK_ROLLBACK_WRITE_CAPABILITY,
+            "lockDomain": b"kernaid:rescue-resolver-link:target-lock:v1\0",
+            "safeModes": {0o600},
+            "responseCapability": WRITE_CAPABILITY,
+            "descriptorType": WRITE_DESCRIPTOR_TYPE,
         }
     raise HandoffFailure("INTERNAL")
 
@@ -2628,6 +2645,7 @@ def _send_record(
             WRITE_CAPABILITY,
             ROLLBACK_WRITE_CAPABILITY,
             CRYPTTAB_ROLLBACK_WRITE_CAPABILITY,
+            RESOLVER_LINK_ROLLBACK_WRITE_CAPABILITY,
         }:
             if (response.get("descriptor") != {"type": WRITE_DESCRIPTOR_TYPE, "count": 1}
                     or len(descriptors) != 1):

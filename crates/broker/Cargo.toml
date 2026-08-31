@@ -45,6 +45,11 @@ rescue-ext4-fsck-production-candidate = [
     "dep:sha2",
     "dep:zeroize",
 ]
+rescue-resolver-link-production-candidate = [
+    "rescue-fstab-production-candidate",
+    "dep:sha2",
+    "dep:zeroize",
+]
 repair-vault-client = [
     "dep:rustix",
     "dep:sha2",
