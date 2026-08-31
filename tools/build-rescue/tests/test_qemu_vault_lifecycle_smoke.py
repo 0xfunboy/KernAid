@@ -2375,8 +2375,10 @@ class SanitizedOutputTests(unittest.TestCase):
             qemu_args=["-m", "2048"],
         )
         login_credential = synthetic_login_credential()
-        prompt = mock.Mock()
-        prompt.end.return_value = 0
+        passphrase_prompt = mock.Mock()
+        passphrase_prompt.end.return_value = 37
+        confirmation_prompt = mock.Mock()
+        confirmation_prompt.end.return_value = 91
         stdout = io.StringIO()
         stderr = io.StringIO()
         with (
@@ -2397,9 +2399,13 @@ class SanitizedOutputTests(unittest.TestCase):
             ),
             mock.patch.object(controller, "QemuHarness", return_value=fake_harness),
             mock.patch.object(
-                controller, "wait_firstboot_prompt", return_value=prompt
-            ),
-            mock.patch.object(controller, "wait_firstboot_attestation"),
+                controller,
+                "wait_firstboot_prompt",
+                side_effect=[passphrase_prompt, confirmation_prompt],
+            ) as firstboot_prompt,
+            mock.patch.object(
+                controller, "wait_firstboot_attestation"
+            ) as firstboot_attestation,
             mock.patch.object(
                 controller,
                 "run_lifecycle",
@@ -2422,6 +2428,15 @@ class SanitizedOutputTests(unittest.TestCase):
         fake_qmp.system_powerdown.assert_called_once_with()
         fake_harness.wait_for_shutdown.assert_called_once()
         fake_harness.cleanup.assert_called_once_with()
+        self.assertEqual(
+            firstboot_prompt.call_args_list[0].args[1:3],
+            ("passphrase", 0),
+        )
+        self.assertEqual(
+            firstboot_prompt.call_args_list[1].args[1:3],
+            ("confirmation", 37),
+        )
+        self.assertEqual(firstboot_attestation.call_args.args[1], 91)
 
     def test_cleanup_failure_dominates_a_success_attestation(self) -> None:
         correct_raw = b"0123456789abcdef" * 4

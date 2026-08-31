@@ -34,6 +34,46 @@ TAMPER_SPEC.loader.exec_module(tamper)
 
 
 class QemuRepairCandidateSmokeTests(unittest.TestCase):
+    def test_firstboot_confirmation_advances_past_passphrase_prompt(self) -> None:
+        console = mock.Mock()
+        qmp = mock.Mock()
+        key = bytearray(b"0" * 64)
+        passphrase_prompt = mock.Mock()
+        passphrase_prompt.end.return_value = 37
+        confirmation_prompt = mock.Mock()
+        confirmation_prompt.end.return_value = 91
+
+        with (
+            mock.patch.object(
+                controller.LIFECYCLE,
+                "wait_firstboot_prompt",
+                side_effect=[passphrase_prompt, confirmation_prompt],
+            ) as firstboot_prompt,
+            mock.patch.object(
+                controller.LIFECYCLE, "wait_firstboot_attestation"
+            ) as firstboot_attestation,
+        ):
+            controller.provision_firstboot(
+                console,
+                qmp,
+                key,
+                time.monotonic() + 1800.0,
+            )
+
+        self.assertEqual(
+            firstboot_prompt.call_args_list[0].args[1:3],
+            ("passphrase", 0),
+        )
+        self.assertEqual(
+            firstboot_prompt.call_args_list[1].args[1:3],
+            ("confirmation", 37),
+        )
+        self.assertEqual(firstboot_attestation.call_args.args[1], 91)
+        self.assertEqual(
+            qmp.send_hex_line.call_args_list,
+            [mock.call(key), mock.call(key)],
+        )
+
     @staticmethod
     def _receipt_transcript_console(return_code: int) -> object:
         begin = b"KERNAID_PROVIDER_PROOF_BEGIN_V1_repair-backup-tamper-apply"

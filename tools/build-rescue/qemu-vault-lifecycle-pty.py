@@ -4262,7 +4262,7 @@ def main(arguments: Sequence[str]) -> int:
         if lifecycle_deadline <= time.monotonic():
             raise ClosedFailure("lifecycle", "shutdown-reserve-exhausted")
         if parsed.boot == 1:
-            wait_firstboot_prompt(
+            passphrase = wait_firstboot_prompt(
                 console,
                 "passphrase",
                 0,
@@ -4274,7 +4274,7 @@ def main(arguments: Sequence[str]) -> int:
             confirmation = wait_firstboot_prompt(
                 console,
                 "confirmation",
-                0,
+                passphrase.end(),
                 _deadline(aggregate, FIRSTBOOT_PROMPT_TIMEOUT_SECONDS),
                 "firstboot-confirmation",
             )

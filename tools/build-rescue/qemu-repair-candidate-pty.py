@@ -1217,7 +1217,7 @@ def provision_firstboot(
 ) -> None:
     """Provision exactly one zero-p3 disposable Rescue medium."""
 
-    LIFECYCLE.wait_firstboot_prompt(
+    passphrase = LIFECYCLE.wait_firstboot_prompt(
         console,
         "passphrase",
         0,
@@ -1231,7 +1231,7 @@ def provision_firstboot(
     confirmation = LIFECYCLE.wait_firstboot_prompt(
         console,
         "confirmation",
-        0,
+        passphrase.end(),
         LIFECYCLE._deadline(
             aggregate, LIFECYCLE.FIRSTBOOT_PROMPT_TIMEOUT_SECONDS
         ),
