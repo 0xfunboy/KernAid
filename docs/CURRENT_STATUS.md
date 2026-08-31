@@ -221,8 +221,9 @@ complete GUI qualification remain open.
    using the [physical USB qualification
    runbook](runbooks/physical-usb-qualification.md), and record firmware,
    storage, network and UI evidence.
-2. Finish the real-account Rescue provider/vault lifecycle without exposing or
-   copying the CLI credential store.
+2. Finish the real-account Rescue provider/vault lifecycle using the
+   [two-boot qualification runbook](runbooks/real-provider-qualification.md),
+   without exposing or copying either provider credential store.
 3. Fix and qualify one exact repair candidate through post-commit rollback,
    automatic restore, injected faults, interrupted processes, restart/reboot
    reconciliation and destructive power-loss recovery on disposable targets.

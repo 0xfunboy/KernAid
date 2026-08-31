@@ -287,6 +287,10 @@ physical-media behavior remain external release gates. The automated BIOS and
 UEFI lifecycle gates passed the real pinned CLI's offline signed-out status
 path and do not create an account session.
 
+To qualify the separate OpenAI API-key diagnosis and ChatGPT/Codex
+authentication paths together across a clean reboot, follow the
+[real-provider and encrypted-persistence runbook](runbooks/real-provider-qualification.md).
+
 ## Diagnose a running operating system
 
 Download the matching artifact from a post-change `desktop` run in which the
