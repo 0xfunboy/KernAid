@@ -62,55 +62,84 @@ class FakeQmp:
 
 
 class NativeVaultPromptSmokeTests(unittest.TestCase):
-    def test_secret_line_has_one_bounded_deadline_and_is_never_retried(self) -> None:
-        class SecretQmp:
+    def test_frame_capture_refreshes_qmp_deadline_and_closes_with_safe_stage(self) -> None:
+        class FrameQmp:
             def __init__(self, failure=None) -> None:
                 self.failure = failure
-                self.deadlines: list[float] = []
-                self.lines: list[bytearray] = []
+                self.events: list[tuple[str, object]] = []
 
             def set_deadline(self, deadline: float) -> None:
-                self.deadlines.append(deadline)
+                self.events.append(("deadline", deadline))
 
-            def send_hex_line(self, secret: bytearray) -> None:
-                self.lines.append(secret)
+            def execute(self, command: str, arguments: dict[str, object]) -> None:
+                self.events.append((command, arguments))
                 if self.failure is not None:
                     raise self.failure
 
-        secret = bytearray(b"0123456789abcdef" * 4)
-        try:
-            qmp = SecretQmp()
-            with mock.patch.object(native_prompt_smoke.time, "monotonic", return_value=100.0):
-                native_prompt_smoke._send_secret_line(qmp, secret, 120.0)
-            self.assertEqual(qmp.deadlines, [120.0])
-            self.assertEqual(qmp.lines, [secret])
-            self.assertEqual(native_prompt_smoke.SECRET_BYTES + 1, 65)
-            self.assertGreater(native_prompt_smoke.QMP_SECRET_LINE_TIMEOUT_SECONDS, 10.0)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for stage in native_prompt_smoke.FRAME_CAPTURE_STAGES:
+                with self.subTest(stage=stage):
+                    qmp = FrameQmp()
+                    path = root / f"{stage}.ppm"
+                    with (
+                        mock.patch.object(
+                            native_prompt_smoke.time, "monotonic", return_value=100.0
+                        ),
+                        mock.patch.object(
+                            native_prompt_smoke.UI_SMOKE,
+                            "_read_exact_screenshot",
+                            return_value=b"ppm",
+                        ),
+                        mock.patch.object(
+                            native_prompt_smoke.UI_SMOKE,
+                            "parse_ppm",
+                            return_value=(800, 600, b"pixels"),
+                        ),
+                        mock.patch.object(
+                            native_prompt_smoke.UI_SMOKE, "_remove_screenshot"
+                        ),
+                    ):
+                        observed = native_prompt_smoke._capture_frame(
+                            qmp, path, root, 130.0, stage
+                        )
+                    self.assertEqual(observed, (800, 600, b"pixels"))
+                    self.assertEqual(qmp.events[0], ("deadline", 130.0))
+                    self.assertEqual(qmp.events[1][0], "screendump")
 
-            closed = native_prompt_smoke.ClosedFailure("qmp", "send-timeout")
-            failing = SecretQmp(closed)
+            qmp_failure = FrameQmp(
+                native_prompt_smoke.ClosedFailure("qmp", "send-timeout")
+            )
             with (
-                mock.patch.object(native_prompt_smoke.time, "monotonic", return_value=100.0),
+                mock.patch.object(
+                    native_prompt_smoke.time, "monotonic", return_value=100.0
+                ),
+                mock.patch.object(native_prompt_smoke.UI_SMOKE, "_remove_screenshot"),
                 self.assertRaises(native_prompt_smoke.ClosedFailure) as failure,
             ):
-                native_prompt_smoke._send_secret_line(failing, secret, 200.0)
-            self.assertIs(failure.exception, closed)
-            self.assertEqual(failing.deadlines, [145.0])
-            self.assertEqual(failing.lines, [secret])
-
-            invalid = SecretQmp()
-            with self.assertRaises(native_prompt_smoke.ClosedFailure) as failure:
-                native_prompt_smoke._send_secret_line(
-                    invalid, bytearray(b"0" * (native_prompt_smoke.SECRET_BYTES - 1)), 200.0
+                native_prompt_smoke._capture_frame(
+                    qmp_failure, root / "failed.ppm", root, 130.0, "baseline"
                 )
             self.assertEqual(
                 (failure.exception.stage, failure.exception.code),
-                ("secret", "length-invalid"),
+                ("framebuffer-baseline", "qmp-send-timeout"),
             )
-            self.assertEqual(invalid.deadlines, [])
-            self.assertEqual(invalid.lines, [])
-        finally:
-            native_prompt_smoke.LIFECYCLE.wipe(secret)
+
+            expired = FrameQmp()
+            with (
+                mock.patch.object(
+                    native_prompt_smoke.time, "monotonic", return_value=130.0
+                ),
+                self.assertRaises(native_prompt_smoke.ClosedFailure) as failure,
+            ):
+                native_prompt_smoke._capture_frame(
+                    expired, root / "expired.ppm", root, 130.0, "return"
+                )
+            self.assertEqual(
+                (failure.exception.stage, failure.exception.code),
+                ("framebuffer-return", "deadline"),
+            )
+            self.assertEqual(expired.events, [])
 
     def test_each_boot_keeps_the_qualified_lifecycle_timeout(self) -> None:
         parsed = native_prompt_smoke._parse_arguments(

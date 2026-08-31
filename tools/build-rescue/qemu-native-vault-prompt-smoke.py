@@ -42,10 +42,7 @@ HEX_ALPHABET = b"0123456789abcdef"
 JOURNAL_MARKER_DIRECTORY = "/run/kernaid-qemu-native-prompt-journal-proof"
 JOURNAL_PROOF_STAGES = ("boot1", "boot2")
 JOURNAL_MARKER_PROOF_TIMEOUT_SECONDS = 45.0
-# A 64-byte passphrase plus Return is 65 separately correlated QMP requests.
-# Keep one absolute deadline for the complete line, but do not force those
-# requests through the generic 10-second single-command window.
-QMP_SECRET_LINE_TIMEOUT_SECONDS = 45.0
+FRAME_CAPTURE_STAGES = frozenset(("baseline", "prompt", "return"))
 
 
 def _load_module(name: str, path: Path) -> ModuleType:
@@ -221,16 +218,6 @@ def _new_passphrase() -> bytearray:
 
 def _deadline(aggregate: float, seconds: float) -> float:
     return min(aggregate, time.monotonic() + seconds)
-
-
-def _send_secret_line(qmp: object, secret: bytearray, aggregate: float) -> None:
-    """Send one fixed-size passphrase once within one absolute QMP deadline."""
-
-    if len(secret) != SECRET_BYTES:
-        raise ClosedFailure("secret", "length-invalid")
-    qmp.set_deadline(_deadline(aggregate, QMP_SECRET_LINE_TIMEOUT_SECONDS))
-    # Never retry here: a timeout can follow a partially delivered line.
-    qmp.send_hex_line(secret)
 
 
 def _tool(name: str) -> str:
@@ -649,15 +636,33 @@ def _qemu_arguments(
     return arguments
 
 
-def _capture_frame(qmp: object, path: Path, work_directory: Path) -> tuple[int, int, bytes]:
+def _capture_frame(
+    qmp: object,
+    path: Path,
+    work_directory: Path,
+    deadline: float,
+    stage: str,
+) -> tuple[int, int, bytes]:
+    if stage not in FRAME_CAPTURE_STAGES:
+        raise ClosedFailure("framebuffer", "stage-invalid")
+    failure_stage = f"framebuffer-{stage}"
+    if time.monotonic() >= deadline:
+        raise ClosedFailure(failure_stage, "deadline")
     try:
         if path.exists() or path.is_symlink():
             raise UI_SMOKE.SmokeError("frame exists")
-        qmp.execute("screendump", {"filename": os.fspath(path)})
+        try:
+            # QmpClient retains its previous absolute deadline. Refresh it for
+            # every screendump so time spent logging in or running guest proofs
+            # cannot leave a stale start/previous-command deadline behind.
+            qmp.set_deadline(deadline)
+            qmp.execute("screendump", {"filename": os.fspath(path)})
+        except ClosedFailure as error:
+            raise ClosedFailure(failure_stage, f"qmp-{error.code}") from error
         payload = UI_SMOKE._read_exact_screenshot(path, work_directory)
         return UI_SMOKE.parse_ppm(payload)
     except (OSError, UI_SMOKE.SmokeError) as error:
-        raise ClosedFailure("framebuffer", "capture-failed") from error
+        raise ClosedFailure(failure_stage, "capture-failed") from error
     finally:
         try:
             UI_SMOKE._remove_screenshot(path, work_directory)
@@ -665,16 +670,22 @@ def _capture_frame(qmp: object, path: Path, work_directory: Path) -> tuple[int, 
             pass
 
 
-def _find_brand_frame(qmp: object, work_directory: Path, deadline: float) -> tuple[int, int, bytes]:
+def _find_brand_frame(
+    qmp: object, work_directory: Path, deadline: float, stage: str
+) -> tuple[int, int, bytes]:
+    if stage not in {"baseline", "return"}:
+        raise ClosedFailure("framebuffer", "stage-invalid")
     path = work_directory / "before.ppm"
     for _ in range(FRAME_ATTEMPTS):
-        width, height, pixels = _capture_frame(qmp, path, work_directory)
+        width, height, pixels = _capture_frame(
+            qmp, path, work_directory, deadline, stage
+        )
         if UI_SMOKE.is_kernaid_render(pixels):
             return width, height, pixels
         if time.monotonic() >= deadline:
             break
         time.sleep(FRAME_SETTLE_SECONDS)
-    raise ClosedFailure("framebuffer", "brand-missing")
+    raise ClosedFailure(f"framebuffer-{stage}", "brand-missing")
 
 
 def _require_prompt_frame(
@@ -686,7 +697,9 @@ def _require_prompt_frame(
     path = work_directory / "after.ppm"
     width, height, before = baseline
     for _ in range(FRAME_ATTEMPTS):
-        next_width, next_height, pixels = _capture_frame(qmp, path, work_directory)
+        next_width, next_height, pixels = _capture_frame(
+            qmp, path, work_directory, deadline, "prompt"
+        )
         if (
             (next_width, next_height) == (width, height)
             and not UI_SMOKE.is_kernaid_render(pixels)
@@ -696,7 +709,7 @@ def _require_prompt_frame(
         if time.monotonic() >= deadline:
             break
         time.sleep(FRAME_SETTLE_SECONDS)
-    raise ClosedFailure("framebuffer", "prompt-missing")
+    raise ClosedFailure("framebuffer-prompt", "prompt-missing")
 
 
 def _send_alt_u(qmp: object) -> None:
@@ -760,14 +773,16 @@ def _run_firstboot(
             deadline=_deadline(aggregate, LIFECYCLE.READINESS_TIMEOUT_SECONDS),
             stage="firstboot-start",
         )
-        _send_secret_line(qmp, secret, aggregate)
+        qmp.set_deadline(_deadline(aggregate, 10.0))
+        qmp.send_hex_line(secret)
         confirmation = console.wait_regex(
             re.compile(rb"KERNAID_RESCUE_FIRSTBOOT_PROMPT_READY_V1 step=confirmation"),
             start=prompt.end(),
             deadline=_deadline(aggregate, LIFECYCLE.READINESS_TIMEOUT_SECONDS),
             stage="firstboot-confirmation",
         )
-        _send_secret_line(qmp, secret, aggregate)
+        qmp.set_deadline(_deadline(aggregate, 10.0))
+        qmp.send_hex_line(secret)
         LIFECYCLE.wait_firstboot_attestation(
             console,
             confirmation.end(),
@@ -846,7 +861,9 @@ def _run_prompt_boot(
             or before_status.device_id is not None
         ):
             raise ClosedFailure("prompt", "vault-not-locked")
-        baseline = _find_brand_frame(qmp, work_directory, _deadline(aggregate, 30.0))
+        baseline = _find_brand_frame(
+            qmp, work_directory, _deadline(aggregate, 30.0), "baseline"
+        )
         cursor = LIFECYCLE.run_guest_proof(
             console, "native-pre", PRE_PROOF, cursor, aggregate, timeout=60.0
         )
@@ -857,7 +874,8 @@ def _run_prompt_boot(
             console, "native-ready", READY_PROOF, cursor, aggregate, timeout=75.0
         )
         _require_prompt_frame(qmp, work_directory, baseline, _deadline(aggregate, 15.0))
-        _send_secret_line(qmp, secret, aggregate)
+        qmp.set_deadline(_deadline(aggregate, 10.0))
+        qmp.send_hex_line(secret)
         cursor = LIFECYCLE.run_guest_proof(
             console, "native-post", POST_PROOF, cursor, aggregate, timeout=650.0
         )
@@ -880,7 +898,9 @@ def _run_prompt_boot(
             aggregate,
             timeout=JOURNAL_MARKER_PROOF_TIMEOUT_SECONDS,
         )
-        returned = _find_brand_frame(qmp, work_directory, _deadline(aggregate, 30.0))
+        returned = _find_brand_frame(
+            qmp, work_directory, _deadline(aggregate, 30.0), "return"
+        )
         if returned[:2] != baseline[:2]:
             raise ClosedFailure("framebuffer", "dimension-changed")
         qmp.set_deadline(_deadline(aggregate, 10.0))
