@@ -2320,6 +2320,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "kernaid-entitlements"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "ed25519-dalek",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "kernaid-evidence"
 version = "0.1.0"
 dependencies = [
