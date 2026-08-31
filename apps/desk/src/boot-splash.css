@@ -1,0 +1,142 @@
+:root {
+  color: #edf3ed;
+  background: #0d1110;
+}
+
+html,
+body,
+#root {
+  min-width: 100%;
+  min-height: 100%;
+  margin: 0;
+  background: #0d1110;
+}
+
+.boot-splash {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 22px;
+  overflow: hidden;
+  color: #edf3ed;
+  background:
+    radial-gradient(circle at 78% 8%, rgb(199 255 61 / 12%), transparent 43%),
+    linear-gradient(135deg, #070b0a, #0d1412 55%, #081110);
+  font-family: Inter, system-ui, sans-serif;
+}
+
+.boot-splash::before {
+  position: absolute;
+  inset: 0;
+  content: "";
+  opacity: 0.18;
+  background-image:
+    linear-gradient(rgb(199 255 61 / 10%) 1px, transparent 1px),
+    linear-gradient(90deg, rgb(199 255 61 / 10%) 1px, transparent 1px);
+  background-size: 40px 40px;
+  mask-image: linear-gradient(to bottom, black, transparent 78%);
+}
+
+.boot-splash__brand {
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 22px;
+}
+
+.boot-splash__brand > div {
+  display: grid;
+  gap: 7px;
+}
+
+.boot-splash__brand strong {
+  color: #f4f8f5;
+  font-size: clamp(28px, 5vw, 44px);
+  letter-spacing: 0.2em;
+}
+
+.boot-splash__brand span:not(.boot-splash__mark) {
+  color: #9aa7a1;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.25em;
+}
+
+.boot-splash__mark {
+  position: relative;
+  display: grid;
+  width: 92px;
+  height: 92px;
+  place-content: center;
+  color: #c7ff3d;
+  border: 2px solid #27342f;
+  border-radius: 22px;
+  background: #0d1110;
+  font-size: 59px;
+  font-weight: 900;
+  line-height: 1;
+}
+
+.boot-splash__mark::after {
+  position: absolute;
+  top: 15px;
+  right: 14px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #50d8e8;
+  content: "";
+}
+
+.boot-splash p,
+.boot-splash small {
+  z-index: 1;
+  margin: 0;
+  color: #aebbb4;
+  letter-spacing: 0.12em;
+}
+
+.boot-splash p {
+  font-size: 14px;
+}
+
+.boot-splash small {
+  color: #718078;
+  font-size: 10px;
+}
+
+.boot-splash__progress {
+  z-index: 1;
+  width: min(340px, 60vw);
+  height: 2px;
+  overflow: hidden;
+  background: #26332e;
+}
+
+.boot-splash__progress::after {
+  display: block;
+  width: 42%;
+  height: 100%;
+  background: linear-gradient(90deg, #c7ff3d, #50d8e8);
+  content: "";
+  animation: kernaid-boot-progress 1.4s ease-in-out infinite alternate;
+}
+
+@keyframes kernaid-boot-progress {
+  from {
+    transform: translateX(-100%);
+  }
+
+  to {
+    transform: translateX(238%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .boot-splash__progress::after {
+    animation: none;
+    transform: translateX(70%);
+  }
+}

@@ -1,0 +1,8 @@
+[Plymouth Theme]
+Name=KernAid Rescue
+Description=KernAid secure offline inspection boot splash
+ModuleName=script
+
+[script]
+ImageDir=/usr/share/plymouth/themes/kernaid
+ScriptFile=/usr/share/plymouth/themes/kernaid/kernaid.script
