@@ -2343,6 +2343,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "kernaid-fleet-runtime"
+version = "0.1.0"
+dependencies = [
+ "kernaid-device-identity",
+ "kernaid-fleet-client",
+ "rusqlite",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "kernaid-linux-blockfd"
 version = "0.1.0"
 dependencies = [
