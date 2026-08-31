@@ -6,6 +6,9 @@ import {
   auditDomainPayloadBytes,
   auditSigningBytes,
   canonicalJson,
+  entitlementPullSigningBytes,
+  entitlementRevocationSigningBytes,
+  entitlementSigningBytes,
   enrollmentSigningBytes,
   inventorySigningBytes,
   parsePolicyPullRequest,
@@ -15,9 +18,13 @@ import {
   parseEnrollmentRequest,
   parseAuditEnvelope,
   parseInventoryEnvelope,
+  parseEntitlementEnvelope,
+  parseEntitlementPullRequest,
+  parseEntitlementRevocationEnvelope,
   toUnsignedEnrollment,
   toUnsignedAudit,
   toUnsignedInventory,
+  toUnsignedEntitlementPull,
   toUnsignedPolicyBundle,
   toUnsignedPolicyPull,
 } from "../src/index.js";
@@ -46,6 +53,16 @@ const POLICY_PUBLIC_KEY_SPKI =
   "MCowBQYDK2VwAyEAIBLLkMpg6OXY2vZuInLSIz4EhtVX6MZhQe2JIBd9frc";
 const POLICY_BUNDLE_JSON =
   '{"assignments":{"deviceIds":["KA-0123456789abcdef01234567"]},"expiresAtUnix":1800172800,"issuedAtUnix":1800000000,"notBeforeUnix":1800000100,"offlineAllowedUntilUnix":1800086400,"policyId":"repair-baseline","revision":7,"rules":{"allowEvidenceUpload":true,"allowedActionIds":["linux.fstab.disable-missing-uuid.v1","system.observe.noop"],"deniedActionIds":["windows.registry.unsafe.v1"],"emergencyRollbackAlwaysAllowed":true,"localApprovalFrom":"R1","maxRisk":"R2","providerModes":["enterprise","offline","openai_api"],"retentionDays":90,"updateRing":"stable"},"schema":"dev.kernaid.fleet.policy-bundle.v1","signature":"fqRlJ15i5Hyn_oec1PkbDWMIjyFxMLEOPnnyOshBjnZciwVgu-v_uW5vIAiHqyi7p3CfGucukV2U-7AaHDjjBg","tenantId":"tenant-europe-1"}';
+const ENTITLEMENT_PULL_UNSIGNED =
+  '{"deviceId":"KA-3097e2dee2cb4a34b53840cd","issuedAt":"2026-08-31T12:30:45Z","nonce":"paWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaU","schema":"dev.kernaid.fleet.entitlement-pull-request.v1","tenantId":"tenant-europe-1"}';
+const ENTITLEMENT_PULL_JSON =
+  '{"deviceId":"KA-3097e2dee2cb4a34b53840cd","issuedAt":"2026-08-31T12:30:45Z","nonce":"paWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaU","schema":"dev.kernaid.fleet.entitlement-pull-request.v1","signature":"eg54h5wivxIbZKXcoJZEVfa7_5Yi8q6IofVQqLEnYeBFiYiLanDDncO8PGgsyQiyjf2V04NkrGj2CTMRlB-HCQ","tenantId":"tenant-europe-1"}';
+const ENTITLEMENT_ISSUER_SPKI =
+  "MCowBQYDK2VwAyEAwFDFY3pE-oYp__PMzOIwDLNipj2Z2V_FQUUmb0MyRFo";
+const ENTITLEMENT_JSON =
+  '{"claims":{"deviceIds":["device_alpha","device_beta"],"entitlementId":"ent_acme_001","expiresAtUnix":3000,"features":["audit","enterprise_repair","fleet","policy","updates"],"graceUntilUnix":4000,"issuedAtUnix":1000,"limits":{"maxManagedAssets":5000,"maxTechnicians":16,"maxToolDevices":8},"notBeforeUnix":1000,"offlineLeaseUntilUnix":2000,"plan":"enterprise","schema":"dev.kernaid.entitlement.v1","sequence":1,"tenantId":"tenant_acme"},"signature":"sWOJD4yoB89_MICu3glOpehAV8zeXJKXmI_TwnMDj7aZ0MxgA8C4pGtQUWumOMLEDQJp_ZoAbCbmSRpPWKRuBQ"}';
+const ENTITLEMENT_REVOCATIONS_JSON =
+  '{"claims":{"issuedAtUnix":1400,"revokedEntitlementIds":["ent_acme_001"],"schema":"dev.kernaid.entitlement-revocations.v1","sequence":7},"signature":"mOEmDZRrBVWAlYfPFMTT6ywK3y1_hLn0Dd1cdXVAUdg0UM0fZ7CinsR8OSP02TvlVqrl47vkYOcciAMtBIYgBw"}';
 
 test("canonical JSON sorts object keys recursively and preserves array order", () => {
   assert.equal(
@@ -269,6 +286,80 @@ test("Rust and TypeScript signed policy bundle framing is byte-identical", () =>
       parseSignedPolicyBundle({
         ...bundle,
         rules: { ...bundle.rules, emergencyRollbackAlwaysAllowed: false },
+      }),
+    FleetSchemaError,
+  );
+});
+
+test("Rust and TypeScript entitlement pull bytes are byte-identical", () => {
+  const request = parseEntitlementPullRequest(
+    JSON.parse(ENTITLEMENT_PULL_JSON),
+  );
+  assert.equal(canonicalJson(request), ENTITLEMENT_PULL_JSON);
+  assert.equal(
+    canonicalJson(toUnsignedEntitlementPull(request)),
+    ENTITLEMENT_PULL_UNSIGNED,
+  );
+  assert.equal(
+    Buffer.from(entitlementPullSigningBytes(request)).toString(),
+    `kernaid:fleet:entitlement-pull:v1\0${ENTITLEMENT_PULL_UNSIGNED}`,
+  );
+  const key = createPublicKey({
+    key: Buffer.from(PUBLIC_KEY_SPKI, "base64url"),
+    format: "der",
+    type: "spki",
+  });
+  assert.equal(
+    verify(
+      null,
+      entitlementPullSigningBytes(request),
+      key,
+      Buffer.from(request.signature, "base64url"),
+    ),
+    true,
+  );
+  assert.throws(
+    () => parseEntitlementPullRequest({ ...request, diagnostics: [] }),
+    FleetSchemaError,
+  );
+});
+
+test("Rust and TypeScript entitlement documents use identical framing", () => {
+  const key = createPublicKey({
+    key: Buffer.from(ENTITLEMENT_ISSUER_SPKI, "base64url"),
+    format: "der",
+    type: "spki",
+  });
+  const entitlement = parseEntitlementEnvelope(JSON.parse(ENTITLEMENT_JSON));
+  assert.equal(canonicalJson(entitlement), ENTITLEMENT_JSON);
+  assert.equal(
+    verify(
+      null,
+      entitlementSigningBytes(entitlement),
+      key,
+      Buffer.from(entitlement.signature, "base64url"),
+    ),
+    true,
+  );
+
+  const revocations = parseEntitlementRevocationEnvelope(
+    JSON.parse(ENTITLEMENT_REVOCATIONS_JSON),
+  );
+  assert.equal(canonicalJson(revocations), ENTITLEMENT_REVOCATIONS_JSON);
+  assert.equal(
+    verify(
+      null,
+      entitlementRevocationSigningBytes(revocations),
+      key,
+      Buffer.from(revocations.signature, "base64url"),
+    ),
+    true,
+  );
+  assert.throws(
+    () =>
+      parseEntitlementEnvelope({
+        ...entitlement,
+        claims: { ...entitlement.claims, deviceIds: ["z", "a"] },
       }),
     FleetSchemaError,
   );

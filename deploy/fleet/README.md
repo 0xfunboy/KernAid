@@ -16,6 +16,8 @@ SQLite, a private root-token file and no remote-command surface.
 - The root token is mounted as a Docker secret at
   `/run/secrets/kernaid_fleet_root_token`. Its value is never an environment
   variable, image layer, Compose value or console setting.
+- The entitlement issuer's raw Ed25519 public key is mounted as a read-only
+  config. Its offline private key/seed never enters this host or database.
 - Port 7341 is published only on host loopback. The Docker network is internal.
 - `/console/` and the API share an origin, so no permissive CORS policy is
   needed.
@@ -34,8 +36,11 @@ repository; do not paste it into `.env`, Compose or shell history.
 install -d -m 700 /absolute/private/fleet-secrets
 openssl rand -hex 32 > /absolute/private/fleet-secrets/root-token
 chmod 400 /absolute/private/fleet-secrets/root-token
+install -m 444 /secure-export/entitlement.public \
+  /absolute/private/fleet-secrets/entitlement.public
 
 export KERNAID_FLEET_ROOT_TOKEN_FILE=/absolute/private/fleet-secrets/root-token
+export KERNAID_FLEET_ENTITLEMENT_TRUST_ANCHOR_FILE=/absolute/private/fleet-secrets/entitlement.public
 docker compose -f deploy/fleet/compose.yaml build --pull
 docker compose -f deploy/fleet/compose.yaml up -d
 docker compose -f deploy/fleet/compose.yaml ps
@@ -70,8 +75,8 @@ ingress:
 
 Protect `/console/*` and tenant-admin routes under `/v1/tenants/*` with an
 identity-aware access policy. Signed devices still need non-interactive HTTPS
-access to `/v1/enrollments` and `/v1/inventories`, so do not put an interactive
-login in front of those two routes. Keep root tenant creation additionally
+access to enrollment, inventory, audit, policy-pull and entitlement-pull
+routes, so do not put an interactive login in front of them. Keep root tenant creation additionally
 restricted to an operator path or local request. Apply rate limiting to public
 device endpoints without logging Authorization headers or request bodies.
 
@@ -143,6 +148,7 @@ node deploy/fleet/database-lifecycle.mjs verify /absolute/state/fleet.sqlite
 pnpm --filter @kernaid/fleet-control-plane build
 pnpm --filter @kernaid/fleet-console check
 KERNAID_FLEET_ROOT_TOKEN_FILE=/absolute/private/fleet-secrets/root-token \
+KERNAID_FLEET_ENTITLEMENT_TRUST_ANCHOR_FILE=/absolute/private/fleet-secrets/entitlement.public \
   docker compose -f deploy/fleet/compose.yaml config --quiet
 docker build --file deploy/fleet/Dockerfile --tag kernaid/fleet-control-plane:local .
 ```

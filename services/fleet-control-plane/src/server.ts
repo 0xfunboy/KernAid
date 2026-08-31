@@ -5,10 +5,12 @@ import {
   type ServerResponse,
 } from "node:http";
 import type { AddressInfo } from "node:net";
+import type { KeyObject } from "node:crypto";
 import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import { extname, relative, resolve, sep } from "node:path";
 import {
   FleetSchemaError,
+  MAX_ENTITLEMENT_DOCUMENT_BYTES,
   MAX_POLICY_BUNDLE_BYTES,
   auditSigningBytes,
   canonicalJson,
@@ -18,6 +20,13 @@ import {
   expectRecord,
   expectSafeInteger,
   inventorySigningBytes,
+  entitlementAppliesTo,
+  entitlementPullSigningBytes,
+  entitlementRevocationSigningBytes,
+  entitlementSigningBytes,
+  parseEntitlementEnvelope,
+  parseEntitlementPullRequest,
+  parseEntitlementRevocationEnvelope,
   parsePolicyPullRequest,
   parseSignedPolicyBundle,
   policyBundleSigningBytes,
@@ -33,6 +42,7 @@ import {
   hashSecret,
   decodeBase64UrlExact,
   importEd25519Spki,
+  importEd25519Raw,
   secureSecretEqual,
   sha256Hex,
   verifyEd25519,
@@ -48,6 +58,9 @@ import {
   StoreNonceReplayError,
   StorePolicyConflictError,
   StorePolicyRollbackError,
+  StoreEntitlementConflictError,
+  StoreEntitlementPullReplayError,
+  StoreEntitlementRollbackError,
 } from "./store.js";
 
 const MAX_REQUEST_BYTES = 64 * 1024;
@@ -56,6 +69,7 @@ const MAX_ENROLLMENT_TOKEN_SECONDS = 7 * 24 * 60 * 60;
 export interface FleetControlPlaneOptions {
   databasePath: string;
   rootToken: string;
+  entitlementTrustAnchor: string;
   enrollmentClockSkewMs?: number;
   now?: () => Date;
   consoleDirectory?: string;
@@ -64,6 +78,7 @@ export interface FleetControlPlaneOptions {
 export class FleetControlPlane {
   readonly #store: FleetStore;
   readonly #rootToken: string;
+  readonly #entitlementTrustAnchor: KeyObject;
   readonly #clockSkewMs: number;
   readonly #now: () => Date;
   readonly #server: Server;
@@ -78,6 +93,15 @@ export class FleetControlPlane {
     ) {
       throw new Error(
         "root token must be 32-512 canonical base64url characters",
+      );
+    }
+    try {
+      this.#entitlementTrustAnchor = importEd25519Raw(
+        options.entitlementTrustAnchor,
+      );
+    } catch {
+      throw new Error(
+        "entitlement trust anchor must be a canonical raw Ed25519 public key",
       );
     }
     this.#store = new FleetStore(options.databasePath);
@@ -158,6 +182,12 @@ export class FleetControlPlane {
         writeJson(response, 409, { error: "policy_revision_conflict" });
       } else if (error instanceof StoreNonceReplayError) {
         writeJson(response, 409, { error: "policy_pull_replay" });
+      } else if (error instanceof StoreEntitlementRollbackError) {
+        writeJson(response, 409, { error: "entitlement_sequence_rollback" });
+      } else if (error instanceof StoreEntitlementConflictError) {
+        writeJson(response, 409, { error: "entitlement_sequence_conflict" });
+      } else if (error instanceof StoreEntitlementPullReplayError) {
+        writeJson(response, 409, { error: "entitlement_pull_replay" });
       } else {
         writeJson(response, 500, { error: "internal_error" });
       }
@@ -313,6 +343,82 @@ export class FleetControlPlane {
         accepted: true,
         idempotent: result.idempotent,
         publishedAt: result.publishedAt,
+      });
+      return;
+    }
+
+    const entitlementsMatch = /^\/v1\/tenants\/([^/]+)\/entitlements$/.exec(
+      path,
+    );
+    if (method === "POST" && entitlementsMatch !== null) {
+      const tenantId = pathIdentifier(entitlementsMatch[1], "tenantId");
+      this.#authorizeTenant(request, tenantId);
+      const envelope = parseEntitlementEnvelope(
+        await readCanonicalJson(request, MAX_ENTITLEMENT_DOCUMENT_BYTES),
+      );
+      if (envelope.claims.tenantId !== tenantId) {
+        throw new HttpError(403, "tenant_mismatch");
+      }
+      if (
+        !verifyEd25519(
+          this.#entitlementTrustAnchor,
+          entitlementSigningBytes(envelope),
+          envelope.signature,
+        )
+      ) {
+        throw new HttpError(401, "invalid_signature");
+      }
+      const canonicalEnvelope = canonicalJson(envelope);
+      const result = this.#store.publishEntitlement(
+        tenantId,
+        envelope,
+        canonicalEnvelope,
+        sha256Hex(canonicalEnvelope),
+      );
+      writeJson(response, result.idempotent ? 200 : 201, {
+        schema: "dev.kernaid.fleet.entitlement-published.v1",
+        tenantId,
+        entitlementId: envelope.claims.entitlementId,
+        sequence: envelope.claims.sequence,
+        accepted: true,
+        idempotent: result.idempotent,
+      });
+      return;
+    }
+
+    const entitlementRevocationsMatch =
+      /^\/v1\/tenants\/([^/]+)\/entitlement-revocations$/.exec(path);
+    if (method === "POST" && entitlementRevocationsMatch !== null) {
+      const tenantId = pathIdentifier(
+        entitlementRevocationsMatch[1],
+        "tenantId",
+      );
+      this.#authorizeTenant(request, tenantId);
+      const envelope = parseEntitlementRevocationEnvelope(
+        await readCanonicalJson(request, MAX_ENTITLEMENT_DOCUMENT_BYTES),
+      );
+      if (
+        !verifyEd25519(
+          this.#entitlementTrustAnchor,
+          entitlementRevocationSigningBytes(envelope),
+          envelope.signature,
+        )
+      ) {
+        throw new HttpError(401, "invalid_signature");
+      }
+      const canonicalEnvelope = canonicalJson(envelope);
+      const result = this.#store.publishEntitlementRevocations(
+        tenantId,
+        envelope,
+        canonicalEnvelope,
+        sha256Hex(canonicalEnvelope),
+      );
+      writeJson(response, result.idempotent ? 200 : 201, {
+        schema: "dev.kernaid.fleet.entitlement-revocations-published.v1",
+        tenantId,
+        sequence: envelope.claims.sequence,
+        accepted: true,
+        idempotent: result.idempotent,
       });
       return;
     }
@@ -510,6 +616,65 @@ export class FleetControlPlane {
         tenantId: pull.tenantId,
         deviceId: pull.deviceId,
         items,
+      });
+      return;
+    }
+
+    if (method === "POST" && path === "/v1/entitlement-pulls") {
+      const pull = parseEntitlementPullRequest(await readJson(request));
+      const now = this.#validNow();
+      const issuedAtMs = Date.parse(pull.issuedAt);
+      if (Math.abs(now.getTime() - issuedAtMs) > this.#clockSkewMs) {
+        throw new HttpError(401, "entitlement_pull_timestamp_rejected");
+      }
+      const device = this.#store.getDevice(pull.tenantId, pull.deviceId);
+      if (device === undefined) throw new HttpError(401, "unknown_device");
+      if (device.revokedAt !== null) throw new HttpError(403, "device_revoked");
+      let publicKey;
+      try {
+        publicKey = importEd25519Spki(device.publicKeySpki);
+      } catch {
+        throw new HttpError(500, "invalid_stored_key");
+      }
+      if (
+        !verifyEd25519(
+          publicKey,
+          entitlementPullSigningBytes(pull),
+          pull.signature,
+        )
+      ) {
+        throw new HttpError(401, "invalid_signature");
+      }
+      this.#store.recordEntitlementPullNonce({
+        tenantId: pull.tenantId,
+        deviceId: pull.deviceId,
+        nonceSha256: sha256Hex(
+          `kernaid:fleet:entitlement-pull-nonce:v1\0${pull.nonce}`,
+        ),
+        expiresAtMs: issuedAtMs + this.#clockSkewMs + 1,
+        nowMs: now.getTime(),
+      });
+      const entitlements = this.#store
+        .listEntitlementJson(pull.tenantId)
+        .map((stored) =>
+          parseEntitlementEnvelope(JSON.parse(stored) as unknown),
+        )
+        .filter((envelope) => entitlementAppliesTo(envelope, pull.deviceId));
+      const storedRevocations = this.#store.getEntitlementRevocationsJson(
+        pull.tenantId,
+      );
+      const revocations =
+        storedRevocations === undefined
+          ? null
+          : parseEntitlementRevocationEnvelope(
+              JSON.parse(storedRevocations) as unknown,
+            );
+      writeJson(response, 200, {
+        schema: "dev.kernaid.fleet.entitlement-pull-response.v1",
+        tenantId: pull.tenantId,
+        deviceId: pull.deviceId,
+        entitlements,
+        revocations,
       });
       return;
     }

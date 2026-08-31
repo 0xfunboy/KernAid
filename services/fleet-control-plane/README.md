@@ -41,11 +41,20 @@ upload or arbitrary metadata API.
 - Policy pulls are signed by the enrolled device key, time-bounded, and
   nonce-replay protected with a short-lived hash. Revoked and cross-tenant
   identities fail before lookup, and SQLite returns only matching assignments.
+- Entitlement and revocation publication accepts only byte-canonical documents
+  already signed by the offline issuer. Its raw Ed25519 public key is loaded
+  from a file outside SQLite; this service has no issuer private key, seed or
+  signing endpoint. Checkpoints are monotonic and exact replay is idempotent.
+- Entitlement pulls are signed by the enrolled device key, time-bounded and
+  nonce-replay protected. The response contains only documents assigning that
+  exact device plus its tenant-scoped signed revocation checkpoint.
 
 ## API
 
 All POST bodies use `Content-Type: application/json`, reject unknown fields,
 and are limited to 64 KiB, except canonical policy publication at 1 MiB.
+Entitlement and revocation publication must be exact compact canonical JSON
+and is bounded to 64 KiB, matching the Rust verifier.
 
 | Method | Route                                            | Authorization          | Result                                       |
 | ------ | ------------------------------------------------ | ---------------------- | -------------------------------------------- |
@@ -56,8 +65,11 @@ and are limited to 64 KiB, except canonical policy publication at 1 MiB.
 | `POST` | `/v1/inventories`                                | Signed device envelope | Insert or idempotently acknowledge inventory |
 | `POST` | `/v1/audit-events`                               | Signed device envelope | Append or idempotently acknowledge audit     |
 | `POST` | `/v1/policy-pulls`                               | Signed device request  | Return only applicable signed bundles        |
+| `POST` | `/v1/entitlement-pulls`                          | Signed device request  | Return assigned signed entitlements          |
 | `POST` | `/v1/tenants/:tenantId/policy-trust-anchor`      | Tenant bearer          | Set tenant Ed25519 public anchor once        |
 | `POST` | `/v1/tenants/:tenantId/policies`                 | Tenant bearer          | Verify and publish a pre-signed bundle       |
+| `POST` | `/v1/tenants/:tenantId/entitlements`             | Tenant bearer          | Verify/publish offline-signed entitlement    |
+| `POST` | `/v1/tenants/:tenantId/entitlement-revocations`  | Tenant bearer          | Publish signed revocation checkpoint         |
 | `GET`  | `/v1/tenants/:tenantId/devices`                  | Tenant bearer          | `{ items: [...] }` device registry           |
 | `GET`  | `/v1/tenants/:tenantId/assets`                   | Tenant bearer          | `{ items: [...] }` latest aggregate assets   |
 | `GET`  | `/v1/tenants/:tenantId/audit-events`             | Tenant bearer          | Bounded `{ items: [...] }` digest-only audit |
@@ -83,6 +95,13 @@ same 1 MiB limit as the Rust policy crate. Pull responses contain
 must pass the device's durable `PolicyCheckpoint`. The server cannot turn a
 policy into execution authority.
 
+Entitlement pull responses contain
+`{schema,tenantId,deviceId,entitlements,revocations}`. Each document remains
+independently signed by the offline issuer and must be verified on-device with
+`kernaid-entitlements` and its durable checkpoint. The server stores only
+canonical document bytes and monotonic sequence/digest checkpoints; it cannot
+mint or expand an entitlement.
+
 ## Run locally
 
 Use exactly Node.js 24.18.0 and the repository-pinned pnpm 9.15.9.
@@ -95,7 +114,12 @@ install -d -m 700 "$PWD/.local/fleet"
 openssl rand -hex 32 > "$PWD/.local/fleet/root-token"
 chmod 600 "$PWD/.local/fleet/root-token"
 
+# Copy only the offline issuer's public-key file here (never its seed).
+install -m 644 /secure-export/entitlement.public \
+  "$PWD/.local/fleet/entitlement.public"
+
 export KERNAID_FLEET_ROOT_TOKEN_FILE="$PWD/.local/fleet/root-token"
+export KERNAID_FLEET_ENTITLEMENT_TRUST_ANCHOR_FILE="$PWD/.local/fleet/entitlement.public"
 export KERNAID_FLEET_DB_PATH="$PWD/.local/fleet/fleet.sqlite"
 export KERNAID_FLEET_HOST="127.0.0.1"
 export KERNAID_FLEET_PORT="7341"
@@ -133,6 +157,9 @@ see [`deploy/fleet`](../../deploy/fleet/README.md).
 5. Generate the tenant policy key offline. Set its public SPKI once, sign each
    canonical policy outside this service, then publish the signed bundle. Keep
    the private key in the organization signing system.
+6. Provision the vendor entitlement issuer's raw public key through
+   `KERNAID_FLEET_ENTITLEMENT_TRUST_ANCHOR_FILE`. A tenant admin may publish
+   documents produced by that offline issuer, but cannot sign one here.
 
 ## Verification
 
@@ -147,4 +174,5 @@ The focused API suite covers cross-tenant denial, token expiry/reuse, key-ID
 binding, signature tampering, replay/idempotency, multi-asset retention,
 revocation, audit gaps/forks, unknown/private field rejection, hash-only
 secrets, policy assignment isolation, policy rollback/conflict, restart
-persistence, health and optional same-origin console serving.
+persistence, entitlement assignment/replay/tamper/rollback/revocation,
+SQLite v3-to-v4 migration, health and optional same-origin console serving.

@@ -27,6 +27,10 @@ assert.match(dockerfile, /^USER node:node$/m);
 assert.match(dockerfile, /^HEALTHCHECK /m);
 assert.match(dockerfile, /pnpm install --frozen-lockfile --ignore-scripts/);
 assert.match(dockerfile, /FLEET_CONSOLE_DIR=\/opt\/kernaid\/console/);
+assert.match(
+  dockerfile,
+  /KERNAID_FLEET_ENTITLEMENT_TRUST_ANCHOR_FILE=\/run\/configs\/kernaid_entitlement_trust_anchor/,
+);
 assert.match(dockerfile, /VOLUME \["\/var\/lib\/kernaid-fleet"\]/);
 assert.match(
   dockerfile,
@@ -40,10 +44,19 @@ assert.match(compose, /^\s+user: "1000:1000"$/m);
 assert.match(compose, /^\s+read_only: true$/m);
 assert.match(compose, /^\s+tmpfs:$/m);
 assert.match(compose, /^\s+KERNAID_FLEET_ROOT_TOKEN_FILE: \/run\/secrets\//m);
+assert.match(
+  compose,
+  /^\s+KERNAID_FLEET_ENTITLEMENT_TRUST_ANCHOR_FILE: \/run\/configs\//m,
+);
+assert.match(
+  compose,
+  /^\s+file: "\$\{KERNAID_FLEET_ENTITLEMENT_TRUST_ANCHOR_FILE:/m,
+);
 assert.match(compose, /^\s+mode: 0400$/m);
 assert.match(compose, /^\s+internal: true$/m);
 assert.match(compose, /^\s+- ALL$/m);
 assert.doesNotMatch(compose, /^\s+KERNAID_FLEET_ROOT_TOKEN:\s/m);
+assert.doesNotMatch(compose, /ENTITLEMENT_(?:PRIVATE|SEED|SIGNING)/i);
 
 assert.match(dockerignore, /^\*\*$/m);
 assert.match(dockerignore, /^!services\/fleet-control-plane\/\*\*$/m);

@@ -5,6 +5,7 @@ const config = loadFleetServiceConfig();
 const controlPlane = new FleetControlPlane({
   databasePath: config.databasePath,
   rootToken: config.rootToken,
+  entitlementTrustAnchor: config.entitlementTrustAnchor,
   enrollmentClockSkewMs: config.enrollmentClockSkewMs,
   consoleDirectory: config.consoleDirectory,
 });

@@ -18,6 +18,7 @@ Signatures are Ed25519 over these bytes, with no length prefix:
 kernaid:fleet:enrollment:v1\0 || canonical JSON(request without signature)
 kernaid:fleet:inventory:v1\0  || canonical JSON(envelope without signature)
 kernaid:fleet:policy-pull:v1\0 || canonical JSON(request without signature)
+kernaid:fleet:entitlement-pull:v1\0 || canonical JSON(request without signature)
 ```
 
 The test suite includes fixed enrollment and inventory vectors produced by the
@@ -46,6 +47,16 @@ kernaid:fleet:policy:v1\0 || u64be(canonical unsigned length)
 Fixed Rust vectors verify both the policy-pull direct framing and the policy
 bundle length framing byte-for-byte in Node.js.
 
+Signed commercial documents preserve the `kernaid-entitlements` framing:
+
+```text
+KERNAID-ENTITLEMENT-V1\0 || u64be(claims length) || canonical claims
+KERNAID-ENTITLEMENT-REVOCATIONS-V1\0 || u64be(claims length) || canonical claims
+```
+
+Fixed Rust vectors verify entitlement pulls, entitlement documents and
+revocation documents byte-for-byte in Node.js.
+
 ## Closed payloads
 
 - `dev.kernaid.fleet.enrollment-request.v1` binds a one-time token, tenant,
@@ -63,6 +74,9 @@ bundle length framing byte-for-byte in Node.js.
   represented.
 - `dev.kernaid.fleet.policy-bundle.v1` mirrors the strict Rust policy format,
   including sorted assignments/rules and mandatory rollback availability.
+- `dev.kernaid.fleet.entitlement-pull-request.v1` is a minimal signed freshness
+  proof. Entitlement and revocation envelopes contain only the closed,
+  bounded fields accepted by `kernaid-entitlements`.
 
 Device IDs have the canonical form
 `KA-<first 24 lowercase hex characters of SHA-256(raw Ed25519 public key)>`.

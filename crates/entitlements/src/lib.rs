@@ -503,6 +503,9 @@ fn strictly_sorted<T: Ord>(values: &[T]) -> bool {
 mod tests {
     use super::*;
 
+    const FIXTURE_ENTITLEMENT: &str = r#"{"claims":{"deviceIds":["device_alpha","device_beta"],"entitlementId":"ent_acme_001","expiresAtUnix":3000,"features":["audit","enterprise_repair","fleet","policy","updates"],"graceUntilUnix":4000,"issuedAtUnix":1000,"limits":{"maxManagedAssets":5000,"maxTechnicians":16,"maxToolDevices":8},"notBeforeUnix":1000,"offlineLeaseUntilUnix":2000,"plan":"enterprise","schema":"dev.kernaid.entitlement.v1","sequence":1,"tenantId":"tenant_acme"},"signature":"sWOJD4yoB89_MICu3glOpehAV8zeXJKXmI_TwnMDj7aZ0MxgA8C4pGtQUWumOMLEDQJp_ZoAbCbmSRpPWKRuBQ"}"#;
+    const FIXTURE_REVOCATIONS: &str = r#"{"claims":{"issuedAtUnix":1400,"revokedEntitlementIds":["ent_acme_001"],"schema":"dev.kernaid.entitlement-revocations.v1","sequence":7},"signature":"mOEmDZRrBVWAlYfPFMTT6ywK3y1_hLn0Dd1cdXVAUdg0UM0fZ7CinsR8OSP02TvlVqrl47vkYOcciAMtBIYgBw"}"#;
+
     fn signing_key() -> SigningKey {
         SigningKey::from_bytes(&[0x51; 32])
     }
@@ -546,6 +549,7 @@ mod tests {
     fn signed_entitlement_is_canonical_and_verifiable() {
         let key = signing_key();
         let document = sign_entitlement(claims(1), &key).expect("sign entitlement");
+        assert_eq!(document, FIXTURE_ENTITLEMENT.as_bytes());
         let verified = verify_entitlement(&document, &key.verifying_key().to_bytes(), None)
             .expect("verify entitlement");
         assert_eq!(verified.envelope.claims.tenant_id, "tenant_acme");
@@ -654,6 +658,7 @@ mod tests {
             &key,
         )
         .expect("sign revocations");
+        assert_eq!(document, FIXTURE_REVOCATIONS.as_bytes());
         let revoked = verify_revocations(&document, &key.verifying_key().to_bytes(), None)
             .expect("verify revocations");
         let result = capabilities(&verified(1), Some(&revoked), "device_alpha", 1_500);

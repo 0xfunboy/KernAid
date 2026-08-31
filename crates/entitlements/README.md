@@ -28,8 +28,9 @@ Fleet synchronization, audit upload and updates are gated according to the
 verified feature set and lease state.
 
 The crate does not store signing seeds, fetch licenses or grant broker access.
-Private vendor signing material belongs in the control plane or an offline
-release signer; the product receives only the pinned public trust anchor.
+Private vendor signing material belongs only in the offline release signing
+system; devices and the control plane receive only the pinned public trust
+anchor. The control plane has no entitlement signing endpoint.
 
 ## Offline issuance
 
