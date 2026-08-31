@@ -148,6 +148,46 @@ label live-amd64-failsafe
                 Path("/tmp/private.raw"), None, None, None, "invalid"
             )
 
+    def test_direct_boot_does_not_treat_public_boot_live_as_login_exposure(self) -> None:
+        secret = bytearray(b"0123456789abcdef" * 4)
+        login = bytearray(b"live")
+        media_identity = (1, 2, 3, 4)
+        stop = native_prompt_smoke.ClosedFailure("test", "stop")
+        try:
+            with (
+                mock.patch.object(native_prompt_smoke, "_validate_media"),
+                mock.patch.object(
+                    native_prompt_smoke, "_sha256", return_value="a" * 64
+                ),
+                mock.patch.object(
+                    native_prompt_smoke.LIFECYCLE,
+                    "QemuHarness",
+                    side_effect=stop,
+                ) as harness,
+                self.assertRaises(native_prompt_smoke.ClosedFailure) as failure,
+            ):
+                native_prompt_smoke._run_prompt_boot(
+                    "/usr/bin/qemu-system-x86_64",
+                    Path("/tmp/private.raw"),
+                    Path("/tmp/vmlinuz"),
+                    Path("/tmp/initrd.img"),
+                    "boot=live quiet",
+                    Path("/tmp/boot2"),
+                    secret,
+                    login,
+                    "d" * 64,
+                    media_identity,
+                    4096,
+                    "a" * 64,
+                    1800.0,
+                )
+            self.assertIs(failure.exception, stop)
+            self.assertEqual(harness.call_args.args[3], [secret, login])
+            self.assertEqual(harness.call_args.args[4], [secret])
+        finally:
+            native_prompt_smoke.LIFECYCLE.wipe(secret)
+            native_prompt_smoke.LIFECYCLE.wipe(login)
+
     def test_guest_proofs_are_fixed_bounded_and_wait_for_notify_ready(self) -> None:
         proofs = {
             "native-pre": native_prompt_smoke.PRE_PROOF,
