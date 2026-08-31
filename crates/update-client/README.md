@@ -33,6 +33,10 @@ destination path or slot.
 ## Integration order
 
 1. Fetch bytes outside this crate with normal transport hardening and limits.
+   The off-default
+   [`kernaid-fleet-resident-update`](../fleet-resident-update/README.md) is the
+   reference Enterprise HTTPS/download/staging integration; this crate remains
+   transport-neutral.
 2. Call `SignedUpdateManifest::import_and_verify` with the provisioned key.
 3. Evaluate platform, architecture, time, ring, and deterministic rollout.
 4. Call `admit_update` and atomically persist its `next_checkpoint`.

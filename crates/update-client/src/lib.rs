@@ -66,7 +66,8 @@ pub enum ReleaseRing {
 
 /// Locally effective device ring, normally obtained by intersecting local and
 /// Fleet policy. `Hold` blocks ordinary releases, never local rollback.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum UpdateRing {
     Hold,
     Canary,
