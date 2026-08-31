@@ -2,6 +2,8 @@
 
 pub mod rescue_repair;
 
+pub mod rescue_crypttab_repair;
+
 #[cfg(feature = "experimental-physical-parent-fingerprint")]
 pub mod rescue_physical_parent;
 

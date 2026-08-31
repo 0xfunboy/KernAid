@@ -3,9 +3,13 @@ use kernaid_protocol::{ActionStep, Risk};
 
 #[cfg(any(
     feature = "fixture-repair-lab",
-    feature = "rescue-fstab-production-candidate"
+    feature = "rescue-fstab-production-candidate",
+    feature = "rescue-crypttab-production-candidate"
 ))]
 use kernaid_protocol::ValidatedPlan;
+
+#[cfg(feature = "rescue-crypttab-production-candidate")]
+use kernaid_protocol::rescue_crypttab_repair;
 
 /// The only mutating action that the disposable fixture lab may admit.
 #[cfg(feature = "fixture-repair-lab")]
@@ -60,6 +64,25 @@ pub const RESCUE_FSTAB_ROLLBACK_BACKUP: &str = "source-vault-backup";
 #[cfg(feature = "rescue-fstab-production-candidate")]
 pub const RESCUE_FSTAB_EVIDENCE_IDS: [&str; 2] = ["E-LINUX-FSTAB", "E-LINUX-LSBLK"];
 
+#[cfg(feature = "rescue-crypttab-production-candidate")]
+pub const RESCUE_CRYPTTAB_ACTION_ID: &str = rescue_crypttab_repair::ACTION_ID;
+#[cfg(feature = "rescue-crypttab-production-candidate")]
+pub const RESCUE_CRYPTTAB_FINDING_ID: &str = rescue_crypttab_repair::FINDING_ID;
+#[cfg(feature = "rescue-crypttab-production-candidate")]
+pub const RESCUE_CRYPTTAB_FINDING_VERSION: u16 = rescue_crypttab_repair::FINDING_VERSION;
+#[cfg(feature = "rescue-crypttab-production-candidate")]
+pub const RESCUE_CRYPTTAB_RESOURCE_ID: &str = rescue_crypttab_repair::RESOURCE_ID;
+#[cfg(feature = "rescue-crypttab-production-candidate")]
+pub const RESCUE_CRYPTTAB_PREFLIGHT_ID: &str = "linux.crypttab.preflight";
+#[cfg(feature = "rescue-crypttab-production-candidate")]
+pub const RESCUE_CRYPTTAB_BACKUP: &str = "required";
+#[cfg(feature = "rescue-crypttab-production-candidate")]
+pub const RESCUE_CRYPTTAB_VALIDATION_ID: &str = "linux.boot.validate-crypttab";
+#[cfg(feature = "rescue-crypttab-production-candidate")]
+pub const RESCUE_CRYPTTAB_ROLLBACK_ID: &str = "linux.crypttab.restore";
+#[cfg(feature = "rescue-crypttab-production-candidate")]
+pub const RESCUE_CRYPTTAB_EVIDENCE_IDS: [&str; 3] = rescue_crypttab_repair::EVIDENCE_IDS;
+
 #[cfg(feature = "fixture-repair-lab")]
 const MAX_FIXTURE_EVIDENCE_IDS: usize = 32;
 #[cfg(feature = "fixture-repair-lab")]
@@ -88,7 +111,10 @@ pub enum PolicyError {
     InvalidFixtureRollback,
     #[cfg(feature = "rescue-fstab-production-candidate")]
     InvalidRescueFstabPlan,
-    #[cfg(feature = "rescue-fstab-production-candidate")]
+    #[cfg(any(
+        feature = "rescue-fstab-production-candidate",
+        feature = "rescue-crypttab-production-candidate"
+    ))]
     IncoherentRescueTargetFingerprint,
     #[cfg(feature = "rescue-fstab-production-candidate")]
     InvalidRescueFstabEvidence,
@@ -100,6 +126,18 @@ pub enum PolicyError {
     InvalidRescueFstabValidation,
     #[cfg(feature = "rescue-fstab-production-candidate")]
     InvalidRescueFstabRollback,
+    #[cfg(feature = "rescue-crypttab-production-candidate")]
+    InvalidRescueCrypttabPlan,
+    #[cfg(feature = "rescue-crypttab-production-candidate")]
+    InvalidRescueCrypttabEvidence,
+    #[cfg(feature = "rescue-crypttab-production-candidate")]
+    InvalidRescueCrypttabPrecondition,
+    #[cfg(feature = "rescue-crypttab-production-candidate")]
+    InvalidRescueCrypttabBackup,
+    #[cfg(feature = "rescue-crypttab-production-candidate")]
+    InvalidRescueCrypttabValidation,
+    #[cfg(feature = "rescue-crypttab-production-candidate")]
+    InvalidRescueCrypttabRollback,
 }
 
 pub fn validate_phase_zero(step: &ActionStep) -> Result<(), PolicyError> {
@@ -257,6 +295,47 @@ pub fn validate_rescue_fstab_rollback_plan(
     Ok(())
 }
 
+/// Admit only one closed Rescue crypttab plan. This is metadata admission;
+/// it neither dispatches a handler nor grants filesystem authority.
+#[cfg(feature = "rescue-crypttab-production-candidate")]
+pub fn validate_rescue_crypttab_production_candidate_plan(
+    plan: &ValidatedPlan,
+    session_target_fingerprint: &str,
+) -> Result<(), PolicyError> {
+    if !valid_sha256_fingerprint(session_target_fingerprint)
+        || plan.target_fingerprint != session_target_fingerprint
+    {
+        return Err(PolicyError::IncoherentRescueTargetFingerprint);
+    }
+    let [step] = plan.steps.as_slice() else {
+        return Err(PolicyError::InvalidRescueCrypttabPlan);
+    };
+    if step.action != RESCUE_CRYPTTAB_ACTION_ID || step.risk != Risk::R2 {
+        return Err(PolicyError::MutationDisabled);
+    }
+    if step.target_fingerprint != plan.target_fingerprint
+        || !valid_sha256_fingerprint(&step.target_fingerprint)
+    {
+        return Err(PolicyError::IncoherentRescueTargetFingerprint);
+    }
+    if step.evidence_ids.as_slice() != RESCUE_CRYPTTAB_EVIDENCE_IDS {
+        return Err(PolicyError::InvalidRescueCrypttabEvidence);
+    }
+    if step.preconditions.as_slice() != [RESCUE_CRYPTTAB_PREFLIGHT_ID] {
+        return Err(PolicyError::InvalidRescueCrypttabPrecondition);
+    }
+    if step.backup.as_deref() != Some(RESCUE_CRYPTTAB_BACKUP) {
+        return Err(PolicyError::InvalidRescueCrypttabBackup);
+    }
+    if step.validation != RESCUE_CRYPTTAB_VALIDATION_ID {
+        return Err(PolicyError::InvalidRescueCrypttabValidation);
+    }
+    if step.rollback.as_deref() != Some(RESCUE_CRYPTTAB_ROLLBACK_ID) {
+        return Err(PolicyError::InvalidRescueCrypttabRollback);
+    }
+    Ok(())
+}
+
 #[cfg(feature = "fixture-repair-lab")]
 fn validate_fixture_evidence_ids(evidence_ids: &[String]) -> Result<(), PolicyError> {
     if evidence_ids.is_empty() || evidence_ids.len() > MAX_FIXTURE_EVIDENCE_IDS {
@@ -287,7 +366,8 @@ fn valid_typed_id(value: &str, prefix: &str) -> bool {
 
 #[cfg(any(
     feature = "fixture-repair-lab",
-    feature = "rescue-fstab-production-candidate"
+    feature = "rescue-fstab-production-candidate",
+    feature = "rescue-crypttab-production-candidate"
 ))]
 fn valid_sha256_fingerprint(value: &str) -> bool {
     value.strip_prefix("sha256:").is_some_and(|digest| {
@@ -341,6 +421,82 @@ mod tests {
             validate_phase_zero(&fixture),
             Err(PolicyError::MutationDisabled)
         );
+
+        fixture.action = "linux.crypttab.disable-missing-uuid.v1".into();
+        assert_eq!(
+            validate_phase_zero(&fixture),
+            Err(PolicyError::MutationDisabled)
+        );
+    }
+
+    #[cfg(feature = "rescue-crypttab-production-candidate")]
+    mod rescue_crypttab_production_candidate {
+        use super::*;
+
+        const TARGET: &str =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+        fn plan() -> ValidatedPlan {
+            ValidatedPlan {
+                plan_id: "P-rescue-crypttab".into(),
+                target_fingerprint: TARGET.into(),
+                steps: vec![ActionStep {
+                    action: RESCUE_CRYPTTAB_ACTION_ID.into(),
+                    risk: Risk::R2,
+                    target_fingerprint: TARGET.into(),
+                    evidence_ids: RESCUE_CRYPTTAB_EVIDENCE_IDS
+                        .iter()
+                        .map(|value| (*value).to_owned())
+                        .collect(),
+                    preconditions: vec![RESCUE_CRYPTTAB_PREFLIGHT_ID.into()],
+                    backup: Some(RESCUE_CRYPTTAB_BACKUP.into()),
+                    validation: RESCUE_CRYPTTAB_VALIDATION_ID.into(),
+                    rollback: Some(RESCUE_CRYPTTAB_ROLLBACK_ID.into()),
+                }],
+            }
+        }
+
+        #[test]
+        fn admits_only_the_exact_closed_shape() {
+            assert_eq!(
+                validate_rescue_crypttab_production_candidate_plan(&plan(), TARGET),
+                Ok(())
+            );
+            let mut wrong = plan();
+            wrong.steps[0].action = "linux.crypttab.restore".into();
+            assert_eq!(
+                validate_rescue_crypttab_production_candidate_plan(&wrong, TARGET),
+                Err(PolicyError::MutationDisabled)
+            );
+            let mut extra = plan();
+            extra.steps.push(extra.steps[0].clone());
+            assert_eq!(
+                validate_rescue_crypttab_production_candidate_plan(&extra, TARGET),
+                Err(PolicyError::InvalidRescueCrypttabPlan)
+            );
+        }
+
+        #[test]
+        fn rejects_evidence_order_and_every_safety_drift() {
+            let mut evidence = plan();
+            evidence.steps[0].evidence_ids.swap(0, 1);
+            assert_eq!(
+                validate_rescue_crypttab_production_candidate_plan(&evidence, TARGET),
+                Err(PolicyError::InvalidRescueCrypttabEvidence)
+            );
+            let mut backup = plan();
+            backup.steps[0].backup = Some("inherited".into());
+            assert_eq!(
+                validate_rescue_crypttab_production_candidate_plan(&backup, TARGET),
+                Err(PolicyError::InvalidRescueCrypttabBackup)
+            );
+            let mut rollback = plan();
+            rollback.steps[0].rollback = None;
+            assert_eq!(
+                validate_rescue_crypttab_production_candidate_plan(&rollback, TARGET),
+                Err(PolicyError::InvalidRescueCrypttabRollback)
+            );
+        }
     }
 
     #[cfg(feature = "rescue-fstab-production-candidate")]

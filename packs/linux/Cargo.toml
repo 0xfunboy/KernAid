@@ -7,6 +7,7 @@ default=[]
 fixture-snapshot-cli = []
 fixture-repair-lab=["dep:sha2"]
 rescue-fstab-production-candidate=["dep:sha2"]
+rescue-crypttab-production-candidate=["dep:sha2"]
 [lints]
 workspace=true
 [dependencies]
