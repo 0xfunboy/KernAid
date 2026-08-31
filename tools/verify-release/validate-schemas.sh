@@ -7,6 +7,7 @@ expected_schemas=(
   diagnosis-proposal.schema.json
   evidence.schema.json
   execution-event.schema.json
+  linux-filesystem-health.schema.json
   linux-hardware-inventory.schema.json
   linux-normalized-snapshot.schema.json
   linux-storage-health.schema.json
