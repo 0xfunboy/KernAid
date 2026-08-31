@@ -261,7 +261,7 @@ label live-amd64-failsafe
                     1800.0,
                 )
             self.assertIs(failure.exception, stop)
-            self.assertEqual(harness.call_args.args[3], [secret, login])
+            self.assertEqual(harness.call_args.args[3], [secret])
             self.assertEqual(harness.call_args.args[4], [secret])
         finally:
             native_prompt_smoke.LIFECYCLE.wipe(secret)

@@ -761,7 +761,7 @@ def _run_firstboot(
         qemu,
         _qemu_arguments(media, None, None, None, secret_digest),
         qmp_path,
-        [secret, login],
+        [secret],
         [secret, login],
     )
     aggregate = time.monotonic() + timeout
@@ -840,11 +840,11 @@ def _run_prompt_boot(
         qemu,
         _qemu_arguments(media, kernel, initrd, append, secret_digest),
         qmp_path,
-        [secret, login],
+        [secret],
         # live-config's public default login is the literal "live", which is
         # necessarily a substring of the required direct-boot token
-        # "boot=live". Keep it forbidden in both bounded output captures, but
-        # metadata-gate the high-entropy Vault passphrase only; every QEMU
+        # "boot=live". Its echo is checked contextually while authenticating;
+        # metadata-gate the high-entropy Vault passphrase only. Every QEMU
         # argument remains closed by _qemu_arguments() and _boot_append().
         [secret],
     )
