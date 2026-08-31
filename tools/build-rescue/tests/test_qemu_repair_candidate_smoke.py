@@ -462,24 +462,37 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
         workflow = WORKFLOW.read_text(encoding="utf-8")
         self.assertEqual(
             workflow.count("./tools/build-rescue/qemu-repair-candidate-smoke.sh"),
-            5,
+            1,
         )
-        self.assertIn("qemu-repair-candidate-smoke.sh bios apply", workflow)
-        self.assertIn("qemu-repair-candidate-smoke.sh uefi apply", workflow)
-        self.assertIn("qemu-repair-candidate-smoke.sh uefi rollback", workflow)
-        self.assertIn("uefi interrupt-reconcile", workflow)
-        self.assertIn("uefi failure-paths", workflow)
+        self.assertIn("uefi qualification-batch", workflow)
         source = SCRIPT.read_text(encoding="utf-8")
         self.assertIn('firmware="${1:-bios}"', source)
         self.assertIn('scenario="${2:-apply}"', source)
+        for scenario in (
+            "bios:apply",
+            "uefi:apply",
+            "uefi:rollback",
+            "uefi:interrupt-reconcile",
+            "uefi:stale-target",
+            "uefi:cancel",
+            "uefi:backup-tamper",
+            "uefi:repaird-termination",
+            "uefi:auto-restore",
+        ):
+            self.assertIn(scenario, source)
         self.assertIn("controller_timeout=1500", source)
         self.assertIn("controller_timeout=1800", source)
         self.assertIn("controller_timeout=1200", source)
+        self.assertIn("controller_timeout=2100", source)
         self.assertIn('readonly qemu_smp="${KERNAID_QEMU_SMP:-2}"', source)
         self.assertIn('1|2|4|8)', source)
         self.assertIn('-smp "$qemu_smp"', source)
         self.assertNotIn("KERNAID_QEMU_SMP=4", workflow)
-        self.assertEqual(workflow.count("KERNAID_QEMU_SMP=2"), 5)
+        self.assertEqual(workflow.count("KERNAID_QEMU_SMP=2"), 1)
+        self.assertIn(
+            "KERNAID_QEMU_REPAIR_QUALIFICATION_BATCH_ATTESTATION_V1",
+            source,
+        )
 
     def test_repair_shutdown_keeps_a_bounded_tcg_safe_budget(self) -> None:
         source = CONTROLLER.read_text(encoding="utf-8")
@@ -586,7 +599,7 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
         self.assertIn('cmp -s -- "$expected_fstab" "$observed_fstab"', shell)
         self.assertIn("KERNAID_REPAIR_TARGET_SENTINEL", shell)
         self.assertIn('[[ "$prefix_after_sha256" == "$iso_sha256" ]]', shell)
-        self.assertEqual(workflow.count("uefi rollback"), 1)
+        self.assertEqual(shell.count("uefi:rollback"), 1)
 
     def test_interruption_witness_and_reconciliation_are_fail_closed(self) -> None:
         source = CONTROLLER.read_text(encoding="utf-8")
@@ -767,7 +780,8 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
         self.assertIn("scenario=provision-base", shell)
         self.assertIn("cp --reflink=auto --sparse=always", shell)
         self.assertIn('controller_args+=(--already-provisioned)', shell)
-        self.assertEqual(workflow.count("uefi failure-paths"), 1)
+        self.assertEqual(workflow.count("uefi qualification-batch"), 1)
+        self.assertEqual(shell.count("uefi:stale-target"), 1)
         for scenario in controller.FAILURE_SCENARIOS:
             self.assertIn(scenario, shell)
         self.assertIn(

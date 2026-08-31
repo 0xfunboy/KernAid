@@ -213,37 +213,19 @@ jobs:
             ./tools/build-rescue/qemu-smoke.sh secureboot \
             "$PWD/KernAid-Rescue-amd64-repair-candidate.iso"
 
-      - name: QEMU BIOS repair candidate apply qualification
+      - name: QEMU consolidated repair candidate qualification
+        timeout-minutes: 135
         run: |
-          KERNAID_QEMU_SMP=2 \
-            ./tools/build-rescue/qemu-repair-candidate-smoke.sh bios apply \
-            "$PWD/KernAid-Rescue-amd64-repair-candidate.iso"
-
-      - name: QEMU UEFI repair candidate apply qualification
-        run: |
-          KERNAID_QEMU_SMP=2 \
-            ./tools/build-rescue/qemu-repair-candidate-smoke.sh uefi apply \
-            "$PWD/KernAid-Rescue-amd64-repair-candidate.iso"
-
-      - name: QEMU UEFI post-commit rollback qualification
-        run: |
-          KERNAID_QEMU_SMP=2 \
-            ./tools/build-rescue/qemu-repair-candidate-smoke.sh uefi rollback \
-            "$PWD/KernAid-Rescue-amd64-repair-candidate.iso"
-
-      - name: QEMU UEFI repair candidate restart reconciliation qualification
-        run: |
+          log="$PWD/rescue-repair-candidate-batch.log"
+          : >"$log"
+          chmod 0600 "$log"
           KERNAID_QEMU_SMP=2 \
             ./tools/build-rescue/qemu-repair-candidate-smoke.sh \
-            uefi interrupt-reconcile \
-            "$PWD/KernAid-Rescue-amd64-repair-candidate.iso"
-
-      - name: QEMU UEFI exact-image repair failure-path qualification
-        run: |
-          KERNAID_QEMU_SMP=2 \
-            ./tools/build-rescue/qemu-repair-candidate-smoke.sh \
-            uefi failure-paths \
-            "$PWD/KernAid-Rescue-amd64-repair-candidate.iso"
+            uefi qualification-batch \
+            "$PWD/KernAid-Rescue-amd64-repair-candidate.iso" | tee "$log"
+          grep -Eq \
+            '^KERNAID_QEMU_REPAIR_QUALIFICATION_BATCH_ATTESTATION_V1 .* ready=true$' \
+            "$log"
 
       - name: Upload sanitized repair candidate smoke logs
         if: ${{ always() }}

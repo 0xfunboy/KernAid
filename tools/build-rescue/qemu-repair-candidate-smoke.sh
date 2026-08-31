@@ -27,8 +27,12 @@ if [[ "$scenario" != apply && "$scenario" != rollback \
   && "$scenario" != interrupt-reconcile && "$scenario" != failure-paths \
   && "$scenario" != stale-target && "$scenario" != cancel \
   && "$scenario" != backup-tamper && "$scenario" != repaird-termination \
-  && "$scenario" != auto-restore ]]; then
-  echo "Usage: $0 [bios|uefi] [apply|rollback|interrupt-reconcile|failure-paths] [iso]" >&2
+  && "$scenario" != auto-restore && "$scenario" != qualification-batch ]]; then
+  echo "Usage: $0 [bios|uefi] [apply|rollback|interrupt-reconcile|failure-paths|qualification-batch] [iso]" >&2
+  exit 2
+fi
+if [[ "$scenario" == qualification-batch && "$firmware" != uefi ]]; then
+  echo "qualification-batch must start from UEFI provisioning" >&2
   exit 2
 fi
 if [[ "$scenario" != apply ]]; then
@@ -39,6 +43,11 @@ if [[ "$scenario" != apply ]]; then
 fi
 if [[ "$scenario" == rollback ]]; then
   controller_timeout=1500
+elif [[ "$scenario" == qualification-batch ]]; then
+  # Provision once, then reuse isolated sparse copies for every qualification
+  # scenario. The post-confirmation zero proof may consume up to 25 minutes
+  # under TCG; child scenarios inherit already-provisioned media.
+  controller_timeout=2100
 elif [[ "$scenario" == interrupt-reconcile || "$scenario" == backup-tamper ]]; then
   controller_timeout=1800
 elif [[ "$scenario" == failure-paths ]]; then
@@ -284,7 +293,7 @@ fi
 
 set +e
 controller_scenario="$scenario"
-if [[ "$scenario" == failure-paths ]]; then
+if [[ "$scenario" == failure-paths || "$scenario" == qualification-batch ]]; then
   controller_scenario=provision-base
 fi
 controller_args=(
@@ -312,7 +321,7 @@ if [[ "$firmware" == uefi ]]; then
     --ovmf-vars-template "$ovmf_vars_template"
   )
 fi
-if [[ "$scenario" == failure-paths ]]; then
+if [[ "$scenario" == failure-paths || "$scenario" == qualification-batch ]]; then
   python3 -I -B "$controller" \
     "${controller_args[@]}" -- "${qemu_args[@]}" \
     3<"$vault_key" 4<"$login_credential" \
@@ -328,6 +337,46 @@ if [[ "$scenario" == failure-paths ]]; then
   [[ "$(cat "$controller_output")" == "$expected_base" ]] || exit 1
   [[ "$(sha256sum "$target_image" | awk '{print $1}')" == "$target_before_sha256" ]] \
     || exit 1
+
+  if [[ "$scenario" == qualification-batch ]]; then
+    qualification_cases=(
+      bios:apply
+      uefi:apply
+      uefi:rollback
+      uefi:interrupt-reconcile
+      uefi:stale-target
+      uefi:cancel
+      uefi:backup-tamper
+      uefi:repaird-termination
+      uefi:auto-restore
+    )
+    for qualification_case in "${qualification_cases[@]}"; do
+      case_firmware="${qualification_case%%:*}"
+      case_scenario="${qualification_case#*:}"
+      printf 'KERNAID_QEMU_REPAIR_QUALIFICATION_CASE_V1 firmware=%s scenario=%s\n' \
+        "$case_firmware" "$case_scenario" >&2
+      case_output="$(
+        KERNAID_REPAIR_PROVISIONED_BASE="$rescue_media" \
+        KERNAID_REPAIR_PROVISIONED_KEY="$vault_key" \
+        KERNAID_REPAIR_TARGET_BASE="$target_image" \
+        KERNAID_QEMU_SMP="$qemu_smp" \
+          "$repo_dir/tools/build-rescue/qemu-repair-candidate-smoke.sh" \
+          "$case_firmware" "$case_scenario" "$iso"
+      )"
+      case_pattern="^KERNAID_QEMU_REPAIR_CANDIDATE_ATTESTATION_V1 .* firmware=$case_firmware scenario=$case_scenario .* iso_sha256=$iso_sha256 .* ready=true$"
+      [[ "$case_output" != *$'\n'* && "$case_output" =~ $case_pattern ]] \
+        || exit 1
+    done
+    [[ "$(sha256sum "$target_image" | awk '{print $1}')" == "$target_before_sha256" \
+      && "$(stat -c '%s' -- "$vault_key")" == 64 \
+      && "$(tr -d '0-9a-f' <"$vault_key")" == "" ]] || exit 1
+    prefix_after_sha256="$(dd if="$rescue_media" bs=4M iflag=count_bytes \
+      count="$iso_bytes" status=none | sha256sum | awk '{print $1}')"
+    [[ "$prefix_after_sha256" == "$iso_sha256" ]] || exit 1
+    printf '%s\n' \
+      "KERNAID_QEMU_REPAIR_QUALIFICATION_BATCH_ATTESTATION_V1 provisioning=shared scenarios=bios-apply,uefi-apply,uefi-rollback,uefi-interrupt-reconcile,uefi-stale-target,uefi-cancel,uefi-backup-tamper,uefi-repaird-termination,uefi-auto-restore isolated_sparse_copies=true iso_sha256=$iso_sha256 iso_prefix_immutable=true host_physical_devices=false ready=true"
+    exit 0
+  fi
 
   failure_cases=(
     stale-target
