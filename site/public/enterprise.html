@@ -57,7 +57,7 @@
           <a class="button button--signal" href="#platform">Esplora la piattaforma <span aria-hidden="true">↓</span></a>
           <a class="button button--quiet" href="#trust">Valuta il trust model</a>
         </div>
-        <p class="hero-note">Desk e Rescue sono disponibili come engineering preview. Le riparazioni di produzione e Fleet sono in sviluppo.</p>
+        <p class="hero-note">Desk e Rescue sono disponibili come engineering preview. Fleet è operativo come control plane interno; integrazione dispositivo e riparazioni di produzione restano in qualifica.</p>
       </div>
 
       <div class="ops-console" aria-hidden="true">
@@ -300,8 +300,8 @@
         <article>
           <div class="matrix-head"><span>MSP OPERATIONS</span><i>03</i></div>
           <h3>Ripetibilità tra tecnici e tenant</h3>
-          <p>Profili, distribuzione e visibilità centralizzata sono il livello Fleet pianificato, costruito sopra una decisione che resta locale.</p>
-          <ul><li>Separazione di ruoli e contesti <em>Planned</em></li><li>Cataloghi firmati <em>Planned</em></li><li>Fleet governance <em>Planned</em></li></ul>
+          <p>Il control plane Fleet raccoglie inventario firmato e privacy-bounded senza trasformarsi in una shell remota: l’autorità di intervento resta sul dispositivo.</p>
+          <ul><li>Tenant e identità dispositivo separati <em>Preview</em></li><li>Policy ed entitlement firmati <em>Preview</em></li><li>Console operativa interna <em>Live</em></li></ul>
         </article>
       </div>
     </section>
@@ -367,7 +367,7 @@
             <li><span>✓</span>Desk engineering access</li>
             <li><span>✓</span>Rescue qualification track</li>
             <li><span>✓</span>Architecture &amp; workflow reviews</li>
-            <li><span>↗</span>Fleet input and roadmap sessions</li>
+            <li><span>↗</span>Fleet engineering access &amp; roadmap sessions</li>
           </ul>
           <span class="button button--quiet button--full program-closed" aria-disabled="true">Candidature non ancora aperte</span>
           <p class="offer-disclaimer">Indicazione di prezzo in validazione, non un’offerta attualmente acquistabile. Accesso, perimetro e condizioni dipenderanno dalla qualifica e da un accordo dedicato.</p>
@@ -376,7 +376,7 @@
 
       <div class="commercial-model">
         <div class="commercial-model__intro"><span>COMMERCIAL ARCHITECTURE</span><strong>Pagare per controllo e continuità.<br>Non per una scatola nera.</strong></div>
-        <article><span>01</span><h3>Subscription</h3><p>Software, release qualificate, workflow, audit e futuro controllo Fleet.</p><small>Design Partner from $299/month · planned</small></article>
+        <article><span>01</span><h3>Subscription</h3><p>Software, release qualificate, workflow, audit e controllo Fleet in progressiva qualifica.</p><small>Design Partner from $299/month · planned</small></article>
         <article><span>02</span><h3>KernAid One</h3><p>Kit hardware Rescue qualificato e gestito, separato dalla licenza.</p><small>Pricing after physical qualification</small></article>
         <article><span>03</span><h3>BYO provider</h3><p>Il cliente sceglie e paga direttamente il proprio provider AI.</p><small>No token resale · optional usage</small></article>
       </div>
@@ -395,7 +395,7 @@
       <div class="readiness-board">
         <article class="readiness-card readiness-card--ready">
           <div class="readiness-head"><span><i aria-hidden="true"></i> AVAILABLE NOW</span><strong>ENGINEERING PREVIEW</strong></div>
-          <ul><li>Desk build target per Windows, Linux e macOS</li><li>Rescue amd64 qualificata virtualmente BIOS/UEFI</li><li>Diagnosi deterministica e provider opzionale</li><li>Piani R0, report con hash e audit Rescue firmato</li></ul>
+          <ul><li>Desk build target per Windows, Linux e macOS</li><li>Rescue amd64 qualificata virtualmente BIOS/UEFI</li><li>Diagnosi deterministica e provider opzionale</li><li>Fleet interno: identità, inventario firmato e console tenant</li></ul>
         </article>
         <article class="readiness-card readiness-card--active">
           <div class="readiness-head"><span><i aria-hidden="true"></i> ACTIVE GATES</span><strong>QUALIFICATION</strong></div>
@@ -403,7 +403,7 @@
         </article>
         <article class="readiness-card readiness-card--planned">
           <div class="readiness-head"><span><i aria-hidden="true"></i> NEXT SYSTEM</span><strong>ROADMAP</strong></div>
-          <ul><li>Repair pack firmati e aggiornamenti A/B</li><li>Windows offline e WinPE Companion</li><li>Profondità nativa macOS</li><li>Fleet, ruoli e policy organizzative</li></ul>
+          <ul><li>Repair pack firmati e aggiornamenti A/B</li><li>Windows offline e WinPE Companion</li><li>Profondità nativa macOS</li><li>Distribuzione policy e runtime Fleet sui device</li></ul>
         </article>
       </div>
 
