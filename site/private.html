@@ -106,6 +106,58 @@
       </section>
     </section>
 
+    <section class="release-card diagnostic-candidate-card" aria-labelledby="diagnostic-candidate-title">
+      <div class="release-heading">
+        <div>
+          <p class="card-kicker">{{diagnosticCandidateChannel}}</p>
+          <h2 id="diagnostic-candidate-title">{{diagnosticCandidateName}}</h2>
+        </div>
+        <span class="release-status {{diagnosticCandidateStateClass}}"><i></i>{{diagnosticCandidateArtifactState}}</span>
+      </div>
+
+      <div class="danger-note" role="alert">
+        <strong>Physical-test candidate separata · non è la stable</strong>
+        <p>{{diagnosticCandidateWarning}}</p>
+      </div>
+
+      <dl class="release-meta">
+        <div><dt>ISO candidate</dt><dd><code>{{diagnosticCandidateDownloadName}}</code></dd></div>
+        <div><dt>Versione artefatto</dt><dd><code>{{diagnosticCandidateArtifactVersion}}</code></dd></div>
+        <div><dt>Commit sorgente</dt><dd><code>{{diagnosticCandidateSourceCommit}}</code></dd></div>
+        <div><dt>Workflow run</dt><dd><code>{{diagnosticCandidateWorkflowRunId}}</code></dd></div>
+        <div><dt>Dimensione</dt><dd>{{diagnosticCandidateSize}}</dd></div>
+        <div><dt>Modificato</dt><dd>{{diagnosticCandidateModified}}</dd></div>
+        <div><dt>SHA-256</dt><dd><code class="full-hash">{{diagnosticCandidateHash}}</code></dd></div>
+      </dl>
+
+      <div class="qualification-note">
+        <span>Copertura reale del run</span>
+        <p>{{diagnosticCandidateQualification}}</p>
+        <a href="{{diagnosticCandidateWorkflowUrl}}" target="_blank" rel="noreferrer">Apri il workflow candidate ↗</a>
+      </div>
+
+      <div class="release-actions">
+        {{diagnosticCandidateActions}}
+      </div>
+
+      <section class="secondary-artifact" aria-labelledby="diagnostic-retail-title">
+        <div class="secondary-artifact-heading">
+          <div>
+            <p class="card-kicker">Supporto Windows / Rufus</p>
+            <h3 id="diagnostic-retail-title">Immagine retail dello stesso run</h3>
+          </div>
+        </div>
+        <dl class="release-meta secondary-meta">
+          <div><dt>File atteso</dt><dd><code>{{diagnosticCandidateRetailDownloadName}}</code></dd></div>
+          <div><dt>Dimensione</dt><dd>{{diagnosticCandidateRetailSize}}</dd></div>
+          <div><dt>SHA-256</dt><dd><code class="full-hash">{{diagnosticCandidateRetailHash}}</code></dd></div>
+        </dl>
+        <div class="release-actions">
+          {{diagnosticCandidateRetailActions}}
+        </div>
+      </section>
+    </section>
+
     <section class="release-card repair-candidate-card" aria-labelledby="repair-candidate-title">
       <div class="release-heading">
         <div>
@@ -150,6 +202,7 @@
         <p>Windows PowerShell — immagine retail</p><code>Get-FileHash .\{{downloadName}} -Algorithm SHA256</code>
         <p>Linux — immagine retail</p><code>sha256sum -c {{checksumName}}</code>
         <p>Linux — ISO tecnica</p><code>sha256sum -c {{isoChecksumName}}</code>
+        {{diagnosticCandidateVerify}}
         {{repairCandidateVerify}}
       </div>
     </section>

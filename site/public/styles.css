@@ -432,6 +432,7 @@ footer a:hover { color: var(--text); }
   background: linear-gradient(150deg, rgba(80,216,232,.045), transparent 48%), var(--panel);
   box-shadow: var(--shadow);
 }
+.diagnostic-candidate-card,
 .repair-candidate-card { margin-top: 18px; }
 .release-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; }
 .release-heading h2 { margin: 12px 0 0; font-size: clamp(32px, 5vw, 50px); letter-spacing: -.05em; }
@@ -439,6 +440,8 @@ footer a:hover { color: var(--text); }
 .release-status i { width: 7px; height: 7px; border-radius: 50%; }
 .status-ready { color: var(--lime); border-color: rgba(199,255,61,.3); }
 .status-ready i { background: var(--lime); }
+.status-warning { color: var(--amber); border-color: rgba(255,191,105,.35); }
+.status-warning i { background: var(--amber); }
 .status-unavailable { color: var(--danger); border-color: rgba(255,141,116,.3); }
 .status-unavailable i { background: var(--danger); }
 
