@@ -28,6 +28,9 @@ const PLYMOUTH_QUIT_TIMEOUT: Duration = Duration::from_secs(3);
 const PLYMOUTH_PATH: &str = "/usr/bin/plymouth";
 const PLYMOUTH_QUIT_ARGUMENTS: &[&str] = &["quit"];
 const PLYMOUTH_PING_ARGUMENTS: &[&str] = &["--ping"];
+const CHVT_PATH: &str = "/usr/bin/chvt";
+const CHVT_TTY1_ARGUMENTS: &[&str] = &["1"];
+const CHVT_TIMEOUT: Duration = Duration::from_secs(3);
 const SECRET_READ_CHUNK_BYTES: usize = 256;
 const ZERO_SCAN_PROGRESS_MARKER: &str =
     "KERNAID_RESCUE_FIRSTBOOT_PROGRESS_V1 stage=post-confirmation-zero-scan";
@@ -52,6 +55,7 @@ pub enum FirstBootBoundaryError {
     ProcessPrivacyUnavailable,
     PrivateMountNamespaceUnavailable,
     BootSplashDismissalFailed,
+    ActiveConsoleUnavailable,
     TtyConfirmationUnavailable,
     ManagerUnavailable,
     ProvisioningFailed,
@@ -81,6 +85,7 @@ impl FirstBootBoundaryError {
             Self::ProcessPrivacyUnavailable => "process-privacy-unavailable",
             Self::PrivateMountNamespaceUnavailable => "private-mount-namespace-unavailable",
             Self::BootSplashDismissalFailed => "boot-splash-dismissal-failed",
+            Self::ActiveConsoleUnavailable => "active-console-unavailable",
             Self::TtyConfirmationUnavailable => "tty-confirmation-unavailable",
             Self::ManagerUnavailable => "manager-unavailable",
             Self::ProvisioningFailed => "provisioning-failed",
@@ -540,6 +545,7 @@ pub fn run_rescue_firstboot() -> Result<FirstBootProvisioningEvidence, FirstBoot
     enter_private_mount_namespace()?;
     let preflight = run_rescue_firstboot_preflight()?;
     dismiss_boot_splash()?;
+    activate_firstboot_console()?;
     let (first, confirmation) = crate::rescue_daemon::read_firstboot_passphrase_pair()
         .map_err(|_| FirstBootBoundaryError::TtyConfirmationUnavailable)?;
     let passphrase = ConfirmedPassphrase::confirm_values(first, confirmation)?;
@@ -583,6 +589,27 @@ fn run_plymouth_command(
         .stderr(Stdio::null());
     bounded_process::wait(&mut command, PLYMOUTH_QUIT_TIMEOUT)
         .map_err(|_| FirstBootBoundaryError::BootSplashDismissalFailed)
+}
+
+/// Put the fixed first-boot terminal on the physical/QEMU keyboard path before
+/// announcing prompt readiness. Owning tty1 as the foreground process group is
+/// insufficient when Plymouth has left another VT active: keyboard events
+/// would then be delivered to that VT while the provisioner waited forever on
+/// tty1. The command and target are compile-time constants, bounded, and run
+/// without inherited stdio.
+fn activate_firstboot_console() -> Result<(), FirstBootBoundaryError> {
+    let mut command = Command::new(CHVT_PATH);
+    command
+        .args(CHVT_TTY1_ARGUMENTS)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let status = bounded_process::wait(&mut command, CHVT_TIMEOUT)
+        .map_err(|_| FirstBootBoundaryError::ActiveConsoleUnavailable)?;
+    if !status.success() {
+        return Err(FirstBootBoundaryError::ActiveConsoleUnavailable);
+    }
+    Ok(())
 }
 
 fn enter_private_mount_namespace() -> Result<(), FirstBootBoundaryError> {
@@ -826,6 +853,9 @@ mod tests {
         assert_eq!(PLYMOUTH_QUIT_ARGUMENTS, ["quit"]);
         assert_eq!(PLYMOUTH_PING_ARGUMENTS, ["--ping"]);
         assert_eq!(PLYMOUTH_QUIT_TIMEOUT, Duration::from_secs(3));
+        assert_eq!(CHVT_PATH, "/usr/bin/chvt");
+        assert_eq!(CHVT_TTY1_ARGUMENTS, ["1"]);
+        assert_eq!(CHVT_TIMEOUT, Duration::from_secs(3));
         assert_eq!(
             ZERO_SCAN_PROGRESS_MARKER,
             "KERNAID_RESCUE_FIRSTBOOT_PROGRESS_V1 stage=post-confirmation-zero-scan"

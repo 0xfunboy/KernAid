@@ -103,6 +103,7 @@ class VaultSystemdPackagingTests(unittest.TestCase):
         )
         self.assertIn("live-config.service", unit["After"].split())
         self.assertIn("systemd-tmpfiles-setup.service", unit["After"].split())
+        self.assertIn("systemd-vconsole-setup.service", unit["After"].split())
         self.assertEqual(
             set(unit["Before"].split()),
             {
@@ -126,7 +127,8 @@ class VaultSystemdPackagingTests(unittest.TestCase):
         self.assertEqual(service["PrivateDevices"], "no")
         self.assertEqual(service["ProtectSystem"], "strict")
         self.assertEqual(
-            service["CapabilityBoundingSet"], "CAP_CHOWN CAP_SYS_ADMIN"
+            service["CapabilityBoundingSet"],
+            "CAP_CHOWN CAP_SYS_ADMIN CAP_SYS_TTY_CONFIG",
         )
         self.assertNotIn("CAP_DAC_OVERRIDE", service["CapabilityBoundingSet"])
         self.assertNotIn("CAP_FOWNER", service["CapabilityBoundingSet"])

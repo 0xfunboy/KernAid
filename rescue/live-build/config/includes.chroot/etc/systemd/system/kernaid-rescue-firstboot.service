@@ -2,7 +2,7 @@
 Description=KernAid Rescue first-boot vault provisioning gate
 Requires=live-config.service
 Wants=kernaid-qemu-native-prompt-journal-proof@boot1.service
-After=live-config.service systemd-sysusers.service systemd-sysctl.service systemd-tmpfiles-setup.service
+After=live-config.service systemd-sysusers.service systemd-sysctl.service systemd-tmpfiles-setup.service systemd-vconsole-setup.service
 # Plymouth's quit units are also pulled into Debian's multi-user transaction.
 # Do not order this gate ahead of them: the binary already tolerates a
 # completed Plymouth shutdown before it claims tty1.
@@ -47,7 +47,7 @@ ProtectClock=yes
 ProtectHostname=yes
 ProtectControlGroups=yes
 ReadWritePaths=-/run/kernaid /run/lock -/run/cryptsetup
-CapabilityBoundingSet=CAP_CHOWN CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_CHOWN CAP_SYS_ADMIN CAP_SYS_TTY_CONFIG
 AmbientCapabilities=
 RestrictAddressFamilies=AF_UNIX
 RestrictRealtime=yes

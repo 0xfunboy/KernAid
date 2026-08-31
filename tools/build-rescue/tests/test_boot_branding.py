@@ -123,10 +123,17 @@ class RescueBootBrandingTests(unittest.TestCase):
         firstboot = FIRSTBOOT_SOURCE.read_text(encoding="utf-8")
         preflight = "let preflight = run_rescue_firstboot_preflight()?;"
         dismiss = "dismiss_boot_splash()?;"
+        activate = "activate_firstboot_console()?;"
         prompt = "read_firstboot_passphrase_pair()"
         self.assertLess(firstboot.index(preflight), firstboot.index(dismiss))
-        self.assertLess(firstboot.index(dismiss), firstboot.index(prompt))
+        self.assertLess(firstboot.index(dismiss), firstboot.index(activate))
+        self.assertLess(firstboot.index(activate), firstboot.index(prompt))
         self.assertIn('const PLYMOUTH_PATH: &str = "/usr/bin/plymouth";', firstboot)
+        self.assertIn('const CHVT_PATH: &str = "/usr/bin/chvt";', firstboot)
+        self.assertIn(
+            'const CHVT_TTY1_ARGUMENTS: &[&str] = &["1"];',
+            firstboot,
+        )
         self.assertIn(
             'const PLYMOUTH_PING_ARGUMENTS: &[&str] = &["--ping"];',
             firstboot,
