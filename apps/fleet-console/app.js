@@ -1,4 +1,13 @@
 import { boundedSignedDocument } from "./publish-document.js";
+import {
+  assertMinimizedWorkOrder,
+  createWorkOrderPayload,
+  workOrderActions,
+  workOrderActionsForPlatform,
+  workOrderControls,
+  workOrderReadiness,
+  workOrderReceiptState,
+} from "./work-order-ui.js";
 
 const apiBase =
   document
@@ -17,6 +26,9 @@ const state = {
   entitlementRevocations: null,
   updates: [],
   governanceError: "",
+  workOrders: [],
+  workOrderEvents: [],
+  workOrderError: "",
   view: "overview",
 };
 
@@ -83,6 +95,20 @@ const elements = {
   policyStatusList: document.querySelector("#policy-status-list"),
   entitlementStatusList: document.querySelector("#entitlement-status-list"),
   updateStatusList: document.querySelector("#update-status-list"),
+  workOrderRows: document.querySelector("#work-order-rows"),
+  workOrderEvents: document.querySelector("#work-order-events"),
+  workOrderFilter: document.querySelector("#work-order-filter"),
+  workOrderError: document.querySelector("#work-order-error"),
+  workOrderDialog: document.querySelector("#work-order-dialog"),
+  workOrderForm: document.querySelector("#work-order-form"),
+  workOrderFormError: document.querySelector("#work-order-form-error"),
+  workOrderDevice: document.querySelector("#work-order-device"),
+  workOrderAction: document.querySelector("#work-order-action"),
+  workOrderLifetime: document.querySelector("#work-order-lifetime"),
+  workOrderSubmit: document.querySelector("#work-order-submit"),
+  workOrderApprovalWarning: document.querySelector(
+    "#work-order-approval-warning",
+  ),
   publish: document.querySelector("#publish-dialog"),
   publishClose: document.querySelector("#publish-close"),
   publishForm: document.querySelector("#publish-form"),
@@ -188,6 +214,18 @@ function friendlyApiError(code, status) {
       "Update sequence rejected: a newer vendor manifest already exists.",
     update_sequence_conflict:
       "Update sequence rejected: that sequence already contains different bytes.",
+    unsupported_action: "That typed action is not supported by this server.",
+    unsupported_action_version:
+      "The selected action version is not supported by this server.",
+    invalid_work_order_expiry: "Choose a work-order lifetime up to seven days.",
+    target_not_found: "The selected device is no longer enrolled.",
+    action_platform_mismatch:
+      "The selected action is not available on that device runtime.",
+    work_order_not_authorized:
+      "Signed policy or entitlement does not authorize this action for the selected device.",
+    work_order_state_conflict:
+      "The work order changed state. Refresh and try again.",
+    device_revoked: "The selected device has been revoked.",
   };
   if (code && messages[code]) return messages[code];
   if (status === 401 || status === 403)
@@ -233,6 +271,34 @@ function auditItems(payload) {
     }));
 }
 
+function workOrderItems(payload) {
+  return items(payload)
+    .filter(
+      (order) =>
+        order !== null && typeof order === "object" && !Array.isArray(order),
+    )
+    .map((order) => assertMinimizedWorkOrder(order));
+}
+
+function workOrderEventItems(payload) {
+  return items(payload)
+    .filter(
+      (event) =>
+        event !== null && typeof event === "object" && !Array.isArray(event),
+    )
+    .map((event) => ({
+      tenantId: event.tenantId,
+      sequence: event.sequence,
+      workOrderId: event.workOrderId,
+      occurredAt: event.occurredAt,
+      kind: event.kind,
+      actorType: event.actorType,
+      actorId: event.actorId,
+      status: event.status,
+      detailSha256: event.detailSha256,
+    }));
+}
+
 async function loadFleet() {
   if (!state.tenantId || !state.token) return false;
   const encodedTenant = encodeURIComponent(state.tenantId);
@@ -243,6 +309,8 @@ async function loadFleet() {
     policiesResult,
     entitlementsResult,
     updatesResult,
+    workOrdersResult,
+    workOrderEventsResult,
   ] = await Promise.allSettled([
     request(`/v1/tenants/${encodedTenant}/devices`),
     request(`/v1/tenants/${encodedTenant}/assets`),
@@ -250,6 +318,8 @@ async function loadFleet() {
     request(`/v1/tenants/${encodedTenant}/policies`),
     request(`/v1/tenants/${encodedTenant}/entitlements`),
     request(`/v1/tenants/${encodedTenant}/update-manifests`),
+    request(`/v1/tenants/${encodedTenant}/work-orders`),
+    request(`/v1/tenants/${encodedTenant}/work-order-events`),
   ]);
   if (devicesResult.status === "rejected") throw devicesResult.reason;
   if (assetsResult.status === "rejected") throw assetsResult.reason;
@@ -258,6 +328,8 @@ async function loadFleet() {
     policiesResult,
     entitlementsResult,
     updatesResult,
+    workOrdersResult,
+    workOrderEventsResult,
   ]) {
     if (
       result.status === "rejected" &&
@@ -290,13 +362,36 @@ async function loadFleet() {
       : null;
   state.updates =
     updatesResult.status === "fulfilled" ? items(updatesResult.value) : [];
+  try {
+    state.workOrders =
+      workOrdersResult.status === "fulfilled"
+        ? workOrderItems(workOrdersResult.value)
+        : [];
+    state.workOrderEvents =
+      workOrderEventsResult.status === "fulfilled"
+        ? workOrderEventItems(workOrderEventsResult.value)
+        : [];
+    state.workOrderError = workOrderErrorMessage([
+      workOrdersResult,
+      workOrderEventsResult,
+    ]);
+  } catch {
+    state.workOrders = [];
+    state.workOrderEvents = [];
+    state.workOrderError =
+      "Work-order data violated the minimized console boundary.";
+  }
   state.governanceError = governanceErrorMessage([
     policiesResult,
     entitlementsResult,
     updatesResult,
   ]);
   render();
-  return state.auditError === "" && state.governanceError === "";
+  return (
+    state.auditError === "" &&
+    state.governanceError === "" &&
+    state.workOrderError === ""
+  );
 }
 
 function auditErrorMessage(error) {
@@ -313,6 +408,15 @@ function governanceErrorMessage(results) {
     return "Governance status is unavailable on this control-plane version.";
   }
   return "One or more governance domains could not be loaded. Refresh to retry.";
+}
+
+function workOrderErrorMessage(results) {
+  const failed = results.filter((result) => result.status === "rejected");
+  if (failed.length === 0) return "";
+  if (failed.every((result) => result.reason?.status === 404)) {
+    return "Work orders are unavailable on this control-plane version.";
+  }
+  return "Work-order state could not be loaded. Refresh to retry.";
 }
 
 function render() {
@@ -338,6 +442,7 @@ function render() {
   renderAssets();
   renderAudit();
   renderGovernance();
+  renderWorkOrders();
   applyView();
 }
 
@@ -579,6 +684,194 @@ function renderGovernance() {
   );
 }
 
+function renderWorkOrders() {
+  const query = elements.workOrderFilter.value.trim().toLowerCase();
+  const orders = state.workOrders.filter((order) =>
+    JSON.stringify([
+      order.workOrderId,
+      order.requestId,
+      order.targetDeviceId,
+      order.actionId,
+      order.status,
+      order.kind,
+      order.risk,
+    ])
+      .toLowerCase()
+      .includes(query),
+  );
+
+  elements.workOrderError.hidden = state.workOrderError === "";
+  elements.workOrderError.textContent = state.workOrderError;
+  document.querySelector("#work-order-policy-state").textContent =
+    state.policies.length === 0
+      ? "No published candidate"
+      : `${state.policies.length} signed candidate${state.policies.length === 1 ? "" : "s"}`;
+  document.querySelector("#work-order-entitlement-state").textContent =
+    state.entitlements.length === 0
+      ? "No published candidate"
+      : `${state.entitlements.length} issuer-verified candidate${state.entitlements.length === 1 ? "" : "s"}`;
+
+  for (const [status, metric] of [
+    ["pending_approval", "#wo-pending"],
+    ["queued", "#wo-queued"],
+    ["leased", "#wo-leased"],
+    ["succeeded", "#wo-completed"],
+  ]) {
+    document.querySelector(metric).textContent = String(
+      state.workOrders.filter((order) => order.status === status).length,
+    );
+  }
+
+  elements.workOrderRows.replaceChildren();
+  for (const order of orders) {
+    const row = document.createElement("tr");
+    const action = workOrderActions[order.actionId];
+    const approval = order.approval;
+    const lease = order.lease;
+    const result = order.result;
+    const controls = workOrderControls(order);
+    const actions = document.createElement("div");
+    actions.className = "work-order-actions";
+
+    if (controls.canApprove) {
+      actions.append(
+        workOrderActionButton("Approve", "approve", () =>
+          approveWorkOrder(order),
+        ),
+      );
+    }
+    if (controls.canCancel) {
+      actions.append(
+        workOrderActionButton("Cancel", "cancel", () => cancelWorkOrder(order)),
+      );
+    }
+    if (!controls.canApprove && !controls.canCancel) {
+      actions.append(text("span", "Locked", "work-order-locked"));
+    }
+
+    const receipt = text(
+      "small",
+      workOrderReceiptState(order),
+      "receipt-state",
+    );
+    receipt.title =
+      "The signed service receipt is delivered to the device and is not exposed or retained by this console.";
+
+    row.append(
+      cell(
+        text("strong", action?.label ?? order.actionId),
+        text(
+          "small",
+          `${order.actionId} · v${order.actionVersion ?? "—"} · ${short(order.targetDeviceId, 12)}`,
+        ),
+      ),
+      cell(
+        text(
+          "span",
+          String(order.status).replaceAll("_", " "),
+          `status ${order.status}`,
+        ),
+        text("small", `${order.kind} · ${order.risk}`),
+      ),
+      cell(
+        text(
+          "strong",
+          approval
+            ? "Approved"
+            : order.localApprovalRequired
+              ? "Admin required"
+              : "Not required",
+        ),
+        text(
+          "small",
+          approval
+            ? `${short(approval.approvedByCredentialId, 12)} · ${date(approval.approvedAt)}`
+            : order.localApprovalRequired
+              ? "Delivery remains blocked"
+              : "Read-only action",
+        ),
+      ),
+      cell(
+        text("strong", lease ? short(lease.leaseId, 12) : "Not leased"),
+        text(
+          "small",
+          lease
+            ? `${date(lease.leasedAt)} → ${date(lease.leaseExpiresAt)}`
+            : "Awaiting device claim",
+        ),
+      ),
+      cell(
+        text("strong", result?.outcome ?? "No result"),
+        text(
+          "small",
+          result
+            ? `${short(result.resultSha256, 12)} · ${date(result.completedAt)}`
+            : "Digest pending",
+        ),
+        receipt,
+      ),
+      cell(
+        text("strong", date(order.expiresAt)),
+        text("small", `Created ${date(order.createdAt)}`),
+      ),
+      cell(actions),
+    );
+    elements.workOrderRows.append(row);
+  }
+
+  const failed = state.workOrderError !== "";
+  document.querySelector("#work-orders-empty").hidden =
+    failed || orders.length !== 0;
+  elements.workOrderRows.closest("table").hidden =
+    failed || orders.length === 0;
+  renderWorkOrderEvents(query);
+}
+
+function renderWorkOrderEvents(query) {
+  const events = state.workOrderEvents.filter((event) =>
+    JSON.stringify([
+      event.workOrderId,
+      event.kind,
+      event.actorType,
+      event.actorId,
+      event.status,
+    ])
+      .toLowerCase()
+      .includes(query),
+  );
+  elements.workOrderEvents.replaceChildren();
+  for (const event of events.slice(0, 80)) {
+    const node = document.createElement("article");
+    node.className = "work-order-event";
+    node.append(
+      text("span", `#${event.sequence ?? "—"}`, "event-sequence"),
+      text("strong", String(event.kind ?? "unknown").replaceAll("_", " ")),
+      text(
+        "small",
+        `${short(event.workOrderId, 13)} · ${event.actorType ?? "unknown"} ${short(event.actorId, 10)}`,
+      ),
+      text("span", String(event.status ?? "unknown").replaceAll("_", " ")),
+      text("small", date(event.occurredAt)),
+      text(
+        "code",
+        event.detailSha256 ? short(event.detailSha256, 15) : "No detail digest",
+      ),
+    );
+    elements.workOrderEvents.append(node);
+  }
+  document.querySelector("#work-order-events-empty").hidden =
+    state.workOrderError !== "" || events.length !== 0;
+}
+
+function workOrderActionButton(label, kind, handler) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = `row-action ${kind}`;
+  button.textContent = label;
+  button.addEventListener("click", handler);
+  return button;
+}
+
 function renderDocumentList(element, documents, describe, emptyMessage) {
   element.replaceChildren();
   if (documents.length === 0) {
@@ -615,6 +908,7 @@ function applyView() {
     devices: "Enrolled devices",
     assets: "Observed assets",
     audit: "Tenant audit",
+    workorders: "Diagnosis & repair work orders",
     governance: "Fleet governance",
     enrollment: "Device enrollment",
   };
@@ -628,6 +922,114 @@ function applyView() {
       button.classList.toggle("active", button.dataset.view === state.view),
     );
   if (state.view === "enrollment") elements.enrollment.showModal();
+}
+
+function openWorkOrder() {
+  elements.workOrderFormError.textContent = "";
+  elements.workOrderDevice.replaceChildren();
+  const devices = state.devices.filter((device) => device.status !== "revoked");
+  for (const device of devices) {
+    const option = document.createElement("option");
+    option.value = device.deviceId;
+    option.dataset.platform = device.platform ?? "unknown";
+    option.textContent = `${device.displayName || short(device.deviceId, 12)} · ${device.platform ?? "unknown"}`;
+    elements.workOrderDevice.append(option);
+  }
+  elements.workOrderDevice.disabled = devices.length === 0;
+  refreshWorkOrderActions();
+  elements.workOrderDialog.showModal();
+}
+
+function selectedWorkOrderDevice() {
+  const option = elements.workOrderDevice.selectedOptions[0];
+  if (!option) return null;
+  return { deviceId: option.value, platform: option.dataset.platform };
+}
+
+function refreshWorkOrderActions() {
+  const device = selectedWorkOrderDevice();
+  const previous = elements.workOrderAction.value;
+  elements.workOrderAction.replaceChildren();
+  for (const action of workOrderActionsForPlatform(device?.platform)) {
+    const option = document.createElement("option");
+    option.value = action.actionId;
+    option.textContent = `${action.label} · ${action.kind} ${action.risk} · v${action.version}`;
+    elements.workOrderAction.append(option);
+  }
+  if (
+    [...elements.workOrderAction.options].some(
+      (item) => item.value === previous,
+    )
+  ) {
+    elements.workOrderAction.value = previous;
+  }
+  refreshWorkOrderPreflight();
+}
+
+function refreshWorkOrderPreflight() {
+  const device = selectedWorkOrderDevice();
+  const actionId = elements.workOrderAction.value;
+  const readiness = workOrderReadiness({
+    actionId,
+    platform: device?.platform,
+    policyCount: state.policies.length,
+    entitlements: state.entitlements,
+  });
+  for (const [id, ready] of [
+    ["#wo-check-platform", readiness.platformReady],
+    ["#wo-check-policy", readiness.policyReady],
+    ["#wo-check-entitlement", readiness.entitlementReady],
+  ]) {
+    const node = document.querySelector(id);
+    node.className = ready ? "ready" : "missing";
+    node.textContent = ready ? "✓" : "!";
+  }
+  elements.workOrderApprovalWarning.hidden =
+    workOrderActions[actionId]?.localApprovalRequired !== true;
+  elements.workOrderSubmit.disabled = !readiness.canSubmit;
+  elements.workOrderSubmit.title = readiness.canSubmit
+    ? "The server will authoritatively verify exact assignment and scope."
+    : "Publish an applicable signed policy and entitlement first.";
+}
+
+async function approveWorkOrder(order) {
+  if (
+    !window.confirm(
+      `Approve delivery of ${order.actionId} to ${order.targetDeviceId}? This does not replace the device's local Core approval.`,
+    )
+  ) {
+    return;
+  }
+  try {
+    const payload = await request(
+      `/v1/tenants/${encodeURIComponent(state.tenantId)}/work-orders/${encodeURIComponent(order.workOrderId)}/approve`,
+      { method: "POST", body: JSON.stringify({ decision: "approve" }) },
+    );
+    notify(
+      payload?.idempotent ? "Approval already recorded" : "Work order approved",
+    );
+    await loadFleet();
+  } catch (error) {
+    notify(error.message, true);
+  }
+}
+
+async function cancelWorkOrder(order) {
+  if (!window.confirm(`Cancel work order ${order.workOrderId}?`)) return;
+  try {
+    const payload = await request(
+      `/v1/tenants/${encodeURIComponent(state.tenantId)}/work-orders/${encodeURIComponent(order.workOrderId)}/cancel`,
+      { method: "POST", body: JSON.stringify({}) },
+    );
+    notify(
+      payload?.idempotent
+        ? "Cancellation already recorded"
+        : "Work order cancelled",
+    );
+    await loadFleet();
+  } catch (error) {
+    notify(error.message, true);
+  }
 }
 
 async function revokeDevice(deviceId) {
@@ -669,6 +1071,9 @@ function clearSession() {
   state.entitlementRevocations = null;
   state.updates = [];
   state.governanceError = "";
+  state.workOrders = [];
+  state.workOrderEvents = [];
+  state.workOrderError = "";
   sessionStorage.removeItem("kernaid.fleet.tenant");
   sessionStorage.removeItem("kernaid.fleet.admin-token");
   elements.tokenInput.value = "";
@@ -740,6 +1145,50 @@ elements.copyToken.addEventListener("click", async () => {
 elements.enrollmentClose.addEventListener("click", () =>
   elements.enrollment.close(),
 );
+
+elements.workOrderForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const device = selectedWorkOrderDevice();
+  elements.workOrderFormError.textContent = "";
+  setBusy(elements.workOrderSubmit, true);
+  try {
+    const payload = createWorkOrderPayload({
+      requestId: `ui_${crypto.randomUUID().replaceAll("-", "")}`,
+      targetDeviceId: device?.deviceId,
+      platform: device?.platform,
+      actionId: elements.workOrderAction.value,
+      lifetimeSeconds: Number(elements.workOrderLifetime.value),
+      nowMs: Date.now(),
+    });
+    const result = await request(
+      `/v1/tenants/${encodeURIComponent(state.tenantId)}/work-orders`,
+      { method: "POST", body: JSON.stringify(payload) },
+    );
+    elements.workOrderDialog.close();
+    notify(
+      result?.idempotent
+        ? "Work order already queued"
+        : result?.status === "pending_approval"
+          ? "Repair intent created — administrator approval required"
+          : "Diagnostic work order queued",
+    );
+    await loadFleet();
+  } catch (error) {
+    elements.workOrderFormError.textContent = error.message;
+  } finally {
+    setBusy(elements.workOrderSubmit, false);
+    refreshWorkOrderPreflight();
+  }
+});
+
+document
+  .querySelector("#work-order-close")
+  .addEventListener("click", () => elements.workOrderDialog.close());
+elements.workOrderDialog.addEventListener("close", () => {
+  elements.workOrderFormError.textContent = "";
+});
+elements.workOrderDevice.addEventListener("change", refreshWorkOrderActions);
+elements.workOrderAction.addEventListener("change", refreshWorkOrderPreflight);
 
 function openPublish(kind) {
   const configuration = publishKinds[kind];
@@ -821,9 +1270,13 @@ document
 document
   .querySelector("#open-enrollment")
   .addEventListener("click", () => elements.enrollment.showModal());
+document
+  .querySelector("#open-work-order")
+  .addEventListener("click", openWorkOrder);
 elements.deviceFilter.addEventListener("input", renderDevices);
 elements.assetFilter.addEventListener("input", renderAssets);
 elements.auditFilter.addEventListener("input", renderAudit);
+elements.workOrderFilter.addEventListener("input", renderWorkOrders);
 document
   .querySelectorAll(".publish-trigger")
   .forEach((button) =>

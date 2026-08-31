@@ -34,11 +34,14 @@
           <button class="nav-item" data-view="audit">
             <span>04</span>Audit
           </button>
+          <button class="nav-item" data-view="workorders">
+            <span>05</span>Work orders
+          </button>
           <button class="nav-item" data-view="governance">
-            <span>05</span>Governance
+            <span>06</span>Governance
           </button>
           <button class="nav-item" data-view="enrollment">
-            <span>06</span>Enrollment
+            <span>07</span>Enrollment
           </button>
         </nav>
         <div class="rail-foot">
@@ -272,6 +275,102 @@
               </div>
             </section>
 
+            <section class="panel work-order-panel" data-panel="workorders">
+              <div class="panel-head work-order-head">
+                <div>
+                  <p class="eyebrow">Governed device intent</p>
+                  <h2>Diagnosis &amp; repair work orders</h2>
+                </div>
+                <div class="table-tools">
+                  <label class="search"
+                    ><span class="sr-only">Filter work orders</span
+                    ><input
+                      id="work-order-filter"
+                      type="search"
+                      placeholder="Filter work orders"
+                  /></label>
+                  <button
+                    class="button primary"
+                    id="open-work-order"
+                    type="button"
+                  >
+                    New work order
+                  </button>
+                </div>
+              </div>
+              <div class="work-order-boundary">
+                <div>
+                  <span>Policy</span
+                  ><strong id="work-order-policy-state">—</strong>
+                </div>
+                <div>
+                  <span>Entitlement</span
+                  ><strong id="work-order-entitlement-state">—</strong>
+                </div>
+                <div>
+                  <span>Execution boundary</span
+                  ><strong>Device + local Core approval</strong>
+                </div>
+                <p>
+                  Fleet queues typed intent only. It cannot send shell commands,
+                  paths or arguments, and tenant approval never replaces the
+                  device's plan-bound local approval.
+                </p>
+              </div>
+              <div class="work-order-metrics">
+                <div>
+                  <span>Awaiting approval</span
+                  ><strong id="wo-pending">0</strong>
+                </div>
+                <div><span>Queued</span><strong id="wo-queued">0</strong></div>
+                <div>
+                  <span>Active leases</span><strong id="wo-leased">0</strong>
+                </div>
+                <div>
+                  <span>Completed</span><strong id="wo-completed">0</strong>
+                </div>
+              </div>
+              <div
+                class="work-order-error"
+                id="work-order-error"
+                role="alert"
+                hidden
+              ></div>
+              <div class="table-wrap work-order-table">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Action / target</th>
+                      <th>State</th>
+                      <th>Tenant approval</th>
+                      <th>Lease</th>
+                      <th>Result / receipt</th>
+                      <th>Expires</th>
+                      <th><span class="sr-only">Actions</span></th>
+                    </tr>
+                  </thead>
+                  <tbody id="work-order-rows"></tbody>
+                </table>
+                <div class="empty" id="work-orders-empty">
+                  <strong>No work orders</strong>
+                  <p>
+                    Queue a typed diagnostic or an explicitly approved repair.
+                  </p>
+                </div>
+              </div>
+              <div class="work-order-audit-head">
+                <div>
+                  <p class="eyebrow">Immutable transitions</p>
+                  <h2>Work-order audit</h2>
+                </div>
+                <span>Digest-only · newest first</span>
+              </div>
+              <div class="work-order-events" id="work-order-events"></div>
+              <div class="empty compact" id="work-order-events-empty">
+                <strong>No transitions recorded</strong>
+              </div>
+            </section>
+
             <section class="panel assets-panel" data-panel="overview assets">
               <div class="panel-head">
                 <div>
@@ -393,6 +492,72 @@
         <p class="form-error" id="login-error" role="alert"></p>
         <button class="button primary wide" type="submit">
           Open Fleet Console
+        </button>
+      </form>
+    </dialog>
+
+    <dialog
+      id="work-order-dialog"
+      class="modal work-order-modal"
+      aria-labelledby="work-order-title"
+    >
+      <form method="dialog" id="work-order-form">
+        <button
+          class="modal-close"
+          id="work-order-close"
+          type="button"
+          aria-label="Close"
+        >
+          ×
+        </button>
+        <p class="eyebrow">Closed action catalog</p>
+        <h2 id="work-order-title">Create a work order</h2>
+        <p class="modal-copy">
+          Select a device and one versioned KernAid action. There is
+          deliberately no command, argument, path or free-text instruction
+          field.
+        </p>
+        <label
+          >Target device<select id="work-order-device" required></select
+        ></label>
+        <label
+          >Typed action<select id="work-order-action" required></select
+        ></label>
+        <label
+          >Expires in<select id="work-order-lifetime" required>
+            <option value="3600" selected>1 hour</option>
+            <option value="14400">4 hours</option>
+            <option value="86400">24 hours</option>
+            <option value="604800">7 days</option>
+          </select></label
+        >
+        <div class="work-order-preflight" aria-live="polite">
+          <div>
+            <i id="wo-check-platform"></i><span>Runtime supports action</span>
+          </div>
+          <div>
+            <i id="wo-check-policy"></i><span>Signed policy published</span>
+          </div>
+          <div>
+            <i id="wo-check-entitlement"></i
+            ><span>Required entitlement published</span>
+          </div>
+        </div>
+        <div class="approval-warning" id="work-order-approval-warning" hidden>
+          <strong>Two approvals remain separate.</strong>
+          <span
+            >An administrator must approve delivery. Rescue must then obtain a
+            fresh local Core approval bound to the actual plan, target and lease
+            before writing.</span
+          >
+        </div>
+        <p class="form-error" id="work-order-form-error" role="alert"></p>
+        <button
+          class="button primary wide"
+          id="work-order-submit"
+          type="submit"
+        >
+          Queue typed work order
         </button>
       </form>
     </dialog>

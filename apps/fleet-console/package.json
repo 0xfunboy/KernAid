@@ -8,9 +8,9 @@
   },
   "scripts": {
     "format": "prettier --write .",
-    "lint": "node --check app.js",
-    "check": "node --check app.js",
-    "test": "node --check app.js && node --test publish-document.test.mjs && node verify-ui.mjs",
-    "build": "node --check app.js"
+    "lint": "node --check app.js && node --check work-order-ui.js",
+    "check": "node --check app.js && node --check work-order-ui.js",
+    "test": "node --check app.js && node --check work-order-ui.js && node --test publish-document.test.mjs work-order-ui.test.mjs && node verify-ui.mjs",
+    "build": "node --check app.js && node --check work-order-ui.js"
   }
 }

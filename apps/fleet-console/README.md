@@ -6,6 +6,13 @@ one-time enrollment without any remote-command surface. Its governance view
 shows minimized policy, entitlement and update state and publishes only final
 documents already signed by offline issuers.
 
+The Work orders view is an operational tenant-scoped surface for a closed,
+versioned action catalog. Operators can create diagnostics, administrators can
+approve write intents, and either role can cancel an unleased order. There are
+no command, argument, path, script or raw-output fields. Policy, entitlement,
+lease, minimized result and digest-only transition audit state are visible in
+one view.
+
 Serve this directory at `/console/` and the control plane API at the same
 origin. To use another origin, set the `kernaid-api-base` meta value and apply a
 strict matching CORS policy server-side.
@@ -23,12 +30,23 @@ Expected routes:
 - `GET /v1/tenants/:tenantId/policies`
 - `GET /v1/tenants/:tenantId/entitlements`
 - `GET /v1/tenants/:tenantId/update-manifests`
+- `GET /v1/tenants/:tenantId/work-orders`
+- `GET /v1/tenants/:tenantId/work-order-events`
 - `POST /v1/tenants/:tenantId/enrollment-tokens`
 - `POST /v1/tenants/:tenantId/devices/:deviceId/revoke`
 - `POST /v1/tenants/:tenantId/policies`
 - `POST /v1/tenants/:tenantId/entitlements`
 - `POST /v1/tenants/:tenantId/entitlement-revocations`
 - `POST /v1/tenants/:tenantId/update-manifests`
+- `POST /v1/tenants/:tenantId/work-orders`
+- `POST /v1/tenants/:tenantId/work-orders/:workOrderId/approve`
+- `POST /v1/tenants/:tenantId/work-orders/:workOrderId/cancel`
+
+For write actions, tenant administrator approval authorizes delivery only. It
+does not replace the independent local Core approval bound to the actual plan,
+target and lease. The control plane returns signed claim/result receipts to the
+device. The console shows their protocol state but intentionally neither
+receives nor retains the raw receipt or device signature.
 
 Audit is refreshed concurrently with devices and assets. It shows only the
 control plane's bounded event identifiers, state, risk and digest-chain fields;
