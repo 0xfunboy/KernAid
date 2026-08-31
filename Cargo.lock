@@ -2329,6 +2329,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "kernaid-fleet-client"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "ed25519-dalek",
+ "kernaid-device-identity",
+ "serde",
+ "serde_json",
+ "sha2",
+ "zeroize",
+]
+
+[[package]]
 name = "kernaid-linux-blockfd"
 version = "0.1.0"
 dependencies = [
