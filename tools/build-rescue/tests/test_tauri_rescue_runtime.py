@@ -767,6 +767,14 @@ class RescueTauriBoundaryTests(unittest.TestCase):
             source.index("tauri::Builder::default()"),
         )
         self.assertLess(
+            source.index("bootstrap_native_prompt_transport(status"),
+            source.index("WebviewWindowBuilder::new"),
+        )
+        self.assertIn(
+            "bootstrap_native_prompt_transport(status, relay_native_prompt_status)",
+            source,
+        )
+        self.assertLess(
             source.index("let status = attest_rescue_sandbox()"),
             source.index('eprintln!("{status}")'),
         )

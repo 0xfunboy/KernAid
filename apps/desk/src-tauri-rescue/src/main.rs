@@ -325,6 +325,22 @@ fn relay_native_prompt_status() -> Result<NativePromptStatus, NativePromptTransp
     Ok(response)
 }
 
+fn bootstrap_native_prompt_transport<F>(
+    sandbox_status: &str,
+    relay: F,
+) -> Result<(), SandboxProbeFailure>
+where
+    F: FnOnce() -> Result<NativePromptStatus, NativePromptTransportError>,
+{
+    match sandbox_status {
+        SANDBOX_STATUS_QEMU_NATIVE_PROMPT | SANDBOX_STATUS_NORMAL_NATIVE_PROMPT => relay()
+            .map(|_| ())
+            .map_err(|_| SandboxProbeFailure::NativePrompt),
+        SANDBOX_STATUS_QEMU | SANDBOX_STATUS_NORMAL => Ok(()),
+        _ => Err(SandboxProbeFailure::ProbeMode),
+    }
+}
+
 #[tauri::command]
 fn rescue_native_prompt_status() -> NativePromptStatus {
     match relay_native_prompt_status() {
@@ -733,6 +749,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "Rescue shell sandbox probe failed",
         )
     })?;
+    bootstrap_native_prompt_transport(status, relay_native_prompt_status).map_err(|failure| {
+        let failure_status = failure.status();
+        eprintln!("{failure_status}");
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Rescue native prompt transport probe failed",
+        )
+    })?;
     let rescue_url: Url = RESCUE_UI_URL.parse()?;
     // These fixed console lines are diagnostic only. The root-owned checker is
     // the single readiness authority and independently re-attests the process,
@@ -941,6 +965,54 @@ X-Content-Type-Options: nosniff\r\n\
                 "\"kind\":\"vault-unlock\",\"availability\":\"available\",",
                 "\"promptState\":\"idle\"}"
             )
+        );
+    }
+
+    #[test]
+    fn native_prompt_transport_is_bootstrapped_only_for_gated_boots() {
+        for sandbox_status in [SANDBOX_STATUS_QEMU, SANDBOX_STATUS_NORMAL] {
+            let called = std::cell::Cell::new(false);
+            assert_eq!(
+                bootstrap_native_prompt_transport(sandbox_status, || {
+                    called.set(true);
+                    Err(NativePromptTransportError::Failed)
+                }),
+                Ok(())
+            );
+            assert!(!called.get());
+        }
+
+        for sandbox_status in [
+            SANDBOX_STATUS_QEMU_NATIVE_PROMPT,
+            SANDBOX_STATUS_NORMAL_NATIVE_PROMPT,
+        ] {
+            let called = std::cell::Cell::new(false);
+            assert_eq!(
+                bootstrap_native_prompt_transport(sandbox_status, || {
+                    called.set(true);
+                    Ok(NativePromptStatus {
+                        api_version: NATIVE_PROMPT_API_VERSION.to_owned(),
+                        kind: NativePromptKind::VaultUnlock,
+                        availability: NativePromptAvailability::Available,
+                        prompt_state: NativePromptState::Idle,
+                    })
+                }),
+                Ok(())
+            );
+            assert!(called.get());
+            assert_eq!(
+                bootstrap_native_prompt_transport(sandbox_status, || {
+                    Err(NativePromptTransportError::Failed)
+                }),
+                Err(SandboxProbeFailure::NativePrompt)
+            );
+        }
+
+        assert_eq!(
+            bootstrap_native_prompt_transport("invalid", || {
+                Err(NativePromptTransportError::Failed)
+            }),
+            Err(SandboxProbeFailure::ProbeMode)
         );
     }
 }
