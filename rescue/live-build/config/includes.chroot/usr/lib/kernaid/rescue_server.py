@@ -313,6 +313,15 @@ LINUX_ROOT_PARTITION_TYPES = {
 }
 EFI_SYSTEM_PARTITION_TYPE = "c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
 EFI_SYSTEM_FILESYSTEMS = {"fat", "vfat"}
+# Private capability candidates for a future declared-filesystem-set Linux
+# snapshot. This remains narrower than the public target scanner: the offline
+# inspector may eventually resolve an fstab UUID/PARTUUID only to an unmounted
+# direct sibling with a fixed read-only/no-replay policy.
+LINUX_AUXILIARY_FILESYSTEMS = {
+    "ext4": ("ext4", "noload"),
+    "fat": ("vfat", None),
+    "vfat": ("vfat", None),
+}
 APPLE_APFS_PARTITION_TYPE = "7c3457ef-0000-11aa-aa11-00306543ecac"
 OBSERVE_AUTHORIZATION_FIELDS = {
     "sessionId",
@@ -2257,6 +2266,67 @@ def _associated_efi_system_partition(
     }
 
 
+def _associated_linux_filesystem_candidates(
+    disk: dict[str, object], candidate: dict[str, object]
+) -> list[dict[str, object]]:
+    """Return only private, same-disk capabilities usable by a future plan.
+
+    No device from another disk, stacked topology, active mount or
+    identifier-less filesystem can enter this set. The result never crosses
+    the HTTP target-selection boundary and is covered by resolution
+    revalidation before and after inspection.
+    """
+    children = disk["children"]
+    if not isinstance(children, list) or candidate is disk:
+        return []
+    if not any(child is candidate for child in children):
+        return []
+    result: list[dict[str, object]] = []
+    for sibling in children:
+        if sibling is candidate:
+            continue
+        sibling_children = sibling["children"]
+        identity = sibling["identity"]
+        filesystem = sibling["filesystem"]
+        if (
+            not isinstance(sibling_children, list)
+            or sibling_children
+            or not isinstance(identity, dict)
+            or sibling["kind"] != "part"
+            or sibling["mounted"] is not False
+            or filesystem not in LINUX_AUXILIARY_FILESYSTEMS
+            or not any(
+                isinstance(identity.get(field), str) and identity.get(field)
+                for field in ("uuid", "partuuid")
+            )
+        ):
+            continue
+        mount_filesystem, replay_option = LINUX_AUXILIARY_FILESYSTEMS[
+            str(filesystem)
+        ]
+        result.append(
+            {
+                "deviceIdentity": identity,
+                "majorMinor": sibling["major_minor"],
+                "filesystem": filesystem,
+                "mountFilesystem": mount_filesystem,
+                "replayOption": replay_option,
+                "kernelKind": "part",
+                "leaf": True,
+                "directOnDisk": True,
+            }
+        )
+    result.sort(
+        key=lambda item: json.dumps(
+            item["deviceIdentity"],
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    return result
+
+
 def _flatten_target_volumes(
     disk: dict[str, object], disk_ref: str
 ) -> tuple[list[dict[str, object]], dict[int, str]]:
@@ -2426,6 +2496,14 @@ def _normalize_installed_targets_with_resolutions(
                 "topologyFilesystems": topology_filesystems,
                 "associatedEfiSystemPartition": _associated_efi_system_partition(
                     disk, candidate
+                ),
+                # Private only: a later fstab-to-device mount plan may resolve
+                # exact UUID/PARTUUID declarations solely from this bounded
+                # same-disk capability set. It is not in the public scan.
+                "associatedLinuxFilesystemCandidates": (
+                    _associated_linux_filesystem_candidates(disk, candidate)
+                    if family == "linux"
+                    else []
                 ),
             }
 

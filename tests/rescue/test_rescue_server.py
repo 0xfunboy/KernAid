@@ -2182,6 +2182,79 @@ class InstalledTargetTests(unittest.TestCase):
             {"state": "unsupported"},
         )
 
+    def test_linux_auxiliary_capabilities_are_private_direct_and_qualified(self) -> None:
+        def part(name: str, filesystem: str, uuid: str) -> dict[str, object]:
+            return block_device(name, "part", filesystem=filesystem, uuid=uuid)
+
+        root_uuid = "PRIVATE-ROOT"
+        fixture = json.dumps({"blockdevices": [block_device(
+            "sda", "disk", children=[
+                part("sda1", "vfat", "PRIVATE-ESP"),
+                part("sda2", "ext4", root_uuid),
+                part("sda3", "ext4", "PRIVATE-USR"),
+            ],
+        )]})
+        snapshot, resolutions = rescue_server._normalize_installed_targets_with_resolutions(
+            fixture
+        )
+        resolved = next(
+            item for item in resolutions.values()
+            if item["deviceIdentity"]["uuid"] == root_uuid
+        )["associatedLinuxFilesystemCandidates"]
+        self.assertEqual(
+            {(item["deviceIdentity"]["uuid"], item["mountFilesystem"],
+              item["replayOption"]) for item in resolved},
+            {("PRIVATE-ESP", "vfat", None), ("PRIVATE-USR", "ext4", "noload")},
+        )
+        public = json.dumps(snapshot)
+        self.assertNotIn("associatedLinuxFilesystemCandidates", public)
+        self.assertNotIn("PRIVATE-", public)
+
+    def test_linux_auxiliary_capabilities_exclude_every_unbound_device(self) -> None:
+        def device(name: str, uuid: str | None = None, *, kind: str = "part",
+                   filesystem: str = "ext4", **options: object) -> dict[str, object]:
+            return block_device(name, kind, filesystem=filesystem, uuid=uuid, **options)
+
+        selected_uuid, qualified_uuid = "PRIVATE-ROOT", "PRIVATE-QUALIFIED"
+        disk = rescue_server._parse_target_device(block_device(
+            "sda", "disk", children=[
+                device("sda1", selected_uuid),
+                device("sda2", qualified_uuid),
+                device("sda3", "REJECT-MOUNTED", mountpoints=["/private"]),
+                device("sda4", "REJECT-NESTED", children=[
+                    device("vg-nested", "REJECT-NESTED-LEAF", kind="lvm")
+                ]),
+                device("vg-stacked", "REJECT-STACKED", kind="lvm"),
+                device("sda6"),
+                device("sda7", "REJECT-XFS", filesystem="xfs"),
+            ],
+        ), 0, [0])
+        selected = next(
+            item for item in disk["children"]
+            if item["identity"]["uuid"] == selected_uuid
+        )
+        resolved = rescue_server._associated_linux_filesystem_candidates(disk, selected)
+        self.assertEqual(
+            [item["deviceIdentity"]["uuid"] for item in resolved], [qualified_uuid]
+        )
+        self.assertNotIn("REJECT-", json.dumps(resolved))
+
+        scan = json.dumps({"blockdevices": [
+            block_device("sda", "disk", children=[
+                device("sda1", selected_uuid), device("sda2", qualified_uuid)
+            ]),
+            block_device("sdb", "disk", children=[device("sdb1", "OTHER-DISK")]),
+        ]})
+        _snapshot, resolutions = rescue_server._normalize_installed_targets_with_resolutions(scan)
+        same_disk = next(
+            item for item in resolutions.values()
+            if item["deviceIdentity"]["uuid"] == selected_uuid
+        )["associatedLinuxFilesystemCandidates"]
+        self.assertEqual(
+            [item["deviceIdentity"]["uuid"] for item in same_disk], [qualified_uuid]
+        )
+        self.assertNotIn("OTHER-DISK", json.dumps(same_disk))
+
     def test_recovery_target_digest_is_strong_unique_and_never_public(self) -> None:
         filesystem_uuid = "11111111-2222-3333-4444-555555555555"
         partition_uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
