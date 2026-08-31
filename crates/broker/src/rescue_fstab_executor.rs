@@ -246,6 +246,7 @@ impl RescueFstabRollbackExecutionReceipt {
 pub fn prepare_rescue_fstab_rollback(
     source_reservation_id: &str,
     source_transaction_binding_sha256: &str,
+    expected_resource: RepairResourceV1,
     deadline: Instant,
 ) -> Result<PreparedRescueFstabRollback, RescueFstabExecutionError> {
     ensure_deadline(deadline)?;
@@ -270,7 +271,7 @@ pub fn prepare_rescue_fstab_rollback(
         .transaction()
         .cloned()
         .ok_or(RescueFstabExecutionError::InvalidAuthority)?;
-    validate_committed_rollback_source(&source)?;
+    validate_committed_rollback_source(&source, Some(expected_resource))?;
 
     let retrieved = vault_client
         .get(source.backup(), deadline)
@@ -461,7 +462,7 @@ pub fn recover_pending_rescue_fstab_rollback(
         return Err(RescueFstabExecutionError::VaultReconciliationRequired);
     }
     let source = pending.source().clone();
-    validate_committed_rollback_source(&source)?;
+    validate_committed_rollback_source(&source, None)?;
     let retrieved = vault_client
         .get(source.backup(), operation_deadline)
         .map_err(map_vault_error)?;
@@ -504,7 +505,7 @@ fn reconcile_pending_rescue_fstab_rollback(
     ) {
         return rollback_receipt_from_status(&pending);
     }
-    validate_committed_rollback_source(pending.source())?;
+    validate_committed_rollback_source(pending.source(), None)?;
     let intent = source_intent(pending.source())?;
     ensure_exact_bytes(backup.as_slice(), intent.before_sha256())?;
 
@@ -1249,15 +1250,18 @@ fn resource_leaf(resource: RepairResourceV1) -> &'static str {
 
 fn validate_committed_rollback_source(
     source: &RepairTransactionStatusPayload,
+    expected_resource: Option<RepairResourceV1>,
 ) -> Result<(), RescueFstabExecutionError> {
     let intent = source_intent(source)?;
+    let resource = repair_resource_from_transaction(source)
+        .map_err(|_| RescueFstabExecutionError::InvalidAuthority)?;
     if source.phase() != RepairTransactionPhase::Resolved
         || source
             .resolution()
             .map(kernaid_protocol::rescue_repair_vault::RepairTransactionResolution::outcome)
             != Some(RepairTransactionResolutionOutcome::CommittedAfter)
         || source.backup().state() != RepairBackupState::Durable
-        || repair_resource_from_transaction(source) != Ok(RepairResourceV1::Fstab)
+        || expected_resource.is_some_and(|expected| expected != resource)
         || source.backup().resource_sha256() != Some(intent.before_sha256())
         || source.backup().locator()
             != format!(
@@ -1308,7 +1312,7 @@ fn lookup_exact_source(
         .transaction()
         .cloned()
         .ok_or(RescueFstabExecutionError::VaultReconciliationRequired)?;
-    validate_committed_rollback_source(&current)?;
+    validate_committed_rollback_source(&current, None)?;
     Ok(current)
 }
 

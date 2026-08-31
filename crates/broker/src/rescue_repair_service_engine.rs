@@ -42,7 +42,7 @@ use crate::{
 use kernaid_core::{
     RescueFstabCandidateAdmission, RescueFstabCandidateApproval, RescueFstabRollbackAdmission,
     RescueFstabRollbackApproval, RescueFstabRollbackBinding, RescueFstabRollbackSourceBinding,
-    Session, SessionMode, canonical_rescue_fstab_rollback_plan,
+    RescueRepairRollbackResource, Session, SessionMode, canonical_rescue_repair_rollback_plan,
 };
 #[cfg(feature = "rescue-crypttab-production-candidate")]
 use kernaid_protocol::rescue_crypttab_repair::RescueCrypttabPrepareRequest;
@@ -528,6 +528,7 @@ impl RescueFstabRollbackBackend for ProductionRepairEngine {
         let authority = prepare_rescue_fstab_rollback(
             command.source().reservation_id(),
             command.source().transaction_binding_sha256(),
+            command.candidate().repair_resource(),
             deadline,
         )
         .map_err(|error| {
@@ -551,7 +552,13 @@ impl RescueFstabRollbackBackend for ProductionRepairEngine {
             backup.locator(),
         )
         .map_err(|_| invalid_source())?;
-        let (plan, plan_hash) = canonical_rescue_fstab_rollback_plan(
+        let rollback_resource = match command.candidate() {
+            RepairCandidateKind::Fstab => RescueRepairRollbackResource::Fstab,
+            #[cfg(feature = "rescue-crypttab-production-candidate")]
+            RepairCandidateKind::Crypttab => RescueRepairRollbackResource::Crypttab,
+        };
+        let (plan, plan_hash) = canonical_rescue_repair_rollback_plan(
+            rollback_resource,
             command.plan_id(),
             command.rollback_id(),
             authority.target_fingerprint(),
@@ -559,7 +566,8 @@ impl RescueFstabRollbackBackend for ProductionRepairEngine {
             command.source().transaction_binding_sha256(),
         )
         .map_err(|_| invalid_source())?;
-        let binding = RescueFstabRollbackBinding::new(
+        let binding = RescueFstabRollbackBinding::new_for_resource(
+            rollback_resource,
             command.session_id(),
             command.rollback_id(),
             command.plan_id(),
@@ -570,7 +578,7 @@ impl RescueFstabRollbackBackend for ProductionRepairEngine {
         .map_err(|_| invalid_source())?;
         let mut session = Session::new(authority.target_fingerprint(), SessionMode::LinuxRescue);
         let admission = session
-            .stage_rescue_fstab_rollback(&plan, binding)
+            .stage_rescue_repair_rollback(&plan, binding)
             .map_err(|_| invalid_source())?;
         let descriptor = PreparedRollbackDescriptor::new(
             command.session_id(),

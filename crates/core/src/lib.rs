@@ -11,8 +11,11 @@ use kernaid_policy::validate_fixture_repair_lab_plan as validate_fixture_repair_
 use kernaid_policy::{PolicyError, validate_phase_zero};
 #[cfg(feature = "rescue-crypttab-production-candidate")]
 use kernaid_policy::{
-    RESCUE_CRYPTTAB_ACTION_ID, RESCUE_CRYPTTAB_RESOURCE_ID,
+    RESCUE_CRYPTTAB_ACTION_ID, RESCUE_CRYPTTAB_RESOURCE_ID, RESCUE_CRYPTTAB_ROLLBACK_BACKUP,
+    RESCUE_CRYPTTAB_ROLLBACK_EVIDENCE_ID, RESCUE_CRYPTTAB_ROLLBACK_ID,
+    RESCUE_CRYPTTAB_ROLLBACK_PREFLIGHT_ID,
     validate_rescue_crypttab_production_candidate_plan as validate_rescue_crypttab_candidate_policy,
+    validate_rescue_crypttab_rollback_plan as validate_rescue_crypttab_rollback_policy,
 };
 #[cfg(feature = "rescue-fstab-production-candidate")]
 use kernaid_policy::{
@@ -68,6 +71,16 @@ pub fn validate_rescue_crypttab_production_candidate_plan(
     target_fingerprint: &str,
 ) -> Result<(), PolicyError> {
     validate_rescue_crypttab_candidate_policy(plan, target_fingerprint)
+}
+
+/// Apply Core's admission boundary to the distinct crypttab post-commit
+/// rollback. This validates bindings only and grants no write authority.
+#[cfg(feature = "rescue-crypttab-production-candidate")]
+pub fn validate_rescue_crypttab_rollback_plan(
+    plan: &ValidatedPlan,
+    target_fingerprint: &str,
+) -> Result<(), PolicyError> {
+    validate_rescue_crypttab_rollback_policy(plan, target_fingerprint)
 }
 
 /// Immutable broker-derived identity for one exact crypttab preview. Action
@@ -717,6 +730,91 @@ pub const RESCUE_FSTAB_TYPED_CONFIRMATION: &str = "DISABILITA VOCE FSTAB";
 #[cfg(feature = "rescue-fstab-production-candidate")]
 pub const RESCUE_FSTAB_ROLLBACK_TYPED_CONFIRMATION: &str = "RIPRISTINA FSTAB ORIGINALE";
 
+/// Exact confirmation for the distinct crypttab post-commit rollback.
+#[cfg(feature = "rescue-crypttab-production-candidate")]
+pub const RESCUE_CRYPTTAB_ROLLBACK_TYPED_CONFIRMATION: &str = "RIPRISTINA CRYPTTAB ORIGINALE";
+
+/// Compile-time closed resource selector for the shared rollback admission.
+/// It is audit metadata only; it cannot name a path or grant write authority.
+#[cfg(feature = "rescue-fstab-production-candidate")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RescueRepairRollbackResource {
+    Fstab,
+    #[cfg(feature = "rescue-crypttab-production-candidate")]
+    Crypttab,
+}
+
+#[cfg(feature = "rescue-fstab-production-candidate")]
+impl RescueRepairRollbackResource {
+    pub const fn action_id(self) -> &'static str {
+        match self {
+            Self::Fstab => RESCUE_FSTAB_ROLLBACK_ID,
+            #[cfg(feature = "rescue-crypttab-production-candidate")]
+            Self::Crypttab => RESCUE_CRYPTTAB_ROLLBACK_ID,
+        }
+    }
+
+    pub const fn resource_id(self) -> &'static str {
+        match self {
+            Self::Fstab => RESCUE_FSTAB_RESOURCE_ID,
+            #[cfg(feature = "rescue-crypttab-production-candidate")]
+            Self::Crypttab => RESCUE_CRYPTTAB_RESOURCE_ID,
+        }
+    }
+
+    const fn evidence_id(self) -> &'static str {
+        match self {
+            Self::Fstab => RESCUE_FSTAB_ROLLBACK_EVIDENCE_ID,
+            #[cfg(feature = "rescue-crypttab-production-candidate")]
+            Self::Crypttab => RESCUE_CRYPTTAB_ROLLBACK_EVIDENCE_ID,
+        }
+    }
+
+    const fn preflight_id(self) -> &'static str {
+        match self {
+            Self::Fstab => RESCUE_FSTAB_ROLLBACK_PREFLIGHT_ID,
+            #[cfg(feature = "rescue-crypttab-production-candidate")]
+            Self::Crypttab => RESCUE_CRYPTTAB_ROLLBACK_PREFLIGHT_ID,
+        }
+    }
+
+    const fn backup(self) -> &'static str {
+        match self {
+            Self::Fstab => RESCUE_FSTAB_ROLLBACK_BACKUP,
+            #[cfg(feature = "rescue-crypttab-production-candidate")]
+            Self::Crypttab => RESCUE_CRYPTTAB_ROLLBACK_BACKUP,
+        }
+    }
+
+    const fn validation_id(self) -> &'static str {
+        match self {
+            Self::Fstab => RESCUE_FSTAB_VALIDATION_ID,
+            #[cfg(feature = "rescue-crypttab-production-candidate")]
+            Self::Crypttab => kernaid_policy::RESCUE_CRYPTTAB_VALIDATION_ID,
+        }
+    }
+
+    pub const fn typed_confirmation(self) -> &'static str {
+        match self {
+            Self::Fstab => RESCUE_FSTAB_ROLLBACK_TYPED_CONFIRMATION,
+            #[cfg(feature = "rescue-crypttab-production-candidate")]
+            Self::Crypttab => RESCUE_CRYPTTAB_ROLLBACK_TYPED_CONFIRMATION,
+        }
+    }
+
+    fn validate_plan(
+        self,
+        plan: &ValidatedPlan,
+        target_fingerprint: &str,
+    ) -> Result<(), PolicyError> {
+        match self {
+            Self::Fstab => validate_rescue_fstab_rollback_policy(plan, target_fingerprint),
+            #[cfg(feature = "rescue-crypttab-production-candidate")]
+            Self::Crypttab => validate_rescue_crypttab_rollback_policy(plan, target_fingerprint),
+        }
+    }
+}
+
 #[cfg(feature = "rescue-fstab-production-candidate")]
 const RESCUE_FSTAB_APPROVAL_HASH_DOMAIN: &[u8] =
     b"kernaid:linux.fstab.disable-missing-uuid.v1:approval:v1\0";
@@ -728,11 +826,40 @@ const RESCUE_FSTAB_ROLLBACK_APPROVAL_HASH_DOMAIN: &[u8] =
 #[cfg(feature = "rescue-fstab-production-candidate")]
 const RESCUE_FSTAB_ROLLBACK_PLAN_HASH_DOMAIN: &[u8] = b"kernaid:linux.fstab.restore:plan:v1\0";
 
+#[cfg(feature = "rescue-crypttab-production-candidate")]
+const RESCUE_CRYPTTAB_ROLLBACK_APPROVAL_HASH_DOMAIN: &[u8] =
+    b"kernaid:linux.crypttab.disable-missing-source.v1:approval:v1\0";
+
+#[cfg(feature = "rescue-crypttab-production-candidate")]
+const RESCUE_CRYPTTAB_ROLLBACK_PLAN_HASH_DOMAIN: &[u8] =
+    b"kernaid:linux.crypttab.disable-missing-source.v1:plan:v1\0";
+
 /// Reconstruct the sole rollback policy plan and its deterministic hash from
 /// broker-owned IDs plus the authenticated source receipt selector. The hash
 /// binds every plan field, the rollback child ID, and the exact source receipt.
 #[cfg(feature = "rescue-fstab-production-candidate")]
 pub fn canonical_rescue_fstab_rollback_plan(
+    plan_id: &str,
+    rollback_id: &str,
+    target_fingerprint: &str,
+    reservation_id: &str,
+    transaction_binding_sha256: &str,
+) -> Result<(ValidatedPlan, String), RescueFstabRollbackAdmissionError> {
+    canonical_rescue_repair_rollback_plan(
+        RescueRepairRollbackResource::Fstab,
+        plan_id,
+        rollback_id,
+        target_fingerprint,
+        reservation_id,
+        transaction_binding_sha256,
+    )
+}
+
+/// Reconstructs the exact resource-specific rollback plan. The selector is a
+/// closed enum derived by the broker from the authenticated source contract.
+#[cfg(feature = "rescue-fstab-production-candidate")]
+pub fn canonical_rescue_repair_rollback_plan(
+    resource: RescueRepairRollbackResource,
     plan_id: &str,
     rollback_id: &str,
     target_fingerprint: &str,
@@ -751,31 +878,36 @@ pub fn canonical_rescue_fstab_rollback_plan(
         plan_id: plan_id.to_owned(),
         target_fingerprint: target_fingerprint.to_owned(),
         steps: vec![kernaid_protocol::ActionStep {
-            action: RESCUE_FSTAB_ROLLBACK_ID.to_owned(),
+            action: resource.action_id().to_owned(),
             risk: kernaid_protocol::Risk::R2,
             target_fingerprint: target_fingerprint.to_owned(),
-            evidence_ids: vec![RESCUE_FSTAB_ROLLBACK_EVIDENCE_ID.to_owned()],
-            preconditions: vec![RESCUE_FSTAB_ROLLBACK_PREFLIGHT_ID.to_owned()],
-            backup: Some(RESCUE_FSTAB_ROLLBACK_BACKUP.to_owned()),
-            validation: RESCUE_FSTAB_VALIDATION_ID.to_owned(),
+            evidence_ids: vec![resource.evidence_id().to_owned()],
+            preconditions: vec![resource.preflight_id().to_owned()],
+            backup: Some(resource.backup().to_owned()),
+            validation: resource.validation_id().to_owned(),
             rollback: None,
         }],
     };
-    validate_rescue_fstab_rollback_policy(&plan, target_fingerprint)
+    resource
+        .validate_plan(&plan, target_fingerprint)
         .map_err(RescueFstabRollbackAdmissionError::PolicyRejected)?;
 
     let mut digest = Sha256::new();
-    digest.update(RESCUE_FSTAB_ROLLBACK_PLAN_HASH_DOMAIN);
+    digest.update(match resource {
+        RescueRepairRollbackResource::Fstab => RESCUE_FSTAB_ROLLBACK_PLAN_HASH_DOMAIN,
+        #[cfg(feature = "rescue-crypttab-production-candidate")]
+        RescueRepairRollbackResource::Crypttab => RESCUE_CRYPTTAB_ROLLBACK_PLAN_HASH_DOMAIN,
+    });
     for value in [
         plan.plan_id.as_str(),
         plan.target_fingerprint.as_str(),
-        RESCUE_FSTAB_ROLLBACK_ID,
+        resource.action_id(),
         "R2",
         target_fingerprint,
-        RESCUE_FSTAB_ROLLBACK_EVIDENCE_ID,
-        RESCUE_FSTAB_ROLLBACK_PREFLIGHT_ID,
-        RESCUE_FSTAB_ROLLBACK_BACKUP,
-        RESCUE_FSTAB_VALIDATION_ID,
+        resource.evidence_id(),
+        resource.preflight_id(),
+        resource.backup(),
+        resource.validation_id(),
         "rollback:none",
         rollback_id,
         reservation_id,
@@ -1204,6 +1336,7 @@ impl RescueFstabRollbackSourceBinding {
 #[cfg(feature = "rescue-fstab-production-candidate")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RescueFstabRollbackBinding {
+    resource: RescueRepairRollbackResource,
     session_id: String,
     rollback_id: String,
     plan_id: String,
@@ -1222,7 +1355,28 @@ impl RescueFstabRollbackBinding {
         target_fingerprint: impl Into<String>,
         source: RescueFstabRollbackSourceBinding,
     ) -> Result<Self, RescueFstabRollbackAdmissionError> {
+        Self::new_for_resource(
+            RescueRepairRollbackResource::Fstab,
+            session_id,
+            rollback_id,
+            plan_id,
+            plan_hash,
+            target_fingerprint,
+            source,
+        )
+    }
+
+    pub fn new_for_resource(
+        resource: RescueRepairRollbackResource,
+        session_id: impl Into<String>,
+        rollback_id: impl Into<String>,
+        plan_id: impl Into<String>,
+        plan_hash: impl Into<String>,
+        target_fingerprint: impl Into<String>,
+        source: RescueFstabRollbackSourceBinding,
+    ) -> Result<Self, RescueFstabRollbackAdmissionError> {
         let value = Self {
+            resource,
             session_id: session_id.into(),
             rollback_id: rollback_id.into(),
             plan_id: plan_id.into(),
@@ -1258,8 +1412,11 @@ impl RescueFstabRollbackBinding {
     pub fn target_fingerprint(&self) -> &str {
         &self.target_fingerprint
     }
+    pub const fn resource(&self) -> RescueRepairRollbackResource {
+        self.resource
+    }
     pub const fn resource_id(&self) -> &'static str {
-        RESCUE_FSTAB_RESOURCE_ID
+        self.resource.resource_id()
     }
     pub const fn source(&self) -> &RescueFstabRollbackSourceBinding {
         &self.source
@@ -1380,7 +1537,7 @@ impl RescueFstabRollbackAdmission {
         if approval.approval_sequence != self.next_approval_sequence {
             return Err(RescueFstabRollbackAdmissionError::NonMonotonicApproval);
         }
-        if approval.typed_confirmation != RESCUE_FSTAB_ROLLBACK_TYPED_CONFIRMATION {
+        if approval.typed_confirmation != self.binding.resource.typed_confirmation() {
             return Err(RescueFstabRollbackAdmissionError::TypedConfirmationMismatch);
         }
         self.approval_sha256 = Some(rescue_fstab_rollback_approval_sha256(approval));
@@ -1393,14 +1550,18 @@ impl RescueFstabRollbackAdmission {
 #[cfg(feature = "rescue-fstab-production-candidate")]
 fn rescue_fstab_rollback_approval_sha256(approval: &RescueFstabRollbackApproval) -> String {
     let mut digest = Sha256::new();
-    digest.update(RESCUE_FSTAB_ROLLBACK_APPROVAL_HASH_DOMAIN);
+    digest.update(match approval.binding.resource {
+        RescueRepairRollbackResource::Fstab => RESCUE_FSTAB_ROLLBACK_APPROVAL_HASH_DOMAIN,
+        #[cfg(feature = "rescue-crypttab-production-candidate")]
+        RescueRepairRollbackResource::Crypttab => RESCUE_CRYPTTAB_ROLLBACK_APPROVAL_HASH_DOMAIN,
+    });
     for value in [
         approval.binding.session_id.as_str(),
         approval.binding.rollback_id.as_str(),
         approval.binding.plan_id.as_str(),
         approval.binding.plan_hash.as_str(),
         approval.binding.target_fingerprint.as_str(),
-        RESCUE_FSTAB_RESOURCE_ID,
+        approval.binding.resource.resource_id(),
         approval.binding.source.source_plan_id.as_str(),
         approval.binding.source.source_plan_hash.as_str(),
         approval.binding.source.source_approval_id.as_str(),
@@ -1873,13 +2034,29 @@ impl Session {
         plan: &ValidatedPlan,
         binding: RescueFstabRollbackBinding,
     ) -> Result<RescueFstabRollbackAdmission, RescueFstabRollbackAdmissionError> {
+        if binding.resource != RescueRepairRollbackResource::Fstab {
+            return Err(RescueFstabRollbackAdmissionError::BindingMismatch);
+        }
+        self.stage_rescue_repair_rollback(plan, binding)
+    }
+
+    /// Stages the resource-specific rollback admission. The resource is part
+    /// of the immutable binding and selects one closed policy contract.
+    #[cfg(feature = "rescue-fstab-production-candidate")]
+    pub fn stage_rescue_repair_rollback(
+        &mut self,
+        plan: &ValidatedPlan,
+        binding: RescueFstabRollbackBinding,
+    ) -> Result<RescueFstabRollbackAdmission, RescueFstabRollbackAdmissionError> {
         if self.state != State::Observe || self.linux_snapshot.is_some() {
             return Err(RescueFstabRollbackAdmissionError::InvalidSessionState);
         }
         if self.mode != SessionMode::LinuxRescue {
             return Err(RescueFstabRollbackAdmissionError::WrongSessionMode);
         }
-        validate_rescue_fstab_rollback_policy(plan, &self.fingerprint)
+        binding
+            .resource
+            .validate_plan(plan, &self.fingerprint)
             .map_err(RescueFstabRollbackAdmissionError::PolicyRejected)?;
         if binding.plan_id != plan.plan_id
             || binding.target_fingerprint != plan.target_fingerprint
@@ -2784,6 +2961,72 @@ mod tests {
             admission
                 .approval_sha256()
                 .is_some_and(valid_rescue_candidate_sha256)
+        );
+    }
+
+    #[cfg(feature = "rescue-crypttab-production-candidate")]
+    #[test]
+    fn crypttab_rollback_plan_and_approval_cannot_cross_bind_fstab() {
+        let transaction = format!("sha256:{}", "d".repeat(64));
+        let (plan, plan_hash) = canonical_rescue_repair_rollback_plan(
+            RescueRepairRollbackResource::Crypttab,
+            "P-rescue-crypttab-rollback",
+            "RB-rescue-crypttab-rollback",
+            RESCUE_CANDIDATE_TARGET,
+            "B-source-backup",
+            &transaction,
+        )
+        .expect("crypttab rollback plan");
+        assert_eq!(plan.steps[0].action, RESCUE_CRYPTTAB_ROLLBACK_ID);
+        let source = RescueFstabRollbackSourceBinding::new(
+            "P-rescue-crypttab-candidate",
+            RESCUE_CANDIDATE_PLAN_HASH,
+            "A-source-repair",
+            1,
+            "B-source-backup",
+            transaction,
+            "vault://repair/B-source-backup",
+        )
+        .expect("committed crypttab source receipt");
+        let binding = RescueFstabRollbackBinding::new_for_resource(
+            RescueRepairRollbackResource::Crypttab,
+            "S-rescue-crypttab-rollback",
+            "RB-rescue-crypttab-rollback",
+            plan.plan_id.clone(),
+            plan_hash,
+            RESCUE_CANDIDATE_TARGET,
+            source,
+        )
+        .expect("crypttab rollback binding");
+        assert_eq!(binding.resource_id(), RESCUE_CRYPTTAB_RESOURCE_ID);
+        let mut session = Session::new(RESCUE_CANDIDATE_TARGET, SessionMode::LinuxRescue);
+        let mut admission = session
+            .stage_rescue_repair_rollback(&plan, binding.clone())
+            .expect("stage crypttab rollback");
+        let cross_confirmation = RescueFstabRollbackApproval::new(
+            binding.clone(),
+            "A-fresh-rollback",
+            2,
+            RESCUE_FSTAB_ROLLBACK_TYPED_CONFIRMATION,
+        )
+        .expect("cross-resource phrase is syntactically valid");
+        assert_eq!(
+            admission.approve(&cross_confirmation),
+            Err(RescueFstabRollbackAdmissionError::TypedConfirmationMismatch)
+        );
+        let exact = RescueFstabRollbackApproval::new(
+            binding,
+            "A-fresh-rollback",
+            2,
+            RESCUE_CRYPTTAB_ROLLBACK_TYPED_CONFIRMATION,
+        )
+        .expect("exact crypttab rollback approval");
+        admission
+            .approve(&exact)
+            .expect("approve crypttab rollback");
+        assert_eq!(
+            admission.state(),
+            RescueFstabRollbackAdmissionState::Approved
         );
     }
 

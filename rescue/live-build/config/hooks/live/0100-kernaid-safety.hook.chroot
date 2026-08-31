@@ -198,10 +198,12 @@ if [ "$repair_candidate_enabled" = "1" ]; then
     grep -Fq '/api/rescue/repair' "$rescue_server"
     grep -Fq 'kernaid.dev/rescue-repair-service/v1alpha1' "$rescue_server"
     grep -Fq 'repair.fstab.rollback.prepare' "$rescue_server"
+    grep -Fq 'repair.crypttab.rollback.prepare' "$rescue_server"
 else
     ! grep -Fq '/api/rescue/repair' "$rescue_server"
     ! grep -Fq 'kernaid.dev/rescue-repair-service/' "$rescue_server"
     ! grep -Fq 'repair.fstab.' "$rescue_server"
+    ! grep -Fq 'repair.crypttab.' "$rescue_server"
 fi
 grep -Fq '/api/inventory' "$rescue_server"
 grep -Fq '/api/rescue/inspect-installed-target' "$rescue_server"

@@ -5,8 +5,10 @@ const root = fileURLToPath(new URL("../dist/", import.meta.url));
 const repairTokens = [
   "/api/rescue/repair",
   "repair.fstab.rollback.prepare",
+  "repair.crypttab.rollback.prepare",
   "DISABILITA VOCE FSTAB",
   "RIPRISTINA FSTAB ORIGINALE",
+  "RIPRISTINA CRYPTTAB ORIGINALE",
 ];
 const diagnosisTokens = ["/api/rescue/inspect-installed-target", "Diagnostica"];
 const payloads = [];

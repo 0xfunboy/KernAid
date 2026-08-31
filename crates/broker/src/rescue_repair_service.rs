@@ -6,14 +6,17 @@
 //! action identifier, command, observed bytes, or replacement bytes.
 
 use crate::rescue_repair_service_engine::RescueFstabRollbackBackend;
-#[cfg(feature = "rescue-crypttab-production-candidate")]
-use kernaid_core::RESCUE_CRYPTTAB_TYPED_CONFIRMATION;
 use kernaid_core::RESCUE_FSTAB_TYPED_CONFIRMATION;
+#[cfg(feature = "rescue-crypttab-production-candidate")]
+use kernaid_core::{
+    RESCUE_CRYPTTAB_ROLLBACK_TYPED_CONFIRMATION, RESCUE_CRYPTTAB_TYPED_CONFIRMATION,
+};
 use kernaid_linux_pack::production_candidate_contract::{ACTION_ID, RESOURCE_ID};
 #[cfg(feature = "rescue-crypttab-production-candidate")]
 use kernaid_protocol::rescue_crypttab_repair::{
     ACTION_ID as CRYPTTAB_ACTION_ID, RESOURCE_ID as CRYPTTAB_RESOURCE_ID,
 };
+use kernaid_protocol::rescue_repair_vault::RepairResourceV1;
 use kernaid_protocol::rescue_vault::RequestId;
 use rustix::rand::{GetRandomFlags, getrandom};
 use serde::{Deserialize, Serialize};
@@ -53,6 +56,43 @@ impl RepairCandidateKind {
             Self::Crypttab => CRYPTTAB_RESOURCE_ID,
         }
     }
+
+    pub(crate) const fn repair_resource(self) -> RepairResourceV1 {
+        match self {
+            Self::Fstab => RepairResourceV1::Fstab,
+            #[cfg(feature = "rescue-crypttab-production-candidate")]
+            Self::Crypttab => RepairResourceV1::Crypttab,
+        }
+    }
+
+    const fn rollback_kind(self) -> &'static str {
+        match self {
+            Self::Fstab => "fstab-rollback-prepared",
+            #[cfg(feature = "rescue-crypttab-production-candidate")]
+            Self::Crypttab => "crypttab-rollback-prepared",
+        }
+    }
+
+    const fn rollback_action_id(self) -> &'static str {
+        self.repair_resource().rollback_action_id()
+    }
+
+    const fn rollback_confirmation(self) -> &'static str {
+        match self {
+            Self::Fstab => ROLLBACK_CONFIRMATION,
+            #[cfg(feature = "rescue-crypttab-production-candidate")]
+            Self::Crypttab => RESCUE_CRYPTTAB_ROLLBACK_TYPED_CONFIRMATION,
+        }
+    }
+
+    fn from_resource_id(resource_id: &str) -> Option<Self> {
+        match resource_id {
+            RESOURCE_ID => Some(Self::Fstab),
+            #[cfg(feature = "rescue-crypttab-production-candidate")]
+            CRYPTTAB_RESOURCE_ID => Some(Self::Crypttab),
+            _ => None,
+        }
+    }
 }
 
 fn repair_contract(resource_id: &str) -> Option<(&'static str, &'static str, &'static str)> {
@@ -66,6 +106,15 @@ fn repair_contract(resource_id: &str) -> Option<(&'static str, &'static str, &'s
         )),
         _ => None,
     }
+}
+
+fn rollback_contract(resource_id: &str) -> Option<(&'static str, &'static str, &'static str)> {
+    let candidate = RepairCandidateKind::from_resource_id(resource_id)?;
+    Some((
+        candidate.rollback_kind(),
+        candidate.rollback_action_id(),
+        candidate.rollback_confirmation(),
+    ))
 }
 
 /// Path-free public identity of the committed source transaction. This value
@@ -244,6 +293,14 @@ pub enum RepairServiceRequest {
         #[serde(rename = "requestId")]
         request_id: String,
     },
+    #[serde(rename = "repair.crypttab.rollback.status")]
+    #[cfg(feature = "rescue-crypttab-production-candidate")]
+    CrypttabRollbackStatus {
+        #[serde(rename = "apiVersion")]
+        api_version: String,
+        #[serde(rename = "requestId")]
+        request_id: String,
+    },
     #[serde(rename = "repair.fstab.rollback.prepare")]
     RollbackPrepare {
         #[serde(rename = "apiVersion")]
@@ -252,8 +309,42 @@ pub enum RepairServiceRequest {
         request_id: String,
         source: RollbackSourceReceipt,
     },
+    #[serde(rename = "repair.crypttab.rollback.prepare")]
+    #[cfg(feature = "rescue-crypttab-production-candidate")]
+    CrypttabRollbackPrepare {
+        #[serde(rename = "apiVersion")]
+        api_version: String,
+        #[serde(rename = "requestId")]
+        request_id: String,
+        source: RollbackSourceReceipt,
+    },
     #[serde(rename = "repair.fstab.rollback.approve")]
     RollbackApprove {
+        #[serde(rename = "apiVersion")]
+        api_version: String,
+        #[serde(rename = "requestId")]
+        request_id: String,
+        #[serde(rename = "preparedId")]
+        prepared_id: String,
+        #[serde(rename = "rollbackId")]
+        rollback_id: String,
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        #[serde(rename = "planId")]
+        plan_id: String,
+        #[serde(rename = "planHash")]
+        plan_hash: String,
+        source: RollbackSourceReceipt,
+        #[serde(rename = "approvalId")]
+        approval_id: String,
+        #[serde(rename = "approvalSequence")]
+        approval_sequence: u64,
+        #[serde(rename = "typedConfirmation")]
+        typed_confirmation: String,
+    },
+    #[serde(rename = "repair.crypttab.rollback.approve")]
+    #[cfg(feature = "rescue-crypttab-production-candidate")]
+    CrypttabRollbackApprove {
         #[serde(rename = "apiVersion")]
         api_version: String,
         #[serde(rename = "requestId")]
@@ -290,6 +381,21 @@ pub enum RepairServiceRequest {
         plan_hash: String,
         source: RollbackSourceReceipt,
     },
+    #[serde(rename = "repair.crypttab.rollback.cancel")]
+    #[cfg(feature = "rescue-crypttab-production-candidate")]
+    CrypttabRollbackCancel {
+        #[serde(rename = "apiVersion")]
+        api_version: String,
+        #[serde(rename = "requestId")]
+        request_id: String,
+        #[serde(rename = "preparedId")]
+        prepared_id: String,
+        #[serde(rename = "rollbackId")]
+        rollback_id: String,
+        #[serde(rename = "planHash")]
+        plan_hash: String,
+        source: RollbackSourceReceipt,
+    },
 }
 
 impl RepairServiceRequest {
@@ -309,6 +415,14 @@ impl RepairServiceRequest {
             Self::RollbackPrepare { .. } => "repair.fstab.rollback.prepare",
             Self::RollbackApprove { .. } => "repair.fstab.rollback.approve",
             Self::RollbackCancel { .. } => "repair.fstab.rollback.cancel",
+            #[cfg(feature = "rescue-crypttab-production-candidate")]
+            Self::CrypttabRollbackStatus { .. } => "repair.crypttab.rollback.status",
+            #[cfg(feature = "rescue-crypttab-production-candidate")]
+            Self::CrypttabRollbackPrepare { .. } => "repair.crypttab.rollback.prepare",
+            #[cfg(feature = "rescue-crypttab-production-candidate")]
+            Self::CrypttabRollbackApprove { .. } => "repair.crypttab.rollback.approve",
+            #[cfg(feature = "rescue-crypttab-production-candidate")]
+            Self::CrypttabRollbackCancel { .. } => "repair.crypttab.rollback.cancel",
         }
     }
 
@@ -325,7 +439,11 @@ impl RepairServiceRequest {
             #[cfg(feature = "rescue-crypttab-production-candidate")]
             Self::CrypttabPrepare { api_version, .. }
             | Self::CrypttabApprove { api_version, .. }
-            | Self::CrypttabCancel { api_version, .. } => api_version,
+            | Self::CrypttabCancel { api_version, .. }
+            | Self::CrypttabRollbackStatus { api_version, .. }
+            | Self::CrypttabRollbackPrepare { api_version, .. }
+            | Self::CrypttabRollbackApprove { api_version, .. }
+            | Self::CrypttabRollbackCancel { api_version, .. } => api_version,
         }
     }
 
@@ -342,7 +460,11 @@ impl RepairServiceRequest {
             #[cfg(feature = "rescue-crypttab-production-candidate")]
             Self::CrypttabPrepare { request_id, .. }
             | Self::CrypttabApprove { request_id, .. }
-            | Self::CrypttabCancel { request_id, .. } => request_id,
+            | Self::CrypttabCancel { request_id, .. }
+            | Self::CrypttabRollbackStatus { request_id, .. }
+            | Self::CrypttabRollbackPrepare { request_id, .. }
+            | Self::CrypttabRollbackApprove { request_id, .. }
+            | Self::CrypttabRollbackCancel { request_id, .. } => request_id,
         }
     }
 
@@ -360,6 +482,11 @@ impl RepairServiceRequest {
             | Self::RollbackPrepare { .. }
             | Self::RollbackApprove { .. }
             | Self::RollbackCancel { .. } => ROLLBACK_SERVICE_API_VERSION,
+            #[cfg(feature = "rescue-crypttab-production-candidate")]
+            Self::CrypttabRollbackStatus { .. }
+            | Self::CrypttabRollbackPrepare { .. }
+            | Self::CrypttabRollbackApprove { .. }
+            | Self::CrypttabRollbackCancel { .. } => ROLLBACK_SERVICE_API_VERSION,
         };
         if self.api_version() != expected_version || RequestId::parse(self.request_id()).is_err() {
             return Err(RepairServiceErrorToken::InvalidRequest);
@@ -438,7 +565,11 @@ impl RepairServiceRequest {
                 Ok(())
             }
             Self::RollbackStatus { .. } => Ok(()),
+            #[cfg(feature = "rescue-crypttab-production-candidate")]
+            Self::CrypttabRollbackStatus { .. } => Ok(()),
             Self::RollbackPrepare { source, .. } => source.validate(),
+            #[cfg(feature = "rescue-crypttab-production-candidate")]
+            Self::CrypttabRollbackPrepare { source, .. } => source.validate(),
             Self::RollbackApprove {
                 prepared_id,
                 rollback_id,
@@ -465,7 +596,51 @@ impl RepairServiceRequest {
                 }
                 Ok(())
             }
+            #[cfg(feature = "rescue-crypttab-production-candidate")]
+            Self::CrypttabRollbackApprove {
+                prepared_id,
+                rollback_id,
+                session_id,
+                plan_id,
+                plan_hash,
+                source,
+                approval_id,
+                approval_sequence,
+                typed_confirmation,
+                ..
+            } => {
+                source.validate()?;
+                if !valid_fixed_id(prepared_id, "Q-")
+                    || !valid_fixed_id(rollback_id, "RB-")
+                    || !valid_fixed_id(session_id, "S-")
+                    || !valid_fixed_id(plan_id, "P-")
+                    || !valid_prefixed_hash(plan_hash, "sha256:")
+                    || !valid_fixed_id(approval_id, "A-")
+                    || *approval_sequence == 0
+                    || typed_confirmation != RESCUE_CRYPTTAB_ROLLBACK_TYPED_CONFIRMATION
+                {
+                    return Err(RepairServiceErrorToken::InvalidRequest);
+                }
+                Ok(())
+            }
             Self::RollbackCancel {
+                prepared_id,
+                rollback_id,
+                plan_hash,
+                source,
+                ..
+            } => {
+                source.validate()?;
+                if !valid_fixed_id(prepared_id, "Q-")
+                    || !valid_fixed_id(rollback_id, "RB-")
+                    || !valid_prefixed_hash(plan_hash, "sha256:")
+                {
+                    return Err(RepairServiceErrorToken::InvalidRequest);
+                }
+                Ok(())
+            }
+            #[cfg(feature = "rescue-crypttab-production-candidate")]
+            Self::CrypttabRollbackCancel {
                 prepared_id,
                 rollback_id,
                 plan_hash,
@@ -574,6 +749,7 @@ pub struct BrokerOwnedRollbackPrepareCommand {
     rollback_id: String,
     plan_id: String,
     source: RollbackSourceReceipt,
+    candidate: RepairCandidateKind,
 }
 
 impl BrokerOwnedRollbackPrepareCommand {
@@ -591,6 +767,9 @@ impl BrokerOwnedRollbackPrepareCommand {
     }
     pub const fn source(&self) -> &RollbackSourceReceipt {
         &self.source
+    }
+    pub const fn candidate(&self) -> RepairCandidateKind {
+        self.candidate
     }
 }
 
@@ -887,7 +1066,7 @@ impl PreparedRollbackDescriptor {
             || !valid_prefixed_hash(&value.target_fingerprint, "sha256:")
             || value.source.validate().is_err()
             || !valid_fixed_id(&value.source_approval_id, "A-")
-            || value.resource_id != RESOURCE_ID
+            || rollback_contract(&value.resource_id).is_none()
             || !valid_backup_locator(&value.backup_locator)
             || value.backup_locator != format!("vault://repair/{}", value.source.reservation_id)
             || value.next_approval_sequence < 2
@@ -1073,8 +1252,14 @@ struct PreparedRollbackSummary {
 
 impl PreparedRollbackSummary {
     fn detail(&self) -> PreparedRollbackDetail {
+        let (kind, action_id, confirmation_required) =
+            rollback_contract(&self.descriptor.resource_id).unwrap_or((
+                "invalid-rollback-prepared",
+                ROLLBACK_ACTION_ID,
+                ROLLBACK_CONFIRMATION,
+            ));
         PreparedRollbackDetail {
-            kind: "fstab-rollback-prepared",
+            kind,
             prepared_id: self.prepared_id.clone(),
             rollback_id: self.descriptor.rollback_id.clone(),
             session_id: self.descriptor.session_id.clone(),
@@ -1084,10 +1269,10 @@ impl PreparedRollbackSummary {
             source: self.descriptor.source.clone(),
             resource_id: self.descriptor.resource_id.clone(),
             backup_locator: self.descriptor.backup_locator.clone(),
-            action_id: ROLLBACK_ACTION_ID,
+            action_id,
             risk: RISK_ID,
             next_approval_sequence: self.descriptor.next_approval_sequence,
-            confirmation_required: ROLLBACK_CONFIRMATION,
+            confirmation_required,
         }
     }
 }
@@ -1345,6 +1530,8 @@ impl<Engine: RepairPreparationEngine + RescueFstabRollbackBackend> RescueRepairS
             RepairServiceRequest::Status { .. } | RepairServiceRequest::RollbackStatus { .. } => {
                 Ok(())
             }
+            #[cfg(feature = "rescue-crypttab-production-candidate")]
+            RepairServiceRequest::CrypttabRollbackStatus { .. } => Ok(()),
             RepairServiceRequest::Prepare {
                 request_id, target, ..
             } => self.begin_prepare(request_id, target, RepairCandidateKind::Fstab),
@@ -1424,7 +1611,11 @@ impl<Engine: RepairPreparationEngine + RescueFstabRollbackBackend> RescueRepairS
             ),
             RepairServiceRequest::RollbackPrepare {
                 request_id, source, ..
-            } => self.begin_rollback_prepare(request_id, source),
+            } => self.begin_rollback_prepare(request_id, source, RepairCandidateKind::Fstab),
+            #[cfg(feature = "rescue-crypttab-production-candidate")]
+            RepairServiceRequest::CrypttabRollbackPrepare {
+                request_id, source, ..
+            } => self.begin_rollback_prepare(request_id, source, RepairCandidateKind::Crypttab),
             RepairServiceRequest::RollbackApprove {
                 request_id,
                 prepared_id,
@@ -1437,7 +1628,23 @@ impl<Engine: RepairPreparationEngine + RescueFstabRollbackBackend> RescueRepairS
                 approval_sequence,
                 typed_confirmation,
                 ..
-            } => self.begin_rollback_approval(BoundRollbackApproval {
+            } => self.begin_rollback_approval(
+                BoundRollbackApproval {
+                    request_id,
+                    prepared_id,
+                    rollback_id,
+                    session_id,
+                    plan_id,
+                    plan_hash,
+                    source,
+                    approval_id,
+                    approval_sequence,
+                    typed_confirmation,
+                },
+                RepairCandidateKind::Fstab,
+            ),
+            #[cfg(feature = "rescue-crypttab-production-candidate")]
+            RepairServiceRequest::CrypttabRollbackApprove {
                 request_id,
                 prepared_id,
                 rollback_id,
@@ -1448,7 +1655,22 @@ impl<Engine: RepairPreparationEngine + RescueFstabRollbackBackend> RescueRepairS
                 approval_id,
                 approval_sequence,
                 typed_confirmation,
-            }),
+                ..
+            } => self.begin_rollback_approval(
+                BoundRollbackApproval {
+                    request_id,
+                    prepared_id,
+                    rollback_id,
+                    session_id,
+                    plan_id,
+                    plan_hash,
+                    source,
+                    approval_id,
+                    approval_sequence,
+                    typed_confirmation,
+                },
+                RepairCandidateKind::Crypttab,
+            ),
             RepairServiceRequest::RollbackCancel {
                 request_id,
                 prepared_id,
@@ -1462,6 +1684,23 @@ impl<Engine: RepairPreparationEngine + RescueFstabRollbackBackend> RescueRepairS
                 &rollback_id,
                 &plan_hash,
                 &source,
+                RepairCandidateKind::Fstab,
+            ),
+            #[cfg(feature = "rescue-crypttab-production-candidate")]
+            RepairServiceRequest::CrypttabRollbackCancel {
+                request_id,
+                prepared_id,
+                rollback_id,
+                plan_hash,
+                source,
+                ..
+            } => self.begin_rollback_cancel(
+                &request_id,
+                &prepared_id,
+                &rollback_id,
+                &plan_hash,
+                &source,
+                RepairCandidateKind::Crypttab,
             ),
         }
     }
@@ -1664,6 +1903,7 @@ impl<Engine: RepairPreparationEngine + RescueFstabRollbackBackend> RescueRepairS
         &mut self,
         request_id: String,
         source: RollbackSourceReceipt,
+        candidate: RepairCandidateKind,
     ) -> Result<(), RepairServiceErrorToken> {
         let source_terminal = match &self.state.phase {
             InternalState::Idle => None,
@@ -1694,6 +1934,7 @@ impl<Engine: RepairPreparationEngine + RescueFstabRollbackBackend> RescueRepairS
             rollback_id,
             plan_id,
             source,
+            candidate,
         };
         let deadline = absolute_deadline(PREPARE_TIMEOUT)?;
         self.jobs
@@ -1716,6 +1957,7 @@ impl<Engine: RepairPreparationEngine + RescueFstabRollbackBackend> RescueRepairS
     fn begin_rollback_approval(
         &mut self,
         approval: BoundRollbackApproval,
+        candidate: RepairCandidateKind,
     ) -> Result<(), RepairServiceErrorToken> {
         match &self.state.phase {
             InternalState::RollbackPrepared { summary, .. } => {
@@ -1728,6 +1970,7 @@ impl<Engine: RepairPreparationEngine + RescueFstabRollbackBackend> RescueRepairS
                     || approval.source != summary.descriptor.source
                     || approval.approval_id == summary.descriptor.source_approval_id
                     || approval.approval_sequence != summary.descriptor.next_approval_sequence
+                    || summary.descriptor.resource_id != candidate.resource_id()
                 {
                     return Err(RepairServiceErrorToken::BindingMismatch);
                 }
@@ -1794,6 +2037,7 @@ impl<Engine: RepairPreparationEngine + RescueFstabRollbackBackend> RescueRepairS
         rollback_id: &str,
         plan_hash: &str,
         source: &RollbackSourceReceipt,
+        candidate: RepairCandidateKind,
     ) -> Result<(), RepairServiceErrorToken> {
         match &self.state.phase {
             InternalState::RollbackPrepared { summary, .. } => {
@@ -1802,6 +2046,7 @@ impl<Engine: RepairPreparationEngine + RescueFstabRollbackBackend> RescueRepairS
                     || rollback_id != summary.descriptor.rollback_id
                     || plan_hash != summary.descriptor.plan_hash
                     || source != &summary.descriptor.source
+                    || summary.descriptor.resource_id != candidate.resource_id()
                 {
                     return Err(RepairServiceErrorToken::BindingMismatch);
                 }
@@ -2143,7 +2388,14 @@ impl<Engine: RepairPreparationEngine + RescueFstabRollbackBackend> RescueRepairS
         &self,
         operation: &str,
     ) -> (RepairPublicState, Option<RepairResponseDetail>) {
-        let rollback_api = operation.starts_with("repair.fstab.rollback.");
+        let rollback_candidate = rollback_candidate_for_operation(operation);
+        let rollback_api = rollback_candidate.is_some();
+        if let (InternalState::RollbackPrepared { summary, .. }, Some(candidate)) =
+            (&self.state.phase, rollback_candidate)
+            && summary.descriptor.resource_id != candidate.resource_id()
+        {
+            return (RepairPublicState::Executing, None);
+        }
         match (&self.state.phase, rollback_api) {
             (
                 InternalState::Preparing { .. }
@@ -2333,7 +2585,13 @@ fn rollback_descriptor_matches(
     command: &BrokerOwnedRollbackPrepareCommand,
     descriptor: &PreparedRollbackDescriptor,
 ) -> bool {
-    let canonical_hash = kernaid_core::canonical_rescue_fstab_rollback_plan(
+    let resource = match command.candidate() {
+        RepairCandidateKind::Fstab => kernaid_core::RescueRepairRollbackResource::Fstab,
+        #[cfg(feature = "rescue-crypttab-production-candidate")]
+        RepairCandidateKind::Crypttab => kernaid_core::RescueRepairRollbackResource::Crypttab,
+    };
+    let canonical_hash = kernaid_core::canonical_rescue_repair_rollback_plan(
+        resource,
         command.plan_id(),
         command.rollback_id(),
         &descriptor.target_fingerprint,
@@ -2347,6 +2605,7 @@ fn rollback_descriptor_matches(
         && descriptor.plan_id == command.plan_id
         && canonical_hash.as_deref() == Some(descriptor.plan_hash.as_str())
         && descriptor.source == command.source
+        && descriptor.resource_id == command.candidate.resource_id()
         && descriptor.backup_locator == format!("vault://repair/{}", command.source.reservation_id)
 }
 
@@ -2514,11 +2773,22 @@ fn lower_hex(bytes: &[u8]) -> bool {
 }
 
 fn api_version_for_operation(operation: &str) -> &'static str {
-    if operation.starts_with("repair.fstab.rollback.") {
+    if rollback_candidate_for_operation(operation).is_some() {
         ROLLBACK_SERVICE_API_VERSION
     } else {
         REPAIR_SERVICE_API_VERSION
     }
+}
+
+fn rollback_candidate_for_operation(operation: &str) -> Option<RepairCandidateKind> {
+    if operation.starts_with("repair.fstab.rollback.") {
+        return Some(RepairCandidateKind::Fstab);
+    }
+    #[cfg(feature = "rescue-crypttab-production-candidate")]
+    if operation.starts_with("repair.crypttab.rollback.") {
+        return Some(RepairCandidateKind::Crypttab);
+    }
+    None
 }
 
 #[derive(Deserialize)]
@@ -2550,6 +2820,13 @@ impl CorrelationProbe {
                         | "repair.fstab.rollback.prepare"
                         | "repair.fstab.rollback.approve"
                         | "repair.fstab.rollback.cancel"
+                        | "repair.crypttab.prepare"
+                        | "repair.crypttab.approve"
+                        | "repair.crypttab.cancel"
+                        | "repair.crypttab.rollback.status"
+                        | "repair.crypttab.rollback.prepare"
+                        | "repair.crypttab.rollback.approve"
+                        | "repair.crypttab.rollback.cancel"
                 )
             })
             .unwrap_or("repair.status")
@@ -2680,7 +2957,15 @@ mod tests {
         ) -> Result<(Self::PreparedRollback, PreparedRollbackDescriptor), RepairEngineFailure>
         {
             self.state.lock().expect("mock state").rollback_prepared += 1;
-            let (_, plan_hash) = kernaid_core::canonical_rescue_fstab_rollback_plan(
+            let resource = match command.candidate() {
+                RepairCandidateKind::Fstab => kernaid_core::RescueRepairRollbackResource::Fstab,
+                #[cfg(feature = "rescue-crypttab-production-candidate")]
+                RepairCandidateKind::Crypttab => {
+                    kernaid_core::RescueRepairRollbackResource::Crypttab
+                }
+            };
+            let (_, plan_hash) = kernaid_core::canonical_rescue_repair_rollback_plan(
+                resource,
                 command.plan_id(),
                 command.rollback_id(),
                 &hash('2'),
@@ -2698,7 +2983,7 @@ mod tests {
                     hash('2'),
                     command.source().clone(),
                     "A-11111111111111111111111111111111",
-                    RESOURCE_ID,
+                    command.candidate().resource_id(),
                     format!("vault://repair/{}", command.source().reservation_id()),
                     2,
                 )?,
@@ -2974,6 +3259,76 @@ mod tests {
         assert_eq!(state.lock().expect("mock state").rollback_prepared, 1);
     }
 
+    #[cfg(feature = "rescue-crypttab-production-candidate")]
+    #[test]
+    fn crypttab_rollback_is_resource_bound_and_uses_a_fresh_typed_approval() {
+        let (mut service, state) = service();
+        let source = format!(
+            r#""source":{{"reservationId":"B-0123456789abcdef0123456789abcdef","transactionBindingSha256":"{}"}}"#,
+            hash('5')
+        );
+        let _ = service.handle_frame(
+            format!(
+                r#"{{"apiVersion":"{ROLLBACK_SERVICE_API_VERSION}","requestId":"R-30000000-0000-0000-0000-000000000001","operation":"repair.crypttab.rollback.prepare",{source}}}"#
+            )
+            .as_bytes(),
+        );
+        wait_for_state(&mut service, RepairPublicState::Prepared);
+        let status = json(&service.handle_frame(
+            format!(
+                r#"{{"apiVersion":"{ROLLBACK_SERVICE_API_VERSION}","requestId":"R-30000000-0000-0000-0000-000000000002","operation":"repair.crypttab.rollback.status"}}"#
+            )
+            .as_bytes(),
+        ));
+        let rollback = &status["detail"];
+        assert_eq!(rollback["kind"], "crypttab-rollback-prepared");
+        assert_eq!(
+            rollback["actionId"],
+            "linux.crypttab.disable-missing-source.v1"
+        );
+        assert_eq!(rollback["resourceId"], CRYPTTAB_RESOURCE_ID);
+        assert_eq!(
+            rollback["confirmationRequired"],
+            RESCUE_CRYPTTAB_ROLLBACK_TYPED_CONFIRMATION
+        );
+
+        let cross_action = json(&service.handle_frame(
+            format!(
+                r#"{{"apiVersion":"{ROLLBACK_SERVICE_API_VERSION}","requestId":"R-30000000-0000-0000-0000-000000000003","operation":"repair.fstab.rollback.approve","preparedId":"{}","rollbackId":"{}","sessionId":"{}","planId":"{}","planHash":"{}",{source},"approvalId":"A-22222222222222222222222222222222","approvalSequence":2,"typedConfirmation":"{ROLLBACK_CONFIRMATION}"}}"#,
+                rollback["preparedId"].as_str().expect("prepared ID"),
+                rollback["rollbackId"].as_str().expect("rollback ID"),
+                rollback["sessionId"].as_str().expect("session ID"),
+                rollback["planId"].as_str().expect("plan ID"),
+                rollback["planHash"].as_str().expect("plan hash"),
+            )
+            .as_bytes(),
+        ));
+        assert_eq!(cross_action["error"], "binding-mismatch");
+        assert_eq!(service.public_state(), RepairPublicState::Prepared);
+
+        let _ = service.handle_frame(
+            format!(
+                r#"{{"apiVersion":"{ROLLBACK_SERVICE_API_VERSION}","requestId":"R-30000000-0000-0000-0000-000000000004","operation":"repair.crypttab.rollback.approve","preparedId":"{}","rollbackId":"{}","sessionId":"{}","planId":"{}","planHash":"{}",{source},"approvalId":"A-33333333333333333333333333333333","approvalSequence":2,"typedConfirmation":"{RESCUE_CRYPTTAB_ROLLBACK_TYPED_CONFIRMATION}"}}"#,
+                rollback["preparedId"].as_str().expect("prepared ID"),
+                rollback["rollbackId"].as_str().expect("rollback ID"),
+                rollback["sessionId"].as_str().expect("session ID"),
+                rollback["planId"].as_str().expect("plan ID"),
+                rollback["planHash"].as_str().expect("plan hash"),
+            )
+            .as_bytes(),
+        );
+        wait_for_state(&mut service, RepairPublicState::Restored);
+        let calls = state.lock().expect("mock state");
+        assert_eq!(
+            (
+                calls.rollback_prepared,
+                calls.rollback_approved,
+                calls.rollback_executed,
+            ),
+            (1, 1, 1)
+        );
+    }
+
     #[test]
     fn rollback_v2_is_source_bound_and_requires_a_fresh_approval() {
         let (mut service, state) = service();
@@ -3208,6 +3563,7 @@ mod tests {
                     rollback_id: "RB-2000000000000000000000000000001".to_owned(),
                     plan_id: "P-20000000000000000000000000000001".to_owned(),
                     source,
+                    candidate: RepairCandidateKind::Fstab,
                 },
                 prepared_id: "Q-20000000000000000000000000000001".to_owned(),
                 source_terminal: Some(source_terminal),
