@@ -554,6 +554,7 @@ class VaultLivePolicyTests(unittest.TestCase):
         self.assertIn("/usr/lib/kernaid/kernaid-rescue-vaultd", hook)
         self.assertIn("/usr/lib/kernaid/kernaid-rescue-firstboot", hook)
         self.assertIn("/usr/lib/kernaid/kernaid-linux-storage-health", hook)
+        self.assertIn("/usr/lib/kernaid/kernaid-linux-filesystem-health", hook)
         self.assertTrue(SECURE_BOOT_STATE.is_file())
         self.assertEqual(
             hook.count("/usr/lib/kernaid/secure_boot_state.py"), 2
@@ -578,10 +579,14 @@ class VaultLivePolicyTests(unittest.TestCase):
         self.assertIn("[ -u \"$helper\" ] || [ -g \"$helper\" ]", ready)
         self.assertIn("linux.storage.health.v1", ready)
         self.assertIn("KERNAID_RESCUE_STORAGE_HEALTH_READY", ready)
+        self.assertIn("kernaid-linux-filesystem-health", ready)
+        self.assertIn("KERNAID_RESCUE_FILESYSTEM_HEALTH_READY", ready)
         self.assertNotIn("uidmap", active_lines(PACKAGE_LIST))
         self.assertIn("user-setup", active_lines(PACKAGE_LIST))
         self.assertIn("smartmontools", active_lines(PACKAGE_LIST))
         self.assertIn("nvme-cli", active_lines(PACKAGE_LIST))
+        self.assertIn("e2fsprogs", active_lines(PACKAGE_LIST))
+        self.assertIn("ntfs-3g", active_lines(PACKAGE_LIST))
 
     def test_build_stages_only_release_rescue_binaries_as_root_0755(self) -> None:
         build = BUILD_SCRIPT.read_text(encoding="utf-8")
@@ -590,6 +595,7 @@ class VaultLivePolicyTests(unittest.TestCase):
         self.assertIn("KERNAID_RESCUE_VAULTCTL_BINARY", build)
         self.assertIn("KERNAID_LINUX_HARDWARE_INVENTORY_BINARY", build)
         self.assertIn("KERNAID_LINUX_STORAGE_HEALTH_BINARY", build)
+        self.assertIn("KERNAID_LINUX_FILESYSTEM_HEALTH_BINARY", build)
         self.assertIn(
             "config/includes.chroot/usr/lib/kernaid/kernaid-rescue-vaultd", build
         )
@@ -611,6 +617,10 @@ class VaultLivePolicyTests(unittest.TestCase):
             "config/includes.chroot/usr/lib/kernaid/kernaid-linux-storage-health",
             build,
         )
+        self.assertIn(
+            "config/includes.chroot/usr/lib/kernaid/kernaid-linux-filesystem-health",
+            build,
+        )
         self.assertIn("KERNAID_RESCUE_DESK_SHELL_BINARY", build)
         self.assertIn("KERNAID_BLOCKFD_PROBE_BINARY", build)
         self.assertIn(
@@ -623,7 +633,7 @@ class VaultLivePolicyTests(unittest.TestCase):
         self.assertGreaterEqual(build.count("install -o root -g root -m 0755"), 2)
         self.assertIn("trap cleanup_staged_binaries EXIT", build)
         self.assertIn('rmdir -- "$vaultctl_destination_dir"', build)
-        self.assertEqual(build.count("verify-shipping-binary.py"), 12)
+        self.assertEqual(build.count("verify-shipping-binary.py"), 13)
         self.assertIn("--profile tauri-webkit", build)
         self.assertNotIn("cargo build", build)
 
@@ -660,6 +670,7 @@ class VaultLivePolicyTests(unittest.TestCase):
         self.assertIn("--bin kernaid-rescue-openai-executor", workflow)
         self.assertIn("--bin kernaid-linux-hardware-inventory", workflow)
         self.assertIn("--bin kernaid-linux-storage-health", workflow)
+        self.assertIn("--bin kernaid-linux-filesystem-health", workflow)
         self.assertIn("--bin kernaid-rescue-desk-shell", workflow)
         self.assertIn("-p kernaid-rescue-desk-shell", workflow)
         self.assertEqual(workflow.count("--features custom-protocol"), 3)
@@ -688,6 +699,10 @@ class VaultLivePolicyTests(unittest.TestCase):
             workflow,
         )
         self.assertIn(
+            "KERNAID_LINUX_FILESYSTEM_HEALTH_BINARY=/workspace/target/release/kernaid-linux-filesystem-health",
+            workflow,
+        )
+        self.assertIn(
             "KERNAID_RESCUE_DESK_SHELL_BINARY=/workspace/target/release/kernaid-rescue-desk-shell",
             workflow,
         )
@@ -699,7 +714,7 @@ class VaultLivePolicyTests(unittest.TestCase):
         )
         self.assertNotIn("$RUNNER_TEMP/kernaid-rescue-shipping-preflight", workflow)
         self.assertIn("sudo install -o root -g root -m 0755", workflow)
-        self.assertEqual(workflow.count("verify-shipping-binary.py"), 10)
+        self.assertEqual(workflow.count("verify-shipping-binary.py"), 11)
         self.assertIn("--profile tauri-webkit", workflow)
         self.assertIn("qemu-vault-lifecycle-smoke.sh", workflow)
 

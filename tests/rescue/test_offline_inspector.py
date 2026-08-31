@@ -1095,6 +1095,54 @@ class BoundaryTests(unittest.TestCase):
         ):
             offline_inspector.collect_storage_health(time.monotonic() + 2)
 
+    def test_root_helper_filesystem_health_is_fixed_bound_and_minimized(self) -> None:
+        snapshot = {
+            "schemaVersion": "1.0",
+            "kind": "linux-filesystem-health",
+            "targetRef": "disk-1/volume-1",
+            "filesystem": "ext4",
+            "state": "healthy",
+            "checkMode": "e2fsck-read-only",
+            "mountedAtCheck": False,
+            "finding": None,
+        }
+        encoded = json.dumps(snapshot, separators=(",", ":")).encode()
+        completed = offline_inspector.subprocess.CompletedProcess(
+            [offline_inspector.FILESYSTEM_HEALTH_BINARY], 0, encoded, b""
+        )
+        targets = FakeTargets()
+        service = offline_inspector.OfflineInspectorService(targets)
+        with patch.object(
+            offline_inspector.subprocess, "run", return_value=completed
+        ) as run:
+            response = service.handle(
+                {"operation": "filesystem-health", "request": REQUEST}
+            )
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["result"], snapshot)
+        self.assertEqual(targets.resolve_count, 3)
+        self.assertEqual(
+            run.call_args.args[0],
+            [
+                offline_inspector.FILESYSTEM_HEALTH_BINARY,
+                "--selected",
+                "disk-1/volume-1",
+                "ext4",
+                "8:2",
+            ],
+        )
+        self.assertIs(run.call_args.kwargs["stdin"], offline_inspector.subprocess.DEVNULL)
+        self.assertIs(run.call_args.kwargs["stderr"], offline_inspector.subprocess.DEVNULL)
+
+        completed.stdout = json.dumps(
+            {**snapshot, "fileName": "private.txt"}, separators=(",", ":")
+        ).encode()
+        with (
+            patch.object(offline_inspector.subprocess, "run", return_value=completed),
+            self.assertRaises(offline_inspector.InspectionError),
+        ):
+            service.engine.filesystem_health(REQUEST, time.monotonic() + 2)
+
     def test_server_internal_resolution_never_enters_public_scan(self) -> None:
         fixture = {
             "blockdevices": [
@@ -1261,7 +1309,7 @@ class BoundaryTests(unittest.TestCase):
             helper,
         )
         self.assertIn("KillMode=control-group", helper)
-        self.assertIn("RuntimeMaxSec=20", helper)
+        self.assertIn("RuntimeMaxSec=38s", helper)
         self.assertIn("Restart=no", helper)
         self.assertIn("KERNAID_TARGET_ID_KEY_FILE=", helper)
         self.assertIn("RuntimeDirectory=kernaid-offline-inspector", key_service)

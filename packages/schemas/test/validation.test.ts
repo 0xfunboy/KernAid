@@ -15,6 +15,7 @@ const schemaFiles = [
   "diagnosis-proposal.schema.json",
   "evidence.schema.json",
   "execution-event.schema.json",
+  "linux-filesystem-health.schema.json",
   "linux-hardware-inventory.schema.json",
   "linux-normalized-snapshot.schema.json",
   "linux-storage-health.schema.json",
@@ -28,6 +29,44 @@ const schemaFiles = [
   "session-report.schema.json",
   "validated-plan.schema.json",
 ];
+
+test("Linux filesystem health schema rejects device paths and user content", () => {
+  const ajv = new Ajv2020({ allErrors: true, strict: true });
+  const schema = JSON.parse(
+    readFileSync(
+      new URL("../linux-filesystem-health.schema.json", import.meta.url),
+      "utf8",
+    ),
+  );
+  const validate = ajv.compile(schema);
+  const snapshot = {
+    schemaVersion: "1.0",
+    kind: "linux-filesystem-health",
+    targetRef: "disk-1/volume-2",
+    filesystem: "ext4",
+    state: "healthy",
+    checkMode: "e2fsck-read-only",
+    mountedAtCheck: false,
+    finding: null,
+  };
+  assert.equal(validate(snapshot), true);
+  assert.equal(validate({ ...snapshot, targetRef: "/dev/sda2" }), false);
+  assert.equal(validate({ ...snapshot, fileName: "private.txt" }), false);
+  assert.equal(
+    validate({
+      ...snapshot,
+      state: "repair-required",
+      finding: {
+        ruleId: "KA-LNX-FS-001",
+        ruleVersion: 1,
+        severity: "critical",
+        summary: "private.txt is damaged",
+        nextAction: "repair it",
+      },
+    }),
+    false,
+  );
+});
 
 test("Linux storage health schema admits only minimized disk references and indicators", () => {
   const ajv = new Ajv2020({ allErrors: true, strict: true });

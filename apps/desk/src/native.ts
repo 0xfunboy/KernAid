@@ -39,6 +39,13 @@ import {
   storageHealthEvidenceSummary,
   type LinuxStorageHealthSnapshot,
 } from "./storage-health";
+import {
+  LINUX_FILESYSTEM_HEALTH_COLLECTOR,
+  augmentDiagnosisWithFilesystemHealth,
+  filesystemHealthEvidenceSummary,
+  parseLinuxFilesystemHealth,
+  type LinuxFilesystemHealthSnapshot,
+} from "./filesystem-health";
 
 export {
   LINUX_STORAGE_HEALTH_COLLECTOR,
@@ -47,6 +54,12 @@ export {
   storageHealthEvidenceSummary,
   type LinuxStorageHealthSnapshot,
 } from "./storage-health";
+export {
+  LINUX_FILESYSTEM_HEALTH_COLLECTOR,
+  filesystemHealthEvidenceSummary,
+  parseLinuxFilesystemHealth,
+  type LinuxFilesystemHealthSnapshot,
+} from "./filesystem-health";
 
 const SIGNED_REPORT_SCHEMA =
   "https://schemas.kernaid.dev/v1/signed-report-envelope.json";
@@ -644,6 +657,20 @@ export async function collectLinuxNormalizedSnapshot(): Promise<LinuxNormalizedS
   );
 }
 
+export async function collectLinuxFilesystemHealth(): Promise<NativeObservation> {
+  if (!isNative())
+    throw new Error(
+      "La diagnostica filesystem Linux richiede KernAid Desk nativo.",
+    );
+  const parsed = parseNativeObservations([
+    await invoke("collect_linux_filesystem_health"),
+  ]);
+  const observation = parsed[0];
+  if (observation === undefined)
+    throw new Error("La diagnostica filesystem Linux non è disponibile.");
+  return observation;
+}
+
 export async function collectWindowsP0Inventory(): Promise<
   NativeObservation[]
 > {
@@ -773,6 +800,38 @@ export async function inspectRescueInstalledTarget(
       response.status,
     );
   }
+}
+
+export async function inspectRescueFilesystemHealth(
+  expectedSelection: RescueTargetSelection,
+): Promise<LinuxFilesystemHealthSnapshot> {
+  if (!isRescueRuntime())
+    throw new Error(
+      "La diagnostica filesystem selezionata richiede KernAid Rescue.",
+    );
+  const selection = parseRescueTargetSelection(expectedSelection);
+  const response = await fetch("/api/rescue/filesystem-health", {
+    method: "POST",
+    cache: "no-store",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      scanFingerprint: selection.scanFingerprint,
+      targetId: selection.target.targetId,
+    }),
+    signal: AbortSignal.timeout(38_000),
+  });
+  if (!response.ok)
+    throw new Error(`filesystem health HTTP ${response.status}`);
+  const snapshot = parseLinuxFilesystemHealth(
+    JSON.stringify(
+      await readBoundedJson(response, MAX_RESCUE_INSPECTION_RESPONSE_BYTES),
+    ),
+  );
+  if (snapshot.targetRef !== selection.target.sourceRef)
+    throw new Error(
+      "La diagnostica filesystem non corrisponde al target selezionato.",
+    );
+  return snapshot;
 }
 
 export function parseRescueOfflineInspection(
@@ -1055,6 +1114,8 @@ export function parseNativeObservations(value: unknown): NativeObservation[] {
       parseLinuxHardwareInventory(item.output);
     if (item.collector === LINUX_STORAGE_HEALTH_COLLECTOR && item.success)
       parseLinuxStorageHealth(item.output);
+    if (item.collector === LINUX_FILESYSTEM_HEALTH_COLLECTOR && item.success)
+      parseLinuxFilesystemHealth(item.output);
     return item as unknown as NativeObservation;
   });
 }
@@ -1304,7 +1365,8 @@ export function nativeObservationContentType(
   return observation.success &&
     (observation.collector.startsWith("macos.") ||
       observation.collector === LINUX_HARDWARE_COLLECTOR ||
-      observation.collector === LINUX_STORAGE_HEALTH_COLLECTOR)
+      observation.collector === LINUX_STORAGE_HEALTH_COLLECTOR ||
+      observation.collector === LINUX_FILESYSTEM_HEALTH_COLLECTOR)
     ? "application/json"
     : "text/plain";
 }
@@ -1319,6 +1381,10 @@ export function nativeObservationSummary(
     return MACOS_NOT_RUN_SUMMARY;
   if (observation.collector === "macos.startup.state")
     return MACOS_PARTIAL_STARTUP_SUMMARY;
+  if (observation.collector === LINUX_FILESYSTEM_HEALTH_COLLECTOR)
+    return filesystemHealthEvidenceSummary(
+      parseLinuxFilesystemHealth(observation.output),
+    );
   return "Comando di inventario completato";
 }
 
@@ -2160,11 +2226,15 @@ export class PlatformOfflineRulesProvider implements Provider {
     const storageHealthEvidence = evidence.filter(
       (item) => item.evidence.collector === LINUX_STORAGE_HEALTH_COLLECTOR,
     );
+    const filesystemHealthEvidence = evidence.filter(
+      (item) => item.evidence.collector === LINUX_FILESYSTEM_HEALTH_COLLECTOR,
+    );
     const hasLinuxCorpus =
       linuxEvidence.length > 0 ||
       snapshotEvidence.length > 0 ||
       hardwareEvidence.length > 0 ||
-      storageHealthEvidence.length > 0;
+      storageHealthEvidence.length > 0 ||
+      filesystemHealthEvidence.length > 0;
     const windowsEvidence = evidence.filter((item) =>
       WINDOWS_P0_COLLECTORS.includes(
         item.evidence.collector as (typeof WINDOWS_P0_COLLECTORS)[number],
@@ -2295,6 +2365,27 @@ export class PlatformOfflineRulesProvider implements Provider {
       }
     }
 
+    let filesystemHealth: LinuxFilesystemHealthSnapshot | undefined;
+    if (
+      filesystemHealthEvidence.length === 1 &&
+      filesystemHealthEvidence[0]?.evidence.target === "local-machine" &&
+      filesystemHealthEvidence[0].evidence.contentType === "application/json" &&
+      filesystemHealthEvidence[0].evidence.trust === "observed-untrusted"
+    ) {
+      try {
+        filesystemHealth = parseLinuxFilesystemHealth(
+          filesystemHealthEvidence[0].content,
+        );
+        if (
+          filesystemHealthEvidence[0].evidence.summary !==
+          filesystemHealthEvidenceSummary(filesystemHealth)
+        )
+          filesystemHealth = undefined;
+      } catch {
+        filesystemHealth = undefined;
+      }
+    }
+
     let admittedSnapshot: LinuxNormalizedSnapshotEnvelope | undefined;
     if (
       snapshotEvidence.length === 1 &&
@@ -2326,6 +2417,7 @@ export class PlatformOfflineRulesProvider implements Provider {
               ...snapshotEvidence,
               ...hardwareEvidence,
               ...storageHealthEvidence,
+              ...filesystemHealthEvidence,
             ].map((item) => item.evidence.id),
           ),
         ),
@@ -2358,6 +2450,7 @@ export class PlatformOfflineRulesProvider implements Provider {
               ...snapshotEvidence,
               ...hardwareEvidence,
               ...storageHealthEvidence,
+              ...filesystemHealthEvidence,
             ].map((item) => item.evidence.id),
           ),
         ),
@@ -2377,7 +2470,8 @@ export class PlatformOfflineRulesProvider implements Provider {
     const exactCorpus =
       evidence.length ===
         LINUX_RESIDENT_CORPUS_COLLECTORS.length +
-          (storageHealthEvidence.length === 1 ? 1 : 0) &&
+          (storageHealthEvidence.length === 1 ? 1 : 0) +
+          (filesystemHealthEvidence.length === 1 ? 1 : 0) &&
       new Set(evidence.map((item) => item.evidence.id)).size ===
         evidence.length &&
       evidence.every(
@@ -2386,7 +2480,8 @@ export class PlatformOfflineRulesProvider implements Provider {
           (LINUX_RESIDENT_CORPUS_COLLECTORS.some(
             (collector) => collector === item.evidence.collector,
           ) ||
-            item.evidence.collector === LINUX_STORAGE_HEALTH_COLLECTOR),
+            item.evidence.collector === LINUX_STORAGE_HEALTH_COLLECTOR ||
+            item.evidence.collector === LINUX_FILESYSTEM_HEALTH_COLLECTOR),
       ) &&
       LINUX_RESIDENT_CORPUS_COLLECTORS.every(
         (collector) => (collectorCounts.get(collector) ?? 0) === 1,
@@ -2464,12 +2559,20 @@ export class PlatformOfflineRulesProvider implements Provider {
         ]),
       ),
     });
-    return storageHealth === undefined
-      ? boundProposal
-      : augmentDiagnosisWithStorageHealth(
-          boundProposal,
-          storageHealth,
-          storageHealthEvidence[0]!.evidence.id,
+    const storageBound =
+      storageHealth === undefined
+        ? boundProposal
+        : augmentDiagnosisWithStorageHealth(
+            boundProposal,
+            storageHealth,
+            storageHealthEvidence[0]!.evidence.id,
+          );
+    return filesystemHealth === undefined
+      ? storageBound
+      : augmentDiagnosisWithFilesystemHealth(
+          storageBound,
+          filesystemHealth,
+          filesystemHealthEvidence[0]!.evidence.id,
         );
   }
 }
@@ -2494,10 +2597,15 @@ async function diagnoseRescueOfflineCorpus(
   const storageMatches = evidence.filter(
     (item) => item.evidence.collector === LINUX_STORAGE_HEALTH_COLLECTOR,
   );
+  const filesystemMatches = evidence.filter(
+    (item) => item.evidence.collector === LINUX_FILESYSTEM_HEALTH_COLLECTOR,
+  );
   if (
     matching.length !== 1 ||
     storageMatches.length > 1 ||
-    evidence.length !== matching.length + storageMatches.length
+    filesystemMatches.length > 1 ||
+    evidence.length !==
+      matching.length + storageMatches.length + filesystemMatches.length
   )
     return invalid();
   let storageHealth: LinuxStorageHealthSnapshot | undefined;
@@ -2519,14 +2627,42 @@ async function diagnoseRescueOfflineCorpus(
       return invalid();
     }
   }
-  const withStorage = (proposal: DiagnosisProposal): DiagnosisProposal => {
-    if (storageHealth !== undefined)
-      return augmentDiagnosisWithStorageHealth(
-        proposal,
-        storageHealth,
-        storageMatches[0]!.evidence.id,
-      );
-    return proposal;
+  let filesystemHealth: LinuxFilesystemHealthSnapshot | undefined;
+  if (filesystemMatches.length === 1) {
+    const filesystem = filesystemMatches[0]!;
+    if (
+      filesystem.evidence.target !== RESCUE_OFFLINE_EVIDENCE_TARGET ||
+      filesystem.evidence.contentType !== "application/json" ||
+      filesystem.evidence.trust !== "observed-untrusted"
+    )
+      return invalid();
+    try {
+      filesystemHealth = parseLinuxFilesystemHealth(filesystem.content);
+      if (
+        filesystem.evidence.summary !==
+        filesystemHealthEvidenceSummary(filesystemHealth)
+      )
+        return invalid();
+    } catch {
+      return invalid();
+    }
+  }
+  const withHealth = (proposal: DiagnosisProposal): DiagnosisProposal => {
+    const storageBound =
+      storageHealth === undefined
+        ? proposal
+        : augmentDiagnosisWithStorageHealth(
+            proposal,
+            storageHealth,
+            storageMatches[0]!.evidence.id,
+          );
+    return filesystemHealth === undefined
+      ? storageBound
+      : augmentDiagnosisWithFilesystemHealth(
+          storageBound,
+          filesystemHealth,
+          filesystemMatches[0]!.evidence.id,
+        );
   };
   const selected = matching[0]!;
   if (
@@ -2564,7 +2700,7 @@ async function diagnoseRescueOfflineCorpus(
   }
   const evidenceIds = [selected.evidence.id];
   if (corpus.family === "linux" && !corpus.topology.supported)
-    return withStorage(
+    return withHealth(
       parseDiagnosisProposal({
         schemaVersion: "1.0",
         diagnosis:
@@ -2575,7 +2711,7 @@ async function diagnoseRescueOfflineCorpus(
       }),
     );
   if (!corpus.installationConfirmed)
-    return withStorage(
+    return withHealth(
       parseDiagnosisProposal({
         schemaVersion: "1.0",
         diagnosis:
@@ -2589,7 +2725,7 @@ async function diagnoseRescueOfflineCorpus(
     );
   if (corpus.family === "linux") {
     if (corpus.configuration.fstab.malformedLineCount > 0)
-      return withStorage(
+      return withHealth(
         parseDiagnosisProposal({
           schemaVersion: "1.0",
           diagnosis:
@@ -2600,7 +2736,7 @@ async function diagnoseRescueOfflineCorpus(
         }),
       );
     if (corpus.boot.directoryPresent && corpus.boot.kernelArtifactCount === 0)
-      return withStorage(
+      return withHealth(
         parseDiagnosisProposal({
           schemaVersion: "1.0",
           diagnosis:
@@ -2610,7 +2746,7 @@ async function diagnoseRescueOfflineCorpus(
           requestedEvidence: ["rescue.linux.boot-layout.read-only.v1"],
         }),
       );
-    return withStorage(
+    return withHealth(
       parseDiagnosisProposal({
         schemaVersion: "1.0",
         diagnosis:
@@ -2625,7 +2761,7 @@ async function diagnoseRescueOfflineCorpus(
     corpus.servicing.pendingXmlPresent ||
     corpus.servicing.rebootPendingMarkerPresent
   )
-    return withStorage(
+    return withHealth(
       parseDiagnosisProposal({
         schemaVersion: "1.0",
         diagnosis:
@@ -2645,7 +2781,7 @@ async function diagnoseRescueOfflineCorpus(
     !efi.bcdPresent &&
     !efi.fallbackBootloaderPresent
   )
-    return withStorage(
+    return withHealth(
       parseDiagnosisProposal({
         schemaVersion: "1.0",
         diagnosis:
@@ -2656,7 +2792,7 @@ async function diagnoseRescueOfflineCorpus(
       }),
     );
   if (windowsRootBootMissing && efi.state !== "inspected")
-    return withStorage(
+    return withHealth(
       parseDiagnosisProposal({
         schemaVersion: "1.0",
         diagnosis:
@@ -2666,7 +2802,7 @@ async function diagnoseRescueOfflineCorpus(
         requestedEvidence: ["rescue.windows.boot-topology.review.read-only.v1"],
       }),
     );
-  return withStorage(
+  return withHealth(
     parseDiagnosisProposal({
       schemaVersion: "1.0",
       diagnosis:

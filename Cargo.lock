@@ -2466,6 +2466,7 @@ name = "kernaid-linux-pack"
 version = "0.1.0"
 dependencies = [
  "kernaid-evidence",
+ "libc",
  "rustix",
  "serde",
  "serde_json",

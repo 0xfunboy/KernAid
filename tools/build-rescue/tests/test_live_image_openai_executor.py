@@ -621,6 +621,7 @@ class RescueOpenAiExecutorPackagingTests(unittest.TestCase):
         self.assertIn("KERNAID_RESCUE_OPENAI_EXECUTOR_BINARY", build)
         self.assertIn("KERNAID_LINUX_HARDWARE_INVENTORY_BINARY", build)
         self.assertIn("KERNAID_LINUX_STORAGE_HEALTH_BINARY", build)
+        self.assertIn("KERNAID_LINUX_FILESYSTEM_HEALTH_BINARY", build)
         self.assertIn('- "crates/rescue-openai-executor/**"', workflow)
         self.assertIn('- "crates/rescue-openai-provider/**"', workflow)
         self.assertIn(

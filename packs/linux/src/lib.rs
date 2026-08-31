@@ -2,6 +2,7 @@
 //! Linux read-only diagnostics and opt-in disposable fixture repair primitives.
 
 pub mod diagnostics;
+pub mod filesystem_health;
 pub mod hardware;
 pub mod snapshot;
 pub mod storage_health;

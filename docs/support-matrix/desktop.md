@@ -64,6 +64,22 @@ failing, malformed and unavailable responses. Physical SATA, USB bridge and
 NVMe compatibility is still **not qualified**, so this is an implemented
 engineering-preview capability rather than a production support claim.
 
+## Linux filesystem-health boundary
+
+Linux Resident and Rescue share a fixed read-only filesystem checker for ext4
+and NTFS. Resident can inspect only its mounted root and therefore reports a
+clean check as `degraded` until it is repeated offline. Rescue revalidates the
+selected normalized target and checks only an unmounted block device. No
+filesystem is mounted or changed; ext4 uses `e2fsck -f -n` and NTFS uses
+`ntfsfix -n` (no action). Results are limited to `healthy`, `degraded`,
+`repair-required`, or `unsupported`, with fixed next actions and no file names,
+device paths, tool output, or user content.
+
+The Rescue image packages both fixed tools and has a readiness contract for
+the normalized collector. Unit/static evidence covers normalized healthy,
+repair-required, unavailable, malformed, and identity-bound paths. Physical
+filesystem and power-loss matrices are still **not qualified**.
+
 ## Current product boundary
 
 - Offline deterministic diagnosis is the default path. Production Resident

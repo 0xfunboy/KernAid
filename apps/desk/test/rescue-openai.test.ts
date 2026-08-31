@@ -134,6 +134,27 @@ function rescueEvidence(): ObservedEvidence {
   };
 }
 
+function filesystemEvidence(): ObservedEvidence {
+  return {
+    evidence: {
+      schemaVersion: "1.0",
+      id: "E-FILESYSTEM",
+      collector: "linux.filesystem.health.v1",
+      target: "selected-installed-target",
+      capturedAt: "2026-08-31T00:00:00.000Z",
+      contentType: "application/json",
+      sha256: "b".repeat(64),
+      sensitivity: "system",
+      trust: "observed-untrusted",
+      summary:
+        "Fixed read-only filesystem check reports repair-required errors",
+      blobRef: `sha256:${"b".repeat(64)}`,
+    },
+    content:
+      '{"schemaVersion":"1.0","kind":"linux-filesystem-health","targetRef":"disk-1/volume-1","filesystem":"ext4","state":"repair-required","checkMode":"e2fsck-read-only","mountedAtCheck":false,"finding":{"ruleId":"KA-LNX-FS-001","ruleVersion":1,"severity":"critical","summary":"The fixed read-only filesystem check reports errors that require repair.","nextAction":"Back up recoverable data, then use the operating system\'s native repair workflow with explicit write authorization; KernAid did not modify this filesystem."}}',
+  };
+}
+
 function requestFrom(init: RequestInit | undefined): Record<string, unknown> {
   assert.equal(typeof init?.body, "string");
   const body = init.body;
@@ -307,10 +328,11 @@ test("Rescue diagnosis sends exactly one eight-field evidence projection", async
   };
   const proposal = await new RescueOpenAiProvider(fetch).diagnose(
     "Diagnosi read-only",
-    [rescueEvidence()],
+    [rescueEvidence(), filesystemEvidence()],
     CONTEXT_BINDING,
   );
-  assert.equal(proposal.diagnosis, "Verifica read-only richiesta.");
+  assert.match(proposal.diagnosis, /selected filesystem requires repair/iu);
+  assert.deepEqual(proposal.evidenceIds, ["E-RESCUE-CORPUS", "E-FILESYSTEM"]);
 });
 
 test("Rescue diagnosis is one-shot and maps closed executor errors", async () => {

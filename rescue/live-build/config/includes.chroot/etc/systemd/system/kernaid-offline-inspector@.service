@@ -8,7 +8,7 @@ CollectMode=inactive-or-failed
 Type=simple
 ExecStart=/usr/bin/python3 -I /usr/lib/kernaid/offline_inspector.py
 Environment=KERNAID_TARGET_ID_KEY_FILE=/run/kernaid-offline-inspector/target-id.key
-RuntimeMaxSec=20
+RuntimeMaxSec=38s
 Restart=no
 User=root
 Group=root

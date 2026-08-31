@@ -36,6 +36,9 @@ MAX_INSPECTION_RESPONSE_BYTES = 48 * 1024
 OPERATION_TIMEOUT_SECONDS = 18
 STORAGE_HEALTH_BINARY = "/usr/lib/kernaid/kernaid-linux-storage-health"
 MAX_STORAGE_HEALTH_BYTES = 64 * 1024
+FILESYSTEM_HEALTH_BINARY = "/usr/lib/kernaid/kernaid-linux-filesystem-health"
+MAX_FILESYSTEM_HEALTH_BYTES = 16 * 1024
+FILESYSTEM_HEALTH_OPERATION_TIMEOUT_SECONDS = 34
 MAX_TEXT_FILE_BYTES = 64 * 1024
 MAX_OS_RELEASE_BYTES = 16 * 1024
 MAX_DIRECTORY_ENTRIES = 512
@@ -1615,6 +1618,163 @@ class OfflineInspectionEngine:
     def __init__(self, target_module: object) -> None:
         self.targets = target_module
 
+    def filesystem_health(
+        self, request: dict[str, object], deadline: float
+    ) -> dict[str, object]:
+        """Check one freshly resolved target without mounting or returning tool text."""
+        _check_deadline(deadline)
+        selection_before, resolution_before = self.targets.resolve_installed_target(
+            request, deadline=deadline
+        )
+        _qualify_resolution(resolution_before)
+        target = selection_before.get("target")
+        filesystem = resolution_before.get("filesystem")
+        major_minor = resolution_before.get("majorMinor")
+        if (
+            not isinstance(target, dict)
+            or not isinstance(target.get("sourceRef"), str)
+            or not isinstance(filesystem, str)
+            or filesystem not in {"ext4", "ntfs"}
+            or not isinstance(major_minor, str)
+        ):
+            raise InspectionError(
+                "target-resolution-invalid",
+                "La risoluzione interna del target non è valida.",
+                status=503,
+            )
+        source_ref = target["sourceRef"]
+        _assert_target_resolution_unchanged(
+            self.targets,
+            request,
+            selection_before,
+            resolution_before,
+            deadline,
+            _empty_claims(),
+        )
+        timeout = max(0.1, deadline - time.monotonic())
+        try:
+            completed = subprocess.run(
+                [
+                    FILESYSTEM_HEALTH_BINARY,
+                    "--selected",
+                    source_ref,
+                    filesystem,
+                    major_minor,
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=timeout,
+                cwd="/",
+                env={
+                    "LANG": "C",
+                    "LC_ALL": "C",
+                    "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+                },
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise InspectionError(
+                "filesystem-health-unavailable",
+                "La diagnostica filesystem read-only non è disponibile.",
+                status=503,
+                retryable=True,
+            ) from error
+        _check_deadline(deadline)
+        if (
+            completed.returncode != 0
+            or not completed.stdout
+            or len(completed.stdout) > MAX_FILESYSTEM_HEALTH_BYTES
+        ):
+            raise InspectionError(
+                "filesystem-health-unavailable",
+                "La diagnostica filesystem read-only non è disponibile.",
+                status=503,
+                retryable=True,
+            )
+        try:
+            text = completed.stdout.decode("utf-8", errors="strict")
+            snapshot = json.loads(text)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise InspectionError(
+                "filesystem-health-invalid",
+                "Il risultato filesystem normalizzato non è valido.",
+                status=503,
+            ) from error
+        expected_keys = (
+            "schemaVersion",
+            "kind",
+            "targetRef",
+            "filesystem",
+            "state",
+            "checkMode",
+            "mountedAtCheck",
+            "finding",
+        )
+        fixed_findings = {
+            "repair-required": {
+                "ruleId": "KA-LNX-FS-001",
+                "ruleVersion": 1,
+                "severity": "critical",
+                "summary": "The fixed read-only filesystem check reports errors that require repair.",
+                "nextAction": "Back up recoverable data, then use the operating system's native repair workflow with explicit write authorization; KernAid did not modify this filesystem.",
+            },
+            "degraded": {
+                "ruleId": "KA-LNX-FS-002",
+                "ruleVersion": 1,
+                "severity": "high",
+                "summary": "The filesystem was checked while mounted, so a clean result cannot be qualified.",
+                "nextAction": "Boot KernAid Rescue and repeat the fixed read-only check on the unmounted selected target.",
+            },
+            "unsupported": {
+                "ruleId": "KA-LNX-FS-003",
+                "ruleVersion": 1,
+                "severity": "low",
+                "summary": "The fixed read-only filesystem check is unsupported or unavailable.",
+                "nextAction": "Use a qualified read-only diagnostic for this filesystem; do not infer that it is healthy.",
+            },
+        }
+        state = snapshot.get("state") if isinstance(snapshot, dict) else None
+        expected_finding = None if state == "healthy" else fixed_findings.get(state)
+        expected_mode = {
+            "ext4": "e2fsck-read-only",
+            "ntfs": "ntfsfix-no-action",
+        }.get(filesystem)
+        if (
+            not isinstance(snapshot, dict)
+            or tuple(snapshot) != expected_keys
+            or snapshot.get("schemaVersion") != "1.0"
+            or snapshot.get("kind") != "linux-filesystem-health"
+            or snapshot.get("targetRef") != source_ref
+            or snapshot.get("filesystem") != filesystem
+            or state
+            not in {"healthy", "degraded", "repair-required", "unsupported"}
+            or not isinstance(snapshot.get("mountedAtCheck"), bool)
+            or (state == "unsupported")
+            != (snapshot.get("checkMode") == "unavailable")
+            or (
+                state != "unsupported"
+                and snapshot.get("checkMode") != expected_mode
+            )
+            or snapshot.get("finding") != expected_finding
+            or json.dumps(snapshot, ensure_ascii=True, separators=(",", ":"))
+            != text
+        ):
+            raise InspectionError(
+                "filesystem-health-invalid",
+                "Il risultato filesystem normalizzato non è valido.",
+                status=503,
+            )
+        _assert_target_resolution_unchanged(
+            self.targets,
+            request,
+            selection_before,
+            resolution_before,
+            deadline,
+            _empty_claims(),
+        )
+        return snapshot
+
     def inspect(self, request: dict[str, object], deadline: float) -> dict[str, object]:
         _check_deadline(deadline)
         selection_before, resolution_before = self.targets.resolve_installed_target(
@@ -1968,7 +2128,6 @@ class OfflineInspectorService:
         self.fatal_cleanup = False
 
     def dispatch(self, value: object) -> dict[str, object]:
-        deadline = time.monotonic() + OPERATION_TIMEOUT_SECONDS
         if not isinstance(value, dict) or set(value) not in (
             {"operation"},
             {"operation", "request"},
@@ -1979,6 +2138,11 @@ class OfflineInspectorService:
                 status=400,
             )
         operation = value.get("operation")
+        deadline = time.monotonic() + (
+            FILESYSTEM_HEALTH_OPERATION_TIMEOUT_SECONDS
+            if operation == "filesystem-health"
+            else OPERATION_TIMEOUT_SECONDS
+        )
         if operation == "scan" and set(value) == {"operation"}:
             return self.targets.installed_targets(deadline=deadline)
         if operation == "storage-health" and set(value) == {"operation"}:
@@ -1997,6 +2161,11 @@ class OfflineInspectorService:
             return self.targets.select_installed_target(request, deadline=deadline)
         if operation == "inspect" and set(value) == {"operation", "request"}:
             return self.engine.inspect(request, deadline)
+        if operation == "filesystem-health" and set(value) == {
+            "operation",
+            "request",
+        }:
+            return self.engine.filesystem_health(request, deadline)
         raise InspectionError(
             "invalid-helper-request",
             "Operazione dell'ispettore privilegiato non consentita.",
