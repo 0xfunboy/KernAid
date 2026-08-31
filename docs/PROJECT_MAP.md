@@ -1,6 +1,6 @@
 # KernAid project map
 
-Last updated: 30 August 2026
+Last updated: 31 August 2026
 
 This is the short operational map of the product, repository, build artifacts
 and internal delivery channel. For exact qualification evidence, use
@@ -33,6 +33,7 @@ it cannot select a host path, disk or customer target.
 | KernAid Desk | Diagnose a running Windows, Linux or macOS installation | Unsigned engineering builds; read-only production collectors |
 | KernAid Rescue | Boot an amd64 PC that cannot start its installed OS | Hybrid BIOS/UEFI image; gated VT-unlock E2E is implemented but pending CI, and qualification remains virtual until physical USB evidence exists |
 | USB writer v2 | Verify an authorized ISO, write it and provision its encrypted Vault | Linux operator path; accepts only the exact trusted-catalog image |
+| KernAid Fleet | Enroll devices, retain privacy-minimized inventory and apply restrictive tenant policy | Signed client/control-plane vertical slice; device integration and private deployment remain RC gates |
 | Project site | Explain the project publicly and distribute controlled artifacts privately | Public `/`; authenticated `/private/`; no public ISO route |
 
 ## Canonical repository map
@@ -40,7 +41,9 @@ it cannot select a host path, disk or customer target.
 | Path | Contents |
 | --- | --- |
 | `apps/desk/` | React/Tauri Desk application and native Resident adapters |
-| `crates/` | Core, protocol, broker, identity, storage, Rescue vault/provider components |
+| `crates/` | Core, protocol, broker, identity, storage, Rescue vault/provider, Fleet client/policy/runtime and entitlement components |
+| `services/fleet-control-plane/` | Multi-tenant signed enrollment and inventory registry |
+| `apps/fleet-console/` | Internal same-origin Fleet operator console |
 | `packs/` | Strict deterministic diagnostic packs for Linux, Windows and macOS |
 | `rescue/live-build/` | Debian live-image contents and service configuration |
 | `tools/build-rescue/` | Reproducible image build, QEMU gates, SBOM and attestation tooling |
