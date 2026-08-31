@@ -2385,8 +2385,11 @@ dependencies = [
 name = "kernaid-fleet-runtime"
 version = "0.1.0"
 dependencies = [
+ "ed25519-dalek",
  "kernaid-device-identity",
+ "kernaid-entitlements",
  "kernaid-fleet-client",
+ "rand_core 0.6.4",
  "rusqlite",
  "sha2",
  "tempfile",

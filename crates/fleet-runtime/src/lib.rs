@@ -1,11 +1,18 @@
 #![forbid(unsafe_code)]
-//! Durable offline-first delivery for signed KernAid Fleet inventory.
+//! Durable offline-first delivery and entitlement state for KernAid Fleet.
 //!
 //! This crate owns queue state, not transport credentials. Callers keep the
 //! device identity in the existing secure store and submit the returned exact
-//! bytes over their authenticated transport.
+//! bytes over their authenticated transport. Commercial documents are verified
+//! against a caller-supplied public anchor; failures never close local safety
+//! paths such as diagnostics, report export, or rollback.
 
 use kernaid_device_identity::DeviceIdentity;
+use kernaid_entitlements::{
+    EntitlementCheckpoint, EntitlementError, EntitlementState, LicensedCapabilities,
+    RevocationCheckpoint, VerifiedEntitlement, VerifiedRevocations,
+    capabilities as licensed_capabilities, verify_entitlement, verify_revocations,
+};
 use kernaid_fleet_client::{InventoryAsset, MAX_INVENTORY_BATCH_ASSETS, sign_inventory_batch};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
@@ -24,7 +31,8 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
+const IDENTITY_SCHEMA_VERSION: i64 = 1;
 const APPLICATION_ID: i64 = 0x4b41_464c; // "KAFL"
 const MAX_QUEUE_ITEMS: u64 = 100_000;
 const MAX_BATCH_ITEMS: usize = 256;
@@ -32,6 +40,7 @@ const MAX_RETRY_DELAY_SECONDS: u64 = 24 * 60 * 60;
 const MAX_ATTEMPTS: u32 = 1_000_000;
 const SHA256_BYTES: usize = 32;
 const MAX_SIGNED_PAYLOAD_BYTES: usize = 32 * 1024;
+const MAX_ENTITLEMENT_DOCUMENT_BYTES: usize = 64 * 1024;
 
 #[cfg(windows)]
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
@@ -44,6 +53,81 @@ pub struct PendingInventory {
     payload: Vec<u8>,
     payload_sha256: [u8; SHA256_BYTES],
     attempts: u32,
+}
+
+/// Result of atomically applying one signed licensing document.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EntitlementApplyResult {
+    idempotent: bool,
+}
+
+impl EntitlementApplyResult {
+    #[must_use]
+    pub const fn idempotent(self) -> bool {
+        self.idempotent
+    }
+}
+
+/// Runtime view of the entitlement boundary. Missing or unverifiable state is
+/// explicit and never silently interpreted as a paid license.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FleetEntitlementState {
+    TrustAnchorUnavailable,
+    Absent,
+    Corrupt,
+    InvalidClock,
+    Licensed(EntitlementState),
+}
+
+/// Capability decision consumed by Fleet callers. The three safety paths are
+/// intentionally true in every state, including corrupt storage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FleetCapabilities {
+    pub entitlement_state: FleetEntitlementState,
+    pub diagnostics: bool,
+    pub report_export: bool,
+    pub rollback: bool,
+    pub consumer_repair: bool,
+    pub enterprise_repair: bool,
+    pub fleet_sync: bool,
+    pub cached_policy: bool,
+    pub audit_upload: bool,
+    pub updates: bool,
+    pub enterprise_providers: bool,
+}
+
+impl FleetCapabilities {
+    const fn safe_degraded(entitlement_state: FleetEntitlementState) -> Self {
+        Self {
+            entitlement_state,
+            diagnostics: true,
+            report_export: true,
+            rollback: true,
+            consumer_repair: false,
+            enterprise_repair: false,
+            fleet_sync: false,
+            cached_policy: false,
+            audit_upload: false,
+            updates: false,
+            enterprise_providers: false,
+        }
+    }
+
+    const fn licensed(capabilities: LicensedCapabilities) -> Self {
+        Self {
+            entitlement_state: FleetEntitlementState::Licensed(capabilities.state),
+            diagnostics: true,
+            report_export: true,
+            rollback: true,
+            consumer_repair: capabilities.consumer_repair,
+            enterprise_repair: capabilities.enterprise_repair,
+            fleet_sync: capabilities.fleet_sync,
+            cached_policy: capabilities.cached_policy,
+            audit_upload: capabilities.audit_upload,
+            updates: capabilities.updates,
+            enterprise_providers: capabilities.enterprise_providers,
+        }
+    }
 }
 
 impl PendingInventory {
@@ -101,6 +185,8 @@ pub enum FleetRuntimeError {
     StaleAcknowledgement,
     SequenceExhausted,
     Signing,
+    TrustAnchorRequired,
+    Entitlement(EntitlementError),
     Database(rusqlite::Error),
     Io(io::Error),
 }
@@ -120,6 +206,8 @@ impl fmt::Display for FleetRuntimeError {
             Self::StaleAcknowledgement => "Fleet runtime acknowledgement is stale",
             Self::SequenceExhausted => "Fleet inventory sequence is exhausted",
             Self::Signing => "Fleet inventory signing failed",
+            Self::TrustAnchorRequired => "Fleet entitlement trust anchor is required",
+            Self::Entitlement(_) => "Fleet entitlement verification failed",
             Self::Database(_) => "Fleet runtime database operation failed",
             Self::Io(_) => "Fleet runtime filesystem operation failed",
         })
@@ -129,6 +217,7 @@ impl fmt::Display for FleetRuntimeError {
 impl Error for FleetRuntimeError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::Entitlement(error) => Some(error),
             Self::Database(error) => Some(error),
             Self::Io(error) => Some(error),
             _ => None,
@@ -148,6 +237,12 @@ impl From<io::Error> for FleetRuntimeError {
     }
 }
 
+impl From<EntitlementError> for FleetRuntimeError {
+    fn from(error: EntitlementError) -> Self {
+        Self::Entitlement(error)
+    }
+}
+
 /// SQLite-backed inventory queue bound to exactly one tenant and device.
 ///
 /// One product-level interprocess lock must cover each instance's lifetime.
@@ -156,6 +251,7 @@ pub struct FleetRuntime {
     path: PathBuf,
     tenant_id: String,
     device_id: String,
+    entitlement_trust_anchor: Option<[u8; 32]>,
 }
 
 impl FleetRuntime {
@@ -164,6 +260,26 @@ impl FleetRuntime {
         path: &Path,
         tenant_id: &str,
         identity: &DeviceIdentity,
+    ) -> Result<Self, FleetRuntimeError> {
+        Self::open_internal(path, tenant_id, identity, None)
+    }
+
+    /// Open state with an externally pinned vendor entitlement trust anchor.
+    /// The public anchor remains process memory only and is never persisted.
+    pub fn open_with_entitlement_anchor(
+        path: &Path,
+        tenant_id: &str,
+        identity: &DeviceIdentity,
+        entitlement_trust_anchor: &[u8; 32],
+    ) -> Result<Self, FleetRuntimeError> {
+        Self::open_internal(path, tenant_id, identity, Some(*entitlement_trust_anchor))
+    }
+
+    fn open_internal(
+        path: &Path,
+        tenant_id: &str,
+        identity: &DeviceIdentity,
+        entitlement_trust_anchor: Option<[u8; 32]>,
     ) -> Result<Self, FleetRuntimeError> {
         validate_public_identifier(tenant_id)?;
         let device_id = identity.device_id();
@@ -177,11 +293,13 @@ impl FleetRuntime {
         configure_connection(&connection)?;
         harden_database_files(path)?;
         initialize_or_validate(&connection, tenant_id, &device_id)?;
+        harden_database_files(path)?;
         Ok(Self {
             connection,
             path: path.to_path_buf(),
             tenant_id: tenant_id.to_owned(),
             device_id,
+            entitlement_trust_anchor,
         })
     }
 
@@ -193,6 +311,157 @@ impl FleetRuntime {
     #[must_use]
     pub fn device_id(&self) -> &str {
         &self.device_id
+    }
+
+    /// Verify and atomically retain a canonical signed entitlement. The
+    /// retained checkpoint rejects lower sequences and conflicting replays.
+    pub fn apply_entitlement(
+        &mut self,
+        document: &[u8],
+    ) -> Result<EntitlementApplyResult, FleetRuntimeError> {
+        self.ensure_hardened()?;
+        let trust_anchor = self
+            .entitlement_trust_anchor
+            .ok_or(FleetRuntimeError::TrustAnchorRequired)?;
+        let tenant_id = self.tenant_id.clone();
+        let device_id = self.device_id.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let retained = read_entitlement_checkpoint(&transaction)?;
+        let verified = verify_entitlement(document, &trust_anchor, retained.as_ref())?;
+        validate_entitlement_binding(&verified, &tenant_id, &device_id)?;
+        let idempotent = retained.as_ref().is_some_and(|checkpoint| {
+            checkpoint.highest_sequence == verified.checkpoint.highest_sequence
+                && checkpoint.envelope_sha256 == verified.checkpoint.envelope_sha256
+        });
+        transaction.execute(
+            "INSERT INTO fleet_entitlement_state
+             (singleton, document, entitlement_id, tenant_id, highest_sequence,
+              envelope_sha256)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(singleton) DO UPDATE SET
+               document = excluded.document,
+               entitlement_id = excluded.entitlement_id,
+               tenant_id = excluded.tenant_id,
+               highest_sequence = excluded.highest_sequence,
+               envelope_sha256 = excluded.envelope_sha256",
+            params![
+                document,
+                verified.checkpoint.entitlement_id,
+                verified.checkpoint.tenant_id,
+                verified.checkpoint.highest_sequence,
+                verified.checkpoint.envelope_sha256,
+            ],
+        )?;
+        transaction.commit()?;
+        self.ensure_hardened()?;
+        Ok(EntitlementApplyResult { idempotent })
+    }
+
+    /// Load and re-verify the retained entitlement against the external trust
+    /// anchor and the database's monotonic checkpoint.
+    pub fn load_entitlement(&self) -> Result<Option<VerifiedEntitlement>, FleetRuntimeError> {
+        self.ensure_hardened()?;
+        let trust_anchor = self
+            .entitlement_trust_anchor
+            .ok_or(FleetRuntimeError::TrustAnchorRequired)?;
+        let Some(stored) = read_entitlement_document(&self.connection)? else {
+            return Ok(None);
+        };
+        let verified =
+            verify_entitlement(&stored.document, &trust_anchor, Some(&stored.checkpoint))?;
+        validate_entitlement_binding(&verified, &self.tenant_id, &self.device_id)?;
+        Ok(Some(verified))
+    }
+
+    /// Verify and atomically retain the signed global revocation list. Its
+    /// checkpoint remains independent of the active entitlement revision.
+    pub fn apply_revocations(
+        &mut self,
+        document: &[u8],
+    ) -> Result<EntitlementApplyResult, FleetRuntimeError> {
+        self.ensure_hardened()?;
+        let trust_anchor = self
+            .entitlement_trust_anchor
+            .ok_or(FleetRuntimeError::TrustAnchorRequired)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let retained = read_revocation_checkpoint(&transaction)?;
+        let verified = verify_revocations(document, &trust_anchor, retained.as_ref())?;
+        let idempotent = retained.as_ref().is_some_and(|checkpoint| {
+            checkpoint.highest_sequence == verified.checkpoint.highest_sequence
+                && checkpoint.envelope_sha256 == verified.checkpoint.envelope_sha256
+        });
+        transaction.execute(
+            "INSERT INTO fleet_revocation_state
+             (singleton, document, highest_sequence, envelope_sha256)
+             VALUES (1, ?1, ?2, ?3)
+             ON CONFLICT(singleton) DO UPDATE SET
+               document = excluded.document,
+               highest_sequence = excluded.highest_sequence,
+               envelope_sha256 = excluded.envelope_sha256",
+            params![
+                document,
+                verified.checkpoint.highest_sequence,
+                verified.checkpoint.envelope_sha256,
+            ],
+        )?;
+        transaction.commit()?;
+        self.ensure_hardened()?;
+        Ok(EntitlementApplyResult { idempotent })
+    }
+
+    /// Load and re-verify the retained revocation list.
+    pub fn load_revocations(&self) -> Result<Option<VerifiedRevocations>, FleetRuntimeError> {
+        self.ensure_hardened()?;
+        let trust_anchor = self
+            .entitlement_trust_anchor
+            .ok_or(FleetRuntimeError::TrustAnchorRequired)?;
+        let Some(stored) = read_revocation_document(&self.connection)? else {
+            return Ok(None);
+        };
+        Ok(Some(verify_revocations(
+            &stored.document,
+            &trust_anchor,
+            Some(&stored.checkpoint),
+        )?))
+    }
+
+    /// Resolve current capabilities without allowing licensing state to block
+    /// diagnostics, report export, or an already-started rollback. Any missing
+    /// trust anchor, document, invalid clock, signature, checkpoint, binding,
+    /// or database content fails paid capabilities closed.
+    #[must_use]
+    pub fn capabilities(&self, now_unix: u64) -> FleetCapabilities {
+        if self.entitlement_trust_anchor.is_none() {
+            return FleetCapabilities::safe_degraded(FleetEntitlementState::TrustAnchorUnavailable);
+        }
+        if now_unix > kernaid_fleet_client::MAX_SAFE_JSON_INTEGER {
+            return FleetCapabilities::safe_degraded(FleetEntitlementState::InvalidClock);
+        }
+        let entitlement = match self.load_entitlement() {
+            Ok(Some(entitlement)) => entitlement,
+            Ok(None) => {
+                return FleetCapabilities::safe_degraded(FleetEntitlementState::Absent);
+            }
+            Err(_) => {
+                return FleetCapabilities::safe_degraded(FleetEntitlementState::Corrupt);
+            }
+        };
+        let revocations = match self.load_revocations() {
+            Ok(revocations) => revocations,
+            Err(_) => {
+                return FleetCapabilities::safe_degraded(FleetEntitlementState::Corrupt);
+            }
+        };
+        FleetCapabilities::licensed(licensed_capabilities(
+            &entitlement,
+            revocations.as_ref(),
+            &self.device_id,
+            now_unix,
+        ))
     }
 
     /// Sign and durably queue one canonical envelope per asset in one SQLite
@@ -405,6 +674,138 @@ fn decode_pending(row: &rusqlite::Row<'_>) -> rusqlite::Result<PendingInventory>
     })
 }
 
+struct StoredEntitlementDocument {
+    document: Vec<u8>,
+    checkpoint: EntitlementCheckpoint,
+}
+
+struct StoredRevocationDocument {
+    document: Vec<u8>,
+    checkpoint: RevocationCheckpoint,
+}
+
+fn read_entitlement_checkpoint(
+    connection: &Connection,
+) -> Result<Option<EntitlementCheckpoint>, FleetRuntimeError> {
+    Ok(read_entitlement_document(connection)?.map(|stored| stored.checkpoint))
+}
+
+fn read_entitlement_document(
+    connection: &Connection,
+) -> Result<Option<StoredEntitlementDocument>, FleetRuntimeError> {
+    let stored: Option<(Vec<u8>, String, String, u64, String)> = connection
+        .query_row(
+            "SELECT document, entitlement_id, tenant_id, highest_sequence,
+                    envelope_sha256
+             FROM fleet_entitlement_state WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((document, entitlement_id, tenant_id, highest_sequence, envelope_sha256)) = stored
+    else {
+        return Ok(None);
+    };
+    if document.is_empty()
+        || document.len() > MAX_ENTITLEMENT_DOCUMENT_BYTES
+        || !valid_entitlement_identifier(&entitlement_id)
+        || !valid_entitlement_identifier(&tenant_id)
+        || highest_sequence == 0
+        || highest_sequence > kernaid_fleet_client::MAX_SAFE_JSON_INTEGER
+        || !valid_sha256(&envelope_sha256)
+    {
+        return Err(FleetRuntimeError::UnsupportedFormat);
+    }
+    Ok(Some(StoredEntitlementDocument {
+        document,
+        checkpoint: EntitlementCheckpoint {
+            entitlement_id,
+            tenant_id,
+            highest_sequence,
+            envelope_sha256,
+        },
+    }))
+}
+
+fn read_revocation_checkpoint(
+    connection: &Connection,
+) -> Result<Option<RevocationCheckpoint>, FleetRuntimeError> {
+    Ok(read_revocation_document(connection)?.map(|stored| stored.checkpoint))
+}
+
+fn read_revocation_document(
+    connection: &Connection,
+) -> Result<Option<StoredRevocationDocument>, FleetRuntimeError> {
+    let stored: Option<(Vec<u8>, u64, String)> = connection
+        .query_row(
+            "SELECT document, highest_sequence, envelope_sha256
+             FROM fleet_revocation_state WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((document, highest_sequence, envelope_sha256)) = stored else {
+        return Ok(None);
+    };
+    if document.is_empty()
+        || document.len() > MAX_ENTITLEMENT_DOCUMENT_BYTES
+        || highest_sequence == 0
+        || highest_sequence > kernaid_fleet_client::MAX_SAFE_JSON_INTEGER
+        || !valid_sha256(&envelope_sha256)
+    {
+        return Err(FleetRuntimeError::UnsupportedFormat);
+    }
+    Ok(Some(StoredRevocationDocument {
+        document,
+        checkpoint: RevocationCheckpoint {
+            highest_sequence,
+            envelope_sha256,
+        },
+    }))
+}
+
+fn validate_entitlement_binding(
+    entitlement: &VerifiedEntitlement,
+    tenant_id: &str,
+    device_id: &str,
+) -> Result<(), FleetRuntimeError> {
+    let claims = &entitlement.envelope.claims;
+    if claims.tenant_id != tenant_id {
+        return Err(FleetRuntimeError::TenantMismatch);
+    }
+    if claims
+        .device_ids
+        .binary_search_by(|candidate| candidate.as_str().cmp(device_id))
+        .is_err()
+    {
+        return Err(FleetRuntimeError::IdentityMismatch);
+    }
+    Ok(())
+}
+
+fn valid_entitlement_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn initialize_or_validate(
     connection: &Connection,
     tenant_id: &str,
@@ -425,7 +826,7 @@ fn initialize_or_validate(
         connection.execute_batch(
             "BEGIN IMMEDIATE;
          PRAGMA application_id=1262569036;
-         PRAGMA user_version=1;
+         PRAGMA user_version=2;
          CREATE TABLE fleet_runtime_identity (
            singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton = 1),
            schema_version INTEGER NOT NULL CHECK(schema_version = 1),
@@ -441,9 +842,45 @@ fn initialize_or_validate(
            attempts INTEGER NOT NULL CHECK(attempts BETWEEN 0 AND 1000000),
            not_before_epoch INTEGER NOT NULL CHECK(not_before_epoch >= 0)
          );
+         CREATE TABLE fleet_entitlement_state (
+           singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton = 1),
+           document BLOB NOT NULL CHECK(length(document) BETWEEN 1 AND 65536),
+           entitlement_id TEXT NOT NULL,
+           tenant_id TEXT NOT NULL,
+           highest_sequence INTEGER NOT NULL CHECK(highest_sequence BETWEEN 1 AND 9007199254740991),
+           envelope_sha256 TEXT NOT NULL CHECK(length(envelope_sha256) = 64)
+         );
+         CREATE TABLE fleet_revocation_state (
+           singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton = 1),
+           document BLOB NOT NULL CHECK(length(document) BETWEEN 1 AND 65536),
+           highest_sequence INTEGER NOT NULL CHECK(highest_sequence BETWEEN 1 AND 9007199254740991),
+           envelope_sha256 TEXT NOT NULL CHECK(length(envelope_sha256) = 64)
+         );
          COMMIT;",
         )?;
-    } else if application_id != APPLICATION_ID || user_version != SCHEMA_VERSION {
+    } else if application_id != APPLICATION_ID {
+        return Err(FleetRuntimeError::UnsupportedFormat);
+    } else if user_version == 1 {
+        connection.execute_batch(
+            "BEGIN IMMEDIATE;
+             CREATE TABLE fleet_entitlement_state (
+               singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton = 1),
+               document BLOB NOT NULL CHECK(length(document) BETWEEN 1 AND 65536),
+               entitlement_id TEXT NOT NULL,
+               tenant_id TEXT NOT NULL,
+               highest_sequence INTEGER NOT NULL CHECK(highest_sequence BETWEEN 1 AND 9007199254740991),
+               envelope_sha256 TEXT NOT NULL CHECK(length(envelope_sha256) = 64)
+             );
+             CREATE TABLE fleet_revocation_state (
+               singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton = 1),
+               document BLOB NOT NULL CHECK(length(document) BETWEEN 1 AND 65536),
+               highest_sequence INTEGER NOT NULL CHECK(highest_sequence BETWEEN 1 AND 9007199254740991),
+               envelope_sha256 TEXT NOT NULL CHECK(length(envelope_sha256) = 64)
+             );
+             PRAGMA user_version=2;
+             COMMIT;",
+        )?;
+    } else if user_version != SCHEMA_VERSION {
         return Err(FleetRuntimeError::UnsupportedFormat);
     }
     let existing: Option<(i64, String, String)> = connection
@@ -460,11 +897,11 @@ fn initialize_or_validate(
                 "INSERT INTO fleet_runtime_identity
                  (singleton, schema_version, tenant_id, device_id, next_inventory_sequence)
                  VALUES (1, ?1, ?2, ?3, 1)",
-                params![SCHEMA_VERSION, tenant_id, device_id],
+                params![IDENTITY_SCHEMA_VERSION, tenant_id, device_id],
             )?;
         }
         Some((version, stored_tenant, stored_device)) => {
-            if version != SCHEMA_VERSION {
+            if version != IDENTITY_SCHEMA_VERSION {
                 return Err(FleetRuntimeError::UnsupportedFormat);
             }
             if stored_tenant != tenant_id {
@@ -487,7 +924,19 @@ fn validate_schema_shape(connection: &Connection) -> Result<(), FleetRuntimeErro
         connection.query_row("SELECT COUNT(*) FROM fleet_inventory_outbox", [], |row| {
             row.get(0)
         })?;
-    if identity_rows != 1 || queue_rows > MAX_QUEUE_ITEMS {
+    let entitlement_rows: u64 =
+        connection.query_row("SELECT COUNT(*) FROM fleet_entitlement_state", [], |row| {
+            row.get(0)
+        })?;
+    let revocation_rows: u64 =
+        connection.query_row("SELECT COUNT(*) FROM fleet_revocation_state", [], |row| {
+            row.get(0)
+        })?;
+    if identity_rows != 1
+        || queue_rows > MAX_QUEUE_ITEMS
+        || entitlement_rows > 1
+        || revocation_rows > 1
+    {
         return Err(FleetRuntimeError::UnsupportedFormat);
     }
     Ok(())
@@ -599,7 +1048,13 @@ fn reject_link_like(metadata: &fs::Metadata) -> Result<(), FleetRuntimeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::SigningKey;
+    use kernaid_entitlements::{
+        ENTITLEMENT_SCHEMA, EntitlementClaims, EntitlementLimits, Feature, Plan,
+        REVOCATIONS_SCHEMA, RevocationClaims, sign_entitlement, sign_revocations,
+    };
     use kernaid_fleet_client::{AssetArchitecture, AssetHealth, AssetPlatform, FindingCounts};
+    use rand_core::OsRng;
     use tempfile::tempdir;
 
     fn asset(id: &str) -> InventoryAsset {
@@ -613,6 +1068,78 @@ mod tests {
             FindingCounts::new(0, 0, 2),
             "cd".repeat(32),
         )
+    }
+
+    fn entitlement_key() -> SigningKey {
+        SigningKey::generate(&mut OsRng)
+    }
+
+    fn entitlement_claims(tenant_id: &str, device_id: &str, sequence: u64) -> EntitlementClaims {
+        EntitlementClaims {
+            schema: ENTITLEMENT_SCHEMA.to_owned(),
+            entitlement_id: "ent_runtime_001".to_owned(),
+            tenant_id: tenant_id.to_owned(),
+            sequence,
+            plan: Plan::Enterprise,
+            features: vec![
+                Feature::Audit,
+                Feature::EnterpriseRepair,
+                Feature::Fleet,
+                Feature::Policy,
+                Feature::Updates,
+            ],
+            device_ids: vec![device_id.to_owned()],
+            limits: EntitlementLimits {
+                max_tool_devices: 4,
+                max_technicians: 8,
+                max_managed_assets: 1_000,
+            },
+            issued_at_unix: 1_000,
+            not_before_unix: 1_000,
+            offline_lease_until_unix: 2_000,
+            expires_at_unix: 3_000,
+            grace_until_unix: 4_000,
+        }
+    }
+
+    fn entitlement_document(
+        key: &SigningKey,
+        tenant_id: &str,
+        device_id: &str,
+        sequence: u64,
+    ) -> Vec<u8> {
+        sign_entitlement(entitlement_claims(tenant_id, device_id, sequence), key)
+            .expect("sign entitlement fixture")
+    }
+
+    fn revocation_document(
+        key: &SigningKey,
+        sequence: u64,
+        revoked_entitlement_ids: Vec<String>,
+    ) -> Vec<u8> {
+        sign_revocations(
+            RevocationClaims {
+                schema: REVOCATIONS_SCHEMA.to_owned(),
+                sequence,
+                issued_at_unix: 1_500,
+                revoked_entitlement_ids,
+            },
+            key,
+        )
+        .expect("sign revocation fixture")
+    }
+
+    fn assert_only_safety_capabilities(capabilities: FleetCapabilities) {
+        assert!(capabilities.diagnostics);
+        assert!(capabilities.report_export);
+        assert!(capabilities.rollback);
+        assert!(!capabilities.consumer_repair);
+        assert!(!capabilities.enterprise_repair);
+        assert!(!capabilities.fleet_sync);
+        assert!(!capabilities.cached_policy);
+        assert!(!capabilities.audit_upload);
+        assert!(!capabilities.updates);
+        assert!(!capabilities.enterprise_providers);
     }
 
     #[test]
@@ -686,6 +1213,257 @@ mod tests {
             FleetRuntime::open(&path, "tenant-alpha", &other),
             Err(FleetRuntimeError::IdentityMismatch)
         ));
+    }
+
+    #[test]
+    fn v1_state_migrates_and_entitlement_survives_reopen() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("fleet.sqlite3");
+        let identity = DeviceIdentity::generate();
+        let mut legacy =
+            FleetRuntime::open(&path, "tenant-alpha", &identity).expect("create runtime");
+        legacy
+            .queue_inventory(&identity, "2026-08-31T17:00:00Z", vec![asset("asset-a")])
+            .expect("retain legacy queue data");
+        drop(legacy);
+
+        let connection = Connection::open(&path).expect("open legacy fixture");
+        connection
+            .execute_batch(
+                "DROP TABLE fleet_entitlement_state;
+                 DROP TABLE fleet_revocation_state;
+                 PRAGMA user_version=1;",
+            )
+            .expect("restore v1 schema shape");
+        drop(connection);
+
+        let key = entitlement_key();
+        let anchor = key.verifying_key().to_bytes();
+        let document = entitlement_document(&key, "tenant-alpha", &identity.device_id(), 1);
+        let mut runtime =
+            FleetRuntime::open_with_entitlement_anchor(&path, "tenant-alpha", &identity, &anchor)
+                .expect("migrate runtime");
+        assert_eq!(runtime.pending_count().expect("legacy queue count"), 1);
+        assert!(
+            !runtime
+                .apply_entitlement(&document)
+                .expect("apply entitlement")
+                .idempotent()
+        );
+        assert_eq!(
+            runtime.capabilities(1_500).entitlement_state,
+            FleetEntitlementState::Licensed(EntitlementState::Active)
+        );
+        assert!(runtime.capabilities(1_500).enterprise_repair);
+        drop(runtime);
+
+        let mut reopened =
+            FleetRuntime::open_with_entitlement_anchor(&path, "tenant-alpha", &identity, &anchor)
+                .expect("reopen migrated runtime");
+        assert_eq!(
+            reopened
+                .load_entitlement()
+                .expect("load entitlement")
+                .expect("stored entitlement")
+                .checkpoint
+                .highest_sequence,
+            1
+        );
+        assert!(
+            reopened
+                .apply_entitlement(&document)
+                .expect("exact replay")
+                .idempotent()
+        );
+    }
+
+    #[test]
+    fn revocation_persists_and_disables_every_paid_capability() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("fleet.sqlite3");
+        let identity = DeviceIdentity::generate();
+        let key = entitlement_key();
+        let anchor = key.verifying_key().to_bytes();
+        let mut runtime =
+            FleetRuntime::open_with_entitlement_anchor(&path, "tenant-alpha", &identity, &anchor)
+                .expect("open runtime");
+        runtime
+            .apply_entitlement(&entitlement_document(
+                &key,
+                "tenant-alpha",
+                &identity.device_id(),
+                1,
+            ))
+            .expect("apply entitlement");
+        let revocations = revocation_document(&key, 7, vec!["ent_runtime_001".to_owned()]);
+        assert!(
+            !runtime
+                .apply_revocations(&revocations)
+                .expect("apply revocation")
+                .idempotent()
+        );
+        assert!(
+            runtime
+                .apply_revocations(&revocations)
+                .expect("replay revocation")
+                .idempotent()
+        );
+        drop(runtime);
+
+        let reopened =
+            FleetRuntime::open_with_entitlement_anchor(&path, "tenant-alpha", &identity, &anchor)
+                .expect("reopen runtime");
+        let capabilities = reopened.capabilities(1_500);
+        assert_eq!(
+            capabilities.entitlement_state,
+            FleetEntitlementState::Licensed(EntitlementState::Revoked)
+        );
+        assert_only_safety_capabilities(capabilities);
+    }
+
+    #[test]
+    fn persisted_checkpoints_reject_entitlement_and_revocation_rollback() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("fleet.sqlite3");
+        let identity = DeviceIdentity::generate();
+        let key = entitlement_key();
+        let anchor = key.verifying_key().to_bytes();
+        let mut runtime =
+            FleetRuntime::open_with_entitlement_anchor(&path, "tenant-alpha", &identity, &anchor)
+                .expect("open runtime");
+        runtime
+            .apply_entitlement(&entitlement_document(
+                &key,
+                "tenant-alpha",
+                &identity.device_id(),
+                2,
+            ))
+            .expect("apply sequence two");
+        let older = entitlement_document(&key, "tenant-alpha", &identity.device_id(), 1);
+        assert!(matches!(
+            runtime.apply_entitlement(&older),
+            Err(FleetRuntimeError::Entitlement(
+                EntitlementError::RollbackDetected
+            ))
+        ));
+
+        let mut conflict = entitlement_claims("tenant-alpha", &identity.device_id(), 2);
+        conflict.grace_until_unix += 1;
+        let conflict = sign_entitlement(conflict, &key).expect("sign conflict");
+        assert!(matches!(
+            runtime.apply_entitlement(&conflict),
+            Err(FleetRuntimeError::Entitlement(
+                EntitlementError::SequenceConflict
+            ))
+        ));
+
+        runtime
+            .apply_revocations(&revocation_document(&key, 3, vec![]))
+            .expect("apply revocation sequence three");
+        assert!(matches!(
+            runtime.apply_revocations(&revocation_document(&key, 2, vec![])),
+            Err(FleetRuntimeError::Entitlement(
+                EntitlementError::RollbackDetected
+            ))
+        ));
+    }
+
+    #[test]
+    fn entitlement_tenant_and_device_binding_fail_closed() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("fleet.sqlite3");
+        let identity = DeviceIdentity::generate();
+        let other = DeviceIdentity::generate();
+        let key = entitlement_key();
+        let anchor = key.verifying_key().to_bytes();
+        let mut runtime =
+            FleetRuntime::open_with_entitlement_anchor(&path, "tenant-alpha", &identity, &anchor)
+                .expect("open runtime");
+        assert!(matches!(
+            runtime.apply_entitlement(&entitlement_document(
+                &key,
+                "tenant-beta",
+                &identity.device_id(),
+                1,
+            )),
+            Err(FleetRuntimeError::TenantMismatch)
+        ));
+        assert!(matches!(
+            runtime.apply_entitlement(&entitlement_document(
+                &key,
+                "tenant-alpha",
+                &other.device_id(),
+                1,
+            )),
+            Err(FleetRuntimeError::IdentityMismatch)
+        ));
+        let capabilities = runtime.capabilities(1_500);
+        assert_eq!(
+            capabilities.entitlement_state,
+            FleetEntitlementState::Absent
+        );
+        assert_only_safety_capabilities(capabilities);
+    }
+
+    #[test]
+    fn absent_expired_and_corrupt_state_preserve_only_safety_paths() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("fleet.sqlite3");
+        let identity = DeviceIdentity::generate();
+        let unconfigured =
+            FleetRuntime::open(&path, "tenant-alpha", &identity).expect("open unconfigured");
+        let capabilities = unconfigured.capabilities(1_500);
+        assert_eq!(
+            capabilities.entitlement_state,
+            FleetEntitlementState::TrustAnchorUnavailable
+        );
+        assert_only_safety_capabilities(capabilities);
+        drop(unconfigured);
+
+        let key = entitlement_key();
+        let anchor = key.verifying_key().to_bytes();
+        let mut runtime =
+            FleetRuntime::open_with_entitlement_anchor(&path, "tenant-alpha", &identity, &anchor)
+                .expect("open configured runtime");
+        let capabilities = runtime.capabilities(1_500);
+        assert_eq!(
+            capabilities.entitlement_state,
+            FleetEntitlementState::Absent
+        );
+        assert_only_safety_capabilities(capabilities);
+        runtime
+            .apply_entitlement(&entitlement_document(
+                &key,
+                "tenant-alpha",
+                &identity.device_id(),
+                1,
+            ))
+            .expect("apply entitlement");
+        let expired = runtime.capabilities(4_001);
+        assert_eq!(
+            expired.entitlement_state,
+            FleetEntitlementState::Licensed(EntitlementState::Expired)
+        );
+        assert_only_safety_capabilities(expired);
+        drop(runtime);
+
+        let connection = Connection::open(&path).expect("open corruption fixture");
+        connection
+            .execute(
+                "UPDATE fleet_entitlement_state SET document = ?1 WHERE singleton = 1",
+                [b"{}".as_slice()],
+            )
+            .expect("corrupt retained document");
+        drop(connection);
+        let runtime =
+            FleetRuntime::open_with_entitlement_anchor(&path, "tenant-alpha", &identity, &anchor)
+                .expect("reopen corrupt runtime");
+        let corrupt = runtime.capabilities(1_500);
+        assert_eq!(corrupt.entitlement_state, FleetEntitlementState::Corrupt);
+        assert_only_safety_capabilities(corrupt);
+        assert_only_safety_capabilities(
+            runtime.capabilities(kernaid_fleet_client::MAX_SAFE_JSON_INTEGER + 1),
+        );
     }
 
     #[cfg(unix)]
