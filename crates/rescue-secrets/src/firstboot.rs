@@ -1,15 +1,17 @@
 //! Fail-closed first-boot provisioning boundary.
 //!
-//! This feature-gated module proves that the exact p3 capability belonging to
-//! `/run/live/medium` is all-zero, confirms an opaque passphrase from two
-//! independent CLOEXEC descriptors, and drives the closed privileged
-//! provisioning lifecycle. It has no path-taking constructor; success is
-//! exposed only after verified cleanup and locked-profile reclassification.
+//! This feature-gated module quickly gates the exact p3 capability belonging
+//! to `/run/live/medium`, confirms an opaque passphrase from two independent
+//! CLOEXEC descriptors, then proves the complete partition is all-zero exactly
+//! once before driving the closed privileged provisioning lifecycle. It has no
+//! path-taking constructor; success is exposed only after verified cleanup and
+//! locked-profile reclassification.
 
 use crate::{
-    BootVaultLocation, LocatedVaultClassification, LocatedVaultClassificationError,
-    LocatedVaultIdentity, LocatedVaultPartition, RescueVaultMountManager, VaultMountManagerError,
-    bounded_process, locate_boot_vault, profile_classifier::verify_embedded_profile,
+    BootVaultLocation, LocatedVaultClassificationError, LocatedVaultIdentity,
+    LocatedVaultPartition, LocatedVaultPreflightClassification, RescueVaultMountManager,
+    VaultMountManagerError, bounded_process, locate_boot_vault,
+    profile_classifier::verify_embedded_profile,
 };
 use kernaid_protocol::rescue_vault::{MAX_PASSPHRASE_BYTES, MIN_PASSPHRASE_BYTES};
 use std::{
@@ -27,6 +29,8 @@ const PLYMOUTH_PATH: &str = "/usr/bin/plymouth";
 const PLYMOUTH_QUIT_ARGUMENTS: &[&str] = &["quit"];
 const PLYMOUTH_PING_ARGUMENTS: &[&str] = &["--ping"];
 const SECRET_READ_CHUNK_BYTES: usize = 256;
+const ZERO_SCAN_PROGRESS_MARKER: &str =
+    "KERNAID_RESCUE_FIRSTBOOT_PROGRESS_V1 stage=post-confirmation-zero-scan";
 
 /// Stable, redacted failures for the first-boot boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,7 +105,7 @@ impl Error for FirstBootBoundaryError {}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProvisioningState {
     Located,
-    ClassifiedUnprovisioned,
+    PotentiallyUnprovisioned,
     Confirmed,
     LuksFormatted,
     MappingVerified,
@@ -323,7 +327,9 @@ impl ConfirmedPassphrase {
     }
 }
 
-/// Located, descriptor-retaining proof that p3 was all-zero.
+/// Located, descriptor-retaining candidate whose complete LUKS2 header area
+/// was zero. This does not authorize mutation; the complete p3 scan is still
+/// mandatory after confirmation.
 pub struct UnprovisionedFirstBoot {
     partition: LocatedVaultPartition,
     identity: LocatedVaultIdentity,
@@ -334,7 +340,7 @@ impl fmt::Debug for UnprovisionedFirstBoot {
         formatter
             .debug_struct("UnprovisionedFirstBoot")
             .field("identity", &self.identity)
-            .field("state", &ProvisioningState::ClassifiedUnprovisioned)
+            .field("state", &ProvisioningState::PotentiallyUnprovisioned)
             .finish()
     }
 }
@@ -342,7 +348,7 @@ impl fmt::Debug for UnprovisionedFirstBoot {
 impl UnprovisionedFirstBoot {
     #[must_use]
     pub const fn state(&self) -> ProvisioningState {
-        ProvisioningState::ClassifiedUnprovisioned
+        ProvisioningState::PotentiallyUnprovisioned
     }
 
     #[must_use]
@@ -423,13 +429,14 @@ impl ConfirmedFirstBoot {
         self.identity
     }
 
-    /// Repeat the complete zero classifier and immutable identity checks at
-    /// the last available boundary before the executor may mutate.
-    pub fn revalidate_unprovisioned(&self) -> Result<(), FirstBootBoundaryError> {
+    /// Repeat the bounded candidate/header and immutable identity checks after
+    /// confirmation. The manager performs the one complete scan immediately
+    /// before its first possible write.
+    pub fn revalidate_candidate(&self) -> Result<(), FirstBootBoundaryError> {
         if self.partition.identity() != self.identity {
             return Err(FirstBootBoundaryError::MediaChanged);
         }
-        classify_unprovisioned(&self.partition)
+        classify_potentially_unprovisioned(&self.partition)
     }
 
     /// Enter a new private mount namespace and execute the complete canonical
@@ -446,7 +453,7 @@ impl ConfirmedFirstBoot {
     fn provision_in_private_namespace(
         self,
     ) -> Result<FirstBootProvisioningEvidence, FirstBootBoundaryError> {
-        self.revalidate_unprovisioned()?;
+        self.revalidate_candidate()?;
         crate::rescue_daemon::validate_no_active_swap()
             .map_err(|()| FirstBootBoundaryError::ProcessPrivacyUnavailable)?;
         let manager = RescueVaultMountManager::acquire().map_err(map_manager_error)?;
@@ -490,8 +497,10 @@ impl FirstBootPreflight {
     }
 }
 
-/// Locate only p3 of the exact Rescue boot medium and accept only an all-zero
-/// canonical-sized capability. No caller input selects a device or path.
+/// Locate only p3 of the exact Rescue boot medium. Exact Locked and mismatched
+/// headers fail before prompting; a zero header area is retained only as a
+/// candidate for the mandatory post-confirmation full scan. No caller input
+/// selects a device or path.
 pub fn run_rescue_firstboot_preflight() -> Result<FirstBootPreflight, FirstBootBoundaryError> {
     if !rustix::process::geteuid().is_root() {
         return Err(FirstBootBoundaryError::PrivilegeRequired);
@@ -510,7 +519,7 @@ pub fn run_rescue_firstboot_preflight() -> Result<FirstBootPreflight, FirstBootB
         BootVaultLocation::Vault(partition) => partition,
     };
     let identity = partition.identity();
-    classify_unprovisioned(&partition)?;
+    classify_potentially_unprovisioned(&partition)?;
     if partition.identity() != identity {
         return Err(FirstBootBoundaryError::MediaChanged);
     }
@@ -534,14 +543,15 @@ pub fn run_rescue_firstboot() -> Result<FirstBootProvisioningEvidence, FirstBoot
     let (first, confirmation) = crate::rescue_daemon::read_firstboot_passphrase_pair()
         .map_err(|_| FirstBootBoundaryError::TtyConfirmationUnavailable)?;
     let passphrase = ConfirmedPassphrase::confirm_values(first, confirmation)?;
+    eprintln!("{ZERO_SCAN_PROGRESS_MARKER}");
     preflight
         .into_unprovisioned()
         .bind_confirmation(passphrase)
         .provision_in_private_namespace()
 }
 
-/// Relinquish Plymouth only after the exact boot Vault has passed its complete
-/// read-only unprovisioned classification. A distribution quit unit can have
+/// Relinquish Plymouth only after the exact boot Vault has passed its bounded
+/// candidate/header classification. A distribution quit unit can have
 /// already stopped Plymouth by the time a manually started or degraded boot
 /// reaches this boundary. Normalize only that verified no-daemon state: if the
 /// quit command fails while Plymouth still answers, fail closed rather than
@@ -624,10 +634,12 @@ fn map_manager_error(error: VaultMountManagerError) -> FirstBootBoundaryError {
     }
 }
 
-fn classify_unprovisioned(partition: &LocatedVaultPartition) -> Result<(), FirstBootBoundaryError> {
-    match partition.classify_read_only(CLASSIFICATION_TIMEOUT) {
-        Ok(LocatedVaultClassification::Unprovisioned) => Ok(()),
-        Ok(LocatedVaultClassification::Locked) => {
+fn classify_potentially_unprovisioned(
+    partition: &LocatedVaultPartition,
+) -> Result<(), FirstBootBoundaryError> {
+    match partition.classify_firstboot_preflight(CLASSIFICATION_TIMEOUT) {
+        Ok(LocatedVaultPreflightClassification::PotentiallyUnprovisioned) => Ok(()),
+        Ok(LocatedVaultPreflightClassification::Locked) => {
             Err(FirstBootBoundaryError::VaultAlreadyProvisioned)
         }
         Err(error) => Err(map_classification_error(error)),
@@ -814,13 +826,17 @@ mod tests {
         assert_eq!(PLYMOUTH_QUIT_ARGUMENTS, ["quit"]);
         assert_eq!(PLYMOUTH_PING_ARGUMENTS, ["--ping"]);
         assert_eq!(PLYMOUTH_QUIT_TIMEOUT, Duration::from_secs(3));
+        assert_eq!(
+            ZERO_SCAN_PROGRESS_MARKER,
+            "KERNAID_RESCUE_FIRSTBOOT_PROGRESS_V1 stage=post-confirmation-zero-scan"
+        );
     }
 
     #[test]
     fn declared_state_machine_cannot_skip_cleanup_or_final_reclassification() {
         let states = [
             ProvisioningState::Located,
-            ProvisioningState::ClassifiedUnprovisioned,
+            ProvisioningState::PotentiallyUnprovisioned,
             ProvisioningState::Confirmed,
             ProvisioningState::LuksFormatted,
             ProvisioningState::MappingVerified,

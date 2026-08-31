@@ -13,9 +13,10 @@ ConditionPathIsDirectory=/run/live/medium
 [Service]
 Type=oneshot
 # The binary itself accepts no arguments, discovers only p3 of the exact live
-# medium, and prompts only after a complete all-zero classification. Optical,
-# already-provisioned and fail-closed states are recorded but must not make a
-# recovery image unbootable.
+# medium. It rejects Locked/mismatched headers before prompting, then requires
+# one complete all-zero scan after confirmation and before its first write.
+# Optical, already-provisioned and fail-closed states are recorded but must not
+# make a recovery image unbootable.
 ExecStart=-/usr/lib/kernaid/kernaid-rescue-firstboot
 RemainAfterExit=yes
 TimeoutStartSec=0

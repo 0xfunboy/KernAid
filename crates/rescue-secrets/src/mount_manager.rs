@@ -342,11 +342,15 @@ impl RescueVaultMountManager {
         let mut ops = SystemOps;
         ops.ensure_device_unused(&request.device)?;
         ops.ensure_mapper_absent(&request.mapper, &request.mapper_path)?;
-        require_unprovisioned(&request.device)?;
+        // This is the sole complete 8 GiB zero scan. The returned private
+        // proof is consumed by the first mutator so no formatting path can
+        // bypass the post-confirmation classifier.
+        let unprovisioned = require_unprovisioned(&request.device)?;
 
         let luks_uuid = random_uuid_v4()?;
         let filesystem_uuid = random_uuid_v4()?;
-        let format_result = format_luks_profile_v1(&request.device, passphrase, luks_uuid);
+        let format_result =
+            format_luks_profile_v1(&request.device, unprovisioned, passphrase, luks_uuid);
         if let Err(primary) = format_result {
             if SystemOps::verify_mapping_absence(
                 &request.device,
@@ -1797,7 +1801,12 @@ impl VaultOps for SystemOps {
 }
 
 #[cfg(feature = "experimental-firstboot-provisioner")]
-fn require_unprovisioned(device: &BlockDevice) -> Result<(), VaultMountManagerError> {
+struct VerifiedUnprovisioned;
+
+#[cfg(feature = "experimental-firstboot-provisioner")]
+fn require_unprovisioned(
+    device: &BlockDevice,
+) -> Result<VerifiedUnprovisioned, VaultMountManagerError> {
     device.revalidate()?;
     let profile = classify_partition(&device.descriptor, || {
         device.revalidate_profile_capability()
@@ -1805,7 +1814,7 @@ fn require_unprovisioned(device: &BlockDevice) -> Result<(), VaultMountManagerEr
     .map_err(map_profile_classifier_error)?;
     device.revalidate()?;
     match profile {
-        VaultPartitionProfile::Unprovisioned => Ok(()),
+        VaultPartitionProfile::Unprovisioned => Ok(VerifiedUnprovisioned),
         VaultPartitionProfile::Locked(_) | VaultPartitionProfile::ProfileMismatch => {
             Err(VaultMountManagerError::ProfileMismatch)
         }
@@ -1815,6 +1824,7 @@ fn require_unprovisioned(device: &BlockDevice) -> Result<(), VaultMountManagerEr
 #[cfg(feature = "experimental-firstboot-provisioner")]
 fn format_luks_profile_v1(
     device: &BlockDevice,
+    _unprovisioned: VerifiedUnprovisioned,
     passphrase: &[u8],
     luks_uuid: [u8; 36],
 ) -> Result<(), VaultMountManagerError> {

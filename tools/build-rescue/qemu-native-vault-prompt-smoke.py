@@ -832,7 +832,9 @@ def _run_firstboot(
         prompt = console.wait_regex(
             re.compile(rb"KERNAID_RESCUE_FIRSTBOOT_PROMPT_READY_V1 step=passphrase"),
             start=0,
-            deadline=_deadline(aggregate, LIFECYCLE.READINESS_TIMEOUT_SECONDS),
+            deadline=_deadline(
+                aggregate, LIFECYCLE.FIRSTBOOT_PROMPT_TIMEOUT_SECONDS
+            ),
             stage="firstboot-start",
         )
         qmp.set_deadline(_deadline(aggregate, 10.0))
@@ -840,7 +842,9 @@ def _run_firstboot(
         confirmation = console.wait_regex(
             re.compile(rb"KERNAID_RESCUE_FIRSTBOOT_PROMPT_READY_V1 step=confirmation"),
             start=prompt.end(),
-            deadline=_deadline(aggregate, LIFECYCLE.READINESS_TIMEOUT_SECONDS),
+            deadline=_deadline(
+                aggregate, LIFECYCLE.FIRSTBOOT_PROMPT_TIMEOUT_SECONDS
+            ),
             stage="firstboot-confirmation",
         )
         qmp.set_deadline(_deadline(aggregate, 10.0))
@@ -848,7 +852,7 @@ def _run_firstboot(
         LIFECYCLE.wait_firstboot_attestation(
             console,
             confirmation.end(),
-            _deadline(aggregate, LIFECYCLE.READINESS_TIMEOUT_SECONDS),
+            _deadline(aggregate, LIFECYCLE.FIRSTBOOT_RESULT_TIMEOUT_SECONDS),
         )
         cursor = LIFECYCLE.establish_live_session(console, aggregate, login)
         status, cursor = LIFECYCLE.run_companion(

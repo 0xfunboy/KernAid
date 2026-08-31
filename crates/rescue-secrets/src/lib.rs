@@ -202,6 +202,8 @@ pub use application_store::{
     ProviderCredentialStatus, RescueApplicationStoreError, RescueReportSummary,
     RescueVaultApplicationStore,
 };
+#[cfg(all(target_os = "linux", feature = "experimental-firstboot-provisioner"))]
+pub use device_locator::LocatedVaultPreflightClassification;
 #[cfg(target_os = "linux")]
 pub use device_locator::{
     BootVaultLocation, BootVaultLocatorError, LocatedVaultIdentity, LocatedVaultPartition,

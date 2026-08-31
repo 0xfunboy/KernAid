@@ -1221,7 +1221,9 @@ def provision_firstboot(
         console,
         "passphrase",
         0,
-        LIFECYCLE._deadline(aggregate, 600.0),
+        LIFECYCLE._deadline(
+            aggregate, LIFECYCLE.FIRSTBOOT_PROMPT_TIMEOUT_SECONDS
+        ),
         "firstboot-start",
     )
     qmp.set_deadline(LIFECYCLE._deadline(aggregate, 10.0))
@@ -1230,13 +1232,19 @@ def provision_firstboot(
         console,
         "confirmation",
         0,
-        LIFECYCLE._deadline(aggregate, 600.0),
+        LIFECYCLE._deadline(
+            aggregate, LIFECYCLE.FIRSTBOOT_PROMPT_TIMEOUT_SECONDS
+        ),
         "firstboot-confirmation",
     )
     qmp.set_deadline(LIFECYCLE._deadline(aggregate, 10.0))
     qmp.send_hex_line(key)
     LIFECYCLE.wait_firstboot_attestation(
-        console, confirmation.end(), LIFECYCLE._deadline(aggregate, 600.0)
+        console,
+        confirmation.end(),
+        LIFECYCLE._deadline(
+            aggregate, LIFECYCLE.FIRSTBOOT_RESULT_TIMEOUT_SECONDS
+        ),
     )
 
 

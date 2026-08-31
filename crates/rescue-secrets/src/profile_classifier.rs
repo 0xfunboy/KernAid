@@ -90,6 +90,18 @@ pub(crate) enum VaultPartitionProfile {
     ProfileMismatch,
 }
 
+#[cfg(feature = "experimental-firstboot-provisioner")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FirstBootPreflightProfile {
+    /// The complete LUKS2 header area is zero. Bytes beyond it are deliberately
+    /// deferred to the mandatory post-confirmation full scan.
+    PotentiallyUnprovisioned,
+    /// Both redundant headers match the exact active outer profile.
+    Locked,
+    /// Non-zero header bytes do not form the exact active outer profile.
+    ProfileMismatch,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct OuterProfileEvidence {
     uuid: [u8; 36],
@@ -543,6 +555,61 @@ pub(crate) fn classify_partition_with_timeout(
         return Err(ProfileClassifierError::MediaChanged);
     }
     Ok(result)
+}
+
+/// Perform the bounded first-boot prompt gate without scanning the 8 GiB
+/// partition. This is not proof that the partition is empty: only the full
+/// classifier may produce `VaultPartitionProfile::Unprovisioned`.
+#[cfg(feature = "experimental-firstboot-provisioner")]
+pub(crate) fn classify_firstboot_preflight_with_timeout(
+    descriptor: impl AsFd,
+    timeout: Duration,
+    mut revalidate: impl FnMut() -> Result<(), ProfileClassifierError>,
+) -> Result<FirstBootPreflightProfile, ProfileClassifierError> {
+    if timeout.is_zero() || timeout > ZERO_SCAN_TIMEOUT {
+        return Err(ProfileClassifierError::OperationTimedOut);
+    }
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or(ProfileClassifierError::OperationTimedOut)?;
+    verify_embedded_profile()?;
+    revalidate()?;
+    let before = descriptor_snapshot(&descriptor)?;
+    if !FileType::from_raw_mode(before.mode).is_block_device() {
+        return Err(ProfileClassifierError::InvalidDescriptor);
+    }
+    let result = classify_firstboot_preflight_raw(&descriptor, deadline, &mut revalidate)?;
+    revalidate()?;
+    ensure_deadline(deadline)?;
+    if descriptor_snapshot(&descriptor)? != before {
+        return Err(ProfileClassifierError::MediaChanged);
+    }
+    Ok(result)
+}
+
+#[cfg(feature = "experimental-firstboot-provisioner")]
+fn classify_firstboot_preflight_raw(
+    descriptor: impl AsFd,
+    deadline: Instant,
+    mut revalidate: impl FnMut() -> Result<(), ProfileClassifierError>,
+) -> Result<FirstBootPreflightProfile, ProfileClassifierError> {
+    let duplicate = rustix::io::fcntl_dupfd_cloexec(descriptor, 3)
+        .map_err(|_| ProfileClassifierError::InvalidDescriptor)?;
+    let file = File::from(duplicate);
+    revalidate()?;
+    let mut headers = vec![0_u8; 2 * LUKS_HEADER_BYTES];
+    read_exact_at(&file, &mut headers, 0)?;
+    ensure_deadline(deadline)?;
+    revalidate()?;
+    ensure_deadline(deadline)?;
+    if headers.iter().all(|byte| *byte == 0) {
+        return Ok(FirstBootPreflightProfile::PotentiallyUnprovisioned);
+    }
+    Ok(if verify_dual_luks_headers(&file).is_some() {
+        FirstBootPreflightProfile::Locked
+    } else {
+        FirstBootPreflightProfile::ProfileMismatch
+    })
 }
 
 fn classify_raw_partition(
@@ -1460,6 +1527,52 @@ mod tests {
         let profile = classify_raw_partition(&file, capacity, ZERO_SCAN_TIMEOUT, || Ok(()))
             .expect("non-zero tail classification");
         assert!(matches!(profile, VaultPartitionProfile::ProfileMismatch));
+    }
+
+    #[cfg(feature = "experimental-firstboot-provisioner")]
+    #[test]
+    fn firstboot_preflight_defers_tail_scan_but_recognizes_locked_headers() {
+        let file = tempfile().expect("create firstboot preflight fixture");
+        let capacity = 2 * ZERO_SCAN_CHUNK_BYTES as u64 + 17;
+        file.set_len(capacity)
+            .expect("size firstboot preflight fixture");
+        file.write_all_at(&[1], capacity - 1)
+            .expect("write deferred non-zero tail");
+
+        let quick =
+            classify_firstboot_preflight_raw(&file, Instant::now() + ZERO_SCAN_TIMEOUT, || Ok(()))
+                .expect("quick firstboot classification");
+        assert_eq!(
+            quick,
+            FirstBootPreflightProfile::PotentiallyUnprovisioned,
+            "preflight must not scan beyond the bounded header area"
+        );
+        let complete = classify_raw_partition(&file, capacity, ZERO_SCAN_TIMEOUT, || Ok(()))
+            .expect("complete classification");
+        assert!(matches!(complete, VaultPartitionProfile::ProfileMismatch));
+
+        let (locked, _) = dual_luks_file();
+        assert_eq!(
+            classify_firstboot_preflight_raw(
+                &locked,
+                Instant::now() + ZERO_SCAN_TIMEOUT,
+                || Ok(()),
+            )
+            .expect("locked firstboot classification"),
+            FirstBootPreflightProfile::Locked
+        );
+        locked
+            .write_all_at(&[1], LUKS_HEADER_BYTES as u64)
+            .expect("corrupt secondary header");
+        assert_eq!(
+            classify_firstboot_preflight_raw(
+                &locked,
+                Instant::now() + ZERO_SCAN_TIMEOUT,
+                || Ok(()),
+            )
+            .expect("mismatched firstboot classification"),
+            FirstBootPreflightProfile::ProfileMismatch
+        );
     }
 
     #[test]
