@@ -277,6 +277,9 @@ label live-amd64-failsafe
         self.assertIn(b'prompt["Type"]=="notify"', proofs["native-ready"])
         self.assertIn(b'prompt["NotifyAccess"]=="main"', proofs["native-ready"])
         self.assertIn(b'active==b"tty8\\n"', proofs["native-ready"])
+        self.assertIn(
+            b"stage=native-ready checkpoint=", proofs["native-ready"]
+        )
         self.assertNotIn(b"passphrase", proofs["native-ready"].lower())
 
     def test_passphrase_has_no_immutable_full_value_and_root_proof_is_closed(self) -> None:
