@@ -2932,6 +2932,10 @@ class StaticContractTests(unittest.TestCase):
                 "hold-kill",
                 "post-fault",
                 "repair-apply",
+                "native-ready",
+                "native-post",
+                "native-journal-boot1",
+                "native-journal-boot2",
             ),
         )
         for stage in controller.PROVIDER_PROOF_CLOSED_STAGES:

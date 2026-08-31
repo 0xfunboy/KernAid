@@ -167,6 +167,12 @@ PROVIDER_PROOF_UI_STAGES = (
     "ui-status-configured",
 )
 PROVIDER_PROOF_NATIVE_STAGES = ("native-pre",)
+PROVIDER_PROOF_NATIVE_COMMAND_STAGES = (
+    "native-ready",
+    "native-post",
+    "native-journal-boot1",
+    "native-journal-boot2",
+)
 PROVIDER_PROOF_NATIVE_CHECKPOINTS = (
     "cmdline",
     "socket-unit",
@@ -186,7 +192,7 @@ PROVIDER_PROOF_CLOSED_STAGES = PROVIDER_PROOF_UI_STAGES + (
     "hold-kill",
     "post-fault",
     "repair-apply",
-)
+) + PROVIDER_PROOF_NATIVE_COMMAND_STAGES
 PROVIDER_PROOF_UI_CHECKPOINTS = (
     "ui-identity",
     "socket-baseline",
