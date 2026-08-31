@@ -15,6 +15,15 @@ import type {
   SignedUpdateManifest,
 } from "@kernaid/fleet-schemas";
 import { canonicalJson } from "@kernaid/fleet-schemas";
+import {
+  isTenantAccessAction,
+  isTenantRole,
+  validCredentialLabel,
+  type TenantAccessAction,
+  type TenantAccessOutcome,
+  type TenantAccessTargetType,
+  type TenantRole,
+} from "./access.js";
 
 const MAX_POLICY_STREAMS_PER_TENANT = 256;
 const MAX_RECENT_POLICY_PULL_NONCES_PER_DEVICE = 1024;
@@ -24,6 +33,9 @@ const MAX_RECENT_UPDATE_PULL_NONCES_PER_DEVICE = 1024;
 const MAX_SERVICE_RESPONSE_BYTES = 4 * 1024 * 1024;
 const MAX_SERVICE_RECEIPT_BYTES = 8 * 1024;
 const MAX_SERVICE_RECEIPTS_PER_OPERATION = 4;
+const MAX_TENANT_ACCESS_CREDENTIALS = 256;
+const MAX_TENANT_ACCESS_AUDIT_EVENTS = 10_000;
+const MAX_LISTED_TENANT_ACCESS_AUDIT_EVENTS = 256;
 
 export class StoreConflictError extends Error {}
 export class StoreAuthorizationError extends Error {}
@@ -99,6 +111,33 @@ export interface StoredServiceResponse {
   status: number;
   responseBody: string;
   receiptJson: string;
+}
+
+export interface TenantAccessCredential {
+  tenantId: string;
+  credentialId: string;
+  role: TenantRole;
+  label: string;
+  createdAt: string;
+  revokedAt: string | null;
+}
+
+export interface ListedTenantAccessAuditEvent {
+  tenantId: string;
+  sequence: number;
+  occurredAt: string;
+  credentialId: string;
+  role: TenantRole;
+  action: TenantAccessAction;
+  outcome: TenantAccessOutcome;
+  targetTenantId: string;
+  targetType: TenantAccessTargetType;
+  targetId: string;
+}
+
+export interface RevokeTenantAccessCredentialResult {
+  credential: TenantAccessCredential;
+  idempotent: boolean;
 }
 
 interface ServicePullNonce {
@@ -324,21 +363,221 @@ export class FleetStore {
     adminTokenHash: string,
     createdAt: string,
   ): void {
-    this.#database
-      .prepare(
-        "INSERT INTO tenants (tenant_id, admin_token_hash, created_at) VALUES (?, ?, ?)",
-      )
-      .run(tenantId, adminTokenHash, createdAt);
-  }
-
-  authenticateTenant(tenantId: string, adminTokenHash: string): boolean {
-    return (
+    validateCredentialInput({
+      tenantId,
+      credentialId: "bootstrap-admin",
+      tokenHash: adminTokenHash,
+      role: "admin",
+      label: "Initial tenant administrator",
+      createdAt,
+    });
+    this.#transaction(() => {
       this.#database
         .prepare(
-          "SELECT 1 AS allowed FROM tenants WHERE tenant_id = ? AND admin_token_hash = ?",
+          "INSERT INTO tenants (tenant_id, admin_token_hash, created_at) VALUES (?, ?, ?)",
         )
-        .get(tenantId, adminTokenHash) !== undefined
-    );
+        .run(tenantId, adminTokenHash, createdAt);
+      this.#insertTenantAccessCredential({
+        tenantId,
+        credentialId: "bootstrap-admin",
+        tokenHash: adminTokenHash,
+        role: "admin",
+        label: "Initial tenant administrator",
+        createdAt,
+      });
+    });
+  }
+
+  findTenantAccessCredential(
+    tokenHash: string,
+  ): TenantAccessCredential | undefined {
+    if (!isSha256(tokenHash)) throw new Error("access token hash is invalid");
+    const row = this.#database
+      .prepare(
+        `SELECT tenant_id, credential_id, role, label, created_at, revoked_at
+         FROM tenant_access_credentials WHERE token_hash = ?`,
+      )
+      .get(tokenHash) as TenantAccessCredentialRow | undefined;
+    return row === undefined ? undefined : mapTenantAccessCredential(row);
+  }
+
+  createTenantAccessCredential(input: {
+    tenantId: string;
+    credentialId: string;
+    tokenHash: string;
+    role: TenantRole;
+    label: string;
+    createdAt: string;
+  }): TenantAccessCredential {
+    validateCredentialInput(input);
+    return this.#transaction(() => {
+      const count = this.#database
+        .prepare(
+          `SELECT COUNT(*) AS count FROM tenant_access_credentials
+           WHERE tenant_id = ?`,
+        )
+        .get(input.tenantId) as { count: number };
+      if (count.count >= MAX_TENANT_ACCESS_CREDENTIALS) {
+        throw new StoreConflictError("tenant credential limit reached");
+      }
+      try {
+        this.#insertTenantAccessCredential(input);
+      } catch (error) {
+        if (isSqliteConstraint(error)) {
+          throw new StoreConflictError("tenant credential already exists");
+        }
+        throw error;
+      }
+      return {
+        tenantId: input.tenantId,
+        credentialId: input.credentialId,
+        role: input.role,
+        label: input.label,
+        createdAt: input.createdAt,
+        revokedAt: null,
+      };
+    });
+  }
+
+  listTenantAccessCredentials(tenantId: string): TenantAccessCredential[] {
+    if (!isPublicIdentifier(tenantId)) throw new Error("tenant ID is invalid");
+    const rows = this.#database
+      .prepare(
+        `SELECT tenant_id, credential_id, role, label, created_at, revoked_at
+         FROM tenant_access_credentials WHERE tenant_id = ?
+         ORDER BY created_at, credential_id LIMIT ?`,
+      )
+      .all(
+        tenantId,
+        MAX_TENANT_ACCESS_CREDENTIALS,
+      ) as unknown as TenantAccessCredentialRow[];
+    return rows.map(mapTenantAccessCredential);
+  }
+
+  revokeTenantAccessCredential(input: {
+    tenantId: string;
+    credentialId: string;
+    actorCredentialId: string;
+    revokedAt: string;
+  }): RevokeTenantAccessCredentialResult | undefined {
+    if (
+      !isPublicIdentifier(input.tenantId) ||
+      !isPublicIdentifier(input.credentialId) ||
+      !isPublicIdentifier(input.actorCredentialId) ||
+      !isRfc3339(input.revokedAt)
+    ) {
+      throw new Error("credential revocation is invalid");
+    }
+    return this.#transaction(() => {
+      const row = this.#database
+        .prepare(
+          `SELECT tenant_id, credential_id, role, label, created_at, revoked_at
+           FROM tenant_access_credentials
+           WHERE tenant_id = ? AND credential_id = ?`,
+        )
+        .get(input.tenantId, input.credentialId) as
+        TenantAccessCredentialRow | undefined;
+      if (row === undefined) return undefined;
+      const credential = mapTenantAccessCredential(row);
+      if (credential.revokedAt !== null) {
+        return { credential, idempotent: true };
+      }
+      if (credential.credentialId === input.actorCredentialId) {
+        throw new StoreConflictError("credential cannot revoke itself");
+      }
+      if (credential.role === "admin") {
+        const admins = this.#database
+          .prepare(
+            `SELECT COUNT(*) AS count FROM tenant_access_credentials
+             WHERE tenant_id = ? AND role = 'admin' AND revoked_at IS NULL`,
+          )
+          .get(input.tenantId) as { count: number };
+        if (admins.count <= 1) {
+          throw new StoreConflictError("last tenant administrator remains");
+        }
+      }
+      const result = this.#database
+        .prepare(
+          `UPDATE tenant_access_credentials SET revoked_at = ?
+           WHERE tenant_id = ? AND credential_id = ? AND revoked_at IS NULL`,
+        )
+        .run(input.revokedAt, input.tenantId, input.credentialId);
+      if (result.changes !== 1) {
+        throw new StoreConflictError("credential revocation conflicted");
+      }
+      return {
+        credential: { ...credential, revokedAt: input.revokedAt },
+        idempotent: false,
+      };
+    });
+  }
+
+  recordTenantAccessAudit(input: {
+    tenantId: string;
+    occurredAt: string;
+    credentialId: string;
+    role: TenantRole;
+    action: TenantAccessAction;
+    outcome: TenantAccessOutcome;
+    targetTenantId: string;
+    targetType: TenantAccessTargetType;
+    targetId: string;
+  }): number {
+    validateTenantAccessAuditInput(input);
+    return this.#transaction(() => {
+      const current = this.#database
+        .prepare(
+          `SELECT COALESCE(MAX(sequence), 0) AS sequence
+           FROM tenant_access_audit WHERE tenant_id = ?`,
+        )
+        .get(input.tenantId) as { sequence: number };
+      const sequence = current.sequence + 1;
+      if (!Number.isSafeInteger(sequence) || sequence < 1) {
+        throw new StoreConflictError("tenant access audit sequence exhausted");
+      }
+      this.#database
+        .prepare(
+          `INSERT INTO tenant_access_audit
+            (tenant_id, sequence, occurred_at, credential_id, role, action,
+             outcome, target_tenant_id, target_type, target_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          input.tenantId,
+          sequence,
+          input.occurredAt,
+          input.credentialId,
+          input.role,
+          input.action,
+          input.outcome,
+          input.targetTenantId,
+          input.targetType,
+          input.targetId,
+        );
+      this.#database
+        .prepare(
+          `DELETE FROM tenant_access_audit
+           WHERE tenant_id = ? AND sequence <= ?`,
+        )
+        .run(input.tenantId, sequence - MAX_TENANT_ACCESS_AUDIT_EVENTS);
+      return sequence;
+    });
+  }
+
+  listTenantAccessAudit(tenantId: string): ListedTenantAccessAuditEvent[] {
+    if (!isPublicIdentifier(tenantId)) throw new Error("tenant ID is invalid");
+    const rows = this.#database
+      .prepare(
+        `SELECT tenant_id, sequence, occurred_at, credential_id, role, action,
+                outcome, target_tenant_id, target_type, target_id
+         FROM tenant_access_audit WHERE tenant_id = ?
+         ORDER BY sequence DESC LIMIT ?`,
+      )
+      .all(
+        tenantId,
+        MAX_LISTED_TENANT_ACCESS_AUDIT_EVENTS,
+      ) as unknown as TenantAccessAuditRow[];
+    return rows.map(mapTenantAccessAudit);
   }
 
   setPolicyTrustAnchor(
@@ -1284,6 +1523,30 @@ export class FleetStore {
     return result.changes === 1;
   }
 
+  #insertTenantAccessCredential(input: {
+    tenantId: string;
+    credentialId: string;
+    tokenHash: string;
+    role: TenantRole;
+    label: string;
+    createdAt: string;
+  }): void {
+    this.#database
+      .prepare(
+        `INSERT INTO tenant_access_credentials
+          (tenant_id, credential_id, token_hash, role, label, created_at, revoked_at)
+         VALUES (?, ?, ?, ?, ?, ?, NULL)`,
+      )
+      .run(
+        input.tenantId,
+        input.credentialId,
+        input.tokenHash,
+        input.role,
+        input.label,
+        input.createdAt,
+      );
+  }
+
   #recordServicePullNonce(
     operation: FleetServiceOperation,
     tenantId: string,
@@ -1349,7 +1612,7 @@ export class FleetStore {
     const version = this.#database.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    if (version.user_version > 6) {
+    if (version.user_version > 7) {
       throw new Error(
         `unsupported Fleet database version ${version.user_version}`,
       );
@@ -1651,6 +1914,75 @@ export class FleetStore {
           PRAGMA user_version = 6;
         `);
       });
+      currentVersion = 6;
+    }
+
+    if (currentVersion === 6) {
+      this.#transaction(() => {
+        this.#database.exec(`
+          CREATE TABLE tenant_access_credentials (
+            tenant_id TEXT NOT NULL REFERENCES tenants(tenant_id),
+            credential_id TEXT NOT NULL,
+            token_hash TEXT NOT NULL UNIQUE CHECK (
+              length(token_hash) = 64 AND
+              token_hash NOT GLOB '*[^0-9a-f]*'
+            ),
+            role TEXT NOT NULL CHECK (role IN ('admin', 'operator')),
+            label TEXT NOT NULL CHECK (length(label) BETWEEN 1 AND 80),
+            created_at TEXT NOT NULL,
+            revoked_at TEXT,
+            PRIMARY KEY (tenant_id, credential_id)
+          ) STRICT;
+          CREATE INDEX tenant_access_credentials_active_idx
+            ON tenant_access_credentials(tenant_id, role, revoked_at);
+
+          INSERT INTO tenant_access_credentials
+            (tenant_id, credential_id, token_hash, role, label, created_at, revoked_at)
+          SELECT tenant_id, 'bootstrap-admin', admin_token_hash, 'admin',
+                 'Initial tenant administrator', created_at, NULL
+          FROM tenants;
+
+          CREATE TABLE tenant_access_audit (
+            tenant_id TEXT NOT NULL REFERENCES tenants(tenant_id),
+            sequence INTEGER NOT NULL CHECK (sequence > 0),
+            occurred_at TEXT NOT NULL,
+            credential_id TEXT NOT NULL,
+            role TEXT NOT NULL CHECK (role IN ('admin', 'operator')),
+            action TEXT NOT NULL CHECK (action IN (
+              'access_audit.list',
+              'asset.list',
+              'credential.create',
+              'credential.list',
+              'credential.revoke',
+              'device.list',
+              'device.revoke',
+              'device_audit.list',
+              'enrollment_token.create',
+              'entitlement.list',
+              'entitlement.publish',
+              'entitlement_revocations.publish',
+              'policy.list',
+              'policy.publish',
+              'policy_trust_anchor.set',
+              'update.list',
+              'update.publish'
+            )),
+            outcome TEXT NOT NULL CHECK (outcome IN ('allowed', 'denied')),
+            target_tenant_id TEXT NOT NULL,
+            target_type TEXT NOT NULL CHECK (
+              target_type IN ('credential', 'device', 'tenant')
+            ),
+            target_id TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, sequence),
+            FOREIGN KEY (tenant_id, credential_id)
+              REFERENCES tenant_access_credentials(tenant_id, credential_id)
+          ) STRICT;
+          CREATE INDEX tenant_access_audit_recent_idx
+            ON tenant_access_audit(tenant_id, sequence DESC);
+
+          PRAGMA user_version = 7;
+        `);
+      });
     }
   }
 }
@@ -1665,6 +1997,28 @@ interface ServiceResponseRow {
   status: number;
   response_body: string;
   receipt_json: string;
+}
+
+interface TenantAccessCredentialRow {
+  tenant_id: string;
+  credential_id: string;
+  role: string;
+  label: string;
+  created_at: string;
+  revoked_at: string | null;
+}
+
+interface TenantAccessAuditRow {
+  tenant_id: string;
+  sequence: number;
+  occurred_at: string;
+  credential_id: string;
+  role: string;
+  action: string;
+  outcome: string;
+  target_tenant_id: string;
+  target_type: string;
+  target_id: string;
 }
 
 interface AuditSessionRow {
@@ -1779,6 +2133,104 @@ function parseStoredEvidenceDigests(value: string): string[] {
   return parsed;
 }
 
+function validateCredentialInput(input: {
+  tenantId: string;
+  credentialId: string;
+  tokenHash: string;
+  role: TenantRole;
+  label: string;
+  createdAt: string;
+}): void {
+  if (
+    !isPublicIdentifier(input.tenantId) ||
+    !isPublicIdentifier(input.credentialId) ||
+    !isSha256(input.tokenHash) ||
+    !isTenantRole(input.role) ||
+    !validCredentialLabel(input.label) ||
+    !isRfc3339(input.createdAt)
+  ) {
+    throw new Error("tenant access credential is invalid");
+  }
+}
+
+function mapTenantAccessCredential(
+  row: TenantAccessCredentialRow,
+): TenantAccessCredential {
+  if (
+    !isPublicIdentifier(row.tenant_id) ||
+    !isPublicIdentifier(row.credential_id) ||
+    !isTenantRole(row.role) ||
+    !validCredentialLabel(row.label) ||
+    !isRfc3339(row.created_at) ||
+    (row.revoked_at !== null && !isRfc3339(row.revoked_at))
+  ) {
+    throw new Error("stored tenant access credential is invalid");
+  }
+  return {
+    tenantId: row.tenant_id,
+    credentialId: row.credential_id,
+    role: row.role,
+    label: row.label,
+    createdAt: row.created_at,
+    revokedAt: row.revoked_at,
+  };
+}
+
+function validateTenantAccessAuditInput(input: {
+  tenantId: string;
+  occurredAt: string;
+  credentialId: string;
+  role: TenantRole;
+  action: TenantAccessAction;
+  outcome: TenantAccessOutcome;
+  targetTenantId: string;
+  targetType: TenantAccessTargetType;
+  targetId: string;
+}): void {
+  if (
+    !isPublicIdentifier(input.tenantId) ||
+    !isRfc3339(input.occurredAt) ||
+    !isPublicIdentifier(input.credentialId) ||
+    !isTenantRole(input.role) ||
+    !isTenantAccessAction(input.action) ||
+    !["allowed", "denied"].includes(input.outcome) ||
+    !isPublicIdentifier(input.targetTenantId) ||
+    !["credential", "device", "tenant"].includes(input.targetType) ||
+    !isPublicIdentifier(input.targetId)
+  ) {
+    throw new Error("tenant access audit event is invalid");
+  }
+}
+
+function mapTenantAccessAudit(
+  row: TenantAccessAuditRow,
+): ListedTenantAccessAuditEvent {
+  if (
+    !Number.isSafeInteger(row.sequence) ||
+    row.sequence < 1 ||
+    !isTenantRole(row.role) ||
+    !isTenantAccessAction(row.action) ||
+    !["allowed", "denied"].includes(row.outcome) ||
+    !["credential", "device", "tenant"].includes(row.target_type)
+  ) {
+    throw new Error("stored tenant access audit event is invalid");
+  }
+  const mapped = {
+    tenantId: row.tenant_id,
+    sequence: row.sequence,
+    occurredAt: row.occurred_at,
+    credentialId: row.credential_id,
+    role: row.role,
+    action: row.action,
+    outcome: row.outcome as TenantAccessOutcome,
+    targetTenantId: row.target_tenant_id,
+    targetType: row.target_type as TenantAccessTargetType,
+    targetId: row.target_id,
+  };
+  validateTenantAccessAuditInput(mapped);
+  return mapped;
+}
+
 function validateServiceResponseLookup(input: {
   tenantId: string;
   deviceId: string;
@@ -1857,6 +2309,17 @@ function isServiceOperation(value: string): value is FleetServiceOperation {
 
 function isSha256(value: string): boolean {
   return /^[0-9a-f]{64}$/.test(value);
+}
+
+function isRfc3339(value: string): boolean {
+  return (
+    value.length >= 20 &&
+    value.length <= 64 &&
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(
+      value,
+    ) &&
+    Number.isFinite(Date.parse(value))
+  );
 }
 
 function isPublicIdentifier(value: string): boolean {
