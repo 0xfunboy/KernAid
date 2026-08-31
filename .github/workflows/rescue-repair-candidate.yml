@@ -243,6 +243,15 @@ jobs:
             uefi failure-paths \
             "$PWD/KernAid-Rescue-amd64-repair-candidate.iso"
 
+      - name: Upload sanitized repair candidate smoke logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: KernAid-Rescue-repair-candidate-smoke-logs
+          path: rescue-repair-candidate-*.log
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: Upload private repair candidate forensics
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
