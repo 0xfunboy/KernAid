@@ -42,6 +42,9 @@ on:
       - "pnpm-lock.yaml"
       - ".github/workflows/rescue.yml"
 permissions: { contents: read }
+concurrency:
+  group: rescue-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   build-and-smoke-test:
     runs-on: ubuntu-24.04

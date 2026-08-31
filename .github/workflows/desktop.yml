@@ -37,6 +37,9 @@ on:
       - "justfile"
       - ".github/workflows/desktop.yml"
 permissions: { contents: read }
+concurrency:
+  group: desktop-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   prepare_matrix:
     runs-on: ubuntu-24.04

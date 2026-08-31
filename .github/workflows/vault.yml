@@ -23,6 +23,9 @@ on:
       - "rust-toolchain.toml"
       - ".github/workflows/vault.yml"
 permissions: { contents: read }
+concurrency:
+  group: vault-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   luks2-roundtrip:
     runs-on: ubuntu-24.04

@@ -1,6 +1,9 @@
 name: ci
 on: [push, pull_request]
 permissions: { contents: read }
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   rust:
     runs-on: ubuntu-latest
