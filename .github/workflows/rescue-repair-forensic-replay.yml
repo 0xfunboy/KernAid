@@ -25,8 +25,53 @@ jobs:
           sudo apt-get install -y \
             cryptsetup e2fsprogs ovmf qemu-system-x86 \
             squashfs-tools udev util-linux xorriso
-          sudo chown root:root /usr/share/OVMF
-          sudo chmod go-w /usr/share/OVMF
+
+      - name: Harden OVMF firmware ancestry
+        run: |
+          sudo /usr/bin/python3 -I -B - <<'PY'
+          import os
+          import stat
+
+          flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+          opened = []
+
+          def harden(descriptor):
+              before = os.fstat(descriptor)
+              if not stat.S_ISDIR(before.st_mode):
+                  raise RuntimeError("OVMF ancestry entry is not a directory")
+              os.fchown(descriptor, 0, 0)
+              os.fchmod(descriptor, stat.S_IMODE(before.st_mode) & ~0o022)
+              after = os.fstat(descriptor)
+              if (
+                  after.st_uid != 0
+                  or after.st_gid != 0
+                  or stat.S_IMODE(after.st_mode) & 0o022
+              ):
+                  raise RuntimeError("OVMF ancestry entry is not trusted")
+
+          def child(parent, name, *, required):
+              try:
+                  descriptor = os.open(name, flags, dir_fd=parent)
+              except FileNotFoundError:
+                  if required:
+                      raise
+                  return None
+              opened.append(descriptor)
+              harden(descriptor)
+              return descriptor
+
+          try:
+              root = os.open("/", flags)
+              opened.append(root)
+              harden(root)
+              usr = child(root, "usr", required=True)
+              share = child(usr, "share", required=True)
+              child(share, "OVMF", required=True)
+              child(share, "edk2", required=False)
+          finally:
+              for descriptor in reversed(opened):
+                  os.close(descriptor)
+          PY
 
       - name: Download exact failed candidate
         uses: actions/download-artifact@v4
