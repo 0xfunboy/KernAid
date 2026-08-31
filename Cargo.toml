@@ -3,7 +3,7 @@ resolver = "2"
 members = [
   "crates/core", "crates/broker", "crates/evidence", "crates/policy",
   "crates/protocol", "crates/storage", "crates/redaction", "crates/device-identity",
-  "crates/fleet-client", "crates/fleet-runtime",
+  "crates/fleet-client", "crates/fleet-runtime", "crates/fleet-policy",
   "crates/native-secrets", "crates/rescue-secrets", "crates/report-schema",
   "crates/rescue-openai-provider", "crates/rescue-openai-executor",
   "crates/rescue-codex-bridge",
