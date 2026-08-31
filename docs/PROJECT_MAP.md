@@ -9,11 +9,13 @@ and internal delivery channel. For exact qualification evidence, use
 
 ## Where the product is now
 
-KernAid is a substantial **Phase 0 diagnosis-only engineering preview**. It
-collects bounded evidence, produces a diagnosis, validates a typed R0 no-write
-plan and emits a hashed report. Rescue can additionally preserve the exact
-report and audit sequence as a signed envelope in its encrypted Vault. Normal
-builds contain no production target-mutation handler.
+KernAid's stable customer-facing build remains a **diagnosis-only engineering
+preview**. It collects bounded evidence, produces a diagnosis, validates a
+typed R0 no-write plan and emits a hashed report. Rescue can additionally
+preserve the exact report and audit sequence as a signed envelope in its
+encrypted Vault. Separately built, off-default repair candidates now contain
+closed fstab, crypttab and ext4 recovery actions; none is promoted into the
+stable image until its own qualification gate passes.
 
 The intended complete product flow is:
 
@@ -21,36 +23,36 @@ The intended complete product flow is:
 Observe -> Diagnose -> Plan -> Approve -> Repair -> Verify -> Roll back
 ```
 
-The production path currently stops after reporting. One Linux-only fixture
-lab exercises the same `SessionDriver -> Agent Gateway -> Core -> broker`
-shape for repair and rollback against a disposable repository-owned test tree;
-it cannot select a host path, disk or customer target.
+The stable path currently stops after reporting. Candidate actions exercise
+the same `SessionDriver -> Agent Gateway -> Core -> broker` boundary against
+descriptor-bound disposable targets with Vault evidence and explicit
+approval. They remain private and unsupported on customer data.
 
 ## Product surfaces
 
-| Surface | Purpose | Current boundary |
-| --- | --- | --- |
-| KernAid Desk | Diagnose a running Windows, Linux or macOS installation | Unsigned engineering builds; read-only production collectors |
-| KernAid Rescue | Boot an amd64 PC that cannot start its installed OS | Hybrid BIOS/UEFI image; gated VT-unlock E2E is implemented but pending CI, and qualification remains virtual until physical USB evidence exists |
-| USB writer v2 | Verify an authorized ISO, write it and provision its encrypted Vault | Linux operator path; accepts only the exact trusted-catalog image |
-| KernAid Fleet | Enroll devices, retain privacy-minimized inventory and apply restrictive tenant policy | Signed client/control-plane vertical slice; device integration and private deployment remain RC gates |
-| Project site | Explain the project publicly and distribute controlled artifacts privately | Public `/`; authenticated `/private/`; no public ISO route |
+| Surface        | Purpose                                                                                                   | Current boundary                                                                                                                                |
+| -------------- | --------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| KernAid Desk   | Diagnose a running Windows, Linux or macOS installation                                                   | Unsigned engineering builds; read-only production collectors                                                                                    |
+| KernAid Rescue | Boot an amd64 PC that cannot start its installed OS                                                       | Hybrid BIOS/UEFI image; gated VT-unlock E2E is implemented but pending CI, and qualification remains virtual until physical USB evidence exists |
+| USB writer v2  | Verify an authorized ISO, write it and provision its encrypted Vault                                      | Linux operator path; accepts only the exact trusted-catalog image                                                                               |
+| KernAid Fleet  | Enroll devices, retain privacy-minimized inventory, apply restrictive policy and govern typed work orders | Live internal schema v8 control plane and console; Resident work-order execution service remains off-default and unqualified                    |
+| Project site   | Explain the project publicly and distribute controlled artifacts privately                                | Public `/`; authenticated `/private/`; no public ISO route                                                                                      |
 
 ## Canonical repository map
 
-| Path | Contents |
-| --- | --- |
-| `apps/desk/` | React/Tauri Desk application and native Resident adapters |
-| `crates/` | Core, protocol, broker, identity, storage, Rescue vault/provider, Fleet client/policy/runtime and entitlement components |
-| `services/fleet-control-plane/` | Multi-tenant signed enrollment and inventory registry |
-| `apps/fleet-console/` | Internal same-origin Fleet operator console |
-| `packs/` | Strict deterministic diagnostic packs for Linux, Windows and macOS |
-| `rescue/live-build/` | Debian live-image contents and service configuration |
-| `tools/build-rescue/` | Reproducible image build, QEMU gates, SBOM and attestation tooling |
-| `tools/make-device/` | Trusted catalogs and the guarded USB writer |
-| `tests/` | Integration, zero-write, Rescue and fixture coverage |
-| `site/` | Dependency-free public site and authenticated artifact server |
-| `docs/` | Architecture, status and operator documentation |
+| Path                            | Contents                                                                                                                 |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `apps/desk/`                    | React/Tauri Desk application and native Resident adapters                                                                |
+| `crates/`                       | Core, protocol, broker, identity, storage, Rescue vault/provider, Fleet client/policy/runtime and entitlement components |
+| `services/fleet-control-plane/` | Multi-tenant signed enrollment and inventory registry                                                                    |
+| `apps/fleet-console/`           | Internal same-origin Fleet operator console                                                                              |
+| `packs/`                        | Strict deterministic diagnostic packs for Linux, Windows and macOS                                                       |
+| `rescue/live-build/`            | Debian live-image contents and service configuration                                                                     |
+| `tools/build-rescue/`           | Reproducible image build, QEMU gates, SBOM and attestation tooling                                                       |
+| `tools/make-device/`            | Trusted catalogs and the guarded USB writer                                                                              |
+| `tests/`                        | Integration, zero-write, Rescue and fixture coverage                                                                     |
+| `site/`                         | Dependency-free public site and authenticated artifact server                                                            |
+| `docs/`                         | Architecture, status and operator documentation                                                                          |
 
 All Python files under these paths are tracked build, Rescue, writer or test
 sources. They are not abandoned copies.
@@ -59,13 +61,14 @@ sources. They are not abandoned copies.
 
 On the internal build host used during this phase:
 
-| Path/service | Role |
-| --- | --- |
-| `/home/funboy/kernaid` | Only canonical checkout of `0xfunboy/KernAid`, branch `main` |
-| `/home/funboy/KernAid-dist` | Local staging for qualified/private artifacts; not another repository |
-| `kaid-site.service` | Node.js 24 site process on loopback |
-| `kaid-cloudflared.service` | Tunnel for `https://kaid.funboy.eu.cc` |
-| `~/.config/kaid-site/` | Operator-owned password and tunnel credentials; never committed |
+| Path/service                | Role                                                                                 |
+| --------------------------- | ------------------------------------------------------------------------------------ |
+| `/home/funboy/kernaid`      | Only canonical checkout of `0xfunboy/KernAid`, branch `main`                         |
+| `/home/funboy/KernAid-dist` | Local staging for qualified/private artifacts; not another repository                |
+| `kaid-site.service`         | Node.js 24 site process on loopback                                                  |
+| `kaid-cloudflared.service`  | Tunnel for `https://kaid.funboy.eu.cc`                                               |
+| `kernaid-fleet.service`     | Node.js 24.18.0 Fleet v8 origin on loopback, exposed at `https://fleet.funboy.eu.cc` |
+| `~/.config/kaid-site/`      | Operator-owned password and tunnel credentials; never committed                      |
 
 Both user services are enabled and user lingering keeps them active across
 logout and reboot.
@@ -99,8 +102,9 @@ publishes passing digest-bound evidence. Implemented source alone does not
 qualify or promote the feature.
 
 The existence of a GitHub Actions artifact alone never promotes it. Physical
-USB, Secure Boot, real-account provider TLS, signed installers and production
-repairs remain separate release gates.
+USB, real-account provider TLS, signed installers and production repairs
+remain separate release gates; virtual Secure Boot evidence is not a physical
+firmware qualification claim.
 
 ## Safe workspace cleanup
 
