@@ -330,6 +330,16 @@ export class FleetStore {
     return rows.map((row) => row.bundle_json);
   }
 
+  listPolicyJson(tenantId: string): string[] {
+    const rows = this.#database
+      .prepare(
+        `SELECT bundle_json FROM policy_bundles
+         WHERE tenant_id = ? ORDER BY policy_id LIMIT 256`,
+      )
+      .all(tenantId) as unknown as { bundle_json: string }[];
+    return rows.map((row) => row.bundle_json);
+  }
+
   publishEntitlement(
     tenantId: string,
     envelope: EntitlementEnvelope,
@@ -587,6 +597,18 @@ export class FleetStore {
       .all(tenantId, platform, architecture) as unknown as {
       canonical_json: string;
     }[];
+    return rows.map((row) => row.canonical_json);
+  }
+
+  listAllUpdateManifestJson(tenantId: string): string[] {
+    const rows = this.#database
+      .prepare(
+        `SELECT canonical_json FROM update_manifests
+         WHERE tenant_id = ?
+         ORDER BY platform, architecture, release_ring
+         LIMIT 16`,
+      )
+      .all(tenantId) as unknown as { canonical_json: string }[];
     return rows.map((row) => row.canonical_json);
   }
 

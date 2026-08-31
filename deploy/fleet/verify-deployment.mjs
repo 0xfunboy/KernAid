@@ -29,6 +29,10 @@ assert.match(dockerfile, /pnpm install --frozen-lockfile --ignore-scripts/);
 assert.match(dockerfile, /FLEET_CONSOLE_DIR=\/opt\/kernaid\/console/);
 assert.match(
   dockerfile,
+  /apps\/fleet-console\/publish-document\.js[\s\S]+\/opt\/kernaid\/console\/publish-document\.js/,
+);
+assert.match(
+  dockerfile,
   /KERNAID_FLEET_ENTITLEMENT_TRUST_ANCHOR_FILE=\/run\/configs\/kernaid_entitlement_trust_anchor/,
 );
 assert.match(

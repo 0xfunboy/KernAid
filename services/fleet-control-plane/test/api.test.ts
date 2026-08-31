@@ -2279,3 +2279,120 @@ test("SQLite v4 migrates to v5 and update checkpoints survive restart", async ()
     await destroyHarness(harness);
   }
 });
+
+test("tenant governance status is bounded, minimized, and admin-scoped", async () => {
+  const harness = await createHarness();
+  try {
+    const tenant = await createTenant(harness);
+    const other = await createTenant(harness);
+    const device = await enroll(harness, tenant, "governance-console-device");
+    const policySigner = makePolicySigner();
+    assert.equal(
+      (await setPolicyAnchor(harness, tenant, policySigner)).status,
+      201,
+    );
+    assert.equal(
+      (
+        await publishPolicy(
+          harness,
+          tenant,
+          signedPolicy(tenant, policySigner, {
+            policyId: "enterprise-baseline",
+            revision: 3,
+            assignments: { all: true },
+          }),
+        )
+      ).status,
+      201,
+    );
+    assert.equal(
+      (
+        await publishEntitlement(
+          harness,
+          tenant,
+          signedEntitlement(tenant, [device.deviceId], {
+            entitlementId: "enterprise-console",
+            sequence: 4,
+          }),
+        )
+      ).status,
+      201,
+    );
+    assert.equal(
+      (
+        await publishEntitlementRevocations(
+          harness,
+          tenant,
+          signedEntitlementRevocations(2, ["retired-license"]),
+        )
+      ).status,
+      201,
+    );
+    assert.equal(
+      (
+        await publishUpdateManifest(
+          harness,
+          tenant,
+          signedUpdateManifest({ sequence: 9 }),
+        )
+      ).status,
+      201,
+    );
+
+    const paths = ["policies", "entitlements", "update-manifests"];
+    const responses = await Promise.all(
+      paths.map((path) =>
+        api(
+          harness,
+          "GET",
+          `/v1/tenants/${tenant.tenantId}/${path}`,
+          undefined,
+          tenant.adminToken,
+        ),
+      ),
+    );
+    assert.deepEqual(
+      responses.map((response) => response.status),
+      [200, 200, 200],
+    );
+    assert.equal(responses[0]?.body.trustAnchorConfigured, true);
+    assert.equal(
+      (responses[0]?.body.items as { policyId: string }[])[0]?.policyId,
+      "enterprise-baseline",
+    );
+    assert.equal(
+      (responses[1]?.body.items as { entitlementId: string }[])[0]
+        ?.entitlementId,
+      "enterprise-console",
+    );
+    assert.equal(
+      (responses[1]?.body.revocations as { sequence: number }).sequence,
+      2,
+    );
+    assert.equal(
+      (responses[2]?.body.items as { sequence: number }[])[0]?.sequence,
+      9,
+    );
+    const serialized = JSON.stringify(
+      responses.map((response) => response.body),
+    );
+    assert.doesNotMatch(
+      serialized,
+      /signature|canonical_json|artifact|publicKey|private|seed/i,
+    );
+    assert.equal(
+      (
+        await api(
+          harness,
+          "GET",
+          `/v1/tenants/${tenant.tenantId}/policies`,
+          undefined,
+          other.adminToken,
+        )
+      ).status,
+      401,
+    );
+  } finally {
+    await destroyHarness(harness);
+  }
+});

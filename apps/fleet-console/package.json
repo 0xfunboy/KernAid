@@ -10,7 +10,7 @@
     "format": "prettier --write .",
     "lint": "node --check app.js",
     "check": "node --check app.js",
-    "test": "node --check app.js",
+    "test": "node --check app.js && node --test publish-document.test.mjs && node verify-ui.mjs",
     "build": "node --check app.js"
   }
 }
