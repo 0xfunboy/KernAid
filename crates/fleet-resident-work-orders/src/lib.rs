@@ -32,6 +32,9 @@ use std::{
 };
 use zeroize::Zeroizing;
 
+#[cfg(feature = "linux-service")]
+pub mod linux;
+
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
@@ -323,6 +326,26 @@ impl PreparedLocalExecution {
     #[must_use]
     pub fn execution_id(&self) -> &str {
         &self.execution_id
+    }
+
+    #[must_use]
+    pub const fn action_id(&self) -> WorkOrderActionId {
+        self.action_id
+    }
+
+    #[must_use]
+    pub const fn action_version(&self) -> u16 {
+        self.action_version
+    }
+
+    #[must_use]
+    pub fn plan_sha256(&self) -> &str {
+        &self.plan_sha256
+    }
+
+    #[must_use]
+    pub fn target_sha256(&self) -> &str {
+        &self.target_sha256
     }
 
     #[must_use]
