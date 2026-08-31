@@ -999,11 +999,10 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
             shutil.rmtree(root)
 
     def test_backup_tamper_decodes_kernel_loop_device_numbers(self) -> None:
-        device = os.makedev(252, 17)
-        huge_encoded = (252 << 32) | 17
-        self.assertNotEqual(device, huge_encoded)
+        device = os.makedev(252, 0x12345)
+        huge_encoded = 0x45 | (252 << 8) | (0x12300 << 12)
         self.assertTrue(tamper.huge_device_matches(huge_encoded, device))
-        self.assertFalse(tamper.huge_device_matches((253 << 32) | 17, device))
+        self.assertFalse(tamper.huge_device_matches(huge_encoded + 1, device))
         self.assertEqual(tamper.LOOP_INFO64.size, 232)
 
     def test_backup_tamper_parses_canonical_debugfs_inode_sizes(self) -> None:
