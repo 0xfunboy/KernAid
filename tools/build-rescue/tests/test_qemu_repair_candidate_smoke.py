@@ -438,7 +438,8 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
         self.assertIn('readonly qemu_smp="${KERNAID_QEMU_SMP:-2}"', source)
         self.assertIn('1|2|4|8)', source)
         self.assertIn('-smp "$qemu_smp"', source)
-        self.assertIn("KERNAID_QEMU_SMP=4", workflow)
+        self.assertNotIn("KERNAID_QEMU_SMP=4", workflow)
+        self.assertEqual(workflow.count("KERNAID_QEMU_SMP=2"), 5)
 
     def test_repair_shutdown_keeps_a_bounded_tcg_safe_budget(self) -> None:
         source = CONTROLLER.read_text(encoding="utf-8")

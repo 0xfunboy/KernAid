@@ -9,7 +9,10 @@ iso="${3:-$repo_dir/KernAid-Rescue-amd64-repair-candidate.iso}"
 controller="$repo_dir/tools/build-rescue/qemu-repair-candidate-pty.py"
 readonly media_bytes=32000000000
 readonly p3_start_bytes=17179869184
-controller_timeout=900
+# A first boot can spend up to fifteen minutes proving that the future Vault
+# is entirely zero before its first write. Keep one aggregate budget that also
+# covers the TCG boot, repair proof and clean shutdown.
+controller_timeout=1800
 readonly qemu_smp="${KERNAID_QEMU_SMP:-2}"
 readonly provisioned_base="${KERNAID_REPAIR_PROVISIONED_BASE:-}"
 readonly provisioned_key="${KERNAID_REPAIR_PROVISIONED_KEY:-}"
