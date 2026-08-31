@@ -79,6 +79,9 @@ and is bounded to 64 KiB, matching the Rust verifier.
 | `POST` | `/v1/tenants/:tenantId/entitlements`             | Tenant bearer          | Verify/publish offline-signed entitlement    |
 | `POST` | `/v1/tenants/:tenantId/entitlement-revocations`  | Tenant bearer          | Publish signed revocation checkpoint         |
 | `POST` | `/v1/tenants/:tenantId/update-manifests`         | Tenant bearer          | Verify/publish vendor-signed manifest        |
+| `GET`  | `/v1/tenants/:tenantId/policies`                 | Tenant bearer          | Minimized policy status                      |
+| `GET`  | `/v1/tenants/:tenantId/entitlements`             | Tenant bearer          | Minimized entitlement/revocation status      |
+| `GET`  | `/v1/tenants/:tenantId/update-manifests`         | Tenant bearer          | Minimized update-channel status              |
 | `GET`  | `/v1/tenants/:tenantId/devices`                  | Tenant bearer          | `{ items: [...] }` device registry           |
 | `GET`  | `/v1/tenants/:tenantId/assets`                   | Tenant bearer          | `{ items: [...] }` latest aggregate assets   |
 | `GET`  | `/v1/tenants/:tenantId/audit-events`             | Tenant bearer          | Bounded `{ items: [...] }` digest-only audit |
@@ -117,6 +120,11 @@ target and ring bind the response context, while each item must still pass the
 device's vendor-signature verification, durable checkpoint, entitlement,
 policy and inactive-target staging gates. Fleet never downloads artifacts or
 activates a boot target.
+
+The three tenant governance GET routes return only bounded operational
+metadata needed by the console: IDs, revisions/sequences, assignment counts,
+capability names, target/ring and validity windows. They omit signatures,
+public keys, artifact descriptors and stored canonical document bytes.
 
 ## Run locally
 

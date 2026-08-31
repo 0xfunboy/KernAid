@@ -324,6 +324,37 @@ export class FleetControlPlane {
     }
 
     const policiesMatch = /^\/v1\/tenants\/([^/]+)\/policies$/.exec(path);
+    if (method === "GET" && policiesMatch !== null) {
+      const tenantId = pathIdentifier(policiesMatch[1], "tenantId");
+      this.#authorizeTenant(request, tenantId);
+      const items = this.#store.listPolicyJson(tenantId).map((stored) => {
+        const bundle = parseSignedPolicyBundle(JSON.parse(stored) as unknown);
+        return {
+          policyId: bundle.policyId,
+          revision: bundle.revision,
+          issuedAtUnix: bundle.issuedAtUnix,
+          notBeforeUnix: bundle.notBeforeUnix,
+          offlineAllowedUntilUnix: bundle.offlineAllowedUntilUnix,
+          expiresAtUnix: bundle.expiresAtUnix,
+          assignmentScope: "all" in bundle.assignments ? "all" : "devices",
+          assignedDeviceCount:
+            "all" in bundle.assignments
+              ? null
+              : bundle.assignments.deviceIds.length,
+          maxRisk: bundle.rules.maxRisk,
+          localApprovalFrom: bundle.rules.localApprovalFrom,
+          updateRing: bundle.rules.updateRing,
+        };
+      });
+      writeJson(response, 200, {
+        schema: "dev.kernaid.fleet.policy-status-list.v1",
+        tenantId,
+        trustAnchorConfigured:
+          this.#store.getPolicyTrustAnchor(tenantId) !== undefined,
+        items,
+      });
+      return;
+    }
     if (method === "POST" && policiesMatch !== null) {
       const tenantId = pathIdentifier(policiesMatch[1], "tenantId");
       this.#authorizeTenant(request, tenantId);
@@ -375,6 +406,50 @@ export class FleetControlPlane {
     const entitlementsMatch = /^\/v1\/tenants\/([^/]+)\/entitlements$/.exec(
       path,
     );
+    if (method === "GET" && entitlementsMatch !== null) {
+      const tenantId = pathIdentifier(entitlementsMatch[1], "tenantId");
+      this.#authorizeTenant(request, tenantId);
+      const items = this.#store.listEntitlementJson(tenantId).map((stored) => {
+        const envelope = parseEntitlementEnvelope(
+          JSON.parse(stored) as unknown,
+        );
+        return {
+          entitlementId: envelope.claims.entitlementId,
+          sequence: envelope.claims.sequence,
+          plan: envelope.claims.plan,
+          features: envelope.claims.features,
+          assignedDeviceCount: envelope.claims.deviceIds.length,
+          maxToolDevices: envelope.claims.limits.maxToolDevices,
+          maxManagedAssets: envelope.claims.limits.maxManagedAssets,
+          offlineLeaseUntilUnix: envelope.claims.offlineLeaseUntilUnix,
+          expiresAtUnix: envelope.claims.expiresAtUnix,
+          graceUntilUnix: envelope.claims.graceUntilUnix,
+        };
+      });
+      const storedRevocations =
+        this.#store.getEntitlementRevocationsJson(tenantId);
+      const revocationEnvelope =
+        storedRevocations === undefined
+          ? undefined
+          : parseEntitlementRevocationEnvelope(
+              JSON.parse(storedRevocations) as unknown,
+            );
+      writeJson(response, 200, {
+        schema: "dev.kernaid.fleet.entitlement-status-list.v1",
+        tenantId,
+        items,
+        revocations:
+          revocationEnvelope === undefined
+            ? null
+            : {
+                sequence: revocationEnvelope.claims.sequence,
+                issuedAtUnix: revocationEnvelope.claims.issuedAtUnix,
+                revokedCount:
+                  revocationEnvelope.claims.revokedEntitlementIds.length,
+              },
+      });
+      return;
+    }
     if (method === "POST" && entitlementsMatch !== null) {
       const tenantId = pathIdentifier(entitlementsMatch[1], "tenantId");
       this.#authorizeTenant(request, tenantId);
@@ -450,6 +525,35 @@ export class FleetControlPlane {
 
     const updateManifestsMatch =
       /^\/v1\/tenants\/([^/]+)\/update-manifests$/.exec(path);
+    if (method === "GET" && updateManifestsMatch !== null) {
+      const tenantId = pathIdentifier(updateManifestsMatch[1], "tenantId");
+      this.#authorizeTenant(request, tenantId);
+      const items = this.#store
+        .listAllUpdateManifestJson(tenantId)
+        .map((stored) => {
+          const manifest = parseSignedUpdateManifest(
+            JSON.parse(stored) as unknown,
+          );
+          return {
+            releaseId: manifest.releaseId,
+            releaseVersion: manifest.releaseVersion,
+            sequence: manifest.sequence,
+            platform: manifest.platform,
+            architecture: manifest.architecture,
+            releaseRing: manifest.releaseRing,
+            rolloutBasisPoints: manifest.rollout.basisPoints,
+            notBeforeUnix: manifest.notBeforeUnix,
+            expiresAtUnix: manifest.expiresAtUnix,
+            emergencyRollback: manifest.emergencyRollback,
+          };
+        });
+      writeJson(response, 200, {
+        schema: "dev.kernaid.fleet.update-status-list.v1",
+        tenantId,
+        items,
+      });
+      return;
+    }
     if (method === "POST" && updateManifestsMatch !== null) {
       const tenantId = pathIdentifier(updateManifestsMatch[1], "tenantId");
       this.#authorizeTenant(request, tenantId);

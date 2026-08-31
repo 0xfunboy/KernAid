@@ -1,0 +1,48 @@
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const directory = dirname(fileURLToPath(import.meta.url));
+const html = readFileSync(join(directory, "index.html"), "utf8");
+const script = readFileSync(join(directory, "app.js"), "utf8");
+const publishBoundary = readFileSync(
+  join(directory, "publish-document.js"),
+  "utf8",
+);
+
+assert.match(html, /data-view="governance"/);
+assert.match(html, /id="publish-dialog"/);
+assert.match(html, /id="publish-document"[^>]+maxlength="1048576"/s);
+assert.match(html, /No signing happens in this console/);
+assert.match(html, /Content-Security-Policy/);
+
+for (const route of [
+  "policies",
+  "entitlements",
+  "entitlement-revocations",
+  "update-manifests",
+]) {
+  assert.match(script, new RegExp(route));
+}
+for (const schema of [
+  "dev.kernaid.fleet.policy-bundle.v1",
+  "dev.kernaid.entitlement.v1",
+  "dev.kernaid.entitlement-revocations.v1",
+  "dev.kernaid.update.manifest.v1",
+]) {
+  assert.match(script, new RegExp(schema.replaceAll(".", "\\.")));
+}
+
+assert.match(script, /sessionStorage\.setItem\("kernaid\.fleet\.admin-token"/);
+assert.doesNotMatch(script, /localStorage/);
+assert.doesNotMatch(script, /innerHTML|insertAdjacentHTML|document\.write/);
+assert.doesNotMatch(script, /\/v1\/(?:commands|shell|execute|repairs)/i);
+assert.match(script, /maximumBytes: 1024 \* 1024/);
+assert.match(script, /maximumBytes: 64 \* 1024/);
+assert.match(
+  publishBoundary,
+  /Private keys, secrets and credentials cannot be published/,
+);
+
+process.stdout.write("Fleet Console enterprise invariants verified\n");

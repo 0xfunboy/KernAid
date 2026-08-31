@@ -22,6 +22,7 @@ COPY services/fleet-control-plane/tsconfig.json services/fleet-control-plane/tsc
 COPY services/fleet-control-plane/tsconfig.build.json services/fleet-control-plane/tsconfig.build.json
 COPY apps/fleet-console/index.html apps/fleet-console/index.html
 COPY apps/fleet-console/app.js apps/fleet-console/app.js
+COPY apps/fleet-console/publish-document.js apps/fleet-console/publish-document.js
 COPY apps/fleet-console/styles.css apps/fleet-console/styles.css
 
 RUN pnpm --filter @kernaid/fleet-control-plane build
@@ -63,6 +64,8 @@ COPY --from=builder /workspace/apps/fleet-console/index.html \
   /opt/kernaid/console/index.html
 COPY --from=builder /workspace/apps/fleet-console/app.js \
   /opt/kernaid/console/app.js
+COPY --from=builder /workspace/apps/fleet-console/publish-document.js \
+  /opt/kernaid/console/publish-document.js
 COPY --from=builder /workspace/apps/fleet-console/styles.css \
   /opt/kernaid/console/styles.css
 

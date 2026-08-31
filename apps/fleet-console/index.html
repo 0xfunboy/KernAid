@@ -34,8 +34,11 @@
           <button class="nav-item" data-view="audit">
             <span>04</span>Audit
           </button>
+          <button class="nav-item" data-view="governance">
+            <span>05</span>Governance
+          </button>
           <button class="nav-item" data-view="enrollment">
-            <span>05</span>Enrollment
+            <span>06</span>Enrollment
           </button>
         </nav>
         <div class="rail-foot">
@@ -180,6 +183,95 @@
               </ol>
             </aside>
 
+            <section
+              class="panel governance-panel"
+              data-panel="overview governance"
+            >
+              <div class="panel-head governance-head">
+                <div>
+                  <p class="eyebrow">Signed control documents</p>
+                  <h2>Fleet governance</h2>
+                </div>
+                <p class="boundary-note">
+                  Verify offline · publish here · enforce on device
+                </p>
+              </div>
+              <div
+                class="governance-error"
+                id="governance-error"
+                role="alert"
+                hidden
+              ></div>
+              <div class="governance-grid">
+                <article class="governance-card">
+                  <div class="governance-card-top">
+                    <span class="domain-icon policy">P</span>
+                    <span class="domain-state" id="policy-anchor-state"
+                      >Checking</span
+                    >
+                  </div>
+                  <p>Policy</p>
+                  <strong id="policy-count">—</strong>
+                  <small>Active signed policy streams</small>
+                  <ul class="document-list" id="policy-status-list"></ul>
+                  <button
+                    class="button secondary wide publish-trigger"
+                    data-publish-kind="policy"
+                    type="button"
+                  >
+                    Publish signed policy
+                  </button>
+                </article>
+
+                <article class="governance-card">
+                  <div class="governance-card-top">
+                    <span class="domain-icon entitlement">E</span>
+                    <span class="domain-state" id="entitlement-state"
+                      >Checking</span
+                    >
+                  </div>
+                  <p>Entitlements</p>
+                  <strong id="entitlement-count">—</strong>
+                  <small id="revocation-state">No revocation checkpoint</small>
+                  <ul class="document-list" id="entitlement-status-list"></ul>
+                  <div class="split-actions">
+                    <button
+                      class="button secondary publish-trigger"
+                      data-publish-kind="entitlement"
+                      type="button"
+                    >
+                      Publish license
+                    </button>
+                    <button
+                      class="button ghost publish-trigger"
+                      data-publish-kind="revocations"
+                      type="button"
+                    >
+                      Revocations
+                    </button>
+                  </div>
+                </article>
+
+                <article class="governance-card">
+                  <div class="governance-card-top">
+                    <span class="domain-icon update">U</span>
+                    <span class="domain-state trusted">Vendor verified</span>
+                  </div>
+                  <p>Updates</p>
+                  <strong id="update-count">—</strong>
+                  <small>Latest target and release-ring manifests</small>
+                  <ul class="document-list" id="update-status-list"></ul>
+                  <button
+                    class="button secondary wide publish-trigger"
+                    data-publish-kind="update"
+                    type="button"
+                  >
+                    Publish signed manifest
+                  </button>
+                </article>
+              </div>
+            </section>
+
             <section class="panel assets-panel" data-panel="overview assets">
               <div class="panel-head">
                 <div>
@@ -311,7 +403,14 @@
       aria-labelledby="enrollment-title"
     >
       <form method="dialog" id="enrollment-form">
-        <button class="modal-close" value="cancel" aria-label="Close">×</button>
+        <button
+          class="modal-close"
+          id="enrollment-close"
+          type="button"
+          aria-label="Close"
+        >
+          ×
+        </button>
         <p class="eyebrow">Device onboarding</p>
         <h2 id="enrollment-title">Create a one-time token</h2>
         <p class="modal-copy">
@@ -337,6 +436,54 @@
           <small id="token-expiry"></small>
         </section>
         <p class="form-error" id="enrollment-error" role="alert"></p>
+      </form>
+    </dialog>
+
+    <dialog
+      id="publish-dialog"
+      class="modal publish-modal"
+      aria-labelledby="publish-title"
+    >
+      <form method="dialog" id="publish-form">
+        <button
+          class="modal-close"
+          id="publish-close"
+          type="button"
+          aria-label="Close"
+        >
+          ×
+        </button>
+        <p class="eyebrow">Offline trust boundary</p>
+        <h2 id="publish-title">Publish signed document</h2>
+        <p class="modal-copy" id="publish-copy"></p>
+        <div class="trust-callout">
+          <strong>No signing happens in this console.</strong>
+          <span
+            >Paste only the final signed JSON. Private keys, seeds and provider
+            credentials must remain offline.</span
+          >
+        </div>
+        <label
+          >Signed JSON document
+          <textarea
+            id="publish-document"
+            name="document"
+            rows="13"
+            required
+            spellcheck="false"
+            autocomplete="off"
+            maxlength="1048576"
+            placeholder='{"schema":"dev.kernaid…","signature":"…"}'
+          ></textarea>
+        </label>
+        <div class="publish-meta">
+          <span id="publish-limit">Maximum 64 KiB</span>
+          <span>Canonicalized locally before upload</span>
+        </div>
+        <p class="form-error" id="publish-error" role="alert"></p>
+        <button class="button primary wide" type="submit">
+          Verify and publish
+        </button>
       </form>
     </dialog>
 
