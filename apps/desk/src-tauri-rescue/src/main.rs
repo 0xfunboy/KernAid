@@ -257,7 +257,13 @@ fn connect_native_prompt() -> Result<UnixStream, NativePromptTransportError> {
         getsockopt(&stream, sockopt::SockType).map_err(|_| NativePromptTransportError::Failed)?;
     let peer = getsockopt(&stream, sockopt::PeerCredentials)
         .map_err(|_| NativePromptTransportError::Failed)?;
-    if socket_type != SockType::Stream || peer.pid() <= 0 || peer.uid() != 0 || peer.gid() != 0 {
+    // This shell runs in a descendant PID namespace. The root systemd socket
+    // peer lives in an ancestor namespace, so Linux intentionally translates
+    // its PID to zero here. The pinned root-owned socket inode plus root peer
+    // credentials authenticate the server side; the broker independently
+    // pins and authenticates this client with SO_PEERPIDFD in the ancestor
+    // namespace before accepting either operation.
+    if socket_type != SockType::Stream || peer.uid() != 0 || peer.gid() != 0 {
         return Err(NativePromptTransportError::Failed);
     }
     Ok(stream)

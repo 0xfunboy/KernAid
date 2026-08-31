@@ -774,6 +774,8 @@ class RescueTauriBoundaryTests(unittest.TestCase):
             "bootstrap_native_prompt_transport(status, relay_native_prompt_status)",
             source,
         )
+        self.assertNotIn("peer.pid()", source)
+        self.assertIn("peer.uid() != 0 || peer.gid() != 0", source)
         self.assertLess(
             source.index("let status = attest_rescue_sandbox()"),
             source.index('eprintln!("{status}")'),
