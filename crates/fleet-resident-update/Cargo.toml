@@ -1,0 +1,49 @@
+[package]
+name = "kernaid-fleet-resident-update"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+linux-resident = [
+  "dep:fs2",
+  "dep:kernaid-fleet-policy",
+  "dep:kernaid-fleet-runtime",
+  "dep:kernaid-native-secrets",
+  "dep:rand_core",
+  "dep:reqwest",
+  "dep:rustix",
+  "dep:rustls",
+]
+
+[[bin]]
+name = "kernaid-fleet-resident-update"
+path = "src/main.rs"
+required-features = ["linux-resident"]
+
+[dependencies]
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+ed25519-dalek = "2.2"
+fs2 = { version = "0.4.3", optional = true }
+kernaid-device-identity = { path = "../device-identity" }
+kernaid-fleet-client = { path = "../fleet-client" }
+kernaid-fleet-policy = { path = "../fleet-policy", optional = true }
+kernaid-fleet-runtime = { path = "../fleet-runtime", optional = true }
+kernaid-native-secrets = { path = "../native-secrets", optional = true }
+kernaid-update-client = { path = "../update-client" }
+rand_core = { version = "0.6", features = ["getrandom"], optional = true }
+reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "rustls-no-provider"], optional = true }
+rustix = { version = "1.1.4", features = ["fs", "process"], optional = true }
+rustls = { version = "0.23.43", default-features = false, features = ["ring", "std"], optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+url = "2"
+zeroize = "1.8"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

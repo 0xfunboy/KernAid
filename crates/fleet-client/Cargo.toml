@@ -8,6 +8,7 @@ base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 ed25519-dalek = "2.2"
 kernaid-device-identity = { path = "../device-identity" }
+kernaid-update-client = { path = "../update-client" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

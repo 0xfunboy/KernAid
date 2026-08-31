@@ -1,0 +1,17 @@
+{
+  "schema": "dev.kernaid.fleet.resident-update-config.v1",
+  "endpoint": "https://fleet.example.invalid",
+  "tenantId": "tenant-example",
+  "stateDirectory": "/var/lib/kernaid/resident-update",
+  "runtimeStateFile": "/var/lib/kernaid/fleet/runtime-v1.sqlite3",
+  "updateAnchorFile": "/etc/kernaid/trust/update.public",
+  "entitlementAnchorFile": "/etc/kernaid/trust/entitlement.public",
+  "policyAnchorFile": "/etc/kernaid/trust/policy.public",
+  "inactiveTargetFile": "/var/lib/kernaid/slots/slot-b.img",
+  "activeSlot": "A",
+  "updateRing": "stable",
+  "intervalSeconds": 300,
+  "connectTimeoutSeconds": 10,
+  "requestTimeoutSeconds": 1800
+}
+
