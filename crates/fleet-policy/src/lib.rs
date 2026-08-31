@@ -364,6 +364,33 @@ impl VerifiedPolicyBundle {
         &self.bundle.rules
     }
 
+    /// Whether this authenticated policy is explicitly assigned to the
+    /// supplied device. This exposes no signing material and is useful to
+    /// bind a durable device-side cache before retaining the bundle.
+    #[must_use]
+    pub fn applies_to_device(&self, device_id: &str) -> bool {
+        validate_device_id(device_id).is_ok() && self.bundle.assignments.applies_to(device_id)
+    }
+
+    /// Whether this authenticated policy is currently usable for a new
+    /// repair on the supplied device and transport. Diagnostics and an
+    /// already-started rollback remain governed by [`Self::evaluate`].
+    #[must_use]
+    pub fn is_applicable_to(
+        &self,
+        device_id: &str,
+        now_unix: u64,
+        transport: TransportState,
+    ) -> bool {
+        now_unix != 0
+            && now_unix <= MAX_SAFE_JSON_INTEGER
+            && self.applies_to_device(device_id)
+            && now_unix >= self.bundle.not_before_unix
+            && now_unix < self.bundle.expires_at_unix
+            && (transport == TransportState::Online
+                || now_unix <= self.bundle.offline_allowed_until_unix)
+    }
+
     /// Evaluate an action by intersecting Fleet restrictions with local Core
     /// and broker facts. This method grants no execution capability.
     #[must_use]

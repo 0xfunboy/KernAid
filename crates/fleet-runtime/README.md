@@ -49,9 +49,34 @@ bad signature or checkpoint mismatch leaves diagnostics, report export and
 rollback available while every paid capability is false. In particular, an
 entitlement failure can never prevent an already-started rollback.
 
-Database schema v3 adds the audit journal, per-session checkpoint and delivery
-state without changing or discarding the v2 entitlement state, v1 identity or
-inventory outbox. Opening a protected v1 or v2 database migrates it
+## Signed policy cache
+
+`open_with_policy_anchor()` accepts the externally pinned tenant Ed25519
+public key and re-verifies every retained policy before returning. The anchor
+stays in process memory. `open_with_trust_anchors()` configures both policy and
+entitlement verification without mixing their trust domains.
+
+`apply_policy()` accepts only canonical `SignedPolicyBundle` bytes for the
+runtime tenant and enrolled device. Each `policyId` has an independent
+monotonic checkpoint; document and checkpoint advance in one immediate SQLite
+transaction. Exact replay is idempotent, while rollback, same-revision
+conflicts, cross-tenant documents and policies not assigned to this device are
+rejected. There is intentionally no replace-all or delete-on-pull API: a policy
+missing from a partial Fleet response stays cached until its signed expiry or
+offline window makes it inapplicable, or until a future signed revocation
+contract is implemented.
+
+`load_policies()` rechecks canonical encoding, signature, binding, digest and
+checkpoint for the complete cache and fails the whole load if any row is
+invalid. `applicable_policies(now, transport)` returns the verified policies
+currently applicable to new repair. Core/Broker must intersect every returned
+policy with every local restriction; no cached policy independently grants
+execution authority. Diagnostics and an already-started rollback continue to
+use the safety behavior defined by `kernaid-fleet-policy`.
+
+Database schema v4 adds the signed per-policy document/checkpoint cache without
+changing or discarding the v3 audit journal, v2 entitlement state, v1 identity
+or inventory outbox. Opening a protected v1, v2 or v3 database migrates it
 transactionally before use.
 
 The database contains only signed, privacy-minimized Fleet envelopes and audit
