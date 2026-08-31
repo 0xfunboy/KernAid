@@ -17,6 +17,8 @@ const PUBLIC_KEY_BYTES: usize = 32;
 const SIGNATURE_BYTES: usize = 64;
 const HASH_BYTES: usize = 32;
 const MAX_MEDIA_TYPE_BYTES: usize = 255;
+const MAX_PROTOCOL_DOMAIN_BYTES: usize = 255;
+const MAX_PROTOCOL_PAYLOAD_BYTES: usize = 1024 * 1024;
 
 pub const SIGNED_REPORT_ENVELOPE_SCHEMA: &str =
     "https://schemas.kernaid.dev/v1/signed-report-envelope.json";
@@ -499,6 +501,8 @@ pub enum IdentityError {
     InvalidPayloadMediaType,
     PayloadTooLarge,
     PayloadHashMismatch,
+    InvalidProtocolDomain,
+    ProtocolPayloadTooLarge,
 }
 
 impl DeviceIdentity {
@@ -530,6 +534,40 @@ impl DeviceIdentity {
 
     pub fn device_id(&self) -> String {
         device_id_for_public_key(&self.public_key())
+    }
+
+    /// Sign an application protocol payload without exposing or copying the
+    /// device seed.
+    ///
+    /// `domain` must be a short, non-empty, NUL-terminated protocol constant.
+    /// The Ed25519 message is exactly `domain || payload`; callers are
+    /// responsible for supplying deterministic payload bytes. Keeping this
+    /// operation on [`DeviceIdentity`] lets other KernAid protocols reuse the
+    /// enrolled device key while its seed remains in the existing keychain or
+    /// Rescue vault.
+    pub fn sign_domain_separated_payload(
+        &self,
+        domain: &[u8],
+        payload: &[u8],
+    ) -> Result<[u8; SIGNATURE_BYTES], IdentityError> {
+        if domain.is_empty()
+            || domain.len() > MAX_PROTOCOL_DOMAIN_BYTES
+            || domain.last() != Some(&0)
+        {
+            return Err(IdentityError::InvalidProtocolDomain);
+        }
+        if payload.len() > MAX_PROTOCOL_PAYLOAD_BYTES {
+            return Err(IdentityError::ProtocolPayloadTooLarge);
+        }
+
+        let capacity = domain
+            .len()
+            .checked_add(payload.len())
+            .ok_or(IdentityError::ProtocolPayloadTooLarge)?;
+        let mut message = Zeroizing::new(Vec::with_capacity(capacity));
+        message.extend_from_slice(domain);
+        message.extend_from_slice(payload);
+        Ok(self.signing_key.sign(message.as_slice()).to_bytes())
     }
 
     pub fn sign_report(&self, payload: &[u8]) -> SignedReport {
@@ -1538,5 +1576,30 @@ mod tests {
         assert!(declaration.ends_with("#[serde(rename_all = \"camelCase\")]\n"));
         assert!(source.contains("let raw = <&RawValue>::deserialize(deserializer)?;"));
         assert!(source.contains("SignedReportEnvelopeParser::parse(raw.get())"));
+    }
+
+    #[test]
+    fn protocol_signature_is_exact_domain_concatenated_payload() {
+        let identity = DeviceIdentity::from_seed(&[0x81; 32]).expect("fixed protocol identity");
+        let domain = b"kernaid:test:protocol:v1\0";
+        let payload = br#"{"a":1,"z":true}"#;
+        let signature = identity
+            .sign_domain_separated_payload(domain, payload)
+            .expect("sign protocol payload");
+        let mut expected_message = domain.to_vec();
+        expected_message.extend_from_slice(payload);
+        VerifyingKey::from_bytes(&identity.public_key())
+            .expect("valid public key")
+            .verify_strict(&expected_message, &Signature::from_bytes(&signature))
+            .expect("verify exact protocol message");
+
+        assert_eq!(
+            identity.sign_domain_separated_payload(b"missing-terminator", payload),
+            Err(IdentityError::InvalidProtocolDomain)
+        );
+        assert_eq!(
+            identity.sign_domain_separated_payload(domain, &[0_u8; MAX_PROTOCOL_PAYLOAD_BYTES + 1]),
+            Err(IdentityError::ProtocolPayloadTooLarge)
+        );
     }
 }
