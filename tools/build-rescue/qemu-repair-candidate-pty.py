@@ -1447,11 +1447,16 @@ def main(arguments: Sequence[str]) -> int:
         for digest in (parsed.before_sha256, parsed.after_sha256):
             if re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
                 raise LIFECYCLE.ClosedFailure("arguments", "digest-invalid")
-        timeout_maximum = 1800 if parsed.scenario in {
+        if parsed.scenario == "provision-base":
+            timeout_maximum = 2100
+        elif parsed.scenario in {
             "rollback",
             "interrupt-reconcile",
             "backup-tamper",
-        } else 1200
+        }:
+            timeout_maximum = 1800
+        else:
+            timeout_maximum = 1200
         if (
             parsed.before_sha256 == parsed.after_sha256
             or not 300 <= parsed.timeout <= timeout_maximum

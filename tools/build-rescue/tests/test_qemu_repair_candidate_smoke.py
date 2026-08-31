@@ -466,6 +466,7 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
         )
         self.assertIn("uefi qualification-batch", workflow)
         source = SCRIPT.read_text(encoding="utf-8")
+        controller_source = CONTROLLER.read_text(encoding="utf-8")
         self.assertIn('firmware="${1:-bios}"', source)
         self.assertIn('scenario="${2:-apply}"', source)
         for scenario in (
@@ -484,6 +485,8 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
         self.assertIn("controller_timeout=1800", source)
         self.assertIn("controller_timeout=1200", source)
         self.assertIn("controller_timeout=2100", source)
+        self.assertIn('parsed.scenario == "provision-base"', controller_source)
+        self.assertIn("timeout_maximum = 2100", controller_source)
         self.assertIn('readonly qemu_smp="${KERNAID_QEMU_SMP:-2}"', source)
         self.assertIn('1|2|4|8)', source)
         self.assertIn('-smp "$qemu_smp"', source)
