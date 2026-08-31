@@ -57,7 +57,7 @@
           <a class="button button--signal" href="#platform">Esplora la piattaforma <span aria-hidden="true">↓</span></a>
           <a class="button button--quiet" href="#trust">Valuta il trust model</a>
         </div>
-        <p class="hero-note">Desk e Rescue sono disponibili come engineering preview. Fleet è operativo come control plane interno; integrazione dispositivo e riparazioni di produzione restano in qualifica.</p>
+        <p class="hero-note">Desk e Rescue sono disponibili come engineering preview. Fleet v8 è operativo internamente con RBAC, policy, licensing, audit e work order tipizzati; i servizi Resident e le riparazioni restano off-default e in qualifica.</p>
       </div>
 
       <div class="ops-console" aria-hidden="true">
@@ -301,7 +301,7 @@
           <div class="matrix-head"><span>MSP OPERATIONS</span><i>03</i></div>
           <h3>Ripetibilità tra tecnici e tenant</h3>
           <p>Il control plane Fleet raccoglie inventario firmato e privacy-bounded senza trasformarsi in una shell remota: l’autorità di intervento resta sul dispositivo.</p>
-          <ul><li>Tenant e identità dispositivo separati <em>Preview</em></li><li>Policy ed entitlement firmati <em>Preview</em></li><li>Console operativa interna <em>Live</em></li></ul>
+          <ul><li>Tenant, RBAC e identità dispositivo <em>Live</em></li><li>Policy, entitlement e receipt firmati <em>Live</em></li><li>Work order tipizzati, senza shell remota <em>Live</em></li></ul>
         </article>
       </div>
     </section>
@@ -395,15 +395,15 @@
       <div class="readiness-board">
         <article class="readiness-card readiness-card--ready">
           <div class="readiness-head"><span><i aria-hidden="true"></i> AVAILABLE NOW</span><strong>ENGINEERING PREVIEW</strong></div>
-          <ul><li>Desk build target per Windows, Linux e macOS</li><li>Rescue amd64 qualificata virtualmente BIOS/UEFI</li><li>Diagnosi deterministica e provider opzionale</li><li>Fleet interno: identità, inventario firmato e console tenant</li></ul>
+          <ul><li>Desk build target per Windows, Linux e macOS</li><li>Rescue amd64 qualificata virtualmente BIOS/UEFI</li><li>Diagnosi deterministica e provider opzionale</li><li>Fleet v8 interno: inventory, governance, work order e console tenant</li></ul>
         </article>
         <article class="readiness-card readiness-card--active">
           <div class="readiness-head"><span><i aria-hidden="true"></i> ACTIVE GATES</span><strong>QUALIFICATION</strong></div>
-          <ul><li>USB e matrice hardware fisica</li><li>Secure Boot e installer firmati</li><li>Account reale e TLS live in Rescue</li><li>Prima riparazione Linux reale e reversibile</li></ul>
+          <ul><li>USB e matrice hardware fisica</li><li>Secure Boot e installer firmati</li><li>Account reale e TLS live in Rescue</li><li>Qualifica delle candidate fstab, crypttab ed ext4</li></ul>
         </article>
         <article class="readiness-card readiness-card--planned">
           <div class="readiness-head"><span><i aria-hidden="true"></i> NEXT SYSTEM</span><strong>ROADMAP</strong></div>
-          <ul><li>Repair pack firmati e aggiornamenti A/B</li><li>Windows offline e WinPE Companion</li><li>Profondità nativa macOS</li><li>Distribuzione policy e runtime Fleet sui device</li></ul>
+          <ul><li>Repair pack firmati e aggiornamenti A/B</li><li>Windows offline e WinPE Companion</li><li>Profondità nativa macOS</li><li>Packaging del runtime Fleet Resident sui device</li></ul>
         </article>
       </div>
 
