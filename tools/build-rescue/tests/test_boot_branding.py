@@ -106,8 +106,11 @@ class RescueBootBrandingTests(unittest.TestCase):
         )
         self.assertIsNotNone(bootappend)
         tokens = bootappend.group(1).split() if bootappend else []
-        self.assertEqual(tokens.count("splash"), 1)
-        self.assertEqual(tokens.count("plymouth.ignore-serial-consoles"), 1)
+        # The bootloader and Desk shell own the two branded visual stages.
+        # Starting Plymouth in the initramfs would retain tty1 ahead of the
+        # mandatory first-boot Vault prompt.
+        self.assertNotIn("splash", tokens)
+        self.assertNotIn("plymouth.ignore-serial-consoles", tokens)
 
         unit = FIRSTBOOT.read_text(encoding="utf-8")
         self.assertNotIn("ExecStartPre=", unit)
