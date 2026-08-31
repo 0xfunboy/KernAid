@@ -1,0 +1,10 @@
+[Unit]
+Description=Watch for a KernAid staged A/B activation candidate
+Documentation=https://github.com/0xfunboy/KernAid/tree/main/deploy/fleet-resident-update
+
+[Path]
+PathExists=/var/lib/kernaid/fleet-resident-update/boot-activation-candidate.cjson
+Unit=kernaid-fleet-resident-activator.service
+
+[Install]
+WantedBy=multi-user.target
