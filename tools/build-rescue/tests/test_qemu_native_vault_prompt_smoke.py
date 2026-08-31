@@ -267,6 +267,7 @@ label live-amd64-failsafe
         }
         for stage, source in proofs.items():
             with self.subTest(stage=stage):
+                compile(source, f"<{stage}-proof>", "exec")
                 self.assertLess(len(source), 16 * 1024)
                 self.assertEqual(source.count(b"result=true"), 1)
                 self.assertIn(

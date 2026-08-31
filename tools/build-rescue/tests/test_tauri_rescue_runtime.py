@@ -1510,16 +1510,15 @@ class TauriShippingAbiTests(unittest.TestCase):
             (
                 "/usr/bin/systemctl",
                 "start",
-                "--no-block",
                 native_prompt.PROMPT_UNIT,
-            )
+            ),
+            timeout=native_prompt.START_TIMEOUT_SECONDS,
         )
         self.assertEqual(switch.call_args_list, [mock.call(8), mock.call(8)])
         monitor.start.assert_called_once_with()
 
-    def test_native_prompt_open_waits_for_notify_ready_before_switching_vt(self) -> None:
+    def test_native_prompt_open_rejects_a_non_ready_completed_start(self) -> None:
         controller = native_prompt.PromptController()
-        monitor = mock.Mock()
         with (
             mock.patch.object(native_prompt, "_prompt_backend_ready"),
             mock.patch.object(native_prompt, "_active_vt", return_value=7),
@@ -1528,47 +1527,16 @@ class TauriShippingAbiTests(unittest.TestCase):
             mock.patch.object(
                 native_prompt,
                 "_unit_state",
-                side_effect=(
-                    ("activating", "start", "success"),
-                    ("active", "running", "success"),
-                ),
-            ) as unit_state,
+                return_value=("activating", "start", "success"),
+            ),
+            mock.patch.object(native_prompt, "_stop_prompt_unit") as stop,
+            mock.patch.object(native_prompt, "_return_to_vt") as return_to_vt,
             mock.patch.object(native_prompt, "_switch_vt") as switch,
-            mock.patch.object(native_prompt.time, "sleep") as sleep,
-            mock.patch.object(native_prompt.threading, "Thread", return_value=monitor),
         ):
-            self.assertEqual(controller.open_or_focus(), "opened")
-        self.assertEqual(unit_state.call_count, 2)
-        sleep.assert_called_once_with(0.05)
-        switch.assert_called_once_with(8)
-        monitor.start.assert_called_once_with()
-
-    def test_native_prompt_open_waits_for_no_block_job_to_become_visible(self) -> None:
-        controller = native_prompt.PromptController()
-        monitor = mock.Mock()
-        with (
-            mock.patch.object(native_prompt, "_prompt_backend_ready"),
-            mock.patch.object(native_prompt, "_active_vt", return_value=7),
-            mock.patch.object(native_prompt, "_write_return_vt"),
-            mock.patch.object(native_prompt, "_tool", return_value=(0, b"")),
-            mock.patch.object(
-                native_prompt,
-                "_unit_state",
-                side_effect=(
-                    ("inactive", "dead", "success"),
-                    ("activating", "start", "success"),
-                    ("active", "running", "success"),
-                ),
-            ) as unit_state,
-            mock.patch.object(native_prompt, "_switch_vt") as switch,
-            mock.patch.object(native_prompt.time, "sleep") as sleep,
-            mock.patch.object(native_prompt.threading, "Thread", return_value=monitor),
-        ):
-            self.assertEqual(controller.open_or_focus(), "opened")
-        self.assertEqual(unit_state.call_count, 3)
-        self.assertEqual(sleep.call_args_list, [mock.call(0.05), mock.call(0.05)])
-        switch.assert_called_once_with(8)
-        monitor.start.assert_called_once_with()
+            self.assertEqual(controller.open_or_focus(), "failed")
+        stop.assert_called_once_with()
+        return_to_vt.assert_called_once_with(7)
+        switch.assert_not_called()
 
     def test_native_prompt_units_keep_secrets_on_the_fixed_uid1000_tty(self) -> None:
         units = REPO_DIR / "rescue/live-build/config/includes.chroot/etc/systemd/system"
@@ -1607,6 +1575,7 @@ class TauriShippingAbiTests(unittest.TestCase):
             / "rescue/live-build/config/includes.chroot/usr/lib/kernaid"
             / "rescue_native_prompt_broker.py"
         ).read_text()
+        self.assertNotIn("--no-block", broker_source)
         self.assertIn("SO_PEERPIDFD = 77", broker_source)
         self.assertIn("getsockopt(socket.SOL_SOCKET, SO_PEERPIDFD)", broker_source)
         self.assertNotIn("pidfd_open", broker_source)
