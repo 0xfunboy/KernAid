@@ -503,6 +503,10 @@ class RepairTargetHandoffTests(unittest.TestCase):
             contract["rollbackCapability"],
             handoff.CRYPTTAB_VAULT_ROLLBACK_WRITE_CAPABILITY,
         )
+        self.assertEqual(
+            contract["rollbackAction"],
+            "linux.crypttab.disable-missing-source.v1",
+        )
         self.assertEqual(contract["safeModes"], {0o600, 0o644})
         for resource, action in (
             (handoff.CRYPTTAB_REPAIR_RESOURCE, handoff.REPAIR_ACTION),

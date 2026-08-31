@@ -31,7 +31,7 @@ pub const CRYPTTAB_REPAIR_EXECUTION_RESOURCE_ID: &str = "rescue:selected-linux-r
 /// Root-helper capability for one consumed crypttab write lease.
 pub const CRYPTTAB_REPAIR_WRITE_LEASE_CAPABILITY: &str = "crypttab-direct-leaf-rw-v1";
 /// Closed post-commit rollback action for crypttab.
-pub const CRYPTTAB_REPAIR_ROLLBACK_ACTION_ID: &str = "linux.crypttab.restore";
+pub const CRYPTTAB_REPAIR_ROLLBACK_ACTION_ID: &str = "linux.crypttab.disable-missing-source.v1";
 /// Root-helper capability for one consumed crypttab rollback lease.
 pub const CRYPTTAB_REPAIR_ROLLBACK_WRITE_LEASE_CAPABILITY: &str =
     "crypttab-rollback-direct-leaf-rw-v1";
@@ -2464,11 +2464,48 @@ mod tests {
             binding,
         )
         .expect("crypttab durable status");
-        let pending =
-            RepairTransactionStatusPayload::pending(durable).expect("pending crypttab transaction");
+        let pending = RepairTransactionStatusPayload::pending(durable.clone())
+            .expect("pending crypttab transaction");
         let lease =
             RepairWriteLeasePayload::consumed(pending, hash('e')).expect("crypttab write lease");
         assert_eq!(lease.capability(), CRYPTTAB_REPAIR_WRITE_LEASE_CAPABILITY);
+
+        let intent = durable.execution_intent().expect("crypttab intent");
+        let resolution = RepairTransactionResolution::new(
+            RepairTransactionResolutionOutcome::CommittedAfter,
+            intent.after_sha256().clone(),
+            intent.before_metadata().canonical_sha256(),
+            true,
+            intent,
+        )
+        .expect("crypttab committed resolution");
+        let source = RepairTransactionStatusPayload::resolved(durable, resolution)
+            .expect("committed crypttab source");
+        let rollback_binding = RepairRollbackBindingV1::new(
+            &source,
+            "P-crypttab-rollback",
+            hash('8'),
+            "A-crypttab-rollback",
+            hash('9'),
+            2,
+        )
+        .expect("crypttab rollback binding");
+        assert_eq!(
+            rollback_binding.action_id(),
+            CRYPTTAB_REPAIR_ROLLBACK_ACTION_ID
+        );
+        let rollback = RepairRollbackTransactionStatusPayload::pending(
+            RepairRollbackId::parse("RB-fedcba9876543210fedcba9876543210").expect("rollback ID"),
+            source,
+            rollback_binding,
+        )
+        .expect("crypttab rollback transaction");
+        let rollback_lease = RepairRollbackWriteLeasePayload::consumed(rollback, hash('f'))
+            .expect("crypttab rollback lease");
+        assert_eq!(
+            rollback_lease.capability(),
+            CRYPTTAB_REPAIR_ROLLBACK_WRITE_LEASE_CAPABILITY
+        );
     }
 
     #[test]

@@ -31,6 +31,22 @@ jobs:
             libdbus-1-dev libwebkit2gtk-4.1-dev \
             libayatana-appindicator3-dev librsvg2-dev procps
 
+      - name: Validate crypttab rollback contracts
+        run: |
+          pnpm --filter @kernaid/desk exec tsx --test test/rescue-repair.test.ts
+          cargo test --locked -p kernaid-policy \
+            --features rescue-crypttab-production-candidate \
+            rollback_is_a_distinct_non_recursive_closed_plan
+          cargo test --locked -p kernaid-core \
+            --features rescue-fstab-production-candidate,rescue-crypttab-production-candidate \
+            crypttab_rollback_plan_and_approval_cannot_cross_bind_fstab
+          cargo test --locked -p kernaid-protocol \
+            --features experimental-repair-store \
+            crypttab_intent_lease_and_metadata_are_resource_distinct
+          cargo test --locked -p kernaid-broker \
+            --features rescue-fstab-production-candidate,rescue-crypttab-production-candidate \
+            crypttab_rollback_is_resource_bound_and_uses_a_fresh_typed_approval
+
       - name: Harden OVMF firmware ancestry
         run: |
           sudo /usr/bin/python3 -I -B - <<'PY'

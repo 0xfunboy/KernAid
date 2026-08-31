@@ -63,24 +63,39 @@ The local repair service accepts only these additional operations:
 - `repair.crypttab.prepare`
 - `repair.crypttab.approve`
 - `repair.crypttab.cancel`
+- `repair.crypttab.rollback.status`
+- `repair.crypttab.rollback.prepare`
+- `repair.crypttab.rollback.approve`
+- `repair.crypttab.rollback.cancel`
 
 The Desk repair panel can prepare either candidate and renders the exact
 action/resource/confirmation returned by the local service. It never receives
 target paths, configuration bytes, Vault authority, or a generic execution
 primitive.
 
-## Deliberate remaining gate
+## Post-commit rollback
 
-Automatic restore during a failed apply and startup reconciliation are
-implemented. A separate user-initiated **post-commit crypttab rollback** is
-not exposed through Core, the local service, or Desk in this version. The
-protocol/Vault/root leaf already keep crypttab rollback authority distinct, but
-shipping that user flow requires its own Core admission, source-receipt API,
-UI confirmation, and exact-image rollback qualification. Desk therefore does
-not offer the existing fstab rollback action for a crypttab receipt.
+A committed crypttab receipt may start the separate off-default action
+`linux.crypttab.disable-missing-source.v1`. The broker rereads the exact source
+transaction and byte-exact backup from the authenticated Vault, proves that
+the selected target is still in the committed `After` state, and stages a new
+resource-bound Core plan. It requires a fresh, monotonically next, single-use
+approval with the exact phrase `RIPRISTINA CRYPTTAB ORIGINALE`; neither an
+fstab operation nor the source repair approval can authorize it.
+
+Only after the approval is durably bound into a child rollback transaction may
+the fixed root helper consume the crypttab rollback lease. Restore uses the
+shared atomic replacement/fsync/byte-and-metadata verification path. A daemon
+restart reconciles the durable child from exact `Before`, `After`, or third
+state and never overwrites a third state. Desk sends only the source receipt
+selector and exact prepared bindings; it sends no path, bytes, command, or
+generic action.
+
+## Remaining promotion gate
 
 Before promotion, one exact image still must pass crypttab apply, automatic
-restore, daemon interruption/restart reconciliation, cross-contract rejection,
-BIOS/UEFI, and physical USB/power-loss qualification with the Vault on a
-different physical device. Until that evidence exists, the action remains a
-private off-default candidate.
+restore, manual post-commit rollback, daemon interruption/restart
+reconciliation, cross-contract rejection, BIOS/UEFI, and physical
+USB/power-loss qualification with the Vault on a different physical device.
+Until that evidence exists, both crypttab actions remain private off-default
+candidates.

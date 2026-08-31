@@ -23,8 +23,10 @@ MAX_SQUASHFS_LIST_BYTES = 32 * 1024 * 1024
 DESK_REPAIR_TOKENS = (
     b"/api/rescue/repair",
     b"repair.fstab.rollback.prepare",
+    b"repair.crypttab.rollback.prepare",
     b"DISABILITA VOCE FSTAB",
     b"RIPRISTINA FSTAB ORIGINALE",
+    b"RIPRISTINA CRYPTTAB ORIGINALE",
 )
 DESK_DIAGNOSIS_TOKENS = (
     b"/api/rescue/inspect-installed-target",
@@ -35,6 +37,7 @@ SERVER_REPAIR_TOKENS = (
     b"kernaid.dev/rescue-repair-service/v1alpha1",
     b"kernaid.dev/rescue-repair-service/v1alpha2",
     b"repair.fstab.rollback.prepare",
+    b"repair.crypttab.rollback.prepare",
 )
 SERVER_DIAGNOSIS_TOKENS = (
     b"/api/inventory",
@@ -60,10 +63,15 @@ HANDOFF_WRITE_TOKENS = (
     b"repair.rollback.write-lease.consume",
     b"linux-ext4-direct-leaf-readwrite-mount-v1",
     b"fstab-rollback-direct-leaf-rw-v1",
+    b"crypttab-direct-leaf-rw-v1",
+    b"crypttab-rollback-direct-leaf-rw-v1",
     b"selected-target-ext4-mount-readwrite-detached",
     b"linux.fstab.disable-missing-uuid.v1",
     b"linux.fstab.restore",
+    b"linux.crypttab.disable-missing-uuid.v1",
+    b"linux.crypttab.disable-missing-source.v1",
     b"rescue:selected-linux-root:etc/fstab",
+    b"rescue:selected-linux-root:etc/crypttab",
 )
 VAULT_WRITE_TOKENS = (
     b".kernaid-repair-store-v1",

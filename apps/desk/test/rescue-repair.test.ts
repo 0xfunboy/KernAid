@@ -4,6 +4,8 @@ import {
   RESCUE_CRYPTTAB_ACTION_ID,
   RESCUE_CRYPTTAB_CONFIRMATION,
   RESCUE_CRYPTTAB_RESOURCE_ID,
+  RESCUE_CRYPTTAB_ROLLBACK_ACTION_ID,
+  RESCUE_CRYPTTAB_ROLLBACK_CONFIRMATION,
   RESCUE_FSTAB_CONFIRMATION,
   RESCUE_FSTAB_RESOURCE_ID,
   RESCUE_FSTAB_ROLLBACK_CONFIRMATION,
@@ -161,7 +163,7 @@ test("crypttab prepared contract is exact and dispatches only crypttab operation
   );
 });
 
-test("post-commit rollback requires positive fstab candidate provenance", () => {
+test("post-commit rollback requires positive candidate provenance", () => {
   const committed: RescueRepairSnapshot = {
     requestId: REQUEST,
     operation: "repair.status",
@@ -176,7 +178,10 @@ test("post-commit rollback requires positive fstab candidate provenance", () => 
       prepareFailureStage: null,
     },
   };
-  assert.equal(rollbackSourceReceipt(committed, "crypttab"), undefined);
+  assert.deepEqual(rollbackSourceReceipt(committed, "crypttab"), {
+    reservationId: `B-${"9".repeat(32)}`,
+    transactionBindingSha256: `sha256:${"8".repeat(64)}`,
+  });
   assert.equal(rollbackSourceReceipt(committed, undefined), undefined);
   assert.deepEqual(rollbackSourceReceipt(committed, "fstab"), {
     reservationId: `B-${"9".repeat(32)}`,
@@ -299,6 +304,100 @@ test("rollback v2 is exact, source-bound, and rejects cross-version aliases", as
     RESCUE_FSTAB_ROLLBACK_CONFIRMATION,
   );
   assert.doesNotMatch(JSON.stringify(bodies), /path|device|bytes|authority/iu);
+});
+
+test("crypttab rollback dispatch is exact and cannot fall back to fstab", async () => {
+  const operation = "repair.crypttab.rollback.prepare" as const;
+  const parsed = parseRescueRepairResponse(
+    crypttabRollbackPreparedEnvelope(REQUEST, operation),
+    REQUEST,
+    operation,
+  );
+  const detail = preparedRollbackDetail(parsed);
+  assert.ok(detail);
+  assert.equal(detail.kind, "crypttab-rollback-prepared");
+  assert.equal(detail.resourceId, RESCUE_CRYPTTAB_RESOURCE_ID);
+  assert.equal(detail.actionId, RESCUE_CRYPTTAB_ROLLBACK_ACTION_ID);
+  assert.equal(
+    detail.confirmationRequired,
+    RESCUE_CRYPTTAB_ROLLBACK_CONFIRMATION,
+  );
+
+  const crossed = crypttabRollbackPreparedEnvelope(REQUEST, operation);
+  (crossed.detail as Record<string, unknown>).actionId = "linux.fstab.restore";
+  assert.throws(
+    () => parseRescueRepairResponse(crossed, REQUEST, operation),
+    /non valido/u,
+  );
+
+  const bodies: Array<Record<string, unknown>> = [];
+  const requestIds = [REQUEST, NEXT_REQUEST, THIRD_REQUEST];
+  const client = new RescueRepairClient(
+    async (_input, init) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      bodies.push(body);
+      if (body.operation === operation)
+        return frame(
+          crypttabRollbackPreparedEnvelope(String(body.requestId), operation),
+        );
+      return frame({
+        apiVersion: RESCUE_ROLLBACK_API_VERSION,
+        requestId: body.requestId,
+        operation: body.operation,
+        outcome: "ok",
+        stateVersion: 5,
+        state:
+          body.operation === "repair.crypttab.rollback.cancel"
+            ? "succeeded"
+            : "restored",
+        detail:
+          body.operation === "repair.crypttab.rollback.cancel"
+            ? {
+                kind: "terminal",
+                terminalOutcome: "committed",
+                reservationId: `B-${"9".repeat(32)}`,
+                transactionBindingSha256: `sha256:${"8".repeat(64)}`,
+                rebootRequired: false,
+                prepareFailureStage: null,
+              }
+            : {
+                kind: "terminal",
+                terminalOutcome: "rolled-back-original",
+                reservationId: `B-${"9".repeat(32)}`,
+                transactionBindingSha256: `sha256:${"8".repeat(64)}`,
+                rebootRequired: false,
+                prepareFailureStage: null,
+              },
+      });
+    },
+    () => requestIds.shift()!,
+    () => `A-${"e".repeat(32)}`,
+  );
+  const source = {
+    reservationId: `B-${"9".repeat(32)}`,
+    transactionBindingSha256: `sha256:${"8".repeat(64)}`,
+  } as const;
+  const staged = await client.prepareRollback(source, "crypttab");
+  const stagedDetail = preparedRollbackDetail(staged);
+  assert.ok(stagedDetail);
+  await client.approveRollback(
+    stagedDetail,
+    RESCUE_CRYPTTAB_ROLLBACK_CONFIRMATION,
+  );
+  await client.cancelRollback(stagedDetail);
+  assert.deepEqual(
+    bodies.map((body) => body.operation),
+    [
+      "repair.crypttab.rollback.prepare",
+      "repair.crypttab.rollback.approve",
+      "repair.crypttab.rollback.cancel",
+    ],
+  );
+  assert.equal(
+    bodies[1]?.typedConfirmation,
+    RESCUE_CRYPTTAB_ROLLBACK_CONFIRMATION,
+  );
+  assert.doesNotMatch(JSON.stringify(bodies), /repair\.fstab|path|command/iu);
 });
 
 test("client sends only closed target claims and echoes only prepared bindings", async () => {
@@ -619,6 +718,23 @@ function rollbackPreparedEnvelope(
       risk: "R2",
       nextApprovalSequence: 2,
       confirmationRequired: RESCUE_FSTAB_ROLLBACK_CONFIRMATION,
+    },
+  };
+}
+
+function crypttabRollbackPreparedEnvelope(
+  requestId: string,
+  operation: RescueRepairOperation,
+): Record<string, unknown> {
+  const envelope = rollbackPreparedEnvelope(requestId, operation);
+  return {
+    ...envelope,
+    detail: {
+      ...(envelope.detail as Record<string, unknown>),
+      kind: "crypttab-rollback-prepared",
+      resourceId: RESCUE_CRYPTTAB_RESOURCE_ID,
+      actionId: RESCUE_CRYPTTAB_ROLLBACK_ACTION_ID,
+      confirmationRequired: RESCUE_CRYPTTAB_ROLLBACK_CONFIRMATION,
     },
   };
 }

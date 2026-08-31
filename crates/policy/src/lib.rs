@@ -79,7 +79,13 @@ pub const RESCUE_CRYPTTAB_BACKUP: &str = "required";
 #[cfg(feature = "rescue-crypttab-production-candidate")]
 pub const RESCUE_CRYPTTAB_VALIDATION_ID: &str = "linux.boot.validate-crypttab";
 #[cfg(feature = "rescue-crypttab-production-candidate")]
-pub const RESCUE_CRYPTTAB_ROLLBACK_ID: &str = "linux.crypttab.restore";
+pub const RESCUE_CRYPTTAB_ROLLBACK_ID: &str = "linux.crypttab.disable-missing-source.v1";
+#[cfg(feature = "rescue-crypttab-production-candidate")]
+pub const RESCUE_CRYPTTAB_ROLLBACK_EVIDENCE_ID: &str = "E-RESCUE-CRYPTTAB-SOURCE-RECEIPT";
+#[cfg(feature = "rescue-crypttab-production-candidate")]
+pub const RESCUE_CRYPTTAB_ROLLBACK_PREFLIGHT_ID: &str = "linux.crypttab.rollback-source.committed";
+#[cfg(feature = "rescue-crypttab-production-candidate")]
+pub const RESCUE_CRYPTTAB_ROLLBACK_BACKUP: &str = "source-vault-backup";
 #[cfg(feature = "rescue-crypttab-production-candidate")]
 pub const RESCUE_CRYPTTAB_EVIDENCE_IDS: [&str; 3] = rescue_crypttab_repair::EVIDENCE_IDS;
 
@@ -336,6 +342,48 @@ pub fn validate_rescue_crypttab_production_candidate_plan(
     Ok(())
 }
 
+/// Admit only the separately approved rollback of one committed crypttab
+/// candidate. The source transaction's authenticated Vault backup is the
+/// sole mutation input and the plan cannot declare a recursive rollback.
+#[cfg(feature = "rescue-crypttab-production-candidate")]
+pub fn validate_rescue_crypttab_rollback_plan(
+    plan: &ValidatedPlan,
+    session_target_fingerprint: &str,
+) -> Result<(), PolicyError> {
+    if !valid_sha256_fingerprint(session_target_fingerprint)
+        || plan.target_fingerprint != session_target_fingerprint
+    {
+        return Err(PolicyError::IncoherentRescueTargetFingerprint);
+    }
+    let [step] = plan.steps.as_slice() else {
+        return Err(PolicyError::InvalidRescueCrypttabPlan);
+    };
+    if step.action != RESCUE_CRYPTTAB_ROLLBACK_ID || step.risk != Risk::R2 {
+        return Err(PolicyError::MutationDisabled);
+    }
+    if step.target_fingerprint != plan.target_fingerprint
+        || !valid_sha256_fingerprint(&step.target_fingerprint)
+    {
+        return Err(PolicyError::IncoherentRescueTargetFingerprint);
+    }
+    if step.evidence_ids.as_slice() != [RESCUE_CRYPTTAB_ROLLBACK_EVIDENCE_ID] {
+        return Err(PolicyError::InvalidRescueCrypttabEvidence);
+    }
+    if step.preconditions.as_slice() != [RESCUE_CRYPTTAB_ROLLBACK_PREFLIGHT_ID] {
+        return Err(PolicyError::InvalidRescueCrypttabPrecondition);
+    }
+    if step.backup.as_deref() != Some(RESCUE_CRYPTTAB_ROLLBACK_BACKUP) {
+        return Err(PolicyError::InvalidRescueCrypttabBackup);
+    }
+    if step.validation != RESCUE_CRYPTTAB_VALIDATION_ID {
+        return Err(PolicyError::InvalidRescueCrypttabValidation);
+    }
+    if step.rollback.is_some() {
+        return Err(PolicyError::InvalidRescueCrypttabRollback);
+    }
+    Ok(())
+}
+
 #[cfg(feature = "fixture-repair-lab")]
 fn validate_fixture_evidence_ids(evidence_ids: &[String]) -> Result<(), PolicyError> {
     if evidence_ids.is_empty() || evidence_ids.len() > MAX_FIXTURE_EVIDENCE_IDS {
@@ -456,6 +504,23 @@ mod tests {
             }
         }
 
+        fn rollback_plan() -> ValidatedPlan {
+            ValidatedPlan {
+                plan_id: "P-rescue-crypttab-rollback".into(),
+                target_fingerprint: TARGET.into(),
+                steps: vec![ActionStep {
+                    action: RESCUE_CRYPTTAB_ROLLBACK_ID.into(),
+                    risk: Risk::R2,
+                    target_fingerprint: TARGET.into(),
+                    evidence_ids: vec![RESCUE_CRYPTTAB_ROLLBACK_EVIDENCE_ID.into()],
+                    preconditions: vec![RESCUE_CRYPTTAB_ROLLBACK_PREFLIGHT_ID.into()],
+                    backup: Some(RESCUE_CRYPTTAB_ROLLBACK_BACKUP.into()),
+                    validation: RESCUE_CRYPTTAB_VALIDATION_ID.into(),
+                    rollback: None,
+                }],
+            }
+        }
+
         #[test]
         fn admits_only_the_exact_closed_shape() {
             assert_eq!(
@@ -473,6 +538,26 @@ mod tests {
             assert_eq!(
                 validate_rescue_crypttab_production_candidate_plan(&extra, TARGET),
                 Err(PolicyError::InvalidRescueCrypttabPlan)
+            );
+        }
+
+        #[test]
+        fn rollback_is_a_distinct_non_recursive_closed_plan() {
+            assert_eq!(
+                validate_rescue_crypttab_rollback_plan(&rollback_plan(), TARGET),
+                Ok(())
+            );
+            let mut repair_action = rollback_plan();
+            repair_action.steps[0].action = RESCUE_CRYPTTAB_ACTION_ID.into();
+            assert_eq!(
+                validate_rescue_crypttab_rollback_plan(&repair_action, TARGET),
+                Err(PolicyError::MutationDisabled)
+            );
+            let mut recursive = rollback_plan();
+            recursive.steps[0].rollback = Some(RESCUE_CRYPTTAB_ROLLBACK_ID.into());
+            assert_eq!(
+                validate_rescue_crypttab_rollback_plan(&recursive, TARGET),
+                Err(PolicyError::InvalidRescueCrypttabRollback)
             );
         }
 

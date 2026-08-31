@@ -50,6 +50,59 @@ def unit_directives(path: Path) -> dict[str, dict[str, list[str]]]:
 
 
 class RepairCandidatePackagingTests(unittest.TestCase):
+    def test_crypttab_rollback_relay_is_exact_and_cross_binding_fails(self) -> None:
+        source = {
+            "reservationId": "B-0123456789abcdef0123456789abcdef",
+            "transactionBindingSha256": "sha256:" + "5" * 64,
+        }
+        prepare = {
+            "apiVersion": rescue_server.ROLLBACK_API_VERSION,
+            "requestId": "R-10000000-0000-0000-0000-000000000001",
+            "operation": "repair.crypttab.rollback.prepare",
+            "source": source,
+        }
+        rescue_server._validate_repair_request(prepare)
+        approve = {
+            **prepare,
+            "requestId": "R-10000000-0000-0000-0000-000000000002",
+            "operation": "repair.crypttab.rollback.approve",
+            "preparedId": "Q-" + "1" * 32,
+            "rollbackId": "RB-" + "2" * 32,
+            "sessionId": "S-" + "3" * 32,
+            "planId": "P-" + "4" * 32,
+            "planHash": "sha256:" + "6" * 64,
+            "approvalId": "A-" + "7" * 32,
+            "approvalSequence": 2,
+            "typedConfirmation": "RIPRISTINA CRYPTTAB ORIGINALE",
+        }
+        rescue_server._validate_repair_request(approve)
+        crossed = {**approve, "typedConfirmation": "RIPRISTINA FSTAB ORIGINALE"}
+        with self.assertRaises(rescue_server.RepairRelayError):
+            rescue_server._validate_repair_request(crossed)
+
+        detail = {
+            "kind": "crypttab-rollback-prepared",
+            "preparedId": approve["preparedId"],
+            "rollbackId": approve["rollbackId"],
+            "sessionId": approve["sessionId"],
+            "planId": approve["planId"],
+            "planHash": approve["planHash"],
+            "targetFingerprint": "sha256:" + "8" * 64,
+            "source": source,
+            "resourceId": "rescue:selected-linux-root:etc/crypttab",
+            "backupLocator": "vault://repair/" + source["reservationId"],
+            "actionId": "linux.crypttab.disable-missing-source.v1",
+            "risk": "R2",
+            "nextApprovalSequence": 2,
+            "confirmationRequired": "RIPRISTINA CRYPTTAB ORIGINALE",
+        }
+        self.assertTrue(rescue_server._validate_rollback_prepared_detail(detail))
+        self.assertFalse(
+            rescue_server._validate_rollback_prepared_detail(
+                {**detail, "kind": "fstab-rollback-prepared"}
+            )
+        )
+
     def test_vault_gate_preserves_timeout_and_closes_other_failures(self) -> None:
         cases = (
             ("TIMEOUT", 504, "timeout", 504),

@@ -3,7 +3,6 @@ import type { RescueOfflineInspection, RescueTargetSelection } from "./native";
 import {
   RESCUE_CRYPTTAB_FINDING_ID,
   RESCUE_FSTAB_FINDING_ID,
-  RESCUE_FSTAB_ROLLBACK_CONFIRMATION,
   RescueRepairClient,
   RescueRepairServiceError,
   RescueRepairUnavailableError,
@@ -60,7 +59,13 @@ export function RescueRepairPanel({
       setActiveCandidate(
         prepared.kind === "crypttab-prepared" ? "crypttab" : "fstab",
       );
-  }, [prepared]);
+    else if (rollbackPrepared !== undefined)
+      setActiveCandidate(
+        rollbackPrepared.kind === "crypttab-rollback-prepared"
+          ? "crypttab"
+          : "fstab",
+      );
+  }, [prepared, rollbackPrepared]);
 
   useEffect(() => {
     mounted.current = true;
@@ -97,12 +102,32 @@ export function RescueRepairPanel({
     };
     const poll = async () => {
       try {
-        let next = snapshot?.operation.startsWith("repair.fstab.rollback.")
-          ? await repairClient.rollbackStatus(controller.signal)
+        const rollbackCandidate =
+          activeCandidate ??
+          (snapshot?.operation.startsWith("repair.crypttab.rollback.")
+            ? "crypttab"
+            : "fstab");
+        let next = snapshot?.operation.includes(".rollback.")
+          ? await repairClient.rollbackStatus(
+              controller.signal,
+              rollbackCandidate,
+            )
           : await repairClient.status(controller.signal);
         if (next.operation === "repair.status" && next.state === "executing") {
           try {
-            next = await repairClient.rollbackStatus(controller.signal);
+            next = await repairClient.rollbackStatus(
+              controller.signal,
+              rollbackCandidate,
+            );
+            if (
+              next.state === "executing" &&
+              next.detail === null &&
+              activeCandidate === undefined
+            )
+              next = await repairClient.rollbackStatus(
+                controller.signal,
+                rollbackCandidate === "fstab" ? "crypttab" : "fstab",
+              );
           } catch {
             // v1 remains authoritative when the v2 rollback surface is absent.
           }
@@ -123,7 +148,7 @@ export function RescueRepairPanel({
       if (timer !== undefined) window.clearTimeout(timer);
       controller.abort();
     };
-  }, [available, repairClient, snapshot]);
+  }, [activeCandidate, available, repairClient, snapshot]);
 
   async function prepare(candidate: "fstab" | "crypttab"): Promise<void> {
     if (
@@ -201,7 +226,10 @@ export function RescueRepairPanel({
     setMessage(undefined);
     setConfirmation("");
     try {
-      const next = await repairClient.prepareRollback(committedSource);
+      const next = await repairClient.prepareRollback(
+        committedSource,
+        activeCandidate,
+      );
       if (mounted.current)
         setSnapshot((current) => newestSnapshot(current, next));
     } catch (error) {
@@ -214,7 +242,7 @@ export function RescueRepairPanel({
   async function approveRollback(): Promise<void> {
     if (
       rollbackPrepared === undefined ||
-      confirmation !== RESCUE_FSTAB_ROLLBACK_CONFIRMATION ||
+      confirmation !== rollbackPrepared.confirmationRequired ||
       busy
     )
       return;
@@ -255,8 +283,8 @@ export function RescueRepairPanel({
 
   async function refreshAfterError(): Promise<void> {
     try {
-      const current = snapshot?.operation.startsWith("repair.fstab.rollback.")
-        ? await repairClient.rollbackStatus()
+      const current = snapshot?.operation.includes(".rollback.")
+        ? await repairClient.rollbackStatus(undefined, activeCandidate)
         : await repairClient.status();
       if (mounted.current)
         setSnapshot((previous) => newestSnapshot(previous, current));
@@ -457,7 +485,7 @@ export function RescueRepairPanel({
           </div>
           <label className="rescue-repair-confirmation">
             Per approvare il rollback, scrivi esattamente
-            <code>{RESCUE_FSTAB_ROLLBACK_CONFIRMATION}</code>
+            <code>{rollbackPrepared.confirmationRequired}</code>
             <input
               autoComplete="off"
               disabled={busy}
@@ -473,7 +501,7 @@ export function RescueRepairPanel({
             <button
               className="rescue-repair-primary"
               disabled={
-                busy || confirmation !== RESCUE_FSTAB_ROLLBACK_CONFIRMATION
+                busy || confirmation !== rollbackPrepared.confirmationRequired
               }
               onClick={() => void approveRollback()}
             >

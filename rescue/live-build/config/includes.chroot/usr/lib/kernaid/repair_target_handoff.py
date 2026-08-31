@@ -85,7 +85,7 @@ REPAIR_RESOURCE = "rescue:selected-linux-root:etc/fstab"
 CRYPTTAB_VAULT_WRITE_CAPABILITY = "crypttab-direct-leaf-rw-v1"
 CRYPTTAB_VAULT_ROLLBACK_WRITE_CAPABILITY = "crypttab-rollback-direct-leaf-rw-v1"
 CRYPTTAB_REPAIR_ACTION = "linux.crypttab.disable-missing-uuid.v1"
-CRYPTTAB_ROLLBACK_ACTION = "linux.crypttab.restore"
+CRYPTTAB_ROLLBACK_ACTION = "linux.crypttab.disable-missing-source.v1"
 CRYPTTAB_REPAIR_RESOURCE = "rescue:selected-linux-root:etc/crypttab"
 # KERNAID_REPAIR_CANDIDATE_END
 BLOCK_INVENTORY_COLLECTOR = "linux.block.inventory"

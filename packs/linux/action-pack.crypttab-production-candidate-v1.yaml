@@ -26,4 +26,4 @@ spec:
       inputSchema: schemas/linux.crypttab.disable-missing-uuid.v1.json
       preflight: linux.crypttab.preflight
       validate: linux.boot.validate-crypttab
-      rollback: linux.crypttab.restore
+      rollback: linux.crypttab.disable-missing-source.v1
