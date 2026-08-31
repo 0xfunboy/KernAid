@@ -21,8 +21,10 @@ import {
   expectExactKeys,
   expectIdentifier,
   expectRecord,
+  expectRfc3339,
   expectSafeInteger,
   inventorySigningBytes,
+  isWorkOrderActionId,
   entitlementAppliesTo,
   entitlementPullSigningBytes,
   entitlementRevocationSigningBytes,
@@ -35,23 +37,32 @@ import {
   parseSignedUpdateManifest,
   parseServiceReceipt,
   parseUpdatePullRequest,
+  parseWorkOrderClaimRequest,
+  parseWorkOrderResult,
   policyBundleSigningBytes,
   policyPullSigningBytes,
   serviceReceiptSigningBytes,
   updateAppliesTo,
   updateManifestSigningBytes,
   updatePullSigningBytes,
+  workOrderAction,
+  workOrderActionCatalog,
+  workOrderClaimSigningBytes,
+  workOrderResultSigningBytes,
   parseEnrollmentRequest,
   parseAuditEnvelope,
   parseInventoryEnvelope,
   type FleetServiceOperation,
   type ServiceReceipt,
   type ServiceReceiptUnsigned,
+  type WorkOrderActionId,
 } from "@kernaid/fleet-schemas";
 import {
   generateSecret,
   generateTenantId,
   generateCredentialId,
+  generateWorkOrderId,
+  generateWorkOrderLeaseId,
   deviceIdForEd25519Spki,
   hashSecret,
   decodeBase64UrlExact,
@@ -80,7 +91,10 @@ import {
   StoreUpdateConflictError,
   StoreUpdatePullReplayError,
   StoreUpdateRollbackError,
+  StoreWorkOrderReplayError,
+  StoreWorkOrderStateError,
   type StoredServiceResponse,
+  type StoredWorkOrder,
   type TenantAccessCredential,
 } from "./store.js";
 import {
@@ -96,6 +110,7 @@ const MAX_REQUEST_BYTES = 64 * 1024;
 const MAX_ENROLLMENT_TOKEN_SECONDS = 7 * 24 * 60 * 60;
 const MAX_SERVICE_RESPONSE_BYTES = 4 * 1024 * 1024;
 const SERVICE_RECEIPT_HEADER = "X-KernAid-Fleet-Receipt";
+const MAX_WORK_ORDER_LIFETIME_MS = 7 * 24 * 60 * 60 * 1000;
 
 export interface FleetControlPlaneOptions {
   databasePath: string;
@@ -282,6 +297,10 @@ export class FleetControlPlane {
         writeJson(response, 409, { error: "update_sequence_conflict" });
       } else if (error instanceof StoreUpdatePullReplayError) {
         writeJson(response, 409, { error: "update_pull_replay" });
+      } else if (error instanceof StoreWorkOrderReplayError) {
+        writeJson(response, 409, { error: "work_order_replay" });
+      } else if (error instanceof StoreWorkOrderStateError) {
+        writeJson(response, 409, { error: "work_order_state_conflict" });
       } else {
         writeJson(response, 500, { error: "internal_error" });
       }
@@ -822,6 +841,360 @@ export class FleetControlPlane {
         idempotent: result.idempotent,
         publishedAt: result.publishedAt,
       });
+      return;
+    }
+
+    const workOrdersMatch = /^\/v1\/tenants\/([^/]+)\/work-orders$/.exec(path);
+    if (method === "GET" && workOrdersMatch !== null) {
+      const tenantId = pathIdentifier(workOrdersMatch[1], "tenantId");
+      this.#authorizeTenant(
+        request,
+        tenantId,
+        "operator",
+        "work_order.list",
+        tenantTarget(tenantId),
+      );
+      const now = this.#validNow();
+      writeJson(response, 200, {
+        schema: "dev.kernaid.fleet.work-order-list.v1",
+        tenantId,
+        items: this.#store
+          .listWorkOrders(tenantId, now.getTime(), now.toISOString())
+          .map(tenantWorkOrder),
+      });
+      return;
+    }
+    if (method === "POST" && workOrdersMatch !== null) {
+      const tenantId = pathIdentifier(workOrdersMatch[1], "tenantId");
+      const actor = this.#authorizeTenant(
+        request,
+        tenantId,
+        "operator",
+        "work_order.create",
+        tenantTarget(tenantId),
+      );
+      const body = expectRecord(await readJson(request));
+      expectExactKeys(body, [
+        "requestId",
+        "targetDeviceId",
+        "actionId",
+        "actionVersion",
+        "expiresAt",
+      ]);
+      const requestId = expectIdentifier(body.requestId, "requestId");
+      const targetDeviceId = expectIdentifier(
+        body.targetDeviceId,
+        "targetDeviceId",
+      );
+      const actionId = expectIdentifier(body.actionId, "actionId");
+      if (!isWorkOrderActionId(actionId)) {
+        throw new HttpError(400, "unsupported_action");
+      }
+      const action = workOrderAction(actionId);
+      const actionVersion = expectSafeInteger(
+        body.actionVersion,
+        "actionVersion",
+        1,
+      );
+      if (actionVersion !== action.version) {
+        throw new HttpError(400, "unsupported_action_version");
+      }
+      const expiresAt = expectRfc3339(body.expiresAt, "expiresAt");
+      const now = this.#validNow();
+      const expiresAtMs = Date.parse(expiresAt);
+      if (
+        expiresAtMs <= now.getTime() ||
+        expiresAtMs > now.getTime() + MAX_WORK_ORDER_LIFETIME_MS
+      ) {
+        throw new HttpError(400, "invalid_work_order_expiry");
+      }
+      const device = this.#store.getDevice(tenantId, targetDeviceId);
+      if (device === undefined) throw new HttpError(404, "target_not_found");
+      if (device.revokedAt !== null) {
+        throw new HttpError(403, "device_revoked");
+      }
+      if (!(action.platforms as readonly string[]).includes(device.platform)) {
+        throw new HttpError(403, "action_platform_mismatch");
+      }
+      if (
+        !this.#isWorkOrderAuthorized(tenantId, targetDeviceId, actionId, now)
+      ) {
+        throw new HttpError(403, "work_order_not_authorized");
+      }
+      const normalized = {
+        requestId,
+        targetDeviceId,
+        actionId,
+        actionVersion,
+        expiresAt,
+      };
+      const result = this.#store.createWorkOrder({
+        tenantId,
+        workOrderId: generateWorkOrderId(),
+        requestId,
+        requestSha256: sha256Hex(canonicalJson(normalized)),
+        targetDeviceId,
+        actionId,
+        actionVersion,
+        kind: action.kind,
+        risk: action.risk,
+        localApprovalRequired: action.localApprovalRequired,
+        createdByCredentialId: actor.credentialId,
+        createdAt: now.toISOString(),
+        expiresAt,
+        expiresAtMs,
+      });
+      writeJson(response, result.idempotent ? 200 : 201, {
+        schema: "dev.kernaid.fleet.work-order-created.v1",
+        ...tenantWorkOrder(result.workOrder),
+        idempotent: result.idempotent,
+      });
+      return;
+    }
+
+    const workOrderAuditMatch =
+      /^\/v1\/tenants\/([^/]+)\/work-order-events$/.exec(path);
+    if (method === "GET" && workOrderAuditMatch !== null) {
+      const tenantId = pathIdentifier(workOrderAuditMatch[1], "tenantId");
+      this.#authorizeTenant(
+        request,
+        tenantId,
+        "operator",
+        "work_order_audit.list",
+        tenantTarget(tenantId),
+      );
+      writeJson(response, 200, {
+        schema: "dev.kernaid.fleet.work-order-event-list.v1",
+        tenantId,
+        items: this.#store.listWorkOrderEvents(tenantId),
+      });
+      return;
+    }
+
+    const workOrderApproveMatch =
+      /^\/v1\/tenants\/([^/]+)\/work-orders\/([^/]+)\/approve$/.exec(path);
+    if (method === "POST" && workOrderApproveMatch !== null) {
+      const tenantId = pathIdentifier(workOrderApproveMatch[1], "tenantId");
+      const workOrderId = pathIdentifier(
+        workOrderApproveMatch[2],
+        "workOrderId",
+      );
+      const actor = this.#authorizeTenant(
+        request,
+        tenantId,
+        "admin",
+        "work_order.approve",
+        { type: "work_order", id: workOrderId },
+      );
+      const body = expectRecord(await readJson(request));
+      expectExactKeys(body, ["decision"]);
+      if (body.decision !== "approve") {
+        throw new HttpError(400, "invalid_request");
+      }
+      const now = this.#validNow();
+      const existing = this.#store.getWorkOrder(
+        tenantId,
+        workOrderId,
+        now.getTime(),
+        now.toISOString(),
+      );
+      if (existing === undefined) throw new HttpError(404, "not_found");
+      if (
+        !this.#isWorkOrderAuthorized(
+          tenantId,
+          existing.targetDeviceId,
+          existing.actionId,
+          now,
+        )
+      ) {
+        throw new HttpError(403, "work_order_not_authorized");
+      }
+      const result = this.#store.approveWorkOrder({
+        tenantId,
+        workOrderId,
+        credentialId: actor.credentialId,
+        approvedAt: now.toISOString(),
+        nowMs: now.getTime(),
+      });
+      if (result === undefined) throw new HttpError(404, "not_found");
+      writeJson(response, 200, {
+        schema: "dev.kernaid.fleet.work-order-approved.v1",
+        ...tenantWorkOrder(result.workOrder),
+        idempotent: result.idempotent,
+      });
+      return;
+    }
+
+    const workOrderCancelMatch =
+      /^\/v1\/tenants\/([^/]+)\/work-orders\/([^/]+)\/cancel$/.exec(path);
+    if (method === "POST" && workOrderCancelMatch !== null) {
+      const tenantId = pathIdentifier(workOrderCancelMatch[1], "tenantId");
+      const workOrderId = pathIdentifier(
+        workOrderCancelMatch[2],
+        "workOrderId",
+      );
+      const actor = this.#authorizeTenant(
+        request,
+        tenantId,
+        "operator",
+        "work_order.cancel",
+        { type: "work_order", id: workOrderId },
+      );
+      expectEmptyObject(await readJson(request));
+      const now = this.#validNow();
+      const result = this.#store.cancelWorkOrder({
+        tenantId,
+        workOrderId,
+        credentialId: actor.credentialId,
+        cancelledAt: now.toISOString(),
+        nowMs: now.getTime(),
+      });
+      if (result === undefined) throw new HttpError(404, "not_found");
+      writeJson(response, 200, {
+        schema: "dev.kernaid.fleet.work-order-cancelled.v1",
+        ...tenantWorkOrder(result.workOrder),
+        idempotent: result.idempotent,
+      });
+      return;
+    }
+
+    if (method === "POST" && path === "/v1/work-order-claims") {
+      const received = await readJsonRequest(request);
+      const claim = parseWorkOrderClaimRequest(received.value);
+      const device = this.#store.getDevice(claim.tenantId, claim.deviceId);
+      if (device === undefined) throw new HttpError(401, "unknown_device");
+      if (device.revokedAt !== null) throw new HttpError(403, "device_revoked");
+      let publicKey;
+      try {
+        publicKey = importEd25519Spki(device.publicKeySpki);
+      } catch {
+        throw new HttpError(500, "invalid_stored_key");
+      }
+      if (
+        !verifyEd25519(
+          publicKey,
+          workOrderClaimSigningBytes(claim),
+          claim.signature,
+        )
+      ) {
+        throw new HttpError(401, "invalid_signature");
+      }
+      const context = serviceResponseContext(
+        "work_order_claim",
+        claim.tenantId,
+        claim.deviceId,
+        received.bytes,
+      );
+      if (this.#replayServiceResponse(response, context)) return;
+      const now = this.#validNow();
+      const issuedAtMs = Date.parse(claim.issuedAt);
+      if (Math.abs(now.getTime() - issuedAtMs) > this.#clockSkewMs) {
+        throw new HttpError(401, "work_order_claim_timestamp_rejected");
+      }
+      const eligibleActionIds = (
+        Object.keys(workOrderActionCatalog) as WorkOrderActionId[]
+      ).filter((actionId) =>
+        this.#isWorkOrderAuthorized(
+          claim.tenantId,
+          claim.deviceId,
+          actionId,
+          now,
+        ),
+      );
+      const result = this.#store.claimWorkOrder({
+        tenantId: claim.tenantId,
+        deviceId: claim.deviceId,
+        requestSha256: context.requestSha256,
+        nonceSha256: sha256Hex(
+          `kernaid:fleet:work-order-claim-nonce:v1\0${claim.nonce}`,
+        ),
+        nonceExpiresAtMs: issuedAtMs + this.#clockSkewMs + 1,
+        leaseId: generateWorkOrderLeaseId(),
+        leaseSeconds: claim.leaseSeconds,
+        eligibleActionIds,
+        nowMs: now.getTime(),
+        now: now.toISOString(),
+      });
+      this.#commitServiceResponse(
+        response,
+        context,
+        200,
+        {
+          schema: "dev.kernaid.fleet.work-order-claim-response.v1",
+          tenantId: claim.tenantId,
+          deviceId: claim.deviceId,
+          workOrder:
+            result.workOrder === null
+              ? null
+              : deviceWorkOrder(result.workOrder),
+          idempotent: result.idempotent,
+        },
+        now,
+      );
+      return;
+    }
+
+    if (method === "POST" && path === "/v1/work-order-results") {
+      const received = await readJsonRequest(request);
+      const resultEnvelope = parseWorkOrderResult(received.value);
+      const device = this.#store.getDevice(
+        resultEnvelope.tenantId,
+        resultEnvelope.deviceId,
+      );
+      if (device === undefined) throw new HttpError(401, "unknown_device");
+      if (device.revokedAt !== null) throw new HttpError(403, "device_revoked");
+      let publicKey;
+      try {
+        publicKey = importEd25519Spki(device.publicKeySpki);
+      } catch {
+        throw new HttpError(500, "invalid_stored_key");
+      }
+      if (
+        !verifyEd25519(
+          publicKey,
+          workOrderResultSigningBytes(resultEnvelope),
+          resultEnvelope.signature,
+        )
+      ) {
+        throw new HttpError(401, "invalid_signature");
+      }
+      const context = serviceResponseContext(
+        "work_order_result",
+        resultEnvelope.tenantId,
+        resultEnvelope.deviceId,
+        received.bytes,
+      );
+      if (this.#replayServiceResponse(response, context)) return;
+      const now = this.#validNow();
+      if (
+        Math.abs(now.getTime() - Date.parse(resultEnvelope.completedAt)) >
+        this.#clockSkewMs
+      ) {
+        throw new HttpError(401, "work_order_result_timestamp_rejected");
+      }
+      const result = this.#store.recordWorkOrderResult({
+        result: resultEnvelope,
+        envelopeSha256: sha256Hex(canonicalJson(resultEnvelope)),
+        receivedAt: now.toISOString(),
+        nowMs: now.getTime(),
+      });
+      this.#commitServiceResponse(
+        response,
+        context,
+        result.idempotent ? 200 : 201,
+        {
+          schema: "dev.kernaid.fleet.work-order-result-response.v1",
+          tenantId: resultEnvelope.tenantId,
+          deviceId: resultEnvelope.deviceId,
+          workOrderId: resultEnvelope.workOrderId,
+          status: result.workOrder.status,
+          outcome: result.workOrder.outcome,
+          resultSha256: result.workOrder.resultSha256,
+          accepted: true,
+          idempotent: result.idempotent,
+        },
+        now,
+      );
       return;
     }
 
@@ -1477,6 +1850,106 @@ export class FleetControlPlane {
     }
   }
 
+  #isWorkOrderAuthorized(
+    tenantId: string,
+    deviceId: string,
+    actionId: WorkOrderActionId,
+    now: Date,
+  ): boolean {
+    const device = this.#store.getDevice(tenantId, deviceId);
+    const action = workOrderActionCatalog[actionId];
+    if (
+      device === undefined ||
+      device.revokedAt !== null ||
+      !(action.platforms as readonly string[]).includes(device.platform)
+    ) {
+      return false;
+    }
+
+    const anchorSpki = this.#store.getPolicyTrustAnchor(tenantId);
+    if (anchorSpki === undefined) return false;
+    let policyAnchor;
+    try {
+      policyAnchor = importEd25519Spki(anchorSpki);
+    } catch {
+      throw new Error("stored policy trust anchor is invalid");
+    }
+    const nowUnix = Math.floor(now.getTime() / 1000);
+    const policies = this.#store
+      .listApplicablePolicyJson(tenantId, deviceId)
+      .map((stored) => parseSignedPolicyBundle(JSON.parse(stored) as unknown))
+      .filter((bundle) => {
+        if (
+          !verifyEd25519(
+            policyAnchor,
+            policyBundleSigningBytes(bundle),
+            bundle.signature,
+          )
+        ) {
+          throw new Error("stored policy signature is invalid");
+        }
+        return (
+          bundle.notBeforeUnix <= nowUnix && nowUnix < bundle.expiresAtUnix
+        );
+      });
+    if (
+      policies.length === 0 ||
+      policies.some((bundle) =>
+        bundle.rules.deniedActionIds.includes(actionId),
+      ) ||
+      !policies.some(
+        (bundle) =>
+          bundle.rules.allowedActionIds.includes(actionId) &&
+          policyRiskRank(action.risk) <= policyRiskRank(bundle.rules.maxRisk),
+      )
+    ) {
+      return false;
+    }
+
+    const storedRevocations =
+      this.#store.getEntitlementRevocationsJson(tenantId);
+    const revokedIds = new Set<string>();
+    if (storedRevocations !== undefined) {
+      const revocations = parseEntitlementRevocationEnvelope(
+        JSON.parse(storedRevocations) as unknown,
+      );
+      if (
+        !verifyEd25519(
+          this.#entitlementTrustAnchor,
+          entitlementRevocationSigningBytes(revocations),
+          revocations.signature,
+        )
+      ) {
+        throw new Error("stored entitlement revocation signature is invalid");
+      }
+      for (const entitlementId of revocations.claims.revokedEntitlementIds) {
+        revokedIds.add(entitlementId);
+      }
+    }
+    return this.#store.listEntitlementJson(tenantId).some((stored) => {
+      const envelope = parseEntitlementEnvelope(JSON.parse(stored) as unknown);
+      if (
+        !verifyEd25519(
+          this.#entitlementTrustAnchor,
+          entitlementSigningBytes(envelope),
+          envelope.signature,
+        )
+      ) {
+        throw new Error("stored entitlement signature is invalid");
+      }
+      const claims = envelope.claims;
+      return (
+        claims.tenantId === tenantId &&
+        claims.deviceIds.includes(deviceId) &&
+        !revokedIds.has(claims.entitlementId) &&
+        claims.notBeforeUnix <= nowUnix &&
+        nowUnix < claims.expiresAtUnix &&
+        claims.features.includes("fleet") &&
+        claims.features.includes(action.requiredFeature)
+      );
+    });
+  }
+
   #validNow(): Date {
     const now = this.#now();
     if (!Number.isFinite(now.getTime()))
@@ -1539,6 +2012,99 @@ export class FleetControlPlane {
     );
     response.end(body);
   }
+}
+
+function tenantWorkOrder(workOrder: StoredWorkOrder): Record<string, unknown> {
+  return {
+    tenantId: workOrder.tenantId,
+    workOrderId: workOrder.workOrderId,
+    requestId: workOrder.requestId,
+    targetDeviceId: workOrder.targetDeviceId,
+    actionId: workOrder.actionId,
+    actionVersion: workOrder.actionVersion,
+    kind: workOrder.kind,
+    risk: workOrder.risk,
+    localApprovalRequired: workOrder.localApprovalRequired,
+    status: workOrder.status,
+    createdByCredentialId: workOrder.createdByCredentialId,
+    createdAt: workOrder.createdAt,
+    expiresAt: workOrder.expiresAt,
+    approval:
+      workOrder.approvedAt === null
+        ? null
+        : {
+            approvedByCredentialId: workOrder.approvedByCredentialId,
+            approvedAt: workOrder.approvedAt,
+          },
+    lease:
+      workOrder.leaseId === null
+        ? null
+        : {
+            leaseId: workOrder.leaseId,
+            leasedAt: workOrder.leasedAt,
+            leaseExpiresAt: workOrder.leaseExpiresAt,
+          },
+    result:
+      workOrder.outcome === null
+        ? null
+        : {
+            outcome: workOrder.outcome,
+            resultSha256: workOrder.resultSha256,
+            completedAt: workOrder.completedAt,
+          },
+    cancellation:
+      workOrder.cancelledAt === null
+        ? null
+        : {
+            cancelledByCredentialId: workOrder.cancelledByCredentialId,
+            cancelledAt: workOrder.cancelledAt,
+          },
+  };
+}
+
+function deviceWorkOrder(workOrder: StoredWorkOrder): Record<string, unknown> {
+  if (
+    workOrder.status !== "leased" ||
+    workOrder.leaseId === null ||
+    workOrder.leasedAt === null ||
+    workOrder.leaseExpiresAt === null
+  ) {
+    throw new Error("device work order does not contain an active lease");
+  }
+  if (
+    workOrder.localApprovalRequired &&
+    (workOrder.approvedAt === null || workOrder.approvedByCredentialId === null)
+  ) {
+    throw new Error("write work order lacks tenant approval proof");
+  }
+  return {
+    workOrderId: workOrder.workOrderId,
+    targetDeviceId: workOrder.targetDeviceId,
+    actionId: workOrder.actionId,
+    actionVersion: workOrder.actionVersion,
+    kind: workOrder.kind,
+    risk: workOrder.risk,
+    localApprovalRequired: workOrder.localApprovalRequired,
+    status: workOrder.status,
+    createdAt: workOrder.createdAt,
+    expiresAt: workOrder.expiresAt,
+    approval:
+      workOrder.approvedAt === null
+        ? null
+        : {
+            approvedByCredentialId: workOrder.approvedByCredentialId,
+            approvedAt: workOrder.approvedAt,
+          },
+    lease: {
+      leaseId: workOrder.leaseId,
+      leasedAt: workOrder.leasedAt,
+      leaseExpiresAt: workOrder.leaseExpiresAt,
+    },
+  };
+}
+
+function policyRiskRank(risk: "R0" | "R1" | "R2" | "R3"): number {
+  return { R0: 0, R1: 1, R2: 2, R3: 3 }[risk];
 }
 
 class HttpError extends Error {

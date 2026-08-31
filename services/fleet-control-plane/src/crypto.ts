@@ -23,6 +23,14 @@ export function generateCredentialId(): string {
   return `cred_${randomBytes(16).toString("hex")}`;
 }
 
+export function generateWorkOrderId(): string {
+  return `wo_${randomBytes(16).toString("hex")}`;
+}
+
+export function generateWorkOrderLeaseId(): string {
+  return `lease_${randomBytes(16).toString("hex")}`;
+}
+
 export function hashSecret(
   kind: "admin" | "enrollment",
   secret: string,

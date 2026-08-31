@@ -13,8 +13,17 @@ import type {
   EntitlementRevocationEnvelope,
   FleetServiceOperation,
   SignedUpdateManifest,
+  WorkOrderActionId,
+  WorkOrderKind,
+  WorkOrderResult,
+  WorkOrderResultOutcome,
+  WorkOrderRisk,
 } from "@kernaid/fleet-schemas";
-import { canonicalJson } from "@kernaid/fleet-schemas";
+import {
+  canonicalJson,
+  isWorkOrderActionId,
+  workOrderActionCatalog,
+} from "@kernaid/fleet-schemas";
 import {
   isTenantAccessAction,
   isTenantRole,
@@ -36,6 +45,11 @@ const MAX_SERVICE_RECEIPTS_PER_OPERATION = 4;
 const MAX_TENANT_ACCESS_CREDENTIALS = 256;
 const MAX_TENANT_ACCESS_AUDIT_EVENTS = 10_000;
 const MAX_LISTED_TENANT_ACCESS_AUDIT_EVENTS = 256;
+const MAX_WORK_ORDERS_PER_TENANT = 10_000;
+const MAX_LISTED_WORK_ORDERS = 256;
+const MAX_WORK_ORDER_EVENTS_PER_TENANT = 20_000;
+const MAX_LISTED_WORK_ORDER_EVENTS = 512;
+const MAX_RECENT_WORK_ORDER_CLAIMS_PER_DEVICE = 1024;
 
 export class StoreConflictError extends Error {}
 export class StoreAuthorizationError extends Error {}
@@ -53,6 +67,8 @@ export class StoreUpdateRollbackError extends Error {}
 export class StoreUpdateConflictError extends Error {}
 export class StoreUpdatePullReplayError extends Error {}
 export class StoreServiceReceiptAnchorMismatchError extends Error {}
+export class StoreWorkOrderReplayError extends Error {}
+export class StoreWorkOrderStateError extends Error {}
 
 interface EnrollmentTokenRow {
   tenant_id: string;
@@ -137,6 +153,71 @@ export interface ListedTenantAccessAuditEvent {
 
 export interface RevokeTenantAccessCredentialResult {
   credential: TenantAccessCredential;
+  idempotent: boolean;
+}
+
+export type WorkOrderStatus =
+  | "pending_approval"
+  | "queued"
+  | "leased"
+  | "succeeded"
+  | "failed"
+  | "rejected"
+  | "cancelled"
+  | "expired";
+
+export interface StoredWorkOrder {
+  tenantId: string;
+  workOrderId: string;
+  requestId: string;
+  targetDeviceId: string;
+  actionId: WorkOrderActionId;
+  actionVersion: number;
+  kind: WorkOrderKind;
+  risk: WorkOrderRisk;
+  localApprovalRequired: boolean;
+  status: WorkOrderStatus;
+  createdByCredentialId: string;
+  createdAt: string;
+  expiresAt: string;
+  approvedByCredentialId: string | null;
+  approvedAt: string | null;
+  leaseId: string | null;
+  leasedAt: string | null;
+  leaseExpiresAt: string | null;
+  outcome: WorkOrderResultOutcome | null;
+  resultSha256: string | null;
+  completedAt: string | null;
+  cancelledByCredentialId: string | null;
+  cancelledAt: string | null;
+}
+
+export interface ListedWorkOrderEvent {
+  tenantId: string;
+  sequence: number;
+  workOrderId: string;
+  occurredAt: string;
+  kind:
+    | "created"
+    | "approved"
+    | "leased"
+    | "lease_expired"
+    | "completed"
+    | "cancelled"
+    | "expired";
+  actorType: "credential" | "device" | "system";
+  actorId: string;
+  status: WorkOrderStatus;
+  detailSha256: string | null;
+}
+
+export interface WorkOrderMutationResult {
+  workOrder: StoredWorkOrder;
+  idempotent: boolean;
+}
+
+export interface WorkOrderClaimResult {
+  workOrder: StoredWorkOrder | null;
   idempotent: boolean;
 }
 
@@ -578,6 +659,481 @@ export class FleetStore {
         MAX_LISTED_TENANT_ACCESS_AUDIT_EVENTS,
       ) as unknown as TenantAccessAuditRow[];
     return rows.map(mapTenantAccessAudit);
+  }
+
+  createWorkOrder(input: {
+    tenantId: string;
+    workOrderId: string;
+    requestId: string;
+    requestSha256: string;
+    targetDeviceId: string;
+    actionId: WorkOrderActionId;
+    actionVersion: number;
+    kind: WorkOrderKind;
+    risk: WorkOrderRisk;
+    localApprovalRequired: boolean;
+    createdByCredentialId: string;
+    createdAt: string;
+    expiresAt: string;
+    expiresAtMs: number;
+  }): WorkOrderMutationResult {
+    validateWorkOrderCreate(input);
+    return this.#transaction(() => {
+      const existing = this.#database
+        .prepare(
+          `SELECT * FROM work_orders
+           WHERE tenant_id = ? AND request_id = ?`,
+        )
+        .get(input.tenantId, input.requestId) as WorkOrderRow | undefined;
+      if (existing !== undefined) {
+        if (existing.request_sha256 !== input.requestSha256) {
+          throw new StoreConflictError("work-order request ID conflict");
+        }
+        return { workOrder: mapWorkOrder(existing), idempotent: true };
+      }
+      const device = this.#database
+        .prepare(
+          `SELECT revoked_at FROM devices
+           WHERE tenant_id = ? AND device_id = ?`,
+        )
+        .get(input.tenantId, input.targetDeviceId) as
+        { revoked_at: string | null } | undefined;
+      if (device === undefined) {
+        throw new StoreAuthorizationError("work-order target is unknown");
+      }
+      if (device.revoked_at !== null) {
+        throw new StoreRevokedError("work-order target is revoked");
+      }
+      const active = this.#database
+        .prepare(
+          `SELECT COUNT(*) AS count FROM work_orders
+           WHERE tenant_id = ? AND status IN ('pending_approval','queued','leased')`,
+        )
+        .get(input.tenantId) as { count: number };
+      if (active.count >= MAX_WORK_ORDERS_PER_TENANT) {
+        throw new StoreConflictError("active work-order limit reached");
+      }
+      const status: WorkOrderStatus = input.localApprovalRequired
+        ? "pending_approval"
+        : "queued";
+      this.#database
+        .prepare(
+          `INSERT INTO work_orders
+            (tenant_id, work_order_id, request_id, request_sha256,
+             target_device_id, action_id, action_version, kind, risk,
+             local_approval_required, status, created_by_credential_id,
+             created_at, expires_at, expires_at_ms)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          input.tenantId,
+          input.workOrderId,
+          input.requestId,
+          input.requestSha256,
+          input.targetDeviceId,
+          input.actionId,
+          input.actionVersion,
+          input.kind,
+          input.risk,
+          input.localApprovalRequired ? 1 : 0,
+          status,
+          input.createdByCredentialId,
+          input.createdAt,
+          input.expiresAt,
+          input.expiresAtMs,
+        );
+      this.#recordWorkOrderEvent({
+        tenantId: input.tenantId,
+        workOrderId: input.workOrderId,
+        occurredAt: input.createdAt,
+        kind: "created",
+        actorType: "credential",
+        actorId: input.createdByCredentialId,
+        status,
+        detailSha256: input.requestSha256,
+      });
+      return {
+        workOrder: this.#requiredWorkOrder(input.tenantId, input.workOrderId),
+        idempotent: false,
+      };
+    });
+  }
+
+  listWorkOrders(
+    tenantId: string,
+    nowMs: number,
+    now: string,
+  ): StoredWorkOrder[] {
+    validateWorkOrderClock(tenantId, nowMs, now);
+    this.#transaction(() => this.#expireWorkOrders(tenantId, nowMs, now));
+    const rows = this.#database
+      .prepare(
+        `SELECT * FROM work_orders WHERE tenant_id = ?
+         ORDER BY created_at DESC, work_order_id DESC LIMIT ?`,
+      )
+      .all(tenantId, MAX_LISTED_WORK_ORDERS) as unknown as WorkOrderRow[];
+    return rows.map(mapWorkOrder);
+  }
+
+  getWorkOrder(
+    tenantId: string,
+    workOrderId: string,
+    nowMs: number,
+    now: string,
+  ): StoredWorkOrder | undefined {
+    validateWorkOrderClock(tenantId, nowMs, now);
+    if (!isPublicIdentifier(workOrderId)) {
+      throw new Error("work-order ID is invalid");
+    }
+    return this.#transaction(() => {
+      this.#expireWorkOrders(tenantId, nowMs, now);
+      const row = this.#workOrder(tenantId, workOrderId);
+      return row === undefined ? undefined : mapWorkOrder(row);
+    });
+  }
+
+  approveWorkOrder(input: {
+    tenantId: string;
+    workOrderId: string;
+    credentialId: string;
+    approvedAt: string;
+    nowMs: number;
+  }): WorkOrderMutationResult | undefined {
+    validateWorkOrderActorMutation(input);
+    return this.#transaction(() => {
+      this.#expireWorkOrders(input.tenantId, input.nowMs, input.approvedAt);
+      const row = this.#workOrder(input.tenantId, input.workOrderId);
+      if (row === undefined) return undefined;
+      const current = mapWorkOrder(row);
+      if (current.approvedAt !== null) {
+        return { workOrder: current, idempotent: true };
+      }
+      if (
+        current.status !== "pending_approval" ||
+        !current.localApprovalRequired
+      ) {
+        throw new StoreWorkOrderStateError("work order is not approvable");
+      }
+      const changed = this.#database
+        .prepare(
+          `UPDATE work_orders SET status = 'queued',
+             approved_by_credential_id = ?, approved_at = ?
+           WHERE tenant_id = ? AND work_order_id = ?
+             AND status = 'pending_approval'`,
+        )
+        .run(
+          input.credentialId,
+          input.approvedAt,
+          input.tenantId,
+          input.workOrderId,
+        );
+      if (changed.changes !== 1) {
+        throw new StoreWorkOrderStateError("work-order approval conflicted");
+      }
+      this.#recordWorkOrderEvent({
+        tenantId: input.tenantId,
+        workOrderId: input.workOrderId,
+        occurredAt: input.approvedAt,
+        kind: "approved",
+        actorType: "credential",
+        actorId: input.credentialId,
+        status: "queued",
+        detailSha256: null,
+      });
+      return {
+        workOrder: this.#requiredWorkOrder(input.tenantId, input.workOrderId),
+        idempotent: false,
+      };
+    });
+  }
+
+  cancelWorkOrder(input: {
+    tenantId: string;
+    workOrderId: string;
+    credentialId: string;
+    cancelledAt: string;
+    nowMs: number;
+  }): WorkOrderMutationResult | undefined {
+    validateWorkOrderActorMutation({
+      ...input,
+      approvedAt: input.cancelledAt,
+    });
+    return this.#transaction(() => {
+      this.#expireWorkOrders(input.tenantId, input.nowMs, input.cancelledAt);
+      const row = this.#workOrder(input.tenantId, input.workOrderId);
+      if (row === undefined) return undefined;
+      const current = mapWorkOrder(row);
+      if (current.status === "cancelled") {
+        return { workOrder: current, idempotent: true };
+      }
+      if (!["pending_approval", "queued"].includes(current.status)) {
+        throw new StoreWorkOrderStateError(
+          "leased or terminal work order cannot be cancelled",
+        );
+      }
+      this.#database
+        .prepare(
+          `UPDATE work_orders SET status = 'cancelled',
+             cancelled_by_credential_id = ?, cancelled_at = ?
+           WHERE tenant_id = ? AND work_order_id = ?`,
+        )
+        .run(
+          input.credentialId,
+          input.cancelledAt,
+          input.tenantId,
+          input.workOrderId,
+        );
+      this.#recordWorkOrderEvent({
+        tenantId: input.tenantId,
+        workOrderId: input.workOrderId,
+        occurredAt: input.cancelledAt,
+        kind: "cancelled",
+        actorType: "credential",
+        actorId: input.credentialId,
+        status: "cancelled",
+        detailSha256: null,
+      });
+      return {
+        workOrder: this.#requiredWorkOrder(input.tenantId, input.workOrderId),
+        idempotent: false,
+      };
+    });
+  }
+
+  claimWorkOrder(input: {
+    tenantId: string;
+    deviceId: string;
+    requestSha256: string;
+    nonceSha256: string;
+    nonceExpiresAtMs: number;
+    leaseId: string;
+    leaseSeconds: number;
+    eligibleActionIds: readonly WorkOrderActionId[];
+    nowMs: number;
+    now: string;
+  }): WorkOrderClaimResult {
+    validateWorkOrderClaim(input);
+    return this.#transaction(() => {
+      this.#expireWorkOrders(input.tenantId, input.nowMs, input.now);
+      this.#releaseExpiredLeases(
+        input.tenantId,
+        input.deviceId,
+        input.nowMs,
+        input.now,
+      );
+      this.#database
+        .prepare("DELETE FROM work_order_claims WHERE expires_at_ms <= ?")
+        .run(input.nowMs);
+      const existing = this.#database
+        .prepare(
+          `SELECT request_sha256, work_order_id, lease_id FROM work_order_claims
+           WHERE tenant_id = ? AND device_id = ? AND nonce_sha256 = ?`,
+        )
+        .get(input.tenantId, input.deviceId, input.nonceSha256) as
+        | {
+            request_sha256: string;
+            work_order_id: string | null;
+            lease_id: string | null;
+          }
+        | undefined;
+      if (existing !== undefined) {
+        if (existing.request_sha256 !== input.requestSha256) {
+          throw new StoreWorkOrderReplayError("claim nonce was rebound");
+        }
+        if (existing.work_order_id === null) {
+          return { workOrder: null, idempotent: true };
+        }
+        const workOrder = this.#requiredWorkOrder(
+          input.tenantId,
+          existing.work_order_id,
+        );
+        if (
+          existing.lease_id === null ||
+          workOrder.status !== "leased" ||
+          workOrder.leaseId !== existing.lease_id
+        ) {
+          throw new StoreWorkOrderReplayError(
+            "claim lease is no longer active",
+          );
+        }
+        return { workOrder, idempotent: true };
+      }
+      const recent = this.#database
+        .prepare(
+          `SELECT COUNT(*) AS count FROM work_order_claims
+           WHERE tenant_id = ? AND device_id = ?`,
+        )
+        .get(input.tenantId, input.deviceId) as { count: number };
+      if (recent.count >= MAX_RECENT_WORK_ORDER_CLAIMS_PER_DEVICE) {
+        throw new StoreConflictError("recent work-order claim limit reached");
+      }
+      let selected: WorkOrderRow | undefined;
+      if (input.eligibleActionIds.length > 0) {
+        const placeholders = input.eligibleActionIds.map(() => "?").join(",");
+        selected = this.#database
+          .prepare(
+            `SELECT * FROM work_orders
+             WHERE tenant_id = ? AND target_device_id = ? AND status = 'queued'
+               AND action_id IN (${placeholders})
+             ORDER BY created_at, work_order_id LIMIT 1`,
+          )
+          .get(input.tenantId, input.deviceId, ...input.eligibleActionIds) as
+          WorkOrderRow | undefined;
+      }
+      if (selected !== undefined) {
+        const leaseExpiresAtMs = Math.min(
+          input.nowMs + input.leaseSeconds * 1000,
+          selected.expires_at_ms,
+        );
+        const leaseExpiresAt = new Date(leaseExpiresAtMs).toISOString();
+        const changed = this.#database
+          .prepare(
+            `UPDATE work_orders SET status = 'leased', lease_id = ?,
+               leased_at = ?, lease_expires_at = ?, lease_expires_at_ms = ?
+             WHERE tenant_id = ? AND work_order_id = ? AND status = 'queued'`,
+          )
+          .run(
+            input.leaseId,
+            input.now,
+            leaseExpiresAt,
+            leaseExpiresAtMs,
+            input.tenantId,
+            selected.work_order_id,
+          );
+        if (changed.changes !== 1) {
+          throw new StoreWorkOrderStateError("work-order claim conflicted");
+        }
+        this.#recordWorkOrderEvent({
+          tenantId: input.tenantId,
+          workOrderId: selected.work_order_id,
+          occurredAt: input.now,
+          kind: "leased",
+          actorType: "device",
+          actorId: input.deviceId,
+          status: "leased",
+          detailSha256: input.requestSha256,
+        });
+      }
+      this.#database
+        .prepare(
+          `INSERT INTO work_order_claims
+            (tenant_id, device_id, nonce_sha256, request_sha256,
+             work_order_id, lease_id, expires_at_ms)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          input.tenantId,
+          input.deviceId,
+          input.nonceSha256,
+          input.requestSha256,
+          selected?.work_order_id ?? null,
+          selected === undefined ? null : input.leaseId,
+          input.nonceExpiresAtMs,
+        );
+      return {
+        workOrder:
+          selected === undefined
+            ? null
+            : this.#requiredWorkOrder(input.tenantId, selected.work_order_id),
+        idempotent: false,
+      };
+    });
+  }
+
+  recordWorkOrderResult(input: {
+    result: WorkOrderResult;
+    envelopeSha256: string;
+    receivedAt: string;
+    nowMs: number;
+  }): WorkOrderMutationResult {
+    if (!isSha256(input.envelopeSha256) || !isRfc3339(input.receivedAt)) {
+      throw new Error("work-order result storage input is invalid");
+    }
+    return this.#transaction(() => {
+      this.#expireWorkOrders(
+        input.result.tenantId,
+        input.nowMs,
+        input.receivedAt,
+      );
+      const row = this.#workOrder(
+        input.result.tenantId,
+        input.result.workOrderId,
+      );
+      if (row === undefined) {
+        throw new StoreAuthorizationError("work order is unknown");
+      }
+      const current = mapWorkOrder(row);
+      if (current.resultSha256 !== null) {
+        if (row.result_envelope_sha256 === input.envelopeSha256) {
+          return { workOrder: current, idempotent: true };
+        }
+        throw new StoreWorkOrderReplayError("work-order result conflicts");
+      }
+      if (
+        current.status !== "leased" ||
+        current.targetDeviceId !== input.result.deviceId ||
+        current.leaseId !== input.result.leaseId ||
+        current.actionId !== input.result.actionId ||
+        current.actionVersion !== input.result.actionVersion ||
+        current.leasedAt === null ||
+        current.leaseExpiresAt === null ||
+        Date.parse(input.result.completedAt) < Date.parse(current.leasedAt) ||
+        Date.parse(input.result.completedAt) >
+          Date.parse(current.leaseExpiresAt) ||
+        row.lease_expires_at_ms === null ||
+        row.lease_expires_at_ms <= input.nowMs
+      ) {
+        throw new StoreWorkOrderStateError(
+          "work-order result binding is stale",
+        );
+      }
+      this.#database
+        .prepare(
+          `UPDATE work_orders SET status = ?, outcome = ?, result_sha256 = ?,
+             result_envelope_sha256 = ?, completed_at = ?
+           WHERE tenant_id = ? AND work_order_id = ? AND status = 'leased'`,
+        )
+        .run(
+          input.result.outcome,
+          input.result.outcome,
+          input.result.resultSha256,
+          input.envelopeSha256,
+          input.result.completedAt,
+          input.result.tenantId,
+          input.result.workOrderId,
+        );
+      this.#recordWorkOrderEvent({
+        tenantId: input.result.tenantId,
+        workOrderId: input.result.workOrderId,
+        occurredAt: input.receivedAt,
+        kind: "completed",
+        actorType: "device",
+        actorId: input.result.deviceId,
+        status: input.result.outcome,
+        detailSha256: input.result.resultSha256,
+      });
+      return {
+        workOrder: this.#requiredWorkOrder(
+          input.result.tenantId,
+          input.result.workOrderId,
+        ),
+        idempotent: false,
+      };
+    });
+  }
+
+  listWorkOrderEvents(tenantId: string): ListedWorkOrderEvent[] {
+    if (!isPublicIdentifier(tenantId)) throw new Error("tenant ID is invalid");
+    const rows = this.#database
+      .prepare(
+        `SELECT * FROM work_order_events WHERE tenant_id = ?
+         ORDER BY sequence DESC LIMIT ?`,
+      )
+      .all(
+        tenantId,
+        MAX_LISTED_WORK_ORDER_EVENTS,
+      ) as unknown as WorkOrderEventRow[];
+    return rows.map(mapWorkOrderEvent);
   }
 
   setPolicyTrustAnchor(
@@ -1547,6 +2103,123 @@ export class FleetStore {
       );
   }
 
+  #workOrder(tenantId: string, workOrderId: string): WorkOrderRow | undefined {
+    return this.#database
+      .prepare(
+        `SELECT * FROM work_orders
+         WHERE tenant_id = ? AND work_order_id = ?`,
+      )
+      .get(tenantId, workOrderId) as WorkOrderRow | undefined;
+  }
+
+  #requiredWorkOrder(tenantId: string, workOrderId: string): StoredWorkOrder {
+    const row = this.#workOrder(tenantId, workOrderId);
+    if (row === undefined) throw new Error("stored work order disappeared");
+    return mapWorkOrder(row);
+  }
+
+  #expireWorkOrders(tenantId: string, nowMs: number, now: string): void {
+    const rows = this.#database
+      .prepare(
+        `SELECT work_order_id FROM work_orders
+         WHERE tenant_id = ? AND expires_at_ms <= ?
+           AND status IN ('pending_approval','queued','leased')`,
+      )
+      .all(tenantId, nowMs) as unknown as { work_order_id: string }[];
+    for (const row of rows) {
+      this.#database
+        .prepare(
+          `UPDATE work_orders SET status = 'expired'
+           WHERE tenant_id = ? AND work_order_id = ?`,
+        )
+        .run(tenantId, row.work_order_id);
+      this.#recordWorkOrderEvent({
+        tenantId,
+        workOrderId: row.work_order_id,
+        occurredAt: now,
+        kind: "expired",
+        actorType: "system",
+        actorId: "fleet-control-plane",
+        status: "expired",
+        detailSha256: null,
+      });
+    }
+  }
+
+  #releaseExpiredLeases(
+    tenantId: string,
+    deviceId: string,
+    nowMs: number,
+    now: string,
+  ): void {
+    const rows = this.#database
+      .prepare(
+        `SELECT work_order_id FROM work_orders
+         WHERE tenant_id = ? AND target_device_id = ? AND status = 'leased'
+           AND lease_expires_at_ms <= ? AND expires_at_ms > ?`,
+      )
+      .all(tenantId, deviceId, nowMs, nowMs) as unknown as {
+      work_order_id: string;
+    }[];
+    for (const row of rows) {
+      this.#database
+        .prepare(
+          `UPDATE work_orders SET status = 'queued', lease_id = NULL,
+             leased_at = NULL, lease_expires_at = NULL,
+             lease_expires_at_ms = NULL
+           WHERE tenant_id = ? AND work_order_id = ? AND status = 'leased'`,
+        )
+        .run(tenantId, row.work_order_id);
+      this.#recordWorkOrderEvent({
+        tenantId,
+        workOrderId: row.work_order_id,
+        occurredAt: now,
+        kind: "lease_expired",
+        actorType: "system",
+        actorId: "fleet-control-plane",
+        status: "queued",
+        detailSha256: null,
+      });
+    }
+  }
+
+  #recordWorkOrderEvent(input: Omit<ListedWorkOrderEvent, "sequence">): void {
+    const current = this.#database
+      .prepare(
+        `SELECT COALESCE(MAX(sequence), 0) AS sequence
+         FROM work_order_events WHERE tenant_id = ?`,
+      )
+      .get(input.tenantId) as { sequence: number };
+    const sequence = current.sequence + 1;
+    if (!Number.isSafeInteger(sequence) || sequence < 1) {
+      throw new StoreConflictError("work-order event sequence exhausted");
+    }
+    this.#database
+      .prepare(
+        `INSERT INTO work_order_events
+          (tenant_id, sequence, work_order_id, occurred_at, kind, actor_type,
+           actor_id, status, detail_sha256)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        input.tenantId,
+        sequence,
+        input.workOrderId,
+        input.occurredAt,
+        input.kind,
+        input.actorType,
+        input.actorId,
+        input.status,
+        input.detailSha256,
+      );
+    this.#database
+      .prepare(
+        `DELETE FROM work_order_events
+         WHERE tenant_id = ? AND sequence <= ?`,
+      )
+      .run(input.tenantId, sequence - MAX_WORK_ORDER_EVENTS_PER_TENANT);
+  }
+
   #recordServicePullNonce(
     operation: FleetServiceOperation,
     tenantId: string,
@@ -1612,7 +2285,7 @@ export class FleetStore {
     const version = this.#database.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    if (version.user_version > 7) {
+    if (version.user_version > 8) {
       throw new Error(
         `unsupported Fleet database version ${version.user_version}`,
       );
@@ -1983,6 +2656,176 @@ export class FleetStore {
           PRAGMA user_version = 7;
         `);
       });
+      currentVersion = 7;
+    }
+
+    if (currentVersion === 7) {
+      this.#transaction(() => {
+        this.#database.exec(`
+          DROP INDEX tenant_access_audit_recent_idx;
+          ALTER TABLE tenant_access_audit RENAME TO tenant_access_audit_v7;
+          CREATE TABLE tenant_access_audit (
+            tenant_id TEXT NOT NULL REFERENCES tenants(tenant_id),
+            sequence INTEGER NOT NULL CHECK (sequence > 0),
+            occurred_at TEXT NOT NULL,
+            credential_id TEXT NOT NULL,
+            role TEXT NOT NULL CHECK (role IN ('admin', 'operator')),
+            action TEXT NOT NULL CHECK (action IN (
+              'access_audit.list', 'asset.list', 'credential.create',
+              'credential.list', 'credential.revoke', 'device.list',
+              'device.revoke', 'device_audit.list',
+              'enrollment_token.create', 'entitlement.list',
+              'entitlement.publish', 'entitlement_revocations.publish',
+              'policy.list', 'policy.publish', 'policy_trust_anchor.set',
+              'update.list', 'update.publish', 'work_order.approve',
+              'work_order.cancel', 'work_order.create', 'work_order.list',
+              'work_order_audit.list'
+            )),
+            outcome TEXT NOT NULL CHECK (outcome IN ('allowed', 'denied')),
+            target_tenant_id TEXT NOT NULL,
+            target_type TEXT NOT NULL CHECK (
+              target_type IN ('credential', 'device', 'tenant', 'work_order')
+            ),
+            target_id TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, sequence),
+            FOREIGN KEY (tenant_id, credential_id)
+              REFERENCES tenant_access_credentials(tenant_id, credential_id)
+          ) STRICT;
+          INSERT INTO tenant_access_audit SELECT * FROM tenant_access_audit_v7;
+          DROP TABLE tenant_access_audit_v7;
+          CREATE INDEX tenant_access_audit_recent_idx
+            ON tenant_access_audit(tenant_id, sequence DESC);
+
+          DROP INDEX service_receipts_request_idx;
+          ALTER TABLE service_receipts RENAME TO service_receipts_v7;
+          CREATE TABLE service_receipts (
+            tenant_id TEXT NOT NULL,
+            device_id TEXT NOT NULL,
+            operation TEXT NOT NULL CHECK (operation IN (
+              'inventory', 'audit', 'policy_pull', 'entitlement_pull',
+              'work_order_claim', 'work_order_result'
+            )),
+            sequence INTEGER NOT NULL CHECK (sequence > 0),
+            request_sha256 TEXT NOT NULL,
+            response_sha256 TEXT NOT NULL,
+            status INTEGER NOT NULL CHECK (status IN (200, 201)),
+            response_body TEXT NOT NULL,
+            receipt_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, device_id, sequence),
+            FOREIGN KEY (tenant_id, device_id)
+              REFERENCES service_receipt_checkpoints(tenant_id, device_id)
+              ON DELETE CASCADE
+          ) STRICT;
+          INSERT INTO service_receipts SELECT * FROM service_receipts_v7;
+          DROP TABLE service_receipts_v7;
+          CREATE INDEX service_receipts_request_idx
+            ON service_receipts(
+              tenant_id, device_id, operation, request_sha256, sequence DESC
+            );
+
+          CREATE TABLE work_orders (
+            tenant_id TEXT NOT NULL REFERENCES tenants(tenant_id),
+            work_order_id TEXT NOT NULL,
+            request_id TEXT NOT NULL,
+            request_sha256 TEXT NOT NULL CHECK (
+              length(request_sha256) = 64 AND
+              request_sha256 NOT GLOB '*[^0-9a-f]*'
+            ),
+            target_device_id TEXT NOT NULL,
+            action_id TEXT NOT NULL CHECK (action_id IN (
+              'linux.filesystem.health.v1',
+              'linux.storage.health.v1',
+              'linux.fstab.disable-missing-uuid.v1'
+            )),
+            action_version INTEGER NOT NULL CHECK (action_version = 1),
+            kind TEXT NOT NULL CHECK (kind IN ('diagnosis', 'repair')),
+            risk TEXT NOT NULL CHECK (risk IN ('R0', 'R1', 'R2', 'R3')),
+            local_approval_required INTEGER NOT NULL CHECK (
+              local_approval_required IN (0, 1)
+            ),
+            status TEXT NOT NULL CHECK (status IN (
+              'pending_approval', 'queued', 'leased', 'succeeded', 'failed',
+              'rejected', 'cancelled', 'expired'
+            )),
+            created_by_credential_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            expires_at_ms INTEGER NOT NULL,
+            approved_by_credential_id TEXT,
+            approved_at TEXT,
+            lease_id TEXT,
+            leased_at TEXT,
+            lease_expires_at TEXT,
+            lease_expires_at_ms INTEGER,
+            outcome TEXT CHECK (outcome IN ('succeeded', 'failed', 'rejected')),
+            result_sha256 TEXT,
+            result_envelope_sha256 TEXT,
+            completed_at TEXT,
+            cancelled_by_credential_id TEXT,
+            cancelled_at TEXT,
+            PRIMARY KEY (tenant_id, work_order_id),
+            UNIQUE (tenant_id, request_id),
+            FOREIGN KEY (tenant_id, target_device_id)
+              REFERENCES devices(tenant_id, device_id),
+            FOREIGN KEY (tenant_id, created_by_credential_id)
+              REFERENCES tenant_access_credentials(tenant_id, credential_id),
+            FOREIGN KEY (tenant_id, approved_by_credential_id)
+              REFERENCES tenant_access_credentials(tenant_id, credential_id),
+            FOREIGN KEY (tenant_id, cancelled_by_credential_id)
+              REFERENCES tenant_access_credentials(tenant_id, credential_id)
+          ) STRICT;
+          CREATE INDEX work_orders_queue_idx ON work_orders(
+            tenant_id, target_device_id, status, created_at, work_order_id
+          );
+
+          CREATE TABLE work_order_claims (
+            tenant_id TEXT NOT NULL,
+            device_id TEXT NOT NULL,
+            nonce_sha256 TEXT NOT NULL,
+            request_sha256 TEXT NOT NULL,
+            work_order_id TEXT,
+            lease_id TEXT,
+            expires_at_ms INTEGER NOT NULL,
+            CHECK ((work_order_id IS NULL AND lease_id IS NULL) OR
+                   (work_order_id IS NOT NULL AND lease_id IS NOT NULL)),
+            PRIMARY KEY (tenant_id, device_id, nonce_sha256),
+            FOREIGN KEY (tenant_id, device_id)
+              REFERENCES devices(tenant_id, device_id) ON DELETE CASCADE,
+            FOREIGN KEY (tenant_id, work_order_id)
+              REFERENCES work_orders(tenant_id, work_order_id) ON DELETE CASCADE
+          ) STRICT;
+          CREATE INDEX work_order_claims_expiry_idx
+            ON work_order_claims(expires_at_ms);
+
+          CREATE TABLE work_order_events (
+            tenant_id TEXT NOT NULL,
+            sequence INTEGER NOT NULL CHECK (sequence > 0),
+            work_order_id TEXT NOT NULL,
+            occurred_at TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK (kind IN (
+              'created', 'approved', 'leased', 'lease_expired', 'completed',
+              'cancelled', 'expired'
+            )),
+            actor_type TEXT NOT NULL CHECK (
+              actor_type IN ('credential', 'device', 'system')
+            ),
+            actor_id TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN (
+              'pending_approval', 'queued', 'leased', 'succeeded', 'failed',
+              'rejected', 'cancelled', 'expired'
+            )),
+            detail_sha256 TEXT,
+            PRIMARY KEY (tenant_id, sequence),
+            FOREIGN KEY (tenant_id, work_order_id)
+              REFERENCES work_orders(tenant_id, work_order_id) ON DELETE CASCADE
+          ) STRICT;
+          CREATE INDEX work_order_events_recent_idx
+            ON work_order_events(tenant_id, sequence DESC);
+
+          PRAGMA user_version = 8;
+        `);
+      });
     }
   }
 }
@@ -2019,6 +2862,48 @@ interface TenantAccessAuditRow {
   target_tenant_id: string;
   target_type: string;
   target_id: string;
+}
+
+interface WorkOrderRow {
+  tenant_id: string;
+  work_order_id: string;
+  request_id: string;
+  request_sha256: string;
+  target_device_id: string;
+  action_id: string;
+  action_version: number;
+  kind: string;
+  risk: string;
+  local_approval_required: number;
+  status: string;
+  created_by_credential_id: string;
+  created_at: string;
+  expires_at: string;
+  expires_at_ms: number;
+  approved_by_credential_id: string | null;
+  approved_at: string | null;
+  lease_id: string | null;
+  leased_at: string | null;
+  lease_expires_at: string | null;
+  lease_expires_at_ms: number | null;
+  outcome: string | null;
+  result_sha256: string | null;
+  result_envelope_sha256: string | null;
+  completed_at: string | null;
+  cancelled_by_credential_id: string | null;
+  cancelled_at: string | null;
+}
+
+interface WorkOrderEventRow {
+  tenant_id: string;
+  sequence: number;
+  work_order_id: string;
+  occurred_at: string;
+  kind: string;
+  actor_type: string;
+  actor_id: string;
+  status: string;
+  detail_sha256: string | null;
 }
 
 interface AuditSessionRow {
@@ -2133,6 +3018,271 @@ function parseStoredEvidenceDigests(value: string): string[] {
   return parsed;
 }
 
+function validateWorkOrderCreate(input: {
+  tenantId: string;
+  workOrderId: string;
+  requestId: string;
+  requestSha256: string;
+  targetDeviceId: string;
+  actionId: WorkOrderActionId;
+  actionVersion: number;
+  kind: WorkOrderKind;
+  risk: WorkOrderRisk;
+  localApprovalRequired: boolean;
+  createdByCredentialId: string;
+  createdAt: string;
+  expiresAt: string;
+  expiresAtMs: number;
+}): void {
+  const action = workOrderActionCatalog[input.actionId];
+  if (
+    !isPublicIdentifier(input.tenantId) ||
+    !isPublicIdentifier(input.workOrderId) ||
+    !isPublicIdentifier(input.requestId) ||
+    !isSha256(input.requestSha256) ||
+    !/^KA-[0-9a-f]{24}$/.test(input.targetDeviceId) ||
+    action === undefined ||
+    input.actionVersion !== action.version ||
+    input.kind !== action.kind ||
+    input.risk !== action.risk ||
+    input.localApprovalRequired !== action.localApprovalRequired ||
+    !isPublicIdentifier(input.createdByCredentialId) ||
+    !isRfc3339(input.createdAt) ||
+    !isRfc3339(input.expiresAt) ||
+    !Number.isSafeInteger(input.expiresAtMs) ||
+    Date.parse(input.expiresAt) !== input.expiresAtMs ||
+    input.expiresAtMs <= Date.parse(input.createdAt)
+  ) {
+    throw new Error("work-order create input is invalid");
+  }
+}
+
+function validateWorkOrderClock(
+  tenantId: string,
+  nowMs: number,
+  now: string,
+): void {
+  if (
+    !isPublicIdentifier(tenantId) ||
+    !Number.isSafeInteger(nowMs) ||
+    !isRfc3339(now) ||
+    Date.parse(now) !== nowMs
+  ) {
+    throw new Error("work-order clock is invalid");
+  }
+}
+
+function validateWorkOrderActorMutation(input: {
+  tenantId: string;
+  workOrderId: string;
+  credentialId: string;
+  approvedAt: string;
+  nowMs: number;
+}): void {
+  validateWorkOrderClock(input.tenantId, input.nowMs, input.approvedAt);
+  if (
+    !isPublicIdentifier(input.workOrderId) ||
+    !isPublicIdentifier(input.credentialId)
+  ) {
+    throw new Error("work-order actor mutation is invalid");
+  }
+}
+
+function validateWorkOrderClaim(input: {
+  tenantId: string;
+  deviceId: string;
+  requestSha256: string;
+  nonceSha256: string;
+  nonceExpiresAtMs: number;
+  leaseId: string;
+  leaseSeconds: number;
+  eligibleActionIds: readonly WorkOrderActionId[];
+  nowMs: number;
+  now: string;
+}): void {
+  validateWorkOrderClock(input.tenantId, input.nowMs, input.now);
+  if (
+    !/^KA-[0-9a-f]{24}$/.test(input.deviceId) ||
+    !isSha256(input.requestSha256) ||
+    !isSha256(input.nonceSha256) ||
+    !Number.isSafeInteger(input.nonceExpiresAtMs) ||
+    input.nonceExpiresAtMs <= input.nowMs ||
+    !isPublicIdentifier(input.leaseId) ||
+    !Number.isSafeInteger(input.leaseSeconds) ||
+    input.leaseSeconds < 30 ||
+    input.leaseSeconds > 900 ||
+    input.eligibleActionIds.some((item) => !isWorkOrderActionId(item)) ||
+    new Set(input.eligibleActionIds).size !== input.eligibleActionIds.length
+  ) {
+    throw new Error("work-order claim is invalid");
+  }
+}
+
+function mapWorkOrder(row: WorkOrderRow): StoredWorkOrder {
+  if (
+    !isPublicIdentifier(row.tenant_id) ||
+    !isPublicIdentifier(row.work_order_id) ||
+    !isPublicIdentifier(row.request_id) ||
+    !isSha256(row.request_sha256) ||
+    !/^KA-[0-9a-f]{24}$/.test(row.target_device_id) ||
+    !isWorkOrderActionId(row.action_id) ||
+    !isWorkOrderKind(row.kind) ||
+    !isWorkOrderRisk(row.risk) ||
+    !isWorkOrderStatus(row.status) ||
+    ![0, 1].includes(row.local_approval_required) ||
+    !isPublicIdentifier(row.created_by_credential_id) ||
+    !isRfc3339(row.created_at) ||
+    !isRfc3339(row.expires_at) ||
+    Date.parse(row.expires_at) !== row.expires_at_ms ||
+    row.action_version !== workOrderActionCatalog[row.action_id].version ||
+    row.kind !== workOrderActionCatalog[row.action_id].kind ||
+    row.risk !== workOrderActionCatalog[row.action_id].risk ||
+    Boolean(row.local_approval_required) !==
+      workOrderActionCatalog[row.action_id].localApprovalRequired ||
+    !nullableIdentifier(row.approved_by_credential_id) ||
+    !nullableRfc3339(row.approved_at) ||
+    (row.approved_by_credential_id === null) !== (row.approved_at === null) ||
+    !nullableIdentifier(row.lease_id) ||
+    !nullableRfc3339(row.leased_at) ||
+    !nullableRfc3339(row.lease_expires_at) ||
+    (row.lease_id === null ||
+      row.leased_at === null ||
+      row.lease_expires_at === null ||
+      row.lease_expires_at_ms === null) !==
+      (row.lease_id === null &&
+        row.leased_at === null &&
+        row.lease_expires_at === null &&
+        row.lease_expires_at_ms === null) ||
+    (row.lease_expires_at !== null &&
+      Date.parse(row.lease_expires_at) !== row.lease_expires_at_ms) ||
+    (row.outcome !== null && !isWorkOrderResultOutcome(row.outcome)) ||
+    (row.result_sha256 !== null && !isSha256(row.result_sha256)) ||
+    (row.result_envelope_sha256 !== null &&
+      !isSha256(row.result_envelope_sha256)) ||
+    !nullableRfc3339(row.completed_at) ||
+    !nullableIdentifier(row.cancelled_by_credential_id) ||
+    !nullableRfc3339(row.cancelled_at) ||
+    new Set([
+      row.outcome === null,
+      row.result_sha256 === null,
+      row.result_envelope_sha256 === null,
+      row.completed_at === null,
+    ]).size !== 1 ||
+    (row.outcome !== null && row.status !== row.outcome) ||
+    ["succeeded", "failed", "rejected"].includes(row.status) !==
+      (row.outcome !== null) ||
+    (row.cancelled_by_credential_id === null) !== (row.cancelled_at === null) ||
+    (row.status === "cancelled") !== (row.cancelled_at !== null) ||
+    (row.kind === "repair" &&
+      ["leased", "succeeded", "failed", "rejected"].includes(row.status) &&
+      row.approved_at === null)
+  ) {
+    throw new Error("stored work order is invalid");
+  }
+  return {
+    tenantId: row.tenant_id,
+    workOrderId: row.work_order_id,
+    requestId: row.request_id,
+    targetDeviceId: row.target_device_id,
+    actionId: row.action_id,
+    actionVersion: row.action_version,
+    kind: row.kind,
+    risk: row.risk,
+    localApprovalRequired: row.local_approval_required === 1,
+    status: row.status,
+    createdByCredentialId: row.created_by_credential_id,
+    createdAt: row.created_at,
+    expiresAt: row.expires_at,
+    approvedByCredentialId: row.approved_by_credential_id,
+    approvedAt: row.approved_at,
+    leaseId: row.lease_id,
+    leasedAt: row.leased_at,
+    leaseExpiresAt: row.lease_expires_at,
+    outcome: row.outcome,
+    resultSha256: row.result_sha256,
+    completedAt: row.completed_at,
+    cancelledByCredentialId: row.cancelled_by_credential_id,
+    cancelledAt: row.cancelled_at,
+  };
+}
+
+function mapWorkOrderEvent(row: WorkOrderEventRow): ListedWorkOrderEvent {
+  if (
+    !isPublicIdentifier(row.tenant_id) ||
+    !Number.isSafeInteger(row.sequence) ||
+    row.sequence < 1 ||
+    !isPublicIdentifier(row.work_order_id) ||
+    !isRfc3339(row.occurred_at) ||
+    !isWorkOrderEventKind(row.kind) ||
+    !["credential", "device", "system"].includes(row.actor_type) ||
+    !isPublicIdentifier(row.actor_id) ||
+    !isWorkOrderStatus(row.status) ||
+    (row.detail_sha256 !== null && !isSha256(row.detail_sha256))
+  ) {
+    throw new Error("stored work-order event is invalid");
+  }
+  return {
+    tenantId: row.tenant_id,
+    sequence: row.sequence,
+    workOrderId: row.work_order_id,
+    occurredAt: row.occurred_at,
+    kind: row.kind,
+    actorType: row.actor_type as ListedWorkOrderEvent["actorType"],
+    actorId: row.actor_id,
+    status: row.status,
+    detailSha256: row.detail_sha256,
+  };
+}
+
+function isWorkOrderKind(value: string): value is WorkOrderKind {
+  return value === "diagnosis" || value === "repair";
+}
+
+function isWorkOrderRisk(value: string): value is WorkOrderRisk {
+  return ["R0", "R1", "R2", "R3"].includes(value);
+}
+
+function isWorkOrderStatus(value: string): value is WorkOrderStatus {
+  return [
+    "pending_approval",
+    "queued",
+    "leased",
+    "succeeded",
+    "failed",
+    "rejected",
+    "cancelled",
+    "expired",
+  ].includes(value);
+}
+
+function isWorkOrderResultOutcome(
+  value: string,
+): value is WorkOrderResultOutcome {
+  return ["succeeded", "failed", "rejected"].includes(value);
+}
+
+function isWorkOrderEventKind(
+  value: string,
+): value is ListedWorkOrderEvent["kind"] {
+  return [
+    "created",
+    "approved",
+    "leased",
+    "lease_expired",
+    "completed",
+    "cancelled",
+    "expired",
+  ].includes(value);
+}
+
+function nullableIdentifier(value: string | null): boolean {
+  return value === null || isPublicIdentifier(value);
+}
+
+function nullableRfc3339(value: string | null): boolean {
+  return value === null || isRfc3339(value);
+}
+
 function validateCredentialInput(input: {
   tenantId: string;
   credentialId: string;
@@ -2195,7 +3345,9 @@ function validateTenantAccessAuditInput(input: {
     !isTenantAccessAction(input.action) ||
     !["allowed", "denied"].includes(input.outcome) ||
     !isPublicIdentifier(input.targetTenantId) ||
-    !["credential", "device", "tenant"].includes(input.targetType) ||
+    !["credential", "device", "tenant", "work_order"].includes(
+      input.targetType,
+    ) ||
     !isPublicIdentifier(input.targetId)
   ) {
     throw new Error("tenant access audit event is invalid");
@@ -2211,7 +3363,7 @@ function mapTenantAccessAudit(
     !isTenantRole(row.role) ||
     !isTenantAccessAction(row.action) ||
     !["allowed", "denied"].includes(row.outcome) ||
-    !["credential", "device", "tenant"].includes(row.target_type)
+    !["credential", "device", "tenant", "work_order"].includes(row.target_type)
   ) {
     throw new Error("stored tenant access audit event is invalid");
   }
@@ -2302,9 +3454,14 @@ function mapServiceResponse(row: ServiceResponseRow): StoredServiceResponse {
 }
 
 function isServiceOperation(value: string): value is FleetServiceOperation {
-  return ["inventory", "audit", "policy_pull", "entitlement_pull"].includes(
-    value,
-  );
+  return [
+    "inventory",
+    "audit",
+    "policy_pull",
+    "entitlement_pull",
+    "work_order_claim",
+    "work_order_result",
+  ].includes(value);
 }
 
 function isSha256(value: string): boolean {

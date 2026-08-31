@@ -22,6 +22,8 @@ import {
   FLEET_POLICY_BUNDLE_SCHEMA,
   FLEET_POLICY_PULL_SCHEMA,
   FLEET_UPDATE_PULL_SCHEMA,
+  FLEET_WORK_ORDER_CLAIM_SCHEMA,
+  FLEET_WORK_ORDER_RESULT_SCHEMA,
   UPDATE_MANIFEST_SCHEMA,
   auditSigningBytes,
   canonicalJson,
@@ -34,6 +36,8 @@ import {
   policyPullSigningBytes,
   updateManifestSigningBytes,
   updatePullSigningBytes,
+  workOrderClaimSigningBytes,
+  workOrderResultSigningBytes,
   type AuditEnvelope,
   type AuditEnvelopeUnsigned,
   type EnrollmentRequest,
@@ -56,6 +60,10 @@ import {
   type SignedUpdateManifestUnsigned,
   type UpdatePullRequest,
   type UpdatePullRequestUnsigned,
+  type WorkOrderClaimRequest,
+  type WorkOrderClaimRequestUnsigned,
+  type WorkOrderResult,
+  type WorkOrderResultUnsigned,
   parseServiceReceipt,
   serviceReceiptSigningBytes,
   type ServiceReceipt,
@@ -313,6 +321,7 @@ function signedEnrollment(
   tenant: TenantCredentials,
   enrollmentToken: string,
   device: DeviceCredentials,
+  platform: EnrollmentRequestUnsigned["platform"] = "linux",
 ): EnrollmentRequest {
   const unsigned: EnrollmentRequestUnsigned = {
     schema: FLEET_ENROLLMENT_SCHEMA,
@@ -320,7 +329,7 @@ function signedEnrollment(
     tenantId: tenant.tenantId,
     deviceId: device.deviceId,
     publicKeySpki: device.publicKeySpki,
-    platform: "linux",
+    platform,
     agentVersion: "0.1.0-test",
     issuedAt: new Date(harness.now.value).toISOString(),
     nonce: randomBytes(16).toString("base64url"),
@@ -339,6 +348,7 @@ async function enroll(
   harness: Harness,
   tenant: TenantCredentials,
   deviceId: string,
+  platform: EnrollmentRequestUnsigned["platform"] = "linux",
 ): Promise<DeviceCredentials> {
   const token = await createEnrollmentToken(harness, tenant);
   const device = makeDevice(deviceId);
@@ -346,7 +356,7 @@ async function enroll(
     harness,
     "POST",
     "/v1/enrollments",
-    signedEnrollment(harness, tenant, token, device),
+    signedEnrollment(harness, tenant, token, device, platform),
   );
   assert.equal(result.status, 201);
   return device;
@@ -475,6 +485,8 @@ function signedPolicy(
     revision: number;
     assignments: PolicyAssignments;
     retentionDays?: number;
+    allowedActionIds?: string[];
+    deniedActionIds?: string[];
   },
 ): SignedPolicyBundle {
   const nowSeconds = Math.floor(INITIAL_TIME / 1000);
@@ -491,11 +503,11 @@ function signedPolicy(
     rules: {
       maxRisk: "R2",
       localApprovalFrom: "R1",
-      allowedActionIds: [
+      allowedActionIds: input.allowedActionIds ?? [
         "linux.fstab.disable-missing-uuid.v1",
         "system.observe.noop",
       ],
-      deniedActionIds: ["windows.registry.unsafe.v1"],
+      deniedActionIds: input.deniedActionIds ?? ["windows.registry.unsafe.v1"],
       allowEvidenceUpload: true,
       retentionDays: input.retentionDays ?? 90,
       providerModes: ["enterprise", "offline", "openai_api"],
@@ -614,6 +626,62 @@ function signedEntitlementPull(
     signature: sign(
       null,
       entitlementPullSigningBytes(unsigned),
+      device.privateKey,
+    ).toString("base64url"),
+  };
+}
+
+function signedWorkOrderClaim(
+  harness: Harness,
+  tenant: TenantCredentials,
+  device: DeviceCredentials,
+  nonce = randomBytes(32),
+): WorkOrderClaimRequest {
+  const unsigned: WorkOrderClaimRequestUnsigned = {
+    schema: FLEET_WORK_ORDER_CLAIM_SCHEMA,
+    tenantId: tenant.tenantId,
+    deviceId: device.deviceId,
+    issuedAt: new Date(harness.now.value).toISOString(),
+    nonce: nonce.toString("base64url"),
+    leaseSeconds: 300,
+  };
+  return {
+    ...unsigned,
+    signature: sign(
+      null,
+      workOrderClaimSigningBytes(unsigned),
+      device.privateKey,
+    ).toString("base64url"),
+  };
+}
+
+function signedWorkOrderResult(
+  harness: Harness,
+  tenant: TenantCredentials,
+  device: DeviceCredentials,
+  workOrder: Record<string, unknown>,
+  outcome: WorkOrderResultUnsigned["outcome"] = "succeeded",
+): WorkOrderResult {
+  const lease = workOrder.lease as Record<string, unknown>;
+  const unsigned: WorkOrderResultUnsigned = {
+    schema: FLEET_WORK_ORDER_RESULT_SCHEMA,
+    tenantId: tenant.tenantId,
+    deviceId: device.deviceId,
+    workOrderId: workOrder.workOrderId as string,
+    leaseId: lease.leaseId as string,
+    actionId: workOrder.actionId as WorkOrderResultUnsigned["actionId"],
+    actionVersion: workOrder.actionVersion as number,
+    outcome,
+    completedAt: new Date(harness.now.value).toISOString(),
+    resultSha256: createHash("sha256")
+      .update(`bounded-${outcome}`)
+      .digest("hex"),
+  };
+  return {
+    ...unsigned,
+    signature: sign(
+      null,
+      workOrderResultSigningBytes(unsigned),
       device.privateKey,
     ).toString("base64url"),
   };
@@ -1107,7 +1175,7 @@ test("tenant credentials and authorization audit survive restart", async () => {
   }
 });
 
-test("SQLite v6 migrates its tenant administrator into RBAC v7", async () => {
+test("SQLite v6 migrates its tenant administrator through Fleet v8", async () => {
   let harness = await createHarness();
   const directory = harness.directory;
   const now = harness.now;
@@ -1116,6 +1184,9 @@ test("SQLite v6 migrates its tenant administrator into RBAC v7", async () => {
     await destroyHarness(harness, false);
     const legacy = new DatabaseSync(harness.databasePath);
     legacy.exec(`
+      DROP TABLE work_order_events;
+      DROP TABLE work_order_claims;
+      DROP TABLE work_orders;
       DROP TABLE tenant_access_audit;
       DROP TABLE tenant_access_credentials;
       PRAGMA user_version = 6;
@@ -1139,7 +1210,7 @@ test("SQLite v6 migrates its tenant administrator into RBAC v7", async () => {
     const version = database.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    assert.equal(version.user_version, 7);
+    assert.equal(version.user_version, 8);
     database.close();
   } finally {
     await destroyHarness(harness);
@@ -2250,6 +2321,9 @@ test("policy anchor, bundle, and assignment survive SQLite restart", async () =>
 
     const legacy = new DatabaseSync(harness.databasePath);
     legacy.exec(`
+      DROP TABLE work_order_events;
+      DROP TABLE work_order_claims;
+      DROP TABLE work_orders;
       DROP TABLE tenant_access_audit;
       DROP TABLE tenant_access_credentials;
       DROP TABLE service_receipts;
@@ -2299,7 +2373,7 @@ test("policy anchor, bundle, and assignment survive SQLite restart", async () =>
     const version = database.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    assert.equal(version.user_version, 7);
+    assert.equal(version.user_version, 8);
     const nonce = database
       .prepare(
         `SELECT nonce_sha256 FROM policy_pull_nonces
@@ -2602,7 +2676,7 @@ test("signed entitlement pulls isolate assignments and reject replay, key mismat
   }
 });
 
-test("SQLite v3 migrates through v7 and entitlement checkpoints survive restart", async () => {
+test("SQLite v3 migrates through v8 and entitlement checkpoints survive restart", async () => {
   let harness = await createHarness();
   const directory = harness.directory;
   const now = harness.now;
@@ -2617,6 +2691,9 @@ test("SQLite v3 migrates through v7 and entitlement checkpoints survive restart"
 
     const legacy = new DatabaseSync(harness.databasePath);
     legacy.exec(`
+      DROP TABLE work_order_events;
+      DROP TABLE work_order_claims;
+      DROP TABLE work_orders;
       DROP TABLE tenant_access_audit;
       DROP TABLE tenant_access_credentials;
       DROP TABLE service_receipts;
@@ -2667,7 +2744,7 @@ test("SQLite v3 migrates through v7 and entitlement checkpoints survive restart"
     const version = database.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    assert.equal(version.user_version, 7);
+    assert.equal(version.user_version, 8);
     const document = database
       .prepare(
         `SELECT highest_sequence, envelope_sha256, canonical_json
@@ -2893,7 +2970,7 @@ test("signed update pulls bind target and ring, filter eligibility, and reject r
   }
 });
 
-test("SQLite v4 migrates through v7 and update checkpoints survive restart", async () => {
+test("SQLite v4 migrates through v8 and update checkpoints survive restart", async () => {
   let harness = await createHarness();
   const directory = harness.directory;
   const now = harness.now;
@@ -2904,6 +2981,9 @@ test("SQLite v4 migrates through v7 and update checkpoints survive restart", asy
 
     const legacy = new DatabaseSync(harness.databasePath);
     legacy.exec(`
+      DROP TABLE work_order_events;
+      DROP TABLE work_order_claims;
+      DROP TABLE work_orders;
       DROP TABLE tenant_access_audit;
       DROP TABLE tenant_access_credentials;
       DROP TABLE service_receipts;
@@ -2933,7 +3013,7 @@ test("SQLite v4 migrates through v7 and update checkpoints survive restart", asy
     const version = database.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    assert.equal(version.user_version, 7);
+    assert.equal(version.user_version, 8);
     const checkpoint = database
       .prepare(
         `SELECT highest_sequence, manifest_sha256
@@ -3071,6 +3151,481 @@ test("tenant governance status is bounded, minimized, and admin-scoped", async (
       ).status,
       401,
     );
+  } finally {
+    await destroyHarness(harness);
+  }
+});
+
+test("typed work orders require governance and explicit write approval", async () => {
+  const harness = await createHarness();
+  try {
+    const tenant = await createTenant(harness);
+    const operator = await createAccessCredential(
+      harness,
+      tenant,
+      "operator",
+      "Repair desk",
+    );
+    const device = await enroll(harness, tenant, "work-order-device", "rescue");
+    const signer = makePolicySigner();
+    assert.equal((await setPolicyAnchor(harness, tenant, signer)).status, 201);
+    assert.equal(
+      (
+        await publishPolicy(
+          harness,
+          tenant,
+          signedPolicy(tenant, signer, {
+            policyId: "work-orders",
+            revision: 1,
+            assignments: { deviceIds: [device.deviceId] },
+            allowedActionIds: [
+              "linux.filesystem.health.v1",
+              "linux.fstab.disable-missing-uuid.v1",
+              "linux.storage.health.v1",
+            ],
+          }),
+        )
+      ).status,
+      201,
+    );
+    assert.equal(
+      (
+        await publishEntitlement(
+          harness,
+          tenant,
+          signedEntitlement(tenant, [device.deviceId], {
+            entitlementId: "work_order_license",
+            sequence: 1,
+          }),
+        )
+      ).status,
+      201,
+    );
+
+    const expiresAt = new Date(harness.now.value + 3_600_000).toISOString();
+    const diagnosticBody = {
+      requestId: "request-diagnostic-1",
+      targetDeviceId: device.deviceId,
+      actionId: "linux.storage.health.v1",
+      actionVersion: 1,
+      expiresAt,
+    };
+    assert.equal(
+      (
+        await api(
+          harness,
+          "POST",
+          `/v1/tenants/${tenant.tenantId}/work-orders`,
+          { ...diagnosticBody, command: "sh -c id" },
+          operator.accessToken,
+        )
+      ).status,
+      400,
+    );
+    const diagnostic = await api(
+      harness,
+      "POST",
+      `/v1/tenants/${tenant.tenantId}/work-orders`,
+      diagnosticBody,
+      operator.accessToken,
+    );
+    assert.equal(diagnostic.status, 201);
+    assert.equal(diagnostic.body.status, "queued");
+
+    const repair = await api(
+      harness,
+      "POST",
+      `/v1/tenants/${tenant.tenantId}/work-orders`,
+      {
+        requestId: "request-repair-1",
+        targetDeviceId: device.deviceId,
+        actionId: "linux.fstab.disable-missing-uuid.v1",
+        actionVersion: 1,
+        expiresAt,
+      },
+      operator.accessToken,
+    );
+    assert.equal(repair.status, 201);
+    assert.equal(repair.body.status, "pending_approval");
+    assert.equal(repair.body.localApprovalRequired, true);
+    assert.equal(
+      (
+        await api(
+          harness,
+          "POST",
+          `/v1/tenants/${tenant.tenantId}/work-orders/${repair.body.workOrderId as string}/approve`,
+          { decision: "approve" },
+          operator.accessToken,
+        )
+      ).status,
+      403,
+    );
+
+    const claim = signedWorkOrderClaim(harness, tenant, device);
+    const claimed = await api(harness, "POST", "/v1/work-order-claims", claim);
+    assert.equal(claimed.status, 200);
+    const leasedDiagnostic = claimed.body.workOrder as Record<string, unknown>;
+    assert.equal(leasedDiagnostic.actionId, "linux.storage.health.v1");
+    assert.equal(leasedDiagnostic.status, "leased");
+    assert.equal(leasedDiagnostic.approval, null);
+    verifiedServiceReceipt(claimed, {
+      requestBody: JSON.stringify(claim),
+      tenantId: tenant.tenantId,
+      deviceId: device.deviceId,
+      operation: "work_order_claim",
+    });
+    const repeatedClaim = await api(
+      harness,
+      "POST",
+      "/v1/work-order-claims",
+      claim,
+    );
+    assert.equal(repeatedClaim.rawBody, claimed.rawBody);
+    assert.equal(
+      repeatedClaim.headers.get("x-kernaid-fleet-receipt"),
+      claimed.headers.get("x-kernaid-fleet-receipt"),
+    );
+    const reboundUnsigned: WorkOrderClaimRequestUnsigned = {
+      schema: claim.schema,
+      tenantId: claim.tenantId,
+      deviceId: claim.deviceId,
+      issuedAt: claim.issuedAt,
+      nonce: claim.nonce,
+      leaseSeconds: 301,
+    };
+    const reboundClaim: WorkOrderClaimRequest = {
+      ...reboundUnsigned,
+      signature: sign(
+        null,
+        workOrderClaimSigningBytes(reboundUnsigned),
+        device.privateKey,
+      ).toString("base64url"),
+    };
+    assert.equal(
+      (await api(harness, "POST", "/v1/work-order-claims", reboundClaim))
+        .status,
+      409,
+    );
+
+    const resultEnvelope = signedWorkOrderResult(
+      harness,
+      tenant,
+      device,
+      leasedDiagnostic,
+    );
+    const completed = await api(
+      harness,
+      "POST",
+      "/v1/work-order-results",
+      resultEnvelope,
+    );
+    assert.equal(completed.status, 201);
+    assert.equal(completed.body.status, "succeeded");
+    assert.equal(completed.body.resultSha256, resultEnvelope.resultSha256);
+    verifiedServiceReceipt(completed, {
+      requestBody: JSON.stringify(resultEnvelope),
+      tenantId: tenant.tenantId,
+      deviceId: device.deviceId,
+      operation: "work_order_result",
+    });
+    const repeated = await api(
+      harness,
+      "POST",
+      "/v1/work-order-results",
+      resultEnvelope,
+    );
+    assert.equal(repeated.rawBody, completed.rawBody);
+    assert.equal(
+      repeated.headers.get("x-kernaid-fleet-receipt"),
+      completed.headers.get("x-kernaid-fleet-receipt"),
+    );
+
+    const approved = await api(
+      harness,
+      "POST",
+      `/v1/tenants/${tenant.tenantId}/work-orders/${repair.body.workOrderId as string}/approve`,
+      { decision: "approve" },
+      tenant.adminToken,
+    );
+    assert.equal(approved.status, 200);
+    const repairClaim = await api(
+      harness,
+      "POST",
+      "/v1/work-order-claims",
+      signedWorkOrderClaim(harness, tenant, device),
+    );
+    assert.equal(repairClaim.status, 200);
+    const leasedRepair = repairClaim.body.workOrder as Record<string, unknown>;
+    assert.equal(leasedRepair.actionId, "linux.fstab.disable-missing-uuid.v1");
+    assert.equal(leasedRepair.localApprovalRequired, true);
+    assert.notEqual(leasedRepair.approval, null);
+
+    const events = await api(
+      harness,
+      "GET",
+      `/v1/tenants/${tenant.tenantId}/work-order-events`,
+      undefined,
+      operator.accessToken,
+    );
+    assert.equal(events.status, 200);
+    assert.equal(
+      (events.body.items as Array<Record<string, unknown>>).some(
+        (event) => event.kind === "approved" && event.status === "queued",
+      ),
+      true,
+    );
+    assert.doesNotMatch(JSON.stringify(events.body), /sh -c|signature/i);
+  } finally {
+    await destroyHarness(harness);
+  }
+});
+
+test("work-order tenant, signature, entitlement, and revocation checks fail closed", async () => {
+  const harness = await createHarness();
+  try {
+    const first = await createTenant(harness);
+    const second = await createTenant(harness);
+    const device = await enroll(harness, first, "governed-work-order-device");
+    const signer = makePolicySigner();
+    assert.equal((await setPolicyAnchor(harness, first, signer)).status, 201);
+    assert.equal(
+      (
+        await publishPolicy(
+          harness,
+          first,
+          signedPolicy(first, signer, {
+            policyId: "diagnostics",
+            revision: 1,
+            assignments: { deviceIds: [device.deviceId] },
+            allowedActionIds: ["linux.storage.health.v1"],
+          }),
+        )
+      ).status,
+      201,
+    );
+    const entitlement = signedEntitlement(first, [device.deviceId], {
+      entitlementId: "governed_license",
+      sequence: 1,
+    });
+    assert.equal(
+      (await publishEntitlement(harness, first, entitlement)).status,
+      201,
+    );
+    const body = {
+      requestId: "governed-request",
+      targetDeviceId: device.deviceId,
+      actionId: "linux.storage.health.v1",
+      actionVersion: 1,
+      expiresAt: new Date(harness.now.value + 600_000).toISOString(),
+    };
+    assert.equal(
+      (
+        await api(
+          harness,
+          "POST",
+          `/v1/tenants/${first.tenantId}/work-orders`,
+          body,
+          second.adminToken,
+        )
+      ).status,
+      401,
+    );
+    assert.equal(
+      (
+        await api(
+          harness,
+          "POST",
+          `/v1/tenants/${first.tenantId}/work-orders`,
+          { ...body, actionId: "shell.exec.v1", requestId: "shell-request" },
+          first.adminToken,
+        )
+      ).status,
+      400,
+    );
+    assert.equal(
+      (
+        await api(
+          harness,
+          "POST",
+          `/v1/tenants/${first.tenantId}/work-orders`,
+          body,
+          first.adminToken,
+        )
+      ).status,
+      201,
+    );
+    const tamperedClaim = signedWorkOrderClaim(harness, first, device);
+    tamperedClaim.leaseSeconds = 301;
+    assert.equal(
+      (await api(harness, "POST", "/v1/work-order-claims", tamperedClaim))
+        .status,
+      401,
+    );
+    assert.equal(
+      (
+        await publishEntitlementRevocations(
+          harness,
+          first,
+          signedEntitlementRevocations(1, [entitlement.claims.entitlementId]),
+        )
+      ).status,
+      201,
+    );
+    const noLease = await api(
+      harness,
+      "POST",
+      "/v1/work-order-claims",
+      signedWorkOrderClaim(harness, first, device),
+    );
+    assert.equal(noLease.status, 200);
+    assert.equal(noLease.body.workOrder, null);
+    assert.equal(
+      (
+        await api(
+          harness,
+          "POST",
+          `/v1/tenants/${first.tenantId}/devices/${device.deviceId}/revoke`,
+          {},
+          first.adminToken,
+        )
+      ).status,
+      200,
+    );
+    assert.equal(
+      (
+        await api(
+          harness,
+          "POST",
+          "/v1/work-order-claims",
+          signedWorkOrderClaim(harness, first, device),
+        )
+      ).status,
+      403,
+    );
+  } finally {
+    await destroyHarness(harness);
+  }
+});
+
+test("work-order cancellation, expiry, and audit survive restart", async () => {
+  let harness = await createHarness();
+  const directory = harness.directory;
+  const now = harness.now;
+  try {
+    const tenant = await createTenant(harness);
+    const device = await enroll(
+      harness,
+      tenant,
+      "persistent-work-order-device",
+    );
+    const signer = makePolicySigner();
+    assert.equal((await setPolicyAnchor(harness, tenant, signer)).status, 201);
+    assert.equal(
+      (
+        await publishPolicy(
+          harness,
+          tenant,
+          signedPolicy(tenant, signer, {
+            policyId: "persistent-work-orders",
+            revision: 1,
+            assignments: { deviceIds: [device.deviceId] },
+            allowedActionIds: ["linux.filesystem.health.v1"],
+          }),
+        )
+      ).status,
+      201,
+    );
+    assert.equal(
+      (
+        await publishEntitlement(
+          harness,
+          tenant,
+          signedEntitlement(tenant, [device.deviceId], {
+            entitlementId: "persistent_work_order_license",
+            sequence: 1,
+          }),
+        )
+      ).status,
+      201,
+    );
+    const create = async (requestId: string, lifetime: number) =>
+      api(
+        harness,
+        "POST",
+        `/v1/tenants/${tenant.tenantId}/work-orders`,
+        {
+          requestId,
+          targetDeviceId: device.deviceId,
+          actionId: "linux.filesystem.health.v1",
+          actionVersion: 1,
+          expiresAt: new Date(harness.now.value + lifetime).toISOString(),
+        },
+        tenant.adminToken,
+      );
+    const cancelled = await create("cancel-me", 600_000);
+    assert.equal(cancelled.status, 201);
+    assert.equal(
+      (
+        await api(
+          harness,
+          "POST",
+          `/v1/tenants/${tenant.tenantId}/work-orders/${cancelled.body.workOrderId as string}/cancel`,
+          {},
+          tenant.adminToken,
+        )
+      ).status,
+      200,
+    );
+    assert.equal((await create("expire-me", 60_000)).status, 201);
+    harness.now.value += 61_000;
+    await destroyHarness(harness, false);
+    harness = await createHarness({ directory, now });
+    const listed = await api(
+      harness,
+      "GET",
+      `/v1/tenants/${tenant.tenantId}/work-orders`,
+      undefined,
+      tenant.adminToken,
+    );
+    assert.equal(listed.status, 200);
+    const statuses = new Map(
+      (listed.body.items as Array<Record<string, unknown>>).map((item) => [
+        item.requestId,
+        item.status,
+      ]),
+    );
+    assert.equal(statuses.get("cancel-me"), "cancelled");
+    assert.equal(statuses.get("expire-me"), "expired");
+    const claim = await api(
+      harness,
+      "POST",
+      "/v1/work-order-claims",
+      signedWorkOrderClaim(harness, tenant, device),
+    );
+    assert.equal(claim.status, 200);
+    assert.equal(claim.body.workOrder, null);
+    const events = await api(
+      harness,
+      "GET",
+      `/v1/tenants/${tenant.tenantId}/work-order-events`,
+      undefined,
+      tenant.adminToken,
+    );
+    assert.equal(events.status, 200);
+    assert.deepEqual(
+      new Set(
+        (events.body.items as Array<Record<string, unknown>>).map(
+          (event) => event.kind,
+        ),
+      ),
+      new Set(["created", "cancelled", "expired"]),
+    );
+    const database = new DatabaseSync(harness.databasePath, { readOnly: true });
+    const version = database.prepare("PRAGMA user_version").get() as {
+      user_version: number;
+    };
+    assert.equal(version.user_version, 8);
+    database.close();
   } finally {
     await destroyHarness(harness);
   }
