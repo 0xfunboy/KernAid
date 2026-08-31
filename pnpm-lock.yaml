@@ -76,6 +76,8 @@ importers:
         specifier: ^6.3.4
         version: 6.4.3(@types/node@24.13.3)(tsx@4.23.1)
 
+  apps/fleet-console: {}
+
   packages/fleet-schemas:
     devDependencies:
       '@types/node':
@@ -1139,6 +1141,7 @@ packages:
   eslint@9.39.5:
     resolution: {integrity: sha512-DgZS62aPLXKlnxILS/AYCoRvHaZeXceIzlXPkkGGzJWSow1aEk0lbTlxUSlyjC8jcaKxAdOnTDz+o1JFSBsyjw==}
     engines: {node: ^18.18.0 || ^20.9.0 || >=21.1.0}
+    deprecated: This version is no longer supported. Please see https://eslint.org/version-support for other options.
     hasBin: true
     peerDependencies:
       jiti: '*'

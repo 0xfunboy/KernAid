@@ -1,0 +1,16 @@
+{
+  "name": "@kernaid/fleet-console",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "24.18.0"
+  },
+  "scripts": {
+    "format": "prettier --write .",
+    "lint": "node --check app.js",
+    "check": "node --check app.js",
+    "test": "node --check app.js",
+    "build": "node --check app.js"
+  }
+}
