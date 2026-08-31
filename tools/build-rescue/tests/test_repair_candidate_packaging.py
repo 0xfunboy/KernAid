@@ -95,6 +95,7 @@ class RepairCandidatePackagingTests(unittest.TestCase):
         self.assertIn("node-version: 24.18.0", workflow)
         self.assertIn("KERNAID_REPAIR_CANDIDATE=1", workflow)
         self.assertIn("--features rescue-fstab-production-candidate", workflow)
+        self.assertEqual(workflow.count("--features custom-protocol"), 1)
         self.assertIn("-p kernaid-linux-blockfd", workflow)
         self.assertIn("KERNAID_BLOCKFD_PROBE_BINARY=", workflow)
         self.assertEqual(workflow.count("./tools/build-rescue/qemu-smoke.sh"), 2)

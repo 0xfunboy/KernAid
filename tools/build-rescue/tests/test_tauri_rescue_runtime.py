@@ -796,7 +796,7 @@ class RescueTauriBoundaryTests(unittest.TestCase):
                 REPO_DIR / "apps/desk/src-tauri-rescue/tauri.conf.json"
             ).read_text(encoding="utf-8")
         )
-        self.assertNotIn("devUrl", config["build"])
+        self.assertEqual(config["build"]["devUrl"], "http://127.0.0.1:4173")
         self.assertEqual(config["app"]["windows"], [])
         capabilities = config["app"]["security"]["capabilities"]
         self.assertEqual(len(capabilities), 1)
@@ -874,8 +874,14 @@ class RescueTauriBoundaryTests(unittest.TestCase):
         )
         self.assertEqual(
             manifest["dependencies"]["tauri"]["features"],
-            ["custom-protocol"],
+            [],
         )
+        self.assertEqual(manifest["features"]["default"], [])
+        self.assertEqual(
+            manifest["features"]["custom-protocol"],
+            ["tauri/custom-protocol"],
+        )
+        self.assertIn('#[cfg(feature = "custom-protocol")]', source)
 
     def test_live_image_has_one_unprivileged_supervised_shell(self) -> None:
         service = (

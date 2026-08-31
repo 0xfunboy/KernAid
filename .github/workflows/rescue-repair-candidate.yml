@@ -113,6 +113,7 @@ jobs:
             --bin kernaid-rescue-codex \
             --bin kernaid-codex-auth
           cargo build --locked --release -p kernaid-rescue-desk-shell \
+            --features custom-protocol \
             --bin kernaid-rescue-desk-shell
           cargo build --locked --release -p kernaid-broker \
             --features rescue-fstab-production-candidate \

@@ -651,6 +651,7 @@ class VaultLivePolicyTests(unittest.TestCase):
         self.assertIn("--bin kernaid-linux-hardware-inventory", workflow)
         self.assertIn("--bin kernaid-rescue-desk-shell", workflow)
         self.assertIn("-p kernaid-rescue-desk-shell", workflow)
+        self.assertEqual(workflow.count("--features custom-protocol"), 3)
         self.assertIn(
             "KERNAID_RESCUE_VAULTD_BINARY=/workspace/target/release/kernaid-rescue-vaultd",
             workflow,
