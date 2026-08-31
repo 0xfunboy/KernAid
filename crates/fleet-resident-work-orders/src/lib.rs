@@ -33,6 +33,8 @@ use zeroize::Zeroizing;
 
 #[cfg(feature = "linux-service")]
 pub mod linux;
+#[cfg(feature = "rescue-fstab-handoff")]
+pub mod rescue;
 #[cfg(all(feature = "windows-service", any(windows, test)))]
 pub mod windows;
 
@@ -365,6 +367,7 @@ impl PreparedLocalExecution {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LocalHandoffErrorCode {
     ApprovalPending,
+    ApprovalRejected,
     Busy,
     StateMismatch,
     ExecutionFailed,
@@ -477,6 +480,9 @@ impl ResidentWorkOrderError {
             Self::LocalBindingInvalid => "work-order-local-binding-invalid",
             Self::Transport(_) => "work-order-transport-failed",
             Self::Handoff(LocalHandoffErrorCode::ApprovalPending) => "work-order-approval-pending",
+            Self::Handoff(LocalHandoffErrorCode::ApprovalRejected) => {
+                "work-order-approval-rejected"
+            }
             Self::Handoff(_) => "work-order-handoff-failed",
             Self::Client(_) => "work-order-wire-invalid",
             Self::Io(_) => "work-order-state-io",
@@ -784,6 +790,23 @@ impl<T: ResidentWorkOrderTransport> ResidentWorkOrderEngine<T> {
                                 lease_id: order.lease().lease_id().to_owned(),
                             });
                         }
+                        Err(LocalHandoffErrorCode::ApprovalRejected) => {
+                            let result = self.signed_denial(
+                                identity,
+                                &order,
+                                &input,
+                                AuthorizationDenial::LocalApprovalRejected,
+                            )?;
+                            self.journal.replace_stage(
+                                JournalStage::ResultPending {
+                                    claim,
+                                    preparation: None,
+                                    result: URL_SAFE_NO_PAD.encode(result.export_offline()?),
+                                },
+                                None,
+                            )?;
+                            continue;
+                        }
                         Err(error) => return Err(ResidentWorkOrderError::Handoff(error)),
                     };
                     validate_preparation(&preparation, &order, &execution_id, input.now_unix)?;
@@ -964,6 +987,7 @@ enum AuthorizationDenial {
     Entitlement,
     PolicyMissing,
     PolicyDenied,
+    LocalApprovalRejected,
 }
 
 impl AuthorizationDenial {
@@ -973,6 +997,7 @@ impl AuthorizationDenial {
             Self::Entitlement => "entitlement-denied",
             Self::PolicyMissing => "policy-missing",
             Self::PolicyDenied => "policy-denied",
+            Self::LocalApprovalRejected => "local-approval-rejected",
         }
     }
 }

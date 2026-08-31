@@ -2508,6 +2508,7 @@ dependencies = [
  "chrono",
  "ed25519-dalek",
  "fs2",
+ "kernaid-core",
  "kernaid-device-identity",
  "kernaid-fleet-client",
  "kernaid-fleet-policy",

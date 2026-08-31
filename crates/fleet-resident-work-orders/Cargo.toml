@@ -5,7 +5,12 @@ edition.workspace = true
 
 [features]
 default = []
-rescue-fstab-handoff = []
+rescue-fstab-handoff = [
+  "dep:kernaid-core",
+  "dep:kernaid-linux-pack",
+  "kernaid-core/rescue-fstab-production-candidate",
+  "kernaid-linux-pack/rescue-fstab-production-candidate",
+]
 linux-service = [
   "dep:fs2",
   "dep:kernaid-linux-pack",
@@ -43,6 +48,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 ed25519-dalek = "2.2"
 fs2 = { version = "0.4.3", optional = true }
 kernaid-device-identity = { path = "../device-identity" }
+kernaid-core = { path = "../core", optional = true }
 kernaid-fleet-client = { path = "../fleet-client" }
 kernaid-fleet-policy = { path = "../fleet-policy" }
 kernaid-fleet-runtime = { path = "../fleet-runtime" }
