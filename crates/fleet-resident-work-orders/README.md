@@ -64,8 +64,9 @@ OS secret store, reads signed policy and entitlement state from the Fleet
 runtime, and polls only the two fixed work-order routes over HTTPS with no
 redirect or proxy support.
 
-The Linux adapter dispatches only `linux.filesystem.health.v1` and
-`linux.storage.health.v1` to their existing fixed-command, bounded collectors.
+The Linux adapter dispatches only `linux.filesystem.health.v1`,
+`linux.storage.health.v1` and `linux.boot-critical-path.v1` to their existing
+fixed-command, bounded collectors.
 It persists only execution bindings and result digests for restart recovery.
 The Rescue fstab write action is not connected to this process: remote tenant
 approval can never substitute for a fresh local Vault approval or the

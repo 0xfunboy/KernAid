@@ -1,6 +1,6 @@
 //! Installable, off-default Linux Resident service adapter.
 //!
-//! This module deliberately exposes only the two read-only Linux diagnostic
+//! This module deliberately exposes only the three read-only Linux diagnostic
 //! collectors. Rescue repair stays behind its existing Vault/Core/Broker
 //! boundary and is never reachable through this systemd service.
 
@@ -17,7 +17,7 @@ use kernaid_device_identity::{DeviceIdentity, validate_device_id};
 use kernaid_fleet_client::{LeasedWorkOrder, WorkOrderActionId, WorkOrderResultOutcome};
 use kernaid_fleet_policy::{RiskLevel, TransportState};
 use kernaid_fleet_runtime::{FleetRuntime, FleetRuntimeError};
-use kernaid_linux_pack::{filesystem_health, storage_health};
+use kernaid_linux_pack::{boot_critical_path, filesystem_health, storage_health};
 use kernaid_native_secrets::NativeDeviceIdentityStore;
 use rand_core::{OsRng, RngCore};
 use reqwest::{
@@ -386,6 +386,10 @@ impl DiagnosticCollector for SystemDiagnosticCollector {
                 storage_health::to_bounded_json(&storage_health::collect_current_machine())
                     .map(String::into_bytes)
             }
+            WorkOrderActionId::LinuxBootCriticalPathV1 => {
+                boot_critical_path::to_bounded_json(&boot_critical_path::collect_current_machine())
+                    .map(String::into_bytes)
+            }
             WorkOrderActionId::LinuxFstabDisableMissingUuidV1 => {
                 return Err(LocalHandoffErrorCode::StateMismatch);
             }
@@ -613,7 +617,9 @@ impl<C: DiagnosticCollector> LocalWorkOrderHandoff for LinuxDiagnosticHandoff<C>
 const fn is_diagnostic(action: WorkOrderActionId) -> bool {
     matches!(
         action,
-        WorkOrderActionId::LinuxFilesystemHealthV1 | WorkOrderActionId::LinuxStorageHealthV1
+        WorkOrderActionId::LinuxFilesystemHealthV1
+            | WorkOrderActionId::LinuxStorageHealthV1
+            | WorkOrderActionId::LinuxBootCriticalPathV1
     )
 }
 
@@ -1054,6 +1060,7 @@ mod tests {
             match action {
                 WorkOrderActionId::LinuxFilesystemHealthV1 => Ok(b"{\"health\":\"ok\"}".to_vec()),
                 WorkOrderActionId::LinuxStorageHealthV1 => Ok(b"{\"storage\":\"ok\"}".to_vec()),
+                WorkOrderActionId::LinuxBootCriticalPathV1 => Ok(b"{\"boot\":\"ok\"}".to_vec()),
                 WorkOrderActionId::LinuxFstabDisableMissingUuidV1 => {
                     Err(LocalHandoffErrorCode::StateMismatch)
                 }

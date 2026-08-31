@@ -29,6 +29,8 @@ pub enum WorkOrderActionId {
     LinuxFilesystemHealthV1,
     #[serde(rename = "linux.storage.health.v1")]
     LinuxStorageHealthV1,
+    #[serde(rename = "linux.boot-critical-path.v1")]
+    LinuxBootCriticalPathV1,
     #[serde(rename = "linux.fstab.disable-missing-uuid.v1")]
     LinuxFstabDisableMissingUuidV1,
 }
@@ -39,6 +41,7 @@ impl WorkOrderActionId {
         match self {
             Self::LinuxFilesystemHealthV1 => "linux.filesystem.health.v1",
             Self::LinuxStorageHealthV1 => "linux.storage.health.v1",
+            Self::LinuxBootCriticalPathV1 => "linux.boot-critical-path.v1",
             Self::LinuxFstabDisableMissingUuidV1 => "linux.fstab.disable-missing-uuid.v1",
         }
     }
@@ -46,7 +49,9 @@ impl WorkOrderActionId {
     #[must_use]
     pub const fn metadata(self) -> WorkOrderActionMetadata {
         match self {
-            Self::LinuxFilesystemHealthV1 | Self::LinuxStorageHealthV1 => WorkOrderActionMetadata {
+            Self::LinuxFilesystemHealthV1
+            | Self::LinuxStorageHealthV1
+            | Self::LinuxBootCriticalPathV1 => WorkOrderActionMetadata {
                 version: 1,
                 kind: WorkOrderKind::Diagnosis,
                 risk: WorkOrderRisk::R0,
@@ -77,6 +82,7 @@ impl FromStr for WorkOrderActionId {
         match value {
             "linux.filesystem.health.v1" => Ok(Self::LinuxFilesystemHealthV1),
             "linux.storage.health.v1" => Ok(Self::LinuxStorageHealthV1),
+            "linux.boot-critical-path.v1" => Ok(Self::LinuxBootCriticalPathV1),
             "linux.fstab.disable-missing-uuid.v1" => Ok(Self::LinuxFstabDisableMissingUuidV1),
             _ => Err(FleetClientError::InvalidField("actionId")),
         }

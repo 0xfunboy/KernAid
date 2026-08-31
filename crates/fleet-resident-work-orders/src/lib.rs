@@ -1027,7 +1027,9 @@ fn authorize_work_order(
 
 const fn action_supported(action: WorkOrderActionId, platform: ResidentPlatform) -> bool {
     match action {
-        WorkOrderActionId::LinuxFilesystemHealthV1 | WorkOrderActionId::LinuxStorageHealthV1 => {
+        WorkOrderActionId::LinuxFilesystemHealthV1
+        | WorkOrderActionId::LinuxStorageHealthV1
+        | WorkOrderActionId::LinuxBootCriticalPathV1 => {
             matches!(platform, ResidentPlatform::Linux | ResidentPlatform::Rescue)
         }
         WorkOrderActionId::LinuxFstabDisableMissingUuidV1 => {
