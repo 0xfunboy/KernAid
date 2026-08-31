@@ -34,8 +34,8 @@ approval. They remain private and unsupported on customer data.
 | -------------- | --------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
 | KernAid Desk   | Diagnose a running Windows, Linux or macOS installation                                                   | Unsigned engineering builds; read-only production collectors                                                                                    |
 | KernAid Rescue | Boot an amd64 PC that cannot start its installed OS                                                       | Hybrid BIOS/UEFI image; gated VT-unlock E2E is implemented but pending CI, and qualification remains virtual until physical USB evidence exists |
-| USB writer v2  | Verify an authorized ISO, write it and provision its encrypted Vault                                      | Linux operator path; accepts only the exact trusted-catalog image                                                                               |
-| KernAid Fleet  | Enroll devices, retain privacy-minimized inventory, apply restrictive policy and govern typed work orders | Live internal schema v8 control plane and console; Resident work-order execution service remains off-default and unqualified                    |
+| USB writers    | Verify an authorized image, write it and provision or verify the resulting medium                         | Guarded Linux writer plus off-default Windows Media Creator; physical USB remains unqualified                                                    |
+| KernAid Fleet  | Enroll devices, retain minimized inventory, govern typed work orders and track incident closure           | Live internal schema v10 control plane and console; Linux Resident services remain off-default and unqualified                                  |
 | Project site   | Explain the project publicly and distribute controlled artifacts privately                                | Public `/`; authenticated `/private/`; no public ISO route                                                                                      |
 
 ## Canonical repository map
@@ -67,7 +67,7 @@ On the internal build host used during this phase:
 | `/home/funboy/KernAid-dist` | Local staging for qualified/private artifacts; not another repository                |
 | `kaid-site.service`         | Node.js 24.18.0 site process on loopback                                             |
 | `kaid-cloudflared.service`  | Tunnel for `https://kaid.funboy.eu.cc`                                               |
-| `kernaid-fleet.service`     | Node.js 24.18.0 Fleet v8 origin on loopback, exposed at `https://fleet.funboy.eu.cc` |
+| `kernaid-fleet.service`     | Node.js 24.18.0 Fleet v10 origin on loopback, exposed at `https://fleet.funboy.eu.cc` |
 | `~/.config/kaid-site/`      | Operator-owned password and tunnel credentials; never committed                      |
 
 Both user services are enabled and user lingering keeps them active across

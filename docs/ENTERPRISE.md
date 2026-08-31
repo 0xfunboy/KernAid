@@ -77,6 +77,12 @@ and contains no enrollment or administrator token in plaintext.
 | `POST /v1/tenants/:tenantId/work-orders/:id/approve`  | Tenant admin                                        | Approve one organizational write intent                     |
 | `POST /v1/tenants/:tenantId/work-orders/:id/cancel`   | Tenant operator or admin                            | Cancel an unleased order                                    |
 | `GET /v1/tenants/:tenantId/work-order-events`         | Tenant operator or admin                            | List digest-only state transitions                          |
+| `GET /v1/tenants/:tenantId/incident-cases`            | Tenant operator or admin                            | List tenant-isolated operational cases                      |
+| `POST /v1/tenants/:tenantId/incident-cases`           | Tenant operator or admin                            | Open a case from one enrolled device or asset               |
+| `POST /v1/tenants/:tenantId/incident-cases/:id/update` | Tenant operator or admin                            | Change bounded status, severity or assignee                  |
+| `POST /v1/tenants/:tenantId/incident-cases/:id/work-orders` | Tenant operator or admin                       | Link a typed work order and its digest-only state            |
+| `POST /v1/tenants/:tenantId/incident-cases/:id/close` | Tenant admin                                        | Seal a canonical closure report and signed service receipt  |
+| `GET /v1/tenants/:tenantId/incident-case-events`      | Tenant operator or admin                            | List the minimized incident timeline                        |
 | `POST /v1/tenants/:tenantId/devices/:deviceId/revoke` | Tenant admin bearer token                           | Revoke future device submissions                            |
 | `GET /console/`                                       | Same origin                                         | Serve the static operator console when configured           |
 
