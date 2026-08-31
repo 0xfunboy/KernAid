@@ -15,11 +15,20 @@ linux-resident = [
   "dep:rustix",
   "dep:rustls",
 ]
+linux-systemd-boot-activator = [
+  "dep:fs2",
+  "dep:rustix",
+]
 
 [[bin]]
 name = "kernaid-fleet-resident-update"
 path = "src/main.rs"
 required-features = ["linux-resident"]
+
+[[bin]]
+name = "kernaid-fleet-resident-activator"
+path = "src/activator_main.rs"
+required-features = ["linux-systemd-boot-activator"]
 
 [dependencies]
 base64 = "0.22"

@@ -1,0 +1,16 @@
+{
+  "schema": "dev.kernaid.fleet.resident-update-config.v1",
+  "endpoint": "https://fleet.example.invalid",
+  "tenantId": "tenant-example",
+  "stateDirectory": "/var/lib/kernaid/fleet-resident-update",
+  "runtimeStateFile": "/var/lib/kernaid/fleet/runtime-v1.sqlite3",
+  "updateAnchorFile": "/etc/kernaid/update-issuer.pub",
+  "entitlementAnchorFile": "/etc/kernaid/entitlement-issuer.pub",
+  "policyAnchorFile": "/etc/kernaid/policy-issuer.pub",
+  "slotATargetFile": "/boot/EFI/Linux/kernaid-slot-a.efi",
+  "slotBTargetFile": "/boot/EFI/Linux/kernaid-slot-b.efi",
+  "updateRing": "stable",
+  "intervalSeconds": 300,
+  "connectTimeoutSeconds": 10,
+  "requestTimeoutSeconds": 1800
+}

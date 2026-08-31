@@ -1,0 +1,40 @@
+[Unit]
+Description=KernAid Fleet Resident signed A/B update staging
+Documentation=https://github.com/0xfunboy/KernAid/tree/main/deploy/fleet-resident-update
+After=network-online.target kernaid-fleet-resident-sync.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/libexec/kernaid-fleet-resident-update --config /etc/kernaid/fleet-resident-update.json
+User=root
+Group=root
+UMask=0077
+StateDirectory=kernaid/fleet-resident-update
+StateDirectoryMode=0700
+Restart=on-failure
+RestartSec=60s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/kernaid/fleet-resident-update
+ReadWritePaths=/boot/EFI/Linux
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_FOWNER
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

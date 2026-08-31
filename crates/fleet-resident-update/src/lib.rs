@@ -15,9 +15,10 @@ use kernaid_fleet_client::{
     FleetClientError, SignedUpdatePullRequest, UpdatePullRequestInput, UpdatePullResponseError,
 };
 use kernaid_update_client::{
-    ArtifactDescriptor, ArtifactStager, Availability, PreopenedInactiveTarget, Slot, StagingError,
-    StagingReceipt, StagingRecovery, UpdateArchitecture, UpdateCheckpoint, UpdateContext,
-    UpdateError, UpdatePlatform, UpdateRing, VerifiedUpdate, admit_update,
+    AdmittedUpdate, ArtifactDescriptor, ArtifactStager, Availability, CompletedArtifactEvidence,
+    PreopenedInactiveTarget, Slot, StagingError, StagingReceipt, StagingRecovery,
+    UpdateArchitecture, UpdateCheckpoint, UpdateContext, UpdateError, UpdatePlatform, UpdateRing,
+    VerifiedUpdate, admit_update,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -35,8 +36,11 @@ use zeroize::Zeroizing;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
+pub mod activation;
 #[cfg(feature = "linux-resident")]
 pub mod linux;
+#[cfg(feature = "linux-systemd-boot-activator")]
+pub mod linux_activation;
 
 pub const UPDATE_AUDIT_RECEIPT_SCHEMA: &str = "dev.kernaid.fleet.resident-update-audit-receipt.v1";
 pub const UPDATE_AUDIT_RECEIPT_DOMAIN: &[u8] = b"kernaid:fleet:resident-update-audit-receipt:v1\0";
@@ -75,8 +79,18 @@ pub struct ResidentUpdateConfig {
     pub update_anchor_file: PathBuf,
     pub entitlement_anchor_file: PathBuf,
     pub policy_anchor_file: PathBuf,
-    pub inactive_target_file: PathBuf,
-    pub active_slot: Slot,
+    /// Legacy engineering mode: one locally selected inactive file and an
+    /// explicit current slot. Both fields must be present together.
+    #[serde(default)]
+    pub inactive_target_file: Option<PathBuf>,
+    #[serde(default)]
+    pub active_slot: Option<Slot>,
+    /// Production A/B mode: both local targets are provisioned up front and
+    /// the Linux adapter selects only the inactive one from `/proc/cmdline`.
+    #[serde(default)]
+    pub slot_a_target_file: Option<PathBuf>,
+    #[serde(default)]
+    pub slot_b_target_file: Option<PathBuf>,
     pub update_ring: UpdateRing,
     pub interval_seconds: u64,
     pub connect_timeout_seconds: u64,
@@ -103,7 +117,6 @@ impl ResidentUpdateConfig {
             || !absolute_file(&self.update_anchor_file)
             || !absolute_file(&self.entitlement_anchor_file)
             || !absolute_file(&self.policy_anchor_file)
-            || !absolute_file(&self.inactive_target_file)
             || !(MIN_INTERVAL_SECONDS..=MAX_INTERVAL_SECONDS).contains(&self.interval_seconds)
             || !(MIN_TIMEOUT_SECONDS..=MAX_CONNECT_TIMEOUT_SECONDS)
                 .contains(&self.connect_timeout_seconds)
@@ -113,13 +126,34 @@ impl ResidentUpdateConfig {
         {
             return Err(ResidentUpdateError::InvalidConfig);
         }
-        let distinct_files = [
+        let legacy = match (&self.inactive_target_file, self.active_slot) {
+            (Some(path), Some(_)) if absolute_file(path) => true,
+            (None, None) => false,
+            _ => return Err(ResidentUpdateError::InvalidConfig),
+        };
+        let provisioned_ab = match (&self.slot_a_target_file, &self.slot_b_target_file) {
+            (Some(slot_a), Some(slot_b)) if absolute_file(slot_a) && absolute_file(slot_b) => true,
+            (None, None) => false,
+            _ => return Err(ResidentUpdateError::InvalidConfig),
+        };
+        if legacy == provisioned_ab {
+            return Err(ResidentUpdateError::InvalidConfig);
+        }
+        let mut distinct_files = vec![
             &self.runtime_state_file,
             &self.update_anchor_file,
             &self.entitlement_anchor_file,
             &self.policy_anchor_file,
-            &self.inactive_target_file,
         ];
+        if let Some(path) = self.inactive_target_file.as_ref() {
+            distinct_files.push(path);
+        }
+        if let Some(path) = self.slot_a_target_file.as_ref() {
+            distinct_files.push(path);
+        }
+        if let Some(path) = self.slot_b_target_file.as_ref() {
+            distinct_files.push(path);
+        }
         for (index, path) in distinct_files.iter().enumerate() {
             if distinct_files[..index].contains(path) {
                 return Err(ResidentUpdateError::InvalidConfig);
@@ -445,6 +479,7 @@ pub enum ResidentUpdateError {
     PullResponse(UpdatePullResponseError),
     Update(UpdateError),
     Staging(StagingError),
+    Activation(activation::ActivationError),
     Io(io::Error),
 }
 
@@ -484,6 +519,7 @@ impl ResidentUpdateError {
                 _ => "manifest-invalid",
             },
             Self::Staging(_) => "artifact-staging-failed",
+            Self::Activation(error) => error.code(),
             Self::Io(_) => "update-state-io",
         }
     }
@@ -518,6 +554,12 @@ impl From<UpdateError> for ResidentUpdateError {
 impl From<StagingError> for ResidentUpdateError {
     fn from(value: StagingError) -> Self {
         Self::Staging(value)
+    }
+}
+
+impl From<activation::ActivationError> for ResidentUpdateError {
+    fn from(value: activation::ActivationError) -> Self {
+        Self::Activation(value)
     }
 }
 
@@ -796,6 +838,10 @@ impl<T: ResidentUpdateTransport> ResidentUpdateEngine<T> {
                 )?
             }
         };
+        let activation_candidate =
+            activation::BootActivationCandidate::derive(&admission.update, &staging_receipt)?;
+        activation::ActivationJournal::open(&self.journal.directory)?
+            .persist_candidate(&activation_candidate)?;
         let receipt = SignedUpdateAuditReceipt::sign(
             identity,
             &self.tenant_id,
@@ -1279,6 +1325,21 @@ mod tests {
         receipt
             .verify(TENANT, &identity.device_id(), &identity.public_key())
             .expect("verify audit receipt");
+        let audit_json: Value = serde_json::from_slice(
+            &receipt
+                .export_canonical()
+                .expect("export staging audit receipt"),
+        )
+        .expect("parse staging audit receipt");
+        assert_eq!(audit_json["bootActivation"], "not_armed");
+        let candidate = activation::ActivationJournal::open(&state)
+            .expect("open activation journal")
+            .load_candidate()
+            .expect("load activation candidate")
+            .expect("activation candidate exists");
+        assert_eq!(candidate.release_id(), receipt.release_id());
+        assert_eq!(candidate.sequence(), receipt.sequence());
+        assert_eq!(candidate.target_slot(), receipt.target_slot());
         assert_eq!(receipt.sequence(), 7);
         assert_eq!(receipt.target_slot(), Slot::B);
         assert_eq!(pulls.load(Ordering::SeqCst), 1);
@@ -1493,5 +1554,39 @@ mod tests {
                 Err(ResidentUpdateError::InvalidConfig)
             ));
         }
+
+        let mut ab = valid.clone();
+        ab.as_object_mut()
+            .expect("A/B config object")
+            .remove("activeSlot");
+        ab.as_object_mut()
+            .expect("A/B config object")
+            .remove("inactiveTargetFile");
+        ab["slotATargetFile"] = json!("/boot/EFI/Linux/kernaid-slot-a.efi");
+        ab["slotBTargetFile"] = json!("/boot/EFI/Linux/kernaid-slot-b.efi");
+        ResidentUpdateConfig::parse(&serde_json::to_vec(&ab).expect("serialize A/B config"))
+            .expect("valid provisioned A/B config");
+
+        let mut mixed = ab.clone();
+        mixed["activeSlot"] = json!("A");
+        mixed["inactiveTargetFile"] = json!("/var/lib/kernaid/slot-b.img");
+        assert!(
+            ResidentUpdateConfig::parse(
+                &serde_json::to_vec(&mixed).expect("serialize mixed config")
+            )
+            .is_err()
+        );
+
+        let mut incomplete = ab;
+        incomplete
+            .as_object_mut()
+            .expect("incomplete config object")
+            .remove("slotBTargetFile");
+        assert!(
+            ResidentUpdateConfig::parse(
+                &serde_json::to_vec(&incomplete).expect("serialize incomplete config")
+            )
+            .is_err()
+        );
     }
 }

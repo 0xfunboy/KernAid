@@ -30,6 +30,8 @@ const LOCK_FILE: &str = ".resident-update-v1.lock";
 const MAX_PUBLIC_FILE_BYTES: usize = 16 * 1024;
 const MAX_ANCHOR_FILE_BYTES: usize = 128;
 const MAX_REQUEST_BYTES: usize = 16 * 1024;
+const PROC_CMDLINE: &str = "/proc/cmdline";
+const MAX_CMDLINE_BYTES: usize = 16 * 1024;
 
 pub struct HttpsUpdateTransport {
     client: Client,
@@ -212,7 +214,8 @@ pub fn run_service(config: ResidentUpdateConfig, once: bool) -> Result<(), Resid
             update_ring,
             updates_entitled: runtime.capabilities(now_unix).updates,
         };
-        let mut target = open_inactive_target(&config.inactive_target_file, config.active_slot)?;
+        let (inactive_target, active_slot) = locally_selected_target(&config)?;
+        let mut target = open_inactive_target(inactive_target, active_slot)?;
         let outcome = engine.run_once(&identity, input, &mut target)?;
         print_outcome(&outcome);
         if once || matches!(outcome, UpdateCycleOutcome::Staged(_)) {
@@ -220,6 +223,56 @@ pub fn run_service(config: ResidentUpdateConfig, once: bool) -> Result<(), Resid
         }
         thread::sleep(Duration::from_secs(config.interval_seconds));
     }
+}
+
+fn locally_selected_target(
+    config: &ResidentUpdateConfig,
+) -> Result<(&Path, Slot), ResidentUpdateError> {
+    match (
+        config.inactive_target_file.as_deref(),
+        config.active_slot,
+        config.slot_a_target_file.as_deref(),
+        config.slot_b_target_file.as_deref(),
+    ) {
+        (Some(path), Some(active_slot), None, None) => Ok((path, active_slot)),
+        (None, None, Some(slot_a), Some(slot_b)) => {
+            let active_slot = read_active_slot_marker()?;
+            Ok((
+                match active_slot {
+                    Slot::A => slot_b,
+                    Slot::B => slot_a,
+                },
+                active_slot,
+            ))
+        }
+        _ => Err(ResidentUpdateError::InvalidConfig),
+    }
+}
+
+fn read_active_slot_marker() -> Result<Slot, ResidentUpdateError> {
+    let mut bytes = Vec::new();
+    File::open(PROC_CMDLINE)?
+        .take((MAX_CMDLINE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.is_empty() || bytes.len() > MAX_CMDLINE_BYTES {
+        return Err(ResidentUpdateError::InvalidState);
+    }
+    let cmdline = std::str::from_utf8(&bytes).map_err(|_| ResidentUpdateError::InvalidState)?;
+    let mut selected = None;
+    for token in cmdline.split_ascii_whitespace() {
+        let Some(value) = token.strip_prefix("kernaid.slot=") else {
+            continue;
+        };
+        if selected.is_some() {
+            return Err(ResidentUpdateError::InvalidState);
+        }
+        selected = Some(match value {
+            "a" => Slot::A,
+            "b" => Slot::B,
+            _ => return Err(ResidentUpdateError::InvalidState),
+        });
+    }
+    selected.ok_or(ResidentUpdateError::InvalidState)
 }
 
 fn effective_update_ring(
