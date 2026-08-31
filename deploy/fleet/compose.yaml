@@ -1,0 +1,52 @@
+name: kernaid-fleet
+
+services:
+  fleet-control-plane:
+    image: kernaid/fleet-control-plane:0.1.0
+    build:
+      context: ../..
+      dockerfile: deploy/fleet/Dockerfile
+    user: "1000:1000"
+    restart: unless-stopped
+    stop_grace_period: 15s
+    ports:
+      - target: 7341
+        published: "${KERNAID_FLEET_BIND_PORT:-7341}"
+        host_ip: 127.0.0.1
+        protocol: tcp
+    environment:
+      NODE_ENV: production
+      KERNAID_FLEET_HOST: 0.0.0.0
+      KERNAID_FLEET_PORT: "7341"
+      KERNAID_FLEET_DB_PATH: /var/lib/kernaid-fleet/fleet.sqlite
+      KERNAID_FLEET_ROOT_TOKEN_FILE: /run/secrets/kernaid_fleet_root_token
+      FLEET_CONSOLE_DIR: /opt/kernaid/console
+    secrets:
+      - source: fleet-root-token
+        target: kernaid_fleet_root_token
+        uid: "1000"
+        gid: "1000"
+        mode: 0400
+    volumes:
+      - fleet-data:/var/lib/kernaid-fleet
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,uid=1000,gid=1000,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    networks:
+      - fleet-internal
+
+secrets:
+  fleet-root-token:
+    file: "${KERNAID_FLEET_ROOT_TOKEN_FILE:?set an absolute root-token file path}"
+
+volumes:
+  fleet-data:
+
+networks:
+  fleet-internal:
+    internal: true
