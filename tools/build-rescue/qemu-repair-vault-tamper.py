@@ -337,9 +337,12 @@ def proc_fd(descriptor: int) -> str:
 def huge_device_matches(encoded: int, device: int) -> bool:
     """Compare loop_info64's huge_encode_dev value with a stat dev_t."""
 
-    return (encoded >> 32, encoded & 0xFFFFFFFF) == (
-        os.major(device),
-        os.minor(device),
+    major = os.major(device)
+    minor = os.minor(device)
+    return encoded == (
+        (minor & 0xFF)
+        | (major << 8)
+        | ((minor & ~0xFF) << 12)
     )
 
 
