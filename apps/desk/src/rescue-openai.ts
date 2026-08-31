@@ -13,6 +13,13 @@ import {
   parseLinuxNormalizedSnapshotEnvelopeJson,
   type DiagnosisProposal,
 } from "@kernaid/schemas";
+import {
+  LINUX_STORAGE_HEALTH_COLLECTOR,
+  augmentDiagnosisWithStorageHealth,
+  parseLinuxStorageHealth,
+  storageHealthEvidenceSummary,
+  type LinuxStorageHealthSnapshot,
+} from "./storage-health";
 
 const API_VERSION = "kernaid.dev/rescue-openai/v1alpha1";
 const ENDPOINT = "/api/rescue/provider/openai";
@@ -217,6 +224,14 @@ interface RescueEvidence {
   content: string;
 }
 
+interface PreparedRescueEvidence {
+  providerEvidence: RescueEvidence;
+  storage?: {
+    evidenceId: string;
+    snapshot: LinuxStorageHealthSnapshot;
+  };
+}
+
 export async function getRescueOpenAiStatus(
   fetchRequest: Fetch = globalThis.fetch,
 ): Promise<RescueOpenAiStatus> {
@@ -263,7 +278,10 @@ export class RescueOpenAiProvider implements Provider {
   ): Promise<RescueOpenAiContextPreview> {
     if (options.signal?.aborted)
       throw new ProviderError("cancelled", "Anteprima OpenAI annullata.");
-    const rescueEvidence = await prepareEvidence(objective, evidence);
+    const { providerEvidence: rescueEvidence } = await prepareEvidence(
+      objective,
+      evidence,
+    );
     const requestId = newRequestId();
     const response = await exchange(
       this.#fetch,
@@ -302,7 +320,8 @@ export class RescueOpenAiProvider implements Provider {
       !CONTEXT_SHA256.test(options.contextSha256)
     )
       throw providerError("invalid_request");
-    const rescueEvidence = await prepareEvidence(objective, evidence);
+    const prepared = await prepareEvidence(objective, evidence);
+    const rescueEvidence = prepared.providerEvidence;
     const requestId = newRequestId();
     const response = await exchange(
       this.#fetch,
@@ -336,7 +355,13 @@ export class RescueOpenAiProvider implements Provider {
       )
     )
       throw providerError("invalid_response");
-    return proposal;
+    return prepared.storage === undefined
+      ? proposal
+      : augmentDiagnosisWithStorageHealth(
+          proposal,
+          prepared.storage.snapshot,
+          prepared.storage.evidenceId,
+        );
   }
 }
 
@@ -414,11 +439,22 @@ export function parseRescueOpenAiContextPreview(
 async function prepareEvidence(
   objective: string,
   evidence: readonly ObservedEvidence[],
-): Promise<RescueEvidence> {
+): Promise<PreparedRescueEvidence> {
   if (!boundedNonemptyUtf8(objective, MAX_OBJECTIVE_BYTES))
     throw providerError("invalid_request");
-  if (evidence.length !== 1) throw providerError("invalid_request");
-  const observed = evidence[0];
+  const storageEvidence = evidence.filter(
+    (item) => item.evidence.collector === LINUX_STORAGE_HEALTH_COLLECTOR,
+  );
+  const providerEvidence = evidence.filter(
+    (item) => item.evidence.collector !== LINUX_STORAGE_HEALTH_COLLECTOR,
+  );
+  if (
+    providerEvidence.length !== 1 ||
+    storageEvidence.length > 1 ||
+    evidence.length !== providerEvidence.length + storageEvidence.length
+  )
+    throw providerError("invalid_request");
+  const observed = providerEvidence[0];
   if (observed === undefined) throw providerError("invalid_request");
   const item = observed.evidence;
   if (
@@ -464,15 +500,43 @@ async function prepareEvidence(
     if (error instanceof ProviderError) throw error;
     throw providerError("invalid_request");
   }
+  let storage: PreparedRescueEvidence["storage"];
+  if (storageEvidence.length === 1) {
+    const observedStorage = storageEvidence[0]!;
+    if (
+      observedStorage.evidence.schemaVersion !== "1.0" ||
+      !EVIDENCE_ID.test(observedStorage.evidence.id) ||
+      observedStorage.evidence.target !== RESCUE_TARGET ||
+      observedStorage.evidence.contentType !== "application/json" ||
+      observedStorage.evidence.trust !== "observed-untrusted" ||
+      !boundedNonemptyUtf8(observedStorage.content, MAX_EVIDENCE_CONTENT_BYTES)
+    )
+      throw providerError("invalid_request");
+    let snapshot: LinuxStorageHealthSnapshot;
+    try {
+      snapshot = parseLinuxStorageHealth(observedStorage.content);
+    } catch {
+      throw providerError("invalid_request");
+    }
+    if (
+      observedStorage.evidence.summary !==
+      storageHealthEvidenceSummary(snapshot)
+    )
+      throw providerError("invalid_request");
+    storage = { evidenceId: observedStorage.evidence.id, snapshot };
+  }
   return {
-    schemaVersion: "1.0",
-    id: item.id,
-    collector: item.collector,
-    target: RESCUE_TARGET,
-    contentType: "application/json",
-    trust: "observed-untrusted",
-    summary: item.summary,
-    content: observed.content,
+    providerEvidence: {
+      schemaVersion: "1.0",
+      id: item.id,
+      collector: item.collector,
+      target: RESCUE_TARGET,
+      contentType: "application/json",
+      trust: "observed-untrusted",
+      summary: item.summary,
+      content: observed.content,
+    },
+    storage,
   };
 }
 

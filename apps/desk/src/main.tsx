@@ -29,6 +29,8 @@ import {
   inspectRescueInstalledTarget,
   linuxNormalizedSnapshotEvidenceSummary,
   linuxNormalizedSnapshotFromRescue,
+  parseLinuxStorageHealth,
+  projectLinuxStorageHealth,
   scanRescueInstalledTargets,
   secureAuditReady,
   selectRescueInstalledTarget,
@@ -37,9 +39,11 @@ import {
   logoutResidentOpenAi,
   verifyRescueTauriIpcIsolation,
   LINUX_NORMALIZED_SNAPSHOT_COLLECTOR,
+  LINUX_STORAGE_HEALTH_COLLECTOR,
   RESCUE_OFFLINE_EVIDENCE_COLLECTOR,
   RESCUE_OFFLINE_EVIDENCE_TARGET,
   type NativeObservation,
+  type LinuxStorageHealthSnapshot,
   type RescueOfflineInspection,
   RescueOfflineInspectionError,
   type RescueTargetCandidate,
@@ -49,6 +53,7 @@ import {
   type ResidentOpenAiStatus,
   type SecureRuntimeStatus,
 } from "./native";
+import { storageHealthEvidenceSummary } from "./storage-health";
 import {
   getRescueOpenAiStatus,
   parseRescueOpenAiContextPreview,
@@ -371,7 +376,8 @@ function App() {
       !objective.trim() ||
       sessionId === undefined ||
       sessionDriver === undefined ||
-      evidence.length !== 1 ||
+      evidence.length < 1 ||
+      evidence.length > 2 ||
       rescueOpenAiPreviewBusy ||
       busy ||
       !rescueProviderBinding.current.sessionMatches("openai")
@@ -857,6 +863,22 @@ function App() {
         inspection.os.family === "linux"
           ? await linuxNormalizedSnapshotFromRescue(inspection)
           : undefined;
+      const storageObservation = currentRuntimeInventory.find(
+        (item) =>
+          item.collector === LINUX_STORAGE_HEALTH_COLLECTOR &&
+          item.success &&
+          !item.truncated,
+      );
+      const selectedDiskRef = expectedScan.disks.find(
+        (disk) => disk.id === selected.target.diskId,
+      )?.ref;
+      let targetStorageHealth: LinuxStorageHealthSnapshot | undefined;
+      if (storageObservation !== undefined && selectedDiskRef !== undefined) {
+        targetStorageHealth = projectLinuxStorageHealth(
+          parseLinuxStorageHealth(storageObservation.output),
+          selectedDiskRef,
+        );
+      }
       const observed = await preparedDriver.requestEvidence(session.id, {
         collector:
           linuxSnapshot === undefined
@@ -873,6 +895,16 @@ function App() {
             : JSON.stringify(linuxSnapshot),
         contentType: "application/json",
       });
+      if (targetStorageHealth !== undefined)
+        observed.push(
+          ...(await preparedDriver.requestEvidence(session.id, {
+            collector: LINUX_STORAGE_HEALTH_COLLECTOR,
+            target: RESCUE_OFFLINE_EVIDENCE_TARGET,
+            summary: storageHealthEvidenceSummary(targetStorageHealth),
+            observedContent: JSON.stringify(targetStorageHealth),
+            contentType: "application/json",
+          })),
+        );
       if (
         rescueContextEpoch.current !== operationEpoch ||
         rescueProviderBinding.current.commitPreparation(providerPreparation) !==
@@ -1139,6 +1171,20 @@ function App() {
     "Boot",
     "Network",
   ];
+  let storageHealth: LinuxStorageHealthSnapshot | undefined;
+  const storageHealthObservation = nativeEvidence.find(
+    (item) =>
+      item.collector === LINUX_STORAGE_HEALTH_COLLECTOR &&
+      item.success &&
+      !item.truncated,
+  );
+  if (storageHealthObservation !== undefined) {
+    try {
+      storageHealth = parseLinuxStorageHealth(storageHealthObservation.output);
+    } catch {
+      storageHealth = undefined;
+    }
+  }
 
   return (
     <main>
@@ -1267,15 +1313,44 @@ function App() {
             {observationStatus(item, nativeEvidence)}
           </button>
         ))}
-        {nativeEvidence.map((item) => (
-          <details key={item.collector}>
-            <summary>
-              {isRescueRuntime() ? "Rescue · " : ""}
-              {item.collector} · {item.success ? "observed" : "unavailable"}
-            </summary>
-            <pre>{item.output || "Nessun output"}</pre>
-          </details>
-        ))}
+        {storageHealth !== undefined && (
+          <div className="storage-health" aria-label="Storage health">
+            <p className="label">SMART / NVME · READ-ONLY</p>
+            {storageHealth.enumerationStatus === "unsupported" ? (
+              <small>Telemetry unavailable · health not inferred</small>
+            ) : (
+              storageHealth.disks.map((disk) => {
+                const finding = storageHealth?.findings.find(
+                  (item) => item.diskRef === disk.diskRef,
+                );
+                return (
+                  <div
+                    className={`storage-health-disk ${disk.state}`}
+                    key={disk.diskRef}
+                  >
+                    <strong>{disk.diskRef}</strong>
+                    <span>{disk.state.replace("-", " ")}</span>
+                    {disk.temperatureCelsius !== null && (
+                      <small>{disk.temperatureCelsius} °C</small>
+                    )}
+                    {finding !== undefined && <p>{finding.nextAction}</p>}
+                  </div>
+                );
+              })
+            )}
+          </div>
+        )}
+        {nativeEvidence
+          .filter((item) => item.collector !== LINUX_STORAGE_HEALTH_COLLECTOR)
+          .map((item) => (
+            <details key={item.collector}>
+              <summary>
+                {isRescueRuntime() ? "Rescue · " : ""}
+                {item.collector} · {item.success ? "observed" : "unavailable"}
+              </summary>
+              <pre>{item.output || "Nessun output"}</pre>
+            </details>
+          ))}
       </aside>
       <section>
         {isRescueRuntime() ? (

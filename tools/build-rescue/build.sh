@@ -10,6 +10,8 @@ vaultctl_binary="${KERNAID_RESCUE_VAULTCTL_BINARY:-$repo_dir/target/release/kern
 openai_executor_binary="${KERNAID_RESCUE_OPENAI_EXECUTOR_BINARY:-$repo_dir/target/release/kernaid-rescue-openai-executor}"
 hardware_inventory_binary="${KERNAID_LINUX_HARDWARE_INVENTORY_BINARY:-$repo_dir/target/release/kernaid-linux-hardware-inventory}"
 hardware_inventory_destination="$build_dir/config/includes.chroot/usr/lib/kernaid/kernaid-linux-hardware-inventory"
+storage_health_binary="${KERNAID_LINUX_STORAGE_HEALTH_BINARY:-$repo_dir/target/release/kernaid-linux-storage-health}"
+storage_health_destination="$build_dir/config/includes.chroot/usr/lib/kernaid/kernaid-linux-storage-health"
 codex_bridge_binary="${KERNAID_RESCUE_CODEX_BRIDGE_BINARY:-$repo_dir/target/release/kernaid-rescue-codex}"
 codex_client_binary="${KERNAID_RESCUE_CODEX_CLIENT_BINARY:-$repo_dir/target/release/kernaid-codex-auth}"
 codex_cli_binary="${KERNAID_RESCUE_CODEX_CLI_BINARY:-$repo_dir/target/rescue-codex-root/usr/lib/kernaid/codex}"
@@ -99,6 +101,7 @@ validate_amd64_elf "$codex_mounter_binary" "Rescue Codex mount broker"
 validate_amd64_elf "$vaultctl_binary" "Rescue vault companion"
 validate_amd64_elf "$openai_executor_binary" "Rescue OpenAI executor"
 validate_amd64_elf "$hardware_inventory_binary" "Linux hardware inventory collector"
+validate_amd64_elf "$storage_health_binary" "Linux storage health collector"
 validate_amd64_elf "$codex_bridge_binary" "Rescue Codex bridge"
 validate_amd64_elf "$codex_client_binary" "Rescue Codex client"
 validate_amd64_elf "$desk_shell_binary" "Rescue Tauri Desk shell"
@@ -151,6 +154,7 @@ for destination in \
   "$vaultctl_destination" \
   "$openai_executor_destination" \
   "$hardware_inventory_destination" \
+  "$storage_health_destination" \
   "$codex_bridge_destination" \
   "$codex_client_destination" \
   "$codex_cli_destination" \
@@ -178,6 +182,7 @@ cleanup_staged_binaries() {
     "$vaultctl_destination" \
     "$openai_executor_destination" \
     "$hardware_inventory_destination" \
+    "$storage_health_destination" \
     "$codex_bridge_destination" \
     "$codex_client_destination" \
     "$codex_cli_destination" \
@@ -243,6 +248,7 @@ install -o root -g root -m 0755 "$codex_mounter_binary" "$codex_mounter_destinat
 install -o root -g root -m 0755 "$vaultctl_binary" "$vaultctl_destination"
 install -o root -g root -m 0755 "$openai_executor_binary" "$openai_executor_destination"
 install -o root -g root -m 0755 "$hardware_inventory_binary" "$hardware_inventory_destination"
+install -o root -g root -m 0755 "$storage_health_binary" "$storage_health_destination"
 install -o root -g root -m 0755 "$codex_bridge_binary" "$codex_bridge_destination"
 install -o root -g root -m 0755 "$codex_client_binary" "$codex_client_destination"
 install -o root -g root -m 0755 "$codex_cli_binary" "$codex_cli_destination"
@@ -273,6 +279,7 @@ for destination in \
   "$vaultctl_destination" \
   "$openai_executor_destination" \
   "$hardware_inventory_destination" \
+  "$storage_health_destination" \
   "$codex_bridge_destination" \
   "$codex_client_destination" \
   "$codex_cli_destination" \
@@ -285,6 +292,7 @@ python3 -I "$repo_dir/tools/build-rescue/verify-shipping-binary.py" "$codex_moun
 python3 -I "$repo_dir/tools/build-rescue/verify-shipping-binary.py" "$vaultctl_destination"
 python3 -I "$repo_dir/tools/build-rescue/verify-shipping-binary.py" "$openai_executor_destination"
 python3 -I "$repo_dir/tools/build-rescue/verify-shipping-binary.py" "$hardware_inventory_destination"
+python3 -I "$repo_dir/tools/build-rescue/verify-shipping-binary.py" "$storage_health_destination"
 python3 -I "$repo_dir/tools/build-rescue/verify-shipping-binary.py" "$codex_bridge_destination"
 python3 -I "$repo_dir/tools/build-rescue/verify-shipping-binary.py" "$codex_client_destination"
 python3 -I - "$repo_dir/tools/build-rescue/verify-codex-cli.py" \

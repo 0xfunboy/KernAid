@@ -1,0 +1,8 @@
+{
+  "critical_warning": 4,
+  "temperature": 329,
+  "avail_spare": 4,
+  "percent_used": 96,
+  "media_errors": 12,
+  "serial_number": "SECRET-NVME-FAILED"
+}

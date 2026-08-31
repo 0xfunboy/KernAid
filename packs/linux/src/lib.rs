@@ -4,6 +4,7 @@
 pub mod diagnostics;
 pub mod hardware;
 pub mod snapshot;
+pub mod storage_health;
 
 #[cfg(feature = "rescue-fstab-production-candidate")]
 pub mod production_candidate_contract;

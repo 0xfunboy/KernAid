@@ -410,6 +410,10 @@ class ObserveBrokerTests(unittest.TestCase):
             commands["linux.hardware.inventory"],
             ("/usr/lib/kernaid/kernaid-linux-hardware-inventory",),
         )
+        self.assertEqual(
+            rescue_server.STORAGE_HEALTH_BINARY,
+            "/usr/lib/kernaid/kernaid-linux-storage-health",
+        )
         lsblk = commands["linux.block.inventory"]
         fields = lsblk[lsblk.index("--output") + 1].split(",")
         self.assertEqual(
@@ -433,7 +437,8 @@ class ObserveBrokerTests(unittest.TestCase):
         self.assertNotIn("MAJ:MIN", fields)
 
     def test_inventory_collectors_run_concurrently(self) -> None:
-        barrier = threading.Barrier(len(rescue_server.COMMANDS), timeout=3)
+        collector_count = len(rescue_server.COMMANDS) + 1
+        barrier = threading.Barrier(collector_count, timeout=3)
         active = 0
         maximum_active = 0
         counter_lock = threading.Lock()
@@ -460,8 +465,8 @@ class ObserveBrokerTests(unittest.TestCase):
 
         with patch.object(rescue_server, "observe", side_effect=concurrent_observe):
             observations = rescue_server.inventory()
-        self.assertEqual(len(observations), len(rescue_server.COMMANDS))
-        self.assertEqual(maximum_active, len(rescue_server.COMMANDS))
+        self.assertEqual(len(observations), collector_count)
+        self.assertEqual(maximum_active, collector_count)
 
     def test_shared_deadline_reaches_target_scan_and_inventory_commands(self) -> None:
         deadline = time.monotonic() + 2
@@ -489,7 +494,7 @@ class ObserveBrokerTests(unittest.TestCase):
             rescue_server.installed_targets(deadline)
             rescue_server.inventory(deadline)
         self.assertEqual(
-            len(observed_deadlines), len(rescue_server.COMMANDS) + 1
+            len(observed_deadlines), len(rescue_server.COMMANDS) + 2
         )
         self.assertEqual(set(observed_deadlines), {deadline})
 

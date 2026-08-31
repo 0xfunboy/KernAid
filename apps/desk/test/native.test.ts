@@ -22,6 +22,7 @@ import {
   openRescueNativeVaultPrompt,
   parseNativeObservations,
   parseLinuxHardwareInventory,
+  parseLinuxStorageHealth,
   parseRescueOfflineCorpus,
   parseRescueOfflineInspection,
   parseRescueTargetScan,
@@ -39,12 +40,19 @@ import {
   rescueOfflineCorpusJson,
   rescueOfflineEvidenceSummary,
   LINUX_NORMALIZED_SNAPSHOT_COLLECTOR,
+  LINUX_STORAGE_HEALTH_COLLECTOR,
   LINUX_P0_COLLECTORS,
   type LinuxHardwareInventory,
   RESCUE_OFFLINE_EVIDENCE_COLLECTOR,
   RESCUE_OFFLINE_EVIDENCE_TARGET,
   RescueOfflineInspectionError,
 } from "../src/native.js";
+import {
+  augmentDiagnosisWithStorageHealth,
+  projectLinuxStorageHealth,
+  storageHealthEvidenceSummary,
+  type LinuxStorageHealthSnapshot,
+} from "../src/storage-health.js";
 
 test("Rescue native prompt exposes only closed status and enum-plus-nonce open", async () => {
   const status = await getRescueNativePromptStatus(async (command, args) => {
@@ -349,6 +357,84 @@ test("Linux hardware inventory is strict, normalized, and privacy-reduced", () =
     () => parseLinuxHardwareInventory(` ${output}`),
     /Inventario hardware Linux non valido/,
   );
+});
+
+const failingStorageHealth: LinuxStorageHealthSnapshot = {
+  schemaVersion: "1.0",
+  kind: "linux-storage-health",
+  scope: "local-physical-disks",
+  enumerationStatus: "complete",
+  disks: [
+    {
+      diskRef: "disk-1",
+      state: "failing",
+      overallPassed: false,
+      criticalWarning: 4,
+      mediaErrors: 2,
+      temperatureCelsius: 55,
+      availableSparePercent: 4,
+      percentageUsed: 96,
+    },
+  ],
+  findings: [
+    {
+      ruleId: "KA-LNX-STORAGE-001",
+      ruleVersion: 1,
+      severity: "critical",
+      diskRef: "disk-1",
+      summary: "The drive reports a deterministic failure indicator.",
+      nextAction:
+        "Back up recoverable data immediately and replace the drive; KernAid will not claim a hardware repair.",
+    },
+  ],
+};
+
+test("Linux storage health is strict, target-projectable, and identity-free", () => {
+  const output = JSON.stringify(failingStorageHealth);
+  assert.deepEqual(parseLinuxStorageHealth(output), failingStorageHealth);
+  assert.equal(
+    nativeObservationContentType({
+      collector: LINUX_STORAGE_HEALTH_COLLECTOR,
+      trust: "observed-untrusted",
+      output,
+      success: true,
+      truncated: false,
+    }),
+    "application/json",
+  );
+  assert.deepEqual(
+    projectLinuxStorageHealth(failingStorageHealth, "disk-1"),
+    failingStorageHealth,
+  );
+  assert.equal(
+    storageHealthEvidenceSummary(failingStorageHealth),
+    "Read-only storage health found a failing drive",
+  );
+  const proposal = augmentDiagnosisWithStorageHealth(
+    {
+      schemaVersion: "1.0",
+      diagnosis: "Static inspection complete.",
+      confidence: 0.5,
+      evidenceIds: ["E-BASE"],
+      requestedEvidence: [],
+    },
+    failingStorageHealth,
+    "E-STORAGE",
+  );
+  assert.match(proposal.diagnosis, /back up recoverable data immediately/iu);
+  assert.match(proposal.diagnosis, /software cannot repair physical media/iu);
+  assert.deepEqual(proposal.evidenceIds, ["E-BASE", "E-STORAGE"]);
+  assert.equal(proposal.confidence, 0.96);
+
+  for (const invalid of [
+    { ...failingStorageHealth, serial: "secret" },
+    {
+      ...failingStorageHealth,
+      disks: [{ ...failingStorageHealth.disks[0]!, device: "/dev/sda" }],
+    },
+    { ...failingStorageHealth, findings: [] },
+  ])
+    assert.throws(() => parseLinuxStorageHealth(JSON.stringify(invalid)));
 });
 
 test("the exact loopback HTTP origin remains Rescue inside Tauri", async () => {

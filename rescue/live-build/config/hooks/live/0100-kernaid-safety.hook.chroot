@@ -67,6 +67,7 @@ chown root:root \
     /usr/lib/kernaid/codex \
     /usr/lib/kernaid/kernaid-rescue-codex \
     /usr/lib/kernaid/kernaid-rescue-codex-mounter \
+    /usr/lib/kernaid/kernaid-linux-storage-health \
     /usr/bin/kernaid-rescue-desk-shell \
     /usr/lib/kernaid/kernaid-rescue-openai-executor \
     /usr/lib/kernaid/kernaid-rescue-firstboot \
@@ -82,6 +83,7 @@ chmod 0755 \
     /usr/lib/kernaid/codex \
     /usr/lib/kernaid/kernaid-rescue-codex \
     /usr/lib/kernaid/kernaid-rescue-codex-mounter \
+    /usr/lib/kernaid/kernaid-linux-storage-health \
     /usr/bin/kernaid-rescue-desk-shell \
     /usr/lib/kernaid/kernaid-rescue-openai-executor \
     /usr/lib/kernaid/kernaid-rescue-firstboot \

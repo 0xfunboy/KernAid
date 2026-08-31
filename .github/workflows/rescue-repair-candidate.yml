@@ -124,7 +124,8 @@ jobs:
           cargo build --locked --release -p kernaid-rescue-openai-executor \
             --bin kernaid-rescue-openai-executor
           cargo build --locked --release -p kernaid-linux-pack \
-            --bin kernaid-linux-hardware-inventory
+            --bin kernaid-linux-hardware-inventory \
+            --bin kernaid-linux-storage-health
           cargo build --locked --release -p kernaid-rescue-codex-bridge \
             --bin kernaid-rescue-codex \
             --bin kernaid-codex-auth
@@ -150,6 +151,7 @@ jobs:
             -e KERNAID_RESCUE_VAULTCTL_BINARY=/workspace/target/release/kernaid-rescue-vaultctl \
             -e KERNAID_RESCUE_OPENAI_EXECUTOR_BINARY=/workspace/target/release/kernaid-rescue-openai-executor \
             -e KERNAID_LINUX_HARDWARE_INVENTORY_BINARY=/workspace/target/release/kernaid-linux-hardware-inventory \
+            -e KERNAID_LINUX_STORAGE_HEALTH_BINARY=/workspace/target/release/kernaid-linux-storage-health \
             -e KERNAID_RESCUE_CODEX_BRIDGE_BINARY=/workspace/target/release/kernaid-rescue-codex \
             -e KERNAID_RESCUE_CODEX_CLIENT_BINARY=/workspace/target/release/kernaid-codex-auth \
             -e KERNAID_RESCUE_CODEX_CLI_BINARY=/opt/kernaid-codex-root/usr/lib/kernaid/codex \

@@ -17,6 +17,7 @@ const schemaFiles = [
   "execution-event.schema.json",
   "linux-hardware-inventory.schema.json",
   "linux-normalized-snapshot.schema.json",
+  "linux-storage-health.schema.json",
   "rescue-fstab-repair-approval.schema.json",
   "rescue-openai-request.schema.json",
   "rescue-openai-response.schema.json",
@@ -27,6 +28,55 @@ const schemaFiles = [
   "session-report.schema.json",
   "validated-plan.schema.json",
 ];
+
+test("Linux storage health schema admits only minimized disk references and indicators", () => {
+  const ajv = new Ajv2020({ allErrors: true, strict: true });
+  const schema = JSON.parse(
+    readFileSync(
+      new URL("../linux-storage-health.schema.json", import.meta.url),
+      "utf8",
+    ),
+  );
+  const validate = ajv.compile(schema);
+  const snapshot = {
+    schemaVersion: "1.0",
+    kind: "linux-storage-health",
+    scope: "local-physical-disks",
+    enumerationStatus: "complete",
+    disks: [
+      {
+        diskRef: "disk-1",
+        state: "failing",
+        overallPassed: false,
+        criticalWarning: 4,
+        mediaErrors: 2,
+        temperatureCelsius: 55,
+        availableSparePercent: 4,
+        percentageUsed: 96,
+      },
+    ],
+    findings: [
+      {
+        ruleId: "KA-LNX-STORAGE-001",
+        ruleVersion: 1,
+        severity: "critical",
+        diskRef: "disk-1",
+        summary: "The drive reports a deterministic failure indicator.",
+        nextAction:
+          "Back up recoverable data immediately and replace the drive; KernAid will not claim a hardware repair.",
+      },
+    ],
+  };
+  assert.equal(validate(snapshot), true);
+  assert.equal(validate({ ...snapshot, serial: "secret" }), false);
+  assert.equal(
+    validate({
+      ...snapshot,
+      disks: [{ ...snapshot.disks[0], device: "/dev/nvme0n1" }],
+    }),
+    false,
+  );
+});
 
 test("published schema basenames match the expected release set", () => {
   const publishedSchemaFiles = readdirSync(new URL("../", import.meta.url))

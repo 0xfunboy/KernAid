@@ -44,6 +44,8 @@ installed-system session, while the existing storage/hostname identity binding
 remains unchanged.
 
 QEMU proves the shipping binary is packaged and that core CPU and memory facts
-are available in both BIOS and UEFI Rescue boots. It does not prove physical
-device compatibility, sensor correctness, SMART health or firmware support;
-those remain explicit hardware-lab gates.
+are available in both BIOS and UEFI Rescue boots. SMART/NVMe telemetry belongs
+to the separate [Linux storage health contract](linux-storage-health.md), so it
+cannot silently expand this general inventory. Neither QEMU contract proves
+physical device compatibility, sensor correctness or firmware support; those
+remain explicit hardware-lab gates.

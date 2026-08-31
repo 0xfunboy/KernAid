@@ -1,6 +1,6 @@
 # KernAid Desk support matrix
 
-Last reviewed: 30 August 2026
+Last reviewed: 31 August 2026
 
 This page records what the current Desk evidence proves. It is intentionally
 narrower than the product vision in the masterplan. KernAid Desk remains an
@@ -35,18 +35,34 @@ the separately distributed credential companion. Where the table says
 runtime-probed, the packaged native first-launch bootstrap also passed in an
 isolated temporary profile; this is not a complete installed-GUI test.
 
-| Platform target | Produced packages | Strongest current evidence | Exact evidence | Physical status |
-| --- | --- | --- | --- | --- |
-| Linux x86-64 | AppImage, DEB, RPM | Runtime-probed, partial | [Linux job 99307145731](https://github.com/0xfunboy/KernAid/actions/runs/33330140025/job/99307145731) built all packages, exercised the production normalized-snapshot command through Tauri IPC on Ubuntu 24.04, passed the packaged native bootstrap and verified that packages exclude repair UI and the credential companion. It did not install and launch every package format on representative hardware. | Not qualified |
-| Windows x86-64 | MSI, NSIS | Runtime-probed, partial; offline runtime bundled | [Windows job 99307145747](https://github.com/0xfunboy/KernAid/actions/runs/33330140025/job/99307145747) built both installers with Tauri `offlineInstaller` WebView2 mode, passed the packaged native bootstrap and credential-boundary tests, and verified package exclusions. It did not run the complete native Windows P0 collector set or install and exercise the GUI on representative hardware. | Not qualified |
-| macOS Apple silicon | APP, DMG | Runtime-probed, partial | [Apple-silicon job 99307145722](https://github.com/0xfunboy/KernAid/actions/runs/33330140025/job/99307145722) built both packages, ran the native macOS P0 source probe, passed the packaged native bootstrap and verified package exclusions on the hosted runner. It did not install the DMG on representative hardware. | Not qualified |
-| macOS Intel x86-64 | APP, DMG | Build-only | [Intel job 99307145724](https://github.com/0xfunboy/KernAid/actions/runs/33330140025/job/99307145724) cross-built both packages and verified package exclusions. The native first-launch and collector probes were skipped for this cross-built target. | Not qualified |
+| Platform target     | Produced packages  | Strongest current evidence                       | Exact evidence                                                                                                                                                                                                                                                                                                                                                                                                   | Physical status |
+| ------------------- | ------------------ | ------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------- |
+| Linux x86-64        | AppImage, DEB, RPM | Runtime-probed, partial                          | [Linux job 99307145731](https://github.com/0xfunboy/KernAid/actions/runs/33330140025/job/99307145731) built all packages, exercised the production normalized-snapshot command through Tauri IPC on Ubuntu 24.04, passed the packaged native bootstrap and verified that packages exclude repair UI and the credential companion. It did not install and launch every package format on representative hardware. | Not qualified   |
+| Windows x86-64      | MSI, NSIS          | Runtime-probed, partial; offline runtime bundled | [Windows job 99307145747](https://github.com/0xfunboy/KernAid/actions/runs/33330140025/job/99307145747) built both installers with Tauri `offlineInstaller` WebView2 mode, passed the packaged native bootstrap and credential-boundary tests, and verified package exclusions. It did not run the complete native Windows P0 collector set or install and exercise the GUI on representative hardware.          | Not qualified   |
+| macOS Apple silicon | APP, DMG           | Runtime-probed, partial                          | [Apple-silicon job 99307145722](https://github.com/0xfunboy/KernAid/actions/runs/33330140025/job/99307145722) built both packages, ran the native macOS P0 source probe, passed the packaged native bootstrap and verified package exclusions on the hosted runner. It did not install the DMG on representative hardware.                                                                                       | Not qualified   |
+| macOS Intel x86-64  | APP, DMG           | Build-only                                       | [Intel job 99307145724](https://github.com/0xfunboy/KernAid/actions/runs/33330140025/job/99307145724) cross-built both packages and verified package exclusions. The native first-launch and collector probes were skipped for this cross-built target.                                                                                                                                                          | Not qualified   |
 
 No Windows ARM, Linux ARM or 32-bit Desk artifact is currently produced. The
 rolling `windows-latest` and `macos-latest` runner labels are build environments,
 not a declaration that every corresponding OS release is supported. Minimum
 Windows, Linux distribution and macOS version ranges remain unqualified until
 they are pinned and backed by installation/runtime evidence.
+
+## Linux storage-health boundary
+
+Linux Resident and Rescue now share one read-only SMART/NVMe collector. It
+reports only normalized `disk-N` references, overall health, critical warning,
+media errors, temperature, spare and wear when the device exposes them. Its
+closed states are `healthy`, `degraded`, `failing`, `unsupported` and
+`permission-unavailable`; missing tools or permissions never become a healthy
+result. Failing and degraded states recommend backup and physical replacement,
+not a software repair.
+
+The Rescue profile contains `smartmontools` and `nvme-cli`; Resident degrades
+gracefully when either is absent. Fixture/unit evidence covers healthy,
+failing, malformed and unavailable responses. Physical SATA, USB bridge and
+NVMe compatibility is still **not qualified**, so this is an implemented
+engineering-preview capability rather than a production support claim.
 
 ## Current product boundary
 

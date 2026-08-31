@@ -1063,6 +1063,38 @@ class BoundaryTests(unittest.TestCase):
         self.assertTrue(response["ok"])
         self.assertTrue(response["result"]["deadlineActive"])
 
+    def test_root_helper_storage_health_returns_only_normalized_fixed_output(self) -> None:
+        snapshot = {
+            "schemaVersion": "1.0",
+            "kind": "linux-storage-health",
+            "scope": "local-physical-disks",
+            "enumerationStatus": "complete",
+            "disks": [],
+            "findings": [],
+        }
+        encoded = json.dumps(snapshot, separators=(",", ":")).encode()
+        completed = offline_inspector.subprocess.CompletedProcess(
+            [offline_inspector.STORAGE_HEALTH_BINARY], 0, encoded, b""
+        )
+        service = offline_inspector.OfflineInspectorService(FakeTargets())
+        with patch.object(
+            offline_inspector.subprocess, "run", return_value=completed
+        ) as run:
+            response = service.handle({"operation": "storage-health"})
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["result"], snapshot)
+        self.assertEqual(run.call_args.args[0], [offline_inspector.STORAGE_HEALTH_BINARY])
+        self.assertIs(run.call_args.kwargs["stdin"], offline_inspector.subprocess.DEVNULL)
+        self.assertIs(run.call_args.kwargs["stderr"], offline_inspector.subprocess.DEVNULL)
+
+        leaked = {**snapshot, "serial": "CUSTOMER-SECRET"}
+        completed.stdout = json.dumps(leaked, separators=(",", ":")).encode()
+        with (
+            patch.object(offline_inspector.subprocess, "run", return_value=completed),
+            self.assertRaises(offline_inspector.InspectionError),
+        ):
+            offline_inspector.collect_storage_health(time.monotonic() + 2)
+
     def test_server_internal_resolution_never_enters_public_scan(self) -> None:
         fixture = {
             "blockdevices": [
@@ -1224,7 +1256,10 @@ class BoundaryTests(unittest.TestCase):
         self.assertNotIn("Service=", helper_socket)
         self.assertIn("PrivateMounts=yes", helper)
         self.assertIn("PrivateNetwork=yes", helper)
-        self.assertIn("CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH", helper)
+        self.assertIn(
+            "CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH CAP_SYS_RAWIO",
+            helper,
+        )
         self.assertIn("KillMode=control-group", helper)
         self.assertIn("RuntimeMaxSec=20", helper)
         self.assertIn("Restart=no", helper)
