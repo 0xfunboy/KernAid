@@ -81,6 +81,11 @@ FIRSTBOOT_RESULT_PATTERN = re.compile(
     rb"code=([a-z0-9-]{1,64}) success=false"
     rb")\r?\n"
 )
+FIRSTBOOT_PROMPT_OR_RESULT_PATTERN = re.compile(
+    rb"KERNAID_RESCUE_FIRSTBOOT_PROMPT_READY_V1 "
+    rb"step=(passphrase|confirmation)"
+    rb"|" + FIRSTBOOT_RESULT_PATTERN.pattern
+)
 LOGIN_OK_LINE = b"KERNAID_VAULT_LOGIN_V1 uid=1000 user=kernaid group=true"
 LOGIN_FAIL_LINE = b"KERNAID_VAULT_LOGIN_V1 invalid=true"
 # Interactive Bash places this one bracketed-paste disable sequence between an
@@ -458,6 +463,33 @@ def wait_firstboot_attestation(
     if result.group(1) is not None:
         raise ClosedFailure("firstboot", "provisioning-failed")
     return result.end()
+
+
+def wait_firstboot_prompt(
+    console: "SerialConsole", step: str, start: int, deadline: float, stage: str
+) -> re.Match[bytes]:
+    """Wait for one prompt while surfacing an early provisioner failure.
+
+    The old prompt-only wait hid a typed firstboot failure behind a ten-minute
+    controller timeout. Both alternatives are fixed, bounded shipping markers;
+    no console transcript or secret is copied into CI output.
+    """
+
+    if step not in {"passphrase", "confirmation"}:
+        raise ClosedFailure("firstboot", "prompt-step-invalid")
+    result = console.wait_regex(
+        FIRSTBOOT_PROMPT_OR_RESULT_PATTERN,
+        start=start,
+        deadline=deadline,
+        stage=stage,
+    )
+    observed_step = result.group(1)
+    if observed_step == step.encode("ascii"):
+        return result
+    failure_code = result.group(2)
+    if failure_code is not None:
+        raise ClosedFailure("firstboot", f"guest-{failure_code.decode('ascii')}")
+    raise ClosedFailure("firstboot", "unexpected-result")
 
 
 class SecretExposureError(Exception):
@@ -4228,23 +4260,21 @@ def main(arguments: Sequence[str]) -> int:
         if lifecycle_deadline <= time.monotonic():
             raise ClosedFailure("lifecycle", "shutdown-reserve-exhausted")
         if parsed.boot == 1:
-            console.wait_regex(
-                re.compile(
-                    rb"KERNAID_RESCUE_FIRSTBOOT_PROMPT_READY_V1 step=passphrase"
-                ),
-                start=0,
-                deadline=_deadline(aggregate, READINESS_TIMEOUT_SECONDS),
-                stage="firstboot-start",
+            wait_firstboot_prompt(
+                console,
+                "passphrase",
+                0,
+                _deadline(aggregate, READINESS_TIMEOUT_SECONDS),
+                "firstboot-start",
             )
             qmp.set_deadline(_deadline(aggregate, 10.0))
             qmp.send_hex_line(correct)
-            confirmation = console.wait_regex(
-                re.compile(
-                    rb"KERNAID_RESCUE_FIRSTBOOT_PROMPT_READY_V1 step=confirmation"
-                ),
-                start=0,
-                deadline=_deadline(aggregate, READINESS_TIMEOUT_SECONDS),
-                stage="firstboot-confirmation",
+            confirmation = wait_firstboot_prompt(
+                console,
+                "confirmation",
+                0,
+                _deadline(aggregate, READINESS_TIMEOUT_SECONDS),
+                "firstboot-confirmation",
             )
             qmp.set_deadline(_deadline(aggregate, 10.0))
             qmp.send_hex_line(correct)

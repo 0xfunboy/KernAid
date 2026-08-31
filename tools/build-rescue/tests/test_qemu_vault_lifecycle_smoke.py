@@ -2747,6 +2747,44 @@ class StaticContractTests(unittest.TestCase):
             ("firstboot", "provisioning-failed"),
         )
 
+        prompt = (
+            b"\nKERNAID_RESCUE_FIRSTBOOT_PROMPT_READY_V1 "
+            b"step=passphrase\r\n"
+        )
+        prompt_match = controller.FIRSTBOOT_PROMPT_OR_RESULT_PATTERN.search(prompt)
+        self.assertIsNotNone(prompt_match)
+        assert prompt_match is not None
+        console.wait_regex.return_value = prompt_match
+        self.assertEqual(
+            controller.wait_firstboot_prompt(
+                console,
+                "passphrase",
+                0,
+                time.monotonic() + 1,
+                "firstboot-start",
+            ),
+            prompt_match,
+        )
+
+        prompt_failure_match = controller.FIRSTBOOT_PROMPT_OR_RESULT_PATTERN.search(
+            failure
+        )
+        self.assertIsNotNone(prompt_failure_match)
+        assert prompt_failure_match is not None
+        console.wait_regex.return_value = prompt_failure_match
+        with self.assertRaises(controller.ClosedFailure) as early_failure:
+            controller.wait_firstboot_prompt(
+                console,
+                "passphrase",
+                0,
+                time.monotonic() + 1,
+                "firstboot-start",
+            )
+        self.assertEqual(
+            (early_failure.exception.stage, early_failure.exception.code),
+            ("firstboot", "guest-vault-profile-mismatch"),
+        )
+
     def test_shipping_codex_status_proof_is_real_offline_and_closed(self) -> None:
         source = controller._codex_status_probe_source().decode("ascii")
         self.assertNotIn("/usr/bin/kernaid-codex-auth", source)

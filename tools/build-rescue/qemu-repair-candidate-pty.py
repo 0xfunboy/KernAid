@@ -1217,19 +1217,21 @@ def provision_firstboot(
 ) -> None:
     """Provision exactly one zero-p3 disposable Rescue medium."""
 
-    console.wait_regex(
-        re.compile(rb"KERNAID_RESCUE_FIRSTBOOT_PROMPT_READY_V1 step=passphrase"),
-        start=0,
-        deadline=LIFECYCLE._deadline(aggregate, 600.0),
-        stage="firstboot-start",
+    LIFECYCLE.wait_firstboot_prompt(
+        console,
+        "passphrase",
+        0,
+        LIFECYCLE._deadline(aggregate, 600.0),
+        "firstboot-start",
     )
     qmp.set_deadline(LIFECYCLE._deadline(aggregate, 10.0))
     qmp.send_hex_line(key)
-    confirmation = console.wait_regex(
-        re.compile(rb"KERNAID_RESCUE_FIRSTBOOT_PROMPT_READY_V1 step=confirmation"),
-        start=0,
-        deadline=LIFECYCLE._deadline(aggregate, 600.0),
-        stage="firstboot-confirmation",
+    confirmation = LIFECYCLE.wait_firstboot_prompt(
+        console,
+        "confirmation",
+        0,
+        LIFECYCLE._deadline(aggregate, 600.0),
+        "firstboot-confirmation",
     )
     qmp.set_deadline(LIFECYCLE._deadline(aggregate, 10.0))
     qmp.send_hex_line(key)
