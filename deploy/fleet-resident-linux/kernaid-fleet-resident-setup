@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  kernaid-fleet-resident-setup \
+    --endpoint https://fleet.example.com \
+    --tenant TENANT_ID \
+    --service-anchor FILE \
+    --entitlement-anchor FILE \
+    --policy-anchor FILE \
+    --update-anchor FILE \
+    --enrollment-token-file FILE \
+    [--enable] [--enable-linger]
+
+Installs owner-only Fleet configuration and user services. It never enables
+the update or A/B activator automatically. --enable starts the diagnostic sync
+and typed work-order services; --enable-linger also keeps them alive at boot.
+EOF
+}
+
+endpoint=""
+tenant_id=""
+service_anchor=""
+entitlement_anchor=""
+policy_anchor=""
+update_anchor=""
+enrollment_token_file=""
+enable_services=0
+enable_linger=0
+
+while (($#)); do
+  case "$1" in
+    --endpoint|--tenant|--service-anchor|--entitlement-anchor|--policy-anchor|--update-anchor|--enrollment-token-file)
+      if (($# < 2)); then
+        echo "Missing value for $1" >&2
+        usage >&2
+        exit 2
+      fi
+      case "$1" in
+        --endpoint) endpoint="$2" ;;
+        --tenant) tenant_id="$2" ;;
+        --service-anchor) service_anchor="$2" ;;
+        --entitlement-anchor) entitlement_anchor="$2" ;;
+        --policy-anchor) policy_anchor="$2" ;;
+        --update-anchor) update_anchor="$2" ;;
+        --enrollment-token-file) enrollment_token_file="$2" ;;
+      esac
+      shift 2
+      ;;
+    --enable) enable_services=1; shift ;;
+    --enable-linger) enable_linger=1; shift ;;
+    --help|-h) usage; exit 0 ;;
+    *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+if [[ $EUID -eq 0 ]]; then
+  echo "Run this setup as the enrolled desktop user, not as root." >&2
+  exit 2
+fi
+if [[ ! "$endpoint" =~ ^https://[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]{1,5})?$ ]]; then
+  echo "--endpoint must be an HTTPS origin without a path." >&2
+  exit 2
+fi
+if [[ ! "$tenant_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
+  echo "--tenant is invalid." >&2
+  exit 2
+fi
+if [[ ! "$HOME" =~ ^/[A-Za-z0-9._/-]+$ || -L "$HOME" || ! -d "$HOME" || ! -O "$HOME" ]]; then
+  echo "The current user's home directory is not a supported owned directory." >&2
+  exit 2
+fi
+
+for required in service_anchor entitlement_anchor policy_anchor update_anchor enrollment_token_file; do
+  source_file="${!required}"
+  if [[ -z "$source_file" || ! -f "$source_file" || -L "$source_file" || ! -O "$source_file" ]]; then
+    echo "${required//_/-} must name an owned regular file." >&2
+    exit 2
+  fi
+done
+
+validate_anchor() {
+  local source_file="$1"
+  local compact
+  if [[ $(wc -c < "$source_file") -gt 128 ]]; then
+    echo "Invalid Ed25519 anchor: $source_file" >&2
+    exit 2
+  fi
+  compact="$(tr -d '\r\n' < "$source_file")"
+  if [[ ! "$compact" =~ ^[A-Za-z0-9_-]{43}$ ]]; then
+    echo "Invalid canonical Ed25519 anchor: $source_file" >&2
+    exit 2
+  fi
+}
+
+validate_anchor "$service_anchor"
+validate_anchor "$entitlement_anchor"
+validate_anchor "$policy_anchor"
+validate_anchor "$update_anchor"
+
+config_dir="$HOME/.config/kernaid"
+unit_dir="$HOME/.config/systemd/user"
+share_dir="/usr/share/kernaid-fleet-resident"
+state_root="$HOME/.local/share/io.github.0xfunboy.KernAid"
+
+install -d -m 0700 "$config_dir" "$state_root/fleet" "$state_root/fleet-work-orders" "$state_root/update" "$state_root/update-slots"
+install -d -m 0755 "$unit_dir"
+
+install_anchor() {
+  local source_file="$1"
+  local destination="$2"
+  local temporary
+  temporary="$(mktemp "$config_dir/.anchor.XXXXXX")"
+  trap 'rm -f -- "${temporary:-}"' RETURN
+  tr -d '\r\n' < "$source_file" > "$temporary"
+  chmod 0600 "$temporary"
+  mv -fT -- "$temporary" "$destination"
+  trap - RETURN
+}
+
+install_anchor "$service_anchor" "$config_dir/fleet-service.pub"
+install_anchor "$entitlement_anchor" "$config_dir/entitlement-issuer.pub"
+install_anchor "$policy_anchor" "$config_dir/policy-issuer.pub"
+install_anchor "$update_anchor" "$config_dir/update-issuer.pub"
+install -m 0600 "$enrollment_token_file" "$config_dir/enrollment-token"
+
+write_config() {
+  local template="$1"
+  local destination="$2"
+  local temporary
+  temporary="$(mktemp "$config_dir/.config.XXXXXX")"
+  trap 'rm -f -- "${temporary:-}"' RETURN
+  sed \
+    -e "s|https://fleet.example.invalid|$endpoint|g" \
+    -e "s|tenant-example|$tenant_id|g" \
+    -e "s|/home/example|$HOME|g" \
+    "$template" > "$temporary"
+  chmod 0600 "$temporary"
+  mv -fT -- "$temporary" "$destination"
+  trap - RETURN
+}
+
+write_config "$share_dir/examples/fleet-resident.json" "$config_dir/fleet-resident.json"
+write_config "$share_dir/examples/fleet-work-orders.json" "$config_dir/fleet-work-orders.json"
+write_config "$share_dir/examples/fleet-update.json" "$config_dir/fleet-update.json"
+
+install -m 0644 "$share_dir/systemd/user/kernaid-fleet-resident-sync.service" "$unit_dir/"
+install -m 0644 "$share_dir/systemd/user/kernaid-fleet-resident-work-orders.service" "$unit_dir/"
+install -m 0644 "$share_dir/systemd/user/kernaid-fleet-resident-update.service" "$unit_dir/"
+
+systemctl --user daemon-reload
+if ((enable_services)); then
+  systemctl --user enable --now \
+    kernaid-fleet-resident-sync.service \
+    kernaid-fleet-resident-work-orders.service
+fi
+if ((enable_linger)); then
+  if command -v sudo >/dev/null 2>&1; then
+    sudo loginctl enable-linger "$(id -un)"
+  else
+    echo "sudo is required for --enable-linger." >&2
+    exit 1
+  fi
+fi
+
+echo "KernAid Fleet Resident is configured for tenant $tenant_id."
+if ((!enable_services)); then
+  echo "Run: systemctl --user enable --now kernaid-fleet-resident-sync kernaid-fleet-resident-work-orders"
+fi
+echo "The signed update stager and A/B activator remain disabled pending device qualification."
