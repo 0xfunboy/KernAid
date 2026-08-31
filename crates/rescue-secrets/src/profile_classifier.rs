@@ -21,7 +21,10 @@ use std::{
 const MAX_LUKS_JSON_BYTES: usize = 256 * 1024;
 const ZERO_SCAN_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 const ZERO_SCAN_REVALIDATE_BYTES: u64 = 64 * 1024 * 1024;
-const ZERO_SCAN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+// USB mass-storage under firmware emulation can sustain less than 14 MiB/s.
+// Keep the full 8 GiB proof bounded, but leave enough time for one complete
+// post-confirmation scan before the 20-minute firstboot-result deadline.
+const ZERO_SCAN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 pub(crate) const LOGICAL_SECTOR_BYTES: u64 = 512;
 pub(crate) const VAULT_START_LBA: u64 = 33_554_432;
 pub(crate) const VAULT_SECTOR_COUNT: u64 = 16_777_216;
