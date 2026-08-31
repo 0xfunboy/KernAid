@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import type { RescueOfflineInspection, RescueTargetSelection } from "./native";
 import {
-  RESCUE_FSTAB_CONFIRMATION,
+  RESCUE_CRYPTTAB_FINDING_ID,
   RESCUE_FSTAB_FINDING_ID,
   RESCUE_FSTAB_ROLLBACK_CONFIRMATION,
   RescueRepairClient,
@@ -35,6 +35,9 @@ export function RescueRepairPanel({
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string>();
   const [confirmation, setConfirmation] = useState("");
+  const [activeCandidate, setActiveCandidate] = useState<
+    "fstab" | "crypttab"
+  >();
   const mounted = useRef(true);
 
   const qualifiedTarget =
@@ -46,11 +49,18 @@ export function RescueRepairPanel({
     inspection.target.targetId === selection.target.targetId;
   const prepared = preparedRepairDetail(snapshot);
   const rollbackPrepared = preparedRollbackDetail(snapshot);
-  const committedSource = rollbackSourceReceipt(snapshot);
+  const committedSource = rollbackSourceReceipt(snapshot, activeCandidate);
   const preparedTargetCurrent =
     prepared !== undefined &&
     qualifiedTarget &&
     prepared.targetFingerprint === targetFingerprint;
+
+  useEffect(() => {
+    if (prepared !== undefined)
+      setActiveCandidate(
+        prepared.kind === "crypttab-prepared" ? "crypttab" : "fstab",
+      );
+  }, [prepared]);
 
   useEffect(() => {
     mounted.current = true;
@@ -115,7 +125,7 @@ export function RescueRepairPanel({
     };
   }, [available, repairClient, snapshot]);
 
-  async function prepare(): Promise<void> {
+  async function prepare(candidate: "fstab" | "crypttab"): Promise<void> {
     if (
       !qualifiedTarget ||
       busy ||
@@ -129,8 +139,10 @@ export function RescueRepairPanel({
     try {
       const next = await repairClient.prepare(
         rescueRepairTargetClaims(selection, targetFingerprint),
+        candidate,
       );
       if (!mounted.current) return;
+      setActiveCandidate(candidate);
       setSnapshot((current) => newestSnapshot(current, next));
     } catch (error) {
       if (!mounted.current) return;
@@ -145,7 +157,7 @@ export function RescueRepairPanel({
     if (
       prepared === undefined ||
       !preparedTargetCurrent ||
-      confirmation !== RESCUE_FSTAB_CONFIRMATION ||
+      confirmation !== prepared.confirmationRequired ||
       busy
     )
       return;
@@ -283,7 +295,11 @@ export function RescueRepairPanel({
             ? snapshot.state === "idle"
               ? "SOLA LETTURA"
               : rescueRepairStateBadge(snapshot.state)
-            : `${RESCUE_FSTAB_FINDING_ID} · R2`}
+            : `${
+                prepared.kind === "crypttab-prepared"
+                  ? RESCUE_CRYPTTAB_FINDING_ID
+                  : RESCUE_FSTAB_FINDING_ID
+              } · R2`}
         </span>
       </div>
 
@@ -299,7 +315,7 @@ export function RescueRepairPanel({
           </div>
           <div className="rescue-repair-row">
             <span>Controllo</span>
-            <b>Coerenza tra configurazione fstab e dischi osservati</b>
+            <b>Coerenza tra configurazione di avvio e dischi osservati</b>
           </div>
           <p>
             KernAid verificherà in sola lettura se esiste esattamente il caso
@@ -307,13 +323,18 @@ export function RescueRepairPanel({
             controllo. La preparazione non modifica il sistema installato e non
             accetta percorsi, nomi dispositivo o comandi.
           </p>
-          <button
-            className="rescue-repair-primary"
-            disabled={busy}
-            onClick={() => void prepare()}
-          >
-            {busy ? "Verifica…" : "Verifica caso riparabile"}
-          </button>
+          <div className="rescue-repair-actions">
+            <button disabled={busy} onClick={() => void prepare("crypttab")}>
+              Verifica volumi cifrati
+            </button>
+            <button
+              className="rescue-repair-primary"
+              disabled={busy}
+              onClick={() => void prepare("fstab")}
+            >
+              {busy ? "Verifica…" : "Verifica dischi di avvio"}
+            </button>
+          </div>
         </div>
       )}
 
@@ -359,6 +380,10 @@ export function RescueRepairPanel({
             <code title={prepared.resourceId}>{prepared.resourceId}</code>
           </div>
           <div className="rescue-repair-row">
+            <span>Azione esatta</span>
+            <code title={prepared.actionId}>{prepared.actionId}</code>
+          </div>
+          <div className="rescue-repair-row">
             <span>Destinazione backup</span>
             <code title={prepared.backupLocator}>{prepared.backupLocator}</code>
           </div>
@@ -371,7 +396,7 @@ export function RescueRepairPanel({
           </div>
           <label className="rescue-repair-confirmation">
             Per approvare, scrivi esattamente
-            <code>{RESCUE_FSTAB_CONFIRMATION}</code>
+            <code>{prepared.confirmationRequired}</code>
             <input
               autoComplete="off"
               disabled={busy || !preparedTargetCurrent}
@@ -389,7 +414,7 @@ export function RescueRepairPanel({
               disabled={
                 busy ||
                 !preparedTargetCurrent ||
-                confirmation !== RESCUE_FSTAB_CONFIRMATION
+                confirmation !== prepared.confirmationRequired
               }
               onClick={() => void approve()}
             >
@@ -503,8 +528,8 @@ export function RescueRepairPanel({
           {snapshot.state === "manual-reconciliation-required" && (
             <p className="rescue-repair-alert">
               Riavvio Rescue obbligatorio. Non avviare il sistema installato e
-              non modificare manualmente <code>fstab</code>. Riavvia dalla
-              chiavetta KernAid: il recupero riprenderà dalla transazione
+              non modificare manualmente la configurazione di avvio. Riavvia
+              dalla chiavetta KernAid: il recupero riprenderà dalla transazione
               persistita nel Vault.
             </p>
           )}

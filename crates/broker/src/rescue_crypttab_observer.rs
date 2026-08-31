@@ -4,6 +4,7 @@ use crate::{
     rescue_crypttab_candidate::BrokerOwnedCrypttabObservation,
     target_physical_parent::RescueTargetPhysicalParentGuard,
 };
+use kernaid_protocol::rescue_repair_vault::RepairFileMetadataV1;
 use rustix::{
     fd::{AsFd, BorrowedFd},
     fs::{self as rfs, AtFlags, FileType, Mode, OFlags, ResolveFlags},
@@ -40,14 +41,14 @@ pub fn observe_rescue_crypttab(
         .revalidate()
         .map_err(|_| RescueCrypttabObservationError::TargetChanged)?;
     let mount = target.target_detached_mount_descriptor();
-    let crypttab =
+    let (crypttab, metadata) =
         read_exact_regular(mount, CRYPTTAB_RESOURCE, false, true).map_err(|error| match error {
             RescueCrypttabObservationError::FstabUnavailable => {
                 RescueCrypttabObservationError::CrypttabUnavailable
             }
             other => other,
         })?;
-    let fstab = read_exact_regular(mount, FSTAB_RESOURCE, true, false)?;
+    let (fstab, _) = read_exact_regular(mount, FSTAB_RESOURCE, true, false)?;
     let observed_uuids = target.target_observed_uuids().clone();
     if observed_uuids.is_empty() {
         return Err(RescueCrypttabObservationError::UuidInventoryUnavailable);
@@ -65,6 +66,7 @@ pub fn observe_rescue_crypttab(
             crypttab,
             fstab,
             observed_uuids,
+            metadata,
         ),
     )
 }
@@ -74,7 +76,7 @@ fn read_exact_regular(
     resource: &str,
     empty_allowed: bool,
     private_mode_allowed: bool,
-) -> Result<Zeroizing<Vec<u8>>, RescueCrypttabObservationError> {
+) -> Result<(Zeroizing<Vec<u8>>, RepairFileMetadataV1), RescueCrypttabObservationError> {
     let descriptor = rfs::openat2(
         mount,
         resource,
@@ -118,7 +120,9 @@ fn read_exact_regular(
     if before != after || after != named {
         return Err(RescueCrypttabObservationError::TargetChanged);
     }
-    Ok(bytes)
+    let metadata = RepairFileMetadataV1::new(permissions, before.uid, before.gid)
+        .map_err(|_| RescueCrypttabObservationError::UnsafeDocument)?;
+    Ok((bytes, metadata))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

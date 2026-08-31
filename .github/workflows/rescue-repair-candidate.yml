@@ -116,7 +116,7 @@ jobs:
             --features custom-protocol \
             --bin kernaid-rescue-desk-shell
           cargo build --locked --release -p kernaid-broker \
-            --features rescue-fstab-production-candidate \
+            --features rescue-fstab-production-candidate,rescue-crypttab-production-candidate \
             --bin kernaid-rescue-repaird
           cargo build --locked --release -p kernaid-linux-blockfd \
             --bin kernaid-blockfd-probe

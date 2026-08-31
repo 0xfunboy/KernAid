@@ -75,12 +75,18 @@ BUNDLE_DESCRIPTOR_TYPES = (
 # KERNAID_REPAIR_CANDIDATE_BEGIN
 WRITE_CAPABILITY = "linux-ext4-direct-leaf-readwrite-mount-v1"
 ROLLBACK_WRITE_CAPABILITY = "fstab-rollback-direct-leaf-rw-v1"
+CRYPTTAB_ROLLBACK_WRITE_CAPABILITY = "crypttab-rollback-direct-leaf-rw-v1"
 WRITE_DESCRIPTOR_TYPE = "selected-target-ext4-mount-readwrite-detached"
 VAULT_WRITE_CAPABILITY = "fstab-direct-leaf-rw-v1"
 VAULT_ROLLBACK_WRITE_CAPABILITY = "fstab-rollback-direct-leaf-rw-v1"
 REPAIR_ACTION = "linux.fstab.disable-missing-uuid.v1"
 ROLLBACK_ACTION = "linux.fstab.restore"
 REPAIR_RESOURCE = "rescue:selected-linux-root:etc/fstab"
+CRYPTTAB_VAULT_WRITE_CAPABILITY = "crypttab-direct-leaf-rw-v1"
+CRYPTTAB_VAULT_ROLLBACK_WRITE_CAPABILITY = "crypttab-rollback-direct-leaf-rw-v1"
+CRYPTTAB_REPAIR_ACTION = "linux.crypttab.disable-missing-uuid.v1"
+CRYPTTAB_ROLLBACK_ACTION = "linux.crypttab.restore"
+CRYPTTAB_REPAIR_RESOURCE = "rescue:selected-linux-root:etc/crypttab"
 # KERNAID_REPAIR_CANDIDATE_END
 BLOCK_INVENTORY_COLLECTOR = "linux.block.inventory"
 
@@ -1247,6 +1253,28 @@ def _strict_object(value: object, keys: set[str]) -> dict[str, object]:
     return value
 
 
+def _repair_contract(resource: object, action: object) -> dict[str, object]:
+    if resource == REPAIR_RESOURCE and action == REPAIR_ACTION:
+        return {
+            "writeCapability": VAULT_WRITE_CAPABILITY,
+            "rollbackCapability": VAULT_ROLLBACK_WRITE_CAPABILITY,
+            "rollbackAction": ROLLBACK_ACTION,
+            "rollbackResponseCapability": ROLLBACK_WRITE_CAPABILITY,
+            "lockDomain": b"kernaid:rescue-fstab:target-lock:v2\0",
+            "safeModes": {0o644},
+        }
+    if resource == CRYPTTAB_REPAIR_RESOURCE and action == CRYPTTAB_REPAIR_ACTION:
+        return {
+            "writeCapability": CRYPTTAB_VAULT_WRITE_CAPABILITY,
+            "rollbackCapability": CRYPTTAB_VAULT_ROLLBACK_WRITE_CAPABILITY,
+            "rollbackAction": CRYPTTAB_ROLLBACK_ACTION,
+            "rollbackResponseCapability": CRYPTTAB_ROLLBACK_WRITE_CAPABILITY,
+            "lockDomain": b"kernaid:rescue-crypttab:target-lock:v1\0",
+            "safeModes": {0o600, 0o644},
+        }
+    raise HandoffFailure("INTERNAL")
+
+
 def _validate_write_lease(payload: object, reservation: str, binding: str) -> dict[str, str]:
     lease = _strict_object(payload, {"capability", "bootEpochSha256",
                                      "leaseBindingSha256", "transaction"})
@@ -1264,14 +1292,14 @@ def _validate_write_lease(payload: object, reservation: str, binding: str) -> di
                    "diffSha256", "observedUuidSetSha256", "beforeMetadata"}
     intent = _strict_object(backup["executionIntent"], intent_keys)
     metadata = _strict_object(intent["beforeMetadata"], {"mode", "uid", "gid", "xattrs", "posixAcl"})
+    contract = _repair_contract(backup.get("resourceId"), intent.get("actionId"))
     digests = ["draftBindingSha256", "vaultIdentityFingerprint", "physicalParentFingerprint",
                "expectedBackupSha256", "metadataSha256", "planSha256", "approvalSha256",
                "resourceSha256"]
-    if (lease["capability"] != VAULT_WRITE_CAPABILITY or transaction["phase"] != "pending"
+    if (lease["capability"] != contract["writeCapability"] or transaction["phase"] != "pending"
             or transaction["transactionBindingSha256"] != binding
             or backup["state"] != "durable" or backup["reservationId"] != reservation
             or backup["locator"] != "vault://repair/" + reservation
-            or backup["resourceId"] != REPAIR_RESOURCE or intent["actionId"] != REPAIR_ACTION
             or intent["targetRecoveryFingerprint"] is None
             or _RECOVERY_FINGERPRINT.fullmatch(str(intent["targetRecoveryFingerprint"])) is None
             or not isinstance(intent["targetPhysicalParentFingerprint"], str)
@@ -1294,6 +1322,8 @@ def _validate_write_lease(payload: object, reservation: str, binding: str) -> di
             or not isinstance(metadata["mode"], int) or not 0 <= metadata["mode"] <= 0o7777
             or not isinstance(metadata["uid"], int) or not 0 <= metadata["uid"] <= 0xffffffff
             or not isinstance(metadata["gid"], int) or not 0 <= metadata["gid"] <= 0xffffffff
+            or metadata["uid"] != 0 or metadata["gid"] != 0
+            or metadata["mode"] not in contract["safeModes"]
             or metadata["xattrs"] != "none" or metadata["posixAcl"] != "none"):
         raise HandoffFailure("INTERNAL")
     for key in digests:
@@ -1343,17 +1373,21 @@ def _validate_write_lease(payload: object, reservation: str, binding: str) -> di
     if expected_transaction != binding:
         raise HandoffFailure("INTERNAL")
     expected_lock = "lock:" + _hash_fields(
-        b"kernaid:rescue-fstab:target-lock:v2\0",
-        [str(intent["targetRecoveryFingerprint"]).encode(), REPAIR_RESOURCE.encode()])
+        contract["lockDomain"],
+        [str(intent["targetRecoveryFingerprint"]).encode(), str(backup["resourceId"]).encode()])
     if intent["lockIdentity"] != expected_lock or backup["resourceSha256"] != intent["beforeSha256"]:
         raise HandoffFailure("INTERNAL")
     expected_lease = _hash_fields(b"KERNAID-REPAIR-WRITE-LEASE-V1\0", [
-        VAULT_WRITE_CAPABILITY.encode(), _digest(binding), boot,
+        str(contract["writeCapability"]).encode(), _digest(binding), boot,
         str(intent["targetRecoveryFingerprint"]).encode(), expected_lock.encode()])
     if lease["leaseBindingSha256"] != expected_lease:
         raise HandoffFailure("INTERNAL")
     return {"recoveryFingerprint": str(intent["targetRecoveryFingerprint"]),
-            "leaseBindingSha256": expected_lease}
+            "leaseBindingSha256": expected_lease,
+            "writeCapability": str(contract["writeCapability"]),
+            "rollbackCapability": str(contract["rollbackCapability"]),
+            "rollbackAction": str(contract["rollbackAction"]),
+            "rollbackResponseCapability": str(contract["rollbackResponseCapability"])}
 
 
 def _validate_rollback_write_lease(
@@ -1409,6 +1443,7 @@ def _validate_rollback_write_lease(
     intent = backup.get("executionIntent")
     if not isinstance(intent, dict):
         raise HandoffFailure("INTERNAL")
+    contract = _repair_contract(backup.get("resourceId"), intent.get("actionId"))
     source_reservation = backup.get("reservationId")
     source_binding = source.get("transactionBindingSha256")
     source_plan_id = backup.get("planId")
@@ -1420,7 +1455,7 @@ def _validate_rollback_write_lease(
     lock_identity = intent.get("lockIdentity")
     boot = _digest(lease["bootEpochSha256"])
     if (
-        lease["capability"] != VAULT_ROLLBACK_WRITE_CAPABILITY
+        lease["capability"] != contract["rollbackCapability"]
         or _ROLLBACK_ID.fullmatch(rollback_id) is None
         or _SHA256.fullmatch(rollback_binding) is None
         or transaction["phase"] != "pending"
@@ -1442,7 +1477,7 @@ def _validate_rollback_write_lease(
         or not source_approval_id.startswith("A-")
         or not isinstance(source_approval_sha256, str)
         or _SHA256.fullmatch(source_approval_sha256) is None
-        or binding["actionId"] != ROLLBACK_ACTION
+        or binding["actionId"] != contract["rollbackAction"]
         or not isinstance(binding["planId"], str)
         or _PREFIXED_ID.fullmatch(binding["planId"]) is None
         or not str(binding["planId"]).startswith("P-")
@@ -1478,7 +1513,7 @@ def _validate_rollback_write_lease(
     expected_source_lease = _hash_fields(
         b"KERNAID-REPAIR-WRITE-LEASE-V1\0",
         [
-            VAULT_WRITE_CAPABILITY.encode(),
+            str(contract["writeCapability"]).encode(),
             _digest(source_binding),
             boot,
             recovery.encode(),
@@ -1487,7 +1522,7 @@ def _validate_rollback_write_lease(
     )
     source_authority = _validate_write_lease(
         {
-            "capability": VAULT_WRITE_CAPABILITY,
+            "capability": contract["writeCapability"],
             "bootEpochSha256": lease["bootEpochSha256"],
             "leaseBindingSha256": expected_source_lease,
             "transaction": {
@@ -1505,7 +1540,7 @@ def _validate_rollback_write_lease(
             rollback_id.encode(),
             source_reservation.encode(),
             _digest(source_binding),
-            ROLLBACK_ACTION.encode(),
+            str(contract["rollbackAction"]).encode(),
             str(binding["planId"]).encode(),
             _digest(binding["planSha256"]),
             str(binding["approvalId"]).encode(),
@@ -1518,7 +1553,7 @@ def _validate_rollback_write_lease(
     expected_lease = _hash_fields(
         b"KERNAID-REPAIR-ROLLBACK-WRITE-LEASE-V1\0",
         [
-            VAULT_ROLLBACK_WRITE_CAPABILITY.encode(),
+            str(contract["rollbackCapability"]).encode(),
             _digest(rollback_binding),
             boot,
             recovery.encode(),
@@ -1532,6 +1567,7 @@ def _validate_rollback_write_lease(
         "leaseBindingSha256": expected_lease,
         "sourceReservationId": source_reservation,
         "sourceTransactionBindingSha256": source_binding,
+        "responseCapability": contract["rollbackResponseCapability"],
     }
 
 
@@ -1987,7 +2023,9 @@ class RepairTargetHandoff:
             "operation": request["operation"],
             "outcome": "ok",
             "capability": (
-                ROLLBACK_WRITE_CAPABILITY if is_rollback else WRITE_CAPABILITY
+                lease.get("responseCapability", ROLLBACK_WRITE_CAPABILITY)
+                if is_rollback
+                else WRITE_CAPABILITY
             ),
             "targetRecoveryFingerprint": recovery,
             "leaseBindingSha256": lease["leaseBindingSha256"],
@@ -2410,6 +2448,7 @@ def _send_record(
         if response.get("capability") in {
             WRITE_CAPABILITY,
             ROLLBACK_WRITE_CAPABILITY,
+            CRYPTTAB_ROLLBACK_WRITE_CAPABILITY,
         }:
             if (response.get("descriptor") != {"type": WRITE_DESCRIPTOR_TYPE, "count": 1}
                     or len(descriptors) != 1):

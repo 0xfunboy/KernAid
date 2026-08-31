@@ -174,6 +174,8 @@ pub struct RescueCrypttabCandidateAdmission {
     binding: RescueCrypttabCandidateBinding,
     state: RescueCrypttabAdmissionState,
     approval_id: Option<String>,
+    approval_sequence: Option<u64>,
+    approval_sha256: Option<String>,
 }
 
 #[cfg(feature = "rescue-crypttab-production-candidate")]
@@ -192,6 +194,8 @@ impl RescueCrypttabCandidateAdmission {
             binding,
             state: RescueCrypttabAdmissionState::Staged,
             approval_id: None,
+            approval_sequence: None,
+            approval_sha256: None,
         })
     }
 
@@ -199,7 +203,11 @@ impl RescueCrypttabCandidateAdmission {
         &mut self,
         approval: RescueCrypttabCandidateApproval,
     ) -> Result<(), RescueCrypttabAdmissionError> {
-        if self.state != RescueCrypttabAdmissionState::Staged || self.approval_id.is_some() {
+        if self.state != RescueCrypttabAdmissionState::Staged
+            || self.approval_id.is_some()
+            || self.approval_sequence.is_some()
+            || self.approval_sha256.is_some()
+        {
             return Err(RescueCrypttabAdmissionError::ApprovalReplay);
         }
         if approval.binding != self.binding || approval.sequence != 1 {
@@ -208,7 +216,10 @@ impl RescueCrypttabCandidateAdmission {
         if approval.typed_confirmation != RESCUE_CRYPTTAB_TYPED_CONFIRMATION {
             return Err(RescueCrypttabAdmissionError::WrongConfirmation);
         }
+        let approval_sha256 = canonical_crypttab_approval_sha256(&approval);
         self.approval_id = Some(approval.approval_id);
+        self.approval_sequence = Some(approval.sequence);
+        self.approval_sha256 = Some(approval_sha256);
         self.state = RescueCrypttabAdmissionState::Approved;
         Ok(())
     }
@@ -222,6 +233,33 @@ impl RescueCrypttabCandidateAdmission {
     pub fn approval_id(&self) -> Option<&str> {
         self.approval_id.as_deref()
     }
+    pub const fn approval_sequence(&self) -> Option<u64> {
+        self.approval_sequence
+    }
+    pub fn approval_sha256(&self) -> Option<&str> {
+        self.approval_sha256.as_deref()
+    }
+}
+
+#[cfg(feature = "rescue-crypttab-production-candidate")]
+fn canonical_crypttab_approval_sha256(approval: &RescueCrypttabCandidateApproval) -> String {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(b"kernaid:rescue-crypttab:approval:v1\0");
+    for value in [
+        approval.approval_id.as_bytes(),
+        approval.binding.session_id.as_bytes(),
+        approval.binding.plan_id.as_bytes(),
+        approval.binding.plan_sha256.as_bytes(),
+        approval.binding.target_fingerprint.as_bytes(),
+        approval.binding.target_snapshot.as_bytes(),
+        approval.typed_confirmation.as_bytes(),
+    ] {
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value);
+    }
+    digest.update(approval.sequence.to_be_bytes());
+    format!("sha256:{:x}", digest.finalize())
 }
 
 #[cfg(feature = "rescue-crypttab-production-candidate")]

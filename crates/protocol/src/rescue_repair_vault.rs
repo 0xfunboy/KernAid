@@ -24,6 +24,17 @@ pub const REPAIR_WRITE_LEASE_CAPABILITY: &str = "fstab-direct-leaf-rw-v1";
 pub const REPAIR_ROLLBACK_ACTION_ID: &str = "linux.fstab.restore";
 /// The sole root-helper capability represented by a consumed rollback lease.
 pub const REPAIR_ROLLBACK_WRITE_LEASE_CAPABILITY: &str = "fstab-rollback-direct-leaf-rw-v1";
+/// Closed crypttab mutation supported by the shared repair transaction engine.
+pub const CRYPTTAB_REPAIR_EXECUTION_ACTION_ID: &str = "linux.crypttab.disable-missing-uuid.v1";
+/// Logical crypttab resource; never interpreted as a caller-controlled path.
+pub const CRYPTTAB_REPAIR_EXECUTION_RESOURCE_ID: &str = "rescue:selected-linux-root:etc/crypttab";
+/// Root-helper capability for one consumed crypttab write lease.
+pub const CRYPTTAB_REPAIR_WRITE_LEASE_CAPABILITY: &str = "crypttab-direct-leaf-rw-v1";
+/// Closed post-commit rollback action for crypttab.
+pub const CRYPTTAB_REPAIR_ROLLBACK_ACTION_ID: &str = "linux.crypttab.restore";
+/// Root-helper capability for one consumed crypttab rollback lease.
+pub const CRYPTTAB_REPAIR_ROLLBACK_WRITE_LEASE_CAPABILITY: &str =
+    "crypttab-rollback-direct-leaf-rw-v1";
 
 const MAX_OPAQUE_ID_BYTES: usize = 128;
 const RESERVATION_BINDING_DOMAIN: &[u8] = b"KERNAID-REPAIR-RESERVATION-V1\0";
@@ -34,8 +45,77 @@ const WRITE_LEASE_BINDING_DOMAIN: &[u8] = b"KERNAID-REPAIR-WRITE-LEASE-V1\0";
 const ROLLBACK_TRANSACTION_BINDING_DOMAIN: &[u8] = b"KERNAID-REPAIR-ROLLBACK-TRANSACTION-V1\0";
 const ROLLBACK_WRITE_LEASE_BINDING_DOMAIN: &[u8] = b"KERNAID-REPAIR-ROLLBACK-WRITE-LEASE-V1\0";
 const LOCK_ID_DOMAIN: &[u8] = b"kernaid:rescue-fstab:target-lock:v2\0";
+const CRYPTTAB_LOCK_ID_DOMAIN: &[u8] = b"kernaid:rescue-crypttab:target-lock:v1\0";
 const MAX_PERMISSION_MODE: u32 = 0o7777;
 const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
+
+/// Complete set of regular files the Rescue transaction engine may mutate.
+/// No API in this module accepts a raw path, command or arbitrary action.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepairResourceV1 {
+    Fstab,
+    Crypttab,
+}
+
+impl RepairResourceV1 {
+    pub const fn action_id(self) -> &'static str {
+        match self {
+            Self::Fstab => REPAIR_EXECUTION_ACTION_ID,
+            Self::Crypttab => CRYPTTAB_REPAIR_EXECUTION_ACTION_ID,
+        }
+    }
+
+    pub const fn resource_id(self) -> &'static str {
+        match self {
+            Self::Fstab => REPAIR_EXECUTION_RESOURCE_ID,
+            Self::Crypttab => CRYPTTAB_REPAIR_EXECUTION_RESOURCE_ID,
+        }
+    }
+
+    pub const fn write_lease_capability(self) -> &'static str {
+        match self {
+            Self::Fstab => REPAIR_WRITE_LEASE_CAPABILITY,
+            Self::Crypttab => CRYPTTAB_REPAIR_WRITE_LEASE_CAPABILITY,
+        }
+    }
+
+    pub const fn rollback_action_id(self) -> &'static str {
+        match self {
+            Self::Fstab => REPAIR_ROLLBACK_ACTION_ID,
+            Self::Crypttab => CRYPTTAB_REPAIR_ROLLBACK_ACTION_ID,
+        }
+    }
+
+    pub const fn rollback_write_lease_capability(self) -> &'static str {
+        match self {
+            Self::Fstab => REPAIR_ROLLBACK_WRITE_LEASE_CAPABILITY,
+            Self::Crypttab => CRYPTTAB_REPAIR_ROLLBACK_WRITE_LEASE_CAPABILITY,
+        }
+    }
+
+    pub fn from_resource_id(value: &str) -> Result<Self, ProtocolViolation> {
+        match value {
+            REPAIR_EXECUTION_RESOURCE_ID => Ok(Self::Fstab),
+            CRYPTTAB_REPAIR_EXECUTION_RESOURCE_ID => Ok(Self::Crypttab),
+            _ => Err(ProtocolViolation::InvalidPayload),
+        }
+    }
+
+    pub fn from_execution(action_id: &str, resource_id: &str) -> Result<Self, ProtocolViolation> {
+        let resource = Self::from_resource_id(resource_id)?;
+        if action_id != resource.action_id() {
+            return Err(ProtocolViolation::InvalidPayload);
+        }
+        Ok(resource)
+    }
+
+    fn supports_metadata(self, metadata: &RepairFileMetadataV1) -> bool {
+        match self {
+            Self::Fstab => metadata.mode == 0o644,
+            Self::Crypttab => matches!(metadata.mode, 0o600 | 0o644),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -269,8 +349,43 @@ impl RepairExecutionIntentV1 {
         observed_uuid_set_sha256: Sha256,
         before_metadata: RepairFileMetadataV1,
     ) -> Result<Self, ProtocolViolation> {
+        Self::new_for_resource(
+            RepairResourceV1::Fstab,
+            session_id,
+            approval_sequence,
+            target_id,
+            scan_fingerprint,
+            target_fingerprint,
+            target_physical_parent_fingerprint,
+            target_recovery_fingerprint,
+            lock_identity,
+            before_sha256,
+            after_sha256,
+            diff_sha256,
+            observed_uuid_set_sha256,
+            before_metadata,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_for_resource(
+        resource: RepairResourceV1,
+        session_id: impl Into<String>,
+        approval_sequence: u64,
+        target_id: impl Into<String>,
+        scan_fingerprint: impl Into<String>,
+        target_fingerprint: Sha256,
+        target_physical_parent_fingerprint: Sha256,
+        target_recovery_fingerprint: impl Into<String>,
+        lock_identity: impl Into<String>,
+        before_sha256: Sha256,
+        after_sha256: Sha256,
+        diff_sha256: Sha256,
+        observed_uuid_set_sha256: Sha256,
+        before_metadata: RepairFileMetadataV1,
+    ) -> Result<Self, ProtocolViolation> {
         let value = Self {
-            action_id: REPAIR_EXECUTION_ACTION_ID.to_owned(),
+            action_id: resource.action_id().to_owned(),
             session_id: session_id.into(),
             approval_sequence,
             target_id: target_id.into(),
@@ -338,8 +453,12 @@ impl RepairExecutionIntentV1 {
     }
 
     pub(crate) fn validate(&self) -> Result<(), ProtocolViolation> {
-        if self.action_id != REPAIR_EXECUTION_ACTION_ID
-            || !valid_prefixed_id(&self.session_id, "S-")
+        let resource = match self.action_id.as_str() {
+            REPAIR_EXECUTION_ACTION_ID => RepairResourceV1::Fstab,
+            CRYPTTAB_REPAIR_EXECUTION_ACTION_ID => RepairResourceV1::Crypttab,
+            _ => return Err(ProtocolViolation::InvalidPayload),
+        };
+        if !valid_prefixed_id(&self.session_id, "S-")
             || !(1..=MAX_SAFE_JSON_INTEGER).contains(&self.approval_sequence)
             || !valid_opaque_id(&self.target_id)
             || !valid_digest_id(&self.scan_fingerprint, "scan:")
@@ -347,6 +466,7 @@ impl RepairExecutionIntentV1 {
             || !valid_digest_id(&self.lock_identity, "lock:")
             || self.before_sha256 == self.after_sha256
             || self.before_metadata.validate().is_err()
+            || !resource.supports_metadata(&self.before_metadata)
         {
             return Err(ProtocolViolation::InvalidPayload);
         }
@@ -385,9 +505,22 @@ pub fn canonical_repair_execution_intent_sha256(intent: &RepairExecutionIntentV1
 /// resource. Keeping this derivation beside the durable intent lets the Vault
 /// independently reject a syntactically valid but target-unbound lock.
 pub fn canonical_repair_lock_identity(target_recovery_fingerprint: &str) -> String {
+    canonical_repair_lock_identity_for_resource(
+        target_recovery_fingerprint,
+        RepairResourceV1::Fstab,
+    )
+}
+
+pub fn canonical_repair_lock_identity_for_resource(
+    target_recovery_fingerprint: &str,
+    resource: RepairResourceV1,
+) -> String {
     let mut hasher = Sha256Hasher::new();
-    hasher.update(LOCK_ID_DOMAIN);
-    for value in [target_recovery_fingerprint, REPAIR_EXECUTION_RESOURCE_ID] {
+    hasher.update(match resource {
+        RepairResourceV1::Fstab => LOCK_ID_DOMAIN,
+        RepairResourceV1::Crypttab => CRYPTTAB_LOCK_ID_DOMAIN,
+    });
+    for value in [target_recovery_fingerprint, resource.resource_id()] {
         hash_field(&mut hasher, value.as_bytes());
     }
     format!("lock:{}", encode_hex(&hasher.finalize()))
@@ -428,6 +561,11 @@ impl RepairBackupBinding {
             || !valid_prefixed_id(&value.approval_id, "A-")
             || !valid_resource_id(&value.resource_id)
             || value.execution_intent.validate().is_err()
+            || RepairResourceV1::from_execution(
+                value.execution_intent.action_id(),
+                &value.resource_id,
+            )
+            .is_err()
             || value.resource_sha256 != *value.execution_intent.before_sha256()
         {
             return Err(ProtocolViolation::InvalidPayload);
@@ -1246,10 +1384,11 @@ impl RepairWriteLeasePayload {
         transaction: RepairTransactionStatusPayload,
         boot_epoch_sha256: Sha256,
     ) -> Result<Self, ProtocolViolation> {
+        let resource = repair_resource_from_transaction(&transaction)?;
         let lease_binding_sha256 =
             canonical_repair_write_lease_sha256(&transaction, &boot_epoch_sha256)?;
         let value = Self {
-            capability: REPAIR_WRITE_LEASE_CAPABILITY.to_owned(),
+            capability: resource.write_lease_capability().to_owned(),
             boot_epoch_sha256,
             lease_binding_sha256,
             transaction: Box::new(transaction),
@@ -1279,14 +1418,16 @@ impl RepairWriteLeasePayload {
         let Some(intent) = self.transaction.backup().execution_intent() else {
             return Err(ProtocolViolation::InvalidPayload);
         };
-        if self.capability != REPAIR_WRITE_LEASE_CAPABILITY
+        let resource = repair_resource_from_transaction(&self.transaction)?;
+        if self.capability != resource.write_lease_capability()
             || self.transaction.phase() != RepairTransactionPhase::Pending
             || self.transaction.backup().state() != RepairBackupState::Durable
             || self.boot_epoch_sha256.bytes().iter().all(|byte| *byte == 0)
-            || intent.action_id() != REPAIR_EXECUTION_ACTION_ID
-            || self.transaction.backup().resource_id() != Some(REPAIR_EXECUTION_RESOURCE_ID)
             || intent.lock_identity()
-                != canonical_repair_lock_identity(intent.target_recovery_fingerprint())
+                != canonical_repair_lock_identity_for_resource(
+                    intent.target_recovery_fingerprint(),
+                    resource,
+                )
             || self.lease_binding_sha256
                 != canonical_repair_write_lease_sha256(&self.transaction, &self.boot_epoch_sha256)?
         {
@@ -1310,14 +1451,18 @@ pub fn canonical_repair_write_lease_sha256(
     let Some(intent) = transaction.backup().execution_intent() else {
         return Err(ProtocolViolation::InvalidPayload);
     };
+    let resource = repair_resource_from_transaction(transaction)?;
     if intent.lock_identity()
-        != canonical_repair_lock_identity(intent.target_recovery_fingerprint())
+        != canonical_repair_lock_identity_for_resource(
+            intent.target_recovery_fingerprint(),
+            resource,
+        )
     {
         return Err(ProtocolViolation::InvalidPayload);
     }
     let mut hasher = Sha256Hasher::new();
     hasher.update(WRITE_LEASE_BINDING_DOMAIN);
-    hash_field(&mut hasher, REPAIR_WRITE_LEASE_CAPABILITY.as_bytes());
+    hash_field(&mut hasher, resource.write_lease_capability().as_bytes());
     hash_field(
         &mut hasher,
         &transaction.transaction_binding_sha256().bytes(),
@@ -1385,8 +1530,9 @@ impl RepairRollbackBindingV1 {
         approval_sha256: Sha256,
         approval_sequence: u64,
     ) -> Result<Self, ProtocolViolation> {
+        let resource = repair_resource_from_transaction(source)?;
         let value = Self {
-            action_id: REPAIR_ROLLBACK_ACTION_ID.to_owned(),
+            action_id: resource.rollback_action_id().to_owned(),
             plan_id: plan_id.into(),
             plan_sha256,
             approval_id: approval_id.into(),
@@ -1446,12 +1592,13 @@ impl RepairRollbackBindingV1 {
             .backup()
             .execution_intent()
             .ok_or(ProtocolViolation::InvalidPayload)?;
+        let resource = repair_resource_from_transaction(source)?;
         let next_sequence = source_intent
             .approval_sequence()
             .checked_add(1)
             .filter(|value| *value <= MAX_SAFE_JSON_INTEGER)
             .ok_or(ProtocolViolation::InvalidPayload)?;
-        if self.action_id != REPAIR_ROLLBACK_ACTION_ID
+        if self.action_id != resource.rollback_action_id()
             || !valid_prefixed_id(&self.plan_id, "P-")
             || !valid_prefixed_id(&self.approval_id, "A-")
             || self.plan_sha256.bytes() == [0; 32]
@@ -1840,10 +1987,11 @@ impl RepairRollbackWriteLeasePayload {
         transaction: RepairRollbackTransactionStatusPayload,
         boot_epoch_sha256: Sha256,
     ) -> Result<Self, ProtocolViolation> {
+        let resource = repair_resource_from_transaction(transaction.source())?;
         let lease_binding_sha256 =
             canonical_repair_rollback_write_lease_sha256(&transaction, &boot_epoch_sha256)?;
         let value = Self {
-            capability: REPAIR_ROLLBACK_WRITE_LEASE_CAPABILITY.to_owned(),
+            capability: resource.rollback_write_lease_capability().to_owned(),
             boot_epoch_sha256,
             lease_binding_sha256,
             transaction: Box::new(transaction),
@@ -1876,12 +2024,16 @@ impl RepairRollbackWriteLeasePayload {
             .backup()
             .execution_intent()
             .ok_or(ProtocolViolation::InvalidPayload)?;
-        if self.capability != REPAIR_ROLLBACK_WRITE_LEASE_CAPABILITY
+        let resource = repair_resource_from_transaction(self.transaction.source())?;
+        if self.capability != resource.rollback_write_lease_capability()
             || self.transaction.phase() != RepairTransactionPhase::Pending
-            || self.transaction.binding().action_id() != REPAIR_ROLLBACK_ACTION_ID
+            || self.transaction.binding().action_id() != resource.rollback_action_id()
             || self.boot_epoch_sha256.bytes() == [0; 32]
             || source_intent.lock_identity()
-                != canonical_repair_lock_identity(source_intent.target_recovery_fingerprint())
+                != canonical_repair_lock_identity_for_resource(
+                    source_intent.target_recovery_fingerprint(),
+                    resource,
+                )
             || self.lease_binding_sha256
                 != canonical_repair_rollback_write_lease_sha256(
                     &self.transaction,
@@ -1909,8 +2061,12 @@ pub fn canonical_repair_rollback_write_lease_sha256(
         .backup()
         .execution_intent()
         .ok_or(ProtocolViolation::InvalidPayload)?;
+    let resource = repair_resource_from_transaction(transaction.source())?;
     if intent.lock_identity()
-        != canonical_repair_lock_identity(intent.target_recovery_fingerprint())
+        != canonical_repair_lock_identity_for_resource(
+            intent.target_recovery_fingerprint(),
+            resource,
+        )
     {
         return Err(ProtocolViolation::InvalidPayload);
     }
@@ -1918,7 +2074,7 @@ pub fn canonical_repair_rollback_write_lease_sha256(
     hasher.update(ROLLBACK_WRITE_LEASE_BINDING_DOMAIN);
     hash_field(
         &mut hasher,
-        REPAIR_ROLLBACK_WRITE_LEASE_CAPABILITY.as_bytes(),
+        resource.rollback_write_lease_capability().as_bytes(),
     );
     hash_field(
         &mut hasher,
@@ -1943,6 +2099,20 @@ fn validate_committed_rollback_source(
         return Err(ProtocolViolation::InvalidPayload);
     }
     Ok(())
+}
+
+pub fn repair_resource_from_transaction(
+    transaction: &RepairTransactionStatusPayload,
+) -> Result<RepairResourceV1, ProtocolViolation> {
+    let intent = transaction
+        .backup()
+        .execution_intent()
+        .ok_or(ProtocolViolation::InvalidPayload)?;
+    let resource_id = transaction
+        .backup()
+        .resource_id()
+        .ok_or(ProtocolViolation::InvalidPayload)?;
+    RepairResourceV1::from_execution(intent.action_id(), resource_id)
 }
 
 pub fn repair_backup_input(size: u64) -> Result<DescriptorDeclaration, ProtocolViolation> {
@@ -1991,7 +2161,7 @@ fn valid_digest_id(value: &str, prefix: &str) -> bool {
 }
 
 fn valid_resource_id(value: &str) -> bool {
-    value == REPAIR_EXECUTION_RESOURCE_ID
+    RepairResourceV1::from_resource_id(value).is_ok()
 }
 
 fn is_lower_hex(byte: u8) -> bool {
@@ -2212,6 +2382,93 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn crypttab_intent_lease_and_metadata_are_resource_distinct() {
+        let recovery = format!("recovery:{}", "8".repeat(64));
+        let private_metadata = RepairFileMetadataV1::new(0o600, 0, 0).expect("private metadata");
+        assert!(
+            RepairExecutionIntentV1::new(
+                "S-session-1",
+                1,
+                "target-1",
+                format!("scan:{}", "1".repeat(64)),
+                hash('2'),
+                hash('9'),
+                recovery.clone(),
+                canonical_repair_lock_identity(&recovery),
+                hash('4'),
+                hash('b'),
+                hash('c'),
+                hash('d'),
+                private_metadata.clone(),
+            )
+            .is_err()
+        );
+        let intent = RepairExecutionIntentV1::new_for_resource(
+            RepairResourceV1::Crypttab,
+            "S-session-1",
+            1,
+            "target-1",
+            format!("scan:{}", "1".repeat(64)),
+            hash('2'),
+            hash('9'),
+            recovery.clone(),
+            canonical_repair_lock_identity_for_resource(&recovery, RepairResourceV1::Crypttab),
+            hash('4'),
+            hash('b'),
+            hash('c'),
+            hash('d'),
+            private_metadata.clone(),
+        )
+        .expect("crypttab execution intent");
+        assert_eq!(intent.action_id(), CRYPTTAB_REPAIR_EXECUTION_ACTION_ID);
+        assert_ne!(
+            intent.lock_identity(),
+            canonical_repair_lock_identity(&recovery)
+        );
+        assert!(
+            RepairBackupBinding::new(
+                "P-plan-1",
+                hash('6'),
+                "A-approval-1",
+                hash('7'),
+                REPAIR_EXECUTION_RESOURCE_ID,
+                hash('4'),
+                intent.clone(),
+            )
+            .is_err()
+        );
+        let binding = RepairBackupBinding::new(
+            "P-plan-1",
+            hash('6'),
+            "A-approval-1",
+            hash('7'),
+            CRYPTTAB_REPAIR_EXECUTION_RESOURCE_ID,
+            hash('4'),
+            intent,
+        )
+        .expect("crypttab binding");
+        let durable = RepairBackupStatusPayload::durable(
+            reservation(),
+            hash('1'),
+            reservation().locator(),
+            "V-0123456789abcdef0123456789abcdef",
+            hash('2'),
+            hash('3'),
+            8192,
+            4096,
+            hash('4'),
+            private_metadata.canonical_sha256(),
+            binding,
+        )
+        .expect("crypttab durable status");
+        let pending =
+            RepairTransactionStatusPayload::pending(durable).expect("pending crypttab transaction");
+        let lease =
+            RepairWriteLeasePayload::consumed(pending, hash('e')).expect("crypttab write lease");
+        assert_eq!(lease.capability(), CRYPTTAB_REPAIR_WRITE_LEASE_CAPABILITY);
     }
 
     #[test]

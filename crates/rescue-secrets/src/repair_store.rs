@@ -15,14 +15,14 @@ use kernaid_protocol::{
     rescue_repair_vault::{
         RepairBackupBinding as ProtocolRepairBackupBinding,
         RepairBackupStatusPayload as ProtocolRepairBackupStatusPayload, RepairExecutionIntentV1,
-        RepairFileMetadataV1, RepairReservationId as ProtocolRepairReservationId,
+        RepairFileMetadataV1, RepairReservationId as ProtocolRepairReservationId, RepairResourceV1,
         RepairRollbackBindingV1, RepairRollbackId, RepairRollbackResolution,
         RepairRollbackResolutionOutcome, RepairRollbackStatusResultPayload,
         RepairRollbackStatusSelector, RepairRollbackTransactionStatusPayload,
         RepairRollbackWriteLeasePayload, RepairTransactionPhase, RepairTransactionResolution,
         RepairTransactionResolutionOutcome, RepairTransactionStatusPayload,
         RepairTransactionStatusResultPayload, RepairTransactionStatusSelector,
-        RepairWriteLeasePayload, canonical_repair_lock_identity,
+        RepairWriteLeasePayload, canonical_repair_lock_identity_for_resource,
     },
     rescue_vault::Sha256 as ProtocolSha256,
 };
@@ -102,7 +102,6 @@ const RESERVATION_BINDING_DOMAIN: &[u8] = b"KERNAID-REPAIR-RESERVATION-V1\0";
 const VAULT_IDENTITY_DOMAIN: &[u8] = b"KERNAID-REPAIR-VAULT-IDENTITY-V1\0";
 const STABLE_VAULT_ID_DOMAIN: &[u8] = b"KERNAID-REPAIR-STABLE-VAULT-ID-V1\0";
 const WRITE_LEASE_BOOT_EPOCH_DOMAIN: &[u8] = b"KERNAID-REPAIR-WRITE-LEASE-BOOT-EPOCH-V1\0";
-const FSTAB_RESOURCE_ID: &str = "rescue:selected-linux-root:etc/fstab";
 const BOOT_ID_PATH: &str = "/proc/sys/kernel/random/boot_id";
 const PROC_SUPER_MAGIC: u64 = 0x0000_9fa0;
 
@@ -240,7 +239,7 @@ impl RepairBackupDraft {
             || self.target_fingerprint == [0; 32]
             || !valid_recovery_fingerprint(&self.target_recovery_fingerprint)
             || self.expected_backup_sha256 == [0; 32]
-            || self.metadata_sha256 != canonical_fstab_metadata_sha256()
+            || !valid_reserved_metadata_sha256(&self.metadata_sha256)
             || self.backup_size_bytes == 0
             || self.required_capacity_bytes < self.backup_size_bytes
             || self.required_capacity_bytes > MAX_BACKUP_BYTES
@@ -307,6 +306,22 @@ pub fn canonical_fstab_metadata_sha256() -> [u8; 32] {
         .bytes()
 }
 
+/// Additional safe metadata accepted for `/etc/crypttab`. Mode 0644 shares
+/// the fstab digest; mode 0600 is accepted only once the final binding names
+/// the closed crypttab action/resource pair.
+#[must_use]
+pub fn canonical_private_crypttab_metadata_sha256() -> [u8; 32] {
+    RepairFileMetadataV1::new(0o600, 0, 0)
+        .expect("canonical private crypttab metadata is valid")
+        .canonical_sha256()
+        .bytes()
+}
+
+fn valid_reserved_metadata_sha256(value: &[u8; 32]) -> bool {
+    *value == canonical_fstab_metadata_sha256()
+        || *value == canonical_private_crypttab_metadata_sha256()
+}
+
 /// Post-approval binding persisted before backup bytes are installed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -348,7 +363,11 @@ impl RepairBinding {
             || !valid_prefixed_id(&self.approval_id, "A-")
             || self.plan_sha256 == [0; 32]
             || self.approval_sha256 == [0; 32]
-            || self.resource_id != FSTAB_RESOURCE_ID
+            || RepairResourceV1::from_execution(
+                self.execution_intent.action_id(),
+                &self.resource_id,
+            )
+            .is_err()
             || self.resource_sha256 == [0; 32]
             || !valid_execution_intent(&self.execution_intent)
             || self.resource_sha256 != self.execution_intent.before_sha256().bytes()
@@ -1776,8 +1795,13 @@ impl<'vault> RepairVaultStore<'vault> {
         };
         binding.validate_for_record(reservation)?;
         let intent = &binding.execution_intent;
+        let resource = RepairResourceV1::from_execution(intent.action_id(), &binding.resource_id)
+            .map_err(|_| RepairVaultStoreError::InvalidBinding)?;
         if intent.lock_identity()
-            != canonical_repair_lock_identity(intent.target_recovery_fingerprint())
+            != canonical_repair_lock_identity_for_resource(
+                intent.target_recovery_fingerprint(),
+                resource,
+            )
         {
             return Err(RepairVaultStoreError::InvalidBinding);
         }
@@ -3884,9 +3908,15 @@ fn apply_repair_event(
             binding
                 .validate_for_record(reservation)
                 .map_err(|_| RepairVaultStoreError::CorruptJournal)?;
+            let resource = RepairResourceV1::from_execution(
+                binding.execution_intent.action_id(),
+                &binding.resource_id,
+            )
+            .map_err(|_| RepairVaultStoreError::CorruptJournal)?;
             if binding.execution_intent.lock_identity()
-                != canonical_repair_lock_identity(
+                != canonical_repair_lock_identity_for_resource(
                     binding.execution_intent.target_recovery_fingerprint(),
+                    resource,
                 )
             {
                 return Err(RepairVaultStoreError::CorruptJournal);
@@ -6305,7 +6335,13 @@ fn valid_recovery_fingerprint(value: &str) -> bool {
 }
 
 fn valid_execution_intent(intent: &RepairExecutionIntentV1) -> bool {
-    RepairExecutionIntentV1::new(
+    let resource = match intent.action_id() {
+        action if action == RepairResourceV1::Fstab.action_id() => RepairResourceV1::Fstab,
+        action if action == RepairResourceV1::Crypttab.action_id() => RepairResourceV1::Crypttab,
+        _ => return false,
+    };
+    RepairExecutionIntentV1::new_for_resource(
+        resource,
         intent.session_id(),
         intent.approval_sequence(),
         intent.target_id(),
@@ -6438,6 +6474,20 @@ mod tests {
         .expect("valid draft")
     }
 
+    fn crypttab_draft(bytes: &[u8], capacity: u64) -> RepairBackupDraft {
+        RepairBackupDraft::new(
+            "S-repair-test",
+            "target-test",
+            [7; 32],
+            format!("recovery:{}", "6".repeat(64)),
+            Sha256::digest(bytes).into(),
+            canonical_private_crypttab_metadata_sha256(),
+            bytes.len() as u64,
+            capacity,
+        )
+        .expect("valid crypttab draft")
+    }
+
     fn binding(bytes: &[u8]) -> RepairBinding {
         let before_sha256 = ProtocolSha256::parse(&encode_hex(&Sha256::digest(bytes)))
             .expect("protocol before digest");
@@ -6450,7 +6500,10 @@ mod tests {
             ProtocolSha256::parse(&encode_hex(&[7; 32])).expect("target digest"),
             ProtocolSha256::parse(&"d".repeat(64)).expect("target parent digest"),
             recovery_fingerprint.clone(),
-            canonical_repair_lock_identity(&recovery_fingerprint),
+            canonical_repair_lock_identity_for_resource(
+                &recovery_fingerprint,
+                RepairResourceV1::Fstab,
+            ),
             before_sha256,
             ProtocolSha256::parse(&"3".repeat(64)).expect("after digest"),
             ProtocolSha256::parse(&"4".repeat(64)).expect("diff digest"),
@@ -6468,6 +6521,42 @@ mod tests {
             execution_intent,
         )
         .expect("valid binding")
+    }
+
+    fn crypttab_binding(bytes: &[u8]) -> RepairBinding {
+        let before_sha256 = ProtocolSha256::parse(&encode_hex(&Sha256::digest(bytes)))
+            .expect("protocol before digest");
+        let recovery_fingerprint = format!("recovery:{}", "6".repeat(64));
+        let execution_intent = RepairExecutionIntentV1::new_for_resource(
+            RepairResourceV1::Crypttab,
+            "S-repair-test",
+            1,
+            "target-test",
+            format!("scan:{}", "1".repeat(64)),
+            ProtocolSha256::parse(&encode_hex(&[7; 32])).expect("target digest"),
+            ProtocolSha256::parse(&"d".repeat(64)).expect("target parent digest"),
+            recovery_fingerprint.clone(),
+            canonical_repair_lock_identity_for_resource(
+                &recovery_fingerprint,
+                RepairResourceV1::Crypttab,
+            ),
+            before_sha256,
+            ProtocolSha256::parse(&"3".repeat(64)).expect("after digest"),
+            ProtocolSha256::parse(&"4".repeat(64)).expect("diff digest"),
+            ProtocolSha256::parse(&"5".repeat(64)).expect("UUID-set digest"),
+            RepairFileMetadataV1::new(0o600, 0, 0).expect("crypttab metadata"),
+        )
+        .expect("crypttab execution intent");
+        RepairBinding::new(
+            "P-repair-test",
+            [9; 32],
+            "A-repair-test",
+            [10; 32],
+            RepairResourceV1::Crypttab.resource_id(),
+            Sha256::digest(bytes).into(),
+            execution_intent,
+        )
+        .expect("valid crypttab binding")
     }
 
     fn committed_resolution(
@@ -7150,6 +7239,54 @@ mod tests {
             receipt.lease_binding_sha256()
         );
         assert_eq!(store.event_count, event_count + 1);
+    }
+
+    #[test]
+    fn crypttab_backup_and_write_lease_remain_resource_distinct() {
+        let fixture = Fixture::new();
+        let bytes = b"archive UUID=dead-beef none luks,nofail\n";
+        let mut store = fixture
+            .vault
+            .open_repair_store()
+            .expect("open repair store");
+        let reserved = store
+            .reserve_backup(crypttab_draft(bytes, 4096))
+            .expect("reserve crypttab backup");
+        store
+            .persist_backup(
+                reserved,
+                crypttab_binding(bytes),
+                fixture.read_only_source(bytes),
+            )
+            .expect("persist crypttab transaction");
+        let pending = store
+            .transaction_status(&RepairTransactionStatusSelector::pending_singleton())
+            .expect("pending crypttab status")
+            .transaction()
+            .expect("pending crypttab transaction")
+            .clone();
+        let intent = pending
+            .backup()
+            .execution_intent()
+            .expect("crypttab intent");
+        assert_eq!(intent.action_id(), RepairResourceV1::Crypttab.action_id());
+        assert_eq!(
+            pending.backup().resource_id(),
+            Some(RepairResourceV1::Crypttab.resource_id())
+        );
+        assert_eq!(intent.before_metadata().mode(), 0o600);
+
+        let lease = store
+            .consume_write_lease(&RepairTransactionStatusSelector::for_status(&pending))
+            .expect("consume crypttab write lease");
+        assert_eq!(
+            lease.capability(),
+            RepairResourceV1::Crypttab.write_lease_capability()
+        );
+        assert_ne!(
+            lease.capability(),
+            RepairResourceV1::Fstab.write_lease_capability()
+        );
     }
 
     #[test]

@@ -1,11 +1,10 @@
 //! Broker-owned preflight and Core admission for the Rescue crypttab action.
 //!
-//! This is a real deterministic preparation boundary, not an executor. It
-//! deliberately has no public constructor for observation authority and no
-//! filesystem, Vault or write method. A future production resolver in this
-//! crate must create the observation from the same retained four-descriptor
-//! target bundle used by the fstab candidate, then reserve/persist the backup
-//! before this admitted preview can gain execution authority.
+//! The deterministic preview has no public observation constructor or write
+//! method. Production preparation creates it from the retained descriptor-only
+//! target bundle, couples it to a distinct authenticated Vault reservation,
+//! and transfers that inseparable authority into the shared repair transaction
+//! engine only after exact typed approval.
 
 use kernaid_core::{
     RescueCrypttabAdmissionError, RescueCrypttabCandidateAdmission,
@@ -24,10 +23,20 @@ use kernaid_protocol::{
         EVIDENCE_IDS, RescueCrypttabEvidenceBinding, RescueCrypttabPrepareRequest,
         RescueCrypttabPreparedDescriptor,
     },
+    rescue_repair_vault::RepairFileMetadataV1,
 };
 use sha2::{Digest, Sha256};
+use std::time::Instant;
 use std::{collections::BTreeSet, fmt};
 use zeroize::Zeroizing;
+
+use crate::{
+    rescue_fstab_candidate::RescueFstabVaultReservation,
+    rescue_fstab_preflight_resolver::{
+        ProductionRescueFstabTargetGuard, ProductionRescueFstabVaultReservation,
+        acquire_crypttab_target_guard, reserve_crypttab_backup,
+    },
+};
 
 const PLAN_HASH_DOMAIN: &[u8] = b"kernaid:linux.crypttab.disable-missing-uuid.v1:plan:v1\0";
 
@@ -40,6 +49,9 @@ pub enum RescueCrypttabPreflightError {
     InvalidBinding,
     PolicyRejected,
     ApprovalRejected,
+    TargetUnavailable,
+    VaultUnavailable,
+    CancellationFailed,
 }
 
 /// Production read-only entry point. The caller must retain `target` across
@@ -64,6 +76,7 @@ pub struct BrokerOwnedCrypttabObservation {
     crypttab_bytes: Zeroizing<Vec<u8>>,
     fstab_bytes: Zeroizing<Vec<u8>>,
     observed_uuids: BTreeSet<String>,
+    metadata: RepairFileMetadataV1,
 }
 
 impl BrokerOwnedCrypttabObservation {
@@ -82,11 +95,13 @@ impl BrokerOwnedCrypttabObservation {
             crypttab_bytes: Zeroizing::new(crypttab.to_vec()),
             fstab_bytes: Zeroizing::new(fstab.to_vec()),
             observed_uuids,
+            metadata: RepairFileMetadataV1::new(0o644, 0, 0).expect("test metadata"),
         }
     }
 
     /// Only another broker module holding the real root-issued target guard
     /// may construct this value. No caller-controlled path or action exists.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_retained_target_capability(
         scan_fingerprint: String,
         target_id: String,
@@ -95,6 +110,7 @@ impl BrokerOwnedCrypttabObservation {
         crypttab_bytes: Zeroizing<Vec<u8>>,
         fstab_bytes: Zeroizing<Vec<u8>>,
         observed_uuids: BTreeSet<String>,
+        metadata: RepairFileMetadataV1,
     ) -> Self {
         Self {
             scan_fingerprint,
@@ -104,6 +120,7 @@ impl BrokerOwnedCrypttabObservation {
             crypttab_bytes,
             fstab_bytes,
             observed_uuids,
+            metadata,
         }
     }
 }
@@ -133,6 +150,7 @@ pub struct PreparedRescueCrypttabCandidate {
     admission: RescueCrypttabCandidateAdmission,
     backup_bytes: Zeroizing<Vec<u8>>,
     proposed_bytes: Zeroizing<Vec<u8>>,
+    metadata: RepairFileMetadataV1,
 }
 
 impl PreparedRescueCrypttabCandidate {
@@ -141,6 +159,9 @@ impl PreparedRescueCrypttabCandidate {
     }
     pub fn plan(&self) -> &ValidatedPlan {
         &self.plan
+    }
+    pub const fn metadata(&self) -> &RepairFileMetadataV1 {
+        &self.metadata
     }
 
     pub fn approve(
@@ -164,8 +185,139 @@ impl PreparedRescueCrypttabCandidate {
             admission: self.admission,
             backup_bytes: self.backup_bytes,
             proposed_bytes: self.proposed_bytes,
+            metadata: self.metadata,
         })
     }
+}
+
+/// Production prepared authority. Target and authenticated Vault reservation
+/// remain inseparable from the immutable preview until approval or cancel.
+#[must_use]
+pub struct PreparedRescueCrypttabTransaction {
+    candidate: PreparedRescueCrypttabCandidate,
+    target_guard: ProductionRescueFstabTargetGuard,
+    reservation: ProductionRescueFstabVaultReservation,
+}
+
+impl PreparedRescueCrypttabTransaction {
+    pub fn descriptor(&self) -> &RescueCrypttabPreparedDescriptor {
+        self.candidate.descriptor()
+    }
+
+    pub fn backup_locator(&self) -> &str {
+        self.reservation.status().locator()
+    }
+
+    pub fn approve(
+        self,
+        approval_id: impl Into<String>,
+        typed_confirmation: impl Into<String>,
+        cancellation_deadline: Instant,
+    ) -> Result<ApprovedRescueCrypttabTransaction, RescueCrypttabPreflightError> {
+        let Self {
+            candidate,
+            target_guard,
+            reservation,
+        } = self;
+        let candidate = match candidate.approve(approval_id, typed_confirmation) {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                reservation
+                    .cancel(cancellation_deadline)
+                    .map_err(|_| RescueCrypttabPreflightError::CancellationFailed)?;
+                return Err(error);
+            }
+        };
+        Ok(ApprovedRescueCrypttabTransaction {
+            candidate,
+            target_guard,
+            reservation,
+        })
+    }
+
+    pub fn cancel(self, deadline: Instant) -> Result<(), RescueCrypttabPreflightError> {
+        self.reservation
+            .cancel(deadline)
+            .map_err(|_| RescueCrypttabPreflightError::CancellationFailed)
+    }
+}
+
+#[must_use]
+pub struct ApprovedRescueCrypttabTransaction {
+    candidate: ApprovedRescueCrypttabCandidate,
+    target_guard: ProductionRescueFstabTargetGuard,
+    reservation: ProductionRescueFstabVaultReservation,
+}
+
+pub(crate) struct ApprovedRescueCrypttabExecutionParts {
+    pub(crate) descriptor: RescueCrypttabPreparedDescriptor,
+    pub(crate) plan: ValidatedPlan,
+    pub(crate) admission: RescueCrypttabCandidateAdmission,
+    pub(crate) backup_bytes: Zeroizing<Vec<u8>>,
+    pub(crate) proposed_bytes: Zeroizing<Vec<u8>>,
+    pub(crate) metadata: RepairFileMetadataV1,
+    pub(crate) target_guard: ProductionRescueFstabTargetGuard,
+    pub(crate) reservation: ProductionRescueFstabVaultReservation,
+}
+
+impl ApprovedRescueCrypttabTransaction {
+    pub fn descriptor(&self) -> &RescueCrypttabPreparedDescriptor {
+        self.candidate.descriptor()
+    }
+
+    pub fn cancel(self, deadline: Instant) -> Result<(), RescueCrypttabPreflightError> {
+        self.reservation
+            .cancel(deadline)
+            .map_err(|_| RescueCrypttabPreflightError::CancellationFailed)
+    }
+
+    pub(crate) fn into_execution_parts(self) -> ApprovedRescueCrypttabExecutionParts {
+        let ApprovedRescueCrypttabCandidate {
+            descriptor,
+            plan,
+            admission,
+            backup_bytes,
+            proposed_bytes,
+            metadata,
+        } = self.candidate;
+        ApprovedRescueCrypttabExecutionParts {
+            descriptor,
+            plan,
+            admission,
+            backup_bytes,
+            proposed_bytes,
+            metadata,
+            target_guard: self.target_guard,
+            reservation: self.reservation,
+        }
+    }
+}
+
+/// Full production prepare path: acquire target, observe both files, admit
+/// the fail-closed preview, then reserve a distinct authenticated backup.
+pub fn prepare_rescue_crypttab_transaction(
+    request: RescueCrypttabPrepareRequest,
+    deadline: Instant,
+) -> Result<PreparedRescueCrypttabTransaction, RescueCrypttabPreflightError> {
+    let target_guard = acquire_crypttab_target_guard(&request, deadline)
+        .map_err(|_| RescueCrypttabPreflightError::TargetUnavailable)?;
+    let observation =
+        crate::rescue_crypttab_observer::observe_rescue_crypttab(target_guard.inner())
+            .map_err(|_| RescueCrypttabPreflightError::Observation)?;
+    let candidate = prepare_rescue_crypttab_candidate(&request, observation)?;
+    let reservation = reserve_crypttab_backup(
+        &request,
+        &target_guard,
+        &candidate.backup_bytes,
+        candidate.metadata(),
+        deadline,
+    )
+    .map_err(|_| RescueCrypttabPreflightError::VaultUnavailable)?;
+    Ok(PreparedRescueCrypttabTransaction {
+        candidate,
+        target_guard,
+        reservation,
+    })
 }
 
 impl fmt::Debug for PreparedRescueCrypttabCandidate {
@@ -179,19 +331,21 @@ impl fmt::Debug for PreparedRescueCrypttabCandidate {
     }
 }
 
-/// Core-approved material still lacking Vault reservation and write authority.
-/// There is intentionally no execute method in this tranche.
+/// Core-approved preview material. It is not write authority on its own; the
+/// production wrapper keeps it inseparable from the retained target and Vault
+/// reservation before the shared executor can consume it.
 #[must_use]
 pub struct ApprovedRescueCrypttabCandidate {
     descriptor: RescueCrypttabPreparedDescriptor,
     plan: ValidatedPlan,
     admission: RescueCrypttabCandidateAdmission,
-    // Retained as opaque, zeroizing material for the future shared
-    // Vault-backed executor. This approved value is not write authority.
+    // Retained as opaque, zeroizing material for the shared Vault-backed
+    // executor. This approved value alone is not write authority.
     #[allow(dead_code)]
     backup_bytes: Zeroizing<Vec<u8>>,
     #[allow(dead_code)]
     proposed_bytes: Zeroizing<Vec<u8>>,
+    metadata: RepairFileMetadataV1,
 }
 
 impl ApprovedRescueCrypttabCandidate {
@@ -205,6 +359,9 @@ impl ApprovedRescueCrypttabCandidate {
         self.admission
             .approval_id()
             .expect("approved admission has an approval ID")
+    }
+    pub const fn metadata(&self) -> &RepairFileMetadataV1 {
+        &self.metadata
     }
     #[cfg(test)]
     pub(crate) fn backup_bytes(&self) -> &[u8] {
@@ -278,6 +435,7 @@ pub fn prepare_rescue_crypttab_candidate(
         admission,
         backup_bytes: observation.crypttab_bytes,
         proposed_bytes: Zeroizing::new(preview.proposed_crypttab().to_vec()),
+        metadata: observation.metadata,
     })
 }
 
