@@ -7,6 +7,7 @@ members = [
   "crates/fleet-audit", "crates/fleet-coordinator", "crates/fleet-resident-sync",
   "crates/fleet-resident-update",
   "crates/fleet-resident-work-orders",
+  "crates/media-creator-core",
   "crates/update-client",
   "crates/native-secrets", "crates/rescue-secrets", "crates/report-schema",
   "crates/entitlements",
@@ -16,6 +17,7 @@ members = [
   "crates/linux-blockfd",
   "crates/linux-systemd",
   "packs/linux", "packs/macos", "packs/windows", "apps/desk/src-tauri",
+  "apps/media-creator-windows",
   "apps/desk/provider-key",
   "apps/desk/src-tauri-rescue"
 ]
