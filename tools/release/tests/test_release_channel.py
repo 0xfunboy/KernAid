@@ -298,6 +298,25 @@ class ReleaseChannelTests(unittest.TestCase):
         self.assertNotIn("os.link(qualified_output, release_output)", workflow)
         self.assertIn("moved.st_nlink != 1", workflow)
 
+    def test_publisher_reverifies_native_prompt_evidence(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        archive_allowlist = workflow[
+            workflow.index("          expected = {") : workflow.index(
+                "          with zipfile.ZipFile(archive) as bundle:"
+            )
+        ]
+        manifest_args = workflow[
+            workflow.index("          manifest_args=(") : workflow.index(
+                "          python3 -I -B tools/build-rescue/qualification-manifest.py verify"
+            )
+        ]
+        evidence = "kernaid-native-vault-prompt.sanitized.log"
+        self.assertIn(f'              "{evidence}",', archive_allowlist)
+        self.assertIn(
+            f'            --native-prompt-evidence "$qualified/{evidence}"',
+            manifest_args,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

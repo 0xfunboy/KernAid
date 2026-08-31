@@ -351,6 +351,7 @@ jobs:
               "KernAid-Rescue-amd64-retail.json",
               "KernAid-Rescue-amd64-retail.qualification.sigstore.json",
               "kernaid-linux-snapshot-e2e.sanitized.log",
+              "kernaid-native-vault-prompt.sanitized.log",
               "kernaid-vault-lifecycle-bios.sanitized.log",
               "kernaid-vault-lifecycle-uefi.sanitized.log",
               "rescue-usb-smoke-bios.log",
@@ -425,6 +426,7 @@ jobs:
             --catalog "$qualified/KernAid-Rescue-amd64.catalog-entry-v2.json"
             --sbom "$qualified/KernAid-Rescue-amd64.codex.cdx.json"
             --snapshot-evidence "$qualified/kernaid-linux-snapshot-e2e.sanitized.log"
+            --native-prompt-evidence "$qualified/kernaid-native-vault-prompt.sanitized.log"
             --usb-bios-evidence "$qualified/rescue-usb-smoke-bios.log"
             --usb-uefi-evidence "$qualified/rescue-usb-smoke-uefi.log"
             --lifecycle-bios-evidence "$qualified/kernaid-vault-lifecycle-bios.sanitized.log"
