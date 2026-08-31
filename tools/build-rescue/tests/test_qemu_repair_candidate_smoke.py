@@ -1173,8 +1173,7 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
     ) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
         gate = workflow.index(
-            "      - name: QEMU UEFI repair candidate restart reconciliation "
-            "qualification\n"
+            "      - name: QEMU consolidated repair candidate qualification\n"
         )
         forensic_start = workflow.index(
             "      - name: Upload private repair candidate forensics\n"
