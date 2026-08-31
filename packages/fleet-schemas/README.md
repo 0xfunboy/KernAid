@@ -23,6 +23,18 @@ The test suite includes fixed enrollment and inventory vectors produced by the
 Rust `fleet-client` crate. It verifies byte-for-byte canonical JSON and both
 signatures in Node.js.
 
+Audit envelopes preserve the Rust `DeviceIdentity::sign_report` framing. The
+Ed25519 signature covers the following nested byte sequence, where lengths are
+unsigned big-endian integers:
+
+```text
+KERNAID-SIGNED-REPORT-V1\0 || u128be(payload length) || payload
+payload = kernaid:fleet:audit:v1\0 || u64be(canonical length) || canonical JSON(unsigned envelope)
+```
+
+The fixed audit vector in `test/protocol.test.ts` was produced by the Rust
+`fleet-audit` crate and verifies the complete nested framing cross-language.
+
 ## Closed payloads
 
 - `dev.kernaid.fleet.enrollment-request.v1` binds a one-time token, tenant,
@@ -31,6 +43,10 @@ signatures in Node.js.
 - `dev.kernaid.fleet.inventory-envelope.v1` carries one bounded aggregate asset
   snapshot. It has no field for command execution, logs, serial numbers,
   arbitrary findings or raw diagnostic content.
+- `dev.kernaid.fleet.audit-envelope.v1` carries a bounded event in a
+  per-device, per-session digest chain. It accepts only identifiers, status,
+  risk and target/report/evidence digests; raw logs, PII and arbitrary fields
+  are not representable.
 
 Device IDs have the canonical form
 `KA-<first 24 lowercase hex characters of SHA-256(raw Ed25519 public key)>`.

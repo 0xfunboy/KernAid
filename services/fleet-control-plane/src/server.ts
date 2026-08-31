@@ -9,6 +9,7 @@ import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import { extname, relative, resolve, sep } from "node:path";
 import {
   FleetSchemaError,
+  auditSigningBytes,
   canonicalJson,
   enrollmentSigningBytes,
   expectExactKeys,
@@ -17,6 +18,7 @@ import {
   expectSafeInteger,
   inventorySigningBytes,
   parseEnrollmentRequest,
+  parseAuditEnvelope,
   parseInventoryEnvelope,
 } from "@kernaid/fleet-schemas";
 import {
@@ -31,10 +33,12 @@ import {
 } from "./crypto.js";
 import {
   FleetStore,
+  StoreChainForkError,
   StoreAuthorizationError,
   StoreConflictError,
   StoreReplayError,
   StoreRevokedError,
+  StoreSequenceGapError,
 } from "./store.js";
 
 const MAX_REQUEST_BYTES = 64 * 1024;
@@ -135,6 +139,10 @@ export class FleetControlPlane {
         writeJson(response, 409, { error: "conflict" });
       } else if (error instanceof StoreReplayError) {
         writeJson(response, 409, { error: "sequence_replay" });
+      } else if (error instanceof StoreSequenceGapError) {
+        writeJson(response, 409, { error: "sequence_gap" });
+      } else if (error instanceof StoreChainForkError) {
+        writeJson(response, 409, { error: "chain_fork" });
       } else {
         writeJson(response, 500, { error: "internal_error" });
       }
@@ -321,6 +329,53 @@ export class FleetControlPlane {
       return;
     }
 
+    if (method === "POST" && path === "/v1/audit-events") {
+      const envelope = parseAuditEnvelope(await readCanonicalJson(request));
+      const now = this.#validNow();
+      if (Date.parse(envelope.occurredAt) > now.getTime() + this.#clockSkewMs) {
+        throw new HttpError(400, "audit_timestamp_rejected");
+      }
+      const device = this.#store.getDevice(
+        envelope.tenantId,
+        envelope.deviceId,
+      );
+      if (device === undefined) throw new HttpError(401, "unknown_device");
+      if (device.revokedAt !== null) throw new HttpError(403, "device_revoked");
+
+      let publicKey;
+      try {
+        publicKey = importEd25519Spki(device.publicKeySpki);
+      } catch {
+        throw new HttpError(500, "invalid_stored_key");
+      }
+      if (
+        !verifyEd25519(
+          publicKey,
+          auditSigningBytes(envelope),
+          envelope.signature,
+        )
+      ) {
+        throw new HttpError(401, "invalid_signature");
+      }
+
+      const result = this.#store.recordAuditEvent(
+        envelope,
+        sha256Hex(canonicalJson(envelope)),
+        now.toISOString(),
+      );
+      writeJson(response, result.idempotent ? 200 : 201, {
+        schema: "dev.kernaid.fleet.audit-response.v1",
+        tenantId: envelope.tenantId,
+        deviceId: envelope.deviceId,
+        sessionId: envelope.sessionId,
+        eventId: envelope.eventId,
+        sequence: envelope.sequence,
+        accepted: true,
+        idempotent: result.idempotent,
+      });
+      return;
+    }
+
     const devicesMatch = /^\/v1\/tenants\/([^/]+)\/devices$/.exec(path);
     if (method === "GET" && devicesMatch !== null) {
       const tenantId = pathIdentifier(devicesMatch[1], "tenantId");
@@ -352,6 +407,20 @@ export class FleetControlPlane {
         schema: "dev.kernaid.fleet.asset-list.v1",
         tenantId,
         items: this.#store.listAssets(tenantId),
+      });
+      return;
+    }
+
+    const auditEventsMatch = /^\/v1\/tenants\/([^/]+)\/audit-events$/.exec(
+      path,
+    );
+    if (method === "GET" && auditEventsMatch !== null) {
+      const tenantId = pathIdentifier(auditEventsMatch[1], "tenantId");
+      this.#authorizeTenant(request, tenantId);
+      writeJson(response, 200, {
+        schema: "dev.kernaid.fleet.audit-event-list.v1",
+        tenantId,
+        items: this.#store.listAuditEvents(tenantId),
       });
       return;
     }
@@ -477,6 +546,28 @@ function bearerToken(request: IncomingMessage): string | undefined {
 }
 
 async function readJson(request: IncomingMessage): Promise<unknown> {
+  return parseJsonBytes(await readJsonBytes(request));
+}
+
+async function readCanonicalJson(request: IncomingMessage): Promise<unknown> {
+  const bytes = await readJsonBytes(request);
+  const value = parseJsonBytes(bytes);
+  const text = bytes.toString("utf8");
+  try {
+    if (
+      !Buffer.from(text, "utf8").equals(bytes) ||
+      canonicalJson(value) !== text
+    ) {
+      throw new HttpError(400, "noncanonical_json");
+    }
+  } catch (error) {
+    if (error instanceof HttpError) throw error;
+    throw new HttpError(400, "invalid_json");
+  }
+  return value;
+}
+
+async function readJsonBytes(request: IncomingMessage): Promise<Buffer> {
   const contentType = request.headers["content-type"];
   if (
     contentType === undefined ||
@@ -506,8 +597,12 @@ async function readJson(request: IncomingMessage): Promise<unknown> {
       throw new HttpError(413, "request_too_large");
     chunks.push(bytes);
   }
+  return Buffer.concat(chunks);
+}
+
+function parseJsonBytes(bytes: Buffer): unknown {
   try {
-    return JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown;
+    return JSON.parse(bytes.toString("utf8")) as unknown;
   } catch {
     throw new HttpError(400, "invalid_json");
   }

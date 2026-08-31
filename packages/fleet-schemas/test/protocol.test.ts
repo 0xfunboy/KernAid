@@ -1,14 +1,18 @@
 import assert from "node:assert/strict";
-import { createPublicKey, verify } from "node:crypto";
+import { createHash, createPublicKey, verify } from "node:crypto";
 import { test } from "node:test";
 import {
   FleetSchemaError,
+  auditDomainPayloadBytes,
+  auditSigningBytes,
   canonicalJson,
   enrollmentSigningBytes,
   inventorySigningBytes,
   parseEnrollmentRequest,
+  parseAuditEnvelope,
   parseInventoryEnvelope,
   toUnsignedEnrollment,
+  toUnsignedAudit,
   toUnsignedInventory,
 } from "../src/index.js";
 
@@ -22,6 +26,12 @@ const INVENTORY_UNSIGNED =
   '{"asset":{"architecture":"x86_64","assetId":"asset-01","findingCounts":{"critical":1,"info":3,"warning":2},"health":"attention","osRelease":"Debian 13","platform":"linux","snapshotSha256":"16a0eeb0791b6c92451fd284dd9f599e0a7dbe7f6ebea6e2d2d06c7f74aec112","targetFingerprint":"a5652641f192351052d23f21e1803f6fd6c16785058b307dc79e79ec732a462f"},"deviceId":"KA-3097e2dee2cb4a34b53840cd","observedAt":"2026-08-31T12:30:45Z","schema":"dev.kernaid.fleet.inventory-envelope.v1","sequence":7,"tenantId":"tenant-europe-1"}';
 const INVENTORY_JSON =
   '{"asset":{"architecture":"x86_64","assetId":"asset-01","findingCounts":{"critical":1,"info":3,"warning":2},"health":"attention","osRelease":"Debian 13","platform":"linux","snapshotSha256":"16a0eeb0791b6c92451fd284dd9f599e0a7dbe7f6ebea6e2d2d06c7f74aec112","targetFingerprint":"a5652641f192351052d23f21e1803f6fd6c16785058b307dc79e79ec732a462f"},"deviceId":"KA-3097e2dee2cb4a34b53840cd","observedAt":"2026-08-31T12:30:45Z","schema":"dev.kernaid.fleet.inventory-envelope.v1","sequence":7,"signature":"JWA3A3N0H6OQPMr7YOFpMElp9O_m6AX5Cg7i4VP3lrxad21yPm5vAPJTAPWwHgav1rerscC0D9GcI3X95F9OAg","tenantId":"tenant-europe-1"}';
+const AUDIT_PUBLIC_KEY_SPKI =
+  "MCowBQYDK2VwAyEA4v4qObcyZkKCfW2C1JdiLNbCl_54Jw6qQ2sB8Ia288s";
+const AUDIT_JSON =
+  '{"actionId":null,"deviceId":"KA-b41fd894f96ec8adca19a85f","eventId":"event-0001","evidenceSha256":[],"kind":"diagnostic_started","occurredAt":"2026-08-31T14:15:16Z","outcome":"started","previousEventSha256":null,"reportSha256":null,"risk":"R0","schema":"dev.kernaid.fleet.audit-envelope.v1","sequence":1,"sessionId":"session-20260831-001","signature":"JiWRoJagnJva7Cwpcs6nZJPJQObhRzadTpduLvHfrV0mgKz3vc80Doe_Bd-SUehxgLzuLR1ZiPIgorcsZWRfBg","targetSha256":"34a04005bcaf206eec990bd9637d9fdb6725e0a0c0d4aebf003f17f4c956eb5c","tenantId":"tenant-europe-1"}';
+const AUDIT_SHA256 =
+  "141786229c5b9b5e7b05ed50651931bdbcbebaeee9685135e2469cf07d2a4859";
 
 test("canonical JSON sorts object keys recursively and preserves array order", () => {
   assert.equal(
@@ -115,6 +125,71 @@ test("Rust and TypeScript inventory bytes and Ed25519 signature are identical", 
         ...envelope,
         asset: { ...envelope.asset, snapshotSha256: "A".repeat(64) },
       }),
+    FleetSchemaError,
+  );
+});
+
+test("Rust and TypeScript audit framing and signature are byte-identical", () => {
+  const envelope = parseAuditEnvelope(JSON.parse(AUDIT_JSON));
+  assert.equal(canonicalJson(envelope), AUDIT_JSON);
+  assert.equal(
+    createHash("sha256").update(AUDIT_JSON).digest("hex"),
+    AUDIT_SHA256,
+  );
+
+  const unsigned = canonicalJson(toUnsignedAudit(envelope));
+  const domainPayload = Buffer.from(auditDomainPayloadBytes(envelope));
+  const auditDomain = Buffer.from("kernaid:fleet:audit:v1\0", "utf8");
+  assert.equal(
+    domainPayload.subarray(0, auditDomain.length).equals(auditDomain),
+    true,
+  );
+  assert.equal(
+    domainPayload.readBigUInt64BE(auditDomain.length),
+    BigInt(Buffer.byteLength(unsigned)),
+  );
+  assert.equal(
+    domainPayload.subarray(auditDomain.length + 8).toString(),
+    unsigned,
+  );
+
+  const signingBytes = Buffer.from(auditSigningBytes(envelope));
+  const reportDomain = Buffer.from("KERNAID-SIGNED-REPORT-V1\0", "utf8");
+  assert.equal(
+    signingBytes.subarray(0, reportDomain.length).equals(reportDomain),
+    true,
+  );
+  assert.equal(
+    signingBytes
+      .subarray(reportDomain.length, reportDomain.length + 8)
+      .equals(Buffer.alloc(8)),
+    true,
+  );
+  assert.equal(
+    signingBytes.readBigUInt64BE(reportDomain.length + 8),
+    BigInt(domainPayload.length),
+  );
+  assert.equal(
+    signingBytes.subarray(reportDomain.length + 16).equals(domainPayload),
+    true,
+  );
+
+  const key = createPublicKey({
+    key: Buffer.from(AUDIT_PUBLIC_KEY_SPKI, "base64url"),
+    format: "der",
+    type: "spki",
+  });
+  assert.equal(
+    verify(
+      null,
+      signingBytes,
+      key,
+      Buffer.from(envelope.signature, "base64url"),
+    ),
+    true,
+  );
+  assert.throws(
+    () => parseAuditEnvelope({ ...envelope, rawLog: "forbidden" }),
     FleetSchemaError,
   );
 });

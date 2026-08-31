@@ -1,6 +1,10 @@
 import { chmodSync, lstatSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import type {
+  AuditEnvelope,
+  AuditKind,
+  AuditOutcome,
+  AuditRisk,
   EnrollmentPlatform,
   FleetInventoryAsset,
   InventoryEnvelope,
@@ -11,6 +15,8 @@ export class StoreConflictError extends Error {}
 export class StoreAuthorizationError extends Error {}
 export class StoreRevokedError extends Error {}
 export class StoreReplayError extends Error {}
+export class StoreSequenceGapError extends Error {}
+export class StoreChainForkError extends Error {}
 
 interface EnrollmentTokenRow {
   tenant_id: string;
@@ -39,6 +45,29 @@ export interface ListedAsset extends FleetInventoryAsset {
 
 export interface InventoryRecordResult {
   idempotent: boolean;
+}
+
+export interface AuditRecordResult {
+  idempotent: boolean;
+}
+
+export interface ListedAuditEvent {
+  tenantId: string;
+  deviceId: string;
+  sessionId: string;
+  eventId: string;
+  sequence: number;
+  previousEventSha256: string | null;
+  eventSha256: string;
+  occurredAt: string;
+  receivedAt: string;
+  kind: AuditKind;
+  outcome: AuditOutcome;
+  risk: AuditRisk | null;
+  actionId: string | null;
+  targetSha256: string | null;
+  reportSha256: string | null;
+  evidenceSha256: string[];
 }
 
 export class FleetStore {
@@ -310,6 +339,148 @@ export class FleetStore {
     });
   }
 
+  recordAuditEvent(
+    envelope: AuditEnvelope,
+    eventSha256: string,
+    receivedAt: string,
+  ): AuditRecordResult {
+    return this.#transaction(() => {
+      const device = this.#database
+        .prepare(
+          `SELECT revoked_at FROM devices
+           WHERE tenant_id = ? AND device_id = ?`,
+        )
+        .get(envelope.tenantId, envelope.deviceId) as
+        { revoked_at: string | null } | undefined;
+      if (device === undefined)
+        throw new StoreAuthorizationError("device is unknown");
+      if (device.revoked_at !== null)
+        throw new StoreRevokedError("device is revoked");
+
+      const existing = this.#database
+        .prepare(
+          `SELECT event_sha256 FROM audit_events
+           WHERE tenant_id = ? AND device_id = ? AND session_id = ?
+             AND sequence = ?`,
+        )
+        .get(
+          envelope.tenantId,
+          envelope.deviceId,
+          envelope.sessionId,
+          envelope.sequence,
+        ) as { event_sha256: string } | undefined;
+      if (existing !== undefined) {
+        if (existing.event_sha256 === eventSha256) {
+          return { idempotent: true };
+        }
+        throw new StoreChainForkError(
+          "audit sequence already contains another event",
+        );
+      }
+
+      const tail = this.#database
+        .prepare(
+          `SELECT last_sequence, last_event_sha256
+           FROM audit_sessions
+           WHERE tenant_id = ? AND device_id = ? AND session_id = ?`,
+        )
+        .get(envelope.tenantId, envelope.deviceId, envelope.sessionId) as
+        AuditSessionRow | undefined;
+
+      if (tail === undefined) {
+        if (envelope.sequence !== 1 || envelope.previousEventSha256 !== null) {
+          throw new StoreSequenceGapError("audit session must begin at one");
+        }
+        this.#database
+          .prepare(
+            `INSERT INTO audit_sessions
+              (tenant_id, device_id, session_id, last_sequence,
+               last_event_sha256, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            envelope.tenantId,
+            envelope.deviceId,
+            envelope.sessionId,
+            envelope.sequence,
+            eventSha256,
+            receivedAt,
+          );
+      } else {
+        if (envelope.sequence <= tail.last_sequence) {
+          throw new StoreChainForkError(
+            "audit sequence precedes the chain tail",
+          );
+        }
+        if (envelope.sequence !== tail.last_sequence + 1) {
+          throw new StoreSequenceGapError("audit sequence is not contiguous");
+        }
+        if (envelope.previousEventSha256 !== tail.last_event_sha256) {
+          throw new StoreChainForkError("audit previous digest does not match");
+        }
+        this.#database
+          .prepare(
+            `UPDATE audit_sessions
+             SET last_sequence = ?, last_event_sha256 = ?, updated_at = ?
+             WHERE tenant_id = ? AND device_id = ? AND session_id = ?`,
+          )
+          .run(
+            envelope.sequence,
+            eventSha256,
+            receivedAt,
+            envelope.tenantId,
+            envelope.deviceId,
+            envelope.sessionId,
+          );
+      }
+
+      try {
+        this.#database
+          .prepare(
+            `INSERT INTO audit_events
+              (tenant_id, device_id, session_id, event_id, sequence,
+               previous_event_sha256, event_sha256, envelope_json, occurred_at,
+               received_at, kind, outcome, risk, action_id, target_sha256,
+               report_sha256, evidence_sha256_json)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            envelope.tenantId,
+            envelope.deviceId,
+            envelope.sessionId,
+            envelope.eventId,
+            envelope.sequence,
+            envelope.previousEventSha256,
+            eventSha256,
+            canonicalJson(envelope),
+            envelope.occurredAt,
+            receivedAt,
+            envelope.kind,
+            envelope.outcome,
+            envelope.risk,
+            envelope.actionId,
+            envelope.targetSha256,
+            envelope.reportSha256,
+            JSON.stringify(envelope.evidenceSha256),
+          );
+      } catch (error) {
+        if (isSqliteConstraint(error)) {
+          throw new StoreChainForkError(
+            "audit event ID or sequence was reused",
+          );
+        }
+        throw error;
+      }
+      this.#database
+        .prepare(
+          `UPDATE devices SET last_seen_at = ?
+           WHERE tenant_id = ? AND device_id = ?`,
+        )
+        .run(receivedAt, envelope.tenantId, envelope.deviceId);
+      return { idempotent: false };
+    });
+  }
+
   listDevices(tenantId: string): StoredDevice[] {
     const rows = this.#database
       .prepare(
@@ -350,6 +521,38 @@ export class FleetStore {
     }));
   }
 
+  listAuditEvents(tenantId: string): ListedAuditEvent[] {
+    const rows = this.#database
+      .prepare(
+        `SELECT tenant_id, device_id, session_id, event_id, sequence,
+                previous_event_sha256, event_sha256, occurred_at, received_at,
+                kind, outcome, risk, action_id, target_sha256, report_sha256,
+                evidence_sha256_json
+         FROM audit_events WHERE tenant_id = ?
+         ORDER BY received_at, device_id, session_id, sequence
+         LIMIT 1000`,
+      )
+      .all(tenantId) as unknown as AuditEventRow[];
+    return rows.map((row) => ({
+      tenantId: row.tenant_id,
+      deviceId: row.device_id,
+      sessionId: row.session_id,
+      eventId: row.event_id,
+      sequence: row.sequence,
+      previousEventSha256: row.previous_event_sha256,
+      eventSha256: row.event_sha256,
+      occurredAt: row.occurred_at,
+      receivedAt: row.received_at,
+      kind: row.kind as AuditKind,
+      outcome: row.outcome as AuditOutcome,
+      risk: row.risk as AuditRisk | null,
+      actionId: row.action_id,
+      targetSha256: row.target_sha256,
+      reportSha256: row.report_sha256,
+      evidenceSha256: parseStoredEvidenceDigests(row.evidence_sha256_json),
+    }));
+  }
+
   revokeDevice(tenantId: string, deviceId: string, revokedAt: string): boolean {
     const result = this.#database
       .prepare(
@@ -376,15 +579,15 @@ export class FleetStore {
     const version = this.#database.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    if (version.user_version > 1) {
+    if (version.user_version > 2) {
       throw new Error(
         `unsupported Fleet database version ${version.user_version}`,
       );
     }
-    if (version.user_version === 1) return;
-
-    this.#transaction(() => {
-      this.#database.exec(`
+    let currentVersion = version.user_version;
+    if (currentVersion === 0) {
+      this.#transaction(() => {
+        this.#database.exec(`
         CREATE TABLE tenants (
           tenant_id TEXT PRIMARY KEY,
           admin_token_hash TEXT NOT NULL UNIQUE,
@@ -452,8 +655,80 @@ export class FleetStore {
 
         PRAGMA user_version = 1;
       `);
-    });
+      });
+      currentVersion = 1;
+    }
+
+    if (currentVersion === 1) {
+      this.#transaction(() => {
+        this.#database.exec(`
+          CREATE TABLE audit_sessions (
+            tenant_id TEXT NOT NULL,
+            device_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            last_sequence INTEGER NOT NULL,
+            last_event_sha256 TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, device_id, session_id),
+            FOREIGN KEY (tenant_id, device_id)
+              REFERENCES devices(tenant_id, device_id)
+          ) STRICT;
+
+          CREATE TABLE audit_events (
+            tenant_id TEXT NOT NULL,
+            device_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            sequence INTEGER NOT NULL,
+            previous_event_sha256 TEXT,
+            event_sha256 TEXT NOT NULL,
+            envelope_json TEXT NOT NULL,
+            occurred_at TEXT NOT NULL,
+            received_at TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            risk TEXT,
+            action_id TEXT,
+            target_sha256 TEXT,
+            report_sha256 TEXT,
+            evidence_sha256_json TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, device_id, session_id, sequence),
+            UNIQUE (tenant_id, device_id, session_id, event_id),
+            FOREIGN KEY (tenant_id, device_id, session_id)
+              REFERENCES audit_sessions(tenant_id, device_id, session_id)
+          ) STRICT;
+          CREATE INDEX audit_events_tenant_received_idx
+            ON audit_events(tenant_id, received_at, device_id, session_id, sequence);
+
+          PRAGMA user_version = 2;
+        `);
+      });
+    }
   }
+}
+
+interface AuditSessionRow {
+  last_sequence: number;
+  last_event_sha256: string;
+}
+
+interface AuditEventRow {
+  tenant_id: string;
+  device_id: string;
+  session_id: string;
+  event_id: string;
+  sequence: number;
+  previous_event_sha256: string | null;
+  event_sha256: string;
+  occurred_at: string;
+  received_at: string;
+  kind: string;
+  outcome: string;
+  risk: string | null;
+  action_id: string | null;
+  target_sha256: string | null;
+  report_sha256: string | null;
+  evidence_sha256_json: string;
 }
 
 interface DeviceRow {
@@ -506,4 +781,17 @@ function isSqliteConstraint(error: unknown): boolean {
     typeof error.code === "string" &&
     error.code.startsWith("ERR_SQLITE_CONSTRAINT")
   );
+}
+
+function parseStoredEvidenceDigests(value: string): string[] {
+  const parsed: unknown = JSON.parse(value);
+  if (
+    !Array.isArray(parsed) ||
+    parsed.some(
+      (digest) => typeof digest !== "string" || !/^[0-9a-f]{64}$/.test(digest),
+    )
+  ) {
+    throw new Error("stored audit evidence digest list is invalid");
+  }
+  return parsed;
 }
