@@ -36,6 +36,8 @@ MIN_TOTAL_TIMEOUT_SECONDS = 3_600
 MAX_TOTAL_TIMEOUT_SECONDS = 5_400
 FRAME_ATTEMPTS = 120
 FRAME_SETTLE_SECONDS = 0.25
+SHORTCUT_EVENT_SETTLE_SECONDS = 0.05
+NATIVE_UI_STATE_SETTLE_SECONDS = 5.0
 MAX_CONFIG_BYTES = 64 * 1024
 SECRET_BYTES = 64
 HEX_ALPHABET = b"0123456789abcdef"
@@ -744,27 +746,34 @@ def _require_prompt_frame(
 
 
 def _send_alt_u(qmp: object) -> None:
-    events = [
-        (True, "alt"),
-        (True, "u"),
-        (False, "u"),
-        (False, "alt"),
-    ]
-    qmp.execute(
-        "input-send-event",
-        {
-            "events": [
-                {
-                    "type": "key",
-                    "data": {
-                        "down": down,
-                        "key": {"type": "qcode", "data": qcode},
-                    },
-                }
-                for down, qcode in events
-            ]
-        },
-    )
+    def send(events: Sequence[tuple[bool, str]]) -> None:
+        qmp.execute(
+            "input-send-event",
+            {
+                "events": [
+                    {
+                        "type": "key",
+                        "data": {
+                            "down": down,
+                            "key": {"type": "qcode", "data": qcode},
+                        },
+                    }
+                    for down, qcode in events
+                ]
+            },
+        )
+
+    alt_down = False
+    try:
+        send(((True, "alt"),))
+        alt_down = True
+        time.sleep(SHORTCUT_EVENT_SETTLE_SECONDS)
+        send(((True, "u"), (False, "u")))
+        time.sleep(SHORTCUT_EVENT_SETTLE_SECONDS)
+    finally:
+        if alt_down:
+            send(((False, "alt"),))
+    time.sleep(SHORTCUT_EVENT_SETTLE_SECONDS)
 
 
 def _captures_exclude_secret(harness: object, secret: bytearray) -> None:
@@ -898,7 +907,9 @@ def _run_prompt_boot(
         cursor = LIFECYCLE.run_guest_proof(
             console, "native-pre", PRE_PROOF, cursor, aggregate, timeout=60.0
         )
-        time.sleep(0.5)
+        # Root readiness proves the WebKit process and transport, while the
+        # button is mounted only after bounded UI status reads complete.
+        time.sleep(NATIVE_UI_STATE_SETTLE_SECONDS)
         qmp.set_deadline(_deadline(aggregate, 10.0))
         _send_alt_u(qmp)
         cursor = LIFECYCLE.run_guest_proof(

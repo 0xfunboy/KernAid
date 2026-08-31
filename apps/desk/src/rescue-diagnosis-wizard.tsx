@@ -23,12 +23,16 @@ import {
 } from "./report-export";
 import {
   RESCUE_DIAGNOSIS_WIZARD_STEPS,
+  isRescueNativePromptShortcut,
   rescueCandidatePresentation,
   rescueDiagnosisWizardProgress,
   rescueInspectionErrorPresentation,
   rescueInspectionPresentation,
   targetFamilyLabel,
 } from "./rescue-ui";
+
+const NATIVE_PROMPT_STATUS_ATTEMPTS = 20;
+const NATIVE_PROMPT_STATUS_RETRY_MS = 250;
 
 const STEP_LABELS = {
   vault: "Vault",
@@ -134,6 +138,8 @@ export function RescueDiagnosisWizard({
   const [nativePromptBusy, setNativePromptBusy] = useState(false);
   const [nativePromptMessage, setNativePromptMessage] = useState<string>();
   const nativePromptEpoch = useRef(0);
+  const nativePromptInFlight = useRef(false);
+  const nativePromptShortcutPending = useRef(false);
   const reportReady = report !== undefined && sessionId !== undefined;
   const progress = rescueDiagnosisWizardProgress({
     vaultStatusReady,
@@ -157,22 +163,36 @@ export function RescueDiagnosisWizard({
   useEffect(() => {
     const epoch = nativePromptEpoch.current + 1;
     nativePromptEpoch.current = epoch;
-    getRescueNativePromptStatus()
-      .then((next) => {
-        if (nativePromptEpoch.current === epoch) setNativePromptStatus(next);
-      })
-      .catch(() => {
-        if (nativePromptEpoch.current === epoch)
-          setNativePromptStatus(undefined);
-    });
+    async function readStatus() {
+      let lastStatus: RescueNativePromptStatus | undefined;
+      for (let attempt = 0; attempt < NATIVE_PROMPT_STATUS_ATTEMPTS; attempt += 1) {
+        try {
+          lastStatus = await getRescueNativePromptStatus();
+          if (lastStatus.availability === "available") break;
+        } catch {
+          lastStatus = undefined;
+        }
+        if (attempt + 1 < NATIVE_PROMPT_STATUS_ATTEMPTS)
+          await new Promise((resolve) =>
+            globalThis.setTimeout(resolve, NATIVE_PROMPT_STATUS_RETRY_MS),
+          );
+      }
+      if (nativePromptEpoch.current === epoch)
+        setNativePromptStatus(lastStatus);
+    }
+    void readStatus();
     return () => {
       nativePromptEpoch.current += 1;
     };
   }, []);
 
   async function openNativeVaultPrompt() {
-    if (nativePromptBusy || nativePromptStatus?.availability !== "available")
+    if (
+      nativePromptInFlight.current ||
+      nativePromptStatus?.availability !== "available"
+    )
       return;
+    nativePromptInFlight.current = true;
     const epoch = nativePromptEpoch.current + 1;
     nativePromptEpoch.current = epoch;
     setNativePromptBusy(true);
@@ -214,9 +234,48 @@ export function RescueDiagnosisWizard({
         setNativePromptMessage("Prompt sicuro non disponibile.");
       }
     } finally {
+      nativePromptInFlight.current = false;
       if (nativePromptEpoch.current === epoch) setNativePromptBusy(false);
     }
   }
+
+  useEffect(() => {
+    const handleShortcut = (event: KeyboardEvent) => {
+      if (!isRescueNativePromptShortcut(event)) return;
+      event.preventDefault();
+      if (persistentAuditReady) return;
+      nativePromptShortcutPending.current = true;
+      if (
+        vaultUnlockEligible &&
+        nativePromptStatus?.availability === "available"
+      ) {
+        nativePromptShortcutPending.current = false;
+        void openNativeVaultPrompt();
+      }
+    };
+    globalThis.addEventListener("keydown", handleShortcut, true);
+    return () => globalThis.removeEventListener("keydown", handleShortcut, true);
+  }, [persistentAuditReady, vaultUnlockEligible, nativePromptStatus]);
+
+  useEffect(() => {
+    if (!nativePromptShortcutPending.current) return;
+    if (persistentAuditReady || (vaultStatusReady && !vaultUnlockEligible)) {
+      nativePromptShortcutPending.current = false;
+      return;
+    }
+    if (
+      vaultUnlockEligible &&
+      nativePromptStatus?.availability === "available"
+    ) {
+      nativePromptShortcutPending.current = false;
+      void openNativeVaultPrompt();
+    }
+  }, [
+    persistentAuditReady,
+    vaultStatusReady,
+    vaultUnlockEligible,
+    nativePromptStatus,
+  ]);
 
   return (
     <div className="rescue-wizard" aria-label="Diagnosi guidata Rescue">

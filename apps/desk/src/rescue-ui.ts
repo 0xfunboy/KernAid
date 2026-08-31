@@ -50,6 +50,30 @@ export type RescueDiagnosisWizardStep =
   (typeof RESCUE_DIAGNOSIS_WIZARD_STEPS)[number];
 export type RescueDiagnosisWizardStepState = "complete" | "current" | "pending";
 
+export interface RescueNativePromptShortcut {
+  readonly altKey: boolean;
+  readonly code: string;
+  readonly ctrlKey: boolean;
+  readonly isComposing: boolean;
+  readonly metaKey: boolean;
+  readonly repeat: boolean;
+  readonly shiftKey: boolean;
+}
+
+export function isRescueNativePromptShortcut(
+  event: RescueNativePromptShortcut,
+): boolean {
+  return (
+    event.code === "KeyU" &&
+    event.altKey &&
+    !event.ctrlKey &&
+    !event.metaKey &&
+    !event.shiftKey &&
+    !event.repeat &&
+    !event.isComposing
+  );
+}
+
 export interface RescueDiagnosisWizardInput {
   vaultStatusReady: boolean;
   targetSelected: boolean;

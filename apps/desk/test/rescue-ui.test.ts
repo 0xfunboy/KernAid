@@ -4,6 +4,7 @@ import { RescueOfflineInspectionError } from "../src/native.js";
 import {
   finishRescueInspection,
   formatBytes,
+  isRescueNativePromptShortcut,
   observationStatus,
   rescueCandidatePresentation,
   rescueDiagnosisWizardProgress,
@@ -17,6 +18,32 @@ import {
   sameRescueSelection,
   tryStartRescueInspection,
 } from "../src/rescue-ui.js";
+
+test("the Rescue native prompt shortcut is exact and non-repeating", () => {
+  const event = {
+    altKey: true,
+    code: "KeyU",
+    ctrlKey: false,
+    isComposing: false,
+    metaKey: false,
+    repeat: false,
+    shiftKey: false,
+  };
+  assert.equal(isRescueNativePromptShortcut(event), true);
+  for (const override of [
+    { altKey: false },
+    { code: "KeyV" },
+    { ctrlKey: true },
+    { isComposing: true },
+    { metaKey: true },
+    { repeat: true },
+    { shiftKey: true },
+  ])
+    assert.equal(
+      isRescueNativePromptShortcut({ ...event, ...override }),
+      false,
+    );
+});
 
 test("Rescue diagnosis wizard advances only through established state", () => {
   assert.deepEqual(

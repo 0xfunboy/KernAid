@@ -91,6 +91,8 @@ import "./style.css";
 
 type Workflow = "Observe" | "Diagnose" | "Plan" | "Verify";
 type ProviderMode = RescueProviderMode;
+const RESCUE_OPENAI_STATUS_ATTEMPTS = 20;
+const RESCUE_OPENAI_STATUS_RETRY_MS = 250;
 
 function App() {
   const [driver, setDriver] = useState<LocalSessionDriver>();
@@ -226,21 +228,31 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (!isNative() && !isRescueRuntime()) return;
+    const residentRuntime = isNative();
+    const rescueRuntime = isRescueRuntime();
+    if (!residentRuntime && !rescueRuntime) return;
     let cancelled = false;
-    const readStatus = isNative()
-      ? getResidentOpenAiStatus()
-      : getRescueOpenAiStatus();
-    readStatus
-      .then((next) => {
-        if (!cancelled) setOpenAiStatus(next);
-      })
-      .catch(() => {
-        if (!cancelled) setOpenAiStatus(undefined);
-      })
-      .finally(() => {
-        if (!cancelled) setOpenAiStatusReady(true);
-      });
+    async function readStatus() {
+      const attempts = rescueRuntime ? RESCUE_OPENAI_STATUS_ATTEMPTS : 1;
+      for (let attempt = 0; attempt < attempts; attempt += 1) {
+        try {
+          const next = residentRuntime
+            ? await getResidentOpenAiStatus()
+            : await getRescueOpenAiStatus();
+          if (!cancelled) setOpenAiStatus(next);
+          return;
+        } catch {
+          if (attempt + 1 < attempts)
+            await new Promise((resolve) =>
+              globalThis.setTimeout(resolve, RESCUE_OPENAI_STATUS_RETRY_MS),
+            );
+        }
+      }
+      if (!cancelled) setOpenAiStatus(undefined);
+    }
+    void readStatus().finally(() => {
+      if (!cancelled) setOpenAiStatusReady(true);
+    });
     return () => {
       cancelled = true;
     };

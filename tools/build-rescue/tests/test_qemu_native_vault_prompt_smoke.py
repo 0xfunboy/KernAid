@@ -180,47 +180,30 @@ label live-amd64-failsafe
                 with self.assertRaises(native_prompt_smoke.ClosedFailure):
                     native_prompt_smoke._boot_append(invalid)
 
-    def test_alt_u_is_one_real_access_key_event_sequence(self) -> None:
+    def test_alt_u_is_paced_and_releases_the_modifier(self) -> None:
         qmp = FakeQmp()
-        native_prompt_smoke._send_alt_u(qmp)
-        self.assertEqual(len(qmp.calls), 1)
-        command, arguments = qmp.calls[0]
-        self.assertEqual(command, "input-send-event")
+        with mock.patch.object(native_prompt_smoke.time, "sleep") as sleep:
+            native_prompt_smoke._send_alt_u(qmp)
+        self.assertEqual([command for command, _arguments in qmp.calls], [
+            "input-send-event",
+            "input-send-event",
+            "input-send-event",
+        ])
         self.assertEqual(
-            arguments,
-            {
-                "events": [
-                    {
-                        "type": "key",
-                        "data": {
-                            "down": True,
-                            "key": {"type": "qcode", "data": "alt"},
-                        },
-                    },
-                    {
-                        "type": "key",
-                        "data": {
-                            "down": True,
-                            "key": {"type": "qcode", "data": "u"},
-                        },
-                    },
-                    {
-                        "type": "key",
-                        "data": {
-                            "down": False,
-                            "key": {"type": "qcode", "data": "u"},
-                        },
-                    },
-                    {
-                        "type": "key",
-                        "data": {
-                            "down": False,
-                            "key": {"type": "qcode", "data": "alt"},
-                        },
-                    },
+            [
+                [(True, "alt")],
+                [(True, "u"), (False, "u")],
+                [(False, "alt")],
+            ],
+            [
+                [
+                    (event["data"]["down"], event["data"]["key"]["data"])
+                    for event in arguments["events"]
                 ]
-            },
+                for _command, arguments in qmp.calls
+            ],
         )
+        self.assertEqual(sleep.call_count, 3)
 
     def test_qemu_receives_only_the_secret_digest_marker(self) -> None:
         digest = "d" * 64
