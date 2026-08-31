@@ -46,6 +46,20 @@ or Release Channel. It is therefore not a shipping or user-supported repair
 path. The manifest's `productionCandidateOnly` label names the qualification
 track; it does not itself authorize production use.
 
+`action-pack.resolver-link-production-candidate-v1.yaml` defines the separate
+off-default R2 action `linux.network.restore-resolver-link.v1`. It accepts only
+the selected Linux root and the fixed logical resolver-link resource. The
+broker prepares it only when the link is missing or has one of the closed,
+known broken-link states and exactly one installed and enabled resolver is
+proven: systemd-resolved or NetworkManager. A regular file, an unknown link,
+both resolvers, neither resolver, unsafe ownership, or unstable target identity
+is rejected. The browser receives resolver class and hashes only—never a host
+path, hostname, configuration bytes, or link target. Execution stores the
+exact closed pre-state in the distinct authenticated Vault, requires a bound
+single-use R2 approval, atomically installs only the fixed link, verifies it,
+and restores the exact missing/link pre-state on failure or restart recovery.
+It never starts or restarts a service.
+
 `action-pack.crypttab-production-candidate-v1.yaml` defines a second and
 separately compiled preflight candidate,
 `linux.crypttab.disable-missing-uuid.v1`. Its pure pack can comment exactly one

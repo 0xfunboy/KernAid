@@ -4,6 +4,7 @@ import {
   RESCUE_CRYPTTAB_FINDING_ID,
   RESCUE_EXT4_FINDING_ID,
   RESCUE_FSTAB_FINDING_ID,
+  RESCUE_RESOLVER_LINK_FINDING_ID,
   RescueRepairClient,
   RescueRepairServiceError,
   RescueRepairUnavailableError,
@@ -36,7 +37,7 @@ export function RescueRepairPanel({
   const [message, setMessage] = useState<string>();
   const [confirmation, setConfirmation] = useState("");
   const [activeCandidate, setActiveCandidate] = useState<
-    "fstab" | "crypttab" | "ext4"
+    "fstab" | "crypttab" | "ext4" | "resolver-link"
   >();
   const mounted = useRef(true);
 
@@ -62,7 +63,9 @@ export function RescueRepairPanel({
           ? "crypttab"
           : prepared.kind === "ext4-fsck-prepared"
             ? "ext4"
-            : "fstab",
+            : prepared.kind === "resolver-link-prepared"
+              ? "resolver-link"
+              : "fstab",
       );
     else if (rollbackPrepared !== undefined)
       setActiveCandidate(
@@ -156,7 +159,7 @@ export function RescueRepairPanel({
   }, [activeCandidate, available, repairClient, snapshot]);
 
   async function prepare(
-    candidate: "fstab" | "crypttab" | "ext4",
+    candidate: "fstab" | "crypttab" | "ext4" | "resolver-link",
   ): Promise<void> {
     if (
       !qualifiedTarget ||
@@ -232,6 +235,7 @@ export function RescueRepairPanel({
       committedSource === undefined ||
       activeCandidate === undefined ||
       activeCandidate === "ext4" ||
+      activeCandidate === "resolver-link" ||
       busy
     )
       return;
@@ -344,7 +348,9 @@ export function RescueRepairPanel({
                   ? RESCUE_CRYPTTAB_FINDING_ID
                   : prepared.kind === "ext4-fsck-prepared"
                     ? RESCUE_EXT4_FINDING_ID
-                  : RESCUE_FSTAB_FINDING_ID
+                    : prepared.kind === "resolver-link-prepared"
+                      ? RESCUE_RESOLVER_LINK_FINDING_ID
+                      : RESCUE_FSTAB_FINDING_ID
               } · ${prepared.kind === "ext4-fsck-prepared" ? "R3" : "R2"}`}
         </span>
       </div>
@@ -375,6 +381,12 @@ export function RescueRepairPanel({
             </button>
             <button disabled={busy} onClick={() => void prepare("crypttab")}>
               Verifica volumi cifrati
+            </button>
+            <button
+              disabled={busy}
+              onClick={() => void prepare("resolver-link")}
+            >
+              Verifica collegamento DNS
             </button>
             <button
               className="rescue-repair-primary"
@@ -412,7 +424,9 @@ export function RescueRepairPanel({
               <code>
                 {prepared.kind === "ext4-fsck-prepared"
                   ? "filesystem · errori confermati in sola lettura"
-                  : "voce UUID mancante · attiva"}
+                  : prepared.kind === "resolver-link-prepared"
+                    ? "collegamento resolver · mancante o interrotto"
+                    : "voce UUID mancante · attiva"}
               </code>
             </div>
             <div>
@@ -420,7 +434,9 @@ export function RescueRepairPanel({
               <code>
                 {prepared.kind === "ext4-fsck-prepared"
                   ? "e2fsck preen · verifica read-only pulita richiesta"
-                  : "stessa voce · disabilitata da KernAid"}
+                  : prepared.kind === "resolver-link-prepared"
+                    ? "collegamento resolver · destinazione installata verificata"
+                    : "stessa voce · disabilitata da KernAid"}
               </code>
             </div>
           </div>
@@ -562,13 +578,20 @@ export function RescueRepairPanel({
               <p>
                 {activeCandidate === "ext4"
                   ? "La riparazione EXT4 offline è terminata e la verifica e2fsck in sola lettura non segnala più errori. Questo non equivale a una riparazione hardware."
-                  : "La voce non valida è stata disabilitata e il risultato è stato verificato. Puoi spegnere KernAid Rescue e provare ad avviare il sistema installato."}
+                  : activeCandidate === "resolver-link"
+                    ? "Il collegamento del resolver installato è stato ricreato e verificato senza avviare o riavviare servizi. Puoi provare ad avviare il sistema installato."
+                    : "La voce non valida è stata disabilitata e il risultato è stato verificato. Puoi spegnere KernAid Rescue e provare ad avviare il sistema installato."}
               </p>
-              {committedSource !== undefined && activeCandidate !== "ext4" && (
-                <button disabled={busy} onClick={() => void prepareRollback()}>
-                  {busy ? "Preparazione…" : "Prepara ripristino originale"}
-                </button>
-              )}
+              {committedSource !== undefined &&
+                activeCandidate !== "ext4" &&
+                activeCandidate !== "resolver-link" && (
+                  <button
+                    disabled={busy}
+                    onClick={() => void prepareRollback()}
+                  >
+                    {busy ? "Preparazione…" : "Prepara ripristino originale"}
+                  </button>
+                )}
             </>
           )}
           {snapshot.state === "restored" && (

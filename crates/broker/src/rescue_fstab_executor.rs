@@ -12,6 +12,11 @@ use crate::rescue_crypttab_candidate::{
 };
 #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
 use crate::rescue_ext4_fsck_candidate::{ApprovedExt4Repair, ApprovedExt4RepairParts};
+#[cfg(feature = "rescue-resolver-link-production-candidate")]
+use crate::rescue_resolver_link_candidate::{
+    ApprovedResolverLinkRepair, ApprovedResolverLinkRepairParts, ResolverLinkState,
+    revalidate_resolver_link_execution_evidence,
+};
 #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
 use crate::target_write_capability_client::{Ext4RepairResultOutcome, execute_pending_ext4_repair};
 use crate::{
@@ -63,6 +68,7 @@ use zeroize::Zeroizing;
 
 const FSTAB_RESOURCE: &str = "fstab";
 const CRYPTTAB_RESOURCE: &str = "crypttab";
+const RESOLVER_LINK_RESOURCE: &str = "resolv.conf";
 const UNSUPPORTED_BLOCK_RESOURCE: &str = ".kernaid-block-resource-not-a-file";
 const ETC_DIRECTORY: &str = "etc";
 const REPAIR_LOCK_DIRECTORY: &str = "/run/lock/kernaid-repair";
@@ -931,6 +937,128 @@ pub fn execute_approved_rescue_crypttab(
     })
 }
 
+/// Executes the resolver-link candidate through the existing durable Vault,
+/// one-shot write-mount and restart reconciliation engine. Link state is a
+/// closed enum; no caller-controlled pathname or target crosses this boundary.
+#[cfg(feature = "rescue-resolver-link-production-candidate")]
+pub fn execute_approved_resolver_link(
+    approved: ApprovedResolverLinkRepair,
+    deadline: Instant,
+) -> Result<RescueFstabExecutionReceipt, RescueFstabExecutionError> {
+    let operation_deadline = match reserve_cleanup_window(deadline) {
+        Ok(operation) => operation,
+        Err(error) => {
+            approved
+                .cancel(deadline)
+                .map_err(|_| RescueFstabExecutionError::VaultReconciliationRequired)?;
+            return Err(error);
+        }
+    };
+    let ApprovedResolverLinkRepairParts {
+        descriptor,
+        backup,
+        proposed,
+        metadata,
+        target,
+        reservation,
+        approval_id,
+        approval_sha256,
+    } = approved.into_parts();
+    let claims = target.inner().target_claims();
+    let proposed_state = ResolverLinkState::from_canonical_bytes(&proposed);
+    let resolver_matches_proposal = matches!(
+        (descriptor.resolver.as_str(), proposed_state),
+        (
+            "systemd-resolved",
+            Some(ResolverLinkState::ResolvedStubRelative)
+        ) | (
+            "network-manager",
+            Some(ResolverLinkState::NetworkManagerRelative)
+        )
+    );
+    if descriptor.request_id != claims.request_id()
+        || descriptor.scan_fingerprint != claims.scan_fingerprint()
+        || descriptor.target_id != claims.target_id()
+        || descriptor.target_fingerprint != claims.target_fingerprint()
+        || descriptor.before_sha256 != prefixed_bytes_sha256(&backup)
+        || descriptor.after_sha256 != prefixed_bytes_sha256(&proposed)
+        || ResolverLinkState::from_canonical_bytes(&backup).is_none()
+        || !resolver_matches_proposal
+    {
+        reservation
+            .cancel(deadline)
+            .map_err(|_| RescueFstabExecutionError::VaultReconciliationRequired)?;
+        return Err(RescueFstabExecutionError::InvalidAuthority);
+    }
+    let intent = RepairExecutionIntentV1::new_for_resource(
+        RepairResourceV1::ResolverLink,
+        &descriptor.session_id,
+        1,
+        &descriptor.target_id,
+        &descriptor.scan_fingerprint,
+        parse_prefixed_sha256(&descriptor.target_fingerprint)?,
+        parse_prefixed_sha256(target.physical_parent_fingerprint())?,
+        claims.recovery_fingerprint(),
+        target.lock_identity(),
+        parse_prefixed_sha256(&descriptor.before_sha256)?,
+        parse_prefixed_sha256(&descriptor.after_sha256)?,
+        parse_prefixed_sha256(&descriptor.diff_sha256)?,
+        parse_prefixed_sha256(&descriptor.evidence_sha256)?,
+        metadata.clone(),
+    )
+    .map_err(|_| RescueFstabExecutionError::InvalidAuthority)?;
+    let binding = RepairBackupBinding::new(
+        &descriptor.plan_id,
+        parse_prefixed_sha256(&descriptor.plan_sha256)?,
+        approval_id,
+        parse_prefixed_sha256(&approval_sha256)?,
+        RepairResourceV1::ResolverLink.resource_id(),
+        intent.before_sha256().clone(),
+        intent.clone(),
+    )
+    .map_err(|_| RescueFstabExecutionError::InvalidAuthority)?;
+    let _process_lock = acquire_process_lock(operation_deadline)?;
+    let _target_lock = acquire_target_lock(&target, operation_deadline)?;
+    target
+        .inner()
+        .revalidate()
+        .map_err(|_| RescueFstabExecutionError::TargetChanged)?;
+    let (mut vault_client, reserved) = reservation.into_parts();
+    let durable = persist_pending(
+        &mut vault_client,
+        &reserved,
+        &binding,
+        &metadata,
+        &backup,
+        operation_deadline,
+    )?;
+    let pending = RepairTransactionStatusPayload::pending(durable)
+        .map_err(|_| RescueFstabExecutionError::InvalidAuthority)?;
+    drop(target);
+    let write_mount = acquire_pending_target_write_mount(&pending, operation_deadline)
+        .map_err(map_write_capability_error)?;
+    refresh_pending_after_write_lease(&mut vault_client, &pending, operation_deadline)?;
+    let closure = execute_same_boot_target(
+        write_mount,
+        &backup,
+        &proposed,
+        &intent,
+        pending.backup().reservation_id().as_str(),
+        operation_deadline,
+        RescueFstabQualificationFault::None,
+    )?;
+    let resolution = RepairTransactionResolution::new(
+        closure.outcome,
+        closure.observation.resource_sha256,
+        closure.observation.metadata_sha256,
+        closure.cleanup_verified,
+        &intent,
+    )
+    .map_err(|_| RescueFstabExecutionError::RecoveryUnavailable)?;
+    let resolved = resolve_pending(&mut vault_client, &pending, &resolution, deadline)?;
+    receipt_from_status(&resolved)
+}
+
 /// Executes the fixed offline ext4 repair. Durable normalized evidence and a
 /// Pending Vault transaction are established before the one-shot raw block
 /// lease is consumed. e2fsck's undo stream is same-boot only: any ambiguous
@@ -1389,6 +1517,7 @@ fn repair_resource_for_intent(
         RepairResourceV1::Fstab,
         RepairResourceV1::Crypttab,
         RepairResourceV1::Ext4Filesystem,
+        RepairResourceV1::ResolverLink,
     ] {
         if intent.action_id() == resource.action_id() {
             return Ok(resource);
@@ -1402,6 +1531,7 @@ fn resource_leaf(resource: RepairResourceV1) -> &'static str {
         RepairResourceV1::Fstab => FSTAB_RESOURCE,
         RepairResourceV1::Crypttab => CRYPTTAB_RESOURCE,
         RepairResourceV1::Ext4Filesystem => UNSUPPORTED_BLOCK_RESOURCE,
+        RepairResourceV1::ResolverLink => RESOLVER_LINK_RESOURCE,
     }
 }
 
@@ -1838,6 +1968,20 @@ fn classify_with_retained_read_mount(
         .map_err(|_| RescueFstabExecutionError::TargetChanged)?;
     let mount = target.inner().target_detached_mount_descriptor();
     let etc = open_etc_directory(mount)?;
+    #[cfg(feature = "rescue-resolver-link-production-candidate")]
+    if repair_resource_for_intent(intent)? == RepairResourceV1::ResolverLink {
+        let snapshot = snapshot_resolver_link(&etc)?;
+        let result = (
+            exact_resolver_link_state(&snapshot, intent),
+            snapshot.observation(intent),
+        );
+        drop(etc);
+        target
+            .inner()
+            .revalidate()
+            .map_err(|_| RescueFstabExecutionError::TargetChanged)?;
+        return Ok(result);
+    }
     let snapshot = snapshot_repair_resource(&etc, intent)?;
     let result = (exact_state(&snapshot, intent), snapshot.observation());
     drop(etc);
@@ -1999,6 +2143,17 @@ fn close_after_failed_mutation(
     reservation_id: &str,
     deadline: Instant,
 ) -> Result<TargetClosure, RescueFstabExecutionError> {
+    #[cfg(feature = "rescue-resolver-link-production-candidate")]
+    if repair_resource_for_intent(intent)? == RepairResourceV1::ResolverLink {
+        return close_after_failed_resolver_link_mutation(
+            mount,
+            etc,
+            backup,
+            intent,
+            reservation_id,
+            deadline,
+        );
+    }
     let snapshot = snapshot_repair_resource(etc, intent)?;
     match exact_state(&snapshot, intent) {
         ExactTargetState::Before => {
@@ -2036,7 +2191,7 @@ fn close_after_failed_mutation(
 
 #[allow(clippy::too_many_arguments)]
 fn apply_exact_replacement(
-    _mount: &OwnedFd,
+    mount: &OwnedFd,
     etc: &OwnedFd,
     backup: &[u8],
     proposed: &[u8],
@@ -2045,6 +2200,19 @@ fn apply_exact_replacement(
     deadline: Instant,
     qualification_fault: RescueFstabQualificationFault,
 ) -> Result<ClosedObservation, RescueFstabExecutionError> {
+    #[cfg(feature = "rescue-resolver-link-production-candidate")]
+    if repair_resource_for_intent(intent)? == RepairResourceV1::ResolverLink {
+        return apply_resolver_link_replacement(
+            mount,
+            etc,
+            backup,
+            proposed,
+            intent,
+            reservation_id,
+            deadline,
+            qualification_fault,
+        );
+    }
     ensure_deadline(deadline)?;
     let resource = repair_resource_for_intent(intent)?;
     let before = snapshot_repair_resource(etc, intent)?;
@@ -2111,6 +2279,10 @@ fn restore_exact_backup(
     reservation_id: &str,
     deadline: Instant,
 ) -> Result<ClosedObservation, RescueFstabExecutionError> {
+    #[cfg(feature = "rescue-resolver-link-production-candidate")]
+    if repair_resource_for_intent(intent)? == RepairResourceV1::ResolverLink {
+        return restore_resolver_link_backup(etc, backup, intent, reservation_id, deadline);
+    }
     ensure_deadline(deadline)?;
     ensure_exact_bytes(backup, intent.before_sha256())?;
     let resource = repair_resource_for_intent(intent)?;
@@ -2167,6 +2339,361 @@ fn restore_exact_backup(
         intent.before_metadata(),
     )?;
     Ok(final_state.observation())
+}
+
+#[cfg(feature = "rescue-resolver-link-production-candidate")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResolverLinkSnapshot {
+    state: ResolverLinkState,
+    identity: Option<FileIdentity>,
+}
+
+#[cfg(feature = "rescue-resolver-link-production-candidate")]
+impl ResolverLinkSnapshot {
+    fn observation(self, intent: &RepairExecutionIntentV1) -> ClosedObservation {
+        ClosedObservation {
+            resource_sha256: sha256(self.state.canonical_bytes()),
+            metadata_sha256: intent.before_metadata().canonical_sha256(),
+        }
+    }
+
+    fn same_object_and_value(self, other: Self) -> bool {
+        self == other
+    }
+}
+
+#[cfg(feature = "rescue-resolver-link-production-candidate")]
+fn exact_resolver_link_state(
+    snapshot: &ResolverLinkSnapshot,
+    intent: &RepairExecutionIntentV1,
+) -> ExactTargetState {
+    let digest = sha256(snapshot.state.canonical_bytes());
+    if digest == *intent.before_sha256() {
+        ExactTargetState::Before
+    } else if digest == *intent.after_sha256() {
+        ExactTargetState::After
+    } else {
+        ExactTargetState::Third
+    }
+}
+
+#[cfg(feature = "rescue-resolver-link-production-candidate")]
+fn snapshot_resolver_link(
+    etc: &OwnedFd,
+) -> Result<ResolverLinkSnapshot, RescueFstabExecutionError> {
+    snapshot_named_resolver_link(etc, RESOLVER_LINK_RESOURCE, true)
+}
+
+#[cfg(feature = "rescue-resolver-link-production-candidate")]
+fn snapshot_named_resolver_link(
+    directory: &OwnedFd,
+    name: &str,
+    missing_allowed: bool,
+) -> Result<ResolverLinkSnapshot, RescueFstabExecutionError> {
+    let before = match rfs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => stat,
+        Err(error) if missing_allowed && error == rustix::io::Errno::NOENT => {
+            return Ok(ResolverLinkSnapshot {
+                state: ResolverLinkState::Missing,
+                identity: None,
+            });
+        }
+        Err(_) => return Err(RescueFstabExecutionError::UnsafeTarget),
+    };
+    if !FileType::from_raw_mode(before.st_mode).is_symlink()
+        || before.st_uid != 0
+        || before.st_gid != 0
+        || before.st_nlink != 1
+    {
+        return Err(RescueFstabExecutionError::UnsafeTarget);
+    }
+    let target = rfs::readlinkat(directory, name, Vec::new())
+        .map_err(|_| RescueFstabExecutionError::UnsafeTarget)?;
+    let after = rfs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|_| RescueFstabExecutionError::TargetChanged)?;
+    if !same_stat(&before, &after) {
+        return Err(RescueFstabExecutionError::TargetChanged);
+    }
+    let state = ResolverLinkState::from_link_target(target.as_bytes())
+        .ok_or(RescueFstabExecutionError::UnsafeTarget)?;
+    Ok(ResolverLinkSnapshot {
+        state,
+        identity: Some(FileIdentity {
+            device: after.st_dev,
+            inode: after.st_ino,
+        }),
+    })
+}
+
+#[cfg(feature = "rescue-resolver-link-production-candidate")]
+fn create_prepared_resolver_link<'directory>(
+    directory: &'directory OwnedFd,
+    name: &str,
+    state: ResolverLinkState,
+) -> Result<(ResolverLinkSnapshot, NamedFileGuard<'directory>), RescueFstabExecutionError> {
+    let target = state
+        .link_target()
+        .ok_or(RescueFstabExecutionError::InvalidAuthority)?;
+    match rfs::symlinkat(target, directory, name) {
+        Ok(()) => {
+            rfs::chownat(
+                directory,
+                name,
+                Some(Uid::from_raw(0)),
+                Some(Gid::from_raw(0)),
+                AtFlags::SYMLINK_NOFOLLOW,
+            )
+            .map_err(|_| RescueFstabExecutionError::MutationFailed)?;
+            rfs::fsync(directory).map_err(|_| RescueFstabExecutionError::MutationFailed)?;
+        }
+        Err(error) if error == rustix::io::Errno::EXIST => {}
+        Err(_) => return Err(RescueFstabExecutionError::MutationFailed),
+    }
+    let snapshot = snapshot_named_resolver_link(directory, name, false)?;
+    if snapshot.state != state {
+        return Err(RescueFstabExecutionError::UnsafeTarget);
+    }
+    let identity = snapshot
+        .identity
+        .ok_or(RescueFstabExecutionError::UnsafeTarget)?;
+    Ok((
+        snapshot,
+        NamedFileGuard::existing(directory, name.to_owned(), identity),
+    ))
+}
+
+#[cfg(feature = "rescue-resolver-link-production-candidate")]
+fn remove_resolver_link_if_identity(
+    directory: &OwnedFd,
+    name: &str,
+    expected: FileIdentity,
+) -> Result<(), RescueFstabExecutionError> {
+    remove_name_if_identity(directory, name, expected)
+}
+
+#[cfg(feature = "rescue-resolver-link-production-candidate")]
+fn cleanup_known_resolver_link_stage(directory: &OwnedFd, name: &str, expected: ResolverLinkState) {
+    let Ok(snapshot) = snapshot_named_resolver_link(directory, name, false) else {
+        return;
+    };
+    if snapshot.state == expected
+        && let Some(identity) = snapshot.identity
+    {
+        let _ = remove_resolver_link_if_identity(directory, name, identity);
+        let _ = rfs::fsync(directory);
+    }
+}
+
+#[cfg(feature = "rescue-resolver-link-production-candidate")]
+#[allow(clippy::too_many_arguments)]
+fn apply_resolver_link_replacement(
+    mount: &OwnedFd,
+    etc: &OwnedFd,
+    backup: &[u8],
+    proposed: &[u8],
+    intent: &RepairExecutionIntentV1,
+    reservation_id: &str,
+    deadline: Instant,
+    qualification_fault: RescueFstabQualificationFault,
+) -> Result<ClosedObservation, RescueFstabExecutionError> {
+    ensure_deadline(deadline)?;
+    ensure_exact_bytes(backup, intent.before_sha256())?;
+    ensure_exact_bytes(proposed, intent.after_sha256())?;
+    let before_state = ResolverLinkState::from_canonical_bytes(backup)
+        .ok_or(RescueFstabExecutionError::InvalidAuthority)?;
+    let after_state = ResolverLinkState::from_canonical_bytes(proposed)
+        .filter(|state| *state != ResolverLinkState::Missing)
+        .ok_or(RescueFstabExecutionError::InvalidAuthority)?;
+    revalidate_resolver_link_execution_evidence(mount.as_fd(), before_state, after_state)
+        .map_err(|_| RescueFstabExecutionError::TargetChanged)?;
+    let before = snapshot_resolver_link(etc)?;
+    if before.state != before_state
+        || exact_resolver_link_state(&before, intent) != ExactTargetState::Before
+    {
+        return Err(RescueFstabExecutionError::TargetChanged);
+    }
+
+    let stage_name = execution_stage_name_for(RepairResourceV1::ResolverLink, reservation_id);
+    let (prepared, mut stage_guard) = create_prepared_resolver_link(etc, &stage_name, after_state)?;
+    let recheck = snapshot_resolver_link(etc)?;
+    if !recheck.same_object_and_value(before) {
+        return Err(RescueFstabExecutionError::TargetChanged);
+    }
+    ensure_deadline(deadline)?;
+    let rename_flags = if before.state == ResolverLinkState::Missing {
+        RenameFlags::NOREPLACE
+    } else {
+        RenameFlags::EXCHANGE
+    };
+    rfs::renameat_with(etc, &stage_name, etc, RESOLVER_LINK_RESOURCE, rename_flags)
+        .map_err(|_| RescueFstabExecutionError::MutationFailed)?;
+    rfs::fsync(etc).map_err(|_| RescueFstabExecutionError::MutationFailed)?;
+    rfs::syncfs(etc).map_err(|_| RescueFstabExecutionError::MutationFailed)?;
+
+    let installed = snapshot_resolver_link(etc)?;
+    if installed.state != after_state
+        || installed.identity != prepared.identity
+        || exact_resolver_link_state(&installed, intent) != ExactTargetState::After
+    {
+        return Err(RescueFstabExecutionError::TargetChanged);
+    }
+    if before.state == ResolverLinkState::Missing {
+        stage_guard.disarm();
+    } else {
+        let displaced = snapshot_named_resolver_link(etc, &stage_name, false)?;
+        if displaced.state != before_state || displaced.identity != before.identity {
+            return Err(RescueFstabExecutionError::TargetChanged);
+        }
+        remove_resolver_link_if_identity(
+            etc,
+            &stage_name,
+            displaced
+                .identity
+                .ok_or(RescueFstabExecutionError::TargetChanged)?,
+        )?;
+        stage_guard.disarm();
+    }
+    rfs::fsync(etc).map_err(|_| RescueFstabExecutionError::MutationFailed)?;
+    rfs::syncfs(etc).map_err(|_| RescueFstabExecutionError::MutationFailed)?;
+    let final_state = snapshot_resolver_link(etc)?;
+    if final_state.state != after_state
+        || exact_resolver_link_state(&final_state, intent) != ExactTargetState::After
+    {
+        return Err(RescueFstabExecutionError::TargetChanged);
+    }
+    if qualification_fault == RescueFstabQualificationFault::FailAfterInstalled {
+        return Err(RescueFstabExecutionError::MutationFailed);
+    }
+    Ok(final_state.observation(intent))
+}
+
+#[cfg(feature = "rescue-resolver-link-production-candidate")]
+fn restore_resolver_link_backup(
+    etc: &OwnedFd,
+    backup: &[u8],
+    intent: &RepairExecutionIntentV1,
+    reservation_id: &str,
+    deadline: Instant,
+) -> Result<ClosedObservation, RescueFstabExecutionError> {
+    ensure_deadline(deadline)?;
+    ensure_exact_bytes(backup, intent.before_sha256())?;
+    let before_state = ResolverLinkState::from_canonical_bytes(backup)
+        .ok_or(RescueFstabExecutionError::InvalidAuthority)?;
+    let current = snapshot_resolver_link(etc)?;
+    if exact_resolver_link_state(&current, intent) != ExactTargetState::After {
+        return Err(RescueFstabExecutionError::TargetChanged);
+    }
+    let current_identity = current
+        .identity
+        .ok_or(RescueFstabExecutionError::TargetChanged)?;
+    if before_state == ResolverLinkState::Missing {
+        remove_resolver_link_if_identity(etc, RESOLVER_LINK_RESOURCE, current_identity)?;
+    } else {
+        let restore_name = restore_stage_name_for(RepairResourceV1::ResolverLink, reservation_id);
+        let (restore, mut restore_guard) =
+            create_prepared_resolver_link(etc, &restore_name, before_state)?;
+        let recheck = snapshot_resolver_link(etc)?;
+        if !recheck.same_object_and_value(current) {
+            return Err(RescueFstabExecutionError::TargetChanged);
+        }
+        ensure_deadline(deadline)?;
+        rfs::renameat_with(
+            etc,
+            &restore_name,
+            etc,
+            RESOLVER_LINK_RESOURCE,
+            RenameFlags::EXCHANGE,
+        )
+        .map_err(|_| RescueFstabExecutionError::MutationFailed)?;
+        let restored = snapshot_resolver_link(etc)?;
+        let displaced = snapshot_named_resolver_link(etc, &restore_name, false)?;
+        if restored.state != before_state
+            || restored.identity != restore.identity
+            || displaced.identity != Some(current_identity)
+        {
+            return Err(RescueFstabExecutionError::TargetChanged);
+        }
+        remove_resolver_link_if_identity(etc, &restore_name, current_identity)?;
+        restore_guard.disarm();
+    }
+    cleanup_known_resolver_link_stage(
+        etc,
+        &execution_stage_name_for(RepairResourceV1::ResolverLink, reservation_id),
+        before_state,
+    );
+    rfs::fsync(etc).map_err(|_| RescueFstabExecutionError::MutationFailed)?;
+    rfs::syncfs(etc).map_err(|_| RescueFstabExecutionError::MutationFailed)?;
+    let restored = snapshot_resolver_link(etc)?;
+    if restored.state != before_state
+        || exact_resolver_link_state(&restored, intent) != ExactTargetState::Before
+    {
+        return Err(RescueFstabExecutionError::TargetChanged);
+    }
+    Ok(restored.observation(intent))
+}
+
+#[cfg(feature = "rescue-resolver-link-production-candidate")]
+fn close_after_failed_resolver_link_mutation(
+    _mount: &OwnedFd,
+    etc: &OwnedFd,
+    backup: &[u8],
+    intent: &RepairExecutionIntentV1,
+    reservation_id: &str,
+    deadline: Instant,
+) -> Result<TargetClosure, RescueFstabExecutionError> {
+    let snapshot = snapshot_resolver_link(etc)?;
+    match exact_resolver_link_state(&snapshot, intent) {
+        ExactTargetState::Before => {
+            let stage_name =
+                execution_stage_name_for(RepairResourceV1::ResolverLink, reservation_id);
+            match rfs::statat(etc, &stage_name, AtFlags::SYMLINK_NOFOLLOW) {
+                Err(error) if error == rustix::io::Errno::NOENT => {}
+                Err(_) => return Err(RescueFstabExecutionError::UnsafeTarget),
+                Ok(_) => {
+                    let stage = snapshot_named_resolver_link(etc, &stage_name, false)?;
+                    if sha256(stage.state.canonical_bytes()) != *intent.after_sha256() {
+                        return Ok(TargetClosure {
+                            outcome:
+                                RepairTransactionResolutionOutcome::ManualReconciliationRequired,
+                            observation: snapshot.observation(intent),
+                            cleanup_verified: false,
+                            initial_failure: None,
+                        });
+                    }
+                    remove_resolver_link_if_identity(
+                        etc,
+                        &stage_name,
+                        stage
+                            .identity
+                            .ok_or(RescueFstabExecutionError::UnsafeTarget)?,
+                    )?;
+                    rfs::fsync(etc).map_err(|_| RescueFstabExecutionError::MutationFailed)?;
+                }
+            }
+            Ok(TargetClosure {
+                outcome: RepairTransactionResolutionOutcome::ClosedBeforeUnchanged,
+                observation: snapshot.observation(intent),
+                cleanup_verified: false,
+                initial_failure: None,
+            })
+        }
+        ExactTargetState::After => {
+            restore_resolver_link_backup(etc, backup, intent, reservation_id, deadline).map(
+                |observation| TargetClosure {
+                    outcome: RepairTransactionResolutionOutcome::ClosedBeforeRestored,
+                    observation,
+                    cleanup_verified: false,
+                    initial_failure: None,
+                },
+            )
+        }
+        ExactTargetState::Third => Ok(TargetClosure {
+            outcome: RepairTransactionResolutionOutcome::ManualReconciliationRequired,
+            observation: snapshot.observation(intent),
+            cleanup_verified: false,
+            initial_failure: None,
+        }),
+    }
 }
 
 fn open_etc_directory(mount: BorrowedFd<'_>) -> Result<OwnedFd, RescueFstabExecutionError> {
@@ -2526,6 +3053,10 @@ fn ensure_exact_bytes(
 fn sha256(bytes: &[u8]) -> Sha256 {
     Sha256::parse(&format!("{:x}", Sha256Hasher::digest(bytes)))
         .expect("SHA-256 rendering is canonical")
+}
+
+fn prefixed_bytes_sha256(bytes: &[u8]) -> String {
+    format!("sha256:{}", sha256(bytes).as_str())
 }
 
 fn parse_prefixed_sha256(value: &str) -> Result<Sha256, RescueFstabExecutionError> {

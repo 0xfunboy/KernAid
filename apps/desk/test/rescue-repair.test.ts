@@ -10,6 +10,9 @@ import {
   RESCUE_FSTAB_RESOURCE_ID,
   RESCUE_FSTAB_ROLLBACK_CONFIRMATION,
   RESCUE_REPAIR_API_VERSION,
+  RESCUE_RESOLVER_LINK_ACTION_ID,
+  RESCUE_RESOLVER_LINK_CONFIRMATION,
+  RESCUE_RESOLVER_LINK_RESOURCE_ID,
   RESCUE_ROLLBACK_API_VERSION,
   RescueRepairClient,
   RescueRepairServiceError,
@@ -160,6 +163,62 @@ test("crypttab prepared contract is exact and dispatches only crypttab operation
   assert.throws(
     () => parseRescueRepairResponse(crossed, REQUEST, operation),
     /non valido/u,
+  );
+});
+
+test("resolver-link dispatch is closed and never sends a path or link target", async () => {
+  const requestIds = [REQUEST, NEXT_REQUEST, THIRD_REQUEST];
+  const bodies: Record<string, unknown>[] = [];
+  const client = new RescueRepairClient(
+    async (_input, init) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      bodies.push(body);
+      if (body.operation === "repair.resolver-link.prepare")
+        return frame(
+          resolverLinkPreparedEnvelope(
+            String(body.requestId),
+            "repair.resolver-link.prepare",
+          ),
+        );
+      return frame({
+        apiVersion: RESCUE_REPAIR_API_VERSION,
+        requestId: body.requestId,
+        operation: body.operation,
+        outcome: "ok",
+        stateVersion: 3,
+        state: "executing",
+        detail: null,
+      });
+    },
+    () => requestIds.shift()!,
+    () => `A-${"e".repeat(32)}`,
+  );
+  const staged = await client.prepare(
+    {
+      scanFingerprint: `scan:${"a".repeat(64)}`,
+      targetFingerprint: TARGET,
+      targetId: `target:${"b".repeat(64)}`,
+    },
+    "resolver-link",
+  );
+  const detail = preparedRepairDetail(staged);
+  assert.ok(detail);
+  assert.equal(detail.kind, "resolver-link-prepared");
+  assert.equal(detail.resourceId, RESCUE_RESOLVER_LINK_RESOURCE_ID);
+  assert.equal(detail.actionId, RESCUE_RESOLVER_LINK_ACTION_ID);
+  await client.approve(detail, RESCUE_RESOLVER_LINK_CONFIRMATION);
+  await client.cancel(detail);
+  assert.deepEqual(
+    bodies.map((body) => body.operation),
+    [
+      "repair.resolver-link.prepare",
+      "repair.resolver-link.approve",
+      "repair.resolver-link.cancel",
+    ],
+  );
+  assert.doesNotMatch(
+    JSON.stringify(bodies),
+    /\/etc\/|hostname|linkTarget|command|rawConfig/iu,
   );
 });
 
@@ -685,6 +744,23 @@ function crypttabPreparedEnvelope(
       resourceId: RESCUE_CRYPTTAB_RESOURCE_ID,
       actionId: RESCUE_CRYPTTAB_ACTION_ID,
       confirmationRequired: RESCUE_CRYPTTAB_CONFIRMATION,
+    },
+  };
+}
+
+function resolverLinkPreparedEnvelope(
+  requestId: string,
+  operation: RescueRepairOperation,
+): Record<string, unknown> {
+  const envelope = preparedEnvelope(requestId, operation);
+  return {
+    ...envelope,
+    detail: {
+      ...(envelope.detail as Record<string, unknown>),
+      kind: "resolver-link-prepared",
+      resourceId: RESCUE_RESOLVER_LINK_RESOURCE_ID,
+      actionId: RESCUE_RESOLVER_LINK_ACTION_ID,
+      confirmationRequired: RESCUE_RESOLVER_LINK_CONFIRMATION,
     },
   };
 }

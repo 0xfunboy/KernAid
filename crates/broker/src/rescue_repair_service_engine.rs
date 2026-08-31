@@ -46,6 +46,14 @@ use crate::{
         RepairTerminalReceipt,
     },
 };
+#[cfg(feature = "rescue-resolver-link-production-candidate")]
+use crate::{
+    rescue_fstab_executor::execute_approved_resolver_link,
+    rescue_resolver_link_candidate::{
+        ApprovedResolverLinkRepair, PreparedResolverLinkRepair, ResolverLinkPrepareError,
+        prepare_resolver_link_repair,
+    },
+};
 use kernaid_core::{
     RescueFstabCandidateAdmission, RescueFstabCandidateApproval, RescueFstabRollbackAdmission,
     RescueFstabRollbackApproval, RescueFstabRollbackBinding, RescueFstabRollbackSourceBinding,
@@ -138,6 +146,8 @@ pub enum ProductionPreparedRepair {
     Crypttab(Box<PreparedRescueCrypttabTransaction>),
     #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
     Ext4Fsck(Box<PreparedExt4Repair>),
+    #[cfg(feature = "rescue-resolver-link-production-candidate")]
+    ResolverLink(Box<PreparedResolverLinkRepair>),
 }
 
 /// The approved type remains the broker's inseparable target/backup/Core
@@ -148,6 +158,8 @@ pub enum ProductionApprovedRepair {
     Crypttab(Box<ApprovedRescueCrypttabTransaction>),
     #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
     Ext4Fsck(Box<ApprovedExt4Repair>),
+    #[cfg(feature = "rescue-resolver-link-production-candidate")]
+    ResolverLink(Box<ApprovedResolverLinkRepair>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -429,6 +441,48 @@ impl RepairPreparationEngine for ProductionRepairEngine {
                     descriptor,
                 ))
             }
+            #[cfg(feature = "rescue-resolver-link-production-candidate")]
+            RepairCandidateKind::ResolverLink => {
+                let prepared = prepare_resolver_link_repair(
+                    command.request_id(),
+                    command.session_id(),
+                    command.plan_id(),
+                    command.target().scan_fingerprint(),
+                    command.target().target_id(),
+                    command.target().target_fingerprint(),
+                    deadline,
+                )
+                .map_err(map_resolver_link_prepare_failure)?;
+                let audit = prepared.descriptor();
+                let descriptor = match PreparedRepairDescriptor::new(
+                    &audit.session_id,
+                    &audit.plan_id,
+                    &audit.plan_sha256,
+                    &audit.target_fingerprint,
+                    &audit.before_sha256,
+                    &audit.after_sha256,
+                    &audit.diff_sha256,
+                    crate::rescue_resolver_link_candidate::RESOURCE_ID,
+                    prepared.backup_locator(),
+                    1,
+                    true,
+                    true,
+                ) {
+                    Ok(descriptor) => descriptor,
+                    Err(_) => {
+                        prepared
+                            .cancel(deadline)
+                            .map_err(|_| RepairEngineFailure::CancelFailed)?;
+                        return Err(RepairEngineFailure::PrepareFailed(
+                            RepairPrepareFailureStage::AdmissionInternal,
+                        ));
+                    }
+                };
+                Ok((
+                    ProductionPreparedRepair::ResolverLink(Box::new(prepared)),
+                    descriptor,
+                ))
+            }
         }
     }
 
@@ -528,6 +582,23 @@ impl RepairPreparationEngine for ProductionRepairEngine {
                         RepairExecutionFailureStage::ApprovalAdmission,
                     )
                 }),
+            #[cfg(feature = "rescue-resolver-link-production-candidate")]
+            ProductionPreparedRepair::ResolverLink(prepared) => (*prepared)
+                .approve(
+                    approval.session_id(),
+                    approval.plan_id(),
+                    approval.plan_hash(),
+                    approval.approval_id(),
+                    approval.approval_sequence(),
+                    approval.typed_confirmation(),
+                    deadline,
+                )
+                .map(|approved| ProductionApprovedRepair::ResolverLink(Box::new(approved)))
+                .map_err(|_| {
+                    RepairEngineFailure::ApprovalRejected(
+                        RepairExecutionFailureStage::ApprovalAdmission,
+                    )
+                }),
         }
     }
 
@@ -556,6 +627,10 @@ impl RepairPreparationEngine for ProductionRepairEngine {
             #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
             ProductionApprovedRepair::Ext4Fsck(approved) => {
                 execute_approved_ext4_repair(*approved, deadline)
+            }
+            #[cfg(feature = "rescue-resolver-link-production-candidate")]
+            ProductionApprovedRepair::ResolverLink(approved) => {
+                execute_approved_resolver_link(*approved, deadline)
             }
         };
         match result {
@@ -590,6 +665,10 @@ impl RepairPreparationEngine for ProductionRepairEngine {
             ProductionPreparedRepair::Ext4Fsck(prepared) => (*prepared)
                 .cancel(deadline)
                 .map_err(|_| RepairEngineFailure::CancelFailed),
+            #[cfg(feature = "rescue-resolver-link-production-candidate")]
+            ProductionPreparedRepair::ResolverLink(prepared) => (*prepared)
+                .cancel(deadline)
+                .map_err(|_| RepairEngineFailure::CancelFailed),
         }
     }
 }
@@ -605,6 +684,12 @@ impl RescueFstabRollbackBackend for ProductionRepairEngine {
     ) -> Result<(Self::PreparedRollback, PreparedRollbackDescriptor), RepairEngineFailure> {
         #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
         if command.candidate() == RepairCandidateKind::Ext4Fsck {
+            return Err(RepairEngineFailure::RollbackUnavailable(
+                RepairExecutionFailureStage::Authority,
+            ));
+        }
+        #[cfg(feature = "rescue-resolver-link-production-candidate")]
+        if command.candidate() == RepairCandidateKind::ResolverLink {
             return Err(RepairEngineFailure::RollbackUnavailable(
                 RepairExecutionFailureStage::Authority,
             ));
@@ -642,6 +727,12 @@ impl RescueFstabRollbackBackend for ProductionRepairEngine {
             RepairCandidateKind::Crypttab => RescueRepairRollbackResource::Crypttab,
             #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
             RepairCandidateKind::Ext4Fsck => {
+                return Err(RepairEngineFailure::RollbackUnavailable(
+                    RepairExecutionFailureStage::Authority,
+                ));
+            }
+            #[cfg(feature = "rescue-resolver-link-production-candidate")]
+            RepairCandidateKind::ResolverLink => {
                 return Err(RepairEngineFailure::RollbackUnavailable(
                     RepairExecutionFailureStage::Authority,
                 ));
@@ -922,6 +1013,31 @@ fn map_ext4_prepare_failure(error: Ext4PrepareError) -> RepairEngineFailure {
         Ext4PrepareError::InvalidRequest
         | Ext4PrepareError::ApprovalRejected
         | Ext4PrepareError::CancellationFailed => RepairPrepareFailureStage::AdmissionInternal,
+    };
+    RepairEngineFailure::PrepareFailed(stage)
+}
+
+#[cfg(feature = "rescue-resolver-link-production-candidate")]
+fn map_resolver_link_prepare_failure(error: ResolverLinkPrepareError) -> RepairEngineFailure {
+    let stage = match error {
+        ResolverLinkPrepareError::TargetUnavailable => {
+            RepairPrepareFailureStage::TargetCapabilityUnavailable
+        }
+        ResolverLinkPrepareError::TargetChanged => {
+            RepairPrepareFailureStage::TargetCapabilityIdentityChanged
+        }
+        ResolverLinkPrepareError::VaultUnavailable => RepairPrepareFailureStage::VaultReserve,
+        ResolverLinkPrepareError::ObservationUnavailable
+        | ResolverLinkPrepareError::AmbiguousResolver
+        | ResolverLinkPrepareError::UnsafeResolverLink
+        | ResolverLinkPrepareError::RepairNotRequired => {
+            RepairPrepareFailureStage::ObservationPreview
+        }
+        ResolverLinkPrepareError::InvalidRequest
+        | ResolverLinkPrepareError::ApprovalRejected
+        | ResolverLinkPrepareError::CancellationFailed => {
+            RepairPrepareFailureStage::AdmissionInternal
+        }
     };
     RepairEngineFailure::PrepareFailed(stage)
 }

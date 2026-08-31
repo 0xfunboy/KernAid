@@ -19,6 +19,12 @@ export const RESCUE_EXT4_FINDING_ID = "KA-LNX-FS-001";
 export const RESCUE_EXT4_ACTION_ID = "linux.ext4.fsck-preen-with-undo.v1";
 export const RESCUE_EXT4_RESOURCE_ID = "rescue:selected-linux-filesystem:ext4";
 export const RESCUE_EXT4_CONFIRMATION = "REPAIR EXT4 OFFLINE";
+export const RESCUE_RESOLVER_LINK_ACTION_ID =
+  "linux.network.restore-resolver-link.v1";
+export const RESCUE_RESOLVER_LINK_RESOURCE_ID =
+  "rescue:selected-linux-root:etc/resolver-link";
+export const RESCUE_RESOLVER_LINK_CONFIRMATION = "RESTORE RESOLVER LINK";
+export const RESCUE_RESOLVER_LINK_FINDING_ID = "KA-LNX-NET-001";
 export const RESCUE_FSTAB_ROLLBACK_ACTION_ID = "linux.fstab.restore";
 export const RESCUE_FSTAB_ROLLBACK_CONFIRMATION = "RIPRISTINA FSTAB ORIGINALE";
 export const RESCUE_CRYPTTAB_ROLLBACK_ACTION_ID =
@@ -51,6 +57,9 @@ export type RescueRepairOperation =
   | "repair.ext4.prepare"
   | "repair.ext4.approve"
   | "repair.ext4.cancel"
+  | "repair.resolver-link.prepare"
+  | "repair.resolver-link.approve"
+  | "repair.resolver-link.cancel"
   | "repair.fstab.rollback.status"
   | "repair.fstab.rollback.prepare"
   | "repair.fstab.rollback.approve"
@@ -112,7 +121,8 @@ export interface RescueRepairPreparedDetail {
   readonly kind:
     | "fstab-prepared"
     | "crypttab-prepared"
-    | "ext4-fsck-prepared";
+    | "ext4-fsck-prepared"
+    | "resolver-link-prepared";
   readonly preparedId: string;
   readonly sessionId: string;
   readonly planId: string;
@@ -124,12 +134,14 @@ export interface RescueRepairPreparedDetail {
   readonly resourceId:
     | typeof RESCUE_FSTAB_RESOURCE_ID
     | typeof RESCUE_CRYPTTAB_RESOURCE_ID
-    | typeof RESCUE_EXT4_RESOURCE_ID;
+    | typeof RESCUE_EXT4_RESOURCE_ID
+    | typeof RESCUE_RESOLVER_LINK_RESOURCE_ID;
   readonly backupLocator: string;
   readonly actionId:
     | typeof RESCUE_FSTAB_ACTION_ID
     | typeof RESCUE_CRYPTTAB_ACTION_ID
-    | typeof RESCUE_EXT4_ACTION_ID;
+    | typeof RESCUE_EXT4_ACTION_ID
+    | typeof RESCUE_RESOLVER_LINK_ACTION_ID;
   readonly risk: "R2" | "R3";
   readonly backup: {
     readonly state: "reserved";
@@ -139,7 +151,8 @@ export interface RescueRepairPreparedDetail {
   readonly confirmationRequired:
     | typeof RESCUE_FSTAB_CONFIRMATION
     | typeof RESCUE_CRYPTTAB_CONFIRMATION
-    | typeof RESCUE_EXT4_CONFIRMATION;
+    | typeof RESCUE_EXT4_CONFIRMATION
+    | typeof RESCUE_RESOLVER_LINK_CONFIRMATION;
 }
 
 export interface RescueRollbackSourceReceipt {
@@ -259,7 +272,7 @@ export class RescueRepairClient {
 
   async prepare(
     target: RescueRepairTargetClaims,
-    candidate: "fstab" | "crypttab" | "ext4" = "fstab",
+    candidate: "fstab" | "crypttab" | "ext4" | "resolver-link" = "fstab",
     signal?: AbortSignal,
   ): Promise<RescueRepairSnapshot> {
     const claims = parseRescueRepairTargetClaims(target);
@@ -568,7 +581,8 @@ export function preparedRepairDetail(
   return snapshot?.state === "prepared" &&
     (snapshot.detail?.kind === "fstab-prepared" ||
       snapshot.detail?.kind === "crypttab-prepared" ||
-      snapshot.detail?.kind === "ext4-fsck-prepared")
+      snapshot.detail?.kind === "ext4-fsck-prepared" ||
+      snapshot.detail?.kind === "resolver-link-prepared")
     ? snapshot.detail
     : undefined;
 }
@@ -585,11 +599,12 @@ export function preparedRollbackDetail(
 
 export function rollbackSourceReceipt(
   snapshot: RescueRepairSnapshot | undefined,
-  candidate: "fstab" | "crypttab" | "ext4" | undefined,
+  candidate: "fstab" | "crypttab" | "ext4" | "resolver-link" | undefined,
 ): RescueRollbackSourceReceipt | undefined {
   if (
     candidate === undefined ||
     candidate === "ext4" ||
+    candidate === "resolver-link" ||
     snapshot?.state !== "succeeded" ||
     snapshot.detail?.kind !== "terminal" ||
     snapshot.detail.terminalOutcome !== "committed" ||
@@ -711,7 +726,9 @@ function parseDetail(
       (operation.startsWith("repair.fstab.") &&
         prepared.kind !== "fstab-prepared") ||
       (operation.startsWith("repair.ext4.") &&
-        prepared.kind !== "ext4-fsck-prepared")
+        prepared.kind !== "ext4-fsck-prepared") ||
+      (operation.startsWith("repair.resolver-link.") &&
+        prepared.kind !== "resolver-link-prepared")
     )
       throw new Error("Risorsa preparata non coerente con l'operazione.");
     return prepared;
@@ -738,7 +755,9 @@ function repairOperation(
       ? "crypttab"
       : kind === "ext4-fsck-prepared"
         ? "ext4"
-        : "fstab";
+        : kind === "resolver-link-prepared"
+          ? "resolver-link"
+          : "fstab";
   return `repair.${candidate}.${phase}` as RescueRepairOperation;
 }
 
@@ -764,8 +783,9 @@ function parsePreparedDetail(value: unknown): RescueRepairPreparedDetail {
   const backup = exactRecord(item.backup, ["state", "vaultDistinct"]);
   const crypttab = item.kind === "crypttab-prepared";
   const ext4 = item.kind === "ext4-fsck-prepared";
+  const resolverLink = item.kind === "resolver-link-prepared";
   if (
-    (item.kind !== "fstab-prepared" && !crypttab && !ext4) ||
+    (item.kind !== "fstab-prepared" && !crypttab && !ext4 && !resolverLink) ||
     typeof item.preparedId !== "string" ||
     !PREPARED_ID.test(item.preparedId) ||
     typeof item.sessionId !== "string" ||
@@ -788,7 +808,9 @@ function parsePreparedDetail(value: unknown): RescueRepairPreparedDetail {
         ? RESCUE_CRYPTTAB_RESOURCE_ID
         : ext4
           ? RESCUE_EXT4_RESOURCE_ID
-          : RESCUE_FSTAB_RESOURCE_ID) ||
+          : resolverLink
+            ? RESCUE_RESOLVER_LINK_RESOURCE_ID
+            : RESCUE_FSTAB_RESOURCE_ID) ||
     typeof item.backupLocator !== "string" ||
     !BACKUP_LOCATOR.test(item.backupLocator) ||
     item.actionId !==
@@ -796,7 +818,9 @@ function parsePreparedDetail(value: unknown): RescueRepairPreparedDetail {
         ? RESCUE_CRYPTTAB_ACTION_ID
         : ext4
           ? RESCUE_EXT4_ACTION_ID
-          : RESCUE_FSTAB_ACTION_ID) ||
+          : resolverLink
+            ? RESCUE_RESOLVER_LINK_ACTION_ID
+            : RESCUE_FSTAB_ACTION_ID) ||
     item.risk !== (ext4 ? "R3" : "R2") ||
     backup.state !== "reserved" ||
     backup.vaultDistinct !== true ||
@@ -808,8 +832,10 @@ function parsePreparedDetail(value: unknown): RescueRepairPreparedDetail {
         ? RESCUE_CRYPTTAB_CONFIRMATION
         : ext4
           ? RESCUE_EXT4_CONFIRMATION
-          : RESCUE_FSTAB_CONFIRMATION) ||
-    ((crypttab || ext4) && item.nextApprovalSequence !== 1)
+          : resolverLink
+            ? RESCUE_RESOLVER_LINK_CONFIRMATION
+            : RESCUE_FSTAB_CONFIRMATION) ||
+    ((crypttab || ext4 || resolverLink) && item.nextApprovalSequence !== 1)
   )
     throw new Error("Piano Rescue preparato non valido.");
   return structuredClone({

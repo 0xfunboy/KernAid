@@ -50,6 +50,62 @@ def unit_directives(path: Path) -> dict[str, dict[str, list[str]]]:
 
 
 class RepairCandidatePackagingTests(unittest.TestCase):
+    def test_resolver_link_relay_is_path_free_and_exact(self) -> None:
+        target = {
+            "scanFingerprint": "scan:" + "1" * 64,
+            "targetFingerprint": "sha256:" + "2" * 64,
+            "targetId": "target:" + "3" * 64,
+        }
+        prepare = {
+            "apiVersion": rescue_server.REPAIR_API_VERSION,
+            "requestId": "R-10000000-0000-0000-0000-000000000001",
+            "operation": "repair.resolver-link.prepare",
+            "target": target,
+        }
+        rescue_server._validate_repair_request(prepare)
+        approve = {
+            "apiVersion": rescue_server.REPAIR_API_VERSION,
+            "requestId": "R-10000000-0000-0000-0000-000000000002",
+            "operation": "repair.resolver-link.approve",
+            "preparedId": "Q-" + "4" * 32,
+            "sessionId": "S-" + "5" * 32,
+            "planId": "P-" + "6" * 32,
+            "planHash": "sha256:" + "7" * 64,
+            "approvalId": "A-" + "8" * 32,
+            "approvalSequence": 1,
+            "typedConfirmation": "RESTORE RESOLVER LINK",
+        }
+        rescue_server._validate_repair_request(approve)
+        with self.assertRaises(rescue_server.RepairRelayError):
+            rescue_server._validate_repair_request(
+                {**prepare, "path": "/etc/resolv.conf"}
+            )
+
+        detail = {
+            "kind": "resolver-link-prepared",
+            "preparedId": approve["preparedId"],
+            "sessionId": approve["sessionId"],
+            "planId": approve["planId"],
+            "planHash": approve["planHash"],
+            "targetFingerprint": target["targetFingerprint"],
+            "beforeSha256": "sha256:" + "9" * 64,
+            "afterSha256": "sha256:" + "a" * 64,
+            "diffSha256": "sha256:" + "b" * 64,
+            "resourceId": "rescue:selected-linux-root:etc/resolver-link",
+            "backupLocator": "vault://repair/B-" + "c" * 32,
+            "actionId": "linux.network.restore-resolver-link.v1",
+            "risk": "R2",
+            "backup": {"state": "reserved", "vaultDistinct": True},
+            "nextApprovalSequence": 1,
+            "confirmationRequired": "RESTORE RESOLVER LINK",
+        }
+        self.assertTrue(rescue_server._validate_repair_prepared_detail(detail))
+        self.assertFalse(
+            rescue_server._validate_repair_prepared_detail(
+                {**detail, "resourceId": "rescue:selected-linux-root:etc/fstab"}
+            )
+        )
+
     def test_crypttab_rollback_relay_is_exact_and_cross_binding_fails(self) -> None:
         source = {
             "reservationId": "B-0123456789abcdef0123456789abcdef",
