@@ -329,7 +329,8 @@ h2 {
   align-items: center;
   border-bottom: 1px solid var(--line);
 }
-.assets-panel {
+.assets-panel,
+.audit-panel {
   grid-column: 1 / -1;
 }
 input,
@@ -400,6 +401,14 @@ td small {
 .status.attention::before {
   background: var(--amber);
 }
+.audit-outcome.failed::before,
+.audit-outcome.denied::before {
+  background: var(--red);
+}
+.audit-outcome.pending::before,
+.audit-outcome.cancelled::before {
+  background: var(--amber);
+}
 .row-action {
   border: 0;
   background: transparent;
@@ -421,6 +430,13 @@ td small {
 }
 .empty p {
   font-size: 12px;
+}
+.error-state {
+  background: rgba(255, 111, 103, 0.035);
+}
+.error-state strong,
+.error-state p {
+  color: var(--red);
 }
 .posture {
   padding-bottom: 10px;
@@ -595,7 +611,8 @@ td small {
     grid-template-columns: 1fr;
   }
   .posture,
-  .assets-panel {
+  .assets-panel,
+  .audit-panel {
     grid-column: auto;
   }
   .summary-grid {
