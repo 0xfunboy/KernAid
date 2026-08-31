@@ -4,13 +4,13 @@ After=kernaid-fleet.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/node /opt/kernaid/deploy/fleet/scheduled-backup.mjs /var/lib/kernaid-fleet/fleet.sqlite3 /var/backups/kernaid-fleet 14
+ExecStart=/usr/bin/node /opt/kernaid/deploy/fleet/scheduled-backup.mjs /var/lib/kernaid-fleet/fleet.sqlite3 /var/backups/kernaid-fleet 14 /etc/kernaid-fleet/receipt-signing-key.pk8 /etc/kernaid-fleet/receipt.public
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadOnlyPaths=/opt/kernaid /var/lib/kernaid-fleet
+ReadOnlyPaths=/opt/kernaid /var/lib/kernaid-fleet /etc/kernaid-fleet/receipt-signing-key.pk8 /etc/kernaid-fleet/receipt.public
 ReadWritePaths=/var/backups/kernaid-fleet
 LockPersonality=true
 RestrictSUIDSGID=true

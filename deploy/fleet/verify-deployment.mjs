@@ -16,6 +16,14 @@ const databaseLifecycle = readFileSync(
   join(deploymentDirectory, "database-lifecycle.mjs"),
   "utf8",
 );
+const scheduledBackup = readFileSync(
+  join(deploymentDirectory, "scheduled-backup.mjs"),
+  "utf8",
+);
+const backupService = readFileSync(
+  join(deploymentDirectory, "systemd/kernaid-fleet-backup.service"),
+  "utf8",
+);
 
 assert.equal(
   dockerfile.match(
@@ -123,6 +131,24 @@ assert.match(databaseLifecycle, /from "node:sqlite"/);
 assert.match(databaseLifecycle, /PRAGMA quick_check/);
 assert.match(databaseLifecycle, /PRAGMA foreign_key_check/);
 assert.match(databaseLifecycle, /destination already exists/);
+assert.match(
+  databaseLifecycle,
+  /dev\.kernaid\.fleet\.database-backup-manifest\.v1/,
+);
+assert.match(databaseLifecycle, /kernaid:fleet:database-backup:v1\\0/);
+assert.match(databaseLifecycle, /createPrivateKey/);
+assert.match(databaseLifecycle, /manifest\.sig/);
+assert.match(databaseLifecycle, /function copyFileExclusive/);
+assert.match(databaseLifecycle, /constants\.O_EXCL/);
 assert.doesNotMatch(databaseLifecycle, /process\.env/);
+assert.match(scheduledBackup, /\["verify", destination, trustAnchor\]/);
+assert.match(scheduledBackup, /removeBundleAtomically/);
+assert.match(scheduledBackup, /env: \{\}/);
+assert.doesNotMatch(scheduledBackup, /process\.env/);
+assert.match(
+  backupService,
+  /scheduled-backup\.mjs[\s\S]+receipt-signing-key\.pk8[\s\S]+receipt\.public/,
+);
+assert.match(backupService, /UMask=0077/);
 
 process.stdout.write("Fleet deployment invariants verified\n");
