@@ -38,6 +38,7 @@ schema.
 | `services/fleet-control-plane` | Tenant registry, one-time enrollment, signed inventory ingestion, revocation and asset/device APIs | Loopback HTTP origin intended for a TLS reverse proxy or Cloudflare Tunnel |
 | `apps/fleet-console` | Same-origin operator inventory and enrollment UI | Internal engineering console; tenant admin token remains in browser session storage only |
 | `crates/fleet-policy` | Centrally signed, offline-capable restrictive policy bundle | Can only narrow local permission; diagnostics and an already-started rollback remain available |
+| `crates/fleet-audit` | Canonical signed audit events and tamper-evident chain checkpoints | Digest-only offline/device protocol; central ingestion is still an RC gate |
 | `crates/entitlements` | Signed offline entitlements and revocation checkpoints | Paid capabilities degrade without disabling diagnostics, report export or rollback |
 
 The control plane binds every enrolled `KA-…` device ID to the raw Ed25519
