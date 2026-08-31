@@ -1231,6 +1231,26 @@ mod tests {
         SigningKey::from_bytes(&[0x71; 32])
     }
 
+    #[test]
+    fn update_manifest_cross_language_vector_is_stable() {
+        let manifest = SignedUpdateManifest::sign(content(17), &signing_key()).expect("sign");
+        let expected_unsigned = r#"{"architecture":"x86_64","artifact":{"sha256":"1111111111111111111111111111111111111111111111111111111111111111","sizeBytes":4096,"url":"https://updates.kernaid.example/releases/1.2/image.raw.zst"},"emergencyRollback":false,"expiresAtUnix":1800086400,"issuedAtUnix":1800000000,"notBeforeUnix":1800000100,"platform":"linux","releaseId":"kernaid-1.2.17","releaseRing":"stable","releaseVersion":"1.2.17+build.4","rollout":{"basisPoints":10000,"seed":"stable-2026-08"},"schema":"dev.kernaid.update.manifest.v1","sequence":17}"#;
+        let expected_signed = r#"{"architecture":"x86_64","artifact":{"sha256":"1111111111111111111111111111111111111111111111111111111111111111","sizeBytes":4096,"url":"https://updates.kernaid.example/releases/1.2/image.raw.zst"},"emergencyRollback":false,"expiresAtUnix":1800086400,"issuedAtUnix":1800000000,"notBeforeUnix":1800000100,"platform":"linux","releaseId":"kernaid-1.2.17","releaseRing":"stable","releaseVersion":"1.2.17+build.4","rollout":{"basisPoints":10000,"seed":"stable-2026-08"},"schema":"dev.kernaid.update.manifest.v1","sequence":17,"signature":"FJvv4L6RH6VL9CdIbFPTsGY5WEhOODEac9iS2M6GAcknqdrr683vBcGeMzYd3m5_gxdpKRA_Dl8ZA5xcT7KiDQ"}"#;
+
+        assert_eq!(
+            URL_SAFE_NO_PAD.encode(signing_key().verifying_key().as_bytes()),
+            "4v4qObcyZkKCfW2C1JdiLNbCl_54Jw6qQ2sB8Ia288s"
+        );
+        assert_eq!(
+            manifest.unsigned_canonical().expect("unsigned"),
+            expected_unsigned.as_bytes()
+        );
+        assert_eq!(
+            manifest.export_canonical().expect("signed"),
+            expected_signed.as_bytes()
+        );
+    }
+
     fn content(sequence: u64) -> UpdateManifestContent {
         UpdateManifestContent {
             sequence,

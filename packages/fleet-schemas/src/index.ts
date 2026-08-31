@@ -4,4 +4,5 @@ export * from "./enrollment.js";
 export * from "./entitlement.js";
 export * from "./inventory.js";
 export * from "./policy.js";
+export * from "./update.js";
 export * from "./validation.js";

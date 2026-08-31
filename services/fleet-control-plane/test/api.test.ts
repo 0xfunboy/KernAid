@@ -20,6 +20,8 @@ import {
   ENTITLEMENT_REVOCATIONS_SCHEMA,
   FLEET_POLICY_BUNDLE_SCHEMA,
   FLEET_POLICY_PULL_SCHEMA,
+  FLEET_UPDATE_PULL_SCHEMA,
+  UPDATE_MANIFEST_SCHEMA,
   auditSigningBytes,
   canonicalJson,
   enrollmentSigningBytes,
@@ -29,6 +31,8 @@ import {
   inventorySigningBytes,
   policyBundleSigningBytes,
   policyPullSigningBytes,
+  updateManifestSigningBytes,
+  updatePullSigningBytes,
   type AuditEnvelope,
   type AuditEnvelopeUnsigned,
   type EnrollmentRequest,
@@ -47,6 +51,10 @@ import {
   type PolicyPullRequestUnsigned,
   type SignedPolicyBundle,
   type SignedPolicyBundleUnsigned,
+  type SignedUpdateManifest,
+  type SignedUpdateManifestUnsigned,
+  type UpdatePullRequest,
+  type UpdatePullRequestUnsigned,
 } from "@kernaid/fleet-schemas";
 import { FleetControlPlane } from "../src/server.js";
 
@@ -55,6 +63,12 @@ const INITIAL_TIME = Date.parse("2026-08-31T12:00:00.000Z");
 const ENTITLEMENT_ISSUER = generateKeyPairSync("ed25519");
 const ENTITLEMENT_TRUST_ANCHOR = Buffer.from(
   ENTITLEMENT_ISSUER.publicKey.export({ format: "der", type: "spki" }),
+)
+  .subarray(12)
+  .toString("base64url");
+const UPDATE_ISSUER = generateKeyPairSync("ed25519");
+const UPDATE_TRUST_ANCHOR = Buffer.from(
+  UPDATE_ISSUER.publicKey.export({ format: "der", type: "spki" }),
 )
   .subarray(12)
   .toString("base64url");
@@ -93,6 +107,7 @@ async function createHarness(options?: {
   now?: { value: number };
   consoleDirectory?: string;
   entitlementTrustAnchor?: string;
+  updateTrustAnchor?: string;
 }): Promise<Harness> {
   const directory =
     options?.directory ?? mkdtempSync(join(tmpdir(), "kernaid-fleet-test-"));
@@ -103,6 +118,7 @@ async function createHarness(options?: {
     rootToken: ROOT_TOKEN,
     entitlementTrustAnchor:
       options?.entitlementTrustAnchor ?? ENTITLEMENT_TRUST_ANCHOR,
+    updateTrustAnchor: options?.updateTrustAnchor ?? UPDATE_TRUST_ANCHOR,
     now: () => new Date(now.value),
     consoleDirectory: options?.consoleDirectory,
   });
@@ -549,6 +565,93 @@ async function publishPolicy(
     "POST",
     `/v1/tenants/${tenant.tenantId}/policies`,
     bundle,
+    tenant.adminToken,
+  );
+}
+
+function signedUpdateManifest(input: {
+  sequence: number;
+  platform?: SignedUpdateManifestUnsigned["platform"];
+  architecture?: SignedUpdateManifestUnsigned["architecture"];
+  releaseRing?: SignedUpdateManifestUnsigned["releaseRing"];
+  basisPoints?: number;
+  emergencyRollback?: boolean;
+  releaseVersion?: string;
+}): SignedUpdateManifest {
+  const nowSeconds = Math.floor(INITIAL_TIME / 1000);
+  const unsigned: SignedUpdateManifestUnsigned = {
+    schema: UPDATE_MANIFEST_SCHEMA,
+    sequence: input.sequence,
+    releaseId: `release-${input.sequence}`,
+    releaseVersion: input.releaseVersion ?? `1.0.${input.sequence}`,
+    platform: input.platform ?? "linux",
+    architecture: input.architecture ?? "x86_64",
+    releaseRing: input.releaseRing ?? "stable",
+    rollout: {
+      basisPoints: input.basisPoints ?? 10_000,
+      seed: `release-${input.sequence}-cohort`,
+    },
+    issuedAtUnix: nowSeconds,
+    notBeforeUnix: nowSeconds,
+    expiresAtUnix: nowSeconds + 86_400,
+    artifact: {
+      url: `https://updates.kernaid.example/release-${input.sequence}.img`,
+      sizeBytes: 4096,
+      sha256: input.sequence.toString(16).padStart(64, "0"),
+    },
+    emergencyRollback: input.emergencyRollback ?? false,
+  };
+  return {
+    ...unsigned,
+    signature: sign(
+      null,
+      updateManifestSigningBytes(unsigned),
+      UPDATE_ISSUER.privateKey,
+    ).toString("base64url"),
+  };
+}
+
+function signedUpdatePull(
+  harness: Harness,
+  tenant: TenantCredentials,
+  device: DeviceCredentials,
+  input?: {
+    platform?: UpdatePullRequestUnsigned["platform"];
+    architecture?: UpdatePullRequestUnsigned["architecture"];
+    updateRing?: UpdatePullRequestUnsigned["updateRing"];
+    nonce?: Buffer;
+  },
+): UpdatePullRequest {
+  const unsigned: UpdatePullRequestUnsigned = {
+    schema: FLEET_UPDATE_PULL_SCHEMA,
+    tenantId: tenant.tenantId,
+    deviceId: device.deviceId,
+    platform: input?.platform ?? "linux",
+    architecture: input?.architecture ?? "x86_64",
+    updateRing: input?.updateRing ?? "stable",
+    issuedAt: new Date(harness.now.value).toISOString(),
+    nonce: (input?.nonce ?? randomBytes(32)).toString("base64url"),
+  };
+  return {
+    ...unsigned,
+    signature: sign(
+      null,
+      updatePullSigningBytes(unsigned),
+      device.privateKey,
+    ).toString("base64url"),
+  };
+}
+
+async function publishUpdateManifest(
+  harness: Harness,
+  tenant: TenantCredentials,
+  manifest: SignedUpdateManifest,
+): Promise<HttpResult> {
+  return canonicalApi(
+    harness,
+    "POST",
+    `/v1/tenants/${tenant.tenantId}/update-manifests`,
+    manifest,
     tenant.adminToken,
   );
 }
@@ -1487,6 +1590,9 @@ test("policy anchor, bundle, and assignment survive SQLite restart", async () =>
 
     const legacy = new DatabaseSync(harness.databasePath);
     legacy.exec(`
+      DROP TABLE update_pull_nonces;
+      DROP TABLE update_manifests;
+      DROP TABLE tenant_update_checkpoints;
       DROP TABLE entitlement_pull_nonces;
       DROP TABLE entitlement_revocations;
       DROP TABLE entitlement_documents;
@@ -1528,7 +1634,7 @@ test("policy anchor, bundle, and assignment survive SQLite restart", async () =>
     const version = database.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    assert.equal(version.user_version, 4);
+    assert.equal(version.user_version, 5);
     const nonce = database
       .prepare(
         `SELECT nonce_sha256 FROM policy_pull_nonces
@@ -1827,7 +1933,7 @@ test("signed entitlement pulls isolate assignments and reject replay, key mismat
   }
 });
 
-test("SQLite v3 migrates to v4 and entitlement checkpoints survive restart", async () => {
+test("SQLite v3 migrates through v5 and entitlement checkpoints survive restart", async () => {
   let harness = await createHarness();
   const directory = harness.directory;
   const now = harness.now;
@@ -1842,6 +1948,9 @@ test("SQLite v3 migrates to v4 and entitlement checkpoints survive restart", asy
 
     const legacy = new DatabaseSync(harness.databasePath);
     legacy.exec(`
+      DROP TABLE update_pull_nonces;
+      DROP TABLE update_manifests;
+      DROP TABLE tenant_update_checkpoints;
       DROP TABLE entitlement_pull_nonces;
       DROP TABLE entitlement_revocations;
       DROP TABLE entitlement_documents;
@@ -1884,7 +1993,7 @@ test("SQLite v3 migrates to v4 and entitlement checkpoints survive restart", asy
     const version = database.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    assert.equal(version.user_version, 4);
+    assert.equal(version.user_version, 5);
     const document = database
       .prepare(
         `SELECT highest_sequence, envelope_sha256, canonical_json
@@ -1910,6 +2019,256 @@ test("SQLite v3 migrates to v4 and entitlement checkpoints survive restart", asy
     const nonce = database
       .prepare(
         `SELECT nonce_sha256 FROM entitlement_pull_nonces
+         WHERE tenant_id = ? AND device_id = ?`,
+      )
+      .get(tenant.tenantId, device.deviceId) as { nonce_sha256: string };
+    assert.match(nonce.nonce_sha256, /^[0-9a-f]{64}$/);
+    assert.notEqual(nonce.nonce_sha256, pull.nonce);
+    database.close();
+  } finally {
+    await destroyHarness(harness);
+  }
+});
+
+test("vendor-signed update publication is canonical, monotonic, and admin-scoped", async () => {
+  const harness = await createHarness();
+  try {
+    const tenant = await createTenant(harness);
+    const other = await createTenant(harness);
+    const second = signedUpdateManifest({ sequence: 2 });
+
+    const published = await publishUpdateManifest(harness, tenant, second);
+    assert.equal(published.status, 201);
+    assert.equal(published.body.idempotent, false);
+    const replay = await publishUpdateManifest(harness, tenant, second);
+    assert.equal(replay.status, 200);
+    assert.equal(replay.body.idempotent, true);
+
+    const rollback = await publishUpdateManifest(
+      harness,
+      tenant,
+      signedUpdateManifest({ sequence: 1 }),
+    );
+    assert.equal(rollback.status, 409);
+    assert.equal(rollback.body.error, "update_sequence_rollback");
+
+    const conflict = await publishUpdateManifest(
+      harness,
+      tenant,
+      signedUpdateManifest({ sequence: 2, releaseVersion: "2.0.0" }),
+    );
+    assert.equal(conflict.status, 409);
+    assert.equal(conflict.body.error, "update_sequence_conflict");
+
+    const third = signedUpdateManifest({ sequence: 3 });
+    assert.equal(
+      (
+        await publishUpdateManifest(harness, tenant, {
+          ...third,
+          releaseVersion: "tampered",
+        })
+      ).status,
+      401,
+    );
+    assert.equal(
+      (
+        await canonicalApi(
+          harness,
+          "POST",
+          `/v1/tenants/${tenant.tenantId}/update-manifests`,
+          third,
+          other.adminToken,
+        )
+      ).status,
+      401,
+    );
+    assert.equal(
+      (
+        await canonicalApi(
+          harness,
+          "POST",
+          `/v1/tenants/${tenant.tenantId}/update-manifests`,
+          { ...third, signingSeed: "forbidden" },
+          tenant.adminToken,
+        )
+      ).status,
+      400,
+    );
+  } finally {
+    await destroyHarness(harness);
+  }
+});
+
+test("signed update pulls bind target and ring, filter eligibility, and reject replay", async () => {
+  const harness = await createHarness();
+  try {
+    const tenant = await createTenant(harness);
+    const device = await enroll(harness, tenant, "update-device");
+    assert.equal(
+      (
+        await publishUpdateManifest(
+          harness,
+          tenant,
+          signedUpdateManifest({ sequence: 1, releaseRing: "stable" }),
+        )
+      ).status,
+      201,
+    );
+    assert.equal(
+      (
+        await publishUpdateManifest(
+          harness,
+          tenant,
+          signedUpdateManifest({ sequence: 2, releaseRing: "canary" }),
+        )
+      ).status,
+      201,
+    );
+
+    const stablePull = signedUpdatePull(harness, tenant, device);
+    const stable = await api(harness, "POST", "/v1/update-pulls", stablePull);
+    assert.equal(stable.status, 200);
+    assert.deepEqual(
+      (stable.body.items as SignedUpdateManifest[]).map(
+        (item) => item.sequence,
+      ),
+      [1],
+    );
+    assert.equal(stable.body.platform, "linux");
+    assert.equal(stable.body.architecture, "x86_64");
+    assert.equal(stable.body.updateRing, "stable");
+    const replay = await api(harness, "POST", "/v1/update-pulls", stablePull);
+    assert.equal(replay.status, 409);
+    assert.equal(replay.body.error, "update_pull_replay");
+
+    const canary = await api(
+      harness,
+      "POST",
+      "/v1/update-pulls",
+      signedUpdatePull(harness, tenant, device, { updateRing: "canary" }),
+    );
+    assert.deepEqual(
+      (canary.body.items as SignedUpdateManifest[]).map(
+        (item) => item.sequence,
+      ),
+      [2, 1],
+    );
+    const held = await api(
+      harness,
+      "POST",
+      "/v1/update-pulls",
+      signedUpdatePull(harness, tenant, device, { updateRing: "hold" }),
+    );
+    assert.deepEqual(held.body.items, []);
+    const wrongArchitecture = await api(
+      harness,
+      "POST",
+      "/v1/update-pulls",
+      signedUpdatePull(harness, tenant, device, { architecture: "aarch64" }),
+    );
+    assert.equal(wrongArchitecture.body.architecture, "aarch64");
+    assert.deepEqual(wrongArchitecture.body.items, []);
+
+    const tampered = signedUpdatePull(harness, tenant, device);
+    tampered.updateRing = "canary";
+    assert.equal(
+      (await api(harness, "POST", "/v1/update-pulls", tampered)).status,
+      401,
+    );
+    assert.equal(
+      (
+        await api(
+          harness,
+          "POST",
+          "/v1/update-pulls",
+          signedUpdatePull(harness, tenant, device, { platform: "windows" }),
+        )
+      ).status,
+      403,
+    );
+
+    assert.equal(
+      (
+        await publishUpdateManifest(
+          harness,
+          tenant,
+          signedUpdateManifest({
+            sequence: 3,
+            releaseRing: "stable",
+            basisPoints: 0,
+            emergencyRollback: true,
+          }),
+        )
+      ).status,
+      201,
+    );
+    const emergency = await api(
+      harness,
+      "POST",
+      "/v1/update-pulls",
+      signedUpdatePull(harness, tenant, device, { updateRing: "hold" }),
+    );
+    assert.deepEqual(
+      (emergency.body.items as SignedUpdateManifest[]).map(
+        (item) => item.sequence,
+      ),
+      [3],
+    );
+  } finally {
+    await destroyHarness(harness);
+  }
+});
+
+test("SQLite v4 migrates to v5 and update checkpoints survive restart", async () => {
+  let harness = await createHarness();
+  const directory = harness.directory;
+  const now = harness.now;
+  try {
+    const tenant = await createTenant(harness);
+    const device = await enroll(harness, tenant, "persistent-update-device");
+    await destroyHarness(harness, false);
+
+    const legacy = new DatabaseSync(harness.databasePath);
+    legacy.exec(`
+      DROP TABLE update_pull_nonces;
+      DROP TABLE update_manifests;
+      DROP TABLE tenant_update_checkpoints;
+      PRAGMA user_version = 4;
+    `);
+    legacy.close();
+    harness = await createHarness({ directory, now });
+    const manifest = signedUpdateManifest({ sequence: 7 });
+    assert.equal(
+      (await publishUpdateManifest(harness, tenant, manifest)).status,
+      201,
+    );
+    await destroyHarness(harness, false);
+
+    harness = await createHarness({ directory, now });
+    const pull = signedUpdatePull(harness, tenant, device);
+    const result = await api(harness, "POST", "/v1/update-pulls", pull);
+    assert.equal(result.status, 200);
+    assert.equal((result.body.items as SignedUpdateManifest[])[0]?.sequence, 7);
+
+    const database = new DatabaseSync(harness.databasePath, { readOnly: true });
+    const version = database.prepare("PRAGMA user_version").get() as {
+      user_version: number;
+    };
+    assert.equal(version.user_version, 5);
+    const checkpoint = database
+      .prepare(
+        `SELECT highest_sequence, manifest_sha256
+         FROM tenant_update_checkpoints WHERE tenant_id = ?`,
+      )
+      .get(tenant.tenantId) as {
+      highest_sequence: number;
+      manifest_sha256: string;
+    };
+    assert.equal(checkpoint.highest_sequence, 7);
+    assert.match(checkpoint.manifest_sha256, /^[0-9a-f]{64}$/);
+    const nonce = database
+      .prepare(
+        `SELECT nonce_sha256 FROM update_pull_nonces
          WHERE tenant_id = ? AND device_id = ?`,
       )
       .get(tenant.tenantId, device.deviceId) as { nonce_sha256: string };

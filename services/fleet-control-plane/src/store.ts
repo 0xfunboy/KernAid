@@ -11,6 +11,7 @@ import type {
   SignedPolicyBundle,
   EntitlementEnvelope,
   EntitlementRevocationEnvelope,
+  SignedUpdateManifest,
 } from "@kernaid/fleet-schemas";
 import { canonicalJson } from "@kernaid/fleet-schemas";
 
@@ -18,6 +19,7 @@ const MAX_POLICY_STREAMS_PER_TENANT = 256;
 const MAX_RECENT_POLICY_PULL_NONCES_PER_DEVICE = 1024;
 const MAX_ENTITLEMENT_STREAMS_PER_TENANT = 256;
 const MAX_RECENT_ENTITLEMENT_PULL_NONCES_PER_DEVICE = 1024;
+const MAX_RECENT_UPDATE_PULL_NONCES_PER_DEVICE = 1024;
 
 export class StoreConflictError extends Error {}
 export class StoreAuthorizationError extends Error {}
@@ -31,6 +33,9 @@ export class StoreNonceReplayError extends Error {}
 export class StoreEntitlementRollbackError extends Error {}
 export class StoreEntitlementConflictError extends Error {}
 export class StoreEntitlementPullReplayError extends Error {}
+export class StoreUpdateRollbackError extends Error {}
+export class StoreUpdateConflictError extends Error {}
+export class StoreUpdatePullReplayError extends Error {}
 
 interface EnrollmentTokenRow {
   tenant_id: string;
@@ -72,6 +77,11 @@ export interface PolicyPublishResult {
 
 export interface EntitlementPublishResult {
   idempotent: boolean;
+}
+
+export interface UpdatePublishResult {
+  idempotent: boolean;
+  publishedAt: string;
 }
 
 export interface ListedAuditEvent {
@@ -486,6 +496,136 @@ export class FleetStore {
           throw new StoreEntitlementPullReplayError(
             "entitlement pull nonce was reused",
           );
+        }
+        throw error;
+      }
+    });
+  }
+
+  publishUpdateManifest(
+    tenantId: string,
+    manifest: SignedUpdateManifest,
+    canonicalManifest: string,
+    manifestSha256: string,
+    publishedAt: string,
+  ): UpdatePublishResult {
+    return this.#transaction(() => {
+      const current = this.#database
+        .prepare(
+          `SELECT highest_sequence, manifest_sha256, published_at
+           FROM tenant_update_checkpoints WHERE tenant_id = ?`,
+        )
+        .get(tenantId) as
+        | {
+            highest_sequence: number;
+            manifest_sha256: string;
+            published_at: string;
+          }
+        | undefined;
+      if (current !== undefined) {
+        if (manifest.sequence < current.highest_sequence) {
+          throw new StoreUpdateRollbackError("update sequence rollback");
+        }
+        if (manifest.sequence === current.highest_sequence) {
+          if (manifestSha256 === current.manifest_sha256) {
+            return { idempotent: true, publishedAt: current.published_at };
+          }
+          throw new StoreUpdateConflictError("update sequence conflict");
+        }
+      }
+
+      this.#database
+        .prepare(
+          `INSERT INTO update_manifests
+            (tenant_id, platform, architecture, release_ring, sequence,
+             manifest_sha256, canonical_json, published_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT (tenant_id, platform, architecture, release_ring)
+           DO UPDATE SET
+             sequence = excluded.sequence,
+             manifest_sha256 = excluded.manifest_sha256,
+             canonical_json = excluded.canonical_json,
+             published_at = excluded.published_at`,
+        )
+        .run(
+          tenantId,
+          manifest.platform,
+          manifest.architecture,
+          manifest.releaseRing,
+          manifest.sequence,
+          manifestSha256,
+          canonicalManifest,
+          publishedAt,
+        );
+      this.#database
+        .prepare(
+          `INSERT INTO tenant_update_checkpoints
+            (tenant_id, highest_sequence, manifest_sha256, published_at)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT (tenant_id) DO UPDATE SET
+             highest_sequence = excluded.highest_sequence,
+             manifest_sha256 = excluded.manifest_sha256,
+             published_at = excluded.published_at`,
+        )
+        .run(tenantId, manifest.sequence, manifestSha256, publishedAt);
+      return { idempotent: false, publishedAt };
+    });
+  }
+
+  listUpdateManifestJson(
+    tenantId: string,
+    platform: string,
+    architecture: string,
+  ): string[] {
+    const rows = this.#database
+      .prepare(
+        `SELECT canonical_json FROM update_manifests
+         WHERE tenant_id = ? AND platform = ? AND architecture = ?
+         ORDER BY sequence DESC, release_ring
+         LIMIT 2`,
+      )
+      .all(tenantId, platform, architecture) as unknown as {
+      canonical_json: string;
+    }[];
+    return rows.map((row) => row.canonical_json);
+  }
+
+  recordUpdatePullNonce(input: {
+    tenantId: string;
+    deviceId: string;
+    nonceSha256: string;
+    expiresAtMs: number;
+    nowMs: number;
+  }): void {
+    this.#transaction(() => {
+      this.#database
+        .prepare("DELETE FROM update_pull_nonces WHERE expires_at_ms <= ?")
+        .run(input.nowMs);
+      const recent = this.#database
+        .prepare(
+          `SELECT COUNT(*) AS count FROM update_pull_nonces
+           WHERE tenant_id = ? AND device_id = ?`,
+        )
+        .get(input.tenantId, input.deviceId) as { count: number };
+      if (recent.count >= MAX_RECENT_UPDATE_PULL_NONCES_PER_DEVICE) {
+        throw new StoreConflictError("recent update pull limit reached");
+      }
+      try {
+        this.#database
+          .prepare(
+            `INSERT INTO update_pull_nonces
+              (tenant_id, device_id, nonce_sha256, expires_at_ms)
+             VALUES (?, ?, ?, ?)`,
+          )
+          .run(
+            input.tenantId,
+            input.deviceId,
+            input.nonceSha256,
+            input.expiresAtMs,
+          );
+      } catch (error) {
+        if (isSqliteConstraint(error)) {
+          throw new StoreUpdatePullReplayError("update pull nonce was reused");
         }
         throw error;
       }
@@ -955,7 +1095,7 @@ export class FleetStore {
     const version = this.#database.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    if (version.user_version > 4) {
+    if (version.user_version > 5) {
       throw new Error(
         `unsupported Fleet database version ${version.user_version}`,
       );
@@ -1166,6 +1306,47 @@ export class FleetStore {
             ON entitlement_pull_nonces(expires_at_ms);
 
           PRAGMA user_version = 4;
+        `);
+      });
+      currentVersion = 4;
+    }
+
+    if (currentVersion === 4) {
+      this.#transaction(() => {
+        this.#database.exec(`
+          CREATE TABLE tenant_update_checkpoints (
+            tenant_id TEXT PRIMARY KEY REFERENCES tenants(tenant_id),
+            highest_sequence INTEGER NOT NULL,
+            manifest_sha256 TEXT NOT NULL,
+            published_at TEXT NOT NULL
+          ) STRICT;
+
+          CREATE TABLE update_manifests (
+            tenant_id TEXT NOT NULL REFERENCES tenants(tenant_id),
+            platform TEXT NOT NULL,
+            architecture TEXT NOT NULL,
+            release_ring TEXT NOT NULL,
+            sequence INTEGER NOT NULL,
+            manifest_sha256 TEXT NOT NULL,
+            canonical_json TEXT NOT NULL,
+            published_at TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, platform, architecture, release_ring)
+          ) STRICT;
+
+          CREATE TABLE update_pull_nonces (
+            tenant_id TEXT NOT NULL,
+            device_id TEXT NOT NULL,
+            nonce_sha256 TEXT NOT NULL,
+            expires_at_ms INTEGER NOT NULL,
+            PRIMARY KEY (tenant_id, device_id, nonce_sha256),
+            FOREIGN KEY (tenant_id, device_id)
+              REFERENCES devices(tenant_id, device_id)
+              ON DELETE CASCADE
+          ) STRICT;
+          CREATE INDEX update_pull_nonces_expiry_idx
+            ON update_pull_nonces(expires_at_ms);
+
+          PRAGMA user_version = 5;
         `);
       });
     }

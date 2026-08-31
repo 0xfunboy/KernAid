@@ -48,6 +48,13 @@ upload or arbitrary metadata API.
 - Entitlement pulls are signed by the enrolled device key, time-bounded and
   nonce-replay protected. The response contains only documents assigning that
   exact device plus its tenant-scoped signed revocation checkpoint.
+- Update publication accepts only canonical manifests already signed by the
+  externally provisioned vendor anchor. The per-tenant sequence checkpoint is
+  monotonic; exact replay is idempotent and substitution fails closed. No
+  private vendor key or signing endpoint exists here.
+- Update pulls are signed and nonce-protected device requests. Results are
+  filtered by platform, architecture, ring, time and deterministic rollout;
+  every returned manifest remains independently verifiable on the device.
 
 ## API
 
@@ -66,10 +73,12 @@ and is bounded to 64 KiB, matching the Rust verifier.
 | `POST` | `/v1/audit-events`                               | Signed device envelope | Append or idempotently acknowledge audit     |
 | `POST` | `/v1/policy-pulls`                               | Signed device request  | Return only applicable signed bundles        |
 | `POST` | `/v1/entitlement-pulls`                          | Signed device request  | Return assigned signed entitlements          |
+| `POST` | `/v1/update-pulls`                               | Signed device request  | Return applicable vendor-signed manifests    |
 | `POST` | `/v1/tenants/:tenantId/policy-trust-anchor`      | Tenant bearer          | Set tenant Ed25519 public anchor once        |
 | `POST` | `/v1/tenants/:tenantId/policies`                 | Tenant bearer          | Verify and publish a pre-signed bundle       |
 | `POST` | `/v1/tenants/:tenantId/entitlements`             | Tenant bearer          | Verify/publish offline-signed entitlement    |
 | `POST` | `/v1/tenants/:tenantId/entitlement-revocations`  | Tenant bearer          | Publish signed revocation checkpoint         |
+| `POST` | `/v1/tenants/:tenantId/update-manifests`         | Tenant bearer          | Verify/publish vendor-signed manifest        |
 | `GET`  | `/v1/tenants/:tenantId/devices`                  | Tenant bearer          | `{ items: [...] }` device registry           |
 | `GET`  | `/v1/tenants/:tenantId/assets`                   | Tenant bearer          | `{ items: [...] }` latest aggregate assets   |
 | `GET`  | `/v1/tenants/:tenantId/audit-events`             | Tenant bearer          | Bounded `{ items: [...] }` digest-only audit |
@@ -102,6 +111,13 @@ independently signed by the offline issuer and must be verified on-device with
 canonical document bytes and monotonic sequence/digest checkpoints; it cannot
 mint or expand an entitlement.
 
+Update pull responses contain
+`{schema,tenantId,deviceId,platform,architecture,updateRing,items}`. The echoed
+target and ring bind the response context, while each item must still pass the
+device's vendor-signature verification, durable checkpoint, entitlement,
+policy and inactive-target staging gates. Fleet never downloads artifacts or
+activates a boot target.
+
 ## Run locally
 
 Use exactly Node.js 24.18.0 and the repository-pinned pnpm 9.15.9.
@@ -117,9 +133,12 @@ chmod 600 "$PWD/.local/fleet/root-token"
 # Copy only the offline issuer's public-key file here (never its seed).
 install -m 644 /secure-export/entitlement.public \
   "$PWD/.local/fleet/entitlement.public"
+install -m 644 /secure-export/update-vendor.public \
+  "$PWD/.local/fleet/update-vendor.public"
 
 export KERNAID_FLEET_ROOT_TOKEN_FILE="$PWD/.local/fleet/root-token"
 export KERNAID_FLEET_ENTITLEMENT_TRUST_ANCHOR_FILE="$PWD/.local/fleet/entitlement.public"
+export KERNAID_FLEET_UPDATE_TRUST_ANCHOR_FILE="$PWD/.local/fleet/update-vendor.public"
 export KERNAID_FLEET_DB_PATH="$PWD/.local/fleet/fleet.sqlite"
 export KERNAID_FLEET_HOST="127.0.0.1"
 export KERNAID_FLEET_PORT="7341"
@@ -160,6 +179,9 @@ see [`deploy/fleet`](../../deploy/fleet/README.md).
 6. Provision the vendor entitlement issuer's raw public key through
    `KERNAID_FLEET_ENTITLEMENT_TRUST_ANCHOR_FILE`. A tenant admin may publish
    documents produced by that offline issuer, but cannot sign one here.
+7. Provision the vendor update issuer's raw public key through
+   `KERNAID_FLEET_UPDATE_TRUST_ANCHOR_FILE`. Publish only canonical manifests
+   signed offline; devices independently verify and admit them before staging.
 
 ## Verification
 
@@ -174,5 +196,6 @@ The focused API suite covers cross-tenant denial, token expiry/reuse, key-ID
 binding, signature tampering, replay/idempotency, multi-asset retention,
 revocation, audit gaps/forks, unknown/private field rejection, hash-only
 secrets, policy assignment isolation, policy rollback/conflict, restart
-persistence, entitlement assignment/replay/tamper/rollback/revocation,
-SQLite v3-to-v4 migration, health and optional same-origin console serving.
+persistence, entitlement assignment/replay/tamper/rollback/revocation, update
+target/ring filtering, update anti-rollback/replay, SQLite v3-to-v5 migration,
+health and optional same-origin console serving.

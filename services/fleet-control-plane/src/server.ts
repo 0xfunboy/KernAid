@@ -12,6 +12,8 @@ import {
   FleetSchemaError,
   MAX_ENTITLEMENT_DOCUMENT_BYTES,
   MAX_POLICY_BUNDLE_BYTES,
+  MAX_UPDATE_MANIFEST_BYTES,
+  FLEET_UPDATE_PULL_RESPONSE_SCHEMA,
   auditSigningBytes,
   canonicalJson,
   enrollmentSigningBytes,
@@ -29,8 +31,13 @@ import {
   parseEntitlementRevocationEnvelope,
   parsePolicyPullRequest,
   parseSignedPolicyBundle,
+  parseSignedUpdateManifest,
+  parseUpdatePullRequest,
   policyBundleSigningBytes,
   policyPullSigningBytes,
+  updateAppliesTo,
+  updateManifestSigningBytes,
+  updatePullSigningBytes,
   parseEnrollmentRequest,
   parseAuditEnvelope,
   parseInventoryEnvelope,
@@ -61,6 +68,9 @@ import {
   StoreEntitlementConflictError,
   StoreEntitlementPullReplayError,
   StoreEntitlementRollbackError,
+  StoreUpdateConflictError,
+  StoreUpdatePullReplayError,
+  StoreUpdateRollbackError,
 } from "./store.js";
 
 const MAX_REQUEST_BYTES = 64 * 1024;
@@ -70,6 +80,7 @@ export interface FleetControlPlaneOptions {
   databasePath: string;
   rootToken: string;
   entitlementTrustAnchor: string;
+  updateTrustAnchor: string;
   enrollmentClockSkewMs?: number;
   now?: () => Date;
   consoleDirectory?: string;
@@ -79,6 +90,7 @@ export class FleetControlPlane {
   readonly #store: FleetStore;
   readonly #rootToken: string;
   readonly #entitlementTrustAnchor: KeyObject;
+  readonly #updateTrustAnchor: KeyObject;
   readonly #clockSkewMs: number;
   readonly #now: () => Date;
   readonly #server: Server;
@@ -102,6 +114,13 @@ export class FleetControlPlane {
     } catch {
       throw new Error(
         "entitlement trust anchor must be a canonical raw Ed25519 public key",
+      );
+    }
+    try {
+      this.#updateTrustAnchor = importEd25519Raw(options.updateTrustAnchor);
+    } catch {
+      throw new Error(
+        "update trust anchor must be a canonical raw Ed25519 public key",
       );
     }
     this.#store = new FleetStore(options.databasePath);
@@ -188,6 +207,12 @@ export class FleetControlPlane {
         writeJson(response, 409, { error: "entitlement_sequence_conflict" });
       } else if (error instanceof StoreEntitlementPullReplayError) {
         writeJson(response, 409, { error: "entitlement_pull_replay" });
+      } else if (error instanceof StoreUpdateRollbackError) {
+        writeJson(response, 409, { error: "update_sequence_rollback" });
+      } else if (error instanceof StoreUpdateConflictError) {
+        writeJson(response, 409, { error: "update_sequence_conflict" });
+      } else if (error instanceof StoreUpdatePullReplayError) {
+        writeJson(response, 409, { error: "update_pull_replay" });
       } else {
         writeJson(response, 500, { error: "internal_error" });
       }
@@ -419,6 +444,43 @@ export class FleetControlPlane {
         sequence: envelope.claims.sequence,
         accepted: true,
         idempotent: result.idempotent,
+      });
+      return;
+    }
+
+    const updateManifestsMatch =
+      /^\/v1\/tenants\/([^/]+)\/update-manifests$/.exec(path);
+    if (method === "POST" && updateManifestsMatch !== null) {
+      const tenantId = pathIdentifier(updateManifestsMatch[1], "tenantId");
+      this.#authorizeTenant(request, tenantId);
+      const manifest = parseSignedUpdateManifest(
+        await readCanonicalJson(request, MAX_UPDATE_MANIFEST_BYTES),
+      );
+      if (
+        !verifyEd25519(
+          this.#updateTrustAnchor,
+          updateManifestSigningBytes(manifest),
+          manifest.signature,
+        )
+      ) {
+        throw new HttpError(401, "invalid_signature");
+      }
+      const canonicalManifest = canonicalJson(manifest);
+      const result = this.#store.publishUpdateManifest(
+        tenantId,
+        manifest,
+        canonicalManifest,
+        sha256Hex(canonicalManifest),
+        this.#validNow().toISOString(),
+      );
+      writeJson(response, result.idempotent ? 200 : 201, {
+        schema: "dev.kernaid.fleet.update-manifest-published.v1",
+        tenantId,
+        releaseId: manifest.releaseId,
+        sequence: manifest.sequence,
+        accepted: true,
+        idempotent: result.idempotent,
+        publishedAt: result.publishedAt,
       });
       return;
     }
@@ -675,6 +737,69 @@ export class FleetControlPlane {
         deviceId: pull.deviceId,
         entitlements,
         revocations,
+      });
+      return;
+    }
+
+    if (method === "POST" && path === "/v1/update-pulls") {
+      const pull = parseUpdatePullRequest(await readJson(request));
+      const now = this.#validNow();
+      const issuedAtMs = Date.parse(pull.issuedAt);
+      if (Math.abs(now.getTime() - issuedAtMs) > this.#clockSkewMs) {
+        throw new HttpError(401, "update_pull_timestamp_rejected");
+      }
+      const device = this.#store.getDevice(pull.tenantId, pull.deviceId);
+      if (device === undefined) throw new HttpError(401, "unknown_device");
+      if (device.revokedAt !== null) throw new HttpError(403, "device_revoked");
+      if (device.platform !== pull.platform) {
+        throw new HttpError(403, "device_platform_mismatch");
+      }
+      let publicKey;
+      try {
+        publicKey = importEd25519Spki(device.publicKeySpki);
+      } catch {
+        throw new HttpError(500, "invalid_stored_key");
+      }
+      if (
+        !verifyEd25519(publicKey, updatePullSigningBytes(pull), pull.signature)
+      ) {
+        throw new HttpError(401, "invalid_signature");
+      }
+      this.#store.recordUpdatePullNonce({
+        tenantId: pull.tenantId,
+        deviceId: pull.deviceId,
+        nonceSha256: sha256Hex(
+          `kernaid:fleet:update-pull-nonce:v1\0${pull.nonce}`,
+        ),
+        expiresAtMs: issuedAtMs + this.#clockSkewMs + 1,
+        nowMs: now.getTime(),
+      });
+      const nowUnix = Math.floor(now.getTime() / 1000);
+      const items = this.#store
+        .listUpdateManifestJson(pull.tenantId, pull.platform, pull.architecture)
+        .map((stored) =>
+          parseSignedUpdateManifest(JSON.parse(stored) as unknown),
+        )
+        .filter((manifest) => {
+          if (
+            !verifyEd25519(
+              this.#updateTrustAnchor,
+              updateManifestSigningBytes(manifest),
+              manifest.signature,
+            )
+          ) {
+            throw new Error("stored update manifest signature is invalid");
+          }
+          return updateAppliesTo(manifest, pull, nowUnix);
+        });
+      writeJson(response, 200, {
+        schema: FLEET_UPDATE_PULL_RESPONSE_SCHEMA,
+        tenantId: pull.tenantId,
+        deviceId: pull.deviceId,
+        platform: pull.platform,
+        architecture: pull.architecture,
+        updateRing: pull.updateRing,
+        items,
       });
       return;
     }

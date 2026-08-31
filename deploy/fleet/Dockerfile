@@ -40,6 +40,7 @@ ENV NODE_ENV=production \
     KERNAID_FLEET_DB_PATH=/var/lib/kernaid-fleet/fleet.sqlite \
     KERNAID_FLEET_ROOT_TOKEN_FILE=/run/secrets/kernaid_fleet_root_token \
     KERNAID_FLEET_ENTITLEMENT_TRUST_ANCHOR_FILE=/run/configs/kernaid_entitlement_trust_anchor \
+    KERNAID_FLEET_UPDATE_TRUST_ANCHOR_FILE=/run/configs/kernaid_update_trust_anchor \
     FLEET_CONSOLE_DIR=/opt/kernaid/console
 
 WORKDIR /opt/kernaid
