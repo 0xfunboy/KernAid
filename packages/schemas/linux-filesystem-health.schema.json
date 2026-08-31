@@ -1,0 +1,170 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.kernaid.dev/v1/linux-filesystem-health.json",
+  "title": "KernAid read-only Linux filesystem health result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "kind",
+    "targetRef",
+    "filesystem",
+    "state",
+    "checkMode",
+    "mountedAtCheck",
+    "finding"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "1.0" },
+    "kind": { "const": "linux-filesystem-health" },
+    "targetRef": {
+      "type": "string",
+      "pattern": "^(local-root|disk-([1-9]|[12][0-9]|3[0-2])(/volume-([1-9]|[1-9][0-9]|1[01][0-9]|12[0-8]))?)$"
+    },
+    "filesystem": { "enum": ["ext4", "ntfs", "other"] },
+    "state": {
+      "enum": ["healthy", "degraded", "repair-required", "unsupported"]
+    },
+    "checkMode": {
+      "enum": ["e2fsck-read-only", "ntfsfix-no-action", "unavailable"]
+    },
+    "mountedAtCheck": { "type": "boolean" },
+    "finding": {
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "#/$defs/repairRequiredFinding" },
+        { "$ref": "#/$defs/degradedFinding" },
+        { "$ref": "#/$defs/unsupportedFinding" }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "state": { "const": "healthy" } } },
+      "then": { "properties": { "finding": { "type": "null" } } }
+    },
+    {
+      "if": { "properties": { "state": { "const": "repair-required" } } },
+      "then": {
+        "properties": {
+          "finding": { "$ref": "#/$defs/repairRequiredFinding" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "state": { "const": "degraded" } } },
+      "then": {
+        "properties": { "finding": { "$ref": "#/$defs/degradedFinding" } }
+      }
+    },
+    {
+      "if": { "properties": { "state": { "const": "unsupported" } } },
+      "then": {
+        "properties": {
+          "checkMode": { "const": "unavailable" },
+          "finding": { "$ref": "#/$defs/unsupportedFinding" }
+        }
+      },
+      "else": {
+        "properties": {
+          "checkMode": {
+            "enum": ["e2fsck-read-only", "ntfsfix-no-action"]
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "filesystem": { "const": "ext4" } } },
+      "then": {
+        "properties": {
+          "checkMode": { "enum": ["e2fsck-read-only", "unavailable"] }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "filesystem": { "const": "ntfs" } } },
+      "then": {
+        "properties": {
+          "checkMode": { "enum": ["ntfsfix-no-action", "unavailable"] }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "filesystem": { "const": "other" } } },
+      "then": {
+        "properties": {
+          "state": { "const": "unsupported" },
+          "checkMode": { "const": "unavailable" }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "repairRequiredFinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ruleId",
+        "ruleVersion",
+        "severity",
+        "summary",
+        "nextAction"
+      ],
+      "properties": {
+        "ruleId": { "const": "KA-LNX-FS-001" },
+        "ruleVersion": { "const": 1 },
+        "severity": { "const": "critical" },
+        "summary": {
+          "const": "The fixed read-only filesystem check reports errors that require repair."
+        },
+        "nextAction": {
+          "const": "Back up recoverable data, then use the operating system's native repair workflow with explicit write authorization; KernAid did not modify this filesystem."
+        }
+      }
+    },
+    "degradedFinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ruleId",
+        "ruleVersion",
+        "severity",
+        "summary",
+        "nextAction"
+      ],
+      "properties": {
+        "ruleId": { "const": "KA-LNX-FS-002" },
+        "ruleVersion": { "const": 1 },
+        "severity": { "const": "high" },
+        "summary": {
+          "const": "The filesystem was checked while mounted, so a clean result cannot be qualified."
+        },
+        "nextAction": {
+          "const": "Boot KernAid Rescue and repeat the fixed read-only check on the unmounted selected target."
+        }
+      }
+    },
+    "unsupportedFinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ruleId",
+        "ruleVersion",
+        "severity",
+        "summary",
+        "nextAction"
+      ],
+      "properties": {
+        "ruleId": { "const": "KA-LNX-FS-003" },
+        "ruleVersion": { "const": 1 },
+        "severity": { "const": "low" },
+        "summary": {
+          "const": "The fixed read-only filesystem check is unsupported or unavailable."
+        },
+        "nextAction": {
+          "const": "Use a qualified read-only diagnostic for this filesystem; do not infer that it is healthy."
+        }
+      }
+    }
+  }
+}

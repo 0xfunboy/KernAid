@@ -9,6 +9,7 @@ import type {
 } from "@kernaid/schemas";
 import {
   authorizeObserve,
+  collectLinuxFilesystemHealth,
   collectLinuxNormalizedSnapshot,
   collectLocalInventory,
   collectMacosP0Inventory,
@@ -26,9 +27,11 @@ import {
   NativeOpenAiProvider,
   PlatformOfflineRulesProvider,
   fingerprintNativeTarget,
+  inspectRescueFilesystemHealth,
   inspectRescueInstalledTarget,
   linuxNormalizedSnapshotEvidenceSummary,
   linuxNormalizedSnapshotFromRescue,
+  parseLinuxFilesystemHealth,
   parseLinuxStorageHealth,
   projectLinuxStorageHealth,
   scanRescueInstalledTargets,
@@ -39,10 +42,12 @@ import {
   logoutResidentOpenAi,
   verifyRescueTauriIpcIsolation,
   LINUX_NORMALIZED_SNAPSHOT_COLLECTOR,
+  LINUX_FILESYSTEM_HEALTH_COLLECTOR,
   LINUX_STORAGE_HEALTH_COLLECTOR,
   RESCUE_OFFLINE_EVIDENCE_COLLECTOR,
   RESCUE_OFFLINE_EVIDENCE_TARGET,
   type NativeObservation,
+  type LinuxFilesystemHealthSnapshot,
   type LinuxStorageHealthSnapshot,
   type RescueOfflineInspection,
   RescueOfflineInspectionError,
@@ -53,6 +58,7 @@ import {
   type ResidentOpenAiStatus,
   type SecureRuntimeStatus,
 } from "./native";
+import { filesystemHealthEvidenceSummary } from "./filesystem-health";
 import { storageHealthEvidenceSummary } from "./storage-health";
 import {
   getRescueOpenAiStatus,
@@ -132,6 +138,8 @@ function App() {
   const [markdownReport, setMarkdownReport] = useState<MarkdownReportExport>();
   const [markdownReportError, setMarkdownReportError] = useState(false);
   const [nativeEvidence, setNativeEvidence] = useState<NativeObservation[]>([]);
+  const [filesystemHealth, setFilesystemHealth] =
+    useState<LinuxFilesystemHealthSnapshot>();
   const [inventoryReady, setInventoryReady] = useState(!hasLocalCollector());
   const [inventoryError, setInventoryError] = useState<string>();
   const [sessionId, setSessionId] = useState<string>();
@@ -339,6 +347,7 @@ function App() {
     if (isRescueRuntime())
       rescueProviderBinding.current.clearSessionAndPreparation();
     setEvidence([]);
+    setFilesystemHealth(undefined);
     clearRescueOpenAiPreview();
     setProposal(undefined);
     setPlan(undefined);
@@ -377,7 +386,7 @@ function App() {
       sessionId === undefined ||
       sessionDriver === undefined ||
       evidence.length < 1 ||
-      evidence.length > 2 ||
+      evidence.length > 3 ||
       rescueOpenAiPreviewBusy ||
       busy ||
       !rescueProviderBinding.current.sessionMatches("openai")
@@ -581,6 +590,11 @@ function App() {
         )
       ) {
         currentLinuxSnapshot = await collectLinuxNormalizedSnapshot();
+        const filesystemObservation = await collectLinuxFilesystemHealth();
+        currentNativeEvidence.push(filesystemObservation);
+        setFilesystemHealth(
+          parseLinuxFilesystemHealth(filesystemObservation.output),
+        );
       }
       if (currentLinuxSnapshot !== undefined) {
         activeDriver = createDriver(
@@ -863,6 +877,8 @@ function App() {
         inspection.os.family === "linux"
           ? await linuxNormalizedSnapshotFromRescue(inspection)
           : undefined;
+      const selectedFilesystemHealth =
+        await inspectRescueFilesystemHealth(selected);
       const storageObservation = currentRuntimeInventory.find(
         (item) =>
           item.collector === LINUX_STORAGE_HEALTH_COLLECTOR &&
@@ -905,6 +921,15 @@ function App() {
             contentType: "application/json",
           })),
         );
+      observed.push(
+        ...(await preparedDriver.requestEvidence(session.id, {
+          collector: LINUX_FILESYSTEM_HEALTH_COLLECTOR,
+          target: RESCUE_OFFLINE_EVIDENCE_TARGET,
+          summary: filesystemHealthEvidenceSummary(selectedFilesystemHealth),
+          observedContent: JSON.stringify(selectedFilesystemHealth),
+          contentType: "application/json",
+        })),
+      );
       if (
         rescueContextEpoch.current !== operationEpoch ||
         rescueProviderBinding.current.commitPreparation(providerPreparation) !==
@@ -914,6 +939,7 @@ function App() {
           "La sessione Rescue appartiene a un provider non più corrente.",
         );
       setNativeEvidence(currentRuntimeInventory);
+      setFilesystemHealth(selectedFilesystemHealth);
       setInventoryError(undefined);
       setSelectedRescueTarget(selected);
       setRescueInspection(inspection);
@@ -1340,8 +1366,29 @@ function App() {
             )}
           </div>
         )}
+        {filesystemHealth !== undefined && (
+          <div
+            className={`storage-health filesystem-health ${filesystemHealth.state}`}
+            aria-label="Filesystem health"
+          >
+            <p className="label">FILESYSTEM · FIXED READ-ONLY CHECK</p>
+            <div className={`storage-health-disk ${filesystemHealth.state}`}>
+              <strong>{filesystemHealth.targetRef}</strong>
+              <span>
+                {filesystemHealth.filesystem} · {filesystemHealth.state}
+              </span>
+              {filesystemHealth.finding !== null && (
+                <p>{filesystemHealth.finding.nextAction}</p>
+              )}
+            </div>
+          </div>
+        )}
         {nativeEvidence
-          .filter((item) => item.collector !== LINUX_STORAGE_HEALTH_COLLECTOR)
+          .filter(
+            (item) =>
+              item.collector !== LINUX_STORAGE_HEALTH_COLLECTOR &&
+              item.collector !== LINUX_FILESYSTEM_HEALTH_COLLECTOR,
+          )
           .map((item) => (
             <details key={item.collector}>
               <summary>

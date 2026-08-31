@@ -14,6 +14,7 @@ import {
   fingerprintNativeTarget,
   fingerprintRescueTarget,
   getRescueNativePromptStatus,
+  inspectRescueFilesystemHealth,
   inspectRescueInstalledTarget,
   linuxNormalizedSnapshotEvidenceSummary,
   linuxNormalizedSnapshotFromRescue,
@@ -22,6 +23,7 @@ import {
   openRescueNativeVaultPrompt,
   parseNativeObservations,
   parseLinuxHardwareInventory,
+  parseLinuxFilesystemHealth,
   parseLinuxStorageHealth,
   parseRescueOfflineCorpus,
   parseRescueOfflineInspection,
@@ -40,6 +42,7 @@ import {
   rescueOfflineCorpusJson,
   rescueOfflineEvidenceSummary,
   LINUX_NORMALIZED_SNAPSHOT_COLLECTOR,
+  LINUX_FILESYSTEM_HEALTH_COLLECTOR,
   LINUX_STORAGE_HEALTH_COLLECTOR,
   LINUX_P0_COLLECTORS,
   type LinuxHardwareInventory,
@@ -47,6 +50,10 @@ import {
   RESCUE_OFFLINE_EVIDENCE_TARGET,
   RescueOfflineInspectionError,
 } from "../src/native.js";
+import {
+  augmentDiagnosisWithFilesystemHealth,
+  filesystemHealthEvidenceSummary,
+} from "../src/filesystem-health.js";
 import {
   augmentDiagnosisWithStorageHealth,
   projectLinuxStorageHealth,
@@ -435,6 +442,53 @@ test("Linux storage health is strict, target-projectable, and identity-free", ()
     { ...failingStorageHealth, findings: [] },
   ])
     assert.throws(() => parseLinuxStorageHealth(JSON.stringify(invalid)));
+});
+
+test("Linux filesystem health fixtures stay closed and content-free", () => {
+  const fixture = (name: string) =>
+    readFileSync(
+      new URL(
+        `../../../tests/fixtures/linux-filesystem-health/${name}`,
+        import.meta.url,
+      ),
+      "utf8",
+    ).trimEnd();
+  const healthy = parseLinuxFilesystemHealth(fixture("healthy-ext4.v1.json"));
+  const repair = parseLinuxFilesystemHealth(
+    fixture("repair-required-ntfs.v1.json"),
+  );
+  assert.equal(healthy.state, "healthy");
+  assert.equal(repair.state, "repair-required");
+  assert.equal(
+    filesystemHealthEvidenceSummary(repair),
+    "Fixed read-only filesystem check reports repair-required errors",
+  );
+  assert.equal(
+    nativeObservationContentType({
+      collector: LINUX_FILESYSTEM_HEALTH_COLLECTOR,
+      trust: "observed-untrusted",
+      output: JSON.stringify(healthy),
+      success: true,
+      truncated: false,
+    }),
+    "application/json",
+  );
+  const proposal = augmentDiagnosisWithFilesystemHealth(
+    {
+      schemaVersion: "1.0",
+      diagnosis: "Static inspection complete.",
+      confidence: 0.5,
+      evidenceIds: ["E-BASE"],
+      requestedEvidence: [],
+    },
+    repair,
+    "E-FILESYSTEM",
+  );
+  assert.match(proposal.diagnosis, /back up recoverable data first/iu);
+  assert.deepEqual(proposal.evidenceIds, ["E-BASE", "E-FILESYSTEM"]);
+  assert.throws(() =>
+    parseLinuxFilesystemHealth(fixture("malformed-leak.v1.json")),
+  );
 });
 
 test("the exact loopback HTTP origin remains Rescue inside Tauri", async () => {
@@ -887,6 +941,31 @@ test("Rescue inspection HTTP contract is minimal and rejects malformed success",
     assert.equal(inspection.os.family, "windows");
     assert.equal(input, "/api/rescue/inspect-installed-target");
     assert.equal(init?.method, "POST");
+    assert.deepEqual(JSON.parse(String(init?.body)), {
+      scanFingerprint: selection.scanFingerprint,
+      targetId: selection.target.targetId,
+    });
+
+    Object.defineProperty(globalThis, "fetch", {
+      configurable: true,
+      value: async (nextInput: unknown, nextInit: RequestInit | undefined) => {
+        input = nextInput;
+        init = nextInit;
+        return Response.json({
+          schemaVersion: "1.0",
+          kind: "linux-filesystem-health",
+          targetRef: "disk-1/volume-1",
+          filesystem: "ntfs",
+          state: "healthy",
+          checkMode: "ntfsfix-no-action",
+          mountedAtCheck: false,
+          finding: null,
+        });
+      },
+    });
+    const filesystem = await inspectRescueFilesystemHealth(selection);
+    assert.equal(filesystem.state, "healthy");
+    assert.equal(input, "/api/rescue/filesystem-health");
     assert.deepEqual(JSON.parse(String(init?.body)), {
       scanFingerprint: selection.scanFingerprint,
       targetId: selection.target.targetId,

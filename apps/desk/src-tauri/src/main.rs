@@ -1378,6 +1378,27 @@ fn collect_linux_storage_health() -> Observation {
 }
 
 #[cfg(target_os = "linux")]
+fn collect_linux_filesystem_health_observation() -> Observation {
+    let snapshot = kernaid_linux_pack::filesystem_health::collect_current_root();
+    match kernaid_linux_pack::filesystem_health::to_bounded_json(&snapshot) {
+        Ok(output) => Observation {
+            collector: kernaid_linux_pack::filesystem_health::COLLECTOR,
+            trust: "observed-untrusted",
+            output,
+            success: true,
+            truncated: false,
+        },
+        Err(_) => Observation {
+            collector: kernaid_linux_pack::filesystem_health::COLLECTOR,
+            trust: "observed-untrusted",
+            output: String::new(),
+            success: false,
+            truncated: false,
+        },
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn collect_linux_hardware_inventory_bounded(
     state: &'static AtomicU8,
     timeout: Duration,
@@ -1435,6 +1456,21 @@ async fn collect_local_inventory() -> Result<Vec<Observation>, String> {
     tauri::async_runtime::spawn_blocking(collect_local_inventory_sync)
         .await
         .map_err(|_| "L’inventario locale non è stato completato.".to_owned())
+}
+
+#[tauri::command]
+async fn collect_linux_filesystem_health() -> Result<Observation, String> {
+    #[cfg(target_os = "linux")]
+    {
+        tauri::async_runtime::spawn_blocking(collect_linux_filesystem_health_observation)
+            .await
+            .map_err(|_| "La diagnostica filesystem Linux non è stata completata.".to_owned())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err("La diagnostica filesystem è disponibile solo su sistemi Linux.".to_owned())
+    }
 }
 
 #[tauri::command]
@@ -1750,6 +1786,7 @@ macro_rules! production_invoke_handler {
     () => {
         tauri::generate_handler![
             collect_local_inventory,
+            collect_linux_filesystem_health,
             collect_linux_normalized_snapshot,
             collect_macos_p0_inventory,
             collect_windows_p0_inventory,
@@ -1774,6 +1811,7 @@ macro_rules! active_invoke_handler {
     () => {
         tauri::generate_handler![
             collect_local_inventory,
+            collect_linux_filesystem_health,
             collect_linux_normalized_snapshot,
             collect_macos_p0_inventory,
             collect_windows_p0_inventory,

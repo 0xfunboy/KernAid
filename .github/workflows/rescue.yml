@@ -198,7 +198,8 @@ jobs:
             --bin kernaid-rescue-openai-executor
           cargo build --locked --release -p kernaid-linux-pack \
             --bin kernaid-linux-hardware-inventory \
-            --bin kernaid-linux-storage-health
+            --bin kernaid-linux-storage-health \
+            --bin kernaid-linux-filesystem-health
           cargo build --locked --release -p kernaid-rescue-codex-bridge \
             --bin kernaid-rescue-codex \
             --bin kernaid-codex-auth
@@ -221,6 +222,7 @@ jobs:
             sudo unlink -- "$preflight_dir/kernaid-rescue-openai-executor" 2>/dev/null || true
             sudo unlink -- "$preflight_dir/kernaid-linux-hardware-inventory" 2>/dev/null || true
             sudo unlink -- "$preflight_dir/kernaid-linux-storage-health" 2>/dev/null || true
+            sudo unlink -- "$preflight_dir/kernaid-linux-filesystem-health" 2>/dev/null || true
             sudo unlink -- "$preflight_dir/kernaid-rescue-codex" 2>/dev/null || true
             sudo unlink -- "$preflight_dir/kernaid-codex-auth" 2>/dev/null || true
             sudo unlink -- "$preflight_dir/kernaid-rescue-desk-shell" 2>/dev/null || true
@@ -253,6 +255,9 @@ jobs:
             target/release/kernaid-linux-storage-health \
             "$preflight_dir/kernaid-linux-storage-health"
           sudo install -o root -g root -m 0755 \
+            target/release/kernaid-linux-filesystem-health \
+            "$preflight_dir/kernaid-linux-filesystem-health"
+          sudo install -o root -g root -m 0755 \
             target/release/kernaid-rescue-codex \
             "$preflight_dir/kernaid-rescue-codex"
           sudo install -o root -g root -m 0755 \
@@ -276,6 +281,8 @@ jobs:
           sudo /usr/bin/python3 -I tools/build-rescue/verify-shipping-binary.py \
             "$preflight_dir/kernaid-linux-storage-health"
           sudo /usr/bin/python3 -I tools/build-rescue/verify-shipping-binary.py \
+            "$preflight_dir/kernaid-linux-filesystem-health"
+          sudo /usr/bin/python3 -I tools/build-rescue/verify-shipping-binary.py \
             "$preflight_dir/kernaid-rescue-codex"
           sudo /usr/bin/python3 -I tools/build-rescue/verify-shipping-binary.py \
             "$preflight_dir/kernaid-codex-auth"
@@ -292,6 +299,7 @@ jobs:
             -e KERNAID_RESCUE_OPENAI_EXECUTOR_BINARY=/workspace/target/release/kernaid-rescue-openai-executor \
             -e KERNAID_LINUX_HARDWARE_INVENTORY_BINARY=/workspace/target/release/kernaid-linux-hardware-inventory \
             -e KERNAID_LINUX_STORAGE_HEALTH_BINARY=/workspace/target/release/kernaid-linux-storage-health \
+            -e KERNAID_LINUX_FILESYSTEM_HEALTH_BINARY=/workspace/target/release/kernaid-linux-filesystem-health \
             -e KERNAID_RESCUE_CODEX_BRIDGE_BINARY=/workspace/target/release/kernaid-rescue-codex \
             -e KERNAID_RESCUE_CODEX_CLIENT_BINARY=/workspace/target/release/kernaid-codex-auth \
             -e KERNAID_RESCUE_CODEX_CLI_BINARY=/opt/kernaid-codex-root/usr/lib/kernaid/codex \

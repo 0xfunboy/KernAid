@@ -1,0 +1,1 @@
+{"schemaVersion":"1.0","kind":"linux-filesystem-health","targetRef":"disk-1/volume-1","filesystem":"ext4","state":"healthy","checkMode":"e2fsck-read-only","mountedAtCheck":false,"finding":null,"fileName":"private.txt"}

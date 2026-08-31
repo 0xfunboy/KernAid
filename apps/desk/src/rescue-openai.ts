@@ -20,6 +20,13 @@ import {
   storageHealthEvidenceSummary,
   type LinuxStorageHealthSnapshot,
 } from "./storage-health";
+import {
+  LINUX_FILESYSTEM_HEALTH_COLLECTOR,
+  augmentDiagnosisWithFilesystemHealth,
+  filesystemHealthEvidenceSummary,
+  parseLinuxFilesystemHealth,
+  type LinuxFilesystemHealthSnapshot,
+} from "./filesystem-health";
 
 const API_VERSION = "kernaid.dev/rescue-openai/v1alpha1";
 const ENDPOINT = "/api/rescue/provider/openai";
@@ -230,6 +237,10 @@ interface PreparedRescueEvidence {
     evidenceId: string;
     snapshot: LinuxStorageHealthSnapshot;
   };
+  filesystem?: {
+    evidenceId: string;
+    snapshot: LinuxFilesystemHealthSnapshot;
+  };
 }
 
 export async function getRescueOpenAiStatus(
@@ -355,12 +366,20 @@ export class RescueOpenAiProvider implements Provider {
       )
     )
       throw providerError("invalid_response");
-    return prepared.storage === undefined
-      ? proposal
-      : augmentDiagnosisWithStorageHealth(
-          proposal,
-          prepared.storage.snapshot,
-          prepared.storage.evidenceId,
+    const storageBound =
+      prepared.storage === undefined
+        ? proposal
+        : augmentDiagnosisWithStorageHealth(
+            proposal,
+            prepared.storage.snapshot,
+            prepared.storage.evidenceId,
+          );
+    return prepared.filesystem === undefined
+      ? storageBound
+      : augmentDiagnosisWithFilesystemHealth(
+          storageBound,
+          prepared.filesystem.snapshot,
+          prepared.filesystem.evidenceId,
         );
   }
 }
@@ -445,13 +464,22 @@ async function prepareEvidence(
   const storageEvidence = evidence.filter(
     (item) => item.evidence.collector === LINUX_STORAGE_HEALTH_COLLECTOR,
   );
+  const filesystemEvidence = evidence.filter(
+    (item) => item.evidence.collector === LINUX_FILESYSTEM_HEALTH_COLLECTOR,
+  );
   const providerEvidence = evidence.filter(
-    (item) => item.evidence.collector !== LINUX_STORAGE_HEALTH_COLLECTOR,
+    (item) =>
+      item.evidence.collector !== LINUX_STORAGE_HEALTH_COLLECTOR &&
+      item.evidence.collector !== LINUX_FILESYSTEM_HEALTH_COLLECTOR,
   );
   if (
     providerEvidence.length !== 1 ||
     storageEvidence.length > 1 ||
-    evidence.length !== providerEvidence.length + storageEvidence.length
+    filesystemEvidence.length > 1 ||
+    evidence.length !==
+      providerEvidence.length +
+        storageEvidence.length +
+        filesystemEvidence.length
   )
     throw providerError("invalid_request");
   const observed = providerEvidence[0];
@@ -525,6 +553,37 @@ async function prepareEvidence(
       throw providerError("invalid_request");
     storage = { evidenceId: observedStorage.evidence.id, snapshot };
   }
+  let filesystem: PreparedRescueEvidence["filesystem"];
+  if (filesystemEvidence.length === 1) {
+    const observedFilesystem = filesystemEvidence[0]!;
+    if (
+      observedFilesystem.evidence.schemaVersion !== "1.0" ||
+      !EVIDENCE_ID.test(observedFilesystem.evidence.id) ||
+      observedFilesystem.evidence.target !== RESCUE_TARGET ||
+      observedFilesystem.evidence.contentType !== "application/json" ||
+      observedFilesystem.evidence.trust !== "observed-untrusted" ||
+      !boundedNonemptyUtf8(
+        observedFilesystem.content,
+        MAX_EVIDENCE_CONTENT_BYTES,
+      )
+    )
+      throw providerError("invalid_request");
+    let snapshot: LinuxFilesystemHealthSnapshot;
+    try {
+      snapshot = parseLinuxFilesystemHealth(observedFilesystem.content);
+    } catch {
+      throw providerError("invalid_request");
+    }
+    if (
+      observedFilesystem.evidence.summary !==
+      filesystemHealthEvidenceSummary(snapshot)
+    )
+      throw providerError("invalid_request");
+    filesystem = {
+      evidenceId: observedFilesystem.evidence.id,
+      snapshot,
+    };
+  }
   return {
     providerEvidence: {
       schemaVersion: "1.0",
@@ -537,6 +596,7 @@ async function prepareEvidence(
       content: observed.content,
     },
     storage,
+    filesystem,
   };
 }
 

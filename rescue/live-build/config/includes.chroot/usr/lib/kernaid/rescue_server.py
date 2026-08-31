@@ -278,6 +278,7 @@ TARGET_ID_SCOPE = (
 OFFLINE_HELPER_SOCKET = "/run/kernaid-offline-inspector.sock"
 OFFLINE_HELPER_ENABLED = os.environ.get("KERNAID_PRIVILEGED_INSPECTOR") == "1"
 OFFLINE_HELPER_TIMEOUT_SECONDS = 20
+FILESYSTEM_HEALTH_HELPER_TIMEOUT_SECONDS = 36
 MAX_OFFLINE_HELPER_RESPONSE_BYTES = 64 * 1024
 OFFLINE_INSPECTION_CLAIM_FIELDS = {
     "installedOsConfirmed",
@@ -1600,7 +1601,13 @@ def _validate_helper_error(value: object) -> dict[str, object]:
 def _privileged_helper_call(
     operation: str, request: dict[str, object] | None = None
 ) -> object:
-    if operation not in {"inspect", "scan", "select", "storage-health"}:
+    if operation not in {
+        "inspect",
+        "scan",
+        "select",
+        "storage-health",
+        "filesystem-health",
+    }:
         raise BrokerError("Operazione dell'ispettore privilegiato non valida.")
     frame: dict[str, object] = {"operation": operation}
     if request is not None:
@@ -1612,7 +1619,11 @@ def _privileged_helper_call(
         raise BrokerError("Richiesta all'ispettore privilegiato oltre il limite.")
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-            connection.settimeout(OFFLINE_HELPER_TIMEOUT_SECONDS)
+            connection.settimeout(
+                FILESYSTEM_HEALTH_HELPER_TIMEOUT_SECONDS
+                if operation == "filesystem-health"
+                else OFFLINE_HELPER_TIMEOUT_SECONDS
+            )
             connection.connect(OFFLINE_HELPER_SOCKET)
             connection.sendall(encoded)
             connection.shutdown(socket.SHUT_WR)
@@ -2935,6 +2946,33 @@ def inspect_installed_target(request: dict[str, object]) -> dict[str, object]:
     return result
 
 
+def inspect_filesystem_health(request: dict[str, object]) -> dict[str, object]:
+    if (
+        set(request) != {"scanFingerprint", "targetId"}
+        or not _valid_ephemeral_id(request.get("scanFingerprint"), "scan")
+        or not _valid_ephemeral_id(request.get("targetId"), "target")
+    ):
+        raise TargetSelectionError(
+            "Richiesta di diagnostica filesystem non valida.", status=400
+        )
+    result = _privileged_helper_call("filesystem-health", request)
+    if not isinstance(result, dict):
+        raise BrokerError("Risposta privilegiata filesystem non valida.")
+    ordered_keys = (
+        "schemaVersion",
+        "kind",
+        "targetRef",
+        "filesystem",
+        "state",
+        "checkMode",
+        "mountedAtCheck",
+        "finding",
+    )
+    if set(result) != set(ordered_keys):
+        raise BrokerError("Risposta privilegiata filesystem non valida.")
+    return {key: result[key] for key in ordered_keys}
+
+
 def is_identity_observation(collector: str) -> bool:
     return (
         "hostname" in collector
@@ -3812,6 +3850,7 @@ class RescueHandler(SimpleHTTPRequestHandler):
                 return
         if self.path not in {
             "/api/authorize-observe",
+            "/api/rescue/filesystem-health",
             "/api/rescue/inspect-installed-target",
             "/api/rescue/provider/openai",
             "/api/rescue/select-installed-target",
@@ -3827,6 +3866,11 @@ class RescueHandler(SimpleHTTPRequestHandler):
                 return
             content_types = self.headers.get_all("Content-Type", [])
             if content_types != ["application/json"]:
+                self.send_error(415)
+                return
+        elif self.path == "/api/rescue/filesystem-health":
+            self._arm_request_deadline(38)
+            if self.headers.get_content_type() != "application/json":
                 self.send_error(415)
                 return
         elif self.headers.get_content_type() != "application/json":
@@ -3905,6 +3949,12 @@ class RescueHandler(SimpleHTTPRequestHandler):
                     inspect_installed_target(request),
                     ensure_ascii=True,
                     sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            elif self.path == "/api/rescue/filesystem-health":
+                body = json.dumps(
+                    inspect_filesystem_health(request),
+                    ensure_ascii=True,
                     separators=(",", ":"),
                 ).encode()
             else:
