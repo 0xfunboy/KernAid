@@ -1005,6 +1005,13 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
         self.assertFalse(tamper.huge_device_matches(huge_encoded + 1, device))
         self.assertEqual(tamper.LOOP_INFO64.size, 232)
 
+    def test_backup_tamper_targets_the_isolated_vault_root_namespace(self) -> None:
+        self.assertEqual(
+            tamper.BACKUP_DIRECTORY,
+            "/.kernaid-repair-store-v1/backups",
+        )
+        self.assertNotIn(".kernaid-secure-state-v1", tamper.BACKUP_DIRECTORY)
+
     def test_backup_tamper_parses_canonical_debugfs_inode_sizes(self) -> None:
         ubuntu_2404 = (
             b"Inode: 15   Type: regular    Mode:  0644\n"

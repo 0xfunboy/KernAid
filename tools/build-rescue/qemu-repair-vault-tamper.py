@@ -27,9 +27,7 @@ from pathlib import Path
 MEDIA_BYTES = 32_000_000_000
 P3_OFFSET = 17_179_869_184
 P3_BYTES = 8_589_934_592
-BACKUP_DIRECTORY = (
-    "/.kernaid-secure-state-v1/.kernaid-repair-store-v1/backups"
-)
+BACKUP_DIRECTORY = "/.kernaid-repair-store-v1/backups"
 BACKUP_NAME = re.compile(r"backup-B-[0-9a-f]{32}")
 DEBUGFS_INODE_SIZE = re.compile(
     rb"(?:^|\n)(?:"
