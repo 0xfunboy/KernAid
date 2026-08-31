@@ -71,6 +71,17 @@ upload or arbitrary metadata API.
 - The service receipt private key is loaded from an owner-only PKCS#8 DER file.
   Its matching raw public anchor is loaded separately, verified at startup and
   pinned in SQLite by digest. Key mismatch or unplanned rotation fails closed.
+- Tenant operators may queue only the closed work-order catalog. Current v1
+  IDs are the read-only Linux filesystem/storage health collectors and the
+  off-default Rescue fstab R2 candidate. Fleet stores no command, argument,
+  path, diagnostic payload or result body.
+- Every order is tenant/device bound and admitted only while an applicable
+  signed policy and device entitlement permit it. Write orders require a
+  separate tenant-admin approval before delivery. Device claims/results are
+  Ed25519 signed, nonce/replay safe, leased, expiry bounded and acknowledged by
+  the existing signed service receipt. The delivered approval is organizational
+  proof only: Core/broker still require a fresh local approval, backup,
+  verification and rollback before any write.
 
 ## API
 
@@ -94,6 +105,8 @@ and is bounded to 64 KiB, matching the Rust verifier.
 | `POST` | `/v1/policy-pulls`                                              | Signed device request  | Return only applicable signed bundles        |
 | `POST` | `/v1/entitlement-pulls`                                         | Signed device request  | Return assigned signed entitlements          |
 | `POST` | `/v1/update-pulls`                                              | Signed device request  | Return applicable vendor-signed manifests    |
+| `POST` | `/v1/work-order-claims`                                         | Signed device request  | Lease one eligible typed order               |
+| `POST` | `/v1/work-order-results`                                        | Signed device result   | Commit a digest-only terminal result         |
 | `POST` | `/v1/tenants/:tenantId/policy-trust-anchor`                     | Admin                  | Set tenant Ed25519 public anchor once        |
 | `POST` | `/v1/tenants/:tenantId/policies`                                | Admin                  | Verify and publish a pre-signed bundle       |
 | `POST` | `/v1/tenants/:tenantId/entitlements`                            | Admin                  | Verify/publish offline-signed entitlement    |
@@ -105,6 +118,11 @@ and is bounded to 64 KiB, matching the Rust verifier.
 | `GET`  | `/v1/tenants/:tenantId/devices`                                 | Operator or admin      | `{ items: [...] }` device registry           |
 | `GET`  | `/v1/tenants/:tenantId/assets`                                  | Operator or admin      | `{ items: [...] }` latest aggregate assets   |
 | `GET`  | `/v1/tenants/:tenantId/audit-events`                            | Operator or admin      | Bounded `{ items: [...] }` digest-only audit |
+| `GET`  | `/v1/tenants/:tenantId/work-orders`                             | Operator or admin      | Bounded work-order state                     |
+| `POST` | `/v1/tenants/:tenantId/work-orders`                             | Operator or admin      | Queue one typed action                       |
+| `POST` | `/v1/tenants/:tenantId/work-orders/:workOrderId/approve`        | Admin                  | Explicitly approve one write intent          |
+| `POST` | `/v1/tenants/:tenantId/work-orders/:workOrderId/cancel`         | Operator or admin      | Cancel an unleased order                     |
+| `GET`  | `/v1/tenants/:tenantId/work-order-events`                       | Operator or admin      | Digest-only transition audit                 |
 | `POST` | `/v1/tenants/:tenantId/devices/:deviceId/revoke`                | Operator or admin      | Permanently revoke ingestion                 |
 
 Tenant creation takes an exact empty object. Enrollment-token creation takes:
@@ -151,10 +169,31 @@ device's vendor-signature verification, durable checkpoint, entitlement,
 policy and inactive-target staging gates. Fleet never downloads artifacts or
 activates a boot target.
 
-The three tenant governance GET routes return only bounded operational
+Tenant governance GET routes return only bounded operational
 metadata needed by the console: IDs, revisions/sequences, assignment counts,
 capability names, target/ring and validity windows. They omit signatures,
 public keys, artifact descriptors and stored canonical document bytes.
+
+## Work-order operator flow
+
+1. Publish a currently valid tenant policy that assigns the target device and
+   explicitly allows a catalog action. Publish a current, non-revoked
+   entitlement assigning that device (`fleet`, plus `enterprise_repair` for a
+   write).
+2. An operator creates an exact request containing only `requestId`,
+   `targetDeviceId`, `actionId`, `actionVersion` and an RFC3339 `expiresAt`
+   no more than seven days ahead. Reusing `requestId` with different content
+   fails.
+3. Diagnosis orders queue immediately. Repair orders remain
+   `pending_approval` until an admin posts `{ "decision": "approve" }`.
+4. The enrolled device submits a signed claim with a 30-900 second lease. An
+   exact retry returns the retained body and receipt; nonce rebinding fails.
+5. The device re-verifies the receipt, policy, entitlement, local capability
+   and (for writes) a fresh local Core approval bound to the actual plan and
+   target. Fleet itself never executes the action.
+6. The device returns only a signed terminal outcome and `resultSha256`.
+   Operators inspect the immutable transition audit; raw evidence follows the
+   separate evidence/privacy flow, never this API.
 
 ## Run locally
 
@@ -262,6 +301,7 @@ secrets, policy assignment isolation, policy rollback/conflict, restart
 persistence, entitlement assignment/replay/tamper/rollback/revocation, update
 target/ring filtering, update anti-rollback/replay, exact signed service
 receipts, receipt key/anchor mismatch, durable receipt sequence, SQLite
-v3-to-v7 migration, tenant role enforcement, credential revocation,
+v3-to-v8 migration, tenant role enforcement, credential revocation,
+work-order catalog/governance/approval/signature/replay/expiry/restart,
 cross-tenant denial, authorization audit/restart and optional same-origin
 console serving.

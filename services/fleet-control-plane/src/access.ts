@@ -19,11 +19,17 @@ export const tenantAccessActions = [
   "policy_trust_anchor.set",
   "update.list",
   "update.publish",
+  "work_order.approve",
+  "work_order.cancel",
+  "work_order.create",
+  "work_order.list",
+  "work_order_audit.list",
 ] as const;
 export type TenantAccessAction = (typeof tenantAccessActions)[number];
 
 export type TenantAccessOutcome = "allowed" | "denied";
-export type TenantAccessTargetType = "credential" | "device" | "tenant";
+export type TenantAccessTargetType =
+  "credential" | "device" | "tenant" | "work_order";
 
 export function tenantRoleAllows(
   actual: TenantRole,

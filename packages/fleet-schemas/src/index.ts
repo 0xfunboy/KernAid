@@ -7,3 +7,4 @@ export * from "./policy.js";
 export * from "./service-receipt.js";
 export * from "./update.js";
 export * from "./validation.js";
+export * from "./work-order.js";
