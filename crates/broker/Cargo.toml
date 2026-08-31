@@ -40,6 +40,11 @@ rescue-crypttab-production-candidate = [
     "kernaid-core/rescue-crypttab-production-candidate",
     "kernaid-linux-pack/rescue-crypttab-production-candidate",
 ]
+rescue-ext4-fsck-production-candidate = [
+    "rescue-fstab-production-candidate",
+    "dep:sha2",
+    "dep:zeroize",
+]
 repair-vault-client = [
     "dep:rustix",
     "dep:sha2",

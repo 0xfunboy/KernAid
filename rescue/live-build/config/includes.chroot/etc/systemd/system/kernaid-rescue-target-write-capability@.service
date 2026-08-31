@@ -8,13 +8,15 @@ ConditionKernelCommandLine=boot=live
 ConditionKernelCommandLine=kernaid.repair=fstab-v1
 ConditionPathExists=/usr/lib/kernaid/repair-candidate-image-v1
 ConditionPathExists=/run/kernaid-offline-inspector/target-id.key
+ConditionFileIsExecutable=/usr/sbin/e2fsck
+ConditionFileIsExecutable=/usr/sbin/e2undo
 
 [Service]
 Type=simple
 ExecStart=/usr/bin/python3 -I -B /usr/lib/kernaid/repair_target_handoff.py
 Environment=KERNAID_TARGET_HANDOFF_PROFILE=write
 Environment=KERNAID_TARGET_ID_KEY_FILE=/run/kernaid-offline-inspector/target-id.key
-RuntimeMaxSec=90s
+RuntimeMaxSec=210s
 TimeoutStartSec=5s
 TimeoutStopSec=2s
 Restart=no
@@ -46,6 +48,7 @@ ProtectHostname=yes
 ProtectProc=invisible
 ProcSubset=pid
 ReadOnlyPaths=/run /dev
+ReadWritePaths=/run/lock/kernaid-repair
 DevicePolicy=closed
 DeviceAllow=block-* rw
 CapabilityBoundingSet=CAP_SYS_ADMIN

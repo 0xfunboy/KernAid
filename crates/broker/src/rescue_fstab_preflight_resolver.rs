@@ -24,7 +24,10 @@ use kernaid_linux_pack::{
 };
 #[cfg(feature = "rescue-crypttab-production-candidate")]
 use kernaid_protocol::rescue_crypttab_repair::RescueCrypttabPrepareRequest;
-#[cfg(feature = "rescue-crypttab-production-candidate")]
+#[cfg(any(
+    feature = "rescue-crypttab-production-candidate",
+    feature = "rescue-ext4-fsck-production-candidate"
+))]
 use kernaid_protocol::rescue_repair_vault::RepairFileMetadataV1;
 use kernaid_protocol::{
     rescue_repair::{RescueFstabPreflightIntent, RescueFstabPrepareRequest},
@@ -193,14 +196,35 @@ pub(crate) fn acquire_crypttab_target_guard(
     request: &RescueCrypttabPrepareRequest,
     deadline: Instant,
 ) -> Result<ProductionRescueFstabTargetGuard, RescueFstabCapabilityResolutionError> {
-    ensure_deadline(deadline)?;
-    let request_id = RequestId::parse(request.request_id())
-        .map_err(|_| RescueFstabCapabilityResolutionError::Unavailable)?;
-    let capability = acquire_rescue_target_capability(
-        &request_id,
+    acquire_target_guard_for_resource(
+        request.request_id(),
         request.scan_fingerprint(),
         request.target_fingerprint(),
         request.target_id(),
+        RepairResourceV1::Crypttab,
+        deadline,
+    )
+}
+
+/// Acquires the existing closed target bundle while selecting only a compiled
+/// repair lock domain. This is shared by crypttab and ext4; callers cannot
+/// supply a resource string or device pathname.
+pub(crate) fn acquire_target_guard_for_resource(
+    request_id: &str,
+    scan_fingerprint: &str,
+    target_fingerprint: &str,
+    target_id: &str,
+    resource: RepairResourceV1,
+    deadline: Instant,
+) -> Result<ProductionRescueFstabTargetGuard, RescueFstabCapabilityResolutionError> {
+    ensure_deadline(deadline)?;
+    let request_id = RequestId::parse(request_id)
+        .map_err(|_| RescueFstabCapabilityResolutionError::Unavailable)?;
+    let capability = acquire_rescue_target_capability(
+        &request_id,
+        scan_fingerprint,
+        target_fingerprint,
+        target_id,
         deadline,
     )
     .map_err(map_target_client_error)?;
@@ -209,18 +233,16 @@ pub(crate) fn acquire_crypttab_target_guard(
         .map_err(map_physical_parent_error)?;
     ensure_deadline(deadline)?;
     let claims = target.target_claims();
-    if claims.scan_fingerprint() != request.scan_fingerprint()
-        || claims.target_fingerprint() != request.target_fingerprint()
-        || claims.target_id() != request.target_id()
-        || claims.request_id() != request.request_id()
+    target.revalidate().map_err(map_physical_parent_error)?;
+    if claims.scan_fingerprint() != scan_fingerprint
+        || claims.target_fingerprint() != target_fingerprint
+        || claims.target_id() != target_id
+        || claims.request_id() != request_id.as_str()
     {
         return Err(RescueFstabCapabilityResolutionError::IdentityChanged);
     }
-    target.revalidate().map_err(map_physical_parent_error)?;
-    let lock_identity = canonical_repair_lock_identity_for_resource(
-        claims.recovery_fingerprint(),
-        RepairResourceV1::Crypttab,
-    );
+    let lock_identity =
+        canonical_repair_lock_identity_for_resource(claims.recovery_fingerprint(), resource);
     Ok(ProductionRescueFstabTargetGuard {
         target,
         lock_identity,
@@ -237,15 +259,41 @@ pub(crate) fn reserve_crypttab_backup(
     metadata: &RepairFileMetadataV1,
     deadline: Instant,
 ) -> Result<ProductionRescueFstabVaultReservation, RescueFstabCapabilityResolutionError> {
+    reserve_evidence_backup(
+        request.session_id(),
+        request.target_id(),
+        request.scan_fingerprint(),
+        request.target_fingerprint(),
+        target_guard,
+        backup,
+        metadata,
+        deadline,
+    )
+}
+
+/// Reserves one authenticated, physically distinct, bounded evidence object.
+/// The target remains descriptor-bound and is revalidated before and after
+/// the Vault mutation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn reserve_evidence_backup(
+    session_id: &str,
+    target_id: &str,
+    scan_fingerprint: &str,
+    target_fingerprint: &str,
+    target_guard: &ProductionRescueFstabTargetGuard,
+    backup: &[u8],
+    metadata: &RepairFileMetadataV1,
+    deadline: Instant,
+) -> Result<ProductionRescueFstabVaultReservation, RescueFstabCapabilityResolutionError> {
     ensure_deadline(deadline)?;
     target_guard
         .target
         .revalidate()
         .map_err(map_physical_parent_error)?;
     let claims = target_guard.target.target_claims();
-    if claims.scan_fingerprint() != request.scan_fingerprint()
-        || claims.target_fingerprint() != request.target_fingerprint()
-        || claims.target_id() != request.target_id()
+    if claims.scan_fingerprint() != scan_fingerprint
+        || claims.target_fingerprint() != target_fingerprint
+        || claims.target_id() != target_id
         || backup.is_empty()
     {
         return Err(RescueFstabCapabilityResolutionError::IdentityChanged);
@@ -255,9 +303,9 @@ pub(crate) fn reserve_crypttab_backup(
     let required_capacity =
         bounded_capacity(backup_size).ok_or(RescueFstabCapabilityResolutionError::Unavailable)?;
     let draft = RepairBackupDraft::new(
-        request.session_id(),
-        request.target_id(),
-        parse_prefixed_sha256(request.target_fingerprint())?,
+        session_id,
+        target_id,
+        parse_prefixed_sha256(target_fingerprint)?,
         claims.recovery_fingerprint(),
         raw_digest(backup),
         metadata.canonical_sha256(),

@@ -21,15 +21,16 @@ drains; raw output is discarded. The canonical result contains only the
 normalized target reference, filesystem family, check mode, mounted flag, one
 of `healthy`, `degraded`, `repair-required`, or `unsupported`, and an optional
 fixed finding. It cannot contain paths, file names, user content, or raw tool
-text.
+text. The stable product has no filesystem write executor. A separate private,
+off-default ext4 candidate is documented in
+[Rescue ext4 repair v1](rescue-ext4-repair-v1.md).
 
 The privileged Rescue helper reacquires and compares the selected target both
 before and after execution. Its HTTP route returns only the validated canonical
 document. Desk includes that observation in local diagnosis and reports, but
 does not send it to an OpenAI provider; any provider proposal is augmented
 locally with the deterministic finding. A repair-required result recommends a
-backup and an explicit OS-native repair workflow. This action pack has no
-write executor and does not claim to repair a filesystem.
+backup and an explicit OS-native repair workflow in every stable build.
 
 The Rescue build stages the same verified binary used by Resident and includes
 `e2fsprogs` and `ntfs-3g`. The ready gate requires a valid normalized live-root

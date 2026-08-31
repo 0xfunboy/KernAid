@@ -5,6 +5,11 @@
 //! discovered boot-local target and can never submit a pathname, device name,
 //! action identifier, command, observed bytes, or replacement bytes.
 
+#[cfg(feature = "rescue-ext4-fsck-production-candidate")]
+use crate::rescue_ext4_fsck_candidate::{
+    ACTION_ID as EXT4_ACTION_ID, PREPARED_KIND as EXT4_PREPARED_KIND,
+    RESOURCE_ID as EXT4_RESOURCE_ID, TYPED_CONFIRMATION as EXT4_TYPED_CONFIRMATION,
+};
 use crate::rescue_repair_service_engine::RescueFstabRollbackBackend;
 use kernaid_core::RESCUE_FSTAB_TYPED_CONFIRMATION;
 #[cfg(feature = "rescue-crypttab-production-candidate")]
@@ -35,9 +40,14 @@ pub const REPAIR_SERVICE_MAX_FRAME_BYTES: usize = 4096;
 // first durable Vault reservation. Slow USB media and the TCG qualification
 // must retain useful time for both while the operation remains bounded.
 const PREPARE_TIMEOUT: Duration = Duration::from_secs(150);
-const EXECUTE_TIMEOUT: Duration = Duration::from_secs(150);
+// The off-default ext4 action reserves a bounded same-boot e2undo window in
+// the root helper and still leaves the broker's 30-second Vault cleanup
+// budget. Config-file repairs normally complete well inside this ceiling.
+const EXECUTE_TIMEOUT: Duration = Duration::from_secs(240);
 const CANCEL_TIMEOUT: Duration = Duration::from_secs(15);
 const RISK_ID: &str = "R2";
+#[cfg(feature = "rescue-ext4-fsck-production-candidate")]
+const EXT4_RISK_ID: &str = "R3";
 const ROLLBACK_ACTION_ID: &str = "linux.fstab.restore";
 const ROLLBACK_CONFIRMATION: &str = "RIPRISTINA FSTAB ORIGINALE";
 
@@ -46,6 +56,8 @@ pub enum RepairCandidateKind {
     Fstab,
     #[cfg(feature = "rescue-crypttab-production-candidate")]
     Crypttab,
+    #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
+    Ext4Fsck,
 }
 
 impl RepairCandidateKind {
@@ -54,6 +66,8 @@ impl RepairCandidateKind {
             Self::Fstab => RESOURCE_ID,
             #[cfg(feature = "rescue-crypttab-production-candidate")]
             Self::Crypttab => CRYPTTAB_RESOURCE_ID,
+            #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
+            Self::Ext4Fsck => EXT4_RESOURCE_ID,
         }
     }
 
@@ -62,6 +76,8 @@ impl RepairCandidateKind {
             Self::Fstab => RepairResourceV1::Fstab,
             #[cfg(feature = "rescue-crypttab-production-candidate")]
             Self::Crypttab => RepairResourceV1::Crypttab,
+            #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
+            Self::Ext4Fsck => RepairResourceV1::Ext4Filesystem,
         }
     }
 
@@ -70,6 +86,8 @@ impl RepairCandidateKind {
             Self::Fstab => "fstab-rollback-prepared",
             #[cfg(feature = "rescue-crypttab-production-candidate")]
             Self::Crypttab => "crypttab-rollback-prepared",
+            #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
+            Self::Ext4Fsck => "ext4-fsck-rollback-unavailable",
         }
     }
 
@@ -82,6 +100,8 @@ impl RepairCandidateKind {
             Self::Fstab => ROLLBACK_CONFIRMATION,
             #[cfg(feature = "rescue-crypttab-production-candidate")]
             Self::Crypttab => RESCUE_CRYPTTAB_ROLLBACK_TYPED_CONFIRMATION,
+            #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
+            Self::Ext4Fsck => "EXT4 SAME-BOOT ROLLBACK IS NOT EXPOSED",
         }
     }
 
@@ -90,6 +110,8 @@ impl RepairCandidateKind {
             RESOURCE_ID => Some(Self::Fstab),
             #[cfg(feature = "rescue-crypttab-production-candidate")]
             CRYPTTAB_RESOURCE_ID => Some(Self::Crypttab),
+            #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
+            EXT4_RESOURCE_ID => Some(Self::Ext4Fsck),
             _ => None,
         }
     }
@@ -104,8 +126,18 @@ fn repair_contract(resource_id: &str) -> Option<(&'static str, &'static str, &'s
             CRYPTTAB_ACTION_ID,
             RESCUE_CRYPTTAB_TYPED_CONFIRMATION,
         )),
+        #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
+        EXT4_RESOURCE_ID => Some((EXT4_PREPARED_KIND, EXT4_ACTION_ID, EXT4_TYPED_CONFIRMATION)),
         _ => None,
     }
+}
+
+fn repair_risk(resource_id: &str) -> &'static str {
+    #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
+    if resource_id == EXT4_RESOURCE_ID {
+        return EXT4_RISK_ID;
+    }
+    RISK_ID
 }
 
 fn rollback_contract(resource_id: &str) -> Option<(&'static str, &'static str, &'static str)> {
@@ -220,6 +252,15 @@ pub enum RepairServiceRequest {
         request_id: String,
         target: RepairTargetSelector,
     },
+    #[serde(rename = "repair.ext4.prepare")]
+    #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
+    Ext4Prepare {
+        #[serde(rename = "apiVersion")]
+        api_version: String,
+        #[serde(rename = "requestId")]
+        request_id: String,
+        target: RepairTargetSelector,
+    },
     #[serde(rename = "repair.fstab.approve")]
     Approve {
         #[serde(rename = "apiVersion")]
@@ -263,6 +304,28 @@ pub enum RepairServiceRequest {
         #[serde(rename = "typedConfirmation")]
         typed_confirmation: String,
     },
+    #[serde(rename = "repair.ext4.approve")]
+    #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
+    Ext4Approve {
+        #[serde(rename = "apiVersion")]
+        api_version: String,
+        #[serde(rename = "requestId")]
+        request_id: String,
+        #[serde(rename = "preparedId")]
+        prepared_id: String,
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        #[serde(rename = "planId")]
+        plan_id: String,
+        #[serde(rename = "planHash")]
+        plan_hash: String,
+        #[serde(rename = "approvalId")]
+        approval_id: String,
+        #[serde(rename = "approvalSequence")]
+        approval_sequence: u64,
+        #[serde(rename = "typedConfirmation")]
+        typed_confirmation: String,
+    },
     #[serde(rename = "repair.fstab.cancel")]
     Cancel {
         #[serde(rename = "apiVersion")]
@@ -277,6 +340,18 @@ pub enum RepairServiceRequest {
     #[serde(rename = "repair.crypttab.cancel")]
     #[cfg(feature = "rescue-crypttab-production-candidate")]
     CrypttabCancel {
+        #[serde(rename = "apiVersion")]
+        api_version: String,
+        #[serde(rename = "requestId")]
+        request_id: String,
+        #[serde(rename = "preparedId")]
+        prepared_id: String,
+        #[serde(rename = "planHash")]
+        plan_hash: String,
+    },
+    #[serde(rename = "repair.ext4.cancel")]
+    #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
+    Ext4Cancel {
         #[serde(rename = "apiVersion")]
         api_version: String,
         #[serde(rename = "requestId")]
@@ -405,12 +480,18 @@ impl RepairServiceRequest {
             Self::Prepare { .. } => "repair.fstab.prepare",
             #[cfg(feature = "rescue-crypttab-production-candidate")]
             Self::CrypttabPrepare { .. } => "repair.crypttab.prepare",
+            #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
+            Self::Ext4Prepare { .. } => "repair.ext4.prepare",
             Self::Approve { .. } => "repair.fstab.approve",
             #[cfg(feature = "rescue-crypttab-production-candidate")]
             Self::CrypttabApprove { .. } => "repair.crypttab.approve",
+            #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
+            Self::Ext4Approve { .. } => "repair.ext4.approve",
             Self::Cancel { .. } => "repair.fstab.cancel",
             #[cfg(feature = "rescue-crypttab-production-candidate")]
             Self::CrypttabCancel { .. } => "repair.crypttab.cancel",
+            #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
+            Self::Ext4Cancel { .. } => "repair.ext4.cancel",
             Self::RollbackStatus { .. } => "repair.fstab.rollback.status",
             Self::RollbackPrepare { .. } => "repair.fstab.rollback.prepare",
             Self::RollbackApprove { .. } => "repair.fstab.rollback.approve",
@@ -444,6 +525,10 @@ impl RepairServiceRequest {
             | Self::CrypttabRollbackPrepare { api_version, .. }
             | Self::CrypttabRollbackApprove { api_version, .. }
             | Self::CrypttabRollbackCancel { api_version, .. } => api_version,
+            #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
+            Self::Ext4Prepare { api_version, .. }
+            | Self::Ext4Approve { api_version, .. }
+            | Self::Ext4Cancel { api_version, .. } => api_version,
         }
     }
 
@@ -465,6 +550,10 @@ impl RepairServiceRequest {
             | Self::CrypttabRollbackPrepare { request_id, .. }
             | Self::CrypttabRollbackApprove { request_id, .. }
             | Self::CrypttabRollbackCancel { request_id, .. } => request_id,
+            #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
+            Self::Ext4Prepare { request_id, .. }
+            | Self::Ext4Approve { request_id, .. }
+            | Self::Ext4Cancel { request_id, .. } => request_id,
         }
     }
 
@@ -478,6 +567,10 @@ impl RepairServiceRequest {
             Self::CrypttabPrepare { .. }
             | Self::CrypttabApprove { .. }
             | Self::CrypttabCancel { .. } => REPAIR_SERVICE_API_VERSION,
+            #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
+            Self::Ext4Prepare { .. } | Self::Ext4Approve { .. } | Self::Ext4Cancel { .. } => {
+                REPAIR_SERVICE_API_VERSION
+            }
             Self::RollbackStatus { .. }
             | Self::RollbackPrepare { .. }
             | Self::RollbackApprove { .. }
@@ -496,6 +589,8 @@ impl RepairServiceRequest {
             Self::Prepare { target, .. } => target.validate(),
             #[cfg(feature = "rescue-crypttab-production-candidate")]
             Self::CrypttabPrepare { target, .. } => target.validate(),
+            #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
+            Self::Ext4Prepare { target, .. } => target.validate(),
             Self::Approve {
                 prepared_id,
                 session_id,
@@ -541,6 +636,29 @@ impl RepairServiceRequest {
                 }
                 Ok(())
             }
+            #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
+            Self::Ext4Approve {
+                prepared_id,
+                session_id,
+                plan_id,
+                plan_hash,
+                approval_id,
+                approval_sequence,
+                typed_confirmation,
+                ..
+            } => {
+                if !valid_fixed_id(prepared_id, "Q-")
+                    || !valid_fixed_id(session_id, "S-")
+                    || !valid_fixed_id(plan_id, "P-")
+                    || !valid_prefixed_hash(plan_hash, "sha256:")
+                    || !valid_fixed_id(approval_id, "A-")
+                    || *approval_sequence != 1
+                    || typed_confirmation != EXT4_TYPED_CONFIRMATION
+                {
+                    return Err(RepairServiceErrorToken::InvalidRequest);
+                }
+                Ok(())
+            }
             Self::Cancel {
                 prepared_id,
                 plan_hash,
@@ -554,6 +672,18 @@ impl RepairServiceRequest {
             }
             #[cfg(feature = "rescue-crypttab-production-candidate")]
             Self::CrypttabCancel {
+                prepared_id,
+                plan_hash,
+                ..
+            } => {
+                if !valid_fixed_id(prepared_id, "Q-") || !valid_prefixed_hash(plan_hash, "sha256:")
+                {
+                    return Err(RepairServiceErrorToken::InvalidRequest);
+                }
+                Ok(())
+            }
+            #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
+            Self::Ext4Cancel {
                 prepared_id,
                 plan_hash,
                 ..
@@ -1298,7 +1428,7 @@ impl PreparedSummary {
             resource_id: self.descriptor.resource_id.clone(),
             backup_locator: self.descriptor.backup_locator.clone(),
             action_id,
-            risk: RISK_ID,
+            risk: repair_risk(&self.descriptor.resource_id),
             backup: PreparedBackupDetail {
                 state: "reserved",
                 vault_distinct: true,
@@ -1539,6 +1669,10 @@ impl<Engine: RepairPreparationEngine + RescueFstabRollbackBackend> RescueRepairS
             RepairServiceRequest::CrypttabPrepare {
                 request_id, target, ..
             } => self.begin_prepare(request_id, target, RepairCandidateKind::Crypttab),
+            #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
+            RepairServiceRequest::Ext4Prepare {
+                request_id, target, ..
+            } => self.begin_prepare(request_id, target, RepairCandidateKind::Ext4Fsck),
             RepairServiceRequest::Approve {
                 request_id,
                 prepared_id,
@@ -1586,6 +1720,30 @@ impl<Engine: RepairPreparationEngine + RescueFstabRollbackBackend> RescueRepairS
                 },
                 RepairCandidateKind::Crypttab,
             ),
+            #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
+            RepairServiceRequest::Ext4Approve {
+                request_id,
+                prepared_id,
+                session_id,
+                plan_id,
+                plan_hash,
+                approval_id,
+                approval_sequence,
+                typed_confirmation,
+                ..
+            } => self.begin_approval(
+                BoundRepairApproval {
+                    request_id,
+                    prepared_id,
+                    session_id,
+                    plan_id,
+                    plan_hash,
+                    approval_id,
+                    approval_sequence,
+                    typed_confirmation,
+                },
+                RepairCandidateKind::Ext4Fsck,
+            ),
             RepairServiceRequest::Cancel {
                 request_id,
                 prepared_id,
@@ -1608,6 +1766,18 @@ impl<Engine: RepairPreparationEngine + RescueFstabRollbackBackend> RescueRepairS
                 &prepared_id,
                 &plan_hash,
                 RepairCandidateKind::Crypttab,
+            ),
+            #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
+            RepairServiceRequest::Ext4Cancel {
+                request_id,
+                prepared_id,
+                plan_hash,
+                ..
+            } => self.begin_cancel(
+                &request_id,
+                &prepared_id,
+                &plan_hash,
+                RepairCandidateKind::Ext4Fsck,
             ),
             RepairServiceRequest::RollbackPrepare {
                 request_id, source, ..
@@ -2589,6 +2759,8 @@ fn rollback_descriptor_matches(
         RepairCandidateKind::Fstab => kernaid_core::RescueRepairRollbackResource::Fstab,
         #[cfg(feature = "rescue-crypttab-production-candidate")]
         RepairCandidateKind::Crypttab => kernaid_core::RescueRepairRollbackResource::Crypttab,
+        #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
+        RepairCandidateKind::Ext4Fsck => return false,
     };
     let canonical_hash = kernaid_core::canonical_rescue_repair_rollback_plan(
         resource,
@@ -2827,6 +2999,9 @@ impl CorrelationProbe {
                         | "repair.crypttab.rollback.prepare"
                         | "repair.crypttab.rollback.approve"
                         | "repair.crypttab.rollback.cancel"
+                        | "repair.ext4.prepare"
+                        | "repair.ext4.approve"
+                        | "repair.ext4.cancel"
                 )
             })
             .unwrap_or("repair.status")
@@ -2962,6 +3137,12 @@ mod tests {
                 #[cfg(feature = "rescue-crypttab-production-candidate")]
                 RepairCandidateKind::Crypttab => {
                     kernaid_core::RescueRepairRollbackResource::Crypttab
+                }
+                #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
+                RepairCandidateKind::Ext4Fsck => {
+                    return Err(RepairEngineFailure::RollbackUnavailable(
+                        RepairExecutionFailureStage::Authority,
+                    ));
                 }
             };
             let (_, plan_hash) = kernaid_core::canonical_rescue_repair_rollback_plan(

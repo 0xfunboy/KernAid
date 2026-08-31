@@ -8,8 +8,8 @@
 
 use kernaid_protocol::{
     rescue_repair_vault::{
-        RepairBackupState, RepairRollbackTransactionStatusPayload, RepairTransactionPhase,
-        RepairTransactionResolutionOutcome, RepairTransactionStatusPayload,
+        RepairBackupState, RepairResourceV1, RepairRollbackTransactionStatusPayload,
+        RepairTransactionPhase, RepairTransactionResolutionOutcome, RepairTransactionStatusPayload,
         repair_resource_from_transaction,
     },
     rescue_vault::RequestId,
@@ -40,6 +40,8 @@ const ACQUIRE_OPERATION: &str = "target.pending.readwrite.acquire";
 const ACQUIRE_ROLLBACK_OPERATION: &str = "target.rollback.pending.readwrite.acquire";
 const CAPABILITY_TYPE: &str = "linux-ext4-direct-leaf-readwrite-mount-v1";
 const DESCRIPTOR_TYPE: &str = "selected-target-ext4-mount-readwrite-detached";
+const EXT4_CAPABILITY_TYPE: &str = "linux-ext4-fsck-bounded-result-v1";
+const EXT4_DESCRIPTOR_TYPE: &str = "normalized-ext4-fsck-result";
 const EXT_SUPER_MAGIC: u64 = 0xef53;
 const MAX_REQUEST_FRAME_BYTES: usize = 1_024;
 const MAX_RESPONSE_FRAME_BYTES: usize = 2_048;
@@ -79,6 +81,60 @@ pub struct RescueTargetWriteMountCapability {
     transaction_binding_sha256: String,
     target_recovery_fingerprint: String,
     lease_binding_sha256: String,
+}
+
+/// Normalized result returned by the root-owned fixed ext4 executor after the
+/// exact durable write lease was consumed. No raw block descriptor crosses
+/// into the unprivileged repair broker.
+pub struct RescueExt4RepairResult {
+    outcome: Ext4RepairResultOutcome,
+    reservation_id: String,
+    transaction_binding_sha256: String,
+    target_recovery_fingerprint: String,
+    lease_binding_sha256: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ext4RepairResultOutcome {
+    CommittedClean,
+    ClosedBeforeUnchanged,
+    ClosedBeforeRestored,
+    ManualReconciliationRequired,
+}
+
+impl RescueExt4RepairResult {
+    pub fn outcome(&self) -> Ext4RepairResultOutcome {
+        self.outcome
+    }
+
+    pub fn reservation_id(&self) -> &str {
+        &self.reservation_id
+    }
+
+    pub fn transaction_binding_sha256(&self) -> &str {
+        &self.transaction_binding_sha256
+    }
+
+    pub fn target_recovery_fingerprint(&self) -> &str {
+        &self.target_recovery_fingerprint
+    }
+
+    pub fn lease_binding_sha256(&self) -> &str {
+        &self.lease_binding_sha256
+    }
+}
+
+impl fmt::Debug for RescueExt4RepairResult {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RescueExt4RepairResult")
+            .field("outcome", &self.outcome)
+            .field("reservation_id", &"[opaque]")
+            .field("transaction_binding_sha256", &"[opaque hash]")
+            .field("target_recovery_fingerprint", &"[opaque stable digest]")
+            .field("lease_binding_sha256", &"[opaque hash]")
+            .finish()
+    }
 }
 
 /// Non-cloneable authority for the writable mount of one exact durable
@@ -243,6 +299,32 @@ struct SuccessResponseWire {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Ext4SuccessResponseWire {
+    api_version: String,
+    request_id: String,
+    operation: String,
+    #[serde(rename = "outcome")]
+    _outcome: SuccessOutcome,
+    reservation_id: String,
+    transaction_binding_sha256: String,
+    target_recovery_fingerprint: String,
+    lease_binding_sha256: String,
+    capability: String,
+    descriptor: DescriptorWire,
+    repair_outcome: Ext4RepairOutcomeWire,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum Ext4RepairOutcomeWire {
+    CommittedClean,
+    ClosedBeforeUnchanged,
+    ClosedBeforeRestored,
+    ManualReconciliationRequired,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RollbackSuccessResponseWire {
     api_version: String,
     request_id: String,
@@ -305,6 +387,12 @@ pub fn acquire_pending_target_write_mount(
         .backup()
         .execution_intent()
         .ok_or(TargetWriteCapabilityClientError::InvalidPending)?;
+    if repair_resource_from_transaction(pending)
+        .map_err(|_| TargetWriteCapabilityClientError::InvalidPending)?
+        == RepairResourceV1::Ext4Filesystem
+    {
+        return Err(TargetWriteCapabilityClientError::InvalidPending);
+    }
     if pending.phase() != RepairTransactionPhase::Pending
         || pending.backup().state() != RepairBackupState::Durable
         || !valid_recovery_fingerprint(intent.target_recovery_fingerprint())
@@ -341,6 +429,61 @@ pub fn acquire_pending_target_write_mount(
     let received = receive_frame(socket.as_fd(), deadline)
         .map_err(|_| TargetWriteCapabilityClientError::ReconciliationRequired)?;
     decode_response(
+        received,
+        request_id.as_str(),
+        reservation_id,
+        transaction_binding_sha256,
+        intent.target_recovery_fingerprint(),
+    )
+    .map_err(|_| TargetWriteCapabilityClientError::ReconciliationRequired)
+}
+
+/// Consumes the same single-use durable write lease as the mounted-file
+/// executor, but delegates the entire fixed bounded ext4 mutation to the
+/// root helper and accepts only a normalized descriptor-free result.
+pub fn execute_pending_ext4_repair(
+    pending: &RepairTransactionStatusPayload,
+    deadline: Instant,
+) -> Result<RescueExt4RepairResult, TargetWriteCapabilityClientError> {
+    let intent = pending
+        .backup()
+        .execution_intent()
+        .ok_or(TargetWriteCapabilityClientError::InvalidPending)?;
+    if pending.phase() != RepairTransactionPhase::Pending
+        || pending.backup().state() != RepairBackupState::Durable
+        || repair_resource_from_transaction(pending)
+            .map_err(|_| TargetWriteCapabilityClientError::InvalidPending)?
+            != RepairResourceV1::Ext4Filesystem
+        || !valid_recovery_fingerprint(intent.target_recovery_fingerprint())
+    {
+        return Err(TargetWriteCapabilityClientError::InvalidPending);
+    }
+    let reservation_id = pending.backup().reservation_id().as_str();
+    let transaction_binding_sha256 = pending.transaction_binding_sha256().as_str();
+    let request_id = fresh_request_id()?;
+    let request = AcquireRequestWire {
+        api_version: API_VERSION,
+        request_id: request_id.as_str(),
+        operation: ACQUIRE_OPERATION,
+        reservation_id,
+        transaction_binding_sha256,
+    };
+    let encoded = serde_json::to_vec(&request)
+        .map_err(|_| TargetWriteCapabilityClientError::InvalidPending)?;
+    if encoded.is_empty() || encoded.len() > MAX_REQUEST_FRAME_BYTES {
+        return Err(TargetWriteCapabilityClientError::InvalidPending);
+    }
+    ensure_before(deadline)?;
+    let socket = connect_fixed_endpoint(deadline)?;
+    authenticate_root_seqpacket_server(socket.as_fd()).map_err(|error| match error {
+        SeqpacketTransportError::ServerNotRoot => TargetWriteCapabilityClientError::ServerNotRoot,
+        _ => TargetWriteCapabilityClientError::InvalidTransport,
+    })?;
+    send_frame(socket.as_fd(), &encoded, deadline)
+        .map_err(|_| TargetWriteCapabilityClientError::ReconciliationRequired)?;
+    let received = receive_frame(socket.as_fd(), deadline)
+        .map_err(|_| TargetWriteCapabilityClientError::ReconciliationRequired)?;
+    decode_ext4_response(
         received,
         request_id.as_str(),
         reservation_id,
@@ -658,6 +801,62 @@ fn decode_rollback_response(
     }
 }
 
+fn decode_ext4_response(
+    received: ReceivedFrame,
+    request_id: &str,
+    reservation_id: &str,
+    transaction_binding_sha256: &str,
+    target_recovery_fingerprint: &str,
+) -> Result<RescueExt4RepairResult, PostSendError> {
+    let probe: OutcomeProbe =
+        serde_json::from_slice(&received.bytes).map_err(|_| PostSendError::Invalid)?;
+    match probe.outcome {
+        Outcome::Ok => {
+            let response: Ext4SuccessResponseWire =
+                serde_json::from_slice(&received.bytes).map_err(|_| PostSendError::Invalid)?;
+            if response.api_version != API_VERSION
+                || response.request_id != request_id
+                || response.operation != ACQUIRE_OPERATION
+                || response.reservation_id != reservation_id
+                || response.transaction_binding_sha256 != transaction_binding_sha256
+                || response.target_recovery_fingerprint != target_recovery_fingerprint
+                || response.capability != EXT4_CAPABILITY_TYPE
+                || response.descriptor.descriptor_type != EXT4_DESCRIPTOR_TYPE
+                || response.descriptor.count != 0
+                || !valid_raw_sha256(&response.lease_binding_sha256)
+                || response
+                    .lease_binding_sha256
+                    .bytes()
+                    .all(|byte| byte == b'0')
+            {
+                return Err(PostSendError::Invalid);
+            }
+            if !received.descriptors.is_empty() {
+                return Err(PostSendError::Invalid);
+            }
+            let outcome = match response.repair_outcome {
+                Ext4RepairOutcomeWire::CommittedClean => Ext4RepairResultOutcome::CommittedClean,
+                Ext4RepairOutcomeWire::ClosedBeforeUnchanged => {
+                    Ext4RepairResultOutcome::ClosedBeforeUnchanged
+                }
+                Ext4RepairOutcomeWire::ClosedBeforeRestored => {
+                    Ext4RepairResultOutcome::ClosedBeforeRestored
+                }
+                Ext4RepairOutcomeWire::ManualReconciliationRequired => {
+                    Ext4RepairResultOutcome::ManualReconciliationRequired
+                }
+            };
+            Ok(RescueExt4RepairResult {
+                outcome,
+                reservation_id: response.reservation_id,
+                transaction_binding_sha256: response.transaction_binding_sha256,
+                target_recovery_fingerprint: response.target_recovery_fingerprint,
+                lease_binding_sha256: response.lease_binding_sha256,
+            })
+        }
+        Outcome::Error => Err(PostSendError::Invalid),
+    }
+}
 fn validate_write_mount(descriptor: BorrowedFd<'_>) -> Result<(), PostSendError> {
     let stat = rfs::fstat(descriptor).map_err(|_| PostSendError::Invalid)?;
     let filesystem = rfs::fstatfs(descriptor).map_err(|_| PostSendError::Invalid)?;

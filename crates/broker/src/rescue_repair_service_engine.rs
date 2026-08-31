@@ -12,6 +12,13 @@ use crate::{
     },
     rescue_fstab_executor::execute_approved_rescue_crypttab,
 };
+#[cfg(feature = "rescue-ext4-fsck-production-candidate")]
+use crate::{
+    rescue_ext4_fsck_candidate::{
+        ApprovedExt4Repair, Ext4PrepareError, PreparedExt4Repair, prepare_ext4_repair,
+    },
+    rescue_fstab_executor::execute_approved_ext4_repair,
+};
 use crate::{
     rescue_fstab_candidate::{
         ApprovedRescueFstabTransaction, PreparedRescueFstabPlan,
@@ -129,6 +136,8 @@ pub enum ProductionPreparedRepair {
     },
     #[cfg(feature = "rescue-crypttab-production-candidate")]
     Crypttab(Box<PreparedRescueCrypttabTransaction>),
+    #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
+    Ext4Fsck(Box<PreparedExt4Repair>),
 }
 
 /// The approved type remains the broker's inseparable target/backup/Core
@@ -137,6 +146,8 @@ pub enum ProductionApprovedRepair {
     Fstab(Box<ProductionApprovedTransaction>),
     #[cfg(feature = "rescue-crypttab-production-candidate")]
     Crypttab(Box<ApprovedRescueCrypttabTransaction>),
+    #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
+    Ext4Fsck(Box<ApprovedExt4Repair>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -376,6 +387,48 @@ impl RepairPreparationEngine for ProductionRepairEngine {
                     descriptor,
                 ))
             }
+            #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
+            RepairCandidateKind::Ext4Fsck => {
+                let prepared = prepare_ext4_repair(
+                    command.request_id(),
+                    command.session_id(),
+                    command.plan_id(),
+                    command.target().scan_fingerprint(),
+                    command.target().target_id(),
+                    command.target().target_fingerprint(),
+                    deadline,
+                )
+                .map_err(map_ext4_prepare_failure)?;
+                let audit = prepared.descriptor();
+                let descriptor = match PreparedRepairDescriptor::new(
+                    &audit.session_id,
+                    &audit.plan_id,
+                    &audit.plan_sha256,
+                    &audit.target_fingerprint,
+                    &audit.before_sha256,
+                    &audit.after_sha256,
+                    &audit.diff_sha256,
+                    crate::rescue_ext4_fsck_candidate::RESOURCE_ID,
+                    prepared.backup_locator(),
+                    1,
+                    true,
+                    true,
+                ) {
+                    Ok(descriptor) => descriptor,
+                    Err(_) => {
+                        prepared
+                            .cancel(deadline)
+                            .map_err(|_| RepairEngineFailure::CancelFailed)?;
+                        return Err(RepairEngineFailure::PrepareFailed(
+                            RepairPrepareFailureStage::AdmissionInternal,
+                        ));
+                    }
+                };
+                Ok((
+                    ProductionPreparedRepair::Ext4Fsck(Box::new(prepared)),
+                    descriptor,
+                ))
+            }
         }
     }
 
@@ -458,6 +511,23 @@ impl RepairPreparationEngine for ProductionRepairEngine {
                         )
                     })
             }
+            #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
+            ProductionPreparedRepair::Ext4Fsck(prepared) => (*prepared)
+                .approve(
+                    approval.session_id(),
+                    approval.plan_id(),
+                    approval.plan_hash(),
+                    approval.approval_id(),
+                    approval.approval_sequence(),
+                    approval.typed_confirmation(),
+                    deadline,
+                )
+                .map(|approved| ProductionApprovedRepair::Ext4Fsck(Box::new(approved)))
+                .map_err(|_| {
+                    RepairEngineFailure::ApprovalRejected(
+                        RepairExecutionFailureStage::ApprovalAdmission,
+                    )
+                }),
         }
     }
 
@@ -482,6 +552,10 @@ impl RepairPreparationEngine for ProductionRepairEngine {
             #[cfg(feature = "rescue-crypttab-production-candidate")]
             ProductionApprovedRepair::Crypttab(approved) => {
                 execute_approved_rescue_crypttab(*approved, deadline)
+            }
+            #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
+            ProductionApprovedRepair::Ext4Fsck(approved) => {
+                execute_approved_ext4_repair(*approved, deadline)
             }
         };
         match result {
@@ -512,6 +586,10 @@ impl RepairPreparationEngine for ProductionRepairEngine {
             ProductionPreparedRepair::Crypttab(prepared) => (*prepared)
                 .cancel(deadline)
                 .map_err(|_| RepairEngineFailure::CancelFailed),
+            #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
+            ProductionPreparedRepair::Ext4Fsck(prepared) => (*prepared)
+                .cancel(deadline)
+                .map_err(|_| RepairEngineFailure::CancelFailed),
         }
     }
 }
@@ -525,6 +603,12 @@ impl RescueFstabRollbackBackend for ProductionRepairEngine {
         command: &BrokerOwnedRollbackPrepareCommand,
         deadline: Instant,
     ) -> Result<(Self::PreparedRollback, PreparedRollbackDescriptor), RepairEngineFailure> {
+        #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
+        if command.candidate() == RepairCandidateKind::Ext4Fsck {
+            return Err(RepairEngineFailure::RollbackUnavailable(
+                RepairExecutionFailureStage::Authority,
+            ));
+        }
         let authority = prepare_rescue_fstab_rollback(
             command.source().reservation_id(),
             command.source().transaction_binding_sha256(),
@@ -556,6 +640,12 @@ impl RescueFstabRollbackBackend for ProductionRepairEngine {
             RepairCandidateKind::Fstab => RescueRepairRollbackResource::Fstab,
             #[cfg(feature = "rescue-crypttab-production-candidate")]
             RepairCandidateKind::Crypttab => RescueRepairRollbackResource::Crypttab,
+            #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
+            RepairCandidateKind::Ext4Fsck => {
+                return Err(RepairEngineFailure::RollbackUnavailable(
+                    RepairExecutionFailureStage::Authority,
+                ));
+            }
         };
         let (plan, plan_hash) = canonical_rescue_repair_rollback_plan(
             rollback_resource,
@@ -812,6 +902,26 @@ fn map_crypttab_preflight_failure(error: RescueCrypttabPreflightError) -> Repair
         | RescueCrypttabPreflightError::ApprovalRejected => {
             RepairPrepareFailureStage::AdmissionInternal
         }
+    };
+    RepairEngineFailure::PrepareFailed(stage)
+}
+
+#[cfg(feature = "rescue-ext4-fsck-production-candidate")]
+fn map_ext4_prepare_failure(error: Ext4PrepareError) -> RepairEngineFailure {
+    let stage = match error {
+        Ext4PrepareError::TargetUnavailable => {
+            RepairPrepareFailureStage::TargetCapabilityUnavailable
+        }
+        Ext4PrepareError::TargetChanged => {
+            RepairPrepareFailureStage::TargetCapabilityIdentityChanged
+        }
+        Ext4PrepareError::VaultUnavailable => RepairPrepareFailureStage::VaultReserve,
+        Ext4PrepareError::PreflightUnavailable | Ext4PrepareError::RepairNotRequired => {
+            RepairPrepareFailureStage::ObservationPreview
+        }
+        Ext4PrepareError::InvalidRequest
+        | Ext4PrepareError::ApprovalRejected
+        | Ext4PrepareError::CancellationFailed => RepairPrepareFailureStage::AdmissionInternal,
     };
     RepairEngineFailure::PrepareFailed(stage)
 }

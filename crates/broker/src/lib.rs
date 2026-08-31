@@ -23,6 +23,12 @@ pub mod rescue_crypttab_candidate;
 #[cfg(all(target_os = "linux", feature = "rescue-crypttab-production-candidate"))]
 pub mod rescue_crypttab_observer;
 
+/// Closed, off-default ext4 preen candidate. It stores only normalized
+/// preflight evidence in the authenticated Repair Vault and exposes no
+/// caller-selected command, option, path or block device.
+#[cfg(all(target_os = "linux", feature = "rescue-ext4-fsck-production-candidate"))]
+pub mod rescue_ext4_fsck_candidate;
+
 /// Closed, off-default same-boot transaction engine and durable reboot
 /// recovery for the authorized Phase 1 Rescue mutations.
 #[cfg(all(target_os = "linux", feature = "rescue-fstab-production-candidate"))]
