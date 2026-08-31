@@ -36,7 +36,10 @@ ProtectKernelTunables=yes
 ProtectClock=yes
 ProtectHostname=yes
 ProtectProc=invisible
-ProcSubset=pid
+# journalctl --boot=0 resolves the current boot through
+# /proc/sys/kernel/random/boot_id; keep non-process procfs read-only and
+# preserve ProtectProc=invisible for process metadata isolation.
+ProcSubset=all
 ReadWritePaths=/run/kernaid-qemu-native-prompt-journal-proof
 CapabilityBoundingSet=
 AmbientCapabilities=

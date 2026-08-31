@@ -201,6 +201,9 @@ label live-amd64-failsafe
         self.assertIn("StandardOutput=null", service)
         self.assertIn("StandardError=null", service)
         self.assertIn("CapabilityBoundingSet=", service)
+        self.assertIn("ProtectProc=invisible", service)
+        self.assertIn("ProcSubset=all", service)
+        self.assertNotIn("ProcSubset=pid", service)
         firstboot_unit = (
             REPO_DIR
             / "rescue/live-build/config/includes.chroot/etc/systemd/system/kernaid-rescue-firstboot.service"
