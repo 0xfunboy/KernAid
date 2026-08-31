@@ -152,12 +152,12 @@ class NativeVaultPromptSmokeTests(unittest.TestCase):
 
     def test_each_boot_keeps_the_qualified_lifecycle_timeout(self) -> None:
         parsed = native_prompt_smoke._parse_arguments(
-            ["--iso", "/tmp/KernAid.iso", "--timeout", "3600"]
+            ["--iso", "/tmp/KernAid.iso", "--timeout", "4200"]
         )
-        self.assertEqual(parsed.timeout / 2, 1800)
+        self.assertEqual(parsed.timeout / 2, 2100)
         with self.assertRaises(native_prompt_smoke.ClosedFailure):
             native_prompt_smoke._parse_arguments(
-                ["--iso", "/tmp/KernAid.iso", "--timeout", "3599"]
+                ["--iso", "/tmp/KernAid.iso", "--timeout", "5401"]
             )
 
     def test_direct_kernel_append_is_extracted_from_the_default_iso_entry(self) -> None:
@@ -434,7 +434,7 @@ label live-amd64-failsafe
         self.assertIn("needs: build-and-smoke-test", job)
         self.assertIn("name: KernAid-Rescue-amd64", job)
         self.assertIn("qemu-native-vault-prompt-smoke.py", job)
-        self.assertIn("--timeout 3600", job)
+        self.assertIn("--timeout 4200", job)
         self.assertNotIn("matrix:", job)
         self.assertNotIn("strategy:", job)
         self.assertNotIn("lb build", job)
