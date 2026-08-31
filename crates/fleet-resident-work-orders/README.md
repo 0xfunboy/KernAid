@@ -48,3 +48,25 @@ does not bypass policy, entitlement, local approval or lease validation.
 The device identity is supplied in memory for signing and is never serialized
 to the journal. Results contain only an outcome and digest; raw output, logs,
 tokens and approval secrets are not persisted or uploaded by this crate.
+
+## Linux service (off by default)
+
+Build the separate Resident service explicitly:
+
+```sh
+cargo build --release -p kernaid-fleet-resident-work-orders --features linux-service
+```
+
+The binary is absent from normal workspace and Desk builds. Its systemd user
+deployment is under `deploy/fleet-resident-work-orders/` and is never enabled
+by installation. It loads the existing `resident-v1` identity from the native
+OS secret store, reads signed policy and entitlement state from the Fleet
+runtime, and polls only the two fixed work-order routes over HTTPS with no
+redirect or proxy support.
+
+The Linux adapter dispatches only `linux.filesystem.health.v1` and
+`linux.storage.health.v1` to their existing fixed-command, bounded collectors.
+It persists only execution bindings and result digests for restart recovery.
+The Rescue fstab write action is not connected to this process: remote tenant
+approval can never substitute for a fresh local Vault approval or the
+Core/Broker policy and entitlement boundary.

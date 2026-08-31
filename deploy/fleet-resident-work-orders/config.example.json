@@ -1,0 +1,16 @@
+{
+  "schema": "dev.kernaid.fleet.resident-work-order-service-config.v1",
+  "endpoint": "https://fleet.example.invalid",
+  "tenantId": "tenant-example",
+  "stateDirectory": "/home/example/.local/share/io.github.0xfunboy.KernAid/fleet-work-orders",
+  "runtimeStateFile": "/home/example/.local/share/io.github.0xfunboy.KernAid/fleet/runtime-v1.sqlite3",
+  "serviceReceiptAnchorFile": "/home/example/.config/kernaid/fleet-service.pub",
+  "entitlementAnchorFile": "/home/example/.config/kernaid/entitlement-issuer.pub",
+  "policyAnchorFile": "/home/example/.config/kernaid/policy-issuer.pub",
+  "intervalSeconds": 60,
+  "minimumBackoffSeconds": 5,
+  "maximumBackoffSeconds": 900,
+  "connectTimeoutSeconds": 10,
+  "requestTimeoutSeconds": 30,
+  "leaseSeconds": 300
+}

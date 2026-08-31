@@ -1,0 +1,36 @@
+[Unit]
+Description=KernAid Fleet Resident typed work orders
+Documentation=https://github.com/0xfunboy/KernAid/tree/main/deploy/fleet-resident-work-orders
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/libexec/kernaid-fleet-resident-work-orders --config %h/.config/kernaid/fleet-work-orders.json
+Restart=on-failure
+RestartSec=30s
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/io.github.0xfunboy.KernAid/fleet-work-orders
+ReadWritePaths=%h/.local/share/io.github.0xfunboy.KernAid/fleet
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=default.target
