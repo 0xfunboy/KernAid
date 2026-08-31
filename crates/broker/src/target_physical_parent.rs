@@ -7,7 +7,8 @@
 
 #[cfg(any(
     feature = "rescue-fstab-production-candidate",
-    feature = "rescue-crypttab-production-candidate"
+    feature = "rescue-crypttab-production-candidate",
+    feature = "rescue-ext4-fsck-production-candidate"
 ))]
 use crate::target_capability_client::RescueTargetCapabilityClaims;
 use crate::target_capability_client::{
@@ -133,7 +134,8 @@ impl RescueTargetPhysicalParentGuard {
 
     #[cfg(any(
         feature = "rescue-fstab-production-candidate",
-        feature = "rescue-crypttab-production-candidate"
+        feature = "rescue-crypttab-production-candidate",
+        feature = "rescue-ext4-fsck-production-candidate"
     ))]
     pub(crate) fn target_claims(&self) -> &RescueTargetCapabilityClaims {
         self.target.claims()

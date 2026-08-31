@@ -35,6 +35,14 @@ pub const CRYPTTAB_REPAIR_ROLLBACK_ACTION_ID: &str = "linux.crypttab.disable-mis
 /// Root-helper capability for one consumed crypttab rollback lease.
 pub const CRYPTTAB_REPAIR_ROLLBACK_WRITE_LEASE_CAPABILITY: &str =
     "crypttab-rollback-direct-leaf-rw-v1";
+/// Closed, candidate-only ext4 repair. The durable Vault object is the
+/// normalized preflight evidence; the e2fsck undo stream remains a same-boot
+/// capability and is never represented as a durable full-filesystem backup.
+pub const EXT4_REPAIR_EXECUTION_ACTION_ID: &str = "linux.ext4.fsck-preen-with-undo.v1";
+pub const EXT4_REPAIR_EXECUTION_RESOURCE_ID: &str = "rescue:selected-linux-filesystem:ext4";
+pub const EXT4_REPAIR_WRITE_LEASE_CAPABILITY: &str = "ext4-block-rw-v1";
+pub const EXT4_REPAIR_ROLLBACK_ACTION_ID: &str = "linux.ext4.fsck-undo.same-boot.v1";
+pub const EXT4_REPAIR_ROLLBACK_WRITE_LEASE_CAPABILITY: &str = "ext4-block-rollback-rw-v1";
 
 const MAX_OPAQUE_ID_BYTES: usize = 128;
 const RESERVATION_BINDING_DOMAIN: &[u8] = b"KERNAID-REPAIR-RESERVATION-V1\0";
@@ -46,6 +54,7 @@ const ROLLBACK_TRANSACTION_BINDING_DOMAIN: &[u8] = b"KERNAID-REPAIR-ROLLBACK-TRA
 const ROLLBACK_WRITE_LEASE_BINDING_DOMAIN: &[u8] = b"KERNAID-REPAIR-ROLLBACK-WRITE-LEASE-V1\0";
 const LOCK_ID_DOMAIN: &[u8] = b"kernaid:rescue-fstab:target-lock:v2\0";
 const CRYPTTAB_LOCK_ID_DOMAIN: &[u8] = b"kernaid:rescue-crypttab:target-lock:v1\0";
+const EXT4_LOCK_ID_DOMAIN: &[u8] = b"kernaid:rescue-ext4-fsck:target-lock:v1\0";
 const MAX_PERMISSION_MODE: u32 = 0o7777;
 const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
 
@@ -55,6 +64,7 @@ const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
 pub enum RepairResourceV1 {
     Fstab,
     Crypttab,
+    Ext4Filesystem,
 }
 
 impl RepairResourceV1 {
@@ -62,6 +72,7 @@ impl RepairResourceV1 {
         match self {
             Self::Fstab => REPAIR_EXECUTION_ACTION_ID,
             Self::Crypttab => CRYPTTAB_REPAIR_EXECUTION_ACTION_ID,
+            Self::Ext4Filesystem => EXT4_REPAIR_EXECUTION_ACTION_ID,
         }
     }
 
@@ -69,6 +80,7 @@ impl RepairResourceV1 {
         match self {
             Self::Fstab => REPAIR_EXECUTION_RESOURCE_ID,
             Self::Crypttab => CRYPTTAB_REPAIR_EXECUTION_RESOURCE_ID,
+            Self::Ext4Filesystem => EXT4_REPAIR_EXECUTION_RESOURCE_ID,
         }
     }
 
@@ -76,6 +88,7 @@ impl RepairResourceV1 {
         match self {
             Self::Fstab => REPAIR_WRITE_LEASE_CAPABILITY,
             Self::Crypttab => CRYPTTAB_REPAIR_WRITE_LEASE_CAPABILITY,
+            Self::Ext4Filesystem => EXT4_REPAIR_WRITE_LEASE_CAPABILITY,
         }
     }
 
@@ -83,6 +96,7 @@ impl RepairResourceV1 {
         match self {
             Self::Fstab => REPAIR_ROLLBACK_ACTION_ID,
             Self::Crypttab => CRYPTTAB_REPAIR_ROLLBACK_ACTION_ID,
+            Self::Ext4Filesystem => EXT4_REPAIR_ROLLBACK_ACTION_ID,
         }
     }
 
@@ -90,6 +104,7 @@ impl RepairResourceV1 {
         match self {
             Self::Fstab => REPAIR_ROLLBACK_WRITE_LEASE_CAPABILITY,
             Self::Crypttab => CRYPTTAB_REPAIR_ROLLBACK_WRITE_LEASE_CAPABILITY,
+            Self::Ext4Filesystem => EXT4_REPAIR_ROLLBACK_WRITE_LEASE_CAPABILITY,
         }
     }
 
@@ -97,6 +112,7 @@ impl RepairResourceV1 {
         match value {
             REPAIR_EXECUTION_RESOURCE_ID => Ok(Self::Fstab),
             CRYPTTAB_REPAIR_EXECUTION_RESOURCE_ID => Ok(Self::Crypttab),
+            EXT4_REPAIR_EXECUTION_RESOURCE_ID => Ok(Self::Ext4Filesystem),
             _ => Err(ProtocolViolation::InvalidPayload),
         }
     }
@@ -113,6 +129,9 @@ impl RepairResourceV1 {
         match self {
             Self::Fstab => metadata.mode == 0o644,
             Self::Crypttab => matches!(metadata.mode, 0o600 | 0o644),
+            // This metadata binds the small normalized evidence object stored
+            // in the Repair Vault, not target filesystem metadata.
+            Self::Ext4Filesystem => metadata.mode == 0o600,
         }
     }
 }
@@ -456,6 +475,7 @@ impl RepairExecutionIntentV1 {
         let resource = match self.action_id.as_str() {
             REPAIR_EXECUTION_ACTION_ID => RepairResourceV1::Fstab,
             CRYPTTAB_REPAIR_EXECUTION_ACTION_ID => RepairResourceV1::Crypttab,
+            EXT4_REPAIR_EXECUTION_ACTION_ID => RepairResourceV1::Ext4Filesystem,
             _ => return Err(ProtocolViolation::InvalidPayload),
         };
         if !valid_prefixed_id(&self.session_id, "S-")
@@ -519,6 +539,7 @@ pub fn canonical_repair_lock_identity_for_resource(
     hasher.update(match resource {
         RepairResourceV1::Fstab => LOCK_ID_DOMAIN,
         RepairResourceV1::Crypttab => CRYPTTAB_LOCK_ID_DOMAIN,
+        RepairResourceV1::Ext4Filesystem => EXT4_LOCK_ID_DOMAIN,
     });
     for value in [target_recovery_fingerprint, resource.resource_id()] {
         hash_field(&mut hasher, value.as_bytes());
@@ -1593,6 +1614,11 @@ impl RepairRollbackBindingV1 {
             .execution_intent()
             .ok_or(ProtocolViolation::InvalidPayload)?;
         let resource = repair_resource_from_transaction(source)?;
+        // ext4 e2undo is a same-boot failure guard executed inside the root
+        // helper, not a durable post-commit rollback authority.
+        if resource == RepairResourceV1::Ext4Filesystem {
+            return Err(ProtocolViolation::InvalidPayload);
+        }
         let next_sequence = source_intent
             .approval_sequence()
             .checked_add(1)

@@ -56,6 +56,70 @@ class RepairTargetHandoffDeadlineTests(unittest.TestCase):
         self.assertEqual(raised.exception.request_id, REQUEST["requestId"])
 
 
+class Ext4FixedExecutorTests(unittest.TestCase):
+    def test_ext4_preflight_rejects_operational_error_bits(self) -> None:
+        for code, expected in ((0, "clean"), (4, "repair-required"), (12, "unavailable")):
+            with self.subTest(code=code), patch.object(
+                handoff, "_run_ext4_tool", return_value=code
+            ):
+                self.assertEqual(
+                    handoff._ext4_readonly_state(
+                        11, time.monotonic() + 1, 1.0
+                    ),
+                    expected,
+                )
+
+    def test_ext4_contract_is_distinct_and_root_executor_returns_only_normalized_result(self) -> None:
+        contract = handoff._repair_contract(
+            handoff.EXT4_REPAIR_RESOURCE, handoff.EXT4_REPAIR_ACTION
+        )
+        self.assertEqual(
+            contract["responseCapability"], handoff.EXT4_EXECUTION_CAPABILITY
+        )
+        self.assertEqual(
+            contract["descriptorType"], handoff.EXT4_EXECUTION_DESCRIPTOR_TYPE
+        )
+        with (
+            patch.object(
+                handoff,
+                "_ext4_readonly_state",
+                side_effect=("repair-required", "clean"),
+            ),
+            patch.object(handoff, "_run_ext4_tool", return_value=1) as run,
+            patch.object(handoff.os, "open", side_effect=(41, 42)),
+            patch.object(handoff.os, "fsync"),
+            patch.object(handoff.os, "close"),
+        ):
+            outcome = handoff._execute_ext4_repair(
+                11,
+                "B-0123456789abcdef0123456789abcdef",
+                time.monotonic() + 180,
+            )
+        self.assertEqual(outcome, "committed-clean")
+        arguments = run.call_args.args[1]
+        self.assertEqual(arguments[:3], ("-f", "-p", "-z"))
+        self.assertNotIn("/dev/", " ".join(arguments))
+
+    def test_failed_apply_qualifies_only_same_boot_diagnostic_restore(self) -> None:
+        with (
+            patch.object(
+                handoff,
+                "_ext4_readonly_state",
+                side_effect=("repair-required", "unavailable", "repair-required"),
+            ),
+            patch.object(handoff, "_run_ext4_tool", side_effect=(4, 0)),
+            patch.object(handoff.os, "open", side_effect=(41, 42)),
+            patch.object(handoff.os, "fsync"),
+            patch.object(handoff.os, "close"),
+        ):
+            outcome = handoff._execute_ext4_repair(
+                11,
+                "B-0123456789abcdef0123456789abcdef",
+                time.monotonic() + 180,
+            )
+        self.assertEqual(outcome, "closed-before-restored")
+
+
 BLOCK_INVENTORY = json.dumps(
     {
         "blockdevices": [

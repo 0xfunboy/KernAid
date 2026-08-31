@@ -21,6 +21,7 @@ from pathlib import Path
 import re
 # KERNAID_REPAIR_CANDIDATE_BEGIN
 import secrets
+import subprocess
 # KERNAID_REPAIR_CANDIDATE_END
 import socket
 import stat
@@ -77,6 +78,18 @@ WRITE_CAPABILITY = "linux-ext4-direct-leaf-readwrite-mount-v1"
 ROLLBACK_WRITE_CAPABILITY = "fstab-rollback-direct-leaf-rw-v1"
 CRYPTTAB_ROLLBACK_WRITE_CAPABILITY = "crypttab-rollback-direct-leaf-rw-v1"
 WRITE_DESCRIPTOR_TYPE = "selected-target-ext4-mount-readwrite-detached"
+EXT4_EXECUTION_CAPABILITY = "linux-ext4-fsck-bounded-result-v1"
+EXT4_EXECUTION_DESCRIPTOR_TYPE = "normalized-ext4-fsck-result"
+EXT4_EXECUTION_OUTCOMES = {
+    "committed-clean",
+    "closed-before-unchanged",
+    "closed-before-restored",
+    "manual-reconciliation-required",
+}
+EXT4_EXECUTION_TIMEOUT_SECONDS = 195
+EXT4_E2FSCK = "/usr/sbin/e2fsck"
+EXT4_E2UNDO = "/usr/sbin/e2undo"
+EXT4_UNDO_DIRECTORY = "/run/lock/kernaid-repair"
 VAULT_WRITE_CAPABILITY = "fstab-direct-leaf-rw-v1"
 VAULT_ROLLBACK_WRITE_CAPABILITY = "fstab-rollback-direct-leaf-rw-v1"
 REPAIR_ACTION = "linux.fstab.disable-missing-uuid.v1"
@@ -87,6 +100,11 @@ CRYPTTAB_VAULT_ROLLBACK_WRITE_CAPABILITY = "crypttab-rollback-direct-leaf-rw-v1"
 CRYPTTAB_REPAIR_ACTION = "linux.crypttab.disable-missing-uuid.v1"
 CRYPTTAB_ROLLBACK_ACTION = "linux.crypttab.disable-missing-source.v1"
 CRYPTTAB_REPAIR_RESOURCE = "rescue:selected-linux-root:etc/crypttab"
+EXT4_VAULT_WRITE_CAPABILITY = "ext4-block-rw-v1"
+EXT4_VAULT_ROLLBACK_WRITE_CAPABILITY = "ext4-block-rollback-rw-v1"
+EXT4_REPAIR_ACTION = "linux.ext4.fsck-preen-with-undo.v1"
+EXT4_ROLLBACK_ACTION = "linux.ext4.fsck-undo.same-boot.v1"
+EXT4_REPAIR_RESOURCE = "rescue:selected-linux-filesystem:ext4"
 # KERNAID_REPAIR_CANDIDATE_END
 BLOCK_INVENTORY_COLLECTOR = "linux.block.inventory"
 
@@ -1262,6 +1280,8 @@ def _repair_contract(resource: object, action: object) -> dict[str, object]:
             "rollbackResponseCapability": ROLLBACK_WRITE_CAPABILITY,
             "lockDomain": b"kernaid:rescue-fstab:target-lock:v2\0",
             "safeModes": {0o644},
+            "responseCapability": WRITE_CAPABILITY,
+            "descriptorType": WRITE_DESCRIPTOR_TYPE,
         }
     if resource == CRYPTTAB_REPAIR_RESOURCE and action == CRYPTTAB_REPAIR_ACTION:
         return {
@@ -1271,6 +1291,19 @@ def _repair_contract(resource: object, action: object) -> dict[str, object]:
             "rollbackResponseCapability": CRYPTTAB_ROLLBACK_WRITE_CAPABILITY,
             "lockDomain": b"kernaid:rescue-crypttab:target-lock:v1\0",
             "safeModes": {0o600, 0o644},
+            "responseCapability": WRITE_CAPABILITY,
+            "descriptorType": WRITE_DESCRIPTOR_TYPE,
+        }
+    if resource == EXT4_REPAIR_RESOURCE and action == EXT4_REPAIR_ACTION:
+        return {
+            "writeCapability": EXT4_VAULT_WRITE_CAPABILITY,
+            "rollbackCapability": EXT4_VAULT_ROLLBACK_WRITE_CAPABILITY,
+            "rollbackAction": EXT4_ROLLBACK_ACTION,
+            "rollbackResponseCapability": EXT4_EXECUTION_CAPABILITY,
+            "lockDomain": b"kernaid:rescue-ext4-fsck:target-lock:v1\0",
+            "safeModes": {0o600},
+            "responseCapability": EXT4_EXECUTION_CAPABILITY,
+            "descriptorType": EXT4_EXECUTION_DESCRIPTOR_TYPE,
         }
     raise HandoffFailure("INTERNAL")
 
@@ -1382,12 +1415,16 @@ def _validate_write_lease(payload: object, reservation: str, binding: str) -> di
         str(intent["targetRecoveryFingerprint"]).encode(), expected_lock.encode()])
     if lease["leaseBindingSha256"] != expected_lease:
         raise HandoffFailure("INTERNAL")
-    return {"recoveryFingerprint": str(intent["targetRecoveryFingerprint"]),
-            "leaseBindingSha256": expected_lease,
-            "writeCapability": str(contract["writeCapability"]),
-            "rollbackCapability": str(contract["rollbackCapability"]),
-            "rollbackAction": str(contract["rollbackAction"]),
-            "rollbackResponseCapability": str(contract["rollbackResponseCapability"])}
+    return {
+        "recoveryFingerprint": str(intent["targetRecoveryFingerprint"]),
+        "leaseBindingSha256": expected_lease,
+        "writeCapability": str(contract["writeCapability"]),
+        "rollbackCapability": str(contract["rollbackCapability"]),
+        "rollbackAction": str(contract["rollbackAction"]),
+        "rollbackResponseCapability": str(contract["rollbackResponseCapability"]),
+        "responseCapability": str(contract["responseCapability"]),
+        "descriptorType": str(contract["descriptorType"]),
+    }
 
 
 def _validate_rollback_write_lease(
@@ -1699,6 +1736,113 @@ def _consume_rollback_write_lease(
     raise HandoffFailure("INTERNAL")
 
 
+def _run_ext4_tool(
+    binary: str,
+    arguments: tuple[str, ...],
+    descriptors: tuple[int, ...],
+    deadline: float,
+    maximum_seconds: float,
+) -> int | None:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return None
+    try:
+        result = subprocess.run(
+            (binary, *arguments),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            pass_fds=descriptors,
+            cwd="/",
+            env={
+                "LANG": "C",
+                "LC_ALL": "C",
+                "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+            },
+            timeout=max(0.001, min(remaining, maximum_seconds)),
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.returncode if 0 <= result.returncode <= 255 else None
+
+
+def _ext4_readonly_state(descriptor: int, deadline: float, seconds: float) -> str:
+    descriptor_path = f"/proc/self/fd/{descriptor}"
+    code = _run_ext4_tool(
+        EXT4_E2FSCK,
+        ("-f", "-n", descriptor_path),
+        (descriptor,),
+        deadline,
+        seconds,
+    )
+    if code == 0:
+        return "clean"
+    if code is not None and code & 0b100 and code & ~0b111 == 0:
+        return "repair-required"
+    return "unavailable"
+
+
+def _execute_ext4_repair(
+    descriptor: int,
+    reservation_id: str,
+    deadline: float,
+) -> str:
+    # The caller has already consumed the single-use Vault lease and bound this
+    # raw descriptor to the selected unmounted target. The root helper retains
+    # the raw block authority and returns only this closed result vocabulary.
+    before = _ext4_readonly_state(descriptor, deadline, 30.0)
+    if before != "repair-required":
+        return "closed-before-unchanged"
+    undo_path = f"{EXT4_UNDO_DIRECTORY}/ext4-undo-{reservation_id}"
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        undo = os.open(undo_path, flags, 0o600)
+    except OSError:
+        return "manual-reconciliation-required"
+    try:
+        os.fsync(undo)
+        directory = os.open(
+            EXT4_UNDO_DIRECTORY,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+        block_path = f"/proc/self/fd/{descriptor}"
+        undo_descriptor_path = f"/proc/self/fd/{undo}"
+        apply_code = _run_ext4_tool(
+            EXT4_E2FSCK,
+            ("-f", "-p", "-z", undo_descriptor_path, block_path),
+            (undo, descriptor),
+            deadline,
+            120.0,
+        )
+        os.fsync(undo)
+        os.fsync(descriptor)
+        after = _ext4_readonly_state(descriptor, deadline, 20.0)
+        if apply_code is not None and apply_code & ~0b11 == 0 and after == "clean":
+            return "committed-clean"
+        rollback_code = _run_ext4_tool(
+            EXT4_E2UNDO,
+            ("-f", undo_descriptor_path, block_path),
+            (undo, descriptor),
+            deadline,
+            35.0,
+        )
+        os.fsync(descriptor)
+        restored = _ext4_readonly_state(descriptor, deadline, 10.0)
+        if rollback_code == 0 and restored == "repair-required":
+            return "closed-before-restored"
+        return "manual-reconciliation-required"
+    except OSError:
+        return "manual-reconciliation-required"
+    finally:
+        os.close(undo)
+
+
 # KERNAID_REPAIR_CANDIDATE_END
 def _close_descriptors(descriptors: list[int]) -> None:
     while descriptors:
@@ -1931,8 +2075,9 @@ class RepairTargetHandoff:
         self, request: dict[str, str]
     ) -> tuple[dict[str, object], list[int]]:
         request_id = request["requestId"]
-        deadline = time.monotonic() + IO_TIMEOUT_SECONDS
+        deadline = time.monotonic() + EXT4_EXECUTION_TIMEOUT_SECONDS
         descriptors: list[int] = []
+        ext4_outcome: str | None = None
         is_rollback = request["operation"] == ROLLBACK_WRITE_OPERATION
         try:
             # Consumption is deliberately first and is never retried except for
@@ -1979,8 +2124,14 @@ class RepairTargetHandoff:
             _revalidate_block_pair(descriptors, major_minor, major, minor,
                                    parent_major_minor, parent_major, parent_minor, request_id,
                                    writable_leaf=True)
-            mount = _create_detached_ext4_write_mount(descriptors[0], major, minor)
-            descriptors.append(mount)
+            execute_ext4 = (
+                not is_rollback
+                and lease.get("responseCapability") == EXT4_EXECUTION_CAPABILITY
+            )
+            mount: int | None = None
+            if not execute_ext4:
+                mount = _create_detached_ext4_write_mount(descriptors[0], major, minor)
+                descriptors.append(mount)
             selection_c, resolution_c = self.targets.resolve_recovery_target(
                 reference, deadline=deadline)
             qualified_c = _qualify(self.targets, request, selection_c, resolution_c,
@@ -2005,10 +2156,33 @@ class RepairTargetHandoff:
                     or _physical_parent_fingerprint(fresh_claims)
                     != current_parent_fingerprint):
                 raise HandoffFailure("TARGET_CHANGED", request_id)
-            _assert_detached_ext4_write_mount_fd(mount, major, minor)
-            # Raw block capabilities remain inside the root helper TCB.
-            os.close(descriptors.pop(1))
-            os.close(descriptors.pop(0))
+            if execute_ext4:
+                _assert_block_fd(descriptors[0], major, minor, writable=True)
+                ext4_outcome = _execute_ext4_repair(
+                    descriptors[0], request["reservationId"], deadline
+                )
+                _revalidate_block_pair(
+                    descriptors,
+                    major_minor,
+                    major,
+                    minor,
+                    parent_major_minor,
+                    parent_major,
+                    parent_minor,
+                    request_id,
+                    writable_leaf=True,
+                )
+                _assert_block_fd(descriptors[0], major, minor, writable=True)
+                os.close(descriptors.pop(1))
+                os.close(descriptors.pop(0))
+            else:
+                if mount is None:
+                    raise HandoffFailure("INTERNAL", request_id)
+                _assert_detached_ext4_write_mount_fd(mount, major, minor)
+                # Raw block capabilities remain inside the root helper TCB for
+                # regular-file repairs.
+                os.close(descriptors.pop(1))
+                os.close(descriptors.pop(0))
         except HandoffFailure as error:
             _close_descriptors(descriptors)
             if error.request_id is None:
@@ -2025,12 +2199,17 @@ class RepairTargetHandoff:
             "capability": (
                 lease.get("responseCapability", ROLLBACK_WRITE_CAPABILITY)
                 if is_rollback
-                else WRITE_CAPABILITY
+                else lease.get("responseCapability", WRITE_CAPABILITY)
             ),
             "targetRecoveryFingerprint": recovery,
             "leaseBindingSha256": lease["leaseBindingSha256"],
-            "descriptor": {"type": WRITE_DESCRIPTOR_TYPE, "count": 1},
+            "descriptor": {
+                "type": lease.get("descriptorType", WRITE_DESCRIPTOR_TYPE),
+                "count": 0 if ext4_outcome is not None else 1,
+            },
         }
+        if ext4_outcome is not None:
+            response["repairOutcome"] = ext4_outcome
         if is_rollback:
             response.update(
                 {
@@ -2452,6 +2631,15 @@ def _send_record(
         }:
             if (response.get("descriptor") != {"type": WRITE_DESCRIPTOR_TYPE, "count": 1}
                     or len(descriptors) != 1):
+                raise HandoffFailure("INTERNAL", response.get("requestId"))
+            return _send_encoded_record(connection, encoded, descriptors)
+        if response.get("capability") == EXT4_EXECUTION_CAPABILITY:
+            if (
+                response.get("descriptor")
+                != {"type": EXT4_EXECUTION_DESCRIPTOR_TYPE, "count": 0}
+                or response.get("repairOutcome") not in EXT4_EXECUTION_OUTCOMES
+                or descriptors
+            ):
                 raise HandoffFailure("INTERNAL", response.get("requestId"))
             return _send_encoded_record(connection, encoded, descriptors)
         # KERNAID_REPAIR_CANDIDATE_END

@@ -24,6 +24,7 @@ DESK_REPAIR_TOKENS = (
     b"/api/rescue/repair",
     b"repair.fstab.rollback.prepare",
     b"repair.crypttab.rollback.prepare",
+    b"linux.ext4.fsck-preen-with-undo.v1",
     b"DISABILITA VOCE FSTAB",
     b"RIPRISTINA FSTAB ORIGINALE",
     b"RIPRISTINA CRYPTTAB ORIGINALE",
@@ -38,6 +39,7 @@ SERVER_REPAIR_TOKENS = (
     b"kernaid.dev/rescue-repair-service/v1alpha2",
     b"repair.fstab.rollback.prepare",
     b"repair.crypttab.rollback.prepare",
+    b"repair.ext4.prepare",
 )
 SERVER_DIAGNOSIS_TOKENS = (
     b"/api/inventory",
@@ -70,6 +72,8 @@ HANDOFF_WRITE_TOKENS = (
     b"linux.fstab.restore",
     b"linux.crypttab.disable-missing-uuid.v1",
     b"linux.crypttab.disable-missing-source.v1",
+    b"linux.ext4.fsck-preen-with-undo.v1",
+    b"linux-ext4-fsck-bounded-result-v1",
     b"rescue:selected-linux-root:etc/fstab",
     b"rescue:selected-linux-root:etc/crypttab",
 )

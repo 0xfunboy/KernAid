@@ -9,6 +9,8 @@ ConditionKernelCommandLine=kernaid.repair=fstab-v1
 ConditionPathExists=/usr/lib/kernaid/repair-candidate-image-v1
 ConditionFileIsExecutable=/usr/lib/kernaid/kernaid-rescue-repaird
 ConditionFileIsExecutable=/usr/lib/kernaid/kernaid-blockfd-probe
+ConditionFileIsExecutable=/usr/sbin/e2fsck
+ConditionFileIsExecutable=/usr/sbin/e2undo
 ConditionPathIsDirectory=/run/lock/kernaid-repair
 
 [Service]

@@ -14,7 +14,7 @@ use std::{
     io::{self, Read},
     os::unix::{
         fs::{FileTypeExt, MetadataExt, OpenOptionsExt},
-        io::AsRawFd,
+        io::{AsRawFd, BorrowedFd},
         process::CommandExt,
     },
     process::{Child, Command, Stdio},
@@ -34,6 +34,35 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const E2FSCK: &str = "/usr/sbin/e2fsck";
 const NTFSFIX: &str = "/usr/bin/ntfsfix";
 static FIXED_TOOL_SPAWN: Mutex<()> = Mutex::new(());
+
+/// Closed result used by the off-default ext4 repair preflight and
+/// postcondition verifier. It intentionally carries no tool output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ext4OfflineCheck {
+    Clean,
+    RepairRequired,
+    Unavailable,
+}
+
+/// Runs the same fixed, bounded `e2fsck -f -n` policy against a descriptor
+/// already acquired and identity-checked by the Rescue target broker.
+pub fn check_ext4_descriptor(device: BorrowedFd<'_>) -> Ext4OfflineCheck {
+    let Ok(duplicate) = rustix::io::dup(device) else {
+        return Ext4OfflineCheck::Unavailable;
+    };
+    let file = File::from(duplicate);
+    let result = SystemRunner.run(FilesystemKind::Ext4, &file);
+    if result.disposition != RunDisposition::Completed {
+        return Ext4OfflineCheck::Unavailable;
+    }
+    match result.exit_code {
+        Some(0) => Ext4OfflineCheck::Clean,
+        // Bit 2 is the documented uncorrected-filesystem-error signal. Any
+        // operational/usage/cancel/library bit makes admission unavailable.
+        Some(code) if code & 0b100 != 0 && code & !0b111 == 0 => Ext4OfflineCheck::RepairRequired,
+        _ => Ext4OfflineCheck::Unavailable,
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

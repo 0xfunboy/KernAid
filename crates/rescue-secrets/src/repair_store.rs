@@ -6338,6 +6338,9 @@ fn valid_execution_intent(intent: &RepairExecutionIntentV1) -> bool {
     let resource = match intent.action_id() {
         action if action == RepairResourceV1::Fstab.action_id() => RepairResourceV1::Fstab,
         action if action == RepairResourceV1::Crypttab.action_id() => RepairResourceV1::Crypttab,
+        action if action == RepairResourceV1::Ext4Filesystem.action_id() => {
+            RepairResourceV1::Ext4Filesystem
+        }
         _ => return false,
     };
     RepairExecutionIntentV1::new_for_resource(

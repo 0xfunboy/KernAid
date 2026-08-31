@@ -282,6 +282,8 @@ class RepairCandidatePackagingTests(unittest.TestCase):
             [
                 "/usr/lib/kernaid/kernaid-rescue-repaird",
                 "/usr/lib/kernaid/kernaid-blockfd-probe",
+                "/usr/sbin/e2fsck",
+                "/usr/sbin/e2undo",
             ],
         )
         self.assertEqual(

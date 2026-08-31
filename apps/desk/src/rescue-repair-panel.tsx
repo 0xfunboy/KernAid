@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from "react";
 import type { RescueOfflineInspection, RescueTargetSelection } from "./native";
 import {
   RESCUE_CRYPTTAB_FINDING_ID,
+  RESCUE_EXT4_FINDING_ID,
   RESCUE_FSTAB_FINDING_ID,
   RescueRepairClient,
   RescueRepairServiceError,
@@ -35,7 +36,7 @@ export function RescueRepairPanel({
   const [message, setMessage] = useState<string>();
   const [confirmation, setConfirmation] = useState("");
   const [activeCandidate, setActiveCandidate] = useState<
-    "fstab" | "crypttab"
+    "fstab" | "crypttab" | "ext4"
   >();
   const mounted = useRef(true);
 
@@ -57,7 +58,11 @@ export function RescueRepairPanel({
   useEffect(() => {
     if (prepared !== undefined)
       setActiveCandidate(
-        prepared.kind === "crypttab-prepared" ? "crypttab" : "fstab",
+        prepared.kind === "crypttab-prepared"
+          ? "crypttab"
+          : prepared.kind === "ext4-fsck-prepared"
+            ? "ext4"
+            : "fstab",
       );
     else if (rollbackPrepared !== undefined)
       setActiveCandidate(
@@ -102,11 +107,11 @@ export function RescueRepairPanel({
     };
     const poll = async () => {
       try {
-        const rollbackCandidate =
-          activeCandidate ??
-          (snapshot?.operation.startsWith("repair.crypttab.rollback.")
+        const rollbackCandidate: "fstab" | "crypttab" =
+          activeCandidate === "crypttab" ||
+          snapshot?.operation.startsWith("repair.crypttab.rollback.")
             ? "crypttab"
-            : "fstab");
+            : "fstab";
         let next = snapshot?.operation.includes(".rollback.")
           ? await repairClient.rollbackStatus(
               controller.signal,
@@ -150,7 +155,9 @@ export function RescueRepairPanel({
     };
   }, [activeCandidate, available, repairClient, snapshot]);
 
-  async function prepare(candidate: "fstab" | "crypttab"): Promise<void> {
+  async function prepare(
+    candidate: "fstab" | "crypttab" | "ext4",
+  ): Promise<void> {
     if (
       !qualifiedTarget ||
       busy ||
@@ -221,7 +228,13 @@ export function RescueRepairPanel({
   }
 
   async function prepareRollback(): Promise<void> {
-    if (committedSource === undefined || busy) return;
+    if (
+      committedSource === undefined ||
+      activeCandidate === undefined ||
+      activeCandidate === "ext4" ||
+      busy
+    )
+      return;
     setBusy(true);
     setMessage(undefined);
     setConfirmation("");
@@ -284,7 +297,10 @@ export function RescueRepairPanel({
   async function refreshAfterError(): Promise<void> {
     try {
       const current = snapshot?.operation.includes(".rollback.")
-        ? await repairClient.rollbackStatus(undefined, activeCandidate)
+        ? await repairClient.rollbackStatus(
+            undefined,
+            activeCandidate === "crypttab" ? "crypttab" : "fstab",
+          )
         : await repairClient.status();
       if (mounted.current)
         setSnapshot((previous) => newestSnapshot(previous, current));
@@ -326,8 +342,10 @@ export function RescueRepairPanel({
             : `${
                 prepared.kind === "crypttab-prepared"
                   ? RESCUE_CRYPTTAB_FINDING_ID
+                  : prepared.kind === "ext4-fsck-prepared"
+                    ? RESCUE_EXT4_FINDING_ID
                   : RESCUE_FSTAB_FINDING_ID
-              } · R2`}
+              } · ${prepared.kind === "ext4-fsck-prepared" ? "R3" : "R2"}`}
         </span>
       </div>
 
@@ -352,6 +370,9 @@ export function RescueRepairPanel({
             accetta percorsi, nomi dispositivo o comandi.
           </p>
           <div className="rescue-repair-actions">
+            <button disabled={busy} onClick={() => void prepare("ext4")}>
+              Verifica e ripara EXT4
+            </button>
             <button disabled={busy} onClick={() => void prepare("crypttab")}>
               Verifica volumi cifrati
             </button>
@@ -388,11 +409,19 @@ export function RescueRepairPanel({
           <div className="rescue-repair-diff" aria-label="Anteprima modifica">
             <div>
               <span>− Prima</span>
-              <code>voce UUID mancante · attiva</code>
+              <code>
+                {prepared.kind === "ext4-fsck-prepared"
+                  ? "filesystem · errori confermati in sola lettura"
+                  : "voce UUID mancante · attiva"}
+              </code>
             </div>
             <div>
               <span>+ Dopo</span>
-              <code>stessa voce · disabilitata da KernAid</code>
+              <code>
+                {prepared.kind === "ext4-fsck-prepared"
+                  ? "e2fsck preen · verifica read-only pulita richiesta"
+                  : "stessa voce · disabilitata da KernAid"}
+              </code>
             </div>
           </div>
           <div className="rescue-repair-row">
@@ -416,10 +445,15 @@ export function RescueRepairPanel({
             <code title={prepared.backupLocator}>{prepared.backupLocator}</code>
           </div>
           <div className="rescue-repair-backup">
-            <b>Backup pronto su dispositivo distinto</b>
+            <b>
+              {prepared.kind === "ext4-fsck-prepared"
+                ? "Evidenza preflight pronta su Vault distinto"
+                : "Backup pronto su dispositivo distinto"}
+            </b>
             <small>
-              Riserva Vault verificata · i byte originali non sono mostrati al
-              browser
+              {prepared.kind === "ext4-fsck-prepared"
+                ? "L'undo e2fsck protegge solo il tentativo nello stesso avvio: non è un backup completo e non è affidabile dopo blackout o riavvio."
+                : "Riserva Vault verificata · i byte originali non sono mostrati al browser"}
             </small>
           </div>
           <label className="rescue-repair-confirmation">
@@ -526,11 +560,11 @@ export function RescueRepairPanel({
           {snapshot.state === "succeeded" && (
             <>
               <p>
-                La voce non valida è stata disabilitata e il risultato è stato
-                verificato. Puoi spegnere KernAid Rescue e provare ad avviare il
-                sistema installato.
+                {activeCandidate === "ext4"
+                  ? "La riparazione EXT4 offline è terminata e la verifica e2fsck in sola lettura non segnala più errori. Questo non equivale a una riparazione hardware."
+                  : "La voce non valida è stata disabilitata e il risultato è stato verificato. Puoi spegnere KernAid Rescue e provare ad avviare il sistema installato."}
               </p>
-              {committedSource !== undefined && (
+              {committedSource !== undefined && activeCandidate !== "ext4" && (
                 <button disabled={busy} onClick={() => void prepareRollback()}>
                   {busy ? "Preparazione…" : "Prepara ripristino originale"}
                 </button>
@@ -541,7 +575,9 @@ export function RescueRepairPanel({
             <p>
               {snapshot.detail.terminalOutcome === "rolled-back-original"
                 ? "Rollback completato e verificato: la configurazione originale è stata ripristinata."
-                : "La verifica non ha qualificato il risultato. KernAid ha ripristinato esattamente il backup originale; nessun successo viene dichiarato."}
+                : activeCandidate === "ext4"
+                  ? "La verifica non ha qualificato il risultato. e2undo ha riportato il filesystem alla precedente classe diagnostica nello stesso avvio; KernAid non dichiara un ripristino byte-perfect."
+                  : "La verifica non ha qualificato il risultato. KernAid ha ripristinato esattamente il backup originale; nessun successo viene dichiarato."}
             </p>
           )}
           {snapshot.state === "cancelled" && (
@@ -555,10 +591,9 @@ export function RescueRepairPanel({
           )}
           {snapshot.state === "manual-reconciliation-required" && (
             <p className="rescue-repair-alert">
-              Riavvio Rescue obbligatorio. Non avviare il sistema installato e
-              non modificare manualmente la configurazione di avvio. Riavvia
-              dalla chiavetta KernAid: il recupero riprenderà dalla transazione
-              persistita nel Vault.
+              {activeCandidate === "ext4"
+                ? "Stato EXT4 ambiguo: non riavviare il sistema installato e non ripetere automaticamente la riparazione. L'undo same-boot non è power-loss safe; conserva il Vault e richiedi una riconciliazione tecnica manuale."
+                : "Riavvio Rescue obbligatorio. Non avviare il sistema installato e non modificare manualmente la configurazione di avvio. Riavvia dalla chiavetta KernAid: il recupero riprenderà dalla transazione persistita nel Vault."}
             </p>
           )}
           {snapshot.detail.transactionBindingSha256 !== null && (

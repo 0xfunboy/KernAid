@@ -80,6 +80,14 @@ the normalized collector. Unit/static evidence covers normalized healthy,
 repair-required, unavailable, malformed, and identity-bound paths. Physical
 filesystem and power-loss matrices are still **not qualified**.
 
+The private Repair candidate additionally contains one R3 ext4 preen action.
+It is restricted to an unmounted, descriptor-bound selected target, requires a
+distinct authenticated Vault evidence record and typed single-use approval,
+and keeps `e2fsck` plus raw block authority inside the root helper. Its e2undo
+stream is same-boot only and is not a full backup or power-loss-safe rollback;
+ambiguous state stops for manual reconciliation. This candidate is **not
+qualified, promoted, or present in stable images**. NTFS remains read-only.
+
 ## Current product boundary
 
 - Offline deterministic diagnosis is the default path. Production Resident

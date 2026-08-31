@@ -10,6 +10,10 @@
 use crate::rescue_crypttab_candidate::{
     ApprovedRescueCrypttabExecutionParts, ApprovedRescueCrypttabTransaction,
 };
+#[cfg(feature = "rescue-ext4-fsck-production-candidate")]
+use crate::rescue_ext4_fsck_candidate::{ApprovedExt4Repair, ApprovedExt4RepairParts};
+#[cfg(feature = "rescue-ext4-fsck-production-candidate")]
+use crate::target_write_capability_client::{Ext4RepairResultOutcome, execute_pending_ext4_repair};
 use crate::{
     repair_vault_client::{RepairBackupBytes, RepairVaultClient, RepairVaultClientError},
     rescue_fstab_candidate::{
@@ -26,6 +30,8 @@ use crate::{
         acquire_pending_target_write_mount,
     },
 };
+#[cfg(feature = "rescue-ext4-fsck-production-candidate")]
+use kernaid_linux_pack::filesystem_health::{Ext4OfflineCheck, check_ext4_descriptor};
 use kernaid_protocol::{
     rescue_repair_vault::{
         RepairBackupBinding, RepairBackupState, RepairBackupStatusPayload, RepairExecutionIntentV1,
@@ -57,6 +63,7 @@ use zeroize::Zeroizing;
 
 const FSTAB_RESOURCE: &str = "fstab";
 const CRYPTTAB_RESOURCE: &str = "crypttab";
+const UNSUPPORTED_BLOCK_RESOURCE: &str = ".kernaid-block-resource-not-a-file";
 const ETC_DIRECTORY: &str = "etc";
 const REPAIR_LOCK_DIRECTORY: &str = "/run/lock/kernaid-repair";
 const MAX_REPAIR_RESOURCE_BYTES: usize = 1024 * 1024;
@@ -66,7 +73,6 @@ const SAFETY_CLEANUP_BUDGET: Duration = Duration::from_secs(30);
 const RESOLUTION_BUDGET: Duration = Duration::from_secs(10);
 const LOCK_POLL: Duration = Duration::from_millis(5);
 const VAULT_RECOVERY_POLL: Duration = Duration::from_millis(250);
-
 static PROCESS_EXECUTOR_LOCK: Mutex<()> = Mutex::new(());
 
 /// Closed QEMU qualification seam for the production candidate. The only
@@ -925,6 +931,140 @@ pub fn execute_approved_rescue_crypttab(
     })
 }
 
+/// Executes the fixed offline ext4 repair. Durable normalized evidence and a
+/// Pending Vault transaction are established before the one-shot raw block
+/// lease is consumed. e2fsck's undo stream is same-boot only: any ambiguous
+/// restart is deliberately reported for manual reconciliation, never retried.
+#[cfg(feature = "rescue-ext4-fsck-production-candidate")]
+pub fn execute_approved_ext4_repair(
+    approved: ApprovedExt4Repair,
+    deadline: Instant,
+) -> Result<RescueFstabExecutionReceipt, RescueFstabExecutionError> {
+    let operation_deadline = reserve_cleanup_window(deadline)?;
+    let ApprovedExt4RepairParts {
+        descriptor,
+        evidence,
+        metadata,
+        target,
+        reservation,
+        approval_id,
+        approval_sha256,
+    } = approved.into_parts();
+    let claims = target.inner().target_claims();
+    if descriptor.request_id != claims.request_id()
+        || descriptor.scan_fingerprint != claims.scan_fingerprint()
+        || descriptor.target_id != claims.target_id()
+        || descriptor.target_fingerprint != claims.target_fingerprint()
+        || descriptor.before_sha256
+            != format!("sha256:{:x}", Sha256Hasher::digest(evidence.as_slice()))
+    {
+        reservation
+            .cancel(deadline)
+            .map_err(|_| RescueFstabExecutionError::VaultReconciliationRequired)?;
+        return Err(RescueFstabExecutionError::InvalidAuthority);
+    }
+    let intent = RepairExecutionIntentV1::new_for_resource(
+        RepairResourceV1::Ext4Filesystem,
+        &descriptor.session_id,
+        1,
+        &descriptor.target_id,
+        &descriptor.scan_fingerprint,
+        parse_prefixed_sha256(&descriptor.target_fingerprint)?,
+        parse_prefixed_sha256(target.physical_parent_fingerprint())?,
+        claims.recovery_fingerprint(),
+        target.lock_identity(),
+        parse_prefixed_sha256(&descriptor.before_sha256)?,
+        parse_prefixed_sha256(&descriptor.after_sha256)?,
+        parse_prefixed_sha256(&descriptor.diff_sha256)?,
+        parse_prefixed_sha256(&descriptor.before_sha256)?,
+        metadata.clone(),
+    )
+    .map_err(|_| RescueFstabExecutionError::InvalidAuthority)?;
+    let binding = RepairBackupBinding::new(
+        &descriptor.plan_id,
+        parse_prefixed_sha256(&descriptor.plan_sha256)?,
+        approval_id,
+        parse_prefixed_sha256(&approval_sha256)?,
+        RepairResourceV1::Ext4Filesystem.resource_id(),
+        intent.before_sha256().clone(),
+        intent.clone(),
+    )
+    .map_err(|_| RescueFstabExecutionError::InvalidAuthority)?;
+    let _process_lock = acquire_process_lock(operation_deadline)?;
+    let _target_lock = acquire_target_lock(&target, operation_deadline)?;
+    target
+        .inner()
+        .revalidate()
+        .map_err(|_| RescueFstabExecutionError::TargetChanged)?;
+    if check_ext4_descriptor(target.inner().target_block_descriptor())
+        != Ext4OfflineCheck::RepairRequired
+    {
+        reservation
+            .cancel(deadline)
+            .map_err(|_| RescueFstabExecutionError::VaultReconciliationRequired)?;
+        return Err(RescueFstabExecutionError::TargetChanged);
+    }
+    let (mut vault_client, reserved) = reservation.into_parts();
+    let durable = persist_pending(
+        &mut vault_client,
+        &reserved,
+        &binding,
+        &metadata,
+        &evidence,
+        operation_deadline,
+    )?;
+    let pending = RepairTransactionStatusPayload::pending(durable)
+        .map_err(|_| RescueFstabExecutionError::InvalidAuthority)?;
+    drop(target);
+    let result = execute_pending_ext4_repair(&pending, operation_deadline)
+        .map_err(map_write_capability_error)?;
+    refresh_pending_after_write_lease(&mut vault_client, &pending, operation_deadline)?;
+    if result.reservation_id() != pending.backup().reservation_id().as_str()
+        || result.transaction_binding_sha256() != pending.transaction_binding_sha256().as_str()
+        || result.target_recovery_fingerprint() != intent.target_recovery_fingerprint()
+        || result.lease_binding_sha256().is_empty()
+    {
+        return Err(RescueFstabExecutionError::RecoveryRequired);
+    }
+    let closure = match result.outcome() {
+        Ext4RepairResultOutcome::CommittedClean => Ext4TargetClosure {
+            outcome: RepairTransactionResolutionOutcome::CommittedAfter,
+            observed_resource_sha256: intent.after_sha256().clone(),
+            cleanup_verified: true,
+        },
+        Ext4RepairResultOutcome::ClosedBeforeUnchanged => Ext4TargetClosure {
+            outcome: RepairTransactionResolutionOutcome::ClosedBeforeUnchanged,
+            observed_resource_sha256: intent.before_sha256().clone(),
+            cleanup_verified: true,
+        },
+        Ext4RepairResultOutcome::ClosedBeforeRestored => Ext4TargetClosure {
+            outcome: RepairTransactionResolutionOutcome::ClosedBeforeRestored,
+            observed_resource_sha256: intent.before_sha256().clone(),
+            cleanup_verified: true,
+        },
+        Ext4RepairResultOutcome::ManualReconciliationRequired => {
+            return Err(RescueFstabExecutionError::RecoveryRequired);
+        }
+    };
+    let resolution = RepairTransactionResolution::new(
+        closure.outcome,
+        closure.observed_resource_sha256,
+        metadata.canonical_sha256(),
+        closure.cleanup_verified,
+        &intent,
+    )
+    .map_err(|_| RescueFstabExecutionError::RecoveryUnavailable)?;
+    let resolved = resolve_pending(&mut vault_client, &pending, &resolution, deadline)?;
+    receipt_from_status(&resolved)
+}
+
+#[cfg(feature = "rescue-ext4-fsck-production-candidate")]
+struct Ext4TargetClosure {
+    outcome: RepairTransactionResolutionOutcome,
+    observed_resource_sha256: Sha256,
+    cleanup_verified: bool,
+}
+
 /// Reconciles the sole unresolved transaction after a process restart or
 /// reboot. Target reacquisition uses only the approval-bound stable recovery
 /// fingerprint; every boot-local target claim is freshly authenticated.
@@ -959,6 +1099,18 @@ pub fn recover_pending_rescue_fstab(
         .execution_intent()
         .cloned()
         .ok_or(RescueFstabExecutionError::InvalidAuthority)?;
+    #[cfg(feature = "rescue-ext4-fsck-production-candidate")]
+    if repair_resource_for_intent(&intent)? == RepairResourceV1::Ext4Filesystem {
+        // e2fsck's undo file is intentionally same-boot only. A process or
+        // machine restart after the durable Pending barrier is ambiguous, so
+        // never reacquire write authority or auto-retry the block mutation.
+        return Ok(Some(RescueFstabExecutionReceipt {
+            outcome: RescueFstabExecutionOutcome::ManualReconciliationRequired,
+            reservation_id: pending.backup().reservation_id().as_str().to_owned(),
+            transaction_binding_sha256: pending.transaction_binding_sha256().as_str().to_owned(),
+            initial_failure: Some(RescueFstabExecutionError::RecoveryRequired),
+        }));
+    }
 
     let live_vault = vault_client
         .live_identity(operation_deadline)
@@ -1233,7 +1385,11 @@ fn source_intent(
 fn repair_resource_for_intent(
     intent: &RepairExecutionIntentV1,
 ) -> Result<RepairResourceV1, RescueFstabExecutionError> {
-    for resource in [RepairResourceV1::Fstab, RepairResourceV1::Crypttab] {
+    for resource in [
+        RepairResourceV1::Fstab,
+        RepairResourceV1::Crypttab,
+        RepairResourceV1::Ext4Filesystem,
+    ] {
         if intent.action_id() == resource.action_id() {
             return Ok(resource);
         }
@@ -1245,6 +1401,7 @@ fn resource_leaf(resource: RepairResourceV1) -> &'static str {
     match resource {
         RepairResourceV1::Fstab => FSTAB_RESOURCE,
         RepairResourceV1::Crypttab => CRYPTTAB_RESOURCE,
+        RepairResourceV1::Ext4Filesystem => UNSUPPORTED_BLOCK_RESOURCE,
     }
 }
 
