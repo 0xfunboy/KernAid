@@ -2513,8 +2513,10 @@ dependencies = [
  "kernaid-fleet-policy",
  "kernaid-fleet-runtime",
  "kernaid-linux-pack",
+ "kernaid-linux-systemd",
  "kernaid-macos-pack",
  "kernaid-native-secrets",
+ "kernaid-protocol",
  "kernaid-windows-pack",
  "process-wrap",
  "rand_core 0.6.4",
@@ -2733,6 +2735,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "kernaid-device-identity",
+ "kernaid-fleet-client",
  "kernaid-linux-nsfs",
  "kernaid-protocol",
  "kernaid-report-schema",

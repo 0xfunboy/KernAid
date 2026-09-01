@@ -9,11 +9,12 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::DateTime;
 use ed25519_dalek::{Signature, VerifyingKey};
+#[cfg(test)]
 use kernaid_device_identity::DeviceIdentity;
 use kernaid_fleet_client::{
-    FleetClientError, LeasedWorkOrder, SignedWorkOrderClaimRequest, SignedWorkOrderResult,
-    WorkOrderActionId, WorkOrderClaimRequestInput, WorkOrderKind, WorkOrderRequiredFeature,
-    WorkOrderResultInput, WorkOrderResultOutcome, WorkOrderRisk,
+    FleetClientError, FleetRequestSigner, LeasedWorkOrder, SignedWorkOrderClaimRequest,
+    SignedWorkOrderResult, WorkOrderActionId, WorkOrderClaimRequestInput, WorkOrderKind,
+    WorkOrderRequiredFeature, WorkOrderResultInput, WorkOrderResultOutcome, WorkOrderRisk,
 };
 use kernaid_fleet_policy::{
     PolicyDecision, PolicyEvaluation, PolicyOperation, RiskLevel, TransportState,
@@ -38,6 +39,12 @@ pub mod linux;
 pub mod macos;
 #[cfg(any(feature = "rescue-fstab-handoff", feature = "rescue-repair-handoff"))]
 pub mod rescue;
+#[cfg(all(target_os = "linux", feature = "rescue-repair-handoff"))]
+pub mod rescue_local;
+#[cfg(all(target_os = "linux", feature = "rescue-fleet-service"))]
+pub mod rescue_service;
+#[cfg(all(target_os = "linux", feature = "rescue-fleet-service"))]
+pub mod rescue_vault_signer;
 #[cfg(all(feature = "windows-service", any(windows, test)))]
 pub mod windows;
 
@@ -668,31 +675,32 @@ pub struct ResidentWorkOrderEngine<T> {
 }
 
 impl<T: ResidentWorkOrderTransport> ResidentWorkOrderEngine<T> {
-    pub fn open(
+    pub fn open<S: FleetRequestSigner + ?Sized>(
         tenant_id: &str,
-        identity: &DeviceIdentity,
+        identity: &S,
         service_receipt_anchor: &[u8; 32],
         state_directory: &Path,
         transport: T,
     ) -> Result<Self, ResidentWorkOrderError> {
         validate_identifier(tenant_id)?;
-        let device_id = identity.device_id();
+        let device_id = identity.device_id()?;
+        let device_public_key = identity.public_key()?;
         let service_receipt_anchor = VerifyingKey::from_bytes(service_receipt_anchor)
             .map_err(|_| ResidentWorkOrderError::InvalidContext)?;
         let journal = WorkOrderJournal::open(state_directory, tenant_id, &device_id)?;
         Ok(Self {
             tenant_id: tenant_id.to_owned(),
             device_id,
-            device_public_key: identity.public_key(),
+            device_public_key,
             service_receipt_anchor,
             transport,
             journal,
         })
     }
 
-    pub fn run_once<H: LocalWorkOrderHandoff>(
+    pub fn run_once<H: LocalWorkOrderHandoff, S: FleetRequestSigner + ?Sized>(
         &mut self,
-        identity: &DeviceIdentity,
+        identity: &S,
         input: WorkOrderCycleInput,
         authorization: &WorkOrderAuthorization<'_>,
         handoff: &mut H,
@@ -702,16 +710,14 @@ impl<T: ResidentWorkOrderTransport> ResidentWorkOrderEngine<T> {
         for _ in 0..6 {
             match self.journal.document.stage.clone() {
                 JournalStage::Idle => {
-                    let request = SignedWorkOrderClaimRequest::sign(
-                        identity,
-                        WorkOrderClaimRequestInput::new(
+                    let request = identity
+                        .sign_work_order_claim(WorkOrderClaimRequestInput::new(
                             &self.tenant_id,
                             &input.issued_at,
                             input.nonce.to_vec(),
                             input.lease_seconds,
-                        ),
-                    )?
-                    .export_offline()?;
+                        ))?
+                        .export_offline()?;
                     self.journal.replace_stage(
                         JournalStage::ClaimPending {
                             request: URL_SAFE_NO_PAD.encode(request),
@@ -834,16 +840,14 @@ impl<T: ResidentWorkOrderTransport> ResidentWorkOrderEngine<T> {
                         .execute_or_recover(&preparation)
                         .map_err(ResidentWorkOrderError::Handoff)?;
                     validate_sha256(&local_result.result_sha256)?;
-                    let result = SignedWorkOrderResult::sign(
-                        identity,
-                        WorkOrderResultInput::from_order(
+                    let result =
+                        identity.sign_work_order_result(WorkOrderResultInput::from_order(
                             &self.tenant_id,
                             &order,
                             local_result.outcome,
                             &input.issued_at,
                             local_result.result_sha256,
-                        ),
-                    )?;
+                        ))?;
                     self.journal.replace_stage(
                         JournalStage::ResultPending {
                             claim,
@@ -927,8 +931,12 @@ impl<T: ResidentWorkOrderTransport> ResidentWorkOrderEngine<T> {
         Err(ResidentWorkOrderError::StateCorrupt)
     }
 
-    fn ensure_identity(&self, identity: &DeviceIdentity) -> Result<(), ResidentWorkOrderError> {
-        if identity.device_id() != self.device_id || identity.public_key() != self.device_public_key
+    fn ensure_identity<S: FleetRequestSigner + ?Sized>(
+        &self,
+        identity: &S,
+    ) -> Result<(), ResidentWorkOrderError> {
+        if identity.device_id()? != self.device_id
+            || identity.public_key()? != self.device_public_key
         {
             return Err(ResidentWorkOrderError::InvalidContext);
         }
@@ -964,24 +972,22 @@ impl<T: ResidentWorkOrderTransport> ResidentWorkOrderEngine<T> {
             .ok_or(ResidentWorkOrderError::StateCorrupt)
     }
 
-    fn signed_denial(
+    fn signed_denial<S: FleetRequestSigner + ?Sized>(
         &self,
-        identity: &DeviceIdentity,
+        identity: &S,
         order: &LeasedWorkOrder,
         input: &WorkOrderCycleInput,
         denial: AuthorizationDenial,
     ) -> Result<SignedWorkOrderResult, ResidentWorkOrderError> {
-        SignedWorkOrderResult::sign(
-            identity,
-            WorkOrderResultInput::from_order(
+        identity
+            .sign_work_order_result(WorkOrderResultInput::from_order(
                 &self.tenant_id,
                 order,
                 WorkOrderResultOutcome::Rejected,
                 &input.issued_at,
                 rejection_digest(order, denial),
-            ),
-        )
-        .map_err(Into::into)
+            ))
+            .map_err(Into::into)
     }
 }
 

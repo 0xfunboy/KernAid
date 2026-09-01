@@ -5,6 +5,9 @@ repair_candidate_binary=/usr/lib/kernaid/kernaid-rescue-repaird
 repair_candidate_blockfd_probe=/usr/lib/kernaid/kernaid-blockfd-probe
 repair_candidate_service=/etc/systemd/system/kernaid-rescue-repaird.service
 repair_candidate_socket=/etc/systemd/system/kernaid-rescue-repaird.socket
+fleet_repair_binary=/usr/lib/kernaid/kernaid-fleet-rescue-repair-bridge
+fleet_repair_service=/etc/systemd/system/kernaid-fleet-rescue-repair.service
+fleet_repair_socket=/etc/systemd/system/kernaid-fleet-rescue-repair.socket
 repair_candidate_sysusers=/etc/sysusers.d/kernaid-repair-candidate.conf
 repair_candidate_tmpfiles=/usr/lib/tmpfiles.d/kernaid-repair-candidate.conf
 repair_candidate_ui_dropin=/etc/systemd/system/kernaid-ui.service.d/50-kernaid-repair-candidate.conf
@@ -106,6 +109,9 @@ if [ -e "$repair_candidate_marker" ] || [ -L "$repair_candidate_marker" ]; then
         "$repair_candidate_blockfd_probe" \
         "$repair_candidate_service" \
         "$repair_candidate_socket" \
+        "$fleet_repair_binary" \
+        "$fleet_repair_service" \
+        "$fleet_repair_socket" \
         "$repair_candidate_sysusers" \
         "$repair_candidate_tmpfiles" \
         "$repair_candidate_ui_dropin" \
@@ -115,6 +121,7 @@ if [ -e "$repair_candidate_marker" ] || [ -L "$repair_candidate_marker" ]; then
     done
     test -x "$repair_candidate_binary"
     test -x "$repair_candidate_blockfd_probe"
+    test -x "$fleet_repair_binary"
     grep -Fxq 'kernaid.repair=fstab-v1' "$repair_candidate_marker"
     chown root:root \
         "$repair_candidate_marker" \
@@ -122,6 +129,9 @@ if [ -e "$repair_candidate_marker" ] || [ -L "$repair_candidate_marker" ]; then
         "$repair_candidate_blockfd_probe" \
         "$repair_candidate_service" \
         "$repair_candidate_socket" \
+        "$fleet_repair_binary" \
+        "$fleet_repair_service" \
+        "$fleet_repair_socket" \
         "$repair_candidate_sysusers" \
         "$repair_candidate_tmpfiles" \
         "$repair_candidate_ui_dropin" \
@@ -131,12 +141,15 @@ if [ -e "$repair_candidate_marker" ] || [ -L "$repair_candidate_marker" ]; then
     chmod 0755 \
         "$repair_candidate_binary" \
         "$repair_candidate_blockfd_probe" \
+        "$fleet_repair_binary" \
         /etc/systemd/system/kernaid-ui.service.d \
         /etc/systemd/system/kernaid-ready.service.d
     chmod 0644 \
         "$repair_candidate_marker" \
         "$repair_candidate_service" \
         "$repair_candidate_socket" \
+        "$fleet_repair_service" \
+        "$fleet_repair_socket" \
         "$repair_candidate_sysusers" \
         "$repair_candidate_tmpfiles" \
         "$repair_candidate_ui_dropin" \
@@ -148,6 +161,9 @@ else
         "$repair_candidate_blockfd_probe" \
         "$repair_candidate_service" \
         "$repair_candidate_socket" \
+        "$fleet_repair_binary" \
+        "$fleet_repair_service" \
+        "$fleet_repair_socket" \
         "$repair_candidate_sysusers" \
         "$repair_candidate_tmpfiles" \
         "$repair_candidate_ui_dropin" \
@@ -390,6 +406,8 @@ systemctl enable kernaid-rescue-vaultd.socket
 systemctl enable kernaid-rescue-vaultd.service
 if [ "$repair_candidate_enabled" = "1" ]; then
     systemctl enable kernaid-rescue-repaird.socket
+    systemctl enable kernaid-fleet-rescue-repair.socket
+    systemctl enable kernaid-fleet-rescue-repair.service
 fi
 systemctl mask swap.target
 mkdir -p /etc/polkit-1/rules.d

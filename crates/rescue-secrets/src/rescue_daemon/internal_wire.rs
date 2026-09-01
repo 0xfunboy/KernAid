@@ -43,13 +43,45 @@ use std::{
 #[cfg(feature = "experimental-codex-home-lease")]
 use std::os::fd::AsFd;
 
-#[cfg(feature = "experimental-repair-store")]
+#[cfg(all(
+    feature = "experimental-repair-store",
+    feature = "experimental-fleet-signing"
+))]
+const COMMAND_MAGIC: &[u8; 8] = b"KRVWC009";
+#[cfg(all(
+    feature = "experimental-repair-store",
+    not(feature = "experimental-fleet-signing")
+))]
 const COMMAND_MAGIC: &[u8; 8] = b"KRVWC008";
-#[cfg(not(feature = "experimental-repair-store"))]
+#[cfg(all(
+    not(feature = "experimental-repair-store"),
+    feature = "experimental-fleet-signing"
+))]
+const COMMAND_MAGIC: &[u8; 8] = b"KRVWC004";
+#[cfg(all(
+    not(feature = "experimental-repair-store"),
+    not(feature = "experimental-fleet-signing")
+))]
 const COMMAND_MAGIC: &[u8; 8] = b"KRVWC003";
-#[cfg(feature = "experimental-repair-store")]
+#[cfg(all(
+    feature = "experimental-repair-store",
+    feature = "experimental-fleet-signing"
+))]
+const RESPONSE_MAGIC: &[u8; 8] = b"KRVWR009";
+#[cfg(all(
+    feature = "experimental-repair-store",
+    not(feature = "experimental-fleet-signing")
+))]
 const RESPONSE_MAGIC: &[u8; 8] = b"KRVWR008";
-#[cfg(not(feature = "experimental-repair-store"))]
+#[cfg(all(
+    not(feature = "experimental-repair-store"),
+    feature = "experimental-fleet-signing"
+))]
+const RESPONSE_MAGIC: &[u8; 8] = b"KRVWR004";
+#[cfg(all(
+    not(feature = "experimental-repair-store"),
+    not(feature = "experimental-fleet-signing")
+))]
 const RESPONSE_MAGIC: &[u8; 8] = b"KRVWR003";
 // Repair capabilities intentionally remain one canonical fixed-size binary
 // record. Rollback status embeds the complete committed source transaction;
@@ -63,11 +95,17 @@ const COMMAND_BYTES: usize = 128;
 const RESPONSE_BYTES: usize = 4096;
 #[cfg(not(feature = "experimental-repair-store"))]
 const RESPONSE_BYTES: usize = 128;
-const MAX_RECORD_BYTES: usize = if COMMAND_BYTES > RESPONSE_BYTES {
+#[cfg(not(feature = "experimental-fleet-signing"))]
+const CONTROL_RECORD_BYTES: usize = if COMMAND_BYTES > RESPONSE_BYTES {
     COMMAND_BYTES
 } else {
     RESPONSE_BYTES
 };
+#[cfg(feature = "experimental-fleet-signing")]
+const MAX_RECORD_BYTES: usize =
+    kernaid_protocol::rescue_vault::MAX_FLEET_SIGNED_REQUEST_BYTES as usize;
+#[cfg(not(feature = "experimental-fleet-signing"))]
+const MAX_RECORD_BYTES: usize = CONTROL_RECORD_BYTES;
 const COMMAND_VALUE_OFFSET: usize = 20;
 const COMMAND_PEER_UID_OFFSET: usize = 28;
 const COMMAND_PEER_PID_OFFSET: usize = 32;
@@ -566,6 +604,33 @@ pub(super) enum WorkerApplicationCommand {
     },
 }
 
+#[cfg(feature = "experimental-fleet-signing")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum WorkerFleetSignCommand {
+    Enrollment { input_size: u64 },
+    WorkOrderClaim { input_size: u64 },
+    WorkOrderResult { input_size: u64 },
+}
+
+#[cfg(feature = "experimental-fleet-signing")]
+impl WorkerFleetSignCommand {
+    pub(super) const fn kind(self) -> WorkerCommandKind {
+        match self {
+            Self::Enrollment { .. } => WorkerCommandKind::FleetEnrollmentSign,
+            Self::WorkOrderClaim { .. } => WorkerCommandKind::FleetWorkOrderClaimSign,
+            Self::WorkOrderResult { .. } => WorkerCommandKind::FleetWorkOrderResultSign,
+        }
+    }
+
+    pub(super) const fn input_size(self) -> u64 {
+        match self {
+            Self::Enrollment { input_size }
+            | Self::WorkOrderClaim { input_size }
+            | Self::WorkOrderResult { input_size } => input_size,
+        }
+    }
+}
+
 impl WorkerApplicationCommand {
     pub(super) const fn kind(&self) -> WorkerCommandKind {
         match self {
@@ -621,6 +686,12 @@ pub(super) enum WorkerCommandKind {
     RepairRollbackResolve,
     #[cfg(feature = "experimental-repair-store")]
     RepairRollbackWriteLeaseConsume,
+    #[cfg(feature = "experimental-fleet-signing")]
+    FleetEnrollmentSign,
+    #[cfg(feature = "experimental-fleet-signing")]
+    FleetWorkOrderClaimSign,
+    #[cfg(feature = "experimental-fleet-signing")]
+    FleetWorkOrderResultSign,
     AttestQuiescent,
     Shutdown,
 }
@@ -631,17 +702,32 @@ pub(super) struct WorkerCommand {
     pub(super) kind: WorkerCommandKind,
     pub(super) secret_size: u16,
     pub(super) application: Option<WorkerApplicationCommand>,
+    #[cfg(feature = "experimental-fleet-signing")]
+    pub(super) fleet: Option<WorkerFleetSignCommand>,
     #[cfg(feature = "experimental-repair-store")]
     pub(super) repair: Option<WorkerRepairCommand>,
 }
 
 impl WorkerCommand {
+    fn fleet_is_some(&self) -> bool {
+        #[cfg(feature = "experimental-fleet-signing")]
+        {
+            self.fleet.is_some()
+        }
+        #[cfg(not(feature = "experimental-fleet-signing"))]
+        {
+            false
+        }
+    }
+
     pub(super) fn bootstrap(request_id: u64) -> Self {
         Self {
             request_id,
             kind: WorkerCommandKind::Bootstrap,
             secret_size: 0,
             application: None,
+            #[cfg(feature = "experimental-fleet-signing")]
+            fleet: None,
             #[cfg(feature = "experimental-repair-store")]
             repair: None,
         }
@@ -653,6 +739,8 @@ impl WorkerCommand {
             kind: WorkerCommandKind::Probe,
             secret_size: 0,
             application: None,
+            #[cfg(feature = "experimental-fleet-signing")]
+            fleet: None,
             #[cfg(feature = "experimental-repair-store")]
             repair: None,
         }
@@ -664,6 +752,8 @@ impl WorkerCommand {
             kind: WorkerCommandKind::Unlock,
             secret_size: passphrase_size,
             application: None,
+            #[cfg(feature = "experimental-fleet-signing")]
+            fleet: None,
             #[cfg(feature = "experimental-repair-store")]
             repair: None,
         }
@@ -675,6 +765,8 @@ impl WorkerCommand {
             kind: WorkerCommandKind::Lock,
             secret_size: 0,
             application: None,
+            #[cfg(feature = "experimental-fleet-signing")]
+            fleet: None,
             #[cfg(feature = "experimental-repair-store")]
             repair: None,
         }
@@ -686,6 +778,8 @@ impl WorkerCommand {
             kind: WorkerCommandKind::ProviderStatus,
             secret_size: 0,
             application: None,
+            #[cfg(feature = "experimental-fleet-signing")]
+            fleet: None,
             #[cfg(feature = "experimental-repair-store")]
             repair: None,
         }
@@ -697,6 +791,8 @@ impl WorkerCommand {
             kind: WorkerCommandKind::ProviderOpenAiConfigure,
             secret_size: api_key_size,
             application: None,
+            #[cfg(feature = "experimental-fleet-signing")]
+            fleet: None,
             #[cfg(feature = "experimental-repair-store")]
             repair: None,
         }
@@ -708,6 +804,8 @@ impl WorkerCommand {
             kind: WorkerCommandKind::ProviderOpenAiLogout,
             secret_size: 0,
             application: None,
+            #[cfg(feature = "experimental-fleet-signing")]
+            fleet: None,
             #[cfg(feature = "experimental-repair-store")]
             repair: None,
         }
@@ -719,6 +817,8 @@ impl WorkerCommand {
             kind: WorkerCommandKind::ProviderOpenAiBorrow,
             secret_size: 0,
             application: None,
+            #[cfg(feature = "experimental-fleet-signing")]
+            fleet: None,
             #[cfg(feature = "experimental-repair-store")]
             repair: None,
         }
@@ -731,6 +831,8 @@ impl WorkerCommand {
             kind: WorkerCommandKind::ProviderCodexHomeLease,
             secret_size: 0,
             application: None,
+            #[cfg(feature = "experimental-fleet-signing")]
+            fleet: None,
             #[cfg(feature = "experimental-repair-store")]
             repair: None,
         }
@@ -742,6 +844,21 @@ impl WorkerCommand {
             kind: application.kind(),
             secret_size: 0,
             application: Some(application),
+            #[cfg(feature = "experimental-fleet-signing")]
+            fleet: None,
+            #[cfg(feature = "experimental-repair-store")]
+            repair: None,
+        }
+    }
+
+    #[cfg(feature = "experimental-fleet-signing")]
+    pub(super) fn fleet(request_id: u64, fleet: WorkerFleetSignCommand) -> Self {
+        Self {
+            request_id,
+            kind: fleet.kind(),
+            secret_size: 0,
+            application: None,
+            fleet: Some(fleet),
             #[cfg(feature = "experimental-repair-store")]
             repair: None,
         }
@@ -754,6 +871,8 @@ impl WorkerCommand {
             kind: repair.kind(),
             secret_size: 0,
             application: None,
+            #[cfg(feature = "experimental-fleet-signing")]
+            fleet: None,
             repair: Some(repair),
         }
     }
@@ -764,6 +883,8 @@ impl WorkerCommand {
             kind: WorkerCommandKind::Shutdown,
             secret_size: 0,
             application: None,
+            #[cfg(feature = "experimental-fleet-signing")]
+            fleet: None,
             #[cfg(feature = "experimental-repair-store")]
             repair: None,
         }
@@ -775,6 +896,8 @@ impl WorkerCommand {
             kind: WorkerCommandKind::AttestQuiescent,
             secret_size: 0,
             application: None,
+            #[cfg(feature = "experimental-fleet-signing")]
+            fleet: None,
             #[cfg(feature = "experimental-repair-store")]
             repair: None,
         }
@@ -785,11 +908,33 @@ impl WorkerCommand {
             .application
             .as_ref()
             .map(WorkerApplicationCommand::kind);
+        #[cfg(feature = "experimental-fleet-signing")]
+        let fleet_kind = self.fleet.map(WorkerFleetSignCommand::kind);
+        #[cfg(feature = "experimental-fleet-signing")]
+        if fleet_kind.is_some_and(|kind| kind != self.kind)
+            || (fleet_kind.is_some() && (application_kind.is_some() || self.secret_size != 0))
+            || (fleet_kind.is_none()
+                && matches!(
+                    self.kind,
+                    WorkerCommandKind::FleetEnrollmentSign
+                        | WorkerCommandKind::FleetWorkOrderClaimSign
+                        | WorkerCommandKind::FleetWorkOrderResultSign
+                ))
+            || self.fleet.is_some_and(|fleet| {
+                !(2..=kernaid_protocol::rescue_vault::MAX_FLEET_SIGNING_INPUT_BYTES)
+                    .contains(&fleet.input_size())
+            })
+        {
+            return Err(InternalWireError::InvalidFrame);
+        }
         #[cfg(feature = "experimental-repair-store")]
         let repair_kind = self.repair.as_ref().map(WorkerRepairCommand::kind);
         #[cfg(feature = "experimental-repair-store")]
         if repair_kind.is_some_and(|kind| kind != self.kind)
-            || (repair_kind.is_some() && (application_kind.is_some() || self.secret_size != 0))
+            || (repair_kind.is_some()
+                && (application_kind.is_some()
+                    || self.secret_size != 0
+                    || cfg!(feature = "experimental-fleet-signing") && self.fleet_is_some()))
             || (repair_kind.is_none()
                 && matches!(
                     self.kind,
@@ -880,6 +1025,12 @@ impl WorkerCommand {
             WorkerCommandKind::RepairRollbackResolve => 28,
             #[cfg(feature = "experimental-repair-store")]
             WorkerCommandKind::RepairRollbackWriteLeaseConsume => 29,
+            #[cfg(feature = "experimental-fleet-signing")]
+            WorkerCommandKind::FleetEnrollmentSign => 30,
+            #[cfg(feature = "experimental-fleet-signing")]
+            WorkerCommandKind::FleetWorkOrderClaimSign => 31,
+            #[cfg(feature = "experimental-fleet-signing")]
+            WorkerCommandKind::FleetWorkOrderResultSign => 32,
         };
         bytes[12..20].copy_from_slice(&self.request_id.to_be_bytes());
         if let Some(application) = &self.application {
@@ -935,16 +1086,21 @@ impl WorkerCommand {
                 }
             }
         }
+        #[cfg(feature = "experimental-fleet-signing")]
+        if let Some(fleet) = self.fleet {
+            bytes[COMMAND_VALUE_OFFSET..COMMAND_VALUE_OFFSET + 8]
+                .copy_from_slice(&fleet.input_size().to_be_bytes());
+        }
         #[cfg(feature = "experimental-repair-store")]
         if let Some(repair) = &self.repair {
             repair.validate()?;
             encode_repair_command(&mut bytes, repair)?;
-        } else if self.application.is_none() {
+        } else if self.application.is_none() && !self.fleet_is_some() {
             bytes[COMMAND_VALUE_OFFSET..COMMAND_VALUE_OFFSET + 2]
                 .copy_from_slice(&self.secret_size.to_be_bytes());
         }
         #[cfg(not(feature = "experimental-repair-store"))]
-        if self.application.is_none() {
+        if self.application.is_none() && !self.fleet_is_some() {
             bytes[COMMAND_VALUE_OFFSET..COMMAND_VALUE_OFFSET + 2]
                 .copy_from_slice(&self.secret_size.to_be_bytes());
         }
@@ -1010,6 +1166,12 @@ impl WorkerCommand {
             28 => WorkerCommandKind::RepairRollbackResolve,
             #[cfg(feature = "experimental-repair-store")]
             29 => WorkerCommandKind::RepairRollbackWriteLeaseConsume,
+            #[cfg(feature = "experimental-fleet-signing")]
+            30 => WorkerCommandKind::FleetEnrollmentSign,
+            #[cfg(feature = "experimental-fleet-signing")]
+            31 => WorkerCommandKind::FleetWorkOrderClaimSign,
+            #[cfg(feature = "experimental-fleet-signing")]
+            32 => WorkerCommandKind::FleetWorkOrderResultSign,
             _ => return Err(InternalWireError::InvalidFrame),
         };
         let application = match kind {
@@ -1065,6 +1227,35 @@ impl WorkerCommand {
             }),
             _ => None,
         };
+        #[cfg(feature = "experimental-fleet-signing")]
+        let fleet = match kind {
+            WorkerCommandKind::FleetEnrollmentSign => Some(WorkerFleetSignCommand::Enrollment {
+                input_size: u64::from_be_bytes(
+                    bytes[COMMAND_VALUE_OFFSET..COMMAND_VALUE_OFFSET + 8]
+                        .try_into()
+                        .map_err(|_| InternalWireError::InvalidFrame)?,
+                ),
+            }),
+            WorkerCommandKind::FleetWorkOrderClaimSign => {
+                Some(WorkerFleetSignCommand::WorkOrderClaim {
+                    input_size: u64::from_be_bytes(
+                        bytes[COMMAND_VALUE_OFFSET..COMMAND_VALUE_OFFSET + 8]
+                            .try_into()
+                            .map_err(|_| InternalWireError::InvalidFrame)?,
+                    ),
+                })
+            }
+            WorkerCommandKind::FleetWorkOrderResultSign => {
+                Some(WorkerFleetSignCommand::WorkOrderResult {
+                    input_size: u64::from_be_bytes(
+                        bytes[COMMAND_VALUE_OFFSET..COMMAND_VALUE_OFFSET + 8]
+                            .try_into()
+                            .map_err(|_| InternalWireError::InvalidFrame)?,
+                    ),
+                })
+            }
+            _ => None,
+        };
         #[cfg(feature = "experimental-repair-store")]
         let repair = match kind {
             WorkerCommandKind::RepairBackupReserve
@@ -1085,15 +1276,33 @@ impl WorkerCommand {
             }
             _ => None,
         };
-        #[cfg(feature = "experimental-repair-store")]
+        #[cfg(all(
+            feature = "experimental-repair-store",
+            feature = "experimental-fleet-signing"
+        ))]
+        let payload_command = application.is_some() || repair.is_some() || fleet.is_some();
+        #[cfg(all(
+            feature = "experimental-repair-store",
+            not(feature = "experimental-fleet-signing")
+        ))]
         let payload_command = application.is_some() || repair.is_some();
-        #[cfg(not(feature = "experimental-repair-store"))]
+        #[cfg(all(
+            not(feature = "experimental-repair-store"),
+            feature = "experimental-fleet-signing"
+        ))]
+        let payload_command = application.is_some() || fleet.is_some();
+        #[cfg(all(
+            not(feature = "experimental-repair-store"),
+            not(feature = "experimental-fleet-signing")
+        ))]
         let payload_command = application.is_some();
         let command = Self {
             request_id,
             kind,
             secret_size: if payload_command { 0 } else { secret_size },
             application,
+            #[cfg(feature = "experimental-fleet-signing")]
+            fleet,
             #[cfg(feature = "experimental-repair-store")]
             repair,
         };
@@ -2353,6 +2562,10 @@ pub(super) enum WorkerResultCode {
     RepairRollbackResolved,
     #[cfg(feature = "experimental-repair-store")]
     RepairRollbackWriteLeaseConsumed,
+    #[cfg(feature = "experimental-fleet-signing")]
+    FleetSignedReady,
+    #[cfg(feature = "experimental-fleet-signing")]
+    FleetInvalidRequest,
 }
 
 impl WorkerResultCode {
@@ -2458,6 +2671,10 @@ impl WorkerResultCode {
             Self::RepairRollbackResolved => 78,
             #[cfg(feature = "experimental-repair-store")]
             Self::RepairRollbackWriteLeaseConsumed => 79,
+            #[cfg(feature = "experimental-fleet-signing")]
+            Self::FleetSignedReady => 80,
+            #[cfg(feature = "experimental-fleet-signing")]
+            Self::FleetInvalidRequest => 81,
         }
     }
 
@@ -2563,6 +2780,10 @@ impl WorkerResultCode {
             78 => Ok(Self::RepairRollbackResolved),
             #[cfg(feature = "experimental-repair-store")]
             79 => Ok(Self::RepairRollbackWriteLeaseConsumed),
+            #[cfg(feature = "experimental-fleet-signing")]
+            80 => Ok(Self::FleetSignedReady),
+            #[cfg(feature = "experimental-fleet-signing")]
+            81 => Ok(Self::FleetInvalidRequest),
             _ => Err(InternalWireError::InvalidFrame),
         }
     }
@@ -2612,6 +2833,10 @@ pub(super) struct WorkerResponse {
     pub(super) report: Option<WorkerReportSummary>,
     pub(super) application_output_size: Option<u64>,
     pub(super) application_record_count: Option<u16>,
+    #[cfg(feature = "experimental-fleet-signing")]
+    pub(super) fleet_public_key: Option<[u8; 32]>,
+    #[cfg(feature = "experimental-fleet-signing")]
+    pub(super) fleet_output_size: Option<u64>,
     #[cfg(feature = "experimental-repair-store")]
     pub(super) repair_status: Option<Box<WorkerRepairStatus>>,
     #[cfg(feature = "experimental-repair-store")]
@@ -2629,6 +2854,38 @@ pub(super) struct WorkerResponse {
 }
 
 impl WorkerResponse {
+    fn fleet_metadata_is_invalid(&self, expected: bool) -> bool {
+        #[cfg(feature = "experimental-fleet-signing")]
+        {
+            expected != self.fleet_public_key.is_some()
+                || expected != self.fleet_output_size.is_some()
+                || self.fleet_output_size.is_some_and(|size| {
+                    !(2..=kernaid_protocol::rescue_vault::MAX_FLEET_SIGNED_REQUEST_BYTES)
+                        .contains(&size)
+                })
+                || self.fleet_public_key.is_some_and(|public_key| {
+                    self.device_id.as_ref().is_none_or(|device_id| {
+                        kernaid_device_identity::device_id_for_public_key(&public_key) != *device_id
+                    })
+                })
+        }
+        #[cfg(not(feature = "experimental-fleet-signing"))]
+        {
+            expected
+        }
+    }
+
+    fn fleet_output_size_value(&self) -> Option<u64> {
+        #[cfg(feature = "experimental-fleet-signing")]
+        {
+            self.fleet_output_size
+        }
+        #[cfg(not(feature = "experimental-fleet-signing"))]
+        {
+            None
+        }
+    }
+
     pub(super) fn new(request_id: u64, code: WorkerResultCode) -> Self {
         Self {
             request_id,
@@ -2639,6 +2896,10 @@ impl WorkerResponse {
             report: None,
             application_output_size: None,
             application_record_count: None,
+            #[cfg(feature = "experimental-fleet-signing")]
+            fleet_public_key: None,
+            #[cfg(feature = "experimental-fleet-signing")]
+            fleet_output_size: None,
             #[cfg(feature = "experimental-repair-store")]
             repair_status: None,
             #[cfg(feature = "experimental-repair-store")]
@@ -2666,6 +2927,10 @@ impl WorkerResponse {
             report: None,
             application_output_size: None,
             application_record_count: None,
+            #[cfg(feature = "experimental-fleet-signing")]
+            fleet_public_key: None,
+            #[cfg(feature = "experimental-fleet-signing")]
+            fleet_output_size: None,
             #[cfg(feature = "experimental-repair-store")]
             repair_status: None,
             #[cfg(feature = "experimental-repair-store")]
@@ -2693,6 +2958,10 @@ impl WorkerResponse {
             report: None,
             application_output_size: None,
             application_record_count: None,
+            #[cfg(feature = "experimental-fleet-signing")]
+            fleet_public_key: None,
+            #[cfg(feature = "experimental-fleet-signing")]
+            fleet_output_size: None,
             #[cfg(feature = "experimental-repair-store")]
             repair_status: None,
             #[cfg(feature = "experimental-repair-store")]
@@ -2733,6 +3002,20 @@ impl WorkerResponse {
         let mut response = Self::new(request_id, WorkerResultCode::ApplicationReportReady);
         response.application_output_size = Some(report.envelope_size);
         response.report = Some(report);
+        response
+    }
+
+    #[cfg(feature = "experimental-fleet-signing")]
+    pub(super) fn fleet_signed_ready(
+        request_id: u64,
+        device_id: String,
+        public_key: [u8; 32],
+        output_size: u64,
+    ) -> Self {
+        let mut response = Self::new(request_id, WorkerResultCode::FleetSignedReady);
+        response.device_id = Some(device_id);
+        response.fleet_public_key = Some(public_key);
+        response.fleet_output_size = Some(output_size);
         response
     }
 
@@ -2853,6 +3136,10 @@ impl WorkerResponse {
         let persisted_metadata = self.code == WorkerResultCode::ApplicationReportPersisted;
         let list_metadata = self.code == WorkerResultCode::ApplicationReportListReady;
         let report_metadata = self.code == WorkerResultCode::ApplicationReportReady;
+        #[cfg(feature = "experimental-fleet-signing")]
+        let fleet_metadata = self.code == WorkerResultCode::FleetSignedReady;
+        #[cfg(not(feature = "experimental-fleet-signing"))]
+        let fleet_metadata = false;
         #[cfg(feature = "experimental-repair-store")]
         let repair_metadata = matches!(
             self.code,
@@ -2937,12 +3224,13 @@ impl WorkerResponse {
             return Err(InternalWireError::InvalidFrame);
         }
         if self.request_id == 0
-            || device_metadata != self.device_id.is_some()
+            || (device_metadata || fleet_metadata) != self.device_id.is_some()
             || provider_metadata != self.output_size.is_some()
             || audit_metadata != self.audit_sequence.is_some()
             || (persisted_metadata || report_metadata) != self.report.is_some()
             || (list_metadata || report_metadata) != self.application_output_size.is_some()
             || list_metadata != self.application_record_count.is_some()
+            || self.fleet_metadata_is_invalid(fleet_metadata)
             || self
                 .output_size
                 .is_some_and(|size| !valid_openai_key_size(size))
@@ -2985,6 +3273,7 @@ impl WorkerResponse {
         let value = self
             .audit_sequence
             .or(self.application_output_size)
+            .or(self.fleet_output_size_value())
             .or({
                 #[cfg(feature = "experimental-repair-store")]
                 {
@@ -3010,6 +3299,10 @@ impl WorkerResponse {
                 .copy_from_slice(&encode_identifier(report.report_id.as_str(), b"RP-")?);
             bytes[RESPONSE_SHA256_OFFSET..RESPONSE_SHA256_OFFSET + 32]
                 .copy_from_slice(&report.envelope_sha256);
+        }
+        #[cfg(feature = "experimental-fleet-signing")]
+        if let Some(public_key) = self.fleet_public_key {
+            bytes[RESPONSE_SHA256_OFFSET..RESPONSE_SHA256_OFFSET + 32].copy_from_slice(&public_key);
         }
         bytes[DEVICE_ID_OFFSET..DEVICE_ID_OFFSET + device.len()].copy_from_slice(device);
         #[cfg(feature = "experimental-repair-store")]
@@ -3058,6 +3351,8 @@ impl WorkerResponse {
             return Err(InternalWireError::InvalidFrame);
         }
         let code = WorkerResultCode::decode(bytes[8])?;
+        #[cfg(feature = "experimental-fleet-signing")]
+        let fleet_metadata = code == WorkerResultCode::FleetSignedReady;
         #[cfg(feature = "experimental-repair-store")]
         let repair_metadata = matches!(
             code,
@@ -3291,6 +3586,14 @@ impl WorkerResponse {
             .then_some(value),
             application_record_count: (code == WorkerResultCode::ApplicationReportListReady)
                 .then_some(count),
+            #[cfg(feature = "experimental-fleet-signing")]
+            fleet_public_key: fleet_metadata.then(|| {
+                bytes[RESPONSE_SHA256_OFFSET..RESPONSE_SHA256_OFFSET + 32]
+                    .try_into()
+                    .expect("fixed public-key slice")
+            }),
+            #[cfg(feature = "experimental-fleet-signing")]
+            fleet_output_size: fleet_metadata.then_some(value),
             #[cfg(feature = "experimental-repair-store")]
             repair_status,
             #[cfg(feature = "experimental-repair-store")]
@@ -3386,7 +3689,78 @@ fn command_requires_descriptor(kind: WorkerCommandKind) -> bool {
     );
     #[cfg(not(feature = "experimental-repair-store"))]
     let repair = false;
-    base || repair
+    #[cfg(feature = "experimental-fleet-signing")]
+    let fleet = matches!(
+        kind,
+        WorkerCommandKind::FleetEnrollmentSign
+            | WorkerCommandKind::FleetWorkOrderClaimSign
+            | WorkerCommandKind::FleetWorkOrderResultSign
+    );
+    #[cfg(not(feature = "experimental-fleet-signing"))]
+    let fleet = false;
+    base || repair || fleet
+}
+
+#[cfg(feature = "experimental-fleet-signing")]
+pub(super) fn send_fleet_signing_input(
+    socket: BorrowedFd<'_>,
+    bytes: &[u8],
+    deadline: Instant,
+) -> Result<(), InternalWireError> {
+    if !(2..=kernaid_protocol::rescue_vault::MAX_FLEET_SIGNING_INPUT_BYTES as usize)
+        .contains(&bytes.len())
+    {
+        return Err(InternalWireError::InvalidFrame);
+    }
+    send_record(socket, bytes, &[], deadline)
+}
+
+#[cfg(feature = "experimental-fleet-signing")]
+pub(super) fn receive_fleet_signing_input(
+    socket: BorrowedFd<'_>,
+    expected_size: u64,
+    deadline: Instant,
+) -> Result<zeroize::Zeroizing<Vec<u8>>, InternalWireError> {
+    let (bytes, descriptors) = receive_record(socket, deadline)?;
+    if !descriptors.is_empty()
+        || u64::try_from(bytes.len()) != Ok(expected_size)
+        || !(2..=kernaid_protocol::rescue_vault::MAX_FLEET_SIGNING_INPUT_BYTES)
+            .contains(&expected_size)
+    {
+        return Err(InternalWireError::InvalidFrame);
+    }
+    Ok(zeroize::Zeroizing::new(bytes))
+}
+
+#[cfg(feature = "experimental-fleet-signing")]
+pub(super) fn send_fleet_signed_request(
+    socket: BorrowedFd<'_>,
+    bytes: &[u8],
+    deadline: Instant,
+) -> Result<(), InternalWireError> {
+    if !(2..=kernaid_protocol::rescue_vault::MAX_FLEET_SIGNED_REQUEST_BYTES as usize)
+        .contains(&bytes.len())
+    {
+        return Err(InternalWireError::InvalidFrame);
+    }
+    send_record(socket, bytes, &[], deadline)
+}
+
+#[cfg(feature = "experimental-fleet-signing")]
+pub(super) fn receive_fleet_signed_request(
+    socket: BorrowedFd<'_>,
+    expected_size: u64,
+    deadline: Instant,
+) -> Result<zeroize::Zeroizing<Vec<u8>>, InternalWireError> {
+    let (bytes, descriptors) = receive_record(socket, deadline)?;
+    if !descriptors.is_empty()
+        || u64::try_from(bytes.len()) != Ok(expected_size)
+        || !(2..=kernaid_protocol::rescue_vault::MAX_FLEET_SIGNED_REQUEST_BYTES)
+            .contains(&expected_size)
+    {
+        return Err(InternalWireError::InvalidFrame);
+    }
+    Ok(zeroize::Zeroizing::new(bytes))
 }
 
 pub(super) fn send_response(
@@ -4150,6 +4524,77 @@ mod tests {
             assert_eq!(encoded.len(), RESPONSE_BYTES);
             assert_eq!(WorkerResponse::decode(&encoded), Ok(response));
         }
+    }
+
+    #[cfg(feature = "experimental-fleet-signing")]
+    #[test]
+    fn fleet_commands_and_signed_envelopes_use_one_closed_seqpacket_channel() {
+        let identity =
+            kernaid_device_identity::DeviceIdentity::from_seed(&[0x67; 32]).expect("test identity");
+        let input = br#"{"schema":"dev.kernaid.fleet.work-order-claim-signing-input.v1"}"#;
+        let signed = br#"{"schema":"dev.kernaid.fleet.work-order-claim.v1"}"#;
+        let input_size = u64::try_from(input.len()).expect("input size");
+        let command =
+            WorkerCommand::fleet(31, WorkerFleetSignCommand::WorkOrderClaim { input_size });
+        let encoded = command.encode().expect("Fleet command frame");
+        assert_eq!(encoded[8], 31);
+        assert!(!encoded.windows(6).any(|window| window == b"schema"));
+        assert_eq!(WorkerCommand::decode(&encoded), Ok(command.clone()));
+
+        let (parent, worker) = pair();
+        let (caller, signer) = pair();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        send_command(
+            parent.as_fd(),
+            command.clone(),
+            Some(signer.as_fd()),
+            deadline,
+        )
+        .expect("send Fleet command");
+        let (received, channel) =
+            receive_command(worker.as_fd(), deadline).expect("receive Fleet command");
+        assert_eq!(received, command);
+        let channel = channel.expect("Fleet data channel");
+        send_fleet_signing_input(caller.as_fd(), input, deadline).expect("send signing input");
+        assert_eq!(
+            receive_fleet_signing_input(channel.as_fd(), input_size, deadline)
+                .expect("receive signing input")
+                .as_slice(),
+            input
+        );
+        send_fleet_signed_request(channel.as_fd(), signed, deadline)
+            .expect("send complete signed request");
+        assert_eq!(
+            receive_fleet_signed_request(
+                caller.as_fd(),
+                u64::try_from(signed.len()).expect("signed size"),
+                deadline,
+            )
+            .expect("receive complete signed request")
+            .as_slice(),
+            signed
+        );
+
+        let response = WorkerResponse::fleet_signed_ready(
+            31,
+            identity.device_id(),
+            identity.public_key(),
+            u64::try_from(signed.len()).expect("signed size"),
+        );
+        let encoded = response.encode().expect("Fleet response frame");
+        assert_eq!(encoded[8], 80);
+        assert!(!encoded.windows(6).any(|window| window == b"schema"));
+        assert_eq!(WorkerResponse::decode(&encoded), Ok(response));
+
+        assert_eq!(
+            WorkerCommand::fleet(32, WorkerFleetSignCommand::Enrollment { input_size: 1 },)
+                .encode(),
+            Err(InternalWireError::InvalidFrame)
+        );
+        assert_eq!(
+            WorkerResponse::new(31, WorkerResultCode::FleetSignedReady).encode(),
+            Err(InternalWireError::InvalidFrame)
+        );
     }
 
     #[test]

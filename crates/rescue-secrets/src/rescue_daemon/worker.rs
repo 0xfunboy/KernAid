@@ -50,6 +50,8 @@ const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(10);
 const CLASSIFICATION_TIMEOUT: Duration = Duration::from_secs(9 * 60);
 const PROVIDER_PIPE_TIMEOUT: Duration = Duration::from_secs(15);
 const APPLICATION_PIPE_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(feature = "experimental-fleet-signing")]
+const FLEET_SIGNING_TIMEOUT: Duration = Duration::from_secs(15);
 const PIPEFS_MAGIC: u64 = 0x5049_5045;
 const MAX_PROVIDER_OUTPUT_BYTES: usize = MAX_OPENAI_KEY_BYTES as usize;
 const MAX_REPORT_INPUT_BYTES: usize = MAX_SESSION_REPORT_JSON_BYTES as usize;
@@ -488,6 +490,50 @@ fn handle_command(
                     request_id,
                     Result::ApplicationReportNotFound,
                 ),
+                Err(code) => internal_wire::WorkerResponse::new(request_id, code),
+            };
+            (response, false)
+        }
+        #[cfg(feature = "experimental-fleet-signing")]
+        Command::FleetEnrollmentSign
+        | Command::FleetWorkOrderClaimSign
+        | Command::FleetWorkOrderResultSign => {
+            let Some(channel) = descriptor else {
+                return (
+                    internal_wire::WorkerResponse::new(request_id, Result::FleetInvalidRequest),
+                    false,
+                );
+            };
+            let Some(fleet) = command.fleet else {
+                return (
+                    internal_wire::WorkerResponse::new(request_id, Result::FleetInvalidRequest),
+                    false,
+                );
+            };
+            if fleet.kind() != command.kind
+                || internal_wire::validate_control_socket(channel.as_fd()).is_err()
+            {
+                return (
+                    internal_wire::WorkerResponse::new(request_id, Result::FleetInvalidRequest),
+                    false,
+                );
+            }
+            let signed = match state {
+                WorkerVaultState::Locked => Err(Result::Busy),
+                WorkerVaultState::Unlocked(_) if validate_no_active_swap().is_err() => {
+                    Err(Result::CleanupFailed)
+                }
+                WorkerVaultState::Unlocked(mounted) => sign_fleet_request(mounted, fleet, channel),
+            };
+            let response = match signed {
+                Ok((device_id, public_key, output_size)) => {
+                    internal_wire::WorkerResponse::fleet_signed_ready(
+                        request_id,
+                        device_id,
+                        public_key,
+                        output_size,
+                    )
+                }
                 Err(code) => internal_wire::WorkerResponse::new(request_id, code),
             };
             (response, false)
@@ -1317,6 +1363,42 @@ fn persist_report(
         (Err(_), Ok(None)) => Err(Result::ApplicationMutationAborted),
         (Ok(_), Ok(None)) | (_, Err(_)) => Err(Result::ApplicationStateAmbiguous),
     }
+}
+
+#[cfg(feature = "experimental-fleet-signing")]
+fn sign_fleet_request(
+    mounted: &MountedRescueVault,
+    command: internal_wire::WorkerFleetSignCommand,
+    channel: OwnedFd,
+) -> Result<(String, [u8; 32], u64), internal_wire::WorkerResultCode> {
+    use internal_wire::WorkerResultCode as Result;
+    let deadline = Instant::now() + FLEET_SIGNING_TIMEOUT;
+    let input =
+        internal_wire::receive_fleet_signing_input(channel.as_fd(), command.input_size(), deadline)
+            .map_err(|_| Result::FleetInvalidRequest)?;
+    let store = mounted
+        .secrets()
+        .open_application_store()
+        .map_err(|_| Result::IoFailed)?;
+    let signed = match command {
+        internal_wire::WorkerFleetSignCommand::Enrollment { .. } => {
+            store.sign_fleet_enrollment(&input)
+        }
+        internal_wire::WorkerFleetSignCommand::WorkOrderClaim { .. } => {
+            store.sign_fleet_work_order_claim(&input)
+        }
+        internal_wire::WorkerFleetSignCommand::WorkOrderResult { .. } => {
+            store.sign_fleet_work_order_result(&input)
+        }
+    }
+    .map_err(|error| match error {
+        RescueApplicationStoreError::InvalidFleetSigningInput => Result::FleetInvalidRequest,
+        _ => Result::IoFailed,
+    })?;
+    let output_size = u64::try_from(signed.bytes.len()).map_err(|_| Result::IoFailed)?;
+    internal_wire::send_fleet_signed_request(channel.as_fd(), &signed.bytes, deadline)
+        .map_err(|_| Result::IoFailed)?;
+    Ok((signed.device_id, signed.public_key, output_size))
 }
 
 fn reopen_report_summary(

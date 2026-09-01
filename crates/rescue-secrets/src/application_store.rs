@@ -3,9 +3,10 @@
 //! This layer is deliberately narrower than the encrypted journal and device
 //! identity primitives beneath it. Production callers can store one OpenAI
 //! credential, append only typed Agent lifecycle records, and persist signed
-//! `SessionReport` documents. They cannot append arbitrary journal bytes,
-//! create an identity, export a key, or use the identity as a generic signing
-//! oracle.
+//! `SessionReport` documents. With the off-default Fleet feature they may also
+//! request three closed Fleet envelopes (enrollment, claim, result). They
+//! cannot append arbitrary journal bytes, create an identity, export a key, or
+//! use the identity as a generic signing oracle.
 
 use crate::linux::{
     DEVICE_IDENTITY_NAME, JOURNAL_ANCHOR_NAME, JOURNAL_DATABASE_NAME, JOURNAL_KEY_NAME,
@@ -14,6 +15,10 @@ use crate::linux::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use kernaid_device_identity::{DeviceIdentity, SignedReportEnvelope};
+#[cfg(feature = "experimental-fleet-signing")]
+use kernaid_fleet_client::{
+    SignedEnrollmentRequest, SignedWorkOrderClaimRequest, SignedWorkOrderResult,
+};
 use kernaid_protocol::rescue_vault::{
     AgentRole, AuditEventType, AuditOutcome, ErrorToken, MAX_AUDIT_SEQUENCE, Operation, PeerRole,
     RequestId, RequestPayload, ValidatedRequest,
@@ -75,6 +80,8 @@ pub enum RescueApplicationStoreError {
     ReportNotFound,
     ReportLimitReached,
     InvalidAgentAudit,
+    #[cfg(feature = "experimental-fleet-signing")]
+    InvalidFleetSigningInput,
     StaleAgentSequence,
     CorruptJournal,
     CorruptApplicationState,
@@ -97,6 +104,8 @@ impl fmt::Display for RescueApplicationStoreError {
             Self::ReportNotFound => "the Rescue report does not exist",
             Self::ReportLimitReached => "the Rescue report limit has been reached",
             Self::InvalidAgentAudit => "invalid Agent lifecycle audit record",
+            #[cfg(feature = "experimental-fleet-signing")]
+            Self::InvalidFleetSigningInput => "invalid purpose-specific Fleet signing input",
             Self::StaleAgentSequence => "the Agent audit sequence is not the next value",
             Self::CorruptJournal => "the Rescue application journal is invalid",
             Self::CorruptApplicationState => "the Rescue application state is invalid",
@@ -124,6 +133,15 @@ pub struct RescueReportSummary {
     report_id: String,
     envelope_size: u64,
     envelope_sha256: [u8; 32],
+}
+
+/// Public result of a closed Fleet signing operation. The private key remains
+/// in [`RescueVaultApplicationStore`]; only a complete signed request leaves.
+#[cfg(feature = "experimental-fleet-signing")]
+pub(crate) struct FleetSignedRequest {
+    pub(crate) device_id: String,
+    pub(crate) public_key: [u8; 32],
+    pub(crate) bytes: Zeroizing<Vec<u8>>,
 }
 
 impl RescueReportSummary {
@@ -399,6 +417,68 @@ enum ApplicationFaultPoint {
 impl<'vault> RescueVaultApplicationStore<'vault> {
     pub(crate) fn open(inner: &'vault VaultInner) -> Result<Self, RescueApplicationStoreError> {
         Self::open_internal(inner, None)
+    }
+
+    #[cfg(feature = "experimental-fleet-signing")]
+    pub(crate) fn sign_fleet_enrollment(
+        &self,
+        input: &[u8],
+    ) -> Result<FleetSignedRequest, RescueApplicationStoreError> {
+        self.ensure_ready()?;
+        let signed = SignedEnrollmentRequest::sign_canonical_input(&self.identity, input)
+            .map_err(|_| RescueApplicationStoreError::InvalidFleetSigningInput)?;
+        self.fleet_signed_request(
+            signed
+                .export_offline()
+                .map_err(|_| RescueApplicationStoreError::InvalidFleetSigningInput)?,
+        )
+    }
+
+    #[cfg(feature = "experimental-fleet-signing")]
+    pub(crate) fn sign_fleet_work_order_claim(
+        &self,
+        input: &[u8],
+    ) -> Result<FleetSignedRequest, RescueApplicationStoreError> {
+        self.ensure_ready()?;
+        let signed = SignedWorkOrderClaimRequest::sign_canonical_input(&self.identity, input)
+            .map_err(|_| RescueApplicationStoreError::InvalidFleetSigningInput)?;
+        self.fleet_signed_request(
+            signed
+                .export_offline()
+                .map_err(|_| RescueApplicationStoreError::InvalidFleetSigningInput)?,
+        )
+    }
+
+    #[cfg(feature = "experimental-fleet-signing")]
+    pub(crate) fn sign_fleet_work_order_result(
+        &self,
+        input: &[u8],
+    ) -> Result<FleetSignedRequest, RescueApplicationStoreError> {
+        self.ensure_ready()?;
+        let signed = SignedWorkOrderResult::sign_canonical_input(&self.identity, input)
+            .map_err(|_| RescueApplicationStoreError::InvalidFleetSigningInput)?;
+        self.fleet_signed_request(
+            signed
+                .export_offline()
+                .map_err(|_| RescueApplicationStoreError::InvalidFleetSigningInput)?,
+        )
+    }
+
+    #[cfg(feature = "experimental-fleet-signing")]
+    fn fleet_signed_request(
+        &self,
+        bytes: Vec<u8>,
+    ) -> Result<FleetSignedRequest, RescueApplicationStoreError> {
+        if !(2..=kernaid_protocol::rescue_vault::MAX_FLEET_SIGNED_REQUEST_BYTES as usize)
+            .contains(&bytes.len())
+        {
+            return Err(RescueApplicationStoreError::InvalidFleetSigningInput);
+        }
+        Ok(FleetSignedRequest {
+            device_id: self.device_id.clone(),
+            public_key: self.identity.public_key(),
+            bytes: Zeroizing::new(bytes),
+        })
     }
 
     fn open_internal(
@@ -2122,6 +2202,124 @@ mod tests {
                 .event
                 .starts_with(b"{\"type\":\"vault.identity.bound\"")
         );
+    }
+
+    #[cfg(feature = "experimental-fleet-signing")]
+    #[test]
+    fn fleet_signer_returns_only_three_identity_bound_complete_envelopes() {
+        use kernaid_fleet_client::{
+            EnrollmentPlatform, EnrollmentRequestInput, LeasedWorkOrder, SignedEnrollmentRequest,
+            SignedWorkOrderClaimRequest, SignedWorkOrderResult, WorkOrderClaimRequestInput,
+            WorkOrderResultInput, WorkOrderResultOutcome,
+        };
+
+        let fixture = Fixture::new();
+        fixture.provision_identity();
+        let vault = fixture.open_vault();
+        let store = vault
+            .open_application_store()
+            .expect("open application store");
+        let device_id = store.device_id.clone();
+        let public_key = store.identity.public_key();
+
+        let enrollment_input = EnrollmentRequestInput::new(
+            "enroll_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "tenant-rescue",
+            EnrollmentPlatform::Rescue,
+            "0.1.0-test",
+            "2026-09-01T12:00:00Z",
+            vec![0x31; 32],
+        );
+        let enrollment_canonical = enrollment_input
+            .export_signing_input()
+            .expect("enrollment input");
+        let enrollment = store
+            .sign_fleet_enrollment(&enrollment_canonical)
+            .expect("sign enrollment");
+        assert_eq!(enrollment.device_id, device_id);
+        assert_eq!(enrollment.public_key, public_key);
+        SignedEnrollmentRequest::import_for_signing_input(
+            &enrollment.bytes,
+            &enrollment_input,
+            &device_id,
+            &public_key,
+        )
+        .expect("verify exact enrollment input");
+        assert!(matches!(
+            store.sign_fleet_work_order_claim(&enrollment_canonical),
+            Err(RescueApplicationStoreError::InvalidFleetSigningInput)
+        ));
+
+        let claim_input = WorkOrderClaimRequestInput::new(
+            "tenant-rescue",
+            "2026-09-01T12:00:01Z",
+            vec![0x32; 32],
+            300,
+        );
+        let claim_canonical = claim_input.export_signing_input().expect("claim input");
+        let claim = store
+            .sign_fleet_work_order_claim(&claim_canonical)
+            .expect("sign claim");
+        SignedWorkOrderClaimRequest::import_for_signing_input(
+            &claim.bytes,
+            &claim_input,
+            &device_id,
+            &public_key,
+        )
+        .expect("verify exact claim input");
+
+        let order: LeasedWorkOrder = serde_json::from_value(serde_json::json!({
+            "workOrderId": "wo-rescue-sign-1",
+            "targetDeviceId": device_id,
+            "actionId": "linux.filesystem.health.v1",
+            "actionVersion": 1,
+            "kind": "diagnosis",
+            "risk": "R0",
+            "localApprovalRequired": false,
+            "status": "leased",
+            "createdAt": "2026-09-01T11:59:00Z",
+            "expiresAt": "2026-09-01T13:00:00Z",
+            "approval": null,
+            "lease": {
+                "leaseId": "lease-rescue-sign-1",
+                "leasedAt": "2026-09-01T12:00:00Z",
+                "leaseExpiresAt": "2026-09-01T12:05:00Z"
+            }
+        }))
+        .expect("leased work order");
+        let result_input = WorkOrderResultInput::from_order(
+            "tenant-rescue",
+            &order,
+            WorkOrderResultOutcome::Succeeded,
+            "2026-09-01T12:00:02Z",
+            "11".repeat(32),
+        );
+        let result_canonical = result_input.export_signing_input().expect("result input");
+        let result = store
+            .sign_fleet_work_order_result(&result_canonical)
+            .expect("sign result");
+        SignedWorkOrderResult::import_for_signing_input(
+            &result.bytes,
+            &result_input,
+            &device_id,
+            &public_key,
+        )
+        .expect("verify exact result input");
+
+        for invalid in [b"arbitrary bytes".as_slice(), b"{}".as_slice()] {
+            assert!(matches!(
+                store.sign_fleet_enrollment(invalid),
+                Err(RescueApplicationStoreError::InvalidFleetSigningInput)
+            ));
+            assert!(matches!(
+                store.sign_fleet_work_order_claim(invalid),
+                Err(RescueApplicationStoreError::InvalidFleetSigningInput)
+            ));
+            assert!(matches!(
+                store.sign_fleet_work_order_result(invalid),
+                Err(RescueApplicationStoreError::InvalidFleetSigningInput)
+            ));
+        }
     }
 
     #[test]

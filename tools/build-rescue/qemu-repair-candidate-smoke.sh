@@ -9,6 +9,7 @@ iso="${3:-$repo_dir/KernAid-Rescue-amd64-repair-candidate.iso}"
 controller="$repo_dir/tools/build-rescue/qemu-repair-candidate-pty.py"
 readonly media_bytes=32000000000
 readonly p3_start_bytes=17179869184
+readonly p3_bytes=8589934592
 # A first boot can spend up to fifteen minutes proving that the future Vault
 # is entirely zero before its first write. Keep one aggregate budget that also
 # covers the TCG boot, repair proof and clean shutdown.
@@ -18,6 +19,8 @@ readonly provisioned_base="${KERNAID_REPAIR_PROVISIONED_BASE:-}"
 readonly provisioned_key="${KERNAID_REPAIR_PROVISIONED_KEY:-}"
 readonly provisioned_target="${KERNAID_REPAIR_TARGET_BASE:-}"
 readonly tamper_helper="$repo_dir/tools/build-rescue/qemu-repair-vault-tamper.py"
+readonly host_vault_provisioner="$repo_dir/tools/build-rescue/provision-repair-vault-base.sh"
+readonly vault_probe="$repo_dir/target/release/kernaid-rescue-vault-probe"
 
 if [[ "$firmware" != bios && "$firmware" != uefi ]]; then
   echo "Usage: $0 [bios|uefi] [apply|rollback|interrupt-reconcile|crypttab-lifecycle|ext4-apply|resolver-link-apply|failure-paths|qualification-batch] [iso]" >&2
@@ -45,12 +48,6 @@ if [[ "$scenario" != apply ]]; then
 fi
 if [[ "$scenario" == rollback ]]; then
   controller_timeout=1500
-elif [[ "$scenario" == qualification-batch ]]; then
-  # Provision once, then reuse isolated sparse copies for every qualification
-  # scenario. The pre-confirmation scan and post-confirmation zero proof may
-  # together consume most of 50 minutes under a loaded two-vCPU TCG runner;
-  # child scenarios inherit already-provisioned media.
-  controller_timeout=3000
 elif [[ "$scenario" == interrupt-reconcile || "$scenario" == backup-tamper ]]; then
   controller_timeout=1800
 elif [[ "$scenario" == failure-paths ]]; then
@@ -67,7 +64,8 @@ if [[ -n "$provisioned_base" || -n "$provisioned_key" \
   || -n "$provisioned_target" ]]; then
   [[ -n "$provisioned_base" && -n "$provisioned_key" \
     && -n "$provisioned_target" \
-    && "$scenario" != failure-paths ]] || {
+    && "$scenario" != failure-paths \
+    && "$scenario" != qualification-batch ]] || {
     echo "Invalid internal provisioned-base handoff" >&2
     exit 2
   }
@@ -92,7 +90,8 @@ required_commands=(
 if [[ "$scenario" == ext4-apply ]]; then
   required_commands+=(e2fsck)
 fi
-if [[ "$scenario" == failure-paths || "$scenario" == backup-tamper ]]; then
+if [[ "$scenario" == failure-paths || "$scenario" == backup-tamper \
+  || "$scenario" == qualification-batch ]]; then
   required_commands+=(blockdev cryptsetup losetup sudo)
 fi
 for command in "${required_commands[@]}"; do
@@ -103,6 +102,17 @@ done
 if [[ "$scenario" == failure-paths || "$scenario" == backup-tamper ]]; then
   [[ -f "$tamper_helper" && ! -L "$tamper_helper" ]] \
     || { echo "Vault tamper helper not found" >&2; exit 2; }
+fi
+if [[ "$scenario" == qualification-batch ]]; then
+  [[ -f "$host_vault_provisioner" && ! -L "$host_vault_provisioner" \
+    && -x "$host_vault_provisioner" ]] || {
+    echo "Host Repair Vault provisioner not found" >&2
+    exit 2
+  }
+  [[ -f "$vault_probe" && ! -L "$vault_probe" && -x "$vault_probe" ]] || {
+    echo "Host-only project Vault probe not found" >&2
+    exit 2
+  }
 fi
 
 work_dir="$(mktemp -d /tmp/kernaid-qemu-repair-candidate.XXXXXXXX)"
@@ -294,6 +304,106 @@ if [[ -n "$provisioned_base" ]]; then
   already_provisioned=true
 fi
 
+if [[ "$scenario" == qualification-batch ]]; then
+  # The full guest first-boot lifecycle remains a separate, unchanged product
+  # gate. This consolidated Repair matrix needs one reusable Vault base, so it
+  # provisions that base once on the host with the same canonical profile and
+  # descriptor-bound project probe already exercised by the USB lifecycle
+  # qualification. No guest first-boot claim is made by this batch.
+  host_provision_output="$work_dir/host-vault-provision.out"
+  host_provision_error="$work_dir/host-vault-provision.err"
+  readonly expected_host_provision="KERNAID_REPAIR_HOST_VAULT_BASE_ATTESTATION_V1 geometry=layout-v1 p3=exact-zero-before-first-write profile=canonical-v1 probe=initialize-verify identity=stable key=private-mode-0600 cleanup=complete target_access=none host_physical_devices=false ready=true"
+
+  prefix_before_host_sha256="$(dd if="$rescue_media" bs=4M iflag=count_bytes \
+    count="$iso_bytes" status=none | sha256sum | awk '{print $1}')"
+  key_before_host_sha256="$(sha256sum "$vault_key" | awk '{print $1}')"
+  target_before_host_sha256="$(sha256sum "$target_image" | awk '{print $1}')"
+  [[ "$prefix_before_host_sha256" == "$iso_sha256" \
+    && "$(stat -c '%d:%i' -- "$rescue_media")" \
+      != "$(stat -c '%d:%i' -- "$target_image")" ]] || exit 1
+
+  set +e
+  # The unprivileged harness intentionally owns these bounded evidence files;
+  # sudo applies only to the host provisioning helper.
+  # shellcheck disable=SC2024
+  sudo -n -- "$host_vault_provisioner" \
+    --media "$rescue_media" --key "$vault_key" --probe "$vault_probe" \
+    >"$host_provision_output" 2>"$host_provision_error"
+  host_provision_status=$?
+  set -e
+  if [[ "$host_provision_status" -ne 0 ]]; then
+    cat "$host_provision_error" >&2
+    exit "$host_provision_status"
+  fi
+  [[ ! -s "$host_provision_error" \
+    && "$(cat "$host_provision_output")" == "$expected_host_provision" ]] \
+    || exit 1
+  cat "$host_provision_output" >&2
+
+  prefix_after_host_sha256="$(dd if="$rescue_media" bs=4M iflag=count_bytes \
+    count="$iso_bytes" status=none | sha256sum | awk '{print $1}')"
+  p3_base_sha256="$(dd if="$rescue_media" bs=4M iflag=skip_bytes,count_bytes \
+    skip="$p3_start_bytes" count="$p3_bytes" status=none \
+    | sha256sum | awk '{print $1}')"
+  [[ "$prefix_after_host_sha256" == "$iso_sha256" \
+    && "$p3_base_sha256" =~ ^[0-9a-f]{64}$ \
+    && "$(sha256sum "$vault_key" | awk '{print $1}')" \
+      == "$key_before_host_sha256" \
+    && "$(stat -c '%u:%a:%h:%s' -- "$vault_key")" \
+      == "$EUID:600:1:64" \
+    && "$(sha256sum "$target_image" | awk '{print $1}')" \
+      == "$target_before_host_sha256" ]] || exit 1
+
+  qualification_cases=(
+    bios:apply
+    uefi:apply
+    uefi:rollback
+    uefi:interrupt-reconcile
+    uefi:stale-target
+    uefi:cancel
+    uefi:backup-tamper
+    uefi:repaird-termination
+    uefi:auto-restore
+    uefi:crypttab-lifecycle
+    uefi:ext4-apply
+    uefi:resolver-link-apply
+  )
+  for qualification_case in "${qualification_cases[@]}"; do
+    case_firmware="${qualification_case%%:*}"
+    case_scenario="${qualification_case#*:}"
+    printf 'KERNAID_QEMU_REPAIR_QUALIFICATION_CASE_V1 firmware=%s scenario=%s\n' \
+      "$case_firmware" "$case_scenario" >&2
+    case_output="$(
+      KERNAID_REPAIR_PROVISIONED_BASE="$rescue_media" \
+      KERNAID_REPAIR_PROVISIONED_KEY="$vault_key" \
+      KERNAID_REPAIR_TARGET_BASE="$target_image" \
+      KERNAID_QEMU_SMP="$qemu_smp" \
+        "$repo_dir/tools/build-rescue/qemu-repair-candidate-smoke.sh" \
+        "$case_firmware" "$case_scenario" "$iso"
+    )"
+    case_pattern="^KERNAID_QEMU_REPAIR_CANDIDATE_ATTESTATION_V1 .* firmware=$case_firmware scenario=$case_scenario .* iso_sha256=$iso_sha256 .* ready=true$"
+    [[ "$case_output" != *$'\n'* && "$case_output" =~ $case_pattern ]] \
+      || exit 1
+  done
+
+  p3_after_cases_sha256="$(dd if="$rescue_media" bs=4M \
+    iflag=skip_bytes,count_bytes skip="$p3_start_bytes" count="$p3_bytes" \
+    status=none | sha256sum | awk '{print $1}')"
+  prefix_after_sha256="$(dd if="$rescue_media" bs=4M iflag=count_bytes \
+    count="$iso_bytes" status=none | sha256sum | awk '{print $1}')"
+  [[ "$prefix_after_sha256" == "$iso_sha256" \
+    && "$p3_after_cases_sha256" == "$p3_base_sha256" \
+    && "$(sha256sum "$target_image" | awk '{print $1}')" \
+      == "$target_before_host_sha256" \
+    && "$(sha256sum "$vault_key" | awk '{print $1}')" \
+      == "$key_before_host_sha256" \
+    && "$(stat -c '%u:%a:%h:%s' -- "$vault_key")" \
+      == "$EUID:600:1:64" ]] || exit 1
+  printf '%s\n' \
+    "KERNAID_QEMU_REPAIR_QUALIFICATION_BATCH_ATTESTATION_V1 provisioning=host-probe-canonical-v1 guest_firstboot=not-claimed standard_firstboot_gate=unchanged-separate scenarios=bios-apply,uefi-apply,uefi-rollback,uefi-interrupt-reconcile,uefi-stale-target,uefi-cancel,uefi-backup-tamper,uefi-repaird-termination,uefi-auto-restore,uefi-crypttab-lifecycle,uefi-ext4-apply,uefi-resolver-link-apply actions=linux.fstab.disable-missing-uuid.v1,linux.crypttab.disable-missing-uuid.v1,linux.ext4.fsck-preen-with-undo.v1,linux.network.restore-resolver-link.v1 vault_profile=canonical-v1 vault_identity=initialize-verify-stable p3=exact key=private-mode-0600 target=separate base_immutable=true isolated_sparse_copies=true iso_sha256=$iso_sha256 iso_prefix_immutable=true host_physical_devices=false ready=true"
+  exit 0
+fi
+
 if [[ "$scenario" == ext4-apply ]]; then
   # Create one deterministic, preen-repairable inconsistency only in this
   # isolated scenario copy. The shared provisioned base remains byte-exact.
@@ -362,7 +472,7 @@ fi
 
 set +e
 controller_scenario="$scenario"
-if [[ "$scenario" == failure-paths || "$scenario" == qualification-batch ]]; then
+if [[ "$scenario" == failure-paths ]]; then
   controller_scenario=provision-base
 fi
 controller_before_sha256="$before_sha256"
@@ -400,7 +510,7 @@ if [[ "$firmware" == uefi ]]; then
     --ovmf-vars-template "$ovmf_vars_template"
   )
 fi
-if [[ "$scenario" == failure-paths || "$scenario" == qualification-batch ]]; then
+if [[ "$scenario" == failure-paths ]]; then
   python3 -I -B "$controller" \
     "${controller_args[@]}" -- "${qemu_args[@]}" \
     3<"$vault_key" 4<"$login_credential" \
@@ -416,49 +526,6 @@ if [[ "$scenario" == failure-paths || "$scenario" == qualification-batch ]]; the
   [[ "$(cat "$controller_output")" == "$expected_base" ]] || exit 1
   [[ "$(sha256sum "$target_image" | awk '{print $1}')" == "$target_before_sha256" ]] \
     || exit 1
-
-  if [[ "$scenario" == qualification-batch ]]; then
-    qualification_cases=(
-      bios:apply
-      uefi:apply
-      uefi:rollback
-      uefi:interrupt-reconcile
-      uefi:stale-target
-      uefi:cancel
-      uefi:backup-tamper
-      uefi:repaird-termination
-      uefi:auto-restore
-      uefi:crypttab-lifecycle
-      uefi:ext4-apply
-      uefi:resolver-link-apply
-    )
-    for qualification_case in "${qualification_cases[@]}"; do
-      case_firmware="${qualification_case%%:*}"
-      case_scenario="${qualification_case#*:}"
-      printf 'KERNAID_QEMU_REPAIR_QUALIFICATION_CASE_V1 firmware=%s scenario=%s\n' \
-        "$case_firmware" "$case_scenario" >&2
-      case_output="$(
-        KERNAID_REPAIR_PROVISIONED_BASE="$rescue_media" \
-        KERNAID_REPAIR_PROVISIONED_KEY="$vault_key" \
-        KERNAID_REPAIR_TARGET_BASE="$target_image" \
-        KERNAID_QEMU_SMP="$qemu_smp" \
-          "$repo_dir/tools/build-rescue/qemu-repair-candidate-smoke.sh" \
-          "$case_firmware" "$case_scenario" "$iso"
-      )"
-      case_pattern="^KERNAID_QEMU_REPAIR_CANDIDATE_ATTESTATION_V1 .* firmware=$case_firmware scenario=$case_scenario .* iso_sha256=$iso_sha256 .* ready=true$"
-      [[ "$case_output" != *$'\n'* && "$case_output" =~ $case_pattern ]] \
-        || exit 1
-    done
-    [[ "$(sha256sum "$target_image" | awk '{print $1}')" == "$target_before_sha256" \
-      && "$(stat -c '%s' -- "$vault_key")" == 64 \
-      && "$(tr -d '0-9a-f' <"$vault_key")" == "" ]] || exit 1
-    prefix_after_sha256="$(dd if="$rescue_media" bs=4M iflag=count_bytes \
-      count="$iso_bytes" status=none | sha256sum | awk '{print $1}')"
-    [[ "$prefix_after_sha256" == "$iso_sha256" ]] || exit 1
-    printf '%s\n' \
-      "KERNAID_QEMU_REPAIR_QUALIFICATION_BATCH_ATTESTATION_V1 provisioning=shared scenarios=bios-apply,uefi-apply,uefi-rollback,uefi-interrupt-reconcile,uefi-stale-target,uefi-cancel,uefi-backup-tamper,uefi-repaird-termination,uefi-auto-restore,uefi-crypttab-lifecycle,uefi-ext4-apply,uefi-resolver-link-apply actions=linux.fstab.disable-missing-uuid.v1,linux.crypttab.disable-missing-uuid.v1,linux.ext4.fsck-preen-with-undo.v1,linux.network.restore-resolver-link.v1 isolated_sparse_copies=true iso_sha256=$iso_sha256 iso_prefix_immutable=true host_physical_devices=false ready=true"
-    exit 0
-  fi
 
   failure_cases=(
     stale-target

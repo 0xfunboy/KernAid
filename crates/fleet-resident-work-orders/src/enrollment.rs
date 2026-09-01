@@ -6,8 +6,9 @@
 //! or serializes an identity seed.
 
 use crate::{TransportErrorCode, WorkOrderTransportResponse};
+#[cfg(test)]
 use kernaid_device_identity::DeviceIdentity;
-use kernaid_fleet_client::{EnrollmentPlatform, EnrollmentRequestInput, SignedEnrollmentRequest};
+use kernaid_fleet_client::{EnrollmentPlatform, EnrollmentRequestInput, FleetRequestSigner};
 use serde::{Deserialize, Serialize};
 use std::{
     error::Error,
@@ -24,7 +25,14 @@ use std::{
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
 };
 
-#[cfg(all(unix, any(feature = "linux-service", feature = "macos-service")))]
+#[cfg(all(
+    unix,
+    any(
+        feature = "linux-service",
+        feature = "macos-service",
+        feature = "rescue-fleet-service"
+    )
+))]
 use std::os::unix::fs::MetadataExt;
 
 #[cfg(windows)]
@@ -205,8 +213,8 @@ pub fn require_enrollment(
 /// identity-creation lock for the complete call. `None` is accepted only when
 /// the exact enrollment journal already exists.
 #[allow(clippy::too_many_arguments)]
-pub fn bootstrap_enrollment<T: EnrollmentTransport>(
-    identity: &DeviceIdentity,
+pub fn bootstrap_enrollment<T: EnrollmentTransport, S: FleetRequestSigner + ?Sized>(
+    identity: &S,
     platform: EnrollmentPlatform,
     state_directory: &Path,
     tenant_id: &str,
@@ -216,23 +224,21 @@ pub fn bootstrap_enrollment<T: EnrollmentTransport>(
     transport: &mut T,
 ) -> Result<EnrollmentOutcome, ResidentEnrollmentError> {
     let endpoint = transport.origin().to_owned();
-    validate_binding_inputs(state_directory, &endpoint, tenant_id, &identity.device_id())?;
+    let device_id = identity.device_id()?;
+    validate_binding_inputs(state_directory, &endpoint, tenant_id, &device_id)?;
     let journal = EnrollmentJournal::new(state_directory);
-    if journal.verify(&endpoint, tenant_id, &identity.device_id())? {
+    if journal.verify(&endpoint, tenant_id, &device_id)? {
         return Ok(EnrollmentOutcome::AlreadyEnrolled);
     }
     let token = token.ok_or(ResidentEnrollmentError::EnrollmentRequired)?;
-    let request = SignedEnrollmentRequest::sign(
-        identity,
-        EnrollmentRequestInput::new(
-            token.to_owned(),
-            tenant_id.to_owned(),
-            platform,
-            env!("CARGO_PKG_VERSION"),
-            issued_at,
-            nonce.to_vec(),
-        ),
-    )?;
+    let request = identity.sign_enrollment(EnrollmentRequestInput::new(
+        token.to_owned(),
+        tenant_id.to_owned(),
+        platform,
+        env!("CARGO_PKG_VERSION"),
+        issued_at,
+        nonce.to_vec(),
+    ))?;
     let body = request.export_offline()?;
     let response = transport
         .post_enrollment(&body, MAX_ENROLLMENT_RESPONSE_BYTES)
@@ -247,7 +253,7 @@ pub fn bootstrap_enrollment<T: EnrollmentTransport>(
         .map_err(|_| ResidentEnrollmentError::EnrollmentRejected)?;
     if accepted.schema != "dev.kernaid.fleet.enrollment-response.v1"
         || accepted.tenant_id != tenant_id
-        || accepted.device_id != identity.device_id()
+        || accepted.device_id != device_id
         || !accepted.accepted
         || chrono::DateTime::parse_from_rfc3339(&accepted.enrolled_at).is_err()
     {
@@ -257,7 +263,7 @@ pub fn bootstrap_enrollment<T: EnrollmentTransport>(
         schema: ENROLLMENT_STATE_SCHEMA.to_owned(),
         endpoint,
         tenant_id: tenant_id.to_owned(),
-        device_id: identity.device_id(),
+        device_id,
         enrolled_at: accepted.enrolled_at,
     })?;
     Ok(EnrollmentOutcome::NewlyEnrolled)
@@ -328,7 +334,14 @@ fn read_private_bounded(path: &Path, maximum: usize) -> Result<Vec<u8>, Resident
     if metadata.permissions().mode() & 0o077 != 0 {
         return Err(ResidentEnrollmentError::InvalidState);
     }
-    #[cfg(all(unix, any(feature = "linux-service", feature = "macos-service")))]
+    #[cfg(all(
+        unix,
+        any(
+            feature = "linux-service",
+            feature = "macos-service",
+            feature = "rescue-fleet-service"
+        )
+    ))]
     if metadata.uid() != rustix::process::getuid().as_raw() {
         return Err(ResidentEnrollmentError::InvalidState);
     }

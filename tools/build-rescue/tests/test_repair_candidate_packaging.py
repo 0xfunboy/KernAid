@@ -50,6 +50,57 @@ def unit_directives(path: Path) -> dict[str, dict[str, list[str]]]:
 
 
 class RepairCandidatePackagingTests(unittest.TestCase):
+    def test_fleet_repair_local_relay_preserves_exact_action_binding(self) -> None:
+        intent = {
+            "schema": rescue_server.FLEET_REPAIR_INTENT_SCHEMA,
+            "deviceId": "KA-" + "1" * 24,
+            "workOrderId": "wo-rescue-1",
+            "leaseId": "lease-rescue-1",
+            "executionId": "exec_rescue_1",
+            "actionId": "linux.ext4.fsck-preen-with-undo.v1",
+            "actionVersion": 1,
+            "risk": "R3",
+            "state": "awaiting-approval",
+            "leaseExpiresAt": "2026-09-01T01:05:00Z",
+            "evidence": {
+                "preparedId": "Q-" + "2" * 32,
+                "sessionId": "S-" + "3" * 32,
+                "planId": "P-" + "4" * 32,
+                "planSha256": "5" * 64,
+                "targetSha256": "6" * 64,
+                "beforeSha256": "7" * 64,
+                "afterSha256": "8" * 64,
+                "diffSha256": "9" * 64,
+                "backupLocator": "vault://repair/B-" + "a" * 32,
+                "approvalSequence": 1,
+                "evidenceSha256": "b" * 64,
+            },
+            "confirmationRequired": "REPAIR EXT4 OFFLINE",
+        }
+        response = {
+            "apiVersion": rescue_server.FLEET_REPAIR_LOCAL_API_VERSION,
+            "operation": "status",
+            "outcome": "ok",
+            "intent": intent,
+        }
+        rescue_server._validate_fleet_repair_response(response, "status")
+        for changed in (
+            {**intent, "risk": "R2"},
+            {**intent, "confirmationRequired": "DISABILITA VOCE FSTAB"},
+            {**intent, "evidence": None},
+            {**intent, "leaseId": "lease forbidden"},
+        ):
+            with self.subTest(changed=changed):
+                with self.assertRaises(rescue_server.FleetRepairRelayError):
+                    rescue_server._validate_fleet_repair_response(
+                        {**response, "intent": changed}, "status"
+                    )
+
+        with self.assertRaises(rescue_server.FleetRepairRelayError):
+            rescue_server._validate_fleet_repair_response(
+                {**response, "operation": "submit"}, "status"
+            )
+
     def test_resolver_link_relay_is_path_free_and_exact(self) -> None:
         target = {
             "scanFingerprint": "scan:" + "1" * 64,
@@ -220,6 +271,11 @@ class RepairCandidatePackagingTests(unittest.TestCase):
         self.assertEqual(workflow.count("--features custom-protocol"), 1)
         self.assertIn("-p kernaid-linux-blockfd", workflow)
         self.assertIn("KERNAID_BLOCKFD_PROBE_BINARY=", workflow)
+        self.assertIn("experimental-fleet-signing", workflow)
+        self.assertIn("-p kernaid-fleet-resident-work-orders", workflow)
+        self.assertIn("--features rescue-fleet-service", workflow)
+        self.assertIn("--bin kernaid-fleet-rescue-repair-bridge", workflow)
+        self.assertIn("KERNAID_FLEET_RESCUE_REPAIR_BINARY=", workflow)
         self.assertEqual(workflow.count("./tools/build-rescue/qemu-smoke.sh"), 2)
         self.assertIn("QEMU UEFI Secure Boot candidate smoke test", workflow)
         self.assertIn("./tools/build-rescue/qemu-smoke.sh secureboot", workflow)
@@ -234,10 +290,13 @@ class RepairCandidatePackagingTests(unittest.TestCase):
     def test_default_profile_contains_no_candidate_artifact_or_client_group(self) -> None:
         absent = (
             LIVE / "usr/lib/kernaid/kernaid-rescue-repaird",
+            LIVE / "usr/lib/kernaid/kernaid-fleet-rescue-repair-bridge",
             LIVE / "usr/lib/kernaid/kernaid-blockfd-probe",
             LIVE / "usr/lib/kernaid/repair-candidate-image-v1",
             LIVE / "etc/systemd/system/kernaid-rescue-repaird.service",
             LIVE / "etc/systemd/system/kernaid-rescue-repaird.socket",
+            LIVE / "etc/systemd/system/kernaid-fleet-rescue-repair.service",
+            LIVE / "etc/systemd/system/kernaid-fleet-rescue-repair.socket",
             LIVE / "etc/sysusers.d/kernaid-repair-candidate.conf",
             LIVE / "usr/lib/tmpfiles.d/kernaid-repair-candidate.conf",
             LIVE
@@ -259,6 +318,7 @@ class RepairCandidatePackagingTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("u kernaid-repair - ", base_sysusers)
         self.assertNotIn("kernaid-repair-client", base_sysusers)
+        self.assertNotIn("kernaid-fleet", base_sysusers)
         self.assertNotIn("kernaid-repair-client", base_ui)
 
     def test_build_toggle_stages_only_the_exact_candidate_binary_and_name(self) -> None:
@@ -275,11 +335,21 @@ class RepairCandidatePackagingTests(unittest.TestCase):
             source,
         )
         self.assertIn(
+            'fleet_rescue_binary="${KERNAID_FLEET_RESCUE_REPAIR_BINARY:-'
+            '$repo_dir/target/release/kernaid-fleet-rescue-repair-bridge}"',
+            source,
+        )
+        self.assertIn(
             'KERNAID_REPAIR_CANDIDATE must be exactly 0 or 1', source
         )
         self.assertIn(
             'validate_amd64_elf "$repaird_binary" '
             '"Rescue fstab repair candidate broker"',
+            source,
+        )
+        self.assertIn(
+            'validate_amd64_elf "$fleet_rescue_binary" '
+            '"Rescue Fleet repair bridge"',
             source,
         )
         self.assertIn(
@@ -321,6 +391,7 @@ class RepairCandidatePackagingTests(unittest.TestCase):
         )
         self.assertIn('--bootappend-live-failsafe "$bootappend_compat"', source)
         self.assertIn('"$repaird_destination" \\', source)
+        self.assertIn('"$fleet_rescue_destination" \\', source)
         self.assertIn('"$repair_candidate_marker_destination" \\', source)
 
     def test_persistent_seqpacket_daemon_is_exactly_candidate_gated(self) -> None:
@@ -482,12 +553,15 @@ class RepairCandidatePackagingTests(unittest.TestCase):
         self.assertIn("authenticated", unit_source)
         self.assertIn("no host /dev access", unit_source)
 
-    def test_only_loopback_server_gets_candidate_client_group(self) -> None:
-        self.assertEqual(
-            (CANDIDATE / "kernaid-repair-candidate.conf").read_text(
-                encoding="utf-8"
-            ).splitlines()[-1],
-            "g kernaid-repair-client - -",
+    def test_only_closed_local_services_get_candidate_client_group(self) -> None:
+        sysusers = (CANDIDATE / "kernaid-repair-candidate.conf").read_text(
+            encoding="utf-8"
+        ).splitlines()
+        self.assertIn("g kernaid-repair-client - -", sysusers)
+        self.assertIn(
+            'u kernaid-fleet - "KernAid Rescue Fleet work-order bridge" '
+            "/nonexistent /usr/sbin/nologin",
+            sysusers,
         )
         self.assertEqual(
             (CANDIDATE / "kernaid-repair-candidate.tmpfiles.conf").read_text(
@@ -530,6 +604,38 @@ class RepairCandidatePackagingTests(unittest.TestCase):
         )[1].split(" ", maxsplit=1)[0]
         self.assertNotIn("kernaid-repair-client", default_groups.split(","))
 
+    def test_fleet_bridge_is_repair_only_and_has_narrow_process_authority(self) -> None:
+        socket = unit_directives(
+            CANDIDATE / "kernaid-fleet-rescue-repair.socket"
+        )
+        service = unit_directives(
+            CANDIDATE / "kernaid-fleet-rescue-repair.service"
+        )
+        conditions = ["boot=live", "kernaid.repair=fstab-v1"]
+        self.assertEqual(socket["Unit"]["ConditionKernelCommandLine"], conditions)
+        self.assertEqual(service["Unit"]["ConditionKernelCommandLine"], conditions)
+        self.assertEqual(
+            socket["Socket"]["ListenSequentialPacket"],
+            ["/run/kernaid-fleet-rescue-repair.sock"],
+        )
+        self.assertEqual(socket["Socket"]["FileDescriptorName"], ["fleet-rescue-api"])
+        self.assertEqual(socket["Socket"]["SocketGroup"], ["kernaid-repair-client"])
+        self.assertEqual(service["Service"]["User"], ["kernaid-fleet"])
+        self.assertEqual(service["Service"]["Group"], ["kernaid-repair-client"])
+        self.assertEqual(service["Service"]["SupplementaryGroups"], ["kernaid-vault"])
+        self.assertEqual(service["Service"]["CapabilityBoundingSet"], [""])
+        self.assertEqual(service["Service"]["AmbientCapabilities"], [""])
+        self.assertEqual(
+            service["Service"]["RestrictAddressFamilies"],
+            ["AF_UNIX AF_INET AF_INET6"],
+        )
+        self.assertIn(
+            "/etc/kernaid/fleet-rescue-repair.json",
+            service["Unit"]["ConditionPathExists"],
+        )
+        self.assertNotIn("LoadCredential", service["Service"])
+        self.assertNotIn("Environment", service["Service"])
+
     def test_safety_hook_validates_and_enables_candidate_units_conditionally(self) -> None:
         hook = HOOK.read_text(encoding="utf-8")
         candidate_gate = (
@@ -544,6 +650,12 @@ class RepairCandidatePackagingTests(unittest.TestCase):
         self.assertEqual(
             hook.count("systemctl enable kernaid-rescue-repaird.service"), 0
         )
+        self.assertEqual(
+            hook.count("systemctl enable kernaid-fleet-rescue-repair.socket"), 1
+        )
+        self.assertEqual(
+            hook.count("systemctl enable kernaid-fleet-rescue-repair.service"), 1
+        )
         self.assertLess(
             hook.index('if [ "$repair_candidate_enabled" = "1" ]; then'),
             hook.index("systemctl enable kernaid-rescue-repaird.socket"),
@@ -553,6 +665,9 @@ class RepairCandidatePackagingTests(unittest.TestCase):
             '"$repair_candidate_blockfd_probe"',
             '"$repair_candidate_service"',
             '"$repair_candidate_socket"',
+            '"$fleet_repair_binary"',
+            '"$fleet_repair_service"',
+            '"$fleet_repair_socket"',
             '"$repair_candidate_sysusers"',
             '"$repair_candidate_tmpfiles"',
             '"$repair_candidate_ui_dropin"',

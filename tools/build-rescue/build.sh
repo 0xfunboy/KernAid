@@ -32,6 +32,8 @@ desk_shell_destination="$build_dir/config/includes.chroot/usr/bin/kernaid-rescue
 repair_candidate="${KERNAID_REPAIR_CANDIDATE-0}"
 repaird_binary="${KERNAID_RESCUE_REPAIRD_BINARY:-$repo_dir/target/release/kernaid-rescue-repaird}"
 repaird_destination="$build_dir/config/includes.chroot/usr/lib/kernaid/kernaid-rescue-repaird"
+fleet_rescue_binary="${KERNAID_FLEET_RESCUE_REPAIR_BINARY:-$repo_dir/target/release/kernaid-fleet-rescue-repair-bridge}"
+fleet_rescue_destination="$build_dir/config/includes.chroot/usr/lib/kernaid/kernaid-fleet-rescue-repair-bridge"
 blockfd_probe_binary="${KERNAID_BLOCKFD_PROBE_BINARY:-$repo_dir/target/release/kernaid-blockfd-probe}"
 blockfd_probe_destination="$build_dir/config/includes.chroot/usr/lib/kernaid/kernaid-blockfd-probe"
 repair_candidate_source="$build_dir/candidate"
@@ -41,6 +43,10 @@ repair_service_source="$repair_candidate_source/kernaid-rescue-repaird.service"
 repair_service_destination="$build_dir/config/includes.chroot/etc/systemd/system/kernaid-rescue-repaird.service"
 repair_socket_source="$repair_candidate_source/kernaid-rescue-repaird.socket"
 repair_socket_destination="$build_dir/config/includes.chroot/etc/systemd/system/kernaid-rescue-repaird.socket"
+fleet_rescue_service_source="$repair_candidate_source/kernaid-fleet-rescue-repair.service"
+fleet_rescue_service_destination="$build_dir/config/includes.chroot/etc/systemd/system/kernaid-fleet-rescue-repair.service"
+fleet_rescue_socket_source="$repair_candidate_source/kernaid-fleet-rescue-repair.socket"
+fleet_rescue_socket_destination="$build_dir/config/includes.chroot/etc/systemd/system/kernaid-fleet-rescue-repair.socket"
 repair_sysusers_source="$repair_candidate_source/kernaid-repair-candidate.conf"
 repair_sysusers_destination="$build_dir/config/includes.chroot/etc/sysusers.d/kernaid-repair-candidate.conf"
 repair_tmpfiles_source="$repair_candidate_source/kernaid-repair-candidate.tmpfiles.conf"
@@ -113,6 +119,7 @@ validate_amd64_elf "$codex_client_binary" "Rescue Codex client"
 validate_amd64_elf "$desk_shell_binary" "Rescue Tauri Desk shell"
 if [[ "$repair_candidate" = "1" ]]; then
   validate_amd64_elf "$repaird_binary" "Rescue fstab repair candidate broker"
+  validate_amd64_elf "$fleet_rescue_binary" "Rescue Fleet repair bridge"
   validate_amd64_elf "$blockfd_probe_binary" "Rescue block descriptor probe"
 fi
 
@@ -121,6 +128,8 @@ if [[ "$repair_candidate" = "1" ]]; then
     "$repair_candidate_marker_source" \
     "$repair_service_source" \
     "$repair_socket_source" \
+    "$fleet_rescue_service_source" \
+    "$fleet_rescue_socket_source" \
     "$repair_sysusers_source" \
     "$repair_tmpfiles_source" \
     "$repair_ui_dropin_source" \
@@ -168,10 +177,13 @@ for destination in \
   "$codex_cli_destination" \
   "$desk_shell_destination" \
   "$repaird_destination" \
+  "$fleet_rescue_destination" \
   "$blockfd_probe_destination" \
   "$repair_candidate_marker_destination" \
   "$repair_service_destination" \
   "$repair_socket_destination" \
+  "$fleet_rescue_service_destination" \
+  "$fleet_rescue_socket_destination" \
   "$repair_sysusers_destination" \
   "$repair_tmpfiles_destination" \
   "$repair_ui_dropin_destination" \
@@ -198,10 +210,13 @@ cleanup_staged_binaries() {
     "$codex_cli_destination" \
     "$desk_shell_destination" \
     "$repaird_destination" \
+    "$fleet_rescue_destination" \
     "$blockfd_probe_destination" \
     "$repair_candidate_marker_destination" \
     "$repair_service_destination" \
     "$repair_socket_destination" \
+    "$fleet_rescue_service_destination" \
+    "$fleet_rescue_socket_destination" \
     "$repair_sysusers_destination" \
     "$repair_tmpfiles_destination" \
     "$repair_ui_dropin_destination" \
@@ -268,6 +283,8 @@ install -o root -g root -m 0755 "$desk_shell_binary" "$desk_shell_destination"
 if [[ "$repair_candidate" = "1" ]]; then
   install -o root -g root -m 0755 "$repaird_binary" "$repaird_destination"
   install -o root -g root -m 0755 \
+    "$fleet_rescue_binary" "$fleet_rescue_destination"
+  install -o root -g root -m 0755 \
     "$blockfd_probe_binary" "$blockfd_probe_destination"
   install -o root -g root -m 0644 \
     "$repair_candidate_marker_source" "$repair_candidate_marker_destination"
@@ -275,6 +292,10 @@ if [[ "$repair_candidate" = "1" ]]; then
     "$repair_service_source" "$repair_service_destination"
   install -o root -g root -m 0644 \
     "$repair_socket_source" "$repair_socket_destination"
+  install -o root -g root -m 0644 \
+    "$fleet_rescue_service_source" "$fleet_rescue_service_destination"
+  install -o root -g root -m 0644 \
+    "$fleet_rescue_socket_source" "$fleet_rescue_socket_destination"
   install -o root -g root -m 0644 \
     "$repair_sysusers_source" "$repair_sysusers_destination"
   install -o root -g root -m 0644 \
@@ -335,11 +356,14 @@ python3 -I "$repo_dir/tools/build-rescue/verify-shipping-binary.py" \
   --profile tauri-webkit "$desk_shell_destination"
 if [[ "$repair_candidate" = "1" ]]; then
   test "$(stat -c '%u:%g:%a' "$repaird_destination")" = "0:0:755"
+  test "$(stat -c '%u:%g:%a' "$fleet_rescue_destination")" = "0:0:755"
   test "$(stat -c '%u:%g:%a' "$blockfd_probe_destination")" = "0:0:755"
   for candidate_configuration in \
     "$repair_candidate_marker_destination" \
     "$repair_service_destination" \
     "$repair_socket_destination" \
+    "$fleet_rescue_service_destination" \
+    "$fleet_rescue_socket_destination" \
     "$repair_sysusers_destination" \
     "$repair_tmpfiles_destination" \
     "$repair_ui_dropin_destination" \
@@ -348,6 +372,8 @@ if [[ "$repair_candidate" = "1" ]]; then
   done
   python3 -I "$repo_dir/tools/build-rescue/verify-shipping-binary.py" \
     "$repaird_destination"
+  python3 -I "$repo_dir/tools/build-rescue/verify-shipping-binary.py" \
+    "$fleet_rescue_destination"
   python3 -I "$repo_dir/tools/build-rescue/verify-shipping-binary.py" \
     "$blockfd_probe_destination"
 fi

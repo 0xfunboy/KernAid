@@ -60,6 +60,13 @@ pub const MAX_SESSION_REPORT_JSON_BYTES: u64 =
 /// indexed by the daemon. The 1.5 MiB ceiling includes base64url expansion and
 /// the bounded envelope metadata around a maximum-size raw payload.
 pub const MAX_SIGNED_REPORT_ENVELOPE_BYTES: u64 = 1536 * 1024;
+/// Maximum canonical operation-specific input accepted by any Fleet signer.
+#[cfg(feature = "experimental-fleet-signing")]
+pub const MAX_FLEET_SIGNING_INPUT_BYTES: u64 = 4 * 1024;
+/// Maximum complete canonical signed Fleet request returned by the Vault.
+/// Keeping this at one small seqpacket also bounds the worker handoff.
+#[cfg(feature = "experimental-fleet-signing")]
+pub const MAX_FLEET_SIGNED_REQUEST_BYTES: u64 = 4 * 1024;
 /// Largest report index returned in one response.
 pub const MAX_REPORTS_PER_RESPONSE: usize = 256;
 /// Fixed authenticated media type for every persisted SessionReport payload.
@@ -74,6 +81,8 @@ pub struct PeerAllowlist {
     application_uid: Option<u32>,
     openai_uid: Option<u32>,
     codex_uid: Option<u32>,
+    #[cfg(feature = "experimental-fleet-signing")]
+    fleet_uid: Option<u32>,
     #[cfg(feature = "experimental-repair-store")]
     repair_broker_uid: Option<u32>,
     #[cfg(feature = "experimental-repair-store")]
@@ -88,6 +97,8 @@ impl fmt::Debug for PeerAllowlist {
             .field("application_configured", &self.application_uid.is_some())
             .field("openai_configured", &self.openai_uid.is_some())
             .field("codex_configured", &self.codex_uid.is_some());
+        #[cfg(feature = "experimental-fleet-signing")]
+        debug.field("fleet_configured", &self.fleet_uid.is_some());
         #[cfg(feature = "experimental-repair-store")]
         debug
             .field(
@@ -112,6 +123,8 @@ impl PeerAllowlist {
             application_uid: None,
             openai_uid: None,
             codex_uid: None,
+            #[cfg(feature = "experimental-fleet-signing")]
+            fleet_uid: None,
             #[cfg(feature = "experimental-repair-store")]
             repair_broker_uid: None,
         }
@@ -132,6 +145,8 @@ impl PeerAllowlist {
             application_uid: None,
             openai_uid: None,
             codex_uid: None,
+            #[cfg(feature = "experimental-fleet-signing")]
+            fleet_uid: None,
             repair_broker_uid: None,
             repair_target_helper_root_only: true,
         }
@@ -154,6 +169,14 @@ impl PeerAllowlist {
             Ok(PeerRole::Agent(AgentRole::OpenAi))
         } else if self.codex_uid == Some(peer_uid) {
             Ok(PeerRole::Agent(AgentRole::Codex))
+        } else if cfg!(feature = "experimental-fleet-signing") && self.fleet_uid() == Some(peer_uid)
+        {
+            #[cfg(feature = "experimental-fleet-signing")]
+            {
+                Ok(PeerRole::Agent(AgentRole::Fleet))
+            }
+            #[cfg(not(feature = "experimental-fleet-signing"))]
+            unreachable!()
         } else if cfg!(feature = "experimental-repair-store")
             && self.repair_broker_uid() == Some(peer_uid)
         {
@@ -179,6 +202,8 @@ pub struct PeerAllowlistBuilder {
     application_uid: Option<u32>,
     openai_uid: Option<u32>,
     codex_uid: Option<u32>,
+    #[cfg(feature = "experimental-fleet-signing")]
+    fleet_uid: Option<u32>,
     #[cfg(feature = "experimental-repair-store")]
     repair_broker_uid: Option<u32>,
 }
@@ -191,6 +216,8 @@ impl fmt::Debug for PeerAllowlistBuilder {
             .field("application_configured", &self.application_uid.is_some())
             .field("openai_configured", &self.openai_uid.is_some())
             .field("codex_configured", &self.codex_uid.is_some());
+        #[cfg(feature = "experimental-fleet-signing")]
+        debug.field("fleet_configured", &self.fleet_uid.is_some());
         #[cfg(feature = "experimental-repair-store")]
         debug.field(
             "repair_broker_configured",
@@ -208,6 +235,7 @@ impl PeerAllowlistBuilder {
             || self.application_uid == Some(uid)
             || self.openai_uid == Some(uid)
             || self.codex_uid == Some(uid)
+            || self.fleet_uid() == Some(uid)
             || self.repair_broker_uid() == Some(uid)
             || self.uid_for(role).is_some()
         {
@@ -227,6 +255,7 @@ impl PeerAllowlistBuilder {
             || self.application_uid == Some(uid)
             || self.openai_uid == Some(uid)
             || self.codex_uid == Some(uid)
+            || self.fleet_uid() == Some(uid)
             || self.repair_broker_uid.is_some()
         {
             return Err(ProtocolViolation::InvalidAllowlist);
@@ -241,6 +270,7 @@ impl PeerAllowlistBuilder {
             self.application_uid,
             self.openai_uid,
             self.codex_uid,
+            self.fleet_uid(),
             self.repair_broker_uid(),
         ];
         if self.companion_uid == 0
@@ -263,6 +293,8 @@ impl PeerAllowlistBuilder {
             application_uid: self.application_uid,
             openai_uid: self.openai_uid,
             codex_uid: self.codex_uid,
+            #[cfg(feature = "experimental-fleet-signing")]
+            fleet_uid: self.fleet_uid,
             #[cfg(feature = "experimental-repair-store")]
             repair_broker_uid: self.repair_broker_uid,
             #[cfg(feature = "experimental-repair-store")]
@@ -275,6 +307,8 @@ impl PeerAllowlistBuilder {
             AgentRole::Application => self.application_uid,
             AgentRole::OpenAi => self.openai_uid,
             AgentRole::Codex => self.codex_uid,
+            #[cfg(feature = "experimental-fleet-signing")]
+            AgentRole::Fleet => self.fleet_uid,
         }
     }
 
@@ -283,6 +317,8 @@ impl PeerAllowlistBuilder {
             AgentRole::Application => &mut self.application_uid,
             AgentRole::OpenAi => &mut self.openai_uid,
             AgentRole::Codex => &mut self.codex_uid,
+            #[cfg(feature = "experimental-fleet-signing")]
+            AgentRole::Fleet => &mut self.fleet_uid,
         }
     }
 
@@ -292,6 +328,17 @@ impl PeerAllowlistBuilder {
             self.repair_broker_uid
         }
         #[cfg(not(feature = "experimental-repair-store"))]
+        {
+            None
+        }
+    }
+
+    fn fleet_uid(&self) -> Option<u32> {
+        #[cfg(feature = "experimental-fleet-signing")]
+        {
+            self.fleet_uid
+        }
+        #[cfg(not(feature = "experimental-fleet-signing"))]
         {
             None
         }
@@ -309,6 +356,17 @@ impl PeerAllowlist {
             None
         }
     }
+
+    fn fleet_uid(&self) -> Option<u32> {
+        #[cfg(feature = "experimental-fleet-signing")]
+        {
+            self.fleet_uid
+        }
+        #[cfg(not(feature = "experimental-fleet-signing"))]
+        {
+            None
+        }
+    }
 }
 
 /// Purpose-specific Agent identity derived exclusively from its allowlisted
@@ -318,6 +376,8 @@ pub enum AgentRole {
     Application,
     OpenAi,
     Codex,
+    #[cfg(feature = "experimental-fleet-signing")]
+    Fleet,
 }
 
 /// Role derived exclusively from a kernel-authenticated peer UID.
@@ -529,6 +589,15 @@ pub enum Operation {
     ReportList,
     #[serde(rename = "report.get")]
     ReportGet,
+    #[cfg(feature = "experimental-fleet-signing")]
+    #[serde(rename = "fleet.enrollment.sign")]
+    FleetEnrollmentSign,
+    #[cfg(feature = "experimental-fleet-signing")]
+    #[serde(rename = "fleet.work-order.claim.sign")]
+    FleetWorkOrderClaimSign,
+    #[cfg(feature = "experimental-fleet-signing")]
+    #[serde(rename = "fleet.work-order.result.sign")]
+    FleetWorkOrderResultSign,
     #[cfg(feature = "experimental-repair-store")]
     #[serde(rename = "repair.backup.reserve")]
     RepairBackupReserve,
@@ -614,6 +683,14 @@ impl Operation {
             PeerRole::Agent(AgentRole::Codex) => {
                 matches!(self, Self::VaultStatus | Self::ProviderCodexHomeLease)
             }
+            #[cfg(feature = "experimental-fleet-signing")]
+            PeerRole::Agent(AgentRole::Fleet) => matches!(
+                self,
+                Self::VaultStatus
+                    | Self::FleetEnrollmentSign
+                    | Self::FleetWorkOrderClaimSign
+                    | Self::FleetWorkOrderResultSign
+            ),
             #[cfg(feature = "experimental-repair-store")]
             PeerRole::RepairBroker => matches!(
                 self,
@@ -746,6 +823,15 @@ pub enum DescriptorType {
     SessionReportJsonPipe,
     #[serde(rename = "signed-report-envelope-pipe")]
     SignedReportEnvelopePipe,
+    #[cfg(feature = "experimental-fleet-signing")]
+    #[serde(rename = "fleet-enrollment-input-pipe")]
+    FleetEnrollmentInputPipe,
+    #[cfg(feature = "experimental-fleet-signing")]
+    #[serde(rename = "fleet-work-order-claim-input-pipe")]
+    FleetWorkOrderClaimInputPipe,
+    #[cfg(feature = "experimental-fleet-signing")]
+    #[serde(rename = "fleet-work-order-result-input-pipe")]
+    FleetWorkOrderResultInputPipe,
     #[cfg(feature = "experimental-repair-store")]
     #[serde(rename = "repair-backup-input-pipe")]
     RepairBackupInputPipe,
@@ -844,6 +930,18 @@ pub enum RequestPayload {
     },
     ReportGet {
         report_id: ReportId,
+    },
+    #[cfg(feature = "experimental-fleet-signing")]
+    FleetEnrollmentSign {
+        input: DescriptorDeclaration,
+    },
+    #[cfg(feature = "experimental-fleet-signing")]
+    FleetWorkOrderClaimSign {
+        input: DescriptorDeclaration,
+    },
+    #[cfg(feature = "experimental-fleet-signing")]
+    FleetWorkOrderResultSign {
+        input: DescriptorDeclaration,
     },
     #[cfg(feature = "experimental-repair-store")]
     RepairBackupReserve {
@@ -1439,6 +1537,34 @@ fn parse_payload(
                 input: payload.input,
             })
         }
+        #[cfg(feature = "experimental-fleet-signing")]
+        Operation::FleetEnrollmentSign
+        | Operation::FleetWorkOrderClaimSign
+        | Operation::FleetWorkOrderResultSign => {
+            let payload = serde_json::from_str::<DescriptorPayload>(raw.get())
+                .map_err(|_| ProtocolViolation::InvalidPayload)?;
+            let expected = match operation {
+                Operation::FleetEnrollmentSign => DescriptorType::FleetEnrollmentInputPipe,
+                Operation::FleetWorkOrderClaimSign => DescriptorType::FleetWorkOrderClaimInputPipe,
+                Operation::FleetWorkOrderResultSign => {
+                    DescriptorType::FleetWorkOrderResultInputPipe
+                }
+                _ => unreachable!(),
+            };
+            validate_declaration(&payload.input, expected, 2, MAX_FLEET_SIGNING_INPUT_BYTES)?;
+            Ok(match operation {
+                Operation::FleetEnrollmentSign => RequestPayload::FleetEnrollmentSign {
+                    input: payload.input,
+                },
+                Operation::FleetWorkOrderClaimSign => RequestPayload::FleetWorkOrderClaimSign {
+                    input: payload.input,
+                },
+                Operation::FleetWorkOrderResultSign => RequestPayload::FleetWorkOrderResultSign {
+                    input: payload.input,
+                },
+                _ => unreachable!(),
+            })
+        }
         Operation::ProviderCodexHomeLease => {
             let payload = serde_json::from_str::<CodexHomeLeasePayload>(raw.get())
                 .map_err(|_| ProtocolViolation::InvalidPayload)?;
@@ -1741,6 +1867,10 @@ fn payload_descriptor(payload: &RequestPayload) -> Option<&DescriptorDeclaration
         RequestPayload::VaultUnlock { input }
         | RequestPayload::ProviderOpenAiConfigure { input }
         | RequestPayload::ReportPersist { input, .. } => Some(input),
+        #[cfg(feature = "experimental-fleet-signing")]
+        RequestPayload::FleetEnrollmentSign { input }
+        | RequestPayload::FleetWorkOrderClaimSign { input }
+        | RequestPayload::FleetWorkOrderResultSign { input } => Some(input),
         #[cfg(feature = "experimental-repair-store")]
         RequestPayload::RepairBackupPersist { input, .. } => Some(input),
         RequestPayload::ProviderCodexHomeLease { .. } => None,
@@ -1793,6 +1923,12 @@ fn validate_received_descriptors(
             DescriptorType::PassphrasePipe
             | DescriptorType::OpenAiApiKeyPipe
             | DescriptorType::SessionReportJsonPipe => validate_pipe_descriptor(descriptor)?,
+            #[cfg(feature = "experimental-fleet-signing")]
+            DescriptorType::FleetEnrollmentInputPipe
+            | DescriptorType::FleetWorkOrderClaimInputPipe
+            | DescriptorType::FleetWorkOrderResultInputPipe => {
+                validate_pipe_descriptor(descriptor)?
+            }
             #[cfg(feature = "experimental-repair-store")]
             DescriptorType::RepairBackupInputPipe => validate_pipe_descriptor(descriptor)?,
             DescriptorType::CodexHomeOPath
@@ -2052,6 +2188,61 @@ impl ReportSummary {
     }
 }
 
+/// Public identity plus one complete, canonical Fleet request signed inside
+/// the Vault. The payload is an already-formed request, not a signature oracle.
+#[cfg(feature = "experimental-fleet-signing")]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FleetSignedEnvelopePayload {
+    device_id: String,
+    public_key: [u8; 32],
+    signed_request: String,
+}
+
+#[cfg(feature = "experimental-fleet-signing")]
+impl FleetSignedEnvelopePayload {
+    pub fn new(
+        device_id: String,
+        public_key: [u8; 32],
+        signed_request: Vec<u8>,
+    ) -> Result<Self, ProtocolViolation> {
+        let signed_request =
+            String::from_utf8(signed_request).map_err(|_| ProtocolViolation::InvalidPayload)?;
+        let payload = Self {
+            device_id,
+            public_key,
+            signed_request,
+        };
+        payload.validate()?;
+        Ok(payload)
+    }
+
+    pub fn validate(&self) -> Result<(), ProtocolViolation> {
+        if kernaid_device_identity::validate_device_id(&self.device_id).is_err()
+            || kernaid_device_identity::device_id_for_public_key(&self.public_key) != self.device_id
+            || !(2..=MAX_FLEET_SIGNED_REQUEST_BYTES).contains(&(self.signed_request.len() as u64))
+            || !self.signed_request.is_ascii()
+            || !self.signed_request.starts_with('{')
+            || !self.signed_request.ends_with('}')
+        {
+            return Err(ProtocolViolation::InvalidPayload);
+        }
+        Ok(())
+    }
+
+    pub fn device_id(&self) -> &str {
+        &self.device_id
+    }
+
+    pub const fn public_key(&self) -> &[u8; 32] {
+        &self.public_key
+    }
+
+    pub fn signed_request(&self) -> &[u8] {
+        self.signed_request.as_bytes()
+    }
+}
+
 /// Closed success payload set. No variant contains a filesystem path, secret,
 /// OS error string, or free-form diagnostic text.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2067,6 +2258,8 @@ pub enum SuccessPayload {
         reports: Vec<ReportSummary>,
     },
     Report(ReportSummary, DescriptorDeclaration),
+    #[cfg(feature = "experimental-fleet-signing")]
+    FleetSigned(FleetSignedEnvelopePayload),
     #[cfg(feature = "experimental-repair-store")]
     RepairBackupStatus(Box<RepairBackupStatusPayload>),
     #[cfg(feature = "experimental-repair-store")]
@@ -2218,6 +2411,15 @@ fn encode_success(
             operation,
             outcome: "ok",
             payload: ReportResponse { report, output },
+        }),
+        #[cfg(feature = "experimental-fleet-signing")]
+        SuccessPayload::FleetSigned(signed) => serde_json::to_vec(&SuccessWire {
+            api_version: API_VERSION,
+            request_id,
+            state_version,
+            operation,
+            outcome: "ok",
+            payload: signed,
         }),
         #[cfg(feature = "experimental-repair-store")]
         SuccessPayload::RepairBackupStatus(status) => serde_json::to_vec(&SuccessWire {
@@ -2485,6 +2687,22 @@ fn validate_success(
         {
             Some(declaration)
         }
+        #[cfg(feature = "experimental-fleet-signing")]
+        (
+            Operation::FleetEnrollmentSign,
+            RequestPayload::FleetEnrollmentSign { .. },
+            SuccessPayload::FleetSigned(signed),
+        )
+        | (
+            Operation::FleetWorkOrderClaimSign,
+            RequestPayload::FleetWorkOrderClaimSign { .. },
+            SuccessPayload::FleetSigned(signed),
+        )
+        | (
+            Operation::FleetWorkOrderResultSign,
+            RequestPayload::FleetWorkOrderResultSign { .. },
+            SuccessPayload::FleetSigned(signed),
+        ) if signed.validate().is_ok() => None,
         #[cfg(feature = "experimental-repair-store")]
         (
             Operation::RepairBackupReserve,
@@ -2684,6 +2902,12 @@ fn validate_success(
         (Some(declaration), [descriptor]) => match declaration.kind {
             DescriptorType::OpenAiApiKeyPipe | DescriptorType::SignedReportEnvelopePipe => {
                 validate_borrowed_pipe(*descriptor)
+            }
+            #[cfg(feature = "experimental-fleet-signing")]
+            DescriptorType::FleetEnrollmentInputPipe
+            | DescriptorType::FleetWorkOrderClaimInputPipe
+            | DescriptorType::FleetWorkOrderResultInputPipe => {
+                Err(ProtocolViolation::InvalidDescriptor)
             }
             #[cfg(feature = "experimental-repair-store")]
             DescriptorType::RepairBackupOutputPipe => validate_borrowed_pipe(*descriptor),

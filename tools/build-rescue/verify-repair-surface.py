@@ -35,6 +35,9 @@ DESK_DIAGNOSIS_TOKENS = (
 )
 SERVER_REPAIR_TOKENS = (
     b"/api/rescue/repair",
+    b"/api/rescue/fleet-repair",
+    b"kernaid.dev/fleet-rescue-repair-local/v1",
+    b"/run/kernaid-fleet-rescue-repair.sock",
     b"kernaid.dev/rescue-repair-service/v1alpha1",
     b"kernaid.dev/rescue-repair-service/v1alpha2",
     b"repair.fstab.rollback.prepare",
@@ -81,6 +84,11 @@ VAULT_WRITE_TOKENS = (
     b".kernaid-repair-store-v1",
     b"repair.transaction.write-lease.consume",
     b"repair.rollback.write-lease.consume",
+)
+VAULT_FLEET_SIGNING_TOKENS = (
+    b"fleet.enrollment.sign",
+    b"fleet.work-order.claim.sign",
+    b"fleet.work-order.result.sign",
 )
 
 
@@ -209,6 +217,12 @@ def verify_vaultd(path: Path, mode: str) -> None:
         VAULT_WRITE_TOKENS,
         mode == "candidate",
     )
+    _assert_tokens(
+        "Rescue Vault purpose-specific Fleet signer",
+        [payload],
+        VAULT_FLEET_SIGNING_TOKENS,
+        mode == "candidate",
+    )
 
 
 def _tool(name: str) -> str:
@@ -259,10 +273,13 @@ def verify_iso(path: Path, mode: str) -> None:
                 "usr/lib/kernaid/repair_target_handoff.py",
                 "usr/lib/kernaid/kernaid-rescue-vaultd",
                 "usr/lib/kernaid/kernaid-rescue-repaird",
+                "usr/lib/kernaid/kernaid-fleet-rescue-repair-bridge",
                 "usr/lib/kernaid/kernaid-blockfd-probe",
                 "usr/lib/kernaid/repair-candidate-image-v1",
                 "etc/systemd/system/kernaid-rescue-repaird.service",
                 "etc/systemd/system/kernaid-rescue-repaird.socket",
+                "etc/systemd/system/kernaid-fleet-rescue-repair.service",
+                "etc/systemd/system/kernaid-fleet-rescue-repair.socket",
                 "etc/systemd/system/kernaid-rescue-target-write-capability.socket",
                 "etc/systemd/system/kernaid-rescue-target-write-capability@.service",
                 "etc/sysusers.d/kernaid-repair-candidate.conf",
@@ -270,6 +287,8 @@ def verify_iso(path: Path, mode: str) -> None:
                 "etc/systemd/system/kernaid-ui.service.d/50-kernaid-repair-candidate.conf",
                 "etc/systemd/system/kernaid-ready.service.d/50-kernaid-repair-candidate.conf",
                 "etc/systemd/system/sockets.target.wants/kernaid-rescue-repaird.socket",
+                "etc/systemd/system/sockets.target.wants/kernaid-fleet-rescue-repair.socket",
+                "etc/systemd/system/multi-user.target.wants/kernaid-fleet-rescue-repair.service",
                 "opt/kernaid/desk",
             ],
             check=True,
@@ -282,10 +301,13 @@ def verify_iso(path: Path, mode: str) -> None:
         verify_desk(root / "opt/kernaid/desk", mode)
         candidate_paths = (
             root / "usr/lib/kernaid/kernaid-rescue-repaird",
+            root / "usr/lib/kernaid/kernaid-fleet-rescue-repair-bridge",
             root / "usr/lib/kernaid/kernaid-blockfd-probe",
             root / "usr/lib/kernaid/repair-candidate-image-v1",
             root / "etc/systemd/system/kernaid-rescue-repaird.service",
             root / "etc/systemd/system/kernaid-rescue-repaird.socket",
+            root / "etc/systemd/system/kernaid-fleet-rescue-repair.service",
+            root / "etc/systemd/system/kernaid-fleet-rescue-repair.socket",
             root
             / "etc/systemd/system/kernaid-rescue-target-write-capability.socket",
             root
@@ -298,6 +320,10 @@ def verify_iso(path: Path, mode: str) -> None:
             / "etc/systemd/system/kernaid-ready.service.d/50-kernaid-repair-candidate.conf",
             root
             / "etc/systemd/system/sockets.target.wants/kernaid-rescue-repaird.socket",
+            root
+            / "etc/systemd/system/sockets.target.wants/kernaid-fleet-rescue-repair.socket",
+            root
+            / "etc/systemd/system/multi-user.target.wants/kernaid-fleet-rescue-repair.service",
         )
         for candidate_path in candidate_paths:
             exists = candidate_path.exists() or candidate_path.is_symlink()
@@ -307,7 +333,11 @@ def verify_iso(path: Path, mode: str) -> None:
                     f"expected candidate artifact to be {expectation}: {candidate_path}"
                 )
         if mode == "candidate":
-            write_service = _regular_payload(candidate_paths[6], 64 * 1024)
+            write_service = _regular_payload(
+                root
+                / "etc/systemd/system/kernaid-rescue-target-write-capability@.service",
+                64 * 1024,
+            )
             for token in (
                 b"Environment=KERNAID_TARGET_HANDOFF_PROFILE=write",
                 b"DeviceAllow=block-* rw",
@@ -316,12 +346,16 @@ def verify_iso(path: Path, mode: str) -> None:
                     raise ValueError(
                         f"candidate write-capability unit lacks {token.decode('ascii')}"
                     )
-            enabled_socket = candidate_paths[-1]
-            if not enabled_socket.is_symlink():
-                raise ValueError("candidate repair socket is not enabled")
-            link_target = os.readlink(enabled_socket)
-            if not link_target.endswith("/kernaid-rescue-repaird.socket"):
-                raise ValueError("candidate repair socket enablement target is invalid")
+            enabled_links = {
+                candidate_paths[-3]: "/kernaid-rescue-repaird.socket",
+                candidate_paths[-2]: "/kernaid-fleet-rescue-repair.socket",
+                candidate_paths[-1]: "/kernaid-fleet-rescue-repair.service",
+            }
+            for enabled, expected_target in enabled_links.items():
+                if not enabled.is_symlink():
+                    raise ValueError(f"candidate unit is not enabled: {enabled}")
+                if not os.readlink(enabled).endswith(expected_target):
+                    raise ValueError(f"candidate unit enablement target is invalid: {enabled}")
         listing = subprocess.run(
             [_tool("unsquashfs"), "-ll", str(squashfs)],
             check=True,

@@ -44,9 +44,13 @@ COMPILED_ACTIONS: Final = (
     "linux.fstab.disable-missing-uuid.v1",
     "linux.network.restore-resolver-link.v1",
 )
-# The current consolidated harness exercises the fstab action.  Compiled is
-# intentionally not synonymous with qualified.
-QUALIFIED_ACTIONS: Final = ("linux.fstab.disable-missing-uuid.v1",)
+QUALIFIED_ACTIONS: Final = COMPILED_ACTIONS
+ATTESTED_ACTIONS: Final = (
+    "linux.fstab.disable-missing-uuid.v1",
+    "linux.crypttab.disable-missing-uuid.v1",
+    "linux.ext4.fsck-preen-with-undo.v1",
+    "linux.network.restore-resolver-link.v1",
+)
 SCENARIOS: Final = (
     "bios-apply",
     "uefi-apply",
@@ -57,6 +61,9 @@ SCENARIOS: Final = (
     "uefi-backup-tamper",
     "uefi-repaird-termination",
     "uefi-auto-restore",
+    "uefi-crypttab-lifecycle",
+    "uefi-ext4-apply",
+    "uefi-resolver-link-apply",
 )
 P3_ZERO_SHA256: Final = "ebfb4ef19ae410f190327b5ebd312711263bc7579970e87d9c1e2d84e06b3c25"
 COMMIT_RE: Final = re.compile(r"[0-9a-f]{40}\Z")
@@ -296,7 +303,14 @@ def _evidence(path: Path, kind: str, iso_sha256: str) -> dict[str, Any]:
     else:
         expected = (
             "KERNAID_QEMU_REPAIR_QUALIFICATION_BATCH_ATTESTATION_V1 "
-            f"provisioning=shared scenarios={','.join(SCENARIOS)} "
+            "provisioning=host-probe-canonical-v1 "
+            "guest_firstboot=not-claimed "
+            "standard_firstboot_gate=unchanged-separate "
+            f"scenarios={','.join(SCENARIOS)} "
+            f"actions={','.join(ATTESTED_ACTIONS)} "
+            "vault_profile=canonical-v1 "
+            "vault_identity=initialize-verify-stable p3=exact "
+            "key=private-mode-0600 target=separate base_immutable=true "
             "isolated_sparse_copies=true "
             f"iso_sha256={iso_sha256} iso_prefix_immutable=true "
             "host_physical_devices=false ready=true\n"
@@ -332,11 +346,19 @@ def _build(arguments: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any
         "repairBatch": _evidence(arguments.batch_evidence, "batch", iso["sha256"]),
         "uefiSecureBoot": _evidence(arguments.uefi_evidence, "uefi", iso["sha256"]),
     }
+    vault_base = {
+        "guestFirstbootClaimed": False,
+        "profile": "canonical-v1",
+        "projectProbe": "initialize-verify",
+        "provisioning": "host-probe-canonical-v1",
+        "standardFirstbootGate": "unchanged-separate",
+    }
     qualification = {
         "environment": "qemu",
         "evidence": evidence,
         "scenarios": list(SCENARIOS),
         "secureBoot": True,
+        "vaultBase": vault_base,
     }
     catalog = {
         "artifactName": ISO_NAME,
@@ -353,6 +375,7 @@ def _build(arguments: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any
         "schema": CATALOG_SCHEMA,
         "sha256": iso["sha256"],
         "source": source,
+        "vaultBase": vault_base,
     }
     catalog_payload = canonical_bytes(catalog)
     catalog_metadata = {
@@ -386,6 +409,7 @@ def _build(arguments: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any
         "requiredJobs": ["build-and-smoke-test"],
         "schema": SCHEMA,
         "source": source,
+        "vaultBase": vault_base,
     }
     return catalog, manifest
 

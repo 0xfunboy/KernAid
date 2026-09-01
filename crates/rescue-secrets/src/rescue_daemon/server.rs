@@ -1,3 +1,5 @@
+#[cfg(feature = "experimental-fleet-signing")]
+use super::passwd_fleet_agent_uid;
 #[cfg(feature = "experimental-repair-store")]
 use super::runtime::WorkerRepairGetResult;
 use super::{
@@ -31,6 +33,8 @@ use kernaid_protocol::rescue_vault::{
     ServerReceiveError, Sha256, SuccessPayload, ValidatedRequest, VaultState, VaultStatusPayload,
     authenticate_seqpacket_peer, gate_operation_for_vault_state, validate_passphrase_read,
 };
+#[cfg(feature = "experimental-fleet-signing")]
+use kernaid_protocol::rescue_vault::{FleetSignedEnvelopePayload, MAX_FLEET_SIGNING_INPUT_BYTES};
 use nix::sys::signal::{SigSet, Signal};
 use nix::sys::socket::{getsockopt, sockopt};
 use rand_core::{OsRng, RngCore};
@@ -300,6 +304,16 @@ trait WorkerBoundary: Send + Sync {
         deadline: Instant,
     ) -> Result<(internal_wire::WorkerResponse, Vec<ReportSummary>), RescueVaultDaemonError>;
     fn report_get(&self, report_id: &ReportId, deadline: Instant) -> WorkerReportGetResult;
+    #[cfg(feature = "experimental-fleet-signing")]
+    fn fleet_sign(
+        &self,
+        command: internal_wire::WorkerFleetSignCommand,
+        input: &[u8],
+        deadline: Instant,
+    ) -> Result<(internal_wire::WorkerResponse, Zeroizing<Vec<u8>>), RescueVaultDaemonError> {
+        let _ = (command, input, deadline);
+        Err(RescueVaultDaemonError::ProtocolFailure)
+    }
     #[cfg(feature = "experimental-repair-store")]
     fn repair_backup_reserve(
         &self,
@@ -491,6 +505,16 @@ impl WorkerBoundary for WorkerHandle {
         deadline: Instant,
     ) -> Result<(internal_wire::WorkerResponse, Vec<ReportSummary>), RescueVaultDaemonError> {
         WorkerHandle::report_list(self, deadline)
+    }
+
+    #[cfg(feature = "experimental-fleet-signing")]
+    fn fleet_sign(
+        &self,
+        command: internal_wire::WorkerFleetSignCommand,
+        input: &[u8],
+        deadline: Instant,
+    ) -> Result<(internal_wire::WorkerResponse, Zeroizing<Vec<u8>>), RescueVaultDaemonError> {
+        WorkerHandle::fleet_sign(self, command, input, deadline)
     }
 
     fn report_get(&self, report_id: &ReportId, deadline: Instant) -> WorkerReportGetResult {
@@ -1525,6 +1549,9 @@ fn validated_peer_allowlist(companion_uid: u32) -> Result<PeerAllowlist, RescueV
         .ok_or(RescueVaultDaemonError::InvalidConfiguration)?;
     let application_uid = passwd_application_agent_uid(&bytes, companion_uid)
         .ok_or(RescueVaultDaemonError::InvalidConfiguration)?;
+    #[cfg(feature = "experimental-fleet-signing")]
+    let fleet_uid = passwd_fleet_agent_uid(&bytes, companion_uid)
+        .ok_or(RescueVaultDaemonError::InvalidConfiguration)?;
     #[cfg(feature = "experimental-repair-store")]
     let repair_uid = passwd_repair_broker_uid(&bytes, companion_uid)
         .ok_or(RescueVaultDaemonError::InvalidConfiguration)?;
@@ -1536,6 +1563,10 @@ fn validated_peer_allowlist(companion_uid: u32) -> Result<PeerAllowlist, RescueV
     let builder = PeerAllowlist::builder(companion_uid)
         .agent(AgentRole::OpenAi, openai_uid)
         .and_then(|builder| builder.agent(AgentRole::Application, application_uid))
+        .map_err(|_| RescueVaultDaemonError::InvalidConfiguration)?;
+    #[cfg(feature = "experimental-fleet-signing")]
+    let builder = builder
+        .agent(AgentRole::Fleet, fleet_uid)
         .map_err(|_| RescueVaultDaemonError::InvalidConfiguration)?;
     #[cfg(feature = "experimental-codex-home-lease")]
     let builder = builder
@@ -2758,6 +2789,12 @@ impl Supervisor {
             Operation::ReportGet => {
                 self.handle_application_report_get(request, started, &connection)
             }
+            #[cfg(feature = "experimental-fleet-signing")]
+            Operation::FleetEnrollmentSign
+            | Operation::FleetWorkOrderClaimSign
+            | Operation::FleetWorkOrderResultSign => {
+                self.handle_fleet_sign(request, started, &connection)
+            }
             #[cfg(feature = "experimental-repair-store")]
             Operation::RepairBackupReserve => {
                 self.handle_repair_backup_reserve(request, started, &connection)
@@ -3251,6 +3288,108 @@ impl Supervisor {
                 ) =>
             {
                 self.finish_application_read(request, Err(ErrorToken::IoFailed), deadline)
+            }
+            Ok(_) | Err(_) => {
+                self.mark_fault_by(deadline);
+                (
+                    self.snapshot().version,
+                    HandlerResult::Error(request, ErrorToken::RebootRequired),
+                )
+            }
+        }
+    }
+
+    #[cfg(feature = "experimental-fleet-signing")]
+    fn handle_fleet_sign(
+        self: &Arc<Self>,
+        mut request: ValidatedRequest,
+        started: Instant,
+        connection: &ClientConnection<'_>,
+    ) -> (u64, HandlerResult) {
+        let deadline = started
+            .checked_add(WORKER_OPERATION_TIMEOUT)
+            .unwrap_or(started);
+        let (command, input_size) = match request.payload() {
+            RequestPayload::FleetEnrollmentSign { input } => (
+                internal_wire::WorkerFleetSignCommand::Enrollment {
+                    input_size: input.size,
+                },
+                input.size,
+            ),
+            RequestPayload::FleetWorkOrderClaimSign { input } => (
+                internal_wire::WorkerFleetSignCommand::WorkOrderClaim {
+                    input_size: input.size,
+                },
+                input.size,
+            ),
+            RequestPayload::FleetWorkOrderResultSign { input } => (
+                internal_wire::WorkerFleetSignCommand::WorkOrderResult {
+                    input_size: input.size,
+                },
+                input.size,
+            ),
+            _ => {
+                let version = self.snapshot().version;
+                return (version, HandlerResult::Error(request, ErrorToken::IoFailed));
+            }
+        };
+        if let Err((version, error)) = self.prepare_application_operation(
+            request.expected_state_version(),
+            false,
+            connection,
+            deadline,
+        ) {
+            return (version, HandlerResult::Error(request, error));
+        }
+        let Some(input) = request.take_descriptor() else {
+            return self.finish_application_read(request, Err(ErrorToken::FdRequired), deadline);
+        };
+        let input = match read_exact_fleet_input(input, input_size, deadline) {
+            Ok(input) => input,
+            Err(()) => {
+                return self.finish_application_read(request, Err(ErrorToken::IoFailed), deadline);
+            }
+        };
+        let Some(worker) = self.worker.as_ref() else {
+            self.mark_fault_by(deadline);
+            return (
+                self.snapshot().version,
+                HandlerResult::Error(request, ErrorToken::RebootRequired),
+            );
+        };
+        match worker.fleet_sign(command, &input, deadline) {
+            Ok((response, signed))
+                if response.code == internal_wire::WorkerResultCode::FleetSignedReady =>
+            {
+                let payload = response
+                    .device_id
+                    .clone()
+                    .zip(response.fleet_public_key)
+                    .and_then(|(device_id, public_key)| {
+                        FleetSignedEnvelopePayload::new(device_id, public_key, signed.to_vec()).ok()
+                    });
+                match payload {
+                    Some(payload) => self.finish_application_read(
+                        request,
+                        Ok(SuccessPayload::FleetSigned(payload)),
+                        deadline,
+                    ),
+                    None => {
+                        self.mark_fault_by(deadline);
+                        (
+                            self.snapshot().version,
+                            HandlerResult::Error(request, ErrorToken::RebootRequired),
+                        )
+                    }
+                }
+            }
+            Ok((response, _))
+                if response.code == internal_wire::WorkerResultCode::FleetInvalidRequest =>
+            {
+                self.finish_application_read(request, Err(ErrorToken::IoFailed), deadline)
+            }
+            Ok((response, _)) if response.code == internal_wire::WorkerResultCode::Busy => {
+                self.finish_application_read(request, Err(ErrorToken::Locked), deadline)
             }
             Ok(_) | Err(_) => {
                 self.mark_fault_by(deadline);
@@ -6555,6 +6694,14 @@ fn external_operation_is_enabled(
                 | Operation::ReportList
                 | Operation::ReportGet
         ),
+        #[cfg(feature = "experimental-fleet-signing")]
+        kernaid_protocol::rescue_vault::PeerRole::Agent(AgentRole::Fleet) => matches!(
+            operation,
+            Operation::VaultStatus
+                | Operation::FleetEnrollmentSign
+                | Operation::FleetWorkOrderClaimSign
+                | Operation::FleetWorkOrderResultSign
+        ),
         #[cfg(feature = "experimental-repair-store")]
         kernaid_protocol::rescue_vault::PeerRole::RepairBroker => matches!(
             operation,
@@ -6623,6 +6770,10 @@ fn provider_process_scope(role: kernaid_protocol::rescue_vault::PeerRole) -> Pro
         }
         kernaid_protocol::rescue_vault::PeerRole::Companion
         | kernaid_protocol::rescue_vault::PeerRole::Agent(AgentRole::Application) => {
+            ProcessScope::DirectPeer
+        }
+        #[cfg(feature = "experimental-fleet-signing")]
+        kernaid_protocol::rescue_vault::PeerRole::Agent(AgentRole::Fleet) => {
             ProcessScope::DirectPeer
         }
         #[cfg(feature = "experimental-repair-store")]
@@ -6882,6 +7033,52 @@ fn read_exact_passphrase(
         }
     };
     validate_passphrase_read(&value, declared_size, reached_eof).map_err(|_| ())?;
+    Ok(value)
+}
+
+#[cfg(feature = "experimental-fleet-signing")]
+fn read_exact_fleet_input(
+    descriptor: OwnedFd,
+    declared_size: u64,
+    deadline: Instant,
+) -> Result<Zeroizing<Vec<u8>>, ()> {
+    if !(2..=MAX_FLEET_SIGNING_INPUT_BYTES).contains(&declared_size) {
+        return Err(());
+    }
+    let expected = usize::try_from(declared_size).map_err(|_| ())?;
+    let status = rfs::fcntl_getfl(&descriptor).map_err(|_| ())?;
+    if status & OFlags::ACCMODE != OFlags::RDONLY {
+        return Err(());
+    }
+    rfs::fcntl_setfl(&descriptor, status | OFlags::NONBLOCK).map_err(|_| ())?;
+    let mut value = Zeroizing::new(Vec::with_capacity(expected));
+    while value.len() < expected {
+        ensure_before(deadline)?;
+        let mut buffer = Zeroizing::new([0_u8; 512]);
+        let chunk = (expected - value.len()).min(buffer.len());
+        match rustix::io::read(&descriptor, &mut buffer[..chunk]) {
+            Ok(0) => return Err(()),
+            Ok(read) => value.extend_from_slice(&buffer[..read]),
+            Err(error) if error == rustix::io::Errno::INTR => {}
+            Err(error) if error == rustix::io::Errno::AGAIN => {
+                wait_pipe(descriptor.as_fd(), deadline)?;
+            }
+            Err(_) => return Err(()),
+        }
+    }
+    loop {
+        ensure_before(deadline)?;
+        let mut extra = [0_u8; 1];
+        match rustix::io::read(&descriptor, &mut extra) {
+            Ok(0) => break,
+            Ok(_) => return Err(()),
+            Err(error) if error == rustix::io::Errno::INTR => {}
+            Err(error) if error == rustix::io::Errno::AGAIN => {
+                wait_pipe(descriptor.as_fd(), deadline)?;
+            }
+            Err(_) => return Err(()),
+        }
+    }
     Ok(value)
 }
 

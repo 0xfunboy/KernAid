@@ -7,6 +7,7 @@ edition.workspace = true
 default = []
 experimental-physical-parent-fingerprint = ["dep:sha2"]
 experimental-repair-store = ["experimental-physical-parent-fingerprint"]
+experimental-fleet-signing = []
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

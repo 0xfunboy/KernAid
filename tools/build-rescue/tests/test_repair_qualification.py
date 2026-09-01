@@ -16,7 +16,14 @@ P3_SHA256 = "ebfb4ef19ae410f190327b5ebd312711263bc7579970e87d9c1e2d84e06b3c25"
 SCENARIOS = (
     "bios-apply,uefi-apply,uefi-rollback,uefi-interrupt-reconcile,"
     "uefi-stale-target,uefi-cancel,uefi-backup-tamper,"
-    "uefi-repaird-termination,uefi-auto-restore"
+    "uefi-repaird-termination,uefi-auto-restore,uefi-crypttab-lifecycle,"
+    "uefi-ext4-apply,uefi-resolver-link-apply"
+)
+ACTIONS = (
+    "linux.fstab.disable-missing-uuid.v1,"
+    "linux.crypttab.disable-missing-uuid.v1,"
+    "linux.ext4.fsck-preen-with-undo.v1,"
+    "linux.network.restore-resolver-link.v1"
 )
 
 
@@ -95,7 +102,13 @@ class RepairQualificationTests(unittest.TestCase):
         )
         self.batch.write_text(
             "KERNAID_QEMU_REPAIR_QUALIFICATION_BATCH_ATTESTATION_V1 "
-            f"provisioning=shared scenarios={SCENARIOS} isolated_sparse_copies=true "
+            "provisioning=host-probe-canonical-v1 guest_firstboot=not-claimed "
+            "standard_firstboot_gate=unchanged-separate "
+            f"scenarios={SCENARIOS} actions={ACTIONS} "
+            "vault_profile=canonical-v1 "
+            "vault_identity=initialize-verify-stable p3=exact "
+            "key=private-mode-0600 target=separate base_immutable=true "
+            "isolated_sparse_copies=true "
             f"iso_sha256={iso_sha} iso_prefix_immutable=true "
             "host_physical_devices=false ready=true\n",
             encoding="ascii",
@@ -159,7 +172,7 @@ class RepairQualificationTests(unittest.TestCase):
         result = self.run_cli("create")
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_create_and_verify_keep_compiled_and_qualified_actions_distinct(self) -> None:
+    def test_create_and_verify_bind_all_actions_and_host_vault_base(self) -> None:
         self.create()
         manifest = json.loads(self.manifest.read_text(encoding="ascii"))
         catalog = json.loads(self.catalog.read_text(encoding="ascii"))
@@ -169,13 +182,20 @@ class RepairQualificationTests(unittest.TestCase):
         self.assertEqual(manifest["channel"], "repair")
         self.assertEqual(
             manifest["capabilities"]["qualifiedRepairActions"],
-            ["linux.fstab.disable-missing-uuid.v1"],
+            manifest["capabilities"]["compiledRepairActions"],
         )
-        self.assertGreater(
-            len(manifest["capabilities"]["compiledRepairActions"]),
-            len(manifest["capabilities"]["qualifiedRepairActions"]),
+        self.assertEqual(
+            manifest["vaultBase"],
+            {
+                "guestFirstbootClaimed": False,
+                "profile": "canonical-v1",
+                "projectProbe": "initialize-verify",
+                "provisioning": "host-probe-canonical-v1",
+                "standardFirstbootGate": "unchanged-separate",
+            },
         )
         self.assertEqual(catalog["schema"], "dev.kernaid.rescue-repair-catalog-entry.v1")
+        self.assertEqual(catalog["qualification"]["vaultBase"], manifest["vaultBase"])
         self.assertEqual(self.run_cli("verify").returncode, 0)
 
     def test_verify_rejects_evidence_tampering(self) -> None:

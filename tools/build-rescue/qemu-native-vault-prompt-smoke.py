@@ -837,7 +837,10 @@ def _run_firstboot(
             ),
             stage="firstboot-start",
         )
-        qmp.set_deadline(_deadline(aggregate, 10.0))
+        time.sleep(LIFECYCLE.FIRSTBOOT_PROMPT_SETTLE_SECONDS)
+        qmp.set_deadline(
+            _deadline(aggregate, LIFECYCLE.QMP_SECRET_INPUT_TIMEOUT_SECONDS)
+        )
         qmp.send_hex_line(secret)
         confirmation = console.wait_regex(
             re.compile(rb"KERNAID_RESCUE_FIRSTBOOT_PROMPT_READY_V1 step=confirmation"),
@@ -847,7 +850,10 @@ def _run_firstboot(
             ),
             stage="firstboot-confirmation",
         )
-        qmp.set_deadline(_deadline(aggregate, 10.0))
+        time.sleep(LIFECYCLE.FIRSTBOOT_PROMPT_SETTLE_SECONDS)
+        qmp.set_deadline(
+            _deadline(aggregate, LIFECYCLE.QMP_SECRET_INPUT_TIMEOUT_SECONDS)
+        )
         qmp.send_hex_line(secret)
         LIFECYCLE.wait_firstboot_attestation(
             console,
@@ -942,7 +948,9 @@ def _run_prompt_boot(
             console, "native-ready", READY_PROOF, cursor, aggregate, timeout=75.0
         )
         _require_prompt_frame(qmp, work_directory, baseline, _deadline(aggregate, 15.0))
-        qmp.set_deadline(_deadline(aggregate, 10.0))
+        qmp.set_deadline(
+            _deadline(aggregate, LIFECYCLE.QMP_SECRET_INPUT_TIMEOUT_SECONDS)
+        )
         qmp.send_hex_line(secret)
         cursor = LIFECYCLE.run_guest_proof(
             console, "native-post", POST_PROOF, cursor, aggregate, timeout=650.0

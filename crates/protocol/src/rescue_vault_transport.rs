@@ -33,6 +33,8 @@ use crate::rescue_vault::{
     SuccessPayload, VaultState, VaultStatusPayload, valid_report_list, validate_borrowed_pipe,
     validate_mount_namespace_descriptor, validate_mount_root_descriptor, validate_o_path_directory,
 };
+#[cfg(feature = "experimental-fleet-signing")]
+use crate::rescue_vault::{FleetSignedEnvelopePayload, MAX_FLEET_SIGNING_INPUT_BYTES};
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::net::{
     AddressFamily, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags,
@@ -529,6 +531,18 @@ pub enum ClientRequestPayload {
     ReportGet {
         report_id: ReportId,
     },
+    #[cfg(feature = "experimental-fleet-signing")]
+    FleetEnrollmentSign {
+        input_size: u64,
+    },
+    #[cfg(feature = "experimental-fleet-signing")]
+    FleetWorkOrderClaimSign {
+        input_size: u64,
+    },
+    #[cfg(feature = "experimental-fleet-signing")]
+    FleetWorkOrderResultSign {
+        input_size: u64,
+    },
     #[cfg(feature = "experimental-repair-store")]
     RepairBackupReserve {
         draft: RepairBackupDraft,
@@ -609,6 +623,12 @@ impl ClientRequestPayload {
             Self::ReportPersist { .. } => Operation::ReportPersist,
             Self::ReportList => Operation::ReportList,
             Self::ReportGet { .. } => Operation::ReportGet,
+            #[cfg(feature = "experimental-fleet-signing")]
+            Self::FleetEnrollmentSign { .. } => Operation::FleetEnrollmentSign,
+            #[cfg(feature = "experimental-fleet-signing")]
+            Self::FleetWorkOrderClaimSign { .. } => Operation::FleetWorkOrderClaimSign,
+            #[cfg(feature = "experimental-fleet-signing")]
+            Self::FleetWorkOrderResultSign { .. } => Operation::FleetWorkOrderResultSign,
             #[cfg(feature = "experimental-repair-store")]
             Self::RepairBackupReserve { .. } => Operation::RepairBackupReserve,
             #[cfg(feature = "experimental-repair-store")]
@@ -656,6 +676,21 @@ impl ClientRequestPayload {
             }),
             Self::ReportPersist { input_size, .. } => Some(DescriptorDeclaration {
                 kind: DescriptorType::SessionReportJsonPipe,
+                size: *input_size,
+            }),
+            #[cfg(feature = "experimental-fleet-signing")]
+            Self::FleetEnrollmentSign { input_size } => Some(DescriptorDeclaration {
+                kind: DescriptorType::FleetEnrollmentInputPipe,
+                size: *input_size,
+            }),
+            #[cfg(feature = "experimental-fleet-signing")]
+            Self::FleetWorkOrderClaimSign { input_size } => Some(DescriptorDeclaration {
+                kind: DescriptorType::FleetWorkOrderClaimInputPipe,
+                size: *input_size,
+            }),
+            #[cfg(feature = "experimental-fleet-signing")]
+            Self::FleetWorkOrderResultSign { input_size } => Some(DescriptorDeclaration {
+                kind: DescriptorType::FleetWorkOrderResultInputPipe,
                 size: *input_size,
             }),
             #[cfg(feature = "experimental-repair-store")]
@@ -752,6 +787,12 @@ fn valid_client_payload(payload: &ClientRequestPayload) -> bool {
         }
         ClientRequestPayload::ReportPersist { input_size, .. } => {
             (2..=MAX_SESSION_REPORT_JSON_BYTES).contains(input_size)
+        }
+        #[cfg(feature = "experimental-fleet-signing")]
+        ClientRequestPayload::FleetEnrollmentSign { input_size }
+        | ClientRequestPayload::FleetWorkOrderClaimSign { input_size }
+        | ClientRequestPayload::FleetWorkOrderResultSign { input_size } => {
+            (2..=MAX_FLEET_SIGNING_INPUT_BYTES).contains(input_size)
         }
         #[cfg(feature = "experimental-repair-store")]
         ClientRequestPayload::RepairBackupPersist {
@@ -1006,6 +1047,17 @@ pub fn encode_client_request(
                     .ok_or(ProtocolViolation::InvalidPayload)?,
             },
         ),
+        #[cfg(feature = "experimental-fleet-signing")]
+        ClientRequestPayload::FleetEnrollmentSign { .. }
+        | ClientRequestPayload::FleetWorkOrderClaimSign { .. }
+        | ClientRequestPayload::FleetWorkOrderResultSign { .. } => encode_client_request_payload(
+            request,
+            InputRequestPayload {
+                input: declaration
+                    .as_ref()
+                    .ok_or(ProtocolViolation::InvalidPayload)?,
+            },
+        ),
         ClientRequestPayload::ProviderCodexHomeLease => encode_client_request_payload(
             request,
             CodexHomeLeaseRequestPayload {
@@ -1211,6 +1263,10 @@ fn validate_client_request_descriptors(
             DescriptorType::PassphrasePipe
             | DescriptorType::OpenAiApiKeyPipe
             | DescriptorType::SessionReportJsonPipe => validate_borrowed_pipe(*descriptor),
+            #[cfg(feature = "experimental-fleet-signing")]
+            DescriptorType::FleetEnrollmentInputPipe
+            | DescriptorType::FleetWorkOrderClaimInputPipe
+            | DescriptorType::FleetWorkOrderResultInputPipe => validate_borrowed_pipe(*descriptor),
             #[cfg(feature = "experimental-repair-store")]
             DescriptorType::RepairBackupInputPipe => validate_borrowed_pipe(*descriptor),
             DescriptorType::CodexHomeOPath
@@ -1689,6 +1745,17 @@ fn decode_success_payload(
             validate_one_descriptor(descriptors, DescriptorType::SignedReportEnvelopePipe)?;
             Ok(SuccessPayload::Report(report, response.output))
         }
+        #[cfg(feature = "experimental-fleet-signing")]
+        ClientRequestPayload::FleetEnrollmentSign { .. }
+        | ClientRequestPayload::FleetWorkOrderClaimSign { .. }
+        | ClientRequestPayload::FleetWorkOrderResultSign { .. } => {
+            require_no_descriptors(descriptors)?;
+            let signed: FleetSignedEnvelopePayload = decode_payload(raw)?;
+            signed
+                .validate()
+                .map_err(|_| ClientResponseDecodeError::InvalidPayload)?;
+            Ok(SuccessPayload::FleetSigned(signed))
+        }
         #[cfg(feature = "experimental-repair-store")]
         ClientRequestPayload::RepairBackupReserve { draft } => {
             require_no_descriptors(descriptors)?;
@@ -1987,6 +2054,12 @@ fn validate_one_descriptor(
         | DescriptorType::CodexMountNamespace
         | DescriptorType::CodexMountRoot
         | DescriptorType::SessionReportJsonPipe => Err(ProtocolViolation::InvalidDescriptor),
+        #[cfg(feature = "experimental-fleet-signing")]
+        DescriptorType::FleetEnrollmentInputPipe
+        | DescriptorType::FleetWorkOrderClaimInputPipe
+        | DescriptorType::FleetWorkOrderResultInputPipe => {
+            Err(ProtocolViolation::InvalidDescriptor)
+        }
         #[cfg(feature = "experimental-repair-store")]
         DescriptorType::RepairBackupInputPipe => Err(ProtocolViolation::InvalidDescriptor),
     };

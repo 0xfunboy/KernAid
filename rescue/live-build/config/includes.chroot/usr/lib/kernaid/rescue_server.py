@@ -74,8 +74,14 @@ MAX_PROVIDER_RESPONSE_FRAME_BYTES = 64 * 1024
 REPAIR_API_VERSION = "kernaid.dev/rescue-repair-service/v1alpha1"
 ROLLBACK_API_VERSION = "kernaid.dev/rescue-repair-service/v1alpha2"
 REPAIR_SOCKET = "/run/kernaid-rescue-repair.sock"
+FLEET_REPAIR_LOCAL_API_VERSION = (
+    "kernaid.dev/fleet-rescue-repair-local/v1"
+)
+FLEET_REPAIR_INTENT_SCHEMA = "dev.kernaid.fleet.rescue-repair-intent.v1"
+FLEET_REPAIR_SOCKET = "/run/kernaid-fleet-rescue-repair.sock"
 REPAIR_CANDIDATE_MARKER = "/usr/lib/kernaid/repair-candidate-image-v1"
 MAX_REPAIR_FRAME_BYTES = 4 * 1024
+MAX_FLEET_REPAIR_FRAME_BYTES = 16 * 1024
 REPAIR_REQUEST_DEADLINE_SECONDS = 8
 REPAIR_REQUEST_ID = re.compile(
     r"^R-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
@@ -147,6 +153,42 @@ REPAIR_PREPARE_FAILURE_STAGES = {
     "admission-internal",
 }
 REPAIR_RELAY_LOCK = threading.Lock()
+FLEET_REPAIR_RELAY_LOCK = threading.Lock()
+FLEET_REPAIR_ACTIONS = {
+    "linux.fstab.disable-missing-uuid.v1": ("R2", "DISABILITA VOCE FSTAB"),
+    "linux.crypttab.disable-missing-uuid.v1": (
+        "R2",
+        "DISABILITA VOCE CRYPTTAB",
+    ),
+    "linux.ext4.fsck-preen-with-undo.v1": ("R3", "REPAIR EXT4 OFFLINE"),
+    "linux.network.restore-resolver-link.v1": (
+        "R2",
+        "RESTORE RESOLVER LINK",
+    ),
+}
+FLEET_REPAIR_STATES = {
+    "awaiting-target",
+    "staging",
+    "awaiting-approval",
+    "approved",
+    "executing",
+    "canceling",
+    "rejected",
+    "succeeded",
+    "failed",
+    "manual-reconciliation-required",
+}
+FLEET_REPAIR_ERRORS = {
+    "rescue-fleet-request-invalid",
+    "rescue-fleet-action-unsupported",
+    "rescue-fleet-binding-mismatch",
+    "rescue-fleet-approval-expired",
+    "rescue-fleet-busy",
+    "rescue-fleet-broker-unavailable",
+    "rescue-fleet-broker-protocol",
+    "rescue-fleet-state-corrupt",
+    "rescue-fleet-state-io",
+}
 # KERNAID_REPAIR_CANDIDATE_END
 APPLICATION_HTTP_API_VERSION = "kernaid.dev/rescue-application-http/v1alpha1"
 APPLICATION_RELAY_API_VERSION = "kernaid.dev/rescue-application-relay/v1alpha1"
@@ -420,6 +462,15 @@ class ProviderRelayError(Exception):
 # KERNAID_REPAIR_CANDIDATE_BEGIN
 class RepairRelayError(Exception):
     """A fixed candidate-repair relay failure safe for the local UI."""
+
+    def __init__(self, code: str, status: int) -> None:
+        super().__init__(code)
+        self.code = code
+        self.status = status
+
+
+class FleetRepairRelayError(Exception):
+    """A closed Fleet-to-Rescue relay failure safe for the local UI."""
 
     def __init__(self, code: str, status: int) -> None:
         super().__init__(code)
@@ -1592,6 +1643,220 @@ def relay_repair_request(
         if connection is not None:
             connection.close()
         REPAIR_RELAY_LOCK.release()
+
+
+def _fleet_identifier(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and 1 <= len(value) <= 160
+        and all(
+            character.isascii()
+            and (character.isalnum() or character in "-_.:/")
+            for character in value
+        )
+    )
+
+
+def _validate_fleet_repair_evidence(value: object) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+        "preparedId",
+        "sessionId",
+        "planId",
+        "planSha256",
+        "targetSha256",
+        "beforeSha256",
+        "afterSha256",
+        "diffSha256",
+        "backupLocator",
+        "approvalSequence",
+        "evidenceSha256",
+    }:
+        return False
+    return (
+        _repair_id(value.get("preparedId"), "Q")
+        and _repair_id(value.get("sessionId"), "S")
+        and _repair_id(value.get("planId"), "P")
+        and all(
+            isinstance(value.get(field), str)
+            and re.fullmatch(r"[0-9a-f]{64}", str(value[field])) is not None
+            for field in (
+                "planSha256",
+                "targetSha256",
+                "beforeSha256",
+                "afterSha256",
+                "diffSha256",
+                "evidenceSha256",
+            )
+        )
+        and isinstance(value.get("backupLocator"), str)
+        and REPAIR_BACKUP_LOCATOR.fullmatch(str(value["backupLocator"]))
+        is not None
+        and isinstance(value.get("approvalSequence"), int)
+        and not isinstance(value.get("approvalSequence"), bool)
+        and 1 <= int(value["approvalSequence"]) <= MAX_AUDIT_SEQUENCE
+    )
+
+
+def _validate_fleet_repair_intent(value: object) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+        "schema",
+        "deviceId",
+        "workOrderId",
+        "leaseId",
+        "executionId",
+        "actionId",
+        "actionVersion",
+        "risk",
+        "state",
+        "leaseExpiresAt",
+        "evidence",
+        "confirmationRequired",
+    }:
+        return False
+    action = value.get("actionId")
+    contract = FLEET_REPAIR_ACTIONS.get(action) if isinstance(action, str) else None
+    state = value.get("state")
+    evidence = value.get("evidence")
+    confirmation = value.get("confirmationRequired")
+    if contract is None or state not in FLEET_REPAIR_STATES:
+        return False
+    evidence_required = state not in {"awaiting-target", "staging"}
+    confirmation_required = state == "awaiting-approval"
+    return (
+        value.get("schema") == FLEET_REPAIR_INTENT_SCHEMA
+        and isinstance(value.get("deviceId"), str)
+        and re.fullmatch(r"KA-[0-9a-f]{24}", str(value["deviceId"])) is not None
+        and all(
+            _fleet_identifier(value.get(field))
+            for field in ("workOrderId", "leaseId", "executionId")
+        )
+        and value.get("actionVersion") == 1
+        and value.get("risk") == contract[0]
+        and isinstance(value.get("leaseExpiresAt"), str)
+        and 1 <= len(str(value["leaseExpiresAt"])) <= 64
+        and not any(character.isspace() for character in str(value["leaseExpiresAt"]))
+        and (
+            not evidence_required
+            and evidence is None
+            or evidence_required
+            and _validate_fleet_repair_evidence(evidence)
+        )
+        and (
+            confirmation == contract[1]
+            if confirmation_required
+            else confirmation is None
+        )
+    )
+
+
+def _validate_fleet_repair_response(
+    response: dict[str, object], operation: str
+) -> None:
+    if (
+        response.get("apiVersion") != FLEET_REPAIR_LOCAL_API_VERSION
+        or response.get("operation") != operation
+        or response.get("outcome") not in {"ok", "error"}
+    ):
+        raise FleetRepairRelayError("invalid-response", 502)
+    if response.get("outcome") == "error":
+        if (
+            set(response) != {"apiVersion", "operation", "outcome", "error"}
+            or response.get("error") not in FLEET_REPAIR_ERRORS
+        ):
+            raise FleetRepairRelayError("invalid-response", 502)
+        return
+    if (
+        set(response) != {"apiVersion", "operation", "outcome", "intent"}
+        or response.get("intent") is not None
+        and not _validate_fleet_repair_intent(response.get("intent"))
+    ):
+        raise FleetRepairRelayError("invalid-response", 502)
+
+
+def _validate_root_fleet_repair_peer(connection: socket.socket) -> None:
+    try:
+        peer = connection.getpeername()
+        socket_type = connection.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE)
+        credentials = connection.getsockopt(
+            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
+        )
+        pid, uid, gid = struct.unpack("3i", credentials)
+    except (OSError, struct.error) as error:
+        raise FleetRepairRelayError("relay-unavailable", 503) from error
+    if (
+        connection.family != socket.AF_UNIX
+        or socket_type != socket.SOCK_SEQPACKET
+        or peer != FLEET_REPAIR_SOCKET
+        or pid != 1
+        or uid != 0
+        or gid != 0
+    ):
+        raise FleetRepairRelayError("relay-unavailable", 503)
+
+
+def relay_fleet_repair_request(
+    operation: str,
+    request: dict[str, object] | None,
+    deadline: float,
+) -> dict[str, object]:
+    if operation not in {"status", "submit"} or (request is None) != (
+        operation == "status"
+    ):
+        raise FleetRepairRelayError("invalid-request", 400)
+    envelope: dict[str, object] = {
+        "apiVersion": FLEET_REPAIR_LOCAL_API_VERSION,
+        "operation": operation,
+    }
+    if request is not None:
+        envelope["request"] = request
+    frame = json.dumps(
+        envelope, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    ).encode("ascii")
+    if len(frame) > MAX_FLEET_REPAIR_FRAME_BYTES:
+        raise FleetRepairRelayError("invalid-request", 413)
+    if not FLEET_REPAIR_RELAY_LOCK.acquire(blocking=False):
+        raise FleetRepairRelayError("rescue-fleet-busy", 429)
+    connection: socket.socket | None = None
+    try:
+        connection = socket.socket(
+            socket.AF_UNIX, socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC
+        )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise FleetRepairRelayError("timeout", 504)
+        connection.settimeout(remaining)
+        connection.connect(FLEET_REPAIR_SOCKET)
+        _validate_root_fleet_repair_peer(connection)
+        if connection.send(frame) != len(frame):
+            raise FleetRepairRelayError("relay-unavailable", 503)
+        response_bytes, ancillary, flags, _address = connection.recvmsg(
+            MAX_FLEET_REPAIR_FRAME_BYTES + 1, 0
+        )
+        if (
+            ancillary
+            or not response_bytes
+            or len(response_bytes) > MAX_FLEET_REPAIR_FRAME_BYTES
+            or flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC)
+        ):
+            raise FleetRepairRelayError("invalid-response", 502)
+        try:
+            response = _strict_json_object(
+                response_bytes, MAX_FLEET_REPAIR_FRAME_BYTES
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+            raise FleetRepairRelayError("invalid-response", 502) from error
+        _validate_fleet_repair_response(response, operation)
+        return response
+    except socket.timeout as error:
+        raise FleetRepairRelayError("timeout", 504) from error
+    except FleetRepairRelayError:
+        raise
+    except OSError as error:
+        raise FleetRepairRelayError("relay-unavailable", 503) from error
+    finally:
+        if connection is not None:
+            connection.close()
+        FLEET_REPAIR_RELAY_LOCK.release()
 
 
 def require_unlocked_repair_vault(deadline: float) -> None:
@@ -3420,6 +3685,174 @@ class RescueHandler(SimpleHTTPRequestHandler):
             },
         )
 
+    def _send_fleet_repair_json(
+        self, status: int, value: dict[str, object]
+    ) -> None:
+        body = json.dumps(
+            value, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+        ).encode("ascii")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        if status == 429:
+            self.send_header("Retry-After", "1")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_fleet_repair_failure(self, error: FleetRepairRelayError) -> None:
+        self._send_fleet_repair_json(
+            error.status,
+            {
+                "apiVersion": FLEET_REPAIR_LOCAL_API_VERSION,
+                "outcome": "error",
+                "error": error.code,
+            },
+        )
+
+    def _fleet_repair_post_headers(self) -> bool:
+        hosts = self.headers.get_all("Host", [])
+        origins = self.headers.get_all("Origin", [])
+        fetch_sites = self.headers.get_all("Sec-Fetch-Site", [])
+        if len(hosts) != 1 or hosts[0] not in ALLOWED_HOSTS:
+            self.send_error(421)
+            return False
+        if (
+            len(origins) != 1
+            or origins[0] not in ALLOWED_ORIGINS
+            or origins[0] != f"http://{hosts[0]}"
+        ):
+            self.send_error(403)
+            return False
+        if len(fetch_sites) > 1 or (
+            fetch_sites and fetch_sites[0] not in {"none", "same-origin"}
+        ):
+            self.send_error(403)
+            return False
+        if self.headers.get_all("Transfer-Encoding") or self.headers.get_all(
+            "Content-Encoding"
+        ):
+            self._send_fleet_repair_failure(
+                FleetRepairRelayError("invalid-request", 400)
+            )
+            return False
+        if self.headers.get_all("Content-Type", []) != ["application/json"]:
+            self._send_fleet_repair_failure(
+                FleetRepairRelayError("invalid-request", 415)
+            )
+            return False
+        return True
+
+    def _fleet_repair_post_body(self) -> dict[str, object]:
+        lengths = self.headers.get_all("Content-Length", [])
+        if (
+            len(lengths) != 1
+            or not lengths[0].isascii()
+            or not lengths[0].isdigit()
+        ):
+            raise FleetRepairRelayError("invalid-request", 400)
+        length = int(lengths[0])
+        if not 2 <= length <= MAX_REPAIR_FRAME_BYTES:
+            raise FleetRepairRelayError(
+                "invalid-request", 413 if length > MAX_REPAIR_FRAME_BYTES else 400
+            )
+        encoded = self.rfile.read(length)
+        if len(encoded) != length:
+            raise FleetRepairRelayError("invalid-request", 400)
+        try:
+            return _strict_json_object(encoded, MAX_REPAIR_FRAME_BYTES)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+            raise FleetRepairRelayError("invalid-request", 400) from error
+
+    def _fleet_repair_response_status(self, error: object) -> int:
+        if error in {
+            "rescue-fleet-request-invalid",
+            "rescue-fleet-action-unsupported",
+        }:
+            return 400
+        if error == "rescue-fleet-approval-expired":
+            return 409
+        if error == "rescue-fleet-busy":
+            return 429
+        if error == "rescue-fleet-binding-mismatch":
+            return 409
+        return 503
+
+    def _handle_fleet_repair_get(self) -> bool:
+        if self.path != "/api/rescue/fleet-repair":
+            return False
+        try:
+            if not _repair_candidate_available():
+                self.send_error(404)
+                return True
+            response = relay_fleet_repair_request(
+                "status",
+                None,
+                time.monotonic() + REPAIR_REQUEST_DEADLINE_SECONDS,
+            )
+            if response["outcome"] == "error":
+                raise FleetRepairRelayError(
+                    str(response["error"]),
+                    self._fleet_repair_response_status(response["error"]),
+                )
+            intent = response["intent"]
+            if intent is None:
+                self.send_response(204)
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            else:
+                self._send_fleet_repair_json(200, intent)
+        except RepairRelayError as error:
+            self._send_fleet_repair_failure(
+                FleetRepairRelayError(error.code, error.status)
+            )
+        except FleetRepairRelayError as error:
+            if error.code == "relay-unavailable":
+                self.send_error(404)
+            else:
+                self._send_fleet_repair_failure(error)
+        return True
+
+    def _handle_fleet_repair_post(self) -> bool:
+        if self.path != "/api/rescue/fleet-repair":
+            return False
+        if not self.local_authority():
+            self.send_error(421)
+            return True
+        try:
+            if not _repair_candidate_available():
+                self.send_error(404)
+                return True
+        except RepairRelayError as error:
+            self._send_fleet_repair_failure(
+                FleetRepairRelayError(error.code, error.status)
+            )
+            return True
+        if not self._fleet_repair_post_headers():
+            return True
+        try:
+            request = self._fleet_repair_post_body()
+            deadline = time.monotonic() + REPAIR_REQUEST_DEADLINE_SECONDS
+            require_unlocked_repair_vault(deadline)
+            response = relay_fleet_repair_request("submit", request, deadline)
+            if response["outcome"] == "error":
+                raise FleetRepairRelayError(
+                    str(response["error"]),
+                    self._fleet_repair_response_status(response["error"]),
+                )
+            intent = response["intent"]
+            if intent is None:
+                raise FleetRepairRelayError("invalid-response", 502)
+            self._send_fleet_repair_json(200, intent)
+        except RepairRelayError as error:
+            self._send_fleet_repair_failure(
+                FleetRepairRelayError(error.code, error.status)
+            )
+        except FleetRepairRelayError as error:
+            self._send_fleet_repair_failure(error)
+        return True
+
     def _repair_post_headers(self) -> bool:
         hosts = self.headers.get_all("Host", [])
         origins = self.headers.get_all("Origin", [])
@@ -3831,6 +4264,10 @@ class RescueHandler(SimpleHTTPRequestHandler):
         if not self.same_site_request():
             self.send_error(403)
             return
+        # KERNAID_REPAIR_CANDIDATE_BEGIN
+        if self._handle_fleet_repair_get():
+            return
+        # KERNAID_REPAIR_CANDIDATE_END
         if self._handle_application_get():
             return
         if self.path == "/api/inventory":
@@ -3884,6 +4321,8 @@ class RescueHandler(SimpleHTTPRequestHandler):
         if self._handle_application_post():
             return
         # KERNAID_REPAIR_CANDIDATE_BEGIN
+        if self._handle_fleet_repair_post():
+            return
         if self._handle_repair_post():
             return
         # KERNAID_REPAIR_CANDIDATE_END

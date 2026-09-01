@@ -62,6 +62,16 @@ class FakeQmp:
 
 
 class NativeVaultPromptSmokeTests(unittest.TestCase):
+    def test_firstboot_input_uses_the_qualified_qmp_pacing(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertEqual(
+            source.count("time.sleep(LIFECYCLE.FIRSTBOOT_PROMPT_SETTLE_SECONDS)"),
+            2,
+        )
+        self.assertEqual(
+            source.count("LIFECYCLE.QMP_SECRET_INPUT_TIMEOUT_SECONDS"), 3
+        )
+
     def test_native_prompt_proofs_require_the_activated_socket_state(self) -> None:
         for proof in (native_prompt_smoke.PRE_PROOF, native_prompt_smoke.POST_PROOF):
             with self.subTest(proof=proof[:32]):

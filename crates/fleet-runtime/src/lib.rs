@@ -443,7 +443,14 @@ impl FleetRuntime {
         tenant_id: &str,
         identity: &DeviceIdentity,
     ) -> Result<Self, FleetRuntimeError> {
-        Self::open_internal(path, tenant_id, identity, None, None)
+        Self::open_internal(
+            path,
+            tenant_id,
+            identity.device_id(),
+            identity.public_key(),
+            None,
+            None,
+        )
     }
 
     /// Open state with an externally pinned vendor entitlement trust anchor.
@@ -457,7 +464,8 @@ impl FleetRuntime {
         Self::open_internal(
             path,
             tenant_id,
-            identity,
+            identity.device_id(),
+            identity.public_key(),
             Some(*entitlement_trust_anchor),
             None,
         )
@@ -472,7 +480,14 @@ impl FleetRuntime {
         identity: &DeviceIdentity,
         policy_trust_anchor: &[u8; 32],
     ) -> Result<Self, FleetRuntimeError> {
-        Self::open_internal(path, tenant_id, identity, None, Some(*policy_trust_anchor))
+        Self::open_internal(
+            path,
+            tenant_id,
+            identity.device_id(),
+            identity.public_key(),
+            None,
+            Some(*policy_trust_anchor),
+        )
     }
 
     /// Open state with both the vendor entitlement and tenant policy anchors.
@@ -487,7 +502,33 @@ impl FleetRuntime {
         Self::open_internal(
             path,
             tenant_id,
-            identity,
+            identity.device_id(),
+            identity.public_key(),
+            Some(*entitlement_trust_anchor),
+            Some(*policy_trust_anchor),
+        )
+    }
+
+    /// Open state for an identity whose private key remains in a separate
+    /// purpose-specific signer (for example the Rescue Vault worker).
+    pub fn open_with_public_identity_and_trust_anchors(
+        path: &Path,
+        tenant_id: &str,
+        device_id: &str,
+        device_public_key: &[u8; 32],
+        entitlement_trust_anchor: &[u8; 32],
+        policy_trust_anchor: &[u8; 32],
+    ) -> Result<Self, FleetRuntimeError> {
+        if kernaid_device_identity::validate_device_id(device_id).is_err()
+            || kernaid_device_identity::device_id_for_public_key(device_public_key) != device_id
+        {
+            return Err(FleetRuntimeError::IdentityMismatch);
+        }
+        Self::open_internal(
+            path,
+            tenant_id,
+            device_id.to_owned(),
+            *device_public_key,
             Some(*entitlement_trust_anchor),
             Some(*policy_trust_anchor),
         )
@@ -496,13 +537,12 @@ impl FleetRuntime {
     fn open_internal(
         path: &Path,
         tenant_id: &str,
-        identity: &DeviceIdentity,
+        device_id: String,
+        device_public_key: [u8; 32],
         entitlement_trust_anchor: Option<[u8; 32]>,
         policy_trust_anchor: Option<[u8; 32]>,
     ) -> Result<Self, FleetRuntimeError> {
         validate_public_identifier(tenant_id)?;
-        let device_id = identity.device_id();
-        let device_public_key = identity.public_key();
         if let Some(anchor) = policy_trust_anchor {
             VerifyingKey::from_bytes(&anchor)
                 .map_err(|_| FleetRuntimeError::InvalidPolicyTrustAnchor)?;

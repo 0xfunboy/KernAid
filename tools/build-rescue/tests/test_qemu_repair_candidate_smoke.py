@@ -14,6 +14,7 @@ REPO = Path(__file__).resolve().parents[3]
 SCRIPT = REPO / "tools/build-rescue/qemu-repair-candidate-smoke.sh"
 CONTROLLER = REPO / "tools/build-rescue/qemu-repair-candidate-pty.py"
 TAMPER = REPO / "tools/build-rescue/qemu-repair-vault-tamper.py"
+HOST_PROVISIONER = REPO / "tools/build-rescue/provision-repair-vault-base.sh"
 WORKFLOW = REPO / ".github/workflows/rescue-repair-candidate.yml"
 
 SPEC = importlib.util.spec_from_file_location("qemu_repair_candidate", CONTROLLER)
@@ -507,7 +508,7 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
         self.assertIn("controller_timeout=1500", source)
         self.assertIn("controller_timeout=1800", source)
         self.assertIn("controller_timeout=1200", source)
-        self.assertIn("controller_timeout=3000", source)
+        self.assertNotIn("controller_timeout=3000", source)
         self.assertIn('parsed.scenario == "provision-base"', controller_source)
         self.assertIn("timeout_maximum = 3000", controller_source)
         self.assertIn('readonly qemu_smp="${KERNAID_QEMU_SMP:-2}"', source)
@@ -519,6 +520,10 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
             "KERNAID_QEMU_REPAIR_QUALIFICATION_BATCH_ATTESTATION_V1",
             source,
         )
+        self.assertIn("provisioning=host-probe-canonical-v1", source)
+        self.assertIn("guest_firstboot=not-claimed", source)
+        self.assertIn("standard_firstboot_gate=unchanged-separate", source)
+        self.assertIn("base_immutable=true", source)
         self.assertIn(
             "actions=linux.fstab.disable-missing-uuid.v1,"
             "linux.crypttab.disable-missing-uuid.v1,"
@@ -526,6 +531,54 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
             "linux.network.restore-resolver-link.v1",
             source,
         )
+
+    def test_qualification_batch_uses_one_canonical_host_probe_base(self) -> None:
+        shell = SCRIPT.read_text(encoding="utf-8")
+        helper = HOST_PROVISIONER.read_text(encoding="utf-8")
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+
+        self.assertIn(
+            'sudo -n -- "$host_vault_provisioner"',
+            shell,
+        )
+        self.assertIn(
+            '--media "$rescue_media" --key "$vault_key" --probe "$vault_probe"',
+            shell,
+        )
+        self.assertEqual(shell.count("bios:apply"), 1)
+        self.assertEqual(shell.count("uefi:resolver-link-apply"), 1)
+        self.assertIn('p3_after_cases_sha256" == "$p3_base_sha256', shell)
+        self.assertIn('== "$target_before_host_sha256"', shell)
+        self.assertIn('== "$key_before_host_sha256"', shell)
+
+        for exact in (
+            "readonly media_bytes=32000000000",
+            "readonly p3_start_bytes=17179869184",
+            "readonly p3_bytes=8589934592",
+            "--offset \"$p3_start_bytes\"",
+            "--sizelimit \"$p3_bytes\"",
+            "--type luks2 --batch-mode --label KERNAID_VAULT",
+            "--pbkdf argon2id --pbkdf-force-iterations 4",
+            "-L KERNAID_VAULT -M /",
+            'manager_mapper="kernaid-vault-$random_suffix"',
+            '--mode "$mode"',
+            "run_probe initialize",
+            "run_probe verify",
+            "identity=stable",
+            "target_access=none",
+            "host_physical_devices=false",
+        ):
+            self.assertIn(exact, helper)
+        self.assertIn('"${SUDO_UID}:600:1"', helper)
+        self.assertIn("p3_zero_sha256=ebfb4ef19ae410f", helper)
+        self.assertNotIn("repair-target.raw", helper)
+        self.assertNotIn("--target", helper)
+        self.assertNotIn("/dev/sd", helper)
+        self.assertNotIn("/dev/nvme", helper)
+
+        self.assertIn("--features privileged-probe", workflow)
+        self.assertIn("--bin kernaid-rescue-vault-probe", workflow)
+        self.assertIn("provision-repair-vault-base.sh", workflow)
 
     def test_repair_shutdown_keeps_a_bounded_tcg_safe_budget(self) -> None:
         source = CONTROLLER.read_text(encoding="utf-8")

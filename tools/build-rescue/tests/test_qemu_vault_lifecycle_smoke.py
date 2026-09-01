@@ -3850,6 +3850,12 @@ class StaticContractTests(unittest.TestCase):
         self.assertIn("step=(passphrase|confirmation)", python)
         self.assertEqual(controller.FIRSTBOOT_PROMPT_TIMEOUT_SECONDS, 600.0)
         self.assertEqual(controller.FIRSTBOOT_RESULT_TIMEOUT_SECONDS, 1500.0)
+        self.assertEqual(controller.FIRSTBOOT_PROMPT_SETTLE_SECONDS, 1.0)
+        self.assertEqual(controller.QMP_SECRET_INPUT_TIMEOUT_SECONDS, 30.0)
+        self.assertEqual(controller.QMP_KEY_SETTLE_SECONDS, 0.1)
+        self.assertEqual(
+            python.count("time.sleep(FIRSTBOOT_PROMPT_SETTLE_SECONDS)"), 2
+        )
         self.assertIn(
             "KERNAID_RESCUE_FIRSTBOOT_PROGRESS_V1 stage=post-confirmation-zero-scan",
             (REPO_DIR / "crates/rescue-secrets/src/firstboot.rs").read_text(

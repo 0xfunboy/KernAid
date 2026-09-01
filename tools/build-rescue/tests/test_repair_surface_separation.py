@@ -80,6 +80,9 @@ class RepairSurfaceSeparationTests(unittest.TestCase):
                     vaultd_payload += b" " + b" ".join(
                         self.verifier.VAULT_WRITE_TOKENS
                     )
+                    vaultd_payload += b" " + b" ".join(
+                        self.verifier.VAULT_FLEET_SIGNING_TOKENS
+                    )
                 vaultd.write_bytes(vaultd_payload)
                 self.verifier.verify_desk(desk, mode)
                 self.verifier.verify_server(server, mode)

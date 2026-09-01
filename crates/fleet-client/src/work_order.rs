@@ -14,6 +14,10 @@ pub const WORK_ORDER_CLAIM_RESPONSE_SCHEMA: &str = "dev.kernaid.fleet.work-order
 pub const WORK_ORDER_RESULT_SCHEMA: &str = "dev.kernaid.fleet.work-order-result.v1";
 pub const WORK_ORDER_CLAIM_SIGNATURE_DOMAIN: &[u8] = b"kernaid:fleet:work-order-claim:v1\0";
 pub const WORK_ORDER_RESULT_SIGNATURE_DOMAIN: &[u8] = b"kernaid:fleet:work-order-result:v1\0";
+pub const WORK_ORDER_CLAIM_SIGNING_INPUT_SCHEMA: &str =
+    "dev.kernaid.fleet.work-order-claim-signing-input.v1";
+pub const WORK_ORDER_RESULT_SIGNING_INPUT_SCHEMA: &str =
+    "dev.kernaid.fleet.work-order-result-signing-input.v1";
 
 const MAX_CLAIM_BYTES: usize = 8 * 1024;
 const MAX_CLAIM_RESPONSE_BYTES: usize = 32 * 1024;
@@ -186,6 +190,36 @@ impl WorkOrderClaimRequestInput {
             lease_seconds,
         }
     }
+
+    pub fn export_signing_input(&self) -> Result<Vec<u8>, FleetClientError> {
+        canonical_json(&WorkOrderClaimSigningInput {
+            schema: WORK_ORDER_CLAIM_SIGNING_INPUT_SCHEMA,
+            tenant_id: &self.tenant_id,
+            issued_at: &self.issued_at,
+            nonce: URL_SAFE_NO_PAD.encode(self.nonce.as_slice()),
+            lease_seconds: self.lease_seconds,
+        })
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkOrderClaimSigningInput<'a> {
+    schema: &'static str,
+    tenant_id: &'a str,
+    issued_at: &'a str,
+    nonce: String,
+    lease_seconds: u16,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct OwnedWorkOrderClaimSigningInput {
+    schema: String,
+    tenant_id: String,
+    issued_at: String,
+    nonce: String,
+    lease_seconds: u16,
 }
 
 impl fmt::Debug for WorkOrderClaimRequestInput {
@@ -250,6 +284,27 @@ impl SignedWorkOrderClaimRequest {
         Ok(request)
     }
 
+    pub fn sign_canonical_input(
+        identity: &DeviceIdentity,
+        bytes: &[u8],
+    ) -> Result<Self, FleetClientError> {
+        let input: OwnedWorkOrderClaimSigningInput = import_canonical(bytes, MAX_CLAIM_BYTES)?;
+        if input.schema != WORK_ORDER_CLAIM_SIGNING_INPUT_SCHEMA {
+            return Err(FleetClientError::InvalidField("schema"));
+        }
+        let nonce =
+            decode_bounded_base64url("nonce", &input.nonce, MIN_NONCE_BYTES, MAX_NONCE_BYTES)?;
+        Self::sign(
+            identity,
+            WorkOrderClaimRequestInput::new(
+                input.tenant_id,
+                input.issued_at,
+                nonce.to_vec(),
+                input.lease_seconds,
+            ),
+        )
+    }
+
     pub fn verify(
         &self,
         expected_tenant_id: &str,
@@ -294,6 +349,27 @@ impl SignedWorkOrderClaimRequest {
     ) -> Result<Self, FleetClientError> {
         let request: Self = import_canonical(bytes, MAX_CLAIM_BYTES)?;
         request.verify(expected_tenant_id, expected_device_id, enrolled_public_key)?;
+        Ok(request)
+    }
+
+    pub fn import_for_signing_input(
+        bytes: &[u8],
+        input: &WorkOrderClaimRequestInput,
+        expected_device_id: &str,
+        expected_public_key: &[u8; ED25519_PUBLIC_KEY_BYTES],
+    ) -> Result<Self, FleetClientError> {
+        let request = Self::import_offline(
+            bytes,
+            &input.tenant_id,
+            expected_device_id,
+            expected_public_key,
+        )?;
+        if request.issued_at != input.issued_at
+            || request.nonce != URL_SAFE_NO_PAD.encode(input.nonce.as_slice())
+            || request.lease_seconds != input.lease_seconds
+        {
+            return Err(FleetClientError::InvalidField("signingInput"));
+        }
         Ok(request)
     }
 
@@ -593,6 +669,48 @@ impl WorkOrderResultInput {
             result_sha256: result_sha256.into(),
         }
     }
+
+    pub fn export_signing_input(&self) -> Result<Vec<u8>, FleetClientError> {
+        canonical_json(&WorkOrderResultSigningInput {
+            schema: WORK_ORDER_RESULT_SIGNING_INPUT_SCHEMA,
+            tenant_id: &self.tenant_id,
+            work_order_id: &self.work_order_id,
+            lease_id: &self.lease_id,
+            action_id: self.action_id,
+            action_version: self.action_version,
+            outcome: self.outcome,
+            completed_at: &self.completed_at,
+            result_sha256: &self.result_sha256,
+        })
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkOrderResultSigningInput<'a> {
+    schema: &'static str,
+    tenant_id: &'a str,
+    work_order_id: &'a str,
+    lease_id: &'a str,
+    action_id: WorkOrderActionId,
+    action_version: u16,
+    outcome: WorkOrderResultOutcome,
+    completed_at: &'a str,
+    result_sha256: &'a str,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct OwnedWorkOrderResultSigningInput {
+    schema: String,
+    tenant_id: String,
+    work_order_id: String,
+    lease_id: String,
+    action_id: WorkOrderActionId,
+    action_version: u16,
+    outcome: WorkOrderResultOutcome,
+    completed_at: String,
+    result_sha256: String,
 }
 
 impl fmt::Debug for WorkOrderResultInput {
@@ -670,6 +788,29 @@ impl SignedWorkOrderResult {
         Ok(result)
     }
 
+    pub fn sign_canonical_input(
+        identity: &DeviceIdentity,
+        bytes: &[u8],
+    ) -> Result<Self, FleetClientError> {
+        let input: OwnedWorkOrderResultSigningInput = import_canonical(bytes, MAX_RESULT_BYTES)?;
+        if input.schema != WORK_ORDER_RESULT_SIGNING_INPUT_SCHEMA {
+            return Err(FleetClientError::InvalidField("schema"));
+        }
+        Self::sign(
+            identity,
+            WorkOrderResultInput {
+                tenant_id: input.tenant_id,
+                work_order_id: input.work_order_id,
+                lease_id: input.lease_id,
+                action_id: input.action_id,
+                action_version: input.action_version,
+                outcome: input.outcome,
+                completed_at: input.completed_at,
+                result_sha256: input.result_sha256,
+            },
+        )
+    }
+
     pub fn verify(
         &self,
         expected_tenant_id: &str,
@@ -711,6 +852,31 @@ impl SignedWorkOrderResult {
     ) -> Result<Self, FleetClientError> {
         let result: Self = import_canonical(bytes, MAX_RESULT_BYTES)?;
         result.verify(expected_tenant_id, expected_device_id, enrolled_public_key)?;
+        Ok(result)
+    }
+
+    pub fn import_for_signing_input(
+        bytes: &[u8],
+        input: &WorkOrderResultInput,
+        expected_device_id: &str,
+        expected_public_key: &[u8; ED25519_PUBLIC_KEY_BYTES],
+    ) -> Result<Self, FleetClientError> {
+        let result = Self::import_offline(
+            bytes,
+            &input.tenant_id,
+            expected_device_id,
+            expected_public_key,
+        )?;
+        if result.work_order_id != input.work_order_id
+            || result.lease_id != input.lease_id
+            || result.action_id != input.action_id
+            || result.action_version != input.action_version
+            || result.outcome != input.outcome
+            || result.completed_at != input.completed_at
+            || result.result_sha256 != input.result_sha256
+        {
+            return Err(FleetClientError::InvalidField("signingInput"));
+        }
         Ok(result)
     }
 

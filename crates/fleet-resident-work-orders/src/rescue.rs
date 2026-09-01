@@ -26,6 +26,23 @@ use std::{
     fmt, io,
     path::{Path, PathBuf},
 };
+#[cfg(all(target_os = "linux", feature = "rescue-repair-handoff"))]
+use std::{
+    io::IoSliceMut,
+    mem::MaybeUninit,
+    time::{Duration, Instant},
+};
+
+#[cfg(all(target_os = "linux", feature = "rescue-repair-handoff"))]
+use rustix::{
+    event::{PollFd, PollFlags, Timespec, poll},
+    fd::{AsFd, BorrowedFd, OwnedFd},
+    fs::{self as rfs, AtFlags, FileType, OFlags},
+    net::{
+        AddressFamily, RecvAncillaryBuffer, RecvFlags, ReturnFlags, SendFlags, SocketAddrUnix,
+        SocketFlags, SocketType, connect, recvmsg, send, socket_with,
+    },
+};
 
 pub const DESK_API_VERSION: &str = "kernaid.dev/fleet-rescue-repair/v1alpha1";
 pub const INTENT_SCHEMA: &str = "dev.kernaid.fleet.rescue-repair-intent.v1";
@@ -41,6 +58,11 @@ const MAX_LOCAL_APPROVAL_AGE_SECONDS: u64 = 120;
 const EVIDENCE_DIGEST_DOMAIN: &[u8] = b"kernaid:fleet:rescue-repair-evidence:v1\0";
 const APPROVAL_PROOF_DOMAIN: &[u8] = b"kernaid:fleet:rescue-local-approval:v1\0";
 const TERMINAL_DIGEST_DOMAIN: &[u8] = b"kernaid:fleet:rescue-terminal-receipt:v1\0";
+
+#[cfg(all(target_os = "linux", feature = "rescue-repair-handoff"))]
+const REPAIR_SOCKET_PATH: &str = "/run/kernaid-rescue-repair.sock";
+#[cfg(all(target_os = "linux", feature = "rescue-repair-handoff"))]
+const REPAIR_BROKER_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[cfg(feature = "rescue-repair-handoff")]
 const EXT4_RESOURCE_ID: &str = "rescue:selected-linux-filesystem:ext4";
@@ -172,6 +194,234 @@ pub trait RescueRepairBroker {
         request: &[u8],
         maximum_response_bytes: usize,
     ) -> Result<Vec<u8>, RescueAdapterError>;
+}
+
+/// Production Linux broker for the fixed, systemd-owned Rescue repair API.
+///
+/// `repaird` authenticates this process through `SO_PEERCRED`; this side also
+/// authenticates PID 1 as the owner of the socket-activated connection. No
+/// caller-controlled endpoint, framing mode or timeout crosses this boundary.
+#[cfg(all(target_os = "linux", feature = "rescue-repair-handoff"))]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SystemRescueRepairBroker;
+
+#[cfg(all(target_os = "linux", feature = "rescue-repair-handoff"))]
+impl RescueRepairBroker for SystemRescueRepairBroker {
+    fn exchange(
+        &mut self,
+        request: &[u8],
+        maximum_response_bytes: usize,
+    ) -> Result<Vec<u8>, RescueAdapterError> {
+        if request.is_empty()
+            || request.len() > MAX_BROKER_FRAME_BYTES
+            || maximum_response_bytes == 0
+            || maximum_response_bytes > MAX_BROKER_FRAME_BYTES
+        {
+            return Err(RescueAdapterError::BrokerProtocol);
+        }
+        let deadline = Instant::now()
+            .checked_add(REPAIR_BROKER_TIMEOUT)
+            .ok_or(RescueAdapterError::BrokerUnavailable)?;
+        let socket = connect_repaird(deadline)?;
+        send_repair_frame(socket.as_fd(), request, deadline)?;
+        receive_repair_frame(socket.as_fd(), maximum_response_bytes, deadline)
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "rescue-repair-handoff"))]
+fn connect_repaird(deadline: Instant) -> Result<OwnedFd, RescueAdapterError> {
+    let named = validate_named_repair_socket()?;
+    let socket = socket_with(
+        AddressFamily::UNIX,
+        SocketType::SEQPACKET,
+        SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+        None,
+    )
+    .map_err(|_| RescueAdapterError::BrokerUnavailable)?;
+    let address = SocketAddrUnix::new(REPAIR_SOCKET_PATH)
+        .map_err(|_| RescueAdapterError::BrokerUnavailable)?;
+    match connect(&socket, &address) {
+        Ok(()) => {}
+        Err(error) if error == rustix::io::Errno::INPROGRESS => {
+            wait_repair_ready(socket.as_fd(), PollFlags::OUT, deadline)?;
+            rustix::net::sockopt::socket_error(&socket)
+                .map_err(|_| RescueAdapterError::BrokerUnavailable)?
+                .map_err(|_| RescueAdapterError::BrokerUnavailable)?;
+        }
+        Err(_) => return Err(RescueAdapterError::BrokerUnavailable),
+    }
+    authenticate_repaird(socket.as_fd())?;
+    // Recheck the named endpoint after connect so a rename race cannot swap
+    // the path between the ownership check and the authenticated peer check.
+    let rechecked = validate_named_repair_socket()?;
+    if named != rechecked {
+        return Err(RescueAdapterError::BrokerUnavailable);
+    }
+    Ok(socket)
+}
+
+#[cfg(all(target_os = "linux", feature = "rescue-repair-handoff"))]
+fn validate_named_repair_socket() -> Result<(u64, u64, u32), RescueAdapterError> {
+    let named = rfs::statat(rfs::CWD, REPAIR_SOCKET_PATH, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|_| RescueAdapterError::BrokerUnavailable)?;
+    let run = rfs::statat(rfs::CWD, "/run", AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|_| RescueAdapterError::BrokerUnavailable)?;
+    let client_gid = rustix::process::getgid().as_raw();
+    if client_gid == 0
+        || !FileType::from_raw_mode(named.st_mode).is_socket()
+        || named.st_uid != 0
+        || named.st_gid != client_gid
+        || named.st_nlink != 1
+        || named.st_mode & 0o7777 != 0o660
+        || !FileType::from_raw_mode(run.st_mode).is_dir()
+        || run.st_uid != 0
+        || run.st_gid != 0
+        || run.st_mode & 0o022 != 0
+    {
+        return Err(RescueAdapterError::BrokerUnavailable);
+    }
+    Ok((named.st_dev, named.st_ino, named.st_gid))
+}
+
+#[cfg(all(target_os = "linux", feature = "rescue-repair-handoff"))]
+fn authenticate_repaird(socket: BorrowedFd<'_>) -> Result<(), RescueAdapterError> {
+    let descriptor =
+        rustix::io::fcntl_getfd(socket).map_err(|_| RescueAdapterError::BrokerUnavailable)?;
+    let status = rfs::fcntl_getfl(socket).map_err(|_| RescueAdapterError::BrokerUnavailable)?;
+    let peer: SocketAddrUnix = rustix::net::getpeername(socket)
+        .map_err(|_| RescueAdapterError::BrokerUnavailable)?
+        .ok_or(RescueAdapterError::BrokerUnavailable)?
+        .try_into()
+        .map_err(|_| RescueAdapterError::BrokerUnavailable)?;
+    let credentials = rustix::net::sockopt::socket_peercred(socket)
+        .map_err(|_| RescueAdapterError::BrokerUnavailable)?;
+    if rustix::net::sockopt::socket_domain(socket)
+        .map_err(|_| RescueAdapterError::BrokerUnavailable)?
+        != AddressFamily::UNIX
+        || rustix::net::sockopt::socket_type(socket)
+            .map_err(|_| RescueAdapterError::BrokerUnavailable)?
+            != SocketType::SEQPACKET
+        || rustix::net::sockopt::socket_acceptconn(socket)
+            .map_err(|_| RescueAdapterError::BrokerUnavailable)?
+        || !descriptor.contains(rustix::io::FdFlags::CLOEXEC)
+        || !status.contains(OFlags::NONBLOCK)
+        || peer.path_bytes() != Some(REPAIR_SOCKET_PATH.as_bytes())
+        || credentials.pid.as_raw_nonzero().get() != 1
+        || credentials.uid.as_raw() != 0
+        || credentials.gid.as_raw() != 0
+        || rustix::net::sockopt::socket_passcred(socket)
+            .map_err(|_| RescueAdapterError::BrokerUnavailable)?
+    {
+        return Err(RescueAdapterError::BrokerUnavailable);
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", feature = "rescue-repair-handoff"))]
+fn send_repair_frame(
+    socket: BorrowedFd<'_>,
+    frame: &[u8],
+    deadline: Instant,
+) -> Result<(), RescueAdapterError> {
+    loop {
+        ensure_repair_deadline(deadline)?;
+        match send(socket, frame, SendFlags::DONTWAIT | SendFlags::NOSIGNAL) {
+            Ok(sent) if sent == frame.len() => return Ok(()),
+            Ok(_) => return Err(RescueAdapterError::BrokerProtocol),
+            Err(error) if error == rustix::io::Errno::INTR => {}
+            Err(error) if error == rustix::io::Errno::AGAIN => {
+                wait_repair_ready(socket, PollFlags::OUT, deadline)?;
+            }
+            Err(_) => return Err(RescueAdapterError::BrokerUnavailable),
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "rescue-repair-handoff"))]
+fn receive_repair_frame(
+    socket: BorrowedFd<'_>,
+    maximum: usize,
+    deadline: Instant,
+) -> Result<Vec<u8>, RescueAdapterError> {
+    let mut bytes = vec![0_u8; maximum + 1];
+    let mut io = [IoSliceMut::new(&mut bytes)];
+    // Zero ancillary capacity deliberately converts every cmsg into CTRUNC;
+    // the kernel closes any excess SCM_RIGHTS descriptors for us.
+    let mut control_space: [MaybeUninit<u8>; 0] = [];
+    let mut control = RecvAncillaryBuffer::new(&mut control_space);
+    let message = loop {
+        ensure_repair_deadline(deadline)?;
+        match recvmsg(
+            socket,
+            &mut io,
+            &mut control,
+            RecvFlags::CMSG_CLOEXEC | RecvFlags::TRUNC | RecvFlags::DONTWAIT,
+        ) {
+            Ok(message) => break message,
+            Err(error) if error == rustix::io::Errno::INTR => {}
+            Err(error) if error == rustix::io::Errno::AGAIN => {
+                wait_repair_ready(socket, PollFlags::IN, deadline)?;
+            }
+            Err(_) => return Err(RescueAdapterError::BrokerUnavailable),
+        }
+    };
+    if message.bytes == 0
+        || message.bytes > maximum
+        || message
+            .flags
+            .intersects(ReturnFlags::TRUNC | ReturnFlags::CTRUNC)
+    {
+        return Err(RescueAdapterError::BrokerProtocol);
+    }
+    bytes.truncate(message.bytes);
+    Ok(bytes)
+}
+
+#[cfg(all(target_os = "linux", feature = "rescue-repair-handoff"))]
+fn ensure_repair_deadline(deadline: Instant) -> Result<(), RescueAdapterError> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .map(|_| ())
+        .ok_or(RescueAdapterError::BrokerUnavailable)
+}
+
+#[cfg(all(target_os = "linux", feature = "rescue-repair-handoff"))]
+fn wait_repair_ready(
+    socket: BorrowedFd<'_>,
+    interest: PollFlags,
+    deadline: Instant,
+) -> Result<(), RescueAdapterError> {
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(RescueAdapterError::BrokerUnavailable)?;
+        let seconds = i64::try_from(remaining.as_secs()).unwrap_or(i64::MAX);
+        let timeout = Timespec {
+            tv_sec: seconds,
+            tv_nsec: if seconds == i64::MAX {
+                999_999_999
+            } else {
+                i64::from(remaining.subsec_nanos())
+            },
+        };
+        let mut descriptors = [PollFd::from_borrowed_fd(socket, interest)];
+        match poll(&mut descriptors, Some(&timeout)) {
+            Ok(0) => return Err(RescueAdapterError::BrokerUnavailable),
+            Ok(_) => {
+                let ready = descriptors[0].revents();
+                if ready.contains(PollFlags::NVAL) {
+                    return Err(RescueAdapterError::BrokerUnavailable);
+                }
+                if ready.intersects(interest | PollFlags::ERR | PollFlags::HUP | PollFlags::RDHUP) {
+                    return Ok(());
+                }
+            }
+            Err(error) if error == rustix::io::Errno::INTR => {}
+            Err(_) => return Err(RescueAdapterError::BrokerUnavailable),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -557,6 +807,7 @@ impl<B: RescueRepairBroker> RescueFleetRepairAdapter<B> {
             || approved_at > now_unix
             || approved_at < leased_at
             || approved_at >= lease_expires_at
+            || now_unix >= lease_expires_at
             || now_unix.saturating_sub(approved_at) > MAX_LOCAL_APPROVAL_AGE_SECONDS
         {
             return Err(RescueAdapterError::ApprovalExpired);
@@ -747,6 +998,70 @@ impl<B: RescueRepairBroker> RescueFleetRepairAdapter<B> {
         Ok(())
     }
 
+    fn retire_expired_intent_before(
+        &mut self,
+        order: &LeasedWorkOrder,
+        execution_id: &str,
+    ) -> Result<(), RescueAdapterError> {
+        let Some(intent) = self.state.intent.as_ref() else {
+            return Ok(());
+        };
+        if intent_matches_order(intent, order, execution_id) {
+            return Ok(());
+        }
+        let lease_expires_at = timestamp_unix(&intent.lease_expires_at)
+            .map_err(|_| RescueAdapterError::StateCorrupt)?;
+        let next_lease_started_at = timestamp_unix(order.lease().leased_at())
+            .map_err(|_| RescueAdapterError::StateCorrupt)?;
+        if lease_expires_at > next_lease_started_at {
+            return Ok(());
+        }
+
+        match intent.state {
+            RescueIntentState::AwaitingTarget
+            | RescueIntentState::Rejected
+            | RescueIntentState::Succeeded
+            | RescueIntentState::Failed
+            | RescueIntentState::ManualReconciliationRequired => {
+                self.state.intent = None;
+                self.persist()
+            }
+            RescueIntentState::Staging => {
+                let evidence = self.prepare_or_recover()?;
+                let intent = self
+                    .state
+                    .intent
+                    .as_mut()
+                    .ok_or(RescueAdapterError::StateCorrupt)?;
+                intent.evidence = Some(evidence);
+                intent.state = RescueIntentState::Canceling;
+                self.persist()?;
+                self.cancel_expired_intent()
+            }
+            RescueIntentState::AwaitingApproval
+            | RescueIntentState::Approved
+            | RescueIntentState::Canceling => {
+                self.state
+                    .intent
+                    .as_mut()
+                    .ok_or(RescueAdapterError::StateCorrupt)?
+                    .state = RescueIntentState::Canceling;
+                self.persist()?;
+                self.cancel_expired_intent()
+            }
+            // An operation that repaird has already started must be recovered
+            // by its original idempotent execution path, never silently
+            // replaced by a second write intent.
+            RescueIntentState::Executing => Err(RescueAdapterError::Busy),
+        }
+    }
+
+    fn cancel_expired_intent(&mut self) -> Result<(), RescueAdapterError> {
+        self.cancel_or_recover()?;
+        self.state.intent = None;
+        self.persist()
+    }
+
     fn persist(&self) -> Result<(), RescueAdapterError> {
         validate_state(&self.state, &self.state.tenant_id, &self.state.device_id)?;
         let bytes = canonical_json(&self.state)?;
@@ -775,6 +1090,8 @@ impl<B: RescueRepairBroker> LocalWorkOrderHandoff for RescueFleetRepairAdapter<B
         {
             return Err(LocalHandoffErrorCode::StateMismatch);
         }
+        self.retire_expired_intent_before(order, execution_id)
+            .map_err(map_local_error)?;
         let replace_terminal = self.state.intent.as_ref().is_some_and(|intent| {
             matches!(
                 intent.state,
@@ -1212,6 +1529,10 @@ fn validate_state(
             || !request_id_valid(&intent.broker_prepare_request_id)
             || !request_id_valid(&intent.broker_approval_request_id)
             || !request_id_valid(&intent.broker_cancel_request_id)
+            || timestamp_unix(&intent.leased_at).is_err()
+            || timestamp_unix(&intent.lease_expires_at).is_err()
+            || timestamp_unix(&intent.leased_at).ok()
+                >= timestamp_unix(&intent.lease_expires_at).ok()
         {
             return Err(RescueAdapterError::StateCorrupt);
         }
@@ -1636,6 +1957,18 @@ mod tests {
         .expect("work order")
     }
 
+    fn successor_order(action_id: WorkOrderActionId) -> LeasedWorkOrder {
+        let mut value = serde_json::to_value(repair_order(action_id)).expect("work order JSON");
+        value["workOrderId"] = json!(format!("wo-successor-{}", action_id.wire_name()));
+        value["createdAt"] = json!("2026-08-31T12:36:00Z");
+        value["expiresAt"] = json!("2026-08-31T13:36:00Z");
+        value["approval"]["approvedAt"] = json!("2026-08-31T12:35:30Z");
+        value["lease"]["leaseId"] = json!(format!("lease-successor-{}", action_id.wire_name()));
+        value["lease"]["leasedAt"] = json!("2026-08-31T12:36:00Z");
+        value["lease"]["leaseExpiresAt"] = json!("2026-08-31T12:41:00Z");
+        serde_json::from_value(value).expect("successor work order")
+    }
+
     fn stage_request(intent: &RescueDeskIntent) -> StageIntentRequest {
         StageIntentRequest {
             api_version: DESK_API_VERSION.to_owned(),
@@ -1774,6 +2107,51 @@ mod tests {
         assert_eq!(
             adapter.prepare(&order, EXECUTION),
             Err(LocalHandoffErrorCode::ApprovalPending)
+        );
+
+        let at_expiry = timestamp_unix(&staged.lease_expires_at).expect("lease expiry");
+        assert_eq!(
+            adapter.approve(&approval_request(&staged), at_expiry),
+            Err(RescueAdapterError::ApprovalExpired)
+        );
+    }
+
+    #[test]
+    fn expired_unexecuted_intent_is_cancelled_before_successor_is_admitted() {
+        let directory = TempDir::new().expect("tempdir");
+        let action_id = WorkOrderActionId::LinuxFstabDisableMissingUuidV1;
+        let broker = MockBroker::new(action_id);
+        let mut adapter = opened(&directory, broker.clone());
+        let order = repair_order(action_id);
+        assert_eq!(
+            adapter.prepare(&order, EXECUTION),
+            Err(LocalHandoffErrorCode::ApprovalPending)
+        );
+        let intent = adapter.desk_intent().expect("intent");
+        let staged = adapter.stage(&stage_request(&intent)).expect("staged");
+        assert_eq!(staged.state, RescueIntentState::AwaitingApproval);
+
+        let successor = successor_order(action_id);
+        let successor_execution = "exec_abcdefabcdefabcdefabcdefabcdefab";
+        assert_eq!(
+            adapter.prepare(&successor, successor_execution),
+            Err(LocalHandoffErrorCode::ApprovalPending)
+        );
+        let admitted = adapter.desk_intent().expect("successor intent");
+        assert_eq!(admitted.work_order_id, successor.work_order_id());
+        assert_eq!(admitted.state, RescueIntentState::AwaitingTarget);
+        assert_eq!(
+            broker.operations(),
+            [
+                "repair.status",
+                repair_action_contract(action_id)
+                    .expect("contract")
+                    .prepare_operation,
+                "repair.status",
+                repair_action_contract(action_id)
+                    .expect("contract")
+                    .cancel_operation,
+            ]
         );
     }
 

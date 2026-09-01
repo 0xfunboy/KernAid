@@ -2350,6 +2350,8 @@ struct WorkerTransactionContext<'a> {
     cancellation: Option<&'a AtomicBool>,
     provider_output: Option<OwnedFd>,
     application: Option<internal_wire::WorkerApplicationCommand>,
+    #[cfg(feature = "experimental-fleet-signing")]
+    fleet: Option<internal_wire::WorkerFleetSignCommand>,
     #[cfg(feature = "experimental-repair-store")]
     repair: Option<internal_wire::WorkerRepairCommand>,
 }
@@ -2674,6 +2676,50 @@ impl WorkerHandle {
             _ if bytes.is_empty() => Ok((response, None)),
             _ => Err(RescueVaultDaemonError::ProtocolFailure),
         }
+    }
+
+    #[cfg(feature = "experimental-fleet-signing")]
+    pub(super) fn fleet_sign(
+        &self,
+        command: internal_wire::WorkerFleetSignCommand,
+        input: &[u8],
+        deadline: Instant,
+    ) -> Result<(internal_wire::WorkerResponse, Zeroizing<Vec<u8>>), RescueVaultDaemonError> {
+        if u64::try_from(input.len()) != Ok(command.input_size()) {
+            return Err(RescueVaultDaemonError::ProtocolFailure);
+        }
+        let (parent, worker) = socketpair(
+            AddressFamily::UNIX,
+            SocketType::SEQPACKET,
+            SocketFlags::CLOEXEC,
+            None,
+        )
+        .map_err(|_| RescueVaultDaemonError::WorkerUnavailable)?;
+        internal_wire::send_fleet_signing_input(parent.as_fd(), input, deadline)
+            .map_err(|_| RescueVaultDaemonError::ProtocolFailure)?;
+        let (response, descriptor) = self.transact_inner(
+            command.kind(),
+            None,
+            Some(worker),
+            deadline,
+            WorkerTransactionContext {
+                fleet: Some(command),
+                ..WorkerTransactionContext::default()
+            },
+        )?;
+        if descriptor.is_some() {
+            return Err(RescueVaultDaemonError::ProtocolFailure);
+        }
+        if response.code != internal_wire::WorkerResultCode::FleetSignedReady {
+            return Ok((response, Zeroizing::new(Vec::new())));
+        }
+        let expected = response
+            .fleet_output_size
+            .ok_or(RescueVaultDaemonError::ProtocolFailure)?;
+        let output =
+            internal_wire::receive_fleet_signed_request(parent.as_fd(), expected, deadline)
+                .map_err(|_| RescueVaultDaemonError::ProtocolFailure)?;
+        Ok((response, output))
     }
 
     #[cfg(feature = "experimental-repair-store")]
@@ -3081,6 +3127,8 @@ impl WorkerHandle {
             cancellation,
             provider_output,
             application,
+            #[cfg(feature = "experimental-fleet-signing")]
+            fleet,
             #[cfg(feature = "experimental-repair-store")]
             repair,
         } = context;
@@ -3095,6 +3143,10 @@ impl WorkerHandle {
                 .as_ref()
                 .is_some_and(|application| application.kind() != kind)
         {
+            return Err(RescueVaultDaemonError::ProtocolFailure);
+        }
+        #[cfg(feature = "experimental-fleet-signing")]
+        if fleet.is_some_and(|fleet| fleet.kind() != kind) {
             return Err(RescueVaultDaemonError::ProtocolFailure);
         }
         #[cfg(feature = "experimental-repair-store")]
@@ -3129,21 +3181,40 @@ impl WorkerHandle {
         let repair_payload = repair;
         #[cfg(not(feature = "experimental-repair-store"))]
         let repair_payload: Option<()> = None;
-        let (command, outgoing) = match (kind, secret_size, descriptor, application, repair_payload)
-        {
+        #[cfg(feature = "experimental-fleet-signing")]
+        let fleet_payload = fleet;
+        #[cfg(not(feature = "experimental-fleet-signing"))]
+        let fleet_payload: Option<()> = None;
+        let (command, outgoing) = match (
+            kind,
+            secret_size,
+            descriptor,
+            application,
+            repair_payload,
+            fleet_payload,
+        ) {
             #[cfg(feature = "experimental-repair-store")]
-            (kind, None, descriptor, None, Some(repair)) if kind == repair.kind() => (
+            (kind, None, descriptor, None, Some(repair), None) if kind == repair.kind() => (
                 internal_wire::WorkerCommand::repair(request_id, repair),
                 descriptor,
             ),
-            (kind, None, descriptor, Some(application), None) if kind == application.kind() => (
-                internal_wire::WorkerCommand::application(request_id, application),
+            #[cfg(feature = "experimental-fleet-signing")]
+            (kind, None, descriptor, None, None, Some(fleet)) if kind == fleet.kind() => (
+                internal_wire::WorkerCommand::fleet(request_id, fleet),
                 descriptor,
             ),
-            (internal_wire::WorkerCommandKind::Bootstrap, _, _, _, _) => {
+            (kind, None, descriptor, Some(application), None, None)
+                if kind == application.kind() =>
+            {
+                (
+                    internal_wire::WorkerCommand::application(request_id, application),
+                    descriptor,
+                )
+            }
+            (internal_wire::WorkerCommandKind::Bootstrap, _, _, _, _, _) => {
                 return Err(RescueVaultDaemonError::ProtocolFailure);
             }
-            (internal_wire::WorkerCommandKind::Probe, None, None, None, None) => {
+            (internal_wire::WorkerCommandKind::Probe, None, None, None, None, None) => {
                 (internal_wire::WorkerCommand::probe(request_id), None)
             }
             (
@@ -3152,14 +3223,15 @@ impl WorkerHandle {
                 Some(descriptor),
                 None,
                 None,
+                None,
             ) => (
                 internal_wire::WorkerCommand::unlock(request_id, size),
                 Some(descriptor),
             ),
-            (internal_wire::WorkerCommandKind::Lock, None, None, None, None) => {
+            (internal_wire::WorkerCommandKind::Lock, None, None, None, None, None) => {
                 (internal_wire::WorkerCommand::lock(request_id), None)
             }
-            (internal_wire::WorkerCommandKind::ProviderStatus, None, None, None, None) => (
+            (internal_wire::WorkerCommandKind::ProviderStatus, None, None, None, None, None) => (
                 internal_wire::WorkerCommand::provider_status(request_id),
                 None,
             ),
@@ -3169,11 +3241,19 @@ impl WorkerHandle {
                 Some(descriptor),
                 None,
                 None,
+                None,
             ) => (
                 internal_wire::WorkerCommand::provider_openai_configure(request_id, size),
                 Some(descriptor),
             ),
-            (internal_wire::WorkerCommandKind::ProviderOpenAiLogout, None, None, None, None) => (
+            (
+                internal_wire::WorkerCommandKind::ProviderOpenAiLogout,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ) => (
                 internal_wire::WorkerCommand::provider_openai_logout(request_id),
                 None,
             ),
@@ -3183,20 +3263,28 @@ impl WorkerHandle {
                 Some(descriptor),
                 None,
                 None,
+                None,
             ) => (
                 internal_wire::WorkerCommand::provider_openai_borrow(request_id),
                 Some(descriptor),
             ),
             #[cfg(feature = "experimental-codex-home-lease")]
-            (internal_wire::WorkerCommandKind::ProviderCodexHomeLease, None, None, None, None) => (
+            (
+                internal_wire::WorkerCommandKind::ProviderCodexHomeLease,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ) => (
                 internal_wire::WorkerCommand::provider_codex_home_lease(request_id),
                 None,
             ),
-            (internal_wire::WorkerCommandKind::AttestQuiescent, None, None, None, None) => (
+            (internal_wire::WorkerCommandKind::AttestQuiescent, None, None, None, None, None) => (
                 internal_wire::WorkerCommand::attest_quiescent(request_id),
                 None,
             ),
-            (internal_wire::WorkerCommandKind::Shutdown, None, None, None, None) => {
+            (internal_wire::WorkerCommandKind::Shutdown, None, None, None, None, None) => {
                 (internal_wire::WorkerCommand::shutdown(request_id), None)
             }
             _ => return Err(RescueVaultDaemonError::ProtocolFailure),
@@ -3852,6 +3940,17 @@ fn response_matches(
             Result::ApplicationReportReady
                 | Result::ApplicationReportNotFound
                 | Result::ApplicationStateAmbiguous
+                | Result::IoFailed
+                | Result::CleanupFailed
+                | Result::Busy
+        ),
+        #[cfg(feature = "experimental-fleet-signing")]
+        Command::FleetEnrollmentSign
+        | Command::FleetWorkOrderClaimSign
+        | Command::FleetWorkOrderResultSign => matches!(
+            response.code,
+            Result::FleetSignedReady
+                | Result::FleetInvalidRequest
                 | Result::IoFailed
                 | Result::CleanupFailed
                 | Result::Busy

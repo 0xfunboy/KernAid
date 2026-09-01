@@ -110,16 +110,21 @@ jobs:
           python3 -I -B -c 'from pathlib import Path; path = Path("tools/build-rescue/repair-qualification.py"); compile(path.read_bytes(), str(path), "exec", dont_inherit=True)'
           python3 -I -B -c 'from pathlib import Path; path = Path("tools/build-rescue/qemu-repair-vault-tamper.py"); compile(path.read_bytes(), str(path), "exec", dont_inherit=True)'
           bash -n tools/build-rescue/build.sh tools/build-rescue/qemu-smoke.sh \
-            tools/build-rescue/qemu-repair-candidate-smoke.sh
+            tools/build-rescue/qemu-repair-candidate-smoke.sh \
+            tools/build-rescue/provision-repair-vault-base.sh
           shellcheck tools/build-rescue/build.sh tools/build-rescue/qemu-smoke.sh \
-            tools/build-rescue/qemu-repair-candidate-smoke.sh
+            tools/build-rescue/qemu-repair-candidate-smoke.sh \
+            tools/build-rescue/provision-repair-vault-base.sh
           pnpm exec prettier --check \
             .github/workflows/rescue-repair-candidate.yml
 
       - name: Build standard Rescue binaries and repair candidate daemon
         run: |
           cargo build --locked --release -p kernaid-rescue-secrets \
-            --features experimental-codex-home-lease,experimental-firstboot-provisioner,experimental-repair-store \
+            --features privileged-probe \
+            --bin kernaid-rescue-vault-probe
+          cargo build --locked --release -p kernaid-rescue-secrets \
+            --features experimental-codex-home-lease,experimental-firstboot-provisioner,experimental-repair-store,experimental-fleet-signing \
             --bin kernaid-rescue-vaultd \
             --bin kernaid-rescue-vaultctl \
             --bin kernaid-rescue-codex-mounter \
@@ -142,6 +147,9 @@ jobs:
             --bin kernaid-rescue-repaird
           cargo build --locked --release -p kernaid-linux-blockfd \
             --bin kernaid-blockfd-probe
+          cargo build --locked --release -p kernaid-fleet-resident-work-orders \
+            --features rescue-fleet-service \
+            --bin kernaid-fleet-rescue-repair-bridge
 
       - name: Build isolated repair candidate ISO
         run: |
@@ -149,6 +157,7 @@ jobs:
             -e KERNAID_DESK_PREBUILT=1 \
             -e KERNAID_REPAIR_CANDIDATE=1 \
             -e KERNAID_RESCUE_REPAIRD_BINARY=/workspace/target/release/kernaid-rescue-repaird \
+            -e KERNAID_FLEET_RESCUE_REPAIR_BINARY=/workspace/target/release/kernaid-fleet-rescue-repair-bridge \
             -e KERNAID_BLOCKFD_PROBE_BINARY=/workspace/target/release/kernaid-blockfd-probe \
             -e KERNAID_RESCUE_VAULTD_BINARY=/workspace/target/release/kernaid-rescue-vaultd \
             -e KERNAID_RESCUE_FIRSTBOOT_BINARY=/workspace/target/release/kernaid-rescue-firstboot \

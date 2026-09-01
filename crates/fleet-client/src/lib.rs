@@ -54,6 +54,62 @@ const MAX_OS_RELEASE_BYTES: usize = 256;
 const MIN_NONCE_BYTES: usize = 16;
 const MAX_NONCE_BYTES: usize = 64;
 
+/// Exact, operation-specific document accepted by the Rescue Vault enrollment
+/// signer. It deliberately omits device identity: the Vault injects its own
+/// identity and signs only after parsing this closed canonical schema.
+pub const ENROLLMENT_SIGNING_INPUT_SCHEMA: &str = "dev.kernaid.fleet.enrollment-signing-input.v1";
+
+/// Purpose-specific Fleet signing surface. Implementations may keep the
+/// device key outside this process; callers can request only the three Fleet
+/// envelopes represented here, never an arbitrary signature.
+pub trait FleetRequestSigner {
+    fn device_id(&self) -> Result<String, FleetClientError>;
+    fn public_key(&self) -> Result<[u8; ED25519_PUBLIC_KEY_BYTES], FleetClientError>;
+    fn sign_enrollment(
+        &self,
+        input: EnrollmentRequestInput,
+    ) -> Result<SignedEnrollmentRequest, FleetClientError>;
+    fn sign_work_order_claim(
+        &self,
+        input: WorkOrderClaimRequestInput,
+    ) -> Result<SignedWorkOrderClaimRequest, FleetClientError>;
+    fn sign_work_order_result(
+        &self,
+        input: WorkOrderResultInput,
+    ) -> Result<SignedWorkOrderResult, FleetClientError>;
+}
+
+impl FleetRequestSigner for DeviceIdentity {
+    fn device_id(&self) -> Result<String, FleetClientError> {
+        Ok(DeviceIdentity::device_id(self))
+    }
+
+    fn public_key(&self) -> Result<[u8; ED25519_PUBLIC_KEY_BYTES], FleetClientError> {
+        Ok(DeviceIdentity::public_key(self))
+    }
+
+    fn sign_enrollment(
+        &self,
+        input: EnrollmentRequestInput,
+    ) -> Result<SignedEnrollmentRequest, FleetClientError> {
+        SignedEnrollmentRequest::sign(self, input)
+    }
+
+    fn sign_work_order_claim(
+        &self,
+        input: WorkOrderClaimRequestInput,
+    ) -> Result<SignedWorkOrderClaimRequest, FleetClientError> {
+        SignedWorkOrderClaimRequest::sign(self, input)
+    }
+
+    fn sign_work_order_result(
+        &self,
+        input: WorkOrderResultInput,
+    ) -> Result<SignedWorkOrderResult, FleetClientError> {
+        SignedWorkOrderResult::sign(self, input)
+    }
+}
+
 /// Enrollment operating environment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -197,6 +253,45 @@ impl EnrollmentRequestInput {
             nonce: Zeroizing::new(nonce.into()),
         }
     }
+
+    /// Export the only enrollment input accepted by a remote purpose-specific
+    /// signer. Canonicalization prevents an intermediary from reinterpreting
+    /// duplicate, unknown, or reordered JSON fields.
+    pub fn export_signing_input(&self) -> Result<Vec<u8>, FleetClientError> {
+        canonical_json(&EnrollmentSigningInput {
+            schema: ENROLLMENT_SIGNING_INPUT_SCHEMA,
+            enrollment_token: &self.enrollment_token,
+            tenant_id: &self.tenant_id,
+            platform: self.platform,
+            agent_version: &self.agent_version,
+            issued_at: &self.issued_at,
+            nonce: URL_SAFE_NO_PAD.encode(self.nonce.as_slice()),
+        })
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EnrollmentSigningInput<'a> {
+    schema: &'static str,
+    enrollment_token: &'a str,
+    tenant_id: &'a str,
+    platform: EnrollmentPlatform,
+    agent_version: &'a str,
+    issued_at: &'a str,
+    nonce: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct OwnedEnrollmentSigningInput {
+    schema: String,
+    enrollment_token: String,
+    tenant_id: String,
+    platform: EnrollmentPlatform,
+    agent_version: String,
+    issued_at: String,
+    nonce: String,
 }
 
 impl fmt::Debug for EnrollmentRequestInput {
@@ -278,6 +373,33 @@ impl SignedEnrollmentRequest {
         Ok(request)
     }
 
+    /// Parse one exact signing-input document and sign the resulting fixed
+    /// enrollment schema. This is the Vault boundary; it cannot be used for
+    /// any other Ed25519 domain or payload shape.
+    pub fn sign_canonical_input(
+        identity: &DeviceIdentity,
+        bytes: &[u8],
+    ) -> Result<Self, FleetClientError> {
+        let input: OwnedEnrollmentSigningInput =
+            import_canonical(bytes, MAX_ENROLLMENT_OFFLINE_BYTES)?;
+        if input.schema != ENROLLMENT_SIGNING_INPUT_SCHEMA {
+            return Err(FleetClientError::InvalidField("schema"));
+        }
+        let nonce =
+            decode_bounded_base64url("nonce", &input.nonce, MIN_NONCE_BYTES, MAX_NONCE_BYTES)?;
+        Self::sign(
+            identity,
+            EnrollmentRequestInput::new(
+                input.enrollment_token,
+                input.tenant_id,
+                input.platform,
+                input.agent_version,
+                input.issued_at,
+                nonce.to_vec(),
+            ),
+        )
+    }
+
     /// Verify structure, tenant, one-time token, device/key binding, and
     /// signature. The returned key is suitable for the enrollment registry.
     pub fn verify(
@@ -331,6 +453,28 @@ impl SignedEnrollmentRequest {
     ) -> Result<Self, FleetClientError> {
         let request: Self = import_canonical(bytes, MAX_ENROLLMENT_OFFLINE_BYTES)?;
         request.verify(expected_tenant_id, expected_enrollment_token)?;
+        Ok(request)
+    }
+
+    /// Validate a remote signer's response against the exact enrollment input
+    /// that was sent and an independently pinned public identity.
+    pub fn import_for_signing_input(
+        bytes: &[u8],
+        input: &EnrollmentRequestInput,
+        expected_device_id: &str,
+        expected_public_key: &[u8; ED25519_PUBLIC_KEY_BYTES],
+    ) -> Result<Self, FleetClientError> {
+        let request = Self::import_offline(bytes, &input.tenant_id, &input.enrollment_token)?;
+        let nonce = URL_SAFE_NO_PAD.encode(input.nonce.as_slice());
+        if request.device_id != expected_device_id
+            || request.verify(&input.tenant_id, &input.enrollment_token)? != *expected_public_key
+            || request.platform != input.platform
+            || request.agent_version != input.agent_version
+            || request.issued_at != input.issued_at
+            || request.nonce != nonce
+        {
+            return Err(FleetClientError::UnexpectedDevice);
+        }
         Ok(request)
     }
 
@@ -672,6 +816,7 @@ pub enum FleetClientError {
     UnexpectedDevice,
     UnexpectedEnrollmentToken,
     InvalidInventoryBatch,
+    SignerUnavailable,
 }
 
 impl fmt::Display for FleetClientError {
@@ -691,6 +836,7 @@ impl fmt::Display for FleetClientError {
                 formatter.write_str("unexpected Fleet enrollment token")
             }
             Self::InvalidInventoryBatch => formatter.write_str("invalid Fleet inventory batch"),
+            Self::SignerUnavailable => formatter.write_str("Fleet signer is unavailable"),
         }
     }
 }

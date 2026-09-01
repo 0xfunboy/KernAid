@@ -8,11 +8,17 @@ experimental-vault-manager = []
 experimental-codex-home-lease = ["experimental-vault-manager", "dep:kernaid-linux-nsfs"]
 experimental-firstboot-provisioner = ["experimental-vault-manager"]
 experimental-repair-store = ["experimental-vault-manager", "kernaid-protocol/experimental-repair-store"]
+experimental-fleet-signing = [
+  "experimental-vault-manager",
+  "kernaid-protocol/experimental-fleet-signing",
+  "dep:kernaid-fleet-client",
+]
 privileged-probe = ["experimental-vault-manager"]
 
 [dependencies]
 base64 = "0.22"
 kernaid-device-identity = { path = "../device-identity" }
+kernaid-fleet-client = { path = "../fleet-client", optional = true }
 kernaid-linux-nsfs = { path = "../linux-nsfs", optional = true }
 kernaid-protocol = { path = "../protocol" }
 kernaid-report-schema = { path = "../report-schema" }

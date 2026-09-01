@@ -12,9 +12,20 @@ rescue-fstab-handoff = [
   "kernaid-linux-pack/rescue-fstab-production-candidate",
 ]
 rescue-repair-handoff = [
+  "dep:rustix",
   "rescue-fstab-handoff",
   "kernaid-core/rescue-crypttab-production-candidate",
   "kernaid-linux-pack/rescue-crypttab-production-candidate",
+]
+rescue-fleet-service = [
+  "rescue-repair-handoff",
+  "dep:fs2",
+  "dep:kernaid-linux-systemd",
+  "dep:kernaid-protocol",
+  "dep:rand_core",
+  "dep:reqwest",
+  "dep:rustls",
+  "kernaid-protocol/experimental-fleet-signing",
 ]
 linux-service = [
   "dep:fs2",
@@ -61,6 +72,11 @@ name = "kernaid-fleet-resident-macos"
 path = "src/macos_main.rs"
 required-features = ["macos-service"]
 
+[[bin]]
+name = "kernaid-fleet-rescue-repair-bridge"
+path = "src/rescue_main.rs"
+required-features = ["rescue-fleet-service"]
+
 [dependencies]
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
@@ -72,12 +88,14 @@ kernaid-fleet-client = { path = "../fleet-client" }
 kernaid-fleet-policy = { path = "../fleet-policy" }
 kernaid-fleet-runtime = { path = "../fleet-runtime" }
 kernaid-linux-pack = { path = "../../packs/linux", optional = true }
+kernaid-linux-systemd = { path = "../linux-systemd", optional = true }
 kernaid-macos-pack = { path = "../../packs/macos", optional = true }
 kernaid-native-secrets = { path = "../native-secrets", optional = true }
+kernaid-protocol = { path = "../protocol", optional = true }
 kernaid-windows-pack = { path = "../../packs/windows", optional = true }
 rand_core = { version = "0.6", features = ["getrandom"], optional = true }
 reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "rustls-no-provider"], optional = true }
-rustix = { version = "1.1.4", features = ["fs", "process"], optional = true }
+rustix = { version = "1.1.4", features = ["event", "fs", "net", "process"], optional = true }
 rustls = { version = "0.23.43", default-features = false, features = ["ring", "std"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

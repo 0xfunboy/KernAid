@@ -142,6 +142,37 @@ For tenant and first-device provisioning, use the off-default
 a separate owner-only file, and emits a distinct short-lived single-use device
 bundle without printing any token value.
 
+### Repair-image Fleet bootstrap
+
+The private Rescue repair image packages a one-shot bootstrap in
+`/usr/lib/kernaid/kernaid-fleet-rescue-repair-bridge`. It remains inert until
+an operator supplies a public tenant bundle and a separate root-owned `0600`
+file containing only the one-use enrollment token:
+
+```bash
+sudo /usr/lib/kernaid/kernaid-fleet-rescue-repair-bridge bootstrap \
+  --bundle /absolute/public/rescue-fleet-bootstrap.json \
+  --token-file /absolute/private/enrollment.token
+```
+
+The public bundle uses schema
+`dev.kernaid.fleet.rescue-repair-bootstrap-bundle.v1` and contains exactly
+`endpoint`, `tenantId`, the base64url-encoded 32-byte
+`serviceReceiptAnchor`, `entitlementAnchor`, and `policyAnchor`, plus
+`intervalSeconds`, `minimumBackoffSeconds`, `maximumBackoffSeconds`,
+`connectTimeoutSeconds`, `requestTimeoutSeconds`, and `leaseSeconds`. It never
+contains the enrollment token or a private key.
+
+Run the command only after the Rescue Vault is provisioned and unlocked. The
+bootstrap discovers and verifies the Vault's public device identity through
+the purpose-specific enrollment signer, enrolls as the unprivileged
+`kernaid-fleet` account, installs anchors before the activation-gating config,
+deletes both staged and source token files only after accepted enrollment, and
+starts the socket/service. A malformed bundle, mismatched identity, rejected
+enrollment, existing conflicting config, or unavailable Vault fails closed.
+This command and service exist only in the private repair candidate; stable
+diagnosis images do not package them.
+
 ## Policy and entitlement invariants
 
 - Fleet policy is signed by an external tenant trust anchor and contains no

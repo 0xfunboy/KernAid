@@ -29,6 +29,8 @@ pub(super) const COMPANION_UID: u32 = 1000;
 pub(super) const COMPANION_NAME: &[u8] = b"kernaid";
 pub(super) const OPENAI_AGENT_NAME: &[u8] = b"kernaid-openai";
 pub(super) const APPLICATION_AGENT_NAME: &[u8] = b"kernaid-application";
+#[cfg(feature = "experimental-fleet-signing")]
+pub(super) const FLEET_AGENT_NAME: &[u8] = b"kernaid-fleet";
 const ISOLATED_AGENT_HOME: &[u8] = b"/nonexistent";
 const ISOLATED_AGENT_SHELL: &[u8] = b"/usr/sbin/nologin";
 const OPENAI_AGENT_GROUP: &[u8] = b"kernaid-openai";
@@ -422,6 +424,11 @@ pub(super) fn passwd_openai_agent_uid(bytes: &[u8], companion_uid: u32) -> Optio
 /// home directory or login shell.
 pub(super) fn passwd_application_agent_uid(bytes: &[u8], companion_uid: u32) -> Option<u32> {
     passwd_isolated_agent_uid(bytes, companion_uid, APPLICATION_AGENT_NAME)
+}
+
+#[cfg(feature = "experimental-fleet-signing")]
+pub(super) fn passwd_fleet_agent_uid(bytes: &[u8], companion_uid: u32) -> Option<u32> {
+    passwd_isolated_agent_uid(bytes, companion_uid, FLEET_AGENT_NAME)
 }
 
 fn passwd_isolated_agent_uid(

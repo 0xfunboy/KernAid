@@ -45,7 +45,9 @@ READINESS_TIMEOUT_SECONDS = 1200.0
 FIRSTBOOT_PROMPT_TIMEOUT_SECONDS = 600.0
 FIRSTBOOT_RESULT_TIMEOUT_SECONDS = 1500.0
 CONTROLLER_TIMEOUT_SECONDS = 2100
-QMP_KEY_SETTLE_SECONDS = 0.02
+FIRSTBOOT_PROMPT_SETTLE_SECONDS = 1.0
+QMP_SECRET_INPUT_TIMEOUT_SECONDS = 30.0
+QMP_KEY_SETTLE_SECONDS = 0.1
 ACPI_SHUTDOWN_SECONDS = 180.0
 SHUTDOWN_RESERVE_SECONDS = ACPI_SHUTDOWN_SECONDS + 15.0
 PROCESS_CLEANUP_SECONDS = 5.0
@@ -4275,7 +4277,10 @@ def main(arguments: Sequence[str]) -> int:
                 _deadline(aggregate, FIRSTBOOT_PROMPT_TIMEOUT_SECONDS),
                 "firstboot-start",
             )
-            qmp.set_deadline(_deadline(aggregate, 10.0))
+            time.sleep(FIRSTBOOT_PROMPT_SETTLE_SECONDS)
+            qmp.set_deadline(
+                _deadline(aggregate, QMP_SECRET_INPUT_TIMEOUT_SECONDS)
+            )
             qmp.send_hex_line(correct)
             confirmation = wait_firstboot_prompt(
                 console,
@@ -4284,7 +4289,10 @@ def main(arguments: Sequence[str]) -> int:
                 _deadline(aggregate, FIRSTBOOT_PROMPT_TIMEOUT_SECONDS),
                 "firstboot-confirmation",
             )
-            qmp.set_deadline(_deadline(aggregate, 10.0))
+            time.sleep(FIRSTBOOT_PROMPT_SETTLE_SECONDS)
+            qmp.set_deadline(
+                _deadline(aggregate, QMP_SECRET_INPUT_TIMEOUT_SECONDS)
+            )
             qmp.send_hex_line(correct)
             wait_firstboot_attestation(
                 console,

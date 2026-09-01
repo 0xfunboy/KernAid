@@ -1,0 +1,63 @@
+[Unit]
+Description=KernAid Rescue Fleet verified repair work-order bridge
+Requires=kernaid-fleet-rescue-repair.socket kernaid-rescue-repaird.socket kernaid-rescue-vaultd.socket kernaid-rescue-vaultd.service systemd-sysusers.service
+Wants=network-online.target
+After=kernaid-fleet-rescue-repair.socket kernaid-rescue-repaird.socket kernaid-rescue-vaultd.socket kernaid-rescue-vaultd.service network-online.target systemd-sysusers.service
+Before=kernaid-ui.service
+ConditionKernelCommandLine=boot=live
+ConditionKernelCommandLine=kernaid.repair=fstab-v1
+ConditionPathExists=/usr/lib/kernaid/repair-candidate-image-v1
+ConditionPathExists=/etc/kernaid/fleet-rescue-repair.json
+ConditionFileIsExecutable=/usr/lib/kernaid/kernaid-fleet-rescue-repair-bridge
+
+[Service]
+Type=simple
+Sockets=kernaid-fleet-rescue-repair.socket
+ExecStart=/usr/lib/kernaid/kernaid-fleet-rescue-repair-bridge serve --config /etc/kernaid/fleet-rescue-repair.json
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=30s
+TimeoutStopSec=15s
+KillMode=control-group
+SendSIGKILL=yes
+StandardInput=null
+StandardOutput=journal
+StandardError=journal
+User=kernaid-fleet
+Group=kernaid-repair-client
+SupplementaryGroups=kernaid-vault
+UMask=0077
+StateDirectory=kernaid-fleet-rescue
+StateDirectoryMode=0700
+LimitCORE=0
+LimitNOFILE=64
+TasksMax=16
+NoNewPrivileges=yes
+PrivateMounts=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateIPC=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+ReadWritePaths=/var/lib/kernaid-fleet-rescue
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+KeyringMode=private
+RemoveIPC=yes
+
+[Install]
+WantedBy=multi-user.target
