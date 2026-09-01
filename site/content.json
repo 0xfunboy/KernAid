@@ -33,8 +33,8 @@
     "sha256": "0d69b27b1b79edf9017538c3742cae97fa59960f2992a2dba7caec6620997449",
     "retailDownloadName": "KernAid-Rescue-aa8255a-diagnostic-physical-test-candidate-x86_64-retail.img.xz",
     "retailChecksumName": "KernAid-Rescue-aa8255a-diagnostic-physical-test-candidate-x86_64-retail.img.xz.sha256",
-    "qualification": "L'ISO esatta del run 33455599335 ha superato build, ABI, controllo delle superfici diagnosis-only, SBOM, QEMU BIOS, UEFI Secure Boot, framebuffer WebKit, input da tastiera e USB-style two-boot BIOS/UEFI sullo stesso digest. I job separati di prompt e lifecycle Vault restano il gate della promozione stable e non vengono anticipati da questa pubblicazione diagnostica privata.",
-    "warning": "CANDIDATA DIAGNOSTICA PER TEST FISICO CONTROLLATO: usare soltanto su un PC di laboratorio e con una chiavetta sacrificabile. Finché l'intero run e la successiva Release Channel non sono verdi, non considerarla una stable e non usarla su hardware cliente. La stable internal.6 resta disponibile separatamente."
+    "qualification": "L'ISO esatta del run 33455599335 ha superato build, ABI, controllo delle superfici diagnosis-only, SBOM, QEMU BIOS, UEFI Secure Boot, framebuffer WebKit, input da tastiera e USB-style two-boot BIOS/UEFI sullo stesso digest. I tre job separati di prompt e lifecycle Vault sono poi falliti sul medesimo timeout firstboot-confirmation; qualified-release è stato correttamente saltato. La correzione di pacing della tastiera QMP è nel batch successivo be88efa e non modifica questa immagine.",
+    "warning": "CANDIDATA DIAGNOSTICA NON PROMOSSA, SOLO PER TEST FISICO CONTROLLATO DI BOOT E UI: usare esclusivamente su un PC di laboratorio e con una chiavetta sacrificabile. Non affidarsi al provisioning Vault e non usarla su hardware cliente. La stable internal.6 resta disponibile separatamente."
   },
   "repairCandidate": {
     "available": false,
