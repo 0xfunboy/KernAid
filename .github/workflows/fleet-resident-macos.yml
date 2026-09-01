@@ -42,7 +42,7 @@ jobs:
           targets: ${{ matrix.target }}
       - name: Targeted Resident state-machine test
         if: matrix.name == 'macos-aarch64'
-        run: cargo test --locked -p kernaid-fleet-resident-work-orders --features macos-service --lib
+        run: cargo test --locked -p kernaid-fleet-resident-work-orders --features macos-service --lib diagnosis_claim_handoff_and_signed_result_complete_end_to_end
       - name: Build unsigned macOS Resident
         run: >-
           cargo build --locked --release
@@ -122,6 +122,17 @@ jobs:
             shasum -a 256 "${NAME}-UNSIGNED-UNNOTARIZED.tar.gz" \
               > "${NAME}-UNSIGNED-UNNOTARIZED.tar.gz.sha256"
           )
+      - name: Native staged install, run-once and cleanup lifecycle
+        env:
+          BUNDLE: dist/KernAid-Fleet-Resident-${{ matrix.name }}-UNSIGNED-UNNOTARIZED
+          TARGET: ${{ matrix.target }}
+        run: |
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          if [[ "$host" != "$TARGET" ]]; then
+            echo "Skipping execution of non-native $TARGET bundle; packaging checks still apply."
+            exit 0
+          fi
+          python3 deploy/fleet-resident-lifecycle/install-smoke.py --platform macos --package "$BUNDLE"
       - name: Upload explicitly unsigned and unnotarized bundle
         uses: actions/upload-artifact@v4
         with:

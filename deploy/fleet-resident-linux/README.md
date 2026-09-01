@@ -28,3 +28,10 @@ until their separate device qualification is complete.
 The build workflow emits an amd64 `.deb` and adjacent SHA-256 file. Production
 distribution still requires repository/package signing and qualification on
 the supported Linux matrix.
+
+Before upload, the native Linux job extracts that exact `.deb` into an isolated
+temporary root, rejects maintainer scripts, symlinks and pre-enabled systemd
+links, checks the packaged claim/result contract, and invokes `--once` with no
+identity or anchors. The expected fail-closed result proves the one-shot entry
+point without contacting Fleet; the job then removes the complete staging
+root. See `deploy/fleet-resident-lifecycle/README.md` for the boundary.

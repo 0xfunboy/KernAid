@@ -110,3 +110,10 @@ caller-selected path is reachable.
 Developer ID signing, notarization, LaunchAgent/Keychain acceptance, supported
 macOS-version qualification, and physical Intel plus Apple-silicon runs remain
 external release gates.
+
+The existing two-architecture build matrix also runs one staging lifecycle on
+the architecture native to its runner. It checks the packaged claim/result
+contract and disabled `RunAtLoad`/`KeepAlive` values, exercises `--once` until
+the deliberately absent public anchors fail closed, proves no LaunchAgent was
+loaded, and deletes the isolated staging root. It uses no identity, credential,
+private key or signature; the non-native matrix leg remains a packaging check.

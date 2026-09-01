@@ -15,16 +15,27 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.88.0
       - name: Install native build dependencies
         run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends libdbus-1-dev libsecret-1-dev pkg-config
+      - name: Verify the closed claim/result state-machine contract
+        run: >-
+          cargo test --locked -p kernaid-fleet-resident-work-orders
+          --features linux-service --lib
+          diagnosis_claim_handoff_and_signed_result_complete_end_to_end
       - name: Build the four off-default Resident executables
         run: |
           cargo build --locked --release -p kernaid-fleet-resident-sync --features linux-resident
           cargo build --locked --release -p kernaid-fleet-resident-work-orders --features linux-service
           cargo build --locked --release -p kernaid-fleet-resident-update --features linux-resident,linux-systemd-boot-activator
       - name: Assemble disabled-by-default Debian package
+        id: package
         run: |
           version="0.1.0+git${GITHUB_SHA::12}"
           SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" \
             ./deploy/fleet-resident-linux/build-deb.sh "$version" amd64 dist
+          package="dist/kernaid-fleet-resident_${version}_amd64.deb"
+          test -f "$package"
+          echo "path=$package" >> "$GITHUB_OUTPUT"
+      - name: Native staged install, run-once and cleanup lifecycle
+        run: python3 deploy/fleet-resident-lifecycle/install-smoke.py --platform linux --package "${{ steps.package.outputs.path }}"
       - name: Upload Linux Resident package
         uses: actions/upload-artifact@v4
         with:

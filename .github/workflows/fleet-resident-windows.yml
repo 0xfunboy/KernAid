@@ -9,6 +9,8 @@ permissions:
 jobs:
   cross-build-windows-x86-64:
     runs-on: ubuntu-24.04
+    outputs:
+      artifact_name: ${{ steps.package.outputs.artifact_name }}
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -25,7 +27,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends gcc-mingw-w64-x86-64
       - name: Targeted Rust and wire-schema checks
         run: |
-          cargo test --locked -p kernaid-fleet-resident-work-orders --features windows-service --lib
+          cargo test --locked -p kernaid-fleet-resident-work-orders --features windows-service --lib diagnosis_claim_handoff_and_signed_result_complete_end_to_end
           pnpm install --frozen-lockfile
           pnpm --filter @kernaid/fleet-schemas test
       - name: Cross-build unsigned Windows service
@@ -120,3 +122,21 @@ jobs:
             ${{ steps.package.outputs.release }}
           if-no-files-found: error
           retention-days: 14
+
+  native-install-smoke:
+    needs: cross-build-windows-x86-64
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download the existing unsigned development package
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.cross-build-windows-x86-64.outputs.artifact_name }}
+          path: ${{ runner.temp }}/kernaid-fleet-resident-package
+      - name: Native staged install, run-once and uninstall lifecycle
+        shell: pwsh
+        run: |
+          $archives = @(Get-ChildItem -LiteralPath "${{ runner.temp }}/kernaid-fleet-resident-package" -Filter '*.zip' -File)
+          if ($archives.Count -ne 1) { throw "Expected exactly one Resident ZIP." }
+          python deploy/fleet-resident-lifecycle/install-smoke.py --platform windows --package $archives[0].FullName
