@@ -88,6 +88,27 @@ test("readiness, actions, receipt labels, and minimized response are fail closed
     }).actionId,
     "windows.p0.diagnose.v1",
   );
+  assert.deepEqual(
+    workOrderActionsForPlatform("macos").map((action) => action.actionId),
+    ["macos.p0.diagnose.v1"],
+  );
+  assert.deepEqual(
+    createWorkOrderPayload({
+      requestId: "ui_macos_diagnosis",
+      targetDeviceId: deviceId,
+      platform: "macos",
+      actionId: "macos.p0.diagnose.v1",
+      lifetimeSeconds: 600,
+      nowMs: Date.parse("2026-08-31T18:00:00Z"),
+    }),
+    {
+      requestId: "ui_macos_diagnosis",
+      targetDeviceId: deviceId,
+      actionId: "macos.p0.diagnose.v1",
+      actionVersion: 1,
+      expiresAt: "2026-08-31T18:10:00.000Z",
+    },
+  );
   assert.deepEqual(workOrderControls({ status: "pending_approval" }), {
     canApprove: true,
     canCancel: true,

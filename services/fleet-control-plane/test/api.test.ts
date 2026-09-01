@@ -1816,7 +1816,7 @@ test("console login is exact, tenant-bound, and rate limited with bounded state"
   }
 });
 
-test("SQLite v6 migrates its tenant administrator through Fleet v11", async () => {
+test("SQLite v6 migrates its tenant administrator through Fleet v12", async () => {
   let harness = await createHarness();
   const directory = harness.directory;
   const now = harness.now;
@@ -1858,7 +1858,7 @@ test("SQLite v6 migrates its tenant administrator through Fleet v11", async () =
     const version = database.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    assert.equal(version.user_version, 11);
+    assert.equal(version.user_version, 12);
     database.close();
   } finally {
     await destroyHarness(harness);
@@ -3034,7 +3034,7 @@ test("policy anchor, bundle, and assignment survive SQLite restart", async () =>
     const version = database.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    assert.equal(version.user_version, 11);
+    assert.equal(version.user_version, 12);
     const nonce = database
       .prepare(
         `SELECT nonce_sha256 FROM policy_pull_nonces
@@ -3337,7 +3337,7 @@ test("signed entitlement pulls isolate assignments and reject replay, key mismat
   }
 });
 
-test("SQLite v3 migrates through v11 and entitlement checkpoints survive restart", async () => {
+test("SQLite v3 migrates through v12 and entitlement checkpoints survive restart", async () => {
   let harness = await createHarness();
   const directory = harness.directory;
   const now = harness.now;
@@ -3416,7 +3416,7 @@ test("SQLite v3 migrates through v11 and entitlement checkpoints survive restart
     const version = database.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    assert.equal(version.user_version, 11);
+    assert.equal(version.user_version, 12);
     const document = database
       .prepare(
         `SELECT highest_sequence, envelope_sha256, canonical_json
@@ -3642,7 +3642,7 @@ test("signed update pulls bind target and ring, filter eligibility, and reject r
   }
 });
 
-test("SQLite v4 migrates through v11 and update checkpoints survive restart", async () => {
+test("SQLite v4 migrates through v12 and update checkpoints survive restart", async () => {
   let harness = await createHarness();
   const directory = harness.directory;
   const now = harness.now;
@@ -3696,7 +3696,7 @@ test("SQLite v4 migrates through v11 and update checkpoints survive restart", as
     const version = database.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    assert.equal(version.user_version, 11);
+    assert.equal(version.user_version, 12);
     const checkpoint = database
       .prepare(
         `SELECT highest_sequence, manifest_sha256
@@ -3839,8 +3839,10 @@ test("tenant governance status is bounded, minimized, and admin-scoped", async (
   }
 });
 
-test("Windows P0 diagnosis remains a closed typed Fleet work order", async () => {
-  const harness = await createHarness();
+test("SQLite v11 work orders migrate to v12 without losing Windows P0", async () => {
+  let harness = await createHarness();
+  const directory = harness.directory;
+  const now = harness.now;
   try {
     const tenant = await createTenant(harness);
     const device = await enroll(harness, tenant, "windows-device", "windows");
@@ -3890,6 +3892,46 @@ test("Windows P0 diagnosis remains a closed typed Fleet work order", async () =>
     assert.equal(created.status, 201);
     assert.equal(created.body.kind, "diagnosis");
     assert.equal(created.body.actionId, "windows.p0.diagnose.v1");
+
+    await destroyHarness(harness, false);
+    const legacy = new DatabaseSync(harness.databasePath);
+    legacy.exec("PRAGMA user_version = 11");
+    legacy.close();
+
+    harness = await createHarness({ directory, now });
+    const listed = await api(
+      harness,
+      "GET",
+      `/v1/tenants/${tenant.tenantId}/work-orders`,
+      undefined,
+      tenant.adminToken,
+    );
+    assert.equal(listed.status, 200);
+    assert.equal(
+      (listed.body.items as Array<Record<string, unknown>>)[0]?.actionId,
+      "windows.p0.diagnose.v1",
+    );
+    const database = new DatabaseSync(harness.databasePath, { readOnly: true });
+    const version = database.prepare("PRAGMA user_version").get() as {
+      user_version: number;
+    };
+    assert.equal(version.user_version, 12);
+    const schema = database
+      .prepare(
+        "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'work_orders'",
+      )
+      .get() as { sql: string };
+    for (const actionId of [
+      "linux.boot-critical-path.v1",
+      "linux.filesystem.health.v1",
+      "linux.storage.health.v1",
+      "linux.fstab.disable-missing-uuid.v1",
+      "windows.p0.diagnose.v1",
+      "macos.p0.diagnose.v1",
+    ]) {
+      assert.ok(schema.sql.includes(`'${actionId}'`));
+    }
+    database.close();
   } finally {
     await destroyHarness(harness);
   }
@@ -4364,7 +4406,7 @@ test("work-order cancellation, expiry, and audit survive restart", async () => {
     const version = database.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    assert.equal(version.user_version, 11);
+    assert.equal(version.user_version, 12);
     database.close();
   } finally {
     await destroyHarness(harness);
