@@ -18,6 +18,8 @@ readonly qemu_smp="${KERNAID_QEMU_SMP:-2}"
 readonly provisioned_base="${KERNAID_REPAIR_PROVISIONED_BASE:-}"
 readonly provisioned_key="${KERNAID_REPAIR_PROVISIONED_KEY:-}"
 readonly provisioned_target="${KERNAID_REPAIR_TARGET_BASE:-}"
+readonly qualification_batch_child="${KERNAID_REPAIR_QUALIFICATION_BATCH_CHILD:-}"
+readonly repair_readiness_marker=KERNAID_RESCUE_REPAIR_QUALIFICATION_READY_V1
 readonly tamper_helper="$repo_dir/tools/build-rescue/qemu-repair-vault-tamper.py"
 readonly host_vault_provisioner="$repo_dir/tools/build-rescue/provision-repair-vault-base.sh"
 readonly vault_probe="$repo_dir/target/release/kernaid-rescue-vault-probe"
@@ -67,6 +69,16 @@ if [[ -n "$provisioned_base" || -n "$provisioned_key" \
     && "$scenario" != failure-paths \
     && "$scenario" != qualification-batch ]] || {
     echo "Invalid internal provisioned-base handoff" >&2
+    exit 2
+  }
+fi
+if [[ -n "$qualification_batch_child" ]]; then
+  [[ "$qualification_batch_child" == v1 \
+    && -n "$provisioned_base" && -n "$provisioned_key" \
+    && -n "$provisioned_target" \
+    && "$scenario" != failure-paths \
+    && "$scenario" != qualification-batch ]] || {
+    echo "Invalid internal qualification-batch child handoff" >&2
     exit 2
   }
 fi
@@ -379,15 +391,21 @@ if [[ "$scenario" == qualification-batch ]]; then
     printf 'KERNAID_QEMU_REPAIR_QUALIFICATION_CASE_V1 firmware=%s scenario=%s\n' \
       "$case_firmware" "$case_scenario" >&2
     case_output="$(
+      # This internal token is accepted only with the three validated handoffs
+      # above and adds the pinned guest Repair-readiness fw_cfg marker.
       KERNAID_REPAIR_PROVISIONED_BASE="$rescue_media" \
       KERNAID_REPAIR_PROVISIONED_KEY="$vault_key" \
       KERNAID_REPAIR_TARGET_BASE="$target_image" \
+      KERNAID_REPAIR_QUALIFICATION_BATCH_CHILD=v1 \
       KERNAID_QEMU_SMP="$qemu_smp" \
         "$repo_dir/tools/build-rescue/qemu-repair-candidate-smoke.sh" \
         "$case_firmware" "$case_scenario" "$iso"
     )"
-    case_pattern="^KERNAID_QEMU_REPAIR_CANDIDATE_ATTESTATION_V1 .* firmware=$case_firmware scenario=$case_scenario .* iso_sha256=$iso_sha256 .* ready=true$"
-    [[ "$case_output" != *$'\n'* && "$case_output" =~ $case_pattern ]] \
+    case_pattern="^KERNAID_QEMU_REPAIR_CANDIDATE_ATTESTATION_V1 .* firmware=$case_firmware scenario=$case_scenario .* iso_sha256=$iso_sha256 .* guest_readiness=repair-service-v1 guest_readiness_marker=$repair_readiness_marker ready=true$"
+    case_without_readiness_marker="${case_output/guest_readiness_marker=$repair_readiness_marker/}"
+    [[ "$case_output" != *$'\n'* \
+      && "$case_without_readiness_marker" != *"$repair_readiness_marker"* \
+      && "$case_output" =~ $case_pattern ]] \
       || exit 1
   done
 
@@ -405,7 +423,7 @@ if [[ "$scenario" == qualification-batch ]]; then
     && "$(stat -c '%u:%a:%h:%s' -- "$vault_key")" \
       == "$EUID:600:1:64" ]] || exit 1
   printf '%s\n' \
-    "KERNAID_QEMU_REPAIR_QUALIFICATION_BATCH_ATTESTATION_V1 provisioning=host-probe-canonical-v1 guest_firstboot=not-claimed standard_firstboot_gate=unchanged-separate scenarios=bios-apply,uefi-apply,uefi-rollback,uefi-interrupt-reconcile,uefi-stale-target,uefi-cancel,uefi-backup-tamper,uefi-repaird-termination,uefi-auto-restore,uefi-crypttab-lifecycle,uefi-ext4-apply,uefi-resolver-link-apply actions=linux.fstab.disable-missing-uuid.v1,linux.crypttab.disable-missing-uuid.v1,linux.ext4.fsck-preen-with-undo.v1,linux.network.restore-resolver-link.v1 vault_profile=canonical-v1 vault_identity=initialize-verify-stable p3=exact key=private-mode-0600 target=separate base_immutable=true isolated_sparse_copies=true iso_sha256=$iso_sha256 iso_prefix_immutable=true host_physical_devices=false ready=true"
+    "KERNAID_QEMU_REPAIR_QUALIFICATION_BATCH_ATTESTATION_V1 provisioning=host-probe-canonical-v1 guest_firstboot=not-claimed standard_firstboot_gate=unchanged-separate guest_readiness=repair-service-v1 guest_readiness_marker=$repair_readiness_marker standard_full_readiness_gate=unchanged-separate scenarios=bios-apply,uefi-apply,uefi-rollback,uefi-interrupt-reconcile,uefi-stale-target,uefi-cancel,uefi-backup-tamper,uefi-repaird-termination,uefi-auto-restore,uefi-crypttab-lifecycle,uefi-ext4-apply,uefi-resolver-link-apply actions=linux.fstab.disable-missing-uuid.v1,linux.crypttab.disable-missing-uuid.v1,linux.ext4.fsck-preen-with-undo.v1,linux.network.restore-resolver-link.v1 vault_profile=canonical-v1 vault_identity=initialize-verify-stable p3=exact key=private-mode-0600 target=separate base_immutable=true isolated_sparse_copies=true iso_sha256=$iso_sha256 iso_prefix_immutable=true host_physical_devices=false ready=true"
   exit 0
 fi
 
@@ -460,6 +478,12 @@ qemu_args=(
   -fw_cfg name=opt/kernaid-tauri-sandbox-probe,string=v1
 )
 
+if [[ "$qualification_batch_child" == v1 ]]; then
+  qemu_args+=(
+    -fw_cfg name=opt/kernaid-repair-qualification-probe,string=v1
+  )
+fi
+
 qualification_fault=""
 if [[ "$scenario" == repaird-termination || "$scenario" == auto-restore ]]; then
   qualification_fault="$work_dir/qualification-fault"
@@ -501,6 +525,11 @@ controller_args=(
 )
 if [[ "$already_provisioned" == true ]]; then
   controller_args+=(--already-provisioned)
+fi
+readiness_attestation=""
+if [[ "$qualification_batch_child" == v1 ]]; then
+  controller_args+=(--qualification-batch-child)
+  readiness_attestation=" guest_readiness=repair-service-v1 guest_readiness_marker=$repair_readiness_marker"
 fi
 if [[ "$scenario" == backup-tamper ]]; then
   controller_args+=(
@@ -621,6 +650,9 @@ else
   expected_fstab="$seed/etc/fstab"
   expected_terminal=restored
 fi
+if [[ "$qualification_batch_child" == v1 ]]; then
+  expected_guest="${expected_guest% ready=true}${readiness_attestation} ready=true"
+fi
 [[ "$(cat "$controller_output")" == "$expected_guest" ]] || exit 1
 
 debugfs -R "dump -p /etc/fstab $observed_fstab" "$target_image" >/dev/null 2>&1
@@ -737,4 +769,4 @@ elif [[ "$scenario" == resolver-link-apply ]]; then
   resource_attestation="before_sha256=$controller_before_sha256 after_sha256=$controller_after_sha256 exact_link=resolved-stub-relative metadata=uid-gid-no-xattrs"
 fi
 printf '%s\n' \
-  "KERNAID_QEMU_REPAIR_CANDIDATE_ATTESTATION_V1 action=$attested_action firmware=$firmware scenario=$scenario drives=rescue-usb,target-ext4 physical_parents=distinct vault=luks2-ext4 $resource_attestation stage_cleanup=true terminal=$expected_terminal iso_sha256=$iso_sha256 iso_prefix_immutable=true host_physical_devices=false${failure_attestation} ready=true"
+  "KERNAID_QEMU_REPAIR_CANDIDATE_ATTESTATION_V1 action=$attested_action firmware=$firmware scenario=$scenario drives=rescue-usb,target-ext4 physical_parents=distinct vault=luks2-ext4 $resource_attestation stage_cleanup=true terminal=$expected_terminal iso_sha256=$iso_sha256 iso_prefix_immutable=true host_physical_devices=false${failure_attestation}${readiness_attestation} ready=true"

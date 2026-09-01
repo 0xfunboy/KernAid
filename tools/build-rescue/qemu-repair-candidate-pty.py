@@ -45,6 +45,33 @@ PACK_QUALIFICATION_SCENARIOS = (
     "ext4-apply",
     "resolver-link-apply",
 )
+REPAIR_QUALIFICATION_PROBE_ARGUMENT = (
+    "name=opt/kernaid-repair-qualification-probe,string=v1"
+)
+REPAIR_QUALIFICATION_READY_MARKER = (
+    "KERNAID_RESCUE_REPAIR_QUALIFICATION_READY_V1"
+)
+REPAIR_QUALIFICATION_READY_LINE = (
+    REPAIR_QUALIFICATION_READY_MARKER
+    + " identity=validated vault=active application=stable "
+    "repair_socket=active-listening ownership=root-client-group mode=0660 "
+    "full_readiness=separate ready=true"
+).encode("ascii")
+REPAIR_QUALIFICATION_READY_PATTERN = re.compile(
+    rb"^" + re.escape(REPAIR_QUALIFICATION_READY_LINE) + rb"\r?$",
+    re.MULTILINE,
+)
+REPAIR_QUALIFICATION_GLOBAL_READY_PATTERN = re.compile(
+    rb"^" + re.escape(LIFECYCLE.READY_LINE) + rb"\r?$",
+    re.MULTILINE,
+)
+REPAIR_QUALIFICATION_READY_THEN_GLOBAL_PATTERN = re.compile(
+    rb"^" + re.escape(REPAIR_QUALIFICATION_READY_LINE)
+    + rb"\r?\n"
+    + re.escape(LIFECYCLE.READY_LINE)
+    + rb"\r?$",
+    re.MULTILINE,
+)
 TAMPER_HELPER_FAILURE_CODES = frozenset(
     {
         "arguments-invalid",
@@ -138,6 +165,7 @@ def parser() -> ClosedParser:
         required=True,
     )
     value.add_argument("--already-provisioned", action="store_true")
+    value.add_argument("--qualification-batch-child", action="store_true")
     value.add_argument("--ovmf-code", type=Path)
     value.add_argument("--ovmf-vars-template", type=Path)
     value.add_argument("--vault-key-fd", type=int, required=True)
@@ -150,6 +178,27 @@ def parser() -> ClosedParser:
     value.add_argument("--timeout", type=float, default=900.0)
     value.add_argument("qemu_args", nargs=argparse.REMAINDER)
     return value
+
+
+def repair_qualification_probe_enabled(arguments: Sequence[str]) -> bool:
+    """Accept only one exact, paired QEMU Repair-readiness probe option."""
+
+    needle = "opt/kernaid-repair-qualification-probe"
+    related = [
+        (index, argument)
+        for index, argument in enumerate(arguments)
+        if needle in argument
+    ]
+    if not related:
+        return False
+    if (
+        len(related) != 1
+        or related[0][0] == 0
+        or arguments[related[0][0] - 1] != "-fw_cfg"
+        or related[0][1] != REPAIR_QUALIFICATION_PROBE_ARGUMENT
+    ):
+        raise LIFECYCLE.ClosedFailure("arguments", "readiness-probe-invalid")
+    return True
 
 
 def trusted_firmware_file(path: Path) -> Path:
@@ -1526,6 +1575,22 @@ def run_repair_unlock_companion(
     return recovered, recovery_cursor
 
 
+def require_repair_qualification_readiness(console: object) -> None:
+    """Bind a batch child to one exact guest marker immediately before READY."""
+
+    snapshot = console.capture.snapshot()
+    if (
+        len(REPAIR_QUALIFICATION_READY_PATTERN.findall(snapshot)) != 1
+        or len(REPAIR_QUALIFICATION_GLOBAL_READY_PATTERN.findall(snapshot))
+        != 1
+        or len(
+            REPAIR_QUALIFICATION_READY_THEN_GLOBAL_PATTERN.findall(snapshot)
+        )
+        != 1
+    ):
+        raise LIFECYCLE.ClosedFailure("readiness", "repair-marker-invalid")
+
+
 def unlock_repair_vault(
     console: object,
     aggregate: float,
@@ -1533,10 +1598,13 @@ def unlock_repair_vault(
     key: bytearray,
     *,
     stage: str,
+    qualification_batch_child: bool = False,
 ) -> int:
     """Enter the live session and require a locked-to-unlocked transition."""
 
     cursor = LIFECYCLE.establish_live_session(console, aggregate, login)
+    if qualification_batch_child:
+        require_repair_qualification_readiness(console)
     _, cursor = LIFECYCLE.collect_runtime(console, f"{stage}-initial", cursor, aggregate)
     initial, cursor = LIFECYCLE.run_companion(
         console, "status", f"{stage}-initial-status", cursor, aggregate
@@ -1668,6 +1736,20 @@ def main(arguments: Sequence[str]) -> int:
         parsed = parser().parse_args(arguments)
         if parsed.qemu_args[:1] != ["--"]:
             raise LIFECYCLE.ClosedFailure("arguments", "invalid")
+        qualification_probe = repair_qualification_probe_enabled(
+            parsed.qemu_args[1:]
+        )
+        if qualification_probe != parsed.qualification_batch_child:
+            raise LIFECYCLE.ClosedFailure(
+                "arguments", "readiness-probe-mismatch"
+            )
+        if parsed.qualification_batch_child and (
+            not parsed.already_provisioned
+            or parsed.scenario == "provision-base"
+        ):
+            raise LIFECYCLE.ClosedFailure(
+                "arguments", "qualification-child-invalid"
+            )
         if (
             parsed.scenario
             in {
@@ -1765,7 +1847,12 @@ def main(arguments: Sequence[str]) -> int:
             )
         else:
             cursor = unlock_repair_vault(
-                console, aggregate, login, key, stage="repair"
+                console,
+                aggregate,
+                login,
+                key,
+                stage="repair",
+                qualification_batch_child=parsed.qualification_batch_child,
             )
         if parsed.scenario == "apply":
             LIFECYCLE.run_guest_proof(
@@ -2049,11 +2136,17 @@ def main(arguments: Sequence[str]) -> int:
     else:
         action = "linux.fstab.disable-missing-uuid.v1"
         suffix = "terminal=restored fault=after-installed recovery=closed-before-restored target_writes=positive"
+    readiness_suffix = ""
+    if parsed.qualification_batch_child:
+        readiness_suffix = (
+            " guest_readiness=repair-service-v1"
+            f" guest_readiness_marker={REPAIR_QUALIFICATION_READY_MARKER}"
+        )
     print(
         f"{ATTESTATION_PREFIX} action={action} "
         f"firmware={parsed.firmware} scenario={parsed.scenario} "
         f"{digest_suffix} "
-        f"vault_distinct=true {suffix} ready=true",
+        f"vault_distinct=true {suffix}{readiness_suffix} ready=true",
         flush=True,
     )
     return 0

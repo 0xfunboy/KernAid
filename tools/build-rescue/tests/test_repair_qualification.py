@@ -104,6 +104,10 @@ class RepairQualificationTests(unittest.TestCase):
             "KERNAID_QEMU_REPAIR_QUALIFICATION_BATCH_ATTESTATION_V1 "
             "provisioning=host-probe-canonical-v1 guest_firstboot=not-claimed "
             "standard_firstboot_gate=unchanged-separate "
+            "guest_readiness=repair-service-v1 "
+            "guest_readiness_marker="
+            "KERNAID_RESCUE_REPAIR_QUALIFICATION_READY_V1 "
+            "standard_full_readiness_gate=unchanged-separate "
             f"scenarios={SCENARIOS} actions={ACTIONS} "
             "vault_profile=canonical-v1 "
             "vault_identity=initialize-verify-stable p3=exact "
@@ -194,14 +198,36 @@ class RepairQualificationTests(unittest.TestCase):
                 "standardFirstbootGate": "unchanged-separate",
             },
         )
+        self.assertEqual(
+            manifest["readiness"],
+            {
+                "guestGate": "repair-service-v1",
+                "guestMarker": "KERNAID_RESCUE_REPAIR_QUALIFICATION_READY_V1",
+                "standardFullGate": "unchanged-separate",
+            },
+        )
         self.assertEqual(catalog["schema"], "dev.kernaid.rescue-repair-catalog-entry.v1")
         self.assertEqual(catalog["qualification"]["vaultBase"], manifest["vaultBase"])
+        self.assertEqual(catalog["readiness"], manifest["readiness"])
+        self.assertEqual(
+            catalog["qualification"]["readiness"], manifest["readiness"]
+        )
         self.assertEqual(self.run_cli("verify").returncode, 0)
 
     def test_verify_rejects_evidence_tampering(self) -> None:
         self.create()
         self.batch.write_text("ready=true\n", encoding="ascii")
         result = self.run_cli("verify")
+        self.assertEqual(result.returncode, 3)
+        self.assertIn("exact scenario set", result.stderr)
+
+    def test_create_rejects_full_readiness_substitution_for_repair_gate(self) -> None:
+        content = self.batch.read_text(encoding="ascii").replace(
+            "guest_readiness=repair-service-v1",
+            "guest_readiness=full-rescue-v1",
+        )
+        self.batch.write_text(content, encoding="ascii")
+        result = self.run_cli("create")
         self.assertEqual(result.returncode, 3)
         self.assertIn("exact scenario set", result.stderr)
 

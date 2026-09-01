@@ -75,6 +75,40 @@ PY
     tauri_sandbox_smoke=1
 fi
 
+# The consolidated Repair matrix uses an explicit QEMU-only gate so its twelve
+# isolated mutation proofs do not repeat unrelated inventory and WebKit gates.
+# Without this pinned marker the full shipping readiness path below is unchanged.
+repair_qualification_smoke=0
+repair_qualification_marker=/sys/firmware/qemu_fw_cfg/by_name/opt/kernaid-repair-qualification-probe/raw
+if [ -e "$repair_qualification_marker" ] || [ -L "$repair_qualification_marker" ]; then
+    if ! python3 -I - "$repair_qualification_marker" <<'PY'
+import os
+import stat
+import sys
+
+descriptor = os.open(sys.argv[1], os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+try:
+    metadata = os.fstat(descriptor)
+    payload = os.read(descriptor, 4)
+finally:
+    os.close(descriptor)
+if (
+    not stat.S_ISREG(metadata.st_mode)
+    or metadata.st_uid != 0
+    or metadata.st_gid != 0
+    or metadata.st_nlink != 1
+    or stat.S_IMODE(metadata.st_mode) & 0o222
+    or metadata.st_size not in (0, 2, 3)
+    or payload not in (b"v1", b"v1\0")
+):
+    raise SystemExit(1)
+PY
+    then
+        fail "Repair qualification probe marker failed its pinned content gate"
+    fi
+    repair_qualification_smoke=1
+fi
+
 fail_vaultd_startup() {
     vaultd_startup_status="$(
         /usr/bin/timeout --signal=TERM --kill-after=1s 5s \
@@ -522,6 +556,31 @@ test "$application_status_again" = "$application_status" \
 test "$(systemctl show --property=MainPID --value kernaid-rescue-application.service)" = "$application_relay_pid" \
     || fail "Application relay identity changed between lifecycle requests"
 printf '\nKERNAID_RESCUE_APPLICATION_RELAY_READY\n' >/dev/ttyS0
+
+if [ "$repair_qualification_smoke" = "1" ]; then
+    # Keep this narrower READY bound to the exact production services exercised
+    # by every end-to-end Repair proof. The daemon remains socket-activated.
+    repair_client_group_id="$(getent group kernaid-repair-client | awk -F: 'NF == 4 && $1 == "kernaid-repair-client" && $3 ~ /^[0-9]+$/ && $4 == "" { print $3 }')"
+    test -n "$repair_client_group_id" \
+        || fail "Repair qualification client group is missing or unsafe"
+    getent group | awk -F: -v gid="$repair_client_group_id" '$1 == "kernaid-repair-client" || $3 == gid { count += 1; if (NF != 4 || $1 != "kernaid-repair-client" || $3 != gid || $4 != "") bad = 1 } END { exit !(count == 1 && !bad) }' \
+        || fail "Repair qualification client group is colliding or has static members"
+    test "$(systemctl show --property=ActiveState --value kernaid-rescue-repaird.socket)" = "active" \
+        || fail "Repair qualification socket is not active"
+    repair_socket_substate="$(systemctl show --property=SubState --value kernaid-rescue-repaird.socket)" \
+        || fail "Repair qualification socket state is unavailable"
+    case "$repair_socket_substate" in
+        listening) ;;
+        *) fail "Repair qualification socket is not operational" ;;
+    esac
+    test -S /run/kernaid-rescue-repair.sock \
+        || fail "Repair qualification pathname is not a socket"
+    test "$(stat -c '%u:%g:%a:%h' -- /run/kernaid-rescue-repair.sock)" = "0:${repair_client_group_id}:660:1" \
+        || fail "Repair qualification socket ownership or mode is unsafe"
+    printf '\nKERNAID_RESCUE_REPAIR_QUALIFICATION_READY_V1 identity=validated vault=active application=stable repair_socket=active-listening ownership=root-client-group mode=0660 full_readiness=separate ready=true\n' >/dev/ttyS0
+    echo KERNAID_RESCUE_READY >/dev/ttyS0
+    exit 0
+fi
 
 script_path="$(printf '%s' "$index" | sed -n 's/.*src="\.\/\([^"?]*\)".*/\1/p' | head -n 1)"
 case "$script_path" in assets/*.js) ;; *) fail "JavaScript bundle path is missing" ;; esac

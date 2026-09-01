@@ -306,6 +306,10 @@ def _evidence(path: Path, kind: str, iso_sha256: str) -> dict[str, Any]:
             "provisioning=host-probe-canonical-v1 "
             "guest_firstboot=not-claimed "
             "standard_firstboot_gate=unchanged-separate "
+            "guest_readiness=repair-service-v1 "
+            "guest_readiness_marker="
+            "KERNAID_RESCUE_REPAIR_QUALIFICATION_READY_V1 "
+            "standard_full_readiness_gate=unchanged-separate "
             f"scenarios={','.join(SCENARIOS)} "
             f"actions={','.join(ATTESTED_ACTIONS)} "
             "vault_profile=canonical-v1 "
@@ -353,9 +357,15 @@ def _build(arguments: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any
         "provisioning": "host-probe-canonical-v1",
         "standardFirstbootGate": "unchanged-separate",
     }
+    readiness = {
+        "guestGate": "repair-service-v1",
+        "guestMarker": "KERNAID_RESCUE_REPAIR_QUALIFICATION_READY_V1",
+        "standardFullGate": "unchanged-separate",
+    }
     qualification = {
         "environment": "qemu",
         "evidence": evidence,
+        "readiness": readiness,
         "scenarios": list(SCENARIOS),
         "secureBoot": True,
         "vaultBase": vault_base,
@@ -370,6 +380,7 @@ def _build(arguments: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any
         "physicalQualification": False,
         "qualification": qualification,
         "qualifiedRepairActions": list(QUALIFIED_ACTIONS),
+        "readiness": readiness,
         "releaseClass": "engineering-candidate",
         "repairEnabled": True,
         "schema": CATALOG_SCHEMA,
@@ -404,6 +415,7 @@ def _build(arguments: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any
         "evidence": evidence,
         "physicalQualification": False,
         "qualificationEnvironment": "qemu",
+        "readiness": readiness,
         "releaseClass": "engineering-candidate",
         "repairEnabled": True,
         "requiredJobs": ["build-and-smoke-test"],

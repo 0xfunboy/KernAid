@@ -557,6 +557,35 @@ exec /bin/bash --noprofile --norc -i
             controller.wipe(credential)
             capture.wipe()
 
+    def test_repair_qualification_marker_cannot_replace_global_readiness(self) -> None:
+        master, slave = os.openpty()
+        tty.setraw(slave)
+        capture = controller.BoundedCapture(4096, [])
+        console = controller.SerialConsole(slave, capture, lambda: None)
+        try:
+            os.write(
+                master,
+                b"\r\nKERNAID_RESCUE_REPAIR_QUALIFICATION_READY_V1 "
+                b"identity=validated vault=active application=stable "
+                b"repair_socket=active-listening ownership=root-client-group "
+                b"mode=0660 full_readiness=separate ready=true\r\n",
+            )
+            with self.assertRaises(controller.ClosedFailure) as failure:
+                console.wait_line(
+                    controller.READY_LINE,
+                    start=0,
+                    deadline=time.monotonic() + 0.05,
+                    stage="readiness",
+                )
+            self.assertEqual(
+                (failure.exception.stage, failure.exception.code),
+                ("readiness", "timeout"),
+            )
+        finally:
+            console.close()
+            os.close(master)
+            capture.wipe()
+
     def test_not_ready_exposes_only_a_contextual_allowlisted_tauri_stage(self) -> None:
         declared_stages = set(
             re.findall(
