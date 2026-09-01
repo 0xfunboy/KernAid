@@ -8,17 +8,15 @@
 //! No command in this module configures or returns a credential, exposes tools,
 //! invokes a broker, or falls back to a different provider.
 
-use crate::{
-    resident_openai::{
-        ResidentDiagnosisProposal, ResidentOpenAiDiagnosisRequest, ResidentOpenAiError,
-        ResidentOpenAiErrorCode, cancelled, credential_unavailable, diagnosis_schema,
-        invalid_request, invalid_response, parse_and_sanitize_proposal, request_contains_bytes,
-        request_error, response_too_large, timeout, transport, validate_and_normalize_input,
-    },
-    resident_openai_credentials::{
-        RESIDENT_PROVIDER_PROFILE, ResidentProviderCredentialError,
-        ResidentProviderCredentialStatus, ResidentProviderCredentials,
-    },
+use crate::resident_openai::{
+    ResidentDiagnosisProposal, ResidentOpenAiDiagnosisRequest, ResidentOpenAiError,
+    ResidentOpenAiErrorCode, cancelled, credential_unavailable, diagnosis_schema, invalid_request,
+    invalid_response, parse_and_sanitize_proposal, request_contains_bytes, request_error,
+    response_too_large, timeout, transport, validate_and_normalize_input,
+};
+use kernaid_desk_shell::resident_openai_credentials::{
+    RESIDENT_PROVIDER_PROFILE, ResidentProviderCredentialError, ResidentProviderCredentialStatus,
+    ResidentProviderCredentials,
 };
 use kernaid_native_secrets::NativeProviderKind;
 use reqwest::{
