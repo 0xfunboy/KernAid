@@ -5,6 +5,7 @@ mod fixture_repair_lab;
 #[cfg(any(target_os = "macos", test))]
 mod macos_resident;
 mod resident_openai;
+mod resident_openai_credentials;
 mod resident_structured_provider;
 mod secure_runtime;
 #[cfg(any(target_os = "windows", test))]
