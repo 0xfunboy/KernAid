@@ -31,6 +31,7 @@ use std::{
 };
 use zeroize::Zeroizing;
 
+pub mod enrollment;
 #[cfg(feature = "linux-service")]
 pub mod linux;
 #[cfg(all(feature = "macos-service", any(target_os = "macos", test)))]

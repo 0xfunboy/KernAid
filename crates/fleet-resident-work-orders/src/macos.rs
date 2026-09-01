@@ -9,11 +9,14 @@ use super::{
     LocalExecutionResult, LocalHandoffErrorCode, LocalWorkOrderHandoff, PreparedLocalExecution,
     ResidentWorkOrderError, ResidentWorkOrderTransport, TransportErrorCode,
     WorkOrderTransportResponse,
+    enrollment::{self, EnrollmentTransport, ResidentEnrollmentError},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 #[cfg(target_os = "macos")]
 use fs2::FileExt as _;
 use kernaid_device_identity::validate_device_id;
+#[cfg(target_os = "macos")]
+use kernaid_fleet_client::EnrollmentPlatform;
 use kernaid_fleet_client::{LeasedWorkOrder, WorkOrderActionId, WorkOrderResultOutcome};
 use kernaid_fleet_runtime::FleetRuntimeError;
 use reqwest::{
@@ -34,6 +37,9 @@ use std::{
     path::{Component, Path, PathBuf},
     time::Duration,
 };
+
+#[cfg(any(target_os = "macos", test))]
+use std::ffi::{OsStr, OsString};
 
 #[cfg(target_os = "macos")]
 use super::{
@@ -56,7 +62,6 @@ use rand_core::{OsRng, RngCore};
 use std::{
     collections::BTreeMap,
     env,
-    ffi::OsStr,
     os::unix::process::CommandExt as _,
     process::{Child, Command, Stdio},
     thread,
@@ -114,6 +119,7 @@ pub struct MacosWorkOrderServiceConfig {
     pub service_receipt_anchor_file: PathBuf,
     pub entitlement_anchor_file: PathBuf,
     pub policy_anchor_file: PathBuf,
+    pub enrollment_token_file: PathBuf,
     pub interval_seconds: u64,
     pub minimum_backoff_seconds: u64,
     pub maximum_backoff_seconds: u64,
@@ -142,6 +148,7 @@ impl MacosWorkOrderServiceConfig {
             || !safe_absolute_file(&self.service_receipt_anchor_file)
             || !safe_absolute_file(&self.entitlement_anchor_file)
             || !safe_absolute_file(&self.policy_anchor_file)
+            || !safe_absolute_file(&self.enrollment_token_file)
             || !(MIN_INTERVAL_SECONDS..=MAX_INTERVAL_SECONDS).contains(&self.interval_seconds)
             || self.minimum_backoff_seconds == 0
             || self.minimum_backoff_seconds > self.maximum_backoff_seconds
@@ -160,6 +167,7 @@ impl MacosWorkOrderServiceConfig {
             &self.service_receipt_anchor_file,
             &self.entitlement_anchor_file,
             &self.policy_anchor_file,
+            &self.enrollment_token_file,
         ];
         for (index, file) in files.iter().enumerate() {
             if files[..index].contains(file) {
@@ -181,6 +189,7 @@ pub enum MacosWorkOrderServiceError {
     NonceUnavailable,
     Runtime(FleetRuntimeError),
     Resident(ResidentWorkOrderError),
+    Enrollment(ResidentEnrollmentError),
     Io(io::Error),
 }
 
@@ -197,6 +206,7 @@ impl MacosWorkOrderServiceError {
             Self::NonceUnavailable => "nonce-unavailable",
             Self::Runtime(_) => "runtime-unavailable",
             Self::Resident(error) => error.code(),
+            Self::Enrollment(error) => error.code(),
             Self::Io(_) => "io-failed",
         }
     }
@@ -232,6 +242,12 @@ impl From<io::Error> for MacosWorkOrderServiceError {
 impl From<ResidentWorkOrderError> for MacosWorkOrderServiceError {
     fn from(value: ResidentWorkOrderError) -> Self {
         Self::Resident(value)
+    }
+}
+
+impl From<ResidentEnrollmentError> for MacosWorkOrderServiceError {
+    fn from(value: ResidentEnrollmentError) -> Self {
+        Self::Enrollment(value)
     }
 }
 
@@ -329,6 +345,20 @@ impl ResidentWorkOrderTransport for HttpsWorkOrderTransport {
         maximum_response_bytes: usize,
     ) -> Result<WorkOrderTransportResponse, TransportErrorCode> {
         self.post(RESULT_ROUTE, body, maximum_response_bytes)
+    }
+}
+
+impl EnrollmentTransport for HttpsWorkOrderTransport {
+    fn origin(&self) -> &str {
+        &self.origin
+    }
+
+    fn post_enrollment(
+        &mut self,
+        body: &[u8],
+        maximum_response_bytes: usize,
+    ) -> Result<WorkOrderTransportResponse, TransportErrorCode> {
+        self.post(enrollment::ENROLLMENT_ROUTE, body, maximum_response_bytes)
     }
 }
 
@@ -1012,7 +1042,27 @@ fn terminate_process_group(child: &mut Child) {
 
 #[cfg(target_os = "macos")]
 pub fn run_from_args() -> Result<(), MacosWorkOrderServiceError> {
-    let mut arguments = env::args_os().skip(1);
+    let options = parse_service_arguments(env::args_os().skip(1))?;
+    let config = MacosWorkOrderServiceConfig::parse(&read_public_bounded(
+        &options.config_path,
+        MAX_CONFIG_BYTES,
+    )?)?;
+    run_service(config, options.once, options.initialize_identity)
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MacosServiceOptions {
+    config_path: PathBuf,
+    once: bool,
+    initialize_identity: bool,
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_service_arguments(
+    arguments: impl IntoIterator<Item = OsString>,
+) -> Result<MacosServiceOptions, MacosWorkOrderServiceError> {
+    let mut arguments = arguments.into_iter();
     if arguments.next().as_deref() != Some(OsStr::new("--config")) {
         return Err(MacosWorkOrderServiceError::InvalidArguments);
     }
@@ -1021,17 +1071,28 @@ pub fn run_from_args() -> Result<(), MacosWorkOrderServiceError> {
             .next()
             .ok_or(MacosWorkOrderServiceError::InvalidArguments)?,
     );
-    let once = match arguments.next() {
-        None => false,
-        Some(value) if value == "--once" => true,
-        Some(_) => return Err(MacosWorkOrderServiceError::InvalidArguments),
-    };
-    if arguments.next().is_some() || !safe_absolute_file(&config_path) {
+    if !safe_absolute_file(&config_path) {
         return Err(MacosWorkOrderServiceError::InvalidArguments);
     }
-    let config =
-        MacosWorkOrderServiceConfig::parse(&read_public_bounded(&config_path, MAX_CONFIG_BYTES)?)?;
-    run_service(config, once)
+    let mut once = false;
+    let mut initialize_identity = false;
+    for argument in arguments {
+        if argument == OsStr::new("--once") && !once {
+            once = true;
+        } else if argument == OsStr::new("--initialize-identity") && !initialize_identity {
+            initialize_identity = true;
+        } else {
+            return Err(MacosWorkOrderServiceError::InvalidArguments);
+        }
+    }
+    if initialize_identity && !once {
+        return Err(MacosWorkOrderServiceError::InvalidArguments);
+    }
+    Ok(MacosServiceOptions {
+        config_path,
+        once,
+        initialize_identity,
+    })
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1043,7 +1104,14 @@ pub fn run_from_args() -> Result<(), MacosWorkOrderServiceError> {
 pub fn run_service(
     config: MacosWorkOrderServiceConfig,
     once: bool,
+    initialize_identity: bool,
 ) -> Result<(), MacosWorkOrderServiceError> {
+    if initialize_identity {
+        if !once {
+            return Err(MacosWorkOrderServiceError::InvalidArguments);
+        }
+        return bootstrap_enrollment(config);
+    }
     config.validate()?;
     ensure_private_directory(&config.state_directory)?;
     let _lock = open_service_lock(&config.state_directory.join(SERVICE_LOCK_FILE))?;
@@ -1056,17 +1124,23 @@ pub fn run_service(
         .load_device_identity()
         .map_err(|_| MacosWorkOrderServiceError::IdentityUnavailable)?
         .ok_or(MacosWorkOrderServiceError::IdentityUnavailable)?;
+    let transport = HttpsWorkOrderTransport::new(
+        &config.endpoint,
+        config.connect_timeout_seconds,
+        config.request_timeout_seconds,
+    )?;
+    enrollment::require_enrollment(
+        &config.state_directory,
+        &transport.origin,
+        &config.tenant_id,
+        &identity.device_id(),
+    )?;
     let runtime = FleetRuntime::open_with_trust_anchors(
         &config.runtime_state_file,
         &config.tenant_id,
         &identity,
         &entitlement_anchor,
         &policy_anchor,
-    )?;
-    let transport = HttpsWorkOrderTransport::new(
-        &config.endpoint,
-        config.connect_timeout_seconds,
-        config.request_timeout_seconds,
     )?;
     let mut engine = ResidentWorkOrderEngine::open(
         &config.tenant_id,
@@ -1105,6 +1179,55 @@ pub fn run_service(
             Err(error) => return Err(error),
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn bootstrap_enrollment(
+    config: MacosWorkOrderServiceConfig,
+) -> Result<(), MacosWorkOrderServiceError> {
+    config.validate()?;
+    ensure_private_directory(&config.state_directory)?;
+    let _service_lock = open_service_lock(&config.state_directory.join(SERVICE_LOCK_FILE))?;
+    let _identity_lock = open_identity_initialization_lock(&config.state_directory)?;
+    let _ = read_public_anchor(&config.service_receipt_anchor_file)?;
+    let _ = read_public_anchor(&config.entitlement_anchor_file)?;
+    let _ = read_public_anchor(&config.policy_anchor_file)?;
+    let mut identity_store = NativeDeviceIdentityStore::open_named(RESIDENT_IDENTITY_NAMESPACE)
+        .map_err(|_| MacosWorkOrderServiceError::IdentityUnavailable)?;
+    let identity = match identity_store
+        .load_device_identity()
+        .map_err(|_| MacosWorkOrderServiceError::IdentityUnavailable)?
+    {
+        Some(identity) => identity,
+        None => identity_store
+            .create_device_identity()
+            .map_err(|_| MacosWorkOrderServiceError::IdentityUnavailable)?,
+    };
+    let token = enrollment::read_optional_enrollment_token(&config.enrollment_token_file)?;
+    let now = Utc::now();
+    let mut nonce = Zeroizing::new(vec![0_u8; 32]);
+    OsRng
+        .try_fill_bytes(&mut nonce)
+        .map_err(|_| MacosWorkOrderServiceError::NonceUnavailable)?;
+    let mut transport = HttpsWorkOrderTransport::new(
+        &config.endpoint,
+        config.connect_timeout_seconds,
+        config.request_timeout_seconds,
+    )?;
+    enrollment::bootstrap_enrollment(
+        &identity,
+        EnrollmentPlatform::Macos,
+        &config.state_directory,
+        &config.tenant_id,
+        token.as_deref().map(String::as_str),
+        now.to_rfc3339_opts(SecondsFormat::Secs, true),
+        nonce,
+        &mut transport,
+    )?;
+    if token.is_some() {
+        enrollment::remove_consumed_enrollment_token(&config.enrollment_token_file)?;
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -1275,6 +1398,24 @@ fn open_service_lock(path: &Path) -> Result<File, MacosWorkOrderServiceError> {
     file.try_lock_exclusive()
         .map_err(|_| MacosWorkOrderServiceError::InvalidState)?;
     Ok(file)
+}
+
+#[cfg(target_os = "macos")]
+fn open_identity_initialization_lock(
+    state_directory: &Path,
+) -> Result<File, MacosWorkOrderServiceError> {
+    let parent = state_directory
+        .parent()
+        .ok_or(MacosWorkOrderServiceError::InvalidState)?;
+    let metadata = fs::symlink_metadata(parent)?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != rustix::process::getuid().as_raw()
+        || metadata.mode() & 0o077 != 0
+    {
+        return Err(MacosWorkOrderServiceError::InvalidState);
+    }
+    open_service_lock(&parent.join(".resident-v1.lock"))
 }
 
 fn cleanup_temporary(path: &Path) -> Result<(), MacosWorkOrderServiceError> {
@@ -1507,6 +1648,7 @@ mod tests {
             service_receipt_anchor_file: root.join("trust/service.pub"),
             entitlement_anchor_file: root.join("trust/entitlement.pub"),
             policy_anchor_file: root.join("trust/policy.pub"),
+            enrollment_token_file: root.join("enrollment-token"),
             interval_seconds: 60,
             minimum_backoff_seconds: 2,
             maximum_backoff_seconds: 120,
@@ -1538,6 +1680,43 @@ mod tests {
         let mut invalid = config;
         invalid.endpoint = "https://user:secret@fleet.example.invalid/".to_owned();
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn identity_bootstrap_is_explicit_one_shot_only() {
+        let parse = |values: &[&str]| parse_service_arguments(values.iter().map(OsString::from));
+        let expected = MacosServiceOptions {
+            config_path: PathBuf::from("/tmp/kernaid/config.json"),
+            once: true,
+            initialize_identity: true,
+        };
+        assert_eq!(
+            parse(&[
+                "--config",
+                "/tmp/kernaid/config.json",
+                "--initialize-identity",
+                "--once",
+            ])
+            .expect("explicit bootstrap"),
+            expected
+        );
+        for values in [
+            vec![
+                "--config",
+                "/tmp/kernaid/config.json",
+                "--initialize-identity",
+            ],
+            vec!["--config", "/tmp/kernaid/config.json", "--once", "--once"],
+            vec!["--config", "/tmp/kernaid/config.json", "--enroll"],
+        ] {
+            assert!(
+                matches!(
+                    parse(&values),
+                    Err(MacosWorkOrderServiceError::InvalidArguments)
+                ),
+                "unexpected accepted arguments: {values:?}"
+            );
+        }
     }
 
     #[test]

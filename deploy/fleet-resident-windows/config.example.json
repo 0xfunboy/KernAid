@@ -7,6 +7,7 @@
   "serviceReceiptAnchorFile": "C:\\ProgramData\\KernAid\\Trust\\fleet-service-receipt.pub",
   "entitlementAnchorFile": "C:\\ProgramData\\KernAid\\Trust\\fleet-entitlement.pub",
   "policyAnchorFile": "C:\\ProgramData\\KernAid\\Trust\\fleet-policy.pub",
+  "enrollmentTokenFile": "C:\\ProgramData\\KernAid\\Enrollment\\enrollment-token",
   "intervalSeconds": 60,
   "minimumBackoffSeconds": 2,
   "maximumBackoffSeconds": 300,

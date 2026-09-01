@@ -49,17 +49,32 @@ physical acceptance evidence exist.
 3. Copy `config.example.json` to `config.json`; replace `REPLACE_USER`, the
    public tenant, HTTPS origin, absolute state paths, and public trust-anchor
    paths. The strict JSON accepts no command, arguments, script, collector,
-   token, key, or writable target.
-4. Provision the existing enrolled `resident-v1` identity in that user's
-   native macOS secret store. Provision the signed Fleet runtime and the three
-   base64url-no-pad Ed25519 public anchors at the configured paths. The
-   Resident never creates, exports, prints, or writes a seed.
-5. Keep the Resident state directory `0700`. Keep config and anchors owned by
-   the enrolled user and not group/world writable. The runtime directory must
+   token value, key, or writable target.
+4. Put a short-lived enrollment token, and only that token plus an optional
+   final newline, at `enrollmentTokenFile` with mode `0600`. Provision the three
+   base64url-no-pad Ed25519 public anchors first. Run the explicit bootstrap:
+
+   ```sh
+   "$HOME/Library/Application Support/KernAid/Fleet Resident/kernaid-fleet-resident-macos" \
+     --config "$HOME/Library/Application Support/KernAid/Fleet Resident/config.json" \
+     --initialize-identity --once
+   ```
+
+   It takes the same canonical Resident lock as Desk, creates `resident-v1`
+   only when absent, signs one HTTPS enrollment, commits only the public
+   endpoint/tenant/device binding, removes the token after that commit, and
+   exits. It never exports, prints, or writes the seed. Normal startup never
+   creates or enrolls an identity.
+5. Provision the signed Fleet runtime issued for that enrolled identity.
+6. Keep both the Resident application-data root (the parent of
+   `stateDirectory`) and the state directory itself `0700`; the canonical
+   identity lock lives in that parent. Keep config and anchors owned by the
+   enrolled user and not group/world writable. The runtime directory must
    permit its SQLite journal files but no broader filesystem writes.
 
-Run one acceptance cycle in that user's GUI session before installing the
-LaunchAgent:
+Run one normal acceptance cycle in that user's GUI session before installing
+the LaunchAgent. It fails closed unless enrollment, all public anchors, and the
+signed runtime bind the same endpoint, tenant and identity:
 
 ```sh
 "$HOME/Library/Application Support/KernAid/Fleet Resident/kernaid-fleet-resident-macos" \

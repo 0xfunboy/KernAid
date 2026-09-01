@@ -4,6 +4,10 @@ The three Fleet Resident workflows invoke `install-smoke.py` on their native
 runner after assembling the existing development package. The check never
 uses an enrollment token, device identity, private key or signature.
 
+Windows and macOS packages must still contain the fixed enrollment route,
+public enrollment-state schema and fail-closed marker. The smoke only verifies
+those inert binary markers; it never invokes bootstrap or fabricates a client.
+
 It verifies the packaged fixed claim/result routes and schemas, stages the
 package outside production locations, exercises the one-shot command until it
 fails closed at deliberately absent public anchors, proves startup remains

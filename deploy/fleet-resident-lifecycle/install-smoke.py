@@ -27,6 +27,11 @@ CONTRACT_MARKERS = (
     b"dev.kernaid.fleet.work-order-claim-request.v1",
     b"dev.kernaid.fleet.work-order-result.v1",
 )
+ENROLLMENT_CONTRACT_MARKERS = (
+    b"/v1/enrollments",
+    b"dev.kernaid.fleet.resident-enrollment.v1",
+    b"enrollment-required",
+)
 FORBIDDEN_CONFIG_KEYS = {
     "arguments",
     "collector",
@@ -96,6 +101,17 @@ def verify_binary_contract(binary: Path) -> None:
         raise SmokeFailure(f"Resident executable lacks claim/result contract: {missing}")
 
 
+def verify_enrollment_contract(binary: Path) -> None:
+    payload = binary.read_bytes()
+    missing = [
+        marker.decode("ascii")
+        for marker in ENROLLMENT_CONTRACT_MARKERS
+        if marker not in payload
+    ]
+    if missing:
+        raise SmokeFailure(f"Resident executable lacks explicit enrollment contract: {missing}")
+
+
 def verify_public_config(path: Path, expected_schema: str) -> None:
     regular_file(path, "public configuration template")
     try:
@@ -135,6 +151,7 @@ def write_smoke_config(platform: str, root: Path) -> tuple[Path, Path]:
         "serviceReceiptAnchorFile": str(trust / "service.pub"),
         "entitlementAnchorFile": str(trust / "entitlement.pub"),
         "policyAnchorFile": str(trust / "policy.pub"),
+        "enrollmentTokenFile": str(root / "absent-enrollment-token"),
         "intervalSeconds": 60,
         "minimumBackoffSeconds": 2,
         "maximumBackoffSeconds": 30,
@@ -285,6 +302,7 @@ def windows_smoke(package: Path) -> None:
         safe_extract_windows_bundle(package, bundle)
         binary = bundle / "KernAid-Fleet-Resident.exe"
         verify_binary_contract(binary)
+        verify_enrollment_contract(binary)
         verify_public_config(
             bundle / "config.example.json",
             "dev.kernaid.fleet.resident-windows-service-config.v1",
@@ -348,6 +366,7 @@ def macos_smoke(package: Path) -> None:
         shutil.copytree(package, bundle, symlinks=False)
         binary = bundle / "kernaid-fleet-resident-macos"
         verify_binary_contract(binary)
+        verify_enrollment_contract(binary)
         verify_public_config(
             bundle / "config.example.json",
             "dev.kernaid.fleet.resident-macos-service-config.v1",
@@ -394,7 +413,7 @@ def main() -> int:
     print(
         f"KERNAID_FLEET_RESIDENT_LIFECYCLE_V1 platform={arguments.platform} status=ok "
         "install=staged run_once=fail-closed startup=disabled "
-        "claim_result=present cleanup=complete"
+        "enrollment=explicit claim_result=present cleanup=complete"
     )
     return 0
 

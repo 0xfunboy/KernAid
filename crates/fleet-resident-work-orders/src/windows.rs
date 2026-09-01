@@ -8,6 +8,7 @@ use super::{
     LocalExecutionResult, LocalHandoffErrorCode, LocalWorkOrderHandoff, PreparedLocalExecution,
     ResidentWorkOrderError, ResidentWorkOrderTransport, TransportErrorCode,
     WorkOrderTransportResponse,
+    enrollment::{self, EnrollmentTransport, ResidentEnrollmentError},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 #[cfg(windows)]
@@ -15,6 +16,8 @@ use chrono::{SecondsFormat, Utc};
 #[cfg(windows)]
 use fs2::FileExt as _;
 use kernaid_device_identity::validate_device_id;
+#[cfg(windows)]
+use kernaid_fleet_client::EnrollmentPlatform;
 use kernaid_fleet_client::{LeasedWorkOrder, WorkOrderActionId, WorkOrderResultOutcome};
 use kernaid_fleet_runtime::FleetRuntimeError;
 #[cfg(windows)]
@@ -136,6 +139,7 @@ pub struct WindowsWorkOrderServiceConfig {
     pub service_receipt_anchor_file: PathBuf,
     pub entitlement_anchor_file: PathBuf,
     pub policy_anchor_file: PathBuf,
+    pub enrollment_token_file: PathBuf,
     pub interval_seconds: u64,
     pub minimum_backoff_seconds: u64,
     pub maximum_backoff_seconds: u64,
@@ -164,6 +168,7 @@ impl WindowsWorkOrderServiceConfig {
             || !safe_absolute_path(&self.service_receipt_anchor_file)
             || !safe_absolute_path(&self.entitlement_anchor_file)
             || !safe_absolute_path(&self.policy_anchor_file)
+            || !safe_absolute_path(&self.enrollment_token_file)
             || !(MIN_INTERVAL_SECONDS..=MAX_INTERVAL_SECONDS).contains(&self.interval_seconds)
             || self.minimum_backoff_seconds == 0
             || self.minimum_backoff_seconds > self.maximum_backoff_seconds
@@ -182,6 +187,7 @@ impl WindowsWorkOrderServiceConfig {
             &self.service_receipt_anchor_file,
             &self.entitlement_anchor_file,
             &self.policy_anchor_file,
+            &self.enrollment_token_file,
         ];
         for (index, path) in paths.iter().enumerate() {
             if paths[..index].contains(path) {
@@ -203,6 +209,7 @@ pub enum WindowsWorkOrderServiceError {
     ServiceControl,
     Runtime(FleetRuntimeError),
     Resident(ResidentWorkOrderError),
+    Enrollment(ResidentEnrollmentError),
     Io(io::Error),
 }
 
@@ -219,6 +226,7 @@ impl WindowsWorkOrderServiceError {
             Self::ServiceControl => "windows-service-control-failed",
             Self::Runtime(_) => "runtime-unavailable",
             Self::Resident(error) => error.code(),
+            Self::Enrollment(error) => error.code(),
             Self::Io(_) => "io-failed",
         }
     }
@@ -254,6 +262,12 @@ impl From<io::Error> for WindowsWorkOrderServiceError {
 impl From<ResidentWorkOrderError> for WindowsWorkOrderServiceError {
     fn from(value: ResidentWorkOrderError) -> Self {
         Self::Resident(value)
+    }
+}
+
+impl From<ResidentEnrollmentError> for WindowsWorkOrderServiceError {
+    fn from(value: ResidentEnrollmentError) -> Self {
+        Self::Enrollment(value)
     }
 }
 
@@ -349,6 +363,20 @@ impl ResidentWorkOrderTransport for HttpsWorkOrderTransport {
         maximum_response_bytes: usize,
     ) -> Result<WorkOrderTransportResponse, TransportErrorCode> {
         self.post(RESULT_ROUTE, body, maximum_response_bytes)
+    }
+}
+
+impl EnrollmentTransport for HttpsWorkOrderTransport {
+    fn origin(&self) -> &str {
+        &self.origin
+    }
+
+    fn post_enrollment(
+        &mut self,
+        body: &[u8],
+        maximum_response_bytes: usize,
+    ) -> Result<WorkOrderTransportResponse, TransportErrorCode> {
+        self.post(enrollment::ENROLLMENT_ROUTE, body, maximum_response_bytes)
     }
 }
 
@@ -983,7 +1011,6 @@ fn run_cycle<T: ResidentWorkOrderTransport, H: LocalWorkOrderHandoff>(
 fn run_worker(
     config: WindowsWorkOrderServiceConfig,
     once: bool,
-    initialize_identity: bool,
     shutdown: &Receiver<()>,
 ) -> Result<(), WindowsWorkOrderServiceError> {
     config.validate()?;
@@ -994,27 +1021,27 @@ fn run_worker(
     let policy_anchor = read_public_anchor(&config.policy_anchor_file)?;
     let mut identity_store = NativeDeviceIdentityStore::open_named(RESIDENT_IDENTITY_NAMESPACE)
         .map_err(|_| WindowsWorkOrderServiceError::IdentityUnavailable)?;
-    let identity = match identity_store
+    let identity = identity_store
         .load_device_identity()
         .map_err(|_| WindowsWorkOrderServiceError::IdentityUnavailable)?
-    {
-        Some(identity) => identity,
-        None if initialize_identity => identity_store
-            .create_device_identity()
-            .map_err(|_| WindowsWorkOrderServiceError::IdentityUnavailable)?,
-        None => return Err(WindowsWorkOrderServiceError::IdentityUnavailable),
-    };
+        .ok_or(WindowsWorkOrderServiceError::IdentityUnavailable)?;
+    let transport = HttpsWorkOrderTransport::new(
+        &config.endpoint,
+        config.connect_timeout_seconds,
+        config.request_timeout_seconds,
+    )?;
+    enrollment::require_enrollment(
+        &config.state_directory,
+        &transport.origin,
+        &config.tenant_id,
+        &identity.device_id(),
+    )?;
     let runtime = FleetRuntime::open_with_trust_anchors(
         &config.runtime_state_file,
         &config.tenant_id,
         &identity,
         &entitlement_anchor,
         &policy_anchor,
-    )?;
-    let transport = HttpsWorkOrderTransport::new(
-        &config.endpoint,
-        config.connect_timeout_seconds,
-        config.request_timeout_seconds,
     )?;
     let mut engine = ResidentWorkOrderEngine::open(
         &config.tenant_id,
@@ -1055,6 +1082,55 @@ fn run_worker(
 }
 
 #[cfg(windows)]
+fn bootstrap_enrollment(
+    config: WindowsWorkOrderServiceConfig,
+) -> Result<(), WindowsWorkOrderServiceError> {
+    config.validate()?;
+    ensure_private_directory(&config.state_directory)?;
+    let _service_lock = open_service_lock(&config.state_directory.join(SERVICE_LOCK_FILE))?;
+    let _identity_lock = open_identity_initialization_lock(&config.state_directory)?;
+    let _ = read_public_anchor(&config.service_receipt_anchor_file)?;
+    let _ = read_public_anchor(&config.entitlement_anchor_file)?;
+    let _ = read_public_anchor(&config.policy_anchor_file)?;
+    let mut identity_store = NativeDeviceIdentityStore::open_named(RESIDENT_IDENTITY_NAMESPACE)
+        .map_err(|_| WindowsWorkOrderServiceError::IdentityUnavailable)?;
+    let identity = match identity_store
+        .load_device_identity()
+        .map_err(|_| WindowsWorkOrderServiceError::IdentityUnavailable)?
+    {
+        Some(identity) => identity,
+        None => identity_store
+            .create_device_identity()
+            .map_err(|_| WindowsWorkOrderServiceError::IdentityUnavailable)?,
+    };
+    let token = enrollment::read_optional_enrollment_token(&config.enrollment_token_file)?;
+    let now = Utc::now();
+    let mut nonce = Zeroizing::new(vec![0_u8; 32]);
+    OsRng
+        .try_fill_bytes(&mut nonce)
+        .map_err(|_| WindowsWorkOrderServiceError::NonceUnavailable)?;
+    let mut transport = HttpsWorkOrderTransport::new(
+        &config.endpoint,
+        config.connect_timeout_seconds,
+        config.request_timeout_seconds,
+    )?;
+    enrollment::bootstrap_enrollment(
+        &identity,
+        EnrollmentPlatform::Windows,
+        &config.state_directory,
+        &config.tenant_id,
+        token.as_deref().map(String::as_str),
+        now.to_rfc3339_opts(SecondsFormat::Secs, true),
+        nonce,
+        &mut transport,
+    )?;
+    if token.is_some() {
+        enrollment::remove_consumed_enrollment_token(&config.enrollment_token_file)?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
 static SERVICE_CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 #[cfg(windows)]
@@ -1068,7 +1144,7 @@ fn service_main(arguments: Vec<OsString>) {
 
 #[cfg(windows)]
 fn service_main_inner(arguments: Vec<OsString>) -> Result<(), WindowsWorkOrderServiceError> {
-    let initialize_identity = parse_service_start_arguments(&arguments)?;
+    let mode = parse_service_start_arguments(&arguments)?;
     let config_path = SERVICE_CONFIG_PATH
         .get()
         .ok_or(WindowsWorkOrderServiceError::InvalidArguments)?;
@@ -1088,7 +1164,10 @@ fn service_main_inner(arguments: Vec<OsString>) -> Result<(), WindowsWorkOrderSe
     status
         .set_service_status(service_status(ServiceState::Running, true, 0))
         .map_err(|_| WindowsWorkOrderServiceError::ServiceControl)?;
-    let result = run_worker(config, false, initialize_identity, &shutdown_rx);
+    let result = match mode {
+        WindowsServiceMode::Normal => run_worker(config, false, &shutdown_rx),
+        WindowsServiceMode::BootstrapEnrollment => bootstrap_enrollment(config),
+    };
     let exit = if result.is_ok() { 0 } else { 1 };
     status
         .set_service_status(service_status(ServiceState::Stopped, false, exit))
@@ -1114,17 +1193,26 @@ fn service_status(state: ServiceState, accepts_stop: bool, exit: u32) -> Service
 }
 
 #[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WindowsServiceMode {
+    Normal,
+    BootstrapEnrollment,
+}
+
+#[cfg(windows)]
 fn parse_service_start_arguments(
     arguments: &[OsString],
-) -> Result<bool, WindowsWorkOrderServiceError> {
+) -> Result<WindowsServiceMode, WindowsWorkOrderServiceError> {
     let filtered: Vec<&OsStr> = arguments
         .iter()
         .map(OsString::as_os_str)
         .filter(|value| *value != OsStr::new(WINDOWS_SERVICE_NAME))
         .collect();
     match filtered.as_slice() {
-        [] => Ok(false),
-        [value] if *value == OsStr::new("--initialize-identity") => Ok(true),
+        [] => Ok(WindowsServiceMode::Normal),
+        [value] if *value == OsStr::new("--bootstrap-enrollment") => {
+            Ok(WindowsServiceMode::BootstrapEnrollment)
+        }
         _ => Err(WindowsWorkOrderServiceError::InvalidArguments),
     }
 }
@@ -1140,17 +1228,8 @@ pub fn run_from_args() -> Result<(), WindowsWorkOrderServiceError> {
             let config_path = exact_config_argument(&mut arguments)?;
             install_service(&config_path)
         }
-        Some("start") => {
-            let initialize = match arguments.next() {
-                None => false,
-                Some(value) if value == "--initialize-identity" => true,
-                Some(_) => return Err(WindowsWorkOrderServiceError::InvalidArguments),
-            };
-            if arguments.next().is_some() {
-                return Err(WindowsWorkOrderServiceError::InvalidArguments);
-            }
-            start_service(initialize)
-        }
+        Some("enroll") if arguments.next().is_none() => enroll_service(),
+        Some("start") if arguments.next().is_none() => start_service(),
         Some("stop") if arguments.next().is_none() => stop_service(),
         Some("uninstall") if arguments.next().is_none() => uninstall_service(),
         Some("run-once") => {
@@ -1160,7 +1239,7 @@ pub fn run_from_args() -> Result<(), WindowsWorkOrderServiceError> {
                 MAX_CONFIG_BYTES,
             )?)?;
             let (_sender, receiver) = mpsc::channel();
-            run_worker(config, true, false, &receiver)
+            run_worker(config, true, &receiver)
         }
         Some("service") => {
             let config_path = exact_config_argument(&mut arguments)?;
@@ -1240,7 +1319,7 @@ fn install_service(config_path: &Path) -> Result<(), WindowsWorkOrderServiceErro
 }
 
 #[cfg(windows)]
-fn start_service(initialize_identity: bool) -> Result<(), WindowsWorkOrderServiceError> {
+fn start_service() -> Result<(), WindowsWorkOrderServiceError> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
         .map_err(|_| WindowsWorkOrderServiceError::ServiceControl)?;
     let service = manager
@@ -1249,12 +1328,49 @@ fn start_service(initialize_identity: bool) -> Result<(), WindowsWorkOrderServic
             ServiceAccess::START | ServiceAccess::QUERY_STATUS,
         )
         .map_err(|_| WindowsWorkOrderServiceError::ServiceControl)?;
-    if initialize_identity {
-        service.start(&[OsStr::new("--initialize-identity")])
-    } else {
-        service.start::<&OsStr>(&[])
+    service
+        .start::<&OsStr>(&[])
+        .map_err(|_| WindowsWorkOrderServiceError::ServiceControl)
+}
+
+#[cfg(windows)]
+fn enroll_service() -> Result<(), WindowsWorkOrderServiceError> {
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .map_err(|_| WindowsWorkOrderServiceError::ServiceControl)?;
+    let service = manager
+        .open_service(
+            WINDOWS_SERVICE_NAME,
+            ServiceAccess::START | ServiceAccess::QUERY_STATUS,
+        )
+        .map_err(|_| WindowsWorkOrderServiceError::ServiceControl)?;
+    if service
+        .query_status()
+        .map_err(|_| WindowsWorkOrderServiceError::ServiceControl)?
+        .current_state
+        != ServiceState::Stopped
+    {
+        return Err(WindowsWorkOrderServiceError::ServiceControl);
     }
-    .map_err(|_| WindowsWorkOrderServiceError::ServiceControl)
+    service
+        .start(&[OsStr::new("--bootstrap-enrollment")])
+        .map_err(|_| WindowsWorkOrderServiceError::ServiceControl)?;
+    let deadline = Instant::now() + Duration::from_secs(190);
+    loop {
+        let status = service
+            .query_status()
+            .map_err(|_| WindowsWorkOrderServiceError::ServiceControl)?;
+        if status.current_state == ServiceState::Stopped {
+            return if status.exit_code == ServiceExitCode::NO_ERROR {
+                Ok(())
+            } else {
+                Err(WindowsWorkOrderServiceError::ServiceControl)
+            };
+        }
+        if Instant::now() >= deadline {
+            return Err(WindowsWorkOrderServiceError::ServiceControl);
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
 }
 
 #[cfg(windows)]
@@ -1352,6 +1468,11 @@ fn safe_absolute_path(path: &Path) -> bool {
 }
 
 fn ensure_private_directory(path: &Path) -> Result<(), WindowsWorkOrderServiceError> {
+    #[cfg(windows)]
+    use std::os::windows::fs::MetadataExt;
+
+    #[cfg(windows)]
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
     if !safe_absolute_path(path) {
         return Err(WindowsWorkOrderServiceError::InvalidConfig);
     }
@@ -1362,6 +1483,10 @@ fn ensure_private_directory(path: &Path) -> Result<(), WindowsWorkOrderServiceEr
     }
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(WindowsWorkOrderServiceError::InvalidState);
+    }
+    #[cfg(windows)]
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(WindowsWorkOrderServiceError::InvalidState);
     }
     #[cfg(unix)]
@@ -1377,22 +1502,52 @@ fn ensure_private_directory(path: &Path) -> Result<(), WindowsWorkOrderServiceEr
 
 #[cfg(windows)]
 fn open_service_lock(path: &Path) -> Result<File, WindowsWorkOrderServiceError> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     if let Ok(metadata) = fs::symlink_metadata(path) {
-        if !metadata.is_file() || metadata.file_type().is_symlink() {
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        {
             return Err(WindowsWorkOrderServiceError::InvalidState);
         }
     }
     let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
+    options
+        .read(true)
+        .write(true)
+        .create(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(WindowsWorkOrderServiceError::InvalidState);
+    }
     file.try_lock_exclusive()
         .map_err(|_| WindowsWorkOrderServiceError::InvalidState)?;
     Ok(file)
+}
+
+#[cfg(windows)]
+fn open_identity_initialization_lock(
+    state_directory: &Path,
+) -> Result<File, WindowsWorkOrderServiceError> {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    let parent = state_directory
+        .parent()
+        .ok_or(WindowsWorkOrderServiceError::InvalidState)?;
+    let metadata = fs::symlink_metadata(parent)?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
+        return Err(WindowsWorkOrderServiceError::InvalidState);
+    }
+    open_service_lock(&parent.join(".resident-v1.lock"))
 }
 
 fn cleanup_pending(path: &Path) -> Result<(), WindowsWorkOrderServiceError> {
@@ -1616,8 +1771,19 @@ mod tests {
 
     #[test]
     fn config_rejects_secret_and_command_fields() {
-        let payload = br#"{"schema":"dev.kernaid.fleet.resident-windows-service-config.v1","endpoint":"https://fleet.example.invalid","tenantId":"tenant-a","stateDirectory":"/tmp/state","runtimeStateFile":"/tmp/runtime","serviceReceiptAnchorFile":"/tmp/service.pub","entitlementAnchorFile":"/tmp/entitlement.pub","policyAnchorFile":"/tmp/policy.pub","intervalSeconds":60,"minimumBackoffSeconds":2,"maximumBackoffSeconds":120,"connectTimeoutSeconds":5,"requestTimeoutSeconds":30,"leaseSeconds":300,"command":"cmd.exe","token":"secret"}"#;
-        assert!(WindowsWorkOrderServiceConfig::parse(payload).is_err());
+        let payload = br#"{"schema":"dev.kernaid.fleet.resident-windows-service-config.v1","endpoint":"https://fleet.example.invalid","tenantId":"tenant-a","stateDirectory":"/tmp/state","runtimeStateFile":"/tmp/runtime","serviceReceiptAnchorFile":"/tmp/service.pub","entitlementAnchorFile":"/tmp/entitlement.pub","policyAnchorFile":"/tmp/policy.pub","enrollmentTokenFile":"/tmp/enrollment-token","intervalSeconds":60,"minimumBackoffSeconds":2,"maximumBackoffSeconds":120,"connectTimeoutSeconds":5,"requestTimeoutSeconds":30,"leaseSeconds":300}"#;
+        assert!(WindowsWorkOrderServiceConfig::parse(payload).is_ok());
+        let mut value: Value = serde_json::from_slice(payload).expect("config JSON");
+        value
+            .as_object_mut()
+            .expect("config object")
+            .insert("command".to_owned(), Value::String("cmd.exe".to_owned()));
+        assert!(
+            WindowsWorkOrderServiceConfig::parse(
+                &serde_json::to_vec(&value).expect("invalid config")
+            )
+            .is_err()
+        );
     }
 
     #[test]

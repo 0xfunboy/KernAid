@@ -32,6 +32,15 @@ class LifecycleSmokeStaticTests(unittest.TestCase):
             with self.assertRaises(smoke.SmokeFailure):
                 smoke.verify_binary_contract(binary)
 
+    def test_native_enrollment_contract_is_packaged_without_a_credential(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "resident"
+            binary.write_bytes(b"\0".join(smoke.ENROLLMENT_CONTRACT_MARKERS))
+            smoke.verify_enrollment_contract(binary)
+            binary.write_bytes(b"\0".join(smoke.ENROLLMENT_CONTRACT_MARKERS[:-1]))
+            with self.assertRaises(smoke.SmokeFailure):
+                smoke.verify_enrollment_contract(binary)
+
     def test_generated_configs_are_public_and_credential_free(self) -> None:
         schemas = {
             "linux": "dev.kernaid.fleet.resident-work-order-service-config.v1",
@@ -100,6 +109,23 @@ class LifecycleSmokeStaticTests(unittest.TestCase):
         self.assertEqual(setup.count(bootstrap), 1)
         self.assertLess(setup.index("if ((enable_services)); then"), setup.index(bootstrap))
         self.assertLess(setup.index(bootstrap), setup.index("systemctl --user enable --now"))
+
+    def test_windows_and_macos_bootstrap_remain_explicit_and_pre_start(self) -> None:
+        windows = (REPO / "deploy/fleet-resident-windows/README.md").read_text(
+            encoding="utf-8"
+        )
+        macos = (REPO / "deploy/fleet-resident-macos/README.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertLess(
+            windows.index("kernaid-fleet-resident-windows.exe enroll"),
+            windows.index("kernaid-fleet-resident-windows.exe start"),
+        )
+        self.assertIn("--initialize-identity --once", macos)
+        plist = (
+            REPO / "deploy/fleet-resident-macos/io.kernaid.fleet-resident-macos.plist"
+        ).read_text(encoding="utf-8")
+        self.assertIn("<key>RunAtLoad</key>\n  <false/>", plist)
 
 
 if __name__ == "__main__":
