@@ -73,11 +73,15 @@ Therefore Linux can publish AppImage, DEB and RPM together, Windows MSI and
 NSIS together, and macOS app bundle and DMG together without colliding. The
 accepted variants are `appimage`, `deb`, `rpm`, `msi`, `nsis`, `app`, `dmg`,
 and Rescue `qualified-zip`, `qualified-iso` or `retail-img-xz`; each is valid
-only on its matching platform. The publisher exposes the verified ISO and its
-checksum as the `qualified-iso` group. The compressed Windows retail image and
-its checksum form the separate `retail-img-xz` group; the image is never a
-member of the qualified ZIP. The publisher rejects every individual GitHub
-Release asset at or above 1,999,999,999 bytes.
+only on its matching platform. Repair uses the separate
+`repair-qualified-zip`, `repair-qualified-iso` and `repair-retail-img-xz`
+variants, which are accepted only as an all-Repair artifact set on the
+`repair-internal` channel and only with Repair-workflow provenance. The stable
+publisher exposes the verified ISO and its checksum as the `qualified-iso`
+group. The compressed Windows retail image and its checksum form the separate
+`retail-img-xz` group; the image is never a member of the qualified ZIP. The
+publisher rejects every individual GitHub Release asset at or above
+1,999,999,999 bytes.
 Additional records may be `checksum`, `qualification`, `sbom`, or `signature`.
 All files in one variant group must identify the same run. Desk uses
 `desktop.yml`; Rescue uses `rescue.yml`.
@@ -157,6 +161,32 @@ precondition. Immutability applies only to releases published while enabled.
 Consumers must still verify the included channel attestation and manifest
 hash. This permission does not code-sign MSI, DMG, AppImage or the boot chain.
 Those assets remain explicitly unsigned engineering candidates.
+
+## Publish the isolated Repair channel
+
+Repair media is a different product boundary, not a newer diagnosis-only
+Rescue image. A successful main-branch
+`.github/workflows/rescue-repair-candidate.yml` run publishes artifacts named
+`KernAid-Rescue-Repair-*`, a Repair-specific catalog and qualification
+manifest, deterministic checksum sidecars, the compressed 32 GB retail image,
+and GitHub/Sigstore provenance and qualification bundles. Its manifest lists
+all compiled repair actions separately from the smaller set actually exercised
+by the consolidated QEMU qualification. It explicitly records virtual-only,
+non-physical engineering qualification.
+
+`.github/workflows/release-channel-repair.yml` accepts only those two exact
+qualified artifacts from a successful first-attempt `main` run. It re-runs the
+Repair verifier and Sigstore checks before staging anything, then publishes an
+immutable prerelease under `kernaid-repair-internal-v<VERSION>`. Its independent
+`repair-internal` sequence/hash chain cannot contain Desk or diagnosis-only
+Rescue variants and cannot use `.github/workflows/rescue.yml` provenance. For
+sequence 2 and later, supply the current Repair channel head and the SHA-256 of
+`KernAid-release-channel-repair-v1.json` from that release.
+
+Do not offer Repair artifacts through the retail diagnosis-only download path.
+Promotion here proves only the exact scenarios and action IDs recorded in the
+Repair manifest; physical-machine and production qualification remain separate
+release gates.
 
 The checked-in JSON Schema is
 `tools/release/release-channel.v1.schema.json`. Run the focused local contract

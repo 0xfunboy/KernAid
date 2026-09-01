@@ -1,0 +1,615 @@
+name: release-channel-repair
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Repair engineering version (for example 0.1.0-repair.1)
+        required: true
+        type: string
+      source_commit:
+        description: Exact commit of the successful Repair workflow
+        required: true
+        type: string
+      repair_run_id:
+        description: Successful Rescue Repair workflow run ID
+        required: true
+        type: string
+      sequence:
+        description: Monotonic repair-internal channel sequence
+        required: true
+        default: "1"
+        type: string
+      previous_release_tag:
+        description: Required for sequence > 1
+        required: false
+        type: string
+      previous_manifest_sha256:
+        description: Required for sequence > 1
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  actions: read
+  id-token: write
+  attestations: write
+  artifact-metadata: write
+
+concurrency:
+  group: kernaid-repair-internal-release-channel
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.repository == '0xfunboy/KernAid'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CHANNEL: repair-internal
+      VERSION: ${{ inputs.version }}
+      SOURCE_COMMIT: ${{ inputs.source_commit }}
+      REPAIR_RUN_ID: ${{ inputs.repair_run_id }}
+      CHANNEL_SEQUENCE: ${{ inputs.sequence }}
+      PREVIOUS_RELEASE_TAG: ${{ inputs.previous_release_tag }}
+      PREVIOUS_MANIFEST_SHA256: ${{ inputs.previous_manifest_sha256 }}
+      MANIFEST_FILENAME: KernAid-release-channel-repair-v1.json
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 24.18.0 }
+
+      - name: Validate immutable Repair dispatch inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(node --version)" = "v24.18.0"
+          python3 -I -B - <<'PY'
+          import os
+          import re
+
+          version = os.environ["VERSION"]
+          commit = os.environ["SOURCE_COMMIT"]
+          run_id = os.environ["REPAIR_RUN_ID"]
+          sequence = os.environ["CHANNEL_SEQUENCE"]
+          previous_tag = os.environ.get("PREVIOUS_RELEASE_TAG", "")
+          previous_sha256 = os.environ.get("PREVIOUS_MANIFEST_SHA256", "")
+          if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,63}", version) is None:
+              raise SystemExit("invalid Repair release version")
+          if re.fullmatch(r"[0-9a-f]{40}", commit) is None:
+              raise SystemExit("source commit must be a full lowercase SHA")
+          if re.fullmatch(r"[1-9][0-9]{0,19}", run_id) is None:
+              raise SystemExit("Repair workflow run ID must be positive")
+          if re.fullmatch(r"[1-9][0-9]{0,9}", sequence) is None:
+              raise SystemExit("Repair channel sequence must be positive and bounded")
+          if int(sequence) == 1:
+              if previous_tag or previous_sha256:
+                  raise SystemExit("sequence 1 cannot name a previous Repair release")
+          else:
+              if re.fullmatch(
+                  r"kernaid-repair-internal-v[A-Za-z0-9][A-Za-z0-9._+-]{0,63}",
+                  previous_tag,
+              ) is None:
+                  raise SystemExit("previous Repair release tag is invalid")
+              if re.fullmatch(r"[0-9a-f]{64}", previous_sha256) is None:
+                  raise SystemExit("previous Repair manifest SHA-256 is invalid")
+          PY
+
+      - name: Resolve the exact successful Repair run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          metadata="$RUNNER_TEMP/kernaid-repair-channel-metadata"
+          install -d -m 0700 -- "$metadata"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$REPAIR_RUN_ID" \
+            >"$metadata/repair-run.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$REPAIR_RUN_ID/artifacts?per_page=100" \
+            >"$metadata/repair-artifacts.json"
+          python3 -I -B - "$metadata" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import sys
+
+          root = Path(sys.argv[1])
+          run = json.loads((root / "repair-run.json").read_text(encoding="utf-8"))
+          expected = {
+              "id": int(os.environ["REPAIR_RUN_ID"]),
+              "head_sha": os.environ["SOURCE_COMMIT"],
+              "path": ".github/workflows/rescue-repair-candidate.yml",
+              "status": "completed",
+              "conclusion": "success",
+              "run_attempt": 1,
+              "head_branch": "main",
+          }
+          if any(run.get(field) != value for field, value in expected.items()):
+              raise SystemExit("Repair run is not the exact successful first-attempt main run")
+          inventory = json.loads(
+              (root / "repair-artifacts.json").read_text(encoding="utf-8")
+          )
+          required = {
+              "KernAid-Rescue-Repair-amd64-qualified",
+              "KernAid-Rescue-Repair-amd64-qualified-retail",
+          }
+          names = [
+              item.get("name")
+              for item in inventory.get("artifacts", [])
+              if item.get("expired") is False
+          ]
+          if any(names.count(name) != 1 for name in required):
+              raise SystemExit("qualified Repair artifacts are absent or ambiguous")
+          PY
+
+      - name: Verify the unique published Repair channel head
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          releases="$RUNNER_TEMP/kernaid-repair-internal-releases.jsonl"
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | @base64' >"$releases"
+          python3 -I -B - "$releases" <<'PY'
+          import base64
+          import json
+          import os
+          from pathlib import Path
+          import sys
+
+          published = []
+          for line in Path(sys.argv[1]).read_text(encoding="ascii").splitlines():
+              release = json.loads(base64.b64decode(line, validate=True))
+              tag = release.get("tag_name")
+              if release.get("draft") is False and isinstance(tag, str) and tag.startswith(
+                  "kernaid-repair-internal-v"
+              ):
+                  if not isinstance(release.get("published_at"), str) or not isinstance(
+                      release.get("id"), int
+                  ):
+                      raise SystemExit("published Repair release metadata is invalid")
+                  published.append((release["published_at"], release["id"], tag))
+          sequence = int(os.environ["CHANNEL_SEQUENCE"])
+          if sequence == 1:
+              if published:
+                  raise SystemExit("sequence 1 cannot restart the Repair channel")
+          elif not published or max(published)[2] != os.environ["PREVIOUS_RELEASE_TAG"]:
+              raise SystemExit("previous tag is not the published Repair channel head")
+          PY
+
+      - name: Verify previous Repair anti-rollback link
+        if: inputs.sequence != '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          previous="$RUNNER_TEMP/kernaid-previous-repair-channel"
+          install -d -m 0700 -- "$previous"
+          gh release download "$PREVIOUS_RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "$MANIFEST_FILENAME" \
+            --dir "$previous"
+          python3 -I -B - "$previous/$MANIFEST_FILENAME" <<'PY'
+          import hashlib
+          import importlib.util
+          import json
+          import os
+          from pathlib import Path
+          import sys
+
+          path = Path(sys.argv[1])
+          payload = path.read_bytes()
+          if hashlib.sha256(payload).hexdigest() != os.environ["PREVIOUS_MANIFEST_SHA256"]:
+              raise SystemExit("previous Repair manifest digest does not match")
+          module_path = Path("tools/release/release_channel.py").resolve()
+          spec = importlib.util.spec_from_file_location("kernaid_release_channel", module_path)
+          if spec is None or spec.loader is None:
+              raise SystemExit("release-channel verifier is unavailable")
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          document = module.validate_manifest(json.loads(payload.decode("ascii")))
+          if module.canonical_bytes(document) != payload:
+              raise SystemExit("previous Repair manifest is not canonical")
+          if document["channel"] != "repair-internal":
+              raise SystemExit("previous manifest belongs to another channel")
+          if document["sequence"] != int(os.environ["CHANNEL_SEQUENCE"]) - 1:
+              raise SystemExit("previous Repair manifest sequence is not contiguous")
+          PY
+
+      - name: Download exact immutable Repair artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          metadata="$RUNNER_TEMP/kernaid-repair-channel-metadata"
+          staging="$RUNNER_TEMP/kernaid-repair-channel-assets"
+          install -d -m 0755 -- "$staging"
+          artifact_id() {
+            python3 -I -B - "$metadata/repair-artifacts.json" "$1" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+          items = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))["artifacts"]
+          matches = [item for item in items if item.get("name") == sys.argv[2] and item.get("expired") is False]
+          if len(matches) != 1 or not isinstance(matches[0].get("id"), int):
+              raise SystemExit("required Repair artifact is absent or ambiguous")
+          print(matches[0]["id"])
+          PY
+          }
+          download_zip() {
+            local id temporary output
+            id="$(artifact_id "$1")"
+            output="$2"
+            temporary="$staging/.${output}.partial"
+            gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" >"$temporary"
+            python3 -I -B - "$temporary" <<'PY'
+          from pathlib import Path
+          import stat
+          import sys
+          path = Path(sys.argv[1])
+          details = path.lstat()
+          if (
+              not stat.S_ISREG(details.st_mode)
+              or details.st_nlink != 1
+              or not 0 < details.st_size <= 32 * 1024 * 1024 * 1024
+          ):
+              raise SystemExit("downloaded Repair artifact archive is unsafe")
+          with path.open("rb") as stream:
+              if stream.read(4) != b"PK\x03\x04":
+                  raise SystemExit("downloaded Repair artifact is not a ZIP")
+          PY
+            chmod 0644 -- "$temporary"
+            mv -fT -- "$temporary" "$staging/$output"
+          }
+          download_zip KernAid-Rescue-Repair-amd64-qualified \
+            "KernAid-Rescue-Repair-${VERSION}-x86_64-qualified.zip"
+          download_zip KernAid-Rescue-Repair-amd64-qualified-retail \
+            ".KernAid-Rescue-Repair-${VERSION}-x86_64-retail-actions.zip"
+
+      - name: Reverify and stage the qualified Repair payload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          staging="$RUNNER_TEMP/kernaid-repair-channel-assets"
+          archive="$staging/KernAid-Rescue-Repair-${VERSION}-x86_64-qualified.zip"
+          qualified="$RUNNER_TEMP/kernaid-channel-qualified-repair"
+          install -d -m 0700 -- "$qualified"
+          python3 -I -B - "$archive" "$qualified" <<'PY'
+          import os
+          from pathlib import Path, PurePosixPath
+          import shutil
+          import stat
+          import sys
+          import zipfile
+
+          archive, destination = map(Path, sys.argv[1:])
+          expected = {
+              "KernAid-Rescue-Repair-amd64.catalog-entry.json",
+              "KernAid-Rescue-Repair-amd64.iso",
+              "KernAid-Rescue-Repair-amd64.iso.sha256",
+              "KernAid-Rescue-Repair-amd64.provenance.sigstore.json",
+              "KernAid-Rescue-Repair-amd64.qualification.sigstore.json",
+              "KernAid-Rescue-Repair-amd64.qualified.json",
+              "KernAid-Rescue-Repair-amd64-retail.img.xz.sha256",
+              "KernAid-Rescue-Repair-amd64-retail.json",
+              "KernAid-Rescue-Repair-amd64-retail.qualification.sigstore.json",
+              "kernaid-rescue-repair-bios.sanitized.log",
+              "kernaid-rescue-repair-qualification-batch.sanitized.log",
+              "kernaid-rescue-repair-uefi.sanitized.log",
+          }
+          with zipfile.ZipFile(archive) as bundle:
+              members = bundle.infolist()
+              if {item.filename for item in members} != expected:
+                  raise SystemExit("qualified Repair archive members are not exact")
+              if sum(item.file_size for item in members) > 16 * 1024 * 1024 * 1024:
+                  raise SystemExit("qualified Repair archive expands beyond its bound")
+              for item in members:
+                  name = PurePosixPath(item.filename)
+                  mode = item.external_attr >> 16
+                  if len(name.parts) != 1 or item.is_dir() or (mode and not stat.S_ISREG(mode)):
+                      raise SystemExit("qualified Repair archive contains an unsafe member")
+                  with bundle.open(item) as source, (destination / name.name).open("xb") as target:
+                      shutil.copyfileobj(source, target, 4 * 1024 * 1024)
+                      target.flush()
+                      os.fsync(target.fileno())
+          PY
+          retail_archive="$staging/.KernAid-Rescue-Repair-${VERSION}-x86_64-retail-actions.zip"
+          python3 -I -B - "$retail_archive" "$qualified/KernAid-Rescue-Repair-amd64-retail.img.xz" <<'PY'
+          import os
+          from pathlib import Path
+          import shutil
+          import stat
+          import sys
+          import zipfile
+          archive, output = map(Path, sys.argv[1:])
+          expected = "KernAid-Rescue-Repair-amd64-retail.img.xz"
+          with zipfile.ZipFile(archive) as bundle:
+              members = bundle.infolist()
+              if len(members) != 1 or members[0].filename != expected:
+                  raise SystemExit("Repair retail archive members are not exact")
+              member = members[0]
+              mode = member.external_attr >> 16
+              if member.is_dir() or (mode and not stat.S_ISREG(mode)) or not 0 < member.file_size < 1_999_999_999:
+                  raise SystemExit("Repair retail archive member is unsafe")
+              with bundle.open(member) as source, output.open("xb") as target:
+                  shutil.copyfileobj(source, target, 4 * 1024 * 1024)
+                  target.flush()
+                  os.fsync(target.fileno())
+          archive.unlink()
+          PY
+          attempt="$(python3 -I -B -c 'import json,sys; print(json.load(open(sys.argv[1]))["run_attempt"])' \
+            "$RUNNER_TEMP/kernaid-repair-channel-metadata/repair-run.json")"
+          manifest_args=(
+            --repository "$GITHUB_REPOSITORY"
+            --commit "$SOURCE_COMMIT"
+            --run-id "$REPAIR_RUN_ID"
+            --run-attempt "$attempt"
+            --run-url "https://github.com/$GITHUB_REPOSITORY/actions/runs/$REPAIR_RUN_ID"
+            --artifact-version "repair-ci-${REPAIR_RUN_ID}-${attempt}"
+            --iso "$qualified/KernAid-Rescue-Repair-amd64.iso"
+            --checksum "$qualified/KernAid-Rescue-Repair-amd64.iso.sha256"
+            --retail-image "$qualified/KernAid-Rescue-Repair-amd64-retail.img.xz"
+            --retail-checksum "$qualified/KernAid-Rescue-Repair-amd64-retail.img.xz.sha256"
+            --retail-metadata "$qualified/KernAid-Rescue-Repair-amd64-retail.json"
+            --bios-evidence "$qualified/kernaid-rescue-repair-bios.sanitized.log"
+            --uefi-evidence "$qualified/kernaid-rescue-repair-uefi.sanitized.log"
+            --batch-evidence "$qualified/kernaid-rescue-repair-qualification-batch.sanitized.log"
+            --catalog "$qualified/KernAid-Rescue-Repair-amd64.catalog-entry.json"
+          )
+          python3 -I -B tools/build-rescue/repair-qualification.py verify \
+            "${manifest_args[@]}" \
+            --manifest "$qualified/KernAid-Rescue-Repair-amd64.qualified.json"
+          gh attestation verify "$qualified/KernAid-Rescue-Repair-amd64.iso" \
+            -R "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/rescue-repair-candidate.yml" \
+            --source-digest "$SOURCE_COMMIT" --source-ref refs/heads/main
+          for subject in \
+            KernAid-Rescue-Repair-amd64.iso \
+            KernAid-Rescue-Repair-amd64-retail.img.xz; do
+            bundle="$qualified/KernAid-Rescue-Repair-amd64.qualification.sigstore.json"
+            if [[ "$subject" == *retail* ]]; then
+              bundle="$qualified/KernAid-Rescue-Repair-amd64-retail.qualification.sigstore.json"
+            fi
+            gh attestation verify "$qualified/$subject" \
+              -R "$GITHUB_REPOSITORY" --bundle "$bundle" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/rescue-repair-candidate.yml" \
+              --source-digest "$SOURCE_COMMIT" --source-ref refs/heads/main \
+              --predicate-type 'https://kernaid.dev/attestations/rescue-repair-qualified-release/v1'
+          done
+
+          iso_release="$staging/KernAid-Rescue-Repair-${VERSION}-x86_64.iso"
+          retail_release="$staging/KernAid-Rescue-Repair-${VERSION}-x86_64-retail.img.xz"
+          install -m 0644 -- "$qualified/KernAid-Rescue-Repair-amd64.iso" "$iso_release"
+          install -m 0644 -- "$qualified/KernAid-Rescue-Repair-amd64-retail.img.xz" "$retail_release"
+          python3 -I -B - "$qualified" "$iso_release" "$retail_release" <<'PY'
+          import hashlib
+          from pathlib import Path
+          import re
+          import sys
+          qualified, iso, retail = map(Path, sys.argv[1:])
+          pairs = (
+              (qualified / "KernAid-Rescue-Repair-amd64.iso.sha256", iso),
+              (qualified / "KernAid-Rescue-Repair-amd64-retail.img.xz.sha256", retail),
+          )
+          for checksum, artifact in pairs:
+              match = re.fullmatch(rb"([0-9a-f]{64})  [A-Za-z0-9._+-]+\n", checksum.read_bytes())
+              if match is None:
+                  raise SystemExit("qualified Repair checksum is not canonical")
+              digest = hashlib.sha256()
+              with artifact.open("rb") as stream:
+                  for chunk in iter(lambda: stream.read(4 * 1024 * 1024), b""):
+                      digest.update(chunk)
+              expected = match.group(1).decode("ascii")
+              if digest.hexdigest() != expected:
+                  raise SystemExit("versioned Repair asset does not match qualification")
+              Path(str(artifact) + ".sha256").write_text(
+                  f"{expected}  {artifact.name}\n", encoding="ascii"
+              )
+          PY
+
+      - name: Build and verify the canonical Repair channel manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          staging="$RUNNER_TEMP/kernaid-repair-channel-assets"
+          descriptor="$RUNNER_TEMP/kernaid-repair-channel-descriptor.json"
+          output="$staging/$MANIFEST_FILENAME"
+          current="$RUNNER_TEMP/kernaid-current-repair-channel-run.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" >"$current"
+          export KERNAID_CHANNEL_PUBLISHED_AT KERNAID_REPAIR_RUN_ATTEMPT KERNAID_CHANNEL_STAGING
+          KERNAID_CHANNEL_PUBLISHED_AT="$(python3 -I -B -c 'import json,sys; print(json.load(open(sys.argv[1]))["created_at"])' "$current")"
+          KERNAID_REPAIR_RUN_ATTEMPT="$(python3 -I -B -c 'import json,sys; print(json.load(open(sys.argv[1]))["run_attempt"])' "$RUNNER_TEMP/kernaid-repair-channel-metadata/repair-run.json")"
+          KERNAID_CHANNEL_STAGING="$staging"
+          python3 -I -B - "$descriptor" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import sys
+          root = Path(os.environ["KERNAID_CHANNEL_STAGING"])
+          version = os.environ["VERSION"]
+          tag = f"kernaid-repair-internal-v{version}"
+          base = f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/releases/download/{tag}"
+          run = int(os.environ["REPAIR_RUN_ID"])
+          attempt = int(os.environ["KERNAID_REPAIR_RUN_ATTEMPT"])
+          provenance = {
+              "runAttempt": attempt,
+              "runId": run,
+              "workflow": ".github/workflows/rescue-repair-candidate.yml",
+          }
+          filenames = (
+              (f"KernAid-Rescue-Repair-{version}-x86_64-qualified.zip", "image", "application/zip", "repair-qualified-zip"),
+              (f"KernAid-Rescue-Repair-{version}-x86_64.iso", "image", "application/octet-stream", "repair-qualified-iso"),
+              (f"KernAid-Rescue-Repair-{version}-x86_64.iso.sha256", "checksum", "text/plain", "repair-qualified-iso"),
+              (f"KernAid-Rescue-Repair-{version}-x86_64-retail.img.xz", "image", "application/x-xz", "repair-retail-img-xz"),
+              (f"KernAid-Rescue-Repair-{version}-x86_64-retail.img.xz.sha256", "checksum", "text/plain", "repair-retail-img-xz"),
+          )
+          artifacts = [{
+              "architecture": "x86_64",
+              "component": "rescue",
+              "kind": kind,
+              "mediaType": media,
+              "path": str((root / filename).resolve()),
+              "platform": "rescue",
+              "provenance": provenance,
+              "url": f"{base}/{filename}",
+              "variant": variant,
+              "version": version,
+          } for filename, kind, media, variant in filenames]
+          sequence = int(os.environ["CHANNEL_SEQUENCE"])
+          previous = None if sequence == 1 else {
+              "sequence": sequence - 1,
+              "sha256": os.environ["PREVIOUS_MANIFEST_SHA256"],
+          }
+          document = {
+              "artifacts": artifacts,
+              "channel": "repair-internal",
+              "previous": previous,
+              "publishedAt": os.environ["KERNAID_CHANNEL_PUBLISHED_AT"],
+              "schema": "dev.kernaid.release-channel-input.v1",
+              "sequence": sequence,
+              "source": {"commit": os.environ["SOURCE_COMMIT"], "repository": os.environ["GITHUB_REPOSITORY"]},
+          }
+          Path(sys.argv[1]).write_text(
+              json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n",
+              encoding="ascii",
+          )
+          PY
+          python3 -I -B tools/release/release_channel.py create \
+            --descriptor "$descriptor" --output "$output"
+          python3 -I -B tools/release/release_channel.py verify \
+            --manifest "$output" --artifact-root "$staging"
+
+      - name: Attest the complete Repair channel
+        id: attest_repair_channel
+        uses: actions/attest@v4
+        with:
+          subject-path: ${{ runner.temp }}/kernaid-repair-channel-assets/*
+      - name: Add the Repair channel attestation bundle
+        run: |
+          install -m 0644 -- \
+            "${{ steps.attest_repair_channel.outputs.bundle-path }}" \
+            "$RUNNER_TEMP/kernaid-repair-channel-assets/KernAid-release-channel-repair-v1.sigstore.json"
+
+      - name: Publish the immutable Repair prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="kernaid-repair-internal-v${VERSION}"
+          release_exists=0
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            release_exists=1
+          fi
+          if ! git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f ref="refs/tags/$tag" -f sha="$SOURCE_COMMIT" >/dev/null
+          fi
+          observed="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq 'select(.object.type == "commit") | .object.sha')"
+          if [[ "$observed" != "$SOURCE_COMMIT" ]]; then
+            echo "Repair tag is not the exact lightweight source ref" >&2
+            exit 1
+          fi
+          notes="$RUNNER_TEMP/kernaid-repair-release-notes.md"
+          printf '%s\n' \
+            "KernAid Repair engineering channel sequence ${CHANNEL_SEQUENCE}." \
+            "" \
+            "This image has repair actions enabled. It is never the diagnosis-only retail Rescue product." \
+            "Qualification is virtual and action-scoped; it does not claim physical or production qualification." \
+            "Source commit: ${SOURCE_COMMIT}" \
+            "Repair run: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${REPAIR_RUN_ID}" \
+            >"$notes"
+          python3 -I -B - "$RUNNER_TEMP/kernaid-repair-channel-assets" <<'PY'
+          from pathlib import Path
+          import stat
+          import sys
+          for path in Path(sys.argv[1]).iterdir():
+              details = path.lstat()
+              if not stat.S_ISREG(details.st_mode) or details.st_nlink != 1 or not 0 < details.st_size < 1_999_999_999:
+                  raise SystemExit("staged Repair release asset is unsafe")
+          PY
+          if [[ "$release_exists" == 0 ]]; then
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --verify-tag \
+              --title "KernAid Repair ${VERSION} — engineering candidate" \
+              --notes-file "$notes" --draft --prerelease \
+              "$RUNNER_TEMP"/kernaid-repair-channel-assets/*
+          fi
+          draft="$RUNNER_TEMP/kernaid-repair-channel-draft.json"
+          inventory="$RUNNER_TEMP/kernaid-repair-channel-drafts.jsonl"
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | @base64' >"$inventory"
+          python3 -I -B - "$inventory" "$tag" >"$draft" <<'PY'
+          import base64
+          import json
+          from pathlib import Path
+          import sys
+          matches = [
+              json.loads(base64.b64decode(line, validate=True))
+              for line in Path(sys.argv[1]).read_text(encoding="ascii").splitlines()
+          ]
+          matches = [item for item in matches if item.get("tag_name") == sys.argv[2]]
+          if len(matches) != 1:
+              raise SystemExit("Repair release draft is absent or ambiguous")
+          print(json.dumps(matches[0], sort_keys=True, separators=(",", ":")))
+          PY
+          python3 -I -B - "$draft" "$RUNNER_TEMP/kernaid-repair-channel-assets" "$tag" <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import stat
+          import sys
+          release = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          root = Path(sys.argv[2])
+          if (
+              release.get("tag_name") != sys.argv[3]
+              or release.get("draft") is not True
+              or release.get("prerelease") is not True
+              or release.get("name")
+              != f"KernAid Repair {os.environ['VERSION']} — engineering candidate"
+          ):
+              raise SystemExit("Repair release draft identity is invalid")
+          expected = {}
+          for path in root.iterdir():
+              details = path.lstat()
+              if not stat.S_ISREG(details.st_mode) or details.st_nlink != 1:
+                  raise SystemExit("Repair release asset identity is unsafe")
+              digest = hashlib.sha256()
+              with path.open("rb") as stream:
+                  for chunk in iter(lambda: stream.read(4 * 1024 * 1024), b""):
+                      digest.update(chunk)
+              expected[path.name] = (details.st_size, f"sha256:{digest.hexdigest()}")
+          observed = {
+              item.get("name"): (item.get("size"), item.get("digest"))
+              for item in release.get("assets", []) if isinstance(item, dict)
+          }
+          if observed != expected:
+              raise SystemExit("Repair release draft assets do not match staging")
+          PY
+          gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --verify-tag --draft=false
+          published="$RUNNER_TEMP/kernaid-repair-channel-published.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" >"$published"
+          python3 -I -B - "$published" "$tag" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+          release = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if release.get("tag_name") != sys.argv[2] or release.get("draft") is not False or release.get("prerelease") is not True or release.get("immutable") is not True:
+              raise SystemExit("published Repair release is not the exact immutable prerelease")
+          PY
+
+      - name: Retain the exact published Repair channel
+        uses: actions/upload-artifact@v4
+        with:
+          name: KernAid-release-channel-repair-${{ inputs.version }}
+          path: ${{ runner.temp }}/kernaid-repair-channel-assets
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0

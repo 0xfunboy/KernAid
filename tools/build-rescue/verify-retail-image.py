@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -I
-"""Verify and describe the fixed 32 GB compressed Windows retail image."""
+"""Verify and describe a fixed 32 GB compressed Rescue retail image."""
 
 from __future__ import annotations
 
@@ -12,9 +12,24 @@ from pathlib import Path
 import stat
 import sys
 
-RAW_NAME = "KernAid-Rescue-amd64-retail.img"
+NAMES = {
+    "diagnosis": {
+        "iso": "KernAid-Rescue-amd64.iso",
+        "raw": "KernAid-Rescue-amd64-retail.img",
+        "metadata": "KernAid-Rescue-amd64-retail.json",
+        "schema": "dev.kernaid.rescue-retail-image.v1",
+    },
+    "repair": {
+        "iso": "KernAid-Rescue-Repair-amd64.iso",
+        "raw": "KernAid-Rescue-Repair-amd64-retail.img",
+        "metadata": "KernAid-Rescue-Repair-amd64-retail.json",
+        "schema": "dev.kernaid.rescue-repair-retail-image.v1",
+    },
+}
+# Compatibility aliases for callers and tests of the diagnosis-only product.
+RAW_NAME = NAMES["diagnosis"]["raw"]
 XZ_NAME = f"{RAW_NAME}.xz"
-METADATA_NAME = "KernAid-Rescue-amd64-retail.json"
+METADATA_NAME = NAMES["diagnosis"]["metadata"]
 RAW_BYTES = 32_000_000_000
 P3_START = 17_179_869_184
 P3_BYTES = 8_589_934_592
@@ -46,9 +61,15 @@ def digest_file(path: Path) -> tuple[int, str]:
     return size, digest.hexdigest()
 
 
-def verify(iso: Path, archive: Path) -> dict[str, object]:
-    iso_entry = regular(iso, "KernAid-Rescue-amd64.iso")
-    archive_entry = regular(archive, XZ_NAME)
+def verify(iso: Path, archive: Path, variant: str = "diagnosis") -> dict[str, object]:
+    try:
+        names = NAMES[variant]
+    except KeyError:
+        fail("retail image variant is unsupported")
+    raw_name = names["raw"]
+    archive_name = f"{raw_name}.xz"
+    iso_entry = regular(iso, names["iso"])
+    archive_entry = regular(archive, archive_name)
     if iso_entry.st_size >= P3_START or archive_entry.st_size > MAX_COMPRESSED_BYTES:
         fail("ISO or compressed retail image size is outside fixed bounds")
     iso_size, iso_sha256 = digest_file(iso)
@@ -89,7 +110,11 @@ def verify(iso: Path, archive: Path) -> dict[str, object]:
     if p3_sha256 != P3_ZERO_SHA256:
         fail("retail p3 does not match the fixed 8 GiB zero digest")
     return {
-        "compressed": {"bytes": compressed_size, "name": XZ_NAME, "sha256": compressed_sha256},
+        "compressed": {
+            "bytes": compressed_size,
+            "name": archive_name,
+            "sha256": compressed_sha256,
+        },
         "isoPrefix": {"bytes": iso_size, "sha256": iso_sha256},
         "p3": {
             "bytes": P3_BYTES,
@@ -97,8 +122,8 @@ def verify(iso: Path, archive: Path) -> dict[str, object]:
             "startBytes": P3_START,
             "zero": True,
         },
-        "raw": {"bytes": RAW_BYTES, "name": RAW_NAME, "sha256": raw_digest.hexdigest()},
-        "schema": "dev.kernaid.rescue-retail-image.v1",
+        "raw": {"bytes": RAW_BYTES, "name": raw_name, "sha256": raw_digest.hexdigest()},
+        "schema": names["schema"],
         "tailZero": True,
     }
 
@@ -112,11 +137,15 @@ def main() -> int:
     parser.add_argument("--iso", required=True, type=Path)
     parser.add_argument("--archive", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument(
+        "--variant", choices=tuple(NAMES), default="diagnosis", help="product boundary"
+    )
     arguments = parser.parse_args()
     try:
-        if not arguments.output.is_absolute() or arguments.output.name != METADATA_NAME:
+        expected_metadata = NAMES[arguments.variant]["metadata"]
+        if not arguments.output.is_absolute() or arguments.output.name != expected_metadata:
             fail("retail metadata path or filename is not exact")
-        payload = canonical(verify(arguments.iso, arguments.archive))
+        payload = canonical(verify(arguments.iso, arguments.archive, arguments.variant))
         descriptor = os.open(arguments.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o644)
         try:
             view = memoryview(payload)

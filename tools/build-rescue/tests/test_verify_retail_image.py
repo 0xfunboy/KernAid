@@ -71,6 +71,25 @@ class VerifyRetailImageTests(unittest.TestCase):
         self.assertEqual(self.archive.read_bytes(), second.read_bytes())
         self.module.verify(self.iso, self.archive)
 
+    def test_repair_variant_has_distinct_names_and_schema(self) -> None:
+        repair_iso = self.root / "KernAid-Rescue-Repair-amd64.iso"
+        repair_archive = self.root / "KernAid-Rescue-Repair-amd64-retail.img.xz"
+        repair_iso.write_bytes(self.iso.read_bytes())
+        raw = repair_iso.read_bytes().ljust(self.module.RAW_BYTES, b"\0")
+        with lzma.open(
+            repair_archive, "wb", preset=6, check=lzma.CHECK_SHA256
+        ) as output:
+            output.write(raw)
+        metadata = self.module.verify(repair_iso, repair_archive, "repair")
+        self.assertEqual(
+            metadata["schema"], "dev.kernaid.rescue-repair-retail-image.v1"
+        )
+        self.assertEqual(
+            metadata["raw"]["name"], "KernAid-Rescue-Repair-amd64-retail.img"
+        )
+        with self.assertRaisesRegex(RuntimeError, "filename is not exact"):
+            self.module.verify(repair_iso, repair_archive)
+
 
 if __name__ == "__main__":
     unittest.main()
