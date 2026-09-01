@@ -57,9 +57,9 @@ Integrated in current source, but not automatically qualified or promoted:
 - live Fleet schema v12 with active offline commercial licensing and scheduled
   signed, WAL-safe, independently verified backup bundles; and
 - a gated private software catalog that now publishes the reviewed Media
-  Creator, Linux Resident and Windows Resident engineering artifacts with
-  exact provenance, digest, qualification and unsigned-state metadata; the
-  dual-architecture macOS slot remains closed.
+  Creator and Linux, Windows and dual-architecture macOS Resident engineering
+  artifacts with exact provenance, digest, qualification and unsigned-state
+  metadata.
 
 The latest diagnostic candidate, Rescue run `33447510598`, passed the core
 build/boot/render/input/two-boot gates but failed all three Vault jobs at the

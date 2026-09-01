@@ -74,7 +74,7 @@ dependencies.
 | `KAID_LINUX_FLEET_RESIDENT_SHA256_PATH` | No | `${KAID_LINUX_FLEET_RESIDENT_PATH}.sha256` |
 | `KAID_WINDOWS_FLEET_RESIDENT_PATH` | No; required only after the exact bundle is enabled in `content.json` | No default |
 | `KAID_WINDOWS_FLEET_RESIDENT_SHA256_PATH` | No | `${KAID_WINDOWS_FLEET_RESIDENT_PATH}.sha256` |
-| `KAID_MACOS_FLEET_RESIDENT_PATH` | No; reserved until an exact macOS package is reviewed | No default |
+| `KAID_MACOS_FLEET_RESIDENT_PATH` | No; required only after an exact macOS multi-architecture catalog is reviewed | No default |
 | `KAID_MACOS_FLEET_RESIDENT_SHA256_PATH` | No | `${KAID_MACOS_FLEET_RESIDENT_PATH}.sha256` |
 
 The authentication file must contain one non-empty password. Keep it and any
