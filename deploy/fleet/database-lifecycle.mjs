@@ -114,6 +114,7 @@ async function createSignedBundle(
     } finally {
       sourceDatabase.close();
     }
+    makeStandaloneDatabase(databasePath);
     const databaseSummary = verifyDatabase(databasePath);
     const digest = await hashFile(databasePath);
     const manifest = {
@@ -162,6 +163,37 @@ async function createSignedBundle(
     if (!published) removeKnownBundle(staging);
     throw error;
   }
+}
+
+function makeStandaloneDatabase(path) {
+  assertSecureFile(path, "backup database", true);
+  const database = new DatabaseSync(path, { timeout: 5_000 });
+  try {
+    const journalMode = database
+      .prepare("PRAGMA journal_mode = DELETE")
+      .get()?.journal_mode;
+    if (journalMode !== "delete") {
+      fail("backup database could not enter standalone journal mode");
+    }
+  } finally {
+    database.close();
+  }
+  for (const suffix of ["-shm", "-wal"]) {
+    const sidecar = `${path}${suffix}`;
+    if (!existsSync(sidecar)) continue;
+    assertSecureFile(sidecar, "backup database sidecar", true);
+    removeFile(sidecar);
+  }
+  const descriptor = openSync(
+    path,
+    constants.O_RDONLY | constants.O_NOFOLLOW,
+  );
+  try {
+    fsyncSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
+  syncDirectory(dirname(path));
 }
 
 async function verifySignedBundle(bundleArgument, trustAnchorArgument) {
