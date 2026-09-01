@@ -39,6 +39,35 @@ never claim otherwise.
 | 6 | Installable Resident services, trusted catalog, public/private site, operator and recovery documentation |
 | 7 | Final integrated qualification, exact artifact promotion and release-candidate publication |
 
+## Checkpoint — 1 September 2026
+
+Integrated in current source, but not automatically qualified or promoted:
+
+- four off-default Rescue repair actions, including resolver-link restoration,
+  plus a local-only Fleet-to-Rescue `fstab` intent adapter that still requires
+  fresh target/evidence-bound approval;
+- a disabled-by-default Linux Resident `.deb` containing sync, R0 work orders,
+  signed update staging and the UEFI/systemd-boot A/B activator;
+- the off-default Windows R0 Resident and its explicitly unsigned deployment
+  ZIP workflow;
+- the Windows Media Creator wizard, which verifies an offline-signed exact
+  release bundle while its EXE/ZIP remains unsigned pending Authenticode;
+- live Fleet schema v11 with active offline commercial licensing and scheduled
+  signed, WAL-safe, independently verified backup bundles; and
+- a gated private software catalog that publishes no slot without exact
+  provenance, digest, qualification and signature-state metadata.
+
+The latest diagnostic candidate, Rescue run `33447510598`, passed the core
+build/boot/render/input/two-boot gates but failed all three Vault jobs at the
+same first-boot confirmation timeout. The tty1 activation correction is in
+current source and has not yet been qualified in a newer ISO. Stable
+`0.1.0-internal.6` therefore remains unchanged.
+
+The fastest remaining path is one consolidated source push, one combined
+Rescue/Desktop/repair milestone matrix, parallel software-package workflows,
+then exact artifact review and promotion. Repeated unchanged tests are not part
+of this plan.
+
 ## RC completion gate
 
 - Consumer download, checksum and writer instructions point to the same exact
