@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import type { RescueOfflineInspection, RescueTargetSelection } from "./native";
 import {
-  FLEET_FSTAB_CONFIRMATION,
   FleetRescueClient,
   FleetRescueUnavailableError,
+  fleetRescueAction,
   type FleetRescueIntent,
 } from "./fleet-rescue-repair";
 import {
@@ -100,6 +100,7 @@ export function FleetRescueRepairPanel({
   ]);
 
   if (intent === undefined || intent === null) return null;
+  const action = fleetRescueAction(intent.actionId);
 
   async function stage(): Promise<void> {
     if (
@@ -133,7 +134,7 @@ export function FleetRescueRepairPanel({
     if (
       intent === undefined ||
       intent === null ||
-      confirmation !== FLEET_FSTAB_CONFIRMATION ||
+      confirmation !== intent.confirmationRequired ||
       busy
     )
       return;
@@ -179,7 +180,9 @@ export function FleetRescueRepairPanel({
           <small>FLEET · INTENTO REMOTO, AUTORITÀ LOCALE</small>
           <h2>Riparazione proposta per questo dispositivo</h2>
         </div>
-        <span>R2 · FSTAB</span>
+        <span>
+          {intent.risk} · {action.label}
+        </span>
       </div>
       <p className="rescue-repair-state">
         Fleet ha richiesto una sola azione nota. Non verrà eseguita finché
@@ -233,7 +236,7 @@ export function FleetRescueRepairPanel({
           <>
             <label className="rescue-repair-confirmation">
               Nuova approvazione locale: scrivi esattamente
-              <code>{FLEET_FSTAB_CONFIRMATION}</code>
+              <code>{intent.confirmationRequired}</code>
               <input
                 autoComplete="off"
                 spellCheck={false}
@@ -248,7 +251,7 @@ export function FleetRescueRepairPanel({
               </button>
               <button
                 className="rescue-repair-primary"
-                disabled={busy || confirmation !== FLEET_FSTAB_CONFIRMATION}
+                disabled={busy || confirmation !== intent.confirmationRequired}
                 onClick={() => void approve()}
               >
                 Approva questo piano

@@ -55,6 +55,22 @@ test("readiness, actions, receipt labels, and minimized response are fail closed
       "linux.boot-critical-path.v1",
     ],
   );
+  assert.deepEqual(
+    workOrderActionsForPlatform("rescue").map((action) => [
+      action.actionId,
+      action.risk,
+      action.localApprovalRequired,
+    ]),
+    [
+      ["linux.filesystem.health.v1", "R0", false],
+      ["linux.storage.health.v1", "R0", false],
+      ["linux.boot-critical-path.v1", "R0", false],
+      ["linux.fstab.disable-missing-uuid.v1", "R2", true],
+      ["linux.crypttab.disable-missing-uuid.v1", "R2", true],
+      ["linux.ext4.fsck-preen-with-undo.v1", "R3", true],
+      ["linux.network.restore-resolver-link.v1", "R2", true],
+    ],
+  );
   assert.equal(
     workOrderReadiness({
       actionId: "linux.fstab.disable-missing-uuid.v1",

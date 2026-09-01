@@ -11,6 +11,11 @@ rescue-fstab-handoff = [
   "kernaid-core/rescue-fstab-production-candidate",
   "kernaid-linux-pack/rescue-fstab-production-candidate",
 ]
+rescue-repair-handoff = [
+  "rescue-fstab-handoff",
+  "kernaid-core/rescue-crypttab-production-candidate",
+  "kernaid-linux-pack/rescue-crypttab-production-candidate",
+]
 linux-service = [
   "dep:fs2",
   "dep:kernaid-linux-pack",

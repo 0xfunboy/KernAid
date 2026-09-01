@@ -33,6 +33,12 @@ pub enum WorkOrderActionId {
     LinuxBootCriticalPathV1,
     #[serde(rename = "linux.fstab.disable-missing-uuid.v1")]
     LinuxFstabDisableMissingUuidV1,
+    #[serde(rename = "linux.crypttab.disable-missing-uuid.v1")]
+    LinuxCrypttabDisableMissingUuidV1,
+    #[serde(rename = "linux.ext4.fsck-preen-with-undo.v1")]
+    LinuxExt4FsckPreenWithUndoV1,
+    #[serde(rename = "linux.network.restore-resolver-link.v1")]
+    LinuxNetworkRestoreResolverLinkV1,
     #[serde(rename = "windows.p0.diagnose.v1")]
     WindowsP0DiagnoseV1,
     #[serde(rename = "macos.p0.diagnose.v1")]
@@ -47,6 +53,9 @@ impl WorkOrderActionId {
             Self::LinuxStorageHealthV1 => "linux.storage.health.v1",
             Self::LinuxBootCriticalPathV1 => "linux.boot-critical-path.v1",
             Self::LinuxFstabDisableMissingUuidV1 => "linux.fstab.disable-missing-uuid.v1",
+            Self::LinuxCrypttabDisableMissingUuidV1 => "linux.crypttab.disable-missing-uuid.v1",
+            Self::LinuxExt4FsckPreenWithUndoV1 => "linux.ext4.fsck-preen-with-undo.v1",
+            Self::LinuxNetworkRestoreResolverLinkV1 => "linux.network.restore-resolver-link.v1",
             Self::WindowsP0DiagnoseV1 => "windows.p0.diagnose.v1",
             Self::MacosP0DiagnoseV1 => "macos.p0.diagnose.v1",
         }
@@ -66,10 +75,19 @@ impl WorkOrderActionId {
                 local_approval_required: false,
                 required_feature: WorkOrderRequiredFeature::Fleet,
             },
-            Self::LinuxFstabDisableMissingUuidV1 => WorkOrderActionMetadata {
+            Self::LinuxFstabDisableMissingUuidV1
+            | Self::LinuxCrypttabDisableMissingUuidV1
+            | Self::LinuxNetworkRestoreResolverLinkV1 => WorkOrderActionMetadata {
                 version: 1,
                 kind: WorkOrderKind::Repair,
                 risk: WorkOrderRisk::R2,
+                local_approval_required: true,
+                required_feature: WorkOrderRequiredFeature::EnterpriseRepair,
+            },
+            Self::LinuxExt4FsckPreenWithUndoV1 => WorkOrderActionMetadata {
+                version: 1,
+                kind: WorkOrderKind::Repair,
+                risk: WorkOrderRisk::R3,
                 local_approval_required: true,
                 required_feature: WorkOrderRequiredFeature::EnterpriseRepair,
             },
@@ -92,6 +110,9 @@ impl FromStr for WorkOrderActionId {
             "linux.storage.health.v1" => Ok(Self::LinuxStorageHealthV1),
             "linux.boot-critical-path.v1" => Ok(Self::LinuxBootCriticalPathV1),
             "linux.fstab.disable-missing-uuid.v1" => Ok(Self::LinuxFstabDisableMissingUuidV1),
+            "linux.crypttab.disable-missing-uuid.v1" => Ok(Self::LinuxCrypttabDisableMissingUuidV1),
+            "linux.ext4.fsck-preen-with-undo.v1" => Ok(Self::LinuxExt4FsckPreenWithUndoV1),
+            "linux.network.restore-resolver-link.v1" => Ok(Self::LinuxNetworkRestoreResolverLinkV1),
             "windows.p0.diagnose.v1" => Ok(Self::WindowsP0DiagnoseV1),
             "macos.p0.diagnose.v1" => Ok(Self::MacosP0DiagnoseV1),
             _ => Err(FleetClientError::InvalidField("actionId")),
@@ -912,6 +933,28 @@ mod tests {
         claim
             .import_response(&serde_json::to_vec(&approved).expect("approved response"))
             .expect("approved write order");
+    }
+
+    #[test]
+    fn rescue_repair_catalog_has_exact_risk_and_local_approval_contracts() {
+        for (wire_name, risk) in [
+            ("linux.fstab.disable-missing-uuid.v1", WorkOrderRisk::R2),
+            ("linux.crypttab.disable-missing-uuid.v1", WorkOrderRisk::R2),
+            ("linux.ext4.fsck-preen-with-undo.v1", WorkOrderRisk::R3),
+            ("linux.network.restore-resolver-link.v1", WorkOrderRisk::R2),
+        ] {
+            let action: WorkOrderActionId = wire_name.parse().expect("catalog action");
+            let metadata = action.metadata();
+            assert_eq!(action.wire_name(), wire_name);
+            assert_eq!(metadata.version, 1);
+            assert_eq!(metadata.kind, WorkOrderKind::Repair);
+            assert_eq!(metadata.risk, risk);
+            assert!(metadata.local_approval_required);
+            assert_eq!(
+                metadata.required_feature,
+                WorkOrderRequiredFeature::EnterpriseRepair
+            );
+        }
     }
 
     #[test]

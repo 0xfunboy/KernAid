@@ -35,7 +35,7 @@ use zeroize::Zeroizing;
 pub mod linux;
 #[cfg(all(feature = "macos-service", any(target_os = "macos", test)))]
 pub mod macos;
-#[cfg(feature = "rescue-fstab-handoff")]
+#[cfg(any(feature = "rescue-fstab-handoff", feature = "rescue-repair-handoff"))]
 pub mod rescue;
 #[cfg(all(feature = "windows-service", any(windows, test)))]
 pub mod windows;
@@ -1070,7 +1070,17 @@ const fn action_supported(action: WorkOrderActionId, platform: ResidentPlatform)
         }
         WorkOrderActionId::LinuxFstabDisableMissingUuidV1 => {
             matches!(platform, ResidentPlatform::Rescue)
-                && cfg!(any(test, feature = "rescue-fstab-handoff"))
+                && cfg!(any(
+                    test,
+                    feature = "rescue-fstab-handoff",
+                    feature = "rescue-repair-handoff"
+                ))
+        }
+        WorkOrderActionId::LinuxCrypttabDisableMissingUuidV1
+        | WorkOrderActionId::LinuxExt4FsckPreenWithUndoV1
+        | WorkOrderActionId::LinuxNetworkRestoreResolverLinkV1 => {
+            matches!(platform, ResidentPlatform::Rescue)
+                && cfg!(any(test, feature = "rescue-repair-handoff"))
         }
         WorkOrderActionId::WindowsP0DiagnoseV1 => matches!(platform, ResidentPlatform::Windows),
         WorkOrderActionId::MacosP0DiagnoseV1 => matches!(platform, ResidentPlatform::Macos),

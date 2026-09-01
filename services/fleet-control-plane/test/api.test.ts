@@ -609,6 +609,7 @@ function signedPolicy(
     retentionDays?: number;
     allowedActionIds?: string[];
     deniedActionIds?: string[];
+    maxRisk?: SignedPolicyBundleUnsigned["rules"]["maxRisk"];
   },
 ): SignedPolicyBundle {
   const nowSeconds = Math.floor(INITIAL_TIME / 1000);
@@ -623,7 +624,7 @@ function signedPolicy(
     expiresAtUnix: nowSeconds + 172_800,
     assignments: input.assignments,
     rules: {
-      maxRisk: "R2",
+      maxRisk: input.maxRisk ?? "R2",
       localApprovalFrom: "R1",
       allowedActionIds: input.allowedActionIds ?? [
         "linux.fstab.disable-missing-uuid.v1",
@@ -1816,7 +1817,7 @@ test("console login is exact, tenant-bound, and rate limited with bounded state"
   }
 });
 
-test("SQLite v6 migrates its tenant administrator through Fleet v12", async () => {
+test("SQLite v6 migrates its tenant administrator through Fleet v13", async () => {
   let harness = await createHarness();
   const directory = harness.directory;
   const now = harness.now;
@@ -1858,7 +1859,7 @@ test("SQLite v6 migrates its tenant administrator through Fleet v12", async () =
     const version = database.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    assert.equal(version.user_version, 12);
+    assert.equal(version.user_version, 13);
     database.close();
   } finally {
     await destroyHarness(harness);
@@ -3034,7 +3035,7 @@ test("policy anchor, bundle, and assignment survive SQLite restart", async () =>
     const version = database.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    assert.equal(version.user_version, 12);
+    assert.equal(version.user_version, 13);
     const nonce = database
       .prepare(
         `SELECT nonce_sha256 FROM policy_pull_nonces
@@ -3337,7 +3338,7 @@ test("signed entitlement pulls isolate assignments and reject replay, key mismat
   }
 });
 
-test("SQLite v3 migrates through v12 and entitlement checkpoints survive restart", async () => {
+test("SQLite v3 migrates through v13 and entitlement checkpoints survive restart", async () => {
   let harness = await createHarness();
   const directory = harness.directory;
   const now = harness.now;
@@ -3416,7 +3417,7 @@ test("SQLite v3 migrates through v12 and entitlement checkpoints survive restart
     const version = database.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    assert.equal(version.user_version, 12);
+    assert.equal(version.user_version, 13);
     const document = database
       .prepare(
         `SELECT highest_sequence, envelope_sha256, canonical_json
@@ -3642,7 +3643,7 @@ test("signed update pulls bind target and ring, filter eligibility, and reject r
   }
 });
 
-test("SQLite v4 migrates through v12 and update checkpoints survive restart", async () => {
+test("SQLite v4 migrates through v13 and update checkpoints survive restart", async () => {
   let harness = await createHarness();
   const directory = harness.directory;
   const now = harness.now;
@@ -3696,7 +3697,7 @@ test("SQLite v4 migrates through v12 and update checkpoints survive restart", as
     const version = database.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    assert.equal(version.user_version, 12);
+    assert.equal(version.user_version, 13);
     const checkpoint = database
       .prepare(
         `SELECT highest_sequence, manifest_sha256
@@ -3839,7 +3840,7 @@ test("tenant governance status is bounded, minimized, and admin-scoped", async (
   }
 });
 
-test("SQLite v11 work orders migrate to v12 without losing Windows P0", async () => {
+test("SQLite v11 work orders migrate through v13 without losing Windows P0", async () => {
   let harness = await createHarness();
   const directory = harness.directory;
   const now = harness.now;
@@ -3915,7 +3916,7 @@ test("SQLite v11 work orders migrate to v12 without losing Windows P0", async ()
     const version = database.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    assert.equal(version.user_version, 12);
+    assert.equal(version.user_version, 13);
     const schema = database
       .prepare(
         "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'work_orders'",
@@ -3926,11 +3927,135 @@ test("SQLite v11 work orders migrate to v12 without losing Windows P0", async ()
       "linux.filesystem.health.v1",
       "linux.storage.health.v1",
       "linux.fstab.disable-missing-uuid.v1",
+      "linux.crypttab.disable-missing-uuid.v1",
+      "linux.ext4.fsck-preen-with-undo.v1",
+      "linux.network.restore-resolver-link.v1",
       "windows.p0.diagnose.v1",
       "macos.p0.diagnose.v1",
     ]) {
       assert.ok(schema.sql.includes(`'${actionId}'`));
     }
+    database.close();
+  } finally {
+    await destroyHarness(harness);
+  }
+});
+
+test("Fleet v13 persists every governed Rescue repair action", async () => {
+  const harness = await createHarness();
+  try {
+    const tenant = await createTenant(harness);
+    const operator = await createAccessCredential(
+      harness,
+      tenant,
+      "operator",
+      "Rescue repair desk",
+    );
+    const device = await enroll(
+      harness,
+      tenant,
+      "rescue-repair-device",
+      "rescue",
+    );
+    const signer = makePolicySigner();
+    const actions = [
+      {
+        actionId: "linux.crypttab.disable-missing-uuid.v1",
+        risk: "R2",
+      },
+      {
+        actionId: "linux.ext4.fsck-preen-with-undo.v1",
+        risk: "R3",
+      },
+      {
+        actionId: "linux.fstab.disable-missing-uuid.v1",
+        risk: "R2",
+      },
+      {
+        actionId: "linux.network.restore-resolver-link.v1",
+        risk: "R2",
+      },
+    ] as const;
+
+    assert.equal((await setPolicyAnchor(harness, tenant, signer)).status, 201);
+    assert.equal(
+      (
+        await publishPolicy(
+          harness,
+          tenant,
+          signedPolicy(tenant, signer, {
+            policyId: "rescue-repair-actions",
+            revision: 1,
+            assignments: { deviceIds: [device.deviceId] },
+            allowedActionIds: actions.map(({ actionId }) => actionId),
+            maxRisk: "R3",
+          }),
+        )
+      ).status,
+      201,
+    );
+    assert.equal(
+      (
+        await publishEntitlement(
+          harness,
+          tenant,
+          signedEntitlement(tenant, [device.deviceId], {
+            entitlementId: "rescue_repair_actions_license",
+            sequence: 1,
+          }),
+        )
+      ).status,
+      201,
+    );
+
+    const expiresAt = new Date(harness.now.value + 3_600_000).toISOString();
+    for (const [index, action] of actions.entries()) {
+      const created = await api(
+        harness,
+        "POST",
+        `/v1/tenants/${tenant.tenantId}/work-orders`,
+        {
+          requestId: `rescue-repair-${index}`,
+          targetDeviceId: device.deviceId,
+          actionId: action.actionId,
+          actionVersion: 1,
+          expiresAt,
+        },
+        operator.accessToken,
+      );
+      assert.equal(created.status, 201);
+      assert.equal(created.body.actionId, action.actionId);
+      assert.equal(created.body.kind, "repair");
+      assert.equal(created.body.risk, action.risk);
+      assert.equal(created.body.localApprovalRequired, true);
+      assert.equal(created.body.status, "pending_approval");
+    }
+
+    const database = new DatabaseSync(harness.databasePath, { readOnly: true });
+    const stored = database
+      .prepare(
+        `SELECT action_id, risk, local_approval_required
+         FROM work_orders
+         WHERE tenant_id = ?
+         ORDER BY request_id`,
+      )
+      .all(tenant.tenantId) as unknown as Array<{
+      action_id: string;
+      risk: string;
+      local_approval_required: number;
+    }>;
+    assert.deepEqual(
+      stored.map((row) => ({
+        actionId: row.action_id,
+        risk: row.risk,
+        localApprovalRequired: row.local_approval_required === 1,
+      })),
+      actions.map(({ actionId, risk }) => ({
+        actionId,
+        risk,
+        localApprovalRequired: true,
+      })),
+    );
     database.close();
   } finally {
     await destroyHarness(harness);
@@ -4406,7 +4531,7 @@ test("work-order cancellation, expiry, and audit survive restart", async () => {
     const version = database.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    assert.equal(version.user_version, 12);
+    assert.equal(version.user_version, 13);
     database.close();
   } finally {
     await destroyHarness(harness);
