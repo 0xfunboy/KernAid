@@ -390,7 +390,10 @@ impl DiagnosticCollector for SystemDiagnosticCollector {
                 boot_critical_path::to_bounded_json(&boot_critical_path::collect_current_machine())
                     .map(String::into_bytes)
             }
-            WorkOrderActionId::LinuxFstabDisableMissingUuidV1 => {
+            WorkOrderActionId::LinuxFstabDisableMissingUuidV1
+            | WorkOrderActionId::LinuxCrypttabDisableMissingUuidV1
+            | WorkOrderActionId::LinuxExt4FsckPreenWithUndoV1
+            | WorkOrderActionId::LinuxNetworkRestoreResolverLinkV1 => {
                 return Err(LocalHandoffErrorCode::StateMismatch);
             }
             WorkOrderActionId::WindowsP0DiagnoseV1 => {
@@ -1067,7 +1070,10 @@ mod tests {
                 WorkOrderActionId::LinuxFilesystemHealthV1 => Ok(b"{\"health\":\"ok\"}".to_vec()),
                 WorkOrderActionId::LinuxStorageHealthV1 => Ok(b"{\"storage\":\"ok\"}".to_vec()),
                 WorkOrderActionId::LinuxBootCriticalPathV1 => Ok(b"{\"boot\":\"ok\"}".to_vec()),
-                WorkOrderActionId::LinuxFstabDisableMissingUuidV1 => {
+                WorkOrderActionId::LinuxFstabDisableMissingUuidV1
+                | WorkOrderActionId::LinuxCrypttabDisableMissingUuidV1
+                | WorkOrderActionId::LinuxExt4FsckPreenWithUndoV1
+                | WorkOrderActionId::LinuxNetworkRestoreResolverLinkV1 => {
                     Err(LocalHandoffErrorCode::StateMismatch)
                 }
                 WorkOrderActionId::WindowsP0DiagnoseV1 => Err(LocalHandoffErrorCode::StateMismatch),

@@ -1,20 +1,25 @@
 //! Rescue-only adapter between typed Fleet repair work orders and repaird.
 //!
 //! Fleet can create an intent but cannot create local write authority. The
-//! adapter accepts only the compile-time fstab action, obtains path-free local
-//! evidence from repaird, and requires a fresh Desk approval bound to every
-//! relevant digest before the Resident engine can persist an execution.
+//! adapter accepts only four compile-time repair actions, obtains path-free
+//! local evidence from repaird, and requires a fresh action-specific Desk
+//! approval bound to every relevant digest before the Resident engine can
+//! persist an execution.
 
 use super::{
     BoundLocalApproval, LocalExecutionResult, LocalHandoffErrorCode, LocalWorkOrderHandoff,
     PreparedLocalExecution, ResidentWorkOrderError, canonical_json, import_canonical,
     read_private_optional, timestamp_unix, validate_json, write_atomic,
 };
+#[cfg(feature = "rescue-repair-handoff")]
+use kernaid_core::RESCUE_CRYPTTAB_TYPED_CONFIRMATION;
 use kernaid_core::RESCUE_FSTAB_TYPED_CONFIRMATION;
 use kernaid_fleet_client::{
     LeasedWorkOrder, WorkOrderActionId, WorkOrderKind, WorkOrderResultOutcome, WorkOrderRisk,
 };
-use kernaid_linux_pack::production_candidate_contract::{ACTION_ID, RESOURCE_ID};
+#[cfg(feature = "rescue-repair-handoff")]
+use kernaid_linux_pack::crypttab_candidate_contract::RESOURCE_ID as CRYPTTAB_RESOURCE_ID;
+use kernaid_linux_pack::production_candidate_contract::RESOURCE_ID as FSTAB_RESOURCE_ID;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -36,6 +41,81 @@ const MAX_LOCAL_APPROVAL_AGE_SECONDS: u64 = 120;
 const EVIDENCE_DIGEST_DOMAIN: &[u8] = b"kernaid:fleet:rescue-repair-evidence:v1\0";
 const APPROVAL_PROOF_DOMAIN: &[u8] = b"kernaid:fleet:rescue-local-approval:v1\0";
 const TERMINAL_DIGEST_DOMAIN: &[u8] = b"kernaid:fleet:rescue-terminal-receipt:v1\0";
+
+#[cfg(feature = "rescue-repair-handoff")]
+const EXT4_RESOURCE_ID: &str = "rescue:selected-linux-filesystem:ext4";
+#[cfg(feature = "rescue-repair-handoff")]
+const RESOLVER_LINK_RESOURCE_ID: &str = "rescue:selected-linux-root:etc/resolver-link";
+#[cfg(feature = "rescue-repair-handoff")]
+const EXT4_TYPED_CONFIRMATION: &str = "REPAIR EXT4 OFFLINE";
+#[cfg(feature = "rescue-repair-handoff")]
+const RESOLVER_LINK_TYPED_CONFIRMATION: &str = "RESTORE RESOLVER LINK";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RepairActionContract {
+    action_id: WorkOrderActionId,
+    resource_id: &'static str,
+    prepared_kind: &'static str,
+    risk: WorkOrderRisk,
+    risk_id: &'static str,
+    typed_confirmation: &'static str,
+    prepare_operation: &'static str,
+    approve_operation: &'static str,
+    cancel_operation: &'static str,
+}
+
+fn repair_action_contract(action_id: WorkOrderActionId) -> Option<RepairActionContract> {
+    match action_id {
+        WorkOrderActionId::LinuxFstabDisableMissingUuidV1 => Some(RepairActionContract {
+            action_id,
+            resource_id: FSTAB_RESOURCE_ID,
+            prepared_kind: "fstab-prepared",
+            risk: WorkOrderRisk::R2,
+            risk_id: "R2",
+            typed_confirmation: RESCUE_FSTAB_TYPED_CONFIRMATION,
+            prepare_operation: "repair.fstab.prepare",
+            approve_operation: "repair.fstab.approve",
+            cancel_operation: "repair.fstab.cancel",
+        }),
+        #[cfg(feature = "rescue-repair-handoff")]
+        WorkOrderActionId::LinuxCrypttabDisableMissingUuidV1 => Some(RepairActionContract {
+            action_id,
+            resource_id: CRYPTTAB_RESOURCE_ID,
+            prepared_kind: "crypttab-prepared",
+            risk: WorkOrderRisk::R2,
+            risk_id: "R2",
+            typed_confirmation: RESCUE_CRYPTTAB_TYPED_CONFIRMATION,
+            prepare_operation: "repair.crypttab.prepare",
+            approve_operation: "repair.crypttab.approve",
+            cancel_operation: "repair.crypttab.cancel",
+        }),
+        #[cfg(feature = "rescue-repair-handoff")]
+        WorkOrderActionId::LinuxExt4FsckPreenWithUndoV1 => Some(RepairActionContract {
+            action_id,
+            resource_id: EXT4_RESOURCE_ID,
+            prepared_kind: "ext4-fsck-prepared",
+            risk: WorkOrderRisk::R3,
+            risk_id: "R3",
+            typed_confirmation: EXT4_TYPED_CONFIRMATION,
+            prepare_operation: "repair.ext4.prepare",
+            approve_operation: "repair.ext4.approve",
+            cancel_operation: "repair.ext4.cancel",
+        }),
+        #[cfg(feature = "rescue-repair-handoff")]
+        WorkOrderActionId::LinuxNetworkRestoreResolverLinkV1 => Some(RepairActionContract {
+            action_id,
+            resource_id: RESOLVER_LINK_RESOURCE_ID,
+            prepared_kind: "resolver-link-prepared",
+            risk: WorkOrderRisk::R2,
+            risk_id: "R2",
+            typed_confirmation: RESOLVER_LINK_TYPED_CONFIRMATION,
+            prepare_operation: "repair.resolver-link.prepare",
+            approve_operation: "repair.resolver-link.approve",
+            cancel_operation: "repair.resolver-link.cancel",
+        }),
+        _ => None,
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RescueAdapterError {
@@ -310,20 +390,23 @@ impl<B: RescueRepairBroker> RescueFleetRepairAdapter<B> {
 
     #[must_use]
     pub fn desk_intent(&self) -> Option<RescueDeskIntent> {
-        self.state.intent.as_ref().map(|intent| RescueDeskIntent {
-            schema: INTENT_SCHEMA.to_owned(),
-            device_id: self.state.device_id.clone(),
-            work_order_id: intent.work_order_id.clone(),
-            lease_id: intent.lease_id.clone(),
-            execution_id: intent.execution_id.clone(),
-            action_id: intent.action_id.wire_name().to_owned(),
-            action_version: intent.action_version,
-            risk: "R2".to_owned(),
-            state: intent.state,
-            lease_expires_at: intent.lease_expires_at.clone(),
-            evidence: intent.evidence.clone(),
-            confirmation_required: matches!(intent.state, RescueIntentState::AwaitingApproval)
-                .then(|| RESCUE_FSTAB_TYPED_CONFIRMATION.to_owned()),
+        self.state.intent.as_ref().and_then(|intent| {
+            let contract = repair_action_contract(intent.action_id)?;
+            Some(RescueDeskIntent {
+                schema: INTENT_SCHEMA.to_owned(),
+                device_id: self.state.device_id.clone(),
+                work_order_id: intent.work_order_id.clone(),
+                lease_id: intent.lease_id.clone(),
+                execution_id: intent.execution_id.clone(),
+                action_id: intent.action_id.wire_name().to_owned(),
+                action_version: intent.action_version,
+                risk: contract.risk_id.to_owned(),
+                state: intent.state,
+                lease_expires_at: intent.lease_expires_at.clone(),
+                evidence: intent.evidence.clone(),
+                confirmation_required: matches!(intent.state, RescueIntentState::AwaitingApproval)
+                    .then(|| contract.typed_confirmation.to_owned()),
+            })
         })
     }
 
@@ -453,11 +536,13 @@ impl<B: RescueRepairBroker> RescueFleetRepairAdapter<B> {
             .evidence
             .as_ref()
             .ok_or(RescueAdapterError::StateCorrupt)?;
+        let contract = repair_action_contract(intent.action_id)
+            .ok_or(RescueAdapterError::UnsupportedAction)?;
         if request.plan_sha256 != evidence.plan_sha256
             || request.target_sha256 != evidence.target_sha256
             || request.evidence_sha256 != evidence.evidence_sha256
             || request.approval_sequence != evidence.approval_sequence
-            || request.typed_confirmation != RESCUE_FSTAB_TYPED_CONFIRMATION
+            || request.typed_confirmation != contract.typed_confirmation
             || !fixed_id(&request.approval_id, "A-")
         {
             return Err(RescueAdapterError::BindingMismatch);
@@ -541,9 +626,15 @@ impl<B: RescueRepairBroker> RescueFleetRepairAdapter<B> {
         if api_version != DESK_API_VERSION
             || operation != expected_operation
             || device_id != self.state.device_id
-            || action_id != ACTION_ID
-            || action_version != 1
         {
+            return Err(RescueAdapterError::InvalidRequest);
+        }
+        let requested_action = action_id
+            .parse::<WorkOrderActionId>()
+            .map_err(|_| RescueAdapterError::UnsupportedAction)?;
+        let contract = repair_action_contract(requested_action)
+            .ok_or(RescueAdapterError::UnsupportedAction)?;
+        if action_version != contract.action_id.metadata().version {
             return Err(RescueAdapterError::InvalidRequest);
         }
         let intent = self
@@ -554,7 +645,7 @@ impl<B: RescueRepairBroker> RescueFleetRepairAdapter<B> {
         if intent.work_order_id != work_order_id
             || intent.lease_id != lease_id
             || intent.execution_id != execution_id
-            || intent.action_id.wire_name() != action_id
+            || intent.action_id != requested_action
             || intent.action_version != action_version
         {
             return Err(RescueAdapterError::BindingMismatch);
@@ -568,6 +659,8 @@ impl<B: RescueRepairBroker> RescueFleetRepairAdapter<B> {
             .intent
             .as_ref()
             .ok_or(RescueAdapterError::StateCorrupt)?;
+        let contract = repair_action_contract(intent.action_id)
+            .ok_or(RescueAdapterError::UnsupportedAction)?;
         let target = intent
             .target
             .as_ref()
@@ -589,7 +682,7 @@ impl<B: RescueRepairBroker> RescueFleetRepairAdapter<B> {
             let request = BrokerPrepareRequest {
                 api_version: REPAIR_SERVICE_API_VERSION,
                 request_id: &intent.broker_prepare_request_id,
-                operation: "repair.fstab.prepare",
+                operation: contract.prepare_operation,
                 target,
             };
             let response = self
@@ -598,12 +691,12 @@ impl<B: RescueRepairBroker> RescueFleetRepairAdapter<B> {
             snapshot = parse_broker_response(
                 &response,
                 &intent.broker_prepare_request_id,
-                "repair.fstab.prepare",
+                contract.prepare_operation,
             )?;
         }
         match snapshot.state.as_str() {
             "preparing" => Err(RescueAdapterError::Busy),
-            "prepared" => prepared_evidence(&snapshot, target),
+            "prepared" => prepared_evidence(&snapshot, target, contract),
             _ => Err(RescueAdapterError::BrokerProtocol),
         }
     }
@@ -614,6 +707,8 @@ impl<B: RescueRepairBroker> RescueFleetRepairAdapter<B> {
             .intent
             .as_ref()
             .ok_or(RescueAdapterError::StateCorrupt)?;
+        let contract = repair_action_contract(intent.action_id)
+            .ok_or(RescueAdapterError::UnsupportedAction)?;
         let evidence = intent
             .evidence
             .as_ref()
@@ -633,7 +728,7 @@ impl<B: RescueRepairBroker> RescueFleetRepairAdapter<B> {
             let request = BrokerCancelRequest {
                 api_version: REPAIR_SERVICE_API_VERSION,
                 request_id: &intent.broker_cancel_request_id,
-                operation: "repair.fstab.cancel",
+                operation: contract.cancel_operation,
                 prepared_id: &evidence.prepared_id,
                 plan_hash: &plan_hash,
             };
@@ -643,7 +738,7 @@ impl<B: RescueRepairBroker> RescueFleetRepairAdapter<B> {
             snapshot = parse_broker_response(
                 &response,
                 &intent.broker_cancel_request_id,
-                "repair.fstab.cancel",
+                contract.cancel_operation,
             )?;
         }
         if snapshot.state != "cancelled" {
@@ -669,11 +764,12 @@ impl<B: RescueRepairBroker> LocalWorkOrderHandoff for RescueFleetRepairAdapter<B
         order: &LeasedWorkOrder,
         execution_id: &str,
     ) -> Result<PreparedLocalExecution, LocalHandoffErrorCode> {
+        let contract = repair_action_contract(order.action_id())
+            .ok_or(LocalHandoffErrorCode::StateMismatch)?;
         if order.target_device_id() != self.state.device_id
-            || order.action_id() != WorkOrderActionId::LinuxFstabDisableMissingUuidV1
-            || order.action_version() != 1
+            || order.action_version() != contract.action_id.metadata().version
             || order.kind() != WorkOrderKind::Repair
-            || order.risk() != WorkOrderRisk::R2
+            || order.risk() != contract.risk
             || !order.local_approval_required()
             || order.approval().is_none()
         {
@@ -787,6 +883,8 @@ impl<B: RescueRepairBroker> LocalWorkOrderHandoff for RescueFleetRepairAdapter<B
             .intent
             .as_ref()
             .ok_or(LocalHandoffErrorCode::StateMismatch)?;
+        let contract =
+            repair_action_contract(intent.action_id).ok_or(LocalHandoffErrorCode::StateMismatch)?;
         let evidence = intent
             .evidence
             .as_ref()
@@ -818,14 +916,14 @@ impl<B: RescueRepairBroker> LocalWorkOrderHandoff for RescueFleetRepairAdapter<B
             let request = BrokerApproveRequest {
                 api_version: REPAIR_SERVICE_API_VERSION,
                 request_id: &intent.broker_approval_request_id,
-                operation: "repair.fstab.approve",
+                operation: contract.approve_operation,
                 prepared_id: &evidence.prepared_id,
                 session_id: &evidence.session_id,
                 plan_id: &evidence.plan_id,
                 plan_hash: &plan_hash,
                 approval_id: &approval.approval_id,
                 approval_sequence: approval.approval_sequence,
-                typed_confirmation: RESCUE_FSTAB_TYPED_CONFIRMATION,
+                typed_confirmation: contract.typed_confirmation,
             };
             let response = self
                 .broker
@@ -837,7 +935,7 @@ impl<B: RescueRepairBroker> LocalWorkOrderHandoff for RescueFleetRepairAdapter<B
             snapshot = parse_broker_response(
                 &response,
                 &intent.broker_approval_request_id,
-                "repair.fstab.approve",
+                contract.approve_operation,
             )
             .map_err(map_local_error)?;
         }
@@ -986,6 +1084,7 @@ fn parse_broker_response(
 fn prepared_evidence(
     snapshot: &BrokerSnapshot,
     target: &RescueTargetClaims,
+    contract: RepairActionContract,
 ) -> Result<RescuePreparedEvidence, RescueAdapterError> {
     let Some(BrokerDetail::Prepared(detail)) = snapshot.detail.as_ref() else {
         return Err(RescueAdapterError::BrokerProtocol);
@@ -1003,11 +1102,11 @@ fn prepared_evidence(
         approval_sequence: detail.next_approval_sequence,
         evidence_sha256: String::new(),
     };
-    if detail.kind != "fstab-prepared"
-        || detail.resource_id != RESOURCE_ID
-        || detail.action_id != ACTION_ID
-        || detail.risk != "R2"
-        || detail.confirmation_required != RESCUE_FSTAB_TYPED_CONFIRMATION
+    if detail.kind != contract.prepared_kind
+        || detail.resource_id != contract.resource_id
+        || detail.action_id != contract.action_id.wire_name()
+        || detail.risk != contract.risk_id
+        || detail.confirmation_required != contract.typed_confirmation
         || detail.backup.state != "reserved"
         || !detail.backup.vault_distinct
         || format!("sha256:{}", prepared.target_sha256) != target.target_fingerprint
@@ -1054,8 +1153,8 @@ fn terminal_receipt(
         work_order_id: intent.work_order_id.clone(),
         lease_id: intent.lease_id.clone(),
         execution_id: intent.execution_id.clone(),
-        action_id: ACTION_ID.to_owned(),
-        action_version: 1,
+        action_id: intent.action_id.wire_name().to_owned(),
+        action_version: intent.action_version,
         evidence_sha256: evidence.evidence_sha256.clone(),
         outcome,
         reservation_id: detail.reservation_id.clone(),
@@ -1103,9 +1202,10 @@ fn validate_state(
         return Err(RescueAdapterError::StateCorrupt);
     }
     if let Some(intent) = &state.intent {
-        if intent.action_id != WorkOrderActionId::LinuxFstabDisableMissingUuidV1
-            || intent.action_version != 1
-            || intent.risk != WorkOrderRisk::R2
+        let contract =
+            repair_action_contract(intent.action_id).ok_or(RescueAdapterError::StateCorrupt)?;
+        if intent.action_version != contract.action_id.metadata().version
+            || intent.risk != contract.risk
             || intent.work_order_id.is_empty()
             || intent.lease_id.is_empty()
             || intent.execution_id.is_empty()
@@ -1185,8 +1285,8 @@ fn validate_state(
                 || receipt.work_order_id != intent.work_order_id
                 || receipt.lease_id != intent.lease_id
                 || receipt.execution_id != intent.execution_id
-                || receipt.action_id != ACTION_ID
-                || receipt.action_version != 1
+                || receipt.action_id != intent.action_id.wire_name()
+                || receipt.action_version != intent.action_version
                 || !lower_hash(&receipt.evidence_sha256)
                 || intent
                     .evidence
@@ -1384,20 +1484,44 @@ mod tests {
 
     #[derive(Clone)]
     struct MockBroker {
+        action_id: WorkOrderActionId,
+        reported_action_id: WorkOrderActionId,
         state: Arc<Mutex<BrokerState>>,
         requests: Arc<Mutex<Vec<Vec<u8>>>>,
     }
 
     impl MockBroker {
-        fn new() -> Self {
+        fn new(action_id: WorkOrderActionId) -> Self {
             Self {
+                action_id,
+                reported_action_id: action_id,
                 state: Arc::new(Mutex::new(BrokerState::Idle)),
                 requests: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
+        #[cfg(feature = "rescue-repair-handoff")]
+        fn reporting(mut self, action_id: WorkOrderActionId) -> Self {
+            self.reported_action_id = action_id;
+            self
+        }
+
         fn request_count(&self) -> usize {
             self.requests.lock().expect("requests").len()
+        }
+
+        fn operations(&self) -> Vec<String> {
+            self.requests
+                .lock()
+                .expect("requests")
+                .iter()
+                .map(|request| {
+                    serde_json::from_slice::<Value>(request).expect("request JSON")["operation"]
+                        .as_str()
+                        .expect("operation")
+                        .to_owned()
+                })
+                .collect()
         }
     }
 
@@ -1420,23 +1544,23 @@ mod tests {
             let request_id = request["requestId"]
                 .as_str()
                 .ok_or(RescueAdapterError::BrokerProtocol)?;
+            let contract =
+                repair_action_contract(self.action_id).ok_or(RescueAdapterError::BrokerProtocol)?;
             let mut state = self.state.lock().expect("state");
-            match operation {
-                "repair.status" => {}
-                "repair.fstab.prepare" if *state == BrokerState::Idle => {
-                    *state = BrokerState::Prepared;
-                }
-                "repair.fstab.approve" if *state == BrokerState::Prepared => {
-                    *state = BrokerState::Terminal;
-                }
-                "repair.fstab.cancel" if *state == BrokerState::Prepared => {
-                    *state = BrokerState::Cancelled;
-                }
-                _ => return Err(RescueAdapterError::BrokerProtocol),
+            if operation == "repair.status" {
+                // Status recovery is deliberately shared and path-free.
+            } else if operation == contract.prepare_operation && *state == BrokerState::Idle {
+                *state = BrokerState::Prepared;
+            } else if operation == contract.approve_operation && *state == BrokerState::Prepared {
+                *state = BrokerState::Terminal;
+            } else if operation == contract.cancel_operation && *state == BrokerState::Prepared {
+                *state = BrokerState::Cancelled;
+            } else {
+                return Err(RescueAdapterError::BrokerProtocol);
             }
             let (public_state, detail) = match *state {
                 BrokerState::Idle => ("idle", Value::Null),
-                BrokerState::Prepared => ("prepared", prepared_detail()),
+                BrokerState::Prepared => ("prepared", prepared_detail(self.reported_action_id)),
                 BrokerState::Terminal => ("succeeded", terminal_detail("committed")),
                 BrokerState::Cancelled => ("cancelled", terminal_detail("cancelled")),
             };
@@ -1453,9 +1577,10 @@ mod tests {
         }
     }
 
-    fn prepared_detail() -> Value {
+    fn prepared_detail(action_id: WorkOrderActionId) -> Value {
+        let contract = repair_action_contract(action_id).expect("repair contract");
         json!({
-            "kind": "fstab-prepared",
+            "kind": contract.prepared_kind,
             "preparedId": format!("Q-{}", "1".repeat(32)),
             "sessionId": format!("S-{}", "2".repeat(32)),
             "planId": format!("P-{}", "3".repeat(32)),
@@ -1464,13 +1589,13 @@ mod tests {
             "beforeSha256": format!("sha256:{}", "6".repeat(64)),
             "afterSha256": format!("sha256:{}", "7".repeat(64)),
             "diffSha256": format!("sha256:{}", "8".repeat(64)),
-            "resourceId": RESOURCE_ID,
+            "resourceId": contract.resource_id,
             "backupLocator": format!("vault://repair/B-{}", "9".repeat(32)),
-            "actionId": ACTION_ID,
-            "risk": "R2",
+            "actionId": contract.action_id.wire_name(),
+            "risk": contract.risk_id,
             "backup": {"state": "reserved", "vaultDistinct": true},
             "nextApprovalSequence": 1,
-            "confirmationRequired": RESCUE_FSTAB_TYPED_CONFIRMATION
+            "confirmationRequired": contract.typed_confirmation
         })
     }
 
@@ -1485,14 +1610,15 @@ mod tests {
         })
     }
 
-    fn repair_order() -> LeasedWorkOrder {
+    fn repair_order(action_id: WorkOrderActionId) -> LeasedWorkOrder {
+        let contract = repair_action_contract(action_id).expect("repair contract");
         serde_json::from_value(json!({
-            "workOrderId": "wo-rescue-fstab-1",
+            "workOrderId": format!("wo-rescue-{}", action_id.wire_name()),
             "targetDeviceId": DEVICE,
-            "actionId": ACTION_ID,
+            "actionId": action_id.wire_name(),
             "actionVersion": 1,
             "kind": "repair",
-            "risk": "R2",
+            "risk": contract.risk_id,
             "localApprovalRequired": true,
             "status": "leased",
             "createdAt": "2026-08-31T12:00:00Z",
@@ -1502,7 +1628,7 @@ mod tests {
                 "approvedByCredentialId": "credential-1"
             },
             "lease": {
-                "leaseId": "lease-rescue-fstab-1",
+                "leaseId": format!("lease-rescue-{}", action_id.wire_name()),
                 "leasedAt": "2026-08-31T12:30:00Z",
                 "leaseExpiresAt": "2026-08-31T12:35:00Z"
             }
@@ -1530,6 +1656,8 @@ mod tests {
 
     fn approval_request(intent: &RescueDeskIntent) -> ApproveIntentRequest {
         let evidence = intent.evidence.as_ref().expect("evidence");
+        let action_id = intent.action_id.parse().expect("action ID");
+        let contract = repair_action_contract(action_id).expect("repair contract");
         ApproveIntentRequest {
             api_version: DESK_API_VERSION.to_owned(),
             operation: "approve".to_owned(),
@@ -1545,8 +1673,20 @@ mod tests {
             approval_id: format!("A-{}", "d".repeat(32)),
             approval_sequence: evidence.approval_sequence,
             approved_at: APPROVED_AT.to_owned(),
-            typed_confirmation: RESCUE_FSTAB_TYPED_CONFIRMATION.to_owned(),
+            typed_confirmation: contract.typed_confirmation.to_owned(),
         }
+    }
+
+    fn repair_actions() -> Vec<WorkOrderActionId> {
+        #[cfg(feature = "rescue-repair-handoff")]
+        return vec![
+            WorkOrderActionId::LinuxFstabDisableMissingUuidV1,
+            WorkOrderActionId::LinuxCrypttabDisableMissingUuidV1,
+            WorkOrderActionId::LinuxExt4FsckPreenWithUndoV1,
+            WorkOrderActionId::LinuxNetworkRestoreResolverLinkV1,
+        ];
+        #[cfg(not(feature = "rescue-repair-handoff"))]
+        vec![WorkOrderActionId::LinuxFstabDisableMissingUuidV1]
     }
 
     fn opened(directory: &TempDir, broker: MockBroker) -> RescueFleetRepairAdapter<MockBroker> {
@@ -1555,53 +1695,67 @@ mod tests {
     }
 
     #[test]
-    fn fleet_intent_requires_fresh_evidence_bound_local_approval() {
-        let directory = TempDir::new().expect("tempdir");
-        let broker = MockBroker::new();
-        let mut adapter = opened(&directory, broker.clone());
-        let order = repair_order();
-        assert_eq!(
-            adapter.prepare(&order, EXECUTION),
-            Err(LocalHandoffErrorCode::ApprovalPending)
-        );
-        let intent = adapter.desk_intent().expect("intent");
-        assert_eq!(intent.state, RescueIntentState::AwaitingTarget);
-        let staged = adapter.stage(&stage_request(&intent)).expect("staged");
-        assert_eq!(staged.state, RescueIntentState::AwaitingApproval);
-        assert_eq!(
-            staged.confirmation_required.as_deref(),
-            Some(RESCUE_FSTAB_TYPED_CONFIRMATION)
-        );
+    fn fleet_intent_requires_fresh_evidence_bound_local_approval_for_each_repair() {
+        for action_id in repair_actions() {
+            let contract = repair_action_contract(action_id).expect("repair contract");
+            let directory = TempDir::new().expect("tempdir");
+            let broker = MockBroker::new(action_id);
+            let mut adapter = opened(&directory, broker.clone());
+            let order = repair_order(action_id);
+            assert_eq!(
+                adapter.prepare(&order, EXECUTION),
+                Err(LocalHandoffErrorCode::ApprovalPending)
+            );
+            let intent = adapter.desk_intent().expect("intent");
+            assert_eq!(intent.state, RescueIntentState::AwaitingTarget);
+            assert_eq!(intent.risk, contract.risk_id);
+            let staged = adapter.stage(&stage_request(&intent)).expect("staged");
+            assert_eq!(staged.state, RescueIntentState::AwaitingApproval);
+            assert_eq!(
+                staged.confirmation_required.as_deref(),
+                Some(contract.typed_confirmation)
+            );
 
-        let mut tampered = approval_request(&staged);
-        tampered.evidence_sha256 = "0".repeat(64);
-        assert_eq!(
-            adapter.approve(&tampered, NOW_UNIX),
-            Err(RescueAdapterError::BindingMismatch)
-        );
-        let approved = adapter
-            .approve(&approval_request(&staged), NOW_UNIX)
-            .expect("approved");
-        assert_eq!(approved.state, RescueIntentState::Approved);
+            let mut tampered = approval_request(&staged);
+            tampered.evidence_sha256 = "0".repeat(64);
+            assert_eq!(
+                adapter.approve(&tampered, NOW_UNIX),
+                Err(RescueAdapterError::BindingMismatch)
+            );
+            let approved = adapter
+                .approve(&approval_request(&staged), NOW_UNIX)
+                .expect("approved");
+            assert_eq!(approved.state, RescueIntentState::Approved);
 
-        let prepared = adapter.prepare(&order, EXECUTION).expect("preparation");
-        let result = adapter
-            .execute_or_recover(&prepared)
-            .expect("terminal result");
-        assert_eq!(result.outcome, WorkOrderResultOutcome::Succeeded);
-        let calls = broker.request_count();
-        let replay = adapter
-            .execute_or_recover(&prepared)
-            .expect("terminal replay");
-        assert_eq!(replay, result);
-        assert_eq!(broker.request_count(), calls);
+            let prepared = adapter.prepare(&order, EXECUTION).expect("preparation");
+            let result = adapter
+                .execute_or_recover(&prepared)
+                .expect("terminal result");
+            assert_eq!(result.outcome, WorkOrderResultOutcome::Succeeded);
+            assert_eq!(
+                broker.operations(),
+                [
+                    "repair.status",
+                    contract.prepare_operation,
+                    "repair.status",
+                    contract.approve_operation,
+                ]
+            );
+            let calls = broker.request_count();
+            let replay = adapter
+                .execute_or_recover(&prepared)
+                .expect("terminal replay");
+            assert_eq!(replay, result);
+            assert_eq!(broker.request_count(), calls);
+        }
     }
 
     #[test]
     fn stale_or_cross_device_approval_is_never_authority() {
         let directory = TempDir::new().expect("tempdir");
-        let mut adapter = opened(&directory, MockBroker::new());
-        let order = repair_order();
+        let action_id = WorkOrderActionId::LinuxFstabDisableMissingUuidV1;
+        let mut adapter = opened(&directory, MockBroker::new(action_id));
+        let order = repair_order(action_id);
         let _ = adapter.prepare(&order, EXECUTION);
         let intent = adapter.desk_intent().expect("intent");
         let staged = adapter.stage(&stage_request(&intent)).expect("staged");
@@ -1626,9 +1780,10 @@ mod tests {
     #[test]
     fn explicit_local_rejection_is_durable_and_terminal_for_engine() {
         let directory = TempDir::new().expect("tempdir");
-        let broker = MockBroker::new();
+        let action_id = WorkOrderActionId::LinuxFstabDisableMissingUuidV1;
+        let broker = MockBroker::new(action_id);
         let mut adapter = opened(&directory, broker);
-        let order = repair_order();
+        let order = repair_order(action_id);
         let _ = adapter.prepare(&order, EXECUTION);
         let intent = adapter.desk_intent().expect("intent");
         let staged = adapter.stage(&stage_request(&intent)).expect("staged");
@@ -1649,18 +1804,59 @@ mod tests {
         assert_eq!(rejected.state, RescueIntentState::Rejected);
         drop(adapter);
 
-        let mut reopened = opened(&directory, MockBroker::new());
+        let mut reopened = opened(&directory, MockBroker::new(action_id));
         assert_eq!(
             reopened.prepare(&order, EXECUTION),
             Err(LocalHandoffErrorCode::ApprovalRejected)
         );
     }
 
+    #[cfg(feature = "rescue-repair-handoff")]
+    #[test]
+    fn action_binding_cannot_be_swapped_by_desk_or_broker() {
+        let fstab = WorkOrderActionId::LinuxFstabDisableMissingUuidV1;
+        let crypttab = WorkOrderActionId::LinuxCrypttabDisableMissingUuidV1;
+        let directory = TempDir::new().expect("tempdir");
+        let mut adapter = opened(&directory, MockBroker::new(fstab));
+        let order = repair_order(fstab);
+        let _ = adapter.prepare(&order, EXECUTION);
+        let intent = adapter.desk_intent().expect("intent");
+        let mut swapped = stage_request(&intent);
+        swapped.action_id = crypttab.wire_name().to_owned();
+        assert_eq!(
+            adapter.stage(&swapped),
+            Err(RescueAdapterError::BindingMismatch)
+        );
+
+        let staged = adapter.stage(&stage_request(&intent)).expect("staged");
+        let mut swapped = approval_request(&staged);
+        swapped.action_id = crypttab.wire_name().to_owned();
+        swapped.typed_confirmation = repair_action_contract(crypttab)
+            .expect("crypttab contract")
+            .typed_confirmation
+            .to_owned();
+        assert_eq!(
+            adapter.approve(&swapped, NOW_UNIX),
+            Err(RescueAdapterError::BindingMismatch)
+        );
+
+        let directory = TempDir::new().expect("tempdir");
+        let broker = MockBroker::new(fstab).reporting(crypttab);
+        let mut adapter = opened(&directory, broker);
+        let _ = adapter.prepare(&order, EXECUTION);
+        let intent = adapter.desk_intent().expect("intent");
+        assert_eq!(
+            adapter.stage(&stage_request(&intent)),
+            Err(RescueAdapterError::BrokerProtocol)
+        );
+    }
+
     #[test]
     fn desk_json_is_canonical_strict_and_state_contains_no_secret_or_raw_content() {
         let directory = TempDir::new().expect("tempdir");
-        let mut adapter = opened(&directory, MockBroker::new());
-        let order = repair_order();
+        let action_id = WorkOrderActionId::LinuxFstabDisableMissingUuidV1;
+        let mut adapter = opened(&directory, MockBroker::new(action_id));
+        let order = repair_order(action_id);
         let _ = adapter.prepare(&order, EXECUTION);
         let intent = adapter.desk_intent().expect("intent");
         let mut value = serde_json::to_value(stage_request(&intent)).expect("JSON");

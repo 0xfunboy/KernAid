@@ -82,12 +82,32 @@ test("work-order claim and result use closed direct-domain signatures", () => {
 test("work-order schemas reject shell-shaped fields and unknown actions", () => {
   assert.deepEqual(Object.keys(workOrderActionCatalog).sort(), [
     "linux.boot-critical-path.v1",
+    "linux.crypttab.disable-missing-uuid.v1",
+    "linux.ext4.fsck-preen-with-undo.v1",
     "linux.filesystem.health.v1",
     "linux.fstab.disable-missing-uuid.v1",
+    "linux.network.restore-resolver-link.v1",
     "linux.storage.health.v1",
     "macos.p0.diagnose.v1",
     "windows.p0.diagnose.v1",
   ]);
+  for (const actionId of [
+    "linux.fstab.disable-missing-uuid.v1",
+    "linux.crypttab.disable-missing-uuid.v1",
+    "linux.network.restore-resolver-link.v1",
+  ] as const) {
+    assert.equal(workOrderActionCatalog[actionId].risk, "R2");
+    assert.equal(workOrderActionCatalog[actionId].localApprovalRequired, true);
+  }
+  assert.equal(
+    workOrderActionCatalog["linux.ext4.fsck-preen-with-undo.v1"].risk,
+    "R3",
+  );
+  assert.equal(
+    workOrderActionCatalog["linux.ext4.fsck-preen-with-undo.v1"]
+      .localApprovalRequired,
+    true,
+  );
   assert.throws(() =>
     parseWorkOrderClaimRequest({
       schema: FLEET_WORK_ORDER_CLAIM_SCHEMA,

@@ -40,14 +40,27 @@ intersects them and fails closed. A repair requires both the organizational
 approval delivered by Fleet and a separate fresh `BoundLocalApproval` bound to
 the work order, lease, action/version, execution, plan and target digests.
 
-`linux.fstab.disable-missing-uuid.v1` is compiled off by default. A Rescue
-integration must explicitly enable `rescue-fstab-handoff`. That feature exposes
-`RescueFleetRepairAdapter`, whose only broker output is the existing fixed
-`repair.status`, `repair.fstab.prepare`, `repair.fstab.approve` and
-`repair.fstab.cancel` protocol. The supplied `RescueRepairBroker` implementation
-must terminate at the authenticated local `kernaid-rescue-repaird` seqpacket
-service; it must not proxy a caller-selected endpoint. Core, Broker and Vault
-therefore remain the only write-authority path.
+Rescue repair handoff is compiled off by default. A full Rescue integration
+must explicitly enable `rescue-repair-handoff`; the older
+`rescue-fstab-handoff` feature remains a compatibility subset for fstab only.
+The full feature exposes exactly these compile-time contracts:
+
+- `linux.fstab.disable-missing-uuid.v1` — R2,
+  `DISABILITA VOCE FSTAB`;
+- `linux.crypttab.disable-missing-uuid.v1` — R2,
+  `DISABILITA VOCE CRYPTTAB`;
+- `linux.ext4.fsck-preen-with-undo.v1` — R3,
+  `REPAIR EXT4 OFFLINE`;
+- `linux.network.restore-resolver-link.v1` — R2,
+  `RESTORE RESOLVER LINK`.
+
+`RescueFleetRepairAdapter` selects only each action's fixed
+`repair.<action>.prepare`, `repair.<action>.approve` and
+`repair.<action>.cancel` operations plus shared `repair.status`. The supplied
+`RescueRepairBroker` implementation must terminate at the authenticated local
+`kernaid-rescue-repaird` seqpacket service; it must not proxy a caller-selected
+endpoint. Core, Broker and Vault therefore remain the only write-authority
+path.
 
 The adapter persists an owner-only intent before any broker exchange. Desk can
 read the minimized `dev.kernaid.fleet.rescue-repair-intent.v1` view and submit
@@ -98,9 +111,10 @@ The Linux adapter dispatches only `linux.filesystem.health.v1`,
 `linux.storage.health.v1` and `linux.boot-critical-path.v1` to their existing
 fixed-command, bounded collectors.
 It persists only execution bindings and result digests for restart recovery.
-The Rescue fstab write action is not connected to this process: remote tenant
-approval can never substitute for a fresh local Vault approval or the
-Core/Broker policy and entitlement boundary.
+The Rescue write actions are not connected to this process: remote tenant
+approval can never substitute for fresh target evidence, a fresh local Desk
+approval, Vault reservation or the Core/Broker policy and entitlement
+boundary.
 
 ## Windows x86-64 service (off by default)
 

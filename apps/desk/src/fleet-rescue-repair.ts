@@ -1,12 +1,58 @@
 import type { RescueRepairTargetClaims } from "./rescue-repair";
+import {
+  RESCUE_CRYPTTAB_ACTION_ID,
+  RESCUE_CRYPTTAB_CONFIRMATION,
+  RESCUE_EXT4_ACTION_ID,
+  RESCUE_EXT4_CONFIRMATION,
+  RESCUE_FSTAB_ACTION_ID,
+  RESCUE_FSTAB_CONFIRMATION,
+  RESCUE_RESOLVER_LINK_ACTION_ID,
+  RESCUE_RESOLVER_LINK_CONFIRMATION,
+} from "./rescue-repair";
 
 export const FLEET_RESCUE_API_VERSION =
   "kernaid.dev/fleet-rescue-repair/v1alpha1";
 export const FLEET_RESCUE_INTENT_SCHEMA =
   "dev.kernaid.fleet.rescue-repair-intent.v1";
 export const FLEET_RESCUE_ENDPOINT = "/api/rescue/fleet-repair";
-export const FLEET_FSTAB_ACTION = "linux.fstab.disable-missing-uuid.v1";
-export const FLEET_FSTAB_CONFIRMATION = "DISABILITA VOCE FSTAB";
+export const FLEET_FSTAB_ACTION = RESCUE_FSTAB_ACTION_ID;
+export const FLEET_FSTAB_CONFIRMATION = RESCUE_FSTAB_CONFIRMATION;
+export const FLEET_CRYPTTAB_ACTION = RESCUE_CRYPTTAB_ACTION_ID;
+export const FLEET_CRYPTTAB_CONFIRMATION = RESCUE_CRYPTTAB_CONFIRMATION;
+export const FLEET_EXT4_ACTION = RESCUE_EXT4_ACTION_ID;
+export const FLEET_EXT4_CONFIRMATION = RESCUE_EXT4_CONFIRMATION;
+export const FLEET_RESOLVER_LINK_ACTION = RESCUE_RESOLVER_LINK_ACTION_ID;
+export const FLEET_RESOLVER_LINK_CONFIRMATION =
+  RESCUE_RESOLVER_LINK_CONFIRMATION;
+
+export const fleetRescueActionCatalog = {
+  [FLEET_FSTAB_ACTION]: {
+    label: "FSTAB",
+    risk: "R2",
+    confirmation: FLEET_FSTAB_CONFIRMATION,
+  },
+  [FLEET_CRYPTTAB_ACTION]: {
+    label: "CRYPTTAB",
+    risk: "R2",
+    confirmation: FLEET_CRYPTTAB_CONFIRMATION,
+  },
+  [FLEET_EXT4_ACTION]: {
+    label: "EXT4 OFFLINE",
+    risk: "R3",
+    confirmation: FLEET_EXT4_CONFIRMATION,
+  },
+  [FLEET_RESOLVER_LINK_ACTION]: {
+    label: "RESOLVER LINK",
+    risk: "R2",
+    confirmation: FLEET_RESOLVER_LINK_CONFIRMATION,
+  },
+} as const;
+
+export type FleetRescueActionId = keyof typeof fleetRescueActionCatalog;
+export type FleetRescueRisk =
+  (typeof fleetRescueActionCatalog)[FleetRescueActionId]["risk"];
+export type FleetRescueConfirmation =
+  (typeof fleetRescueActionCatalog)[FleetRescueActionId]["confirmation"];
 
 const MAX_RESPONSE_BYTES = 16 * 1024;
 const IDENTIFIER = /^[A-Za-z0-9._:/-]{1,160}$/u;
@@ -46,13 +92,13 @@ export interface FleetRescueIntent {
   readonly workOrderId: string;
   readonly leaseId: string;
   readonly executionId: string;
-  readonly actionId: typeof FLEET_FSTAB_ACTION;
+  readonly actionId: FleetRescueActionId;
   readonly actionVersion: 1;
-  readonly risk: "R2";
+  readonly risk: FleetRescueRisk;
   readonly state: FleetRescueIntentState;
   readonly leaseExpiresAt: string;
   readonly evidence: FleetRescueEvidence | null;
-  readonly confirmationRequired: typeof FLEET_FSTAB_CONFIRMATION | null;
+  readonly confirmationRequired: FleetRescueConfirmation | null;
 }
 
 type FetchLike = (
@@ -101,7 +147,8 @@ export class FleetRescueClient {
       evidence === null ||
       intent.state !== "awaiting-approval" ||
       !FIXED_ID.test(approvalId) ||
-      typedConfirmation !== FLEET_FSTAB_CONFIRMATION
+      typedConfirmation !== intent.confirmationRequired ||
+      typedConfirmation !== fleetRescueAction(intent.actionId).confirmation
     )
       throw new Error("Approvazione locale non valida.");
     return await this.#required(
@@ -189,15 +236,15 @@ export function parseFleetRescueIntent(value: unknown): FleetRescueIntent {
     "evidence",
     "confirmationRequired",
   ]);
+  const action = fleetRescueAction(object.actionId);
   if (
     object.schema !== FLEET_RESCUE_INTENT_SCHEMA ||
     !identifier(object.deviceId) ||
     !identifier(object.workOrderId) ||
     !identifier(object.leaseId) ||
     !identifier(object.executionId) ||
-    object.actionId !== FLEET_FSTAB_ACTION ||
     object.actionVersion !== 1 ||
-    object.risk !== "R2" ||
+    object.risk !== action.risk ||
     typeof object.leaseExpiresAt !== "string" ||
     !Number.isFinite(Date.parse(object.leaseExpiresAt)) ||
     !isIntentState(object.state)
@@ -206,11 +253,11 @@ export function parseFleetRescueIntent(value: unknown): FleetRescueIntent {
   const evidence =
     object.evidence === null ? null : parseEvidence(object.evidence);
   const confirmation = object.confirmationRequired;
-  if (confirmation !== null && confirmation !== FLEET_FSTAB_CONFIRMATION)
+  if (confirmation !== null && confirmation !== action.confirmation)
     throw new Error("Conferma Fleet Rescue non valida.");
   if (
     (object.state === "awaiting-approval" &&
-      confirmation !== FLEET_FSTAB_CONFIRMATION) ||
+      confirmation !== action.confirmation) ||
     (object.state !== "awaiting-approval" && confirmation !== null)
   )
     throw new Error("Stato conferma Fleet Rescue non valido.");
@@ -218,6 +265,17 @@ export function parseFleetRescueIntent(value: unknown): FleetRescueIntent {
     if (object.state === "awaiting-approval" || evidence === null)
       throw new Error("Binding evidenza Fleet Rescue non valido.");
   return { ...(object as unknown as FleetRescueIntent), evidence };
+}
+
+export function fleetRescueAction(
+  value: unknown,
+): (typeof fleetRescueActionCatalog)[FleetRescueActionId] {
+  if (
+    typeof value !== "string" ||
+    !Object.hasOwn(fleetRescueActionCatalog, value)
+  )
+    throw new Error("Azione Fleet Rescue non valida.");
+  return fleetRescueActionCatalog[value as FleetRescueActionId];
 }
 
 function parseEvidence(value: unknown): FleetRescueEvidence {
