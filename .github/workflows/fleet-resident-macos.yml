@@ -73,8 +73,55 @@ jobs:
             INSTALL.md \
             UNSIGNED-UNNOTARIZED.txt \
             > SHA256SUMS)
-          tar -C dist -czf "dist/${NAME}-UNSIGNED-UNNOTARIZED.tar.gz" "$(basename "$bundle")"
-          shasum -a 256 "dist/${NAME}-UNSIGNED-UNNOTARIZED.tar.gz" > "dist/${NAME}-UNSIGNED-UNNOTARIZED.tar.gz.sha256"
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          export SOURCE_DATE_EPOCH
+          export BUNDLE_PATH="$bundle"
+          export ARCHIVE_PATH="dist/${NAME}-UNSIGNED-UNNOTARIZED.tar.gz"
+          python3 - <<'PY'
+          import gzip
+          import io
+          import os
+          import stat
+          import tarfile
+          from pathlib import Path
+
+          bundle = Path(os.environ["BUNDLE_PATH"])
+          archive = Path(os.environ["ARCHIVE_PATH"])
+          source_epoch = int(os.environ["SOURCE_DATE_EPOCH"])
+          members = [bundle, *sorted(bundle.iterdir(), key=lambda item: item.name)]
+          with archive.open("wb") as output:
+              with gzip.GzipFile(
+                  filename="", mode="wb", fileobj=output, mtime=0, compresslevel=9
+              ) as compressed:
+                  with tarfile.open(
+                      fileobj=compressed, mode="w", format=tarfile.PAX_FORMAT
+                  ) as tar:
+                      for source in members:
+                          relative = source.relative_to(bundle.parent).as_posix()
+                          info = tarfile.TarInfo(
+                              f"{relative}/" if source.is_dir() else relative
+                          )
+                          info.uid = 0
+                          info.gid = 0
+                          info.uname = ""
+                          info.gname = ""
+                          info.mtime = source_epoch
+                          info.mode = stat.S_IMODE(source.stat().st_mode)
+                          if source.is_dir():
+                              info.type = tarfile.DIRTYPE
+                              tar.addfile(info)
+                          elif source.is_file() and not source.is_symlink():
+                              payload = source.read_bytes()
+                              info.size = len(payload)
+                              tar.addfile(info, io.BytesIO(payload))
+                          else:
+                              raise SystemExit(f"unsupported bundle member: {source}")
+          PY
+          (
+            cd dist || exit 1
+            shasum -a 256 "${NAME}-UNSIGNED-UNNOTARIZED.tar.gz" \
+              > "${NAME}-UNSIGNED-UNNOTARIZED.tar.gz.sha256"
+          )
       - name: Upload explicitly unsigned and unnotarized bundle
         uses: actions/upload-artifact@v4
         with:
@@ -84,3 +131,315 @@ jobs:
             dist/${{ matrix.name }}-UNSIGNED-UNNOTARIZED.tar.gz.sha256
           if-no-files-found: error
           retention-days: 7
+
+  package-site-catalog:
+    needs: build-unsigned
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download Apple-silicon bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: KernAid-Fleet-Resident-macos-aarch64-UNSIGNED-UNNOTARIZED
+          path: ${{ runner.temp }}/kernaid-macos-resident-input/KernAid-Fleet-Resident-macos-aarch64-UNSIGNED-UNNOTARIZED
+      - name: Download Intel bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: KernAid-Fleet-Resident-macos-x86_64-UNSIGNED-UNNOTARIZED
+          path: ${{ runner.temp }}/kernaid-macos-resident-input/KernAid-Fleet-Resident-macos-x86_64-UNSIGNED-UNNOTARIZED
+      - name: Verify and assemble one site-ready catalog bundle
+        id: package
+        shell: python
+        env:
+          INPUT_ROOT: ${{ runner.temp }}/kernaid-macos-resident-input
+          OUTPUT_ROOT: ${{ github.workspace }}/dist/macos-site-ready
+          SOURCE_COMMIT: ${{ github.sha }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          SOURCE_RUN_ID: ${{ github.run_id }}
+          SOURCE_RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          import hashlib
+          import json
+          import os
+          import re
+          import stat
+          import tarfile
+          import tomllib
+          import zipfile
+          from pathlib import Path, PurePosixPath
+
+          EXPECTED = (
+              (
+                  "aarch64",
+                  "KernAid-Fleet-Resident-macos-aarch64-UNSIGNED-UNNOTARIZED",
+                  "macos-aarch64-UNSIGNED-UNNOTARIZED.tar.gz",
+              ),
+              (
+                  "x86_64",
+                  "KernAid-Fleet-Resident-macos-x86_64-UNSIGNED-UNNOTARIZED",
+                  "macos-x86_64-UNSIGNED-UNNOTARIZED.tar.gz",
+              ),
+          )
+          MAX_ARCHIVE_BYTES = 64 * 1024 * 1024
+          MAX_SIDECAR_BYTES = 256
+          MANIFEST_NAME = "KernAid-Fleet-Resident-macos.catalog.json"
+          WORKFLOW = ".github/workflows/fleet-resident-macos.yml"
+
+
+          def fail(message):
+              raise SystemExit(message)
+
+
+          def canonical_json(value):
+              return json.dumps(
+                  value,
+                  ensure_ascii=False,
+                  allow_nan=False,
+                  separators=(",", ":"),
+                  sort_keys=True,
+              ).encode("utf-8")
+
+
+          def regular_file(path, label, maximum):
+              try:
+                  metadata = path.lstat()
+              except FileNotFoundError:
+                  fail(f"missing {label}: {path.name}")
+              if not stat.S_ISREG(metadata.st_mode) or path.is_symlink():
+                  fail(f"{label} must be a regular non-symlink file: {path.name}")
+              if metadata.st_size <= 0 or metadata.st_size > maximum:
+                  fail(f"{label} has an invalid byte count: {path.name}")
+              return metadata.st_size
+
+
+          def sha256_file(path):
+              digest = hashlib.sha256()
+              size = 0
+              with path.open("rb") as source:
+                  while chunk := source.read(1024 * 1024):
+                      digest.update(chunk)
+                      size += len(chunk)
+              return size, digest.hexdigest()
+
+
+          def verified_inner_members(archive, artifact_name):
+              root = artifact_name
+              required_files = {
+                  "INSTALL.md",
+                  "SHA256SUMS",
+                  "UNSIGNED-UNNOTARIZED.txt",
+                  "config.example.json",
+                  "io.kernaid.fleet-resident-macos.plist",
+                  "kernaid-fleet-resident-macos",
+              }
+              expected_names = {root, *(f"{root}/{name}" for name in required_files)}
+              try:
+                  with tarfile.open(archive, mode="r:gz") as package:
+                      members = package.getmembers()
+                      by_name = {}
+                      for member in members:
+                          normalized = member.name.rstrip("/")
+                          path = PurePosixPath(normalized)
+                          if (
+                              path.is_absolute()
+                              or ".." in path.parts
+                              or normalized in by_name
+                              or not (member.isdir() or member.isfile())
+                          ):
+                              fail(f"unsafe tar member in {archive.name}: {member.name}")
+                          by_name[normalized] = member
+                      if set(by_name) != expected_names:
+                          fail(f"unexpected tar structure: {archive.name}")
+                      if not by_name[root].isdir():
+                          fail(f"missing package root directory: {archive.name}")
+                      sums_member = package.extractfile(by_name[f"{root}/SHA256SUMS"])
+                      if sums_member is None:
+                          fail(f"missing inner checksums: {archive.name}")
+                      sums = sums_member.read(4096)
+                      if len(sums) >= 4096:
+                          fail(f"inner checksums exceed limit: {archive.name}")
+                      try:
+                          lines = sums.decode("ascii").splitlines()
+                      except UnicodeDecodeError:
+                          fail(f"inner checksums are not ASCII: {archive.name}")
+                      expected_hashed = required_files - {"SHA256SUMS"}
+                      observed = {}
+                      for line in lines:
+                          match = re.fullmatch(r"([0-9a-f]{64})  ([A-Za-z0-9._-]+)", line)
+                          if match is None or match.group(2) in observed:
+                              fail(f"inner checksum is not canonical: {archive.name}")
+                          observed[match.group(2)] = match.group(1)
+                      if set(observed) != expected_hashed:
+                          fail(f"inner checksum inventory mismatch: {archive.name}")
+                      for name, expected_sha256 in observed.items():
+                          member_file = package.extractfile(by_name[f"{root}/{name}"])
+                          if member_file is None:
+                              fail(f"could not read inner member: {name}")
+                          digest = hashlib.sha256()
+                          while chunk := member_file.read(1024 * 1024):
+                              digest.update(chunk)
+                          if digest.hexdigest() != expected_sha256:
+                              fail(f"inner checksum mismatch: {archive.name}/{name}")
+              except (tarfile.TarError, OSError) as error:
+                  fail(f"invalid architecture archive {archive.name}: {error}")
+
+
+          repository_root = Path.cwd().resolve()
+          input_root = Path(os.environ["INPUT_ROOT"])
+          output_root = Path(os.environ["OUTPUT_ROOT"])
+          if input_root.is_symlink() or not input_root.is_dir():
+              fail("downloaded artifact root is not a safe directory")
+          expected_directories = {item[1] for item in EXPECTED}
+          actual_directories = {item.name for item in input_root.iterdir()}
+          if actual_directories != expected_directories:
+              fail("exactly two named architecture artifacts are required")
+
+          source_commit = os.environ["SOURCE_COMMIT"]
+          if re.fullmatch(r"[0-9a-f]{40}", source_commit) is None:
+              fail("source commit must be a full lowercase Git SHA")
+          source_repository = os.environ["SOURCE_REPOSITORY"]
+          if source_repository != "0xfunboy/KernAid":
+              fail("site catalog may be built only from the canonical repository")
+          run_id = int(os.environ["SOURCE_RUN_ID"])
+          run_attempt = int(os.environ["SOURCE_RUN_ATTEMPT"])
+          if run_id <= 0 or run_attempt <= 0:
+              fail("workflow provenance is invalid")
+          with (repository_root / "Cargo.toml").open("rb") as workspace_file:
+              version = tomllib.load(workspace_file)["workspace"]["package"]["version"]
+          if re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version) is None:
+              fail("workspace version is not a supported release version")
+
+          artifacts = []
+          bundle_members = {}
+          for architecture, artifact_name, archive_name in EXPECTED:
+              artifact_directory = input_root / artifact_name
+              if artifact_directory.is_symlink() or not artifact_directory.is_dir():
+                  fail(f"unsafe architecture artifact: {artifact_name}")
+              sidecar_name = f"{archive_name}.sha256"
+              actual_files = {item.name for item in artifact_directory.iterdir()}
+              if actual_files != {archive_name, sidecar_name}:
+                  fail(f"architecture artifact inventory mismatch: {artifact_name}")
+              archive = artifact_directory / archive_name
+              sidecar = artifact_directory / sidecar_name
+              regular_file(archive, "architecture archive", MAX_ARCHIVE_BYTES)
+              regular_file(sidecar, "architecture checksum", MAX_SIDECAR_BYTES)
+              archive_bytes, archive_sha256 = sha256_file(archive)
+              expected_sidecar = f"{archive_sha256}  {archive_name}\n".encode("ascii")
+              if sidecar.read_bytes() != expected_sidecar:
+                  fail(f"portable checksum mismatch: {sidecar_name}")
+              verified_inner_members(archive, artifact_name)
+              artifacts.append(
+                  {
+                      "architecture": architecture,
+                      "bytes": archive_bytes,
+                      "checksumFilename": sidecar_name,
+                      "filename": archive_name,
+                      "sha256": archive_sha256,
+                  }
+              )
+              bundle_members[archive_name] = archive.read_bytes()
+              bundle_members[sidecar_name] = expected_sidecar
+
+          source = {
+              "commit": source_commit,
+              "repository": source_repository,
+              "runAttempt": run_attempt,
+              "runId": run_id,
+              "workflow": WORKFLOW,
+          }
+          catalog = {
+              "artifacts": artifacts,
+              "schema": "dev.kernaid.fleet-resident-macos.catalog.v1",
+              "signature": {
+                  "developerId": "not-applied",
+                  "notarization": "not-applied",
+                  "status": "unsigned-unnotarized",
+              },
+              "source": source,
+              "version": version,
+          }
+          catalog_bytes = canonical_json(catalog)
+          if canonical_json(json.loads(catalog_bytes)) != catalog_bytes:
+              fail("catalog manifest is not canonical")
+          bundle_members[MANIFEST_NAME] = catalog_bytes
+
+          if output_root.exists() or output_root.is_symlink():
+              fail("site-ready output directory already exists")
+          output_root.mkdir(parents=True, mode=0o700)
+          stem = (
+              f"KernAid-Fleet-Resident-macos-multiarch-v{version}"
+              "-UNSIGNED-UNNOTARIZED"
+          )
+          archive_path = output_root / f"{stem}.zip"
+          with zipfile.ZipFile(
+              archive_path, mode="x", compression=zipfile.ZIP_DEFLATED, compresslevel=9
+          ) as bundle:
+              for name in sorted(bundle_members):
+                  info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+                  info.compress_type = zipfile.ZIP_DEFLATED
+                  info.create_system = 3
+                  info.external_attr = 0o100644 << 16
+                  bundle.writestr(
+                      info,
+                      bundle_members[name],
+                      compress_type=zipfile.ZIP_DEFLATED,
+                      compresslevel=9,
+                  )
+          archive_path.chmod(0o600)
+          with zipfile.ZipFile(archive_path, mode="r") as bundle:
+              if bundle.namelist() != sorted(bundle_members) or bundle.testzip() is not None:
+                  fail("site-ready ZIP verification failed")
+              if bundle.read(MANIFEST_NAME) != catalog_bytes:
+                  fail("site-ready ZIP changed the catalog manifest")
+
+          bundle_bytes, bundle_sha256 = sha256_file(archive_path)
+          checksum_path = output_root / f"{archive_path.name}.sha256"
+          checksum_path.write_bytes(
+              f"{bundle_sha256}  {archive_path.name}\n".encode("ascii")
+          )
+          checksum_path.chmod(0o600)
+          release = {
+              "architectures": ["aarch64", "x86_64"],
+              "bytes": bundle_bytes,
+              "catalogManifest": MANIFEST_NAME,
+              "filename": archive_path.name,
+              "schema": "dev.kernaid.fleet-resident-macos.download.v1",
+              "sha256": bundle_sha256,
+              "signatureStatus": "unsigned-unnotarized",
+              "source": source,
+              "version": version,
+          }
+          release_path = output_root / f"{stem}.release.json"
+          release_path.write_bytes(canonical_json(release))
+          release_path.chmod(0o600)
+          if canonical_json(json.loads(release_path.read_bytes())) != release_path.read_bytes():
+              fail("download descriptor is not canonical")
+
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+              output.write(f"artifact_name={stem}\n")
+              output.write(f"archive={archive_path}\n")
+              output.write(f"checksum={checksum_path}\n")
+              output.write(f"release={release_path}\n")
+          print(
+              json.dumps(
+                  {
+                      "bytes": bundle_bytes,
+                      "filename": archive_path.name,
+                      "sha256": bundle_sha256,
+                  },
+                  separators=(",", ":"),
+                  sort_keys=True,
+              )
+          )
+      - name: Upload one site-ready multi-architecture publish set
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.artifact_name }}
+          path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.checksum }}
+            ${{ steps.package.outputs.release }}
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0

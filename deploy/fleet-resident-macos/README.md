@@ -4,11 +4,45 @@ This is a separate, off-default Enterprise component for Intel and Apple
 silicon Macs. It is not part of Desk, does not expose a repair surface, and
 copying the bundle does not load, enable, or start its LaunchAgent.
 
+## Site-ready multi-architecture bundle
+
+The `fleet-resident-macos` workflow first builds separate Apple-silicon and
+Intel development archives. Only after both matrix jobs succeed, a final
+fail-closed job downloads them and emits one site publish set:
+
+- `KernAid-Fleet-Resident-macos-multiarch-v<version>-UNSIGNED-UNNOTARIZED.zip`;
+- a portable SHA-256 sidecar for that ZIP; and
+- a canonical `dev.kernaid.fleet-resident-macos.download.v1` descriptor.
+
+The ZIP contains both architecture-specific `.tar.gz` files, a portable
+basename-only SHA-256 sidecar for each, and the canonical
+`KernAid-Fleet-Resident-macos.catalog.json` manifest. The catalog schema is
+`dev.kernaid.fleet-resident-macos.catalog.v1`; it binds the workspace version,
+full source commit, canonical repository, workflow run ID and attempt, exact
+filename/architecture/byte count/SHA-256 for both archives, and the explicit
+`unsigned-unnotarized` signature state. Canonical JSON is UTF-8 without a
+trailing newline, with recursively sorted keys, compact separators and fixed
+array order (`aarch64`, then `x86_64`).
+
+The aggregation job requires exactly the two named input artifacts and exactly
+one archive plus sidecar in each. It rehashes both outer archives, requires
+portable sidecars, validates the complete tar inventory and every inner
+`SHA256SUMS` entry, then reopens the deterministic ZIP before upload. Missing,
+extra, symlinked, malformed or mismatched input fails the job. The resulting
+ZIP is a two-architecture container, not a universal/fat Mach-O binary.
+
+The publish set remains internal. Its checksum and manifest provide integrity
+and provenance, not Developer ID authenticity or Apple notarization. The site
+must label it unsigned and unnotarized until external signing, notarization and
+physical acceptance evidence exist.
+
 ## Package and provision
 
-1. Select the artifact matching the Mac CPU. CI artifacts named
-   `UNSIGNED-UNNOTARIZED` are internal development inputs only. Do not deploy
-   them to customer machines or bypass Gatekeeper.
+1. Verify the multi-architecture ZIP against its adjacent sidecar, open it and
+   select the enclosed archive matching the Mac CPU. Verify that archive with
+   its own adjacent sidecar. Files named `UNSIGNED-UNNOTARIZED` are internal
+   development inputs only. Do not deploy them to customer machines or bypass
+   Gatekeeper.
 2. After Developer ID signing and notarization, install the binary for the
    enrolled user at the exact absolute path recorded in the plist. Keep its
    directory owner-only and the executable non-writable by other users.
