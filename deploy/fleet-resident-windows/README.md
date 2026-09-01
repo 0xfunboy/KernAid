@@ -54,3 +54,12 @@ raw logs, PII, token, key seed or diagnostic content.
 
 Code signing, MSI ACL validation, SCM lifecycle validation on physical Windows
 x86-64, and a real enrolled-device acceptance run are external release gates.
+
+The development workflow now reuses the already assembled unsigned ZIP on a
+native Windows runner. In an ephemeral staging directory it verifies the
+packaged claim/result contract, registers the service as on-demand
+`LocalService`, proves installation did not start it, exercises `run-once`
+until the deliberately absent public anchors fail closed, then uses the
+product's `uninstall` command and verifies complete SCM and file cleanup. No
+enrollment credential, device identity, private key or test signature is
+provided; this does not replace the external release gates above.
