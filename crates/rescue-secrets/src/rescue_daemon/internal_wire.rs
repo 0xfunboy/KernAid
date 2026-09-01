@@ -4127,7 +4127,11 @@ mod tests {
         );
         let encoded = persist.encode().expect("repair persist frame");
         assert_eq!(encoded.len(), 4096);
-        assert_eq!(&encoded[..8], b"KRVWC008");
+        #[cfg(feature = "experimental-fleet-signing")]
+        assert_eq!(COMMAND_MAGIC, b"KRVWC009");
+        #[cfg(not(feature = "experimental-fleet-signing"))]
+        assert_eq!(COMMAND_MAGIC, b"KRVWC008");
+        assert_eq!(&encoded[..8], COMMAND_MAGIC);
         assert_eq!(WorkerCommand::decode(&encoded), Ok(persist));
 
         let mut noncanonical = encoded;
@@ -4144,7 +4148,11 @@ mod tests {
             WorkerResponse::repair(41, WorkerResultCode::RepairBackupDurable, durable.clone());
         let encoded = response.encode().expect("repair response frame");
         assert_eq!(encoded.len(), 4096);
-        assert_eq!(&encoded[..8], b"KRVWR008");
+        #[cfg(feature = "experimental-fleet-signing")]
+        assert_eq!(RESPONSE_MAGIC, b"KRVWR009");
+        #[cfg(not(feature = "experimental-fleet-signing"))]
+        assert_eq!(RESPONSE_MAGIC, b"KRVWR008");
+        assert_eq!(&encoded[..8], RESPONSE_MAGIC);
         assert_eq!(WorkerResponse::decode(&encoded), Ok(response));
 
         let durable_protocol = durable.to_protocol().expect("durable protocol status");
@@ -4214,7 +4222,7 @@ mod tests {
             .encode()
             .expect("maximal nested rollback begin frame");
         assert_eq!(encoded.len(), 4096);
-        assert_eq!(&encoded[..8], b"KRVWC008");
+        assert_eq!(&encoded[..8], COMMAND_MAGIC);
         assert_eq!(WorkerCommand::decode(&encoded), Ok(rollback_begin));
 
         let rollback_pending = RepairRollbackTransactionStatusPayload::pending(
@@ -4301,7 +4309,7 @@ mod tests {
         ] {
             let encoded = response.encode().expect("rollback response frame");
             assert_eq!(encoded.len(), 4096);
-            assert_eq!(&encoded[..8], b"KRVWR008");
+            assert_eq!(&encoded[..8], RESPONSE_MAGIC);
             assert_eq!(WorkerResponse::decode(&encoded), Ok(response));
         }
 

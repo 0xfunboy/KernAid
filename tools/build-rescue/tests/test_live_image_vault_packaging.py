@@ -643,7 +643,7 @@ class VaultLivePolicyTests(unittest.TestCase):
         self.assertGreaterEqual(build.count("install -o root -g root -m 0755"), 2)
         self.assertIn("trap cleanup_staged_binaries EXIT", build)
         self.assertIn('rmdir -- "$vaultctl_destination_dir"', build)
-        self.assertEqual(build.count("verify-shipping-binary.py"), 14)
+        self.assertEqual(build.count("verify-shipping-binary.py"), 15)
         self.assertIn("--profile tauri-webkit", build)
         self.assertNotIn("cargo build", build)
 
