@@ -35,10 +35,88 @@ jobs:
           -p kernaid-fleet-resident-work-orders
           --features windows-service
           --bin kernaid-fleet-resident-windows
-      - name: Upload explicitly unsigned development binary
+      - name: Assemble deterministic deployment bundle
+        id: package
+        shell: python
+        env:
+          SOURCE_COMMIT: ${{ github.sha }}
+        run: |
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import zipfile
+
+          root = pathlib.Path.cwd()
+          version = "0.1.0"
+          stem = f"KernAid-Fleet-Resident-windows-x86_64-v{version}-UNSIGNED"
+          staging = root / "dist" / stem
+          staging.mkdir(parents=True, exist_ok=False)
+          members = {
+              "KernAid-Fleet-Resident.exe": root / "target/x86_64-pc-windows-gnu/release/kernaid-fleet-resident-windows.exe",
+              "config.example.json": root / "deploy/fleet-resident-windows/config.example.json",
+              "INSTALL.md": root / "deploy/fleet-resident-windows/README.md",
+          }
+          for name, source in members.items():
+              (staging / name).write_bytes(source.read_bytes())
+          executable = (staging / "KernAid-Fleet-Resident.exe").read_bytes()
+          package_manifest = {
+              "architecture": "x86_64",
+              "authenticode": {"required": True, "status": "not-applied"},
+              "executable": {
+                  "bytes": len(executable),
+                  "name": "KernAid-Fleet-Resident.exe",
+                  "sha256": hashlib.sha256(executable).hexdigest(),
+              },
+              "schema": "dev.kernaid.fleet-resident-windows-package.v1",
+              "source": {
+                  "commit": os.environ["SOURCE_COMMIT"],
+                  "repository": "0xfunboy/KernAid",
+                  "workflow": ".github/workflows/fleet-resident-windows.yml",
+              },
+              "version": version,
+          }
+          manifest_name = "KernAid-Fleet-Resident.package.json"
+          (staging / manifest_name).write_bytes(
+              json.dumps(package_manifest, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode()
+          )
+          notice_name = "AUTHENTICODE-REQUIRED.txt"
+          (staging / notice_name).write_text(
+              "This internal build has not received the required Microsoft Authenticode signature.\n",
+              encoding="utf-8",
+              newline="\n",
+          )
+          archive = root / "dist" / f"{stem}.zip"
+          order = [notice_name, "INSTALL.md", "KernAid-Fleet-Resident.exe", manifest_name, "config.example.json"]
+          with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as bundle:
+              for name in order:
+                  info = zipfile.ZipInfo(name, (1980, 1, 1, 0, 0, 0))
+                  info.compress_type = zipfile.ZIP_DEFLATED
+                  info.external_attr = 0o100644 << 16
+                  bundle.writestr(info, (staging / name).read_bytes())
+          archive_bytes = archive.read_bytes()
+          digest = hashlib.sha256(archive_bytes).hexdigest()
+          checksum = archive.with_suffix(".zip.sha256")
+          checksum.write_text(f"{digest}  {archive.name}\n", encoding="ascii", newline="\n")
+          release = archive.with_suffix(".release.json")
+          release.write_bytes(json.dumps({
+              "architecture": "x86_64",
+              "authenticodeStatus": "required-external",
+              "bytes": len(archive_bytes),
+              "filename": archive.name,
+              "schema": "dev.kernaid.fleet-resident-windows-download.v1",
+              "sha256": digest,
+              "version": version,
+          }, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode())
+          with pathlib.Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+              output.write(f"artifact_name={stem}\narchive={archive}\nchecksum={checksum}\nrelease={release}\n")
+      - name: Upload explicitly unsigned deployment bundle
         uses: actions/upload-artifact@v4
         with:
-          name: KernAid-Fleet-Resident-windows-x86_64-UNSIGNED
-          path: target/x86_64-pc-windows-gnu/release/kernaid-fleet-resident-windows.exe
+          name: ${{ steps.package.outputs.artifact_name }}
+          path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.checksum }}
+            ${{ steps.package.outputs.release }}
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 14
