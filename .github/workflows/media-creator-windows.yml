@@ -9,13 +9,32 @@ permissions:
 jobs:
   cross-build-windows-x86-64:
     runs-on: ubuntu-24.04
+    env:
+      KERNAID_MEDIA_BUNDLE_TRUST_ANCHOR: ${{ vars.KERNAID_MEDIA_BUNDLE_TRUST_ANCHOR }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88.0
         with:
           targets: x86_64-pc-windows-gnu
       - name: Install Windows GNU linker
-        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends gcc-mingw-w64-x86-64
+        run: >-
+          sudo apt-get update && sudo apt-get install --yes --no-install-recommends
+          binutils-mingw-w64-x86-64 gcc-mingw-w64-x86-64
+      - name: Require canonical public release-bundle anchor
+        shell: python
+        run: |
+          import base64
+          import os
+          import re
+
+          value = os.environ.get("KERNAID_MEDIA_BUNDLE_TRUST_ANCHOR", "")
+          if not re.fullmatch(r"[A-Za-z0-9_-]{43}", value):
+              raise SystemExit(
+                  "Repository variable KERNAID_MEDIA_BUNDLE_TRUST_ANCHOR must be a raw Ed25519 public key in canonical base64url"
+              )
+          raw = base64.urlsafe_b64decode(value + "=")
+          if len(raw) != 32 or base64.urlsafe_b64encode(raw).decode().rstrip("=") != value:
+              raise SystemExit("release-bundle trust anchor is not canonical")
       - name: Targeted core tests
         run: cargo test --locked -p kernaid-media-creator-core
       - name: Cross-build unsigned Windows executable
@@ -23,11 +42,102 @@ jobs:
           cargo build --locked --release
           --target x86_64-pc-windows-gnu
           -p kernaid-media-creator-windows
-          --features windows-cli
-      - name: Upload explicitly unsigned development binary
+          --features windows-wizard
+      - name: Build deterministic site publish set
+        id: package
+        shell: python
+        env:
+          SOURCE_COMMIT: ${{ github.sha }}
+        run: |
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import subprocess
+          import zipfile
+
+          root = pathlib.Path.cwd()
+          cargo = json.loads(subprocess.check_output(
+              ["cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"],
+              text=True,
+          ))
+          package = next(
+              item for item in cargo["packages"]
+              if item["name"] == "kernaid-media-creator-windows"
+          )
+          version = package["version"]
+          stem = f"KernAid-Media-Creator-windows-x86_64-v{version}-UNSIGNED"
+          output = root / "dist" / stem
+          output.mkdir(parents=True, exist_ok=False)
+          built = root / "target/x86_64-pc-windows-gnu/release/kernaid-media-creator.exe"
+          executable = output / "KernAid-Media-Creator.exe"
+          executable.write_bytes(built.read_bytes())
+          executable_bytes = executable.read_bytes()
+          executable_sha256 = hashlib.sha256(executable_bytes).hexdigest()
+          package_manifest = {
+              "architecture": "x86_64",
+              "authenticode": {"required": True, "status": "not-applied"},
+              "executable": {
+                  "bytes": len(executable_bytes),
+                  "name": executable.name,
+                  "sha256": executable_sha256,
+              },
+              "schema": "dev.kernaid.media-creator-package.v1",
+              "source": {
+                  "commit": os.environ["SOURCE_COMMIT"],
+                  "repository": "0xfunboy/KernAid",
+                  "workflow": ".github/workflows/media-creator-windows.yml",
+              },
+              "version": version,
+          }
+          manifest_name = "KernAid-Media-Creator.package.json"
+          (output / manifest_name).write_bytes(
+              json.dumps(package_manifest, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode()
+          )
+          notice_name = "AUTHENTICODE-REQUIRED.txt"
+          (output / notice_name).write_text(
+              "This build has not received the required external Microsoft Authenticode signature.\n"
+              "Do not publish it as a production download until signing and release verification pass.\n",
+              encoding="utf-8",
+              newline="\n",
+          )
+          archive = root / "dist" / f"{stem}.zip"
+          with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as bundle:
+              for name in [notice_name, "KernAid-Media-Creator.exe", manifest_name]:
+                  info = zipfile.ZipInfo(name, (1980, 1, 1, 0, 0, 0))
+                  info.compress_type = zipfile.ZIP_DEFLATED
+                  info.external_attr = 0o100644 << 16
+                  bundle.writestr(info, (output / name).read_bytes())
+          archive_bytes = archive.read_bytes()
+          archive_sha256 = hashlib.sha256(archive_bytes).hexdigest()
+          checksum = archive.with_suffix(".zip.sha256")
+          checksum.write_text(f"{archive_sha256}  {archive.name}\n", encoding="ascii", newline="\n")
+          release = {
+              "architecture": "x86_64",
+              "authenticodeStatus": "required-external",
+              "bytes": len(archive_bytes),
+              "filename": archive.name,
+              "packageManifest": manifest_name,
+              "schema": "dev.kernaid.media-creator-download.v1",
+              "sha256": archive_sha256,
+              "version": version,
+          }
+          release_path = archive.with_suffix(".release.json")
+          release_path.write_bytes(
+              json.dumps(release, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode()
+          )
+          with pathlib.Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as handle:
+              handle.write(f"artifact_name={stem}\n")
+              handle.write(f"archive={archive}\n")
+              handle.write(f"checksum={checksum}\n")
+              handle.write(f"release={release_path}\n")
+      - name: Upload one explicitly unsigned site publish set
         uses: actions/upload-artifact@v4
         with:
-          name: KernAid-Media-Creator-windows-x86_64-UNSIGNED
-          path: target/x86_64-pc-windows-gnu/release/kernaid-media-creator.exe
+          name: ${{ steps.package.outputs.artifact_name }}
+          path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.checksum }}
+            ${{ steps.package.outputs.release }}
           if-no-files-found: error
           retention-days: 7

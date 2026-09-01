@@ -4,7 +4,9 @@
 //! and qualification manifest. Disk discovery/opening remains a platform
 //! adapter responsibility; the public workflow never accepts a device path.
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{SecondsFormat, Utc};
+use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
 use lzma_rust2::{Action, Status, XzStream};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -19,7 +21,10 @@ pub const CATALOG_SCHEMA: &str = "dev.kernaid.trusted-rescue-images.v2";
 pub const QUALIFICATION_SCHEMA: &str = "dev.kernaid.rescue-qualified-release.v1";
 pub const RETAIL_SCHEMA: &str = "dev.kernaid.rescue-retail-image.v1";
 pub const REPORT_SCHEMA: &str = "dev.kernaid.media-creator-report.v1";
+pub const RELEASE_BUNDLE_SCHEMA: &str = "dev.kernaid.media-release-bundle.v1";
+pub const RELEASE_BUNDLE_MANIFEST_NAME: &str = "KernAid-Rescue-amd64.media-bundle.json";
 pub const CATALOG_NAME: &str = "KernAid-Rescue-amd64.catalog-entry-v2.json";
+pub const QUALIFICATION_NAME: &str = "KernAid-Rescue-amd64.qualified.json";
 pub const RETAIL_NAME: &str = "KernAid-Rescue-amd64-retail.img.xz";
 pub const RETAIL_METADATA_NAME: &str = "KernAid-Rescue-amd64-retail.json";
 pub const RAW_NAME: &str = "KernAid-Rescue-amd64-retail.img";
@@ -33,6 +38,8 @@ const P3_ZERO_SHA256: &str = "ebfb4ef19ae410f190327b5ebd312711263bc7579970e87d9c
 const IO_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 const XZ_MEMORY_LIMIT_KIB: u32 = 256 * 1024;
 const MAX_JSON_BYTES: usize = 16 * 1024 * 1024;
+const MAX_BUNDLE_MANIFEST_BYTES: usize = 64 * 1024;
+pub const RELEASE_BUNDLE_SIGNING_DOMAIN: &[u8] = b"kernaid:media-release-bundle:v1\0";
 
 #[derive(Debug)]
 pub enum Error {
@@ -96,6 +103,237 @@ impl AuthorizedImage {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct SignedReleaseBundleManifest {
+    schema: String,
+    artifact_version: String,
+    files: ReleaseBundleFiles,
+    key_id: String,
+    signature: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct ReleaseBundleFiles {
+    catalog_entry: ReleaseBundleFile,
+    qualification: ReleaseBundleFile,
+    retail_image: ReleaseBundleFile,
+    retail_metadata: ReleaseBundleFile,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct ReleaseBundleFile {
+    name: String,
+    bytes: u64,
+    sha256: String,
+}
+
+/// Decode the raw Ed25519 release-bundle trust anchor embedded by the Windows
+/// build. The bundle cannot provide or replace its own trust anchor.
+pub fn decode_release_bundle_trust_anchor(encoded: &str) -> Result<[u8; 32], Error> {
+    if encoded.len() != 43
+        || !encoded
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(Error::InvalidInput(
+            "release bundle trust anchor is not canonical base64url",
+        ));
+    }
+    let decoded = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| Error::InvalidInput("release bundle trust anchor is invalid"))?;
+    let raw: [u8; 32] = decoded
+        .try_into()
+        .map_err(|_| Error::InvalidInput("release bundle trust anchor length is invalid"))?;
+    if URL_SAFE_NO_PAD.encode(raw) != encoded {
+        return Err(Error::InvalidInput(
+            "release bundle trust anchor is not canonical base64url",
+        ));
+    }
+    VerifyingKey::from_bytes(&raw)
+        .map_err(|_| Error::InvalidInput("release bundle trust anchor is invalid"))?;
+    Ok(raw)
+}
+
+/// Verify one canonical signed local release bundle and bind its three JSON
+/// inputs plus the retail archive descriptor before returning an image
+/// authorization. The caller must open only the four fixed sibling filenames
+/// named by this contract; it never accepts paths from the manifest.
+pub fn authorize_release_bundle(
+    trusted_catalog_bytes: &[u8],
+    bundle_manifest_bytes: &[u8],
+    trust_anchor: &[u8; 32],
+    catalog_entry_bytes: &[u8],
+    qualification_bytes: &[u8],
+    retail_metadata_bytes: &[u8],
+) -> Result<AuthorizedImage, Error> {
+    let bundle = verify_release_bundle_manifest(bundle_manifest_bytes, trust_anchor)?;
+    verify_bundle_bytes(
+        &bundle.files.catalog_entry,
+        CATALOG_NAME,
+        MAX_JSON_BYTES as u64,
+        catalog_entry_bytes,
+    )?;
+    verify_bundle_bytes(
+        &bundle.files.qualification,
+        QUALIFICATION_NAME,
+        MAX_JSON_BYTES as u64,
+        qualification_bytes,
+    )?;
+    verify_bundle_bytes(
+        &bundle.files.retail_metadata,
+        RETAIL_METADATA_NAME,
+        MAX_JSON_BYTES as u64,
+        retail_metadata_bytes,
+    )?;
+    validate_bundle_file(
+        &bundle.files.retail_image,
+        RETAIL_NAME,
+        MAX_COMPRESSED_BYTES,
+    )?;
+
+    let authorized = authorize_release(
+        trusted_catalog_bytes,
+        catalog_entry_bytes,
+        qualification_bytes,
+        retail_metadata_bytes,
+    )?;
+    if bundle.artifact_version != authorized.artifact_version
+        || bundle.files.retail_image.bytes != authorized.compressed_bytes
+        || bundle.files.retail_image.sha256 != authorized.compressed_sha256
+    {
+        return Err(Error::InvalidInput(
+            "signed bundle version or image differs from qualification",
+        ));
+    }
+    Ok(authorized)
+}
+
+fn verify_release_bundle_manifest(
+    bytes: &[u8],
+    trust_anchor: &[u8; 32],
+) -> Result<SignedReleaseBundleManifest, Error> {
+    if bytes.is_empty() || bytes.len() > MAX_BUNDLE_MANIFEST_BYTES {
+        return Err(Error::InvalidInput(
+            "release bundle manifest is empty or exceeds its bound",
+        ));
+    }
+    let manifest: SignedReleaseBundleManifest = serde_json::from_slice(bytes)?;
+    let full_value = serde_json::to_value(&manifest)?;
+    if canonical_json(&full_value)?.as_bytes() != bytes {
+        return Err(Error::InvalidInput(
+            "release bundle manifest must be canonical JSON",
+        ));
+    }
+    if manifest.schema != RELEASE_BUNDLE_SCHEMA
+        || !valid_artifact_version(&manifest.artifact_version)
+    {
+        return Err(Error::InvalidInput(
+            "release bundle schema or version is invalid",
+        ));
+    }
+    validate_bundle_file(
+        &manifest.files.catalog_entry,
+        CATALOG_NAME,
+        MAX_JSON_BYTES as u64,
+    )?;
+    validate_bundle_file(
+        &manifest.files.qualification,
+        QUALIFICATION_NAME,
+        MAX_JSON_BYTES as u64,
+    )?;
+    validate_bundle_file(
+        &manifest.files.retail_metadata,
+        RETAIL_METADATA_NAME,
+        MAX_JSON_BYTES as u64,
+    )?;
+    validate_bundle_file(
+        &manifest.files.retail_image,
+        RETAIL_NAME,
+        MAX_COMPRESSED_BYTES,
+    )?;
+
+    let expected_key_id = format!("sha256:{}", sha256_hex(trust_anchor));
+    if manifest.key_id != expected_key_id {
+        return Err(Error::InvalidInput(
+            "release bundle signer does not match the embedded trust anchor",
+        ));
+    }
+    let signature_bytes = URL_SAFE_NO_PAD
+        .decode(&manifest.signature)
+        .map_err(|_| Error::InvalidInput("release bundle signature is invalid"))?;
+    let signature_raw: [u8; 64] = signature_bytes
+        .try_into()
+        .map_err(|_| Error::InvalidInput("release bundle signature length is invalid"))?;
+    if URL_SAFE_NO_PAD.encode(signature_raw) != manifest.signature {
+        return Err(Error::InvalidInput(
+            "release bundle signature is not canonical base64url",
+        ));
+    }
+    let mut unsigned = full_value;
+    unsigned
+        .as_object_mut()
+        .ok_or(Error::InvalidInput(
+            "release bundle manifest root is invalid",
+        ))?
+        .remove("signature");
+    let canonical_unsigned = canonical_json(&unsigned)?;
+    let mut message =
+        Vec::with_capacity(RELEASE_BUNDLE_SIGNING_DOMAIN.len() + canonical_unsigned.len());
+    message.extend_from_slice(RELEASE_BUNDLE_SIGNING_DOMAIN);
+    message.extend_from_slice(canonical_unsigned.as_bytes());
+    let verifying_key = VerifyingKey::from_bytes(trust_anchor)
+        .map_err(|_| Error::InvalidInput("release bundle trust anchor is invalid"))?;
+    verifying_key
+        .verify(&message, &Signature::from_bytes(&signature_raw))
+        .map_err(|_| Error::InvalidInput("release bundle signature verification failed"))?;
+    Ok(manifest)
+}
+
+fn validate_bundle_file(
+    file: &ReleaseBundleFile,
+    expected_name: &str,
+    maximum_bytes: u64,
+) -> Result<(), Error> {
+    if file.name != expected_name
+        || file.bytes == 0
+        || file.bytes > maximum_bytes
+        || !valid_sha256(&file.sha256)
+    {
+        return Err(Error::InvalidInput(
+            "release bundle file descriptor is invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_bundle_bytes(
+    file: &ReleaseBundleFile,
+    expected_name: &str,
+    maximum_bytes: u64,
+    bytes: &[u8],
+) -> Result<(), Error> {
+    validate_bundle_file(file, expected_name, maximum_bytes)?;
+    if file.bytes != bytes.len() as u64 || file.sha256 != sha256_hex(bytes) {
+        return Err(Error::InvalidInput(
+            "release bundle member does not match its signed manifest",
+        ));
+    }
+    Ok(())
+}
+
+fn valid_artifact_version(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value.as_bytes()[0].is_ascii_alphanumeric()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-'))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiskCandidate {
     pub opaque_id: String,
@@ -152,6 +390,20 @@ impl ConfirmedSelection {
     pub fn candidate(&self) -> &DiskCandidate {
         &self.0
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MediaPhase {
+    ValidatingArchive,
+    WritingUsb,
+    VerifyingUsb,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MediaProgress {
+    pub phase: MediaPhase,
+    pub completed_bytes: u64,
+    pub total_bytes: u64,
 }
 
 /// An adapter must bind opaque IDs to its own latest enumeration snapshot and
@@ -302,6 +554,36 @@ fn parse_json(bytes: &[u8]) -> Result<Value, Error> {
         ));
     }
     Ok(serde_json::from_slice(bytes)?)
+}
+
+fn canonical_json(value: &Value) -> Result<String, Error> {
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
+            Ok(serde_json::to_string(value)?)
+        }
+        Value::Array(values) => {
+            let items = values
+                .iter()
+                .map(canonical_json)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(format!("[{}]", items.join(",")))
+        }
+        Value::Object(values) => {
+            let mut keys = values.keys().collect::<Vec<_>>();
+            keys.sort();
+            let fields = keys
+                .into_iter()
+                .map(|key| {
+                    Ok(format!(
+                        "{}:{}",
+                        serde_json::to_string(key)?,
+                        canonical_json(&values[key])?
+                    ))
+                })
+                .collect::<Result<Vec<_>, Error>>()?;
+            Ok(format!("{{{}}}", fields.join(",")))
+        }
+    }
 }
 
 /// Bind the retail archive to its qualification manifest and the embedded or
@@ -650,11 +932,30 @@ pub fn verify_archive<R: Read + Seek>(
     source: &mut R,
     image: &AuthorizedImage,
 ) -> Result<(), Error> {
+    verify_archive_with_progress(source_name, source, image, &mut |_| {})
+}
+
+fn verify_archive_with_progress<R: Read + Seek>(
+    source_name: &str,
+    source: &mut R,
+    image: &AuthorizedImage,
+    progress: &mut impl FnMut(MediaProgress),
+) -> Result<(), Error> {
     if source_name != RETAIL_NAME {
         return Err(Error::InvalidInput("retail archive filename is not exact"));
     }
     source.seek(SeekFrom::Start(0))?;
-    let (bytes, digest) = hash_exact(source, image.compressed_bytes + 1)?;
+    progress(MediaProgress {
+        phase: MediaPhase::ValidatingArchive,
+        completed_bytes: 0,
+        total_bytes: image.compressed_bytes,
+    });
+    let (bytes, digest) = hash_exact(
+        source,
+        image.compressed_bytes + 1,
+        image.compressed_bytes,
+        progress,
+    )?;
     if bytes != image.compressed_bytes || digest != image.compressed_sha256 {
         return Err(Error::InvalidInput(
             "retail archive size or SHA-256 does not match qualification",
@@ -733,18 +1034,44 @@ pub fn create_media<B: DiskBackend, R: Read + Seek>(
     source: &mut R,
     image: &AuthorizedImage,
 ) -> Result<CreationReport, Error> {
-    verify_archive(source_name, source, image)?;
+    create_media_with_progress(backend, confirmed, source_name, source, image, |_| {})
+}
+
+pub fn create_media_with_progress<B, R, P>(
+    backend: &mut B,
+    confirmed: ConfirmedSelection,
+    source_name: &str,
+    source: &mut R,
+    image: &AuthorizedImage,
+    mut progress: P,
+) -> Result<CreationReport, Error>
+where
+    B: DiskBackend,
+    R: Read + Seek,
+    P: FnMut(MediaProgress),
+{
+    verify_archive_with_progress(source_name, source, image, &mut progress)?;
     let selected = confirmed.0;
     let mut target = backend.open_revalidated(&selected)?;
     target.seek(SeekFrom::Start(0))?;
-    let written_sha = stream_xz(source, &mut target, image.raw_bytes)?;
+    progress(MediaProgress {
+        phase: MediaPhase::WritingUsb,
+        completed_bytes: 0,
+        total_bytes: image.raw_bytes,
+    });
+    let written_sha = stream_xz(source, &mut target, image.raw_bytes, &mut progress)?;
     if written_sha != image.raw_sha256 {
         return Err(Error::InvalidInput("decompressed image SHA-256 is invalid"));
     }
     target.flush()?;
     target.sync_all()?;
     target.seek(SeekFrom::Start(0))?;
-    let readback_sha = hash_prefix(&mut target, image.raw_bytes)?;
+    progress(MediaProgress {
+        phase: MediaPhase::VerifyingUsb,
+        completed_bytes: 0,
+        total_bytes: image.raw_bytes,
+    });
+    let readback_sha = hash_prefix(&mut target, image.raw_bytes, &mut progress)?;
     if readback_sha != image.raw_sha256 {
         return Err(Error::InvalidInput("USB readback SHA-256 did not match"));
     }
@@ -775,6 +1102,7 @@ fn stream_xz(
     source: &mut impl Read,
     target: &mut impl Write,
     expected_bytes: u64,
+    progress: &mut impl FnMut(MediaProgress),
 ) -> Result<String, Error> {
     let mut decoder = XzStream::new_mem_limit(true, XZ_MEMORY_LIMIT_KIB);
     let mut input = vec![0_u8; IO_CHUNK_BYTES];
@@ -806,6 +1134,11 @@ fn stream_xz(
             target.write_all(&output[..result.bytes_produced])?;
             raw_hasher.update(&output[..result.bytes_produced]);
             remaining -= result.bytes_produced as u64;
+            progress(MediaProgress {
+                phase: MediaPhase::WritingUsb,
+                completed_bytes: expected_bytes - remaining,
+                total_bytes: expected_bytes,
+            });
         }
         if result.status == Status::StreamEnd {
             break;
@@ -824,7 +1157,12 @@ fn stream_xz(
     Ok(format!("{:x}", raw_hasher.finalize()))
 }
 
-fn hash_exact(reader: &mut impl Read, maximum: u64) -> Result<(u64, String), Error> {
+fn hash_exact(
+    reader: &mut impl Read,
+    maximum: u64,
+    expected: u64,
+    progress: &mut impl FnMut(MediaProgress),
+) -> Result<(u64, String), Error> {
     let mut hasher = Sha256::new();
     let mut total = 0_u64;
     let mut buffer = vec![0_u8; IO_CHUNK_BYTES];
@@ -840,11 +1178,20 @@ fn hash_exact(reader: &mut impl Read, maximum: u64) -> Result<(u64, String), Err
             return Err(Error::InvalidInput("input exceeds its declared bound"));
         }
         hasher.update(&buffer[..read]);
+        progress(MediaProgress {
+            phase: MediaPhase::ValidatingArchive,
+            completed_bytes: total.min(expected),
+            total_bytes: expected,
+        });
     }
     Ok((total, format!("{:x}", hasher.finalize())))
 }
 
-fn hash_prefix(reader: &mut impl Read, bytes: u64) -> Result<String, Error> {
+fn hash_prefix(
+    reader: &mut impl Read,
+    bytes: u64,
+    progress: &mut impl FnMut(MediaProgress),
+) -> Result<String, Error> {
     let mut hasher = Sha256::new();
     let mut remaining = bytes;
     let mut buffer = vec![0_u8; IO_CHUNK_BYTES];
@@ -859,6 +1206,11 @@ fn hash_prefix(reader: &mut impl Read, bytes: u64) -> Result<String, Error> {
         }
         hasher.update(&buffer[..read]);
         remaining -= read as u64;
+        progress(MediaProgress {
+            phase: MediaPhase::VerifyingUsb,
+            completed_bytes: bytes - remaining,
+            total_bytes: bytes,
+        });
     }
     Ok(format!("{:x}", hasher.finalize()))
 }
@@ -878,6 +1230,7 @@ impl MediaHandle for std::fs::File {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::{Signer as _, SigningKey};
     use lzma_rust2::{XzOptions, XzWriter};
     use serde_json::json;
     use std::{
@@ -907,6 +1260,40 @@ mod tests {
             catalog_sha256: "1".repeat(64),
             qualification_sha256: "2".repeat(64),
         }
+    }
+
+    fn signed_bundle_manifest(
+        artifact_version: &str,
+        catalog_entry: &[u8],
+        qualification: &[u8],
+        retail_metadata: &[u8],
+        retail_bytes: u64,
+        retail_sha256: &str,
+        signing_key: &SigningKey,
+    ) -> Result<Vec<u8>, Error> {
+        let trust_anchor = signing_key.verifying_key().to_bytes();
+        let mut manifest = json!({
+            "artifactVersion": artifact_version,
+            "files": {
+                "catalogEntry": {"bytes": catalog_entry.len(), "name": CATALOG_NAME, "sha256": digest(catalog_entry)},
+                "qualification": {"bytes": qualification.len(), "name": QUALIFICATION_NAME, "sha256": digest(qualification)},
+                "retailImage": {"bytes": retail_bytes, "name": RETAIL_NAME, "sha256": retail_sha256},
+                "retailMetadata": {"bytes": retail_metadata.len(), "name": RETAIL_METADATA_NAME, "sha256": digest(retail_metadata)}
+            },
+            "keyId": format!("sha256:{}", digest(&trust_anchor)),
+            "schema": RELEASE_BUNDLE_SCHEMA
+        });
+        let unsigned = canonical_json(&manifest)?;
+        let mut message = RELEASE_BUNDLE_SIGNING_DOMAIN.to_vec();
+        message.extend_from_slice(unsigned.as_bytes());
+        manifest
+            .as_object_mut()
+            .ok_or(Error::InvalidInput("test manifest"))?
+            .insert(
+                "signature".to_owned(),
+                Value::String(URL_SAFE_NO_PAD.encode(signing_key.sign(&message).to_bytes())),
+            );
+        Ok(canonical_json(&manifest)?.into_bytes())
     }
 
     fn candidate(id: &str) -> DiskCandidate {
@@ -1017,18 +1404,40 @@ mod tests {
         let confirmed =
             select_disk(&candidates, &eligible[0])?.confirm("ERASE KERNAID USB KAUSB-test0001")?;
         let mut source = Cursor::new(compressed);
-        let report = create_media(
+        let mut progress = Vec::new();
+        let report = create_media_with_progress(
             &mut backend,
             confirmed,
             RETAIL_NAME,
             &mut source,
             &authorized,
+            |event| progress.push(event),
         )?;
         assert_eq!(backend.opens, 1);
         assert_eq!(report.raw_sha256, digest(&raw));
         assert_eq!(report.readback_sha256, digest(&raw));
         let written = fs::read(&backend.path)?;
         assert_eq!(&written[..raw.len()], raw.as_slice());
+        for phase in [
+            MediaPhase::ValidatingArchive,
+            MediaPhase::WritingUsb,
+            MediaPhase::VerifyingUsb,
+        ] {
+            let events = progress
+                .iter()
+                .filter(|event| event.phase == phase)
+                .collect::<Vec<_>>();
+            assert!(!events.is_empty());
+            assert_eq!(events.first().map(|event| event.completed_bytes), Some(0));
+            assert_eq!(
+                events.last().map(|event| event.completed_bytes),
+                events.last().map(|event| event.total_bytes)
+            );
+            assert!(events.windows(2).all(|pair| {
+                pair[0].completed_bytes <= pair[1].completed_bytes
+                    && pair[0].total_bytes == pair[1].total_bytes
+            }));
+        }
         Ok(())
     }
 
@@ -1141,6 +1550,107 @@ mod tests {
         assert_eq!(
             authorized.artifact_version(),
             entry["artifactVersion"].as_str().ok_or("version")?
+        );
+
+        let signing_key = SigningKey::from_bytes(&[0x42; 32]);
+        let bundle_manifest = signed_bundle_manifest(
+            authorized.artifact_version(),
+            &entry_bytes,
+            &qualification_bytes,
+            &metadata_bytes,
+            authorized.compressed_bytes(),
+            authorized.compressed_sha256(),
+            &signing_key,
+        )?;
+        let bundle_authorized = authorize_release_bundle(
+            trusted,
+            &bundle_manifest,
+            &signing_key.verifying_key().to_bytes(),
+            &entry_bytes,
+            &qualification_bytes,
+            &metadata_bytes,
+        )?;
+        assert_eq!(
+            bundle_authorized.artifact_version(),
+            authorized.artifact_version()
+        );
+
+        let mut noncanonical_manifest = bundle_manifest.clone();
+        noncanonical_manifest.push(b'\n');
+        assert!(
+            authorize_release_bundle(
+                trusted,
+                &noncanonical_manifest,
+                &signing_key.verifying_key().to_bytes(),
+                &entry_bytes,
+                &qualification_bytes,
+                &metadata_bytes,
+            )
+            .is_err()
+        );
+        let mut unknown_field_manifest: Value = serde_json::from_slice(&bundle_manifest)?;
+        unknown_field_manifest
+            .as_object_mut()
+            .ok_or("bundle object")?
+            .insert(
+                "downloadUrl".to_owned(),
+                Value::String("https://invalid".to_owned()),
+            );
+        assert!(
+            authorize_release_bundle(
+                trusted,
+                canonical_json(&unknown_field_manifest)?.as_bytes(),
+                &signing_key.verifying_key().to_bytes(),
+                &entry_bytes,
+                &qualification_bytes,
+                &metadata_bytes,
+            )
+            .is_err()
+        );
+        let mut tampered_signature_manifest: Value = serde_json::from_slice(&bundle_manifest)?;
+        let signature = tampered_signature_manifest["signature"]
+            .as_str()
+            .ok_or("bundle signature")?;
+        let replacement = if signature.starts_with('A') { 'B' } else { 'A' };
+        let changed_signature = format!("{replacement}{}", &signature[1..]);
+        tampered_signature_manifest["signature"] = Value::String(changed_signature);
+        assert!(
+            authorize_release_bundle(
+                trusted,
+                canonical_json(&tampered_signature_manifest)?.as_bytes(),
+                &signing_key.verifying_key().to_bytes(),
+                &entry_bytes,
+                &qualification_bytes,
+                &metadata_bytes,
+            )
+            .is_err()
+        );
+
+        let mut changed_qualification = qualification_bytes.clone();
+        changed_qualification.push(b' ');
+        assert!(
+            authorize_release_bundle(
+                trusted,
+                &bundle_manifest,
+                &signing_key.verifying_key().to_bytes(),
+                &entry_bytes,
+                &changed_qualification,
+                &metadata_bytes,
+            )
+            .is_err()
+        );
+        assert!(
+            authorize_release_bundle(
+                trusted,
+                &bundle_manifest,
+                &SigningKey::from_bytes(&[0x24; 32])
+                    .verifying_key()
+                    .to_bytes(),
+                &entry_bytes,
+                &qualification_bytes,
+                &metadata_bytes,
+            )
+            .is_err()
         );
 
         let mut tampered_entry = entry;

@@ -1,16 +1,18 @@
 use kernaid_media_creator_core::{
-    DiskBackend, DiskCandidate, Error as CoreError, MediaHandle, RETAIL_METADATA_NAME, RETAIL_NAME,
-    authorize_release, create_media, eligible_disks, select_disk, verify_archive,
+    AuthorizedImage, ConfirmedSelection, CreationReport, DiskBackend, DiskCandidate,
+    Error as CoreError, MediaHandle, MediaProgress, QUALIFICATION_NAME,
+    RELEASE_BUNDLE_MANIFEST_NAME, RETAIL_METADATA_NAME, RETAIL_NAME, authorize_release_bundle,
+    create_media_with_progress, decode_release_bundle_trust_anchor,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env,
     fs::{self, File, OpenOptions},
-    io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 use windows_sys::Win32::{
     Foundation::HANDLE,
@@ -23,14 +25,14 @@ use wmi::WMIConnection;
 
 const TRUSTED_CATALOG: &[u8] =
     include_bytes!("../../../tools/make-device/trusted-rescue-images.v2.json");
-const QUALIFICATION_NAME: &str = "KernAid-Rescue-amd64.qualified.json";
+const RELEASE_BUNDLE_TRUST_ANCHOR: &str = env!("KERNAID_MEDIA_BUNDLE_TRUST_ANCHOR");
+const MAX_BUNDLE_MANIFEST_BYTES: u64 = 64 * 1024;
 const MAX_METADATA_BYTES: u64 = 16 * 1024 * 1024;
 const FILE_SHARE_READ: u32 = 1;
 const FILE_SHARE_WRITE: u32 = 2;
 
 #[derive(Debug)]
 pub(crate) enum AppError {
-    Usage(&'static str),
     Message(String),
     Io(io::Error),
     Core(CoreError),
@@ -41,7 +43,6 @@ pub(crate) enum AppError {
 impl std::fmt::Display for AppError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Usage(message) => formatter.write_str(message),
             Self::Message(message) => formatter.write_str(message),
             Self::Io(error) => write!(formatter, "I/O error: {error}"),
             Self::Core(error) => write!(formatter, "{error}"),
@@ -83,133 +84,102 @@ impl From<serde_json::Error> for AppError {
     }
 }
 
-struct Arguments {
-    image: PathBuf,
-    catalog_entry: PathBuf,
-    qualification: PathBuf,
-    metadata: PathBuf,
-    report: PathBuf,
+#[derive(Clone)]
+pub(crate) struct LoadedRelease {
+    pub(crate) manifest_path: PathBuf,
+    pub(crate) image_path: PathBuf,
+    pub(crate) authorized: AuthorizedImage,
 }
 
-pub fn run() -> Result<(), AppError> {
-    let arguments = parse_arguments(env::args_os().skip(1))?;
-    require_name(&arguments.image, RETAIL_NAME)?;
-    require_name(
-        &arguments.catalog_entry,
-        kernaid_media_creator_core::CATALOG_NAME,
+#[derive(Clone)]
+pub(crate) struct CreatedMedia {
+    pub(crate) report_path: Option<PathBuf>,
+    pub(crate) report_warning: Option<String>,
+}
+
+pub(crate) fn load_release_bundle(path: &Path) -> Result<LoadedRelease, AppError> {
+    require_name(path, RELEASE_BUNDLE_MANIFEST_NAME)?;
+    let manifest = read_bounded(path, MAX_BUNDLE_MANIFEST_BYTES, "release bundle manifest")?;
+    let parent = path.parent().ok_or_else(|| {
+        AppError::Message("the release bundle must be inside a normal folder".to_owned())
+    })?;
+    let catalog_path = parent.join(kernaid_media_creator_core::CATALOG_NAME);
+    let qualification_path = parent.join(QUALIFICATION_NAME);
+    let metadata_path = parent.join(RETAIL_METADATA_NAME);
+    let image_path = parent.join(RETAIL_NAME);
+    let catalog = read_bounded(&catalog_path, MAX_METADATA_BYTES, "catalog entry")?;
+    let qualification = read_bounded(
+        &qualification_path,
+        MAX_METADATA_BYTES,
+        "qualification manifest",
     )?;
-    require_name(&arguments.qualification, QUALIFICATION_NAME)?;
-    require_name(&arguments.metadata, RETAIL_METADATA_NAME)?;
-    let qualification = read_bounded(&arguments.qualification, MAX_METADATA_BYTES)?;
-    let metadata = read_bounded(&arguments.metadata, MAX_METADATA_BYTES)?;
-    let catalog_entry = read_bounded(&arguments.catalog_entry, MAX_METADATA_BYTES)?;
-    let authorized = authorize_release(TRUSTED_CATALOG, &catalog_entry, &qualification, &metadata)?;
-    let mut image = OpenOptions::new().read(true).open(&arguments.image)?;
-    verify_archive(RETAIL_NAME, &mut image, &authorized)?;
-
-    let mut report_file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&arguments.report)
-        .map_err(|error| {
-            if error.kind() == io::ErrorKind::AlreadyExists {
-                AppError::Message("report path already exists; choose a new .json path".to_owned())
-            } else {
-                AppError::Io(error)
-            }
-        })?;
-
-    let mut backend = WindowsDiskBackend::new();
-    let snapshot = backend.enumerate()?;
-    let eligible = eligible_disks(&snapshot, &authorized);
-    if eligible.is_empty() {
+    let metadata = read_bounded(&metadata_path, MAX_METADATA_BYTES, "retail metadata")?;
+    let trust_anchor = decode_release_bundle_trust_anchor(RELEASE_BUNDLE_TRUST_ANCHOR)?;
+    let authorized = authorize_release_bundle(
+        TRUSTED_CATALOG,
+        &manifest,
+        &trust_anchor,
+        &catalog,
+        &qualification,
+        &metadata,
+    )?;
+    let image_metadata = fs::symlink_metadata(&image_path).map_err(|_| {
+        AppError::Message("the signed bundle is missing its retail image".to_owned())
+    })?;
+    if !image_metadata.file_type().is_file()
+        || image_metadata.len() != authorized.compressed_bytes()
+    {
         return Err(AppError::Message(
-            "no unambiguous, writable, whole removable USB disk of at least 32 GB was found"
+            "the retail image is not the exact regular file declared by the signed bundle"
                 .to_owned(),
         ));
     }
+    Ok(LoadedRelease {
+        manifest_path: path.to_path_buf(),
+        image_path,
+        authorized,
+    })
+}
 
-    println!("KernAid Media Creator\n");
-    println!("Qualified retail image: {}", authorized.artifact_version());
-    println!("Only these removable USB disks can be selected:\n");
-    for (index, disk) in eligible.iter().enumerate() {
-        println!(
-            "  {}. {} | serial {} | {} bytes | {}",
-            index + 1,
-            disk.model,
-            disk.serial,
-            disk.capacity_bytes,
-            disk.opaque_id
-        );
+pub(crate) fn create_release_media(
+    mut backend: WindowsDiskBackend,
+    confirmed: ConfirmedSelection,
+    release: LoadedRelease,
+    progress: impl FnMut(MediaProgress),
+) -> Result<CreatedMedia, AppError> {
+    let image_metadata = fs::symlink_metadata(&release.image_path)?;
+    if !image_metadata.file_type().is_file()
+        || image_metadata.len() != release.authorized.compressed_bytes()
+    {
+        return Err(AppError::Message(
+            "the signed retail image changed before verification".to_owned(),
+        ));
     }
-    println!("\nChoose disk number (or Ctrl+C to cancel):");
-    let stdin = io::stdin();
-    let mut input = BufReader::new(stdin.lock());
-    let choice = read_bounded_line(&mut input, 16)?;
-    let index = choice
-        .parse::<usize>()
-        .ok()
-        .and_then(|value| value.checked_sub(1))
-        .filter(|value| *value < eligible.len())
-        .ok_or(AppError::Message("disk selection is invalid".to_owned()))?;
-    let selection = select_disk(&snapshot, &eligible[index])?;
-    println!("\nALL DATA ON THIS USB DISK WILL BE ERASED.");
-    println!("Type exactly: {}", selection.confirmation_phrase());
-    let phrase = read_bounded_line(&mut input, 128)?;
-    let confirmed = selection.confirm(&phrase)?;
-
-    image.seek(SeekFrom::Start(0))?;
-    let report = create_media(
+    let mut image = OpenOptions::new().read(true).open(&release.image_path)?;
+    let report = create_media_with_progress(
         &mut backend,
         confirmed,
         RETAIL_NAME,
         &mut image,
-        &authorized,
+        &release.authorized,
+        progress,
     )?;
-    serde_json::to_writer_pretty(&mut report_file, &report)?;
-    report_file.write_all(b"\n")?;
-    report_file.sync_all()?;
-    println!("\nKernAid USB created and read back successfully.");
-    println!("Report: {}", arguments.report.display());
-    Ok(())
-}
-
-fn parse_arguments(
-    arguments: impl Iterator<Item = std::ffi::OsString>,
-) -> Result<Arguments, AppError> {
-    let mut values = BTreeMap::<String, PathBuf>::new();
-    let mut iterator = arguments;
-    while let Some(flag) = iterator.next() {
-        let flag = flag
-            .into_string()
-            .map_err(|_| AppError::Usage("argument names must be Unicode"))?;
-        if !matches!(
-            flag.as_str(),
-            "--image" | "--catalog-entry" | "--qualification" | "--metadata" | "--report"
-        ) || values.contains_key(&flag)
-        {
-            return Err(AppError::Usage(
-                "usage: kernaid-media-creator --image <retail.img.xz> --catalog-entry <catalog-entry-v2.json> --qualification <qualified.json> --metadata <retail.json> --report <new-report.json>",
-            ));
-        }
-        let value = iterator
-            .next()
-            .ok_or(AppError::Usage("argument value is missing"))?;
-        values.insert(flag, PathBuf::from(value));
+    let report_parent = release
+        .manifest_path
+        .parent()
+        .ok_or_else(|| AppError::Message("the release bundle folder is unavailable".to_owned()))?;
+    match save_report(report_parent, &report) {
+        Ok(report_path) => Ok(CreatedMedia {
+            report_path: Some(report_path),
+            report_warning: None,
+        }),
+        Err(error) => Ok(CreatedMedia {
+            report_path: None,
+            report_warning: Some(format!(
+                "The USB is ready, but the optional creation report could not be saved: {error}"
+            )),
+        }),
     }
-    let take = |name: &str| {
-        values
-            .get(name)
-            .cloned()
-            .ok_or(AppError::Usage("all five named paths are required"))
-    };
-    Ok(Arguments {
-        image: take("--image")?,
-        catalog_entry: take("--catalog-entry")?,
-        qualification: take("--qualification")?,
-        metadata: take("--metadata")?,
-        report: take("--report")?,
-    })
 }
 
 fn require_name(path: &Path, expected: &str) -> Result<(), AppError> {
@@ -221,30 +191,55 @@ fn require_name(path: &Path, expected: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-fn read_bounded(path: &Path, maximum: u64) -> Result<Vec<u8>, AppError> {
-    let metadata = fs::symlink_metadata(path)?;
+fn read_bounded(path: &Path, maximum: u64, label: &str) -> Result<Vec<u8>, AppError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|_| AppError::Message(format!("the signed bundle is missing {label}")))?;
     if !metadata.file_type().is_file() || metadata.len() == 0 || metadata.len() > maximum {
-        return Err(AppError::Message(
-            "metadata input is not a bounded regular file".to_owned(),
-        ));
+        return Err(AppError::Message(format!(
+            "{label} is not a bounded regular file"
+        )));
     }
     Ok(fs::read(path)?)
 }
 
-fn read_bounded_line(reader: &mut impl BufRead, maximum: u64) -> Result<String, AppError> {
-    let mut bytes = Vec::new();
-    let mut limited = reader.take(maximum + 1);
-    limited.read_until(b'\n', &mut bytes)?;
-    if bytes.len() as u64 > maximum || !bytes.ends_with(b"\n") {
-        return Err(AppError::Message(
-            "interactive input exceeded its bound".to_owned(),
-        ));
+fn create_report_file(parent: &Path) -> Result<(PathBuf, File), AppError> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| AppError::Message("the system clock is invalid".to_owned()))?
+        .as_secs();
+    for suffix in 0_u8..100 {
+        let name = if suffix == 0 {
+            format!("KernAid-Media-Creation-report-{timestamp}.json")
+        } else {
+            format!("KernAid-Media-Creation-report-{timestamp}-{suffix}.json")
+        };
+        let path = parent.join(name);
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(AppError::Io(error)),
+        }
     }
-    while matches!(bytes.last(), Some(b'\n' | b'\r')) {
-        bytes.pop();
+    Err(AppError::Message(
+        "a new creation report filename could not be reserved".to_owned(),
+    ))
+}
+
+fn save_report(parent: &Path, report: &CreationReport) -> Result<PathBuf, AppError> {
+    let (path, mut file) = create_report_file(parent)?;
+    if let Err(error) = write_report(&mut file, report) {
+        drop(file);
+        let _ = fs::remove_file(&path);
+        return Err(error);
     }
-    String::from_utf8(bytes)
-        .map_err(|_| AppError::Message("interactive input is not UTF-8".to_owned()))
+    Ok(path)
+}
+
+fn write_report(file: &mut File, report: &CreationReport) -> Result<(), AppError> {
+    serde_json::to_writer_pretty(&mut *file, report)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -253,12 +248,12 @@ struct SnapshotDisk {
     candidate: DiskCandidate,
 }
 
-struct WindowsDiskBackend {
+pub(crate) struct WindowsDiskBackend {
     snapshot: BTreeMap<String, SnapshotDisk>,
 }
 
 impl WindowsDiskBackend {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             snapshot: BTreeMap::new(),
         }
@@ -419,7 +414,7 @@ impl DiskBackend for WindowsDiskBackend {
             .map_err(|error| {
                 if error.kind() == io::ErrorKind::PermissionDenied {
                     CoreError::InvalidInput(
-                        "raw disk access was denied; start the terminal as Administrator and retry",
+                        "Windows did not grant administrator access to this removable USB drive",
                     )
                 } else {
                     CoreError::Io(error)
@@ -432,7 +427,7 @@ impl DiskBackend for WindowsDiskBackend {
     }
 }
 
-struct WindowsDisk {
+pub(crate) struct WindowsDisk {
     disk: File,
     _volume_locks: Vec<File>,
 }
