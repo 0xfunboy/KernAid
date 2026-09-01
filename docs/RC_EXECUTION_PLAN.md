@@ -1,8 +1,12 @@
 # KernAid seven-day RC execution plan
 
-This is the active delivery plan. Product scope and safety boundaries remain
-defined by [MASTERPLAN.md](MASTERPLAN.md); exact shipped behavior remains
-defined by [CURRENT_STATUS.md](CURRENT_STATUS.md).
+This plan is prepared for the next execution window and is currently paused
+after the diagnosis-release/site/documentation closeout requested by the
+owner. Resume it with the
+[AI product-completion directive](AI_PRODUCT_COMPLETION_DIRECTIVE.md).
+Product scope and safety boundaries remain defined by
+[MASTERPLAN.md](MASTERPLAN.md); exact shipped behavior remains defined by
+[CURRENT_STATUS.md](CURRENT_STATUS.md).
 
 ## Target
 
@@ -31,17 +35,40 @@ never claim otherwise.
 
 ## Delivery sequence
 
-| Active day | Integrated outcome |
+Workstreams run in parallel; the day column is a deadline, not a serialized
+queue.
+
+| Deadline | Integrated outcome |
 | --- | --- |
-| 1–2 | Boot branding, physical-rendering fallback, Vault/first-boot fixes, CI budget and one new diagnosis candidate |
-| 3 | One combined Rescue BIOS/UEFI, encrypted two-boot, Desktop packaging and repair-candidate cycle |
-| 4–5 | High-value bounded repair packs plus governed Fleet work orders, device client, console, policy, licensing, audit and updates |
-| 6 | Installable Resident services, trusted catalog, public/private site, operator and recovery documentation |
-| 7 | Final integrated qualification, exact artifact promotion and release-candidate publication |
+| Today | Qualify and promote the current diagnosis ISO, update the trusted catalog and authenticated site, and publish one unambiguous Windows download path. |
+| Day 2 | Close the consumer Rescue/Desk journey: guided diagnosis, offline fallback, Vault, report export, Media Creator and recovery instructions. |
+| Day 4 | Promote the four bounded Linux Rescue repairs after their combined apply/failure/rollback matrix; finish the corresponding approval and recovery UX. |
+| Day 5 | Close the Enterprise software loop across onboarding, Resident identity, restrictive policy, licensing, work orders, local approval, signed result, incidents, updates and audit. |
+| Day 6 | Complete the installable Linux/Windows/macOS Resident packages, Windows-native repair expansion and the customer-buildable WinPE companion path that Microsoft licensing permits. |
+| Day 7 | Run one final integrated matrix, publish the consumer and Enterprise RC artifacts, update the commercial/private site and freeze exact operator documentation. |
 
 ## Checkpoint — 1 September 2026
 
-Integrated in current source, but not automatically qualified or promoted:
+The closed diagnosis cohort is exact source commit
+`6e9742e5b0c4397728dde80e9a0a91a09214f7cd`. CI run `33486399168` and Desktop
+run `33486399165` succeeded. Rescue run `33486399275` passed build, shipping
+surface exclusion, ordinary BIOS/UEFI and USB-style two-boot BIOS/UEFI, but its
+separate UEFI Vault lifecycle failed readiness. `internal.7` was not dispatched;
+the remaining BIOS lifecycle/native-prompt jobs were cancelled after that
+irreversible result, and the exact ISO is retained only as a private
+physical-test candidate. This cut
+serializes initial inventory and target discovery and preserves truthful
+`unsupported` optional SMART/NVMe evidence instead of blocking diagnosis.
+
+The exact current repair candidate is commit
+`01cf8fe981971ea9c1b3fa82d1f90de744a0d3ad`, Repair run `33482972849`. The
+consolidated batch failed at `uefi:crypttab-lifecycle` with the exact marker
+`stage=provider-proof code=command-failed`; no qualified ISO or publisher was
+produced. Per the owner stop request, this candidate is recorded but not fixed
+or rerun in the current closeout.
+
+Integrated in current source, but still off-default or awaiting exact-image
+qualification:
 
 - four off-default Rescue repair actions plus a local-only Fleet-to-Rescue
   adapter for all four corresponding closed intents; every repair still
@@ -61,24 +88,20 @@ Integrated in current source, but not automatically qualified or promoted:
   artifacts with exact provenance, digest, qualification and unsigned-state
   metadata.
 
-The latest private diagnostic candidate is the exact ISO from commit `aa8255a`,
-Rescue run `33455599335`. Its core build, boot, render, input and USB-style
-two-boot BIOS/UEFI matrix passed, but all three Vault jobs stopped at the same
-`firstboot-confirmation` timeout. It is available privately only for controlled
-physical boot/UI testing and is neither Vault-qualified nor promoted. Stable
-`0.1.0-internal.6` therefore remains unchanged.
+The reviewed Resident source is `fe3c940d525f5c1c2ecd8123bdb100cd3280b908`.
+Linux run `33471097700`, Windows run `33471100838` and macOS run `33471099291`
+are green. The native services expose explicit one-shot enrollment: a
+platform-bound identity signs the fixed request, a one-use token is consumed
+only after acceptance, and normal startup requires the persisted public
+binding. The workflows verify that contract, disabled startup, the fail-closed
+no-anchor path and cleanup. Packages remain unsigned; physical key-store,
+publisher-signing and endpoint-to-production-Fleet evidence remain external.
 
-The next consolidated source cut is commit `be88efa`. Rescue run
-`33459542561`, Desktop run `33459542555` and repair run `33459558782` are in
-progress; this plan assigns them no outcome before completion. In parallel,
-the exact Linux, Windows and macOS Resident packages passed their automated
-native lifecycle gates in runs `33459558805`, `33459558875` and `33459559165`.
-Those packages are still unsigned engineering artifacts: real enrollment,
-native secret stores, publisher signing and physical endpoints remain open.
-
-The fastest remaining path is to finish the three active milestone workflows,
-review and promote only exact green artifacts, then spend the remaining cycle
-on physical/external gates. Repeated unchanged tests are not part of this plan.
+The stable download remains `0.1.0-internal.6` because the diagnosis cohort did
+not satisfy every Vault gate. Run `33486399275` is exposed separately and
+truthfully as physical-test input; it is not trusted-catalog or Release Channel
+promotion. Further feature work and reruns are paused after the current
+site/documentation closeout, per the owner stop request.
 
 ## RC completion gate
 

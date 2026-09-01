@@ -31,70 +31,46 @@ build and uses a fresh temporary fixture and journal on every launch.
 every file path and byte before and after collection. It never accepts a
 physical block-device path.
 
-The CI workflows are configured to produce engineering-preview desktop installers for Windows, Linux, Intel macOS and Apple-silicon macOS, plus a separate amd64 hybrid BIOS/UEFI Rescue ISO. A build is usable only when its exact workflow and qualification gates pass; see [Current status](docs/CURRENT_STATUS.md) before downloading an artifact. Production distribution still requires Windows code signing and Apple signing/notarization.
+The CI workflows produce engineering-preview desktop installers for Windows,
+Linux, Intel macOS and Apple-silicon macOS, plus separate amd64 hybrid BIOS/UEFI
+diagnosis and repair Rescue images. Current diagnosis source commit
+`6e9742e5b0c4397728dde80e9a0a91a09214f7cd` passed [CI run
+33486399168](https://github.com/0xfunboy/KernAid/actions/runs/33486399168)
+and the complete four-platform [Desktop run
+33486399165](https://github.com/0xfunboy/KernAid/actions/runs/33486399165).
+Rescue run `33486399275` passed its build and integrated BIOS/UEFI boot and
+USB-style two-boot matrix, but failed the separate UEFI Vault lifecycle
+readiness gate. It is therefore a private physical-test candidate, not a
+promoted release. Production distribution still requires Windows code signing
+and Apple signing/notarization.
 
 ## Use in the workshop
 
-- **PC that does not boot (controlled engineering preview):** the private area
-  exposes the exact stable retail Rescue candidate identified in
-  [Current status](docs/CURRENT_STATUS.md) only for first physical-boot
-  qualification. Verify its checksum and, on Windows, write it with Rufus in
-  DD mode to a factory-new or disposable USB of at least 32 GB. The trusted v2
-  catalog revision 8 authorizes only this exact ISO, so the Linux writer can
-  verify, copy and provision its encrypted vault. Rufus only writes the
-  qualified zero-state retail image; first live boot provisions the Vault after
-  local passphrase confirmation.
-  The promoted immutable internal release is `0.1.0-internal.6`: artifact
-  `ci-33330139973-1`, built from commit
-  `5db47001fad2a3814d90837bcdcea545b2da0fa9` by Rescue run `33330139973`
-  attempt 1.
-  Its exact ISO is `1,223,540,736` bytes with SHA-256
-  `fe8d54d8e154f6a4712c65855b5dffdcb31dddeac0d3a03c299d606f87a16000`;
-  the compressed retail image is `1,191,669,060` bytes with SHA-256
-  `efc5d4d0c428d0f7a992eb21154c4243c5566d7c85d6481e174c43cac909aa9b`.
-  Release Channel v1 sequence 6 binds those files in a canonical manifest with
-  SHA-256 `11d15af0ef07b78760f468f3302cd398255c072dba0920b868c967f53206e674`.
-  The stable build compiled with repair disabled and passed the shipping-image
-  gate proving that repair UI, handlers, units and write surfaces are absent.
-  It replaces the retired `0d61eac` physical-test candidate, which reached
-  Xorg on an Intel PC but painted only a black frame and movable pointer. Start
-  with the normal branded boot entry; if it cannot establish a usable display,
-  reboot and select **KernAid Rescue - Compatibility graphics**.
-  Physical USB boot and firmware remain unqualified. On a successful boot,
-  select the
-  installed-system candidate in the left rail, and keep Secure Boot disabled
-  for this engineering preview. The target is re-scanned before every session;
-  target selection itself remains metadata-only. When **Diagnostica** starts,
-  the qualified helper can inspect a direct leaf ext4 or NTFS installation
-  read-only. For a Windows partition on GPT it also inspects exactly one
-  unmounted direct-sibling FAT EFI System Partition, when uniquely qualified,
-  and returns only fixed boot-marker booleans. No repair or unlock is attempted.
-  Linux P0 snapshot parity between Resident and Rescue v1 is limited to content
-  on the root filesystem. If the installation's `fstab` declares a separate
-  mount at or below `/etc` (including `/etc/machine-id`), `/boot` (including
-  `/boot/efi`), `/efi`, `/usr`, or `/var`, KernAid marks the corpus unsupported
-  and blocks diagnosis; multi-mount parity is not claimed.
-  The signed persistent-report path requires a Vault provisioned by the Linux
-  v2 writer or retail first boot: unlock it from the native TTY before Desk
-  initializes. After diagnosis, use
-  `kernaid-rescue-vaultctl report-list` and
-  `kernaid-rescue-vaultctl report-export RP-...` to place a verified envelope
-  at `/home/kernaid/KernAid-Reports/<id>.signed.json`. The stable
-  `0.1.0-internal.6` ISO passed persistence, retrieval and fixed-path
-  signed-envelope export on that same artifact under virtual BIOS and UEFI.
-  Physical USB behavior remains a separate qualification gate.
-  A newer diagnosis-only ISO from commit `aa8255a`, Rescue run `33455599335`,
-  is separately available in the authenticated area for controlled physical
-  boot/UI investigation. Its core build, branded UI/input, BIOS/UEFI Secure
-  Boot and USB-style two-boot gates passed, but all three Vault jobs failed at
-  `firstboot-confirmation`. It does not replace this stable image. The repair
-  candidate remains private, unavailable and unpromoted; current exact evidence
-  is maintained in
-  [Current status](docs/CURRENT_STATUS.md).
-  The follow-up `be88efa` cut is still being evaluated by Rescue run
-  `33459542561`, Desktop run `33459542555` and repair run `33459558782`; no
-  outcome is claimed while those workflows remain in progress.
-- **Windows, Linux or macOS that does boot:** use the matching unsigned artifact from immutable release `0.1.0-internal.6`, built by Desktop run `33330140025` attempt 1 from the same exact source as Rescue. All four platform jobs and their package-inspection gates passed. Install it and launch KernAid like a normal application; CI packaging is not physical installation or complete GUI qualification. The gate rejects Desk packages containing the separately distributed credential companion. Windows and macOS startup collect only a fast, derived target identity; the deeper P0 collection starts once when **Diagnostica** is selected. macOS queries only the current-user `launchd` table and safe-boot integer, and explicitly reports system `launchd`, software-update availability, system-event analysis, and login/background-item counts as unqualified instead of inventing results. The fixed commands do not request repairs, although native Windows tools such as DISM may still update their own operating-system logs. After diagnosis, retain the JSON as the authoritative machine-readable artifact; the additional Markdown download is an explicitly unsigned reading copy.
+- **PC that does not boot (controlled engineering preview):** use only an exact
+  diagnosis image whose adjacent checksum you have verified. The authenticated
+  site exposes the exact run `33486399275` physical-test ISO from `6e9742e`,
+  1,307,344,896 bytes, SHA-256
+  `8a971474335846495903d2a314145e3cb3a04fdb930405461eb215bbc66c46da`.
+  It is not catalog-authorized or promoted because its UEFI Vault lifecycle
+  stopped at `stage=readiness code=not-ready`; use it only to retest physical
+  boot, graphics, input and diagnosis on non-customer hardware. On Windows,
+  write it with Rufus in DD mode to a factory-new or disposable USB of at least
+  32,000,000,000 bytes. Keep Secure Boot disabled for this engineering test.
+  Start with the normal branded entry and use **KernAid Rescue - Compatibility
+  graphics** only when needed. Exact commands and release evidence live in
+  [Current status](docs/CURRENT_STATUS.md) and the [operator
+  guide](docs/operator-guide.md).
+- **Windows, Linux or macOS that does boot:** the complete unsigned packaging
+  matrix from commit `6e9742e5b0c4397728dde80e9a0a91a09214f7cd`
+  passed [Desktop run 33486399165](https://github.com/0xfunboy/KernAid/actions/runs/33486399165)
+  for Windows x86-64, Linux x86-64, Intel macOS and Apple-silicon macOS.
+  Installers remain engineering previews: CI packaging is not physical
+  installation, publisher signing or complete GUI qualification. The package
+  gate rejects inclusion of the separately distributed credential companion.
+  Windows and macOS startup collect only a fast derived target identity; deeper
+  P0 collection starts once when **Diagnostica** is selected. After diagnosis,
+  retain JSON as the authoritative machine-readable artifact; Markdown is an
+  explicitly unsigned reading copy.
 - **Linux machine inventory:** Resident and Rescue use the same bounded Rust
   collector for CPU count/model, total RAM, firmware boot mode, selected public
   DMI model fields, and normalized PCI/USB class/vendor/product IDs. It excludes
@@ -116,13 +92,15 @@ The CI workflows are configured to produce engineering-preview desktop installer
   the complete OS corpus to a provider-neutral proposal before the bounded
   60-second HTTPS request; raw collector content is never sent. Offline rules
   remain the startup/default provider and require no account or network.
-  Separately, Agent Gateway now exports bounded one-shot Anthropic Messages
-  and Gemini Interactions adapters. They send the same provider-neutral,
-  evidence-bound diagnosis projection, request strict JSON, expose no tools or
-  broker access, reject redirects and foreign evidence IDs, and obtain API
-  keys only from a runtime secret supplier. They are library implementations,
-  not yet wired into the shipping Desk/Rescue selector or qualified against
-  live vendor accounts.
+  Anthropic Messages and Gemini Interactions are now wired into the Resident
+  Desk selector through native Tauri commands. They send the same
+  provider-neutral, evidence-bound diagnosis projection, request strict JSON,
+  expose no tools or broker access, reject redirects and foreign evidence IDs,
+  and load keys only inside the native runtime from independently
+  purpose-bound OS credential records. The WebView receives presence-only
+  status and sanitized proposals. Packaging passed Desktop run `33486399165`;
+  real vendor accounts and live API behavior remain external qualification
+  gates. Rescue remains Offline/OpenAI only.
 - **Do not use on customer data as a repair tool yet:** the current workflow diagnoses and stages an R0 no-write plan. It deliberately cannot execute real repairs.
 
 Qualified Rescue candidates pass three separate QEMU gates under both legacy
@@ -140,28 +118,40 @@ current workflow and downloadable-artifact status is tracked in
 [Current status](docs/CURRENT_STATUS.md); do not infer that every `main` commit
 has produced a publishable ISO.
 
-The private repair candidate has a separate, narrower workflow. Source now
-contains four off-default actions. Its consolidated exact-image harness now
-reuses one provisioned Rescue/Vault base across isolated scenario copies: the
-existing `fstab` apply/failure/recovery matrix, `crypttab` apply plus fresh
-explicit rollback, ext4 preen plus a clean read-only postcheck, and exact
-resolver-link restoration. This is implemented qualification logic, not a
-successful remote workflow or a promoted ISO. All four corresponding Fleet
-repair intents also reach this local Rescue boundary, but cannot bypass a fresh
-target/evidence-bound local approval. Repair run `33459558782` from commit
-`be88efa` is in progress and has no claimed outcome. Power-loss, physical USB,
-hardware, firmware, Secure Boot and customer-data gates remain open.
+The private repair candidate has a separate, narrower workflow. Source contains
+four off-default actions. Its consolidated exact-image harness reuses one
+provisioned Rescue/Vault base across isolated scenario copies: the `fstab`
+apply/failure/recovery matrix, `crypttab` apply plus fresh explicit rollback,
+ext4 preen plus a clean read-only postcheck, and exact resolver-link
+restoration. All four corresponding Fleet intents reach the local Rescue
+boundary but cannot bypass a fresh target/evidence-bound local approval. The
+adapter contract passed its disposable four-action approval/broker/Vault test;
+that does not qualify a shipping ISO. Repair run `33482972849` on commit
+`01cf8fe` failed at the UEFI crypttab provider-proof step; no qualified Repair
+ISO or publisher was produced, and the candidate remains unavailable.
+Power-loss, physical USB, hardware, firmware, Secure Boot and customer-data
+gates remain open.
 
-Fleet Resident workflow source also contains native staged package-lifecycle
-gates. Linux inspects and runs the exact built `.deb` once in an isolated root;
-Windows registers the packaged executable as an on-demand `LocalService`,
-proves it remains stopped, exercises the fail-closed one-shot path and
-uninstalls it; the native macOS matrix leg verifies disabled LaunchAgent
-settings, exercises the same no-anchor failure and cleans up. These checks use
-no enrollment identity or signing key. The exact automated lifecycle passed in
-Linux run `33459558805`, Windows run `33459558875` and macOS run
-`33459559165`. Those green package gates do not replace signing, real
-enrollment, native secret-store or physical endpoint qualification.
+Fleet Resident source now has explicit one-shot enrollment on Linux, Windows
+and macOS: it creates or loads the platform-bound native device identity, signs
+the fixed `/v1/enrollments` request, consumes the one-use token only after an
+accepted response and requires the persisted public binding before normal
+service startup. Native package workflows inspect the exact staged artifact,
+prove startup remains disabled, exercise the fail-closed no-anchor path and
+  clean up. The current packages from commit `fe3c940d525f5c1c2ecd8123bdb100cd3280b908`
+  passed Linux run [33471097700](https://github.com/0xfunboy/KernAid/actions/runs/33471097700),
+  Windows run [33471100838](https://github.com/0xfunboy/KernAid/actions/runs/33471100838)
+  and macOS run [33471099291](https://github.com/0xfunboy/KernAid/actions/runs/33471099291).
+Those automated gates include the explicit enrollment contract but do not
+replace publisher signing, hardware-backed key-store behavior or a physical
+endpoint-to-production-Fleet qualification.
+
+The Fleet control plane's focused disposable cryptographic E2E is green on the
+current source: enterprise license, one-use token and signed enrollment,
+policy, entitlement, update, typed work-order claim/result, service receipt,
+audit and console-session boundaries all passed against temporary SQLite only.
+The signed scheduled backup is active, and its independent verify/restore drill
+passed to a disposable destination without overwriting the live database.
 
 The live internal Fleet service is schema v13. Its closed work-order catalog
 contains all four Rescue repair identifiers, but the stable image still contains
@@ -180,18 +170,19 @@ See [Current status](docs/CURRENT_STATUS.md), the [operator guide](docs/operator
 
 ## Current limitations
 
-- Shipping Resident Desk still has one bounded diagnosis-only OpenAI Responses
-  integration plus deterministic offline rules. The tool-free Anthropic and
-  Gemini adapters exist in Agent Gateway source but are not yet wired into a
-  product selector or remotely qualified. Rescue includes feature-gated
+- Shipping Resident Desk has bounded diagnosis-only OpenAI Responses,
+  Anthropic Messages and Gemini Interactions integrations plus deterministic
+  offline rules. All three remote providers are native, tool-free and
+  credential-isolated; only live real-account qualification remains open.
+  Rescue includes feature-gated
   persistent-vault, signed-report, executor and loopback UI-server relay
   plumbing; an exact image is virtually qualified only after the full Rescue
   workflow passes, including both privileged BIOS and UEFI lifecycle jobs. The
-  v2 writer can provision that vault only for an exact catalog-authorized image
-  on factory-new controlled-lab media; revision 8 authorizes the exact current
-  internally qualified candidate.
-  The Rescue report relay is loopback/internal-only; the exact current image
-  passed its signed-report shipping lifecycle under virtual BIOS and UEFI.
+  writer can provision that vault only for an exact catalog-authorized image on
+  factory-new controlled-lab media.
+  The Rescue report relay is loopback/internal-only. Current-source run
+  `33486399275` failed UEFI Vault lifecycle readiness, so its downloadable
+  physical-test candidate makes no signed-report or persistence claim.
   Real-account Codex authorization, live provider TLS and physical-media
   qualification remain incomplete.
 - Native production host inventory has no mutation or repair handler; the

@@ -100,8 +100,9 @@ release bundle.
 Use the concise [physical USB qualification
 runbook](runbooks/physical-usb-qualification.md) to record a reproducible
 machine-specific result and the bounded black-screen evidence. The release
-values below describe the candidate current at the time of this guide; the
-active candidate and its qualified manifest remain authoritative.
+values below describe the promoted candidate current at the time of this guide;
+`docs/CURRENT_STATUS.md` is authoritative for any newer, explicitly
+unqualified physical-test ISO.
 
 For workflow releases whose qualification manifest contains `retailImage`, use
 `KernAid-Rescue-0.1.0-internal.6-x86_64-retail.img.xz` directly with a current
@@ -115,7 +116,16 @@ The matching ISO is `1,223,540,736` bytes with SHA-256
 do not substitute the ISO when following the Rufus retail-image procedure.
 
 Use only a replacement physical-test candidate explicitly identified as active
-in `docs/CURRENT_STATUS.md`. The previous `0d61eac` diagnosis-only candidate
+in `docs/CURRENT_STATUS.md`. The active controlled-test input is the exact ISO
+from Rescue run `33486399275`, source `6e9742e`, `1,307,344,896` bytes,
+SHA-256
+`8a971474335846495903d2a314145e3cb3a04fdb930405461eb215bbc66c46da`.
+Download it from the authenticated site's diagnostic-candidate card, verify
+the adjacent checksum in PowerShell, and write the `.iso` with Rufus in DD mode
+to a disposable 64 GB USB. It passed the integrated BIOS/UEFI boot and USB
+two-boot matrix but failed the separate UEFI Vault readiness gate: use it only
+for physical boot, graphics, input and diagnosis retesting, not Vault
+persistence or customer work. The previous `0d61eac` diagnosis-only candidate
 reached Xorg on an Intel physical PC but failed to paint the KernAid UI, so it
 must not be reused as evidence of a successful boot. A physical check never
 promotes the release by itself.

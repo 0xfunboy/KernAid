@@ -30,13 +30,13 @@ approval. They remain private and unsupported on customer data.
 
 ## Product surfaces
 
-| Surface        | Purpose                                                                                                   | Current boundary                                                                                                                                |
-| -------------- | --------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| KernAid Desk   | Diagnose a running Windows, Linux or macOS installation                                                   | Unsigned engineering builds; read-only production collectors                                                                                    |
-| KernAid Rescue | Boot an amd64 PC that cannot start its installed OS                                                       | Hybrid BIOS/UEFI image; private candidate `33455599335` passed boot/UI/USB-style gates but failed all three Vault prompt/lifecycle jobs           |
-| USB writers    | Verify an authorized image, write it and provision or verify the resulting medium                         | Guarded Linux writer plus off-default Windows Media Creator; physical USB remains unqualified                                                    |
-| KernAid Fleet  | Enroll devices, retain minimized inventory, govern typed work orders and track incident closure           | Live internal schema v13; all four Rescue repair intents are mapped locally, while native Resident lifecycle is green only at the automated package level |
-| Project site   | Explain the project publicly and distribute controlled artifacts privately                                | Public `/`; authenticated `/private/`; no public ISO route                                                                                      |
+| Surface        | Purpose                                                                                         | Current boundary                                                                                                                                                                                          |
+| -------------- | ----------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| KernAid Desk   | Diagnose a running Windows, Linux or macOS installation                                         | `6e9742e` four-platform packaging is green in run `33486399165`; Offline/OpenAI/Anthropic/Gemini remain native, tool-free provider boundaries                                                              |
+| KernAid Rescue | Boot an amd64 PC that cannot start its installed OS                                             | Run `33486399275` passed integrated BIOS/UEFI and USB-style two-boot gates but failed UEFI Vault readiness; exact ISO is private physical-test input, not a promoted release                              |
+| USB writers    | Verify an authorized image, write it and provision or verify the resulting medium               | Guarded Linux writer plus off-default Windows Media Creator; physical USB remains unqualified                                                                                                             |
+| KernAid Fleet  | Enroll devices, retain minimized inventory, govern typed work orders and track incident closure | Live internal schema v13; disposable cryptographic E2E and backup restore drill are green, all four Rescue intents are mapped locally, and current native Resident enrollment/package workflows are green |
+| Project site   | Explain the project publicly and distribute controlled artifacts privately                      | Public `/`; authenticated `/private/`; no public ISO route                                                                                                                                                |
 
 ## Canonical repository map
 
@@ -61,16 +61,16 @@ sources. They are not abandoned copies.
 
 On the internal build host used during this phase:
 
-| Path/service                | Role                                                                                 |
-| --------------------------- | ------------------------------------------------------------------------------------ |
-| `/home/funboy/kernaid`      | Only canonical checkout of `0xfunboy/KernAid`, branch `main`                         |
-| `/home/funboy/KernAid-dist` | Local staging for qualified/private artifacts; not another repository                |
-| `kaid-site.service`         | Node.js 24.18.0 site process on loopback                                             |
-| `kaid-cloudflared.service`  | Tunnel for `https://kaid.funboy.eu.cc`                                               |
+| Path/service                | Role                                                                                  |
+| --------------------------- | ------------------------------------------------------------------------------------- |
+| `/home/funboy/kernaid`      | Only canonical checkout of `0xfunboy/KernAid`, branch `main`                          |
+| `/home/funboy/KernAid-dist` | Local staging for qualified/private artifacts; not another repository                 |
+| `kaid-site.service`         | Node.js 24.18.0 site process on loopback                                              |
+| `kaid-cloudflared.service`  | Tunnel for `https://kaid.funboy.eu.cc`                                                |
 | `kernaid-fleet.service`     | Node.js 24.18.0 Fleet v13 origin on loopback, exposed at `https://fleet.funboy.eu.cc` |
-| `~/.config/kaid-site/`      | Operator-owned password and tunnel credentials; never committed                      |
+| `~/.config/kaid-site/`      | Operator-owned password and tunnel credentials; never committed                       |
 
-Both user services are enabled and user lingering keeps them active across
+All three user services are enabled and user lingering keeps them active across
 logout and reboot.
 
 ## How an artifact becomes downloadable
@@ -96,20 +96,34 @@ logout and reboot.
 7. Only then are the private site metadata and pinned local artifact changed
    together and the service restarted.
 
-The exact private candidate from commit `aa8255a`, Rescue run `33455599335`,
-passed the core build, branded WebKit UI/input, BIOS/UEFI Secure Boot and
-USB-style two-boot matrix. Its BIOS and UEFI Vault lifecycle jobs plus native
-prompt job all stopped at `firstboot-confirmation`; it is therefore available
-privately for boot/UI testing only and was not promoted. The follow-up Rescue
-run `33459542561` from commit `be88efa` is in progress and has no claimed
-outcome.
+The current integrated diagnosis source cut is
+`6e9742e5b0c4397728dde80e9a0a91a09214f7cd`. CI run `33486399168` and the
+complete Windows/Linux/Intel-macOS/Apple-silicon Desktop run `33486399165` are
+green. Desktop includes native OpenAI, Anthropic and Gemini credential/status,
+transport and selector boundaries; the provider-key companion remains outside
+the installers. Live vendor-account behavior is still an external gate.
 
-The same `be88efa` cut is also under Desktop qualification in run
-`33459542555` and repair qualification in run `33459558782`; neither in-progress
-run is evidence of success. The exact Resident package lifecycle workflows are
-already green for Linux (`33459558805`), Windows (`33459558875`) and macOS
-(`33459559165`), while signing, enrollment and physical endpoint evidence
-remain separate gates.
+The two ISO workflows ended without a promotable image:
+
+- diagnosis Rescue run `33486399275`: integrated build/boot/USB matrix green,
+  UEFI Vault readiness failed, `internal.7` not dispatched; exact
+  `8a971474…c46da` ISO exposed privately only as a physical-test candidate;
+- repair Rescue run `33482972849` on `01cf8fe`: **FAILED** at
+  `uefi:crypttab-lifecycle`; no qualified artifact or promotion exists.
+
+The current Resident source is `fe3c940d525f5c1c2ecd8123bdb100cd3280b908`.
+Linux (`33471097700`), Windows (`33471100838`) and macOS (`33471099291`) are
+green for their staged native package workflows and explicit enrollment
+contract. The source uses platform-bound identities, fixed signed enrollment,
+post-acceptance token consumption and a required public binding before normal
+startup. Publisher signing, physical key stores and a physical production
+endpoint remain separate gates.
+
+The focused Fleet software path is also green on disposable state: commercial
+license, one-use token, signed enrollment, policy, entitlement, update, work
+order, signed result/service receipt, audit and console. The four-action local
+Rescue approval/broker/Vault adapter and signed backup verify/restore drill are
+green. These tests do not promote either failed ISO candidate.
 
 The existence of a GitHub Actions artifact alone never promotes it. Physical
 USB, real-account provider TLS, signed installers and production repairs
@@ -125,18 +139,16 @@ firmware qualification claim.
 - Keep the exact artifact referenced by `site/content.json` and the trusted
   catalog. Old failed evidence and superseded unserved builds may be removed
   after their replacement is verified.
-- The retired `0d61eac` image may be retained as immutable audit evidence, but
-  it must not remain configured as a private-site download or trusted-catalog
-  entry after the `29830e8` cutover.
 - Never treat `/home/funboy/KernAid-dist` as source code or commit secrets from
   `~/.config/kaid-site/`.
 
 ## Next product gates
 
 The ordered, authoritative list is maintained in
-[Current status](CURRENT_STATUS.md). First let the in-progress Rescue, Desktop
-and repair workflows finish and review only their exact completed evidence.
-The next external proof is then physical USB boot on disposable media and
-non-customer hardware; after that come physical Secure Boot, signed delivery,
-real-account provider lifecycle and the first production repair action with
-preconditions, backup, verification and rollback.
+[Current status](CURRENT_STATUS.md). Finish and promote only diagnosis Rescue
+run `33486399275`; Repair run `33482972849` is recorded failed and intentionally
+paused. Desktop and source CI are already green and should not be repeated
+unchanged. The next external proof is physical USB boot on disposable
+media and non-customer hardware; after that come physical Secure Boot, signed
+delivery, real-account provider lifecycle and the first production repair
+action with preconditions, backup, verification and rollback.
