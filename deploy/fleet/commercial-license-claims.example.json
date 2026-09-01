@@ -1,0 +1,25 @@
+{
+  "schema": "dev.kernaid.fleet.enterprise-license.v1",
+  "version": 1,
+  "licenseId": "license_example_001",
+  "tenantId": "tenant_example",
+  "sequence": 1,
+  "keyId": "vendor-2026-01",
+  "plan": "enterprise",
+  "features": [
+    "device_management",
+    "entitlements",
+    "incidents",
+    "policy",
+    "remote_diagnosis",
+    "remote_repair",
+    "technician_seats",
+    "updates"
+  ],
+  "deviceLimit": 100,
+  "seatLimit": 10,
+  "issuedAtUnix": 1767225600,
+  "notBeforeUnix": 1767225600,
+  "expiresAtUnix": 1893456000,
+  "graceUntilUnix": 1896048000
+}

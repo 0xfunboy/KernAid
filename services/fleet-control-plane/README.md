@@ -327,11 +327,31 @@ manual protocol is:
     root token is read from an owner-only file and is never placed on argv:
 
 ```bash
+install -d -m 700 /absolute/offline-commercial-issuer
+install -m 600 deploy/fleet/commercial-license-claims.example.json \
+  /absolute/offline-commercial-issuer/tenant-claims.json
+kernaid-fleet-license-issuer keygen vendor-2026-01 \
+  /absolute/offline-commercial-issuer/commercial.pk8 \
+  /absolute/offline-commercial-issuer/commercial.public
+kernaid-fleet-license-issuer issue \
+  /absolute/offline-commercial-issuer/tenant-claims.json \
+  /absolute/offline-commercial-issuer/commercial.pk8 \
+  /absolute/offline-commercial-issuer/tenant-license.json
 kernaid-fleet-license-admin verify tenant-license.json commercial.public vendor-2026-01 tenant_example
 kernaid-fleet-license-admin import https://fleet.example.invalid /run/secrets/kernaid_fleet_root_token tenant-license.json
 kernaid-fleet-license-admin status https://fleet.example.invalid /run/secrets/kernaid_fleet_root_token tenant_example
 kernaid-fleet-license-admin revoke https://fleet.example.invalid /run/secrets/kernaid_fleet_root_token tenant_example license_example
 ```
+
+`tenant-claims.json` contains the exact schema-v1 claims documented by
+`EnterpriseLicenseClaims`; the issuer validates every field before signing,
+writes new files exclusively and never prints private material or the license
+body. Keep the issuer directory offline and owner-only. Copy only
+`commercial.public` to Fleet and the signed tenant license to the import host.
+Start from
+[`deploy/fleet/commercial-license-claims.example.json`](../../deploy/fleet/commercial-license-claims.example.json),
+replace every example identity, limit and time window, then review the exact
+canonical claims before issuing.
 
 The control plane never contains a commercial signing key and implements no
 billing or payment simulation. The SQLite clock checkpoint detects ordinary

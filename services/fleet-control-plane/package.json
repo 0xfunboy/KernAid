@@ -13,7 +13,8 @@
     }
   },
   "bin": {
-    "kernaid-fleet-license-admin": "./dist/license-admin.js"
+    "kernaid-fleet-license-admin": "./dist/license-admin.js",
+    "kernaid-fleet-license-issuer": "./dist/license-issuer.js"
   },
   "scripts": {
     "prebuild": "pnpm --filter @kernaid/fleet-schemas build",
