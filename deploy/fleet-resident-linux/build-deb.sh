@@ -109,8 +109,12 @@ EOF
 epoch="${SOURCE_DATE_EPOCH:-0}"
 find "$package_root" -type d -exec chmod 0755 {} +
 find "$package_root" -exec touch -h -d "@$epoch" {} +
-package_path="$output_directory/kernaid-fleet-resident_${version}_${architecture}.deb"
+package_name="kernaid-fleet-resident_${version}_${architecture}.deb"
+package_path="$output_directory/$package_name"
 dpkg-deb --root-owner-group --build "$package_root" "$package_path"
-sha256sum "$package_path" > "$package_path.sha256"
+(
+  cd "$output_directory"
+  sha256sum "$package_name" > "$package_name.sha256"
+)
 dpkg-deb --info "$package_path" >/dev/null
 echo "$package_path"
