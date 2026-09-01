@@ -509,6 +509,10 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
         self.assertIn("controller_timeout=1800", source)
         self.assertIn("controller_timeout=1200", source)
         self.assertNotIn("controller_timeout=3000", source)
+        self.assertIn(
+            '[[ "$scenario" == apply && -n "$provisioned_base" ]]',
+            source,
+        )
         self.assertIn('parsed.scenario == "provision-base"', controller_source)
         self.assertIn("timeout_maximum = 3000", controller_source)
         self.assertIn('readonly qemu_smp="${KERNAID_QEMU_SMP:-2}"', source)

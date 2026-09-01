@@ -70,6 +70,11 @@ if [[ -n "$provisioned_base" || -n "$provisioned_key" \
     exit 2
   }
 fi
+if [[ "$scenario" == apply && -n "$provisioned_base" ]]; then
+  # The reusable base has already completed the bounded first-boot zero scan.
+  # Keep its apply case within the controller's tighter post-provision budget.
+  controller_timeout=1200
+fi
 
 case "$qemu_smp" in
   1|2|4|8) ;;
