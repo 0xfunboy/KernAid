@@ -289,7 +289,7 @@ function validateSoftwareContent(software) {
       );
     }
     for (const field of ["downloadName", "checksumName"]) {
-      if (typeof item[field] !== "string" || !/^[A-Za-z0-9._-]+$/.test(item[field])) {
+      if (typeof item[field] !== "string" || !/^[A-Za-z0-9._+-]+$/.test(item[field])) {
         throw new Error(`content.json software.${key}.${field} is not a safe filename`);
       }
     }
