@@ -2207,7 +2207,28 @@ def observe(
 
 
 def observe_storage_health(deadline: float | None = None) -> dict[str, object]:
-    """Collect only the normalized root-owned storage-health document."""
+    """Collect normalized storage health without blocking the diagnosis corpus."""
+
+    unavailable = {
+        "schemaVersion": "1.0",
+        "kind": "linux-storage-health",
+        "scope": "local-physical-disks",
+        "enumerationStatus": "unsupported",
+        "disks": [],
+        "findings": [],
+    }
+
+    def unavailable_observation() -> dict[str, object]:
+        return {
+            "collector": "linux.storage.health.v1",
+            "trust": "observed-untrusted",
+            "output": json.dumps(
+                unavailable, ensure_ascii=True, separators=(",", ":")
+            ),
+            "success": True,
+            "truncated": False,
+        }
+
     try:
         _check_deadline(deadline)
         if OFFLINE_HELPER_ENABLED:
@@ -2223,16 +2244,21 @@ def observe_storage_health(deadline: float | None = None) -> dict[str, object]:
                 "truncated": False,
             }
         if deadline is None:
-            return observe("linux.storage.health.v1", (STORAGE_HEALTH_BINARY,))
-        return observe("linux.storage.health.v1", (STORAGE_HEALTH_BINARY,), deadline)
-    except (OSError, TimeoutError, ValueError, PrivilegedHelperError):
-        return {
-            "collector": "linux.storage.health.v1",
-            "trust": "observed-untrusted",
-            "output": "",
-            "success": False,
-            "truncated": False,
-        }
+            observation = observe(
+                "linux.storage.health.v1", (STORAGE_HEALTH_BINARY,)
+            )
+        else:
+            observation = observe(
+                "linux.storage.health.v1", (STORAGE_HEALTH_BINARY,), deadline
+            )
+        return observation if observation["success"] is True else unavailable_observation()
+    except TimeoutError:
+        raise
+    except (OSError, ValueError, PrivilegedHelperError):
+        # SMART/NVMe telemetry is additive. Preserve a truthful unsupported
+        # result so a missing or transiently unavailable tool cannot prevent
+        # the rest of the read-only diagnosis from opening.
+        return unavailable_observation()
 
 
 def observe_boot_critical_path(deadline: float | None = None) -> dict[str, object]:

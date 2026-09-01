@@ -319,7 +319,7 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (!isRescueRuntime()) return;
+    if (!isRescueRuntime() || !inventoryReady) return;
     let cancelled = false;
     const operationEpoch = ++rescueContextEpoch.current;
     setRescueTargetBusy(true);
@@ -355,7 +355,7 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [inventoryReady]);
 
   useEffect(() => {
     if (!hasLocalCollector()) return;

@@ -403,6 +403,42 @@ class ObserveBrokerTests(unittest.TestCase):
             )
         self.assertLess(time.monotonic() - started, 0.75)
 
+    def test_unavailable_storage_health_is_truthful_optional_evidence(self) -> None:
+        helper_error = rescue_server.PrivilegedHelperError(
+            {
+                "code": "storage-health-unavailable",
+                "message": "unavailable",
+                "retryable": True,
+                "claims": {
+                    field: False
+                    for field in rescue_server.OFFLINE_INSPECTION_CLAIM_FIELDS
+                },
+            },
+            503,
+        )
+        with (
+            patch.object(rescue_server, "OFFLINE_HELPER_ENABLED", True),
+            patch.object(
+                rescue_server,
+                "_privileged_helper_call",
+                side_effect=helper_error,
+            ),
+        ):
+            observation = rescue_server.observe_storage_health()
+        self.assertTrue(observation["success"])
+        self.assertFalse(observation["truncated"])
+        self.assertEqual(
+            json.loads(str(observation["output"])),
+            {
+                "schemaVersion": "1.0",
+                "kind": "linux-storage-health",
+                "scope": "local-physical-disks",
+                "enumerationStatus": "unsupported",
+                "disks": [],
+                "findings": [],
+            },
+        )
+
     def test_inventory_uses_minimized_fixed_collectors(self) -> None:
         commands = dict(rescue_server.COMMANDS)
         self.assertNotIn("linux.fstab", commands)
@@ -1982,7 +2018,7 @@ class InstalledTargetTests(unittest.TestCase):
         target_marker = ready_check.index("KERNAID_RESCUE_TARGET_SELECTION_READY")
         selection_branch = ready_check.index('if [ -n "$selection_request" ]; then')
         selection_branch_end = ready_check.index("\nfi\n", selection_branch)
-        general_marker = ready_check.index("echo KERNAID_RESCUE_READY")
+        general_marker = ready_check.rindex("echo KERNAID_RESCUE_READY")
         self.assertLess(post_position, fingerprint_binding)
         self.assertLess(fingerprint_binding, target_marker)
         self.assertLess(target_binding, composite_binding)
