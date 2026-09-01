@@ -797,17 +797,20 @@ mod tests {
     }
 
     fn healthy_root() -> TempDir {
-        let root = TempDir::new().unwrap();
-        fs::create_dir_all(root.path().join("etc")).unwrap();
-        fs::create_dir_all(root.path().join("boot/grub")).unwrap();
+        let root = TempDir::new().expect("create boot fixture root");
+        fs::create_dir_all(root.path().join("etc")).expect("create fixture etc");
+        fs::create_dir_all(root.path().join("boot/grub")).expect("create fixture boot tree");
         fs::write(
             root.path().join("etc/fstab"),
             "UUID=x / ext4 defaults 0 1\n",
         )
-        .unwrap();
-        fs::write(root.path().join("boot/vmlinuz-test"), b"kernel").unwrap();
-        fs::write(root.path().join("boot/initrd.img-test"), b"initrd").unwrap();
-        fs::write(root.path().join("boot/grub/grub.cfg"), b"config").unwrap();
+        .expect("write fixture fstab");
+        fs::write(root.path().join("boot/vmlinuz-test"), b"kernel")
+            .expect("write fixture kernel");
+        fs::write(root.path().join("boot/initrd.img-test"), b"initrd")
+            .expect("write fixture initramfs");
+        fs::write(root.path().join("boot/grub/grub.cfg"), b"config")
+            .expect("write fixture bootloader config");
         root
     }
 
@@ -819,8 +822,11 @@ mod tests {
             &runner("", "graphical.target @1.0s\n└─basic.target @1.0s +250ms\n"),
         );
         assert_eq!(snapshot.state, BootState::Healthy);
-        let json = to_bounded_json(&snapshot).unwrap();
-        assert_eq!(parse_bounded_json(json.as_bytes()).unwrap(), snapshot);
+        let json = to_bounded_json(&snapshot).expect("serialize healthy snapshot");
+        assert_eq!(
+            parse_bounded_json(json.as_bytes()).expect("parse healthy snapshot"),
+            snapshot
+        );
         assert!(!json.contains("UUID=x"));
         assert!(!json.contains("vmlinuz-test"));
         assert!(!json.contains("basic.target"));
@@ -829,7 +835,8 @@ mod tests {
     #[test]
     fn failed_critical_unit_and_missing_initramfs_are_boot_risk() {
         let root = healthy_root();
-        fs::remove_file(root.path().join("boot/initrd.img-test")).unwrap();
+        fs::remove_file(root.path().join("boot/initrd.img-test"))
+            .expect("remove fixture initramfs");
         let snapshot = collect(
             root.path(),
             &runner(
@@ -847,7 +854,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["KA-LNX-BOOT-001", "KA-LNX-BOOT-003", "KA-LNX-BOOT-005"]
         );
-        let json = to_bounded_json(&snapshot).unwrap();
+        let json = to_bounded_json(&snapshot).expect("serialize boot-risk snapshot");
         assert!(!json.contains("user-private-value"));
         assert!(!json.contains("local-fs.target"));
     }
@@ -855,7 +862,8 @@ mod tests {
     #[test]
     fn malformed_fstab_and_unavailable_tools_fail_closed() {
         let root = healthy_root();
-        fs::write(root.path().join("etc/fstab"), b"secret invalid row\n").unwrap();
+        fs::write(root.path().join("etc/fstab"), b"secret invalid row\n")
+            .expect("write invalid fixture fstab");
         let snapshot = collect(root.path(), &FixtureRunner(BTreeMap::new()));
         assert_eq!(snapshot.state, BootState::BootRisk);
         assert_eq!(snapshot.configuration.fstab_status, FstabStatus::Invalid);
@@ -863,7 +871,7 @@ mod tests {
             snapshot.runtime.failed_units_status,
             SourceStatus::Unavailable
         );
-        let json = to_bounded_json(&snapshot).unwrap();
+        let json = to_bounded_json(&snapshot).expect("serialize invalid-fstab snapshot");
         assert!(!json.contains("secret"));
     }
 
@@ -871,7 +879,7 @@ mod tests {
     fn parser_rejects_noncanonical_and_unknown_fields() {
         let root = healthy_root();
         let snapshot = collect(root.path(), &runner("", "basic.target @1s +1ms\n"));
-        let canonical = to_bounded_json(&snapshot).unwrap();
+        let canonical = to_bounded_json(&snapshot).expect("serialize canonical snapshot");
         assert!(parse_bounded_json(format!("{canonical}\n").as_bytes()).is_err());
         let injected = canonical.replacen("{", "{\"rawOutput\":\"secret\",", 1);
         assert!(parse_bounded_json(injected.as_bytes()).is_err());
