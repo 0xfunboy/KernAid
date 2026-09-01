@@ -40,6 +40,11 @@ FAILURE_SCENARIOS = (
     "repaird-termination",
     "auto-restore",
 )
+PACK_QUALIFICATION_SCENARIOS = (
+    "crypttab-lifecycle",
+    "ext4-apply",
+    "resolver-link-apply",
+)
 TAMPER_HELPER_FAILURE_CODES = frozenset(
     {
         "arguments-invalid",
@@ -119,6 +124,7 @@ def parser() -> ClosedParser:
             "interrupt-reconcile",
             "provision-base",
             *FAILURE_SCENARIOS,
+            *PACK_QUALIFICATION_SCENARIOS,
         ),
         required=True,
     )
@@ -539,6 +545,220 @@ else:
     sys.stdout.write("KERNAID_QEMU_PROVIDER_PROOF_V1 stage="+STAGE+" result=true\\n")
 '''
     return textwrap.dedent(source).encode("ascii")
+
+
+def pack_qualification_source(
+    scenario: str,
+    before_sha256: str,
+    after_sha256: str,
+) -> bytes:
+    """Return one closed exact-image proof for an additional repair pack."""
+
+    configurations = {
+        "crypttab-lifecycle": {
+            "kind": "crypttab-prepared",
+            "prepare": "repair.crypttab.prepare",
+            "approve": "repair.crypttab.approve",
+            "action": "linux.crypttab.disable-missing-uuid.v1",
+            "resource": "rescue:selected-linux-root:etc/crypttab",
+            "risk": "R2",
+            "confirmation": "DISABILITA VOCE CRYPTTAB",
+            "expected_before": before_sha256,
+            "expected_after": after_sha256,
+        },
+        "ext4-apply": {
+            "kind": "ext4-fsck-prepared",
+            "prepare": "repair.ext4.prepare",
+            "approve": "repair.ext4.approve",
+            "action": "linux.ext4.fsck-preen-with-undo.v1",
+            "resource": "rescue:selected-linux-filesystem:ext4",
+            "risk": "R3",
+            "confirmation": "REPAIR EXT4 OFFLINE",
+            "expected_before": None,
+            "expected_after": None,
+        },
+        "resolver-link-apply": {
+            "kind": "resolver-link-prepared",
+            "prepare": "repair.resolver-link.prepare",
+            "approve": "repair.resolver-link.approve",
+            "action": "linux.network.restore-resolver-link.v1",
+            "resource": "rescue:selected-linux-root:etc/resolver-link",
+            "risk": "R2",
+            "confirmation": "RESTORE RESOLVER LINK",
+            "expected_before": before_sha256,
+            "expected_after": after_sha256,
+        },
+    }
+    try:
+        configuration = configurations[scenario]
+    except KeyError as error:
+        raise ValueError("unsupported pack qualification scenario") from error
+    for digest in (before_sha256, after_sha256):
+        if re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
+            raise ValueError("invalid pack qualification digest")
+    if before_sha256 == after_sha256:
+        raise ValueError("pack qualification digests must be distinct")
+
+    source = r'''import hashlib,http.client,json,re,secrets,sys,time
+HOST="127.0.0.1:4173"
+ORIGIN="http://127.0.0.1:4173"
+API="kernaid.dev/rescue-repair-service/v1alpha1"
+ROLLBACK_API="kernaid.dev/rescue-repair-service/v1alpha2"
+SCENARIO=__SCENARIO__
+KIND=__KIND__
+PREPARE=__PREPARE__
+APPROVE=__APPROVE__
+ACTION=__ACTION__
+RESOURCE=__RESOURCE__
+RISK=__RISK__
+CONFIRMATION=__CONFIRMATION__
+EXPECTED_BEFORE=__EXPECTED_BEFORE__
+EXPECTED_AFTER=__EXPECTED_AFTER__
+counter=0
+def fail():
+    sys.exit(46)
+def request_id():
+    global counter
+    counter+=1
+    return "R-40000000-0000-0000-0000-"+format(counter,"012x")
+def valid_hex_id(value,prefix):
+    return isinstance(value,str) and len(value)==len(prefix)+32 and value.startswith(prefix) and all(character in "0123456789abcdef" for character in value[len(prefix):])
+def valid_hash(value):
+    return isinstance(value,str) and re.fullmatch(r"sha256:[0-9a-f]{64}",value) is not None
+def exchange(path,body=None,timeout=25):
+    encoded=None if body is None else json.dumps(body,ensure_ascii=True,separators=(",",":")).encode("ascii")
+    headers={"Host":HOST}
+    if encoded is not None:
+        headers.update({"Origin":ORIGIN,"Content-Type":"application/json"})
+    connection=http.client.HTTPConnection("127.0.0.1",4173,timeout=timeout)
+    try:
+        connection.request("GET" if encoded is None else "POST",path,body=encoded,headers=headers)
+        response=connection.getresponse()
+        payload=response.read(65537)
+        status=response.status
+    finally:
+        connection.close()
+    if len(payload)>65536:
+        raise RuntimeError()
+    return status,json.loads(payload)
+def repair(api,operation,extra=None):
+    body={"apiVersion":api,"requestId":request_id(),"operation":operation}
+    if extra is not None:
+        body.update(extra)
+    status,value=exchange("/api/rescue/repair",body)
+    keys={"apiVersion","requestId","operation","outcome","stateVersion","state","detail"}
+    if status!=200 or not isinstance(value,dict) or set(value)!=keys or value.get("apiVersion")!=api or value.get("requestId")!=body["requestId"] or value.get("operation")!=operation or value.get("outcome")!="ok" or isinstance(value.get("stateVersion"),bool) or not isinstance(value.get("stateVersion"),int):
+        raise RuntimeError()
+    return value
+def wait(api,operation,states,deadline):
+    while time.monotonic()<deadline:
+        value=repair(api,operation)
+        if value.get("state") in states:
+            return value
+        time.sleep(.2)
+    raise RuntimeError()
+def terminal(value,state,outcome,reservation=None,binding=None):
+    detail=value.get("detail")
+    keys={"kind","terminalOutcome","reservationId","transactionBindingSha256","rebootRequired","prepareFailureStage"}
+    return value.get("state")==state and isinstance(detail,dict) and set(detail)==keys and detail.get("kind")=="terminal" and detail.get("terminalOutcome")==outcome and detail.get("rebootRequired") is False and detail.get("prepareFailureStage") is None and valid_hex_id(detail.get("reservationId"),"B-") and valid_hash(detail.get("transactionBindingSha256")) and (reservation is None or detail.get("reservationId")==reservation) and (binding is None or detail.get("transactionBindingSha256")==binding)
+deadline=time.monotonic()+600
+try:
+    while True:
+        try:
+            initial=repair(API,"repair.status")
+            if initial.get("state")=="idle":
+                break
+        except BaseException:
+            pass
+        if time.monotonic()>=deadline:
+            raise RuntimeError()
+        time.sleep(.25)
+    while True:
+        try:
+            inventory_code,inventory=exchange("/api/inventory")
+            scan_code,scan=exchange("/api/rescue/installed-targets")
+            if inventory_code==200 and scan_code==200:
+                break
+        except BaseException:
+            pass
+        if time.monotonic()>=deadline:
+            raise RuntimeError()
+        time.sleep(.25)
+    candidates=[item for item in scan["candidates"] if item.get("osFamilyHint")=="linux" and item.get("requiresUnlock") is False]
+    if len(candidates)!=1:
+        raise RuntimeError()
+    candidate=candidates[0]
+    selection={"scanFingerprint":scan["scanFingerprint"],"targetId":candidate["targetId"]}
+    selected_code,selected=exchange("/api/rescue/select-installed-target",selection)
+    inspected_code,inspected=exchange("/api/rescue/inspect-installed-target",selection)
+    if selected_code!=200 or selected.get("target")!=candidate or inspected_code!=200 or inspected.get("status")!="installed-os-content-inspected" or inspected.get("target",{}).get("filesystem")!="ext4":
+        raise RuntimeError()
+    identity=[item for item in inventory if "hostname" in item.get("collector","") or "block.inventory" in item.get("collector","") or item.get("collector","").endswith((".disks",".system",".storage.identity"))]
+    if not identity or any(item.get("success") is not True or item.get("truncated") is True for item in identity):
+        raise RuntimeError()
+    canonical="\0".join(item["collector"]+"\0"+item["output"] for item in identity)
+    runtime="sha256:"+hashlib.sha256(canonical.encode()).hexdigest()
+    candidate_json=json.dumps(candidate,ensure_ascii=True,sort_keys=True,separators=(",",":"))
+    material="\0".join(("kernaid-rescue-observe-target-v1",runtime,scan["scanFingerprint"],candidate["targetId"],candidate_json))
+    target_fingerprint="sha256:"+hashlib.sha256(material.encode()).hexdigest()
+    target={"scanFingerprint":scan["scanFingerprint"],"targetFingerprint":target_fingerprint,"targetId":candidate["targetId"]}
+    prepared=repair(API,PREPARE,{"target":target})
+    if prepared.get("state")=="preparing":
+        prepared=wait(API,"repair.status",{"prepared","failed","restored","manual-reconciliation-required"},deadline)
+    detail=prepared.get("detail")
+    prepared_keys={"kind","preparedId","sessionId","planId","planHash","targetFingerprint","beforeSha256","afterSha256","diffSha256","resourceId","backupLocator","actionId","risk","backup","nextApprovalSequence","confirmationRequired"}
+    if prepared.get("state")!="prepared" or not isinstance(detail,dict) or set(detail)!=prepared_keys or detail.get("kind")!=KIND or not valid_hex_id(detail.get("preparedId"),"Q-") or not valid_hex_id(detail.get("sessionId"),"S-") or not valid_hex_id(detail.get("planId"),"P-") or not all(valid_hash(detail.get(field)) for field in ("planHash","targetFingerprint","beforeSha256","afterSha256","diffSha256")) or detail.get("targetFingerprint")!=target_fingerprint or detail.get("beforeSha256")==detail.get("afterSha256") or detail.get("resourceId")!=RESOURCE or not isinstance(detail.get("backupLocator"),str) or re.fullmatch(r"vault://repair/B-[0-9a-f]{32}",detail["backupLocator"]) is None or detail.get("actionId")!=ACTION or detail.get("risk")!=RISK or detail.get("backup")!={"state":"reserved","vaultDistinct":True} or detail.get("nextApprovalSequence")!=1 or detail.get("confirmationRequired")!=CONFIRMATION:
+        raise RuntimeError()
+    if EXPECTED_BEFORE is not None and detail.get("beforeSha256")!=EXPECTED_BEFORE:
+        raise RuntimeError()
+    if EXPECTED_AFTER is not None and detail.get("afterSha256")!=EXPECTED_AFTER:
+        raise RuntimeError()
+    source_reservation=detail["backupLocator"].removeprefix("vault://repair/")
+    apply_approval="A-"+secrets.token_hex(16)
+    approved=repair(API,APPROVE,{"preparedId":detail["preparedId"],"sessionId":detail["sessionId"],"planId":detail["planId"],"planHash":detail["planHash"],"approvalId":apply_approval,"approvalSequence":detail["nextApprovalSequence"],"typedConfirmation":CONFIRMATION})
+    if approved.get("state")=="executing":
+        approved=wait(API,"repair.status",{"succeeded","restored","failed","manual-reconciliation-required","cancelled"},deadline)
+    if not terminal(approved,"succeeded","committed",source_reservation):
+        raise RuntimeError()
+    receipt={"reservationId":approved["detail"]["reservationId"],"transactionBindingSha256":approved["detail"]["transactionBindingSha256"]}
+    if SCENARIO=="crypttab-lifecycle":
+        rollback=repair(ROLLBACK_API,"repair.crypttab.rollback.prepare",{"source":receipt})
+        if rollback.get("state")=="preparing":
+            rollback=wait(ROLLBACK_API,"repair.crypttab.rollback.status",{"prepared","succeeded","failed","restored","manual-reconciliation-required"},deadline)
+        item=rollback.get("detail")
+        rollback_keys={"kind","preparedId","rollbackId","sessionId","planId","planHash","targetFingerprint","source","resourceId","backupLocator","actionId","risk","nextApprovalSequence","confirmationRequired"}
+        if rollback.get("state")!="prepared" or not isinstance(item,dict) or set(item)!=rollback_keys or item.get("kind")!="crypttab-rollback-prepared" or not valid_hex_id(item.get("preparedId"),"Q-") or not valid_hex_id(item.get("rollbackId"),"RB-") or not valid_hex_id(item.get("sessionId"),"S-") or not valid_hex_id(item.get("planId"),"P-") or not valid_hash(item.get("planHash")) or item.get("targetFingerprint")!=target_fingerprint or item.get("source")!=receipt or item.get("resourceId")!=RESOURCE or item.get("backupLocator")!="vault://repair/"+receipt["reservationId"] or item.get("actionId")!="linux.crypttab.disable-missing-source.v1" or item.get("risk")!="R2" or item.get("nextApprovalSequence")!=2 or item.get("confirmationRequired")!="RIPRISTINA CRYPTTAB ORIGINALE":
+            raise RuntimeError()
+        rollback_approval="A-"+secrets.token_hex(16)
+        while rollback_approval==apply_approval:
+            rollback_approval="A-"+secrets.token_hex(16)
+        rolled=repair(ROLLBACK_API,"repair.crypttab.rollback.approve",{"preparedId":item["preparedId"],"rollbackId":item["rollbackId"],"sessionId":item["sessionId"],"planId":item["planId"],"planHash":item["planHash"],"source":receipt,"approvalId":rollback_approval,"approvalSequence":item["nextApprovalSequence"],"typedConfirmation":item["confirmationRequired"]})
+        if rolled.get("state")=="executing":
+            rolled=wait(ROLLBACK_API,"repair.crypttab.rollback.status",{"restored","failed","manual-reconciliation-required","cancelled"},deadline)
+        if not terminal(rolled,"restored","rolled-back-original",receipt["reservationId"],receipt["transactionBindingSha256"]):
+            raise RuntimeError()
+except BaseException:
+    fail()
+sys.stdout.write("KERNAID_QEMU_PROVIDER_PROOF_V1 stage=repair-"+SCENARIO+" result=true\n")
+'''
+    replacements = {
+        "__SCENARIO__": repr(scenario),
+        "__KIND__": repr(configuration["kind"]),
+        "__PREPARE__": repr(configuration["prepare"]),
+        "__APPROVE__": repr(configuration["approve"]),
+        "__ACTION__": repr(configuration["action"]),
+        "__RESOURCE__": repr(configuration["resource"]),
+        "__RISK__": repr(configuration["risk"]),
+        "__CONFIRMATION__": repr(configuration["confirmation"]),
+        "__EXPECTED_BEFORE__": repr(configuration["expected_before"]),
+        "__EXPECTED_AFTER__": repr(configuration["expected_after"]),
+    }
+    for needle, replacement in replacements.items():
+        source = source.replace(needle, replacement)
+    encoded = textwrap.dedent(source).encode("ascii")
+    if len(encoded) > 16 * 1024:
+        raise ValueError("pack qualification source exceeds guest proof bound")
+    return encoded
 
 
 def failure_path_source(mode: str, before_sha256: str, after_sha256: str) -> bytes:
@@ -1438,7 +1658,13 @@ def main(arguments: Sequence[str]) -> int:
         if parsed.qemu_args[:1] != ["--"]:
             raise LIFECYCLE.ClosedFailure("arguments", "invalid")
         if (
-            parsed.scenario in {"rollback", "interrupt-reconcile", *FAILURE_SCENARIOS}
+            parsed.scenario
+            in {
+                "rollback",
+                "interrupt-reconcile",
+                *FAILURE_SCENARIOS,
+                *PACK_QUALIFICATION_SCENARIOS,
+            }
             and parsed.firmware != "uefi"
         ):
             raise LIFECYCLE.ClosedFailure("arguments", "scenario-firmware-invalid")
@@ -1540,6 +1766,28 @@ def main(arguments: Sequence[str]) -> int:
                 timeout=420.0,
             )
             qmp.set_deadline(LIFECYCLE._deadline(aggregate, 10.0))
+            qmp.system_powerdown()
+            harness.wait_for_shutdown(
+                LIFECYCLE._deadline(aggregate, REPAIR_ACPI_SHUTDOWN_SECONDS)
+            )
+        elif parsed.scenario in PACK_QUALIFICATION_SCENARIOS:
+            LIFECYCLE.run_guest_proof(
+                console,
+                f"repair-{parsed.scenario}",
+                pack_qualification_source(
+                    parsed.scenario,
+                    parsed.before_sha256,
+                    parsed.after_sha256,
+                ),
+                cursor,
+                aggregate,
+                timeout=620.0,
+            )
+            qmp.set_deadline(LIFECYCLE._deadline(aggregate, 10.0))
+            if target_write_bytes(qmp) <= 0:
+                raise LIFECYCLE.ClosedFailure(
+                    "pack-qualification", "write-witness-missing"
+                )
             qmp.system_powerdown()
             harness.wait_for_shutdown(
                 LIFECYCLE._deadline(aggregate, REPAIR_ACPI_SHUTDOWN_SECONDS)
@@ -1735,9 +1983,32 @@ def main(arguments: Sequence[str]) -> int:
             flush=True,
         )
         return 1
+    digest_suffix = (
+        f"before_sha256={parsed.before_sha256} "
+        f"after_sha256={parsed.after_sha256}"
+    )
     if parsed.scenario == "apply":
         action = "linux.fstab.disable-missing-uuid.v1"
         suffix = "terminal=committed approval=typed-single-use"
+    elif parsed.scenario == "crypttab-lifecycle":
+        action = "linux.crypttab.disable-missing-source.v1"
+        suffix = (
+            "apply=committed terminal=rolled-back-original "
+            "rollback=fresh-typed-single-use exact_bytes=restored"
+        )
+    elif parsed.scenario == "ext4-apply":
+        action = "linux.ext4.fsck-preen-with-undo.v1"
+        digest_suffix = "contract_hashes=validated"
+        suffix = (
+            "terminal=committed postcheck=clean same_boot_undo=armed "
+            "postcommit_rollback=unavailable approval=typed-single-use"
+        )
+    elif parsed.scenario == "resolver-link-apply":
+        action = "linux.network.restore-resolver-link.v1"
+        suffix = (
+            "terminal=committed link=resolved-stub-relative "
+            "rollback=automatic-on-failure approval=typed-single-use"
+        )
     elif parsed.scenario == "rollback":
         action = "linux.fstab.restore"
         suffix = (
@@ -1770,7 +2041,7 @@ def main(arguments: Sequence[str]) -> int:
     print(
         f"{ATTESTATION_PREFIX} action={action} "
         f"firmware={parsed.firmware} scenario={parsed.scenario} "
-        f"before_sha256={parsed.before_sha256} after_sha256={parsed.after_sha256} "
+        f"{digest_suffix} "
         f"vault_distinct=true {suffix} ready=true",
         flush=True,
     )
