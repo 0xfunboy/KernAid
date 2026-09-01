@@ -12,7 +12,9 @@ import {
   enrollmentSigningBytes,
   inventorySigningBytes,
   parsePolicyPullRequest,
+  parseSignedPolicyBundleUnsigned,
   parseSignedPolicyBundle,
+  policyProviderModes,
   policyBundleSigningBytes,
   policyPullSigningBytes,
   parseSignedUpdateManifest,
@@ -89,6 +91,30 @@ test("canonical JSON sorts object keys recursively and preserves array order", (
     TypeError,
   );
   assert.throws(() => canonicalJson({ value: undefined }), TypeError);
+});
+
+test("Fleet policy exposes the complete closed P0 provider catalog", () => {
+  assert.deepEqual(policyProviderModes, [
+    "anthropic_api",
+    "enterprise",
+    "gemini_api",
+    "offline",
+    "openai_api",
+    "openai_compatible",
+  ]);
+  const policy = toUnsignedPolicyBundle(
+    parseSignedPolicyBundle(JSON.parse(POLICY_BUNDLE_JSON)),
+  );
+  policy.rules.providerModes = [...policyProviderModes];
+  assert.deepEqual(
+    parseSignedPolicyBundleUnsigned(policy).rules.providerModes,
+    policyProviderModes,
+  );
+  policy.rules.providerModes.reverse();
+  assert.throws(
+    () => parseSignedPolicyBundleUnsigned(policy),
+    FleetSchemaError,
+  );
 });
 
 test("Rust and TypeScript update manifest bytes and signature are identical", () => {

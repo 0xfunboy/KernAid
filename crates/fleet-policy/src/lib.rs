@@ -32,6 +32,7 @@ const MAX_CHECKPOINT_BYTES: usize = 4 * 1024;
 const MAX_ID_BYTES: usize = 160;
 const MAX_ASSIGNED_DEVICES: usize = 4_096;
 const MAX_ACTION_IDS: usize = 1_024;
+const MAX_PROVIDER_MODES: usize = 6;
 
 /// Fleet risk values. R4 is intentionally not representable by this v1 wire
 /// contract; a caller maps an unknown or higher local risk to `None` and the
@@ -48,19 +49,23 @@ pub enum RiskLevel {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderMode {
+    AnthropicApi,
     Offline,
     OpenaiApi,
     OpenaiCompatible,
     Enterprise,
+    GeminiApi,
 }
 
 impl ProviderMode {
     const fn wire_name(self) -> &'static str {
         match self {
+            Self::AnthropicApi => "anthropic_api",
             Self::Offline => "offline",
             Self::OpenaiApi => "openai_api",
             Self::OpenaiCompatible => "openai_compatible",
             Self::Enterprise => "enterprise",
+            Self::GeminiApi => "gemini_api",
         }
     }
 }
@@ -715,7 +720,7 @@ fn validate_rules(rules: &PolicyRules) -> Result<(), FleetPolicyError> {
         return Err(FleetPolicyError::InvalidField("rules.retentionDays"));
     }
     if rules.provider_modes.is_empty()
-        || rules.provider_modes.len() > 4
+        || rules.provider_modes.len() > MAX_PROVIDER_MODES
         || rules
             .provider_modes
             .windows(2)
@@ -1027,6 +1032,33 @@ mod tests {
         let text = std::str::from_utf8(&bytes).expect("policy UTF-8");
         assert!(text.starts_with("{\"assignments\":{\"deviceIds\":"));
         assert!(text.contains("\"emergencyRollbackAlwaysAllowed\":true"));
+    }
+
+    #[test]
+    fn policy_admits_the_complete_closed_provider_catalog() {
+        let mut content = content(8);
+        content.rules.provider_modes = vec![
+            ProviderMode::AnthropicApi,
+            ProviderMode::Enterprise,
+            ProviderMode::GeminiApi,
+            ProviderMode::Offline,
+            ProviderMode::OpenaiApi,
+            ProviderMode::OpenaiCompatible,
+        ];
+        let verified = SignedPolicyBundle::sign(content, &signing_key())
+            .expect("sign policy")
+            .verify(&signing_key().verifying_key(), TENANT)
+            .expect("verify policy");
+        for mode in [
+            ProviderMode::AnthropicApi,
+            ProviderMode::Enterprise,
+            ProviderMode::GeminiApi,
+            ProviderMode::Offline,
+            ProviderMode::OpenaiApi,
+            ProviderMode::OpenaiCompatible,
+        ] {
+            assert!(verified.provider_mode_allowed(mode, true));
+        }
     }
 
     #[test]

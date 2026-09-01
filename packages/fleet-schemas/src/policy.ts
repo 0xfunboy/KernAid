@@ -93,7 +93,9 @@ function parsePolicyPullUnsignedFields(
 
 export const policyRiskLevels = ["R0", "R1", "R2", "R3"] as const;
 export const policyProviderModes = [
+  "anthropic_api",
   "enterprise",
+  "gemini_api",
   "offline",
   "openai_api",
   "openai_compatible",
@@ -323,7 +325,7 @@ function parseRules(value: unknown): FleetPolicyRules {
   if (
     !Array.isArray(object.providerModes) ||
     object.providerModes.length === 0 ||
-    object.providerModes.length > 4
+    object.providerModes.length > policyProviderModes.length
   ) {
     throw new FleetSchemaError("policy.rules.providerModes is invalid");
   }
