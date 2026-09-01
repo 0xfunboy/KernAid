@@ -33,6 +33,8 @@ use zeroize::Zeroizing;
 
 #[cfg(feature = "linux-service")]
 pub mod linux;
+#[cfg(all(feature = "macos-service", any(target_os = "macos", test)))]
+pub mod macos;
 #[cfg(feature = "rescue-fstab-handoff")]
 pub mod rescue;
 #[cfg(all(feature = "windows-service", any(windows, test)))]
@@ -231,6 +233,7 @@ pub trait ResidentWorkOrderTransport {
 #[serde(rename_all = "lowercase")]
 pub enum ResidentPlatform {
     Linux,
+    Macos,
     Rescue,
     Windows,
 }
@@ -1070,6 +1073,7 @@ const fn action_supported(action: WorkOrderActionId, platform: ResidentPlatform)
                 && cfg!(any(test, feature = "rescue-fstab-handoff"))
         }
         WorkOrderActionId::WindowsP0DiagnoseV1 => matches!(platform, ResidentPlatform::Windows),
+        WorkOrderActionId::MacosP0DiagnoseV1 => matches!(platform, ResidentPlatform::Macos),
     }
 }
 

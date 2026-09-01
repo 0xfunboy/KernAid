@@ -85,6 +85,7 @@ test("work-order schemas reject shell-shaped fields and unknown actions", () => 
     "linux.filesystem.health.v1",
     "linux.fstab.disable-missing-uuid.v1",
     "linux.storage.health.v1",
+    "macos.p0.diagnose.v1",
     "windows.p0.diagnose.v1",
   ]);
   assert.throws(() =>

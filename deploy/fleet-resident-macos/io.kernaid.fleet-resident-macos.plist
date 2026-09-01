@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>io.kernaid.fleet-resident-macos</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/REPLACE_USER/Library/Application Support/KernAid/Fleet Resident/kernaid-fleet-resident-macos</string>
+    <string>--config</string>
+    <string>/Users/REPLACE_USER/Library/Application Support/KernAid/Fleet Resident/config.json</string>
+  </array>
+  <key>LimitLoadToSessionType</key>
+  <string>Aqua</string>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>KeepAlive</key>
+  <false/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>LowPriorityIO</key>
+  <true/>
+</dict>
+</plist>

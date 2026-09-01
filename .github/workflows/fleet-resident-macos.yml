@@ -1,0 +1,86 @@
+name: fleet-resident-macos
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wire-schema:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.18.0
+          cache: pnpm
+      - run: ./tools/check-node-version.sh
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @kernaid/fleet-schemas test
+
+  build-unsigned:
+    needs: wire-schema
+    runs-on: macos-latest
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-aarch64
+            target: aarch64-apple-darwin
+          - name: macos-x86_64
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          targets: ${{ matrix.target }}
+      - name: Targeted Resident state-machine test
+        if: matrix.name == 'macos-aarch64'
+        run: cargo test --locked -p kernaid-fleet-resident-work-orders --features macos-service --lib
+      - name: Build unsigned macOS Resident
+        run: >-
+          cargo build --locked --release
+          --target ${{ matrix.target }}
+          -p kernaid-fleet-resident-work-orders
+          --features macos-service
+          --bin kernaid-fleet-resident-macos
+      - name: Assemble explicit development bundle
+        env:
+          TARGET: ${{ matrix.target }}
+          NAME: ${{ matrix.name }}
+        run: |
+          bundle="dist/KernAid-Fleet-Resident-${NAME}-UNSIGNED-UNNOTARIZED"
+          mkdir -p "$bundle"
+          cp "target/${TARGET}/release/kernaid-fleet-resident-macos" "$bundle/"
+          chmod 700 "$bundle/kernaid-fleet-resident-macos"
+          cp deploy/fleet-resident-macos/config.example.json "$bundle/"
+          cp deploy/fleet-resident-macos/io.kernaid.fleet-resident-macos.plist "$bundle/"
+          cp deploy/fleet-resident-macos/README.md "$bundle/INSTALL.md"
+          printf '%s\n' \
+            'INTERNAL DEVELOPMENT ARTIFACT' \
+            'This binary is unsigned and unnotarized. Do not deploy to customers or bypass Gatekeeper.' \
+            > "$bundle/UNSIGNED-UNNOTARIZED.txt"
+          (cd "$bundle" && shasum -a 256 \
+            kernaid-fleet-resident-macos \
+            config.example.json \
+            io.kernaid.fleet-resident-macos.plist \
+            INSTALL.md \
+            UNSIGNED-UNNOTARIZED.txt \
+            > SHA256SUMS)
+          tar -C dist -czf "dist/${NAME}-UNSIGNED-UNNOTARIZED.tar.gz" "$(basename "$bundle")"
+          shasum -a 256 "dist/${NAME}-UNSIGNED-UNNOTARIZED.tar.gz" > "dist/${NAME}-UNSIGNED-UNNOTARIZED.tar.gz.sha256"
+      - name: Upload explicitly unsigned and unnotarized bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: KernAid-Fleet-Resident-${{ matrix.name }}-UNSIGNED-UNNOTARIZED
+          path: |
+            dist/${{ matrix.name }}-UNSIGNED-UNNOTARIZED.tar.gz
+            dist/${{ matrix.name }}-UNSIGNED-UNNOTARIZED.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7

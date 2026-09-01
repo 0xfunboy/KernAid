@@ -6,6 +6,8 @@
 //! observed data is untrusted. Findings contain only fixed text and fixed
 //! collector identifiers; observed strings are never copied into a finding.
 
+pub mod resident;
+
 use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use std::{collections::BTreeSet, error::Error, fmt};
 
