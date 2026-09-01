@@ -44,6 +44,15 @@ export const workOrderActions = Object.freeze({
     platforms: Object.freeze(["windows"]),
     localApprovalRequired: false,
   }),
+  "macos.p0.diagnose.v1": Object.freeze({
+    label: "macOS P0 diagnosis",
+    version: 1,
+    kind: "diagnosis",
+    risk: "R0",
+    requiredFeature: "fleet",
+    platforms: Object.freeze(["macos"]),
+    localApprovalRequired: false,
+  }),
 });
 
 const workOrderStatuses = new Set([

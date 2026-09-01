@@ -3489,7 +3489,7 @@ export class FleetStore {
     const version = this.#database.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    if (version.user_version > 11) {
+    if (version.user_version > 12) {
       throw new Error(
         `unsupported Fleet database version ${version.user_version}`,
       );
@@ -4426,6 +4426,86 @@ export class FleetStore {
             .all();
           if (violations.length !== 0) {
             throw new Error("Fleet v11 migration violated a foreign key");
+          }
+        });
+      } finally {
+        this.#database.exec("PRAGMA foreign_keys = ON");
+      }
+      currentVersion = 11;
+    }
+
+    if (currentVersion === 11) {
+      this.#database.exec("PRAGMA foreign_keys = OFF");
+      try {
+        this.#transaction(() => {
+          this.#database.exec(`
+            CREATE TABLE work_orders_v12 (
+              tenant_id TEXT NOT NULL REFERENCES tenants(tenant_id),
+              work_order_id TEXT NOT NULL,
+              request_id TEXT NOT NULL,
+              request_sha256 TEXT NOT NULL CHECK (
+                length(request_sha256) = 64 AND
+                request_sha256 NOT GLOB '*[^0-9a-f]*'
+              ),
+              target_device_id TEXT NOT NULL,
+              action_id TEXT NOT NULL CHECK (action_id IN (
+                'linux.boot-critical-path.v1',
+                'linux.filesystem.health.v1',
+                'linux.storage.health.v1',
+                'linux.fstab.disable-missing-uuid.v1',
+                'windows.p0.diagnose.v1',
+                'macos.p0.diagnose.v1'
+              )),
+              action_version INTEGER NOT NULL CHECK (action_version = 1),
+              kind TEXT NOT NULL CHECK (kind IN ('diagnosis', 'repair')),
+              risk TEXT NOT NULL CHECK (risk IN ('R0', 'R1', 'R2', 'R3')),
+              local_approval_required INTEGER NOT NULL CHECK (
+                local_approval_required IN (0, 1)
+              ),
+              status TEXT NOT NULL CHECK (status IN (
+                'pending_approval', 'queued', 'leased', 'succeeded', 'failed',
+                'rejected', 'cancelled', 'expired'
+              )),
+              created_by_credential_id TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              expires_at TEXT NOT NULL,
+              expires_at_ms INTEGER NOT NULL,
+              approved_by_credential_id TEXT,
+              approved_at TEXT,
+              lease_id TEXT,
+              leased_at TEXT,
+              lease_expires_at TEXT,
+              lease_expires_at_ms INTEGER,
+              outcome TEXT CHECK (outcome IN ('succeeded', 'failed', 'rejected')),
+              result_sha256 TEXT,
+              result_envelope_sha256 TEXT,
+              completed_at TEXT,
+              cancelled_by_credential_id TEXT,
+              cancelled_at TEXT,
+              PRIMARY KEY (tenant_id, work_order_id),
+              UNIQUE (tenant_id, request_id),
+              FOREIGN KEY (tenant_id, target_device_id)
+                REFERENCES devices(tenant_id, device_id),
+              FOREIGN KEY (tenant_id, created_by_credential_id)
+                REFERENCES tenant_access_credentials(tenant_id, credential_id),
+              FOREIGN KEY (tenant_id, approved_by_credential_id)
+                REFERENCES tenant_access_credentials(tenant_id, credential_id),
+              FOREIGN KEY (tenant_id, cancelled_by_credential_id)
+                REFERENCES tenant_access_credentials(tenant_id, credential_id)
+            ) STRICT;
+            INSERT INTO work_orders_v12 SELECT * FROM work_orders;
+            DROP TABLE work_orders;
+            ALTER TABLE work_orders_v12 RENAME TO work_orders;
+            CREATE INDEX work_orders_queue_idx ON work_orders(
+              tenant_id, target_device_id, status, created_at, work_order_id
+            );
+            PRAGMA user_version = 12;
+          `);
+          const violations = this.#database
+            .prepare("PRAGMA foreign_key_check")
+            .all();
+          if (violations.length !== 0) {
+            throw new Error("Fleet v12 migration violated a foreign key");
           }
         });
       } finally {
