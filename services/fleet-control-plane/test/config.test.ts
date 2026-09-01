@@ -31,12 +31,16 @@ test("external receipt key and matching public anchor load from bounded files", 
     KERNAID_FLEET_DB_PATH: databasePath,
     KERNAID_FLEET_ENTITLEMENT_TRUST_ANCHOR_FILE: anchorPath,
     KERNAID_FLEET_UPDATE_TRUST_ANCHOR_FILE: anchorPath,
+    KERNAID_FLEET_ENTERPRISE_LICENSE_TRUST_ANCHOR_FILE: anchorPath,
+    KERNAID_FLEET_ENTERPRISE_LICENSE_KEY_ID: "vendor-2026-01",
     KERNAID_FLEET_SERVICE_RECEIPT_SIGNING_KEY_FILE: signingKeyPath,
     KERNAID_FLEET_SERVICE_RECEIPT_TRUST_ANCHOR_FILE: anchorPath,
   };
 
   const config = loadFleetServiceConfig(environment);
   assert.equal(config.serviceReceiptTrustAnchor, publicAnchor);
+  assert.equal(config.enterpriseLicenseTrustAnchor, publicAnchor);
+  assert.equal(config.enterpriseLicenseKeyId, "vendor-2026-01");
   assert.equal(
     ed25519RawPublicKey(config.serviceReceiptSigningKey),
     publicAnchor,

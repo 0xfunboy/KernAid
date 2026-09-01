@@ -61,6 +61,15 @@ upload or arbitrary metadata API.
 - Entitlement pulls are signed by the enrolled device key, time-bounded and
   nonce-replay protected. The response contains only documents assigning that
   exact device plus its tenant-scoped signed revocation checkpoint.
+- Commercial Enterprise licensing is a separate tenant-bound, versioned
+  Ed25519 envelope. Its key ID, plan, sorted feature allowlist, device and
+  technician limits, not-before, expiry and grace window are signed offline.
+  Fleet retains only the signed envelope, deterministic seat assignments,
+  monotonic clock checkpoint and digest-only lifecycle audit. New Enterprise
+  mutations require an active feature and available seat; grace, expiry,
+  revocation, invalid signatures and clock rollback fail closed. Device
+  inventory/audit ingestion, local diagnosis and reads of retained data remain
+  available.
 - Update publication accepts only canonical manifests already signed by the
   externally provisioned vendor anchor. The per-tenant sequence checkpoint is
   monotonic; exact replay is idempotent and substitution fails closed. No
@@ -100,49 +109,53 @@ and are limited to 64 KiB, except canonical policy publication at 1 MiB.
 Entitlement and revocation publication must be exact compact canonical JSON
 and is bounded to 64 KiB, matching the Rust verifier.
 
-| Method | Route                                                           | Authorization          | Result                                       |
-| ------ | --------------------------------------------------------------- | ---------------------- | -------------------------------------------- |
-| `GET`  | `/healthz`                                                      | Public                 | SQLite liveness                              |
-| `POST` | `/v1/console-sessions`                                          | Tenant token once      | Create short in-memory browser session       |
-| `GET`  | `/v1/console-session`                                           | Secure session cookie  | Recover role, expiry and CSRF state          |
-| `DELETE` | `/v1/console-session`                                         | Session cookie + CSRF  | Revoke current session and clear cookie      |
-| `POST` | `/v1/tenants`                                                   | Root bearer            | One-time `tenantId`, `adminToken`            |
-| `GET`  | `/v1/tenants/:tenantId/access-credentials`                      | Admin                  | List credential metadata, never tokens       |
-| `POST` | `/v1/tenants/:tenantId/access-credentials`                      | Admin                  | Create one-time-visible role token           |
-| `POST` | `/v1/tenants/:tenantId/access-credentials/:credentialId/revoke` | Admin                  | Revoke one credential                        |
-| `GET`  | `/v1/tenants/:tenantId/access-audit`                            | Admin                  | Last 256 authorization decisions             |
-| `POST` | `/v1/tenants/:tenantId/enrollment-tokens`                       | Operator or admin      | One-time `enrollmentToken`, `expiresAt`      |
-| `POST` | `/v1/enrollments`                                               | Signed public request  | Enroll a device                              |
-| `POST` | `/v1/inventories`                                               | Signed device envelope | Insert or idempotently acknowledge inventory |
-| `POST` | `/v1/audit-events`                                              | Signed device envelope | Append or idempotently acknowledge audit     |
-| `POST` | `/v1/policy-pulls`                                              | Signed device request  | Return only applicable signed bundles        |
-| `POST` | `/v1/entitlement-pulls`                                         | Signed device request  | Return assigned signed entitlements          |
-| `POST` | `/v1/update-pulls`                                              | Signed device request  | Return applicable vendor-signed manifests    |
-| `POST` | `/v1/work-order-claims`                                         | Signed device request  | Lease one eligible typed order               |
-| `POST` | `/v1/work-order-results`                                        | Signed device result   | Commit a digest-only terminal result         |
-| `POST` | `/v1/tenants/:tenantId/policy-trust-anchor`                     | Admin                  | Set tenant Ed25519 public anchor once        |
-| `POST` | `/v1/tenants/:tenantId/policies`                                | Admin                  | Verify and publish a pre-signed bundle       |
-| `POST` | `/v1/tenants/:tenantId/entitlements`                            | Admin                  | Verify/publish offline-signed entitlement    |
-| `POST` | `/v1/tenants/:tenantId/entitlement-revocations`                 | Admin                  | Publish signed revocation checkpoint         |
-| `POST` | `/v1/tenants/:tenantId/update-manifests`                        | Admin                  | Verify/publish vendor-signed manifest        |
-| `GET`  | `/v1/tenants/:tenantId/policies`                                | Operator or admin      | Minimized policy status                      |
-| `GET`  | `/v1/tenants/:tenantId/entitlements`                            | Operator or admin      | Minimized entitlement/revocation status      |
-| `GET`  | `/v1/tenants/:tenantId/update-manifests`                        | Operator or admin      | Minimized update-channel status              |
-| `GET`  | `/v1/tenants/:tenantId/devices`                                 | Operator or admin      | `{ items: [...] }` device registry           |
-| `GET`  | `/v1/tenants/:tenantId/assets`                                  | Operator or admin      | `{ items: [...] }` latest aggregate assets   |
-| `GET`  | `/v1/tenants/:tenantId/audit-events`                            | Operator or admin      | Bounded `{ items: [...] }` digest-only audit |
-| `GET`  | `/v1/tenants/:tenantId/work-orders`                             | Operator or admin      | Bounded work-order state                     |
-| `POST` | `/v1/tenants/:tenantId/work-orders`                             | Operator or admin      | Queue one typed action                       |
-| `POST` | `/v1/tenants/:tenantId/work-orders/:workOrderId/approve`        | Admin                  | Explicitly approve one write intent          |
-| `POST` | `/v1/tenants/:tenantId/work-orders/:workOrderId/cancel`         | Operator or admin      | Cancel an unleased order                     |
-| `GET`  | `/v1/tenants/:tenantId/work-order-events`                       | Operator or admin      | Digest-only transition audit                 |
-| `GET`  | `/v1/tenants/:tenantId/incident-cases`                          | Operator or admin      | Bounded cases and linked state digests       |
-| `POST` | `/v1/tenants/:tenantId/incident-cases`                          | Operator or admin      | Open a device/asset case                     |
-| `POST` | `/v1/tenants/:tenantId/incident-cases/:caseId/update`           | Operator or admin      | Update bounded open workflow metadata        |
-| `POST` | `/v1/tenants/:tenantId/incident-cases/:caseId/work-orders`      | Operator or admin      | Link a compatible typed work order           |
-| `POST` | `/v1/tenants/:tenantId/incident-cases/:caseId/close`            | Admin                  | Seal canonical report and signed receipt     |
-| `GET`  | `/v1/tenants/:tenantId/incident-case-events`                    | Operator or admin      | Digest-only case timeline                    |
-| `POST` | `/v1/tenants/:tenantId/devices/:deviceId/revoke`                | Operator or admin      | Permanently revoke ingestion                 |
+| Method   | Route                                                           | Authorization          | Result                                       |
+| -------- | --------------------------------------------------------------- | ---------------------- | -------------------------------------------- |
+| `GET`    | `/healthz`                                                      | Public                 | SQLite liveness                              |
+| `POST`   | `/v1/console-sessions`                                          | Tenant token once      | Create short in-memory browser session       |
+| `GET`    | `/v1/console-session`                                           | Secure session cookie  | Recover role, expiry and CSRF state          |
+| `DELETE` | `/v1/console-session`                                           | Session cookie + CSRF  | Revoke current session and clear cookie      |
+| `POST`   | `/v1/tenants`                                                   | Root bearer            | One-time `tenantId`, `adminToken`            |
+| `POST`   | `/v1/admin/enterprise-licenses/import`                          | Root bearer            | Verify/import offline commercial license     |
+| `GET`    | `/v1/admin/enterprise-licenses/:tenantId`                       | Root bearer            | Commercial status, seats and audit           |
+| `POST`   | `/v1/admin/enterprise-licenses/revoke`                          | Root bearer            | Revoke exact current commercial license      |
+| `GET`    | `/v1/tenants/:tenantId/enterprise-license`                      | Operator or admin      | Minimized commercial status and usage        |
+| `GET`    | `/v1/tenants/:tenantId/access-credentials`                      | Admin                  | List credential metadata, never tokens       |
+| `POST`   | `/v1/tenants/:tenantId/access-credentials`                      | Admin                  | Create one-time-visible role token           |
+| `POST`   | `/v1/tenants/:tenantId/access-credentials/:credentialId/revoke` | Admin                  | Revoke one credential                        |
+| `GET`    | `/v1/tenants/:tenantId/access-audit`                            | Admin                  | Last 256 authorization decisions             |
+| `POST`   | `/v1/tenants/:tenantId/enrollment-tokens`                       | Operator or admin      | One-time `enrollmentToken`, `expiresAt`      |
+| `POST`   | `/v1/enrollments`                                               | Signed public request  | Enroll a device                              |
+| `POST`   | `/v1/inventories`                                               | Signed device envelope | Insert or idempotently acknowledge inventory |
+| `POST`   | `/v1/audit-events`                                              | Signed device envelope | Append or idempotently acknowledge audit     |
+| `POST`   | `/v1/policy-pulls`                                              | Signed device request  | Return only applicable signed bundles        |
+| `POST`   | `/v1/entitlement-pulls`                                         | Signed device request  | Return assigned signed entitlements          |
+| `POST`   | `/v1/update-pulls`                                              | Signed device request  | Return applicable vendor-signed manifests    |
+| `POST`   | `/v1/work-order-claims`                                         | Signed device request  | Lease one eligible typed order               |
+| `POST`   | `/v1/work-order-results`                                        | Signed device result   | Commit a digest-only terminal result         |
+| `POST`   | `/v1/tenants/:tenantId/policy-trust-anchor`                     | Admin                  | Set tenant Ed25519 public anchor once        |
+| `POST`   | `/v1/tenants/:tenantId/policies`                                | Admin                  | Verify and publish a pre-signed bundle       |
+| `POST`   | `/v1/tenants/:tenantId/entitlements`                            | Admin                  | Verify/publish offline-signed entitlement    |
+| `POST`   | `/v1/tenants/:tenantId/entitlement-revocations`                 | Admin                  | Publish signed revocation checkpoint         |
+| `POST`   | `/v1/tenants/:tenantId/update-manifests`                        | Admin                  | Verify/publish vendor-signed manifest        |
+| `GET`    | `/v1/tenants/:tenantId/policies`                                | Operator or admin      | Minimized policy status                      |
+| `GET`    | `/v1/tenants/:tenantId/entitlements`                            | Operator or admin      | Minimized entitlement/revocation status      |
+| `GET`    | `/v1/tenants/:tenantId/update-manifests`                        | Operator or admin      | Minimized update-channel status              |
+| `GET`    | `/v1/tenants/:tenantId/devices`                                 | Operator or admin      | `{ items: [...] }` device registry           |
+| `GET`    | `/v1/tenants/:tenantId/assets`                                  | Operator or admin      | `{ items: [...] }` latest aggregate assets   |
+| `GET`    | `/v1/tenants/:tenantId/audit-events`                            | Operator or admin      | Bounded `{ items: [...] }` digest-only audit |
+| `GET`    | `/v1/tenants/:tenantId/work-orders`                             | Operator or admin      | Bounded work-order state                     |
+| `POST`   | `/v1/tenants/:tenantId/work-orders`                             | Operator or admin      | Queue one typed action                       |
+| `POST`   | `/v1/tenants/:tenantId/work-orders/:workOrderId/approve`        | Admin                  | Explicitly approve one write intent          |
+| `POST`   | `/v1/tenants/:tenantId/work-orders/:workOrderId/cancel`         | Operator or admin      | Cancel an unleased order                     |
+| `GET`    | `/v1/tenants/:tenantId/work-order-events`                       | Operator or admin      | Digest-only transition audit                 |
+| `GET`    | `/v1/tenants/:tenantId/incident-cases`                          | Operator or admin      | Bounded cases and linked state digests       |
+| `POST`   | `/v1/tenants/:tenantId/incident-cases`                          | Operator or admin      | Open a device/asset case                     |
+| `POST`   | `/v1/tenants/:tenantId/incident-cases/:caseId/update`           | Operator or admin      | Update bounded open workflow metadata        |
+| `POST`   | `/v1/tenants/:tenantId/incident-cases/:caseId/work-orders`      | Operator or admin      | Link a compatible typed work order           |
+| `POST`   | `/v1/tenants/:tenantId/incident-cases/:caseId/close`            | Admin                  | Seal canonical report and signed receipt     |
+| `GET`    | `/v1/tenants/:tenantId/incident-case-events`                    | Operator or admin      | Digest-only case timeline                    |
+| `POST`   | `/v1/tenants/:tenantId/devices/:deviceId/revoke`                | Operator or admin      | Permanently revoke ingestion                 |
 
 Tenant creation takes an exact empty object. Enrollment-token creation takes:
 
@@ -245,6 +258,8 @@ node --input-type=module -e \
 export KERNAID_FLEET_ROOT_TOKEN_FILE="$PWD/.local/fleet/root-token"
 export KERNAID_FLEET_ENTITLEMENT_TRUST_ANCHOR_FILE="$PWD/.local/fleet/entitlement.public"
 export KERNAID_FLEET_UPDATE_TRUST_ANCHOR_FILE="$PWD/.local/fleet/update-vendor.public"
+export KERNAID_FLEET_ENTERPRISE_LICENSE_TRUST_ANCHOR_FILE="$PWD/.local/fleet/commercial.public"
+export KERNAID_FLEET_ENTERPRISE_LICENSE_KEY_ID="vendor-2026-01"
 export KERNAID_FLEET_SERVICE_RECEIPT_SIGNING_KEY_FILE="$PWD/.local/fleet/receipt-signing-key.pk8"
 export KERNAID_FLEET_SERVICE_RECEIPT_TRUST_ANCHOR_FILE="$PWD/.local/fleet/receipt.public"
 export KERNAID_FLEET_DB_PATH="$PWD/.local/fleet/fleet.sqlite"
@@ -307,6 +322,24 @@ manual protocol is:
    readable only by Fleet and install the matching raw public anchor in each
    Resident. Back up the private key with the database: changing either side
    without an explicit migration makes synchronization fail closed.
+10. Install the commercial issuer's raw Ed25519 public anchor and exact key ID
+    outside SQLite. Verify and import a tenant license from the same host; the
+    root token is read from an owner-only file and is never placed on argv:
+
+```bash
+kernaid-fleet-license-admin verify tenant-license.json commercial.public vendor-2026-01 tenant_example
+kernaid-fleet-license-admin import https://fleet.example.invalid /run/secrets/kernaid_fleet_root_token tenant-license.json
+kernaid-fleet-license-admin status https://fleet.example.invalid /run/secrets/kernaid_fleet_root_token tenant_example
+kernaid-fleet-license-admin revoke https://fleet.example.invalid /run/secrets/kernaid_fleet_root_token tenant_example license_example
+```
+
+The control plane never contains a commercial signing key and implements no
+billing or payment simulation. The SQLite clock checkpoint detects ordinary
+wall-clock rollback and prevents extending a license by moving time backward;
+without a TPM-backed trusted clock it cannot prove time across restored machine
+images. Grace is visibility/export-only in v1: new Enterprise operations stop
+at expiry. The bootstrap recovery administrator does not consume a technician
+seat; every subsequently created admin/operator credential does.
 
 ## Verification
 
@@ -324,7 +357,8 @@ secrets, policy assignment isolation, policy rollback/conflict, restart
 persistence, entitlement assignment/replay/tamper/rollback/revocation, update
 target/ring filtering, update anti-rollback/replay, exact signed service
 receipts, receipt key/anchor mismatch, durable receipt sequence, SQLite
-v3-to-v10 migration, tenant role enforcement, credential revocation,
+v3-to-v11 migration, commercial signature/tamper/lifecycle/seat/revocation,
+tenant role enforcement, credential revocation,
 work-order catalog/governance/approval/signature/replay/expiry/restart,
 incident RBAC/source isolation/linking/signed closure/restart, cross-tenant
 denial, authorization audit/restart and optional same-origin console serving.

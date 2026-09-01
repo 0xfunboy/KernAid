@@ -35,6 +35,7 @@ const state = {
   policyAnchorConfigured: false,
   entitlements: [],
   entitlementRevocations: null,
+  enterpriseLicense: null,
   updates: [],
   governanceError: "",
   workOrders: [],
@@ -110,6 +111,7 @@ const elements = {
   policyStatusList: document.querySelector("#policy-status-list"),
   entitlementStatusList: document.querySelector("#entitlement-status-list"),
   updateStatusList: document.querySelector("#update-status-list"),
+  enterpriseLicenseUsage: document.querySelector("#enterprise-license-usage"),
   workOrderRows: document.querySelector("#work-order-rows"),
   workOrderEvents: document.querySelector("#work-order-events"),
   workOrderFilter: document.querySelector("#work-order-filter"),
@@ -276,6 +278,22 @@ function friendlyApiError(code, status) {
       "The selected device or asset is no longer available.",
     incident_case_mismatch: "The incident identifier does not match the path.",
     device_revoked: "The selected device has been revoked.",
+    enterprise_license_required:
+      "Import a tenant-bound Enterprise license with the local admin CLI before creating Fleet operations.",
+    enterprise_license_grace:
+      "The Enterprise license is in grace: existing data remains available, but new operations are stopped.",
+    enterprise_license_expired:
+      "The Enterprise license expired. Existing data remains available.",
+    enterprise_license_revoked:
+      "The Enterprise license was revoked. Existing data remains available.",
+    enterprise_license_clock_rollback:
+      "Fleet detected a wall-clock rollback and stopped new Enterprise operations.",
+    enterprise_feature_not_entitled:
+      "This Enterprise license does not allow the requested feature.",
+    enterprise_seat_limit_reached:
+      "The licensed device or technician seat limit is full.",
+    enterprise_seat_limit_exceeded:
+      "Active assignments exceed this license. Revoke devices or technician credentials before creating new operations.",
     csrf_required:
       "This secure session is stale. Sign in again before changing Fleet state.",
     console_login_rate_limited:
@@ -394,6 +412,7 @@ async function loadFleet() {
     auditResult,
     policiesResult,
     entitlementsResult,
+    enterpriseLicenseResult,
     updatesResult,
     workOrdersResult,
     workOrderEventsResult,
@@ -405,6 +424,7 @@ async function loadFleet() {
     request(`/v1/tenants/${encodedTenant}/audit-events`),
     request(`/v1/tenants/${encodedTenant}/policies`),
     request(`/v1/tenants/${encodedTenant}/entitlements`),
+    request(`/v1/tenants/${encodedTenant}/enterprise-license`),
     request(`/v1/tenants/${encodedTenant}/update-manifests`),
     request(`/v1/tenants/${encodedTenant}/work-orders`),
     request(`/v1/tenants/${encodedTenant}/work-order-events`),
@@ -417,6 +437,7 @@ async function loadFleet() {
     auditResult,
     policiesResult,
     entitlementsResult,
+    enterpriseLicenseResult,
     updatesResult,
     workOrdersResult,
     workOrderEventsResult,
@@ -451,6 +472,10 @@ async function loadFleet() {
   state.entitlementRevocations =
     entitlementsResult.status === "fulfilled"
       ? (entitlementsResult.value?.revocations ?? null)
+      : null;
+  state.enterpriseLicense =
+    enterpriseLicenseResult.status === "fulfilled"
+      ? enterpriseLicenseResult.value
       : null;
   state.updates =
     updatesResult.status === "fulfilled" ? items(updatesResult.value) : [];
@@ -495,6 +520,7 @@ async function loadFleet() {
   state.governanceError = governanceErrorMessage([
     policiesResult,
     entitlementsResult,
+    enterpriseLicenseResult,
     updatesResult,
   ]);
   render();
@@ -732,6 +758,41 @@ function renderAudit() {
 function renderGovernance() {
   elements.governanceError.hidden = state.governanceError === "";
   elements.governanceError.textContent = state.governanceError;
+
+  const commercial = state.enterpriseLicense;
+  const commercialState = commercial?.state ?? "unavailable";
+  const commercialLicense = commercial?.license ?? null;
+  const licenseState = document.querySelector("#enterprise-license-state");
+  licenseState.textContent = commercialState.replaceAll("_", " ");
+  licenseState.className = `domain-state ${commercialState === "active" ? "ready" : "missing"}`;
+  document.querySelector("#enterprise-license-plan").textContent =
+    commercialLicense?.plan ?? "Not licensed";
+  document.querySelector("#enterprise-license-window").textContent =
+    commercialLicense === null
+      ? "Offline vendor proof required"
+      : `${commercialLicense.keyId} · ${lifecycle(commercialLicense.validity?.expiresAtUnix)}`;
+  const latestLicenseEvent = Array.isArray(commercial?.events)
+    ? commercial.events[0]
+    : null;
+  document.querySelector("#enterprise-license-audit").textContent =
+    latestLicenseEvent === null
+      ? "No license lifecycle events"
+      : `Audit #${latestLicenseEvent.sequence ?? "—"} · ${String(latestLicenseEvent.kind ?? "unknown").replaceAll("_", " ")}`;
+  renderDocumentList(
+    elements.enterpriseLicenseUsage,
+    commercialLicense === null
+      ? []
+      : [
+          { label: "Devices", ...commercialLicense.devices },
+          { label: "Technicians", ...commercialLicense.technicians },
+        ],
+    (usage) => ({
+      title: usage.label,
+      detail: `${usage.assigned ?? 0} assigned`,
+      sequence: `${usage.assigned ?? 0}/${usage.limit ?? 0}`,
+    }),
+    "No commercial license imported",
+  );
 
   document.querySelector("#policy-count").textContent = String(
     state.policies.length,
@@ -1463,6 +1524,7 @@ function clearSession() {
   state.policyAnchorConfigured = false;
   state.entitlements = [];
   state.entitlementRevocations = null;
+  state.enterpriseLicense = null;
   state.updates = [];
   state.governanceError = "";
   state.workOrders = [];

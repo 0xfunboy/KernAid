@@ -12,6 +12,9 @@
       "import": "./dist/index.js"
     }
   },
+  "bin": {
+    "kernaid-fleet-license-admin": "./dist/license-admin.js"
+  },
   "scripts": {
     "prebuild": "pnpm --filter @kernaid/fleet-schemas build",
     "build": "tsc -p tsconfig.build.json",

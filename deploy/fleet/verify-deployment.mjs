@@ -64,6 +64,10 @@ assert.match(
   dockerfile,
   /KERNAID_FLEET_UPDATE_TRUST_ANCHOR_FILE=\/run\/configs\/kernaid_update_trust_anchor/,
 );
+assert.match(
+  dockerfile,
+  /KERNAID_FLEET_ENTERPRISE_LICENSE_TRUST_ANCHOR_FILE=\/run\/configs\/kernaid_enterprise_license_trust_anchor/,
+);
 assert.match(dockerfile, /VOLUME \["\/var\/lib\/kernaid-fleet"\]/);
 assert.match(
   dockerfile,
@@ -99,6 +103,11 @@ assert.match(
 );
 assert.match(
   compose,
+  /^\s+KERNAID_FLEET_ENTERPRISE_LICENSE_TRUST_ANCHOR_FILE: \/run\/configs\//m,
+);
+assert.match(compose, /^\s+KERNAID_FLEET_ENTERPRISE_LICENSE_KEY_ID:/m);
+assert.match(
+  compose,
   /^\s+file: "\$\{KERNAID_FLEET_SERVICE_RECEIPT_SIGNING_KEY_FILE:/m,
 );
 assert.match(
@@ -113,6 +122,10 @@ assert.match(
   compose,
   /^\s+file: "\$\{KERNAID_FLEET_UPDATE_TRUST_ANCHOR_FILE:/m,
 );
+assert.match(
+  compose,
+  /^\s+file: "\$\{KERNAID_FLEET_ENTERPRISE_LICENSE_TRUST_ANCHOR_FILE:/m,
+);
 assert.match(compose, /^\s+mode: 0400$/m);
 assert.match(compose, /^\s+internal: true$/m);
 assert.match(compose, /^\s+- ALL$/m);
@@ -120,6 +133,7 @@ assert.doesNotMatch(compose, /^\s+KERNAID_FLEET_ROOT_TOKEN:\s/m);
 assert.doesNotMatch(compose, /SERVICE_RECEIPT_(?:SEED|PRIVATE_KEY)(?:\s|:|=)/i);
 assert.doesNotMatch(compose, /ENTITLEMENT_(?:PRIVATE|SEED|SIGNING)/i);
 assert.doesNotMatch(compose, /UPDATE_(?:PRIVATE|SEED|SIGNING)/i);
+assert.doesNotMatch(compose, /ENTERPRISE_LICENSE_(?:PRIVATE|SEED|SIGNING)/i);
 assert.match(readme, /Secure, HttpOnly, SameSite\s+Strict/);
 assert.match(readme, /Open the console only through its HTTPS hostname/);
 

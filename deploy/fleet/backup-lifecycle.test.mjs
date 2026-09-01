@@ -243,7 +243,7 @@ function createFixture(t) {
   ]) {
     db.exec(`CREATE TABLE ${table} (id TEXT PRIMARY KEY)`);
   }
-  db.exec("PRAGMA user_version = 10");
+  db.exec("PRAGMA user_version = 11");
   db.close();
   chmodSync(database, 0o600);
 

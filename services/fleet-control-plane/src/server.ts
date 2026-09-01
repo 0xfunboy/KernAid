@@ -104,12 +104,25 @@ import {
   StoreWorkOrderStateError,
   StoreIncidentCaseReplayError,
   StoreIncidentCaseStateError,
+  StoreEnterpriseLicenseConflictError,
+  StoreEnterpriseLicenseRollbackError,
+  StoreEnterpriseSeatLimitError,
   type ListedIncidentCaseEvent,
   type StoredIncidentCase,
   type StoredServiceResponse,
   type StoredWorkOrder,
   type TenantAccessCredential,
 } from "./store.js";
+import {
+  ENTERPRISE_CLOCK_ROLLBACK_TOLERANCE_SECONDS,
+  MAX_ENTERPRISE_LICENSE_BYTES,
+  evaluateEnterpriseLicense,
+  parseEnterpriseLicenseEnvelope,
+  verifyEnterpriseLicense,
+  type EnterpriseLicenseClaims,
+  type EnterpriseLicenseEvaluation,
+  type EnterpriseLicenseFeature,
+} from "./enterprise-license.js";
 import {
   isTenantRole,
   tenantRoleAllows,
@@ -146,6 +159,8 @@ export interface FleetControlPlaneOptions {
   serviceReceiptTrustAnchor: string;
   entitlementTrustAnchor: string;
   updateTrustAnchor: string;
+  enterpriseLicenseTrustAnchor: string;
+  enterpriseLicenseKeyId: string;
   enrollmentClockSkewMs?: number;
   consoleSessionTtlMs?: number;
   now?: () => Date;
@@ -177,6 +192,8 @@ export class FleetControlPlane {
   readonly #serviceReceiptTrustAnchor: KeyObject;
   readonly #entitlementTrustAnchor: KeyObject;
   readonly #updateTrustAnchor: KeyObject;
+  readonly #enterpriseLicenseTrustAnchor: KeyObject;
+  readonly #enterpriseLicenseKeyId: string;
   readonly #clockSkewMs: number;
   readonly #now: () => Date;
   readonly #server: Server;
@@ -233,6 +250,23 @@ export class FleetControlPlane {
         "update trust anchor must be a canonical raw Ed25519 public key",
       );
     }
+    if (
+      options.enterpriseLicenseKeyId.length < 1 ||
+      options.enterpriseLicenseKeyId.length > 128 ||
+      !/^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(options.enterpriseLicenseKeyId)
+    ) {
+      throw new Error("enterprise license key ID is invalid");
+    }
+    try {
+      this.#enterpriseLicenseTrustAnchor = importEd25519Raw(
+        options.enterpriseLicenseTrustAnchor,
+      );
+    } catch {
+      throw new Error(
+        "enterprise license trust anchor must be a canonical raw Ed25519 public key",
+      );
+    }
+    this.#enterpriseLicenseKeyId = options.enterpriseLicenseKeyId;
     this.#store = new FleetStore(options.databasePath);
     try {
       this.#store.bindServiceReceiptAnchor(
@@ -346,6 +380,16 @@ export class FleetControlPlane {
         writeJson(response, 409, { error: "incident_case_replay" });
       } else if (error instanceof StoreIncidentCaseStateError) {
         writeJson(response, 409, { error: "incident_case_state_conflict" });
+      } else if (error instanceof StoreEnterpriseLicenseRollbackError) {
+        writeJson(response, 409, {
+          error: "enterprise_license_sequence_rollback",
+        });
+      } else if (error instanceof StoreEnterpriseLicenseConflictError) {
+        writeJson(response, 409, {
+          error: "enterprise_license_sequence_conflict",
+        });
+      } else if (error instanceof StoreEnterpriseSeatLimitError) {
+        writeJson(response, 409, { error: "enterprise_seat_limit_reached" });
       } else if (error instanceof ConsoleSessionCapacityError) {
         writeJson(response, 503, { error: "console_session_capacity" });
       } else {
@@ -461,6 +505,91 @@ export class FleetControlPlane {
       return;
     }
 
+    if (method === "POST" && path === "/v1/admin/enterprise-licenses/import") {
+      this.#authorizeRoot(request);
+      const envelope = parseEnterpriseLicenseEnvelope(
+        await readCanonicalJson(request, MAX_ENTERPRISE_LICENSE_BYTES),
+      );
+      if (
+        !verifyEnterpriseLicense(
+          envelope,
+          this.#enterpriseLicenseTrustAnchor,
+          this.#enterpriseLicenseKeyId,
+        )
+      ) {
+        throw new HttpError(401, "invalid_enterprise_license_signature");
+      }
+      if (
+        this.#store.getTenantAccessCredential(
+          envelope.claims.tenantId,
+          "bootstrap-admin",
+        ) === undefined
+      ) {
+        throw new HttpError(404, "tenant_not_found");
+      }
+      const canonicalEnvelope = canonicalJson(envelope);
+      const importedAt = this.#validNow().toISOString();
+      const result = this.#store.importEnterpriseLicense({
+        claims: envelope.claims,
+        canonicalJson: canonicalEnvelope,
+        envelopeSha256: sha256Hex(canonicalEnvelope),
+        importedAt,
+        actorId: "root-admin",
+      });
+      writeJson(response, result.idempotent ? 200 : 201, {
+        ...this.#enterpriseLicenseResponse(envelope.claims.tenantId),
+        idempotent: result.idempotent,
+      });
+      return;
+    }
+
+    if (method === "POST" && path === "/v1/admin/enterprise-licenses/revoke") {
+      this.#authorizeRoot(request);
+      const body = expectRecord(await readJson(request, 4 * 1024));
+      expectExactKeys(body, ["tenantId", "licenseId"]);
+      const tenantId = expectIdentifier(body.tenantId, "tenantId");
+      const licenseId = expectIdentifier(body.licenseId, "licenseId");
+      const result = this.#store.revokeEnterpriseLicense({
+        tenantId,
+        licenseId,
+        revokedAt: this.#validNow().toISOString(),
+        actorId: "root-admin",
+      });
+      if (result === undefined) throw new HttpError(404, "not_found");
+      writeJson(response, 200, {
+        ...this.#enterpriseLicenseResponse(tenantId),
+        idempotent: result.idempotent,
+      });
+      return;
+    }
+
+    const adminEnterpriseLicenseMatch =
+      /^\/v1\/admin\/enterprise-licenses\/([^/]+)$/.exec(path);
+    if (method === "GET" && adminEnterpriseLicenseMatch !== null) {
+      this.#authorizeRoot(request);
+      const tenantId = pathIdentifier(
+        adminEnterpriseLicenseMatch[1],
+        "tenantId",
+      );
+      writeJson(response, 200, this.#enterpriseLicenseResponse(tenantId));
+      return;
+    }
+
+    const enterpriseLicenseMatch =
+      /^\/v1\/tenants\/([^/]+)\/enterprise-license$/.exec(path);
+    if (method === "GET" && enterpriseLicenseMatch !== null) {
+      const tenantId = pathIdentifier(enterpriseLicenseMatch[1], "tenantId");
+      this.#authorizeTenant(
+        request,
+        tenantId,
+        "operator",
+        "entitlement.list",
+        tenantTarget(tenantId),
+      );
+      writeJson(response, 200, this.#enterpriseLicenseResponse(tenantId));
+      return;
+    }
+
     const accessCredentialsMatch =
       /^\/v1\/tenants\/([^/]+)\/access-credentials$/.exec(path);
     if (method === "GET" && accessCredentialsMatch !== null) {
@@ -483,12 +612,16 @@ export class FleetControlPlane {
     }
     if (method === "POST" && accessCredentialsMatch !== null) {
       const tenantId = pathIdentifier(accessCredentialsMatch[1], "tenantId");
-      this.#authorizeTenant(
+      const actor = this.#authorizeTenant(
         request,
         tenantId,
         "admin",
         "credential.create",
         tenantTarget(tenantId),
+      );
+      const enterpriseLicense = this.#requireEnterpriseFeature(
+        tenantId,
+        "technician_seats",
       );
       const body = expectRecord(await readJson(request));
       expectExactKeys(body, ["label", "role"]);
@@ -509,6 +642,10 @@ export class FleetControlPlane {
         role: body.role,
         label: body.label,
         createdAt,
+        enterpriseSeat: {
+          limit: enterpriseLicense.seatLimit,
+          actorId: actor.credentialId,
+        },
       });
       writeJson(response, 201, {
         schema: "dev.kernaid.fleet.access-credential-created.v1",
@@ -584,6 +721,7 @@ export class FleetControlPlane {
         "enrollment_token.create",
         tenantTarget(tenantId),
       );
+      this.#requireEnterpriseFeature(tenantId, "device_management");
       const body = expectRecord(await readJson(request));
       expectExactKeys(body, ["expiresInSeconds"]);
       const expiresInSeconds = expectSafeInteger(
@@ -623,6 +761,7 @@ export class FleetControlPlane {
         "policy_trust_anchor.set",
         tenantTarget(tenantId),
       );
+      this.#requireEnterpriseFeature(tenantId, "policy");
       const body = expectRecord(await readJson(request));
       expectExactKeys(body, ["publicKeySpki"]);
       if (
@@ -695,6 +834,7 @@ export class FleetControlPlane {
         "policy.publish",
         tenantTarget(tenantId),
       );
+      this.#requireEnterpriseFeature(tenantId, "policy");
       const bundle = parseSignedPolicyBundle(
         await readCanonicalJson(request, MAX_POLICY_BUNDLE_BYTES),
       );
@@ -802,6 +942,7 @@ export class FleetControlPlane {
         "entitlement.publish",
         tenantTarget(tenantId),
       );
+      this.#requireEnterpriseFeature(tenantId, "entitlements");
       const envelope = parseEntitlementEnvelope(
         await readCanonicalJson(request, MAX_ENTITLEMENT_DOCUMENT_BYTES),
       );
@@ -849,6 +990,7 @@ export class FleetControlPlane {
         "entitlement_revocations.publish",
         tenantTarget(tenantId),
       );
+      this.#requireEnterpriseFeature(tenantId, "entitlements");
       const envelope = parseEntitlementRevocationEnvelope(
         await readCanonicalJson(request, MAX_ENTITLEMENT_DOCUMENT_BYTES),
       );
@@ -924,6 +1066,7 @@ export class FleetControlPlane {
         "update.publish",
         tenantTarget(tenantId),
       );
+      this.#requireEnterpriseFeature(tenantId, "updates");
       const manifest = parseSignedUpdateManifest(
         await readCanonicalJson(request, MAX_UPDATE_MANIFEST_BYTES),
       );
@@ -986,6 +1129,7 @@ export class FleetControlPlane {
         "incident_case.create",
         tenantTarget(tenantId),
       );
+      this.#requireEnterpriseFeature(tenantId, "incidents");
       const body = expectRecord(await readJson(request));
       expectExactKeys(body, [
         "requestId",
@@ -1080,6 +1224,7 @@ export class FleetControlPlane {
         "incident_case.update",
         { type: "incident_case", id: caseId },
       );
+      this.#requireEnterpriseFeature(tenantId, "incidents");
       const body = expectRecord(await readJson(request));
       expectExactKeys(body, ["severity", "status", "assigneeLabel"]);
       const normalized = {
@@ -1122,6 +1267,7 @@ export class FleetControlPlane {
         "incident_case.link_work_order",
         { type: "incident_case", id: caseId },
       );
+      this.#requireEnterpriseFeature(tenantId, "incidents");
       const body = expectRecord(await readJson(request));
       expectExactKeys(body, ["workOrderId"]);
       const result = this.#store.linkIncidentWorkOrder({
@@ -1241,6 +1387,10 @@ export class FleetControlPlane {
         throw new HttpError(400, "unsupported_action");
       }
       const action = workOrderAction(actionId);
+      this.#requireEnterpriseFeature(
+        tenantId,
+        action.kind === "repair" ? "remote_repair" : "remote_diagnosis",
+      );
       const actionVersion = expectSafeInteger(
         body.actionVersion,
         "actionVersion",
@@ -1349,6 +1499,10 @@ export class FleetControlPlane {
         now.toISOString(),
       );
       if (existing === undefined) throw new HttpError(404, "not_found");
+      this.#requireEnterpriseFeature(
+        tenantId,
+        existing.kind === "repair" ? "remote_repair" : "remote_diagnosis",
+      );
       if (
         !this.#isWorkOrderAuthorized(
           tenantId,
@@ -1441,16 +1595,27 @@ export class FleetControlPlane {
       if (Math.abs(now.getTime() - issuedAtMs) > this.#clockSkewMs) {
         throw new HttpError(401, "work_order_claim_timestamp_rejected");
       }
+      const enterpriseFeatures = this.#activeEnterpriseFeatures(
+        claim.tenantId,
+        now,
+      );
       const eligibleActionIds = (
         Object.keys(workOrderActionCatalog) as WorkOrderActionId[]
-      ).filter((actionId) =>
-        this.#isWorkOrderAuthorized(
-          claim.tenantId,
-          claim.deviceId,
-          actionId,
-          now,
-        ),
-      );
+      ).filter((actionId) => {
+        const action = workOrderAction(actionId);
+        const licensed = enterpriseFeatures.has(
+          action.kind === "repair" ? "remote_repair" : "remote_diagnosis",
+        );
+        return (
+          licensed &&
+          this.#isWorkOrderAuthorized(
+            claim.tenantId,
+            claim.deviceId,
+            actionId,
+            now,
+          )
+        );
+      });
       const result = this.#store.claimWorkOrder({
         tenantId: claim.tenantId,
         deviceId: claim.deviceId,
@@ -1589,6 +1754,11 @@ export class FleetControlPlane {
         throw new HttpError(401, "invalid_signature");
       }
 
+      const enterpriseLicense = this.#requireEnterpriseFeature(
+        enrollment.tenantId,
+        "device_management",
+      );
+
       this.#store.enrollDevice({
         tokenHash,
         tenantId: enrollment.tenantId,
@@ -1598,6 +1768,7 @@ export class FleetControlPlane {
         agentVersion: enrollment.agentVersion,
         enrolledAt: now.toISOString(),
         nowMs: now.getTime(),
+        enterpriseSeat: { limit: enterpriseLicense.deviceLimit },
       });
       writeJson(response, 201, {
         schema: "dev.kernaid.fleet.enrollment-response.v1",
@@ -2000,13 +2171,26 @@ export class FleetControlPlane {
     if (method === "POST" && revokeMatch !== null) {
       const tenantId = pathIdentifier(revokeMatch[1], "tenantId");
       const deviceId = pathIdentifier(revokeMatch[2], "deviceId");
-      this.#authorizeTenant(request, tenantId, "operator", "device.revoke", {
-        type: "device",
-        id: deviceId,
-      });
+      const actor = this.#authorizeTenant(
+        request,
+        tenantId,
+        "operator",
+        "device.revoke",
+        {
+          type: "device",
+          id: deviceId,
+        },
+      );
       expectEmptyObject(await readJson(request));
       const revokedAt = this.#validNow().toISOString();
-      if (!this.#store.revokeDevice(tenantId, deviceId, revokedAt)) {
+      if (
+        !this.#store.revokeDevice(
+          tenantId,
+          deviceId,
+          revokedAt,
+          actor.credentialId,
+        )
+      ) {
         throw new HttpError(404, "not_found");
       }
       writeJson(response, 200, {
@@ -2019,6 +2203,208 @@ export class FleetControlPlane {
     }
 
     throw new HttpError(404, "not_found");
+  }
+
+  #requireEnterpriseFeature(
+    tenantId: string,
+    feature: EnterpriseLicenseFeature,
+  ): EnterpriseLicenseClaims {
+    const now = this.#validNow();
+    let licensed:
+      | {
+          claims: EnterpriseLicenseClaims;
+          evaluation: EnterpriseLicenseEvaluation;
+        }
+      | undefined;
+    try {
+      licensed = this.#evaluatedEnterpriseLicense(tenantId, now);
+    } catch {
+      throw new HttpError(403, "enterprise_license_invalid");
+    }
+    if (licensed === undefined) {
+      throw new HttpError(403, "enterprise_license_required");
+    }
+    if (!licensed.evaluation.operationsAllowed) {
+      throw new HttpError(
+        403,
+        `enterprise_license_${licensed.evaluation.state}`,
+      );
+    }
+    const activeSeats = this.#store
+      .listEnterpriseLicenseSeats(tenantId)
+      .filter((seat) => seat.revokedAt === null);
+    if (
+      activeSeats.filter((seat) => seat.kind === "device").length >
+        licensed.claims.deviceLimit ||
+      activeSeats.filter((seat) => seat.kind === "technician").length >
+        licensed.claims.seatLimit
+    ) {
+      throw new HttpError(403, "enterprise_seat_limit_exceeded");
+    }
+    if (!licensed.claims.features.includes(feature)) {
+      throw new HttpError(403, "enterprise_feature_not_entitled");
+    }
+    return licensed.claims;
+  }
+
+  #activeEnterpriseFeatures(
+    tenantId: string,
+    now: Date,
+  ): ReadonlySet<EnterpriseLicenseFeature> {
+    try {
+      const licensed = this.#evaluatedEnterpriseLicense(tenantId, now);
+      if (licensed?.evaluation.operationsAllowed !== true) {
+        return new Set<EnterpriseLicenseFeature>();
+      }
+      const activeSeats = this.#store
+        .listEnterpriseLicenseSeats(tenantId)
+        .filter((seat) => seat.revokedAt === null);
+      const overLimit =
+        activeSeats.filter((seat) => seat.kind === "device").length >
+          licensed.claims.deviceLimit ||
+        activeSeats.filter((seat) => seat.kind === "technician").length >
+          licensed.claims.seatLimit;
+      return overLimit
+        ? new Set<EnterpriseLicenseFeature>()
+        : new Set(licensed.claims.features);
+    } catch {
+      return new Set<EnterpriseLicenseFeature>();
+    }
+  }
+
+  #evaluatedEnterpriseLicense(
+    tenantId: string,
+    now: Date,
+  ):
+    | {
+        claims: EnterpriseLicenseClaims;
+        evaluation: EnterpriseLicenseEvaluation;
+      }
+    | undefined {
+    const stored = this.#store.getEnterpriseLicense(tenantId);
+    if (stored === undefined) return undefined;
+    const envelope = parseEnterpriseLicenseEnvelope(
+      JSON.parse(stored.canonicalJson) as unknown,
+    );
+    if (
+      canonicalJson(envelope) !== stored.canonicalJson ||
+      sha256Hex(stored.canonicalJson) !== stored.envelopeSha256 ||
+      !verifyEnterpriseLicense(
+        envelope,
+        this.#enterpriseLicenseTrustAnchor,
+        this.#enterpriseLicenseKeyId,
+        tenantId,
+      ) ||
+      envelope.claims.licenseId !== stored.licenseId ||
+      envelope.claims.sequence !== stored.sequence ||
+      envelope.claims.keyId !== stored.keyId ||
+      envelope.claims.plan !== stored.plan ||
+      canonicalJson(envelope.claims.features) !==
+        canonicalJson(stored.features) ||
+      envelope.claims.deviceLimit !== stored.deviceLimit ||
+      envelope.claims.seatLimit !== stored.seatLimit ||
+      envelope.claims.issuedAtUnix !== stored.issuedAtUnix ||
+      envelope.claims.notBeforeUnix !== stored.notBeforeUnix ||
+      envelope.claims.expiresAtUnix !== stored.expiresAtUnix ||
+      envelope.claims.graceUntilUnix !== stored.graceUntilUnix
+    ) {
+      throw new Error("stored enterprise license verification failed");
+    }
+    const nowUnix = Math.floor(now.getTime() / 1_000);
+    const clock = this.#store.observeEnterpriseClock({
+      tenantId,
+      nowUnix,
+      rollbackToleranceSeconds: ENTERPRISE_CLOCK_ROLLBACK_TOLERANCE_SECONDS,
+      occurredAt: now.toISOString(),
+    });
+    return {
+      claims: envelope.claims,
+      evaluation: evaluateEnterpriseLicense(envelope.claims, {
+        nowUnix,
+        retainedClockUnix: clock.retainedClockUnix,
+        revoked: stored.revokedAt !== null,
+      }),
+    };
+  }
+
+  #enterpriseLicenseResponse(tenantId: string): Record<string, unknown> {
+    const seats = this.#store.listEnterpriseLicenseSeats(tenantId);
+    const activeDeviceSeats = seats.filter(
+      (seat) => seat.kind === "device" && seat.revokedAt === null,
+    );
+    const activeTechnicianSeats = seats.filter(
+      (seat) => seat.kind === "technician" && seat.revokedAt === null,
+    );
+    const base = {
+      schema: "dev.kernaid.fleet.enterprise-license-status.v1",
+      tenantId,
+      assignments: seats.slice(0, 256),
+      assignmentsTruncated: seats.length > 256,
+      events: this.#store.listEnterpriseLicenseEvents(tenantId),
+    };
+    const stored = this.#store.getEnterpriseLicense(tenantId);
+    if (stored === undefined) {
+      return {
+        ...base,
+        state: "missing",
+        operationsAllowed: false,
+        license: null,
+      };
+    }
+    let evaluated:
+      | {
+          claims: EnterpriseLicenseClaims;
+          evaluation: EnterpriseLicenseEvaluation;
+        }
+      | undefined;
+    try {
+      evaluated = this.#evaluatedEnterpriseLicense(tenantId, this.#validNow());
+    } catch {
+      return {
+        ...base,
+        state: "invalid",
+        operationsAllowed: false,
+        license: null,
+      };
+    }
+    if (evaluated === undefined)
+      throw new Error("enterprise license disappeared");
+    const overLimit =
+      activeDeviceSeats.length > evaluated.claims.deviceLimit ||
+      activeTechnicianSeats.length > evaluated.claims.seatLimit;
+    return {
+      ...base,
+      state:
+        evaluated.evaluation.state === "active" && overLimit
+          ? "over_limit"
+          : evaluated.evaluation.state,
+      operationsAllowed: evaluated.evaluation.operationsAllowed && !overLimit,
+      evaluatedAtUnix: evaluated.evaluation.evaluatedAtUnix,
+      retainedClockUnix: evaluated.evaluation.retainedClockUnix,
+      license: {
+        licenseId: evaluated.claims.licenseId,
+        sequence: evaluated.claims.sequence,
+        keyId: evaluated.claims.keyId,
+        plan: evaluated.claims.plan,
+        features: evaluated.claims.features,
+        validity: {
+          issuedAtUnix: evaluated.claims.issuedAtUnix,
+          notBeforeUnix: evaluated.claims.notBeforeUnix,
+          expiresAtUnix: evaluated.claims.expiresAtUnix,
+          graceUntilUnix: evaluated.claims.graceUntilUnix,
+        },
+        devices: {
+          assigned: activeDeviceSeats.length,
+          limit: evaluated.claims.deviceLimit,
+        },
+        technicians: {
+          assigned: activeTechnicianSeats.length,
+          limit: evaluated.claims.seatLimit,
+        },
+        importedAt: stored.importedAt,
+        revokedAt: stored.revokedAt,
+      },
+    };
   }
 
   #authorizeRoot(request: IncomingMessage): void {

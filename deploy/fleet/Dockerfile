@@ -46,6 +46,8 @@ ENV NODE_ENV=production \
     KERNAID_FLEET_SERVICE_RECEIPT_TRUST_ANCHOR_FILE=/run/configs/kernaid_fleet_service_receipt_trust_anchor \
     KERNAID_FLEET_ENTITLEMENT_TRUST_ANCHOR_FILE=/run/configs/kernaid_entitlement_trust_anchor \
     KERNAID_FLEET_UPDATE_TRUST_ANCHOR_FILE=/run/configs/kernaid_update_trust_anchor \
+    KERNAID_FLEET_ENTERPRISE_LICENSE_TRUST_ANCHOR_FILE=/run/configs/kernaid_enterprise_license_trust_anchor \
+    KERNAID_FLEET_ENTERPRISE_LICENSE_KEY_ID=vendor-2026-01 \
     FLEET_CONSOLE_DIR=/opt/kernaid/console
 
 WORKDIR /opt/kernaid
