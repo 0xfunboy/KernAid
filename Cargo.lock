@@ -2661,6 +2661,7 @@ name = "kernaid-provider-key"
 version = "0.1.0"
 dependencies = [
  "kernaid-desk-shell",
+ "kernaid-native-secrets",
  "rpassword",
  "zeroize",
 ]

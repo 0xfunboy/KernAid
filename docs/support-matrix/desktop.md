@@ -101,8 +101,10 @@ qualified, promoted, or present in stable images**. NTFS remains read-only.
 - All four platform jobs in workflow run `33330140025` attempt 1 passed the
   packaged-output gates that reject repair UI and the separately distributed
   credential companion from the diagnosis-only Desk artifacts.
-- Optional Resident OpenAI setup still uses the separately distributed native
-  credential companion documented in the operator guide.
+- Optional Resident OpenAI, Anthropic and Gemini setup uses the separately
+  distributed native credential companion documented in the operator guide.
+  Anthropic/Gemini have not been qualified against live vendor accounts; their
+  buttons remain disabled until the matching OS-keyring credential exists.
 
 Use [Current status](../CURRENT_STATUS.md) for the overall product boundary and
 the [operator guide](../operator-guide.md#diagnose-a-running-operating-system)

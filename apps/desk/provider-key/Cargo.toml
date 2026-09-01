@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 kernaid-desk-shell = { path = "../src-tauri" }
+kernaid-native-secrets = { path = "../../../crates/native-secrets" }
 rpassword = "7.4"
 zeroize = "1.8"
 

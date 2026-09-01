@@ -2,7 +2,8 @@
 
 use fs2::FileExt as _;
 use kernaid_native_secrets::{
-    NativeOpenAiApiKeyStore, NativeProviderSecretStatus, NativeSecretError,
+    NativeOpenAiApiKeyStore, NativeProviderApiKeyStore, NativeProviderKind,
+    NativeProviderSecretStatus, NativeSecretError,
 };
 use std::{
     error::Error,
@@ -30,7 +31,8 @@ use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::fs::OpenOptions;
 
 pub const RESIDENT_SECRET_NAMESPACE: &str = "resident-v1";
-pub const OPENAI_PROVIDER_PROFILE: &str = "resident-default";
+pub const RESIDENT_PROVIDER_PROFILE: &str = "resident-default";
+pub const OPENAI_PROVIDER_PROFILE: &str = RESIDENT_PROVIDER_PROFILE;
 const APP_IDENTIFIER: &str = "dev.kernaid.desk";
 #[cfg(any(test, not(unix)))]
 const PROVIDER_LOCK_FILE_NAME: &str = ".resident-openai-v1.lock";
@@ -69,6 +71,82 @@ impl Error for ResidentOpenAiCredentialError {}
 pub enum ResidentOpenAiCredentialStatus {
     Absent,
     Configured,
+}
+
+pub type ResidentProviderCredentialError = ResidentOpenAiCredentialError;
+pub type ResidentProviderCredentialStatus = ResidentOpenAiCredentialStatus;
+
+/// One provider-specific Resident credential boundary.
+///
+/// Provider kind and profile are fixed before the native keyring is opened.
+/// Its lock is provider-specific, so Desk can hold independent OpenAI,
+/// Anthropic and Gemini stores while the setup companion remains excluded for
+/// the selected provider. No secret-returning or serializable API exists.
+pub struct ResidentProviderCredentials {
+    store: Mutex<NativeProviderApiKeyStore>,
+    _instance_lock: File,
+}
+
+impl ResidentProviderCredentials {
+    pub fn open(
+        app_data_directory: &Path,
+        provider: NativeProviderKind,
+    ) -> Result<Self, ResidentProviderCredentialError> {
+        if app_data_directory != default_app_data_directory()? {
+            return Err(ResidentProviderCredentialError::InvalidApplicationDirectory);
+        }
+        ensure_private_directory(app_data_directory)?;
+        let instance_lock =
+            open_instance_lock(&provider_lock_path_for(app_data_directory, provider))?;
+        let store = NativeProviderApiKeyStore::open_named(
+            RESIDENT_SECRET_NAMESPACE,
+            provider,
+            RESIDENT_PROVIDER_PROFILE,
+        )
+        .map_err(map_open_error)?;
+        Ok(Self {
+            store: Mutex::new(store),
+            _instance_lock: instance_lock,
+        })
+    }
+
+    pub fn status(
+        &self,
+    ) -> Result<ResidentProviderCredentialStatus, ResidentProviderCredentialError> {
+        match lock_provider_store(&self.store)?
+            .status()
+            .map_err(map_native_error)?
+        {
+            NativeProviderSecretStatus::Absent => Ok(ResidentProviderCredentialStatus::Absent),
+            NativeProviderSecretStatus::Configured => {
+                Ok(ResidentProviderCredentialStatus::Configured)
+            }
+        }
+    }
+
+    pub fn configure(
+        &self,
+        api_key: Zeroizing<Vec<u8>>,
+    ) -> Result<(), ResidentProviderCredentialError> {
+        lock_provider_store(&self.store)?
+            .configure(api_key)
+            .map_err(map_native_error)
+    }
+
+    pub fn with_api_key<T>(
+        &self,
+        use_secret: impl FnOnce(&[u8]) -> T,
+    ) -> Result<Option<T>, ResidentProviderCredentialError> {
+        lock_provider_store(&self.store)?
+            .with_api_key(use_secret)
+            .map_err(map_native_error)
+    }
+
+    pub fn logout(&self) -> Result<(), ResidentProviderCredentialError> {
+        lock_provider_store(&self.store)?
+            .logout()
+            .map_err(map_native_error)
+    }
 }
 
 /// Resident-only OpenAI credential access guarded by an inter-process lock.
@@ -142,8 +220,14 @@ pub fn default_app_data_directory() -> Result<PathBuf, ResidentOpenAiCredentialE
 
 #[cfg(unix)]
 fn provider_lock_path(_app_data_directory: &Path) -> PathBuf {
+    provider_lock_path_for(_app_data_directory, NativeProviderKind::OpenAi)
+}
+
+#[cfg(unix)]
+fn provider_lock_path_for(_app_data_directory: &Path, provider: NativeProviderKind) -> PathBuf {
     Path::new("/tmp").join(format!(
-        ".kernaid-resident-openai-v1-{}-{}.lock",
+        ".kernaid-resident-{}-v1-{}-{}.lock",
+        provider.as_str(),
         OPENAI_PROVIDER_PROFILE,
         process::getuid().as_raw()
     ))
@@ -151,7 +235,15 @@ fn provider_lock_path(_app_data_directory: &Path) -> PathBuf {
 
 #[cfg(not(unix))]
 fn provider_lock_path(app_data_directory: &Path) -> PathBuf {
-    app_data_directory.join(PROVIDER_LOCK_FILE_NAME)
+    provider_lock_path_for(app_data_directory, NativeProviderKind::OpenAi)
+}
+
+#[cfg(not(unix))]
+fn provider_lock_path_for(app_data_directory: &Path, provider: NativeProviderKind) -> PathBuf {
+    match provider {
+        NativeProviderKind::OpenAi => app_data_directory.join(PROVIDER_LOCK_FILE_NAME),
+        _ => app_data_directory.join(format!(".resident-{}-v1.lock", provider.as_str())),
+    }
 }
 
 fn lock_store(
@@ -160,6 +252,14 @@ fn lock_store(
     store
         .lock()
         .map_err(|_| ResidentOpenAiCredentialError::CredentialUnavailable)
+}
+
+fn lock_provider_store(
+    store: &Mutex<NativeProviderApiKeyStore>,
+) -> Result<MutexGuard<'_, NativeProviderApiKeyStore>, ResidentProviderCredentialError> {
+    store
+        .lock()
+        .map_err(|_| ResidentProviderCredentialError::CredentialUnavailable)
 }
 
 fn map_open_error(error: NativeSecretError) -> ResidentOpenAiCredentialError {

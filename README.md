@@ -103,14 +103,16 @@ The CI workflows are configured to produce engineering-preview desktop installer
   instead of converting missing data into a healthy result.
 - **Optional Resident reasoning:** the current Desk integration can configure
   the public `resident-default` profile from the hidden native TTY prompts of
-  `kernaid-provider-key configure`, then explicitly select OpenAI in Desk. The
+  `kernaid-provider-key configure`, optionally adding `--provider anthropic` or
+  `--provider gemini`, then explicitly select the configured provider in Desk. The
   companion is a separate, platform-matched workflow artifact. Current source
   builds it from a package outside the Tauri crate, and the Desktop workflow
   fails if package inspection finds it inside a Desk installer. Use only a
   post-change run where that gate passed; extract the companion and run it from
   its download directory as described in the operator guide.
-  The key stays in the OS credential store/backend; the webview receives only
-  presence status and can request idempotent logout. Strict local packs reduce
+  Each provider key stays in its independently purpose-bound OS credential
+  store record; the webview receives only presence status and can request
+  idempotent logout. Strict local packs reduce
   the complete OS corpus to a provider-neutral proposal before the bounded
   60-second HTTPS request; raw collector content is never sent. Offline rules
   remain the startup/default provider and require no account or network.

@@ -488,6 +488,17 @@ export interface ResidentOpenAiStatus {
   credential: "absent" | "configured";
 }
 
+export type ResidentStructuredProviderMode = "anthropic_api" | "gemini_api";
+
+export interface ResidentStructuredProviderStatus {
+  schemaVersion: "1.0";
+  providerMode: ResidentStructuredProviderMode;
+  provider: "anthropic" | "gemini";
+  profile: "resident-default";
+  model: "claude-sonnet-5" | "gemini-3.1-pro";
+  credential: "absent" | "configured";
+}
+
 type NativeInvoke = <T>(
   command: string,
   args?: Record<string, unknown>,
@@ -2143,6 +2154,126 @@ export class NativeOpenAiProvider implements Provider {
   }
 }
 
+export async function getResidentStructuredProviderStatus(
+  providerMode: ResidentStructuredProviderMode,
+  invokeCommand: NativeInvoke = invoke,
+): Promise<ResidentStructuredProviderStatus> {
+  if (invokeCommand === invoke && !isNative())
+    throw new Error("Il provider Resident richiede KernAid Desk nativo.");
+  try {
+    return parseResidentStructuredProviderStatus(
+      await invokeCommand("resident_structured_provider_status", {
+        providerMode,
+      }),
+      providerMode,
+    );
+  } catch (error) {
+    throw nativeStructuredProviderError(error, providerMode);
+  }
+}
+
+export async function logoutResidentStructuredProvider(
+  providerMode: ResidentStructuredProviderMode,
+  invokeCommand: NativeInvoke = invoke,
+): Promise<ResidentStructuredProviderStatus> {
+  if (invokeCommand === invoke && !isNative())
+    throw new Error("Il provider Resident richiede KernAid Desk nativo.");
+  try {
+    return parseResidentStructuredProviderStatus(
+      await invokeCommand("resident_structured_provider_logout", {
+        providerMode,
+      }),
+      providerMode,
+    );
+  } catch (error) {
+    throw nativeStructuredProviderError(error, providerMode);
+  }
+}
+
+/**
+ * Tauri-only proxy for direct Anthropic/Gemini diagnosis.
+ *
+ * This object has no secret supplier: credentials and all vendor transport
+ * stay behind the native command boundary. The WebView can submit only the
+ * selected closed mode and the same bounded evidence envelope used by the
+ * qualified OpenAI Resident adapter.
+ */
+export class NativeResidentStructuredProvider implements Provider {
+  readonly capabilities = Object.freeze({
+    streaming: false,
+    structuredOutput: true,
+    toolRequests: false,
+    local: false,
+  });
+
+  readonly #providerMode: ResidentStructuredProviderMode;
+  readonly #invoke: NativeInvoke;
+
+  constructor(
+    providerMode: ResidentStructuredProviderMode,
+    invokeCommand: NativeInvoke = invoke,
+  ) {
+    this.#providerMode = providerMode;
+    this.#invoke = invokeCommand;
+  }
+
+  async diagnose(
+    objective: string,
+    evidence: readonly ObservedEvidence[],
+    options: ProviderRequestOptions = {},
+  ): Promise<DiagnosisProposal> {
+    if (!objective.trim() || evidence.length === 0)
+      throw new ProviderError("invalid_request", "Provider input is invalid");
+    if (options.signal?.aborted)
+      throw new ProviderError("cancelled", "Provider request was cancelled");
+    const requestId = `O-${crypto.randomUUID()}`;
+    const request = {
+      requestId,
+      objective,
+      evidence: evidence.map(({ evidence: item, content }) => ({
+        id: item.id,
+        collector: item.collector,
+        target: item.target,
+        capturedAt: item.capturedAt,
+        contentType: item.contentType,
+        sha256: item.sha256,
+        sensitivity: item.sensitivity,
+        trust: item.trust,
+        summary: item.summary,
+        content,
+      })),
+    };
+    let rejectCancellation: ((reason: ProviderError) => void) | undefined;
+    const cancellation = new Promise<never>((_resolve, reject) => {
+      rejectCancellation = reject;
+    });
+    const onAbort = (): void => {
+      void this.#invoke("resident_structured_provider_cancel", {
+        providerMode: this.#providerMode,
+        requestId,
+      }).catch(() => undefined);
+      rejectCancellation?.(
+        new ProviderError("cancelled", "Provider request was cancelled"),
+      );
+    };
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+    const operation = this.#invoke<unknown>(
+      "resident_structured_provider_diagnose",
+      { providerMode: this.#providerMode, request },
+    );
+    try {
+      return parseDiagnosisProposal(
+        await Promise.race([operation, cancellation]),
+      );
+    } catch (error) {
+      if (error instanceof ProviderError) throw error;
+      throw nativeStructuredProviderError(error, this.#providerMode);
+    } finally {
+      options.signal?.removeEventListener("abort", onAbort);
+    }
+  }
+}
+
 export function secureAuditReady(status: SecureRuntimeStatus): boolean {
   return status.audit === "secure" && status.signing === "ready";
 }
@@ -2994,6 +3125,34 @@ export function parseResidentOpenAiStatus(
   return structuredClone(item) as unknown as ResidentOpenAiStatus;
 }
 
+export function parseResidentStructuredProviderStatus(
+  value: unknown,
+  expectedMode: ResidentStructuredProviderMode,
+): ResidentStructuredProviderStatus {
+  const item = exactRecord(value, [
+    "schemaVersion",
+    "providerMode",
+    "provider",
+    "profile",
+    "model",
+    "credential",
+  ]);
+  const expected =
+    expectedMode === "anthropic_api"
+      ? { provider: "anthropic", model: "claude-sonnet-5" }
+      : { provider: "gemini", model: "gemini-3.1-pro" };
+  if (
+    item.schemaVersion !== "1.0" ||
+    item.providerMode !== expectedMode ||
+    item.provider !== expected.provider ||
+    item.profile !== "resident-default" ||
+    item.model !== expected.model ||
+    !(item.credential === "absent" || item.credential === "configured")
+  )
+    throw new Error("Stato provider Resident non valido.");
+  return structuredClone(item) as unknown as ResidentStructuredProviderStatus;
+}
+
 function nativeOpenAiError(value: unknown): ProviderError {
   const fallback = new ProviderError(
     "transport",
@@ -3040,6 +3199,62 @@ function nativeOpenAiError(value: unknown): ProviderError {
     case "busy":
     case "transport":
       return fallback;
+    default:
+      return fallback;
+  }
+}
+
+function nativeStructuredProviderError(
+  value: unknown,
+  providerMode: ResidentStructuredProviderMode,
+): ProviderError {
+  const label = providerMode === "anthropic_api" ? "Anthropic" : "Gemini";
+  const fallback = new ProviderError(
+    "transport",
+    `${label} Resident non è disponibile.`,
+  );
+  if (typeof value !== "object" || value === null || Array.isArray(value))
+    return fallback;
+  const item = value as Record<string, unknown>;
+  if (Object.keys(item).some((key) => key !== "code" && key !== "message"))
+    return fallback;
+  switch (item.code) {
+    case "cancelled":
+      return new ProviderError("cancelled", `Richiesta ${label} annullata.`);
+    case "credential_unavailable":
+      return new ProviderError(
+        "credential_unavailable",
+        `Credenziale ${label} non disponibile.`,
+      );
+    case "invalid_request":
+      return new ProviderError(
+        "invalid_request",
+        `Richiesta ${label} non valida.`,
+      );
+    case "invalid_response":
+      return new ProviderError(
+        "invalid_response",
+        `Risposta ${label} non valida.`,
+      );
+    case "request_too_large":
+      return new ProviderError(
+        "request_too_large",
+        `Richiesta ${label} troppo grande.`,
+      );
+    case "response_too_large":
+      return new ProviderError(
+        "response_too_large",
+        `Risposta ${label} troppo grande.`,
+      );
+    case "timeout":
+      return new ProviderError("timeout", `Richiesta ${label} scaduta.`);
+    case "upstream":
+      return new ProviderError(
+        "upstream",
+        `${label} ha rifiutato la richiesta.`,
+      );
+    case "busy":
+    case "transport":
     default:
       return fallback;
   }

@@ -393,26 +393,36 @@ run the applicable command:
 ```text
 Windows: .\kernaid-provider-key.exe configure
 Linux/macOS: ./kernaid-provider-key configure
+
+Anthropic: append --provider anthropic
+Gemini: append --provider gemini
+OpenAI: omit --provider, or append --provider openai
 ```
 
 Enter the API key twice at the hidden TTY prompts. The companion rejects keys
 from command-line arguments, redirected standard input, files and environment
-variables. It stores the key under the public `resident-default` profile in
+variables. It stores the selected provider key under the public
+`resident-default` profile in
 Windows Credential Manager, macOS Keychain or Linux Secret Service; no
-plaintext fallback exists. `kernaid-provider-key status` reports only
-`configured` or `absent`. Close Desk before running either companion command,
-because Desk and the companion share an exclusive provider-store lock. The
+plaintext fallback exists. Add the same `--provider` option to
+`kernaid-provider-key status` or `logout`; status reports only `configured` or
+`absent`. Close Desk before running any companion command, because Desk and the
+companion share an exclusive provider-specific store lock. The
 companion accepts no data-directory override, and changing `HOME`, XDG or
 `APPDATA` cannot create a second lock for the same OS-user provider profile.
 
-Restart Desk and select **OpenAI** in the header. Selection is explicit:
+Restart Desk and select **OpenAI**, **Anthropic** or **Gemini** in the header.
+A provider button remains disabled until its own protected credential is
+present; the WebView has no configure or secret-read command. Selection is explicit:
 KernAid starts with **Offline** rules even when a key exists and never silently
 falls back or resubmits context to another provider. The backend sends one
-bounded HTTPS request to `https://api.openai.com/v1/responses` using the fixed
-`gpt-5.6-sol` profile, `store: false`, no tools, and a strict diagnosis-only
-JSON schema. Reasoning effort is fixed to `medium`, the combined reasoning and
-answer budget is 4,096 tokens, and the request fails closed after 60 seconds
-(with a 10-second connection bound). Before any network request, the native
+bounded HTTPS request to the selected fixed native endpoint: OpenAI Responses
+with `gpt-5.6-sol`, Anthropic Messages with `claude-sonnet-5`, or Gemini
+Interactions with `gemini-3.1-pro`. Every adapter uses strict diagnosis-only
+structured JSON, a 4,096-token output bound, no streaming, no tools and no
+broker. OpenAI additionally fixes `store: false` and reasoning effort to
+`medium`. Requests fail closed after 60 seconds (with a 10-second connection
+bound). Before any network request, the native
 backend requires the exact complete OS-specific corpus, verifies each content
 hash, and parses it with the strict local diagnostic pack. Raw collector
 content, targets and summaries never enter provider context: OpenAI receives
@@ -430,8 +440,12 @@ Select **Logout** in the header to cancel any active provider request, remove
 the selected key idempotently, verify its absence, and return to Offline rules.
 If the keyring, network, timeout or provider response fails, the cloud request
 fails closed while Offline diagnostics remain selectable. Provider use sends
-diagnostic data to OpenAI under the technician's own account and terms; review
+diagnostic data to the selected vendor under the technician's own account and terms; review
 customer authorization and applicable data-processing requirements first.
+Provisioning a real vendor key and accepting that vendor's account terms is the
+only external setup gate; builds and CI never contain provider credentials, and
+the direct Anthropic/Gemini paths remain unqualified against live vendor
+accounts until an operator performs that explicit credentialed check.
 
 ## Safety rules
 

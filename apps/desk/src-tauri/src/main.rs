@@ -5,6 +5,7 @@ mod fixture_repair_lab;
 #[cfg(any(target_os = "macos", test))]
 mod macos_resident;
 mod resident_openai;
+mod resident_structured_provider;
 mod secure_runtime;
 #[cfg(any(target_os = "windows", test))]
 mod windows_resident;
@@ -16,6 +17,11 @@ use kernaid_protocol::BrokerRequest;
 use resident_openai::{
     ResidentOpenAiRuntime, resident_openai_cancel, resident_openai_diagnose,
     resident_openai_logout, resident_openai_status,
+};
+use resident_structured_provider::{
+    ResidentStructuredProviderRuntime, resident_structured_provider_cancel,
+    resident_structured_provider_diagnose, resident_structured_provider_logout,
+    resident_structured_provider_status,
 };
 use secure_runtime::{
     SecureRuntime, append_audit_record, initialize_device_identity, seal_signed_report,
@@ -1823,7 +1829,11 @@ macro_rules! production_invoke_handler {
             resident_openai_status,
             resident_openai_diagnose,
             resident_openai_cancel,
-            resident_openai_logout
+            resident_openai_logout,
+            resident_structured_provider_status,
+            resident_structured_provider_diagnose,
+            resident_structured_provider_cancel,
+            resident_structured_provider_logout
         ]
     };
 }
@@ -1849,6 +1859,10 @@ macro_rules! active_invoke_handler {
             resident_openai_diagnose,
             resident_openai_cancel,
             resident_openai_logout,
+            resident_structured_provider_status,
+            resident_structured_provider_diagnose,
+            resident_structured_provider_cancel,
+            resident_structured_provider_logout,
             fixture_repair_lab::fixture_lab_status,
             fixture_repair_lab::fixture_lab_stage,
             fixture_repair_lab::fixture_lab_execute,
@@ -1963,6 +1977,7 @@ fn run_gui() {
             let runtime = SecureRuntime::open(&app_data_directory)?;
             app.manage(runtime);
             app.manage(ResidentOpenAiRuntime::open(&app_data_directory));
+            app.manage(ResidentStructuredProviderRuntime::open(&app_data_directory));
             #[cfg(all(target_os = "linux", feature = "fixture-repair-lab"))]
             app.manage(FixtureRepairLab::new()?);
             Ok(())

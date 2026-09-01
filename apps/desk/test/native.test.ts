@@ -8,6 +8,7 @@ import {
 } from "@kernaid/schemas";
 import {
   NativeOpenAiProvider,
+  NativeResidentStructuredProvider,
   PlatformOfflineRulesProvider,
   authorizeObserve,
   collectLocalInventory,
@@ -32,6 +33,7 @@ import {
   parseNativeSignedArtifact,
   parseRescueNativePromptStatus,
   parseResidentOpenAiStatus,
+  parseResidentStructuredProviderStatus,
   parseSecureRuntimeStatus,
   scanRescueInstalledTargets,
   selectRescueInstalledTarget,
@@ -1600,6 +1602,87 @@ test("Resident OpenAI cancellation and errors never expose backend detail", asyn
       return true;
     },
   );
+});
+
+test("Resident structured-provider status is mode-bound and presence-only", () => {
+  assert.deepEqual(
+    parseResidentStructuredProviderStatus(
+      {
+        schemaVersion: "1.0",
+        providerMode: "anthropic_api",
+        provider: "anthropic",
+        profile: "resident-default",
+        model: "claude-sonnet-5",
+        credential: "configured",
+      },
+      "anthropic_api",
+    ),
+    {
+      schemaVersion: "1.0",
+      providerMode: "anthropic_api",
+      provider: "anthropic",
+      profile: "resident-default",
+      model: "claude-sonnet-5",
+      credential: "configured",
+    },
+  );
+  assert.throws(() =>
+    parseResidentStructuredProviderStatus(
+      {
+        schemaVersion: "1.0",
+        providerMode: "gemini_api",
+        provider: "gemini",
+        profile: "resident-default",
+        model: "gemini-3.1-pro",
+        credential: "configured",
+        credentialValue: "must-never-cross-the-webview",
+      },
+      "gemini_api",
+    ),
+  );
+  assert.throws(() =>
+    parseResidentStructuredProviderStatus(
+      {
+        schemaVersion: "1.0",
+        providerMode: "gemini_api",
+        provider: "gemini",
+        profile: "resident-default",
+        model: "gemini-3.1-pro",
+        credential: "configured",
+      },
+      "anthropic_api",
+    ),
+  );
+});
+
+test("Resident Anthropic/Gemini proxies send no credential across IPC", async () => {
+  for (const providerMode of ["anthropic_api", "gemini_api"] as const) {
+    const calls: Array<{ command: string; args?: Record<string, unknown> }> =
+      [];
+    const invoke = async <T>(
+      command: string,
+      args?: Record<string, unknown>,
+    ): Promise<T> => {
+      calls.push({ command, args });
+      return {
+        schemaVersion: "1.0",
+        diagnosis: "Read-only follow-up required.",
+        confidence: 0.7,
+        evidenceIds: ["E-1"],
+        requestedEvidence: [],
+      } as T;
+    };
+    const proposal = await new NativeResidentStructuredProvider(
+      providerMode,
+      invoke,
+    ).diagnose("Diagnose", [providerEvidence()]);
+    assert.equal(proposal.diagnosis, "Read-only follow-up required.");
+    assert.equal(calls[0]?.command, "resident_structured_provider_diagnose");
+    assert.equal(calls[0]?.args?.providerMode, providerMode);
+    const serialized = JSON.stringify(calls[0]?.args);
+    assert.doesNotMatch(serialized, /api.?key|authorization|bearer/iu);
+    assert.match(serialized, /observed-untrusted/u);
+  }
 });
 
 test("signed artifacts are bound to the requested payload and container hash", async () => {

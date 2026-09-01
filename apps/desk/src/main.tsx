@@ -15,6 +15,7 @@ import {
   collectMacosP0Inventory,
   collectWindowsP0Inventory,
   getResidentOpenAiStatus,
+  getResidentStructuredProviderStatus,
   getSecureRuntimeStatus,
   hasLocalCollector,
   initializeDeviceIdentity,
@@ -25,6 +26,7 @@ import {
   isRescueRuntime,
   NativeAuditSink,
   NativeOpenAiProvider,
+  NativeResidentStructuredProvider,
   PlatformOfflineRulesProvider,
   fingerprintNativeTarget,
   inspectRescueFilesystemHealth,
@@ -41,6 +43,7 @@ import {
   rescueOfflineCorpusJson,
   rescueOfflineEvidenceSummary,
   logoutResidentOpenAi,
+  logoutResidentStructuredProvider,
   verifyRescueTauriIpcIsolation,
   LINUX_NORMALIZED_SNAPSHOT_COLLECTOR,
   LINUX_FILESYSTEM_HEALTH_COLLECTOR,
@@ -59,6 +62,8 @@ import {
   type RescueTargetScan,
   type RescueTargetSelection,
   type ResidentOpenAiStatus,
+  type ResidentStructuredProviderMode,
+  type ResidentStructuredProviderStatus,
   type SecureRuntimeStatus,
 } from "./native";
 import { filesystemHealthEvidenceSummary } from "./filesystem-health";
@@ -104,7 +109,7 @@ import { RescueRepairPanel } from "./rescue-repair-entry";
 import "./style.css";
 
 type Workflow = "Observe" | "Diagnose" | "Plan" | "Verify";
-type ProviderMode = RescueProviderMode;
+type ProviderMode = RescueProviderMode | ResidentStructuredProviderMode;
 const RESCUE_OPENAI_STATUS_ATTEMPTS = 20;
 const RESCUE_OPENAI_STATUS_RETRY_MS = 250;
 
@@ -118,6 +123,11 @@ function App() {
     ResidentOpenAiStatus | RescueOpenAiStatus
   >();
   const [openAiStatusReady, setOpenAiStatusReady] = useState(false);
+  const [structuredProviderStatuses, setStructuredProviderStatuses] = useState<
+    Partial<
+      Record<ResidentStructuredProviderMode, ResidentStructuredProviderStatus>
+    >
+  >({});
   const [providerLogoutBusy, setProviderLogoutBusy] = useState(false);
   const providerLogoutInFlight = useRef(false);
   const [objective, setObjective] = useState("");
@@ -174,6 +184,11 @@ function App() {
       : openAiStatus?.profile === "rescue-default"
         ? rescueOpenAiReady(openAiStatus)
         : false;
+  const providerReady = (mode: ProviderMode): boolean => {
+    if (mode === "offline") return true;
+    if (mode === "openai") return openAiReady;
+    return structuredProviderStatuses[mode]?.credential === "configured";
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -238,6 +253,35 @@ function App() {
       }
     }
     void startRuntime();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isNative()) return;
+    let cancelled = false;
+    void Promise.all(
+      (["anthropic_api", "gemini_api"] as const).map(async (providerMode) => {
+        try {
+          return [
+            providerMode,
+            await getResidentStructuredProviderStatus(providerMode),
+          ] as const;
+        } catch {
+          return [providerMode, undefined] as const;
+        }
+      }),
+    ).then((entries) => {
+      if (cancelled) return;
+      const next: Partial<
+        Record<ResidentStructuredProviderMode, ResidentStructuredProviderStatus>
+      > = {};
+      for (const [providerMode, status] of entries) {
+        if (status !== undefined) next[providerMode] = status;
+      }
+      setStructuredProviderStatuses(next);
+    });
     return () => {
       cancelled = true;
     };
@@ -443,7 +487,9 @@ function App() {
         (rescueOpenAiContextPreview === undefined ||
           rescueOpenAiAcceptedContextSha256 !==
             rescueOpenAiContextPreview.contextSha256)) ||
-      !rescueProviderBinding.current.sessionMatches(providerMode)
+      !rescueProviderBinding.current.sessionMatches(
+        rescueProviderMode(providerMode),
+      )
     )
       return;
     const operationEpoch = rescueContextEpoch.current;
@@ -464,7 +510,11 @@ function App() {
         throw new Error(
           "Il target Rescue è cambiato: ripetere scansione e ispezione.",
         );
-      if (!rescueProviderBinding.current.sessionMatches(providerMode))
+      if (
+        !rescueProviderBinding.current.sessionMatches(
+          rescueProviderMode(providerMode),
+        )
+      )
         throw new Error(
           "Il provider Rescue è cambiato: ripetere l’ispezione del target.",
         );
@@ -1012,7 +1062,9 @@ function App() {
       !sessionDriver ||
       (isRescueRuntime() && rescueInspectionInFlight.current) ||
       (isRescueRuntime() &&
-        !rescueProviderBinding.current.sessionMatches(providerMode)) ||
+        !rescueProviderBinding.current.sessionMatches(
+          rescueProviderMode(providerMode),
+        )) ||
       (isRescueRuntime() &&
         (!sameRescueSelection(sessionRescueTarget, selectedRescueTarget) ||
           !sameRescueInspection(selectedRescueTarget, rescueInspection)))
@@ -1067,6 +1119,7 @@ function App() {
   function chooseProvider(next: ProviderMode) {
     if (
       (!isNative() && !isRescueRuntime()) ||
+      (isRescueRuntime() && !isRescueProviderMode(next)) ||
       next === providerMode ||
       busy ||
       (isRescueRuntime() && rescueTargetBusy) ||
@@ -1074,10 +1127,11 @@ function App() {
       (isRescueRuntime() && rescueInspectionInFlight.current) ||
       sessionId !== undefined ||
       driver === undefined ||
-      (next === "openai" && !openAiReady)
+      !providerReady(next)
     )
       return;
     if (isRescueRuntime()) {
+      if (!isRescueProviderMode(next)) return;
       const transition = transitionRescueProviderMode(
         rescueProviderBinding.current,
         next,
@@ -1101,26 +1155,35 @@ function App() {
       ),
     );
     setStatus(
-      next === "openai"
-        ? "OpenAI selezionato. Il corpus grezzo resta locale; vengono inviati obiettivo filtrato, proposta deterministica e soli ID/collector."
-        : "Diagnostica offline selezionata. Nessun dato lascia il computer.",
+      next === "offline"
+        ? "Diagnostica offline selezionata. Nessun dato lascia il computer."
+        : `${providerLabel(next)} selezionato. Il corpus grezzo resta locale; vengono inviati obiettivo filtrato, proposta deterministica e soli ID/collector.`,
     );
   }
 
-  async function logoutOpenAi() {
+  async function logoutProvider() {
     if (
       !isNative() ||
       providerLogoutInFlight.current ||
-      (providerMode !== "openai" && (busy || sessionId !== undefined))
+      providerMode === "offline"
     )
       return;
+    const activeMode = providerMode;
     providerLogoutInFlight.current = true;
     setProviderLogoutBusy(true);
     setBusy(true);
     const hadDriver = driver !== undefined;
     try {
-      const next = await logoutResidentOpenAi();
-      setOpenAiStatus(next);
+      if (activeMode === "openai") {
+        const next = await logoutResidentOpenAi();
+        setOpenAiStatus(next);
+      } else {
+        const next = await logoutResidentStructuredProvider(activeMode);
+        setStructuredProviderStatuses((current) => ({
+          ...current,
+          [activeMode]: next,
+        }));
+      }
       setProviderMode("offline");
       invalidateSession();
       if (hadDriver)
@@ -1128,13 +1191,13 @@ function App() {
           createDriver(activeAuditSink(runtimeStatus), undefined, "offline"),
         );
       setStatus(
-        "Logout OpenAI completato e verificato. Provider offline attivo.",
+        `Logout ${providerLabel(activeMode)} completato e verificato. Provider offline attivo.`,
       );
     } catch (error) {
       setStatus(
         error instanceof Error
           ? error.message
-          : "Logout OpenAI non completato.",
+          : "Logout provider non completato.",
       );
     } finally {
       providerLogoutInFlight.current = false;
@@ -1265,33 +1328,56 @@ function App() {
               >
                 OpenAI
               </button>
-              {isNative() && openAiStatus?.credential === "configured" && (
-                <button
-                  disabled={
-                    providerLogoutBusy ||
-                    (providerMode !== "openai" &&
-                      (busy || sessionId !== undefined))
-                  }
-                  onClick={logoutOpenAi}
-                >
-                  {providerLogoutBusy ? "Logout…" : "Logout"}
-                </button>
-              )}
+              <button
+                aria-pressed={providerMode === "anthropic_api"}
+                disabled={
+                  busy ||
+                  sessionId !== undefined ||
+                  !providerReady("anthropic_api")
+                }
+                onClick={() => chooseProvider("anthropic_api")}
+              >
+                Anthropic
+              </button>
+              <button
+                aria-pressed={providerMode === "gemini_api"}
+                disabled={
+                  busy ||
+                  sessionId !== undefined ||
+                  !providerReady("gemini_api")
+                }
+                onClick={() => chooseProvider("gemini_api")}
+              >
+                Gemini
+              </button>
+              {isNative() &&
+                providerMode !== "offline" &&
+                providerReady(providerMode) && (
+                  <button
+                    disabled={providerLogoutBusy}
+                    onClick={logoutProvider}
+                  >
+                    {providerLogoutBusy ? "Logout…" : "Logout"}
+                  </button>
+                )}
             </div>
           )}
           <span>
             {isNative() ? "Resident" : "Rescue"} ·{" "}
-            {providerMode === "openai"
-              ? "OpenAI · gpt-5.6-sol"
-              : "Offline rules"}{" "}
-            · {securityLabel}
+            {providerSummary(providerMode)} · {securityLabel}
           </span>
-          {isNative() && openAiStatus?.credential !== "configured" && (
-            <small>
-              OpenAI non configurato · chiudi Desk e avvia con{" "}
-              <code>configure</code> il companion nativo estratto
-            </small>
-          )}
+          {isNative() &&
+            (openAiStatus?.credential !== "configured" ||
+              structuredProviderStatuses.anthropic_api?.credential !==
+                "configured" ||
+              structuredProviderStatuses.gemini_api?.credential !==
+                "configured") && (
+              <small>
+                I provider senza credenziale restano disabilitati · chiudi Desk
+                e usa{" "}
+                <code>kernaid-provider-key configure --provider NOME</code>
+              </small>
+            )}
         </div>
       </header>
       <aside>
@@ -1460,7 +1546,7 @@ function App() {
             inspectionCurrent={rescueInspectionCurrent}
             inspectionBusy={rescueInspectionBusy}
             inspectionBlocked={rescueInspectionBlocked}
-            providerMode={providerMode}
+            providerMode={rescueProviderMode(providerMode)}
             openAiReady={openAiReady}
             providerSelectionDisabled={
               busy ||
@@ -1498,7 +1584,9 @@ function App() {
               !rescueInspectionCurrent ||
               sessionId === undefined ||
               sessionDriver === undefined ||
-              !rescueProviderBinding.current.sessionMatches(providerMode) ||
+              !rescueProviderBinding.current.sessionMatches(
+                rescueProviderMode(providerMode),
+              ) ||
               rescueInspectionBlocked ||
               !runtimeReady ||
               !driver ||
@@ -1586,13 +1674,14 @@ function App() {
             )}
           </div>
         )}
-        {!isRescueRuntime() && providerMode === "openai" && (
+        {!isRescueRuntime() && providerMode !== "offline" && (
           <p className="provider-context-notice" role="note">
-            A OpenAI invieremo l’obiettivo dopo filtri conservativi per token,
-            email, IP e percorsi comuni, più la proposta diagnostica locale e
-            soli ID/collector. Il corpus grezzo resta sul PC. Il testo libero
-            può comunque contenere nomi o altri dati personali: non inserirli;
-            questa versione non offre ancora un’anteprima del contesto.
+            A {providerLabel(providerMode)} invieremo l’obiettivo dopo filtri
+            conservativi per token, email, IP e percorsi comuni, più la proposta
+            diagnostica locale e soli ID/collector. Il corpus grezzo resta sul
+            PC. Il testo libero può comunque contenere nomi o altri dati
+            personali: non inserirli; questa versione non offre ancora
+            un’anteprima del contesto.
           </p>
         )}
         {!isRescueRuntime() && (
@@ -1719,14 +1808,29 @@ function createDriver(
   providerMode: ProviderMode = "offline",
   evidenceProfile: "legacy-non-linux" | "linux-p0-v1" = "legacy-non-linux",
 ): LocalSessionDriver {
-  return new LocalSessionDriver(
-    providerMode === "openai"
-      ? isNative()
+  let provider;
+  switch (providerMode) {
+    case "offline":
+      provider = new PlatformOfflineRulesProvider();
+      break;
+    case "openai":
+      provider = isNative()
         ? new NativeOpenAiProvider()
         : isRescueRuntime()
           ? new RescueOpenAiProvider()
-          : new PlatformOfflineRulesProvider()
-      : new PlatformOfflineRulesProvider(),
+          : undefined;
+      break;
+    case "anthropic_api":
+    case "gemini_api":
+      provider = isNative()
+        ? new NativeResidentStructuredProvider(providerMode)
+        : undefined;
+      break;
+  }
+  if (provider === undefined)
+    throw new Error("Il provider selezionato non è disponibile nel runtime.");
+  return new LocalSessionDriver(
+    provider,
     hasLocalCollector()
       ? {
           execute: (request) => authorizeObserve(request, rescueTarget),
@@ -1735,6 +1839,38 @@ function createDriver(
     auditSink,
     evidenceProfile,
   );
+}
+
+function isRescueProviderMode(mode: ProviderMode): mode is RescueProviderMode {
+  return mode === "offline" || mode === "openai";
+}
+
+function rescueProviderMode(mode: ProviderMode): RescueProviderMode {
+  return isRescueProviderMode(mode) ? mode : "offline";
+}
+
+function providerLabel(mode: Exclude<ProviderMode, "offline">): string {
+  switch (mode) {
+    case "openai":
+      return "OpenAI";
+    case "anthropic_api":
+      return "Anthropic";
+    case "gemini_api":
+      return "Gemini";
+  }
+}
+
+function providerSummary(mode: ProviderMode): string {
+  switch (mode) {
+    case "offline":
+      return "Offline rules";
+    case "openai":
+      return "OpenAI · gpt-5.6-sol";
+    case "anthropic_api":
+      return "Anthropic · Claude Sonnet 5";
+    case "gemini_api":
+      return "Gemini · 3.1 Pro";
+  }
 }
 
 function rescueVaultLabel(

@@ -134,7 +134,7 @@ pub struct ResidentOpenAiError {
 }
 
 impl ResidentOpenAiError {
-    const fn new(code: ResidentOpenAiErrorCode, message: &'static str) -> Self {
+    pub(super) const fn new(code: ResidentOpenAiErrorCode, message: &'static str) -> Self {
         Self { code, message }
     }
 }
@@ -152,7 +152,7 @@ pub struct ResidentOpenAiStatus {
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ResidentOpenAiDiagnosisRequest {
-    request_id: String,
+    pub(super) request_id: String,
     objective: String,
     evidence: Vec<ResidentProviderEvidence>,
 }
@@ -187,9 +187,9 @@ struct NormalizedCorpus {
     evidence_ids: HashSet<String>,
 }
 
-struct NormalizedProviderInput {
-    context: Value,
-    evidence_ids: HashSet<String>,
+pub(super) struct NormalizedProviderInput {
+    pub(super) context: Value,
+    pub(super) evidence_ids: HashSet<String>,
 }
 
 trait CredentialSource: Send + Sync {
@@ -533,7 +533,7 @@ fn production_client() -> Result<Client, reqwest::Error> {
         .build()
 }
 
-fn validate_and_normalize_input(
+pub(super) fn validate_and_normalize_input(
     request: &ResidentOpenAiDiagnosisRequest,
 ) -> Result<NormalizedProviderInput, ResidentOpenAiError> {
     if !valid_request_id(&request.request_id)
@@ -817,7 +817,7 @@ fn build_request_body(input: Value) -> Result<Vec<u8>, ResidentOpenAiError> {
     Ok(body)
 }
 
-fn diagnosis_schema() -> Value {
+pub(super) fn diagnosis_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
@@ -941,8 +941,19 @@ fn parse_response(
     if message_count != 1 || text.trim().is_empty() {
         return Err(invalid_response());
     }
+    parse_and_sanitize_proposal(&text, api_key, evidence_ids)
+}
+
+pub(super) fn parse_and_sanitize_proposal(
+    text: &str,
+    api_key: &[u8],
+    evidence_ids: &HashSet<String>,
+) -> Result<ResidentDiagnosisProposal, ResidentOpenAiError> {
+    if text.len() > MAX_OUTPUT_TEXT_BYTES || text.trim().is_empty() {
+        return Err(invalid_response());
+    }
     let mut proposal: ResidentDiagnosisProposal =
-        serde_json::from_str(&text).map_err(|_| invalid_response())?;
+        serde_json::from_str(text).map_err(|_| invalid_response())?;
     validate_proposal(&proposal, evidence_ids)?;
     if proposal_contains_bytes(&proposal, api_key) {
         return Err(invalid_response());
@@ -1073,7 +1084,10 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
             .any(|window| window == needle)
 }
 
-fn request_contains_bytes(request: &ResidentOpenAiDiagnosisRequest, needle: &[u8]) -> bool {
+pub(super) fn request_contains_bytes(
+    request: &ResidentOpenAiDiagnosisRequest,
+    needle: &[u8],
+) -> bool {
     contains_bytes(request.objective.as_bytes(), needle)
         || request.evidence.iter().any(|evidence| {
             [
@@ -1118,35 +1132,35 @@ fn credential_error(_: ResidentOpenAiCredentialError) -> ResidentOpenAiError {
     credential_unavailable()
 }
 
-const fn credential_unavailable() -> ResidentOpenAiError {
+pub(super) const fn credential_unavailable() -> ResidentOpenAiError {
     ResidentOpenAiError::new(
         ResidentOpenAiErrorCode::CredentialUnavailable,
         "La credenziale OpenAI non è disponibile.",
     )
 }
 
-const fn cancelled() -> ResidentOpenAiError {
+pub(super) const fn cancelled() -> ResidentOpenAiError {
     ResidentOpenAiError::new(
         ResidentOpenAiErrorCode::Cancelled,
         "La richiesta OpenAI è stata annullata.",
     )
 }
 
-const fn timeout() -> ResidentOpenAiError {
+pub(super) const fn timeout() -> ResidentOpenAiError {
     ResidentOpenAiError::new(
         ResidentOpenAiErrorCode::Timeout,
         "La richiesta OpenAI ha superato il tempo massimo.",
     )
 }
 
-const fn transport() -> ResidentOpenAiError {
+pub(super) const fn transport() -> ResidentOpenAiError {
     ResidentOpenAiError::new(
         ResidentOpenAiErrorCode::Transport,
         "La connessione a OpenAI non è riuscita.",
     )
 }
 
-fn request_error(error: reqwest::Error) -> ResidentOpenAiError {
+pub(super) fn request_error(error: reqwest::Error) -> ResidentOpenAiError {
     if error.is_timeout() {
         timeout()
     } else {
@@ -1154,21 +1168,21 @@ fn request_error(error: reqwest::Error) -> ResidentOpenAiError {
     }
 }
 
-const fn invalid_request() -> ResidentOpenAiError {
+pub(super) const fn invalid_request() -> ResidentOpenAiError {
     ResidentOpenAiError::new(
         ResidentOpenAiErrorCode::InvalidRequest,
         "La richiesta OpenAI Resident non è valida.",
     )
 }
 
-const fn invalid_response() -> ResidentOpenAiError {
+pub(super) const fn invalid_response() -> ResidentOpenAiError {
     ResidentOpenAiError::new(
         ResidentOpenAiErrorCode::InvalidResponse,
         "La risposta OpenAI non rispetta il contratto diagnostico.",
     )
 }
 
-const fn response_too_large() -> ResidentOpenAiError {
+pub(super) const fn response_too_large() -> ResidentOpenAiError {
     ResidentOpenAiError::new(
         ResidentOpenAiErrorCode::ResponseTooLarge,
         "La risposta OpenAI supera il limite consentito.",

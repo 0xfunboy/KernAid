@@ -31,14 +31,15 @@ const MAX_PROVIDER_ENVELOPE_BYTES: usize = 1024;
 const DEVICE_IDENTITY_SEED_BYTES: usize = 32;
 const ENVELOPE_PREFIX: &[u8] = b"kernaid-secret-v1:";
 const PROVIDER_ENVELOPE_PREFIX: &[u8] = b"kernaid-provider-secret-v1:";
-const OPENAI_API_KEY_LABEL: &[u8] = b"openai-api-key-v1";
 const MIN_PROVIDER_PROFILE_ID_BYTES: usize = 1;
-/// Maximum byte length accepted for a Resident OpenAI API key.
+/// Maximum byte length accepted for a Resident provider API key.
 ///
 /// The conservative 512-byte cross-platform limit leaves the complete
 /// purpose-bound base64url envelope below 1 KiB, comfortably within the
 /// Windows Credential Manager generic-credential blob limit.
-pub const MAX_OPENAI_API_KEY_BYTES: usize = 512;
+pub const MAX_PROVIDER_API_KEY_BYTES: usize = 512;
+/// Backward-compatible name for the provider API-key size bound.
+pub const MAX_OPENAI_API_KEY_BYTES: usize = MAX_PROVIDER_API_KEY_BYTES;
 /// Maximum byte length of a public Resident provider-profile identifier.
 pub const MAX_PROVIDER_PROFILE_ID_BYTES: usize = 48;
 
@@ -68,7 +69,7 @@ impl SecretNamespace {
     }
 }
 
-/// Public, non-secret identifier for one OpenAI credential profile.
+/// Public, non-secret identifier for one provider credential profile.
 ///
 /// Profile identifiers contain only lowercase ASCII letters, digits, and
 /// single internal `-` separators. They must start and end with an
@@ -142,41 +143,81 @@ pub enum NativeProviderSecretStatus {
     Configured,
 }
 
-/// OS-keyring storage for one profiled OpenAI API key in Resident mode.
+/// Supported native API-key credential purposes.
+///
+/// The provider is a closed, typed set so callers cannot create ambiguous
+/// keyring names or envelopes from arbitrary strings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum NativeProviderKind {
+    OpenAi,
+    Anthropic,
+    Gemini,
+}
+
+impl NativeProviderKind {
+    /// Stable public identifier used by policy and native integrations.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenAi => "openai",
+            Self::Anthropic => "anthropic",
+            Self::Gemini => "gemini",
+        }
+    }
+
+    const fn api_key_label(self) -> &'static str {
+        match self {
+            Self::OpenAi => "openai-api-key-v1",
+            Self::Anthropic => "anthropic-api-key-v1",
+            Self::Gemini => "gemini-api-key-v1",
+        }
+    }
+}
+
+/// OS-keyring storage for one typed, profiled provider API key in Resident
+/// mode.
 ///
 /// The key is never returned by a public getter. Backend-only consumers can
-/// borrow it for the duration of [`Self::with_openai_api_key`]. Configure and
+/// borrow it for the duration of [`Self::with_api_key`]. Configure and
 /// logout both verify their result with an immediate readback. Callers should
 /// hold the application's inter-process single-instance lock across each
 /// operation; a native keyring cannot prevent a later external replacement.
-pub struct NativeOpenAiApiKeyStore {
+pub struct NativeProviderApiKeyStore {
     namespace: SecretNamespace,
+    provider: NativeProviderKind,
     profile: ProviderProfileId,
     backend: Box<dyn SecretBackend>,
 }
 
-impl NativeOpenAiApiKeyStore {
+impl NativeProviderApiKeyStore {
     pub fn open(
         namespace: SecretNamespace,
+        provider: NativeProviderKind,
         profile: ProviderProfileId,
     ) -> Result<Self, NativeSecretError> {
         Ok(Self {
             namespace,
+            provider,
             profile,
             backend: Box::new(KeyringBackend::open()?),
         })
     }
 
-    pub fn open_named(namespace: &str, profile: &str) -> Result<Self, NativeSecretError> {
+    pub fn open_named(
+        namespace: &str,
+        provider: NativeProviderKind,
+        profile: &str,
+    ) -> Result<Self, NativeSecretError> {
         Self::open(
             SecretNamespace::parse(namespace)?,
+            provider,
             ProviderProfileId::parse(profile)?,
         )
     }
 
     /// Return only whether the profile has a valid configured credential.
     pub fn status(&mut self) -> Result<NativeProviderSecretStatus, NativeSecretError> {
-        Ok(if self.load_openai_api_key()?.is_some() {
+        Ok(if self.load_api_key()?.is_some() {
             NativeProviderSecretStatus::Configured
         } else {
             NativeProviderSecretStatus::Absent
@@ -188,13 +229,14 @@ impl NativeOpenAiApiKeyStore {
     /// The supplied allocation is zeroized on return, including validation and
     /// backend error paths. Accepted credentials are non-empty, visible ASCII
     /// without whitespace or control bytes, and at most
-    /// [`MAX_OPENAI_API_KEY_BYTES`] bytes. No provider-prefix assumption is
+    /// [`MAX_PROVIDER_API_KEY_BYTES`] bytes. No provider-prefix assumption is
     /// made.
     pub fn configure(&mut self, api_key: Zeroizing<Vec<u8>>) -> Result<(), NativeSecretError> {
-        validate_openai_api_key(&api_key)
+        validate_provider_api_key(&api_key)
             .map_err(|()| NativeSecretError::InvalidProviderCredential)?;
-        let envelope = encode_provider_secret(&self.namespace, &self.profile, &api_key)?;
-        let name = CredentialName::provider(&self.namespace, &self.profile);
+        let envelope =
+            encode_provider_secret(&self.namespace, self.provider, &self.profile, &api_key)?;
+        let name = CredentialName::provider(&self.namespace, self.provider, &self.profile);
         self.backend.set(&name, &envelope)?;
         let persisted = self
             .backend
@@ -211,11 +253,11 @@ impl NativeOpenAiApiKeyStore {
     /// The decoded allocation is zeroized immediately after the callback
     /// returns. `Ok(None)` means the profile is not configured. This method is
     /// not a frontend or serialization boundary.
-    pub fn with_openai_api_key<T>(
+    pub fn with_api_key<T>(
         &mut self,
         use_secret: impl FnOnce(&[u8]) -> T,
     ) -> Result<Option<T>, NativeSecretError> {
-        let Some(api_key) = self.load_openai_api_key()? else {
+        let Some(api_key) = self.load_api_key()? else {
             return Ok(None);
         };
         Ok(Some(use_secret(&api_key)))
@@ -223,7 +265,7 @@ impl NativeOpenAiApiKeyStore {
 
     /// Idempotently delete the profile credential and verify its absence.
     pub fn logout(&mut self) -> Result<(), NativeSecretError> {
-        let name = CredentialName::provider(&self.namespace, &self.profile);
+        let name = CredentialName::provider(&self.namespace, self.provider, &self.profile);
         self.backend.delete(&name)?;
         if self.backend.get(&name)?.is_some() {
             return Err(NativeSecretError::WriteVerificationFailed);
@@ -231,12 +273,71 @@ impl NativeOpenAiApiKeyStore {
         Ok(())
     }
 
-    fn load_openai_api_key(&mut self) -> Result<Option<Zeroizing<Vec<u8>>>, NativeSecretError> {
-        let name = CredentialName::provider(&self.namespace, &self.profile);
+    fn load_api_key(&mut self) -> Result<Option<Zeroizing<Vec<u8>>>, NativeSecretError> {
+        let name = CredentialName::provider(&self.namespace, self.provider, &self.profile);
         let Some(envelope) = self.backend.get(&name)? else {
             return Ok(None);
         };
-        decode_provider_secret(&self.namespace, &self.profile, &envelope).map(Some)
+        decode_provider_secret(&self.namespace, self.provider, &self.profile, &envelope).map(Some)
+    }
+
+    #[cfg(test)]
+    fn with_backend(
+        namespace: SecretNamespace,
+        provider: NativeProviderKind,
+        profile: ProviderProfileId,
+        backend: Box<dyn SecretBackend>,
+    ) -> Self {
+        Self {
+            namespace,
+            provider,
+            profile,
+            backend,
+        }
+    }
+}
+
+/// Backward-compatible OpenAI-only facade over
+/// [`NativeProviderApiKeyStore`].
+///
+/// Existing integrations retain the original constructors and
+/// `with_openai_api_key` callback while all records keep their exact historic
+/// credential name and envelope purpose.
+pub struct NativeOpenAiApiKeyStore {
+    inner: NativeProviderApiKeyStore,
+}
+
+impl NativeOpenAiApiKeyStore {
+    pub fn open(
+        namespace: SecretNamespace,
+        profile: ProviderProfileId,
+    ) -> Result<Self, NativeSecretError> {
+        NativeProviderApiKeyStore::open(namespace, NativeProviderKind::OpenAi, profile)
+            .map(|inner| Self { inner })
+    }
+
+    pub fn open_named(namespace: &str, profile: &str) -> Result<Self, NativeSecretError> {
+        NativeProviderApiKeyStore::open_named(namespace, NativeProviderKind::OpenAi, profile)
+            .map(|inner| Self { inner })
+    }
+
+    pub fn status(&mut self) -> Result<NativeProviderSecretStatus, NativeSecretError> {
+        self.inner.status()
+    }
+
+    pub fn configure(&mut self, api_key: Zeroizing<Vec<u8>>) -> Result<(), NativeSecretError> {
+        self.inner.configure(api_key)
+    }
+
+    pub fn with_openai_api_key<T>(
+        &mut self,
+        use_secret: impl FnOnce(&[u8]) -> T,
+    ) -> Result<Option<T>, NativeSecretError> {
+        self.inner.with_api_key(use_secret)
+    }
+
+    pub fn logout(&mut self) -> Result<(), NativeSecretError> {
+        self.inner.logout()
     }
 
     #[cfg(test)]
@@ -246,9 +347,12 @@ impl NativeOpenAiApiKeyStore {
         backend: Box<dyn SecretBackend>,
     ) -> Self {
         Self {
-            namespace,
-            profile,
-            backend,
+            inner: NativeProviderApiKeyStore::with_backend(
+                namespace,
+                NativeProviderKind::OpenAi,
+                profile,
+                backend,
+            ),
         }
     }
 }
@@ -500,18 +604,24 @@ impl CredentialName {
         }
     }
 
-    fn provider(namespace: &SecretNamespace, profile: &ProviderProfileId) -> Self {
+    fn provider(
+        namespace: &SecretNamespace,
+        provider: NativeProviderKind,
+        profile: &ProviderProfileId,
+    ) -> Self {
         let account = format!(
-            "{}:provider:openai:{}:api-key-v1",
+            "{}:provider:{}:{}:api-key-v1",
             namespace.as_str(),
+            provider.as_str(),
             profile.as_str()
         );
         Self {
             service: SERVICE_NAME,
             #[cfg(target_os = "windows")]
             windows_target: format!(
-                "{WINDOWS_TARGET_PREFIX}/{}/provider/openai/{}/api-key-v1",
+                "{WINDOWS_TARGET_PREFIX}/{}/provider/{}/{}/api-key-v1",
                 namespace.as_str(),
+                provider.as_str(),
                 profile.as_str()
             ),
             account,
@@ -687,12 +797,13 @@ fn decode_secret(
 
 fn encode_provider_secret(
     namespace: &SecretNamespace,
+    provider: NativeProviderKind,
     profile: &ProviderProfileId,
     value: &[u8],
 ) -> Result<Zeroizing<Vec<u8>>, NativeSecretError> {
-    validate_openai_api_key(value).map_err(|()| NativeSecretError::InvalidProviderCredential)?;
+    validate_provider_api_key(value).map_err(|()| NativeSecretError::InvalidProviderCredential)?;
     let payload = Zeroizing::new(URL_SAFE_NO_PAD.encode(value));
-    let prefix = provider_envelope_purpose(namespace, profile);
+    let prefix = provider_envelope_purpose(namespace, provider, profile);
     let mut envelope = Zeroizing::new(Vec::with_capacity(prefix.len() + payload.len()));
     envelope.extend_from_slice(&prefix);
     envelope.extend_from_slice(payload.as_bytes());
@@ -704,13 +815,14 @@ fn encode_provider_secret(
 
 fn decode_provider_secret(
     namespace: &SecretNamespace,
+    provider: NativeProviderKind,
     profile: &ProviderProfileId,
     envelope: &[u8],
 ) -> Result<Zeroizing<Vec<u8>>, NativeSecretError> {
     if envelope.len() > MAX_PROVIDER_ENVELOPE_BYTES {
         return Err(NativeSecretError::InvalidStoredValue);
     }
-    let prefix = provider_envelope_purpose(namespace, profile);
+    let prefix = provider_envelope_purpose(namespace, provider, profile);
     let Some(payload) = envelope.strip_prefix(prefix.as_slice()) else {
         return Err(NativeSecretError::InvalidStoredValue);
     };
@@ -721,7 +833,7 @@ fn decode_provider_secret(
         .decode(payload)
         .map(Zeroizing::new)
         .map_err(|_| NativeSecretError::InvalidStoredValue)?;
-    validate_openai_api_key(&decoded).map_err(|()| NativeSecretError::InvalidStoredValue)?;
+    validate_provider_api_key(&decoded).map_err(|()| NativeSecretError::InvalidStoredValue)?;
     let canonical = Zeroizing::new(URL_SAFE_NO_PAD.encode(decoded.as_slice()));
     if canonical.as_bytes() != payload {
         return Err(NativeSecretError::InvalidStoredValue);
@@ -731,28 +843,29 @@ fn decode_provider_secret(
 
 fn provider_envelope_purpose(
     namespace: &SecretNamespace,
+    provider: NativeProviderKind,
     profile: &ProviderProfileId,
 ) -> Zeroizing<Vec<u8>> {
     let mut prefix = Zeroizing::new(Vec::with_capacity(
         PROVIDER_ENVELOPE_PREFIX.len()
             + namespace.as_str().len()
-            + OPENAI_API_KEY_LABEL.len()
+            + provider.api_key_label().len()
             + profile.as_str().len()
             + 3,
     ));
     prefix.extend_from_slice(PROVIDER_ENVELOPE_PREFIX);
     prefix.extend_from_slice(namespace.as_str().as_bytes());
     prefix.push(b':');
-    prefix.extend_from_slice(OPENAI_API_KEY_LABEL);
+    prefix.extend_from_slice(provider.api_key_label().as_bytes());
     prefix.push(b':');
     prefix.extend_from_slice(profile.as_str().as_bytes());
     prefix.push(b':');
     prefix
 }
 
-fn validate_openai_api_key(value: &[u8]) -> Result<(), ()> {
+fn validate_provider_api_key(value: &[u8]) -> Result<(), ()> {
     if value.is_empty()
-        || value.len() > MAX_OPENAI_API_KEY_BYTES
+        || value.len() > MAX_PROVIDER_API_KEY_BYTES
         || !value.iter().all(|byte| matches!(byte, 0x21..=0x7e))
     {
         return Err(());
@@ -1057,7 +1170,7 @@ mod tests {
         let observer = backend.clone();
         let namespace = namespace();
         let profile = profile();
-        let name = CredentialName::provider(&namespace, &profile);
+        let name = CredentialName::provider(&namespace, NativeProviderKind::OpenAi, &profile);
         let mut store = NativeOpenAiApiKeyStore::with_backend(
             namespace.clone(),
             profile.clone(),
@@ -1104,6 +1217,120 @@ mod tests {
     }
 
     #[test]
+    fn typed_provider_keys_have_distinct_names_and_envelope_purposes() {
+        let backend = MemoryBackend::default();
+        let observer = backend.clone();
+        let namespace = namespace();
+        let profile = profile();
+
+        for (provider, expected_name, expected_purpose) in [
+            (
+                NativeProviderKind::OpenAi,
+                "resident-test-01:provider:openai:technician-01:api-key-v1",
+                b"kernaid-provider-secret-v1:resident-test-01:openai-api-key-v1:technician-01:"
+                    .as_slice(),
+            ),
+            (
+                NativeProviderKind::Anthropic,
+                "resident-test-01:provider:anthropic:technician-01:api-key-v1",
+                b"kernaid-provider-secret-v1:resident-test-01:anthropic-api-key-v1:technician-01:"
+                    .as_slice(),
+            ),
+            (
+                NativeProviderKind::Gemini,
+                "resident-test-01:provider:gemini:technician-01:api-key-v1",
+                b"kernaid-provider-secret-v1:resident-test-01:gemini-api-key-v1:technician-01:"
+                    .as_slice(),
+            ),
+        ] {
+            let name = CredentialName::provider(&namespace, provider, &profile);
+            assert_eq!(name.account, expected_name);
+            #[cfg(target_os = "windows")]
+            assert_eq!(
+                name.windows_target,
+                expected_name
+                    .replacen(
+                        "resident-test-01:provider:",
+                        "KernAid/Resident/resident-test-01/provider/",
+                        1
+                    )
+                    .replace(':', "/")
+            );
+
+            let expected = synthetic_api_key(64);
+            let mut store = NativeProviderApiKeyStore::with_backend(
+                namespace.clone(),
+                provider,
+                profile.clone(),
+                Box::new(backend.clone()),
+            );
+            store
+                .configure(Zeroizing::new(expected.to_vec()))
+                .expect("configure typed provider credential");
+            let persisted = observer.value(&name).expect("provider envelope exists");
+            assert!(persisted.starts_with(expected_purpose));
+            assert_eq!(
+                store
+                    .with_api_key(|loaded| loaded == expected.as_slice())
+                    .expect("borrow typed provider credential"),
+                Some(true)
+            );
+        }
+
+        let openai_name =
+            CredentialName::provider(&namespace, NativeProviderKind::OpenAi, &profile);
+        let anthropic_name =
+            CredentialName::provider(&namespace, NativeProviderKind::Anthropic, &profile);
+        let openai_envelope = observer
+            .value(&openai_name)
+            .expect("OpenAI envelope exists");
+        observer.replace(anthropic_name, openai_envelope);
+        let mut anthropic = NativeProviderApiKeyStore::with_backend(
+            namespace,
+            NativeProviderKind::Anthropic,
+            profile,
+            Box::new(backend),
+        );
+        assert!(matches!(
+            anthropic.status(),
+            Err(NativeSecretError::InvalidStoredValue)
+        ));
+    }
+
+    #[test]
+    fn openai_wrapper_and_typed_store_share_the_legacy_record() {
+        let backend = MemoryBackend::default();
+        let namespace = namespace();
+        let profile = profile();
+        let expected = synthetic_api_key(88);
+        let mut typed = NativeProviderApiKeyStore::with_backend(
+            namespace.clone(),
+            NativeProviderKind::OpenAi,
+            profile.clone(),
+            Box::new(backend.clone()),
+        );
+        typed
+            .configure(Zeroizing::new(expected.to_vec()))
+            .expect("configure through typed API");
+
+        let mut legacy =
+            NativeOpenAiApiKeyStore::with_backend(namespace, profile, Box::new(backend));
+        assert_eq!(
+            legacy
+                .with_openai_api_key(|loaded| loaded == expected.as_slice())
+                .expect("borrow through legacy wrapper"),
+            Some(true)
+        );
+        legacy
+            .logout()
+            .expect("legacy wrapper deletes typed record");
+        assert_eq!(
+            typed.status().expect("typed status after legacy logout"),
+            NativeProviderSecretStatus::Absent
+        );
+    }
+
+    #[test]
     fn openai_key_validation_enforces_boundaries_and_visible_ascii() {
         let backend = MemoryBackend::default();
         let mut store =
@@ -1141,8 +1368,10 @@ mod tests {
         let first_profile = profile();
         let second_profile =
             ProviderProfileId::parse("technician-02").expect("valid second profile");
-        let first_name = CredentialName::provider(&namespace, &first_profile);
-        let second_name = CredentialName::provider(&namespace, &second_profile);
+        let first_name =
+            CredentialName::provider(&namespace, NativeProviderKind::OpenAi, &first_profile);
+        let second_name =
+            CredentialName::provider(&namespace, NativeProviderKind::OpenAi, &second_profile);
         let mut first = NativeOpenAiApiKeyStore::with_backend(
             namespace.clone(),
             first_profile,
@@ -1204,7 +1433,7 @@ mod tests {
         let observer = backend.clone();
         let namespace = namespace();
         let profile = profile();
-        let name = CredentialName::provider(&namespace, &profile);
+        let name = CredentialName::provider(&namespace, NativeProviderKind::OpenAi, &profile);
         let mut store =
             NativeOpenAiApiKeyStore::with_backend(namespace, profile, Box::new(backend));
 
