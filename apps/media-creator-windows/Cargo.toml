@@ -3,15 +3,16 @@ name = "kernaid-media-creator-windows"
 version.workspace = true
 edition.workspace = true
 license-file = "../../LICENSE"
+build = "build.rs"
 
 [features]
 default = []
-windows-cli = []
+windows-wizard = []
 
 [[bin]]
 name = "kernaid-media-creator"
 path = "src/main.rs"
-required-features = ["windows-cli"]
+required-features = ["windows-wizard"]
 
 [dependencies]
 kernaid-media-creator-core = { path = "../../crates/media-creator-core" }
@@ -22,10 +23,21 @@ sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 windows-sys = { version = "0.61.2", features = [
   "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_System_LibraryLoader",
   "Win32_System_IO",
   "Win32_System_Ioctl",
+  "Win32_UI_Controls",
+  "Win32_UI_Controls_Dialogs",
+  "Win32_UI_HiDpi",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_WindowsAndMessaging",
 ] }
 wmi = { version = "0.18.4", default-features = false }
+
+[build-dependencies]
+base64 = "0.22"
+embed-resource = "3.0.11"
 
 [lints.clippy]
 unwrap_used = "deny"

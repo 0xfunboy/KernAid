@@ -2594,7 +2594,9 @@ dependencies = [
 name = "kernaid-media-creator-core"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
+ "ed25519-dalek",
  "lzma-rust2",
  "serde",
  "serde_json",
@@ -2606,6 +2608,8 @@ dependencies = [
 name = "kernaid-media-creator-windows"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
+ "embed-resource",
  "kernaid-media-creator-core",
  "serde",
  "serde_json",
