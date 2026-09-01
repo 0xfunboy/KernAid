@@ -43,9 +43,9 @@ never claim otherwise.
 
 Integrated in current source, but not automatically qualified or promoted:
 
-- four off-default Rescue repair actions, including resolver-link restoration,
-  plus a local-only Fleet-to-Rescue `fstab` intent adapter that still requires
-  fresh target/evidence-bound approval;
+- four off-default Rescue repair actions plus a local-only Fleet-to-Rescue
+  adapter for all four corresponding closed intents; every repair still
+  requires fresh target/evidence-bound approval;
 - a disabled-by-default Linux Resident `.deb` containing sync, R0 work orders,
   signed update staging and the UEFI/systemd-boot A/B activator;
 - the off-default Windows R0 Resident and its explicitly unsigned deployment
@@ -54,23 +54,31 @@ Integrated in current source, but not automatically qualified or promoted:
   Intel and Apple-silicon bundle workflow;
 - the Windows Media Creator wizard, which verifies an offline-signed exact
   release bundle while its EXE/ZIP remains unsigned pending Authenticode;
-- live Fleet schema v12 with active offline commercial licensing and scheduled
+- live Fleet schema v13 with active offline commercial licensing and scheduled
   signed, WAL-safe, independently verified backup bundles; and
 - a gated private software catalog that now publishes the reviewed Media
   Creator and Linux, Windows and dual-architecture macOS Resident engineering
   artifacts with exact provenance, digest, qualification and unsigned-state
   metadata.
 
-The latest diagnostic candidate, Rescue run `33447510598`, passed the core
-build/boot/render/input/two-boot gates but failed all three Vault jobs at the
-same first-boot confirmation timeout. The tty1 activation correction is in
-current source and has not yet been qualified in a newer ISO. Stable
+The latest private diagnostic candidate is the exact ISO from commit `aa8255a`,
+Rescue run `33455599335`. Its core build, boot, render, input and USB-style
+two-boot BIOS/UEFI matrix passed, but all three Vault jobs stopped at the same
+`firstboot-confirmation` timeout. It is available privately only for controlled
+physical boot/UI testing and is neither Vault-qualified nor promoted. Stable
 `0.1.0-internal.6` therefore remains unchanged.
 
-The fastest remaining path is one consolidated source push, one combined
-Rescue/Desktop/repair milestone matrix, parallel software-package workflows,
-then exact artifact review and promotion. Repeated unchanged tests are not part
-of this plan.
+The next consolidated source cut is commit `be88efa`. Rescue run
+`33459542561`, Desktop run `33459542555` and repair run `33459558782` are in
+progress; this plan assigns them no outcome before completion. In parallel,
+the exact Linux, Windows and macOS Resident packages passed their automated
+native lifecycle gates in runs `33459558805`, `33459558875` and `33459559165`.
+Those packages are still unsigned engineering artifacts: real enrollment,
+native secret stores, publisher signing and physical endpoints remain open.
+
+The fastest remaining path is to finish the three active milestone workflows,
+review and promote only exact green artifacts, then spend the remaining cycle
+on physical/external gates. Repeated unchanged tests are not part of this plan.
 
 ## RC completion gate
 

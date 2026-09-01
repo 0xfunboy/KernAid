@@ -35,7 +35,7 @@ schema.
 | `crates/fleet-client`               | Canonical Ed25519 enrollment, inventory and signed work-order claim/result envelopes               | Offline/transport-neutral; reuses the existing protected device identity                         |
 | `crates/fleet-runtime`              | Durable SQLite outbox, inventory sequencing and verified entitlement state                         | External vendor anchor; paid features fail closed while diagnosis/export/rollback stay available |
 | `packages/fleet-schemas`            | Matching Node.js wire validation and canonical signing bytes                                       | Strict bounded v1 schemas                                                                        |
-| `services/fleet-control-plane`      | Tenant registry, signed device traffic, governance, work orders, incidents and commercial licensing | Live loopback origin at schema v12 behind the internal TLS tunnel                                |
+| `services/fleet-control-plane`      | Tenant registry, signed device traffic, governance, work orders, incidents and commercial licensing | Live loopback origin at schema v13 behind the internal TLS tunnel                                |
 | `apps/fleet-console`                | Same-origin inventory, governance, work-order, incident and license UI                               | Short-lived server-memory session, Secure cookie and CSRF; no persistent browser bearer token    |
 | `crates/fleet-policy`               | Offline policy issuer and signed, offline-capable restrictive bundle                               | Server receives no seed; policy can only narrow local permission                                 |
 | `crates/fleet-audit`                | Canonical signed audit events and tamper-evident chain checkpoints                                 | Digest-only device protocol with central signature, sequence and chain verification              |
@@ -43,7 +43,7 @@ schema.
 | `crates/update-client`              | Signed A/B release admission, offline issuer and boot-state planner                                | External trust anchor, monotonic manifests, ring/rollout/time gates and failed-boot rollback     |
 | `crates/fleet-resident-update`      | HTTPS update staging plus local UEFI/systemd-boot A/B activation                                   | Off-default; inactive-slot only, one-shot boot, fallback/offline rollback; never reboots          |
 | `tools/fleet-onboarding`            | Guided tenant creation and short-lived one-device provisioning bundle                              | Off-default CLI; owner-only files, no token output, shell, signing, or remote-command capability |
-| `crates/fleet-resident-work-orders` | Durable allowlisted device-side work-order client                                                  | Off-default; Fleet intent never replaces fresh local Core/broker approval                        |
+| `crates/fleet-resident-work-orders` | Durable allowlisted device-side work-order client and Rescue handoff for all four repair identifiers | Off-default; Fleet intent never replaces fresh local Core/broker approval                        |
 | `deploy/fleet-resident-linux`       | Disabled-by-default amd64 Debian package for sync, work orders, staging and A/B activation          | Does not enroll, enable services, alter boot state or reboot during installation                 |
 | `deploy/fleet-resident-windows`     | On-demand Windows `LocalService` deployment for `windows.p0.diagnose.v1@1`                          | R0/digest-only; CI ZIP is explicitly unsigned and needs Authenticode/native qualification        |
 | `deploy/fleet-resident-macos`       | Off-default LaunchAgent deployment for `macos.p0.diagnose.v1@1` on Intel and Apple silicon          | R0/digest-only; CI bundles are explicitly unsigned/unnotarized and need native qualification     |
@@ -100,6 +100,15 @@ and contains no enrollment or administrator token in plaintext.
 The service accepts no arbitrary command, script, filesystem path or broker
 request. Adding one would violate the Enterprise trust boundary.
 
+Schema v13 closes the repair catalog over exactly
+`linux.fstab.disable-missing-uuid.v1`,
+`linux.crypttab.disable-missing-uuid.v1`,
+`linux.ext4.fsck-preen-with-undo.v1` and
+`linux.network.restore-resolver-link.v1`. The device-side Rescue adapter maps
+all four identifiers to their exact local action, but a signed Fleet work order
+is only organizational intent: it cannot skip fresh local target selection,
+evidence, approval, Core validation, Vault backup or broker enforcement.
+
 ## Local engineering run
 
 Use the repository-pinned Node.js `24.18.0`:
@@ -149,7 +158,7 @@ bundle without printing any token value.
 ## Remaining Enterprise RC gates
 
 The internal control plane is running at `https://fleet.funboy.eu.cc/` through
-a loopback-only persistent user service. The live database is schema v12 and
+a loopback-only persistent user service. The live database is schema v13 and
 has one active, non-revoked offline-signed Enterprise license for the internal
 tenant. Fleet receives only public entitlement, update and commercial trust
 anchors; all issuer private keys remain outside its filesystem view.
@@ -157,22 +166,33 @@ anchors; all issuer private keys remain outside its filesystem view.
 The live service also has a persistent scheduled backup. Each online SQLite
 copy is forced into standalone journal mode, checked for integrity/foreign-key
 violations, bound into a canonical manifest and signed with the existing
-service-receipt Ed25519 key. The latest schema-v12 bundle was independently
-verified offline on 1 September 2026. Root and tenant credentials remain
-owner-only and outside source control.
+service-receipt Ed25519 key. The last explicitly recorded independent restore
+verification covers a schema-v12 bundle from 1 September 2026; the live schema
+is now v13, so that older evidence is not presented as a v13 restore result.
+Root and tenant credentials remain owner-only and outside source control.
+
+The automated native package lifecycle is green for the exact current-source
+engineering artifacts: Linux run `33459558805`, Windows run `33459558875` and
+macOS run `33459559165`. These gates staged the packages, proved disabled
+startup, exercised the deliberate missing-trust-anchor failure and cleaned up;
+Windows additionally proved an on-demand stopped `LocalService`, and both
+native macOS architectures proved that no LaunchAgent was loaded. They do not
+qualify real identity/enrollment, OS secret stores, publisher signing or
+physical endpoints.
 
 The remaining RC work is:
 
-1. qualify installation, service identity and work-order lifecycle for the
-   exact reviewed Linux `.deb` and unsigned Windows deployment bundle now
-   published in the authenticated project area;
+1. qualify real service identity, enrollment, native secret storage and the
+   closed work-order lifecycle on physical endpoints for the exact reviewed
+   Linux `.deb`, Windows ZIP and dual-architecture macOS bundle now published
+   in the authenticated project area;
 2. qualify the Linux UEFI/systemd-boot A/B activator on a disposable two-slot
    system and bind it to one exact signed release; BIOS/GRUB remains unsupported;
-3. qualify the local Rescue Fleet `fstab` adapter end to end. Fleet may deliver
-   intent, but Desk must still collect a fresh target/evidence-bound approval
-   before Core/Broker/Vault can mutate anything;
-4. qualify the existing native Intel/Apple-silicon macOS Resident bundles and
-   complete publisher signing, notarization/Authenticode, production
+3. let repair run `33459558782` finish, then qualify all four local Rescue
+   Fleet adapters end to end. Fleet may deliver intent, but Desk must still
+   collect a fresh target/evidence-bound approval before Core/Broker/Vault can
+   mutate anything;
+4. complete publisher signing, notarization/Authenticode, production
    Access/rate-limit policy and physical endpoint evidence;
 5. qualify each actual repair pack on disposable virtual and physical targets.
 

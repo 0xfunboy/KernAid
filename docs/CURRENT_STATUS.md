@@ -57,17 +57,17 @@ production promotion of repair packs remain open milestones.
 | `crypttab` recovery | `linux.crypttab.disable-missing-uuid.v1` rejects critical mappings, external key sources, ambiguity and mandatory `fstab` consumers; the candidate includes Vault reservation, atomic execution, verification, UI, exact rollback and restart reconciliation. |
 | ext4 recovery | `linux.ext4.fsck-preen-with-undo.v1` is an R3, unmounted-target action using bounded `e2fsck -p -f -z`, read-only verification and same-boot `e2undo`; it explicitly stops for manual reconciliation when exact recovery cannot be proved. |
 | Resolver-link recovery | `linux.network.restore-resolver-link.v1` restores only the fixed resolver symlink after proving exactly one supported resolver, preserves the exact missing/link pre-state in the Vault and never starts or restarts a service. |
-| Fleet control plane | Live internal schema v12: signed enrollment/inventory/audit/policy/entitlement/update delivery, secure browser sessions, RBAC, typed Linux, Windows and macOS work orders, incident cases and service receipts. Offline Ed25519 commercial licensing is active for the internal tenant; expiry, revocation, seat limits and clock rollback fail closed for paid operations. |
+| Fleet control plane | Live internal schema v13: signed enrollment/inventory/audit/policy/entitlement/update delivery, secure browser sessions, RBAC, typed Linux, Windows and macOS work orders, incident cases and service receipts. The v13 closed work-order catalog admits all four Rescue repair identifiers while preserving the approval, lease and device bindings. Offline Ed25519 commercial licensing is active for the internal tenant; expiry, revocation, seat limits and clock rollback fail closed for paid operations. |
 | Fleet provider policy | Signed policy uses the closed modes `offline`, `openai_api`, `openai_compatible`, `anthropic_api`, `gemini_api` and `enterprise`. A mode is usable only when both local capability and signed policy allow it; policy cannot create an unsupported adapter or broker authority. |
 | Fleet backup | The live SQLite service has a scheduled, signed three-file backup bundle. The online copy is converted from WAL mode into one standalone database before its canonical manifest is signed; offline verify/restore reject tampering, wrong keys, sidecars, symlinks and overwrite. |
 | Linux Fleet Resident | A disabled-by-default amd64 `.deb` packages signed sync, the three closed Linux R0 diagnostic work orders, signed update staging and the UEFI/systemd-boot A/B activator. Installation does not enroll, enable, change boot state or reboot. |
 | Windows Fleet Resident | A separate off-default `LocalService` worker admits only `windows.p0.diagnose.v1@1`, retains digest-only idempotent state and exposes an explicitly unsigned deployment-bundle workflow. It installs on demand and never auto-starts. |
 | macOS Fleet Resident | A separate off-default LaunchAgent worker admits only `macos.p0.diagnose.v1@1`, reuses the bounded native Desk collector and retains digest-only idempotent state. Its Intel and Apple-silicon workflow bundles remain explicitly unsigned and unnotarized. |
-| Native Resident package lifecycle | Workflow source stages the exact Linux `.deb`, Windows ZIP and native-architecture macOS bundle, verifies the fixed claim/result files and disabled startup, exercises one fail-closed run with intentionally absent trust anchors, and cleans up. Windows additionally proves an on-demand stopped `LocalService`; macOS proves no LaunchAgent is loaded. These no-identity/no-key checks have no post-change green remote run yet and do not qualify signing, real enrollment, native secret storage or physical endpoints. |
-| Rescue Fleet adapter | The private candidate can display an exact Fleet `fstab` repair intent, but execution still requires a fresh local approval bound to device, lease, action, plan, target and evidence before the existing Core/Broker/Vault path is reached. Fleet cannot execute it remotely. |
+| Native Resident package lifecycle | The exact staged Linux `.deb`, Windows ZIP and native-architecture macOS bundles passed their automated native lifecycle gates in runs `33459558805`, `33459558875` and `33459559165`: fixed claim/result contract, disabled startup, one intentional no-trust-anchor fail-closed run and cleanup. Windows additionally proved an on-demand stopped `LocalService`; macOS proved no LaunchAgent was loaded. The artifacts remain unsigned engineering builds and these gates do not qualify real enrollment, native secret storage or physical endpoints. |
+| Rescue Fleet adapter | The private candidate maps all four closed Fleet repair intents (`fstab`, `crypttab`, ext4 preen/undo and resolver-link restoration) to their exact local action. Execution still requires a fresh local approval bound to device, lease, action, plan, target and evidence before the existing Core/Broker/Vault path is reached. Fleet cannot execute a repair remotely. |
 | Signed A/B activation | The off-default Linux activator admits only a signed, already staged inactive slot on locally provisioned UEFI/systemd-boot A/B systems. It persists before `bootctl`, uses one-shot boot, promotes or records fallback, retains offline rollback and never repartitions or reboots. BIOS/GRUB fails closed. |
 | Windows Media Creator | The native wizard consumes one exact Ed25519-signed release bundle, lists only qualified removable whole disks, requires exact erase confirmation, streams the XZ image and performs full readback SHA-256. Its workflow output remains an explicitly unsigned EXE/ZIP until Authenticode is applied externally. |
-| Private software catalog | The authenticated project site serves reviewed Media Creator, Linux, Windows and dual-architecture macOS Resident engineering artifacts from runs `33454416574`, `33455607922`, `33454416610` and `33455609776`, with exact provenance, bytes, checksum, qualification and unsigned status. Each route remains independently fail-closed if its reviewed file or metadata is absent. |
+| Private software catalog | The authenticated project site serves the reviewed Media Creator and the latest native-lifecycle-qualified Linux, Windows and dual-architecture macOS Resident engineering artifacts from runs `33454416574`, `33459558805`, `33459558875` and `33459559165`, with exact provenance, bytes, checksum, qualification and unsigned status. Each route remains independently fail-closed if its reviewed file or metadata is absent. |
 | Rescue first boot | The promoted image provisions an all-zero p3 into the canonical LUKS2/ext4 Vault, seeds its identity and Codex home, closes it and verifies the locked profile; the exact flow passed two-boot BIOS/UEFI QEMU qualification |
 | Release channel | Canonical Release Channel v1, anti-rollback links, strict verification and immutable internal prerelease `0.1.0-internal.6` are active through sequence 6; this is not an automatic updater or signed production channel |
 
@@ -97,9 +97,10 @@ treated as a newer release.
   broker envelope. It is development evidence, not a release receipt.
 - Physical USB boot has not been qualified. The diagnosis-only stable image from
   commit `5db4700` completed every normal virtual gate in Rescue run
-  `33330139973`. A newer diagnostic ISO from run `33447510598` is available only
-  in the authenticated area for controlled boot/UI investigation; it is not a
-  promoted or Vault-qualified replacement for the stable image.
+  `33330139973`. A newer diagnostic ISO from run `33455599335`, commit
+  `aa8255a`, is available only in the authenticated area for controlled boot/UI
+  investigation; it is not a promoted or Vault-qualified replacement for the
+  stable image.
 - The first reported physical boot of the previous diagnosis-only RC on an
   Intel Core i5-6200-class PC reached Xorg/Matchbox but showed only a black
   desktop and movable pointer. That is a failed physical qualification, not a
@@ -109,19 +110,20 @@ treated as a newer release.
   Mesa shader cache, adds a compatibility-graphics boot entry and replaces the
   Debian boot artwork with KernAid branding. Physical retest is still required
   before claiming physical hardware qualification.
-- Rescue run `33447510598` passed its build, ABI, SBOM, shipping-surface,
+- Rescue run `33455599335` passed its build, ABI, SBOM, shipping-surface,
   framebuffer/WebKit, keyboard, BIOS, UEFI Secure Boot and USB-style two-boot
   gates. Its BIOS/UEFI Vault lifecycle and native-prompt jobs all stopped at
-  the same `firstboot-confirmation` timeout, so qualification was skipped. The
-  current source explicitly switches to tty1 before advertising prompt
-  readiness (`b82710f`), but that fix has not yet passed a new exact-image run.
+  the same `firstboot-confirmation` timeout, so qualification was skipped. A
+  subsequent input-pacing correction is included in source commit `be88efa`;
+  Rescue run `33459542561` is still in progress and has no claimed outcome.
 - Secure Boot is not qualified.
 - Desktop installers are unsigned engineering previews.
 - The Linux Resident `.deb`, Windows Resident ZIP, macOS Resident bundles and
   Windows Media Creator ZIP are engineering packaging paths, not released
-  customer installers. Workflow source now stages the exact Resident packages,
-  proves disabled startup, performs a deliberately no-anchor fail-closed run
-  and cleans up, but no post-change green remote run is claimed. Real identity,
+  customer installers. The exact Resident packages passed their automated
+  native lifecycle workflows in Linux run `33459558805`, Windows run
+  `33459558875` and macOS run `33459559165`, including disabled startup, an
+  intentional no-anchor fail-closed execution and cleanup. Real identity,
   enrollment, native secret stores, Linux repository/package signing, Windows
   Authenticode, macOS Developer ID signing/notarization and physical endpoint
   qualification remain open.
@@ -195,15 +197,15 @@ fixed.
 ### Newer diagnostic candidate — not promoted
 
 The authenticated area separately exposes the exact ISO from
-[Rescue run 33447510598](https://github.com/0xfunboy/KernAid/actions/runs/33447510598),
+[Rescue run 33455599335](https://github.com/0xfunboy/KernAid/actions/runs/33455599335),
 source commit
-[`6e5303b361e3de478f002f01f35914c1662fa578`](https://github.com/0xfunboy/KernAid/commit/6e5303b361e3de478f002f01f35914c1662fa578):
+[`aa8255ac3837d8ec458b682e9704ffe085347a08`](https://github.com/0xfunboy/KernAid/commit/aa8255ac3837d8ec458b682e9704ffe085347a08):
 
 | Field | Exact value |
 | --- | --- |
-| Artifact version | `ci-33447510598-1` |
+| Artifact version | `ci-33455599335-1` |
 | ISO size | `1,307,344,896` bytes |
-| ISO SHA-256 | `fbd54a749691df4c4cd9bcd7b61c0ff3d515df063763896069a652a0c947400c` |
+| ISO SHA-256 | `0d69b27b1b79edf9017538c3742cae97fa59960f2992a2dba7caec6620997449` |
 | Passed | Build, ABI, stable-surface exclusion, SBOM, QEMU BIOS, UEFI Secure Boot, WebKit framebuffer, keyboard input and USB-style two-boot BIOS/UEFI |
 | Failed | BIOS Vault lifecycle, UEFI Vault lifecycle and BIOS native prompt: common `firstboot-confirmation` timeout |
 | Qualification | `qualified-release` skipped; no catalog or Release Channel promotion |
@@ -211,8 +213,21 @@ source commit
 Use this ISO only on non-customer hardware and a disposable USB to investigate
 physical boot and UI. Do not rely on its Vault provisioning. It has no retail
 image in the private area and does not replace `0.1.0-internal.6` or trusted
-catalog v2 revision 8. Commit `b82710f` now activates tty1 before accepting
-first-boot input, but only the next integrated ISO run can qualify that change.
+catalog v2 revision 8. The input-pacing correction in commit `be88efa` belongs
+to a later build and cannot retroactively qualify this ISO.
+
+### Current integrated qualification batch — in progress
+
+Commit
+[`be88efab849365f4d3e7431e110ebd318e8d67a8`](https://github.com/0xfunboy/KernAid/commit/be88efab849365f4d3e7431e110ebd318e8d67a8)
+is currently being evaluated by
+[Rescue run 33459542561](https://github.com/0xfunboy/KernAid/actions/runs/33459542561),
+[Desktop run 33459542555](https://github.com/0xfunboy/KernAid/actions/runs/33459542555)
+and
+[repair run 33459558782](https://github.com/0xfunboy/KernAid/actions/runs/33459558782).
+All three are in progress at this status cut. Their presence is not evidence
+of success, and none authorizes promotion until its complete required matrix
+finishes green and the exact artifacts are independently reviewed.
 
 ### Retired physical-test candidate
 
@@ -236,16 +251,17 @@ explicit catalog and private-site promotion is completed.
 
 Current source contains four independent off-default actions: `fstab`,
 `crypttab`, ext4 preen/undo and resolver-link restoration. It also contains the
-local Rescue adapter for a Fleet-issued `fstab` intent. None is present in the
-stable image, and no current-source repair image has passed and been promoted
-through the full exact-image matrix. The current harness reuses one provisioned
-Rescue/Vault/target base through isolated sparse copies and covers the existing
-`fstab` apply/failure/recovery matrix, `crypttab` apply plus fresh explicit
-rollback, ext4 preen plus clean read-only verification, and resolver apply plus
-exact symlink restoration. That source-level extension was added after the
-historical run below; no green remote run or promoted repair image proves it.
-The table therefore remains evidence for the last separately reviewed image,
-not the status of current source.
+local Rescue adapter for each corresponding closed Fleet repair intent. None
+is present in the stable image, and no current-source repair image has passed
+and been promoted through the full exact-image matrix. The current harness
+reuses one provisioned Rescue/Vault/target base through isolated sparse copies
+and covers the existing `fstab` apply/failure/recovery matrix, `crypttab` apply
+plus fresh explicit rollback, ext4 preen plus clean read-only verification, and
+resolver apply plus exact symlink restoration. That source-level extension was
+added after the historical run below; no green remote run or promoted repair
+image proves it. The table therefore remains evidence for the last separately
+reviewed image, not the status of current source. Repair run `33459558782` is
+evaluating the new batch and remains in progress; no result is claimed here.
 
 | Field | Exact value |
 | --- | --- |
@@ -285,17 +301,17 @@ complete GUI qualification remain open.
 
 ## Immediate next gates
 
-1. Run one integrated Rescue matrix containing the tty1 first-boot correction;
-   promote nothing unless build, boot, two-boot, native prompt and both Vault
-   lifecycle jobs pass on the same exact image.
-2. Run the current shared-base exact-image repair batch and retain one green
-   remote run before treating its four scenarios as virtually qualified; then
-   keep destructive power-loss and physical recovery as separate gates.
-3. Obtain a green post-change workflow for the staged native Resident lifecycle,
-   then qualify real service identity, enrollment, native secret stores and the
-   closed R0 work-order lifecycle on physical Linux, Windows and macOS endpoints;
-   qualify the Media Creator erase/write/readback flow separately on disposable
-   USB.
+1. Let Rescue run `33459542561` complete; promote nothing unless build, boot,
+   two-boot, native prompt and both Vault lifecycle jobs pass on the same exact
+   image.
+2. Let repair run `33459558782` complete and retain one green exact-image run
+   before treating its four scenarios as virtually qualified; then keep
+   destructive power-loss and physical recovery as separate gates.
+3. The staged native Resident lifecycle is green in runs `33459558805`,
+   `33459558875` and `33459559165`. Next qualify real service identity,
+   enrollment, native secret stores and the closed R0 work-order lifecycle on
+   physical Linux, Windows and macOS endpoints; qualify the Media Creator
+   erase/write/readback flow separately on disposable USB.
 4. Boot the resulting exact diagnostic image from physical USB on a small
    hardware matrix using the [physical USB qualification
    runbook](runbooks/physical-usb-qualification.md), and record firmware,

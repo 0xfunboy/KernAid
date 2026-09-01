@@ -1,6 +1,6 @@
 # KernAid project map
 
-Last updated: 31 August 2026
+Last updated: 1 September 2026
 
 This is the short operational map of the product, repository, build artifacts
 and internal delivery channel. For exact qualification evidence, use
@@ -14,8 +14,8 @@ preview**. It collects bounded evidence, produces a diagnosis, validates a
 typed R0 no-write plan and emits a hashed report. Rescue can additionally
 preserve the exact report and audit sequence as a signed envelope in its
 encrypted Vault. Separately built, off-default repair candidates now contain
-closed fstab, crypttab and ext4 recovery actions; none is promoted into the
-stable image until its own qualification gate passes.
+closed fstab, crypttab, ext4 preen/undo and resolver-link recovery actions;
+none is promoted into the stable image until its own qualification gate passes.
 
 The intended complete product flow is:
 
@@ -33,9 +33,9 @@ approval. They remain private and unsupported on customer data.
 | Surface        | Purpose                                                                                                   | Current boundary                                                                                                                                |
 | -------------- | --------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
 | KernAid Desk   | Diagnose a running Windows, Linux or macOS installation                                                   | Unsigned engineering builds; read-only production collectors                                                                                    |
-| KernAid Rescue | Boot an amd64 PC that cannot start its installed OS                                                       | Hybrid BIOS/UEFI image; gated VT-unlock E2E is implemented but pending CI, and qualification remains virtual until physical USB evidence exists |
+| KernAid Rescue | Boot an amd64 PC that cannot start its installed OS                                                       | Hybrid BIOS/UEFI image; private candidate `33455599335` passed boot/UI/USB-style gates but failed all three Vault prompt/lifecycle jobs           |
 | USB writers    | Verify an authorized image, write it and provision or verify the resulting medium                         | Guarded Linux writer plus off-default Windows Media Creator; physical USB remains unqualified                                                    |
-| KernAid Fleet  | Enroll devices, retain minimized inventory, govern typed work orders and track incident closure           | Live internal schema v10 control plane and console; Linux Resident services remain off-default and unqualified                                  |
+| KernAid Fleet  | Enroll devices, retain minimized inventory, govern typed work orders and track incident closure           | Live internal schema v13; all four Rescue repair intents are mapped locally, while native Resident lifecycle is green only at the automated package level |
 | Project site   | Explain the project publicly and distribute controlled artifacts privately                                | Public `/`; authenticated `/private/`; no public ISO route                                                                                      |
 
 ## Canonical repository map
@@ -67,7 +67,7 @@ On the internal build host used during this phase:
 | `/home/funboy/KernAid-dist` | Local staging for qualified/private artifacts; not another repository                |
 | `kaid-site.service`         | Node.js 24.18.0 site process on loopback                                             |
 | `kaid-cloudflared.service`  | Tunnel for `https://kaid.funboy.eu.cc`                                               |
-| `kernaid-fleet.service`     | Node.js 24.18.0 Fleet v10 origin on loopback, exposed at `https://fleet.funboy.eu.cc` |
+| `kernaid-fleet.service`     | Node.js 24.18.0 Fleet v13 origin on loopback, exposed at `https://fleet.funboy.eu.cc` |
 | `~/.config/kaid-site/`      | Operator-owned password and tunnel credentials; never committed                      |
 
 Both user services are enabled and user lingering keeps them active across
@@ -96,10 +96,20 @@ logout and reboot.
 7. Only then are the private site metadata and pinned local artifact changed
    together and the service restarted.
 
-The VT job, root proof channel and strict manifest binding are implemented in
-the repository but are **pending CI qualification** until a protected run
-publishes passing digest-bound evidence. Implemented source alone does not
-qualify or promote the feature.
+The exact private candidate from commit `aa8255a`, Rescue run `33455599335`,
+passed the core build, branded WebKit UI/input, BIOS/UEFI Secure Boot and
+USB-style two-boot matrix. Its BIOS and UEFI Vault lifecycle jobs plus native
+prompt job all stopped at `firstboot-confirmation`; it is therefore available
+privately for boot/UI testing only and was not promoted. The follow-up Rescue
+run `33459542561` from commit `be88efa` is in progress and has no claimed
+outcome.
+
+The same `be88efa` cut is also under Desktop qualification in run
+`33459542555` and repair qualification in run `33459558782`; neither in-progress
+run is evidence of success. The exact Resident package lifecycle workflows are
+already green for Linux (`33459558805`), Windows (`33459558875`) and macOS
+(`33459559165`), while signing, enrollment and physical endpoint evidence
+remain separate gates.
 
 The existence of a GitHub Actions artifact alone never promotes it. Physical
 USB, real-account provider TLS, signed installers and production repairs
@@ -124,8 +134,9 @@ firmware qualification claim.
 ## Next product gates
 
 The ordered, authoritative list is maintained in
-[Current status](CURRENT_STATUS.md). In practical terms the next external
-proof is physical USB boot on disposable media and non-customer hardware;
-after that come Secure Boot, signed delivery, real-account provider lifecycle
-and the first production repair action with preconditions, backup,
-verification and rollback.
+[Current status](CURRENT_STATUS.md). First let the in-progress Rescue, Desktop
+and repair workflows finish and review only their exact completed evidence.
+The next external proof is then physical USB boot on disposable media and
+non-customer hardware; after that come physical Secure Boot, signed delivery,
+real-account provider lifecycle and the first production repair action with
+preconditions, backup, verification and rollback.

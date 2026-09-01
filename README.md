@@ -79,17 +79,21 @@ The CI workflows are configured to produce engineering-preview desktop installer
   initializes. After diagnosis, use
   `kernaid-rescue-vaultctl report-list` and
   `kernaid-rescue-vaultctl report-export RP-...` to place a verified envelope
-  at `/home/kernaid/KernAid-Reports/<id>.signed.json`. The exact current private
-  ISO passed persistence, retrieval and fixed-path signed-envelope export on
-  that same artifact under virtual BIOS and UEFI. Physical USB behavior remains
-  a separate qualification gate.
-  A newer diagnosis-only ISO from run `33447510598` is separately available in
-  the authenticated area for physical boot/UI investigation. Its core boot
-  gates passed, but all three Vault jobs failed at first-boot confirmation; the
-  tty1 correction in current source is not yet requalified. It does not replace
-  this stable image. The repair candidate remains private, unavailable and
-  unpromoted; current exact evidence is maintained in
+  at `/home/kernaid/KernAid-Reports/<id>.signed.json`. The stable
+  `0.1.0-internal.6` ISO passed persistence, retrieval and fixed-path
+  signed-envelope export on that same artifact under virtual BIOS and UEFI.
+  Physical USB behavior remains a separate qualification gate.
+  A newer diagnosis-only ISO from commit `aa8255a`, Rescue run `33455599335`,
+  is separately available in the authenticated area for controlled physical
+  boot/UI investigation. Its core build, branded UI/input, BIOS/UEFI Secure
+  Boot and USB-style two-boot gates passed, but all three Vault jobs failed at
+  `firstboot-confirmation`. It does not replace this stable image. The repair
+  candidate remains private, unavailable and unpromoted; current exact evidence
+  is maintained in
   [Current status](docs/CURRENT_STATUS.md).
+  The follow-up `be88efa` cut is still being evaluated by Rescue run
+  `33459542561`, Desktop run `33459542555` and repair run `33459558782`; no
+  outcome is claimed while those workflows remain in progress.
 - **Windows, Linux or macOS that does boot:** use the matching unsigned artifact from immutable release `0.1.0-internal.6`, built by Desktop run `33330140025` attempt 1 from the same exact source as Rescue. All four platform jobs and their package-inspection gates passed. Install it and launch KernAid like a normal application; CI packaging is not physical installation or complete GUI qualification. The gate rejects Desk packages containing the separately distributed credential companion. Windows and macOS startup collect only a fast, derived target identity; the deeper P0 collection starts once when **Diagnostica** is selected. macOS queries only the current-user `launchd` table and safe-boot integer, and explicitly reports system `launchd`, software-update availability, system-event analysis, and login/background-item counts as unqualified instead of inventing results. The fixed commands do not request repairs, although native Windows tools such as DISM may still update their own operating-system logs. After diagnosis, retain the JSON as the authoritative machine-readable artifact; the additional Markdown download is an explicitly unsigned reading copy.
 - **Linux machine inventory:** Resident and Rescue use the same bounded Rust
   collector for CPU count/model, total RAM, firmware boot mode, selected public
@@ -128,7 +132,8 @@ layout and persistent vault without altering the ISO prefix or unrelated target
 regions. Finally, privileged lifecycle jobs exercise the shipping Python UI
 server's strict same-origin HTTP-to-AF_UNIX provider relay with provider
 networking disabled. Raw screenshots are never published. These gates do not
-exercise live provider TLS, a real account, Secure Boot, or physical media. The
+exercise live provider TLS, a real account, physical Secure Boot, or physical
+media. The
 current workflow and downloadable-artifact status is tracked in
 [Current status](docs/CURRENT_STATUS.md); do not infer that every `main` commit
 has produced a publishable ISO.
@@ -139,7 +144,10 @@ reuses one provisioned Rescue/Vault base across isolated scenario copies: the
 existing `fstab` apply/failure/recovery matrix, `crypttab` apply plus fresh
 explicit rollback, ext4 preen plus a clean read-only postcheck, and exact
 resolver-link restoration. This is implemented qualification logic, not a
-successful remote workflow or a promoted ISO. Power-loss, physical USB,
+successful remote workflow or a promoted ISO. All four corresponding Fleet
+repair intents also reach this local Rescue boundary, but cannot bypass a fresh
+target/evidence-bound local approval. Repair run `33459558782` from commit
+`be88efa` is in progress and has no claimed outcome. Power-loss, physical USB,
 hardware, firmware, Secure Boot and customer-data gates remain open.
 
 Fleet Resident workflow source also contains native staged package-lifecycle
@@ -148,9 +156,14 @@ Windows registers the packaged executable as an on-demand `LocalService`,
 proves it remains stopped, exercises the fail-closed one-shot path and
 uninstalls it; the native macOS matrix leg verifies disabled LaunchAgent
 settings, exercises the same no-anchor failure and cleans up. These checks use
-no enrollment identity or signing key. No post-change green workflow is cited
-yet, and they do not replace signing, real enrollment, native secret-store or
-physical endpoint qualification.
+no enrollment identity or signing key. The exact automated lifecycle passed in
+Linux run `33459558805`, Windows run `33459558875` and macOS run
+`33459559165`. Those green package gates do not replace signing, real
+enrollment, native secret-store or physical endpoint qualification.
+
+The live internal Fleet service is schema v13. Its closed work-order catalog
+contains all four Rescue repair identifiers, but the stable image still contains
+no repair surface and no repair action is promoted.
 
 Signed Fleet policy now recognizes the closed provider-mode catalog
 `offline`, `openai_api`, `openai_compatible`, `anthropic_api`, `gemini_api` and
