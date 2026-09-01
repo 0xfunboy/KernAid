@@ -480,7 +480,7 @@ qemu_args=(
 
 if [[ "$qualification_batch_child" == v1 ]]; then
   qemu_args+=(
-    -fw_cfg name=opt/kernaid-repair-qualification-probe,string=v1
+    -fw_cfg "name=opt/kernaid-repair-qualification-probe,string=v1"
   )
 fi
 
