@@ -227,7 +227,7 @@ jobs:
           KERNAID_QEMU_SMP=2 \
             ./tools/build-rescue/qemu-repair-candidate-smoke.sh \
             uefi qualification-batch \
-            "$PWD/KernAid-Rescue-amd64-repair-candidate.iso" | tee "$log"
+            "$PWD/KernAid-Rescue-amd64-repair-candidate.iso" 2>&1 | tee "$log"
           grep -Eq \
             '^KERNAID_QEMU_REPAIR_QUALIFICATION_BATCH_ATTESTATION_V1 .* ready=true$' \
             "$log"

@@ -74,6 +74,11 @@ OVMF_ROOTS = (Path("/usr/share/OVMF"), Path("/usr/share/edk2"))
 # ACPI shutdown mandatory, but do not misclassify that bounded shutdown as a
 # repair failure merely because it exceeds the generic 180-second VM budget.
 REPAIR_ACPI_SHUTDOWN_SECONDS = 300.0
+# Provisioning the disposable 32 GB repair medium must prove the future Vault
+# extent is zero before the first write.  Under two-vCPU TCG that repair-only
+# proof can exceed the generic lifecycle budget, while the surrounding
+# controller still enforces its 2,100-second aggregate deadline.
+REPAIR_FIRSTBOOT_RESULT_TIMEOUT_SECONDS = 1800.0
 
 EXECUTE_STATE_CLASSIFIER_SOURCE = r'''
 def execute_state_checkpoint(value):
@@ -1463,7 +1468,7 @@ def provision_firstboot(
         console,
         confirmation.end(),
         LIFECYCLE._deadline(
-            aggregate, LIFECYCLE.FIRSTBOOT_RESULT_TIMEOUT_SECONDS
+            aggregate, REPAIR_FIRSTBOOT_RESULT_TIMEOUT_SECONDS
         ),
     )
 

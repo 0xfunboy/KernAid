@@ -516,6 +516,10 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
     def test_repair_shutdown_keeps_a_bounded_tcg_safe_budget(self) -> None:
         source = CONTROLLER.read_text(encoding="utf-8")
         self.assertEqual(controller.REPAIR_ACPI_SHUTDOWN_SECONDS, 300.0)
+        self.assertEqual(
+            controller.REPAIR_FIRSTBOOT_RESULT_TIMEOUT_SECONDS,
+            1800.0,
+        )
         self.assertEqual(source.count("REPAIR_ACPI_SHUTDOWN_SECONDS)"), 8)
         self.assertNotIn(
             "wait_for_shutdown(LIFECYCLE._deadline(aggregate, 180.0))", source
