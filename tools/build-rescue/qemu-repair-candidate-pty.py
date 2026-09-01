@@ -75,9 +75,10 @@ OVMF_ROOTS = (Path("/usr/share/OVMF"), Path("/usr/share/edk2"))
 # repair failure merely because it exceeds the generic 180-second VM budget.
 REPAIR_ACPI_SHUTDOWN_SECONDS = 300.0
 # Provisioning the disposable 32 GB repair medium must prove the future Vault
-# extent is zero before the first write.  Under two-vCPU TCG that repair-only
-# proof can exceed the generic lifecycle budget, while the surrounding
-# controller still enforces its 2,100-second aggregate deadline.
+# extent is zero before the first write.  Under two-vCPU TCG both the interval
+# before the confirmation prompt and the post-confirmation proof can exceed the
+# generic lifecycle budgets. Keep both waits repair-specific and bounded.
+REPAIR_FIRSTBOOT_PROMPT_TIMEOUT_SECONDS = 1200.0
 REPAIR_FIRSTBOOT_RESULT_TIMEOUT_SECONDS = 1800.0
 
 EXECUTE_STATE_CLASSIFIER_SOURCE = r'''
@@ -1446,9 +1447,7 @@ def provision_firstboot(
         console,
         "passphrase",
         0,
-        LIFECYCLE._deadline(
-            aggregate, LIFECYCLE.FIRSTBOOT_PROMPT_TIMEOUT_SECONDS
-        ),
+        LIFECYCLE._deadline(aggregate, REPAIR_FIRSTBOOT_PROMPT_TIMEOUT_SECONDS),
         "firstboot-start",
     )
     qmp.set_deadline(LIFECYCLE._deadline(aggregate, 10.0))
@@ -1457,9 +1456,7 @@ def provision_firstboot(
         console,
         "confirmation",
         passphrase.end(),
-        LIFECYCLE._deadline(
-            aggregate, LIFECYCLE.FIRSTBOOT_PROMPT_TIMEOUT_SECONDS
-        ),
+        LIFECYCLE._deadline(aggregate, REPAIR_FIRSTBOOT_PROMPT_TIMEOUT_SECONDS),
         "firstboot-confirmation",
     )
     qmp.set_deadline(LIFECYCLE._deadline(aggregate, 10.0))
@@ -1679,7 +1676,7 @@ def main(arguments: Sequence[str]) -> int:
             if re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
                 raise LIFECYCLE.ClosedFailure("arguments", "digest-invalid")
         if parsed.scenario == "provision-base":
-            timeout_maximum = 2100
+            timeout_maximum = 3000
         elif parsed.scenario in {
             "rollback",
             "interrupt-reconcile",

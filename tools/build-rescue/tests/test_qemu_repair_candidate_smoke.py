@@ -493,9 +493,9 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
         self.assertIn("controller_timeout=1500", source)
         self.assertIn("controller_timeout=1800", source)
         self.assertIn("controller_timeout=1200", source)
-        self.assertIn("controller_timeout=2100", source)
+        self.assertIn("controller_timeout=3000", source)
         self.assertIn('parsed.scenario == "provision-base"', controller_source)
-        self.assertIn("timeout_maximum = 2100", controller_source)
+        self.assertIn("timeout_maximum = 3000", controller_source)
         self.assertIn('readonly qemu_smp="${KERNAID_QEMU_SMP:-2}"', source)
         self.assertIn('1|2|4|8)', source)
         self.assertIn('-smp "$qemu_smp"', source)
@@ -516,6 +516,10 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
     def test_repair_shutdown_keeps_a_bounded_tcg_safe_budget(self) -> None:
         source = CONTROLLER.read_text(encoding="utf-8")
         self.assertEqual(controller.REPAIR_ACPI_SHUTDOWN_SECONDS, 300.0)
+        self.assertEqual(
+            controller.REPAIR_FIRSTBOOT_PROMPT_TIMEOUT_SECONDS,
+            1200.0,
+        )
         self.assertEqual(
             controller.REPAIR_FIRSTBOOT_RESULT_TIMEOUT_SECONDS,
             1800.0,

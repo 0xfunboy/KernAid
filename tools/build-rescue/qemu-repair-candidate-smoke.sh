@@ -47,9 +47,10 @@ if [[ "$scenario" == rollback ]]; then
   controller_timeout=1500
 elif [[ "$scenario" == qualification-batch ]]; then
   # Provision once, then reuse isolated sparse copies for every qualification
-  # scenario. The post-confirmation zero proof may consume up to 25 minutes
-  # under TCG; child scenarios inherit already-provisioned media.
-  controller_timeout=2100
+  # scenario. The pre-confirmation scan and post-confirmation zero proof may
+  # together consume most of 50 minutes under a loaded two-vCPU TCG runner;
+  # child scenarios inherit already-provisioned media.
+  controller_timeout=3000
 elif [[ "$scenario" == interrupt-reconcile || "$scenario" == backup-tamper ]]; then
   controller_timeout=1800
 elif [[ "$scenario" == failure-paths ]]; then
