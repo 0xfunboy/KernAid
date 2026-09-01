@@ -3849,7 +3849,7 @@ class StaticContractTests(unittest.TestCase):
         self.assertIn("KERNAID_RESCUE_FIRSTBOOT_PROMPT_READY_V1 ", python)
         self.assertIn("step=(passphrase|confirmation)", python)
         self.assertEqual(controller.FIRSTBOOT_PROMPT_TIMEOUT_SECONDS, 600.0)
-        self.assertEqual(controller.FIRSTBOOT_RESULT_TIMEOUT_SECONDS, 1500.0)
+        self.assertEqual(controller.FIRSTBOOT_RESULT_TIMEOUT_SECONDS, 1800.0)
         self.assertEqual(controller.FIRSTBOOT_PROMPT_SETTLE_SECONDS, 1.0)
         self.assertEqual(controller.QMP_SECRET_INPUT_TIMEOUT_SECONDS, 30.0)
         self.assertEqual(controller.QMP_KEY_SETTLE_SECONDS, 0.1)

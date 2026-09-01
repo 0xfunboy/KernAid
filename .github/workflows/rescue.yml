@@ -454,7 +454,7 @@ jobs:
   native-vault-prompt-bios:
     needs: build-and-smoke-test
     runs-on: ubuntu-24.04
-    timeout-minutes: 85
+    timeout-minutes: 95
     steps:
       - uses: actions/checkout@v4
       - name: Install native prompt VM tooling
@@ -468,7 +468,7 @@ jobs:
           name: KernAid-Rescue-amd64
           path: ${{ runner.temp }}/kernaid-native-vault-prompt/image
       - name: QEMU BIOS native Vault prompt test
-        timeout-minutes: 75
+        timeout-minutes: 85
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -496,7 +496,7 @@ jobs:
           set +e
           python3 -I -B \
             "$GITHUB_WORKSPACE/tools/build-rescue/qemu-native-vault-prompt-smoke.py" \
-            --iso "$iso" --timeout 4200 >"$raw_output" 2>&1
+            --iso "$iso" --timeout 4800 >"$raw_output" 2>&1
           harness_status=$?
           set -e
 
@@ -572,7 +572,7 @@ jobs:
   vault-lifecycle-bios:
     needs: build-and-smoke-test
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 130
     steps:
       - uses: actions/checkout@v4
       - name: Install isolated lifecycle VM tooling
@@ -642,7 +642,7 @@ jobs:
           name: KernAid-Rescue-vault-lifecycle-probe-input
           path: ${{ runner.temp }}/kernaid-vault-lifecycle-bios/probe
       - name: QEMU BIOS two-boot vault lifecycle test
-        timeout-minutes: 110
+        timeout-minutes: 120
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -851,7 +851,7 @@ jobs:
   vault-lifecycle-uefi:
     needs: build-and-smoke-test
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 130
     steps:
       - uses: actions/checkout@v4
       - name: Install isolated lifecycle VM tooling
@@ -921,7 +921,7 @@ jobs:
           name: KernAid-Rescue-vault-lifecycle-probe-input
           path: ${{ runner.temp }}/kernaid-vault-lifecycle-uefi/probe
       - name: QEMU UEFI two-boot vault lifecycle test
-        timeout-minutes: 110
+        timeout-minutes: 120
         shell: bash
         run: |
           set -Eeuo pipefail

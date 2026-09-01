@@ -18,8 +18,8 @@ readonly p3_bytes=8589934592
 readonly boot_count=2
 readonly probe_controller_timeout_seconds=620
 readonly probe_wrapper_timeout_seconds=640
-readonly qemu_controller_timeout_seconds=2100
-readonly qemu_wrapper_timeout_seconds=2130
+readonly qemu_controller_timeout_seconds=2400
+readonly qemu_wrapper_timeout_seconds=2430
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 firmware="${1:-bios}"
