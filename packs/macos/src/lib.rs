@@ -156,7 +156,8 @@ pub struct StorageProjection {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StorageDevice {
-    pub internal: bool,
+    #[serde(deserialize_with = "required_option")]
+    pub internal: Option<bool>,
     #[serde(deserialize_with = "required_option")]
     pub solid_state: Option<bool>,
     pub smart_status: SmartStatus,
@@ -630,7 +631,7 @@ pub fn diagnose_macos_p0(inputs: MacosP0Inputs<'_>) -> Result<DiagnosticReport, 
     if storage
         .devices
         .iter()
-        .any(|device| device.internal && device.smart_status == SmartStatus::Failing)
+        .any(|device| device.internal == Some(true) && device.smart_status == SmartStatus::Failing)
     {
         findings.push(finding(
             "macos.storage.smart-failing",
@@ -640,7 +641,11 @@ pub fn diagnose_macos_p0(inputs: MacosP0Inputs<'_>) -> Result<DiagnosticReport, 
             "macos.apple-diagnostics.handoff",
         ));
     }
-    if !storage.devices.iter().any(|device| device.internal) {
+    if !storage
+        .devices
+        .iter()
+        .any(|device| device.internal == Some(true))
+    {
         findings.push(finding(
             "macos.storage.internal-device-unreported",
             Severity::Medium,
@@ -975,6 +980,17 @@ mod tests {
 
     #[test]
     fn nullable_projection_fields_are_still_required() {
+        let storage = br#"{"schemaVersion":"1.0","queryComplete":true,"devices":[{"solidState":null,"smartStatus":"verified"}]}"#;
+        assert_eq!(
+            parse_storage(EvidenceInput {
+                id: STORAGE_EVIDENCE_ID,
+                body: storage,
+            })
+            .expect_err("unknown internal state must be explicit null")
+            .kind,
+            DiagnosticErrorKind::MalformedInput
+        );
+
         let storage = br#"{"schemaVersion":"1.0","queryComplete":true,"devices":[{"internal":true,"smartStatus":"verified"}]}"#;
         assert_eq!(
             parse_storage(EvidenceInput {

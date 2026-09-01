@@ -87,7 +87,7 @@ const MAX_RAW_RECORDS: usize = 4096;
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct StorageDeviceProjection {
-    internal: bool,
+    internal: Option<bool>,
     solid_state: Option<bool>,
     smart_status: &'static str,
 }
@@ -236,6 +236,50 @@ fn yes_no(value: &Value) -> Result<bool, ()> {
     }
 }
 
+fn optional_yes_no(value: Option<&Value>) -> Result<Option<bool>, ()> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(value @ (Value::Bool(_) | Value::String(_))) => {
+            yes_no(value).map(Some).or_else(|_| match value {
+                Value::String(value)
+                    if !value.is_empty()
+                        && value.len() <= 64
+                        && !value.chars().any(char::is_control) =>
+                {
+                    Ok(None)
+                }
+                _ => Err(()),
+            })
+        }
+        Some(_) => Err(()),
+    }
+}
+
+fn merge_optional_bool(left: Option<bool>, right: Option<bool>) -> Result<Option<bool>, ()> {
+    match (left, right) {
+        (None, value) | (value, None) => Ok(value),
+        (Some(left), Some(right)) if left == right => Ok(Some(left)),
+        _ => Err(()),
+    }
+}
+
+fn merge_storage_projection(
+    left: &StorageDeviceProjection,
+    right: &StorageDeviceProjection,
+) -> Result<StorageDeviceProjection, ()> {
+    let smart_status = match (left.smart_status, right.smart_status) {
+        (left, right) if left == right => left,
+        ("failing", _) | (_, "failing") => "failing",
+        ("verified", "unsupported") | ("unsupported", "verified") => "verified",
+        _ => return Err(()),
+    };
+    Ok(StorageDeviceProjection {
+        internal: merge_optional_bool(left.internal, right.internal)?,
+        solid_state: merge_optional_bool(left.solid_state, right.solid_state)?,
+        smart_status,
+    })
+}
+
 fn storage_records(raw: &str) -> Result<(Vec<StorageDeviceProjection>, Vec<String>), ()> {
     let root: Value = serde_json::from_str(raw).map_err(|_| ())?;
     let records = object(&root)?
@@ -246,84 +290,101 @@ fn storage_records(raw: &str) -> Result<(Vec<StorageDeviceProjection>, Vec<Strin
         return Err(());
     }
 
-    let mut devices = BTreeMap::new();
+    let mut devices: BTreeMap<String, StorageDeviceProjection> = BTreeMap::new();
     let mut identity = BTreeSet::new();
     for record in records {
         let record = object(record)?;
-        // `system_profiler` can include logical/disk-image rows which have no
-        // physical-drive projection. They are outside this collector's typed
-        // device scope and must not poison otherwise complete physical data.
-        let physical = match record.get("physical_drive") {
-            None | Some(Value::Null) => continue,
-            Some(value) => object(value)?,
-        };
-        let internal = yes_no(physical.get("is_internal_disk").ok_or(())?)?;
-        let solid_state = match physical.get("medium_type") {
-            None | Some(Value::Null) => None,
-            Some(Value::String(value)) => match value.trim().to_ascii_lowercase().as_str() {
-                "ssd" | "solid state" | "solid_state" => Some(true),
-                "hdd" | "rotational" | "rotating" => Some(false),
-                _ => None,
-            },
-            Some(_) => return Err(()),
-        };
-        let smart_status = match physical.get("smart_status") {
-            None | Some(Value::Null) => "unsupported",
-            Some(Value::String(value)) if value.eq_ignore_ascii_case("verified") => "verified",
-            Some(Value::String(value)) if value.eq_ignore_ascii_case("failing") => "failing",
-            Some(Value::String(value))
-                if value.eq_ignore_ascii_case("unsupported")
-                    || value.eq_ignore_ascii_case("not supported")
-                    || value.eq_ignore_ascii_case("not available") =>
-            {
-                "unsupported"
+        let mut volume_identity = Vec::new();
+        let mut physical_identity = Vec::new();
+        for field in ["bsd_name", "volume_uuid"] {
+            if let Some(value) = record.get(field).filter(|value| !value.is_null()) {
+                let value = bounded_identity_value(value)?;
+                volume_identity.push(format!("volume.{field}={value}"));
             }
-            _ => return Err(()),
-        };
-        let projection = StorageDeviceProjection {
-            internal,
-            solid_state,
-            smart_status,
+        }
+
+        // Hosted macOS can privacy-redact the physical-drive object. Accept a
+        // redacted row only for the exact root/data mount, retain explicit
+        // unknown capability values, and never infer that a disk is internal.
+        let root_or_data = matches!(
+            record.get("mount_point"),
+            Some(Value::String(value)) if value == "/" || value == "/System/Volumes/Data"
+        );
+        let physical = match record.get("physical_drive") {
+            None | Some(Value::Null) if root_or_data && !volume_identity.is_empty() => None,
+            None | Some(Value::Null) => continue,
+            Some(value) => Some(object(value)?),
         };
 
-        let mut record_identity = Vec::new();
-        let mut physical_identity = Vec::new();
-        for (prefix, source, fields) in [
-            ("volume", record, &["bsd_name", "volume_uuid"][..]),
-            (
-                "physical",
-                physical,
-                &[
-                    "_name",
-                    "device_name",
-                    "media_name",
-                    "protocol",
-                    "serial_number",
-                ][..],
-            ),
-        ] {
-            for field in fields {
-                if let Some(value) = source.get(*field).filter(|value| !value.is_null()) {
+        let projection = if let Some(physical) = physical {
+            for field in [
+                "_name",
+                "device_name",
+                "media_name",
+                "protocol",
+                "serial_number",
+            ] {
+                if let Some(value) = physical.get(field).filter(|value| !value.is_null()) {
                     let value = bounded_identity_value(value)?;
-                    let token = format!("{prefix}.{field}={value}");
-                    if prefix == "physical" {
-                        physical_identity.push(token.clone());
-                    }
-                    record_identity.push(token);
+                    physical_identity.push(format!("physical.{field}={value}"));
                 }
             }
+            let solid_state = match physical.get("medium_type") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(value)) => match value.trim().to_ascii_lowercase().as_str() {
+                    "ssd" | "solid state" | "solid_state" => Some(true),
+                    "hdd" | "rotational" | "rotating" => Some(false),
+                    _ if !value.is_empty()
+                        && value.len() <= 64
+                        && !value.chars().any(char::is_control) =>
+                    {
+                        None
+                    }
+                    _ => return Err(()),
+                },
+                Some(_) => return Err(()),
+            };
+            let smart_status = match physical.get("smart_status") {
+                None | Some(Value::Null) => "unsupported",
+                Some(Value::String(value)) if value.eq_ignore_ascii_case("verified") => "verified",
+                Some(Value::String(value)) if value.eq_ignore_ascii_case("failing") => "failing",
+                Some(Value::String(value))
+                    if !value.is_empty()
+                        && value.len() <= 64
+                        && !value.chars().any(char::is_control) =>
+                {
+                    "unsupported"
+                }
+                _ => return Err(()),
+            };
+            StorageDeviceProjection {
+                internal: optional_yes_no(physical.get("is_internal_disk"))?,
+                solid_state,
+                smart_status,
+            }
+        } else {
+            StorageDeviceProjection {
+                internal: None,
+                solid_state: None,
+                smart_status: "unsupported",
+            }
+        };
+
+        let physical_key = if physical_identity.is_empty() {
+            if volume_identity.is_empty() {
+                return Err(());
+            }
+            volume_identity.join("\0")
+        } else {
+            physical_identity.join("\0")
+        };
+        if let Some(previous) = devices.get_mut(&physical_key) {
+            *previous = merge_storage_projection(previous, &projection)?;
+        } else {
+            devices.insert(physical_key, projection);
         }
-        if physical_identity.is_empty() {
-            return Err(());
-        }
-        let physical_key = physical_identity.join("\0");
-        if devices
-            .insert(physical_key, projection.clone())
-            .is_some_and(|previous| previous != projection)
-        {
-            return Err(());
-        }
-        identity.extend(record_identity);
+        identity.extend(volume_identity);
+        identity.extend(physical_identity);
     }
     if devices.is_empty() || identity.is_empty() {
         return Err(());
@@ -881,12 +942,48 @@ mod tests {
 
         for malformed in [
             r#"{"SPStorageDataType":[{"physical_drive":[]}]}"#,
-            r#"{"SPStorageDataType":[{"physical_drive":{"_name":"disk"}}]}"#,
-            r#"{"SPStorageDataType":[{"physical_drive":{"_name":"disk","is_internal_disk":"yes","smart_status":"failing soon"}}]}"#,
+            r#"{"SPStorageDataType":[{"physical_drive":{}}]}"#,
             r#"{"SPStorageDataType":[{"physical_drive":{"_name":7,"is_internal_disk":"yes"}}]}"#,
         ] {
             assert!(normalize_storage(malformed).is_err());
         }
+    }
+
+    #[test]
+    fn storage_accepts_privacy_redacted_root_rows_without_inventing_capabilities() {
+        let raw = r#"{
+          "SPStorageDataType": [{
+            "_name":"Macintosh HD",
+            "bsd_name":"disk3s1s1",
+            "volume_uuid":"11111111-2222-3333-4444-555555555555",
+            "mount_point":"/"
+          }]
+        }"#;
+
+        assert_eq!(
+            assert_valid("macos.storage.inventory", normalize_storage(raw)),
+            r#"{"schemaVersion":"1.0","queryComplete":true,"devices":[{"internal":null,"solidState":null,"smartStatus":"unsupported"}]}"#
+        );
+        assert!(derive_storage_identity(raw).is_ok());
+
+        let unrelated =
+            r#"{"SPStorageDataType":[{"bsd_name":"disk9s1","mount_point":"/tmp/image"}]}"#;
+        assert!(normalize_storage(unrelated).is_err());
+    }
+
+    #[test]
+    fn duplicate_physical_rows_merge_unknown_capabilities_conservatively() {
+        let raw = r#"{
+          "SPStorageDataType": [
+            {"bsd_name":"disk3s1","physical_drive":{"_name":"APPLE SSD","is_internal_disk":null}},
+            {"bsd_name":"disk3s5","physical_drive":{"_name":"APPLE SSD","is_internal_disk":"yes","medium_type":"ssd","smart_status":"failing"}}
+          ]
+        }"#;
+
+        assert_eq!(
+            assert_valid("macos.storage.inventory", normalize_storage(raw)),
+            r#"{"schemaVersion":"1.0","queryComplete":true,"devices":[{"internal":true,"solidState":true,"smartStatus":"failing"}]}"#
+        );
     }
 
     #[test]
