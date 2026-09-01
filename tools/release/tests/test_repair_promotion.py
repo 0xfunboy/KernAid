@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 import unittest
 
@@ -38,9 +39,25 @@ class RepairPromotionStaticTests(unittest.TestCase):
 
     def test_qualifier_never_overclaims_compiled_actions(self) -> None:
         source = QUALIFIER.read_text(encoding="utf-8")
-        self.assertIn("COMPILED_ACTIONS", source)
-        self.assertIn("QUALIFIED_ACTIONS", source)
-        self.assertIn('QUALIFIED_ACTIONS: Final = ("linux.fstab.disable-missing-uuid.v1",)', source)
+        assignments = {
+            node.target.id: node.value
+            for node in ast.parse(source).body
+            if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+        }
+        compiled = assignments.get("COMPILED_ACTIONS")
+        self.assertIsInstance(compiled, ast.Tuple)
+        self.assertEqual(
+            ast.literal_eval(compiled),
+            (
+                "linux.crypttab.disable-missing-uuid.v1",
+                "linux.ext4.fsck-preen-with-undo.v1",
+                "linux.fstab.disable-missing-uuid.v1",
+                "linux.network.restore-resolver-link.v1",
+            ),
+        )
+        qualified = assignments.get("QUALIFIED_ACTIONS")
+        self.assertIsInstance(qualified, ast.Name)
+        self.assertEqual(qualified.id, "COMPILED_ACTIONS")
         self.assertIn('"physicalQualification": False', source)
         self.assertIn('"releaseClass": "engineering-candidate"', source)
         self.assertIn('"diagnosisOnly": False', source)
