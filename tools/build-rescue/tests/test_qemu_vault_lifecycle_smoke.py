@@ -2091,7 +2091,9 @@ class ProbeRunnerTests(unittest.TestCase):
 
 
 class QmpTests(unittest.TestCase):
-    def test_firstboot_hex_line_is_paced_one_key_per_qmp_request(self) -> None:
+    def test_firstboot_hex_line_paces_key_down_and_up_as_separate_requests(
+        self,
+    ) -> None:
         secret = bytearray(b"0123456789abcdef" * 4)
         client = controller.QmpClient(mock.Mock(), time.monotonic() + 5)
         calls: list[tuple[str, dict[str, object]]] = []
@@ -2109,23 +2111,26 @@ class QmpTests(unittest.TestCase):
             controller.wipe(secret)
 
         expected_qcodes = list("0123456789abcdef" * 4) + ["ret"]
-        self.assertEqual(len(calls), len(expected_qcodes))
-        for (command, arguments), expected_qcode in zip(
-            calls, expected_qcodes, strict=True
+        expected_events = [
+            (expected_qcode, down)
+            for expected_qcode in expected_qcodes
+            for down in (True, False)
+        ]
+        self.assertEqual(len(calls), len(expected_events))
+        for (command, arguments), (expected_qcode, expected_down) in zip(
+            calls, expected_events, strict=True
         ):
             self.assertEqual(command, "input-send-event")
             events = arguments["events"]
-            self.assertEqual(len(events), 2)
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0]["data"]["down"], expected_down)
             self.assertEqual(
-                [event["data"]["down"] for event in events], [True, False]
-            )
-            self.assertEqual(
-                [event["data"]["key"] for event in events],
-                [{"type": "qcode", "data": expected_qcode}] * 2,
+                events[0]["data"]["key"],
+                {"type": "qcode", "data": expected_qcode},
             )
         self.assertEqual(
             sleep.call_args_list,
-            [mock.call(controller.QMP_KEY_SETTLE_SECONDS)] * len(expected_qcodes),
+            [mock.call(controller.QMP_KEY_SETTLE_SECONDS)] * len(expected_events),
         )
 
     def test_firstboot_hex_line_rejects_invalid_alphabet_before_qmp(self) -> None:

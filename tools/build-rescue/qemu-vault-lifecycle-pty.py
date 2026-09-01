@@ -1854,26 +1854,25 @@ class QmpClient:
         # A single 64-byte line is 130 key down/up events including Return.
         # Sending that as one QMP burst can overrun the emulated keyboard path:
         # QMP acknowledges command acceptance, not consumption by tty1.  Keep
-        # each correlated request bounded to one key and give i8042/tty1 time
-        # to consume it before the next request.  Never retry a whole secret
-        # line because a partial delivery would then concatenate credentials.
+        # each correlated request bounded to one key transition and give
+        # i8042/tty1 time to consume both the press and release before the next
+        # transition.  Never retry a whole secret line because a partial
+        # delivery would then concatenate credentials.
         for value in secret:
             self._send_paced_qcode(chr(value))
         self._send_paced_qcode("ret")
 
     def _send_paced_qcode(self, qcode: str) -> None:
-        events = [
-            {
+        for down in (True, False):
+            event = {
                 "type": "key",
                 "data": {
                     "down": down,
                     "key": {"type": "qcode", "data": qcode},
                 },
             }
-            for down in (True, False)
-        ]
-        self.execute("input-send-event", {"events": events})
-        time.sleep(QMP_KEY_SETTLE_SECONDS)
+            self.execute("input-send-event", {"events": [event]})
+            time.sleep(QMP_KEY_SETTLE_SECONDS)
 
     def quit(self) -> None:
         self.execute("quit")
