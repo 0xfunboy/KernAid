@@ -123,6 +123,12 @@ jobs:
           cargo build --locked --release -p kernaid-rescue-secrets \
             --features privileged-probe \
             --bin kernaid-rescue-vault-probe
+          probe=target/release/kernaid-rescue-vault-probe
+          probe_sha256="$(sha256sum "$probe" | awk '{print $1}')"
+          install -m 0755 -- "$probe" "${probe}.single-link"
+          mv -f -- "${probe}.single-link" "$probe"
+          test "$(stat -c '%h' -- "$probe")" = 1
+          test "$(sha256sum "$probe" | awk '{print $1}')" = "$probe_sha256"
           cargo build --locked --release -p kernaid-rescue-secrets \
             --features experimental-codex-home-lease,experimental-firstboot-provisioner,experimental-repair-store,experimental-fleet-signing \
             --bin kernaid-rescue-vaultd \
