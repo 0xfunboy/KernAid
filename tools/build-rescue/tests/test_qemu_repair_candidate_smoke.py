@@ -89,6 +89,67 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
             [mock.call(controller.REPAIR_FIRSTBOOT_PROMPT_SETTLE_SECONDS)] * 2,
         )
 
+    def test_batch_readiness_requires_one_exact_marker_adjacent_to_one_ready(
+        self,
+    ) -> None:
+        marker = controller.REPAIR_QUALIFICATION_READY_LINE + b"\r\n"
+        ready = controller.LIFECYCLE.READY_LINE + b"\r\n"
+
+        capture = controller.LIFECYCLE.BoundedCapture(4096, [])
+        capture.append(b"boot\r\n" + marker + ready + b"login prompt\r\n")
+        controller.require_repair_qualification_readiness(
+            mock.Mock(capture=capture)
+        )
+
+        invalid_transcripts = (
+            ready,
+            marker + marker + ready,
+            ready + marker + ready,
+            marker + b"unrelated\r\n" + ready,
+            marker.replace(b"mode=0660", b"mode=0666") + ready,
+        )
+        for transcript in invalid_transcripts:
+            with self.subTest(transcript=transcript):
+                rejected = controller.LIFECYCLE.BoundedCapture(4096, [])
+                rejected.append(transcript)
+                with self.assertRaises(
+                    controller.LIFECYCLE.ClosedFailure
+                ) as observed:
+                    controller.require_repair_qualification_readiness(
+                        mock.Mock(capture=rejected)
+                    )
+                self.assertEqual(observed.exception.stage, "readiness")
+                self.assertEqual(
+                    observed.exception.code,
+                    "repair-marker-invalid",
+                )
+
+    def test_batch_readiness_probe_argument_is_exact_and_uniquely_paired(
+        self,
+    ) -> None:
+        exact = controller.REPAIR_QUALIFICATION_PROBE_ARGUMENT
+        self.assertFalse(controller.repair_qualification_probe_enabled([]))
+        self.assertTrue(
+            controller.repair_qualification_probe_enabled(["-fw_cfg", exact])
+        )
+
+        for arguments in (
+            [exact],
+            ["-fw_cfg", exact, "-fw_cfg", exact],
+            ["-fw_cfg", exact.replace("string=v1", "string=v2")],
+            ["-fw_cfg", exact + "-suffix"],
+        ):
+            with self.subTest(arguments=arguments):
+                with self.assertRaises(
+                    controller.LIFECYCLE.ClosedFailure
+                ) as observed:
+                    controller.repair_qualification_probe_enabled(arguments)
+                self.assertEqual(observed.exception.stage, "arguments")
+                self.assertEqual(
+                    observed.exception.code,
+                    "readiness-probe-invalid",
+                )
+
     @staticmethod
     def _receipt_transcript_console(return_code: int) -> object:
         begin = b"KERNAID_PROVIDER_PROOF_BEGIN_V1_repair-backup-tamper-apply"

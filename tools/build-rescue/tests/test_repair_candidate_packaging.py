@@ -13,6 +13,9 @@ CANDIDATE = REPO / "rescue/live-build/candidate"
 BUILD = REPO / "tools/build-rescue/build.sh"
 HOOK = REPO / "rescue/live-build/config/hooks/live/0100-kernaid-safety.hook.chroot"
 WORKFLOW = REPO / ".github/workflows/rescue-repair-candidate.yml"
+REPAIR_SMOKE = REPO / "tools/build-rescue/qemu-repair-candidate-smoke.sh"
+REPAIR_CONTROLLER = REPO / "tools/build-rescue/qemu-repair-candidate-pty.py"
+READY_CHECK = LIVE / "usr/lib/kernaid/ready-check"
 PHYSICAL_PARENT = REPO / "crates/broker/src/target_physical_parent.rs"
 REPAIR_ENGINE = REPO / "crates/broker/src/rescue_repair_service_engine.rs"
 RESCUE_SERVER = (
@@ -50,6 +53,91 @@ def unit_directives(path: Path) -> dict[str, dict[str, list[str]]]:
 
 
 class RepairCandidatePackagingTests(unittest.TestCase):
+    def test_batch_only_repair_readiness_is_pinned_and_socket_bound(self) -> None:
+        shell = REPAIR_SMOKE.read_text(encoding="utf-8")
+        controller = REPAIR_CONTROLLER.read_text(encoding="utf-8")
+        ready = READY_CHECK.read_text(encoding="utf-8")
+
+        self.assertIn(
+            'readonly qualification_batch_child="${KERNAID_REPAIR_QUALIFICATION_BATCH_CHILD:-}"',
+            shell,
+        )
+        self.assertIn("KERNAID_REPAIR_QUALIFICATION_BATCH_CHILD=v1", shell)
+        self.assertIn(
+            '[[ "$qualification_batch_child" == v1',
+            shell,
+        )
+        self.assertEqual(
+            shell.count(
+                "name=opt/kernaid-repair-qualification-probe,string=v1"
+            ),
+            1,
+        )
+        for contract in (
+            "--qualification-batch-child",
+            "guest_readiness=repair-service-v1 guest_readiness_marker=",
+            'case_without_readiness_marker="${case_output/',
+            "guest_readiness_marker=$repair_readiness_marker ready=true",
+        ):
+            self.assertIn(contract, shell)
+        for contract in (
+            "REPAIR_QUALIFICATION_READY_PATTERN",
+            "REPAIR_QUALIFICATION_GLOBAL_READY_PATTERN",
+            "REPAIR_QUALIFICATION_READY_THEN_GLOBAL_PATTERN",
+            'ClosedFailure("readiness", "repair-marker-invalid")',
+            "guest_readiness_marker={REPAIR_QUALIFICATION_READY_MARKER}",
+        ):
+            self.assertIn(contract, controller)
+        marker_gate = ready[
+            ready.index("repair_qualification_smoke=0") :
+            ready.index("fail_vaultd_startup()")
+        ]
+        self.assertIn(
+            "/sys/firmware/qemu_fw_cfg/by_name/opt/"
+            "kernaid-repair-qualification-probe/raw",
+            marker_gate,
+        )
+        for contract in (
+            "os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW",
+            "stat.S_ISREG(metadata.st_mode)",
+            "metadata.st_uid != 0",
+            "metadata.st_gid != 0",
+            "metadata.st_nlink != 1",
+            "stat.S_IMODE(metadata.st_mode) & 0o222",
+            "metadata.st_size not in (0, 2, 3)",
+            'payload not in (b"v1", b"v1\\0")',
+        ):
+            self.assertIn(contract, marker_gate)
+
+        repair_gate_start = ready.index(
+            'if [ "$repair_qualification_smoke" = "1" ]; then'
+        )
+        repair_gate_end = ready.index('script_path="', repair_gate_start)
+        repair_gate = ready[repair_gate_start:repair_gate_end]
+        self.assertLess(
+            ready.index("KERNAID_RESCUE_APPLICATION_RELAY_READY"),
+            repair_gate_start,
+        )
+        for contract in (
+            "kernaid-repair-client",
+            "kernaid-rescue-repaird.socket",
+            "ActiveState",
+            "SubState",
+            "listening) ;;",
+            "/run/kernaid-rescue-repair.sock",
+            '0:${repair_client_group_id}:660:1',
+            "KERNAID_RESCUE_REPAIR_QUALIFICATION_READY_V1",
+            "full_readiness=separate",
+            "echo KERNAID_RESCUE_READY",
+            "exit 0",
+        ):
+            self.assertIn(contract, repair_gate)
+        self.assertNotIn("listening|running", repair_gate)
+        self.assertGreater(
+            ready.rindex("echo KERNAID_RESCUE_READY"),
+            ready.index("tauri_guest_attestation"),
+        )
+
     def test_fleet_repair_local_relay_preserves_exact_action_binding(self) -> None:
         intent = {
             "schema": rescue_server.FLEET_REPAIR_INTENT_SCHEMA,
