@@ -2159,7 +2159,10 @@ class QmpTests(unittest.TestCase):
             )
         self.assertEqual(
             sleep.call_args_list,
-            [mock.call(controller.QMP_KEY_SETTLE_SECONDS)] * len(expected_events),
+            [mock.call(controller.QMP_KEY_SETTLE_SECONDS)]
+            * (len(expected_events) - 2)
+            + [mock.call(controller.QMP_LINE_DRAIN_SECONDS)]
+            + [mock.call(controller.QMP_KEY_SETTLE_SECONDS)] * 2,
         )
 
     def test_firstboot_hex_line_rejects_invalid_alphabet_before_qmp(self) -> None:
@@ -2186,7 +2189,12 @@ class QmpTests(unittest.TestCase):
                 client.send_hex_line(secret, settle_seconds=0.1)
         finally:
             controller.wipe(secret)
-        self.assertEqual(sleep.call_args_list, [mock.call(0.1)] * 4)
+        self.assertEqual(
+            sleep.call_args_list,
+            [mock.call(0.1)] * 2
+            + [mock.call(controller.QMP_LINE_DRAIN_SECONDS)]
+            + [mock.call(0.1)] * 2,
+        )
 
     def test_firstboot_hex_line_rejects_unbounded_pacing_override(self) -> None:
         client = controller.QmpClient(mock.Mock(), time.monotonic() + 5)
