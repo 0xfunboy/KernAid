@@ -805,8 +805,7 @@ mod tests {
             "UUID=x / ext4 defaults 0 1\n",
         )
         .expect("write fixture fstab");
-        fs::write(root.path().join("boot/vmlinuz-test"), b"kernel")
-            .expect("write fixture kernel");
+        fs::write(root.path().join("boot/vmlinuz-test"), b"kernel").expect("write fixture kernel");
         fs::write(root.path().join("boot/initrd.img-test"), b"initrd")
             .expect("write fixture initramfs");
         fs::write(root.path().join("boot/grub/grub.cfg"), b"config")

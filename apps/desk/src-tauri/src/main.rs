@@ -650,12 +650,12 @@ fn collect_windows_native(
     program: &'static str,
     args: &[&str],
     timeout: Duration,
-    normalize: fn(&str, &str, i32) -> Result<String, ()>,
+    normalize: fn(&str, &str, i32) -> Result<String, windows_resident::ResidentContractError>,
 ) -> Observation {
     match run_fixed_command(program, args, timeout, QUALIFIED_WINDOWS_MAX_OUTPUT_BYTES) {
         Ok(output) => match normalize(&output.stdout, &output.stderr, output.exit_code) {
             Ok(normalized) => validated_windows_output(collector, normalized),
-            Err(()) => failed_windows_observation(collector, false),
+            Err(_) => failed_windows_observation(collector, false),
         },
         Err(error) => failed_windows_observation(collector, error.truncated()),
     }
@@ -737,7 +737,7 @@ fn collect_windows_boot() -> Observation {
         boot_native_output(&default_loader),
     ) {
         Ok(normalized) => validated_windows_output("windows.boot.state", normalized),
-        Err(()) => failed_windows_observation("windows.boot.state", false),
+        Err(_) => failed_windows_observation("windows.boot.state", false),
     }
 }
 
@@ -754,7 +754,7 @@ fn windows_identity_from_volumes(volumes: &Observation) -> Observation {
             success: true,
             truncated: false,
         },
-        Err(()) => failed_windows_observation("windows.storage.identity", false),
+        Err(_) => failed_windows_observation("windows.storage.identity", false),
     }
 }
 
@@ -781,7 +781,7 @@ fn collect_windows_spec(spec: windows_resident::CollectorSpec) -> Observation {
         windows_resident::CollectorKind::SfcNotRunUnqualified => {
             match windows_resident::sfc_not_run_projection() {
                 Ok(output) => validated_windows_output(spec.collector, output),
-                Err(()) => failed_windows_observation(spec.collector, false),
+                Err(_) => failed_windows_observation(spec.collector, false),
             }
         }
         windows_resident::CollectorKind::Boot => collect_windows_boot(),
