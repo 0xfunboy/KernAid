@@ -14,6 +14,13 @@ manifest binds the exact fixed catalog-entry, qualification, retail metadata,
 and retail archive descriptors. Unknown fields and cross-version/mixed-member
 input are rejected.
 
+`kernaid-media-bundle-issuer` creates that manifest without network access. It
+reads only the four fixed-name qualified-release members, checks their complete
+cross-member contract, streams and hashes the bounded retail archive, signs
+canonical JSON, verifies the result through `authorize_release_bundle`, and
+persists a create-new output. The operational procedure is in
+[`docs/runbooks/media-release-bundle.md`](../../docs/runbooks/media-release-bundle.md).
+
 The core never accepts a block-device path. A platform backend must enumerate
 whole removable USB disks, retain an opaque snapshot, and re-probe the selected
 disk before opening it exclusively. Only an exact `ERASE KERNAID USB <id>`

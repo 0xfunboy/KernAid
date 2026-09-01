@@ -34,6 +34,9 @@ Ed25519. Canonical JSON is compact, recursively lexicographically key-sorted,
 and preserves array order. `signature` is canonical unpadded base64url. `keyId`
 is `sha256:` followed by the lowercase SHA-256 of the raw 32-byte public key.
 The private key is never used by this app, its workflow, or this repository.
+Release operators create the manifest with the repository's offline
+`kernaid-media-bundle-issuer`; see the
+[media release bundle runbook](../../docs/runbooks/media-release-bundle.md).
 
 The matching raw public key is embedded at build time from the public
 `KERNAID_MEDIA_BUNDLE_TRUST_ANCHOR` value (canonical unpadded base64url). A
